@@ -137,6 +137,19 @@ multi-VM concurrency milestone, even though early single-guest milestones
 - [ ] **M2-8** — Real-hardware validation (Intel + AMD).
   Deps: M2-7, SETUP-3, SETUP-4
 
+  *Open gate: not yet run, same as M0-5 above -- no physical Intel/AMD
+  test hardware is reachable from this environment. SVM has real
+  QEMU/KVM nested-virtualization validation (M2-7: 5/5 clean runs,
+  correct HLT exit); VMX has none at all (this dev environment is
+  AMD-only hardware, so not even software emulation can exercise it) --
+  M2-8 is where VMX's vcpu_create/vcpu_run and its VM-entry/VM-exit
+  trampoline (deferred at M2-7, see vmx_ops.c) would actually get
+  written and iterated against real Intel silicon, not just where an
+  already-working backend gets double-checked. Downstream milestones
+  have proceeded past this point by the same explicit user decision
+  (2026-07-13) as M0-5 -- this still needs to happen for real on both
+  vendors' hardware before this checkbox is genuine.*
+
 ---
 
 ## M3 — EPT + first real guest boot (plan.md §9 M3)
