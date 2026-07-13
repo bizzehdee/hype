@@ -11,7 +11,7 @@ CFLAGS  := --target=$(TARGET) -ffreestanding -fshort-wchar -mno-red-zone \
 LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 
 BUILD_DIR := build
-CORE_SRCS := core/format.c core/console.c core/panic.c core/halt.c core/memmap.c
+CORE_SRCS := core/format.c core/console.c core/panic.c core/halt.c
 BOOT_SRCS := boot/main.c
 SRCS      := $(BOOT_SRCS) $(CORE_SRCS)
 OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRCS))
