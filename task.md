@@ -64,7 +64,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
   Deps: M0-4, M0-5
 - [x] **M1-2** — Own GDT/IDT.
   Deps: M0-4, M0-5
-- [ ] **M1-3** — Own paging.
+- [x] **M1-3** — Own paging.
   Deps: M0-4, M0-5
 - [ ] **M1-4** — `ExitBootServices()` sequence; hypervisor becomes the only
   kernel.

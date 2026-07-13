@@ -15,7 +15,8 @@ CORE_SRCS := core/format.c core/console.c core/panic.c core/halt.c core/memmap.c
              core/sys_table.c
 ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
-             arch/x86_64/cpu/isr_entry.c
+             arch/x86_64/cpu/isr_entry.c arch/x86_64/cpu/paging.c \
+             arch/x86_64/cpu/paging_load.c
 ARCH_ASM_SRCS := arch/x86_64/cpu/isr_stubs.S
 BOOT_SRCS := boot/main.c
 SRCS      := $(BOOT_SRCS) $(CORE_SRCS) $(ARCH_SRCS)

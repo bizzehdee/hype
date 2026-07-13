@@ -4,11 +4,15 @@
 #include "../core/sys_table.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
+#include "../arch/x86_64/cpu/paging.h"
 
 /* Static storage: still valid (and unmoving) after the segment reload
  * below, and after ExitBootServices() once M1-4 lands. */
 static hype_gdt_entry_t g_gdt[HYPE_GDT_ENTRY_COUNT];
 static hype_idt_entry_t g_idt[HYPE_IDT_ENTRY_COUNT];
+static hype_pte_t g_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_pd[HYPE_PAGING_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
@@ -27,6 +31,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_idt_build(g_idt, hype_isr_stub_table, HYPE_GDT_CODE64_SEL);
     hype_idt_load(g_idt, HYPE_IDT_ENTRY_COUNT);
     hype_console_print(SystemTable, "own IDT loaded\n");
+
+    hype_paging_build_identity(g_pml4, g_pdpt, g_pd, HYPE_PAGING_MAX_GB);
+    hype_paging_load(g_pml4);
+    hype_console_print(SystemTable, "own paging loaded\n");
 
     status = hype_memmap_get(SystemTable->BootServices, &map, &map_size, &desc_size, &map_key);
     if (status != EFI_SUCCESS) {
