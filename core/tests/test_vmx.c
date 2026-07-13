@@ -46,10 +46,31 @@ static void test_cr4_with_vmxe(void) {
     CHECK_HEX("existing bits preserved", cr4, result & ~HYPE_CR4_VMXE);
 }
 
+static void test_adjust_controls(void) {
+    /* allowed0 (bits 31:0) = must-be-1 mask; allowed1 (bits 63:32) =
+     * may-be-1 mask. */
+    uint64_t cap;
+    uint32_t result;
+
+    /* Bit 0 must be 1 (allowed0 bit 0 set), bit 1 must be 0 (allowed1
+     * bit 1 clear) regardless of what's "desired". */
+    cap = ((uint64_t)0xFFFFFFFDu << 32) | 0x00000001u;
+    result = hype_vmx_adjust_controls(0, cap);
+    CHECK_HEX("bit forced to 1 by allowed0 even when not desired", 1u, result & 1u);
+    CHECK_HEX("bit forced to 0 by allowed1 even if desired", 0u, hype_vmx_adjust_controls(0xFFFFFFFFu, cap) & 2u);
+
+    /* A bit that's optional (allowed0 clear, allowed1 set) follows the
+     * caller's desired value. */
+    cap = ((uint64_t)0x00000004u << 32) | 0x00000000u;
+    CHECK_HEX("optional bit set when desired", 4u, hype_vmx_adjust_controls(0x4u, cap) & 4u);
+    CHECK_HEX("optional bit clear when not desired", 0u, hype_vmx_adjust_controls(0x0u, cap) & 4u);
+}
+
 int main(void) {
     test_feature_control_allows_vmxon();
     test_feature_control_with_vmxon_enabled();
     test_cr4_with_vmxe();
+    test_adjust_controls();
 
     if (failures == 0) {
         printf("all tests passed\n");

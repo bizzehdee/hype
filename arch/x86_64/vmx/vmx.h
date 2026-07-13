@@ -43,6 +43,21 @@ uint64_t hype_vmx_feature_control_with_vmxon_enabled(uint64_t feature_control);
 uint64_t hype_vmx_cr4_with_vmxe(uint64_t old_cr4);
 
 /*
+ * Adjusts a desired 32-bit VM-execution/entry/exit control value
+ * against one of the VMX capability MSRs (IA32_VMX_(TRUE_)PINBASED_CTLS/
+ * PROCBASED_CTLS/PROCBASED_CTLS2/EXIT_CTLS/ENTRY_CTLS): bits 31:0 of the
+ * MSR are the "allowed-0" settings (a bit set there means that control
+ * bit is *not* allowed to be 0, i.e. must be 1); bits 63:32 are the
+ * "allowed-1" settings (a bit *clear* there means that control bit is
+ * not allowed to be 1, i.e. must be 0). The standard algorithm (Intel
+ * SDM Vol 3C, Appendix A.3.1 and everywhere else a capability MSR is
+ * consulted): OR in whatever must be 1, then AND against whatever may
+ * be 1. Pure bit-manipulation, no CPU state touched -- the actual RDMSR
+ * is the caller's job (vmcs_hw.c).
+ */
+uint32_t hype_vmx_adjust_controls(uint32_t desired, uint64_t capability_msr);
+
+/*
  * Enables VMX on the calling physical CPU: unlocks/enables
  * IA32_FEATURE_CONTROL if needed, sets CR4.VMXE, writes the VMCS
  * revision ID into a VMXON region, and executes VMXON. Returns 0 on
