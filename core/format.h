@@ -5,8 +5,10 @@
 
 /*
  * Freestanding, no-libc printf-equivalent core (SETUP-6). Supports
- * %s %c %d %u %x %p %%. No field widths/precision/flags -- add them
- * only when a real caller needs them.
+ * %s %c %d %u %x %p %% and the 64-bit variants %lld %llu %llx (no bare
+ * %d/%u/%x is ever 64-bit -- always go through the ll length modifier
+ * for addresses/page counts/anything else genuinely 64-bit). No field
+ * widths/precision/flags -- add them only when a real caller needs them.
  *
  * Sizes are `unsigned long long`, not `unsigned long`: the UEFI target
  * (x86_64-unknown-uefi, PE/COFF, MS x64 ABI) is LLP64 -- `long` is only

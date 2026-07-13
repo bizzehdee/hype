@@ -40,9 +40,9 @@ Checkbox = done. `Deps: —` = no prerequisites.
 - [x] **M0-2** — Minimal UEFI app: print "hype" via `ConOut`, return
   `EFI_SUCCESS` cleanly.
   Deps: M0-1, SETUP-6
-- [ ] **M0-3** — Dump the UEFI memory map.
+- [x] **M0-3** — Dump the UEFI memory map.
   Deps: M0-2
-- [ ] **M0-4** — Validate build/boot/deploy loop in QEMU+OVMF.
+- [x] **M0-4** — Validate build/boot/deploy loop in QEMU+OVMF.
   Deps: M0-3, SETUP-2
 - [ ] **M0-5** — Validate build/boot/deploy loop on real Intel + AMD
   hardware.

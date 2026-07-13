@@ -68,6 +68,21 @@ int main(void) {
     fmt(buf, sizeof(buf), "%p", (void *)0x1234ULL);
     CHECK_STR("%p", "0x1234", buf);
 
+    fmt(buf, sizeof(buf), "%llu", 18446744073709551615ULL);
+    CHECK_STR("%llu max", "18446744073709551615", buf);
+
+    fmt(buf, sizeof(buf), "%llx", 0xdeadbeef12345678ULL);
+    CHECK_STR("%llx", "deadbeef12345678", buf);
+
+    fmt(buf, sizeof(buf), "%lld", -123456789012345LL);
+    CHECK_STR("%lld negative", "-123456789012345", buf);
+
+    fmt(buf, sizeof(buf), "%l!");
+    CHECK_STR("bare %l passthrough", "%l!", buf);
+
+    fmt(buf, sizeof(buf), "%llz");
+    CHECK_STR("%ll with unknown specifier passthrough", "%llz", buf);
+
     fmt(buf, sizeof(buf), "%z");
     CHECK_STR("unknown specifier passthrough", "%z", buf);
 

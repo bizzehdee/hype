@@ -33,6 +33,40 @@ typedef void *EFI_EVENT;
 #define EFIAPI __attribute__((ms_abi))
 
 #define EFI_SUCCESS ((EFI_STATUS)0)
+#define EFI_ERR_BIT 0x8000000000000000ULL
+#define EFI_BUFFER_TOO_SMALL ((EFI_STATUS)(EFI_ERR_BIT | 5))
+
+typedef UINT64 EFI_PHYSICAL_ADDRESS;
+typedef UINT64 EFI_VIRTUAL_ADDRESS;
+
+/* Values match the UEFI spec's EFI_MEMORY_TYPE enum exactly. */
+enum {
+    EfiReservedMemoryType,
+    EfiLoaderCode,
+    EfiLoaderData,
+    EfiBootServicesCode,
+    EfiBootServicesData,
+    EfiRuntimeServicesCode,
+    EfiRuntimeServicesData,
+    EfiConventionalMemory,
+    EfiUnusableMemory,
+    EfiACPIReclaimMemory,
+    EfiACPIMemoryNVS,
+    EfiMemoryMappedIO,
+    EfiMemoryMappedIOPortSpace,
+    EfiPalCode,
+    EfiPersistentMemory,
+    EfiUnacceptedMemoryType,
+    EfiMaxMemoryType
+};
+
+typedef struct {
+    UINT32 Type;
+    EFI_PHYSICAL_ADDRESS PhysicalStart;
+    EFI_VIRTUAL_ADDRESS VirtualStart;
+    UINT64 NumberOfPages;
+    UINT64 Attribute;
+} EFI_MEMORY_DESCRIPTOR;
 
 typedef struct {
     UINT64 Signature;
@@ -65,6 +99,79 @@ struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
     void *Mode;
 };
 
+typedef EFI_STATUS (EFIAPI *EFI_GET_MEMORY_MAP)(
+    UINTN *MemoryMapSize,
+    EFI_MEMORY_DESCRIPTOR *MemoryMap,
+    UINTN *MapKey,
+    UINTN *DescriptorSize,
+    UINT32 *DescriptorVersion);
+
+typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_POOL)(
+    UINT32 PoolType,
+    UINTN Size,
+    void **Buffer);
+
+typedef EFI_STATUS (EFIAPI *EFI_FREE_POOL)(void *Buffer);
+
+typedef EFI_STATUS (EFIAPI *EFI_EXIT_BOOT_SERVICES)(
+    EFI_HANDLE ImageHandle,
+    UINTN MapKey);
+
+/*
+ * Full 44-function-pointer layout per the UEFI spec's
+ * EFI_BOOT_SERVICES_REVISION table, so that fields past DescriptorVersion
+ * (needed later, e.g. ExitBootServices for M1-4) land at correct offsets.
+ * Only the handful this code actually calls are given real signatures;
+ * the rest are void* placeholders -- same rule as the rest of this file.
+ */
+typedef struct {
+    EFI_TABLE_HEADER Hdr;
+    void *RaiseTPL;
+    void *RestoreTPL;
+    void *AllocatePages;
+    void *FreePages;
+    EFI_GET_MEMORY_MAP GetMemoryMap;
+    EFI_ALLOCATE_POOL AllocatePool;
+    EFI_FREE_POOL FreePool;
+    void *CreateEvent;
+    void *SetTimer;
+    void *WaitForEvent;
+    void *SignalEvent;
+    void *CloseEvent;
+    void *CheckEvent;
+    void *InstallProtocolInterface;
+    void *ReinstallProtocolInterface;
+    void *UninstallProtocolInterface;
+    void *HandleProtocol;
+    void *Reserved;
+    void *RegisterProtocolNotify;
+    void *LocateHandle;
+    void *LocateDevicePath;
+    void *InstallConfigurationTable;
+    void *LoadImage;
+    void *StartImage;
+    void *Exit;
+    void *UnloadImage;
+    EFI_EXIT_BOOT_SERVICES ExitBootServices;
+    void *GetNextMonotonicCount;
+    void *Stall;
+    void *SetWatchdogTimer;
+    void *ConnectController;
+    void *DisconnectController;
+    void *OpenProtocol;
+    void *CloseProtocol;
+    void *OpenProtocolInformation;
+    void *ProtocolsPerHandle;
+    void *LocateHandleBuffer;
+    void *LocateProtocol;
+    void *InstallMultipleProtocolInterfaces;
+    void *UninstallMultipleProtocolInterfaces;
+    void *CalculateCrc32;
+    void *CopyMem;
+    void *SetMem;
+    void *CreateEventEx;
+} EFI_BOOT_SERVICES;
+
 typedef struct {
     EFI_TABLE_HEADER Hdr;
     CHAR16 *FirmwareVendor;
@@ -76,7 +183,7 @@ typedef struct {
     EFI_HANDLE StandardErrorHandle;
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *StdErr;
     void *RuntimeServices;
-    void *BootServices;
+    EFI_BOOT_SERVICES *BootServices;
     UINTN NumberOfTableEntries;
     void *ConfigurationTable;
 } EFI_SYSTEM_TABLE;

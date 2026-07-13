@@ -88,6 +88,41 @@ int hype_vsnprintf(char *buf, unsigned long long bufsz, const char *fmt, va_list
             put_uint(buf, bufsz, &written, (unsigned long long)p, 16);
             break;
         }
+        case 'l': {
+            /* %ll[uxd] -- 64-bit variants; a hypervisor deals in 64-bit
+             * addresses/counts (EPT entries, LBAs, page counts, ...)
+             * constantly, so this earns its keep over just %p everywhere. */
+            if (fmt[1] != 'l') {
+                put_char(buf, bufsz, &written, '%');
+                put_char(buf, bufsz, &written, 'l');
+                break;
+            }
+            fmt++;
+            switch (fmt[1]) {
+            case 'u': {
+                unsigned long long v = va_arg(ap, unsigned long long);
+                put_uint(buf, bufsz, &written, v, 10);
+                fmt++;
+                break;
+            }
+            case 'x': {
+                unsigned long long v = va_arg(ap, unsigned long long);
+                put_uint(buf, bufsz, &written, v, 16);
+                fmt++;
+                break;
+            }
+            case 'd': {
+                long long v = va_arg(ap, long long);
+                put_int(buf, bufsz, &written, v);
+                fmt++;
+                break;
+            }
+            default:
+                put_str(buf, bufsz, &written, "%ll");
+                break;
+            }
+            break;
+        }
         case '%':
             put_char(buf, bufsz, &written, '%');
             break;
