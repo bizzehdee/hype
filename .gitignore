@@ -1,0 +1,41 @@
+# hype.efi build output (clang/lld -> x86_64-unknown-uefi)
+*.o
+*.obj
+*.efi
+*.lib
+*.map
+*.dll
+*.pdb
+build/
+out/
+
+# EDK2 guest firmware pipeline (separate build, plan.md §8)
+edk2/Build/
+edk2/Conf/
+*.fd
+*.rom
+
+# Disk images / test artifacts
+*.img
+*.qcow2
+*.vhd
+*.iso
+
+# QEMU / debugging
+*.pid
+gdb.log
+
+# Host-native unit test coverage runs (core/tests/run.sh), per-module
+# binaries built without an extension (test_<module> -> from test_<module>.c)
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+core/tests/test_*
+!core/tests/test_*.c
+
+# Editor/OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store

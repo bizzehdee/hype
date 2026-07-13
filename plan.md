@@ -814,25 +814,25 @@ isn't lost.
 Concrete, actionable items to close out before M0 work starts, beyond what
 §9's milestone list already covers:
 
-- [ ] `git init` the repository; add a `LICENSE` file with the full GPLv3
+- [x] `git init` the repository; add a `LICENSE` file with the full GPLv3
   text (not just the mention at the top of this plan) and a `.gitignore`
   for build artifacts (`*.efi`, `*.o`, EDK2 build output directories, etc.).
-- [ ] Install and pin versions for: the C cross-toolchain targeting
+- [x] Install and pin versions for: the C cross-toolchain targeting
   `x86_64-unknown-uefi` (clang/lld or GNU-EFI, per §8), QEMU, and an OVMF
   firmware image build — record exact versions used so "works on my
   machine" doesn't creep in later.
-- [ ] Confirm Secure Boot can actually be disabled on both the Intel and
+- [x] Confirm Secure Boot can actually be disabled on both the Intel and
   AMD test machines (§10 decision #18) — needed for §10 decision #5 to hold
   in practice, not just in the plan.
-- [ ] Confirm both test machines expose a way to get boot-time output before
+- [x] Confirm both test machines expose a way to get boot-time output before
   trusting GOP/framebuffer text rendering — a physical serial port (or
   equivalent) as the fallback debug channel if `hype.efi` fails before GOP
   init succeeds.
-- [ ] Settle the debugging workflow: QEMU `-s -S` + GDB attached to a debug
+- [x] Settle the debugging workflow: QEMU `-s -S` + GDB attached to a debug
   build of `hype.efi` with symbols loaded, as the primary loop; serial
   logging as the channel that also works on real hardware where GDB-over-JTAG
   isn't assumed to be available.
-- [ ] Write the minimal freestanding primitives M0 will immediately depend
+- [x] Write the minimal freestanding primitives M0 will immediately depend
   on: a tiny `printf`-equivalent over UEFI `ConOut` (text-mode, pre-GOP) for
   M0's own output, and a panic/assert stub that halts cleanly with a message
   — small enough to write once, needed by literally every milestone after.

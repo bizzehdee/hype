@@ -11,22 +11,22 @@ Checkbox = done. `Deps: —` = no prerequisites.
 
 ## SETUP — Pre-M0 readiness (plan.md §11)
 
-- [ ] **SETUP-1** — `git init`; add `LICENSE` (full GPLv3 text) and
+- [x] **SETUP-1** — `git init`; add `LICENSE` (full GPLv3 text) and
   `.gitignore` for build artifacts.
   Deps: —
-- [ ] **SETUP-2** — Install and pin versions: C cross-toolchain targeting
+- [x] **SETUP-2** — Install and pin versions: C cross-toolchain targeting
   `x86_64-unknown-uefi` (clang/lld or GNU-EFI), QEMU, OVMF firmware image.
   Deps: —
-- [ ] **SETUP-3** — Confirm Secure Boot can be disabled on both the Intel
+- [x] **SETUP-3** — Confirm Secure Boot can be disabled on both the Intel
   and AMD test machines.
   Deps: —
-- [ ] **SETUP-4** — Confirm both test machines expose a serial (or
+- [x] **SETUP-4** — Confirm both test machines expose a serial (or
   equivalent) fallback debug channel available before GOP init succeeds.
   Deps: —
-- [ ] **SETUP-5** — Settle debugging workflow: QEMU `-s -S` + GDB against a
+- [x] **SETUP-5** — Settle debugging workflow: QEMU `-s -S` + GDB against a
   debug build with symbols, plus serial logging as the real-hardware path.
   Deps: SETUP-2
-- [ ] **SETUP-6** — Write minimal freestanding primitives: `printf`-equivalent
+- [x] **SETUP-6** — Write minimal freestanding primitives: `printf`-equivalent
   over UEFI `ConOut`, and a panic/assert stub.
   Deps: SETUP-2
 
