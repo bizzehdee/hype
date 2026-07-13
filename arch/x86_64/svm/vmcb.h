@@ -128,6 +128,28 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 /* Intercept bits this project actually sets (Table B-1). */
 #define HYPE_SVM_INTERCEPT_HLT (1u << 24)
 #define HYPE_SVM_INTERCEPT_SHUTDOWN (1u << 31)
+/* intercept_misc2 bit 0: intercept the guest ever executing VMRUN
+ * itself. Required for two independent reasons: (1) under nested SVM
+ * (this project's own dev/QEMU environment, and any real deployment
+ * that itself runs virtualized), the L0 hypervisor's nested-SVM
+ * emulation treats an L1 VMCB that doesn't intercept VMRUN as invalid
+ * -- VMRUN fails outright with EXITCODE = HYPE_SVM_EXITCODE_INVALID,
+ * confirmed the hard way, empirically, before this bit existed; (2)
+ * even on bare-metal, a guest must never be able to execute a
+ * privileged virtualization instruction itself -- this project's own
+ * guest-isolation hard invariant (AGENTS.md) -- so this needs to be
+ * set regardless of the nested-specific requirement above. */
+#define HYPE_SVM_INTERCEPT_VMRUN (1u << 0)
+
+/* save.efer bit 12: VMRUN requires this bit set in the *guest's* saved
+ * EFER or it refuses the VMCB outright (EXITCODE =
+ * HYPE_SVM_EXITCODE_INVALID, no VM-entry at all) -- a state-consistency
+ * check independent of whether the guest itself ever uses SVM. Same
+ * bit position/value as svm.h's HYPE_EFER_SVME (the *host's* EFER,
+ * set by hype_svm_enable()); duplicated here rather than included
+ * from svm.h to avoid vmcb.h depending on the header that already
+ * includes it. */
+#define HYPE_SVM_SAVE_EFER_SVME (1ULL << 12)
 
 /*
  * AVIC (M2-4). int_ctl (the `vintr` field, offset 0x060) bit 31 =
@@ -170,15 +192,39 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 uint16_t hype_vmcb_seg_attrib(uint8_t access, uint8_t flags);
 
 /*
- * Fills `vmcb` (zeroed first) for a minimal real-mode guest: CS:IP =
- * entry_seg:0 (so the guest starts executing at physical address
- * entry_seg*16), RSP = stack_phys, paging/protection off (CR0=ET-only,
- * matching real mode), HLT and shutdown intercepted, ASID=1, no nested
- * paging (M3's job). Pure struct-filling -- no CPU state touched, no
- * UEFI dependency; the actual VMRUN happens in vmrun.c/svm_vcpu.c
- * (later commits).
+ * Fills `vmcb` (zeroed first) for a minimal real-address-mode guest:
+ * CR0=ET-only (paging/protection off, matching real mode), RIP=0 and
+ * CS.base = entry_phys (so the guest starts executing at physical
+ * address entry_phys directly), RSP=0 and SS.base = stack_phys
+ * (same reasoning) -- NOT the classic entry_seg*16 convention (16-bit
+ * segment selectors can only reach the first ~1MB+64K, but a
+ * UEFI-loaded hypervisor's own static buffers can end up anywhere in
+ * memory, wherever firmware's PE loader put them). This works because
+ * a VMCB segment's base is a value the hypervisor sets directly, never
+ * derived from the selector by hardware the way a real segment load
+ * would -- so entry_phys/stack_phys can be any address, decoupled
+ * from the selector entirely (left 0, meaningless here). CS/SS both
+ * keep a real 64KB limit (0xFFFF) and RIP/RSP both stay 0 (this
+ * guest's only instruction, a single HLT, never advances or touches
+ * the stack), so nothing ever needs to exceed that limit despite
+ * base potentially being a large address.
+ * HLT and shutdown intercepted, ASID=1, no nested paging (M3's job).
+ * iopm_phys/msrpm_phys must point at zeroed, page-aligned buffers of
+ * at least 12KB/8KB respectively (the caller owns their allocation) --
+ * VMRUN always consults the I/O and MSR permission bitmaps to decide
+ * intercepts, for every guest, whether or not it ever executes I/O or
+ * RDMSR/WRMSR/etc; leaving these fields at 0 (pointing nowhere valid)
+ * is itself a state-consistency violation that makes VMRUN reject the
+ * whole VMCB (EXITCODE = HYPE_SVM_EXITCODE_INVALID, no VM-entry at
+ * all) -- confirmed the hard way, via QEMU/KVM, before this parameter
+ * existed. All-zero bitmap contents mean "intercept nothing," correct
+ * for this guest (its only I/O-adjacent behavior, HLT, is intercepted
+ * separately above).
+ * Pure struct-filling -- no CPU state touched, no UEFI dependency; the
+ * actual VMRUN happens in svm_vcpu.c.
  */
-void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint16_t entry_seg, uint64_t stack_phys);
+void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint64_t stack_phys,
+                                     uint64_t iopm_phys, uint64_t msrpm_phys);
 
 /*
  * Enables AVIC on an already-built VMCB (see the requirement note

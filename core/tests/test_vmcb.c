@@ -68,22 +68,33 @@ static void test_seg_attrib(void) {
 static void test_build_realmode_guest(void) {
     hype_vmcb_t vmcb;
 
-    hype_vmcb_build_realmode_guest(&vmcb, 0x1000, 0x9000);
+    /* entry_phys/stack_phys deliberately far above the classic 1MB
+     * real-mode reach, e.g. wherever a UEFI PE loader actually placed
+     * our own static buffers. */
+    hype_vmcb_build_realmode_guest(&vmcb, 0x1e1e6000ULL, 0x1e200000ULL, 0x200000ULL, 0x300000ULL);
 
     CHECK_HEX("HLT is intercepted", HYPE_SVM_INTERCEPT_HLT,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_HLT);
     CHECK_HEX("shutdown is intercepted", HYPE_SVM_INTERCEPT_SHUTDOWN,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_SHUTDOWN);
+    CHECK_HEX("VMRUN is intercepted", HYPE_SVM_INTERCEPT_VMRUN,
+              vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_VMRUN);
     CHECK_HEX("ASID is nonzero", 1, vmcb.control.guest_asid_tlb_ctl);
     CHECK_HEX("nested paging disabled", 0, vmcb.control.np_enable);
 
-    CHECK_HEX("CS selector matches entry_seg", 0x1000, vmcb.save.cs.selector);
-    CHECK_HEX("CS base is entry_seg*16", 0x10000, vmcb.save.cs.base);
-    CHECK_HEX("CS limit is 64K", 0xFFFF, vmcb.save.cs.limit);
+    CHECK_HEX("CS base is entry_phys directly", 0x1e1e6000ULL, vmcb.save.cs.base);
+    CHECK_HEX("CS limit is a real 64KB", 0xFFFFu, vmcb.save.cs.limit);
+    CHECK_HEX("DS base is 0", 0, vmcb.save.ds.base);
+    CHECK_HEX("DS limit is a real 64KB", 0xFFFFu, vmcb.save.ds.limit);
+    CHECK_HEX("SS base is stack_phys directly", 0x1e200000ULL, vmcb.save.ss.base);
+    CHECK_HEX("SS limit is a real 64KB", 0xFFFFu, vmcb.save.ss.limit);
     CHECK_HEX("RIP is 0 (entry point is CS.base)", 0, vmcb.save.rip);
-    CHECK_HEX("RSP is the given stack address", 0x9000, vmcb.save.rsp);
+    CHECK_HEX("RSP is 0 (stack pointer is SS.base)", 0, vmcb.save.rsp);
     CHECK_HEX("CR0 is ET-only (paging/protection off)", 0x10, vmcb.save.cr0);
-    CHECK_HEX("EFER is 0 (not in long mode)", 0, vmcb.save.efer);
+    CHECK_HEX("EFER has only SVME set (required by VMRUN, guest not in long mode)",
+              HYPE_SVM_SAVE_EFER_SVME, vmcb.save.efer);
+    CHECK_HEX("IOPM base wired through", 0x200000ULL, vmcb.control.iopm_base_pa);
+    CHECK_HEX("MSRPM base wired through", 0x300000ULL, vmcb.control.msrpm_base_pa);
 }
 
 static void test_build_realmode_guest_zeroes_first(void) {
@@ -95,7 +106,7 @@ static void test_build_realmode_guest_zeroes_first(void) {
         bytes[i] = 0xAA;
     }
 
-    hype_vmcb_build_realmode_guest(&vmcb, 0, 0);
+    hype_vmcb_build_realmode_guest(&vmcb, 0, 0, 0, 0);
 
     /* A field this function never explicitly sets (host usage region)
      * should end up zeroed by the initial clear, not left as the
@@ -108,7 +119,7 @@ static void test_build_realmode_guest_zeroes_first(void) {
 static void test_configure_avic(void) {
     hype_vmcb_t vmcb;
 
-    hype_vmcb_build_realmode_guest(&vmcb, 0, 0);
+    hype_vmcb_build_realmode_guest(&vmcb, 0, 0, 0, 0);
     /* Some other int_ctl bit already set (e.g. V_IGN_TPR, bit 20) --
      * confirms configure_avic ORs its bit in rather than clobbering
      * whatever else int_ctl already held. */
@@ -129,7 +140,7 @@ static void test_configure_avic(void) {
 static void test_configure_avic_masks_low_bits_and_sets_max_index(void) {
     hype_vmcb_t vmcb;
 
-    hype_vmcb_build_realmode_guest(&vmcb, 0, 0);
+    hype_vmcb_build_realmode_guest(&vmcb, 0, 0, 0, 0);
     /* A non-page-aligned address (low 12 bits set) must be masked off,
      * and max_physical_id packed into avic_physical_table_ptr's low
      * byte alongside the (masked) address. */

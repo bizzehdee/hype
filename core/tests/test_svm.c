@@ -31,7 +31,7 @@ static void test_efer_with_svme_idempotent(void) {
 static void test_vcpu_enable_apic_accel(void) {
     hype_vmcb_t vmcb;
 
-    hype_vmcb_build_realmode_guest(&vmcb, 0, 0);
+    hype_vmcb_build_realmode_guest(&vmcb, 0, 0, 0, 0);
     hype_svm_vcpu_enable_apic_accel(&vmcb);
 
     CHECK_HEX("AVIC enable bit set", HYPE_SVM_INT_CTL_AVIC_ENABLE,

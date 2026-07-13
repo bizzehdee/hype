@@ -6,6 +6,7 @@
 #include "../core/halt.h"
 #include "../core/memmap.h"
 #include "../core/serial.h"
+#include "../core/guest_ram.h"
 #include "../arch/x86_64/cpu/cpu_features.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -15,6 +16,7 @@
 #include "../arch/x86_64/cpu/pic.h"
 #include "../arch/x86_64/cpu/pit.h"
 #include "../arch/x86_64/cpu/timer.h"
+#include "../arch/x86_64/cpu/vmexit.h"
 #include "../arch/x86_64/cpu/vmm_select.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
@@ -25,6 +27,14 @@ static hype_pte_t g_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4
 static hype_pte_t g_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_pd[HYPE_PAGING_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_gop_console_t g_gop_console;
+
+/* M2-7: the hand-written test guest's code+stack pages -- wherever
+ * the linker/loader actually placed them; hype_svm_vcpu_create()
+ * points the guest's CS.base directly at their address (see vmcb.h's
+ * "big real mode" comment), so no particular alignment or address
+ * range is required. */
+static uint8_t g_m2_7_guest_code[4096] __attribute__((aligned(4096)));
+static uint8_t g_m2_7_guest_stack[4096] __attribute__((aligned(4096)));
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
@@ -180,6 +190,47 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_fatal("vmm: %s enable failed", ops->name);
         }
         hype_serial_print("vmm: %s enabled\n", ops->name);
+
+        /*
+         * M2-7: launch a hand-written guest whose entire body is a
+         * single HLT, and confirm the VM-exit round trip. VMX's
+         * vcpu_create/vcpu_run stay NULL past this milestone (see
+         * vmx_ops.c) -- only SVM actually launches here; VMX's
+         * equivalent is deferred to M2-8's real Intel hardware pass.
+         */
+        if (ops->vcpu_create == 0 || ops->vcpu_run == 0) {
+            hype_serial_print("vmm: %s vCPU launch not implemented yet -- M2-7 test guest skipped\n",
+                               ops->name);
+        } else {
+            /* M2-6 hard invariant: zero every byte of a guest's
+             * reserved RAM before its first VM-entry, on every
+             * (re)start -- not just the bytes we're about to write
+             * ourselves. */
+            hype_guest_ram_zero(g_m2_7_guest_code, sizeof(g_m2_7_guest_code));
+            hype_guest_ram_zero(g_m2_7_guest_stack, sizeof(g_m2_7_guest_stack));
+            g_m2_7_guest_code[0] = 0xF4; /* HLT */
+
+            uint64_t entry_phys = (uint64_t)(uintptr_t)g_m2_7_guest_code;
+            uint64_t stack_phys = (uint64_t)(uintptr_t)(g_m2_7_guest_stack + sizeof(g_m2_7_guest_stack));
+            hype_serial_print("vmm: %s M2-7 test guest: entry_phys=0x%llx stack_phys=0x%llx\n",
+                               ops->name, (unsigned long long)entry_phys, (unsigned long long)stack_phys);
+
+            hype_vcpu_ctx_t *ctx = ops->vcpu_create(entry_phys, stack_phys, 0);
+            if (ctx == 0) {
+                hype_fatal("vmm: %s vcpu_create failed", ops->name);
+            }
+
+            hype_vmexit_info_t info;
+            int rc = hype_vmexit_dispatch_loop(ops, ctx, kind, &info);
+            if (rc != 0) {
+                hype_fatal("vmm: %s M2-7 test guest did not exit cleanly (reason=0x%llx qual=0x%llx)",
+                           ops->name, (unsigned long long)info.reason,
+                           (unsigned long long)info.qualification);
+            }
+            hype_serial_print("vmm: %s M2-7 test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx)\n",
+                               ops->name, (unsigned long long)info.reason,
+                               (unsigned long long)info.guest_rip);
+        }
     }
 
     hype_halt_forever();

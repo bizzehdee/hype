@@ -131,7 +131,7 @@ multi-VM concurrency milestone, even though early single-guest milestones
 - [x] **M2-6** — Guest RAM zeroing before first VM-entry, on every
   (re)start (§10 decision #15).
   Deps: M2-3
-- [ ] **M2-7** — Launch a hand-written `hlt`-loop guest; confirm VM-exit
+- [x] **M2-7** — Launch a hand-written `hlt`-loop guest; confirm VM-exit
   round trip.
   Deps: M2-4, M2-5, M2-6
 - [ ] **M2-8** — Real-hardware validation (Intel + AMD).
