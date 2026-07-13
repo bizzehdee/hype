@@ -34,7 +34,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
 
 ## M0 — UEFI hello world (plan.md §9 M0, §12)
 
-- [ ] **M0-1** — Scaffold repo layout per plan.md §7 (`/boot`, `/core`,
+- [x] **M0-1** — Scaffold repo layout per plan.md §7 (`/boot`, `/core`,
   `/arch`, `/devices`, `/storage`, `/net`, `/fw`, `/tools`, `/docs`).
   Deps: SETUP-1
 - [ ] **M0-2** — Minimal UEFI app: print "hype" via `ConOut`, return
