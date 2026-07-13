@@ -75,7 +75,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
   — reused later by the dashboard (§6b) and guest firmware GOP exposure
   (§6/§6c).
   Deps: M1-4
-- [ ] **M1-7** — Panic handler: halt cleanly with a message, via M1-5/M1-6.
+- [x] **M1-7** — Panic handler: halt cleanly with a message, via M1-5/M1-6.
   Deps: M1-5, M1-6
 - [ ] **M1-8** — Timer tick (PIT/HPET bring-up for the host itself).
   Deps: M1-4

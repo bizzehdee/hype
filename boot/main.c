@@ -1,11 +1,10 @@
 #include "../core/efi_types.h"
 #include "../core/console.h"
-#include "../core/format.h"
+#include "../core/fatal.h"
 #include "../core/gop.h"
 #include "../core/gop_text.h"
 #include "../core/halt.h"
 #include "../core/memmap.h"
-#include "../core/panic.h"
 #include "../core/serial.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -35,9 +34,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     status = hype_memmap_get(SystemTable->BootServices, &map, &map_size, &desc_size, &map_key);
     if (status != EFI_SUCCESS) {
-        char msg[64];
-        hype_snprintf(msg, sizeof(msg), "failed to get memory map: 0x%llx", (unsigned long long)status);
-        hype_panic(SystemTable, msg);
+        hype_fatal("failed to get memory map: 0x%llx", (unsigned long long)status);
     }
 
     hype_memmap_dump(SystemTable, map, map_size, desc_size);
@@ -55,9 +52,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     status = hype_exit_boot_services(ImageHandle, SystemTable->BootServices);
     if (status != EFI_SUCCESS) {
-        char msg[64];
-        hype_snprintf(msg, sizeof(msg), "ExitBootServices failed: 0x%llx", (unsigned long long)status);
-        hype_panic(SystemTable, msg);
+        hype_fatal("ExitBootServices failed: 0x%llx", (unsigned long long)status);
     }
 
     /*
@@ -123,6 +118,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                gop->Mode->Info->VerticalResolution,
                                gop->Mode->Info->PixelsPerScanLine,
                                0xFFFFFFu, 0x000000u);
+        /* From here on, any fatal fault (arch/x86_64/cpu/isr_entry.c)
+         * prints to this console too, not just serial. */
+        hype_fatal_set_gop(&g_gop_console);
         hype_gop_print(&g_gop_console, "hype: Boot Services exited, hypervisor now running\n");
     }
 
