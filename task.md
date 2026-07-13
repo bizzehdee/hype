@@ -37,7 +37,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
 - [x] **M0-1** — Scaffold repo layout per plan.md §7 (`/boot`, `/core`,
   `/arch`, `/devices`, `/storage`, `/net`, `/fw`, `/tools`, `/docs`).
   Deps: SETUP-1
-- [ ] **M0-2** — Minimal UEFI app: print "hype" via `ConOut`, return
+- [x] **M0-2** — Minimal UEFI app: print "hype" via `ConOut`, return
   `EFI_SUCCESS` cleanly.
   Deps: M0-1, SETUP-6
 - [ ] **M0-3** — Dump the UEFI memory map.
