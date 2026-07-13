@@ -68,3 +68,14 @@ void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint16_t entry_seg, uint6
     vmcb->save.rsp = stack_phys;
     vmcb->save.rax = 0;
 }
+
+void hype_vmcb_configure_avic(hype_vmcb_t *vmcb, uint64_t apic_bar_phys,
+                               uint64_t backing_page_phys, uint64_t logical_table_phys,
+                               uint64_t physical_table_phys, uint8_t max_physical_id) {
+    vmcb->control.vintr |= HYPE_SVM_INT_CTL_AVIC_ENABLE;
+    vmcb->control.avic_apic_bar = apic_bar_phys & HYPE_SVM_AVIC_ADDR_MASK;
+    vmcb->control.avic_backing_page_ptr = backing_page_phys & HYPE_SVM_AVIC_ADDR_MASK;
+    vmcb->control.avic_logical_table_ptr = logical_table_phys & HYPE_SVM_AVIC_ADDR_MASK;
+    vmcb->control.avic_physical_table_ptr =
+        (physical_table_phys & HYPE_SVM_AVIC_ADDR_MASK) | max_physical_id;
+}

@@ -129,6 +129,31 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 #define HYPE_SVM_INTERCEPT_HLT (1u << 24)
 #define HYPE_SVM_INTERCEPT_SHUTDOWN (1u << 31)
 
+/*
+ * AVIC (M2-4). int_ctl (the `vintr` field, offset 0x060) bit 31 =
+ * AVIC Enable -- corroborated by every real-world SVM implementation
+ * (e.g. Linux KVM's AVIC_ENABLE_MASK) rather than re-verified against
+ * the AMD SDM PDF specifically for this task.
+ *
+ * AVIC requires nested paging (NP_ENABLE=1, M3-1) to actually
+ * intercept and redirect guest local-APIC MMIO accesses to the
+ * backing page -- real-world hypervisors only ever set AVIC_ENABLE
+ * alongside NP_ENABLE=1, and this project follows that same rule:
+ * hype_vmcb_configure_avic() is meant to be called on a VMCB that
+ * also has NP_ENABLE=1. It is deliberately NOT called from
+ * hype_vmcb_build_realmode_guest() (M2-3), whose flat unpaged M2-7
+ * test guest has NP_ENABLE=0 -- enabling AVIC there would very likely
+ * make VMRUN reject the VMCB as invalid on real hardware. Wiring this
+ * in for real is M3+'s job, once nested paging exists.
+ */
+#define HYPE_SVM_INT_CTL_AVIC_ENABLE (1ULL << 31)
+
+/* avic_apic_bar/avic_backing_page_ptr/avic_logical_table_ptr/
+ * avic_physical_table_ptr all hold a page-aligned physical address in
+ * bits 51:12; avic_physical_table_ptr additionally packs the highest
+ * physical APIC ID covered by the table into bits 7:0. */
+#define HYPE_SVM_AVIC_ADDR_MASK 0x000FFFFFFFFFF000ULL
+
 /* SVM #VMEXIT codes this project checks for (AMD SDM Appendix C). */
 #define HYPE_SVM_EXITCODE_HLT 0x78ULL
 #define HYPE_SVM_EXITCODE_SHUTDOWN 0x7FULL
@@ -154,5 +179,21 @@ uint16_t hype_vmcb_seg_attrib(uint8_t access, uint8_t flags);
  * (later commits).
  */
 void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint16_t entry_seg, uint64_t stack_phys);
+
+/*
+ * Enables AVIC on an already-built VMCB (see the requirement note
+ * above hype_vmcb_configure_avic()'s bit definitions -- `vmcb` must
+ * also have NP_ENABLE=1): sets int_ctl's AVIC-enable bit and wires in
+ * the guest-visible APIC_BAR physical address plus this vCPU's
+ * backing-page and this VM's logical/physical ID table physical
+ * addresses (each must already be page-aligned; the caller owns
+ * their allocation and lifetime). max_physical_id is the highest
+ * physical APIC ID this VM's physical ID table covers (0 for a
+ * single-vCPU VM, matching M2's scope). Pure struct mutation --
+ * preserves every other int_ctl bit already set.
+ */
+void hype_vmcb_configure_avic(hype_vmcb_t *vmcb, uint64_t apic_bar_phys,
+                               uint64_t backing_page_phys, uint64_t logical_table_phys,
+                               uint64_t physical_table_phys, uint8_t max_physical_id);
 
 #endif /* HYPE_ARCH_SVM_VMCB_H */

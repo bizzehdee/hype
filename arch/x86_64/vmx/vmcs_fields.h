@@ -34,8 +34,27 @@
 
 /* Primary processor-based VM-execution control bits used here. */
 #define HYPE_VMX_PROCBASED_ACTIVATE_SECONDARY_CONTROLS (1u << 31)
+/*
+ * TPR shadow (M2-4): lets the guest read/write CR8/TPR against a
+ * virtual-APIC page instead of trapping, without needing EPT (unlike
+ * "virtualize APIC accesses" below, this doesn't require EPT-mapped
+ * memory -- the virtual-APIC page is referenced by a plain physical
+ * address, same as the MSR/I/O bitmaps). This encoding and the
+ * secondary-control bits below are from strong, well-corroborated
+ * recall (they match every open-source VMX implementation, e.g.
+ * Linux's arch/x86/include/asm/vmx.h) rather than re-verified against
+ * the fetched Appendix B/Table 24-6 text specifically for this task,
+ * unlike vmcs_fields.h's M2-3 batch above.
+ */
+#define HYPE_VMX_PROCBASED_USE_TPR_SHADOW (1u << 21)
 /* Secondary processor-based VM-execution control bits used here. */
 #define HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST (1u << 7)
+/* APIC-register virtualization / virtual-interrupt delivery (M2-4):
+ * both operate on the virtual-APIC page directly, not through EPT, so
+ * (unlike "virtualize APIC accesses", intentionally not used here)
+ * they don't require EPT to be enabled. */
+#define HYPE_VMX_PROCBASED2_APIC_REGISTER_VIRT (1u << 8)
+#define HYPE_VMX_PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY (1u << 9)
 
 /* VM-entry control bits used here. IA32E_MODE_GUEST is deliberately
  * NOT set -- this project's minimal test guest starts in unpaged
@@ -60,6 +79,7 @@
 #define HYPE_VMCS_HOST_TR_SELECTOR 0x0C0Cu
 
 /* 64-bit fields (Table B-4/B-6). */
+#define HYPE_VMCS_VIRTUAL_APIC_PAGE_ADDR 0x2012u /* full; +1 = high (M2-4) */
 #define HYPE_VMCS_VMCS_LINK_POINTER 0x2800u /* full; +1 = high */
 
 /* 32-bit control fields (Table B-8). */
@@ -68,6 +88,7 @@
 #define HYPE_VMCS_EXCEPTION_BITMAP 0x4004u
 #define HYPE_VMCS_VM_EXIT_CONTROLS 0x400Cu
 #define HYPE_VMCS_VM_ENTRY_CONTROLS 0x4012u
+#define HYPE_VMCS_TPR_THRESHOLD 0x401Cu /* M2-4 */
 #define HYPE_VMCS_SECONDARY_VM_EXEC_CONTROL 0x401Eu
 
 /* 32-bit read-only VM-exit info fields (Table B-9). */

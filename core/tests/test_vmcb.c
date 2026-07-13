@@ -105,12 +105,51 @@ static void test_build_realmode_guest_zeroes_first(void) {
               vmcb.control.reserved_host_usage[0]);
 }
 
+static void test_configure_avic(void) {
+    hype_vmcb_t vmcb;
+
+    hype_vmcb_build_realmode_guest(&vmcb, 0, 0);
+    /* Some other int_ctl bit already set (e.g. V_IGN_TPR, bit 20) --
+     * confirms configure_avic ORs its bit in rather than clobbering
+     * whatever else int_ctl already held. */
+    vmcb.control.vintr = (1ULL << 20);
+
+    hype_vmcb_configure_avic(&vmcb, 0xFEE00000ULL, 0x100000ULL, 0x101000ULL, 0x102000ULL, 0);
+
+    CHECK_HEX("AVIC enable bit set", HYPE_SVM_INT_CTL_AVIC_ENABLE,
+              vmcb.control.vintr & HYPE_SVM_INT_CTL_AVIC_ENABLE);
+    CHECK_HEX("pre-existing int_ctl bit preserved", (1ULL << 20), vmcb.control.vintr & (1ULL << 20));
+    CHECK_HEX("apic_bar page-aligned address preserved", 0xFEE00000ULL, vmcb.control.avic_apic_bar);
+    CHECK_HEX("backing page pointer set", 0x100000ULL, vmcb.control.avic_backing_page_ptr);
+    CHECK_HEX("logical table pointer set", 0x101000ULL, vmcb.control.avic_logical_table_ptr);
+    CHECK_HEX("physical table pointer + max index", 0x102000ULL,
+              vmcb.control.avic_physical_table_ptr);
+}
+
+static void test_configure_avic_masks_low_bits_and_sets_max_index(void) {
+    hype_vmcb_t vmcb;
+
+    hype_vmcb_build_realmode_guest(&vmcb, 0, 0);
+    /* A non-page-aligned address (low 12 bits set) must be masked off,
+     * and max_physical_id packed into avic_physical_table_ptr's low
+     * byte alongside the (masked) address. */
+    hype_vmcb_configure_avic(&vmcb, 0xFEE00ABCULL, 0x100ABCULL, 0x101ABCULL, 0x102000ULL, 0x07u);
+
+    CHECK_HEX("apic_bar low bits masked off", 0xFEE00000ULL, vmcb.control.avic_apic_bar);
+    CHECK_HEX("backing page low bits masked off", 0x100000ULL, vmcb.control.avic_backing_page_ptr);
+    CHECK_HEX("logical table low bits masked off", 0x101000ULL, vmcb.control.avic_logical_table_ptr);
+    CHECK_HEX("physical table address + max index 7", 0x102007ULL,
+              vmcb.control.avic_physical_table_ptr);
+}
+
 int main(void) {
     test_struct_sizes();
     test_field_offsets();
     test_seg_attrib();
     test_build_realmode_guest();
     test_build_realmode_guest_zeroes_first();
+    test_configure_avic();
+    test_configure_avic_masks_low_bits_and_sets_max_index();
 
     if (failures == 0) {
         printf("all tests passed\n");

@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "../cpu/vmm_ops.h"
+#include "vmcb.h"
 
 /*
  * AMD-V/SVM backend (M2, plan.md §4/§9). Validated in this project's
@@ -31,6 +32,19 @@ uint64_t hype_svm_efer_with_svme(uint64_t old_efer);
  * real logic and is fully tested.
  */
 int hype_svm_enable(void);
+
+/*
+ * Enables AVIC on `vmcb` (M2-4) using this project's own statically-
+ * reserved AVIC backing/logical/physical ID table pages and the
+ * platform's real LAPIC MMIO base as the guest-visible APIC_BAR
+ * (single-vCPU scope for now -- see vmcb.h's HYPE_SVM_INT_CTL_AVIC_ENABLE
+ * comment for why `vmcb` must already have NP_ENABLE=1, and why this is
+ * NOT called from hype_vmcb_build_realmode_guest()). Pure struct
+ * mutation over fixed static-buffer addresses -- no privileged
+ * instructions, so unlike most of this backend's "enable" code, this
+ * is fully unit-testable.
+ */
+void hype_svm_vcpu_enable_apic_accel(hype_vmcb_t *vmcb);
 
 extern const hype_vmm_ops_t hype_svm_ops;
 

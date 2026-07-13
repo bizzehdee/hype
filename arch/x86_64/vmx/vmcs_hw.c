@@ -4,6 +4,7 @@
 /* UNVALIDATED -- see vmx.h and vmcs.h. */
 
 static uint8_t g_vmcs_region[4096] __attribute__((aligned(4096)));
+static uint8_t g_virtual_apic_page[4096] __attribute__((aligned(4096)));
 
 static void hype_vmx_host_exit_stub(void) {
     for (;;) {
@@ -188,10 +189,17 @@ int hype_vmx_vmcs_build_realmode_guest(uint16_t entry_seg, uint64_t stack_phys) 
                                                : HYPE_MSR_IA32_VMX_ENTRY_CTLS);
 
     uint32_t pin_ctls = hype_vmx_adjust_controls(0, pin_cap);
-    uint32_t proc_ctls = hype_vmx_adjust_controls(HYPE_VMX_PROCBASED_ACTIVATE_SECONDARY_CONTROLS,
-                                                   proc_cap);
-    uint32_t proc2_ctls = hype_vmx_adjust_controls(HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST,
-                                                    proc2_cap);
+    /* TPR shadow (M2-4) needs neither EPT nor "virtualize APIC
+     * accesses" -- see vmcs_fields.h's comment on why it and the
+     * secondary APICv bits below are safe to enable ahead of M3's
+     * EPT. */
+    uint32_t proc_ctls = hype_vmx_adjust_controls(
+        HYPE_VMX_PROCBASED_ACTIVATE_SECONDARY_CONTROLS | HYPE_VMX_PROCBASED_USE_TPR_SHADOW,
+        proc_cap);
+    uint32_t proc2_ctls = hype_vmx_adjust_controls(
+        HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST | HYPE_VMX_PROCBASED2_APIC_REGISTER_VIRT |
+            HYPE_VMX_PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY,
+        proc2_cap);
     uint32_t exit_ctls = hype_vmx_adjust_controls(0, exit_cap);
     uint32_t entry_ctls = hype_vmx_adjust_controls(0, entry_cap);
 
@@ -201,6 +209,13 @@ int hype_vmx_vmcs_build_realmode_guest(uint16_t entry_seg, uint64_t stack_phys) 
     rc |= vmwrite(HYPE_VMCS_VM_EXIT_CONTROLS, exit_ctls);
     rc |= vmwrite(HYPE_VMCS_VM_ENTRY_CONTROLS, entry_ctls);
     rc |= vmwrite(HYPE_VMCS_EXCEPTION_BITMAP, 0);
+
+    /* TPR shadow/APICv (M2-4): only takes effect if the capability
+     * negotiation above actually granted USE_TPR_SHADOW (older CPUs
+     * without it will simply ignore VIRTUAL_APIC_PAGE_ADDR/
+     * TPR_THRESHOLD). 0 threshold = no TPR-masking VM-exits. */
+    rc |= vmwrite(HYPE_VMCS_VIRTUAL_APIC_PAGE_ADDR, (uint64_t)(uintptr_t)g_virtual_apic_page);
+    rc |= vmwrite(HYPE_VMCS_TPR_THRESHOLD, 0);
 
     /* Guest state: flat real-mode-like guest at entry_seg:0, matching
      * hype_vmcb_build_realmode_guest()'s convention on the SVM side. */

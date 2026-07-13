@@ -123,7 +123,7 @@ multi-VM concurrency milestone, even though early single-guest milestones
   Deps: M2-1
 - [x] **M2-3** — Minimal VMCS (Intel) / VMCB (AMD) construction.
   Deps: M2-2
-- [ ] **M2-4** — Enable APICv (Intel) / AVIC (AMD) — required from this
+- [x] **M2-4** — Enable APICv (Intel) / AVIC (AMD) — required from this
   milestone, not deferred.
   Deps: M2-3
 - [ ] **M2-5** — VM-exit handler dispatch loop skeleton.
