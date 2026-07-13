@@ -58,7 +58,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
 
 ## M1 — Boot Services exit + own kernel context (plan.md §9 M1)
 
-- [ ] **M1-1** — `hype.cfg` config parser (plan.md §5 schema: `vcpus`,
+- [x] **M1-1** — `hype.cfg` config parser (plan.md §5 schema: `vcpus`,
   `cpu_set`, `mem_mb`, `boot`, `install_media`, `target_disk`,
   `target_disk_size_gb`, `firmware`, `os_hint`, `net_mode`).
   Deps: M0-4, M0-5
