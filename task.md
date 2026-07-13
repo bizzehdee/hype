@@ -84,24 +84,24 @@ Checkbox = done. `Deps: —` = no prerequisites.
 
 ## ADM — Startup admission control (plan.md §6i, §10 decision #14/#16)
 
-- [ ] **ADM-1** — Sum configured `mem_mb` across all VMs; reject startup if
+- [x] **ADM-1** — Sum configured `mem_mb` across all VMs; reject startup if
   it (plus hypervisor/device reserve) exceeds physical RAM from the UEFI
   memory map.
   Deps: M1-1, M0-3
-- [ ] **ADM-2** — Sum configured `vcpus` against physical core count;
+- [x] **ADM-2** — Sum configured `vcpus` against physical core count;
   reject if it can't be satisfied under 1:1 pinning.
   Deps: M1-1
-- [ ] **ADM-3** — Validate explicit `cpu_set` entries: cores exist, count
+- [x] **ADM-3** — Validate explicit `cpu_set` entries: cores exist, count
   matches `vcpus`, and no two VMs' `cpu_set` ranges overlap (hard reject on
   overlap, not a warning).
   Deps: ADM-2
-- [ ] **ADM-4** — Reject startup if any two VMs' `target_disk` resolve to
+- [x] **ADM-4** — Reject startup if any two VMs' `target_disk` resolve to
   the same `file:` path or `physical:` serial/GUID, or if any two VMs would
   resolve to the same persisted varstore file (security-critical — closes
   the gap between §6d's "exclusively owned" claim and what's actually
   enforced; found in security review, §10 decision #20).
   Deps: M1-1
-- [ ] **ADM-5** — Validate `net_peers`: every listed name resolves to a VM
+- [x] **ADM-5** — Validate `net_peers`: every listed name resolves to a VM
   actually defined in `hype.cfg`, and both VMs in a pairing have
   `net_mode = nat`; reject startup otherwise (§10 decision #21) — keeps
   guest-to-guest connectivity an explicit, auditable opt-in rather than a

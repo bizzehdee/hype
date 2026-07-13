@@ -99,3 +99,19 @@ EFI_STATUS hype_exit_boot_services(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *b
         bs->FreePool(map);
     }
 }
+
+UINT64 hype_memmap_usable_bytes(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size, UINTN desc_size) {
+    UINTN count = (desc_size > 0) ? (map_size / desc_size) : 0;
+    UINTN i;
+    const UINT8 *base = (const UINT8 *)map;
+    UINT64 total = 0;
+
+    for (i = 0; i < count; i++) {
+        const EFI_MEMORY_DESCRIPTOR *d = (const EFI_MEMORY_DESCRIPTOR *)(base + i * desc_size);
+        if (d->Type == EfiConventionalMemory || d->Type == EfiBootServicesCode ||
+            d->Type == EfiBootServicesData) {
+            total += d->NumberOfPages * 4096ULL;
+        }
+    }
+    return total;
+}

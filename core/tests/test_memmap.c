@@ -422,11 +422,39 @@ static void test_exit_boot_services_propagates_memmap_error(void) {
               0, g_ebs_exit_calls);
 }
 
+static void test_usable_bytes(void) {
+    EFI_MEMORY_DESCRIPTOR map[5];
+    UINT64 result;
+
+    map[0].Type = EfiConventionalMemory;
+    map[0].NumberOfPages = 10;
+    map[1].Type = EfiBootServicesCode;
+    map[1].NumberOfPages = 5;
+    map[2].Type = EfiBootServicesData;
+    map[2].NumberOfPages = 3;
+    map[3].Type = EfiLoaderData; /* excluded -- our own image */
+    map[3].NumberOfPages = 1000;
+    map[4].Type = EfiReservedMemoryType; /* excluded */
+    map[4].NumberOfPages = 1000;
+
+    result = hype_memmap_usable_bytes(map, sizeof(map), sizeof(EFI_MEMORY_DESCRIPTOR));
+
+    CHECK_INT("usable_bytes sums only Conventional+BootServicesCode/Data",
+              (18ULL * 4096ULL), (long long)result);
+}
+
+static void test_usable_bytes_empty(void) {
+    UINT64 result = hype_memmap_usable_bytes(0, 0, sizeof(EFI_MEMORY_DESCRIPTOR));
+    CHECK_INT("usable_bytes of an empty map is zero", 0, (long long)result);
+}
+
 int main(void) {
     test_type_name();
     test_get_success();
     test_get_probe_error();
     test_get_allocate_error();
+    test_usable_bytes();
+    test_usable_bytes_empty();
     test_get_second_call_error();
     test_dump();
     test_dump_empty();

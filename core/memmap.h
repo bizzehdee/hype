@@ -47,4 +47,15 @@ void hype_memmap_dump(EFI_SYSTEM_TABLE *system_table,
  */
 EFI_STATUS hype_exit_boot_services(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs);
 
+/*
+ * ADM-1: total bytes of memory that become available for our own use
+ * once Boot Services are gone -- EfiConventionalMemory (already free)
+ * plus EfiBootServicesCode/Data (only reserved while firmware is still
+ * using it). Deliberately excludes EfiLoaderCode/Data (our own loaded
+ * image), ACPI/Runtime/Reserved/MMIO regions (not general-purpose RAM).
+ * Pure arithmetic over an already-fetched map -- no UEFI calls, no
+ * allocation.
+ */
+UINT64 hype_memmap_usable_bytes(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size, UINTN desc_size);
+
 #endif /* HYPE_MEMMAP_H */
