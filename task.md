@@ -119,7 +119,7 @@ multi-VM concurrency milestone, even though early single-guest milestones
 - [x] **M2-1** — CPU feature detection (VMX/EPT vs. SVM/NPT) and
   `vmm_ops` vtable dispatch (`vmx_ops` / `svm_ops`).
   Deps: M1-4
-- [ ] **M2-2** — VMXON (Intel) / SVM mode enable (AMD).
+- [x] **M2-2** — VMXON (Intel) / SVM mode enable (AMD).
   Deps: M2-1
 - [ ] **M2-3** — Minimal VMCS (Intel) / VMCB (AMD) construction.
   Deps: M2-2

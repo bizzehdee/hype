@@ -15,6 +15,7 @@
 #include "../arch/x86_64/cpu/pic.h"
 #include "../arch/x86_64/cpu/pit.h"
 #include "../arch/x86_64/cpu/timer.h"
+#include "../arch/x86_64/cpu/vmm_select.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -160,20 +161,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_serial_print("timer: %llu ticks (PIT @ 1000Hz)\n",
                        (unsigned long long)hype_timer_get_ticks());
 
-    /* M2-1: which virtualization backend this host actually has.
-     * Neither is fatal in the sense of a config error -- it means this
-     * hardware (or QEMU without -cpu host/+svm/+vmx) simply can't run
-     * VMs at all, which is unrecoverable for a hypervisor either way. */
-    switch (hype_cpu_detect_vmm_kind()) {
-    case HYPE_VMM_KIND_VMX:
-        hype_serial_print("vmm: VMX (Intel) detected\n");
-        break;
-    case HYPE_VMM_KIND_SVM:
-        hype_serial_print("vmm: SVM (AMD) detected\n");
-        break;
-    case HYPE_VMM_KIND_NONE:
-    default:
-        hype_fatal("no usable virtualization extension (VMX/SVM) detected");
+    /*
+     * M2-1/M2-2: detect which virtualization backend this host has and
+     * enable it. Neither "no backend" nor "enable failed" is a config
+     * error to recover from -- a hypervisor that can't virtualize can't
+     * do anything else useful either.
+     */
+    {
+        hype_vmm_kind_t kind = hype_cpu_detect_vmm_kind();
+        const hype_vmm_ops_t *ops = hype_vmm_ops_for_kind(kind);
+
+        if (ops == 0) {
+            hype_fatal("no usable virtualization extension (VMX/SVM) detected");
+        }
+        hype_serial_print("vmm: %s detected\n", ops->name);
+
+        if (ops->enable() != 0) {
+            hype_fatal("vmm: %s enable failed", ops->name);
+        }
+        hype_serial_print("vmm: %s enabled\n", ops->name);
     }
 
     hype_halt_forever();

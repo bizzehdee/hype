@@ -19,7 +19,10 @@ ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/id
              arch/x86_64/cpu/paging.c arch/x86_64/cpu/paging_load.c \
              arch/x86_64/cpu/pic.c arch/x86_64/cpu/lapic.c arch/x86_64/cpu/pit.c \
              arch/x86_64/cpu/pit_hw.c arch/x86_64/cpu/timer.c arch/x86_64/cpu/timer_isr.c \
-             arch/x86_64/cpu/cpu_features.c arch/x86_64/cpu/cpu_features_hw.c
+             arch/x86_64/cpu/cpu_features.c arch/x86_64/cpu/cpu_features_hw.c \
+             arch/x86_64/cpu/vmm_select.c \
+             arch/x86_64/svm/svm_bits.c arch/x86_64/svm/svm_enable_hw.c arch/x86_64/svm/svm_ops.c \
+             arch/x86_64/vmx/vmx_bits.c arch/x86_64/vmx/vmx_enable_hw.c arch/x86_64/vmx/vmx_ops.c
 ARCH_ASM_SRCS := arch/x86_64/cpu/isr_stubs.S
 BOOT_SRCS := boot/main.c
 SRCS      := $(BOOT_SRCS) $(CORE_SRCS) $(ARCH_SRCS)
