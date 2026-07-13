@@ -128,7 +128,7 @@ multi-VM concurrency milestone, even though early single-guest milestones
   Deps: M2-3
 - [x] **M2-5** — VM-exit handler dispatch loop skeleton.
   Deps: M2-3
-- [ ] **M2-6** — Guest RAM zeroing before first VM-entry, on every
+- [x] **M2-6** — Guest RAM zeroing before first VM-entry, on every
   (re)start (§10 decision #15).
   Deps: M2-3
 - [ ] **M2-7** — Launch a hand-written `hlt`-loop guest; confirm VM-exit
