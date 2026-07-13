@@ -1,0 +1,148 @@
+# Agent Rules — hype
+
+This repo builds a thin UEFI type-1 hypervisor. Full design lives in
+[`plan.md`](plan.md); the actionable, dependency-tracked breakdown of that
+design lives in [`task.md`](task.md). Read both before making non-trivial
+changes — this file is the condensed rule set, not a replacement for either.
+
+## Before doing anything
+
+1. Check `task.md` for the task ID(s) covering the work. If none exists,
+   add one in the right epic with an honest `Deps:` list before starting —
+   don't do undocumented work.
+2. Check that a task's `Deps:` are actually checked off in `task.md`. If
+   they aren't, either do them first or stop and ask — do not skip ahead on
+   the assumption a prerequisite "probably doesn't matter yet."
+3. If the work touches something `plan.md` §10 already decided, follow that
+   decision. If you think a decision is wrong, say so and get it changed in
+   `plan.md` §10 — don't silently diverge from a documented decision in code.
+4. If the work surfaces a genuinely new decision (a fork not already
+   covered by §10), resolve it and add it to `plan.md` §10 as a new
+   numbered entry before writing the code that depends on it.
+
+## Hard invariants — do not weaken these without updating plan.md §10 first
+
+- **Guest isolation is the point of this project.** Every one of these
+  exists because of `plan.md` §6g/§6j/§10's security-review decisions
+  (#19–22):
+  - Every device-emulation code path that touches a guest-supplied address,
+    offset, or length (virtio descriptors, AHCI/NVMe command buffers, block
+    I/O LBA+count) **must** validate it against that specific VM's own
+    EPT/NPT-mapped range and the backing resource's real size before the
+    host dereferences it or performs the corresponding I/O. No raw guest
+    pointer is ever trusted directly. This is the actual guest-escape
+    vector — EPT/NPT alone does not prevent it.
+  - No two VMs' `cpu_set` ranges, `target_disk` paths, or varstore files may
+    overlap/collide — enforced at startup admission control, not left as an
+    assumption.
+  - Guest-to-guest networking is default-deny; a pairing is only allowed
+    when explicitly named via `net_peers` in `hype.cfg`, validated at
+    startup. Never make guest-to-guest traffic possible as a side effect of
+    how NAT/switching happens to be implemented.
+  - A misbehaving/faulted guest is torn down alone (Force power off) — never
+    a hypervisor-wide halt or reset in response to one guest's fault.
+  - A fault-isolation watchdog catches hangs/anomalies; it is **not** a
+    substitute for the input-validation rule above.
+- **1:1 exclusive vCPU-to-pCPU pinning.** No shared pCPU between two VMs,
+  ever — this is what the fault-isolation guarantee depends on.
+- **Guest RAM is zeroed before first execution**, on every (re)start,
+  including after Force power off — never reused as-is.
+- **No guest gets direct hardware access.** Physical disk/NIC access is
+  always mediated through a host-side driver plus an emulated guest-facing
+  frontend — never PCI passthrough or guest-initiated DMA to real hardware.
+  This is why v1 needs no IOMMU; don't add passthrough without revisiting
+  that.
+- **Destructive writes to a `physical:` target disk require**: serial/GUID
+  match confirmed at VM start, an interactive dashboard confirmation before
+  the first write, and a non-empty-partition-table guard — a `physical:`
+  config entry alone must never be sufficient to trigger a wipe.
+
+## Toolchain & language
+
+- `hype.efi` itself: **C**, freestanding, targeting `x86_64-unknown-uefi`,
+  built with the lightweight clang/lld-or-GNU-EFI pipeline — not EDK2, not
+  Rust (`plan.md` §8, §10 decision #17). No libc.
+- The guest firmware blob is a separate concern, built via EDK2, vendoring a
+  stripped OVMF (`plan.md` §10 decision #1). Don't conflate the two build
+  pipelines.
+- Every device-emulation and host-driver module runs at the most privileged
+  level with no OS underneath and no process boundary to contain a bug —
+  code review here should weigh a missed bounds check as a full-machine
+  compromise, not a crash.
+
+## License
+
+- Project license is **GPLv3**. Any third-party code adapted in (e.g. the
+  AHCI/NVMe or NIC host drivers) must be GPLv3-*compatible*: MIT/BSD,
+  Apache, GPLv3, or "GPLv2-or-later" are fine to pull in and relicense.
+  **Plain GPLv2-only code is not GPLv3-compatible** — check the specific
+  file/module's license header before adapting anything, not just the
+  source project's overall stated license.
+
+## Testing
+
+- QEMU/KVM nested virtualization (`-cpu host,+vmx`) for fast iteration.
+- A **mandatory real-hardware validation pass** (both Intel and AMD, per
+  `plan.md` §10 decision #18) at every milestone gate — QEMU alone is
+  necessary but not sufficient; nested VMX/SVM emulation doesn't faithfully
+  reproduce every edge case.
+
+### Unit testing
+
+- **Unit testing is a core requirement, not optional, on all testable
+  code.** "Testable" means anything expressible as pure(-ish) logic that
+  doesn't require actual privileged CPU state, real hardware, or a running
+  hypervisor to exercise — this covers more of the codebase than it might
+  first appear: the `hype.cfg` parser, all of §6i's admission-control
+  checks (memory/vcpu/`cpu_set` overlap, `target_disk`/varstore uniqueness,
+  `net_peers` validation), the §6j guest-address bounds-checking logic,
+  `blk_backend` LBA/length validation, ACPI table synthesis, the per-vCPU
+  watchdog's fault-classification logic, and the host power-lifecycle
+  state-record read/write logic.
+- **90% line/branch coverage is the floor**, not a target to approach, on
+  every testable module. Falling short blocks the change — treat it the
+  same as a failing build.
+- Code that genuinely can't be unit tested (VMXON/VMCS/VMCB setup, inline
+  asm, VM-exit trampolines, real MMIO/PIO register access, anything that
+  only makes sense with actual CPU privilege transitions) is exempt, but
+  **the exemption is for the hardware-touching shim only** — write that
+  shim as thin as possible and push the actual decision logic behind it
+  into a plain, testable function. E.g. "decode this VM-exit reason and
+  decide what to do" should be a pure function fed a struct of exit info,
+  unit tested directly; only the few lines that read the real VMCS/VMCB
+  fields into that struct are exempt. Don't use "it touches hardware
+  somewhere in the call stack" to excuse an entire module from coverage.
+- New code that isn't unit tested where testable, or that drops a module's
+  coverage below 90%, doesn't get merged — this is enforced the same way
+  as the real-hardware validation gate above, not treated as a nice-to-have
+  cleanup for later.
+
+## Feature requests vs. bugfixes
+
+- A **bugfix** (existing behavior doesn't match what `plan.md`/`task.md`
+  already specify) can go straight to a code change — no planning detour
+  needed, just fix it and check the relevant `task.md` box if it wasn't
+  already.
+- Anything bigger than a bugfix — new capabilities, new config surface, new
+  devices/drivers, or any change to behavior beyond restoring the documented
+  spec — **must go through `plan.md` first**: work out the design, log any
+  new forks as numbered entries in §10 (with alternatives considered, same
+  style as the existing entries), and update whichever `plan.md` section the
+  feature belongs to. Only after that's settled should it be **appended to
+  `task.md`** as new task ID(s), placed in the right epic, with an honest
+  `Deps:` list wired to whatever existing tasks it actually depends on (and
+  updating any downstream tasks'/epics' deps if the new work now sits in
+  front of them). Do not add net-new tasks to `task.md` without a
+  corresponding `plan.md` change to justify them — the two files must stay
+  in sync, not diverge.
+
+## Keeping `plan.md` and `task.md` in sync
+
+- `task.md` task IDs are referenced from commit messages/PRs where practical
+  (e.g. `M5-3`, `VALID-2`) so the dependency graph stays trustworthy.
+- Check off a `task.md` box only when the task is actually done and
+  validated per its milestone's testing bar (QEMU + real hardware where
+  applicable) — not when the code merely compiles.
+- If a change makes a `plan.md` §10 decision obsolete or wrong, update that
+  decision's entry (don't delete the history — note what changed and why,
+  matching the existing entries' style).
