@@ -22,20 +22,37 @@ typedef struct {
 } hype_isr_frame_t;
 
 /* Human-readable name for one of the SDM's 32 architectural exception
- * vectors; vectors 32-255 are user-defined/IRQ, unused before M1-8. */
+ * vectors; vectors 32-255 are user-defined/IRQ. */
 const char *hype_isr_vector_name(uint64_t vector);
 
-/* Formats the fatal-fault message hype_isr_dispatch() prints. Pure/
- * testable -- see isr_decode.c for why dispatch itself isn't. */
+/* Formats the fatal-fault message hype_isr_dispatch() panics with when
+ * no handler is registered for a vector. Pure/testable -- see
+ * isr_decode.c for why dispatch itself only partly is. */
 void hype_isr_format_message(char *buf, unsigned long long bufsz, const hype_isr_frame_t *frame);
+
+typedef void (*hype_isr_handler_fn)(const hype_isr_frame_t *frame);
+
+/*
+ * Registers a handler for a hardware IRQ vector (32-255) that returns
+ * normally instead of being fatal -- isr_stubs.S's trampoline restores
+ * all registers and `iretq`s when hype_isr_dispatch() returns. Vectors
+ * 0-31 (the SDM's architectural exceptions) can't be registered this
+ * way and are always fatal; M1 has no recovery story for a genuine CPU
+ * fault, only for expected hardware IRQs (the timer, M1-8; more devices
+ * later). Returns 1 on success, 0 if vector is out of the registerable
+ * range. Last registration for a given vector wins.
+ */
+int hype_isr_register(uint8_t vector, hype_isr_handler_fn handler);
 
 /*
  * Called by isr_stubs.S's common trampoline for every one of the 256
- * vectors. For M1, every fault is fatal: format a message, print it via
- * serial (never ConOut -- see isr_entry.c for why that's not optional),
- * halt. Never returns. Not unit tested -- it's a thin wrapper around
- * the tested hype_isr_format_message() plus the noreturn
- * hype_halt_forever(), same reasoning as hype_panic() itself (halt.h).
+ * vectors. If a handler is registered for this vector (only possible
+ * for 32-255), calls it and returns -- the testable, common case now
+ * that M1-8 needs the timer IRQ to resume normally rather than panic.
+ * Otherwise formats a message and calls the noreturn hype_fatal():
+ * that branch isn't unit tested (calling it in a test would hang the
+ * test binary rather than verify anything), same reasoning as
+ * hype_fatal() itself (halt.h).
  */
 void hype_isr_dispatch(const hype_isr_frame_t *frame);
 

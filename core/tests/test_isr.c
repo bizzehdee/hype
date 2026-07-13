@@ -112,10 +112,76 @@ static void test_format_message_truncates_safely(void) {
     }
 }
 
+#define CHECK_INT(desc, expected, actual) \
+    do { \
+        if ((long long)(expected) != (long long)(actual)) { \
+            printf("FAIL: %s: expected %lld, got %lld\n", (desc), (long long)(expected), (long long)(actual)); \
+            failures++; \
+        } \
+    } while (0)
+
+static int g_handler_calls;
+static uint64_t g_handler_last_vector;
+
+static void mock_handler(const hype_isr_frame_t *frame) {
+    g_handler_calls++;
+    g_handler_last_vector = frame->vector;
+}
+
+static void test_register_rejects_exception_vectors(void) {
+    CHECK_INT("register rejects vector 0", 0, hype_isr_register(0, mock_handler));
+    CHECK_INT("register rejects vector 31", 0, hype_isr_register(31, mock_handler));
+}
+
+static void test_register_accepts_irq_vectors(void) {
+    CHECK_INT("register accepts vector 32", 1, hype_isr_register(32, mock_handler));
+    CHECK_INT("register accepts vector 255", 1, hype_isr_register(255, mock_handler));
+}
+
+static void test_dispatch_calls_registered_handler_and_returns(void) {
+    hype_isr_frame_t frame;
+
+    memset(&frame, 0, sizeof(frame));
+    frame.vector = 200;
+    hype_isr_register(200, mock_handler);
+
+    g_handler_calls = 0;
+    g_handler_last_vector = 999;
+
+    /* This call must actually return -- if hype_isr_dispatch() fell
+     * through to the fatal path here, this test would hang instead of
+     * failing cleanly, which is exactly why the no-handler branch is
+     * never exercised in this file (see isr.h). */
+    hype_isr_dispatch(&frame);
+
+    CHECK_INT("dispatch calls the registered handler exactly once", 1, g_handler_calls);
+    CHECK_INT("dispatch passes the same frame through", 200, g_handler_last_vector);
+}
+
+static void test_dispatch_last_registration_wins(void) {
+    hype_isr_frame_t frame;
+    static int second_calls = 0;
+
+    memset(&frame, 0, sizeof(frame));
+    frame.vector = 201;
+
+    hype_isr_register(201, mock_handler);
+    hype_isr_register(201, mock_handler); /* re-register same vector */
+
+    g_handler_calls = 0;
+    hype_isr_dispatch(&frame);
+    CHECK_INT("re-registering the same vector still dispatches once", 1, g_handler_calls);
+    (void)second_calls;
+}
+
 int main(void) {
     test_vector_name();
     test_format_message();
     test_format_message_truncates_safely();
+    test_register_rejects_exception_vectors();
+    test_register_accepts_irq_vectors();
+    test_dispatch_calls_registered_handler_and_returns();
+    test_dispatch_last_registration_wins();
 
     if (failures == 0) {
         printf("all tests passed\n");

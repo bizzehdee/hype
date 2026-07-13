@@ -1,4 +1,4 @@
-# Per-vector ISR entry stubs + common trampoline (M1-2).
+# Per-vector ISR entry stubs + common trampoline (M1-2, extended M1-8).
 #
 # Hand-written asm with nothing to unit test -- see idt.h for the split
 # between this and the tested encode/decode logic. Generated via
@@ -11,6 +11,15 @@
 # empirically (see docs/toolchain.md), not assumed. That means the
 # frame pointer goes in %rcx (not %rdi), and the call needs 32 bytes of
 # shadow space plus 16-byte stack alignment, unlike a SysV target.
+#
+# hype_isr_dispatch() (isr_decode.c) can now return normally -- M1-8
+# needs the timer IRQ to resume the interrupted code, not halt -- so
+# unlike M1-2's original version, the pre-call %rsp (before the
+# alignment below discards it) has to survive the call so it can be
+# restored afterward for a clean register-pop + `iretq` sequence. %rbp
+# is callee-saved under the calling convention above, so C code called
+# from here is required to preserve whatever we stash there across the
+# call -- exactly what a plain scratch stash needs.
 
 .altmacro
 
@@ -60,17 +69,29 @@ isr_common_entry:
     push %r15
 
     mov %rsp, %rcx      # MS x64 ABI arg0 = pointer to hype_isr_frame_t
-    and $-16, %rsp      # force 16-byte alignment; nothing above this line
-                        # is touched again (M1's handler never returns)
+    mov %rsp, %rbp      # stash pre-alignment rsp (callee-saved -- survives the call)
+    and $-16, %rsp      # force 16-byte alignment
     sub $0x20, %rsp     # MS x64 ABI shadow space
     call hype_isr_dispatch
+    mov %rbp, %rsp      # undo the alignment; rsp is back at the top of our pushes
 
-    # hype_isr_dispatch is expected to never return (it panics). If it
-    # somehow does, halt rather than run off into whatever garbage
-    # follows -- same fallback as halt.c elsewhere in this codebase.
-.hang:
-    hlt
-    jmp .hang
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rbp
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rbx
+    pop %rax
+    add $16, %rsp       # discard the vector + error_code the stub pushed
+    iretq
 
 .set i, 0
 .rept 256

@@ -8,7 +8,12 @@
 #include "../core/serial.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
+#include "../arch/x86_64/cpu/isr.h"
+#include "../arch/x86_64/cpu/lapic.h"
 #include "../arch/x86_64/cpu/paging.h"
+#include "../arch/x86_64/cpu/pic.h"
+#include "../arch/x86_64/cpu/pit.h"
+#include "../arch/x86_64/cpu/timer.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -118,12 +123,41 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                gop->Mode->Info->VerticalResolution,
                                gop->Mode->Info->PixelsPerScanLine,
                                0xFFFFFFu, 0x000000u);
-        /* From here on, any fatal fault (arch/x86_64/cpu/isr_entry.c)
+        /* From here on, any fatal fault (arch/x86_64/cpu/isr_decode.c)
          * prints to this console too, not just serial. */
         hype_fatal_set_gop(&g_gop_console);
         hype_gop_print(&g_gop_console, "hype: Boot Services exited, hypervisor now running\n");
     }
 
     hype_serial_print("hype: Boot Services exited, hypervisor now running\n");
+
+    /*
+     * M1-8: bring up the host's own timer tick. Ordering matters again:
+     * mask the stray LAPIC timer firmware left armed and firing at
+     * vector 32 (observed while validating M1-5 -- see lapic.h) and
+     * every legacy PIC line (pic.c's remap masks all 16 before we
+     * unmask just the one we handle) *before* registering our handler
+     * and unmasking IRQ0, so nothing can fire on a vector we haven't
+     * wired up yet. Only `sti` once all of that is in place --
+     * interrupts have been durably masked since right after
+     * ExitBootServices() (idt_load.c) specifically so nothing could
+     * fire before we were ready for it. This is that "ready."
+     */
+    hype_lapic_mask_timer((volatile uint32_t *)HYPE_LAPIC_DEFAULT_BASE);
+    hype_pic_remap_and_mask_all(HYPE_TIMER_VECTOR);
+    hype_isr_register(HYPE_TIMER_VECTOR, hype_timer_isr);
+    hype_pic_unmask_irq(HYPE_TIMER_IRQ);
+    hype_pit_init(1000);
+    hype_sti();
+
+    {
+        uint64_t target = hype_timer_get_ticks() + 1000; /* ~1s at 1000Hz */
+        while (hype_timer_get_ticks() < target) {
+            hype_wait_for_interrupt();
+        }
+    }
+    hype_serial_print("timer: %llu ticks (PIT @ 1000Hz)\n",
+                       (unsigned long long)hype_timer_get_ticks());
+
     hype_halt_forever();
 }

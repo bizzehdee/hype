@@ -77,7 +77,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
   Deps: M1-4
 - [x] **M1-7** — Panic handler: halt cleanly with a message, via M1-5/M1-6.
   Deps: M1-5, M1-6
-- [ ] **M1-8** — Timer tick (PIT/HPET bring-up for the host itself).
+- [x] **M1-8** — Timer tick (PIT/HPET bring-up for the host itself).
   Deps: M1-4
 
 ---

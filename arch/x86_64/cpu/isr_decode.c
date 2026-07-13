@@ -1,11 +1,6 @@
 #include "isr.h"
+#include "../../../core/fatal.h"
 #include "../../../core/format.h"
-
-/* hype_isr_dispatch() itself lives in isr_entry.c, alongside nothing
- * else -- it calls the noreturn hype_panic(), so like hype_panic()
- * itself (see halt.c), calling it would hang a test rather than verify
- * anything. Keeping it in its own file keeps this file's coverage
- * numbers meaningful instead of diluted by an untestable wrapper. */
 
 const char *hype_isr_vector_name(uint64_t vector) {
     switch (vector) {
@@ -47,4 +42,37 @@ void hype_isr_format_message(char *buf, unsigned long long bufsz, const hype_isr
                   "unhandled interrupt: vector=%llu (%s) error_code=0x%llx rip=0x%llx cs=0x%llx rflags=0x%llx",
                   frame->vector, hype_isr_vector_name(frame->vector), frame->error_code,
                   frame->rip, frame->cs, frame->rflags);
+}
+
+/* Only vectors 32-255 are ever populated -- see hype_isr_register(). */
+static hype_isr_handler_fn g_handlers[256];
+
+int hype_isr_register(uint8_t vector, hype_isr_handler_fn handler) {
+    if (vector < 32) {
+        return 0;
+    }
+    g_handlers[vector] = handler;
+    return 1;
+}
+
+/*
+ * The handler-found branch is fully testable (register a handler,
+ * dispatch a frame for its vector, confirm it was called and dispatch
+ * returned). The no-handler branch calls the noreturn hype_fatal() and
+ * is deliberately not exercised in tests -- doing so would hang the
+ * test binary rather than verify anything, same reasoning as
+ * hype_fatal() itself (halt.h).
+ */
+void hype_isr_dispatch(const hype_isr_frame_t *frame) {
+    char msg[192];
+    hype_isr_handler_fn handler;
+
+    handler = (frame->vector < 256) ? g_handlers[frame->vector] : 0;
+    if (handler != 0) {
+        handler(frame);
+        return;
+    }
+
+    hype_isr_format_message(msg, sizeof(msg), frame);
+    hype_fatal("%s", msg);
 }

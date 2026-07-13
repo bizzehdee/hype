@@ -11,6 +11,10 @@ __attribute__((noreturn)) void hype_halt_forever(void) {
     }
 }
 
+void hype_wait_for_interrupt(void) {
+    __asm__ volatile("hlt");
+}
+
 /*
  * hype_fatal() lives here, not in fatal.c: it never returns (calling it
  * in a test would hang the test binary rather than verify anything), so
