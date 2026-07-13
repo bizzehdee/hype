@@ -48,6 +48,12 @@ Checkbox = done. `Deps: —` = no prerequisites.
   hardware.
   Deps: M0-3, SETUP-3, SETUP-4
 
+  *Open gate: not yet run. Downstream M1+ work has proceeded past this
+  point by explicit user decision (2026-07-13) to skip waiting on it for
+  now, not because the dependency stopped mattering -- this still needs
+  to happen and this checkbox should get filled in for real once it
+  does.*
+
 ---
 
 ## M1 — Boot Services exit + own kernel context (plan.md §9 M1)
