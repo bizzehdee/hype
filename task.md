@@ -126,7 +126,7 @@ multi-VM concurrency milestone, even though early single-guest milestones
 - [x] **M2-4** — Enable APICv (Intel) / AVIC (AMD) — required from this
   milestone, not deferred.
   Deps: M2-3
-- [ ] **M2-5** — VM-exit handler dispatch loop skeleton.
+- [x] **M2-5** — VM-exit handler dispatch loop skeleton.
   Deps: M2-3
 - [ ] **M2-6** — Guest RAM zeroing before first VM-entry, on every
   (re)start (§10 decision #15).
