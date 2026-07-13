@@ -304,6 +304,124 @@ static void test_dump_empty(void) {
     }
 }
 
+/* ---- hype_exit_boot_services: mocked EFI_BOOT_SERVICES ---- */
+
+static int g_ebs_get_calls;
+static int g_ebs_free_calls;
+static int g_ebs_exit_calls;
+static int g_ebs_fail_count;
+static UINTN g_ebs_desc_size;
+static UINT8 g_ebs_pool_buf[4096];
+static int g_ebs_force_probe_error;
+static EFI_STATUS g_ebs_probe_error_value;
+
+static EFI_STATUS EFIAPI mock_ebs_get_memory_map(UINTN *map_size, EFI_MEMORY_DESCRIPTOR *map,
+                                                  UINTN *map_key, UINTN *desc_size,
+                                                  UINT32 *desc_version) {
+    g_ebs_get_calls++;
+    *desc_size = g_ebs_desc_size;
+    *desc_version = 1;
+    *map_key = (UINTN)g_ebs_get_calls; /* distinct per attempt, mimics a changing map */
+
+    if (map == 0) {
+        if (g_ebs_force_probe_error) {
+            return g_ebs_probe_error_value;
+        }
+        *map_size = g_ebs_desc_size * 2;
+        return EFI_BUFFER_TOO_SMALL;
+    }
+    *map_size = g_ebs_desc_size * 2;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI mock_ebs_allocate_pool(UINT32 pool_type, UINTN size, void **buffer) {
+    (void)pool_type;
+    if (size > sizeof(g_ebs_pool_buf)) {
+        return EFI_BUFFER_TOO_SMALL;
+    }
+    *buffer = g_ebs_pool_buf;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI mock_ebs_free_pool(void *buffer) {
+    (void)buffer;
+    g_ebs_free_calls++;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI mock_ebs_exit_boot_services(EFI_HANDLE image_handle, UINTN map_key) {
+    (void)image_handle;
+    (void)map_key;
+    g_ebs_exit_calls++;
+    if (g_ebs_exit_calls <= g_ebs_fail_count) {
+        return EFI_ERR_BIT | 2; /* stale map key, in spirit */
+    }
+    return EFI_SUCCESS;
+}
+
+static void make_ebs_boot_services(EFI_BOOT_SERVICES *bs) {
+    memset(bs, 0, sizeof(*bs));
+    bs->GetMemoryMap = mock_ebs_get_memory_map;
+    bs->AllocatePool = mock_ebs_allocate_pool;
+    bs->FreePool = mock_ebs_free_pool;
+    bs->ExitBootServices = mock_ebs_exit_boot_services;
+}
+
+static void reset_ebs_mocks(void) {
+    g_ebs_get_calls = 0;
+    g_ebs_free_calls = 0;
+    g_ebs_exit_calls = 0;
+    g_ebs_fail_count = 0;
+    g_ebs_desc_size = sizeof(EFI_MEMORY_DESCRIPTOR);
+    g_ebs_force_probe_error = 0;
+}
+
+static void test_exit_boot_services_success_first_try(void) {
+    EFI_BOOT_SERVICES bs;
+    EFI_STATUS status;
+
+    make_ebs_boot_services(&bs);
+    reset_ebs_mocks();
+
+    status = hype_exit_boot_services((EFI_HANDLE)0x1234, &bs);
+
+    CHECK_INT("exit_boot_services succeeds first try", (int)EFI_SUCCESS, (int)status);
+    CHECK_INT("exit_boot_services calls ExitBootServices once", 1, g_ebs_exit_calls);
+    CHECK_INT("exit_boot_services does not free the map on success", 0, g_ebs_free_calls);
+}
+
+static void test_exit_boot_services_retries_on_stale_map_key(void) {
+    EFI_BOOT_SERVICES bs;
+    EFI_STATUS status;
+
+    make_ebs_boot_services(&bs);
+    reset_ebs_mocks();
+    g_ebs_fail_count = 2; /* fail twice, succeed on the 3rd attempt */
+
+    status = hype_exit_boot_services((EFI_HANDLE)0x1234, &bs);
+
+    CHECK_INT("exit_boot_services eventually succeeds", (int)EFI_SUCCESS, (int)status);
+    CHECK_INT("exit_boot_services retried exactly 3 times", 3, g_ebs_exit_calls);
+    CHECK_INT("exit_boot_services frees the map on each failed attempt", 2, g_ebs_free_calls);
+}
+
+static void test_exit_boot_services_propagates_memmap_error(void) {
+    EFI_BOOT_SERVICES bs;
+    EFI_STATUS status;
+
+    make_ebs_boot_services(&bs);
+    reset_ebs_mocks();
+    g_ebs_force_probe_error = 1;
+    g_ebs_probe_error_value = EFI_ERR_BIT | 9;
+
+    status = hype_exit_boot_services((EFI_HANDLE)0x1234, &bs);
+
+    CHECK_INT("exit_boot_services propagates a real GetMemoryMap error",
+              (int)(EFI_ERR_BIT | 9), (int)status);
+    CHECK_INT("exit_boot_services never calls ExitBootServices if memmap fetch fails",
+              0, g_ebs_exit_calls);
+}
+
 int main(void) {
     test_type_name();
     test_get_success();
@@ -312,6 +430,9 @@ int main(void) {
     test_get_second_call_error();
     test_dump();
     test_dump_empty();
+    test_exit_boot_services_success_first_try();
+    test_exit_boot_services_retries_on_stale_map_key();
+    test_exit_boot_services_propagates_memmap_error();
 
     if (failures == 0) {
         printf("all tests passed\n");

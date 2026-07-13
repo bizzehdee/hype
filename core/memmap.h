@@ -31,4 +31,20 @@ void hype_memmap_dump(EFI_SYSTEM_TABLE *system_table,
                        UINTN map_size,
                        UINTN desc_size);
 
+/*
+ * M1-4: calls ExitBootServices(), handling the spec-mandated retry --
+ * if the memory map changes between GetMemoryMap() and
+ * ExitBootServices() (map_key goes stale), ExitBootServices() fails and
+ * boot services are still active, so the correct response is to fetch a
+ * fresh map and try again (this converges quickly in practice; nothing
+ * bounds the retry count because nothing in the spec does either -- a
+ * system where this never converges has bigger problems than this loop).
+ *
+ * On success, boot services (including ConOut) are gone -- the caller
+ * must not touch system_table->BootServices or system_table->ConOut
+ * again. On failure (a GetMemoryMap error unrelated to staleness), boot
+ * services are still usable and no allocation is left outstanding.
+ */
+EFI_STATUS hype_exit_boot_services(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs);
+
 #endif /* HYPE_MEMMAP_H */

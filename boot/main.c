@@ -1,5 +1,6 @@
 #include "../core/efi_types.h"
 #include "../core/console.h"
+#include "../core/halt.h"
 #include "../core/memmap.h"
 #include "../core/sys_table.h"
 #include "../arch/x86_64/cpu/gdt.h"
@@ -18,8 +19,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
     EFI_STATUS status;
-
-    (void)ImageHandle;
 
     hype_sys_table_set(SystemTable);
     hype_console_print(SystemTable, "hype\n");
@@ -45,16 +44,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_memmap_dump(SystemTable, map, map_size, desc_size);
     SystemTable->BootServices->FreePool(map);
 
+    status = hype_exit_boot_services(ImageHandle, SystemTable->BootServices);
+    if (status != EFI_SUCCESS) {
+        hype_console_print(SystemTable, "ExitBootServices failed: 0x%llx\n", (unsigned long long)status);
+        return status;
+    }
+
     /*
-     * Returning EFI_SUCCESS here hands control back to firmware, which
-     * keeps running its own subsequent code (the boot manager, etc.)
-     * with our GDT/IDT still installed at the CPU level -- firmware
-     * wasn't expecting that, so its first hardware interrupt after this
-     * point hits our (currently panics-on-everything) IDT instead of
-     * its own. That's expected and harmless for M1-2: this whole
-     * boot-services-still-attached flow is transitional scaffolding.
-     * Once M1-4 calls ExitBootServices(), control never returns to
-     * firmware at all, and this stops being a real scenario.
+     * Boot Services -- including ConOut, which every hype_console_print
+     * above depended on -- are gone as of the line above. This is now
+     * the only kernel running on this CPU; there is no output channel
+     * again until M1-5 (serial) or M1-6 (GOP), and nothing else built
+     * yet for it to do, so halt.
      */
-    return EFI_SUCCESS;
+    hype_halt_forever();
 }

@@ -66,7 +66,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
   Deps: M0-4, M0-5
 - [x] **M1-3** — Own paging.
   Deps: M0-4, M0-5
-- [ ] **M1-4** — `ExitBootServices()` sequence; hypervisor becomes the only
+- [x] **M1-4** — `ExitBootServices()` sequence; hypervisor becomes the only
   kernel.
   Deps: M1-2, M1-3
 - [ ] **M1-5** — Serial console driver.

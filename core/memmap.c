@@ -79,3 +79,23 @@ void hype_memmap_dump(EFI_SYSTEM_TABLE *system_table,
                             (unsigned long long)d->NumberOfPages);
     }
 }
+
+EFI_STATUS hype_exit_boot_services(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs) {
+    EFI_MEMORY_DESCRIPTOR *map = 0;
+    UINTN map_size = 0, desc_size = 0, map_key = 0;
+    EFI_STATUS status;
+
+    for (;;) {
+        status = hype_memmap_get(bs, &map, &map_size, &desc_size, &map_key);
+        if (status != EFI_SUCCESS) {
+            return status;
+        }
+
+        status = bs->ExitBootServices(image_handle, map_key);
+        if (status == EFI_SUCCESS) {
+            return EFI_SUCCESS;
+        }
+
+        bs->FreePool(map);
+    }
+}
