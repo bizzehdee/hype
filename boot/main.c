@@ -1,6 +1,8 @@
 #include "../core/efi_types.h"
 #include "../core/console.h"
 #include "../core/format.h"
+#include "../core/gop.h"
+#include "../core/gop_text.h"
 #include "../core/halt.h"
 #include "../core/memmap.h"
 #include "../core/panic.h"
@@ -16,11 +18,14 @@ static hype_idt_entry_t g_idt[HYPE_IDT_ENTRY_COUNT];
 static hype_pte_t g_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_pd[HYPE_PAGING_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_gop_console_t g_gop_console;
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
     EFI_STATUS status;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
+    int have_gop;
 
     hype_console_print(SystemTable, "hype\n");
 
@@ -37,6 +42,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     hype_memmap_dump(SystemTable, map, map_size, desc_size);
     SystemTable->BootServices->FreePool(map);
+
+    /* LocateProtocol is a Boot Services call like the memory map fetch
+     * above -- must happen before ExitBootServices(). A GOP-less system
+     * isn't fatal: serial remains available regardless, so just note it
+     * and move on rather than hype_panic(). */
+    status = hype_gop_locate(SystemTable->BootServices, &gop);
+    have_gop = (status == EFI_SUCCESS);
+    if (!have_gop) {
+        hype_console_print(SystemTable, "no GOP found: 0x%llx\n", (unsigned long long)status);
+    }
 
     status = hype_exit_boot_services(ImageHandle, SystemTable->BootServices);
     if (status != EFI_SUCCESS) {
@@ -92,9 +107,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * Boot Services -- including ConOut, which every hype_console_print
      * above depended on -- are gone as of the ExitBootServices() call
      * above. This is now the only kernel running on this CPU. Serial
-     * (initialized above) is the only output channel until M1-6 (GOP);
-     * nothing else built yet for it to do, so say so and halt.
+     * (initialized above) is one output channel; GOP (if found earlier,
+     * while Boot Services still worked) is the other -- the framebuffer
+     * itself is just memory, identity-mapped by our own paging above,
+     * so writing into it needs nothing further from firmware. Only
+     * handle the two 32bpp linear pixel formats GOP defines; anything
+     * else (PixelBltOnly, PixelBitMask) isn't a linear framebuffer we
+     * can just write into, so skip it rather than misinterpret it.
      */
+    if (have_gop && gop->Mode != 0 && gop->Mode->Info != 0 &&
+        (gop->Mode->Info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor ||
+         gop->Mode->Info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)) {
+        hype_gop_console_init(&g_gop_console, (void *)gop->Mode->FrameBufferBase,
+                               gop->Mode->Info->HorizontalResolution,
+                               gop->Mode->Info->VerticalResolution,
+                               gop->Mode->Info->PixelsPerScanLine,
+                               0xFFFFFFu, 0x000000u);
+        hype_gop_print(&g_gop_console, "hype: Boot Services exited, hypervisor now running\n");
+    }
+
     hype_serial_print("hype: Boot Services exited, hypervisor now running\n");
     hype_halt_forever();
 }

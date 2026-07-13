@@ -71,7 +71,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
   Deps: M1-2, M1-3
 - [x] **M1-5** — Serial console driver.
   Deps: M1-4
-- [ ] **M1-6** — GOP linear-framebuffer text renderer (bitmap font blitter)
+- [x] **M1-6** — GOP linear-framebuffer text renderer (bitmap font blitter)
   — reused later by the dashboard (§6b) and guest firmware GOP exposure
   (§6/§6c).
   Deps: M1-4
@@ -177,7 +177,7 @@ multi-VM concurrency milestone, even though early single-guest milestones
 
 ## VIDEO — Display devices (plan.md §6, §6b)
 
-- [ ] **VIDEO-1** — (= M1-6) GOP linear-framebuffer text renderer.
+- [x] **VIDEO-1** — (= M1-6) GOP linear-framebuffer text renderer.
   Deps: M1-6
 - [ ] **VIDEO-2** — Guest-facing GOP protocol exposure, pre-OS-driver
   (writes into a per-VM framebuffer in guest RAM).
