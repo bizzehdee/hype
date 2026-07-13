@@ -116,7 +116,7 @@ multi-VM concurrency milestone, even though early single-guest milestones
 
 ## M2 — VMX/SVM bring-up, single vCPU (plan.md §9 M2, §10 decision #6/#17)
 
-- [ ] **M2-1** — CPU feature detection (VMX/EPT vs. SVM/NPT) and
+- [x] **M2-1** — CPU feature detection (VMX/EPT vs. SVM/NPT) and
   `vmm_ops` vtable dispatch (`vmx_ops` / `svm_ops`).
   Deps: M1-4
 - [ ] **M2-2** — VMXON (Intel) / SVM mode enable (AMD).

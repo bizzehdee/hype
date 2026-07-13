@@ -6,6 +6,7 @@
 #include "../core/halt.h"
 #include "../core/memmap.h"
 #include "../core/serial.h"
+#include "../arch/x86_64/cpu/cpu_features.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
 #include "../arch/x86_64/cpu/isr.h"
@@ -158,6 +159,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
     hype_serial_print("timer: %llu ticks (PIT @ 1000Hz)\n",
                        (unsigned long long)hype_timer_get_ticks());
+
+    /* M2-1: which virtualization backend this host actually has.
+     * Neither is fatal in the sense of a config error -- it means this
+     * hardware (or QEMU without -cpu host/+svm/+vmx) simply can't run
+     * VMs at all, which is unrecoverable for a hypervisor either way. */
+    switch (hype_cpu_detect_vmm_kind()) {
+    case HYPE_VMM_KIND_VMX:
+        hype_serial_print("vmm: VMX (Intel) detected\n");
+        break;
+    case HYPE_VMM_KIND_SVM:
+        hype_serial_print("vmm: SVM (AMD) detected\n");
+        break;
+    case HYPE_VMM_KIND_NONE:
+    default:
+        hype_fatal("no usable virtualization extension (VMX/SVM) detected");
+    }
 
     hype_halt_forever();
 }
