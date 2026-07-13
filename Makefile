@@ -11,10 +11,16 @@ CFLAGS  := --target=$(TARGET) -ffreestanding -fshort-wchar -mno-red-zone \
 LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 
 BUILD_DIR := build
-CORE_SRCS := core/format.c core/console.c core/panic.c core/halt.c core/memmap.c
+CORE_SRCS := core/format.c core/console.c core/panic.c core/halt.c core/memmap.c \
+             core/sys_table.c
+ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
+             arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
+             arch/x86_64/cpu/isr_entry.c
+ARCH_ASM_SRCS := arch/x86_64/cpu/isr_stubs.S
 BOOT_SRCS := boot/main.c
-SRCS      := $(BOOT_SRCS) $(CORE_SRCS)
-OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRCS))
+SRCS      := $(BOOT_SRCS) $(CORE_SRCS) $(ARCH_SRCS)
+OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRCS)) \
+             $(patsubst %.S,$(BUILD_DIR)/%.o,$(ARCH_ASM_SRCS))
 OUT       := $(BUILD_DIR)/hype.efi
 
 OVMF_CODE := /usr/share/OVMF/OVMF_CODE.fd
@@ -28,6 +34,10 @@ all: $(OUT)
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.S
+	@mkdir -p $(dir $@)
+	$(CC) --target=$(TARGET) -ffreestanding -mno-red-zone -c $< -o $@
 
 $(OUT): $(OBJS)
 	$(LD) $(LDFLAGS) -out:$@ $(OBJS)

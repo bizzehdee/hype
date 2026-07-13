@@ -62,7 +62,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
   `cpu_set`, `mem_mb`, `boot`, `install_media`, `target_disk`,
   `target_disk_size_gb`, `firmware`, `os_hint`, `net_mode`).
   Deps: M0-4, M0-5
-- [ ] **M1-2** — Own GDT/IDT.
+- [x] **M1-2** — Own GDT/IDT.
   Deps: M0-4, M0-5
 - [ ] **M1-3** — Own paging.
   Deps: M0-4, M0-5
