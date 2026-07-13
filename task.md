@@ -69,7 +69,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
 - [x] **M1-4** — `ExitBootServices()` sequence; hypervisor becomes the only
   kernel.
   Deps: M1-2, M1-3
-- [ ] **M1-5** — Serial console driver.
+- [x] **M1-5** — Serial console driver.
   Deps: M1-4
 - [ ] **M1-6** — GOP linear-framebuffer text renderer (bitmap font blitter)
   — reused later by the dashboard (§6b) and guest firmware GOP exposure

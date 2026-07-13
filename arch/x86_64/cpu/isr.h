@@ -25,16 +25,17 @@ typedef struct {
  * vectors; vectors 32-255 are user-defined/IRQ, unused before M1-8. */
 const char *hype_isr_vector_name(uint64_t vector);
 
-/* Formats the fatal-fault message hype_isr_dispatch() panics with.
- * Pure/testable -- see isr_dispatch.c for why dispatch itself isn't. */
+/* Formats the fatal-fault message hype_isr_dispatch() prints. Pure/
+ * testable -- see isr_decode.c for why dispatch itself isn't. */
 void hype_isr_format_message(char *buf, unsigned long long bufsz, const hype_isr_frame_t *frame);
 
 /*
  * Called by isr_stubs.S's common trampoline for every one of the 256
- * vectors. For M1, every fault is fatal: format a message and panic.
- * Never returns. Not unit tested -- it's a thin wrapper around the
- * tested hype_isr_format_message() plus the noreturn hype_panic(),
- * same reasoning as hype_panic() itself (halt.h).
+ * vectors. For M1, every fault is fatal: format a message, print it via
+ * serial (never ConOut -- see isr_entry.c for why that's not optional),
+ * halt. Never returns. Not unit tested -- it's a thin wrapper around
+ * the tested hype_isr_format_message() plus the noreturn
+ * hype_halt_forever(), same reasoning as hype_panic() itself (halt.h).
  */
 void hype_isr_dispatch(const hype_isr_frame_t *frame);
 

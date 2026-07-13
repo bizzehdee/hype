@@ -61,11 +61,26 @@ void hype_idt_encode_entry(hype_idt_entry_t *entry, uint64_t handler,
  */
 void hype_idt_build(hype_idt_entry_t *table, const uint64_t *stub_table, uint16_t code_selector);
 
-/* Loads `table` via `lidt`. Never unit tested -- see idt_load.c. */
+/*
+ * Masks interrupts (`cli`) and loads `table` via `lidt`, atomically --
+ * every vector here is fatal (M1's policy), so there must be no window
+ * where the table is live but interrupts aren't yet masked. Only call
+ * this once nothing that could still flip interrupts back on will ever
+ * run again -- in practice, after a successful ExitBootServices() (see
+ * boot/main.c and this function's own comment in idt_load.c for why
+ * that ordering matters). Re-enabling (`sti`) is a separate, later
+ * decision (M1-8). Never unit tested -- see idt_load.c.
+ */
 void hype_idt_load(const hype_idt_entry_t *table, uint16_t entry_count);
 
 /* HYPE_IDT_ENTRY_COUNT stub entry points, one per vector, defined in
  * isr_stubs.S -- pass directly as hype_idt_build()'s stub_table. */
 extern const uint64_t hype_isr_stub_table[HYPE_IDT_ENTRY_COUNT];
+
+/* Raw cli/sti, for later callers that need to mask/unmask outside of
+ * hype_idt_load() (e.g. M1-8 re-enabling once ready). Never unit
+ * tested -- see idt_load.c. */
+void hype_cli(void);
+void hype_sti(void);
 
 #endif /* HYPE_ARCH_IDT_H */

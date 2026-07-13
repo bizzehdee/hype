@@ -17,7 +17,7 @@ LIB_DIRS="../ ../../arch/x86_64/cpu/"
 # AGENTS.md. Still linked below; just not reported on.
 is_exempt() {
     case "$1" in
-        */halt.c|*/gdt_load.c|*/idt_load.c|*/isr_entry.c|*/paging_load.c) return 0 ;;
+        */halt.c|*/gdt_load.c|*/idt_load.c|*/isr_entry.c|*/paging_load.c|*/serial_hw.c) return 0 ;;
         *) return 1 ;;
     esac
 }

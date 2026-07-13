@@ -12,7 +12,7 @@ LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 
 BUILD_DIR := build
 CORE_SRCS := core/format.c core/console.c core/panic.c core/halt.c core/memmap.c \
-             core/sys_table.c
+             core/serial.c core/serial_hw.c
 ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
              arch/x86_64/cpu/isr_entry.c arch/x86_64/cpu/paging.c \
