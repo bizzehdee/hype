@@ -116,6 +116,18 @@ static void test_build_realmode_guest_zeroes_first(void) {
               vmcb.control.reserved_host_usage[0]);
 }
 
+static void test_enable_nested_paging(void) {
+    hype_vmcb_t vmcb;
+
+    hype_vmcb_build_realmode_guest(&vmcb, 0, 0, 0, 0);
+    CHECK_HEX("nested paging starts disabled", 0, vmcb.control.np_enable);
+
+    hype_vmcb_enable_nested_paging(&vmcb, 0x400000ULL);
+
+    CHECK_HEX("NP_ENABLE set", 1, vmcb.control.np_enable);
+    CHECK_HEX("N_CR3 set to the given NPT root", 0x400000ULL, vmcb.control.n_cr3);
+}
+
 static void test_configure_avic(void) {
     hype_vmcb_t vmcb;
 
@@ -159,6 +171,7 @@ int main(void) {
     test_seg_attrib();
     test_build_realmode_guest();
     test_build_realmode_guest_zeroes_first();
+    test_enable_nested_paging();
     test_configure_avic();
     test_configure_avic_masks_low_bits_and_sets_max_index();
 

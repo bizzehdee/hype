@@ -31,6 +31,7 @@
 
 #define HYPE_PAGING_PRESENT (1ULL << 0)
 #define HYPE_PAGING_WRITE (1ULL << 1)
+#define HYPE_PAGING_USER (1ULL << 2)
 #define HYPE_PAGING_PS (1ULL << 7)
 
 typedef uint64_t hype_pte_t;

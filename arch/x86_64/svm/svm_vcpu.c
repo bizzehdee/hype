@@ -42,10 +42,17 @@ static inline void vmsave(uint64_t vmcb_phys) {
 }
 
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root) {
-    (void)ept_or_npt_root;
-
     hype_vmcb_build_realmode_guest(&g_vmcb, guest_rip, guest_rsp, (uint64_t)(uintptr_t)g_iopm,
                                     (uint64_t)(uintptr_t)g_msrpm);
+
+    /* 0 means "no nested paging" (M2's original, still-supported
+     * scope) -- a real NPT root is always a nonzero, page-aligned
+     * physical address. See vmcb.h's HYPE_SVM_INT_CTL_AVIC_ENABLE
+     * comment: AVIC additionally requires this to have been called. */
+    if (ept_or_npt_root != 0) {
+        hype_vmcb_enable_nested_paging(&g_vmcb, ept_or_npt_root);
+    }
+
     g_ctx.vmcb = &g_vmcb;
     return &g_ctx;
 }

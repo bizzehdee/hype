@@ -50,17 +50,20 @@ void hype_svm_vcpu_enable_apic_accel(hype_vmcb_t *vmcb);
  * M2-7: creates this backend's (single, static -- M2's scope is one
  * vCPU; M8 is where real multi-vCPU allocation happens) vCPU context,
  * building a flat real-address-mode guest
- * (hype_vmcb_build_realmode_guest()) whose CS.base points directly at
- * guest_rip (RIP=0) -- unlike the classic entry_seg*16 real-mode
- * convention, guest_rip can be any address in the low 4GB (see
- * vmcb.h's "big real mode" comment), which matters because a
- * UEFI-loaded hypervisor's own static buffers can end up anywhere
- * firmware's PE loader put them, nowhere near the first 1MB.
- * ept_or_npt_root is accepted per hype_vmm_ops_t's signature but
- * unused (M2 has no nested paging -- M3-1's job); only 0 is supported
- * here. Exempt from unit testing -- thin wrapper around
- * hype_vmcb_build_realmode_guest() (already tested) with no logic of
- * its own.
+ * (hype_vmcb_build_realmode_guest()) whose CS.base/SS.base point
+ * directly at guest_rip/guest_rsp (RIP/RSP=0) -- guest_rip/guest_rsp
+ * can be any address, unlike the classic entry_seg*16 real-mode
+ * convention (see vmcb.h), which matters because a UEFI-loaded
+ * hypervisor's own static buffers can end up anywhere firmware's PE
+ * loader put them, nowhere near the first 1MB.
+ * ept_or_npt_root (M3-1): 0 means no nested paging (M2's original
+ * scope, still supported); a nonzero value is treated as an NPT root
+ * physical address built by hype_npt_build_identity()
+ * (arch/x86_64/svm/npt.h) and wired in via
+ * hype_vmcb_enable_nested_paging(). Exempt from unit testing -- thin
+ * wrapper around hype_vmcb_build_realmode_guest()/
+ * hype_vmcb_enable_nested_paging() (both already tested) with no logic
+ * of its own beyond the zero-check.
  */
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root);
 

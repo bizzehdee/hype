@@ -93,6 +93,11 @@ void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint
     vmcb->save.rax = 0;
 }
 
+void hype_vmcb_enable_nested_paging(hype_vmcb_t *vmcb, uint64_t npt_root_phys) {
+    vmcb->control.np_enable = 1;
+    vmcb->control.n_cr3 = npt_root_phys;
+}
+
 void hype_vmcb_configure_avic(hype_vmcb_t *vmcb, uint64_t apic_bar_phys,
                                uint64_t backing_page_phys, uint64_t logical_table_phys,
                                uint64_t physical_table_phys, uint8_t max_physical_id) {

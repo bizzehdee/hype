@@ -227,6 +227,19 @@ void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint
                                      uint64_t iopm_phys, uint64_t msrpm_phys);
 
 /*
+ * Enables nested paging (M3-1) on an already-built VMCB: sets
+ * NP_ENABLE and points N_CR3 at an NPT root built by
+ * hype_npt_build_identity() (arch/x86_64/svm/npt.h). Deliberately
+ * separate from hype_vmcb_build_realmode_guest() (which always leaves
+ * NP_ENABLE=0) so existing callers/tests of that function are
+ * unaffected -- callers that want nested paging call this afterward,
+ * the same layering hype_vmcb_configure_avic() already uses (and which
+ * AVIC, per its own comment above, actually depends on this having
+ * been called first). Pure struct mutation -- no CPU state touched.
+ */
+void hype_vmcb_enable_nested_paging(hype_vmcb_t *vmcb, uint64_t npt_root_phys);
+
+/*
  * Enables AVIC on an already-built VMCB (see the requirement note
  * above hype_vmcb_configure_avic()'s bit definitions -- `vmcb` must
  * also have NP_ENABLE=1): sets int_ctl's AVIC-enable bit and wires in

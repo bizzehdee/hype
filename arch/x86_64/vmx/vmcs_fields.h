@@ -48,6 +48,17 @@
  */
 #define HYPE_VMX_PROCBASED_USE_TPR_SHADOW (1u << 21)
 /* Secondary processor-based VM-execution control bits used here. */
+/* "Unrestricted guest" (below) requires "enable EPT" to also be 1 --
+ * Intel SDM: an unrestricted guest can run with paging disabled, and
+ * EPT is what still gives every guest-physical access a real
+ * translation/permission check in that state. M3-1 is what actually
+ * builds and wires in real EPT tables (ept.c); before that, M2's
+ * vcpu_create path never got to VMLAUNCH/VMRESUME anyway (see
+ * vmx_ops.c), so this requirement went unmet without effect -- still
+ * worth fixing now that EPT construction exists, since VMX's
+ * unrestricted-guest configuration would otherwise be invalid on real
+ * hardware regardless. */
+#define HYPE_VMX_PROCBASED2_ENABLE_EPT (1u << 1)
 #define HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST (1u << 7)
 /* APIC-register virtualization / virtual-interrupt delivery (M2-4):
  * both operate on the virtual-APIC page directly, not through EPT, so
@@ -80,6 +91,7 @@
 
 /* 64-bit fields (Table B-4/B-6). */
 #define HYPE_VMCS_VIRTUAL_APIC_PAGE_ADDR 0x2012u /* full; +1 = high (M2-4) */
+#define HYPE_VMCS_EPT_POINTER 0x201Au /* full; +1 = high (M3-1) */
 #define HYPE_VMCS_VMCS_LINK_POINTER 0x2800u /* full; +1 = high */
 
 /* 32-bit control fields (Table B-8). */

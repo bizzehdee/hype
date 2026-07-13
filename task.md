@@ -154,7 +154,7 @@ multi-VM concurrency milestone, even though early single-guest milestones
 
 ## M3 — EPT + first real guest boot (plan.md §9 M3)
 
-- [ ] **M3-1** — EPT/NPT table construction (identity-mapped).
+- [x] **M3-1** — EPT/NPT table construction (identity-mapped).
   Deps: M2-7
 - [ ] **M3-2** — 1:1 vCPU-to-pCPU pinning, including explicit `cpu_set`
   support.

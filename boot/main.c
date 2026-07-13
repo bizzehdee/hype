@@ -18,6 +18,7 @@
 #include "../arch/x86_64/cpu/timer.h"
 #include "../arch/x86_64/cpu/vmexit.h"
 #include "../arch/x86_64/cpu/vmm_select.h"
+#include "../arch/x86_64/svm/npt.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -30,11 +31,16 @@ static hype_gop_console_t g_gop_console;
 
 /* M2-7: the hand-written test guest's code+stack pages -- wherever
  * the linker/loader actually placed them; hype_svm_vcpu_create()
- * points the guest's CS.base directly at their address (see vmcb.h's
- * "big real mode" comment), so no particular alignment or address
- * range is required. */
+ * points the guest's CS.base/SS.base directly at their address (see
+ * vmcb.h), so no particular alignment or address range is required. */
 static uint8_t g_m2_7_guest_code[4096] __attribute__((aligned(4096)));
 static uint8_t g_m2_7_guest_stack[4096] __attribute__((aligned(4096)));
+
+/* M3-1: NPT identity map for the same test guest, built fresh on
+ * every (re)start like everything else here. */
+static hype_pte_t g_npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_npt_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_npt_pd[HYPE_NPT_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
@@ -215,7 +221,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_serial_print("vmm: %s M2-7 test guest: entry_phys=0x%llx stack_phys=0x%llx\n",
                                ops->name, (unsigned long long)entry_phys, (unsigned long long)stack_phys);
 
-            hype_vcpu_ctx_t *ctx = ops->vcpu_create(entry_phys, stack_phys, 0);
+            /* M3-1: SVM's NPT is real and QEMU-validated (unlike EPT,
+             * which has nowhere to be wired in yet -- VMX's
+             * vcpu_create stays NULL, see above). Building it fresh
+             * for every (re)start, same as everything else here. */
+            uint64_t npt_root_phys = 0;
+            if (kind == HYPE_VMM_KIND_SVM) {
+                hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+                npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+                hype_serial_print("vmm: %s NPT identity map built (root=0x%llx, %u GB)\n", ops->name,
+                                   (unsigned long long)npt_root_phys, HYPE_NPT_MAX_GB);
+            }
+
+            hype_vcpu_ctx_t *ctx = ops->vcpu_create(entry_phys, stack_phys, npt_root_phys);
             if (ctx == 0) {
                 hype_fatal("vmm: %s vcpu_create failed", ops->name);
             }
