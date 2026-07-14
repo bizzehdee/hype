@@ -897,3 +897,21 @@ own "keeping plan.md and task.md in sync" rule).
   cross-node memory access is a real, measurable performance cliff this
   project shouldn't reintroduce once it's no longer avoided for free by
   static 1:1 pinning to a fixed core.
+
+- **Memory ballooning, for dynamic per-VM RAM allocation with a
+  configurable floor and ceiling** (noted 2026-07-14). v1's admission
+  control (§6i) sizes each VM's RAM as a fixed amount decided at start
+  and never revisited; v2 would let a VM's actual resident RAM float
+  between an operator-configured floor and ceiling, reclaiming unused
+  memory back to the host (or other VMs) under pressure. This almost
+  certainly needs a **guest-side driver** cooperating with the host (the
+  same shape as virtio-balloon: the guest OS driver "inflates"/"deflates"
+  a balloon of pages it stops using, which the host can then actually
+  reclaim) — it is not something the hypervisor can safely do unilaterally
+  from outside the guest, since only the guest OS knows which of its own
+  pages are genuinely free. Implies a new guest-facing device (likely
+  virtio-balloon itself, for the same guest-driver-availability reasons
+  NET-2/M5 already lean on virtio for net/blk) plus new `hype.cfg` surface
+  for the floor/ceiling and probably a host-side reclamation policy
+  (§6i's admission-control math would also need to account for "ceiling,"
+  not just a fixed size, when validating total host RAM commitment).
