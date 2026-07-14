@@ -1089,6 +1089,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_gop_console_clear(&g_gop_console);
         hype_fatal_set_gop(&g_gop_console);
         hype_gop_print(&g_gop_console, "hype: running self-tests...\n");
+        /* Real-hardware debugging: our own host paging (built later,
+         * right after ExitBootServices -- see HYPE_PAGING_MAX_GB) only
+         * identity-maps the first HYPE_PAGING_MAX_GB gigabytes. If this
+         * GPU's framebuffer BAR sits above that (plausible on a modern
+         * board with Resizable BAR/Above-4G decoding), the framebuffer
+         * goes unmapped the instant our own page tables load, faulting
+         * with no IDT yet in place -- this print exists to confirm or
+         * rule that out directly. */
+        hype_debug_print("gop: FrameBufferBase=0x%llx FrameBufferSize=0x%llx\n",
+                          (unsigned long long)gop->Mode->FrameBufferBase,
+                          (unsigned long long)gop->Mode->FrameBufferSize);
     }
 
     /*
@@ -1201,12 +1212,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * line means ExitBootServices() itself never returned control --
      * a real firmware quirk QEMU/OVMF's own implementation might not
      * reproduce. */
-    hype_serial_print("about to call ExitBootServices...\n");
+    hype_debug_print("about to call ExitBootServices...\n");
     status = hype_exit_boot_services(ImageHandle, SystemTable->BootServices);
     if (status != EFI_SUCCESS) {
         hype_fatal("ExitBootServices failed: 0x%llx", (unsigned long long)status);
     }
-    hype_serial_print("ExitBootServices returned\n");
+    hype_debug_print("ExitBootServices returned\n");
 
     /*
      * GDT, paging, and IDT are all built and loaded here, together,
@@ -1238,27 +1249,27 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * an interrupt could actually fire.
      */
     hype_cli();
-    hype_serial_print("interrupts masked (cli)\n");
+    hype_debug_print("interrupts masked (cli)\n");
 
     /* Real-hardware debugging: LGDT + reloading every segment register
      * is one of the more real-silicon-sensitive sequences here (a bad
      * descriptor can fault immediately) -- bracket it so a hang
      * localizes to this exact instruction sequence, not "somewhere
      * between cli and the timer starting." */
-    hype_serial_print("about to load own GDT...\n");
+    hype_debug_print("about to load own GDT...\n");
     hype_gdt_build(g_gdt);
     hype_gdt_load(g_gdt, HYPE_GDT_ENTRY_COUNT);
-    hype_serial_print("own GDT loaded\n");
+    hype_debug_print("own GDT loaded\n");
 
-    hype_serial_print("about to load own paging...\n");
+    hype_debug_print("about to load own paging (identity-mapping %u GB)...\n", HYPE_PAGING_MAX_GB);
     hype_paging_build_identity(g_pml4, g_pdpt, g_pd, HYPE_PAGING_MAX_GB);
     hype_paging_load(g_pml4);
-    hype_serial_print("own paging loaded\n");
+    hype_debug_print("own paging loaded\n");
 
-    hype_serial_print("about to load own IDT...\n");
+    hype_debug_print("about to load own IDT...\n");
     hype_idt_build(g_idt, hype_isr_stub_table, HYPE_GDT_CODE64_SEL);
     hype_idt_load(g_idt, HYPE_IDT_ENTRY_COUNT);
-    hype_serial_print("own IDT loaded\n");
+    hype_debug_print("own IDT loaded\n");
 
     /*
      * Boot Services -- including ConOut, which every hype_console_print
