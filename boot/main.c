@@ -225,6 +225,12 @@ static void EFIAPI run_test_guest(void *arg) {
     const hype_vmm_ops_t *ops = args->ops;
     hype_vmm_kind_t kind = args->kind;
 
+    /* Real-hardware debugging: a hang here (no further serial output
+     * at all past this line) localizes the failure to ops->enable()
+     * itself -- RDMSR/WRMSR against real hardware MSRs, unlike
+     * anything QEMU/KVM's nested-virtualization emulation exercises
+     * the same way bare metal does. */
+    hype_serial_print("vmm: about to enable %s...\n", ops->name);
     if (ops->enable() != 0) {
         hype_fatal("vmm: %s enable failed", ops->name);
     }
@@ -1020,12 +1026,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * instead, right here, same as M2-7/M3-1's original behavior.
      */
     {
-        hype_vmm_kind_t kind = hype_cpu_detect_vmm_kind();
+        hype_cpu_diag_t cpu_diag = hype_cpu_detect_vmm_kind_diag();
+        hype_vmm_kind_t kind = cpu_diag.kind;
         const hype_vmm_ops_t *ops = hype_vmm_ops_for_kind(kind);
         static hype_test_guest_args_t args;
         EFI_MP_SERVICES_PROTOCOL *mp = 0;
         UINTN target_ap = 0;
         int have_target_ap = 0;
+
+        /* Real-hardware debugging: the single most useful line in the
+         * whole log if a machine turns out to be the "wrong" vendor,
+         * or a feature bit is unexpectedly absent (e.g. SVM disabled
+         * in firmware setup) -- print it before anything else can go
+         * wrong, not only on failure. */
+        hype_serial_print(
+            "cpu: vendor=%s vmx=%d svm=%d\n",
+            (cpu_diag.vendor == HYPE_CPU_VENDOR_INTEL)
+                ? "Intel"
+                : (cpu_diag.vendor == HYPE_CPU_VENDOR_AMD) ? "AMD" : "unknown",
+            cpu_diag.has_vmx, cpu_diag.has_svm);
 
         if (ops == 0) {
             hype_fatal("no usable virtualization extension (VMX/SVM) detected");
@@ -1046,6 +1065,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
             hype_console_print(SystemTable, "mp: dispatching test guest to pinned pCPU #%llu\n",
                                 (unsigned long long)target_ap);
+            /* Mirrored to serial too (not just the UEFI console) --
+             * real-hardware debugging: if the AP never comes back, this
+             * is the last line either channel will show, and serial is
+             * the more reliable one to actually capture from real
+             * hardware. */
+            hype_serial_print("mp: dispatching test guest to pinned pCPU #%llu...\n",
+                               (unsigned long long)target_ap);
             /* WaitEvent=0/NULL => blocking: waits for
              * run_all_test_guests() to return, which it always does on
              * success. On a fatal path inside it (hype_fatal() ->
@@ -1070,10 +1096,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         }
     }
 
+    /* Real-hardware debugging: a hang with this as the last serial
+     * line means ExitBootServices() itself never returned control --
+     * a real firmware quirk QEMU/OVMF's own implementation might not
+     * reproduce. */
+    hype_serial_print("about to call ExitBootServices...\n");
     status = hype_exit_boot_services(ImageHandle, SystemTable->BootServices);
     if (status != EFI_SUCCESS) {
         hype_fatal("ExitBootServices failed: 0x%llx", (unsigned long long)status);
     }
+    hype_serial_print("ExitBootServices returned\n");
 
     /*
      * GDT, paging, and IDT are all built and loaded here, together,
@@ -1105,15 +1137,24 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * an interrupt could actually fire.
      */
     hype_cli();
+    hype_serial_print("interrupts masked (cli)\n");
 
+    /* Real-hardware debugging: LGDT + reloading every segment register
+     * is one of the more real-silicon-sensitive sequences here (a bad
+     * descriptor can fault immediately) -- bracket it so a hang
+     * localizes to this exact instruction sequence, not "somewhere
+     * between cli and the timer starting." */
+    hype_serial_print("about to load own GDT...\n");
     hype_gdt_build(g_gdt);
     hype_gdt_load(g_gdt, HYPE_GDT_ENTRY_COUNT);
     hype_serial_print("own GDT loaded\n");
 
+    hype_serial_print("about to load own paging...\n");
     hype_paging_build_identity(g_pml4, g_pdpt, g_pd, HYPE_PAGING_MAX_GB);
     hype_paging_load(g_pml4);
     hype_serial_print("own paging loaded\n");
 
+    hype_serial_print("about to load own IDT...\n");
     hype_idt_build(g_idt, hype_isr_stub_table, HYPE_GDT_CODE64_SEL);
     hype_idt_load(g_idt, HYPE_IDT_ENTRY_COUNT);
     hype_serial_print("own IDT loaded\n");
@@ -1138,6 +1179,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                gop->Mode->Info->VerticalResolution,
                                gop->Mode->Info->PixelsPerScanLine,
                                0xFFFFFFu, 0x000000u);
+        /* Firmware's own pre-ExitBootServices console output is still
+         * sitting in this same linear framebuffer otherwise. */
+        hype_gop_console_clear(&g_gop_console);
         /* From here on, any fatal fault (arch/x86_64/cpu/isr_decode.c)
          * prints to this console too, not just serial. */
         hype_fatal_set_gop(&g_gop_console);
@@ -1163,7 +1207,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_isr_register(HYPE_TIMER_VECTOR, hype_timer_isr);
     hype_pic_unmask_irq(HYPE_TIMER_IRQ);
     hype_pit_init(1000);
+    hype_serial_print("about to enable interrupts (sti)...\n");
     hype_sti();
+    hype_serial_print("interrupts enabled -- waiting for timer ticks\n");
 
     {
         uint64_t target = hype_timer_get_ticks() + 1000; /* ~1s at 1000Hz */

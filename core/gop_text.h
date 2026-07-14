@@ -49,6 +49,12 @@ void hype_gop_draw_glyph(hype_gop_console_t *con, unsigned int col, unsigned int
  * row. */
 void hype_gop_scroll(hype_gop_console_t *con);
 
+/* Fills every visible pixel to bg and resets the cursor to (0,0) --
+ * firmware's own pre-ExitBootServices console output (or a prior
+ * console's leftover text) is still sitting in the same linear
+ * framebuffer otherwise, since nothing before this ever clears it. */
+void hype_gop_console_clear(hype_gop_console_t *con);
+
 /* Writes one character: '\n' moves to the next line (scrolling if
  * already on the last row); anything else draws a glyph and advances
  * the cursor, wrapping to the next line at the right edge. */

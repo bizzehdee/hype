@@ -212,6 +212,33 @@ static void test_scroll_noop_when_shorter_than_one_glyph_row(void) {
     }
 }
 
+static void test_console_clear(void) {
+    hype_gop_console_t con;
+    unsigned int x, y;
+    int all_bg = 1;
+
+    reset_fb(&con);
+    hype_gop_write(&con, "hi");
+    con.cursor_row = 1;
+    con.cursor_col = 2;
+
+    hype_gop_console_clear(&con);
+
+    for (y = 0; y < FB_H; y++) {
+        for (x = 0; x < FB_W; x++) {
+            if (px(x, y) != BG) {
+                all_bg = 0;
+            }
+        }
+    }
+    if (!all_bg) {
+        printf("FAIL: clear did not set every pixel to bg\n");
+        failures++;
+    }
+    CHECK_INT("clear resets cursor col", 0, con.cursor_col);
+    CHECK_INT("clear resets cursor row", 0, con.cursor_row);
+}
+
 static void test_write_and_print(void) {
     hype_gop_console_t con;
     reset_fb(&con);
@@ -236,6 +263,7 @@ int main(void) {
     test_putc_scrolls_when_last_row_wraps();
     test_scroll();
     test_scroll_noop_when_shorter_than_one_glyph_row();
+    test_console_clear();
     test_write_and_print();
 
     if (failures == 0) {

@@ -63,6 +63,18 @@ void hype_gop_scroll(hype_gop_console_t *con) {
     }
 }
 
+void hype_gop_console_clear(hype_gop_console_t *con) {
+    unsigned int x, y;
+
+    for (y = 0; y < con->height; y++) {
+        for (x = 0; x < con->width; x++) {
+            con->fb[pixel_index(con, x, y)] = con->bg;
+        }
+    }
+    con->cursor_col = 0;
+    con->cursor_row = 0;
+}
+
 static void gop_newline(hype_gop_console_t *con) {
     con->cursor_col = 0;
     if (con->cursor_row + 1 >= con->rows) {
