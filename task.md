@@ -382,8 +382,6 @@ tasks — see updated deps below.*
   trap mechanism are both reusable as-is once M5 exists.*
 - [ ] **M4-4** — Per-VM ACPI table synthesis (RSDP/XSDT/FADT/MADT/MCFG).
   Deps: M4-2, M3-2
-- [ ] **M4-4** — Per-VM ACPI table synthesis (RSDP/XSDT/FADT/MADT/MCFG).
-  Deps: M4-2, M3-2
 - [ ] **M4-5** — Virtual optical drive device (read-only ISO passthrough,
   AHCI/ATAPI or virtio-scsi CD-ROM).
   Deps: M3-1
@@ -574,6 +572,20 @@ tasks — see updated deps below.*
 - [ ] **STRETCH-4** — Guest disk image snapshotting (explicit non-goal for
   v1 — only revisit if a real ask emerges, per §10 decision #3).
   Deps: M5-3
+
+---
+
+## DOCS — User-facing documentation
+
+- [ ] **DOCS-1** — End-user `README.md`: written for someone downloading a
+  packaged build/installer, not building from source. Covers what hype is,
+  supported host/guest requirements, install steps, first-run/basic usage,
+  and where to get help — no build/toolchain instructions (those stay in
+  `fw/README.md`/`tools/`, not the top-level README). Keep in sync with
+  whatever v1's actual packaging/installer mechanism ends up being, so this
+  is best written once that's settled (post-M9/M10 area) rather than
+  early.
+  Deps: none hard, but most useful once install/packaging is real (M9/M10)
 
 ---
 

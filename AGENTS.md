@@ -146,3 +146,17 @@ changes — this file is the condensed rule set, not a replacement for either.
 - If a change makes a `plan.md` §10 decision obsolete or wrong, update that
   decision's entry (don't delete the history — note what changed and why,
   matching the existing entries' style).
+
+## Keeping user-facing docs in sync
+
+- The top-level `README.md` (once `DOCS-1` exists) is written for someone
+  downloading a packaged build/installer — no build/toolchain instructions
+  there. Build/toolchain docs belong in `fw/README.md`/`tools/` instead;
+  don't blur the two.
+- Any change that affects what an end user sees or does — install steps,
+  supported host/guest OS list, first-run behavior, config file format,
+  packaging/installer mechanism — must update `README.md` (and any other
+  affected doc, e.g. `fw/README.md` for firmware-build-provenance changes)
+  in the same change, not as a follow-up. Treat stale user-facing docs the
+  same as a stale `task.md`/`plan.md` — don't merge a behavior change
+  without the doc that describes it.
