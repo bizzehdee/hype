@@ -60,8 +60,16 @@ static hype_pte_t g_npt_pd[HYPE_NPT_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __att
  * entry, with the kernel/zero-page/stack range identity-mapped.
  * Reuses hype_paging_build_identity() directly (arch/x86_64/cpu/
  * paging.h) -- a ring-0-only guest CR3 needs no User/Supervisor bit,
- * unlike NPT (arch/x86_64/svm/npt.h). */
-#define HYPE_M3_5_GUEST_PAGING_GB 4
+ * unlike NPT (arch/x86_64/svm/npt.h).
+ *
+ * Tied to HYPE_PAGING_MAX_GB, not a separate smaller constant, for the
+ * same real-hardware reason as HYPE_NPT_MAX_GB (arch/x86_64/svm/npt.h)
+ * -- a 4GB-only map left this guest's own entry point (a static buffer
+ * in the same image) unmapped and immediately triple-faulting
+ * (VMEXIT_SHUTDOWN) the first time this ran on real AMD hardware whose
+ * firmware happened to load the image above 4GB, something QEMU's own
+ * small test VMs never exercised. */
+#define HYPE_M3_5_GUEST_PAGING_GB HYPE_PAGING_MAX_GB
 static hype_pte_t g_guest_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_guest_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_guest_pd[HYPE_M3_5_GUEST_PAGING_GB][HYPE_PAGING_ENTRIES_PER_TABLE]
@@ -122,9 +130,10 @@ static uint8_t g_m4_3_guest_code[4096] __attribute__((aligned(4096)));
 static uint8_t g_m4_3_guest_stack[4096] __attribute__((aligned(4096)));
 
 /* Guest-physical address the emulated flash is mapped at: 3GB,
- * comfortably inside the 4GB NPT/guest identity map this test guest
- * reuses (HYPE_NPT_MAX_GB/HYPE_M3_5_GUEST_PAGING_GB, both 4) and
- * nowhere near any real static buffer this project actually uses --
+ * comfortably inside the NPT/guest identity map this test guest reuses
+ * (HYPE_NPT_MAX_GB/HYPE_M3_5_GUEST_PAGING_GB, now both tied to
+ * HYPE_PAGING_MAX_GB -- see that constant's own comment) and nowhere
+ * near any real static buffer this project actually uses --
  * marking its covering 2MB NPT entry not-present
  * (hype_npt_mark_not_present()) can't collide with anything real, and
  * since that marking is what makes the guest's access fault into

@@ -18,10 +18,19 @@
  * paging.
  */
 
-/* Generous default for a single test/dev guest -- revisit once real
- * per-VM memory sizing (hype.cfg's mem_mb, already summed by ADM-1)
- * drives this instead of a fixed constant. */
-#define HYPE_NPT_MAX_GB 4
+/* Was a separate, smaller fixed constant (4) until real-hardware
+ * testing (M4-5's real-AMD-hardware pass) found it insufficient: this
+ * project's own static guest/test buffers live in the same statically
+ * linked image as everything else, and real UEFI firmware is free to
+ * load that image well above 4GB of physical address space (confirmed
+ * on real hardware -- a static buffer landed just past 5GB) even
+ * though QEMU's own small test VMs never happen to place it that high.
+ * NPT must cover at least as much as the host's own identity map
+ * already does (HYPE_PAGING_MAX_GB, paging.h) for exactly the same
+ * reason, so it's tied to that constant directly instead of drifting
+ * out of sync with it again. Revisit once real per-VM memory sizing
+ * (hype.cfg's mem_mb, already summed by ADM-1) drives this instead. */
+#define HYPE_NPT_MAX_GB HYPE_PAGING_MAX_GB
 
 /*
  * Fills pml4[0] -> pdpt -> pd_tables[0..gb_to_map-1] as a flat
