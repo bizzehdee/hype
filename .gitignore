@@ -9,6 +9,10 @@
 build/
 out/
 
+# tools/make-usb-package.sh's generated output -- README.md and the
+# .img/directory tree it builds are all regenerable, not source.
+release/
+
 # EDK2 guest firmware pipeline (separate build, plan.md §8)
 edk2/Build/
 edk2/Conf/
