@@ -532,7 +532,83 @@ tasks — see updated deps below.*
   enumerating and reading from this device -- that's M4-6's job.*
 - [ ] **M4-6** — Boot a stock Linux UEFI installer ISO (e.g. Debian
   netinst) end-to-end through GRUB.
-  Deps: M4-3, M4-4, M4-5, VIDEO-2
+  Deps: CPUMSR-2, RAM-2, PCI-2, FW-2, ISO-2
+
+  *Scoping this task out (2026-07-14) surfaced that "boot a stock
+  Linux ISO through GRUB" actually needs ~7 substantial new subsystems
+  never separately planned: CPUID/MSR interception (currently neither
+  exists at all -- every guest CPUID/RDMSR/WRMSR reaches real hardware
+  unmediated, a guest-isolation gap), dynamic per-VM guest RAM
+  allocation + NPT sizing (currently a fixed blanket map, not driven by
+  hype.cfg's mem_mb), a real OVMF reset-vector boot path (every guest
+  so far starts at a hand-picked entry_phys, never real firmware), and
+  PCI configuration-space emulation (devices/acpi.h's own MCFG comment
+  already flagged this as unbacked -- without it no guest driver can
+  even discover M4-5's AHCI device). Real ISO loading, by contrast,
+  does NOT need M5 (which depends on M4-6, not the reverse) -- UEFI's
+  own Boot-Services file I/O can read a file from the same ESP hype.efi
+  boots from. Split into the new CPUMSR/RAM/PCI/FW/ISO sections below
+  rather than attempted as one task -- M4-6 itself is now the final
+  GRUB+Linux integration step once all five are done.*
+
+---
+
+## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
+## invariant; a gap M4-6's own scoping surfaced, 2026-07-14)
+
+- [ ] **CPUMSR-1** — CPUID intercept + minimal safe/synthesized leaf set.
+  Deps: M2-3
+- [ ] **CPUMSR-2** — MSR intercept baseline (RDMSR/WRMSR).
+  Deps: CPUMSR-1
+
+---
+
+## RAM — Dynamic per-VM guest RAM + NPT sizing
+
+- [ ] **RAM-1** — Allocate a real, mem_mb-sized guest RAM region via
+  UEFI AllocatePages; wire ADM's already-validated mem_mb into it.
+  Deps: ADM-1, M3-1
+- [ ] **RAM-2** — Size NPT identity mapping to the actual allocated
+  region instead of a fixed blanket constant.
+  Deps: RAM-1
+
+---
+
+## PCI — PCI configuration-space + host-bridge emulation
+
+- [ ] **PCI-1** — Minimal ECAM-based PCI host bridge + config space
+  device model (ACPI MCFG already synthesized, M4-4).
+  Deps: M4-4
+- [ ] **PCI-2** — Expose the existing AHCI device (M4-5) as a
+  discoverable PCI function (vendor/device ID, class code, ABAR as
+  BAR5) instead of a fixed guest-physical address.
+  Deps: PCI-1, M4-5
+
+---
+
+## FW — Real OVMF firmware boot wiring
+
+- [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
+  reset-vector convention, executing directly from OVMF_CODE.fd mapped
+  as ordinary executable NPT-backed guest memory (not the pflash
+  MMIO-trap model, which stays correct for OVMF_VARS.fd only).
+  Deps: RAM-2, CPUMSR-2, M4-2, M4-3
+- [ ] **FW-2** — Load OVMF_CODE.fd/OVMF_VARS.fd from fw/ into guest RAM
+  at boot, replacing the fixed hand-written test-guest entry points
+  used through M4-5/VIDEO-2.
+  Deps: FW-1
+
+---
+
+## ISO — Real installer media loading
+
+- [ ] **ISO-1** — Read a real installer ISO from the same ESP hype.efi
+  was booted from, via UEFI's own Simple File System Protocol (Boot
+  Services, before ExitBootServices) -- does not need M5.
+  Deps: none new
+- [ ] **ISO-2** — Back M4-5's existing AHCI/ATAPI in-memory model with
+  the real loaded ISO buffer instead of a synthetic one.
+  Deps: ISO-1, M4-5
 
 ---
 
@@ -740,7 +816,8 @@ The shortest path to "install one of each OS family, running concurrently,
 survives a host reboot" runs:
 
 ```
-SETUP-* → M0-* → M1-* → ADM-* → M2-* → M3-* → VALID-* → M4-*
+SETUP-* → M0-* → M1-* → ADM-* → M2-* → M3-* → VALID-* → M4-1..M4-5
+   → CPUMSR-*/RAM-*/PCI-*/FW-*/ISO-* (feed M4-6) → M4-6
    → NET-* → M5-* → M6-*  ─┐
                     M7-* ──┼→ M8-* → M9-*
               INPUT-*/VIDEO-* (feed M7 and M8) ┘
