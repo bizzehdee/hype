@@ -27,7 +27,7 @@ ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/id
              arch/x86_64/vmx/vmcs_hw.c arch/x86_64/vmx/ept.c
 ARCH_ASM_SRCS := arch/x86_64/cpu/isr_stubs.S
 DEVICE_SRCS := devices/pic.c devices/pit.c devices/pflash.c devices/acpi.c devices/acpi_loader.c \
-               devices/fw_cfg.c
+               devices/fw_cfg.c devices/ahci.c devices/atapi.c
 BOOT_SRCS := boot/main.c
 SRCS      := $(BOOT_SRCS) $(CORE_SRCS) $(ARCH_SRCS) $(DEVICE_SRCS)
 OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRCS)) \

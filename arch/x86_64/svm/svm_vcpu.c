@@ -265,6 +265,152 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
     return 0;
 }
 
+/* Max bytes hype_mmio_decode() could ever need for the narrow
+ * instruction forms it supports (prefix + REX + two-byte opcode +
+ * ModRM + SIB + disp32 -- the longest case, MOVZX with a SIB-plus-
+ * disp32 memory operand) -- comfortably under x86's own 15-byte
+ * legal-instruction-length limit. */
+#define HYPE_MMIO_MAX_INSTR_BYTES 15
+
+/* Walks the guest's Command List (slot 0 only, this project's own
+ * single-outstanding-command scope) -> Command Table -> ATAPI CDB,
+ * dispatches it, copies the response into the PRDT-described guest
+ * buffer(s), and updates the port's completion-observable state.
+ * Every guest-memory access here is a plain pointer dereference, same
+ * flat-identity-map reasoning as hype_svm_vcpu_handle_npf()'s own
+ * instruction-byte fetch. Returns 0 if the command was a recognized
+ * ATAPI PACKET command, -1 otherwise (a raw ATA command, or a Command
+ * FIS that isn't even a Register H2D FIS) -- this project's own scope
+ * is "one ATAPI CD-ROM," never a raw ATA disk on this port, so
+ * anything else is fail-closed rather than guessed at, matching every
+ * other MMIO/NPF handler's convention here. */
+static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi) {
+    uint64_t cmd_list_phys = (uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32);
+    uint64_t rx_fis_phys = (uint64_t)ahci->p_fb | ((uint64_t)ahci->p_fbu << 32);
+    const uint8_t *cmd_hdr_bytes = (const uint8_t *)(uintptr_t)cmd_list_phys;
+    hype_ahci_cmd_header_t hdr;
+    const uint8_t *cmd_table_bytes;
+    const uint8_t *prdt_bytes;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+    hype_atapi_result_t result;
+    const uint8_t *src;
+    uint32_t remaining;
+    uint32_t prd_idx;
+    uint8_t status_reg;
+    uint8_t error_reg;
+    uint8_t *d2h_fis;
+    unsigned i;
+
+    hype_ahci_decode_cmd_header(cmd_hdr_bytes, &hdr);
+    if (!hdr.is_atapi) {
+        return -1;
+    }
+
+    cmd_table_bytes = (const uint8_t *)(uintptr_t)hdr.cmd_table_phys;
+    if (cmd_table_bytes[0] != 0x27u || cmd_table_bytes[2] != 0xA0u) {
+        return -1; /* not a Register H2D FIS carrying ATA_CMD_PACKET (0xA0) */
+    }
+    for (i = 0; i < HYPE_ATAPI_CDB_MAX; i++) {
+        cdb[i] = cmd_table_bytes[0x40 + i];
+    }
+
+    hype_atapi_execute_cdb(atapi, cdb, &result);
+
+    src = result.uses_media_data ? (atapi->media_data + result.media_offset) : result.synth_data;
+    remaining = result.uses_media_data ? result.media_length : result.synth_length;
+
+    prdt_bytes = cmd_table_bytes + 0x80;
+    prd_idx = 0;
+    while (remaining > 0 && prd_idx < hdr.prdtl) {
+        hype_ahci_prdt_entry_t prd;
+        uint32_t chunk;
+        uint8_t *dst;
+        uint32_t j;
+
+        hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)prd_idx * 16u, &prd);
+        chunk = (prd.byte_count < remaining) ? prd.byte_count : remaining;
+        dst = (uint8_t *)(uintptr_t)prd.data_phys;
+        for (j = 0; j < chunk; j++) {
+            dst[j] = src[j];
+        }
+        src += chunk;
+        remaining -= chunk;
+        prd_idx++;
+    }
+
+    /* ATA STATUS register: DRDY|DSC always, +ERR on CHECK_CONDITION.
+     * ATAPI convention: a failed PACKET command's ERROR register
+     * carries the SCSI sense key in its upper nibble. */
+    status_reg = (result.status == HYPE_ATAPI_STATUS_GOOD) ? 0x50u : 0x51u;
+    error_reg = (result.status == HYPE_ATAPI_STATUS_GOOD) ? 0u : (uint8_t)(atapi->sense_key << 4);
+    ahci->p_tfd = (uint32_t)status_reg | ((uint32_t)error_reg << 8);
+
+    d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_phys + 0x40);
+    for (i = 0; i < 20; i++) {
+        d2h_fis[i] = 0;
+    }
+    d2h_fis[0] = 0x34; /* FIS type: Register - Device to Host */
+    d2h_fis[2] = status_reg;
+    d2h_fis[3] = error_reg;
+
+    ahci->p_ci &= ~0x1u;     /* slot 0 complete */
+    ahci->p_is |= (1u << 6); /* D2H Register FIS interrupt bit -- spec-completeness; no real
+                              * interrupt delivery wired up in this milestone (polling guest
+                              * driver, same as fw_cfg's own DMA test guest). */
+    return 0;
+}
+
+int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                   uint64_t ahci_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < ahci_base_phys) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - ahci_base_phys);
+
+    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+
+    reg = gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
+            if (process_ahci_command_slot0(ahci, atapi) != 0) {
+                return -1;
+            }
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_ahci_mmio_read(ahci, offset, decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
@@ -345,13 +491,6 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
 
     return (info->reason == HYPE_SVM_EXITCODE_INVALID) ? -1 : 0;
 }
-
-/* Max bytes hype_mmio_decode() could ever need for the narrow
- * instruction forms it supports (prefix + REX + two-byte opcode +
- * ModRM + SIB + disp32 -- the longest case, MOVZX with a SIB-plus-
- * disp32 memory operand) -- comfortably under x86's own 15-byte
- * legal-instruction-length limit. */
-#define HYPE_MMIO_MAX_INSTR_BYTES 15
 
 int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t pf_base_phys) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;

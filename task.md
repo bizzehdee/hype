@@ -430,9 +430,45 @@ tasks — see updated deps below.*
   fw_cfg transport) -- that integration is M4-6's job, matching this
   project's own "build the primitive now, defer the harder integration"
   pattern (e.g. M4-3's flash persistence).*
-- [ ] **M4-5** — Virtual optical drive device (read-only ISO passthrough,
+- [x] **M4-5** — Virtual optical drive device (read-only ISO passthrough,
   AHCI/ATAPI or virtio-scsi CD-ROM).
   Deps: M3-1
+
+  *AHCI/ATAPI chosen over virtio-scsi (explicit user decision): every
+  guest OS family (Linux/BSD/Windows) has inbox AHCI/ATAPI drivers, so
+  this is reusable as-is for M7's Windows installer boot later instead
+  of needing a second CD-ROM transport built then. Register offsets,
+  bit layouts, and the Command Header/PRDT/Register-FIS wire formats
+  (`devices/ahci.h`/`.c`) are transcribed directly from the Linux
+  kernel's own AHCI driver (drivers/ata/ahci.h,
+  drivers/ata/libata-sata.c's ata_tf_to_fis()/ata_tf_from_fis()) --
+  fetched and read for this task, not reconstructed from memory.
+  Scoped to exactly one port with one ATAPI device attached (this
+  milestone's own scope). `devices/atapi.h`/`.c` is the ATAPI/SCSI
+  command layer (TEST UNIT READY, INQUIRY, READ CAPACITY(10),
+  READ(10), REQUEST SENSE -- the commands a real ATAPI driver actually
+  issues to enumerate and read a disc), backed by an in-memory "ISO"
+  buffer -- real host-file reading needs M5's disk driver, the same
+  circular-dependency situation M4-3's flash persistence and M4-4's
+  ACPI blob already had, so real media is deferred the same way.
+  Both modules are pure logic, 100%/100%/99%+ region/line/branch
+  covered; MMIO wiring reuses M4-3's NPF/hype_mmio_decode() mechanism
+  unchanged (AHCI registers are accessed via ordinary MOV instructions,
+  same as pflash's), with a new exempt command-processing step
+  (`hype_svm_vcpu_handle_ahci_npf()`/`process_ahci_command_slot0()`,
+  arch/x86_64/svm/svm_vcpu.c) that walks the guest's Command List/
+  Command Table/PRDT on a PxCI (Command Issue) write and copies the
+  ATAPI response into the guest's own PRDT-described buffer(s).
+  Validated end-to-end with a synthetic long-mode test guest
+  (hand-written machine code for the register setup/trigger/poll
+  sequence; the Command Header/Table/CDB/PRDT content itself is
+  host-built directly into guest memory, same convention as M4-4's
+  fw_cfg test): issues a real READ(10) for one sector via the actual
+  AHCI/ATAPI protocol, and the host confirms the transferred sector
+  matches the backing buffer byte-for-byte. 5/5 clean QEMU runs.
+  NOT yet validated: a real guest OS's own AHCI/ATAPI driver (Linux's
+  ahci+sr_mod, or UEFI's own AhciBusDxe during M4-6's boot) actually
+  enumerating and reading from this device -- that's M4-6's job.*
 - [ ] **M4-6** — Boot a stock Linux UEFI installer ISO (e.g. Debian
   netinst) end-to-end through GRUB.
   Deps: M4-3, M4-4, M4-5, VIDEO-2

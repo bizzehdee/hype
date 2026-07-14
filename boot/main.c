@@ -28,6 +28,8 @@
 #include "../devices/acpi.h"
 #include "../devices/acpi_loader.h"
 #include "../devices/fw_cfg.h"
+#include "../devices/ahci.h"
+#include "../devices/atapi.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -736,6 +738,222 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
         (unsigned long long)sizeof(g_m4_4_rsdp));
 }
 
+/*
+ * M4-5: synthesizes a single-port AHCI HBA (devices/ahci.h) with one
+ * ATAPI CD-ROM attached (devices/atapi.h), backed by an in-memory
+ * "ISO" buffer (host-file reading needs M5's disk driver, the same
+ * circular dependency M4-3's flash persistence and M4-4's ACPI table
+ * blob already had -- build the primitive now, wire real media later).
+ * A hand-written long-mode test guest drives the real AHCI/ATAPI
+ * protocol: initializes the port's registers, issues a READ(10) ATAPI
+ * PACKET command for one sector, polls for completion, halts -- the
+ * host then confirms the transferred sector matches the backing
+ * buffer byte-for-byte. This validates the AHCI+ATAPI device model
+ * itself end-to-end under real QEMU/SVM; it does NOT yet validate a
+ * real guest OS's own AHCI/ATAPI driver against it -- that's M4-6's
+ * job, matching this project's established "build the primitive now,
+ * defer the harder integration" pattern.
+ */
+#define HYPE_M4_5_AHCI_GPA (HYPE_M4_3_PFLASH_GPA + HYPE_PAGING_2MB)
+
+static uint8_t g_m4_5_media[4 * HYPE_ATAPI_SECTOR_SIZE] __attribute__((aligned(4096)));
+static uint8_t g_m4_5_cmd_list[4096] __attribute__((aligned(4096)));
+static uint8_t g_m4_5_cmd_table[4096] __attribute__((aligned(4096)));
+static uint8_t g_m4_5_rx_fis[4096] __attribute__((aligned(4096)));
+static uint8_t g_m4_5_dest_buffer[HYPE_ATAPI_SECTOR_SIZE] __attribute__((aligned(4096)));
+static uint8_t g_m4_5_guest_code[256] __attribute__((aligned(4096)));
+static uint8_t g_m4_5_guest_stack[4096] __attribute__((aligned(4096)));
+static hype_ahci_t g_m4_5_ahci;
+static hype_atapi_t g_m4_5_atapi;
+
+/*
+ * Guest payload: initializes the AHCI port (GHC.AE, PxCLB/PxCLBU,
+ * PxFB/PxFBU, PxCMD=ST|FRE) then issues the command already staged in
+ * slot 0 (PxCI=1, triggering hype_svm_vcpu_handle_ahci_npf()'s command
+ * processing) and polls PxCI until the device clears it. The Command
+ * Header/Command Table/PRDT content itself -- a real Register H2D FIS
+ * carrying ATA_CMD_PACKET plus a READ(10) CDB -- is host-built
+ * directly into guest memory before launch (same "host pre-populates
+ * structured state, guest only triggers+polls" convention M4-4's fw_cfg
+ * test already established), avoiding hand-encoding that structure as
+ * machine code. Every store here is register-to-memory (0x89) or
+ * memory-to-register (0x8B), the same forms hype_mmio_decode() already
+ * supports and this project's own test suite already covers.
+ *
+ *   mov rbx, <patched: AHCI MMIO base>     48 BB 00*8
+ *   mov eax, 0x80000000 (GHC.AE)          B8 00 00 00 80
+ *   mov [rbx+4], eax                       89 43 04
+ *   mov eax, <patched: CLB low32>          B8 00*4
+ *   mov [rbx+0x100], eax                   89 83 00 01 00 00
+ *   mov eax, <patched: CLB high32>         B8 00*4
+ *   mov [rbx+0x104], eax                   89 83 04 01 00 00
+ *   mov eax, <patched: FB low32>           B8 00*4
+ *   mov [rbx+0x108], eax                   89 83 08 01 00 00
+ *   mov eax, <patched: FB high32>          B8 00*4
+ *   mov [rbx+0x10C], eax                   89 83 0C 01 00 00
+ *   mov eax, 0x00000011 (PxCMD ST|FRE)     B8 11 00 00 00
+ *   mov [rbx+0x118], eax                   89 83 18 01 00 00
+ *   mov eax, 0x00000001 (PxCI slot 0)      B8 01 00 00 00
+ *   mov [rbx+0x138], eax                   89 83 38 01 00 00  <- triggers
+ * poll:
+ *   mov eax, [rbx+0x138]                   8B 83 38 01 00 00
+ *   test eax, eax                          85 C0
+ *   jnz poll                               75 F6
+ *   hlt                                    F4
+ *   jmp $-3                                EB FD
+ */
+static const uint8_t g_m4_5_payload_template[] = {
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x80,
+    0x89, 0x43, 0x04,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x00, 0x01, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x04, 0x01, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x08, 0x01, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x0C, 0x01, 0x00, 0x00,
+    0xB8, 0x11, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x18, 0x01, 0x00, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x8B, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x85, 0xC0,
+    0x75, 0xF6,
+    0xF4,
+    0xEB, 0xFD
+};
+#define HYPE_M4_5_PAYLOAD_RBX_IMM_OFFSET 2
+#define HYPE_M4_5_PAYLOAD_CLB_LOW_IMM_OFFSET 19
+#define HYPE_M4_5_PAYLOAD_CLB_HIGH_IMM_OFFSET 30
+#define HYPE_M4_5_PAYLOAD_FB_LOW_IMM_OFFSET 41
+#define HYPE_M4_5_PAYLOAD_FB_HIGH_IMM_OFFSET 52
+
+static void run_m4_5_ahci_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
+    uint64_t ahci_gpa, cmd_list_phys, cmd_table_phys, rx_fis_phys, dest_phys;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("m4-5: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_m4_5_cmd_list, sizeof(g_m4_5_cmd_list));
+    hype_guest_ram_zero(g_m4_5_cmd_table, sizeof(g_m4_5_cmd_table));
+    hype_guest_ram_zero(g_m4_5_rx_fis, sizeof(g_m4_5_rx_fis));
+    hype_guest_ram_zero(g_m4_5_dest_buffer, sizeof(g_m4_5_dest_buffer));
+    hype_guest_ram_zero(g_m4_5_guest_code, sizeof(g_m4_5_guest_code));
+    hype_guest_ram_zero(g_m4_5_guest_stack, sizeof(g_m4_5_guest_stack));
+
+    /* Recognizable synthetic "ISO" content -- sector N's bytes are all
+     * (N & 0xFF), letting the read-back check confirm both the right
+     * sector was fetched and the right byte count. */
+    for (i = 0; i < sizeof(g_m4_5_media); i++) {
+        g_m4_5_media[i] = (uint8_t)((i / HYPE_ATAPI_SECTOR_SIZE) & 0xFFu);
+    }
+    hype_atapi_reset(&g_m4_5_atapi, g_m4_5_media, sizeof(g_m4_5_media));
+    hype_ahci_reset(&g_m4_5_ahci);
+
+    cmd_list_phys = (uint64_t)(uintptr_t)g_m4_5_cmd_list;
+    cmd_table_phys = (uint64_t)(uintptr_t)g_m4_5_cmd_table;
+    rx_fis_phys = (uint64_t)(uintptr_t)g_m4_5_rx_fis;
+    dest_phys = (uint64_t)(uintptr_t)g_m4_5_dest_buffer;
+
+    /* Command Header, slot 0: CFL=5 (Register H2D FIS is 5 DWORDs),
+     * ATAPI bit (0x20) set, PRDTL=1 (one PRDT entry) -> opts =
+     * (1 << 16) | 0x20 | 5 = 0x00010025. */
+    hype_write_le32(g_m4_5_cmd_list + 0, 0x00010025u);
+    hype_write_le32(g_m4_5_cmd_list + 4, 0);          /* PRDBC, device-written on completion */
+    hype_write_le32(g_m4_5_cmd_list + 8, (uint32_t)cmd_table_phys);
+    hype_write_le32(g_m4_5_cmd_list + 12, (uint32_t)(cmd_table_phys >> 32));
+
+    /* Command Table: Register H2D FIS (20 bytes) at offset 0 --
+     * command = ATA_CMD_PACKET (0xA0), C bit set (bit 7 of byte 1). */
+    g_m4_5_cmd_table[0] = 0x27;
+    g_m4_5_cmd_table[1] = 0x80;
+    g_m4_5_cmd_table[2] = 0xA0;
+    /* ATAPI CDB (16 bytes) at offset 0x40 -- READ(10): LBA=2, transfer
+     * length=1 block, matching HYPE_ATAPI_CMD_READ10's own byte layout
+     * (devices/atapi.c's handle_read10()). */
+    g_m4_5_cmd_table[0x40 + 0] = HYPE_ATAPI_CMD_READ10;
+    g_m4_5_cmd_table[0x40 + 5] = 2; /* LBA low byte (LBA = 2) */
+    g_m4_5_cmd_table[0x40 + 8] = 1; /* transfer length low byte (1 block) */
+    /* PRDT entry 0 (16 bytes) at offset 0x80: destination buffer,
+     * DBC field = byte_count - 1 (a real hardware/spec quirk, see
+     * hype_ahci_decode_prdt_entry()'s own comment). */
+    hype_write_le32(g_m4_5_cmd_table + 0x80 + 0, (uint32_t)dest_phys);
+    hype_write_le32(g_m4_5_cmd_table + 0x80 + 4, (uint32_t)(dest_phys >> 32));
+    hype_write_le32(g_m4_5_cmd_table + 0x80 + 12, HYPE_ATAPI_SECTOR_SIZE - 1u);
+
+    for (i = 0; i < sizeof(g_m4_5_payload_template); i++) {
+        g_m4_5_guest_code[i] = g_m4_5_payload_template[i];
+    }
+    ahci_gpa = HYPE_M4_5_AHCI_GPA;
+    hype_write_le64(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_RBX_IMM_OFFSET, ahci_gpa);
+    hype_write_le32(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_CLB_LOW_IMM_OFFSET, (uint32_t)cmd_list_phys);
+    hype_write_le32(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_CLB_HIGH_IMM_OFFSET,
+                     (uint32_t)(cmd_list_phys >> 32));
+    hype_write_le32(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_FB_LOW_IMM_OFFSET, (uint32_t)rx_fis_phys);
+    hype_write_le32(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_FB_HIGH_IMM_OFFSET,
+                     (uint32_t)(rx_fis_phys >> 32));
+
+    entry_rip = (uint64_t)(uintptr_t)g_m4_5_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_m4_5_guest_stack + sizeof(g_m4_5_guest_stack));
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+    hype_npt_mark_not_present(g_npt_pd, HYPE_M4_5_AHCI_GPA);
+    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+
+    hype_serial_print("m4-5: entry_rip=0x%llx ahci_gpa=0x%llx cmd_list=0x%llx cmd_table=0x%llx\n",
+                       (unsigned long long)entry_rip, (unsigned long long)ahci_gpa,
+                       (unsigned long long)cmd_list_phys, (unsigned long long)cmd_table_phys);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    if (ctx == 0) {
+        hype_fatal("m4-5: vcpu_create_long_mode failed");
+    }
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("m4-5: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+            if (hype_svm_vcpu_handle_ahci_npf(ctx, &g_m4_5_ahci, &g_m4_5_atapi, HYPE_M4_5_AHCI_GPA) != 0) {
+                hype_fatal("m4-5: unhandled/unrecognized AHCI MMIO access (qual=0x%llx guest_rip=0x%llx)",
+                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("m4-5: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+
+    for (i = 0; i < HYPE_ATAPI_SECTOR_SIZE; i++) {
+        if (g_m4_5_dest_buffer[i] != g_m4_5_media[2 * HYPE_ATAPI_SECTOR_SIZE + i]) {
+            hype_fatal("m4-5: AHCI/ATAPI READ(10) mismatch at byte %llu: got 0x%x, expected 0x%x", i,
+                       g_m4_5_dest_buffer[i], g_m4_5_media[2 * HYPE_ATAPI_SECTOR_SIZE + i]);
+        }
+    }
+
+    hype_serial_print(
+        "m4-5: AHCI/ATAPI test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- %u-byte "
+        "READ(10) round trip verified byte-for-byte\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_ATAPI_SECTOR_SIZE);
+}
+
 /* Runs every test guest in sequence -- what actually gets dispatched
  * (inline on the BSP, or onto a pinned AP; see efi_main) so each new
  * milestone's test guest still exercises real 1:1 vCPU-to-pCPU
@@ -746,6 +964,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_m3_5_linux_shim_test(args->ops, args->kind);
     run_m4_3_pflash_mmio_test(args->ops, args->kind);
     run_m4_4_fw_cfg_test(args->ops, args->kind);
+    run_m4_5_ahci_test(args->ops, args->kind);
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {

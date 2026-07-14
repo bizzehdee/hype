@@ -9,6 +9,8 @@
 #include "../../../devices/pit.h"
 #include "../../../devices/pflash.h"
 #include "../../../devices/fw_cfg.h"
+#include "../../../devices/ahci.h"
+#include "../../../devices/atapi.h"
 #include "vmcb.h"
 
 /*
@@ -183,6 +185,40 @@ int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t p
  * isolation.
  */
 int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw);
+
+/*
+ * Handles an NPF (M4-5) VM-exit against `ahci`, a single-port AHCI HBA
+ * model (devices/ahci.h) with one ATAPI CD-ROM device (`atapi`,
+ * devices/atapi.h) attached, mapped starting at guest-physical address
+ * `ahci_base_phys` and previously marked not-present via
+ * hype_npt_mark_not_present() -- same MMIO-trap mechanism as
+ * hype_svm_vcpu_handle_npf() (M4-3), reusing the same instruction
+ * decode (hype_mmio_decode(), reading the faulting instruction
+ * directly out of guest memory at RIP) since AHCI registers are
+ * accessed via ordinary 32-bit MOV instructions just like pflash's.
+ * On an MMIO write that lands on PxCI (Command Issue) and results in
+ * bit 0 being set, additionally processes command slot 0 synchronously
+ * (this project's own single-outstanding-command scope): walks the
+ * guest's Command List/Command Table/PRDT (raw guest-memory reads, the
+ * same flat-identity-map pointer dereferences every other exempt
+ * handler here already relies on), extracts the 16-byte ATAPI CDB,
+ * dispatches it via hype_atapi_execute_cdb(), copies the response into
+ * the PRDT-described guest buffer(s) (or does nothing for a
+ * data-less command like TEST UNIT READY), updates PxTFD and the
+ * Received FIS's D2H Register FIS, and clears PxCI's bit 0 -- a
+ * polling guest driver (this project's own validated pattern, matching
+ * fw_cfg's DMA test and real UEFI AHCI drivers' typical early-boot
+ * behavior before interrupts are set up) observes completion by
+ * re-reading PxCI. Returns 0 for a recognized access, non-zero
+ * otherwise (the caller's job to treat as fatal, matching this
+ * project's other MMIO handlers' fail-closed convention). Exempt from
+ * unit testing -- reaches into the exempt VMCB fields this backend's
+ * real VMRUN produces and does its own raw guest-memory access; every
+ * hype_ahci_*()/hype_atapi_*() call this dispatches to is already
+ * fully tested in isolation.
+ */
+int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                   uint64_t ahci_base_phys);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */
