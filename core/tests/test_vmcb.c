@@ -228,6 +228,28 @@ static void test_decode_ioio_info1_32bit(void) {
     CHECK_HEX("decoded size", 4, io.size_bytes);
 }
 
+static void test_decode_npf_info_write(void) {
+    hype_svm_npf_t npf;
+    uint64_t exitinfo1 = HYPE_SVM_NPF_INFO1_WRITE;
+    uint64_t exitinfo2 = 0xFEEDC000ULL;
+
+    hype_svm_decode_npf_info(exitinfo1, exitinfo2, &npf);
+
+    CHECK_HEX("decoded as write", 1, npf.is_write);
+    CHECK_HEX("decoded guest-physical fault address", exitinfo2, npf.guest_phys_addr);
+}
+
+static void test_decode_npf_info_read(void) {
+    hype_svm_npf_t npf;
+    uint64_t exitinfo1 = HYPE_SVM_NPF_INFO1_PRESENT; /* write bit clear -- a read */
+    uint64_t exitinfo2 = 0x1000ULL;
+
+    hype_svm_decode_npf_info(exitinfo1, exitinfo2, &npf);
+
+    CHECK_HEX("decoded as read", 0, npf.is_write);
+    CHECK_HEX("decoded guest-physical fault address", exitinfo2, npf.guest_phys_addr);
+}
+
 int main(void) {
     test_struct_sizes();
     test_field_offsets();
@@ -239,6 +261,8 @@ int main(void) {
     test_decode_ioio_info1_out();
     test_decode_ioio_info1_in_16bit();
     test_decode_ioio_info1_32bit();
+    test_decode_npf_info_write();
+    test_decode_npf_info_read();
     test_configure_avic();
     test_configure_avic_masks_low_bits_and_sets_max_index();
 

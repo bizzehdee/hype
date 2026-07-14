@@ -174,6 +174,11 @@ void hype_svm_decode_ioio_info1(uint64_t exitinfo1, hype_svm_ioio_t *out) {
     }
 }
 
+void hype_svm_decode_npf_info(uint64_t exitinfo1, uint64_t exitinfo2, hype_svm_npf_t *out) {
+    out->is_write = (exitinfo1 & HYPE_SVM_NPF_INFO1_WRITE) != 0;
+    out->guest_phys_addr = exitinfo2;
+}
+
 void hype_vmcb_enable_nested_paging(hype_vmcb_t *vmcb, uint64_t npt_root_phys) {
     vmcb->control.np_enable = 1;
     vmcb->control.n_cr3 = npt_root_phys;

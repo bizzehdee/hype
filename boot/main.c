@@ -24,6 +24,7 @@
 #include "../core/linux_boot.h"
 #include "../devices/pic.h"
 #include "../devices/pit.h"
+#include "../devices/pflash.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -102,6 +103,92 @@ static const uint8_t g_m3_5_payload[] = {
     0xF4,                   /* hlt */
     0xEB, 0xFD              /* jmp $-3 (back to hlt, belt-and-braces) */
 };
+
+/*
+ * M4-3: dedicated backing store + device state for the emulated CFI
+ * flash (devices/pflash.h). Small on purpose -- this test only
+ * exercises WRITE_BYTE and an array READ, not a full varstore image;
+ * real persistence to a host file is explicitly deferred (M5's disk
+ * driver doesn't exist yet -- see task.md's M4-3 scope note).
+ */
+static uint8_t g_m4_3_pflash_backing[4096] __attribute__((aligned(4096)));
+static hype_pflash_t g_m4_3_pflash;
+static uint8_t g_m4_3_guest_code[4096] __attribute__((aligned(4096)));
+static uint8_t g_m4_3_guest_stack[4096] __attribute__((aligned(4096)));
+
+/* Guest-physical address the emulated flash is mapped at: 3GB,
+ * comfortably inside the 4GB NPT/guest identity map this test guest
+ * reuses (HYPE_NPT_MAX_GB/HYPE_M3_5_GUEST_PAGING_GB, both 4) and
+ * nowhere near any real static buffer this project actually uses --
+ * marking its covering 2MB NPT entry not-present
+ * (hype_npt_mark_not_present()) can't collide with anything real, and
+ * since that marking is what makes the guest's access fault into
+ * hype_svm_vcpu_handle_npf() in the first place (entirely
+ * software-emulated from there -- the underlying "physical" address is
+ * never actually touched), it does not matter whether QEMU's
+ * configured RAM even reaches 3GB. */
+#define HYPE_M4_3_PFLASH_GPA (3ULL * HYPE_PAGING_1GB)
+
+/*
+ * M4-3's hand-written MMIO test payload: issues a real CFI WRITE_BYTE
+ * command (0x10) and data byte through genuine memory-mapped stores at
+ * HYPE_M4_3_PFLASH_GPA, reads the byte back through a genuine
+ * memory-mapped load (exercising the read-side NPF/decode/dispatch
+ * path, not just the write side), then re-issues WRITE_BYTE at a
+ * second offset (+0x100) with the exact value just read back -- so the
+ * host can confirm BOTH directions worked from the pflash backing
+ * array alone: backing[0] == 0xAB proves the write path;
+ * backing[0x100] == 0xAB proves the read genuinely delivered 0xAB into
+ * CL (not some stale/garbage value) and that value made it back out
+ * through a second write. Every instruction here is one of the exact
+ * forms hype_mmio_decode() supports (already unit-tested in isolation,
+ * core/tests/test_mmio_decode.c) -- verified byte-for-byte against the
+ * AMD64 opcode tables, same rigor as every other hand-written test
+ * payload in this file. The two 8-byte immediate fields (zeroed here)
+ * are patched at runtime (see HYPE_M4_3_PAYLOAD_*_IMM_OFFSET below) --
+ * simpler and less error-prone than hand-transcribing
+ * HYPE_M4_3_PFLASH_GPA's little-endian encoding into a byte literal.
+ *
+ *   mov rbx, <patched>   48 BB 00 00 00 00 00 00 00 00
+ *   mov rdx, <patched>   48 BA 00 00 00 00 00 00 00 00
+ *   mov al, 0x10         B0 10
+ *   mov [rbx], al        88 03   (issue WRITE_BYTE at offset 0)
+ *   mov al, 0xAB         B0 AB
+ *   mov [rbx], al        88 03   (write data byte 0xAB at offset 0)
+ *   mov cl, [rbx]        8A 0B   (read it back into CL)
+ *   mov al, 0x10         B0 10
+ *   mov [rdx], al        88 02   (issue WRITE_BYTE at offset 0x100)
+ *   mov [rdx], cl        88 0A   (write CL's value at offset 0x100)
+ *   hlt                  F4
+ *   jmp $-3              EB FD  (belt-and-braces, matching M3-5's payload)
+ */
+static const uint8_t g_m4_3_payload_template[] = {
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB0, 0x10,
+    0x88, 0x03,
+    0xB0, 0xAB,
+    0x88, 0x03,
+    0x8A, 0x0B,
+    0xB0, 0x10,
+    0x88, 0x02,
+    0x88, 0x0A,
+    0xF4,
+    0xEB, 0xFD
+};
+#define HYPE_M4_3_PAYLOAD_RBX_IMM_OFFSET 2
+#define HYPE_M4_3_PAYLOAD_RDX_IMM_OFFSET 12
+
+/* Writes `value` little-endian into dst[0..7] -- avoids an unaligned
+ * uint64_t* store (dst is not necessarily 8-byte aligned within the
+ * guest code buffer), matching this file's existing byte-at-a-time
+ * conventions elsewhere. */
+static void hype_write_le64(unsigned char *dst, uint64_t value) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        dst[i] = (unsigned char)(value >> (8 * i));
+    }
+}
 
 typedef struct {
     const hype_vmm_ops_t *ops;
@@ -293,6 +380,113 @@ static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t 
         g_m3_5_pit.channels[0].latch_pending);
 }
 
+/*
+ * M4-3: builds a minimal 64-bit long-mode guest (NOT a Linux
+ * boot-protocol shim like M3-5 -- hype_svm_vcpu_create_long_mode()
+ * itself has no such requirement, it just needs an entry RIP/RSP/CR3,
+ * so this test skips core/linux_boot.h entirely), this time with
+ * nested paging genuinely enabled (M3-5 passed npt_root=0 -- "no NPT
+ * for this first pass"), and with the emulated flash's covering NPT
+ * entry marked not-present so the guest's own memory-mapped accesses
+ * to it take a real NPF, decoded and dispatched by
+ * hype_svm_vcpu_handle_npf() to devices/pflash.h. SVM-only, same
+ * reasoning as run_m3_5_linux_shim_test() above (VMX's vcpu_run stays
+ * NULL past M2-7).
+ */
+static void run_m4_3_pflash_mmio_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("m4-3: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+        return;
+    }
+
+    /* M2-6 hard invariant: zero every byte of this guest's reserved
+     * RAM before its first VM-entry, on every (re)start. NOT applied to
+     * g_m4_3_pflash_backing -- that is the guest's *persistent*
+     * variable store (devices/pflash.h's own hype_pflash_reset() doc
+     * comment), which by definition must survive a restart; this test
+     * starts it from a known all-zero state itself instead, since
+     * there is nothing to persist across yet (M5's disk driver). */
+    hype_guest_ram_zero(g_m4_3_guest_code, sizeof(g_m4_3_guest_code));
+    hype_guest_ram_zero(g_m4_3_guest_stack, sizeof(g_m4_3_guest_stack));
+    for (i = 0; i < sizeof(g_m4_3_pflash_backing); i++) {
+        g_m4_3_pflash_backing[i] = 0;
+    }
+    hype_pflash_reset(&g_m4_3_pflash, g_m4_3_pflash_backing, sizeof(g_m4_3_pflash_backing));
+
+    for (i = 0; i < sizeof(g_m4_3_payload_template); i++) {
+        g_m4_3_guest_code[i] = g_m4_3_payload_template[i];
+    }
+    hype_write_le64(g_m4_3_guest_code + HYPE_M4_3_PAYLOAD_RBX_IMM_OFFSET, HYPE_M4_3_PFLASH_GPA);
+    hype_write_le64(g_m4_3_guest_code + HYPE_M4_3_PAYLOAD_RDX_IMM_OFFSET, HYPE_M4_3_PFLASH_GPA + 0x100);
+
+    entry_rip = (uint64_t)(uintptr_t)g_m4_3_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_m4_3_guest_stack + sizeof(g_m4_3_guest_stack));
+
+    /* Rebuilt fresh here (same "fresh on every (re)start" convention as
+     * every other identity map in this file) -- reusing the same
+     * static tables run_m3_5_linux_shim_test() already used above is
+     * safe since that guest has already finished running by the time
+     * this one starts (see run_all_test_guests()), never concurrently. */
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+    hype_npt_mark_not_present(g_npt_pd, HYPE_M4_3_PFLASH_GPA);
+    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+
+    hype_serial_print("m4-3: entry_rip=0x%llx guest_cr3=0x%llx npt_root=0x%llx pflash_gpa=0x%llx\n",
+                       (unsigned long long)entry_rip, (unsigned long long)guest_cr3,
+                       (unsigned long long)npt_root_phys, (unsigned long long)HYPE_M4_3_PFLASH_GPA);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    if (ctx == 0) {
+        hype_fatal("m4-3: vcpu_create_long_mode failed");
+    }
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("m4-3: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+            if (hype_svm_vcpu_handle_npf(ctx, &g_m4_3_pflash, HYPE_M4_3_PFLASH_GPA) != 0) {
+                hype_fatal("m4-3: unhandled/unrecognized MMIO access (qual=0x%llx guest_rip=0x%llx)",
+                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("m4-3: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+
+    if (g_m4_3_pflash_backing[0] != 0xABu) {
+        hype_fatal("m4-3: pflash write path failed: backing[0]=0x%x, expected 0xab",
+                   g_m4_3_pflash_backing[0]);
+    }
+    if (g_m4_3_pflash_backing[0x100] != 0xABu) {
+        hype_fatal(
+            "m4-3: pflash read path failed: backing[0x100]=0x%x, expected 0xab (the guest's own "
+            "memory-mapped read must not have returned 0xab)",
+            g_m4_3_pflash_backing[0x100]);
+    }
+
+    hype_serial_print(
+        "m4-3: pflash MMIO test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx, backing[0]=0x%x "
+        "backing[0x100]=0x%x -- write and read-back round trip both verified)\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, g_m4_3_pflash_backing[0],
+        g_m4_3_pflash_backing[0x100]);
+}
+
 /* Runs every test guest in sequence -- what actually gets dispatched
  * (inline on the BSP, or onto a pinned AP; see efi_main) so each new
  * milestone's test guest still exercises real 1:1 vCPU-to-pCPU
@@ -301,6 +495,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     hype_test_guest_args_t *args = (hype_test_guest_args_t *)arg;
     run_test_guest(arg);
     run_m3_5_linux_shim_test(args->ops, args->kind);
+    run_m4_3_pflash_mmio_test(args->ops, args->kind);
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {

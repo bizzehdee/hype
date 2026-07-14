@@ -180,6 +180,7 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 #define HYPE_SVM_EXITCODE_HLT 0x78ULL
 #define HYPE_SVM_EXITCODE_SHUTDOWN 0x7FULL
 #define HYPE_SVM_EXITCODE_IOIO 0x7BULL
+#define HYPE_SVM_EXITCODE_NPF 0x400ULL
 #define HYPE_SVM_EXITCODE_INVALID 0xFFFFFFFFFFFFFFFFULL /* VMRUN itself failed (bad VMCB state) */
 
 /* intercept_misc1 bit 27 (M3-5): trap every guest IN/OUT so this
@@ -214,6 +215,36 @@ typedef struct {
  * operand size. Pure bit extraction, no CPU state touched.
  */
 void hype_svm_decode_ioio_info1(uint64_t exitinfo1, hype_svm_ioio_t *out);
+
+/*
+ * NPF (#VMEXIT_NPF, M4-3) EXITINFO1 mirrors the standard x86 #PF
+ * error-code bit layout: bit0 = the NPT entry was present (a
+ * permissions violation) vs. not present at all (this project's own
+ * MMIO-trap mechanism, hype_npt_mark_not_present(), only ever produces
+ * the not-present case); bit1 = the access was a write. EXITINFO2 is
+ * the faulting guest-*physical* address (already fully resolved by
+ * hardware page-walking NPT -- unlike the faulting instruction's
+ * memory operand encoding, this never needs decoding from raw
+ * instruction bytes). No separate intercept-enable bit exists for NPF
+ * the way HLT/SHUTDOWN/IOIO have one -- it fires automatically
+ * whenever nested paging is enabled (NP_ENABLE=1,
+ * hype_vmcb_enable_nested_paging()) and a guest access hits a
+ * not-present/permission-violated NPT entry.
+ */
+#define HYPE_SVM_NPF_INFO1_PRESENT (1ULL << 0)
+#define HYPE_SVM_NPF_INFO1_WRITE (1ULL << 1)
+
+typedef struct {
+    int is_write;
+    uint64_t guest_phys_addr;
+} hype_svm_npf_t;
+
+/*
+ * Decodes an NPF intercept's EXITINFO1/EXITINFO2 into write-vs-read
+ * and the faulting guest-physical address. Pure bit extraction, no CPU
+ * state touched.
+ */
+void hype_svm_decode_npf_info(uint64_t exitinfo1, uint64_t exitinfo2, hype_svm_npf_t *out);
 
 /*
  * Packs a segment's access-rights byte and flags nibble into the

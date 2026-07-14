@@ -56,8 +56,21 @@ static void test_build_identity(void) {
               g_pd[2][3] & 0x000FFFFFFFFFF000ULL);
 }
 
+static void test_mark_not_present(void) {
+    hype_npt_build_identity(g_pml4, g_pdpt, g_pd, 3);
+
+    hype_npt_mark_not_present(g_pd, 2ULL * HYPE_PAGING_1GB + 3ULL * HYPE_PAGING_2MB);
+
+    CHECK_HEX("marked entry is fully cleared (not-present)", 0, g_pd[2][3]);
+    CHECK_HEX("neighboring entry within the same PD is untouched", 1,
+              g_pd[2][2] != 0);
+    CHECK_HEX("neighboring entry within the same PD is untouched (after)", 1,
+              g_pd[2][4] != 0);
+}
+
 int main(void) {
     test_build_identity();
+    test_mark_not_present();
 
     if (failures == 0) {
         printf("all tests passed\n");

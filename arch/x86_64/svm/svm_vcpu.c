@@ -9,13 +9,27 @@
  */
 struct hype_vcpu_ctx {
     hype_vmcb_t *vmcb;
-    /* Not a VMCB field -- VMRUN only loads/saves RAX/RSP/RIP/RFLAGS
-     * from the VMCB; every other GPR (RSI included) just passes
-     * through whatever the host had at VMRUN time. Loaded into the
-     * real RSI register immediately before VMRUN (see vmrun() below),
-     * so a guest can rely on it at entry the way the Linux boot
-     * protocol's RSI=zero-page-address convention requires (M3-5). */
-    uint64_t initial_rsi;
+    /* Not VMCB fields -- VMRUN only loads/saves RAX/RSP/RIP/RFLAGS from
+     * the VMCB; every other GPR just passes through whatever value was
+     * loaded immediately before VMRUN (see vmrun_full() below), and
+     * guest code can freely modify any of them before the next
+     * #VMEXIT. vmrun_full() loads every slot here into the matching
+     * real register immediately before VMRUN (so e.g. a guest can rely
+     * on RSI holding the Linux boot protocol's zero-page address at
+     * entry, M3-5) and captures the guest's post-exit value back here
+     * immediately after (needed to read a write's source register or
+     * patch a read's destination register during MMIO emulation,
+     * hype_svm_vcpu_handle_npf() below, M4-3).
+     * Indexed by x86-64 register encoding (0=RAX,1=RCX,2=RDX,3=RBX,
+     * 4=RSP,5=RBP,6=RSI,7=RDI,8-15=R8-R15); index 0 and 4 are never
+     * read/written here (RAX lives in vmcb->save.rax, which VMRUN
+     * itself manages; RSP is restored automatically by VMRUN's own
+     * host-state save/restore, and no guest register-encoded MMIO
+     * operand can legally be RSP anyway) -- left as unused slots rather
+     * than a compacted array purely so every other index matches the
+     * raw ModRM.reg encoding hype_mmio_decode() reports directly,
+     * avoiding a translation table in the NPF/MMIO decode path. */
+    uint64_t gprs[16];
 };
 
 static hype_vmcb_t g_vmcb __attribute__((aligned(4096)));
@@ -48,34 +62,89 @@ static inline void vmload(uint64_t vmcb_phys) {
 
 /*
  * VMRUN transfers control to guest code, which can freely modify ANY
- * general-purpose register before the next #VMEXIT -- not just
- * RAX/RSI (the two given as explicit operands here), which VMCB
- * fields and the boot-protocol RSI convention respectively care
- * about. A plain input-only constraint ("a"(x), "S"(x)) does not by
- * itself tell the compiler those registers are clobbered by the
- * instruction -- without saying so, the compiler could keep some
- * *other* live C value (e.g. the caller's `real` pointer) in one of
- * the registers guest code actually stomps, silently corrupting it
- * once the guest runs. Read-write ("+a"/"+S") constraints bound to
- * throwaway locals mark RAX/RSI as genuinely clobbered without
- * conflicting with their use as inputs; every other GPR guest code
- * could reach is clobbered explicitly. Confirmed the hard way: this
- * exact gap caused `real->vmcb->control.exitcode` to read
- * plausible-looking garbage instead of a real SVM exit code, once the
- * guest actually ran code that touched RSI.
+ * general-purpose register before the next #VMEXIT -- not just RAX
+ * (the VMCB-managed one) or a single register some earlier, narrower
+ * version of this function happened to care about. A plain input-only
+ * constraint does not by itself tell the compiler a register is
+ * clobbered by the instruction -- without saying so, the compiler
+ * could keep some *other* live C value (e.g. the caller's `real`
+ * pointer) in one of the registers guest code actually stomps,
+ * silently corrupting it once the guest runs; confirmed the hard way
+ * once already (M3-5), when exactly this gap made
+ * `real->vmcb->control.exitcode` read plausible-looking garbage
+ * instead of a real SVM exit code, once the guest actually ran code
+ * that touched RSI.
+ *
+ * M4-3 needs strictly more than that fix: MMIO emulation
+ * (hype_svm_vcpu_handle_npf() below) must be able to read a write's
+ * source register and patch a read's destination register, for *any*
+ * GPR the compiled guest code happens to use -- not just detect that
+ * one specific register was clobbered. So every GPR this project can
+ * reach (RCX/RDX/RBX/RBP/RSI/RDI/R8-R15; RAX excepted, since VMCB
+ * already manages it via save.rax; RSP excepted, since VMRUN's own
+ * host-state save/restore keeps the *host's* RSP valid across the
+ * transition and no legal MMIO operand register is ever RSP) is
+ * loaded from g_ctx.gprs[] into the real register immediately before
+ * VMRUN and captured back immediately after, via direct "+m" memory
+ * operands referencing the file-scope g_ctx directly (safe and
+ * simple specifically because there is only ever one static instance,
+ * per this backend's single-vCPU scope) -- and, same as the RAX/RSI
+ * fix before it, every one of those registers is ALSO listed in the
+ * clobber list: the "+m" operand tells the compiler the *memory* may
+ * change, the clobber tells it the *register* is destroyed, and both
+ * are needed since this template uses each register as fixed scratch
+ * space the compiler's own register allocator has no visibility into.
  */
-static inline void vmrun(uint64_t vmcb_phys, uint64_t initial_rsi) {
+static inline void vmrun_full(uint64_t vmcb_phys) {
     uint64_t clobbered_rax = vmcb_phys;
-    uint64_t clobbered_rsi = initial_rsi;
-    __asm__ volatile("vmrun %%rax"
-                      : "+a"(clobbered_rax), "+S"(clobbered_rsi)
+    __asm__ volatile("mov %[rcx], %%rcx\n\t"
+                      "mov %[rdx], %%rdx\n\t"
+                      "mov %[rbx], %%rbx\n\t"
+                      "mov %[rbp], %%rbp\n\t"
+                      "mov %[rsi], %%rsi\n\t"
+                      "mov %[rdi], %%rdi\n\t"
+                      "mov %[r8], %%r8\n\t"
+                      "mov %[r9], %%r9\n\t"
+                      "mov %[r10], %%r10\n\t"
+                      "mov %[r11], %%r11\n\t"
+                      "mov %[r12], %%r12\n\t"
+                      "mov %[r13], %%r13\n\t"
+                      "mov %[r14], %%r14\n\t"
+                      "mov %[r15], %%r15\n\t"
+                      "vmrun %%rax\n\t"
+                      "mov %%rcx, %[rcx]\n\t"
+                      "mov %%rdx, %[rdx]\n\t"
+                      "mov %%rbx, %[rbx]\n\t"
+                      "mov %%rbp, %[rbp]\n\t"
+                      "mov %%rsi, %[rsi]\n\t"
+                      "mov %%rdi, %[rdi]\n\t"
+                      "mov %%r8, %[r8]\n\t"
+                      "mov %%r9, %[r9]\n\t"
+                      "mov %%r10, %[r10]\n\t"
+                      "mov %%r11, %[r11]\n\t"
+                      "mov %%r12, %[r12]\n\t"
+                      "mov %%r13, %[r13]\n\t"
+                      "mov %%r14, %[r14]\n\t"
+                      "mov %%r15, %[r15]\n\t"
+                      : "+a"(clobbered_rax), [rcx] "+m"(g_ctx.gprs[1]), [rdx] "+m"(g_ctx.gprs[2]),
+                        [rbx] "+m"(g_ctx.gprs[3]), [rbp] "+m"(g_ctx.gprs[5]), [rsi] "+m"(g_ctx.gprs[6]),
+                        [rdi] "+m"(g_ctx.gprs[7]), [r8] "+m"(g_ctx.gprs[8]), [r9] "+m"(g_ctx.gprs[9]),
+                        [r10] "+m"(g_ctx.gprs[10]), [r11] "+m"(g_ctx.gprs[11]), [r12] "+m"(g_ctx.gprs[12]),
+                        [r13] "+m"(g_ctx.gprs[13]), [r14] "+m"(g_ctx.gprs[14]), [r15] "+m"(g_ctx.gprs[15])
                       :
-                      : "memory", "cc", "rbx", "rcx", "rdx", "rdi", "rbp", "r8", "r9", "r10", "r11",
-                        "r12", "r13", "r14", "r15");
+                      : "memory", "cc", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10",
+                        "r11", "r12", "r13", "r14", "r15");
 }
 
 static inline void vmsave(uint64_t vmcb_phys) {
     __asm__ volatile("vmsave %%rax" : : "a"(vmcb_phys) : "memory");
+}
+
+static void reset_gprs(void) {
+    unsigned i;
+    for (i = 0; i < 16; i++) {
+        g_ctx.gprs[i] = 0;
+    }
 }
 
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root) {
@@ -91,7 +160,7 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, ui
     }
 
     g_ctx.vmcb = &g_vmcb;
-    g_ctx.initial_rsi = 0;
+    reset_gprs();
     return &g_ctx;
 }
 
@@ -123,13 +192,36 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
     }
 
     g_ctx.vmcb = &g_vmcb;
-    g_ctx.initial_rsi = 0;
+    reset_gprs();
     return &g_ctx;
 }
 
 void hype_svm_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
-    real->initial_rsi = rsi;
+    real->gprs[6] = rsi; /* RSI's index in gprs[] -- see the struct's own comment */
+}
+
+/*
+ * Maps an x86-64 register encoding (as hype_mmio_decode() reports it)
+ * to where this backend actually stores that register's live value.
+ * NULL for RSP (index 4): never a legal MMIO operand register, and
+ * this backend never captures the guest's RSP value at all (VMRUN's
+ * own host-state save/restore only concerns the *host's* RSP). RAX
+ * (index 0) lives in vmcb->save.rax, the one GPR VMRUN itself manages
+ * directly; every other index is g_ctx's own post-VMRUN capture
+ * (vmrun_full() above). Pure pointer arithmetic over already-captured
+ * state -- no CPU access itself -- but kept in this exempt file since
+ * it only makes sense paired with the exempt VMCB/GPR state it reaches
+ * into.
+ */
+static uint64_t *gpr_ptr(struct hype_vcpu_ctx *real, uint8_t reg) {
+    if (reg == 4u) {
+        return 0;
+    }
+    if (reg == 0u) {
+        return &real->vmcb->save.rax;
+    }
+    return &real->gprs[reg];
 }
 
 int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit) {
@@ -184,7 +276,7 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
 
     clgi();
     vmload(vmcb_phys);
-    vmrun(vmcb_phys, real->initial_rsi);
+    vmrun_full(vmcb_phys);
     vmsave(vmcb_phys);
     stgi();
 
@@ -193,4 +285,81 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     info->guest_rip = real->vmcb->save.rip;
 
     return (info->reason == HYPE_SVM_EXITCODE_INVALID) ? -1 : 0;
+}
+
+/* Max bytes hype_mmio_decode() could ever need for the narrow
+ * instruction forms it supports (prefix + REX + two-byte opcode +
+ * ModRM + SIB + disp32 -- the longest case, MOVZX with a SIB-plus-
+ * disp32 memory operand) -- comfortably under x86's own 15-byte
+ * legal-instruction-length limit. */
+#define HYPE_MMIO_MAX_INSTR_BYTES 15
+
+int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t pf_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < pf_base_phys) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - pf_base_phys);
+
+    /* AMD Decode Assist (VMCB's num_bytes_fetched/guest_instruction_bytes)
+     * was the original plan here, but confirmed empirically -- via a
+     * real QEMU/KVM run under this project's own nested-SVM dev
+     * environment -- that it is NOT reliably populated even when the
+     * underlying CPU's own CPUID leaf 0x8000000A advertises the
+     * feature (nested SVM emulation's own gap, not this project's).
+     * Reading the faulting instruction directly out of guest memory at
+     * RIP sidesteps that gap entirely and is at least as correct: this
+     * project's guest/NPT setup is a flat identity map (guest-virtual
+     * == guest-physical == host-physical), so vmcb->save.rip is
+     * already a valid host pointer with no translation needed -- the
+     * exact same assumption M3-5's test-guest setup already relies on
+     * when it writes the guest's payload bytes directly via a raw
+     * pointer before the guest ever runs. */
+    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+
+    /* Defense-in-depth: EXITINFO1's own write bit and the decoded
+     * instruction's direction must agree -- a mismatch means either
+     * decode went wrong or this handler is being called for a fault
+     * that isn't really the decoded instruction's, and it is not safe
+     * to guess which. */
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+
+    reg = gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        if (hype_pflash_write(pf, offset, decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_pflash_read(pf, offset, decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    /* Same "next-RIP-for-free" convenience as HLT/IOIO, just sourced
+     * from the decoder's own computed instruction length instead of an
+     * EXITINFO2 the hardware doesn't provide for NPF (EXITINFO2 there
+     * is the faulting *address*, already consumed above). */
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
 }

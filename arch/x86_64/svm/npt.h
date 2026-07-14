@@ -35,4 +35,19 @@ void hype_npt_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
                               hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                               unsigned int gb_to_map);
 
+/*
+ * Marks the 2MB PD entry covering `phys_addr` as not-present (M4-3):
+ * any guest access anywhere in that 2MB range then takes an NPF
+ * (#VMEXIT_NPF) instead of a direct memory access, which is how this
+ * project traps MMIO-style devices (the emulated CFI flash,
+ * devices/pflash.h, being the first) without needing 4KB-granularity
+ * NPT at all -- coarse (whole 2MB), but simple, and correct as long as
+ * the device's actual backing region is placed within its own
+ * dedicated 2MB range not shared with real guest RAM. `phys_addr` must
+ * fall within the range hype_npt_build_identity() already mapped
+ * (gb_to_map GB) -- this only clears an existing entry, it doesn't
+ * grow the table. Pure struct mutation, no CPU state touched.
+ */
+void hype_npt_mark_not_present(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE], uint64_t phys_addr);
+
 #endif /* HYPE_ARCH_SVM_NPT_H */

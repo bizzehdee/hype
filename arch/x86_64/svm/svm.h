@@ -4,8 +4,10 @@
 #include <stdint.h>
 
 #include "../cpu/vmm_ops.h"
+#include "../cpu/mmio_decode.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
+#include "../../../devices/pflash.h"
 #include "vmcb.h"
 
 /*
@@ -111,6 +113,43 @@ void hype_svm_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi);
  * already fully tested in isolation.
  */
 int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit);
+
+/*
+ * Handles an NPF (M4-3) VM-exit against `pf`, an emulated CFI flash
+ * device (devices/pflash.h) mapped starting at guest-physical address
+ * `pf_base_phys` and previously marked not-present via
+ * hype_npt_mark_not_present() (arch/x86_64/svm/npt.h) -- the only way
+ * this project ever produces an NPF in the first place. Decodes
+ * EXITINFO1/EXITINFO2 (hype_svm_decode_npf_info()) for the fault
+ * direction/address, then decodes the faulting instruction by reading
+ * its raw bytes directly out of guest memory at vmcb->save.rip (a
+ * plain host pointer dereference -- this project's guest/NPT setup is
+ * a flat identity map, so no translation is needed; AMD's Decode
+ * Assist, the VMCB's num_bytes_fetched/guest_instruction_bytes fields,
+ * was the original plan, but confirmed empirically NOT reliably
+ * populated under nested SVM even when the host CPU's own CPUID
+ * advertises the feature -- see M4-3's commit) via hype_mmio_decode()
+ * to determine which register carries the value and how wide the
+ * access is, then dispatches to hype_pflash_read()/hype_pflash_write().
+ * A read's result is merged back into the destination register
+ * (hype_mmio_merge_read_value()); a write's source register is
+ * extracted the same width-aware way (hype_mmio_extract_write_value())
+ * -- RAX is read/written via vmcb->save.rax (the one GPR VMRUN itself
+ * manages); every other register (RSP excepted -- never a valid MMIO
+ * accessor register) via this backend's own post-VMRUN GPR capture.
+ * Advances the guest's RIP past the decoded instruction using the
+ * decoder's own computed instr_len. Returns 0 if the fault was against
+ * `pf`'s own range and the instruction was a recognized form, non-zero
+ * otherwise (the caller's job to treat as fatal -- silently guessing
+ * at an unrecognized MMIO access is not safe, matching this project's
+ * IOIO handler's own fail-closed convention). Exempt from unit testing
+ * -- reaches into the exempt VMCB fields this backend's real VMRUN
+ * produces; hype_svm_decode_npf_info(), hype_mmio_decode(),
+ * hype_mmio_merge_read_value(), hype_mmio_extract_write_value(), and
+ * devices/pflash.h's own read/write are all already fully tested in
+ * isolation.
+ */
+int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t pf_base_phys);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */

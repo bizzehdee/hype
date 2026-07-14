@@ -340,8 +340,48 @@ tasks — see updated deps below.*
   `hype.efi` itself through its own full existing test suite exactly
   as `edk2-ovmf` already does. Not yet used as actual guest-facing
   firmware for a VM -- that's M4-3 onward.*
-- [ ] **M4-3** — Emulated flash/varstore, persisted to disk.
+- [x] **M4-3** — Emulated flash/varstore, persisted to disk.
   Deps: M4-2
+
+  *CFI (Common Flash Interface) NOR-flash command-protocol emulation
+  (`devices/pflash.h`/`.c`: WRITE_BYTE/BLOCK_ERASE/CLEAR_STATUS/
+  READ_STATUS/READ_DEVID/WRITE_TO_BUFFER/READ_ARRAY) backed by an
+  in-memory buffer, fully unit-tested. MMIO trapping via NPT: guest
+  accesses to the flash's 2MB range are forced to fault
+  (`hype_npt_mark_not_present()`) into a real SVM NPF (#VMEXIT_NPF)
+  handler (`hype_svm_vcpu_handle_npf()`) that decodes the faulting
+  MOV/MOVZX instruction (a narrow, purpose-built x86_64 decoder,
+  `arch/x86_64/cpu/mmio_decode.h`/`.c`, scoped to exactly the forms
+  EDK2's own MmioRead8/MmioWrite8-style library calls compile to;
+  fully unit-tested including ModRM/SIB/disp8/disp32/RIP-relative
+  addressing) and dispatches to the flash model. Originally planned to
+  read the faulting instruction via AMD SVM Decode Assist
+  (VMCB `num_bytes_fetched`/`guest_instruction_bytes`, confirmed
+  present via CPUID on this dev environment's host CPU) but confirmed
+  empirically, via real QEMU/KVM runs, that nested SVM does not
+  reliably populate those fields even when the CPU advertises the
+  feature -- switched to reading guest memory directly at RIP instead
+  (a plain host pointer dereference, since this project's guest/NPT
+  setup is a flat identity map), which is more portable and no longer
+  depends on that hardware feature at all. `hype_svm_vcpu_run()`'s
+  VMRUN sequence was also extended to capture/restore every
+  general-purpose register (previously only RAX/RSI), needed so the
+  NPF handler can read a write's source register or patch a read's
+  destination register for any register compiled MMIO-accessor code
+  happens to use.
+  Validated end-to-end with a synthetic long-mode test guest
+  (hand-written machine code, same rigor as M3-5): issues a real
+  WRITE_BYTE command and data byte through genuine memory-mapped
+  stores, reads the byte back through a genuine memory-mapped load,
+  then writes that read-back value out to a second offset -- so the
+  host can confirm both the write and read paths from the flash's
+  backing array alone. 5/5 clean QEMU runs.
+  Real persistence to a host file explicitly deferred -- that needs a
+  disk driver, M5's job; this milestone's own dependency graph would
+  otherwise be circular. The in-memory device model and NPT-based MMIO
+  trap mechanism are both reusable as-is once M5 exists.*
+- [ ] **M4-4** — Per-VM ACPI table synthesis (RSDP/XSDT/FADT/MADT/MCFG).
+  Deps: M4-2, M3-2
 - [ ] **M4-4** — Per-VM ACPI table synthesis (RSDP/XSDT/FADT/MADT/MCFG).
   Deps: M4-2, M3-2
 - [ ] **M4-5** — Virtual optical drive device (read-only ISO passthrough,
