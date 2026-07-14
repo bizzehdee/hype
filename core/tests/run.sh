@@ -10,14 +10,14 @@
 set -e
 cd "$(dirname "$0")"
 
-LIB_DIRS="../ ../../arch/x86_64/cpu/ ../../arch/x86_64/svm/ ../../arch/x86_64/vmx/"
+LIB_DIRS="../ ../../arch/x86_64/cpu/ ../../arch/x86_64/svm/ ../../arch/x86_64/vmx/ ../../devices/"
 
 # Files that only make sense with a real CPU privilege transition (hlt,
 # lgdt+segment reload, ...) are exempt from the coverage gate per
 # AGENTS.md. Still linked below; just not reported on.
 is_exempt() {
     case "$1" in
-        */halt.c|*/gdt_load.c|*/idt_load.c|*/paging_load.c|*/serial_hw.c|*/pic.c|*/pit_hw.c|*/timer_isr.c|*/cpu_features_hw.c|*/svm_enable_hw.c|*/vmx_enable_hw.c|*/vmcs_hw.c|*/svm_vcpu.c) return 0 ;;
+        */halt.c|*/gdt_load.c|*/idt_load.c|*/paging_load.c|*/serial_hw.c|*/cpu/pic.c|*/pit_hw.c|*/timer_isr.c|*/cpu_features_hw.c|*/svm_enable_hw.c|*/vmx_enable_hw.c|*/vmcs_hw.c|*/svm_vcpu.c) return 0 ;;
         *) return 1 ;;
     esac
 }

@@ -1,0 +1,150 @@
+#include "pit.h"
+
+#define HYPE_PIT_CHANNEL0_DATA 0x40u
+#define HYPE_PIT_CHANNEL1_DATA 0x41u
+#define HYPE_PIT_CHANNEL2_DATA 0x42u
+#define HYPE_PIT_MODE_COMMAND 0x43u
+
+static void channel_reset(hype_pit_emu_channel_t *ch) {
+    ch->reload = 0;
+    ch->counter = 0;
+    ch->mode = 0;
+    ch->access_mode = 3;
+    ch->bcd = 0;
+    ch->rw_toggle = 0;
+    ch->latched_value = 0;
+    ch->latch_pending = 0;
+    ch->read_toggle = 0;
+}
+
+void hype_pit_emu_reset(hype_pit_emu_t *pit) {
+    int i;
+    for (i = 0; i < 3; i++) {
+        channel_reset(&pit->channels[i]);
+    }
+}
+
+static void write_command(hype_pit_emu_t *pit, uint8_t value) {
+    uint8_t channel_sel = (uint8_t)((value >> 6) & 0x03u);
+    uint8_t rw = (uint8_t)((value >> 4) & 0x03u);
+    uint8_t mode = (uint8_t)((value >> 1) & 0x07u);
+    uint8_t bcd = value & 0x01u;
+    hype_pit_emu_channel_t *ch;
+
+    if (channel_sel == 3u) {
+        return; /* read-back command -- not supported by this stub */
+    }
+    ch = &pit->channels[channel_sel];
+
+    if (rw == 0u) {
+        /* Latch command: snapshot the live counter; programming is untouched. */
+        ch->latched_value = ch->counter;
+        ch->latch_pending = 1;
+        ch->read_toggle = 0;
+        return;
+    }
+
+    ch->access_mode = rw;
+    ch->mode = mode;
+    ch->bcd = bcd;
+    ch->rw_toggle = 0;
+    /* Real hardware: programming a new mode doesn't reload the
+     * counter until the guest actually writes a new count. */
+}
+
+static void write_data(hype_pit_emu_channel_t *ch, uint8_t value) {
+    switch (ch->access_mode) {
+        case 1: /* lobyte only */
+            ch->reload = (uint16_t)((ch->reload & 0xFF00u) | value);
+            ch->counter = ch->reload;
+            return;
+        case 2: /* hibyte only */
+            ch->reload = (uint16_t)((ch->reload & 0x00FFu) | ((uint16_t)value << 8));
+            ch->counter = ch->reload;
+            return;
+        case 3: /* lobyte then hibyte -- counter only reloads once both arrive */
+            if (ch->rw_toggle == 0) {
+                ch->reload = (uint16_t)((ch->reload & 0xFF00u) | value);
+                ch->rw_toggle = 1;
+            } else {
+                ch->reload = (uint16_t)((ch->reload & 0x00FFu) | ((uint16_t)value << 8));
+                ch->rw_toggle = 0;
+                ch->counter = ch->reload;
+            }
+            return;
+        default: /* access_mode 0 (latch) is not a valid data-write state */
+            return;
+    }
+}
+
+int hype_pit_emu_io_write(hype_pit_emu_t *pit, uint16_t port, uint8_t value) {
+    switch (port) {
+        case HYPE_PIT_CHANNEL0_DATA:
+            write_data(&pit->channels[0], value);
+            return 0;
+        case HYPE_PIT_CHANNEL1_DATA:
+            write_data(&pit->channels[1], value);
+            return 0;
+        case HYPE_PIT_CHANNEL2_DATA:
+            write_data(&pit->channels[2], value);
+            return 0;
+        case HYPE_PIT_MODE_COMMAND:
+            write_command(pit, value);
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+static uint8_t read_data(hype_pit_emu_channel_t *ch) {
+    uint16_t value = ch->latch_pending ? ch->latched_value : ch->counter;
+
+    switch (ch->access_mode) {
+        case 1: /* lobyte only */
+            ch->latch_pending = 0;
+            return (uint8_t)(value & 0xFFu);
+        case 2: /* hibyte only */
+            ch->latch_pending = 0;
+            return (uint8_t)((value >> 8) & 0xFFu);
+        case 3: /* lobyte then hibyte */
+            if (ch->read_toggle == 0) {
+                ch->read_toggle = 1;
+                return (uint8_t)(value & 0xFFu);
+            }
+            ch->read_toggle = 0;
+            ch->latch_pending = 0;
+            return (uint8_t)((value >> 8) & 0xFFu);
+        default:
+            return 0;
+    }
+}
+
+int hype_pit_emu_io_read(hype_pit_emu_t *pit, uint16_t port, uint8_t *out_value) {
+    switch (port) {
+        case HYPE_PIT_CHANNEL0_DATA:
+            *out_value = read_data(&pit->channels[0]);
+            return 0;
+        case HYPE_PIT_CHANNEL1_DATA:
+            *out_value = read_data(&pit->channels[1]);
+            return 0;
+        case HYPE_PIT_CHANNEL2_DATA:
+            *out_value = read_data(&pit->channels[2]);
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+void hype_pit_emu_tick(hype_pit_emu_t *pit) {
+    int i;
+    for (i = 0; i < 3; i++) {
+        hype_pit_emu_channel_t *ch = &pit->channels[i];
+        if (ch->counter == 0) {
+            if (ch->mode == 2u || ch->mode == 3u) {
+                ch->counter = ch->reload;
+            }
+            continue;
+        }
+        ch->counter--;
+    }
+}

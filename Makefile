@@ -26,8 +26,9 @@ ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/id
              arch/x86_64/vmx/vmx_bits.c arch/x86_64/vmx/vmx_enable_hw.c arch/x86_64/vmx/vmx_ops.c \
              arch/x86_64/vmx/vmcs_hw.c arch/x86_64/vmx/ept.c
 ARCH_ASM_SRCS := arch/x86_64/cpu/isr_stubs.S
+DEVICE_SRCS := devices/pic.c devices/pit.c
 BOOT_SRCS := boot/main.c
-SRCS      := $(BOOT_SRCS) $(CORE_SRCS) $(ARCH_SRCS)
+SRCS      := $(BOOT_SRCS) $(CORE_SRCS) $(ARCH_SRCS) $(DEVICE_SRCS)
 OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRCS)) \
              $(patsubst %.S,$(BUILD_DIR)/%.o,$(ARCH_ASM_SRCS))
 OUT       := $(BUILD_DIR)/hype.efi

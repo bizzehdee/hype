@@ -182,8 +182,18 @@ multi-VM concurrency milestone, even though early single-guest milestones
   integration (loading a real bzImage, building guest page tables,
   VMRUNning it, confirming it actually runs) is M3-5's job once M3-4's
   device stubs exist too, per task.md's own dependency graph.*
-- [ ] **M3-4** — Minimal guest-visible device stubs: PIC/IOAPIC, PIT/HPET.
+- [x] **M3-4** — Minimal guest-visible device stubs: PIC/IOAPIC, PIT/HPET.
   Deps: M3-1
+
+  *Scope note: implements the classic i8259 PIC + i8254 PIT pair (the
+  same minimal choice real minimal VMMs like Firecracker make) rather
+  than IOAPIC/HPET -- sufficient for a guest's early boot
+  interrupt-controller/timer programming. Both are pure, tested
+  register-level state machines (ICW1-4 init, OCW1/2/3, PIT
+  mode/access/latch programming) -- not yet wired into an actual SVM
+  IOIO-intercept dispatch (no guest has ever executed IN/OUT yet); that
+  wiring, and validating a real guest programming these without
+  hanging, is M3-5's job.*
 - [ ] **M3-5** — Boot a minimal Linux kernel end-to-end; validate
   APICv/AVIC interrupt delivery and the VM-exit loop under real device I/O.
   Deps: M3-3, M3-4, M2-4
