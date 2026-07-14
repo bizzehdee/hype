@@ -652,12 +652,67 @@ tasks — see updated deps below.*
 
 ## RAM — Dynamic per-VM guest RAM + NPT sizing
 
-- [ ] **RAM-1** — Allocate a real, mem_mb-sized guest RAM region via
+- [x] **RAM-1** — Allocate a real, mem_mb-sized guest RAM region via
   UEFI AllocatePages; wire ADM's already-validated mem_mb into it.
   Deps: ADM-1, M3-1
-- [ ] **RAM-2** — Size NPT identity mapping to the actual allocated
+
+  *Confirmed via grep that neither `hype.cfg` parsing nor ADM's
+  admission checks were wired into the real boot path at all before
+  this -- `core/cfg.c`/`core/admission.c` existed only as standalone,
+  unit-tested modules, never actually called from `boot/main.c`, and
+  `mem_mb` was never used for anything except ADM's own budget-sum
+  arithmetic. Scope note: this task builds and validates the
+  allocation/NPT-sizing *mechanism* itself (the genuinely new
+  engineering work) using a synthetic one-VM config with a fixed test
+  `mem_mb` (`HYPE_RAM_1_TEST_MEM_MB` = 64), standing in for a real
+  parsed config -- reading an actual `hype.cfg` from the ESP needs
+  UEFI's Simple File System Protocol, which doesn't exist yet either
+  (the same file-I/O gap ISO-1 will need); wiring a *real* parsed
+  config in is a follow-on integration step, not this task's own scope,
+  matching M4-3/M4-4/M4-5's own established "primitive now, harder
+  integration later" pattern.
+  What *is* real: `core/admission.c` added to the main build
+  (`Makefile`) for the first time, and `hype_adm_check_memory()`
+  (ADM-1, already fully unit tested) now actually runs in the real boot
+  path -- against `hype_memmap_usable_bytes()`'s real computation over
+  this machine's own actual UEFI memory map (`core/memmap.c`, also
+  already existed but had never been consumed this way), not a
+  hardcoded/assumed figure. `hype_alloc_pages_any()`
+  (`AllocatePages(AllocateAnyPages)`, boot/main.c) is this project's
+  first UEFI allocation with no address constraint -- correct here
+  because the guest that runs inside it is long-mode (RIP addressing
+  has no 32-bit segment-base truncation risk the way M2-7's real-mode
+  guest does, per that guest's own real-hardware-bug comment).
+  Allocation happens on the BSP before MP dispatch, same ordering as
+  M2-7's own below-4GB allocation and for the same reason (Boot
+  Services calls from a non-BSP AP context are untested territory this
+  project has deliberately avoided so far).*
+- [x] **RAM-2** — Size NPT identity mapping to the actual allocated
   region instead of a fixed blanket constant.
   Deps: RAM-1
+
+  *`hype_ram_1_gb_to_map()` (`boot/main.c`) computes the GB count
+  needed to cover a guest-physical end address by rounding up to the
+  next whole GB, bounded by `HYPE_PAGING_MAX_GB` (the real compile-time
+  capacity of every `g_npt_pd`/`g_guest_pd`-style array in this file) --
+  fails closed (`hype_fatal()`) rather than silently overrunning a
+  static array if a future, larger `mem_mb` ever needs more coverage
+  than that. Both `hype_paging_build_identity()` (guest CR3) and
+  `hype_npt_build_identity()` (NPT) map from GB index 0 upward, the
+  same shape as every existing identity map here -- this computes *how
+  many* GB that shared shape needs to reach, not a new "map only this
+  region" builder.
+  Validated with a new synthetic test guest whose code/stack live
+  *inside* RAM-1's dynamically-allocated region (not a separate fixed
+  buffer): a single HLT, deliberately trivial -- what's actually being
+  proven is that the dynamically-computed NPT/guest-CR3 coverage
+  genuinely reaches wherever `AllocatePages(AllocateAnyPages)` actually
+  placed the allocation, the same class of real-hardware bug this
+  project already found and fixed once this session (`arch/x86_64/svm/
+  npt.h`'s own `HYPE_NPT_MAX_GB` comment) for a differently-sized gap
+  (compiler-placed static buffers, not firmware-placed dynamic
+  allocations). Clean QEMU run; every other existing test guest (M2-7
+  through CPUMSR-2) still halts cleanly.*
 
 ---
 
