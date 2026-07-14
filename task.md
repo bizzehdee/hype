@@ -55,11 +55,14 @@ the same bar.
   hardware.
   Deps: M0-3, SETUP-3, SETUP-4
 
-  *Open gate: not yet run. Downstream M1+ work has proceeded past this
-  point by explicit user decision (2026-07-13) to skip waiting on it for
-  now, not because the dependency stopped mattering -- this still needs
-  to happen and this checkbox should get filled in for real once it
-  does.*
+  *AMD half confirmed 2026-07-14: full build/boot/deploy loop (own
+  memory map dump, `ExitBootServices()`, own GDT/paging/IDT swap, timer
+  tick loop) now runs cleanly on two different real AMD machines (a
+  laptop and a Ryzen 9 5950X/B550 desktop, both 32GB RAM) via the USB
+  test package (`tools/make-usb-package.sh`) -- see M2-8's note for the
+  real bugs found and fixed along the way. Intel/VMX half still
+  unvalidated -- no physical Intel test hardware reachable from this
+  environment; that half of this checkbox stays open.*
 
 ---
 
@@ -144,18 +147,38 @@ multi-VM concurrency milestone, even though early single-guest milestones
 - [ ] **M2-8** — Real-hardware validation (Intel + AMD).
   Deps: M2-7, SETUP-3, SETUP-4
 
-  *Open gate: not yet run, same as M0-5 above -- no physical Intel/AMD
-  test hardware is reachable from this environment. SVM has real
-  QEMU/KVM nested-virtualization validation (M2-7: 5/5 clean runs,
-  correct HLT exit); VMX has none at all (this dev environment is
-  AMD-only hardware, so not even software emulation can exercise it) --
-  M2-8 is where VMX's vcpu_create/vcpu_run and its VM-entry/VM-exit
-  trampoline (deferred at M2-7, see vmx_ops.c) would actually get
-  written and iterated against real Intel silicon, not just where an
-  already-working backend gets double-checked. Downstream milestones
-  have proceeded past this point by the same explicit user decision
-  (2026-07-13) as M0-5 -- this still needs to happen for real on both
-  vendors' hardware before this checkbox is genuine.*
+  *AMD half confirmed 2026-07-14 on two real machines (a laptop and a
+  Ryzen 9 5950X/B550 desktop, both 32GB RAM), via a dedicated USB test
+  package (`tools/make-usb-package.sh`) carrying every M2-M4-5 test
+  guest plus screen-visible debug checkpoints (`hype_debug_print()`,
+  core/fatal.h/halt.c) bracketing every real-hardware-risky step --
+  added specifically because `hype_fatal()` never printed via UEFI's
+  own ConOut, and GOP console registration originally happened only
+  after the test guests ran, making an early panic indistinguishable
+  from a silent hang on a screen-only setup with no serial capture.
+  Two real, non-obvious bugs found this way, neither reproducible under
+  this project's QEMU/KVM nested-SVM dev environment:
+  1. `HYPE_NPT_MAX_GB`/M3-5's guest-CR3 identity map were both hardcoded
+     to 4GB while the host's own paging already used 64GB -- QEMU's
+     small test VMs always load the image under 4GB, but real UEFI
+     firmware on a 32GB machine loaded it just past 5GB, leaving the
+     guest's own entry point unmapped and triple-faulting
+     (VMEXIT_SHUTDOWN) on its first fetch. Fixed by tying both to
+     `HYPE_PAGING_MAX_GB` directly (arch/x86_64/svm/npt.h).
+  2. M2-7's real-mode guest pointed CS.base/SS.base straight at a
+     static buffer's address; AMD SVM only implements the low 32 bits
+     of most VMCB segment base fields (vmcb.h's own `hype_vmcb_seg_t`
+     comment already flagged this), so real silicon silently truncated
+     CS.base whenever that buffer landed above 4GB -- nested SVM under
+     QEMU/KVM apparently honors the full 64-bit field regardless. Fixed
+     by wiring up `EFI_BOOT_SERVICES.AllocatePages` (previously an
+     unused stub) and explicitly allocating that guest's code+stack
+     below 4GB via `AllocateMaxAddress` (boot/main.c).
+  VMX/Intel half still completely open -- no physical Intel test
+  hardware reachable from this environment, and VMX's vcpu_create/
+  vcpu_run trampoline (deferred at M2-7, see vmx_ops.c) still doesn't
+  exist. Downstream milestones have proceeded past this point by the
+  same explicit user decision (2026-07-13) as M0-5.*
 
 ---
 
@@ -238,19 +261,21 @@ multi-VM concurrency milestone, even though early single-guest milestones
 - [ ] **M3-6** — Real-hardware validation (Intel + AMD).
   Deps: M3-5, SETUP-3, SETUP-4
 
-  *Open gate: not yet run, same as M0-5/M2-8 above -- no physical
-  Intel/AMD test hardware is reachable from this environment. SVM has
-  real QEMU/KVM nested-virtualization validation throughout M3 (M3-1
-  NPT, M3-2 pinning, M3-5's full synthetic-bzImage guest launch, all
-  5/5 clean runs); VMX has none at all (AMD-only dev environment).
-  M3-6 is where the two real bugs found via M3-5's QEMU pass (IOPM
-  bitmap fill, VMRUN register clobbering) would get a second,
-  independent confirmation on real AMD silicon, and where VMX's
+  *AMD half confirmed 2026-07-14, same real-hardware pass as M2-8's
+  note (two AMD machines, laptop + Ryzen 9 5950X/B550): M3-1's NPT,
+  M3-2's pinning, and M3-5's full synthetic-bzImage guest launch
+  (IOIO-intercept dispatch to the PIC/PIT stubs, clean HLT exit) all
+  now confirmed on real AMD silicon, not just QEMU/KVM nested SVM --
+  see M2-8's note for the two real-hardware-only bugs found and fixed
+  (NPT/guest-paging map size, real-mode guest segment-base placement).
+  The two bugs M3-5 itself found under QEMU (IOPM bitmap fill, VMRUN
+  register clobbering) did not resurface on real hardware, for what
+  that's worth. VMX/Intel half still completely open -- no physical
+  Intel test hardware reachable from this environment, and VMX's
   still-nonexistent vcpu_run trampoline (deferred since M2-8) would
-  actually need to be written and debugged against real Intel
-  hardware for the first time. Downstream milestones have proceeded
-  past this point by the same explicit user decision (2026-07-13) as
-  M0-5/M2-8.*
+  still need to be written and debugged against real Intel hardware
+  for the first time. Downstream milestones have proceeded past this
+  point by the same explicit user decision (2026-07-13) as M0-5/M2-8.*
 
 ---
 
@@ -375,7 +400,8 @@ tasks — see updated deps below.*
   stores, reads the byte back through a genuine memory-mapped load,
   then writes that read-back value out to a second offset -- so the
   host can confirm both the write and read paths from the flash's
-  backing array alone. 5/5 clean QEMU runs.
+  backing array alone. 5/5 clean QEMU runs, plus confirmed on real AMD
+  hardware 2026-07-14 (see M2-8's note).
   Real persistence to a host file explicitly deferred -- that needs a
   disk driver, M5's job; this milestone's own dependency graph would
   otherwise be circular. The in-memory device model and NPT-based MMIO
@@ -420,7 +446,8 @@ tasks — see updated deps below.*
   (hand-written machine code, same rigor as M3-5/M4-3): the guest
   speaks fw_cfg's real DMA protocol to fetch "etc/acpi/rsdp" into a
   guest buffer, and the host confirms every byte matches what
-  `hype_acpi_build_rsdp()` built. 5/5 clean QEMU runs. Found and fixed
+  `hype_acpi_build_rsdp()` built. 5/5 clean QEMU runs, plus confirmed
+  on real AMD hardware 2026-07-14 (see M2-8's note). Found and fixed
   one real bug this way: an 8-byte little-endian immediate-patch helper
   was reused against a 4-byte immediate slot in the test payload,
   silently corrupting the following instruction's opening bytes.
@@ -465,7 +492,8 @@ tasks — see updated deps below.*
   host-built directly into guest memory, same convention as M4-4's
   fw_cfg test): issues a real READ(10) for one sector via the actual
   AHCI/ATAPI protocol, and the host confirms the transferred sector
-  matches the backing buffer byte-for-byte. 5/5 clean QEMU runs.
+  matches the backing buffer byte-for-byte. 5/5 clean QEMU runs, plus
+  confirmed on real AMD hardware 2026-07-14 (see M2-8's note).
   NOT yet validated: a real guest OS's own AHCI/ATAPI driver (Linux's
   ahci+sr_mod, or UEFI's own AhciBusDxe during M4-6's boot) actually
   enumerating and reading from this device -- that's M4-6's job.*
