@@ -765,10 +765,41 @@ tasks — see updated deps below.*
   stores it) -- fixed the test payload to match that existing
   convention rather than extending the decoder. Clean QEMU run; every
   other existing test guest (M2-7 through RAM-2) still halts cleanly.*
-- [ ] **PCI-2** — Expose the existing AHCI device (M4-5) as a
+- [x] **PCI-2** — Expose the existing AHCI device (M4-5) as a
   discoverable PCI function (vendor/device ID, class code, ABAR as
   BAR5) instead of a fixed guest-physical address.
   Deps: PCI-1, M4-5
+
+  *The genuinely hard part flagged when this was scoped out of M4-6:
+  real PCI enumeration means the guest *chooses* a device's MMIO
+  address itself (via BAR sizing/programming), not something the host
+  can hardcode ahead of time -- unlike every other MMIO device in this
+  project (pflash/AHCI/PCI's own ECAM window), which all live at a
+  fixed, host-picked guest-physical address whose NPT entry is marked
+  not-present once, up front. Solved with a *reactive* NPT update: the
+  test's own dispatch loop watches every PCI config-space write PCI-1's
+  handler processes, and the moment one results in
+  `hype_pci_memory_space_enabled()` becoming true with a nonzero
+  `hype_pci_get_bar_value()` (BAR5), it calls
+  `hype_npt_mark_not_present()` right then, at whatever address the
+  guest just chose -- mapping the device's MMIO window into existence
+  only once the guest has actually finished enumerating it, exactly
+  when real hardware would start decoding it too.
+  Found and fixed one real, if currently untriggered-by-this-test's-own
+  addresses, bug while building this: `hype_svm_vcpu_handle_pci_ecam_npf()`
+  (PCI-1) only checked a *lower* bound on the ECAM region -- harmless
+  with one NPT-trapped region active, but wrong once a second one (a
+  device's dynamically-BAR-programmed window) can coexist; fixed by
+  checking both bounds (`HYPE_PCI_ECAM_BUS0_SIZE`, devices/pci.h).
+  Validated with a synthetic test guest playing the role a real PCI bus
+  driver would: programs AHCI's BAR5 with an address deliberately
+  different from the old fixed `HYPE_M4_5_AHCI_GPA` (proving this is
+  genuinely dynamic, not incidentally the same constant), sets
+  Command.Memory Space Enable, then runs M4-5's own already-proven
+  AHCI/ATAPI register setup + READ(10) sequence unchanged, just
+  retargeted to the newly-discovered address. Clean QEMU run on the
+  first attempt; every other existing test guest (M2-7 through PCI-1)
+  still halts cleanly.*
 
 ---
 

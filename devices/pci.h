@@ -56,6 +56,17 @@
 #define HYPE_PCI_ECAM_FUNCTION_MASK 0x7u
 #define HYPE_PCI_ECAM_BUS_MASK 0xFFu
 
+/* Bus 0's own share of the whole (nominally much larger) MCFG-
+ * described ECAM region: 32 devices * 8 functions * 4KB = 1MB. This
+ * project only ever backs bus 0 (PCI-1), so this is also the exact
+ * size the exempt NPF glue (arch/x86_64/svm/svm_vcpu.c's
+ * hype_svm_vcpu_handle_pci_ecam_npf()) should treat as "mine, not some
+ * other device's" -- needed once PCI-2 introduces a second NPT-trapped
+ * region (a device's own dynamically-BAR-programmed MMIO window) that
+ * could otherwise be mistaken for an ECAM access if only a lower bound
+ * were checked. */
+#define HYPE_PCI_ECAM_BUS0_SIZE 0x100000u
+
 /* This project's own placeholder vendor ID -- not a real PCI-SIG
  * assignment, and deliberately not pretending to be any real vendor's
  * hardware (same "honest, not pretending compatibility" choice as

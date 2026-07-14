@@ -281,16 +281,23 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
  * the same instruction decode (hype_mmio_decode(), reading the
  * faulting instruction directly out of guest memory at RIP) since ECAM
  * is accessed via ordinary MOV instructions just like pflash's/AHCI's.
+ * Checks BOTH bounds of `[ecam_base_phys, ecam_base_phys +
+ * HYPE_PCI_ECAM_BUS0_SIZE)` -- not just the lower one -- returning -1
+ * if the fault is outside this device's own range; this matters once
+ * PCI-2 introduces a second, independently NPT-trapped region (a
+ * device's own dynamically-BAR-programmed MMIO window), which an
+ * only-a-lower-bound check could otherwise mistake for an ECAM access.
  * Resolves the faulting guest-physical address into an ECAM byte
  * offset, decodes it via hype_pci_decode_ecam_offset(), and dispatches
  * to hype_pci_config_read()/_write() -- both of which always succeed
  * (see devices/pci.h's own top comment for why a config-space access
  * architecturally never faults the way a real memory access can), so
  * unlike every other NPF handler here, this one has no "unrecognized
- * access" failure mode of its own; it can still return -1 if the
- * faulting instruction itself doesn't decode (an unsupported
- * MOV/MOVZX form), matching hype_svm_vcpu_handle_npf()'s own
- * convention for that case. Advances RIP past the decoded instruction.
+ * access" failure mode of its own beyond being outside its own range;
+ * it can still return -1 if the faulting instruction itself doesn't
+ * decode (an unsupported MOV/MOVZX form), matching
+ * hype_svm_vcpu_handle_npf()'s own convention for that case. Advances
+ * RIP past the decoded instruction.
  * Exempt from unit testing -- reaches into the exempt VMCB fields this
  * backend's real VMRUN produces; hype_pci_decode_ecam_offset(),
  * hype_mmio_decode(), and hype_pci_config_read()/_write() are all

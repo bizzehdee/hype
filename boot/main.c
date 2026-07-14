@@ -1743,6 +1743,266 @@ static void run_pci_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
 }
 
+/*
+ * PCI-2: makes M4-5's real AHCI device genuinely PCI-discoverable --
+ * registered via PCI-1's config-space model with BAR5 sized (the real
+ * ABAR convention), instead of always living at a fixed guest-physical
+ * address the guest never had to discover for itself. The guest here
+ * plays the role a real PCI bus driver would: program BAR5 with an
+ * address of its own choosing (deliberately different from
+ * HYPE_M4_5_AHCI_GPA, to prove this is genuinely dynamic, not
+ * incidentally the same fixed value), then set Command.Memory Space
+ * Enable -- only *after* observing that exact config-space write does
+ * this test's own dispatch loop (mirroring what a real PCI-aware
+ * hypervisor's device model does) dynamically NPT-map the device at
+ * that address, letting the rest of M4-5's own already-proven AHCI/
+ * ATAPI register setup + READ(10) sequence run unchanged, just
+ * retargeted to the newly-discovered address instead of a compile-time
+ * constant.
+ */
+static uint8_t g_pci_2_media[4 * HYPE_ATAPI_SECTOR_SIZE] __attribute__((aligned(4096)));
+static uint8_t g_pci_2_cmd_list[4096] __attribute__((aligned(4096)));
+static uint8_t g_pci_2_cmd_table[4096] __attribute__((aligned(4096)));
+static uint8_t g_pci_2_rx_fis[4096] __attribute__((aligned(4096)));
+static uint8_t g_pci_2_dest_buffer[HYPE_ATAPI_SECTOR_SIZE] __attribute__((aligned(4096)));
+static uint8_t g_pci_2_guest_code[192] __attribute__((aligned(4096)));
+static uint8_t g_pci_2_guest_stack[4096] __attribute__((aligned(4096)));
+static hype_ahci_t g_pci_2_ahci;
+static hype_atapi_t g_pci_2_atapi;
+static hype_pci_t g_pci_2_pci;
+
+#define HYPE_PCI_2_AHCI_DEV 1u
+/* The address the guest itself chooses to place the AHCI device at,
+ * by programming it into BAR5 -- deliberately NOT
+ * HYPE_M4_5_AHCI_GPA (3GB+2MB), to prove this is genuinely discovered/
+ * dynamic rather than coincidentally the same fixed constant. Must fit
+ * in 32 bits (BAR5 is an ordinary 32-bit memory BAR). */
+#define HYPE_PCI_2_AHCI_GPA (HYPE_M4_3_PFLASH_GPA + 4ULL * 1024 * 1024)
+
+/*
+ * Section A (RBX = ECAM base): programs BAR5 with the chosen address,
+ * then sets Command.Memory Space Enable -- the standard PCI
+ * enumeration sequence a real bus driver performs once it has sized a
+ * BAR and decided where to place it.
+ * Section B (RBX = the just-programmed AHCI address): byte-for-byte
+ * identical to g_m4_5_payload_template's own AHCI setup/trigger/poll
+ * sequence (from its own "mov rbx, <ahci gpa>" onward) -- copied
+ * verbatim rather than shared, matching this project's own established
+ * "each milestone test owns its payload" convention; the "jnz poll"
+ * relative branch keeps working unchanged since it's relative to its
+ * own position, not the whole payload's start.
+ *
+ *   mov rbx, <patched: ECAM base>          48 BB 00*8
+ *   mov eax, <patched: HYPE_PCI_2_AHCI_GPA>  B8 00*4
+ *   mov [rbx+0x8024], eax  (BAR5)            89 83 24 80 00 00
+ *   mov eax, 2  (Memory Space Enable)        B8 02 00 00 00
+ *   mov [rbx+0x8004], eax  (Command)         89 83 04 80 00 00
+ *   mov rbx, <patched: HYPE_PCI_2_AHCI_GPA>  48 BB 00*8
+ *   mov eax, 0x80000000 (GHC.AE)             B8 00 00 00 80
+ *   mov [rbx+4], eax                         89 43 04
+ *   mov eax, <patched: CLB low32>            B8 00*4
+ *   mov [rbx+0x100], eax                     89 83 00 01 00 00
+ *   mov eax, <patched: CLB high32>           B8 00*4
+ *   mov [rbx+0x104], eax                     89 83 04 01 00 00
+ *   mov eax, <patched: FB low32>             B8 00*4
+ *   mov [rbx+0x108], eax                     89 83 08 01 00 00
+ *   mov eax, <patched: FB high32>            B8 00*4
+ *   mov [rbx+0x10C], eax                     89 83 0C 01 00 00
+ *   mov eax, 0x00000011 (PxCMD ST|FRE)       B8 11 00 00 00
+ *   mov [rbx+0x118], eax                     89 83 18 01 00 00
+ *   mov eax, 0x00000001 (PxCI slot 0)        B8 01 00 00 00
+ *   mov [rbx+0x138], eax                     89 83 38 01 00 00  <- triggers
+ * poll:
+ *   mov eax, [rbx+0x138]                     8B 83 38 01 00 00
+ *   test eax, eax                            85 C0
+ *   jnz poll                                 75 F6
+ *   hlt                                      F4
+ *   jmp $-3                                  EB FD
+ */
+static const uint8_t g_pci_2_payload_template[] = {
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x24, 0x80, 0x00, 0x00,
+    0xB8, 0x02, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x04, 0x80, 0x00, 0x00,
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x80,
+    0x89, 0x43, 0x04,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x00, 0x01, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x04, 0x01, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x08, 0x01, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x0C, 0x01, 0x00, 0x00,
+    0xB8, 0x11, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x18, 0x01, 0x00, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x8B, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x85, 0xC0,
+    0x75, 0xF6,
+    0xF4,
+    0xEB, 0xFD
+};
+#define HYPE_PCI_2_PAYLOAD_ECAM_RBX_IMM_OFFSET 2
+#define HYPE_PCI_2_PAYLOAD_BAR5_VALUE_IMM_OFFSET 11
+#define HYPE_PCI_2_PAYLOAD_AHCI_RBX_IMM_OFFSET 34
+#define HYPE_PCI_2_PAYLOAD_CLB_LOW_IMM_OFFSET 51
+#define HYPE_PCI_2_PAYLOAD_CLB_HIGH_IMM_OFFSET 62
+#define HYPE_PCI_2_PAYLOAD_FB_LOW_IMM_OFFSET 73
+#define HYPE_PCI_2_PAYLOAD_FB_HIGH_IMM_OFFSET 84
+
+static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
+    uint64_t cmd_list_phys, cmd_table_phys, rx_fis_phys, dest_phys;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+    int ahci_mapped;
+    uint64_t ahci_mapped_base;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("pci-2: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_pci_2_cmd_list, sizeof(g_pci_2_cmd_list));
+    hype_guest_ram_zero(g_pci_2_cmd_table, sizeof(g_pci_2_cmd_table));
+    hype_guest_ram_zero(g_pci_2_rx_fis, sizeof(g_pci_2_rx_fis));
+    hype_guest_ram_zero(g_pci_2_dest_buffer, sizeof(g_pci_2_dest_buffer));
+    hype_guest_ram_zero(g_pci_2_guest_code, sizeof(g_pci_2_guest_code));
+    hype_guest_ram_zero(g_pci_2_guest_stack, sizeof(g_pci_2_guest_stack));
+
+    for (i = 0; i < sizeof(g_pci_2_media); i++) {
+        g_pci_2_media[i] = (uint8_t)((i / HYPE_ATAPI_SECTOR_SIZE) & 0xFFu);
+    }
+    hype_atapi_reset(&g_pci_2_atapi, g_pci_2_media, sizeof(g_pci_2_media));
+    hype_ahci_reset(&g_pci_2_ahci);
+
+    hype_pci_reset(&g_pci_2_pci);
+    hype_pci_add_device(&g_pci_2_pci, HYPE_PCI_2_AHCI_DEV, HYPE_PCI_VENDOR_ID_HYPE, 0x0002u, 0x01, 0x06,
+                         0x01);
+    hype_pci_set_bar_size(&g_pci_2_pci, HYPE_PCI_2_AHCI_DEV, 5, 0x1000u);
+
+    cmd_list_phys = (uint64_t)(uintptr_t)g_pci_2_cmd_list;
+    cmd_table_phys = (uint64_t)(uintptr_t)g_pci_2_cmd_table;
+    rx_fis_phys = (uint64_t)(uintptr_t)g_pci_2_rx_fis;
+    dest_phys = (uint64_t)(uintptr_t)g_pci_2_dest_buffer;
+
+    hype_write_le32(g_pci_2_cmd_list + 0, 0x00010025u);
+    hype_write_le32(g_pci_2_cmd_list + 4, 0);
+    hype_write_le32(g_pci_2_cmd_list + 8, (uint32_t)cmd_table_phys);
+    hype_write_le32(g_pci_2_cmd_list + 12, (uint32_t)(cmd_table_phys >> 32));
+
+    g_pci_2_cmd_table[0] = 0x27;
+    g_pci_2_cmd_table[1] = 0x80;
+    g_pci_2_cmd_table[2] = 0xA0;
+    g_pci_2_cmd_table[0x40 + 0] = HYPE_ATAPI_CMD_READ10;
+    g_pci_2_cmd_table[0x40 + 5] = 2;
+    g_pci_2_cmd_table[0x40 + 8] = 1;
+    hype_write_le32(g_pci_2_cmd_table + 0x80 + 0, (uint32_t)dest_phys);
+    hype_write_le32(g_pci_2_cmd_table + 0x80 + 4, (uint32_t)(dest_phys >> 32));
+    hype_write_le32(g_pci_2_cmd_table + 0x80 + 12, HYPE_ATAPI_SECTOR_SIZE - 1u);
+
+    for (i = 0; i < sizeof(g_pci_2_payload_template); i++) {
+        g_pci_2_guest_code[i] = g_pci_2_payload_template[i];
+    }
+    hype_write_le64(g_pci_2_guest_code + HYPE_PCI_2_PAYLOAD_ECAM_RBX_IMM_OFFSET, HYPE_PCI_1_ECAM_GPA);
+    hype_write_le32(g_pci_2_guest_code + HYPE_PCI_2_PAYLOAD_BAR5_VALUE_IMM_OFFSET,
+                     (uint32_t)HYPE_PCI_2_AHCI_GPA);
+    hype_write_le64(g_pci_2_guest_code + HYPE_PCI_2_PAYLOAD_AHCI_RBX_IMM_OFFSET, HYPE_PCI_2_AHCI_GPA);
+    hype_write_le32(g_pci_2_guest_code + HYPE_PCI_2_PAYLOAD_CLB_LOW_IMM_OFFSET, (uint32_t)cmd_list_phys);
+    hype_write_le32(g_pci_2_guest_code + HYPE_PCI_2_PAYLOAD_CLB_HIGH_IMM_OFFSET,
+                     (uint32_t)(cmd_list_phys >> 32));
+    hype_write_le32(g_pci_2_guest_code + HYPE_PCI_2_PAYLOAD_FB_LOW_IMM_OFFSET, (uint32_t)rx_fis_phys);
+    hype_write_le32(g_pci_2_guest_code + HYPE_PCI_2_PAYLOAD_FB_HIGH_IMM_OFFSET,
+                     (uint32_t)(rx_fis_phys >> 32));
+
+    entry_rip = (uint64_t)(uintptr_t)g_pci_2_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_pci_2_guest_stack + sizeof(g_pci_2_guest_stack));
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+    hype_npt_mark_not_present(g_npt_pd, HYPE_PCI_1_ECAM_GPA);
+    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+
+    hype_debug_print("pci-2: entry_rip=0x%llx ecam_gpa=0x%llx chosen_ahci_gpa=0x%llx\n",
+                      (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
+                      (unsigned long long)HYPE_PCI_2_AHCI_GPA);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    if (ctx == 0) {
+        hype_fatal("pci-2: vcpu_create_long_mode failed");
+    }
+
+    ahci_mapped = 0;
+    ahci_mapped_base = 0;
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("pci-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_pci_2_pci, HYPE_PCI_1_ECAM_GPA) == 0) {
+                /* A config-space write may just have set Memory Space
+                 * Enable with a valid BAR5 already programmed -- if
+                 * so, this is the exact moment a real PCI-aware
+                 * hypervisor would map the device's now-known MMIO
+                 * window. Only ever done once per run (ahci_mapped
+                 * guards it) -- this test's guest never reprograms
+                 * BAR5 after enabling it. */
+                if (!ahci_mapped &&
+                    hype_pci_memory_space_enabled(&g_pci_2_pci, HYPE_PCI_2_AHCI_DEV)) {
+                    uint64_t bar5 = hype_pci_get_bar_value(&g_pci_2_pci, HYPE_PCI_2_AHCI_DEV, 5);
+                    if (bar5 != 0) {
+                        hype_npt_mark_not_present(g_npt_pd, bar5);
+                        ahci_mapped_base = bar5;
+                        ahci_mapped = 1;
+                        hype_debug_print("pci-2: AHCI BAR5 enabled at 0x%llx -- NPT-mapping it now\n",
+                                          (unsigned long long)bar5);
+                    }
+                }
+                continue;
+            }
+
+            if (ahci_mapped &&
+                hype_svm_vcpu_handle_ahci_npf(ctx, &g_pci_2_ahci, &g_pci_2_atapi, ahci_mapped_base) == 0) {
+                continue;
+            }
+
+            hype_fatal("pci-2: unhandled NPF (qual=0x%llx guest_rip=0x%llx)",
+                       (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("pci-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+    if (!ahci_mapped || ahci_mapped_base != HYPE_PCI_2_AHCI_GPA) {
+        hype_fatal("pci-2: AHCI device was never dynamically mapped at the chosen BAR5 address");
+    }
+
+    for (i = 0; i < sizeof(g_pci_2_dest_buffer); i++) {
+        if (g_pci_2_dest_buffer[i] != g_pci_2_media[2 * HYPE_ATAPI_SECTOR_SIZE + i]) {
+            hype_fatal("pci-2: READ(10) round trip mismatch at byte %llu", i);
+        }
+    }
+
+    hype_debug_print(
+        "pci-2: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- AHCI discovered via "
+        "PCI BAR5=0x%llx, %u-byte READ(10) round trip verified byte-for-byte\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
+        (unsigned long long)ahci_mapped_base, HYPE_ATAPI_SECTOR_SIZE);
+}
+
 /* Runs every test guest in sequence -- what actually gets dispatched
  * (inline on the BSP, or onto a pinned AP; see efi_main) so each new
  * milestone's test guest still exercises real 1:1 vCPU-to-pCPU
@@ -1758,6 +2018,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_cpumsr_test(args->ops, args->kind);
     run_ram_1_test(args->ops, args->kind);
     run_pci_1_test(args->ops, args->kind);
+    run_pci_2_test(args->ops, args->kind);
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {

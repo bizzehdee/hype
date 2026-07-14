@@ -520,7 +520,12 @@ int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uin
 
     hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
 
-    if (npf.guest_phys_addr < ecam_base_phys) {
+    /* Both bounds matter, not just the lower one: PCI-2 introduces a
+     * second NPT-trapped region (a device's own dynamically-BAR-
+     * programmed MMIO window) that could otherwise be mistaken for an
+     * ECAM access if this only checked "at or past the base." */
+    if (npf.guest_phys_addr < ecam_base_phys ||
+        npf.guest_phys_addr >= ecam_base_phys + HYPE_PCI_ECAM_BUS0_SIZE) {
         return -1;
     }
 
