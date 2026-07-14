@@ -7,6 +7,13 @@ epics with no dependency between them can run in parallel.
 
 Checkbox = done. `Deps: —` = no prerequisites.
 
+**Minimum supported guest target (plan.md §1, decided 2026-07-14): Windows
+(any 64-bit), Linux (any 64-bit), and BSD (any 64-bit) — no 32-bit guests.**
+M3 validates the core VM-exit loop via a Linux-specific direct `bzImage` boot
+(cheapest path, not the only supported one); M4+ guest-firmware work and M6's
+dedicated BSD milestone bring Windows and BSD (and firmware-booted Linux) to
+the same bar.
+
 ---
 
 ## SETUP — Pre-M0 readiness (plan.md §11)

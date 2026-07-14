@@ -23,6 +23,10 @@ device emulation, and boot plumbing to install and run guest operating systems,
 with no aspirations to advanced scheduling, live migration, or nested
 virtualization in v1.
 
+**Minimum supported guest target: Windows (any 64-bit version), Linux (any
+64-bit distribution), and BSD (any 64-bit variant) — no 32-bit guests of any
+kind. See §10 decision #23.**
+
 Non-goals (v1): live migration, GPU passthrough/SR-IOV, nested virtualization,
 nice management UI, nested-paging tricks beyond basic EPT/NPT, VM memory
 snapshotting (live RAM state), VirtIO ballooning.
@@ -808,6 +812,20 @@ isn't lost.
     are never forwarded to any guest, including whichever VM had focus
     immediately before, closing a potential input-leak path between the
     dashboard and a backgrounded guest.
+23. **Minimum guest OS target — decided: Windows (any 64-bit version),
+    Linux (any 64-bit distribution), and BSD (any 64-bit variant —
+    FreeBSD/OpenBSD/NetBSD); no 32-bit guest support of any kind, on any of
+    the three families.** BSD was already in scope via §5's `os_hint` enum
+    and §9's dedicated M6 milestone; this decision makes the "minimum bar,
+    all three families, 64-bit only" framing explicit rather than implicit.
+    Windows and BSD both boot via guest UEFI firmware (§6, §7 `/fw`); Linux
+    additionally gets a direct `bzImage` boot path (M3) as the cheapest way
+    to validate the core VM-exit loop before guest firmware exists — not as
+    its only supported boot path, a firmware-booted Linux guest is equally
+    valid. Guests may still pass transiently through real-mode/protected
+    mode as part of their own normal boot sequence (e.g. a Linux bzImage's
+    own decompression stub); that's the guest's own boot code, not a
+    32-bit-guest support path this project needs to build.
 
 ## 11. Pre-M0 readiness checklist
 
