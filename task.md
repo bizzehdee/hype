@@ -380,8 +380,56 @@ tasks — see updated deps below.*
   disk driver, M5's job; this milestone's own dependency graph would
   otherwise be circular. The in-memory device model and NPT-based MMIO
   trap mechanism are both reusable as-is once M5 exists.*
-- [ ] **M4-4** — Per-VM ACPI table synthesis (RSDP/XSDT/FADT/MADT/MCFG).
+- [x] **M4-4** — Per-VM ACPI table synthesis (RSDP/XSDT/FADT/MADT/MCFG).
   Deps: M4-2, M3-2
+
+  *Since M4-2 uses real, vendored OVMF (not custom-written firmware),
+  its stock AcpiPlatformDxe driver never builds ACPI content itself --
+  it fetches it via QEMU's own fw_cfg device and a "linker/loader"
+  script that tells firmware how to allocate memory for the blob,
+  patch cross-table pointers, and recompute checksums once real
+  addresses are known. Implementing genuine fw_cfg + linker-loader
+  support (rather than patching our own OVMF build to skip it) was an
+  explicit user choice, so stock OVMF works unmodified. `devices/acpi.h`/
+  `.c` builds RSDT-independent XSDT+FADT+MADT+MCFG+DSDT content as one
+  relocatable blob (every cross-table pointer field pre-filled with
+  the *target's offset within that blob*, not a final address; every
+  checksum byte left 0) -- FADT targets ACPI's Hardware-Reduced
+  profile, needing no legacy PM1a/PM-timer/GPE emulation; DSDT is a
+  header-only placeholder (no AML), deferred until a real device
+  actually needs one. `devices/acpi_loader.h`/`.c` builds the exact
+  128-byte-entry "etc/table-loader" wire format QEMU/OVMF define
+  (ALLOCATE/ADD_POINTER/ADD_CHECKSUM), struct layout and field order
+  fetched from QEMU's own bios-linker-loader.h, not reconstructed from
+  memory. `devices/fw_cfg.h`/`.c` is the device model itself (classic
+  selector/data ports 0x510/0x511 plus the real DMA interface at
+  0x514/0x518) -- port numbers, well-known keys, and the DMA struct's
+  big-endian wire encoding fetched from QEMU's own
+  standard-headers/linux/qemu_fw_cfg.h and cross-checked directly
+  against this project's own vendored OVMF driver source
+  (edk2/OvmfPkg/Library/QemuFwCfgLib), which is also what caught that
+  OVMF's actual DMA-support probe reads a classic-interface feature bit
+  (FW_CFG_ID) rather than reading back the DMA address register's
+  "QEMU CFG" signature -- this device doesn't need that probe path at
+  all. Every one of these three modules is pure logic, 100%/100%
+  region/line covered (acpi.c, acpi_loader.c) or 96.9%/97.5%/93.5%
+  region/line/branch (fw_cfg.c); wiring into the exempt SVM IOIO glue
+  (`hype_svm_vcpu_handle_fw_cfg_ioio()`, arch/x86_64/svm/svm_vcpu.c) is
+  a thin adapter, same layering as M3-4's PIC/PIT and M4-3's pflash.
+  Validated end-to-end with a synthetic long-mode test guest
+  (hand-written machine code, same rigor as M3-5/M4-3): the guest
+  speaks fw_cfg's real DMA protocol to fetch "etc/acpi/rsdp" into a
+  guest buffer, and the host confirms every byte matches what
+  `hype_acpi_build_rsdp()` built. 5/5 clean QEMU runs. Found and fixed
+  one real bug this way: an 8-byte little-endian immediate-patch helper
+  was reused against a 4-byte immediate slot in the test payload,
+  silently corrupting the following instruction's opening bytes.
+  NOT yet validated: real, vendored OVMF actually booting as a nested
+  guest and its AcpiPlatformDxe successfully consuming this content
+  end-to-end (confirming the linker-loader script itself, not just the
+  fw_cfg transport) -- that integration is M4-6's job, matching this
+  project's own "build the primitive now, defer the harder integration"
+  pattern (e.g. M4-3's flash persistence).*
 - [ ] **M4-5** — Virtual optical drive device (read-only ISO passthrough,
   AHCI/ATAPI or virtio-scsi CD-ROM).
   Deps: M3-1

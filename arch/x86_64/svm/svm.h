@@ -8,6 +8,7 @@
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
 #include "../../../devices/pflash.h"
+#include "../../../devices/fw_cfg.h"
 #include "vmcb.h"
 
 /*
@@ -150,6 +151,38 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
  * isolation.
  */
 int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t pf_base_phys);
+
+/*
+ * Handles an IOIO VM-exit against `fw`, a fw_cfg device model
+ * (devices/fw_cfg.h) -- how this project's own synthesized ACPI
+ * content (devices/acpi.h/acpi_loader.h) reaches the guest's real,
+ * vendored OVMF firmware (M4-4). Decodes EXITINFO1
+ * (hype_svm_decode_ioio_info1()) and dispatches four ports: 0x510
+ * (16-bit OUT, select) and 0x511 (8-bit IN, next byte) drive
+ * hype_fw_cfg_select()/hype_fw_cfg_read_byte() directly from/into the
+ * guest's RAX; 0x514 and 0x518 (32-bit OUT each) drive the DMA
+ * interface (hype_fw_cfg_dma_addr_high()/_low()) -- the 0x518 write is
+ * what triggers the actual transfer, per fw_cfg's own protocol, so
+ * this function then reads the 16-byte access struct directly out of
+ * guest memory at the address hype_fw_cfg_dma_addr_low() returns (a
+ * plain host pointer dereference, same flat-identity-map reasoning as
+ * hype_svm_vcpu_handle_npf()'s own instruction-byte fetch), decodes it
+ * (hype_fw_cfg_dma_decode()), resolves its own `address` field into
+ * another guest pointer for the actual data transfer, calls
+ * hype_fw_cfg_dma_execute(), and writes the result back into the
+ * access struct's Control field (big-endian, matching what OVMF's own
+ * polling loop expects). Returns 0 for a recognized port, non-zero for
+ * any other port or an IN issued against an OUT-only port (or vice
+ * versa) -- the caller's job to treat as fatal, matching this
+ * project's other IOIO/NPF handlers' fail-closed convention. Advances
+ * the guest's RIP to EXITINFO2 on success, same "next-RIP-for-free"
+ * convenience as hype_svm_vcpu_handle_ioio(). Exempt from unit testing
+ * -- reaches into the exempt VMCB fields this backend's real VMRUN
+ * produces and does its own raw guest-memory access; every
+ * hype_fw_cfg_*() call this dispatches to is already fully tested in
+ * isolation.
+ */
+int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */
