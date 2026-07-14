@@ -238,6 +238,20 @@ multi-VM concurrency milestone, even though early single-guest milestones
 - [ ] **M3-6** — Real-hardware validation (Intel + AMD).
   Deps: M3-5, SETUP-3, SETUP-4
 
+  *Open gate: not yet run, same as M0-5/M2-8 above -- no physical
+  Intel/AMD test hardware is reachable from this environment. SVM has
+  real QEMU/KVM nested-virtualization validation throughout M3 (M3-1
+  NPT, M3-2 pinning, M3-5's full synthetic-bzImage guest launch, all
+  5/5 clean runs); VMX has none at all (AMD-only dev environment).
+  M3-6 is where the two real bugs found via M3-5's QEMU pass (IOPM
+  bitmap fill, VMRUN register clobbering) would get a second,
+  independent confirmation on real AMD silicon, and where VMX's
+  still-nonexistent vcpu_run trampoline (deferred since M2-8) would
+  actually need to be written and debugged against real Intel
+  hardware for the first time. Downstream milestones have proceeded
+  past this point by the same explicit user decision (2026-07-13) as
+  M0-5/M2-8.*
+
 ---
 
 ## INPUT — Input devices (plan.md §6b, §6c)
