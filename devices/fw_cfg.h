@@ -64,6 +64,17 @@ typedef struct {
     const char *name; /* caller-owned, must outlive this fw_cfg instance */
     const uint8_t *data; /* caller-owned */
     uint32_t size;
+    /* NULL for a read-only file (every file hype_fw_cfg_add_file()
+     * registers) -- non-NULL, and equal to `data` itself, for a file
+     * registered via hype_fw_cfg_add_writable_file() (VIDEO-2's
+     * "etc/ramfb", the first and so far only writable file this
+     * project serves). Kept as a separate field rather than dropping
+     * `data`'s const qualifier so every existing read-only caller/file
+     * stays structurally guest-immutable by construction, matching
+     * this project's own guest-isolation invariant (AGENTS.md) -- a
+     * guest must never be able to write into synthesized ACPI content
+     * just because the write path exists at all. */
+    uint8_t *write_data;
 } hype_fw_cfg_file_t;
 
 typedef struct {
@@ -98,6 +109,19 @@ void hype_fw_cfg_reset(hype_fw_cfg_t *fw);
  * the FW_CFG_FILE_DIR content. Pure struct/buffer filling.
  */
 int hype_fw_cfg_add_file(hype_fw_cfg_t *fw, const char *name, const uint8_t *data, uint32_t size);
+
+/*
+ * Registers a writable file (VIDEO-2): `buf`/`size` caller-owned, must
+ * outlive `fw`. Identical to hype_fw_cfg_add_file() otherwise (same
+ * key assignment, same FW_CFG_FILE_DIR rebuild), except a DMA WRITE
+ * targeting this file's selector actually copies guest-supplied bytes
+ * into `buf` (hype_fw_cfg_dma_execute()) instead of being rejected.
+ * `buf`'s initial content becomes this file's initial read content too
+ * (there is only one buffer, read and written through the same
+ * pointer) -- typically the caller zeroes it first, matching every
+ * other guest-visible buffer's M2-6 zero-before-use convention.
+ */
+int hype_fw_cfg_add_writable_file(hype_fw_cfg_t *fw, const char *name, uint8_t *buf, uint32_t size);
 
 /* Classic interface: selects `key` for reading, resetting the read
  * offset to 0 -- port 0x510's write handler. */
@@ -149,11 +173,16 @@ void hype_fw_cfg_dma_decode(const uint8_t raw[16], hype_fw_cfg_dma_op_t *out);
  * what keeps it fully unit-testable with a plain stack/static buffer
  * standing in for guest memory. SELECT (if set) is applied first, so a
  * single op can select-then-read/write/skip in one call, matching real
- * hardware. WRITE is rejected (HYPE_FW_CFG_DMA_CTL_ERROR) -- every file
- * this project serves via fw_cfg is read-only guest-visible content
- * (ACPI tables/loader script), there is nothing to accept a write into.
- * A read past the selected item's own size fills the remainder with 0,
- * same convention as the classic interface. Returns the value the
+ * hardware. WRITE is rejected (HYPE_FW_CFG_DMA_CTL_ERROR) unless the
+ * selected item was registered via hype_fw_cfg_add_writable_file()
+ * (VIDEO-2's "etc/ramfb") -- every other file this project serves via
+ * fw_cfg is read-only guest-visible content (ACPI tables/loader
+ * script), with nothing to accept a write into. A write (or read) past
+ * the selected item's own size is dropped (or, for a read, fills the
+ * remainder with 0) rather than growing or overrunning the
+ * destination buffer -- a guest-supplied `op->length` is untrusted
+ * input (VALID's own invariant: never trust a guest-supplied
+ * address/length in device emulation code). Returns the value the
  * caller should write back (big-endian) into the guest's Control
  * field: 0 on success, HYPE_FW_CFG_DMA_CTL_ERROR set otherwise.
  */

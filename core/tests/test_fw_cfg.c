@@ -262,6 +262,76 @@ static void test_dma_execute_write_rejected(void) {
     CHECK_HEX("write is rejected with the error bit set", HYPE_FW_CFG_DMA_CTL_ERROR, result);
 }
 
+static void test_writable_file_dma_write_lands_in_buffer(void) {
+    hype_fw_cfg_t fw;
+    uint8_t backing[4] = {0, 0, 0, 0};
+    uint8_t guest_buf[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    hype_fw_cfg_dma_op_t op;
+    uint32_t result;
+    int key;
+
+    hype_fw_cfg_reset(&fw);
+    key = hype_fw_cfg_add_writable_file(&fw, "etc/ramfb", backing, sizeof(backing));
+
+    op.control = HYPE_FW_CFG_DMA_CTL_SELECT | HYPE_FW_CFG_DMA_CTL_WRITE;
+    op.select_key = (uint16_t)key;
+    op.length = 4;
+    op.address = 0; /* unused by hype_fw_cfg_dma_execute() itself */
+    result = hype_fw_cfg_dma_execute(&fw, &op, guest_buf);
+
+    CHECK_HEX("write to a writable file is not an error", 0, result);
+    CHECK_HEX("backing[0]", 0xAA, backing[0]);
+    CHECK_HEX("backing[1]", 0xBB, backing[1]);
+    CHECK_HEX("backing[2]", 0xCC, backing[2]);
+    CHECK_HEX("backing[3]", 0xDD, backing[3]);
+}
+
+static void test_writable_file_read_back_sees_written_content(void) {
+    hype_fw_cfg_t fw;
+    uint8_t backing[2] = {0, 0};
+    uint8_t guest_buf[2] = {0x12, 0x34};
+    hype_fw_cfg_dma_op_t op;
+    int key;
+
+    hype_fw_cfg_reset(&fw);
+    key = hype_fw_cfg_add_writable_file(&fw, "etc/ramfb", backing, sizeof(backing));
+
+    op.control = HYPE_FW_CFG_DMA_CTL_SELECT | HYPE_FW_CFG_DMA_CTL_WRITE;
+    op.select_key = (uint16_t)key;
+    op.length = 2;
+    op.address = 0;
+    hype_fw_cfg_dma_execute(&fw, &op, guest_buf);
+
+    /* The classic interface reads the SAME buffer a writable file's
+     * DMA write just landed in -- there is only one buffer. */
+    hype_fw_cfg_select(&fw, (uint16_t)key);
+    CHECK_HEX("byte 0 read back", 0x12, hype_fw_cfg_read_byte(&fw));
+    CHECK_HEX("byte 1 read back", 0x34, hype_fw_cfg_read_byte(&fw));
+}
+
+static void test_writable_file_write_past_end_is_dropped(void) {
+    hype_fw_cfg_t fw;
+    uint8_t backing[2] = {0x11, 0x22};
+    uint8_t guest_buf[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    hype_fw_cfg_dma_op_t op;
+    int key;
+
+    hype_fw_cfg_reset(&fw);
+    key = hype_fw_cfg_add_writable_file(&fw, "etc/ramfb", backing, sizeof(backing));
+
+    /* Guest claims a 4-byte write against a 2-byte buffer -- the extra
+     * bytes must be dropped, never written past `backing`'s own end
+     * (VALID's own invariant: a guest-supplied length is untrusted). */
+    op.control = HYPE_FW_CFG_DMA_CTL_SELECT | HYPE_FW_CFG_DMA_CTL_WRITE;
+    op.select_key = (uint16_t)key;
+    op.length = 4;
+    op.address = 0;
+    hype_fw_cfg_dma_execute(&fw, &op, guest_buf);
+
+    CHECK_HEX("backing[0] overwritten", 0xAA, backing[0]);
+    CHECK_HEX("backing[1] overwritten", 0xBB, backing[1]);
+}
+
 static void test_read_byte_unrecognized_key_returns_zero(void) {
     hype_fw_cfg_t fw;
     hype_fw_cfg_reset(&fw);
@@ -321,6 +391,9 @@ int main(void) {
     test_dma_execute_read_past_end_fills_zero();
     test_dma_execute_skip_advances_offset_without_data();
     test_dma_execute_write_rejected();
+    test_writable_file_dma_write_lands_in_buffer();
+    test_writable_file_read_back_sees_written_content();
+    test_writable_file_write_past_end_is_dropped();
     test_read_byte_unrecognized_key_returns_zero();
     test_dma_execute_select_only_is_a_harmless_no_op();
     test_dma_execute_unrecognized_key_rejected();

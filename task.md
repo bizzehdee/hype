@@ -299,9 +299,42 @@ multi-VM concurrency milestone, even though early single-guest milestones
 
 - [x] **VIDEO-1** — (= M1-6) GOP linear-framebuffer text renderer.
   Deps: M1-6
-- [ ] **VIDEO-2** — Guest-facing GOP protocol exposure, pre-OS-driver
+- [x] **VIDEO-2** — Guest-facing GOP protocol exposure, pre-OS-driver
   (writes into a per-VM framebuffer in guest RAM).
   Deps: M1-6, M3-1
+
+  *Implemented as QEMU's "ramfb" protocol (`devices/ramfb.h`/`.c`),
+  not a custom scheme -- this project's vendored, unmodified OVMF
+  (M4-2) already ships `OvmfPkg/QemuRamfbDxe` (confirmed present in the
+  vendored build), which discovers a writable fw_cfg file `"etc/ramfb"`
+  and writes a 28-byte `RAMFB_CONFIG` struct (guest-chosen framebuffer
+  address + format/width/height/stride, every field big-endian) back
+  into it once it has allocated its own framebuffer in guest RAM --
+  struct layout and field order transcribed directly from
+  `edk2/OvmfPkg/QemuRamfbDxe/QemuRamfb.c`, not reconstructed from
+  memory. Required extending `devices/fw_cfg.c` (M4-4) with its first
+  writable file: `hype_fw_cfg_add_writable_file()` plus a
+  `hype_fw_cfg_dma_execute()` WRITE path that copies guest-supplied
+  bytes into the file's own backing buffer (bounds-checked against a
+  guest-supplied length, per VALID's own invariant) -- every other file
+  this project serves via fw_cfg stays structurally read-only by
+  construction (a separate `write_data` field, not a dropped `const`),
+  so this doesn't loosen guest-isolation for the ACPI content M4-4
+  already serves. Confirmed OVMF's own `QemuFwCfgWriteBytes()` uses the
+  DMA write path here, not the classic port-based one, since this
+  project's fw_cfg model already advertises DMA support (M4-4).
+  Validated end-to-end with a synthetic long-mode test guest, same
+  rigor/pattern as M4-4's own fw_cfg DMA test with the roles reversed:
+  host pre-builds a RAMFB_CONFIG in guest memory (standing in for what
+  a real OVMF driver computes), the guest payload triggers/polls the
+  DMA write, and the host decodes the fw_cfg file's resulting backing
+  buffer (`hype_ramfb_decode_config()`) and confirms every field
+  matches byte-for-byte. Multiple clean QEMU runs.
+  Scope is the protocol/transport only -- actually presenting the
+  guest's framebuffer content on the host's real screen is VIDEO-3's
+  job, and a real OVMF instance actually driving this (not a synthetic
+  test guest mimicking its wire behavior) is M4-6's job, same
+  "primitive now, integration later" split as M4-3/M4-4/M4-5.*
 - [ ] **VIDEO-3** — Post-boot VGA/Bochs-VBE-class virtual display adapter
   (for Windows' inbox Basic Display Adapter and Linux/BSD `vesafb`/`efifb`).
   Deps: VIDEO-2

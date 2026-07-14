@@ -30,6 +30,7 @@
 #include "../devices/fw_cfg.h"
 #include "../devices/ahci.h"
 #include "../devices/atapi.h"
+#include "../devices/ramfb.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -1017,6 +1018,174 @@ static void run_m4_5_ahci_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) 
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_ATAPI_SECTOR_SIZE);
 }
 
+/*
+ * VIDEO-2: exercises devices/ramfb.h/fw_cfg.c's new writable-file DMA
+ * WRITE path against the exact "etc/ramfb" protocol this project's own
+ * vendored OVMF (M4-2) already knows how to speak -- confirmed present
+ * in the vendored build (edk2/Build/.../QemuRamfbDxe.efi) via
+ * OvmfPkg/QemuRamfbDxe. Same host-pre-populates/guest-triggers
+ * convention as M4-4's fw_cfg DMA test, with the roles reversed: the
+ * guest payload here writes a host-built RAMFB_CONFIG (28 bytes, every
+ * field big-endian, exact layout/values transcribed from
+ * edk2/OvmfPkg/QemuRamfbDxe/QemuRamfb.c) into the fw_cfg-registered
+ * "etc/ramfb" file, standing in for what a real OVMF driver's
+ * QemuRamfbGraphicsOutputSetMode() does after allocating its own
+ * framebuffer. This milestone's own scope is the protocol/transport
+ * only -- actually presenting the guest's framebuffer content on the
+ * host's real screen is VIDEO-3's job (a "post-boot virtual display
+ * adapter"), matching this project's established "build the primitive
+ * now, defer the harder integration" pattern.
+ */
+static uint8_t g_video_2_guest_code[128] __attribute__((aligned(4096)));
+static uint8_t g_video_2_guest_stack[4096] __attribute__((aligned(4096)));
+static uint8_t g_video_2_access_struct[16] __attribute__((aligned(16)));
+static uint8_t g_video_2_config_buf[HYPE_RAMFB_CONFIG_SIZE] __attribute__((aligned(16)));
+static uint8_t g_video_2_ramfb_backing[HYPE_RAMFB_CONFIG_SIZE];
+static uint8_t g_video_2_guest_framebuffer[64] __attribute__((aligned(64)));
+static hype_fw_cfg_t g_video_2_fw_cfg;
+
+/* Identical shape to g_m4_4_payload_template -- the access struct's own
+ * CONTROL field (host-built, WRITE instead of READ) is what determines
+ * direction; the guest instructions that trigger/poll it don't need to
+ * differ. Kept as its own copy rather than shared, matching every
+ * other milestone test payload here (M4-3/M4-4/M4-5 all have their
+ * own, despite overlapping shapes) -- these are milestone-scoped
+ * fixtures, not a reusable abstraction. */
+static const uint8_t g_video_2_payload_template[] = {
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x66, 0xBA, 0x14, 0x05,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0xEF,
+    0x66, 0xBA, 0x18, 0x05,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0xEF,
+    0x8B, 0x03,
+    0x85, 0xC0,
+    0x75, 0xFA,
+    0xF4,
+    0xEB, 0xFD
+};
+#define HYPE_VIDEO_2_PAYLOAD_RBX_IMM_OFFSET 2
+#define HYPE_VIDEO_2_PAYLOAD_DMA_HIGH_IMM_OFFSET 15
+#define HYPE_VIDEO_2_PAYLOAD_DMA_LOW_IMM_OFFSET 25
+
+static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, access_struct_phys, config_buf_phys, framebuffer_phys;
+    uint32_t access_high, access_low;
+    int ramfb_key;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+    hype_ramfb_config_t decoded;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("video-2: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_video_2_guest_code, sizeof(g_video_2_guest_code));
+    hype_guest_ram_zero(g_video_2_guest_stack, sizeof(g_video_2_guest_stack));
+    hype_guest_ram_zero(g_video_2_access_struct, sizeof(g_video_2_access_struct));
+    hype_guest_ram_zero(g_video_2_config_buf, sizeof(g_video_2_config_buf));
+    hype_guest_ram_zero(g_video_2_ramfb_backing, sizeof(g_video_2_ramfb_backing));
+    hype_guest_ram_zero(g_video_2_guest_framebuffer, sizeof(g_video_2_guest_framebuffer));
+
+    hype_fw_cfg_reset(&g_video_2_fw_cfg);
+    ramfb_key = hype_fw_cfg_add_writable_file(&g_video_2_fw_cfg, "etc/ramfb", g_video_2_ramfb_backing,
+                                               sizeof(g_video_2_ramfb_backing));
+    if (ramfb_key < 0) {
+        hype_fatal("video-2: fw_cfg registry full while registering etc/ramfb");
+    }
+
+    /* Host builds the 28-byte RAMFB_CONFIG the guest "wants to write"
+     * directly in guest memory, every field big-endian -- standing in
+     * for what a real OVMF driver computes after choosing its own
+     * framebuffer address (g_video_2_guest_framebuffer here). Matches
+     * M4-4's own "guest payload only triggers/polls, host pre-builds
+     * the content" convention. */
+    framebuffer_phys = (uint64_t)(uintptr_t)g_video_2_guest_framebuffer;
+    hype_write_be64(g_video_2_config_buf + 0, framebuffer_phys);
+    hype_write_be32(g_video_2_config_buf + 8, HYPE_RAMFB_FORMAT_XRGB8888);
+    hype_write_be32(g_video_2_config_buf + 12, 0);
+    hype_write_be32(g_video_2_config_buf + 16, 800);
+    hype_write_be32(g_video_2_config_buf + 20, 600);
+    hype_write_be32(g_video_2_config_buf + 24, 800u * 4u);
+
+    access_struct_phys = (uint64_t)(uintptr_t)g_video_2_access_struct;
+    config_buf_phys = (uint64_t)(uintptr_t)g_video_2_config_buf;
+    {
+        uint32_t control =
+            ((uint32_t)ramfb_key << 16) | HYPE_FW_CFG_DMA_CTL_SELECT | HYPE_FW_CFG_DMA_CTL_WRITE;
+        hype_write_be32(g_video_2_access_struct + 0, control);
+        hype_write_be32(g_video_2_access_struct + 4, (uint32_t)sizeof(g_video_2_config_buf));
+        hype_write_be64(g_video_2_access_struct + 8, config_buf_phys);
+    }
+
+    access_high = (uint32_t)(access_struct_phys >> 32);
+    access_low = (uint32_t)access_struct_phys;
+
+    for (i = 0; i < sizeof(g_video_2_payload_template); i++) {
+        g_video_2_guest_code[i] = g_video_2_payload_template[i];
+    }
+    hype_write_le64(g_video_2_guest_code + HYPE_VIDEO_2_PAYLOAD_RBX_IMM_OFFSET, access_struct_phys);
+    hype_write_le32(g_video_2_guest_code + HYPE_VIDEO_2_PAYLOAD_DMA_HIGH_IMM_OFFSET,
+                     hype_byteswap32(access_high));
+    hype_write_le32(g_video_2_guest_code + HYPE_VIDEO_2_PAYLOAD_DMA_LOW_IMM_OFFSET,
+                     hype_byteswap32(access_low));
+
+    entry_rip = (uint64_t)(uintptr_t)g_video_2_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_video_2_guest_stack + sizeof(g_video_2_guest_stack));
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_debug_print("video-2: entry_rip=0x%llx access_struct=0x%llx config_buf=0x%llx ramfb_key=0x%x\n",
+                      (unsigned long long)entry_rip, (unsigned long long)access_struct_phys,
+                      (unsigned long long)config_buf_phys, ramfb_key);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    if (ctx == 0) {
+        hype_fatal("video-2: vcpu_create_long_mode failed");
+    }
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("video-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
+            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_video_2_fw_cfg) != 0) {
+                hype_fatal("video-2: unhandled guest port I/O (qual=0x%llx guest_rip=0x%llx)",
+                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("video-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+
+    hype_ramfb_decode_config(g_video_2_ramfb_backing, &decoded);
+    if (decoded.address != framebuffer_phys || decoded.fourcc != HYPE_RAMFB_FORMAT_XRGB8888 ||
+        decoded.flags != 0 || decoded.width != 800 || decoded.height != 600 || decoded.stride != 800u * 4u) {
+        hype_fatal(
+            "video-2: decoded etc/ramfb config mismatch (address=0x%llx fourcc=0x%x width=%u height=%u "
+            "stride=%u)",
+            (unsigned long long)decoded.address, decoded.fourcc, decoded.width, decoded.height,
+            decoded.stride);
+    }
+
+    hype_debug_print(
+        "video-2: ramfb test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- etc/ramfb DMA "
+        "write verified byte-for-byte (framebuffer=0x%llx %ux%u XRGB8888)\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
+        (unsigned long long)framebuffer_phys, decoded.width, decoded.height);
+}
+
 /* Runs every test guest in sequence -- what actually gets dispatched
  * (inline on the BSP, or onto a pinned AP; see efi_main) so each new
  * milestone's test guest still exercises real 1:1 vCPU-to-pCPU
@@ -1028,6 +1197,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_m4_3_pflash_mmio_test(args->ops, args->kind);
     run_m4_4_fw_cfg_test(args->ops, args->kind);
     run_m4_5_ahci_test(args->ops, args->kind);
+    run_video_2_ramfb_test(args->ops, args->kind);
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {

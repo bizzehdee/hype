@@ -70,10 +70,20 @@ int hype_fw_cfg_add_file(hype_fw_cfg_t *fw, const char *name, const uint8_t *dat
     fw->files[fw->file_count].name = name;
     fw->files[fw->file_count].data = data;
     fw->files[fw->file_count].size = size;
+    fw->files[fw->file_count].write_data = 0;
     fw->file_count++;
     rebuild_dir(fw);
 
     return (int)(HYPE_FW_CFG_KEY_FILE_FIRST + fw->file_count - 1);
+}
+
+int hype_fw_cfg_add_writable_file(hype_fw_cfg_t *fw, const char *name, uint8_t *buf, uint32_t size) {
+    int key = hype_fw_cfg_add_file(fw, name, buf, size);
+    if (key < 0) {
+        return key;
+    }
+    fw->files[fw->file_count - 1].write_data = buf;
+    return key;
 }
 
 static int lookup_item(const hype_fw_cfg_t *fw, uint16_t key, const uint8_t **out_data, uint32_t *out_size) {
@@ -105,6 +115,23 @@ static int lookup_item(const hype_fw_cfg_t *fw, uint16_t key, const uint8_t **ou
     for (i = 0; i < fw->file_count; i++) {
         if ((uint16_t)(HYPE_FW_CFG_KEY_FILE_FIRST + i) == key) {
             *out_data = fw->files[i].data;
+            *out_size = fw->files[i].size;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Same lookup as lookup_item(), but only succeeds for a file registered
+ * via hype_fw_cfg_add_writable_file() -- every other file (including
+ * the synthetic SIGNATURE/ID/FILE_DIR items, which aren't even entries
+ * in `files[]`) is not writable. */
+static int lookup_writable_item(const hype_fw_cfg_t *fw, uint16_t key, uint8_t **out_data, uint32_t *out_size) {
+    uint32_t i;
+
+    for (i = 0; i < fw->file_count; i++) {
+        if ((uint16_t)(HYPE_FW_CFG_KEY_FILE_FIRST + i) == key && fw->files[i].write_data != 0) {
+            *out_data = fw->files[i].write_data;
             *out_size = fw->files[i].size;
             return 0;
         }
@@ -173,7 +200,19 @@ uint32_t hype_fw_cfg_dma_execute(hype_fw_cfg_t *fw, const hype_fw_cfg_dma_op_t *
     }
 
     if (op->control & HYPE_FW_CFG_DMA_CTL_WRITE) {
-        return HYPE_FW_CFG_DMA_CTL_ERROR;
+        uint8_t *dst;
+
+        if (lookup_writable_item(fw, fw->selected_key, &dst, &size) != 0) {
+            return HYPE_FW_CFG_DMA_CTL_ERROR;
+        }
+        for (i = 0; i < op->length; i++) {
+            uint32_t dst_off = fw->offset + i;
+            if (dst_off < size) {
+                dst[dst_off] = guest_data_ptr[i];
+            }
+        }
+        fw->offset += op->length;
+        return 0;
     }
 
     if (op->control & HYPE_FW_CFG_DMA_CTL_READ) {
