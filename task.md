@@ -171,9 +171,17 @@ multi-VM concurrency milestone, even though early single-guest milestones
   rest of real multi-VM concurrency, matching every other
   single-instance-for-now scoping decision through M2/M3 (single VMCB,
   single AVIC/NPT table, ...).*
-- [ ] **M3-3** — Basic Linux boot protocol shim (direct `bzImage` boot, no
+- [x] **M3-3** — Basic Linux boot protocol shim (direct `bzImage` boot, no
   firmware).
   Deps: M3-1
+
+  *Scope note: parsing/construction logic only (setup-header
+  validation, payload offset, 64-bit entry address, zero-page/E820
+  construction), pure and 100%-tested against the documented Linux
+  boot protocol -- not yet wired into an actual guest launch. That
+  integration (loading a real bzImage, building guest page tables,
+  VMRUNning it, confirming it actually runs) is M3-5's job once M3-4's
+  device stubs exist too, per task.md's own dependency graph.*
 - [ ] **M3-4** — Minimal guest-visible device stubs: PIC/IOAPIC, PIT/HPET.
   Deps: M3-1
 - [ ] **M3-5** — Boot a minimal Linux kernel end-to-end; validate
