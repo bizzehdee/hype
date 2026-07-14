@@ -317,11 +317,29 @@ tasks — see updated deps below.*
 
 ## M4 — Guest UEFI firmware + ACPI synth (plan.md §9 M4, §10 decision #1)
 
-- [ ] **M4-1** — EDK2 build pipeline for the guest firmware blob (separate
+- [x] **M4-1** — EDK2 build pipeline for the guest firmware blob (separate
   from `hype.efi`'s own toolchain).
   Deps: SETUP-2
-- [ ] **M4-2** — Vendor/strip an OVMF build as the guest firmware base.
+
+  *`edk2` vendored as a git submodule pinned to `edk2-stable202511`,
+  plus one local commit fixing a real NASM 3.x regression (see that
+  commit's message) -- this dev environment's Fedora release ships
+  NASM 3.01 with no older version available, and 3.x rejects "push
+  strict dword <imm>"/"push dword <imm>" in 64-bit mode, which
+  UefiCpuPkg's X64 IDT stub generation relies on. `tools/build-fw.sh`
+  automates the whole pipeline (BaseTools built with clang, then
+  OvmfPkg/OvmfPkgX64.dsc via the CLANGDWARF tag) end-to-end,
+  confirmed reproducible by re-running it.*
+- [x] **M4-2** — Vendor/strip an OVMF build as the guest firmware base.
   Deps: M4-1
+
+  *`fw/OVMF_CODE.fd`/`fw/OVMF_VARS.fd` committed (plan.md §7's "vendored
+  blob," not just a build script -- downstream consumers get a working
+  firmware pair without needing the EDK2 toolchain themselves).
+  Smoke-tested standalone (reaches BdsDxe correctly) and booting
+  `hype.efi` itself through its own full existing test suite exactly
+  as `edk2-ovmf` already does. Not yet used as actual guest-facing
+  firmware for a VM -- that's M4-3 onward.*
 - [ ] **M4-3** — Emulated flash/varstore, persisted to disk.
   Deps: M4-2
 - [ ] **M4-4** — Per-VM ACPI table synthesis (RSDP/XSDT/FADT/MADT/MCFG).

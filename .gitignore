@@ -14,6 +14,10 @@ edk2/Build/
 edk2/Conf/
 *.fd
 *.rom
+# ...except fw/'s own vendored OVMF blob (plan.md §7 -- "reuse a
+# stripped EDK2/OVMF build as a vendored blob"), produced by
+# tools/build-fw.sh, which *is* meant to be committed.
+!fw/*.fd
 
 # Disk images / test artifacts
 *.img
