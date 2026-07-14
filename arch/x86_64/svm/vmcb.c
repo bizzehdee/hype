@@ -93,6 +93,87 @@ void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint
     vmcb->save.rax = 0;
 }
 
+/* Flat long-mode segment conventions: present, DPL0; code =
+ * execute/read (0x9B), data = read/write (0x93). Flags nibble bits
+ * are G|D/B|L|AVL (high to low) per hype_vmcb_seg_attrib(); CS gets
+ * L=1 (bit 1 of the nibble) marking it a 64-bit code segment, plus
+ * G=1 (bit 3) for a conventional 4GB limit; data segments get G=1
+ * and D/B=1 (bit 2), the standard flat-32-style data segment
+ * convention real 64-bit kernels themselves also set up (base/limit
+ * are otherwise not meaningfully enforced by hardware in 64-bit
+ * mode). */
+#define LONGMODE_CODE_ACCESS 0x9Bu
+#define LONGMODE_CODE_FLAGS 0xAu /* G=1, L=1 */
+#define LONGMODE_DATA_ACCESS 0x93u
+#define LONGMODE_DATA_FLAGS 0xCu /* G=1, D/B=1 */
+#define LONGMODE_LIMIT 0xFFFFFFFFu
+
+static void set_longmode_seg(hype_vmcb_seg_t *seg, uint8_t access, uint8_t flags) {
+    seg->selector = 0;
+    seg->base = 0;
+    seg->limit = LONGMODE_LIMIT;
+    seg->attrib = hype_vmcb_seg_attrib(access, flags);
+}
+
+void hype_vmcb_build_long_mode_guest(hype_vmcb_t *vmcb, uint64_t entry_rip, uint64_t guest_cr3,
+                                      uint64_t rsp, uint64_t iopm_phys, uint64_t msrpm_phys) {
+    unsigned char *bytes = (unsigned char *)vmcb;
+    unsigned long long i;
+
+    for (i = 0; i < sizeof(*vmcb); i++) {
+        bytes[i] = 0;
+    }
+
+    vmcb->control.intercept_misc1 =
+        HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN | HYPE_SVM_INTERCEPT_IOIO_PROT;
+    vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_VMRUN;
+
+    vmcb->control.iopm_base_pa = iopm_phys;
+    vmcb->control.msrpm_base_pa = msrpm_phys;
+
+    vmcb->control.guest_asid_tlb_ctl = 1;
+    vmcb->control.np_enable = 0; /* caller opts in via hype_vmcb_enable_nested_paging() */
+    vmcb->control.vmcb_clean_bits = 0;
+
+    set_longmode_seg(&vmcb->save.cs, LONGMODE_CODE_ACCESS, LONGMODE_CODE_FLAGS);
+    set_longmode_seg(&vmcb->save.ds, LONGMODE_DATA_ACCESS, LONGMODE_DATA_FLAGS);
+    set_longmode_seg(&vmcb->save.es, LONGMODE_DATA_ACCESS, LONGMODE_DATA_FLAGS);
+    set_longmode_seg(&vmcb->save.ss, LONGMODE_DATA_ACCESS, LONGMODE_DATA_FLAGS);
+    set_longmode_seg(&vmcb->save.fs, LONGMODE_DATA_ACCESS, LONGMODE_DATA_FLAGS);
+    set_longmode_seg(&vmcb->save.gs, LONGMODE_DATA_ACCESS, LONGMODE_DATA_FLAGS);
+
+    vmcb->save.gdtr.base = 0;
+    vmcb->save.gdtr.limit = 0xFFFF;
+    vmcb->save.idtr.base = 0;
+    vmcb->save.idtr.limit = 0xFFFF;
+
+    vmcb->save.cr0 = 0x80000001u; /* PG | PE */
+    vmcb->save.cr3 = guest_cr3;
+    vmcb->save.cr4 = 0x00000020u; /* PAE */
+    /* EFER: SVME (VMRUN requires it, see HYPE_SVM_SAVE_EFER_SVME) |
+     * LME (bit 8) | LMA (bit 10) -- VMRUN loads guest state directly
+     * rather than running the real activation sequence, so LMA (which
+     * hardware would normally set itself once PG+LME+PE all become
+     * true together) must be set explicitly here. */
+    vmcb->save.efer = HYPE_SVM_SAVE_EFER_SVME | (1ULL << 8) | (1ULL << 10);
+    vmcb->save.rflags = 0x2;
+    vmcb->save.rip = entry_rip;
+    vmcb->save.rsp = rsp;
+    vmcb->save.rax = 0;
+}
+
+void hype_svm_decode_ioio_info1(uint64_t exitinfo1, hype_svm_ioio_t *out) {
+    out->is_in = (exitinfo1 & HYPE_SVM_IOIO_INFO1_TYPE_IN) != 0;
+    out->port = (uint16_t)((exitinfo1 >> HYPE_SVM_IOIO_INFO1_PORT_SHIFT) & 0xFFFFu);
+    if (exitinfo1 & HYPE_SVM_IOIO_INFO1_SIZE8) {
+        out->size_bytes = 1;
+    } else if (exitinfo1 & HYPE_SVM_IOIO_INFO1_SIZE16) {
+        out->size_bytes = 2;
+    } else {
+        out->size_bytes = 4;
+    }
+}
+
 void hype_vmcb_enable_nested_paging(hype_vmcb_t *vmcb, uint64_t npt_root_phys) {
     vmcb->control.np_enable = 1;
     vmcb->control.n_cr3 = npt_root_phys;

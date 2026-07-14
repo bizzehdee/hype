@@ -165,6 +165,69 @@ static void test_configure_avic_masks_low_bits_and_sets_max_index(void) {
               vmcb.control.avic_physical_table_ptr);
 }
 
+static void test_build_long_mode_guest(void) {
+    hype_vmcb_t vmcb;
+
+    hype_vmcb_build_long_mode_guest(&vmcb, 0x100200ULL, 0x200000ULL, 0x300000ULL, 0x400000ULL,
+                                     0x500000ULL);
+
+    CHECK_HEX("HLT is intercepted", HYPE_SVM_INTERCEPT_HLT,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_HLT);
+    CHECK_HEX("shutdown is intercepted", HYPE_SVM_INTERCEPT_SHUTDOWN,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_SHUTDOWN);
+    CHECK_HEX("IOIO is intercepted (unlike the real-mode guest)", HYPE_SVM_INTERCEPT_IOIO_PROT,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_IOIO_PROT);
+    CHECK_HEX("VMRUN is intercepted", HYPE_SVM_INTERCEPT_VMRUN,
+              vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_VMRUN);
+    CHECK_HEX("nested paging starts disabled (caller opts in)", 0, vmcb.control.np_enable);
+    CHECK_HEX("IOPM base wired through", 0x400000ULL, vmcb.control.iopm_base_pa);
+    CHECK_HEX("MSRPM base wired through", 0x500000ULL, vmcb.control.msrpm_base_pa);
+
+    CHECK_HEX("RIP is the given 64-bit entry point", 0x100200ULL, vmcb.save.rip);
+    CHECK_HEX("RSP is the given stack address", 0x300000ULL, vmcb.save.rsp);
+    CHECK_HEX("CR3 is the given guest page table root", 0x200000ULL, vmcb.save.cr3);
+    CHECK_HEX("CR0 has PE and PG set", 0x80000001ULL, vmcb.save.cr0);
+    CHECK_HEX("CR4 has PAE set", 0x20ULL, vmcb.save.cr4);
+    CHECK_HEX("EFER has SVME, LME, and LMA set", (1ULL << 12) | (1ULL << 8) | (1ULL << 10),
+              vmcb.save.efer);
+
+    CHECK_HEX("CS is marked as a 64-bit long-mode segment", 1,
+              (vmcb.save.cs.attrib & (1u << 9)) != 0); /* flags nibble bit 1 (L) at attrib bit 9 */
+}
+
+static void test_decode_ioio_info1_out(void) {
+    hype_svm_ioio_t io;
+    /* port 0x21 (bits 31:16), 8-bit size (bit 4), OUT (bit 0 clear). */
+    uint64_t exitinfo1 = ((uint64_t)0x21u << HYPE_SVM_IOIO_INFO1_PORT_SHIFT) | HYPE_SVM_IOIO_INFO1_SIZE8;
+
+    hype_svm_decode_ioio_info1(exitinfo1, &io);
+
+    CHECK_HEX("decoded as OUT", 0, io.is_in);
+    CHECK_HEX("decoded port", 0x21, io.port);
+    CHECK_HEX("decoded size", 1, io.size_bytes);
+}
+
+static void test_decode_ioio_info1_in_16bit(void) {
+    hype_svm_ioio_t io;
+    uint64_t exitinfo1 = ((uint64_t)0x3F8u << HYPE_SVM_IOIO_INFO1_PORT_SHIFT) | HYPE_SVM_IOIO_INFO1_SIZE16 |
+                          HYPE_SVM_IOIO_INFO1_TYPE_IN;
+
+    hype_svm_decode_ioio_info1(exitinfo1, &io);
+
+    CHECK_HEX("decoded as IN", 1, io.is_in);
+    CHECK_HEX("decoded port beyond the 8-bit imm range", 0x3F8, io.port);
+    CHECK_HEX("decoded size", 2, io.size_bytes);
+}
+
+static void test_decode_ioio_info1_32bit(void) {
+    hype_svm_ioio_t io;
+    uint64_t exitinfo1 = HYPE_SVM_IOIO_INFO1_SIZE32;
+
+    hype_svm_decode_ioio_info1(exitinfo1, &io);
+
+    CHECK_HEX("decoded size", 4, io.size_bytes);
+}
+
 int main(void) {
     test_struct_sizes();
     test_field_offsets();
@@ -172,6 +235,10 @@ int main(void) {
     test_build_realmode_guest();
     test_build_realmode_guest_zeroes_first();
     test_enable_nested_paging();
+    test_build_long_mode_guest();
+    test_decode_ioio_info1_out();
+    test_decode_ioio_info1_in_16bit();
+    test_decode_ioio_info1_32bit();
     test_configure_avic();
     test_configure_avic_masks_low_bits_and_sets_max_index();
 

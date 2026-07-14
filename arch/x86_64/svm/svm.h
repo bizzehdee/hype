@@ -4,6 +4,8 @@
 #include <stdint.h>
 
 #include "../cpu/vmm_ops.h"
+#include "../../../devices/pic.h"
+#include "../../../devices/pit.h"
 #include "vmcb.h"
 
 /*
@@ -66,6 +68,49 @@ void hype_svm_vcpu_enable_apic_accel(hype_vmcb_t *vmcb);
  * of its own beyond the zero-check.
  */
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root);
+
+/*
+ * M3-5: creates this backend's (same single, static instance as
+ * hype_svm_vcpu_create() -- calling one after the other simply
+ * replaces the running test guest, which is fine, only one ever runs
+ * at a time) vCPU context for a 64-bit long-mode guest matching the
+ * Linux boot protocol (hype_vmcb_build_long_mode_guest()): RIP=
+ * entry_rip, RSP=rsp, CR3=guest_cr3 (the guest's own identity page
+ * tables, built by the caller via arch/x86_64/cpu/paging.h -- reused
+ * directly, not NPT). npt_root has the same 0-means-disabled
+ * convention as hype_svm_vcpu_create(). Exempt from unit testing --
+ * thin wrapper around already-tested builders.
+ */
+hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t guest_cr3, uint64_t rsp,
+                                                 uint64_t npt_root);
+
+/*
+ * Sets the value RSI will hold at this vCPU's next VM-entry (M3-5) --
+ * see vmcb.h's hype_vmcb_build_long_mode_guest() comment for why this
+ * isn't a VMCB field. The Linux boot protocol requires RSI to hold the
+ * zero page's guest-physical address at 64-bit entry. Exempt from unit
+ * testing -- trivial state mutation feeding directly into the exempt
+ * hype_svm_vcpu_run()'s inline asm, nothing meaningful to observe
+ * without executing VMRUN.
+ */
+void hype_svm_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi);
+
+/*
+ * Handles an IOIO (M3-5) VM-exit: decodes EXITINFO1
+ * (hype_svm_decode_ioio_info1()), routes the port to `pic` (0x20/0x21/
+ * 0xA0/0xA1) or `pit` (0x40-0x43), reads/writes the emulated device
+ * accordingly (patching the low byte of the guest's RAX for an IN),
+ * and advances the guest's RIP to EXITINFO2 (the instruction after the
+ * IN/OUT) on success. Returns 0 if the port was recognized and
+ * handled, non-zero for any other port (the caller's job to treat as
+ * fatal -- no guest is ever allowed direct hardware access, AGENTS.md,
+ * so an unrecognized port is not silently ignored). Exempt from unit
+ * testing -- reaches into the exempt VMCB fields this backend's real
+ * VMRUN produces; hype_svm_decode_ioio_info1() and every
+ * hype_pic_emu_io_*()/hype_pit_emu_io_*() call this dispatches to are
+ * already fully tested in isolation.
+ */
+int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */

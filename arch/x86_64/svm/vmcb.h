@@ -179,7 +179,41 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 /* SVM #VMEXIT codes this project checks for (AMD SDM Appendix C). */
 #define HYPE_SVM_EXITCODE_HLT 0x78ULL
 #define HYPE_SVM_EXITCODE_SHUTDOWN 0x7FULL
+#define HYPE_SVM_EXITCODE_IOIO 0x7BULL
 #define HYPE_SVM_EXITCODE_INVALID 0xFFFFFFFFFFFFFFFFULL /* VMRUN itself failed (bad VMCB state) */
+
+/* intercept_misc1 bit 27 (M3-5): trap every guest IN/OUT so this
+ * project's device stubs (devices/pic.h, devices/pit.h) can emulate
+ * them -- there is no passthrough port I/O in this project (guests
+ * never get direct hardware access, AGENTS.md), so every port a guest
+ * touches must be intercepted, not just a chosen subset. */
+#define HYPE_SVM_INTERCEPT_IOIO_PROT (1u << 27)
+
+/*
+ * EXITINFO1's bitfield for an IOIO intercept (AMD SDM): bit 0 = TYPE
+ * (0 = OUT, 1 = IN), bits 6:4 = operand size (bit4=8-bit, bit5=16-bit,
+ * bit6=32-bit -- exactly one set), bits 31:16 = port number. EXITINFO2
+ * holds the guest RIP to resume at (the instruction after the
+ * IN/OUT), the same "next-RIP-for-free" convenience this project
+ * already relies on for HLT.
+ */
+#define HYPE_SVM_IOIO_INFO1_TYPE_IN (1ULL << 0)
+#define HYPE_SVM_IOIO_INFO1_SIZE8 (1ULL << 4)
+#define HYPE_SVM_IOIO_INFO1_SIZE16 (1ULL << 5)
+#define HYPE_SVM_IOIO_INFO1_SIZE32 (1ULL << 6)
+#define HYPE_SVM_IOIO_INFO1_PORT_SHIFT 16
+
+typedef struct {
+    int is_in;
+    uint16_t port;
+    uint8_t size_bytes; /* 1, 2, or 4 */
+} hype_svm_ioio_t;
+
+/*
+ * Decodes an IOIO intercept's EXITINFO1 value into direction/port/
+ * operand size. Pure bit extraction, no CPU state touched.
+ */
+void hype_svm_decode_ioio_info1(uint64_t exitinfo1, hype_svm_ioio_t *out);
 
 /*
  * Packs a segment's access-rights byte and flags nibble into the
@@ -225,6 +259,41 @@ uint16_t hype_vmcb_seg_attrib(uint8_t access, uint8_t flags);
  */
 void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint64_t stack_phys,
                                      uint64_t iopm_phys, uint64_t msrpm_phys);
+
+/*
+ * Fills `vmcb` (zeroed first) for a minimal 64-bit long-mode guest,
+ * matching the Linux/x86_64 boot protocol's documented 64-bit entry
+ * state (M3-5, core/linux_boot.h): CR0.PE=1/PG=1, CR4.PAE=1,
+ * EFER.LME=1 (plus LMA=1 and SVME, see HYPE_SVM_SAVE_EFER_SVME --
+ * VMRUN loads whatever's in the VMCB directly, without walking
+ * through the real activation sequence hardware normally requires, so
+ * LMA must be set explicitly here rather than relying on hardware to
+ * derive it), flat 4GB code/data segments with CS marked as a 64-bit
+ * (long-mode) segment, RIP=entry_rip, RSP=rsp, CR3=guest_cr3 (the
+ * guest's own identity page tables -- see arch/x86_64/cpu/paging.h's
+ * builder, reused as-is since a ring-0-only guest CR3 needs no User/
+ * Supervisor bit, unlike NPT). HLT, shutdown, VMRUN, and now IOIO are
+ * all intercepted (see HYPE_SVM_INTERCEPT_IOIO_PROT -- this guest is
+ * expected to actually execute IN/OUT, unlike the M2-7 real-mode
+ * guest). iopm_phys/msrpm_phys have the same requirement as
+ * hype_vmcb_build_realmode_guest(). Nested paging is NOT enabled here
+ * -- call hype_vmcb_enable_nested_paging() afterward, same layering as
+ * every other builder in this file.
+ *
+ * RSI (the zero page's guest-physical address -- the one register the
+ * 64-bit boot protocol requires at entry) is deliberately NOT set
+ * here: unlike RAX/RSP/RIP/RFLAGS, the VMCB save-state area has no
+ * RSI field at all -- VMRUN only loads/saves a specific subset of
+ * architectural state; every other general-purpose register (RSI
+ * included) simply passes through whatever the *host* had in it at
+ * the moment VMRUN executes. Setting the guest's initial RSI is
+ * svm_vcpu.c's job (hype_svm_vcpu_set_rsi()), immediately before
+ * VMRUN, not this function's.
+ *
+ * Pure struct-filling -- no CPU state touched, no UEFI dependency.
+ */
+void hype_vmcb_build_long_mode_guest(hype_vmcb_t *vmcb, uint64_t entry_rip, uint64_t guest_cr3,
+                                      uint64_t rsp, uint64_t iopm_phys, uint64_t msrpm_phys);
 
 /*
  * Enables nested paging (M3-1) on an already-built VMCB: sets

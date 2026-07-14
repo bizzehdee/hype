@@ -20,6 +20,10 @@
 #include "../arch/x86_64/cpu/vmexit.h"
 #include "../arch/x86_64/cpu/vmm_select.h"
 #include "../arch/x86_64/svm/npt.h"
+#include "../arch/x86_64/svm/svm.h"
+#include "../core/linux_boot.h"
+#include "../devices/pic.h"
+#include "../devices/pit.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -42,6 +46,62 @@ static uint8_t g_m2_7_guest_stack[4096] __attribute__((aligned(4096)));
 static hype_pte_t g_npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_npt_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_npt_pd[HYPE_NPT_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+
+/* M3-5: guest identity page tables (the GUEST's own CR3) for the
+ * long-mode Linux boot-protocol test guest -- distinct from both the
+ * host's own paging (g_pml4 etc.) and NPT (g_npt_pml4 etc.): the
+ * Linux boot protocol requires paging already enabled at 64-bit
+ * entry, with the kernel/zero-page/stack range identity-mapped.
+ * Reuses hype_paging_build_identity() directly (arch/x86_64/cpu/
+ * paging.h) -- a ring-0-only guest CR3 needs no User/Supervisor bit,
+ * unlike NPT (arch/x86_64/svm/npt.h). */
+#define HYPE_M3_5_GUEST_PAGING_GB 4
+static hype_pte_t g_guest_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_guest_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_guest_pd[HYPE_M3_5_GUEST_PAGING_GB][HYPE_PAGING_ENTRIES_PER_TABLE]
+    __attribute__((aligned(4096)));
+
+/*
+ * M3-5: a synthetic, hand-built "bzImage" -- a real setup_header
+ * (parsed through core/linux_boot.h's shim, not bypassed) followed by
+ * a tiny hand-written 64-bit payload standing in for a real kernel's
+ * entry code. Same rigor/reasoning as M2-7's single-HLT-byte guest:
+ * full control over the outcome, proving the new plumbing (guest
+ * paging, long-mode VMCB, IOIO intercept -> device stubs) actually
+ * works, before attempting a real, unpredictable kernel.
+ */
+static uint8_t g_m3_5_bzimage[4096] __attribute__((aligned(4096)));
+static uint8_t g_m3_5_guest_stack[8192] __attribute__((aligned(4096)));
+static hype_linux_boot_params_t g_m3_5_zero_page __attribute__((aligned(4096)));
+static hype_pic_emu_t g_m3_5_pic;
+static hype_pit_emu_t g_m3_5_pit;
+
+/*
+ * The hand-written payload standing in for a kernel's 64-bit entry
+ * point: masks all IRQs on the emulated PIC (a guest OUT, exercising
+ * devices/pic.h's write dispatch), latches and reads back PIT channel
+ * 0 (a guest IN, exercising devices/pit.h's read dispatch), then
+ * halts. Deliberately does NOT touch the serial port -- this project's
+ * own guest-isolation invariant (AGENTS.md) means every port a guest
+ * touches gets intercepted, serial included, and there is no emulated
+ * serial device yet (M3-4's device list is PIC/IOAPIC/PIT/HPET only,
+ * not serial) -- confirmed the hard way when an earlier version of
+ * this payload's serial writes correctly triggered "unhandled port"
+ * once IOIO interception actually started working. Verified
+ * byte-for-byte against well-established, unambiguous x86_64 opcodes
+ * (register-implicit MOV/IN/OUT/HLT forms -- no ModRM/SIB byte
+ * complexity anywhere in this sequence).
+ */
+static const uint8_t g_m3_5_payload[] = {
+    0xB0, 0xFF,             /* mov al, 0xff */
+    0xE6, 0x21,             /* out 0x21, al -- PIC: mask all IRQs */
+    0xB0, 0x00,             /* mov al, 0x00 */
+    0xE6, 0x43,             /* out 0x43, al -- PIT: latch channel 0 */
+    0xE4, 0x40,             /* in al, 0x40  -- PIT: read latched lobyte */
+    0xE4, 0x40,             /* in al, 0x40  -- PIT: read latched hibyte */
+    0xF4,                   /* hlt */
+    0xEB, 0xFD              /* jmp $-3 (back to hlt, belt-and-braces) */
+};
 
 typedef struct {
     const hype_vmm_ops_t *ops;
@@ -117,6 +177,132 @@ static void EFIAPI run_test_guest(void *arg) {
                        (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
 }
 
+/*
+ * M3-5: builds the synthetic bzImage (real setup_header validated
+ * through core/linux_boot.h's shim, not bypassed), builds guest
+ * identity page tables, launches the long-mode test guest, and runs a
+ * real VM-exit loop that keeps resuming the guest across IOIO exits
+ * (routed to devices/pic.h and devices/pit.h) until it halts. SVM-only
+ * -- VMX's vcpu_create/vcpu_run stay NULL past M2-7 (vmx_ops.c), same
+ * as the M2-7/M3-1/M3-2 test guest above.
+ */
+static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    hype_linux_setup_header_t hdr;
+    unsigned char *hdr_bytes = (unsigned char *)&hdr;
+    unsigned long long i;
+    unsigned char *img;
+    hype_linux_setup_header_t *img_hdr;
+    uint32_t payload_offset;
+    unsigned char *payload_at;
+    uint64_t payload_load_address, entry_rip, guest_cr3, rsp, rsi;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("m3-5: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+        return;
+    }
+
+    /* M2-6 hard invariant: zero every byte of this guest's reserved
+     * RAM before its first VM-entry, on every (re)start. */
+    hype_guest_ram_zero(g_m3_5_bzimage, sizeof(g_m3_5_bzimage));
+    hype_guest_ram_zero(g_m3_5_guest_stack, sizeof(g_m3_5_guest_stack));
+    hype_guest_ram_zero(&g_m3_5_zero_page, sizeof(g_m3_5_zero_page));
+
+    for (i = 0; i < sizeof(hdr); i++) {
+        hdr_bytes[i] = 0;
+    }
+    hdr.setup_sects = 4; /* real-mode/setup region = (4+1)*512 = 2560 bytes */
+    hdr.boot_flag = HYPE_LINUX_BOOT_FLAG;
+    hdr.header = HYPE_LINUX_HDR_MAGIC;
+    hdr.version = 0x020Fu;
+    hdr.xloadflags = HYPE_LINUX_XLF_KERNEL_64;
+
+    if (!hype_linux_header_is_valid(&hdr)) {
+        hype_fatal("m3-5: synthetic setup header failed its own validity check");
+    }
+
+    /* Write the header into the synthetic bzImage buffer at its real
+     * file offset -- exactly where a real loader would find it, not a
+     * shortcut around the shim being tested. */
+    img = g_m3_5_bzimage;
+    img_hdr = (hype_linux_setup_header_t *)(img + HYPE_LINUX_SETUP_HEADER_OFFSET);
+    *img_hdr = hdr;
+
+    payload_offset = hype_linux_payload_file_offset(&hdr);
+    payload_at = img + payload_offset;
+    payload_load_address = (uint64_t)(uintptr_t)payload_at;
+    entry_rip = hype_linux_64bit_entry(payload_load_address);
+
+    /* The 64-bit entry point is payload_load_address + 0x200, not
+     * payload_load_address itself (hype_linux_64bit_entry()) -- write
+     * the hand-written test payload AT the entry point, not at the
+     * start of the payload region a few hundred bytes before it. */
+    for (i = 0; i < sizeof(g_m3_5_payload); i++) {
+        ((unsigned char *)(uintptr_t)entry_rip)[i] = g_m3_5_payload[i];
+    }
+
+    hype_pic_emu_reset(&g_m3_5_pic);
+    hype_pit_emu_reset(&g_m3_5_pit);
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    rsp = (uint64_t)(uintptr_t)(g_m3_5_guest_stack + sizeof(g_m3_5_guest_stack));
+    rsi = (uint64_t)(uintptr_t)&g_m3_5_zero_page;
+
+    hype_serial_print("m3-5: entry_rip=0x%llx guest_cr3=0x%llx zero_page=0x%llx\n",
+                       (unsigned long long)entry_rip, (unsigned long long)guest_cr3,
+                       (unsigned long long)rsi);
+
+    /* No NPT for this first pass (0) -- see task.md's M3-5 scope note
+     * on why full AVIC interrupt-delivery validation is deferred. */
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    if (ctx == 0) {
+        hype_fatal("m3-5: vcpu_create_long_mode failed");
+    }
+    hype_svm_vcpu_set_rsi(ctx, rsi);
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("m3-5: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
+            if (hype_svm_vcpu_handle_ioio(ctx, &g_m3_5_pic, &g_m3_5_pit) != 0) {
+                hype_fatal("m3-5: unhandled guest port I/O (qual=0x%llx)",
+                           (unsigned long long)info.qualification);
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("m3-5: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx "
+                   "expected_entry=0x%llx qual=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
+                   (unsigned long long)entry_rip, (unsigned long long)info.qualification);
+    }
+
+    hype_serial_print(
+        "m3-5: Linux boot-protocol shim test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx, "
+        "PIC master IMR=0x%x, PIT ch0 latch_pending=%d)\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, g_m3_5_pic.master.imr,
+        g_m3_5_pit.channels[0].latch_pending);
+}
+
+/* Runs every test guest in sequence -- what actually gets dispatched
+ * (inline on the BSP, or onto a pinned AP; see efi_main) so each new
+ * milestone's test guest still exercises real 1:1 vCPU-to-pCPU
+ * pinning (M3-2) rather than only the first one ever tested. */
+static void EFIAPI run_all_test_guests(void *arg) {
+    hype_test_guest_args_t *args = (hype_test_guest_args_t *)arg;
+    run_test_guest(arg);
+    run_m3_5_linux_shim_test(args->ops, args->kind);
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -162,9 +348,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * responding to shared memory writes once ExitBootServices had
      * run, even with no work involved beyond the bare go/done flags).
      * Running here, synchronously, sidesteps that entirely -- nothing
-     * run_test_guest() does depends on our own GDT/IDT/paging/timer
-     * (see its own comment), so there's no reason it needs to run
-     * after ExitBootServices at all. No extra pCPU (or no MP services
+     * run_all_test_guests() does depends on our own GDT/IDT/paging/
+     * timer (see run_test_guest()'s own comment), so there's no reason
+     * it needs to run after ExitBootServices at all. No extra pCPU (or
+     * no MP services
      * at all) isn't fatal -- the test guest just runs on the BSP
      * instead, right here, same as M2-7/M3-1's original behavior.
      */
@@ -195,15 +382,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
             hype_console_print(SystemTable, "mp: dispatching test guest to pinned pCPU #%llu\n",
                                 (unsigned long long)target_ap);
-            /* WaitEvent=0/NULL => blocking: waits for run_test_guest()
-             * to return, which it always does on success. On a fatal
-             * path inside it (hype_fatal() -> hype_halt_forever(),
-             * never returns), this call -- and so the whole boot --
-             * blocks forever on that core too; the diagnostic message
-             * fatal() already printed to serial is what actually
-             * matters for debugging a genuinely unrecoverable
-             * condition, so this is an accepted tradeoff, not a gap. */
-            status = mp->StartupThisAP(mp, run_test_guest, target_ap, 0, 0, &args, &finished);
+            /* WaitEvent=0/NULL => blocking: waits for
+             * run_all_test_guests() to return, which it always does on
+             * success. On a fatal path inside it (hype_fatal() ->
+             * hype_halt_forever(), never returns), this call -- and so
+             * the whole boot -- blocks forever on that core too; the
+             * diagnostic message fatal() already printed to serial is
+             * what actually matters for debugging a genuinely
+             * unrecoverable condition, so this is an accepted
+             * tradeoff, not a gap. */
+            status = mp->StartupThisAP(mp, run_all_test_guests, target_ap, 0, 0, &args, &finished);
             if (status != EFI_SUCCESS) {
                 hype_fatal("mp: StartupThisAP on pCPU #%llu failed: 0x%llx",
                            (unsigned long long)target_ap, (unsigned long long)status);
@@ -214,7 +402,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_console_print(SystemTable,
                                 "mp: no extra pCPU available (0x%llx) -- test guest running on the BSP\n",
                                 (unsigned long long)status);
-            run_test_guest(&args);
+            run_all_test_guests(&args);
         }
     }
 

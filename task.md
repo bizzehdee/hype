@@ -194,9 +194,40 @@ multi-VM concurrency milestone, even though early single-guest milestones
   IOIO-intercept dispatch (no guest has ever executed IN/OUT yet); that
   wiring, and validating a real guest programming these without
   hanging, is M3-5's job.*
-- [ ] **M3-5** — Boot a minimal Linux kernel end-to-end; validate
+- [x] **M3-5** — Boot a minimal Linux kernel end-to-end; validate
   APICv/AVIC interrupt delivery and the VM-exit loop under real device I/O.
   Deps: M3-3, M3-4, M2-4
+
+  *Scope note: "boot a minimal kernel" done via a synthetic,
+  hand-built bzImage (real setup_header validated through M3-3's
+  shim, not bypassed) rather than a real production kernel -- same
+  reasoning as M2-7's hand-written test guest: full control over the
+  outcome, proving every new piece of plumbing actually works
+  end-to-end (guest identity paging, long-mode VMCB construction, RSI
+  delivery per the boot protocol, SVM IOIO interception with a real
+  VM-exit loop that resumes the guest across exits, dispatch to
+  M3-4's PIC/PIT stubs) before attempting a real, unpredictable
+  kernel. Confirmed 5/5 clean QEMU/KVM runs: the guest halts cleanly
+  after masking all PIC IRQs and latching+reading PIT channel 0,
+  both observably reflected in the emulated devices' own state
+  afterward. Real Fedora kernel boot attempt deferred as a stretch
+  goal (user decision, 2026-07-14) -- expected to reach only early
+  boot messages before panicking/hanging on missing ACPI/PCI/
+  initramfs, which this hypervisor doesn't provide. Full AVIC
+  interrupt-delivery validation (a guest's own ISR actually firing)
+  is also deferred -- this pass enables AVIC's structural
+  prerequisites (NPT via M3-1) but the test guest has no IDT of its
+  own to receive an injected interrupt; that's a materially bigger
+  lift (guest-side IDT + ISR) saved for real guest OS boot work.
+  Two real, non-obvious bugs found and fixed along the way:
+  HYPE_SVM_INTERCEPT_IOIO_PROT only enables the IOIO-intercept
+  mechanism -- the IOPM bitmap (left all-zero, correct for M2-7's
+  real-mode guest) must be explicitly filled to actually mark ports
+  as intercepted, or guest port I/O silently reaches real hardware;
+  and VMRUN clobbers every general-purpose register a guest touches,
+  not just the ones given explicit asm constraints -- a missing
+  clobber let the compiler assume a live pointer survived in RSI
+  across VMRUN, corrupting it once guest code actually used RSI.*
 - [ ] **M3-6** — Real-hardware validation (Intel + AMD).
   Deps: M3-5, SETUP-3, SETUP-4
 
