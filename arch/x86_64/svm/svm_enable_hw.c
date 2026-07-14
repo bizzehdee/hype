@@ -1,5 +1,7 @@
 #include "svm.h"
 
+#include "../../../core/fatal.h"
+
 /* Host Save Area: a 4KB scratch page the CPU saves host state into on
  * every VMRUN and restores from on every #VMEXIT. We never read it
  * ourselves (that's what the VMCB's save-state area and our own
@@ -26,8 +28,27 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
  * fully tested.
  */
 int hype_svm_enable(void) {
-    uint64_t efer = rdmsr(HYPE_MSR_EFER);
+    uint64_t vm_cr;
+    uint64_t efer;
+
+    /* Real-hardware debugging: VM_CR.SVMDIS (bit 4) can lock SVM off
+     * independently of the "SVM enabled" BIOS toggle -- if it's set,
+     * the EFER WRMSR below takes a #GP that (at this point in boot,
+     * before our own IDT is loaded) has nowhere safe to land. Reading
+     * VM_CR itself is a plain RDMSR and cannot fault this way, so this
+     * print is always safe and always the last screen/serial line
+     * before the first genuinely risky instruction in this function. */
+    vm_cr = rdmsr(HYPE_MSR_VM_CR);
+    hype_debug_print("svm: VM_CR=0x%llx SVMDIS=%d\n", (unsigned long long)vm_cr,
+                      (vm_cr & HYPE_MSR_VM_CR_SVMDIS) != 0);
+
+    efer = rdmsr(HYPE_MSR_EFER);
+    hype_debug_print("svm: EFER(before)=0x%llx -- about to WRMSR EFER (set SVME)...\n",
+                      (unsigned long long)efer);
     wrmsr(HYPE_MSR_EFER, hype_svm_efer_with_svme(efer));
+    hype_debug_print("svm: EFER WRMSR done -- about to WRMSR VM_HSAVE_PA=0x%llx...\n",
+                      (unsigned long long)(uint64_t)(uintptr_t)g_hsave_area);
     wrmsr(HYPE_MSR_VM_HSAVE_PA, (uint64_t)g_hsave_area);
+    hype_debug_print("svm: VM_HSAVE_PA WRMSR done -- SVM enable complete\n");
     return 0;
 }

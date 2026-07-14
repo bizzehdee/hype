@@ -1,5 +1,7 @@
 #include "svm.h"
 
+#include "../../../core/fatal.h"
+
 /*
  * Concrete per-vCPU context for the SVM backend (M2-7). Opaque outside
  * this file per vmm_ops.h's hype_vcpu_ctx_t contract -- the dispatch
@@ -479,11 +481,24 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint64_t vmcb_phys = (uint64_t)(uintptr_t)real->vmcb;
 
+    /* Real-hardware debugging: this brackets the single riskiest
+     * instruction sequence in the whole boot path. If the last line
+     * seen (screen or serial) is the "about to" one below with no
+     * matching "VMRUN returned", the fault/hang is inside CLGI/VMLOAD/
+     * VMRUN itself -- real bare-metal SVM has fault paths (e.g. an
+     * invalid VMCB field bare metal validates more strictly than
+     * nested/emulated SVM does) that this project's own QEMU+KVM
+     * nested-SVM validation may simply never have exercised. */
+    hype_debug_print("svm: about to CLGI/VMLOAD/VMRUN (vmcb_phys=0x%llx)...\n",
+                      (unsigned long long)vmcb_phys);
     clgi();
     vmload(vmcb_phys);
     vmrun_full(vmcb_phys);
+    hype_debug_print("svm: VMRUN returned -- about to VMSAVE/STGI...\n");
     vmsave(vmcb_phys);
     stgi();
+    hype_debug_print("svm: STGI done, exitcode=0x%llx\n",
+                      (unsigned long long)real->vmcb->control.exitcode);
 
     info->reason = real->vmcb->control.exitcode;
     info->qualification = real->vmcb->control.exitinfo1;

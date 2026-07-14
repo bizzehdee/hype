@@ -29,4 +29,18 @@ hype_gop_console_t *hype_fatal_get_gop(void);
  */
 __attribute__((noreturn)) void hype_fatal(const char *fmt, ...);
 
+/*
+ * Non-fatal sibling of hype_fatal(): formats fmt/... and prints it via
+ * serial and (if registered) the GOP console, same two channels, but
+ * returns normally instead of halting. Added for real-hardware
+ * bring-up: a screen-only setup (no serial capture) previously had no
+ * way to see any of the fine-grained "about to do X" / "X done"
+ * checkpoints that only ever went to hype_serial_print() -- meaning a
+ * hang partway through a risky real-hardware-only sequence (enabling
+ * SVM, VMRUN, ...) looked identical to one after it. Not unit tested,
+ * same reasoning as hype_fatal() (halt.c) -- it's a thin wrapper around
+ * hype_serial_print()/hype_gop_print(), both themselves exempt.
+ */
+void hype_debug_print(const char *fmt, ...);
+
 #endif /* HYPE_FATAL_H */

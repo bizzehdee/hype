@@ -41,3 +41,20 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
 
     hype_halt_forever();
 }
+
+void hype_debug_print(const char *fmt, ...) {
+    char msg[192];
+    va_list ap;
+    hype_gop_console_t *gop;
+
+    va_start(ap, fmt);
+    hype_vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    hype_serial_print("%s", msg);
+
+    gop = hype_fatal_get_gop();
+    if (gop != 0) {
+        hype_gop_print(gop, "%s", msg);
+    }
+}

@@ -230,11 +230,11 @@ static void EFIAPI run_test_guest(void *arg) {
      * itself -- RDMSR/WRMSR against real hardware MSRs, unlike
      * anything QEMU/KVM's nested-virtualization emulation exercises
      * the same way bare metal does. */
-    hype_serial_print("vmm: about to enable %s...\n", ops->name);
+    hype_debug_print("vmm: about to enable %s...\n", ops->name);
     if (ops->enable() != 0) {
         hype_fatal("vmm: %s enable failed", ops->name);
     }
-    hype_serial_print("vmm: %s enabled\n", ops->name);
+    hype_debug_print("vmm: %s enabled\n", ops->name);
 
     /*
      * VMX's vcpu_create/vcpu_run stay NULL past M2-7 (see vmx_ops.c)
@@ -242,7 +242,7 @@ static void EFIAPI run_test_guest(void *arg) {
      * deferred to M2-8's real Intel hardware pass.
      */
     if (ops->vcpu_create == 0 || ops->vcpu_run == 0) {
-        hype_serial_print("vmm: %s vCPU launch not implemented yet -- test guest skipped\n", ops->name);
+        hype_debug_print("vmm: %s vCPU launch not implemented yet -- test guest skipped\n", ops->name);
         return;
     }
 
@@ -255,8 +255,8 @@ static void EFIAPI run_test_guest(void *arg) {
 
     uint64_t entry_phys = (uint64_t)(uintptr_t)g_m2_7_guest_code;
     uint64_t stack_phys = (uint64_t)(uintptr_t)(g_m2_7_guest_stack + sizeof(g_m2_7_guest_stack));
-    hype_serial_print("vmm: %s test guest: entry_phys=0x%llx stack_phys=0x%llx\n", ops->name,
-                       (unsigned long long)entry_phys, (unsigned long long)stack_phys);
+    hype_debug_print("vmm: %s test guest: entry_phys=0x%llx stack_phys=0x%llx\n", ops->name,
+                      (unsigned long long)entry_phys, (unsigned long long)stack_phys);
 
     /* M3-1: SVM's NPT is real and QEMU-validated (unlike EPT, which
      * has nowhere to be wired in yet -- VMX's vcpu_create stays NULL,
@@ -266,14 +266,16 @@ static void EFIAPI run_test_guest(void *arg) {
     if (kind == HYPE_VMM_KIND_SVM) {
         hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
         npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
-        hype_serial_print("vmm: %s NPT identity map built (root=0x%llx, %u GB)\n", ops->name,
-                           (unsigned long long)npt_root_phys, HYPE_NPT_MAX_GB);
+        hype_debug_print("vmm: %s NPT identity map built (root=0x%llx, %u GB)\n", ops->name,
+                          (unsigned long long)npt_root_phys, HYPE_NPT_MAX_GB);
     }
 
+    hype_debug_print("vmm: about to call %s vcpu_create...\n", ops->name);
     hype_vcpu_ctx_t *ctx = ops->vcpu_create(entry_phys, stack_phys, npt_root_phys);
     if (ctx == 0) {
         hype_fatal("vmm: %s vcpu_create failed", ops->name);
     }
+    hype_debug_print("vmm: %s vcpu_create done -- entering dispatch loop...\n", ops->name);
 
     hype_vmexit_info_t info;
     int rc = hype_vmexit_dispatch_loop(ops, ctx, kind, &info);
@@ -281,8 +283,8 @@ static void EFIAPI run_test_guest(void *arg) {
         hype_fatal("vmm: %s test guest did not exit cleanly (reason=0x%llx qual=0x%llx)", ops->name,
                    (unsigned long long)info.reason, (unsigned long long)info.qualification);
     }
-    hype_serial_print("vmm: %s test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx)\n", ops->name,
-                       (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    hype_debug_print("vmm: %s test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx)\n", ops->name,
+                      (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
 }
 
 /*
@@ -1069,7 +1071,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * or a feature bit is unexpectedly absent (e.g. SVM disabled
          * in firmware setup) -- print it before anything else can go
          * wrong, not only on failure. */
-        hype_serial_print(
+        hype_debug_print(
             "cpu: vendor=%s vmx=%d svm=%d\n",
             (cpu_diag.vendor == HYPE_CPU_VENDOR_INTEL)
                 ? "Intel"
@@ -1079,7 +1081,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         if (ops == 0) {
             hype_fatal("no usable virtualization extension (VMX/SVM) detected");
         }
-        hype_serial_print("vmm: %s detected\n", ops->name);
+        hype_debug_print("vmm: %s detected\n", ops->name);
 
         args.ops = ops;
         args.kind = kind;

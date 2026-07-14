@@ -25,6 +25,15 @@
 #define HYPE_EFER_SVME (1ULL << 12)
 #define HYPE_MSR_VM_HSAVE_PA 0xC0010117u
 
+/* VM_CR (AMD SDM Vol 2, 15.31): bit 4 (SVMDIS) can be set by firmware
+ * to lock SVM off independently of the "SVM enabled" BIOS toggle the
+ * user sees -- if set, the EFER.SVME WRMSR in hype_svm_enable() below
+ * takes a #GP. Read-only diagnostic for real-hardware bring-up
+ * (svm_enable_hw.c prints it before touching EFER); not otherwise
+ * acted on here. */
+#define HYPE_MSR_VM_CR 0xC0010114u
+#define HYPE_MSR_VM_CR_SVMDIS (1ULL << 4)
+
 /* Given the current EFER value, returns it with SVME (bit 12) set,
  * leaving every other bit (LME/LMA/NXE, ...) untouched. Pure
  * bit-manipulation -- the actual RDMSR/WRMSR round trip is the exempt
