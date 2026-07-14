@@ -13,7 +13,7 @@ LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 BUILD_DIR := build
 CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/serial.c core/serial_hw.c core/font8x8.c core/gop.c core/gop_text.c \
-             core/fatal.c core/strutil.c core/guest_ram.c
+             core/fatal.c core/strutil.c core/guest_ram.c core/mp.c
 ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
              arch/x86_64/cpu/paging.c arch/x86_64/cpu/paging_load.c \
@@ -60,13 +60,17 @@ test:
 # (nested virtualization), which plain TCG emulation doesn't faithfully
 # provide (plan.md §10 decision #4's own stated testing strategy).
 # Falls back to TCG automatically if /dev/kvm isn't available.
+# -smp 2: required from M3-2 onward so there's a real second pCPU to
+# exercise EFI_MP_SERVICES_PROTOCOL-based vCPU pinning against; with
+# only 1 CPU the test guest still runs correctly, just on the BSP
+# (the documented, non-fatal fallback -- see boot/main.c).
 run: $(OUT)
 	@mkdir -p $(ESP)/EFI/BOOT
 	cp $(OUT) $(ESP)/EFI/BOOT/BOOTX64.EFI
 	cp $(OVMF_VARS) $(BUILD_DIR)/OVMF_VARS.fd
 	qemu-system-x86_64 \
 	  -machine q35 -m 512 -nodefaults \
-	  -accel kvm -accel tcg -cpu host \
+	  -accel kvm -accel tcg -cpu host -smp 2 \
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,file=$(BUILD_DIR)/OVMF_VARS.fd \
 	  -drive format=raw,file=fat:rw:$(ESP) \

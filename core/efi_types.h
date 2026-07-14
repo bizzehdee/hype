@@ -35,6 +35,7 @@ typedef void *EFI_EVENT;
 #define EFI_SUCCESS ((EFI_STATUS)0)
 #define EFI_ERR_BIT 0x8000000000000000ULL
 #define EFI_BUFFER_TOO_SMALL ((EFI_STATUS)(EFI_ERR_BIT | 5))
+#define EFI_NOT_FOUND ((EFI_STATUS)(EFI_ERR_BIT | 14))
 
 typedef UINT64 EFI_PHYSICAL_ADDRESS;
 typedef UINT64 EFI_VIRTUAL_ADDRESS;
@@ -129,6 +130,15 @@ typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(
     void *Registration,
     void **Interface);
 
+typedef void (EFIAPI *EFI_EVENT_NOTIFY)(EFI_EVENT Event, void *Context);
+
+typedef EFI_STATUS (EFIAPI *EFI_CREATE_EVENT)(
+    UINT32 Type,
+    UINTN NotifyTpl,
+    EFI_EVENT_NOTIFY NotifyFunction,
+    void *NotifyContext,
+    EFI_EVENT *Event);
+
 /*
  * Full 44-function-pointer layout per the UEFI spec's
  * EFI_BOOT_SERVICES_REVISION table, so that fields past DescriptorVersion
@@ -145,7 +155,7 @@ typedef struct {
     EFI_GET_MEMORY_MAP GetMemoryMap;
     EFI_ALLOCATE_POOL AllocatePool;
     EFI_FREE_POOL FreePool;
-    void *CreateEvent;
+    EFI_CREATE_EVENT CreateEvent;
     void *SetTimer;
     void *WaitForEvent;
     void *SignalEvent;
@@ -229,6 +239,66 @@ typedef struct {
  * 9042a9de-23dc-4a38-96fb-7aded080516a. */
 #define EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID \
     { 0x9042a9de, 0x23dc, 0x4a38, { 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a } }
+
+/*
+ * EFI_MP_SERVICES_PROTOCOL (M3-2): lets a pre-ExitBootServices client
+ * enumerate and dispatch code onto additional physical CPUs (APs) --
+ * firmware itself handles the real-mode INIT-SIPI-SIPI bring-up
+ * sequence internally, so this project never needs to write that
+ * low-level trampoline itself. Struct layout/GUID per the UEFI
+ * Platform Init spec (MdePkg's Protocol/MpService.h); only the
+ * functions this project actually calls are given real signatures.
+ */
+#define EFI_MP_SERVICES_PROTOCOL_GUID \
+    { 0x3fdda605, 0xa76e, 0x4f46, { 0xad, 0x29, 0x12, 0xf4, 0x53, 0x1b, 0x3d, 0x08 } }
+
+#define HYPE_MP_PROCESSOR_AS_BSP_BIT 0x00000001u
+#define HYPE_MP_PROCESSOR_ENABLED_BIT 0x00000002u
+
+typedef struct {
+    UINT32 Package;
+    UINT32 Core;
+    UINT32 Thread;
+} EFI_CPU_PHYSICAL_LOCATION;
+
+typedef struct {
+    UINT64 ProcessorId;
+    UINT32 StatusFlag;
+    EFI_CPU_PHYSICAL_LOCATION Location;
+} EFI_PROCESSOR_INFORMATION;
+
+typedef struct EFI_MP_SERVICES_PROTOCOL EFI_MP_SERVICES_PROTOCOL;
+
+typedef EFI_STATUS (EFIAPI *EFI_MP_SERVICES_GET_NUMBER_OF_PROCESSORS)(
+    EFI_MP_SERVICES_PROTOCOL *This,
+    UINTN *NumberOfProcessors,
+    UINTN *NumberOfEnabledProcessors);
+
+typedef EFI_STATUS (EFIAPI *EFI_MP_SERVICES_GET_PROCESSOR_INFO)(
+    EFI_MP_SERVICES_PROTOCOL *This,
+    UINTN ProcessorNumber,
+    EFI_PROCESSOR_INFORMATION *ProcessorInfoBuffer);
+
+typedef void (EFIAPI *EFI_AP_PROCEDURE)(void *ProcedureArgument);
+
+typedef EFI_STATUS (EFIAPI *EFI_MP_SERVICES_STARTUP_THIS_AP)(
+    EFI_MP_SERVICES_PROTOCOL *This,
+    EFI_AP_PROCEDURE Procedure,
+    UINTN ProcessorNumber,
+    EFI_EVENT WaitEvent,
+    UINTN TimeoutInMicroseconds,
+    void *ProcedureArgument,
+    BOOLEAN *Finished);
+
+struct EFI_MP_SERVICES_PROTOCOL {
+    EFI_MP_SERVICES_GET_NUMBER_OF_PROCESSORS GetNumberOfProcessors;
+    EFI_MP_SERVICES_GET_PROCESSOR_INFO GetProcessorInfo;
+    void *StartupAllAPs;
+    EFI_MP_SERVICES_STARTUP_THIS_AP StartupThisAP;
+    void *SwitchBSP;
+    void *EnableDisableAP;
+    void *WhoAmI;
+};
 
 typedef struct {
     EFI_TABLE_HEADER Hdr;

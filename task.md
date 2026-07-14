@@ -156,9 +156,21 @@ multi-VM concurrency milestone, even though early single-guest milestones
 
 - [x] **M3-1** — EPT/NPT table construction (identity-mapped).
   Deps: M2-7
-- [ ] **M3-2** — 1:1 vCPU-to-pCPU pinning, including explicit `cpu_set`
+- [x] **M3-2** — 1:1 vCPU-to-pCPU pinning, including explicit `cpu_set`
   support.
   Deps: ADM-3, M2-7
+
+  *Scope note: the real pinning mechanism is built and QEMU-validated
+  -- EFI_MP_SERVICES_PROTOCOL dispatches the test guest's vCPU onto a
+  specific, chosen non-BSP physical core (core/mp.c, boot/main.c),
+  confirmed 5/5 clean runs with `-smp 2`. `hype_mp_pick_target_ap()`
+  currently picks "any enabled non-BSP processor," not yet a specific
+  core number driven by hype.cfg's parsed `cpu_set` list (ADM-3
+  already validates that config, but nothing wires it to a real
+  per-VM pinning decision yet) -- that's deferred to M8 alongside the
+  rest of real multi-VM concurrency, matching every other
+  single-instance-for-now scoping decision through M2/M3 (single VMCB,
+  single AVIC/NPT table, ...).*
 - [ ] **M3-3** — Basic Linux boot protocol shim (direct `bzImage` boot, no
   firmware).
   Deps: M3-1
