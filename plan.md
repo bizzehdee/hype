@@ -890,4 +890,10 @@ own "keeping plan.md and task.md in sync" rule).
   for free. Any v2 work here must explicitly re-derive how fault
   isolation holds under real scheduling before it can replace the
   pinning invariant, not just drop the invariant and assume isolation
-  still holds.
+  still holds. The scheduler must also be **NUMA-node aware**: on
+  multi-socket/multi-node hosts, place a VM's vCPUs and its guest RAM on
+  the same NUMA node wherever possible (and keep them together across
+  any rebalancing), rather than scheduling purely on core availability —
+  cross-node memory access is a real, measurable performance cliff this
+  project shouldn't reintroduce once it's no longer avoided for free by
+  static 1:1 pinning to a fixed core.
