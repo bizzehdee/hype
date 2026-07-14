@@ -40,12 +40,27 @@ static hype_pte_t g_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4
 static hype_pte_t g_pd[HYPE_PAGING_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_gop_console_t g_gop_console;
 
-/* M2-7: the hand-written test guest's code+stack pages -- wherever
- * the linker/loader actually placed them; hype_svm_vcpu_create()
- * points the guest's CS.base/SS.base directly at their address (see
- * vmcb.h), so no particular alignment or address range is required. */
-static uint8_t g_m2_7_guest_code[4096] __attribute__((aligned(4096)));
-static uint8_t g_m2_7_guest_stack[4096] __attribute__((aligned(4096)));
+/*
+ * M2-7's hand-written test guest runs in real-address mode
+ * (hype_vmcb_build_realmode_guest()), which points the guest's
+ * CS.base/SS.base directly at this buffer's own physical address (see
+ * vmcb.h). Confirmed on real AMD hardware (two different 32GB
+ * machines) that this is NOT safe with a plain static buffer: AMD SVM
+ * only implements the low 32 bits of most VMCB segment base fields
+ * (vmcb.h's hype_vmcb_seg_t comment) -- real silicon silently
+ * truncates CS.base to bits 31:0 whenever the linker/loader happens to
+ * place this buffer above 4GB (which real UEFI firmware on a machine
+ * with enough RAM does routinely; QEMU's own small test VMs never
+ * happen to), sending the guest's first fetch to a completely
+ * unrelated physical address and triple-faulting it instantly
+ * (VMEXIT_SHUTDOWN) -- nested SVM under QEMU/KVM apparently honors the
+ * full 64-bit field, masking this on every dev-environment run. Fixed
+ * by explicitly allocating this guest's code/stack pages below 4GB via
+ * UEFI's AllocatePages(AllocateMaxAddress) instead of trusting the
+ * compiler's own static placement -- see hype_alloc_pages_below_4gb()
+ * and its call site in efi_main(), before the MP dispatch block. */
+static uint64_t g_m2_7_guest_code_phys;
+static uint64_t g_m2_7_guest_stack_top_phys;
 
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
@@ -214,6 +229,32 @@ static void hype_write_le32(unsigned char *dst, uint32_t value) {
     }
 }
 
+/*
+ * Allocates `pages` 4KB pages entirely below the 4GB boundary via
+ * AllocateMaxAddress -- must be called before ExitBootServices(), same
+ * as every other Boot Services call in this file. Needed specifically
+ * for M2-7's real-mode test guest (see its own buffer-declaration
+ * comment): AMD SVM only implements the low 32 bits of most VMCB
+ * segment base fields, so that guest's CS.base/SS.base (set directly
+ * to this buffer's physical address) must fit in 32 bits or real
+ * hardware silently truncates it -- confirmed the hard way on real AMD
+ * hardware, where the compiler's own static placement landed just past
+ * 5GB. Fatal on failure: every caller needs this memory to exist for
+ * its test guest to run at all. Returns the allocated physical
+ * address directly (this project's flat-identity-map convention --
+ * a plain pointer dereference at that address is valid immediately,
+ * no translation needed).
+ */
+static uint64_t hype_alloc_pages_below_4gb(EFI_BOOT_SERVICES *bs, UINTN pages) {
+    EFI_PHYSICAL_ADDRESS mem = 0xFFFFFFFFULL;
+    EFI_STATUS status = bs->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &mem);
+    if (status != EFI_SUCCESS) {
+        hype_fatal("AllocatePages(<4GB, %u pages) failed: 0x%llx", (unsigned int)pages,
+                   (unsigned long long)status);
+    }
+    return (uint64_t)mem;
+}
+
 typedef struct {
     const hype_vmm_ops_t *ops;
     hype_vmm_kind_t kind;
@@ -257,13 +298,18 @@ static void EFIAPI run_test_guest(void *arg) {
 
     /* M2-6 hard invariant: zero every byte of a guest's reserved RAM
      * before its first VM-entry, on every (re)start -- not just the
-     * bytes we're about to write ourselves. */
-    hype_guest_ram_zero(g_m2_7_guest_code, sizeof(g_m2_7_guest_code));
-    hype_guest_ram_zero(g_m2_7_guest_stack, sizeof(g_m2_7_guest_stack));
-    g_m2_7_guest_code[0] = 0xF4; /* HLT */
+     * bytes we're about to write ourselves. g_m2_7_guest_code_phys/
+     * g_m2_7_guest_stack_top_phys are below-4GB pages allocated by
+     * efi_main() (see hype_alloc_pages_below_4gb()) before this
+     * function ever runs -- see this test's own buffer-declaration
+     * comment above for why a plain static buffer isn't safe here. */
+    uint8_t *guest_code = (uint8_t *)(uintptr_t)g_m2_7_guest_code_phys;
+    hype_guest_ram_zero(guest_code, 4096);
+    hype_guest_ram_zero((void *)(uintptr_t)(g_m2_7_guest_stack_top_phys - 4096), 4096);
+    guest_code[0] = 0xF4; /* HLT */
 
-    uint64_t entry_phys = (uint64_t)(uintptr_t)g_m2_7_guest_code;
-    uint64_t stack_phys = (uint64_t)(uintptr_t)(g_m2_7_guest_stack + sizeof(g_m2_7_guest_stack));
+    uint64_t entry_phys = g_m2_7_guest_code_phys;
+    uint64_t stack_phys = g_m2_7_guest_stack_top_phys;
     hype_debug_print("vmm: %s test guest: entry_phys=0x%llx stack_phys=0x%llx\n", ops->name,
                       (unsigned long long)entry_phys, (unsigned long long)stack_phys);
 
@@ -1091,6 +1137,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_fatal("no usable virtualization extension (VMX/SVM) detected");
         }
         hype_debug_print("vmm: %s detected\n", ops->name);
+
+        /* Must happen here, before ExitBootServices(), and before
+         * run_all_test_guests() below actually uses these -- see
+         * g_m2_7_guest_code_phys's own comment for why a static buffer
+         * isn't safe for this particular (real-mode) test guest. One
+         * single 2-page allocation, not two separate 1-page ones: the
+         * UEFI spec guarantees the pages *within* one AllocatePages
+         * call are contiguous and non-overlapping, but says nothing
+         * about the relative placement of two independent calls. */
+        {
+            uint64_t pages_phys = hype_alloc_pages_below_4gb(SystemTable->BootServices, 2);
+            g_m2_7_guest_code_phys = pages_phys;
+            g_m2_7_guest_stack_top_phys = pages_phys + 2 * 4096;
+        }
 
         args.ops = ops;
         args.kind = kind;

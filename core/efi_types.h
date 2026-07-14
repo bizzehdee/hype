@@ -100,6 +100,20 @@ struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
     void *Mode;
 };
 
+/* Values match the UEFI spec's EFI_ALLOCATE_TYPE enum exactly. */
+enum {
+    AllocateAnyPages,
+    AllocateMaxAddress,
+    AllocateAddress,
+    MaxAllocateType
+};
+
+typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_PAGES)(
+    UINT32 Type,
+    UINT32 MemoryType,
+    UINTN Pages,
+    EFI_PHYSICAL_ADDRESS *Memory);
+
 typedef EFI_STATUS (EFIAPI *EFI_GET_MEMORY_MAP)(
     UINTN *MemoryMapSize,
     EFI_MEMORY_DESCRIPTOR *MemoryMap,
@@ -150,7 +164,7 @@ typedef struct {
     EFI_TABLE_HEADER Hdr;
     void *RaiseTPL;
     void *RestoreTPL;
-    void *AllocatePages;
+    EFI_ALLOCATE_PAGES AllocatePages;
     void *FreePages;
     EFI_GET_MEMORY_MAP GetMemoryMap;
     EFI_ALLOCATE_POOL AllocatePool;
