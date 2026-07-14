@@ -1005,6 +1005,36 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
 
     /*
+     * GOP console + hype_fatal()'s registration for it are both set up
+     * here -- *before* the test-guest dispatch below, not after
+     * ExitBootServices() -- specifically so a hype_fatal() panic during
+     * any of those test guests is actually visible on screen. Found the
+     * hard way on real AMD hardware: hype_fatal() only ever prints via
+     * serial and (if registered) GOP, never UEFI's own ConOut, and the
+     * test guests all run before ExitBootServices -- so with the GOP
+     * console registered only afterward (this project's original
+     * ordering), a panic during test-guest execution was completely
+     * silent on a screen-only setup (no serial capture), indistinguishable
+     * from a genuine hang. FrameBufferBase/resolution are available as
+     * soon as GOP is located, independent of ExitBootServices, so this
+     * doesn't need to wait. Framebuffer contents survive past
+     * ExitBootServices and the later GDT/paging/IDT swap unchanged --
+     * it's just memory, and the later "Boot Services exited" print
+     * below reuses this same console rather than re-initializing it. */
+    if (have_gop && gop->Mode != 0 && gop->Mode->Info != 0 &&
+        (gop->Mode->Info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor ||
+         gop->Mode->Info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)) {
+        hype_gop_console_init(&g_gop_console, (void *)gop->Mode->FrameBufferBase,
+                               gop->Mode->Info->HorizontalResolution,
+                               gop->Mode->Info->VerticalResolution,
+                               gop->Mode->Info->PixelsPerScanLine,
+                               0xFFFFFFu, 0x000000u);
+        hype_gop_console_clear(&g_gop_console);
+        hype_fatal_set_gop(&g_gop_console);
+        hype_gop_print(&g_gop_console, "hype: running self-tests...\n");
+    }
+
+    /*
      * M3-2: 1:1 vCPU-to-pCPU pinning. The test guest launches *here*,
      * before ExitBootServices, dispatched onto a pinned AP via a
      * blocking StartupThisAP call when one is available -- not after,
@@ -1163,28 +1193,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * Boot Services -- including ConOut, which every hype_console_print
      * above depended on -- are gone as of the ExitBootServices() call
      * above. This is now the only kernel running on this CPU. Serial
-     * (initialized above) is one output channel; GOP (if found earlier,
-     * while Boot Services still worked) is the other -- the framebuffer
-     * itself is just memory, identity-mapped by our own paging above,
-     * so writing into it needs nothing further from firmware. Only
-     * handle the two 32bpp linear pixel formats GOP defines; anything
-     * else (PixelBltOnly, PixelBitMask) isn't a linear framebuffer we
-     * can just write into, so skip it rather than misinterpret it.
+     * (initialized above) is one output channel; GOP (already
+     * initialized/registered with hype_fatal(), above, before the
+     * test-guest dispatch -- see that block's own comment) is the
+     * other -- the framebuffer itself is just memory, identity-mapped
+     * by our own paging above, so writing into it needs nothing
+     * further from firmware.
      */
     if (have_gop && gop->Mode != 0 && gop->Mode->Info != 0 &&
         (gop->Mode->Info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor ||
          gop->Mode->Info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)) {
-        hype_gop_console_init(&g_gop_console, (void *)gop->Mode->FrameBufferBase,
-                               gop->Mode->Info->HorizontalResolution,
-                               gop->Mode->Info->VerticalResolution,
-                               gop->Mode->Info->PixelsPerScanLine,
-                               0xFFFFFFu, 0x000000u);
-        /* Firmware's own pre-ExitBootServices console output is still
-         * sitting in this same linear framebuffer otherwise. */
         hype_gop_console_clear(&g_gop_console);
-        /* From here on, any fatal fault (arch/x86_64/cpu/isr_decode.c)
-         * prints to this console too, not just serial. */
-        hype_fatal_set_gop(&g_gop_console);
         hype_gop_print(&g_gop_console, "hype: Boot Services exited, hypervisor now running\n");
     }
 
