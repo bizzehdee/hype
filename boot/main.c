@@ -1561,6 +1561,188 @@ static void run_ram_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         gb_to_map);
 }
 
+/*
+ * PCI-1: exercises the new ECAM-based PCI configuration-space model
+ * (devices/pci.h, hype_svm_vcpu_handle_pci_ecam_npf() in
+ * arch/x86_64/svm/svm_vcpu.c) end-to-end -- registers a host bridge
+ * (bus 0/device 0, class 0x0600) and a fake AHCI-class device (bus 0/
+ * device 1, class 0x010601, standing in for M4-5's real AHCI device
+ * until PCI-2 wires that in for real), then has the guest read the
+ * host bridge's vendor/device ID and class code, probe an absent
+ * device (confirming the standard "reads as all-1s" convention every
+ * real PCI bus-walk relies on), and run the BAR sizing/programming
+ * protocol against the fake AHCI device's BAR0 -- all via ordinary
+ * guest-RAM-mapped-looking MOV instructions that actually NPF-trap
+ * through the ECAM region, same mechanism as M4-3/M4-5's own MMIO
+ * devices.
+ */
+static uint8_t g_pci_1_guest_code[128] __attribute__((aligned(4096)));
+static uint8_t g_pci_1_guest_stack[4096] __attribute__((aligned(4096)));
+static uint8_t g_pci_1_result_buf[32] __attribute__((aligned(16)));
+static hype_pci_t g_pci_1_pci;
+
+/* Guest-physical base of the (bus-0-only) ECAM window -- 4GB,
+ * comfortably clear of HYPE_M4_3_PFLASH_GPA (3GB) and
+ * HYPE_M4_5_AHCI_GPA (3GB+2MB), well within the shared NPT/guest
+ * identity map's reach. */
+#define HYPE_PCI_1_ECAM_GPA (4ULL * HYPE_PAGING_1GB)
+#define HYPE_PCI_1_AHCI_DEV 1u
+
+/*
+ *   mov rbx, <patched: ECAM base guest-physical address>
+ *                                          48 BB 00*8
+ *   mov rdi, <patched: result_buf guest-physical address>
+ *                                          48 BF 00*8
+ *   mov eax, [rbx+0]      (host bridge vendor/device ID)  8B 43 00
+ *   mov [rdi+0], eax                                      89 47 00
+ *   mov eax, [rbx+8]      (host bridge class code)        8B 43 08
+ *   mov [rdi+4], eax                                      89 47 04
+ *   mov eax, [rbx+0x28000] (device 5, absent)             8B 83 00 80 02 00
+ *   mov [rdi+8], eax                                       89 47 08
+ *   mov eax, 0xFFFFFFFF   (device1 BAR0 sizing probe value) B8 FF FF FF FF
+ *   mov [rbx+0x8010], eax                                  89 83 10 80 00 00
+ *   mov eax, [rbx+0x8010]                                  8B 83 10 80 00 00
+ *   mov [rdi+12], eax                                      89 47 0C
+ *   mov eax, 0xE0100123   (program a real address)         B8 23 01 10 E0
+ *   mov [rbx+0x8010], eax                                  89 83 10 80 00 00
+ *   mov eax, [rbx+0x8010]                                  8B 83 10 80 00 00
+ *   mov [rdi+16], eax                                      89 47 10
+ *   hlt                                                    F4
+ *   jmp $-3                                                EB FD
+ *
+ * Note: BAR writes go through EAX rather than a "mov dword [mem],
+ * imm32" (opcode 0xC7) form -- hype_mmio_decode() only supports the
+ * MOV/MOVZX register forms every other test guest here already uses
+ * (0x88/0x89/0x8A/0x8B/0F B6/0F B7), not immediate-to-memory stores;
+ * matching that existing convention here rather than extending the
+ * decoder just for this test's own convenience.
+ */
+static const uint8_t g_pci_1_payload_template[] = {
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0xBF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x8B, 0x43, 0x00,
+    0x89, 0x47, 0x00,
+    0x8B, 0x43, 0x08,
+    0x89, 0x47, 0x04,
+    0x8B, 0x83, 0x00, 0x80, 0x02, 0x00,
+    0x89, 0x47, 0x08,
+    0xB8, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x89, 0x83, 0x10, 0x80, 0x00, 0x00,
+    0x8B, 0x83, 0x10, 0x80, 0x00, 0x00,
+    0x89, 0x47, 0x0C,
+    0xB8, 0x23, 0x01, 0x10, 0xE0,
+    0x89, 0x83, 0x10, 0x80, 0x00, 0x00,
+    0x8B, 0x83, 0x10, 0x80, 0x00, 0x00,
+    0x89, 0x47, 0x10,
+    0xF4,
+    0xEB, 0xFD
+};
+#define HYPE_PCI_1_PAYLOAD_RBX_IMM_OFFSET 2
+#define HYPE_PCI_1_PAYLOAD_RDI_IMM_OFFSET 12
+
+static void run_pci_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys, result_buf_phys;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+    uint32_t got_hostbridge_id, got_hostbridge_class, got_absent, got_bar_mask, got_bar_addr;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("pci-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_pci_1_guest_code, sizeof(g_pci_1_guest_code));
+    hype_guest_ram_zero(g_pci_1_guest_stack, sizeof(g_pci_1_guest_stack));
+    hype_guest_ram_zero(g_pci_1_result_buf, sizeof(g_pci_1_result_buf));
+
+    hype_pci_reset(&g_pci_1_pci);
+    hype_pci_add_device(&g_pci_1_pci, 0, HYPE_PCI_VENDOR_ID_HYPE, 0x0000u, 0x06, 0x00, 0x00);
+    hype_pci_add_device(&g_pci_1_pci, HYPE_PCI_1_AHCI_DEV, HYPE_PCI_VENDOR_ID_HYPE, 0x0001u, 0x01, 0x06,
+                         0x01);
+    hype_pci_set_bar_size(&g_pci_1_pci, HYPE_PCI_1_AHCI_DEV, 0, 0x1000u);
+
+    result_buf_phys = (uint64_t)(uintptr_t)g_pci_1_result_buf;
+
+    for (i = 0; i < sizeof(g_pci_1_payload_template); i++) {
+        g_pci_1_guest_code[i] = g_pci_1_payload_template[i];
+    }
+    hype_write_le64(g_pci_1_guest_code + HYPE_PCI_1_PAYLOAD_RBX_IMM_OFFSET, HYPE_PCI_1_ECAM_GPA);
+    hype_write_le64(g_pci_1_guest_code + HYPE_PCI_1_PAYLOAD_RDI_IMM_OFFSET, result_buf_phys);
+
+    entry_rip = (uint64_t)(uintptr_t)g_pci_1_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_pci_1_guest_stack + sizeof(g_pci_1_guest_stack));
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+    hype_npt_mark_not_present(g_npt_pd, HYPE_PCI_1_ECAM_GPA);
+    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+
+    hype_debug_print("pci-1: entry_rip=0x%llx ecam_gpa=0x%llx result_buf=0x%llx\n",
+                      (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
+                      (unsigned long long)result_buf_phys);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    if (ctx == 0) {
+        hype_fatal("pci-1: vcpu_create_long_mode failed");
+    }
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("pci-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_pci_1_pci, HYPE_PCI_1_ECAM_GPA) != 0) {
+                hype_fatal("pci-1: unhandled guest ECAM access (qual=0x%llx guest_rip=0x%llx)",
+                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("pci-1: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+
+    got_hostbridge_id = (uint32_t)g_pci_1_result_buf[0] | ((uint32_t)g_pci_1_result_buf[1] << 8) |
+                        ((uint32_t)g_pci_1_result_buf[2] << 16) | ((uint32_t)g_pci_1_result_buf[3] << 24);
+    got_hostbridge_class = (uint32_t)g_pci_1_result_buf[4] | ((uint32_t)g_pci_1_result_buf[5] << 8) |
+                           ((uint32_t)g_pci_1_result_buf[6] << 16) | ((uint32_t)g_pci_1_result_buf[7] << 24);
+    got_absent = (uint32_t)g_pci_1_result_buf[8] | ((uint32_t)g_pci_1_result_buf[9] << 8) |
+                 ((uint32_t)g_pci_1_result_buf[10] << 16) | ((uint32_t)g_pci_1_result_buf[11] << 24);
+    got_bar_mask = (uint32_t)g_pci_1_result_buf[12] | ((uint32_t)g_pci_1_result_buf[13] << 8) |
+                   ((uint32_t)g_pci_1_result_buf[14] << 16) | ((uint32_t)g_pci_1_result_buf[15] << 24);
+    got_bar_addr = (uint32_t)g_pci_1_result_buf[16] | ((uint32_t)g_pci_1_result_buf[17] << 8) |
+                   ((uint32_t)g_pci_1_result_buf[18] << 16) | ((uint32_t)g_pci_1_result_buf[19] << 24);
+
+    if (got_hostbridge_id != (((uint32_t)0x0000u << 16) | HYPE_PCI_VENDOR_ID_HYPE)) {
+        hype_fatal("pci-1: host bridge vendor/device ID mismatch (got 0x%x)", got_hostbridge_id);
+    }
+    if (got_hostbridge_class != 0x06000000u) {
+        hype_fatal("pci-1: host bridge class code mismatch (got 0x%x)", got_hostbridge_class);
+    }
+    if (got_absent != 0xFFFFFFFFu) {
+        hype_fatal("pci-1: absent device did not read all-ones (got 0x%x)", got_absent);
+    }
+    if (got_bar_mask != 0xFFFFF000u) {
+        hype_fatal("pci-1: BAR size mask mismatch (got 0x%x)", got_bar_mask);
+    }
+    if (got_bar_addr != 0xE0100000u) {
+        hype_fatal("pci-1: BAR programmed address mismatch (got 0x%x)", got_bar_addr);
+    }
+
+    hype_debug_print(
+        "pci-1: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- host bridge id/class, "
+        "absent-device probe, BAR sizing all verified via ECAM\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+}
+
 /* Runs every test guest in sequence -- what actually gets dispatched
  * (inline on the BSP, or onto a pinned AP; see efi_main) so each new
  * milestone's test guest still exercises real 1:1 vCPU-to-pCPU
@@ -1575,6 +1757,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_video_2_ramfb_test(args->ops, args->kind);
     run_cpumsr_test(args->ops, args->kind);
     run_ram_1_test(args->ops, args->kind);
+    run_pci_1_test(args->ops, args->kind);
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {

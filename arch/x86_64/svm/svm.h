@@ -13,6 +13,7 @@
 #include "../../../devices/fw_cfg.h"
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
+#include "../../../devices/pci.h"
 #include "vmcb.h"
 
 /*
@@ -270,6 +271,32 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw);
  */
 int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
                                    uint64_t ahci_base_phys);
+
+/*
+ * Handles an NPF (PCI-1) VM-exit against `pci`, this project's own
+ * minimal ECAM-based PCI configuration-space model (devices/pci.h),
+ * mapped starting at guest-physical address `ecam_base_phys` and
+ * previously marked not-present via hype_npt_mark_not_present() --
+ * same MMIO-trap mechanism as every other NPF handler here, reusing
+ * the same instruction decode (hype_mmio_decode(), reading the
+ * faulting instruction directly out of guest memory at RIP) since ECAM
+ * is accessed via ordinary MOV instructions just like pflash's/AHCI's.
+ * Resolves the faulting guest-physical address into an ECAM byte
+ * offset, decodes it via hype_pci_decode_ecam_offset(), and dispatches
+ * to hype_pci_config_read()/_write() -- both of which always succeed
+ * (see devices/pci.h's own top comment for why a config-space access
+ * architecturally never faults the way a real memory access can), so
+ * unlike every other NPF handler here, this one has no "unrecognized
+ * access" failure mode of its own; it can still return -1 if the
+ * faulting instruction itself doesn't decode (an unsupported
+ * MOV/MOVZX form), matching hype_svm_vcpu_handle_npf()'s own
+ * convention for that case. Advances RIP past the decoded instruction.
+ * Exempt from unit testing -- reaches into the exempt VMCB fields this
+ * backend's real VMRUN produces; hype_pci_decode_ecam_offset(),
+ * hype_mmio_decode(), and hype_pci_config_read()/_write() are all
+ * already fully tested in isolation.
+ */
+int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uint64_t ecam_base_phys);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */

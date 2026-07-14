@@ -718,9 +718,53 @@ tasks — see updated deps below.*
 
 ## PCI — PCI configuration-space + host-bridge emulation
 
-- [ ] **PCI-1** — Minimal ECAM-based PCI host bridge + config space
+- [x] **PCI-1** — Minimal ECAM-based PCI host bridge + config space
   device model (ACPI MCFG already synthesized, M4-4).
   Deps: M4-4
+
+  *Confirmed via an existing code comment (`devices/acpi.h`'s own MCFG
+  field, "not yet backed by a real MMIO/PCI config-space device model")
+  that this was a known, already-flagged gap -- ACPI advertised an ECAM
+  window to guest firmware, but nothing responded to accesses within
+  it, so no guest PCI bus driver could discover any device at all,
+  including M4-5's AHCI controller.
+  New `devices/pci.h`/`.c`: a small, fixed bus-0-only topology (no
+  PCI-to-PCI bridges modeled -- every device presents a Type 0, not
+  Type 1, header, so compliant firmware never looks for a further bus;
+  single-function devices only, since the multi-function header bit is
+  never set). Config-space register layout (Vendor/Device ID, Command/
+  Status, Class Code, Header Type, BARs) is stable, decades-old PCI
+  Local Bus Specification knowledge, not something needing external
+  verification the way this session's AMD-specific VMCB work did.
+  Implements the standard BAR sizing/programming protocol (write
+  all-1s, read back the size mask; write a real address, read back
+  masked to the BAR's own alignment) and the "absent device reads as
+  all-1s" convention every real PCI bus-walk relies on to know where
+  the device list ends -- confirmed this project's placeholder vendor
+  ID (`HYPE_PCI_VENDOR_ID_HYPE`, not a real PCI-SIG assignment, same
+  "honest, not pretending compatibility" choice as CPUMSR-1's
+  "HypeHypeHype" CPUID signature) has no effect on real driver
+  compatibility, since AHCI-class drivers bind on class code, not
+  vendor/device ID. 100%/100%/96.88% region/line/branch covered.
+  Exempt glue `hype_svm_vcpu_handle_pci_ecam_npf()` (`svm_vcpu.c`)
+  reuses M4-3/M4-5's exact NPF/`hype_mmio_decode()` mechanism (ECAM is
+  accessed via ordinary MOV instructions) -- unlike every other NPF
+  handler here, `hype_pci_config_read()`/`_write()` always succeed
+  (config-space accesses architecturally never fault), so this handler
+  has no "unrecognized access" failure mode beyond the instruction
+  itself failing to decode.
+  Validated with a synthetic long-mode test guest: reads a registered
+  host bridge's vendor/device ID and class code, probes an absent
+  device (confirms the all-1s convention), and runs the full BAR
+  sizing/programming protocol against a fake AHCI-class device's BAR0
+  -- all via real ECAM MMIO accesses through the actual VM-exit path.
+  Found and fixed one real bug this way: the test payload's original
+  BAR-write instructions used `mov dword [mem], imm32` (opcode 0xC7,
+  immediate-to-memory), a form `hype_mmio_decode()` was never built to
+  support (every other test guest here loads a register first, then
+  stores it) -- fixed the test payload to match that existing
+  convention rather than extending the decoder. Clean QEMU run; every
+  other existing test guest (M2-7 through RAM-2) still halts cleanly.*
 - [ ] **PCI-2** — Expose the existing AHCI device (M4-5) as a
   discoverable PCI function (vendor/device ID, class code, ABAR as
   BAR5) instead of a fixed guest-physical address.

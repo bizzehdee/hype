@@ -510,6 +510,48 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
     return 0;
 }
 
+int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uint64_t ecam_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    hype_pci_ecam_addr_t addr;
+    uint64_t *reg;
+    const uint8_t *guest_bytes;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < ecam_base_phys) {
+        return -1;
+    }
+
+    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+
+    reg = gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    hype_pci_decode_ecam_offset(npf.guest_phys_addr - ecam_base_phys, &addr);
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        hype_pci_config_write(pci, &addr, decoded.size_bytes, value);
+    } else {
+        uint32_t value = 0;
+        hype_pci_config_read(pci, &addr, decoded.size_bytes, &value);
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
