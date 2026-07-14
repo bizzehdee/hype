@@ -1,31 +1,42 @@
 # Toolchain versions (SETUP-2)
 
-Pinned per `plan.md` §8/§11. Recorded from the current dev machine
-(Fedora Linux 44) so "works on my machine" doesn't creep in later. Any
-machine building `hype.efi` or running the QEMU loop should match these
-(or the change should be a deliberate, recorded bump to this file).
+Pinned per `plan.md` §8/§11. This records the minimum versions this
+project's build/dev loop has been validated against, not one specific
+machine — any machine building `hype.efi` or running the QEMU loop
+should meet or exceed these (or the change should be a deliberate,
+recorded bump to this file).
 
-| Component | Package | Version |
+| Component | Package | Minimum validated version |
 |---|---|---|
-| C compiler | `clang` | 22.1.8 (Fedora 22.1.8-1.fc44) |
+| C compiler | `clang` | 22.1.8 |
 | Linker | `lld` (`ld.lld`) | 22.1.8 |
 | Target triple | — | `x86_64-unknown-uefi` |
-| Emulator | `qemu-system-x86` | 10.2.2 (qemu-10.2.2-1.fc44) |
-| Guest firmware (dev loop) | `edk2-ovmf` | 20260508-4.fc44 |
-| Debugger | `gdb` | 17.1-6.fc44 |
+| Emulator | `qemu-system-x86` | 10.2.2 |
+| Guest firmware (dev loop) | `edk2-ovmf` | 20260508-4 |
+| Debugger | `gdb` | 17.1 |
 
-## OVMF firmware paths (this machine)
+## OVMF firmware paths
 
-Non-SEV/TDX, non-secure-boot pair used for the QEMU dev loop:
+The `run` target needs a non-SEV/TDX, non-secure-boot OVMF code/vars
+pair (Secure-Boot-capable variants also exist, typically named
+`OVMF_CODE.secboot.fd`/`OVMF_VARS.secboot.fd` — not used for v1 per §10
+decision #5). Where these live depends on the distro's packaging:
 
-- Code: `/usr/share/OVMF/OVMF_CODE.fd`
-- Vars: `/usr/share/OVMF/OVMF_VARS.fd`
+| Distro | Typical path |
+|---|---|
+| Fedora | `/usr/share/OVMF/OVMF_CODE.fd` / `OVMF_VARS.fd` |
+| Debian/Ubuntu | `/usr/share/OVMF/OVMF_CODE.fd` / `OVMF_VARS.fd` (package `ovmf`) |
 
-Secure-Boot-capable variants also exist (`OVMF_CODE.secboot.fd` /
-`OVMF_VARS.secboot.fd`) — not used for v1 per §10 decision #5 (Secure Boot
-disabled on test hardware; STRETCH-2 revisits signing later).
+The `Makefile`'s `OVMF_CODE`/`OVMF_VARS` variables default to the
+Fedora path above; override them if your install differs:
 
-QEMU machine type: `q35` (tested against `pc-q35-9.2`).
+```sh
+make OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd run
+```
+
+QEMU machine type: `q35` (validated against `pc-q35-9.2`; any `q35`
+revision that still supports this project's feature set — AHCI/fw_cfg/
+nested SVM under `-cpu host` — should work).
 
 ## Smoke-tested
 
@@ -45,7 +56,7 @@ Full boot-in-QEMU validation of this pipeline is M0-4/M0-5, not SETUP-2 —
 this only confirms the compiler/linker invocation itself produces a
 loadable EFI image.
 
-## Rebuilding this toolchain elsewhere
+## Installing this toolchain
 
 ```sh
 # Fedora

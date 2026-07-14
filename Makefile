@@ -34,8 +34,11 @@ OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRCS)) \
              $(patsubst %.S,$(BUILD_DIR)/%.o,$(ARCH_ASM_SRCS))
 OUT       := $(BUILD_DIR)/hype.efi
 
-OVMF_CODE := /usr/share/OVMF/OVMF_CODE.fd
-OVMF_VARS := /usr/share/OVMF/OVMF_VARS.fd
+# Fedora's edk2-ovmf path -- override on the command line (make
+# OVMF_CODE=... OVMF_VARS=... run) if your distro installs these
+# elsewhere (see docs/toolchain.md).
+OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE.fd
+OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS.fd
 ESP       := $(BUILD_DIR)/esp
 
 .PHONY: all clean test run
