@@ -949,3 +949,29 @@ own "keeping plan.md and task.md in sync" rule).
   pass (auth model, wire protocol, master-vs-mesh topology choice) before
   promotion to a real task.md epic, not just an API bolted onto existing
   per-VM management code.
+
+- **Dynamically-sizable (thin-provisioned) virtual disks, pooled across
+  one or more physical disks, encrypted and isolated per VM** (noted
+  2026-07-14). v1's storage model (M5's `blk_backend`, M10's physical-disk
+  target) is a virtual disk mapped to one fixed-size `file:` backing file
+  or one whole `physical:` device -- no thin provisioning, no pooling. v2
+  would let a virtual block device grow on demand (allocated space backed
+  by extents drawn from a shared pool spanning part or all of one or more
+  physical disks, not a single pre-sized file), so multiple VMs' virtual
+  disks share the same underlying physical capacity instead of each
+  needing its own dedicated, fully-reserved region. Two invariants that
+  must hold regardless of pooling: (1) **encryption** -- every VM's data
+  at rest, encrypted, with per-VM (not shared/global) key material, so
+  compromising one VM's stored data doesn't expose another's; (2)
+  **isolation** -- a VM must never be able to address, read, or infer the
+  existence of another VM's extents within the shared pool, even though
+  they physically coexist on the same disk(s) -- this is the same
+  guest-isolation invariant (AGENTS.md) M5/M10's per-VM `blk_backend`
+  already needs, just harder to keep true once backing storage is
+  literally shared/interleaved rather than physically separate files/
+  devices. This is a substantial new storage-management layer (an extent
+  allocator, a pool-spanning-multiple-disks abstraction, per-VM key
+  management/rotation, and probably a background reclamation/defrag
+  story for thin-provisioned space) -- deserves its own design pass
+  before promotion to a task.md epic, likely building on M5's
+  `blk_backend` vtable rather than replacing it.
