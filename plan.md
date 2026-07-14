@@ -863,3 +863,31 @@ skeleton to build on for M0, plus the repo layout from §7 and a build script
 (the lightweight clang/lld-or-GNU-EFI pipeline per §8, not EDK2 — that's
 reserved for the guest firmware blob) that produces a bootable `hype.efi`
 runnable in QEMU+OVMF.
+
+## 13. Future work (v2+, explicitly out of scope for v1)
+
+Ideas captured here are deliberately **not** on any `task.md` milestone —
+recording the intent now so it isn't lost, without pulling it into v1's
+scope or weakening any v1 hard invariant to make room for it. Nothing here
+should be implemented without first promoting it to a real `task.md` epic
+and, if it changes a v1 decision, updating §10 explicitly (per AGENTS.md's
+own "keeping plan.md and task.md in sync" rule).
+
+- **Real vCPU scheduler, replacing 1:1 exclusive pCPU pinning** (noted
+  2026-07-14). v1's hard invariant (§3, §10, AGENTS.md) is one vCPU
+  permanently and exclusively owning one pCPU — simple, and it's *why*
+  §6g's fault-isolation guarantee holds "by construction" (a hung guest
+  occupies only its own core, never one shared with another guest's
+  vCPU). A v2 direction is to replace this with hype's own scheduler:
+  multiple vCPUs (from the same or different guests) time-sliced across a
+  smaller pCPU pool, with optional config-driven affinity (e.g. pin
+  specific vCPUs/VMs to specific pCPUs when an operator wants that, but
+  don't require it). This is a materially bigger architectural change
+  than it sounds, because §6g's fault-isolation story would need a new
+  mechanism once "hung vCPU occupies only its own pCPU" is no longer true
+  by construction — likely some form of scheduling quantum/priority
+  guarantee enforced by the scheduler itself, replacing what pinning gave
+  for free. Any v2 work here must explicitly re-derive how fault
+  isolation holds under real scheduling before it can replace the
+  pinning invariant, not just drop the invariant and assume isolation
+  still holds.
