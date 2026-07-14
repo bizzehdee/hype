@@ -269,10 +269,23 @@ distinct from any guest's own console:
   needs for scheduling/debugging (exit counts, `HLT` time, last-scheduled
   timestamp) — the dashboard just renders state that already exists, it
   doesn't add new instrumentation surface.
-- **Rendering**: reuse the same GOP linear-framebuffer text renderer used
-  for the hypervisor's own boot/setup messages (§9 M1) — a simple bitmap
-  font blitter, no guest involvement, no dependency on any guest's video
-  state.
+- **Rendering** (updated 2026-07-14 — v1 scope, not just a stopgap): the
+  dashboard itself should read as **corporate-yet-modern**, not the raw
+  bitmap-font text console used for the hypervisor's own boot/setup
+  messages (§9 M1) — that renderer stays for early boot logging (it has
+  to; nothing richer exists that early), but the dashboard is a distinct,
+  later-stage UI layer built with an actual embedded GUI toolkit rather
+  than hand-rolled text/pixel blitting. Leading candidate: **LVGL**
+  (Light and Versatile Graphics Library) — MIT-licensed, C, designed for
+  exactly this kind of bare-metal/no-OS/no-libc target with a raw linear
+  framebuffer as its only display backend requirement, no guest
+  involvement, no dependency on any guest's video state. Confirm LVGL's
+  actual portability to this project's freestanding toolchain (no libc,
+  custom allocator, no filesystem) before committing to it over
+  hand-rolling; if it doesn't fit cleanly, evaluate alternatives with the
+  same bare-metal-friendly shape rather than falling back to a plain text
+  console by default. This decision needs revisiting when M8-1 is
+  actually scoped/started, not decided in the abstract now.
 - **Navigation**: arrow keys / number keys to select a VM from the list and
   switch the framebuffer + keyboard focus to that guest's own console;
   another hotkey press returns to the dashboard. **Input exclusivity while
@@ -915,3 +928,24 @@ own "keeping plan.md and task.md in sync" rule).
   for the floor/ceiling and probably a host-side reclamation policy
   (§6i's admission-control math would also need to account for "ceiling,"
   not just a fixed size, when validating total host RAM commitment).
+
+- **Web API/UI for remote management, with multi-hypervisor
+  master/mesh linking** (noted 2026-07-14). v1 has no remote management
+  surface at all -- everything is local (hype.cfg on the host's own ESP,
+  local console/serial output). v2 would add a web API/UI allowing remote
+  management of a single hypervisor instance, plus a way to link multiple
+  "secondary" hypervisor instances under one "master" for centralized
+  management, or (an alternative topology to design between, not both by
+  default) have instances manage each other directly as a mesh with no
+  single master. Security and encryption are explicitly paramount for
+  this surface, not an afterthought -- this is a new, network-exposed
+  attack surface on a type-1 hypervisor, so authentication, transport
+  encryption (TLS at minimum), and authorization between instances all
+  need to be designed in from the start, not bolted on. The UI itself
+  should read as corporate-yet-modern, not a bare admin-panel aesthetic.
+  This is a large, separate subsystem (its own network stack usage
+  building on NET-*, a new API surface, a new UI, and a new inter-
+  instance trust/protocol model) -- deserves its own dedicated design
+  pass (auth model, wire protocol, master-vs-mesh topology choice) before
+  promotion to a real task.md epic, not just an API bolted onto existing
+  per-VM management code.
