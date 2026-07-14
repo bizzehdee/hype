@@ -6,6 +6,7 @@
 #include "../cpu/vmm_ops.h"
 #include "../cpu/mmio_decode.h"
 #include "../cpu/cpuid_emulate.h"
+#include "../cpu/msr_emulate.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
 #include "../../../devices/pflash.h"
@@ -146,6 +147,26 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
  * itself is already fully tested in isolation.
  */
 void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
+
+/*
+ * Handles an MSR (CPUMSR-2, RDMSR/WRMSR) VM-exit: decodes direction
+ * from EXITINFO1 bit 0 (0=RDMSR, 1=WRMSR, per AMD SDM) and the MSR
+ * number from RCX, calls hype_msr_decide() (arch/x86_64/cpu/
+ * msr_emulate.h) to look it up on this project's small allow-list, and
+ * either services it (APIC_BASE synthesized read, EFER routed to/from
+ * the VMCB's own save.efer, TSC computed via a real RDTSC plus the
+ * VMCB's own tsc_offset) or returns -1 for anything not on the
+ * allow-list -- the caller's job to treat as fatal, matching every
+ * other unrecognized-access convention here (IOIO/NPF/CPUID). On
+ * success, advances RIP by 2 (RDMSR/WRMSR's own fixed instruction
+ * length, same convenience hype_svm_vcpu_handle_cpuid() already
+ * relies on). Exempt from unit testing -- reaches into the exempt
+ * VMCB/GPR fields this backend's real VMRUN produces and executes a
+ * real RDTSC instruction; hype_msr_decide()/hype_msr_apic_base_value()
+ * are already fully tested in isolation. Returns 0 on success, -1 for
+ * a rejected MSR.
+ */
+int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx);
 
 /*
  * Handles an NPF (M4-3) VM-exit against `pf`, an emulated CFI flash

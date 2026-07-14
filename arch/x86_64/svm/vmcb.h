@@ -139,6 +139,20 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
  * arch/x86_64/cpu/cpuid_emulate.h for what the guest sees instead.
  */
 #define HYPE_SVM_INTERCEPT_CPUID (1u << 18)
+/*
+ * CPUMSR-2: intercept every guest RDMSR/WRMSR (bit 28 of
+ * intercept_misc1 -- this file's own comment already documented this
+ * bit's position, just never defined/set it). Enabling this bit alone
+ * isn't sufficient by itself -- VMRUN also always consults the MSR
+ * permission bitmap (msrpm_base_pa) to decide whether any *specific*
+ * MSR actually traps; this project fills that bitmap with 0xFF
+ * (svm_vcpu.c, mirroring g_iopm's own existing "intercept everything"
+ * pattern) so every MSR does. Without either the intercept bit or a
+ * filled bitmap, every guest RDMSR/WRMSR reaches real hardware
+ * unmediated -- the same class of guest-isolation gap
+ * HYPE_SVM_INTERCEPT_CPUID fixed for CPUID.
+ */
+#define HYPE_SVM_INTERCEPT_MSR_PROT (1u << 28)
 /* intercept_misc2 bit 0: intercept the guest ever executing VMRUN
  * itself. Required for two independent reasons: (1) under nested SVM
  * (this project's own dev/QEMU environment, and any real deployment
@@ -192,6 +206,7 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 #define HYPE_SVM_EXITCODE_SHUTDOWN 0x7FULL
 #define HYPE_SVM_EXITCODE_IOIO 0x7BULL
 #define HYPE_SVM_EXITCODE_CPUID 0x72ULL
+#define HYPE_SVM_EXITCODE_MSR 0x7CULL
 #define HYPE_SVM_EXITCODE_NPF 0x400ULL
 #define HYPE_SVM_EXITCODE_INVALID 0xFFFFFFFFFFFFFFFFULL /* VMRUN itself failed (bad VMCB state) */
 

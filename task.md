@@ -602,8 +602,51 @@ tasks — see updated deps below.*
   via `hype_cpuid_emulate()` fed with its own real CPUID output,
   confirming a byte-for-byte match -- proving the whole VM-exit path,
   not just the pure decode logic. Clean QEMU run.*
-- [ ] **CPUMSR-2** — MSR intercept baseline (RDMSR/WRMSR).
+- [x] **CPUMSR-2** — MSR intercept baseline (RDMSR/WRMSR).
   Deps: CPUMSR-1
+
+  *Confirmed via grep that `g_msrpm` was wired into both VMCBs'
+  `msrpm_base_pa` but never filled -- stayed all-zero ("intercept
+  nothing"), unlike `g_iopm` (filled with 0xFF for the long-mode
+  guest). Every guest RDMSR/WRMSR reached real hardware unmediated, the
+  same class of gap CPUMSR-1 fixed for CPUID.
+  Adds `HYPE_SVM_INTERCEPT_MSR_PROT` (bit 28 of intercept_misc1 --
+  this project's own comment already documented this bit's position,
+  just never defined/set it) and `HYPE_SVM_EXITCODE_MSR` (0x7C) to
+  `vmcb.h`. Set in both VMCB builders; `g_msrpm` filled with 0xFF in
+  both guest-create paths (`svm_vcpu.c`), mirroring `g_iopm`'s own
+  existing pattern exactly -- the intercept bit alone is not
+  sufficient, VMRUN always consults the bitmap to decide whether any
+  *specific* MSR actually traps.
+  New pure-logic module `arch/x86_64/cpu/msr_emulate.h`/`.c`
+  (`hype_msr_decide()`) is a small, explicit allow-list rather than a
+  full MSR emulation layer -- CPUMSR-1's leaf-1 MTRR bit is already
+  forced clear specifically so well-behaved guest software never
+  attempts an MTRR MSR access, narrowing what actually needs handling
+  here: `APIC_BASE` (read-only, a fixed synthesized value --
+  `hype_msr_apic_base_value()` -- built from `lapic.h`'s
+  `HYPE_LAPIC_DEFAULT_BASE` with Global Enable/BSP bits set, matching
+  M2-4's AVIC scope), `EFER` (read/write, routed directly to/from the
+  VMCB's own already-tracked `save.efer` field), `TSC` (read-only,
+  real `rdtsc()` plus the VMCB's own `tsc_offset` control field).
+  Everything else is fail-closed, matching every other unrecognized-
+  access convention already established (IOIO/NPF/CPUID) -- to be
+  iterated based on what a real OVMF/GRUB/Linux boot log actually
+  demands. 100%/100%/100% region/line/branch covered.
+  Exempt glue `hype_svm_vcpu_handle_msr()` (`svm_vcpu.c`) decodes
+  direction from EXITINFO1 bit 0 and the MSR number from RCX, executes
+  a real RDTSC when needed, and returns -1 for a rejected MSR (the
+  caller's job to treat as fatal).
+  Validated by extending CPUMSR-1's own test guest: after its three
+  CPUID leaves, it now also issues RDMSR against APIC_BASE and EFER
+  (writes deliberately not exercised here -- WRMSR against a guest's
+  own EFER mid-test risks destabilizing its long-mode state, not worth
+  the risk for a baseline test) and stores both results into the same
+  host-inspectable buffer; the host confirms APIC_BASE matches
+  `hype_msr_apic_base_value()` exactly and EFER's returned value is a
+  plausible 64-bit-mode EFER (SVME set). Clean QEMU run; every other
+  existing test guest (M2-7 through VIDEO-2) still halts cleanly with
+  both intercepts now active.*
 
 ---
 

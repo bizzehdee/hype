@@ -150,6 +150,19 @@ static void reset_gprs(void) {
 }
 
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root) {
+    unsigned i;
+
+    /* CPUMSR-2: this guest now sets HYPE_SVM_INTERCEPT_MSR_PROT
+     * (hype_vmcb_build_realmode_guest()) -- same "the bit only enables
+     * interception, the bitmap decides per-MSR" reasoning as
+     * hype_svm_vcpu_create_long_mode()'s own g_iopm fill below. All-
+     * zero (BSS default) would mean "intercept nothing," letting every
+     * guest RDMSR/WRMSR reach real hardware directly despite the
+     * intercept bit being set. */
+    for (i = 0; i < sizeof(g_msrpm); i++) {
+        g_msrpm[i] = 0xFFu;
+    }
+
     hype_vmcb_build_realmode_guest(&g_vmcb, guest_rip, guest_rsp, (uint64_t)(uintptr_t)g_iopm,
                                     (uint64_t)(uintptr_t)g_msrpm);
 
@@ -184,6 +197,12 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
      * every byte with 0xFF marks every port as intercepted. */
     for (i = 0; i < sizeof(g_iopm); i++) {
         g_iopm[i] = 0xFFu;
+    }
+
+    /* CPUMSR-2: same reasoning as the IOPM fill just above, now for
+     * HYPE_SVM_INTERCEPT_MSR_PROT. */
+    for (i = 0; i < sizeof(g_msrpm); i++) {
+        g_msrpm[i] = 0xFFu;
     }
 
     hype_vmcb_build_long_mode_guest(&g_vmcb, entry_rip, guest_cr3, rsp, (uint64_t)(uintptr_t)g_iopm,
@@ -297,6 +316,52 @@ void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     real->gprs[2] = out.edx; /* RDX */
 
     real->vmcb->save.rip += 2; /* CPUID is always exactly 2 bytes (0F A2) */
+}
+
+/* Runs the real `rdtsc` instruction. Exempt from unit testing, same
+ * reasoning as real_cpuid() above. */
+static inline uint64_t real_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int is_write = (real->vmcb->control.exitinfo1 & 0x1ULL) != 0;
+    uint32_t msr_number = (uint32_t)real->gprs[1]; /* RCX */
+    hype_msr_action_t action = hype_msr_decide(msr_number, is_write);
+
+    switch (action) {
+    case HYPE_MSR_ACTION_READ_APIC_BASE: {
+        uint64_t value = hype_msr_apic_base_value();
+        real->vmcb->save.rax = (uint64_t)(uint32_t)value;
+        real->gprs[2] = (uint64_t)(uint32_t)(value >> 32); /* RDX */
+        break;
+    }
+    case HYPE_MSR_ACTION_READWRITE_EFER:
+        if (is_write) {
+            uint64_t value =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+            real->vmcb->save.efer = value;
+        } else {
+            real->vmcb->save.rax = (uint64_t)(uint32_t)real->vmcb->save.efer;
+            real->gprs[2] = (uint64_t)(uint32_t)(real->vmcb->save.efer >> 32);
+        }
+        break;
+    case HYPE_MSR_ACTION_READ_TSC: {
+        uint64_t tsc = real_rdtsc() + real->vmcb->control.tsc_offset;
+        real->vmcb->save.rax = (uint64_t)(uint32_t)tsc;
+        real->gprs[2] = (uint64_t)(uint32_t)(tsc >> 32);
+        break;
+    }
+    case HYPE_MSR_ACTION_REJECT:
+    default:
+        return -1;
+    }
+
+    real->vmcb->save.rip += 2; /* RDMSR/WRMSR are always exactly 2 bytes (0F 32 / 0F 30) */
+    return 0;
 }
 
 /* Max bytes hype_mmio_decode() could ever need for the narrow

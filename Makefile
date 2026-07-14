@@ -21,7 +21,7 @@ ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/id
              arch/x86_64/cpu/pit_hw.c arch/x86_64/cpu/timer.c arch/x86_64/cpu/timer_isr.c \
              arch/x86_64/cpu/cpu_features.c arch/x86_64/cpu/cpu_features_hw.c \
              arch/x86_64/cpu/vmm_select.c arch/x86_64/cpu/vmexit.c arch/x86_64/cpu/mmio_decode.c \
-             arch/x86_64/cpu/cpuid_emulate.c \
+             arch/x86_64/cpu/cpuid_emulate.c arch/x86_64/cpu/msr_emulate.c \
              arch/x86_64/svm/svm_bits.c arch/x86_64/svm/svm_enable_hw.c arch/x86_64/svm/svm_ops.c \
              arch/x86_64/svm/vmcb.c arch/x86_64/svm/svm_vcpu.c arch/x86_64/svm/npt.c \
              arch/x86_64/vmx/vmx_bits.c arch/x86_64/vmx/vmx_enable_hw.c arch/x86_64/vmx/vmx_ops.c \
