@@ -5,6 +5,7 @@
 
 #include "../cpu/vmm_ops.h"
 #include "../cpu/mmio_decode.h"
+#include "../cpu/cpuid_emulate.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
 #include "../../../devices/pflash.h"
@@ -125,6 +126,26 @@ void hype_svm_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi);
  * already fully tested in isolation.
  */
 int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit);
+
+/*
+ * Handles a CPUID (CPUMSR-1) VM-exit: reads the guest's requested
+ * leaf/subleaf from RAX/RCX, executes the real `cpuid` instruction for
+ * that same leaf/subleaf (a plain hardware read -- not guest-visible
+ * until hype_cpuid_emulate() has curated it), calls
+ * hype_cpuid_emulate() (arch/x86_64/cpu/cpuid_emulate.h) to decide what
+ * the guest should actually see, writes the result into RAX/RBX/RCX/
+ * RDX (zero-extending each to the full 64-bit register, matching real
+ * CPUID's own architectural behavior in 64-bit mode), and advances RIP
+ * by 2 (CPUID's own fixed instruction length -- no ModRM/operand
+ * decoding needed, unlike hype_svm_vcpu_handle_npf()'s MMIO path).
+ * Always succeeds -- there is no "unrecognized CPUID leaf" failure
+ * mode, hype_cpuid_emulate() has a safe all-zero fallback for
+ * anything it doesn't explicitly handle. Exempt from unit testing --
+ * reaches into the exempt VMCB/GPR fields this backend's real VMRUN
+ * produces and executes a real CPUID instruction; hype_cpuid_emulate()
+ * itself is already fully tested in isolation.
+ */
+void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
 
 /*
  * Handles an NPF (M4-3) VM-exit against `pf`, an emulated CFI flash

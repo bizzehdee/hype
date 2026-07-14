@@ -128,6 +128,17 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 /* Intercept bits this project actually sets (Table B-1). */
 #define HYPE_SVM_INTERCEPT_HLT (1u << 24)
 #define HYPE_SVM_INTERCEPT_SHUTDOWN (1u << 31)
+/*
+ * CPUMSR-1: intercept every guest CPUID (bit 18 of intercept_misc1's
+ * "Intercept Vector 3" layout -- cross-referenced against the AMD SDM
+ * and internally consistent with this file's own already-established
+ * neighboring bits, all from the same real table: HLT=24, IOIO_PROT=27,
+ * MSR_PROT=28, SHUTDOWN=31). Without this, CPUID executes natively
+ * against the real host CPU with zero mediation -- a guest-isolation
+ * gap (AGENTS.md) surfaced while scoping M4-6; see
+ * arch/x86_64/cpu/cpuid_emulate.h for what the guest sees instead.
+ */
+#define HYPE_SVM_INTERCEPT_CPUID (1u << 18)
 /* intercept_misc2 bit 0: intercept the guest ever executing VMRUN
  * itself. Required for two independent reasons: (1) under nested SVM
  * (this project's own dev/QEMU environment, and any real deployment
@@ -180,6 +191,7 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 #define HYPE_SVM_EXITCODE_HLT 0x78ULL
 #define HYPE_SVM_EXITCODE_SHUTDOWN 0x7FULL
 #define HYPE_SVM_EXITCODE_IOIO 0x7BULL
+#define HYPE_SVM_EXITCODE_CPUID 0x72ULL
 #define HYPE_SVM_EXITCODE_NPF 0x400ULL
 #define HYPE_SVM_EXITCODE_INVALID 0xFFFFFFFFFFFFFFFFULL /* VMRUN itself failed (bad VMCB state) */
 

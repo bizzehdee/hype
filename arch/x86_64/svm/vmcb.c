@@ -37,10 +37,13 @@ void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint
         bytes[i] = 0;
     }
 
-    /* Intercept HLT (the guest's only instruction, M2-7) and shutdown
+    /* Intercept HLT (the guest's only instruction, M2-7), shutdown
      * (a triple fault -- no exception handling exists yet, so a
-     * shutdown must come back to us rather than reset the machine). */
-    vmcb->control.intercept_misc1 = HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN;
+     * shutdown must come back to us rather than reset the machine),
+     * and CPUID (CPUMSR-1 -- guest-isolation baseline: without this,
+     * CPUID executes natively against the real host CPU). */
+    vmcb->control.intercept_misc1 =
+        HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN | HYPE_SVM_INTERCEPT_CPUID;
     vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_VMRUN;
 
     vmcb->control.iopm_base_pa = iopm_phys;
@@ -124,8 +127,10 @@ void hype_vmcb_build_long_mode_guest(hype_vmcb_t *vmcb, uint64_t entry_rip, uint
         bytes[i] = 0;
     }
 
-    vmcb->control.intercept_misc1 =
-        HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN | HYPE_SVM_INTERCEPT_IOIO_PROT;
+    /* CPUMSR-1: CPUID intercepted here too, same guest-isolation
+     * baseline reasoning as hype_vmcb_build_realmode_guest() above. */
+    vmcb->control.intercept_misc1 = HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN |
+                                     HYPE_SVM_INTERCEPT_IOIO_PROT | HYPE_SVM_INTERCEPT_CPUID;
     vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_VMRUN;
 
     vmcb->control.iopm_base_pa = iopm_phys;

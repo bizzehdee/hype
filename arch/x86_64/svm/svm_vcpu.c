@@ -267,6 +267,38 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
     return 0;
 }
 
+/* Runs the real `cpuid` instruction for (eax, ecx). Exempt from unit
+ * testing per AGENTS.md -- same reasoning as cpu_features_hw.c's own
+ * cpuid() helper (which this deliberately mirrors): the actual
+ * decision logic (hype_cpuid_emulate()) is what's tested; this is just
+ * the raw leaf read. */
+static inline void real_cpuid(uint32_t eax, uint32_t ecx, hype_cpuid_result_t *out) {
+    __asm__ volatile("cpuid"
+                      : "=a"(out->eax), "=b"(out->ebx), "=c"(out->ecx), "=d"(out->edx)
+                      : "a"(eax), "c"(ecx));
+}
+
+void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    uint32_t eax_in = (uint32_t)real->vmcb->save.rax;
+    uint32_t ecx_in = (uint32_t)real->gprs[1]; /* RCX */
+    hype_cpuid_result_t host_real;
+    hype_cpuid_result_t out;
+
+    real_cpuid(eax_in, ecx_in, &host_real);
+    hype_cpuid_emulate(eax_in, ecx_in, &host_real, &out);
+
+    /* CPUID zero-extends all four registers to their full 64-bit width
+     * in 64-bit mode -- assigning a uint32_t into a uint64_t field
+     * already does that zero-extension. */
+    real->vmcb->save.rax = out.eax;
+    real->gprs[3] = out.ebx; /* RBX */
+    real->gprs[1] = out.ecx; /* RCX */
+    real->gprs[2] = out.edx; /* RDX */
+
+    real->vmcb->save.rip += 2; /* CPUID is always exactly 2 bytes (0F A2) */
+}
+
 /* Max bytes hype_mmio_decode() could ever need for the narrow
  * instruction forms it supports (prefix + REX + two-byte opcode +
  * ModRM + SIB + disp32 -- the longest case, MOVZX with a SIB-plus-

@@ -556,8 +556,52 @@ tasks — see updated deps below.*
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
 ## invariant; a gap M4-6's own scoping surfaced, 2026-07-14)
 
-- [ ] **CPUMSR-1** — CPUID intercept + minimal safe/synthesized leaf set.
+- [x] **CPUMSR-1** — CPUID intercept + minimal safe/synthesized leaf set.
   Deps: M2-3
+
+  *Confirmed via grep that CPUID previously had zero interception at
+  all -- executed natively against the real host CPU, a guest-
+  isolation gap surfaced while scoping M4-6. Adds
+  `HYPE_SVM_INTERCEPT_CPUID` (bit 18 of intercept_misc1) and
+  `HYPE_SVM_EXITCODE_CPUID` (0x72) to `vmcb.h`, cross-referenced
+  against the AMD SVM Intercept Vector 3 layout and Appendix C exit
+  codes -- confirmed internally consistent with this project's own
+  already-established neighboring constants (HLT=24/0x78,
+  IOIO_PROT=27/0x7B, MSR_PROT=28/0x7C, SHUTDOWN=31/0x7F all come from
+  the same real table). Set in both VMCB builders (`vmcb.c`) -- a
+  correctness fix applying retroactively to every existing test guest,
+  though none of them execute CPUID so no behavior change for M2-7
+  through VIDEO-2's own tests.
+  New pure-logic module `arch/x86_64/cpu/cpuid_emulate.h`/`.c`
+  (`hype_cpuid_emulate()`) synthesizes a deliberately minimal leaf set
+  rather than reinventing every field from scratch: reads the real
+  host CPU's own CPUID result for the same leaf/subleaf and passes
+  most fields straight through (family/model/stepping and most feature
+  bits aren't isolation-sensitive), curating only what matters --
+  max basic/extended leaf capped at 1/0x80000001 so well-behaved guest
+  software never reaches an unhandled leaf (anything else safely
+  returns all-zero, the same convention real hardware uses for a
+  reserved leaf); leaf 1's hypervisor-present bit (ECX 31) forced set
+  and MTRR bit (EDX 12) forced clear (so guest software doesn't attempt
+  MTRR MSR access this project doesn't emulate, narrowing CPUMSR-2's
+  own scope); leaf 0x80000001's SVM bit (ECX 2) forced clear (this
+  project doesn't emulate nested SVM for guests, so must not advertise
+  it); leaf 0x40000000 (the Xen/KVM/Hyper-V/VMware hypervisor-CPUID
+  convention) reports a distinct, honest "HypeHypeHype" signature, not
+  pretending compatibility with any of those (that's M7-1's later,
+  Windows-specific job). 100%/100%/100% region/line/branch covered.
+  Exempt glue `hype_svm_vcpu_handle_cpuid()` (`svm_vcpu.c`) executes
+  the real `cpuid` instruction (mirrors `cpu_features_hw.c`'s own
+  `cpuid()` helper), calls `hype_cpuid_emulate()`, writes EAX/EBX/ECX/
+  EDX back (zero-extended, matching CPUID's own 64-bit-mode behavior),
+  advances RIP by 2 (CPUID's fixed instruction length).
+  Validated end-to-end with a new synthetic long-mode test guest:
+  issues real CPUID for leaves 0/1/0x40000000, stores each result into
+  a host-inspectable buffer via ordinary guest-RAM writes (no MMIO/NPF
+  involved), and the host independently recomputes the expected result
+  via `hype_cpuid_emulate()` fed with its own real CPUID output,
+  confirming a byte-for-byte match -- proving the whole VM-exit path,
+  not just the pure decode logic. Clean QEMU run.*
 - [ ] **CPUMSR-2** — MSR intercept baseline (RDMSR/WRMSR).
   Deps: CPUMSR-1
 

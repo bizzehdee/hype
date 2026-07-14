@@ -1186,6 +1186,169 @@ static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t ki
         (unsigned long long)framebuffer_phys, decoded.width, decoded.height);
 }
 
+/*
+ * CPUMSR-1: exercises the new CPUID VM-exit path
+ * (hype_svm_vcpu_handle_cpuid(), arch/x86_64/svm/svm_vcpu.c) end-to-
+ * end, not just hype_cpuid_emulate() in isolation -- proves the VMCB
+ * intercept bit, exit-code dispatch, and register write-back all
+ * actually work together. Guest executes real CPUID for leaves 0, 1,
+ * and the hypervisor-signature leaf (0x40000000), storing each
+ * result's EAX/EBX/ECX/EDX into a host-inspectable guest buffer via
+ * RDI-relative stores (ordinary guest-RAM writes, no MMIO/NPF
+ * involved -- unlike M4-3/M4-5's device tests).
+ */
+static uint8_t g_cpumsr_1_guest_code[128] __attribute__((aligned(4096)));
+static uint8_t g_cpumsr_1_guest_stack[4096] __attribute__((aligned(4096)));
+static uint8_t g_cpumsr_1_result_buf[48] __attribute__((aligned(16)));
+
+/*
+ *   mov rdi, <patched: result_buf guest-physical address>
+ *                                        48 BF 00 00 00 00 00 00 00 00
+ *   mov eax, 0                           B8 00 00 00 00
+ *   cpuid                                0F A2
+ *   mov [rdi+0], eax                     89 47 00
+ *   mov [rdi+4], ebx                     89 5F 04
+ *   mov [rdi+8], ecx                     89 4F 08
+ *   mov [rdi+12], edx                    89 57 0C
+ *   mov eax, 1                           B8 01 00 00 00
+ *   cpuid                                0F A2
+ *   mov [rdi+16], eax                    89 47 10
+ *   mov [rdi+20], ebx                    89 5F 14
+ *   mov [rdi+24], ecx                    89 4F 18
+ *   mov [rdi+28], edx                    89 57 1C
+ *   mov eax, 0x40000000                  B8 00 00 00 40
+ *   cpuid                                0F A2
+ *   mov [rdi+32], eax                    89 47 20
+ *   mov [rdi+36], ebx                    89 5F 24
+ *   mov [rdi+40], ecx                    89 4F 28
+ *   mov [rdi+44], edx                    89 57 2C
+ *   hlt                                  F4
+ *   jmp $-3                              EB FD
+ */
+static const uint8_t g_cpumsr_1_payload_template[] = {
+    0x48, 0xBF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x0F, 0xA2,
+    0x89, 0x47, 0x00,
+    0x89, 0x5F, 0x04,
+    0x89, 0x4F, 0x08,
+    0x89, 0x57, 0x0C,
+    0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x0F, 0xA2,
+    0x89, 0x47, 0x10,
+    0x89, 0x5F, 0x14,
+    0x89, 0x4F, 0x18,
+    0x89, 0x57, 0x1C,
+    0xB8, 0x00, 0x00, 0x00, 0x40,
+    0x0F, 0xA2,
+    0x89, 0x47, 0x20,
+    0x89, 0x5F, 0x24,
+    0x89, 0x4F, 0x28,
+    0x89, 0x57, 0x2C,
+    0xF4,
+    0xEB, 0xFD
+};
+#define HYPE_CPUMSR_1_PAYLOAD_RDI_IMM_OFFSET 2
+
+static void run_cpumsr_1_cpuid_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, result_buf_phys;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+    hype_cpuid_result_t real, expected;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("cpumsr-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n",
+                           ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_cpumsr_1_guest_code, sizeof(g_cpumsr_1_guest_code));
+    hype_guest_ram_zero(g_cpumsr_1_guest_stack, sizeof(g_cpumsr_1_guest_stack));
+    hype_guest_ram_zero(g_cpumsr_1_result_buf, sizeof(g_cpumsr_1_result_buf));
+
+    result_buf_phys = (uint64_t)(uintptr_t)g_cpumsr_1_result_buf;
+
+    for (i = 0; i < sizeof(g_cpumsr_1_payload_template); i++) {
+        g_cpumsr_1_guest_code[i] = g_cpumsr_1_payload_template[i];
+    }
+    hype_write_le64(g_cpumsr_1_guest_code + HYPE_CPUMSR_1_PAYLOAD_RDI_IMM_OFFSET, result_buf_phys);
+
+    entry_rip = (uint64_t)(uintptr_t)g_cpumsr_1_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_cpumsr_1_guest_stack + sizeof(g_cpumsr_1_guest_stack));
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_debug_print("cpumsr-1: entry_rip=0x%llx result_buf=0x%llx\n", (unsigned long long)entry_rip,
+                      (unsigned long long)result_buf_phys);
+
+    /* No NPT for this test -- pure register/memory-write test, no
+     * MMIO-trapped device involved (same reasoning as M4-4's fw_cfg
+     * test). */
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    if (ctx == 0) {
+        hype_fatal("cpumsr-1: vcpu_create_long_mode failed");
+    }
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("cpumsr-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
+            hype_svm_vcpu_handle_cpuid(ctx);
+            continue;
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("cpumsr-1: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+
+    /* Host independently recomputes the same expected result via
+     * hype_cpuid_emulate() (already fully unit tested in isolation)
+     * fed with the real host CPU's own CPUID output for each leaf, and
+     * confirms the guest's VM-exit-mediated result matches byte-for-
+     * byte -- proving the whole intercept path, not just the pure
+     * decode logic. */
+    for (i = 0; i < 3; i++) {
+        uint32_t eax_in = (i == 0) ? 0u : (i == 1) ? 1u : 0x40000000u;
+        const uint8_t *slot = g_cpumsr_1_result_buf + i * 16;
+        uint32_t got_eax, got_ebx, got_ecx, got_edx;
+
+        __asm__ volatile("cpuid"
+                          : "=a"(real.eax), "=b"(real.ebx), "=c"(real.ecx), "=d"(real.edx)
+                          : "a"(eax_in), "c"(0));
+        hype_cpuid_emulate(eax_in, 0, &real, &expected);
+
+        got_eax = (uint32_t)slot[0] | ((uint32_t)slot[1] << 8) | ((uint32_t)slot[2] << 16) |
+                  ((uint32_t)slot[3] << 24);
+        got_ebx = (uint32_t)slot[4] | ((uint32_t)slot[5] << 8) | ((uint32_t)slot[6] << 16) |
+                  ((uint32_t)slot[7] << 24);
+        got_ecx = (uint32_t)slot[8] | ((uint32_t)slot[9] << 8) | ((uint32_t)slot[10] << 16) |
+                  ((uint32_t)slot[11] << 24);
+        got_edx = (uint32_t)slot[12] | ((uint32_t)slot[13] << 8) | ((uint32_t)slot[14] << 16) |
+                  ((uint32_t)slot[15] << 24);
+
+        if (got_eax != expected.eax || got_ebx != expected.ebx || got_ecx != expected.ecx ||
+            got_edx != expected.edx) {
+            hype_fatal("cpumsr-1: CPUID leaf 0x%x mismatch (got eax=0x%x ebx=0x%x ecx=0x%x edx=0x%x, "
+                       "expected eax=0x%x ebx=0x%x ecx=0x%x edx=0x%x)",
+                       eax_in, got_eax, got_ebx, got_ecx, got_edx, expected.eax, expected.ebx,
+                       expected.ecx, expected.edx);
+        }
+    }
+
+    hype_debug_print(
+        "cpumsr-1: CPUID test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- leaves "
+        "0/1/0x40000000 verified byte-for-byte via the real VM-exit path\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+}
+
 /* Runs every test guest in sequence -- what actually gets dispatched
  * (inline on the BSP, or onto a pinned AP; see efi_main) so each new
  * milestone's test guest still exercises real 1:1 vCPU-to-pCPU
@@ -1198,6 +1361,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_m4_4_fw_cfg_test(args->ops, args->kind);
     run_m4_5_ahci_test(args->ops, args->kind);
     run_video_2_ramfb_test(args->ops, args->kind);
+    run_cpumsr_1_cpuid_test(args->ops, args->kind);
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
