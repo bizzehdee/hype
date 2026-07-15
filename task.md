@@ -7,6 +7,69 @@ epics with no dependency between them can run in parallel.
 
 Checkbox = done. `Deps: —` = no prerequisites.
 
+---
+
+## Execution status & dependency graph (reconciled 2026-07-16)
+
+Snapshot of all open tasks vs. what's actually done. Done through: SETUP,
+M0-1..4, M1, ADM, M2-1..7, M3-1..5, INT-1/2, INPUT-1..4, VIDEO-1/2/3,
+M4-1..5, CPUMSR-1/2, RAM-1/2, PCI-1/2, ISO-1/2, M5-1/2, FW-1a..e, FW-2.
+**FW-1 (real OVMF boot) is DONE and hardware-confirmed**; FW-1f (guest
+console input) is partial → continues as FW-1g.
+
+**READY NOW (no unmet dependency):**
+- `FW-1h` — bootable CD in the OVMF guest → the bridge to M4-6
+- `FW-1g` — guest keyboard input (investigation; sharp finding in hand)
+- `VALID-1` — guest addr/length bounds-check helper (unblocks VALID-2/3/4,
+  M5-3, NET-2/3; closes a real security gap)
+- `NET-1` — virtio-net device baseline
+- `M7-1` — Windows-facing CPUID/hypervisor-vendor leaves
+- `M7-3` — Windows input/display plumbing (INPUT-1/2 + VIDEO-3 all done)
+- `M8-1` — GOP dashboard surface; `M8-2` — per-VM stats; `M8-5` — pause/resume
+- `TERM-1` — GOP terminal surface (but TERM-2/3 gate on M8 — see below)
+- real-hardware-gated (need a physical run, not code): `M0-5`, `M2-8`,
+  `M3-6`, `M8-10`
+
+**Recommended order (value + dependency):**
+`FW-1h → M4-6` (boot an installer — no input needed, BDS auto-boots the CD),
+then `FW-1g` (drive it), then the install chain `VALID-1 → VALID-3 → M5-3
+→ M5-4 → M5-5 → M5-6`. `NET-1`, `M7-1`/`M7-3`, `M8-1`/`M8-2`/`M8-5` are
+independent and can run in parallel whenever picked up.
+
+**Critical paths (→ = "then"):**
+- Boot an OS installer: **FW-1h → M4-6**
+- Install an OS to disk: **VALID-1 → VALID-3 → M5-3 → M5-4 → M5-5 → M5-6**
+  (M5-5 also needs M4-6 ✓-after-above and NET-5)
+- Networking: **NET-1 → {NET-2 (needs VALID-2), NET-3 (needs VALID-1),
+  NET-4 → NET-4a → NET-4b} → NET-5**
+- Windows guest: **M7-1 → M7-2 → M7-4** (M7-3 parallel)
+- BSD guest: **M5-6 → M6-1 → M6-2**
+- Multi-VM + management UI: **{M8-1, M8-2, M8-5} → M8-3 → M8-3a**, and
+  **M8-4 (needs M6-2 + M7-4) → M8-6/M8-7 → M8-8 → M8-9 → M8-10**;
+  **TERM-1 → TERM-2 (needs M8-2/4/7) / TERM-3 (needs M8-3)**
+- Persistence/power: **M9-1..6**; hardening/polish: **M10**, `STRETCH-*`,
+  `DOCS-1`; deferred to v2: `V2-TELEM-*`, `V2-MGMT-1`
+
+**BLOCKED (immediate blocker in parens):** VALID-2/3/4 (VALID-1) ·
+M4-6 (FW-1h) · NET-2 (VALID-2) · NET-3 (VALID-1) · NET-4/4a/4b/5 (NET-1) ·
+M5-3 (VALID-3) · M5-4 (M5-3) · M5-5 (M5-4/NET-5) · M5-6 (M5-5) ·
+M6-1 (M5-6) · M6-2 (M6-1) · M7-2 (M7-1) · M7-4 (M7-2/M7-3) ·
+M8-3 (M8-1) · M8-3a (M8-3) · M8-4 (M6-2/M7-4) · M8-6/M8-7 (M8-4) ·
+M8-8 (M8-7) · M8-9 (M8-3/5/6/8) · M8-10 (M8-9) · TERM-2 (M8) · TERM-3 (M8-3) ·
+M9/M10/STRETCH/DOCS (long chains) · V2-* (deferred).
+
+**Decomposition status:** the READY set above is atomic and scoped (each is
+a single, self-contained task; FW-1h/M4-6/FW-1g/VALID-1/VALID-3 also have
+detailed scope notes in their sections). The BLOCKED set is already
+milestone-decomposed here with Deps + scope; per this file's own
+"revisit when actually scoped/started" convention (see TERM-3), deeper
+sub-scoping of far-off blocked milestones (M6, M7-2/4, M8-3..10, M9, M10,
+NET-2..5) is deferred until they unblock — decomposing blocked work now
+would be premature. The tracker (TaskCreate) currently mirrors only the
+active FW/M4/M5/VALID front; the rest live here in task.md.
+
+---
+
 **Minimum supported guest target (plan.md §1, decided 2026-07-14): Windows
 (any 64-bit), Linux (any 64-bit), and BSD (any 64-bit) — no 32-bit guests.**
 M3 validates the core VM-exit loop via a Linux-specific direct `bzImage` boot
@@ -839,7 +902,16 @@ tasks — see updated deps below.*
   enumerating and reading from this device -- that's M4-6's job.*
 - [ ] **M4-6** — Boot a stock Linux UEFI installer ISO (e.g. Debian
   netinst) end-to-end through GRUB.
-  Deps: CPUMSR-2, RAM-2, PCI-2, FW-2, ISO-2
+  Deps: FW-1h, ISO-2 (FW-2, CPUMSR-2, RAM-2, PCI-2 all done)
+  Scope: with FW-1h giving the guest a bootable CD, OVMF's BDS should
+  boot the ISO's EFI loader (shim/GRUB) automatically. This is a
+  boot-and-observe task like FW-1c/d: run it, watch the forwarded
+  console + a `#VMEXIT_NPF`/IOIO for whatever the loader/kernel touches
+  that FW-1's device set doesn't yet cover, and handle the next blocker.
+  No upfront subtasks -- the ISO's loader reveals what's needed
+  (candidate follow-ons: more of the AHCI/ATAPI command surface, block
+  reads at scale, and eventually keyboard via FW-1g for the GRUB menu if
+  it doesn't auto-boot).
 
   *Scoping this task out (2026-07-14) surfaced that "boot a stock
   Linux ISO through GRUB" actually needs ~7 substantial new subsystems
@@ -1985,13 +2057,29 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
     `hype_svm_vcpu_handle_pci_cf8_ioio()`, `hype_svm_vcpu_handle_cmos_ioio()`,
     `hype_svm_vcpu_handle_acpi_pm_timer_ioio()`.
 
-- [ ] **FW-2** — Load OVMF_CODE.fd/OVMF_VARS.fd from fw/ into guest RAM
-  at boot, replacing the fixed hand-written test-guest entry points
-  used through M4-5/VIDEO-2. (File loading itself is already done as
-  part of FW-1's own work above -- this task now just tracks the
-  remaining "guest actually boots" milestone once FW-1's blocker is
-  resolved.)
+- [x] **FW-2** — Load OVMF_CODE.fd/OVMF_VARS.fd from fw/ into guest RAM
+  at boot. DONE, subsumed by FW-1a..e: FW-1 reads both .fd files from
+  the ESP, NPT-maps them at the top-of-4GB flash window, and boots real
+  OVMF end-to-end. Nothing further needed here.
   Deps: FW-1
+
+- [ ] **FW-1h** — Bootable optical drive (real ISO) in FW-1's OVMF guest.
+  FW-1 boots OVMF to BDS but it finds "No bootable option" -- the guest
+  has no disk/CD. Integrate the existing, individually-tested pieces
+  into FW-1's guest (no new device code):
+  - Register an AHCI PCI function in g_fw_1_pci
+    (`hype_pci_add_device`, class 0x01/0x06 SATA, a BAR5 ABAR), exactly
+    as run_pci_2_test does.
+  - Back its ATAPI/CD model with ISO-1's already-loaded real ISO buffer
+    (`hype_atapi_reset(&atapi, (uint8_t*)g_iso_host_phys, g_iso_size)`),
+    exactly as run_iso_2_test does.
+  - In the FW-1 NPF dispatch, detect OVMF programming BAR5, NPT-map the
+    ABAR window, and route its MMIO to
+    `hype_svm_vcpu_handle_ahci_npf(ctx, &ahci, &atapi, abar_base)` --
+    the dynamic-BAR pattern run_pci_2_test already uses.
+  Then OVMF's BDS should auto-discover the CD and boot its
+  EFI\BOOT\BOOTX64.EFI with no keypress -- the bridge to M4-6. Single
+  integration task; no subtasks. Deps: FW-1d, M4-5, ISO-2, PCI-2.
 
 ---
 
