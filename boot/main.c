@@ -172,6 +172,23 @@ static hype_acpi_loader_entry_t g_fw_1_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENT
 #define HYPE_FW_1_PCI_VENDOR_ID_INTEL 0x8086u
 #define HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH 0x29C0u
 
+/* ICH9 LPC bridge (the Q35 chipset's south bridge, bus 0/device 31/
+ * function 0 -- Q35MchIch9.h's own POWER_MGMT_REGISTER_Q35() macro,
+ * "B/D/F/Type: 0/0x1f/0/PCI"), a real Intel device ID (ICH9 LPC
+ * Interface Controller). Confirmed via source-level investigation
+ * (edk2/OvmfPkg/Library/PlatformInitLib/Platform.c's
+ * PciAndThenOr32(Pmba, ...) programming ICH9_PMBASE, config offset
+ * 0x40) that PlatformPei writes the ACPI PM Timer's I/O port base
+ * here -- without this device registered, that write was silently
+ * dropped (hype_pci_config_write()'s own "write to an absent device is
+ * dropped" convention), so AcpiTimerLib's later PciRead32(Pmba) saw
+ * the absent-device all-1s default instead: 0xFFFFFFFF & ~PMBA_RTE(1)
+ * = 0xFFFFFFFE, + ACPI_TIMER_OFFSET(8), truncated to UINT32 =
+ * 0x00000006 -- an exact match for the observed port-0x6 infinite poll
+ * loop (AcpiTimerLib's own GetPerformanceCounter()). */
+#define HYPE_FW_1_PCI_DEV_ICH9_LPC 31u
+#define HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC 0x2918u
+
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
 static hype_pte_t g_npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
@@ -2291,6 +2308,8 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_pci_reset(&g_fw_1_pci);
     hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
                          0x00, 0x00);
+    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ICH9_LPC, HYPE_FW_1_PCI_VENDOR_ID_INTEL,
+                         HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC, 0x06, 0x01, 0x00);
 
     /* Real OVMF's own platform init needs real ACPI content via
      * fw_cfg, the same "etc/acpi/rsdp"/"etc/acpi/tables"/
@@ -2433,13 +2452,16 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             if (hype_svm_vcpu_handle_cmos_ioio(ctx, &g_fw_1_cmos) == 0) {
                 continue;
             }
+            if (hype_svm_vcpu_handle_acpi_pm_timer_ioio(ctx) == 0) {
+                continue;
+            }
 
             {
                 hype_svm_ioio_t io;
                 hype_svm_vcpu_handle_unknown_ioio(ctx, &io);
-                hype_debug_print("fw-1: unhandled port 0x%x %s size=%u -- absorbing\n",
+                hype_debug_print("fw-1: unhandled port 0x%x %s size=%u rip=0x%llx -- absorbing\n",
                                   (unsigned int)io.port, io.is_in ? "IN" : "OUT",
-                                  (unsigned int)io.size_bytes);
+                                  (unsigned int)io.size_bytes, (unsigned long long)info.guest_rip);
             }
             continue;
         }

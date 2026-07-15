@@ -418,6 +418,34 @@ int hype_svm_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos) {
     return 0;
 }
 
+#define HYPE_FW_1_ACPI_PM_TIMER_PORT 0x608u
+#define HYPE_FW_1_ACPI_PM_TIMER_MASK 0x00FFFFFFu /* 24-bit -- TMR_VAL_EXT unset in this project's own FADT */
+
+int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+
+    if (io.port != HYPE_FW_1_ACPI_PM_TIMER_PORT) {
+        return -1;
+    }
+
+    if (io.is_in) {
+        uint32_t value = (uint32_t)real_rdtsc() & HYPE_FW_1_ACPI_PM_TIMER_MASK;
+        real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFFFFFFFULL) | value;
+    }
+    /* A write to the PM Timer's own status/value port is not a real
+     * hardware operation this register supports -- silently ignored,
+     * matching every other "nothing meaningful to do" IOIO write
+     * already established here (e.g. hype_svm_vcpu_handle_unknown_ioio()). */
+
+    /* EXITINFO2 gives the resume RIP directly, same "next-RIP-for-free"
+     * convenience hype_svm_vcpu_handle_ioio() itself already relies on. */
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return 0;
+}
+
 void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     out->cs_selector = real->vmcb->save.cs.selector;

@@ -988,28 +988,76 @@ tasks — see updated deps below.*
     - Confirmed fixed: the exact `rip=0xE0006` #PF no longer occurs at
       all with these two fixes in place -- the guest now runs well
       past that point.
-  - **Current blocker (new, after the fw_cfg/CMOS fix)**: the guest now
-    enters an unbounded polling loop reading port `0x6` (a 4-byte IN,
-    repeated 10,000+ times with no other VM-exit in between) instead of
-    crashing -- a benign hang, not a fault. Port `0x6` is conventionally
-    the 8237 DMA controller's channel-3 address register (legacy PC I/O
-    map), though a 4-byte access to an 8-bit-only legacy DMA register is
-    unusual and not yet explained; a source-level correlation (the same
-    method that resolved every prior blocker this session) hasn't yet
-    identified which OVMF driver/PPI performs this specific read or
-    what value would satisfy its poll condition. Not yet root-caused --
-    the next concrete step for a future session: search
-    `edk2/Build/OvmfX64/RELEASE_CLANGDWARF/` for any module reading I/O
-    port 0x6 (grep the disassembly/source for the literal port number
-    or a `DMA`-related PPI/library), or add a temporary CMOS-style
-    minimal DMA-controller stub and iterate on what response value
-    breaks the loop.
+  - **Root-caused and fixed the follow-on port-`0x6` infinite poll**
+    above too -- it turned out to be the exact same class of bug as the
+    microvm misdetection, one PCI device earlier in the chain. Symbolized
+    via `nm`/`addr2line` against `edk2/Build/.../MdeModulePkg/Core/Pei/
+    PeiMain/DEBUG/PeiCore.debug`: the polling RIP resolved to
+    `IoRead32()` called from `OvmfPkg/Library/AcpiTimerLib/
+    BaseAcpiTimerLib.c`'s `GetPerformanceCounter()`. That library
+    computes the ACPI PM Timer's I/O port as
+    `(PciRead32(Pmba) & ~PMBA_RTE) + ACPI_TIMER_OFFSET(8)`, where `Pmba`
+    is the ICH9 LPC bridge's own PCI config register (bus 0/device
+    0x1f/function 0, offset `0x40`) -- a **second** PCI device this
+    project had never registered. Reading it returned the absent-device
+    default `0xFFFFFFFF`; `& ~PMBA_RTE(1)` = `0xFFFFFFFE`; `+ 8`,
+    truncated to `UINT32`, = exactly `0x00000006` -- confirmed via the
+    live trace, byte-for-byte matching the observed port.
+    `OvmfPkg/Library/PlatformInitLib/Platform.c` confirmed the
+    *intended* fix path already exists in OVMF itself:
+    `PciAndThenOr32(Pmba, ...)` programs a real value into this
+    register during early boot -- but since device 0x1f didn't exist in
+    this project's PCI model, that write was silently dropped
+    (`hype_pci_config_write()`'s own documented "write to an absent
+    device is dropped" behavior), so the later read still saw
+    `0xFFFFFFFF`.
+    - **Fix**: `run_fw_1_test()` now also registers the ICH9 LPC bridge
+      (device 0x1f, a real Intel device ID) via `hype_pci_add_device()`
+      -- with the device present, `PciAndThenOr32()`'s write actually
+      lands, and the later read gets back the real, intended
+      `ICH9_PMBASE_VALUE(0x600) + ACPI_TIMER_OFFSET(8) = 0x608` --
+      confirmed via the live trace: the poll port changed from `0x6` to
+      exactly `0x608` after this fix alone, before the timer itself was
+      even implemented.
+    - Port `0x608` still needed an actual monotonically-increasing
+      value (the all-1s absorbed default can never satisfy a
+      calibration/stall loop waiting for time to pass). New exempt
+      handler `hype_svm_vcpu_handle_acpi_pm_timer_ioio()`
+      (`arch/x86_64/svm/svm_vcpu.c`) returns a real `RDTSC` read masked
+      to 24 bits (this project's own FADT, `devices/acpi.c`, never sets
+      the `TMR_VAL_EXT` flag, so the guest itself expects a 24-bit, not
+      32-bit, counter -- kept consistent with what we actually tell it).
+    - Confirmed fixed: the port-`0x6`/`0x608` poll is completely gone;
+      the guest now runs well past PEI, into genuine DXE-phase driver
+      execution (confirmed via `rip` values in the hundreds-of-MB range,
+      far beyond any PEI/DXE FV's own "Fixed Flash Address" range).
+  - **Current blocker (new, after the PM Timer fix)**: a new #PF --
+    this time a *read* (`err=0x0`: not-present, read, supervisor) from
+    guest-linear address 0 again (`CR2=0`), at `rip` in the hundreds-of-
+    MB range. The instruction bytes decode as `cmp ebp, [rbx]` with
+    `rbx=0` -- a genuine NULL-pointer read, somewhere in a DXE driver.
+    This is the first fault this session that the established
+    `nm`/`addr2line`-against-`edk2/Build` technique **cannot resolve**:
+    the address doesn't fall within any FV's own statically-listed
+    "Fixed Flash Address" module range (`DXEFV.Fv.map` has none at this
+    address) -- DXE Core dynamically loads and relocates most drivers
+    at runtime-chosen addresses that aren't known ahead of time from
+    the static build artifacts alone, unlike every earlier PEI-phase
+    fault this session (PEI's own modules ARE all fixed-address,
+    hence resolvable). Making further progress here needs either live
+    debugging (not straightforward against a nested-SVM L2 guest in
+    this environment) or a differently-targeted investigation (e.g.
+    identifying which DXE driver dispatches around this point in boot
+    and reasoning about what it reads from a NULL/uninitialized
+    pointer -- possibly another not-yet-registered device, following
+    the same pattern as PCI/fw_cfg/CMOS/ACPI-timer above).
   - New diagnostic accessors added for this investigation, all exempt
     from unit testing (same reasoning as every other
     `hype_svm_vcpu_handle_*` glue function): `hype_svm_vcpu_get_last_npf()`,
     `hype_svm_vcpu_get_debug_state()` (CS/CR0/CR2/CR3/RIP/RFLAGS/RSP),
     `hype_svm_vcpu_set_rip()`, `hype_svm_vcpu_handle_unknown_ioio()`,
-    `hype_svm_vcpu_handle_pci_cf8_ioio()`, `hype_svm_vcpu_handle_cmos_ioio()`.
+    `hype_svm_vcpu_handle_pci_cf8_ioio()`, `hype_svm_vcpu_handle_cmos_ioio()`,
+    `hype_svm_vcpu_handle_acpi_pm_timer_ioio()`.
 
 - [ ] **FW-2** — Load OVMF_CODE.fd/OVMF_VARS.fd from fw/ into guest RAM
   at boot, replacing the fixed hand-written test-guest entry points

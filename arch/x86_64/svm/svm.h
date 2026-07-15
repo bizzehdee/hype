@@ -226,6 +226,26 @@ int hype_svm_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci);
 int hype_svm_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos);
 
 /*
+ * FW-1: services the ACPI PM Timer's own I/O port (hardcoded to 0x608
+ * -- OVMF's own fixed ICH9_PMBASE_VALUE(0x600) + ACPI_TIMER_OFFSET(8),
+ * both compile-time constants in edk2/OvmfPkg/Include/OvmfPlatforms.h,
+ * not guest-computed, confirmed via source and this project's own live
+ * trace once the ICH9 LPC bridge's PMBA register was correctly
+ * programmable). Returns a real, monotonically-increasing 24-bit
+ * counter (real_rdtsc() masked to 24 bits -- this project's own FADT,
+ * devices/acpi.c, never sets the TMR_VAL_EXT flag, so the guest itself
+ * expects a 24-bit, not 32-bit, counter) -- OVMF's own AcpiTimerLib
+ * uses this for calibration/stall loops, which an always-0xFFFFFFFF
+ * absorbed default can never satisfy. Returns 0 if the port was 0x608
+ * (handled), -1 otherwise, same composable-handler-chain shape as
+ * every other IOIO handler here. Exempt from unit testing -- reaches
+ * into the exempt VMCB/GPR fields this backend's real VMRUN produces
+ * and executes a real RDTSC instruction, same reasoning as
+ * hype_svm_vcpu_handle_msr()'s own TSC case.
+ */
+int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx);
+
+/*
  * FW-1 real-hardware/real-firmware debugging: a snapshot of the guest
  * state fields that matter for diagnosing a fault reported against
  * this project's own "guest_rip" alone -- once a real-mode guest
