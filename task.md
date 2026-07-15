@@ -1201,6 +1201,34 @@ the identical `PANIC: fw-1: exc vec=14 err=0x0 cr2=0x0 ... rip=...`
 fault with zero regressions. `tools/make-usb-package.sh` rebuilt with
 this fix; real-hardware re-test should now redraw at normal speed.
 
+**Update (2026-07-15, later still): re-test with the GOP fix reached
+the identical `exc vec=14`/`cr2=0x0` #PF, screen-photo-confirmed --
+but real hardware silently stops right at `STGI done, exitcode=0x4e`,
+one line before the "fw-1: exc vec=..." summary ever prints.** The
+code between that print and the summary line (`hype_svm_vcpu_get_
+debug_state()`, then dereferencing `dbg.rip`/`dbg.rsp` directly as raw
+host pointers to dump instruction bytes and a stack snapshot) had
+always run successfully under QEMU's small, uniformly-mapped 512MB
+test VM -- but a real machine's memory map is far larger and more
+complex, with no guarantee firmware's own page tables identity-map
+every address the same way. The likely explanation: one of those raw
+dereferences (rip/rsp themselves, not the already-defensively-checked
+`stack[2]` candidate) faults again on real hardware, with no handler
+for a fault-during-fault-handling, silently resetting/hanging the
+machine before the one line that actually matters ever printed.
+
+Fix: reordered `run_fw_1_test()`'s own exception branch (`boot/
+main.c`) so the core `fw-1: exc vec=... err=... cr0=... cr2=... cr3=...
+rip=...` summary prints FIRST, via `hype_debug_print()` (not
+`hype_fatal()`, which halts and would make everything below
+unreachable) -- immediately after the exit-code line, before the
+raw-byte/stack-dump attempts that might themselves crash the real
+machine. The raw-byte/stack dumps and the final `hype_fatal()` call
+still run afterward, unchanged, for when they DO work. Verified via
+QEMU (real virtual GPU device) that the reordered dump still produces
+the same "exc vec=14 err=0x0 cr2=0x0 ... rip=..." fault with zero
+regressions. `tools/make-usb-package.sh` rebuilt again with this fix.
+
 - [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash

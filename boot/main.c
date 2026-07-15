@@ -4291,6 +4291,26 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             uint8_t *fault_bytes;
             hype_svm_vcpu_get_debug_state(ctx, &dbg);
 
+            /* Real-hardware finding: this core summary line -- vector/
+             * error/CR0/CR2/CR3/RIP, everything actually needed to
+             * compare a fault across environments -- used to print
+             * LAST, via hype_fatal(), after the raw-byte/stack-dump
+             * attempts below. On real hardware those dereferences can
+             * themselves fault (a real machine's memory map is far
+             * larger/more complex than QEMU's small, uniformly-mapped
+             * test VM; there's no guarantee firmware's own page tables
+             * identity-map every address this project's flat-map
+             * assumption expects), silently killing the machine before
+             * the one line that actually matters ever printed. Printed
+             * FIRST now, via hype_debug_print() (not hype_fatal(),
+             * which halts and would make everything below unreachable),
+             * specifically so it survives even if what follows doesn't. */
+            hype_debug_print("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr2=0x%llx cr3=0x%llx rip=0x%llx\n",
+                              (unsigned long long)(info.reason - HYPE_SVM_EXITCODE_EXCEPTION_BASE),
+                              (unsigned long long)info.qualification, (unsigned long long)dbg.cr0,
+                              (unsigned long long)dbg.cr2, (unsigned long long)dbg.cr3,
+                              (unsigned long long)dbg.rip);
+
             /* cs_base=0 (flat protected mode) here, so dbg.rip already
              * is the linear == guest-physical == host-physical address
              * (this project's NPT identity-maps ordinary RAM) -- a raw
