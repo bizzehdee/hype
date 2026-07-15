@@ -1289,6 +1289,88 @@ more ground truth in one round trip rather than guessing further.
 `tools/make-usb-package.sh` rebuilt again; this print set is sized to
 fit comfortably on one 1080p screen for a photo/OCR capture.
 
+**Update (2026-07-15, session close-out): full real-hardware capture
+obtained; a genuinely new, narrow, UNRESOLVED finding -- parking this
+investigation here rather than continuing to guess.**
+
+Full real-hardware output (photo/OCR-confirmed, AMD laptop, ASUS
+VivoBook):
+```
+fw-1: exc vec=14 err=0x0 cr0=0x80000033 cr2=0x0 cr3=0x800000 rip=0xffffffffffffffff
+fw-1: cs_selector=0x38 cs_base=0x0 rflags=0x2 rsp=0xfcd8d4f0
+fw-1: exitinfo2=0x0 (cr2 above should match)
+fw-1: rip=0xffffffffffffffff is not a plausible host pointer -- skipping the raw-byte dump
+fw-1: rsp=0xfcd8d4f0 [0]=0xffffffffffffffff [1]=0xffffffffffffffff [2]=0xffffffffffffffff [3]=0xffffffffffffffff
+PANIC: fw-1: exc vec=14 err=0x0 cr0=0x80000033 cr2=0x0 cr3=0x800000 rip=0xffffffffffffffff
+```
+
+**What's confirmed sane and mutually consistent**: `cr0`=0x80000033
+(PE|MP|ET|NE|PG -- protected mode, paging enabled, matches "deep in
+DXE"), `cr3`=0x800000 (small, page-aligned, plausible page-table
+root), `cs_selector`=0x38 (a normal-looking 64-bit code selector),
+`cs_base`=0x0 (architecturally correct for 64-bit long mode -- CS.base
+is forced 0), and -- most importantly -- `exitinfo2` (VMCB *control*
+area) exactly matches `cr2` (VMCB *save* area), both `0x0`. These are
+two independently-sourced fields for the same "faulting address"
+concept agreeing exactly, which is strong evidence the CR2=0
+NULL-pointer finding itself is genuinely real, not a save-state
+population artifact -- i.e., **the original DXE NULL-pointer bug this
+whole task was about is very likely confirmed reproducing on real
+hardware, independent of the RIP mystery below.**
+
+**What's garbage, narrowly and specifically**: `rip` (0xFFFFFFFFFFFFFFFF)
+and `rflags` (0x2 -- suspiciously "too clean," only the fixed-1
+reserved bit set, no other flag reflecting real in-flight execution
+state) -- these are the *exact two adjacent fields* in the VMCB's own
+state-save area (`arch/x86_64/svm/vmcb.h`: `rflags` at offset 0x170,
+`rip` at 0x178, immediately following `dr6`/`dr7`/`cr0`/`cr3`/`cr4`,
+all of which read fine, and immediately preceding an 88-byte reserved
+gap before `rsp` at 0x1D8, which also reads fine as a value). Also
+garbage: the actual **guest memory** at that (otherwise-plausible)
+`rsp` address -- all 4 sampled qwords read `0xFFFFFFFFFFFFFFFF` too,
+a second, independent all-1s location.
+
+**Ruled out**: a struct-layout bug in `hype_vmcb_t` -- the struct is
+`__attribute__((packed))`, every field is offset-commented straight
+from the real AMD APM (Rev 3.39, Appendix B), and two
+`_Static_assert`s enforce the control/save area sizes match spec
+exactly. The field ORDER around rflags/rip matches the real spec
+(CR4,CR3,CR0,DR7,DR6,RFLAGS,RIP, in that order) -- if this were an
+offset/padding bug, it would shift *everything* from that point
+onward, not leave a narrow 16-byte window bad while RSP (nearby, just
+past a reserved gap) reads fine again. **No AMD erratum or documented
+behavior explaining this narrow RFLAGS+RIP-specific gap has been
+found or researched yet** -- this needs either a targeted spec/erratum
+search (not yet done -- time-boxed out of this session) or genuine
+hardware-level debugging (JTAG, a real debugger attached to the
+physical machine) to actually resolve, neither of which fits a
+screen-photo-driven remote debugging loop.
+
+**Decision: parking here, not continuing to iterate.** This started as
+"does the already-documented DXE NULL-pointer fault reproduce on real
+hardware" (answer: very likely yes, per the cr2/exitinfo2 agreement
+above) and grew into a second, independent, open-ended mystery
+(RFLAGS/RIP specifically). Real value was already captured this
+session as a side effect of this investigation, independent of FW-1
+itself ever getting resolved:
+- A real GOP-screen-redraw performance bug (uncached direct
+  framebuffer writes, 2-3 seconds/line) -- fixed, benefits every future
+  real-hardware test of every milestone, not just FW-1.
+- A real "diagnostic dump can crash the machine a second time" bug
+  (unconditionally dereferencing exception-context fields as raw
+  pointers without a plausibility check) -- fixed, same benefit.
+
+Both fixes are committed, tested, and already proven to not regress
+QEMU's own (always-sane-valued) exception path. FW-1 itself remains
+`[ ]`/parked, now with a fuller, more precise problem statement than
+before this session started. Revisit either by researching the
+RFLAGS/RIP-specific AMD SVM behavior directly, or by moving on to
+other work and returning to real-hardware FW-1 debugging later with
+better tooling (e.g. once M5-3's disk-log approach, noted earlier in
+this same section, exists -- durable logging matters far more for
+this kind of narrow, low-level register-state puzzle than for a
+one-shot "does it panic" check).
+
 - [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash
