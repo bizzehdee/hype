@@ -994,10 +994,27 @@ tasks — see updated deps below.*
 
 ## ISO — Real installer media loading
 
-- [ ] **ISO-1** — Read a real installer ISO from the same ESP hype.efi
+- [x] **ISO-1** — Read a real installer ISO from the same ESP hype.efi
   was booted from, via UEFI's own Simple File System Protocol (Boot
   Services, before ExitBootServices) -- does not need M5.
   Deps: none new
+
+  *Reused FW-1's own `core/file_io.h` unchanged (already generic, not
+  OVMF-specific -- its own header comment already anticipated this).
+  `Makefile`'s new `TEST_ISO` variable (default
+  `/usr/share/edk2/ovmf/UefiShell.iso`, the same edk2-ovmf package's
+  own real ~2.8MB bootable ISO9660 image -- not vendored into this
+  repo, just copied onto the ESP at test time, matching how the
+  outer/host OVMF_VARS.fd is handled) is copied to `\iso\test.iso` by
+  the `run` target. `efi_main()` reads it via
+  `hype_file_locate_root()`/`_get_size()`/`_read_into()`, then verifies
+  the read is real (not a short read that happened to report success)
+  by checking for ISO9660's own "CD001" Primary Volume Descriptor
+  standard identifier (ECMA-119 SS7.1.1, always at byte offset 32769)
+  in the actual bytes read back. Clean QEMU run on the first attempt:
+  "iso-1: read a real 2895872-byte ISO9660 image ... "CD001" identifier
+  verified at offset 32769" -- every other existing test guest (M2-7
+  through PCI-2) and FW-1's own progress point are both unaffected.*
 - [ ] **ISO-2** — Back M4-5's existing AHCI/ATAPI in-memory model with
   the real loaded ISO buffer instead of a synthetic one.
   Deps: ISO-1, M4-5

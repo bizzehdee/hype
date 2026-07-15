@@ -41,6 +41,11 @@ OUT       := $(BUILD_DIR)/hype.efi
 # elsewhere (see docs/toolchain.md).
 OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE.fd
 OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS.fd
+# A real, reasonably-sized ISO9660 image for ISO-1's own test -- reuses
+# the same edk2-ovmf package's own UefiShell.iso (real media, not a
+# synthetic blob) rather than vendoring a copy of it into this repo;
+# override on the command line for a different test image.
+TEST_ISO  ?= /usr/share/edk2/ovmf/UefiShell.iso
 ESP       := $(BUILD_DIR)/esp
 
 .PHONY: all clean test run
@@ -77,6 +82,8 @@ run: $(OUT)
 	cp $(OVMF_VARS) $(BUILD_DIR)/OVMF_VARS.fd
 	@mkdir -p $(ESP)/EFI/hype
 	cp fw/OVMF_CODE.fd fw/OVMF_VARS.fd $(ESP)/EFI/hype/
+	@mkdir -p $(ESP)/iso
+	cp $(TEST_ISO) $(ESP)/iso/test.iso
 	qemu-system-x86_64 \
 	  -machine q35 -m 512 -nodefaults \
 	  -accel kvm -accel tcg -cpu host -smp 2 \

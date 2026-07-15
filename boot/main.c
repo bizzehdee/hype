@@ -2539,6 +2539,67 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 (unsigned long long)g_fw_1_combined_host_phys);
         }
 
+        /*
+         * ISO-1: reads a real installer ISO (\iso\test.iso -- a real
+         * ISO9660 image the Makefile's own `run` target copies onto the
+         * ESP, per task.md's own "does not need M5" scoping) from the
+         * same ESP hype.efi was booted from, reusing FW-1's own
+         * core/file_io.h (already generic, not OVMF-specific). Verifies
+         * both the read succeeded at the file's own real size (not just
+         * a fixed/guessed buffer) and that a real ISO9660 Primary Volume
+         * Descriptor's "CD001" standard identifier
+         * (ECMA-119 SS7.1.1/7.1.2, always at byte offset 32769 -- the
+         * 2nd byte of the 17th 2048-byte sector) is genuinely present
+         * in what was read back -- proof this is real ISO content, not
+         * garbage/a short read that happened to return success.
+         */
+        {
+            EFI_FILE_PROTOCOL *root = 0;
+            EFI_STATUS iso_status;
+            UINT64 iso_size;
+            uint64_t iso_host_phys;
+            UINTN iso_pages;
+            const uint8_t *iso_bytes;
+
+            iso_status = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
+            if (iso_status != EFI_SUCCESS) {
+                hype_fatal("iso-1: hype_file_locate_root failed: 0x%llx", (unsigned long long)iso_status);
+            }
+
+            iso_status = hype_file_get_size(root, SystemTable->BootServices, (CHAR16 *)L"\\iso\\test.iso",
+                                             &iso_size);
+            if (iso_status != EFI_SUCCESS) {
+                hype_fatal("iso-1: hype_file_get_size(test.iso) failed: 0x%llx",
+                           (unsigned long long)iso_status);
+            }
+            if (iso_size < 32769 + 5) {
+                hype_fatal("iso-1: test.iso is too small to be a real ISO9660 image (%llu bytes)",
+                           (unsigned long long)iso_size);
+            }
+
+            iso_pages = (UINTN)((iso_size + 4095ULL) / 4096ULL);
+            iso_host_phys = hype_alloc_pages_any(SystemTable->BootServices, iso_pages);
+
+            iso_status =
+                hype_file_read_into(root, (CHAR16 *)L"\\iso\\test.iso", (void *)(uintptr_t)iso_host_phys,
+                                     iso_size);
+            if (iso_status != EFI_SUCCESS) {
+                hype_fatal("iso-1: hype_file_read_into(test.iso) failed: 0x%llx",
+                           (unsigned long long)iso_status);
+            }
+
+            iso_bytes = (const uint8_t *)(uintptr_t)iso_host_phys;
+            if (iso_bytes[32769] != 'C' || iso_bytes[32770] != 'D' || iso_bytes[32771] != '0' ||
+                iso_bytes[32772] != '0' || iso_bytes[32773] != '1') {
+                hype_fatal("iso-1: test.iso is missing the ISO9660 \"CD001\" standard identifier");
+            }
+
+            hype_debug_print(
+                "iso-1: read a real %llu-byte ISO9660 image from \\iso\\test.iso, \"CD001\" "
+                "identifier verified at offset 32769\n",
+                (unsigned long long)iso_size);
+        }
+
         args.ops = ops;
         args.kind = kind;
 
