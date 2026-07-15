@@ -805,6 +805,27 @@ tasks — see updated deps below.*
 
 ## FW — Real OVMF firmware boot wiring
 
+**Note (2026-07-15): FW-* needs real-hardware validation with durable
+debug logging, once M5 (storage) exists.** This session's FW-1 work was
+debugged entirely in a nested-SVM dev environment (this project's own
+hype.efi running as an L1 hypervisor under an outer QEMU/KVM host,
+itself launching real OVMF as an L2 guest) -- a setup that could have
+its own artifacts not present on bare metal (matching M2-8's own
+precedent: "two real, non-obvious bugs found [on real hardware], neither
+reproducible under [nested virtualization]"). Screen-only debug
+checkpoints (`hype_debug_print()`, per M2-8's `tools/make-usb-package.sh`
+precedent) are workable for simple pass/fail milestones, but FW-1's own
+remaining blocker needed dozens of iterative, detailed diagnostic dumps
+(NPF/exception state, raw instruction bytes, stack walks,
+`addr2line`-correlated addresses) -- entirely impractical to read off a
+screen with no scrollback and no persistent record. Once M5 lands a real
+`blk_backend`, FW-* real-hardware validation should write its debug log
+directly to disk -- e.g. appending to a file on the FAT32 EFI System
+Partition of the same USB drive `tools/make-usb-package.sh` already
+builds -- giving a durable, retrievable log from real hardware the same
+way `/tmp/qemu_*.log` capture already does for this dev environment.
+Revisit this note when picking FW-1 back up.
+
 - [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash
