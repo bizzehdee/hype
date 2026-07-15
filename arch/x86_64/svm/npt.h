@@ -59,4 +59,29 @@ void hype_npt_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
  */
 void hype_npt_mark_not_present(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE], uint64_t phys_addr);
 
+/*
+ * Remaps `size` bytes (a whole multiple of HYPE_PAGING_2MB) of guest-
+ * physical address space, starting at `guest_phys_base`, to
+ * `host_phys_base` instead of the identity mapping
+ * hype_npt_build_identity() already put there for that range (FW-1).
+ * Needed whenever a guest-physical address is architecturally fixed
+ * (e.g. the classic x86 reset-vector convention's top-of-4GB flash
+ * window that real, unmodified guest firmware assumes) but does NOT
+ * correspond to real, available host RAM at that same literal
+ * physical address -- confirmed the hard way: that exact range is
+ * where the underlying machine's own real firmware flash lives
+ * (whether that's a real motherboard's BIOS/UEFI flash, or, when
+ * nested under another hypervisor the way this project's own dev
+ * environment runs, the L0 host's own OVMF), not general-purpose RAM
+ * this project can safely repurpose -- attempting to identity-map and
+ * write into it corrupts the underlying host's own firmware state.
+ * Must be called AFTER hype_npt_build_identity() for the same
+ * pd_tables, since it overwrites whatever entries the identity sweep
+ * already wrote for this range. `guest_phys_base` and `host_phys_base`
+ * must both be 2MB-aligned. Pure struct mutation, no CPU state
+ * touched.
+ */
+void hype_npt_map_range(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE], uint64_t guest_phys_base,
+                         uint64_t host_phys_base, uint64_t size);
+
 #endif /* HYPE_ARCH_SVM_NPT_H */

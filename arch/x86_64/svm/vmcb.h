@@ -210,6 +210,16 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 #define HYPE_SVM_EXITCODE_NPF 0x400ULL
 #define HYPE_SVM_EXITCODE_INVALID 0xFFFFFFFFFFFFFFFFULL /* VMRUN itself failed (bad VMCB state) */
 
+/* EXITCODE 0x40-0x5F: guest exception vectors 0-31 (EXITCODE = 0x40 +
+ * vector), fired only for vectors marked in control.intercept_exceptions
+ * (FW-1: without this, an unhandled guest fault -- e.g. #GP from an
+ * unemulated instruction/access -- is delivered straight to the guest's
+ * own IDT instead of exiting to us; real EDK2 firmware's own early
+ * exception handlers frequently just spin forever (CpuDeadLoop-style)
+ * rather than crash, which looks identical to a hang with no further
+ * VMEXITs at all unless this is intercepted). */
+#define HYPE_SVM_EXITCODE_EXCEPTION_BASE 0x40ULL
+
 /* intercept_misc1 bit 27 (M3-5): trap every guest IN/OUT so this
  * project's device stubs (devices/pic.h, devices/pit.h) can emulate
  * them -- there is no passthrough port I/O in this project (guests

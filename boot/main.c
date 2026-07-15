@@ -9,6 +9,7 @@
 #include "../core/guest_ram.h"
 #include "../core/mp.h"
 #include "../core/admission.h"
+#include "../core/file_io.h"
 #include "../arch/x86_64/cpu/cpu_features.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -84,6 +85,63 @@ static uint64_t g_m2_7_guest_stack_top_phys;
 #define HYPE_RAM_1_TEST_MEM_MB 64u
 static uint64_t g_ram_1_base_phys;
 static uint64_t g_ram_1_size_bytes;
+
+/*
+ * FW-1: this project's own vendored guest firmware (M4-2), read from
+ * the same ESP hype.efi was itself booted from (core/file_io.h).
+ *
+ * Found the hard way, on the very first attempt: OVMF_CODE.fd/
+ * OVMF_VARS.fd's own internal addressing assumes the classic x86/QEMU
+ * convention of being mapped ending exactly at guest-physical 4GB
+ * (0xFFFFFFF0, the reset vector) -- but that is NOT safe/available
+ * *host*-physical memory to allocate real content into. Whether
+ * running nested under another hypervisor (this project's own dev
+ * environment, where that exact host-physical range turned out to be
+ * the L0 host's own real OVMF flash -- writing into it corrupted the
+ * host firmware and crashed it with a #PF) or on real hardware (the
+ * literal top-of-4GB range is the motherboard's own real BIOS/UEFI
+ * flash chip, not general-purpose RAM either), that address is real,
+ * fixed hardware, not something this project can repurpose.
+ *
+ * Fixed with NPT remapping (hype_npt_map_range(), arch/x86_64/svm/
+ * npt.h): the combined CODE+VARS content is loaded into one ordinary,
+ * freely-allocated (AllocateAnyPages) host-physical buffer -- wherever
+ * that actually is -- and NPT translates guest-physical
+ * [0x100000000 - (code_size+vars_size), 0x100000000) to THAT host
+ * address instead of identity-mapping it. The guest still sees its
+ * own reset vector at the architecturally-correct 0xFFFFFFF0; only the
+ * underlying host-physical backing differs from a plain identity map.
+ * VARS.fd is placed first in the combined buffer, immediately followed
+ * by CODE.fd, matching their real relative guest-physical layout
+ * (VARS immediately below CODE).
+ *
+ * Scope note (deliberate, for this first real-OVMF launch attempt):
+ * the whole combined region is ordinary present, executable guest
+ * memory -- NOT wiring VARS through M4-3's pflash MMIO-trap model yet.
+ * Real CODE+VARS placement (VARS immediately below CODE, neither file
+ * a round 2MB multiple) means the two regions don't align to this
+ * project's own NPT granularity (2MB PS=1 leaf entries only, no 4KB PT
+ * level exists in this paging model) -- VARS's own not-present region
+ * would inevitably bleed into CODE's own first ~1.4MB, breaking its
+ * execute-in-place fetches. Reconciling that is real, separate design
+ * work; deferred until this first attempt confirms whether the reset-
+ * vector-launch mechanism itself even works and shows what real
+ * OVMF's SEC phase actually touches first -- SEC-phase code runs
+ * strictly XIP from ROM for quite a while before DXE-phase variable
+ * services would ever touch VARS, so this is unlikely to matter yet.
+ *
+ * Loaded once, on the BSP in efi_main() before MP dispatch (same
+ * ordering/reasoning as g_m2_7_guest_code_phys/g_ram_1_base_phys
+ * above -- Boot Services calls from a non-BSP AP context is untested
+ * territory this project has deliberately avoided all session).
+ */
+static uint64_t g_fw_1_combined_host_phys;
+static uint64_t g_fw_1_combined_size;
+static uint64_t g_fw_1_code_size;
+static uint64_t g_fw_1_vars_size;
+static uint8_t g_fw_1_guest_stack[65536] __attribute__((aligned(4096)));
+static hype_pic_emu_t g_fw_1_pic;
+static hype_pit_emu_t g_fw_1_pit;
 
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
@@ -298,6 +356,26 @@ static uint64_t hype_alloc_pages_any(EFI_BOOT_SERVICES *bs, UINTN pages) {
                    (unsigned long long)status);
     }
     return (uint64_t)mem;
+}
+
+/*
+ * Like hype_alloc_pages_any(), but guarantees the returned host-physical
+ * address is 2MB-aligned. hype_npt_map_range() (arch/x86_64/svm/npt.h)
+ * encodes its host_phys_base into PS=1 (2MB) PDEs, which require the
+ * address's low 21 bits to be zero -- UEFI's AllocatePages only ever
+ * guarantees 4KB alignment, so a plain hype_alloc_pages_any() call here
+ * silently produces a PDE with garbage in its reserved low bits, which
+ * hardware treats as a page-level protection violation (an NPF on the
+ * very first access, not a not-present fault) rather than anything
+ * obviously "unaligned". Over-allocates by up to one extra 2MB granule
+ * and returns the aligned address within it; the leading unaligned pages
+ * are simply left allocated and unused (never freed -- this hypervisor
+ * never exits).
+ */
+static uint64_t hype_alloc_pages_any_2mb_aligned(EFI_BOOT_SERVICES *bs, uint64_t size) {
+    UINTN pages = (UINTN)((size + HYPE_PAGING_2MB) / 4096ULL);
+    uint64_t raw = hype_alloc_pages_any(bs, pages);
+    return (raw + HYPE_PAGING_2MB - 1) & ~(HYPE_PAGING_2MB - 1);
 }
 
 typedef struct {
@@ -2003,6 +2081,174 @@ static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         (unsigned long long)ahci_mapped_base, HYPE_ATAPI_SECTOR_SIZE);
 }
 
+/*
+ * FW-1: the first attempt at launching this project's own real,
+ * unmodified vendored OVMF (M4-2) -- not a hand-written synthetic test
+ * guest. Real-mode entry at the classic x86 reset vector, using the
+ * genuine hardware reset convention (CS.base=0xFFFF0000, RIP=0xFFF0,
+ * linear=0xFFFFFFF0) rather than folding the whole address into
+ * CS.base with RIP=0 the way every prior synthetic test guest does --
+ * real firmware's own ResetVector code depends on RIP starting near
+ * the top of its 16-bit range (see hype_svm_vcpu_set_rip()'s comment).
+ * Reuses hype_svm_vcpu_create()'s existing "CS.base is whatever the
+ * hypervisor sets directly" convention (M2-7's own, already-proven
+ * mechanism) rather than a new VMCB builder -- the guest never inspects
+ * its own CS *selector* value, only the linear address it lands at,
+ * which is correct here regardless.
+ *
+ * This is fundamentally exploratory: nothing in this project has ever
+ * run real third-party firmware before, only fully-controlled
+ * hand-written payloads. The dispatch loop below handles exactly the
+ * VM-exits already built for that reason (CPUID, MSR) and lets
+ * anything else fall through to a fatal with full diagnostic info
+ * (reason/qualification/guest_rip) -- that fatal message is the actual
+ * point of this first attempt: whatever it reports is what needs
+ * building next, iterated the same log-driven way every other
+ * real-hardware-facing piece of this project has been.
+ */
+static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("fw-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
+    hype_pic_emu_reset(&g_fw_1_pic);
+    hype_pit_emu_reset(&g_fw_1_pit);
+
+    /* Real x86 reset state is CS.base=0xFFFF0000, RIP=0xFFF0 -- NOT
+     * CS.base=0xFFFFFFF0, RIP=0, despite both giving the identical
+     * initial linear address. Real firmware's own ResetVector code
+     * relies on RIP starting near the *top* of its 16-bit range (its
+     * own first jump is a negative/backward displacement); starting
+     * RIP at 0 instead underflows that same displacement into a #GP
+     * against the real-mode CS limit (see hype_svm_vcpu_set_rip()'s own
+     * comment -- confirmed empirically, not guessed). */
+    reset_cs_base = 0x100000000ULL - 0x10000ULL; /* 0xFFFF0000 */
+    reset_rip = 0xFFF0ULL;
+    stack_top = (uint64_t)(uintptr_t)(g_fw_1_guest_stack + sizeof(g_fw_1_guest_stack));
+
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+    /* Guest-physical [4GB - combined_size, 4GB) -> wherever the
+     * combined VARS+CODE content actually got allocated (see
+     * g_fw_1_combined_host_phys's own comment for why NOT an identity
+     * map here). combined_size is a whole multiple of HYPE_PAGING_2MB
+     * (confirmed: both file sizes are individually page-aligned, and
+     * this project's own vendored build's CODE+VARS together land on
+     * a 2MB-aligned combined size too). */
+    hype_npt_map_range(g_npt_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
+                        g_fw_1_combined_size);
+    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+
+    hype_debug_print(
+        "fw-1: launching real OVMF at cs_base=0x%llx rip=0x%llx (guest-physical [0x%llx,0x100000000) -> "
+        "host-physical 0x%llx)\n",
+        (unsigned long long)reset_cs_base, (unsigned long long)reset_rip,
+        (unsigned long long)(0x100000000ULL - g_fw_1_combined_size),
+        (unsigned long long)g_fw_1_combined_host_phys);
+
+    ctx = hype_svm_vcpu_create(reset_cs_base, stack_top, npt_root_phys);
+    if (ctx == 0) {
+        hype_fatal("fw-1: vcpu_create failed");
+    }
+    hype_svm_vcpu_set_rip(ctx, reset_rip);
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
+            hype_svm_vcpu_handle_cpuid(ctx);
+            continue;
+        }
+        if (info.reason == HYPE_SVM_EXITCODE_MSR) {
+            if (hype_svm_vcpu_handle_msr(ctx) != 0) {
+                hype_fatal("fw-1: unhandled guest MSR access (qual=0x%llx guest_rip=0x%llx)",
+                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+            }
+            continue;
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+            hype_svm_npf_t npf;
+            hype_svm_vcpu_get_last_npf(ctx, &npf);
+            hype_fatal("fw-1: unhandled NPF at guest-physical 0x%llx (%s, guest_rip=0x%llx)",
+                       (unsigned long long)npf.guest_phys_addr, npf.is_write ? "write" : "read",
+                       (unsigned long long)info.guest_rip);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
+            if (hype_svm_vcpu_handle_ioio(ctx, &g_fw_1_pic, &g_fw_1_pit) == 0) {
+                continue;
+            }
+
+            {
+                hype_svm_ioio_t io;
+                hype_svm_vcpu_handle_unknown_ioio(ctx, &io);
+                hype_debug_print("fw-1: unhandled port 0x%x %s size=%u -- absorbing\n",
+                                  (unsigned int)io.port, io.is_in ? "IN" : "OUT",
+                                  (unsigned int)io.size_bytes);
+            }
+            continue;
+        }
+
+        if (info.reason >= HYPE_SVM_EXITCODE_EXCEPTION_BASE &&
+            info.reason <= HYPE_SVM_EXITCODE_EXCEPTION_BASE + 31) {
+            hype_svm_debug_state_t dbg;
+            uint8_t *fault_bytes;
+            hype_svm_vcpu_get_debug_state(ctx, &dbg);
+
+            /* cs_base=0 (flat protected mode) here, so dbg.rip already
+             * is the linear == guest-physical == host-physical address
+             * (this project's NPT identity-maps ordinary RAM) -- a raw
+             * host pointer dereference is safe pre-ExitBootServices,
+             * same reasoning devices/pflash.h's own direct-memory-
+             * access callers already rely on. */
+            fault_bytes = (uint8_t *)(uintptr_t)dbg.rip;
+            hype_debug_print("fw-1: bytes at rip: %x %x %x %x %x %x %x %x %x %x %x %x\n",
+                              fault_bytes[0], fault_bytes[1], fault_bytes[2], fault_bytes[3],
+                              fault_bytes[4], fault_bytes[5], fault_bytes[6], fault_bytes[7],
+                              fault_bytes[8], fault_bytes[9], fault_bytes[10], fault_bytes[11]);
+
+            /* This is the generic CopyMem() leaf primitive (confirmed
+             * against fw/OVMF_CODE.fd's own raw bytes), pushed rsi/rdi
+             * at entry -- the return address into whoever actually
+             * called CopyMem(dest=0, ...) is 2 qwords above the current
+             * RSP. Same raw-host-pointer reasoning as fault_bytes
+             * above. */
+            {
+                uint64_t *stack = (uint64_t *)(uintptr_t)dbg.rsp;
+                uint8_t *caller_bytes = (uint8_t *)(uintptr_t)stack[2];
+                hype_debug_print("fw-1: rsp=0x%llx [0]=0x%llx [1]=0x%llx [2]=0x%llx [3]=0x%llx\n",
+                                  (unsigned long long)dbg.rsp, (unsigned long long)stack[0],
+                                  (unsigned long long)stack[1], (unsigned long long)stack[2],
+                                  (unsigned long long)stack[3]);
+                hype_debug_print("fw-1: bytes at [2]-8: %x %x %x %x %x %x %x %x | %x %x %x %x\n",
+                                  caller_bytes[-8], caller_bytes[-7], caller_bytes[-6], caller_bytes[-5],
+                                  caller_bytes[-4], caller_bytes[-3], caller_bytes[-2], caller_bytes[-1],
+                                  caller_bytes[0], caller_bytes[1], caller_bytes[2], caller_bytes[3]);
+            }
+
+            hype_fatal("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr2=0x%llx cr3=0x%llx rip=0x%llx",
+                       (unsigned long long)(info.reason - HYPE_SVM_EXITCODE_EXCEPTION_BASE),
+                       (unsigned long long)info.qualification, (unsigned long long)dbg.cr0,
+                       (unsigned long long)dbg.cr2, (unsigned long long)dbg.cr3,
+                       (unsigned long long)dbg.rip);
+        }
+
+        break;
+    }
+
+    hype_fatal("fw-1: real OVMF exited the initial dispatch loop (reason=0x%llx qual=0x%llx guest_rip=0x%llx)",
+               (unsigned long long)info.reason, (unsigned long long)info.qualification,
+               (unsigned long long)info.guest_rip);
+}
+
 /* Runs every test guest in sequence -- what actually gets dispatched
  * (inline on the BSP, or onto a pinned AP; see efi_main) so each new
  * milestone's test guest still exercises real 1:1 vCPU-to-pCPU
@@ -2019,6 +2265,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_ram_1_test(args->ops, args->kind);
     run_pci_1_test(args->ops, args->kind);
     run_pci_2_test(args->ops, args->kind);
+    run_fw_1_test(args->ops, args->kind);
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
@@ -2190,6 +2437,77 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             g_ram_1_size_bytes = (uint64_t)HYPE_RAM_1_TEST_MEM_MB * 1024ULL * 1024ULL;
             pages = (UINTN)(g_ram_1_size_bytes / 4096ULL);
             g_ram_1_base_phys = hype_alloc_pages_any(SystemTable->BootServices, pages);
+        }
+
+        /*
+         * FW-1: read this project's own vendored guest firmware from
+         * the same ESP hype.efi was itself booted from, into one
+         * ordinary, freely-allocated host-physical buffer (see
+         * g_fw_1_combined_host_phys's own comment for why NOT the
+         * literal top-of-4GB guest-physical address) -- VARS.fd first,
+         * CODE.fd immediately after, matching their real relative
+         * guest-physical layout.
+         */
+        {
+            EFI_FILE_PROTOCOL *root = 0;
+            EFI_STATUS fw_status;
+            uint64_t content_size, mapped_size, content_start;
+
+            fw_status = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
+            if (fw_status != EFI_SUCCESS) {
+                hype_fatal("fw-1: hype_file_locate_root failed: 0x%llx", (unsigned long long)fw_status);
+            }
+
+            fw_status = hype_file_get_size(root, SystemTable->BootServices,
+                                            (CHAR16 *)L"\\EFI\\hype\\OVMF_CODE.fd", &g_fw_1_code_size);
+            if (fw_status != EFI_SUCCESS) {
+                hype_fatal("fw-1: hype_file_get_size(OVMF_CODE.fd) failed: 0x%llx",
+                           (unsigned long long)fw_status);
+            }
+            fw_status = hype_file_get_size(root, SystemTable->BootServices,
+                                            (CHAR16 *)L"\\EFI\\hype\\OVMF_VARS.fd", &g_fw_1_vars_size);
+            if (fw_status != EFI_SUCCESS) {
+                hype_fatal("fw-1: hype_file_get_size(OVMF_VARS.fd) failed: 0x%llx",
+                           (unsigned long long)fw_status);
+            }
+
+            /* hype_npt_map_range() requires a whole-2MB-multiple size
+             * -- round up rather than assume this vendored build's own
+             * file sizes happen to add up to one exactly (they
+             * currently do, but a rebuilt OVMF might not). Any padding
+             * goes at the START of the allocated/mapped region (the
+             * lowest addresses) -- real file content is always placed
+             * flush against the END, so guest-physical 4GB - 16 (the
+             * reset vector) keeps landing on CODE's own real last
+             * bytes regardless of padding. */
+            content_size = g_fw_1_code_size + g_fw_1_vars_size;
+            mapped_size = (content_size + HYPE_PAGING_2MB - 1) & ~(HYPE_PAGING_2MB - 1);
+            g_fw_1_combined_size = mapped_size;
+
+            g_fw_1_combined_host_phys =
+                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, mapped_size);
+            hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_combined_host_phys, mapped_size);
+
+            content_start = g_fw_1_combined_host_phys + (mapped_size - content_size);
+            fw_status = hype_file_read_into(root, (CHAR16 *)L"\\EFI\\hype\\OVMF_VARS.fd",
+                                             (void *)(uintptr_t)content_start, g_fw_1_vars_size);
+            if (fw_status != EFI_SUCCESS) {
+                hype_fatal("fw-1: hype_file_read_into(OVMF_VARS.fd) failed: 0x%llx",
+                           (unsigned long long)fw_status);
+            }
+            fw_status = hype_file_read_into(root, (CHAR16 *)L"\\EFI\\hype\\OVMF_CODE.fd",
+                                             (void *)(uintptr_t)(content_start + g_fw_1_vars_size),
+                                             g_fw_1_code_size);
+            if (fw_status != EFI_SUCCESS) {
+                hype_fatal("fw-1: hype_file_read_into(OVMF_CODE.fd) failed: 0x%llx",
+                           (unsigned long long)fw_status);
+            }
+
+            hype_debug_print(
+                "fw-1: OVMF_VARS.fd+OVMF_CODE.fd (%llu bytes content, %llu bytes mapped) loaded at "
+                "host-physical 0x%llx\n",
+                (unsigned long long)content_size, (unsigned long long)mapped_size,
+                (unsigned long long)g_fw_1_combined_host_phys);
         }
 
         args.ops = ops;

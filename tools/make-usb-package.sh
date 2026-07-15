@@ -42,6 +42,13 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/EFI/BOOT"
 cp "$REPO_ROOT/build/hype.efi" "$OUT_DIR/EFI/BOOT/BOOTX64.EFI"
 cp "$SCRIPT_DIR/usb-package-README.md" "$OUT_DIR/README.md"
+# FW-1: hype.efi reads its own vendored guest firmware pair from
+# \EFI\hype\ on the same volume it was itself booted from (core/
+# file_io.h) -- must be present here for the real-OVMF-guest launch to
+# find them, same path the QEMU `make run` target already copies these
+# to (see Makefile's own `run` target).
+mkdir -p "$OUT_DIR/EFI/hype"
+cp "$REPO_ROOT/fw/OVMF_CODE.fd" "$REPO_ROOT/fw/OVMF_VARS.fd" "$OUT_DIR/EFI/hype/"
 
 echo "make-usb-package.sh: building $IMG_PATH (FAT32, ${IMG_SIZE_MB}MB)..."
 mkdir -p "$RELEASE_DIR"
@@ -50,7 +57,10 @@ dd if=/dev/zero of="$IMG_PATH" bs=1M count="$IMG_SIZE_MB" status=none
 mformat -i "$IMG_PATH" -F ::
 mmd -i "$IMG_PATH" ::/EFI
 mmd -i "$IMG_PATH" ::/EFI/BOOT
+mmd -i "$IMG_PATH" ::/EFI/hype
 mcopy -i "$IMG_PATH" "$REPO_ROOT/build/hype.efi" ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i "$IMG_PATH" "$REPO_ROOT/fw/OVMF_CODE.fd" ::/EFI/hype/OVMF_CODE.fd
+mcopy -i "$IMG_PATH" "$REPO_ROOT/fw/OVMF_VARS.fd" ::/EFI/hype/OVMF_VARS.fd
 
 echo
 echo "make-usb-package.sh: done."

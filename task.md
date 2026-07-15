@@ -810,9 +810,124 @@ tasks — see updated deps below.*
   as ordinary executable NPT-backed guest memory (not the pflash
   MMIO-trap model, which stays correct for OVMF_VARS.fd only).
   Deps: RAM-2, CPUMSR-2, M4-2, M4-3
+
+  *Substantial progress, not yet complete -- real OVMF now executes
+  correctly through real-mode -> protected-mode -> long-mode with
+  paging enabled, several real, independently-valuable bugs found and
+  fixed along the way, but a guest-internal #PF (destination address 0
+  in a CopyMem-style bulk copy, deep in SEC-phase C code) still blocks
+  full boot. In order found:*
+  - *`core/file_io.h/.c` (new): reads OVMF_CODE.fd/OVMF_VARS.fd from
+    the same ESP hype.efi was booted from, via
+    EFI_LOADED_IMAGE_PROTOCOL + EFI_SIMPLE_FILE_SYSTEM_PROTOCOL +
+    EFI_FILE_PROTOCOL. 100%/100%/100% unit-tested via fake protocol
+    structs (`core/tests/test_file_io.c`).*
+  - ***Bug (transcription)***: `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` in
+    `core/efi_types.h` was missing its leading `UINT64 Revision;`
+    field, so `OpenVolume()` called through the wrong byte offset --
+    corrupted the *host* (outer) firmware's own memory and crashed it.
+    Caught via a real host-firmware `#PF` crash dump, fixed by adding
+    the field.
+  - **`hype_npt_map_range()`** (new, `arch/x86_64/svm/npt.h/.c`):
+    remaps an arbitrary guest-physical range to a *different*
+    host-physical range (non-identity), needed because the reset
+    vector's guest-physical address (top of 4GB) is NOT safe to
+    identity-map -- that literal host-physical range is where the
+    outer/host firmware's own real flash lives on this nested-SVM dev
+    box (and would be real BIOS/UEFI flash on bare metal). Both bases
+    must be 2MB-aligned (this project's NPT/paging is 2MB-PS-only, no
+    4KB level). 100%/100%/100% unit-tested.
+  - ***Bug (alignment)***: the combined VARS+CODE buffer was allocated
+    via a plain `AllocatePages(AllocateAnyPages, ...)`, which UEFI only
+    guarantees 4KB-aligned, not the 2MB alignment `hype_npt_map_range`
+    requires for its PS=1 PDEs. A misaligned host-phys base leaves
+    garbage in the PDE's reserved low bits -- hardware reports this as
+    a *permission violation* NPF (EXITINFO1 bit0=1, "entry present")
+    on the very first guest fetch, not a not-present fault, which is
+    actively misleading. Fixed by adding
+    `hype_alloc_pages_any_2mb_aligned()` (over-allocates by up to one
+    extra 2MB granule, returns the aligned address within it).
+  - ***Bug (guest isolation)***: `hype_vmcb_build_realmode_guest()`
+    never set `HYPE_SVM_INTERCEPT_IOIO_PROT`, and
+    `hype_svm_vcpu_create()` never filled `g_iopm` -- every prior
+    real-mode test guest never executed I/O, so this went unnoticed,
+    but real OVMF does real port I/O (A20 gate, CMOS, fw_cfg, legacy
+    PCI, ...) immediately. Without this, that I/O reaches real host
+    hardware completely unmediated -- the exact same class of gap
+    CPUMSR-1/2 fixed for CPUID/MSR, now extended to IOIO for the
+    real-mode path too (matching M3-5's long-mode path, which already
+    had it). Also added `hype_svm_vcpu_handle_unknown_ioio()` (a safe
+    generic default -- IN reads back all-1s, matching devices/pci.h's
+    own "absent device" convention; OUT is dropped) since real OVMF
+    probes far more ports than the PIC/PIT allow-list covers.
+  - ***Bug (guest isolation, diagnostic)***: no exception vector was
+    ever intercepted (`intercept_exceptions` was always 0). An
+    unhandled guest exception (e.g. #GP) was silently delivered to the
+    guest's own IDT instead of exiting to us -- real EDK2 firmware's
+    own early exception handlers frequently just spin forever
+    (`CpuDeadLoop()`-style) rather than crash, which is
+    indistinguishable from a genuine hang with no further VM-exits at
+    all. Fixed by intercepting all 32 vectors (`0xFFFFFFFF`) and
+    reporting vector/error-code/CS/CR0/CR2/CR3/RIP/RSP on any hit.
+  - ***Bug (reset-vector convention)***: this project's established
+    "CS.base = full reset address, RIP = 0" convention (correct for
+    every hand-written synthetic real-mode test guest since M2-7) does
+    NOT match real x86 hardware reset state (`CS.base=0xFFFF0000,
+    RIP=0xFFF0` -- same resulting linear address, `0xFFFFFFF0`, but a
+    different RIP). Real firmware's own ResetVector code depends on RIP
+    starting near the *top* of its 16-bit range: its own first jump is
+    a small backward/negative displacement, which stays positive from
+    RIP=0xFFF0 but *underflows* 16-bit arithmetic into a huge positive
+    offset from RIP=0, exceeding the real-mode CS limit (0xFFFF) and
+    raising #GP. Confirmed empirically (guest faulted at RIP=0x10000,
+    exactly one past the limit, on the very first instruction). Fixed
+    by adding `hype_svm_vcpu_set_rip()` and using the genuine hardware
+    convention for FW-1 specifically (every other real-mode test guest
+    is untouched, still using RIP=0 deliberately).
+  - ***Bug (CPUID under-reporting)***: `hype_cpuid_emulate()` reported
+    max extended leaf `0x80000001`, so real firmware skips querying
+    leaf `0x80000008` (physical/linear address widths) entirely,
+    falling back to a hardcoded default. Fixed by bumping the
+    max-extended-leaf report to `0x80000008` and passing that leaf
+    through from the real host value (address width isn't
+    guest-isolation-sensitive, only correctness-sensitive here).
+    Confirmed via unit test; did NOT resolve the current blocking #PF
+    on its own, but is a real, independently-valuable correctness fix
+    kept regardless.
+  - **Current blocker**: after A20-gate enable (port 0x92, absorbed by
+    the new generic IOIO default) and no other device access, the
+    guest reaches full 64-bit long mode with paging enabled
+    (CR0=0x80000033) entirely within its own small SEC-phase temporary
+    RAM window (CR3=0x800000), then raises a #PF: a `REP MOVSQ`
+    (EDK2's generic `CopyMem`/`InternalMemCopyMem` primitive, confirmed
+    byte-for-byte against the raw `fw/OVMF_CODE.fd` file at flash
+    offset `0x3484f9`) writes to guest-linear address exactly 0
+    (CR2=0). The caller (return address 0x83dd0b, found via the
+    `[3]=0x5AA55AA55AA55AA5` `PcdInitValueInTemporaryStack` fill-marker
+    on the stack) does `mov r8, rdi; call CopyMem` with RDI already 0
+    at the call site -- the actual bad-destination computation happens
+    further up the call chain, not yet isolated. `/edk2` (the vendored
+    EDK2 source submodule, `OvmfPkg/Sec/SecMain.c`,
+    `OvmfPkg/Library/PlatformInitLib/MemDetect.c`) is available locally
+    for continued source-level investigation; `MemDetect.c` confirms
+    OVMF's real memory-size discovery needs either fw_cfg's "etc/e820"
+    file or, failing that, CMOS ports 0x34/0x35 -- neither is wired up
+    for FW-1 yet (no fw_cfg device is registered for this guest at
+    all), a strong candidate for *some* destination miscalculation even
+    though no fw_cfg/CMOS port access had been observed yet at the
+    point of this specific fault.
+  - New diagnostic accessors added for this investigation, all exempt
+    from unit testing (same reasoning as every other
+    `hype_svm_vcpu_handle_*` glue function): `hype_svm_vcpu_get_last_npf()`,
+    `hype_svm_vcpu_get_debug_state()` (CS/CR0/CR2/CR3/RIP/RFLAGS/RSP),
+    `hype_svm_vcpu_set_rip()`.
+
 - [ ] **FW-2** — Load OVMF_CODE.fd/OVMF_VARS.fd from fw/ into guest RAM
   at boot, replacing the fixed hand-written test-guest entry points
-  used through M4-5/VIDEO-2.
+  used through M4-5/VIDEO-2. (File loading itself is already done as
+  part of FW-1's own work above -- this task now just tracks the
+  remaining "guest actually boots" milestone once FW-1's blocker is
+  resolved.)
   Deps: FW-1
 
 ---

@@ -68,9 +68,50 @@ static void test_mark_not_present(void) {
               g_pd[2][4] != 0);
 }
 
+static void test_map_range_single_entry(void) {
+    hype_npt_build_identity(g_pml4, g_pdpt, g_pd, 3);
+
+    /* Remap guest-physical 1GB (gb=1, pd index 0) to a completely
+     * different host-physical address -- e.g. the classic "top of
+     * 4GB" range this project's own build_identity sweep would
+     * otherwise identity-map onto real host firmware flash instead of
+     * available RAM (FW-1). */
+    hype_npt_map_range(g_pd, HYPE_PAGING_1GB, 0xDEAD000000ULL, HYPE_PAGING_2MB);
+
+    CHECK_HEX("remapped entry points at the new host address", 0xDEAD000000ULL,
+              g_pd[1][0] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("remapped entry still present+write+user+ps",
+              HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_USER | HYPE_PAGING_PS,
+              g_pd[1][0] & 0xFFFULL);
+    CHECK_HEX("neighboring entry (pd[1][1]) untouched -- still identity",
+              HYPE_PAGING_1GB + HYPE_PAGING_2MB, g_pd[1][1] & 0x000FFFFFFFFFF000ULL);
+}
+
+static void test_map_range_spans_multiple_entries_and_gb_boundary(void) {
+    hype_npt_build_identity(g_pml4, g_pdpt, g_pd, 3);
+
+    /* Starts at the last 2MB entry of gb=0 and spans into gb=1 --
+     * exercises the gb/pd_index recomputation crossing a 1GB
+     * boundary, matching FW-1's own real address layout (guest-
+     * physical 0xFFC00000, within gb=3, spanning its last two 2MB
+     * entries). */
+    hype_npt_map_range(g_pd, 511ULL * HYPE_PAGING_2MB, 0x9000000000ULL, 2ULL * HYPE_PAGING_2MB);
+
+    CHECK_HEX("first remapped entry (pd[0][511])", 0x9000000000ULL,
+              g_pd[0][511] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("second remapped entry (pd[1][0])", 0x9000000000ULL + HYPE_PAGING_2MB,
+              g_pd[1][0] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("entry before the remapped range (pd[0][510]) untouched -- still identity",
+              510ULL * HYPE_PAGING_2MB, g_pd[0][510] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("entry after the remapped range (pd[1][1]) untouched -- still identity",
+              HYPE_PAGING_1GB + HYPE_PAGING_2MB, g_pd[1][1] & 0x000FFFFFFFFFF000ULL);
+}
+
 int main(void) {
     test_build_identity();
     test_mark_not_present();
+    test_map_range_single_entry();
+    test_map_range_spans_multiple_entries_and_gb_boundary();
 
     if (failures == 0) {
         printf("all tests passed\n");

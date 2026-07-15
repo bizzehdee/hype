@@ -40,12 +40,23 @@ void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint
     /* Intercept HLT (the guest's only instruction, M2-7), shutdown
      * (a triple fault -- no exception handling exists yet, so a
      * shutdown must come back to us rather than reset the machine),
-     * and CPUID/MSR (CPUMSR-1/CPUMSR-2 -- guest-isolation baseline:
-     * without these, CPUID/RDMSR/WRMSR execute natively against the
-     * real host CPU). */
+     * CPUID/MSR (CPUMSR-1/CPUMSR-2), and IOIO (FW-1 -- a real firmware
+     * guest does real port I/O; hype_svm_vcpu_create()'s own g_iopm
+     * fill is what actually marks every port intercepted, same
+     * "control bit only enables interception, the bitmap decides per-
+     * port" split hype_svm_vcpu_create_long_mode() already documents)
+     * -- guest-isolation baseline: without these, CPUID/RDMSR/WRMSR/
+     * IN/OUT execute natively against the real host CPU/hardware. */
     vmcb->control.intercept_misc1 = HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN |
-                                     HYPE_SVM_INTERCEPT_CPUID | HYPE_SVM_INTERCEPT_MSR_PROT;
+                                     HYPE_SVM_INTERCEPT_CPUID | HYPE_SVM_INTERCEPT_MSR_PROT |
+                                     HYPE_SVM_INTERCEPT_IOIO_PROT;
     vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_VMRUN;
+
+    /* FW-1: intercept every guest exception vector (see
+     * HYPE_SVM_EXITCODE_EXCEPTION_BASE's own comment) -- real firmware
+     * catching its own unexpected fault and spinning forever looks
+     * identical to a genuine hang unless we see the fault first. */
+    vmcb->control.intercept_exceptions = 0xFFFFFFFFu;
 
     vmcb->control.iopm_base_pa = iopm_phys;
     vmcb->control.msrpm_base_pa = msrpm_phys;

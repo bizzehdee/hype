@@ -29,3 +29,19 @@ void hype_npt_mark_not_present(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TA
 
     pd_tables[gb][pd_index] = 0;
 }
+
+void hype_npt_map_range(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE], uint64_t guest_phys_base,
+                         uint64_t host_phys_base, uint64_t size) {
+    uint64_t table_flags = HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_USER;
+    uint64_t page_flags = table_flags | HYPE_PAGING_PS;
+    uint64_t offset;
+
+    for (offset = 0; offset < size; offset += HYPE_PAGING_2MB) {
+        uint64_t guest_phys = guest_phys_base + offset;
+        uint64_t host_phys = host_phys_base + offset;
+        unsigned int gb = (unsigned int)(guest_phys / HYPE_PAGING_1GB);
+        unsigned int pd_index = (unsigned int)((guest_phys % HYPE_PAGING_1GB) / HYPE_PAGING_2MB);
+
+        pd_tables[gb][pd_index] = hype_paging_encode_entry(host_phys, page_flags);
+    }
+}

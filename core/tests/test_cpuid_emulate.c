@@ -53,7 +53,7 @@ static void test_leaf_extended_max_vendor_string(void) {
 
     hype_cpuid_emulate(0x80000000u, 0, &real, &out);
 
-    CHECK_HEX("max extended leaf", 0x80000001u, out.eax);
+    CHECK_HEX("max extended leaf", 0x80000008u, out.eax);
     CHECK_HEX("ebx \"Auth\"", 0x68747541u, out.ebx);
     CHECK_HEX("edx \"enti\"", 0x69746e65u, out.edx);
     CHECK_HEX("ecx \"cAMD\"", 0x444d4163u, out.ecx);
@@ -79,6 +79,18 @@ static void test_leaf_ext1_svm_already_clear_is_idempotent(void) {
     hype_cpuid_emulate(0x80000001u, 0, &real, &out);
 
     CHECK_HEX("ecx unchanged when SVM bit already clear", real.ecx, out.ecx);
+}
+
+static void test_leaf_ext8_address_sizes_passthrough(void) {
+    hype_cpuid_result_t real = {0x00003028u, 0x00000000u, 0x00000000u, 0x00000000u};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate(0x80000008u, 0, &real, &out);
+
+    CHECK_HEX("eax passthrough (phys/linear address widths)", real.eax, out.eax);
+    CHECK_HEX("ebx passthrough", real.ebx, out.ebx);
+    CHECK_HEX("ecx passthrough", real.ecx, out.ecx);
+    CHECK_HEX("edx passthrough", real.edx, out.edx);
 }
 
 static void test_hypervisor_leaf_signature(void) {
@@ -124,6 +136,7 @@ int main(void) {
     test_leaf_extended_max_vendor_string();
     test_leaf_ext1_clears_svm_bit();
     test_leaf_ext1_svm_already_clear_is_idempotent();
+    test_leaf_ext8_address_sizes_passthrough();
     test_hypervisor_leaf_signature();
     test_unhandled_leaf_returns_all_zero();
     test_unhandled_extended_leaf_returns_all_zero();

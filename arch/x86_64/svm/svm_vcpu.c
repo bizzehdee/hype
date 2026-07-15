@@ -40,11 +40,9 @@ static struct hype_vcpu_ctx g_ctx;
 /* AMD SDM: 12KB I/O permission map, 8KB MSR permission map -- VMRUN
  * always consults both, for every guest, regardless of whether it
  * ever executes I/O or RDMSR/WRMSR/etc. All-zero (this array's default,
- * BSS-zeroed) means "intercept nothing," correct for the real-mode
- * guest (hype_svm_vcpu_create() below), which never sets
- * HYPE_SVM_INTERCEPT_IOIO_PROT and so never consults this bitmap at
- * all; hype_svm_vcpu_create_long_mode() (M3-5), which does set that
- * bit, fills every byte with 0xFF first (see its own comment) so
+ * BSS-zeroed) would mean "intercept nothing"; both hype_svm_vcpu_create()
+ * (real-mode, FW-1 onward) and hype_svm_vcpu_create_long_mode() (M3-5)
+ * fill every byte with 0xFF first (see each function's own comment) so
  * every port actually traps instead of silently reaching real
  * hardware. */
 static uint8_t g_iopm[12288] __attribute__((aligned(4096)));
@@ -152,13 +150,18 @@ static void reset_gprs(void) {
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root) {
     unsigned i;
 
-    /* CPUMSR-2: this guest now sets HYPE_SVM_INTERCEPT_MSR_PROT
-     * (hype_vmcb_build_realmode_guest()) -- same "the bit only enables
-     * interception, the bitmap decides per-MSR" reasoning as
-     * hype_svm_vcpu_create_long_mode()'s own g_iopm fill below. All-
-     * zero (BSS default) would mean "intercept nothing," letting every
-     * guest RDMSR/WRMSR reach real hardware directly despite the
-     * intercept bit being set. */
+    /* FW-1: this guest now sets HYPE_SVM_INTERCEPT_IOIO_PROT too
+     * (hype_vmcb_build_realmode_guest()) -- a real firmware guest does
+     * real port I/O, unlike every prior real-mode test guest. Same "the
+     * bit only enables interception, the bitmap decides per-port"
+     * reasoning hype_svm_vcpu_create_long_mode() already documents:
+     * all-zero would silently let every guest IN/OUT reach real
+     * hardware despite the intercept bit being set. */
+    for (i = 0; i < sizeof(g_iopm); i++) {
+        g_iopm[i] = 0xFFu;
+    }
+
+    /* CPUMSR-2: same reasoning, now for HYPE_SVM_INTERCEPT_MSR_PROT. */
     for (i = 0; i < sizeof(g_msrpm); i++) {
         g_msrpm[i] = 0xFFu;
     }
@@ -324,6 +327,44 @@ static inline uint64_t real_rdtsc(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+void hype_svm_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_svm_npf_t *out) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, out);
+}
+
+void hype_svm_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *out) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, out);
+
+    if (out->is_in) {
+        uint64_t mask =
+            (out->size_bytes == 1u) ? 0xFFULL : (out->size_bytes == 2u) ? 0xFFFFULL : 0xFFFFFFFFULL;
+        real->vmcb->save.rax = (real->vmcb->save.rax & ~mask) | mask;
+    }
+
+    /* EXITINFO2 gives the resume RIP directly, same "next-RIP-for-free"
+     * convenience hype_svm_vcpu_handle_ioio() itself already relies on. */
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+}
+
+void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    out->cs_selector = real->vmcb->save.cs.selector;
+    out->cs_base = real->vmcb->save.cs.base;
+    out->cr0 = real->vmcb->save.cr0;
+    out->cr2 = real->vmcb->save.cr2;
+    out->cr3 = real->vmcb->save.cr3;
+    out->rip = real->vmcb->save.rip;
+    out->rflags = real->vmcb->save.rflags;
+    out->rsp = real->vmcb->save.rsp;
+}
+
+void hype_svm_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->vmcb->save.rip = rip;
 }
 
 int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {

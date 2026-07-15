@@ -14,7 +14,7 @@ BUILD_DIR := build
 CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/serial.c core/serial_hw.c core/font8x8.c core/gop.c core/gop_text.c \
              core/fatal.c core/strutil.c core/guest_ram.c core/mp.c core/linux_boot.c \
-             core/admission.c
+             core/admission.c core/file_io.c
 ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
              arch/x86_64/cpu/paging.c arch/x86_64/cpu/paging_load.c \
@@ -75,6 +75,8 @@ run: $(OUT)
 	@mkdir -p $(ESP)/EFI/BOOT
 	cp $(OUT) $(ESP)/EFI/BOOT/BOOTX64.EFI
 	cp $(OVMF_VARS) $(BUILD_DIR)/OVMF_VARS.fd
+	@mkdir -p $(ESP)/EFI/hype
+	cp fw/OVMF_CODE.fd fw/OVMF_VARS.fd $(ESP)/EFI/hype/
 	qemu-system-x86_64 \
 	  -machine q35 -m 512 -nodefaults \
 	  -accel kvm -accel tcg -cpu host -smp 2 \

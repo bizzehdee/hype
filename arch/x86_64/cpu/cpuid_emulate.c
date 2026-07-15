@@ -32,7 +32,7 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
     }
 
     if (eax_in == 0x80000000u) {
-        out->eax = 0x80000001u; /* max extended leaf supported */
+        out->eax = 0x80000008u; /* max extended leaf supported */
         out->ebx = 0x68747541u; /* "Auth" */
         out->edx = 0x69746e65u; /* "enti" */
         out->ecx = 0x444d4163u; /* "cAMD" */
@@ -44,6 +44,26 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
         out->edx = real->edx;
         out->ecx = real->ecx & ~HYPE_CPUID_EXT1_ECX_SVM_BIT;
         out->ebx = 0;
+        return;
+    }
+
+    if (eax_in == 0x80000008u) {
+        /* EAX bits 7:0/15:8 = physical/linear address widths -- real
+         * firmware's own page-table setup (SEC/PEI, before permanent
+         * memory is even found) reads this to decide how many
+         * page-table levels/entries to build. Under-reporting it (this
+         * leaf previously wasn't recognized at all, falling through to
+         * the safe-looking but wrong all-zero default) let firmware
+         * build page tables sized for a 0-bit address space, walking
+         * off the end of them almost immediately -- confirmed via
+         * FW-1's own real-OVMF boot attempt (a guest #PF, not an NPF,
+         * right after CR0.PG was set). Passed through as-is: address
+         * width isn't guest-isolation-sensitive, only correctness-
+         * sensitive here. */
+        out->eax = real->eax;
+        out->ebx = real->ebx;
+        out->ecx = real->ecx;
+        out->edx = real->edx;
         return;
     }
 

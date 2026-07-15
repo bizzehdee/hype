@@ -150,6 +150,84 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
 void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
 
 /*
+ * FW-1 real-hardware/real-firmware debugging: decodes and returns the
+ * most recent NPF's direction/faulting-guest-physical-address
+ * (hype_svm_decode_npf_info(), arch/x86_64/svm/vmcb.h) without
+ * dispatching to any specific device model -- for a guest this
+ * project doesn't yet have a full device model for (real, unmodified
+ * OVMF), knowing exactly *which* guest-physical address an
+ * unhandled NPF targeted is the actual diagnostic that matters, the
+ * same log-driven iteration this project has used for every other
+ * real-hardware-facing surprise. Exempt from unit testing -- reaches
+ * into the exempt VMCB fields this backend's real VMRUN produces;
+ * hype_svm_decode_npf_info() itself is already fully tested in
+ * isolation.
+ */
+void hype_svm_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_svm_npf_t *out);
+
+/*
+ * FW-1: decodes an IOIO VM-exit this project has no specific device
+ * model for (real, unmodified OVMF probes far more ports than
+ * hype_svm_vcpu_handle_ioio()'s PIC/PIT allow-list covers) and gives it
+ * a safe, generic default response instead of treating it as fatal --
+ * an IN reads back all-1s (this project's established "absent device"
+ * convention, matching devices/pci.h's own unbacked-config-space reads),
+ * an OUT is silently dropped -- then advances RIP via EXITINFO2, the
+ * same "next-RIP-for-free" convenience hype_svm_vcpu_handle_ioio()
+ * itself already relies on. Returns the decoded port/direction/size via
+ * `out` purely for the caller's own diagnostic logging. Exempt from unit
+ * testing -- reaches into the exempt VMCB/GPR fields this backend's
+ * real VMRUN produces; hype_svm_decode_ioio_info1() itself is already
+ * fully tested in isolation.
+ */
+void hype_svm_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *out);
+
+/*
+ * FW-1 real-hardware/real-firmware debugging: a snapshot of the guest
+ * state fields that matter for diagnosing a fault reported against
+ * this project's own "guest_rip" alone -- once a real-mode guest
+ * reloads CS (e.g. OVMF's own real-mode-to-protected-mode transition),
+ * CS.base is no longer the fixed reset-vector value this project's own
+ * CS.base trick relies on, and RIP alone stops meaning anything without
+ * knowing what CS.base/CR0.PE actually are at that moment.
+ */
+typedef struct {
+    uint16_t cs_selector;
+    uint64_t cs_base;
+    uint64_t cr0;
+    uint64_t cr2; /* faulting linear address, meaningful only after a guest #PF (vector 14) */
+    uint64_t cr3;
+    uint64_t rip;
+    uint64_t rflags;
+    uint64_t rsp;
+} hype_svm_debug_state_t;
+
+void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out);
+
+/*
+ * FW-1: overrides the RIP hype_svm_vcpu_create() otherwise hardcodes to
+ * 0 (correct for every synthetic real-mode test guest so far, which are
+ * free to assume RIP=0 as their own starting point). Real x86 hardware
+ * reset state is CS.base=0xFFFF0000, RIP=0xFFF0 -- NOT CS.base=
+ * 0xFFFFFFF0, RIP=0, despite both producing the identical initial
+ * linear address (base+rip=0xFFFFFFF0). The difference matters the
+ * instant the guest's own code executes a near jump with a *negative*
+ * displacement (EDK2's own ResetVector.asm does exactly this, jumping
+ * "backward" to an earlier label in the same 64KB page): starting from
+ * RIP=0xFFF0, a small negative displacement stays comfortably positive;
+ * starting from RIP=0 (this project's own prior convention), the exact
+ * same displacement underflows 16-bit arithmetic and wraps to a huge
+ * positive offset, exceeding the real-mode CS limit (0xFFFF) and
+ * raising #GP -- confirmed empirically (FW-1: guest faulted at
+ * rip=0x10000, exactly one past the 16-bit limit, with CS.base/CR0
+ * otherwise unchanged, i.e. still on the very first instruction).
+ * Callers needing genuine reset-vector semantics for real firmware must
+ * pass guest_rip=0xFFFF0000 (not 0xFFFFFFF0) to hype_svm_vcpu_create()
+ * and then call this to set rip=0xFFF0 afterward.
+ */
+void hype_svm_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip);
+
+/*
  * Handles an MSR (CPUMSR-2, RDMSR/WRMSR) VM-exit: decodes direction
  * from EXITINFO1 bit 0 (0=RDMSR, 1=WRMSR, per AMD SDM) and the MSR
  * number from RCX, calls hype_msr_decide() (arch/x86_64/cpu/
