@@ -60,6 +60,24 @@ void hype_npt_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
 void hype_npt_mark_not_present(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE], uint64_t phys_addr);
 
 /*
+ * Marks every 2MB PD entry in [base, base+size) not-present (FW-1a):
+ * the range version of hype_npt_mark_not_present(), used to leave a
+ * guest a clean map where only its real RAM region and its firmware
+ * flash window are present and EVERYTHING else faults. Any guest access
+ * to an unmapped 2MB range then takes a located #VMEXIT_NPF (with the
+ * guest-physical address in EXITINFO2) instead of silently reaching
+ * whatever the flat identity map would otherwise have pointed at --
+ * critically, the host's own sub-4GB MMIO hole, which reads all-1s and
+ * is exactly what let real OVMF read a garbage pointer and jump to it.
+ * `base` and `size` must both be 2MB-aligned; the whole range must fall
+ * within what hype_npt_build_identity() already sized (gb_to_map GB) --
+ * this only clears existing entries, it doesn't grow the table. Pure
+ * struct mutation, no CPU state touched.
+ */
+void hype_npt_mark_range_not_present(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE], uint64_t base,
+                                      uint64_t size);
+
+/*
  * Remaps `size` bytes (a whole multiple of HYPE_PAGING_2MB) of guest-
  * physical address space, starting at `guest_phys_base`, to
  * `host_phys_base` instead of the identity mapping

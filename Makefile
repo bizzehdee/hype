@@ -33,7 +33,7 @@ ARCH_ASM_SRCS := arch/x86_64/cpu/isr_stubs.S
 DEVICE_SRCS := devices/pic.c devices/pit.c devices/pflash.c devices/acpi.c devices/acpi_loader.c \
                devices/fw_cfg.c devices/ahci.c devices/atapi.c devices/ramfb.c devices/pci.c \
                devices/cmos.c devices/ps2_keyboard.c devices/ps2_mouse.c devices/bochs_vbe.c \
-               devices/fb_blit.c devices/virtio_blk.c devices/ata_disk.c
+               devices/fb_blit.c devices/virtio_blk.c devices/ata_disk.c devices/e820.c
 BOOT_SRCS := boot/main.c
 SRCS      := $(BOOT_SRCS) $(CORE_SRCS) $(ARCH_SRCS) $(DEVICE_SRCS)
 OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRCS)) \
@@ -89,7 +89,7 @@ run: $(OUT)
 	@mkdir -p $(ESP)/iso
 	cp $(TEST_ISO) $(ESP)/iso/test.iso
 	qemu-system-x86_64 \
-	  -machine q35 -m 512 -nodefaults \
+	  -machine q35 -m 2048 -nodefaults \
 	  -accel kvm -accel tcg -cpu host -smp 2 \
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,file=$(BUILD_DIR)/OVMF_VARS.fd \

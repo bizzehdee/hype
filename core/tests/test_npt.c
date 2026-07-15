@@ -107,9 +107,28 @@ static void test_map_range_spans_multiple_entries_and_gb_boundary(void) {
               HYPE_PAGING_1GB + HYPE_PAGING_2MB, g_pd[1][1] & 0x000FFFFFFFFFF000ULL);
 }
 
+static void test_mark_range_not_present_spans_gb_boundary(void) {
+    hype_npt_build_identity(g_pml4, g_pdpt, g_pd, 3);
+
+    /* FW-1a: clear guest-physical [0.5GB, 1.5GB) -- 512 * 2MB entries
+     * spanning the gb=0 -> gb=1 boundary -- the "punch out everything
+     * between guest RAM and the flash window" step. */
+    hype_npt_mark_range_not_present(g_pd, HYPE_PAGING_1GB / 2, HYPE_PAGING_1GB);
+
+    CHECK_HEX("entry just below the cleared range (pd[0][255]) untouched",
+              255ULL * HYPE_PAGING_2MB, g_pd[0][255] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("first cleared entry (pd[0][256])", 0, g_pd[0][256]);
+    CHECK_HEX("last entry of gb=0 cleared (pd[0][511])", 0, g_pd[0][511]);
+    CHECK_HEX("first entry of gb=1 cleared (pd[1][0])", 0, g_pd[1][0]);
+    CHECK_HEX("last cleared entry (pd[1][255])", 0, g_pd[1][255]);
+    CHECK_HEX("entry just above the cleared range (pd[1][256]) untouched -- still identity",
+              HYPE_PAGING_1GB + 256ULL * HYPE_PAGING_2MB, g_pd[1][256] & 0x000FFFFFFFFFF000ULL);
+}
+
 int main(void) {
     test_build_identity();
     test_mark_not_present();
+    test_mark_range_not_present_spans_gb_boundary();
     test_map_range_single_entry();
     test_map_range_spans_multiple_entries_and_gb_boundary();
 

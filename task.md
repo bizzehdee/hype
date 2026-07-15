@@ -1505,7 +1505,47 @@ asserts, EXITINTINFO/NRIP capture, and -- most importantly -- a
 correct, spec-cited root cause replacing a wrong one. FW-1 stays `[ ]`
 but is no longer a "mystery"; it's a well-scoped guest-memory-map task.
 
-- [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
+**Update (2026-07-15, FW-1a implemented + validated in QEMU -- the
+jump-to-(-1) is fixed; next blocker is the guest LAPIC).** Gave the
+guest a real, backed low-RAM map instead of the flat identity map that
+handed it the host MMIO hole:
+
+- **Guest RAM**: fixed 1 GiB (`HYPE_FW_1_GUEST_RAM_BYTES`, boot/main.c),
+  2MB-aligned, below the Q35 0xE0000000 MMCONFIG/hole base and far above
+  OVMF's ~26MB early footprint. Allocated + zeroed as one contiguous
+  host buffer in efi_main (`g_fw_1_ram_host_phys`).
+- **NPT** (arch/x86_64/svm/npt.c): FW-1 now builds only the low 4GB
+  (>=4GB left not-present), maps guest-physical [0,1GiB) -> the RAM
+  buffer, keeps the flash window, and marks EVERYTHING else not-present
+  via new `hype_npt_mark_range_not_present`, so any stray/MMIO access
+  faults as a located NPF instead of silently reaching host RAM/MMIO.
+- **RAM-size signal**: new `devices/e820.c` builds the fw_cfg `etc/e820`
+  file (OVMF reads it before CMOS) declaring exactly [0,1GiB) usable;
+  CMOS 0x34/0x35 updated to report the same size (was the host's total,
+  the root-cause bug). etc/e820 wire format transcribed from
+  edk2/OvmfPkg/Include/IndustryStandard/E820.h (20-byte packed entries).
+- QEMU `run` bumped `-m 512` -> `-m 2048` (a guest given 1 GiB needs its
+  host VM to have more).
+
+QEMU result: OVMF now boots FAR past the old crash -- dozens of
+CPUID/MSR/IOIO exits through PEI/DXE -- then a clean
+`PANIC: fw-1: unhandled NPF at guest-physical 0xfee000f0 (read,
+guest_rip=0xfffd006b)`. That's the **Local APIC MMIO** (base
+0xFEE00000, offset 0xF0 = Spurious Interrupt Vector Register), OVMF
+executing from its flash window. No jump-to-(-1); exactly the designed
+"next unemulated thing becomes a precise NPF" outcome. All prior test
+guests (M2-7..M5-2) still halt cleanly (reason=0x78) -- no regressions.
+Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
+
+- [ ] **FW-1b** — Guest Local APIC. OVMF's PEI reads/writes LAPIC MMIO
+  at 0xFEE00000 (first hit: SVR at +0xF0); FW-1a leaves it not-present
+  so it NPFs. Options: emulate LAPIC MMIO via the NPF handler, or wire
+  the guest onto the AVIC infrastructure this project already has
+  (M2-4). Discovered empirically from FW-1a's NPF; likely followed by
+  more MMIO (IOAPIC 0xFEC00000, MMCONFIG ECAM 0xE0000000 -> reuse the
+  PCI-1 model). Deps: FW-1a, M2-4.
+
+- [~] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash
   MMIO-trap model, which stays correct for OVMF_VARS.fd only).

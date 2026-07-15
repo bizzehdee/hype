@@ -36,6 +36,7 @@
 #include "../devices/atapi.h"
 #include "../devices/ramfb.h"
 #include "../devices/fb_blit.h"
+#include "../devices/e820.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -140,6 +141,25 @@ static uint64_t g_ram_1_size_bytes;
  */
 static uint64_t g_fw_1_combined_host_phys;
 static uint64_t g_fw_1_combined_size;
+/*
+ * FW-1a: the guest's own low RAM, backed by a real, freely-allocated
+ * host buffer and NPT-mapped at guest-physical [0, size) -- NOT the flat
+ * identity map used before, which handed the guest the host's real
+ * sub-4GB MMIO hole (reads all-1s) wherever OVMF placed its DXE stack,
+ * so OVMF read a garbage pointer off its own stack and jumped to -1 (see
+ * task.md's FW section). Size is fixed well below the Q35 32-bit MMIO
+ * hole base (PcdPciExpressBaseAddress = 0xE0000000, which OVMF asserts
+ * low RAM stays under) and far above OVMF's ~26MB fixed early footprint
+ * (SEC page tables/temp RAM + PEIFV/DXEFV shadows + decompression
+ * scratch, up to 0x1A10000). 1 GiB is a safe contiguous allocation and
+ * ample for reaching the OVMF shell; bump it (and it alone) when a later
+ * milestone needs a bigger guest. Must stay 2MB-aligned (NPT granularity)
+ * and <= 0xE0000000. */
+#define HYPE_FW_1_GUEST_RAM_BYTES (1024ULL * 1024ULL * 1024ULL) /* 1 GiB */
+static uint64_t g_fw_1_ram_host_phys;
+/* One usable e820 entry (20 bytes) is all FW-1 registers today; sized
+ * for a handful in case a reserved region is ever added. */
+static uint8_t g_fw_1_e820_blob[HYPE_E820_ENTRY_SIZE * 8];
 /* ISO-1's own loaded test.iso buffer, kept around for ISO-2 to back
  * the AHCI/ATAPI model with real data instead of re-reading the file a
  * second time. */
@@ -4177,17 +4197,41 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                   loader_entries * (uint32_t)sizeof(hype_acpi_loader_entry_t)) < 0) {
             hype_fatal("fw-1: fw_cfg registry full while registering table-loader");
         }
+
+        /* FW-1a: etc/e820 -- the memory map OVMF reads FIRST (before the
+         * CMOS fallback below) to size low RAM
+         * (PlatformInitLib/MemDetect.c: PlatformScanE820). Declares
+         * exactly the RAM this project actually backs with a real host
+         * buffer: a single usable region [0, HYPE_FW_1_GUEST_RAM_BYTES),
+         * well below the Q35 32-bit MMIO hole. This is what makes OVMF
+         * place its DXE stack inside backed RAM instead of just below
+         * 4GB in the host's MMIO hole (the jump-to-(-1) root cause). */
+        {
+            hype_e820_region_t ram_region;
+            int e820_len;
+            ram_region.base = 0;
+            ram_region.length = HYPE_FW_1_GUEST_RAM_BYTES;
+            ram_region.type = HYPE_E820_TYPE_RAM;
+            e820_len = hype_e820_build(g_fw_1_e820_blob, (uint32_t)sizeof(g_fw_1_e820_blob), &ram_region, 1);
+            if (e820_len < 0) {
+                hype_fatal("fw-1: hype_e820_build failed");
+            }
+            if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, "etc/e820", g_fw_1_e820_blob, (uint32_t)e820_len) < 0) {
+                hype_fatal("fw-1: fw_cfg registry full while registering e820");
+            }
+        }
     }
 
-    /* CMOS 0x34/0x35: the memory-size fallback path OVMF's own
-     * PlatformPei reads when fw_cfg's "etc/e820" file isn't present
-     * (this project doesn't register one -- ACPI content above is a
-     * separate concern) -- reports the actual usable RAM this machine
-     * has, not a guessed value, the same "reflect reality, don't
-     * fabricate" principle RAM-1 already established. */
+    /* CMOS 0x34/0x35: OVMF's memory-size fallback if it doesn't honor
+     * etc/e820 above. Report the SAME guest RAM size (in 64KB units above
+     * 16MB) so the two agree -- NOT the host's total RAM, which is what
+     * put OVMF's stack just below 4GB in the host MMIO hole. 1 GiB is
+     * 0x3F00 units, well under the register's 16-bit range; the clamp
+     * stays only as a fail-safe. */
     {
-        uint64_t above_16mb =
-            (g_usable_ram_bytes > 16ULL * 1024 * 1024) ? (g_usable_ram_bytes - 16ULL * 1024 * 1024) : 0;
+        uint64_t above_16mb = (HYPE_FW_1_GUEST_RAM_BYTES > 16ULL * 1024 * 1024)
+                                  ? (HYPE_FW_1_GUEST_RAM_BYTES - 16ULL * 1024 * 1024)
+                                  : 0;
         uint64_t units_64kb = above_16mb / 65536ULL;
         if (units_64kb > 0xFFFFULL) {
             units_64kb = 0xFFFFULL;
@@ -4208,16 +4252,28 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     reset_rip = 0xFFF0ULL;
     stack_top = (uint64_t)(uintptr_t)(g_fw_1_guest_stack + sizeof(g_fw_1_guest_stack));
 
-    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
-    /* Guest-physical [4GB - combined_size, 4GB) -> wherever the
-     * combined VARS+CODE content actually got allocated (see
-     * g_fw_1_combined_host_phys's own comment for why NOT an identity
-     * map here). combined_size is a whole multiple of HYPE_PAGING_2MB
-     * (confirmed: both file sizes are individually page-aligned, and
-     * this project's own vendored build's CODE+VARS together land on
-     * a 2MB-aligned combined size too). */
+    /* FW-1a NPT layout (replaces the old flat identity map, which handed
+     * the guest the host's real sub-4GB MMIO hole as if it were RAM):
+     * only build the low 4GB of guest-physical space -- guest-physical
+     * >= 4GB is left not-present (pdpt[4..] stay zero), since a 1 GiB
+     * guest never addresses there. Then:
+     *   [0, GUEST_RAM)            -> the real allocated host RAM buffer
+     *   [4GB - combined, 4GB)     -> the OVMF flash window (as before)
+     *   [GUEST_RAM, 4GB-combined) -> not present, so a stray or MMIO
+     *                                access (MMCONFIG 0xE0000000, LAPIC/
+     *                                IOAPIC, an unassigned BAR, ...)
+     *                                takes a located #VMEXIT_NPF instead
+     *                                of silently reaching host RAM/MMIO.
+     * combined_size is a whole 2MB multiple (both .fd sizes are
+     * page-aligned and this vendored build's CODE+VARS land on a
+     * 2MB-aligned combined size); GUEST_RAM and 4GB are 2MB-aligned too,
+     * so every range below is 2MB-granular. */
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, 4);
+    hype_npt_map_range(g_npt_pd, 0, g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
     hype_npt_map_range(g_npt_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
                         g_fw_1_combined_size);
+    hype_npt_mark_range_not_present(g_npt_pd, HYPE_FW_1_GUEST_RAM_BYTES,
+                                     (0x100000000ULL - g_fw_1_combined_size) - HYPE_FW_1_GUEST_RAM_BYTES);
     npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
 
     hype_debug_print(
@@ -4704,6 +4760,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 (unsigned long long)content_size, (unsigned long long)mapped_size,
                 (unsigned long long)g_fw_1_combined_host_phys);
         }
+
+        /*
+         * FW-1a: allocate + zero the guest's low RAM as a real,
+         * contiguous host buffer (NPT-mapped at guest-physical
+         * [0, HYPE_FW_1_GUEST_RAM_BYTES) in run_fw_1_test), on the BSP
+         * before MP dispatch -- same ordering/reasoning as the firmware
+         * buffer above. Zeroed so OVMF's reset-vector page-table build
+         * at guest-physical 0x800000 and its SEC/PEI temp RAM start from
+         * clean memory. */
+        g_fw_1_ram_host_phys =
+            hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, HYPE_FW_1_GUEST_RAM_BYTES);
+        hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+        hype_debug_print("fw-1: guest RAM %llu MiB backed at host-physical 0x%llx\n",
+                          (unsigned long long)(HYPE_FW_1_GUEST_RAM_BYTES / (1024ULL * 1024ULL)),
+                          (unsigned long long)g_fw_1_ram_host_phys);
 
         /*
          * ISO-1: reads a real installer ISO (\iso\test.iso -- a real
