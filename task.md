@@ -1229,6 +1229,41 @@ QEMU (real virtual GPU device) that the reordered dump still produces
 the same "exc vec=14 err=0x0 cr2=0x0 ... rip=..." fault with zero
 regressions. `tools/make-usb-package.sh` rebuilt again with this fix.
 
+**Update (2026-07-15, later still again): the summary line now reaches
+the screen -- and it reveals a genuinely new, unexplained real-hardware
+finding.** Real hardware: `fw-1: exc vec=14 err=0x0 cr0=0x80000033
+cr2=0x0 cr3=0x800000 rip=0xffffffffffffffff`. `cr0`/`cr2`/`cr3` all
+match the QEMU-documented fault closely (identical `cr0`, identical
+`cr2=0`) -- but `rip` is `0xFFFFFFFFFFFFFFFF`, not a remotely plausible
+guest address, unlike every prior QEMU run (always a normal-looking
+address in the low few hundred MB). Dereferencing that value as a raw
+host pointer for the raw-byte dump is exactly what silently killed the
+machine one line later even after the reordering fix above -- nothing
+maps the very top of the 64-bit address space.
+
+**Root cause of `rip=-1` itself is still unconfirmed** -- this is a
+new, separate mystery from the original DXE NULL-pointer fault, not
+yet explained by anything in this project's own code (no VMCB field is
+ever pre-set to a `0xFF`-poison pattern anywhere in `arch/x86_64/svm/
+svm_vcpu.c`; `vmrun_full()`'s own inline asm doesn't touch `save.rip`
+at all -- real hardware's own VMRUN is solely responsible for writing
+it on VMEXIT). Worth its own follow-up investigation later (candidate
+angles: whether this specific exception/exit combination has a
+documented AMD SVM edge case around guest-state save completeness;
+whether real hardware reached this fault from a genuinely different
+guest execution path than QEMU did).
+
+Immediate fix (unblocks getting any further diagnostic detail at all):
+`dbg.rip`/`dbg.rsp` are now guarded with the same plausibility check
+already used for the stack's own candidate return address (nonzero,
+below 4GB) before being dereferenced as raw pointers -- an implausible
+value now prints a clear "not a plausible host pointer -- skipping"
+notice instead of crashing the machine a second time. Verified via
+QEMU (unit tests unaffected, 51/51 passing; the guarded branch's own
+"plausible" path is unchanged from before, so QEMU's own always-sane
+`rip`/`rsp` values take the exact same code path as previously
+verified). `tools/make-usb-package.sh` rebuilt again with this fix.
+
 - [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash

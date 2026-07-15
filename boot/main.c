@@ -4311,17 +4311,39 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                               (unsigned long long)dbg.cr2, (unsigned long long)dbg.cr3,
                               (unsigned long long)dbg.rip);
 
-            /* cs_base=0 (flat protected mode) here, so dbg.rip already
-             * is the linear == guest-physical == host-physical address
-             * (this project's NPT identity-maps ordinary RAM) -- a raw
-             * host pointer dereference is safe pre-ExitBootServices,
-             * same reasoning devices/pflash.h's own direct-memory-
-             * access callers already rely on. */
-            fault_bytes = (uint8_t *)(uintptr_t)dbg.rip;
-            hype_debug_print("fw-1: bytes at rip: %x %x %x %x %x %x %x %x %x %x %x %x\n",
-                              fault_bytes[0], fault_bytes[1], fault_bytes[2], fault_bytes[3],
-                              fault_bytes[4], fault_bytes[5], fault_bytes[6], fault_bytes[7],
-                              fault_bytes[8], fault_bytes[9], fault_bytes[10], fault_bytes[11]);
+            /* Real-hardware finding: dbg.rip itself can be an
+             * implausible sentinel-looking value (observed: exactly
+             * 0xFFFFFFFFFFFFFFFF, all bits set -- not a remotely
+             * plausible guest address, unlike CR0/CR2/CR3 alongside it,
+             * which read as completely sane values) for this specific
+             * fault on real hardware, never seen under QEMU. Whatever
+             * the underlying cause (still unconfirmed -- worth its own
+             * follow-up investigation), unconditionally dereferencing
+             * it as a host pointer is exactly what silently killed the
+             * machine here before: nothing maps the very top of the
+             * 64-bit address space. Same plausibility guard as the
+             * stack[2] candidate-return-address check below (nonzero,
+             * below 4GB -- this project's own "usable low memory"
+             * convention) now applies to dbg.rip/dbg.rsp themselves,
+             * so a garbage value degrades to a clear, printed "skipped"
+             * notice instead of a second, unhandled fault. cs_base=0
+             * (flat protected mode) here, so a plausible dbg.rip is
+             * already the linear == guest-physical == host-physical
+             * address (this project's NPT identity-maps ordinary RAM)
+             * -- a raw host pointer dereference is otherwise safe
+             * pre-ExitBootServices, same reasoning devices/pflash.h's
+             * own direct-memory-access callers already rely on. */
+            if (dbg.rip != 0 && dbg.rip < 0x100000000ULL) {
+                fault_bytes = (uint8_t *)(uintptr_t)dbg.rip;
+                hype_debug_print("fw-1: bytes at rip: %x %x %x %x %x %x %x %x %x %x %x %x\n",
+                                  fault_bytes[0], fault_bytes[1], fault_bytes[2], fault_bytes[3],
+                                  fault_bytes[4], fault_bytes[5], fault_bytes[6], fault_bytes[7],
+                                  fault_bytes[8], fault_bytes[9], fault_bytes[10], fault_bytes[11]);
+            } else {
+                hype_debug_print("fw-1: rip=0x%llx is not a plausible host pointer -- skipping the "
+                                  "raw-byte dump\n",
+                                  (unsigned long long)dbg.rip);
+            }
 
             /* This is the generic CopyMem() leaf primitive (confirmed
              * against fw/OVMF_CODE.fd's own raw bytes), pushed rsi/rdi
@@ -4329,7 +4351,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
              * called CopyMem(dest=0, ...) is 2 qwords above the current
              * RSP. Same raw-host-pointer reasoning as fault_bytes
              * above. */
-            {
+            if (dbg.rsp != 0 && dbg.rsp < 0x100000000ULL) {
                 uint64_t *stack = (uint64_t *)(uintptr_t)dbg.rsp;
                 hype_debug_print("fw-1: rsp=0x%llx [0]=0x%llx [1]=0x%llx [2]=0x%llx [3]=0x%llx\n",
                                   (unsigned long long)dbg.rsp, (unsigned long long)stack[0],
@@ -4349,6 +4371,10 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                       caller_bytes[-4], caller_bytes[-3], caller_bytes[-2], caller_bytes[-1],
                                       caller_bytes[0], caller_bytes[1], caller_bytes[2], caller_bytes[3]);
                 }
+            } else {
+                hype_debug_print("fw-1: rsp=0x%llx is not a plausible host pointer -- skipping the "
+                                  "stack dump\n",
+                                  (unsigned long long)dbg.rsp);
             }
 
             hype_fatal("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr2=0x%llx cr3=0x%llx rip=0x%llx",
