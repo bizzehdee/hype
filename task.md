@@ -1624,7 +1624,12 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
   OVMF fully booted, ran BDS, found no boot disk (FW-1's guest has none),
   and idles at the Boot Manager prompt. Suite 55/55, guest_uart.c ~98% /
   vt_filter.c ~96% coverage, no regressions. Deps: FW-1d, VIDEO-1 style
-  console.
+  console. ***Confirmed on real AMD hardware (VivoBook, 2026-07-15)***:
+  the guest's `BdsDxe: No bootable option ... / Press any key to enter
+  the Boot Manager` message rendered on the physical screen (twice, the
+  BDS retry loop, matching QEMU) before hype cleared to "hypervisor now
+  running" -- so the guest firmware's own console output is visible on
+  real silicon, and the ~11k-line trace flood is gone.
 
 - [ ] **FW-1f** — Guest console INPUT (drive the shell). OVMF idles at
   "Press any key". Feed keystrokes to the guest via the UART RX ring
