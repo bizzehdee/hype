@@ -114,6 +114,42 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
 void hype_svm_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi);
 
 /*
+ * INT-1/INT-2: overrides this vCPU's IDTR/GDTR (hype_vmcb_build_long_mode_guest()'s
+ * own default of base=0/limit=0xFFFF has no real descriptor table
+ * behind it -- fine for every long-mode test guest so far, none of
+ * which ever took a real hardware-validated segment/gate reload, but
+ * genuine interrupt injection does exactly that: hardware loads the
+ * IDT gate from guest memory at IDTR.base, then validates/loads CS
+ * from a real descriptor at GDTR.base -- both must point at
+ * host-pre-populated, real descriptor tables for injection to actually
+ * succeed rather than fault). Exempt from unit testing -- trivial
+ * state mutation, nothing meaningful to observe without executing
+ * VMRUN, same reasoning as hype_svm_vcpu_set_rsi().
+ */
+void hype_svm_vcpu_set_idt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
+void hype_svm_vcpu_set_gdt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
+
+/*
+ * INT-1/INT-2: overrides this vCPU's CS/SS *selector* fields
+ * (hype_vmcb_build_long_mode_guest()'s own default of 0 for every
+ * segment -- fine for VMRUN's own state load, which sets segment
+ * attributes directly from the VMCB without any descriptor-table
+ * validation, but a real hardware interrupt/exception delivery pushes
+ * the CPU's *current* CS (and, in 64-bit mode, always SS too --
+ * unlike 32-bit mode, x86-64 IRETQ's own stack frame always includes
+ * RSP/SS regardless of any privilege-level change) onto the stack,
+ * and IRETQ later pops and *genuinely reloads* both from those exact
+ * values -- reloading the null selector (0) is architecturally invalid
+ * for CS/SS and raises #GP, confirmed the hard way: this project's own
+ * first real interrupt-delivery test triple-faulted (SHUTDOWN) right
+ * at its own IRETQ before this existed). Must match real, present
+ * descriptors in whatever hype_svm_vcpu_set_gdt() pointed GDTR at.
+ * Exempt from unit testing, same reasoning as hype_svm_vcpu_set_idt()/
+ * _set_gdt().
+ */
+void hype_svm_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selector, uint16_t ss_selector);
+
+/*
  * Handles an IOIO (M3-5) VM-exit: decodes EXITINFO1
  * (hype_svm_decode_ioio_info1()), routes the port to `pic` (0x20/0x21/
  * 0xA0/0xA1) or `pit` (0x40-0x43), reads/writes the emulated device
@@ -244,6 +280,44 @@ int hype_svm_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos);
  * hype_svm_vcpu_handle_msr()'s own TSC case.
  */
 int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx);
+
+/*
+ * INT-1/INT-2: the high-level API a device model calls to deliver an
+ * interrupt `vector` to this guest -- "now, or as soon as it genuinely
+ * can" per hype_svm_can_accept_interrupt(). If the guest can accept it
+ * immediately, writes EVENTINJ directly via
+ * hype_svm_encode_eventinj_intr() (delivered on the very next VMRUN).
+ * Otherwise arms an interrupt-window request
+ * (hype_svm_arm_vintr_request(), HYPE_SVM_INTERCEPT_VINTR) and remembers
+ * `vector` so hype_svm_vcpu_handle_vintr_window() can actually inject it
+ * once that window opens -- this project only ever has one interrupt
+ * genuinely in flight at a time (matching its own current single-IRQ-
+ * source scope; a real multi-device PIC's own IRR/priority logic is
+ * devices/pic.h's job, not this function's), so a second call before
+ * the first is delivered overwrites the pending vector rather than
+ * queuing -- acceptable for now, revisit if/when multiple concurrent
+ * pending interrupts are ever a real scenario. Exempt from unit testing
+ * -- reaches into the exempt VMCB fields this backend's real VMRUN
+ * produces; every pure function this composes
+ * (hype_svm_can_accept_interrupt()/hype_svm_encode_eventinj_intr()/
+ * hype_svm_arm_vintr_request()) is already fully tested in isolation.
+ */
+void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
+
+/*
+ * INT-2: handles an EXITCODE_VINTR VM-exit -- disarms the window
+ * request (hype_svm_disarm_vintr_request(),
+ * ~HYPE_SVM_INTERCEPT_VINTR) and, if a vector is still pending from an
+ * earlier hype_svm_vcpu_request_interrupt() call, retries delivery
+ * (which must now succeed, since this exit firing at all means the
+ * window hardware was waiting for has genuinely opened). Does not
+ * touch RIP -- unlike HLT/CPUID/MSR/IOIO, VINTR isn't an instruction
+ * boundary; hardware doesn't advance RIP for this exit (confirmed
+ * against the AMD SDM's own SEV-ES Exitcodes table), so there is
+ * nothing to skip past. Exempt from unit testing, same reasoning as
+ * hype_svm_vcpu_request_interrupt().
+ */
+void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx);
 
 /*
  * FW-1 real-hardware/real-firmware debugging: a snapshot of the guest

@@ -225,6 +225,24 @@ void hype_svm_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi) {
     real->gprs[6] = rsi; /* RSI's index in gprs[] -- see the struct's own comment */
 }
 
+void hype_svm_vcpu_set_idt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->vmcb->save.idtr.base = base;
+    real->vmcb->save.idtr.limit = limit;
+}
+
+void hype_svm_vcpu_set_gdt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->vmcb->save.gdtr.base = base;
+    real->vmcb->save.gdtr.limit = limit;
+}
+
+void hype_svm_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selector, uint16_t ss_selector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->vmcb->save.cs.selector = cs_selector;
+    real->vmcb->save.ss.selector = ss_selector;
+}
+
 /*
  * Maps an x86-64 register encoding (as hype_mmio_decode() reports it)
  * to where this backend actually stores that register's live value.
@@ -444,6 +462,42 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
      * convenience hype_svm_vcpu_handle_ioio() itself already relies on. */
     real->vmcb->save.rip = real->vmcb->control.exitinfo2;
     return 0;
+}
+
+/* This project's own current single-IRQ-source scope (see
+ * hype_svm_vcpu_request_interrupt()'s own comment) -- one pending
+ * vector is all that's ever needed right now. */
+static int g_pending_irq_valid = 0;
+static uint8_t g_pending_irq_vector = 0;
+
+void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+
+    if (hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
+        real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
+        return;
+    }
+
+    real->vmcb->control.vintr = hype_svm_arm_vintr_request(real->vmcb->control.vintr);
+    real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_VINTR;
+    g_pending_irq_valid = 1;
+    g_pending_irq_vector = vector;
+}
+
+void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+
+    real->vmcb->control.vintr = hype_svm_disarm_vintr_request(real->vmcb->control.vintr);
+    real->vmcb->control.intercept_misc1 &= ~HYPE_SVM_INTERCEPT_VINTR;
+
+    if (g_pending_irq_valid) {
+        uint8_t vector = g_pending_irq_vector;
+        g_pending_irq_valid = 0;
+        /* This window firing at all means the guest can accept an
+         * interrupt right now -- hype_svm_vcpu_request_interrupt()'s
+         * own can-accept check will take the direct-EVENTINJ path. */
+        hype_svm_vcpu_request_interrupt(ctx, vector);
+    }
 }
 
 void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out) {

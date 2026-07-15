@@ -198,6 +198,26 @@ void hype_svm_decode_npf_info(uint64_t exitinfo1, uint64_t exitinfo2, hype_svm_n
     out->guest_phys_addr = exitinfo2;
 }
 
+uint64_t hype_svm_encode_eventinj_intr(uint8_t vector) {
+    return HYPE_SVM_EVENTINJ_V | (HYPE_SVM_EVENTINJ_TYPE_INTR << HYPE_SVM_EVENTINJ_TYPE_SHIFT) |
+           ((uint64_t)vector & HYPE_SVM_EVENTINJ_VECTOR_MASK);
+}
+
+int hype_svm_can_accept_interrupt(uint64_t rflags, uint64_t interrupt_shadow) {
+    if ((interrupt_shadow & HYPE_SVM_INTERRUPT_SHADOW_ACTIVE) != 0) {
+        return 0;
+    }
+    return (rflags & HYPE_RFLAGS_IF) != 0;
+}
+
+uint64_t hype_svm_arm_vintr_request(uint64_t vintr) {
+    return (vintr & ~HYPE_SVM_VINTR_INJECTION_BITS_MASK) | HYPE_SVM_VINTR_V_IRQ | HYPE_SVM_VINTR_V_IGN_TPR;
+}
+
+uint64_t hype_svm_disarm_vintr_request(uint64_t vintr) {
+    return vintr & ~HYPE_SVM_VINTR_INJECTION_BITS_MASK;
+}
+
 void hype_vmcb_enable_nested_paging(hype_vmcb_t *vmcb, uint64_t npt_root_phys) {
     vmcb->control.np_enable = 1;
     vmcb->control.n_cr3 = npt_root_phys;

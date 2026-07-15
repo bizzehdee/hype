@@ -128,6 +128,15 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 /* Intercept bits this project actually sets (Table B-1). */
 #define HYPE_SVM_INTERCEPT_HLT (1u << 24)
 #define HYPE_SVM_INTERCEPT_SHUTDOWN (1u << 31)
+/* INT-2: bit 4 -- "Intercept VINTR (virtual maskable interrupt)",
+ * Appendix B Table B-1, offset 00Ch -- confirms, verbatim, this file's
+ * own pre-existing top-of-struct comment ("VINTR=4") that was never
+ * backed by an actual #define until now. Only ever set/cleared
+ * transiently around an armed interrupt-window request
+ * (hype_svm_vcpu_request_interrupt()/_handle_vintr_window(),
+ * svm_vcpu.c) -- not part of any guest's baseline intercept set the
+ * way HLT/SHUTDOWN/CPUID/MSR_PROT are. */
+#define HYPE_SVM_INTERCEPT_VINTR (1u << 4)
 /*
  * CPUMSR-1: intercept every guest CPUID (bit 18 of intercept_misc1's
  * "Intercept Vector 3" layout -- cross-referenced against the AMD SDM
@@ -195,6 +204,77 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
  */
 #define HYPE_SVM_INT_CTL_AVIC_ENABLE (1ULL << 31)
 
+/*
+ * INT-1/INT-2 (guest-interrupt injection): int_ctl (the `vintr` field,
+ * offset 0x060) bits used to request an "interrupt window" VMEXIT --
+ * fetched and read for this task against the AMD64 Architecture
+ * Programmer's Manual Volume 2, Rev 3.30 (Sept 2018), Table 15-22
+ * "Virtual Interrupt Control (VMCB offset 60h)", p.512, cross-checked
+ * against Appendix B's own combined description of offset 60h-67h.
+ * V_IRQ (bit 8) requests hardware treat a virtual interrupt as pending;
+ * V_INTR_PRIO (bits 19:16) is its priority, compared against V_TPR
+ * (bits 3:0, this project always leaves at 0) unless V_IGN_TPR (bit 20)
+ * is set to skip that check entirely -- this project always sets
+ * V_IGN_TPR alongside V_IRQ (matching real hypervisors' own "just poke
+ * me when the guest can take *any* interrupt" convention, since the
+ * actual vector delivered is via EVENTINJ, not V_INTR_VECTOR -- this
+ * project never uses AVIC, so V_INTR_VECTOR's hardware-delivery path
+ * is irrelevant here). Hardware clears V_IRQ once the interrupt window
+ * genuinely opens and fires EXITCODE_VINTR; nothing here is itself the
+ * interrupt delivery -- that's still EVENTINJ, written only once that
+ * VMEXIT confirms the guest can actually accept it right now.
+ */
+#define HYPE_SVM_VINTR_V_IRQ (1ULL << 8)
+#define HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT 16
+#define HYPE_SVM_VINTR_V_INTR_PRIO_MASK (0xFULL << HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT)
+#define HYPE_SVM_VINTR_V_IGN_TPR (1ULL << 20)
+/* Every bit hype_svm_arm_vintr_request()/_disarm_vintr_request() ever
+ * touch, as a single mask -- matches Linux KVM's own
+ * V_IRQ_INJECTION_BITS_MASK naming/grouping. */
+#define HYPE_SVM_VINTR_INJECTION_BITS_MASK \
+    (HYPE_SVM_VINTR_V_IRQ | HYPE_SVM_VINTR_V_INTR_PRIO_MASK | HYPE_SVM_VINTR_V_IGN_TPR)
+
+/*
+ * EVENTINJ (offset 0x0A8) -- event injection into the guest on the
+ * next VMRUN. Fetched and read for this task against the same AMD SDM
+ * revision above, §15.20 "Event Injection", Figure 15-5, pp.478-479,
+ * cross-checked against Appendix B's own offset-0A8h entry. TYPE
+ * values are Table 15-11's own enumeration (verbatim: 0=external/
+ * virtual interrupt, 2=NMI, 3=exception, 4=software interrupt (INTn)
+ * -- every other value is reserved/unused and VMRUN rejects the VMCB
+ * outright if given one). This project only ever injects TYPE_INTR
+ * (a maskable device interrupt via a synthesized vector, not a real
+ * external/APIC-sourced one) -- EV/ERRORCODE stay unused (0) since an
+ * interrupt, unlike a hardware exception such as #GP/#PF, never
+ * carries an error code.
+ */
+#define HYPE_SVM_EVENTINJ_VECTOR_MASK 0xFFULL
+#define HYPE_SVM_EVENTINJ_TYPE_SHIFT 8
+#define HYPE_SVM_EVENTINJ_TYPE_MASK (0x7ULL << HYPE_SVM_EVENTINJ_TYPE_SHIFT)
+#define HYPE_SVM_EVENTINJ_TYPE_INTR 0ULL
+#define HYPE_SVM_EVENTINJ_TYPE_NMI 2ULL
+#define HYPE_SVM_EVENTINJ_TYPE_EXCEPTION 3ULL
+#define HYPE_SVM_EVENTINJ_TYPE_SOFT_INTR 4ULL
+#define HYPE_SVM_EVENTINJ_EV (1ULL << 11)
+#define HYPE_SVM_EVENTINJ_V (1ULL << 31)
+#define HYPE_SVM_EVENTINJ_ERRORCODE_SHIFT 32
+
+/*
+ * interrupt_shadow (offset 0x068) -- Appendix B's own offset-068h
+ * entry, same AMD SDM revision above: bit 0 = INTERRUPT_SHADOW (the
+ * one-instruction-window convention after STI/MOV-SS/POP-SS during
+ * which even IF=1 does not admit an interrupt, §15.21.5 "Interrupt
+ * Shadows"); bit 1 = GUEST_INTERRUPT_MASK, a write-back-only mirror of
+ * the guest's own RFLAGS.IF at the last #VMEXIT, "not used during
+ * VMRUN" per the spec's own text -- this project reads RFLAGS.IF
+ * directly from vmcb->save.rflags instead, matching the spec's own
+ * guidance not to rely on this bit as an input.
+ */
+#define HYPE_SVM_INTERRUPT_SHADOW_ACTIVE (1ULL << 0)
+
+/* Standard x86 RFLAGS.IF -- architectural, not AMD-SVM-specific. */
+#define HYPE_RFLAGS_IF (1ULL << 9)
+
 /* avic_apic_bar/avic_backing_page_ptr/avic_logical_table_ptr/
  * avic_physical_table_ptr all hold a page-aligned physical address in
  * bits 51:12; avic_physical_table_ptr additionally packs the highest
@@ -209,6 +289,14 @@ _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page
 #define HYPE_SVM_EXITCODE_MSR 0x7CULL
 #define HYPE_SVM_EXITCODE_NPF 0x400ULL
 #define HYPE_SVM_EXITCODE_INVALID 0xFFFFFFFFFFFFFFFFULL /* VMRUN itself failed (bad VMCB state) */
+/* INT-2: fired when a requested "interrupt window" (HYPE_SVM_INTERCEPT_VINTR
+ * + VINTR_V_IRQ) genuinely opens -- confirmed against two independent
+ * tables in the same AMD SDM revision as this file's other INT-1/INT-2
+ * constants: Appendix C "SVM Intercept Codes" and §15.35's own AE
+ * Exitcodes table (which also notes hardware does NOT advance RIP for
+ * this exit -- there is no instruction to skip past, unlike HLT/CPUID/
+ * MSR/IOIO). */
+#define HYPE_SVM_EXITCODE_VINTR 0x64ULL
 
 /* EXITCODE 0x40-0x5F: guest exception vectors 0-31 (EXITCODE = 0x40 +
  * vector), fired only for vectors marked in control.intercept_exceptions
@@ -282,6 +370,50 @@ typedef struct {
  * state touched.
  */
 void hype_svm_decode_npf_info(uint64_t exitinfo1, uint64_t exitinfo2, hype_svm_npf_t *out);
+
+/*
+ * INT-1: encodes an EVENTINJ value that injects a maskable (TYPE_INTR)
+ * interrupt of the given vector on the next VMRUN. This project never
+ * injects anything else (no NMI/exception/soft-interrupt injection --
+ * exceptions the *guest itself* causes are still delivered by hardware
+ * directly, not through this path), so this deliberately isn't a
+ * general "encode any event" function; a future real need for another
+ * TYPE can generalize it then. Pure bit packing, no CPU state touched.
+ */
+uint64_t hype_svm_encode_eventinj_intr(uint8_t vector);
+
+/*
+ * INT-1: true if the guest can accept a maskable interrupt right now --
+ * RFLAGS.IF set AND not inside an interrupt shadow (see
+ * HYPE_SVM_INTERRUPT_SHADOW_ACTIVE's own comment for what that means).
+ * This project has no VGIF/nested-guest concept, so those are the only
+ * two gates that apply here (real hardware's full gating list also
+ * includes GIF and, for AVIC, a priority check against V_TPR -- neither
+ * relevant to this project's own non-AVIC, non-nested scope). Pure
+ * logic, no CPU state touched.
+ */
+int hype_svm_can_accept_interrupt(uint64_t rflags, uint64_t interrupt_shadow);
+
+/*
+ * INT-2: returns `vintr` with V_IRQ/V_INTR_PRIO/V_IGN_TPR set to
+ * request an interrupt-window VMEXIT (EXITCODE_VINTR) the moment the
+ * guest becomes able to accept an interrupt -- V_IGN_TPR is always set
+ * alongside V_IRQ (this project never uses V_TPR-based priority
+ * masking; the actual vector delivered comes from EVENTINJ once that
+ * VMEXIT fires, not from V_INTR_VECTOR/AVIC's own hardware-delivery
+ * path). Every other bit of `vintr` (e.g. HYPE_SVM_INT_CTL_AVIC_ENABLE,
+ * unused by this project but preserved for correctness regardless) is
+ * left untouched. Pure bit packing, no CPU state touched.
+ */
+uint64_t hype_svm_arm_vintr_request(uint64_t vintr);
+
+/*
+ * INT-2: returns `vintr` with the same bits _arm_vintr_request() sets
+ * cleared, once the requested window has genuinely opened
+ * (EXITCODE_VINTR) or the request is no longer needed. Pure bit
+ * packing, no CPU state touched.
+ */
+uint64_t hype_svm_disarm_vintr_request(uint64_t vintr);
 
 /*
  * Packs a segment's access-rights byte and flags nibble into the

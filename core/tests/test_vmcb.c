@@ -250,6 +250,70 @@ static void test_decode_npf_info_read(void) {
     CHECK_HEX("decoded guest-physical fault address", exitinfo2, npf.guest_phys_addr);
 }
 
+static void test_encode_eventinj_intr(void) {
+    uint64_t value = hype_svm_encode_eventinj_intr(0x31u);
+
+    CHECK_HEX("V bit set", 1, (value & HYPE_SVM_EVENTINJ_V) != 0);
+    CHECK_HEX("TYPE is TYPE_INTR (0)", 0, (value & HYPE_SVM_EVENTINJ_TYPE_MASK) >> HYPE_SVM_EVENTINJ_TYPE_SHIFT);
+    CHECK_HEX("EV bit clear (no error code)", 0, (value & HYPE_SVM_EVENTINJ_EV) != 0);
+    CHECK_HEX("vector", 0x31u, value & HYPE_SVM_EVENTINJ_VECTOR_MASK);
+    CHECK_HEX("errorcode bits clear", 0, value >> HYPE_SVM_EVENTINJ_ERRORCODE_SHIFT);
+}
+
+static void test_encode_eventinj_intr_vector_masked_to_8_bits(void) {
+    /* vector is already a uint8_t parameter, so the widest value that
+     * can ever reach the function is 0xFF -- confirm it round-trips
+     * through the VECTOR_MASK unchanged rather than being clipped
+     * further. */
+    uint64_t value = hype_svm_encode_eventinj_intr((uint8_t)0xFFu);
+    CHECK_HEX("full-width vector preserved", 0xFFu, value & HYPE_SVM_EVENTINJ_VECTOR_MASK);
+}
+
+static void test_can_accept_interrupt_if_set_no_shadow(void) {
+    CHECK_HEX("IF=1, no shadow -> can accept", 1, hype_svm_can_accept_interrupt(HYPE_RFLAGS_IF, 0));
+}
+
+static void test_can_accept_interrupt_if_clear(void) {
+    CHECK_HEX("IF=0 -> cannot accept", 0, hype_svm_can_accept_interrupt(0, 0));
+}
+
+static void test_can_accept_interrupt_in_shadow(void) {
+    CHECK_HEX("IF=1 but in interrupt shadow -> cannot accept", 0,
+              hype_svm_can_accept_interrupt(HYPE_RFLAGS_IF, HYPE_SVM_INTERRUPT_SHADOW_ACTIVE));
+}
+
+static void test_can_accept_interrupt_if_clear_and_in_shadow(void) {
+    CHECK_HEX("neither condition met -> cannot accept", 0,
+              hype_svm_can_accept_interrupt(0, HYPE_SVM_INTERRUPT_SHADOW_ACTIVE));
+}
+
+static void test_arm_vintr_request_sets_bits_preserves_others(void) {
+    uint64_t armed = hype_svm_arm_vintr_request(HYPE_SVM_INT_CTL_AVIC_ENABLE);
+
+    CHECK_HEX("V_IRQ set", 1, (armed & HYPE_SVM_VINTR_V_IRQ) != 0);
+    CHECK_HEX("V_IGN_TPR set", 1, (armed & HYPE_SVM_VINTR_V_IGN_TPR) != 0);
+    CHECK_HEX("unrelated bit (AVIC enable) preserved", 1, (armed & HYPE_SVM_INT_CTL_AVIC_ENABLE) != 0);
+}
+
+static void test_arm_vintr_request_idempotent_over_stale_priority_bits(void) {
+    /* A previous, now-irrelevant V_INTR_PRIO value must not survive a
+     * fresh arm -- the mask clears the whole injection-bits group
+     * before re-setting it. */
+    uint64_t stale = 0x5ULL << HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT;
+    uint64_t armed = hype_svm_arm_vintr_request(stale);
+    CHECK_HEX("stale priority bits cleared", 0, armed & HYPE_SVM_VINTR_V_INTR_PRIO_MASK);
+}
+
+static void test_disarm_vintr_request_clears_bits_preserves_others(void) {
+    uint64_t armed = hype_svm_arm_vintr_request(HYPE_SVM_INT_CTL_AVIC_ENABLE);
+    uint64_t disarmed = hype_svm_disarm_vintr_request(armed);
+
+    CHECK_HEX("V_IRQ clear", 0, disarmed & HYPE_SVM_VINTR_V_IRQ);
+    CHECK_HEX("V_IGN_TPR clear", 0, disarmed & HYPE_SVM_VINTR_V_IGN_TPR);
+    CHECK_HEX("V_INTR_PRIO clear", 0, disarmed & HYPE_SVM_VINTR_V_INTR_PRIO_MASK);
+    CHECK_HEX("unrelated bit (AVIC enable) preserved", 1, (disarmed & HYPE_SVM_INT_CTL_AVIC_ENABLE) != 0);
+}
+
 int main(void) {
     test_struct_sizes();
     test_field_offsets();
@@ -265,6 +329,15 @@ int main(void) {
     test_decode_npf_info_read();
     test_configure_avic();
     test_configure_avic_masks_low_bits_and_sets_max_index();
+    test_encode_eventinj_intr();
+    test_encode_eventinj_intr_vector_masked_to_8_bits();
+    test_can_accept_interrupt_if_set_no_shadow();
+    test_can_accept_interrupt_if_clear();
+    test_can_accept_interrupt_in_shadow();
+    test_can_accept_interrupt_if_clear_and_in_shadow();
+    test_arm_vintr_request_sets_bits_preserves_others();
+    test_arm_vintr_request_idempotent_over_stale_priority_bits();
+    test_disarm_vintr_request_clears_bits_preserves_others();
 
     if (failures == 0) {
         printf("all tests passed\n");

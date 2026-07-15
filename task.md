@@ -298,19 +298,68 @@ has gotten away with pure guest-side polling). User decision
 (2026-07-15): build this now, before INPUT-1, rather than starting with
 a polling-only keyboard and deferring real interrupt delivery.
 
-- [ ] **INT-1** — EVENTINJ-based immediate interrupt injection: inject a
+- [x] **INT-1** — EVENTINJ-based immediate interrupt injection: inject a
   maskable (INTR-type) interrupt directly via the VMCB's EVENTINJ field
   when the guest can accept it right now (RFLAGS.IF=1, no interrupt
   shadow). Pure bit-encoding logic unit tested; the actual VMCB write
   is exempt glue, same split as every other VMCB-touching function
   here.
   Deps: M3-1
-- [ ] **INT-2** — VINTR-window-based deferred injection: when the guest
+- [x] **INT-2** — VINTR-window-based deferred injection: when the guest
   can't accept an interrupt immediately, request an interrupt-window
   VMEXIT (V_IRQ in the VINTR/int_ctl field, VINTR intercept enabled)
   and actually inject once that VMEXIT fires -- the real-hardware-
   correct path a guest with IF=0 (or mid-interrupt-shadow) needs.
   Deps: INT-1
+
+  *Implemented together (one test guest proves both). `arch/x86_64/svm/
+  vmcb.h`'s EVENTINJ/VINTR/interrupt_shadow bit-layout constants and
+  `HYPE_SVM_EXITCODE_VINTR`/`HYPE_SVM_INTERCEPT_VINTR` were fetched and
+  verified against the real AMD64 Architecture Programmer's Manual
+  Volume 2, Rev 3.30 (Sept 2018) -- not reconstructed from memory,
+  matching this file's own established rigor for AMD-specific fields.
+  New pure functions in `vmcb.c` (100%/100%/100% unit tested,
+  `core/tests/test_vmcb.c`): `hype_svm_encode_eventinj_intr()`,
+  `hype_svm_can_accept_interrupt()` (RFLAGS.IF + interrupt-shadow
+  gating), `hype_svm_arm_vintr_request()`/`_disarm_vintr_request()`.
+  Exempt glue (`svm_vcpu.c`): `hype_svm_vcpu_request_interrupt()` (the
+  device-facing API -- injects directly if the guest can accept now,
+  otherwise arms a VINTR window and remembers the pending vector, one
+  at a time, matching this project's own current single-IRQ-source
+  scope) and `hype_svm_vcpu_handle_vintr_window()` (disarms + retries
+  once the window genuinely opens). Also added
+  `hype_svm_vcpu_set_idt()`/`_set_gdt()`/`_set_cs_ss_selectors()`,
+  since every prior long-mode test guest's default GDTR/IDTR (base=0,
+  no real table) and null CS/SS selectors were fine for VMRUN's own
+  direct state load but not for a *genuine* hardware-validated
+  interrupt delivery + IRETQ return.
+
+  Proven end-to-end by a new dedicated test guest (`run_int_test()`,
+  boot/main.c) -- a real guest GDT (flat code/data descriptors) + IDT
+  (one populated 64-bit interrupt gate) in guest memory, a payload that
+  loads a marker address, STIs, and busy-polls the marker until HLT,
+  plus an ISR at a fixed offset that sets the marker and IRETQs.
+  `hype_svm_vcpu_request_interrupt()` is called *before* the first
+  VMRUN (RFLAGS.IF=0 at that point), deliberately exercising INT-2's
+  deferred path first (arms the window) and INT-1's direct path second
+  (once the guest's own STI opens it, firing EXITCODE_VINTR). Two real
+  bugs found and fixed getting a clean run:
+  - ***Bug***: the guest's own `vmcb->save.cs.selector`/`ss.selector`
+    (0, this project's existing convention -- fine for VMRUN's direct
+    state load, which never validates selectors against a real GDT)
+    caused a SHUTDOWN (triple fault) right at the ISR's own IRETQ: a
+    real interrupt delivery pushes the *current* CS selector onto the
+    stack (and, in 64-bit mode, always SS too, unlike 32-bit mode)
+    and IRETQ genuinely reloads both from the popped values --
+    reloading the null selector is architecturally invalid for CS/SS
+    (#GP), cascading into a triple fault with no #GP/#DF handler
+    installed. Fixed via the new `hype_svm_vcpu_set_cs_ss_selectors()`
+    setter, pointing both at real, present descriptors in the test's
+    own constructed GDT.
+  - Confirmed clean QEMU run: "vector 0x31 delivered via an armed
+    VINTR window (INT-2) then direct EVENTINJ (INT-1), ISR ran and set
+    the marker" -- every other existing test guest still halts
+    cleanly.*
 
 ---
 
