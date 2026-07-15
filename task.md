@@ -1567,15 +1567,29 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
     == guest-physical.) Unit suite 53/53, guest_lapic.c ~98% coverage,
     clean build, no QEMU regressions.
 
-- [ ] **FW-1c** — Guest PCI config via MMCONFIG ECAM. After FW-1b, OVMF
-  NPFs reading ECAM at guest-physical 0xE00F8040 (base 0xE0000000, bus
-  0/dev 31/func 0/reg 0x40 -- the ICH9 LPC bridge PMBASE), rip in guest
-  RAM. FW-1 already services legacy CF8/CFC PCI I/O via
-  `hype_svm_vcpu_handle_pci_cf8_ioio`; PCI-1 also built an ECAM MMIO
-  handler `hype_svm_vcpu_handle_pci_ecam_npf(ctx, pci, ecam_base_phys)`
-  -- wire that into the FW-1 NPF block (base 0xE0000000, the value FW-1's
-  ACPI MCFG already advertises) with the same guest-RIP->host
-  instruction-byte translation FW-1b added. Deps: FW-1b, PCI-1.
+- [x] **FW-1c** — Guest PCI config via MMCONFIG ECAM. DONE + validated
+  in QEMU. Wired PCI-1's `hype_svm_vcpu_handle_pci_ecam_npf` into the
+  FW-1 NPF block at `HYPE_FW_1_ECAM_GPA` (0xE0000000, matching FW-1's
+  ACPI MCFG and OVMF's Q35 PcdPciExpressBaseAddress). Added the
+  guest-RIP->host instruction-byte translation to that handler too (new
+  `guest_insn_bytes` param; the 5 existing identity-mapped callers pass
+  `info.guest_rip` directly, FW-1 passes `fw_1_guest_phys_to_host`).
+  Result: ECAM NPFs handled jumped 143 -> 1856; OVMF booted through PCI
+  enumeration, console, and PS/2 keyboard init (ports 0x60/0x64) all the
+  way to a stable idle HLT (see FW-1d). No regressions (17 prior guests
+  halt cleanly; unit suite unchanged). Deps: FW-1b, PCI-1.
+
+- [ ] **FW-1d** — OVMF reaches a stable idle HLT (reason=0x78, rip in
+  guest RAM) after full DXE/BDS init -- i.e. **OVMF effectively boots**.
+  The FW-1 loop currently treats HLT as the catch-all "exited dispatch
+  loop" fatal. Real work: (a) handle HLT as wait-for-interrupt (re-VMRUN
+  so the LAPIC timer wakes it), (b) a bounded, clean termination that
+  declares boot success once the guest is demonstrably idle-looping
+  (instead of the current fatal / an unbounded loop). Then FW-1 is a
+  passing milestone. Genuinely interacting with OVMF (seeing the shell,
+  sending keystrokes) needs a guest console/serial bridge + wiring the
+  INPUT-1/INPUT-2 PS/2 devices into the FW-1 IOIO handler -- its own
+  step. Deps: FW-1c.
 
 - [~] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped

@@ -647,8 +647,14 @@ int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, 
  * backend's real VMRUN produces; hype_pci_decode_ecam_offset(),
  * hype_mmio_decode(), and hype_pci_config_read()/_write() are all
  * already fully tested in isolation.
+ *
+ * `guest_insn_bytes` is the faulting instruction's bytes, resolved to a
+ * host address by the caller (for the identity-mapped test guests that
+ * is just the guest RIP; FW-1 remaps RAM/flash and must translate --
+ * see hype_svm_vcpu_handle_lapic_npf's own note).
  */
-int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uint64_t ecam_base_phys);
+int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uint64_t ecam_base_phys,
+                                       const uint8_t *guest_insn_bytes);
 
 /*
  * VIDEO-3's exempt NPF glue for the Bochs-VBE display adapter's BAR2

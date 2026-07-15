@@ -213,6 +213,14 @@ static hype_acpi_loader_entry_t g_fw_1_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENT
 #define HYPE_FW_1_PCI_DEV_ICH9_LPC 31u
 #define HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC 0x2918u
 
+/* FW-1c: guest-physical base of the PCI MMCONFIG (ECAM) window. Must
+ * match the base FW-1's ACPI MCFG table advertises (cfg.mcfg_base_
+ * address below) AND OVMF's Q35 PcdPciExpressBaseAddress default, since
+ * OVMF derives its ECAM accesses from that PCD, not from MCFG. Left
+ * not-present by FW-1a's NPT map, so ECAM MMIO traps here as an NPF and
+ * is serviced by PCI-1's own config-space model. */
+#define HYPE_FW_1_ECAM_GPA 0xE0000000ULL
+
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
 static hype_pte_t g_npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
@@ -2717,7 +2725,8 @@ static void run_pci_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_pci_1_pci, HYPE_PCI_1_ECAM_GPA) != 0) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_pci_1_pci, HYPE_PCI_1_ECAM_GPA,
+                                                (const uint8_t *)(uintptr_t)info.guest_rip) != 0) {
                 hype_fatal("pci-1: unhandled guest ECAM access (qual=0x%llx guest_rip=0x%llx)",
                            (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
             }
@@ -2970,7 +2979,8 @@ static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_pci_2_pci, HYPE_PCI_1_ECAM_GPA) == 0) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_pci_2_pci, HYPE_PCI_1_ECAM_GPA,
+                                                (const uint8_t *)(uintptr_t)info.guest_rip) == 0) {
                 /* A config-space write may just have set Memory Space
                  * Enable with a valid BAR5 already programmed -- if
                  * so, this is the exact moment a real PCI-aware
@@ -3225,7 +3235,8 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_video_3_pci, HYPE_PCI_1_ECAM_GPA) == 0) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_video_3_pci, HYPE_PCI_1_ECAM_GPA,
+                                                (const uint8_t *)(uintptr_t)info.guest_rip) == 0) {
                 if (!mmio_mapped && hype_pci_memory_space_enabled(&g_video_3_pci, HYPE_VIDEO_3_DISPLAY_DEV)) {
                     uint64_t bar2 = hype_pci_get_bar_value(&g_video_3_pci, HYPE_VIDEO_3_DISPLAY_DEV, 2);
                     if (bar2 != 0) {
@@ -3672,7 +3683,8 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_m5_1_pci, HYPE_PCI_1_ECAM_GPA) == 0) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_m5_1_pci, HYPE_PCI_1_ECAM_GPA,
+                                                (const uint8_t *)(uintptr_t)info.guest_rip) == 0) {
                 if (!mmio_mapped && hype_pci_memory_space_enabled(&g_m5_1_pci, HYPE_M5_1_VIRTIO_DEV)) {
                     uint64_t bar4 = hype_pci_get_bar_value(&g_m5_1_pci, HYPE_M5_1_VIRTIO_DEV,
                                                             HYPE_M5_1_BAR_INDEX);
@@ -4037,7 +4049,8 @@ static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_m5_2_pci, HYPE_PCI_1_ECAM_GPA) == 0) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_m5_2_pci, HYPE_PCI_1_ECAM_GPA,
+                                                (const uint8_t *)(uintptr_t)info.guest_rip) == 0) {
                 if (!ahci_mapped &&
                     hype_pci_memory_space_enabled(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV)) {
                     uint64_t bar5 = hype_pci_get_bar_value(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV, 5);
@@ -4194,7 +4207,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         cfg.io_apic_id = 1;
         cfg.io_apic_address = 0xFEC00000u;
         cfg.io_apic_gsi_base = 0;
-        cfg.mcfg_base_address = 0xE0000000ULL;
+        cfg.mcfg_base_address = HYPE_FW_1_ECAM_GPA;
         cfg.pci_segment = 0;
         cfg.pci_start_bus = 0;
         cfg.pci_end_bus = 255;
@@ -4357,6 +4370,13 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
              * NPT is not an identity map. */
             if (hype_svm_vcpu_handle_lapic_npf(ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE,
                                                 fw_1_guest_phys_to_host(info.guest_rip)) == 0) {
+                continue;
+            }
+            /* FW-1c: PCI config space via MMCONFIG ECAM at 0xE0000000
+             * (OVMF's Q35 PcdPciExpressBaseAddress). Reuses PCI-1's ECAM
+             * config model over FW-1's own host bridge + LPC devices. */
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_fw_1_pci, HYPE_FW_1_ECAM_GPA,
+                                                   fw_1_guest_phys_to_host(info.guest_rip)) == 0) {
                 continue;
             }
             hype_svm_vcpu_get_last_npf(ctx, &npf);
