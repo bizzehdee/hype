@@ -1487,8 +1487,83 @@ Revisit this note when picking FW-1 back up.
 
 ## M5 — virtio-blk/AHCI + full install (plan.md §9 M5)
 
-- [ ] **M5-1** — virtio-blk guest-facing device.
+- [x] **M5-1** — virtio-blk guest-facing device.
   Deps: M4-5
+
+  *A modern (non-transitional, virtio 1.x) virtio-blk PCI device --
+  what a real Linux/BSD guest's own inbox virtio_blk driver discovers
+  and drives, structurally unrelated to M4-5's AHCI/ATAPI transport
+  (no SATA/ATA layer at all). PCI identity (vendor 0x1AF4/device
+  0x1042/class 0x01/0x00/0x00 -- QEMU's own real convention, not the
+  more generic 0x0180 a naive spec reading might suggest), the
+  virtio-pci capability structure, common-config register layout,
+  device-status handshake, virtqueue wire format, and virtio_blk_req
+  layout were fetched and confirmed against the real OASIS VIRTIO v1.1
+  spec plus the Linux kernel's own headers and QEMU's source, not
+  reconstructed from memory -- same discipline as every other
+  wire-format struct here.
+
+  New `devices/virtio_blk.h/.c`: a pure common-cfg/device-cfg register
+  model (each register enforcing its own real access width),
+  `hype_virtio_blk_is_queue_ready()`, and `hype_virtq_decode_desc()`
+  (pure virtq_desc bit extraction). Offers zero optional
+  `VIRTIO_BLK_F_*` feature bits -- only `VIRTIO_F_VERSION_1` -- which
+  the real Linux driver source confirms is sufficient to probe/bind
+  (every optional feature's absence is an already-handled fallback).
+  100% line, 99.01% branch coverage (`core/tests/test_virtio_blk.c`,
+  19 tests, including a data-driven sweep closing the "wrong access
+  width" branch for every one of the ~19 registers rather than
+  duplicating near-identical tests by hand).
+
+  Scoped to exactly one virtqueue and exactly 3 descriptors per chain
+  (header/one data segment/status -- no scatter-gather across
+  multiple data descriptors), mirroring AHCI's own "single ATAPI
+  device, one command at a time" scope-narrowing. Exempt glue
+  `hype_svm_vcpu_handle_virtio_blk_npf()` (`arch/x86_64/svm/
+  svm_vcpu.c`) NPT-traps only the single MMIO BAR (all four
+  capability regions -- COMMON_CFG/NOTIFY_CFG/ISR_CFG/DEVICE_CFG --
+  live in one BAR at fixed sub-offsets, this implementation's own
+  choice since the spec doesn't mandate a layout); a NOTIFY write
+  walks the virtqueue via a private `process_virtio_blk_queue()`
+  helper, draining every newly-avail chain since the device's own
+  internal `last_avail_idx` bookkeeping (a real device keeps the
+  equivalent privately too -- not part of the wire format).
+
+  A real virtio-pci capability list (spec §4.1.4, 4 capabilities +
+  the NOTIFY one's own trailing `notify_off_multiplier`) is
+  faithfully constructed in the test's PCI config-space bytes -- not
+  walked by the synthetic test guest itself (which targets the known
+  BAR4 offset directly, the same "test guest knows the device's own
+  structure" convention PCI-2/VIDEO-3 already established), but built
+  correctly so a real guest OS driver's own generic capability walk
+  would find it.
+
+  New synthetic test guest `run_m5_1_test()` (`boot/main.c`) is
+  structurally different from every earlier one here: the
+  virtqueue's own descriptor table/avail ring/used ring and both
+  requests' header/data/status buffers are pre-built by HOST-side C
+  code, not the guest's own instruction stream -- mirroring how a
+  real device's DMA engine reads/writes guest memory independently of
+  the guest CPU, so the guest payload only ever touches PCI/MMIO
+  registers (every access NPF-routed). Exercises both directions in
+  one run: a WRITE (`VIRTIO_BLK_T_OUT`) persisting a guest-supplied
+  pattern to a fabricated sector, and a READ (`VIRTIO_BLK_T_IN`)
+  delivering a host-pre-placed pattern from a different sector back
+  to the guest -- both chains queued before a single NOTIFY kick
+  (proving the device drains every new avail entry per notify, not
+  just one), the guest polling the used ring until both complete.
+  Feature negotiation is a genuine read-then-accept (not a blindly
+  assumed value): the guest reads `device_feature`, then writes that
+  exact value back as `driver_feature`.
+
+  **Clean first-attempt QEMU run** -- both requests round-tripped
+  correctly (backing-store bytes match the guest's write pattern
+  byte-for-byte; the guest's own read buffer matches the host's
+  pre-placed pattern byte-for-byte; both status bytes read
+  `VIRTIO_BLK_S_OK`). A real host-file-backed store is explicitly
+  M5-3's own job ("blk_backend") -- this task's backing store is a
+  fixed in-memory buffer, matching M4-3 pflash's own "primitive now,
+  integration later" precedent.*
 - [ ] **M5-2** — AHCI guest-facing device.
   Deps: M4-5
 - [ ] **M5-3** — `blk_backend` vtable + file-backed implementation (§6d),

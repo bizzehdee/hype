@@ -18,6 +18,7 @@
 #include "../../../devices/ps2_keyboard.h"
 #include "../../../devices/ps2_mouse.h"
 #include "../../../devices/bochs_vbe.h"
+#include "../../../devices/virtio_blk.h"
 #include "vmcb.h"
 
 /*
@@ -605,6 +606,53 @@ int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uin
  */
 int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                         uint64_t mmio_base_phys);
+
+/*
+ * M5-1's exempt NPF glue for the virtio-blk device's single MMIO BAR
+ * (devices/virtio_blk.h), covering all four virtio-pci capability
+ * regions (COMMON_CFG/NOTIFY_CFG/ISR_CFG/DEVICE_CFG) this project lays
+ * out within it. Both-bounds-checks against `mmio_base_phys` (same
+ * rationale as the ECAM/Bochs-VBE handlers), then dispatches by the
+ * fault offset's own sub-region:
+ *   - COMMON_CFG: routed straight to hype_virtio_blk_common_cfg_read/
+ *     _write(), which already enforce each register's own correct
+ *     access width -- this glue just passes the decoded width through.
+ *   - NOTIFY_CFG: a 4-byte write here (regardless of its actual value
+ *     -- there is only one queue, so any notify write means "queue 0
+ *     has new work") walks the virtqueue via the private
+ *     process_virtio_blk_queue() helper below, ONLY once
+ *     hype_virtio_blk_is_queue_ready() confirms the driver has
+ *     finished setup -- a notify that arrives before DRIVER_OK/
+ *     queue_enable is a driver bug this project doesn't need to
+ *     humor. A read here is meaningless (real hardware convention:
+ *     ignored, reads back 0).
+ *   - ISR_CFG: hype_virtio_blk_isr_read() (read clears, real hardware
+ *     semantics); writes ignored (read-only from the driver's own
+ *     perspective).
+ *   - DEVICE_CFG: hype_virtio_blk_device_cfg_read() only; writes
+ *     ignored (also read-only from the driver's perspective).
+ *
+ * `backing`/`backing_bytes` is this milestone's own scope: a fixed,
+ * already-allocated in-memory buffer standing in for a real disk --
+ * a genuine host-file-backed store (blk_backend) is M5-3's job, not
+ * this one's, matching M4-3 pflash's own "primitive now, integration
+ * later" precedent. Descriptor-chain walking assumes exactly 3
+ * descriptors per chain (header, one data segment, status) -- no
+ * scatter-gather across multiple data descriptors, this project's own
+ * single-segment simplification (mirrors AHCI's own "single ATAPI
+ * device, one command at a time" scope-narrowing). Guest-supplied
+ * descriptor addresses/lengths are dereferenced directly, the same
+ * established (if VALID-1..4-pending) convention every other device
+ * handler here already follows -- not a new gap this task introduces.
+ * Advances RIP past the decoded instruction.
+ * Exempt from unit testing -- reaches into the exempt VMCB fields this
+ * backend's real VMRUN produces and walks guest memory directly;
+ * hype_mmio_decode(), hype_virtq_decode_desc(), and every
+ * hype_virtio_blk_*_cfg_read/write()/hype_virtio_blk_is_queue_ready()
+ * call it makes are already fully tested in isolation.
+ */
+int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev, uint8_t *backing,
+                                         uint64_t backing_bytes, uint64_t mmio_base_phys);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */

@@ -888,6 +888,195 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
     return 0;
 }
 
+/*
+ * Walks every newly-submitted chain in the (single) virtqueue since
+ * this device's own last_avail_idx bookkeeping, processing each as a
+ * virtio_blk_req: exactly 3 descriptors (header, one data segment,
+ * status), a single-segment simplification (see hype_svm_vcpu_handle_
+ * virtio_blk_npf()'s own doc comment for why). Returns -1 if a chain
+ * doesn't have that exact shape (malformed guest request); 0 otherwise.
+ */
+static int process_virtio_blk_queue(hype_virtio_blk_t *dev, uint8_t *backing, uint64_t backing_bytes) {
+    const uint8_t *avail_base = (const uint8_t *)(uintptr_t)dev->queue_driver;
+    const uint8_t *desc_base = (const uint8_t *)(uintptr_t)dev->queue_desc;
+    uint8_t *used_base = (uint8_t *)(uintptr_t)dev->queue_device;
+    uint16_t avail_idx = (uint16_t)(avail_base[2] | (avail_base[3] << 8));
+
+    while (dev->last_avail_idx != avail_idx) {
+        uint16_t ring_index = (uint16_t)(dev->last_avail_idx % dev->queue_size);
+        uint16_t head_desc =
+            (uint16_t)(avail_base[4 + 2 * ring_index] | (avail_base[4 + 2 * ring_index + 1] << 8));
+        uint8_t raw_desc[16];
+        hype_virtq_desc_t header_desc, data_desc, status_desc;
+        const uint8_t *hdr;
+        uint32_t req_type;
+        uint64_t sector;
+        uint64_t byte_offset;
+        uint8_t status_value;
+        uint32_t used_len;
+        uint16_t used_idx;
+        uint16_t used_ring_index;
+        uint32_t elem_off;
+        uint32_t j;
+
+        for (j = 0; j < 16u; j++) {
+            raw_desc[j] = desc_base[(uint32_t)head_desc * 16u + j];
+        }
+        hype_virtq_decode_desc(raw_desc, &header_desc);
+        if ((header_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0) {
+            return -1;
+        }
+        for (j = 0; j < 16u; j++) {
+            raw_desc[j] = desc_base[(uint32_t)header_desc.next * 16u + j];
+        }
+        hype_virtq_decode_desc(raw_desc, &data_desc);
+        if ((data_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0) {
+            return -1;
+        }
+        for (j = 0; j < 16u; j++) {
+            raw_desc[j] = desc_base[(uint32_t)data_desc.next * 16u + j];
+        }
+        hype_virtq_decode_desc(raw_desc, &status_desc);
+        if ((status_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) != 0) {
+            return -1; /* status must be the chain's last descriptor */
+        }
+
+        hdr = (const uint8_t *)(uintptr_t)header_desc.addr;
+        req_type = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) | ((uint32_t)hdr[2] << 16) |
+                   ((uint32_t)hdr[3] << 24);
+        sector = (uint64_t)hdr[8] | ((uint64_t)hdr[9] << 8) | ((uint64_t)hdr[10] << 16) |
+                 ((uint64_t)hdr[11] << 24) | ((uint64_t)hdr[12] << 32) | ((uint64_t)hdr[13] << 40) |
+                 ((uint64_t)hdr[14] << 48) | ((uint64_t)hdr[15] << 56);
+        byte_offset = sector * HYPE_VIRTIO_BLK_SECTOR_SIZE;
+
+        if (byte_offset + data_desc.len > backing_bytes) {
+            status_value = HYPE_VIRTIO_BLK_S_IOERR;
+            used_len = 1;
+        } else if (req_type == HYPE_VIRTIO_BLK_T_OUT) {
+            const uint8_t *src = (const uint8_t *)(uintptr_t)data_desc.addr;
+            for (j = 0; j < data_desc.len; j++) {
+                backing[byte_offset + j] = src[j];
+            }
+            status_value = HYPE_VIRTIO_BLK_S_OK;
+            used_len = 1;
+        } else if (req_type == HYPE_VIRTIO_BLK_T_IN) {
+            uint8_t *dst = (uint8_t *)(uintptr_t)data_desc.addr;
+            for (j = 0; j < data_desc.len; j++) {
+                dst[j] = backing[byte_offset + j];
+            }
+            status_value = HYPE_VIRTIO_BLK_S_OK;
+            used_len = data_desc.len + 1u;
+        } else {
+            status_value = HYPE_VIRTIO_BLK_S_UNSUPP;
+            used_len = 1;
+        }
+
+        *(uint8_t *)(uintptr_t)status_desc.addr = status_value;
+
+        used_idx = (uint16_t)(used_base[2] | (used_base[3] << 8));
+        used_ring_index = (uint16_t)(used_idx % dev->queue_size);
+        elem_off = 4u + 8u * used_ring_index;
+        used_base[elem_off + 0] = (uint8_t)(head_desc & 0xFFu);
+        used_base[elem_off + 1] = (uint8_t)((head_desc >> 8) & 0xFFu);
+        used_base[elem_off + 2] = 0;
+        used_base[elem_off + 3] = 0;
+        used_base[elem_off + 4] = (uint8_t)(used_len & 0xFFu);
+        used_base[elem_off + 5] = (uint8_t)((used_len >> 8) & 0xFFu);
+        used_base[elem_off + 6] = (uint8_t)((used_len >> 16) & 0xFFu);
+        used_base[elem_off + 7] = (uint8_t)((used_len >> 24) & 0xFFu);
+        used_idx = (uint16_t)(used_idx + 1u);
+        used_base[2] = (uint8_t)(used_idx & 0xFFu);
+        used_base[3] = (uint8_t)((used_idx >> 8) & 0xFFu);
+
+        dev->isr_status |= 0x01u;
+        dev->last_avail_idx = (uint16_t)(dev->last_avail_idx + 1u);
+    }
+
+    return 0;
+}
+
+int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev, uint8_t *backing,
+                                         uint64_t backing_bytes, uint64_t mmio_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < mmio_base_phys ||
+        npf.guest_phys_addr >= mmio_base_phys + HYPE_VIRTIO_BLK_BAR_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - mmio_base_phys);
+
+    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+
+    reg = gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    if (offset >= HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET &&
+        offset < HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET + HYPE_VIRTIO_COMMON_CFG_SIZE) {
+        uint32_t region_offset = offset - HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET;
+        if (decoded.is_write) {
+            uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+            if (hype_virtio_blk_common_cfg_write(dev, region_offset, decoded.size_bytes, value) != 0) {
+                return -1;
+            }
+        } else {
+            uint32_t value = 0;
+            if (hype_virtio_blk_common_cfg_read(dev, region_offset, decoded.size_bytes, &value) != 0) {
+                return -1;
+            }
+            *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        }
+    } else if (offset >= HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET &&
+               offset < HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET + 4u) {
+        if (decoded.is_write) {
+            if (hype_virtio_blk_is_queue_ready(dev)) {
+                if (process_virtio_blk_queue(dev, backing, backing_bytes) != 0) {
+                    return -1;
+                }
+            }
+        } else {
+            *reg = hype_mmio_merge_read_value(*reg, 0, decoded.size_bytes, decoded.zero_extend);
+        }
+    } else if (offset == HYPE_VIRTIO_BLK_BAR_ISR_CFG_OFFSET) {
+        if (!decoded.is_write) {
+            uint8_t value = hype_virtio_blk_isr_read(dev);
+            *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        }
+    } else if (offset >= HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET &&
+               offset < HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET + HYPE_VIRTIO_BLK_CFG_SIZE) {
+        if (!decoded.is_write) {
+            uint32_t value = 0;
+            uint32_t region_offset = offset - HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET;
+            if (hype_virtio_blk_device_cfg_read(dev, region_offset, decoded.size_bytes, &value) != 0) {
+                return -1;
+            }
+            *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        }
+    } else {
+        /* Reserved area of the MMIO BAR -- reads as 0, writes ignored. */
+        if (!decoded.is_write) {
+            *reg = hype_mmio_merge_read_value(*reg, 0, decoded.size_bytes, decoded.zero_extend);
+        }
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
