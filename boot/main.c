@@ -4429,14 +4429,33 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     if (have_gop && gop->Mode != 0 && gop->Mode->Info != 0 &&
         (gop->Mode->Info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor ||
          gop->Mode->Info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)) {
-        hype_gop_console_init(&g_gop_console, (void *)gop->Mode->FrameBufferBase,
-                               gop->Mode->Info->HorizontalResolution,
+        /* Real-hardware perf fix (found via real-hardware FW-1
+         * testing): draw into a shadow buffer in ordinary RAM, not
+         * gop->Mode->FrameBufferBase directly -- the real framebuffer
+         * is very likely mapped uncached, and gop_text.c's own one-
+         * store-per-pixel drawing (plus a full-screen read+write on
+         * every scroll) against uncached memory measured at 2-3
+         * *seconds* per redrawn line on real AMD hardware (invisible
+         * under QEMU's virtual GPU, which has no such caching-
+         * performance cliff) -- catastrophic once dozens of test
+         * guests each print several lines. hype_gop_flush() (core/
+         * gop.h) pushes this shadow buffer to the real screen in one
+         * Blt() call instead, typically hardware-accelerated/DMA'd by
+         * the platform's own GOP driver. */
+        uint64_t fb_bytes = (uint64_t)gop->Mode->Info->PixelsPerScanLine *
+                             gop->Mode->Info->VerticalResolution * sizeof(unsigned int);
+        uint64_t fb_pages = (fb_bytes + 0xFFFu) / 0x1000u;
+        void *shadow_fb = (void *)(uintptr_t)hype_alloc_pages_any(SystemTable->BootServices, (UINTN)fb_pages);
+
+        hype_gop_console_init(&g_gop_console, shadow_fb, gop->Mode->Info->HorizontalResolution,
                                gop->Mode->Info->VerticalResolution,
                                gop->Mode->Info->PixelsPerScanLine,
                                0xFFFFFFu, 0x000000u);
         hype_gop_console_clear(&g_gop_console);
         hype_fatal_set_gop(&g_gop_console);
+        hype_fatal_set_gop_protocol(gop, (void *)gop->Mode->FrameBufferBase);
         hype_gop_print(&g_gop_console, "hype: running self-tests...\n");
+        hype_gop_flush(gop, &g_gop_console, (void *)gop->Mode->FrameBufferBase);
         /* Real-hardware debugging: our own host paging (built later,
          * right after ExitBootServices -- see HYPE_PAGING_MAX_GB) only
          * identity-maps the first HYPE_PAGING_MAX_GB gigabytes. If this
@@ -4733,6 +4752,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     if (status != EFI_SUCCESS) {
         hype_fatal("ExitBootServices failed: 0x%llx", (unsigned long long)status);
     }
+    /* Blt() (hype_gop_flush()'s own preferred path) is a Boot-Services-
+     * era protocol call, unsafe to use from here on -- clear the
+     * registered GOP protocol handle so every subsequent
+     * hype_debug_print()/hype_fatal() falls back to a direct memcpy
+     * into the real framebuffer instead (still valid indefinitely; see
+     * core/gop.h's own hype_gop_flush() doc comment). The real
+     * framebuffer address itself, already registered above, is left
+     * untouched. */
+    hype_fatal_set_gop_protocol(0, hype_fatal_get_real_fb());
     hype_debug_print("ExitBootServices returned\n");
 
     /*
@@ -4803,6 +4831,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          gop->Mode->Info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)) {
         hype_gop_console_clear(&g_gop_console);
         hype_gop_print(&g_gop_console, "hype: Boot Services exited, hypervisor now running\n");
+        /* Post-ExitBootServices: Blt() is no longer safe (gop=0 here
+         * falls back to hype_gop_flush()'s own direct-memcpy path). */
+        hype_gop_flush(0, &g_gop_console, hype_fatal_get_real_fb());
     }
 
     hype_serial_print("hype: Boot Services exited, hypervisor now running\n");

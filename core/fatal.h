@@ -1,6 +1,7 @@
 #ifndef HYPE_FATAL_H
 #define HYPE_FATAL_H
 
+#include "efi_types.h"
 #include "gop_text.h"
 
 /*
@@ -19,6 +20,24 @@
  * found). hype_fatal_get_gop() exists for testing the roundtrip. */
 void hype_fatal_set_gop(hype_gop_console_t *con);
 hype_gop_console_t *hype_fatal_get_gop(void);
+
+/*
+ * Registers the raw GOP protocol handle (used by hype_gop_flush()'s
+ * Blt() path) and the real hardware framebuffer address (used by its
+ * post-ExitBootServices memcpy fallback) -- found necessary via real-
+ * hardware FW-1 testing: hype_gop_console_t's own framebuffer pointer
+ * is now a shadow buffer in ordinary RAM (see boot/main.c's console-
+ * init site), so every hype_debug_print()/hype_fatal() call needs a
+ * way to flush that shadow buffer onto the real screen after printing
+ * into it. Call once alongside hype_fatal_set_gop(); call again with
+ * `gop=0` (real_fb unchanged) right after ExitBootServices() succeeds
+ * -- Blt() is a Boot-Services-era protocol call, unsafe to use
+ * afterward, unlike a direct write to the real framebuffer address,
+ * which stays valid indefinitely.
+ */
+void hype_fatal_set_gop_protocol(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, void *real_fb);
+EFI_GRAPHICS_OUTPUT_PROTOCOL *hype_fatal_get_gop_protocol(void);
+void *hype_fatal_get_real_fb(void);
 
 /*
  * Formats fmt/... as "PANIC: <message>", prints it via serial and (if

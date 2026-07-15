@@ -1160,6 +1160,47 @@ disk-log-based approach from the note above if/when a genuine
 iterative real-hardware investigation is needed later (e.g. if this
 one *doesn't* reproduce identically and a deeper look is required).
 
+**Update (2026-07-15, later same day): found and fixed a real GOP-
+rendering perf bug during the actual real-hardware attempt.** The
+package above worked, but the operator reported ~2-3 *seconds* per
+redrawn screen line -- `hype_debug_print()`'s screen path
+(`hype_gop_print()`/`hype_gop_scroll()`, `core/gop_text.c`) was drawing
+directly into `gop->Mode->FrameBufferBase`, one uncached MMIO store per
+pixel, with a full-screen read+write on every scroll -- invisible under
+QEMU's virtual GPU (no memory-attribute performance cliff there) but
+catastrophic on real silicon once dozens of test guests each print
+several lines. What looked like an infinite loop (5+ minutes with no
+visible progress) was real progress at a real crawl, not a hang.
+
+Fix (reference technique confirmed against a separate, known-fast real-
+hardware GOP renderer at `/mnt/data/dev/UefiBenchmark`, which does
+**not** touch memory-attribute/MTRR/PAT plumbing at all -- its speed
+comes purely from drawing into a normal cached-RAM shadow buffer and
+flushing via one GOP `Blt()` call per frame): `hype_gop_console_t`'s
+own framebuffer pointer is now a shadow buffer in ordinary
+Boot-Services-allocated RAM (`hype_alloc_pages_any()`), not the real
+hardware framebuffer; a new `hype_gop_flush()` (`core/gop.h/.c`, real
+`EFI_GRAPHICS_OUTPUT_PROTOCOL.Blt()` struct/enum/signature added to
+`core/efi_types.h`, transcribed from EDK2's own
+`MdePkg/Include/Protocol/GraphicsOutput.h`, not reconstructed from
+memory) pushes that shadow buffer to the real screen in one call after
+every print. Since `Blt()` is a Boot-Services-era protocol call and all
+of run_all_test_guests() (including FW-1) runs *before*
+`ExitBootServices()`, this covers every test guest's own debug output;
+the one place `hype_gop_flush()` is used post-`ExitBootServices()`
+falls back to a direct memcpy into the real framebuffer instead (still
+valid indefinitely, unlike a protocol call). `core/fatal.c` gained a
+paired getter/setter for the raw GOP protocol handle + real framebuffer
+address so `hype_debug_print()`/`hype_fatal()` can flush automatically.
+100% coverage on both new/changed modules (mocked `Blt()`, matching
+`hype_gop_locate()`'s own existing mocking convention). Verified via
+QEMU (with a real virtual GPU device this time, exercising the actual
+`Blt()` path throughout, not just the "no GOP" fallback this project's
+own dev harness normally hits) that the full test sequence still reaches
+the identical `PANIC: fw-1: exc vec=14 err=0x0 cr2=0x0 ... rip=...`
+fault with zero regressions. `tools/make-usb-package.sh` rebuilt with
+this fix; real-hardware re-test should now redraw at normal speed.
+
 - [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash

@@ -2,6 +2,7 @@
 
 #include "fatal.h"
 #include "format.h"
+#include "gop.h"
 #include "halt.h"
 #include "serial.h"
 
@@ -37,6 +38,7 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
     gop = hype_fatal_get_gop();
     if (gop != 0) {
         hype_gop_print(gop, "PANIC: %s\n", msg);
+        hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());
     }
 
     hype_halt_forever();
@@ -56,5 +58,6 @@ void hype_debug_print(const char *fmt, ...) {
     gop = hype_fatal_get_gop();
     if (gop != 0) {
         hype_gop_print(gop, "%s", msg);
+        hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());
     }
 }

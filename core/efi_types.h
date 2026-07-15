@@ -248,10 +248,43 @@ typedef struct {
     UINTN FrameBufferSize;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
 
+/* Real-hardware GOP-rendering perf fix: Blt() lets a caller push a
+ * whole shadow buffer to the real framebuffer in one call (typically
+ * hardware-accelerated/DMA'd by the platform's own GOP driver),
+ * instead of the catastrophically slow one-uncached-store-per-pixel
+ * writes a direct FrameBufferBase pointer produces on real silicon
+ * (invisible under QEMU's virtual GPU, which has no such caching-
+ * attribute performance cliff). Struct/enum layout and the Blt
+ * function pointer's own parameter list are transcribed directly from
+ * EDK2's own MdePkg/Include/Protocol/GraphicsOutput.h, not
+ * reconstructed from memory -- same discipline as this project's
+ * other UEFI protocol structs. */
 typedef struct {
+    UINT8 Blue;
+    UINT8 Green;
+    UINT8 Red;
+    UINT8 Reserved;
+} EFI_GRAPHICS_OUTPUT_BLT_PIXEL;
+
+typedef enum {
+    EfiBltVideoFill,
+    EfiBltVideoToBltBuffer,
+    EfiBltBufferToVideo,
+    EfiBltVideoToVideo,
+    EfiGraphicsOutputBltOperationMax
+} EFI_GRAPHICS_OUTPUT_BLT_OPERATION;
+
+struct _EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+typedef EFI_STATUS(EFIAPI *EFI_GRAPHICS_OUTPUT_PROTOCOL_BLT)(
+    struct _EFI_GRAPHICS_OUTPUT_PROTOCOL *This, EFI_GRAPHICS_OUTPUT_BLT_PIXEL *BltBuffer,
+    EFI_GRAPHICS_OUTPUT_BLT_OPERATION BltOperation, UINTN SourceX, UINTN SourceY, UINTN DestinationX,
+    UINTN DestinationY, UINTN Width, UINTN Height, UINTN Delta);
+
+typedef struct _EFI_GRAPHICS_OUTPUT_PROTOCOL {
     void *QueryMode;
     void *SetMode;
-    void *Blt;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_BLT Blt;
     EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL;
 

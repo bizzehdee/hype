@@ -21,6 +21,37 @@ int main(void) {
         failures++;
     }
 
+    {
+        EFI_GRAPHICS_OUTPUT_PROTOCOL fake_gop;
+        int real_fb_marker;
+        EFI_GRAPHICS_OUTPUT_PROTOCOL *got_proto;
+        void *got_fb;
+
+        hype_fatal_set_gop_protocol(&fake_gop, &real_fb_marker);
+        got_proto = hype_fatal_get_gop_protocol();
+        got_fb = hype_fatal_get_real_fb();
+        if (got_proto != &fake_gop) {
+            printf("FAIL: hype_fatal_get_gop_protocol() did not round-trip the registered pointer\n");
+            failures++;
+        }
+        if (got_fb != &real_fb_marker) {
+            printf("FAIL: hype_fatal_get_real_fb() did not round-trip the registered pointer\n");
+            failures++;
+        }
+
+        /* The documented "clear gop, keep real_fb" pattern used right
+         * after ExitBootServices(). */
+        hype_fatal_set_gop_protocol(0, &real_fb_marker);
+        if (hype_fatal_get_gop_protocol() != 0) {
+            printf("FAIL: hype_fatal_get_gop_protocol() should return NULL after being cleared\n");
+            failures++;
+        }
+        if (hype_fatal_get_real_fb() != &real_fb_marker) {
+            printf("FAIL: hype_fatal_get_real_fb() should be unaffected by clearing the gop protocol\n");
+            failures++;
+        }
+    }
+
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;
