@@ -1537,13 +1537,45 @@ executing from its flash window. No jump-to-(-1); exactly the designed
 guests (M2-7..M5-2) still halt cleanly (reason=0x78) -- no regressions.
 Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
 
-- [ ] **FW-1b** — Guest Local APIC. OVMF's PEI reads/writes LAPIC MMIO
-  at 0xFEE00000 (first hit: SVR at +0xF0); FW-1a leaves it not-present
-  so it NPFs. Options: emulate LAPIC MMIO via the NPF handler, or wire
-  the guest onto the AVIC infrastructure this project already has
-  (M2-4). Discovered empirically from FW-1a's NPF; likely followed by
-  more MMIO (IOAPIC 0xFEC00000, MMCONFIG ECAM 0xE0000000 -> reuse the
-  PCI-1 model). Deps: FW-1a, M2-4.
+- [x] **FW-1b** — Guest Local APIC. DONE + validated in QEMU: OVMF now
+  boots deep into DXE and advances to the next blocker (ECAM, see
+  FW-1c). Chose NPF-trapped MMIO emulation, NOT AVIC (M2-4's AVIC is
+  unwired plumbing, needs 4KB-under-2MB NPT + undefined AVIC exits, and
+  wouldn't solve timer delivery anyway).
+  - `devices/guest_lapic.{h,c}`: software LAPIC (SVR/ID/VERSION/LVT_TIMER/
+    INIT+CURRENT_COUNT/DIVIDE/EOI/LINT0-1) with a synthetic per-VM-exit
+    countdown driving a periodic timer IRQ. Register subset confirmed
+    against edk2 BaseXApicX2ApicLib; TPR/ICR unused (single vCPU).
+  - `hype_svm_vcpu_handle_lapic_npf` (svm_vcpu.c) mirrors the bochs_vbe
+    handler, range-checked to [0xFEE00000,+4KB). Wired into the FW-1 NPF
+    block; the LAPIC region is already not-present from FW-1a (no NPT
+    change).
+  - Timer delivery: each VM-exit ticks the LAPIC; when a timer IRQ comes
+    due it's injected via the existing INT-1/INT-2 EVENTINJ/VINTR path
+    (the FW-1 loop now handles EXITCODE_VINTR). OVMF's LocalApicTimerDxe
+    needs these ticks to advance BDS -- confirmed working (VINTR + HLT
+    exits observed, OVMF reached DXE memory-map processing).
+  - IA32_APIC_BASE (MSR 0x1B) already returned EN=1/EXTD=0/base=0xFEE00000
+    (CPUMSR-2), keeping OVMF on the xAPIC MMIO path -- no change needed.
+  - ***Bug found + fixed during bring-up***: the MMIO handlers read the
+    faulting instruction bytes via save.rip as a HOST pointer, which
+    only works under an identity NPT. FW-1a remaps both guest RAM and
+    flash, so that read landed on wrong host memory -> decode failed ->
+    fatal. Fixed by translating guest RIP -> host through FW-1's own map
+    (`fw_1_guest_phys_to_host`, boot/main.c) and passing the bytes into
+    the handler. (FW-1's guest paging is identity, so guest-linear RIP
+    == guest-physical.) Unit suite 53/53, guest_lapic.c ~98% coverage,
+    clean build, no QEMU regressions.
+
+- [ ] **FW-1c** — Guest PCI config via MMCONFIG ECAM. After FW-1b, OVMF
+  NPFs reading ECAM at guest-physical 0xE00F8040 (base 0xE0000000, bus
+  0/dev 31/func 0/reg 0x40 -- the ICH9 LPC bridge PMBASE), rip in guest
+  RAM. FW-1 already services legacy CF8/CFC PCI I/O via
+  `hype_svm_vcpu_handle_pci_cf8_ioio`; PCI-1 also built an ECAM MMIO
+  handler `hype_svm_vcpu_handle_pci_ecam_npf(ctx, pci, ecam_base_phys)`
+  -- wire that into the FW-1 NPF block (base 0xE0000000, the value FW-1's
+  ACPI MCFG already advertises) with the same guest-RIP->host
+  instruction-byte translation FW-1b added. Deps: FW-1b, PCI-1.
 
 - [~] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped

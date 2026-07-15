@@ -1064,6 +1064,54 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
     return 0;
 }
 
+int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
+                                    uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < lapic_base_phys ||
+        npf.guest_phys_addr >= lapic_base_phys + HYPE_GUEST_LAPIC_MMIO_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - lapic_base_phys);
+
+    if (guest_insn_bytes == 0 || hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+    if (decoded.size_bytes != 4u) {
+        return -1; /* xAPIC registers are 32-bit dword accesses only */
+    }
+
+    reg = gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        if (hype_guest_lapic_write(lapic, offset, decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_guest_lapic_read(lapic, offset, decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 /*
  * Walks every newly-submitted chain in the (single) virtqueue since
  * this device's own last_avail_idx bookkeeping, processing each as a

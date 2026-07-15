@@ -18,6 +18,7 @@
 #include "../../../devices/ps2_keyboard.h"
 #include "../../../devices/ps2_mouse.h"
 #include "../../../devices/bochs_vbe.h"
+#include "../../../devices/guest_lapic.h"
 #include "../../../devices/virtio_blk.h"
 #include "../../../devices/ata_disk.h"
 #include "vmcb.h"
@@ -675,6 +676,25 @@ int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uin
  */
 int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                         uint64_t mmio_base_phys);
+
+/*
+ * FW-1b's exempt NPF glue for the guest Local APIC (devices/guest_lapic.h)
+ * at [lapic_base_phys, lapic_base_phys + HYPE_GUEST_LAPIC_MMIO_SIZE).
+ * Same range-check->decode->dispatch->advance-RIP flow as the other
+ * MMIO handlers here; xAPIC registers are 32-bit, so a non-4-byte
+ * access returns -1 (fail closed). Returns 0 if the fault was in the
+ * LAPIC window and handled, -1 otherwise (so the FW-1 loop can fall
+ * through to its unhandled-NPF fatal).
+ *
+ * Unlike the pflash/bochs_vbe handlers, the faulting instruction bytes
+ * are passed IN (`guest_insn_bytes`) rather than read from save.rip as
+ * a host pointer: FW-1's NPT remaps both guest RAM and the firmware
+ * flash window away from an identity map, so the caller must translate
+ * the guest RIP to its real host backing address first (FW-1's guest
+ * paging is identity, so guest-linear RIP == guest-physical there).
+ */
+int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
+                                    uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes);
 
 /*
  * M5-1's exempt NPF glue for the virtio-blk device's single MMIO BAR

@@ -177,6 +177,7 @@ static hype_pic_emu_t g_fw_1_pic;
 static hype_pit_emu_t g_fw_1_pit;
 static hype_pci_t g_fw_1_pci;
 static hype_cmos_t g_fw_1_cmos;
+static hype_guest_lapic_t g_fw_1_lapic; /* FW-1b: guest Local APIC (0xFEE00000) */
 static hype_fw_cfg_t g_fw_1_fw_cfg;
 static hype_acpi_rsdp_t g_fw_1_rsdp;
 static uint8_t g_fw_1_tables_blob[4096] __attribute__((aligned(64)));
@@ -4131,6 +4132,27 @@ static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
  * building next, iterated the same log-driven way every other
  * real-hardware-facing piece of this project has been.
  */
+
+/*
+ * FW-1b: translate a guest-physical address to the host address that
+ * backs it under FW-1's (non-identity) NPT map, or 0 if unmapped. Used
+ * to fetch the faulting instruction's bytes for MMIO decode: unlike the
+ * fully-identity-mapped test guests, FW-1 remaps both guest RAM and the
+ * flash window, so save.rip cannot be dereferenced as a host pointer
+ * directly. (FW-1's guest paging is identity, so a guest-linear RIP
+ * equals its guest-physical address here.) Mirrors exactly the two
+ * hype_npt_map_range() calls in the NPT build below. */
+static const uint8_t *fw_1_guest_phys_to_host(uint64_t gpa) {
+    uint64_t flash_base = 0x100000000ULL - g_fw_1_combined_size;
+    if (gpa < HYPE_FW_1_GUEST_RAM_BYTES) {
+        return (const uint8_t *)(uintptr_t)(g_fw_1_ram_host_phys + gpa);
+    }
+    if (gpa >= flash_base && gpa < 0x100000000ULL) {
+        return (const uint8_t *)(uintptr_t)(g_fw_1_combined_host_phys + (gpa - flash_base));
+    }
+    return 0;
+}
+
 static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
@@ -4144,6 +4166,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
     hype_pic_emu_reset(&g_fw_1_pic);
     hype_pit_emu_reset(&g_fw_1_pit);
+    hype_guest_lapic_reset(&g_fw_1_lapic);
     hype_pci_reset(&g_fw_1_pci);
     hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
                          0x00, 0x00);
@@ -4290,8 +4313,21 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_svm_vcpu_set_rip(ctx, reset_rip);
 
     for (;;) {
+        uint8_t timer_vector;
+
         if (ops->vcpu_run(ctx, &info) != 0) {
             hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        /* FW-1b: advance the guest LAPIC timer one synthetic tick per
+         * VM-exit; when a timer IRQ comes due, request its delivery via
+         * the INT-1/INT-2 EVENTINJ/VINTR path (delivered on the next
+         * VMRUN, or when a VINTR window opens if the guest can't accept
+         * it yet). OVMF's LocalApicTimerDxe needs these ticks to advance
+         * BDS to the shell. */
+        hype_guest_lapic_tick(&g_fw_1_lapic);
+        if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
+            hype_svm_vcpu_request_interrupt(ctx, timer_vector);
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
@@ -4306,8 +4342,23 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             continue;
         }
 
+        if (info.reason == HYPE_SVM_EXITCODE_VINTR) {
+            /* The VINTR window opened -- the guest can now take the
+             * pending timer IRQ (INT-2). */
+            hype_svm_vcpu_handle_vintr_window(ctx);
+            continue;
+        }
+
         if (info.reason == HYPE_SVM_EXITCODE_NPF) {
             hype_svm_npf_t npf;
+            /* FW-1b: the guest Local APIC at 0xFEE00000 is the expected
+             * NPF here (the region is not-present by design). Pass the
+             * host-translated faulting instruction bytes, since FW-1's
+             * NPT is not an identity map. */
+            if (hype_svm_vcpu_handle_lapic_npf(ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE,
+                                                fw_1_guest_phys_to_host(info.guest_rip)) == 0) {
+                continue;
+            }
             hype_svm_vcpu_get_last_npf(ctx, &npf);
             hype_fatal("fw-1: unhandled NPF at guest-physical 0x%llx (%s, guest_rip=0x%llx)",
                        (unsigned long long)npf.guest_phys_addr, npf.is_write ? "write" : "read",
