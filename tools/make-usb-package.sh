@@ -26,6 +26,16 @@ RELEASE_DIR="$REPO_ROOT/release"
 OUT_DIR="$RELEASE_DIR/usb"
 IMG_PATH="$RELEASE_DIR/hype-usb.img"
 IMG_SIZE_MB=64
+# ISO-1/ISO-2's own test guests read a real ISO from \iso\test.iso on
+# the same volume hype.efi was booted from (boot/main.c) -- without
+# one present, that test (and every test dispatched after it,
+# including FW-1) fails immediately with a file-not-found panic before
+# ever running. Same default the dev `make run` target already uses
+# (Makefile's own TEST_ISO); override on the command line
+# (TEST_ISO=/path/to.iso tools/make-usb-package.sh) if your distro
+# vendors edk2-ovmf's own UefiShell.iso elsewhere or you'd rather use a
+# different (small) ISO9660 image.
+TEST_ISO=${TEST_ISO:-/usr/share/edk2/ovmf/UefiShell.iso}
 
 for tool in mformat mmd mcopy dd; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -50,6 +60,16 @@ cp "$SCRIPT_DIR/usb-package-README.md" "$OUT_DIR/README.md"
 mkdir -p "$OUT_DIR/EFI/hype"
 cp "$REPO_ROOT/fw/OVMF_CODE.fd" "$REPO_ROOT/fw/OVMF_VARS.fd" "$OUT_DIR/EFI/hype/"
 
+if [ -f "$TEST_ISO" ]; then
+    mkdir -p "$OUT_DIR/iso"
+    cp "$TEST_ISO" "$OUT_DIR/iso/test.iso"
+else
+    echo "make-usb-package.sh: WARNING: TEST_ISO ($TEST_ISO) not found -- ISO-1/ISO-2's own test" >&2
+    echo "  guest (and everything dispatched after it, including FW-1) will panic immediately" >&2
+    echo "  with a file-not-found error instead of actually running. Set TEST_ISO=/path/to.iso" >&2
+    echo "  to point at a real ISO9660 image if you want the full test sequence to run." >&2
+fi
+
 echo "make-usb-package.sh: building $IMG_PATH (FAT32, ${IMG_SIZE_MB}MB)..."
 mkdir -p "$RELEASE_DIR"
 rm -f "$IMG_PATH"
@@ -61,6 +81,10 @@ mmd -i "$IMG_PATH" ::/EFI/hype
 mcopy -i "$IMG_PATH" "$REPO_ROOT/build/hype.efi" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG_PATH" "$REPO_ROOT/fw/OVMF_CODE.fd" ::/EFI/hype/OVMF_CODE.fd
 mcopy -i "$IMG_PATH" "$REPO_ROOT/fw/OVMF_VARS.fd" ::/EFI/hype/OVMF_VARS.fd
+if [ -f "$TEST_ISO" ]; then
+    mmd -i "$IMG_PATH" ::/iso
+    mcopy -i "$IMG_PATH" "$TEST_ISO" ::/iso/test.iso
+fi
 
 echo
 echo "make-usb-package.sh: done."

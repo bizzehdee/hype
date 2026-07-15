@@ -1133,6 +1133,33 @@ builds -- giving a durable, retrievable log from real hardware the same
 way `/tmp/qemu_*.log` capture already does for this dev environment.
 Revisit this note when picking FW-1 back up.
 
+**Update (2026-07-15): a real-hardware attempt is worthwhile now, before
+M5-3's disk log exists.** The above note is about *iterative* debugging
+(dozens of dumps while narrowing down a live investigation) -- but
+FW-1's current blocker doesn't need that anymore: the exact fault is
+already fully characterized under nested-SVM (`exc vec=14 err=0x0
+cr2=0x0`, a NULL-pointer read at a dynamically-relocated DXE driver),
+and the only open question is whether *this same* fault reproduces on
+bare metal or not -- a single snapshot, not an iterative session. The
+existing GOP-screen debug path (`hype_debug_print()`/`hype_fatal()`,
+both already routed to screen since `hype_gop_console_init()` +
+`hype_fatal_set_gop()` run before `run_all_test_guests()`, see the
+INPUT-3/4 dispatch-ordering notes above) already prints FW-1's own
+full exception dump -- vector/err/CR0/CR2/CR3/RIP, raw instruction
+bytes, and a stack dump -- to the screen, not just serial. That's
+sufficient for this one-shot comparison. `tools/make-usb-package.sh`
+was updated to also bundle a real test ISO (`\iso\test.iso`, the same
+`UefiShell.iso` the dev QEMU harness already uses) so the full test
+sequence actually reaches FW-1 on real hardware instead of dying
+earlier at ISO-1/ISO-2 for want of a file; `tools/usb-package-README.md`
+was updated to describe the current (much longer) test sequence and
+the expected `PANIC: fw-1: ...` outcome instead of its old, stale
+"one line then nothing" description. Verified via QEMU that the
+rebuilt package reaches the identical panic. Still recommend the
+disk-log-based approach from the note above if/when a genuine
+iterative real-hardware investigation is needed later (e.g. if this
+one *doesn't* reproduce identically and a deeper look is required).
+
 - [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash
