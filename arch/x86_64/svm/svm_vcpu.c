@@ -590,6 +590,7 @@ void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t 
     out->rip = real->vmcb->save.rip;
     out->rflags = real->vmcb->save.rflags;
     out->rsp = real->vmcb->save.rsp;
+    out->exitinfo2 = real->vmcb->control.exitinfo2;
 }
 
 void hype_svm_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip) {

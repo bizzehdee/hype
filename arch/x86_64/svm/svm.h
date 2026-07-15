@@ -398,6 +398,16 @@ typedef struct {
     uint64_t rip;
     uint64_t rflags;
     uint64_t rsp;
+    /* Real-hardware investigation (rip reading back as an implausible
+     * sentinel on real AMD hardware, never seen under nested-SVM
+     * QEMU/KVM): the VMCB *control* area's own EXITINFO2 -- which the
+     * AMD spec documents as ALSO holding the faulting linear address
+     * for an intercepted #PF, independent of the *save* area's CR2
+     * field above -- so the two can be compared. If they disagree on
+     * real hardware, that points at the save-state area (where RIP
+     * also lives) not being fully/reliably populated for this specific
+     * exit, rather than a one-off RIP-specific issue. */
+    uint64_t exitinfo2;
 } hype_svm_debug_state_t;
 
 void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out);

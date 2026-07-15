@@ -1264,6 +1264,31 @@ QEMU (unit tests unaffected, 51/51 passing; the guarded branch's own
 `rip`/`rsp` values take the exact same code path as previously
 verified). `tools/make-usb-package.sh` rebuilt again with this fix.
 
+**Update (2026-07-15, later still yet again): the guarded rsp dump
+revealed a second independent all-1s finding.** Real hardware:
+`rsp=0xfcd8d4f0` (itself a plausible-looking address, under 4GB) but
+`[0]`/`[1]`/`[2]`/`[3]` (the 4 qwords actually stored *at* that
+address -- guest memory, a completely separate region from the VMCB
+struct RIP lives in) all read back as the exact same
+`0xFFFFFFFFFFFFFFFF`. Two independent memory locations both reading
+pure all-1s is a stronger signal than either alone.
+
+Added (zero new risk -- all plain struct-field reads already
+captured, no new dereferences): `cs_selector`/`cs_base`/`rflags` (were
+captured in `hype_svm_debug_state_t` all along but never actually
+printed) now print alongside `rsp`; and a new `exitinfo2` field
+(`arch/x86_64/svm/svm.h`/`svm_vcpu.c`) exposes the VMCB *control*
+area's own copy of the faulting address, which the AMD spec documents
+as also being written for an intercepted #PF, independent of the
+*save* area's `cr2` -- printed so the two can be directly compared. If
+they disagree on real hardware, that's strong evidence the save-state
+area (where RIP/RSP's own target also lives) isn't being fully/
+reliably populated for this specific exit, rather than a RIP-specific
+one-off. Still no confirmed root cause -- this is purely about getting
+more ground truth in one round trip rather than guessing further.
+`tools/make-usb-package.sh` rebuilt again; this print set is sized to
+fit comfortably on one 1080p screen for a photo/OCR capture.
+
 - [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash

@@ -4310,6 +4310,26 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                               (unsigned long long)info.qualification, (unsigned long long)dbg.cr0,
                               (unsigned long long)dbg.cr2, (unsigned long long)dbg.cr3,
                               (unsigned long long)dbg.rip);
+            /* Real-hardware investigation (rip=-1 finding, see below):
+             * these fields are already captured in `dbg` at zero extra
+             * risk (plain struct reads, no new dereferences) but were
+             * never actually printed -- if cs_selector/cs_base/rflags
+             * ALSO look like the same all-1s sentinel, that points at
+             * several adjacent VMCB save-state fields being garbage
+             * together (a wider issue); if they look sane, that narrows
+             * the garbage specifically to rip (and whatever rsp points
+             * at), which points somewhere else entirely. */
+            hype_debug_print("fw-1: cs_selector=0x%x cs_base=0x%llx rflags=0x%llx rsp=0x%llx\n",
+                              (unsigned int)dbg.cs_selector, (unsigned long long)dbg.cs_base,
+                              (unsigned long long)dbg.rflags, (unsigned long long)dbg.rsp);
+            /* Real-hardware investigation: EXITINFO2 (control area) and
+             * CR2 (save area) both architecturally hold the same
+             * faulting linear address for an intercepted #PF -- if they
+             * disagree here, that's strong evidence the save-state area
+             * (where RIP also lives) isn't being fully/reliably
+             * populated for this specific exit on real hardware. */
+            hype_debug_print("fw-1: exitinfo2=0x%llx (cr2 above should match)\n",
+                              (unsigned long long)dbg.exitinfo2);
 
             /* Real-hardware finding: dbg.rip itself can be an
              * implausible sentinel-looking value (observed: exactly
