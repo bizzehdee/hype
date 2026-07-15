@@ -496,9 +496,46 @@ a polling-only keyboard and deferring real interrupt delivery.
   should happen *before* test-guest dispatch instead, once FW-1 is
   unparked or the test-guest sequence is reworked. Deferred rather than
   reordering boot-critical code as a side effect of this task.*
-- [ ] **INPUT-4** — Leader-chord recognition: `Right-Ctrl+Right-Alt` held +
+- [x] **INPUT-4** — Leader-chord recognition: `Right-Ctrl+Right-Alt` held +
   action key (`D`, `1`-`9`, `Left`/`Right`, `Esc`).
   Deps: INPUT-3
+
+  *Scope was deliberately narrow, matching the task's own title -- pure
+  chord *recognition* over raw host scancode bytes, not the dashboard/
+  VM-switching it will eventually drive (that's M8-1's job, per
+  plan.md §6b). New `arch/x86_64/cpu/leader_chord.h/.c`: a pure decoder
+  (100% line, 91.30% branch coverage, `core/tests/test_leader_chord.c`,
+  13 tests) that tracks Right-Ctrl/Right-Alt held state byte-by-byte
+  and, once both are held, recognizes `D` (toggle dashboard), `1`-`9`
+  (jump to VM N), `Left`/`Right` (cycle prev/next), `Esc` (return to
+  dashboard) -- returning one of `HYPE_CHORD_ACTION_*` plus a `vm_index`
+  for the digit case. No hardware access at all; feed it bytes
+  (`hype_host_kbd_poll_scancode()`, INPUT-3), get back actions.
+
+  Scan Code Set 1 make/break byte values (Right-Ctrl `E0 1D`/`E0 9D`,
+  Right-Alt `E0 38`/`E0 B8`, `D` `20`/`A0`, `1`-`9` `02`-`0A`/`82`-`8A`,
+  `Esc` `01`/`81`, Left-Arrow `E0 4B`/`E0 CB`, Right-Arrow `E0 4D`/
+  `E0 CD`) were fetched and confirmed against a real reference table at
+  implementation time, not reconstructed from memory -- same rigor this
+  project applies to every other hardware protocol constant. Left-Ctrl/
+  Left-Alt share the same base byte as their right-side counterparts
+  but arrive with no `0xE0` prefix -- a dedicated test
+  (`test_left_ctrl_alt_are_not_confused_with_right_variants`) confirms
+  they're correctly rejected rather than accidentally satisfying the
+  chord.
+
+  Wired a minimal driving loop into `efi_main()`'s existing ~1s tail
+  loop (right after the M1-8 timer/PIC bring-up block): drains
+  `hype_host_kbd_poll_scancode()`, feeds each byte through the decoder,
+  and reports any recognized action via `hype_serial_print()` -- the
+  only currently-observable proof available, since no dashboard/VM
+  list exists yet to actually act on it. **Live keypress verification
+  is blocked by the same pre-existing ordering issue documented under
+  INPUT-3**: `run_all_test_guests()` runs before this code, and FW-1's
+  parked panic halts the host before it's ever reached. Unit tests are
+  the full verification for this task until that ordering issue is
+  resolved (post-FW-1-unpark) or M8-1 gives this a real consumer to
+  exercise end-to-end.*
 
 ---
 
@@ -1552,6 +1589,41 @@ Revisit this note when picking FW-1 back up.
   is best written once that's settled (post-M9/M10 area) rather than
   early.
   Deps: none hard, but most useful once install/packaging is real (M9/M10)
+
+---
+
+## V2 — Post-v1 features (explicitly out of v1 scope)
+
+Not part of any v1 milestone above; recorded here so the ask isn't lost,
+not scheduled against the critical path.
+
+- [ ] **V2-TELEM-1** — Per-VM vCPU usage telemetry: track actual
+  (burst) CPU time used per second per vCPU, plus a separate "reserved"
+  figure that assumes 100% utilization of whatever share of a pCPU the
+  VM's config reserves (distinct numbers — burst is measured, reserved
+  is a static entitlement figure, not sampled).
+  Deps: user request 2026-07-15 (during INPUT-4); no v1 milestone Deps
+  yet — needs its own scoping pass (where the per-vCPU exit-count/HLT-
+  time stats this'd build on, already read by the dashboard per §6b,
+  get sampled/rolled up on a 1-second cadence; where per-second
+  history is buffered/retained before the API client ships it).
+- [ ] **V2-TELEM-2** — Per-VM memory reservation telemetry: the
+  `mem_mb` figure already validated by `core/admission.c`, reported
+  out per-VM (not working-set/usage — that's the dashboard's own
+  best-effort EPT/NPT approximation, §6b; this is the static
+  reservation figure).
+  Deps: V2-TELEM-1 (shares whatever per-second sampling/buffering
+  infrastructure V2-TELEM-1 builds)
+- [ ] **V2-TELEM-3** — Per-VM bandwidth usage telemetry (network
+  throughput; needs NET-* to exist first — no virtual NIC device
+  model exists yet to measure).
+  Deps: V2-TELEM-1, NET-1
+- [ ] **V2-TELEM-4** — Telemetry client built into the hypervisor
+  itself, shipping V2-TELEM-1/2/3's per-VM samples to a **separate,
+  not-yet-specced API project** (out of this repo's scope until that
+  project has its own protocol/schema/transport decided — this task is
+  blocked on that spec existing, not on anything in this codebase).
+  Deps: V2-TELEM-1, V2-TELEM-2, V2-TELEM-3
 
 ---
 

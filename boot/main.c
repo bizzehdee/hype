@@ -20,6 +20,7 @@
 #include "../arch/x86_64/cpu/pit.h"
 #include "../arch/x86_64/cpu/timer.h"
 #include "../arch/x86_64/cpu/ps2_host.h"
+#include "../arch/x86_64/cpu/leader_chord.h"
 #include "../arch/x86_64/cpu/vmexit.h"
 #include "../arch/x86_64/cpu/vmm_select.h"
 #include "../arch/x86_64/svm/npt.h"
@@ -3733,9 +3734,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_serial_print("interrupts enabled -- waiting for timer ticks\n");
 
     {
+        /* INPUT-4: leader-chord recognition (plan.md §6b). No dashboard
+         * or VM-switching consumer exists yet (that's M8's job) -- this
+         * just drains whatever hype_host_kbd_isr() (INPUT-3) buffered,
+         * feeds it through the pure hype_chord_feed_scancode() decoder,
+         * and reports any recognized action via serial, as the only
+         * currently-observable proof the chord was decoded correctly. */
         uint64_t target = hype_timer_get_ticks() + 1000; /* ~1s at 1000Hz */
+        hype_chord_state_t chord_state;
+        hype_chord_state_reset(&chord_state);
         while (hype_timer_get_ticks() < target) {
+            uint8_t scancode;
             hype_wait_for_interrupt();
+            while (hype_host_kbd_poll_scancode(&scancode)) {
+                hype_chord_result_t result = hype_chord_feed_scancode(&chord_state, scancode);
+                if (result.action != HYPE_CHORD_ACTION_NONE) {
+                    hype_serial_print("leader-chord: action=%d vm_index=%u\n",
+                                       (int)result.action, (unsigned)result.vm_index);
+                }
+            }
         }
     }
     hype_serial_print("timer: %llu ticks (PIT @ 1000Hz)\n",
