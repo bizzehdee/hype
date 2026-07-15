@@ -724,6 +724,12 @@ int hype_svm_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart
  */
 int hype_svm_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port, uint8_t *out_byte);
 
+/* FW-1g: enable/disable per-access tracing of guest 0x60/0x64 (PS/2)
+ * accesses in hype_svm_vcpu_handle_ps2_ioio (default off). FW-1 turns it
+ * on after injecting a keystroke to see whether OVMF's WaitForKey poll
+ * reads the status/scancode. */
+void hype_svm_set_ps2_trace(int enabled);
+
 /*
  * M5-1's exempt NPF glue for the virtio-blk device's single MMIO BAR
  * (devices/virtio_blk.h), covering all four virtio-pci capability

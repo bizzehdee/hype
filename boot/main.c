@@ -249,8 +249,9 @@ static hype_acpi_loader_entry_t g_fw_1_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENT
  * guest stays idle for HYPE_FW_1_KEY_WAIT_EXITS total VM-exits after the
  * key, it didn't consume it on a ConIn source we feed -- don't claim it
  * advanced. */
-#define HYPE_FW_1_KEY_REACTION_EXITS 2000ULL
-#define HYPE_FW_1_KEY_WAIT_EXITS 8000ULL
+#define HYPE_FW_1_KEY_REACTION_CHARS 40ULL  /* new console chars after the key => menu rendered => reacted */
+#define HYPE_FW_1_KEY_REARM_INTERVAL 256ULL /* re-arm the scancode every N exits (leaves OBF-clear windows) */
+#define HYPE_FW_1_KEY_WAIT_EXITS 20000ULL   /* give up waiting for a reaction after this many exits post-key */
 
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
@@ -4428,6 +4429,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     int key_injected = 0;
     int key_reacted = 0;
     unsigned long long console_chars = 0;
+    unsigned long long inject_chars = 0;
     unsigned long long inject_productive = 0;
     unsigned long long inject_total = 0;
     hype_vt_filter_t dbg_filter;
@@ -4480,15 +4482,32 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         console_chars += fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
                                                   (unsigned int)sizeof(uart_line2));
 
-        /* FW-1f: once a key has been injected, OVMF reacting = it leaves
-         * its idle wait and does real work (menu processing). Detect that
-         * as soon as it's clearly happening -- don't grind through the
-         * whole (huge) menu render. */
-        if (key_injected && !key_reacted &&
-            productive_exits - inject_productive >= HYPE_FW_1_KEY_REACTION_EXITS) {
-            key_reacted = 1;
-            booted = 1;
-            break;
+        /* FW-1g: after a key is injected, "reacted" = the guest emits new
+         * CONSOLE output (the Boot Manager Menu's item labels are plain
+         * text that survives the VT filter) -- a robust signal, unlike
+         * productive-exit count which OVMF's keyboard status-poll spin
+         * inflates. AND re-arm the scancode on a throttled cadence:
+         * OVMF busy-polls status rather than idle-HLTing, so the byte
+         * must be present *during* that poll -- but re-arming every exit
+         * would keep OBF perpetually set and hang OVMF's drain loop, so
+         * only every N exits (leaving OBF-clear windows for the drain to
+         * finish and the key to be processed). */
+        if (key_injected && !key_reacted) {
+            if (console_chars - inject_chars >= HYPE_FW_1_KEY_REACTION_CHARS) {
+                key_reacted = 1;
+                booted = 1;
+                break;
+            }
+            /* Give up whether OVMF is idle-HLTing OR busy-spinning on the
+             * keyboard status (this check runs every exit, unlike the
+             * HLT-branch one). */
+            if (total_exits - inject_total >= HYPE_FW_1_KEY_WAIT_EXITS) {
+                booted = 1;
+                break;
+            }
+            if ((total_exits - inject_total) % HYPE_FW_1_KEY_REARM_INTERVAL == 0) {
+                hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, HYPE_FW_1_KEY_ENTER_MAKE);
+            }
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
@@ -4738,7 +4757,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, HYPE_FW_1_KEY_ENTER_MAKE);
                 hype_guest_uart_rx_enqueue(&g_fw_1_uart, (uint8_t)'\r');
                 hype_guest_uart_rx_enqueue(&g_fw_1_uart2, (uint8_t)'\r');
+                /* FW-1g: trace what OVMF does with the keyboard from here
+                 * on -- does its WaitForKey poll read the status (OBF)
+                 * and consume the scancode? */
+                hype_svm_set_ps2_trace(1);
                 key_injected = 1;
+                inject_chars = console_chars;
                 inject_productive = productive_exits;
                 inject_total = total_exits;
                 continue;

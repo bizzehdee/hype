@@ -463,9 +463,20 @@ int hype_svm_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd)
     return 0;
 }
 
+/* FW-1g: when on, every guest 0x60/0x64 access is logged (port, dir,
+ * value, guest rip). FW-1 turns it on right after injecting a keystroke
+ * so we can see whether OVMF's WaitForKey poll reads the status (OBF)
+ * and consumes the scancode -- without the init traffic drowning it. */
+static int g_ps2_trace = 0;
+
+void hype_svm_set_ps2_trace(int enabled) {
+    g_ps2_trace = enabled ? 1 : 0;
+}
+
 int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
+    uint8_t traced_value = 0;
 
     hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
 
@@ -478,6 +489,7 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
                 hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_DATA, &value);
             }
             real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
+            traced_value = value;
         } else {
             uint8_t value = (uint8_t)(real->vmcb->save.rax & 0xFFu);
             if (hype_ps2_kbd_take_aux_data_write(kbd)) {
@@ -485,6 +497,7 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
             } else {
                 hype_ps2_kbd_io_write(kbd, HYPE_PS2_PORT_DATA, value);
             }
+            traced_value = value;
         }
     } else if (io.port == HYPE_PS2_PORT_STATUS_COMMAND) {
         if (io.is_in) {
@@ -494,11 +507,19 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
                 status |= HYPE_PS2_STATUS_OUTPUT_FULL | HYPE_PS2_STATUS_AUX_DATA;
             }
             real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | status;
+            traced_value = status;
         } else {
-            hype_ps2_kbd_io_write(kbd, HYPE_PS2_PORT_STATUS_COMMAND, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+            traced_value = (uint8_t)(real->vmcb->save.rax & 0xFFu);
+            hype_ps2_kbd_io_write(kbd, HYPE_PS2_PORT_STATUS_COMMAND, traced_value);
         }
     } else {
         return -1;
+    }
+
+    if (g_ps2_trace) {
+        hype_debug_print("fw-1 ps2| %s 0x%x %s=0x%x rip=0x%llx\n", io.is_in ? "IN " : "OUT",
+                          (unsigned int)io.port, io.is_in ? "->" : "<-", (unsigned int)traced_value,
+                          (unsigned long long)real->vmcb->save.rip);
     }
 
     /* EXITINFO2 gives the resume RIP directly, same "next-RIP-for-free"

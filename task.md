@@ -1694,6 +1694,33 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
     directly answers the question (does OVMF poll the keyboard at the
     prompt? does it read our scancode?) without the debug-boot slowdown.
 
+  **PS/2 access trace added + first finding (2026-07-15):**
+  `hype_svm_set_ps2_trace()` (svm_vcpu.c) logs every guest 0x60/0x64
+  access (dir/value/rip); FW-1 enables it at the key injection. Also
+  added a throttled scancode re-arm (every 256 exits, leaving OBF-clear
+  windows so OVMF's drain loop can finish) and switched reaction
+  detection to a CONSOLE-output delta (menu labels are plain text that
+  survive the VT filter) -- robust vs the keyboard status-poll spin.
+  - ***Trace instrument works*** (a from-start trace showed 2263
+    accesses: the full init handshake -- self-test 0x55, reset ->
+    0xFA/0xAA, 0xF0/0x02, 0xF4, 0xED... all ACKed -- plus a heavy
+    status-poll loop from rip 0x3eef7f53 reading 0x64=0x4 (OBF clear)).
+  - ***Key finding: at the "press any key" prompt where FW-1 injects,
+    OVMF makes ZERO keyboard accesses*** (injection-time trace is empty;
+    0x1C never read; no 0x64 polls). All keyboard activity is during
+    init/early boot; by the late idle prompt the poll has stopped. So no
+    scancode injection can work -- OVMF's Ps2KeyboardDxe ConIn is not
+    being serviced at the prompt (driver ran its init I/O but its
+    SimpleTextIn poll / WaitForKey isn't active there). Prime suspect:
+    InitKeyboard hit a timeout (the status-poll spin waiting for an OBF
+    that never came) and Start failed, so the keyboard never joined the
+    live ConIn. Confirming needs the driver's OWN debug log at a
+    FAST-ENOUGH level -- the full 0xFFFFFFFF DEBUG build is too slow
+    (barely reached SEC); next step is a targeted/lower-level DEBUG mask
+    (or only DEBUG_ERROR|DEBUG_INFO) so it reaches DXE keyboard binding
+    in time, and inspect whether Ps2KeyboardDxe's Start succeeds and
+    whether the PS/2 keyboard is in the console ConIn.
+
 - [x] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash
