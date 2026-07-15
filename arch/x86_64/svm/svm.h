@@ -183,6 +183,29 @@ void hype_svm_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_svm_npf_t *out);
 void hype_svm_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *out);
 
 /*
+ * FW-1: routes an IOIO VM-exit to `pci`'s legacy CF8/CFC config-space
+ * ports (devices/pci.h's hype_pci_cf8_write()/_read()/
+ * hype_cf8_config_read()/_write()) -- confirmed necessary the hard way:
+ * without this, every guest read of the host bridge's PCI ID via these
+ * ports silently absorbed as all-1s (hype_svm_vcpu_handle_unknown_ioio())
+ * made this project's own vendored OVMF conclude it was running on
+ * QEMU's "microvm" machine type (whose sentinel host-bridge device ID
+ * happens to BE 0xFFFF), sending it down a completely wrong,
+ * fw_cfg-FDT-based init path that eventually crashed. Returns 0 if the
+ * port was 0xCF8 or 0xCFC-0xCFF (handled, RIP already advanced via
+ * EXITINFO2) or -1 for any other port (caller falls through to its own
+ * next handler in the chain, same composable-handler-chain shape as
+ * hype_svm_vcpu_handle_ioio()). Width-aware (1/2/4-byte IN/OUT),
+ * unlike hype_svm_vcpu_handle_ioio()'s PIC/PIT (always 8-bit) --
+ * merges/extracts the guest's RAX the same way
+ * hype_mmio_merge_read_value()/hype_mmio_extract_write_value() do for
+ * MMIO. Exempt from unit testing -- reaches into the exempt VMCB/GPR
+ * fields this backend's real VMRUN produces; every function in
+ * devices/pci.h this composes is already fully tested in isolation.
+ */
+int hype_svm_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci);
+
+/*
  * FW-1 real-hardware/real-firmware debugging: a snapshot of the guest
  * state fields that matter for diagnosing a fault reported against
  * this project's own "guest_rip" alone -- once a real-mode guest

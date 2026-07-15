@@ -142,6 +142,20 @@ static uint64_t g_fw_1_vars_size;
 static uint8_t g_fw_1_guest_stack[65536] __attribute__((aligned(4096)));
 static hype_pic_emu_t g_fw_1_pic;
 static hype_pit_emu_t g_fw_1_pit;
+static hype_pci_t g_fw_1_pci;
+
+/* Intel Q35 MCH (the real Q35 chipset's host bridge) vendor/device ID
+ * -- transcribed from this project's own vendored edk2 submodule,
+ * edk2/OvmfPkg/Include/IndustryStandard/Q35MchIch9.h
+ * (INTEL_Q35_MCH_DEVICE_ID). Confirmed via source-level investigation
+ * (edk2/OvmfPkg/PlatformPei/Platform.c) that OVMF reads this exact
+ * device ID via the legacy CF8/CFC ports to decide it's running on a
+ * genuine PC-compatible platform; without a real host bridge here, an
+ * unhandled read absorbs as all-1s (0xFFFF), which OVMF's own platform
+ * detection treats as the QEMU "microvm" machine-type sentinel instead
+ * -- sending it down a completely different, unsupported init path. */
+#define HYPE_FW_1_PCI_VENDOR_ID_INTEL 0x8086u
+#define HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH 0x29C0u
 
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
@@ -2119,6 +2133,9 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
     hype_pic_emu_reset(&g_fw_1_pic);
     hype_pit_emu_reset(&g_fw_1_pit);
+    hype_pci_reset(&g_fw_1_pci);
+    hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
+                         0x00, 0x00);
 
     /* Real x86 reset state is CS.base=0xFFFF0000, RIP=0xFFF0 -- NOT
      * CS.base=0xFFFFFFF0, RIP=0, despite both giving the identical
@@ -2186,6 +2203,9 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             if (hype_svm_vcpu_handle_ioio(ctx, &g_fw_1_pic, &g_fw_1_pit) == 0) {
                 continue;
             }
+            if (hype_svm_vcpu_handle_pci_cf8_ioio(ctx, &g_fw_1_pci) == 0) {
+                continue;
+            }
 
             {
                 hype_svm_ioio_t io;
@@ -2223,15 +2243,24 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
              * above. */
             {
                 uint64_t *stack = (uint64_t *)(uintptr_t)dbg.rsp;
-                uint8_t *caller_bytes = (uint8_t *)(uintptr_t)stack[2];
                 hype_debug_print("fw-1: rsp=0x%llx [0]=0x%llx [1]=0x%llx [2]=0x%llx [3]=0x%llx\n",
                                   (unsigned long long)dbg.rsp, (unsigned long long)stack[0],
                                   (unsigned long long)stack[1], (unsigned long long)stack[2],
                                   (unsigned long long)stack[3]);
-                hype_debug_print("fw-1: bytes at [2]-8: %x %x %x %x %x %x %x %x | %x %x %x %x\n",
-                                  caller_bytes[-8], caller_bytes[-7], caller_bytes[-6], caller_bytes[-5],
-                                  caller_bytes[-4], caller_bytes[-3], caller_bytes[-2], caller_bytes[-1],
-                                  caller_bytes[0], caller_bytes[1], caller_bytes[2], caller_bytes[3]);
+                /* Only a plausible-looking (nonzero, low-memory)
+                 * candidate return address is worth dereferencing --
+                 * unlike the earlier temp-RAM fault, this stack slot
+                 * isn't guaranteed to hold a return address at all, and
+                 * blindly dereferencing whatever's there (confirmed:
+                 * 0 last time) wildly corrupts *host* memory since this
+                 * is a raw host-pointer read from our own L1 context. */
+                if (stack[2] != 0 && stack[2] < 0x100000000ULL) {
+                    uint8_t *caller_bytes = (uint8_t *)(uintptr_t)stack[2];
+                    hype_debug_print("fw-1: bytes at [2]-8: %x %x %x %x %x %x %x %x | %x %x %x %x\n",
+                                      caller_bytes[-8], caller_bytes[-7], caller_bytes[-6], caller_bytes[-5],
+                                      caller_bytes[-4], caller_bytes[-3], caller_bytes[-2], caller_bytes[-1],
+                                      caller_bytes[0], caller_bytes[1], caller_bytes[2], caller_bytes[3]);
+                }
             }
 
             hype_fatal("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr2=0x%llx cr3=0x%llx rip=0x%llx",

@@ -350,6 +350,42 @@ void hype_svm_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *ou
     real->vmcb->save.rip = real->vmcb->control.exitinfo2;
 }
 
+int hype_svm_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+
+    if (io.port == HYPE_PCI_CF8_PORT) {
+        if (io.is_in) {
+            uint32_t value = hype_pci_cf8_read(pci);
+            real->vmcb->save.rax =
+                hype_mmio_merge_read_value(real->vmcb->save.rax, value, io.size_bytes, io.size_bytes == 4);
+        } else {
+            hype_pci_cf8_write(pci, hype_mmio_extract_write_value(real->vmcb->save.rax, io.size_bytes));
+        }
+    } else if (io.port >= HYPE_PCI_CFC_PORT && io.port <= HYPE_PCI_CFC_PORT + 3) {
+        unsigned int byte_offset = io.port - HYPE_PCI_CFC_PORT;
+
+        if (io.is_in) {
+            uint32_t value;
+            hype_pci_cf8_config_read(pci, byte_offset, io.size_bytes, &value);
+            real->vmcb->save.rax =
+                hype_mmio_merge_read_value(real->vmcb->save.rax, value, io.size_bytes, io.size_bytes == 4);
+        } else {
+            hype_pci_cf8_config_write(pci, byte_offset, io.size_bytes,
+                                       hype_mmio_extract_write_value(real->vmcb->save.rax, io.size_bytes));
+        }
+    } else {
+        return -1;
+    }
+
+    /* EXITINFO2 gives the resume RIP directly, same "next-RIP-for-free"
+     * convenience hype_svm_vcpu_handle_ioio() itself already relies on. */
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return 0;
+}
+
 void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     out->cs_selector = real->vmcb->save.cs.selector;

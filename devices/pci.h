@@ -90,6 +90,12 @@ typedef struct {
 
 typedef struct {
     hype_pci_device_t devices[HYPE_PCI_MAX_DEVICES]; /* bus 0, function 0 only, indexed by device number */
+    /* Last value written to the legacy 0xCF8 config-address port (FW-1)
+     * -- genuinely part of the host bridge's own state, the same way
+     * devices/fw_cfg.h's hype_fw_cfg_t keeps its own selected_key/offset
+     * internally rather than pushing that state out to the exempt glue
+     * layer. */
+    uint32_t cf8_selected;
 } hype_pci_t;
 
 typedef struct {
@@ -184,5 +190,56 @@ void hype_pci_config_read(const hype_pci_t *pci, const hype_pci_ecam_addr_t *add
  */
 void hype_pci_config_write(hype_pci_t *pci, const hype_pci_ecam_addr_t *addr, uint8_t size_bytes,
                             uint32_t value);
+
+/*
+ * Legacy CF8/CFC port-based config-space access (PCI Local Bus
+ * Specification, "Configuration Address Register"/"Configuration Data
+ * Register") -- an older mechanism many guests still probe before, or
+ * instead of, ECAM (confirmed: this project's own vendored OVMF reads
+ * the host bridge's device ID this way during PlatformPei, well before
+ * ACPI's MCFG table -- and by extension ECAM -- would even be parsed).
+ * Register layout of the 32-bit address value written to 0xCF8: bit 31
+ * = enable (ignored here -- this project has no need to model the
+ * "disabled" behavior some real chipsets exhibit when it's clear, the
+ * same "config-space access never fails" reasoning as every other
+ * access in this header), bits 23:16 = bus, 15:11 = device, 10:8 =
+ * function, 7:2 = register (dword-aligned; bits 1:0 are always zero).
+ */
+#define HYPE_PCI_CF8_PORT 0xCF8u
+#define HYPE_PCI_CFC_PORT 0xCFCu
+#define HYPE_PCI_CF8_BUS_SHIFT 16
+#define HYPE_PCI_CF8_DEVICE_SHIFT 11
+#define HYPE_PCI_CF8_FUNCTION_SHIFT 8
+#define HYPE_PCI_CF8_REGISTER_MASK 0xFCu
+
+/* Stores the address a later CFC-family access will operate on (a
+ * plain OUT to 0xCF8 always succeeds). Pure struct mutation. */
+void hype_pci_cf8_write(hype_pci_t *pci, uint32_t value);
+
+/* Reads back the last value written to 0xCF8 (real hardware supports
+ * this readback too; this project's OVMF guest doesn't rely on it, but
+ * modeling it costs nothing and keeps the port fully bidirectional).
+ * Pure struct read. */
+uint32_t hype_pci_cf8_read(const hype_pci_t *pci);
+
+/*
+ * Decodes a raw 0xCF8 address value into bus/device/function/register
+ * -- pure bit extraction, no CPU/guest-memory access of its own, same
+ * shape as hype_pci_decode_ecam_offset().
+ */
+void hype_pci_decode_cf8_address(uint32_t cf8_value, hype_pci_ecam_addr_t *out);
+
+/*
+ * Config-data access through the legacy CFC/CFD/CFE/CFF ports: reads/
+ * writes the register the currently-selected 0xCF8 address decodes to,
+ * plus `byte_offset` (0-3, from which of CFC/CFD/CFE/CFF the guest
+ * used) -- the standard convention for sub-4-byte accesses through
+ * this mechanism. Composes hype_pci_decode_cf8_address() with
+ * hype_pci_config_read()/_write(); always succeeds, same reasoning as
+ * every other config-space access here.
+ */
+void hype_pci_cf8_config_read(const hype_pci_t *pci, unsigned int byte_offset, uint8_t size_bytes,
+                               uint32_t *out_value);
+void hype_pci_cf8_config_write(hype_pci_t *pci, unsigned int byte_offset, uint8_t size_bytes, uint32_t value);
 
 #endif /* HYPE_DEVICES_PCI_H */

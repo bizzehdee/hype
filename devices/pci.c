@@ -17,6 +17,7 @@ void hype_pci_reset(hype_pci_t *pci) {
             pci->devices[i].bar_size[j] = 0;
         }
     }
+    pci->cf8_selected = 0;
 }
 
 int hype_pci_add_device(hype_pci_t *pci, uint8_t device_number, uint16_t vendor_id, uint16_t device_id,
@@ -152,4 +153,36 @@ void hype_pci_config_write(hype_pci_t *pci, const hype_pci_ecam_addr_t *addr, ui
     for (i = 0; i < size_bytes && (addr->register_offset + i) < HYPE_PCI_CONFIG_SIZE; i++) {
         dev->config[addr->register_offset + i] = (uint8_t)(value >> (8 * i));
     }
+}
+
+void hype_pci_cf8_write(hype_pci_t *pci, uint32_t value) {
+    pci->cf8_selected = value;
+}
+
+uint32_t hype_pci_cf8_read(const hype_pci_t *pci) {
+    return pci->cf8_selected;
+}
+
+void hype_pci_decode_cf8_address(uint32_t cf8_value, hype_pci_ecam_addr_t *out) {
+    out->bus = (unsigned int)((cf8_value >> HYPE_PCI_CF8_BUS_SHIFT) & HYPE_PCI_ECAM_BUS_MASK);
+    out->device = (unsigned int)((cf8_value >> HYPE_PCI_CF8_DEVICE_SHIFT) & HYPE_PCI_ECAM_DEVICE_MASK);
+    out->function = (unsigned int)((cf8_value >> HYPE_PCI_CF8_FUNCTION_SHIFT) & HYPE_PCI_ECAM_FUNCTION_MASK);
+    out->register_offset = (unsigned int)(cf8_value & HYPE_PCI_CF8_REGISTER_MASK);
+}
+
+void hype_pci_cf8_config_read(const hype_pci_t *pci, unsigned int byte_offset, uint8_t size_bytes,
+                               uint32_t *out_value) {
+    hype_pci_ecam_addr_t addr;
+
+    hype_pci_decode_cf8_address(pci->cf8_selected, &addr);
+    addr.register_offset += byte_offset;
+    hype_pci_config_read(pci, &addr, size_bytes, out_value);
+}
+
+void hype_pci_cf8_config_write(hype_pci_t *pci, unsigned int byte_offset, uint8_t size_bytes, uint32_t value) {
+    hype_pci_ecam_addr_t addr;
+
+    hype_pci_decode_cf8_address(pci->cf8_selected, &addr);
+    addr.register_offset += byte_offset;
+    hype_pci_config_write(pci, &addr, size_bytes, value);
 }

@@ -894,33 +894,93 @@ tasks — see updated deps below.*
     Confirmed via unit test; did NOT resolve the current blocking #PF
     on its own, but is a real, independently-valuable correctness fix
     kept regardless.
-  - **Current blocker**: after A20-gate enable (port 0x92, absorbed by
-    the new generic IOIO default) and no other device access, the
-    guest reaches full 64-bit long mode with paging enabled
-    (CR0=0x80000033) entirely within its own small SEC-phase temporary
-    RAM window (CR3=0x800000), then raises a #PF: a `REP MOVSQ`
-    (EDK2's generic `CopyMem`/`InternalMemCopyMem` primitive, confirmed
-    byte-for-byte against the raw `fw/OVMF_CODE.fd` file at flash
-    offset `0x3484f9`) writes to guest-linear address exactly 0
-    (CR2=0). The caller (return address 0x83dd0b, found via the
-    `[3]=0x5AA55AA55AA55AA5` `PcdInitValueInTemporaryStack` fill-marker
-    on the stack) does `mov r8, rdi; call CopyMem` with RDI already 0
-    at the call site -- the actual bad-destination computation happens
-    further up the call chain, not yet isolated. `/edk2` (the vendored
-    EDK2 source submodule, `OvmfPkg/Sec/SecMain.c`,
-    `OvmfPkg/Library/PlatformInitLib/MemDetect.c`) is available locally
-    for continued source-level investigation; `MemDetect.c` confirms
-    OVMF's real memory-size discovery needs either fw_cfg's "etc/e820"
-    file or, failing that, CMOS ports 0x34/0x35 -- neither is wired up
-    for FW-1 yet (no fw_cfg device is registered for this guest at
-    all), a strong candidate for *some* destination miscalculation even
-    though no fw_cfg/CMOS port access had been observed yet at the
-    point of this specific fault.
+  - **Root-caused and fixed the NULL-`CopyMem` #PF above**, using the
+    vendored `/edk2` submodule's own surviving build artifacts
+    (`edk2/Build/OvmfX64/RELEASE_CLANGDWARF/`, including per-module
+    `.map`/`.debug` files with full DWARF info -- `addr2line`/`nm`
+    against `OvmfPkg/PlatformPei/PlatformPei/DEBUG/PlatformPei.debug`
+    symbolized the fault's RIP to `InternalMemCopyMem` and its caller to
+    `InitializePlatform` (`OvmfPkg/PlatformPei/Platform.c:135`, LTO-
+    inlined `MicrovmInitialization()`). Root cause: this project had
+    **no PCI configuration-space emulation wired up for FW-1 at all**
+    (PCI-1/PCI-2's own `devices/pci.h` model was never registered for
+    this guest) -- OVMF's `PlatformPei` reads the host bridge's device
+    ID via the *legacy* 0xCF8/0xCFC ports (confirmed via source:
+    `OvmfPkg/PlatformPei/Platform.c:346`,
+    `PciRead16(OVMF_HOSTBRIDGE_DID)`), well before ACPI's MCFG table --
+    and by extension ECAM -- would even be parsed. With those ports
+    unhandled, they hit the existing generic
+    `hype_svm_vcpu_handle_unknown_ioio()` absorb-as-all-1s default,
+    making OVMF read the host bridge device ID back as `0xFFFF` --
+    which OVMF's own platform detection treats as the QEMU "microvm"
+    machine-type sentinel (`HostBridgeDevId == 0xffff`), sending it down
+    a completely different, fw_cfg-FDT-based init path this project
+    doesn't support, eventually crashing in `MicrovmInitialization()`'s
+    own `CopyMem(NewBase, EmptyFdt, FdtSize)` once its own
+    `AllocatePages()`-derived `NewBase` came out wrong. Confirmed via
+    the full unhandled-port log: repeated `0xcf8`/`0xcfe` accesses
+    (interleaved with `0x70`/`0x71` CMOS and `0x510`/`0x511` fw_cfg,
+    also unhandled) right before every fault.
+    - **Fix**: `devices/pci.h/.c` gained legacy CF8/CFC support --
+      `hype_pci_cf8_write()`/`_read()` (stores/reads the selected
+      config address, now a field of `hype_pci_t` itself, matching how
+      `devices/fw_cfg.h`'s own protocol state is kept internally),
+      `hype_pci_decode_cf8_address()` (pure bit extraction: bits 23:16
+      = bus, 15:11 = device, 10:8 = function, 7:2 = dword-aligned
+      register), and `hype_pci_cf8_config_read()`/`_write()` (composes
+      the decode with the already-tested `hype_pci_config_read()`/
+      `_write()`, plus a `byte_offset` for CFD/CFE/CFF sub-accesses).
+      100%/100%/96.88% unit tested (`core/tests/test_pci.c`).
+    - Exempt glue: `hype_svm_vcpu_handle_pci_cf8_ioio()`
+      (`arch/x86_64/svm/svm_vcpu.c`) -- width-aware (1/2/4-byte) IOIO
+      dispatch to the CF8/CFC ports, reusing
+      `hype_mmio_merge_read_value()`/`hype_mmio_extract_write_value()`
+      for RAX merge/extract (unlike `hype_svm_vcpu_handle_ioio()`'s
+      PIC/PIT, always 8-bit).
+    - `boot/main.c`'s `run_fw_1_test()` now registers a real host bridge
+      (Intel Q35 MCH, vendor `0x8086`/device `0x29C0` --
+      `INTEL_Q35_MCH_DEVICE_ID`, transcribed from
+      `edk2/OvmfPkg/Include/IndustryStandard/Q35MchIch9.h`) via
+      `hype_pci_add_device()`, and wires
+      `hype_svm_vcpu_handle_pci_cf8_ioio()` into the dispatch loop ahead
+      of the generic absorb-unknown fallback.
+    - ***Bug (self-inflicted, in this session's own diagnostic code)***:
+      the stack-caller-byte-dump diagnostic added earlier blindly
+      dereferenced `stack[2]` assuming it held a plausible return
+      address (true for the temp-RAM-window fault, which happened to
+      have the `0x5AA5...` fill marker validating it) -- a *different*
+      fault (this one) had a genuinely fresh, zeroed stack slot,
+      making the dereference read host address `-8`, corrupting *this
+      project's own* host-side execution (a raw host-pointer read from
+      L1's own context, not the guest's). Fixed by guarding on
+      `stack[2] != 0 && stack[2] < 4GB` before dereferencing.
+  - **Current blocker (new, after the microvm fix)**: with real PCI
+    config-space access working, the guest now correctly detects itself
+    as Q35 (not microvm), and progresses much further -- past PEI
+    entirely, reaching what appears to be DXE/GOP console
+    initialization (a screen-clear/cursor-home escape sequence appears
+    in the serial log just before the next fault, consistent with
+    ConsoleSplitter/GraphicsConsole starting up) -- before hitting a
+    *new* #PF at guest-linear `rip=0xE0006`, `CR3=0x800000` (back to the
+    SEC-phase temp-RAM page tables -- unclear yet whether this is a
+    second pass through SEC/PEI, e.g. an S3-resume-style path, or
+    something else). `0xE0006` falls within the classic PC "legacy BIOS
+    shadow" range (`0xE0000-0xFFFFF`), well below where either the PEI
+    or DXE FVs are actually mapped (both `>= 0x830000` per
+    `edk2/OvmfPkg/Include/Fdf/MemFd.fdf.inc`'s `MEMFD_BASE_ADDRESS`-
+    relative offsets) -- a strong candidate for legacy VGA-BIOS/option-
+    ROM shadow scanning jumping into memory this project has never
+    populated (no such device model exists yet). Not yet root-caused;
+    the same `addr2line`/`nm`-against-`edk2/Build` technique that solved
+    the microvm bug should apply here too, once the exact module
+    covering this address (if any -- it may not resolve to either FV at
+    all) is identified.
   - New diagnostic accessors added for this investigation, all exempt
     from unit testing (same reasoning as every other
     `hype_svm_vcpu_handle_*` glue function): `hype_svm_vcpu_get_last_npf()`,
     `hype_svm_vcpu_get_debug_state()` (CS/CR0/CR2/CR3/RIP/RFLAGS/RSP),
-    `hype_svm_vcpu_set_rip()`.
+    `hype_svm_vcpu_set_rip()`, `hype_svm_vcpu_handle_unknown_ioio()`,
+    `hype_svm_vcpu_handle_pci_cf8_ioio()`.
 
 - [ ] **FW-2** — Load OVMF_CODE.fd/OVMF_VARS.fd from fw/ into guest RAM
   at boot, replacing the fixed hand-written test-guest entry points
