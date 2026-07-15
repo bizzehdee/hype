@@ -461,9 +461,41 @@ a polling-only keyboard and deferring real interrupt delivery.
   "mouse packet 0x8/0x5/0xfb delivered via PS/2 -> PIC (vector 0x2c)
   -> INT-1/INT-2, ISR read it back correctly" -- every other existing
   test guest still halts cleanly.*
-- [ ] **INPUT-3** — Host-level keyboard controller ownership + raw scancode
+- [x] **INPUT-3** — Host-level keyboard controller ownership + raw scancode
   interception, beneath any guest.
   Deps: M1-4
+
+  *A real hardware driver (not guest emulation) -- once M1-4's
+  `ExitBootServices()` has run, UEFI's own Simple Text Input Protocol
+  is gone for good, so the host itself must read the real i8042
+  controller directly for its own purposes (the dashboard leader
+  chord, INPUT-4). Same split as every other host driver here
+  (`arch/x86_64/cpu/pit.c`/`pit_hw.c`): new `arch/x86_64/cpu/ps2_host.h/.c`
+  (a pure ring buffer, 100%/100%/100% unit tested,
+  `core/tests/test_ps2_host.c`) plus `ps2_host_hw.c` (exempt -- real
+  `inb` from port 0x60, `hype_isr_register()`, `hype_pic_unmask_irq()`),
+  wired into `efi_main()` right after M1-8's own timer/PIC setup
+  (`HYPE_HOST_KBD_VECTOR = HYPE_TIMER_VECTOR + 1`, reusing the SAME PIC
+  remap the timer already did rather than remapping again, which would
+  re-mask every line). `hype_host_kbd_poll_scancode()` is the API the
+  dashboard/leader-chord recognizer (INPUT-4) will poll.
+
+  Structurally identical to `hype_timer_isr()`'s own shape (already
+  validated on real AMD hardware, M2-8/M3-6's own notes) -- same
+  ISR-register + IRQ-unmask + EOI pattern, just a different port/
+  vector. **Not live-verified via an actual keypress this session**:
+  attempted via QEMU's own monitor (`sendkey`) while hype.efi was
+  running, but discovered that `run_all_test_guests()` (line ~3609)
+  executes *before* this timer/keyboard bring-up block (line ~3719) in
+  `efi_main()`'s own sequential flow -- meaning FW-1's own parked,
+  deliberate panic (`hype_fatal()` -> `hype_halt_forever()`) halts the
+  entire host before execution ever reaches this code at all. This is
+  a genuine, pre-existing ordering quirk (test-guest dispatch blocks
+  all host-level bring-up that comes after it), not something INPUT-3
+  itself introduced -- worth revisiting whether host kernel bring-up
+  should happen *before* test-guest dispatch instead, once FW-1 is
+  unparked or the test-guest sequence is reworked. Deferred rather than
+  reordering boot-critical code as a side effect of this task.*
 - [ ] **INPUT-4** — Leader-chord recognition: `Right-Ctrl+Right-Alt` held +
   action key (`D`, `1`-`9`, `Left`/`Right`, `Esc`).
   Deps: INPUT-3

@@ -19,6 +19,7 @@
 #include "../arch/x86_64/cpu/pic.h"
 #include "../arch/x86_64/cpu/pit.h"
 #include "../arch/x86_64/cpu/timer.h"
+#include "../arch/x86_64/cpu/ps2_host.h"
 #include "../arch/x86_64/cpu/vmexit.h"
 #include "../arch/x86_64/cpu/vmm_select.h"
 #include "../arch/x86_64/svm/npt.h"
@@ -3720,6 +3721,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_isr_register(HYPE_TIMER_VECTOR, hype_timer_isr);
     hype_pic_unmask_irq(HYPE_TIMER_IRQ);
     hype_pit_init(1000);
+    /* INPUT-3: host-level keyboard ownership -- must happen here too,
+     * strictly before sti, same "nothing can fire on a vector we
+     * haven't wired up yet" discipline this whole block already
+     * follows for the timer. Does not call hype_pic_remap_and_mask_all()
+     * again (see ps2_host.h's own top comment for why: IRQ1 already
+     * landed on HYPE_TIMER_VECTOR+1 from the timer's own remap above). */
+    hype_host_kbd_init();
     hype_serial_print("about to enable interrupts (sti)...\n");
     hype_sti();
     hype_serial_print("interrupts enabled -- waiting for timer ticks\n");
