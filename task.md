@@ -279,10 +279,45 @@ multi-VM concurrency milestone, even though early single-guest milestones
 
 ---
 
+## INT — SVM guest-interrupt injection infrastructure
+
+Discovered as a genuine prerequisite while scoping INPUT-1 (2026-07-15):
+this project has no way to actually deliver an interrupt to a guest yet.
+`devices/pic.h`'s `hype_pic_emu_raise_irq()` only sets an internal IRR
+bit; nothing reads it or writes anything into the VMCB.
+`arch/x86_64/svm/vmcb.h`'s own `eventinj`/`vintr` fields (offsets
+0xA8/0x060) are already laid out from the AMD SDM but never populated,
+and `arch/x86_64/cpu/vmexit.h` already flags this directly:
+"[exception/interrupt] injection doesn't exist until M3+, so there is
+nothing else this project can do with a VM-exit yet" -- still true. A
+guest-facing PS/2 keyboard (INPUT-1) genuinely needs this: real OSes'
+PS/2 drivers are IRQ1-driven, not purely polling, and this is
+foundational infrastructure well beyond PS/2 (AHCI/virtio storage and
+networking will eventually want it too, though everything built so far
+has gotten away with pure guest-side polling). User decision
+(2026-07-15): build this now, before INPUT-1, rather than starting with
+a polling-only keyboard and deferring real interrupt delivery.
+
+- [ ] **INT-1** — EVENTINJ-based immediate interrupt injection: inject a
+  maskable (INTR-type) interrupt directly via the VMCB's EVENTINJ field
+  when the guest can accept it right now (RFLAGS.IF=1, no interrupt
+  shadow). Pure bit-encoding logic unit tested; the actual VMCB write
+  is exempt glue, same split as every other VMCB-touching function
+  here.
+  Deps: M3-1
+- [ ] **INT-2** — VINTR-window-based deferred injection: when the guest
+  can't accept an interrupt immediately, request an interrupt-window
+  VMEXIT (V_IRQ in the VINTR/int_ctl field, VINTR intercept enabled)
+  and actually inject once that VMEXIT fires -- the real-hardware-
+  correct path a guest with IF=0 (or mid-interrupt-shadow) needs.
+  Deps: INT-1
+
+---
+
 ## INPUT — Input devices (plan.md §6b, §6c)
 
 - [ ] **INPUT-1** — Guest-facing PS/2 keyboard device.
-  Deps: M3-4
+  Deps: M3-4, INT-2
 - [ ] **INPUT-2** — Guest-facing PS/2 mouse device (for GUI installers,
   §6c).
   Deps: INPUT-1
