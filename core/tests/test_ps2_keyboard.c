@@ -182,11 +182,50 @@ static void test_has_pending_byte(void) {
     CHECK_HEX("pending after enqueue", 1, hype_ps2_kbd_has_pending_byte(&kbd));
 }
 
+/* FW-1f: keyboard reset (0xFF via 0x60) must return ACK (0xFA) THEN
+ * BAT-complete (0xAA) as two separately-readable bytes -- OVMF's
+ * Ps2KeyboardDxe waits for both. Exercises the output FIFO. */
+static void test_keyboard_reset_returns_ack_then_bat(void) {
+    hype_ps2_kbd_t kbd;
+    uint8_t data, status;
+
+    hype_ps2_kbd_reset(&kbd);
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_DATA, HYPE_PS2_KBD_CMD_RESET); /* 0xFF */
+
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, &status);
+    CHECK_HEX("OBF set after reset command", HYPE_PS2_STATUS_OUTPUT_FULL,
+              status & HYPE_PS2_STATUS_OUTPUT_FULL);
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &data);
+    CHECK_HEX("first reset response byte is ACK", HYPE_PS2_KBD_ACK, data);
+
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, &status);
+    CHECK_HEX("OBF still set for the second byte", HYPE_PS2_STATUS_OUTPUT_FULL,
+              status & HYPE_PS2_STATUS_OUTPUT_FULL);
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &data);
+    CHECK_HEX("second reset response byte is BAT-complete", HYPE_PS2_KBD_BAT_OK, data);
+
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, &status);
+    CHECK_HEX("OBF clears after both bytes read", 0, status & HYPE_PS2_STATUS_OUTPUT_FULL);
+}
+
+/* Status must never set the transmit-timeout bit (0x20) alongside OBF --
+ * OVMF's read gate requires (bit5|bit0)==bit0. */
+static void test_status_has_no_transmit_timeout_bit(void) {
+    hype_ps2_kbd_t kbd;
+    uint8_t status;
+    hype_ps2_kbd_reset(&kbd);
+    hype_ps2_kbd_enqueue_scancode(&kbd, 0x1Cu);
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, &status);
+    CHECK_HEX("transmit-timeout bit (0x20) never set", 0, status & 0x20u);
+}
+
 int main(void) {
     test_reset_state();
     test_unrecognized_port_rejected();
     test_enqueue_scancode_sets_obf_and_reads_back();
     test_enqueue_overwrites_unread_byte();
+    test_keyboard_reset_returns_ack_then_bat();
+    test_status_has_no_transmit_timeout_bit();
     test_read_config_byte();
     test_write_config_byte_roundtrip();
     test_data_write_without_pending_config_command_is_a_keyboard_command();

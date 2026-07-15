@@ -182,6 +182,9 @@ static hype_guest_lapic_t g_fw_1_lapic; /* FW-1b: guest Local APIC (0xFEE00000) 
 static hype_guest_uart_t g_fw_1_uart;  /* FW-1e: guest 16550 UART (COM1 0x3F8) */
 static hype_guest_uart_t g_fw_1_uart2; /* FW-1e: guest 16550 UART (COM2 0x2F8) -- OVMF probes/uses both */
 #define HYPE_SERIAL_COM2 0x2F8u
+static hype_ps2_kbd_t g_fw_1_ps2;     /* FW-1f: guest PS/2 keyboard (0x60/0x64) -- OVMF's actual ConIn */
+static hype_ps2_mouse_t g_fw_1_mouse; /* required by the shared PS/2 IOIO handler signature */
+#define HYPE_FW_1_KEY_ENTER_MAKE 0x1Cu /* Set-1 make code for Enter */
 static hype_fw_cfg_t g_fw_1_fw_cfg;
 static hype_acpi_rsdp_t g_fw_1_rsdp;
 static uint8_t g_fw_1_tables_blob[4096] __attribute__((aligned(64)));
@@ -236,6 +239,17 @@ static hype_acpi_loader_entry_t g_fw_1_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENT
  * stable idle within this many exits, something is wrong -- fail loudly
  * instead of spinning forever (e.g. an early HLT with no timer). */
 #define HYPE_FW_1_MAX_EXITS 5000000ULL
+/* FW-1f: evidence-based reaction detection for an injected keystroke.
+ * "Reacted" = OVMF leaves its idle wait and does at least this many
+ * PRODUCTIVE (non-HLT) exits after the key -- entering the Boot Manager
+ * Menu is thousands of exits of work. (We can't key off *console* chars:
+ * the menu is a full-screen TUI that's almost all VT escapes, which our
+ * filter strips -- rendering it is the TERM milestone.) If instead the
+ * guest stays idle for HYPE_FW_1_KEY_WAIT_EXITS total VM-exits after the
+ * key, it didn't consume it on a ConIn source we feed -- don't claim it
+ * advanced. */
+#define HYPE_FW_1_KEY_REACTION_EXITS 2000ULL
+#define HYPE_FW_1_KEY_WAIT_EXITS 8000ULL
 
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
@@ -4187,14 +4201,16 @@ static const uint8_t *fw_1_guest_phys_to_host(uint64_t gpa) {
  * guest's console output to hype's own console (serial + GOP) one line
  * at a time -- one GOP Blt per line rather than per byte. `filter`,
  * `line` and `line_len` persist across calls (owned by the caller). */
-static void fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_filter_t *filter, char *line,
-                                     unsigned int *line_len, unsigned int line_cap) {
+static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_filter_t *filter, char *line,
+                                             unsigned int *line_len, unsigned int line_cap) {
+    unsigned int emitted = 0;
     uint8_t b;
     while (hype_guest_uart_tx_dequeue(uart, &b)) {
         char c;
         if (!hype_vt_filter(filter, b, &c)) {
             continue;
         }
+        emitted++;
         if (c == '\n') {
             line[*line_len] = '\0';
             hype_debug_print("%s\n", line);
@@ -4208,6 +4224,7 @@ static void fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_filter_t *f
         }
         line[(*line_len)++] = c;
     }
+    return emitted;
 }
 
 static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
@@ -4226,6 +4243,8 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_guest_lapic_reset(&g_fw_1_lapic);
     hype_guest_uart_reset(&g_fw_1_uart);
     hype_guest_uart_reset(&g_fw_1_uart2);
+    hype_ps2_kbd_reset(&g_fw_1_ps2);
+    hype_ps2_mouse_reset(&g_fw_1_mouse);
     hype_pci_reset(&g_fw_1_pci);
     hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
                          0x00, 0x00);
@@ -4381,6 +4400,11 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_vt_filter_t uart_filter2;
     char uart_line2[256];
     unsigned int uart_line_len2 = 0;
+    int key_injected = 0;
+    int key_reacted = 0;
+    unsigned long long console_chars = 0;
+    unsigned long long inject_productive = 0;
+    unsigned long long inject_total = 0;
 
     hype_vt_filter_reset(&uart_filter);
     hype_vt_filter_reset(&uart_filter2);
@@ -4419,11 +4443,24 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_svm_vcpu_request_interrupt(ctx, timer_vector);
         }
 
-        /* FW-1e: surface any console text the guest wrote to either UART. */
-        fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
-                                 (unsigned int)sizeof(uart_line));
-        fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
-                                 (unsigned int)sizeof(uart_line2));
+        /* FW-1e: surface any console text the guest wrote to either UART.
+         * FW-1f uses the emitted-char count as evidence the guest reacted
+         * to an injected keystroke. */
+        console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
+                                                  (unsigned int)sizeof(uart_line));
+        console_chars += fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
+                                                  (unsigned int)sizeof(uart_line2));
+
+        /* FW-1f: once a key has been injected, OVMF reacting = it leaves
+         * its idle wait and does real work (menu processing). Detect that
+         * as soon as it's clearly happening -- don't grind through the
+         * whole (huge) menu render. */
+        if (key_injected && !key_reacted &&
+            productive_exits - inject_productive >= HYPE_FW_1_KEY_REACTION_EXITS) {
+            key_reacted = 1;
+            booted = 1;
+            break;
+        }
 
         if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
             hype_svm_vcpu_handle_cpuid(ctx);
@@ -4478,6 +4515,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 continue;
             }
             if (hype_svm_vcpu_handle_cmos_ioio(ctx, &g_fw_1_cmos) == 0) {
+                continue;
+            }
+            /* FW-1f: guest PS/2 keyboard/mouse (0x60/0x64) -- OVMF's
+             * Ps2KeyboardDxe ConIn. Must be modeled (not absorbed) so it
+             * can read the controller status + our injected scancode. */
+            if (hype_svm_vcpu_handle_ps2_ioio(ctx, &g_fw_1_ps2, &g_fw_1_mouse) == 0) {
                 continue;
             }
             /* FW-1e: guest COM1 UART (0x3F8-0x3FF). TX bytes are buffered
@@ -4628,15 +4671,39 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_HLT) {
-            /* FW-1d: OVMF's idle wait (CpuSleep). It never HLTs during
-             * DXE/BDS init, so a HLT past HYPE_FW_1_BOOTED_EXITS
-             * productive exits means the firmware finished booting and
-             * is idle-waiting for the next timer tick / a keypress --
-             * treat that as success and end the bring-up test. An
-             * (unexpected) earlier HLT is treated as plain
+            /* OVMF's idle wait (CpuSleep). It never HLTs during DXE/BDS
+             * init, so a HLT past HYPE_FW_1_BOOTED_EXITS productive exits
+             * means the firmware finished booting and is idle-waiting for
+             * a timer tick / a keypress. An earlier HLT is plain
              * wait-for-interrupt: keep running so the LAPIC timer wakes
              * it (bounded by HYPE_FW_1_MAX_EXITS above). */
-            if (productive_exits >= HYPE_FW_1_BOOTED_EXITS) {
+            if (productive_exits < HYPE_FW_1_BOOTED_EXITS) {
+                continue;
+            }
+            /* FW-1f: OVMF is idle at "Press any key to enter the Boot
+             * Manager Menu". Inject one keystroke (Enter) into the guest
+             * serial RX to exercise guest console INPUT. Feed BOTH COM1
+             * and COM2 -- this build's DEBUG log is on COM2, so the
+             * interactive Terminal ConIn may be on either; whichever OVMF
+             * actually polls consumes it. */
+            if (!key_injected) {
+                hype_debug_print(
+                    "fw-1: OVMF idle at its prompt -- injecting Enter via PS/2 + COM1/COM2 (ConIn test)\n");
+                /* PS/2 is OVMF's real ConIn here; serial RX is belt-and-
+                 * suspenders in case the Terminal console is active. */
+                hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, HYPE_FW_1_KEY_ENTER_MAKE);
+                hype_guest_uart_rx_enqueue(&g_fw_1_uart, (uint8_t)'\r');
+                hype_guest_uart_rx_enqueue(&g_fw_1_uart2, (uint8_t)'\r');
+                key_injected = 1;
+                inject_productive = productive_exits;
+                inject_total = total_exits;
+                continue;
+            }
+            /* Reaction (OVMF doing real work) is detected at the top of
+             * the loop. Here we only handle the OPPOSITE: the guest keeps
+             * idle-HLTing well past the key with no reaction. Stop
+             * without claiming it advanced. */
+            if (total_exits - inject_total >= HYPE_FW_1_KEY_WAIT_EXITS) {
                 booted = 1;
                 break;
             }
@@ -4652,11 +4719,21 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
                              (unsigned int)sizeof(uart_line2));
 
+    if (booted && key_reacted) {
+        hype_debug_print(
+            "fw-1: real OVMF BOOTED + INTERACTIVE -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2) with "
+            "console output forwarded, and the injected PS/2 Enter DROVE it out of its idle prompt "
+            "into Boot Manager Menu processing (%llu productive exits after the key -- guest ConIn "
+            "confirmed). Rendering that full-screen menu TUI is the TERM milestone. guest_rip=0x%llx.\n",
+            (unsigned long long)(productive_exits - inject_productive), (unsigned long long)info.guest_rip);
+        return;
+    }
     if (booted) {
         hype_debug_print(
-            "fw-1: real OVMF BOOTED -- reached its BDS idle HLT after %llu productive VM-exits "
-            "(full DXE/BDS: LAPIC timer, PCI/ECAM enumeration, PS/2 init), guest_rip=0x%llx. "
-            "Interacting with it (shell output/keystrokes) needs a guest console + PS/2 bridge next.\n",
+            "fw-1: real OVMF BOOTED -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2 controller init) and "
+            "console output forwarded, idle at the Boot Manager prompt after %llu productive VM-exits. "
+            "The injected keystroke did NOT yet register (OVMF's WaitForKey poll isn't picking up the "
+            "PS/2 scancode) -- input needs deeper debug (FW-1g), not just a wire-up. guest_rip=0x%llx.\n",
             (unsigned long long)productive_exits, (unsigned long long)info.guest_rip);
         return;
     }

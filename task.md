@@ -1631,13 +1631,48 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
   running" -- so the guest firmware's own console output is visible on
   real silicon, and the ~11k-line trace flood is gone.
 
-- [ ] **FW-1f** — Guest console INPUT (drive the shell). OVMF idles at
-  "Press any key". Feed keystrokes to the guest via the UART RX ring
-  (`hype_guest_uart_rx_enqueue` + LSR.DR, already built/tested) and/or
-  the PS/2 keyboard model (INPUT-1) on ports 0x60/0x64. On real hardware,
-  source the keys from INPUT-3 (host keyboard ownership). Then: press a
-  key -> Boot Manager Menu / UEFI shell, the interactive path toward
-  M4-6 (boot an installer). Deps: FW-1e, INPUT-1/INPUT-3.
+- [~] **FW-1f** — Guest console INPUT (drive the shell). PARTIAL: the
+  supporting work landed and is correct, but a keystroke does NOT yet
+  actually drive OVMF -- root cause is deeper than a wire-up (see
+  FW-1g). What was established/fixed:
+  - ***Serial RX is NOT OVMF's ConIn*** -- injecting Enter on COM1/COM2
+    RX produced zero reaction (verified twice).
+  - ***OVMF's Ps2KeyboardDxe is 100% POLL-BASED, no IRQ*** (confirmed
+    against edk2 MdeModulePkg/Bus/Isa/Ps2KeyboardDxe) -- so no
+    IOAPIC/8259 IRQ1 delivery is needed; a placed scancode + correct
+    status is read by its 20ms timer / WaitForKey poll. (Good: saves
+    building IOAPIC emulation.)
+  - ***PS/2 controller model completed for OVMF's init*** (devices/
+    ps2_keyboard.{h,c}): added a small output FIFO and made keyboard
+    RESET (0xFF via 0x60) return ACK (0xFA) THEN BAT-complete (0xAA) --
+    OVMF waits for both. Before, the missing 0xAA cost a ~1s poll
+    timeout: FW-1's PS/2 init went from ~130k productive exits down to
+    ~13k. Status byte deliberately never sets the transmit-timeout bit
+    (0x20) since OVMF's read gate requires (bit5|bit0)==bit0. PS/2
+    (0x60/0x64) is now modeled in FW-1 (`hype_svm_vcpu_handle_ps2_ioio`)
+    instead of absorbed, so OVMF's keyboard actually initializes.
+  - ***Still not working***: with a scancode injected at the prompt
+    (single and re-armed), OVMF's WaitForKey poll does not register it
+    -- it keeps reprinting "Press any key" rather than entering the Boot
+    Manager Menu (no menu console text appears). Ps2KeyboardDxe clearly
+    ran its full init (~9k extra exits), so it bound; why its poll
+    doesn't surface the injected key needs deeper debugging (OVMF
+    DEBUG-level trace of the keyboard driver, or checking whether the
+    PS/2 keyboard actually landed in ConIn / whether BDS resets ConIn
+    between prompt retries and drains the byte). FW-1 reports this
+    honestly ("injected keystroke did NOT yet register ... input needs
+    deeper debug (FW-1g)"); no false success. Suite green, no
+    regressions, boots on QEMU. Deps: FW-1e.
+
+- [ ] **FW-1g** — Make a guest keystroke actually register (drive OVMF's
+  Boot Manager Menu / shell). Deep-debug why Ps2KeyboardDxe's poll
+  doesn't surface an injected scancode despite completing init: inspect
+  the inner guest's OVMF DEBUG log (route more of COM2 / raise debug
+  level), confirm the PS/2 keyboard is in ConIn, check whether BDS
+  resets/drains ConIn between "press any key" retries, and verify the
+  exact status/scancode/timing the WaitForKey poll consumes. Then wire a
+  real key source (INPUT-3 host keyboard) instead of the synthetic
+  Enter. Deps: FW-1f.
 
 - [x] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped

@@ -72,10 +72,25 @@
  * init sequence to proceed, without modeling scanning/LEDs/typematic
  * rate for real. */
 #define HYPE_PS2_KBD_ACK 0xFAu
+/* Keyboard-device commands (sent via port 0x60) whose responses this
+ * project models specifically. Reset (0xFF) uniquely returns TWO bytes:
+ * ACK (0xFA) then BAT-complete (0xAA) -- real firmware (OVMF's
+ * Ps2KeyboardDxe) waits for both, so the model must be able to hold
+ * more than one pending output byte (FW-1f). */
+#define HYPE_PS2_KBD_CMD_RESET 0xFFu
+#define HYPE_PS2_KBD_BAT_OK 0xAAu
+
+/* Output byte FIFO depth. Real firmware never needs more than a couple
+ * pending at once here (ACK+BAT); a small ring is plenty. */
+#define HYPE_PS2_KBD_FIFO_SIZE 8u
 
 typedef struct {
-    uint8_t data_buffer;
-    int output_buffer_full; /* OBF -- data_buffer holds an unread byte */
+    /* Output-buffer FIFO: bytes waiting to be read at port 0x60 (command
+     * responses and injected scancodes). OBF (status bit 0) reflects
+     * out_count > 0. */
+    uint8_t out_fifo[HYPE_PS2_KBD_FIFO_SIZE];
+    unsigned int out_head;  /* index of the next byte to read */
+    unsigned int out_count; /* bytes currently queued */
     uint8_t config_byte;    /* controller configuration byte (0x20/0x60) */
     int awaiting_config_byte_write; /* 1 right after CMD_WRITE_CONFIG_BYTE, until the next 0x60 write */
     int keyboard_port_enabled;
