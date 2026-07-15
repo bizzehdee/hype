@@ -416,9 +416,51 @@ a polling-only keyboard and deferring real interrupt delivery.
   - Confirmed clean QEMU run: "scancode 0x1e delivered via PS/2 -> PIC
     (vector 0x21) -> INT-1/INT-2, ISR read it back correctly" -- every
     other existing test guest still halts cleanly.*
-- [ ] **INPUT-2** — Guest-facing PS/2 mouse device (for GUI installers,
+- [x] **INPUT-2** — Guest-facing PS/2 mouse device (for GUI installers,
   §6c).
   Deps: INPUT-1
+
+  *New `devices/ps2_mouse.h/.c` (100%/100%/100% unit tested,
+  `core/tests/test_ps2_mouse.c`): the i8042's own "auxiliary" channel
+  -- RESET (queues ACK+self-test-pass+device-ID, matching real
+  power-on semantics), enable/disable data reporting, get device ID,
+  set defaults, a generic ACK for anything else, and a small FIFO
+  (unlike the keyboard's single-pending-byte scope -- RESET's own
+  3-byte response and every movement packet both need in-order,
+  multi-byte reads). `devices/ps2_keyboard.h/.c` (INPUT-1) extended
+  with the controller-level routing every real i8042 needs to
+  multiplex both channels through the same ports: 0xA7/0xA8/0xA9
+  (aux port disable/enable/test) and 0xD4 (write-to-aux, a one-shot
+  prefix consumed by the new `hype_ps2_kbd_take_aux_data_write()`)
+  plus `hype_ps2_kbd_has_pending_byte()` (mirroring the mouse's own
+  query, letting the combined status byte reflect either channel).
+  New exempt glue `hype_svm_vcpu_handle_ps2_ioio()` (`svm_vcpu.c`)
+  routes port 0x60 writes to keyboard or mouse based on that one-shot
+  flag, and reads (0x60 data, 0x64 status) prefer the mouse's own
+  pending byte when present, setting `HYPE_PS2_STATUS_AUX_DATA` --
+  matching real hardware's single shared data path. Delivery reuses
+  INPUT-1's own `hype_svm_vcpu_deliver_pic_irq()` unchanged, now
+  targeting the *slave* PIC's IRQ4 (IRQ12 overall) instead of the
+  master's IRQ1.
+
+  Proven end-to-end by a new test guest (`run_input_2_test()`,
+  boot/main.c) -- a genuinely realistic mouse-enable sequence: the
+  guest initializes *both* the master 8259 (unmasking only IRQ2, the
+  slave's own cascade line -- required for any slave-originated IRQ to
+  reach the CPU at all) and the slave 8259 (unmasking only IRQ4),
+  enables the controller's aux port, then speaks to the mouse itself
+  through the 0xD4 prefix to enable data reporting -- reading back its
+  ACK before proceeding, exactly as a real driver must. The ISR reads
+  the delivered 3-byte movement packet from port 0x60 and sends EOI to
+  *both* the slave (ending this specific IRQ) and the master (ending
+  the cascade's own in-service state), a real driver detail this
+  project's own PIC model doesn't enforce but every real OS observes.
+  Clean QEMU run on the first attempt (the timing lessons from
+  INPUT-1's own two bugs -- gate the device event on the guest's own
+  readiness, never re-raise on retry -- applied directly this time):
+  "mouse packet 0x8/0x5/0xfb delivered via PS/2 -> PIC (vector 0x2c)
+  -> INT-1/INT-2, ISR read it back correctly" -- every other existing
+  test guest still halts cleanly.*
 - [ ] **INPUT-3** — Host-level keyboard controller ownership + raw scancode
   interception, beneath any guest.
   Deps: M1-4

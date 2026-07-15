@@ -138,6 +138,50 @@ static void test_unrecognized_controller_command_is_ignored(void) {
     CHECK_HEX("no response staged for an unrecognized command", 0, status & HYPE_PS2_STATUS_OUTPUT_FULL);
 }
 
+static void test_disable_then_enable_aux_port(void) {
+    hype_ps2_kbd_t kbd;
+
+    hype_ps2_kbd_reset(&kbd);
+    CHECK_HEX("aux port enabled after reset", 1, kbd.aux_port_enabled);
+
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, HYPE_PS2_CMD_DISABLE_AUX_PORT);
+    CHECK_HEX("aux port disabled", 0, kbd.aux_port_enabled);
+
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, HYPE_PS2_CMD_ENABLE_AUX_PORT);
+    CHECK_HEX("aux port re-enabled", 1, kbd.aux_port_enabled);
+}
+
+static void test_aux_port_test(void) {
+    hype_ps2_kbd_t kbd;
+    uint8_t data = 0;
+
+    hype_ps2_kbd_reset(&kbd);
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, HYPE_PS2_CMD_TEST_AUX_PORT);
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &data);
+    CHECK_HEX("aux port test passed response", HYPE_PS2_AUX_TEST_PASSED, data);
+}
+
+static void test_write_to_aux_sets_one_shot_flag(void) {
+    hype_ps2_kbd_t kbd;
+
+    hype_ps2_kbd_reset(&kbd);
+    CHECK_HEX("flag clear before 0xD4", 0, hype_ps2_kbd_take_aux_data_write(&kbd));
+
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, HYPE_PS2_CMD_WRITE_TO_AUX);
+    CHECK_HEX("flag set after 0xD4", 1, hype_ps2_kbd_take_aux_data_write(&kbd));
+    CHECK_HEX("flag consumed -- clear on the very next check", 0, hype_ps2_kbd_take_aux_data_write(&kbd));
+}
+
+static void test_has_pending_byte(void) {
+    hype_ps2_kbd_t kbd;
+
+    hype_ps2_kbd_reset(&kbd);
+    CHECK_HEX("nothing pending after reset", 0, hype_ps2_kbd_has_pending_byte(&kbd));
+
+    hype_ps2_kbd_enqueue_scancode(&kbd, 0x1Eu);
+    CHECK_HEX("pending after enqueue", 1, hype_ps2_kbd_has_pending_byte(&kbd));
+}
+
 int main(void) {
     test_reset_state();
     test_unrecognized_port_rejected();
@@ -150,6 +194,10 @@ int main(void) {
     test_interface_test();
     test_disable_then_enable_keyboard_port();
     test_unrecognized_controller_command_is_ignored();
+    test_disable_then_enable_aux_port();
+    test_aux_port_test();
+    test_write_to_aux_sets_one_shot_flag();
+    test_has_pending_byte();
 
     if (failures == 0) {
         printf("all tests passed\n");

@@ -463,6 +463,50 @@ int hype_svm_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd)
     return 0;
 }
 
+int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+
+    if (io.port == HYPE_PS2_PORT_DATA) {
+        if (io.is_in) {
+            uint8_t value;
+            if (hype_ps2_mouse_has_pending_byte(mouse)) {
+                value = hype_ps2_mouse_read_byte(mouse);
+            } else {
+                hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_DATA, &value);
+            }
+            real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
+        } else {
+            uint8_t value = (uint8_t)(real->vmcb->save.rax & 0xFFu);
+            if (hype_ps2_kbd_take_aux_data_write(kbd)) {
+                hype_ps2_mouse_write_command(mouse, value);
+            } else {
+                hype_ps2_kbd_io_write(kbd, HYPE_PS2_PORT_DATA, value);
+            }
+        }
+    } else if (io.port == HYPE_PS2_PORT_STATUS_COMMAND) {
+        if (io.is_in) {
+            uint8_t status;
+            hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_STATUS_COMMAND, &status);
+            if (hype_ps2_mouse_has_pending_byte(mouse)) {
+                status |= HYPE_PS2_STATUS_OUTPUT_FULL | HYPE_PS2_STATUS_AUX_DATA;
+            }
+            real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | status;
+        } else {
+            hype_ps2_kbd_io_write(kbd, HYPE_PS2_PORT_STATUS_COMMAND, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+        }
+    } else {
+        return -1;
+    }
+
+    /* EXITINFO2 gives the resume RIP directly, same "next-RIP-for-free"
+     * convenience hype_svm_vcpu_handle_ioio() itself already relies on. */
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return 0;
+}
+
 #define HYPE_FW_1_ACPI_PM_TIMER_PORT 0x608u
 #define HYPE_FW_1_ACPI_PM_TIMER_MASK 0x00FFFFFFu /* 24-bit -- TMR_VAL_EXT unset in this project's own FADT */
 

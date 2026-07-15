@@ -6,6 +6,8 @@ void hype_ps2_kbd_reset(hype_ps2_kbd_t *kbd) {
     kbd->config_byte = 0;
     kbd->awaiting_config_byte_write = 0;
     kbd->keyboard_port_enabled = 1;
+    kbd->aux_port_enabled = 1;
+    kbd->next_data_write_is_for_aux = 0;
 }
 
 void hype_ps2_kbd_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode) {
@@ -56,6 +58,18 @@ int hype_ps2_kbd_io_write(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t value) {
         case HYPE_PS2_CMD_INTERFACE_TEST:
             stage_response(kbd, HYPE_PS2_INTERFACE_TEST_PASSED);
             break;
+        case HYPE_PS2_CMD_DISABLE_AUX_PORT:
+            kbd->aux_port_enabled = 0;
+            break;
+        case HYPE_PS2_CMD_ENABLE_AUX_PORT:
+            kbd->aux_port_enabled = 1;
+            break;
+        case HYPE_PS2_CMD_TEST_AUX_PORT:
+            stage_response(kbd, HYPE_PS2_AUX_TEST_PASSED);
+            break;
+        case HYPE_PS2_CMD_WRITE_TO_AUX:
+            kbd->next_data_write_is_for_aux = 1;
+            break;
         default:
             /* Unrecognized controller command -- silently ignored,
              * matching real hardware's own tolerance of commands a
@@ -73,11 +87,24 @@ int hype_ps2_kbd_io_write(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t value) {
             /* A command byte sent to the keyboard device itself (not
              * the controller) -- generically ACKed, see this file's
              * own header comment for why nothing more specific is
-             * modeled yet. */
+             * modeled yet. Never reached for an AUX-targeted write --
+             * the exempt glue routes those to devices/ps2_mouse.h
+             * instead, per hype_ps2_kbd_take_aux_data_write()'s own
+             * comment. */
             stage_response(kbd, HYPE_PS2_KBD_ACK);
         }
         return 0;
     }
 
     return -1;
+}
+
+int hype_ps2_kbd_has_pending_byte(const hype_ps2_kbd_t *kbd) {
+    return kbd->output_buffer_full;
+}
+
+int hype_ps2_kbd_take_aux_data_write(hype_ps2_kbd_t *kbd) {
+    int was_set = kbd->next_data_write_is_for_aux;
+    kbd->next_data_write_is_for_aux = 0;
+    return was_set;
 }

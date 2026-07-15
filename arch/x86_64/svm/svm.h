@@ -16,6 +16,7 @@
 #include "../../../devices/pci.h"
 #include "../../../devices/cmos.h"
 #include "../../../devices/ps2_keyboard.h"
+#include "../../../devices/ps2_mouse.h"
 #include "vmcb.h"
 
 /*
@@ -274,6 +275,28 @@ int hype_svm_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos);
  * isolation.
  */
 int hype_svm_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd);
+
+/*
+ * INPUT-2: routes an IOIO VM-exit to ports 0x60/0x64 across BOTH the
+ * keyboard and mouse channels sharing them -- unlike
+ * hype_svm_vcpu_handle_ps2_kbd_ioio() (kept as-is for INPUT-1's own
+ * keyboard-only guests), this handles a real controller's own
+ * channel-routing behavior: a 0x60 write goes to the mouse instead of
+ * the keyboard exactly when `kbd`'s own
+ * hype_ps2_kbd_take_aux_data_write() says the last controller command
+ * was 0xD4; a 0x60 read (and port 0x64's own status bits) prefers the
+ * mouse's own pending byte over the keyboard's whenever both happen to
+ * have one ready (devices/ps2_mouse.h's own hype_ps2_mouse_has_pending_byte()),
+ * setting HYPE_PS2_STATUS_AUX_DATA to say so -- matching real
+ * hardware's own single shared data path across two channels. Returns
+ * 0 if the port was 0x60 or 0x64 (handled, RIP already advanced via
+ * EXITINFO2), or -1 for any other port. Exempt from unit testing --
+ * reaches into the exempt VMCB/GPR fields this backend's real VMRUN
+ * produces; every function this composes (in both
+ * devices/ps2_keyboard.h and devices/ps2_mouse.h) is already fully
+ * tested in isolation.
+ */
+int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse);
 
 /*
  * FW-1: services the ACPI PM Timer's own I/O port (hardcoded to 0x608

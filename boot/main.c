@@ -2143,6 +2143,305 @@ static void run_input_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         (unsigned int)HYPE_INPUT_1_TEST_SCANCODE);
 }
 
+static uint8_t g_input_2_gdt[24] __attribute__((aligned(16))) = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9B, 0xAF, 0x00,
+    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x93, 0xCF, 0x00,
+};
+static uint8_t g_input_2_idt[4096] __attribute__((aligned(4096)));
+static uint8_t g_input_2_guest_stack[4096] __attribute__((aligned(4096)));
+static uint8_t g_input_2_marker[4096] __attribute__((aligned(4096)));
+static uint8_t g_input_2_result[4096] __attribute__((aligned(4096))); /* [0]=status [1]=dx [2]=dy */
+static hype_pic_emu_t g_input_2_pic;
+static hype_pit_emu_t g_input_2_pit; /* unused by this test's own payload -- required by
+                                      * hype_svm_vcpu_handle_ioio()'s existing signature */
+static hype_ps2_kbd_t g_input_2_kbd;
+static hype_ps2_mouse_t g_input_2_mouse;
+
+#define HYPE_INPUT_2_TEST_STATUS 0x08u /* left button up, no sign/overflow bits */
+#define HYPE_INPUT_2_TEST_DX 0x05u
+#define HYPE_INPUT_2_TEST_DY 0xFBu /* -5, two's complement, in the packet's own signed-byte convention */
+#define HYPE_INPUT_2_MOUSE_VECTOR 0x2Cu /* slave offset 0x28 + IRQ4 (IRQ12 overall) */
+
+/*
+ * Guest payload -- a real OS-shaped mouse-enable sequence: programs
+ * BOTH the master 8259 (unmasking only IRQ2, the slave's own cascade
+ * line -- required for ANY slave-originated IRQ, including the
+ * mouse's IRQ12, to ever reach the CPU at all, matching real hardware)
+ * and the slave 8259 (unmasking only IRQ4, IRQ12 overall), enables the
+ * i8042's own auxiliary port (0xA8), then speaks directly to the
+ * mouse device through the 0xD4 write-to-aux prefix to enable data
+ * reporting (0xF4) -- reading back its ACK before proceeding, exactly
+ * as a real driver must (leaving it unread would have the ISR
+ * misinterpret it as the first byte of a movement packet). The ISR
+ * reads the delivered 3-byte movement packet from port 0x60, sends EOI
+ * to *both* the slave (ending this specific IRQ) and the master
+ * (ending the cascade's own in-service state) -- a real driver detail
+ * this project's own PIC model doesn't enforce, but every real OS
+ * observes for any slave-originated interrupt.
+ *
+ *   mov rbx, <patched: marker guest-physical address>     48 BB 00*8
+ *   mov rcx, <patched: result-buffer guest-physical>       48 B9 00*8
+ *   mov al, 0x11 (master ICW1)          B0 11
+ *   mov dx, 0x20                        66 BA 20 00
+ *   out dx, al                          EE
+ *   mov al, 0x20 (master ICW2)          B0 20
+ *   mov dx, 0x21                        66 BA 21 00
+ *   out dx, al                          EE
+ *   mov al, 0x04 (master ICW3)          B0 04
+ *   out dx, al                          EE
+ *   mov al, 0x01 (master ICW4)          B0 01
+ *   out dx, al                          EE
+ *   mov al, 0xFB (master OCW1 -- unmask only IRQ2) B0 FB
+ *   out dx, al                          EE
+ *   mov al, 0x11 (slave ICW1)           B0 11
+ *   mov dx, 0xA0                        66 BA A0 00
+ *   out dx, al                          EE
+ *   mov al, 0x28 (slave ICW2)           B0 28
+ *   mov dx, 0xA1                        66 BA A1 00
+ *   out dx, al                          EE
+ *   mov al, 0x02 (slave ICW3)           B0 02
+ *   out dx, al                          EE
+ *   mov al, 0x01 (slave ICW4)           B0 01
+ *   out dx, al                          EE
+ *   mov al, 0xEF (slave OCW1 -- unmask only IRQ4) B0 EF
+ *   out dx, al                          EE
+ *   mov al, 0xA8 (ENABLE_AUX_PORT)      B0 A8
+ *   mov dx, 0x64                        66 BA 64 00
+ *   out dx, al                          EE
+ *   mov al, 0xD4 (WRITE_TO_AUX)         B0 D4
+ *   out dx, al                          EE
+ *   mov al, 0xF4 (mouse: enable reporting) B0 F4
+ *   mov dx, 0x60                        66 BA 60 00
+ *   out dx, al                          EE
+ *   in al, dx (discard the mouse's own ACK) EC
+ *   sti                                 FB
+ * poll:
+ *   cmp byte [rbx], 0                   80 3B 00
+ *   je poll                             74 FB
+ *   hlt                                 F4
+ *   jmp $-3                             EB FD
+ *   ... padding to isr's own fixed offset ...
+ * isr:
+ *   mov dx, 0x60                        66 BA 60 00
+ *   in al, dx                           EC
+ *   mov [rcx], al                       88 01
+ *   in al, dx                           EC
+ *   mov [rcx+1], al                     88 41 01
+ *   in al, dx                           EC
+ *   mov [rcx+2], al                     88 41 02
+ *   mov al, 0x20 (OCW2 non-specific EOI) B0 20
+ *   mov dx, 0xA0 (slave first)          66 BA A0 00
+ *   out dx, al                          EE
+ *   mov dx, 0x20 (then master)          66 BA 20 00
+ *   out dx, al                          EE
+ *   mov byte [rbx], 1                   C6 03 01
+ *   iretq                               48 CF
+ */
+static const uint8_t g_input_2_payload_template[] = {
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB0, 0x11,
+    0x66, 0xBA, 0x20, 0x00,
+    0xEE,
+    0xB0, 0x20,
+    0x66, 0xBA, 0x21, 0x00,
+    0xEE,
+    0xB0, 0x04,
+    0xEE,
+    0xB0, 0x01,
+    0xEE,
+    0xB0, 0xFB,
+    0xEE,
+    0xB0, 0x11,
+    0x66, 0xBA, 0xA0, 0x00,
+    0xEE,
+    0xB0, 0x28,
+    0x66, 0xBA, 0xA1, 0x00,
+    0xEE,
+    0xB0, 0x02,
+    0xEE,
+    0xB0, 0x01,
+    0xEE,
+    0xB0, 0xEF,
+    0xEE,
+    0xB0, 0xA8,
+    0x66, 0xBA, 0x64, 0x00,
+    0xEE,
+    0xB0, 0xD4,
+    0xEE,
+    0xB0, 0xF4,
+    0x66, 0xBA, 0x60, 0x00,
+    0xEE,
+    0xEC,
+    0xFB,
+    0x80, 0x3B, 0x00,
+    0x74, 0xFB,
+    0xF4,
+    0xEB, 0xFD,
+    0x90, 0x90, 0x90,
+    0x66, 0xBA, 0x60, 0x00,
+    0xEC,
+    0x88, 0x01,
+    0xEC,
+    0x88, 0x41, 0x01,
+    0xEC,
+    0x88, 0x41, 0x02,
+    0xB0, 0x20,
+    0x66, 0xBA, 0xA0, 0x00,
+    0xEE,
+    0x66, 0xBA, 0x20, 0x00,
+    0xEE,
+    0xC6, 0x03, 0x01,
+    0x48, 0xCF,
+};
+#define HYPE_INPUT_2_PAYLOAD_RBX_IMM_OFFSET 2
+#define HYPE_INPUT_2_PAYLOAD_RCX_IMM_OFFSET 12
+#define HYPE_INPUT_2_PAYLOAD_ISR_OFFSET 96
+static uint8_t g_input_2_guest_code[sizeof(g_input_2_payload_template)] __attribute__((aligned(4096)));
+
+/*
+ * INPUT-2: guest-facing PS/2 mouse device (plan.md §6c). Same overall
+ * shape as run_input_1_test(), one level deeper: the "device event"
+ * (a mouse movement) can only be injected once the guest has itself
+ * finished BOTH PIC channels' own initialization *and* explicitly
+ * enabled mouse data reporting (hype_ps2_mouse_t's own reporting_enabled
+ * flag, set the moment the guest's 0xF4 command is written -- mirroring
+ * INPUT-1's own "wait for the guest's own init_state to reach 0" gate,
+ * extended with this mouse-specific readiness condition since a real
+ * mouse never streams movement before being told to).
+ */
+static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, marker_phys, result_phys, isr_phys, gdt_phys, idt_phys;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("input-2: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n",
+                           ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_input_2_idt, sizeof(g_input_2_idt));
+    hype_guest_ram_zero(g_input_2_guest_code, sizeof(g_input_2_guest_code));
+    hype_guest_ram_zero(g_input_2_guest_stack, sizeof(g_input_2_guest_stack));
+    hype_guest_ram_zero(g_input_2_marker, sizeof(g_input_2_marker));
+    hype_guest_ram_zero(g_input_2_result, sizeof(g_input_2_result));
+    hype_pic_emu_reset(&g_input_2_pic);
+    hype_pit_emu_reset(&g_input_2_pit);
+    hype_ps2_kbd_reset(&g_input_2_kbd);
+    hype_ps2_mouse_reset(&g_input_2_mouse);
+
+    for (i = 0; i < sizeof(g_input_2_payload_template); i++) {
+        g_input_2_guest_code[i] = g_input_2_payload_template[i];
+    }
+    marker_phys = (uint64_t)(uintptr_t)g_input_2_marker;
+    result_phys = (uint64_t)(uintptr_t)g_input_2_result;
+    hype_write_le64(g_input_2_guest_code + HYPE_INPUT_2_PAYLOAD_RBX_IMM_OFFSET, marker_phys);
+    hype_write_le64(g_input_2_guest_code + HYPE_INPUT_2_PAYLOAD_RCX_IMM_OFFSET, result_phys);
+
+    isr_phys = (uint64_t)(uintptr_t)(g_input_2_guest_code + HYPE_INPUT_2_PAYLOAD_ISR_OFFSET);
+
+    {
+        uint8_t *gate = g_input_2_idt + (unsigned)HYPE_INPUT_2_MOUSE_VECTOR * 16;
+        gate[0] = (uint8_t)(isr_phys & 0xFFu);
+        gate[1] = (uint8_t)((isr_phys >> 8) & 0xFFu);
+        gate[2] = 0x08;
+        gate[3] = 0x00;
+        gate[4] = 0x00;
+        gate[5] = 0x8E;
+        gate[6] = (uint8_t)((isr_phys >> 16) & 0xFFu);
+        gate[7] = (uint8_t)((isr_phys >> 24) & 0xFFu);
+        hype_write_le32(gate + 8, (uint32_t)(isr_phys >> 32));
+        hype_write_le32(gate + 12, 0);
+    }
+
+    entry_rip = (uint64_t)(uintptr_t)g_input_2_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_input_2_guest_stack + sizeof(g_input_2_guest_stack));
+    gdt_phys = (uint64_t)(uintptr_t)g_input_2_gdt;
+    idt_phys = (uint64_t)(uintptr_t)g_input_2_idt;
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_debug_print("input-2: entry_rip=0x%llx isr_phys=0x%llx\n", (unsigned long long)entry_rip,
+                      (unsigned long long)isr_phys);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    if (ctx == 0) {
+        hype_fatal("input-2: vcpu_create_long_mode failed");
+    }
+
+    hype_svm_vcpu_set_gdt(ctx, gdt_phys, (uint16_t)(sizeof(g_input_2_gdt) - 1));
+    hype_svm_vcpu_set_idt(ctx, idt_phys, (uint16_t)(sizeof(g_input_2_idt) - 1));
+    hype_svm_vcpu_set_cs_ss_selectors(ctx, 0x08u, 0x10u);
+
+    {
+        int event_delivered = 0;
+
+        for (;;) {
+            if (ops->vcpu_run(ctx, &info) != 0) {
+                hype_fatal("input-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+            }
+
+            if (info.reason == HYPE_SVM_EXITCODE_VINTR) {
+                hype_svm_vcpu_handle_vintr_window(ctx);
+                continue;
+            }
+
+            if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
+                if (hype_svm_vcpu_handle_ioio(ctx, &g_input_2_pic, &g_input_2_pit) == 0) {
+                    continue;
+                }
+                if (hype_svm_vcpu_handle_ps2_ioio(ctx, &g_input_2_kbd, &g_input_2_mouse) == 0) {
+                    /* Mirrors run_input_1_test()'s own "wait for the
+                     * guest to genuinely be ready" gate, extended with
+                     * the mouse-specific readiness condition: reporting
+                     * must be enabled (the guest's own 0xF4, just
+                     * handled above if this is that exact write) AND
+                     * the slave PIC's own init must be complete (IRQ4
+                     * unmasked). */
+                    if (!event_delivered && g_input_2_mouse.reporting_enabled &&
+                        g_input_2_pic.slave.init_state == 0) {
+                        hype_ps2_mouse_enqueue_movement(&g_input_2_mouse, HYPE_INPUT_2_TEST_STATUS,
+                                                         HYPE_INPUT_2_TEST_DX, HYPE_INPUT_2_TEST_DY);
+                        hype_svm_vcpu_deliver_pic_irq(ctx, &g_input_2_pic.slave, 4);
+                        event_delivered = 1;
+                    }
+                    continue;
+                }
+                hype_fatal("input-2: unhandled IOIO access (qual=0x%llx guest_rip=0x%llx)",
+                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+            }
+
+            break;
+        }
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("input-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+    if (g_input_2_marker[0] != 1) {
+        hype_fatal("input-2: interrupt handler never ran (marker=0x%x)", g_input_2_marker[0]);
+    }
+    if (g_input_2_result[0] != HYPE_INPUT_2_TEST_STATUS || g_input_2_result[1] != HYPE_INPUT_2_TEST_DX ||
+        g_input_2_result[2] != HYPE_INPUT_2_TEST_DY) {
+        hype_fatal("input-2: ISR read the wrong packet (got 0x%x/0x%x/0x%x, expected 0x%x/0x%x/0x%x)",
+                   g_input_2_result[0], g_input_2_result[1], g_input_2_result[2], HYPE_INPUT_2_TEST_STATUS,
+                   HYPE_INPUT_2_TEST_DX, HYPE_INPUT_2_TEST_DY);
+    }
+
+    hype_debug_print(
+        "input-2: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- mouse packet "
+        "0x%x/0x%x/0x%x delivered via PS/2 -> PIC (vector 0x%x) -> INT-1/INT-2, ISR read it back "
+        "correctly\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
+        (unsigned int)HYPE_INPUT_2_TEST_STATUS, (unsigned int)HYPE_INPUT_2_TEST_DX,
+        (unsigned int)HYPE_INPUT_2_TEST_DY, (unsigned int)HYPE_INPUT_2_MOUSE_VECTOR);
+}
+
 /*
  * RAM-1/RAM-2: exercises the new dynamically-allocated,
  * dynamically-NPT-sized guest RAM path (g_ram_1_base_phys/
@@ -2961,6 +3260,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_cpumsr_test(args->ops, args->kind);
     run_int_test(args->ops, args->kind);
     run_input_1_test(args->ops, args->kind);
+    run_input_2_test(args->ops, args->kind);
     run_ram_1_test(args->ops, args->kind);
     run_pci_1_test(args->ops, args->kind);
     run_pci_2_test(args->ops, args->kind);
