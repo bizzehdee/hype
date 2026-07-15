@@ -4291,60 +4291,45 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             uint8_t *fault_bytes;
             hype_svm_vcpu_get_debug_state(ctx, &dbg);
 
-            /* Real-hardware finding: this core summary line -- vector/
-             * error/CR0/CR2/CR3/RIP, everything actually needed to
-             * compare a fault across environments -- used to print
-             * LAST, via hype_fatal(), after the raw-byte/stack-dump
-             * attempts below. On real hardware those dereferences can
-             * themselves fault (a real machine's memory map is far
-             * larger/more complex than QEMU's small, uniformly-mapped
-             * test VM; there's no guarantee firmware's own page tables
-             * identity-map every address this project's flat-map
-             * assumption expects), silently killing the machine before
-             * the one line that actually matters ever printed. Printed
-             * FIRST now, via hype_debug_print() (not hype_fatal(),
-             * which halts and would make everything below unreachable),
-             * specifically so it survives even if what follows doesn't. */
-            hype_debug_print("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr2=0x%llx cr3=0x%llx rip=0x%llx\n",
+            /* Core fault summary. Printed FIRST, via hype_debug_print()
+             * (not hype_fatal(), which halts and would make the deeper
+             * dumps below unreachable), so it survives even if a later
+             * dereference itself faults.
+             *
+             * CRITICAL (APM Vol 2 24593 Rev 3.44 §15.12.15): for an
+             * intercepted #PF the intercept is tested BEFORE CR2 is
+             * written, so the save-area CR2 printed here is STALE (the
+             * previous fault's value), NOT this fault's address. The
+             * real faulting address is EXITINFO2 (printed below). An
+             * earlier session misread cr2=0 here as a confirmed
+             * NULL-pointer deref -- it was never written for this exit.
+             * cr2 is kept in the dump only to show it is stale/ignored. */
+            hype_debug_print("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr3=0x%llx rip=0x%llx (cr2=0x%llx STALE)\n",
                               (unsigned long long)(info.reason - HYPE_SVM_EXITCODE_EXCEPTION_BASE),
                               (unsigned long long)info.qualification, (unsigned long long)dbg.cr0,
-                              (unsigned long long)dbg.cr2, (unsigned long long)dbg.cr3,
-                              (unsigned long long)dbg.rip);
-            /* Real-hardware investigation (rip=-1 finding, see below):
-             * these fields are already captured in `dbg` at zero extra
-             * risk (plain struct reads, no new dereferences) but were
-             * never actually printed -- if cs_selector/cs_base/rflags
-             * ALSO look like the same all-1s sentinel, that points at
-             * several adjacent VMCB save-state fields being garbage
-             * together (a wider issue); if they look sane, that narrows
-             * the garbage specifically to rip (and whatever rsp points
-             * at), which points somewhere else entirely. */
+                              (unsigned long long)dbg.cr3, (unsigned long long)dbg.rip,
+                              (unsigned long long)dbg.cr2);
             hype_debug_print("fw-1: cs_selector=0x%x cs_base=0x%llx rflags=0x%llx rsp=0x%llx\n",
                               (unsigned int)dbg.cs_selector, (unsigned long long)dbg.cs_base,
                               (unsigned long long)dbg.rflags, (unsigned long long)dbg.rsp);
-            /* Real-hardware investigation: EXITINFO2 (control area) and
-             * CR2 (save area) both architecturally hold the same
-             * faulting linear address for an intercepted #PF -- if they
-             * disagree here, that's strong evidence the save-state area
-             * (where RIP also lives) isn't being fully/reliably
-             * populated for this specific exit on real hardware. */
-            hype_debug_print("fw-1: exitinfo2=0x%llx (cr2 above should match)\n",
+            /* THE authoritative faulting address for an intercepted #PF
+             * (§15.12.15: "The faulting address is saved in the
+             * EXITINFO2 field"). Real-hardware finding: this reads
+             * 0xFFFFFFFFFFFFFFFF, exactly equal to rip -- i.e. the guest
+             * transferred control to -1 and faulted FETCHING the
+             * instruction there (err=0 is consistent: the #PF error
+             * code's I/D "instruction fetch" bit is only defined when
+             * EFER.NXE=1 && CR4.PAE=1, §8.4.2, and this guest has NXE
+             * off, so a fetch fault reports err=0). rip=-1 is therefore
+             * CORRECT, not a corrupt save. The garbage -1 pointer came
+             * from guest memory that reads all-1s -- see the rsp dump. */
+            hype_debug_print("fw-1: FAULT ADDR (exitinfo2)=0x%llx  [rip==this => bad control transfer to it]\n",
                               (unsigned long long)dbg.exitinfo2);
 
-            /* THE decisive field for the rip=-1 / rflags=reset / cr2=0
-             * puzzle (APM Vol 2 24593 Rev 3.44 §15.7.2 / §15.20). A data
-             * read of linear 0 cannot be executing at rip=-1, so the
-             * saved rip/rflags don't describe a clean single fault. If
-             * EXITINTINFO's VALID bit (63:32 err, bit 11 err-valid, bit
-             * 31 VALID, 10:8 type, 7:0 vector) is set, this #PF was taken
-             * *while the guest was delivering a prior exception/interrupt
-             * through its own IDT* -- i.e. a nested fault (the IDT entry,
-             * the handler's code page, or the exception-frame stack page
-             * is itself unmapped under FW-1's deliberately-partial NPT),
-             * NOT the original faulting instruction. If VALID is clear,
-             * that whole theory is dead and this becomes an
-             * erratum-class save-completeness question. NRIP is captured
-             * as an independent cross-check on the save-area rip. */
+            /* §15.7.2/§15.20: EXITINTINFO is written when the intercept
+             * fired while the guest was delivering a PRIOR event through
+             * its IDT. Real hardware: valid=0 -- so this is the PRIMARY
+             * fault, not a nested-delivery fault. NRIP cross-checks rip. */
             hype_debug_print("fw-1: exitintinfo=0x%llx (valid=%u type=%u vec=%u) nrip=0x%llx\n",
                               (unsigned long long)dbg.exitintinfo,
                               (unsigned int)((dbg.exitintinfo >> 31) & 0x1ULL),
@@ -4417,11 +4402,11 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                   (unsigned long long)dbg.rsp);
             }
 
-            hype_fatal("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr2=0x%llx cr3=0x%llx rip=0x%llx",
+            hype_fatal("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr3=0x%llx rip=0x%llx faultaddr=0x%llx",
                        (unsigned long long)(info.reason - HYPE_SVM_EXITCODE_EXCEPTION_BASE),
                        (unsigned long long)info.qualification, (unsigned long long)dbg.cr0,
-                       (unsigned long long)dbg.cr2, (unsigned long long)dbg.cr3,
-                       (unsigned long long)dbg.rip);
+                       (unsigned long long)dbg.cr3, (unsigned long long)dbg.rip,
+                       (unsigned long long)dbg.exitinfo2);
         }
 
         break;

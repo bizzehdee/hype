@@ -1441,6 +1441,70 @@ NOT yet rebuilt for this change -- do that before the next hardware
 capture. Milestone stays parked; the analysis is materially further
 along and the next data point is now one boot away from settling it.
 
+**Update (2026-07-15, decisive capture -- root cause FOUND, and the
+whole prior framing was wrong).** Real-hardware capture with the new
+diagnostic (photo/OCR, VivoBook):
+```
+fw-1: exc vec=14 err=0x0 cr0=0x80000033 cr2=0x0 cr3=0x800000 rip=0xffffffffffffffff
+fw-1: cs_selector=0x38 cs_base=0x0 rflags=0x2 rsp=0xfcd8d4f0
+fw-1: exitinfo2=0xffffffffffffffff
+fw-1: exitintinfo=0x0 (valid=0 type=0 vec=0) nrip=0x0
+fw-1: rsp=0xfcd8d4f0 [0..3]=0xffffffffffffffff
+```
+Two APM facts, read directly this session, dismantle the old story and
+assemble the real one:
+
+- ***§15.12.15: for an intercepted #PF the intercept is tested BEFORE
+  CR2 is written, and the faulting address is in EXITINFO2, not CR2.***
+  So `cr2=0x0` is STALE, not this fault's address. The prior session's
+  headline conclusion -- "cr2=0 => DXE NULL-pointer deref confirmed on
+  real hardware" -- was WRONG: it trusted a register the CPU never
+  wrote for this exit. The real fault address is EXITINFO2 =
+  `0xffffffffffffffff`, and it also flipped run-to-run (0x0 last time,
+  all-1s now), which is exactly what a stale-vs-live pair looks like.
+
+- ***§8.4.2: the #PF error-code I/D "instruction fetch" bit is only
+  defined when EFER.NXE=1 && CR4.PAE=1.*** This guest runs with NXE
+  off, so an instruction-FETCH fault reports err=0. Combined with
+  EXITINFO2 == rip == `0xffffffffffffffff`, the picture is fully
+  self-consistent and needs no erratum: **the guest transferred
+  control to 0xFFFFFFFFFFFFFFFF and #PF'd fetching the instruction
+  there.** rip=-1 is CORRECT, not a corrupt save. rflags=0x2 and
+  exitintinfo valid=0 fit (primary fault, not nested delivery).
+
+- ***Where the -1 pointer came from -- the actual FW-1 bug.*** The
+  guest read all-1s from memory and jumped/returned through it. The
+  rsp dump shows why: guest memory around 0xfcd8d4f0 (~3.95GB, just
+  below 4GB) reads all-1s. FW-1's NPT IDENTITY-maps guest-physical to
+  host-physical (hype_npt_build_identity over HYPE_NPT_MAX_GB), so the
+  guest inherits the HOST's real memory map -- including the host
+  chipset's MMIO hole below 4GB (0xC0000000-0xFFFFFFFF region), which
+  reads all-1s. OVMF sized/placed its DXE stack near the top of what
+  it believed was low RAM and landed in that hole; every push/pop and
+  saved return address there is all-1s, so the first `ret`/indirect
+  call jumps to -1. Under QEMU this never reproduced because QEMU's
+  guest-physical map has RAM there, not host MMIO.
+
+So the three "mysteries" (rip=-1, rflags=too-clean, all-1s stack) are
+ONE root cause: **the identity NPT gives the guest the host's MMIO
+hole instead of a clean contiguous RAM map.** The fix is real work,
+not a one-liner: FW-1 must present the guest a synthetic RAM map that
+avoids a sub-4GB MMIO hole (the classic PC "low RAM below the hole,
+the rest remapped above 4GB" split) and NPT-translate guest RAM to
+wherever host RAM actually is -- i.e. stop identity-mapping, and make
+the guest's memory size / e820 / CMOS agree with that layout. That is
+squarely RAM-2 / a new FW-1 sub-task, and it is the true blocker M4-6
+depends on.
+
+Code corrected to match reality: the fault dump now prints EXITINFO2
+as the authoritative fault address and labels cr2 "STALE"; the
+`hype_svm_debug_state_t` / diagnostic comments that had cr2 and
+exitinfo2 backwards are fixed. Build + full unit suite green.
+Diagnostic value banked this session: the compile-time VMCB offset
+asserts, EXITINTINFO/NRIP capture, and -- most importantly -- a
+correct, spec-cited root cause replacing a wrong one. FW-1 stays `[ ]`
+but is no longer a "mystery"; it's a well-scoped guest-memory-map task.
+
 - [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash

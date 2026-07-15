@@ -398,15 +398,13 @@ typedef struct {
     uint64_t rip;
     uint64_t rflags;
     uint64_t rsp;
-    /* Real-hardware investigation (rip reading back as an implausible
-     * sentinel on real AMD hardware, never seen under nested-SVM
-     * QEMU/KVM): the VMCB *control* area's own EXITINFO2 -- which the
-     * AMD spec documents as ALSO holding the faulting linear address
-     * for an intercepted #PF, independent of the *save* area's CR2
-     * field above -- so the two can be compared. If they disagree on
-     * real hardware, that points at the save-state area (where RIP
-     * also lives) not being fully/reliably populated for this specific
-     * exit, rather than a one-off RIP-specific issue. */
+    /* For an intercepted #PF this is THE faulting linear address (APM
+     * Vol 2 24593 Rev 3.44 §15.12.15). It is NOT redundant with the
+     * save-area CR2 above: §15.12.15 says the intercept is tested
+     * BEFORE CR2 is written by the exception, so save.cr2 is stale for
+     * an intercepted #PF and exitinfo2 is the only valid fault address.
+     * (An earlier session had this backwards, trusting cr2 and treating
+     * exitinfo2 as a mere cross-check.) */
     uint64_t exitinfo2;
     /* Real-hardware investigation (rip=-1 / rflags=reset-value / cr2=0
      * all seen together, an internally-inconsistent single-fault
