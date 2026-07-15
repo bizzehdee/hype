@@ -1511,6 +1511,37 @@ Revisit this note when picking FW-1 back up.
 
 ---
 
+## TERM — GOP-rendered VM management terminal (v1; new milestone,
+## user request 2026-07-15 — complements M8's own GUI dashboard, §6b)
+
+VM management (not just status viewing) via two GOP-rendered surfaces:
+the existing GUI dashboard (M8-1, LVGL-class per §6b) for visual
+navigation, **plus** an emulated text terminal with a basic command
+set for the same lifecycle actions M8-4..M8-8 already define. Explicitly
+**GOP-only for v1** — no serial or network exposure, matching §6b's own
+"local-only for v1" decision. SSH-based remote management is explicitly
+a v2 feature (see `V2-MGMT-1` below), not started now.
+
+- [ ] **TERM-1** — GOP-rendered text terminal surface: a monospace
+  character-grid renderer on the real host screen (reuses VIDEO-1's own
+  bitmap-font primitives, `core/gop_text.c`, rather than the "corporate"
+  LVGL-class dashboard renderer), with input from the host's own PS/2
+  keyboard (INPUT-3) and shown/dismissed via the leader chord (INPUT-4).
+  Deps: VIDEO-1, INPUT-3, INPUT-4
+- [ ] **TERM-2** — Basic command parser + command set operating on the
+  same per-VM state M8's dashboard reads/controls: list VMs, show
+  per-VM status (M8-2's stats), start/stop/pause/resume/shutdown/force
+  power off a VM by name, switch console focus.
+  Deps: TERM-1, M8-2, M8-4, M8-5, M8-6, M8-7
+- [ ] **TERM-3** — Wire the terminal in as an alternate view alongside
+  the GUI dashboard, both reachable via the same leader-chord toggle
+  (M8-3). Exact UX split (two separate views vs. one primary with the
+  other as fallback) is undecided — revisit when this is actually
+  scoped/started.
+  Deps: M8-3, TERM-1
+
+---
+
 ## M9 — Persistence & host power lifecycle
 ## (plan.md §9 M9, §6h, §10 decision #13)
 
@@ -1624,6 +1655,13 @@ not scheduled against the critical path.
   project has its own protocol/schema/transport decided — this task is
   blocked on that spec existing, not on anything in this codebase).
   Deps: V2-TELEM-1, V2-TELEM-2, V2-TELEM-3
+- [ ] **V2-MGMT-1** — SSH-based remote VM management, deferred from
+  TERM's v1 GOP-only scope (user request 2026-07-15: "the terminal
+  should also be via gop only for now. SSH will be a v2 feature").
+  Needs its own scoping pass (network stack doesn't exist yet at all —
+  NET-* only covers guest-facing NICs, not a host-side management
+  network stack; auth/access-control model undecided).
+  Deps: TERM-2, NET-1
 
 ---
 
