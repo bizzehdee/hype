@@ -1590,7 +1590,11 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
   completes and hype proceeds to its normal steady state ("Boot Services
   exited ... waiting for timer ticks") -- zero panics, all prior guests
   still halt cleanly. **The whole FW-1 milestone (real OVMF boot) is
-  DONE.** Next, separate: a guest console/serial bridge + wiring
+  DONE.** ***Confirmed on real AMD hardware (VivoBook, 2026-07-15)***:
+  the machine reached "Boot Services exited, hypervisor now running" --
+  which only prints after run_all_test_guests() (incl. FW-1) returns
+  without a fatal -- so real OVMF boots end to end on real silicon,
+  matching QEMU, not just under nested SVM. Next, separate: a guest console/serial bridge + wiring
   INPUT-1/INPUT-2 PS/2 devices into the FW-1 IOIO handler to actually
   see/drive the OVMF shell (the path toward M4-6). Deps: FW-1c.
 
