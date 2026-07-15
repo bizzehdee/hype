@@ -811,6 +811,16 @@ tasks — see updated deps below.*
   MMIO-trap model, which stays correct for OVMF_VARS.fd only).
   Deps: RAM-2, CPUMSR-2, M4-2, M4-3
 
+  **PARKED 2026-07-15** -- substantial progress made (see below), but
+  the remaining blocker (a NULL-pointer fault in a dynamically-
+  relocated DXE driver) needs live debugging or a different
+  investigative angle, not more of the same source-correlation
+  technique. User decision: move on to INPUT, then VIDEO-3, then M5,
+  and circle back to FW-1/FW-2/M4-6 later. Nothing here needs
+  unwinding -- every fix committed so far (file I/O, PCI CF8/CFC, ACPI/
+  fw_cfg, CMOS, ACPI PM Timer) is real, independently correct
+  infrastructure, not a throwaway experiment.
+
   *Substantial progress, not yet complete -- real OVMF now executes
   correctly through real-mode -> protected-mode -> long-mode with
   paging enabled, several real, independently-valuable bugs found and
