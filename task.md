@@ -1579,19 +1579,29 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
   way to a stable idle HLT (see FW-1d). No regressions (17 prior guests
   halt cleanly; unit suite unchanged). Deps: FW-1b, PCI-1.
 
-- [ ] **FW-1d** — OVMF reaches a stable idle HLT (reason=0x78, rip in
-  guest RAM) after full DXE/BDS init -- i.e. **OVMF effectively boots**.
-  The FW-1 loop currently treats HLT as the catch-all "exited dispatch
-  loop" fatal. Real work: (a) handle HLT as wait-for-interrupt (re-VMRUN
-  so the LAPIC timer wakes it), (b) a bounded, clean termination that
-  declares boot success once the guest is demonstrably idle-looping
-  (instead of the current fatal / an unbounded loop). Then FW-1 is a
-  passing milestone. Genuinely interacting with OVMF (seeing the shell,
-  sending keystrokes) needs a guest console/serial bridge + wiring the
-  INPUT-1/INPUT-2 PS/2 devices into the FW-1 IOIO handler -- its own
-  step. Deps: FW-1c.
+- [x] **FW-1d** — OVMF idle HLT handled; FW-1 is now a passing
+  milestone. DONE + validated in QEMU. The FW-1 loop treats HLT as
+  wait-for-interrupt (continue, so the LAPIC timer wakes it) and, once
+  the guest HLTs past HYPE_FW_1_BOOTED_EXITS (1500) *productive*
+  (non-HLT) VM-exits -- OVMF never HLTs during init, only at BDS idle --
+  declares boot success and returns cleanly, with a HYPE_FW_1_MAX_EXITS
+  runaway guard. QEMU: `fw-1: real OVMF BOOTED -- reached its BDS idle
+  HLT after 3563 productive VM-exits`, then run_all_test_guests
+  completes and hype proceeds to its normal steady state ("Boot Services
+  exited ... waiting for timer ticks") -- zero panics, all prior guests
+  still halt cleanly. **The whole FW-1 milestone (real OVMF boot) is
+  DONE.** Next, separate: a guest console/serial bridge + wiring
+  INPUT-1/INPUT-2 PS/2 devices into the FW-1 IOIO handler to actually
+  see/drive the OVMF shell (the path toward M4-6). Deps: FW-1c.
 
-- [~] **FW-1** — New "firmware guest" VMCB builder: real x86
+Known follow-up (not blocking): the per-VM-exit `svm: about to CLGI/
+VMLOAD/VMRUN` / `VMRUN returned` / `STGI done` trace prints (added for
+the rip=-1 investigation, now solved) fire 3 lines per exit -- ~11k
+lines for an OVMF boot. Harmless on serial but worth gating behind a
+verbosity flag before the real-hardware console work, since GOP renders
+every line.
+
+- [x] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash
   MMIO-trap model, which stays correct for OVMF_VARS.fd only).

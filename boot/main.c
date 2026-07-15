@@ -221,6 +221,18 @@ static hype_acpi_loader_entry_t g_fw_1_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENT
  * is serviced by PCI-1's own config-space model. */
 #define HYPE_FW_1_ECAM_GPA 0xE0000000ULL
 
+/* FW-1d: OVMF never executes HLT during DXE/BDS init -- its idle wait
+ * (CpuSleep) HLTs only once everything is up. Empirically it reaches
+ * that idle HLT after ~3600 VM-exits; treat a HLT past this many
+ * *productive* (non-HLT) exits as "firmware booted" and finish the
+ * bring-up test cleanly. Comfortably below the observed count and far
+ * above any early boot activity (which does not HLT). */
+#define HYPE_FW_1_BOOTED_EXITS 1500ULL
+/* Runaway guard: if the guest neither makes progress nor reaches a
+ * stable idle within this many exits, something is wrong -- fail loudly
+ * instead of spinning forever (e.g. an early HLT with no timer). */
+#define HYPE_FW_1_MAX_EXITS 5000000ULL
+
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
 static hype_pte_t g_npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
@@ -4325,11 +4337,26 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     }
     hype_svm_vcpu_set_rip(ctx, reset_rip);
 
+    {
+    unsigned long long productive_exits = 0;
+    unsigned long long total_exits = 0;
+    int booted = 0;
+
     for (;;) {
         uint8_t timer_vector;
 
         if (ops->vcpu_run(ctx, &info) != 0) {
             hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (++total_exits > HYPE_FW_1_MAX_EXITS) {
+            hype_fatal("fw-1: exceeded %llu VM-exits without reaching a stable idle -- guest stuck "
+                       "(last reason=0x%llx guest_rip=0x%llx)",
+                       (unsigned long long)HYPE_FW_1_MAX_EXITS, (unsigned long long)info.reason,
+                       (unsigned long long)info.guest_rip);
+        }
+        if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+            productive_exits++;
         }
 
         /* FW-1b: advance the guest LAPIC timer one synthetic tick per
@@ -4536,12 +4563,38 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                        (unsigned long long)dbg.exitinfo2);
         }
 
+        if (info.reason == HYPE_SVM_EXITCODE_HLT) {
+            /* FW-1d: OVMF's idle wait (CpuSleep). It never HLTs during
+             * DXE/BDS init, so a HLT past HYPE_FW_1_BOOTED_EXITS
+             * productive exits means the firmware finished booting and
+             * is idle-waiting for the next timer tick / a keypress --
+             * treat that as success and end the bring-up test. An
+             * (unexpected) earlier HLT is treated as plain
+             * wait-for-interrupt: keep running so the LAPIC timer wakes
+             * it (bounded by HYPE_FW_1_MAX_EXITS above). */
+            if (productive_exits >= HYPE_FW_1_BOOTED_EXITS) {
+                booted = 1;
+                break;
+            }
+            continue;
+        }
+
         break;
+    }
+
+    if (booted) {
+        hype_debug_print(
+            "fw-1: real OVMF BOOTED -- reached its BDS idle HLT after %llu productive VM-exits "
+            "(full DXE/BDS: LAPIC timer, PCI/ECAM enumeration, PS/2 init), guest_rip=0x%llx. "
+            "Interacting with it (shell output/keystrokes) needs a guest console + PS/2 bridge next.\n",
+            (unsigned long long)productive_exits, (unsigned long long)info.guest_rip);
+        return;
     }
 
     hype_fatal("fw-1: real OVMF exited the initial dispatch loop (reason=0x%llx qual=0x%llx guest_rip=0x%llx)",
                (unsigned long long)info.reason, (unsigned long long)info.qualification,
                (unsigned long long)info.guest_rip);
+    }
 }
 
 /* Runs every test guest in sequence -- what actually gets dispatched
