@@ -1015,9 +1015,30 @@ tasks — see updated deps below.*
   "iso-1: read a real 2895872-byte ISO9660 image ... "CD001" identifier
   verified at offset 32769" -- every other existing test guest (M2-7
   through PCI-2) and FW-1's own progress point are both unaffected.*
-- [ ] **ISO-2** — Back M4-5's existing AHCI/ATAPI in-memory model with
+- [x] **ISO-2** — Back M4-5's existing AHCI/ATAPI in-memory model with
   the real loaded ISO buffer instead of a synthetic one.
   Deps: ISO-1, M4-5
+
+  *A new, dedicated test guest (`run_iso_2_test()`, boot/main.c) --
+  structurally an exact copy of M4-5's own test (same payload template,
+  same fixed-AHCI-address convention; PCI discovery stays PCI-2's own
+  separate concern) -- but `hype_atapi_reset()` is backed by ISO-1's
+  real loaded `\iso\test.iso` buffer instead of a synthetic pattern.
+  Reads LBA 16 (the ISO9660 Primary Volume Descriptor sector, always
+  the 17th 2048-byte sector per ECMA-119 §8.4) via the guest's own
+  AHCI/ATAPI READ(10) command, then verifies both a byte-for-byte match
+  against the real file's own content at that exact offset *and* the
+  "CD001" identifier at the sector's own byte offset 1 -- the same
+  signature ISO-1 already verified via direct UEFI file I/O, now
+  confirmed reachable through the emulated AHCI/ATAPI hardware path
+  too. Clean QEMU run on the first attempt (after fixing the test
+  dispatch order -- `run_fw_1_test()` currently ends in a `hype_fatal()`
+  that never returns, so `run_iso_2_test()` must run *before* it in
+  `run_all_test_guests()`, not after): "iso-2: AHCI/ATAPI test guest
+  halted cleanly ... real ISO LBA 16 read byte-for-byte via emulated
+  hardware, "CD001" identifier verified" -- every other existing test
+  guest (M2-7 through PCI-2) and FW-1's own progress point are all
+  unaffected.*
 
 ---
 

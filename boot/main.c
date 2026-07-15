@@ -137,6 +137,11 @@ static uint64_t g_ram_1_size_bytes;
  */
 static uint64_t g_fw_1_combined_host_phys;
 static uint64_t g_fw_1_combined_size;
+/* ISO-1's own loaded test.iso buffer, kept around for ISO-2 to back
+ * the AHCI/ATAPI model with real data instead of re-reading the file a
+ * second time. */
+static uint64_t g_iso_host_phys;
+static uint64_t g_iso_size;
 static uint64_t g_fw_1_code_size;
 static uint64_t g_fw_1_vars_size;
 static uint8_t g_fw_1_guest_stack[65536] __attribute__((aligned(4096)));
@@ -1152,6 +1157,146 @@ static void run_m4_5_ahci_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) 
         "m4-5: AHCI/ATAPI test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- %u-byte "
         "READ(10) round trip verified byte-for-byte\n",
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_ATAPI_SECTOR_SIZE);
+}
+
+#define HYPE_ISO_2_AHCI_GPA (HYPE_M4_5_AHCI_GPA + HYPE_PAGING_2MB)
+#define HYPE_ISO_2_PVD_LBA 16 /* ISO9660 Primary Volume Descriptor: always the 17th 2048-byte sector */
+
+static uint8_t g_iso_2_cmd_list[4096] __attribute__((aligned(4096)));
+static uint8_t g_iso_2_cmd_table[4096] __attribute__((aligned(4096)));
+static uint8_t g_iso_2_rx_fis[4096] __attribute__((aligned(4096)));
+static uint8_t g_iso_2_dest_buffer[HYPE_ATAPI_SECTOR_SIZE] __attribute__((aligned(4096)));
+static uint8_t g_iso_2_guest_code[256] __attribute__((aligned(4096)));
+static uint8_t g_iso_2_guest_stack[4096] __attribute__((aligned(4096)));
+static hype_ahci_t g_iso_2_ahci;
+static hype_atapi_t g_iso_2_atapi;
+
+/*
+ * ISO-2: backs M4-5's own AHCI/ATAPI in-memory model with ISO-1's real
+ * loaded \iso\test.iso buffer (g_iso_host_phys/g_iso_size) instead of a
+ * synthetic pattern -- otherwise an exact copy of M4-5's own test
+ * guest (same payload template, same fixed-address convention; PCI
+ * discovery is PCI-2's own separate concern, not needed here). Reads
+ * LBA 16, the ISO9660 Primary Volume Descriptor sector (always the
+ * 17th 2048-byte sector, ECMA-119 SS8.4), and verifies both a
+ * byte-for-byte match against the real file content at that same
+ * offset *and* the "CD001" identifier at the sector's own byte offset
+ * 1 -- the same signature ISO-1 already verified via direct UEFI file
+ * I/O, now confirmed reachable through the emulated AHCI/ATAPI
+ * hardware path instead.
+ */
+static void run_iso_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
+    uint64_t cmd_list_phys, cmd_table_phys, rx_fis_phys, dest_phys;
+    const uint8_t *iso_bytes;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("iso-2: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_iso_2_cmd_list, sizeof(g_iso_2_cmd_list));
+    hype_guest_ram_zero(g_iso_2_cmd_table, sizeof(g_iso_2_cmd_table));
+    hype_guest_ram_zero(g_iso_2_rx_fis, sizeof(g_iso_2_rx_fis));
+    hype_guest_ram_zero(g_iso_2_dest_buffer, sizeof(g_iso_2_dest_buffer));
+    hype_guest_ram_zero(g_iso_2_guest_code, sizeof(g_iso_2_guest_code));
+    hype_guest_ram_zero(g_iso_2_guest_stack, sizeof(g_iso_2_guest_stack));
+
+    hype_atapi_reset(&g_iso_2_atapi, (uint8_t *)(uintptr_t)g_iso_host_phys, (uint32_t)g_iso_size);
+    hype_ahci_reset(&g_iso_2_ahci);
+
+    cmd_list_phys = (uint64_t)(uintptr_t)g_iso_2_cmd_list;
+    cmd_table_phys = (uint64_t)(uintptr_t)g_iso_2_cmd_table;
+    rx_fis_phys = (uint64_t)(uintptr_t)g_iso_2_rx_fis;
+    dest_phys = (uint64_t)(uintptr_t)g_iso_2_dest_buffer;
+
+    hype_write_le32(g_iso_2_cmd_list + 0, 0x00010025u);
+    hype_write_le32(g_iso_2_cmd_list + 4, 0);
+    hype_write_le32(g_iso_2_cmd_list + 8, (uint32_t)cmd_table_phys);
+    hype_write_le32(g_iso_2_cmd_list + 12, (uint32_t)(cmd_table_phys >> 32));
+
+    g_iso_2_cmd_table[0] = 0x27;
+    g_iso_2_cmd_table[1] = 0x80;
+    g_iso_2_cmd_table[2] = 0xA0;
+    g_iso_2_cmd_table[0x40 + 0] = HYPE_ATAPI_CMD_READ10;
+    g_iso_2_cmd_table[0x40 + 5] = HYPE_ISO_2_PVD_LBA; /* LBA low byte */
+    g_iso_2_cmd_table[0x40 + 8] = 1;                  /* transfer length: 1 block */
+    hype_write_le32(g_iso_2_cmd_table + 0x80 + 0, (uint32_t)dest_phys);
+    hype_write_le32(g_iso_2_cmd_table + 0x80 + 4, (uint32_t)(dest_phys >> 32));
+    hype_write_le32(g_iso_2_cmd_table + 0x80 + 12, HYPE_ATAPI_SECTOR_SIZE - 1u);
+
+    for (i = 0; i < sizeof(g_m4_5_payload_template); i++) {
+        g_iso_2_guest_code[i] = g_m4_5_payload_template[i];
+    }
+    hype_write_le64(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_RBX_IMM_OFFSET, HYPE_ISO_2_AHCI_GPA);
+    hype_write_le32(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_CLB_LOW_IMM_OFFSET, (uint32_t)cmd_list_phys);
+    hype_write_le32(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_CLB_HIGH_IMM_OFFSET,
+                     (uint32_t)(cmd_list_phys >> 32));
+    hype_write_le32(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_FB_LOW_IMM_OFFSET, (uint32_t)rx_fis_phys);
+    hype_write_le32(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_FB_HIGH_IMM_OFFSET,
+                     (uint32_t)(rx_fis_phys >> 32));
+
+    entry_rip = (uint64_t)(uintptr_t)g_iso_2_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_iso_2_guest_stack + sizeof(g_iso_2_guest_stack));
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+    hype_npt_mark_not_present(g_npt_pd, HYPE_ISO_2_AHCI_GPA);
+    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+
+    hype_debug_print("iso-2: entry_rip=0x%llx ahci_gpa=0x%llx reading real ISO LBA %u\n",
+                      (unsigned long long)entry_rip, (unsigned long long)HYPE_ISO_2_AHCI_GPA,
+                      HYPE_ISO_2_PVD_LBA);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    if (ctx == 0) {
+        hype_fatal("iso-2: vcpu_create_long_mode failed");
+    }
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("iso-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+            if (hype_svm_vcpu_handle_ahci_npf(ctx, &g_iso_2_ahci, &g_iso_2_atapi, HYPE_ISO_2_AHCI_GPA) !=
+                0) {
+                hype_fatal("iso-2: unhandled/unrecognized AHCI MMIO access (qual=0x%llx guest_rip=0x%llx)",
+                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("iso-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+
+    iso_bytes = (const uint8_t *)(uintptr_t)g_iso_host_phys;
+    for (i = 0; i < HYPE_ATAPI_SECTOR_SIZE; i++) {
+        uint64_t file_offset = (uint64_t)HYPE_ISO_2_PVD_LBA * HYPE_ATAPI_SECTOR_SIZE + i;
+        if (g_iso_2_dest_buffer[i] != iso_bytes[file_offset]) {
+            hype_fatal("iso-2: AHCI/ATAPI READ(10) mismatch at byte %llu: got 0x%x, expected 0x%x", i,
+                       g_iso_2_dest_buffer[i], iso_bytes[file_offset]);
+        }
+    }
+    if (g_iso_2_dest_buffer[1] != 'C' || g_iso_2_dest_buffer[2] != 'D' || g_iso_2_dest_buffer[3] != '0' ||
+        g_iso_2_dest_buffer[4] != '0' || g_iso_2_dest_buffer[5] != '1') {
+        hype_fatal("iso-2: \"CD001\" identifier missing from the AHCI/ATAPI-read sector");
+    }
+
+    hype_debug_print(
+        "iso-2: AHCI/ATAPI test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- real ISO LBA "
+        "%u read byte-for-byte via emulated hardware, \"CD001\" identifier verified\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_ISO_2_PVD_LBA);
 }
 
 /*
@@ -2294,6 +2439,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_ram_1_test(args->ops, args->kind);
     run_pci_1_test(args->ops, args->kind);
     run_pci_2_test(args->ops, args->kind);
+    run_iso_2_test(args->ops, args->kind);
     run_fw_1_test(args->ops, args->kind);
 }
 
@@ -2598,6 +2744,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "iso-1: read a real %llu-byte ISO9660 image from \\iso\\test.iso, \"CD001\" "
                 "identifier verified at offset 32769\n",
                 (unsigned long long)iso_size);
+
+            g_iso_host_phys = iso_host_phys;
+            g_iso_size = iso_size;
         }
 
         args.ops = ops;
