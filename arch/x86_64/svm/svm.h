@@ -19,6 +19,7 @@
 #include "../../../devices/ps2_mouse.h"
 #include "../../../devices/bochs_vbe.h"
 #include "../../../devices/virtio_blk.h"
+#include "../../../devices/ata_disk.h"
 #include "vmcb.h"
 
 /*
@@ -546,6 +547,47 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw);
  */
 int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
                                    uint64_t ahci_base_phys);
+
+/*
+ * M5-2's counterpart to hype_svm_vcpu_handle_ahci_npf() above -- same
+ * hype_ahci_t register model and NPF/PxCI-write trigger, but for a
+ * SECOND, independent AHCI controller instance backing a plain ATA
+ * disk (devices/ata_disk.h) rather than the ATAPI optical drive. Two
+ * separate controller instances rather than a second port on the
+ * existing one: hype_ahci_t was written for exactly one port (see its
+ * own top comment) -- extending it to genuinely multi-port would mean
+ * touching M4-5's already-tested code for no real benefit, when two
+ * independent single-port controllers (a real, valid hardware
+ * topology too) get the same result with zero risk to working code.
+ *
+ * Dispatches on the H2D Register FIS's own command byte (hype_ahci_
+ * decode_h2d_fis(), not the Command Header's "A"/ATAPI bit this
+ * project's existing ATAPI path uses) to IDENTIFY DEVICE, READ DMA
+ * EXT, WRITE DMA EXT, or FLUSH CACHE EXT; anything else is rejected
+ * (-1) as an unrecognized command, this project's own scope not
+ * modeling the rest of the ATA command set. READ/WRITE DMA EXT bounds-
+ * check the resolved LBA range (hype_ata_disk_range_in_bounds(),
+ * "0 count means 65536 sectors" already resolved via hype_ata_disk_
+ * resolve_sector_count()) before touching the backing buffer at all,
+ * reporting IDNF (ID Not Found, error register 0x10) with the ERR
+ * status bit set on an out-of-range request rather than silently
+ * reading/writing past the disk's own end. Streams through the PRDT
+ * list exactly like the existing ATAPI path (same chunking loop), just
+ * in whichever direction (guest<-backing-store for reads/IDENTIFY,
+ * backing-store<-guest for writes) the command requires. Builds the
+ * D2H completion FIS the same way the ATAPI path already does (status/
+ * error registers, PxTFD, PxIS D2H-FIS bit, PxCI slot-0 clear).
+ * Advances RIP past the decoded instruction (delegated to the same
+ * bounds-check + hype_mmio_decode() shape hype_svm_vcpu_handle_
+ * ahci_npf() already uses for PxCI writes).
+ * Exempt from unit testing -- reaches into the exempt VMCB fields this
+ * backend's real VMRUN produces and walks guest memory directly;
+ * hype_ahci_decode_cmd_header()/_decode_prdt_entry()/_decode_h2d_fis(),
+ * hype_ata_disk_build_identify()/_resolve_sector_count()/
+ * _range_in_bounds() are all already fully tested in isolation.
+ */
+int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_ata_disk_t *disk,
+                                        uint64_t ahci_base_phys);
 
 /*
  * Handles an NPF (PCI-1) VM-exit against `pci`, this project's own

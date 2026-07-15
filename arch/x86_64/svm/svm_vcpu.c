@@ -781,6 +781,179 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
     return 0;
 }
 
+/* Fills the D2H (Device to Host) completion FIS and clears PxCI's slot
+ * 0 -- shared tail shape between the ATAPI and plain-ATA command
+ * paths, byte-for-byte the same fields process_ahci_command_slot0()
+ * already builds for ATAPI. */
+static void complete_ahci_command_slot0(hype_ahci_t *ahci, uint64_t rx_fis_phys, uint8_t status_reg,
+                                         uint8_t error_reg) {
+    uint8_t *d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_phys + 0x40);
+    unsigned i;
+
+    ahci->p_tfd = (uint32_t)status_reg | ((uint32_t)error_reg << 8);
+
+    for (i = 0; i < 20; i++) {
+        d2h_fis[i] = 0;
+    }
+    d2h_fis[0] = 0x34; /* FIS type: Register - Device to Host */
+    d2h_fis[2] = status_reg;
+    d2h_fis[3] = error_reg;
+
+    ahci->p_ci &= ~0x1u;
+    ahci->p_is |= (1u << 6);
+}
+
+/* M5-2's plain-ATA command dispatch, the H2D-FIS-command-byte-driven
+ * counterpart to process_ahci_command_slot0()'s own ATAPI-only path.
+ * Returns -1 for anything that isn't this handler's command (the
+ * Command Header carries an ATAPI PACKET, or the H2D FIS isn't a valid
+ * command FIS at all, or the command byte isn't one this project
+ * models) so the caller can fall through to whichever other handler
+ * actually owns it. */
+static int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
+    uint64_t cmd_list_phys = (uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32);
+    uint64_t rx_fis_phys = (uint64_t)ahci->p_fb | ((uint64_t)ahci->p_fbu << 32);
+    const uint8_t *cmd_hdr_bytes = (const uint8_t *)(uintptr_t)cmd_list_phys;
+    hype_ahci_cmd_header_t hdr;
+    const uint8_t *cmd_table_bytes;
+    const uint8_t *prdt_bytes;
+    hype_ahci_h2d_fis_t fis;
+    uint8_t identify[HYPE_ATA_IDENTIFY_SIZE];
+    const uint8_t *src = 0;
+    uint8_t *dst_media = 0;
+    uint32_t remaining;
+    uint32_t prd_idx;
+    uint8_t status_reg;
+    uint8_t error_reg;
+    int is_write_direction = 0;
+
+    hype_ahci_decode_cmd_header(cmd_hdr_bytes, &hdr);
+    if (hdr.is_atapi) {
+        return -1; /* not this handler's command -- the ATAPI path owns it */
+    }
+
+    cmd_table_bytes = (const uint8_t *)(uintptr_t)hdr.cmd_table_phys;
+    if (cmd_table_bytes[0] != 0x27u || (cmd_table_bytes[1] & 0x80u) == 0u) {
+        return -1; /* not a valid H2D Register FIS carrying a command */
+    }
+    hype_ahci_decode_h2d_fis(cmd_table_bytes, &fis);
+
+    status_reg = HYPE_ATA_STATUS_DRDY;
+    error_reg = 0;
+    remaining = 0;
+
+    if (fis.command == HYPE_ATA_CMD_IDENTIFY_DEVICE) {
+        hype_ata_disk_build_identify(disk, identify);
+        src = identify;
+        remaining = HYPE_ATA_IDENTIFY_SIZE;
+    } else if (fis.command == HYPE_ATA_CMD_READ_DMA_EXT) {
+        uint32_t sector_count = hype_ata_disk_resolve_sector_count(fis.count);
+        if (hype_ata_disk_range_in_bounds(disk, fis.lba, sector_count)) {
+            src = disk->media + fis.lba * HYPE_ATA_SECTOR_SIZE;
+            remaining = sector_count * HYPE_ATA_SECTOR_SIZE;
+        } else {
+            status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
+            error_reg = 0x10u; /* IDNF -- ID Not Found, the real ATA convention for an out-of-range LBA */
+        }
+    } else if (fis.command == HYPE_ATA_CMD_WRITE_DMA_EXT) {
+        uint32_t sector_count = hype_ata_disk_resolve_sector_count(fis.count);
+        is_write_direction = 1;
+        if (hype_ata_disk_range_in_bounds(disk, fis.lba, sector_count)) {
+            dst_media = disk->media + fis.lba * HYPE_ATA_SECTOR_SIZE;
+            remaining = sector_count * HYPE_ATA_SECTOR_SIZE;
+        } else {
+            status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
+            error_reg = 0x10u;
+        }
+    } else if (fis.command == HYPE_ATA_CMD_FLUSH_CACHE_EXT) {
+        /* Nothing to stream -- an immediate, no-data completion. */
+    } else {
+        return -1; /* unrecognized command -- outside this project's own modeled ATA subset */
+    }
+
+    prdt_bytes = cmd_table_bytes + 0x80;
+    prd_idx = 0;
+    while (remaining > 0 && prd_idx < hdr.prdtl) {
+        hype_ahci_prdt_entry_t prd;
+        uint32_t chunk;
+        uint32_t j;
+
+        hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)prd_idx * 16u, &prd);
+        chunk = (prd.byte_count < remaining) ? prd.byte_count : remaining;
+
+        if (is_write_direction) {
+            const uint8_t *guest_src = (const uint8_t *)(uintptr_t)prd.data_phys;
+            for (j = 0; j < chunk; j++) {
+                dst_media[j] = guest_src[j];
+            }
+            dst_media += chunk;
+        } else {
+            uint8_t *guest_dst = (uint8_t *)(uintptr_t)prd.data_phys;
+            for (j = 0; j < chunk; j++) {
+                guest_dst[j] = src[j];
+            }
+            src += chunk;
+        }
+        remaining -= chunk;
+        prd_idx++;
+    }
+
+    complete_ahci_command_slot0(ahci, rx_fis_phys, status_reg, error_reg);
+    return 0;
+}
+
+int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_ata_disk_t *disk,
+                                        uint64_t ahci_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < ahci_base_phys ||
+        npf.guest_phys_addr >= ahci_base_phys + HYPE_AHCI_MMIO_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - ahci_base_phys);
+
+    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+
+    reg = gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
+            if (process_ahci_ata_command_slot0(ahci, disk) != 0) {
+                return -1;
+            }
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_ahci_mmio_read(ahci, offset, decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uint64_t ecam_base_phys) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_npf_t npf;

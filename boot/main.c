@@ -3725,6 +3725,368 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 }
 
 /*
+ * M5-2: a plain ATA hard-disk device (devices/ata_disk.h) behind its
+ * own, second AHCI HBA instance -- genuine ATA commands (IDENTIFY
+ * DEVICE, READ/WRITE DMA EXT) via a Register H2D FIS, no ATAPI/SCSI-
+ * CDB indirection at all (M4-5's own, entirely separate optical
+ * drive). A second, independent hype_ahci_t/PCI function rather than
+ * a second port on the existing single-port model -- see devices/
+ * ata_disk.h's own top comment for why.
+ *
+ * Reuses M4-5/PCI-2's own exact PCI-discovery-then-port-bring-up
+ * payload shape (GHC.AE, CLB/CLBU, FB/FBU, PxCMD ST|FRE, PxCI
+ * trigger+poll) verbatim for its own first command, then demonstrates
+ * that a single AHCI port can issue a SEQUENCE of distinct ATA
+ * commands (this project's own single-command-slot scope, one at a
+ * time, not concurrently) by patching the same Command Table's own
+ * FIS command/LBA bytes and PRDT entry in place between commands --
+ * ordinary (non-intercepted) guest-RAM writes, no different from
+ * VIDEO-3/M5-1's own direct buffer writes, since the Command
+ * Table/List/PRDT never NPT-trap (only the AHCI MMIO BAR itself
+ * does). Three commands in one run: IDENTIFY DEVICE (proving command
+ * dispatch + PRDT streaming for a no-LBA command), WRITE DMA EXT
+ * (guest-supplied pattern -> backing store at one sector), READ DMA
+ * EXT (backing store, pre-filled by the host at a different sector,
+ * -> a guest destination buffer) -- exercising both data directions
+ * the same way M5-1's own virtio-blk test does.
+ */
+static uint8_t g_m5_2_cmd_list[1024] __attribute__((aligned(4096)));
+static uint8_t g_m5_2_cmd_table[4096] __attribute__((aligned(4096)));
+static uint8_t g_m5_2_rx_fis[4096] __attribute__((aligned(4096)));
+static uint8_t g_m5_2_guest_code[512] __attribute__((aligned(4096)));
+static uint8_t g_m5_2_guest_stack[4096] __attribute__((aligned(4096)));
+static uint8_t g_m5_2_media[0x10000] __attribute__((aligned(4096))); /* 128 sectors */
+static uint8_t g_m5_2_identify_result[512] __attribute__((aligned(4096)));
+static uint8_t g_m5_2_write_data[16] __attribute__((aligned(4096)));
+static uint8_t g_m5_2_read_dest[16] __attribute__((aligned(4096)));
+static hype_pci_t g_m5_2_pci;
+static hype_ahci_t g_m5_2_ahci;
+static hype_ata_disk_t g_m5_2_disk;
+
+#define HYPE_M5_2_ATA_DISK_DEV 1u
+/* Same "arbitrary offset from an existing constant, always NPT-
+ * trapped so real backing doesn't matter" scheme M4-5/PCI-2/VIDEO-3/
+ * M5-1 all already established. */
+#define HYPE_M5_2_AHCI_GPA (HYPE_M4_3_PFLASH_GPA + 4ULL * 1024 * 1024)
+#define HYPE_M5_2_WRITE_SECTOR 5ull
+#define HYPE_M5_2_READ_SECTOR 20ull
+#define HYPE_M5_2_DATA_LEN 16u
+
+/*
+ * Section A/B (RBX = ECAM base, then RBX = AHCI addr): PCI discovery +
+ * port bring-up, byte-for-byte identical to g_pci_2_payload_template's
+ * own AHCI setup sequence -- triggers the host-pre-built command 1
+ * (IDENTIFY DEVICE, already sitting in slot 0) and polls for it.
+ * Section C (RBX = Command Table addr): patches command byte + LBA/
+ * device fields + PRDT DBA/DBC in place for command 2 (WRITE DMA EXT),
+ * then (RBX = AHCI addr again) triggers + polls it.
+ * Section D: same patch-then-trigger-then-poll shape for command 3
+ * (READ DMA EXT).
+ *
+ *   [-- identical to g_pci_2_payload_template through its own poll --]
+ *   mov rbx, <patched: Command Table addr>       48 BB 00*8
+ *   mov al, 0x35 (WRITE DMA EXT)                  B0 35
+ *   mov [rbx+2], al                                88 83 02 00 00 00
+ *   mov eax, 0x40000005 (device=0x40, LBA=5)       B8 05 00 00 40
+ *   mov [rbx+4], eax                               89 83 04 00 00 00
+ *   mov eax, <patched: write_data addr>            B8 00*4
+ *   mov [rbx+0x80], eax  (PRDT DBA)                89 83 80 00 00 00
+ *   mov eax, 15  (PRDT DBC = len-1)                B8 0F 00 00 00
+ *   mov [rbx+0x8C], eax                            89 83 8C 00 00 00
+ *   mov rbx, <patched: AHCI addr>                  48 BB 00*8
+ *   mov eax, 1                                     B8 01 00 00 00
+ *   mov [rbx+0x138], eax  (PxCI trigger)           89 83 38 01 00 00
+ * poll2:
+ *   mov eax, [rbx+0x138]                           8B 83 38 01 00 00
+ *   test eax, eax                                   85 C0
+ *   jnz poll2                                        75 F6
+ *   mov rbx, <patched: Command Table addr>         48 BB 00*8
+ *   mov al, 0x25 (READ DMA EXT)                     B0 25
+ *   mov [rbx+2], al                                 88 83 02 00 00 00
+ *   mov eax, 0x40000014 (device=0x40, LBA=20)       B8 14 00 00 40
+ *   mov [rbx+4], eax                                89 83 04 00 00 00
+ *   mov eax, <patched: read_dest addr>              B8 00*4
+ *   mov [rbx+0x80], eax                              89 83 80 00 00 00
+ *   mov eax, 15                                      B8 0F 00 00 00
+ *   mov [rbx+0x8C], eax                              89 83 8C 00 00 00
+ *   mov rbx, <patched: AHCI addr>                    48 BB 00*8
+ *   mov eax, 1                                       B8 01 00 00 00
+ *   mov [rbx+0x138], eax                             89 83 38 01 00 00
+ * poll3:
+ *   mov eax, [rbx+0x138]                             8B 83 38 01 00 00
+ *   test eax, eax                                     85 C0
+ *   jnz poll3                                          75 F6
+ *   hlt                                                F4
+ *   jmp $-3                                            EB FD
+ */
+static const uint8_t g_m5_2_payload_template[] = {
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x24, 0x80, 0x00, 0x00,
+    0xB8, 0x02, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x04, 0x80, 0x00, 0x00,
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x80,
+    0x89, 0x43, 0x04,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x00, 0x01, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x04, 0x01, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x08, 0x01, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x0C, 0x01, 0x00, 0x00,
+    0xB8, 0x11, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x18, 0x01, 0x00, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x8B, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x85, 0xC0,
+    0x75, 0xF6,
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB0, 0x35,
+    0x88, 0x83, 0x02, 0x00, 0x00, 0x00,
+    0xB8, 0x05, 0x00, 0x00, 0x40,
+    0x89, 0x83, 0x04, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x80, 0x00, 0x00, 0x00,
+    0xB8, 0x0F, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x8C, 0x00, 0x00, 0x00,
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x8B, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x85, 0xC0,
+    0x75, 0xF6,
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB0, 0x25,
+    0x88, 0x83, 0x02, 0x00, 0x00, 0x00,
+    0xB8, 0x14, 0x00, 0x00, 0x40,
+    0x89, 0x83, 0x04, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x80, 0x00, 0x00, 0x00,
+    0xB8, 0x0F, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x8C, 0x00, 0x00, 0x00,
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x8B, 0x83, 0x38, 0x01, 0x00, 0x00,
+    0x85, 0xC0,
+    0x75, 0xF6,
+    0xF4,
+    0xEB, 0xFD
+};
+#define HYPE_M5_2_PAYLOAD_ECAM_RBX_IMM_OFFSET 2
+#define HYPE_M5_2_PAYLOAD_BAR5_VALUE_IMM_OFFSET 11
+#define HYPE_M5_2_PAYLOAD_AHCI_RBX_IMM_OFFSET 34
+#define HYPE_M5_2_PAYLOAD_CLB_LOW_IMM_OFFSET 51
+#define HYPE_M5_2_PAYLOAD_CLB_HIGH_IMM_OFFSET 62
+#define HYPE_M5_2_PAYLOAD_FB_LOW_IMM_OFFSET 73
+#define HYPE_M5_2_PAYLOAD_FB_HIGH_IMM_OFFSET 84
+#define HYPE_M5_2_PAYLOAD_TABLE_RBX_1_IMM_OFFSET 128
+#define HYPE_M5_2_PAYLOAD_WRITE_DATA_ADDR_IMM_OFFSET 156
+#define HYPE_M5_2_PAYLOAD_AHCI_RBX_2_IMM_OFFSET 179
+#define HYPE_M5_2_PAYLOAD_TABLE_RBX_2_IMM_OFFSET 210
+#define HYPE_M5_2_PAYLOAD_READ_DEST_ADDR_IMM_OFFSET 238
+#define HYPE_M5_2_PAYLOAD_AHCI_RBX_3_IMM_OFFSET 261
+
+static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
+    uint64_t cmd_list_phys, cmd_table_phys, rx_fis_phys;
+    uint64_t identify_phys, write_data_phys, read_dest_phys;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+    int ahci_mapped;
+    uint64_t ahci_mapped_base;
+    uint64_t write_sector_offset, read_sector_offset;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("m5-2: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_m5_2_cmd_list, sizeof(g_m5_2_cmd_list));
+    hype_guest_ram_zero(g_m5_2_cmd_table, sizeof(g_m5_2_cmd_table));
+    hype_guest_ram_zero(g_m5_2_rx_fis, sizeof(g_m5_2_rx_fis));
+    hype_guest_ram_zero(g_m5_2_guest_code, sizeof(g_m5_2_guest_code));
+    hype_guest_ram_zero(g_m5_2_guest_stack, sizeof(g_m5_2_guest_stack));
+    hype_guest_ram_zero(g_m5_2_media, sizeof(g_m5_2_media));
+    hype_guest_ram_zero(g_m5_2_identify_result, sizeof(g_m5_2_identify_result));
+    hype_guest_ram_zero(g_m5_2_write_data, sizeof(g_m5_2_write_data));
+    hype_guest_ram_zero(g_m5_2_read_dest, sizeof(g_m5_2_read_dest));
+
+    for (i = 0; i < HYPE_M5_2_DATA_LEN; i++) {
+        g_m5_2_write_data[i] = (uint8_t)(0xC0u + i);
+    }
+    read_sector_offset = HYPE_M5_2_READ_SECTOR * HYPE_ATA_SECTOR_SIZE;
+    for (i = 0; i < HYPE_M5_2_DATA_LEN; i++) {
+        g_m5_2_media[read_sector_offset + i] = (uint8_t)(0xD0u + i);
+    }
+
+    hype_ata_disk_reset(&g_m5_2_disk, g_m5_2_media, sizeof(g_m5_2_media));
+    hype_ahci_reset(&g_m5_2_ahci);
+    hype_pci_reset(&g_m5_2_pci);
+    hype_pci_add_device(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV, HYPE_PCI_VENDOR_ID_HYPE, 0x0004u, 0x01, 0x06,
+                         0x01);
+    hype_pci_set_bar_size(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV, 5, 0x1000u);
+
+    cmd_list_phys = (uint64_t)(uintptr_t)g_m5_2_cmd_list;
+    cmd_table_phys = (uint64_t)(uintptr_t)g_m5_2_cmd_table;
+    rx_fis_phys = (uint64_t)(uintptr_t)g_m5_2_rx_fis;
+    identify_phys = (uint64_t)(uintptr_t)g_m5_2_identify_result;
+    write_data_phys = (uint64_t)(uintptr_t)g_m5_2_write_data;
+    read_dest_phys = (uint64_t)(uintptr_t)g_m5_2_read_dest;
+
+    /* Command Header slot 0: CFL=5 (unused by this project's own ATA
+     * dispatch), prdtl=1 -- stays fixed across all 3 commands, only
+     * the Command Table's own FIS/PRDT bytes change between them. */
+    hype_write_le32(g_m5_2_cmd_list + 0, 0x00010005u);
+    hype_write_le32(g_m5_2_cmd_list + 4, 0);
+    hype_write_le32(g_m5_2_cmd_list + 8, (uint32_t)cmd_table_phys);
+    hype_write_le32(g_m5_2_cmd_list + 12, (uint32_t)(cmd_table_phys >> 32));
+
+    /* Command Table: H2D Register FIS pre-built for command 1
+     * (IDENTIFY DEVICE) -- the guest's own asm triggers this one
+     * as-is, then patches command/LBA/PRDT bytes in place for
+     * commands 2 and 3. */
+    g_m5_2_cmd_table[0] = 0x27;
+    g_m5_2_cmd_table[1] = 0x80;
+    g_m5_2_cmd_table[2] = HYPE_ATA_CMD_IDENTIFY_DEVICE;
+    /* Count field (bytes 12-13): IDENTIFY ignores it, but WRITE/READ
+     * DMA EXT (commands 2/3) both want exactly 1 sector -- the guest's
+     * own asm never patches these two bytes between commands (nothing
+     * else needs to change here), so setting it once, here, is enough
+     * for all 3 commands. Left at 0 this would resolve to 65536 via
+     * the real "0 means max" convention, failing WRITE/READ's own
+     * bounds check against this test's 128-sector disk. */
+    g_m5_2_cmd_table[12] = 1;
+    g_m5_2_cmd_table[13] = 0;
+    hype_write_le32(g_m5_2_cmd_table + 0x80 + 0, (uint32_t)identify_phys);
+    hype_write_le32(g_m5_2_cmd_table + 0x80 + 4, (uint32_t)(identify_phys >> 32));
+    hype_write_le32(g_m5_2_cmd_table + 0x80 + 12, HYPE_ATA_IDENTIFY_SIZE - 1u);
+
+    for (i = 0; i < sizeof(g_m5_2_payload_template); i++) {
+        g_m5_2_guest_code[i] = g_m5_2_payload_template[i];
+    }
+    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_ECAM_RBX_IMM_OFFSET, HYPE_PCI_1_ECAM_GPA);
+    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_BAR5_VALUE_IMM_OFFSET,
+                     (uint32_t)HYPE_M5_2_AHCI_GPA);
+    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_AHCI_RBX_IMM_OFFSET, HYPE_M5_2_AHCI_GPA);
+    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_CLB_LOW_IMM_OFFSET, (uint32_t)cmd_list_phys);
+    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_CLB_HIGH_IMM_OFFSET,
+                     (uint32_t)(cmd_list_phys >> 32));
+    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_FB_LOW_IMM_OFFSET, (uint32_t)rx_fis_phys);
+    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_FB_HIGH_IMM_OFFSET,
+                     (uint32_t)(rx_fis_phys >> 32));
+    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_TABLE_RBX_1_IMM_OFFSET, cmd_table_phys);
+    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_WRITE_DATA_ADDR_IMM_OFFSET,
+                     (uint32_t)write_data_phys);
+    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_AHCI_RBX_2_IMM_OFFSET, HYPE_M5_2_AHCI_GPA);
+    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_TABLE_RBX_2_IMM_OFFSET, cmd_table_phys);
+    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_READ_DEST_ADDR_IMM_OFFSET,
+                     (uint32_t)read_dest_phys);
+    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_AHCI_RBX_3_IMM_OFFSET, HYPE_M5_2_AHCI_GPA);
+
+    entry_rip = (uint64_t)(uintptr_t)g_m5_2_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_m5_2_guest_stack + sizeof(g_m5_2_guest_stack));
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+    hype_npt_mark_not_present(g_npt_pd, HYPE_PCI_1_ECAM_GPA);
+    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+
+    hype_debug_print("m5-2: entry_rip=0x%llx ecam_gpa=0x%llx chosen_ahci_gpa=0x%llx\n",
+                      (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
+                      (unsigned long long)HYPE_M5_2_AHCI_GPA);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    if (ctx == 0) {
+        hype_fatal("m5-2: vcpu_create_long_mode failed");
+    }
+
+    ahci_mapped = 0;
+    ahci_mapped_base = 0;
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("m5-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_m5_2_pci, HYPE_PCI_1_ECAM_GPA) == 0) {
+                if (!ahci_mapped &&
+                    hype_pci_memory_space_enabled(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV)) {
+                    uint64_t bar5 = hype_pci_get_bar_value(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV, 5);
+                    if (bar5 != 0) {
+                        hype_npt_mark_not_present(g_npt_pd, bar5);
+                        ahci_mapped_base = bar5;
+                        ahci_mapped = 1;
+                        hype_debug_print("m5-2: ATA disk BAR5 enabled at 0x%llx -- NPT-mapping it now\n",
+                                          (unsigned long long)bar5);
+                    }
+                }
+                continue;
+            }
+
+            if (ahci_mapped &&
+                hype_svm_vcpu_handle_ahci_disk_npf(ctx, &g_m5_2_ahci, &g_m5_2_disk, ahci_mapped_base) ==
+                    0) {
+                continue;
+            }
+
+            hype_fatal("m5-2: unhandled NPF (qual=0x%llx guest_rip=0x%llx)",
+                       (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("m5-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+    if (!ahci_mapped || ahci_mapped_base != HYPE_M5_2_AHCI_GPA) {
+        hype_fatal("m5-2: ATA disk device was never dynamically mapped at the chosen BAR5 address");
+    }
+
+    /* IDENTIFY DEVICE round trip. Word 0's bit 15 lives in its own
+     * HIGH byte (byte 1 of the little-endian word), not byte 0. */
+    if ((g_m5_2_identify_result[1] & 0x80u) != 0) {
+        hype_fatal("m5-2: IDENTIFY DEVICE word 0 bit 15 (ATAPI) is set on what should be an ATA device");
+    }
+    if ((g_m5_2_identify_result[99] & 0x02u) == 0) {
+        hype_fatal("m5-2: IDENTIFY DEVICE word 49 does not report LBA support");
+    }
+    if ((g_m5_2_identify_result[167] & 0x04u) == 0) {
+        hype_fatal("m5-2: IDENTIFY DEVICE word 83 does not report LBA48 support");
+    }
+
+    /* WRITE DMA EXT round trip. */
+    write_sector_offset = HYPE_M5_2_WRITE_SECTOR * HYPE_ATA_SECTOR_SIZE;
+    for (i = 0; i < HYPE_M5_2_DATA_LEN; i++) {
+        if (g_m5_2_media[write_sector_offset + i] != (uint8_t)(0xC0u + i)) {
+            hype_fatal("m5-2: WRITE DMA EXT did not persist correctly at byte %llu", i);
+        }
+    }
+
+    /* READ DMA EXT round trip. */
+    for (i = 0; i < HYPE_M5_2_DATA_LEN; i++) {
+        if (g_m5_2_read_dest[i] != (uint8_t)(0xD0u + i)) {
+            hype_fatal("m5-2: READ DMA EXT did not deliver the backing store's own data at byte %llu", i);
+        }
+    }
+
+    hype_debug_print(
+        "m5-2: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- ATA disk discovered via "
+        "PCI BAR5=0x%llx, IDENTIFY DEVICE + WRITE DMA EXT + READ DMA EXT all round-tripped correctly\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
+        (unsigned long long)ahci_mapped_base);
+}
+
+/*
  * FW-1: the first attempt at launching this project's own real,
  * unmodified vendored OVMF (M4-2) -- not a hand-written synthetic test
  * guest. Real-mode entry at the classic x86 reset vector, using the
@@ -4006,6 +4368,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_iso_2_test(args->ops, args->kind);
     run_video_3_test(args->ops, args->kind);
     run_m5_1_test(args->ops, args->kind);
+    run_m5_2_test(args->ops, args->kind);
     run_fw_1_test(args->ops, args->kind);
 }
 

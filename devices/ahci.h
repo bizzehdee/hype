@@ -169,4 +169,32 @@ typedef struct {
 /* Decodes a 16-byte PRDT entry. Pure bit extraction. */
 void hype_ahci_decode_prdt_entry(const uint8_t raw[16], hype_ahci_prdt_entry_t *out);
 
+/*
+ * M5-2: the H2D (Host-to-Device) Register FIS's own ATA-specific
+ * fields (byte offsets fetched and confirmed against QEMU's
+ * hw/ide/ahci.c handle_reg_h2d_fis() and the Linux kernel's own
+ * include/linux/ata.h, not reconstructed from memory) -- command
+ * (byte 2), the 48-bit LBA split across bytes 4-6 (LBA 23:0) and
+ * bytes 8-10 (LBA 47:24, the "HOB"/expanded bytes), device register
+ * (byte 7), and the 16-bit Count field (bytes 12-13). This project's
+ * existing ATAPI path (process_ahci_command_slot0(), arch/x86_64/svm/
+ * svm_vcpu.c) only ever checks byte 2 == 0xA0 (PACKET) inline; this
+ * decoder is for M5-2's own plain-ATA command path, which needs the
+ * LBA/count fields PACKET never carries.
+ */
+typedef struct {
+    uint8_t command;
+    uint64_t lba; /* full 48-bit value, already combined */
+    uint8_t device;
+    uint16_t count; /* raw Count field -- NOT yet resolved via the "0 means 65536" convention */
+} hype_ahci_h2d_fis_t;
+
+/* Decodes a 20-byte H2D Register FIS. Pure bit extraction, no guest-
+ * memory access -- the caller has already read these bytes out of
+ * guest memory (same split as every other decode function here). Does
+ * not validate FIS type (byte 0) or the C bit (byte 1, bit 7) -- the
+ * caller checks those itself, matching hype_ahci_decode_cmd_header()'s
+ * own "just extract bits, the caller validates context" convention. */
+void hype_ahci_decode_h2d_fis(const uint8_t raw[20], hype_ahci_h2d_fis_t *out);
+
 #endif /* HYPE_DEVICES_AHCI_H */

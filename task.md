@@ -1564,12 +1564,93 @@ Revisit this note when picking FW-1 back up.
   M5-3's own job ("blk_backend") -- this task's backing store is a
   fixed in-memory buffer, matching M4-3 pflash's own "primitive now,
   integration later" precedent.*
-- [ ] **M5-2** — AHCI guest-facing device.
+- [x] **M5-2** — AHCI guest-facing device.
   Deps: M4-5
+
+  *A plain ATA hard-disk device (`devices/ata_disk.h/.c`) -- genuine
+  ATA commands (IDENTIFY DEVICE, READ/WRITE DMA EXT) carried directly
+  in a SATA Register H2D FIS, no ATAPI/SCSI-CDB indirection at all
+  (M4-5's own, entirely separate optical drive). ATA command byte
+  values, the H2D FIS's own field layout, 48-bit LBA/count encoding,
+  IDENTIFY DEVICE response field offsets, and status-register
+  semantics were fetched and confirmed against the Linux kernel's own
+  `include/linux/ata.h` plus QEMU's `hw/ide/ahci.c`
+  (`handle_reg_h2d_fis()`), not reconstructed from memory.
+
+  Deliberately a SECOND, independent AHCI HBA/PCI function rather than
+  a second port on the existing single-port `hype_ahci_t` (M4-5) --
+  that struct was written for exactly one port total; extending it to
+  genuinely multi-port would mean touching M4-5's already-tested code
+  for no real benefit, when two independent single-port controllers
+  (a real, valid hardware topology too) get the same result with zero
+  risk to working code.
+
+  New `devices/ata_disk.h/.c`: `hype_ata_disk_build_identify()`
+  (a deliberately minimal 512-byte IDENTIFY response -- only the
+  fields a real driver actually checks: word 0 ATA-not-ATAPI, word 49
+  LBA support, words 60-61/83/86/100-103 LBA28/LBA48 capacity +
+  support/enabled bits, plus a fixed model/serial/firmware string,
+  byte-swapped per word per the real ATA convention),
+  `hype_ata_disk_resolve_sector_count()` (the real "0 means 65536"
+  convention for 48-bit EXT commands), `hype_ata_disk_range_in_bounds()`.
+  Extended `devices/ahci.h/.c` with `hype_ahci_decode_h2d_fis()` (pure
+  H2D Register FIS field extraction -- command/48-bit LBA/device/count
+  -- the existing ATAPI path only ever inline-checks byte 2 == 0xA0,
+  never decoding LBA/count at all). 100% line coverage across both
+  modules (`core/tests/test_ata_disk.c` new, 7 tests;
+  `core/tests/test_ahci.c` +1 test for the new decoder).
+
+  Exempt glue `hype_svm_vcpu_handle_ahci_disk_npf()`/
+  `process_ahci_ata_command_slot0()` (`arch/x86_64/svm/svm_vcpu.c`)
+  dispatches on the H2D FIS's own command byte (not the Command
+  Header's "A"/ATAPI bit); READ/WRITE DMA EXT bounds-check the
+  resolved LBA range before touching the backing buffer, reporting
+  IDNF (error 0x10, ERR status bit) on an out-of-range request rather
+  than reading/writing past the disk's own end. Streams through the
+  PRDT list with the same chunking loop the existing ATAPI path
+  already uses, just in whichever direction the command requires;
+  builds the D2H completion FIS via a small shared helper factored out
+  of (but not changing) the existing ATAPI completion code.
+
+  New synthetic test guest `run_m5_2_test()` (`boot/main.c`) reuses
+  M4-5/PCI-2's own PCI-discovery-then-port-bring-up payload verbatim,
+  then demonstrates a sequence of 3 distinct ATA commands on the same
+  single command slot (this project's own one-command-at-a-time
+  scope) by patching the Command Table's own FIS/PRDT bytes in place
+  between commands -- ordinary, non-intercepted guest-RAM writes, the
+  same as VIDEO-3/M5-1's own direct buffer writes, since the Command
+  Table never NPT-traps (only the AHCI MMIO BAR does): IDENTIFY DEVICE
+  (host-prebuilt, triggered as-is), then WRITE DMA EXT (guest pattern
+  -> backing store at one sector), then READ DMA EXT (backing store,
+  pre-filled by the host at a different sector, -> a guest buffer).
+
+  **Found and fixed one real bug during QEMU verification**: the H2D
+  FIS's own Count field (bytes 12-13) was left at 0 for every command
+  (the guest payload never patches it, since it's the same for both
+  data commands) -- resolved via the real "0 means 65536" convention,
+  this made WRITE/READ request 65536 sectors instead of 1, failing the
+  bounds check against the test's 128-sector disk and silently
+  streaming zero bytes. Fixed by having the host set Count=1 once,
+  covering all 3 commands (IDENTIFY ignores it). Clean run after that
+  fix -- all three commands round-tripped correctly.*
 - [ ] **M5-3** — `blk_backend` vtable + file-backed implementation (§6d),
   with guest LBA/length bounds-checking against the backing file's actual
   size per VALID-3.
   Deps: M5-1, M5-2, VALID-3
+
+  *Genuinely blocked, not just unstarted: VALID-3 (guest-supplied
+  address/length validation for AHCI/NVMe-class buffer pointers) is
+  still `[ ]`, and this task's own scope explicitly requires it
+  ("bounds-checking... per VALID-3") -- building blk_backend without
+  it would mean a real host-file-backed disk trusting raw guest LBA/
+  length values completely unchecked, exactly the class of gap
+  VALID-* exists to close project-wide. M5-5/M5-6 are further blocked
+  on M4-6 (real OVMF boot, itself blocked on FW-1's parked DXE fault)
+  and NET-5 (no networking work started at all). M5-1/M5-2 (this
+  session's own work) are the only pieces of M5 with no unmet
+  prerequisite -- a legitimate stopping point, matching FW-1's own
+  earlier "park it, note why, come back later" precedent rather than
+  building on top of an intentionally-skipped security control.*
 - [ ] **M5-4** — `/tools` disk-image prep script (`target_disk_size_gb`
   handling).
   Deps: M5-3

@@ -299,6 +299,36 @@ static void test_decode_prdt_entry(void) {
     CHECK_HEX("byte_count is DBC+1", 2048u, prd.byte_count);
 }
 
+static void test_decode_h2d_fis(void) {
+    uint8_t raw[20];
+    hype_ahci_h2d_fis_t fis;
+    unsigned i;
+
+    for (i = 0; i < 20; i++) {
+        raw[i] = 0;
+    }
+    raw[0] = 0x27;               /* FIS type: Register H2D */
+    raw[1] = 0x80;               /* C bit set */
+    raw[2] = 0x25; /* READ DMA EXT (devices/ata_disk.h's own HYPE_ATA_CMD_READ_DMA_EXT) */
+    raw[4] = 0x11;               /* LBA[7:0] */
+    raw[5] = 0x22;               /* LBA[15:8] */
+    raw[6] = 0x33;               /* LBA[23:16] */
+    raw[7] = 0x40;               /* Device register */
+    raw[8] = 0x44;               /* LBA[31:24] */
+    raw[9] = 0x55;               /* LBA[39:32] */
+    raw[10] = 0x66;              /* LBA[47:40] */
+    raw[12] = 0x34;              /* Count low */
+    raw[13] = 0x12;              /* Count high */
+
+    hype_ahci_decode_h2d_fis(raw, &fis);
+
+    CHECK_HEX("command decoded", 0x25u, fis.command);
+    CHECK_HEX("48-bit LBA decoded from both the low and expanded byte groups",
+              0x0000665544332211ULL, fis.lba);
+    CHECK_HEX("device register decoded", 0x40u, fis.device);
+    CHECK_HEX("16-bit count decoded", 0x1234u, fis.count);
+}
+
 int main(void) {
     test_reset_state();
     test_read_write_clb_fb();
@@ -313,6 +343,7 @@ int main(void) {
     test_decode_cmd_header();
     test_decode_cmd_header_write_bit();
     test_decode_prdt_entry();
+    test_decode_h2d_fis();
 
     if (failures == 0) {
         printf("all tests passed\n");

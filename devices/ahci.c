@@ -130,3 +130,13 @@ void hype_ahci_decode_prdt_entry(const uint8_t raw[16], hype_ahci_prdt_entry_t *
     out->data_phys = (uint64_t)dba | ((uint64_t)dbau << 32);
     out->byte_count = (dbc_i & 0x3FFFFFu) + 1u; /* DBC is bits 21:0, "byte count - 1" per spec */
 }
+
+void hype_ahci_decode_h2d_fis(const uint8_t raw[20], hype_ahci_h2d_fis_t *out) {
+    uint64_t lba_low24 = (uint64_t)raw[4] | ((uint64_t)raw[5] << 8) | ((uint64_t)raw[6] << 16);
+    uint64_t lba_high24 = (uint64_t)raw[8] | ((uint64_t)raw[9] << 8) | ((uint64_t)raw[10] << 16);
+
+    out->command = raw[2];
+    out->lba = lba_low24 | (lba_high24 << 24);
+    out->device = raw[7];
+    out->count = (uint16_t)(raw[12] | (raw[13] << 8));
+}
