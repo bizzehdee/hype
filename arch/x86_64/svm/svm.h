@@ -408,6 +408,25 @@ typedef struct {
      * also lives) not being fully/reliably populated for this specific
      * exit, rather than a one-off RIP-specific issue. */
     uint64_t exitinfo2;
+    /* Real-hardware investigation (rip=-1 / rflags=reset-value / cr2=0
+     * all seen together, an internally-inconsistent single-fault
+     * picture -- a data read of linear 0 cannot be executing at rip=-1).
+     * APM Vol 2 (24593 Rev 3.44) §15.7.2 / §15.20: EXITINTINFO (control
+     * 0x088) is written on #VMEXIT when the intercept fired *while the
+     * guest was delivering a prior interrupt/exception through its own
+     * IDT*. If VALID (bit 31) here, this #PF is a nested fault taken
+     * mid-delivery (e.g. the IDT/handler/stack page itself unmapped
+     * under FW-1's partial NPT), NOT the original faulting instruction
+     * -- which fully explains why the saved rip/rflags don't describe a
+     * clean single fault. If NOT valid, that hypothesis is dead and an
+     * erratum-class save-completeness issue moves to the front. Either
+     * way it is the single most decisive field for this puzzle, and
+     * reading it is free (already in the VMCB we hold). */
+    uint64_t exitintinfo;
+    /* control 0x0C8: NRIP, the address of the *next* instruction. For
+     * decode-assisted intercepts hardware fills this; captured as an
+     * independent cross-check on the save-area rip. */
+    uint64_t nrip;
 } hype_svm_debug_state_t;
 
 void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out);

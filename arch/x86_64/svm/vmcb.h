@@ -125,6 +125,31 @@ typedef struct {
 _Static_assert(sizeof(hype_vmcb_control_t) == 0x400, "VMCB control area must be exactly 1024 bytes");
 _Static_assert(sizeof(hype_vmcb_t) == 0x1000, "VMCB must be exactly one 4KB page");
 
+/*
+ * Per-field absolute-offset checks, transcribed directly from APM Vol 2
+ * (24593 Rev 3.44) Appendix B, Table B-2 -- the state-save area starts
+ * at 0x400 into the VMCB page, so a save-area-relative offset X is at
+ * absolute 0x400+X. The two size asserts above only catch a NET size
+ * error; two compensating mistakes on opposite sides of a field could
+ * pass them while still landing that field on the wrong bytes. These
+ * pin the exact fields the FW-1 real-hardware investigation reads, so
+ * "the struct member and the raw byte offset agree" is a compile-time
+ * guarantee, not something to re-verify with a hardware round trip.
+ * (__builtin_offsetof, not <stddef.h>'s offsetof -- freestanding.)
+ */
+_Static_assert(__builtin_offsetof(hype_vmcb_t, save) == 0x400, "state-save area must start at 0x400");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, save.cr4) == 0x548, "save.cr4 must be at 0x148 (abs 0x548)");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, save.cr3) == 0x550, "save.cr3 must be at 0x150 (abs 0x550)");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, save.cr0) == 0x558, "save.cr0 must be at 0x158 (abs 0x558)");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, save.rflags) == 0x570, "save.rflags must be at 0x170 (abs 0x570)");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, save.rip) == 0x578, "save.rip must be at 0x178 (abs 0x578)");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, save.rsp) == 0x5D8, "save.rsp must be at 0x1D8 (abs 0x5D8)");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, save.rax) == 0x5F8, "save.rax must be at 0x1F8 (abs 0x5F8)");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, save.cr2) == 0x640, "save.cr2 must be at 0x240 (abs 0x640)");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitinfo1) == 0x078, "control.exitinfo1 must be at 0x078");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitinfo2) == 0x080, "control.exitinfo2 must be at 0x080");
+_Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "control.exitintinfo must be at 0x088");
+
 /* Intercept bits this project actually sets (Table B-1). */
 #define HYPE_SVM_INTERCEPT_HLT (1u << 24)
 #define HYPE_SVM_INTERCEPT_SHUTDOWN (1u << 31)

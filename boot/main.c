@@ -4331,6 +4331,26 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_debug_print("fw-1: exitinfo2=0x%llx (cr2 above should match)\n",
                               (unsigned long long)dbg.exitinfo2);
 
+            /* THE decisive field for the rip=-1 / rflags=reset / cr2=0
+             * puzzle (APM Vol 2 24593 Rev 3.44 §15.7.2 / §15.20). A data
+             * read of linear 0 cannot be executing at rip=-1, so the
+             * saved rip/rflags don't describe a clean single fault. If
+             * EXITINTINFO's VALID bit (63:32 err, bit 11 err-valid, bit
+             * 31 VALID, 10:8 type, 7:0 vector) is set, this #PF was taken
+             * *while the guest was delivering a prior exception/interrupt
+             * through its own IDT* -- i.e. a nested fault (the IDT entry,
+             * the handler's code page, or the exception-frame stack page
+             * is itself unmapped under FW-1's deliberately-partial NPT),
+             * NOT the original faulting instruction. If VALID is clear,
+             * that whole theory is dead and this becomes an
+             * erratum-class save-completeness question. NRIP is captured
+             * as an independent cross-check on the save-area rip. */
+            hype_debug_print("fw-1: exitintinfo=0x%llx (valid=%u type=%u vec=%u) nrip=0x%llx\n",
+                              (unsigned long long)dbg.exitintinfo,
+                              (unsigned int)((dbg.exitintinfo >> 31) & 0x1ULL),
+                              (unsigned int)((dbg.exitintinfo >> 8) & 0x7ULL),
+                              (unsigned int)(dbg.exitintinfo & 0xFFULL), (unsigned long long)dbg.nrip);
+
             /* Real-hardware finding: dbg.rip itself can be an
              * implausible sentinel-looking value (observed: exactly
              * 0xFFFFFFFFFFFFFFFF, all bits set -- not a remotely

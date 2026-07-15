@@ -1371,6 +1371,76 @@ this same section, exists -- durable logging matters far more for
 this kind of narrow, low-level register-state puzzle than for a
 one-shot "does it panic" check).
 
+**Update (2026-07-15, APM Vol 2 review -- unparked the analysis, not
+the milestone).** Read AMD64 APM Vol 2 (24593 Rev 3.44), §15.5/§15.6/
+§15.7 and Appendix B Table B-2 directly (downloaded the real PDF, not
+reconstructed from memory), to attack the rip=-1 / rflags=0x2 / cr2=0
+real-hardware finding. Three of the four candidate causes are now
+formally eliminated, and the diagnostic is armed to settle the rest in
+one more capture:
+
+- ***"Hardware never saved rip/rflags" -- REFUTED by §15.6.*** On
+  #VMEXIT the CPU "writes back to the VMCB the current guest state --
+  the same subset ... as is loaded by the VMRUN instruction," and
+  §15.5's "Loading Guest State" list explicitly includes CS/rIP,
+  RFLAGS, RAX, SS/RSP. §15.5.2's VMLOAD/VMSAVE-only set is FS, GS, TR,
+  LDTR, KernelGsBase, STAR/LSTAR/CSTAR/SFMASK, SYSENTER_{CS,ESP,EIP}
+  -- rip/rflags are NOT in it. So rip/rflags ARE hardware-written on
+  every #VMEXIT; a "not populated" story is off the table. (And
+  svm_vcpu.c's vcpu_run DOES call vmload/vmsave around vmrun, so even
+  the VMLOAD-only fields are handled.)
+
+- ***"Cacheline/coherence staleness" -- REFUTED by the offset map.***
+  Appendix B: RFLAGS=0x170, RIP=0x178 sit in the SAME 64-byte
+  cacheline (0x140-0x17F) as CR4=0x148/CR3=0x150/CR0=0x158/DR7=0x160/
+  DR6=0x168 -- and cr0/cr3 read back correct on real hardware. A whole
+  good-and-bad-values-in-one-line split can't be a memory-type/flush
+  problem.
+
+- ***"Struct mispacked / wrong offsets" -- REFUTED at COMPILE TIME.***
+  Added per-field `_Static_assert(__builtin_offsetof(...))` for the
+  absolute VMCB offsets of save.{cr4,cr3,cr0,rflags,rip,rsp,rax,cr2}
+  and control.{exitinfo1,exitinfo2,exitintinfo}, transcribed straight
+  from Table B-2 (save area starts at 0x400, so save.rip == abs 0x578,
+  save.rflags == abs 0x570). The build PASSES -- so `vmcb->save.rip`
+  reads exactly the bytes hardware wrote to 0x578. This is the
+  compile-time form of the "dump the raw offset and compare" check;
+  the struct member and the raw offset are now guaranteed identical,
+  no hardware round trip needed. Also refutes "reading a different
+  VMCB page": vcpu_run passes `(uintptr_t)real->vmcb` to vmrun and
+  get_debug_state reads the same `real->vmcb` -- one page.
+
+- ***Surviving hypothesis -- nested fault during IDT delivery
+  (§15.7.2 / §15.20).*** A supervisor data READ of linear 0 (err=0,
+  cr2=0) cannot be executing at rip=-1, so the saved rip/rflags do not
+  describe a clean single fault. The APM's mechanism for exactly this:
+  EXITINTINFO (control 0x088) is written on #VMEXIT when the intercept
+  fired *while the guest was delivering a prior exception/interrupt
+  through its own IDT*. FW-1 intercepts ALL 32 exception vectors
+  (`intercept_exceptions = 0xFFFFFFFFu`, vmcb.c), so if OVMF took some
+  first fault and, mid-delivery, hit an unmapped IDT/handler/stack page
+  under FW-1's deliberately-partial NPT, we'd intercept that nested
+  #PF with a mangled rip -- fully consistent with the observation. The
+  diagnostic now captures and prints EXITINTINFO (decoded valid/type/
+  vector) plus NRIP. **Next real-hardware capture is decisive**:
+  EXITINTINFO valid=1 => nested-delivery fault confirmed (and the real
+  fix is NPT coverage / not blanket-intercepting exceptions OVMF
+  handles itself, not a register-save mystery); valid=0 => delivery
+  theory dead, erratum-class save-completeness moves to the front.
+
+- ***rsp-memory-all-FF is a reader artifact, explained.*** The dump
+  dereferences guest-VIRTUAL rsp (0xfcd8d4f0) as a HOST pointer; on
+  real hardware that lands in the chipset MMIO hole just below 4GB
+  (0xFC000000-0xFFFFFFFF), which reads all-1s. Not guest corruption --
+  a guest-linear address simply isn't a valid host pointer without a
+  guest page-table walk.
+
+Build + full unit suite green (all tests passed) with the added
+asserts and the EXITINTINFO/NRIP capture. `tools/make-usb-package.sh`
+NOT yet rebuilt for this change -- do that before the next hardware
+capture. Milestone stays parked; the analysis is materially further
+along and the next data point is now one boot away from settling it.
+
 - [ ] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped
   as ordinary executable NPT-backed guest memory (not the pflash
