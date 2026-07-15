@@ -1598,12 +1598,41 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
   INPUT-1/INPUT-2 PS/2 devices into the FW-1 IOIO handler to actually
   see/drive the OVMF shell (the path toward M4-6). Deps: FW-1c.
 
-Known follow-up (not blocking): the per-VM-exit `svm: about to CLGI/
-VMLOAD/VMRUN` / `VMRUN returned` / `STGI done` trace prints (added for
-the rip=-1 investigation, now solved) fire 3 lines per exit -- ~11k
-lines for an OVMF boot. Harmless on serial but worth gating behind a
-verbosity flag before the real-hardware console work, since GOP renders
-every line.
+- [x] **FW-1e** — Guest serial console OUTPUT (see OVMF's log/shell).
+  DONE + validated in QEMU. OVMF's console/DEBUG rides a 16550 UART;
+  our old absorb of 0x3F8-0x3FF made PciSioSerialDxe's SerialPresent
+  scratch-register probe fail, so nothing was emitted. Now:
+  - `devices/guest_uart.{h,c}`: minimal 16550 model. SCR (offset 7)
+    round-trips (the probe: writes 0xAA/0x55), LSR always reports
+    THRE|TEMT so transmit never stalls; THR writes queue TX bytes,
+    RX ring + LSR.DR ready for input (FW-1f). Emulated on BOTH COM1
+    (0x3F8) and COM2 (0x2F8) -- this vendored OVMF is a DEBUG build that
+    sends its DEBUG log to COM2 (that was the 0x2FF spam) and the
+    interactive Terminal console to COM1.
+  - `devices/vt_filter.{h,c}`: strips VT/ANSI escape sequences (our GOP
+    console can't interpret them) so forwarded text is legible. (Full
+    terminal emulation is the later TERM milestone.)
+  - `hype_svm_vcpu_handle_uart_ioio` (svm_vcpu.c) dispatches the IOIO;
+    the FW-1 loop drains queued TX each exit, filters, and forwards to
+    hype's own console (serial + GOP) a line at a time.
+  - Also gated the per-VM-exit `svm: CLGI/VMLOAD/VMRUN` trace behind
+    `hype_svm_set_vmrun_trace()` (FW-1 keeps only the first, riskiest
+    entry traced) -- ~11k lines/boot down to a handful.
+  QEMU: the inner guest's console now shows (VT-filtered, so unambiguously
+  ours vs the outer QEMU-host OVMF): `BdsDxe: No bootable option or
+  device was found. / Press any key to enter the Boot Manager Menu.` --
+  OVMF fully booted, ran BDS, found no boot disk (FW-1's guest has none),
+  and idles at the Boot Manager prompt. Suite 55/55, guest_uart.c ~98% /
+  vt_filter.c ~96% coverage, no regressions. Deps: FW-1d, VIDEO-1 style
+  console.
+
+- [ ] **FW-1f** — Guest console INPUT (drive the shell). OVMF idles at
+  "Press any key". Feed keystrokes to the guest via the UART RX ring
+  (`hype_guest_uart_rx_enqueue` + LSR.DR, already built/tested) and/or
+  the PS/2 keyboard model (INPUT-1) on ports 0x60/0x64. On real hardware,
+  source the keys from INPUT-3 (host keyboard ownership). Then: press a
+  key -> Boot Manager Menu / UEFI shell, the interactive path toward
+  M4-6 (boot an installer). Deps: FW-1e, INPUT-1/INPUT-3.
 
 - [x] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped

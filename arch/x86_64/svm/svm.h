@@ -19,6 +19,7 @@
 #include "../../../devices/ps2_mouse.h"
 #include "../../../devices/bochs_vbe.h"
 #include "../../../devices/guest_lapic.h"
+#include "../../../devices/guest_uart.h"
 #include "../../../devices/virtio_blk.h"
 #include "../../../devices/ata_disk.h"
 #include "vmcb.h"
@@ -703,6 +704,16 @@ int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
                                     uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes);
 
 /*
+ * FW-1e's exempt IOIO glue for the guest 16550 UART (devices/guest_uart.h)
+ * at COM1 [base_port, base_port+8). Byte-wide IN/OUT via AL, dispatched
+ * to the register model; TX bytes the guest writes to THR are buffered
+ * in the model for the caller to drain and forward to hype's console.
+ * Returns 0 if the port was in range and handled, -1 otherwise (so the
+ * FW-1 IOIO chain falls through to the next device / the absorb path).
+ */
+int hype_svm_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart, uint16_t base_port);
+
+/*
  * M5-1's exempt NPF glue for the virtio-blk device's single MMIO BAR
  * (devices/virtio_blk.h), covering all four virtio-pci capability
  * regions (COMMON_CFG/NOTIFY_CFG/ISR_CFG/DEVICE_CFG) this project lays
@@ -768,6 +779,12 @@ void hype_svm_vcpu_enable_apic_accel_ops(hype_vcpu_ctx_t *ctx);
  * nested-SVM probe) rather than SDM-reading alone.
  */
 int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info);
+
+/* Enable/disable the per-VM-exit CLGI/VMLOAD/VMRUN trace prints in
+ * hype_svm_vcpu_run (default on). A long-running guest (real OVMF, with
+ * thousands of exits) disables it after the first entry so it doesn't
+ * flood the console; short test guests leave it on. */
+void hype_svm_set_vmrun_trace(int enabled);
 
 extern const hype_vmm_ops_t hype_svm_ops;
 

@@ -37,6 +37,7 @@
 #include "../devices/ramfb.h"
 #include "../devices/fb_blit.h"
 #include "../devices/e820.h"
+#include "../devices/vt_filter.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -178,6 +179,9 @@ static hype_pit_emu_t g_fw_1_pit;
 static hype_pci_t g_fw_1_pci;
 static hype_cmos_t g_fw_1_cmos;
 static hype_guest_lapic_t g_fw_1_lapic; /* FW-1b: guest Local APIC (0xFEE00000) */
+static hype_guest_uart_t g_fw_1_uart;  /* FW-1e: guest 16550 UART (COM1 0x3F8) */
+static hype_guest_uart_t g_fw_1_uart2; /* FW-1e: guest 16550 UART (COM2 0x2F8) -- OVMF probes/uses both */
+#define HYPE_SERIAL_COM2 0x2F8u
 static hype_fw_cfg_t g_fw_1_fw_cfg;
 static hype_acpi_rsdp_t g_fw_1_rsdp;
 static uint8_t g_fw_1_tables_blob[4096] __attribute__((aligned(64)));
@@ -4178,6 +4182,34 @@ static const uint8_t *fw_1_guest_phys_to_host(uint64_t gpa) {
     return 0;
 }
 
+/* FW-1e: drain the guest UART's transmit ring, strip terminal escape
+ * sequences (hype's GOP console can't interpret them), and emit the
+ * guest's console output to hype's own console (serial + GOP) one line
+ * at a time -- one GOP Blt per line rather than per byte. `filter`,
+ * `line` and `line_len` persist across calls (owned by the caller). */
+static void fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_filter_t *filter, char *line,
+                                     unsigned int *line_len, unsigned int line_cap) {
+    uint8_t b;
+    while (hype_guest_uart_tx_dequeue(uart, &b)) {
+        char c;
+        if (!hype_vt_filter(filter, b, &c)) {
+            continue;
+        }
+        if (c == '\n') {
+            line[*line_len] = '\0';
+            hype_debug_print("%s\n", line);
+            *line_len = 0;
+            continue;
+        }
+        if (*line_len >= line_cap - 1) {
+            line[*line_len] = '\0';
+            hype_debug_print("%s\n", line);
+            *line_len = 0;
+        }
+        line[(*line_len)++] = c;
+    }
+}
+
 static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
@@ -4192,6 +4224,8 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_pic_emu_reset(&g_fw_1_pic);
     hype_pit_emu_reset(&g_fw_1_pit);
     hype_guest_lapic_reset(&g_fw_1_lapic);
+    hype_guest_uart_reset(&g_fw_1_uart);
+    hype_guest_uart_reset(&g_fw_1_uart2);
     hype_pci_reset(&g_fw_1_pci);
     hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
                          0x00, 0x00);
@@ -4341,6 +4375,15 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     unsigned long long productive_exits = 0;
     unsigned long long total_exits = 0;
     int booted = 0;
+    hype_vt_filter_t uart_filter;
+    char uart_line[256];
+    unsigned int uart_line_len = 0;
+    hype_vt_filter_t uart_filter2;
+    char uart_line2[256];
+    unsigned int uart_line_len2 = 0;
+
+    hype_vt_filter_reset(&uart_filter);
+    hype_vt_filter_reset(&uart_filter2);
 
     for (;;) {
         uint8_t timer_vector;
@@ -4354,6 +4397,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                        "(last reason=0x%llx guest_rip=0x%llx)",
                        (unsigned long long)HYPE_FW_1_MAX_EXITS, (unsigned long long)info.reason,
                        (unsigned long long)info.guest_rip);
+        }
+        /* FW-1e: keep the first (riskiest) VMRUN traced, then silence the
+         * per-exit CLGI/VMLOAD/VMRUN spam -- real OVMF does thousands of
+         * exits and each trace line is GOP-rendered. */
+        if (total_exits == 1) {
+            hype_svm_set_vmrun_trace(0);
         }
         if (info.reason != HYPE_SVM_EXITCODE_HLT) {
             productive_exits++;
@@ -4369,6 +4418,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
             hype_svm_vcpu_request_interrupt(ctx, timer_vector);
         }
+
+        /* FW-1e: surface any console text the guest wrote to either UART. */
+        fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
+                                 (unsigned int)sizeof(uart_line));
+        fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
+                                 (unsigned int)sizeof(uart_line2));
 
         if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
             hype_svm_vcpu_handle_cpuid(ctx);
@@ -4423,6 +4478,15 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 continue;
             }
             if (hype_svm_vcpu_handle_cmos_ioio(ctx, &g_fw_1_cmos) == 0) {
+                continue;
+            }
+            /* FW-1e: guest COM1 UART (0x3F8-0x3FF). TX bytes are buffered
+             * in the model and drained to hype's console at the top of
+             * the loop. */
+            if (hype_svm_vcpu_handle_uart_ioio(ctx, &g_fw_1_uart, HYPE_SERIAL_COM1) == 0) {
+                continue;
+            }
+            if (hype_svm_vcpu_handle_uart_ioio(ctx, &g_fw_1_uart2, HYPE_SERIAL_COM2) == 0) {
                 continue;
             }
             if (hype_svm_vcpu_handle_acpi_pm_timer_ioio(ctx) == 0) {
@@ -4581,6 +4645,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
         break;
     }
+
+    /* Flush any console text the guest emitted right before it idled. */
+    fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
+                             (unsigned int)sizeof(uart_line));
+    fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
+                             (unsigned int)sizeof(uart_line2));
 
     if (booted) {
         hype_debug_print(

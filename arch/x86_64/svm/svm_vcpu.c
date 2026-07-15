@@ -957,6 +957,31 @@ int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, 
     return 0;
 }
 
+int hype_svm_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart, uint16_t base_port) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+    uint32_t offset;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+
+    if (io.port < base_port || io.port >= (uint32_t)base_port + HYPE_GUEST_UART_NREGS) {
+        return -1;
+    }
+    offset = (uint32_t)io.port - base_port;
+
+    if (io.is_in) {
+        uint8_t value = hype_guest_uart_read(uart, offset);
+        real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
+    } else {
+        hype_guest_uart_write(uart, offset, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+    }
+
+    /* EXITINFO2 is the resume RIP, same convenience the other IOIO
+     * handlers use. */
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uint64_t ecam_base_phys,
                                        const uint8_t *guest_insn_bytes) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
@@ -1364,6 +1389,18 @@ void hype_svm_vcpu_enable_apic_accel_ops(hype_vcpu_ctx_t *ctx) {
     hype_svm_vcpu_enable_apic_accel(real->vmcb);
 }
 
+/* FW-1e: the per-VM-exit CLGI/VMLOAD/VMRUN trace below is invaluable for
+ * bring-up (it brackets the riskiest instruction sequence -- see its own
+ * comment) but emits 3 lines PER exit, ~11k lines for a full OVMF boot,
+ * which the GOP renders one at a time. A long-running guest (real OVMF)
+ * turns it off after its first entry via hype_svm_set_vmrun_trace();
+ * short test guests leave it on. Default on. */
+static int g_vmrun_trace = 1;
+
+void hype_svm_set_vmrun_trace(int enabled) {
+    g_vmrun_trace = enabled ? 1 : 0;
+}
+
 int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint64_t vmcb_phys = (uint64_t)(uintptr_t)real->vmcb;
@@ -1376,16 +1413,22 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
      * invalid VMCB field bare metal validates more strictly than
      * nested/emulated SVM does) that this project's own QEMU+KVM
      * nested-SVM validation may simply never have exercised. */
-    hype_debug_print("svm: about to CLGI/VMLOAD/VMRUN (vmcb_phys=0x%llx)...\n",
-                      (unsigned long long)vmcb_phys);
+    if (g_vmrun_trace) {
+        hype_debug_print("svm: about to CLGI/VMLOAD/VMRUN (vmcb_phys=0x%llx)...\n",
+                          (unsigned long long)vmcb_phys);
+    }
     clgi();
     vmload(vmcb_phys);
     vmrun_full(vmcb_phys);
-    hype_debug_print("svm: VMRUN returned -- about to VMSAVE/STGI...\n");
+    if (g_vmrun_trace) {
+        hype_debug_print("svm: VMRUN returned -- about to VMSAVE/STGI...\n");
+    }
     vmsave(vmcb_phys);
     stgi();
-    hype_debug_print("svm: STGI done, exitcode=0x%llx\n",
-                      (unsigned long long)real->vmcb->control.exitcode);
+    if (g_vmrun_trace) {
+        hype_debug_print("svm: STGI done, exitcode=0x%llx\n",
+                          (unsigned long long)real->vmcb->control.exitcode);
+    }
 
     info->reason = real->vmcb->control.exitcode;
     info->qualification = real->vmcb->control.exitinfo1;
