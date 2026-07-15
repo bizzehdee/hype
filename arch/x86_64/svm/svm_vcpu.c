@@ -828,6 +828,66 @@ int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uin
     return 0;
 }
 
+int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
+                                        uint64_t mmio_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < mmio_base_phys ||
+        npf.guest_phys_addr >= mmio_base_phys + HYPE_BOCHS_VBE_MMIO_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - mmio_base_phys);
+
+    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+    if (decoded.size_bytes != 2u) {
+        return -1; /* DISPI registers are architecturally 16-bit only */
+    }
+
+    reg = gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    if (offset < HYPE_BOCHS_VBE_DISPI_OFFSET || offset >= HYPE_BOCHS_VBE_DISPI_OFFSET + HYPE_BOCHS_VBE_DISPI_SIZE) {
+        /* Reserved area of the MMIO BAR -- reads as 0, writes ignored,
+         * same convention devices/ahci.h's own MMIO model uses. */
+        if (!decoded.is_write) {
+            *reg = hype_mmio_merge_read_value(*reg, 0, decoded.size_bytes, decoded.zero_extend);
+        }
+        real->vmcb->save.rip += decoded.instr_len;
+        return 0;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        if (hype_bochs_vbe_mmio_write(dev, offset - HYPE_BOCHS_VBE_DISPI_OFFSET, (uint16_t)value) != 0) {
+            return -1;
+        }
+    } else {
+        uint16_t value = 0;
+        if (hype_bochs_vbe_mmio_read(dev, offset - HYPE_BOCHS_VBE_DISPI_OFFSET, &value) != 0) {
+            return -1;
+        }
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;

@@ -35,6 +35,7 @@
 #include "../devices/ahci.h"
 #include "../devices/atapi.h"
 #include "../devices/ramfb.h"
+#include "../devices/fb_blit.h"
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -356,6 +357,15 @@ static void hype_write_le32(unsigned char *dst, uint32_t value) {
     for (i = 0; i < 4; i++) {
         dst[i] = (unsigned char)(value >> (8 * i));
     }
+}
+
+/* Reads back a 4-byte little-endian value a test guest wrote directly
+ * into its own (unintercepted, ordinarily-mapped) memory -- e.g.
+ * VIDEO-3's framebuffer pixels, which take no VM-exit to write, so
+ * there is no device-model read path to go through for verification. */
+static uint32_t hype_read_le32(const unsigned char *src) {
+    return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) |
+           ((uint32_t)src[3] << 24);
 }
 
 /*
@@ -2988,6 +2998,278 @@ static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 }
 
 /*
+ * VIDEO-3: a post-boot, PCI-discoverable Bochs-VBE-class display
+ * adapter (devices/bochs_vbe.h) -- discovered via the same ECAM/BAR
+ * enumeration sequence PCI-2 established for AHCI, then programmed and
+ * written to exactly the way a real Linux vesafb/efifb or Windows
+ * Basic Display Adapter driver would: probe/place BAR0 (framebuffer)
+ * and BAR2 (DISPI registers), set Memory Space Enable, program
+ * XRES/YRES/BPP/ENABLE over BAR2, then write pixels directly into
+ * BAR0 -- no further register access needed per pixel (this is the
+ * "no separate commit" real-hardware behavior devices/bochs_vbe.h's
+ * own header comment documents).
+ *
+ * BAR0's chosen address is deliberately g_video_3_framebuffer's own
+ * real static-buffer address, NOT an arbitrary formula-based GPA the
+ * way BAR2/ECAM are -- pixel writes must land on genuinely backed,
+ * readable-back memory (this project's NPT is a blanket identity map,
+ * but there's no guarantee real DRAM actually backs an arbitrary high
+ * GPA on real hardware/QEMU the way there is for hype.efi's own loaded
+ * image), and BAR0 is deliberately never NPT-trapped at all, unlike
+ * BAR2 -- pixel writes take zero VM-exits, the same way real VRAM
+ * works.
+ */
+static uint8_t g_video_3_guest_code[192] __attribute__((aligned(4096)));
+static uint8_t g_video_3_guest_stack[4096] __attribute__((aligned(4096)));
+static uint8_t g_video_3_framebuffer[0x40000] __attribute__((aligned(4096)));
+static uint8_t g_video_3_host_screen[0x40000] __attribute__((aligned(4096)));
+static hype_pci_t g_video_3_pci;
+static hype_bochs_vbe_t g_video_3_bochs_vbe;
+
+#define HYPE_VIDEO_3_DISPLAY_DEV 1u
+/* Same "arbitrary offset from an existing constant, always NPT-
+ * trapped so real backing doesn't matter" scheme PCI-2 established for
+ * AHCI's own BAR5 -- reused verbatim since each test guest builds its
+ * own isolated hype_pci_t/NPT and these tests never run concurrently. */
+#define HYPE_VIDEO_3_MMIO_GPA (HYPE_M4_3_PFLASH_GPA + 4ULL * 1024 * 1024)
+#define HYPE_VIDEO_3_WIDTH 320u
+#define HYPE_VIDEO_3_HEIGHT 200u
+#define HYPE_VIDEO_3_BPP 32u
+/* Power-of-two BAR0 size (hype_pci_set_bar_size()'s own requirement);
+ * WIDTH*HEIGHT*4 = 256,000 bytes of actual pixel data fits comfortably
+ * within it with headroom to spare. */
+#define HYPE_VIDEO_3_FB_BAR_SIZE 0x40000u
+
+/*
+ * Section A (RBX = ECAM base): places BAR0 (framebuffer) and BAR2
+ * (DISPI registers), then sets Memory Space Enable -- byte-for-byte
+ * the same PCI enumeration idiom PCI-2's own payload established, just
+ * with a second BAR to place.
+ * Section B (RBX = the just-programmed MMIO/BAR2 address): programs
+ * XRES/YRES/BPP/ENABLE via 16-bit (0x66-prefixed) MOVs -- DISPI
+ * registers are architecturally 16-bit only.
+ * Section C (RBX = the just-programmed framebuffer/BAR0 address):
+ * writes a recognizable pattern to the first and last pixel of the
+ * 320x200x32bpp mode just enabled, proving real-hardware-style direct
+ * pixel access with no further register interaction.
+ *
+ *   mov rbx, <patched: ECAM base>            48 BB 00*8
+ *   mov eax, <patched: framebuffer addr>     B8 00*4
+ *   mov [rbx+0x8010], eax  (BAR0)            89 83 10 80 00 00
+ *   mov eax, <patched: MMIO addr>            B8 00*4
+ *   mov [rbx+0x8018], eax  (BAR2)            89 83 18 80 00 00
+ *   mov eax, 2  (Memory Space Enable)        B8 02 00 00 00
+ *   mov [rbx+0x8004], eax  (Command)         89 83 04 80 00 00
+ *   mov rbx, <patched: MMIO addr>            48 BB 00*8
+ *   mov ax, 320  (XRES)                      66 B8 40 01
+ *   mov [rbx+0x502], ax                      66 89 83 02 05 00 00
+ *   mov ax, 200  (YRES)                      66 B8 C8 00
+ *   mov [rbx+0x504], ax                      66 89 83 04 05 00 00
+ *   mov ax, 32  (BPP)                        66 B8 20 00
+ *   mov [rbx+0x506], ax                      66 89 83 06 05 00 00
+ *   mov ax, 0x41 (ENABLE=ENABLED|LFB_ENABLED) 66 B8 41 00
+ *   mov [rbx+0x508], ax                      66 89 83 08 05 00 00
+ *   mov rbx, <patched: framebuffer addr>     48 BB 00*8
+ *   mov eax, <patched: first pixel value>    B8 00*4
+ *   mov [rbx], eax                           89 03
+ *   mov eax, <patched: last pixel value>     B8 00*4
+ *   mov [rbx+<patched: last pixel offset>], eax  89 83 00*4
+ *   hlt                                      F4
+ *   jmp $-3                                  EB FD
+ */
+static const uint8_t g_video_3_payload_template[] = {
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x10, 0x80, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x18, 0x80, 0x00, 0x00,
+    0xB8, 0x02, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x04, 0x80, 0x00, 0x00,
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x66, 0xB8, 0x40, 0x01,
+    0x66, 0x89, 0x83, 0x02, 0x05, 0x00, 0x00,
+    0x66, 0xB8, 0xC8, 0x00,
+    0x66, 0x89, 0x83, 0x04, 0x05, 0x00, 0x00,
+    0x66, 0xB8, 0x20, 0x00,
+    0x66, 0x89, 0x83, 0x06, 0x05, 0x00, 0x00,
+    0x66, 0xB8, 0x41, 0x00,
+    0x66, 0x89, 0x83, 0x08, 0x05, 0x00, 0x00,
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x03,
+    0xB8, 0x00, 0x00, 0x00, 0x00,
+    0x89, 0x83, 0x00, 0x00, 0x00, 0x00,
+    0xF4,
+    0xEB, 0xFD
+};
+#define HYPE_VIDEO_3_PAYLOAD_ECAM_RBX_IMM_OFFSET 2
+#define HYPE_VIDEO_3_PAYLOAD_FB_BAR0_IMM_OFFSET 11
+#define HYPE_VIDEO_3_PAYLOAD_MMIO_BAR2_IMM_OFFSET 22
+#define HYPE_VIDEO_3_PAYLOAD_MMIO_RBX_IMM_OFFSET 45
+#define HYPE_VIDEO_3_PAYLOAD_FB_RBX_IMM_OFFSET 99
+#define HYPE_VIDEO_3_PAYLOAD_FIRST_PIXEL_VALUE_IMM_OFFSET 108
+#define HYPE_VIDEO_3_PAYLOAD_LAST_PIXEL_VALUE_IMM_OFFSET 115
+#define HYPE_VIDEO_3_PAYLOAD_LAST_PIXEL_OFFSET_IMM_OFFSET 121
+
+/* Top byte (the "X"/reserved channel in XRGB8888) is deliberately 0 --
+ * hype_fb_blit_copy()'s own pack_rgb() legitimately zeroes it on every
+ * repack (it's padding, not real pixel data), so a nonzero reserved
+ * byte here would never survive the blit round trip below, for
+ * reasons that have nothing to do with a blit bug. */
+#define HYPE_VIDEO_3_FIRST_PIXEL_VALUE 0x00223344u
+#define HYPE_VIDEO_3_LAST_PIXEL_VALUE 0x00667788u
+
+static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
+    uint64_t fb_phys, mmio_phys;
+    uint32_t stride_bytes, last_pixel_offset;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+    int mmio_mapped;
+    uint64_t mmio_mapped_base;
+    hype_bochs_vbe_mode_t mode;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("video-3: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n",
+                           ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_video_3_guest_code, sizeof(g_video_3_guest_code));
+    hype_guest_ram_zero(g_video_3_guest_stack, sizeof(g_video_3_guest_stack));
+    hype_guest_ram_zero(g_video_3_framebuffer, sizeof(g_video_3_framebuffer));
+    hype_guest_ram_zero(g_video_3_host_screen, sizeof(g_video_3_host_screen));
+
+    hype_bochs_vbe_reset(&g_video_3_bochs_vbe);
+    hype_pci_reset(&g_video_3_pci);
+    hype_pci_add_device(&g_video_3_pci, HYPE_VIDEO_3_DISPLAY_DEV, HYPE_BOCHS_VBE_PCI_VENDOR_ID,
+                         HYPE_BOCHS_VBE_PCI_DEVICE_ID, HYPE_BOCHS_VBE_PCI_CLASS_BASE,
+                         HYPE_BOCHS_VBE_PCI_CLASS_SUB, HYPE_BOCHS_VBE_PCI_CLASS_INTERFACE);
+    hype_pci_set_bar_size(&g_video_3_pci, HYPE_VIDEO_3_DISPLAY_DEV, 0, HYPE_VIDEO_3_FB_BAR_SIZE);
+    hype_pci_set_bar_size(&g_video_3_pci, HYPE_VIDEO_3_DISPLAY_DEV, 2, HYPE_BOCHS_VBE_MMIO_SIZE);
+
+    fb_phys = (uint64_t)(uintptr_t)g_video_3_framebuffer;
+    mmio_phys = HYPE_VIDEO_3_MMIO_GPA;
+    stride_bytes = HYPE_VIDEO_3_WIDTH * (HYPE_VIDEO_3_BPP / 8u);
+    last_pixel_offset = stride_bytes * (HYPE_VIDEO_3_HEIGHT - 1u) + (HYPE_VIDEO_3_WIDTH - 1u) * (HYPE_VIDEO_3_BPP / 8u);
+
+    for (i = 0; i < sizeof(g_video_3_payload_template); i++) {
+        g_video_3_guest_code[i] = g_video_3_payload_template[i];
+    }
+    hype_write_le64(g_video_3_guest_code + HYPE_VIDEO_3_PAYLOAD_ECAM_RBX_IMM_OFFSET, HYPE_PCI_1_ECAM_GPA);
+    hype_write_le32(g_video_3_guest_code + HYPE_VIDEO_3_PAYLOAD_FB_BAR0_IMM_OFFSET, (uint32_t)fb_phys);
+    hype_write_le32(g_video_3_guest_code + HYPE_VIDEO_3_PAYLOAD_MMIO_BAR2_IMM_OFFSET, (uint32_t)mmio_phys);
+    hype_write_le64(g_video_3_guest_code + HYPE_VIDEO_3_PAYLOAD_MMIO_RBX_IMM_OFFSET, mmio_phys);
+    hype_write_le64(g_video_3_guest_code + HYPE_VIDEO_3_PAYLOAD_FB_RBX_IMM_OFFSET, fb_phys);
+    hype_write_le32(g_video_3_guest_code + HYPE_VIDEO_3_PAYLOAD_FIRST_PIXEL_VALUE_IMM_OFFSET,
+                     HYPE_VIDEO_3_FIRST_PIXEL_VALUE);
+    hype_write_le32(g_video_3_guest_code + HYPE_VIDEO_3_PAYLOAD_LAST_PIXEL_VALUE_IMM_OFFSET,
+                     HYPE_VIDEO_3_LAST_PIXEL_VALUE);
+    hype_write_le32(g_video_3_guest_code + HYPE_VIDEO_3_PAYLOAD_LAST_PIXEL_OFFSET_IMM_OFFSET,
+                     last_pixel_offset);
+
+    entry_rip = (uint64_t)(uintptr_t)g_video_3_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_video_3_guest_stack + sizeof(g_video_3_guest_stack));
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+    hype_npt_mark_not_present(g_npt_pd, HYPE_PCI_1_ECAM_GPA);
+    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+
+    hype_debug_print("video-3: entry_rip=0x%llx ecam_gpa=0x%llx fb_addr=0x%llx mmio_addr=0x%llx\n",
+                      (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
+                      (unsigned long long)fb_phys, (unsigned long long)mmio_phys);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    if (ctx == 0) {
+        hype_fatal("video-3: vcpu_create_long_mode failed");
+    }
+
+    mmio_mapped = 0;
+    mmio_mapped_base = 0;
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("video-3: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+
+        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_video_3_pci, HYPE_PCI_1_ECAM_GPA) == 0) {
+                if (!mmio_mapped && hype_pci_memory_space_enabled(&g_video_3_pci, HYPE_VIDEO_3_DISPLAY_DEV)) {
+                    uint64_t bar2 = hype_pci_get_bar_value(&g_video_3_pci, HYPE_VIDEO_3_DISPLAY_DEV, 2);
+                    if (bar2 != 0) {
+                        hype_npt_mark_not_present(g_npt_pd, bar2);
+                        mmio_mapped_base = bar2;
+                        mmio_mapped = 1;
+                        hype_debug_print(
+                            "video-3: display BAR2 (MMIO) enabled at 0x%llx -- NPT-mapping it now\n",
+                            (unsigned long long)bar2);
+                    }
+                }
+                continue;
+            }
+
+            if (mmio_mapped &&
+                hype_svm_vcpu_handle_bochs_vbe_npf(ctx, &g_video_3_bochs_vbe, mmio_mapped_base) == 0) {
+                continue;
+            }
+
+            hype_fatal("video-3: unhandled NPF (qual=0x%llx guest_rip=0x%llx)",
+                       (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+        }
+
+        break;
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("video-3: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+    if (!mmio_mapped || mmio_mapped_base != HYPE_VIDEO_3_MMIO_GPA) {
+        hype_fatal("video-3: display adapter's MMIO BAR2 was never dynamically mapped");
+    }
+
+    hype_bochs_vbe_get_mode(&g_video_3_bochs_vbe, &mode);
+    if (!mode.valid || mode.width != HYPE_VIDEO_3_WIDTH || mode.height != HYPE_VIDEO_3_HEIGHT ||
+        mode.bytes_per_pixel != HYPE_VIDEO_3_BPP / 8u || mode.stride_bytes != stride_bytes ||
+        mode.fb_offset_bytes != 0) {
+        hype_fatal("video-3: guest-programmed display mode was not decoded as expected");
+    }
+
+    if (hype_read_le32(g_video_3_framebuffer + 0) != HYPE_VIDEO_3_FIRST_PIXEL_VALUE) {
+        hype_fatal("video-3: first pixel write did not land in the framebuffer");
+    }
+    if (hype_read_le32(g_video_3_framebuffer + last_pixel_offset) != HYPE_VIDEO_3_LAST_PIXEL_VALUE) {
+        hype_fatal("video-3: last pixel write did not land in the framebuffer");
+    }
+
+    /* Prove the other half of VIDEO-3 (VIDEO-2's own task.md note: the
+     * actual blit onto the host's real screen is this milestone's job)
+     * against this device's own real, guest-programmed output -- not
+     * just synthetic buffers in test_fb_blit.c's own unit tests. */
+    hype_fb_blit_copy(g_video_3_framebuffer, mode.width, mode.height, mode.stride_bytes,
+                       HYPE_FB_PIXEL_FORMAT_XRGB8888, g_video_3_host_screen, mode.width, mode.height,
+                       stride_bytes, HYPE_FB_PIXEL_FORMAT_XRGB8888);
+    if (hype_read_le32(g_video_3_host_screen + 0) != HYPE_VIDEO_3_FIRST_PIXEL_VALUE) {
+        hype_fatal("video-3: blit did not carry the first pixel to the host screen buffer");
+    }
+    if (hype_read_le32(g_video_3_host_screen + last_pixel_offset) != HYPE_VIDEO_3_LAST_PIXEL_VALUE) {
+        hype_fatal("video-3: blit did not carry the last pixel to the host screen buffer");
+    }
+
+    hype_debug_print(
+        "video-3: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- display adapter "
+        "discovered via PCI BAR0=0x%llx/BAR2=0x%llx, %ux%u@%ubpp mode decoded correctly, "
+        "first/last pixel round-tripped through the framebuffer and the host-screen blit\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
+        (unsigned long long)fb_phys, (unsigned long long)mmio_mapped_base, mode.width, mode.height,
+        mode.bytes_per_pixel * 8u);
+}
+
+/*
  * FW-1: the first attempt at launching this project's own real,
  * unmodified vendored OVMF (M4-2) -- not a hand-written synthetic test
  * guest. Real-mode entry at the classic x86 reset vector, using the
@@ -3267,6 +3549,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_pci_1_test(args->ops, args->kind);
     run_pci_2_test(args->ops, args->kind);
     run_iso_2_test(args->ops, args->kind);
+    run_video_3_test(args->ops, args->kind);
     run_fw_1_test(args->ops, args->kind);
 }
 

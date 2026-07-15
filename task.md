@@ -579,9 +579,72 @@ a polling-only keyboard and deferring real interrupt delivery.
   job, and a real OVMF instance actually driving this (not a synthetic
   test guest mimicking its wire behavior) is M4-6's job, same
   "primitive now, integration later" split as M4-3/M4-4/M4-5.*
-- [ ] **VIDEO-3** — Post-boot VGA/Bochs-VBE-class virtual display adapter
+- [x] **VIDEO-3** — Post-boot VGA/Bochs-VBE-class virtual display adapter
   (for Windows' inbox Basic Display Adapter and Linux/BSD `vesafb`/`efifb`).
   Deps: VIDEO-2
+
+  *Modeled after QEMU's "bochs-display" device specifically (vendor
+  0x1234/device 0x1111, class 0x03/0x80/0x00 -- deliberately not the
+  combined legacy-VGA "std-vga" device, matching this project's own
+  "simplest device that satisfies real guest drivers" bias). Register
+  indices, the MMIO-window addressing formula (BAR2 offset 0x500 +
+  register*2), ENABLE flag bits, and framebuffer/mode semantics were
+  fetched and confirmed directly from QEMU's own source
+  (`hw/display/bochs-display.c`, `include/hw/display/bochs-vbe.h`) via
+  a dedicated research pass, not reconstructed from memory -- same
+  discipline as this project's other wire-format structs.
+
+  New `devices/bochs_vbe.h/.c`: a pure DISPI register model
+  (`hype_bochs_vbe_mmio_read/_write`) plus `hype_bochs_vbe_get_mode()`,
+  which computes stride/fb-offset from XRES/YRES/BPP/VIRT_WIDTH/
+  X_OFFSET/Y_OFFSET, auto-raising a too-small VIRT_WIDTH/HEIGHT to the
+  requested resolution (the well-documented real Bochs VBE "auto-
+  configure" convention). 100% line, 97.06% branch coverage
+  (`core/tests/test_bochs_vbe.c`, 12 tests). Only bpp 16/32 are real,
+  matching bochs-display's own restricted mode set.
+
+  New `devices/fb_blit.h/.c`: the other half of VIDEO-2's own note that
+  "the actual blit of the guest's framebuffer content onto the host's
+  real screen is VIDEO-3's job" -- a pure pixel-format-converting
+  row-copy (XRGB8888/XBGR8888/RGB565), clipped to the smaller of
+  source/destination dimensions. 97.50% line, 93.18% branch coverage
+  (`core/tests/test_fb_blit.c`, 11 tests).
+
+  PCI wiring follows PCI-2's exact established pattern: exempt
+  `hype_svm_vcpu_handle_bochs_vbe_npf()` (`arch/x86_64/svm/svm_vcpu.c`)
+  NPT-traps only BAR2 (the MMIO register window, both-bounds-checked
+  like the ECAM handler, rejecting anything but a 2-byte-wide MOV since
+  DISPI registers are architecturally 16-bit-only) -- BAR0 (the
+  framebuffer) is deliberately **never** NPT-trapped, so pixel writes
+  take zero VM-exits, matching real VRAM's own behavior. This is also
+  why BAR0's chosen address is the test's own real static buffer
+  address (`g_video_3_framebuffer`), not an arbitrary formula-based GPA
+  the way BAR2/ECAM are -- pixel writes need genuinely backed, readable
+  memory, unlike a register window that's always intercepted.
+
+  New synthetic test guest `run_video_3_test()` (`boot/main.c`):
+  discovers the device via PCI/ECAM (byte-for-byte PCI-2's own
+  enumeration idiom, extended to place a second BAR), programs
+  XRES=320/YRES=200/BPP=32/ENABLE via BAR2, writes a first/last-pixel
+  test pattern directly into BAR0, then HLTs. Host verifies
+  `hype_bochs_vbe_get_mode()` decodes the expected mode, the pixel
+  writes round-tripped through the framebuffer, and
+  `hype_fb_blit_copy()` correctly carries both pixels into a
+  stand-in "host screen" buffer -- proving the blit against this
+  device's own real, guest-driven output, not just synthetic unit-test
+  buffers. **Clean QEMU run on the second attempt**: the first attempt
+  used a test pixel value with a nonzero top ("reserved"/X) byte, which
+  `pack_rgb()` legitimately zeroes on every repack (it's padding, not
+  real color data) -- not a blit bug, just an unrealistic test value;
+  fixed by choosing pixel values with a zero reserved byte.
+
+  Wiring an actual *live* blit into `efi_main()`'s own tail loop
+  (rendering onto the real GOP framebuffer) was deliberately NOT done
+  here -- there's no "current VM"/console-focus concept yet for a live
+  blit to attach to (that's M8's dashboard job), and the same
+  `run_all_test_guests()`-before-host-bringup ordering issue already
+  documented under INPUT-3/INPUT-4 means it couldn't be live-verified
+  yet regardless. Revisit once M8 gives this a real consumer.*
 
 ---
 

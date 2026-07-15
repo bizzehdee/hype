@@ -17,6 +17,7 @@
 #include "../../../devices/cmos.h"
 #include "../../../devices/ps2_keyboard.h"
 #include "../../../devices/ps2_mouse.h"
+#include "../../../devices/bochs_vbe.h"
 #include "vmcb.h"
 
 /*
@@ -577,6 +578,33 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
  * already fully tested in isolation.
  */
 int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uint64_t ecam_base_phys);
+
+/*
+ * VIDEO-3's exempt NPF glue for the Bochs-VBE display adapter's BAR2
+ * (MMIO register window, devices/bochs_vbe.h) -- deliberately NOT for
+ * BAR0 (the framebuffer): the framebuffer is ordinary guest RAM this
+ * project's blanket NPT identity map already leaves present, so pixel
+ * writes take zero VM-exits, matching real VRAM's own behavior (see
+ * boot/main.c's run_video_3_test()). Only BAR2's register window is
+ * ever NPT-trapped.
+ *
+ * Checks both bounds against `mmio_base_phys` (same rationale as the
+ * ECAM handler just above -- a second, independently NPT-trapped
+ * region must not be mistaken for this one), decodes the faulting
+ * instruction (rejecting anything but a 2-byte-wide MOV, since DISPI
+ * registers are architecturally 16-bit-only), and dispatches to
+ * hype_bochs_vbe_mmio_read()/_write() -- an offset within the MMIO BAR
+ * but outside the DISPI register block (devices/bochs_vbe.h) reads as
+ * 0 / ignores the write, the same "reserved reads as 0" convention
+ * devices/ahci.h's own MMIO model already uses. Advances RIP past the
+ * decoded instruction.
+ * Exempt from unit testing -- reaches into the exempt VMCB fields this
+ * backend's real VMRUN produces; hype_mmio_decode() and
+ * hype_bochs_vbe_mmio_read()/_write() are already fully tested in
+ * isolation.
+ */
+int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
+                                        uint64_t mmio_base_phys);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */
