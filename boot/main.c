@@ -185,6 +185,7 @@ static hype_guest_uart_t g_fw_1_uart2; /* FW-1e: guest 16550 UART (COM2 0x2F8) -
 static hype_ps2_kbd_t g_fw_1_ps2;     /* FW-1f: guest PS/2 keyboard (0x60/0x64) -- OVMF's actual ConIn */
 static hype_ps2_mouse_t g_fw_1_mouse; /* required by the shared PS/2 IOIO handler signature */
 #define HYPE_FW_1_KEY_ENTER_MAKE 0x1Cu /* Set-1 make code for Enter */
+#define HYPE_FW_1_DEBUG_PORT 0x402u    /* FW-1g: OVMF SEC/PEI PlatformDebugLibIoPort */
 static hype_fw_cfg_t g_fw_1_fw_cfg;
 static hype_acpi_rsdp_t g_fw_1_rsdp;
 static uint8_t g_fw_1_tables_blob[4096] __attribute__((aligned(64)));
@@ -4227,6 +4228,30 @@ static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_fil
     return emitted;
 }
 
+/* FW-1g: feed one byte of the guest's OVMF debug-io-port (0x402) log to
+ * hype's console, a line at a time, tagged so it's distinguishable from
+ * the guest's ConOut console and hype's own output. Debug text is plain
+ * ASCII, but reuse the VT filter for safety. */
+static void fw_1_debug_feed(hype_vt_filter_t *filter, char *line, unsigned int *line_len,
+                             unsigned int line_cap, uint8_t byte) {
+    char c;
+    if (!hype_vt_filter(filter, byte, &c)) {
+        return;
+    }
+    if (c == '\n') {
+        line[*line_len] = '\0';
+        hype_debug_print("fw-1 ovmf-dbg| %s\n", line);
+        *line_len = 0;
+        return;
+    }
+    if (*line_len >= line_cap - 1) {
+        line[*line_len] = '\0';
+        hype_debug_print("fw-1 ovmf-dbg| %s\n", line);
+        *line_len = 0;
+    }
+    line[(*line_len)++] = c;
+}
+
 static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
@@ -4405,9 +4430,13 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     unsigned long long console_chars = 0;
     unsigned long long inject_productive = 0;
     unsigned long long inject_total = 0;
+    hype_vt_filter_t dbg_filter;
+    char dbg_line[256];
+    unsigned int dbg_line_len = 0;
 
     hype_vt_filter_reset(&uart_filter);
     hype_vt_filter_reset(&uart_filter2);
+    hype_vt_filter_reset(&dbg_filter);
 
     for (;;) {
         uint8_t timer_vector;
@@ -4531,6 +4560,21 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
             if (hype_svm_vcpu_handle_uart_ioio(ctx, &g_fw_1_uart2, HYPE_SERIAL_COM2) == 0) {
                 continue;
+            }
+            /* FW-1g: OVMF's SEC/PEI debug-io port (0x402). Forward the
+             * log to hype's console (only active in a DEBUG OVMF build;
+             * harmless otherwise). */
+            {
+                uint8_t dbg_byte = 0;
+                int dr = hype_svm_vcpu_handle_debug_port_ioio(ctx, HYPE_FW_1_DEBUG_PORT, &dbg_byte);
+                if (dr == 0) {
+                    fw_1_debug_feed(&dbg_filter, dbg_line, &dbg_line_len, (unsigned int)sizeof(dbg_line),
+                                    dbg_byte);
+                    continue;
+                }
+                if (dr == 1) {
+                    continue;
+                }
             }
             if (hype_svm_vcpu_handle_acpi_pm_timer_ioio(ctx) == 0) {
                 continue;
@@ -4722,19 +4766,21 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     if (booted && key_reacted) {
         hype_debug_print(
             "fw-1: real OVMF BOOTED + INTERACTIVE -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2) with "
-            "console output forwarded, and the injected PS/2 Enter DROVE it out of its idle prompt "
-            "into Boot Manager Menu processing (%llu productive exits after the key -- guest ConIn "
-            "confirmed). Rendering that full-screen menu TUI is the TERM milestone. guest_rip=0x%llx.\n",
-            (unsigned long long)(productive_exits - inject_productive), (unsigned long long)info.guest_rip);
+            "%llu chars of console output forwarded, and the injected PS/2 Enter DROVE it out of its "
+            "idle prompt into Boot Manager Menu processing (%llu productive exits after the key -- guest "
+            "ConIn confirmed). Rendering that full-screen menu TUI is the TERM milestone. guest_rip=0x%llx.\n",
+            (unsigned long long)console_chars, (unsigned long long)(productive_exits - inject_productive),
+            (unsigned long long)info.guest_rip);
         return;
     }
     if (booted) {
         hype_debug_print(
-            "fw-1: real OVMF BOOTED -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2 controller init) and "
-            "console output forwarded, idle at the Boot Manager prompt after %llu productive VM-exits. "
-            "The injected keystroke did NOT yet register (OVMF's WaitForKey poll isn't picking up the "
-            "PS/2 scancode) -- input needs deeper debug (FW-1g), not just a wire-up. guest_rip=0x%llx.\n",
-            (unsigned long long)productive_exits, (unsigned long long)info.guest_rip);
+            "fw-1: real OVMF BOOTED -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2 controller init), %llu "
+            "chars of console output forwarded, idle at the Boot Manager prompt after %llu productive "
+            "VM-exits. The injected keystroke did NOT yet register (OVMF's WaitForKey poll isn't picking "
+            "up the PS/2 scancode) -- input needs deeper debug (FW-1g), not just a wire-up. guest_rip=0x%llx.\n",
+            (unsigned long long)console_chars, (unsigned long long)productive_exits,
+            (unsigned long long)info.guest_rip);
         return;
     }
 

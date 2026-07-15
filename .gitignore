@@ -47,3 +47,7 @@ core/tests/test_*
 .idea/
 *.swp
 .DS_Store
+
+# FW-1g: locally-built DEBUG guest firmware (regenerate with FW_TARGET=DEBUG tools/build-fw.sh)
+fw/OVMF_CODE.debug.fd
+fw/OVMF_VARS.debug.fd

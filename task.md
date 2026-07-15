@@ -1666,13 +1666,33 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
 
 - [ ] **FW-1g** — Make a guest keystroke actually register (drive OVMF's
   Boot Manager Menu / shell). Deep-debug why Ps2KeyboardDxe's poll
-  doesn't surface an injected scancode despite completing init: inspect
-  the inner guest's OVMF DEBUG log (route more of COM2 / raise debug
-  level), confirm the PS/2 keyboard is in ConIn, check whether BDS
-  resets/drains ConIn between "press any key" retries, and verify the
-  exact status/scancode/timing the WaitForKey poll consumes. Then wire a
-  real key source (INPUT-3 host keyboard) instead of the synthetic
-  Enter. Deps: FW-1f.
+  doesn't surface an injected scancode despite completing init: confirm
+  the PS/2 keyboard is in ConIn, check whether BDS resets/drains ConIn
+  between "press any key" retries, and verify the exact status/scancode/
+  timing the WaitForKey poll consumes. Then wire a real key source
+  (INPUT-3 host keyboard) instead of the synthetic Enter. Deps: FW-1f.
+
+  **Debug-log routing set up (2026-07-15):**
+  - `tools/build-fw.sh` now takes `FW_TARGET=DEBUG` -> builds OVMF `-b
+    DEBUG` with `PcdDebugPrintErrorLevel=0xFFFFFFFF`, output to
+    `fw/OVMF_CODE.debug.fd` (gitignored, regenerable; RELEASE path
+    untouched). Built and confirmed OK.
+  - hype now routes the guest's SEC/PEI debug-io port 0x402
+    (`hype_svm_vcpu_handle_debug_port_ioio`: read -> 0xE9 presence
+    signature, write -> byte forwarded to hype's console tagged
+    "fw-1 ovmf-dbg|"), plus DXE DEBUG already flows via the FW-1e COM1/
+    COM2 UART forwarding. Always-on, harmless under a RELEASE guest.
+  - ***Finding: a full-DEBUG OVMF boot is impractically slow under hype
+    in QEMU*** -- the DEBUG firehose (every DEBUG() byte is a trapped
+    IOIO exit) meant a 150s run barely reached early SEC (rip=0x84fc72,
+    A20), nowhere near the DXE keyboard phase. So full-debug boot is NOT
+    the practical FW-1g tool as-is; use it only with a much longer
+    timeout or a targeted (single-module / lower-level) debug mask.
+  - ***Recommended FW-1g tool instead: hype-side PS/2 access tracing***
+    -- log every guest 0x60/0x64 read/write (value + rip) during the
+    FW-1 run around the key injection, using the fast RELEASE OVMF. That
+    directly answers the question (does OVMF poll the keyboard at the
+    prompt? does it read our scancode?) without the debug-boot slowdown.
 
 - [x] **FW-1** — New "firmware guest" VMCB builder: real x86
   reset-vector convention, executing directly from OVMF_CODE.fd mapped

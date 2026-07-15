@@ -714,6 +714,17 @@ int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
 int hype_svm_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart, uint16_t base_port);
 
 /*
+ * FW-1g: the QEMU/bochs debug-io port (default 0x402), where OVMF's
+ * PlatformDebugLibIoPort (SEC/PEI) writes its DEBUG() log one byte at a
+ * time. A read must return the 0xE9 presence signature so OVMF enables
+ * the channel; a write hands the byte back in *out_byte for the caller
+ * to forward to hype's console. Returns 0 if it was a write (byte in
+ * *out_byte), 1 if it was a read (handled, nothing to forward), or -1
+ * if the port wasn't `base_port`. Advances RIP when handled.
+ */
+int hype_svm_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port, uint8_t *out_byte);
+
+/*
  * M5-1's exempt NPF glue for the virtio-blk device's single MMIO BAR
  * (devices/virtio_blk.h), covering all four virtio-pci capability
  * regions (COMMON_CFG/NOTIFY_CFG/ISR_CFG/DEVICE_CFG) this project lays

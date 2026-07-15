@@ -957,6 +957,29 @@ int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, 
     return 0;
 }
 
+int hype_svm_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port, uint8_t *out_byte) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+    int is_write;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+    if (io.port != base_port) {
+        return -1;
+    }
+
+    is_write = !io.is_in;
+    if (io.is_in) {
+        /* 0xE9 = the QEMU/bochs debug-port presence signature OVMF's
+         * PlatformDebugLibIoPort checks before enabling the channel. */
+        real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | 0xE9u;
+    } else {
+        *out_byte = (uint8_t)(real->vmcb->save.rax & 0xFFu);
+    }
+
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return is_write ? 0 : 1;
+}
+
 int hype_svm_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart, uint16_t base_port) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
