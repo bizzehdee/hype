@@ -161,6 +161,66 @@ static void test_raise_irq_ignores_out_of_range(void) {
     CHECK_HEX("out-of-range irq number is a no-op", 0, pic.master.irr);
 }
 
+static void test_acknowledge_computes_vector_from_irq_offset(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u; /* matches the real-mode BIOS default remap */
+    pic.master.imr = 0x00u;        /* nothing masked */
+    hype_pic_emu_raise_irq(&pic.master, 1);
+
+    CHECK_HEX("acknowledge reports a pending IRQ", 1,
+              hype_pic_emu_acknowledge_highest_priority(&pic.master, &vector));
+    CHECK_HEX("vector = irq_offset + irq number", 0x21u, vector);
+    CHECK_HEX("IRR bit moved out", 0, pic.master.irr & (1u << 1));
+    CHECK_HEX("ISR bit now set (in service)", 1, (pic.master.isr & (1u << 1)) != 0);
+}
+
+static void test_acknowledge_returns_zero_when_masked(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0xAAu;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.master.imr = 0xFFu; /* everything masked */
+    hype_pic_emu_raise_irq(&pic.master, 1);
+
+    CHECK_HEX("nothing to acknowledge -- masked", 0,
+              hype_pic_emu_acknowledge_highest_priority(&pic.master, &vector));
+    CHECK_HEX("out_vector left untouched", 0xAAu, vector);
+    CHECK_HEX("IRR bit still pending", 1, (pic.master.irr & (1u << 1)) != 0);
+}
+
+static void test_acknowledge_returns_zero_when_nothing_pending(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0xAAu;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.master.imr = 0x00u;
+
+    CHECK_HEX("nothing to acknowledge -- no IRQ raised", 0,
+              hype_pic_emu_acknowledge_highest_priority(&pic.master, &vector));
+    CHECK_HEX("out_vector left untouched", 0xAAu, vector);
+}
+
+static void test_acknowledge_picks_lowest_numbered_irq_first(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.master.imr = 0x00u;
+    hype_pic_emu_raise_irq(&pic.master, 3);
+    hype_pic_emu_raise_irq(&pic.master, 1);
+
+    CHECK_HEX("acknowledge reports a pending IRQ", 1,
+              hype_pic_emu_acknowledge_highest_priority(&pic.master, &vector));
+    CHECK_HEX("lower IRQ number (higher priority) wins", 0x21u, vector);
+    CHECK_HEX("the other IRQ is still pending", 1, (pic.master.irr & (1u << 3)) != 0);
+}
+
 int main(void) {
     test_reset_is_fully_masked();
     test_unrecognized_port_rejected();
@@ -174,6 +234,10 @@ int main(void) {
     test_slave_is_independent_of_master();
     test_raise_irq_sets_irr_bit_independent_of_mask();
     test_raise_irq_ignores_out_of_range();
+    test_acknowledge_computes_vector_from_irq_offset();
+    test_acknowledge_returns_zero_when_masked();
+    test_acknowledge_returns_zero_when_nothing_pending();
+    test_acknowledge_picks_lowest_numbered_irq_first();
 
     if (failures == 0) {
         printf("all tests passed\n");

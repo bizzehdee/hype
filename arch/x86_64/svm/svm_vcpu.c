@@ -436,6 +436,33 @@ int hype_svm_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos) {
     return 0;
 }
 
+int hype_svm_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+    int rc;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+
+    if (io.is_in) {
+        uint8_t value = 0;
+        rc = hype_ps2_kbd_io_read(kbd, io.port, &value);
+        if (rc == 0) {
+            real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
+        }
+    } else {
+        rc = hype_ps2_kbd_io_write(kbd, io.port, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+    }
+
+    if (rc != 0) {
+        return -1;
+    }
+
+    /* EXITINFO2 gives the resume RIP directly, same "next-RIP-for-free"
+     * convenience hype_svm_vcpu_handle_ioio() itself already relies on. */
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return 0;
+}
+
 #define HYPE_FW_1_ACPI_PM_TIMER_PORT 0x608u
 #define HYPE_FW_1_ACPI_PM_TIMER_MASK 0x00FFFFFFu /* 24-bit -- TMR_VAL_EXT unset in this project's own FADT */
 
@@ -496,6 +523,15 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
         /* This window firing at all means the guest can accept an
          * interrupt right now -- hype_svm_vcpu_request_interrupt()'s
          * own can-accept check will take the direct-EVENTINJ path. */
+        hype_svm_vcpu_request_interrupt(ctx, vector);
+    }
+}
+
+void hype_svm_vcpu_deliver_pic_irq(hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip, uint8_t irq) {
+    uint8_t vector;
+
+    hype_pic_emu_raise_irq(chip, irq);
+    if (hype_pic_emu_acknowledge_highest_priority(chip, &vector)) {
         hype_svm_vcpu_request_interrupt(ctx, vector);
     }
 }

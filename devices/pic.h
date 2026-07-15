@@ -63,4 +63,22 @@ int hype_pic_emu_io_read(hype_pic_emu_t *pic, uint16_t port, uint8_t *out_value)
  * 7. */
 void hype_pic_emu_raise_irq(hype_pic_emu_chip_t *chip, uint8_t irq);
 
+/*
+ * INPUT-1: the real 8259 INTA-cycle operation an actual interrupt
+ * controller performs on the CPU's behalf -- finds the
+ * highest-priority (lowest-numbered, this project's own scope: no
+ * rotating-priority modes modeled) IRQ that's both pending (IRR) and
+ * unmasked (IMR clear), moves it from IRR to ISR (now "in service"
+ * until the guest's own EOI, matching real hardware), and returns the
+ * actual vector to deliver: `chip->irq_offset` (ICW2's own vector base
+ * -- already tracked, just never consumed until now) plus the IRQ
+ * number. Returns 1 and fills *out_vector if such an IRQ exists, 0
+ * otherwise (nothing to deliver -- every pending IRQ is masked, or
+ * there are none). Pure logic, no CPU/guest-memory access -- actually
+ * injecting the returned vector into a guest is the exempt glue's job
+ * (arch/x86_64/svm/svm_vcpu.c's hype_svm_vcpu_request_interrupt(),
+ * INT-1/INT-2).
+ */
+int hype_pic_emu_acknowledge_highest_priority(hype_pic_emu_chip_t *chip, uint8_t *out_vector);
+
 #endif /* HYPE_DEVICES_PIC_H */

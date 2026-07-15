@@ -15,6 +15,7 @@
 #include "../../../devices/atapi.h"
 #include "../../../devices/pci.h"
 #include "../../../devices/cmos.h"
+#include "../../../devices/ps2_keyboard.h"
 #include "vmcb.h"
 
 /*
@@ -262,6 +263,19 @@ int hype_svm_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci);
 int hype_svm_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos);
 
 /*
+ * INPUT-1: routes an IOIO VM-exit to `kbd`'s data/status-command ports
+ * (0x60/0x64, devices/ps2_keyboard.h). Returns 0 if the port was one of
+ * these two (handled, RIP already advanced via EXITINFO2), or -1 for
+ * any other port, same composable-handler-chain shape as every other
+ * IOIO handler here. Always 1-byte width (the real i8042's own only
+ * access form). Exempt from unit testing -- reaches into the exempt
+ * VMCB/GPR fields this backend's real VMRUN produces; every function
+ * in devices/ps2_keyboard.h this composes is already fully tested in
+ * isolation.
+ */
+int hype_svm_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd);
+
+/*
  * FW-1: services the ACPI PM Timer's own I/O port (hardcoded to 0x608
  * -- OVMF's own fixed ICH9_PMBASE_VALUE(0x600) + ACPI_TIMER_OFFSET(8),
  * both compile-time constants in edk2/OvmfPkg/Include/OvmfPlatforms.h,
@@ -318,6 +332,27 @@ void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
  * hype_svm_vcpu_request_interrupt().
  */
 void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx);
+
+/*
+ * INPUT-1: the reusable "a device wired to `chip` just raised `irq`"
+ * entry point -- combines devices/pic.h's own real-hardware modeling
+ * (hype_pic_emu_raise_irq() sets IRR; hype_pic_emu_acknowledge_highest_priority()
+ * performs the INTA-cycle equivalent, moving the highest-priority
+ * pending/unmasked IRQ from IRR to ISR and computing its real vector
+ * from the chip's own ICW2-programmed offset) with
+ * hype_svm_vcpu_request_interrupt() (INT-1/INT-2) to actually deliver
+ * that vector to the guest, now or once it genuinely can accept it.
+ * If nothing pending is currently unmasked (acknowledge finds
+ * nothing), this is a no-op beyond raising IRR -- exactly matching
+ * real hardware, where a masked IRQ simply waits until unmasked.
+ * Every future PIC-routed device (PS/2 mouse, etc.) should reuse this
+ * same entry point rather than re-deriving the raise+acknowledge+
+ * inject sequence itself. Exempt from unit testing -- reaches into
+ * the exempt VMCB fields hype_svm_vcpu_request_interrupt() itself
+ * already does; devices/pic.h's own two functions this composes are
+ * already fully tested in isolation.
+ */
+void hype_svm_vcpu_deliver_pic_irq(hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip, uint8_t irq);
 
 /*
  * FW-1 real-hardware/real-firmware debugging: a snapshot of the guest

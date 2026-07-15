@@ -1901,6 +1901,248 @@ static void run_int_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_INT_TEST_VECTOR);
 }
 
+/* Same flat code/data GDT content as g_int_gdt (INT-1/INT-2) -- a
+ * fresh, dedicated copy rather than sharing that buffer, matching this
+ * project's own "each test owns its buffers" convention. */
+static uint8_t g_input_1_gdt[24] __attribute__((aligned(16))) = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9B, 0xAF, 0x00,
+    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x93, 0xCF, 0x00,
+};
+static uint8_t g_input_1_idt[4096] __attribute__((aligned(4096)));
+static uint8_t g_input_1_guest_stack[4096] __attribute__((aligned(4096)));
+static uint8_t g_input_1_marker[4096] __attribute__((aligned(4096)));
+static uint8_t g_input_1_scancode_result[4096] __attribute__((aligned(4096)));
+static hype_pic_emu_t g_input_1_pic;
+static hype_pit_emu_t g_input_1_pit; /* unused by this test's own payload -- required by
+                                      * hype_svm_vcpu_handle_ioio()'s existing signature */
+static hype_ps2_kbd_t g_input_1_ps2;
+
+/*
+ * Guest payload -- a real OS-shaped keyboard init sequence, not just a
+ * synthetic test harness: programs the master 8259 (ICW1-4, matching
+ * the real BIOS-default convention of remapping IRQ0-7 to vectors
+ * 0x20-0x27), unmasks only IRQ1 (OCW1), enables interrupts, then
+ * busy-polls a marker exactly like a real idle loop waiting for a key.
+ * The ISR reads the delivered scancode from the PS/2 data port, sends
+ * a non-specific EOI, and sets the marker -- proving the full
+ * device-to-guest path (devices/ps2_keyboard.h -> devices/pic.h's own
+ * acknowledge -> INT-1/INT-2's injection) works end-to-end, not just
+ * the injection mechanism alone (already proven by run_int_test()).
+ *
+ *   mov rbx, <patched: marker guest-physical address>    48 BB 00*8
+ *   mov rcx, <patched: scancode-result guest-physical>    48 B9 00*8
+ *   mov al, 0x11 (ICW1)                 B0 11
+ *   mov dx, 0x20                        66 BA 20 00
+ *   out dx, al                          EE
+ *   mov al, 0x20 (ICW2 -- vector offset) B0 20
+ *   mov dx, 0x21                        66 BA 21 00
+ *   out dx, al                          EE
+ *   mov al, 0x04 (ICW3)                 B0 04
+ *   out dx, al                          EE
+ *   mov al, 0x01 (ICW4)                 B0 01
+ *   out dx, al                          EE
+ *   mov al, 0xFD (OCW1 -- mask all but IRQ1) B0 FD
+ *   out dx, al                          EE
+ *   sti                                 FB
+ * poll:
+ *   cmp byte [rbx], 0                   80 3B 00
+ *   je poll                             74 FB
+ *   hlt                                 F4
+ *   jmp $-3                             EB FD
+ *   ... padding to isr's own fixed offset ...
+ * isr:
+ *   mov dx, 0x60                        66 BA 60 00
+ *   in al, dx                           EC
+ *   mov [rcx], al                       88 01
+ *   mov dx, 0x20                        66 BA 20 00
+ *   mov al, 0x20 (OCW2 non-specific EOI) B0 20
+ *   out dx, al                          EE
+ *   mov byte [rbx], 1                   C6 03 01
+ *   iretq                               48 CF
+ */
+static const uint8_t g_input_1_payload_template[] = {
+    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB0, 0x11,
+    0x66, 0xBA, 0x20, 0x00,
+    0xEE,
+    0xB0, 0x20,
+    0x66, 0xBA, 0x21, 0x00,
+    0xEE,
+    0xB0, 0x04,
+    0xEE,
+    0xB0, 0x01,
+    0xEE,
+    0xB0, 0xFD,
+    0xEE,
+    0xFB,
+    0x80, 0x3B, 0x00,
+    0x74, 0xFB,
+    0xF4,
+    0xEB, 0xFD,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x66, 0xBA, 0x60, 0x00,
+    0xEC,
+    0x88, 0x01,
+    0x66, 0xBA, 0x20, 0x00,
+    0xB0, 0x20,
+    0xEE,
+    0xC6, 0x03, 0x01,
+    0x48, 0xCF,
+};
+#define HYPE_INPUT_1_PAYLOAD_RBX_IMM_OFFSET 2
+#define HYPE_INPUT_1_PAYLOAD_RCX_IMM_OFFSET 12
+#define HYPE_INPUT_1_PAYLOAD_ISR_OFFSET 64
+#define HYPE_INPUT_1_TEST_SCANCODE 0x1Eu /* Set 1 make code for 'A' */
+static uint8_t g_input_1_guest_code[sizeof(g_input_1_payload_template)] __attribute__((aligned(4096)));
+
+/*
+ * INPUT-1: guest-facing PS/2 keyboard device (plan.md §6c) -- proves
+ * the full device-to-guest delivery path, not just the injection
+ * mechanism run_int_test() already proved. Same "request the interrupt
+ * before the first VMRUN" pattern: the key press is enqueued and IRQ1
+ * raised while RFLAGS.IF is still 0, so the guest's own PIC
+ * initialization + STI (not the host) is what actually opens the
+ * delivery window -- exactly the real sequence a genuine keypress
+ * arriving before an OS finishes booting would follow.
+ */
+static void run_input_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    unsigned long long i;
+    uint64_t entry_rip, guest_cr3, rsp, marker_phys, scancode_result_phys, isr_phys, gdt_phys, idt_phys;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+
+    if (kind != HYPE_VMM_KIND_SVM) {
+        hype_serial_print("input-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n",
+                           ops->name);
+        return;
+    }
+
+    hype_guest_ram_zero(g_input_1_idt, sizeof(g_input_1_idt));
+    hype_guest_ram_zero(g_input_1_guest_code, sizeof(g_input_1_guest_code));
+    hype_guest_ram_zero(g_input_1_guest_stack, sizeof(g_input_1_guest_stack));
+    hype_guest_ram_zero(g_input_1_marker, sizeof(g_input_1_marker));
+    hype_guest_ram_zero(g_input_1_scancode_result, sizeof(g_input_1_scancode_result));
+    hype_pic_emu_reset(&g_input_1_pic);
+    hype_pit_emu_reset(&g_input_1_pit);
+    hype_ps2_kbd_reset(&g_input_1_ps2);
+
+    for (i = 0; i < sizeof(g_input_1_payload_template); i++) {
+        g_input_1_guest_code[i] = g_input_1_payload_template[i];
+    }
+    marker_phys = (uint64_t)(uintptr_t)g_input_1_marker;
+    scancode_result_phys = (uint64_t)(uintptr_t)g_input_1_scancode_result;
+    hype_write_le64(g_input_1_guest_code + HYPE_INPUT_1_PAYLOAD_RBX_IMM_OFFSET, marker_phys);
+    hype_write_le64(g_input_1_guest_code + HYPE_INPUT_1_PAYLOAD_RCX_IMM_OFFSET, scancode_result_phys);
+
+    isr_phys = (uint64_t)(uintptr_t)(g_input_1_guest_code + HYPE_INPUT_1_PAYLOAD_ISR_OFFSET);
+
+    /* IDT entry 0x21 (this guest's own ICW2 offset 0x20 + IRQ1): a
+     * 64-bit interrupt gate, same construction as run_int_test()'s own
+     * IDT entry. */
+    {
+        uint8_t *gate = g_input_1_idt + 0x21u * 16;
+        gate[0] = (uint8_t)(isr_phys & 0xFFu);
+        gate[1] = (uint8_t)((isr_phys >> 8) & 0xFFu);
+        gate[2] = 0x08;
+        gate[3] = 0x00;
+        gate[4] = 0x00;
+        gate[5] = 0x8E;
+        gate[6] = (uint8_t)((isr_phys >> 16) & 0xFFu);
+        gate[7] = (uint8_t)((isr_phys >> 24) & 0xFFu);
+        hype_write_le32(gate + 8, (uint32_t)(isr_phys >> 32));
+        hype_write_le32(gate + 12, 0);
+    }
+
+    entry_rip = (uint64_t)(uintptr_t)g_input_1_guest_code;
+    rsp = (uint64_t)(uintptr_t)(g_input_1_guest_stack + sizeof(g_input_1_guest_stack));
+    gdt_phys = (uint64_t)(uintptr_t)g_input_1_gdt;
+    idt_phys = (uint64_t)(uintptr_t)g_input_1_idt;
+
+    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
+
+    hype_debug_print("input-1: entry_rip=0x%llx isr_phys=0x%llx\n", (unsigned long long)entry_rip,
+                      (unsigned long long)isr_phys);
+
+    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    if (ctx == 0) {
+        hype_fatal("input-1: vcpu_create_long_mode failed");
+    }
+
+    hype_svm_vcpu_set_gdt(ctx, gdt_phys, (uint16_t)(sizeof(g_input_1_gdt) - 1));
+    hype_svm_vcpu_set_idt(ctx, idt_phys, (uint16_t)(sizeof(g_input_1_idt) - 1));
+    hype_svm_vcpu_set_cs_ss_selectors(ctx, 0x08u, 0x10u);
+
+    /* The key press itself: enqueue the scancode in the PS/2 device,
+     * then, once the guest's own PIC initialization has genuinely
+     * finished, raise IRQ1 through it -- this project's own real
+     * device model, not a shortcut straight to EVENTINJ. Deliberately
+     * NOT raised before the first VMRUN: this guest's very first
+     * instructions are its own ICW1-4 sequence, and a real 8259's own
+     * ICW1 unconditionally clears IRR (a fresh initialization discards
+     * any previously pending state, matching real hardware) -- raising
+     * IRQ1 any earlier would just have it wiped out again immediately.
+     * A real keypress that happens to arrive before an OS has even
+     * initialized its own PIC is genuinely lost on real hardware too;
+     * this test instead waits for initialization to finish (tracked
+     * below via the PIC's own init_state reaching 0, "normal
+     * operation") before the key press happens, matching a realistic
+     * timing. */
+    hype_ps2_kbd_enqueue_scancode(&g_input_1_ps2, HYPE_INPUT_1_TEST_SCANCODE);
+
+    {
+        int irq1_delivered = 0;
+
+        for (;;) {
+            if (ops->vcpu_run(ctx, &info) != 0) {
+                hype_fatal("input-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+            }
+
+            if (info.reason == HYPE_SVM_EXITCODE_VINTR) {
+                hype_svm_vcpu_handle_vintr_window(ctx);
+                continue;
+            }
+
+            if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
+                if (hype_svm_vcpu_handle_ioio(ctx, &g_input_1_pic, &g_input_1_pit) == 0) {
+                    if (!irq1_delivered && g_input_1_pic.master.init_state == 0) {
+                        hype_svm_vcpu_deliver_pic_irq(ctx, &g_input_1_pic.master, 1);
+                        irq1_delivered = 1;
+                    }
+                    continue;
+                }
+                if (hype_svm_vcpu_handle_ps2_kbd_ioio(ctx, &g_input_1_ps2) == 0) {
+                    continue;
+                }
+                hype_fatal("input-1: unhandled IOIO access (qual=0x%llx guest_rip=0x%llx)",
+                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+            }
+
+            break;
+        }
+    }
+
+    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+        hype_fatal("input-1: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+    if (g_input_1_marker[0] != 1) {
+        hype_fatal("input-1: interrupt handler never ran (marker=0x%x)", g_input_1_marker[0]);
+    }
+    if (g_input_1_scancode_result[0] != HYPE_INPUT_1_TEST_SCANCODE) {
+        hype_fatal("input-1: ISR read the wrong scancode (got 0x%x, expected 0x%x)",
+                   g_input_1_scancode_result[0], HYPE_INPUT_1_TEST_SCANCODE);
+    }
+
+    hype_debug_print(
+        "input-1: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- scancode 0x%x "
+        "delivered via PS/2 -> PIC (vector 0x21) -> INT-1/INT-2, ISR read it back correctly\n",
+        (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
+        (unsigned int)HYPE_INPUT_1_TEST_SCANCODE);
+}
+
 /*
  * RAM-1/RAM-2: exercises the new dynamically-allocated,
  * dynamically-NPT-sized guest RAM path (g_ram_1_base_phys/
@@ -2718,6 +2960,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_video_2_ramfb_test(args->ops, args->kind);
     run_cpumsr_test(args->ops, args->kind);
     run_int_test(args->ops, args->kind);
+    run_input_1_test(args->ops, args->kind);
     run_ram_1_test(args->ops, args->kind);
     run_pci_1_test(args->ops, args->kind);
     run_pci_2_test(args->ops, args->kind);

@@ -365,8 +365,57 @@ a polling-only keyboard and deferring real interrupt delivery.
 
 ## INPUT — Input devices (plan.md §6b, §6c)
 
-- [ ] **INPUT-1** — Guest-facing PS/2 keyboard device.
+- [x] **INPUT-1** — Guest-facing PS/2 keyboard device.
   Deps: M3-4, INT-2
+
+  *New `devices/ps2_keyboard.h/.c` (100%/100%/100% unit tested,
+  `core/tests/test_ps2_keyboard.c`): a real i8042 controller/keyboard
+  channel model (ports 0x60 data, 0x64 status/command) -- self-test
+  (0xAA), interface test (0xAB), read/write config byte (0x20/0x60),
+  enable/disable keyboard port (0xAE/0xAD), and a generic ACK for any
+  keyboard-device command sent via 0x60, plus the single-pending-byte
+  scancode buffer every real read ultimately goes through. Also closed
+  the loop on `devices/pic.h`'s own long-dead
+  `hype_pic_emu_raise_irq()`: a new `hype_pic_emu_acknowledge_highest_priority()`
+  performs the real 8259 INTA-cycle equivalent (finds the
+  highest-priority pending+unmasked IRQ, moves it IRR->ISR, computes
+  its real vector from the chip's own ICW2-programmed offset) --
+  fully unit tested, `core/tests/test_pic_emu.c`. Exempt glue
+  (`svm_vcpu.c`): `hype_svm_vcpu_handle_ps2_kbd_ioio()` and the
+  reusable `hype_svm_vcpu_deliver_pic_irq()` (raise + acknowledge +
+  INT-1/INT-2 injection in one call -- every future PIC-routed device
+  should reuse this same entry point).
+
+  Proven end-to-end by a new test guest (`run_input_1_test()`,
+  boot/main.c) -- a *realistic* OS-shaped sequence, not just a
+  synthetic harness: the guest programs the master 8259 itself
+  (ICW1-4, unmasking only IRQ1), enables interrupts, and busy-waits;
+  its own ISR reads the delivered scancode from port 0x60, sends a
+  real EOI, and sets a marker. Two real timing bugs found and fixed
+  getting a clean run:
+  - ***Bug***: the initial design raised IRQ1 *before* the guest's
+    first VMRUN, expecting it to stay masked-but-pending through the
+    guest's own PIC init -- but a real 8259's own ICW1 unconditionally
+    clears IRR as part of a fresh initialization (discarding any
+    previously pending state, matching real hardware), wiping out the
+    pre-raised bit before the guest ever unmasks it. A real keypress
+    arriving before an OS has initialized its own PIC is genuinely
+    lost on real hardware too -- fixed by only raising IRQ1 once the
+    guest's own PIC initialization has genuinely finished (tracked via
+    `hype_pic_emu_chip_t`'s own `init_state` reaching 0), matching
+    realistic timing instead.
+  - ***Bug***: an early retry design called the combined
+    raise+acknowledge+inject helper on *every* subsequent PIC port
+    write (to catch the guest's OCW1 unmask) -- since raising is
+    unconditional, this re-raised and redelivered the same keypress
+    forever, including via the EOI write the ISR's own interrupt
+    handler performs (an infinite redelivery loop). Fixed by
+    separating "raise" (done exactly once) from "acknowledge" (safe to
+    retry speculatively any number of times -- a genuine no-op once
+    IRR's bit is already serviced).
+  - Confirmed clean QEMU run: "scancode 0x1e delivered via PS/2 -> PIC
+    (vector 0x21) -> INT-1/INT-2, ISR read it back correctly" -- every
+    other existing test guest still halts cleanly.*
 - [ ] **INPUT-2** — Guest-facing PS/2 mouse device (for GUI installers,
   §6c).
   Deps: INPUT-1

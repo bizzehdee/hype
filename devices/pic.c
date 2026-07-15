@@ -126,3 +126,18 @@ void hype_pic_emu_raise_irq(hype_pic_emu_chip_t *chip, uint8_t irq) {
     }
     chip->irr |= (uint8_t)(1u << irq);
 }
+
+int hype_pic_emu_acknowledge_highest_priority(hype_pic_emu_chip_t *chip, uint8_t *out_vector) {
+    uint8_t pending = chip->irr & (uint8_t)~chip->imr;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        if (pending & (uint8_t)(1u << i)) {
+            chip->irr &= (uint8_t) ~(1u << i);
+            chip->isr |= (uint8_t)(1u << i);
+            *out_vector = (uint8_t)(chip->irq_offset + i);
+            return 1;
+        }
+    }
+    return 0;
+}
