@@ -14,6 +14,7 @@
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
 #include "../../../devices/pci.h"
+#include "../../../devices/cmos.h"
 #include "vmcb.h"
 
 /*
@@ -204,6 +205,25 @@ void hype_svm_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *ou
  * devices/pci.h this composes is already fully tested in isolation.
  */
 int hype_svm_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci);
+
+/*
+ * FW-1: routes an IOIO VM-exit to `cmos`'s index/data ports (0x70/0x71,
+ * devices/cmos.h) -- confirmed necessary via source-level investigation
+ * of this project's own vendored OVMF
+ * (edk2/OvmfPkg/Library/PlatformInitLib/MemDetect.c,
+ * PlatformGetSystemMemorySizeBelow4gb()): without fw_cfg's "etc/e820"
+ * describing a nonzero low-memory size, OVMF falls back to reading
+ * CMOS registers 0x34/0x35 for the system's memory size. Returns 0 if
+ * the port was 0x70 or 0x71 (handled, RIP already advanced via
+ * EXITINFO2), or -1 for any other port, same composable-handler-chain
+ * shape as hype_svm_vcpu_handle_ioio()/hype_svm_vcpu_handle_pci_cf8_ioio().
+ * Always 1-byte width (CMOS's own real-hardware convention -- there is
+ * no wider access form). Exempt from unit testing -- reaches into the
+ * exempt VMCB/GPR fields this backend's real VMRUN produces; every
+ * function in devices/cmos.h this composes is already fully tested in
+ * isolation.
+ */
+int hype_svm_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos);
 
 /*
  * FW-1 real-hardware/real-firmware debugging: a snapshot of the guest

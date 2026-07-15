@@ -142,12 +142,22 @@ static uint64_t g_fw_1_combined_size;
  * second time. */
 static uint64_t g_iso_host_phys;
 static uint64_t g_iso_size;
+/* Set once in efi_main() from the real UEFI memory map -- FW-1's own
+ * CMOS model reports this (not a guessed/fixed value) as the guest's
+ * memory size, matching how a real VM's memory-size discovery ought to
+ * reflect what's actually available. */
+static uint64_t g_usable_ram_bytes;
 static uint64_t g_fw_1_code_size;
 static uint64_t g_fw_1_vars_size;
 static uint8_t g_fw_1_guest_stack[65536] __attribute__((aligned(4096)));
 static hype_pic_emu_t g_fw_1_pic;
 static hype_pit_emu_t g_fw_1_pit;
 static hype_pci_t g_fw_1_pci;
+static hype_cmos_t g_fw_1_cmos;
+static hype_fw_cfg_t g_fw_1_fw_cfg;
+static hype_acpi_rsdp_t g_fw_1_rsdp;
+static uint8_t g_fw_1_tables_blob[4096] __attribute__((aligned(64)));
+static hype_acpi_loader_entry_t g_fw_1_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENTRIES];
 
 /* Intel Q35 MCH (the real Q35 chipset's host bridge) vendor/device ID
  * -- transcribed from this project's own vendored edk2 submodule,
@@ -2282,6 +2292,72 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
                          0x00, 0x00);
 
+    /* Real OVMF's own platform init needs real ACPI content via
+     * fw_cfg, the same "etc/acpi/rsdp"/"etc/acpi/tables"/
+     * "etc/table-loader" mechanism M4-4 already built and proved works
+     * against real SVM -- confirmed necessary here too: with no fw_cfg
+     * device registered at all, every fw_cfg port access (0x510/0x511)
+     * was absorbed as all-1s (visible in the unhandled-port log),
+     * giving real OVMF no valid ACPI/RSDP content to find. */
+    {
+        hype_acpi_layout_t layout;
+        hype_acpi_config_t cfg;
+        uint32_t loader_entries;
+        unsigned int z;
+
+        for (z = 0; z < HYPE_ACPI_MAX_CPUS; z++) {
+            cfg.apic_ids[z] = (uint8_t)z;
+        }
+        cfg.cpu_count = 1;
+        cfg.local_apic_address = 0xFEE00000u;
+        cfg.io_apic_id = 1;
+        cfg.io_apic_address = 0xFEC00000u;
+        cfg.io_apic_gsi_base = 0;
+        cfg.mcfg_base_address = 0xE0000000ULL;
+        cfg.pci_segment = 0;
+        cfg.pci_start_bus = 0;
+        cfg.pci_end_bus = 255;
+        cfg.sci_interrupt = 9;
+
+        if (hype_acpi_build_tables_blob(g_fw_1_tables_blob, sizeof(g_fw_1_tables_blob), &cfg, &layout) !=
+            0) {
+            hype_fatal("fw-1: hype_acpi_build_tables_blob failed");
+        }
+        hype_acpi_build_rsdp(&g_fw_1_rsdp, layout.xsdt_offset);
+        loader_entries = hype_acpi_loader_build_script(g_fw_1_loader_script, &layout);
+
+        hype_fw_cfg_reset(&g_fw_1_fw_cfg);
+        if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_RSDP, (const uint8_t *)&g_fw_1_rsdp,
+                                  sizeof(g_fw_1_rsdp)) < 0) {
+            hype_fatal("fw-1: fw_cfg registry full while registering rsdp");
+        }
+        if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_TABLES, g_fw_1_tables_blob,
+                                  layout.total_length) < 0) {
+            hype_fatal("fw-1: fw_cfg registry full while registering tables");
+        }
+        if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, "etc/table-loader", (const uint8_t *)g_fw_1_loader_script,
+                                  loader_entries * (uint32_t)sizeof(hype_acpi_loader_entry_t)) < 0) {
+            hype_fatal("fw-1: fw_cfg registry full while registering table-loader");
+        }
+    }
+
+    /* CMOS 0x34/0x35: the memory-size fallback path OVMF's own
+     * PlatformPei reads when fw_cfg's "etc/e820" file isn't present
+     * (this project doesn't register one -- ACPI content above is a
+     * separate concern) -- reports the actual usable RAM this machine
+     * has, not a guessed value, the same "reflect reality, don't
+     * fabricate" principle RAM-1 already established. */
+    {
+        uint64_t above_16mb =
+            (g_usable_ram_bytes > 16ULL * 1024 * 1024) ? (g_usable_ram_bytes - 16ULL * 1024 * 1024) : 0;
+        uint64_t units_64kb = above_16mb / 65536ULL;
+        if (units_64kb > 0xFFFFULL) {
+            units_64kb = 0xFFFFULL;
+        }
+        hype_cmos_reset(&g_fw_1_cmos);
+        hype_cmos_set_extended_memory_above_16mb(&g_fw_1_cmos, (uint16_t)units_64kb);
+    }
+
     /* Real x86 reset state is CS.base=0xFFFF0000, RIP=0xFFF0 -- NOT
      * CS.base=0xFFFFFFF0, RIP=0, despite both giving the identical
      * initial linear address. Real firmware's own ResetVector code
@@ -2349,6 +2425,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 continue;
             }
             if (hype_svm_vcpu_handle_pci_cf8_ioio(ctx, &g_fw_1_pci) == 0) {
+                continue;
+            }
+            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_fw_1_fw_cfg) == 0) {
+                continue;
+            }
+            if (hype_svm_vcpu_handle_cmos_ioio(ctx, &g_fw_1_cmos) == 0) {
                 continue;
             }
 
@@ -2467,6 +2549,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * check ahead of the guest-RAM allocation below is against this
      * machine's own real usable RAM, not a guess. */
     usable_ram_bytes = hype_memmap_usable_bytes(map, map_size, desc_size);
+    g_usable_ram_bytes = usable_ram_bytes;
     SystemTable->BootServices->FreePool(map);
 
     /* LocateProtocol is a Boot Services call like the memory map fetch

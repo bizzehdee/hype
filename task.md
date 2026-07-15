@@ -954,33 +954,62 @@ tasks — see updated deps below.*
       project's own* host-side execution (a raw host-pointer read from
       L1's own context, not the guest's). Fixed by guarding on
       `stack[2] != 0 && stack[2] < 4GB` before dereferencing.
-  - **Current blocker (new, after the microvm fix)**: with real PCI
-    config-space access working, the guest now correctly detects itself
-    as Q35 (not microvm), and progresses much further -- past PEI
-    entirely, reaching what appears to be DXE/GOP console
-    initialization (a screen-clear/cursor-home escape sequence appears
-    in the serial log just before the next fault, consistent with
-    ConsoleSplitter/GraphicsConsole starting up) -- before hitting a
-    *new* #PF at guest-linear `rip=0xE0006`, `CR3=0x800000` (back to the
-    SEC-phase temp-RAM page tables -- unclear yet whether this is a
-    second pass through SEC/PEI, e.g. an S3-resume-style path, or
-    something else). `0xE0006` falls within the classic PC "legacy BIOS
-    shadow" range (`0xE0000-0xFFFFF`), well below where either the PEI
-    or DXE FVs are actually mapped (both `>= 0x830000` per
-    `edk2/OvmfPkg/Include/Fdf/MemFd.fdf.inc`'s `MEMFD_BASE_ADDRESS`-
-    relative offsets) -- a strong candidate for legacy VGA-BIOS/option-
-    ROM shadow scanning jumping into memory this project has never
-    populated (no such device model exists yet). Not yet root-caused;
-    the same `addr2line`/`nm`-against-`edk2/Build` technique that solved
-    the microvm bug should apply here too, once the exact module
-    covering this address (if any -- it may not resolve to either FV at
-    all) is identified.
+  - **Investigated and fixed the follow-on #PF at `rip=0xE0006`** above.
+    Ruled out a legacy VGA-BIOS/option-ROM shadow-scan false positive
+    first (a pre-launch diagnostic dump found no `0x55 0xAA` signature
+    anywhere near `0xC0000`/`0xE0000`). The real cause, found via the
+    same source-level method that solved the microvm bug: this
+    project's vendored OVMF had **no fw_cfg device registered for FW-1
+    at all** -- ACPI content (RSDP/XSDT/FADT/MADT/MCFG/DSDT,
+    `devices/acpi.h`, already built and proved working by M4-4) was
+    never exposed via fw_cfg for this guest, and OVMF's own memory-size
+    fallback (`OvmfPkg/Library/PlatformInitLib/MemDetect.c`,
+    `PlatformGetSystemMemorySizeBelow4gb()`) reads CMOS registers
+    0x34/0x35 when fw_cfg's "etc/e820" file isn't present -- also
+    unhandled, also absorbed as all-1s. Both gaps are now fixed:
+    - `run_fw_1_test()` now builds real ACPI content
+      (`hype_acpi_build_tables_blob()`/`_build_rsdp()`/
+      `_loader_build_script()`, exactly M4-4's own already-tested
+      functions) and registers it with a real `hype_fw_cfg_t`
+      (`g_fw_1_fw_cfg`), wiring `hype_svm_vcpu_handle_fw_cfg_ioio()`
+      into the dispatch loop.
+    - **New device model**: `devices/cmos.h/.c` -- a minimal CMOS/RTC
+      register file (128 bytes, index/data port pair at 0x70/0x71,
+      bit 7 of the index write masked off as the conventional
+      NMI-disable bit, not a register-select bit). Only registers
+      0x34/0x35 (system memory above 16MB, in 64KB units) are ever
+      given a meaningful value -- computed from the *actual* usable
+      RAM this machine has (`hype_memmap_usable_bytes()`'s own result,
+      already computed for RAM-1's admission check, now also kept in
+      `g_usable_ram_bytes`), not a guessed constant, the same
+      "reflect reality" principle RAM-1 established. 100%/100%/100%
+      unit tested (`core/tests/test_cmos.c`). Exempt glue:
+      `hype_svm_vcpu_handle_cmos_ioio()`.
+    - Confirmed fixed: the exact `rip=0xE0006` #PF no longer occurs at
+      all with these two fixes in place -- the guest now runs well
+      past that point.
+  - **Current blocker (new, after the fw_cfg/CMOS fix)**: the guest now
+    enters an unbounded polling loop reading port `0x6` (a 4-byte IN,
+    repeated 10,000+ times with no other VM-exit in between) instead of
+    crashing -- a benign hang, not a fault. Port `0x6` is conventionally
+    the 8237 DMA controller's channel-3 address register (legacy PC I/O
+    map), though a 4-byte access to an 8-bit-only legacy DMA register is
+    unusual and not yet explained; a source-level correlation (the same
+    method that resolved every prior blocker this session) hasn't yet
+    identified which OVMF driver/PPI performs this specific read or
+    what value would satisfy its poll condition. Not yet root-caused --
+    the next concrete step for a future session: search
+    `edk2/Build/OvmfX64/RELEASE_CLANGDWARF/` for any module reading I/O
+    port 0x6 (grep the disassembly/source for the literal port number
+    or a `DMA`-related PPI/library), or add a temporary CMOS-style
+    minimal DMA-controller stub and iterate on what response value
+    breaks the loop.
   - New diagnostic accessors added for this investigation, all exempt
     from unit testing (same reasoning as every other
     `hype_svm_vcpu_handle_*` glue function): `hype_svm_vcpu_get_last_npf()`,
     `hype_svm_vcpu_get_debug_state()` (CS/CR0/CR2/CR3/RIP/RFLAGS/RSP),
     `hype_svm_vcpu_set_rip()`, `hype_svm_vcpu_handle_unknown_ioio()`,
-    `hype_svm_vcpu_handle_pci_cf8_ioio()`.
+    `hype_svm_vcpu_handle_pci_cf8_ioio()`, `hype_svm_vcpu_handle_cmos_ioio()`.
 
 - [ ] **FW-2** — Load OVMF_CODE.fd/OVMF_VARS.fd from fw/ into guest RAM
   at boot, replacing the fixed hand-written test-guest entry points

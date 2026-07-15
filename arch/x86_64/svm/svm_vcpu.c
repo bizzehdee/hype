@@ -386,6 +386,38 @@ int hype_svm_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
     return 0;
 }
 
+int hype_svm_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+
+    if (io.port == 0x70u) {
+        if (io.is_in) {
+            /* Real hardware supports reading the index register back;
+             * this project has no callers that do, but there is no
+             * reason to fail an IN here rather than answer it. */
+            real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | cmos->index;
+        } else {
+            hype_cmos_index_write(cmos, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+        }
+    } else if (io.port == 0x71u) {
+        if (io.is_in) {
+            uint8_t value = hype_cmos_data_read(cmos);
+            real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
+        } else {
+            hype_cmos_data_write(cmos, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+        }
+    } else {
+        return -1;
+    }
+
+    /* EXITINFO2 gives the resume RIP directly, same "next-RIP-for-free"
+     * convenience hype_svm_vcpu_handle_ioio() itself already relies on. */
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return 0;
+}
+
 void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     out->cs_selector = real->vmcb->save.cs.selector;
