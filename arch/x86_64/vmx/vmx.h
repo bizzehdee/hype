@@ -24,6 +24,16 @@
 #define HYPE_FEATURE_CONTROL_VMX_OUTSIDE_SMX (1ULL << 2)
 #define HYPE_MSR_IA32_VMX_BASIC 0x480u
 
+/* IA32_VMX_CR0/CR4_FIXED0/1 (SDM Vol 3C, "VMXON" + App A.7/A.8): before
+ * VMXON, CR0 and CR4 must have every bit set that is 1 in FIXED0 and
+ * every bit clear that is 0 in FIXED1. Not applying these is a common
+ * cause of a #GP from VMXON on real silicon (e.g. CR0.NE, bit 5, which
+ * VMX requires but some environments leave clear). */
+#define HYPE_MSR_IA32_VMX_CR0_FIXED0 0x486u
+#define HYPE_MSR_IA32_VMX_CR0_FIXED1 0x487u
+#define HYPE_MSR_IA32_VMX_CR4_FIXED0 0x488u
+#define HYPE_MSR_IA32_VMX_CR4_FIXED1 0x489u
+
 #define HYPE_CR4_VMXE (1ULL << 13)
 
 /* Whether IA32_FEATURE_CONTROL's current value permits VMXON: either
@@ -41,6 +51,13 @@ uint64_t hype_vmx_feature_control_with_vmxon_enabled(uint64_t feature_control);
 /* Given the current CR4 value, returns it with VMXE (bit 13) set,
  * leaving every other bit untouched. Pure bit-manipulation. */
 uint64_t hype_vmx_cr4_with_vmxe(uint64_t old_cr4);
+
+/* Forces a CR0/CR4 value to satisfy the VMX fixed-bit requirements:
+ * every bit that is 1 in fixed0 must be set, every bit that is 0 in
+ * fixed1 must be clear -> (cr | fixed0) & fixed1 (SDM Vol 3C, App A.7/
+ * A.8). Applied before VMXON so a required bit like CR0.NE can't be the
+ * cause of a #GP. Pure bit-manipulation. */
+uint64_t hype_vmx_cr_with_fixed_bits(uint64_t cr, uint64_t fixed0, uint64_t fixed1);
 
 /*
  * Adjusts a desired 32-bit VM-execution/entry/exit control value

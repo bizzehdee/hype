@@ -46,6 +46,32 @@ static void test_cr4_with_vmxe(void) {
     CHECK_HEX("existing bits preserved", cr4, result & ~HYPE_CR4_VMXE);
 }
 
+static void test_cr_with_fixed_bits(void) {
+    /* FIXED0 = must-be-1 bits; FIXED1 = may-be-1 bits (a 0 there forces
+     * the bit clear). (cr | fixed0) & fixed1. */
+    /* CR0.NE (bit 5) required by VMX but clear in the input -> gets set. */
+    uint64_t fixed0 = (1ULL << 0) | (1ULL << 5);          /* PE + NE required */
+    uint64_t fixed1 = ~0ULL;                               /* nothing forced to 0 */
+    CHECK_HEX("required bit (NE) forced set", (1ULL << 5),
+              hype_vmx_cr_with_fixed_bits(0x1ULL, fixed0, fixed1) & (1ULL << 5));
+    CHECK_HEX("already-set required bit preserved", 0x1ULL,
+              hype_vmx_cr_with_fixed_bits(0x1ULL, fixed0, fixed1) & 0x1ULL);
+
+    /* A bit that FIXED1 forces to 0 (bit 31 clear in fixed1) is cleared
+     * even if currently set. */
+    fixed0 = 0ULL;
+    fixed1 = ~(1ULL << 31);
+    CHECK_HEX("forbidden bit forced clear", 0ULL,
+              hype_vmx_cr_with_fixed_bits((1ULL << 31) | 0x21ULL, fixed0, fixed1) & (1ULL << 31));
+    CHECK_HEX("unaffected bits preserved", 0x21ULL,
+              hype_vmx_cr_with_fixed_bits((1ULL << 31) | 0x21ULL, fixed0, fixed1) & 0x21ULL);
+
+    /* Typical real values: FIXED0=0x80000021 (PE|NE|PG must be 1),
+     * FIXED1=0xffffffff -> a CR0 already having those is unchanged. */
+    CHECK_HEX("compliant CR0 unchanged", 0x80000033ULL,
+              hype_vmx_cr_with_fixed_bits(0x80000033ULL, 0x80000021ULL, 0xFFFFFFFFULL));
+}
+
 static void test_adjust_controls(void) {
     /* allowed0 (bits 31:0) = must-be-1 mask; allowed1 (bits 63:32) =
      * may-be-1 mask. */
@@ -70,6 +96,7 @@ int main(void) {
     test_feature_control_allows_vmxon();
     test_feature_control_with_vmxon_enabled();
     test_cr4_with_vmxe();
+    test_cr_with_fixed_bits();
     test_adjust_controls();
 
     if (failures == 0) {

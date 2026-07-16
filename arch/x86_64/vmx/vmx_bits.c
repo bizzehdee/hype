@@ -18,6 +18,10 @@ uint64_t hype_vmx_cr4_with_vmxe(uint64_t old_cr4) {
     return old_cr4 | HYPE_CR4_VMXE;
 }
 
+uint64_t hype_vmx_cr_with_fixed_bits(uint64_t cr, uint64_t fixed0, uint64_t fixed1) {
+    return (cr | fixed0) & fixed1;
+}
+
 uint32_t hype_vmx_adjust_controls(uint32_t desired, uint64_t capability_msr) {
     uint32_t allowed0 = (uint32_t)(capability_msr & 0xFFFFFFFFu);
     uint32_t allowed1 = (uint32_t)(capability_msr >> 32);
