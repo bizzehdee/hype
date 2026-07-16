@@ -22,6 +22,7 @@
 #include "../../../devices/guest_uart.h"
 #include "../../../devices/virtio_blk.h"
 #include "../../../devices/ata_disk.h"
+#include "../../../core/guest_mem.h"
 #include "vmcb.h"
 
 /*
@@ -616,18 +617,19 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
                                    uint64_t ahci_base_phys);
 
 /*
- * FW-1h variant of hype_svm_vcpu_handle_ahci_npf() for a guest whose
- * NPT does NOT identity-map RAM. Real OVMF (FW-1) runs with guest-
- * physical [0, GUEST_RAM) remapped to a separately-allocated host
- * buffer (g_fw_1_ram_host_phys), so every guest-physical address OVMF's
- * AhciBusDxe programs into the Command List/Table, received-FIS area
- * and PRDT -- plus the faulting instruction's own RIP -- must have
- * dma_offset (= g_fw_1_ram_host_phys) added before it is dereferenced
- * as a host pointer. Identical to the identity-map handler above in
- * every other respect (pass dma_offset == 0 for that case, which is
- * exactly what the plain handler does). Same unit-test exemption. */
-int hype_svm_vcpu_handle_ahci_npf_xlat(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
-                                        uint64_t ahci_base_phys, uint64_t dma_offset);
+ * FW-1h/VALID-3 variant of hype_svm_vcpu_handle_ahci_npf() for a guest
+ * whose NPT does NOT identity-map RAM. Real OVMF (FW-1) runs with guest-
+ * physical [0, GUEST_RAM) remapped to a separately-allocated host buffer
+ * plus a flash window near 4GB, so every guest-physical address the
+ * guest's AHCI driver programs into the Command List/Table, received-FIS
+ * area and PRDT -- plus the faulting instruction's own RIP -- is
+ * translated AND bounds-checked through dma_map (VALID-1) with its
+ * access length before being dereferenced; an out-of-range address
+ * fails the command rather than reaching host memory. The plain handler
+ * above is the NULL-map (trusted identity) case. Same unit-test
+ * exemption. */
+int hype_svm_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                       uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map);
 
 /*
  * M5-2's counterpart to hype_svm_vcpu_handle_ahci_npf() above -- same

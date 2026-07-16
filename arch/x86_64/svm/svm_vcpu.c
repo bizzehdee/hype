@@ -1,5 +1,7 @@
 #include "svm.h"
 
+#include "../../../core/guest_mem.h"
+
 #include "../../../core/fatal.h"
 
 /*
@@ -815,6 +817,22 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
  * legal-instruction-length limit. */
 #define HYPE_MMIO_MAX_INSTR_BYTES 15
 
+/* VALID-3 guest-physical -> host translation for the AHCI DMA path.
+ * A NULL dma_map means "trusted identity-mapped guest" (the M4-5/ISO-2/
+ * PCI-2/M5-2 cooperating test guests, whose NPT identity-maps RAM so
+ * guest-physical == host and whose DMA addresses this project itself
+ * wrote) -- return the address unchecked, preserving their exact prior
+ * behavior. A non-NULL map (FW-1's real OVMF/OS guest) routes every
+ * guest-supplied address through the bounds-checked VALID-1 lookup with
+ * its access length; a 0 return (out of range / straddling / overrun /
+ * overflow) propagates as "reject" to the caller. */
+static uint64_t ahci_dma_xlate(const hype_gpa_map_t *dma_map, uint64_t gpa, uint64_t len) {
+    if (dma_map == 0) {
+        return gpa;
+    }
+    return hype_gpa_to_host(dma_map, gpa, len);
+}
+
 /* Walks the guest's Command List (slot 0 only, this project's own
  * single-outstanding-command scope) -> Command Table -> ATAPI CDB,
  * dispatches it, copies the response into the PRDT-described guest
@@ -827,13 +845,15 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
  * is "one ATAPI CD-ROM," never a raw ATA disk on this port, so
  * anything else is fail-closed rather than guessed at, matching every
  * other MMIO/NPF handler's convention here. */
-static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi, uint64_t dma_offset) {
+static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                       const hype_gpa_map_t *dma_map) {
     uint64_t cmd_list_phys = (uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32);
     uint64_t rx_fis_phys = (uint64_t)ahci->p_fb | ((uint64_t)ahci->p_fbu << 32);
-    uint8_t *cmd_hdr_bytes = (uint8_t *)(uintptr_t)(cmd_list_phys + dma_offset);
+    uint8_t *cmd_hdr_bytes;
     hype_ahci_cmd_header_t hdr;
     const uint8_t *cmd_table_bytes;
     const uint8_t *prdt_bytes;
+    uint8_t *rx_fis_host;
     hype_atapi_result_t result;
     uint8_t identify[HYPE_ATAPI_IDENTIFY_SIZE];
     const uint8_t *src;
@@ -846,8 +866,27 @@ static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi, ui
     uint8_t *d2h_fis;
     unsigned i;
 
+    /* VALID-3: every guest-physical address the AHCI command structures
+     * carry is guest-controlled, so each is translated through the VM's
+     * bounds-checked gpa map (VALID-1) -- with its access length -- and
+     * a rejected (0) translation fails the command rather than
+     * dereferencing an out-of-range host pointer. The command header is
+     * the 32-byte slot-0 entry. */
+    cmd_hdr_bytes = (uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, cmd_list_phys, 32u);
+    if (cmd_hdr_bytes == 0) {
+        return -1;
+    }
+
     hype_ahci_decode_cmd_header(cmd_hdr_bytes, &hdr);
-    cmd_table_bytes = (const uint8_t *)(uintptr_t)(hdr.cmd_table_phys + dma_offset);
+    /* Command Table = 0x80-byte CFIS/ACMD/reserved block + prdtl 16-byte
+     * PRDT entries. A malicious prdtl that would run the table off the
+     * region is caught here (the length is computed in 64-bit so it
+     * cannot wrap before the check). */
+    cmd_table_bytes = (const uint8_t *)(uintptr_t)ahci_dma_xlate(
+        dma_map, hdr.cmd_table_phys, (uint64_t)0x80u + (uint64_t)hdr.prdtl * 16u);
+    if (cmd_table_bytes == 0) {
+        return -1;
+    }
 
     if (!hdr.is_atapi) {
         /* A plain H2D Register FIS command (Command Header's ATAPI bit
@@ -942,7 +981,14 @@ static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi, ui
 
         hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)prd_idx * 16u, &prd);
         chunk = (prd.byte_count < remaining) ? prd.byte_count : remaining;
-        dst = (uint8_t *)(uintptr_t)(prd.data_phys + dma_offset);
+        /* VALID-3: the PRD data buffer is guest-supplied -- bounds-check
+         * [data_phys, data_phys+chunk) before writing the response into
+         * it, so a guest-programmed PRD can never steer the copy at
+         * hypervisor or another VM's memory. */
+        dst = (uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, prd.data_phys, chunk);
+        if (dst == 0) {
+            return -1;
+        }
         for (j = 0; j < chunk; j++) {
             dst[j] = src[j];
         }
@@ -965,7 +1011,16 @@ static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi, ui
 
     ahci->p_tfd = (uint32_t)status_reg | ((uint32_t)error_reg << 8);
 
-    d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_phys + dma_offset + 0x40);
+    /* VALID-3: the Received FIS area is guest-supplied. Validate
+     * [rx_fis, rx_fis+0x54) (the D2H Register FIS sits at offset 0x40,
+     * 20 bytes) as one range -- computing the +0x40 on the host pointer
+     * after translation, so a near-top guest address cannot overflow
+     * before the check. */
+    rx_fis_host = (uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
+    if (rx_fis_host == 0) {
+        return -1;
+    }
+    d2h_fis = rx_fis_host + 0x40;
     for (i = 0; i < 20; i++) {
         d2h_fis[i] = 0;
     }
@@ -982,25 +1037,18 @@ static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi, ui
     return 0;
 }
 
-/* Shared body for the ATAPI AHCI NPF handler. dma_offset is added to
- * every guest-physical address this path dereferences as a host pointer
- * -- both the faulting instruction fetch (save.rip) and every DMA
- * structure the guest programmed (Command List/Table, received-FIS
- * area, PRDT data buffers). It is 0 for a guest whose NPT identity-maps
- * RAM (guest-physical == host-physical, e.g. every M4-5/ISO-2/PCI-2
- * test guest), and the guest-RAM host offset for a guest whose NPT
- * remaps RAM to a separately-allocated host buffer (FW-1's real OVMF
- * boot: guest-physical [0, GUEST_RAM) -> g_fw_1_ram_host_phys + gpa).
- * The single linear offset is correct because OVMF's own code and all
- * the DMA structures it programs live in that one contiguous low-RAM
- * region. NOTE (VALID-3): dma_offset translation does NOT yet bounds-
- * check the guest-supplied addresses against the RAM window -- a guest
- * that programs an out-of-range DMA pointer would translate to an
- * out-of-range host pointer. FW-1's own trusted OVMF never does; a
- * malicious/buggy guest is VALID-3's job to fence off. */
+/* Shared body for the ATAPI AHCI NPF handler. dma_map (VALID-1/VALID-3)
+ * translates + bounds-checks every guest-physical address this path
+ * touches -- the faulting instruction fetch (when decode assists are
+ * absent) and, in process_ahci_command_slot0(), every DMA structure the
+ * guest programmed. A NULL map means "trusted identity-mapped guest"
+ * (the M4-5/ISO-2/PCI-2 test guests: guest-physical == host, unchecked);
+ * a non-NULL map is FW-1's real guest, whose OVMF/OS-supplied addresses
+ * are validated against its actual guest-physical layout (RAM + flash),
+ * so an out-of-range address is rejected rather than dereferenced. */
 static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_t *ahci,
                                            hype_atapi_t *atapi, uint64_t ahci_base_phys,
-                                           uint64_t dma_offset) {
+                                           const hype_gpa_map_t *dma_map) {
     hype_svm_npf_t npf;
     hype_mmio_decode_t decoded;
     uint64_t *reg;
@@ -1017,13 +1065,15 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
 
     /* Prefer AMD's decode-assist instruction capture (valid regardless
      * of the guest's paging); fall back to translating RIP as a guest-
-     * physical address for an identity-paged guest on a CPU without
-     * decode assists (dma_offset makes that translation RAM-remap-aware
-     * for FW-1, and is 0 for the identity-mapped test guests). */
+     * physical address (identity-paged guests -- OVMF -- run with
+     * RIP == guest-physical) through the bounds-checked map. */
     if (real->vmcb->control.num_bytes_fetched != 0) {
         guest_bytes = real->vmcb->control.guest_instruction_bytes;
     } else {
-        guest_bytes = (const uint8_t *)(uintptr_t)(real->vmcb->save.rip + dma_offset);
+        guest_bytes = (const uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, real->vmcb->save.rip, 1u);
+        if (guest_bytes == 0) {
+            return -1;
+        }
     }
     if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
         return -1;
@@ -1047,7 +1097,7 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
             return -1;
         }
         if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
-            if (process_ahci_command_slot0(ahci, atapi, dma_offset) != 0) {
+            if (process_ahci_command_slot0(ahci, atapi, dma_map) != 0) {
                 return -1;
             }
         }
@@ -1069,13 +1119,15 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
 
 int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
                                    uint64_t ahci_base_phys) {
+    /* NULL map: trusted identity-mapped test guest (guest-physical ==
+     * host, addresses this project wrote itself). */
     return hype_svm_ahci_atapi_npf_common((struct hype_vcpu_ctx *)ctx, ahci, atapi, ahci_base_phys, 0);
 }
 
-int hype_svm_vcpu_handle_ahci_npf_xlat(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
-                                        uint64_t ahci_base_phys, uint64_t dma_offset) {
+int hype_svm_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                       uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map) {
     return hype_svm_ahci_atapi_npf_common((struct hype_vcpu_ctx *)ctx, ahci, atapi, ahci_base_phys,
-                                          dma_offset);
+                                          dma_map);
 }
 
 /* Fills the D2H (Device to Host) completion FIS and clears PxCI's slot

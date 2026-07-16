@@ -748,11 +748,39 @@ code. Foundational to every device model task below; not optional.
 - [ ] **VALID-2** — Apply VALID-1 to virtio queue descriptor processing
   (virtio-blk, virtio-net).
   Deps: VALID-1
-- [ ] **VALID-3** — Apply VALID-1 to AHCI/NVMe command FIS buffer pointers,
+- [x] **VALID-3** — Apply VALID-1 to AHCI/NVMe command FIS buffer pointers,
   plus explicit LBA+sector-count bounds-checking against the backing
   store's actual size (file length or physical disk capacity) before any
   read/write — reject out-of-range requests, never clamp/truncate silently.
   Deps: VALID-1
+
+  *AHCI DMA path (svm_vcpu.c process_ahci_command_slot0): every guest-
+  supplied guest-physical address the command carries -- the Command
+  List header (32B), Command Table (0x80 + prdtl*16, so a malicious
+  prdtl is caught), each PRDT data buffer (chunk bytes), and the
+  Received-FIS area (0x54B) -- is now translated through the VALID-1
+  bounds-checked `hype_gpa_to_host()` with its access length before it
+  is dereferenced; a rejected (out-of-range / straddling / overrun /
+  overflow) address fails the command instead of steering the copy at
+  hypervisor or another VM's memory. The faulting-instruction fetch uses
+  the same map when decode assists are absent. Threaded via a
+  `const hype_gpa_map_t *dma_map`: `hype_svm_vcpu_handle_ahci_npf_map()`
+  (FW-1, passing g_fw_1_dma_map = its RAM+flash layout) bounds-checks;
+  the plain `hype_svm_vcpu_handle_ahci_npf()` passes NULL for the
+  trusted identity-mapped M4-5/ISO-2/PCI-2 test guests (whose DMA
+  addresses this project wrote itself), a zero-cost `gpa == host` path.
+  LBA+sector-count bounds-checking against the backing store was already
+  enforced by the device models and is retained: ATAPI READ(10)
+  (devices/atapi.c handle_read10) rejects lba >= total_sectors or a
+  count that overruns with CHECK_CONDITION/ILLEGAL_REQUEST, and the ATA
+  disk path uses hype_ata_disk_range_in_bounds() (IDNF on out-of-range)
+  -- never clamped/truncated. Verified under QEMU+KVM: FW-1's real OVMF
+  boots the UEFI Shell AND GRUB+the Linux kernel entirely through the
+  now-bounds-checked AHCI DMA (legitimate in-range DMA passes; only
+  out-of-range is rejected). All 56 unit binaries pass. (A future
+  hardening could complete a rejected command with an error status
+  rather than the current fail-closed fatal, and VALID-2/4 extend the
+  same helper to virtio and the remaining device buffers.)*
 - [ ] **VALID-4** — Apply VALID-1 to any other guest-supplied buffer used
   by device emulation (PS/2, framebuffer-adjacent paths) as those devices
   are built.

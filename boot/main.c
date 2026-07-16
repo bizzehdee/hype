@@ -198,6 +198,9 @@ static hype_acpi_loader_entry_t g_fw_1_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENT
  * loaded buffer (g_iso_host_phys/g_iso_size), same as run_iso_2_test. */
 static hype_ahci_t g_fw_1_ahci;
 static hype_atapi_t g_fw_1_atapi;
+/* VALID-1/VALID-3: FW-1's guest-physical -> host layout (RAM + flash),
+ * used to bounds-check every guest-supplied AHCI DMA address. */
+static hype_gpa_map_t g_fw_1_dma_map;
 /* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
  * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
  * guest-physical address in the 32-bit PCI MMIO aperture, and enables
@@ -4519,6 +4522,16 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                      (0x100000000ULL - g_fw_1_combined_size) - HYPE_FW_1_GUEST_RAM_BYTES);
     npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
 
+    /* VALID-1/VALID-3: the guest-physical -> host map, mirroring the two
+     * hype_npt_map_range() calls above exactly. The AHCI DMA path
+     * bounds-checks every guest-supplied address against this before
+     * dereferencing it, so OVMF/the guest OS can never steer a device
+     * DMA outside its own RAM/flash. */
+    hype_gpa_map_reset(&g_fw_1_dma_map);
+    hype_gpa_map_add(&g_fw_1_dma_map, 0, g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_gpa_map_add(&g_fw_1_dma_map, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
+                      g_fw_1_combined_size);
+
     hype_debug_print(
         "fw-1: launching real OVMF at cs_base=0x%llx rip=0x%llx (guest-physical [0x%llx,0x100000000) -> "
         "host-physical 0x%llx)\n",
@@ -4611,32 +4624,17 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         console_chars += fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
                                                   (unsigned int)sizeof(uart_line2));
 
-        /* FW-1g: after a key is injected, "reacted" = the guest emits new
-         * CONSOLE output (the Boot Manager Menu's item labels are plain
-         * text that survives the VT filter) -- a robust signal, unlike
-         * productive-exit count which OVMF's keyboard status-poll spin
-         * inflates. AND re-arm the scancode on a throttled cadence:
-         * OVMF busy-polls status rather than idle-HLTing, so the byte
-         * must be present *during* that poll -- but re-arming every exit
-         * would keep OBF perpetually set and hang OVMF's drain loop, so
-         * only every N exits (leaving OBF-clear windows for the drain to
-         * finish and the key to be processed). */
-        if (key_injected && !key_reacted) {
-            if (console_chars - inject_chars >= HYPE_FW_1_KEY_REACTION_CHARS) {
-                key_reacted = 1;
-                booted = 1;
-                break;
-            }
-            /* Give up whether OVMF is idle-HLTing OR busy-spinning on the
-             * keyboard status (this check runs every exit, unlike the
-             * HLT-branch one). */
-            if (total_exits - inject_total >= HYPE_FW_1_KEY_WAIT_EXITS) {
-                booted = 1;
-                break;
-            }
-            if ((total_exits - inject_total) % HYPE_FW_1_KEY_REARM_INTERVAL == 0) {
-                hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, HYPE_FW_1_KEY_ENTER_MAKE);
-            }
+        /* FW-1g: "reacted" = the guest emitted new CONSOLE output after
+         * we fed it a key -- evidence the keystroke registered and drove
+         * the guest forward. Recorded for the final report; it does NOT
+         * end the run. The key injection (in the PS/2 branch below)
+         * UNBLOCKS each interactive prompt so the guest keeps booting --
+         * FW-1h needs the CD to boot and M4-6 needs the kernel to start,
+         * both of which happen only if the loop runs on past the first
+         * prompt rather than terminating at it. */
+        if (key_injected && !key_reacted &&
+            console_chars - inject_chars >= HYPE_FW_1_KEY_REACTION_CHARS) {
+            key_reacted = 1;
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
@@ -4718,8 +4716,8 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 hype_svm_vcpu_get_last_npf(ctx, &ahci_npf);
                 if (ahci_npf.guest_phys_addr >= ahci_abar &&
                     ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
-                    if (hype_svm_vcpu_handle_ahci_npf_xlat(ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
-                                                            g_fw_1_ram_host_phys) == 0) {
+                    if (hype_svm_vcpu_handle_ahci_npf_map(ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
+                                                           &g_fw_1_dma_map) == 0) {
                         continue;
                     }
                     hype_fatal("fw-1: unhandled AHCI ABAR MMIO at guest-physical 0x%llx (%s, "
@@ -4766,14 +4764,25 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                     } else {
                         kbd_poll_run = 0;
                     }
-                    if (!key_injected && productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
+                    /* Feed Enter whenever the guest has clearly settled
+                     * into an input-wait (a long run of empty status
+                     * polls) past the boot threshold. This UNBLOCKS the
+                     * prompt so the guest proceeds -- the early OVMF/BDS
+                     * "press a key to continue" prompt, then GRUB's menu,
+                     * then the shell -- rather than stalling. Re-arms only
+                     * after another full poll run (kbd_poll_run reset to
+                     * 0), so it never holds OBF perpetually set. */
+                    if (productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
                         kbd_poll_run >= HYPE_FW_1_KBD_POLL_INJECT_RUN) {
-                        hype_debug_print("fw-1: guest is polling the keyboard at an interactive prompt "
-                                          "(%llu consecutive empty status reads, %llu productive exits) -- "
-                                          "injecting Enter now (FW-1g)\n",
-                                          (unsigned long long)kbd_poll_run,
-                                          (unsigned long long)productive_exits);
+                        if (!key_injected) {
+                            hype_debug_print(
+                                "fw-1: guest polling the keyboard at an interactive prompt (%llu "
+                                "consecutive empty status reads, %llu productive exits) -- feeding Enter "
+                                "to drive it forward (FW-1g)\n",
+                                (unsigned long long)kbd_poll_run, (unsigned long long)productive_exits);
+                        }
                         hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, HYPE_FW_1_KEY_ENTER_MAKE);
+                        kbd_poll_run = 0;
                         key_injected = 1;
                         inject_chars = console_chars;
                         inject_productive = productive_exits;
