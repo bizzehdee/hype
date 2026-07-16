@@ -1023,15 +1023,30 @@ tasks — see updated deps below.*
   per-device emulation the kernel demands in order, decomposed below.
   These gate "kernel reaches userspace", not the GRUB milestone (done).*
 
-- [ ] **M4-6a** — Port 0x61 (NMI status/control + PIT channel-2 gate +
-  refresh-clock toggle). Linux's early PIT-based delay calibration
-  (`calibrate_delay`/`pit_calibrate_tsc`) polls port 0x61: bit 4
-  (refresh clock, toggles ~every 15us) and bit 5 (PIT ch2 OUT, follows
-  the ch2 counter when the gate bit 0 is set). FW-1 currently absorbs
-  0x61 as an unhandled port, so neither bit ever changes and the
-  calibration loop spins to HYPE_FW_1_MAX_EXITS. Model port 0x61 (likely
-  fold into devices/pit.h or a small companion): bit 4 toggling, bit 5
-  driven by the existing PIT ch2 model + the guest-written gate.
+- [x] **M4-6a** — Port 0x61 (NMI status/control + PIT channel-2 gate +
+  refresh-clock toggle). DONE + verified: the Alpine kernel now runs
+  well past PIT delay calibration (previously spun on port 0x61 to
+  HYPE_FW_1_MAX_EXITS) into serial-port probing and AHCI driver init.
+
+  *Extended the guest PIT model (devices/pit.{h,c}) with a System
+  Control Port B (0x61) surface: a write latches the software-writable
+  low nibble (channel-2 GATE in bit 0, speaker in bit 1); a read returns
+  those plus the RAM-refresh clock (bit 4, flipped every read so a
+  refresh-watching delay loop always sees it change) and channel 2's OUT
+  pin (bit 5). OUT follows a mode-0 one-shot: driven low when ch2 is
+  programmed (control word 0xb0), high once the counter reaches terminal
+  count. hype_pit_emu_tick() now sets ch2 OUT at TC, and the FW-1 loop
+  ticks the guest PIT once per VM-exit (alongside the LAPIC tick), so
+  each poll of port 0x61 advances ch2 -- exactly what Linux's
+  pit_calibrate_tsc polls (set gate, load count, `while ((inb(0x61) &
+  0x20) == 0)`). Wired port 0x61 into hype_svm_vcpu_handle_ioio.
+  Unit-tested (test_pit_emu.c: OUT low-after-program, high-at-TC,
+  reprogram-resets, refresh toggle, writable-bit mask); devices/pit.c
+  stays well above the coverage floor. The default UefiShell boot is
+  unaffected. The kernel's NEXT blocker is a separate one -- its AHCI
+  driver's MMIO decode needs a guest-page-table walk for the faulting
+  instruction (the kernel runs in virtual address space), addressed in
+  the M4-6d/AHCI work.
   Deps: M4-6 infra (done).
 - [ ] **M4-6b** — Guest timer-interrupt delivery at scale: once past
   calibration the kernel arms the LAPIC timer / PIT and expects periodic

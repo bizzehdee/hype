@@ -234,6 +234,63 @@ static void test_readback_command_is_ignored(void) {
     CHECK_HEX("read-back command leaves default access mode alone", 3, pit.channels[0].access_mode);
 }
 
+/* M4-6a: the port-0x61 / channel-2-OUT path a Linux PIT-based TSC/delay
+ * calibration drives -- program ch2 mode 0, load a count, set the gate,
+ * then poll port 0x61 bit 5 for OUT to go high at terminal count. */
+static void test_port61_ch2_out_goes_high_at_terminal_count(void) {
+    hype_pit_emu_t pit;
+    hype_pit_emu_reset(&pit);
+
+    CHECK_HEX("port61 resets to 0", 0, pit.port61);
+    CHECK_HEX("ch2 OUT resets low", 0, hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_CH2_OUT);
+
+    /* Control word 0xb0: channel 2, access lobyte/hibyte, mode 0. */
+    hype_pit_emu_io_write(&pit, 0x43, 0xb0);
+    CHECK_HEX("OUT low after programming ch2 mode 0", 0,
+              hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_CH2_OUT);
+
+    /* Load count = 3 (lobyte then hibyte). */
+    hype_pit_emu_io_write(&pit, 0x42, 0x03);
+    hype_pit_emu_io_write(&pit, 0x42, 0x00);
+
+    /* Enable the gate (bit 0) and confirm it reads back. */
+    hype_pit_emu_port61_write(&pit, HYPE_PIT_PORT61_CH2_GATE);
+    CHECK_HEX("gate bit reads back", HYPE_PIT_PORT61_CH2_GATE,
+              hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_CH2_GATE);
+
+    /* Not yet at terminal count. */
+    hype_pit_emu_tick(&pit); /* 3 -> 2 */
+    hype_pit_emu_tick(&pit); /* 2 -> 1 */
+    CHECK_HEX("OUT still low mid-count", 0,
+              hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_CH2_OUT);
+    hype_pit_emu_tick(&pit); /* 1 -> 0: terminal count */
+    CHECK_HEX("OUT high at terminal count", HYPE_PIT_PORT61_CH2_OUT,
+              hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_CH2_OUT);
+
+    /* Reprogramming ch2 drives OUT low again (next calibration loop). */
+    hype_pit_emu_io_write(&pit, 0x43, 0xb0);
+    CHECK_HEX("OUT low again after reprogramming", 0,
+              hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_CH2_OUT);
+}
+
+static void test_port61_refresh_toggles(void) {
+    hype_pit_emu_t pit;
+    uint8_t a, b;
+    hype_pit_emu_reset(&pit);
+    a = hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_REFRESH;
+    b = hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_REFRESH;
+    CHECK_HEX("refresh clock bit flips between consecutive reads", 1, a != b);
+}
+
+static void test_port61_write_masks_to_writable_bits(void) {
+    hype_pit_emu_t pit;
+    hype_pit_emu_reset(&pit);
+    /* Writing all-ones stores only the writable low nibble; the OUT and
+     * refresh bits are device-produced, not writable. */
+    hype_pit_emu_port61_write(&pit, 0xFF);
+    CHECK_HEX("only writable low nibble latched", HYPE_PIT_PORT61_WRITABLE, pit.port61);
+}
+
 int main(void) {
     test_reset_defaults();
     test_unrecognized_port_rejected();
@@ -251,6 +308,9 @@ int main(void) {
     test_tick_stays_at_zero_in_mode0();
     test_channels_are_independent();
     test_readback_command_is_ignored();
+    test_port61_ch2_out_goes_high_at_terminal_count();
+    test_port61_refresh_toggles();
+    test_port61_write_masks_to_writable_bits();
 
     if (failures == 0) {
         printf("all tests passed\n");

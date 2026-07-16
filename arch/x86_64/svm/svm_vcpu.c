@@ -358,6 +358,18 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
         } else {
             rc = hype_pit_emu_io_write(pit, io.port, (uint8_t)(real->vmcb->save.rax & 0xFFu));
         }
+    } else if (io.port == 0x61u) {
+        /* System Control Port B: PIT channel-2 gate (write) + OUT/refresh
+         * clock (read). A guest's PIT-based TSC/delay calibration
+         * (e.g. Linux pit_calibrate_tsc) sets the ch2 gate here then
+         * polls bit 5 for OUT; without it the poll spins forever. */
+        if (io.is_in) {
+            real->vmcb->save.rax =
+                (real->vmcb->save.rax & ~0xFFULL) | hype_pit_emu_port61_read(pit);
+        } else {
+            hype_pit_emu_port61_write(pit, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+        }
+        rc = 0;
     } else {
         return -1;
     }

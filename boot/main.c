@@ -4615,6 +4615,11 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
             hype_svm_vcpu_request_interrupt(ctx, timer_vector);
         }
+        /* M4-6a: advance the guest PIT one tick per VM-exit so channel 2
+         * counts down (its OUT pin, read back on port 0x61 bit 5, drives
+         * the Linux kernel's PIT-based TSC/delay calibration out of its
+         * poll spin). */
+        hype_pit_emu_tick(&g_fw_1_pit);
 
         /* FW-1e: surface any console text the guest wrote to either UART.
          * FW-1f uses the emitted-char count as evidence the guest reacted

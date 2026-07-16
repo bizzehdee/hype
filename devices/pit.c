@@ -22,6 +22,9 @@ void hype_pit_emu_reset(hype_pit_emu_t *pit) {
     for (i = 0; i < 3; i++) {
         channel_reset(&pit->channels[i]);
     }
+    pit->port61 = 0;
+    pit->ch2_out = 0;
+    pit->refresh_toggle = 0;
 }
 
 static void write_command(hype_pit_emu_t *pit, uint8_t value) {
@@ -50,6 +53,14 @@ static void write_command(hype_pit_emu_t *pit, uint8_t value) {
     ch->rw_toggle = 0;
     /* Real hardware: programming a new mode doesn't reload the
      * counter until the guest actually writes a new count. */
+
+    /* Programming channel 2 drives its OUT pin low until the (about to
+     * be loaded) count reaches terminal count -- a PIT-based calibration
+     * writes this control word (0xb0: ch2, mode 0) then polls port 0x61
+     * bit 5 for OUT to go high, so it must start low here. */
+    if (channel_sel == 2u) {
+        pit->ch2_out = 0;
+    }
 }
 
 static void write_data(hype_pit_emu_channel_t *ch, uint8_t value) {
@@ -146,5 +157,32 @@ void hype_pit_emu_tick(hype_pit_emu_t *pit) {
             continue;
         }
         ch->counter--;
+        /* Channel 2, mode 0 (one-shot): OUT (read back on port 0x61 bit
+         * 5) goes high when the counter reaches terminal count. This is
+         * what a guest's PIT-based TSC/delay calibration polls to learn
+         * the count finished. */
+        if (i == 2 && ch->counter == 0 && ch->mode == 0u) {
+            pit->ch2_out = 1;
+        }
     }
+}
+
+void hype_pit_emu_port61_write(hype_pit_emu_t *pit, uint8_t value) {
+    pit->port61 = (uint8_t)(value & HYPE_PIT_PORT61_WRITABLE);
+}
+
+uint8_t hype_pit_emu_port61_read(hype_pit_emu_t *pit) {
+    uint8_t value = (uint8_t)(pit->port61 & HYPE_PIT_PORT61_WRITABLE);
+
+    /* Bit 4 is the RAM-refresh clock: on real hardware it toggles
+     * continuously, so flip it every read -- a guest that times a delay
+     * by watching it always sees it change rather than spinning. */
+    pit->refresh_toggle = (uint8_t)(pit->refresh_toggle ^ 1u);
+    if (pit->refresh_toggle) {
+        value |= HYPE_PIT_PORT61_REFRESH;
+    }
+    if (pit->ch2_out) {
+        value |= HYPE_PIT_PORT61_CH2_OUT;
+    }
+    return value;
 }
