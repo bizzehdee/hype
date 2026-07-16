@@ -1404,6 +1404,26 @@ tasks — see updated deps below.*
   inaccurate on real AMD firmware (QEMU's Stall was exact); a separate
   real-HW timebase bug (M4-6b1), not the plateau cause but worth fixing.*
 
+  *WARN header captured 2026-07-16 -- PIVOTAL, reverses M4-6d2a's "IRQ not
+  needed" call. The AHCI-probe WARNING is `drivers/ata/libata-core.c:6058
+  ata_host_activate+0x12e` from `ahci_init_one` = the `WARN_ON(irq_handler)`
+  in ata_host_activate's `if (!irq)` polling branch: libata was handed
+  **irq == 0** (no PCI interrupt) yet ahci still passed a handler. So the
+  kernel polls NOT by choice but because the AHCI function advertises no
+  interrupt (Interrupt Pin=0 -- we reverted hype_pci_set_interrupt after
+  the flaky segfault), so OVMF assigns no line and dev->irq==0. libata's
+  forced polling probe is exactly what stalls post-COMRESET. M4-6d2a's
+  "kernel polls, so no IRQ needed" was circular (no IRQ advertised ->
+  polls -> "no IRQ needed"). CORRECT FIX = the AHCI-IRQ delivery whose
+  building blocks are already committed (aa40591: hype_ahci_irq_pending,
+  hype_pci_set_interrupt, global-IS latch) and whose FW-1-loop wiring was
+  reverted: (1) advertise the AHCI Interrupt Pin/Line so libata gets
+  irq != 0 and uses its well-tested INTERRUPT-driven path (enabling PxIE);
+  (2) deliver the completion IRQ through the 8259 PIC. Re-wire + test in
+  QEMU (expect: WARN gone, PxIE set, probe completes past the plateau),
+  then re-validate on real AMD. The earlier segfault is a non-issue
+  (established flaky/environmental in M4-6d2a).*
+
   *Building blocks landed (2026-07-16, commit aa40591), inert until the
   loop wiring is made safe:*
   - `hype_ahci_irq_pending()` (devices/ahci.c) -- the HBA interrupt-
