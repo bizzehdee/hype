@@ -473,6 +473,17 @@ void hype_svm_set_ps2_trace(int enabled) {
     g_ps2_trace = enabled ? 1 : 0;
 }
 
+/* FW-1h diagnostic: trace every AHCI command-slot dispatch (the CDB
+ * opcode, whether it is an ATAPI PACKET, and the resulting status), so
+ * we can see exactly what OVMF's AtaAtapiPassThru/ScsiDisk stack asks
+ * the emulated CD-ROM for during boot-device discovery. Off by default;
+ * FW-1's guest turns it on right before launch. */
+static int g_ahci_trace = 0;
+
+void hype_svm_set_ahci_trace(int enabled) {
+    g_ahci_trace = enabled ? 1 : 0;
+}
+
 int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
@@ -678,43 +689,113 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
  * is "one ATAPI CD-ROM," never a raw ATA disk on this port, so
  * anything else is fail-closed rather than guessed at, matching every
  * other MMIO/NPF handler's convention here. */
-static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi) {
+static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi, uint64_t dma_offset) {
     uint64_t cmd_list_phys = (uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32);
     uint64_t rx_fis_phys = (uint64_t)ahci->p_fb | ((uint64_t)ahci->p_fbu << 32);
-    const uint8_t *cmd_hdr_bytes = (const uint8_t *)(uintptr_t)cmd_list_phys;
+    uint8_t *cmd_hdr_bytes = (uint8_t *)(uintptr_t)(cmd_list_phys + dma_offset);
     hype_ahci_cmd_header_t hdr;
     const uint8_t *cmd_table_bytes;
     const uint8_t *prdt_bytes;
-    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
     hype_atapi_result_t result;
+    uint8_t identify[HYPE_ATAPI_IDENTIFY_SIZE];
     const uint8_t *src;
     uint32_t remaining;
+    uint32_t transferred;
     uint32_t prd_idx;
     uint8_t status_reg;
     uint8_t error_reg;
+    uint32_t pis_bit;
     uint8_t *d2h_fis;
     unsigned i;
 
     hype_ahci_decode_cmd_header(cmd_hdr_bytes, &hdr);
+    cmd_table_bytes = (const uint8_t *)(uintptr_t)(hdr.cmd_table_phys + dma_offset);
+
     if (!hdr.is_atapi) {
-        return -1;
-    }
+        /* A plain H2D Register FIS command (Command Header's ATAPI bit
+         * clear). A real AHCI driver issues two of these to an ATAPI
+         * device during setup (EDK2 AhciModeInitialization):
+         *   - IDENTIFY PACKET DEVICE (0xA1): PIO data-in of the fixed
+         *     512-byte identify block. The driver waits for a PIO Setup
+         *     FIS (PxIS.PSS) and requires PRDBC == 512.
+         *   - SET FEATURES (0xEF): a no-data command selecting the
+         *     transfer mode -- acknowledged with a data-less success
+         *     (D2H FIS, PxIS.DHRS). */
+        uint8_t ata_cmd = cmd_table_bytes[2];
+        if (cmd_table_bytes[0] != 0x27u) {
+            if (g_ahci_trace) {
+                hype_debug_print("ahci-trace: non-ATAPI slot0 with bad FIS type=0x%x cmd=0x%x\n",
+                                  (unsigned int)cmd_table_bytes[0], (unsigned int)ata_cmd);
+            }
+            return -1;
+        }
+        if (ata_cmd == HYPE_AHCI_ATA_CMD_IDENTIFY_PACKET_DEVICE) {
+            hype_atapi_build_identify(atapi, identify);
+            src = identify;
+            remaining = HYPE_ATAPI_IDENTIFY_SIZE;
+            status_reg = 0x50u; /* DRDY|DSC */
+            error_reg = 0;
+            pis_bit = HYPE_AHCI_PIS_PSS;
+            if (g_ahci_trace) {
+                hype_debug_print("ahci-trace: IDENTIFY PACKET DEVICE (0xA1) -> 512-byte PIO-in\n");
+            }
+        } else if (ata_cmd == HYPE_AHCI_ATA_CMD_SET_FEATURES) {
+            src = identify; /* unused: no data transferred (remaining == 0) */
+            remaining = 0;
+            status_reg = 0x50u; /* DRDY|DSC, no error */
+            error_reg = 0;
+            pis_bit = HYPE_AHCI_PIS_DHRS;
+            if (g_ahci_trace) {
+                hype_debug_print("ahci-trace: SET FEATURES (0xEF) -> no-data ack\n");
+            }
+        } else {
+            if (g_ahci_trace) {
+                hype_debug_print("ahci-trace: unhandled non-ATAPI command slot0 -- FIS type=0x%x cmd=0x%x\n",
+                                  (unsigned int)cmd_table_bytes[0], (unsigned int)ata_cmd);
+            }
+            return -1;
+        }
+    } else {
+        uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+        if (cmd_table_bytes[0] != 0x27u || cmd_table_bytes[2] != 0xA0u) {
+            if (g_ahci_trace) {
+                hype_debug_print(
+                    "ahci-trace: ATAPI slot0 but FIS type/cmd unexpected (fistype=0x%x cmd=0x%x)\n",
+                    (unsigned int)cmd_table_bytes[0], (unsigned int)cmd_table_bytes[2]);
+            }
+            return -1; /* not a Register H2D FIS carrying ATA_CMD_PACKET (0xA0) */
+        }
+        for (i = 0; i < HYPE_ATAPI_CDB_MAX; i++) {
+            cdb[i] = cmd_table_bytes[0x40 + i];
+        }
 
-    cmd_table_bytes = (const uint8_t *)(uintptr_t)hdr.cmd_table_phys;
-    if (cmd_table_bytes[0] != 0x27u || cmd_table_bytes[2] != 0xA0u) {
-        return -1; /* not a Register H2D FIS carrying ATA_CMD_PACKET (0xA0) */
-    }
-    for (i = 0; i < HYPE_ATAPI_CDB_MAX; i++) {
-        cdb[i] = cmd_table_bytes[0x40 + i];
-    }
+        hype_atapi_execute_cdb(atapi, cdb, &result);
 
-    hype_atapi_execute_cdb(atapi, cdb, &result);
+        if (g_ahci_trace) {
+            hype_debug_print(
+                "ahci-trace: ATAPI CDB=0x%x lba=%u/%u status=%s uses_media=%u len=%u\n",
+                (unsigned int)cdb[0], (unsigned int)cdb[2], (unsigned int)cdb[5],
+                result.status == HYPE_ATAPI_STATUS_GOOD ? "GOOD" : "CHECK",
+                (unsigned int)result.uses_media_data,
+                (unsigned int)(result.uses_media_data ? result.media_length : result.synth_length));
+        }
 
-    src = result.uses_media_data ? (atapi->media_data + result.media_offset) : result.synth_data;
-    remaining = result.uses_media_data ? result.media_length : result.synth_length;
+        src = result.uses_media_data ? (atapi->media_data + result.media_offset) : result.synth_data;
+        remaining = result.uses_media_data ? result.media_length : result.synth_length;
+        /* ATA STATUS register: DRDY|DSC always, +ERR on CHECK_CONDITION.
+         * ATAPI convention: a failed PACKET command's ERROR register
+         * carries the SCSI sense key in its upper nibble. */
+        status_reg = (result.status == HYPE_ATAPI_STATUS_GOOD) ? 0x50u : 0x51u;
+        error_reg = (result.status == HYPE_ATAPI_STATUS_GOOD) ? 0u : (uint8_t)(atapi->sense_key << 4);
+        /* ATAPI PACKET data/no-data commands complete with a Device-to-
+         * Host Register FIS (EDK2's AhciPioTransfer/AhciNonDataTransfer
+         * wait on PxIS.DHRS for them). */
+        pis_bit = HYPE_AHCI_PIS_DHRS;
+    }
 
     prdt_bytes = cmd_table_bytes + 0x80;
     prd_idx = 0;
+    transferred = 0;
     while (remaining > 0 && prd_idx < hdr.prdtl) {
         hype_ahci_prdt_entry_t prd;
         uint32_t chunk;
@@ -723,23 +804,30 @@ static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi) {
 
         hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)prd_idx * 16u, &prd);
         chunk = (prd.byte_count < remaining) ? prd.byte_count : remaining;
-        dst = (uint8_t *)(uintptr_t)prd.data_phys;
+        dst = (uint8_t *)(uintptr_t)(prd.data_phys + dma_offset);
         for (j = 0; j < chunk; j++) {
             dst[j] = src[j];
         }
         src += chunk;
         remaining -= chunk;
+        transferred += chunk;
         prd_idx++;
     }
 
-    /* ATA STATUS register: DRDY|DSC always, +ERR on CHECK_CONDITION.
-     * ATAPI convention: a failed PACKET command's ERROR register
-     * carries the SCSI sense key in its upper nibble. */
-    status_reg = (result.status == HYPE_ATAPI_STATUS_GOOD) ? 0x50u : 0x51u;
-    error_reg = (result.status == HYPE_ATAPI_STATUS_GOOD) ? 0u : (uint8_t)(atapi->sense_key << 4);
+    /* PRDBC (Command Header dword 1, byte offset 4): the count of bytes
+     * actually transferred. EDK2's PIO-in path (AhciPioTransfer, used by
+     * IDENTIFY PACKET DEVICE) checks PRDBC == the requested DataCount and
+     * fails the command otherwise, so it must be written back into the
+     * guest's command header. Harmless for the other paths that ignore
+     * it. */
+    cmd_hdr_bytes[4] = (uint8_t)(transferred & 0xFFu);
+    cmd_hdr_bytes[5] = (uint8_t)((transferred >> 8) & 0xFFu);
+    cmd_hdr_bytes[6] = (uint8_t)((transferred >> 16) & 0xFFu);
+    cmd_hdr_bytes[7] = (uint8_t)((transferred >> 24) & 0xFFu);
+
     ahci->p_tfd = (uint32_t)status_reg | ((uint32_t)error_reg << 8);
 
-    d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_phys + 0x40);
+    d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_phys + dma_offset + 0x40);
     for (i = 0; i < 20; i++) {
         d2h_fis[i] = 0;
     }
@@ -747,16 +835,34 @@ static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi) {
     d2h_fis[2] = status_reg;
     d2h_fis[3] = error_reg;
 
-    ahci->p_ci &= ~0x1u;     /* slot 0 complete */
-    ahci->p_is |= (1u << 6); /* D2H Register FIS interrupt bit -- spec-completeness; no real
-                              * interrupt delivery wired up in this milestone (polling guest
-                              * driver, same as fw_cfg's own DMA test guest). */
+    ahci->p_ci &= ~0x1u; /* slot 0 complete */
+    /* Completion interrupt-status bit a real driver polls (PxIS.DHRS for
+     * D2H completions, PxIS.PSS for PIO-in). No real interrupt delivery
+     * is wired up in this milestone -- the guest driver polls, same as
+     * fw_cfg's own DMA test guest. */
+    ahci->p_is |= pis_bit;
     return 0;
 }
 
-int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
-                                   uint64_t ahci_base_phys) {
-    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+/* Shared body for the ATAPI AHCI NPF handler. dma_offset is added to
+ * every guest-physical address this path dereferences as a host pointer
+ * -- both the faulting instruction fetch (save.rip) and every DMA
+ * structure the guest programmed (Command List/Table, received-FIS
+ * area, PRDT data buffers). It is 0 for a guest whose NPT identity-maps
+ * RAM (guest-physical == host-physical, e.g. every M4-5/ISO-2/PCI-2
+ * test guest), and the guest-RAM host offset for a guest whose NPT
+ * remaps RAM to a separately-allocated host buffer (FW-1's real OVMF
+ * boot: guest-physical [0, GUEST_RAM) -> g_fw_1_ram_host_phys + gpa).
+ * The single linear offset is correct because OVMF's own code and all
+ * the DMA structures it programs live in that one contiguous low-RAM
+ * region. NOTE (VALID-3): dma_offset translation does NOT yet bounds-
+ * check the guest-supplied addresses against the RAM window -- a guest
+ * that programs an out-of-range DMA pointer would translate to an
+ * out-of-range host pointer. FW-1's own trusted OVMF never does; a
+ * malicious/buggy guest is VALID-3's job to fence off. */
+static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_t *ahci,
+                                           hype_atapi_t *atapi, uint64_t ahci_base_phys,
+                                           uint64_t dma_offset) {
     hype_svm_npf_t npf;
     hype_mmio_decode_t decoded;
     uint64_t *reg;
@@ -765,12 +871,13 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
 
     hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
 
-    if (npf.guest_phys_addr < ahci_base_phys) {
+    if (npf.guest_phys_addr < ahci_base_phys ||
+        npf.guest_phys_addr >= ahci_base_phys + HYPE_AHCI_MMIO_SIZE) {
         return -1;
     }
     offset = (uint32_t)(npf.guest_phys_addr - ahci_base_phys);
 
-    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    guest_bytes = (const uint8_t *)(uintptr_t)(real->vmcb->save.rip + dma_offset);
     if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
         return -1;
     }
@@ -785,11 +892,15 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
 
     if (decoded.is_write) {
         uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        if (g_ahci_trace) {
+            hype_debug_print("ahci-trace: ABAR write off=0x%x val=0x%x\n", (unsigned int)offset,
+                              (unsigned int)value);
+        }
         if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
             return -1;
         }
         if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
-            if (process_ahci_command_slot0(ahci, atapi) != 0) {
+            if (process_ahci_command_slot0(ahci, atapi, dma_offset) != 0) {
                 return -1;
             }
         }
@@ -798,11 +909,26 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
         if (hype_ahci_mmio_read(ahci, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
+        if (g_ahci_trace) {
+            hype_debug_print("ahci-trace: ABAR read  off=0x%x val=0x%x\n", (unsigned int)offset,
+                              (unsigned int)value);
+        }
         *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
     }
 
     real->vmcb->save.rip += decoded.instr_len;
     return 0;
+}
+
+int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                   uint64_t ahci_base_phys) {
+    return hype_svm_ahci_atapi_npf_common((struct hype_vcpu_ctx *)ctx, ahci, atapi, ahci_base_phys, 0);
+}
+
+int hype_svm_vcpu_handle_ahci_npf_xlat(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                        uint64_t ahci_base_phys, uint64_t dma_offset) {
+    return hype_svm_ahci_atapi_npf_common((struct hype_vcpu_ctx *)ctx, ahci, atapi, ahci_base_phys,
+                                          dma_offset);
 }
 
 /* Fills the D2H (Device to Host) completion FIS and clears PxCI's slot
@@ -824,7 +950,11 @@ static void complete_ahci_command_slot0(hype_ahci_t *ahci, uint64_t rx_fis_phys,
     d2h_fis[3] = error_reg;
 
     ahci->p_ci &= ~0x1u;
-    ahci->p_is |= (1u << 6);
+    /* PxIS.DHRS -- the D2H Register FIS interrupt bit a real driver
+     * polls for a plain-ATA command's completion (same correction as
+     * the ATAPI path; the M4-5/M5-2 cooperating test guests polled PxCI
+     * and never depended on this bit). */
+    ahci->p_is |= HYPE_AHCI_PIS_DHRS;
 }
 
 /* M5-2's plain-ATA command dispatch, the H2D-FIS-command-byte-driven

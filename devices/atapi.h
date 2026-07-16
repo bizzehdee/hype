@@ -25,6 +25,17 @@
 #define HYPE_ATAPI_CDB_MAX 16
 #define HYPE_ATAPI_SECTOR_SIZE 2048u
 
+/* IDENTIFY PACKET DEVICE (ATA command 0xA1) response size: 256 words =
+ * 512 bytes, the fixed ATA identify block length. A real UEFI AHCI
+ * driver (EDK2 AhciIdentifyPacket) issues this ATA command -- NOT a
+ * SCSI CDB -- to an ATAPI device right after it reads the ATAPI port
+ * signature, and requires a successful 512-byte PIO-in completion
+ * before it will enumerate the drive. The AHCI glue calls the builder
+ * below for it; the device-type detail the driver actually acts on
+ * comes from the port signature + later INQUIRY, so this block only
+ * needs to be a valid ATAPI identify (word 0 marks a packet device). */
+#define HYPE_ATAPI_IDENTIFY_SIZE 512u
+
 #define HYPE_ATAPI_CMD_TEST_UNIT_READY 0x00u
 #define HYPE_ATAPI_CMD_REQUEST_SENSE 0x03u
 #define HYPE_ATAPI_CMD_INQUIRY 0x12u
@@ -94,5 +105,18 @@ void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint32_t med
  */
 void hype_atapi_execute_cdb(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_MAX],
                             hype_atapi_result_t *out);
+
+/*
+ * Builds the 512-byte ATA IDENTIFY PACKET DEVICE response for this
+ * ATAPI drive into `out`. Word 0 (general configuration) marks a
+ * removable ATAPI CD-ROM using a 12-byte command packet (bits 15:14=10b
+ * ATAPI, bits 12:8=00101b CD-ROM, bits 1:0=00 12-byte packet) -- the
+ * standard value real CD-ROM firmware and QEMU both report (0x85C0).
+ * Model/firmware/serial ATA strings are filled with byte-swapped ASCII
+ * per the ATA string convention; every other word stays 0 (this
+ * project's minimal, read-only-optical scope). Pure data synthesis --
+ * no CPU/guest-memory access.
+ */
+void hype_atapi_build_identify(const hype_atapi_t *dev, uint8_t out[HYPE_ATAPI_IDENTIFY_SIZE]);
 
 #endif /* HYPE_DEVICES_ATAPI_H */

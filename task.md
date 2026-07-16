@@ -2063,23 +2063,62 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
   OVMF end-to-end. Nothing further needed here.
   Deps: FW-1
 
-- [ ] **FW-1h** — Bootable optical drive (real ISO) in FW-1's OVMF guest.
-  FW-1 boots OVMF to BDS but it finds "No bootable option" -- the guest
-  has no disk/CD. Integrate the existing, individually-tested pieces
-  into FW-1's guest (no new device code):
-  - Register an AHCI PCI function in g_fw_1_pci
-    (`hype_pci_add_device`, class 0x01/0x06 SATA, a BAR5 ABAR), exactly
-    as run_pci_2_test does.
-  - Back its ATAPI/CD model with ISO-1's already-loaded real ISO buffer
-    (`hype_atapi_reset(&atapi, (uint8_t*)g_iso_host_phys, g_iso_size)`),
-    exactly as run_iso_2_test does.
-  - In the FW-1 NPF dispatch, detect OVMF programming BAR5, NPT-map the
-    ABAR window, and route its MMIO to
-    `hype_svm_vcpu_handle_ahci_npf(ctx, &ahci, &atapi, abar_base)` --
-    the dynamic-BAR pattern run_pci_2_test already uses.
-  Then OVMF's BDS should auto-discover the CD and boot its
-  EFI\BOOT\BOOTX64.EFI with no keypress -- the bridge to M4-6. Single
-  integration task; no subtasks. Deps: FW-1d, M4-5, ISO-2, PCI-2.
+- [x] **FW-1h** — Bootable optical drive (real ISO) in FW-1's OVMF guest.
+  DONE, hardware-path verified under QEMU+KVM: OVMF's BDS auto-discovers
+  the emulated CD and boots it with no keypress --
+  `BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM ..." from
+  PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)` then `UEFI Interactive
+  Shell v2.2` / `FS0: ...CD0a65535a0` -- the UEFI Shell from the test ISO
+  running as a guest, the bridge to M4-6.
+
+  Wiring (boot/main.c run_fw_1_test): register an AHCI PCI function in
+  g_fw_1_pci (dev 2, class 0x01/0x06 SATA, prog-if 0x01, 4KB BAR5 ABAR);
+  back g_fw_1_atapi with ISO-1's loaded real ISO; in the NPF dispatch,
+  latch the ABAR base once OVMF sets Memory Space Enable on the function
+  (no explicit NPT mark needed -- FW-1a already left [GUEST_RAM,4GB-flash)
+  not-present, so the aperture faults) and route ABAR-window faults to a
+  new RAM-remap-aware handler.
+
+  *Scope discovery -- NOT "integration only":* the original note assumed
+  the M4-5 AHCI/ATAPI model was reusable as-is via
+  hype_svm_vcpu_handle_ahci_npf(). It was not: that model was built to
+  satisfy a *cooperating* hand-written test guest (which programs the
+  command list itself and polls PxCI), and lacked the fidelity a *real*
+  UEFI AHCI driver (SataControllerDxe -> AtaAtapiPassThru -> ScsiDisk)
+  needs to enumerate the device. Each gap was found by tracing against
+  the in-tree EDK2 driver source (edk2/MdeModulePkg/Bus/Ata/
+  AtaAtapiPassThru/AhciMode.c), not guessed:
+    1. **NPT DMA translation** -- FW-1 remaps guest RAM to a separate
+       host buffer, but the AHCI handler dereferenced guest-physical
+       Command List/Table/FIS/PRDT addresses (and the faulting RIP) as
+       raw host pointers (only valid under the identity NPT the M4-5/
+       ISO-2/PCI-2 test guests use). Added hype_svm_vcpu_handle_ahci_
+       npf_xlat(..., dma_offset): a single linear offset (=
+       g_fw_1_ram_host_phys) applied to every guest-physical it touches.
+    2. **GHC.HR self-clear** -- AhciReset() sets GHC.HR (HBA reset) and
+       polls until hardware clears it; the model just stored GHC, so HR
+       stayed set, the poll timed out, and AhciModeInitialization
+       abandoned the controller before any port init (zero commands
+       issued). Fixed in devices/ahci.c: HR now self-clears on write.
+    3. **IDENTIFY PACKET DEVICE (0xA1)** -- the ATA (non-PACKET) command
+       the driver issues to an ATAPI device right after reading the port
+       signature; neither command path handled it. Added
+       hype_atapi_build_identify() (512-byte block, word 0 = 0x85C0 =
+       ATAPI CD-ROM) + a PIO-in completion.
+    4. **SET FEATURES (0xEF)** -- the no-data transfer-mode command the
+       driver issues after IDENTIFY; acknowledged with a data-less
+       success.
+    5. **Completion protocol** -- a real driver polls PxIS (DHRS bit 0
+       for D2H/DMA/ATAPI-PACKET, PSS bit 1 for PIO-in), not PxCI; the
+       model set an unrelated bit (6) the cooperating guest ignored.
+       Corrected, and PRDBC (Command Header dword 1) is now written back
+       (EDK2's PIO-in path requires PRDBC == requested length).
+  All device-model changes are unit-tested (test_ahci.c GHC self-clear,
+  test_atapi.c IDENTIFY PACKET DEVICE); ahci.c/atapi.c stay >=90%
+  coverage. The M4-5/ISO-2/PCI-2 cooperating test guests are unchanged
+  and still pass (they pass dma_offset 0 and poll PxCI). A per-command
+  AHCI trace (hype_svm_set_ahci_trace) was added for the investigation
+  and left available but off. Deps: FW-1d, M4-5, ISO-2, PCI-2.
 
 ---
 

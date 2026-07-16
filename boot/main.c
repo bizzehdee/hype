@@ -190,6 +190,19 @@ static hype_fw_cfg_t g_fw_1_fw_cfg;
 static hype_acpi_rsdp_t g_fw_1_rsdp;
 static uint8_t g_fw_1_tables_blob[4096] __attribute__((aligned(64)));
 static hype_acpi_loader_entry_t g_fw_1_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENTRIES];
+/* FW-1h: a real AHCI/ATAPI CD-ROM controller so OVMF's BDS finds a
+ * bootable optical drive (ISO-1's loaded \iso\test.iso). Device model
+ * (M4-5), PCI discovery (PCI-2), and the real-ISO backing (ISO-2) all
+ * already exist and are individually tested; FW-1h only integrates them
+ * into the real-OVMF guest. The ATAPI model is backed by ISO-1's own
+ * loaded buffer (g_iso_host_phys/g_iso_size), same as run_iso_2_test. */
+static hype_ahci_t g_fw_1_ahci;
+static hype_atapi_t g_fw_1_atapi;
+/* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
+ * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
+ * guest-physical address in the 32-bit PCI MMIO aperture, and enables
+ * Memory Space -- exactly the PCI-2 discovery path. */
+#define HYPE_FW_1_PCI_DEV_AHCI 2u
 
 /* Intel Q35 MCH (the real Q35 chipset's host bridge) vendor/device ID
  * -- transcribed from this project's own vendored edk2 submodule,
@@ -4276,6 +4289,19 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                          0x00, 0x00);
     hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ICH9_LPC, HYPE_FW_1_PCI_VENDOR_ID_INTEL,
                          HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC, 0x06, 0x01, 0x00);
+    /* FW-1h: AHCI SATA controller (class 0x01 / subclass 0x06 / prog-IF
+     * 0x01 -- "AHCI 1.0"), with a 4KB BAR5 (ABAR) for OVMF to size and
+     * place, exactly as run_pci_2_test registers it. Backed by ISO-1's
+     * real loaded ISO so OVMF's BDS finds a bootable CD. */
+    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u, 0x01, 0x06,
+                         0x01);
+    hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
+    hype_ahci_reset(&g_fw_1_ahci);
+    hype_atapi_reset(&g_fw_1_atapi, (uint8_t *)(uintptr_t)g_iso_host_phys, (uint32_t)g_iso_size);
+    /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging
+     * the CD-ROM discovery sequence -- hype_svm_set_ahci_trace(1) -- but
+     * left off here: a real boot issues thousands of commands and each
+     * trace line is GOP-rendered. */
 
     /* Real OVMF's own platform init needs real ACPI content via
      * fw_cfg, the same "etc/acpi/rsdp"/"etc/acpi/tables"/
@@ -4435,6 +4461,11 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_vt_filter_t dbg_filter;
     char dbg_line[256];
     unsigned int dbg_line_len = 0;
+    /* FW-1h: set once OVMF has sized+placed BAR5 and enabled Memory
+     * Space on the AHCI function -- from then on, faults inside the
+     * ABAR window route to the (RAM-remap-aware) AHCI MMIO handler. */
+    int ahci_mapped = 0;
+    uint64_t ahci_abar = 0;
 
     hype_vt_filter_reset(&uart_filter);
     hype_vt_filter_reset(&uart_filter2);
@@ -4544,7 +4575,51 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
              * config model over FW-1's own host bridge + LPC devices. */
             if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_fw_1_pci, HYPE_FW_1_ECAM_GPA,
                                                    fw_1_guest_phys_to_host(info.guest_rip)) == 0) {
+                /* FW-1h: an ECAM config write may have just programmed
+                 * BAR5 and set Memory Space Enable on the AHCI function.
+                 * That is the moment OVMF's PciBusDxe finalizes the
+                 * controller's MMIO window -- capture the guest-physical
+                 * ABAR base so ABAR-window faults route to the AHCI
+                 * handler from here on. No NPT change is needed: the
+                 * whole [GUEST_RAM, 4GB-flash) span is already not-
+                 * present (FW-1a's mark_range_not_present), so the ABAR
+                 * OVMF assigns inside the 32-bit PCI aperture already
+                 * faults as an NPF -- unlike PCI-2's full identity map,
+                 * which had to mark it not-present explicitly. Only
+                 * latched once; this guest never reprograms BAR5. */
+                if (!ahci_mapped && hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI)) {
+                    uint64_t bar5 = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5);
+                    if (bar5 != 0) {
+                        ahci_abar = bar5;
+                        ahci_mapped = 1;
+                        hype_debug_print("fw-1: AHCI BAR5 (ABAR) enabled at guest-physical 0x%llx -- "
+                                          "routing its MMIO to the CD-ROM model now\n",
+                                          (unsigned long long)bar5);
+                    }
+                }
                 continue;
+            }
+            /* FW-1h: AHCI ABAR MMIO. Gate on the faulting guest-physical
+             * address so this only claims accesses actually inside the
+             * ABAR window (the ATAPI handler itself now range-checks too,
+             * but keeping the gate here keeps an out-of-window fault on
+             * the clear "unhandled NPF" path below). The _xlat variant
+             * adds g_fw_1_ram_host_phys to every guest-physical DMA
+             * pointer OVMF programmed, since FW-1 remaps guest RAM. */
+            if (ahci_mapped) {
+                hype_svm_npf_t ahci_npf;
+                hype_svm_vcpu_get_last_npf(ctx, &ahci_npf);
+                if (ahci_npf.guest_phys_addr >= ahci_abar &&
+                    ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
+                    if (hype_svm_vcpu_handle_ahci_npf_xlat(ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
+                                                            g_fw_1_ram_host_phys) == 0) {
+                        continue;
+                    }
+                    hype_fatal("fw-1: unhandled AHCI ABAR MMIO at guest-physical 0x%llx (%s, "
+                               "guest_rip=0x%llx)",
+                               (unsigned long long)ahci_npf.guest_phys_addr,
+                               ahci_npf.is_write ? "write" : "read", (unsigned long long)info.guest_rip);
+                }
             }
             hype_svm_vcpu_get_last_npf(ctx, &npf);
             hype_fatal("fw-1: unhandled NPF at guest-physical 0x%llx (%s, guest_rip=0x%llx)",
@@ -4799,10 +4874,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     }
     if (booted) {
         hype_debug_print(
-            "fw-1: real OVMF BOOTED -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2 controller init), %llu "
-            "chars of console output forwarded, idle at the Boot Manager prompt after %llu productive "
-            "VM-exits. The injected keystroke did NOT yet register (OVMF's WaitForKey poll isn't picking "
-            "up the PS/2 scancode) -- input needs deeper debug (FW-1g), not just a wire-up. guest_rip=0x%llx.\n",
+            "fw-1: real OVMF BOOTED -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2, AHCI CD-ROM), %llu "
+            "chars of console output forwarded above, idle after %llu productive VM-exits. With FW-1h's "
+            "bootable CD present, BDS auto-discovers and starts it (the forwarded console shows the booted "
+            "image's own output -- e.g. the UEFI Shell from the test ISO); with no bootable media it "
+            "instead idles at the Boot Manager prompt. Any injected keystroke did not visibly register "
+            "(that input path is FW-1g). guest_rip=0x%llx.\n",
             (unsigned long long)console_chars, (unsigned long long)productive_exits,
             (unsigned long long)info.guest_rip);
         return;

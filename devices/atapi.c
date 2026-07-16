@@ -137,6 +137,47 @@ static void handle_request_sense(hype_atapi_t *dev, hype_atapi_result_t *out) {
      * project's own simplified model -- see each handler above). */
 }
 
+static void write_swapped_ascii(uint8_t *out, const char *str, uint32_t field_bytes) {
+    uint32_t len = 0;
+    uint32_t i;
+
+    while (str[len] != '\0') {
+        len++;
+    }
+
+    /* ATA identify strings are stored with each 16-bit word byte-
+     * swapped -- the same convention hype_ata_disk_build_identify()
+     * uses for the plain-ATA disk. */
+    for (i = 0; i < field_bytes; i += 2u) {
+        uint8_t c0 = (i < len) ? (uint8_t)str[i] : (uint8_t)' ';
+        uint8_t c1 = (i + 1u < len) ? (uint8_t)str[i + 1u] : (uint8_t)' ';
+        out[i] = c1;
+        out[i + 1u] = c0;
+    }
+}
+
+void hype_atapi_build_identify(const hype_atapi_t *dev, uint8_t out[HYPE_ATAPI_IDENTIFY_SIZE]) {
+    uint32_t i;
+
+    (void)dev; /* the identify block is fixed for this read-only CD-ROM model */
+
+    for (i = 0; i < HYPE_ATAPI_IDENTIFY_SIZE; i++) {
+        out[i] = 0;
+    }
+
+    /* Word 0 (general configuration) = 0x85C0: bits 15:14=10b (ATAPI
+     * device), bits 12:8=00101b (CD-ROM device type), bits 6:5=10b
+     * (DRQ within 50us of receiving PACKET), bits 1:0=00 (12-byte
+     * command packet). The standard value a real CD-ROM and QEMU both
+     * report, stored little-endian. */
+    out[0] = 0xC0u;
+    out[1] = 0x85u;
+
+    write_swapped_ascii(out + 20, "HYPE0000000000000001", 20u); /* words 10-19: serial number */
+    write_swapped_ascii(out + 46, "1.0", 8u);                   /* words 23-26: firmware revision */
+    write_swapped_ascii(out + 54, "HYPE VIRTUAL CD-ROM", 40u);  /* words 27-46: model number */
+}
+
 void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint32_t media_size) {
     dev->media_data = media_data;
     dev->media_size = media_size;

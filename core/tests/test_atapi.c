@@ -235,6 +235,25 @@ static void test_unrecognized_opcode_rejected(void) {
     CHECK_HEX("asc INVALID_COMMAND_OPCODE", HYPE_ATAPI_ASC_INVALID_COMMAND_OPCODE, dev.asc);
 }
 
+static void test_build_identify_packet_device(void) {
+    hype_atapi_t dev;
+    uint8_t id[HYPE_ATAPI_IDENTIFY_SIZE];
+    uint16_t word0;
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    hype_atapi_build_identify(&dev, id);
+
+    word0 = (uint16_t)((uint16_t)id[0] | ((uint16_t)id[1] << 8));
+    CHECK_HEX("word 0 = 0x85C0 (ATAPI CD-ROM, 12-byte packet)", 0x85C0u, word0);
+    CHECK_HEX("bits 15:14 = 10b (ATAPI protocol)", 0x2u, (word0 >> 14) & 0x3u);
+    CHECK_HEX("bits 12:8 = 00101b (CD-ROM device type)", 0x05u, (word0 >> 8) & 0x1Fu);
+    CHECK_HEX("bits 1:0 = 00 (12-byte command packet)", 0x0u, word0 & 0x3u);
+    /* Model string (words 27-46) is byte-swapped ASCII: "HYPE..." -> the
+     * first stored byte is the second character ('Y'). */
+    CHECK_HEX("model string byte-swapped ('Y' first)", 'Y', id[54]);
+    CHECK_HEX("model string byte-swapped ('H' second)", 'H', id[55]);
+}
+
 int main(void) {
     init_media();
 
@@ -251,6 +270,7 @@ int main(void) {
     test_request_sense_reflects_last_failure();
     test_request_sense_no_sense_by_default();
     test_unrecognized_opcode_rejected();
+    test_build_identify_packet_device();
 
     if (failures == 0) {
         printf("all tests passed\n");

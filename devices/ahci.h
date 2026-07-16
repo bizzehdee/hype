@@ -63,6 +63,35 @@
 
 #define HYPE_AHCI_MMIO_SIZE (HYPE_AHCI_PORT_BASE + HYPE_AHCI_PORT_STRIDE)
 
+/* GHC (Global HBA Control) bits this project models. */
+#define HYPE_AHCI_GHC_HR (1u << 0)   /* HBA Reset (write-1; self-clears when the reset completes) */
+#define HYPE_AHCI_GHC_AE (1u << 31)  /* AHCI Enable */
+
+/* PxIS (Port Interrupt Status) completion bits a real AHCI driver polls
+ * to learn a command finished (EDK2 AhciCheckFisReceived): DHRS when a
+ * Device-to-Host Register FIS arrived (D2H/DMA/ATAPI-PACKET commands),
+ * PSS when a PIO Setup FIS arrived (PIO-in commands -- IDENTIFY [PACKET]
+ * DEVICE). The M4-5 model originally set an unrelated bit here, which a
+ * cooperating hand-written test guest ignored (it polled PxCI) but a
+ * real driver waits on -- corrected for FW-1h. */
+#define HYPE_AHCI_PIS_DHRS (1u << 0) /* Device to Host Register FIS Interrupt */
+#define HYPE_AHCI_PIS_PSS (1u << 1)  /* PIO Setup FIS Interrupt */
+
+/* ATA IDENTIFY PACKET DEVICE (command 0xA1): the ATA-level command a
+ * real AHCI driver issues to an ATAPI device (EDK2 AhciIdentifyPacket)
+ * -- delivered as a plain H2D Register FIS command byte, NOT a SCSI CDB
+ * inside a PACKET, so the Command Header's ATAPI ('A') bit is 0. (EDK2's
+ * confusingly-named ATA_CMD_IDENTIFY_DEVICE == 0xA1 is this command;
+ * 0xEC / ATA_CMD_IDENTIFY_DRIVE is the plain-ATA-disk one.) */
+#define HYPE_AHCI_ATA_CMD_IDENTIFY_PACKET_DEVICE 0xA1u
+
+/* ATA SET FEATURES (command 0xEF): a no-data ATA command a real AHCI
+ * driver issues right after IDENTIFY to select the transfer mode (EDK2
+ * AhciModeInitialization -> AhciDeviceSetFeature). This project models
+ * a single fixed transfer profile, so it just acknowledges the command
+ * with a successful, data-less completion. */
+#define HYPE_AHCI_ATA_CMD_SET_FEATURES 0xEFu
+
 /* PxCMD bits this project models. */
 #define HYPE_AHCI_PCMD_ST (1u << 0)  /* Start (guest-set: spin up the port's DMA engine) */
 #define HYPE_AHCI_PCMD_FRE (1u << 4) /* FIS Receive Enable */

@@ -578,6 +578,20 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
                                    uint64_t ahci_base_phys);
 
 /*
+ * FW-1h variant of hype_svm_vcpu_handle_ahci_npf() for a guest whose
+ * NPT does NOT identity-map RAM. Real OVMF (FW-1) runs with guest-
+ * physical [0, GUEST_RAM) remapped to a separately-allocated host
+ * buffer (g_fw_1_ram_host_phys), so every guest-physical address OVMF's
+ * AhciBusDxe programs into the Command List/Table, received-FIS area
+ * and PRDT -- plus the faulting instruction's own RIP -- must have
+ * dma_offset (= g_fw_1_ram_host_phys) added before it is dereferenced
+ * as a host pointer. Identical to the identity-map handler above in
+ * every other respect (pass dma_offset == 0 for that case, which is
+ * exactly what the plain handler does). Same unit-test exemption. */
+int hype_svm_vcpu_handle_ahci_npf_xlat(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                        uint64_t ahci_base_phys, uint64_t dma_offset);
+
+/*
  * M5-2's counterpart to hype_svm_vcpu_handle_ahci_npf() above -- same
  * hype_ahci_t register model and NPF/PxCI-write trigger, but for a
  * SECOND, independent AHCI controller instance backing a plain ATA
@@ -729,6 +743,13 @@ int hype_svm_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_por
  * on after injecting a keystroke to see whether OVMF's WaitForKey poll
  * reads the status/scancode. */
 void hype_svm_set_ps2_trace(int enabled);
+
+/* FW-1h: enable/disable per-command tracing of AHCI command-slot
+ * dispatches (the ATAPI CDB opcode + resulting status, and any non-
+ * PACKET command that reaches the ATAPI path) in the AHCI NPF handlers
+ * (default off). FW-1's guest turns it on to see what OVMF's storage
+ * stack asks the emulated CD-ROM for during boot-device discovery. */
+void hype_svm_set_ahci_trace(int enabled);
 
 /*
  * M5-1's exempt NPF glue for the virtio-blk device's single MMIO BAR

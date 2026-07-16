@@ -66,7 +66,18 @@ int hype_ahci_mmio_write(hype_ahci_t *ahci, uint32_t offset, uint8_t size_bytes,
     }
 
     switch (offset) {
-        case HYPE_AHCI_REG_GHC: ahci->ghc = value; return 0;
+        case HYPE_AHCI_REG_GHC:
+            /* GHC.HR (bit 0, HBA Reset) is self-clearing: real hardware
+             * performs the reset and clears HR once it completes (AHCI
+             * 1.3.1 SS3.1.2). Model the reset as instantaneous -- store
+             * every other bit as written (notably AE, bit 31) but always
+             * report HR clear, so a real AHCI driver's reset-completion
+             * poll (EDK2 AhciReset()) sees HR==0 immediately instead of
+             * spinning until timeout and abandoning the controller (the
+             * exact stall that kept OVMF's storage stack from ever
+             * enumerating the CD-ROM -- FW-1h). */
+            ahci->ghc = value & ~(uint32_t)HYPE_AHCI_GHC_HR;
+            return 0;
         case HYPE_AHCI_REG_IS: ahci->is &= ~value; return 0; /* RW1C */
         case HYPE_AHCI_REG_CCC_CTL: ahci->ccc_ctl = value; return 0;
         case HYPE_AHCI_REG_EM_CTL: ahci->em_ctl = value; return 0;

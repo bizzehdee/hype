@@ -63,6 +63,26 @@ static void test_pcmd_start_mirrors_running_bits(void) {
     CHECK_HEX("clearing ST/FRE clears CR/FR too", 0, value);
 }
 
+static void test_ghc_hr_self_clears(void) {
+    hype_ahci_t ahci;
+    uint32_t value;
+    hype_ahci_reset(&ahci);
+
+    /* A real AHCI driver (EDK2 AhciReset) sets GHC.AE, then sets GHC.HR
+     * and polls GHC until HR reads back clear. HR is self-clearing on
+     * real hardware, so the model must report it clear immediately (else
+     * the driver spins until timeout and abandons the controller). AE
+     * and every other bit written alongside must be preserved. */
+    hype_ahci_mmio_write(&ahci, HYPE_AHCI_REG_GHC, 4, HYPE_AHCI_GHC_AE);
+    hype_ahci_mmio_read(&ahci, HYPE_AHCI_REG_GHC, 4, &value);
+    CHECK_HEX("AE stored", HYPE_AHCI_GHC_AE, value);
+
+    hype_ahci_mmio_write(&ahci, HYPE_AHCI_REG_GHC, 4, HYPE_AHCI_GHC_AE | HYPE_AHCI_GHC_HR);
+    hype_ahci_mmio_read(&ahci, HYPE_AHCI_REG_GHC, 4, &value);
+    CHECK_HEX("HR reads back clear immediately", 0, (value & HYPE_AHCI_GHC_HR));
+    CHECK_HEX("AE preserved across the HR write", HYPE_AHCI_GHC_AE, (value & HYPE_AHCI_GHC_AE));
+}
+
 static void test_is_rw1c(void) {
     hype_ahci_t ahci;
     uint32_t value;
@@ -202,9 +222,12 @@ static void test_write_every_writable_register(void) {
 
     hype_ahci_reset(&ahci);
 
+    /* GHC.HR (bit 0) is self-clearing (HBA reset completes instantly in
+     * the model), so 0xA1 written reads back as 0xA0 -- every other bit
+     * stored, HR reported clear. See test_ghc_hr_self_clears(). */
     hype_ahci_mmio_write(&ahci, HYPE_AHCI_REG_GHC, 4, 0xA1u);
     hype_ahci_mmio_read(&ahci, HYPE_AHCI_REG_GHC, 4, &value);
-    CHECK_HEX("GHC write", 0xA1u, value);
+    CHECK_HEX("GHC write (HR self-clears)", 0xA0u, value);
 
     hype_ahci_mmio_write(&ahci, HYPE_AHCI_REG_CCC_CTL, 4, 0xA2u);
     hype_ahci_mmio_read(&ahci, HYPE_AHCI_REG_CCC_CTL, 4, &value);
@@ -333,6 +356,7 @@ int main(void) {
     test_reset_state();
     test_read_write_clb_fb();
     test_pcmd_start_mirrors_running_bits();
+    test_ghc_hr_self_clears();
     test_is_rw1c();
     test_ci_write_ors_in_bits();
     test_reserved_register_reads_zero_and_ignores_writes();
