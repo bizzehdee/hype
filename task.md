@@ -718,12 +718,33 @@ EPT/NPT (that only stops direct guest-to-guest memory access) — it's the
 hypervisor trusting a guest-supplied address/length in device emulation
 code. Foundational to every device model task below; not optional.
 
-- [ ] **VALID-1** — Guest-physical-address translation/bounds-check helper:
+- [x] **VALID-1** — Guest-physical-address translation/bounds-check helper:
   given a VM, a guest-physical address, and a length, validate against that
   VM's own EPT/NPT-mapped range before returning a host-virtual pointer. All
   device emulation code paths must go through this, never dereference a
   raw guest-supplied address directly.
   Deps: M3-1
+
+  *New pure-logic module `core/guest_mem.h`/`.c`: a `hype_gpa_map_t`
+  describes one VM's guest-physical -> host layout as up to
+  HYPE_GPA_MAP_MAX_REGIONS contiguous regions (e.g. FW-1's guest RAM
+  [0, GUEST_RAM) + the flash window near 4GB). `hype_gpa_to_host(map,
+  gpa, len)` returns a host address ONLY if `len > 0` and the whole
+  [gpa, gpa+len) range lies within a single region; it returns 0
+  (reject) for out-of-range, region-straddling, region-overrunning,
+  zero-length, or arithmetic-overflowing requests -- never a bogus
+  pointer, and a range that runs past a region end is rejected outright,
+  not retried against a later region (a device buffer must be contiguous
+  in one region). `hype_gpa_map_add()` rejects malformed regions
+  (zero length, or base+length overflowing 2^64) so the lookup's
+  containment math never wraps. `hype_gpa_range_valid()` is the
+  validate-only variant, kept distinct from the address so a legitimate
+  host address of 0 is never mistaken for "invalid". Fully unit-tested
+  (`core/tests/test_guest_mem.c`: translate/reject/straddle/overrun/
+  overflow/zero-length/capacity, plus the host-base-0 and top-of-space
+  edge cases). This is the VALID-1 primitive; routing each device's
+  guest-supplied buffers through it is VALID-2 (virtio), VALID-3 (AHCI/
+  NVMe + LBA range), VALID-4 (other).*
 - [ ] **VALID-2** — Apply VALID-1 to virtio queue descriptor processing
   (virtio-blk, virtio-net).
   Deps: VALID-1
