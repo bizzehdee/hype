@@ -1424,6 +1424,29 @@ tasks — see updated deps below.*
   then re-validate on real AMD. The earlier segfault is a non-issue
   (established flaky/environmental in M4-6d2a).*
 
+  *IRQ WIRING DONE 2026-07-16 (commit a0b2b2d), partial result. Advertised
+  AHCI Interrupt Pin INTA + delivery on config-0x3C's line via a new
+  cascade-aware PIC path (hype_pic_emu_raise_global_irq +
+  hype_pic_emu_acknowledge, master/slave with the slave->IR2 cascade;
+  hype_pci_get_interrupt_line). QEMU result: **the WARN is GONE** --
+  libata now runs interrupt-driven, request_irq(11)s and unmasks the slave
+  cascade (slave IMR=0xf7 bit3 clear, master IMR=0xe8 bit2 clear); no
+  segfault. BUT the fscrypt plateau persists: p_ie=0x0, AHCI IRQs=0,
+  GHC.IE set but PxIE never set. So the async probe stalls in the
+  **COMRESET/reset phase, BEFORE libata enables PxIE or issues a
+  command** -- the completion IRQ is necessary but can't help a stall that
+  precedes any completion. NEXT SUB-TASK (the actual milestone blocker):
+  make the AHCI model complete libata's hardreset. After the guest writes
+  PxSCTL DET=1 then DET=0 (COMRESET), libata (ahci_hardreset ->
+  sata_link_resume/ahci_check_ready) waits for the device to come back --
+  our PxSCTL write is a plain store that presents nothing. Need to model
+  COMRESET: on DET->0, (re)present the device -- PxSSTS DET=3, PxSIG =
+  ATAPI signature, PxTFD !BSY, and deliver the initial D2H Register FIS
+  into the FIS-receive area + PxIS (raise the IRQ if PxIE/GHC.IE) so
+  libata's reset-completion wait is satisfied and the probe proceeds to
+  IDENTIFY/READ. Get a traced kernel-phase capture (poll vs interrupt
+  wait) to confirm exactly what libata blocks on after DET->0.*
+
   *Building blocks landed (2026-07-16, commit aa40591), inert until the
   loop wiring is made safe:*
   - `hype_ahci_irq_pending()` (devices/ahci.c) -- the HBA interrupt-
