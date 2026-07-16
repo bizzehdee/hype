@@ -1233,6 +1233,46 @@ tasks — see updated deps below.*
   the kernel's queueing/retry. Bounds-checking already applied
   (VALID-3). Deps: M4-6d1.
 
+  *STEP-1 DIAGNOSIS (2026-07-16, traced boot, AHCI trace temporarily on):
+  the FW-1 kernel's async libata/scsi scan DOES read the ISO -- but it
+  issues **TEST UNIT READY (CDB 0x00) + REQUEST SENSE (CDB 0x03) after
+  every single command**, a perfect 1:1:1 cycle. Trace histogram over one
+  boot: 150x READ(10) (0x28), 151x TUR (0x00), 151x REQUEST SENSE (0x03),
+  2x INQUIRY (0x12), 1x READ CAPACITY (0x25) -- every READ(10) is
+  bracketed by TUR+SENSE, LBAs repeat (16,17,18,19 re-read), progress is
+  crawling. It then runs a libata EH reset sequence (stop engine: clear
+  PxCMD.ST; clear PxSERR; COMRESET: PxSCTL 0x300->0x301->0x300) and goes
+  idle -- plateau at `Key type fscrypt-provisioning registered`
+  (async_synchronize_full never returns, so /init never runs). NO kernel
+  ata/scsi EH text is emitted (no "hard resetting link"), so it is not a
+  loud timeout path. Our side reports every command status=GOOD, ATAPI
+  SCSI status GOOD, AHCI PxTFD=0x50 (DRDY|DSC, ERR clear) -- so the
+  trigger is a COMPLETION-SEMANTICS mismatch, not a SCSI-status error.
+  Concrete gaps found by inspection:
+    1. The D2H Register FIS we build (svm_vcpu.c) is only partially
+       populated: the 20 bytes are zeroed and only byte 0 (FIS type
+       0x34), byte 2 (status), byte 3 (error) are set. The ATAPI
+       completion fields are left zero -- the Interrupt Reason (sector-
+       count byte 12; a completed ATAPI data-in should report I/O|C/D =
+       0x03) and the byte-count (LBA mid/high, bytes 5-6). PRDBC in the
+       command header IS set correctly.
+    2. INQUIRY reports SCSI VERSION 0x00 (atapi.c handle_inquiry
+       synth_data[2]=0) -- "no standard claimed"; real ATAPI CD-ROMs
+       report ~0x05 (SPC-3), which can change how conservatively the
+       kernel drives the device.
+    3. PxSCTL COMRESET (ahci.c:106) is a plain store -- it does not
+       re-sequence PxTFD/PxSSTS/PxSIG (they happen to read ready, so
+       likely secondary).
+  STEP-2 PLAN: pin the exact libata trigger for the per-command TUR+SENSE
+  by comparing our AHCI-ATAPI completion byte-for-byte against QEMU's
+  reference (hw/ide/ahci.c + hw/ide/atapi.c -- the completion Linux reads
+  cleanly), since our-code inspection narrowed it to the above but did not
+  prove which field libata keys on. Fix the D2H FIS population (IREASON +
+  byte count) and INQUIRY version first (both are correctness fixes
+  regardless), then re-trace: success = TUR/SENSE no longer bracket every
+  read and the scan completes so async_synchronize_full returns. Confounded
+  by nested-SVM flakiness -> confirm on real HW.*
+
   *Building blocks landed (2026-07-16, commit aa40591), inert until the
   loop wiring is made safe:*
   - `hype_ahci_irq_pending()` (devices/ahci.c) -- the HBA interrupt-
