@@ -559,10 +559,15 @@ void hype_svm_set_msr_trace(int enabled) {
     g_msr_trace = enabled ? 1 : 0;
 }
 
-int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse) {
+int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse,
+                                   int *out_kbd_wait) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
     uint8_t traced_value = 0;
+
+    if (out_kbd_wait != 0) {
+        *out_kbd_wait = 0;
+    }
 
     hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
 
@@ -591,6 +596,12 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
             hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_STATUS_COMMAND, &status);
             if (hype_ps2_mouse_has_pending_byte(mouse)) {
                 status |= HYPE_PS2_STATUS_OUTPUT_FULL | HYPE_PS2_STATUS_AUX_DATA;
+            }
+            /* A status read with the output buffer empty is the guest
+             * checking "is a key/byte available?" and finding none -- the
+             * signal that it is polling, waiting for input (FW-1g). */
+            if (out_kbd_wait != 0 && (status & HYPE_PS2_STATUS_OUTPUT_FULL) == 0) {
+                *out_kbd_wait = 1;
             }
             real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | status;
             traced_value = status;

@@ -265,6 +265,13 @@ static hype_atapi_t g_fw_1_atapi;
 #define HYPE_FW_1_KEY_REACTION_CHARS 40ULL  /* new console chars after the key => menu rendered => reacted */
 #define HYPE_FW_1_KEY_REARM_INTERVAL 256ULL /* re-arm the scancode every N exits (leaves OBF-clear windows) */
 #define HYPE_FW_1_KEY_WAIT_EXITS 20000ULL   /* give up waiting for a reaction after this many exits post-key */
+/* FW-1g: inject a key once the guest has done this many *consecutive*
+ * empty keyboard status polls -- an interactive prompt busy-waiting for
+ * input (e.g. the UEFI Shell's "press any key to continue" countdown
+ * polls port 0x64 thousands of times). Keyboard init interleaves data
+ * reads/command writes, which reset the run, so a run this long is
+ * unambiguously an idle input-wait, not init. */
+#define HYPE_FW_1_KBD_POLL_INJECT_RUN 512ULL
 
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
@@ -2487,7 +2494,7 @@ static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 if (hype_svm_vcpu_handle_ioio(ctx, &g_input_2_pic, &g_input_2_pit) == 0) {
                     continue;
                 }
-                if (hype_svm_vcpu_handle_ps2_ioio(ctx, &g_input_2_kbd, &g_input_2_mouse) == 0) {
+                if (hype_svm_vcpu_handle_ps2_ioio(ctx, &g_input_2_kbd, &g_input_2_mouse, 0) == 0) {
                     /* Mirrors run_input_1_test()'s own "wait for the
                      * guest to genuinely be ready" gate, extended with
                      * the mouse-specific readiness condition: reporting
@@ -4381,6 +4388,10 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * VMCB-backed MSRs (FS/GS/syscall/sysenter, PAT, EFER) are handled
      * for real, not stubbed -- see configure_guest_msrpm(). */
     hype_svm_set_msr_trace(1);
+    /* FW-1g: per-access PS/2 tracing (hype_svm_set_ps2_trace(1)) is
+     * available for debugging the keyboard handshake, left off -- an
+     * interactive prompt busy-polls 0x64 thousands of times and each
+     * trace line is GOP-rendered. */
 
     /* Real OVMF's own platform init needs real ACPI content via
      * fw_cfg, the same "etc/acpi/rsdp"/"etc/acpi/tables"/
@@ -4540,6 +4551,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     unsigned int uart_line_len2 = 0;
     int key_injected = 0;
     int key_reacted = 0;
+    unsigned long long kbd_poll_run = 0; /* FW-1g: consecutive empty keyboard status polls */
     unsigned long long console_chars = 0;
     unsigned long long inject_chars = 0;
     unsigned long long inject_productive = 0;
@@ -4737,11 +4749,38 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             if (hype_svm_vcpu_handle_cmos_ioio(ctx, &g_fw_1_cmos) == 0) {
                 continue;
             }
-            /* FW-1f: guest PS/2 keyboard/mouse (0x60/0x64) -- OVMF's
+            /* FW-1f/g: guest PS/2 keyboard/mouse (0x60/0x64) -- OVMF's
              * Ps2KeyboardDxe ConIn. Must be modeled (not absorbed) so it
-             * can read the controller status + our injected scancode. */
-            if (hype_svm_vcpu_handle_ps2_ioio(ctx, &g_fw_1_ps2, &g_fw_1_mouse) == 0) {
-                continue;
+             * can read the controller status + our injected scancode.
+             * out_kbd_wait flags a keyboard status poll that found no
+             * data -- FW-1g counts a run of these (an interactive prompt
+             * busy-polling for a key, e.g. the shell's "press any key to
+             * continue" countdown) to time the key injection into that
+             * exact window; init-phase polling interleaves data reads and
+             * command writes, which reset the run to 0. */
+            {
+                int kbd_wait = 0;
+                if (hype_svm_vcpu_handle_ps2_ioio(ctx, &g_fw_1_ps2, &g_fw_1_mouse, &kbd_wait) == 0) {
+                    if (kbd_wait) {
+                        kbd_poll_run++;
+                    } else {
+                        kbd_poll_run = 0;
+                    }
+                    if (!key_injected && productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
+                        kbd_poll_run >= HYPE_FW_1_KBD_POLL_INJECT_RUN) {
+                        hype_debug_print("fw-1: guest is polling the keyboard at an interactive prompt "
+                                          "(%llu consecutive empty status reads, %llu productive exits) -- "
+                                          "injecting Enter now (FW-1g)\n",
+                                          (unsigned long long)kbd_poll_run,
+                                          (unsigned long long)productive_exits);
+                        hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, HYPE_FW_1_KEY_ENTER_MAKE);
+                        key_injected = 1;
+                        inject_chars = console_chars;
+                        inject_productive = productive_exits;
+                        inject_total = total_exits;
+                    }
+                    continue;
+                }
             }
             /* FW-1e: guest COM1 UART (0x3F8-0x3FF). TX bytes are buffered
              * in the model and drained to hype's console at the top of
@@ -4929,10 +4968,6 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, HYPE_FW_1_KEY_ENTER_MAKE);
                 hype_guest_uart_rx_enqueue(&g_fw_1_uart, (uint8_t)'\r');
                 hype_guest_uart_rx_enqueue(&g_fw_1_uart2, (uint8_t)'\r');
-                /* FW-1g: trace what OVMF does with the keyboard from here
-                 * on -- does its WaitForKey poll read the status (OBF)
-                 * and consume the scancode? */
-                hype_svm_set_ps2_trace(1);
                 key_injected = 1;
                 inject_chars = console_chars;
                 inject_productive = productive_exits;
@@ -4961,10 +4996,11 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
     if (booted && key_reacted) {
         hype_debug_print(
-            "fw-1: real OVMF BOOTED + INTERACTIVE -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2) with "
-            "%llu chars of console output forwarded, and the injected PS/2 Enter DROVE it out of its "
-            "idle prompt into Boot Manager Menu processing (%llu productive exits after the key -- guest "
-            "ConIn confirmed). Rendering that full-screen menu TUI is the TERM milestone. guest_rip=0x%llx.\n",
+            "fw-1: real OVMF BOOTED + INTERACTIVE (FW-1g) -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2, "
+            "AHCI CD-ROM) with %llu chars of console output forwarded, and the injected PS/2 Enter was "
+            "READ by the guest's keyboard driver at its interactive prompt (the guest polled 0x64, we set "
+            "OBF, it read scancode 0x1C off 0x60) and REACTED with %llu productive exits + new console "
+            "output -- guest ConIn confirmed end-to-end. guest_rip=0x%llx.\n",
             (unsigned long long)console_chars, (unsigned long long)(productive_exits - inject_productive),
             (unsigned long long)info.guest_rip);
         return;

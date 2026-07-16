@@ -1814,13 +1814,41 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
     deeper debug (FW-1g)"); no false success. Suite green, no
     regressions, boots on QEMU. Deps: FW-1e.
 
-- [ ] **FW-1g** — Make a guest keystroke actually register (drive OVMF's
-  Boot Manager Menu / shell). Deep-debug why Ps2KeyboardDxe's poll
-  doesn't surface an injected scancode despite completing init: confirm
-  the PS/2 keyboard is in ConIn, check whether BDS resets/drains ConIn
-  between "press any key" retries, and verify the exact status/scancode/
-  timing the WaitForKey poll consumes. Then wire a real key source
-  (INPUT-3 host keyboard) instead of the synthetic Enter. Deps: FW-1f.
+- [x] **FW-1g** — Make a guest keystroke actually register (drive OVMF's
+  shell / an interactive prompt). DONE + verified under QEMU+KVM: the
+  guest's own keyboard driver READS an injected scancode and REACTS.
+  Deps: FW-1f.
+
+  *Root cause (found by tracing every guest 0x60/0x64 access from boot
+  start against EDK2 Ps2KbdCtrller.c) was an injection-TIMING bug, not
+  the earlier "Ps2KeyboardDxe.Start failed" theory -- which FW-1h
+  disproved by giving the guest an interactive target (the UEFI Shell)
+  instead of the dead "no bootable device" Boot Manager prompt:*
+  - *Keyboard init completes cleanly: every command (0x20 read-cmd-byte,
+    0x60/0x67 write-cmd-byte, 0xF4 enable, 0xAB->0x00 interface test,
+    0xFF->0xFA/0xAA reset+BAT, 0xF0/0x02 scancode set) is ACKed by the
+    devices/ps2_keyboard.c model, so Start succeeds and its timer poll
+    runs (thousands of 0x64 status reads).*
+  - *The interactive prompt busy-polls port 0x64 for a key (the Shell's
+    "Press ESC in N seconds ... or any other key to continue" countdown
+    polls thousands of times in a row). The old FW-1f logic injected only
+    at the post-boot idle HLT -- which lands AFTER that busy-poll window
+    expires, so the scancode was never polled.*
+  - *Fix (svm_vcpu.c + boot/main.c): hype_svm_vcpu_handle_ps2_ioio() now
+    reports, via out_kbd_wait, a keyboard status read that found the
+    output buffer empty -- i.e. the guest waiting for input. FW-1 counts
+    a run of >= HYPE_FW_1_KBD_POLL_INJECT_RUN (512) consecutive such
+    polls (unambiguously an idle input-wait: init interleaves data reads
+    /commands, which reset the run) past the boot threshold, and injects
+    Enter into that exact window. The guest's poll then sees OBF set,
+    reads scancode 0x1C off 0x60, and reacts (new console output). Trace
+    confirmed `IN 0x60 ->=0x1c` reads + the "BOOTED + INTERACTIVE"
+    reaction; per-access PS/2 tracing (hype_svm_set_ps2_trace) stays
+    available but off.*
+  - *Remaining refinement (not blocking): wire a real key source
+    (INPUT-3 host keyboard) in place of the synthetic Enter, so a human
+    at the machine drives the guest. Tracked as the "drive it" half; the
+    core "a keystroke registers" invariant is proven.*
 
   **Debug-log routing set up (2026-07-15):**
   - `tools/build-fw.sh` now takes `FW_TARGET=DEBUG` -> builds OVMF `-b

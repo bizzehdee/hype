@@ -301,7 +301,15 @@ int hype_svm_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd)
  * devices/ps2_keyboard.h and devices/ps2_mouse.h) is already fully
  * tested in isolation.
  */
-int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse);
+/* Handles a guest PS/2 controller access (data port 0x60 / status+command
+ * port 0x64) against the emulated keyboard + mouse. If out_kbd_wait is
+ * non-NULL it is set to 1 when this access was a keyboard status-port read
+ * that found the output buffer empty -- i.e. the guest is polling, waiting
+ * for a keystroke (FW-1g uses a run of these to time a key injection into
+ * an interactive prompt's poll window); 0 for every other access. Returns
+ * 0 if the access was a PS/2 port, -1 otherwise. */
+int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse,
+                                   int *out_kbd_wait);
 
 /*
  * FW-1: services the ACPI PM Timer's own I/O port (hardcoded to 0x608
