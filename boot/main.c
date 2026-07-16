@@ -5175,6 +5175,42 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 inject_total = total_exits;
                 continue;
             }
+            /* M4-6d2: a HLT with IF=1 is an interrupt-wait (Linux idle /
+             * msleep does `sti; hlt`). Because we intercept the HLT before
+             * it retires, the STI interrupt-shadow that covered it never
+             * clears, so a pending timer/AHCI IRQ stays blocked
+             * (can_accept=0) and jiffies freeze -- the M4-6d2 plateau. When
+             * an interrupt is actually deliverable now, model the wake:
+             * retire the HLT (RIP past it + drop the shadow) and inject, so
+             * the guest resumes after the HLT with the IRQ taken. Nothing
+             * deliverable => fall through and keep re-halting (advancing
+             * time) until one comes due. */
+            {
+                hype_svm_intr_state_t is;
+                int if_set, pic_ready;
+                hype_svm_vcpu_get_intr_state(ctx, &is);
+                if_set = (int)((is.rflags >> 9) & 1u);
+                pic_ready = (g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) &&
+                            (((g_fw_1_pic.master.irr & (uint8_t)~g_fw_1_pic.master.imr) != 0) ||
+                             ((g_fw_1_pic.slave.irr & (uint8_t)~g_fw_1_pic.slave.imr) != 0 &&
+                              (g_fw_1_pic.master.imr & (uint8_t)(1u << 2)) == 0));
+                if (if_set && (is.pending_valid || pic_ready)) {
+                    hype_svm_vcpu_wake_hlt(ctx); /* retire HLT + clear STI shadow */
+                    if (!hype_svm_vcpu_deliver_pending_if_ready(ctx) &&
+                        g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
+                        uint8_t v;
+                        if (hype_pic_emu_acknowledge(&g_fw_1_pic, &v)) {
+                            hype_svm_vcpu_request_interrupt(ctx, v);
+                            if (v == g_fw_1_pic.master.irq_offset) {
+                                pit_irqs++;
+                            } else {
+                                ahci_irqs++;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
             /* M4-6d2b: stop once the guest has been quiescent (no
              * productive exit) for HYPE_FW_1_IDLE_GIVEUP_SECONDS of real
              * time -- it has reached a stable idle (OVMF at its prompt, or
@@ -5187,6 +5223,29 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
              * productive exit lets the kernel's probe/init proceed while
              * still catching a true stall. Falls back to the exit-count
              * test if TSC calibration was unavailable. */
+            /* M4-6d2 DIAG: the moment we first notice the guest quiescent
+             * for ~2s (well before the 10s give-up) with a PIC IRQ still
+             * in service, dump its interrupt-acceptance state -- this is
+             * the timer-IRQ wedge, and IF/shadow/eventinj/vintr/pending
+             * tell whether it's a dead IF=0 halt or ready-but-undelivered. */
+            {
+                static int wedge_dumped = 0;
+                if (!wedge_dumped && g_fw_1_host_tsc_hz != 0 &&
+                    tb_last_tsc - last_progress_tsc >= 2ULL * g_fw_1_host_tsc_hz &&
+                    (g_fw_1_pic.master.isr != 0 || g_fw_1_pic.slave.isr != 0)) {
+                    hype_svm_intr_state_t is;
+                    wedge_dumped = 1;
+                    hype_svm_vcpu_get_intr_state(ctx, &is);
+                    hype_debug_print("fw-1: M4-6d2 WEDGE: IF=%d shadow=0x%llx eventinj=0x%llx vintr=0x%llx "
+                                      "can_accept=%d pending=%d/vec0x%x (master ISR=0x%x IMR=0x%x, "
+                                      "slave ISR=0x%x IMR=0x%x)\n",
+                                      (int)((is.rflags >> 9) & 1u), (unsigned long long)is.interrupt_shadow,
+                                      (unsigned long long)is.eventinj, (unsigned long long)is.vintr,
+                                      is.can_accept, is.pending_valid, (unsigned int)is.pending_vector,
+                                      (unsigned int)g_fw_1_pic.master.isr, (unsigned int)g_fw_1_pic.master.imr,
+                                      (unsigned int)g_fw_1_pic.slave.isr, (unsigned int)g_fw_1_pic.slave.imr);
+                }
+            }
             if (g_fw_1_host_tsc_hz != 0) {
                 if (tb_last_tsc - last_progress_tsc >=
                     HYPE_FW_1_IDLE_GIVEUP_SECONDS * g_fw_1_host_tsc_hz) {

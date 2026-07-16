@@ -378,6 +378,32 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx);
  * Returns 1 if it injected. Exempt VMCB glue. */
 int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);
 
+/* M4-6d2: retire an intercepted HLT and consume its STI interrupt-shadow,
+ * modelling an interrupt waking a halted CPU (RIP advances past the 1-byte
+ * HLT so the guest resumes after it). Call on a HLT intercept immediately
+ * before injecting the waking interrupt. Without this, a `sti; hlt` idle
+ * wait deadlocks: the shadow that covered the HLT is never consumed (we
+ * intercept the HLT before it retires), so the pending interrupt stays
+ * blocked and the guest never wakes. Exempt VMCB glue. */
+void hype_svm_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
+
+/* M4-6d2 DIAG: snapshot of the guest's interrupt-acceptance state, for
+ * dumping at a suspected timer-IRQ wedge -- tells whether the guest is
+ * blocked with interrupts disabled (rflags IF=0 / interrupt_shadow set /
+ * !can_accept) versus ready-but-not-delivered, and whether an EVENTINJ is
+ * staged / a VINTR window armed / a vector still pending. */
+typedef struct {
+    uint64_t rflags;
+    uint64_t interrupt_shadow;
+    uint64_t eventinj;
+    uint64_t vintr;
+    int can_accept;
+    int pending_valid;
+    uint8_t pending_vector;
+} hype_svm_intr_state_t;
+
+void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *out);
+
 /* M4-6d2 DIAG: read the interrupt-injection path counters -- how many
  * requests took the direct-EVENTINJ path (guest could accept), how many
  * were deferred to a VINTR window, how many VINTR windows fired to

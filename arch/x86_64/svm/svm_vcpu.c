@@ -687,6 +687,18 @@ void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long
     *overwrite = g_int_defer_overwrite;
 }
 
+void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *out) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    out->rflags = real->vmcb->save.rflags;
+    out->interrupt_shadow = real->vmcb->control.interrupt_shadow;
+    out->eventinj = real->vmcb->control.eventinj;
+    out->vintr = real->vmcb->control.vintr;
+    out->can_accept =
+        hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow);
+    out->pending_valid = g_pending_irq_valid;
+    out->pending_vector = g_pending_irq_vector;
+}
+
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
 
@@ -721,6 +733,19 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
          * own can-accept check will take the direct-EVENTINJ path. */
         hype_svm_vcpu_request_interrupt(ctx, vector);
     }
+}
+
+void hype_svm_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    /* Model an interrupt waking a halted CPU: the HLT retires (so the
+     * guest resumes AFTER it -- e.g. its idle loop's need_resched check --
+     * not by re-executing HLT), and the STI interrupt-shadow that covered
+     * the HLT is consumed. HLT is a fixed 1-byte opcode (0xF4), so past-it
+     * is RIP+1 (no reliance on nRIP, which QEMU's nested SVM may not
+     * populate). The caller injects the waking interrupt right after; the
+     * guest takes it with a return address after the HLT. */
+    real->vmcb->save.rip += 1;
+    real->vmcb->control.interrupt_shadow &= ~1ULL;
 }
 
 int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
