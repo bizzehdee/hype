@@ -167,10 +167,11 @@ void hype_pit_emu_tick(hype_pit_emu_t *pit) {
     }
 }
 
-void hype_pit_emu_advance(hype_pit_emu_t *pit, uint64_t ticks) {
+unsigned hype_pit_emu_advance(hype_pit_emu_t *pit, uint64_t ticks) {
     int i;
+    unsigned ch0_wraps = 0;
     if (ticks == 0) {
-        return;
+        return 0;
     }
     for (i = 0; i < 3; i++) {
         hype_pit_emu_channel_t *ch = &pit->channels[i];
@@ -180,6 +181,13 @@ void hype_pit_emu_advance(hype_pit_emu_t *pit, uint64_t ticks) {
             uint32_t period = (ch->reload != 0u) ? (uint32_t)ch->reload : 0x10000u;
             uint32_t cur = (ch->counter != 0u) ? (uint32_t)ch->counter : period;
             uint32_t step = (uint32_t)(ticks % period);
+            /* Count terminal-count crossings for channel 0 (IRQ0): the
+             * first crossing is after `cur` ticks, then every `period`. */
+            if (i == 0) {
+                if (ticks >= (uint64_t)cur) {
+                    ch0_wraps = (unsigned)(1u + (ticks - (uint64_t)cur) / (uint64_t)period);
+                }
+            }
             cur = (step < cur) ? (cur - step) : (period - (step - cur));
             ch->counter = (uint16_t)cur;
         } else {
@@ -194,6 +202,7 @@ void hype_pit_emu_advance(hype_pit_emu_t *pit, uint64_t ticks) {
             }
         }
     }
+    return ch0_wraps;
 }
 
 void hype_pit_emu_port61_write(hype_pit_emu_t *pit, uint8_t value) {

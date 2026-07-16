@@ -4581,6 +4581,8 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     int key_injected = 0;
     int key_reacted = 0;
     unsigned long long kbd_poll_run = 0; /* FW-1g: consecutive empty keyboard status polls */
+    unsigned long long timer_irqs = 0;   /* M4-6b: guest LAPIC-timer IRQs actually delivered */
+    unsigned long long pit_irqs = 0;     /* M4-6b4: PIT IRQ0 (legacy clockevent) IRQs delivered */
     unsigned long long console_chars = 0;
     unsigned long long inject_chars = 0;
     unsigned long long inject_productive = 0;
@@ -4655,11 +4657,32 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
             if (ticks != 0) {
                 hype_guest_lapic_advance(&g_fw_1_lapic, ticks);
-                hype_pit_emu_advance(&g_fw_1_pit, ticks);
+                /* Channel-0 terminal-count crossings during this advance
+                 * are PIT IRQ0 timer edges (M4-6b4). */
+                if (hype_pit_emu_advance(&g_fw_1_pit, ticks) != 0) {
+                    hype_pic_emu_raise_irq(&g_fw_1_pic.master, 0);
+                }
             }
         }
         if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
             hype_svm_vcpu_request_interrupt(ctx, timer_vector);
+            timer_irqs++;
+        }
+        /* M4-6b4: deliver the legacy PIT clockevent. A guest OS that runs
+         * without ACPI/IO-APIC (our FW-1 guest gets no RSDP -> fully
+         * legacy) uses PIT IRQ0 through the 8259 PIC as its timer. Only
+         * inject when IRQ0 isn't already in service (ISR bit 0 clear),
+         * i.e. the guest has EOI'd the previous one -- otherwise a fast
+         * real-time cadence would flood it with nested timer IRQs. The
+         * PIC's acknowledge honours the guest's own IMR (a masked IRQ0 is
+         * never delivered) and returns the guest-programmed vector
+         * (ICW2 base + 0). */
+        if ((g_fw_1_pic.master.isr & 0x01u) == 0) {
+            uint8_t pic_vector;
+            if (hype_pic_emu_acknowledge_highest_priority(&g_fw_1_pic.master, &pic_vector)) {
+                hype_svm_vcpu_request_interrupt(ctx, pic_vector);
+                pit_irqs++;
+            }
         }
 
         /* FW-1e: surface any console text the guest wrote to either UART.
@@ -5048,6 +5071,17 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                              (unsigned int)sizeof(uart_line));
     fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
                              (unsigned int)sizeof(uart_line2));
+
+    /* M4-6b diagnostic: how many guest LAPIC-timer IRQs were actually
+     * delivered, and whether one is still stuck in-service (never EOI'd
+     * by the guest). timer_irqs == 1 with in_service == 1 means the
+     * guest took one tick and never acknowledged it -> its clockevent
+     * isn't live. A large count means it is servicing the timer. */
+    hype_debug_print("fw-1: M4-6b diag: LAPIC timer IRQs=%llu (in_service=%d), PIT IRQ0 IRQs=%llu "
+                      "(master ISR=0x%x IMR=0x%x), host_tsc_hz=%llu\n",
+                      (unsigned long long)timer_irqs, g_fw_1_lapic.timer_in_service,
+                      (unsigned long long)pit_irqs, (unsigned int)g_fw_1_pic.master.isr,
+                      (unsigned int)g_fw_1_pic.master.imr, (unsigned long long)g_fw_1_host_tsc_hz);
 
     if (booted && key_reacted) {
         hype_debug_print(

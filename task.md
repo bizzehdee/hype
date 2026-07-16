@@ -1120,13 +1120,31 @@ tasks — see updated deps below.*
   the redirection-table entries) so the guest can program IRQ routing,
   and deliver routed IRQs to the guest LAPIC via the INT-1/INT-2 path.
   Deps: M4-6b2.
-- [ ] **M4-6b4** — Clockevent IRQ delivery. Deliver the kernel's chosen
-  periodic timer interrupt at the (now real-time) calibrated cadence:
-  extend FW-1b's guest LAPIC timer to fire off the real-time count
-  (M4-6b1) at the guest-programmed vector, and/or deliver PIT IRQ0
-  through the PIC/IO-APIC (M4-6b3), so the scheduler tick actually fires
-  and the kernel advances past end-of-initcalls to "Run /init".
-  Deps: M4-6b1, M4-6b3.
+- [x] **M4-6b4** — Clockevent IRQ delivery (legacy PIT/8259 path). DONE +
+  verified: the guest's clockevent now receives ticks. A per-run
+  diagnostic first showed the kernel delivered **0** LAPIC-timer IRQs
+  (init_count stayed 0) -- it does NOT use the LAPIC timer; with no
+  ACPI/IO-APIC (see M4-6b2) it runs fully legacy and uses **PIT IRQ0
+  through the 8259 PIC**. So the FW-1 loop now, when
+  hype_pit_emu_advance() reports channel-0 terminal-count crossings
+  (new return value), raises IRQ0 on the master PIC
+  (hype_pic_emu_raise_irq), then -- gated on IRQ0 not already in service
+  (ISR bit 0), so a fast cadence can't flood nested IRQs -- acknowledges
+  the highest-priority unmasked IRQ (honouring the guest's IMR) and
+  injects the guest-programmed vector (ICW2 base + IRQ) via the
+  INT-1/INT-2 path. Verified: master ISR returns to 0 between ticks (the
+  guest IS servicing + EOI'ing them) with IMR=0xe8 (guest unmasked IRQ0),
+  42 IRQ0s delivered over ~0.46s of a boot. The LAPIC-timer advance from
+  M4-6b1 stays wired too, for any guest that does use it.
+
+  *Does not by itself reach userspace: the kernel now has a live
+  clockevent but still idle-HLTs at end-of-do_initcalls, because
+  `async_synchronize_full()` (run before `/init`) waits on the libata
+  AHCI port-scan async probe, which completes via an AHCI controller
+  INTERRUPT the guest enabled -- and this project completes AHCI commands
+  by PxCI/PxIS polling only, never firing the AHCI IRQ. Delivering that
+  (PCI INTx via the PIC when a command completes with PxIE/GHC.IE set) is
+  M4-6d2's core.* Deps: M4-6b1.
 - [x] **M4-6c** — Kernel console visibility. DONE + verified: the Linux
   kernel's own dmesg flows to hype's forwarded console. No hype code
   change was needed -- FW-1e's guest COM1 UART model already serves the

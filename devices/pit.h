@@ -92,8 +92,15 @@ void hype_pit_emu_tick(hype_pit_emu_t *pit);
  * and channel 2's mode-0 OUT pin latches high when it reaches terminal
  * count (drives port 0x61 bit 5, same as the single-tick path). A 0
  * `reload` is treated as the full 65536-count period.
+ *
+ * Returns the number of times channel 0 completed a period (reached
+ * terminal count) during this advance -- i.e. the count of IRQ0 timer
+ * ticks the caller should signal to the PIC (0 if channel 0 is not in a
+ * periodic mode). Channel 0 is the system timer wired to IRQ0 by
+ * hardware convention; a guest OS's PIT-based clockevent counts on that
+ * edge. (Channels 1/2 have no IRQ wired here.)
  */
-void hype_pit_emu_advance(hype_pit_emu_t *pit, uint64_t ticks);
+unsigned hype_pit_emu_advance(hype_pit_emu_t *pit, uint64_t ticks);
 
 /*
  * System Control Port B (I/O port 0x61) write: latches the software-
