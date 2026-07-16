@@ -900,18 +900,54 @@ tasks — see updated deps below.*
   NOT yet validated: a real guest OS's own AHCI/ATAPI driver (Linux's
   ahci+sr_mod, or UEFI's own AhciBusDxe during M4-6's boot) actually
   enumerating and reading from this device -- that's M4-6's job.*
-- [ ] **M4-6** — Boot a stock Linux UEFI installer ISO (e.g. Debian
-  netinst) end-to-end through GRUB.
+- [~] **M4-6** — Boot a stock Linux UEFI installer ISO end-to-end
+  through GRUB. IN PROGRESS: the GRUB stage works end-to-end and the
+  Linux kernel starts; the kernel does not yet reach userspace (a device-
+  emulation tail remains, decomposed into M4-6a.. below).
   Deps: FW-1h, ISO-2 (FW-2, CPUMSR-2, RAM-2, PCI-2 all done)
-  Scope: with FW-1h giving the guest a bootable CD, OVMF's BDS should
-  boot the ISO's EFI loader (shim/GRUB) automatically. This is a
-  boot-and-observe task like FW-1c/d: run it, watch the forwarded
-  console + a `#VMEXIT_NPF`/IOIO for whatever the loader/kernel touches
-  that FW-1's device set doesn't yet cover, and handle the next blocker.
-  No upfront subtasks -- the ISO's loader reveals what's needed
-  (candidate follow-ons: more of the AHCI/ATAPI command surface, block
-  reads at scale, and eventually keyboard via FW-1g for the GRUB menu if
-  it doesn't auto-boot).
+
+  *Verified under QEMU+KVM with a real Alpine 3.21.7 virt ISO (64 MB,
+  UEFI/GRUB-bootable): OVMF's BDS auto-discovers the CD (FW-1h) and boots
+  it -> `GNU GRUB version 2.12` menu -> auto-selects "Linux virt" ->
+  `Booting 'Linux virt'` -> the real Linux kernel runs through early
+  setup (percpu/GS, its own IDT exceptions, MSRs, xAPIC MMIO) and reaches
+  PIT-based delay calibration. Getting there required real-guest
+  infrastructure the earlier synthetic/OVMF guests never exercised, each
+  grounded in the AMD APM / the observed guest behavior, not guessed:*
+
+  - *MSR handling for a real OS (`svm_vcpu.c`): the CPUMSR-2 blanket
+    "intercept every MSR, fail-closed" is impractical for a kernel that
+    touches dozens. `configure_guest_msrpm()` opens an MSRPM passthrough
+    set for the MSRs VMSAVE/VMLOAD already context-switch via the guest
+    VMCB (FS/GS/KernelGS base, STAR/LSTAR/CSTAR/SFMASK, SYSENTER_*) --
+    correct + isolated because `hype_svm_vcpu_run()` vmload/vmsaves the
+    guest VMCB and hype never uses those MSRs. PAT (0x277) stays
+    intercepted and is emulated into the VMCB's own `g_pat` (not in the
+    VMSAVE set, so a native write would corrupt the host). Any other
+    unrecognized MSR is, for the FW-1 guest only, logged + isolation-
+    safely stubbed (RDMSR->0, WRMSR->ignored; `hype_svm_set_msr_trace`)
+    rather than fatal -- the synthetic test guests keep fail-closed.*
+  - *Exception interception off for the real-OS guest
+    (`hype_svm_vcpu_set_exception_intercepts(ctx, 0)`): the builders'
+    strict `0xFFFFFFFF` (every vector -> #VMEXIT) is right for the
+    synthetic tests and was invaluable for OVMF bring-up, but fatal to a
+    real OS, which handles its own #PF (demand paging), #GP/#UD (feature
+    probing), #NM (lazy FPU), ... A triple fault still returns as
+    SHUTDOWN.*
+  - *MMIO instruction decode for a paging guest: once the kernel runs in
+    its own virtual address space, RIP is a high-canonical virtual
+    address, so the OVMF-era "translate RIP as guest-physical" no longer
+    reaches the faulting instruction. Now prefers AMD decode-assists
+    (`num_bytes_fetched`/`guest_instruction_bytes`, the correct source on
+    real AMD HW); since QEMU+KVM nested SVM does NOT populate them, falls
+    back to a 4-level guest page-table walk (`fw_1_guest_virt_to_phys`,
+    honoring 1G/2M pages) rooted at the guest CR3.*
+
+  Remaining tail (each a boot-and-observe device gap, decomposed so it
+  is not one unbounded task): **M4-6a** (port 0x61 / PIT ch2 timer
+  calibration -- the current blocker), then guest-timer interrupt
+  delivery, kernel console visibility, and root/initramfs handoff. See
+  M4-6a.. below.
 
   *Scoping this task out (2026-07-14) surfaced that "boot a stock
   Linux ISO through GRUB" actually needs ~7 substantial new subsystems
@@ -929,6 +965,48 @@ tasks — see updated deps below.*
   boots from. Split into the new CPUMSR/RAM/PCI/FW/ISO sections below
   rather than attempted as one task -- M4-6 itself is now the final
   GRUB+Linux integration step once all five are done.*
+
+  *Second scope discovery (2026-07-16, from actually booting Alpine):
+  "the final integration step" is itself a staged sequence of Linux
+  guest-device gaps, revealed one at a time as the kernel boots. The
+  reusable hypervisor infrastructure (real-OS MSR/exception/MMIO-decode
+  handling above) is done and committed under M4-6; what remains is
+  per-device emulation the kernel demands in order, decomposed below.
+  These gate "kernel reaches userspace", not the GRUB milestone (done).*
+
+- [ ] **M4-6a** — Port 0x61 (NMI status/control + PIT channel-2 gate +
+  refresh-clock toggle). Linux's early PIT-based delay calibration
+  (`calibrate_delay`/`pit_calibrate_tsc`) polls port 0x61: bit 4
+  (refresh clock, toggles ~every 15us) and bit 5 (PIT ch2 OUT, follows
+  the ch2 counter when the gate bit 0 is set). FW-1 currently absorbs
+  0x61 as an unhandled port, so neither bit ever changes and the
+  calibration loop spins to HYPE_FW_1_MAX_EXITS. Model port 0x61 (likely
+  fold into devices/pit.h or a small companion): bit 4 toggling, bit 5
+  driven by the existing PIT ch2 model + the guest-written gate.
+  Deps: M4-6 infra (done).
+- [ ] **M4-6b** — Guest timer-interrupt delivery at scale: once past
+  calibration the kernel arms the LAPIC timer / PIT and expects periodic
+  IRQs to drive its scheduler and delayed work. FW-1b/INT-2 already
+  inject the guest LAPIC timer vector; confirm it survives real kernel
+  IDT/IRQ setup and that the delivery cadence is right, handling
+  whatever the kernel's clockevent/clocksource selection touches.
+  Deps: M4-6a.
+- [ ] **M4-6c** — Kernel console visibility: get the kernel's own
+  console output onto hype's forwarded console so boot is observable and
+  driveable. Confirm the GRUB `linux` cmdline routes to a device FW-1
+  surfaces (COM1 `console=ttyS0` -> FW-1e's guest UART is the likely
+  path; else the kernel logs only to a framebuffer/tty0 we don't yet
+  render). May need appending a console= arg or handling the kernel's
+  8250 probe/divisor writes.
+  Deps: M4-6a.
+- [ ] **M4-6d** — Root/initramfs handoff to userspace: the Alpine virt
+  initramfs is loaded by GRUB into guest RAM (no disk needed for it), so
+  the kernel should unpack it and run `/init`; drive whatever remaining
+  device/timer/console gaps that exercises up to a visible userspace
+  prompt (the true "end-to-end" bar). Larger installer ISOs that stream
+  from the CD instead of a GRUB-loaded initramfs additionally need the
+  block-read-at-scale path -- overlaps M5.
+  Deps: M4-6b, M4-6c.
 
 ---
 

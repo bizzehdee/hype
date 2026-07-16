@@ -454,6 +454,36 @@ void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t 
  */
 void hype_svm_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip);
 
+/* Overrides the VMCB's exception-intercept bitmap (bit per vector 0-31).
+ * The builders default to 0xFFFFFFFF (intercept every exception) -- a
+ * strict fault-catch that is right for the synthetic milestone test
+ * guests (which are not supposed to fault at all) and was invaluable for
+ * the OVMF bring-up. A *real* guest OS, by contrast, handles its own
+ * exceptions as routine operation (a Linux kernel takes #PF for demand
+ * paging, #GP/#UD probing CPU features, #NM for lazy FPU, ...), so
+ * intercepting them is fatal to it. FW-1 sets this to 0 once OVMF hands
+ * off to a booted OS: the guest owns every vector, and an unrecoverable
+ * triple fault still returns to us as HYPE_SVM_EXITCODE_SHUTDOWN. */
+void hype_svm_vcpu_set_exception_intercepts(hype_vcpu_ctx_t *ctx, uint32_t mask);
+
+/* Returns the AMD SVM "decode assists" guest instruction bytes captured
+ * by hardware on the current NPF/#PF intercept (VMCB control area
+ * 0xD0/0xD1), writing the fetched byte count to *out_num. When the count
+ * is nonzero these are the faulting instruction's bytes regardless of
+ * the guest's paging -- the only way to decode an MMIO access once a
+ * guest runs its own virtual address space (a Linux kernel's RIP is a
+ * high-canonical virtual address, not a guest-physical one, so fetching
+ * via a guest-physical translation of RIP no longer works). A zero count
+ * means decode assists did not populate them (older/emulated CPUs); the
+ * caller should fall back to translating RIP for an identity-paged guest
+ * (e.g. OVMF). */
+const uint8_t *hype_svm_vcpu_guest_insn_bytes(hype_vcpu_ctx_t *ctx, uint8_t *out_num);
+
+/* The guest's current CR3 (VMCB save.cr3) -- the physical base of its
+ * top-level page table, for walking guest virtual -> guest-physical when
+ * decode assists are unavailable (e.g. QEMU+KVM nested SVM). */
+uint64_t hype_svm_vcpu_get_cr3(hype_vcpu_ctx_t *ctx);
+
 /*
  * Handles an MSR (CPUMSR-2, RDMSR/WRMSR) VM-exit: decodes direction
  * from EXITINFO1 bit 0 (0=RDMSR, 1=WRMSR, per AMD SDM) and the MSR
@@ -750,6 +780,13 @@ void hype_svm_set_ps2_trace(int enabled);
  * (default off). FW-1's guest turns it on to see what OVMF's storage
  * stack asks the emulated CD-ROM for during boot-device discovery. */
 void hype_svm_set_ahci_trace(int enabled);
+
+/* M4-6: when on, an MSR the allow-list doesn't recognize is logged and
+ * handled permissively (RDMSR -> 0, WRMSR -> ignored) rather than being
+ * fatal -- a discovery aid to reveal, in one real-guest boot, the full
+ * set of MSRs a Linux kernel touches. Off by default (the handler stays
+ * fail-closed for isolation). */
+void hype_svm_set_msr_trace(int enabled);
 
 /*
  * M5-1's exempt NPF glue for the virtio-blk device's single MMIO BAR

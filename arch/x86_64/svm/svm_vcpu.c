@@ -147,6 +147,69 @@ static void reset_gprs(void) {
     }
 }
 
+/* MSRs that VMSAVE/VMLOAD save+restore around VMRUN (AMD APM Vol 2
+ * 15.5.2): FS/GS/KernelGS base, the SYSCALL MSRs (STAR/LSTAR/CSTAR/
+ * SFMASK) and the SYSENTER MSRs. Because hype_svm_vcpu_run() vmload/
+ * vmsaves the *guest* VMCB around VMRUN, the guest's values for these
+ * live in per-guest VMCB state -- and hype itself never uses them --
+ * so the guest can read/write them natively with no #VMEXIT, fully
+ * isolated. Intercepting them (the CPUMSR-2 blanket 0xFF default) would
+ * both cost an exit per access and break a real guest unless each were
+ * emulated: a Linux kernel writes GS_BASE in early boot and immediately
+ * depends on %gs-relative percpu accesses, so dropping the write faults
+ * the kernel instantly. PAT is deliberately NOT here -- it is not in
+ * the VMSAVE set, so a native guest PAT write would corrupt the host's
+ * PAT; it stays intercepted and emulated into the VMCB's own g_pat. */
+static const uint32_t g_msrpm_passthrough[] = {
+    0xC0000100u, /* FS_BASE */
+    0xC0000101u, /* GS_BASE */
+    0xC0000102u, /* KERNEL_GS_BASE */
+    0xC0000081u, /* STAR */
+    0xC0000082u, /* LSTAR */
+    0xC0000083u, /* CSTAR */
+    0xC0000084u, /* SFMASK */
+    0x00000174u, /* SYSENTER_CS */
+    0x00000175u, /* SYSENTER_ESP */
+    0x00000176u, /* SYSENTER_EIP */
+};
+
+/* Clears the read+write intercept bits for one MSR in the 8KB MSRPM.
+ * MSRPM layout (AMD APM 15.11): three covered ranges, 2 bits/MSR
+ * (bit0=read, bit1=write). Range 0 (0..0x1FFF) at byte 0, range 1
+ * (0xC0000000..) at byte 0x800, range 2 (0xC0010000..) at byte 0x1000.
+ * An MSR outside all three ranges is left as-is (still intercepted). */
+static void msrpm_clear_intercept(uint8_t *msrpm, uint32_t msr) {
+    uint32_t byte_off;
+    uint32_t bit_in_byte;
+    if (msr < 0x2000u) {
+        byte_off = msr / 4u;
+        bit_in_byte = (msr % 4u) * 2u;
+    } else if (msr >= 0xC0000000u && msr < 0xC0002000u) {
+        uint32_t idx = msr - 0xC0000000u;
+        byte_off = 0x800u + idx / 4u;
+        bit_in_byte = (idx % 4u) * 2u;
+    } else if (msr >= 0xC0010000u && msr < 0xC0012000u) {
+        uint32_t idx = msr - 0xC0010000u;
+        byte_off = 0x1000u + idx / 4u;
+        bit_in_byte = (idx % 4u) * 2u;
+    } else {
+        return;
+    }
+    msrpm[byte_off] &= (uint8_t) ~(0x3u << bit_in_byte);
+}
+
+/* Fills the MSRPM to intercept everything (guest-isolation default),
+ * then opens the VMSAVE/VMLOAD-managed passthrough set above. */
+static void configure_guest_msrpm(uint8_t *msrpm) {
+    unsigned i;
+    for (i = 0; i < 8192u; i++) {
+        msrpm[i] = 0xFFu;
+    }
+    for (i = 0; i < sizeof(g_msrpm_passthrough) / sizeof(g_msrpm_passthrough[0]); i++) {
+        msrpm_clear_intercept(msrpm, g_msrpm_passthrough[i]);
+    }
+}
+
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root) {
     unsigned i;
 
@@ -161,10 +224,10 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, ui
         g_iopm[i] = 0xFFu;
     }
 
-    /* CPUMSR-2: same reasoning, now for HYPE_SVM_INTERCEPT_MSR_PROT. */
-    for (i = 0; i < sizeof(g_msrpm); i++) {
-        g_msrpm[i] = 0xFFu;
-    }
+    /* CPUMSR-2: intercept every MSR (isolation default), then open the
+     * VMSAVE/VMLOAD-managed passthrough set so a real guest (FW-1's
+     * Linux) can use FS/GS base + syscall/sysenter MSRs natively. */
+    configure_guest_msrpm(g_msrpm);
 
     hype_vmcb_build_realmode_guest(&g_vmcb, guest_rip, guest_rsp, (uint64_t)(uintptr_t)g_iopm,
                                     (uint64_t)(uintptr_t)g_msrpm);
@@ -203,10 +266,10 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
     }
 
     /* CPUMSR-2: same reasoning as the IOPM fill just above, now for
-     * HYPE_SVM_INTERCEPT_MSR_PROT. */
-    for (i = 0; i < sizeof(g_msrpm); i++) {
-        g_msrpm[i] = 0xFFu;
-    }
+     * HYPE_SVM_INTERCEPT_MSR_PROT -- intercept all, then open the
+     * VMSAVE/VMLOAD-managed passthrough set (harmless for the long-mode
+     * test guests, which never touch those MSRs). */
+    configure_guest_msrpm(g_msrpm);
 
     hype_vmcb_build_long_mode_guest(&g_vmcb, entry_rip, guest_cr3, rsp, (uint64_t)(uintptr_t)g_iopm,
                                      (uint64_t)(uintptr_t)g_msrpm);
@@ -484,6 +547,18 @@ void hype_svm_set_ahci_trace(int enabled) {
     g_ahci_trace = enabled ? 1 : 0;
 }
 
+/* M4-6 diagnostic: when on, an MSR the allow-list doesn't recognize is
+ * logged and handled permissively (RDMSR -> 0, WRMSR -> ignored) instead
+ * of being fatal, so a single real-guest (Linux) boot reveals the full
+ * set of MSRs the guest touches -- far cheaper than one fatal-and-fix
+ * cycle per MSR. Off by default; the committed handler stays fail-closed
+ * (returns -1 -> the caller's fatal) for guest isolation. */
+static int g_msr_trace = 0;
+
+void hype_svm_set_msr_trace(int enabled) {
+    g_msr_trace = enabled ? 1 : 0;
+}
+
 int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
@@ -632,11 +707,48 @@ void hype_svm_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip) {
     real->vmcb->save.rip = rip;
 }
 
+void hype_svm_vcpu_set_exception_intercepts(hype_vcpu_ctx_t *ctx, uint32_t mask) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->vmcb->control.intercept_exceptions = mask;
+}
+
+const uint8_t *hype_svm_vcpu_guest_insn_bytes(hype_vcpu_ctx_t *ctx, uint8_t *out_num) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (out_num != 0) {
+        *out_num = real->vmcb->control.num_bytes_fetched;
+    }
+    return real->vmcb->control.guest_instruction_bytes;
+}
+
+uint64_t hype_svm_vcpu_get_cr3(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    return real->vmcb->save.cr3;
+}
+
 int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int is_write = (real->vmcb->control.exitinfo1 & 0x1ULL) != 0;
     uint32_t msr_number = (uint32_t)real->gprs[1]; /* RCX */
-    hype_msr_action_t action = hype_msr_decide(msr_number, is_write);
+    hype_msr_action_t action;
+
+    /* IA32_PAT (0x277): emulated into the VMCB's own g_pat, which VMRUN
+     * loads for the guest under nested paging -- per-guest and isolated.
+     * Must stay intercepted (not passed through like the VMSAVE-managed
+     * MSRs): PAT is not context-switched by VMSAVE/VMLOAD, so a native
+     * guest write would corrupt the host's page-attribute table. */
+    if (msr_number == 0x277u) {
+        if (is_write) {
+            real->vmcb->save.g_pat =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+        } else {
+            real->vmcb->save.rax = (uint64_t)(uint32_t)real->vmcb->save.g_pat;
+            real->gprs[2] = (uint64_t)(uint32_t)(real->vmcb->save.g_pat >> 32);
+        }
+        real->vmcb->save.rip += 2;
+        return 0;
+    }
+
+    action = hype_msr_decide(msr_number, is_write);
 
     switch (action) {
     case HYPE_MSR_ACTION_READ_APIC_BASE: {
@@ -663,6 +775,21 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     }
     case HYPE_MSR_ACTION_REJECT:
     default:
+        if (g_msr_trace) {
+            uint64_t wval =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+            hype_debug_print("msr-trace: unhandled %s msr=0x%x val=0x%llx rip=0x%llx\n",
+                              is_write ? "WRMSR" : "RDMSR", (unsigned int)msr_number,
+                              (unsigned long long)(is_write ? wval : 0ULL),
+                              (unsigned long long)real->vmcb->save.rip);
+            if (!is_write) {
+                real->vmcb->save.rax = 0;
+                real->gprs[2] = 0;
+            }
+            /* permissive: WRMSR ignored, RDMSR returns 0 -- discovery only */
+            real->vmcb->save.rip += 2;
+            return 0;
+        }
         return -1;
     }
 
@@ -877,7 +1004,16 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
     }
     offset = (uint32_t)(npf.guest_phys_addr - ahci_base_phys);
 
-    guest_bytes = (const uint8_t *)(uintptr_t)(real->vmcb->save.rip + dma_offset);
+    /* Prefer AMD's decode-assist instruction capture (valid regardless
+     * of the guest's paging); fall back to translating RIP as a guest-
+     * physical address for an identity-paged guest on a CPU without
+     * decode assists (dma_offset makes that translation RAM-remap-aware
+     * for FW-1, and is 0 for the identity-mapped test guests). */
+    if (real->vmcb->control.num_bytes_fetched != 0) {
+        guest_bytes = real->vmcb->control.guest_instruction_bytes;
+    } else {
+        guest_bytes = (const uint8_t *)(uintptr_t)(real->vmcb->save.rip + dma_offset);
+    }
     if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
         return -1;
     }

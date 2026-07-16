@@ -4211,6 +4211,74 @@ static const uint8_t *fw_1_guest_phys_to_host(uint64_t gpa) {
     return 0;
 }
 
+/* Reads one 64-bit guest page-table entry at guest-physical `gpa`, or
+ * returns 0 (a not-present entry) if it isn't backed. */
+static uint64_t fw_1_read_guest_pte(uint64_t gpa) {
+    const uint8_t *p = fw_1_guest_phys_to_host(gpa & ~0xFFFULL);
+    if (p == 0) {
+        return 0;
+    }
+    p += (uint32_t)(gpa & 0xFFFULL);
+    return (uint64_t)hype_read_le32(p) | ((uint64_t)hype_read_le32(p + 4) << 32);
+}
+
+/* Walks the guest's own 4-level long-mode page tables (rooted at CR3) to
+ * translate a guest-VIRTUAL address to guest-physical. Needed to fetch
+ * the faulting instruction's bytes for MMIO decode once the guest runs
+ * in its own virtual address space (a Linux kernel's RIP is a high-
+ * canonical virtual address, unlike OVMF's identity-mapped RIP): AMD's
+ * decode-assist capture is the preferred source, but QEMU+KVM nested SVM
+ * does not populate it, so this is the fallback there. Honors 1 GiB and
+ * 2 MiB large pages (PS bit); returns -1 on any not-present level.
+ * Assumes 4-level paging (this project never advertises LA57 to guests).
+ * The PHYSMASK matches x86-64's 52-bit max physical address. */
+static int fw_1_guest_virt_to_phys(uint64_t cr3, uint64_t gva, uint64_t *out_gpa) {
+    const uint64_t PHYS = 0x000FFFFFFFFFF000ULL; /* bits 51:12 */
+    uint64_t e;
+
+    e = fw_1_read_guest_pte((cr3 & PHYS) + (((gva >> 39) & 0x1FFULL) * 8ULL)); /* PML4E */
+    if ((e & 1ULL) == 0) {
+        return -1;
+    }
+    e = fw_1_read_guest_pte((e & PHYS) + (((gva >> 30) & 0x1FFULL) * 8ULL)); /* PDPTE */
+    if ((e & 1ULL) == 0) {
+        return -1;
+    }
+    if (e & (1ULL << 7)) { /* 1 GiB page */
+        *out_gpa = (e & 0x000FFFFFC0000000ULL) | (gva & 0x3FFFFFFFULL);
+        return 0;
+    }
+    e = fw_1_read_guest_pte((e & PHYS) + (((gva >> 21) & 0x1FFULL) * 8ULL)); /* PDE */
+    if ((e & 1ULL) == 0) {
+        return -1;
+    }
+    if (e & (1ULL << 7)) { /* 2 MiB page */
+        *out_gpa = (e & 0x000FFFFFFFE00000ULL) | (gva & 0x1FFFFFULL);
+        return 0;
+    }
+    e = fw_1_read_guest_pte((e & PHYS) + (((gva >> 12) & 0x1FFULL) * 8ULL)); /* PTE */
+    if ((e & 1ULL) == 0) {
+        return -1;
+    }
+    *out_gpa = (e & PHYS) | (gva & 0xFFFULL);
+    return 0;
+}
+
+/* Best-effort host pointer to the faulting instruction bytes for a guest
+ * whose RIP may be virtual: try a guest page-table walk (CR3), then fall
+ * back to treating RIP as guest-physical (correct for an identity-paged
+ * guest such as OVMF). Used only when decode assists gave nothing. */
+static const uint8_t *fw_1_insn_bytes_via_ptwalk(hype_vcpu_ctx_t *ctx, uint64_t guest_rip) {
+    uint64_t gpa = 0;
+    if (fw_1_guest_virt_to_phys(hype_svm_vcpu_get_cr3(ctx), guest_rip, &gpa) == 0) {
+        const uint8_t *p = fw_1_guest_phys_to_host(gpa);
+        if (p != 0) {
+            return p;
+        }
+    }
+    return fw_1_guest_phys_to_host(guest_rip);
+}
+
 /* FW-1e: drain the guest UART's transmit ring, strip terminal escape
  * sequences (hype's GOP console can't interpret them), and emit the
  * guest's console output to hype's own console (serial + GOP) one line
@@ -4302,6 +4370,17 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * the CD-ROM discovery sequence -- hype_svm_set_ahci_trace(1) -- but
      * left off here: a real boot issues thousands of commands and each
      * trace line is GOP-rendered. */
+    /* M4-6: for the real-OS guest, an MSR the allow-list doesn't
+     * recognize is logged and safely stubbed (RDMSR -> 0, WRMSR ->
+     * ignored) instead of being fatal. This stays isolation-safe -- it
+     * never reads or writes a real host MSR -- while letting a real
+     * kernel, which touches many benign MSRs (microcode rev, TSC_AUX,
+     * ...), boot past them; the log shows exactly which it wanted. The
+     * synthetic milestone test guests keep the fail-closed default (this
+     * flag is per-run and only FW-1 sets it). VMSAVE/VMLOAD-managed and
+     * VMCB-backed MSRs (FS/GS/syscall/sysenter, PAT, EFER) are handled
+     * for real, not stubbed -- see configure_guest_msrpm(). */
+    hype_svm_set_msr_trace(1);
 
     /* Real OVMF's own platform init needs real ACPI content via
      * fw_cfg, the same "etc/acpi/rsdp"/"etc/acpi/tables"/
@@ -4441,6 +4520,13 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         hype_fatal("fw-1: vcpu_create failed");
     }
     hype_svm_vcpu_set_rip(ctx, reset_rip);
+    /* M4-6: let the guest own every exception vector. OVMF and any OS it
+     * boots (real Linux takes routine #PF/#GP/#UD/#NM) handle their own
+     * faults via their own IDTs; intercepting exceptions -- the strict
+     * default that caught the FW-1 bring-up faults -- is fatal to a real
+     * guest. An unrecoverable triple fault still returns to us as
+     * HYPE_SVM_EXITCODE_SHUTDOWN. */
+    hype_svm_vcpu_set_exception_intercepts(ctx, 0);
 
     {
     unsigned long long productive_exits = 0;
@@ -4562,19 +4648,28 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
         if (info.reason == HYPE_SVM_EXITCODE_NPF) {
             hype_svm_npf_t npf;
+            /* Faulting-instruction bytes for MMIO decode. Prefer AMD's
+             * decode-assist capture (valid regardless of guest paging):
+             * once a guest runs its own virtual address space (a Linux
+             * kernel's RIP is a high-canonical virtual address), RIP is
+             * no longer a guest-physical address, so translating it can't
+             * reach the instruction. Fall back to a guest-physical
+             * translation of RIP for an identity-paged guest (OVMF) on a
+             * CPU without decode assists. */
+            uint8_t insn_n = 0;
+            const uint8_t *insn = hype_svm_vcpu_guest_insn_bytes(ctx, &insn_n);
+            if (insn_n == 0) {
+                insn = fw_1_insn_bytes_via_ptwalk(ctx, info.guest_rip);
+            }
             /* FW-1b: the guest Local APIC at 0xFEE00000 is the expected
-             * NPF here (the region is not-present by design). Pass the
-             * host-translated faulting instruction bytes, since FW-1's
-             * NPT is not an identity map. */
-            if (hype_svm_vcpu_handle_lapic_npf(ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE,
-                                                fw_1_guest_phys_to_host(info.guest_rip)) == 0) {
+             * NPF here (the region is not-present by design). */
+            if (hype_svm_vcpu_handle_lapic_npf(ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE, insn) == 0) {
                 continue;
             }
             /* FW-1c: PCI config space via MMCONFIG ECAM at 0xE0000000
              * (OVMF's Q35 PcdPciExpressBaseAddress). Reuses PCI-1's ECAM
              * config model over FW-1's own host bridge + LPC devices. */
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_fw_1_pci, HYPE_FW_1_ECAM_GPA,
-                                                   fw_1_guest_phys_to_host(info.guest_rip)) == 0) {
+            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_fw_1_pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
                 /* FW-1h: an ECAM config write may have just programmed
                  * BAR5 and set Memory Space Enable on the AHCI function.
                  * That is the moment OVMF's PciBusDxe finalizes the
@@ -4622,9 +4717,11 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 }
             }
             hype_svm_vcpu_get_last_npf(ctx, &npf);
-            hype_fatal("fw-1: unhandled NPF at guest-physical 0x%llx (%s, guest_rip=0x%llx)",
+            hype_fatal("fw-1: unhandled NPF at guest-physical 0x%llx (%s, guest_rip=0x%llx, "
+                       "decode_assist_bytes=%u insn[0..2]=%x %x %x)",
                        (unsigned long long)npf.guest_phys_addr, npf.is_write ? "write" : "read",
-                       (unsigned long long)info.guest_rip);
+                       (unsigned long long)info.guest_rip, (unsigned int)insn_n,
+                       insn_n > 0 ? insn[0] : 0, insn_n > 1 ? insn[1] : 0, insn_n > 2 ? insn[2] : 0);
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
