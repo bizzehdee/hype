@@ -59,6 +59,26 @@ void hype_paging_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
                                  hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                                  unsigned int gb_to_map);
 
+/*
+ * Adds a 2MB-page identity mapping for the 1GB-aligned region(s) that
+ * cover [phys_base, phys_base+size) into an already-built PML4[0]->pdpt
+ * hierarchy (i.e. call after hype_paging_build_identity, sharing its
+ * pdpt). For a physical region ABOVE the low identity map -- notably a
+ * GOP framebuffer BAR that firmware placed in high MMIO space (e.g.
+ * 256GB on an Intel i5-13420H), which would otherwise be unmapped the
+ * instant CR3 is loaded, taking the debug console down with it. Wires
+ * pdpt[gb] -> pd_tables[n] for each 1GB slot touched (n = 0,1,...) and
+ * fills each pd with that GB's 512 2MB identity pages. pd_tables must
+ * provide one table per GB the region spans; a realistic framebuffer
+ * touches 1 (or 2 if it straddles a 1GB boundary). Requires
+ * phys_base+size <= 512GB (a single PML4[0] entry). Returns the number
+ * of GB slots mapped, 0 if the region is out of PML4[0] range or empty.
+ * Pure table-filling, no CPU state touched.
+ */
+unsigned int hype_paging_map_region_2mb(hype_pte_t *pdpt,
+                                         hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                                         uint64_t phys_base, uint64_t size);
+
 /* Loads `pml4`'s physical address into CR3. Never unit tested -- see
  * paging_load.c. */
 void hype_paging_load(const hype_pte_t *pml4);

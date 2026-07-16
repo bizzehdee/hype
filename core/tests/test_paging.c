@@ -83,12 +83,65 @@ static void test_build_identity(void) {
               g_pd[2][3] & 0x000FFFFFFFFFF000ULL);
 }
 
+static hype_pte_t g_fb_pd[2][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+
+static void test_map_region_high_framebuffer(void) {
+    /* An Intel i5-13420H places the GOP framebuffer BAR at 256GB. */
+    uint64_t fb_base = 0x4000000000ULL; /* 256 GB, 1GB-aligned */
+    uint64_t fb_size = 0x7e9000ULL;     /* ~8.3 MB (from the real screen dump) */
+    unsigned int mapped;
+    uint64_t gb_index = fb_base / HYPE_PAGING_1GB; /* 256 */
+
+    hype_paging_build_identity(g_pml4, g_pdpt, g_pd, 4);
+    /* The BAR's PDPT slot starts not-present after the low identity map. */
+    CHECK_HEX("pdpt[256] absent before mapping", 0, g_pdpt[gb_index]);
+
+    mapped = hype_paging_map_region_2mb(g_pdpt, g_fb_pd, fb_base, fb_size);
+    CHECK_HEX("one GB slot mapped (fb fits in one GB)", 1, mapped);
+    CHECK_HEX("pdpt[256] now present+write", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE,
+              g_pdpt[gb_index] & 0xFFFULL);
+    CHECK_HEX("pdpt[256] points at fb pd", (uint64_t)g_fb_pd[0],
+              g_pdpt[gb_index] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("fb pd[0] identity-maps 256GB as a 2MB page",
+              HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_PS, g_fb_pd[0][0] & 0xFFFULL);
+    CHECK_HEX("fb pd[0] physical address is 256GB", fb_base, g_fb_pd[0][0] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("fb pd[1] physical address is 256GB+2MB", fb_base + HYPE_PAGING_2MB,
+              g_fb_pd[0][1] & 0x000FFFFFFFFFF000ULL);
+    /* The low identity map is untouched. */
+    CHECK_HEX("low map pdpt[0] still present", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE,
+              g_pdpt[0] & 0xFFFULL);
+}
+
+static void test_map_region_straddling_gb_boundary(void) {
+    /* A region starting 1MB below a 1GB boundary spans two GB slots. */
+    uint64_t base = 8ULL * HYPE_PAGING_1GB - 0x100000ULL;
+    unsigned int mapped;
+    hype_paging_build_identity(g_pml4, g_pdpt, g_pd, 4);
+    mapped = hype_paging_map_region_2mb(g_pdpt, g_fb_pd, base, 0x400000ULL /* 4MB */);
+    CHECK_HEX("straddling region maps two GB slots", 2, mapped);
+    CHECK_HEX("pdpt[7] present", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE, g_pdpt[7] & 0xFFFULL);
+    CHECK_HEX("pdpt[8] present", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE, g_pdpt[8] & 0xFFFULL);
+}
+
+static void test_map_region_out_of_range_and_empty(void) {
+    hype_paging_build_identity(g_pml4, g_pdpt, g_pd, 4);
+    /* Beyond PML4[0] (>= 512GB) -> refused. */
+    CHECK_HEX("region at/above 512GB refused", 0,
+              hype_paging_map_region_2mb(g_pdpt, g_fb_pd, 512ULL * HYPE_PAGING_1GB, 0x1000ULL));
+    /* Zero size -> nothing mapped. */
+    CHECK_HEX("zero-size region maps nothing", 0,
+              hype_paging_map_region_2mb(g_pdpt, g_fb_pd, 0x4000000000ULL, 0));
+}
+
 int main(void) {
     test_encode_entry();
     test_encode_entry_masks_low_bits_of_address();
     test_encode_entry_nx_bit();
     test_encode_entry_flags_masked_to_allowed_bits();
     test_build_identity();
+    test_map_region_high_framebuffer();
+    test_map_region_straddling_gb_boundary();
+    test_map_region_out_of_range_and_empty();
 
     if (failures == 0) {
         printf("all tests passed\n");

@@ -255,11 +255,23 @@ multi-VM concurrency milestone, even though early single-guest milestones
   CF/fail=0 -> "vmm: VMX enabled"**. So **M2-2 VMXON is validated on real
   Intel silicon** (parity with the AMD SVM-enable). Guests then skip
   (vcpu_run still NULL) and it proceeds into the post-ExitBootServices
-  runtime; last line captured was "about to load own paging (identity-
-  mapping 64 GB)..." (pending confirmation whether it completes or hangs
-  there -- that runtime path is vendor-neutral hype setup, not VMX).
-  NEXT for Intel parity: the VMX vcpu_create/vcpu_run VM-entry/exit
-  trampoline so guests actually launch.*
+  runtime, where it HUNG at "about to load own paging (identity-mapping
+  64 GB)...". Root cause (2nd finding, commit below): this machine's GOP
+  framebuffer BAR is at host-physical 0x4000000000 (256GB) -- the iGPU's
+  high-MMIO aperture, far above both the 8GB of RAM and hype's 64GB
+  identity map. Loading hype's own CR3 (mapping only the low 64GB)
+  unmapped the framebuffer, so the next hype_debug_print faulted (no IDT
+  loaded yet) -> hard hang. The old code even commented "the framebuffer
+  is just memory, identity-mapped by our own paging" -- true only when
+  the BAR is under HYPE_PAGING_MAX_GB; a latent bug AMD's test machines
+  never hit (their framebuffers sat under 64GB). Fixed by
+  hype_paging_map_region_2mb(): after the low identity map, explicitly
+  map the GOP FrameBufferBase/Size range (from gop->Mode) into hype's
+  tables before the CR3 load. Awaiting the next Intel run to confirm the
+  runtime now completes (own paging loaded -> IDT -> "hypervisor now
+  running" -> timer ticks) -- which puts the whole currently-runnable
+  path at AMD parity on Intel. NEXT for full parity: the VMX vcpu_create/
+  vcpu_run VM-entry/exit trampoline so guests actually launch.*
 
 ---
 

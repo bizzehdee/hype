@@ -46,6 +46,10 @@ static hype_idt_entry_t g_idt[HYPE_IDT_ENTRY_COUNT];
 static hype_pte_t g_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_pd[HYPE_PAGING_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+/* Extra PD tables for mapping a GOP framebuffer BAR that firmware placed
+ * in high MMIO above the low identity map (e.g. 256GB on Intel client
+ * parts). Two tables cover a framebuffer that straddles a 1GB boundary. */
+static hype_pte_t g_fb_pd[2][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_gop_console_t g_gop_console;
 
 /*
@@ -5649,6 +5653,30 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     hype_debug_print("about to load own paging (identity-mapping %u GB)...\n", HYPE_PAGING_MAX_GB);
     hype_paging_build_identity(g_pml4, g_pdpt, g_pd, HYPE_PAGING_MAX_GB);
+    /* Firmware can place the GOP framebuffer BAR in high MMIO space far
+     * above the low identity map (e.g. 0x4000000000 = 256GB on an Intel
+     * i5-13420H). The old code assumed the framebuffer was "just memory,
+     * identity-mapped by our own paging" -- true only when it sits under
+     * HYPE_PAGING_MAX_GB. When it doesn't, the CR3 load below unmaps the
+     * console and the very next print faults (with no IDT yet loaded) ->
+     * hard hang. Map the framebuffer's own physical range before the
+     * switch so the console survives it. */
+    if (have_gop && gop->Mode != 0) {
+        uint64_t fb_base = (uint64_t)gop->Mode->FrameBufferBase;
+        uint64_t fb_size = (uint64_t)gop->Mode->FrameBufferSize;
+        if (fb_size != 0 &&
+            fb_base + fb_size > (uint64_t)HYPE_PAGING_MAX_GB * HYPE_PAGING_1GB) {
+            unsigned int mapped = hype_paging_map_region_2mb(g_pdpt, g_fb_pd, fb_base, fb_size);
+            hype_debug_print("paging: framebuffer BAR 0x%llx+0x%llx is above the %uGB map -- "
+                              "mapped %u extra GB slot(s)\n",
+                              (unsigned long long)fb_base, (unsigned long long)fb_size,
+                              HYPE_PAGING_MAX_GB, mapped);
+            if (mapped == 0) {
+                hype_debug_print("paging: WARNING framebuffer BAR out of PML4[0] range -- "
+                                  "console will go dark after CR3 load\n");
+            }
+        }
+    }
     hype_paging_load(g_pml4);
     hype_debug_print("own paging loaded\n");
 

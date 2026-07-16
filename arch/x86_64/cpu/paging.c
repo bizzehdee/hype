@@ -24,3 +24,34 @@ void hype_paging_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
         }
     }
 }
+
+unsigned int hype_paging_map_region_2mb(hype_pte_t *pdpt,
+                                         hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                                         uint64_t phys_base, uint64_t size) {
+    uint64_t first_gb, last_gb, gb;
+    unsigned int n;
+
+    if (size == 0) {
+        return 0;
+    }
+    first_gb = phys_base / HYPE_PAGING_1GB;
+    last_gb = (phys_base + size - 1) / HYPE_PAGING_1GB;
+    /* PML4[0] (built by hype_paging_build_identity) spans [0, 512GB); a
+     * region needing a higher PML4 entry is out of scope for this
+     * single-table helper. */
+    if (last_gb >= HYPE_PAGING_ENTRIES_PER_TABLE) {
+        return 0;
+    }
+
+    n = 0;
+    for (gb = first_gb; gb <= last_gb; gb++, n++) {
+        hype_pte_t *pd = pd_tables[n];
+        unsigned int j;
+        pdpt[gb] = hype_paging_encode_entry((uint64_t)pd, HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE);
+        for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
+            uint64_t phys = gb * HYPE_PAGING_1GB + (uint64_t)j * HYPE_PAGING_2MB;
+            pd[j] = hype_paging_encode_entry(phys, HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_PS);
+        }
+    }
+    return n;
+}
