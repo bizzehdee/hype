@@ -1233,45 +1233,51 @@ tasks — see updated deps below.*
   the kernel's queueing/retry. Bounds-checking already applied
   (VALID-3). Deps: M4-6d1.
 
-  *STEP-1 DIAGNOSIS (2026-07-16, traced boot, AHCI trace temporarily on):
-  the FW-1 kernel's async libata/scsi scan DOES read the ISO -- but it
-  issues **TEST UNIT READY (CDB 0x00) + REQUEST SENSE (CDB 0x03) after
-  every single command**, a perfect 1:1:1 cycle. Trace histogram over one
-  boot: 150x READ(10) (0x28), 151x TUR (0x00), 151x REQUEST SENSE (0x03),
-  2x INQUIRY (0x12), 1x READ CAPACITY (0x25) -- every READ(10) is
-  bracketed by TUR+SENSE, LBAs repeat (16,17,18,19 re-read), progress is
-  crawling. It then runs a libata EH reset sequence (stop engine: clear
-  PxCMD.ST; clear PxSERR; COMRESET: PxSCTL 0x300->0x301->0x300) and goes
-  idle -- plateau at `Key type fscrypt-provisioning registered`
-  (async_synchronize_full never returns, so /init never runs). NO kernel
-  ata/scsi EH text is emitted (no "hard resetting link"), so it is not a
-  loud timeout path. Our side reports every command status=GOOD, ATAPI
-  SCSI status GOOD, AHCI PxTFD=0x50 (DRDY|DSC, ERR clear) -- so the
-  trigger is a COMPLETION-SEMANTICS mismatch, not a SCSI-status error.
-  Concrete gaps found by inspection:
-    1. The D2H Register FIS we build (svm_vcpu.c) is only partially
-       populated: the 20 bytes are zeroed and only byte 0 (FIS type
-       0x34), byte 2 (status), byte 3 (error) are set. The ATAPI
-       completion fields are left zero -- the Interrupt Reason (sector-
-       count byte 12; a completed ATAPI data-in should report I/O|C/D =
-       0x03) and the byte-count (LBA mid/high, bytes 5-6). PRDBC in the
-       command header IS set correctly.
-    2. INQUIRY reports SCSI VERSION 0x00 (atapi.c handle_inquiry
-       synth_data[2]=0) -- "no standard claimed"; real ATAPI CD-ROMs
-       report ~0x05 (SPC-3), which can change how conservatively the
-       kernel drives the device.
-    3. PxSCTL COMRESET (ahci.c:106) is a plain store -- it does not
-       re-sequence PxTFD/PxSSTS/PxSIG (they happen to read ready, so
-       likely secondary).
-  STEP-2 PLAN: pin the exact libata trigger for the per-command TUR+SENSE
-  by comparing our AHCI-ATAPI completion byte-for-byte against QEMU's
-  reference (hw/ide/ahci.c + hw/ide/atapi.c -- the completion Linux reads
-  cleanly), since our-code inspection narrowed it to the above but did not
-  prove which field libata keys on. Fix the D2H FIS population (IREASON +
-  byte count) and INQUIRY version first (both are correctness fixes
-  regardless), then re-trace: success = TUR/SENSE no longer bracket every
-  read and the scan completes so async_synchronize_full returns. Confounded
-  by nested-SVM flakiness -> confirm on real HW.*
+  *STEP-1 DIAGNOSIS (2026-07-16, traced boot). CORRECTED after checking
+  the trace timeline against guest boundaries -- the first pass
+  (commit 655b623) misattributed OVMF/GRUB's CD reads to the kernel:*
+
+  The traced boot has three phases by log line: FW-1/OVMF launches at
+  L587, "Linux version" at L14352, the kernel's `scsi host0: ahci` at
+  L14673, plateau `fscrypt-provisioning registered` at L14711.
+    - **The TUR+SENSE-per-read pattern (150x READ(10), 151x TUR, 151x
+      REQUEST SENSE, 2x INQUIRY, 1x READ CAPACITY) is all in L913-14337 --
+      i.e. OVMF + GRUB reading the CD to load vmlinuz/initramfs. It is
+      SLOW (a TUR+SENSE brackets each read) but FUNCTIONAL: the kernel
+      loaded and ran. NOT the Linux kernel, NOT the boot blocker.** (So
+      the "completion-semantics mismatch / D2H FIS / INQUIRY version"
+      theory from the first pass is not on the critical path -- those may
+      still be worth tidying for EDK2's benefit but do not gate M4-6.)
+    - **The real blocker is the KERNEL's own libata probe (L14673+).** It
+      does exactly one thing then stalls: stop engine (clear PxCMD.ST),
+      clear PxSERR/PxIS/global-IS, then a hardreset COMRESET
+      (PxSCTL 0x300->0x301->0x300) -- and then issues NO further AHCI
+      access at all: no PxSSTS (0x128) debounce poll, no PxTFD (0x120)
+      BSY-wait, no PxSIG read, no IDENTIFY, no READ. It idle-HLTs ->
+      plateau -> the FW-1 loop's 10s idle detector fires. So libata is
+      stuck in the post-COMRESET wait (sata_link_resume's msleep, before
+      the PxSSTS debounce).
+    - Timer state at exit: PIT IRQ0 IRQs=50 for the whole run, **master
+      ISR=0x1 (IRQ0 stuck IN-SERVICE, never EOI'd)**. If IRQ0 delivery is
+      wedged, jiffies stop -> the kernel's post-COMRESET `msleep` never
+      returns -> exactly this stall. That points at the timer-IRQ
+      delivery / PIC-acknowledge path (INT-1/INT-2), NOT the ATAPI model.
+      Caveat: a prior clean run (M4-6d2b val2) plateaued at the same spot
+      with master ISR=0x0, so "stuck IRQ0" may be one instance of a more
+      general post-COMRESET stall (or nested-SVM flakiness) -- not yet
+      proven the sole cause.
+  STEP-2 PLAN (revised): the fix is NOT the ATAPI completion. Instrument
+  the kernel-phase timer delivery + libata reset: (a) boot with kernel
+  `libata`/`ata` dynamic-debug (or ignore_loglevel) so libata prints what
+  it does after the COMRESET ("hard resetting link" / "SATA link up" /
+  "link resume failed") -- authoritative vs. guessing; (b) check whether
+  IRQ0 stops being delivered after the COMRESET (add a stuck-in-service
+  detector / count ticks during the post-reset window) and whether the
+  PIC-acknowledge path strands ISR bit 0 when the guest can't accept the
+  IRQ (IF=0 during libata's reset critical section). Fix whichever of
+  {timer-IRQ wedge, post-reset link-state re-presentation} is the cause,
+  then confirm the probe proceeds to PxSSTS/IDENTIFY/READ. Nested-SVM
+  flakiness confound -> real-HW confirmation applies.*
 
   *Building blocks landed (2026-07-16, commit aa40591), inert until the
   loop wiring is made safe:*
