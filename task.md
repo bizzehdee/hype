@@ -243,6 +243,24 @@ multi-VM concurrency milestone, even though early single-guest milestones
   exist. Downstream milestones have proceeded past this point by the
   same explicit user decision (2026-07-13) as M0-5.*
 
+  *INTEL PROGRESS 2026-07-16 (commit a82c8b1): first real Intel-hardware
+  run, on an Intel CPU (vmx=1 svm=0), 2611 MHz, 1024 MiB guest. The
+  existing build LOCKED at "vmm: about to enable VMX" -- VMXON #GP into
+  UEFI's exception handler. Root cause (confirmed on the metal): CR0.NE
+  (bit 5) was clear but IA32_VMX_CR0_FIXED0=0x80000021 requires it, so
+  VMXON faulted. Fixed by applying the SDM CR0/CR4 fixed bits before
+  VMXON (hype_vmx_cr_with_fixed_bits, (cr|fixed0)&fixed1). Screen
+  confirmed: CR0 0x80010013->0x80010033 (NE set), CR4 0x660->0x2660
+  (VMXE), VMX_BASIC=0x3da0500..013 rev_id=0x13, **VMXON returned
+  CF/fail=0 -> "vmm: VMX enabled"**. So **M2-2 VMXON is validated on real
+  Intel silicon** (parity with the AMD SVM-enable). Guests then skip
+  (vcpu_run still NULL) and it proceeds into the post-ExitBootServices
+  runtime; last line captured was "about to load own paging (identity-
+  mapping 64 GB)..." (pending confirmation whether it completes or hangs
+  there -- that runtime path is vendor-neutral hype setup, not VMX).
+  NEXT for Intel parity: the VMX vcpu_create/vcpu_run VM-entry/exit
+  trampoline so guests actually launch.*
+
 ---
 
 ## M3 — EPT + first real guest boot (plan.md §9 M3)
