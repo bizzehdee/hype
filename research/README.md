@@ -21,22 +21,30 @@ In-tree primary sources (the vendored `edk2/` tree, QEMU headers) are
 authoritative for their own formats and are cited by repo path instead;
 this archive is only for external documents not already in the repo.
 
+## Copyright
+
+The manuals archived here are **copyright of their respective owners**
+(AMD, Intel) and are redistributed by them for developer reference. They
+are kept in this directory only as an offline engineering reference for
+building this project; they are not part of the project's own GPLv3
+source and their copyright/licensing is unchanged by inclusion here. Do
+not treat them as project-licensed material.
+
 ## Archived documents
 
 | File | Document | Revision | Source |
 |------|----------|----------|--------|
-| _(none archived yet)_ | | | |
+| `24593_3.44_APM_Vol2.pdf` | AMD64 Architecture Programmer's Manual, Vol. 2 — System Programming (SVM/VMCB) | pub. 24593, Rev. 3.44 | https://docs.amd.com/v/u/en-US/24593_3.44_APM_Vol2 |
+| `325462-092-sdm-vol-1-2abcd-3abcd-4.pdf` | Intel® 64 and IA-32 Architectures Software Developer's Manuals — combined volume set (Vol. 1, 2ABCD, 3ABCD, 4) | order 325462, rev. 092 | https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html |
 
-## Known external references used (PDF to be archived on next fetch)
+### Key extracts captured against tasks
 
-These were consulted in earlier work and are cited in `task.md`; the PDFs
-were not saved at the time. Archive them here the next time they are
-fetched, then move them into the table above.
-
-- **AMD64 Architecture Programmer's Manual, Vol. 2 (System Programming),
-  pub. 24593, Rev. 3.44.** Used for the SVM/VMCB work — §15 (SVM: VMRUN,
-  #VMEXIT, EVENTINJ/VINTR §15.20/§15.21, intercepted-#PF semantics
+- **AMD APM Vol 2 (`24593_3.44_APM_Vol2.pdf`).** SVM/VMCB work — §15 (SVM:
+  VMRUN, #VMEXIT, EVENTINJ/VINTR §15.20/§15.21, intercepted-#PF semantics
   §15.12.15, decode assists, MSRPM/IOPM layout §15.11) and Appendix B
-  (VMCB layout / state-save-area field offsets). Cited throughout the
-  M2 (SVM), FW-1, CPUMSR, and M4-6b task notes. Fetch:
-  https://docs.amd.com/v/u/en-US/24593_3.44_APM_Vol2
+  (VMCB layout / state-save-area field offsets). Cited throughout the M2
+  (SVM), FW-1, CPUMSR, and M4-6b task notes.
+- **Intel SDM (`325462-092-sdm-vol-1-2abcd-3abcd-4.pdf`).** The Intel-host
+  counterpart reference (VMX/VT-x, IA-32 system programming) for the
+  mandatory Intel real-hardware validation pass (AGENTS.md testing gate);
+  cite the specific volume/§ against the task when used.
