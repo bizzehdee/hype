@@ -1205,7 +1205,21 @@ tasks — see updated deps below.*
 - [ ] **M4-6d2** — Block reads at scale for the rootfs mount. Alpine's
   `/init` mounts the squashfs rootfs from the CD via libata ->
   ScsiDisk -> our AHCI/ATAPI model, at scale (many READ(10)s over a
-  ~60MB image). Per M4-6d1's 2026-07-16 findings, the kernel already
+  ~60MB image).
+
+  **RE-SCOPED (2026-07-16, per M4-6d2a): the AHCI completion INTERRUPT is
+  NOT required.** The Linux guest polls the port (PxIE=0) -- it never
+  arms AHCI interrupts -- so item (2) below (deliver the IRQ) is dropped
+  from the Linux critical path (kept only as a note for a future
+  interrupt-driven guest). The remaining, real work for reaching the
+  rootfs mount is: (0) stop the FW-1 dispatch loop from ending the run
+  while the kernel legitimately idle-waits on the async libata probe
+  (the OVMF-tuned idle-exit heuristic; the immediate blocker -- likely a
+  new task M4-6d2b), then (1) verify polled ATAPI DMA read completion is
+  correct enough that libata doesn't retry/re-read (the deeper plateau
+  the raised-limit run hit). Original notes retained below.
+
+  Per M4-6d1's 2026-07-16 findings, the kernel already
   issues these READ(10)s at scale and our polling path returns GOOD, but
   it re-reads/retries and never advances -- the concrete work here is
   therefore: (1) verify the ATAPI DMA read completion exactly matches
@@ -1254,6 +1268,43 @@ tasks — see updated deps below.*
   Note the coupling: the PCI Interrupt Line and the IRQ delivery must
   ship together -- advertising Line=5 without delivering IRQ5 would make
   libata `request_irq(5)` then hang waiting for interrupts that never come.
+- [x] **M4-6d2a** — Root-caused the AHCI-IRQ wiring segfault. DONE
+  (2026-07-16). Two safe diagnostic boots (a "would-inject" counter that
+  logs when `hype_ahci_irq_pending()` goes true but never injects; run
+  once without and once with the PCI Interrupt Line advertised) settled
+  it decisively -- **both booted clean to the same plateau, no segfault**:
+  - The earlier wiring-run segfault was **flaky/environmental** (nested
+    SVM under QEMU), NOT a bug in the wiring. Proof: the IRQ5-injection
+    code is gated on `hype_ahci_irq_pending()`, which was **never true**
+    in either run (`AHCI irq_pending-true iters=0`), because the guest
+    never sets PxIE (see below) -- so the injection code never executes,
+    and the ack-gate change is provably inert without it. Advertising the
+    Interrupt Line alone also does not crash (falsifies "OVMF interrupt
+    setup faults").
+  - **Key finding that re-scopes M4-6d2: the Linux guest polls AHCI --
+    it never enables PxIE.** Exit state both runs: `ghc=0x80000002`
+    (GHC.IE set by OVMF) but `p_ie=0x0`, `p_is=0x0`. `ata1` comes up as
+    `SATA max UDMA/133 abar m4096@0x80000000 port 0x80000100 irq 11`
+    (OVMF reprogrammed Interrupt Line 0x3C to its own Q35 PIRQ result,
+    11, over the 5 we set -- config 0x3C is guest/firmware-writable), but
+    libata drives the port by polling PxCI/PxIS, not by interrupt. So an
+    AHCI completion INTERRUPT is NOT needed to boot Linux; the polling
+    path (already working, M4-6d1: 150 GOOD READ(10)s) is what the kernel
+    uses. The interrupt building blocks (commit aa40591) are harmless and
+    retained (a future interrupt-driven guest, e.g. Windows, may use
+    them), but M4-6d2 no longer needs the IRQ-delivery wiring.
+  - **The actual blocker is the FW-1 dispatch loop's exit heuristic.**
+    Last kernel line before the plateau is `Key type fscrypt-provisioning
+    registered` -- end of `do_initcalls`, right before
+    `async_synchronize_full()`. The libata port scan runs as async work
+    (COMRESET + ~1-2s ATA reset delay + IDENTIFY), during which the
+    kernel legitimately idle-HLTs. The loop's OVMF-tuned heuristic
+    (HYPE_FW_1_KEY_WAIT_EXITS=20000 idle exits => "hung") fires during
+    that wait and ends the run before the probe finishes -- no
+    `ata1: SATA link up`, no IDENTIFY in the clean build. (The earlier
+    raised-limit TEMP-DIAG run confirmed that with more tolerance the
+    probe completes and the rootfs reads proceed, then plateaus deeper.)
+  Deps: M4-6d2 (building blocks).
 - [ ] **M4-6d3** — Userspace login prompt. Drive the remaining device/
   console gaps until Alpine's OpenRC/init brings up an interactive login
   prompt on ttyS0 -- the true end-to-end bar for M4-6. Larger installer
