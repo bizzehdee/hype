@@ -183,10 +183,20 @@ void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint32_t med
     dev->media_size = media_size;
     dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
     dev->asc = 0;
+    dev->command_count = 0;
+    dev->read10_count = 0;
+    dev->last_cdb = 0;
 }
 
 void hype_atapi_execute_cdb(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_MAX],
                             hype_atapi_result_t *out) {
+    /* Diagnostic bookkeeping (see hype_atapi_t): every CDB counts, so a
+     * caller can report CD progress without tracing each command. */
+    dev->command_count++;
+    dev->last_cdb = cdb[0];
+    if (cdb[0] == HYPE_ATAPI_CMD_READ10) {
+        dev->read10_count++;
+    }
     switch (cdb[0]) {
         case HYPE_ATAPI_CMD_TEST_UNIT_READY:
             handle_test_unit_ready(dev, out);

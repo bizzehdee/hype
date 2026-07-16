@@ -70,6 +70,15 @@ typedef struct {
      * conditions this project doesn't model). */
     uint8_t sense_key;
     uint8_t asc;
+    /* Diagnostic counters (M4-6 real-HW debugging): total CDBs executed
+     * and the most-recent opcode + count of READ(10)s. Let a caller
+     * report AHCI/CD progress compactly (e.g. on a screen-only real-
+     * hardware box where per-command tracing would flood/stall the GOP
+     * console) instead of tracing every command. Reset by
+     * hype_atapi_reset. */
+    uint32_t command_count;
+    uint32_t read10_count;
+    uint8_t last_cdb;
 } hype_atapi_t;
 
 typedef struct {

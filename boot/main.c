@@ -4767,6 +4767,26 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
              * CPU without decode assists. */
             uint8_t insn_n = 0;
             const uint8_t *insn = hype_svm_vcpu_guest_insn_bytes(ctx, &insn_n);
+            /* M4-6 real-AMD DIAG: the decode-assist path (insn_n > 0) is
+             * used only on real AMD -- QEMU+KVM nested SVM never populates
+             * num_bytes_fetched, so it's the ptwalk fallback there and this
+             * path has never actually been exercised. One-shot dump of the
+             * first NPF's decode-assist state + bytes: n=0 means real HW
+             * ALSO isn't giving decode assists (unexpected); n>0 with sane
+             * instruction bytes means the path is live and we can trust the
+             * MMIO decode. */
+            {
+                static int fw1_da_diag = 0;
+                if (!fw1_da_diag) {
+                    fw1_da_diag = 1;
+                    hype_debug_print("fw-1 DIAG: 1st NPF decode-assist n=%u (0=none->ptwalk) "
+                                      "insn=%02x %02x %02x %02x guest_rip=0x%llx\n",
+                                      (unsigned int)insn_n,
+                                      insn_n > 0 && insn ? insn[0] : 0, insn_n > 1 && insn ? insn[1] : 0,
+                                      insn_n > 2 && insn ? insn[2] : 0, insn_n > 3 && insn ? insn[3] : 0,
+                                      (unsigned long long)info.guest_rip);
+                }
+            }
             if (insn_n == 0) {
                 insn = fw_1_insn_bytes_via_ptwalk(ctx, info.guest_rip);
             }
@@ -4817,6 +4837,35 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                     ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
                     if (hype_svm_vcpu_handle_ahci_npf_map(ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
                                                            &g_fw_1_dma_map, insn) == 0) {
+                        /* M4-6 real-AMD DIAG (compact, screen-only-friendly):
+                         * report CD progress at milestones instead of tracing
+                         * every command. First ATAPI command proves OVMF is
+                         * driving the controller; first READ(10) proves CD
+                         * data I/O works; the running READ(10) count (every
+                         * 64) shows sustained reads. If the guest OVMF drops
+                         * to the shell with read10=0, its storage stack never
+                         * read the CD (AHCI/ATAPI issue); with read10>0 but no
+                         * boot, it's a boot-order/bootable-media issue. */
+                        {
+                            static uint32_t last_reported_reads = 0;
+                            static int first_cmd_reported = 0;
+                            if (!first_cmd_reported && g_fw_1_atapi.command_count > 0) {
+                                first_cmd_reported = 1;
+                                hype_debug_print("fw-1 DIAG: guest issued 1st ATAPI CDB (opcode=0x%x)\n",
+                                                  (unsigned int)g_fw_1_atapi.last_cdb);
+                            }
+                            if (g_fw_1_atapi.read10_count == 1 && last_reported_reads == 0) {
+                                hype_debug_print("fw-1 DIAG: 1st ATAPI READ(10) done -- CD data I/O "
+                                                  "works on real HW (cmds=%u)\n",
+                                                  (unsigned int)g_fw_1_atapi.command_count);
+                            }
+                            if (g_fw_1_atapi.read10_count >= last_reported_reads + 64) {
+                                last_reported_reads = g_fw_1_atapi.read10_count;
+                                hype_debug_print("fw-1 DIAG: ATAPI READ(10) count=%u (cmds=%u)\n",
+                                                  (unsigned int)g_fw_1_atapi.read10_count,
+                                                  (unsigned int)g_fw_1_atapi.command_count);
+                            }
+                        }
                         continue;
                     }
                     hype_fatal("fw-1: unhandled AHCI ABAR MMIO at guest-physical 0x%llx (%s, "

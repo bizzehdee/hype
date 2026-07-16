@@ -254,6 +254,30 @@ static void test_build_identify_packet_device(void) {
     CHECK_HEX("model string byte-swapped ('H' second)", 'H', id[55]);
 }
 
+static void test_diagnostic_counters(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    CHECK_HEX("reset zeroes command_count", 0, dev.command_count);
+    CHECK_HEX("reset zeroes read10_count", 0, dev.read10_count);
+
+    make_cdb(cdb, HYPE_ATAPI_CMD_INQUIRY);
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+    CHECK_HEX("command_count after 1 cmd", 1, dev.command_count);
+    CHECK_HEX("last_cdb = INQUIRY", HYPE_ATAPI_CMD_INQUIRY, dev.last_cdb);
+    CHECK_HEX("read10_count still 0", 0, dev.read10_count);
+
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ10);
+    cdb[8] = 1; /* 1 sector */
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+    CHECK_HEX("command_count after 3 cmds", 3, dev.command_count);
+    CHECK_HEX("read10_count after 2 reads", 2, dev.read10_count);
+    CHECK_HEX("last_cdb = READ10", HYPE_ATAPI_CMD_READ10, dev.last_cdb);
+}
+
 int main(void) {
     init_media();
 
@@ -271,6 +295,7 @@ int main(void) {
     test_request_sense_no_sense_by_default();
     test_unrecognized_opcode_rejected();
     test_build_identify_packet_device();
+    test_diagnostic_counters();
 
     if (failures == 0) {
         printf("all tests passed\n");
