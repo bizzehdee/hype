@@ -4738,7 +4738,13 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
          * timer cadence from flooding nested IRQs. acknowledge() honours
          * the guest's IMRs and the master/slave cascade, and returns the
          * guest-programmed vector. */
-        if (g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
+        /* M4-6d2: first deliver any already-deferred IRQ the moment the
+         * guest can accept it (don't wait only on the VINTR intercept --
+         * that gap stranded the timer tick and froze jiffies). If it
+         * injected, skip acknowledging a new one this iteration so the
+         * freshly-staged EVENTINJ isn't clobbered. */
+        if (!hype_svm_vcpu_deliver_pending_if_ready(ctx) &&
+            g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
             uint8_t pic_vector;
             if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
                 hype_svm_vcpu_request_interrupt(ctx, pic_vector);
@@ -5218,6 +5224,15 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                       (unsigned int)g_fw_1_pic.slave.isr, (unsigned int)g_fw_1_pic.slave.imr,
                       (unsigned int)g_fw_1_ahci.ghc, (unsigned int)g_fw_1_ahci.p_ie,
                       (unsigned long long)g_fw_1_host_tsc_hz);
+    {
+        /* M4-6d2 DIAG: interrupt-injection path breakdown -- if the timer
+         * (or AHCI) IRQ delivery wedges, defer >> window or overwrite > 0
+         * shows deferred injections stuck/lost via the VINTR path. */
+        unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
+        hype_svm_vcpu_get_int_diag(&ei, &df, &wn, &ov);
+        hype_debug_print("fw-1: M4-6d2 int diag: EVENTINJ=%llu, VINTR-defer=%llu, VINTR-window=%llu, "
+                          "defer-overwrite=%llu\n", ei, df, wn, ov);
+    }
 
     if (booted && key_reacted) {
         hype_debug_print(

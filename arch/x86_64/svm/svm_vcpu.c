@@ -673,18 +673,37 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
 static int g_pending_irq_valid = 0;
 static uint8_t g_pending_irq_vector = 0;
 
+/* M4-6d2 DIAG: interrupt-injection path counters (INT-1/INT-2). */
+static unsigned long long g_int_eventinj = 0;   /* accepted immediately (direct EVENTINJ) */
+static unsigned long long g_int_vintr_defer = 0; /* couldn't accept -> VINTR window armed */
+static unsigned long long g_int_vintr_window = 0;/* VINTR window fired -> deferred inject */
+static unsigned long long g_int_defer_overwrite = 0; /* a deferral clobbered an unserviced pending vector */
+
+void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
+                                 unsigned long long *window, unsigned long long *overwrite) {
+    *eventinj = g_int_eventinj;
+    *defer = g_int_vintr_defer;
+    *window = g_int_vintr_window;
+    *overwrite = g_int_defer_overwrite;
+}
+
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
 
     if (hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
+        g_int_eventinj++;
         return;
     }
 
+    if (g_pending_irq_valid) {
+        g_int_defer_overwrite++; /* a second vector deferred before the first was delivered */
+    }
     real->vmcb->control.vintr = hype_svm_arm_vintr_request(real->vmcb->control.vintr);
     real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_VINTR;
     g_pending_irq_valid = 1;
     g_pending_irq_vector = vector;
+    g_int_vintr_defer++;
 }
 
 void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
@@ -696,11 +715,41 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
     if (g_pending_irq_valid) {
         uint8_t vector = g_pending_irq_vector;
         g_pending_irq_valid = 0;
+        g_int_vintr_window++;
         /* This window firing at all means the guest can accept an
          * interrupt right now -- hype_svm_vcpu_request_interrupt()'s
          * own can-accept check will take the direct-EVENTINJ path. */
         hype_svm_vcpu_request_interrupt(ctx, vector);
     }
+}
+
+int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+
+    /* M4-6d2: belt-and-suspenders to the VINTR window (INT-2). A deferred
+     * interrupt is only delivered when its VINTR intercept fires; if that
+     * doesn't happen promptly (observed: a deferred PIT IRQ0 stranded
+     * while the guest was halted/ready, wedging the timer -> jiffies froze
+     * -> libata's post-COMRESET msleep hung), poll each vCPU loop
+     * iteration and inject directly the moment the guest can accept -- and
+     * only then move it off the pending slot / disarm the window. Also
+     * guards against EVENTINJ clobbering an event already staged this
+     * entry. Returns 1 if it injected. */
+    if (!g_pending_irq_valid) {
+        return 0;
+    }
+    if ((real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) != 0) {
+        return 0; /* an event is already staged for the next VMRUN */
+    }
+    if (!hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
+        return 0;
+    }
+    real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(g_pending_irq_vector);
+    g_pending_irq_valid = 0;
+    real->vmcb->control.vintr = hype_svm_disarm_vintr_request(real->vmcb->control.vintr);
+    real->vmcb->control.intercept_misc1 &= ~HYPE_SVM_INTERCEPT_VINTR;
+    g_int_eventinj++;
+    return 1;
 }
 
 void hype_svm_vcpu_deliver_pic_irq(hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip, uint8_t irq) {

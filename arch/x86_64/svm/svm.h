@@ -370,6 +370,23 @@ void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
  */
 void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx);
 
+/* M4-6d2: if an interrupt is deferred (waiting on a VINTR window) and the
+ * guest can now accept one, inject it directly this instant rather than
+ * waiting for the VINTR intercept to fire -- closes a delivery gap where
+ * a deferred timer IRQ stayed stranded (guest halted/ready but the window
+ * never fired), freezing jiffies. Call once per vCPU-loop iteration.
+ * Returns 1 if it injected. Exempt VMCB glue. */
+int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);
+
+/* M4-6d2 DIAG: read the interrupt-injection path counters -- how many
+ * requests took the direct-EVENTINJ path (guest could accept), how many
+ * were deferred to a VINTR window, how many VINTR windows fired to
+ * deliver a deferred vector, and how many deferrals clobbered a still-
+ * undelivered pending vector. defer >> window (or overwrite > 0) means
+ * deferred injections are getting stuck/lost. */
+void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
+                                 unsigned long long *window, unsigned long long *overwrite);
+
 /*
  * INPUT-1: the reusable "a device wired to `chip` just raised `irq`"
  * entry point -- combines devices/pic.h's own real-hardware modeling

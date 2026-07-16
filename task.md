@@ -1447,6 +1447,31 @@ tasks — see updated deps below.*
   IDENTIFY/READ. Get a traced kernel-phase capture (poll vs interrupt
   wait) to confirm exactly what libata blocks on after DET->0.*
 
+  *ROOT CAUSE NARROWED 2026-07-16 -- it's the INT path, NOT the AHCI
+  model. Traced kernel-phase capture: after the COMRESET (PxSCTL
+  0x300->0x301->0x300) libata makes NO further AHCI access -- it never
+  reaches the PxSSTS/PxTFD poll, so it's stuck in sata_link_resume's
+  msleep, i.e. jiffies frozen. INT-path counters (new
+  hype_svm_vcpu_get_int_diag) confirmed a stranded timer IRQ:
+  EVENTINJ/VINTR-defer/VINTR-window with defer exceeding window by one
+  and master PIC ISR=0x1 stuck (IRQ0 acknowledged, never EOI'd) => timer
+  wedged at the async libata probe (~41 ticks in, right at fscrypt) ->
+  msleep hangs -> plateau. Tried hype_svm_vcpu_deliver_pending_if_ready()
+  (deliver a deferred IRQ the moment the guest can accept, not only on
+  the VINTR VMEXIT): it works (VINTR-window 38->3, deferrals now deliver
+  directly) and is a correct latency improvement, but the plateau
+  PERSISTS -- same fscrypt stop, ISR still 0x1. So the wedge isn't just
+  VINTR-window latency: the guest ends up halted/idle WITHOUT the pending
+  timer IRQ ever being taken+EOI'd. NEXT: determine the guest's state at
+  the wedge -- is it HLT with IF=0 (a dead halt; would mean our injection
+  or an earlier event left IF wrong), or IF=1 (then why isn't the
+  delivered IRQ0 handled+EOI'd)? Instrument save.rflags.IF + eventinj
+  state at the stuck point, and whether the guest ever runs its IRQ0
+  handler after the wedge. Committed so far: AHCI IRQ wiring (a0b2b2d,
+  WARN gone/interrupt mode), INT diag counters + deliver_pending_if_ready
+  (this commit). The AHCI-completion IRQ path is correct and ready; it's
+  gated behind fixing this timer-IRQ wedge so the probe can progress.*
+
   *Building blocks landed (2026-07-16, commit aa40591), inert until the
   loop wiring is made safe:*
   - `hype_ahci_irq_pending()` (devices/ahci.c) -- the HBA interrupt-
