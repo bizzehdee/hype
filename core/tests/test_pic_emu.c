@@ -221,6 +221,68 @@ static void test_acknowledge_picks_lowest_numbered_irq_first(void) {
     CHECK_HEX("the other IRQ is still pending", 1, (pic.master.irr & (1u << 3)) != 0);
 }
 
+static void test_raise_global_irq_routes_master_vs_slave(void) {
+    hype_pic_emu_t pic;
+    hype_pic_emu_reset(&pic);
+
+    hype_pic_emu_raise_global_irq(&pic, 5);   /* master IR5 */
+    hype_pic_emu_raise_global_irq(&pic, 11);  /* slave IR3 (11-8) */
+    CHECK_HEX("global IRQ 5 lands on master IRR bit 5", 1, (pic.master.irr & (1u << 5)) != 0);
+    CHECK_HEX("global IRQ 11 lands on slave IRR bit 3", 1, (pic.slave.irr & (1u << 3)) != 0);
+
+    hype_pic_emu_raise_global_irq(&pic, 16); /* out of range: no-op */
+    CHECK_HEX("out-of-range global IRQ ignored (master)", 0x20u, pic.master.irr);
+}
+
+static void test_acknowledge_cascade_delivers_slave_irq(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.slave.irq_offset = 0x28u;
+    pic.master.imr = 0x00u; /* all unmasked incl. IR2 cascade */
+    pic.slave.imr = 0x00u;
+
+    hype_pic_emu_raise_global_irq(&pic, 11); /* AHCI on slave IR3 -> vector 0x28+3 */
+    CHECK_HEX("cascade acknowledge reports pending", 1, hype_pic_emu_acknowledge(&pic, &vector));
+    CHECK_HEX("delivers the slave's vector (0x28 + 3)", 0x2Bu, vector);
+    CHECK_HEX("slave IR3 moved to in-service", 1, (pic.slave.isr & (1u << 3)) != 0);
+    CHECK_HEX("master cascade IR2 also in-service", 1, (pic.master.isr & (1u << 2)) != 0);
+}
+
+static void test_acknowledge_master_beats_cascade_by_priority(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.slave.irq_offset = 0x28u;
+    pic.master.imr = 0x00u;
+    pic.slave.imr = 0x00u;
+
+    hype_pic_emu_raise_global_irq(&pic, 0);  /* timer IRQ0 (highest priority) */
+    hype_pic_emu_raise_global_irq(&pic, 11); /* AHCI slave IR3 (via cascade IR2) */
+    CHECK_HEX("acknowledge reports pending", 1, hype_pic_emu_acknowledge(&pic, &vector));
+    CHECK_HEX("IRQ0 wins over the cascaded slave IRQ", 0x20u, vector);
+    CHECK_HEX("slave IRQ still pending", 1, (pic.slave.irr & (1u << 3)) != 0);
+}
+
+static void test_acknowledge_cascade_blocked_when_master_ir2_masked(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0xEE;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.slave.irq_offset = 0x28u;
+    pic.master.imr = (uint8_t)(1u << 2); /* cascade line masked */
+    pic.slave.imr = 0x00u;
+
+    hype_pic_emu_raise_global_irq(&pic, 11);
+    CHECK_HEX("slave IRQ blocked when master IR2 (cascade) masked", 0,
+              hype_pic_emu_acknowledge(&pic, &vector));
+}
+
 int main(void) {
     test_reset_is_fully_masked();
     test_unrecognized_port_rejected();
@@ -238,6 +300,10 @@ int main(void) {
     test_acknowledge_returns_zero_when_masked();
     test_acknowledge_returns_zero_when_nothing_pending();
     test_acknowledge_picks_lowest_numbered_irq_first();
+    test_raise_global_irq_routes_master_vs_slave();
+    test_acknowledge_cascade_delivers_slave_irq();
+    test_acknowledge_master_beats_cascade_by_priority();
+    test_acknowledge_cascade_blocked_when_master_ir2_masked();
 
     if (failures == 0) {
         printf("all tests passed\n");

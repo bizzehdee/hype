@@ -81,4 +81,26 @@ void hype_pic_emu_raise_irq(hype_pic_emu_chip_t *chip, uint8_t irq);
  */
 int hype_pic_emu_acknowledge_highest_priority(hype_pic_emu_chip_t *chip, uint8_t *out_vector);
 
+/* Raises a global (0-15) IRQ line across the master/slave pair: 0-7 go
+ * on the master's IRR, 8-15 on the slave's IRR bit (global-8). The
+ * slave's cascade into master IR2 is resolved at acknowledge time (see
+ * hype_pic_emu_acknowledge), so this just sets the right IRR bit. No-op
+ * if global_irq > 15. (M4-6d2: an AHCI controller whose PCI Interrupt
+ * Line firmware routed to a slave line, e.g. 11, needs the slave path.) */
+void hype_pic_emu_raise_global_irq(hype_pic_emu_t *pic, uint8_t global_irq);
+
+/*
+ * Cascade-aware INTA acknowledge across the master/slave pair. Resolves
+ * the highest-priority pending+unmasked IRQ the way a real cascaded
+ * 8259 pair does: the slave's INT feeds the master's IR2, so a slave IRQ
+ * only reaches the CPU when master IR2 is also unmasked, and master
+ * priorities interleave (IR0, IR1, then the slave's IR8..IR15 via IR2,
+ * then IR3..IR7). On success moves the winning IRQ from IRR to ISR (and,
+ * for a slave IRQ, also sets master ISR IR2 -- the guest EOIs both
+ * chips), fills *out_vector with the delivering chip's irq_offset + its
+ * local IRQ, and returns 1. Returns 0 if nothing is deliverable. Pure
+ * logic; injecting the vector stays the exempt glue's job.
+ */
+int hype_pic_emu_acknowledge(hype_pic_emu_t *pic, uint8_t *out_vector);
+
 #endif /* HYPE_DEVICES_PIC_H */

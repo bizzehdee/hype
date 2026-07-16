@@ -141,3 +141,54 @@ int hype_pic_emu_acknowledge_highest_priority(hype_pic_emu_chip_t *chip, uint8_t
     }
     return 0;
 }
+
+void hype_pic_emu_raise_global_irq(hype_pic_emu_t *pic, uint8_t global_irq) {
+    if (global_irq < 8u) {
+        pic->master.irr |= (uint8_t)(1u << global_irq);
+    } else if (global_irq < 16u) {
+        pic->slave.irr |= (uint8_t)(1u << (global_irq - 8u));
+    }
+}
+
+int hype_pic_emu_acknowledge(hype_pic_emu_t *pic, uint8_t *out_vector) {
+    uint8_t m_pending = pic->master.irr & (uint8_t)~pic->master.imr;
+    uint8_t s_pending = pic->slave.irr & (uint8_t)~pic->slave.imr;
+    uint8_t effective;
+    int i;
+
+    /* The slave's INT drives master IR2 (the cascade line), gated by
+     * master IR2's own mask -- a slave IRQ can only reach the CPU when
+     * master IR2 is unmasked. */
+    effective = m_pending;
+    if (s_pending != 0 && (pic->master.imr & (uint8_t)(1u << 2)) == 0) {
+        effective |= (uint8_t)(1u << 2);
+    }
+
+    for (i = 0; i < 8; i++) {
+        if ((effective & (uint8_t)(1u << i)) == 0) {
+            continue;
+        }
+        if (i == 2 && s_pending != 0) {
+            /* Cascade: the winning line is the slave's highest-priority
+             * pending IRQ. Put it in service on the slave and mark the
+             * cascade (master IR2) in service too. */
+            int j;
+            for (j = 0; j < 8; j++) {
+                if (s_pending & (uint8_t)(1u << j)) {
+                    pic->slave.irr &= (uint8_t) ~(1u << j);
+                    pic->slave.isr |= (uint8_t)(1u << j);
+                    pic->master.isr |= (uint8_t)(1u << 2);
+                    *out_vector = (uint8_t)(pic->slave.irq_offset + j);
+                    return 1;
+                }
+            }
+        }
+        /* A master-line IRQ (IR2 with no slave pending is treated as a
+         * plain master line). */
+        pic->master.irr &= (uint8_t) ~(1u << i);
+        pic->master.isr |= (uint8_t)(1u << i);
+        *out_vector = (uint8_t)(pic->master.irq_offset + i);
+        return 1;
+    }
+    return 0;
+}

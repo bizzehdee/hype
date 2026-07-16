@@ -4410,6 +4410,16 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u, 0x01, 0x06,
                          0x01);
     hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
+    /* M4-6d2: advertise a legacy PCI interrupt on the AHCI function
+     * (Interrupt Pin INTA=1) so the guest treats it as interrupt-capable
+     * and libata uses its interrupt-driven path rather than the forced-
+     * polling one (which WARNs -- ata_host_activate WARN_ON(irq_handler)
+     * -- and stalls the probe, confirmed on real AMD). Line 11 is just an
+     * initial value; OVMF reprograms Interrupt Line (config 0x3C) via its
+     * Q35 routing and the guest reads that back, so the vCPU loop
+     * delivers the completion IRQ on whatever line 0x3C actually holds
+     * (hype_pci_get_interrupt_line), master or slave. */
+    hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
     hype_ahci_reset(&g_fw_1_ahci);
     hype_atapi_reset(&g_fw_1_atapi, (uint8_t *)(uintptr_t)g_iso_host_phys, (uint32_t)g_iso_size);
     /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging
@@ -4603,6 +4613,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     unsigned long long kbd_poll_run = 0; /* FW-1g: consecutive empty keyboard status polls */
     unsigned long long timer_irqs = 0;   /* M4-6b: guest LAPIC-timer IRQs actually delivered */
     unsigned long long pit_irqs = 0;     /* M4-6b4: PIT IRQ0 (legacy clockevent) IRQs delivered */
+    unsigned long long ahci_irqs = 0;    /* M4-6d2: AHCI completion IRQs raised on the guest's line */
     unsigned long long console_chars = 0;
     unsigned long long inject_chars = 0;
     unsigned long long inject_productive = 0;
@@ -4698,20 +4709,46 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_svm_vcpu_request_interrupt(ctx, timer_vector);
             timer_irqs++;
         }
-        /* M4-6b4: deliver the legacy PIT clockevent. A guest OS that runs
-         * without ACPI/IO-APIC (our FW-1 guest gets no RSDP -> fully
-         * legacy) uses PIT IRQ0 through the 8259 PIC as its timer. Only
-         * inject when IRQ0 isn't already in service (ISR bit 0 clear),
-         * i.e. the guest has EOI'd the previous one -- otherwise a fast
-         * real-time cadence would flood it with nested timer IRQs. The
-         * PIC's acknowledge honours the guest's own IMR (a masked IRQ0 is
-         * never delivered) and returns the guest-programmed vector
-         * (ICW2 base + 0). */
-        if ((g_fw_1_pic.master.isr & 0x01u) == 0) {
+        /* M4-6d2: raise the AHCI completion IRQ on the line the guest
+         * actually programmed. hype_ahci_irq_pending() is level-sensitive
+         * (GHC.IE && PxIS&PxIE); the line comes from the AHCI function's
+         * PCI Interrupt Line (config 0x3C, which OVMF routed -- typically
+         * 11, a slave-PIC line). Only (re)raise when that line isn't
+         * already in service, so a still-asserted level doesn't re-request
+         * while the guest's ISR is running. */
+        if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
+            uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
+            if (line != 0u && line < 16u) {
+                int in_service = (line < 8u)
+                    ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
+                    : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
+                if (!in_service) {
+                    hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
+                    ahci_irqs++;
+                }
+            }
+        }
+        /* M4-6b4/M4-6d2: deliver the highest-priority pending PIC IRQ --
+         * the PIT IRQ0 clockevent (master) or the AHCI completion IRQ
+         * (master or slave, via the cascade). A fully-legacy guest (our
+         * FW-1 guest gets no RSDP) drives both through the 8259 pair.
+         * Deliver only when nothing is already in service anywhere (both
+         * ISRs clear), i.e. the guest has EOI'd the previous IRQ --
+         * modelling single-in-service INTA gating and preventing a fast
+         * timer cadence from flooding nested IRQs. acknowledge() honours
+         * the guest's IMRs and the master/slave cascade, and returns the
+         * guest-programmed vector. */
+        if (g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
             uint8_t pic_vector;
-            if (hype_pic_emu_acknowledge_highest_priority(&g_fw_1_pic.master, &pic_vector)) {
+            if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
                 hype_svm_vcpu_request_interrupt(ctx, pic_vector);
-                pit_irqs++;
+                /* Attribute by the master vector base: IRQ0 = PIT
+                 * clockevent, anything else = the AHCI line. */
+                if (pic_vector == g_fw_1_pic.master.irq_offset) {
+                    pit_irqs++;
+                } else {
+                    ahci_irqs++;
+                }
             }
         }
 
@@ -5171,11 +5208,16 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * by the guest). timer_irqs == 1 with in_service == 1 means the
      * guest took one tick and never acknowledged it -> its clockevent
      * isn't live. A large count means it is servicing the timer. */
-    hype_debug_print("fw-1: M4-6b diag: LAPIC timer IRQs=%llu (in_service=%d), PIT IRQ0 IRQs=%llu "
-                      "(master ISR=0x%x IMR=0x%x), host_tsc_hz=%llu\n",
+    hype_debug_print("fw-1: M4-6b diag: LAPIC timer IRQs=%llu (in_service=%d), PIT IRQ0 IRQs=%llu, "
+                      "AHCI IRQs=%llu on line %u (master ISR=0x%x IMR=0x%x, slave ISR=0x%x IMR=0x%x, "
+                      "AHCI ghc=0x%x p_ie=0x%x), host_tsc_hz=%llu\n",
                       (unsigned long long)timer_irqs, g_fw_1_lapic.timer_in_service,
-                      (unsigned long long)pit_irqs, (unsigned int)g_fw_1_pic.master.isr,
-                      (unsigned int)g_fw_1_pic.master.imr, (unsigned long long)g_fw_1_host_tsc_hz);
+                      (unsigned long long)pit_irqs, (unsigned long long)ahci_irqs,
+                      (unsigned int)hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI),
+                      (unsigned int)g_fw_1_pic.master.isr, (unsigned int)g_fw_1_pic.master.imr,
+                      (unsigned int)g_fw_1_pic.slave.isr, (unsigned int)g_fw_1_pic.slave.imr,
+                      (unsigned int)g_fw_1_ahci.ghc, (unsigned int)g_fw_1_ahci.p_ie,
+                      (unsigned long long)g_fw_1_host_tsc_hz);
 
     if (booted && key_reacted) {
         hype_debug_print(

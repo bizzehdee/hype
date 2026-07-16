@@ -141,6 +141,13 @@ void hype_pci_set_bar_size(hype_pci_t *pci, uint8_t device_number, unsigned int 
  */
 void hype_pci_set_interrupt(hype_pci_t *pci, uint8_t device_number, uint8_t int_pin, uint8_t int_line);
 
+/* Reads back a device's current Interrupt Line (config 0x3C) -- whatever
+ * value firmware/the guest last programmed there (a guest reads it to
+ * pick which 8259 IRQ to request). Returns 0 for an absent device. Used
+ * by the vCPU loop to deliver a device's completion IRQ on the exact
+ * line the guest is listening on. Pure struct read. */
+uint8_t hype_pci_get_interrupt_line(const hype_pci_t *pci, uint8_t device_number);
+
 /*
  * Reads back a device's current BAR value (whatever a prior
  * hype_pci_config_write() stored there -- either a size-sizing mask
