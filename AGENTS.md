@@ -147,6 +147,35 @@ changes — this file is the condensed rule set, not a replacement for either.
   decision's entry (don't delete the history — note what changed and why,
   matching the existing entries' style).
 
+## Hardware/spec research provenance
+
+Any research against a vendor developer manual (AMD APM, Intel SDM, a
+datasheet) — or hardware/spec research in general (a device register
+layout, an on-the-wire format, an errata) — must be archived so it is
+never re-fetched from the web:
+
+- **Check order, always, before any web search or download:** (1) the
+  relevant `task.md` task's summary/notes, then (2) the `research/`
+  directory, then — only if neither has it — (3) the web. Reaching for
+  a web search or download first is a process error; the whole point of
+  this rule is that the answer is usually already captured.
+- **When you do fetch a manual/datasheet:** save the PDF (or the exact
+  source document) under `research/` with a descriptive, versioned name
+  (e.g. `research/amd-apm-vol2-24593-r3.44.pdf`), and record in
+  `research/README.md` what it is, its version/revision, and where it
+  came from.
+- **Capture the extract against the task:** in the `task.md` entry (or
+  entries) the research was for, write the specific facts used — the
+  section/table numbers, the field offsets, the bit meanings, the exact
+  values — as a short summary with a pointer to the archived file
+  (`research/<file>`, §/table). These per-task summaries are the
+  first thing the next agent (or future you) reads, so make them
+  self-sufficient: enough to act on without re-opening the PDF.
+- Prefer in-tree primary sources when they exist (the vendored `edk2/`
+  and QEMU headers are authoritative for their own formats) and cite the
+  file path the same way; the `research/` archive is for external
+  documents that are not already in the repo.
+
 ## Keeping user-facing docs in sync
 
 - The top-level `README.md` (once `DOCS-1` exists) is written for someone
