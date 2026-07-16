@@ -267,11 +267,36 @@ multi-VM concurrency milestone, even though early single-guest milestones
   never hit (their framebuffers sat under 64GB). Fixed by
   hype_paging_map_region_2mb(): after the low identity map, explicitly
   map the GOP FrameBufferBase/Size range (from gop->Mode) into hype's
-  tables before the CR3 load. Awaiting the next Intel run to confirm the
-  runtime now completes (own paging loaded -> IDT -> "hypervisor now
-  running" -> timer ticks) -- which puts the whole currently-runnable
-  path at AMD parity on Intel. NEXT for full parity: the VMX vcpu_create/
-  vcpu_run VM-entry/exit trampoline so guests actually launch.*
+  tables before the CR3 load. CONFIRMED on the next Intel run
+  (2026-07-16): boot now reaches "vmx enabled" -> "vCPU launch not
+  implemented yet" -> [remaining guests skip] -> screen blanks (GOP
+  console-clear) -> "hype: Boot Services exited, hypervisor now running".
+  So the full post-ExitBootServices runtime bring-up (own paging +
+  framebuffer, IDT, timer/PIC/PIT + sti) executes on real Intel. All
+  output after the console-clear is hype_serial_print (serial only),
+  ending in hype_halt_forever(), so on this screen-only box the blanked
+  "Boot Services exited" screen holding steady IS the successful terminal
+  state -- the timer-loop proof-of-life just goes to an uncaptured serial
+  port. **VMXON + the whole vendor-neutral runtime path are validated on
+  real Intel silicon = M2-2 parity with AMD.** Not positively
+  distinguishable on-screen from a hang at sti; a GOP-visible timer
+  heartbeat (hype_debug_print renders to the framebuffer post-EBS, unlike
+  serial-only hype_serial_print) would make it conclusive if wanted.
+  NEXT for full Intel parity: the VMX vcpu_create/vcpu_run VM-entry/exit
+  trampoline so guests actually launch (bigger piece; needs a longer HW
+  window).*
+
+  *REAL-AMD M4-6 finding 2026-07-16: with a real AMD box, FW-1 was run
+  END-TO-END on hardware for the first time (M2-8's AMD pass only covered
+  M2-M4-5). hype's full self-test output appears, then the guest OVMF
+  (inside FW-1) reaches the UEFI Shell's "Press ESC in 5 seconds to skip
+  startup.nsh" countdown and HANGS after the 5s -- it drops to the shell
+  instead of booting the CD -> GRUB -> Linux the way it does under QEMU.
+  So on real AMD the guest firmware boots but diverges from the QEMU BDS
+  path (doesn't auto-boot the emulated CD, or the FW-1 loop stalls once
+  OVMF is at the shell). This is the M4-6 frontier on real hardware --
+  separate from the QEMU-side M4-6d2 libata-probe stall, and needs its
+  own FW-1-loop instrumentation on the AMD box. See M4-6 / M4-6d.*
 
 ---
 
