@@ -70,6 +70,21 @@ else
     echo "  to point at a real ISO9660 image if you want the full test sequence to run." >&2
 fi
 
+# Size the FAT32 image to fit its contents: hype.efi + the two OVMF blobs
+# (~8MB) + FAT metadata, plus the test ISO if present (which can be tens of
+# MB -- a full Alpine ISO overflowed the old fixed 64MB). Base overhead +
+# ISO size (rounded up to a whole MB), floored at IMG_SIZE_MB.
+img_overhead_mb=32
+iso_mb=0
+if [ -f "$TEST_ISO" ]; then
+    iso_bytes=$(wc -c < "$TEST_ISO")
+    iso_mb=$(( (iso_bytes + 1048575) / 1048576 ))
+fi
+img_needed_mb=$(( img_overhead_mb + iso_mb ))
+if [ "$img_needed_mb" -gt "$IMG_SIZE_MB" ]; then
+    IMG_SIZE_MB=$img_needed_mb
+fi
+
 echo "make-usb-package.sh: building $IMG_PATH (FAT32, ${IMG_SIZE_MB}MB)..."
 mkdir -p "$RELEASE_DIR"
 rm -f "$IMG_PATH"
