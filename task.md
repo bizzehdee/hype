@@ -1218,6 +1218,42 @@ tasks — see updated deps below.*
   rather than relying on polling alone; (3) sustain correctness under
   the kernel's queueing/retry. Bounds-checking already applied
   (VALID-3). Deps: M4-6d1.
+
+  *Building blocks landed (2026-07-16, commit aa40591), inert until the
+  loop wiring is made safe:*
+  - `hype_ahci_irq_pending()` (devices/ahci.c) -- the HBA interrupt-
+    generation predicate. **AHCI 1.3.1 SS5.5.3 (interrupt generation):**
+    a port raises an interrupt when `(PxIS & PxIE) != 0`; the HBA sets
+    the port's bit in the global IS register; the HBA asserts its PCI
+    interrupt (INTx/MSI) only while `GHC.IE` (bit 1) is also set.
+    Software deasserts by clearing PxIS then IS (both RW1C). One-port
+    model, so it reduces to `GHC.IE && (p_is & p_ie)`. (Spec was
+    consulted in-code; PDF not archived -- add to research/ per AGENTS.md
+    on next fetch. Related in-code cite: ahci.c GHC.HR self-clear, SS3.1.2.)
+  - `hype_pci_set_interrupt()` (devices/pci.c) -- sets config Interrupt
+    Pin 0x3D / Line 0x3C. `hype_pci_add_device` left both 0, so a
+    no-ACPI-_PRT guest (ours) saw the AHCI function as interrupt-less
+    (Pin 0 => "uses no interrupt"), forcing the degraded polled path in
+    M4-6d1's findings.
+  - global-IS latch at both completion sites (svm_vcpu.c), guarded by
+    PxIE so it stays inert for the polling test guests.
+
+  *Wiring attempt FAILED and was reverted:* injecting master IRQ5 (the
+  declared Interrupt Line) on `hype_ahci_irq_pending()`, with the FW-1
+  ack gate relaxed from IRQ0-only to single-in-service, turned the
+  previously-working boot into a SEGFAULT during OVMF's DXE/BDS phase
+  ("BdsDxe: failed to load Boot0002 ...", host QEMU `Segmentation fault
+  (core dumped)`), long before the kernel -- i.e. delivering an AHCI IRQ
+  disturbs OVMF's own (polled) AHCI usage. **Next session:** find a
+  delivery gate that cannot fire during the OVMF phase (candidates:
+  require the guest to have unmasked IRQ5 in the PIC IMR *and* set
+  GHC.IE+PxIE, which real OVMF in polled mode does not; or defer AHCI-IRQ
+  delivery until a kernel-stage signal), reproduce/bisect the segfault to
+  confirm the exact trigger (injection vs. the ack-gate change), then
+  validate a full boot reaches further before landing the wiring.
+  Note the coupling: the PCI Interrupt Line and the IRQ delivery must
+  ship together -- advertising Line=5 without delivering IRQ5 would make
+  libata `request_irq(5)` then hang waiting for interrupts that never come.
 - [ ] **M4-6d3** — Userspace login prompt. Drive the remaining device/
   console gaps until Alpine's OpenRC/init brings up an interactive login
   prompt on ttyS0 -- the true end-to-end bar for M4-6. Larger installer
