@@ -1060,7 +1060,8 @@ static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi,
  * so an out-of-range address is rejected rather than dereferenced. */
 static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_t *ahci,
                                            hype_atapi_t *atapi, uint64_t ahci_base_phys,
-                                           const hype_gpa_map_t *dma_map) {
+                                           const hype_gpa_map_t *dma_map,
+                                           const uint8_t *guest_insn_bytes) {
     hype_svm_npf_t npf;
     hype_mmio_decode_t decoded;
     uint64_t *reg;
@@ -1075,11 +1076,15 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
     }
     offset = (uint32_t)(npf.guest_phys_addr - ahci_base_phys);
 
-    /* Prefer AMD's decode-assist instruction capture (valid regardless
-     * of the guest's paging); fall back to translating RIP as a guest-
-     * physical address (identity-paged guests -- OVMF -- run with
-     * RIP == guest-physical) through the bounds-checked map. */
-    if (real->vmcb->control.num_bytes_fetched != 0) {
+    /* Faulting-instruction bytes for MMIO decode. A caller that already
+     * resolved them (FW-1: decode assists, else a guest page-table walk
+     * of the virtual RIP -- the kernel's AHCI driver runs in its own
+     * virtual address space, so RIP is NOT guest-physical) passes them
+     * in. Otherwise (the identity-mapped test guests) fetch via the map,
+     * where RIP == guest-physical == host. */
+    if (guest_insn_bytes != 0) {
+        guest_bytes = guest_insn_bytes;
+    } else if (real->vmcb->control.num_bytes_fetched != 0) {
         guest_bytes = real->vmcb->control.guest_instruction_bytes;
     } else {
         guest_bytes = (const uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, real->vmcb->save.rip, 1u);
@@ -1131,15 +1136,17 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
 
 int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
                                    uint64_t ahci_base_phys) {
-    /* NULL map: trusted identity-mapped test guest (guest-physical ==
-     * host, addresses this project wrote itself). */
-    return hype_svm_ahci_atapi_npf_common((struct hype_vcpu_ctx *)ctx, ahci, atapi, ahci_base_phys, 0);
+    /* NULL map + NULL insn: trusted identity-mapped test guest (guest-
+     * physical == host, RIP == guest-physical; decode fetched via the
+     * map internally). */
+    return hype_svm_ahci_atapi_npf_common((struct hype_vcpu_ctx *)ctx, ahci, atapi, ahci_base_phys, 0, 0);
 }
 
 int hype_svm_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
-                                       uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map) {
+                                       uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map,
+                                       const uint8_t *guest_insn_bytes) {
     return hype_svm_ahci_atapi_npf_common((struct hype_vcpu_ctx *)ctx, ahci, atapi, ahci_base_phys,
-                                          dma_map);
+                                          dma_map, guest_insn_bytes);
 }
 
 /* Fills the D2H (Device to Host) completion FIS and clears PxCI's slot

@@ -629,7 +629,8 @@ int hype_svm_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
  * above is the NULL-map (trusted identity) case. Same unit-test
  * exemption. */
 int hype_svm_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
-                                       uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map);
+                                       uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map,
+                                       const uint8_t *guest_insn_bytes);
 
 /*
  * M5-2's counterpart to hype_svm_vcpu_handle_ahci_npf() above -- same

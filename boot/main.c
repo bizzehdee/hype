@@ -4722,7 +4722,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 if (ahci_npf.guest_phys_addr >= ahci_abar &&
                     ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
                     if (hype_svm_vcpu_handle_ahci_npf_map(ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
-                                                           &g_fw_1_dma_map) == 0) {
+                                                           &g_fw_1_dma_map, insn) == 0) {
                         continue;
                     }
                     hype_fatal("fw-1: unhandled AHCI ABAR MMIO at guest-physical 0x%llx (%s, "
