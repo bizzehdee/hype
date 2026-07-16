@@ -1041,11 +1041,17 @@ static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi,
     d2h_fis[3] = error_reg;
 
     ahci->p_ci &= ~0x1u; /* slot 0 complete */
-    /* Completion interrupt-status bit a real driver polls (PxIS.DHRS for
-     * D2H completions, PxIS.PSS for PIO-in). No real interrupt delivery
-     * is wired up in this milestone -- the guest driver polls, same as
-     * fw_cfg's own DMA test guest. */
+    /* Completion interrupt-status bit (PxIS.DHRS for D2H completions,
+     * PxIS.PSS for PIO-in). A guest that polls waits on this directly;
+     * one that took the interrupt-driven path (M4-6d2) enabled PxIE, so
+     * also latch the port's bit in the global IS register -- its ISR
+     * (Linux ahci_interrupt) reads IS first to learn which port fired.
+     * The vCPU loop turns (GHC.IE && PxIS&PxIE) into a raised PIC IRQ
+     * via hype_ahci_irq_pending(). */
     ahci->p_is |= pis_bit;
+    if ((ahci->p_is & ahci->p_ie) != 0) {
+        ahci->is |= HYPE_AHCI_IS_PORT0;
+    }
     return 0;
 }
 
@@ -1171,8 +1177,12 @@ static void complete_ahci_command_slot0(hype_ahci_t *ahci, uint64_t rx_fis_phys,
     /* PxIS.DHRS -- the D2H Register FIS interrupt bit a real driver
      * polls for a plain-ATA command's completion (same correction as
      * the ATAPI path; the M4-5/M5-2 cooperating test guests polled PxCI
-     * and never depended on this bit). */
+     * and never depended on this bit). Latch the global IS port bit for
+     * an interrupt-driven guest, same as the ATAPI path (M4-6d2). */
     ahci->p_is |= HYPE_AHCI_PIS_DHRS;
+    if ((ahci->p_is & ahci->p_ie) != 0) {
+        ahci->is |= HYPE_AHCI_IS_PORT0;
+    }
 }
 
 /* M5-2's plain-ATA command dispatch, the H2D-FIS-command-byte-driven

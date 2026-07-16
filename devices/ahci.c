@@ -115,6 +115,19 @@ int hype_ahci_mmio_write(hype_ahci_t *ahci, uint32_t offset, uint8_t size_bytes,
     }
 }
 
+int hype_ahci_irq_pending(const hype_ahci_t *ahci) {
+    /* AHCI 1.3.1 SS5.5.3: the HBA asserts its interrupt while GHC.IE is
+     * set and some port has (PxIS & PxIE) != 0. Single-port model, so
+     * only port 0 contributes. Computed from the enabled status bits
+     * directly (rather than the latched global IS) so that once the
+     * guest's ISR clears PxIS the condition deasserts, matching the
+     * hardware level-sensitive line. */
+    if ((ahci->ghc & HYPE_AHCI_GHC_IE) == 0) {
+        return 0;
+    }
+    return (ahci->p_is & ahci->p_ie) != 0;
+}
+
 void hype_ahci_decode_cmd_header(const uint8_t raw[32], hype_ahci_cmd_header_t *out) {
     uint32_t opts = (uint32_t)raw[0] | ((uint32_t)raw[1] << 8) | ((uint32_t)raw[2] << 16) |
                     ((uint32_t)raw[3] << 24);

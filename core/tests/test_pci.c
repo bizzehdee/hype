@@ -100,6 +100,39 @@ static void test_ahci_class_code(void) {
     CHECK_HEX("AHCI class code (0x010601xx)", 0x01060100u, value);
 }
 
+static void test_set_interrupt_pin_and_line(void) {
+    hype_pci_t pci;
+    hype_pci_ecam_addr_t line = {0, 1, 0, 0x3C};
+    hype_pci_ecam_addr_t both = {0, 1, 0, 0x3C};
+    uint32_t value;
+
+    hype_pci_reset(&pci);
+    hype_pci_add_device(&pci, 1, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u, 0x01, 0x06, 0x01);
+
+    /* Before set: Interrupt Pin/Line both read 0 (function uses no
+     * interrupt) -- exactly the state that left a no-ACPI guest with no
+     * IRQ to request (M4-6d2). */
+    hype_pci_config_read(&pci, &line, 1, &value);
+    CHECK_HEX("Interrupt Line defaults to 0", 0x00u, value);
+
+    hype_pci_set_interrupt(&pci, 1, 1u, 5u);
+
+    hype_pci_config_read(&pci, &line, 1, &value);
+    CHECK_HEX("Interrupt Line = 5 after set", 0x05u, value);
+    /* 0x3C..0x3D as a 16-bit read: line in the low byte, pin (INTA=1) in
+     * the high byte -- the layout a guest reads to route the device. */
+    hype_pci_config_read(&pci, &both, 2, &value);
+    CHECK_HEX("Interrupt Line|Pin<<8 = 0x0105", 0x0105u, value);
+}
+
+static void test_set_interrupt_ignores_out_of_range_device(void) {
+    hype_pci_t pci;
+    hype_pci_reset(&pci);
+    /* Must not write out of bounds for an invalid device number. */
+    hype_pci_set_interrupt(&pci, (uint8_t)HYPE_PCI_MAX_DEVICES, 1u, 5u);
+    hype_pci_set_interrupt(&pci, 0xFFu, 1u, 5u);
+}
+
 static void test_bar_sizing_protocol(void) {
     hype_pci_t pci;
     hype_pci_ecam_addr_t bar0 = {0, 1, 0, 0x10};
@@ -342,6 +375,8 @@ int main(void) {
     test_non_bus_zero_or_non_function_zero_reads_absent();
     test_add_device_populates_header();
     test_ahci_class_code();
+    test_set_interrupt_pin_and_line();
+    test_set_interrupt_ignores_out_of_range_device();
     test_bar_sizing_protocol();
     test_unimplemented_bar_always_reads_zero();
     test_write_to_absent_device_is_dropped();

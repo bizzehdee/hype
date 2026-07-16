@@ -129,6 +129,19 @@ int hype_pci_add_device(hype_pci_t *pci, uint8_t device_number, uint16_t vendor_
 void hype_pci_set_bar_size(hype_pci_t *pci, uint8_t device_number, unsigned int bar_index, uint32_t size);
 
 /*
+ * Sets a device's Interrupt Pin (config 0x3D) and Interrupt Line
+ * (config 0x3C). Interrupt Pin is read-only, firmware-fixed hardware
+ * wiring (1=INTA .. 4=INTD; 0 = the function uses no interrupt);
+ * Interrupt Line is the ISA/PIC IRQ the platform routed that pin to,
+ * which firmware programs and a legacy (no-ACPI-_PRT) guest reads back
+ * verbatim to decide which IRQ to request. This project has no ACPI
+ * interrupt-routing tables the guest honours, so it must present a
+ * usable line here directly. Must be called after hype_pci_add_device()
+ * for that device. Pure struct mutation.
+ */
+void hype_pci_set_interrupt(hype_pci_t *pci, uint8_t device_number, uint8_t int_pin, uint8_t int_line);
+
+/*
  * Reads back a device's current BAR value (whatever a prior
  * hype_pci_config_write() stored there -- either a size-sizing mask
  * response or the guest's own programmed address, aligned to the

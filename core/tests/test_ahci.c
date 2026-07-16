@@ -120,6 +120,38 @@ static void test_ci_write_ors_in_bits(void) {
     CHECK_HEX("PxCI accumulates issued slots", 0x5u, value);
 }
 
+static void test_irq_pending_conditions(void) {
+    hype_ahci_t ahci;
+    hype_ahci_reset(&ahci);
+
+    /* Reset state: no interrupt asserted. */
+    CHECK_HEX("irq idle after reset", 0, hype_ahci_irq_pending(&ahci));
+
+    /* A completion status bit alone (PxIS) is not enough -- GHC.IE and
+     * PxIE must both be enabled for the HBA to assert its line. */
+    ahci.p_is = HYPE_AHCI_PIS_DHRS;
+    CHECK_HEX("PxIS alone: no irq (GHC.IE+PxIE clear)", 0, hype_ahci_irq_pending(&ahci));
+
+    ahci.p_ie = HYPE_AHCI_PIS_DHRS;
+    CHECK_HEX("PxIS&PxIE but GHC.IE clear: no irq", 0, hype_ahci_irq_pending(&ahci));
+
+    ahci.ghc |= HYPE_AHCI_GHC_IE;
+    CHECK_HEX("GHC.IE + (PxIS&PxIE): irq asserts", 1, hype_ahci_irq_pending(&ahci));
+
+    /* A status bit the driver did not enable must not assert. */
+    ahci.p_is = HYPE_AHCI_PIS_PSS;
+    ahci.p_ie = HYPE_AHCI_PIS_DHRS;
+    CHECK_HEX("PxIS bit not in PxIE: no irq", 0, hype_ahci_irq_pending(&ahci));
+
+    /* Clearing PxIS (RW1C, what a driver's ISR does) deasserts the
+     * level-sensitive line. */
+    ahci.p_is = HYPE_AHCI_PIS_DHRS;
+    ahci.p_ie = HYPE_AHCI_PIS_DHRS;
+    CHECK_HEX("re-armed: irq asserts", 1, hype_ahci_irq_pending(&ahci));
+    hype_ahci_mmio_write(&ahci, HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS, 4, HYPE_AHCI_PIS_DHRS);
+    CHECK_HEX("PxIS cleared: irq deasserts", 0, hype_ahci_irq_pending(&ahci));
+}
+
 static void test_reserved_register_reads_zero_and_ignores_writes(void) {
     hype_ahci_t ahci;
     uint32_t value;
@@ -359,6 +391,7 @@ int main(void) {
     test_ghc_hr_self_clears();
     test_is_rw1c();
     test_ci_write_ors_in_bits();
+    test_irq_pending_conditions();
     test_reserved_register_reads_zero_and_ignores_writes();
     test_rejects_misaligned_and_wrong_width();
     test_rejects_out_of_range_offset();

@@ -65,7 +65,15 @@
 
 /* GHC (Global HBA Control) bits this project models. */
 #define HYPE_AHCI_GHC_HR (1u << 0)   /* HBA Reset (write-1; self-clears when the reset completes) */
+#define HYPE_AHCI_GHC_IE (1u << 1)   /* Interrupt Enable (global: gates HBA interrupt assertion) */
 #define HYPE_AHCI_GHC_AE (1u << 31)  /* AHCI Enable */
+
+/* IS (global Interrupt Status): one bit per port. This project models a
+ * single port (0), so only bit 0 is ever set. Hardware sets IS.IPS[p]
+ * when port p has an interrupt condition (PxIS & PxIE != 0); software
+ * clears it write-1 (RW1C). A real driver's ISR (Linux ahci_interrupt)
+ * reads IS first to learn which port fired, so it must reflect port 0. */
+#define HYPE_AHCI_IS_PORT0 (1u << 0)
 
 /* PxIS (Port Interrupt Status) completion bits a real AHCI driver polls
  * to learn a command finished (EDK2 AhciCheckFisReceived): DHRS when a
@@ -174,6 +182,15 @@ int hype_ahci_mmio_read(const hype_ahci_t *ahci, uint32_t offset, uint8_t size_b
  * a misaligned offset or wrong width.
  */
 int hype_ahci_mmio_write(hype_ahci_t *ahci, uint32_t offset, uint8_t size_bytes, uint32_t value);
+
+/* Returns 1 if the HBA would be asserting its interrupt line right now,
+ * 0 otherwise. Per AHCI 1.3.1 SS5.5.3 (interrupt generation): a port
+ * raises an interrupt when (PxIS & PxIE) != 0, and the HBA asserts its
+ * PCI interrupt only while GHC.IE is also set. This project models one
+ * port, so the condition reduces to GHC.IE && (p_is & p_ie). Pure read;
+ * the caller (the vCPU loop) turns a transition-to-pending into a raised
+ * PIC IRQ line, and the guest deasserts by clearing PxIS/IS (RW1C). */
+int hype_ahci_irq_pending(const hype_ahci_t *ahci);
 
 /* Command Header (32 bytes, Command List entry). */
 typedef struct {

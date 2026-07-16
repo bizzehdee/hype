@@ -56,6 +56,14 @@ void hype_pci_set_bar_size(hype_pci_t *pci, uint8_t device_number, unsigned int 
     pci->devices[device_number].bar_size[bar_index] = size;
 }
 
+void hype_pci_set_interrupt(hype_pci_t *pci, uint8_t device_number, uint8_t int_pin, uint8_t int_line) {
+    if (device_number >= HYPE_PCI_MAX_DEVICES) {
+        return;
+    }
+    pci->devices[device_number].config[0x3C] = int_line; /* Interrupt Line */
+    pci->devices[device_number].config[0x3D] = int_pin;  /* Interrupt Pin  */
+}
+
 uint32_t hype_pci_get_bar_value(const hype_pci_t *pci, uint8_t device_number, unsigned int bar_index) {
     const hype_pci_device_t *dev;
     const uint8_t *p;
