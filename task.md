@@ -1174,14 +1174,50 @@ tasks — see updated deps below.*
   proc/sys, the module loads named on the cmdline: loop, squashfs,
   sd-mod). Observable now that the console is visible (M4-6c).
   Deps: M4-6b4, M4-6c.
+
+  *Diagnostic findings (2026-07-16), NOT yet [x]: with the clockevent
+  live (M4-6b4), a long instrumented run shows the kernel now drives the
+  AHCI/ATAPI CD hard -- libata resets the link (PxSCTL COMRESET
+  0x301->0x300), runs the ATAPI IDENTIFY PACKET DEVICE, and then issues
+  a sustained run of ~150 READ(10) (CDB 0x28) commands of ~640KB each
+  (655360/589824/32768 B), LBA advancing by 320 sectors per command
+  (low byte cycling +64 mod 256), interleaved with TEST UNIT READY
+  (0x00) and REQUEST SENSE (0x03). Every command completes status=GOOD
+  through our model's PxCI/PxIS polling path (PxIE was written 0 and
+  stays 0 the whole time -- interrupt-driven completion is NOT in play
+  yet; GHC.IE=1 was set but the port IE is off, i.e. this is libata's
+  polled scan/EH phase). BUT: (a) the console never prints "Freeing
+  unused kernel image memory" / "Run /init as init process", so it may
+  still be inside `kernel_init_freeable`/`async_synchronize_full` rather
+  than in `/init`; and (b) the read total (~150 x 640KB ~= 96MB from a
+  64MB ISO) means the same regions are being RE-READ -- a retry loop,
+  not linear forward progress -- and it plateaus at ~150 (no new reads,
+  no new console) without reaching userspace. Interpretation: the
+  commands "complete GOOD" from our side but are not fully satisfying
+  libata's DMA-ATAPI completion expectations, so it retries. Resolving
+  this (correct D2H FIS / PxTFD / PxIS completion semantics, and almost
+  certainly delivering the AHCI completion IRQ once PxIE is re-enabled)
+  is M4-6d2's core. Also noted: the FW-1 dispatch loop's idle-exit
+  heuristic (HYPE_FW_1_KEY_WAIT_EXITS, tuned for OVMF's idle-HLT) cuts a
+  booting kernel off too early; a booting-OS run needs a progress-based
+  exit (run while console/AHCI activity advances) rather than the OVMF
+  heuristic. Deps: M4-6b4, M4-6c.*
 - [ ] **M4-6d2** — Block reads at scale for the rootfs mount. Alpine's
   `/init` mounts the squashfs rootfs from the CD via libata ->
   ScsiDisk -> our AHCI/ATAPI model, at scale (many READ(10)s over a
-  ~60MB image). This likely needs real AHCI completion-INTERRUPT
-  delivery (PxIS + the HBA IRQ routed through the IO-APIC) rather than
-  the pure-polling path M4-5/FW-1h use, plus sustained correctness under
-  the kernel's own queueing. Bounds-checking already applied (VALID-3).
-  Deps: M4-6d1, M4-6b3.
+  ~60MB image). Per M4-6d1's 2026-07-16 findings, the kernel already
+  issues these READ(10)s at scale and our polling path returns GOOD, but
+  it re-reads/retries and never advances -- the concrete work here is
+  therefore: (1) verify the ATAPI DMA read completion exactly matches
+  what libata's `ahci`/`ata_qc_complete` path expects (D2H Register FIS
+  in the port's FIS-receive area, PxTFD status/error, PRDBC/byte-count,
+  and the PxIS bits DHRS/PSS set in the right order before PxCI clears);
+  (2) deliver the AHCI controller completion INTERRUPT -- PCI INTx
+  raised through the 8259 PIC (legacy mode; no IO-APIC, see M4-6b2/b3)
+  when a command completes with PxIE (port IE) and GHC.IE both set --
+  rather than relying on polling alone; (3) sustain correctness under
+  the kernel's queueing/retry. Bounds-checking already applied
+  (VALID-3). Deps: M4-6d1.
 - [ ] **M4-6d3** — Userspace login prompt. Drive the remaining device/
   console gaps until Alpine's OpenRC/init brings up an interactive login
   prompt on ttyS0 -- the true end-to-end bar for M4-6. Larger installer
