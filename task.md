@@ -992,11 +992,16 @@ tasks — see updated deps below.*
     back to a 4-level guest page-table walk (`fw_1_guest_virt_to_phys`,
     honoring 1G/2M pages) rooted at the guest CR3.*
 
-  Remaining tail (each a boot-and-observe device gap, decomposed so it
-  is not one unbounded task): **M4-6a** (port 0x61 / PIT ch2 timer
-  calibration -- the current blocker), then guest-timer interrupt
-  delivery, kernel console visibility, and root/initramfs handoff. See
-  M4-6a.. below.
+  Progress (2026-07-16): **M4-6a** (port 0x61 / PIT ch2 calibration) and
+  **M4-6c** (kernel console visible on ttyS0) are DONE, and M4-6d's AHCI
+  MMIO decode for a virtual-RIP guest is done -- the real Linux 6.12
+  kernel now boots observably through end-of-initcalls, binding its AHCI
+  driver to our controller. The remaining blocker is **M4-6b** (a working
+  clockevent: the kernel idle-HLTs before `/init` because it runs in a
+  degraded platform -- no real-time timebase, ACPI interpreter disabled,
+  IO-APIC skipped). M4-6b and M4-6d are now decomposed into M4-6b1..b4
+  and M4-6d1..d3 below; the ordering is roughly
+  M4-6b1 -> M4-6b2 -> M4-6b3 -> M4-6b4 -> M4-6d1 -> M4-6d2 -> M4-6d3.
 
   *Scoping this task out (2026-07-14) surfaced that "boot a stock
   Linux ISO through GRUB" actually needs ~7 substantial new subsystems
@@ -1081,8 +1086,42 @@ tasks — see updated deps below.*
   kernel accepts (real LAPIC/IO-APIC entries), an IO-APIC model,
   real-time-proportional PIT/TSC, and either LAPIC-timer or PIT-IRQ0
   clockevent delivery through it. This is a multi-part platform-
-  emulation milestone, not a single fix -- decompose further when
-  picked up.* Deps: M4-6a.
+  emulation milestone, decomposed into M4-6b1..b4 below.* Deps: M4-6a.
+
+- [ ] **M4-6b1** — Real-time-proportional guest timebase. Today the FW-1
+  loop ticks the guest PIT/LAPIC-timer once per VM-exit, unrelated to
+  real time, so the kernel's `tsc: Fast TSC calibration using PIT`
+  measures a nonsense ~17 GHz and every timer calibrated against it is
+  unusable. Drive the guest PIT counters (and the LAPIC-timer count)
+  from real elapsed host TSC instead: the loop reads `rdtsc`, and ticks
+  each guest counter by (elapsed_host_tsc / a fixed ratio) so guest
+  PIT/LAPIC time is a stable fraction of the TSC the guest reads
+  natively. Then the kernel's PIT-based TSC calibration lands near the
+  real CPU frequency and a LAPIC-timer calibration against it is sane.
+  The pure PIT/LAPIC models already take a caller-driven cadence (see
+  their headers); this changes only what cadence FW-1 feeds them.
+  Deps: M4-6a.
+- [ ] **M4-6b2** — ACPI MADT/tables the kernel keeps enabled. M4-4's
+  hardware-reduced FADT + header-only DSDT make Linux print
+  `ACPI: Interpreter disabled` / `PnP ACPI: disabled`, leaving it with
+  no ACPI-described interrupt controllers. Extend devices/acpi.* to emit
+  a MADT with real Local-APIC + IO-APIC entries (and interrupt-source
+  overrides) and a DSDT with enough valid AML that Linux keeps the
+  interpreter enabled and enumerates the platform. Deps: M4-4.
+- [ ] **M4-6b3** — IO-APIC device model. Linux logs "Not enabling
+  interrupt remapping due to skipped IO-APIC setup"; with no IO-APIC it
+  cannot route legacy IRQs (the PIT's IRQ0 timer, the AHCI IRQ, ...).
+  Emulate a minimal IO-APIC (MMIO window at 0xFEC00000: IOREGSEL/IOWIN,
+  the redirection-table entries) so the guest can program IRQ routing,
+  and deliver routed IRQs to the guest LAPIC via the INT-1/INT-2 path.
+  Deps: M4-6b2.
+- [ ] **M4-6b4** — Clockevent IRQ delivery. Deliver the kernel's chosen
+  periodic timer interrupt at the (now real-time) calibrated cadence:
+  extend FW-1b's guest LAPIC timer to fire off the real-time count
+  (M4-6b1) at the guest-programmed vector, and/or deliver PIT IRQ0
+  through the PIC/IO-APIC (M4-6b3), so the scheduler tick actually fires
+  and the kernel advances past end-of-initcalls to "Run /init".
+  Deps: M4-6b1, M4-6b3.
 - [x] **M4-6c** — Kernel console visibility. DONE + verified: the Linux
   kernel's own dmesg flows to hype's forwarded console. No hype code
   change was needed -- FW-1e's guest COM1 UART model already serves the
@@ -1098,14 +1137,34 @@ tasks — see updated deps below.*
   network/crypto init, "Unpacking initramfs" -- through end of
   do_initcalls. (A stock installer that already sets console=ttyS0, or a
   build-time remaster step, avoids the manual ISO edit.) Deps: M4-6a.
-- [ ] **M4-6d** — Root/initramfs handoff to userspace: the Alpine virt
-  initramfs is loaded by GRUB into guest RAM (no disk needed for it), so
-  the kernel should unpack it and run `/init`; drive whatever remaining
-  device/timer/console gaps that exercises up to a visible userspace
-  prompt (the true "end-to-end" bar). Larger installer ISOs that stream
-  from the CD instead of a GRUB-loaded initramfs additionally need the
-  block-read-at-scale path -- overlaps M5.
-  Deps: M4-6b, M4-6c.
+- [ ] **M4-6d** — Root/initramfs handoff to userspace. The AHCI MMIO
+  decode for a virtual-RIP guest is DONE (091ccaa) -- the kernel probes
+  and binds the emulated AHCI controller ("ata1: SATA ... abar
+  m4096@0x80000000"). Reaching a userspace prompt is gated on M4-6b (a
+  working clockevent so the scheduler runs `/init`) and then the block/
+  rootfs path; decomposed into M4-6d1..d3 below. Deps: M4-6b, M4-6c.
+
+- [ ] **M4-6d1** — Kernel reaches and runs `/init`. Once M4-6b gives a
+  working clockevent, confirm the GRUB-loaded initramfs unpacks and the
+  kernel execs `/init` (Alpine's initramfs is in RAM, so no disk needed
+  for this step), handling whatever early userspace touches (devtmpfs,
+  proc/sys, the module loads named on the cmdline: loop, squashfs,
+  sd-mod). Observable now that the console is visible (M4-6c).
+  Deps: M4-6b4, M4-6c.
+- [ ] **M4-6d2** — Block reads at scale for the rootfs mount. Alpine's
+  `/init` mounts the squashfs rootfs from the CD via libata ->
+  ScsiDisk -> our AHCI/ATAPI model, at scale (many READ(10)s over a
+  ~60MB image). This likely needs real AHCI completion-INTERRUPT
+  delivery (PxIS + the HBA IRQ routed through the IO-APIC) rather than
+  the pure-polling path M4-5/FW-1h use, plus sustained correctness under
+  the kernel's own queueing. Bounds-checking already applied (VALID-3).
+  Deps: M4-6d1, M4-6b3.
+- [ ] **M4-6d3** — Userspace login prompt. Drive the remaining device/
+  console gaps until Alpine's OpenRC/init brings up an interactive login
+  prompt on ttyS0 -- the true end-to-end bar for M4-6. Larger installer
+  ISOs that stream from the CD (rather than a GRUB-loaded initramfs)
+  exercise the same M4-6d2 block path harder; a from-disk install is
+  M5's job. Deps: M4-6d2.
 
 ---
 
