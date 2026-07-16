@@ -298,6 +298,36 @@ multi-VM concurrency milestone, even though early single-guest milestones
   separate from the QEMU-side M4-6d2 libata-probe stall, and needs its
   own FW-1-loop instrumentation on the AMD box. See M4-6 / M4-6d.*
 
+- [ ] **VMX-1** — VMX vcpu_create + vcpu_run VM-entry/exit trampoline.
+  The Intel counterpart of SVM's hype_svm_vcpu_run, deferred since M2-7
+  because it needs real Intel HW to develop (vmx_ops.c's own comment;
+  now unblocked -- VMXON validated on real Intel, M2-8). Scope: (a)
+  vcpu_create -- finish the guest+host VMCS state (vmcs_hw.c already
+  builds much of it; host RIP/RSP currently point at a halt stub) so a
+  guest is launchable; (b) a hand-written VM-entry/exit asm trampoline
+  (VMLAUNCH first entry, VMRESUME after) that saves/restores host GPRs
+  around the transition and, because the CPU jumps to VMCS HOST_RIP on
+  #VMEXIT (not "the next instruction" like SVM's VMRUN), re-enters C at a
+  known point -- analogous to isr_stubs.S but for the VMX control-
+  transfer model; (c) populate hype_vmexit_info_t from the VMCS
+  (exit reason/qualification/guest-RIP/instruction-length via VMREAD).
+  Ground it in the archived Intel SDM Vol 3C (VMCS fields, VM-entry/exit
+  behaviour, App B field encodings). Develop via the USB build-and-report
+  loop on the Intel box (screen-visible checkpoints, same as M2-8).
+  Deps: M2-8 (VMXON validated on Intel), M2-3.
+- [ ] **VMX-2** — Un-gate the M2-M4-5 test guests on VMX + port the guest
+  handlers to read the VMCS. Every run_*_test has an `if (kind != SVM)
+  return;` guard and the handlers (hype_svm_vcpu_handle_ioio/npf/cpuid/
+  msr/ahci_npf, request_interrupt) read VMCB fields. Add the VMX
+  equivalents (EPT for NPF, exit-qualification/instruction-info decode,
+  VM-entry interruption-info for injection) so the same guests run on
+  VMX. Most of this is writable + unit-testable WITHOUT Intel HW; only
+  the run validation needs the box. Deps: VMX-1.
+- [ ] **VMX-3** — Real Intel HW validation of VMX-1/VMX-2: the M2-M4-5
+  guest set runs on the Intel box, reaching AMD's M2-8 parity (currently
+  only VMXON-enable + the vendor-neutral runtime path are Intel-
+  validated). Deps: VMX-2, M2-8.
+
 ---
 
 ## M3 — EPT + first real guest boot (plan.md §9 M3)
