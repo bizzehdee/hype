@@ -286,17 +286,39 @@ multi-VM concurrency milestone, even though early single-guest milestones
   trampoline so guests actually launch (bigger piece; needs a longer HW
   window).*
 
-  *REAL-AMD M4-6 finding 2026-07-16: with a real AMD box, FW-1 was run
-  END-TO-END on hardware for the first time (M2-8's AMD pass only covered
-  M2-M4-5). hype's full self-test output appears, then the guest OVMF
-  (inside FW-1) reaches the UEFI Shell's "Press ESC in 5 seconds to skip
-  startup.nsh" countdown and HANGS after the 5s -- it drops to the shell
-  instead of booting the CD -> GRUB -> Linux the way it does under QEMU.
-  So on real AMD the guest firmware boots but diverges from the QEMU BDS
-  path (doesn't auto-boot the emulated CD, or the FW-1 loop stalls once
-  OVMF is at the shell). This is the M4-6 frontier on real hardware --
-  separate from the QEMU-side M4-6d2 libata-probe stall, and needs its
-  own FW-1-loop instrumentation on the AMD box. See M4-6 / M4-6d.*
+  *REAL-AMD FW-1 finding 2026-07-16 -- RESOLVED, NOT A BUG (and a big
+  validation win). FW-1 was run end-to-end on a real AMD box (ASUS
+  VivoBook) for the first time (M2-8's AMD pass only covered M2-M4-5).
+  Initial symptom: the guest OVMF reaches the UEFI Shell "Press ESC in
+  5s to skip startup.nsh" prompt and appears to hang. A compact
+  diagnostic build (commit 4d07a8e: decode-assist one-shot + ATAPI
+  command/READ(10) counters surfaced as FW-1 milestones) showed on the
+  metal:
+    - "1st ATAPI READ(10) done -- CD data I/O works on real HW",
+      READ(10) count climbing to 64+ (cmds=197) -- **the whole FW-1
+      AHCI/ATAPI CD-read path works on real AMD, including the
+      decode-assist MMIO decode that QEMU+KVM nested SVM never exercises
+      (num_bytes_fetched is always 0 under QEMU).** This validates M4-5/
+      ISO-2/FW-1h + the AHCI MMIO decode on real AMD silicon.
+    - "BdsDxe: loading/starting Boot0002 UEFI HYPE VIRTUAL CD-ROM" then
+      "UEFI Interactive Shell v2.2" + "FS0: .../CDROM(0x0)". OVMF
+      correctly read + booted the CD; it lands in a shell because the
+      disc IS a shell: tools/make-usb-package.sh defaults
+      TEST_ISO=/usr/share/edk2/ovmf/UefiShell.iso (the 2.8MB ISO ISO-1
+      reported: "read a real 2895872-byte ISO9660 image"), NOT the ~64MB
+      Alpine ISO used in QEMU. So "drops to shell" = booted the shell ISO
+      as designed.
+    - It then panicked "exceeded 200000000 VM-exits ... guest stuck
+      (reason=0x78 HLT)". Also expected: the UEFI shell busy-polls the
+      keyboard (productive IOIO exits), so the 10s wall-clock idle-giveup
+      (M4-6d2b) never triggers and the run hits the MAX_EXITS runaway
+      guard. Correct guard behaviour for a guest that never progresses.
+  CONCLUSION: no hype bug -- FW-1 works on real AMD; it was booting the
+  wrong (shell) ISO. NEXT: rebuild the USB with the full Alpine ISO
+  (TEST_ISO=<alpine>.iso tools/make-usb-package.sh) and watch the real
+  Linux boot on real AMD -- the first chance to see whether M4-6d's
+  QEMU-side stall (M4-6d2's libata async-probe plateau) reproduces on
+  real AMD or behaves differently (real decode assists + real timing).*
 
 - [ ] **VMX-1** — VMX vcpu_create + vcpu_run VM-entry/exit trampoline.
   The Intel counterpart of SVM's hype_svm_vcpu_run, deferred since M2-7

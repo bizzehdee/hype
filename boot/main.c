@@ -4854,7 +4854,8 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                 hype_debug_print("fw-1 DIAG: guest issued 1st ATAPI CDB (opcode=0x%x)\n",
                                                   (unsigned int)g_fw_1_atapi.last_cdb);
                             }
-                            if (g_fw_1_atapi.read10_count == 1 && last_reported_reads == 0) {
+                            if (g_fw_1_atapi.read10_count >= 1 && last_reported_reads == 0) {
+                                last_reported_reads = 1; /* latch: fire once, not per-MMIO-access */
                                 hype_debug_print("fw-1 DIAG: 1st ATAPI READ(10) done -- CD data I/O "
                                                   "works on real HW (cmds=%u)\n",
                                                   (unsigned int)g_fw_1_atapi.command_count);
