@@ -1274,13 +1274,15 @@ tasks — see updated deps below.*
   working clockevent so the scheduler runs `/init`) and then the block/
   rootfs path; decomposed into M4-6d1..d3 below. Deps: M4-6b, M4-6c.
 
-- [ ] **M4-6d1** — Kernel reaches and runs `/init`. Once M4-6b gives a
-  working clockevent, confirm the GRUB-loaded initramfs unpacks and the
-  kernel execs `/init` (Alpine's initramfs is in RAM, so no disk needed
-  for this step), handling whatever early userspace touches (devtmpfs,
-  proc/sys, the module loads named on the cmdline: loop, squashfs,
-  sd-mod). Observable now that the console is visible (M4-6c).
-  Deps: M4-6b4, M4-6c.
+- [x] **M4-6d1** — Kernel reaches and runs `/init`. DONE 2026-07-16.
+  Confirmed on the forwarded console: "Freeing unused kernel image (initmem)
+  memory" -> "Run /init as init process" -> "squashfs: version 4.0" ->
+  Alpine's initramfs "Mounting boot media..." -> "sr 0:0:0:0: [sr0]" ->
+  "Mounting boot media: ok." Reaching this took the M4-6d2 fixes below
+  (the STI;HLT timer-wedge fix that lets the async libata probe complete,
+  and processing every AHCI command slot so the scsi scan finishes) --
+  without them the kernel never left async_synchronize_full. Deps: M4-6b4,
+  M4-6c.
 
   *Diagnostic findings (2026-07-16), NOT yet [x]: with the clockevent
   live (M4-6b4), a long instrumented run shows the kernel now drives the
@@ -1471,6 +1473,30 @@ tasks — see updated deps below.*
   WARN gone/interrupt mode), INT diag counters + deliver_pending_if_ready
   (this commit). The AHCI-completion IRQ path is correct and ready; it's
   gated behind fixing this timer-IRQ wedge so the probe can progress.*
+
+  *BREAKTHROUGH 2026-07-16/17 -- two fixes cleared the probe/scan and the
+  boot reached userspace:
+    1. STI;HLT interrupt-shadow timer wedge (commit 317026f): the wedge
+       dump (IF=1, interrupt_shadow=0x1, can_accept=0, timer vec pending,
+       ISR stuck) showed Linux idle/msleep does `sti; hlt`; intercepting
+       the HLT before it retired left the STI shadow set forever, blocking
+       the timer -> jiffies frozen -> libata's post-COMRESET msleep hung.
+       Fix: hype_svm_vcpu_wake_hlt() retires the HLT (RIP+1) + clears the
+       shadow when delivering the waking IRQ. Result: probe completes --
+       "ata1: SATA link up", ATAPI IDENTIFY, PxIE set, AHCI IRQs firing.
+    2. Multi-slot AHCI commands (commit 8fbac6d): the handler only ran the
+       slot-0 command; libata cycles slots by tag and issued slot 1
+       (PxCI=0x2) -> never executed -> scsi scan blocked. Fix:
+       process_ahci_command_slot(slot), caller loops over every set PxCI
+       bit. Result: scan completes, "Run /init", "sr0", "Mounting boot
+       media: ok." -- M4-6d1 done, block/mount path works.
+  So M4-6d2's block-reads-at-scale is essentially working (reads to 193,
+  CD mounted). NEW stall (the next frontier, ~M4-6d3): the boot now reaches
+  Alpine's "Installing packages to root filesystem..." then stalls -- reads
+  frozen at 193, guest busy (no idle give-up) but no console progress for
+  minutes. Next: trace what the guest does in that phase (a specific
+  command/port it spins on, or a still-missing device) -- distinct from the
+  now-fixed probe/scan path.*
 
   *Building blocks landed (2026-07-16, commit aa40591), inert until the
   loop wiring is made safe:*
