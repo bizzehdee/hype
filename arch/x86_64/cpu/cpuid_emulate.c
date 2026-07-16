@@ -2,6 +2,7 @@
 
 #define HYPE_CPUID_HYPERVISOR_PRESENT_BIT (1u << 31)
 #define HYPE_CPUID_LEAF1_EDX_MTRR_BIT (1u << 12)
+#define HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT (1u << 24)
 #define HYPE_CPUID_EXT1_ECX_SVM_BIT (1u << 2)
 
 static void zero_result(hype_cpuid_result_t *out) {
@@ -27,7 +28,17 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
         out->eax = real->eax;
         out->ebx = real->ebx;
         out->edx = real->edx & ~HYPE_CPUID_LEAF1_EDX_MTRR_BIT;
-        out->ecx = real->ecx | HYPE_CPUID_HYPERVISOR_PRESENT_BIT;
+        /* Hypervisor-present set; MTRR already cleared above. Also clear
+         * TSC_DEADLINE (ECX bit 24): with it set, a guest OS arms its
+         * LAPIC timer via the IA32_TSC_DEADLINE MSR (0x6e0) -- a mode
+         * this project does not model, so no timer interrupt would ever
+         * fire and the guest's scheduler stalls (a real Linux kernel
+         * idle-HLTs forever right after unpacking its initramfs).
+         * Clearing it makes the guest fall back to the LAPIC timer's
+         * initial-count mode, which FW-1b's guest LAPIC model does drive
+         * and inject. */
+        out->ecx = (real->ecx | HYPE_CPUID_HYPERVISOR_PRESENT_BIT) &
+                   ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT;
         return;
     }
 

@@ -33,7 +33,9 @@ static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
     CHECK_HEX("eax passthrough", real.eax, out.eax);
     CHECK_HEX("ebx passthrough", real.ebx, out.ebx);
     CHECK_HEX("hypervisor-present bit forced set", 1, (out.ecx & (1u << 31)) != 0);
-    CHECK_HEX("ecx otherwise passthrough", real.ecx | (1u << 31), out.ecx);
+    CHECK_HEX("TSC_DEADLINE bit forced clear", 0, (out.ecx & (1u << 24)) != 0);
+    /* ecx = real | hypervisor-present, minus the TSC_DEADLINE bit. */
+    CHECK_HEX("ecx otherwise passthrough", (real.ecx | (1u << 31)) & ~(1u << 24), out.ecx);
     CHECK_HEX("MTRR bit forced clear", 0, (out.edx & (1u << 12)) != 0);
     CHECK_HEX("edx otherwise passthrough", real.edx & ~(1u << 12), out.edx);
 }

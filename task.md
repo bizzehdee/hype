@@ -1048,21 +1048,39 @@ tasks — see updated deps below.*
   instruction (the kernel runs in virtual address space), addressed in
   the M4-6d/AHCI work.
   Deps: M4-6 infra (done).
-- [ ] **M4-6b** — Guest timer-interrupt delivery at scale: once past
-  calibration the kernel arms the LAPIC timer / PIT and expects periodic
-  IRQs to drive its scheduler and delayed work. FW-1b/INT-2 already
-  inject the guest LAPIC timer vector; confirm it survives real kernel
-  IDT/IRQ setup and that the delivery cadence is right, handling
-  whatever the kernel's clockevent/clocksource selection touches.
-  Deps: M4-6a.
-- [ ] **M4-6c** — Kernel console visibility: get the kernel's own
-  console output onto hype's forwarded console so boot is observable and
-  driveable. Confirm the GRUB `linux` cmdline routes to a device FW-1
-  surfaces (COM1 `console=ttyS0` -> FW-1e's guest UART is the likely
-  path; else the kernel logs only to a framebuffer/tty0 we don't yet
-  render). May need appending a console= arg or handling the kernel's
-  8250 probe/divisor writes.
-  Deps: M4-6a.
+- [~] **M4-6b** — Guest timer-interrupt delivery at scale (the current
+  M4-6 blocker). IN PROGRESS. Fixed one half: dmesg showed "TSC deadline
+  timer available", so the kernel armed its LAPIC timer via the
+  IA32_TSC_DEADLINE MSR (0x6e0) -- a mode this project doesn't model, so
+  no tick ever fired. cpuid_emulate.c now clears CPUID leaf-1 ECX bit 24
+  (TSC_DEADLINE) so the guest falls back to the LAPIC timer's initial-
+  count mode that FW-1b drives+injects (unit test updated; UefiShell
+  unaffected). Remaining: the kernel still idle-HLTs at the end of
+  do_initcalls (~0.13s guest-time, right before "Run /init") waiting for
+  a working clockevent to schedule its init thread. FW-1b's LAPIC timer
+  is a fixed synthetic per-exit countdown that does NOT correlate with
+  the PIT/TSC the kernel calibrates it against, so the kernel's LAPIC-
+  timer calibration likely computes an unusable rate (or the fixed
+  cadence doesn't match its expectation) and the scheduler never
+  advances to userspace. The genuinely hard part: a calibratable,
+  real-time-proportional guest timer (LAPIC timer count decrementing at
+  a rate consistent with the guest's TSC/PIT reads), and/or PIT-IRQ0
+  clockevent delivery. Deps: M4-6a.
+- [x] **M4-6c** — Kernel console visibility. DONE + verified: the Linux
+  kernel's own dmesg flows to hype's forwarded console. No hype code
+  change was needed -- FW-1e's guest COM1 UART model already serves the
+  kernel's 8250 driver correctly (the kernel programs it and its output
+  appears). The only requirement is the guest kernel cmdline routing to
+  ttyS0: Alpine's stock cmdline is `... quiet` with no console=, so its
+  dmesg goes to tty0 (a framebuffer we don't render). Confirmed by
+  remastering the test ISO with `xorriso ... -update grub.cfg` to a
+  cmdline of `console=ttyS0,115200 earlyprintk=serial,ttyS0,115200` (no
+  quiet): full boot log now visible -- "Linux version 6.12.81-0-virt",
+  the e820 map matching FW-1's, clocksource setup, AHCI driver binding
+  our controller ("ata1: SATA ... abar m4096@0x80000000"), i8042 probe,
+  network/crypto init, "Unpacking initramfs" -- through end of
+  do_initcalls. (A stock installer that already sets console=ttyS0, or a
+  build-time remaster step, avoids the manual ISO edit.) Deps: M4-6a.
 - [ ] **M4-6d** — Root/initramfs handoff to userspace: the Alpine virt
   initramfs is loaded by GRUB into guest RAM (no disk needed for it), so
   the kernel should unpack it and run `/init`; drive whatever remaining
