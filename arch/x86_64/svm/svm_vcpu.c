@@ -931,9 +931,10 @@ static uint64_t ahci_dma_xlate(const hype_gpa_map_t *dma_map, uint64_t gpa, uint
  * is "one ATAPI CD-ROM," never a raw ATA disk on this port, so
  * anything else is fail-closed rather than guessed at, matching every
  * other MMIO/NPF handler's convention here. */
-static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi,
-                                       const hype_gpa_map_t *dma_map) {
-    uint64_t cmd_list_phys = (uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32);
+static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                      const hype_gpa_map_t *dma_map, unsigned slot) {
+    uint64_t cmd_list_phys =
+        ((uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32)) + (uint64_t)slot * 32u;
     uint64_t rx_fis_phys = (uint64_t)ahci->p_fb | ((uint64_t)ahci->p_fbu << 32);
     uint8_t *cmd_hdr_bytes;
     hype_ahci_cmd_header_t hdr;
@@ -1114,7 +1115,7 @@ static int process_ahci_command_slot0(hype_ahci_t *ahci, hype_atapi_t *atapi,
     d2h_fis[2] = status_reg;
     d2h_fis[3] = error_reg;
 
-    ahci->p_ci &= ~0x1u; /* slot 0 complete */
+    ahci->p_ci &= (uint32_t)~(1u << slot); /* this slot complete */
     /* Completion interrupt-status bit (PxIS.DHRS for D2H completions,
      * PxIS.PSS for PIO-in). A guest that polls waits on this directly;
      * one that took the interrupt-driven path (M4-6d2) enabled PxIE, so
@@ -1193,9 +1194,19 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
         if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
             return -1;
         }
-        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
-            if (process_ahci_command_slot0(ahci, atapi, dma_map) != 0) {
-                return -1;
+        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && ahci->p_ci != 0) {
+            /* The guest issues a command by setting that slot's PxCI bit;
+             * libata cycles command slots by tag, so it is NOT always slot
+             * 0 (a slot-1 command was exactly what stalled the CD-ROM scan
+             * -- M4-6d2). Process every issued slot, lowest first; each
+             * clears its own PxCI bit. */
+            unsigned slot;
+            for (slot = 0; slot < 32u; slot++) {
+                if ((ahci->p_ci & (1u << slot)) != 0) {
+                    if (process_ahci_command_slot(ahci, atapi, dma_map, slot) != 0) {
+                        return -1;
+                    }
+                }
             }
         }
     } else {
