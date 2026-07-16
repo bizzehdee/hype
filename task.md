@@ -1305,6 +1305,41 @@ tasks — see updated deps below.*
     raised-limit TEMP-DIAG run confirmed that with more tolerance the
     probe completes and the rootfs reads proceed, then plateaus deeper.)
   Deps: M4-6d2 (building blocks).
+- [x] **M4-6d2b** — Booting-OS-appropriate FW-1 loop exit. DONE
+  (2026-07-16). Replaced the OVMF-tuned give-up test
+  (`total_exits - inject_total >= HYPE_FW_1_KEY_WAIT_EXITS`, which
+  measured from the OVMF-prompt keystroke and so fired on a booting
+  kernel's very first idle-HLT -- long after the key) with a WALL-CLOCK
+  idle detector: track `last_progress_tsc` (host TSC of the last
+  productive, non-HLT exit) and stop only after
+  `HYPE_FW_1_IDLE_GIVEUP_SECONDS` (10s) of real time with zero productive
+  work -- a genuine stable idle (a prompt) or a true hang. An exit count
+  can't be used: the HLT/VMRUN idle-spin rate is far too high/variable.
+  Also raised `HYPE_FW_1_MAX_EXITS` 5M -> 200M (last-resort ceiling for
+  real HW; the wall-clock idle detector + `make run` timeout are the
+  primary stops). Falls back to the old exit-count test if TSC
+  calibration was unavailable. Verified: clean build; the FW-1 run now
+  runs the kernel to a genuine 10s stable idle then exits cleanly
+  ("real OVMF BOOTED + INTERACTIVE ... 41829 chars", PIT IRQ0 IRQs=41,
+  host_tsc_hz calibrated) and the harness proceeds to later test guests
+  -- OVMF + every other guest unaffected. Deps: M4-6b4.
+
+  *What it revealed (feeds M4-6d2 step 1): even with the loop no longer
+  cutting it off, the kernel plateaus at the SAME point -- last dmesg
+  `Key type fscrypt-provisioning registered` (end of do_initcalls), then
+  it idle-HLTs and the 10s detector fires. The idle detector firing
+  proves the kernel is genuinely QUIESCENT there, i.e. the async libata
+  probe (awaited by `async_synchronize_full()` right after
+  do_initcalls) is BLOCKED, not slow: a progressing probe polls PxCI/
+  PxSSTS (productive exits) which would keep resetting the idle timer.
+  Yet the raised-limit TEMP-DIAG run (AHCI trace ON) DID complete the
+  probe + reads -- so probe completion is timing-sensitive/racy (or the
+  earlier run was a non-flaky instance). Two confounds to separate in
+  M4-6d2: (a) the probe stall itself; (b) intermittent nested-SVM-under-
+  QEMU flakiness -- across this session's FW-1 boots one segfaulted and
+  one failed TSC calibration ("Unable to calibrate against PIT") while
+  others booted clean, so a real-hardware run (AGENTS.md gate) is needed
+  to tell a hype bug from an emulation artifact.*
 - [ ] **M4-6d3** — Userspace login prompt. Drive the remaining device/
   console gaps until Alpine's OpenRC/init brings up an interactive login
   prompt on ttyS0 -- the true end-to-end bar for M4-6. Larger installer

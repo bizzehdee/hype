@@ -260,10 +260,26 @@ static uint64_t g_fw_1_host_tsc_hz;
  * bring-up test cleanly. Comfortably below the observed count and far
  * above any early boot activity (which does not HLT). */
 #define HYPE_FW_1_BOOTED_EXITS 1500ULL
-/* Runaway guard: if the guest neither makes progress nor reaches a
- * stable idle within this many exits, something is wrong -- fail loudly
- * instead of spinning forever (e.g. an early HLT with no timer). */
-#define HYPE_FW_1_MAX_EXITS 5000000ULL
+/* Runaway guard: last-resort ceiling on total VM-exits. Raised for the
+ * M4-6 OS-boot case -- a real kernel booting under nested emulation does
+ * far more than the ~5M an OVMF bring-up needed (initcalls, the libata
+ * probe, unpacking + reading the rootfs at scale all run for tens of
+ * millions of exits). The PRIMARY stop for a booting OS is the
+ * wall-clock idle detector (HYPE_FW_1_IDLE_GIVEUP_SECONDS) below and, in
+ * QEMU, the `make run` timeout; this ceiling only catches a true runaway
+ * on real hardware where neither of those applies. */
+#define HYPE_FW_1_MAX_EXITS 200000000ULL
+/* M4-6d2b: a booting OS legitimately idle-HLTs for real-time stretches
+ * (e.g. libata's COMRESET + ATA reset delay, waiting on the clockevent)
+ * -- that is NOT a hang, unlike OVMF which only HLTs once booted. So the
+ * "guest is quiescent, stop" decision is made on WALL-CLOCK time since
+ * the last productive (non-HLT) exit, not on an exit count: the HLT/VMRUN
+ * idle spin rate is far too high and variable to threshold by count. If
+ * the guest does zero productive work for this many seconds it has either
+ * reached a stable idle (a login/shell prompt) or genuinely hung -- stop
+ * and report either way. Comfortably longer than any single in-boot wait,
+ * bounded so a run doesn't burn minutes idling at the end. */
+#define HYPE_FW_1_IDLE_GIVEUP_SECONDS 10ULL
 /* FW-1f: evidence-based reaction detection for an injected keystroke.
  * "Reacted" = OVMF leaves its idle wait and does at least this many
  * PRODUCTIVE (non-HLT) exits after the key -- entering the Boot Manager
@@ -4598,6 +4614,10 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     /* M4-6b1: drive the guest timebase from real elapsed host TSC. */
     uint64_t tb_last_tsc = hype_rdtsc();
     uint64_t tb_accum = 0; /* fractional-tick carry (units of host TSC * PIT_HZ) */
+    /* M4-6d2b: host TSC of the most recent productive (non-HLT) exit --
+     * "last time the guest did real work". The idle detector measures
+     * wall-clock since this to decide the guest is quiescent. */
+    uint64_t last_progress_tsc = tb_last_tsc;
 
     hype_vt_filter_reset(&uart_filter);
     hype_vt_filter_reset(&uart_filter2);
@@ -4643,6 +4663,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             uint64_t delta = now_tsc - tb_last_tsc;
             uint64_t ticks;
             tb_last_tsc = now_tsc;
+            /* M4-6d2b: any non-HLT exit is the guest doing real work
+             * (MMIO, port I/O, NPF, CPUID/MSR ...) -- mark progress so the
+             * idle detector only fires after a true quiescent stretch. */
+            if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+                last_progress_tsc = now_tsc;
+            }
             if (g_fw_1_host_tsc_hz != 0) {
                 /* Cap the delta at ~1s of TSC so a long CPU-bound guest
                  * stretch can't overflow the * PIT_HZ scaling. */
@@ -5052,11 +5078,25 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 inject_total = total_exits;
                 continue;
             }
-            /* Reaction (OVMF doing real work) is detected at the top of
-             * the loop. Here we only handle the OPPOSITE: the guest keeps
-             * idle-HLTing well past the key with no reaction. Stop
-             * without claiming it advanced. */
-            if (total_exits - inject_total >= HYPE_FW_1_KEY_WAIT_EXITS) {
+            /* M4-6d2b: stop once the guest has been quiescent (no
+             * productive exit) for HYPE_FW_1_IDLE_GIVEUP_SECONDS of real
+             * time -- it has reached a stable idle (OVMF at its prompt, or
+             * a booted OS at a login/shell prompt) or genuinely hung. This
+             * replaces the old "exits since the injected key" test, which
+             * measured from the OVMF-prompt keystroke and so fired on a
+             * booting kernel's very first idle-HLT (it legitimately idles
+             * for real-time stretches on the async libata probe, long
+             * after the key). Measuring wall-clock since the last
+             * productive exit lets the kernel's probe/init proceed while
+             * still catching a true stall. Falls back to the exit-count
+             * test if TSC calibration was unavailable. */
+            if (g_fw_1_host_tsc_hz != 0) {
+                if (tb_last_tsc - last_progress_tsc >=
+                    HYPE_FW_1_IDLE_GIVEUP_SECONDS * g_fw_1_host_tsc_hz) {
+                    booted = 1;
+                    break;
+                }
+            } else if (total_exits - inject_total >= HYPE_FW_1_KEY_WAIT_EXITS) {
                 booted = 1;
                 break;
             }
