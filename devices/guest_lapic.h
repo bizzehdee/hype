@@ -103,6 +103,20 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
 void hype_guest_lapic_tick(hype_guest_lapic_t *lapic);
 
 /*
+ * Advances the timer by `ticks` timer-clock cycles in one O(1) step --
+ * the real-time-proportional form of hype_guest_lapic_tick() for M4-6b1,
+ * where the FW-1 loop advances the LAPIC timer by the same real-elapsed
+ * tick count it advances the PIT. When armed+unmasked, decrements
+ * current_count by `ticks`; when the count reaches terminal, sets
+ * timer_irq_pending (periodic -> reloads from init_count keeping phase;
+ * one-shot -> stays at 0). Because current_count now moves at the same
+ * real rate as the PIT, a guest that calibrates the LAPIC timer against
+ * the PIT/TSC gets a consistent, usable frequency and its programmed
+ * initial count fires at the real rate it intended.
+ */
+void hype_guest_lapic_advance(hype_guest_lapic_t *lapic, uint64_t ticks);
+
+/*
  * If a timer IRQ is due and none is currently in service, returns 1 and
  * writes the timer vector (LVT_TIMER bits 7:0) to *vector_out, marking
  * it in-service and clearing the pending flag. Otherwise returns 0. A

@@ -167,6 +167,35 @@ void hype_pit_emu_tick(hype_pit_emu_t *pit) {
     }
 }
 
+void hype_pit_emu_advance(hype_pit_emu_t *pit, uint64_t ticks) {
+    int i;
+    if (ticks == 0) {
+        return;
+    }
+    for (i = 0; i < 3; i++) {
+        hype_pit_emu_channel_t *ch = &pit->channels[i];
+        if (ch->mode == 2u || ch->mode == 3u) {
+            /* Periodic: the counter cycles within [1, reload]. A 0 reload
+             * means the full 65536-count period. */
+            uint32_t period = (ch->reload != 0u) ? (uint32_t)ch->reload : 0x10000u;
+            uint32_t cur = (ch->counter != 0u) ? (uint32_t)ch->counter : period;
+            uint32_t step = (uint32_t)(ticks % period);
+            cur = (step < cur) ? (cur - step) : (period - (step - cur));
+            ch->counter = (uint16_t)cur;
+        } else {
+            /* One-shot (modes 0/1/4/5): counts down to 0 and stops. */
+            if (ticks >= (uint64_t)ch->counter) {
+                ch->counter = 0;
+                if (i == 2 && ch->mode == 0u) {
+                    pit->ch2_out = 1;
+                }
+            } else {
+                ch->counter = (uint16_t)((uint64_t)ch->counter - ticks);
+            }
+        }
+    }
+}
+
 void hype_pit_emu_port61_write(hype_pit_emu_t *pit, uint8_t value) {
     pit->port61 = (uint8_t)(value & HYPE_PIT_PORT61_WRITABLE);
 }

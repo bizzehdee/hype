@@ -201,6 +201,14 @@ static hype_atapi_t g_fw_1_atapi;
 /* VALID-1/VALID-3: FW-1's guest-physical -> host layout (RAM + flash),
  * used to bounds-check every guest-supplied AHCI DMA address. */
 static hype_gpa_map_t g_fw_1_dma_map;
+/* M4-6b1: measured real host TSC frequency (Hz), calibrated once in
+ * efi_main via a Boot-Services Stall. The FW-1 loop converts real TSC
+ * deltas into guest PIT/LAPIC-timer ticks at the 8254's 1.193182 MHz
+ * so the guest's TSC/timer calibration lands at the true CPU frequency
+ * instead of a nonsense value. 0 until calibrated (loop then falls back
+ * to a single tick per exit). */
+static uint64_t g_fw_1_host_tsc_hz;
+#define HYPE_PIT_HZ 1193182ULL
 /* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
  * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
  * guest-physical address in the 32-bit PCI MMIO aperture, and enables
@@ -448,6 +456,14 @@ static void hype_write_le32(unsigned char *dst, uint32_t value) {
 static void hype_write_le16(unsigned char *dst, uint16_t value) {
     dst[0] = (unsigned char)(value & 0xFFu);
     dst[1] = (unsigned char)((value >> 8) & 0xFFu);
+}
+
+/* M4-6b1: the real host TSC, for driving the guest timebase from real
+ * elapsed time rather than one tick per VM-exit. */
+static inline uint64_t hype_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
 }
 
 /* Reads back a 4-byte little-endian value a test guest wrote directly
@@ -4577,6 +4593,9 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * ABAR window route to the (RAM-remap-aware) AHCI MMIO handler. */
     int ahci_mapped = 0;
     uint64_t ahci_abar = 0;
+    /* M4-6b1: drive the guest timebase from real elapsed host TSC. */
+    uint64_t tb_last_tsc = hype_rdtsc();
+    uint64_t tb_accum = 0; /* fractional-tick carry (units of host TSC * PIT_HZ) */
 
     hype_vt_filter_reset(&uart_filter);
     hype_vt_filter_reset(&uart_filter2);
@@ -4605,21 +4624,43 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             productive_exits++;
         }
 
-        /* FW-1b: advance the guest LAPIC timer one synthetic tick per
-         * VM-exit; when a timer IRQ comes due, request its delivery via
-         * the INT-1/INT-2 EVENTINJ/VINTR path (delivered on the next
-         * VMRUN, or when a VINTR window opens if the guest can't accept
-         * it yet). OVMF's LocalApicTimerDxe needs these ticks to advance
-         * BDS to the shell. */
-        hype_guest_lapic_tick(&g_fw_1_lapic);
+        /* M4-6b1: advance the guest PIT + LAPIC timer by the number of
+         * 1.193182 MHz ticks that really elapsed since the last exit
+         * (real host TSC delta scaled by PIT_HZ / host_tsc_hz), instead
+         * of a fixed one-tick-per-exit. This makes guest time a stable
+         * fraction of the TSC the guest reads natively, so the kernel's
+         * PIT-based TSC calibration lands at the true CPU frequency and
+         * its LAPIC-timer calibration (against the same timebase) is
+         * consistent -- the prerequisite for a working clockevent. The
+         * fractional remainder is carried in tb_accum so no ticks are
+         * lost to truncation. Falls back to one tick/exit if calibration
+         * was unavailable (host_tsc_hz == 0). When the timer IRQ comes
+         * due, deliver it via the INT-1/INT-2 EVENTINJ/VINTR path. */
+        {
+            uint64_t now_tsc = hype_rdtsc();
+            uint64_t delta = now_tsc - tb_last_tsc;
+            uint64_t ticks;
+            tb_last_tsc = now_tsc;
+            if (g_fw_1_host_tsc_hz != 0) {
+                /* Cap the delta at ~1s of TSC so a long CPU-bound guest
+                 * stretch can't overflow the * PIT_HZ scaling. */
+                if (delta > g_fw_1_host_tsc_hz) {
+                    delta = g_fw_1_host_tsc_hz;
+                }
+                tb_accum += delta * HYPE_PIT_HZ;
+                ticks = tb_accum / g_fw_1_host_tsc_hz;
+                tb_accum -= ticks * g_fw_1_host_tsc_hz;
+            } else {
+                ticks = 1;
+            }
+            if (ticks != 0) {
+                hype_guest_lapic_advance(&g_fw_1_lapic, ticks);
+                hype_pit_emu_advance(&g_fw_1_pit, ticks);
+            }
+        }
         if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
             hype_svm_vcpu_request_interrupt(ctx, timer_vector);
         }
-        /* M4-6a: advance the guest PIT one tick per VM-exit so channel 2
-         * counts down (its OUT pin, read back on port 0x61 bit 5, drives
-         * the Linux kernel's PIT-based TSC/delay calibration out of its
-         * poll spin). */
-        hype_pit_emu_tick(&g_fw_1_pit);
 
         /* FW-1e: surface any console text the guest wrote to either UART.
          * FW-1f uses the emitted-char count as evidence the guest reacted
@@ -5403,6 +5444,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
             g_iso_host_phys = iso_host_phys;
             g_iso_size = iso_size;
+        }
+
+        /* M4-6b1: calibrate the real host TSC frequency once, while Boot
+         * Services (and its Stall) are still available, so the FW-1 guest
+         * can drive its PIT/LAPIC timebase from real elapsed TSC. Stall
+         * busy-waits the given microseconds against the platform timer;
+         * 20 ms is long enough to average out its granularity. TSC is
+         * invariant across cores on any SVM-capable CPU, so a value taken
+         * on the BSP here is valid on the pinned AP the guest runs on. */
+        {
+            /* core/efi_types.h leaves Stall as an untyped void* -- cast
+             * to its real signature: EFI_STATUS (EFIAPI *)(UINTN us). */
+            EFI_STATUS(EFIAPI * stall_fn)(UINTN) =
+                (EFI_STATUS(EFIAPI *)(UINTN))SystemTable->BootServices->Stall;
+            uint64_t t0 = hype_rdtsc();
+            stall_fn(20000);
+            g_fw_1_host_tsc_hz = (hype_rdtsc() - t0) * 50ULL; /* *(1e6/20000) */
+            hype_debug_print("fw-1: host TSC calibrated at %llu Hz (%llu MHz)\n",
+                              (unsigned long long)g_fw_1_host_tsc_hz,
+                              (unsigned long long)(g_fw_1_host_tsc_hz / 1000000ULL));
         }
 
         args.ops = ops;

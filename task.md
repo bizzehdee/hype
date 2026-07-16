@@ -1088,19 +1088,24 @@ tasks — see updated deps below.*
   clockevent delivery through it. This is a multi-part platform-
   emulation milestone, decomposed into M4-6b1..b4 below.* Deps: M4-6a.
 
-- [ ] **M4-6b1** — Real-time-proportional guest timebase. Today the FW-1
-  loop ticks the guest PIT/LAPIC-timer once per VM-exit, unrelated to
-  real time, so the kernel's `tsc: Fast TSC calibration using PIT`
-  measures a nonsense ~17 GHz and every timer calibrated against it is
-  unusable. Drive the guest PIT counters (and the LAPIC-timer count)
-  from real elapsed host TSC instead: the loop reads `rdtsc`, and ticks
-  each guest counter by (elapsed_host_tsc / a fixed ratio) so guest
-  PIT/LAPIC time is a stable fraction of the TSC the guest reads
-  natively. Then the kernel's PIT-based TSC calibration lands near the
-  real CPU frequency and a LAPIC-timer calibration against it is sane.
-  The pure PIT/LAPIC models already take a caller-driven cadence (see
-  their headers); this changes only what cadence FW-1 feeds them.
-  Deps: M4-6a.
+- [x] **M4-6b1** — Real-time-proportional guest timebase. DONE +
+  verified: the kernel's `tsc: Fast TSC calibration using PIT` now
+  reports `Detected 3400.812 MHz processor` (matching the host TSC
+  calibrated at 3401 MHz), where it previously measured a nonsense
+  ~17 GHz. efi_main calibrates the real host TSC frequency once via a
+  Boot-Services `Stall(20ms)` (g_fw_1_host_tsc_hz); the FW-1 loop then
+  converts each exit's real host-TSC delta into 1.193182 MHz ticks and
+  advances the guest PIT + LAPIC timer by that many (new
+  hype_pit_emu_advance() / hype_guest_lapic_advance(), the O(1) bulk
+  forms of the per-tick functions; fractional remainder carried so no
+  ticks are lost, delta capped at ~1s to avoid overflow). So guest time
+  is now a stable fraction of the TSC the guest reads natively, making
+  both the PIT-based TSC calibration and any LAPIC-timer calibration
+  accurate and consistent. Unit-tested (test_pit_emu.c + test_guest_lapic.c
+  advance cases). This is the prerequisite for a usable clockevent; it
+  does not by itself reach userspace -- the kernel still idle-HLTs at
+  end-of-initcalls because the clockevent IRQ isn't delivered through a
+  working interrupt path (M4-6b2/b3/b4). Deps: M4-6a.
 - [ ] **M4-6b2** — ACPI MADT/tables the kernel keeps enabled. M4-4's
   hardware-reduced FADT + header-only DSDT make Linux print
   `ACPI: Interpreter disabled` / `PnP ACPI: disabled`, leaving it with

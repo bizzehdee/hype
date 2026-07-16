@@ -291,6 +291,42 @@ static void test_port61_write_masks_to_writable_bits(void) {
     CHECK_HEX("only writable low nibble latched", HYPE_PIT_PORT61_WRITABLE, pit.port61);
 }
 
+/* M4-6b1: bulk advance-by-N, the real-time-proportional tick. */
+static void test_advance_one_shot_ch2_saturates_and_sets_out(void) {
+    hype_pit_emu_t pit;
+    hype_pit_emu_reset(&pit);
+    hype_pit_emu_io_write(&pit, 0x43, 0xb0); /* ch2, mode 0 */
+    hype_pit_emu_io_write(&pit, 0x42, 0x00); /* count = 0x0300 = 768 */
+    hype_pit_emu_io_write(&pit, 0x42, 0x03);
+    CHECK_HEX("counter loaded", 0x0300, pit.channels[2].counter);
+
+    hype_pit_emu_advance(&pit, 300);
+    CHECK_HEX("mid-count decrements by N", 0x0300 - 300, pit.channels[2].counter);
+    CHECK_HEX("OUT still low mid-count", 0, hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_CH2_OUT);
+
+    hype_pit_emu_advance(&pit, 100000); /* far past terminal */
+    CHECK_HEX("one-shot saturates at 0", 0, pit.channels[2].counter);
+    CHECK_HEX("OUT high at terminal count", HYPE_PIT_PORT61_CH2_OUT,
+              hype_pit_emu_port61_read(&pit) & HYPE_PIT_PORT61_CH2_OUT);
+}
+
+static void test_advance_periodic_wraps(void) {
+    hype_pit_emu_t pit;
+    hype_pit_emu_reset(&pit);
+    /* ch0, mode 3 (square wave), reload 1000. */
+    hype_pit_emu_io_write(&pit, 0x43, 0x36); /* ch0, lo/hi, mode 3 */
+    hype_pit_emu_io_write(&pit, 0x40, (uint8_t)(1000 & 0xFF));
+    hype_pit_emu_io_write(&pit, 0x40, (uint8_t)(1000 >> 8));
+    CHECK_HEX("periodic reload loaded", 1000, pit.channels[0].counter);
+
+    hype_pit_emu_advance(&pit, 400);
+    CHECK_HEX("periodic decrements", 600, pit.channels[0].counter);
+    /* Advance 2.5 periods (2500): net -2500 mod 1000 from 600 -> stays in [1,1000]. */
+    hype_pit_emu_advance(&pit, 2500);
+    CHECK_HEX("periodic stays within [1,reload]", 1,
+              (pit.channels[0].counter >= 1 && pit.channels[0].counter <= 1000));
+}
+
 int main(void) {
     test_reset_defaults();
     test_unrecognized_port_rejected();
@@ -311,6 +347,8 @@ int main(void) {
     test_port61_ch2_out_goes_high_at_terminal_count();
     test_port61_refresh_toggles();
     test_port61_write_masks_to_writable_bits();
+    test_advance_one_shot_ch2_saturates_and_sets_out();
+    test_advance_periodic_wraps();
 
     if (failures == 0) {
         printf("all tests passed\n");

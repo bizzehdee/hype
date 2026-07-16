@@ -188,6 +188,55 @@ static void test_all_registers_roundtrip(void) {
     CHECK_HEX("VERSION unchanged after write attempt", HYPE_GUEST_LAPIC_VERSION_VALUE, v);
 }
 
+/* M4-6b1: real-time-proportional advance-by-N. */
+static void test_advance_periodic_fires_at_count(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 32u | HYPE_GUEST_LAPIC_LVT_PERIODIC);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 1000u);
+
+    hype_guest_lapic_advance(&l, 400);
+    CHECK_HEX("current_count decremented by N", 600, l.current_count);
+    CHECK_HEX("no IRQ before terminal count", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
+
+    hype_guest_lapic_advance(&l, 700); /* crosses 0 (600 -> terminal, +100 over) */
+    CHECK_HEX("periodic IRQ fires at terminal count", 1, hype_guest_lapic_take_timer_irq(&l, &vec));
+    CHECK_HEX("fires at the programmed vector", 32u, vec);
+    CHECK_HEX("periodic reloaded near init_count (phase carried)", 900, l.current_count);
+}
+
+static void test_advance_one_shot_fires_once(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 48u); /* one-shot (no PERIODIC bit) */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 500u);
+
+    hype_guest_lapic_advance(&l, 10000); /* far past terminal */
+    CHECK_HEX("one-shot IRQ fires", 1, hype_guest_lapic_take_timer_irq(&l, &vec));
+    CHECK_HEX("one-shot count stays at 0", 0, l.current_count);
+    /* After EOI, a one-shot at terminal does not re-fire. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+    hype_guest_lapic_advance(&l, 10000);
+    CHECK_HEX("one-shot does not re-fire", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
+}
+
+static void test_advance_masked_or_disarmed_never_fires(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 32u | HYPE_GUEST_LAPIC_LVT_MASKED);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 100u);
+    hype_guest_lapic_advance(&l, 100000);
+    CHECK_HEX("masked timer never fires under advance", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 32u); /* armed but init_count 0 */
+    hype_guest_lapic_advance(&l, 100000);
+    CHECK_HEX("disarmed timer never fires under advance", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
+}
+
 int main(void) {
     test_reset_defaults();
     test_all_registers_roundtrip();
@@ -198,6 +247,9 @@ int main(void) {
     test_in_service_gates_next_irq();
     test_masked_timer_never_fires();
     test_disarmed_timer_never_fires();
+    test_advance_periodic_fires_at_count();
+    test_advance_one_shot_fires_once();
+    test_advance_masked_or_disarmed_never_fires();
 
     if (failures == 0) {
         printf("all tests passed\n");

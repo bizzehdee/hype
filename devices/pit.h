@@ -84,6 +84,18 @@ int hype_pit_emu_io_read(hype_pit_emu_t *pit, uint16_t port, uint8_t *out_value)
 void hype_pit_emu_tick(hype_pit_emu_t *pit);
 
 /*
+ * Advances every channel's counter by `ticks` in one O(1) step -- the
+ * bulk form of hype_pit_emu_tick(), for a caller (M4-6b1's FW-1 loop)
+ * that ticks the PIT proportionally to real elapsed time (many PIT
+ * ticks per VM-exit) rather than exactly one per exit. Periodic modes
+ * (2/3) wrap within [1, reload]; one-shot modes (0/1/4/5) saturate at 0,
+ * and channel 2's mode-0 OUT pin latches high when it reaches terminal
+ * count (drives port 0x61 bit 5, same as the single-tick path). A 0
+ * `reload` is treated as the full 65536-count period.
+ */
+void hype_pit_emu_advance(hype_pit_emu_t *pit, uint64_t ticks);
+
+/*
  * System Control Port B (I/O port 0x61) write: latches the software-
  * writable low nibble (channel-2 GATE in bit 0, speaker in bit 1). A
  * guest sets bit 0 to let channel 2 count; the OUT pin it later reads

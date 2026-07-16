@@ -138,6 +138,40 @@ void hype_guest_lapic_tick(hype_guest_lapic_t *lapic) {
     }
 }
 
+void hype_guest_lapic_advance(hype_guest_lapic_t *lapic, uint64_t ticks) {
+    /* Timer disarmed (init_count == 0) or masked: nothing to do. */
+    if (lapic->init_count == 0 || (lapic->lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED) != 0) {
+        lapic->timer_irq_pending = 0;
+        return;
+    }
+    if (ticks == 0) {
+        return;
+    }
+
+    /* A one-shot already sitting at terminal count (current_count == 0)
+     * has fired and must not fire again; a periodic never rests at 0
+     * (it reloads on expiry), so a 0 here is always a spent one-shot. */
+    if (lapic->current_count == 0) {
+        return;
+    }
+
+    if (ticks >= (uint64_t)lapic->current_count) {
+        /* Counter crossed terminal count -> the timer expired. */
+        lapic->timer_irq_pending = 1;
+        if ((lapic->lvt_timer & HYPE_GUEST_LAPIC_LVT_PERIODIC) != 0) {
+            /* Reload from init_count, carrying the overshoot forward so
+             * the periodic phase stays roughly aligned to real time. */
+            uint64_t leftover = (ticks - (uint64_t)lapic->current_count) % (uint64_t)lapic->init_count;
+            lapic->current_count = lapic->init_count - (uint32_t)leftover;
+        } else {
+            /* One-shot: fire once and stay at terminal count. */
+            lapic->current_count = 0;
+        }
+    } else {
+        lapic->current_count -= (uint32_t)ticks;
+    }
+}
+
 int hype_guest_lapic_take_timer_irq(hype_guest_lapic_t *lapic, uint8_t *vector_out) {
     if (!lapic->timer_irq_pending || lapic->timer_in_service) {
         return 0;
