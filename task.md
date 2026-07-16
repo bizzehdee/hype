@@ -1065,7 +1065,24 @@ tasks — see updated deps below.*
   advances to userspace. The genuinely hard part: a calibratable,
   real-time-proportional guest timer (LAPIC timer count decrementing at
   a rate consistent with the guest's TSC/PIT reads), and/or PIT-IRQ0
-  clockevent delivery. Deps: M4-6a.
+  clockevent delivery.
+
+  *Deeper root cause (from the now-visible dmesg, M4-6c): the kernel
+  boots in a DEGRADED platform mode that leaves it with no usable
+  clockevent -- `tsc: Fast TSC calibration using PIT` then `Detected
+  17165.295 MHz processor` (a bogus ~17 GHz, because the guest PIT ticks
+  once per VM-exit rather than in real time, so the PIT/TSC correlation
+  the kernel measures is meaningless); `ACPI: Interpreter disabled` +
+  `pnp: PnP ACPI: disabled` (M4-4's ACPI is a hardware-reduced FADT with
+  a header-only DSDT -- the kernel finds it insufficient and turns the
+  interpreter off); `Not enabling interrupt remapping due to skipped
+  IO-APIC setup` + `smpboot: SMP disabled`. So beyond the timer itself,
+  reaching a scheduling kernel needs a real platform: an ACPI MADT the
+  kernel accepts (real LAPIC/IO-APIC entries), an IO-APIC model,
+  real-time-proportional PIT/TSC, and either LAPIC-timer or PIT-IRQ0
+  clockevent delivery through it. This is a multi-part platform-
+  emulation milestone, not a single fix -- decompose further when
+  picked up.* Deps: M4-6a.
 - [x] **M4-6c** — Kernel console visibility. DONE + verified: the Linux
   kernel's own dmesg flows to hype's forwarded console. No hype code
   change was needed -- FW-1e's guest COM1 UART model already serves the
