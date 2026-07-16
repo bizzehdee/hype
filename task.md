@@ -1386,6 +1386,24 @@ tasks — see updated deps below.*
   then confirm the probe proceeds to PxSSTS/IDENTIFY/READ. Nested-SVM
   flakiness confound -> real-HW confirmation applies.*
 
+  *REAL-AMD CONFIRMATION 2026-07-16 (VivoBook, full Alpine ISO): the
+  plateau REPRODUCES on real hardware -- kernel reaches ata1 registration
+  + "Key type fscrypt-provisioning registered", the async libata probe
+  stalls, the guest idles, and the FW-1 loop exits cleanly via the 10s
+  idle detector (PIT IRQ0 IRQs=239, clockevent fine). So the M4-6d2 stall
+  is a REAL hype bug, not a QEMU nested-SVM artifact -- fixing it fixes
+  both. NOT a login prompt (same wall as QEMU). Two NEW real-AMD-only
+  signals to chase: (1) a kernel WARNING backtrace during the AHCI PCI
+  probe -- stack `ahci_pci_driver_init -> do_one_initcall ->
+  kernel_init_freeable`, "---[ end trace ]---" -- the driver tripped a
+  WARN_ON during probe (the "WARNING: ... at <file>:<line>" header wasn't
+  captured yet; get it next -- a strong lead on what the AHCI model does
+  that the driver rejects). (2) TSC marked UNSTABLE: "tsc-early skewed
+  119ms over a 510ms watchdog interval" -> kernel drops TSC for
+  refined-jiffies. host_tsc_hz calibration (via BootServices->Stall) is
+  inaccurate on real AMD firmware (QEMU's Stall was exact); a separate
+  real-HW timebase bug (M4-6b1), not the plateau cause but worth fixing.*
+
   *Building blocks landed (2026-07-16, commit aa40591), inert until the
   loop wiring is made safe:*
   - `hype_ahci_irq_pending()` (devices/ahci.c) -- the HBA interrupt-
