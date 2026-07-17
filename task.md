@@ -1935,6 +1935,26 @@ tasks — see updated deps below.*
   the tick-delivery rate (M4-6d4's other half) is the remaining
   quality-of-life work, no longer a hard blocker.*
 
+  *[x] DONE 2026-07-18 -- REAL-HARDWARE END-TO-END LOGIN REACHED. With
+  the UEFI watchdog disabled, the Zen2 laptop booted the STOCK
+  alpine-virt 3.21 ISO all the way through: full OpenRC (modules,
+  fsck/remount/mount, kernel params, user login records, syslog,
+  firstboot -- all [ok]) -> "Welcome to Alpine Linux 3.21 / Kernel
+  6.12.81-0-virt on an x86_64" -> `localhost login:` on BOTH ttyS0 and
+  ttyS1, then idles at the prompt. No PANIC (the one "PANIC" token in the
+  log is inside the catcher-armed banner text). This is the M4-6
+  real-hardware validation bar met on bare metal (AMD), matching the
+  QEMU result from M4-6d3. Root-cause chain that got here: (1) UEFI
+  watchdog was force-resetting at 5 min (commit 7347780) -- THE blocker;
+  (2) 8259 priority-aware delivery (commit eab470c) un-starves the
+  scheduler tick that caused the soft lockups. The login-run log still
+  shows 3 soft lockups (24/26/38s) because it was captured on the
+  watchdog-only build; the priority-delivery fix (QEMU-validated, ticks
+  climb steadily, no regression) targets exactly those and is in the
+  repackaged image for the next confirmatory run. Remaining slowness
+  (console-I/O VM-exit volume: ioio dominated by the polled 8250 UART,
+  ~2-3 exits/char) is pure quality-of-life, tracked separately.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
