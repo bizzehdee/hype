@@ -1782,6 +1782,23 @@ tasks — see updated deps below.*
   repackaged. NEXT: real-HW TIMERHIST run to pick the exact fix.
   Deps: M4-6d3.
 
+  *TIMERHIST RESULT (2026-07-17, 2nd real-HW run, commit 14bffca): the
+  clockevent walks LAPIC-periodic -> PIT-periodic (mode 2) -> PIT-
+  one-shot (mode 4); the LAPIC timer is ABANDONED after 2 ticks (masked,
+  lapic_irq frozen at 2). Soft lockups straddle BOTH the periodic and
+  one-shot phases -> not a one-shot-specific bug but a general timer-IRQ
+  DELIVERY-RATE collapse: real HW delivers ~8 PIT ticks/s where QEMU
+  delivers ~100/s from the IDENTICAL periodic-PIT code (QEMU-measured
+  pit_irq0 +500 per 5s) and reaches login. Boot otherwise correct,
+  reaches "Scanning hardware for mdev" ~196s, no crash. The WEDGE dump
+  (gated on 2s quiescence) can't see it because the stalls occur while
+  the guest is BUSY with an AHCI-IRQ storm (ahci_irq climbs 7x faster
+  than pit_irq0). Added a TIMER-STARVE detector that fires when IRQ0
+  sits raised-but-undelivered in the master IRR >2s and dumps the reason
+  (stuck in-service ISR blocking the both-ISRs-clear gate / can_accept
+  IF=0 / defer-overwrite). QEMU-validated: no false positive, no
+  regression. The next real-HW run's TIMER-STARVE line names the fix.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
