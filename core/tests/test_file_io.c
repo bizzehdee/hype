@@ -20,6 +20,8 @@ static EFI_FILE_PROTOCOL g_fake_file;
 static int g_open_calls;
 static EFI_STATUS g_open_status;
 static int g_close_calls;
+static int g_open_expect_read = 1; /* read tests assert READ mode; write tests relax it */
+static UINT64 g_last_open_mode;
 
 static EFI_STATUS EFIAPI fake_open(EFI_FILE_PROTOCOL *this, EFI_FILE_PROTOCOL **new_handle,
                                     CHAR16 *file_name, UINT64 open_mode, UINT64 attributes) {
@@ -27,11 +29,54 @@ static EFI_STATUS EFIAPI fake_open(EFI_FILE_PROTOCOL *this, EFI_FILE_PROTOCOL **
     (void)file_name;
     (void)attributes;
     g_open_calls++;
-    CHECK_INT("open mode is read-only", EFI_FILE_MODE_READ, open_mode);
+    g_last_open_mode = open_mode;
+    if (g_open_expect_read) {
+        CHECK_INT("open mode is read-only", EFI_FILE_MODE_READ, open_mode);
+    }
     if (g_open_status != EFI_SUCCESS) {
         return g_open_status;
     }
     *new_handle = &g_fake_file;
+    return EFI_SUCCESS;
+}
+
+/* Write-path fakes (hype_file_write_new). */
+static int g_write_calls;
+static UINTN g_write_last_size;
+static char g_write_backing[64];
+static EFI_STATUS g_write_status;
+static int g_write_short;
+static int g_delete_calls;
+static int g_flush_calls;
+
+static EFI_STATUS EFIAPI fake_write(EFI_FILE_PROTOCOL *this, UINTN *buffer_size, void *buffer) {
+    (void)this;
+    g_write_calls++;
+    if (g_write_status != EFI_SUCCESS) {
+        return g_write_status;
+    }
+    if (*buffer_size <= sizeof(g_write_backing)) {
+        unsigned int i;
+        for (i = 0; i < (unsigned int)*buffer_size; i++) {
+            g_write_backing[i] = ((const char *)buffer)[i];
+        }
+    }
+    if (g_write_short && *buffer_size > 0) {
+        *buffer_size -= 1; /* report a short write */
+    }
+    g_write_last_size = *buffer_size;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI fake_delete(EFI_FILE_PROTOCOL *this) {
+    (void)this;
+    g_delete_calls++;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI fake_flush(EFI_FILE_PROTOCOL *this) {
+    (void)this;
+    g_flush_calls++;
     return EFI_SUCCESS;
 }
 
@@ -109,6 +154,56 @@ static void reset_fakes(void) {
     g_allocate_pool_calls = 0;
     g_allocate_pool_status = EFI_SUCCESS;
     g_free_pool_calls = 0;
+    g_open_expect_read = 1;
+    g_last_open_mode = 0;
+    g_write_calls = 0;
+    g_write_last_size = 0;
+    g_write_status = EFI_SUCCESS;
+    g_write_short = 0;
+    g_delete_calls = 0;
+    g_flush_calls = 0;
+}
+
+static void setup_write_fakes(void) {
+    g_open_expect_read = 0;
+    g_fake_file.Write = fake_write;
+    g_fake_file.Delete = fake_delete;
+    g_fake_file.Flush = fake_flush;
+}
+
+static void test_write_new_success(void) {
+    EFI_STATUS status;
+    const char payload[] = "hype log";
+    reset_fakes();
+    setup_write_fakes();
+    status = hype_file_write_new(&g_fake_root, (CHAR16 *)L"\\hype-log.txt", payload, 8);
+    CHECK_INT("write_new success", EFI_SUCCESS, status);
+    CHECK_INT("stale copy deleted first", 1, g_delete_calls);
+    CHECK_INT("wrote once", 1, g_write_calls);
+    CHECK_INT("wrote all bytes", 8, (int)g_write_last_size);
+    CHECK_INT("flushed", 1, g_flush_calls);
+    CHECK_INT("last open was create|write|read", 1,
+              g_last_open_mode == (EFI_FILE_MODE_CREATE | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_READ));
+    CHECK_INT("payload byte 0", 'h', g_write_backing[0]);
+}
+
+static void test_write_new_open_fails(void) {
+    EFI_STATUS status;
+    reset_fakes();
+    setup_write_fakes();
+    g_open_status = EFI_NOT_FOUND; /* both the delete-probe open and the create open fail */
+    status = hype_file_write_new(&g_fake_root, (CHAR16 *)L"\\hype-log.txt", "x", 1);
+    CHECK_INT("write_new returns the open error", EFI_NOT_FOUND, status);
+    CHECK_INT("no write attempted", 0, g_write_calls);
+}
+
+static void test_write_new_short_write_is_aborted(void) {
+    EFI_STATUS status;
+    reset_fakes();
+    setup_write_fakes();
+    g_write_short = 1; /* fake_write reports fewer bytes than asked */
+    status = hype_file_write_new(&g_fake_root, (CHAR16 *)L"\\hype-log.txt", "abcd", 4);
+    CHECK_INT("short write is aborted", EFI_ABORTED, status);
 }
 
 static void test_get_size_success(void) {
@@ -437,6 +532,9 @@ int main(void) {
     test_read_into_open_fails();
     test_read_into_read_fails();
     test_read_into_short_read_is_aborted();
+    test_write_new_success();
+    test_write_new_open_fails();
+    test_write_new_short_write_is_aborted();
 
     if (failures == 0) {
         printf("all tests passed\n");

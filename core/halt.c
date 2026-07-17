@@ -4,6 +4,7 @@
 #include "format.h"
 #include "gop.h"
 #include "halt.h"
+#include "logbuf.h"
 #include "serial.h"
 
 __attribute__((noreturn)) void hype_halt_forever(void) {
@@ -54,6 +55,10 @@ void hype_debug_print(const char *fmt, ...) {
     va_end(ap);
 
     hype_serial_print("%s", msg);
+    /* Tee into the in-memory capture so boot/main.c can flush the whole
+     * console to a file on the boot volume before ExitBootServices --
+     * the serial-less real-hardware debug path (core/logbuf.h). */
+    hype_logbuf_append(msg);
 
     gop = hype_fatal_get_gop();
     if (gop != 0) {

@@ -63,4 +63,16 @@ EFI_STATUS hype_file_get_size(EFI_FILE_PROTOCOL *root, EFI_BOOT_SERVICES *bs, CH
  */
 EFI_STATUS hype_file_read_into(EFI_FILE_PROTOCOL *root, CHAR16 *path, void *buffer, UINTN buffer_size);
 
+/*
+ * Writes `size` bytes of `buffer` to `path` (relative to `root`),
+ * replacing any existing file (a stale longer copy is Delete()d first so
+ * no old tail survives). Opens CREATE|WRITE|READ, writes, Flush()es, and
+ * Closes. Returns EFI_SUCCESS only if the whole buffer was written
+ * (a short write is EFI_ABORTED). Used to drop hype's captured console
+ * log (core/logbuf.h) onto the boot volume before ExitBootServices for
+ * serial-less real-hardware debugging. Same Boot-Services file I/O as
+ * the read path; unit tested against fake protocol structs.
+ */
+EFI_STATUS hype_file_write_new(EFI_FILE_PROTOCOL *root, CHAR16 *path, const void *buffer, UINTN size);
+
 #endif /* HYPE_CORE_FILE_IO_H */

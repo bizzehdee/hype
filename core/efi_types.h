@@ -419,6 +419,14 @@ typedef EFI_STATUS (EFIAPI *EFI_FILE_GET_INFO)(
     UINTN *BufferSize,
     void *Buffer);
 
+typedef EFI_STATUS (EFIAPI *EFI_FILE_WRITE)(
+    EFI_FILE_PROTOCOL *This,
+    UINTN *BufferSize,
+    void *Buffer);
+
+typedef EFI_STATUS (EFIAPI *EFI_FILE_FLUSH)(EFI_FILE_PROTOCOL *This);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_DELETE)(EFI_FILE_PROTOCOL *This);
+
 /*
  * EFI_FILE_PROTOCOL: only the functions this project actually calls
  * (Open/Close/Read/GetInfo) are given real signatures, matching every
@@ -432,17 +440,19 @@ struct EFI_FILE_PROTOCOL {
     UINT64 Revision;
     EFI_FILE_OPEN Open;
     EFI_FILE_CLOSE Close;
-    void *Delete;
+    EFI_FILE_DELETE Delete;
     EFI_FILE_READ Read;
-    void *Write;
+    EFI_FILE_WRITE Write;
     void *GetPosition;
     void *SetPosition;
     EFI_FILE_GET_INFO GetInfo;
     void *SetInfo;
-    void *Flush;
+    EFI_FILE_FLUSH Flush;
 };
 
 #define EFI_FILE_MODE_READ 0x0000000000000001ULL
+#define EFI_FILE_MODE_WRITE 0x0000000000000002ULL
+#define EFI_FILE_MODE_CREATE 0x8000000000000000ULL
 
 typedef struct {
     UINT64 Revision;

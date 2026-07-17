@@ -10,6 +10,7 @@
 #include "../core/mp.h"
 #include "../core/admission.h"
 #include "../core/file_io.h"
+#include "../core/logbuf.h"
 #include "../arch/x86_64/cpu/cpu_features.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -5873,6 +5874,31 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 "mp: no extra pCPU available (0x%llx) -- test guest running on the BSP\n",
                                 (unsigned long long)status);
             run_all_test_guests(&args);
+        }
+    }
+
+    /* Real-hardware debugging (serial-less): flush the captured console
+     * log to a file on the volume hype.efi was loaded from, while Boot
+     * Services file I/O is still available. The tester reads the
+     * complete, exact log off the USB stick instead of photographing a
+     * wrapping framebuffer. Best-effort -- a read-only or non-FAT boot
+     * volume just prints a status line and boot continues. Everything
+     * printed up to here (including the FW-1 guest console and the
+     * giveup diagnostics) is in the buffer; this trailing status line
+     * is not (it reports the write that just happened). */
+    {
+        EFI_FILE_PROTOCOL *log_root = 0;
+        if (hype_file_locate_root(ImageHandle, SystemTable->BootServices, &log_root) == EFI_SUCCESS) {
+            EFI_STATUS log_status =
+                hype_file_write_new(log_root, (CHAR16 *)L"\\hype-log.txt", hype_logbuf_data(),
+                                     (UINTN)hype_logbuf_len());
+            log_root->Close(log_root);
+            hype_debug_print("hype: console log (%u bytes%s) -> \\hype-log.txt on the boot volume: %s\n",
+                              hype_logbuf_len(), hype_logbuf_truncated() ? ", TRUNCATED" : "",
+                              log_status == EFI_SUCCESS ? "written"
+                                                        : "write FAILED (read-only or non-FAT volume?)");
+        } else {
+            hype_debug_print("hype: could not open the boot volume to write \\hype-log.txt\n");
         }
     }
 

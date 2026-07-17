@@ -82,3 +82,35 @@ EFI_STATUS hype_file_read_into(EFI_FILE_PROTOCOL *root, CHAR16 *path, void *buff
     }
     return EFI_SUCCESS;
 }
+
+EFI_STATUS hype_file_write_new(EFI_FILE_PROTOCOL *root, CHAR16 *path, const void *buffer, UINTN size) {
+    EFI_FILE_PROTOCOL *file = 0;
+    EFI_STATUS status;
+    UINTN write_size = size;
+
+    /* Delete any stale copy first so a shorter run can't leave a tail of
+     * a previous, longer one -- Delete() also closes the handle. */
+    if (root->Open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0) == EFI_SUCCESS) {
+        file->Delete(file);
+        file = 0;
+    }
+
+    status = root->Open(root, &file, path,
+                        EFI_FILE_MODE_CREATE | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_READ, 0);
+    if (status != EFI_SUCCESS) {
+        return status;
+    }
+
+    status = file->Write(file, &write_size, (void *)buffer);
+    if (status == EFI_SUCCESS && file->Flush != 0) {
+        file->Flush(file);
+    }
+    file->Close(file);
+    if (status != EFI_SUCCESS) {
+        return status;
+    }
+    if (write_size != size) {
+        return EFI_ABORTED;
+    }
+    return EFI_SUCCESS;
+}
