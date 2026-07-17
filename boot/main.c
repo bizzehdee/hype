@@ -4638,6 +4638,16 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     {
     unsigned long long productive_exits = 0;
     unsigned long long total_exits = 0;
+    /* Lightweight per-exit-reason histogram (M4-6 real-HW perf triage): a
+     * running count of exits by kind, plus the three suspected hot
+     * sub-buckets (io_delay port 0x80, SPEC_CTRL MSR 0x48, AHCI ABAR
+     * NPF). Dumped to the log every few seconds so diffing consecutive
+     * lines shows which exit type dominates a slow stretch. Just integer
+     * increments -- no per-exit formatting. */
+    unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
+                       ex_other = 0;
+    unsigned long long ex_io80 = 0, ex_ahci_npf = 0;
+    uint64_t last_exhist_tsc = 0;
     int booted = 0;
     hype_vt_filter_t uart_filter;
     char uart_line[256];
@@ -4696,6 +4706,31 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
         if (info.reason != HYPE_SVM_EXITCODE_HLT) {
             productive_exits++;
+        }
+
+        /* Per-exit-reason tally (see the ex_* declarations). Sub-buckets
+         * (io80/msr_spec/ahci) are bumped at their handlers below. */
+        switch (info.reason) {
+            case HYPE_SVM_EXITCODE_HLT:   ex_hlt++;   break;
+            case HYPE_SVM_EXITCODE_NPF:   ex_npf++;   break;
+            case HYPE_SVM_EXITCODE_IOIO:  ex_ioio++;  break;
+            case HYPE_SVM_EXITCODE_MSR:   ex_msr++;   break;
+            case HYPE_SVM_EXITCODE_CPUID: ex_cpuid++; break;
+            case HYPE_SVM_EXITCODE_VINTR: ex_vintr++; break;
+            default:                      ex_other++; break;
+        }
+        /* Dump the histogram every ~5s of wall-clock. The periodic flush
+         * below writes it to \hype-log.txt, so diffing two EXHIST lines
+         * gives per-second exit rates by kind for the slow stretch. */
+        if (g_fw_1_host_tsc_hz != 0) {
+            uint64_t now_eh = hype_rdtsc();
+            if (last_exhist_tsc == 0 || now_eh - last_exhist_tsc >= 5ULL * g_fw_1_host_tsc_hz) {
+                last_exhist_tsc = now_eh;
+                hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
+                                 "msr=%llu cpuid=%llu vintr=%llu other=%llu\n",
+                                 total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
+                                 ex_cpuid, ex_vintr, ex_other);
+            }
         }
 
         /* Periodically flush the captured console log to \hype-log.txt so
@@ -4997,6 +5032,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                     ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
                     if (hype_svm_vcpu_handle_ahci_npf_map(ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
                                                            &g_fw_1_dma_map, insn) == 0) {
+                        ex_ahci_npf++; /* exit-histogram sub-bucket */
                         /* M4-6 real-AMD DIAG (compact, screen-only-friendly):
                          * report CD progress at milestones instead of tracing
                          * every command. First ATAPI command proves OVMF is
@@ -5143,6 +5179,9 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 unsigned int k;
                 int already = 0;
                 hype_svm_vcpu_handle_unknown_ioio(ctx, &io);
+                if (io.port == 0x80u) {
+                    ex_io80++; /* exit-histogram sub-bucket: io_delay port */
+                }
                 key = (uint32_t)io.port | (io.is_in ? 0x80000000u : 0u);
                 for (k = 0; k < seen_ports_n; k++) {
                     if (seen_ports[k] == key) {
