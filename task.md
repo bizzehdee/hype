@@ -1911,6 +1911,30 @@ tasks — see updated deps below.*
   (e.g. a bad stack), pointing at a stack/GDT issue rather than a data
   pointer.*
 
+  *ROOT CAUSE FOUND 2026-07-18 (commit 7347780): the exception catcher
+  armed but did NOT fire -- so it was never a catchable CPU fault. The
+  reset is the UEFI WATCHDOG TIMER. Firmware arms a 5-minute watchdog
+  when it hands control to a boot app and force-RESETS the machine if
+  the app runs that whole period without ExitBootServices(). The FW-1
+  guest loop runs many minutes BEFORE ExitBootServices (the log flush
+  needs Boot Services), and COSTHIST vmrun_tot clustered at 250-280s on
+  both machines -- right under 300s. Every clue fits: no panic (firmware
+  reset, not a CPU fault), uncatchable by our IDT, deterministic ~5-min
+  timing, real-HW-only (QEMU's OVMF watchdog never fired in-window, so
+  every QEMU boot was fine while both real machines reset identically).
+  Fix: SetWatchdogTimer(0,0,0,0) in efi_main right after serial init.
+  This retroactively corrects the whole M4-6d4 arc: the timer-tick
+  starvation / soft-lockups were a real but SEPARATE slowness (the guest
+  Linux soft-lockup detector firing because our emulated tick is slow),
+  NOT the reboot. The idle-wait, TIMERHIST/TIMER-STARVE/COSTHIST
+  instrumentation, format-%02x fix, and exception catcher all remain
+  valid improvements; the exception catcher in particular is what proved
+  (by NOT firing) that the reset was non-CPU-fault, pointing straight at
+  the watchdog. NEXT real-HW run should blow past ~5 min -- if it reaches
+  login, M4-6 real-HW validation is met; if it still soft-locks slowly,
+  the tick-delivery rate (M4-6d4's other half) is the remaining
+  quality-of-life work, no longer a hard blocker.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
