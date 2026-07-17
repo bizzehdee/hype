@@ -4422,6 +4422,66 @@ static void fw_1_log_init(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs) {
     hype_fatal_set_flush_hook(fw_1_flush_log);
 }
 
+/* M4-6d4: catch a HOST-side CPU exception during the FW-1 guest loop.
+ *
+ * The loop runs BEFORE ExitBootServices (so the \hype-log.txt flush works),
+ * but the hypervisor's own IDT isn't installed until AFTER the guests return
+ * (efi_main, hype_idt_load). So during the loop the firmware's IDT is live,
+ * and a HOST-side fault in one of our exit handlers (a bad guest-controlled
+ * pointer, say) takes a #PF/#GP the firmware doesn't expect -- on real
+ * hardware that silently triple-faults and RESETS the machine, leaving no
+ * PANIC in the log (exactly the M4-6d4 real-HW symptom: both a 5950x and a
+ * Zen2 laptop reboot at the same "Scanning hardware for mdev" point with no
+ * fatal message). This surgically overrides ONLY the 32 architectural
+ * exception vectors (0-31) in the live firmware IDT to point at our own ISR
+ * stubs -- which decode + hype_fatal(), flushing the log with the faulting
+ * vector name and RIP before halting. Hardware IRQ vectors (32-255) are left
+ * exactly as firmware set them, so firmware IRQs and the Boot-Services
+ * storage the log flush rides on keep working untouched. The gate selector
+ * is the CURRENT CS (we're still on the firmware GDT here, not ours). The
+ * originals are restored after the loop. This is a strict improvement, not
+ * just a diagnostic: a caught, reported host fault beats a silent reset. */
+static hype_idt_entry_t g_fw_1_saved_idt_exc[32];
+static int g_fw_1_idt_patched;
+
+static void fw_1_install_exception_catcher(void) {
+    hype_idt_ptr_t idtr;
+    hype_idt_entry_t *live;
+    uint16_t cs = 0;
+    unsigned v;
+    __asm__ volatile("sidt %0" : "=m"(idtr));
+    __asm__ volatile("mov %%cs, %0" : "=r"(cs));
+    if (idtr.base == 0 || idtr.limit < (uint16_t)(32u * sizeof(hype_idt_entry_t) - 1u)) {
+        hype_debug_print("fw-1: exception catcher NOT armed (firmware IDT base=0x%llx limit=%u too small)\n",
+                          (unsigned long long)idtr.base, (unsigned int)idtr.limit);
+        return;
+    }
+    live = (hype_idt_entry_t *)(uintptr_t)idtr.base;
+    for (v = 0; v < 32u; v++) {
+        g_fw_1_saved_idt_exc[v] = live[v];
+        hype_idt_encode_entry(&live[v], hype_isr_stub_table[v], cs, 0, HYPE_IDT_TYPE_INTERRUPT_GATE);
+    }
+    g_fw_1_idt_patched = 1;
+    hype_debug_print("fw-1: host exception catcher armed (IDT base=0x%llx cs=0x%x) -- a host fault "
+                      "in the guest loop now flushes a PANIC instead of resetting the machine\n",
+                      (unsigned long long)idtr.base, (unsigned int)cs);
+}
+
+static void fw_1_remove_exception_catcher(void) {
+    hype_idt_ptr_t idtr;
+    hype_idt_entry_t *live;
+    unsigned v;
+    if (!g_fw_1_idt_patched) {
+        return;
+    }
+    __asm__ volatile("sidt %0" : "=m"(idtr));
+    live = (hype_idt_entry_t *)(uintptr_t)idtr.base;
+    for (v = 0; v < 32u; v++) {
+        live[v] = g_fw_1_saved_idt_exc[v];
+    }
+    g_fw_1_idt_patched = 0;
+}
+
 static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
@@ -4689,6 +4749,11 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_vt_filter_reset(&uart_filter);
     hype_vt_filter_reset(&uart_filter2);
     hype_vt_filter_reset(&dbg_filter);
+
+    /* M4-6d4: arm the host exception catcher for the duration of the loop
+     * so a host fault produces a flushed PANIC (with the faulting vector +
+     * RIP) instead of a silent triple-fault machine reset. */
+    fw_1_install_exception_catcher();
 
     for (;;) {
         uint8_t timer_vector;
@@ -5615,6 +5680,11 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
         break;
     }
+
+    /* M4-6d4: restore the firmware's exception vectors now that the guest
+     * loop is done -- the subsequent Boot Services calls (GetMemoryMap,
+     * ExitBootServices) run under firmware's own handlers again. */
+    fw_1_remove_exception_catcher();
 
     /* Flush any console text the guest emitted right before it idled. */
     fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
