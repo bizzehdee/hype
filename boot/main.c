@@ -4915,6 +4915,63 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
         }
 
+        /* M4-6d4: TIMER-STARVATION detector. The real-HW soft lockups
+         * happen while the guest is BUSY (an AHCI-IRQ storm from CD reads),
+         * so the WEDGE dump above -- gated on 2s of QUIESCENCE -- never sees
+         * them. This one instead watches the timer clockevent directly: if
+         * IRQ0 has been raised in the master PIC's IRR (a PIT tick edge is
+         * pending) but NOT delivered for >2s of wall-clock, the scheduler
+         * tick is starving -- exactly the soft-lockup condition. Dump, once
+         * per starvation episode, the precise reason: a non-zero ISR means
+         * the "both ISRs clear" delivery gate is blocked by an in-service
+         * IRQ the guest hasn't EOI'd (e.g. a stuck AHCI/cascade line);
+         * can_accept=0 (IF=0/shadow) means the guest has interrupts masked;
+         * a growing defer-overwrite means staged injections are being lost.
+         * The episode re-arms whenever a PIT IRQ0 is actually delivered
+         * (pit_irqs advances) or the IRR bit clears. Pure diagnostic. */
+        {
+            static uint64_t irq0_raised_since = 0;
+            static unsigned long long pit_irqs_at_arm = 0;
+            static int starve_dumped = 0;
+            int irq0_in_irr = (g_fw_1_pic.master.irr & 0x01u) != 0;
+            uint64_t now_sv = hype_rdtsc();
+            if (pit_irqs != pit_irqs_at_arm) {
+                /* A tick was delivered -- reset the episode. */
+                pit_irqs_at_arm = pit_irqs;
+                irq0_raised_since = 0;
+                starve_dumped = 0;
+            }
+            if (!irq0_in_irr) {
+                irq0_raised_since = 0;
+                starve_dumped = 0;
+            } else if (g_fw_1_host_tsc_hz != 0) {
+                if (irq0_raised_since == 0) {
+                    irq0_raised_since = now_sv;
+                } else if (!starve_dumped &&
+                           now_sv - irq0_raised_since >= 2ULL * g_fw_1_host_tsc_hz) {
+                    hype_svm_intr_state_t sv;
+                    unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
+                    starve_dumped = 1;
+                    hype_svm_vcpu_get_intr_state(ctx, &sv);
+                    hype_svm_vcpu_get_int_diag(&ei, &df, &wn, &ov);
+                    hype_debug_print(
+                        "fw-1 TIMER-STARVE: IRQ0 undelivered >2s | IF=%d shadow=0x%llx can_accept=%d "
+                        "pending=%d/vec0x%x eventinj=0x%llx | mIRR=0x%x mISR=0x%x mIMR=0x%x "
+                        "sIRR=0x%x sISR=0x%x sIMR=0x%x | ahci p_is=0x%x p_ie=0x%x p_ci=0x%x | "
+                        "defer=%llu overwrite=%llu | pit_irqs=%llu ahci_irqs=%llu\n",
+                        (int)((sv.rflags >> 9) & 1u), (unsigned long long)sv.interrupt_shadow,
+                        sv.can_accept, sv.pending_valid, (unsigned int)sv.pending_vector,
+                        (unsigned long long)sv.eventinj,
+                        (unsigned int)g_fw_1_pic.master.irr, (unsigned int)g_fw_1_pic.master.isr,
+                        (unsigned int)g_fw_1_pic.master.imr, (unsigned int)g_fw_1_pic.slave.irr,
+                        (unsigned int)g_fw_1_pic.slave.isr, (unsigned int)g_fw_1_pic.slave.imr,
+                        (unsigned int)g_fw_1_ahci.p_is, (unsigned int)g_fw_1_ahci.p_ie,
+                        (unsigned int)g_fw_1_ahci.p_ci, df, ov,
+                        (unsigned long long)pit_irqs, (unsigned long long)ahci_irqs);
+                }
+            }
+        }
+
         /* FW-1e: surface any console text the guest wrote to either UART.
          * FW-1f uses the emitted-char count as evidence the guest reacted
          * to an injected keystroke. */
