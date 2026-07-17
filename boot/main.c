@@ -5339,6 +5339,37 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                           "defer-overwrite=%llu\n", ei, df, wn, ov);
     }
 
+    /* M4-6d3 real-HW diag: characterise WHY the loop gave up. On real
+     * hardware the wrapping GOP console loses scrollback, so surface the
+     * decisive facts on the final frame: the guest RIP + RFLAGS.IF at the
+     * idle point (IF=0 => a dead `cli; hlt`, i.e. a kernel panic/BUG, not a
+     * live idle -- the timer can't wake it, which is exactly what a 10s
+     * giveup with master ISR=0 looks like), plus the last, still-buffered
+     * partial console line (a panic header has no trailing newline, so the
+     * line-buffered drain never emitted it). */
+    if (booted) {
+        hype_svm_intr_state_t gs;
+        hype_svm_vcpu_get_intr_state(ctx, &gs);
+        if (uart_line_len > 0) {
+            uart_line[uart_line_len] = '\0';
+            hype_debug_print("fw-1: last ttyS0 (unterminated): %s\n", uart_line);
+            uart_line_len = 0;
+        }
+        if (uart_line_len2 > 0) {
+            uart_line2[uart_line_len2] = '\0';
+            hype_debug_print("fw-1: last ttyS1 (unterminated): %s\n", uart_line2);
+            uart_line_len2 = 0;
+        }
+        hype_debug_print("fw-1: GIVEUP CAUSE: guest_rip=0x%llx IF=%d (%s) shadow=0x%llx eventinj=0x%llx "
+                          "can_accept=%d pending=%d/vec0x%x last_exit_reason=0x%llx\n",
+                          (unsigned long long)info.guest_rip, (int)((gs.rflags >> 9) & 1u),
+                          (((gs.rflags >> 9) & 1u) ? "live idle -- waiting on an undelivered IRQ"
+                                                   : "DEAD HALT -- cli;hlt, likely a guest panic/BUG"),
+                          (unsigned long long)gs.interrupt_shadow, (unsigned long long)gs.eventinj,
+                          gs.can_accept, gs.pending_valid, (unsigned int)gs.pending_vector,
+                          (unsigned long long)info.reason);
+    }
+
     if (booted && key_reacted) {
         hype_debug_print(
             "fw-1: real OVMF BOOTED + INTERACTIVE (FW-1g) -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2, "
