@@ -222,6 +222,40 @@ static void test_advance_one_shot_fires_once(void) {
     CHECK_HEX("one-shot does not re-fire", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
 }
 
+/* M4-6d4: the LAPIC one-shot CYCLE. When a tickless Linux uses the LAPIC
+ * timer as its clockevent, it re-arms after every expiry: take the IRQ,
+ * EOI, write a fresh init_count, take the next IRQ, repeat. QEMU runs the
+ * FW-1 guest with the LAPIC timer MASKED (it uses the periodic PIT), so
+ * this cycle is never exercised there -- a re-arm bug would only surface on
+ * real hardware. Drive several consecutive cycles and confirm each re-arm
+ * fires exactly one fresh IRQ. */
+static void test_advance_one_shot_rearm_refires(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    int cycle;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 48u); /* one-shot */
+
+    for (cycle = 0; cycle < 4; cycle++) {
+        /* Re-arm by writing a fresh initial count, even from a spent
+         * (current_count == 0) state. */
+        hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 500u);
+        CHECK_HEX("re-arm reloads current_count", 500, l.current_count);
+
+        hype_guest_lapic_advance(&l, 200);
+        CHECK_HEX("no IRQ before terminal this cycle", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
+        hype_guest_lapic_advance(&l, 400); /* crosses terminal (200+400 > 500) */
+        CHECK_HEX("re-armed one-shot fires", 1, hype_guest_lapic_take_timer_irq(&l, &vec));
+        CHECK_HEX("count spent again", 0, l.current_count);
+
+        /* EOI so the next cycle's IRQ isn't gated by in-service. */
+        hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+        /* Still spent until the next re-arm: no phantom IRQ. */
+        hype_guest_lapic_advance(&l, 10000);
+        CHECK_HEX("spent between cycles, no re-fire", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
+    }
+}
+
 static void test_advance_masked_or_disarmed_never_fires(void) {
     hype_guest_lapic_t l;
     uint8_t vec = 0;
@@ -248,6 +282,7 @@ int main(void) {
     test_masked_timer_never_fires();
     test_disarmed_timer_never_fires();
     test_advance_periodic_fires_at_count();
+    test_advance_one_shot_rearm_refires();
     test_advance_one_shot_fires_once();
     test_advance_masked_or_disarmed_never_fires();
 

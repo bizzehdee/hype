@@ -353,6 +353,38 @@ static void test_advance_one_shot_ch0_raises_irq0_once(void) {
     CHECK_HEX("spent one-shot does not re-fire", 0, edges);
 }
 
+/* M4-6d4: the tickless clockevent CYCLE, not just a single shot. A tickless
+ * Linux re-arms its one-shot PIT after every expiry (write a fresh reload,
+ * take the next IRQ0, repeat). QEMU never exercises this -- it runs the PIT
+ * in periodic mode 2 -- so a re-arm bug would only ever surface on real
+ * hardware. Drive several consecutive arm -> expire -> re-arm cycles and
+ * confirm each one raises exactly one fresh IRQ0 edge. */
+static void test_advance_one_shot_ch0_rearm_refires(void) {
+    hype_pit_emu_t pit;
+    unsigned edges;
+    int cycle;
+    hype_pit_emu_reset(&pit);
+    hype_pit_emu_io_write(&pit, 0x43, 0x30); /* ch0, lobyte/hibyte, mode 0 */
+
+    for (cycle = 0; cycle < 4; cycle++) {
+        /* Re-arm: writing a fresh reload reloads the live counter even from
+         * a spent (counter == 0) state. */
+        hype_pit_emu_io_write(&pit, 0x40, 50);
+        hype_pit_emu_io_write(&pit, 0x40, 0);
+        CHECK_HEX("re-arm reloads the counter", 50, pit.channels[0].counter);
+
+        edges = hype_pit_emu_advance(&pit, 20);
+        CHECK_HEX("no edge before terminal on this cycle", 0, edges);
+        edges = hype_pit_emu_advance(&pit, 40); /* crosses terminal (20+40 > 50) */
+        CHECK_HEX("re-armed one-shot fires exactly one IRQ0 edge", 1, edges);
+        CHECK_HEX("counter spent again", 0, pit.channels[0].counter);
+
+        /* Still spent until the next re-arm: no phantom edges. */
+        edges = hype_pit_emu_advance(&pit, 10000);
+        CHECK_HEX("spent between cycles, no re-fire", 0, edges);
+    }
+}
+
 int main(void) {
     test_reset_defaults();
     test_unrecognized_port_rejected();
@@ -375,6 +407,7 @@ int main(void) {
     test_port61_write_masks_to_writable_bits();
     test_advance_one_shot_ch2_saturates_and_sets_out();
     test_advance_one_shot_ch0_raises_irq0_once();
+    test_advance_one_shot_ch0_rearm_refires();
     test_advance_periodic_wraps();
 
     if (failures == 0) {
