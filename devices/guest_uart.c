@@ -43,8 +43,20 @@ uint8_t hype_guest_uart_read(hype_guest_uart_t *u, uint32_t offset) {
         case HYPE_UART_REG_IER:
             return dlab ? u->dlm : u->ier;
         case HYPE_UART_REG_IIR_FCR:
-            /* IIR: bit 0 set = "no interrupt pending" (we drive none). */
-            return 0x01u;
+            /* IIR: report the highest-priority enabled, asserted interrupt
+             * so the guest's serial ISR knows why it fired and services it.
+             * RX-data-available (when ERBFI set) outranks THRE (when ETBEI
+             * set); THRE is always assertable since TX is infinite-speed.
+             * bit0=0 means "interrupt pending". The driver clears the
+             * source (drains RX / disables ETBEI when its TX queue empties),
+             * so this stops asserting on its own -- no interrupt storm. */
+            if ((u->ier & HYPE_UART_IER_ERBFI) && rx_available(u)) {
+                return HYPE_UART_IIR_RDA;
+            }
+            if (u->ier & HYPE_UART_IER_ETBEI) {
+                return HYPE_UART_IIR_THRE;
+            }
+            return HYPE_UART_IIR_NONE;
         case HYPE_UART_REG_LCR:
             return u->lcr;
         case HYPE_UART_REG_MCR:
@@ -114,6 +126,16 @@ int hype_guest_uart_tx_dequeue(hype_guest_uart_t *u, uint8_t *out) {
     *out = u->tx[u->tx_head];
     u->tx_head = (u->tx_head + 1u) % HYPE_GUEST_UART_TX_RING;
     return 1;
+}
+
+int hype_guest_uart_irq_pending(const hype_guest_uart_t *u) {
+    if ((u->ier & HYPE_UART_IER_ERBFI) && rx_available(u)) {
+        return 1;
+    }
+    if (u->ier & HYPE_UART_IER_ETBEI) {
+        return 1; /* transmitter always ready */
+    }
+    return 0;
 }
 
 int hype_guest_uart_rx_enqueue(hype_guest_uart_t *u, uint8_t byte) {

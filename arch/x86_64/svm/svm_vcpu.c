@@ -875,12 +875,38 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     case HYPE_MSR_ACTION_REJECT:
     default:
         if (g_msr_trace) {
-            uint64_t wval =
-                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
-            hype_debug_print("msr-trace: unhandled %s msr=0x%x val=0x%llx rip=0x%llx\n",
-                              is_write ? "WRMSR" : "RDMSR", (unsigned int)msr_number,
-                              (unsigned long long)(is_write ? wval : 0ULL),
-                              (unsigned long long)real->vmcb->save.rip);
+            /* M4-6d3: Linux writes SPEC_CTRL (0x48) and PRED_CMD (0x49) on
+             * nearly every kernel entry/exit for Spectre mitigation. The
+             * per-write GOP-rendered trace floods the console and slows
+             * the boot to a crawl, so stub those SILENTLY. Every other
+             * unknown MSR is traced ONCE (latched by number) for
+             * discovery -- enough to see what a real boot touches without
+             * a repeating flood. The stub behaviour (WRMSR ignored, RDMSR
+             * returns 0) is unchanged. */
+            int silent = (msr_number == 0x48u || msr_number == 0x49u);
+            if (!silent) {
+                static uint32_t seen_msrs[128];
+                static unsigned seen_count = 0;
+                unsigned k;
+                int already = 0;
+                for (k = 0; k < seen_count; k++) {
+                    if (seen_msrs[k] == msr_number) {
+                        already = 1;
+                        break;
+                    }
+                }
+                if (!already) {
+                    uint64_t wval = ((uint64_t)(uint32_t)real->gprs[2] << 32) |
+                                    (uint64_t)(uint32_t)real->vmcb->save.rax;
+                    hype_debug_print("msr-trace: unhandled %s msr=0x%x val=0x%llx rip=0x%llx\n",
+                                      is_write ? "WRMSR" : "RDMSR", (unsigned int)msr_number,
+                                      (unsigned long long)(is_write ? wval : 0ULL),
+                                      (unsigned long long)real->vmcb->save.rip);
+                    if (seen_count < 128u) {
+                        seen_msrs[seen_count++] = msr_number;
+                    }
+                }
+            }
             if (!is_write) {
                 real->vmcb->save.rax = 0;
                 real->gprs[2] = 0;

@@ -87,6 +87,44 @@ static void test_misc_registers(void) {
     hype_guest_uart_write(&u, HYPE_UART_REG_IIR_FCR, 0x07);
 }
 
+static void test_tx_interrupt_generation(void) {
+    hype_guest_uart_t u;
+    hype_guest_uart_reset(&u);
+    /* No interrupt enabled -> none pending, IIR = NONE. */
+    CHECK_HEX("irq_pending 0 when IER=0", 0, hype_guest_uart_irq_pending(&u));
+    CHECK_HEX("IIR NONE when IER=0", HYPE_UART_IIR_NONE,
+              hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR));
+    /* Enable the transmit-empty interrupt: TX is infinite-speed, so it's
+     * asserted immediately -- this is what unblocks interrupt-driven tty
+     * writes. */
+    hype_guest_uart_write(&u, HYPE_UART_REG_IER, HYPE_UART_IER_ETBEI);
+    CHECK_HEX("irq_pending 1 when ETBEI set", 1, hype_guest_uart_irq_pending(&u));
+    CHECK_HEX("IIR reports THRE when ETBEI set", HYPE_UART_IIR_THRE,
+              hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR));
+}
+
+static void test_rx_interrupt_and_priority(void) {
+    hype_guest_uart_t u;
+    hype_guest_uart_reset(&u);
+    /* ERBFI enabled but no RX byte waiting -> not pending. */
+    hype_guest_uart_write(&u, HYPE_UART_REG_IER, HYPE_UART_IER_ERBFI);
+    CHECK_HEX("irq_pending 0 when ERBFI set but no RX", 0, hype_guest_uart_irq_pending(&u));
+    /* A waiting RX byte asserts the received-data interrupt. */
+    hype_guest_uart_rx_enqueue(&u, 'x');
+    CHECK_HEX("irq_pending 1 when ERBFI + RX", 1, hype_guest_uart_irq_pending(&u));
+    CHECK_HEX("IIR reports RDA on RX", HYPE_UART_IIR_RDA,
+              hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR));
+    /* RX outranks THRE when both are enabled+asserted. */
+    hype_guest_uart_write(&u, HYPE_UART_REG_IER,
+                          (uint8_t)(HYPE_UART_IER_ERBFI | HYPE_UART_IER_ETBEI));
+    CHECK_HEX("IIR RDA outranks THRE", HYPE_UART_IIR_RDA,
+              hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR));
+    /* Draining the RX byte drops back to the THRE interrupt. */
+    (void)hype_guest_uart_read(&u, HYPE_UART_REG_DATA);
+    CHECK_HEX("IIR falls to THRE after RX drained", HYPE_UART_IIR_THRE,
+              hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR));
+}
+
 static void test_rx_ring_full_rejects(void) {
     hype_guest_uart_t u;
     unsigned int i;
@@ -106,6 +144,8 @@ int main(void) {
     test_rx_read_and_dr();
     test_dlab_aliases_divisor();
     test_misc_registers();
+    test_tx_interrupt_generation();
+    test_rx_interrupt_and_priority();
     test_rx_ring_full_rejects();
 
     if (failures == 0) {

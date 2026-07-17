@@ -4728,6 +4728,25 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 }
             }
         }
+        /* M4-6d3: raise the serial TX/RX interrupt (COM1=IRQ4, COM2=IRQ3)
+         * when the guest has enabled it (IER.ETBEI/ERBFI). The kernel's
+         * printk uses the polled console path (LSR.THRE, always ready), but
+         * a userspace tty write goes through the 8250 driver's interrupt-
+         * driven TX: it enables ETBEI and sleeps until the TX-empty IRQ
+         * fires. Without this, any process that writes enough to the serial
+         * console (e.g. apk's --progress bars during "Installing packages")
+         * blocks forever. Gated on the line not already being in service. */
+        {
+            unsigned u;
+            for (u = 0; u < 2u; u++) {
+                hype_guest_uart_t *uart = (u == 0) ? &g_fw_1_uart : &g_fw_1_uart2;
+                uint8_t irqn = (u == 0) ? 4u : 3u; /* COM1=IRQ4, COM2=IRQ3 */
+                if (hype_guest_uart_irq_pending(uart) &&
+                    (g_fw_1_pic.master.isr & (uint8_t)(1u << irqn)) == 0) {
+                    hype_pic_emu_raise_irq(&g_fw_1_pic.master, irqn);
+                }
+            }
+        }
         /* M4-6b4/M4-6d2: deliver the highest-priority pending PIC IRQ --
          * the PIT IRQ0 clockevent (master) or the AHCI completion IRQ
          * (master or slave, via the cascade). A fully-legacy guest (our
@@ -4765,6 +4784,33 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                                   (unsigned int)sizeof(uart_line));
         console_chars += fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
                                                   (unsigned int)sizeof(uart_line2));
+
+        /* M4-6d3: flush a buffered partial line that looks like an
+         * interactive prompt (ends in ": ", "# ", "$ ", "> ") when the
+         * guest goes idle. An agetty "localhost login: " prompt sends no
+         * trailing newline, so the line-buffered drain above would never
+         * surface it -- yet it's the very milestone we care about. Only
+         * prompt-suffixed partials are flushed, so ordinary mid-line
+         * output isn't fragmented. */
+        if (info.reason == HYPE_SVM_EXITCODE_HLT) {
+            char *bufs[2];
+            unsigned int *lens[2];
+            const char *tags[2];
+            unsigned bi;
+            bufs[0] = uart_line;  lens[0] = &uart_line_len;  tags[0] = "fw-1 ttyS0|";
+            bufs[1] = uart_line2; lens[1] = &uart_line_len2; tags[1] = "fw-1 ttyS1|";
+            for (bi = 0; bi < 2u; bi++) {
+                unsigned int n = *lens[bi];
+                if (n >= 2u && bufs[bi][n - 1u] == ' ') {
+                    char p = bufs[bi][n - 2u];
+                    if (p == ':' || p == '#' || p == '$' || p == '>') {
+                        bufs[bi][n] = '\0';
+                        hype_debug_print("%s %s\n", tags[bi], bufs[bi]);
+                        *lens[bi] = 0;
+                    }
+                }
+            }
+        }
 
         /* FW-1g: "reacted" = the guest emitted new CONSOLE output after
          * we fed it a key -- evidence the keystroke registered and drove

@@ -47,6 +47,14 @@
 #define HYPE_UART_LSR_DR 0x01u
 #define HYPE_UART_LSR_THRE_TEMT 0x60u
 
+/* IER (interrupt enable) bits the 8250 driver uses. */
+#define HYPE_UART_IER_ERBFI 0x01u /* received-data-available interrupt */
+#define HYPE_UART_IER_ETBEI 0x02u /* transmitter-holding-register-empty interrupt */
+/* IIR (interrupt identification) values, bit0=0 means "interrupt pending". */
+#define HYPE_UART_IIR_NONE 0x01u /* no interrupt pending */
+#define HYPE_UART_IIR_THRE 0x02u /* transmitter holding register empty */
+#define HYPE_UART_IIR_RDA 0x04u  /* received data available */
+
 typedef struct {
     uint8_t ier;
     uint8_t lcr;
@@ -74,6 +82,15 @@ void hype_guest_uart_write(hype_guest_uart_t *u, uint32_t offset, uint8_t value)
 /* Drain one transmitted byte (guest wrote it to THR). Returns 1 and
  * sets *out if one was available, else 0. */
 int hype_guest_uart_tx_dequeue(hype_guest_uart_t *u, uint8_t *out);
+
+/* Returns 1 if the UART currently has an enabled interrupt condition
+ * asserted -- THRE (transmit always ready, when ETBEI is set) or RX data
+ * available (when ERBFI is set). The 8250 driver's interrupt-driven TX
+ * (used by userspace tty writes, unlike the kernel's polled printk path)
+ * sleeps until this fires, so a guest that enables ETBEI blocks forever
+ * on a write if the serial IRQ is never delivered. The vCPU loop turns
+ * this into a raised PIC IRQ on the UART's line (COM1=IRQ4, COM2=IRQ3). */
+int hype_guest_uart_irq_pending(const hype_guest_uart_t *u);
 
 /* Feed one input byte to the guest (RBR + LSR.DR). Returns 1 if
  * accepted, 0 if the RX ring is full. Used by an input source (FW-1f);
