@@ -4730,6 +4730,38 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                  "msr=%llu cpuid=%llu vintr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
                                  ex_cpuid, ex_vintr, ex_other);
+                /* M4-6d4: companion line to EXHIST. The real-HW soft lockups
+                 * (blkid stuck 24s, kworker stuck 26s -- confirmed by a
+                 * "clocksource: Long readout interval ... 22.6s" the guest
+                 * itself logged) are the scheduler-tick timer IRQ starving a
+                 * task for 20+s while the loop still takes occasional
+                 * productive exits (so neither the WEDGE dump, gated on a
+                 * stuck in-service bit, nor the 10s idle-giveup ever fires --
+                 * and the GIVEUP TIMER-STATE only prints on loop exit, which a
+                 * live boot never reaches). Emitting the cumulative delivered
+                 * timer-IRQ counts + the current clockevent programming every
+                 * 5s lets a diff of two TIMERHIST lines across the slow region
+                 * show directly whether (and which) clockevent source stopped
+                 * firing, and whether the guest masked IRQ0 (mIMR bit0). Pure
+                 * diagnostic -- no guest-visible state changes. */
+                hype_debug_print("fw-1 TIMERHIST: pit_irq0=%llu lapic_irq=%llu ahci_irq=%llu | "
+                                 "PIT0 mode=%u reload=%u counter=%u | LAPIC lvt=0x%x(%s) init=%u cur=%u | "
+                                 "mIMR=0x%x sIMR=0x%x mISR=0x%x sISR=0x%x\n",
+                                 (unsigned long long)pit_irqs, (unsigned long long)timer_irqs,
+                                 (unsigned long long)ahci_irqs,
+                                 (unsigned int)g_fw_1_pit.channels[0].mode,
+                                 (unsigned int)g_fw_1_pit.channels[0].reload,
+                                 (unsigned int)g_fw_1_pit.channels[0].counter,
+                                 (unsigned int)g_fw_1_lapic.lvt_timer,
+                                 (g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED)
+                                     ? "masked"
+                                     : ((g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_PERIODIC)
+                                            ? "periodic"
+                                            : "1shot"),
+                                 (unsigned int)g_fw_1_lapic.init_count,
+                                 (unsigned int)g_fw_1_lapic.current_count,
+                                 (unsigned int)g_fw_1_pic.master.imr, (unsigned int)g_fw_1_pic.slave.imr,
+                                 (unsigned int)g_fw_1_pic.master.isr, (unsigned int)g_fw_1_pic.slave.isr);
             }
         }
 
