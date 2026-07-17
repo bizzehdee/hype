@@ -213,6 +213,11 @@ static hype_gpa_map_t g_fw_1_dma_map;
  * instead of a nonsense value. 0 until calibrated (loop then falls back
  * to a single tick per exit). */
 static uint64_t g_fw_1_host_tsc_hz;
+/* M4-6d4: VMRUN-vs-loop-body wall-clock split (TSC), to localise the
+ * real-HW per-exit cost. Accumulated in the FW-1 loop, dumped in EXHIST. */
+static uint64_t g_fw_1_vmrun_tsc;
+static uint64_t g_fw_1_body_tsc;
+static uint64_t g_fw_1_prev_post_tsc;
 #define HYPE_PIT_HZ 1193182ULL
 /* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
  * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
@@ -4688,8 +4693,25 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     for (;;) {
         uint8_t timer_vector;
 
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        /* M4-6d4: localise the ~219us/exit real-HW cost. Bracket VMRUN to
+         * separate the SVM world-switch cost (t_pre..t_post) from the
+         * loop-body cost (prev t_post..this t_pre). If world-switch
+         * dominates it is a CPU/microcode/TLB-flush matter; if the body
+         * dominates it is our own code (GOP framebuffer render, real-serial
+         * writes, console drain) and is fixable in software. */
+        {
+            uint64_t t_pre = hype_rdtsc();
+            if (g_fw_1_prev_post_tsc != 0) {
+                g_fw_1_body_tsc += t_pre - g_fw_1_prev_post_tsc;
+            }
+            if (ops->vcpu_run(ctx, &info) != 0) {
+                hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+            }
+            {
+                uint64_t t_post = hype_rdtsc();
+                g_fw_1_vmrun_tsc += t_post - t_pre;
+                g_fw_1_prev_post_tsc = t_post;
+            }
         }
 
         if (++total_exits > HYPE_FW_1_MAX_EXITS) {
@@ -4730,6 +4752,22 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                  "msr=%llu cpuid=%llu vintr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
                                  ex_cpuid, ex_vintr, ex_other);
+                /* M4-6d4: mean per-exit cost split VMRUN world-switch vs our
+                 * loop body, in nanoseconds (TSC / host_tsc_hz * 1e9). Tells
+                 * whether the ~219us/exit is the CPU's world-switch (VMRUN
+                 * dominates -> hard) or our code (body dominates -> fixable
+                 * GOP/serial/drain work). */
+                if (total_exits != 0) {
+                    unsigned long long vmrun_ns =
+                        (g_fw_1_vmrun_tsc / total_exits) * 1000000000ULL / g_fw_1_host_tsc_hz;
+                    unsigned long long body_ns =
+                        (g_fw_1_body_tsc / total_exits) * 1000000000ULL / g_fw_1_host_tsc_hz;
+                    hype_debug_print("fw-1 COSTHIST: mean_per_exit vmrun=%lluns body=%lluns "
+                                     "(vmrun_tot=%llums body_tot=%llums)\n",
+                                     vmrun_ns, body_ns,
+                                     (g_fw_1_vmrun_tsc / g_fw_1_host_tsc_hz) * 1000ULL,
+                                     (g_fw_1_body_tsc / g_fw_1_host_tsc_hz) * 1000ULL);
+                }
                 /* M4-6d4: companion line to EXHIST. The real-HW soft lockups
                  * (blkid stuck 24s, kworker stuck 26s -- confirmed by a
                  * "clocksource: Long readout interval ... 22.6s" the guest
@@ -5525,6 +5563,52 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             } else if (total_exits - inject_total >= HYPE_FW_1_KEY_WAIT_EXITS) {
                 booted = 1;
                 break;
+            }
+            /* M4-6d4: host-side idle wait -- the dominant efficiency lever.
+             * Reaching here means the guest HLTed with IF=1 and nothing
+             * deliverable yet: it is idle-waiting for its next timer edge.
+             * Instead of immediately re-entering the guest (which HLTs again
+             * at once -- QEMU measured 24.6M of 24.8M total exits as this
+             * idle spin, each a full VMRUN world-switch at ~4.3us), busy-wait
+             * on the host TSC until the nearest armed timer is actually due,
+             * then re-enter ONCE. This advances real wall-clock -- and thus
+             * the guest timebase on the next advance, since guest timers are
+             * ticked from the real elapsed TSC -- IDENTICALLY, so there is NO
+             * clock skew; it only removes the wasted world-switches. Nothing
+             * else can wake an idle guest in this model: AHCI/serial/PS2
+             * completions are produced synchronously by the guest's own
+             * MMIO/port exits, which cannot occur while it is halted. Capped
+             * at 10ms so the periodic flush, host input, and the idle-giveup
+             * stay responsive; a longer idle just re-waits in 10ms steps. */
+            if (g_fw_1_host_tsc_hz != 0) {
+                hype_svm_intr_state_t iw;
+                hype_svm_vcpu_get_intr_state(ctx, &iw);
+                if (((iw.rflags >> 9) & 1u) != 0) { /* IF=1: a real interrupt-wait */
+                    uint64_t ttn = 0; /* PIT ticks until the nearest armed timer edge */
+                    if (g_fw_1_pit.channels[0].counter != 0u) {
+                        ttn = (uint64_t)g_fw_1_pit.channels[0].counter;
+                    }
+                    if (g_fw_1_lapic.init_count != 0u &&
+                        (g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED) == 0 &&
+                        g_fw_1_lapic.current_count != 0u) {
+                        uint64_t lt = (uint64_t)g_fw_1_lapic.current_count;
+                        if (ttn == 0u || lt < ttn) { ttn = lt; }
+                    }
+                    if (ttn != 0u) {
+                        uint64_t wait_tsc = ttn * g_fw_1_host_tsc_hz / HYPE_PIT_HZ;
+                        uint64_t cap = g_fw_1_host_tsc_hz / 100ULL; /* 10ms */
+                        uint64_t start = hype_rdtsc();
+                        if (wait_tsc > cap) { wait_tsc = cap; }
+                        while (hype_rdtsc() - start < wait_tsc) {
+                            __asm__ volatile("pause");
+                        }
+                        /* Exclude this deliberate idle wait from the COSTHIST
+                         * loop-body accounting, so that metric keeps measuring
+                         * only real per-exit work (VMRUN vs handler code), not
+                         * time we intentionally spent halted. */
+                        g_fw_1_prev_post_tsc = hype_rdtsc();
+                    }
+                }
             }
             continue;
         }
