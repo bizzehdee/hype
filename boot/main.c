@@ -5078,10 +5078,35 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
             {
                 hype_svm_ioio_t io;
+                /* Absorb every access to an unmodeled port (harmless), but
+                 * trace each distinct (port,direction) only ONCE. Linux's
+                 * io_delay writes port 0x80 after nearly every inb/outb, so
+                 * rendering a line per access to the GOP framebuffer slows
+                 * the boot to a crawl on real hardware; latch it like the
+                 * MSR-trace flood so discovery still works without the
+                 * per-access render. */
+                static uint32_t seen_ports[128];
+                static unsigned int seen_ports_n = 0;
+                uint32_t key;
+                unsigned int k;
+                int already = 0;
                 hype_svm_vcpu_handle_unknown_ioio(ctx, &io);
-                hype_debug_print("fw-1: unhandled port 0x%x %s size=%u rip=0x%llx -- absorbing\n",
-                                  (unsigned int)io.port, io.is_in ? "IN" : "OUT",
-                                  (unsigned int)io.size_bytes, (unsigned long long)info.guest_rip);
+                key = (uint32_t)io.port | (io.is_in ? 0x80000000u : 0u);
+                for (k = 0; k < seen_ports_n; k++) {
+                    if (seen_ports[k] == key) {
+                        already = 1;
+                        break;
+                    }
+                }
+                if (!already) {
+                    hype_debug_print("fw-1: unhandled port 0x%x %s size=%u rip=0x%llx -- absorbing "
+                                      "(further hits on this port silenced)\n",
+                                      (unsigned int)io.port, io.is_in ? "IN" : "OUT",
+                                      (unsigned int)io.size_bytes, (unsigned long long)info.guest_rip);
+                    if (seen_ports_n < 128u) {
+                        seen_ports[seen_ports_n++] = key;
+                    }
+                }
             }
             continue;
         }
