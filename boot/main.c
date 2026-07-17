@@ -4735,14 +4735,20 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
          * driven TX: it enables ETBEI and sleeps until the TX-empty IRQ
          * fires. Without this, any process that writes enough to the serial
          * console (e.g. apk's --progress bars during "Installing packages")
-         * blocks forever. Gated on the line not already being in service. */
+         * blocks forever. Gated on the line being unmasked (the guest
+         * actually uses serial IRQs on it -- e.g. COM1/IRQ4) and not
+         * already in service; raising a masked line (e.g. COM2/IRQ3 when
+         * the guest only polls ttyS1) would just leave a stuck, unhandled
+         * IRR bit. */
         {
             unsigned u;
             for (u = 0; u < 2u; u++) {
                 hype_guest_uart_t *uart = (u == 0) ? &g_fw_1_uart : &g_fw_1_uart2;
                 uint8_t irqn = (u == 0) ? 4u : 3u; /* COM1=IRQ4, COM2=IRQ3 */
+                uint8_t bit = (uint8_t)(1u << irqn);
                 if (hype_guest_uart_irq_pending(uart) &&
-                    (g_fw_1_pic.master.isr & (uint8_t)(1u << irqn)) == 0) {
+                    (g_fw_1_pic.master.imr & bit) == 0 &&
+                    (g_fw_1_pic.master.isr & bit) == 0) {
                     hype_pic_emu_raise_irq(&g_fw_1_pic.master, irqn);
                 }
             }
@@ -5378,6 +5384,22 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                           (unsigned int)g_fw_1_pic.slave.irr, (unsigned int)g_fw_1_pic.slave.imr,
                           (unsigned int)g_fw_1_ahci.p_is, (unsigned int)g_fw_1_ahci.p_ci,
                           hype_ahci_irq_pending(&g_fw_1_ahci));
+        /* The guest is live-idle waiting on a timer IRQ that stopped
+         * coming. Surface the timebase + both clockevent sources so we
+         * can tell a miscalibrated host_tsc_hz (PIT/LAPIC advancing at the
+         * wrong rate) from a tickless guest that stopped the periodic PIT
+         * and armed a one-shot LAPIC timer we're not firing. */
+        hype_debug_print("fw-1: TIMER-STATE: host_tsc_hz=%llu PIT0 mode=%u reload=%u counter=%u | "
+                          "LAPIC lvt_timer=0x%x(%s) init=%u cur=%u pend=%d insvc=%d\n",
+                          (unsigned long long)g_fw_1_host_tsc_hz,
+                          (unsigned int)g_fw_1_pit.channels[0].mode,
+                          (unsigned int)g_fw_1_pit.channels[0].reload,
+                          (unsigned int)g_fw_1_pit.channels[0].counter,
+                          (unsigned int)g_fw_1_lapic.lvt_timer,
+                          (g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_PERIODIC) ? "periodic" : "1shot",
+                          (unsigned int)g_fw_1_lapic.init_count,
+                          (unsigned int)g_fw_1_lapic.current_count,
+                          g_fw_1_lapic.timer_irq_pending, g_fw_1_lapic.timer_in_service);
     }
 
     if (booted && key_reacted) {
