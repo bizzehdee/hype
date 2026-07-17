@@ -1665,19 +1665,29 @@ tasks — see updated deps below.*
 
   *OPEN QUESTIONS / NEXT STEPS (the real d3 blocker is the idle-wait,
   not the p_ci artifact):*
-    1. *Re-settle the `p_ci=0xe8` question with NON-lossy instrumentation
-       that survives the read burst -- e.g. snapshot the stuck slots'
-       command headers into a static buffer during the burst and print
-       it only once, well into the idle phase (serial long drained), or
-       count `p_ci`-left-nonzero events into a counter printed at idle.
-       FW-1 is single-vCPU (verified), so this is not a race; the goal
-       is to learn whether 0xe8 is real uncompleted commands (=> a
-       completion/clear bug) or a stale/artifact value.*
-    2. *Identify the idle-wait cause: leading hypothesis is a guest
-       userspace block during `apk` (package install) -- getrandom/CRNG
-       entropy, or a device/timer wait -- since the guest issues no new
-       AHCI commands while idle. (RDRAND is passed through in CPUID
-       leaf-1 ECX, so entropy is plausible-but-uncertain.)*
+    1. *AHCI ruled out as the idle-wait cause (drain experiment, 2026-
+       07-17): added a one-shot `hype_svm_vcpu_drain_ahci_stuck()` that
+       force-completes every set PxCI slot + raises the completion IRQ
+       after ~8s of idle with `p_ci != 0`. It NEVER fired across ample
+       idle -- i.e. at the loop's decision point `g_fw_1_ahci.p_ci`
+       reads 0 (the wall-clock term works; the histogram used the same
+       `host_tsc_hz` gate and fired every 3s). So there are no reliably-
+       detectable stuck AHCI commands; the earlier `0xe8` was an
+       instrumentation/compiler read artifact, not real outstanding
+       work. Combined with the guest issuing NO new AHCI commands while
+       idle, the AHCI/ATAPI model is NOT the blocker. (Experiment
+       reverted.)*
+    2. *THE remaining blocker: identify the guest-side idle-wait cause.
+       The guest CPU is idle at the native idle RIP, issuing no AHCI
+       commands, waiting on a non-device event -- most likely a
+       userspace block during `apk` (package install): getrandom/CRNG
+       entropy is the leading hypothesis (RDRAND is passed through in
+       CPUID leaf-1 ECX, so it is plausible-but-uncertain), or a futex/
+       pipe/timer wait. Needs guest-side visibility: boot with a more
+       verbose Alpine cmdline (e.g. keep the random-subsystem prints /
+       `ignore_loglevel`), or provide a guest entropy source (virtio-rng
+       is a new device model; simplest test would be a kernel-cmdline
+       entropy-trust flag if the ISO's bootloader config can be edited).*
     3. *Validate on real AMD hardware: the guest runs at native speed
        there (no nested-SVM overhead) and with real timing/entropy, so a
        real-HW run would show whether this stall is QEMU-nested-SVM-
