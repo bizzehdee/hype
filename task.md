@@ -1799,6 +1799,30 @@ tasks — see updated deps below.*
   IF=0 / defer-overwrite). QEMU-validated: no false positive, no
   regression. The next real-HW run's TIMER-STARVE line names the fix.*
 
+  *3rd real-HW run (TIMER-STARVE build): TIMER-STARVE NEVER fired ->
+  REFUTES the delivery-gate hypothesis. pit_irq0 climbs steadily the
+  whole boot (never freezes) -> the timer IS raised and delivered
+  promptly (<2s). Reframed by the hard numbers: 899,152 exits over
+  196.9s = ~219us/exit on real HW, vs QEMU running the SAME boot in 26M
+  exits at ~6us each. The soft lockups are a symptom of the whole loop
+  being ~38x slower per exit, not a timer bug. QEMU COSTHIST (added
+  this session, commit 0371011) localised the dominant cost: 24.6M of
+  24.8M exits (99%) are the guest busy-spinning HLT while idle-waiting
+  for its next timer edge -- each a full VMRUN world-switch. FIX shipped:
+  host-side idle wait -- when the guest HLTs with IF=1 and nothing
+  deliverable, busy-wait on the host TSC until the nearest armed timer
+  is due (cap 10ms) instead of re-entering; advances real time (and the
+  TSC-derived guest timebase) identically, NO skew, nothing else wakes
+  an idle guest in this model. QEMU: total exits 24.8M -> 191k, HLT
+  24.6M -> 6.5k (~130x), boot unaffected. NOTE: idle spin is
+  real-time-proportional so this saves host CPU but may not by itself
+  cut wall-clock-to-login; the remaining cost is in PRODUCTIVE exits
+  (~219us each on real HW). NEXT (user will run on a 5950x bare-metal):
+  COSTHIST vmrun-vs-body split on real HW localises that 219us to either
+  the SVM world-switch (ASID/TLB/microcode) or our loop body (GOP
+  framebuffer flush -- hype_debug_print flushes the whole FB to VRAM per
+  console line -- / real-serial / drain), which dictates the next fix.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
