@@ -1823,6 +1823,29 @@ tasks — see updated deps below.*
   framebuffer flush -- hype_debug_print flushes the whole FB to VRAM per
   console line -- / real-serial / drain), which dictates the next fix.*
 
+  *5950x BARE-METAL run (2026-07-17, idle-wait + COSTHIST build): idle
+  wait CONFIRMED on real HW -- HLT exits 657k -> 97, total 899k -> 260k.
+  COSTHIST split CLEARS our loop body as the cost: body_tot=13s (~50us/
+  exit, 5%); the other 95% (246s) is INSIDE vcpu_run (guest execution +
+  world-switch), NOT the GOP/serial/drain code -- so the framebuffer-
+  flush theory is refuted. Guest runs at ~0.67x real time (guest kernel
+  clock 174s vs ~259s wall) -- respectable, not a gross overhead.
+  Still stalls at the SAME "Scanning hardware for mdev" ~174s with soft
+  lockups. THE lead: only 707 PIT IRQ0 delivered over 174s guest-seconds
+  = ~4 Hz, while the guest arms one-shots as short as reload=234 (196us)
+  and periodic reload=11932 (100 Hz) -- the scheduler-tick clockevent is
+  under-delivered ~25x. NOT the in-service gate (mISR=sISR=0x0 at the
+  sample points). And the soft lockup is blkid/kworker STUCK ON the CPU
+  24s (spinning), not starved off it -- consistent with a task busy-
+  waiting on a timer/IO deadline that our under-delivered tick keeps
+  pushing out. NEXT (real-HW iteration, QEMU can't reproduce -- it runs
+  periodic-PIT at ~100 Hz and boots): instrument WHY PIT IRQ0 edges are
+  lost between arm and delivery under the idle-wait + AHCI-storm load
+  (candidate: a mode-4 one-shot re-armed by the guest before we sampled/
+  delivered its prior edge; or the idle-wait computing the wrong
+  next-deadline so short one-shots are serviced late). That is the fix
+  that gets to login.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
