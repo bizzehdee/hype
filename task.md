@@ -1893,6 +1893,24 @@ tasks — see updated deps below.*
   QEMU can't reproduce the reset (guest config differs), so this
   in-guest catch is the way to localise it.*
 
+  *UPDATE 2026-07-18: format fix did NOT clear it (laptop retest resets
+  at the same mdev point) -- so the %02x arg-shift wasn't the crash.
+  Implemented the exception catcher (commit bbdce28), simpler than the
+  full hybrid IDT: patch ONLY the 32 exception vectors (0-31) in the
+  live firmware IDT in place (sidt + encode gates at our existing ISR
+  stubs with the current CS), restore after the loop; IRQ vectors and
+  Boot-Services storage untouched. A host fault now flushes
+  "PANIC: unhandled interrupt: vector=N (#PF/...) rip=0x.." instead of
+  silently resetting. QEMU-validated: arms, no spurious fire, no
+  regression (boot reaches Loading-hardware-drivers). NEXT real-HW run
+  with this build should print the PANIC line naming the faulting vector
+  + RIP; disassemble hype.efi at that RIP to find the offending
+  handler/deref, then fix it (add the missing bounds check / fail the
+  operation). If instead the machine STILL resets with no PANIC, the
+  fault is a double/triple fault our single-level handler can't catch
+  (e.g. a bad stack), pointing at a stack/GDT issue rather than a data
+  pointer.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
