@@ -1612,6 +1612,82 @@ tasks — see updated deps below.*
   exercise the same M4-6d2 block path harder; a from-disk install is
   M5's job. Deps: M4-6d2.
 
+  *DIAGNOSIS 2026-07-17 (alpine-virt-console.iso, QEMU -accel kvm -cpu
+  host). The boot now reaches deep into userspace: kernel -> `/init` ->
+  "Mounting boot media: ok." -> "Installing packages to root
+  filesystem..." with 237 ATAPI READ(10)s all completing GOOD (128KB
+  each). It then enters a persistent idle-HLT wait and makes no further
+  console progress. Characterised the stall with a per-exit histogram:*
+    - *During the stall the guest is a pure idle loop at a FIXED kernel
+      RIP (0xffffffff..b3bbde = native idle/`default_idle`): ~710k HLT
+      exits / 3s, ~1200 IOIO/3s (timer housekeeping only), **npf=0** --
+      it issues NO new AHCI commands. So the guest CPU is genuinely
+      idle, woken each timer tick, waiting on a non-device event. It is
+      NOT CPU-spinning and NOT waiting on a read it is issuing.*
+    - *`read10_count` is frozen at 237; no new CDBs (read or TUR/SENSE).*
+    - *The idle-detector never fires because the timer IOIO churn counts
+      as "progress" -- the guest is legitimately idle, not wedged in the
+      earlier M4-6d2 sense.*
+
+  *RED HERRING RESOLVED: the AHCI model shows `p_ci=0xe8` at idle (looks
+  like 4 outstanding commands on slots 3/5/6/7), but this is NOT real
+  outstanding work:*
+    - *Slots 3/5/6/7 all completed GOOD earlier; the reads use
+      incrementing slots (libata cycles tags 0..31).*
+    - *The multi-slot AHCI handler provably leaves `p_ci=0` at every
+      entry/exit (added ungated latched entry/exit/post-loop probes:
+      none ever fired). Only `hype_ahci_mmio_write`'s CI case sets
+      `p_ci` bits, and FW-1 uses only the ATAPI multi-slot handler.*
+    - *A main-loop probe showed `p_ci` reads 0xe8 at the histogram-state
+      print but a reload'd dump-guard a few lines later never fired
+      (82 idle windows), despite `p_ci!=0` and `read10==hist_last` both
+      apparently true. I first read this as a concurrent writer, but
+      that is REFUTED: `run_all_test_guests` (which holds the FW-1 loop)
+      is dispatched to a SINGLE pinned AP via `StartupThisAP` (or inline
+      on the BSP) -- FW-1 runs the guest on ONE vCPU, so there is no
+      second thread touching `g_fw_1_ahci`. The state-print-vs-guard
+      discrepancy is therefore a compiler/probe artifact (or a guard-
+      logic bug), NOT concurrency. NET: whether `p_ci=0xe8` is real
+      stuck commands or an instrumentation artifact is UNRESOLVED -- all
+      the p_ci probes were confounded by serial-line drops during the
+      high-volume read burst (16k NPF/3s >> serial throughput). The one
+      solid point stands: while idle the guest issues NO new AHCI
+      commands (npf=0), so it is not actively waiting on our AHCI model.*
+    - *`ghc=0x0` at idle is normal, not corruption: the AHCI model has
+      no GHC-write case, so GHC is never stored (aside: this means
+      `hype_ahci_irq_pending()` = GHC.IE && ... is always false -- worth
+      revisiting, though the Linux guest's completions worked via the
+      per-command PxIS latch).*
+    - *FW-1 guest RAM is NOT the corruption source: it is properly
+      remapped (guest-phys [0,GUEST_RAM) -> a dedicated allocated buffer
+      via hype_npt_map_range + the dma map, [GUEST_RAM,4GB) marked
+      not-present), so guest RAM writes cannot reach hypervisor `.bss`.*
+
+  *OPEN QUESTIONS / NEXT STEPS (the real d3 blocker is the idle-wait,
+  not the p_ci artifact):*
+    1. *Re-settle the `p_ci=0xe8` question with NON-lossy instrumentation
+       that survives the read burst -- e.g. snapshot the stuck slots'
+       command headers into a static buffer during the burst and print
+       it only once, well into the idle phase (serial long drained), or
+       count `p_ci`-left-nonzero events into a counter printed at idle.
+       FW-1 is single-vCPU (verified), so this is not a race; the goal
+       is to learn whether 0xe8 is real uncompleted commands (=> a
+       completion/clear bug) or a stale/artifact value.*
+    2. *Identify the idle-wait cause: leading hypothesis is a guest
+       userspace block during `apk` (package install) -- getrandom/CRNG
+       entropy, or a device/timer wait -- since the guest issues no new
+       AHCI commands while idle. (RDRAND is passed through in CPUID
+       leaf-1 ECX, so entropy is plausible-but-uncertain.)*
+    3. *Validate on real AMD hardware: the guest runs at native speed
+       there (no nested-SVM overhead) and with real timing/entropy, so a
+       real-HW run would show whether this stall is QEMU-nested-SVM-
+       specific or a genuine hype bug (as the M4-6d2 plateau turned out
+       to be a real bug). This is the M4-6d2-established discipline.*
+
+  *Diagnostics used were reverted before commit (clean tree); the
+  characterisation above is the deliverable. Session logs under the
+  scratchpad (m46d3-*.log) hold the raw histograms.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
