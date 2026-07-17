@@ -191,14 +191,29 @@ unsigned hype_pit_emu_advance(hype_pit_emu_t *pit, uint64_t ticks) {
             cur = (step < cur) ? (cur - step) : (period - (step - cur));
             ch->counter = (uint16_t)cur;
         } else {
-            /* One-shot (modes 0/1/4/5): counts down to 0 and stops. */
-            if (ticks >= (uint64_t)ch->counter) {
-                ch->counter = 0;
-                if (i == 2 && ch->mode == 0u) {
-                    pit->ch2_out = 1;
+            /* One-shot (modes 0/1/4/5): counts down to 0 and stops. Only
+             * act on the transition to 0 -- once it's already 0 it stays
+             * put until the guest reprograms it (a fresh reload write). */
+            if (ch->counter != 0u) {
+                if (ticks >= (uint64_t)ch->counter) {
+                    ch->counter = 0;
+                    /* A channel-0 terminal-count crossing is an IRQ0 edge,
+                     * exactly as for a periodic wrap: a tickless Linux
+                     * kernel arms a ONE-SHOT PIT (mode 0/4) as its
+                     * clockevent for the next wakeup, so a one-shot expiry
+                     * MUST raise IRQ0 or the guest, having stopped the
+                     * periodic tick, never wakes from idle (observed on
+                     * real AMD -- the guest wedged with PIT0 mode=4
+                     * counter=0 and no IRQ0 pending). Fire once. */
+                    if (i == 0) {
+                        ch0_wraps = 1;
+                    }
+                    if (i == 2 && ch->mode == 0u) {
+                        pit->ch2_out = 1;
+                    }
+                } else {
+                    ch->counter = (uint16_t)((uint64_t)ch->counter - ticks);
                 }
-            } else {
-                ch->counter = (uint16_t)((uint64_t)ch->counter - ticks);
             }
         }
     }

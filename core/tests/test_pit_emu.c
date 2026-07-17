@@ -327,6 +327,32 @@ static void test_advance_periodic_wraps(void) {
               (pit.channels[0].counter >= 1 && pit.channels[0].counter <= 1000));
 }
 
+static void test_advance_one_shot_ch0_raises_irq0_once(void) {
+    hype_pit_emu_t pit;
+    unsigned edges;
+    hype_pit_emu_reset(&pit);
+    /* Channel 0, lobyte/hibyte, mode 0 (interrupt on terminal count) -- a
+     * one-shot clockevent, exactly what a tickless Linux arms for its
+     * next wakeup. Reload = 100. */
+    hype_pit_emu_io_write(&pit, 0x43, 0x30);
+    hype_pit_emu_io_write(&pit, 0x40, 100);
+    hype_pit_emu_io_write(&pit, 0x40, 0);
+    CHECK_HEX("one-shot armed to reload", 100, pit.channels[0].counter);
+
+    edges = hype_pit_emu_advance(&pit, 40);
+    CHECK_HEX("no IRQ0 edge before terminal count", 0, edges);
+    CHECK_HEX("counter decremented", 60, pit.channels[0].counter);
+
+    edges = hype_pit_emu_advance(&pit, 100);
+    CHECK_HEX("one-shot raises exactly one IRQ0 edge at terminal count", 1, edges);
+    CHECK_HEX("counter stops at 0", 0, pit.channels[0].counter);
+
+    /* A spent one-shot must not keep re-raising IRQ0 (that would flood the
+     * guest); it stays at 0 until reprogrammed. */
+    edges = hype_pit_emu_advance(&pit, 100000);
+    CHECK_HEX("spent one-shot does not re-fire", 0, edges);
+}
+
 int main(void) {
     test_reset_defaults();
     test_unrecognized_port_rejected();
@@ -348,6 +374,7 @@ int main(void) {
     test_port61_refresh_toggles();
     test_port61_write_masks_to_writable_bits();
     test_advance_one_shot_ch2_saturates_and_sets_out();
+    test_advance_one_shot_ch0_raises_irq0_once();
     test_advance_periodic_wraps();
 
     if (failures == 0) {

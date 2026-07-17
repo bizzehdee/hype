@@ -5409,7 +5409,10 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                           (unsigned int)g_fw_1_pit.channels[0].reload,
                           (unsigned int)g_fw_1_pit.channels[0].counter,
                           (unsigned int)g_fw_1_lapic.lvt_timer,
-                          (g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_PERIODIC) ? "periodic" : "1shot",
+                          (g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED)
+                              ? "masked"
+                              : ((g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_PERIODIC) ? "periodic"
+                                                                                          : "1shot"),
                           (unsigned int)g_fw_1_lapic.init_count,
                           (unsigned int)g_fw_1_lapic.current_count,
                           g_fw_1_lapic.timer_irq_pending, g_fw_1_lapic.timer_in_service);
