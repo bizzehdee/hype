@@ -1955,6 +1955,23 @@ tasks — see updated deps below.*
   (console-I/O VM-exit volume: ioio dominated by the polled 8250 UART,
   ~2-3 exits/char) is pure quality-of-life, tracked separately.*
 
+  *CORRECTION 2026-07-18: the confirmed real-HW login was on the
+  WATCHDOG-ONLY build. The 8259 priority-delivery attempt (commit
+  eab470c) was REVERTED (commit ba821ba) -- it REGRESSED on real HW:
+  because the tickless guest re-arms very short one-shot timers (~196us),
+  IRQ0 is almost always pending, and "highest-priority pending always
+  wins" then STARVED the lower-priority AHCI completion IRQ (ahci_irq
+  fell 3447 -> 8), so CD reads stalled and the guest hit "Mounting boot
+  media: failed" at ~122s, never reaching Installing-packages. The old
+  strict "one-in-service-at-a-time" gate was inadvertently PROTECTING
+  AHCI delivery. Tick delivery WAS much faster with the change (pit_irq0
+  707 -> 6322), so the idea is sound but the implementation starves
+  devices. A safe future version needs fairness (a waiting device IRQ
+  must not be starved by a high-frequency re-pending timer) and must not
+  clobber a staged AHCI EVENTINJ with IRQ0. For now the known-good
+  watchdog-only build (reaches login) is restored and repackaged;
+  tick-rate slowness stays QoL, not a blocker.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
