@@ -5847,6 +5847,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * Services or which GDT/IDT happens to be active either way. */
     hype_serial_init(HYPE_SERIAL_COM1, 115200);
 
+    /* M4-6d4: disable the UEFI watchdog timer. Firmware arms it (5-minute
+     * default) when it hands control to a boot application and force-RESETS
+     * the machine if that app runs the whole period without calling
+     * ExitBootServices(). Our FW-1 guest loop deliberately runs for many
+     * minutes of wall-clock BEFORE ExitBootServices (the log flush needs
+     * Boot Services), so the watchdog fired mid-boot -- the real-HW reset
+     * at ~5 min (both a 5950x and a Zen2 laptop reset in the 250-280s wall
+     * window) with NO panic and uncatchable by our exception handler,
+     * because it is a firmware reset, not a CPU fault. Timeout=0 disarms
+     * it. Harmless on QEMU (whose OVMF watchdog never fired in-window). */
+    if (SystemTable->BootServices->SetWatchdogTimer != 0) {
+        SystemTable->BootServices->SetWatchdogTimer(0, 0, 0, 0);
+    }
+
     status = hype_memmap_get(SystemTable->BootServices, &map, &map_size, &desc_size, &map_key);
     if (status != EFI_SUCCESS) {
         hype_fatal("failed to get memory map: 0x%llx", (unsigned long long)status);

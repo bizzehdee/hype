@@ -133,6 +133,16 @@ typedef EFI_STATUS (EFIAPI *EFI_EXIT_BOOT_SERVICES)(
     EFI_HANDLE ImageHandle,
     UINTN MapKey);
 
+/* UEFI arms a watchdog timer (5-minute default) that resets the machine
+ * if a Boot Services application runs that long without calling
+ * ExitBootServices() -- a long-running guest loop must disable it with
+ * Timeout=0, or the firmware force-reboots mid-run. */
+typedef EFI_STATUS (EFIAPI *EFI_SET_WATCHDOG_TIMER)(
+    UINTN Timeout,
+    UINT64 WatchdogCode,
+    UINTN DataSize,
+    CHAR16 *WatchdogData);
+
 typedef struct {
     UINT32 Data1;
     UINT16 Data2;
@@ -197,7 +207,7 @@ typedef struct {
     EFI_EXIT_BOOT_SERVICES ExitBootServices;
     void *GetNextMonotonicCount;
     void *Stall;
-    void *SetWatchdogTimer;
+    EFI_SET_WATCHDOG_TIMER SetWatchdogTimer;
     void *ConnectController;
     void *DisconnectController;
     void *OpenProtocol;
