@@ -103,24 +103,4 @@ void hype_pic_emu_raise_global_irq(hype_pic_emu_t *pic, uint8_t global_irq);
  */
 int hype_pic_emu_acknowledge(hype_pic_emu_t *pic, uint8_t *out_vector);
 
-/*
- * M4-6d4: priority-aware "is anything deliverable right now?" predicate for
- * the dispatch loop. Real 8259 fully-nested mode delivers the highest-
- * priority pending+unmasked IRQ whenever it OUTRANKS whatever is currently
- * in service -- a higher-priority line preempts a lower-priority one that's
- * mid-service (the CPU takes the nested interrupt once it can). The old loop
- * gated all delivery on "both ISRs completely clear", which serialized every
- * interrupt and let a lower-priority in-service line (e.g. an AHCI completion
- * IRQ on a slave line during a CD-read storm) block the highest-priority
- * timer tick IRQ0 -- starving the guest's scheduler tick. This returns 1 iff
- * there is a pending, unmasked, cascade-reachable IRQ whose priority is
- * strictly higher than the highest-priority IRQ currently in service (or
- * nothing is in service). Priority order matches the 8259: master IR0 (top),
- * IR1, then the slave's IR8..IR15 via the IR2 cascade, then master IR3..IR7.
- * Pure logic; the caller still injects through the IF/shadow-respecting
- * request path, so this only removes the artificial serialization -- it never
- * forces an interrupt the guest can't yet accept.
- */
-int hype_pic_emu_has_deliverable(const hype_pic_emu_t *pic);
-
 #endif /* HYPE_DEVICES_PIC_H */

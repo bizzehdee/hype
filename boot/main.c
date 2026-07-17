@@ -5004,7 +5004,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
          * injected, skip acknowledging a new one this iteration so the
          * freshly-staged EVENTINJ isn't clobbered. */
         if (!hype_svm_vcpu_deliver_pending_if_ready(ctx) &&
-            hype_pic_emu_has_deliverable(&g_fw_1_pic)) {
+            g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
             uint8_t pic_vector;
             if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
                 hype_svm_vcpu_request_interrupt(ctx, pic_vector);
@@ -5563,11 +5563,14 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 int if_set, pic_ready;
                 hype_svm_vcpu_get_intr_state(ctx, &is);
                 if_set = (int)((is.rflags >> 9) & 1u);
-                pic_ready = hype_pic_emu_has_deliverable(&g_fw_1_pic);
+                pic_ready = (g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) &&
+                            (((g_fw_1_pic.master.irr & (uint8_t)~g_fw_1_pic.master.imr) != 0) ||
+                             ((g_fw_1_pic.slave.irr & (uint8_t)~g_fw_1_pic.slave.imr) != 0 &&
+                              (g_fw_1_pic.master.imr & (uint8_t)(1u << 2)) == 0));
                 if (if_set && (is.pending_valid || pic_ready)) {
                     hype_svm_vcpu_wake_hlt(ctx); /* retire HLT + clear STI shadow */
                     if (!hype_svm_vcpu_deliver_pending_if_ready(ctx) &&
-                        hype_pic_emu_has_deliverable(&g_fw_1_pic)) {
+                        g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
                         uint8_t v;
                         if (hype_pic_emu_acknowledge(&g_fw_1_pic, &v)) {
                             hype_svm_vcpu_request_interrupt(ctx, v);
