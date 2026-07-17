@@ -1744,6 +1744,44 @@ tasks — see updated deps below.*
   characterisation above is the deliverable. Session logs under the
   scratchpad (m46d3-*.log) hold the raw histograms.*
 
+- [~] **M4-6d4** — Real-hardware timer-tick starvation (soft lockups).
+  IN PROGRESS 2026-07-17 (commits 098e857, ab110e4); BLOCKED on a
+  real-HW log from the new build. On real AMD hardware the STOCK
+  alpine-virt boot is no longer wedging or crashing (M4-6d3's serial-TX
+  and the PIT one-shot IRQ0 fixes hold): it reaches deep into OpenRC
+  (modloop verify, mdev, "Scanning hardware for mdev ... [ ok ]") at
+  ~195s guest time. But it is SLOW, with two watchdog soft lockups
+  (`blkid` stuck 24s, `kworker` stuck 26s) and the guest's own
+  `clocksource: Long readout interval ... cs_nsec 22.6s / wd_nsec 22.6s`
+  -- i.e. ~22s of real time passed with the scheduler tick absent. NOT
+  a crash (no GIVEUP/PANIC anywhere) and NOT a stuck-in-service IRQ (the
+  WEDGE dump, gated on ISR!=0, never fired; PIC ISRs were clear).
+
+  *Exit-histogram (EXHIST) analysis: two regimes. Busy "Installing
+  packages" phase is ioio-dominated (+167k, hlt=0). The OpenRC phase is
+  HLT-dominated (0 -> 641k HLTs) -- the guest idles waiting on a
+  one-shot clockevent whose delivery rate collapses, starving specific
+  tasks 20+s. io80 is only 0.4% of ioio (port 0x80 confirmed a
+  non-factor); TSC calibration is correct (guest detects 2096.61 MHz =
+  our calibrated host_tsc_hz), so timekeeping READS are fine -- it is
+  purely timer-IRQ DELIVERY.*
+
+  *Root-cause narrowing (this session): the real-HW guest is tickless
+  (stable TSC) and arms a ONE-SHOT clockevent; QEMU runs the FW-1 guest
+  with a PERIODIC PIT (mode 2, ~100 Hz) and the LAPIC timer MASKED, so
+  QEMU exercises NEITHER one-shot path -- which is why it boots smoothly
+  and why the bug is real-HW-only. Added a periodic TIMERHIST diagnostic
+  (companion to EXHIST: cumulative PIT-IRQ0 / LAPIC-timer / AHCI IRQ
+  counts + live clockevent programming + PIC IMR/ISR) so diffing two
+  lines across the stall shows which source stalls. Added the missing
+  one-shot RE-ARM cycle unit tests to both device models (arm -> fire ->
+  re-arm -> fire again, several rounds) -- both PASS, proving the PIT
+  and LAPIC one-shot device models are sound, so the fix belongs in the
+  FW-1 loop's IRQ delivery/gating, not the device layer. Validated in
+  QEMU (real FAT-image ESP, not fragile vvfat); no regression. USB image
+  repackaged. NEXT: real-HW TIMERHIST run to pick the exact fix.
+  Deps: M4-6d3.
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
