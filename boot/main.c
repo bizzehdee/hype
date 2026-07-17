@@ -5368,6 +5368,16 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                           (unsigned long long)gs.interrupt_shadow, (unsigned long long)gs.eventinj,
                           gs.can_accept, gs.pending_valid, (unsigned int)gs.pending_vector,
                           (unsigned long long)info.reason);
+        /* What was waiting to be delivered when it wedged: a set IRR bit
+         * (unmasked) means an IRQ was pending in the PIC but never
+         * injected; PxIS/PxCI show an AHCI completion pending or a command
+         * still outstanding. */
+        hype_debug_print("fw-1: PEND-STATE: mIRR=0x%x mIMR=0x%x sIRR=0x%x sIMR=0x%x "
+                          "ahci_p_is=0x%x ahci_p_ci=0x%x ahci_irq_pending=%d\n",
+                          (unsigned int)g_fw_1_pic.master.irr, (unsigned int)g_fw_1_pic.master.imr,
+                          (unsigned int)g_fw_1_pic.slave.irr, (unsigned int)g_fw_1_pic.slave.imr,
+                          (unsigned int)g_fw_1_ahci.p_is, (unsigned int)g_fw_1_ahci.p_ci,
+                          hype_ahci_irq_pending(&g_fw_1_ahci));
     }
 
     if (booted && key_reacted) {
