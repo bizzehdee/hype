@@ -1846,6 +1846,20 @@ tasks — see updated deps below.*
   next-deadline so short one-shots are serviced late). That is the fix
   that gets to login.*
 
+  *QEMU CANNOT REPRODUCE (verified 2026-07-17): even with -cpu
+  host,+invtsc, QEMU stays on periodic-PIT (mode 2, ~100 Hz) and its
+  guest actually falls back to refined-jiffies -- QEMU's TSC never
+  passes the kernel's clocksource-stability watchdog, so the guest never
+  goes tickless and never arms the short mode-4 one-shots that under-
+  deliver on real HW. The failing regime is real-HW-only; iterating the
+  fix needs the bare-metal loop, with the TIMERHIST/TIMER-STARVE/COSTHIST
+  instrumentation already in place. Recommended next-session experiment:
+  log, per PIT ch0 re-arm, the (mode, reload) the guest writes and
+  whether the PRIOR one-shot's edge was delivered before the re-arm -- a
+  re-arm that clobbers an undelivered edge is the likely ~25x loss, and
+  the fix is to latch the pending edge across re-arm (raise IRQ0 on
+  re-arm if the prior count had not been consumed).*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
