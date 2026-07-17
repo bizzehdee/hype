@@ -28,3 +28,17 @@ EFI_GRAPHICS_OUTPUT_PROTOCOL *hype_fatal_get_gop_protocol(void) {
 void *hype_fatal_get_real_fb(void) {
     return g_gop_real_fb;
 }
+
+/* Optional hook run by hype_fatal() just before it halts, so a panic
+ * mid-run still flushes the captured console log (core/logbuf.h) to disk
+ * for real-hardware debugging. Registered by boot/main.c; NULL by default
+ * (e.g. in unit tests) so hype_fatal() stays self-contained. */
+static hype_flush_hook_t g_flush_hook = 0;
+
+void hype_fatal_set_flush_hook(hype_flush_hook_t hook) {
+    g_flush_hook = hook;
+}
+
+hype_flush_hook_t hype_fatal_get_flush_hook(void) {
+    return g_flush_hook;
+}

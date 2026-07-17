@@ -88,13 +88,14 @@ EFI_STATUS hype_file_write_new(EFI_FILE_PROTOCOL *root, CHAR16 *path, const void
     EFI_STATUS status;
     UINTN write_size = size;
 
-    /* Delete any stale copy first so a shorter run can't leave a tail of
-     * a previous, longer one -- Delete() also closes the handle. */
-    if (root->Open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0) == EFI_SUCCESS) {
-        file->Delete(file);
-        file = 0;
-    }
-
+    /* Open (creating if absent) and overwrite from offset 0. Deliberately
+     * does NOT delete+recreate each call: this is written repeatedly to
+     * the same growing log file (periodic flush), and the delete+create
+     * churn is exactly what trips fragile FAT write paths -- QEMU's vvfat
+     * asserts, and picky firmware drivers can choke too. The caller writes
+     * a monotonically GROWING buffer, so overwriting from 0 never leaves a
+     * stale tail within a run; cross-run stale data is cleared once up
+     * front via hype_file_delete(). */
     status = root->Open(root, &file, path,
                         EFI_FILE_MODE_CREATE | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_READ, 0);
     if (status != EFI_SUCCESS) {
@@ -113,4 +114,13 @@ EFI_STATUS hype_file_write_new(EFI_FILE_PROTOCOL *root, CHAR16 *path, const void
         return EFI_ABORTED;
     }
     return EFI_SUCCESS;
+}
+
+EFI_STATUS hype_file_delete(EFI_FILE_PROTOCOL *root, CHAR16 *path) {
+    EFI_FILE_PROTOCOL *file = 0;
+    EFI_STATUS status = root->Open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+    if (status != EFI_SUCCESS) {
+        return status; /* not present (or unopenable) -- nothing to delete */
+    }
+    return file->Delete(file); /* Delete() closes the handle too */
 }

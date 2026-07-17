@@ -4381,6 +4381,42 @@ static void fw_1_debug_feed(hype_vt_filter_t *filter, char *line, unsigned int *
     line[(*line_len)++] = c;
 }
 
+/* Real-hardware, serial-less logging (core/logbuf.h + core/file_io.h).
+ * The boot volume root is located ONCE on the BSP (fw_1_log_init, before
+ * the guest is dispatched -- possibly to a pinned AP), so a flush from
+ * the FW-1 loop or from hype_fatal() only re-opens+writes the file rather
+ * than doing HandleProtocol from a non-BSP context. Fully best-effort:
+ * the first write that errors (a read-only or non-FAT volume) disables
+ * further attempts so it can never wedge the boot. */
+static EFI_FILE_PROTOCOL *g_fw_1_log_root = 0;
+static int g_fw_1_log_disabled = 0;
+
+static void fw_1_flush_log(void) {
+    if (g_fw_1_log_disabled || g_fw_1_log_root == 0) {
+        return;
+    }
+    if (hype_file_write_new(g_fw_1_log_root, (CHAR16 *)L"\\hype-log.txt", hype_logbuf_data(),
+                             (UINTN)hype_logbuf_len()) != EFI_SUCCESS) {
+        g_fw_1_log_disabled = 1;
+    }
+}
+
+/* Called once on the BSP (Boot Services file I/O proven -- the ISO was
+ * just read from this volume) to cache the root + register the crash-time
+ * flush hook. */
+static void fw_1_log_init(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs) {
+    if (hype_file_locate_root(image_handle, bs, &g_fw_1_log_root) != EFI_SUCCESS) {
+        g_fw_1_log_root = 0;
+        g_fw_1_log_disabled = 1;
+        return;
+    }
+    /* Clear any stale log from a previous run ONCE, here on the BSP, so
+     * the subsequent in-place-overwrite flushes never have to delete
+     * (which churns fragile FAT write paths). */
+    hype_file_delete(g_fw_1_log_root, (CHAR16 *)L"\\hype-log.txt");
+    hype_fatal_set_flush_hook(fw_1_flush_log);
+}
+
 static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
@@ -4660,6 +4696,22 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
         if (info.reason != HYPE_SVM_EXITCODE_HLT) {
             productive_exits++;
+        }
+
+        /* Periodically flush the captured console log to \hype-log.txt so
+         * a mid-boot hang OR crash on real hardware still leaves an
+         * up-to-date log on the USB stick (the end-of-run write only fires
+         * if the loop returns; a live boot never does). ~3s of wall-clock
+         * between flushes keeps the file I/O cost negligible; fw_1_flush_log
+         * self-disables if the volume ever rejects a write. */
+        {
+            static uint64_t last_flush_tsc = 0;
+            uint64_t now_flush = hype_rdtsc();
+            if (!g_fw_1_log_disabled && g_fw_1_host_tsc_hz != 0 &&
+                (last_flush_tsc == 0 || now_flush - last_flush_tsc >= 3ULL * g_fw_1_host_tsc_hz)) {
+                last_flush_tsc = now_flush;
+                fw_1_flush_log();
+            }
         }
 
         /* M4-6b1: advance the guest PIT + LAPIC timer by the number of
@@ -5860,6 +5912,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                               (unsigned long long)(g_fw_1_host_tsc_hz / 1000000ULL));
         }
 
+        /* Cache the boot-volume root + register the crash-time log flush,
+         * here on the BSP where Boot Services file I/O is proven (the ISO
+         * was just read from this same volume). Lets the FW-1 loop (which
+         * may run on a pinned AP) and hype_fatal() flush \hype-log.txt
+         * without a first-time locate from a non-BSP context. */
+        fw_1_log_init(ImageHandle, SystemTable->BootServices);
+
         args.ops = ops;
         args.kind = kind;
 
@@ -5914,21 +5973,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * printed up to here (including the FW-1 guest console and the
      * giveup diagnostics) is in the buffer; this trailing status line
      * is not (it reports the write that just happened). */
-    {
-        EFI_FILE_PROTOCOL *log_root = 0;
-        if (hype_file_locate_root(ImageHandle, SystemTable->BootServices, &log_root) == EFI_SUCCESS) {
-            EFI_STATUS log_status =
-                hype_file_write_new(log_root, (CHAR16 *)L"\\hype-log.txt", hype_logbuf_data(),
-                                     (UINTN)hype_logbuf_len());
-            log_root->Close(log_root);
-            hype_debug_print("hype: console log (%u bytes%s) -> \\hype-log.txt on the boot volume: %s\n",
-                              hype_logbuf_len(), hype_logbuf_truncated() ? ", TRUNCATED" : "",
-                              log_status == EFI_SUCCESS ? "written"
-                                                        : "write FAILED (read-only or non-FAT volume?)");
-        } else {
-            hype_debug_print("hype: could not open the boot volume to write \\hype-log.txt\n");
-        }
-    }
+    fw_1_flush_log(); /* final flush via the BSP-cached root (fw_1_log_init) */
+    hype_debug_print("hype: console log (%u bytes%s) -> \\hype-log.txt on the boot volume: %s\n",
+                      hype_logbuf_len(), hype_logbuf_truncated() ? ", TRUNCATED" : "",
+                      (!g_fw_1_log_disabled && g_fw_1_log_root != 0)
+                          ? "written"
+                          : "unavailable (read-only or non-FAT volume?)");
 
     /* Real-hardware debugging: a hang with this as the last serial
      * line means ExitBootServices() itself never returned control --

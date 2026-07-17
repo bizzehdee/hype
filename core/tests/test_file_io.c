@@ -178,7 +178,7 @@ static void test_write_new_success(void) {
     setup_write_fakes();
     status = hype_file_write_new(&g_fake_root, (CHAR16 *)L"\\hype-log.txt", payload, 8);
     CHECK_INT("write_new success", EFI_SUCCESS, status);
-    CHECK_INT("stale copy deleted first", 1, g_delete_calls);
+    CHECK_INT("no delete/recreate churn (overwrite in place)", 0, g_delete_calls);
     CHECK_INT("wrote once", 1, g_write_calls);
     CHECK_INT("wrote all bytes", 8, (int)g_write_last_size);
     CHECK_INT("flushed", 1, g_flush_calls);
@@ -204,6 +204,25 @@ static void test_write_new_short_write_is_aborted(void) {
     g_write_short = 1; /* fake_write reports fewer bytes than asked */
     status = hype_file_write_new(&g_fake_root, (CHAR16 *)L"\\hype-log.txt", "abcd", 4);
     CHECK_INT("short write is aborted", EFI_ABORTED, status);
+}
+
+static void test_delete_success(void) {
+    EFI_STATUS status;
+    reset_fakes();
+    setup_write_fakes();
+    status = hype_file_delete(&g_fake_root, (CHAR16 *)L"\\hype-log.txt");
+    CHECK_INT("delete of an existing file succeeds", EFI_SUCCESS, status);
+    CHECK_INT("delete was issued", 1, g_delete_calls);
+}
+
+static void test_delete_absent_is_open_error(void) {
+    EFI_STATUS status;
+    reset_fakes();
+    setup_write_fakes();
+    g_open_status = EFI_NOT_FOUND; /* file not present */
+    status = hype_file_delete(&g_fake_root, (CHAR16 *)L"\\hype-log.txt");
+    CHECK_INT("delete of an absent file returns the open error", EFI_NOT_FOUND, status);
+    CHECK_INT("no delete issued when absent", 0, g_delete_calls);
 }
 
 static void test_get_size_success(void) {
@@ -535,6 +554,8 @@ int main(void) {
     test_write_new_success();
     test_write_new_open_fails();
     test_write_new_short_write_is_aborted();
+    test_delete_success();
+    test_delete_absent_is_open_error();
 
     if (failures == 0) {
         printf("all tests passed\n");

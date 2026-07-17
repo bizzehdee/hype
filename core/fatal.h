@@ -39,6 +39,13 @@ void hype_fatal_set_gop_protocol(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, void *real_f
 EFI_GRAPHICS_OUTPUT_PROTOCOL *hype_fatal_get_gop_protocol(void);
 void *hype_fatal_get_real_fb(void);
 
+/* A hook hype_fatal() calls just before halting, so a mid-run panic
+ * still flushes the captured console log to disk. Registered by
+ * boot/main.c; unset (NULL) by default. */
+typedef void (*hype_flush_hook_t)(void);
+void hype_fatal_set_flush_hook(hype_flush_hook_t hook);
+hype_flush_hook_t hype_fatal_get_flush_hook(void);
+
 /*
  * Formats fmt/... as "PANIC: <message>", prints it via serial and (if
  * registered) the GOP console, then halts forever. Never returns. Not

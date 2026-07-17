@@ -35,11 +35,24 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
     va_end(ap);
 
     hype_serial_print("PANIC: %s\n", msg);
+    /* Capture the panic in the console log, then flush it to disk (if a
+     * hook is registered) before halting -- so a mid-run panic on real
+     * hardware still leaves \hype-log.txt ending with the cause. */
+    hype_logbuf_append("PANIC: ");
+    hype_logbuf_append(msg);
+    hype_logbuf_append("\n");
 
     gop = hype_fatal_get_gop();
     if (gop != 0) {
         hype_gop_print(gop, "PANIC: %s\n", msg);
         hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());
+    }
+
+    {
+        hype_flush_hook_t flush = hype_fatal_get_flush_hook();
+        if (flush != 0) {
+            flush();
+        }
     }
 
     hype_halt_forever();

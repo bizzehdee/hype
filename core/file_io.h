@@ -75,4 +75,12 @@ EFI_STATUS hype_file_read_into(EFI_FILE_PROTOCOL *root, CHAR16 *path, void *buff
  */
 EFI_STATUS hype_file_write_new(EFI_FILE_PROTOCOL *root, CHAR16 *path, const void *buffer, UINTN size);
 
+/*
+ * Deletes `path` (relative to `root`) if it exists. Returns EFI_SUCCESS
+ * on delete, or the Open error (e.g. EFI_NOT_FOUND) if it wasn't there.
+ * Used once at startup to clear a stale log from a previous run before
+ * the in-place overwrite flushes begin.
+ */
+EFI_STATUS hype_file_delete(EFI_FILE_PROTOCOL *root, CHAR16 *path);
+
 #endif /* HYPE_CORE_FILE_IO_H */
