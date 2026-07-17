@@ -77,6 +77,36 @@ int main(void) {
     fmt(buf, sizeof(buf), "%lld", -123456789012345LL);
     CHECK_STR("%lld negative", "-123456789012345", buf);
 
+    /* Width + zero-pad (M4-6d4). Before this was supported, "%02x" fell
+     * through the parser's default case -- it emitted the literal chars AND
+     * consumed no vararg, silently shifting every following argument (a
+     * wrong-pointer-into-%s hazard). */
+    fmt(buf, sizeof(buf), "%02x", 0x5U);
+    CHECK_STR("%02x zero-pads a byte", "05", buf);
+
+    fmt(buf, sizeof(buf), "%02x", 0xABU);
+    CHECK_STR("%02x already wide is unpadded", "ab", buf);
+
+    fmt(buf, sizeof(buf), "%08x", 0x1234U);
+    CHECK_STR("%08x zero-pads to 8", "00001234", buf);
+
+    fmt(buf, sizeof(buf), "%016llx", 0xDEADBEEFULL);
+    CHECK_STR("%016llx zero-pads a 64-bit value", "00000000deadbeef", buf);
+
+    fmt(buf, sizeof(buf), "%4d", 42);
+    CHECK_STR("%4d space-pads", "  42", buf);
+
+    fmt(buf, sizeof(buf), "%04d", -7);
+    CHECK_STR("%04d sign precedes zero-pad", "-007", buf);
+
+    fmt(buf, sizeof(buf), "%3u", 12345U);
+    CHECK_STR("width narrower than value does not truncate", "12345", buf);
+
+    /* Regression guard for the arg-shift bug: a %02x before a %s must not
+     * steal the string's argument. */
+    fmt(buf, sizeof(buf), "b=%02x s=%s", 0x9U, "ok");
+    CHECK_STR("%02x does not shift the following %s", "b=09 s=ok", buf);
+
     fmt(buf, sizeof(buf), "%l!");
     CHECK_STR("bare %l passthrough", "%l!", buf);
 
