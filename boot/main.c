@@ -4685,10 +4685,22 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 last_progress_tsc = now_tsc;
             }
             if (g_fw_1_host_tsc_hz != 0) {
-                /* Cap the delta at ~1s of TSC so a long CPU-bound guest
-                 * stretch can't overflow the * PIT_HZ scaling. */
-                if (delta > g_fw_1_host_tsc_hz) {
-                    delta = g_fw_1_host_tsc_hz;
+                /* Cap the delta only to prevent the delta * PIT_HZ
+                 * multiply from overflowing (UINT64_MAX / PIT_HZ is ~1.5e13
+                 * TSC, so 300s at any realistic clock is comfortably safe).
+                 * The old 1s cap was far too tight: on real hardware the
+                 * guest genuinely idles for multi-second stretches (a
+                 * tickless kernel waits on a one-shot LAPIC timer, and HLT
+                 * blocks until the next exit), and clamping each such gap to
+                 * 1s DISCARDED the elapsed time -- guest time fell ~16x
+                 * behind real time, so a short one-shot timeout took minutes
+                 * and never fired inside the idle-giveup window. Advancing
+                 * by the full elapsed time lets the one-shot fire when the
+                 * guest expects. (QEMU fast-spins the intercepted HLT with
+                 * microsecond deltas, so it never approaches this cap.) */
+                uint64_t delta_cap = 300ULL * g_fw_1_host_tsc_hz;
+                if (delta > delta_cap) {
+                    delta = delta_cap;
                 }
                 tb_accum += delta * HYPE_PIT_HZ;
                 ticks = tb_accum / g_fw_1_host_tsc_hz;
