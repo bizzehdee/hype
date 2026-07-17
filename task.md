@@ -1860,6 +1860,39 @@ tasks — see updated deps below.*
   the fix is to latch the pending edge across re-arm (raise IRQ0 on
   re-arm if the prior count had not been consumed).*
 
+  *REFRAME 2026-07-17 (both machines FORCE-REBOOT where the log ends):
+  this is a CRASH, not slowness. The soft lockup was a symptom; the real
+  event is a full machine reset right after "Scanning hardware for mdev"
+  (~174s on 5950x, ~196s on laptop), deterministic across two very
+  different CPUs, with NO PANIC/GIVEUP in the log. Every hype_fatal path
+  (unhandled NPF, unhandled AHCI MMIO, unhandled MSR, loop-exit, guest
+  SHUTDOWN/triple-fault) flushes the log first -- so the ABSENCE of a
+  PANIC means the crash bypasses all of them: a HOST-SIDE fault (bad
+  deref in one of our exit handlers) -> CPU triple fault -> reset. The
+  host exception IDT is only installed AFTER the guest loop returns
+  (boot/main.c:6288); during the loop (which runs pre-ExitBootServices so
+  the log flush works) the firmware's IDT is active, and on these two
+  boards an unhandled host #PF resets the machine. Static audit RULED
+  OUT the obvious host-deref paths: AHCI DMA dest (bounds-checked, fails
+  safe), ATAPI media source (read10 clamps lba/count to media_size),
+  hype_gpa_to_host (overflow-safe containment), and the ptwalk insn
+  fetch (real HW gives decode-assist n=15, so the ptwalk fallback is
+  never taken). FOUND + FIXED one real host-deref hazard on the way: a
+  hype_vsnprintf width bug (%02x unsupported -> consumed no vararg ->
+  shifted every later arg; a %02x before a %s fed a bad pointer to
+  put_str) -- commit e2ef906. That is a plausible cause of the reset in
+  any hot-path diagnostic using %02x before a pointer, so worth a HW
+  retest with the fixed build before deeper work.
+  DEFINITIVE next step if the format fix doesn't clear it: a hybrid IDT
+  for the guest loop -- sidt the firmware's IDT, copy its 32-255 entries
+  (so firmware IRQs / Boot-Services storage keep working for the log
+  flush), override only exception vectors 0-31 with our fatal-flush
+  stubs (+ capture CR2 for #PF), lidt it around the FW-1 loop, restore
+  firmware's after. Converts the silent reboot into "PANIC: EXCEPTION
+  #PF at RIP=.. CR2=.." pinpointing the faulting host instruction.
+  QEMU can't reproduce the reset (guest config differs), so this
+  in-guest catch is the way to localise it.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
