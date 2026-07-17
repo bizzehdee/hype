@@ -1694,6 +1694,17 @@ tasks — see updated deps below.*
        specific or a genuine hype bug (as the M4-6d2 plateau turned out
        to be a real bug). This is the M4-6d2-established discipline.*
 
+  *Console is verbose (confirmed 2026-07-17): the ISO's UEFI/GRUB
+  cmdline is `... console=ttyS0,115200 earlyprintk=serial,ttyS0,115200`
+  with NO `quiet` (the `quiet` is only on the BIOS/syslinux path, which
+  FW-1 doesn't use). So the stall is real output-wise, not suppressed.
+  "Installing packages to root filesystem..." is printed by Alpine's
+  initramfs `/init` (mkinitfs) right before it populates the root via
+  `apk`; the init SHELL SCRIPT then blocks (CPU idle). To see which
+  command it blocks on, the cleanest next step is to remaster the
+  initramfs with `set -x` on `/init` (or add a debug shell), since the
+  kernel is already verbose but the script's steps are not.*
+
   *Diagnostics used were reverted before commit (clean tree); the
   characterisation above is the deliverable. Session logs under the
   scratchpad (m46d3-*.log) hold the raw histograms.*
