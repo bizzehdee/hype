@@ -283,6 +283,71 @@ static void test_acknowledge_cascade_blocked_when_master_ir2_masked(void) {
               hype_pic_emu_acknowledge(&pic, &vector));
 }
 
+/* M4-6d4: priority-aware delivery predicate (fully-nested mode). */
+static void init_operational(hype_pic_emu_t *pic) {
+    hype_pic_emu_reset(pic); /* leaves both chips fully masked (imr=0xff) */
+    pic->master.irq_offset = 0x20u;
+    pic->slave.irq_offset = 0x28u;
+    pic->master.imr = 0x00u; /* unmask everything, incl. IR2 cascade */
+    pic->slave.imr = 0x00u;
+}
+
+static void test_has_deliverable_nothing_pending(void) {
+    hype_pic_emu_t pic;
+    init_operational(&pic);
+    CHECK_HEX("nothing pending -> not deliverable", 0, hype_pic_emu_has_deliverable(&pic));
+}
+
+static void test_has_deliverable_pending_and_idle(void) {
+    hype_pic_emu_t pic;
+    init_operational(&pic);
+    hype_pic_emu_raise_irq(&pic.master, 0);
+    CHECK_HEX("pending IRQ0 with nothing in service -> deliverable", 1,
+              hype_pic_emu_has_deliverable(&pic));
+}
+
+static void test_has_deliverable_lower_prio_blocked_by_in_service(void) {
+    hype_pic_emu_t pic;
+    init_operational(&pic);
+    pic.master.isr = (uint8_t)(1u << 1); /* IRQ1 in service */
+    hype_pic_emu_raise_irq(&pic.master, 4); /* IRQ4 pending -- lower priority */
+    CHECK_HEX("lower-priority IRQ4 does NOT preempt in-service IRQ1", 0,
+              hype_pic_emu_has_deliverable(&pic));
+}
+
+static void test_has_deliverable_higher_prio_preempts_in_service(void) {
+    hype_pic_emu_t pic;
+    init_operational(&pic);
+    pic.master.isr = (uint8_t)(1u << 4); /* IRQ4 in service */
+    hype_pic_emu_raise_irq(&pic.master, 0); /* IRQ0 pending -- highest priority */
+    CHECK_HEX("higher-priority IRQ0 preempts in-service IRQ4", 1,
+              hype_pic_emu_has_deliverable(&pic));
+}
+
+static void test_has_deliverable_timer_preempts_in_service_slave_ahci(void) {
+    /* The real M4-6d4 case: an AHCI completion IRQ on a slave line (IRQ11)
+     * is in service (cascade IR2 also in service), and the timer tick IRQ0
+     * is pending. IRQ0 must be deliverable -- it outranks the slave line. */
+    hype_pic_emu_t pic;
+    init_operational(&pic);
+    pic.slave.isr = (uint8_t)(1u << 3);   /* IRQ11 (slave IR3) in service */
+    pic.master.isr = (uint8_t)(1u << 2);  /* cascade IR2 in service */
+    hype_pic_emu_raise_irq(&pic.master, 0); /* timer IRQ0 pending */
+    CHECK_HEX("timer IRQ0 preempts an in-service AHCI slave IRQ", 1,
+              hype_pic_emu_has_deliverable(&pic));
+}
+
+static void test_has_deliverable_slave_does_not_preempt_master_irq1(void) {
+    /* A pending slave IRQ (priority ~IR2 slot) must NOT preempt an
+     * in-service higher-priority master IRQ1. */
+    hype_pic_emu_t pic;
+    init_operational(&pic);
+    pic.master.isr = (uint8_t)(1u << 1);   /* IRQ1 in service */
+    hype_pic_emu_raise_irq(&pic.slave, 3); /* slave IRQ11 pending */
+    CHECK_HEX("pending slave IRQ does NOT preempt in-service master IRQ1", 0,
+              hype_pic_emu_has_deliverable(&pic));
+}
+
 int main(void) {
     test_reset_is_fully_masked();
     test_unrecognized_port_rejected();
@@ -304,6 +369,12 @@ int main(void) {
     test_acknowledge_cascade_delivers_slave_irq();
     test_acknowledge_master_beats_cascade_by_priority();
     test_acknowledge_cascade_blocked_when_master_ir2_masked();
+    test_has_deliverable_nothing_pending();
+    test_has_deliverable_pending_and_idle();
+    test_has_deliverable_lower_prio_blocked_by_in_service();
+    test_has_deliverable_higher_prio_preempts_in_service();
+    test_has_deliverable_timer_preempts_in_service_slave_ahci();
+    test_has_deliverable_slave_does_not_preempt_master_irq1();
 
     if (failures == 0) {
         printf("all tests passed\n");
