@@ -1056,10 +1056,15 @@ tasks — see updated deps below.*
   NOT yet validated: a real guest OS's own AHCI/ATAPI driver (Linux's
   ahci+sr_mod, or UEFI's own AhciBusDxe during M4-6's boot) actually
   enumerating and reading from this device -- that's M4-6's job.*
-- [~] **M4-6** — Boot a stock Linux UEFI installer ISO end-to-end
-  through GRUB. IN PROGRESS: the GRUB stage works end-to-end and the
-  Linux kernel starts; the kernel does not yet reach userspace (a device-
-  emulation tail remains, decomposed into M4-6a.. below).
+- [x] **M4-6** — Boot a stock Linux UEFI installer ISO end-to-end
+  through GRUB. DONE 2026-07-17 (commit da2d863). A stock, unmodified
+  alpine-virt 3.21 UEFI ISO boots through hype to a userspace
+  `localhost login:` prompt on ttyS0: OVMF/GRUB -> Linux kernel -> /init
+  -> mount CD -> apk installs the base system -> switch_root -> OpenRC ->
+  agetty login prompt. The full decomposition (M4-6a/b/c/d1/d2/d3 below)
+  is complete; the last blocker was guest serial TX-interrupt generation
+  (see M4-6d3). Validated in QEMU under -accel kvm; real-hardware
+  re-validation (AMD/Intel) is the remaining follow-up.
   Deps: FW-1h, ISO-2 (FW-2, CPUMSR-2, RAM-2, PCI-2 all done)
 
   *Verified under QEMU+KVM with a real Alpine 3.21.7 virt ISO (64 MB,
@@ -1267,7 +1272,7 @@ tasks — see updated deps below.*
   network/crypto init, "Unpacking initramfs" -- through end of
   do_initcalls. (A stock installer that already sets console=ttyS0, or a
   build-time remaster step, avoids the manual ISO edit.) Deps: M4-6a.
-- [ ] **M4-6d** — Root/initramfs handoff to userspace. The AHCI MMIO
+- [x] **M4-6d** — Root/initramfs handoff to userspace. The AHCI MMIO
   decode for a virtual-RIP guest is DONE (091ccaa) -- the kernel probes
   and binds the emulated AHCI controller ("ata1: SATA ... abar
   m4096@0x80000000"). Reaching a userspace prompt is gated on M4-6b (a
@@ -1311,7 +1316,7 @@ tasks — see updated deps below.*
   booting kernel off too early; a booting-OS run needs a progress-based
   exit (run while console/AHCI activity advances) rather than the OVMF
   heuristic. Deps: M4-6b4, M4-6c.*
-- [ ] **M4-6d2** — Block reads at scale for the rootfs mount. Alpine's
+- [x] **M4-6d2** — Block reads at scale for the rootfs mount. Alpine's
   `/init` mounts the squashfs rootfs from the CD via libata ->
   ScsiDisk -> our AHCI/ATAPI model, at scale (many READ(10)s over a
   ~60MB image).
@@ -1605,7 +1610,37 @@ tasks — see updated deps below.*
   one failed TSC calibration ("Unable to calibrate against PIT") while
   others booted clean, so a real-hardware run (AGENTS.md gate) is needed
   to tell a hype bug from an emulation artifact.*
-- [ ] **M4-6d3** — Userspace login prompt. Drive the remaining device/
+- [x] **M4-6d3** — Userspace login prompt. DONE 2026-07-17 (commit
+  da2d863). A STOCK, unmodified alpine-virt 3.21 UEFI ISO boots through
+  hype end-to-end to `localhost login:` on ttyS0 (and ttyS1): kernel ->
+  /init -> mount CD -> apk installs 25 packages -> switch_root -> OpenRC
+  brings up services (mdev/syslog/firstboot/filesystems all [ ok ]) ->
+  agetty prints the login prompt. Validated in QEMU under -accel kvm.
+
+  *ROOT CAUSE of the final blocker (the "Installing packages" hang): the
+  guest serial TX interrupt was never generated. The kernel's printk
+  uses the polled console path (LSR.THRE, always ready in our UART
+  model), so kernel messages always appeared -- but a userspace tty
+  write goes through the 8250 driver's INTERRUPT-DRIVEN TX: it enables
+  IER.ETBEI and sleeps until the TX-holding-register-empty IRQ (IRQ4 for
+  COM1) fires. Our UART returned IIR='no interrupt pending' (0x01)
+  unconditionally and never raised IRQ4/3, so apk's --progress console
+  writes blocked the process forever. This was the single thing wedging
+  every earlier "Installing packages" stall. Fix: IIR now reports the
+  highest-priority enabled+asserted source (RDA/THRE) +
+  hype_guest_uart_irq_pending(), and the FW-1 loop raises COM1=IRQ4/
+  COM2=IRQ3 when pending (gated on not-in-service). Also silenced the
+  SPEC_CTRL(0x48)/PRED_CMD(0x49) MSR-trace flood (Linux toggles them per
+  kernel entry/exit; the per-write GOP trace crawled the boot) and added
+  a prompt-aware partial-line flush so agetty's newline-less "login: "
+  actually surfaces. How it was found: remastered the initramfs with
+  step markers (isolated the hang to `apk add`), then to /dev/console
+  writes -- NOT entropy (crng init done, entropy_avail=256) and NOT AHCI
+  (drain experiment ruled it out). The p_ci=0xe8 chase was a red herring
+  (compiler/serial-drop artifact). Remaining: re-validate on real AMD/
+  Intel hardware.*
+
+  Original scope note: drive the remaining device/
   console gaps until Alpine's OpenRC/init brings up an interactive login
   prompt on ttyS0 -- the true end-to-end bar for M4-6. Larger installer
   ISOs that stream from the CD (rather than a GRUB-loaded initramfs)
