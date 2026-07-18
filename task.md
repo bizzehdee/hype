@@ -3718,7 +3718,15 @@ observability channel) must land FIRST.*
     hardware, not just QEMU. RT-2 boot-critical goal MET on HW.
   - [ ] **RT-2c** — Adapt the guest timebase (M4-6b1) + console drain to the
     post-EBS host-timer-driven loop (they currently assume the pre-EBS
-    per-VM-exit cadence). Deps: RT-2a.
+    per-VM-exit cadence). Deps: RT-2a. NOT boot-critical (login reached
+    without it). HW data captured at login (RT-3 tail) as input for this +
+    future perf work: irq0_pending_undelivered≈23.6s cumulative tick lateness,
+    almost all from the GUEST running IF=0 (blocked_by_isr_IF1 only 19ms), so
+    delivery -- not the timebase -- is the slow part (boot ~7-8 min).
+    max_single_vmrun dropped 39.9s->13.6s under RT-2b but 13 stretches still
+    ran >100ms without a 1ms preemption landing -- worth understanding why
+    preemption occasionally doesn't fire. COSTHIST body cost rose (~205us/exit)
+    partly from post-EBS GOP memcpy rendering across 640K exits.
   Deps: RT-1.
 
 - [ ] **RT-3** — Post-EBS diagnostic capture that survives a COLD power cycle
@@ -3734,7 +3742,14 @@ observability channel) must land FIRST.*
     wear; a rejected SetVariable latches off so a fussy firmware can't wedge
     the loop. g_hype_rt cached from SystemTable->RuntimeServices in efi_main.
     Deps: RT-1, RT-2a.
-  - [x] **RT-3b** — DONE. fw_1_dump_prev_diag() reads the var back pre-EBS via
+  - [x] **RT-3b** — DONE + HARDWARE-CONFIRMED. On real AMD hardware the
+    cold-boot round-trip WORKS: SetVariable post-EBS returned OK (this firmware
+    does take a runtime NON_VOLATILE write -- the SMM pessimism was wrong), and
+    a cold reboot recovered the full diagnostic tail to \hype-diag-prev.txt
+    (login on ttyS0+ttyS1, Alpine 3.21/kernel 6.12.81, intr=351030/640193
+    exits = ~55% host-tick preemptions, PREEMPT-RIP samples across guest kernel
+    + userspace). RT-3 is a proven post-EBS, cold-boot-surviving, serial-less
+    capture channel. fw_1_dump_prev_diag() reads the var back pre-EBS via
     GetVariable, writes it to \hype-diag-prev.txt (Boot-Services file I/O),
     then clears the var so a stale tail can't be re-dumped. QEMU two-boot
     round-trip PROVEN: boot 1 wrote 4096 bytes to the NV var (OVMF VARS
