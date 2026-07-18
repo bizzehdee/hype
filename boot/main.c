@@ -5898,6 +5898,78 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
  * (inline on the BSP, or onto a pinned AP; see efi_main) so each new
  * milestone's test guest still exercises real 1:1 vCPU-to-pCPU
  * pinning (M3-2) rather than only the first one ever tested. */
+/* M4-6d4 deliverable #3: prove the host can reclaim control from a guest
+ * busy-waiting on PAUSE -- the mechanism behind the host-preemption fix for
+ * the real-HW 40s no-exit VMRUN (a spinning guest starves its own timer
+ * tick because we only regain control on a voluntary exit). Bounded spin
+ * `mov cx,0xFFFF; pause; loop $-2; hlt` ALWAYS terminates via HLT, so a
+ * hypervisor that ignores pause-filtering just shows the HLT with zero
+ * PAUSE intercepts -- no hang. With filtering armed we expect one or more
+ * EXITCODE_PAUSE before the HLT. Reuses the m2-7 below-4GB guest pages
+ * (free once run_test_guest finished). SVM-only. */
+static void run_pause_filter_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+    uint8_t *guest_code;
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+    uint64_t npt_root_phys;
+    unsigned long long pause_exits = 0;
+    unsigned long long iters = 0;
+    unsigned int i;
+    static const uint8_t spin[] = {0xB9, 0xFF, 0xFF, 0xF3, 0x90, 0xE2, 0xFC, 0xF4};
+
+    if (kind != HYPE_VMM_KIND_SVM || ops->vcpu_create == 0 || ops->vcpu_run == 0) {
+        return;
+    }
+    if (!hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
+        hype_debug_print("pause-test: SKIP -- this CPU/hypervisor does not expose SVM "
+                          "pause-filtering (no host-preemption path here)\n");
+        return;
+    }
+
+    guest_code = (uint8_t *)(uintptr_t)g_m2_7_guest_code_phys;
+    hype_guest_ram_zero(guest_code, 4096);
+    hype_guest_ram_zero((void *)(uintptr_t)(g_m2_7_guest_stack_top_phys - 4096), 4096);
+    for (i = 0; i < sizeof(spin); i++) {
+        guest_code[i] = spin[i];
+    }
+
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
+    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+
+    ctx = ops->vcpu_create(g_m2_7_guest_code_phys, g_m2_7_guest_stack_top_phys, npt_root_phys);
+    if (ctx == 0) {
+        hype_fatal("pause-test: vcpu_create failed");
+    }
+    /* count=500 => trips ~131 times over the 65535-pause spin; threshold=4096
+     * >> the few-cycle gap between pauses in this tight loop, so the count
+     * decrements steadily to 0 (on CPUs without PFTHRESHOLD the field is
+     * ignored and it decrements every pause -- trips either way). */
+    hype_svm_vcpu_enable_pause_filter(ctx, 500, 4096);
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_fatal("pause-test: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+        }
+        if (info.reason == HYPE_SVM_EXITCODE_PAUSE) {
+            pause_exits++;
+            if (++iters > 1000000ULL) {
+                break; /* safety bound -- never expected */
+            }
+            continue; /* resume the spin */
+        }
+        if (info.reason == HYPE_SVM_EXITCODE_HLT) {
+            break; /* the bounded spin finished */
+        }
+        hype_fatal("pause-test: unexpected exit reason=0x%llx guest_rip=0x%llx",
+                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
+    }
+    hype_debug_print("pause-test: %s -- %llu PAUSE intercepts before HLT (%s)\n",
+                      (pause_exits > 0) ? "PASS" : "NO-TRIP", pause_exits,
+                      (pause_exits > 0)
+                          ? "host reclaimed control from a spinning guest -- preemption mechanism works"
+                          : "filter never fired -- nested pause-filtering not honored here");
+}
+
 static void EFIAPI run_all_test_guests(void *arg) {
     hype_test_guest_args_t *args = (hype_test_guest_args_t *)arg;
     run_test_guest(arg);
@@ -5917,6 +5989,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_video_3_test(args->ops, args->kind);
     run_m5_1_test(args->ops, args->kind);
     run_m5_2_test(args->ops, args->kind);
+    run_pause_filter_test(args->ops, args->kind); /* M4-6d4 #3: preemption mechanism proof */
     run_fw_1_test(args->ops, args->kind);
 }
 

@@ -302,6 +302,21 @@ void hype_svm_vcpu_set_gdt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) 
     real->vmcb->save.gdtr.limit = limit;
 }
 
+/* M4-6d4: turn on SVM PAUSE-filtering for this guest -- intercept PAUSE, but
+ * only fire EXITCODE_PAUSE after `count` PAUSEs occur within `threshold`
+ * cycles of each other (a spin-loop detector). Lets the hypervisor reclaim
+ * control from a guest busy-waiting on cpu_relax without trapping every
+ * single PAUSE. Caller must first confirm CPU support
+ * (hype_cpu_has_pause_filter) -- without it, INTERCEPT_PAUSE traps EVERY
+ * pause. Exempt from unit testing, same as the other VMCB-reaching setters. */
+void hype_svm_vcpu_enable_pause_filter(hype_vcpu_ctx_t *ctx, uint16_t count, uint16_t threshold) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_PAUSE;
+    real->vmcb->control.pause_filter_count = count;
+    real->vmcb->control.pause_filter_threshold = threshold;
+    real->vmcb->control.vmcb_clean_bits = 0; /* control area changed */
+}
+
 void hype_svm_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selector, uint16_t ss_selector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->vmcb->save.cs.selector = cs_selector;

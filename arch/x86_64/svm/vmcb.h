@@ -153,6 +153,13 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 /* Intercept bits this project actually sets (Table B-1). */
 #define HYPE_SVM_INTERCEPT_HLT (1u << 24)
 #define HYPE_SVM_INTERCEPT_SHUTDOWN (1u << 31)
+/* M4-6d4: intercept PAUSE (APM Vol 2 Appendix B Table B-1, offset 00Ch,
+ * bit 23 -- one below HLT's bit 24). With pause_filter_count/threshold set
+ * it fires EXITCODE_PAUSE only after a burst of PAUSEs within the threshold
+ * window (a spin-loop detector), letting the hypervisor reclaim control from
+ * a guest busy-waiting (e.g. cpu_relax) that would otherwise run without any
+ * intercept and starve its own timer tick. */
+#define HYPE_SVM_INTERCEPT_PAUSE (1u << 23)
 /* INT-2: bit 4 -- "Intercept VINTR (virtual maskable interrupt)",
  * Appendix B Table B-1, offset 00Ch -- confirms, verbatim, this file's
  * own pre-existing top-of-struct comment ("VINTR=4") that was never
@@ -308,6 +315,9 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 
 /* SVM #VMEXIT codes this project checks for (AMD SDM Appendix C). */
 #define HYPE_SVM_EXITCODE_HLT 0x78ULL
+/* M4-6d4: PAUSE intercept exit (APM Vol 2 Appendix C, VMEXIT_PAUSE = 0x77,
+ * one below VMEXIT_HLT = 0x78). Raised when pause-filtering trips. */
+#define HYPE_SVM_EXITCODE_PAUSE 0x77ULL
 #define HYPE_SVM_EXITCODE_SHUTDOWN 0x7FULL
 #define HYPE_SVM_EXITCODE_IOIO 0x7BULL
 #define HYPE_SVM_EXITCODE_CPUID 0x72ULL

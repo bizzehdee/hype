@@ -157,6 +157,11 @@ void hype_svm_vcpu_set_gdt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
  */
 void hype_svm_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selector, uint16_t ss_selector);
 
+/* M4-6d4: enable SVM PAUSE-filtering (INTERCEPT_PAUSE + filter count/
+ * threshold) so a guest spin loop is intercepted after a burst of PAUSEs.
+ * Caller must first confirm hype_cpu_has_pause_filter(). Exempt glue. */
+void hype_svm_vcpu_enable_pause_filter(hype_vcpu_ctx_t *ctx, uint16_t count, uint16_t threshold);
+
 /*
  * Handles an IOIO (M3-5) VM-exit: decodes EXITINFO1
  * (hype_svm_decode_ioio_info1()), routes the port to `pic` (0x20/0x21/
