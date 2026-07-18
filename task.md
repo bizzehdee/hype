@@ -1995,6 +1995,26 @@ tasks — see updated deps below.*
   doesn't help: the real spins aren't PAUSE-based (then the physical
   preemption timer is the fallback).*
 
+  *PAUSE-FILTER HW RESULT (2026-07-18): NEGATIVE -- it does NOT fix the
+  slowness. On the laptop: pause=0 for the whole Alpine boot (filter never
+  fired) while max_single_vmrun stayed 39907ms and the soft lockups were
+  unchanged (24/25/37s). The mechanism itself is fine (pause-test PASS,
+  131 intercepts), so the conclusion is definitive: the guest's ~40s
+  no-exit spins execute ZERO pause instructions -- they are not
+  cpu_relax/jiffies-wait loops. Pause-filtering is correct + harmless
+  (kept; helps pause-spinning guests, zero overhead here since it never
+  fires) but inert for this workload. Login still reached, no regression.
+  NEXT: physical-interrupt interception (INTERCEPT_INTR, EXITCODE_INTR
+  0x60) -- forces a VMEXIT on ANY physical interrupt during guest
+  execution regardless of the instruction mix, so it catches a non-pause
+  spin too. Likely less invasive than a full own-timer: the guest loop
+  runs pre-ExitBootServices while the FIRMWARE's timer is still firing, so
+  intercepting INTR + briefly sti'ing to let the firmware ISR EOI it could
+  preempt using the existing firmware tick (no own IDT/timer). BONUS: the
+  INTR exit can log the guest RIP mid-spin -- the first look at WHAT the
+  40s loop actually is, which may point at a targeted fix instead of the
+  general preemption sledgehammer.*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
