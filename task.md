@@ -1312,6 +1312,62 @@ tasks — see updated deps below.*
   by PxCI/PxIS polling only, never firing the AHCI IRQ. Delivering that
   (PCI INTx via the PIC when a command completes with PxIE/GHC.IE set) is
   M4-6d2's core.* Deps: M4-6b1.
+
+- [ ] **M4-6b5** — Realistic guest LAPIC-timer clockevent so Linux keeps it
+  (the fix for the ~22x-slow real-HW boot). Discovered via the RT-2c boot-perf
+  investigation (2026-07-19): symbolising the hot guest RIPs against the real
+  Alpine 6.12.81 kernel (extracted from the ISO + its System.map) showed the
+  guest is NOT spinning -- the hot spots are `finish_task_switch`,
+  `default_idle`/`pv_native_safe_halt`, `_raw_spin_*`, and mm work
+  (`__handle_mm_fault`, maple-tree). That's the signature of a guest that
+  schedules -> blocks -> idles (HALT) -> waits for a wakeup, thousands of
+  times, on a coarse clock. TIMERHIST confirms: `lapic_irq=4`, LVT masked
+  (0x10000), and `PIT0 mode=2 reload=11932` = the guest fell back to the
+  **100 Hz periodic PIT**, so every timer wait is quantised to 10 ms. Boot
+  takes ~325s of guest execution (vs QEMU's ~15s, where the LAPIC timer works
+  and gives sub-ms timing).
+
+  ROOT CAUSE (confirmed in code): the FW-1 loop advances the guest LAPIC timer
+  by the **same tick count as the PIT, at PIT_HZ = 1.193182 MHz**
+  (boot/main.c hype_guest_lapic_advance call), ~100x slower than a real
+  bus-clock LAPIC timer, and hype_guest_lapic_advance **ignores
+  divide_config**. So Linux calibrates an implausible ~1.19 MHz LAPIC
+  frequency, its clockevent fails verification / is deemed unusable, and it
+  masks the LAPIC timer and uses the 100 Hz PIT. NOTE vs M4-6b4 (which saw
+  init_count stay 0): the kernel now DOES program the LAPIC timer
+  (init=10M) -- behaviour changed -- so making it usable is now the lever.
+
+  SCOPE (concrete):
+  - **b5a — correct count rate.** Give the LAPIC timer its OWN advance rate at
+    a realistic, constant LAPIC/bus frequency (e.g. a nominal 1 GHz base, its
+    own fractional accumulator like tb_accum), DECOUPLED from PIT_HZ, and
+    **honour divide_config** (real rate = base >> log2(divide)). Linux then
+    calibrates a plausible high frequency and derives fine-grained one-shots.
+    Pure count/divide math in hype_guest_lapic_advance -> unit-tested.
+  - **b5b — reliable delivery.** Fix the under-delivery (lapic_irq=4). Ensure
+    every armed expiry that the guest expects is delivered: audit the
+    timer_in_service/EOI gate and the LAPIC-vs-PIT-IRQ competition in the loop
+    so the LAPIC timer IRQ stream isn't starved by IRQ0. Delivery is
+    host-tick-granular (~1 ms via RT-2b) -- that's the effective resolution and
+    is fine (10x better than the 100 Hz PIT).
+  - **b5c — frequency consistency (choose one).** EITHER advertise the
+    crystal/bus frequency via CPUID leaf 0x15/0x16 so Linux skips calibration
+    and uses hype's exact rate, OR ensure the calibration path lands on the
+    advertised rate. Whichever, the advertised/derived frequency and the
+    actual advance rate MUST match, or programmed one-shots fire at the wrong
+    real time and Linux re-disables the timer.
+  - **b5d — one-shot/tickless correctness.** Confirm one-shot mode (NO_HZ
+    tickless arms a one-shot for the next event) fires exactly once per arm at
+    the right count, serviced at the next host tick after expiry.
+  - **b5e — HW verification.** On real HW: the guest keeps the LAPIC timer
+    (LVT unmasked, lapic_irq climbs into the thousands, PIT goes
+    tickless/quiet), and vmrun_tot collapses from ~325s toward tens of
+    seconds. Measure via the RT-3 tail (COSTHIST/TIMERHIST/RIPHIST).
+
+  Unit-testable: the rate+divide math and the delivery-gating predicate (pure,
+  in guest_lapic.c). Exempt: the FW-1-loop advance/inject wiring.
+  Deps: M4-6b1, FW-1b, RT-2b (host-tick delivery granularity). Related:
+  M4-6b2 (ACPI MADT may further steer the kernel toward the LAPIC).
 - [x] **M4-6c** — Kernel console visibility. DONE + verified: the Linux
   kernel's own dmesg flows to hype's forwarded console. No hype code
   change was needed -- FW-1e's guest COM1 UART model already serves the
