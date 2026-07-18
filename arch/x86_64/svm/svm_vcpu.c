@@ -1929,13 +1929,13 @@ void hype_svm_vcpu_enable_apic_accel_ops(hype_vcpu_ctx_t *ctx) {
     hype_svm_vcpu_enable_apic_accel(real->vmcb);
 }
 
-/* FW-1e: the per-VM-exit CLGI/VMLOAD/VMRUN trace below is invaluable for
- * bring-up (it brackets the riskiest instruction sequence -- see its own
- * comment) but emits 3 lines PER exit, ~11k lines for a full OVMF boot,
- * which the GOP renders one at a time. A long-running guest (real OVMF)
- * turns it off after its first entry via hype_svm_set_vmrun_trace();
- * short test guests leave it on. Default on. */
-static int g_vmrun_trace = 1;
+/* FW-1e: the per-VM-exit CLGI/VMLOAD/VMRUN trace below brackets the riskiest
+ * instruction sequence (see its own comment) -- invaluable during bring-up to
+ * localize a VMRUN hang on new hardware. RT-2c: default OFF now that VMRUN is
+ * hardware-proven; it emitted 3 lines PER exit (the "long loop of vmrun/stgi"
+ * seen at startup, from the regression guests). Re-enable via
+ * hype_svm_set_vmrun_trace(1) if a fresh VMRUN-path hang ever needs localizing. */
+static int g_vmrun_trace = 0;
 
 void hype_svm_set_vmrun_trace(int enabled) {
     g_vmrun_trace = enabled ? 1 : 0;

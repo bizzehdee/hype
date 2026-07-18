@@ -29,7 +29,11 @@
  * mock EFI_RUNTIME_SERVICES (same approach as core/gop.c's Blt mock).
  */
 
-#define HYPE_NVLOG_CAPACITY 4096u
+/* RT-2c: 16 KB (was 4 KB) so the recovered tail spans more than a couple of
+ * diagnostic blocks -- enough that the guest's `localhost login` line survives
+ * in the captured window. Well within a typical firmware's per-variable limit;
+ * writes stay throttled (~60s + on-change) so flash wear is unaffected. */
+#define HYPE_NVLOG_CAPACITY 16384u
 
 /* Variable name + vendor GUID under which the tail is stored. The GUID is
  * hype's own, fixed, and distinctive so it never collides with a firmware or

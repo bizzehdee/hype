@@ -41,6 +41,12 @@
 #include "../devices/e820.h"
 #include "../devices/vt_filter.h"
 
+/* RT-2c: run the M2-M5/VIDEO/INPUT regression self-test guests before the
+ * FW-1 Alpine guest? 0 = skip (a normal boot goes straight to Alpine -- less
+ * startup time + log clutter); 1 = run the suite (after touching the VM-exit
+ * core). The machinery they check is HW-proven, so off by default. */
+#define HYPE_RUN_SELFTEST_GUESTS 0
+
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
 static hype_gdt_entry_t g_gdt[HYPE_GDT_ENTRY_COUNT];
@@ -612,16 +618,9 @@ static void EFIAPI run_test_guest(void *arg) {
     const hype_vmm_ops_t *ops = args->ops;
     hype_vmm_kind_t kind = args->kind;
 
-    /* Real-hardware debugging: a hang here (no further serial output
-     * at all past this line) localizes the failure to ops->enable()
-     * itself -- RDMSR/WRMSR against real hardware MSRs, unlike
-     * anything QEMU/KVM's nested-virtualization emulation exercises
-     * the same way bare metal does. */
-    hype_debug_print("vmm: about to enable %s...\n", ops->name);
-    if (ops->enable() != 0) {
-        hype_fatal("vmm: %s enable failed", ops->name);
-    }
-    hype_debug_print("vmm: %s enabled\n", ops->name);
+    /* RT-2c: SVM is now enabled once in efi_main (before any guest), not
+     * here -- so this self-test guest works whether or not it's the first
+     * thing to run. */
 
     /*
      * VMX's vcpu_create/vcpu_run stay NULL past M2-7 (see vmx_ops.c)
@@ -4837,7 +4836,6 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 #define FW_1_RIPHIST_N 24
     uint64_t riphist_rip[FW_1_RIPHIST_N];
     uint64_t riphist_cnt[FW_1_RIPHIST_N];
-    uint64_t riphist_overflow = 0;
     unsigned long long preempt_kernel = 0, preempt_user = 0, preempt_lowmem = 0;
     {
         int rh;
@@ -4974,7 +4972,10 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
          * gives per-second exit rates by kind for the slow stretch. */
         if (g_fw_1_host_tsc_hz != 0) {
             uint64_t now_eh = hype_rdtsc();
-            if (last_exhist_tsc == 0 || now_eh - last_exhist_tsc >= 5ULL * g_fw_1_host_tsc_hz) {
+            /* RT-2c: every 30s (was 5s) so the diagnostic blocks don't flood
+             * the 4KB RT-3 tail and shove the guest console -- incl.
+             * `localhost login` -- out of the captured window. */
+            if (last_exhist_tsc == 0 || now_eh - last_exhist_tsc >= 30ULL * g_fw_1_host_tsc_hz) {
                 last_exhist_tsc = now_eh;
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
@@ -5038,9 +5039,9 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                         }
                     }
                     hype_debug_print(
-                        "fw-1 RIPHIST: kernel=%llu user=%llu lowmem=%llu overflow=%llu | "
+                        "fw-1 RIPHIST: kernel=%llu user=%llu lowmem=%llu | "
                         "hot 0x%llx=%llu 0x%llx=%llu 0x%llx=%llu\n",
-                        preempt_kernel, preempt_user, preempt_lowmem, riphist_overflow,
+                        preempt_kernel, preempt_user, preempt_lowmem,
                         top[0] >= 0 ? (unsigned long long)riphist_rip[top[0]] : 0ULL,
                         top[0] >= 0 ? (unsigned long long)riphist_cnt[top[0]] : 0ULL,
                         top[1] >= 0 ? (unsigned long long)riphist_rip[top[1]] : 0ULL,
@@ -5449,7 +5450,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                  * (>= 0xffff800000000000), user = low half above 1 page,
                  * everything else (firmware/low identity map) = lowmem. */
                 uint64_t rip = info.guest_rip;
-                int rh;
+                int rh, found = -1, freeslot = -1, minslot = -1;
                 if (rip >= 0xffff800000000000ULL) {
                     preempt_kernel++;
                 } else if (rip >= 0x1000ULL && rip < 0x0000800000000000ULL) {
@@ -5457,25 +5458,39 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 } else {
                     preempt_lowmem++;
                 }
+                /* RT-2c (fixed): Misra-Gries / space-saving top-K. On overflow,
+                 * evict the LEAST-frequent entry and inherit its count+1, so
+                 * the table converges on the true heavy hitters instead of
+                 * freezing on the first 24 RIPs seen (early-boot bias). */
                 for (rh = 0; rh < FW_1_RIPHIST_N; rh++) {
-                    if (riphist_cnt[rh] != 0 && riphist_rip[rh] == rip) {
-                        riphist_cnt[rh]++;
+                    if (riphist_cnt[rh] == 0) {
+                        if (freeslot < 0) {
+                            freeslot = rh;
+                        }
+                        continue;
+                    }
+                    if (riphist_rip[rh] == rip) {
+                        found = rh;
                         break;
                     }
-                    if (riphist_cnt[rh] == 0) {
-                        riphist_rip[rh] = rip;
-                        riphist_cnt[rh] = 1;
-                        break;
+                    if (minslot < 0 || riphist_cnt[rh] < riphist_cnt[minslot]) {
+                        minslot = rh;
                     }
                 }
-                if (rh == FW_1_RIPHIST_N) {
-                    riphist_overflow++;
+                if (found >= 0) {
+                    riphist_cnt[found]++;
+                } else if (freeslot >= 0) {
+                    riphist_rip[freeslot] = rip;
+                    riphist_cnt[freeslot] = 1;
+                } else if (minslot >= 0) {
+                    riphist_rip[minslot] = rip;
+                    riphist_cnt[minslot]++;
                 }
             }
             if (g_fw_1_host_tsc_hz != 0) {
                 uint64_t now_pr = hype_rdtsc();
                 if (last_preempt_rip_tsc == 0 ||
-                    now_pr - last_preempt_rip_tsc >= g_fw_1_host_tsc_hz) {
+                    now_pr - last_preempt_rip_tsc >= 10ULL * g_fw_1_host_tsc_hz) {
                     last_preempt_rip_tsc = now_pr;
                     hype_debug_print("fw-1 PREEMPT-RIP: host tick preempted guest at rip=0x%llx\n",
                                      (unsigned long long)info.guest_rip);
@@ -6833,6 +6848,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     hype_serial_print("hype: Boot Services exited, hypervisor now running\n");
 
+    /* RT-2c: enable SVM HERE, unconditionally, before ANY guest runs. This
+     * used to happen inside the first self-test guest (run_test_guest);
+     * gating the self-test off (below) skipped it entirely, so FW-1's first
+     * VMRUN took a host #UD (SVM not enabled). Hoisted so the enable is
+     * independent of whether the self-test suite runs. */
+    hype_debug_print("vmm: about to enable %s...\n", args.ops->name);
+    if (args.ops->enable() != 0) {
+        hype_fatal("vmm: %s enable failed", args.ops->name);
+    }
+    hype_debug_print("vmm: %s enabled\n", args.ops->name);
+
     /*
      * RT-2a: run the guests HERE -- post-ExitBootServices, on the BSP, under
      * hype's own GDT/IDT/paging loaded just above, with firmware entirely
@@ -6849,8 +6875,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * FW-1 Alpine guest runs separately BELOW, after the host timer + sti come
      * up (RT-2b), because it is the one guest that needs host-tick preemption
      * to keep its clock alive through long non-intercepting stretches.
+     *
+     * RT-2c: gated off for a normal boot. These are a regression self-test of
+     * the M2-M5/VIDEO/INPUT VMM machinery -- valuable, but they add startup
+     * time + log clutter on every Alpine boot, and the machinery they check is
+     * long since HW-proven. Flip HYPE_RUN_SELFTEST_GUESTS to 1 to run the
+     * suite (e.g. after touching the VM-exit core); a normal boot skips
+     * straight to the FW-1 guest.
      */
-    run_all_test_guests(&args);
+    if (HYPE_RUN_SELFTEST_GUESTS) {
+        run_all_test_guests(&args);
+    }
 
     /*
      * M1-8: bring up the host's own timer tick. Ordering matters again:
