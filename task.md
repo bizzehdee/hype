@@ -1337,8 +1337,33 @@ tasks — see updated deps below.*
   init_count stay 0): the kernel now DOES program the LAPIC timer
   (init=10M) -- behaviour changed -- so making it usable is now the lever.
 
-  SCOPE (concrete):
-  - **b5a — correct count rate.** Give the LAPIC timer its OWN advance rate at
+  SCOPE (concrete):  [b5a DONE, b5b AUDITED, b5c HELD pending HW]
+  - **b5a — correct count rate. DONE.** guest_lapic.c advance() now divides the
+    base-rate advance by the guest's Divide Configuration Register
+    (hype_guest_lapic_divisor, SDM bits[3,1,0], with a fractional carry in
+    divide_accum). The FW-1 loop advances the LAPIC at PIT_HZ x
+    HYPE_GUEST_LAPIC_MULT (=100 -> ~119.3 MHz, a realistic bus-clock rate)
+    instead of PIT_HZ. Unit-tested (divisor decode + divide-with-carry + the
+    existing advance tests set divide-by-1). QEMU no-regression (LAPIC stays
+    masked there -- QEMU guest uses the PIT -- so this is HW-only).
+  - **b5b — reliable delivery. AUDITED, no bug.** The single deferred-IRQ slot
+    in hype_svm_vcpu_request_interrupt() CANNOT clobber a pending LAPIC-timer
+    request: the FW-1 loop gates the PIC acknowledge on
+    !hype_svm_vcpu_deliver_pending_if_ready() (which also guards a freshly
+    staged EVENTINJ), so a deferred/immediate LAPIC IRQ is delivered before any
+    PIC IRQ can overwrite it. The lapic_irq=4 under-delivery was therefore the
+    SYMPTOM of the wrong rate (b5a) -- the guest calibrated an implausible
+    frequency and masked the timer -- not a delivery race. No code change.
+  - **b5c — frequency consistency. HELD pending the b5a HW result.** With b5a,
+    the LAPIC and PIT are both advanced proportionally to real time, so the
+    guest's calibration (LAPIC ticks measured against the PIT/TSC) lands on
+    hype's exact ~119.3 MHz rate -- self-consistent, no CPUID hint needed. Only
+    if the HW run shows the guest STILL abandons the LAPIC timer despite the
+    correct rate is CPUID 0x15/0x16 advertisement warranted; doing it blind
+    risks advertising a frequency that mismatches the advance rate and makes it
+    worse. Measure first.
+  - **(original scope for reference below)**
+  - **b5a(orig) — correct count rate.** Give the LAPIC timer its OWN advance rate at
     a realistic, constant LAPIC/bus frequency (e.g. a nominal 1 GHz base, its
     own fractional accumulator like tb_accum), DECOUPLED from PIT_HZ, and
     **honour divide_config** (real rate = base >> log2(divide)). Linux then

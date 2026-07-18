@@ -77,9 +77,19 @@ typedef struct {
     uint32_t init_count;
     uint32_t current_count;
     uint32_t tick_accum;   /* VM-exits since the last synthetic expiry */
+    uint64_t divide_accum; /* M4-6b5: fractional carry when dividing the base-rate
+                            * advance by the guest's divide_config divisor */
     int timer_irq_pending; /* a timer IRQ is due but not yet delivered */
     int timer_in_service;  /* delivered, awaiting guest EOI -- at most one in flight */
 } hype_guest_lapic_t;
+
+/*
+ * M4-6b5: decode the LAPIC Divide Configuration Register (offset 0x3E0) into
+ * the timer's clock divisor. Per Intel SDM the divisor is encoded in bits
+ * [3,1,0]: 000->2, 001->4, 010->8, 011->16, 100->32, 101->64, 110->128,
+ * 111->1. Pure -- unit tested.
+ */
+uint32_t hype_guest_lapic_divisor(uint32_t divide_config);
 
 /* Clears to a just-powered-on state (timer masked, no IRQ pending). */
 void hype_guest_lapic_reset(hype_guest_lapic_t *lapic);

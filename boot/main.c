@@ -248,6 +248,14 @@ static uint64_t g_fw_1_stall_prev_tsc;
 static uint64_t g_fw_1_vmrun_max_tsc;
 static unsigned long long g_fw_1_vmrun_over100ms;
 #define HYPE_PIT_HZ 1193182ULL
+/* M4-6b5: the guest LAPIC timer's base (pre-divide) input frequency, expressed
+ * as a multiple of PIT_HZ so it reuses the loop's already-computed real-elapsed
+ * PIT-tick count without a second accumulator. PIT_HZ x 100 ~= 119.3 MHz -- a
+ * realistic bus-clock LAPIC rate (was, wrongly, PIT_HZ x 1 = 1.19 MHz, ~100x
+ * too slow, which made Linux calibrate an implausible frequency and abandon the
+ * LAPIC timer for the coarse 100 Hz PIT). hype_guest_lapic_advance then divides
+ * this by the guest's Divide Configuration Register. */
+#define HYPE_GUEST_LAPIC_MULT 100ULL
 /* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
  * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
  * guest-physical address in the 32-bit PCI MMIO aperture, and enables
@@ -5202,7 +5210,10 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 ticks = 1;
             }
             if (ticks != 0) {
-                hype_guest_lapic_advance(&g_fw_1_lapic, ticks);
+                /* M4-6b5: advance the LAPIC timer at its realistic base rate
+                 * (PIT_HZ x MULT), divided by the guest's DCR inside advance();
+                 * advance the PIT at its own 1.19 MHz rate. */
+                hype_guest_lapic_advance(&g_fw_1_lapic, ticks * HYPE_GUEST_LAPIC_MULT);
                 /* Channel-0 terminal-count crossings during this advance
                  * are PIT IRQ0 timer edges (M4-6b4). */
                 if (hype_pit_emu_advance(&g_fw_1_pit, ticks) != 0) {

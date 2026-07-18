@@ -194,6 +194,7 @@ static void test_advance_periodic_fires_at_count(void) {
     uint8_t vec = 0;
     hype_guest_lapic_reset(&l);
     hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 32u | HYPE_GUEST_LAPIC_LVT_PERIODIC);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_DIVIDE_CONFIG, 4, 0xBu); /* divide-by-1 */
     hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 1000u);
 
     hype_guest_lapic_advance(&l, 400);
@@ -211,6 +212,7 @@ static void test_advance_one_shot_fires_once(void) {
     uint8_t vec = 0;
     hype_guest_lapic_reset(&l);
     hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 48u); /* one-shot (no PERIODIC bit) */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_DIVIDE_CONFIG, 4, 0xBu); /* divide-by-1 */
     hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 500u);
 
     hype_guest_lapic_advance(&l, 10000); /* far past terminal */
@@ -235,6 +237,7 @@ static void test_advance_one_shot_rearm_refires(void) {
     int cycle;
     hype_guest_lapic_reset(&l);
     hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 48u); /* one-shot */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_DIVIDE_CONFIG, 4, 0xBu); /* divide-by-1 */
 
     for (cycle = 0; cycle < 4; cycle++) {
         /* Re-arm by writing a fresh initial count, even from a spent
@@ -271,7 +274,52 @@ static void test_advance_masked_or_disarmed_never_fires(void) {
     CHECK_HEX("disarmed timer never fires under advance", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
 }
 
+/* M4-6b5: the Divide Configuration Register decode (SDM bits [3,1,0]). */
+static void test_divisor_decode(void) {
+    CHECK_HEX("DCR 0x0 -> div 2", 2u, hype_guest_lapic_divisor(0x0u));
+    CHECK_HEX("DCR 0x1 -> div 4", 4u, hype_guest_lapic_divisor(0x1u));
+    CHECK_HEX("DCR 0x2 -> div 8", 8u, hype_guest_lapic_divisor(0x2u));
+    CHECK_HEX("DCR 0x3 -> div 16", 16u, hype_guest_lapic_divisor(0x3u));
+    CHECK_HEX("DCR 0x8 -> div 32", 32u, hype_guest_lapic_divisor(0x8u));
+    CHECK_HEX("DCR 0x9 -> div 64", 64u, hype_guest_lapic_divisor(0x9u));
+    CHECK_HEX("DCR 0xA -> div 128", 128u, hype_guest_lapic_divisor(0xAu));
+    CHECK_HEX("DCR 0xB -> div 1", 1u, hype_guest_lapic_divisor(0xBu));
+    /* bit 2 is reserved and must not affect the decode */
+    CHECK_HEX("DCR 0xF (bit2 set) -> div 1", 1u, hype_guest_lapic_divisor(0xFu));
+}
+
+/* M4-6b5: advance honours the divisor -- divide-by-16 needs 16x the base-rate
+ * ticks to reach terminal count, and the fractional remainder carries. */
+static void test_advance_honours_divide(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 32u);            /* one-shot */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_DIVIDE_CONFIG, 4, 0x3u); /* divide-by-16 */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 100u);
+
+    hype_guest_lapic_advance(&l, 1600); /* 1600 base / 16 = 100 counts -> exactly terminal */
+    CHECK_HEX("divide-by-16: 1600 base ticks = 100 counts -> fires", 1,
+              hype_guest_lapic_take_timer_irq(&l, &vec));
+
+    /* Remainder carry: 8 base ticks/call * 16 calls = 128 base = 8 counts. */
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4, 32u);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_DIVIDE_CONFIG, 4, 0x3u); /* div-16 */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 100u);
+    {
+        int i;
+        for (i = 0; i < 16; i++) {
+            hype_guest_lapic_advance(&l, 8); /* 8/16 = 0 each call, but remainder accrues */
+        }
+    }
+    CHECK_HEX("fractional remainder carries across calls (16x8=128 base=8 counts)", 92,
+              l.current_count);
+}
+
 int main(void) {
+    test_divisor_decode();
+    test_advance_honours_divide();
     test_reset_defaults();
     test_all_registers_roundtrip();
     test_svr_read_write_roundtrip();

@@ -11,8 +11,15 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->init_count = 0;
     lapic->current_count = 0;
     lapic->tick_accum = 0;
+    lapic->divide_accum = 0;
     lapic->timer_irq_pending = 0;
     lapic->timer_in_service = 0;
+}
+
+uint32_t hype_guest_lapic_divisor(uint32_t divide_config) {
+    /* Divisor encoded in bits [3,1,0] (bit 2 reserved). */
+    uint32_t d = ((divide_config & 0x8u) >> 1) | (divide_config & 0x3u);
+    return (d == 0x7u) ? 1u : (1u << (d + 1u));
 }
 
 int hype_guest_lapic_read(hype_guest_lapic_t *lapic, uint32_t offset, unsigned int size, uint32_t *out) {
@@ -139,11 +146,30 @@ void hype_guest_lapic_tick(hype_guest_lapic_t *lapic) {
 }
 
 void hype_guest_lapic_advance(hype_guest_lapic_t *lapic, uint64_t ticks) {
+    uint32_t divisor;
+    uint64_t total;
     /* Timer disarmed (init_count == 0) or masked: nothing to do. */
     if (lapic->init_count == 0 || (lapic->lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED) != 0) {
         lapic->timer_irq_pending = 0;
+        lapic->divide_accum = 0;
         return;
     }
+    if (ticks == 0) {
+        return;
+    }
+
+    /* M4-6b5: `ticks` is at the LAPIC timer's BASE input frequency (the FW-1
+     * loop scales the real-elapsed time to a realistic bus-clock rate, not
+     * PIT_HZ). The actual count decrements at base/divisor, per the guest's
+     * Divide Configuration Register -- so a guest that sets divide-by-16 and
+     * programs its counts accordingly sees the timer fire at the real time it
+     * expects (the mismatch that made Linux calibrate an implausible frequency
+     * and abandon the LAPIC timer for the 100 Hz PIT). The remainder carries
+     * in divide_accum so no fractional counts are lost across calls. */
+    divisor = hype_guest_lapic_divisor(lapic->divide_config);
+    total = lapic->divide_accum + ticks;
+    ticks = total / divisor;
+    lapic->divide_accum = total - ticks * (uint64_t)divisor;
     if (ticks == 0) {
         return;
     }
