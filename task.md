@@ -3539,11 +3539,18 @@ observability channel) must land FIRST.*
 - [ ] **RT-1** — Post-EBS observability channel (replaces the Boot-Services
   \hype-log.txt flush, which is gone once ExitBootServices runs). Must land
   before RT-2 or we go blind on real HW.
-  - [ ] **RT-1a** — Persistent-RAM log ring buffer: back core/logbuf with a
-    reserved physical region carrying a findable magic header, so the
-    captured console survives ExitBootServices (and, ideally, a warm
-    reboot). The in-RAM capture already exists (logbuf, hype_debug_print
-    tees into it); this makes it survivable + locatable. Deps: core/logbuf.
+  - [x] **RT-1a** — Self-describing log-capture buffer. DONE 2026-07-18
+    (commit c15750d). core/logbuf is now one contiguous hype_logbuf_t
+    {magic("hypeLOG\0"), version, len, truncated, checksum, data[2MB]};
+    hype_logbuf_reset() (called first thing in efi_main) stamps the header,
+    append() maintains len+checksum, and pure hype_logbuf_validate()/
+    _find(base,size) let a scanner locate+validate it in RAM (never reading
+    past the region). Survives ExitBootServices (it's our own memory). A
+    fixed *reserved* physical address turned out unnecessary: RT-1b just
+    broad-scans RAM for the magic, so wherever the buffer sits it's findable
+    -- warm-reboot BYTE survival is the empirical piece RT-1b validates.
+    Unit-tested (stamp, validate, find + all rejects); QEMU no-regression,
+    \hype-log.txt still correct. Deps: core/logbuf.
   - [ ] **RT-1b** — Next-boot dump-to-file: early in efi_main on the FOLLOWING
     boot (Boot Services still up), scan for RT-1a's magic and write the
     recovered buffer to \hype-log-prev.txt -- post-EBS logs become
