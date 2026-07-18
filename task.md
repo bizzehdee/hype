@@ -3536,9 +3536,11 @@ one real cost is that post-EBS loses \hype-log.txt -- the debug channel
 every real-HW iteration this session relied on -- so RT-1 (a surviving
 observability channel) must land FIRST.*
 
-- [ ] **RT-1** — Post-EBS observability channel (replaces the Boot-Services
-  \hype-log.txt flush, which is gone once ExitBootServices runs). Must land
-  before RT-2 or we go blind on real HW.
+- [x] **RT-1** — DONE. Post-EBS observability channel (replaces the
+  Boot-Services \hype-log.txt flush, which is gone once ExitBootServices
+  runs). Must land before RT-2 or we go blind on real HW. All three
+  sub-deliverables complete: RT-1a (self-describing capture buffer), RT-1b
+  (next-boot recovery-to-file), RT-1c (dirty-region GOP live channel).
   - [x] **RT-1a** — Self-describing log-capture buffer. DONE 2026-07-18
     (commit c15750d). core/logbuf is now one contiguous hype_logbuf_t
     {magic("hypeLOG\0"), version, len, truncated, checksum, data[2MB]};
@@ -3551,12 +3553,21 @@ observability channel) must land FIRST.*
     -- warm-reboot BYTE survival is the empirical piece RT-1b validates.
     Unit-tested (stamp, validate, find + all rejects); QEMU no-regression,
     \hype-log.txt still correct. Deps: core/logbuf.
-  - [ ] **RT-1b** — Next-boot dump-to-file: early in efi_main on the FOLLOWING
-    boot (Boot Services still up), scan for RT-1a's magic and write the
-    recovered buffer to \hype-log-prev.txt -- post-EBS logs become
-    reviewable via the next boot's file I/O. Gated on empirically confirming
-    the region survives a warm reboot on the target; if it doesn't, GOP
-    on-screen (below) is the live fallback. Deps: RT-1a, core/file_io.
+  - [x] **RT-1b** — DONE. Next-boot dump-to-file. fw_1_dump_prev_log()
+    (boot/main.c) runs early in efi_main -- right after the memory map is
+    fetched (which names the physical ranges safe to read) and before
+    hype_logbuf_reset() stamps this boot's buffer, while Boot-Services file
+    I/O is still up. It walks the EfiConventionalMemory/BootServices*/Loader*
+    descriptors, calls RT-1a's bounds-safe hype_logbuf_find() on each (skips
+    our own live buffer + empty hits), and writes the first valid recovered
+    log to \hype-log-prev.txt -- so a post-EBS crash whose in-loop
+    \hype-log.txt flush never ran becomes reviewable on the next boot. Scan
+    confined to readable ranges (never MMIO/reserved). QEMU no-regression:
+    clean no-op on fresh (zeroed) RAM, boot still reaches Run /init, no
+    fatal. Warm-reboot BYTE survival remains the HW-empirical piece (firmware
+    may zero RAM / the loader may re-zero our BSS at the same address); when
+    it doesn't survive, RT-1c's GOP on-screen channel is the live fallback.
+    Deps: RT-1a, core/file_io.
   - [x] **RT-1c** — DONE. Hardened GOP on-screen rendering post-EBS as the
     always-available LIVE channel (it already renders post-EBS -- the "Boot
     Services exited" banner proves it). Root fix for the M4-6d4

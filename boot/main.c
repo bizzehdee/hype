@@ -4444,6 +4444,78 @@ static void fw_1_log_init(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs) {
     hype_fatal_set_flush_hook(fw_1_flush_log);
 }
 
+/* RT-1b: recover the PREVIOUS boot's log from physical RAM and write it to
+ * \hype-log-prev.txt.
+ *
+ * Once RT-2 moves the guest loop past ExitBootServices, the in-loop
+ * \hype-log.txt flush (fw_1_flush_log) is gone -- Boot-Services file I/O no
+ * longer exists while the guest runs, so a crash/hang after EBS leaves
+ * nothing on disk. RT-1a made the capture region self-describing
+ * (magic-tagged, checksummed) precisely so a LATER boot -- while Boot
+ * Services are still up, here in efi_main -- can scan RAM for it and dump
+ * whatever the prior run captured before it died.
+ *
+ * This is best-effort observability, not a guarantee: whether the region's
+ * bytes survive a warm reboot (firmware may zero conventional RAM, and the
+ * loader zeroes our own BSS on load, which can clobber the prior copy if
+ * hype.efi lands at the same physical address) is empirical per platform.
+ * When it doesn't survive, the GOP on-screen channel (RT-1c) is the live
+ * fallback. Called before hype_logbuf_reset() stamps THIS boot's buffer, so
+ * the only magic in RAM is a genuine prior log; we also skip our own live
+ * buffer defensively in case ordering ever changes.
+ *
+ * The scan is confined to memory-map descriptors we can safely read
+ * (conventional + boot-services + loader ranges) -- never MMIO/reserved,
+ * where a stray read could fault or hang. hype_logbuf_find() is bounds-safe
+ * within each region and validates magic+version+checksum before trusting a
+ * hit. First valid, non-empty, non-live buffer wins. */
+static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
+                               const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size, UINTN desc_size) {
+    EFI_FILE_PROTOCOL *root = 0;
+    const char *base = (const char *)map;
+    const hype_logbuf_t *live = hype_logbuf_get();
+    UINTN count = (desc_size > 0) ? (map_size / desc_size) : 0;
+    UINTN i;
+
+    if (map == 0 || count == 0) {
+        return;
+    }
+
+    for (i = 0; i < count; i++) {
+        const EFI_MEMORY_DESCRIPTOR *d = (const EFI_MEMORY_DESCRIPTOR *)(base + i * desc_size);
+        const void *region;
+        unsigned long region_size;
+        const hype_logbuf_t *found;
+
+        if (d->Type != EfiConventionalMemory && d->Type != EfiBootServicesCode &&
+            d->Type != EfiBootServicesData && d->Type != EfiLoaderCode &&
+            d->Type != EfiLoaderData) {
+            continue;
+        }
+        region = (const void *)(UINTN)d->PhysicalStart;
+        region_size = (unsigned long)(d->NumberOfPages * 4096ull);
+
+        found = hype_logbuf_find(region, region_size);
+        if (found == 0 || found == live || found->len == 0) {
+            continue;
+        }
+
+        /* Found a prior boot's log. Locating the root is deferred to here so
+         * a machine with no prior log never touches the filesystem. */
+        if (hype_file_locate_root(image_handle, bs, &root) != EFI_SUCCESS || root == 0) {
+            return;
+        }
+        hype_file_delete(root, (CHAR16 *)L"\\hype-log-prev.txt");
+        if (hype_file_write_new(root, (CHAR16 *)L"\\hype-log-prev.txt", found->data,
+                                (UINTN)found->len) == EFI_SUCCESS) {
+            hype_debug_print("RT-1b: recovered %u bytes of the previous boot's log%s -> "
+                             "\\hype-log-prev.txt\n",
+                             (unsigned int)found->len, found->truncated ? " (truncated)" : "");
+        }
+        return;
+    }
+}
+
 /* M4-6d4: catch a HOST-side CPU exception during the FW-1 guest loop.
  *
  * The loop runs BEFORE ExitBootServices (so the \hype-log.txt flush works),
@@ -6069,6 +6141,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * machine's own real usable RAM, not a guess. */
     usable_ram_bytes = hype_memmap_usable_bytes(map, map_size, desc_size);
     g_usable_ram_bytes = usable_ram_bytes;
+
+    /* RT-1b: while the map is still in hand (it names which physical ranges
+     * are safe to read) and Boot Services file I/O is still up, scan RAM for
+     * a PREVIOUS boot's self-describing log region and dump it to
+     * \hype-log-prev.txt. Best-effort observability for a post-EBS crash
+     * whose in-loop \hype-log.txt flush never ran; a no-op when no prior log
+     * survived in RAM. */
+    fw_1_dump_prev_log(ImageHandle, SystemTable->BootServices, map, map_size, desc_size);
+
     SystemTable->BootServices->FreePool(map);
 
     /* LocateProtocol is a Boot Services call like the memory map fetch
