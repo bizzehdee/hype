@@ -3515,6 +3515,81 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
 
 ---
 
+## RT — Post-ExitBootServices guest execution model
+## (corrects the M4-6 pre-EBS debugging scaffold; prerequisite to M8-0)
+
+*Why this track exists (2026-07-18): every guest so far runs BEFORE
+ExitBootServices, purely so fw_1_flush_log can persist \hype-log.txt via
+Boot-Services file I/O -- a debugging scaffold, not the production model.
+That model structurally blocks what comes next: (1) UEFI Boot Services
+are not MP-safe (only the BSP may call them), so two guests each doing
+Boot Services from pinned APs cannot work -- M8 concurrency needs hype to
+have already exited Boot Services and own the machine; (2) pre-EBS the
+firmware owns the IDT and timer, so we cannot cleanly preempt a running
+guest -- the M4-6d4 40s-spin / soft-lockups are unfixable there (the
+watchdog-disable and exception-catcher IDT-patch are workarounds around
+exactly this). Post-EBS, hype runs on its OWN GDT/IDT/paging/timer (M1-8,
+already built) and can preempt guests. This track makes that transition
+for the single guest; M8-0 then de-globalizes the FINAL post-EBS loop
+(not the scaffold), so the console/logging rework isn't done twice. The
+one real cost is that post-EBS loses \hype-log.txt -- the debug channel
+every real-HW iteration this session relied on -- so RT-1 (a surviving
+observability channel) must land FIRST.*
+
+- [ ] **RT-1** — Post-EBS observability channel (replaces the Boot-Services
+  \hype-log.txt flush, which is gone once ExitBootServices runs). Must land
+  before RT-2 or we go blind on real HW.
+  - [ ] **RT-1a** — Persistent-RAM log ring buffer: back core/logbuf with a
+    reserved physical region carrying a findable magic header, so the
+    captured console survives ExitBootServices (and, ideally, a warm
+    reboot). The in-RAM capture already exists (logbuf, hype_debug_print
+    tees into it); this makes it survivable + locatable. Deps: core/logbuf.
+  - [ ] **RT-1b** — Next-boot dump-to-file: early in efi_main on the FOLLOWING
+    boot (Boot Services still up), scan for RT-1a's magic and write the
+    recovered buffer to \hype-log-prev.txt -- post-EBS logs become
+    reviewable via the next boot's file I/O. Gated on empirically confirming
+    the region survives a warm reboot on the target; if it doesn't, GOP
+    on-screen (below) is the live fallback. Deps: RT-1a, core/file_io.
+  - [ ] **RT-1c** — Verify/harden GOP on-screen rendering post-EBS as the
+    always-available LIVE channel (it already renders post-EBS -- the "Boot
+    Services exited" banner proves it -- but confirm scrollback/wrap behave
+    and hype_debug_print's per-line full-framebuffer flush isn't pathological
+    on real VRAM; see the M4-6d4 GOP-flush-batching note). Deps: M1-6.
+  Deps: M1-6, core/logbuf, core/file_io.
+
+- [ ] **RT-2** — Move single-guest execution to post-ExitBootServices.
+  - [ ] **RT-2a** — Reorder setup vs execution: keep ALL setup pre-EBS (ISO +
+    OVMF read from the ESP, guest RAM/VMCB/NPT build, fw_1_log_init) exactly
+    as today; then ExitBootServices; then run the guest dispatch loop under
+    hype's own GDT/IDT/paging/timer (M1-8) instead of firmware's. Retire the
+    pre-EBS scaffolding made moot by this: the in-loop Boot-Services log
+    flush (-> RT-1), the firmware-IDT reliance + fw_1_install_exception_catcher
+    IDT-patch (hype's own IDT now catches host faults directly), and the
+    SetWatchdogTimer(0) workaround (no firmware watchdog once EBS'd).
+    Regression bar: single Alpine still boots to `localhost login`, observed
+    via RT-1. Deps: RT-1, M1-8, M1-4.
+  - [ ] **RT-2b** — Host preemption timer (folds M4-6d4's remaining work):
+    with hype's own periodic timer (M1-8) live post-EBS, regain control from
+    a running guest on each host tick (physical-interrupt path -- INTERCEPT_INTR
+    / EXITCODE_INTR 0x60, or the host tick firing between VMRUNs), advance the
+    guest timebase, and inject the due guest tick. This FIXES the 40s no-exit
+    spin / soft lockups generally (a spinning guest is now preemptible
+    regardless of instruction mix -- unlike the reverted pause-filter, which
+    the HW showed inert because the real spins execute no PAUSE). BONUS: log
+    the guest RIP on the preemption exit -- first look at what the 40s loop
+    actually is. Deps: RT-2a.
+  - [ ] **RT-2c** — Adapt the guest timebase (M4-6b1) + console drain to the
+    post-EBS host-timer-driven loop (they currently assume the pre-EBS
+    per-VM-exit cadence). Deps: RT-2a.
+  Deps: RT-1.
+
+  *RT is the prerequisite that turns M8-0 from "refactor the scaffold" into
+  "refactor the real thing." After RT: M8-0 (de-globalize) -> M8-0a (per-VM
+  RAM/NPT) -> M8-0b (concurrent dispatch, now MP-safe post-EBS) -> M8-0c
+  (per-VM console).*
+
+---
+
 ## M8 — Multi-VM concurrency, dashboard, lifecycle control, fault isolation
 ## (plan.md §9 M8, §6b, §6f, §6g, §10 decisions #11/#12)
 
@@ -3537,7 +3612,8 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
   `hype_vm_t` must boot Alpine to login byte-for-byte as today (the
   regression bar). Mechanical (globals -> struct fields) but large; do it
   as its own step so RAM/dispatch/console work builds on a clean instance
-  model. Deps: M4-6 (single-guest path complete), M1-1, ADM-1.
+  model. Deps: RT-2 (de-globalize the FINAL post-EBS loop, not the pre-EBS
+  scaffold), M4-6 (single-guest path complete), M1-1, ADM-1.
 - [ ] **M8-0a** — Per-VM RAM + NPT allocation: loop RAM-1/RAM-2's
   allocation over `cfg.vms[]` so each `hype_vm_t` gets its own AllocatePages
   region (sized from that VM's `mem_mb`) and its own NPT root, instead of
