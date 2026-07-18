@@ -3584,6 +3584,19 @@ observability channel) must land FIRST.*
     test_gop.c: skip-when-clean + copies-only-dirty-rows), all pass; QEMU boot
     no-regression (Installing packages ok, Run /init, log file intact).
     Deps: M1-6.
+  - [x] **RT-1d** — DONE. Hardened RT-1b after the first HW run. (1) Killed
+    the pre-EBS scan pause: the buffer is now page-aligned and
+    hype_logbuf_find takes a stride arg; fw_1_dump_prev_log scans at
+    HYPE_LOGBUF_SCAN_ALIGN (4 KB) instead of 8 bytes -- ~512x fewer probes
+    across multi-GB RAM. (2) fw_1_dump_prev_log always reports its outcome
+    (recovered N / no prior log found / found-but-unwritable) instead of
+    being silent on the common path. (3) Always deletes any stale
+    \hype-log.txt on boot -- RT-2a retired that writer, and a leftover
+    pre-RT-2a file was masquerading as a fresh log on the HW stick.
+    Unit-tested (page-strided find, sub-8 clamp, off-page skip). NOTE from HW:
+    the test laptop is cold-power-cycle only (no warm reboot), so RT-1b
+    recovery finds nothing there -- RT-3 is the cold-boot-surviving channel.
+    Deps: RT-1b.
   Deps: M1-6, core/logbuf, core/file_io.
 
 - [ ] **RT-2** — Move single-guest execution to post-ExitBootServices.
