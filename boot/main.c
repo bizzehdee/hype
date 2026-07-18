@@ -4408,41 +4408,13 @@ static void fw_1_debug_feed(hype_vt_filter_t *filter, char *line, unsigned int *
     line[(*line_len)++] = c;
 }
 
-/* Real-hardware, serial-less logging (core/logbuf.h + core/file_io.h).
- * The boot volume root is located ONCE on the BSP (fw_1_log_init, before
- * the guest is dispatched -- possibly to a pinned AP), so a flush from
- * the FW-1 loop or from hype_fatal() only re-opens+writes the file rather
- * than doing HandleProtocol from a non-BSP context. Fully best-effort:
- * the first write that errors (a read-only or non-FAT volume) disables
- * further attempts so it can never wedge the boot. */
-static EFI_FILE_PROTOCOL *g_fw_1_log_root = 0;
-static int g_fw_1_log_disabled = 0;
-
-static void fw_1_flush_log(void) {
-    if (g_fw_1_log_disabled || g_fw_1_log_root == 0) {
-        return;
-    }
-    if (hype_file_write_new(g_fw_1_log_root, (CHAR16 *)L"\\hype-log.txt", hype_logbuf_data(),
-                             (UINTN)hype_logbuf_len()) != EFI_SUCCESS) {
-        g_fw_1_log_disabled = 1;
-    }
-}
-
-/* Called once on the BSP (Boot Services file I/O proven -- the ISO was
- * just read from this volume) to cache the root + register the crash-time
- * flush hook. */
-static void fw_1_log_init(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs) {
-    if (hype_file_locate_root(image_handle, bs, &g_fw_1_log_root) != EFI_SUCCESS) {
-        g_fw_1_log_root = 0;
-        g_fw_1_log_disabled = 1;
-        return;
-    }
-    /* Clear any stale log from a previous run ONCE, here on the BSP, so
-     * the subsequent in-place-overwrite flushes never have to delete
-     * (which churns fragile FAT write paths). */
-    hype_file_delete(g_fw_1_log_root, (CHAR16 *)L"\\hype-log.txt");
-    hype_fatal_set_flush_hook(fw_1_flush_log);
-}
+/* RT-2a: the live \hype-log.txt flush (fw_1_flush_log/fw_1_log_init) is
+ * retired. The guest loop now runs post-ExitBootServices where Boot-Services
+ * file I/O no longer exists, so there is nothing to flush to during a boot.
+ * The RT-1 channel replaces it: every hype_debug_print tees into the
+ * self-describing in-RAM logbuf (core/logbuf.h), recovered to
+ * \hype-log-prev.txt on the next boot (fw_1_dump_prev_log, below) and
+ * rendered live to the GOP framebuffer (RT-1c). */
 
 /* RT-1b: recover the PREVIOUS boot's log from physical RAM and write it to
  * \hype-log-prev.txt.
@@ -4516,65 +4488,18 @@ static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
     }
 }
 
-/* M4-6d4: catch a HOST-side CPU exception during the FW-1 guest loop.
- *
- * The loop runs BEFORE ExitBootServices (so the \hype-log.txt flush works),
- * but the hypervisor's own IDT isn't installed until AFTER the guests return
- * (efi_main, hype_idt_load). So during the loop the firmware's IDT is live,
- * and a HOST-side fault in one of our exit handlers (a bad guest-controlled
- * pointer, say) takes a #PF/#GP the firmware doesn't expect -- on real
- * hardware that silently triple-faults and RESETS the machine, leaving no
- * PANIC in the log (exactly the M4-6d4 real-HW symptom: both a 5950x and a
- * Zen2 laptop reboot at the same "Scanning hardware for mdev" point with no
- * fatal message). This surgically overrides ONLY the 32 architectural
- * exception vectors (0-31) in the live firmware IDT to point at our own ISR
- * stubs -- which decode + hype_fatal(), flushing the log with the faulting
- * vector name and RIP before halting. Hardware IRQ vectors (32-255) are left
- * exactly as firmware set them, so firmware IRQs and the Boot-Services
- * storage the log flush rides on keep working untouched. The gate selector
- * is the CURRENT CS (we're still on the firmware GDT here, not ours). The
- * originals are restored after the loop. This is a strict improvement, not
- * just a diagnostic: a caught, reported host fault beats a silent reset. */
-static hype_idt_entry_t g_fw_1_saved_idt_exc[32];
-static int g_fw_1_idt_patched;
-
-static void fw_1_install_exception_catcher(void) {
-    hype_idt_ptr_t idtr;
-    hype_idt_entry_t *live;
-    uint16_t cs = 0;
-    unsigned v;
-    __asm__ volatile("sidt %0" : "=m"(idtr));
-    __asm__ volatile("mov %%cs, %0" : "=r"(cs));
-    if (idtr.base == 0 || idtr.limit < (uint16_t)(32u * sizeof(hype_idt_entry_t) - 1u)) {
-        hype_debug_print("fw-1: exception catcher NOT armed (firmware IDT base=0x%llx limit=%u too small)\n",
-                          (unsigned long long)idtr.base, (unsigned int)idtr.limit);
-        return;
-    }
-    live = (hype_idt_entry_t *)(uintptr_t)idtr.base;
-    for (v = 0; v < 32u; v++) {
-        g_fw_1_saved_idt_exc[v] = live[v];
-        hype_idt_encode_entry(&live[v], hype_isr_stub_table[v], cs, 0, HYPE_IDT_TYPE_INTERRUPT_GATE);
-    }
-    g_fw_1_idt_patched = 1;
-    hype_debug_print("fw-1: host exception catcher armed (IDT base=0x%llx cs=0x%x) -- a host fault "
-                      "in the guest loop now flushes a PANIC instead of resetting the machine\n",
-                      (unsigned long long)idtr.base, (unsigned int)cs);
-}
-
-static void fw_1_remove_exception_catcher(void) {
-    hype_idt_ptr_t idtr;
-    hype_idt_entry_t *live;
-    unsigned v;
-    if (!g_fw_1_idt_patched) {
-        return;
-    }
-    __asm__ volatile("sidt %0" : "=m"(idtr));
-    live = (hype_idt_entry_t *)(uintptr_t)idtr.base;
-    for (v = 0; v < 32u; v++) {
-        live[v] = g_fw_1_saved_idt_exc[v];
-    }
-    g_fw_1_idt_patched = 0;
-}
+/* RT-2a: the M4-6d4 firmware-IDT exception catcher (fw_1_install/remove_
+ * exception_catcher) is retired. It existed only because the guest loop ran
+ * BEFORE ExitBootServices, under firmware's IDT, so a host-side fault in an
+ * exit handler silently triple-faulted and reset the machine; it patched the
+ * 32 architectural vectors in the live firmware IDT to point at our ISR stubs
+ * for the duration of the loop. Now the loop runs AFTER ExitBootServices
+ * under hype's OWN IDT (efi_main: hype_idt_build/hype_idt_load), whose stub
+ * table already routes every vector -- including exceptions 0-31, which can
+ * never carry a registered handler (hype_isr_register rejects vector<32) --
+ * to hype_isr_dispatch -> hype_fatal() with the faulting vector, RIP, error
+ * code, and CS. So host faults are caught permanently and with more context,
+ * without patching anyone else's IDT. */
 
 static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
@@ -4864,11 +4789,15 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_vt_filter_reset(&uart_filter2);
     hype_vt_filter_reset(&dbg_filter);
 
-    /* M4-6d4: arm the host exception catcher for the duration of the loop
-     * so a host fault produces a flushed PANIC (with the faulting vector +
-     * RIP) instead of a silent triple-fault machine reset. */
-    fw_1_install_exception_catcher();
-
+    /* RT-2a: the firmware-IDT exception catcher (fw_1_install/remove_
+     * exception_catcher) is retired. The guest loop now runs AFTER
+     * ExitBootServices under hype's OWN IDT (efi_main: hype_idt_build/
+     * hype_idt_load), whose stub table routes every vector -- including
+     * CPU exceptions 0-31, which can never carry a registered handler
+     * (hype_isr_register rejects vector<32) -- to hype_isr_dispatch ->
+     * hype_fatal(), producing a flushed PANIC with the faulting vector,
+     * RIP, error code, and CS. That is strictly more than the old catcher
+     * gave, so no per-loop IDT patching is needed. */
     for (;;) {
         uint8_t timer_vector;
 
@@ -5018,21 +4947,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
         }
 
-        /* Periodically flush the captured console log to \hype-log.txt so
-         * a mid-boot hang OR crash on real hardware still leaves an
-         * up-to-date log on the USB stick (the end-of-run write only fires
-         * if the loop returns; a live boot never does). ~3s of wall-clock
-         * between flushes keeps the file I/O cost negligible; fw_1_flush_log
-         * self-disables if the volume ever rejects a write. */
-        {
-            static uint64_t last_flush_tsc = 0;
-            uint64_t now_flush = hype_rdtsc();
-            if (!g_fw_1_log_disabled && g_fw_1_host_tsc_hz != 0 &&
-                (last_flush_tsc == 0 || now_flush - last_flush_tsc >= 3ULL * g_fw_1_host_tsc_hz)) {
-                last_flush_tsc = now_flush;
-                fw_1_flush_log();
-            }
-        }
+        /* RT-2a: the periodic in-loop \hype-log.txt flush is retired. This
+         * loop now runs post-ExitBootServices, where Boot-Services file I/O
+         * no longer exists. The RT-1 channel replaces it: every
+         * hype_debug_print already tees into the self-describing in-RAM
+         * logbuf (recovered to \hype-log-prev.txt on the next boot, RT-1b)
+         * and renders live to the GOP framebuffer (RT-1c). */
 
         /* M4-6b1: advance the guest PIT + LAPIC timer by the number of
          * 1.193182 MHz ticks that really elapsed since the last exit
@@ -5871,10 +5791,9 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         break;
     }
 
-    /* M4-6d4: restore the firmware's exception vectors now that the guest
-     * loop is done -- the subsequent Boot Services calls (GetMemoryMap,
-     * ExitBootServices) run under firmware's own handlers again. */
-    fw_1_remove_exception_catcher();
+    /* RT-2a: no firmware-IDT restore needed -- this loop runs post-EBS under
+     * hype's own IDT, and there are no subsequent Boot Services calls to
+     * hand back to firmware. */
 
     /* Flush any console text the guest emitted right before it idled. */
     fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
@@ -6103,6 +6022,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
     int have_gop;
     UINT64 usable_ram_bytes = 0;
+    /* RT-2a: the guest now runs AFTER ExitBootServices (below), so its
+     * ops/kind must outlive the pre-EBS setup block that computes them. */
+    hype_test_guest_args_t args;
 
     /* RT-1a: stamp the log-capture region's magic header before anything
      * logs into it, so it is self-describing (findable + validatable by a
@@ -6116,19 +6038,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * Services or which GDT/IDT happens to be active either way. */
     hype_serial_init(HYPE_SERIAL_COM1, 115200);
 
-    /* M4-6d4: disable the UEFI watchdog timer. Firmware arms it (5-minute
-     * default) when it hands control to a boot application and force-RESETS
-     * the machine if that app runs the whole period without calling
-     * ExitBootServices(). Our FW-1 guest loop deliberately runs for many
-     * minutes of wall-clock BEFORE ExitBootServices (the log flush needs
-     * Boot Services), so the watchdog fired mid-boot -- the real-HW reset
-     * at ~5 min (both a 5950x and a Zen2 laptop reset in the 250-280s wall
-     * window) with NO panic and uncatchable by our exception handler,
-     * because it is a firmware reset, not a CPU fault. Timeout=0 disarms
-     * it. Harmless on QEMU (whose OVMF watchdog never fired in-window). */
-    if (SystemTable->BootServices->SetWatchdogTimer != 0) {
-        SystemTable->BootServices->SetWatchdogTimer(0, 0, 0, 0);
-    }
+    /* RT-2a: the M4-6d4 SetWatchdogTimer(0) workaround is retired. Firmware
+     * arms the 5-minute watchdog when it hands off to a boot app and resets
+     * the machine if the app runs the whole period without calling
+     * ExitBootServices(). That fired on real HW only because the old design
+     * ran the multi-minute FW-1 guest loop BEFORE ExitBootServices. RT-2a
+     * calls ExitBootServices EARLY -- right after the fast pre-EBS setup
+     * (allocations + firmware/ISO read + 20ms TSC calibration, all well
+     * under the 5-min window) and BEFORE the guest loop -- so the firmware
+     * watchdog is disarmed by the ExitBootServices transition itself, before
+     * it could ever fire. (If a future slow-media setup path ever approaches
+     * the window, re-add a SetWatchdogTimer(0) here.) */
 
     status = hype_memmap_get(SystemTable->BootServices, &map, &map_size, &desc_size, &map_key);
     if (status != EFI_SUCCESS) {
@@ -6223,34 +6143,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
 
     /*
-     * M3-2: 1:1 vCPU-to-pCPU pinning. The test guest launches *here*,
-     * before ExitBootServices, dispatched onto a pinned AP via a
-     * blocking StartupThisAP call when one is available -- not after,
-     * parked in a loop waiting for later work. An AP that firmware
-     * dispatched via MP services is not guaranteed to survive
-     * ExitBootServices: firmware is free to reclaim/reset APs as part
-     * of that transition (confirmed the hard way -- an earlier design
-     * that parked an AP here and signaled it to do real work only
-     * after ExitBootServices/our own GDT+paging swap reliably hung,
-     * with a golden-signal test confirming the AP simply stopped
-     * responding to shared memory writes once ExitBootServices had
-     * run, even with no work involved beyond the bare go/done flags).
-     * Running here, synchronously, sidesteps that entirely -- nothing
-     * run_all_test_guests() does depends on our own GDT/IDT/paging/
-     * timer (see run_test_guest()'s own comment), so there's no reason
-     * it needs to run after ExitBootServices at all. No extra pCPU (or
-     * no MP services
-     * at all) isn't fatal -- the test guest just runs on the BSP
-     * instead, right here, same as M2-7/M3-1's original behavior.
+     * RT-2a: this block does only PRE-ExitBootServices SETUP -- vendor/ops
+     * detection, all guest allocations (guest code pages, RAM-1 guest RAM,
+     * FW-1 firmware read from the ESP), and host-TSC calibration -- every
+     * one of which needs Boot Services. It no longer RUNS the guest; that
+     * moved past ExitBootServices (see run_all_test_guests(&args) far below),
+     * where the guest executes under hype's own GDT/IDT/paging with firmware
+     * fully out of the picture.
+     *
+     * The earlier design (through M4-6d4) ran the guest here, pre-EBS, on a
+     * pinned AP via a blocking StartupThisAP (M3-2). That AP path was itself
+     * a pre-EBS scaffold: an AP that firmware dispatched via MP services is
+     * not guaranteed to survive ExitBootServices (confirmed the hard way --
+     * a parked-AP-signalled-post-EBS design reliably hung). RT-2a's single
+     * guest simply runs on the BSP post-EBS; bringing up our OWN APs
+     * (INIT-SIPI-SIPI) for concurrent multi-VM dispatch is M8-0b's job.
      */
     {
         hype_cpu_diag_t cpu_diag = hype_cpu_detect_vmm_kind_diag();
         hype_vmm_kind_t kind = cpu_diag.kind;
         const hype_vmm_ops_t *ops = hype_vmm_ops_for_kind(kind);
-        static hype_test_guest_args_t args;
-        EFI_MP_SERVICES_PROTOCOL *mp = 0;
-        UINTN target_ap = 0;
-        int have_target_ap = 0;
 
         /* Real-hardware debugging: the single most useful line in the
          * whole log if a machine turns out to be the "wrong" vendor,
@@ -6495,73 +6407,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                               (unsigned long long)(g_fw_1_host_tsc_hz / 1000000ULL));
         }
 
-        /* Cache the boot-volume root + register the crash-time log flush,
-         * here on the BSP where Boot Services file I/O is proven (the ISO
-         * was just read from this same volume). Lets the FW-1 loop (which
-         * may run on a pinned AP) and hype_fatal() flush \hype-log.txt
-         * without a first-time locate from a non-BSP context. */
-        fw_1_log_init(ImageHandle, SystemTable->BootServices);
-
+        /* RT-2a: capture ops/kind for the post-EBS guest run below. The
+         * \hype-log.txt logging setup (fw_1_log_init) and the pinned-AP
+         * dispatch (hype_mp_locate/StartupThisAP) are both retired here --
+         * the former replaced by the RT-1 in-RAM logbuf channel, the latter
+         * moot now that the single guest runs on the BSP post-EBS. */
         args.ops = ops;
         args.kind = kind;
-
-        status = hype_mp_locate(SystemTable->BootServices, &mp);
-        if (status == EFI_SUCCESS) {
-            status = hype_mp_pick_target_ap(mp, &target_ap);
-            have_target_ap = (status == EFI_SUCCESS);
-        }
-
-        if (have_target_ap) {
-            BOOLEAN finished = 0;
-
-            hype_console_print(SystemTable, "mp: dispatching test guest to pinned pCPU #%llu\n",
-                                (unsigned long long)target_ap);
-            /* Mirrored to serial too (not just the UEFI console) --
-             * real-hardware debugging: if the AP never comes back, this
-             * is the last line either channel will show, and serial is
-             * the more reliable one to actually capture from real
-             * hardware. */
-            hype_serial_print("mp: dispatching test guest to pinned pCPU #%llu...\n",
-                               (unsigned long long)target_ap);
-            /* WaitEvent=0/NULL => blocking: waits for
-             * run_all_test_guests() to return, which it always does on
-             * success. On a fatal path inside it (hype_fatal() ->
-             * hype_halt_forever(), never returns), this call -- and so
-             * the whole boot -- blocks forever on that core too; the
-             * diagnostic message fatal() already printed to serial is
-             * what actually matters for debugging a genuinely
-             * unrecoverable condition, so this is an accepted
-             * tradeoff, not a gap. */
-            status = mp->StartupThisAP(mp, run_all_test_guests, target_ap, 0, 0, &args, &finished);
-            if (status != EFI_SUCCESS) {
-                hype_fatal("mp: StartupThisAP on pCPU #%llu failed: 0x%llx",
-                           (unsigned long long)target_ap, (unsigned long long)status);
-            }
-            hype_console_print(SystemTable, "mp: pinned pCPU #%llu finished\n",
-                                (unsigned long long)target_ap);
-        } else {
-            hype_console_print(SystemTable,
-                                "mp: no extra pCPU available (0x%llx) -- test guest running on the BSP\n",
-                                (unsigned long long)status);
-            run_all_test_guests(&args);
-        }
     }
-
-    /* Real-hardware debugging (serial-less): flush the captured console
-     * log to a file on the volume hype.efi was loaded from, while Boot
-     * Services file I/O is still available. The tester reads the
-     * complete, exact log off the USB stick instead of photographing a
-     * wrapping framebuffer. Best-effort -- a read-only or non-FAT boot
-     * volume just prints a status line and boot continues. Everything
-     * printed up to here (including the FW-1 guest console and the
-     * giveup diagnostics) is in the buffer; this trailing status line
-     * is not (it reports the write that just happened). */
-    fw_1_flush_log(); /* final flush via the BSP-cached root (fw_1_log_init) */
-    hype_debug_print("hype: console log (%u bytes%s) -> \\hype-log.txt on the boot volume: %s\n",
-                      hype_logbuf_len(), hype_logbuf_truncated() ? ", TRUNCATED" : "",
-                      (!g_fw_1_log_disabled && g_fw_1_log_root != 0)
-                          ? "written"
-                          : "unavailable (read-only or non-FAT volume?)");
 
     /* Real-hardware debugging: a hang with this as the last serial
      * line means ExitBootServices() itself never returned control --
@@ -6681,6 +6534,31 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
 
     hype_serial_print("hype: Boot Services exited, hypervisor now running\n");
+
+    /*
+     * RT-2a: run the guest HERE -- post-ExitBootServices, on the BSP, under
+     * hype's own GDT/IDT/paging loaded just above, with firmware entirely
+     * out of the picture. This is the whole point of the RT track: VMRUN now
+     * saves/restores HYPE's host state (not firmware's), a host CPU fault in
+     * the loop lands in hype's IDT -> hype_fatal() with full context (not a
+     * silent firmware triple-fault), and there is no 5-minute firmware
+     * watchdog to race.
+     *
+     * Interrupts stay MASKED across the guest loop (the cli from right after
+     * ExitBootServices still holds -- host timer/sti bring-up is deliberately
+     * left BELOW this call). The guest timebase is rdtsc-polled and its
+     * interrupts are injected via the VMCB (M4-6b1), so it needs no host
+     * physical interrupts to reach login -- this preserves exactly the
+     * delivery behavior that reaches `localhost login` today. Turning the
+     * host tick into a guest-preemption source is RT-2b's job.
+     *
+     * run_all_test_guests() first runs the quick M2-M5/VIDEO/INPUT
+     * regression guests (all self-contained: static/pre-EBS-allocated
+     * memory, no Boot Services), then the FW-1 Alpine guest, which for a
+     * live boot never returns. The host-timer/keyboard/chord tail below is
+     * therefore reached only if that guest loop gives up and returns.
+     */
+    run_all_test_guests(&args);
 
     /*
      * M1-8: bring up the host's own timer tick. Ordering matters again:

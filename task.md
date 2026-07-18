@@ -3587,16 +3587,34 @@ observability channel) must land FIRST.*
   Deps: M1-6, core/logbuf, core/file_io.
 
 - [ ] **RT-2** — Move single-guest execution to post-ExitBootServices.
-  - [ ] **RT-2a** — Reorder setup vs execution: keep ALL setup pre-EBS (ISO +
-    OVMF read from the ESP, guest RAM/VMCB/NPT build, fw_1_log_init) exactly
-    as today; then ExitBootServices; then run the guest dispatch loop under
-    hype's own GDT/IDT/paging/timer (M1-8) instead of firmware's. Retire the
-    pre-EBS scaffolding made moot by this: the in-loop Boot-Services log
-    flush (-> RT-1), the firmware-IDT reliance + fw_1_install_exception_catcher
-    IDT-patch (hype's own IDT now catches host faults directly), and the
-    SetWatchdogTimer(0) workaround (no firmware watchdog once EBS'd).
-    Regression bar: single Alpine still boots to `localhost login`, observed
-    via RT-1. Deps: RT-1, M1-8, M1-4.
+  - [x] **RT-2a** — DONE (QEMU-verified; HW handoff pending). Reordered
+    efi_main: all setup stays pre-EBS (ISO + OVMF read, guest RAM/VMCB/NPT
+    build, TSC calibration -- everything needing Boot Services); then
+    ExitBootServices EARLY; then cli + hype's own GDT/paging/IDT load; then
+    run_all_test_guests(&args) on the BSP, post-EBS, under hype's own
+    environment. `args` hoisted to efi_main scope so ops/kind outlive the
+    setup block. Retired all three scaffolds: (1) the in-loop + final
+    \hype-log.txt flush and fw_1_flush_log/fw_1_log_init/g_fw_1_log_* --
+    replaced by RT-1 (logbuf + next-boot recovery + live GOP); (2)
+    fw_1_install/remove_exception_catcher + g_fw_1_saved_idt_exc -- hype's own
+    IDT stub table now routes every vector incl. exceptions 0-31 (never a
+    registered handler, hype_isr_register rejects <32) to hype_isr_dispatch ->
+    hype_fatal() with full context, strictly better than the firmware-IDT
+    patch; (3) SetWatchdogTimer(0) -- moot now that EBS happens before the
+    long guest loop (firmware watchdog disarmed by the EBS transition). Also
+    retired the pinned-AP StartupThisAP dispatch (APs aren't guaranteed to
+    survive EBS; single guest runs on the BSP -- own-AP bring-up for
+    concurrent VMs is M8-0b). Interrupts stay MASKED across the guest loop
+    (cli from post-EBS holds; host timer/sti tail left below the guest run) --
+    the rdtsc-polled guest timebase + VMCB-injected guest interrupts (M4-6b1)
+    need no host IRQs to reach login, preserving today's delivery behavior;
+    host-tick preemption is RT-2b. VMRUN now saves/restores hype's OWN host
+    GDT/IDT (not firmware's). QEMU no-regression: ordering inverted
+    (ExitBootServices returned -> own IDT loaded -> Boot Services exited, ALL
+    before the guests), pause-test PASS, Run /init, Installing packages ok,
+    `localhost login` reached, zero host faults/panics. Regression bar (single
+    Alpine to login observed via RT-1) MET under QEMU; real-HW confirmation is
+    the outstanding HW-empirical piece. Deps: RT-1, M1-8, M1-4.
   - [ ] **RT-2b** — Host preemption timer (folds M4-6d4's remaining work):
     with hype's own periodic timer (M1-8) live post-EBS, regain control from
     a running guest on each host tick (physical-interrupt path -- INTERCEPT_INTR
