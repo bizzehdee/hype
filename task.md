@@ -17,9 +17,12 @@ M4-1..6 (incl. M4-6a/b1/b4/c/d1..d4), CPUMSR-1/2, RAM-1/2, PCI-1/2,
 ISO-1/2, M5-1/2, FW-1a..h, FW-2, VALID-1/3, RT-1 (a/b/c/d), RT-2a/2b,
 RT-3 (a/b).
 **M4-6 (stock Alpine → userspace `localhost login`) is DONE and
-hardware-confirmed.** **RT-2a (guest execution moved past ExitBootServices)
-is QEMU-verified and confirmed reaching login on real HW by direct
-observation; its full-log HW capture is pending RT-3.**
+hardware-confirmed.** **The RT track's post-EBS execution model
+(RT-2a move + RT-2b host-tick preemption + 8259 spurious-IRQ handling) is
+HARDWARE-CONFIRMED: stock Alpine boots to `localhost login` running entirely
+after ExitBootServices on real AMD silicon.** Only RT-2c (timebase/console
+polish, non-boot-critical) remains in the RT track; M8-0 is effectively
+unblocked.
 
 ### Active frontier — RT track → M8-0 (the current dependency web)
 
@@ -3709,8 +3712,10 @@ observability channel) must land FIRST.*
     registered before sti, EOI per the 8259 protocol (top-ISR-bit set = real).
     Also added RT-3 SetVariable OK/FAILED reporting (the 1st HW run recovered
     no \hype-diag-prev.txt -- likely this firmware won't take a NON_VOLATILE
-    SetVariable post-EBS without SMM; now diagnosable). Next HW run should
-    clear vector=39.
+    SetVariable post-EBS without SMM; now diagnosable). HW RESULT (2nd run,
+    with the spurious-IRQ fix): reached `localhost login` -- the post-EBS
+    execution model (RT-2a+RT-2b) is CONFIRMED working end-to-end on real AMD
+    hardware, not just QEMU. RT-2 boot-critical goal MET on HW.
   - [ ] **RT-2c** — Adapt the guest timebase (M4-6b1) + console drain to the
     post-EBS host-timer-driven loop (they currently assume the pre-EBS
     per-VM-exit cadence). Deps: RT-2a.
