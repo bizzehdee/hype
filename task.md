@@ -9,38 +9,81 @@ Checkbox = done. `Deps: —` = no prerequisites.
 
 ---
 
-## Execution status & dependency graph (reconciled 2026-07-16)
+## Execution status & dependency graph (reconciled 2026-07-18)
 
 Snapshot of all open tasks vs. what's actually done. Done through: SETUP,
 M0-1..4, M1, ADM, M2-1..7, M3-1..5, INT-1/2, INPUT-1..4, VIDEO-1/2/3,
-M4-1..5, CPUMSR-1/2, RAM-1/2, PCI-1/2, ISO-1/2, M5-1/2, FW-1a..e, FW-2.
-**FW-1 (real OVMF boot) is DONE and hardware-confirmed**; FW-1f (guest
-console input) is partial → continues as FW-1g.
+M4-1..6 (incl. M4-6a/b1/b4/c/d1..d4), CPUMSR-1/2, RAM-1/2, PCI-1/2,
+ISO-1/2, M5-1/2, FW-1a..h, FW-2, VALID-1/3, RT-1 (a/b/c/d), RT-2a.
+**M4-6 (stock Alpine → userspace `localhost login`) is DONE and
+hardware-confirmed.** **RT-2a (guest execution moved past ExitBootServices)
+is QEMU-verified and confirmed reaching login on real HW by direct
+observation; its full-log HW capture is pending RT-3.**
+
+### Active frontier — RT track → M8-0 (the current dependency web)
+
+Node colours: green = done · orange = in progress · blue = ready (no unmet
+dep) · grey = blocked.
+
+```mermaid
+flowchart TD
+    RT1["RT-1 observability<br/>(logbuf + recovery + GOP)"]:::done
+    RT1d["RT-1d scan hardening"]:::done
+    RT2a["RT-2a post-EBS move"]:::done
+    RT2b["RT-2b host-tick preemption<br/>(the 40s-spin fix)"]:::ready
+    RT2c["RT-2c timebase/console<br/>adapt to post-EBS loop"]:::ready
+    RT3a["RT-3a EFI-var diag write<br/>(cold-boot-surviving)"]:::active
+    RT3b["RT-3b next-boot readback"]:::blocked
+    M80["M8-0 de-globalize the VM"]:::blocked
+    M80a["M8-0a per-VM RAM/NPT"]:::blocked
+    M80b["M8-0b concurrent dispatch<br/>(own AP bring-up)"]:::blocked
+    M80c["M8-0c per-VM console"]:::blocked
+
+    RT1 --> RT1d
+    RT1 --> RT2a
+    RT2a --> RT2b
+    RT2a --> RT2c
+    RT1 --> RT3a
+    RT2a --> RT3a
+    RT3a --> RT3b
+    RT2b --> M80
+    RT2c --> M80
+    M80 --> M80a --> M80b --> M80c
+
+    classDef done fill:#1b5e20,stroke:#2e7d32,color:#fff;
+    classDef active fill:#e65100,stroke:#ef6c00,color:#fff;
+    classDef ready fill:#0d47a1,stroke:#1565c0,color:#fff;
+    classDef blocked fill:#424242,stroke:#616161,color:#fff;
+```
 
 **READY NOW (no unmet dependency):**
-- `FW-1h` — bootable CD in the OVMF guest → the bridge to M4-6
-- `FW-1g` — guest keyboard input (investigation; sharp finding in hand)
-- `VALID-1` — guest addr/length bounds-check helper (unblocks VALID-2/3/4,
-  M5-3, NET-2/3; closes a real security gap)
-- `NET-1` — virtio-net device baseline
-- `M7-1` — Windows-facing CPUID/hypervisor-vendor leaves
-- `M7-3` — Windows input/display plumbing (INPUT-1/2 + VIDEO-3 all done)
-- `M8-1` — GOP dashboard surface; `M8-2` — per-VM stats; `M8-5` — pause/resume
-- `TERM-1` — GOP terminal surface (but TERM-2/3 gate on M8 — see below)
+- `RT-2b` — host-tick guest preemption; the real fix for the 40s no-exit
+  spin / soft-lockups (deps RT-2a ✓). Needs post-EBS run to debug → RT-3.
+- `RT-2c` — adapt the M4-6b1 guest timebase + console drain to the
+  post-EBS host-timer loop (deps RT-2a ✓).
+- `RT-3a` — post-EBS EFI-variable diagnostic capture (deps RT-1 ✓, RT-2a ✓).
+- Independent tracks (unchanged, pick up any time): `NET-1`,
+  `M7-1`/`M7-3`, `M8-1`/`M8-2`/`M8-5`, `TERM-1`. See their sections.
 - real-hardware-gated (need a physical run, not code): `M0-5`, `M2-8`,
-  `M3-6`, `M8-10`
+  `M3-6`, `M8-10`, plus RT-2a full-HW sign-off and RT-3 cold-boot survival.
 
 **Recommended order (value + dependency):**
-`FW-1h → M4-6` (boot an installer — no input needed, BDS auto-boots the CD),
-then `FW-1g` (drive it), then the install chain `VALID-1 → VALID-3 → M5-3
-→ M5-4 → M5-5 → M5-6`. `NET-1`, `M7-1`/`M7-3`, `M8-1`/`M8-2`/`M8-5` are
-independent and can run in parallel whenever picked up.
+Finish the RT track first — it's the load-bearing prerequisite for M8:
+`RT-3a → RT-3b` (get post-EBS logs off the cold-boot laptop), then
+`RT-2b`/`RT-2c` (host-tick preemption + timebase adaptation), then the
+`M8-0 → M8-0a → M8-0b → M8-0c` de-globalization chain toward concurrent
+VMs. The install chain `VALID-3 ✓ → M5-3 → M5-4 → M5-5 → M5-6` and the
+independent tracks (`NET-1`, `M7-1`/`M7-3`, `M8-1`/`M8-2`/`M8-5`, `TERM-1`)
+can run in parallel whenever picked up.
 
 **Critical paths (→ = "then"):**
-- Boot an OS installer: **FW-1h → M4-6**
-- Install an OS to disk: **VALID-1 → VALID-3 → M5-3 → M5-4 → M5-5 → M5-6**
-  (M5-5 also needs M4-6 ✓-after-above and NET-5)
-- Networking: **NET-1 → {NET-2 (needs VALID-2), NET-3 (needs VALID-1),
+- ~~Boot an OS installer: **FW-1h → M4-6**~~ — DONE (Alpine → login, HW-confirmed).
+- Post-EBS execution model (active): **RT-1 ✓ → RT-2a ✓ → {RT-2b, RT-2c,
+  RT-3a → RT-3b}** → unblocks M8-0.
+- Multi-VM foundation: **RT-2 → M8-0 → M8-0a → M8-0b → M8-0c**.
+- Install an OS to disk: **VALID-3 ✓ → M5-3 → M5-4 → M5-5 → M5-6**
+  (M5-5 also needs NET-5)
+- Networking: **NET-1 → {NET-2 (needs VALID-2), NET-3 (needs VALID-1 ✓),
   NET-4 → NET-4a → NET-4b} → NET-5**
 - Windows guest: **M7-1 → M7-2 → M7-4** (M7-3 parallel)
 - BSD guest: **M5-6 → M6-1 → M6-2**
@@ -50,23 +93,32 @@ independent and can run in parallel whenever picked up.
 - Persistence/power: **M9-1..6**; hardening/polish: **M10**, `STRETCH-*`,
   `DOCS-1`; deferred to v2: `V2-TELEM-*`, `V2-MGMT-1`
 
-**BLOCKED (immediate blocker in parens):** VALID-2/3/4 (VALID-1) ·
-M4-6 (FW-1h) · NET-2 (VALID-2) · NET-3 (VALID-1) · NET-4/4a/4b/5 (NET-1) ·
-M5-3 (VALID-3) · M5-4 (M5-3) · M5-5 (M5-4/NET-5) · M5-6 (M5-5) ·
+**BLOCKED (immediate blocker in parens):** RT-3b (RT-3a) ·
+M8-0 (RT-2b/RT-2c) · M8-0a (M8-0) · M8-0b (M8-0a) · M8-0c (M8-0b) ·
+VALID-2/4 (VALID-1 ✓ — now unblocked) · NET-2 (VALID-2) · NET-4/4a/4b/5 (NET-1) ·
+M5-3 (VALID-3 ✓ — now unblocked) · M5-4 (M5-3) · M5-5 (M5-4/NET-5) · M5-6 (M5-5) ·
 M6-1 (M5-6) · M6-2 (M6-1) · M7-2 (M7-1) · M7-4 (M7-2/M7-3) ·
 M8-3 (M8-1) · M8-3a (M8-3) · M8-4 (M6-2/M7-4) · M8-6/M8-7 (M8-4) ·
 M8-8 (M8-7) · M8-9 (M8-3/5/6/8) · M8-10 (M8-9) · TERM-2 (M8) · TERM-3 (M8-3) ·
 M9/M10/STRETCH/DOCS (long chains) · V2-* (deferred).
 
 **Decomposition status:** the READY set above is atomic and scoped (each is
-a single, self-contained task; FW-1h/M4-6/FW-1g/VALID-1/VALID-3 also have
-detailed scope notes in their sections). The BLOCKED set is already
-milestone-decomposed here with Deps + scope; per this file's own
-"revisit when actually scoped/started" convention (see TERM-3), deeper
-sub-scoping of far-off blocked milestones (M6, M7-2/4, M8-3..10, M9, M10,
-NET-2..5) is deferred until they unblock — decomposing blocked work now
-would be premature. The tracker (TaskCreate) currently mirrors only the
-active FW/M4/M5/VALID front; the rest live here in task.md.
+a single, self-contained task with detailed scope notes in its section). The
+BLOCKED set is already milestone-decomposed here with Deps + scope; per this
+file's own "revisit when actually scoped/started" convention (see TERM-3),
+deeper sub-scoping of far-off blocked milestones (M6, M7-2/4, M8-3..10, M9,
+M10, NET-2..5) is deferred until they unblock — decomposing blocked work now
+would be premature.
+
+**Tracking model (decided 2026-07-18):** this file is the single source of
+truth — the stable IDs, the `Deps:` graph, and the detailed `DONE — …`
+engineering notes all live here, versioned with the code. The mermaid DAG
+above is the visual dependency view for the active frontier (GitHub renders
+it in-repo); refresh it whenever the frontier moves. The ephemeral session
+task tracker (TaskCreate) holds only the *active working set*, not a mirror
+of every task — task.md is authoritative. (Considered and declined a
+GitHub-Projects kanban migration: it would exile the detailed notes out of
+the tree for little gain on a solo, terminal-native project.)
 
 ---
 
