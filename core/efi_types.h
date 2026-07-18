@@ -224,6 +224,43 @@ typedef struct {
     void *CreateEventEx;
 } EFI_BOOT_SERVICES;
 
+/* EFI variable attributes (UEFI spec). NON_VOLATILE persists in the
+ * firmware's NV store (SPI flash) across a cold power cycle; RUNTIME_ACCESS
+ * lets SetVariable be called after ExitBootServices (RT-3's whole point);
+ * BOOTSERVICE_ACCESS lets a later boot read it back before EBS. */
+#define EFI_VARIABLE_NON_VOLATILE 0x00000001u
+#define EFI_VARIABLE_BOOTSERVICE_ACCESS 0x00000002u
+#define EFI_VARIABLE_RUNTIME_ACCESS 0x00000004u
+
+typedef EFI_STATUS(EFIAPI *EFI_GET_VARIABLE)(CHAR16 *VariableName, EFI_GUID *VendorGuid,
+                                             UINT32 *Attributes, UINTN *DataSize, void *Data);
+typedef EFI_STATUS(EFIAPI *EFI_SET_VARIABLE)(CHAR16 *VariableName, EFI_GUID *VendorGuid,
+                                             UINT32 Attributes, UINTN DataSize, void *Data);
+
+/*
+ * EFI_RUNTIME_SERVICES: the services that stay valid after
+ * ExitBootServices (RT-3 uses GetVariable/SetVariable). Full spec layout so
+ * the two variable functions land at the correct offsets; the rest are
+ * void* placeholders -- same rule as EFI_BOOT_SERVICES above.
+ */
+typedef struct {
+    EFI_TABLE_HEADER Hdr;
+    void *GetTime;
+    void *SetTime;
+    void *GetWakeupTime;
+    void *SetWakeupTime;
+    void *SetVirtualAddressMap;
+    void *ConvertPointer;
+    EFI_GET_VARIABLE GetVariable;
+    void *GetNextVariableName;
+    EFI_SET_VARIABLE SetVariable;
+    void *GetNextHighMonotonicCount;
+    void *ResetSystem;
+    void *UpdateCapsule;
+    void *QueryCapsuleCapabilities;
+    void *QueryVariableInfo;
+} EFI_RUNTIME_SERVICES;
+
 /* Values match the UEFI spec's EFI_GRAPHICS_PIXEL_FORMAT enum exactly. */
 enum {
     PixelRedGreenBlueReserved8BitPerColor,
@@ -373,7 +410,7 @@ typedef struct {
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
     EFI_HANDLE StandardErrorHandle;
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *StdErr;
-    void *RuntimeServices;
+    EFI_RUNTIME_SERVICES *RuntimeServices;
     EFI_BOOT_SERVICES *BootServices;
     UINTN NumberOfTableEntries;
     void *ConfigurationTable;

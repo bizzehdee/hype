@@ -11,6 +11,7 @@
 #include "../core/admission.h"
 #include "../core/file_io.h"
 #include "../core/logbuf.h"
+#include "../core/nvlog.h"
 #include "../arch/x86_64/cpu/cpu_features.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -4505,6 +4506,45 @@ static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
     }
 }
 
+/* RT-3: the previous run's diagnostic tail, captured to an NV EFI variable
+ * (core/nvlog.h). Unlike RT-1b's RAM scan this SURVIVES A COLD POWER CYCLE
+ * (SPI flash), so it's the capture path for a power-off-only, serial-less
+ * machine. g_hype_rt is the Runtime Services table cached in efi_main; the
+ * write side runs in the post-EBS FW-1 loop (throttled), this read side runs
+ * pre-EBS here where Boot-Services file I/O can dump it to a file. */
+static EFI_RUNTIME_SERVICES *g_hype_rt = 0;
+/* Throttle the post-EBS variable writes; multiplied by the calibrated host
+ * TSC Hz at use. ~60s between flash writes bounds wear on a long-idle guest. */
+#define HYPE_NVLOG_WRITE_INTERVAL_SECS 60ull
+
+/* RT-3b: recover the previous run's diagnostic tail from the EFI variable and
+ * write it to \hype-diag-prev.txt, then clear the variable so a stale tail
+ * can't be mistaken for a fresh one. Best-effort; runs pre-EBS. */
+static void fw_1_dump_prev_diag(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
+                                EFI_RUNTIME_SERVICES *rt) {
+    static char diag[HYPE_NVLOG_CAPACITY];
+    EFI_FILE_PROTOCOL *root = 0;
+    unsigned int len = 0;
+
+    if (rt == 0) {
+        return;
+    }
+    if (hype_nvlog_read(rt, diag, (unsigned int)sizeof(diag), &len) != EFI_SUCCESS || len == 0) {
+        return; /* no prior tail (common: first run, or firmware without NV RT vars) */
+    }
+    if (hype_file_locate_root(image_handle, bs, &root) == EFI_SUCCESS && root != 0) {
+        hype_file_delete(root, (CHAR16 *)L"\\hype-diag-prev.txt");
+        if (hype_file_write_new(root, (CHAR16 *)L"\\hype-diag-prev.txt", diag, (UINTN)len) ==
+            EFI_SUCCESS) {
+            hype_debug_print("RT-3: recovered %u bytes of the previous run's post-EBS diagnostic "
+                             "tail (EFI var) -> \\hype-diag-prev.txt\n",
+                             len);
+        }
+    }
+    /* Clear it so next boot doesn't re-dump this same (now-stale) tail. */
+    hype_nvlog_clear(rt);
+}
+
 /* RT-2a: the M4-6d4 firmware-IDT exception catcher (fw_1_install/remove_
  * exception_catcher) is retired. It existed only because the guest loop ran
  * BEFORE ExitBootServices, under firmware's IDT, so a host-side fault in an
@@ -4970,6 +5010,36 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
          * hype_debug_print already tees into the self-describing in-RAM
          * logbuf (recovered to \hype-log-prev.txt on the next boot, RT-1b)
          * and renders live to the GOP framebuffer (RT-1c). */
+
+        /* RT-3a: persist the logbuf TAIL to an NV EFI variable via Runtime
+         * Services -- the one channel that both works post-EBS and survives a
+         * COLD power cycle (SPI flash), so a power-off-only, serial-less
+         * machine can still recover the post-EBS diagnostics on the next boot
+         * (RT-3b). Throttled by time + content-change to bound flash wear; a
+         * latched failure stops retrying so a fussy firmware can't wedge the
+         * loop. */
+        {
+            static uint64_t nvlog_last_tsc = 0;
+            static uint32_t nvlog_last_sum = 0;
+            static int nvlog_written = 0;
+            static int nvlog_disabled = 0;
+            if (!nvlog_disabled && g_hype_rt != 0 && g_fw_1_host_tsc_hz != 0) {
+                uint64_t now = hype_rdtsc();
+                uint32_t sum = hype_nvlog_checksum(hype_logbuf_data(), hype_logbuf_len());
+                uint64_t interval = HYPE_NVLOG_WRITE_INTERVAL_SECS * g_fw_1_host_tsc_hz;
+                if (hype_nvlog_should_write(now, nvlog_last_tsc, interval, nvlog_written, sum,
+                                            nvlog_last_sum)) {
+                    if (hype_nvlog_write(g_hype_rt, hype_logbuf_data(), hype_logbuf_len()) ==
+                        EFI_SUCCESS) {
+                        nvlog_last_tsc = now;
+                        nvlog_last_sum = sum;
+                        nvlog_written = 1;
+                    } else {
+                        nvlog_disabled = 1; /* firmware rejected an RT SetVariable -- stop trying */
+                    }
+                }
+            }
+        }
 
         /* M4-6b1: advance the guest PIT + LAPIC timer by the number of
          * 1.193182 MHz ticks that really elapsed since the last exit
@@ -6049,6 +6119,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * in BSS (zero at load), so this must run explicitly. */
     hype_logbuf_reset();
 
+    /* RT-3: cache Runtime Services now -- they stay valid after
+     * ExitBootServices (under our identity map), which is what lets the FW-1
+     * loop write the diagnostic tail to an NV EFI variable post-EBS. */
+    g_hype_rt = SystemTable->RuntimeServices;
+
     hype_console_print(SystemTable, "hype\n");
 
     /* Safe to bring up now: it's raw port I/O, independent of Boot
@@ -6086,6 +6161,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * whose in-loop \hype-log.txt flush never ran; a no-op when no prior log
      * survived in RAM. */
     fw_1_dump_prev_log(ImageHandle, SystemTable->BootServices, map, map_size, desc_size);
+
+    /* RT-3b: recover the previous run's post-EBS diagnostic tail from its NV
+     * EFI variable (survives a cold power cycle, unlike RT-1b's RAM scan) and
+     * dump it to \hype-diag-prev.txt while Boot Services file I/O is up. */
+    fw_1_dump_prev_diag(ImageHandle, SystemTable->BootServices, g_hype_rt);
 
     SystemTable->BootServices->FreePool(map);
 

@@ -14,7 +14,7 @@ Checkbox = done. `Deps: —` = no prerequisites.
 Snapshot of all open tasks vs. what's actually done. Done through: SETUP,
 M0-1..4, M1, ADM, M2-1..7, M3-1..5, INT-1/2, INPUT-1..4, VIDEO-1/2/3,
 M4-1..6 (incl. M4-6a/b1/b4/c/d1..d4), CPUMSR-1/2, RAM-1/2, PCI-1/2,
-ISO-1/2, M5-1/2, FW-1a..h, FW-2, VALID-1/3, RT-1 (a/b/c/d), RT-2a.
+ISO-1/2, M5-1/2, FW-1a..h, FW-2, VALID-1/3, RT-1 (a/b/c/d), RT-2a, RT-3 (a/b).
 **M4-6 (stock Alpine → userspace `localhost login`) is DONE and
 hardware-confirmed.** **RT-2a (guest execution moved past ExitBootServices)
 is QEMU-verified and confirmed reaching login on real HW by direct
@@ -32,8 +32,8 @@ flowchart TD
     RT2a["RT-2a post-EBS move"]:::done
     RT2b["RT-2b host-tick preemption<br/>(the 40s-spin fix)"]:::ready
     RT2c["RT-2c timebase/console<br/>adapt to post-EBS loop"]:::ready
-    RT3a["RT-3a EFI-var diag write<br/>(cold-boot-surviving)"]:::active
-    RT3b["RT-3b next-boot readback"]:::blocked
+    RT3a["RT-3a EFI-var diag write<br/>(cold-boot-surviving)"]:::done
+    RT3b["RT-3b next-boot readback"]:::done
     M80["M8-0 de-globalize the VM"]:::blocked
     M80a["M8-0a per-VM RAM/NPT"]:::blocked
     M80b["M8-0b concurrent dispatch<br/>(own AP bring-up)"]:::blocked
@@ -61,7 +61,6 @@ flowchart TD
   spin / soft-lockups (deps RT-2a ✓). Needs post-EBS run to debug → RT-3.
 - `RT-2c` — adapt the M4-6b1 guest timebase + console drain to the
   post-EBS host-timer loop (deps RT-2a ✓).
-- `RT-3a` — post-EBS EFI-variable diagnostic capture (deps RT-1 ✓, RT-2a ✓).
 - Independent tracks (unchanged, pick up any time): `NET-1`,
   `M7-1`/`M7-3`, `M8-1`/`M8-2`/`M8-5`, `TERM-1`. See their sections.
 - real-hardware-gated (need a physical run, not code): `M0-5`, `M2-8`,
@@ -79,7 +78,7 @@ can run in parallel whenever picked up.
 **Critical paths (→ = "then"):**
 - ~~Boot an OS installer: **FW-1h → M4-6**~~ — DONE (Alpine → login, HW-confirmed).
 - Post-EBS execution model (active): **RT-1 ✓ → RT-2a ✓ → {RT-2b, RT-2c,
-  RT-3a → RT-3b}** → unblocks M8-0.
+  RT-3a ✓ → RT-3b ✓}** → RT-2b/RT-2c remain, then unblocks M8-0.
 - Multi-VM foundation: **RT-2 → M8-0 → M8-0a → M8-0b → M8-0c**.
 - Install an OS to disk: **VALID-3 ✓ → M5-3 → M5-4 → M5-5 → M5-6**
   (M5-5 also needs NET-5)
@@ -93,7 +92,7 @@ can run in parallel whenever picked up.
 - Persistence/power: **M9-1..6**; hardening/polish: **M10**, `STRETCH-*`,
   `DOCS-1`; deferred to v2: `V2-TELEM-*`, `V2-MGMT-1`
 
-**BLOCKED (immediate blocker in parens):** RT-3b (RT-3a) ·
+**BLOCKED (immediate blocker in parens):**
 M8-0 (RT-2b/RT-2c) · M8-0a (M8-0) · M8-0b (M8-0a) · M8-0c (M8-0b) ·
 VALID-2/4 (VALID-1 ✓ — now unblocked) · NET-2 (VALID-2) · NET-4/4a/4b/5 (NET-1) ·
 M5-3 (VALID-3 ✓ — now unblocked) · M5-4 (M5-3) · M5-5 (M5-4/NET-5) · M5-6 (M5-5) ·
@@ -3694,6 +3693,32 @@ observability channel) must land FIRST.*
     post-EBS host-timer-driven loop (they currently assume the pre-EBS
     per-VM-exit cadence). Deps: RT-2a.
   Deps: RT-1.
+
+- [ ] **RT-3** — Post-EBS diagnostic capture that survives a COLD power cycle
+  (new 2026-07-18, from the first RT-2a HW run: the test laptop is
+  power-off-only + serial-less, so RT-1b's RAM scan can never recover a log
+  there). Uses the one channel that both works post-EBS and persists across a
+  cold boot: a NON_VOLATILE EFI variable (SPI-flash-backed) written via
+  Runtime Services SetVariable.
+  - [x] **RT-3a** — DONE. core/nvlog (pure tail-offset/checksum/throttle
+    helpers + mockable SetVariable/GetVariable glue, fully unit-tested). The
+    post-EBS FW-1 loop writes the logbuf TAIL (HYPE_NVLOG_CAPACITY=4 KB) to
+    var HypeDiagTail, throttled by time (~60s) + content-change to bound flash
+    wear; a rejected SetVariable latches off so a fussy firmware can't wedge
+    the loop. g_hype_rt cached from SystemTable->RuntimeServices in efi_main.
+    Deps: RT-1, RT-2a.
+  - [x] **RT-3b** — DONE. fw_1_dump_prev_diag() reads the var back pre-EBS via
+    GetVariable, writes it to \hype-diag-prev.txt (Boot-Services file I/O),
+    then clears the var so a stale tail can't be re-dumped. QEMU two-boot
+    round-trip PROVEN: boot 1 wrote 4096 bytes to the NV var (OVMF VARS
+    pflash); boot 2 recovered them -> "RT-3: recovered 4096 bytes ... ->
+    \hype-diag-prev.txt", file present on the ESP with the prior run's
+    content. Deps: RT-3a.
+  NOTE: the 4 KB tail is only min-viable -- on a busy run it fills with the
+  verbose per-VMRUN svm: trace and can crowd out the high-value periodic
+  EXHIST/COSTHIST/PREEMPT blocks; if that bites, either quiet those per-exit
+  lines out of the logbuf or grow the tail. First-HW SetVariable-post-EBS is
+  the empirical bit (QEMU/OVMF passed). Deps: RT-1, RT-2a.
 
   *RT is the prerequisite that turns M8-0 from "refactor the scaffold" into
   "refactor the real thing." After RT: M8-0 (de-globalize) -> M8-0a (per-VM
