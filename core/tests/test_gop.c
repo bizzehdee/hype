@@ -87,11 +87,15 @@ static void test_flush_uses_blt_when_gop_is_available(void) {
     con.width = 2;
     con.height = 3;
     con.stride = 4;
+    con.dirty_y_min = 0; /* RT-1c: mark the whole frame dirty so flush copies all 3 rows */
+    con.dirty_y_max = 2;
+    con.dirty = 1;
 
     g_blt_calls = 0;
     hype_gop_flush(&fake_gop, &con, (void *)0x1234);
 
     CHECK_INT("Blt is called exactly once", 1, g_blt_calls);
+    CHECK_INT("dirty cleared after flush", 0, con.dirty);
     if (g_blt_buffer != (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)shadow) {
         printf("FAIL: Blt was not passed the console's own shadow buffer\n");
         failures++;
@@ -121,6 +125,9 @@ static void test_flush_falls_back_to_memcpy_when_gop_is_null(void) {
     con.width = 2;
     con.height = 3;
     con.stride = 4;
+    con.dirty_y_min = 0; /* RT-1c: whole frame dirty */
+    con.dirty_y_max = 2;
+    con.dirty = 1;
 
     g_blt_calls = 0;
     hype_gop_flush(0, &con, real_fb);
@@ -143,10 +150,71 @@ static void test_flush_is_a_safe_no_op_with_no_gop_and_no_real_fb(void) {
     con.width = 2;
     con.height = 3;
     con.stride = 4;
+    con.dirty_y_min = 0;
+    con.dirty_y_max = 2;
+    con.dirty = 1;
 
     g_blt_calls = 0;
     hype_gop_flush(0, &con, 0); /* must not crash */
     CHECK_INT("Blt is never called", 0, g_blt_calls);
+}
+
+/* RT-1c: a clean console must not copy anything. */
+static void test_flush_skips_when_clean(void) {
+    unsigned int shadow[4 * 3];
+    unsigned int real_fb[4 * 3];
+    hype_gop_console_t con;
+    unsigned int i;
+
+    for (i = 0; i < 4 * 3; i++) {
+        shadow[i] = 0xA5A5A5A5u;
+        real_fb[i] = 0xFFFFFFFFu;
+    }
+    con.fb = shadow;
+    con.width = 2;
+    con.height = 3;
+    con.stride = 4;
+    con.dirty = 0; /* nothing changed */
+
+    g_blt_calls = 0;
+    hype_gop_flush(0, &con, real_fb);
+    CHECK_INT("clean console -> Blt not called", 0, g_blt_calls);
+    for (i = 0; i < 4 * 3; i++) {
+        CHECK_INT("clean console -> real_fb untouched", 0xFFFFFFFFu, real_fb[i]);
+    }
+}
+
+/* RT-1c: only the dirty pixel-row range is copied; other rows stay
+ * untouched and the dirty flag clears. */
+static void test_flush_copies_only_dirty_rows(void) {
+    unsigned int shadow[4 * 3];
+    unsigned int real_fb[4 * 3];
+    hype_gop_console_t con;
+    unsigned int x, y;
+
+    for (y = 0; y < 3; y++) {
+        for (x = 0; x < 4; x++) {
+            shadow[y * 4 + x] = 0xB0000000u + y * 4 + x;
+            real_fb[y * 4 + x] = 0xFFFFFFFFu;
+        }
+    }
+    con.fb = shadow;
+    con.width = 2;
+    con.height = 3;
+    con.stride = 4;
+    con.dirty_y_min = 1; /* only middle row dirty */
+    con.dirty_y_max = 1;
+    con.dirty = 1;
+
+    g_blt_calls = 0;
+    hype_gop_flush(0, &con, real_fb);
+
+    for (x = 0; x < 2; x++) {
+        CHECK_INT("dirty row copied", shadow[1 * 4 + x], real_fb[1 * 4 + x]);
+        CHECK_INT("row above dirty range untouched", 0xFFFFFFFFu, real_fb[0 * 4 + x]);
+        CHECK_INT("row below dirty range untouched", 0xFFFFFFFFu, real_fb[2 * 4 + x]);
+    }
+    CHECK_INT("dirty cleared after partial flush", 0, con.dirty);
 }
 
 static void test_locate_failure(void) {
@@ -170,6 +238,8 @@ int main(void) {
     test_flush_uses_blt_when_gop_is_available();
     test_flush_falls_back_to_memcpy_when_gop_is_null();
     test_flush_is_a_safe_no_op_with_no_gop_and_no_real_fb();
+    test_flush_skips_when_clean();
+    test_flush_copies_only_dirty_rows();
 
     if (failures == 0) {
         printf("all tests passed\n");

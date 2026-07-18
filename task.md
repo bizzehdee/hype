@@ -3557,11 +3557,22 @@ observability channel) must land FIRST.*
     reviewable via the next boot's file I/O. Gated on empirically confirming
     the region survives a warm reboot on the target; if it doesn't, GOP
     on-screen (below) is the live fallback. Deps: RT-1a, core/file_io.
-  - [ ] **RT-1c** — Verify/harden GOP on-screen rendering post-EBS as the
+  - [x] **RT-1c** — DONE. Hardened GOP on-screen rendering post-EBS as the
     always-available LIVE channel (it already renders post-EBS -- the "Boot
-    Services exited" banner proves it -- but confirm scrollback/wrap behave
-    and hype_debug_print's per-line full-framebuffer flush isn't pathological
-    on real VRAM; see the M4-6d4 GOP-flush-batching note). Deps: M1-6.
+    Services exited" banner proves it). Root fix for the M4-6d4
+    GOP-flush-batching concern: hype_gop_flush was copying the WHOLE
+    framebuffer on every hype_debug_print/idle iteration, pathological on real
+    (potentially uncached) VRAM. Added dirty pixel-row tracking to
+    hype_gop_console_t (dirty/dirty_y_min/dirty_y_max, core/gop_text.h);
+    mark_dirty() in gop_text.c (put_pixel marks its single row; scroll/clear
+    mark the full frame); hype_gop_flush (core/gop.c, now non-const con) skips a
+    clean console entirely and copies only [dirty_y_min,dirty_y_max] -- Blt
+    sub-rectangle pre-EBS, plain row copy post-EBS -- so a one-line print goes
+    from a full-frame blit to ~8 rows. Unit-tested both sides
+    (test_gop_text.c: init/draw_glyph/scroll/clear dirty ranges;
+    test_gop.c: skip-when-clean + copies-only-dirty-rows), all pass; QEMU boot
+    no-regression (Installing packages ok, Run /init, log file intact).
+    Deps: M1-6.
   Deps: M1-6, core/logbuf, core/file_io.
 
 - [ ] **RT-2** — Move single-guest execution to post-ExitBootServices.

@@ -40,6 +40,10 @@ EFI_STATUS hype_gop_locate(EFI_BOOT_SERVICES *bs, EFI_GRAPHICS_OUTPUT_PROTOCOL *
  * function pointer on a fake EFI_GRAPHICS_OUTPUT_PROTOCOL), so this is
  * fully unit tested despite touching UEFI types.
  */
-void hype_gop_flush(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, const hype_gop_console_t *con, void *real_fb);
+/* Copies the console backbuffer to the screen. RT-1c: only the dirty
+ * pixel-row range accumulated since the last flush is copied (and a clean
+ * console is skipped entirely), then the dirty range is cleared -- hence
+ * `con` is non-const. */
+void hype_gop_flush(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop_console_t *con, void *real_fb);
 
 #endif /* HYPE_GOP_H */

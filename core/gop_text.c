@@ -19,6 +19,25 @@ void hype_gop_console_init(hype_gop_console_t *con, void *fb, unsigned int width
     con->cursor_row = 0;
     con->fg = fg;
     con->bg = bg;
+    con->dirty_y_min = 0;
+    con->dirty_y_max = 0;
+    con->dirty = 0;
+}
+
+/* RT-1c: extend the accumulated dirty pixel-row range to include [y0, y1]. */
+static void mark_dirty(hype_gop_console_t *con, unsigned int y0, unsigned int y1) {
+    if (!con->dirty) {
+        con->dirty_y_min = y0;
+        con->dirty_y_max = y1;
+        con->dirty = 1;
+        return;
+    }
+    if (y0 < con->dirty_y_min) {
+        con->dirty_y_min = y0;
+    }
+    if (y1 > con->dirty_y_max) {
+        con->dirty_y_max = y1;
+    }
 }
 
 void hype_gop_put_pixel(hype_gop_console_t *con, unsigned int x, unsigned int y, unsigned int color) {
@@ -26,6 +45,7 @@ void hype_gop_put_pixel(hype_gop_console_t *con, unsigned int x, unsigned int y,
         return;
     }
     con->fb[pixel_index(con, x, y)] = color;
+    mark_dirty(con, y, y); /* the single row this pixel touched */
 }
 
 void hype_gop_draw_glyph(hype_gop_console_t *con, unsigned int col, unsigned int row, unsigned char c) {
@@ -61,6 +81,11 @@ void hype_gop_scroll(hype_gop_console_t *con) {
             con->fb[pixel_index(con, x, y)] = con->bg;
         }
     }
+    /* A scroll shifts every row -- the whole frame is dirty. (scroll/clear
+     * write con->fb directly, not via put_pixel, so mark explicitly.) */
+    if (con->height > 0) {
+        mark_dirty(con, 0, con->height - 1);
+    }
 }
 
 void hype_gop_console_clear(hype_gop_console_t *con) {
@@ -73,6 +98,9 @@ void hype_gop_console_clear(hype_gop_console_t *con) {
     }
     con->cursor_col = 0;
     con->cursor_row = 0;
+    if (con->height > 0) {
+        mark_dirty(con, 0, con->height - 1);
+    }
 }
 
 static void gop_newline(hype_gop_console_t *con) {

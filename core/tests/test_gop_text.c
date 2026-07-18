@@ -251,6 +251,47 @@ static void test_write_and_print(void) {
     CHECK_INT("print formats then writes (\"x=7\" is 3 chars)", 3, con.cursor_col);
 }
 
+/* RT-1c: dirty pixel-row tracking used by hype_gop_flush() to copy only
+ * what changed. */
+static void test_init_clears_dirty(void) {
+    hype_gop_console_t con;
+    reset_fb(&con);
+    CHECK_INT("init leaves the console clean", 0, con.dirty);
+}
+
+static void test_draw_glyph_marks_its_rows_dirty(void) {
+    hype_gop_console_t con;
+    reset_fb(&con);
+    /* A glyph at cell row 0 touches pixel rows [0, 7]. */
+    hype_gop_draw_glyph(&con, 0, 0, 'A');
+    CHECK_INT("draw marks dirty", 1, con.dirty);
+    CHECK_INT("dirty min = glyph top row", 0, con.dirty_y_min);
+    CHECK_INT("dirty max = glyph bottom row", HYPE_GOP_GLYPH_H - 1, con.dirty_y_max);
+
+    /* A glyph at cell row 1 extends the range to [0, 15]. */
+    hype_gop_draw_glyph(&con, 0, 1, 'A');
+    CHECK_INT("dirty min stays at top", 0, con.dirty_y_min);
+    CHECK_INT("dirty max extends to second cell row", 2 * HYPE_GOP_GLYPH_H - 1, con.dirty_y_max);
+}
+
+static void test_scroll_marks_full_frame_dirty(void) {
+    hype_gop_console_t con;
+    reset_fb(&con); /* clean after init */
+    hype_gop_scroll(&con);
+    CHECK_INT("scroll marks dirty", 1, con.dirty);
+    CHECK_INT("scroll dirties from row 0", 0, con.dirty_y_min);
+    CHECK_INT("scroll dirties through the last row", FB_H - 1, con.dirty_y_max);
+}
+
+static void test_clear_marks_full_frame_dirty(void) {
+    hype_gop_console_t con;
+    reset_fb(&con);
+    hype_gop_console_clear(&con);
+    CHECK_INT("clear marks dirty", 1, con.dirty);
+    CHECK_INT("clear dirties from row 0", 0, con.dirty_y_min);
+    CHECK_INT("clear dirties through the last row", FB_H - 1, con.dirty_y_max);
+}
+
 int main(void) {
     test_init();
     test_put_pixel();
@@ -265,6 +306,10 @@ int main(void) {
     test_scroll_noop_when_shorter_than_one_glyph_row();
     test_console_clear();
     test_write_and_print();
+    test_init_clears_dirty();
+    test_draw_glyph_marks_its_rows_dirty();
+    test_scroll_marks_full_frame_dirty();
+    test_clear_marks_full_frame_dirty();
 
     if (failures == 0) {
         printf("all tests passed\n");

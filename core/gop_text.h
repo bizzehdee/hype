@@ -27,6 +27,16 @@ typedef struct {
     unsigned int cursor_row;
     unsigned int fg;
     unsigned int bg;
+    /* RT-1c: dirty pixel-row range [dirty_y_min, dirty_y_max] accumulated
+     * since the last flush, so hype_gop_flush() copies only the rows that
+     * changed (and skips entirely when nothing did) instead of the whole
+     * framebuffer every call. dirty==0 means clean. This matters most
+     * post-ExitBootServices, where flush falls back to a direct pixel copy
+     * to VRAM -- a full-frame copy per printed line is pathologically slow
+     * there; with dirty tracking a one-line print copies ~8 rows. */
+    unsigned int dirty_y_min;
+    unsigned int dirty_y_max;
+    int dirty;
 } hype_gop_console_t;
 
 #define HYPE_GOP_GLYPH_W 8
