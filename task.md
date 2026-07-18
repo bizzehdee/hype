@@ -3701,6 +3701,16 @@ observability channel) must land FIRST.*
     exits, 34 PREEMPT-RIP samples (RIPs in OVMF DXE space), reaches localhost
     login, no fatal. QEMU can't prove the HW hang is fixed (RT-2a passed QEMU
     too); real-HW boot-to-login is the empirical confirmation. Deps: RT-2a.
+    HW RESULT (1st run): RT-2b WORKED -- boot went from the "marking TSC
+    unstable" hang all the way to mounting the guest root fs, then panicked
+    "unhandled interrupt vector=39" = 8259 spurious IRQ7 (masked line, no
+    handler -> hype_fatal; QEMU never generates it). FIXED (commit 3609432):
+    hype_pic_read_master/slave_isr + spurious IRQ7(v39)/IRQ15(v47) handlers
+    registered before sti, EOI per the 8259 protocol (top-ISR-bit set = real).
+    Also added RT-3 SetVariable OK/FAILED reporting (the 1st HW run recovered
+    no \hype-diag-prev.txt -- likely this firmware won't take a NON_VOLATILE
+    SetVariable post-EBS without SMM; now diagnosable). Next HW run should
+    clear vector=39.
   - [ ] **RT-2c** — Adapt the guest timebase (M4-6b1) + console drain to the
     post-EBS host-timer-driven loop (they currently assume the pre-EBS
     per-VM-exit cadence). Deps: RT-2a.
