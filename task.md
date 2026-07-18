@@ -14,7 +14,8 @@ Checkbox = done. `Deps: —` = no prerequisites.
 Snapshot of all open tasks vs. what's actually done. Done through: SETUP,
 M0-1..4, M1, ADM, M2-1..7, M3-1..5, INT-1/2, INPUT-1..4, VIDEO-1/2/3,
 M4-1..6 (incl. M4-6a/b1/b4/c/d1..d4), CPUMSR-1/2, RAM-1/2, PCI-1/2,
-ISO-1/2, M5-1/2, FW-1a..h, FW-2, VALID-1/3, RT-1 (a/b/c/d), RT-2a, RT-3 (a/b).
+ISO-1/2, M5-1/2, FW-1a..h, FW-2, VALID-1/3, RT-1 (a/b/c/d), RT-2a/2b,
+RT-3 (a/b).
 **M4-6 (stock Alpine → userspace `localhost login`) is DONE and
 hardware-confirmed.** **RT-2a (guest execution moved past ExitBootServices)
 is QEMU-verified and confirmed reaching login on real HW by direct
@@ -30,7 +31,7 @@ flowchart TD
     RT1["RT-1 observability<br/>(logbuf + recovery + GOP)"]:::done
     RT1d["RT-1d scan hardening"]:::done
     RT2a["RT-2a post-EBS move"]:::done
-    RT2b["RT-2b host-tick preemption<br/>(the 40s-spin fix)"]:::ready
+    RT2b["RT-2b host-tick preemption<br/>(fixes the post-EBS hang)"]:::done
     RT2c["RT-2c timebase/console<br/>adapt to post-EBS loop"]:::ready
     RT3a["RT-3a EFI-var diag write<br/>(cold-boot-surviving)"]:::done
     RT3b["RT-3b next-boot readback"]:::done
@@ -57,10 +58,10 @@ flowchart TD
 ```
 
 **READY NOW (no unmet dependency):**
-- `RT-2b` — host-tick guest preemption; the real fix for the 40s no-exit
-  spin / soft-lockups (deps RT-2a ✓). Needs post-EBS run to debug → RT-3.
 - `RT-2c` — adapt the M4-6b1 guest timebase + console drain to the
-  post-EBS host-timer loop (deps RT-2a ✓).
+  post-EBS host-timer loop (deps RT-2a ✓). The only RT item left; RT-2b
+  (host-tick preemption) is done, so this is now polish rather than
+  boot-critical.
 - Independent tracks (unchanged, pick up any time): `NET-1`,
   `M7-1`/`M7-3`, `M8-1`/`M8-2`/`M8-5`, `TERM-1`. See their sections.
 - real-hardware-gated (need a physical run, not code): `M0-5`, `M2-8`,
@@ -77,8 +78,8 @@ can run in parallel whenever picked up.
 
 **Critical paths (→ = "then"):**
 - ~~Boot an OS installer: **FW-1h → M4-6**~~ — DONE (Alpine → login, HW-confirmed).
-- Post-EBS execution model (active): **RT-1 ✓ → RT-2a ✓ → {RT-2b, RT-2c,
-  RT-3a ✓ → RT-3b ✓}** → RT-2b/RT-2c remain, then unblocks M8-0.
+- Post-EBS execution model (active): **RT-1 ✓ → RT-2a ✓ → {RT-2b ✓, RT-3a ✓
+  → RT-3b ✓}**; only RT-2c (timebase/console polish) remains → then M8-0.
 - Multi-VM foundation: **RT-2 → M8-0 → M8-0a → M8-0b → M8-0c**.
 - Install an OS to disk: **VALID-3 ✓ → M5-3 → M5-4 → M5-5 → M5-6**
   (M5-5 also needs NET-5)
@@ -3679,16 +3680,27 @@ observability channel) must land FIRST.*
     `localhost login` reached, zero host faults/panics. Regression bar (single
     Alpine to login observed via RT-1) MET under QEMU; real-HW confirmation is
     the outstanding HW-empirical piece. Deps: RT-1, M1-8, M1-4.
-  - [ ] **RT-2b** — Host preemption timer (folds M4-6d4's remaining work):
-    with hype's own periodic timer (M1-8) live post-EBS, regain control from
-    a running guest on each host tick (physical-interrupt path -- INTERCEPT_INTR
-    / EXITCODE_INTR 0x60, or the host tick firing between VMRUNs), advance the
-    guest timebase, and inject the due guest tick. This FIXES the 40s no-exit
-    spin / soft lockups generally (a spinning guest is now preemptible
-    regardless of instruction mix -- unlike the reverted pause-filter, which
-    the HW showed inert because the real spins execute no PAUSE). BONUS: log
-    the guest RIP on the preemption exit -- first look at what the 40s loop
-    actually is. Deps: RT-2a.
+  - [x] **RT-2b** — DONE (QEMU-verified; HW confirmation pending). Host-tick
+    preemption -- also the fix for the RT-2a post-EBS boot HANG (first HW run
+    hung after "Marking TSC unstable ... could not calculate TSC": the guest
+    kernel fell back to a timer-IRQ clocksource and waited for jiffies that
+    never advanced, because RT-2a masked interrupts with no host timer during
+    the guest loop, removing firmware's ambient preemption without a
+    replacement). Fix, scoped to the FW-1 guest only (quick regression guests
+    stay under cli -- they need no timekeeping and INTR exits would perturb
+    their exact-count asserts): HYPE_SVM_INTERCEPT_INTR (bit 0) +
+    HYPE_SVM_EXITCODE_INTR (0x60); hype_svm_vcpu_enable_intr_intercept() arms
+    it on the FW-1 VMCB. efi_main brings up hype's 1000 Hz timer + sti BEFORE
+    run_fw_1_test (split out of run_all_test_guests). A host tick during VMRUN
+    (GIF=1 in-guest) -> #VMEXIT(INTR); the loop's STGI (host IF=1) takes the
+    tick into hype_timer_isr, the loop-top M4-6b1 advance stages any due guest
+    tick, and it resumes -- guest clock keeps moving through any
+    non-intercepting stretch regardless of instruction mix (unlike the
+    reverted-inert pause-filter). EXHIST gains intr=; BONUS PREEMPT-RIP samples
+    the preempted guest RIP ~1/sec. QEMU: mechanism engaged -- intr=1657
+    exits, 34 PREEMPT-RIP samples (RIPs in OVMF DXE space), reaches localhost
+    login, no fatal. QEMU can't prove the HW hang is fixed (RT-2a passed QEMU
+    too); real-HW boot-to-login is the empirical confirmation. Deps: RT-2a.
   - [ ] **RT-2c** — Adapt the guest timebase (M4-6b1) + console drain to the
     post-EBS host-timer-driven loop (they currently assume the pre-EBS
     per-VM-exit cadence). Deps: RT-2a.
