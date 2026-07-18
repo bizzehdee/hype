@@ -317,6 +317,18 @@ void hype_svm_vcpu_enable_pause_filter(hype_vcpu_ctx_t *ctx, uint16_t count, uin
     real->vmcb->control.vmcb_clean_bits = 0; /* control area changed */
 }
 
+/* RT-2b: intercept physical INTR for this guest so a host periodic-timer tick
+ * arriving during VMRUN forces #VMEXIT(EXITCODE_INTR) instead of leaking into
+ * the guest. Part of the FW-1 guest's baseline intercept set once hype's own
+ * timer is live post-EBS -- the interrupt itself is then taken by the host
+ * (hype_timer_isr) when the loop does STGI with host IF=1. Exempt from unit
+ * testing, same as the other VMCB-reaching setters. */
+void hype_svm_vcpu_enable_intr_intercept(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_INTR;
+    real->vmcb->control.vmcb_clean_bits = 0; /* control area changed */
+}
+
 void hype_svm_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selector, uint16_t ss_selector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->vmcb->save.cs.selector = cs_selector;

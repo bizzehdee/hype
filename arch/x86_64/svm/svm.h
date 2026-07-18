@@ -162,6 +162,11 @@ void hype_svm_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selecto
  * Caller must first confirm hype_cpu_has_pause_filter(). Exempt glue. */
 void hype_svm_vcpu_enable_pause_filter(hype_vcpu_ctx_t *ctx, uint16_t count, uint16_t threshold);
 
+/* RT-2b: enable physical-INTR interception so hype's periodic timer can
+ * preempt this guest (#VMEXIT EXITCODE_INTR) even during a long
+ * non-intercepting stretch. Exempt glue. */
+void hype_svm_vcpu_enable_intr_intercept(hype_vcpu_ctx_t *ctx);
+
 /*
  * Handles an IOIO (M3-5) VM-exit: decodes EXITINFO1
  * (hype_svm_decode_ioio_info1()), routes the port to `pic` (0x20/0x21/

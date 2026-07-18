@@ -153,6 +153,15 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 /* Intercept bits this project actually sets (Table B-1). */
 #define HYPE_SVM_INTERCEPT_HLT (1u << 24)
 #define HYPE_SVM_INTERCEPT_SHUTDOWN (1u << 31)
+/* RT-2b: intercept physical INTR (bit 0 of intercept_misc1 -- this file's
+ * own top-of-struct comment already lists "INTR=0"; APM Vol 2 Appendix B
+ * Table B-1, offset 00Ch). With this set, a host physical interrupt arriving
+ * while the guest runs forces #VMEXIT(EXITCODE_INTR) instead of leaking into
+ * the guest's IDT. That is what lets hype's own periodic timer preempt a
+ * guest running a long non-intercepting stretch (the 40s spin) so it can
+ * advance the guest timebase and inject the due guest tick -- the post-EBS
+ * replacement for the ambient firmware-timer preemption RT-2a removed. */
+#define HYPE_SVM_INTERCEPT_INTR (1u << 0)
 /* M4-6d4: intercept PAUSE (APM Vol 2 Appendix B Table B-1, offset 00Ch,
  * bit 23 -- one below HLT's bit 24). With pause_filter_count/threshold set
  * it fires EXITCODE_PAUSE only after a burst of PAUSEs within the threshold
@@ -323,6 +332,12 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 #define HYPE_SVM_EXITCODE_CPUID 0x72ULL
 #define HYPE_SVM_EXITCODE_MSR 0x7CULL
 #define HYPE_SVM_EXITCODE_NPF 0x400ULL
+/* RT-2b: physical-interrupt intercept exit (APM Vol 2 Appendix C,
+ * VMEXIT_INTR = 0x60). Raised when HYPE_SVM_INTERCEPT_INTR is set and a host
+ * physical interrupt (e.g. hype's periodic timer tick) arrives during guest
+ * execution. Hardware does NOT advance RIP for this exit (like VINTR): there
+ * is no guest instruction to skip -- the guest is simply preempted. */
+#define HYPE_SVM_EXITCODE_INTR 0x60ULL
 #define HYPE_SVM_EXITCODE_INVALID 0xFFFFFFFFFFFFFFFFULL /* VMRUN itself failed (bad VMCB state) */
 /* INT-2: fired when a requested "interrupt window" (HYPE_SVM_INTERCEPT_VINTR
  * + VINTR_V_IRQ) genuinely opens -- confirmed against two independent

@@ -4796,6 +4796,18 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                           "its own tick here\n");
     }
 
+    /* RT-2b: the real preemption mechanism (pause-filtering above proved
+     * inert on real HW -- the 40s spins execute no PAUSE). Intercept physical
+     * INTR so hype's own 1000 Hz timer (brought up right before this guest
+     * runs -- see efi_main) preempts the guest on every host tick regardless
+     * of the guest's instruction mix. Each such EXITCODE_INTR exit lets the
+     * loop-top timebase advance run and inject any due guest tick, so jiffies
+     * keep moving even through a non-intercepting stretch -- the post-EBS
+     * replacement for the ambient firmware-timer preemption RT-2a removed. */
+    hype_svm_vcpu_enable_intr_intercept(ctx);
+    hype_debug_print("fw-1: INTR-intercept armed -- host timer ticks now preempt the guest "
+                      "(RT-2b)\n");
+
     {
     unsigned long long productive_exits = 0;
     unsigned long long total_exits = 0;
@@ -4807,8 +4819,9 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * increments -- no per-exit formatting. */
     unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
                        ex_other = 0;
-    unsigned long long ex_io80 = 0, ex_ahci_npf = 0, ex_pause = 0;
+    unsigned long long ex_io80 = 0, ex_ahci_npf = 0, ex_pause = 0, ex_intr = 0;
     uint64_t last_exhist_tsc = 0;
+    uint64_t last_preempt_rip_tsc = 0; /* RT-2b: throttle the preemption-RIP sample log */
     int booted = 0;
     hype_vt_filter_t uart_filter;
     char uart_line[256];
@@ -4922,6 +4935,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             case HYPE_SVM_EXITCODE_CPUID: ex_cpuid++; break;
             case HYPE_SVM_EXITCODE_VINTR: ex_vintr++; break;
             case HYPE_SVM_EXITCODE_PAUSE: ex_pause++; break;
+            case HYPE_SVM_EXITCODE_INTR:  ex_intr++;  break;
             default:                      ex_other++; break;
         }
         /* Dump the histogram every ~5s of wall-clock. The periodic flush
@@ -4932,9 +4946,9 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             if (last_exhist_tsc == 0 || now_eh - last_exhist_tsc >= 5ULL * g_fw_1_host_tsc_hz) {
                 last_exhist_tsc = now_eh;
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
-                                 "msr=%llu cpuid=%llu vintr=%llu pause=%llu other=%llu\n",
+                                 "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
-                                 ex_cpuid, ex_vintr, ex_pause, ex_other);
+                                 ex_cpuid, ex_vintr, ex_pause, ex_intr, ex_other);
                 /* M4-6d4: mean per-exit cost split VMRUN world-switch vs our
                  * loop body, in nanoseconds (TSC / host_tsc_hz * 1e9). Tells
                  * whether the ~219us/exit is the CPU's world-switch (VMRUN
@@ -5318,6 +5332,27 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
              * for the guest. Just resume -- that keeps the guest's jiffies
              * advancing during the spin instead of freezing for tens of
              * seconds. */
+            continue;
+        }
+        if (info.reason == HYPE_SVM_EXITCODE_INTR) {
+            /* RT-2b: hype's periodic host timer tick preempted the guest. The
+             * pending tick was already taken by hype_timer_isr at the loop's
+             * STGI, and the loop-top timebase advance already staged any due
+             * guest tick this iteration -- so, exactly like the PAUSE case, we
+             * just resume. This is what keeps jiffies moving through a long
+             * non-intercepting stretch (the 40s spin) regardless of the
+             * guest's instruction mix. RT-2b bonus: sample the preempted guest
+             * RIP ~1/sec -- the first real look at WHAT that stretch runs,
+             * without flooding the log at 1000 preemptions/sec. */
+            if (g_fw_1_host_tsc_hz != 0) {
+                uint64_t now_pr = hype_rdtsc();
+                if (last_preempt_rip_tsc == 0 ||
+                    now_pr - last_preempt_rip_tsc >= g_fw_1_host_tsc_hz) {
+                    last_preempt_rip_tsc = now_pr;
+                    hype_debug_print("fw-1 PREEMPT-RIP: host tick preempted guest at rip=0x%llx\n",
+                                     (unsigned long long)info.guest_rip);
+                }
+            }
             continue;
         }
         if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
@@ -6099,7 +6134,12 @@ static void EFIAPI run_all_test_guests(void *arg) {
     run_m5_1_test(args->ops, args->kind);
     run_m5_2_test(args->ops, args->kind);
     run_pause_filter_test(args->ops, args->kind); /* M4-6d4 #3: preemption mechanism proof */
-    run_fw_1_test(args->ops, args->kind);
+    /* RT-2b: run_fw_1_test is deliberately NOT run here. The quick regression
+     * guests above all run under `cli` (no host timer, no INTR intercept) --
+     * they halt in milliseconds and need no timekeeping. efi_main brings up
+     * hype's periodic timer + `sti` AFTER this returns and only THEN runs the
+     * FW-1 guest, which is the sole guest that intercepts INTR and needs
+     * host-tick preemption to keep its clock alive. */
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
@@ -6633,7 +6673,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_serial_print("hype: Boot Services exited, hypervisor now running\n");
 
     /*
-     * RT-2a: run the guest HERE -- post-ExitBootServices, on the BSP, under
+     * RT-2a: run the guests HERE -- post-ExitBootServices, on the BSP, under
      * hype's own GDT/IDT/paging loaded just above, with firmware entirely
      * out of the picture. This is the whole point of the RT track: VMRUN now
      * saves/restores HYPE's host state (not firmware's), a host CPU fault in
@@ -6641,19 +6681,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * silent firmware triple-fault), and there is no 5-minute firmware
      * watchdog to race.
      *
-     * Interrupts stay MASKED across the guest loop (the cli from right after
-     * ExitBootServices still holds -- host timer/sti bring-up is deliberately
-     * left BELOW this call). The guest timebase is rdtsc-polled and its
-     * interrupts are injected via the VMCB (M4-6b1), so it needs no host
-     * physical interrupts to reach login -- this preserves exactly the
-     * delivery behavior that reaches `localhost login` today. Turning the
-     * host tick into a guest-preemption source is RT-2b's job.
-     *
-     * run_all_test_guests() first runs the quick M2-M5/VIDEO/INPUT
-     * regression guests (all self-contained: static/pre-EBS-allocated
-     * memory, no Boot Services), then the FW-1 Alpine guest, which for a
-     * live boot never returns. The host-timer/keyboard/chord tail below is
-     * therefore reached only if that guest loop gives up and returns.
+     * run_all_test_guests() runs ONLY the quick M2-M5/VIDEO/INPUT regression
+     * guests -- all self-contained (static/pre-EBS-allocated memory, no Boot
+     * Services), each halting in milliseconds. They run here with interrupts
+     * still MASKED (the post-EBS cli holds); they need no timekeeping. The
+     * FW-1 Alpine guest runs separately BELOW, after the host timer + sti come
+     * up (RT-2b), because it is the one guest that needs host-tick preemption
+     * to keep its clock alive through long non-intercepting stretches.
      */
     run_all_test_guests(&args);
 
@@ -6683,7 +6717,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_host_kbd_init();
     hype_serial_print("about to enable interrupts (sti)...\n");
     hype_sti();
-    hype_serial_print("interrupts enabled -- waiting for timer ticks\n");
+    hype_serial_print("interrupts enabled -- host timer live\n");
+
+    /*
+     * RT-2b: NOW run the FW-1 Alpine guest, with hype's own 1000 Hz timer
+     * live and interrupts enabled. Its VMCB intercepts INTR
+     * (hype_svm_vcpu_enable_intr_intercept), so every host timer tick that
+     * lands during VMRUN forces a #VMEXIT(INTR); the loop takes the tick
+     * (STGI, host IF=1), advances the guest timebase, and injects any due
+     * guest tick -- so the guest's clock keeps moving even through a long
+     * non-intercepting stretch. This is the post-EBS replacement for the
+     * ambient firmware-timer preemption RT-2a removed (without it, the guest
+     * hangs after marking its TSC unstable). For a live boot this never
+     * returns; the chord/idle tail below is reached only if it gives up.
+     */
+    run_fw_1_test(args.ops, args.kind);
 
     {
         /* INPUT-4: leader-chord recognition (plan.md §6b). No dashboard
