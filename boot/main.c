@@ -234,6 +234,12 @@ static uint64_t g_fw_1_irq0_recoverable_tsc;
  * interrupts (IF=0), which no delivery change can fix. */
 static uint64_t g_fw_1_irq0_pending_tsc;
 static uint64_t g_fw_1_stall_prev_tsc;
+/* M4-6d4: longest single VMRUN (guest ran this long before voluntarily
+ * exiting) + count of VMRUNs over 100ms. A big max = the guest runs long
+ * non-intercepting stretches we can't preempt -> a host preemption timer
+ * (INTERCEPT_INTR + physical periodic timer) is the fix. */
+static uint64_t g_fw_1_vmrun_max_tsc;
+static unsigned long long g_fw_1_vmrun_over100ms;
 #define HYPE_PIT_HZ 1193182ULL
 /* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
  * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
@@ -4790,8 +4796,25 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
             {
                 uint64_t t_post = hype_rdtsc();
-                g_fw_1_vmrun_tsc += t_post - t_pre;
+                uint64_t this_vmrun = t_post - t_pre;
+                g_fw_1_vmrun_tsc += this_vmrun;
                 g_fw_1_prev_post_tsc = t_post;
+                /* M4-6d4: the DECISIVE probe for the host-preemption-timer
+                 * question. A single VMRUN's duration = how long the guest ran
+                 * before it voluntarily exited. If the MAX is multi-second, the
+                 * guest runs long non-intercepting stretches during which we
+                 * cannot inject its timer tick (no INTR intercept) -- exactly
+                 * what a host preemption timer fixes, and invisible to the
+                 * between-exits RECOVER metric. If the max stays small (<~10ms)
+                 * the guest exits frequently and the preemption timer would not
+                 * help; the slowness is genuine guest work. Also count how many
+                 * VMRUNs ran longer than 100ms. */
+                if (this_vmrun > g_fw_1_vmrun_max_tsc) {
+                    g_fw_1_vmrun_max_tsc = this_vmrun;
+                }
+                if (g_fw_1_host_tsc_hz != 0 && this_vmrun > g_fw_1_host_tsc_hz / 10ULL) {
+                    g_fw_1_vmrun_over100ms++;
+                }
             }
         }
 
@@ -4856,8 +4879,16 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                      * CD-read work, not recoverable by that fix). */
                     hype_debug_print("fw-1 RECOVER: irq0_pending_undelivered=%llums (tick lateness, "
                                      "upper bound) | blocked_by_isr_IF1=%llums (priority-fix reclaims)\n",
-                                     (g_fw_1_irq0_pending_tsc / g_fw_1_host_tsc_hz) * 1000ULL,
-                                     (g_fw_1_irq0_recoverable_tsc / g_fw_1_host_tsc_hz) * 1000ULL);
+                                     (g_fw_1_irq0_pending_tsc * 1000ULL) / g_fw_1_host_tsc_hz,
+                                     (g_fw_1_irq0_recoverable_tsc * 1000ULL) / g_fw_1_host_tsc_hz);
+                    /* M4-6d4: longest uninterrupted guest run. max_vmrun large
+                     * => guest runs non-intercepting stretches we can't inject
+                     * ticks into => host preemption timer is the fix. (ms via
+                     * multiply-before-divide so sub-second values survive --
+                     * the whole point is telling <10ms from multi-second.) */
+                    hype_debug_print("fw-1 PREEMPT: max_single_vmrun=%llums vmruns_over_100ms=%llu\n",
+                                     (g_fw_1_vmrun_max_tsc * 1000ULL) / g_fw_1_host_tsc_hz,
+                                     g_fw_1_vmrun_over100ms);
                 }
                 /* M4-6d4: companion line to EXHIST. The real-HW soft lockups
                  * (blkid stuck 24s, kworker stuck 26s -- confirmed by a
