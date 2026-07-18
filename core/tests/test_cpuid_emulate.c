@@ -95,6 +95,21 @@ static void test_leaf_ext8_address_sizes_passthrough(void) {
     CHECK_HEX("edx passthrough", real.edx, out.edx);
 }
 
+static void test_leaf_ext7_advertises_invariant_tsc_only(void) {
+    /* Real hardware would report power-management bits here; hype ignores
+     * them and advertises only Invariant TSC (EDX bit 8) so the guest keeps
+     * its passthrough TSC instead of marking it unstable. */
+    hype_cpuid_result_t real = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate(0x80000007u, 0, &real, &out);
+
+    CHECK_HEX("eax zeroed", 0u, out.eax);
+    CHECK_HEX("ebx zeroed", 0u, out.ebx);
+    CHECK_HEX("ecx zeroed", 0u, out.ecx);
+    CHECK_HEX("edx = Invariant TSC (bit 8) only", (1u << 8), out.edx);
+}
+
 static void test_hypervisor_leaf_signature(void) {
     hype_cpuid_result_t real = {0, 0, 0, 0};
     hype_cpuid_result_t out;
@@ -138,6 +153,7 @@ int main(void) {
     test_leaf_extended_max_vendor_string();
     test_leaf_ext1_clears_svm_bit();
     test_leaf_ext1_svm_already_clear_is_idempotent();
+    test_leaf_ext7_advertises_invariant_tsc_only();
     test_leaf_ext8_address_sizes_passthrough();
     test_hypervisor_leaf_signature();
     test_unhandled_leaf_returns_all_zero();

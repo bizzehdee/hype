@@ -4,6 +4,7 @@
 #define HYPE_CPUID_LEAF1_EDX_MTRR_BIT (1u << 12)
 #define HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT (1u << 24)
 #define HYPE_CPUID_EXT1_ECX_SVM_BIT (1u << 2)
+#define HYPE_CPUID_EXT7_EDX_INVARIANT_TSC_BIT (1u << 8)
 
 static void zero_result(hype_cpuid_result_t *out) {
     out->eax = 0;
@@ -55,6 +56,24 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
         out->edx = real->edx;
         out->ecx = real->ecx & ~HYPE_CPUID_EXT1_ECX_SVM_BIT;
         out->ebx = 0;
+        return;
+    }
+
+    if (eax_in == 0x80000007u) {
+        /* Advanced Power Management Information leaf. Advertise ONLY
+         * Invariant TSC (EDX bit 8): hype passes the host TSC straight
+         * through to the guest, and a modern AMD host TSC is invariant
+         * (constant rate regardless of P-/C-states). Without this bit the
+         * guest's clocksource watchdog sees the emulated PIT/PM-timer drift
+         * against the raw TSC and marks the TSC unstable, falling back to a
+         * slow, skewed clock ("clock skew detected" -- observed on real HW)
+         * that makes timed boot work run long. All power-management bits
+         * (EDX 0-7, and EAX/EBX/ECX) stay 0 -- unmodeled and not
+         * guest-isolation-relevant. */
+        out->eax = 0;
+        out->ebx = 0;
+        out->ecx = 0;
+        out->edx = HYPE_CPUID_EXT7_EDX_INVARIANT_TSC_BIT;
         return;
     }
 

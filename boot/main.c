@@ -5048,6 +5048,22 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                         top[1] >= 0 ? (unsigned long long)riphist_cnt[top[1]] : 0ULL,
                         top[2] >= 0 ? (unsigned long long)riphist_rip[top[2]] : 0ULL,
                         top[2] >= 0 ? (unsigned long long)riphist_cnt[top[2]] : 0ULL);
+                    /* RT-2c: decode the guest instruction bytes at the #1 hot
+                     * RIP -- the definitive waiting-vs-working test. F3 90 =
+                     * PAUSE (spin); EC/ED = IN, EE/EF = OUT (device I/O); a
+                     * near-jump back (EB/E9/7x) over a tiny range = poll loop;
+                     * string/ALU ops = real work. Kernel RIPs translate via any
+                     * CR3 (kernel half is shared), so this resolves. */
+                    if (top[0] >= 0) {
+                        const uint8_t *ib = fw_1_insn_bytes_via_ptwalk(ctx, riphist_rip[top[0]]);
+                        if (ib != 0) {
+                            hype_debug_print("fw-1 RIPHOT-INSN 0x%llx: %02x %02x %02x %02x %02x %02x "
+                                             "%02x %02x %02x %02x %02x %02x\n",
+                                             (unsigned long long)riphist_rip[top[0]], ib[0], ib[1],
+                                             ib[2], ib[3], ib[4], ib[5], ib[6], ib[7], ib[8], ib[9],
+                                             ib[10], ib[11]);
+                        }
+                    }
                 }
                 /* M4-6d4: companion line to EXHIST. The real-HW soft lockups
                  * (blkid stuck 24s, kworker stuck 26s -- confirmed by a
