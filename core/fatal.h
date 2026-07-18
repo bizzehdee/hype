@@ -69,4 +69,11 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...);
  */
 void hype_debug_print(const char *fmt, ...);
 
+/* RT-2c: defer hype_debug_print()'s framebuffer push (still renders to the
+ * shadow buffer) so a hot loop can batch VRAM flushes on its own cadence via
+ * hype_debug_flush_gop(). deferred=0 restores immediate per-print flushing.
+ * hype_fatal() flushes unconditionally, so panics are never deferred away. */
+void hype_debug_set_gop_deferred(int deferred);
+void hype_debug_flush_gop(void);
+
 #endif /* HYPE_FATAL_H */

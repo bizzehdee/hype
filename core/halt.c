@@ -58,6 +58,30 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
     hype_halt_forever();
 }
 
+/*
+ * RT-2c: GOP-flush deferral. When set, hype_debug_print() still renders text
+ * into the console's shadow buffer (cheap RAM write, and the RT-1c dirty
+ * range keeps accumulating), but does NOT push it to the real framebuffer --
+ * the caller flushes on its own cadence via hype_debug_flush_gop(). On real
+ * hardware the framebuffer is often uncached and a full-frame scroll memcpy
+ * costs milliseconds; doing that per console line dominated the post-EBS
+ * loop body. The FW-1 loop defers and flushes at ~60 Hz instead, so N lines
+ * printed between flushes cost ONE framebuffer push, not N. hype_fatal()
+ * flushes unconditionally (above), so a panic is never hidden by deferral.
+ */
+static int g_gop_deferred = 0;
+
+void hype_debug_set_gop_deferred(int deferred) {
+    g_gop_deferred = deferred;
+}
+
+void hype_debug_flush_gop(void) {
+    hype_gop_console_t *gop = hype_fatal_get_gop();
+    if (gop != 0) {
+        hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());
+    }
+}
+
 void hype_debug_print(const char *fmt, ...) {
     char msg[192];
     va_list ap;
@@ -76,6 +100,8 @@ void hype_debug_print(const char *fmt, ...) {
     gop = hype_fatal_get_gop();
     if (gop != 0) {
         hype_gop_print(gop, "%s", msg);
-        hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());
+        if (!g_gop_deferred) {
+            hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());
+        }
     }
 }

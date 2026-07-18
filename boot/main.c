@@ -4829,6 +4829,23 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     unsigned long long ex_io80 = 0, ex_ahci_npf = 0, ex_pause = 0, ex_intr = 0;
     uint64_t last_exhist_tsc = 0;
     uint64_t last_preempt_rip_tsc = 0; /* RT-2b: throttle the preemption-RIP sample log */
+    uint64_t last_gop_flush_tsc = 0;   /* RT-2c: throttle deferred GOP framebuffer pushes to ~60 Hz */
+    /* RT-2c waiting-vs-working instrumentation: where host-tick preemptions
+     * land. A few dominant RIPs => guest is spinning (waiting on a slow
+     * clock); spread across many => doing real work. Coarse space split plus
+     * a small hot-RIP table (linear probe, overflow counted). */
+#define FW_1_RIPHIST_N 24
+    uint64_t riphist_rip[FW_1_RIPHIST_N];
+    uint64_t riphist_cnt[FW_1_RIPHIST_N];
+    uint64_t riphist_overflow = 0;
+    unsigned long long preempt_kernel = 0, preempt_user = 0, preempt_lowmem = 0;
+    {
+        int rh;
+        for (rh = 0; rh < FW_1_RIPHIST_N; rh++) {
+            riphist_rip[rh] = 0;
+            riphist_cnt[rh] = 0;
+        }
+    }
     int booted = 0;
     hype_vt_filter_t uart_filter;
     char uart_line[256];
@@ -4875,6 +4892,13 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * hype_fatal(), producing a flushed PANIC with the faulting vector,
      * RIP, error code, and CS. That is strictly more than the old catcher
      * gave, so no per-loop IDT patching is needed. */
+
+    /* RT-2c: defer per-print GOP framebuffer pushes; the loop flushes the
+     * accumulated shadow buffer to VRAM at ~60 Hz below. On real (uncached)
+     * VRAM a full-frame scroll memcpy per console line dominated the loop
+     * body -- batching turns N lines/flush-window into one push. */
+    hype_debug_set_gop_deferred(1);
+
     for (;;) {
         uint8_t timer_vector;
 
@@ -4989,6 +5013,40 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                     hype_debug_print("fw-1 PREEMPT: max_single_vmrun=%llums vmruns_over_100ms=%llu\n",
                                      (g_fw_1_vmrun_max_tsc * 1000ULL) / g_fw_1_host_tsc_hz,
                                      g_fw_1_vmrun_over100ms);
+                }
+                /* RT-2c: waiting-vs-working readout. A few kernel-space RIPs
+                 * carrying most preemptions => guest spinning in a delay loop
+                 * (waiting on a slow clock -> timebase problem). Preemptions
+                 * spread thin across many RIPs => guest doing real work
+                 * (-> emulation/I-O speed problem). */
+                {
+                    int top[3] = {-1, -1, -1};
+                    int rh, k;
+                    for (rh = 0; rh < FW_1_RIPHIST_N; rh++) {
+                        if (riphist_cnt[rh] == 0) {
+                            continue;
+                        }
+                        for (k = 0; k < 3; k++) {
+                            if (top[k] < 0 || riphist_cnt[rh] > riphist_cnt[top[k]]) {
+                                int j;
+                                for (j = 2; j > k; j--) {
+                                    top[j] = top[j - 1];
+                                }
+                                top[k] = rh;
+                                break;
+                            }
+                        }
+                    }
+                    hype_debug_print(
+                        "fw-1 RIPHIST: kernel=%llu user=%llu lowmem=%llu overflow=%llu | "
+                        "hot 0x%llx=%llu 0x%llx=%llu 0x%llx=%llu\n",
+                        preempt_kernel, preempt_user, preempt_lowmem, riphist_overflow,
+                        top[0] >= 0 ? (unsigned long long)riphist_rip[top[0]] : 0ULL,
+                        top[0] >= 0 ? (unsigned long long)riphist_cnt[top[0]] : 0ULL,
+                        top[1] >= 0 ? (unsigned long long)riphist_rip[top[1]] : 0ULL,
+                        top[1] >= 0 ? (unsigned long long)riphist_cnt[top[1]] : 0ULL,
+                        top[2] >= 0 ? (unsigned long long)riphist_rip[top[2]] : 0ULL,
+                        top[2] >= 0 ? (unsigned long long)riphist_cnt[top[2]] : 0ULL);
                 }
                 /* M4-6d4: companion line to EXHIST. The real-HW soft lockups
                  * (blkid stuck 24s, kworker stuck 26s -- confirmed by a
@@ -5302,11 +5360,28 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
         /* FW-1e: surface any console text the guest wrote to either UART.
          * FW-1f uses the emitted-char count as evidence the guest reacted
-         * to an injected keystroke. */
-        console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
-                                                  (unsigned int)sizeof(uart_line));
-        console_chars += fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
-                                                  (unsigned int)sizeof(uart_line2));
+         * to an injected keystroke. RT-2c: skip on host-tick (INTR) exits --
+         * the guest wrote nothing, so draining an empty UART FIFO twice per
+         * host tick (~55% of all exits) is pure waste. */
+        if (info.reason != HYPE_SVM_EXITCODE_INTR) {
+            console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line,
+                                                     &uart_line_len, (unsigned int)sizeof(uart_line));
+            console_chars += fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2,
+                                                     &uart_line_len2, (unsigned int)sizeof(uart_line2));
+        }
+
+        /* RT-2c: push the deferred GOP shadow buffer to the real framebuffer
+         * at ~60 Hz. All hype_debug_print/guest-console text since the last
+         * push has accumulated in the shadow buffer (and RT-1c's dirty range);
+         * this is the ONE framebuffer memcpy that pays the uncached-VRAM cost,
+         * instead of one per printed line. */
+        if (g_fw_1_host_tsc_hz != 0) {
+            uint64_t now_gf = hype_rdtsc();
+            if (last_gop_flush_tsc == 0 || now_gf - last_gop_flush_tsc >= g_fw_1_host_tsc_hz / 60u) {
+                last_gop_flush_tsc = now_gf;
+                hype_debug_flush_gop();
+            }
+        }
 
         /* M4-6d3: flush a buffered partial line that looks like an
          * interactive prompt (ends in ": ", "# ", "$ ", "> ") when the
@@ -5368,6 +5443,35 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
              * guest's instruction mix. RT-2b bonus: sample the preempted guest
              * RIP ~1/sec -- the first real look at WHAT that stretch runs,
              * without flooding the log at 1000 preemptions/sec. */
+            {
+                /* RT-2c: classify + bucket the preempted RIP (waiting vs
+                 * working). x86_64 canonical split: kernel = higher half
+                 * (>= 0xffff800000000000), user = low half above 1 page,
+                 * everything else (firmware/low identity map) = lowmem. */
+                uint64_t rip = info.guest_rip;
+                int rh;
+                if (rip >= 0xffff800000000000ULL) {
+                    preempt_kernel++;
+                } else if (rip >= 0x1000ULL && rip < 0x0000800000000000ULL) {
+                    preempt_user++;
+                } else {
+                    preempt_lowmem++;
+                }
+                for (rh = 0; rh < FW_1_RIPHIST_N; rh++) {
+                    if (riphist_cnt[rh] != 0 && riphist_rip[rh] == rip) {
+                        riphist_cnt[rh]++;
+                        break;
+                    }
+                    if (riphist_cnt[rh] == 0) {
+                        riphist_rip[rh] = rip;
+                        riphist_cnt[rh] = 1;
+                        break;
+                    }
+                }
+                if (rh == FW_1_RIPHIST_N) {
+                    riphist_overflow++;
+                }
+            }
             if (g_fw_1_host_tsc_hz != 0) {
                 uint64_t now_pr = hype_rdtsc();
                 if (last_preempt_rip_tsc == 0 ||
@@ -5936,6 +6040,12 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
         break;
     }
+
+    /* RT-2c: the guest loop gave up and returned -- restore immediate GOP
+     * flushing so the trailing give-up diagnostics + any post-loop output
+     * (efi_main's chord/idle tail) render to the screen as they print. */
+    hype_debug_set_gop_deferred(0);
+    hype_debug_flush_gop();
 
     /* RT-2a: no firmware-IDT restore needed -- this loop runs post-EBS under
      * hype's own IDT, and there are no subsequent Boot Services calls to
