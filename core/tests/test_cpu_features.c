@@ -52,11 +52,21 @@ static void test_kind_select(void) {
               (int)HYPE_VMM_KIND_NONE, (int)hype_vmm_kind_select(HYPE_CPU_VENDOR_INTEL, 0, 1));
 }
 
+static void test_has_pause_filter(void) {
+    CHECK_INT("PAUSEFILTER bit 10 set", 1, hype_cpu_has_pause_filter(1u << 10));
+    CHECK_INT("PAUSEFILTER bit 10 clear", 0, hype_cpu_has_pause_filter(0));
+    CHECK_INT("PAUSEFILTER ignores other bits", 0, hype_cpu_has_pause_filter(~(1u << 10)));
+    CHECK_INT("PFTHRESHOLD bit 12 set", 1, hype_cpu_has_pause_threshold(1u << 12));
+    CHECK_INT("PFTHRESHOLD bit 12 clear", 0, hype_cpu_has_pause_threshold(0));
+    CHECK_INT("PFTHRESHOLD ignores other bits", 0, hype_cpu_has_pause_threshold(~(1u << 12)));
+}
+
 int main(void) {
     test_vendor_from_string();
     test_has_vmx();
     test_has_svm();
     test_kind_select();
+    test_has_pause_filter();
 
     if (failures == 0) {
         printf("all tests passed\n");

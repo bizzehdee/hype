@@ -69,4 +69,12 @@ typedef struct {
  */
 hype_cpu_diag_t hype_cpu_detect_vmm_kind_diag(void);
 
+/* SVM PAUSE-filter support: CPUID Fn8000_000A_EDX bit 10 (PAUSEFILTER),
+ * bit 12 (PFTHRESHOLD). Pure bit checks. */
+int hype_cpu_has_pause_filter(uint32_t leaf8000000a_edx);
+int hype_cpu_has_pause_threshold(uint32_t leaf8000000a_edx);
+
+/* Real CPUID Fn8000_000A_EDX read (SVM feature bitmap). Exempt hw shim. */
+uint32_t hype_cpu_svm_feature_edx(void);
+
 #endif /* HYPE_ARCH_CPU_FEATURES_H */

@@ -43,3 +43,16 @@ hype_vmm_kind_t hype_vmm_kind_select(hype_cpu_vendor_t vendor, int has_vmx, int 
     }
     return HYPE_VMM_KIND_NONE;
 }
+
+/* SVM PAUSE-filter support: CPUID Fn8000_000A_EDX bit 10 (PAUSEFILTER) --
+ * the VMCB pause_filter_count that lets a spin loop be intercepted after a
+ * burst of PAUSEs. Bit 12 (PFTHRESHOLD) additionally enables the
+ * pause_filter_threshold window. Pure bit checks; the real CPUID read is the
+ * exempt hw shim. */
+int hype_cpu_has_pause_filter(uint32_t leaf8000000a_edx) {
+    return (int)((leaf8000000a_edx >> 10) & 1u);
+}
+
+int hype_cpu_has_pause_threshold(uint32_t leaf8000000a_edx) {
+    return (int)((leaf8000000a_edx >> 12) & 1u);
+}

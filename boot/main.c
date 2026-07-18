@@ -6072,6 +6072,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 ? "Intel"
                 : (cpu_diag.vendor == HYPE_CPU_VENDOR_AMD) ? "AMD" : "unknown",
             cpu_diag.has_vmx, cpu_diag.has_svm);
+        /* M4-6d4: does THIS environment expose SVM PAUSE-filtering? Decides
+         * whether the preemption mechanism (#3/#4) is provable here or only on
+         * real HW. QEMU/KVM nested SVM may not pass it through. */
+        {
+            uint32_t svm_edx = hype_cpu_svm_feature_edx();
+            hype_debug_print("cpu: svm_feature_edx=0x%08x pause_filter=%d pause_threshold=%d\n",
+                             svm_edx, hype_cpu_has_pause_filter(svm_edx),
+                             hype_cpu_has_pause_threshold(svm_edx));
+        }
 
         if (ops == 0) {
             hype_fatal("no usable virtualization extension (VMX/SVM) detected");

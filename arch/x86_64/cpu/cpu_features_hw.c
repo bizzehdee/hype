@@ -30,3 +30,12 @@ hype_cpu_diag_t hype_cpu_detect_vmm_kind_diag(void) {
 hype_vmm_kind_t hype_cpu_detect_vmm_kind(void) {
     return hype_cpu_detect_vmm_kind_diag().kind;
 }
+
+/* Reads CPUID Fn8000_000A (SVM revision + feature identification) EDX --
+ * the SVM feature bitmap (PAUSEFILTER=10, PFTHRESHOLD=12, ...). Exempt hw
+ * shim; the pure bit checks are hype_cpu_has_pause_filter/threshold(). */
+uint32_t hype_cpu_svm_feature_edx(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    cpuid(0x8000000Au, &a, &b, &c, &d);
+    return d;
+}
