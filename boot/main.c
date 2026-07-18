@@ -4427,37 +4427,42 @@ static void fw_1_debug_feed(hype_vt_filter_t *filter, char *line, unsigned int *
  * Services are still up, here in efi_main -- can scan RAM for it and dump
  * whatever the prior run captured before it died.
  *
- * This is best-effort observability, not a guarantee: whether the region's
- * bytes survive a warm reboot (firmware may zero conventional RAM, and the
- * loader zeroes our own BSS on load, which can clobber the prior copy if
- * hype.efi lands at the same physical address) is empirical per platform.
- * When it doesn't survive, the GOP on-screen channel (RT-1c) is the live
- * fallback. Called before hype_logbuf_reset() stamps THIS boot's buffer, so
- * the only magic in RAM is a genuine prior log; we also skip our own live
- * buffer defensively in case ordering ever changes.
+ * This is best-effort observability, not a guarantee: the region's bytes
+ * must survive the reboot. A WARM reboot (CPU reset without cutting power)
+ * can preserve them; a COLD power cycle wipes RAM, so on power-off-only
+ * machines this recovers nothing -- there the RT-3 EFI-variable channel
+ * (SPI-flash-backed, survives cold boot) and the live GOP screen (RT-1c) are
+ * the fallbacks. The `found == live` guard skips THIS boot's own buffer
+ * (hype_logbuf_reset() has already stamped it by the time this runs).
  *
- * The scan is confined to memory-map descriptors we can safely read
+ * RT-1d: the scan steps by HYPE_LOGBUF_SCAN_ALIGN (page-aligned buffer +
+ * page-aligned RAM regions), ~512x fewer probes than an 8-byte sweep --
+ * that is what keeps this off the pre-EBS critical path on a many-GB
+ * machine. It is confined to memory-map descriptors we can safely read
  * (conventional + boot-services + loader ranges) -- never MMIO/reserved,
  * where a stray read could fault or hang. hype_logbuf_find() is bounds-safe
  * within each region and validates magic+version+checksum before trusting a
- * hit. First valid, non-empty, non-live buffer wins. */
+ * hit. First valid, non-empty, non-live buffer wins. Always reports its
+ * outcome (RT-1d) and always deletes any stale \hype-log.txt (retired in
+ * RT-2a) so a ghost file can never masquerade as a fresh log. */
 static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
                                const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size, UINTN desc_size) {
     EFI_FILE_PROTOCOL *root = 0;
     const char *base = (const char *)map;
     const hype_logbuf_t *live = hype_logbuf_get();
     UINTN count = (desc_size > 0) ? (map_size / desc_size) : 0;
+    const hype_logbuf_t *found = 0;
     UINTN i;
 
     if (map == 0 || count == 0) {
         return;
     }
 
-    for (i = 0; i < count; i++) {
+    for (i = 0; i < count && found == 0; i++) {
         const EFI_MEMORY_DESCRIPTOR *d = (const EFI_MEMORY_DESCRIPTOR *)(base + i * desc_size);
         const void *region;
         unsigned long region_size;
-        const hype_logbuf_t *found;
+        const hype_logbuf_t *hit;
 
         if (d->Type != EfiConventionalMemory && d->Type != EfiBootServicesCode &&
             d->Type != EfiBootServicesData && d->Type != EfiLoaderCode &&
@@ -4467,24 +4472,36 @@ static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
         region = (const void *)(UINTN)d->PhysicalStart;
         region_size = (unsigned long)(d->NumberOfPages * 4096ull);
 
-        found = hype_logbuf_find(region, region_size);
-        if (found == 0 || found == live || found->len == 0) {
-            continue;
+        hit = hype_logbuf_find(region, region_size, HYPE_LOGBUF_SCAN_ALIGN);
+        if (hit != 0 && hit != live && hit->len != 0) {
+            found = hit;
         }
+    }
 
-        /* Found a prior boot's log. Locating the root is deferred to here so
-         * a machine with no prior log never touches the filesystem. */
-        if (hype_file_locate_root(image_handle, bs, &root) != EFI_SUCCESS || root == 0) {
-            return;
-        }
+    /* Locate the boot volume once, whether or not we found a prior log: we
+     * always want to delete a stale \hype-log.txt, and write \hype-log-prev.txt
+     * if there is something to recover. A non-FAT/read-only volume just means
+     * the on-screen outcome line below is the only record. */
+    if (hype_file_locate_root(image_handle, bs, &root) == EFI_SUCCESS && root != 0) {
+        hype_file_delete(root, (CHAR16 *)L"\\hype-log.txt"); /* RT-2a: no longer written; kill the ghost */
         hype_file_delete(root, (CHAR16 *)L"\\hype-log-prev.txt");
-        if (hype_file_write_new(root, (CHAR16 *)L"\\hype-log-prev.txt", found->data,
+        if (found != 0 &&
+            hype_file_write_new(root, (CHAR16 *)L"\\hype-log-prev.txt", found->data,
                                 (UINTN)found->len) == EFI_SUCCESS) {
             hype_debug_print("RT-1b: recovered %u bytes of the previous boot's log%s -> "
                              "\\hype-log-prev.txt\n",
                              (unsigned int)found->len, found->truncated ? " (truncated)" : "");
+            return;
         }
-        return;
+    }
+
+    if (found == 0) {
+        hype_debug_print("RT-1b: no prior boot log found in RAM (expected after a cold power "
+                         "cycle -- see RT-3 for cold-boot-surviving capture)\n");
+    } else {
+        hype_debug_print("RT-1b: found %u bytes of prior log but could not write it (no "
+                         "writable boot volume)\n",
+                         (unsigned int)found->len);
     }
 }
 

@@ -27,6 +27,13 @@
 
 #define HYPE_LOGBUF_CAPACITY (2u * 1024u * 1024u)
 
+/* RT-1d: the buffer is page-aligned (see g_logbuf's __attribute__((aligned))
+ * in logbuf.c) and UEFI loads hype.efi's image at a page-aligned physical
+ * base, so a previous boot's magic always lands on a 4 KB boundary in RAM.
+ * The RT-1b scanner steps by this instead of 8 bytes -- ~512x fewer probes
+ * across a multi-GB sweep, which is what removes the pre-EBS scan pause. */
+#define HYPE_LOGBUF_SCAN_ALIGN 4096u
+
 /* Distinctive 64-bit tag at the head of the region ("hypeLOG\0") --
  * vanishingly unlikely to occur in random firmware RAM, so a memory scan
  * that finds it (RT-1b) has almost certainly found a real hype log rather
@@ -81,13 +88,16 @@ const hype_logbuf_t *hype_logbuf_get(void);
 int hype_logbuf_validate(const hype_logbuf_t *hdr);
 
 /*
- * Scans [base, base+size) at 8-byte alignment for a valid logbuf header
- * (magic + hype_logbuf_validate). Returns a pointer to the first valid
- * one, or 0 if none. `size` is the byte length of the region to scan.
+ * Scans [base, base+size) for a valid logbuf header (magic +
+ * hype_logbuf_validate), stepping by `stride` bytes. Returns a pointer to
+ * the first valid one, or 0 if none. `stride` is clamped up to 8 (the
+ * minimum at which the header fields are readable); pass
+ * HYPE_LOGBUF_SCAN_ALIGN for a fast real-RAM sweep when `base` is
+ * page-aligned (the RT-1b case), or 8 to probe every 8-byte boundary.
  * Pure -- no allocation, no dereference outside [base, base+size). This is
  * how RT-1b recovers the previous run's log from physical RAM on the
  * following boot. Fully testable.
  */
-const hype_logbuf_t *hype_logbuf_find(const void *base, unsigned long size);
+const hype_logbuf_t *hype_logbuf_find(const void *base, unsigned long size, unsigned long stride);
 
 #endif /* HYPE_CORE_LOGBUF_H */

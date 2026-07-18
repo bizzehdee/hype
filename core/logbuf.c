@@ -1,10 +1,13 @@
 #include "logbuf.h"
 
-/* One contiguous, 8-byte-aligned region: magic header immediately ahead of
+/* One contiguous, page-aligned region: magic header immediately ahead of
  * the data, so a scanner (hype_logbuf_find) locates the magic at a fixed
- * offset before the bytes. Lives in BSS (zero at load); hype_logbuf_reset()
- * stamps the magic before any logging -- see efi_main. */
-static hype_logbuf_t g_logbuf __attribute__((aligned(8)));
+ * offset before the bytes. Page alignment (RT-1d) puts the magic on a 4 KB
+ * boundary in physical RAM -- UEFI loads the image page-aligned -- so the
+ * RT-1b next-boot scan can step by HYPE_LOGBUF_SCAN_ALIGN instead of 8
+ * bytes. Lives in BSS (zero at load); hype_logbuf_reset() stamps the magic
+ * before any logging -- see efi_main. */
+static hype_logbuf_t g_logbuf __attribute__((aligned(HYPE_LOGBUF_SCAN_ALIGN)));
 
 void hype_logbuf_reset(void) {
     g_logbuf.magic = HYPE_LOGBUF_MAGIC;
@@ -64,20 +67,26 @@ int hype_logbuf_validate(const hype_logbuf_t *hdr) {
     return (sum == hdr->checksum) ? 1 : 0;
 }
 
-const hype_logbuf_t *hype_logbuf_find(const void *base, unsigned long size) {
+const hype_logbuf_t *hype_logbuf_find(const void *base, unsigned long size, unsigned long stride) {
     const unsigned char *p;
     unsigned long off;
     /* The header must fit before we can even read its fields: magic(8) +
      * version(4) + len(4) + truncated(4) + checksum(4). */
     const unsigned long header_prefix = 8u + 4u + 4u + 4u + 4u;
 
+    /* 8 is the minimum at which the 8-byte magic is readable; a caller
+     * asking for less is clamped up rather than reading misaligned/OOB. */
+    if (stride < 8u) {
+        stride = 8u;
+    }
     if (base == 0 || size < header_prefix) {
         return 0;
     }
     p = (const unsigned char *)base;
-    /* The region is 8-byte aligned, so the magic can only start at an
-     * 8-byte boundary; scanning by 8 keeps a large real-RAM sweep cheap. */
-    for (off = 0; off + header_prefix <= size; off += 8u) {
+    /* The magic only ever starts on a `stride` boundary relative to `base`
+     * (the buffer is page-aligned and `base` is a page-aligned RAM region),
+     * so stepping by `stride` keeps a large real-RAM sweep cheap. */
+    for (off = 0; off + header_prefix <= size; off += stride) {
         const hype_logbuf_t *cand = (const hype_logbuf_t *)(const void *)(p + off);
         if (cand->magic != HYPE_LOGBUF_MAGIC) {
             continue;

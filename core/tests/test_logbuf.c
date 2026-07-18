@@ -89,7 +89,7 @@ static void test_live_buffer_validates_and_is_findable(void) {
     CHECK_INT("populated buffer validates", 1, hype_logbuf_validate(h));
     /* The real RT-1b path: scan a region starting at the header, find it. */
     CHECK_INT("find locates the live buffer at offset 0", 1,
-              hype_logbuf_find(h, sizeof(hype_logbuf_t)) == h);
+              hype_logbuf_find(h, sizeof(hype_logbuf_t), 8u) == h);
 }
 
 static void test_find_at_offset_and_rejections(void) {
@@ -98,38 +98,69 @@ static void test_find_at_offset_and_rejections(void) {
     memset(buf, 0, sizeof(buf));
     put_header(buf + 64, HYPE_LOGBUF_MAGIC, HYPE_LOGBUF_VERSION, 3, 0, 'a' + 'b' + 'c', "abc");
     CHECK_INT("find locates a header at a nonzero offset", 1,
-              hype_logbuf_find(buf, sizeof(buf)) == (const hype_logbuf_t *)(buf + 64));
+              hype_logbuf_find(buf, sizeof(buf), 8u) == (const hype_logbuf_t *)(buf + 64));
 
     /* Wrong magic -> not found. */
     memset(buf, 0, sizeof(buf));
     put_header(buf + 64, 0xDEADBEEFDEADBEEFULL, HYPE_LOGBUF_VERSION, 0, 0, 0, 0);
-    CHECK_INT("wrong magic is not found", 1, hype_logbuf_find(buf, sizeof(buf)) == 0);
+    CHECK_INT("wrong magic is not found", 1, hype_logbuf_find(buf, sizeof(buf), 8u) == 0);
 
     /* Right magic, wrong version -> validate fails, not found. */
     memset(buf, 0, sizeof(buf));
     put_header(buf + 64, HYPE_LOGBUF_MAGIC, HYPE_LOGBUF_VERSION + 1u, 0, 0, 0, 0);
     CHECK_INT("wrong version rejected", 0,
               hype_logbuf_validate((const hype_logbuf_t *)(buf + 64)));
-    CHECK_INT("wrong version not found", 1, hype_logbuf_find(buf, sizeof(buf)) == 0);
+    CHECK_INT("wrong version not found", 1, hype_logbuf_find(buf, sizeof(buf), 8u) == 0);
 
     /* Right magic/version, checksum doesn't match the data -> rejected. */
     memset(buf, 0, sizeof(buf));
     put_header(buf + 64, HYPE_LOGBUF_MAGIC, HYPE_LOGBUF_VERSION, 3, 0, 0 /*wrong*/, "abc");
     CHECK_INT("bad checksum rejected", 0,
               hype_logbuf_validate((const hype_logbuf_t *)(buf + 64)));
-    CHECK_INT("bad checksum not found", 1, hype_logbuf_find(buf, sizeof(buf)) == 0);
+    CHECK_INT("bad checksum not found", 1, hype_logbuf_find(buf, sizeof(buf), 8u) == 0);
 
     /* A zeroed region has no magic anywhere. */
     memset(buf, 0, sizeof(buf));
-    CHECK_INT("zeroed region yields nothing", 1, hype_logbuf_find(buf, sizeof(buf)) == 0);
+    CHECK_INT("zeroed region yields nothing", 1, hype_logbuf_find(buf, sizeof(buf), 8u) == 0);
 
     /* Claimed len runs past the scanned region -> not found (no over-read). */
     memset(buf, 0, sizeof(buf));
     put_header(buf + 64, HYPE_LOGBUF_MAGIC, HYPE_LOGBUF_VERSION, 100000u, 0, 0, 0);
-    CHECK_INT("oversized len past region not found", 1, hype_logbuf_find(buf, sizeof(buf)) == 0);
+    CHECK_INT("oversized len past region not found", 1, hype_logbuf_find(buf, sizeof(buf), 8u) == 0);
 
-    CHECK_INT("NULL base not found", 1, hype_logbuf_find(0, sizeof(buf)) == 0);
+    CHECK_INT("NULL base not found", 1, hype_logbuf_find(0, sizeof(buf), 8u) == 0);
     CHECK_INT("NULL header does not validate", 0, hype_logbuf_validate(0));
+}
+
+/* RT-1d: the real RT-1b sweep steps by HYPE_LOGBUF_SCAN_ALIGN (4 KB) over
+ * page-aligned RAM. Verify a header on a page boundary is found at that
+ * stride, that a too-small stride is clamped (still finds an 8-aligned
+ * header), and that the page stride correctly skips a header sitting off a
+ * page boundary (the alignment contract the fast scan relies on). */
+static void test_find_honours_stride(void) {
+    static unsigned char buf[3 * 4096] __attribute__((aligned(4096)));
+
+    /* Header exactly on the second page -> found by a 4 KB stride. */
+    memset(buf, 0, sizeof(buf));
+    put_header(buf + 4096, HYPE_LOGBUF_MAGIC, HYPE_LOGBUF_VERSION, 3, 0, 'a' + 'b' + 'c', "abc");
+    CHECK_INT("page-strided find locates a page-aligned header", 1,
+              hype_logbuf_find(buf, sizeof(buf), HYPE_LOGBUF_SCAN_ALIGN) ==
+                  (const hype_logbuf_t *)(buf + 4096));
+
+    /* Same header, but a stride below 8 is clamped up to 8 and still finds
+     * it (4096 is a multiple of 8). */
+    CHECK_INT("sub-8 stride is clamped and still finds it", 1,
+              hype_logbuf_find(buf, sizeof(buf), 1u) == (const hype_logbuf_t *)(buf + 4096));
+
+    /* Header off a page boundary -> a 4 KB stride steps past it (documents
+     * the contract: the fast scan only works because the buffer is
+     * page-aligned). An 8-byte stride still catches it. */
+    memset(buf, 0, sizeof(buf));
+    put_header(buf + 4096 + 64, HYPE_LOGBUF_MAGIC, HYPE_LOGBUF_VERSION, 3, 0, 'a' + 'b' + 'c', "abc");
+    CHECK_INT("page stride skips an off-page header", 1,
+              hype_logbuf_find(buf, sizeof(buf), HYPE_LOGBUF_SCAN_ALIGN) == 0);
+    CHECK_INT("8-byte stride still finds the off-page header", 1,
+              hype_logbuf_find(buf, sizeof(buf), 8u) == (const hype_logbuf_t *)(buf + 4096 + 64));
 }
 
 int main(void) {
@@ -140,6 +171,7 @@ int main(void) {
     test_reset_stamps_header();
     test_live_buffer_validates_and_is_findable();
     test_find_at_offset_and_rejections();
+    test_find_honours_stride();
 
     if (failures == 0) {
         printf("all tests passed\n");
