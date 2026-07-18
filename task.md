@@ -1972,6 +1972,29 @@ tasks — see updated deps below.*
   watchdog-only build (reaches login) is restored and repackaged;
   tick-rate slowness stays QoL, not a blocker.*
 
+  *HOST-PREEMPTION via SVM PAUSE-filtering (2026-07-18). The PREEMPT probe
+  (commits 52187b2, be82164) proved the real cause of the slowness: a
+  single VMRUN ran 40s with ZERO exits (max_single_vmrun=40022ms, 171
+  VMRUNs >100ms), while tick-lateness we could see between exits was only
+  ~4s and the priority-fix-reclaimable slice was 21ms. So a tickless guest
+  busy-waiting on cpu_relax(PAUSE) runs uninterrupted -- we never regain
+  control to inject its tick, its jiffies freeze, soft lockups. Fix (the
+  KVM mechanism, minus the risk of a physical preemption timer): SVM
+  PAUSE-filtering -- intercept PAUSE after a burst, inject the due tick,
+  resume. Built test-guest-first to de-risk: #1 vmcb constants
+  (INTERCEPT_PAUSE bit23, EXITCODE_PAUSE 0x77); #2 pure CPUID detection
+  (hype_cpu_has_pause_filter, unit-tested); #3 run_pause_filter_test -- a
+  bounded spin guest (mov cx; pause; loop; hlt, always terminates) that
+  PROVED the mechanism dev-box (QEMU+KVM honors nested pause-filtering:
+  pause-test PASS, 130 intercepts); #5 FW-1 integration (arm on the Alpine
+  guest count=65535, handle EXITCODE_PAUSE=resume), QEMU-validated full
+  boot to login, no regression, pause=0 as expected (QEMU never spins long
+  enough to trip it). Commits 0c47f9d/149df4a/015ec94. REMAINING (needs
+  real HW -- the 40s spin is HW-only): confirm max_single_vmrun collapses
+  and the soft lockups shrink/vanish on the laptop. Residual risk if it
+  doesn't help: the real spins aren't PAUSE-based (then the physical
+  preemption timer is the fallback).*
+
 ---
 
 ## CPUMSR — CPUID/MSR interception baseline (plan.md's guest-isolation
