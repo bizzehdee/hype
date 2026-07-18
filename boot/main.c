@@ -6032,6 +6032,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     int have_gop;
     UINT64 usable_ram_bytes = 0;
 
+    /* RT-1a: stamp the log-capture region's magic header before anything
+     * logs into it, so it is self-describing (findable + validatable by a
+     * later boot's scanner, RT-1b) from the very first byte. The buffer is
+     * in BSS (zero at load), so this must run explicitly. */
+    hype_logbuf_reset();
+
     hype_console_print(SystemTable, "hype\n");
 
     /* Safe to bring up now: it's raw port I/O, independent of Boot
