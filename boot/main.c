@@ -218,6 +218,22 @@ static uint64_t g_fw_1_host_tsc_hz;
 static uint64_t g_fw_1_vmrun_tsc;
 static uint64_t g_fw_1_body_tsc;
 static uint64_t g_fw_1_prev_post_tsc;
+/* M4-6d4 measurement: wall-clock (TSC) during which the timer IRQ0 was
+ * pending+unmasked, an ISR was in service (so the strict "both ISRs clear"
+ * delivery gate blocked it), AND the guest could accept it (IF=1, no
+ * shadow) -- i.e. exactly the time a fair priority-preemption scheme would
+ * RECLAIM. Compared against total wall-clock this says how much of the
+ * soft-lockup slowness the tick fix can actually recover. */
+static uint64_t g_fw_1_irq0_recoverable_tsc;
+/* Broader companion: total wall-clock a timer IRQ0 edge is pending+unmasked
+ * but NOT yet delivered, for ANY reason (in-service gate, IF=0, shadow).
+ * This is the upper bound on tick lateness -- how much faster delivery
+ * could reclaim in total. Comparing the two: recoverable≈pending means the
+ * in-service gate is the whole story (priority fix recovers it all);
+ * recoverable<<pending means most lateness is the guest itself masking
+ * interrupts (IF=0), which no delivery change can fix. */
+static uint64_t g_fw_1_irq0_pending_tsc;
+static uint64_t g_fw_1_stall_prev_tsc;
 #define HYPE_PIT_HZ 1193182ULL
 /* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
  * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
@@ -4832,6 +4848,16 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                      vmrun_ns, body_ns,
                                      (g_fw_1_vmrun_tsc / g_fw_1_host_tsc_hz) * 1000ULL,
                                      (g_fw_1_body_tsc / g_fw_1_host_tsc_hz) * 1000ULL);
+                    /* M4-6d4 MEASUREMENT: cumulative wall-clock the timer IRQ0
+                     * spent pending+deliverable but BLOCKED by an in-service
+                     * lower-priority IRQ (guest IF=1) -- the time a fair
+                     * priority-preemption scheme would reclaim. Big = the tick
+                     * fix is worth it; small = the slowness is elsewhere (busy
+                     * CD-read work, not recoverable by that fix). */
+                    hype_debug_print("fw-1 RECOVER: irq0_pending_undelivered=%llums (tick lateness, "
+                                     "upper bound) | blocked_by_isr_IF1=%llums (priority-fix reclaims)\n",
+                                     (g_fw_1_irq0_pending_tsc / g_fw_1_host_tsc_hz) * 1000ULL,
+                                     (g_fw_1_irq0_recoverable_tsc / g_fw_1_host_tsc_hz) * 1000ULL);
                 }
                 /* M4-6d4: companion line to EXHIST. The real-HW soft lockups
                  * (blkid stuck 24s, kworker stuck 26s -- confirmed by a
@@ -5016,6 +5042,36 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                     ahci_irqs++;
                 }
             }
+        }
+
+        /* M4-6d4 MEASUREMENT: accumulate wall-clock during which the timer
+         * IRQ0 is pending+unmasked, an ISR is in service (so the strict gate
+         * above blocked it), AND the guest can accept it (IF=1, no shadow) --
+         * the exact time a fair priority-preemption scheme would reclaim.
+         * Cheap PIC pre-check first; only read the guest intr state (the
+         * costly part) when IRQ0 is actually pending behind an in-service
+         * IRQ, so steady-state overhead stays negligible. */
+        {
+            uint64_t now_sb = hype_rdtsc();
+            if (g_fw_1_stall_prev_tsc != 0) {
+                int irq0_pending = (g_fw_1_pic.master.irr & 0x01u) != 0 &&
+                                   (g_fw_1_pic.master.imr & 0x01u) == 0;
+                if (irq0_pending) {
+                    uint64_t dt = now_sb - g_fw_1_stall_prev_tsc;
+                    int isr_busy = (g_fw_1_pic.master.isr != 0 || g_fw_1_pic.slave.isr != 0);
+                    g_fw_1_irq0_pending_tsc += dt; /* IF-agnostic: total tick lateness */
+                    if (isr_busy) {
+                        hype_svm_intr_state_t sb;
+                        hype_svm_vcpu_get_intr_state(ctx, &sb);
+                        if (((sb.rflags >> 9) & 1u) != 0 && sb.interrupt_shadow == 0) {
+                            /* Blocked ONLY by the in-service gate, guest able
+                             * to accept -- what a priority fix reclaims. */
+                            g_fw_1_irq0_recoverable_tsc += dt;
+                        }
+                    }
+                }
+            }
+            g_fw_1_stall_prev_tsc = now_sb;
         }
 
         /* M4-6d4: TIMER-STARVATION detector. The real-HW soft lockups
