@@ -27,4 +27,11 @@ void hype_pic_unmask_irq(uint8_t irq);
  * slave PIC too when irq >= 8, per the 8259's cascade wiring. */
 void hype_pic_send_eoi(uint8_t irq);
 
+/* Read the master/slave In-Service Register (OCW3). RT-2b: the spurious-IRQ
+ * handler checks the top bit to tell a real IRQ7/IRQ15 (bit set -> EOI) from
+ * a spurious one (bit clear -> no EOI) so a masked line firing spuriously on
+ * real hardware never reaches hype_fatal(). */
+uint8_t hype_pic_read_master_isr(void);
+uint8_t hype_pic_read_slave_isr(void);
+
 #endif /* HYPE_ARCH_PIC_H */

@@ -49,3 +49,17 @@ void hype_pic_send_eoi(uint8_t irq) {
     }
     outb(PIC1_CMD, 0x20);
 }
+
+/* Read the In-Service Register via OCW3 (RR=1, RIS=1 -> 0x0B). Used to tell a
+ * spurious IRQ7/IRQ15 (line withdrawn during INTA -- ISR bit clear) from a
+ * real one (ISR bit set), so hype's spurious-IRQ handler EOIs only the real
+ * case. RT-2b. */
+uint8_t hype_pic_read_master_isr(void) {
+    outb(PIC1_CMD, 0x0B);
+    return inb(PIC1_CMD);
+}
+
+uint8_t hype_pic_read_slave_isr(void) {
+    outb(PIC2_CMD, 0x0B);
+    return inb(PIC2_CMD);
+}

@@ -4530,7 +4530,14 @@ static void fw_1_dump_prev_diag(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
         return;
     }
     if (hype_nvlog_read(rt, diag, (unsigned int)sizeof(diag), &len) != EFI_SUCCESS || len == 0) {
-        return; /* no prior tail (common: first run, or firmware without NV RT vars) */
+        /* No prior tail. Common + benign on the first ever boot; but if the
+         * previous run definitely reached the guest loop and this still shows,
+         * the firmware isn't persisting the post-EBS SetVariable (see the
+         * RT-3a "SetVariable FAILED/OK" line the previous run would have
+         * printed). Reported so a blank drive isn't ambiguous. */
+        hype_debug_print("RT-3: no prior diagnostic variable to recover (first boot, or this "
+                         "firmware doesn't persist a post-EBS SetVariable)\n");
+        return;
     }
     if (hype_file_locate_root(image_handle, bs, &root) == EFI_SUCCESS && root != 0) {
         hype_file_delete(root, (CHAR16 *)L"\\hype-diag-prev.txt");
@@ -5037,19 +5044,36 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             static uint32_t nvlog_last_sum = 0;
             static int nvlog_written = 0;
             static int nvlog_disabled = 0;
+            static int nvlog_reported = 0; /* RT-3: report the FIRST write result once */
             if (!nvlog_disabled && g_hype_rt != 0 && g_fw_1_host_tsc_hz != 0) {
                 uint64_t now = hype_rdtsc();
                 uint32_t sum = hype_nvlog_checksum(hype_logbuf_data(), hype_logbuf_len());
                 uint64_t interval = HYPE_NVLOG_WRITE_INTERVAL_SECS * g_fw_1_host_tsc_hz;
                 if (hype_nvlog_should_write(now, nvlog_last_tsc, interval, nvlog_written, sum,
                                             nvlog_last_sum)) {
-                    if (hype_nvlog_write(g_hype_rt, hype_logbuf_data(), hype_logbuf_len()) ==
-                        EFI_SUCCESS) {
+                    EFI_STATUS st = hype_nvlog_write(g_hype_rt, hype_logbuf_data(),
+                                                     hype_logbuf_len());
+                    if (st == EFI_SUCCESS) {
                         nvlog_last_tsc = now;
                         nvlog_last_sum = sum;
                         nvlog_written = 1;
+                        if (!nvlog_reported) {
+                            nvlog_reported = 1;
+                            hype_debug_print("RT-3: post-EBS SetVariable OK -- cold-boot diagnostic "
+                                             "capture is LIVE on this firmware\n");
+                        }
                     } else {
                         nvlog_disabled = 1; /* firmware rejected an RT SetVariable -- stop trying */
+                        if (!nvlog_reported) {
+                            nvlog_reported = 1;
+                            /* This firmware won't take a NON_VOLATILE SetVariable post-EBS
+                             * (commonly: runtime NV writes need SMM, which we don't drive).
+                             * RT-3 cold-boot capture is unavailable here -- rely on the frozen
+                             * GOP screen for panics/hangs. */
+                            hype_debug_print("RT-3: post-EBS SetVariable FAILED (0x%llx) -- cold-boot "
+                                             "diagnostic capture UNAVAILABLE on this firmware\n",
+                                             (unsigned long long)st);
+                        }
                     }
                 }
             }
@@ -6142,6 +6166,33 @@ static void EFIAPI run_all_test_guests(void *arg) {
      * host-tick preemption to keep its clock alive. */
 }
 
+/* RT-2b: 8259 spurious IRQ7/IRQ15 handlers. On real hardware the PIC raises
+ * IRQ7 (master) or IRQ15 (slave) when an IRQ line is withdrawn between the
+ * CPU's interrupt-acknowledge cycles -- a "spurious" interrupt that carries
+ * no In-Service bit and needs no EOI. hype masks every line but the timer, so
+ * any IRQ7/IRQ15 that arrives is spurious; without a registered handler
+ * hype_isr_dispatch() would hype_fatal() on the vector (seen on real HW:
+ * "unhandled interrupt vector=39" while the guest mounted its root fs --
+ * invisible under QEMU, whose 8259 model never generates spurious IRQs). */
+static void hype_spurious_irq7_isr(const hype_isr_frame_t *frame) {
+    (void)frame;
+    /* A real IRQ7 sets master ISR bit 7 -> EOI it; a spurious one does not. */
+    if (hype_pic_read_master_isr() & 0x80u) {
+        hype_pic_send_eoi(7);
+    }
+}
+
+static void hype_spurious_irq15_isr(const hype_isr_frame_t *frame) {
+    (void)frame;
+    /* A real IRQ15 sets slave ISR bit 7 -> EOI both PICs; a spurious one still
+     * asserted the master's IRQ2 cascade, so EOI the master only. */
+    if (hype_pic_read_slave_isr() & 0x80u) {
+        hype_pic_send_eoi(15);
+    } else {
+        hype_pic_send_eoi(2);
+    }
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -6706,6 +6757,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_lapic_mask_timer((volatile uint32_t *)HYPE_LAPIC_DEFAULT_BASE);
     hype_pic_remap_and_mask_all(HYPE_TIMER_VECTOR);
     hype_isr_register(HYPE_TIMER_VECTOR, hype_timer_isr);
+    /* RT-2b: register the 8259 spurious-IRQ handlers (IRQ7 -> vector base+7,
+     * IRQ15 -> base+15) before sti, so a spurious interrupt from the real PIC
+     * is absorbed per the 8259 protocol instead of reaching hype_fatal(). */
+    hype_isr_register((uint8_t)(HYPE_TIMER_VECTOR + 7), hype_spurious_irq7_isr);
+    hype_isr_register((uint8_t)(HYPE_TIMER_VECTOR + 15), hype_spurious_irq15_isr);
     hype_pic_unmask_irq(HYPE_TIMER_IRQ);
     hype_pit_init(1000);
     /* INPUT-3: host-level keyboard ownership -- must happen here too,
