@@ -4722,6 +4722,26 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * HYPE_SVM_EXITCODE_SHUTDOWN. */
     hype_svm_vcpu_set_exception_intercepts(ctx, 0);
 
+    /* M4-6d4 #5: bound the guest's uninterrupted execution via SVM PAUSE-
+     * filtering. Real HW showed a single 40s VMRUN with zero exits (PREEMPT
+     * probe): a tickless guest busy-waiting on cpu_relax (PAUSE) runs with
+     * no intercept, so we never regain control to inject its timer tick and
+     * its jiffies freeze (the soft lockups). With filtering armed, a spin
+     * exits via EXITCODE_PAUSE after ~count PAUSEs; the loop-top timebase
+     * advance then injects any due tick, so jiffies keep moving and the wait
+     * completes. count=65535 (max of the 16-bit field, ~ms-scale between
+     * exits -- fine enough for the 10ms tick, minimal overhead); only when
+     * the CPU/hypervisor exposes it (else INTERCEPT_PAUSE would trap EVERY
+     * pause). Proven in isolation by run_pause_filter_test. */
+    if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
+        hype_svm_vcpu_enable_pause_filter(ctx, 65535u, 4096u);
+        hype_debug_print("fw-1: SVM pause-filtering armed (count=65535) -- guest spin loops now "
+                          "yield control for tick injection\n");
+    } else {
+        hype_debug_print("fw-1: pause-filtering unavailable -- a long guest spin can still starve "
+                          "its own tick here\n");
+    }
+
     {
     unsigned long long productive_exits = 0;
     unsigned long long total_exits = 0;
@@ -4733,7 +4753,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * increments -- no per-exit formatting. */
     unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
                        ex_other = 0;
-    unsigned long long ex_io80 = 0, ex_ahci_npf = 0;
+    unsigned long long ex_io80 = 0, ex_ahci_npf = 0, ex_pause = 0;
     uint64_t last_exhist_tsc = 0;
     int booted = 0;
     hype_vt_filter_t uart_filter;
@@ -4843,6 +4863,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             case HYPE_SVM_EXITCODE_MSR:   ex_msr++;   break;
             case HYPE_SVM_EXITCODE_CPUID: ex_cpuid++; break;
             case HYPE_SVM_EXITCODE_VINTR: ex_vintr++; break;
+            case HYPE_SVM_EXITCODE_PAUSE: ex_pause++; break;
             default:                      ex_other++; break;
         }
         /* Dump the histogram every ~5s of wall-clock. The periodic flush
@@ -4853,9 +4874,9 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             if (last_exhist_tsc == 0 || now_eh - last_exhist_tsc >= 5ULL * g_fw_1_host_tsc_hz) {
                 last_exhist_tsc = now_eh;
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
-                                 "msr=%llu cpuid=%llu vintr=%llu other=%llu\n",
+                                 "msr=%llu cpuid=%llu vintr=%llu pause=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
-                                 ex_cpuid, ex_vintr, ex_other);
+                                 ex_cpuid, ex_vintr, ex_pause, ex_other);
                 /* M4-6d4: mean per-exit cost split VMRUN world-switch vs our
                  * loop body, in nanoseconds (TSC / host_tsc_hz * 1e9). Tells
                  * whether the ~219us/exit is the CPU's world-switch (VMRUN
@@ -5210,6 +5231,16 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             key_reacted = 1;
         }
 
+        if (info.reason == HYPE_SVM_EXITCODE_PAUSE) {
+            /* M4-6d4 #5: pause-filter tripped -- the guest was spinning on
+             * PAUSE (cpu_relax). We've simply regained control; the loop-top
+             * timebase advance + PIC/timer injection already ran this
+             * iteration, so any tick due by elapsed real time is now staged
+             * for the guest. Just resume -- that keeps the guest's jiffies
+             * advancing during the spin instead of freezing for tens of
+             * seconds. */
+            continue;
+        }
         if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
             hype_svm_vcpu_handle_cpuid(ctx);
             continue;
