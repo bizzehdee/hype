@@ -3518,6 +3518,47 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
 ## M8 — Multi-VM concurrency, dashboard, lifecycle control, fault isolation
 ## (plan.md §9 M8, §6b, §6f, §6g, §10 decisions #11/#12)
 
+- [ ] **M8-0** — VM-instance struct: de-globalize the single hardcoded
+  guest into an N-instance model. This is the load-bearing prerequisite
+  for ALL of M8 -- surfaced by scoping "run two Alpine VMs concurrently"
+  (2026-07-18): the config layer (hype.cfg `vms[16]`, M1-1) and admission
+  control (ADM, sums mem_mb/vcpus across all VMs) are already multi-VM,
+  but the guest itself is a singleton. boot/main.c's FW-1 path holds ~36
+  `g_fw_1_*` device globals (UARTx2, PIC, PIT, AHCI, ATAPI, PCI, LAPIC,
+  CMOS, fw_cfg, DMA-map) plus one VMCB/vCPU, one guest-RAM region, and one
+  NPT, and it ignores `cfg.vms[]` (uses hardcoded constants), dispatched
+  to a single pinned AP.
+  Scope: collect all per-guest state into one `hype_vm_t` struct (device
+  models + vCPU ctx + RAM base/size + NPT root + per-VM console buffers +
+  the FW-1 loop's local bookkeeping), replace the `g_fw_1_*` globals with
+  a `hype_vm_t vms[HYPE_CFG_MAX_VMS]` array driven by `cfg.vm_count`, and
+  make the FW-1 loop a function over a `hype_vm_t *` rather than reaching
+  globals. NO behavior change for the single-VM case -- one populated
+  `hype_vm_t` must boot Alpine to login byte-for-byte as today (the
+  regression bar). Mechanical (globals -> struct fields) but large; do it
+  as its own step so RAM/dispatch/console work builds on a clean instance
+  model. Deps: M4-6 (single-guest path complete), M1-1, ADM-1.
+- [ ] **M8-0a** — Per-VM RAM + NPT allocation: loop RAM-1/RAM-2's
+  allocation over `cfg.vms[]` so each `hype_vm_t` gets its own AllocatePages
+  region (sized from that VM's `mem_mb`) and its own NPT root, instead of
+  the one region/NPT built today. Admission (ADM) already validated the
+  totals fit. Deps: M8-0, RAM-2.
+- [ ] **M8-0b** — Concurrent dispatch on dedicated pCPUs: launch each
+  `hype_vm_t`'s vCPU on its own pinned pCPU (extend the single
+  `hype_mp_pick_target_ap`/StartupThisAP dispatch and M3-2's 1:1 pinning
+  to N VMs). One core per VM -- no scheduler needed while pCPUs are not
+  oversubscribed (a time-slicing scheduler is a later task, only for
+  oversubscription). This is what actually makes two guests run at the
+  same time. Deps: M8-0, M8-0a, M3-2.
+- [ ] **M8-0c** — Per-VM console separation: today both guests' consoles
+  would collide on the one GOP/serial/log. Give each `hype_vm_t` its own
+  console capture (per-VM logbuf + serial tag); a viewer/switcher is
+  M8-1/M8-3's dashboard, but minimal separation (distinct \hype-log-N.txt
+  + serial prefixes) is enough to see two VMs booting. Deps: M8-0.
+  *Together M8-0..0c are the minimal "two Alpine live-ISO boots
+  concurrently" subset -- they do NOT need NET/M5/M6/M7 (installs, other
+  OS families) which sit before the rest of M8 on the full critical path.*
+
 - [ ] **M8-1** — Dashboard rendering: per-VM name/os_hint/state/vCPU
   utilization/memory/uptime/boot-media list.
   Deps: VIDEO-1
