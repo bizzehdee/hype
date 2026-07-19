@@ -4507,3 +4507,7 @@ virtio-blk boot) is deferred behind the multi-core milestone per this
 direction. alpine-standard-under-hype was tried once (278MB ISO) then
 reverted to alpine-virt to keep the milestone path clean.
 
+M8-0b-ii STEP 1 HW-CONFIRMED (2026-07-19): real AMD silicon shows "fw-1 CORE:
+run_fw_1_test executing on apic_id=1" -- the FW-1 alpine-virt guest genuinely
+runs on the dedicated AP core (not a BSP fallback). One-alpine-on-its-own-AP is
+done end-to-end on HW. Proceeding to STEP 2: two alpines on two APs.
