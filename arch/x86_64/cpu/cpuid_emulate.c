@@ -5,6 +5,7 @@
 #define HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT (1u << 24)
 #define HYPE_CPUID_EXT1_ECX_SVM_BIT (1u << 2)
 #define HYPE_CPUID_EXT7_EDX_INVARIANT_TSC_BIT (1u << 8)
+#define HYPE_CPUID_LEAF6_EAX_ARAT_BIT (1u << 2)
 
 static void zero_result(hype_cpuid_result_t *out) {
     out->eax = 0;
@@ -40,6 +41,25 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
          * and inject. */
         out->ecx = (real->ecx | HYPE_CPUID_HYPERVISOR_PRESENT_BIT) &
                    ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT;
+        return;
+    }
+
+    if (eax_in == 6) {
+        /* M4-6b5 (b5c): Thermal & Power Management leaf. Advertise ONLY ARAT
+         * (Always Running APIC Timer, EAX bit 2). hype's virtual guest LAPIC
+         * timer is advanced from real elapsed time on every VM-exit,
+         * independent of the guest's idle/C-state -- so it never stops, which
+         * is exactly what ARAT asserts. Without this bit Linux flags the LAPIC
+         * timer CLOCK_EVT_FEAT_C3STOP (assumes it halts in deep idle) and hands
+         * IDLE timekeeping to the 100 Hz PIT broadcast device -> 10 ms-quantised
+         * idle wakeups -> the ~22x-slow real-HW boot (confirmed: the guest arms
+         * the LAPIC timer then re-masks it into broadcast mode). All
+         * thermal/power-management bits stay 0 -- unmodeled, not
+         * guest-isolation-relevant. */
+        out->eax = HYPE_CPUID_LEAF6_EAX_ARAT_BIT;
+        out->ebx = 0;
+        out->ecx = 0;
+        out->edx = 0;
         return;
     }
 

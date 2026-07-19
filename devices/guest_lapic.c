@@ -12,6 +12,7 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->current_count = 0;
     lapic->tick_accum = 0;
     lapic->divide_accum = 0;
+    lapic->lvt_timer_armed_seen = 0;
     lapic->timer_irq_pending = 0;
     lapic->timer_in_service = 0;
 }
@@ -84,6 +85,12 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
             return 0;
         case HYPE_GUEST_LAPIC_REG_LVT_TIMER:
             lapic->lvt_timer = value;
+            /* M4-6b5 diag: record if the guest ever unmasked the timer LVT
+             * (a real vector, mask bit clear) -- i.e. actually tried to use
+             * the LAPIC timer as a clockevent, vs never touching it. */
+            if ((value & HYPE_GUEST_LAPIC_LVT_MASKED) == 0) {
+                lapic->lvt_timer_armed_seen = value;
+            }
             return 0;
         case HYPE_GUEST_LAPIC_REG_LVT_LINT0:
             lapic->lvt_lint0 = value;

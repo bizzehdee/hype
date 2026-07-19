@@ -5089,6 +5089,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                  * diagnostic -- no guest-visible state changes. */
                 hype_debug_print("fw-1 TIMERHIST: pit_irq0=%llu lapic_irq=%llu ahci_irq=%llu | "
                                  "PIT0 mode=%u reload=%u counter=%u | LAPIC lvt=0x%x(%s) init=%u cur=%u | "
+                                 "svr=0x%x dcr=0x%x ever_armed=0x%x | "
                                  "mIMR=0x%x sIMR=0x%x mISR=0x%x sISR=0x%x\n",
                                  (unsigned long long)pit_irqs, (unsigned long long)timer_irqs,
                                  (unsigned long long)ahci_irqs,
@@ -5103,6 +5104,14 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                             : "1shot"),
                                  (unsigned int)g_fw_1_lapic.init_count,
                                  (unsigned int)g_fw_1_lapic.current_count,
+                                 /* M4-6b5 diag: svr bit 8 = APIC software-enabled;
+                                  * ever_armed != 0 => the guest DID unmask the timer
+                                  * LVT at some point (tried it, then re-masked =>
+                                  * calibration/reject); ever_armed == 0 => it never
+                                  * armed the LAPIC timer (fully-legacy PIT). */
+                                 (unsigned int)g_fw_1_lapic.svr,
+                                 (unsigned int)g_fw_1_lapic.divide_config,
+                                 (unsigned int)g_fw_1_lapic.lvt_timer_armed_seen,
                                  (unsigned int)g_fw_1_pic.master.imr, (unsigned int)g_fw_1_pic.slave.imr,
                                  (unsigned int)g_fw_1_pic.master.isr, (unsigned int)g_fw_1_pic.slave.isr);
             }

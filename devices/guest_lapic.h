@@ -79,6 +79,10 @@ typedef struct {
     uint32_t tick_accum;   /* VM-exits since the last synthetic expiry */
     uint64_t divide_accum; /* M4-6b5: fractional carry when dividing the base-rate
                             * advance by the guest's divide_config divisor */
+    uint32_t lvt_timer_armed_seen; /* M4-6b5 diag: last LVT_TIMER value the guest
+                                    * wrote with the mask bit CLEAR (0 if it never
+                                    * armed the timer -- tells "never tried" from
+                                    * "tried then re-masked") */
     int timer_irq_pending; /* a timer IRQ is due but not yet delivered */
     int timer_in_service;  /* delivered, awaiting guest EOI -- at most one in flight */
 } hype_guest_lapic_t;
