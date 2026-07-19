@@ -4650,3 +4650,31 @@ SO for boot time the lever is SERIAL. Safe wins (no hardware-access breach):
   stays REJECTED. TODO: capture the SAME build's IOHIST on real HW (vmrun cost is
   ~440-680us there, so exit-count x cost is the real wall-clock) to confirm the
   distribution holds on silicon.
+
+PERF-1 SAME-BUILD HW HISTOGRAM (2026-07-19): the QEMU-vs-HW compare the expert
+asked for. On real silicon (vm0 total=422191, fuller boot than the early QEMU
+snapshot) the IOIO leader is the INTERRUPT/TIMER MACHINERY, not serial:
+  8259 PIC: 0x21=102565 + 0x20=34903 + 0xa1=2173 = 139641 (33%)  <-- #1
+  PIT ch0:  0x40=67576 (16%)
+  io_delay: 0x80=67578 (16%, an outb_p delay write after each PIC/PIT out)
+  serial COM1: 0x3fd/0x3f8/0x3fe/0x3fa = 93789 (22%); COM2: 0x2fd/0x2f8 = 32539 (8%)
+PIC+PIT+io_delay = ~65% of IOIO. TIMERHIST explains it: pit_irq0=34002 vs
+lapic_irq=540 -- the guest uses the legacy PIT as its CLOCKEVENT and services
+every tick through the 8259 (mask->EOI->unmask = ~3 PIC port accesses/IRQ, each
+an outb_p that also writes 0x80). My earlier "serial dominates" read was an
+early-phase QEMU artifact; the HW fuller-boot truth is interrupt machinery.
+THE REAL LEVER (architectural, not metric-gaming): IO-APIC + MSI (M4-6b3, already
+a PLANNED pending task) -- the guest handles the same IRQs without the per-tick
+8259 mask/EOI port dance, killing the #1 source (~140k PIC exits) + the io_delay
+that trails it. Secondary: a real LAPIC-timer/TSC-deadline clockevent (M4-6b5)
+to stop using the PIT (0x40=67k). Then virtio-console (serial ~126k) and
+virtio-blk (AHCI NPF ~16k). port-0x80 passthrough stays REJECTED.
+SEPARATE BIG UNKNOWN: COSTHIST vmrun_tot~350s vs body_tot~70s of ~453s elapsed,
+with max_single_vmrun=13-14s and vmruns_over_100ms=13-18. At least one ~13s
+single VMRUN (guest ran 13s with nothing forcing an exit = almost certainly a
+SPIN) per VM. The guest EXECUTION time (350s vmrun) is ~4x native (90s), which
+reducing EXIT COUNT alone (IO-APIC/virtio cut the ~70s body) will NOT fully
+explain -- the giant stalls + any exit-induced execution slowdown are a distinct,
+possibly larger lever. MEASURE-FIRST NEXT: instrument long VMRUNs (>50ms: capture
+guest RIP + preceding exit reason) to learn what the 13s stall is, BEFORE
+committing to the IO-APIC build.
