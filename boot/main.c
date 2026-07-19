@@ -5331,6 +5331,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     (unsigned long long)g_fw_1_ap_cr3, (unsigned long long)g_ap_cr3,
                     (unsigned int)g_hype_ap_last_phase, (unsigned int)g_hype_ap_c_alive,
                     (unsigned int)g_fw_1_ap_svm_ok);
+                /* DEFINITIVE which-core check: the physical LAPIC ID (reg 0x20,
+                 * bits 31:24) of the core actually executing this dispatch loop.
+                 * BSP = 0, AP = 1. Removes all doubt about whether the guest is
+                 * on the dedicated core. */
+                {
+                    uint32_t exec_apic_id =
+                        (*(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + 0x20u)) >> 24;
+                    hype_debug_print("fw-1 CORE: run_fw_1_test executing on apic_id=%u (0=BSP 1=AP)\n",
+                                     (unsigned int)exec_apic_id);
+                }
             }
         }
 
