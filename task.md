@@ -4733,3 +4733,28 @@ debates above):
 IO-APIC is a GOOD follow-up (not deprioritised on merit); it just is not the
 immediate step. Immediate priority = one-shot host timer + long-VMRUN
 instrumentation. port-0x80 passthrough stays rejected.
+
+PERF-1 STEP 1 RESULT (2026-07-19, HW LONGVMRUN capture): the ~13s stalls are
+CLASSIFIED as MISSED HOST TICKS, not guest busy-spins. Decoded (0x7b=IOIO,
+0x72=CPUID, 0x60=INTR):
+  vm0: 13623ms@0x835631 r0x7b<-0x7b, 2557ms, 1826ms r0x72, 572ms, 408ms
+  vm1: 14116ms@0x835631 r0x7b<-0x7b, 3404ms, 1943ms r0x72, 582ms, 522ms
+DECISIVE: the 13.6s VMRUN exits on IOIO, NOT INTR. If hype's 1kHz forced AP
+preemption timer were firing, no single VMRUN could exceed ~1ms (it would exit
+r0x60 within a millisecond). Instead the guest runs 13.6s UNINTERRUPTED and only
+exits when IT does an I/O -> hype's periodic timer is NOT preempting during the
+stall. RECOVER confirms the effect: irq0_pending_undelivered=2859-3119ms (guest
+jiffies ~3s behind). Stalls cluster at driver-load / "Mounting boot media"
+(libata/ATAPI CD probe via PIO0), where the kernel does jiffy-based waits that
+balloon because jiffies are frozen while hype isn't preempting. Both VMs exit
+the big stall at the SAME fixed low RIP 0x835631 (non-KASLR -> a specific,
+reproducible routine; resolve vs guest System.map later).
+IMPLICATION for step 2: the current PERIODIC 1ms AP LAPIC timer is not merely
+wasteful -- it is UNRELIABLE (misses for up to 13.6s). The one-shot deadline
+timer must GUARANTEE it fires even mid-long-guest-run. Sub-investigation before/
+with step 2: WHY the current AP LAPIC timer misses -- leading suspects: a
+GIF/STGI window leaving host interrupts masked across a long stretch, or the
+periodic LVT not reliably re-arming/firing (varying gap lengths 0.4-14s, and
+vm0!=vm1, argue against a fixed mis-calibrated period). This is the crux: a
+deadline timer that inherits the same miss bug would not help. FIX the miss,
+then make it deadline-driven.
