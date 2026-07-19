@@ -4462,3 +4462,22 @@ AWAITING HW: soft-lockups gone. THEN: the SPIN investigation (why ~320s in
 VMRUN on BOTH cores -- the real PERF-1; leads: sysvec_call_function hotspot,
 timer/IPI latency, possible guest-SMP-config issue).
 
+PERF-1 REFRAMED (native baseline, 2026-07-19): booted the SAME alpine-virt
+3.21.7 ISO NATIVELY on the laptop via Ventoy (no hype) = 90s (1:30) to
+login. hype (guest on the AP) = ~347s. So the REAL gap is ~3.9x, NOT the
+~60x we assumed against a guessed "native = seconds" baseline. The alpine-
+virt DISKLESS boot is genuinely heavy on this machine (copy ISO to RAM,
+squashfs, apk-install 25 pkgs to tmpfs) -- 90s native is the honest
+baseline. ~4x for a from-scratch trap-and-emulate hypervisor is reasonable,
+not alarming. Also: hype serves the ISO from RAM while Ventoy reads USB, so
+hype has the FASTER media and is still 4x slower => the 4x is PURE
+trap-and-emulate I/O-VMEXIT overhead, not media. NOT a spin (kvmclock
+accurate vs stopwatch; MADT=1 CPU, no phantom SMP; the sysvec_call_function
+"hotspot" was a __pfx symbol-resolution artifact). Exit counts point at I/O:
+io80=65416 (port-0x80 outb_p delay writes -- pure-overhead VMEXITs, killable
+by not intercepting port 0x80), ioio=414278 total (likely serial-console
+per-byte OUT 0x3F8 + PCI cfg + AHCI), npf(ahci)=15974 (emulated-CD MMIO).
+NEXT: per-port IOIO histogram to find the biggest lever + port-0x80
+passthrough; then batch ATAPI/AHCI or boot from virtio-blk instead of the
+chatty emulated CD. This is the real PERF-1 target now.
+
