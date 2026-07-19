@@ -38,8 +38,26 @@ struct hype_vcpu_ctx {
     uint64_t gprs[16];
 };
 
-static hype_vmcb_t g_vmcb __attribute__((aligned(4096)));
-static struct hype_vcpu_ctx g_ctx;
+/* M8-0b-ii: per-vCPU state pool. Was a single g_vmcb/g_ctx (M2's one-vCPU
+ * scope); now one slot per concurrent vCPU so a second guest can run on the AP
+ * (VM0 on the BSP = slot 0, VM1 on the AP = slot 1). VMCB is architecturally
+ * 4KB, so aligning the array to 4KB keeps every element page-aligned (the
+ * _Static_assert guards that). iopm/msrpm below stay shared -- they are
+ * read-only permission maps and every guest wants the same policy. */
+#define HYPE_SVM_MAX_VCPUS 2u
+static hype_vmcb_t g_vmcb_pool[HYPE_SVM_MAX_VCPUS] __attribute__((aligned(4096)));
+static struct hype_vcpu_ctx g_ctx_pool[HYPE_SVM_MAX_VCPUS];
+static unsigned g_vcpu_count;
+_Static_assert(sizeof(hype_vmcb_t) == 4096, "VMCB must be 4KB for per-element page alignment");
+
+/* Allocates the next vCPU slot. The two concurrent guests (BSP + AP) take
+ * slots 0 and 1; the gated-off self-test guests run sequentially and safely
+ * reuse the last slot beyond that. */
+static unsigned svm_alloc_vcpu_slot(void) {
+    unsigned slot = (g_vcpu_count < HYPE_SVM_MAX_VCPUS) ? g_vcpu_count : (HYPE_SVM_MAX_VCPUS - 1u);
+    g_vcpu_count++;
+    return slot;
+}
 
 /* AMD SDM: 12KB I/O permission map, 8KB MSR permission map -- VMRUN
  * always consults both, for every guest, regardless of whether it
@@ -99,55 +117,76 @@ static inline void vmload(uint64_t vmcb_phys) {
  * are needed since this template uses each register as fixed scratch
  * space the compiler's own register allocator has no visibility into.
  */
-static inline void vmrun_full(uint64_t vmcb_phys) {
+/*
+ * The GPR save/restore uses "+m" operands bound to a SPECIFIC pool slot's
+ * gprs[] -- i.e. a static (absolute) address. That is deliberate and load-
+ * bearing: the guest clobbers every GPR, so all of them are in the clobber
+ * list, leaving the compiler no free register to hold a `ctx` pointer for
+ * base+displacement addressing. A static operand needs no base register.
+ * Rather than hand-juggle a ctx pointer across VMRUN on the stack (fragile),
+ * this macro instantiates the register-free body once per pool slot and
+ * vmrun_full() dispatches to the right one. Extend the dispatch if
+ * HYPE_SVM_MAX_VCPUS grows.
+ */
+#define HYPE_VMRUN_BODY(CTX, RAXVAR)                                                               \
+    __asm__ volatile("mov %[rcx], %%rcx\n\t"                                                      \
+                     "mov %[rdx], %%rdx\n\t"                                                      \
+                     "mov %[rbx], %%rbx\n\t"                                                      \
+                     "mov %[rbp], %%rbp\n\t"                                                      \
+                     "mov %[rsi], %%rsi\n\t"                                                      \
+                     "mov %[rdi], %%rdi\n\t"                                                      \
+                     "mov %[r8], %%r8\n\t"                                                        \
+                     "mov %[r9], %%r9\n\t"                                                        \
+                     "mov %[r10], %%r10\n\t"                                                      \
+                     "mov %[r11], %%r11\n\t"                                                      \
+                     "mov %[r12], %%r12\n\t"                                                      \
+                     "mov %[r13], %%r13\n\t"                                                      \
+                     "mov %[r14], %%r14\n\t"                                                      \
+                     "mov %[r15], %%r15\n\t"                                                      \
+                     "vmrun %%rax\n\t"                                                            \
+                     "mov %%rcx, %[rcx]\n\t"                                                      \
+                     "mov %%rdx, %[rdx]\n\t"                                                      \
+                     "mov %%rbx, %[rbx]\n\t"                                                      \
+                     "mov %%rbp, %[rbp]\n\t"                                                      \
+                     "mov %%rsi, %[rsi]\n\t"                                                      \
+                     "mov %%rdi, %[rdi]\n\t"                                                      \
+                     "mov %%r8, %[r8]\n\t"                                                        \
+                     "mov %%r9, %[r9]\n\t"                                                        \
+                     "mov %%r10, %[r10]\n\t"                                                      \
+                     "mov %%r11, %[r11]\n\t"                                                      \
+                     "mov %%r12, %[r12]\n\t"                                                      \
+                     "mov %%r13, %[r13]\n\t"                                                      \
+                     "mov %%r14, %[r14]\n\t"                                                      \
+                     "mov %%r15, %[r15]\n\t"                                                      \
+                     : "+a"(RAXVAR), [rcx] "+m"((CTX).gprs[1]), [rdx] "+m"((CTX).gprs[2]),        \
+                       [rbx] "+m"((CTX).gprs[3]), [rbp] "+m"((CTX).gprs[5]),                      \
+                       [rsi] "+m"((CTX).gprs[6]), [rdi] "+m"((CTX).gprs[7]),                      \
+                       [r8] "+m"((CTX).gprs[8]), [r9] "+m"((CTX).gprs[9]),                        \
+                       [r10] "+m"((CTX).gprs[10]), [r11] "+m"((CTX).gprs[11]),                    \
+                       [r12] "+m"((CTX).gprs[12]), [r13] "+m"((CTX).gprs[13]),                    \
+                       [r14] "+m"((CTX).gprs[14]), [r15] "+m"((CTX).gprs[15])                     \
+                     :                                                                            \
+                     : "memory", "cc", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9",      \
+                       "r10", "r11", "r12", "r13", "r14", "r15")
+
+static inline void vmrun_full(struct hype_vcpu_ctx *ctx, uint64_t vmcb_phys) {
     uint64_t clobbered_rax = vmcb_phys;
-    __asm__ volatile("mov %[rcx], %%rcx\n\t"
-                      "mov %[rdx], %%rdx\n\t"
-                      "mov %[rbx], %%rbx\n\t"
-                      "mov %[rbp], %%rbp\n\t"
-                      "mov %[rsi], %%rsi\n\t"
-                      "mov %[rdi], %%rdi\n\t"
-                      "mov %[r8], %%r8\n\t"
-                      "mov %[r9], %%r9\n\t"
-                      "mov %[r10], %%r10\n\t"
-                      "mov %[r11], %%r11\n\t"
-                      "mov %[r12], %%r12\n\t"
-                      "mov %[r13], %%r13\n\t"
-                      "mov %[r14], %%r14\n\t"
-                      "mov %[r15], %%r15\n\t"
-                      "vmrun %%rax\n\t"
-                      "mov %%rcx, %[rcx]\n\t"
-                      "mov %%rdx, %[rdx]\n\t"
-                      "mov %%rbx, %[rbx]\n\t"
-                      "mov %%rbp, %[rbp]\n\t"
-                      "mov %%rsi, %[rsi]\n\t"
-                      "mov %%rdi, %[rdi]\n\t"
-                      "mov %%r8, %[r8]\n\t"
-                      "mov %%r9, %[r9]\n\t"
-                      "mov %%r10, %[r10]\n\t"
-                      "mov %%r11, %[r11]\n\t"
-                      "mov %%r12, %[r12]\n\t"
-                      "mov %%r13, %[r13]\n\t"
-                      "mov %%r14, %[r14]\n\t"
-                      "mov %%r15, %[r15]\n\t"
-                      : "+a"(clobbered_rax), [rcx] "+m"(g_ctx.gprs[1]), [rdx] "+m"(g_ctx.gprs[2]),
-                        [rbx] "+m"(g_ctx.gprs[3]), [rbp] "+m"(g_ctx.gprs[5]), [rsi] "+m"(g_ctx.gprs[6]),
-                        [rdi] "+m"(g_ctx.gprs[7]), [r8] "+m"(g_ctx.gprs[8]), [r9] "+m"(g_ctx.gprs[9]),
-                        [r10] "+m"(g_ctx.gprs[10]), [r11] "+m"(g_ctx.gprs[11]), [r12] "+m"(g_ctx.gprs[12]),
-                        [r13] "+m"(g_ctx.gprs[13]), [r14] "+m"(g_ctx.gprs[14]), [r15] "+m"(g_ctx.gprs[15])
-                      :
-                      : "memory", "cc", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10",
-                        "r11", "r12", "r13", "r14", "r15");
+    /* Dispatch to the register-free body for this ctx's static pool slot. */
+    if (ctx == &g_ctx_pool[0]) {
+        HYPE_VMRUN_BODY(g_ctx_pool[0], clobbered_rax);
+    } else {
+        HYPE_VMRUN_BODY(g_ctx_pool[1], clobbered_rax);
+    }
 }
 
 static inline void vmsave(uint64_t vmcb_phys) {
     __asm__ volatile("vmsave %%rax" : : "a"(vmcb_phys) : "memory");
 }
 
-static void reset_gprs(void) {
+static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     unsigned i;
     for (i = 0; i < 16; i++) {
-        g_ctx.gprs[i] = 0;
+        ctx->gprs[i] = 0;
     }
 }
 
@@ -216,6 +255,9 @@ static void configure_guest_msrpm(uint8_t *msrpm) {
 
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root) {
     unsigned i;
+    unsigned slot = svm_alloc_vcpu_slot();
+    hype_vmcb_t *vmcb = &g_vmcb_pool[slot];
+    struct hype_vcpu_ctx *ctx = &g_ctx_pool[slot];
 
     /* FW-1: this guest now sets HYPE_SVM_INTERCEPT_IOIO_PROT too
      * (hype_vmcb_build_realmode_guest()) -- a real firmware guest does
@@ -233,7 +275,7 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, ui
      * Linux) can use FS/GS base + syscall/sysenter MSRs natively. */
     configure_guest_msrpm(g_msrpm);
 
-    hype_vmcb_build_realmode_guest(&g_vmcb, guest_rip, guest_rsp, (uint64_t)(uintptr_t)g_iopm,
+    hype_vmcb_build_realmode_guest(vmcb, guest_rip, guest_rsp, (uint64_t)(uintptr_t)g_iopm,
                                     (uint64_t)(uintptr_t)g_msrpm);
 
     /* 0 means "no nested paging" (M2's original, still-supported
@@ -241,17 +283,20 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, ui
      * physical address. See vmcb.h's HYPE_SVM_INT_CTL_AVIC_ENABLE
      * comment: AVIC additionally requires this to have been called. */
     if (ept_or_npt_root != 0) {
-        hype_vmcb_enable_nested_paging(&g_vmcb, ept_or_npt_root);
+        hype_vmcb_enable_nested_paging(vmcb, ept_or_npt_root);
     }
 
-    g_ctx.vmcb = &g_vmcb;
-    reset_gprs();
-    return &g_ctx;
+    ctx->vmcb = vmcb;
+    reset_gprs(ctx);
+    return ctx;
 }
 
 hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t guest_cr3, uint64_t rsp,
                                                  uint64_t npt_root) {
     unsigned i;
+    unsigned slot = svm_alloc_vcpu_slot();
+    hype_vmcb_t *vmcb = &g_vmcb_pool[slot];
+    struct hype_vcpu_ctx *ctx = &g_ctx_pool[slot];
 
     /* This guest sets HYPE_SVM_INTERCEPT_IOIO_PROT (unlike the
      * real-mode guest, which never checks the IOPM at all) -- that
@@ -275,16 +320,16 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
      * test guests, which never touch those MSRs). */
     configure_guest_msrpm(g_msrpm);
 
-    hype_vmcb_build_long_mode_guest(&g_vmcb, entry_rip, guest_cr3, rsp, (uint64_t)(uintptr_t)g_iopm,
+    hype_vmcb_build_long_mode_guest(vmcb, entry_rip, guest_cr3, rsp, (uint64_t)(uintptr_t)g_iopm,
                                      (uint64_t)(uintptr_t)g_msrpm);
 
     if (npt_root != 0) {
-        hype_vmcb_enable_nested_paging(&g_vmcb, npt_root);
+        hype_vmcb_enable_nested_paging(vmcb, npt_root);
     }
 
-    g_ctx.vmcb = &g_vmcb;
-    reset_gprs();
-    return &g_ctx;
+    ctx->vmcb = vmcb;
+    reset_gprs(ctx);
+    return ctx;
 }
 
 void hype_svm_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi) {
@@ -2046,7 +2091,7 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     }
     clgi();
     vmload(vmcb_phys);
-    vmrun_full(vmcb_phys);
+    vmrun_full(real, vmcb_phys);
     if (g_vmrun_trace) {
         hype_debug_print("svm: VMRUN returned -- about to VMSAVE/STGI...\n");
     }

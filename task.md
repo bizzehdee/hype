@@ -4396,3 +4396,19 @@ page-table root, hype GDT/IDT loaded, SVM enabled -- all without faulting.
 The >4GB image-placement difference (only visible on HW) is handled. AP is
 genuinely ready to VMRUN. Proceeding to increment 3.
 
+M8-0b-ii increment 3 (2026-07-19): de-globalized the vCPU core so the AP
+can run its OWN guest. Was a single static g_vmcb/g_ctx (M2 one-vCPU scope);
+now g_vmcb_pool[HYPE_SVM_MAX_VCPUS=2] + g_ctx_pool[2] + svm_alloc_vcpu_slot
+(BSP=slot0, AP=slot1; gated-off sequential self-tests reuse the last slot).
+create()/create_long_mode() allocate a slot; reset_gprs(ctx) + vmrun_full(
+ctx,...) take the ctx. iopm/msrpm stay shared (read-only permission maps).
+TRICKY BIT: vmrun_full's GPR save/restore "+m" operands must be STATIC
+addresses -- the guest clobbers every GPR, so no register is free to hold a
+ctx pointer for base+disp addressing (clang errored "inline assembly
+requires more registers than available" on the naive ctx->gprs[] version).
+Fix: HYPE_VMRUN_BODY macro instantiates the register-free body per static
+pool slot; vmrun_full dispatches by ctx==&g_ctx_pool[i]. _Static_assert keeps
+VMCB=4KB so pool elements stay page-aligned. NEXT (inc 4): allocate g_vms[1]
+resources (or run g_vms[0] on the AP for the perf test); then inc 5 the
+dedicated-core guest-timer + console.
+
