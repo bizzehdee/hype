@@ -4529,3 +4529,34 @@ cores writing one unsynchronized UART) -- exactly the collision M8-0c per-VM
 console routing exists to fix. HW-VALIDATION OWED (QEMU proves the logic).
 NEXT (STEP 2b): allocate g_vms[1] resources (2nd OVMF firmware copy + 2nd
 guest RAM) pre-EBS so AP2 has a real VM to run.
+
+M8-0b-ii STEP 2b+2c (2026-07-19, QEMU): two-VM dispatch built + one real
+multi-VM bug found & fixed; a second found & isolated. Landed:
+  - g_vms[1] resources allocated pre-EBS (own OVMF firmware copy via
+    hype_guest_ram_copy from vm0's pristine buffer + own zeroed 1GB RAM;
+    ISO shared read-only). host_tsc_hz reused (same CPU).
+  - fw_1_ap_main parameterized by VM index (arg): AP1->g_vms[0], AP2->g_vms[1],
+    each with its own SVM host-save area (g_ap_hsave[idx]) and LAPIC-timer calib.
+  - AP2 (apic_id=2) now runs fw_1_ap_main(1) under HYPE_RUN_TWO_VMS (else parks).
+  - svm_alloc_vcpu_slot made atomic (__atomic_fetch_add): two cores creating
+    vCPUs simultaneously must get distinct pool slots (0/1), else two cores
+    VMRUN the same VMCB/ctx. CORE diag now tags vm index.
+BUG #1 FIXED (per-vCPU pvclock): g_pvclock_map/system_msr/wall_msr were
+file-global singletons in svm_vcpu.c. VM1's hype_svm_vcpu_set_pvclock clobbered
+VM0's map, so VM0's kvmclock page-fill translated via VM1's dma_map -> VM0's
+pvclock data landed in VM1's RAM, VM0's own page stayed empty -> garbage
+clocksource -> VM0 dead-halt (IF=0 cli;hlt). Moved map+MSR state into the vCPU
+ctx (mul/shift stay global -- shared TSC rate); set_pvclock now takes the ctx
+and is called AFTER vcpu_create. Verified: failure mode changed from "one boots,
+one dead-halts" to "both boot through OVMF".
+BUG #2 OPEN (AHCI IRQ wedge): with the pvclock fix, BOTH guests now boot
+concurrently through OVMF DXE/BDS on their own cores, then wedge at the SAME
+guest-kernel location (rip ...b3bbde, differing only by per-guest KASLR base)
+waiting on an undelivered AHCI IRQ (vec 0x3b, pending=0) before login. Host has
+32 cores so it is NOT oversubscription -- a deterministic 2nd multi-VM bug in
+the AHCI/IRQ-injection path (AHCI IRQs=277 delivered, then the next never
+arrives). HYPE_RUN_TWO_VMS defaulted back to 0 (proven single-VM-on-AP path,
+reaches login, HW-confirmed) until this is fixed. NEXT: debug the AHCI
+completion/IRQ path under two concurrent guests (per-VM ahci/atapi state looks
+isolated; suspect the shared-ISO concurrent-read path or a shared injection
+resource). Then M8-0c per-VM console routing (serial currently garbles).

@@ -27,4 +27,14 @@
  */
 void hype_guest_ram_zero(void *base, uint64_t size);
 
+/*
+ * Copies `size` bytes from `src` to `dst` (both host-physical,
+ * identity-mapped). M8-0b STEP 2 uses this to give a second VM its own
+ * pristine copy of the OVMF firmware image already loaded for the first VM
+ * (each VM needs a private, writable UEFI variable store, so they cannot
+ * share one buffer). Pure -- plain memory copy, no overlap handling needed
+ * (the two guest buffers are always distinct allocations).
+ */
+void hype_guest_ram_copy(void *dst, const void *src, uint64_t size);
+
 #endif /* HYPE_CORE_GUEST_RAM_H */

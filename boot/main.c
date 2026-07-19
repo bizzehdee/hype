@@ -285,14 +285,28 @@ static uint64_t g_usable_ram_bytes;
  * the slow boot (the guest's clock is now kvmclock, so it doesn't need the
  * host-tick-driven timebase). A stepping stone to two Alpines on two cores. */
 #define HYPE_RUN_GUEST_ON_AP 1
+/* M8-0b STEP 2: run TWO Alpines, one per dedicated AP -- g_vms[0] on apic_id=1
+ * and g_vms[1] on apic_id=2, BSP idle. When 0, only g_vms[0] runs on AP1 and
+ * AP2 merely parks (STEP 2a). Requires enough host RAM for two guests (each
+ * HYPE_FW_1_GUEST_RAM_BYTES + its own OVMF copy) -- QEMU needs -m >= 4096.
+ *
+ * STEP 2 STATUS (2026-07-19): with this =1, both guests boot concurrently all
+ * the way through OVMF DXE/BDS on their own cores (AP1/AP2), but then both
+ * wedge at the same guest-kernel location waiting on an undelivered AHCI IRQ
+ * (vec 0x3b) before login -- a SECOND multi-VM bug (in the AHCI/IRQ-injection
+ * path), distinct from the per-vCPU pvclock dead-halt already fixed. Defaulted
+ * to 0 (proven single-VM-on-AP: reaches login, HW-confirmed) until that wedge
+ * is fixed; flip to 1 (with QEMU -m >= 8192, -smp 3) to continue the bring-up. */
+#define HYPE_RUN_TWO_VMS 0
 static uint64_t g_ap_tramp_page;
 static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
 /* Stashed for fw_1_ap_main to run the guest on the AP (set in efi_main). */
 static const hype_vmm_ops_t *g_fw_1_ops;
 static hype_vmm_kind_t g_fw_1_kind;
-/* M8-0b-ii: the AP's own SVM host-save area (SVME/VM_HSAVE_PA are per-core) +
- * a flag the AP sets once it has enabled SVM on its core without faulting. */
-static uint8_t g_ap_hsave[4096] __attribute__((aligned(4096)));
+/* M8-0b-ii: each AP's own SVM host-save area (SVME/VM_HSAVE_PA are per-core, so
+ * two APs VMRUNning concurrently MUST NOT share one) + a flag an AP sets once
+ * it has enabled SVM on its core without faulting. Indexed by VM/AP index. */
+static uint8_t g_ap_hsave[HYPE_FW_MAX_VMS][4096] __attribute__((aligned(4096)));
 static volatile uint32_t g_fw_1_ap_svm_ok;
 /* AP-bring-up result, latched so the diag tick can re-emit it (the one-shot
  * AP-SMOKETEST line prints too early to survive in the 16KB nvlog tail).
@@ -333,7 +347,13 @@ static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
  * -- under HYPE_RUN_GUEST_ON_AP -- runs the FW-1 guest here (the dedicated-core
  * perf experiment). Never returns. */
 static void fw_1_ap_main(void *arg) {
-    (void)arg;
+    /* STEP 2: `arg` is this core's VM index (0 => g_vms[0] on AP1, 1 =>
+     * g_vms[1] on AP2). Selects this core's guest, its own SVM host-save area,
+     * and (below) its host_tsc_hz for the LAPIC-timer calibration. */
+    unsigned vm_idx = (unsigned)(uintptr_t)arg;
+    if (vm_idx >= HYPE_FW_MAX_VMS) {
+        vm_idx = 0u;
+    }
     /* Give the AP a valid host environment before it can VMRUN: hype's own
      * GDT (reloads CS/segments via lretq) and IDT (for any exception during
      * host execution). Both are shared with the BSP -- safe because
@@ -341,7 +361,7 @@ static void fw_1_ap_main(void *arg) {
      * trampoline left the AP on its own flat GDT and no IDT. */
     hype_gdt_load(g_gdt, HYPE_GDT_ENTRY_COUNT);
     hype_idt_load(g_idt, HYPE_IDT_ENTRY_COUNT);
-    hype_svm_enable_on((uint64_t)(uintptr_t)g_ap_hsave); /* faults never return */
+    hype_svm_enable_on((uint64_t)(uintptr_t)g_ap_hsave[vm_idx]); /* faults never return */
     g_fw_1_ap_svm_ok = 1;
     g_hype_ap_c_alive = 1;
 #if HYPE_RUN_GUEST_ON_AP
@@ -363,9 +383,9 @@ static void fw_1_ap_main(void *arg) {
         *lvt = HYPE_LAPIC_LVT_MASKED; /* masked while calibrating (still counts) */
         *icnt = 0xFFFFFFFFu;
         t0 = hype_rdtsc();
-        /* g_vms[0] directly (not the g_fw_1_* shims -- those need a `vm` local
-         * that fw_1_ap_main doesn't have). */
-        while (hype_rdtsc() - t0 < (g_vms[0].host_tsc_hz / 100ULL)) { /* ~10ms */
+        /* g_vms[vm_idx] directly (not the g_fw_1_* shims -- those need a `vm`
+         * local that fw_1_ap_main doesn't have). */
+        while (hype_rdtsc() - t0 < (g_vms[vm_idx].host_tsc_hz / 100ULL)) { /* ~10ms */
             __asm__ volatile("pause");
         }
         lapic_hz = (uint64_t)(0xFFFFFFFFu - *ccnt) * 100ULL; /* ticks in 10ms -> per sec */
@@ -383,7 +403,7 @@ static void fw_1_ap_main(void *arg) {
      * NPT/VMCB/devices and enters the dispatch loop; never returns for a live
      * boot. INTERCEPT_INTR + the AP's own LAPIC timer above give the periodic
      * forced exits; the clocksource is kvmclock. */
-    run_fw_1_test(&g_vms[0], g_fw_1_ops, g_fw_1_kind);
+    run_fw_1_test(&g_vms[vm_idx], g_fw_1_ops, g_fw_1_kind);
 #endif
     for (;;) {
         __asm__ volatile("cli; hlt");
@@ -4933,14 +4953,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_gpa_map_add(&g_fw_1_dma_map, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
                       g_fw_1_combined_size);
 
-    /* PVCLOCK (kvmclock): register the guest-memory map + host TSC frequency
-     * so the guest's KVM SYSTEM_TIME/WALL_CLOCK MSR writes fill its pvclock
-     * pages (which live in guest RAM, covered by dma_map above). This is what
-     * makes the KVM CPUID signature (cpuid_emulate.c) actually deliver a clock
-     * -- the guest reads time from the TSC via the page instead of running
-     * its own PIT-based calibration, which fails on AMD. */
-    hype_svm_vcpu_set_pvclock(&g_fw_1_dma_map, g_fw_1_host_tsc_hz);
-
     hype_debug_print(
         "fw-1: launching real OVMF at cs_base=0x%llx rip=0x%llx (guest-physical [0x%llx,0x100000000) -> "
         "host-physical 0x%llx)\n",
@@ -4952,6 +4964,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     if (ctx == 0) {
         hype_fatal("fw-1: vcpu_create failed");
     }
+
+    /* PVCLOCK (kvmclock): register THIS vCPU's guest-memory map + host TSC
+     * frequency so the guest's KVM SYSTEM_TIME/WALL_CLOCK MSR writes fill its
+     * pvclock pages (which live in this VM's guest RAM, covered by dma_map
+     * above). This is what makes the KVM CPUID signature (cpuid_emulate.c)
+     * actually deliver a clock -- the guest reads time from the TSC via the
+     * page instead of running its own PIT-based calibration, which fails on
+     * AMD. Must be after vcpu_create (the map is stored per-vCPU in the ctx):
+     * with two concurrent guests each needs its OWN map, else one guest's
+     * pvclock writes land in the other's RAM (M8-0b STEP 2 dead-halt bug). */
+    hype_svm_vcpu_set_pvclock(ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
     hype_svm_vcpu_set_rip(ctx, reset_rip);
     /* M4-6: let the guest own every exception vector. OVMF and any OS it
      * boots (real Linux takes routine #PF/#GP/#UD/#NM) handle their own
@@ -5351,8 +5374,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 {
                     uint32_t exec_apic_id =
                         (*(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + 0x20u)) >> 24;
-                    hype_debug_print("fw-1 CORE: run_fw_1_test executing on apic_id=%u (0=BSP 1=AP)\n",
-                                     (unsigned int)exec_apic_id);
+                    /* STEP 2: also tag which VM this is (vm - g_vms), so the two
+                     * concurrent guests are distinguishable even when their
+                     * serial output interleaves on the shared UART (M8-0c will
+                     * give each its own console). vm0 should show apic_id=1,
+                     * vm1 apic_id=2. */
+                    hype_debug_print(
+                        "fw-1 CORE: vm%u run_fw_1_test executing on apic_id=%u (0=BSP 1=AP1 2=AP2)\n",
+                        (unsigned int)(vm - g_vms), (unsigned int)exec_apic_id);
                 }
             }
         }
@@ -7047,6 +7076,47 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                               (unsigned long long)(g_fw_1_host_tsc_hz / 1000000ULL));
         }
 
+#if HYPE_RUN_TWO_VMS
+        /*
+         * STEP 2b: give g_vms[1] its own firmware + guest RAM so AP2 can run a
+         * SECOND Alpine (STEP 2c dispatches it). Must be done here, pre-EBS,
+         * while UEFI AllocatePages is still available (same as g_vms[0] above).
+         *
+         *  - Firmware: OVMF's *content* is identical between the two VMs, so
+         *    copy g_vms[0]'s freshly-loaded (pristine -- no guest has run yet)
+         *    combined buffer rather than re-reading the files. Each VM needs its
+         *    OWN buffer because OVMF's variable store (VARS) is writable and the
+         *    two guests must not clobber each other's.
+         *  - Guest RAM: a fresh, zeroed HYPE_FW_1_GUEST_RAM_BYTES region (the
+         *    guest-RAM-zeroed-before-first-run invariant, per guest_ram.h).
+         *  - host_tsc_hz: same physical CPU, so reuse the BSP's calibration.
+         *
+         * The ISO (g_iso_host_phys) stays shared: it is read-only, so two
+         * guests reading the same backing concurrently is safe. run_fw_1_test
+         * builds each VM's own NPT/devices/VMCB/ACPI from these fields.
+         */
+        {
+            hype_fw_vm_t *vm1 = &g_vms[1];
+            vm1->code_size = vm->code_size;
+            vm1->vars_size = vm->vars_size;
+            vm1->combined_size = vm->combined_size;
+            vm1->combined_host_phys =
+                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->combined_size);
+            hype_guest_ram_copy((void *)(uintptr_t)vm1->combined_host_phys,
+                                (const void *)(uintptr_t)vm->combined_host_phys, vm1->combined_size);
+            vm1->ram_host_phys =
+                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, HYPE_FW_1_GUEST_RAM_BYTES);
+            hype_guest_ram_zero((void *)(uintptr_t)vm1->ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+            vm1->host_tsc_hz = vm->host_tsc_hz;
+            hype_debug_print(
+                "fw-1 VM1: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
+                (unsigned long long)vm1->combined_host_phys, (unsigned long long)vm1->combined_size,
+                (unsigned long long)vm1->ram_host_phys,
+                (unsigned long long)(HYPE_FW_1_GUEST_RAM_BYTES / (1024ULL * 1024ULL)),
+                (unsigned long long)vm1->host_tsc_hz);
+        }
+#endif
+
         /* RT-2a: capture ops/kind for the post-EBS guest run below. The
          * \hype-log.txt logging setup (fw_1_log_init) and the pinned-AP
          * dispatch (hype_mp_locate/StartupThisAP) are both retired here --
@@ -7296,10 +7366,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * a stale AP1 value. Only attempted when AP1 itself came up (rc=0),
              * so a single-core box or a failed AP1 doesn't chase a phantom AP2. */
             if (ap_rc == 0) {
+                /* STEP 2c: when HYPE_RUN_TWO_VMS, AP2 runs the SECOND Alpine
+                 * (fw_1_ap_main with vm index 1 -> g_vms[1], whose RAM+firmware
+                 * were allocated pre-EBS below). Otherwise it just parks
+                 * (hype_ap_entry) -- the STEP 2a "prove the core comes up" mode. */
+#if HYPE_RUN_TWO_VMS
+                void (*ap2_entry)(void *) = fw_1_ap_main;
+                void *ap2_arg = (void *)(uintptr_t)1u; /* g_vms[1] */
+#else
+                void (*ap2_entry)(void *) = hype_ap_entry;
+                void *ap2_arg = 0;
+#endif
                 int ap2_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 2u,
                                            (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                                            (uint64_t)(uintptr_t)(g_ap2_stack + sizeof(g_ap2_stack)),
-                                           g_fw_1_host_tsc_hz, hype_ap_entry, 0);
+                                           g_fw_1_host_tsc_hz, ap2_entry, ap2_arg);
                 g_fw_1_ap2_rc = ap2_rc;
                 hype_debug_print(
                     "fw-1 AP2-SMOKETEST: apic_id=2 -> rc=%d (long-mode reached=%s), "

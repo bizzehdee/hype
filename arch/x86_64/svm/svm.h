@@ -576,7 +576,7 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx);
  * pages) and the host TSC frequency, so the KVM SYSTEM_TIME/WALL_CLOCK MSR
  * writes can fill the guest's pvclock pages. Call once before running the
  * guest. Without it, those MSR writes are accepted but fill nothing. */
-void hype_svm_vcpu_set_pvclock(const hype_gpa_map_t *map, uint64_t tsc_hz);
+void hype_svm_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, uint64_t tsc_hz);
 
 /* Count of pvclock time-info page fills -- nonzero proves the guest enabled
  * kvmclock and hype backed it. Diagnostic. */

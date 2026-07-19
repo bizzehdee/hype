@@ -36,6 +36,15 @@ struct hype_vcpu_ctx {
      * raw ModRM.reg encoding hype_mmio_decode() reports directly,
      * avoiding a translation table in the NPF/MMIO decode path. */
     uint64_t gprs[16];
+    /* PVCLOCK (kvmclock), per-vCPU. M8-0b STEP 2: two guests run concurrently,
+     * each with its OWN guest-physical->host map, so the map (and each guest's
+     * last KVM SYSTEM_TIME/WALL_CLOCK MSR value) MUST be per-vCPU -- a single
+     * shared map made one guest's pvclock writes land in the OTHER guest's RAM,
+     * leaving its own page unfilled -> garbage clocksource -> dead-halt. The
+     * TSC->ns scale (mul/shift) stays global: all cores share one TSC rate. */
+    const hype_gpa_map_t *pvclock_map;
+    uint64_t pvclock_system_msr;
+    uint64_t pvclock_wall_msr;
 };
 
 /* M8-0b-ii: per-vCPU state pool. Was a single g_vmcb/g_ctx (M2's one-vCPU
@@ -50,13 +59,16 @@ static struct hype_vcpu_ctx g_ctx_pool[HYPE_SVM_MAX_VCPUS];
 static unsigned g_vcpu_count;
 _Static_assert(sizeof(hype_vmcb_t) == 4096, "VMCB must be 4KB for per-element page alignment");
 
-/* Allocates the next vCPU slot. The two concurrent guests (BSP + AP) take
- * slots 0 and 1; the gated-off self-test guests run sequentially and safely
- * reuse the last slot beyond that. */
+/* Allocates the next vCPU slot. The two concurrent guests take slots 0 and 1;
+ * the gated-off self-test guests run sequentially and safely reuse the last
+ * slot beyond that. M8-0b STEP 2: two guests now create their vCPUs on two
+ * different cores (AP1, AP2) at essentially the same instant, so the counter
+ * bump MUST be atomic -- a plain read-modify-write could hand both cores slot
+ * 0, i.e. two cores VMRUNning the same VMCB/ctx pair (memory corruption). A
+ * lock-free fetch-add gives each caller a distinct index regardless of timing. */
 static unsigned svm_alloc_vcpu_slot(void) {
-    unsigned slot = (g_vcpu_count < HYPE_SVM_MAX_VCPUS) ? g_vcpu_count : (HYPE_SVM_MAX_VCPUS - 1u);
-    g_vcpu_count++;
-    return slot;
+    unsigned slot = __atomic_fetch_add(&g_vcpu_count, 1u, __ATOMIC_SEQ_CST);
+    return (slot < HYPE_SVM_MAX_VCPUS) ? slot : (HYPE_SVM_MAX_VCPUS - 1u);
 }
 
 /* AMD SDM: 12KB I/O permission map, 8KB MSR permission map -- VMRUN
@@ -188,6 +200,11 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     for (i = 0; i < 16; i++) {
         ctx->gprs[i] = 0;
     }
+    /* Also clear the per-vCPU pvclock state (M8-0b STEP 2): a slot reused by a
+     * later guest must not inherit a prior guest's pvclock map/MSR values. */
+    ctx->pvclock_map = 0;
+    ctx->pvclock_system_msr = 0;
+    ctx->pvclock_wall_msr = 0;
 }
 
 /* MSRs that VMSAVE/VMLOAD save+restore around VMRUN (AMD APM Vol 2
@@ -898,21 +915,18 @@ uint64_t hype_svm_vcpu_get_cr3(hype_vcpu_ctx_t *ctx) {
     return real->vmcb->save.cr3;
 }
 
-/* PVCLOCK (kvmclock) state: the guest-memory map used to reach the pvclock
- * pages, the host TSC frequency, and the pre-computed TSC->ns scale. A single
- * instance is correct -- all cores share one TSC rate. Registered by the FW-1
- * setup before the guest runs (hype_svm_vcpu_set_pvclock). */
-static const hype_gpa_map_t *g_pvclock_map = 0;
+/* PVCLOCK (kvmclock) TSC->ns scale: global, because all cores share one TSC
+ * rate. The per-VM guest-memory map and per-guest MSR values live in the vCPU
+ * ctx (see struct hype_vcpu_ctx) -- they are NOT shared. */
 static uint32_t g_pvclock_mul = 0;
 static int8_t g_pvclock_shift = 0;
-static uint64_t g_pvclock_system_msr = 0; /* last MSR_KVM_SYSTEM_TIME write (for RDMSR) */
-static uint64_t g_pvclock_wall_msr = 0;
 /* Times hype filled a pvclock time-info page -- nonzero proves the guest
  * detected KVM and enabled kvmclock, and hype backed it. Read by the diag. */
 volatile uint32_t g_hype_pvclock_arm_count = 0;
 
-void hype_svm_vcpu_set_pvclock(const hype_gpa_map_t *map, uint64_t tsc_hz) {
-    g_pvclock_map = map;
+void hype_svm_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, uint64_t tsc_hz) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->pvclock_map = map;
     hype_pvclock_calc_scale(tsc_hz, &g_pvclock_mul, &g_pvclock_shift);
 }
 
@@ -920,13 +934,13 @@ void hype_svm_vcpu_set_pvclock(const hype_gpa_map_t *map, uint64_t tsc_hz) {
  * read time as system_time + scale(rdtsc - tsc_timestamp). We publish
  * system_time = scale(now) with tsc_timestamp = now, so guest time == scale of
  * the raw (passthrough) TSC -- monotonic, TSC_STABLE, no guest calibration. */
-static void hype_svm_pvclock_arm_system_time(uint64_t msr_value) {
+static void hype_svm_pvclock_arm_system_time(struct hype_vcpu_ctx *real, uint64_t msr_value) {
     uint64_t gpa, host, now, system_ns;
-    if ((msr_value & HYPE_KVM_SYSTEM_TIME_ENABLE) == 0 || g_pvclock_map == 0) {
+    if ((msr_value & HYPE_KVM_SYSTEM_TIME_ENABLE) == 0 || real->pvclock_map == 0) {
         return;
     }
     gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
-    host = hype_gpa_to_host(g_pvclock_map, gpa, sizeof(struct hype_pvclock_vcpu_time_info));
+    host = hype_gpa_to_host(real->pvclock_map, gpa, sizeof(struct hype_pvclock_vcpu_time_info));
     if (host == 0) {
         return;
     }
@@ -940,13 +954,13 @@ static void hype_svm_pvclock_arm_system_time(uint64_t msr_value) {
 /* Guest wrote MSR_KVM_WALL_CLOCK: fill the boot-wall-time page. hype has no
  * RTC (CMOS returns 0), so publish epoch 0 -- the guest's monotonic clock
  * (above) is correct; only wall-clock date is unknown, same as today. */
-static void hype_svm_pvclock_arm_wall_clock(uint64_t msr_value) {
+static void hype_svm_pvclock_arm_wall_clock(struct hype_vcpu_ctx *real, uint64_t msr_value) {
     uint64_t gpa, host;
-    if (g_pvclock_map == 0) {
+    if (real->pvclock_map == 0) {
         return;
     }
     gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
-    host = hype_gpa_to_host(g_pvclock_map, gpa, sizeof(struct hype_pvclock_wall_clock));
+    host = hype_gpa_to_host(real->pvclock_map, gpa, sizeof(struct hype_pvclock_wall_clock));
     if (host == 0) {
         return;
     }
@@ -966,24 +980,24 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
      * guest never runs its own (failing, on AMD) TSC calibration. */
     if (msr_number == HYPE_MSR_KVM_SYSTEM_TIME_NEW || msr_number == HYPE_MSR_KVM_SYSTEM_TIME_OLD) {
         if (is_write) {
-            g_pvclock_system_msr =
+            real->pvclock_system_msr =
                 ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
-            hype_svm_pvclock_arm_system_time(g_pvclock_system_msr);
+            hype_svm_pvclock_arm_system_time(real, real->pvclock_system_msr);
         } else {
-            real->vmcb->save.rax = (uint64_t)(uint32_t)g_pvclock_system_msr;
-            real->gprs[2] = (uint64_t)(uint32_t)(g_pvclock_system_msr >> 32);
+            real->vmcb->save.rax = (uint64_t)(uint32_t)real->pvclock_system_msr;
+            real->gprs[2] = (uint64_t)(uint32_t)(real->pvclock_system_msr >> 32);
         }
         real->vmcb->save.rip += 2;
         return 0;
     }
     if (msr_number == HYPE_MSR_KVM_WALL_CLOCK_NEW || msr_number == HYPE_MSR_KVM_WALL_CLOCK_OLD) {
         if (is_write) {
-            g_pvclock_wall_msr =
+            real->pvclock_wall_msr =
                 ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
-            hype_svm_pvclock_arm_wall_clock(g_pvclock_wall_msr);
+            hype_svm_pvclock_arm_wall_clock(real, real->pvclock_wall_msr);
         } else {
-            real->vmcb->save.rax = (uint64_t)(uint32_t)g_pvclock_wall_msr;
-            real->gprs[2] = (uint64_t)(uint32_t)(g_pvclock_wall_msr >> 32);
+            real->vmcb->save.rax = (uint64_t)(uint32_t)real->pvclock_wall_msr;
+            real->gprs[2] = (uint64_t)(uint32_t)(real->pvclock_wall_msr >> 32);
         }
         real->vmcb->save.rip += 2;
         return 0;
