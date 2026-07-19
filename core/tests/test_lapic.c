@@ -89,10 +89,19 @@ static void test_send_ipi_writes_both_icr_dwords(void) {
     CHECK_HEX("ICR_LOW got the SIPI command", 0x00004608u, *icr_low());
 }
 
+static void test_lvt_timer_periodic_encoding(void) {
+    /* vector in low 8 bits + periodic mode bit (17), unmasked (bit 16 clear). */
+    CHECK_HEX("periodic LVT vector 0xEC", 0x200ECu, hype_lapic_lvt_timer_periodic(0xEC));
+    CHECK_HEX("periodic mode bit set", (1u << 17), hype_lapic_lvt_timer_periodic(0x40) & (1u << 17));
+    CHECK_HEX("not masked", 0u, hype_lapic_lvt_timer_periodic(0x40) & HYPE_LAPIC_LVT_MASKED);
+    CHECK_HEX("vector preserved", 0x40u, hype_lapic_lvt_timer_periodic(0x40) & 0xFFu);
+}
+
 int main(void) {
     test_mask_timer_sets_only_the_mask_bit();
     test_mask_timer_idempotent();
     test_mask_timer_does_not_touch_neighboring_registers();
+    test_lvt_timer_periodic_encoding();
     test_icr_high_places_apic_id_in_top_byte();
     test_icr_low_init_is_canonical_value();
     test_icr_low_sipi_encodes_vector_and_startup_mode();

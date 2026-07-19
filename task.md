@@ -4444,3 +4444,21 @@ HYPE_RUN_GUEST_ON_AP is a gated experiment (BSP idle, one guest on the AP);
 the full two-Alpines-two-cores is inc 4+5 (VM1 resources + polished
 dedicated-core timer/console). AWAITING HW: the real boot-time drop.
 
+M8-0b-ii inc 5 (2026-07-19): the AP's own periodic timer. HW showed the
+guest-on-AP soft-locking (CPU stuck 26-40s, single VMRUN up to 40s): with no
+BSP PIT tick reaching the AP, the guest spun in wait loops without exiting,
+so hype could not inject its due timer. The host tick was doing DOUBLE DUTY
+(timer delivery, not just overhead) -- so "fewer preemptions=faster" was
+DISPROVEN. Fix: fw_1_ap_main software-enables the AP LAPIC, calibrates its
+timer vs the TSC (divide-16, masked one-shot, ~10ms sample), and arms it
+periodic at ~1ms; a tiny EOI-only ISR (vector 0x50) + sti. The LAPIC timer
+forces a periodic VMEXIT(INTR) on the AP -> the dispatch loop advances the
+timebase + injects the guest tick, exactly the PIT tick's role on the BSP,
+but per-core. lapic.c gained hype_lapic_lvt_timer_periodic (pure, tested) +
+timer register defines. This makes the dedicated-core guest HEALTHY (no soft
+lockups); it does NOT make the boot faster (expected -- the real slowness is
+the spin, next). QEMU: boots to login, intr now nonzero (timer firing).
+AWAITING HW: soft-lockups gone. THEN: the SPIN investigation (why ~320s in
+VMRUN on BOTH cores -- the real PERF-1; leads: sysvec_call_function hotspot,
+timer/IPI latency, possible guest-SMP-config issue).
+

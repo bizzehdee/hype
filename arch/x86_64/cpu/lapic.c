@@ -7,6 +7,11 @@ void hype_lapic_mask_timer(volatile uint32_t *lapic_base) {
     *lvt_timer = *lvt_timer | HYPE_LAPIC_LVT_MASKED;
 }
 
+uint32_t hype_lapic_lvt_timer_periodic(uint8_t vector) {
+    /* vector in bits 7:0, periodic mode (bit 17), unmasked (bit 16 clear). */
+    return (uint32_t)vector | HYPE_LAPIC_LVT_TIMER_PERIODIC;
+}
+
 /* ICR_LOW delivery-mode field (bits 10:8) + level=assert (bit 14). These are
  * the canonical Intel/AMD MP-init values: INIT-assert = 0x00004500,
  * SIPI = 0x00004600 | vector. */

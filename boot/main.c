@@ -302,8 +302,22 @@ static int g_fw_1_ap_rc = -2;
 static uint64_t g_fw_1_ap_cr3; /* host CR3 at smoketest time (for the diag) */
 static uint64_t g_ap_cr3;      /* the AP's own <4GB identity-map page-table root */
 
-/* Defined much later; fw_1_ap_main runs it on the AP under HYPE_RUN_GUEST_ON_AP. */
+/* Defined much later; used by fw_1_ap_main (which precedes their definitions). */
 static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind);
+static inline uint64_t hype_rdtsc(void);
+
+/* M8-0b-ii inc 5: the AP's periodic-timer vector + ISR. The AP doesn't receive
+ * the BSP's PIT IRQ0, so its guest was never force-preempted -> it spun in
+ * wait loops without exiting, so hype couldn't inject its due timer (soft
+ * lockups on HW). This LAPIC timer forces a periodic VMEXIT(INTR) on the AP,
+ * so the dispatch loop advances the timebase + injects the guest tick -- the
+ * same role the PIT tick plays on the BSP, but per-core. The ISR only EOIs;
+ * the real work happens in the dispatch loop on the INTR exit. */
+#define HYPE_AP_LAPIC_TIMER_VECTOR 0x50u
+static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
+    (void)frame;
+    *(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + HYPE_LAPIC_EOI_OFFSET) = 0;
+}
 
 /* M8-0b-ii: the AP's C landing (runs on the second core, on hype's paging,
  * with its own stack). It loads hype's GDT/IDT, enables SVM on this core, and
@@ -322,12 +336,44 @@ static void fw_1_ap_main(void *arg) {
     g_fw_1_ap_svm_ok = 1;
     g_hype_ap_c_alive = 1;
 #if HYPE_RUN_GUEST_ON_AP
+    /* inc 5: give this core a periodic timer so the guest gets forced exits
+     * (timer delivery), else it soft-locks in wait loops (HW). Software-enable
+     * the LAPIC (INIT reset it), calibrate its timer against the TSC, then arm
+     * it periodic at ~1ms. */
+    {
+        volatile uint8_t *lb = (volatile uint8_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE;
+        volatile uint32_t *svr = (volatile uint32_t *)(lb + HYPE_LAPIC_SVR_OFFSET);
+        volatile uint32_t *dcr = (volatile uint32_t *)(lb + HYPE_LAPIC_TIMER_DIVIDE_OFFSET);
+        volatile uint32_t *lvt = (volatile uint32_t *)(lb + HYPE_LAPIC_LVT_TIMER_OFFSET);
+        volatile uint32_t *icnt = (volatile uint32_t *)(lb + HYPE_LAPIC_TIMER_INITIAL_OFFSET);
+        volatile uint32_t *ccnt = (volatile uint32_t *)(lb + HYPE_LAPIC_TIMER_CURRENT_OFFSET);
+        uint64_t t0, lapic_hz, count;
+
+        *svr = HYPE_LAPIC_SVR_ENABLE | 0xFFu; /* software-enable, spurious vec 0xFF */
+        *dcr = HYPE_LAPIC_TIMER_DIVIDE_16;
+        *lvt = HYPE_LAPIC_LVT_MASKED; /* masked while calibrating (still counts) */
+        *icnt = 0xFFFFFFFFu;
+        t0 = hype_rdtsc();
+        /* g_vms[0] directly (not the g_fw_1_* shims -- those need a `vm` local
+         * that fw_1_ap_main doesn't have). */
+        while (hype_rdtsc() - t0 < (g_vms[0].host_tsc_hz / 100ULL)) { /* ~10ms */
+            __asm__ volatile("pause");
+        }
+        lapic_hz = (uint64_t)(0xFFFFFFFFu - *ccnt) * 100ULL; /* ticks in 10ms -> per sec */
+        *icnt = 0;                                           /* stop the calibration run */
+        count = lapic_hz / 1000ULL;                          /* 1ms period */
+        if (count == 0) {
+            count = 1;
+        }
+        hype_isr_register(HYPE_AP_LAPIC_TIMER_VECTOR, hype_ap_lapic_timer_isr);
+        *lvt = hype_lapic_lvt_timer_periodic((uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR);
+        *icnt = (uint32_t)count;
+        hype_sti(); /* enable host interrupts on the AP so the timer fires */
+    }
     /* Run the FW-1 guest on THIS (dedicated) core. run_fw_1_test builds the
-     * NPT/VMCB/devices and enters the dispatch loop; it never returns for a
-     * live boot. No host 1000Hz tick reaches this core, so the guest is not
-     * force-preempted every 1ms -- the timebase still advances per natural
-     * exit (rdtsc-based) and the clocksource is kvmclock. This is the
-     * dedicated-core perf measurement. */
+     * NPT/VMCB/devices and enters the dispatch loop; never returns for a live
+     * boot. INTERCEPT_INTR + the AP's own LAPIC timer above give the periodic
+     * forced exits; the clocksource is kvmclock. */
     run_fw_1_test(&g_vms[0], g_fw_1_ops, g_fw_1_kind);
 #endif
     for (;;) {

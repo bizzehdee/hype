@@ -22,12 +22,28 @@
 #define HYPE_LAPIC_DEFAULT_BASE 0xFEE00000ULL
 #define HYPE_LAPIC_LVT_TIMER_OFFSET 0x320
 #define HYPE_LAPIC_LVT_MASKED (1u << 16)
+#define HYPE_LAPIC_LVT_TIMER_PERIODIC (1u << 17) /* LVT timer mode = periodic */
+
+/* M8-0b-ii (inc 5): host-LAPIC registers hype programs on the AP so the guest
+ * on the dedicated core gets a periodic forced VMEXIT (its timer-delivery
+ * mechanism, replacing the BSP's PIT tick which the AP doesn't receive). */
+#define HYPE_LAPIC_EOI_OFFSET 0xB0
+#define HYPE_LAPIC_SVR_OFFSET 0xF0
+#define HYPE_LAPIC_SVR_ENABLE (1u << 8) /* APIC software-enable */
+#define HYPE_LAPIC_TIMER_INITIAL_OFFSET 0x380
+#define HYPE_LAPIC_TIMER_CURRENT_OFFSET 0x390
+#define HYPE_LAPIC_TIMER_DIVIDE_OFFSET 0x3E0
+#define HYPE_LAPIC_TIMER_DIVIDE_16 0x3u /* DCR encoding for divide-by-16 */
 
 /* Sets the mask bit in the LVT Timer register, leaving every other bit
  * (vector, timer mode, ...) untouched. `lapic_base` must point at the
  * 4KB LAPIC register window (real hardware: HYPE_LAPIC_DEFAULT_BASE,
  * identity-mapped; tests: any suitably sized buffer). */
 void hype_lapic_mask_timer(volatile uint32_t *lapic_base);
+
+/* LVT Timer register value for a periodic timer on `vector`: vector in the
+ * low 8 bits, periodic mode bit set, unmasked. Pure -- unit tested. */
+uint32_t hype_lapic_lvt_timer_periodic(uint8_t vector);
 
 /*
  * M8-0b: Interrupt Command Register (ICR) IPI send, for bringing a second
