@@ -285,6 +285,10 @@ static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
  * a flag the AP sets once it has enabled SVM on its core without faulting. */
 static uint8_t g_ap_hsave[4096] __attribute__((aligned(4096)));
 static volatile uint32_t g_fw_1_ap_svm_ok;
+/* AP-bring-up result, latched so the diag tick can re-emit it (the one-shot
+ * AP-SMOKETEST line prints too early to survive in the 16KB nvlog tail).
+ * -2 = smoketest not run yet. */
+static int g_fw_1_ap_rc = -2;
 
 /* M8-0b-ii: the AP's C landing (runs on the second core, on hype's paging,
  * with its own stack). Increment 1: prove the AP can become a hypervisor core
@@ -5248,6 +5252,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * and hype filled its pvclock page (the TSC-calibration fix). */
                 hype_debug_print("fw-1 PVCLOCK: arm_count=%u\n",
                                  (unsigned int)g_hype_pvclock_arm_count);
+                /* M8-0b: re-emit the AP bring-up result every tick so it survives
+                 * in the nvlog tail to login (the one-shot AP-SMOKETEST prints too
+                 * early). rc=0 + svm_ok=1 => the second core came up on real HW. */
+                hype_debug_print("fw-1 AP: rc=%d phase=%u c_alive=%u svm_ok=%u\n", g_fw_1_ap_rc,
+                                 (unsigned int)g_hype_ap_last_phase, (unsigned int)g_hype_ap_c_alive,
+                                 (unsigned int)g_fw_1_ap_svm_ok);
             }
         }
 
@@ -7145,6 +7155,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                       (void *)(uintptr_t)g_ap_tramp_page, cr3,
                                       (uint64_t)(uintptr_t)(g_ap_stack + sizeof(g_ap_stack)),
                                       g_fw_1_host_tsc_hz, fw_1_ap_main, 0);
+            g_fw_1_ap_rc = ap_rc;
             hype_debug_print(
                 "fw-1 AP-SMOKETEST: apic_id=1 tramp=0x%llx cr3=0x%llx -> rc=%d (long-mode reached=%s), "
                 "last_phase=%u (0=none 1=real 2=prot 3=long) c_entry_ran=%u ap_svm_ok=%u\n",
