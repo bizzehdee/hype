@@ -291,6 +291,7 @@ static volatile uint32_t g_fw_1_ap_svm_ok;
  * -4 = skipped (host CR3 >= 4GB); >=-1 = hype_ap_start's return. */
 static int g_fw_1_ap_rc = -2;
 static uint64_t g_fw_1_ap_cr3; /* host CR3 at smoketest time (for the diag) */
+static uint64_t g_ap_cr3;      /* the AP's own <4GB identity-map page-table root */
 
 /* M8-0b-ii: the AP's C landing (runs on the second core, on hype's paging,
  * with its own stack). Increment 1: prove the AP can become a hypervisor core
@@ -5258,11 +5259,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * in the nvlog tail to login (the one-shot AP-SMOKETEST prints too
                  * early). rc=0 + svm_ok=1 => the second core came up on real HW. */
                 hype_debug_print(
-                    "fw-1 AP: rc=%d (-3=no-lowpage -4=cr3>=4GB) tramp=0x%llx cr3=0x%llx phase=%u "
+                    "fw-1 AP: rc=%d tramp=0x%llx host_cr3=0x%llx ap_cr3=0x%llx phase=%u "
                     "c_alive=%u svm_ok=%u\n",
                     g_fw_1_ap_rc, (unsigned long long)g_ap_tramp_page,
-                    (unsigned long long)g_fw_1_ap_cr3, (unsigned int)g_hype_ap_last_phase,
-                    (unsigned int)g_hype_ap_c_alive, (unsigned int)g_fw_1_ap_svm_ok);
+                    (unsigned long long)g_fw_1_ap_cr3, (unsigned long long)g_ap_cr3,
+                    (unsigned int)g_hype_ap_last_phase, (unsigned int)g_hype_ap_c_alive,
+                    (unsigned int)g_fw_1_ap_svm_ok);
             }
         }
 
@@ -6850,6 +6852,24 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         /* M8-0b: grab a <1MB page now (Boot Services only) to stage the AP
          * startup trampoline in; the post-EBS smoketest below uses it. */
         g_ap_tramp_page = hype_alloc_page_below_1mb(SystemTable->BootServices);
+
+        /* M8-0b-ii: UEFI can load hype's image (hence g_pml4) above 4GB
+         * (observed on real HW: host CR3 = 0x140099000). The AP trampoline
+         * sets CR3 with a 32-bit `mov` and can't reach a >4GB root, so build
+         * the AP its OWN identity-mapping page-table root guaranteed below 4GB
+         * (PML4 + PDPT + one PD per GB). Same 64GB identity map as g_pml4, so
+         * the AP sees memory identically to the BSP. */
+        {
+            UINTN ap_pt_pages = 2u + (UINTN)HYPE_PAGING_MAX_GB;
+            uint64_t base = hype_alloc_pages_below_4gb(SystemTable->BootServices, ap_pt_pages);
+            hype_pte_t *ap_pml4 = (hype_pte_t *)(uintptr_t)base;
+            hype_pte_t *ap_pdpt = (hype_pte_t *)(uintptr_t)(base + 4096ULL);
+            hype_pte_t(*ap_pd)[HYPE_PAGING_ENTRIES_PER_TABLE] =
+                (hype_pte_t(*)[HYPE_PAGING_ENTRIES_PER_TABLE])(uintptr_t)(base + 8192ULL);
+            hype_guest_ram_zero((void *)(uintptr_t)base, ap_pt_pages * 4096ULL);
+            hype_paging_build_identity(ap_pml4, ap_pdpt, ap_pd, HYPE_PAGING_MAX_GB);
+            g_ap_cr3 = base; /* AllocateMaxAddress(<4GB) guarantees base < 4GB */
+        }
         hype_debug_print("fw-1: guest RAM %llu MiB backed at host-physical 0x%llx\n",
                           (unsigned long long)(HYPE_FW_1_GUEST_RAM_BYTES / (1024ULL * 1024ULL)),
                           (unsigned long long)g_fw_1_ram_host_phys);
@@ -7150,17 +7170,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     {
         uint64_t cr3;
         __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-        g_fw_1_ap_cr3 = cr3; /* captured for the persistent diag regardless of path */
+        g_fw_1_ap_cr3 = cr3; /* hype's own host CR3, captured for the diag */
         if (g_ap_tramp_page == 0) {
             g_fw_1_ap_rc = -3; /* skip: no <1MB trampoline page (low-mem alloc failed) */
             hype_debug_print("fw-1 AP-SMOKETEST: SKIP -- no <1MB trampoline page\n");
-        } else if (cr3 >= 0x100000000ULL) {
-            g_fw_1_ap_rc = -4; /* skip: host CR3 >= 4GB (trampoline loads only low 32 bits) */
-            hype_debug_print("fw-1 AP-SMOKETEST: SKIP -- host CR3 0x%llx >= 4GB\n",
-                              (unsigned long long)cr3);
+        } else if (g_ap_cr3 == 0 || g_ap_cr3 >= 0x100000000ULL) {
+            g_fw_1_ap_rc = -4; /* skip: AP page-table root missing / not <4GB (shouldn't happen) */
+            hype_debug_print("fw-1 AP-SMOKETEST: SKIP -- AP CR3 0x%llx not usable\n",
+                              (unsigned long long)g_ap_cr3);
         } else {
+            /* Use the AP's own <4GB identity-map root (g_ap_cr3), NOT hype's
+             * host CR3 which UEFI may have placed above 4GB. */
             int ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 1u,
-                                      (void *)(uintptr_t)g_ap_tramp_page, cr3,
+                                      (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                                       (uint64_t)(uintptr_t)(g_ap_stack + sizeof(g_ap_stack)),
                                       g_fw_1_host_tsc_hz, fw_1_ap_main, 0);
             g_fw_1_ap_rc = ap_rc;

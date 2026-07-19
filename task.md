@@ -4378,3 +4378,14 @@ Then the perf measurement: does the guest boot faster free of the ~335K
 host-tick preemptions? inc 3 (VMRUN-core de-globalization) is the gating,
 riskiest piece and best done as its own focused, HW-validated effort.
 
+M8-0b-ii AP-CR3 fix (2026-07-19): HW showed rc=-4 cr3=0x140099000 -- UEFI
+loaded hype's image (hence g_pml4) ABOVE 4GB, and the AP trampoline sets
+CR3 with a 32-bit mov (can't reach a >4GB root). Fix: efi_main now builds
+the AP its OWN identity-map page-table root (PML4+PDPT+64 PDs) via
+hype_alloc_pages_below_4gb -> guaranteed <4GB (g_ap_cr3), same 64GB map as
+g_pml4 so the AP sees memory identically. The smoketest passes g_ap_cr3
+(not the host CR3) to hype_ap_start. QEMU: rc=0 ap_cr3=0x7d8cb000 (distinct
+from host_cr3) phase=3 c_alive=1 svm_ok=1 -- AP runs on the fresh <4GB root,
+proving the built map reaches hype code; BSP still boots to login. Should
+now clear the HW -4 skip. AWAITING HW re-test: expect rc=0 svm_ok=1.
+
