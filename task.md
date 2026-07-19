@@ -4389,3 +4389,10 @@ from host_cr3) phase=3 c_alive=1 svm_ok=1 -- AP runs on the fresh <4GB root,
 proving the built map reaches hype code; BSP still boots to login. Should
 now clear the HW -4 skip. AWAITING HW re-test: expect rc=0 svm_ok=1.
 
+M8-0b-ii AP FOUNDATION HW-VALIDATED (2026-07-19): real AMD silicon shows
+fw-1 AP: rc=0 tramp=0x9f000 ... phase=3 c_alive=1 svm_ok=1. The second core
+comes fully up on hardware: INIT-SIPI-SIPI, real->long mode on the <4GB
+page-table root, hype GDT/IDT loaded, SVM enabled -- all without faulting.
+The >4GB image-placement difference (only visible on HW) is handled. AP is
+genuinely ready to VMRUN. Proceeding to increment 3.
+
