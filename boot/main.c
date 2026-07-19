@@ -301,6 +301,15 @@ static volatile uint32_t g_fw_1_ap_svm_ok;
 static int g_fw_1_ap_rc = -2;
 static uint64_t g_fw_1_ap_cr3; /* host CR3 at smoketest time (for the diag) */
 static uint64_t g_ap_cr3;      /* the AP's own <4GB identity-map page-table root */
+/* M8-0b-ii STEP 2: a SECOND AP (apic_id=2) for the two-Alpines-on-two-cores
+ * milestone. Its own stack (each core needs one) and a latched bring-up result
+ * for the diag (same -2 = not reached convention as g_fw_1_ap_rc). STEP 2a just
+ * parks it (hype_ap_entry) to prove the 2nd core comes up; STEP 2c will run
+ * g_vms[1] on it once VM1's resources exist. Reuses g_ap_tramp_page (AP1 is
+ * long past the trampoline by then) and g_ap_cr3 (the <4GB identity map is
+ * per-machine, safe to share across APs). */
+static uint8_t g_ap2_stack[16384] __attribute__((aligned(4096)));
+static int g_fw_1_ap2_rc = -2;
 
 /* Defined much later; used by fw_1_ap_main (which precedes their definitions). */
 static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind);
@@ -5331,6 +5340,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     (unsigned long long)g_fw_1_ap_cr3, (unsigned long long)g_ap_cr3,
                     (unsigned int)g_hype_ap_last_phase, (unsigned int)g_hype_ap_c_alive,
                     (unsigned int)g_fw_1_ap_svm_ok);
+                /* STEP 2a: second AP (apic_id=2) bring-up result, likewise
+                 * re-emitted so it survives to login. rc=0 => hype started a
+                 * SECOND core -- the foundation for two Alpines on two cores. */
+                hype_debug_print("fw-1 AP2: rc=%d (apic_id=2)\n", g_fw_1_ap2_rc);
                 /* DEFINITIVE which-core check: the physical LAPIC ID (reg 0x20,
                  * bits 31:24) of the core actually executing this dispatch loop.
                  * BSP = 0, AP = 1. Removes all doubt about whether the guest is
@@ -7270,6 +7283,30 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 (unsigned long long)g_ap_tramp_page, (unsigned long long)cr3, ap_rc,
                 (ap_rc == 0) ? "yes" : "NO", (unsigned int)g_hype_ap_last_phase,
                 (unsigned int)g_hype_ap_c_alive, (unsigned int)g_fw_1_ap_svm_ok);
+
+            /*
+             * STEP 2a: bring up a SECOND AP (apic_id=2) to prove hype can start
+             * more than one core -- the foundation for two Alpines on two cores.
+             * This one just PARKS (hype_ap_entry: sets alive, cli/hlt); STEP 2c
+             * will hand it g_vms[1] once VM1's resources exist. Safe to reuse
+             * g_ap_tramp_page: AP1 signalled alive and is now executing
+             * fw_1_ap_main from high memory, no longer touching the low
+             * trampoline; hype_ap_start re-copies the blob and re-zeroes its own
+             * per-bring-up `alive` flag, so rc/last_phase below reflect AP2, not
+             * a stale AP1 value. Only attempted when AP1 itself came up (rc=0),
+             * so a single-core box or a failed AP1 doesn't chase a phantom AP2. */
+            if (ap_rc == 0) {
+                int ap2_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 2u,
+                                           (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
+                                           (uint64_t)(uintptr_t)(g_ap2_stack + sizeof(g_ap2_stack)),
+                                           g_fw_1_host_tsc_hz, hype_ap_entry, 0);
+                g_fw_1_ap2_rc = ap2_rc;
+                hype_debug_print(
+                    "fw-1 AP2-SMOKETEST: apic_id=2 -> rc=%d (long-mode reached=%s), "
+                    "last_phase=%u (0=none 1=real 2=prot 3=long)\n",
+                    ap2_rc, (ap2_rc == 0) ? "yes" : "NO",
+                    (unsigned int)g_hype_ap_last_phase);
+            }
         }
     }
 #endif

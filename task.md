@@ -4511,3 +4511,21 @@ M8-0b-ii STEP 1 HW-CONFIRMED (2026-07-19): real AMD silicon shows "fw-1 CORE:
 run_fw_1_test executing on apic_id=1" -- the FW-1 alpine-virt guest genuinely
 runs on the dedicated AP core (not a BSP fallback). One-alpine-on-its-own-AP is
 done end-to-end on HW. Proceeding to STEP 2: two alpines on two APs.
+
+M8-0b-ii STEP 2a DONE (2026-07-19, QEMU): hype now brings up a SECOND AP
+(apic_id=2) post-EBS -- the foundation for two Alpines on two cores. After
+AP1 (apic_id=1) is up and running the guest, the BSP issues a second
+INIT-SIPI-SIPI to apic_id=2 with its own stack (g_ap2_stack), reusing the
+trampoline page (AP1 is long past it) and the shared <4GB identity-map root
+(g_ap_cr3). This AP just PARKS for now (hype_ap_entry: alive + cli/hlt);
+STEP 2c will hand it g_vms[1]. QEMU -smp 3 confirms:
+  fw-1 AP2-SMOKETEST: apic_id=2 -> rc=0 (long-mode reached=yes) last_phase=3
+and the re-emitted "fw-1 AP2: rc=0 (apic_id=2)" survives to the diag tick.
+rc is genuine, not a stale AP1 value: hype_ap_start re-zeroes its own
+per-bring-up trampoline *alive flag (ap_boot.c:80) before the SIPI and waits
+on THAT, so only apic_id=2 can satisfy it. Observed a cosmetic side effect:
+the AP2 line interleaves char-by-char with AP1's guest serial output (two
+cores writing one unsynchronized UART) -- exactly the collision M8-0c per-VM
+console routing exists to fix. HW-VALIDATION OWED (QEMU proves the logic).
+NEXT (STEP 2b): allocate g_vms[1] resources (2nd OVMF firmware copy + 2nd
+guest RAM) pre-EBS so AP2 has a real VM to run.

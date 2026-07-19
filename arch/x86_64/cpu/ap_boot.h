@@ -30,6 +30,11 @@
  *   entry_arg  : opaque argument passed to `entry` (RCX per the MS x64 ABI).
  * Returns 0 if the AP reached the trampoline's long-mode stage within the
  * timeout, -1 otherwise. */
+/* The default 64-bit C landing for a bare AP bring-up: sets g_hype_ap_c_alive
+ * then parks in cli/hlt. Pass as hype_ap_start's `entry` to just prove a core
+ * comes up (e.g. STEP 2a's parked apic_id=2), vs a real per-core main. */
+void hype_ap_entry(void *arg);
+
 int hype_ap_start(volatile uint32_t *lapic_base, uint8_t apic_id, void *tramp_page, uint64_t cr3,
                   uint64_t stack_top, uint64_t tsc_hz, void (*entry)(void *), void *entry_arg);
 
