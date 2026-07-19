@@ -4549,8 +4549,13 @@ static const uint8_t *fw_1_insn_bytes_via_ptwalk(hype_fw_vm_t *vm, hype_vcpu_ctx
  * guest's console output to hype's own console (serial + GOP) one line
  * at a time -- one GOP Blt per line rather than per byte. `filter`,
  * `line` and `line_len` persist across calls (owned by the caller). */
+/* M8-0c: `vm_idx`/`port` tag every forwarded guest console line with which VM
+ * (0/1) and which UART (ttyS0/ttyS1) it came from, so the two concurrent
+ * guests' output is line-attributable on the shared host UART instead of an
+ * indistinguishable char-interleaved blur. */
 static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_filter_t *filter, char *line,
-                                             unsigned int *line_len, unsigned int line_cap) {
+                                             unsigned int *line_len, unsigned int line_cap,
+                                             unsigned vm_idx, unsigned port) {
     unsigned int emitted = 0;
     uint8_t b;
     while (hype_guest_uart_tx_dequeue(uart, &b)) {
@@ -4561,7 +4566,7 @@ static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_fil
         emitted++;
         if (c == '\n') {
             line[*line_len] = '\0';
-            hype_debug_print("%s\n", line);
+            hype_debug_print("fw-1 vm%u ttyS%u| %s\n", vm_idx, port, line);
             /* PERF-1: pin the guest's clocksource/lpj lines so they reach the
              * cold-boot-surviving nvlog even though they scroll off early. */
             hype_clockfacts_observe(&g_fw_1_clockfacts, line);
@@ -4570,7 +4575,7 @@ static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_fil
         }
         if (*line_len >= line_cap - 1) {
             line[*line_len] = '\0';
-            hype_debug_print("%s\n", line);
+            hype_debug_print("fw-1 vm%u ttyS%u| %s\n", vm_idx, port, line);
             *line_len = 0;
         }
         line[(*line_len)++] = c;
@@ -5674,9 +5679,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * host tick (~55% of all exits) is pure waste. */
         if (info.reason != HYPE_SVM_EXITCODE_INTR) {
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line,
-                                                     &uart_line_len, (unsigned int)sizeof(uart_line));
+                                                     &uart_line_len, (unsigned int)sizeof(uart_line),
+                                                     (unsigned)(vm - g_vms), 0u);
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2,
-                                                     &uart_line_len2, (unsigned int)sizeof(uart_line2));
+                                                     &uart_line_len2, (unsigned int)sizeof(uart_line2),
+                                                     (unsigned)(vm - g_vms), 1u);
         }
 
         /* RT-2c: push the deferred GOP shadow buffer to the real framebuffer
@@ -5702,17 +5709,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (info.reason == HYPE_SVM_EXITCODE_HLT) {
             char *bufs[2];
             unsigned int *lens[2];
-            const char *tags[2];
             unsigned bi;
-            bufs[0] = uart_line;  lens[0] = &uart_line_len;  tags[0] = "fw-1 ttyS0|";
-            bufs[1] = uart_line2; lens[1] = &uart_line_len2; tags[1] = "fw-1 ttyS1|";
+            bufs[0] = uart_line;  lens[0] = &uart_line_len;
+            bufs[1] = uart_line2; lens[1] = &uart_line_len2;
             for (bi = 0; bi < 2u; bi++) {
                 unsigned int n = *lens[bi];
                 if (n >= 2u && bufs[bi][n - 1u] == ' ') {
                     char p = bufs[bi][n - 2u];
                     if (p == ':' || p == '#' || p == '$' || p == '>') {
                         bufs[bi][n] = '\0';
-                        hype_debug_print("%s %s\n", tags[bi], bufs[bi]);
+                        /* M8-0c: tag prompt flushes per-VM/-port too. */
+                        hype_debug_print("fw-1 vm%u ttyS%u| %s\n", (unsigned)(vm - g_vms), bi, bufs[bi]);
                         *lens[bi] = 0;
                     }
                 }
@@ -6398,9 +6405,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 
     /* Flush any console text the guest emitted right before it idled. */
     fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
-                             (unsigned int)sizeof(uart_line));
+                             (unsigned int)sizeof(uart_line), (unsigned)(vm - g_vms), 0u);
     fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
-                             (unsigned int)sizeof(uart_line2));
+                             (unsigned int)sizeof(uart_line2), (unsigned)(vm - g_vms), 1u);
 
     /* M4-6b diagnostic: how many guest LAPIC-timer IRQs were actually
      * delivered, and whether one is still stuck in-service (never EOI'd

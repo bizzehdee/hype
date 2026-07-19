@@ -4589,3 +4589,15 @@ slot) held on real hardware. Remaining: the shared UART interleaves the two
 guests char-by-char (cosmetic) -> M8-0c per-VM console routing is the cleanup,
 which will also let each guest's login be read distinctly. No RAM/AllocatePages
 panic on HW (laptop has the headroom for two ~1GB guests + 2 OVMF copies).
+
+M8-0b-ii FULL MILESTONE HW-CONFIRMED + M8-0c (2026-07-19): on the real AMD
+laptop, BOTH Alpine guests reached userspace login -- two live-ISO Alpines,
+each on its own dedicated AP core, both to "localhost login", on real silicon.
+This is the complete "two Alpines on two cores" goal end-to-end on HW (not just
+QEMU). M8-0c per-VM console routing done: every forwarded guest console line is
+now tagged "fw-1 vm%u ttyS%u|" (VM index + UART port), so the two guests'
+output is line-attributable on the shared host UART instead of char-interleaved.
+QEMU-verified all four tag streams (vm0/vm1 x ttyS0/ttyS1) present + distinct.
+M8-0b (concurrent dispatch) + M8-0c (per-VM console) DONE. Remaining multi-VM
+polish is dashboard/switcher territory (M8-1). Next major goal is open: PERF-1
+(make one guest fast -- recommended first) vs SMP guests vs the guest ladder.
