@@ -4601,3 +4601,15 @@ QEMU-verified all four tag streams (vm0/vm1 x ttyS0/ttyS1) present + distinct.
 M8-0b (concurrent dispatch) + M8-0c (per-VM console) DONE. Remaining multi-VM
 polish is dashboard/switcher territory (M8-1). Next major goal is open: PERF-1
 (make one guest fast -- recommended first) vs SMP guests vs the guest ladder.
+
+M8-0b-ii HW EVIDENCE (RT-3 diag artifact, 2026-07-19): the cold-boot-surviving
+nvlog capture double-confirms the milestone with concrete lines: CORE vm0=apic_id=1
++ vm1=apic_id=2 (every tick); AP rc=0 svm_ok=1 + AP2 rc=0; PVCLOCK arm_count=2
+(both VMs armed their own kvmclock -> BUG#1 fix held on silicon); TWO Alpine
+banners + two "localhost login" (ttyS0/ttyS1) + a DOUBLED OpenRC service sequence
+(two independent userspaces); and NO giveup/wedge/dead-halt/panic anywhere
+(BUG#2 fix held). BONUS -- real two-VM HW perf data captured for PERF-1: to
+both-login elapsed ~450s (vs ~347s single-VM: concurrent contention costs ~30%
+wall-clock), io80~67k/VM (port-0x80 delay writes), ioio~420k/VM, npf(ahci)~16k/VM,
+and a striking max_single_vmrun=13-14s (vmruns_over_100ms=15-16) -- a big stall
+outlier worth chasing. mean vmrun ~440-680us/exit. These are the PERF-1 levers.
