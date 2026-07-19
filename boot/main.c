@@ -293,6 +293,13 @@ static volatile uint32_t g_fw_1_ap_svm_ok;
  * put a second Alpine on this core. Never returns. */
 static void fw_1_ap_main(void *arg) {
     (void)arg;
+    /* Give the AP a valid host environment before it can VMRUN: hype's own
+     * GDT (reloads CS/segments via lretq) and IDT (for any exception during
+     * host execution). Both are shared with the BSP -- safe because
+     * hype_gdt_load does no `ltr` (no per-core TSS to conflict over). The
+     * trampoline left the AP on its own flat GDT and no IDT. */
+    hype_gdt_load(g_gdt, HYPE_GDT_ENTRY_COUNT);
+    hype_idt_load(g_idt, HYPE_IDT_ENTRY_COUNT);
     hype_svm_enable_on((uint64_t)(uintptr_t)g_ap_hsave); /* faults never return */
     g_fw_1_ap_svm_ok = 1;
     g_hype_ap_c_alive = 1;
