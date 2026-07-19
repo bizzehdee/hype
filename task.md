@@ -3948,6 +3948,17 @@ observability channel) must land FIRST.*
   change the perf numbers (the 160x-vs-QEMU execution inflation, PERF-1).
   The PERF-1a instrumentation is in place to measure it the moment M8-0b
   runs a VM on its own core.
+  STEP 2 DONE (2026-07-19): threaded an explicit `hype_fw_vm_t *vm`
+  through run_fw_1_test() and efi_main (a `vm = &g_vms[0]` local), and
+  through the guest-memory translation chain (fw_1_guest_phys_to_host,
+  _read_guest_pte, _guest_virt_to_phys, _insn_bytes_via_ptwalk -- vm as
+  first param). The g_fw_1_X shims now expand to `vm->X` rather than
+  `g_vms[0].X`, so the whole (exempt) FW-1 path operates on whichever
+  instance the caller passes -- run_fw_1_test(&g_vms[1], ...) on a second
+  core (M8-0b) needs no use-site edits. Shims kept as naming sugar.
+  QEMU-verified to localhost login, no regression. NEXT: M8-0a per-VM
+  RAM/NPT (today one shared static g_npt_* set) so two instances have
+  disjoint guest memory; then M8-0b own-AP bring-up (INIT-SIPI-SIPI).
   guest into an N-instance model. This is the load-bearing prerequisite
   for ALL of M8 -- surfaced by scoping "run two Alpine VMs concurrently"
   (2026-07-18): the config layer (hype.cfg `vms[16]`, M1-1) and admission

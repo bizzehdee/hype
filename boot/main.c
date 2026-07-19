@@ -161,10 +161,16 @@ static uint64_t g_ram_1_size_bytes;
 /*
  * M8-0: per-VM instance state. Every field here was a `g_fw_1_*` singleton;
  * gathered into one struct so N Alpine guests can run concurrently (each
- * pinned to its own core -- M8-0b). The current single guest is g_vms[0];
- * the `#define g_fw_1_X (g_vms[0].X)` shims below let the (huge, exempt) FW-1
- * path keep compiling unchanged while the storage becomes N-instanceable.
- * Later steps thread an explicit `vm` pointer through run_fw_1_test().
+ * pinned to its own core -- M8-0b). The current single guest is g_vms[0].
+ *
+ * Step 2 (done): run_fw_1_test() and efi_main's setup now take/hold an
+ * explicit `hype_fw_vm_t *vm`, and the memory-translation helpers
+ * (fw_1_guest_phys_to_host and its walk-chain) take it as their first param.
+ * The `#define g_fw_1_X (vm->X)` shims below therefore expand to `vm->X`, so
+ * the (huge, exempt) FW-1 path already operates on whichever instance is
+ * passed in -- run_fw_1_test(&g_vms[1], ...) on a second core (M8-0b) will
+ * Just Work without touching the ~200 use sites. The shims stay only as a
+ * naming convenience; a later cosmetic pass can inline them to vm->X.
  *
  * NOT per-VM (stay file-global below): the loaded ISO buffer (both VMs boot
  * the same media) and the host's usable-RAM total.
@@ -213,40 +219,41 @@ typedef struct hype_fw_vm {
 
 static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
 
-/* M8-0 transitional shims: the FW-1 path still names g_fw_1_*; route them at
- * VM instance 0 until run_fw_1_test() takes an explicit vm pointer. */
-#define g_fw_1_combined_host_phys (g_vms[0].combined_host_phys)
-#define g_fw_1_combined_size (g_vms[0].combined_size)
-#define g_fw_1_code_size (g_vms[0].code_size)
-#define g_fw_1_vars_size (g_vms[0].vars_size)
-#define g_fw_1_ram_host_phys (g_vms[0].ram_host_phys)
-#define g_fw_1_e820_blob (g_vms[0].e820_blob)
-#define g_fw_1_guest_stack (g_vms[0].guest_stack)
-#define g_fw_1_pic (g_vms[0].pic)
-#define g_fw_1_pit (g_vms[0].pit)
-#define g_fw_1_pci (g_vms[0].pci)
-#define g_fw_1_cmos (g_vms[0].cmos)
-#define g_fw_1_lapic (g_vms[0].lapic)
-#define g_fw_1_uart (g_vms[0].uart)
-#define g_fw_1_uart2 (g_vms[0].uart2)
-#define g_fw_1_ps2 (g_vms[0].ps2)
-#define g_fw_1_mouse (g_vms[0].mouse)
-#define g_fw_1_fw_cfg (g_vms[0].fw_cfg)
-#define g_fw_1_rsdp (g_vms[0].rsdp)
-#define g_fw_1_tables_blob (g_vms[0].tables_blob)
-#define g_fw_1_loader_script (g_vms[0].loader_script)
-#define g_fw_1_ahci (g_vms[0].ahci)
-#define g_fw_1_atapi (g_vms[0].atapi)
-#define g_fw_1_dma_map (g_vms[0].dma_map)
-#define g_fw_1_host_tsc_hz (g_vms[0].host_tsc_hz)
-#define g_fw_1_vmrun_tsc (g_vms[0].vmrun_tsc)
-#define g_fw_1_body_tsc (g_vms[0].body_tsc)
-#define g_fw_1_prev_post_tsc (g_vms[0].prev_post_tsc)
-#define g_fw_1_irq0_recoverable_tsc (g_vms[0].irq0_recoverable_tsc)
-#define g_fw_1_irq0_pending_tsc (g_vms[0].irq0_pending_tsc)
-#define g_fw_1_stall_prev_tsc (g_vms[0].stall_prev_tsc)
-#define g_fw_1_vmrun_max_tsc (g_vms[0].vmrun_max_tsc)
-#define g_fw_1_vmrun_over100ms (g_vms[0].vmrun_over100ms)
+/* M8-0 shims: the FW-1 path still names g_fw_1_*; each expands to `vm->X`,
+ * where `vm` is the hype_fw_vm_t* threaded through run_fw_1_test()/efi_main
+ * (step 2). So the path operates on whatever instance the caller passes. */
+#define g_fw_1_combined_host_phys (vm->combined_host_phys)
+#define g_fw_1_combined_size (vm->combined_size)
+#define g_fw_1_code_size (vm->code_size)
+#define g_fw_1_vars_size (vm->vars_size)
+#define g_fw_1_ram_host_phys (vm->ram_host_phys)
+#define g_fw_1_e820_blob (vm->e820_blob)
+#define g_fw_1_guest_stack (vm->guest_stack)
+#define g_fw_1_pic (vm->pic)
+#define g_fw_1_pit (vm->pit)
+#define g_fw_1_pci (vm->pci)
+#define g_fw_1_cmos (vm->cmos)
+#define g_fw_1_lapic (vm->lapic)
+#define g_fw_1_uart (vm->uart)
+#define g_fw_1_uart2 (vm->uart2)
+#define g_fw_1_ps2 (vm->ps2)
+#define g_fw_1_mouse (vm->mouse)
+#define g_fw_1_fw_cfg (vm->fw_cfg)
+#define g_fw_1_rsdp (vm->rsdp)
+#define g_fw_1_tables_blob (vm->tables_blob)
+#define g_fw_1_loader_script (vm->loader_script)
+#define g_fw_1_ahci (vm->ahci)
+#define g_fw_1_atapi (vm->atapi)
+#define g_fw_1_dma_map (vm->dma_map)
+#define g_fw_1_host_tsc_hz (vm->host_tsc_hz)
+#define g_fw_1_vmrun_tsc (vm->vmrun_tsc)
+#define g_fw_1_body_tsc (vm->body_tsc)
+#define g_fw_1_prev_post_tsc (vm->prev_post_tsc)
+#define g_fw_1_irq0_recoverable_tsc (vm->irq0_recoverable_tsc)
+#define g_fw_1_irq0_pending_tsc (vm->irq0_pending_tsc)
+#define g_fw_1_stall_prev_tsc (vm->stall_prev_tsc)
+#define g_fw_1_vmrun_max_tsc (vm->vmrun_max_tsc)
+#define g_fw_1_vmrun_over100ms (vm->vmrun_over100ms)
 
 /* ISO-1's loaded test.iso buffer -- shared: both VMs boot the same media. */
 static uint64_t g_iso_host_phys;
@@ -4288,7 +4295,7 @@ static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
  * directly. (FW-1's guest paging is identity, so a guest-linear RIP
  * equals its guest-physical address here.) Mirrors exactly the two
  * hype_npt_map_range() calls in the NPT build below. */
-static const uint8_t *fw_1_guest_phys_to_host(uint64_t gpa) {
+static const uint8_t *fw_1_guest_phys_to_host(hype_fw_vm_t *vm, uint64_t gpa) {
     uint64_t flash_base = 0x100000000ULL - g_fw_1_combined_size;
     if (gpa < HYPE_FW_1_GUEST_RAM_BYTES) {
         return (const uint8_t *)(uintptr_t)(g_fw_1_ram_host_phys + gpa);
@@ -4301,8 +4308,8 @@ static const uint8_t *fw_1_guest_phys_to_host(uint64_t gpa) {
 
 /* Reads one 64-bit guest page-table entry at guest-physical `gpa`, or
  * returns 0 (a not-present entry) if it isn't backed. */
-static uint64_t fw_1_read_guest_pte(uint64_t gpa) {
-    const uint8_t *p = fw_1_guest_phys_to_host(gpa & ~0xFFFULL);
+static uint64_t fw_1_read_guest_pte(hype_fw_vm_t *vm, uint64_t gpa) {
+    const uint8_t *p = fw_1_guest_phys_to_host(vm, gpa & ~0xFFFULL);
     if (p == 0) {
         return 0;
     }
@@ -4320,15 +4327,15 @@ static uint64_t fw_1_read_guest_pte(uint64_t gpa) {
  * 2 MiB large pages (PS bit); returns -1 on any not-present level.
  * Assumes 4-level paging (this project never advertises LA57 to guests).
  * The PHYSMASK matches x86-64's 52-bit max physical address. */
-static int fw_1_guest_virt_to_phys(uint64_t cr3, uint64_t gva, uint64_t *out_gpa) {
+static int fw_1_guest_virt_to_phys(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva, uint64_t *out_gpa) {
     const uint64_t PHYS = 0x000FFFFFFFFFF000ULL; /* bits 51:12 */
     uint64_t e;
 
-    e = fw_1_read_guest_pte((cr3 & PHYS) + (((gva >> 39) & 0x1FFULL) * 8ULL)); /* PML4E */
+    e = fw_1_read_guest_pte(vm, (cr3 & PHYS) + (((gva >> 39) & 0x1FFULL) * 8ULL)); /* PML4E */
     if ((e & 1ULL) == 0) {
         return -1;
     }
-    e = fw_1_read_guest_pte((e & PHYS) + (((gva >> 30) & 0x1FFULL) * 8ULL)); /* PDPTE */
+    e = fw_1_read_guest_pte(vm, (e & PHYS) + (((gva >> 30) & 0x1FFULL) * 8ULL)); /* PDPTE */
     if ((e & 1ULL) == 0) {
         return -1;
     }
@@ -4336,7 +4343,7 @@ static int fw_1_guest_virt_to_phys(uint64_t cr3, uint64_t gva, uint64_t *out_gpa
         *out_gpa = (e & 0x000FFFFFC0000000ULL) | (gva & 0x3FFFFFFFULL);
         return 0;
     }
-    e = fw_1_read_guest_pte((e & PHYS) + (((gva >> 21) & 0x1FFULL) * 8ULL)); /* PDE */
+    e = fw_1_read_guest_pte(vm, (e & PHYS) + (((gva >> 21) & 0x1FFULL) * 8ULL)); /* PDE */
     if ((e & 1ULL) == 0) {
         return -1;
     }
@@ -4344,7 +4351,7 @@ static int fw_1_guest_virt_to_phys(uint64_t cr3, uint64_t gva, uint64_t *out_gpa
         *out_gpa = (e & 0x000FFFFFFFE00000ULL) | (gva & 0x1FFFFFULL);
         return 0;
     }
-    e = fw_1_read_guest_pte((e & PHYS) + (((gva >> 12) & 0x1FFULL) * 8ULL)); /* PTE */
+    e = fw_1_read_guest_pte(vm, (e & PHYS) + (((gva >> 12) & 0x1FFULL) * 8ULL)); /* PTE */
     if ((e & 1ULL) == 0) {
         return -1;
     }
@@ -4356,15 +4363,15 @@ static int fw_1_guest_virt_to_phys(uint64_t cr3, uint64_t gva, uint64_t *out_gpa
  * whose RIP may be virtual: try a guest page-table walk (CR3), then fall
  * back to treating RIP as guest-physical (correct for an identity-paged
  * guest such as OVMF). Used only when decode assists gave nothing. */
-static const uint8_t *fw_1_insn_bytes_via_ptwalk(hype_vcpu_ctx_t *ctx, uint64_t guest_rip) {
+static const uint8_t *fw_1_insn_bytes_via_ptwalk(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, uint64_t guest_rip) {
     uint64_t gpa = 0;
-    if (fw_1_guest_virt_to_phys(hype_svm_vcpu_get_cr3(ctx), guest_rip, &gpa) == 0) {
-        const uint8_t *p = fw_1_guest_phys_to_host(gpa);
+    if (fw_1_guest_virt_to_phys(vm, hype_svm_vcpu_get_cr3(ctx), guest_rip, &gpa) == 0) {
+        const uint8_t *p = fw_1_guest_phys_to_host(vm, gpa);
         if (p != 0) {
             return p;
         }
     }
-    return fw_1_guest_phys_to_host(guest_rip);
+    return fw_1_guest_phys_to_host(vm, guest_rip);
 }
 
 /* FW-1e: drain the guest UART's transmit ring, strip terminal escape
@@ -4578,7 +4585,7 @@ static void fw_1_dump_prev_diag(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
  * code, and CS. So host faults are caught permanently and with more context,
  * without patching anyone else's IDT. */
 
-static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
+static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
     hype_vmexit_info_t info;
@@ -5082,7 +5089,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                      * string/ALU ops = real work. Kernel RIPs translate via any
                      * CR3 (kernel half is shared), so this resolves. */
                     if (top[0] >= 0) {
-                        const uint8_t *ib = fw_1_insn_bytes_via_ptwalk(ctx, riphist_rip[top[0]]);
+                        const uint8_t *ib = fw_1_insn_bytes_via_ptwalk(vm, ctx, riphist_rip[top[0]]);
                         if (ib != 0) {
                             hype_debug_print("fw-1 RIPHOT-INSN 0x%llx: %02x %02x %02x %02x %02x %02x "
                                              "%02x %02x %02x %02x %02x %02x\n",
@@ -5636,7 +5643,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 }
             }
             if (insn_n == 0) {
-                insn = fw_1_insn_bytes_via_ptwalk(ctx, info.guest_rip);
+                insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
             }
             /* FW-1b: the guest Local APIC at 0xFEE00000 is the expected
              * NPF here (the region is not-present by design). */
@@ -6420,6 +6427,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
     int have_gop;
     UINT64 usable_ram_bytes = 0;
+    /* M8-0: the FW-1 guest is instance 0 of g_vms[]. Everything the setup
+     * block below builds -- guest RAM/firmware, the emulated devices, the
+     * timing state -- lands in *this* instance; the `g_fw_1_X` shims expand
+     * to `vm->X`, so this one declaration threads the instance through both
+     * efi_main's setup and run_fw_1_test(). A second Alpine (g_vms[1], on its
+     * own core -- M8-0b) will get its own vm here. */
+    hype_fw_vm_t *vm = &g_vms[0];
     /* RT-2a: the guest now runs AFTER ExitBootServices (below), so its
      * ops/kind must outlive the pre-EBS setup block that computes them. */
     hype_test_guest_args_t args;
@@ -7027,7 +7041,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * hangs after marking its TSC unstable). For a live boot this never
      * returns; the chord/idle tail below is reached only if it gives up.
      */
-    run_fw_1_test(args.ops, args.kind);
+    run_fw_1_test(vm, args.ops, args.kind);
 
     {
         /* INPUT-4: leader-chord recognition (plan.md §6b). No dashboard
