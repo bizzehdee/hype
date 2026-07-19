@@ -1337,7 +1337,27 @@ tasks — see updated deps below.*
   init_count stay 0): the kernel now DOES program the LAPIC timer
   (init=10M) -- behaviour changed -- so making it usable is now the lever.
 
-  SCOPE (concrete):  [b5a DONE, b5b AUDITED, b5c HELD pending HW]
+  STATUS 2026-07-19: b5a DONE (correct, lapic_irq 4->479), b5b AUDITED
+  (no bug), b5c DONE (ARAT, correct) -- but NONE fixed the boot speed. The
+  guest arms the LAPIC timer then re-masks it regardless (ever_armed=0x20020,
+  svr=0x3ff, dcr=0xb confirmed on HW), and vmrun_tot stayed ~325-340s. The
+  LAPIC-timer path is a DEAD END for boot speed. Root cause of the 22x-slow
+  boot re-identified by disassembling the #1 hot RIP against the extracted
+  vmlinux: it's finish_task_switch+0x9d -- the return from local_irq_enable
+  (pv_ops+0x100 = pv_native_irq_enable, an indirect paravirt call through a
+  retpoline/__x86_return_thunk) after raw_spin_unlock. So the guest is CHURNING
+  THE SCHEDULER (context-switching heavily, tasks blocking on events), not
+  spinning or HLT-idling. Why the same guest that QEMU boots in ~15s churns for
+  340s on hype (scheduler/event-latency churn) is not cleanly pinpointable from
+  the RT-3 tail; remaining hypotheses (un-inlined paravirt/retpoline overhead;
+  dropping the CPUID hypervisor bit for fully-native guest paths) are
+  speculative/risky. PARKED: the boot works (reaches login on real HW), the
+  slowness is pre-existing (~5 min since M4-6), and it's an iteration annoyance
+  not a correctness blocker. Real fix (if pursued) is substantial: async device
+  completion, or a high-res clockevent the guest actually keeps. b5a/b5c stay
+  in (correct improvements). ORIGINAL SCOPE below for reference.
+
+  SCOPE (concrete):  [b5a DONE, b5b AUDITED, b5c DONE -- none fixed boot speed]
   - **b5a — correct count rate. DONE.** guest_lapic.c advance() now divides the
     base-rate advance by the guest's Divide Configuration Register
     (hype_guest_lapic_divisor, SDM bits[3,1,0], with a fractional carry in
