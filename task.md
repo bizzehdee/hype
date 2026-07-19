@@ -4678,3 +4678,34 @@ explain -- the giant stalls + any exit-induced execution slowdown are a distinct
 possibly larger lever. MEASURE-FIRST NEXT: instrument long VMRUNs (>50ms: capture
 guest RIP + preceding exit reason) to learn what the 13s stall is, BEFORE
 committing to the IO-APIC build.
+
+PERF-1 PRIORITY CORRECTED (2026-07-19, expert review #2): "pure I/O VM-exit
+overhead" was INCOMPLETE. The forced 1kHz host-LAPIC-timer INTR exits are ~44%
+of all exits and nearly as numerous as ALL port-I/O combined: vm0 intr=356972
+vs ioio=422191 (of total=807091). Each AP arms a PERIODIC 1ms LAPIC timer
+(fw_1_ap_main, inc5) so a non-exiting guest still gets its due tick injected --
+but that forces ~1000 exits/s even when the next guest timer deadline is much
+farther away, and most fire with no guest tick due = pure overhead. (This also
+inflates the ~350s vmrun_tot: each forced world-switch flushes TLB/cache, so
+collapsing them should speed guest EXECUTION too, not just cut hype body time.)
+REVISED PRIORITY (supersedes the IO-APIC-first note above):
+  1. Replace each AP's PERIODIC 1ms host LAPIC timer with a ONE-SHOT DEADLINE
+     timer, armed to the earliest guest PIT/LAPIC timer deadline. MUST still
+     interrupt a non-exiting guest when a virtual timer is due (preserve the
+     starvation guard), but not force 1000 exits/s between deadlines. hype
+     already models the guest PIT (devices/pit.c) + guest LAPIC (guest_lapic.c)
+     so it can compute the next deadline in host-TSC terms; use LVT one-shot,
+     re-arm on each fire + whenever the guest reprograms a timer (already an
+     exit); cap the deadline so an idle guest still gets periodic wake (console
+     drain / loop-top work).
+  2. RE-MEASURE. Should collapse both the direct INTR exits AND much of the
+     PIC/PIT churn.
+  3. One controlled boot with the guest serial console disabled/minimised (guest
+     cmdline only, NO device-model change) to ISOLATE the ~140k UART port exits.
+  4. THEN the Linux boot-media path: virtio storage/console instead of the
+     chatty legacy AHCI/ATAPI + UART.
+port-0x80: still NOT passthrough (breaches no-direct-hw-access). ~8% only via
+guest io_delay=none (source-side policy), not IOPM passthrough.
+So the FIRST real fix is deadline-driven host preemption, not IO-APIC / port
+0x80 / AHCI batching. IO-APIC (M4-6b3) + clockevent (M4-6b5) + virtio remain
+valid follow-ups, re-ranked by the post-deadline-timer re-measurement.
