@@ -13,6 +13,8 @@
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
+#include "../core/io_histogram.h"
+#include "../core/format.h"
 #include "../arch/x86_64/cpu/cpu_features.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -417,6 +419,15 @@ static void fw_1_ap_main(void *arg) {
  * (they print too early to otherwise be in the 16 KB tail). Diagnostic aid for
  * the single FW-1 guest -- file-global like the ISO buffer above. */
 static hype_clockfacts_t g_fw_1_clockfacts;
+/* PERF-1: per-port I/O-exit histogram, one array per VM (indexed by vm - g_vms)
+ * so the two concurrent guests don't race on one array and each guest's port
+ * distribution is exact. 256KB/VM of BSS -- bounded measurement instrumentation;
+ * gate off (HYPE_IO_HISTOGRAM 0) to reclaim it once the dominant port is known
+ * and the fix (virtio-blk boot) has landed. */
+#define HYPE_IO_HISTOGRAM 1
+#if HYPE_IO_HISTOGRAM
+static uint32_t g_fw_1_io_hist[HYPE_FW_MAX_VMS][HYPE_IO_HIST_PORTS];
+#endif
 #define HYPE_PIT_HZ 1193182ULL
 /* M4-6b5: the guest LAPIC timer's base (pre-divide) input frequency, expressed
  * as a multiple of PIT_HZ so it reuses the loop's already-computed real-elapsed
@@ -5204,6 +5215,32 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
                                  ex_cpuid, ex_vintr, ex_pause, ex_intr, ex_other);
+#if HYPE_IO_HISTOGRAM
+                /* PERF-1: name the dominant IOIO ports (which the ioio= total
+                 * above can't split). One line: "IOHIST vmN total=T: 0xPORT=N ..."
+                 * top 12, descending. This is the measurement that decides which
+                 * safe path to optimise (serial vs PCI vs AHCI legacy vs ...). */
+                {
+                    hype_io_hist_entry_t top[12];
+                    unsigned nt = hype_io_hist_top(g_fw_1_io_hist[vm - g_vms], HYPE_IO_HIST_PORTS, top,
+                                                   (unsigned)(sizeof(top) / sizeof(top[0])));
+                    char hline[320];
+                    int off = hype_snprintf(hline, sizeof(hline), "fw-1 IOHIST vm%u total=%llu:",
+                                            (unsigned)(vm - g_vms),
+                                            (unsigned long long)hype_io_hist_total(
+                                                g_fw_1_io_hist[vm - g_vms], HYPE_IO_HIST_PORTS));
+                    unsigned hi;
+                    for (hi = 0; hi < nt && off > 0 && (unsigned)off < sizeof(hline); hi++) {
+                        int n = hype_snprintf(hline + off, sizeof(hline) - (unsigned)off, " 0x%x=%llu",
+                                              (unsigned)top[hi].port, (unsigned long long)top[hi].count);
+                        if (n <= 0) {
+                            break;
+                        }
+                        off += n;
+                    }
+                    hype_debug_print("%s\n", hline);
+                }
+#endif
                 /* M4-6d4: mean per-exit cost split VMRUN world-switch vs our
                  * loop body, in nanoseconds (TSC / host_tsc_hz * 1e9). Tells
                  * whether the ~219us/exit is the CPU's world-switch (VMRUN
@@ -5975,6 +6012,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
+#if HYPE_IO_HISTOGRAM
+            /* PERF-1: record EVERY I/O exit's port before the handler cascade
+             * runs (peek = decode only, no RIP advance), so the histogram covers
+             * handled ports (serial/PCI/PIT/PIC/CMOS) as well as absorbed ones,
+             * not just the 0x80/AHCI sub-buckets the EXHIST line already tracks. */
+            {
+                hype_svm_ioio_t io_peek;
+                hype_svm_vcpu_peek_ioio(ctx, &io_peek);
+                hype_io_hist_record(g_fw_1_io_hist[vm - g_vms], HYPE_IO_HIST_PORTS, io_peek.port);
+            }
+#endif
             if (hype_svm_vcpu_handle_ioio(ctx, &g_fw_1_pic, &g_fw_1_pit) == 0) {
                 continue;
             }

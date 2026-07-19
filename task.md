@@ -4474,12 +4474,23 @@ hype has the FASTER media and is still 4x slower => the 4x is PURE
 trap-and-emulate I/O-VMEXIT overhead, not media. NOT a spin (kvmclock
 accurate vs stopwatch; MADT=1 CPU, no phantom SMP; the sysvec_call_function
 "hotspot" was a __pfx symbol-resolution artifact). Exit counts point at I/O:
-io80=65416 (port-0x80 outb_p delay writes -- pure-overhead VMEXITs, killable
-by not intercepting port 0x80), ioio=414278 total (likely serial-console
-per-byte OUT 0x3F8 + PCI cfg + AHCI), npf(ahci)=15974 (emulated-CD MMIO).
-NEXT: per-port IOIO histogram to find the biggest lever + port-0x80
-passthrough; then batch ATAPI/AHCI or boot from virtio-blk instead of the
-chatty emulated CD. This is the real PERF-1 target now.
+io80=65416 (port-0x80 outb_p delay writes), ioio=414278 total (likely serial
+per-byte OUT 0x3F8 + PCI cfg + AHCI -- needs a per-port histogram to split),
+npf(ahci)=15974 (emulated-CD MMIO).
+CORRECTION (2026-07-19, expert review): REJECT the earlier "port-0x80
+passthrough" idea. Clearing port 0x80's IOPM bit would let the guest run a REAL
+host OUT 0x80 -- violates hype's hard "no direct hardware access" invariant (a
+security invariant), unacceptable regardless of being harmless on most PCs. Safe
+alternatives: keep interception but cut the delay writes guest-side (paravirtual
+io_delay config), or reduce broader boot-device exit load. The real cost is the
+per-VMRUN transition (HW COSTHIST: mean vmrun ~440-680us/exit) x ~420k IOIO +
+~350k intr exits -> minutes; so REDUCING EXIT COUNT is the lever.
+NEXT (expert-endorsed): (1) add a per-port IOIO histogram (bounded, tested --
+current code only counts 0x80 + AHCI-NPF separately, can't split the ~350k),
+measure SAME build QEMU + HW; (2) quantify serial/PCI/PIT/PIC/CMOS vs AHCI;
+(3) optimise the dominant SAFE path -- strongest lever is virtio-blk boot for
+the Linux ISO (plan already specifies virtio-blk for Linux/BSD) replacing the
+chatty emulated AHCI/ATAPI CD. This is the real PERF-1 target now.
 
 PERF-1 BASELINE CAVEAT (2026-07-19): the 90s native baseline was
 alpine-STANDARD, not alpine-virt (alpine-virt netbooted/fell to recovery on
@@ -4488,9 +4499,10 @@ ROUGH cross-kernel ratio, not clean same-kernel. alpine-virt is the lighter
 workload, so the true same-kernel ratio is likely somewhat >4x. Clean
 comparison TODO: boot alpine-standard UNDER hype vs the 90s native-standard.
 The DIRECTION still holds: single-digit-x (not 60x), I/O-VMEXIT overhead
-(not a spin). The I/O investigation (per-port IOIO histogram, port-0x80
-passthrough, batch ATAPI / virtio-blk boot) is valid regardless of the
-exact multiplier.
+(not a spin). The I/O investigation (per-port IOIO histogram → quantify →
+optimise the dominant safe path, likely virtio-blk boot) is valid regardless
+of the exact multiplier. (port-0x80 "passthrough" REJECTED -- see correction
+above: it would breach the no-direct-hardware-access invariant.)
 
 GUEST-COMPLEXITY LADDER + M8-0b sequence (user direction 2026-07-19):
 stay on alpine-VIRT until BOTH multi-core milestones are confirmed, THEN
@@ -4502,8 +4514,8 @@ climb the guest ladder. Order:
   3. THEN alpine-STANDARD (fuller kernel; also the clean same-kernel perf
      baseline vs the 90s native-standard) as an intermediate rung.
   4. THEN a heavy distro (Fedora / Ubuntu).
-PERF-1 I/O-overhead work (per-port IOIO histogram, port-0x80 passthrough,
-virtio-blk boot) is deferred behind the multi-core milestone per this
+PERF-1 I/O-overhead work (per-port IOIO histogram → virtio-blk boot; NOT
+port-0x80 passthrough -- rejected) is deferred behind the multi-core milestone per this
 direction. alpine-standard-under-hype was tried once (278MB ISO) then
 reverted to alpine-virt to keep the milestone path clean.
 

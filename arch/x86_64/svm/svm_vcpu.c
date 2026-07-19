@@ -530,6 +530,15 @@ void hype_svm_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_svm_npf_t *out) {
     hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, out);
 }
 
+/* PERF-1: decode an IOIO exit's port/direction/size WITHOUT consuming it (no
+ * RIP advance, no RAX write) -- lets the FW-1 loop record every I/O exit's port
+ * into the per-port histogram at the top of its IOIO branch, before the normal
+ * handler cascade runs and advances RIP. Read-only on the VMCB. */
+void hype_svm_vcpu_peek_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *out) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, out);
+}
+
 void hype_svm_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *out) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
 

@@ -243,6 +243,10 @@ void hype_svm_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_svm_npf_t *out);
  */
 void hype_svm_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *out);
 
+/* PERF-1: read an IOIO exit's decoded port/dir/size without consuming the exit
+ * (no RIP/RAX change) -- for per-port histogram instrumentation. */
+void hype_svm_vcpu_peek_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *out);
+
 /*
  * FW-1: routes an IOIO VM-exit to `pci`'s legacy CF8/CFC config-space
  * ports (devices/pci.h's hype_pci_cf8_write()/_read()/
