@@ -37,6 +37,12 @@ not treat them as project-licensed material.
 | `24593_3.44_APM_Vol2.pdf` | AMD64 Architecture Programmer's Manual, Vol. 2 — System Programming (SVM/VMCB) | pub. 24593, Rev. 3.44 | https://docs.amd.com/v/u/en-US/24593_3.44_APM_Vol2 |
 | `325462-092-sdm-vol-1-2abcd-3abcd-4.pdf` | Intel® 64 and IA-32 Architectures Software Developer's Manuals — combined volume set (Vol. 1, 2ABCD, 3ABCD, 4) | order 325462, rev. 092 | https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html |
 
+## Archived wiki exports
+
+| Source | Snapshot | Derived Markdown | Notes |
+|------|----------|----------|------|
+| `OSDev+Wiki-20260719190820.xml` | 2026-07-19 19:08:20 | `osdev-wiki/` | One Markdown file per non-template article; exported templates are expanded into their use sites. |
+
 ### Key extracts captured against tasks
 
 - **AMD APM Vol 2 (`24593_3.44_APM_Vol2.pdf`).** SVM/VMCB work — §15 (SVM:

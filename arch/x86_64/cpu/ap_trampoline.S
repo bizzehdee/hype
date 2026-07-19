@@ -85,6 +85,18 @@ long_entry:
     movw %ax, %fs
     movw %ax, %gs
 
+    # Enable SSE before entering C: the BSP inherited CR0/CR4 SSE bits from
+    # UEFI, but this AP came up through our own trampoline with only PE/PG/PAE
+    # set. Compiled C (run_fw_1_test) uses XMM registers, which #UD (vector 6)
+    # unless CR0.EM is clear + CR0.MP set and CR4.OSFXSR/OSXMMEXCPT are set.
+    movq %cr0, %rax
+    andq $-5, %rax              # clear CR0.EM (bit 2)
+    orq  $0x2, %rax             # set CR0.MP (bit 1)
+    movq %rax, %cr0
+    movq %cr4, %rax
+    orq  $0x600, %rax           # CR4.OSFXSR (9) | CR4.OSXMMEXCPT (10)
+    movq %rax, %cr4
+
     # %rbx == base (upper 32 bits zero-extended from the 32-bit writes; base < 1 MiB).
     movl $3, (tramp_phase - hype_ap_tramp_start)(%rbx)   # phase 3: long mode
     movq (tramp_stack - hype_ap_tramp_start)(%rbx), %rsp

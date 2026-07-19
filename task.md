@@ -4135,6 +4135,17 @@ a v2 feature (see `V2-MGMT-1` below), not started now.
 
 ---
 
+## RESEARCH — Offline reference archive
+
+- [x] **RESEARCH-1** — Render the archived OSDev Wiki MediaWiki export into
+  one Markdown file per non-template article, expanding the export's template
+  definitions into each article and retaining source-page metadata. Preserve
+  unsupported MediaWiki constructs verbatim where conversion would lose
+  information.
+  Deps: —
+
+---
+
 ## STRETCH (plan.md §9, no hard deps beyond a working v1)
 
 - [ ] **STRETCH-1** — Legacy/CSM boot shim.
@@ -4411,4 +4422,25 @@ pool slot; vmrun_full dispatches by ctx==&g_ctx_pool[i]. _Static_assert keeps
 VMCB=4KB so pool elements stay page-aligned. NEXT (inc 4): allocate g_vms[1]
 resources (or run g_vms[0] on the AP for the perf test); then inc 5 the
 dedicated-core guest-timer + console.
+
+M8-0b-ii GUEST-ON-AP (2026-07-19): ran the FW-1 guest (g_vms[0]) on the
+DEDICATED AP core (HYPE_RUN_GUEST_ON_AP), BSP idle. QEMU -smp 2 boots to
+login with a night-and-day profile vs the shared BSP:
+  preempt_if1: ~335000 -> 0   (no 1000Hz host tick on the AP)
+  INTR VMEXITs: ~335000 -> 0
+  total VMEXITs: ~780000 -> 125471 (~6x fewer)
+  idle (hlt_wait): ~0%% -> 89%% (guest reaches login then genuinely HLT-idles)
+i.e. the guest booted in a few seconds of execution then idled 27/30s --
+the shared-core host-tick churn WAS the execution-bound cost (PERF-1). The
+original dedicated-core hypothesis is validated on QEMU; the wall-clock win
+will show on HW (where the BSP boot was 392s execution-bound). kvmclock
+armed on the AP guest too (arm_count=1).
+Two AP-specific fixes found via this experiment (QEMU caught both):
+  - AP needs its own <4GB CR3 (UEFI loaded hype >4GB) -- done earlier.
+  - AP must enable SSE (CR0.EM clear/MP set, CR4.OSFXSR|OSXMMEXCPT): the AP
+    came up via our trampoline and did NOT inherit UEFI's FPU/SSE CR bits,
+    so compiled C in run_fw_1_test #UD'd (vector 6). Added to the trampoline.
+HYPE_RUN_GUEST_ON_AP is a gated experiment (BSP idle, one guest on the AP);
+the full two-Alpines-two-cores is inc 4+5 (VM1 resources + polished
+dedicated-core timer/console). AWAITING HW: the real boot-time drop.
 

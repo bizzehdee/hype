@@ -279,8 +279,17 @@ static uint64_t g_usable_ram_bytes;
  * (allocated pre-EBS) + a stack for the AP's 64-bit C landing. Set
  * HYPE_AP_SMOKETEST to 0 once the AP path is folded into M8-0b-ii. */
 #define HYPE_AP_SMOKETEST 1
+/* M8-0b-ii perf experiment: run the FW-1 guest (g_vms[0]) on the AP (a
+ * DEDICATED core, free of the BSP's 1000Hz host-tick preemption), with the
+ * BSP idle -- to measure whether the ~335K host-tick VMEXITs were the cost of
+ * the slow boot (the guest's clock is now kvmclock, so it doesn't need the
+ * host-tick-driven timebase). A stepping stone to two Alpines on two cores. */
+#define HYPE_RUN_GUEST_ON_AP 1
 static uint64_t g_ap_tramp_page;
 static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
+/* Stashed for fw_1_ap_main to run the guest on the AP (set in efi_main). */
+static const hype_vmm_ops_t *g_fw_1_ops;
+static hype_vmm_kind_t g_fw_1_kind;
 /* M8-0b-ii: the AP's own SVM host-save area (SVME/VM_HSAVE_PA are per-core) +
  * a flag the AP sets once it has enabled SVM on its core without faulting. */
 static uint8_t g_ap_hsave[4096] __attribute__((aligned(4096)));
@@ -293,11 +302,13 @@ static int g_fw_1_ap_rc = -2;
 static uint64_t g_fw_1_ap_cr3; /* host CR3 at smoketest time (for the diag) */
 static uint64_t g_ap_cr3;      /* the AP's own <4GB identity-map page-table root */
 
+/* Defined much later; fw_1_ap_main runs it on the AP under HYPE_RUN_GUEST_ON_AP. */
+static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind);
+
 /* M8-0b-ii: the AP's C landing (runs on the second core, on hype's paging,
- * with its own stack). Increment 1: prove the AP can become a hypervisor core
- * -- enable SVM on it (its own host-save area) and report success. A later
- * increment loads a per-AP GDT/IDT and runs run_fw_1_test(&g_vms[1]) here to
- * put a second Alpine on this core. Never returns. */
+ * with its own stack). It loads hype's GDT/IDT, enables SVM on this core, and
+ * -- under HYPE_RUN_GUEST_ON_AP -- runs the FW-1 guest here (the dedicated-core
+ * perf experiment). Never returns. */
 static void fw_1_ap_main(void *arg) {
     (void)arg;
     /* Give the AP a valid host environment before it can VMRUN: hype's own
@@ -310,6 +321,15 @@ static void fw_1_ap_main(void *arg) {
     hype_svm_enable_on((uint64_t)(uintptr_t)g_ap_hsave); /* faults never return */
     g_fw_1_ap_svm_ok = 1;
     g_hype_ap_c_alive = 1;
+#if HYPE_RUN_GUEST_ON_AP
+    /* Run the FW-1 guest on THIS (dedicated) core. run_fw_1_test builds the
+     * NPT/VMCB/devices and enters the dispatch loop; it never returns for a
+     * live boot. No host 1000Hz tick reaches this core, so the guest is not
+     * force-preempted every 1ms -- the timebase still advances per natural
+     * exit (rdtsc-based) and the clocksource is kvmclock. This is the
+     * dedicated-core perf measurement. */
+    run_fw_1_test(&g_vms[0], g_fw_1_ops, g_fw_1_kind);
+#endif
     for (;;) {
         __asm__ volatile("cli; hlt");
     }
@@ -6965,6 +6985,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * moot now that the single guest runs on the BSP post-EBS. */
         args.ops = ops;
         args.kind = kind;
+        g_fw_1_ops = ops;   /* M8-0b-ii: so fw_1_ap_main can run the guest on the AP */
+        g_fw_1_kind = kind;
     }
 
     /* Real-hardware debugging: a hang with this as the last serial
@@ -7207,8 +7229,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * ambient firmware-timer preemption RT-2a removed (without it, the guest
      * hangs after marking its TSC unstable). For a live boot this never
      * returns; the chord/idle tail below is reached only if it gives up.
+     *
+     * M8-0b-ii: under HYPE_RUN_GUEST_ON_AP the guest runs on the AP instead
+     * (fw_1_ap_main above), so the BSP just idles here -- the dedicated-core
+     * perf experiment. (void)vm silences the unused warning in that mode.
      */
+#if HYPE_RUN_GUEST_ON_AP
+    (void)vm;
+    hype_debug_print("fw-1: guest dispatched to the AP (dedicated core); BSP idle\n");
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+#else
     run_fw_1_test(vm, args.ops, args.kind);
+#endif
 
     {
         /* INPUT-4: leader-chord recognition (plan.md §6b). No dashboard
