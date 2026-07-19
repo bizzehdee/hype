@@ -3934,6 +3934,20 @@ observability channel) must land FIRST.*
 ## (plan.md §9 M8, §6b, §6f, §6g, §10 decisions #11/#12)
 
 - [ ] **M8-0** — VM-instance struct: de-globalize the single hardcoded
+  STEP 1 DONE (2026-07-19): all ~32 g_fw_1_* singletons (guest
+  memory, ~18 emulated devices, per-run timing/diagnostics) gathered into
+  hype_fw_vm_t; static g_vms[HYPE_FW_MAX_VMS(=2)]. Transitional
+  `#define g_fw_1_X (g_vms[0].X)` shims keep the FW-1 path compiling
+  unchanged while storage becomes N-instanceable. QEMU-verified: boots to
+  localhost login, no regression. NEXT: thread an explicit vm pointer
+  through run_fw_1_test (retire the shims) -> M8-0a per-VM RAM/NPT -> M8-0b
+  own AP bring-up (INIT-SIPI-SIPI) to run g_vms[1] on a second core.
+  PERF NOTE (user hypothesis, 2026-07-19): running Alpine on a DEDICATED
+  AP core -- not sharing the BSP with hype + the 1000 Hz host-tick
+  preemption (328K INTR VMEXITs, each a TLB/cache flush) -- may sharply
+  change the perf numbers (the 160x-vs-QEMU execution inflation, PERF-1).
+  The PERF-1a instrumentation is in place to measure it the moment M8-0b
+  runs a VM on its own core.
   guest into an N-instance model. This is the load-bearing prerequisite
   for ALL of M8 -- surfaced by scoping "run two Alpine VMs concurrently"
   (2026-07-18): the config layer (hype.cfg `vms[16]`, M1-1) and admission

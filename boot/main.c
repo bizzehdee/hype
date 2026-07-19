@@ -152,101 +152,107 @@ static uint64_t g_ram_1_size_bytes;
  * above -- Boot Services calls from a non-BSP AP context is untested
  * territory this project has deliberately avoided all session).
  */
-static uint64_t g_fw_1_combined_host_phys;
-static uint64_t g_fw_1_combined_size;
-/*
- * FW-1a: the guest's own low RAM, backed by a real, freely-allocated
- * host buffer and NPT-mapped at guest-physical [0, size) -- NOT the flat
- * identity map used before, which handed the guest the host's real
- * sub-4GB MMIO hole (reads all-1s) wherever OVMF placed its DXE stack,
- * so OVMF read a garbage pointer off its own stack and jumped to -1 (see
- * task.md's FW section). Size is fixed well below the Q35 32-bit MMIO
- * hole base (PcdPciExpressBaseAddress = 0xE0000000, which OVMF asserts
- * low RAM stays under) and far above OVMF's ~26MB fixed early footprint
- * (SEC page tables/temp RAM + PEIFV/DXEFV shadows + decompression
- * scratch, up to 0x1A10000). 1 GiB is a safe contiguous allocation and
- * ample for reaching the OVMF shell; bump it (and it alone) when a later
- * milestone needs a bigger guest. Must stay 2MB-aligned (NPT granularity)
- * and <= 0xE0000000. */
-#define HYPE_FW_1_GUEST_RAM_BYTES (1024ULL * 1024ULL * 1024ULL) /* 1 GiB */
-static uint64_t g_fw_1_ram_host_phys;
-/* One usable e820 entry (20 bytes) is all FW-1 registers today; sized
- * for a handful in case a reserved region is ever added. */
-static uint8_t g_fw_1_e820_blob[HYPE_E820_ENTRY_SIZE * 8];
-/* ISO-1's own loaded test.iso buffer, kept around for ISO-2 to back
- * the AHCI/ATAPI model with real data instead of re-reading the file a
- * second time. */
-static uint64_t g_iso_host_phys;
-static uint64_t g_iso_size;
-/* Set once in efi_main() from the real UEFI memory map -- FW-1's own
- * CMOS model reports this (not a guessed/fixed value) as the guest's
- * memory size, matching how a real VM's memory-size discovery ought to
- * reflect what's actually available. */
-static uint64_t g_usable_ram_bytes;
-static uint64_t g_fw_1_code_size;
-static uint64_t g_fw_1_vars_size;
-static uint8_t g_fw_1_guest_stack[65536] __attribute__((aligned(4096)));
-static hype_pic_emu_t g_fw_1_pic;
-static hype_pit_emu_t g_fw_1_pit;
-static hype_pci_t g_fw_1_pci;
-static hype_cmos_t g_fw_1_cmos;
-static hype_guest_lapic_t g_fw_1_lapic; /* FW-1b: guest Local APIC (0xFEE00000) */
-static hype_guest_uart_t g_fw_1_uart;  /* FW-1e: guest 16550 UART (COM1 0x3F8) */
-static hype_guest_uart_t g_fw_1_uart2; /* FW-1e: guest 16550 UART (COM2 0x2F8) -- OVMF probes/uses both */
+/* Sizing constants (VM-independent). */
+#define HYPE_FW_1_GUEST_RAM_BYTES (1024ULL * 1024ULL * 1024ULL) /* 1 GiB; see hype_fw_vm_t.ram_host_phys */
 #define HYPE_SERIAL_COM2 0x2F8u
-static hype_ps2_kbd_t g_fw_1_ps2;     /* FW-1f: guest PS/2 keyboard (0x60/0x64) -- OVMF's actual ConIn */
-static hype_ps2_mouse_t g_fw_1_mouse; /* required by the shared PS/2 IOIO handler signature */
 #define HYPE_FW_1_KEY_ENTER_MAKE 0x1Cu /* Set-1 make code for Enter */
 #define HYPE_FW_1_DEBUG_PORT 0x402u    /* FW-1g: OVMF SEC/PEI PlatformDebugLibIoPort */
-static hype_fw_cfg_t g_fw_1_fw_cfg;
-static hype_acpi_rsdp_t g_fw_1_rsdp;
-static uint8_t g_fw_1_tables_blob[4096] __attribute__((aligned(64)));
-static hype_acpi_loader_entry_t g_fw_1_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENTRIES];
-/* FW-1h: a real AHCI/ATAPI CD-ROM controller so OVMF's BDS finds a
- * bootable optical drive (ISO-1's loaded \iso\test.iso). Device model
- * (M4-5), PCI discovery (PCI-2), and the real-ISO backing (ISO-2) all
- * already exist and are individually tested; FW-1h only integrates them
- * into the real-OVMF guest. The ATAPI model is backed by ISO-1's own
- * loaded buffer (g_iso_host_phys/g_iso_size), same as run_iso_2_test. */
-static hype_ahci_t g_fw_1_ahci;
-static hype_atapi_t g_fw_1_atapi;
-/* VALID-1/VALID-3: FW-1's guest-physical -> host layout (RAM + flash),
- * used to bounds-check every guest-supplied AHCI DMA address. */
-static hype_gpa_map_t g_fw_1_dma_map;
-/* M4-6b1: measured real host TSC frequency (Hz), calibrated once in
- * efi_main via a Boot-Services Stall. The FW-1 loop converts real TSC
- * deltas into guest PIT/LAPIC-timer ticks at the 8254's 1.193182 MHz
- * so the guest's TSC/timer calibration lands at the true CPU frequency
- * instead of a nonsense value. 0 until calibrated (loop then falls back
- * to a single tick per exit). */
-static uint64_t g_fw_1_host_tsc_hz;
-/* M4-6d4: VMRUN-vs-loop-body wall-clock split (TSC), to localise the
- * real-HW per-exit cost. Accumulated in the FW-1 loop, dumped in EXHIST. */
-static uint64_t g_fw_1_vmrun_tsc;
-static uint64_t g_fw_1_body_tsc;
-static uint64_t g_fw_1_prev_post_tsc;
-/* M4-6d4 measurement: wall-clock (TSC) during which the timer IRQ0 was
- * pending+unmasked, an ISR was in service (so the strict "both ISRs clear"
- * delivery gate blocked it), AND the guest could accept it (IF=1, no
- * shadow) -- i.e. exactly the time a fair priority-preemption scheme would
- * RECLAIM. Compared against total wall-clock this says how much of the
- * soft-lockup slowness the tick fix can actually recover. */
-static uint64_t g_fw_1_irq0_recoverable_tsc;
-/* Broader companion: total wall-clock a timer IRQ0 edge is pending+unmasked
- * but NOT yet delivered, for ANY reason (in-service gate, IF=0, shadow).
- * This is the upper bound on tick lateness -- how much faster delivery
- * could reclaim in total. Comparing the two: recoverable≈pending means the
- * in-service gate is the whole story (priority fix recovers it all);
- * recoverable<<pending means most lateness is the guest itself masking
- * interrupts (IF=0), which no delivery change can fix. */
-static uint64_t g_fw_1_irq0_pending_tsc;
-static uint64_t g_fw_1_stall_prev_tsc;
-/* M4-6d4: longest single VMRUN (guest ran this long before voluntarily
- * exiting) + count of VMRUNs over 100ms. A big max = the guest runs long
- * non-intercepting stretches we can't preempt -> a host preemption timer
- * (INTERCEPT_INTR + physical periodic timer) is the fix. */
-static uint64_t g_fw_1_vmrun_max_tsc;
-static unsigned long long g_fw_1_vmrun_over100ms;
+
+/*
+ * M8-0: per-VM instance state. Every field here was a `g_fw_1_*` singleton;
+ * gathered into one struct so N Alpine guests can run concurrently (each
+ * pinned to its own core -- M8-0b). The current single guest is g_vms[0];
+ * the `#define g_fw_1_X (g_vms[0].X)` shims below let the (huge, exempt) FW-1
+ * path keep compiling unchanged while the storage becomes N-instanceable.
+ * Later steps thread an explicit `vm` pointer through run_fw_1_test().
+ *
+ * NOT per-VM (stay file-global below): the loaded ISO buffer (both VMs boot
+ * the same media) and the host's usable-RAM total.
+ */
+#define HYPE_FW_MAX_VMS 2u
+typedef struct hype_fw_vm {
+    /* --- guest memory (OVMF firmware + low RAM) --- */
+    uint64_t combined_host_phys; /* OVMF_VARS+CODE, host-physical */
+    uint64_t combined_size;
+    uint64_t code_size;
+    uint64_t vars_size;
+    /* FW-1a: the guest's own low RAM, NPT-mapped at guest-physical [0,size).
+     * Must stay 2MB-aligned and <= 0xE0000000 (the Q35 32-bit MMIO hole base
+     * OVMF asserts low RAM stays under). See HYPE_FW_1_GUEST_RAM_BYTES. */
+    uint64_t ram_host_phys;
+    uint8_t e820_blob[HYPE_E820_ENTRY_SIZE * 8];
+    uint8_t guest_stack[65536] __attribute__((aligned(4096)));
+    /* --- emulated devices --- */
+    hype_pic_emu_t pic;
+    hype_pit_emu_t pit;
+    hype_pci_t pci;
+    hype_cmos_t cmos;
+    hype_guest_lapic_t lapic; /* FW-1b: guest Local APIC (0xFEE00000) */
+    hype_guest_uart_t uart;   /* FW-1e: COM1 0x3F8 */
+    hype_guest_uart_t uart2;  /* FW-1e: COM2 0x2F8 -- OVMF probes/uses both */
+    hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
+    hype_ps2_mouse_t mouse;   /* required by the shared PS/2 IOIO handler */
+    hype_fw_cfg_t fw_cfg;
+    hype_acpi_rsdp_t rsdp;
+    uint8_t tables_blob[4096] __attribute__((aligned(64)));
+    hype_acpi_loader_entry_t loader_script[HYPE_ACPI_LOADER_SCRIPT_ENTRIES];
+    hype_ahci_t ahci;   /* FW-1h: AHCI/ATAPI CD-ROM (backed by the loaded ISO) */
+    hype_atapi_t atapi;
+    hype_gpa_map_t dma_map; /* VALID-1/3: guest-phys->host layout for DMA bounds */
+    /* --- per-run timing + diagnostics (M4-6b1/M4-6d4/PERF-1a) --- */
+    uint64_t host_tsc_hz;   /* calibrated CPU freq; drives the guest timebase */
+    uint64_t vmrun_tsc;     /* VMRUN-vs-body split */
+    uint64_t body_tsc;
+    uint64_t prev_post_tsc;
+    uint64_t irq0_recoverable_tsc; /* tick lateness reclaimable by a priority fix */
+    uint64_t irq0_pending_tsc;     /* total tick lateness (upper bound) */
+    uint64_t stall_prev_tsc;
+    uint64_t vmrun_max_tsc;        /* longest single uninterrupted VMRUN */
+    unsigned long long vmrun_over100ms;
+} hype_fw_vm_t;
+
+static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
+
+/* M8-0 transitional shims: the FW-1 path still names g_fw_1_*; route them at
+ * VM instance 0 until run_fw_1_test() takes an explicit vm pointer. */
+#define g_fw_1_combined_host_phys (g_vms[0].combined_host_phys)
+#define g_fw_1_combined_size (g_vms[0].combined_size)
+#define g_fw_1_code_size (g_vms[0].code_size)
+#define g_fw_1_vars_size (g_vms[0].vars_size)
+#define g_fw_1_ram_host_phys (g_vms[0].ram_host_phys)
+#define g_fw_1_e820_blob (g_vms[0].e820_blob)
+#define g_fw_1_guest_stack (g_vms[0].guest_stack)
+#define g_fw_1_pic (g_vms[0].pic)
+#define g_fw_1_pit (g_vms[0].pit)
+#define g_fw_1_pci (g_vms[0].pci)
+#define g_fw_1_cmos (g_vms[0].cmos)
+#define g_fw_1_lapic (g_vms[0].lapic)
+#define g_fw_1_uart (g_vms[0].uart)
+#define g_fw_1_uart2 (g_vms[0].uart2)
+#define g_fw_1_ps2 (g_vms[0].ps2)
+#define g_fw_1_mouse (g_vms[0].mouse)
+#define g_fw_1_fw_cfg (g_vms[0].fw_cfg)
+#define g_fw_1_rsdp (g_vms[0].rsdp)
+#define g_fw_1_tables_blob (g_vms[0].tables_blob)
+#define g_fw_1_loader_script (g_vms[0].loader_script)
+#define g_fw_1_ahci (g_vms[0].ahci)
+#define g_fw_1_atapi (g_vms[0].atapi)
+#define g_fw_1_dma_map (g_vms[0].dma_map)
+#define g_fw_1_host_tsc_hz (g_vms[0].host_tsc_hz)
+#define g_fw_1_vmrun_tsc (g_vms[0].vmrun_tsc)
+#define g_fw_1_body_tsc (g_vms[0].body_tsc)
+#define g_fw_1_prev_post_tsc (g_vms[0].prev_post_tsc)
+#define g_fw_1_irq0_recoverable_tsc (g_vms[0].irq0_recoverable_tsc)
+#define g_fw_1_irq0_pending_tsc (g_vms[0].irq0_pending_tsc)
+#define g_fw_1_stall_prev_tsc (g_vms[0].stall_prev_tsc)
+#define g_fw_1_vmrun_max_tsc (g_vms[0].vmrun_max_tsc)
+#define g_fw_1_vmrun_over100ms (g_vms[0].vmrun_over100ms)
+
+/* ISO-1's loaded test.iso buffer -- shared: both VMs boot the same media. */
+static uint64_t g_iso_host_phys;
+static uint64_t g_iso_size;
+/* Host usable-RAM total (UEFI memory map), reported by the guest CMOS model. */
+static uint64_t g_usable_ram_bytes;
 #define HYPE_PIT_HZ 1193182ULL
 /* M4-6b5: the guest LAPIC timer's base (pre-divide) input frequency, expressed
  * as a multiple of PIT_HZ so it reuses the loop's already-computed real-elapsed
