@@ -4481,3 +4481,14 @@ NEXT: per-port IOIO histogram to find the biggest lever + port-0x80
 passthrough; then batch ATAPI/AHCI or boot from virtio-blk instead of the
 chatty emulated CD. This is the real PERF-1 target now.
 
+PERF-1 BASELINE CAVEAT (2026-07-19): the 90s native baseline was
+alpine-STANDARD, not alpine-virt (alpine-virt netbooted/fell to recovery on
+the bare laptop -- no HW drivers). hype runs alpine-VIRT. So the ~4x is a
+ROUGH cross-kernel ratio, not clean same-kernel. alpine-virt is the lighter
+workload, so the true same-kernel ratio is likely somewhat >4x. Clean
+comparison TODO: boot alpine-standard UNDER hype vs the 90s native-standard.
+The DIRECTION still holds: single-digit-x (not 60x), I/O-VMEXIT overhead
+(not a spin). The I/O investigation (per-port IOIO histogram, port-0x80
+passthrough, batch ATAPI / virtio-blk boot) is valid regardless of the
+exact multiplier.
+
