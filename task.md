@@ -4326,3 +4326,19 @@ KVM signature without the MSR fill would arm a clock over an unfilled page.
 AWAITING QEMU + HW verify: boot to login + arm_count>0 + "Marking TSC
 unstable" gone + faster boot.
 
+PVCLOCK HW VERDICT (2026-07-19): kvmclock WORKS on real AMD silicon --
+"tsc: Detected 2096.624 MHz processor" at [0.000587] (was "could not
+calculate TSC khz"), "Marking TSC unstable" GONE, delay loop "(skipped)
+preset value" (lpj derived from tsc_khz, not calibrated), arm_count=1.
+Gap #3 CLOSED; durable cross-vendor clock. BUT boot time UNCHANGED:
+elapsed=392132ms at login vs old 392202ms. So the TSC-unstable was a real
+bug but NOT the slowness cause -- my causal hypothesis was wrong. The boot
+is still execution-bound (vmrun_tot=341s, 0-1% idle, 335K host-tick INTR
+preemptions). NEW precise data (RIPs resolved at canonical base this boot):
+hot spots = __pick_next_task, schedule/__sched_text_end, _raw_spin_lock_irq,
+sysvec_call_function -- the ~340s of guest execution is SCHEDULER + IPI
+churn. This is exactly the profile a dedicated core (no shared 1000Hz host
+tick) should improve -> M8-0b-ii is now the MEASURED perf lever, not
+speculative. (sysvec_call_function hot = guest doing cross-CPU IPIs, worth
+a look -- is the guest SMP?)
+
