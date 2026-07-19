@@ -54,3 +54,29 @@ not treat them as project-licensed material.
   counterpart reference (VMX/VT-x, IA-32 system programming) for the
   mandatory Intel real-hardware validation pass (AGENTS.md testing gate);
   cite the specific volume/§ against the task when used.
+
+## Online reference links (external, not archived)
+
+Code/spec links gathered for reference. Not downloaded into this tree (code
+repos under their own licenses; the Intel PDFs are superseded by the archived
+combined SDM above). Ratings are relative to hype's actual surfaces (AMD SVM
+host; guest device models + MMIO decode; the Intel-VMX path is future work).
+
+| Link | What it is | Usefulness to hype |
+|------|------------|--------------------|
+| http://www.intel.com/Assets/PDF/manual/253669.pdf | Intel SDM Vol. 3B (system programming, incl. APIC) | ★★ now — the **APIC/LAPIC-timer/IPI** chapter backs M8-0b inc 5 (AP LAPIC timer) and the `sysvec_call_function` spin lead. Superseded by the archived combined SDM (325462); use that copy. |
+| http://www.intel.com/Assets/PDF/manual/253667.pdf | Intel SDM Vol. 2B (instruction set reference) | ★★ — instruction encoding, cross-checks `mmio_decode.c`. Also in the archived combined SDM. |
+| http://lxr.free-electrons.com/source/arch/x86/kvm/vmx.c | KVM VMX implementation (GPLv2) | ★ future — reference for the Intel-VMX ops path (currently a stub). NOT for SVM (AMD APM is the SVM authority). License: GPLv2 — read for understanding, don't copy into GPLv3-with-care. |
+| http://bochs.cvs.sourceforge.net/viewvc/bochs/bochs/cpu/vmx.cc | Bochs VMX emulator (LGPLv2) | ★ future — clean, readable VMX behavior reference for the Intel path. |
+| https://github.com/chillancezen/ZeldaOS.x86_64/blob/master/vm_monitor/vmx_pio.c | ZeldaOS PIO exit sub-handler | ★★ — small VMM's port-I/O dispatch; cross-check for hype's IOIO handling + the **spin investigation** (guest polling a mis-modeled port). |
+| https://github.com/chillancezen/ZeldaOS.x86_64/blob/master/vm_monitor/vmx_instruction_decoding.c | ZeldaOS MMIO mov decode | ★★ — direct comparison for `arch/x86_64/cpu/mmio_decode.c`. |
+| https://github.com/chillancezen/ZeldaOS.x86_64/blob/master/vm_monitor/device_8259pic.c | ZeldaOS 8259 PIC model | ★★ — cross-check `devices/pic.c` (esp. spurious-IRQ / ISR-read behavior). |
+| https://github.com/chillancezen/ZeldaOS.x86_64/blob/master/vm_monitor/device_8253pit.c | ZeldaOS 8253 PIT model | ★★★ — directly relevant to the **spin/timer investigation**: compare channel counting + calibration behavior against `devices/pit.c`. |
+| https://github.com/chillancezen/ZeldaOS.x86_64/blob/master/vm_monitor/device_keyboard.c | ZeldaOS 8042 keyboard model | ★ — cross-check `devices/ps2_keyboard.c`. |
+| https://github.com/chillancezen/ZeldaOS.x86_64/blob/master/vm_monitor/device_serial.c | ZeldaOS 16550 serial model | ★ — cross-check `devices/guest_uart.c`. |
+| https://github.com/chillancezen/ZeldaOS.x86_64/blob/master/vm_monitor/device_video.c | ZeldaOS 16-color video (MMIO) | ✩ low — hype uses GOP/ramfb, not legacy 16-color text MMIO. |
+
+Note on licenses: the KVM (GPLv2) and Bochs (LGPLv2) sources are for
+*understanding*, not copy-paste — hype is GPLv3 and its device/decode logic is
+written fresh from the primary specs. ZeldaOS (check its repo license) is a
+useful "how another small VMM structured this" comparison, same rule.
