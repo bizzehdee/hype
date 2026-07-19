@@ -4357,3 +4357,24 @@ run_fw_1_test(&g_vms[1]) on the AP; handle the dedicated-core guest timer
 timer) + console routing. THEN the perf measurement: does the guest boot
 faster free of the 335K host-tick preemptions?
 
+M8-0b-ii increment 2 (2026-07-19): AP loads hype GDT/IDT before SVM enable
+-> fully hypervisor-capable (QEMU: ap_svm_ok=1, no fault, BSP still boots).
+
+M8-0b-ii REMAINING (re-scoped after finding a hard constraint): running a
+guest on the AP is blocked by the vCPU context being a SINGLETON --
+`static struct hype_vcpu_ctx g_ctx` in svm_vcpu.c, and the VMRUN inline asm
+references g_ctx.gprs[] BY NAME (hardcoded operands). So before the AP can
+VMRUN its own guest:
+  inc 3: de-globalize g_ctx -> per-vCPU context + rework the VMRUN asm to
+         operate on a passed ctx pointer (delicate: the hottest, exempt
+         path; needs care + HW validation).
+  inc 4: allocate g_vms[1] RAM/firmware/ACPI/NPT (extend efi_main pre-EBS)
+         -- OR, for the PERF measurement alone, run g_vms[0] on the AP
+         (BSP idle) and skip VM1 resources.
+  inc 5: dedicated-core guest-timer model (no shared 1000Hz host tick --
+         lean on kvmclock + natural exits, or give the AP its own LAPIC
+         timer) + console routing.
+Then the perf measurement: does the guest boot faster free of the ~335K
+host-tick preemptions? inc 3 (VMRUN-core de-globalization) is the gating,
+riskiest piece and best done as its own focused, HW-validated effort.
+
