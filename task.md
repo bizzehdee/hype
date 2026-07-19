@@ -4287,3 +4287,23 @@ run_fw_1_test(&g_vms[1], ...) on the AP = two Alpines on two cores. Then
 re-measure PERF-1 on the dedicated-core guest. HW-VALIDATION STILL OWED for
 b-i (QEMU proves the logic; real AMD silicon is the bar).
 
+PVCLOCK (kvmclock) STARTED (2026-07-19): the real fix for the AMD TSC
+calibration failure. Root cause confirmed: CPUID leaf 0x15/0x16 (my
+earlier fix, e6f4517) are INTEL-ONLY -- native_calibrate_tsc bails on
+`x86_vendor != INTEL`, so our AuthenticAMD guest ignores them and falls to
+quick_pit_calibrate, which polls the PIT high-byte (one MSB step ~214us)
+and skips values because hype's 1000Hz host tick makes the emulated PIT
+jump ~1ms (~5 MSB steps) at a time -> "could not calculate TSC khz".
+kvmclock sidesteps calibration entirely and is hypervisor-keyed (works on
+AMD AND Intel; covers Linux+BSD, 2 of the 3 guest families -- Windows needs
+a separate Hyper-V TSC page later). STEP 1 DONE: pure ABI module
+devices/pvclock.{h,c} (100% line cov) -- TSC->ns scale math
+(kvm_get_time_scale) + version-protocol page fill + KVM MSR/CPUID/struct
+constants. Also fixed a latent run.sh bug (it linked ap_boot.c's .S-only
+symbols into every test). NEXT: rework CPUID (restore leaf 0 max=1, drop
+the dead 0x15/0x16 + XSAVE-clear from e6f4517; add KVM leaves 0x40000000
+signature / 0x40000001 features / 0x40000010 tsc_khz), trap the KVM
+SYSTEM_TIME/WALL_CLOCK MSRs, and fill the pvclock page (once, TSC_STABLE)
+via hype_gpa_to_host. Then QEMU + HW verify the "Marking TSC unstable"
+line is gone and boot time drops.
+

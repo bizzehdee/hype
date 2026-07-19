@@ -27,6 +27,11 @@ report_srcs=""
 for d in $LIB_DIRS; do
     for f in "$d"*.c; do
         [ -e "$f" ] || continue
+        # ap_boot.c is pure glue that references symbols defined only in
+        # ap_trampoline.S (16-bit asm, not built for the host test target) and
+        # is referenced by no test -- linking it into every test binary just
+        # produces unresolved-symbol errors, so skip it from the link entirely.
+        case "$f" in */ap_boot.c) continue ;; esac
         lib_srcs="$lib_srcs $f"
         if ! is_exempt "$f"; then
             report_srcs="$report_srcs $f"
