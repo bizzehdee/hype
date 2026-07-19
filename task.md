@@ -4267,3 +4267,23 @@ login (no FPU/boot regression from the leaf changes). AWAITING HW RE-TEST:
 does the "Marking TSC unstable" line disappear + does boot time drop?
 (clockfacts buffer widened 384->640B to catch the full clocksource line.)
 
+M8-0b-i DONE (2026-07-19): AP bring-up proven on QEMU -smp 2. hype now
+starts a second core post-EBS via its own INIT-SIPI-SIPI (firmware MP
+services are gone). New: arch/x86_64/cpu/lapic.c ICR IPI encoders (unit-
+tested), ap_trampoline.S (relocatable real->protected->long trampoline that
+computes its own base from the SIPI CS, no code patching -- only a data
+param block), ap_boot.c (copy+patch+INIT-SIPI-SIPI+wait, exempt glue). A
+gated smoketest (HYPE_AP_SMOKETEST) brings up APIC id 1 and reports:
+  AP-SMOKETEST: ... rc=0 (long-mode reached=yes) last_phase=3 c_entry_ran=1
+i.e. the AP walked real->protected->long on hype's paging with its own
+stack and ran hype_ap_entry() at the 64-bit C boundary, then parked in
+cli/hlt. BSP still boots Alpine to login, no regression. Debug note: the
+first attempt failed (rc=-1) because the real-mode data operands added %ebx
+on top of DS (whose base already = the trampoline base) -> double-counted
+base -> garbage GDTR/farptr; fixed by using bare (label-start) DS-relative
+operands in real mode, %ebx only in the flat protected/long accesses.
+NEXT (M8-0b-ii): set up per-AP GDT/IDT/TSS in hype_ap_entry and run
+run_fw_1_test(&g_vms[1], ...) on the AP = two Alpines on two cores. Then
+re-measure PERF-1 on the dedicated-core guest. HW-VALIDATION STILL OWED for
+b-i (QEMU proves the logic; real AMD silicon is the bar).
+

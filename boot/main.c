@@ -18,6 +18,7 @@
 #include "../arch/x86_64/cpu/idt.h"
 #include "../arch/x86_64/cpu/isr.h"
 #include "../arch/x86_64/cpu/lapic.h"
+#include "../arch/x86_64/cpu/ap_boot.h"
 #include "../arch/x86_64/cpu/paging.h"
 #include "../arch/x86_64/cpu/pic.h"
 #include "../arch/x86_64/cpu/pit.h"
@@ -273,6 +274,13 @@ static uint64_t g_iso_host_phys;
 static uint64_t g_iso_size;
 /* Host usable-RAM total (UEFI memory map), reported by the guest CMOS model. */
 static uint64_t g_usable_ram_bytes;
+
+/* M8-0b (AP bring-up smoketest): a <1MB page to stage the AP trampoline in
+ * (allocated pre-EBS) + a stack for the AP's 64-bit C landing. Set
+ * HYPE_AP_SMOKETEST to 0 once the AP path is folded into M8-0b-ii. */
+#define HYPE_AP_SMOKETEST 1
+static uint64_t g_ap_tramp_page;
+static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
 /* PERF-1 (gaps #3/#4): the guest kernel's own clocksource + delay-calibration
  * dmesg lines, pinned so they survive to the login-time RT-3 nvlog snapshot
  * (they print too early to otherwise be in the 16 KB tail). Diagnostic aid for
@@ -591,6 +599,19 @@ static uint64_t hype_alloc_pages_below_4gb(EFI_BOOT_SERVICES *bs, UINTN pages) {
     if (status != EFI_SUCCESS) {
         hype_fatal("AllocatePages(<4GB, %u pages) failed: 0x%llx", (unsigned int)pages,
                    (unsigned long long)status);
+    }
+    return (uint64_t)mem;
+}
+
+/* M8-0b: allocate a single 4KB page below 1MB for the AP startup trampoline.
+ * A Startup IPI's vector is an 8-bit page number, so the AP begins executing
+ * at vector<<12 -- the trampoline must live below 1MB. Best-effort: returns 0
+ * if firmware won't give us low memory (the AP smoketest then just skips). */
+static uint64_t hype_alloc_page_below_1mb(EFI_BOOT_SERVICES *bs) {
+    EFI_PHYSICAL_ADDRESS mem = 0x000FF000ULL; /* highest 4KB page under 1MB */
+    EFI_STATUS status = bs->AllocatePages(AllocateMaxAddress, EfiLoaderData, 1, &mem);
+    if (status != EFI_SUCCESS) {
+        return 0;
     }
     return (uint64_t)mem;
 }
@@ -6779,6 +6800,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         g_fw_1_ram_host_phys =
             hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, HYPE_FW_1_GUEST_RAM_BYTES);
         hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+
+        /* M8-0b: grab a <1MB page now (Boot Services only) to stage the AP
+         * startup trampoline in; the post-EBS smoketest below uses it. */
+        g_ap_tramp_page = hype_alloc_page_below_1mb(SystemTable->BootServices);
         hype_debug_print("fw-1: guest RAM %llu MiB backed at host-physical 0x%llx\n",
                           (unsigned long long)(HYPE_FW_1_GUEST_RAM_BYTES / (1024ULL * 1024ULL)),
                           (unsigned long long)g_fw_1_ram_host_phys);
@@ -7066,6 +7091,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_serial_print("about to enable interrupts (sti)...\n");
     hype_sti();
     hype_serial_print("interrupts enabled -- host timer live\n");
+
+#if HYPE_AP_SMOKETEST
+    /*
+     * M8-0b (step b-i): prove hype can bring up a second core post-EBS via
+     * its own INIT-SIPI-SIPI (firmware MP services are gone). This just lands
+     * the AP in 64-bit mode on hype's paging, runs hype_ap_entry() (sets
+     * g_hype_ap_c_alive, then parks in cli/hlt), and reports it -- no guest on
+     * the AP yet (that's b-ii). Targets APIC id 1 (the second core on QEMU
+     * -smp 2 and a typical 2+ core box); b-ii will enumerate the MADT.
+     */
+    {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        if (g_ap_tramp_page == 0) {
+            hype_debug_print("fw-1 AP-SMOKETEST: SKIP -- no <1MB trampoline page\n");
+        } else if (cr3 >= 0x100000000ULL) {
+            hype_debug_print("fw-1 AP-SMOKETEST: SKIP -- host CR3 0x%llx >= 4GB\n",
+                              (unsigned long long)cr3);
+        } else {
+            int ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 1u,
+                                      (void *)(uintptr_t)g_ap_tramp_page, cr3,
+                                      (uint64_t)(uintptr_t)(g_ap_stack + sizeof(g_ap_stack)),
+                                      g_fw_1_host_tsc_hz);
+            hype_debug_print(
+                "fw-1 AP-SMOKETEST: apic_id=1 tramp=0x%llx cr3=0x%llx -> rc=%d (long-mode reached=%s), "
+                "last_phase=%u (0=none 1=real 2=prot 3=long) c_entry_ran=%u\n",
+                (unsigned long long)g_ap_tramp_page, (unsigned long long)cr3, ap_rc,
+                (ap_rc == 0) ? "yes" : "NO", (unsigned int)g_hype_ap_last_phase,
+                (unsigned int)g_hype_ap_c_alive);
+        }
+    }
+#endif
 
     /*
      * RT-2b: NOW run the FW-1 Alpine guest, with hype's own 1000 Hz timer

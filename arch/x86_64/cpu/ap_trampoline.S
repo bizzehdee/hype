@@ -22,23 +22,29 @@ hype_ap_tramp_start:
     cli
     cld
     movw %cs, %ax
-    movw %ax, %ds                 # DS = CS so (label-start)(%ebx) reads resolve
-    movzwl %cs, %ebx
-    shll $4, %ebx                 # %ebx = physical base of this copy (CS << 4)
+    movw %ax, %ds                 # DS.base = CS.base = this copy's physical base
+    movzwl %ax, %ebx              # %ax already holds %cs
+    shll $4, %ebx                 # %ebx = physical base (CS << 4)
+    movl $1, tramp_phase - hype_ap_tramp_start   # phase 1: real mode reached
 
-    # GDTR.base = base + offset(gdt); limit is preset in the data below.
+    # The values we store below (GDTR.base, the far-jump offset) must be FULL
+    # LINEAR addresses, because after CR0.PE the flat GDT segments have base 0
+    # -- so build them with %ebx. But the STORE/LOAD locations are addressed
+    # through DS, whose base already IS this copy's base, so the memory
+    # operands use a bare (label - start) displacement with NO %ebx (adding it
+    # would double-count the base). Real-mode segment limit is 64K and the blob
+    # is well under that, so the small displacements are in range.
     leal (gdt - hype_ap_tramp_start)(%ebx), %eax
-    movl %eax, (gdtr_base - hype_ap_tramp_start)(%ebx)
-    lgdtl (gdtr - hype_ap_tramp_start)(%ebx)
+    movl %eax, gdtr_base - hype_ap_tramp_start
+    lgdtl gdtr - hype_ap_tramp_start
 
-    # Far-pointer offset for the jump into 32-bit code (selector preset).
     leal (prot_entry - hype_ap_tramp_start)(%ebx), %eax
-    movl %eax, (farptr32 - hype_ap_tramp_start)(%ebx)
+    movl %eax, farptr32 - hype_ap_tramp_start
 
     movl %cr0, %eax
     orl $0x1, %eax                # CR0.PE
     movl %eax, %cr0
-    ljmpl *(farptr32 - hype_ap_tramp_start)(%ebx)
+    ljmpl *(farptr32 - hype_ap_tramp_start)
 
 .code32
 prot_entry:
@@ -48,6 +54,7 @@ prot_entry:
     movw %ax, %ss
     movw %ax, %fs
     movw %ax, %gs
+    movl $2, (tramp_phase - hype_ap_tramp_start)(%ebx)   # phase 2: protected mode
 
     movl %cr4, %eax
     orl $0x20, %eax              # CR4.PAE
@@ -79,6 +86,7 @@ long_entry:
     movw %ax, %gs
 
     # %rbx == base (upper 32 bits zero-extended from the 32-bit writes; base < 1 MiB).
+    movl $3, (tramp_phase - hype_ap_tramp_start)(%rbx)   # phase 3: long mode
     movq (tramp_stack - hype_ap_tramp_start)(%rbx), %rsp
     movl $1, (tramp_alive - hype_ap_tramp_start)(%rbx)   # signal the BSP: mode switch OK
 
@@ -128,6 +136,10 @@ tramp_stack:
 hype_ap_tramp_alive:
 tramp_alive:
     .long 0
+.globl hype_ap_tramp_phase
+hype_ap_tramp_phase:
+tramp_phase:
+    .long 0                     # last stage reached: 1=real 2=protected 3=long
 
 .globl hype_ap_tramp_end
 hype_ap_tramp_end:

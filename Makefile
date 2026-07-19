@@ -26,11 +26,12 @@ ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/id
              arch/x86_64/cpu/cpu_features.c arch/x86_64/cpu/cpu_features_hw.c \
              arch/x86_64/cpu/vmm_select.c arch/x86_64/cpu/vmexit.c arch/x86_64/cpu/mmio_decode.c \
              arch/x86_64/cpu/cpuid_emulate.c arch/x86_64/cpu/msr_emulate.c \
+             arch/x86_64/cpu/ap_boot.c \
              arch/x86_64/svm/svm_bits.c arch/x86_64/svm/svm_enable_hw.c arch/x86_64/svm/svm_ops.c \
              arch/x86_64/svm/vmcb.c arch/x86_64/svm/svm_vcpu.c arch/x86_64/svm/npt.c \
              arch/x86_64/vmx/vmx_bits.c arch/x86_64/vmx/vmx_enable_hw.c arch/x86_64/vmx/vmx_ops.c \
              arch/x86_64/vmx/vmcs_hw.c arch/x86_64/vmx/ept.c
-ARCH_ASM_SRCS := arch/x86_64/cpu/isr_stubs.S
+ARCH_ASM_SRCS := arch/x86_64/cpu/isr_stubs.S arch/x86_64/cpu/ap_trampoline.S
 DEVICE_SRCS := devices/pic.c devices/pit.c devices/pflash.c devices/acpi.c devices/acpi_loader.c \
                devices/fw_cfg.c devices/ahci.c devices/atapi.c devices/ramfb.c devices/pci.c \
                devices/cmos.c devices/ps2_keyboard.c devices/ps2_mouse.c devices/bochs_vbe.c \
