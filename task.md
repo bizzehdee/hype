@@ -3870,6 +3870,49 @@ observability channel) must land FIRST.*
 
 ---
 
+## PERF — FW-1 guest boot performance (measure-first; user-requested 2026-07-19)
+
+- [ ] **PERF-1** — Cut the ~340s FW-1 Alpine boot (guest execution; QEMU-hosted
+  hype ~60s, native QEMU/KVM ~15s). Pre-existing since M4-6 (~5 min). NOT a
+  correctness blocker (reaches login on real HW) -- an iteration-speed one.
+  Prior dead ends (do NOT repeat): guest LAPIC timer (M4-6b5 b5a rate +
+  b5c ARAT -- guest arms then re-masks it regardless), invariant-TSC. Hot spot
+  (disassembled vs the real vmlinux) = finish_task_switch -> local_irq_enable
+  (pv_native_irq_enable) = heavy SCHEDULER CHURN, not spin/HLT-idle.
+
+  This is deliberately measure-first: instrument, identify the DOMINANT source,
+  THEN design + build. No more speculative one-off builds.
+
+  - **PERF-1a — instrument (one build, run on BOTH QEMU-hype and HW-hype).**
+    - Split vmrun_tot into HLT-idle-wait vs active (non-HLT) guest execution --
+      the HLT handler currently busy-waits real time on HW (QEMU fast-forwards
+      it), so this quantifies how much of the 340s is fast-forwardable idle
+      (hlt rose to ~9205 by login; up to ~10ms each = up to ~90s?).
+    - Preemption profile: for each host-tick INTR exit, bucket the guest by
+      state -- idle task (CR3==swapper_pg_dir) vs kernel vs user, and IF set/
+      clear -- to see the distribution (idle vs scheduling vs real work).
+    - Event latency: AHCI command-issue (PxCI write) -> hype completion -> IRQ
+      delivered -> guest resumes; and the timer path. Histogram the latencies.
+    - Context-switch proxy: count INTR preemptions landing in the scheduler
+      (finish_task_switch range) per second.
+    - DIFF the QEMU-hype vs HW-hype profiles from the SAME build -- the delta
+      isolates the HW-specific slowness (cheap: QEMU runs freely).
+  - **PERF-1b — identify + design.** From 1a, the dominant lever is one of:
+    (i) HLT-idle-wait dominates -> fast-forward idle: on an idle HLT with a due
+    timer, advance guest time + deliver immediately instead of real-time
+    waiting (what QEMU/KVM does); risk: guest clock races real time -- bounded,
+    fine for boot. (ii) AHCI/device completion latency dominates -> async/
+    faster completion + prompter IRQ. (iii) genuine active execution dominates
+    (paravirt/retpoline/mitigation overhead) -> hardest; possibly influence
+    guest via CPUID (e.g. hypervisor-bit / feature advertisement) -- risky,
+    validate carefully. Design the specific fix for whichever wins.
+  - **PERF-1c — build + verify** the chosen fix; target vmrun_tot dropping
+    meaningfully (measure via the RT-3 tail COSTHIST).
+  Deps: RT-3 (the capture channel), the vmlinux+System.map extraction workflow
+  (kept in scratchpad; from the boot ISO). Related: M4-6b5 (parked).
+
+---
+
 ## M8 — Multi-VM concurrency, dashboard, lifecycle control, fault isolation
 ## (plan.md §9 M8, §6b, §6f, §6g, §10 decisions #11/#12)
 
