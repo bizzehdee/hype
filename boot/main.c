@@ -157,6 +157,12 @@ static uint64_t g_ram_1_size_bytes;
 #define HYPE_SERIAL_COM2 0x2F8u
 #define HYPE_FW_1_KEY_ENTER_MAKE 0x1Cu /* Set-1 make code for Enter */
 #define HYPE_FW_1_DEBUG_PORT 0x402u    /* FW-1g: OVMF SEC/PEI PlatformDebugLibIoPort */
+/* M8-0a: the FW-1 guest only ever maps the low 4 GiB of guest-physical space
+ * (1 GiB RAM at 0, the OVMF flash window just under 4 GiB, everything between
+ * left not-present so MMIO/stray accesses take a located NPF). So each VM's
+ * own NPT needs just 4 page-directory tables -- ~24 KiB/VM, vs. the 64-entry
+ * shared g_npt_pd the (gated-off) self-test guests still use. */
+#define HYPE_FW_1_NPT_GB 4u
 
 /*
  * M8-0: per-VM instance state. Every field here was a `g_fw_1_*` singleton;
@@ -188,6 +194,12 @@ typedef struct hype_fw_vm {
     uint64_t ram_host_phys;
     uint8_t e820_blob[HYPE_E820_ENTRY_SIZE * 8];
     uint8_t guest_stack[65536] __attribute__((aligned(4096)));
+    /* M8-0a: this instance's own NPT (nested page tables). Per-VM so two
+     * guests can map guest-physical 0 to *different* host RAM without
+     * clobbering each other. Sized for HYPE_FW_1_NPT_GB (the FW-1 layout). */
+    hype_pte_t npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+    hype_pte_t npt_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+    hype_pte_t npt_pd[HYPE_FW_1_NPT_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     /* --- emulated devices --- */
     hype_pic_emu_t pic;
     hype_pit_emu_t pit;
@@ -4765,13 +4777,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * page-aligned and this vendored build's CODE+VARS land on a
      * 2MB-aligned combined size); GUEST_RAM and 4GB are 2MB-aligned too,
      * so every range below is 2MB-granular. */
-    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, 4);
-    hype_npt_map_range(g_npt_pd, 0, g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
-    hype_npt_map_range(g_npt_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
+    hype_npt_build_identity(vm->npt_pml4, vm->npt_pdpt, vm->npt_pd, HYPE_FW_1_NPT_GB);
+    hype_npt_map_range(vm->npt_pd, 0, g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_npt_map_range(vm->npt_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
                         g_fw_1_combined_size);
-    hype_npt_mark_range_not_present(g_npt_pd, HYPE_FW_1_GUEST_RAM_BYTES,
+    hype_npt_mark_range_not_present(vm->npt_pd, HYPE_FW_1_GUEST_RAM_BYTES,
                                      (0x100000000ULL - g_fw_1_combined_size) - HYPE_FW_1_GUEST_RAM_BYTES);
-    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
+    npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
 
     /* VALID-1/VALID-3: the guest-physical -> host map, mirroring the two
      * hype_npt_map_range() calls above exactly. The AHCI DMA path

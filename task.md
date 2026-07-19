@@ -3959,6 +3959,18 @@ observability channel) must land FIRST.*
   QEMU-verified to localhost login, no regression. NEXT: M8-0a per-VM
   RAM/NPT (today one shared static g_npt_* set) so two instances have
   disjoint guest memory; then M8-0b own-AP bring-up (INIT-SIPI-SIPI).
+  M8-0a DONE (2026-07-19): per-VM NPT. Each hype_fw_vm_t now carries its
+  own npt_pml4/npt_pdpt/npt_pd[HYPE_FW_1_NPT_GB=4] (~24 KiB/VM), and the
+  FW-1 build/remap/root use vm->npt_* instead of the shared g_npt_*. So
+  two guests can map guest-physical 0 to different host RAM without
+  clobbering each other -- the last shared mutable state blocking two
+  concurrent instances is gone (guest RAM + firmware are already per-VM
+  fields; the shared g_npt_* now serves only the gated-off self-test
+  guests). QEMU-verified to localhost login, no regression, no stray NPF.
+  NEXT (M8-0b): allocate VM1's RAM+firmware+ACPI into g_vms[1], bring up
+  a second core via INIT-SIPI-SIPI, and run run_fw_1_test(&g_vms[1],...)
+  there while VM0 runs on the BSP -- two Alpines, two cores. This is also
+  the PERF-1 experiment (a guest on a dedicated core, no BSP-sharing).
   guest into an N-instance model. This is the load-bearing prerequisite
   for ALL of M8 -- surfaced by scoping "run two Alpine VMs concurrently"
   (2026-07-18): the config layer (hype.cfg `vms[16]`, M1-1) and admission
