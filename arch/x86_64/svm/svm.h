@@ -204,6 +204,12 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
  */
 void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
 
+/* Publishes the calibrated host TSC frequency (kHz) used by the CPUID
+ * leaf 0x15/0x16 emulation so the guest reads an exact tsc_khz and keeps
+ * the TSC as its clocksource (PERF-1). Call once before running the guest;
+ * 0 (the default) advertises no TSC frequency. */
+void hype_svm_vcpu_set_tsc_khz(uint32_t khz);
+
 /*
  * FW-1 real-hardware/real-firmware debugging: decodes and returns the
  * most recent NPF's direction/faulting-guest-physical-address

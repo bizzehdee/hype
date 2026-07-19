@@ -20,7 +20,7 @@
  * exempt FW-1 path.
  */
 
-#define HYPE_CLOCKFACTS_CAP 384u
+#define HYPE_CLOCKFACTS_CAP 640u
 
 typedef struct hype_clockfacts {
     char buf[HYPE_CLOCKFACTS_CAP]; /* NUL-terminated; captured lines joined by " | " */

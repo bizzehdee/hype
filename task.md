@@ -4246,3 +4246,24 @@ PMTMR unused) and a UEFI-seeded virtual RTC (CMOS returns 0 -> causes the
 bound (PERF-1a: 0% idle, hot RIP=finish_task_switch not __delay), so the
 real lever remains a dedicated core (M8-0b), not clock perception.
 
+PERF-1 TSC-FREQUENCY FIX (2026-07-19): the clockfacts capture (above)
+paid off on real HW -- it caught the decisive line:
+  [0.080000] tsc: Marking TSC unstable due to could not calculate TSC khz
+  [0.100000] Calibrating delay loop... 4058.31 BogoMIPS (lpj=20291584)
+GAP #3 ANSWERED: Linux did NOT keep the TSC -- at 80ms it could not even
+determine the TSC frequency (no CPUID leaf 0x15/0x16 advertised; leaf 0
+reported max-basic-leaf=1 so Linux could not query them; it fell back to
+quick_pit_calibrate against hype's VM-exit-lumpy PIT, too noisy -> failed ->
+TSC discarded). GAP #4 ANSWERED: lpj=20291584 / BogoMIPS 4058 is a normal
+~2GHz calibration, NOT inflated -- delay inflation ruled out.
+FIX: emulate CPUID leaf 0x15 (TSC/crystal ratio) + 0x16 (base MHz) from
+hype's calibrated host_tsc_hz (svm publishes it via
+hype_svm_vcpu_set_tsc_khz), so Linux reads an exact tsc_khz and keeps the
+passthrough TSC -- no PIT calibration. Required bumping leaf 0 max to 0x16,
+which exposes leaf 0xD (XSAVE); handled safely by clearing XSAVE+OSXSAVE in
+leaf 1 (the guest was already FXSAVE-only when leaf 0xD was hidden -> no
+regression, no unmediated XCR0). cpuid_emulate.c 100% cov. QEMU: boots to
+login (no FPU/boot regression from the leaf changes). AWAITING HW RE-TEST:
+does the "Marking TSC unstable" line disappear + does boot time drop?
+(clockfacts buffer widened 384->640B to catch the full clocksource line.)
+

@@ -51,9 +51,10 @@ typedef struct {
  * leaf/subleaf). Pure logic, no CPU access of its own -- fully unit
  * tested. Handled leaves:
  *
- *   0            -- max basic leaf = 1; vendor string "AuthenticAMD"
- *                    (this project only targets AMD hosts so far,
- *                    same scope as M2-8's own real-hardware gate).
+ *   0            -- max basic leaf = 0x16 (raised from 1 so the guest
+ *                    can query leaves 0x15/0x16 below; vendor string
+ *                    "AuthenticAMD" -- this project only targets AMD
+ *                    hosts so far, same scope as M2-8's own gate).
  *   1             -- EAX/EBX passthrough (family/model/stepping,
  *                    brand/APIC-id info -- not isolation-sensitive);
  *                    EDX passthrough except MTRR support (bit 12)
@@ -61,7 +62,27 @@ typedef struct {
  *                    never attempts an MTRR MSR access this project
  *                    doesn't emulate (CPUMSR-2); ECX passthrough
  *                    except the hypervisor-present bit (31) forced
- *                    set.
+ *                    set, TSC_DEADLINE (24) forced clear, and XSAVE
+ *                    (26) + OSXSAVE (27) forced clear -- raising the
+ *                    max basic leaf to 0x16 exposes leaf 0xD (XSAVE
+ *                    enumeration), which this project does not model;
+ *                    clearing XSAVE keeps the guest on legacy FXSAVE
+ *                    exactly as it already was when leaf 0xD was
+ *                    hidden (max leaf 1), so there is no regression and
+ *                    no unmediated XCR0/XSETBV to manage.
+ *   0x15          -- TSC / core-crystal ratio. When tsc_khz != 0:
+ *                    EAX = 1 (ratio denominator), EBX = 1 (numerator),
+ *                    ECX = tsc_khz * 1000 (core crystal Hz), so Linux
+ *                    computes tsc_khz = (ECX/1000) * EBX/EAX exactly
+ *                    and KEEPS the TSC as its clocksource instead of
+ *                    failing PIT-based calibration ("could not
+ *                    calculate TSC khz" -> TSC marked unstable, seen on
+ *                    real HW). tsc_khz == 0 -> all-zero (guest
+ *                    calibrates the old way).
+ *   0x16          -- processor frequency. EAX = base MHz = tsc_khz/1000
+ *                    (a belt-and-suspenders fallback Linux uses if it
+ *                    ignores 0x15); EBX/ECX/EDX = 0. Zero when
+ *                    tsc_khz == 0.
  *   0x80000000    -- max extended leaf = 0x80000001; vendor string
  *                    repeated, same as leaf 0.
  *   0x80000001    -- EAX/EDX passthrough (EDX carries the NX/long-mode
@@ -83,6 +104,6 @@ typedef struct {
  *                    unimplemented/reserved leaf).
  */
 void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_result_t *real,
-                         hype_cpuid_result_t *out);
+                         uint32_t tsc_khz, hype_cpuid_result_t *out);
 
 #endif /* HYPE_ARCH_CPUID_EMULATE_H */

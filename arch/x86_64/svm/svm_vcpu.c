@@ -422,6 +422,18 @@ static inline void real_cpuid(uint32_t eax, uint32_t ecx, hype_cpuid_result_t *o
                       : "a"(eax), "c"(ecx));
 }
 
+/* PERF/M4-6b5: the calibrated host TSC frequency in kHz. Published once by
+ * the FW-1 setup (hype_svm_vcpu_set_tsc_khz) so the CPUID leaf 0x15/0x16
+ * emulation can hand the guest an exact tsc_khz -- all cores share one
+ * physical TSC rate, so a single value is correct, not just a shortcut.
+ * 0 (default) -> leaves 0x15/0x16 advertise nothing, guest calibrates as
+ * before. */
+static uint32_t g_guest_tsc_khz = 0;
+
+void hype_svm_vcpu_set_tsc_khz(uint32_t khz) {
+    g_guest_tsc_khz = khz;
+}
+
 void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint32_t eax_in = (uint32_t)real->vmcb->save.rax;
@@ -430,7 +442,7 @@ void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     hype_cpuid_result_t out;
 
     real_cpuid(eax_in, ecx_in, &host_real);
-    hype_cpuid_emulate(eax_in, ecx_in, &host_real, &out);
+    hype_cpuid_emulate(eax_in, ecx_in, &host_real, g_guest_tsc_khz, &out);
 
     /* CPUID zero-extends all four registers to their full 64-bit width
      * in 64-bit mode -- assigning a uint32_t into a uint64_t field
