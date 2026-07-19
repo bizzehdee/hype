@@ -4578,3 +4578,14 @@ HW-VALIDATION OWED (QEMU proves the logic; real AMD silicon is the bar -- the
 laptop needs enough RAM for two ~1GB guests + 2 OVMF copies). NEXT: build the
 HW package for the user to cold-boot test; then M8-0c per-VM console routing
 (the shared UART currently garbles the two guests' output together).
+
+M8-0b-ii STEP 2 MILESTONE HW-CONFIRMED (2026-07-19): on the real AMD laptop,
+the user saw TWO interleaved Linux kernel output streams and the CORE diag
+lines showing BOTH apic_id=1 AND apic_id=2 -- i.e. two Alpine guests running
+concurrently, each on its own dedicated AP core, on real silicon (not a QEMU-
+only result). This is the core "two Alpines on two APs" milestone, HW-proven.
+The two de-globalization fixes (per-vCPU pvclock map + per-vCPU pending-IRQ
+slot) held on real hardware. Remaining: the shared UART interleaves the two
+guests char-by-char (cosmetic) -> M8-0c per-VM console routing is the cleanup,
+which will also let each guest's login be read distinctly. No RAM/AllocatePages
+panic on HW (laptop has the headroom for two ~1GB guests + 2 OVMF copies).
