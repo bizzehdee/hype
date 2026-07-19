@@ -3897,6 +3897,23 @@ observability channel) must land FIRST.*
       (finish_task_switch range) per second.
     - DIFF the QEMU-hype vs HW-hype profiles from the SAME build -- the delta
       isolates the HW-specific slowness (cheap: QEMU runs freely).
+  - **PERF-1a RESULT (2026-07-19):** DEFINITIVE, and it split QEMU vs HW hard.
+    QEMU-hype: elapsed=90s, hlt_wait=84s (93%), vmrun_tot=2s -> IDLE-bound
+    (fast-forwardable). HW-hype: elapsed=362s, hlt_wait~0-9%,
+    preempt_if1=313712 / preempt_if0=0, vmrun_tot=325s -> EXECUTION-bound. So
+    the SAME guest executes ~160x more instructions on HW than QEMU, all with
+    IF=1. Fast-forward-idle (below) is RULED OUT for HW (only 0-9% idle).
+    Leading hypothesis for the 160x: the guest marked its TSC unstable ->
+    fell back from delay_tsc to the loop-based __delay (loops_per_jiffy);
+    lpj is calibrated against the PIT, which hype delivers LATE
+    (irq0_pending_undelivered~8.5s), so lpj is set too high and every
+    udelay/mdelay in the boot is inflated -> 325s of busy-delay. QEMU's
+    punctual ticks -> correct lpj -> 2s. Unconfirmed (needs guest lpj
+    introspection); the clean fix (guest trusts TSC -> delay_tsc) already
+    resisted the CPUID invariant-TSC/ARAT approach. PARKED with PERF-1: deep,
+    the boot works, many HW rounds spent. If pursued: prove the lpj-inflation
+    theory (or measure the guest's delay path), then either fix tick-delivery
+    punctuality during early calibration or get the guest onto delay_tsc.
   - **PERF-1b — identify + design.** From 1a, the dominant lever is one of:
     (i) HLT-idle-wait dominates -> fast-forward idle: on an idle HLT with a due
     timer, advance guest time + deliver immediately instead of real-time
