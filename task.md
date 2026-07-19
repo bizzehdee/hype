@@ -4709,3 +4709,27 @@ guest io_delay=none (source-side policy), not IOPM passthrough.
 So the FIRST real fix is deadline-driven host preemption, not IO-APIC / port
 0x80 / AHCI batching. IO-APIC (M4-6b3) + clockevent (M4-6b5) + virtio remain
 valid follow-ups, re-ranked by the post-deadline-timer re-measurement.
+
+PERF-1 AGREED SEQUENCE (2026-07-19, expert review #3 -- supersedes the ordering
+debates above):
+  1. LONG-VMRUN EVIDENCE (do first, cheap): on each VMRUN over a threshold
+     (~50ms) record the exit RIP + this exit's reason + the PRECEDING exit's
+     reason, bounded (top-N). Validates whether the 13s intervals are spins
+     (guest busy-looping), interrupt-masked regions (guest ran with IF=0 / in a
+     delay), or MISSED HOST TICKS (hype should have preempted but did not). The
+     RECOVER line already shows ~4.5s of tick lateness, so missed/late ticks are
+     a live suspect.
+  2. ONE-SHOT DEADLINE TIMER: replace each AP's unconditional 1ms periodic
+     LAPIC timer with a bounded one-shot armed to the earliest guest PIT/LAPIC
+     deadline + a SAFETY MAX preemption interval (so an idle/again-non-exiting
+     guest still gets periodic attention). Preserves the starvation guard,
+     avoids needless 1kHz exits, AND (if the stalls are late-tick) can fix them.
+     NOTE: this is NOT merely a body_tot saver -- correcting the earlier claim
+     that it should be deprioritised because "only body_tot can be saved". It
+     also addresses tick lateness + potentially the long stalls.
+  3. RE-MEASURE (long-VMRUN + IOHIST + COSTHIST, same-build QEMU + HW).
+  4. THEN the already-planned path: ACPI MADT (M4-6b2) -> IO-APIC (M4-6b3) ->
+     modern clockevent (M4-6b5 follow-on) -> virtio-console/virtio-storage.
+IO-APIC is a GOOD follow-up (not deprioritised on merit); it just is not the
+immediate step. Immediate priority = one-shot host timer + long-VMRUN
+instrumentation. port-0x80 passthrough stays rejected.

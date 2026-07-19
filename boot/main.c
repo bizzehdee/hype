@@ -428,6 +428,45 @@ static hype_clockfacts_t g_fw_1_clockfacts;
 #if HYPE_IO_HISTOGRAM
 static uint32_t g_fw_1_io_hist[HYPE_FW_MAX_VMS][HYPE_IO_HIST_PORTS];
 #endif
+
+/* PERF-1 step 1 (long-VMRUN evidence): when a single VMRUN runs longer than
+ * HYPE_LONGVMRUN_MS, record its context so the multi-second stalls can be
+ * CLASSIFIED rather than guessed -- the exit RIP (where the guest finally
+ * exited), THIS exit's reason, and the PRECEDING exit's reason (what hype did
+ * right before the long run began). Reading the reasons tells us whether a 13s
+ * interval is a spin (exits by INTR = the host timer was what finally stopped
+ * it, i.e. the guest ran with nothing else forcing an exit), a missed/late
+ * host tick, or an I/O wait. Keeps the N longest per VM (bounded), emitted each
+ * diag tick next to PREEMPT/COSTHIST. */
+#define HYPE_LONGVMRUN_MS 50u
+#define HYPE_LONGVMRUN_TOP 8u
+typedef struct {
+    uint64_t ms;
+    uint64_t rip;
+    uint32_t reason;
+    uint32_t prev_reason;
+} hype_longvmrun_t;
+static hype_longvmrun_t g_fw_1_longvmrun[HYPE_FW_MAX_VMS][HYPE_LONGVMRUN_TOP];
+
+/* Insert a long VMRUN into the per-VM top-N, replacing the smallest slot if the
+ * new duration is larger (zero-initialised slots have ms=0, so they fill first).
+ * O(N), N tiny; called only on the rare >HYPE_LONGVMRUN_MS VMRUN. */
+static void fw_1_longvmrun_record(unsigned vm_idx, uint64_t ms, uint64_t rip, uint32_t reason,
+                                   uint32_t prev_reason) {
+    hype_longvmrun_t *tbl = g_fw_1_longvmrun[vm_idx];
+    unsigned i, min_i = 0;
+    for (i = 1; i < HYPE_LONGVMRUN_TOP; i++) {
+        if (tbl[i].ms < tbl[min_i].ms) {
+            min_i = i;
+        }
+    }
+    if (ms > tbl[min_i].ms) {
+        tbl[min_i].ms = ms;
+        tbl[min_i].rip = rip;
+        tbl[min_i].reason = reason;
+        tbl[min_i].prev_reason = prev_reason;
+    }
+}
 #define HYPE_PIT_HZ 1193182ULL
 /* M4-6b5: the guest LAPIC timer's base (pre-divide) input frequency, expressed
  * as a multiple of PIT_HZ so it reuses the loop's already-computed real-elapsed
@@ -4778,6 +4817,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
     hype_vmexit_info_t info;
+    /* PERF-1 step 1: the reason of the PREVIOUS exit, so a long VMRUN can be
+     * annotated with what hype did right before the guest ran long. */
+    uint64_t prev_exit_reason = 0;
 
     if (kind != HYPE_VMM_KIND_SVM) {
         hype_serial_print("fw-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
@@ -5169,6 +5211,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (g_fw_1_host_tsc_hz != 0 && this_vmrun > g_fw_1_host_tsc_hz / 10ULL) {
                     g_fw_1_vmrun_over100ms++;
                 }
+                /* PERF-1 step 1: classify the long VMRUNs. Record any VMRUN over
+                 * HYPE_LONGVMRUN_MS with its exit RIP + this/preceding exit
+                 * reason. prev_exit_reason still holds the PRIOR exit's reason
+                 * here (updated just below), so this pairs "what hype did last"
+                 * with "how long the guest then ran + where/why it exited". */
+                if (g_fw_1_host_tsc_hz != 0) {
+                    uint64_t this_ms = (this_vmrun * 1000ULL) / g_fw_1_host_tsc_hz;
+                    if (this_ms >= HYPE_LONGVMRUN_MS) {
+                        fw_1_longvmrun_record((unsigned)(vm - g_vms), this_ms, info.guest_rip,
+                                              (uint32_t)info.reason, (uint32_t)prev_exit_reason);
+                    }
+                }
+                prev_exit_reason = info.reason;
             }
         }
 
@@ -5274,6 +5329,36 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_debug_print("fw-1 PREEMPT: max_single_vmrun=%llums vmruns_over_100ms=%llu\n",
                                      (g_fw_1_vmrun_max_tsc * 1000ULL) / g_fw_1_host_tsc_hz,
                                      g_fw_1_vmrun_over100ms);
+                    /* PERF-1 step 1: the N longest VMRUNs with context. Format:
+                     * "MSms@0xRIP rREASON<-rPREV" (SVM exit codes: 0x60=INTR,
+                     * 0x78=HLT, 0x7b=IOIO, 0x400=NPF, 0x72=CPUID, 0x7c=MSR).
+                     * Reading these classifies the stalls (e.g. r0x60 <- ... =>
+                     * a long run that only the host timer stopped = a spin/delay;
+                     * a huge gap before r0x60 => a late host tick). */
+                    {
+                        hype_longvmrun_t *lt = g_fw_1_longvmrun[vm - g_vms];
+                        char lb[400];
+                        int lo = hype_snprintf(lb, sizeof(lb),
+                                               "fw-1 LONGVMRUN vm%u (ms@rip reason<-prev):",
+                                               (unsigned)(vm - g_vms));
+                        unsigned li;
+                        for (li = 0; li < HYPE_LONGVMRUN_TOP && lo > 0 && (unsigned)lo < sizeof(lb);
+                             li++) {
+                            if (lt[li].ms == 0) {
+                                continue;
+                            }
+                            int n = hype_snprintf(lb + lo, sizeof(lb) - (unsigned)lo,
+                                                  " %llums@0x%llx r0x%x<-0x%x",
+                                                  (unsigned long long)lt[li].ms,
+                                                  (unsigned long long)lt[li].rip,
+                                                  (unsigned)lt[li].reason, (unsigned)lt[li].prev_reason);
+                            if (n <= 0) {
+                                break;
+                            }
+                            lo += n;
+                        }
+                        hype_debug_print("%s\n", lb);
+                    }
                 }
                 /* RT-2c: waiting-vs-working readout. A few kernel-space RIPs
                  * carrying most preemptions => guest spinning in a delay loop
