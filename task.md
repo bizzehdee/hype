@@ -4625,3 +4625,28 @@ both-login elapsed ~450s (vs ~347s single-VM: concurrent contention costs ~30%
 wall-clock), io80~67k/VM (port-0x80 delay writes), ioio~420k/VM, npf(ahci)~16k/VM,
 and a striking max_single_vmrun=13-14s (vmruns_over_100ms=15-16) -- a big stall
 outlier worth chasing. mean vmrun ~440-680us/exit. These are the PERF-1 levers.
+
+PERF-1 MEASUREMENT (2026-07-19, per-port IOHIST, QEMU): the decisive per-port
+histogram is in (core/io_histogram.{h,c}, 96%+ cov; recorded per-VM via a new
+side-effect-free hype_svm_vcpu_peek_ioio at the top of the FW-1 IOIO branch;
+emits "fw-1 IOHIST vmN total=T: 0xPORT=N ..." top-12 each diag tick).
+FINDING -- the IOIO leader is the SERIAL CONSOLE, not the boot media:
+  early/boot phase (vm0 total~96k): 0x2fd+0x3fd (COM2+COM1 LSR polls) 16085 each
+  + 0x2f8+0x3f8 (data) 16065 each = 64300 = ~67% of IOIO. Each console byte =
+  2 exits (poll LSR + write data), and it is DOUBLED because Alpine drives both
+  COM1 AND COM2 (getty on ttyS0+ttyS1). Serial is a FRONT-LOADED one-time cost
+  (~64k, flat after login).
+  steady-state/idle (total grows to ~133k): 0x80 (io_delay) ~17k, 0x40 (PIT ch0)
+  ~17k, 0x21 (PIC IMR) ~15k keep GROWING -- the per-tick timer/interrupt servicing
+  loop (outb_p emits a 0x80 delay write after each PIC/PIT access). Matters for
+  long-running idle, NOT boot-to-login.
+  AHCI is the NPF bucket (~16k), separate from IOIO.
+SO for boot time the lever is SERIAL. Safe wins (no hardware-access breach):
+  (1) drop the 2nd serial console (COM2/ttyS1) -> halves serial to ~32k;
+  (2) reduce guest kernel console verbosity (quiet/loglevel) -> fewer bytes;
+  (3) architectural: virtio-console (batched) for Linux/BSD, and virtio-blk boot
+  for the AHCI/NPF side. The steady-state timer/delay tail is a separate issue
+  (IO-APIC M4-6b3 / paravirt timer), not boot-critical. port-0x80 passthrough
+  stays REJECTED. TODO: capture the SAME build's IOHIST on real HW (vmrun cost is
+  ~440-680us there, so exit-count x cost is the real wall-clock) to confirm the
+  distribution holds on silicon.
