@@ -4758,3 +4758,25 @@ periodic LVT not reliably re-arming/firing (varying gap lengths 0.4-14s, and
 vm0!=vm1, argue against a fixed mis-calibrated period). This is the crux: a
 deadline timer that inherits the same miss bug would not help. FIX the miss,
 then make it deadline-driven.
+
+PERF-1 STEP 1b (2026-07-19): extended the long-VMRUN probe with the state that
+separates "timer never fired" from "timer fired but SVM did not exit" (per
+expert): per-AP timer-ISR delta across the run, AP LAPIC LVT + current count,
+guest IF + interrupt-shadow. Line: "fw-1 LVMRUN vmN: MSms@0xRIP r<rsn><-<prev>
+isr+N lvt=.. ccr=.. irr2=.. if=.. shdw=..".
+PRELIMINARY (QEMU, same RIP 0x835631 as the HW 13s stall, just 71ms there):
+  if=0, lvt=0x20050 (armed, UNMASKED, periodic, vec0x50), ccr!=0 (counting),
+  isr+1 (timer fired -> one delivery at the post-exit stgi).
+=> "TIMER FIRED BUT SVM DID NOT EXIT": the LAPIC timer is alive+counting and
+does fire, but the guest ran with IF=0 and under V_INTR_MASKING that blocks the
+INTR #VMEXIT, so the guest runs uninterrupted until its own IOIO. NOT a stopped
+timer. (matches preempt_if0=0: hype NEVER preempts an IF=0 guest.)
+IMPLICATION for step 2: a physical-interrupt preemption timer -- periodic OR
+one-shot deadline -- CANNOT break an IF=0 stall (the interrupt is masked). So
+the deadline timer cuts wasted exits (still worth it) but will NOT fix the 13s
+stalls. Breaking an IF=0 stall needs a mechanism that exits regardless of guest
+IF: options -- (a) fix the ATAPI/libata slow path (or virtio-blk boot) so the
+guest does not spend 13s in that IF=0 region (RIP 0x835631 is at "Mounting boot
+media"); (b) NMI-based preemption (NMI ignores IF); (c) intercept an instruction
+the guest executes inside the region. AWAITING HW capture to confirm the 13.6s
+stall shows if=0 (QEMU already shows it at the same RIP).

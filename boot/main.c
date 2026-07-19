@@ -342,8 +342,23 @@ static inline uint64_t hype_rdtsc(void);
  * same role the PIT tick plays on the BSP, but per-core. The ISR only EOIs;
  * the real work happens in the dispatch loop on the INTR exit. */
 #define HYPE_AP_LAPIC_TIMER_VECTOR 0x50u
+/* PERF-1 step 1b: count how many times each AP's LAPIC timer ISR actually ran,
+ * indexed by apic_id (1=AP1/vm0, 2=AP2/vm1). The long-VMRUN recorder samples
+ * this before/after a stall: if it did NOT advance across a 13s VMRUN, the
+ * timer's interrupt was never *taken* during the stall -- which, cross-checked
+ * against the LAPIC being armed+counting (LVT unmasked, IRR bit set), proves
+ * "timer fired but SVM did not exit" (guest-IF/V_INTR_MASKING gating) vs
+ * "timer never fired" (LAPIC stopped). */
+static volatile uint64_t g_ap_timer_ticks[HYPE_FW_MAX_VMS + 1];
 static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
     (void)frame;
+    {
+        uint32_t apic_id =
+            (*(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + 0x20u)) >> 24;
+        if (apic_id <= HYPE_FW_MAX_VMS) {
+            g_ap_timer_ticks[apic_id]++;
+        }
+    }
     *(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + HYPE_LAPIC_EOI_OFFSET) = 0;
 }
 
@@ -445,14 +460,20 @@ typedef struct {
     uint64_t rip;
     uint32_t reason;
     uint32_t prev_reason;
+    /* step 1b: state sampled to explain WHY the timer didn't preempt this run. */
+    uint64_t isr_delta;  /* AP timer ISRs taken DURING this VMRUN (0 = none) */
+    uint32_t lapic_lvt;  /* AP LAPIC timer LVT at exit (bit16=masked, low8=vector) */
+    uint32_t lapic_ccr;  /* AP LAPIC timer current count at exit (0 => stopped) */
+    uint32_t lapic_irr2; /* AP LAPIC IRR dword for vec 64-95; bit16 => vec 0x50 pending */
+    uint32_t guest_if;   /* guest RFLAGS.IF at exit (0 => interrupts masked) */
+    uint32_t int_shadow; /* guest interrupt-shadow at exit */
 } hype_longvmrun_t;
 static hype_longvmrun_t g_fw_1_longvmrun[HYPE_FW_MAX_VMS][HYPE_LONGVMRUN_TOP];
 
 /* Insert a long VMRUN into the per-VM top-N, replacing the smallest slot if the
  * new duration is larger (zero-initialised slots have ms=0, so they fill first).
  * O(N), N tiny; called only on the rare >HYPE_LONGVMRUN_MS VMRUN. */
-static void fw_1_longvmrun_record(unsigned vm_idx, uint64_t ms, uint64_t rip, uint32_t reason,
-                                   uint32_t prev_reason) {
+static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
     hype_longvmrun_t *tbl = g_fw_1_longvmrun[vm_idx];
     unsigned i, min_i = 0;
     for (i = 1; i < HYPE_LONGVMRUN_TOP; i++) {
@@ -460,11 +481,8 @@ static void fw_1_longvmrun_record(unsigned vm_idx, uint64_t ms, uint64_t rip, ui
             min_i = i;
         }
     }
-    if (ms > tbl[min_i].ms) {
-        tbl[min_i].ms = ms;
-        tbl[min_i].rip = rip;
-        tbl[min_i].reason = reason;
-        tbl[min_i].prev_reason = prev_reason;
+    if (e->ms > tbl[min_i].ms) {
+        tbl[min_i] = *e;
     }
 }
 #define HYPE_PIT_HZ 1193182ULL
@@ -5184,6 +5202,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * writes, console drain) and is fixable in software. */
         {
             uint64_t t_pre = hype_rdtsc();
+            /* step 1b: AP timer-ISR count before this VMRUN, to measure how many
+             * fired DURING it (apic_id = vm index + 1: vm0->AP1, vm1->AP2). */
+            uint64_t isr_ticks_pre = g_ap_timer_ticks[(unsigned)(vm - g_vms) + 1u];
             if (g_fw_1_prev_post_tsc != 0) {
                 g_fw_1_body_tsc += t_pre - g_fw_1_prev_post_tsc;
             }
@@ -5219,8 +5240,24 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (g_fw_1_host_tsc_hz != 0) {
                     uint64_t this_ms = (this_vmrun * 1000ULL) / g_fw_1_host_tsc_hz;
                     if (this_ms >= HYPE_LONGVMRUN_MS) {
-                        fw_1_longvmrun_record((unsigned)(vm - g_vms), this_ms, info.guest_rip,
-                                              (uint32_t)info.reason, (uint32_t)prev_exit_reason);
+                        /* step 1b: sample the state that distinguishes "timer
+                         * never fired" from "timer fired but SVM didn't exit". */
+                        volatile uint8_t *lb = (volatile uint8_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE;
+                        hype_svm_intr_state_t ps;
+                        hype_longvmrun_t e;
+                        hype_svm_vcpu_get_intr_state(ctx, &ps);
+                        e.ms = this_ms;
+                        e.rip = info.guest_rip;
+                        e.reason = (uint32_t)info.reason;
+                        e.prev_reason = (uint32_t)prev_exit_reason;
+                        e.isr_delta =
+                            g_ap_timer_ticks[(unsigned)(vm - g_vms) + 1u] - isr_ticks_pre;
+                        e.lapic_lvt = *(volatile uint32_t *)(lb + HYPE_LAPIC_LVT_TIMER_OFFSET);
+                        e.lapic_ccr = *(volatile uint32_t *)(lb + HYPE_LAPIC_TIMER_CURRENT_OFFSET);
+                        e.lapic_irr2 = *(volatile uint32_t *)(lb + 0x220u); /* IRR vec 64-95 */
+                        e.guest_if = (uint32_t)((ps.rflags >> 9) & 1u);
+                        e.int_shadow = (uint32_t)ps.interrupt_shadow;
+                        fw_1_longvmrun_record((unsigned)(vm - g_vms), &e);
                     }
                 }
                 prev_exit_reason = info.reason;
@@ -5329,35 +5366,38 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_debug_print("fw-1 PREEMPT: max_single_vmrun=%llums vmruns_over_100ms=%llu\n",
                                      (g_fw_1_vmrun_max_tsc * 1000ULL) / g_fw_1_host_tsc_hz,
                                      g_fw_1_vmrun_over100ms);
-                    /* PERF-1 step 1: the N longest VMRUNs with context. Format:
-                     * "MSms@0xRIP rREASON<-rPREV" (SVM exit codes: 0x60=INTR,
-                     * 0x78=HLT, 0x7b=IOIO, 0x400=NPF, 0x72=CPUID, 0x7c=MSR).
-                     * Reading these classifies the stalls (e.g. r0x60 <- ... =>
-                     * a long run that only the host timer stopped = a spin/delay;
-                     * a huge gap before r0x60 => a late host tick). */
+                    /* PERF-1 step 1/1b: one line per long VMRUN with the state
+                     * that distinguishes "timer never fired" from "timer fired
+                     * but SVM didn't exit". Fields:
+                     *   r<reason><-<prev>: SVM exit codes (0x60=INTR,0x78=HLT,
+                     *     0x7b=IOIO,0x400=NPF,0x72=CPUID,0x7c=MSR).
+                     *   isr+N : AP timer ISRs that ran DURING this VMRUN.
+                     *   lvt   : AP LAPIC timer LVT (bit16=masked, low8=vector).
+                     *   ccr   : AP LAPIC timer current count (0=stopped).
+                     *   irr2  : AP LAPIC IRR[64-95]; bit16 (0x10000) set => the
+                     *           timer vector 0x50 fired but was NOT delivered.
+                     *   if    : guest RFLAGS.IF (0 => guest masked interrupts).
+                     *   shdw  : guest interrupt shadow.
+                     * Read: a 13000ms run with isr+0, lvt unmasked+ccr!=0,
+                     * irr2 bit16 set, if=0  =>  timer fired, SVM did not exit
+                     * because the guest had interrupts masked (V_INTR_MASKING). */
                     {
                         hype_longvmrun_t *lt = g_fw_1_longvmrun[vm - g_vms];
-                        char lb[400];
-                        int lo = hype_snprintf(lb, sizeof(lb),
-                                               "fw-1 LONGVMRUN vm%u (ms@rip reason<-prev):",
-                                               (unsigned)(vm - g_vms));
                         unsigned li;
-                        for (li = 0; li < HYPE_LONGVMRUN_TOP && lo > 0 && (unsigned)lo < sizeof(lb);
-                             li++) {
+                        for (li = 0; li < HYPE_LONGVMRUN_TOP; li++) {
                             if (lt[li].ms == 0) {
                                 continue;
                             }
-                            int n = hype_snprintf(lb + lo, sizeof(lb) - (unsigned)lo,
-                                                  " %llums@0x%llx r0x%x<-0x%x",
-                                                  (unsigned long long)lt[li].ms,
-                                                  (unsigned long long)lt[li].rip,
-                                                  (unsigned)lt[li].reason, (unsigned)lt[li].prev_reason);
-                            if (n <= 0) {
-                                break;
-                            }
-                            lo += n;
+                            hype_debug_print(
+                                "fw-1 LVMRUN vm%u: %llums@0x%llx r0x%x<-0x%x isr+%llu lvt=0x%x ccr=0x%x "
+                                "irr2=0x%x if=%u shdw=%u\n",
+                                (unsigned)(vm - g_vms), (unsigned long long)lt[li].ms,
+                                (unsigned long long)lt[li].rip, (unsigned)lt[li].reason,
+                                (unsigned)lt[li].prev_reason, (unsigned long long)lt[li].isr_delta,
+                                (unsigned)lt[li].lapic_lvt, (unsigned)lt[li].lapic_ccr,
+                                (unsigned)lt[li].lapic_irr2, (unsigned)lt[li].guest_if,
+                                (unsigned)lt[li].int_shadow);
                         }
-                        hype_debug_print("%s\n", lb);
                     }
                 }
                 /* RT-2c: waiting-vs-working readout. A few kernel-space RIPs
