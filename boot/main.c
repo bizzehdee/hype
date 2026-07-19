@@ -12,6 +12,7 @@
 #include "../core/file_io.h"
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
+#include "../core/clockfacts.h"
 #include "../arch/x86_64/cpu/cpu_features.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -272,6 +273,11 @@ static uint64_t g_iso_host_phys;
 static uint64_t g_iso_size;
 /* Host usable-RAM total (UEFI memory map), reported by the guest CMOS model. */
 static uint64_t g_usable_ram_bytes;
+/* PERF-1 (gaps #3/#4): the guest kernel's own clocksource + delay-calibration
+ * dmesg lines, pinned so they survive to the login-time RT-3 nvlog snapshot
+ * (they print too early to otherwise be in the 16 KB tail). Diagnostic aid for
+ * the single FW-1 guest -- file-global like the ISO buffer above. */
+static hype_clockfacts_t g_fw_1_clockfacts;
 #define HYPE_PIT_HZ 1193182ULL
 /* M4-6b5: the guest LAPIC timer's base (pre-divide) input frequency, expressed
  * as a multiple of PIT_HZ so it reuses the loop's already-computed real-elapsed
@@ -4404,6 +4410,9 @@ static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_fil
         if (c == '\n') {
             line[*line_len] = '\0';
             hype_debug_print("%s\n", line);
+            /* PERF-1: pin the guest's clocksource/lpj lines so they reach the
+             * cold-boot-surviving nvlog even though they scroll off early. */
+            hype_clockfacts_observe(&g_fw_1_clockfacts, line);
             *line_len = 0;
             continue;
         }
@@ -5170,6 +5179,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  (unsigned int)g_fw_1_lapic.lvt_timer_armed_seen,
                                  (unsigned int)g_fw_1_pic.master.imr, (unsigned int)g_fw_1_pic.slave.imr,
                                  (unsigned int)g_fw_1_pic.master.isr, (unsigned int)g_fw_1_pic.slave.isr);
+
+                /* PERF-1 (gaps #3/#4): re-emit the guest's pinned clocksource +
+                 * delay-calibration lines on every diag tick, so they're always
+                 * in the last 16 KB the RT-3 nvlog snapshots -- otherwise these
+                 * early-boot lines scroll out long before login. Directly shows
+                 * which clocksource Linux settled on (did it keep the TSC?) and
+                 * its loops_per_jiffy, instead of us inferring it. */
+                if (g_fw_1_clockfacts.len > 0) {
+                    hype_debug_print("fw-1 CLOCKFACTS: %s\n", g_fw_1_clockfacts.buf);
+                }
             }
         }
 

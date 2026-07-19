@@ -4229,3 +4229,20 @@ M10 (physical disk) and STRETCH items can start any time their listed
 dependencies are satisfied — they don't sit on the critical path above and
 can be picked up in parallel once M3/VALID (device model + input
 validation basics) and M5/M8 (blk_backend, dashboard) exist.
+
+PERF-1 CLOCKFACTS capture (2026-07-19): folded a guest clocksource +
+loops_per_jiffy capture into the RT-3 nvlog to close the two directly-
+unmeasured links (#3 did Linux keep the TSC as clocksource; #4 is
+loops_per_jiffy sane). New pure module core/clockfacts.{h,c} (97.96% cov)
+matches the decisive early-boot dmesg lines ("lpj=", "Switched to
+clocksource", "Marking TSC unstable", "tsc: Detected", "Refined jiffies")
+as hype drains the guest UART, pins them in a 384B buffer, and re-emits
+"fw-1 CLOCKFACTS: ..." on every diag tick so they stay in the 16KB nvlog
+tail (they print too early to otherwise survive to login). Answers the
+questions from the measured data instead of inferring. NOT-DONE (measured
+as low-payoff): a scaled ACPI PM timer (guest FADT is hardware-reduced ->
+PMTMR unused) and a UEFI-seeded virtual RTC (CMOS returns 0 -> causes the
+"clock skew" warning only, not the 5-min boot). The boot is EXECUTION-
+bound (PERF-1a: 0% idle, hot RIP=finish_task_switch not __delay), so the
+real lever remains a dedicated core (M8-0b), not clock perception.
+
