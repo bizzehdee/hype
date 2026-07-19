@@ -52,10 +52,51 @@ static void test_mask_timer_does_not_touch_neighboring_registers(void) {
     CHECK_HEX("register after LVT Timer untouched", 0x55555555u, *after);
 }
 
+/* M8-0b: ICR IPI encoders + send. */
+
+static void test_icr_high_places_apic_id_in_top_byte(void) {
+    CHECK_HEX("apic id 0 -> 0", 0x00000000u, hype_lapic_icr_high(0));
+    CHECK_HEX("apic id 1 -> bit 24", 0x01000000u, hype_lapic_icr_high(1));
+    CHECK_HEX("apic id 0xFF -> top byte", 0xFF000000u, hype_lapic_icr_high(0xFF));
+}
+
+static void test_icr_low_init_is_canonical_value(void) {
+    /* INIT, assert, edge -> delivery mode 0b101 (0x500) | level assert (0x4000). */
+    CHECK_HEX("INIT-assert ICR low", 0x00004500u, hype_lapic_icr_low_init());
+}
+
+static void test_icr_low_sipi_encodes_vector_and_startup_mode(void) {
+    /* Startup mode 0b110 (0x600) | assert (0x4000) | trampoline page in low 8. */
+    CHECK_HEX("SIPI page 0x08", 0x00004608u, hype_lapic_icr_low_sipi(0x08));
+    CHECK_HEX("SIPI page 0x00", 0x00004600u, hype_lapic_icr_low_sipi(0x00));
+    CHECK_HEX("SIPI page 0xFF", 0x000046FFu, hype_lapic_icr_low_sipi(0xFF));
+}
+
+static uint32_t *icr_low(void) {
+    return (uint32_t *)((unsigned char *)g_fake_lapic + HYPE_LAPIC_ICR_LOW_OFFSET);
+}
+static uint32_t *icr_high(void) {
+    return (uint32_t *)((unsigned char *)g_fake_lapic + HYPE_LAPIC_ICR_HIGH_OFFSET);
+}
+
+static void test_send_ipi_writes_both_icr_dwords(void) {
+    *icr_high() = 0;
+    *icr_low() = 0; /* delivery-status bit clear, so the wait loop exits at once */
+
+    hype_lapic_send_ipi(g_fake_lapic, hype_lapic_icr_high(3), hype_lapic_icr_low_sipi(0x08));
+
+    CHECK_HEX("ICR_HIGH got the destination", 0x03000000u, *icr_high());
+    CHECK_HEX("ICR_LOW got the SIPI command", 0x00004608u, *icr_low());
+}
+
 int main(void) {
     test_mask_timer_sets_only_the_mask_bit();
     test_mask_timer_idempotent();
     test_mask_timer_does_not_touch_neighboring_registers();
+    test_icr_high_places_apic_id_in_top_byte();
+    test_icr_low_init_is_canonical_value();
+    test_icr_low_sipi_encodes_vector_and_startup_mode();
+    test_send_ipi_writes_both_icr_dwords();
 
     if (failures == 0) {
         printf("all tests passed\n");

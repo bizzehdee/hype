@@ -29,4 +29,37 @@
  * identity-mapped; tests: any suitably sized buffer). */
 void hype_lapic_mask_timer(volatile uint32_t *lapic_base);
 
+/*
+ * M8-0b: Interrupt Command Register (ICR) IPI send, for bringing a second
+ * application processor (AP) up post-ExitBootServices via the standard
+ * INIT-SIPI-SIPI sequence (firmware MP services don't survive EBS, so hype
+ * issues the IPIs itself). The ICR is a 64-bit register split across two
+ * MMIO dwords: ICR_HIGH (0x310) holds the destination APIC ID (bits 31:24 in
+ * physical-destination mode); writing ICR_LOW (0x300) latches and sends.
+ *
+ * The dword *encoders* are pure (no MMIO) so their exact bit layout is
+ * unit-tested; only the write+wait sequence (hype_lapic_send_ipi) touches
+ * real MMIO and is exempt.
+ */
+#define HYPE_LAPIC_ICR_LOW_OFFSET 0x300
+#define HYPE_LAPIC_ICR_HIGH_OFFSET 0x310
+#define HYPE_LAPIC_ICR_DELIVERY_STATUS (1u << 12) /* bit 12: 1 = send pending */
+
+/* ICR_HIGH value targeting a single processor by physical APIC id. */
+uint32_t hype_lapic_icr_high(uint8_t apic_id);
+
+/* ICR_LOW for "INIT, assert, edge" -- resets the target AP to a wait-for-SIPI
+ * state (delivery mode 0b101, level=assert). Standard value 0x00004500. */
+uint32_t hype_lapic_icr_low_init(void);
+
+/* ICR_LOW for a Startup IPI (delivery mode 0b110, assert). The 8-bit vector
+ * is the trampoline's physical page number (entry address >> 12), so the AP
+ * begins executing in real mode at (vector << 12). Standard 0x00004600|vec. */
+uint32_t hype_lapic_icr_low_sipi(uint8_t trampoline_page);
+
+/* Sends one IPI: writes ICR_HIGH (destination) then ICR_LOW (latches/sends),
+ * then spins until the delivery-status bit clears. `lapic_base` is the 4KB
+ * register window (HYPE_LAPIC_DEFAULT_BASE on real HW). Exempt glue. */
+void hype_lapic_send_ipi(volatile uint32_t *lapic_base, uint32_t icr_high, uint32_t icr_low);
+
 #endif /* HYPE_ARCH_LAPIC_H */
