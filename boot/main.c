@@ -4837,6 +4837,15 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t last_exhist_tsc = 0;
     uint64_t last_preempt_rip_tsc = 0; /* RT-2b: throttle the preemption-RIP sample log */
     uint64_t last_gop_flush_tsc = 0;   /* RT-2c: throttle deferred GOP framebuffer pushes to ~60 Hz */
+    /* PERF-1a: idle-wait-vs-active split + IF-state preemption profile. The
+     * central question -- how much of the boot is fast-forwardable HLT idle
+     * (hype waits real time; QEMU fast-forwards) vs genuine execution, and
+     * how often the guest runs with interrupts masked (IF=0, delaying
+     * delivery / the scheduler churn). Diff QEMU-hype vs HW-hype to isolate. */
+    uint64_t perf_boot_start_tsc = 0;  /* first FW-1 loop iteration (wall-clock base) */
+    uint64_t perf_hlt_wait_tsc = 0;    /* total real time busy-waited in the HLT idle-wait */
+    unsigned long long perf_hlt_if1 = 0, perf_hlt_if0 = 0;     /* HLT exits by guest IF */
+    unsigned long long perf_preempt_if1 = 0, perf_preempt_if0 = 0; /* host-tick preemptions by IF */
     /* RT-2c waiting-vs-working instrumentation: where host-tick preemptions
      * land. A few dominant RIPs => guest is spinning (waiting on a slow
      * clock); spread across many => doing real work. Coarse space split plus
@@ -4907,6 +4916,10 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
     for (;;) {
         uint8_t timer_vector;
+
+        if (perf_boot_start_tsc == 0) {
+            perf_boot_start_tsc = hype_rdtsc(); /* PERF-1a wall-clock base */
+        }
 
         /* M4-6d4: localise the ~219us/exit real-HW cost. Bracket VMRUN to
          * separate the SVM world-switch cost (t_pre..t_post) from the
@@ -5072,6 +5085,24 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                                              ib[10], ib[11]);
                         }
                     }
+                }
+                /* PERF-1a: the idle-vs-active + IF-state profile. elapsed =
+                 * wall-clock since the FW-1 loop started; hlt_wait = real time
+                 * hype busy-waited in the HLT idle-wait (the fast-forwardable
+                 * part -- QEMU collapses it). Big hlt_wait/elapsed => fix idle;
+                 * small => the boot is genuine active execution. IF split shows
+                 * how much guest time runs with interrupts masked. Diff QEMU-
+                 * hype vs HW-hype to isolate the HW-specific cost. */
+                if (g_fw_1_host_tsc_hz != 0) {
+                    unsigned long long elapsed_ms =
+                        ((hype_rdtsc() - perf_boot_start_tsc) * 1000ULL) / g_fw_1_host_tsc_hz;
+                    unsigned long long hlt_wait_ms =
+                        (perf_hlt_wait_tsc * 1000ULL) / g_fw_1_host_tsc_hz;
+                    hype_debug_print("fw-1 PERF: elapsed=%llums hlt_wait=%llums (%llu%%) | "
+                                     "hlt_if1=%llu hlt_if0=%llu | preempt_if1=%llu preempt_if0=%llu\n",
+                                     elapsed_ms, hlt_wait_ms,
+                                     elapsed_ms ? (hlt_wait_ms * 100ULL / elapsed_ms) : 0ULL,
+                                     perf_hlt_if1, perf_hlt_if0, perf_preempt_if1, perf_preempt_if0);
                 }
                 /* M4-6d4: companion line to EXHIST. The real-HW soft lockups
                  * (blkid stuck 24s, kworker stuck 26s -- confirmed by a
@@ -5487,6 +5518,19 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                  * everything else (firmware/low identity map) = lowmem. */
                 uint64_t rip = info.guest_rip;
                 int rh, found = -1, freeslot = -1, minslot = -1;
+                /* PERF-1a: was the guest running with interrupts enabled (IF=1)
+                 * or masked (IF=0) when the host tick preempted it? A high IF=0
+                 * fraction => lots of time in interrupts-disabled critical
+                 * sections (delays delivery; part of the scheduler churn). */
+                {
+                    hype_svm_intr_state_t ps;
+                    hype_svm_vcpu_get_intr_state(ctx, &ps);
+                    if (((ps.rflags >> 9) & 1u) != 0) {
+                        perf_preempt_if1++;
+                    } else {
+                        perf_preempt_if0++;
+                    }
+                }
                 if (rip >= 0xffff800000000000ULL) {
                     preempt_kernel++;
                 } else if (rip >= 0x1000ULL && rip < 0x0000800000000000ULL) {
@@ -6061,6 +6105,7 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 hype_svm_vcpu_get_intr_state(ctx, &iw);
                 if (((iw.rflags >> 9) & 1u) != 0) { /* IF=1: a real interrupt-wait */
                     uint64_t ttn = 0; /* PIT ticks until the nearest armed timer edge */
+                    perf_hlt_if1++; /* PERF-1a */
                     if (g_fw_1_pit.channels[0].counter != 0u) {
                         ttn = (uint64_t)g_fw_1_pit.channels[0].counter;
                     }
@@ -6081,9 +6126,17 @@ static void run_fw_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                         /* Exclude this deliberate idle wait from the COSTHIST
                          * loop-body accounting, so that metric keeps measuring
                          * only real per-exit work (VMRUN vs handler code), not
-                         * time we intentionally spent halted. */
-                        g_fw_1_prev_post_tsc = hype_rdtsc();
+                         * time we intentionally spent halted. PERF-1a: but DO
+                         * accumulate it here -- this is the fast-forwardable
+                         * idle time (QEMU collapses it; hype honours it). */
+                        {
+                            uint64_t end = hype_rdtsc();
+                            perf_hlt_wait_tsc += end - start;
+                            g_fw_1_prev_post_tsc = end;
+                        }
                     }
+                } else {
+                    perf_hlt_if0++; /* PERF-1a: halted with interrupts masked */
                 }
             }
             continue;
