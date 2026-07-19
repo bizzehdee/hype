@@ -287,8 +287,10 @@ static uint8_t g_ap_hsave[4096] __attribute__((aligned(4096)));
 static volatile uint32_t g_fw_1_ap_svm_ok;
 /* AP-bring-up result, latched so the diag tick can re-emit it (the one-shot
  * AP-SMOKETEST line prints too early to survive in the 16KB nvlog tail).
- * -2 = smoketest not run yet. */
+ * -2 = smoketest not reached; -3 = skipped (no <1MB trampoline page);
+ * -4 = skipped (host CR3 >= 4GB); >=-1 = hype_ap_start's return. */
 static int g_fw_1_ap_rc = -2;
+static uint64_t g_fw_1_ap_cr3; /* host CR3 at smoketest time (for the diag) */
 
 /* M8-0b-ii: the AP's C landing (runs on the second core, on hype's paging,
  * with its own stack). Increment 1: prove the AP can become a hypervisor core
@@ -5255,9 +5257,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 /* M8-0b: re-emit the AP bring-up result every tick so it survives
                  * in the nvlog tail to login (the one-shot AP-SMOKETEST prints too
                  * early). rc=0 + svm_ok=1 => the second core came up on real HW. */
-                hype_debug_print("fw-1 AP: rc=%d phase=%u c_alive=%u svm_ok=%u\n", g_fw_1_ap_rc,
-                                 (unsigned int)g_hype_ap_last_phase, (unsigned int)g_hype_ap_c_alive,
-                                 (unsigned int)g_fw_1_ap_svm_ok);
+                hype_debug_print(
+                    "fw-1 AP: rc=%d (-3=no-lowpage -4=cr3>=4GB) tramp=0x%llx cr3=0x%llx phase=%u "
+                    "c_alive=%u svm_ok=%u\n",
+                    g_fw_1_ap_rc, (unsigned long long)g_ap_tramp_page,
+                    (unsigned long long)g_fw_1_ap_cr3, (unsigned int)g_hype_ap_last_phase,
+                    (unsigned int)g_hype_ap_c_alive, (unsigned int)g_fw_1_ap_svm_ok);
             }
         }
 
@@ -7145,9 +7150,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     {
         uint64_t cr3;
         __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        g_fw_1_ap_cr3 = cr3; /* captured for the persistent diag regardless of path */
         if (g_ap_tramp_page == 0) {
+            g_fw_1_ap_rc = -3; /* skip: no <1MB trampoline page (low-mem alloc failed) */
             hype_debug_print("fw-1 AP-SMOKETEST: SKIP -- no <1MB trampoline page\n");
         } else if (cr3 >= 0x100000000ULL) {
+            g_fw_1_ap_rc = -4; /* skip: host CR3 >= 4GB (trampoline loads only low 32 bits) */
             hype_debug_print("fw-1 AP-SMOKETEST: SKIP -- host CR3 0x%llx >= 4GB\n",
                               (unsigned long long)cr3);
         } else {
