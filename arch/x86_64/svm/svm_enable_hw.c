@@ -27,9 +27,25 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
  * holds the only real logic (what the new EFER value should be) and is
  * fully tested.
  */
+/* Sets EFER.SVME and points VM_HSAVE_PA at `hsave_pa` on the CURRENT core.
+ * SVME and VM_HSAVE_PA are per-core, so every core that will VMRUN must call
+ * this with its OWN host-save page (M8-0b: the AP runs it from its C landing,
+ * silently -- no debug prints, which could race the BSP's console). */
+int hype_svm_enable_on(uint64_t hsave_pa) {
+    uint64_t efer = rdmsr(HYPE_MSR_EFER);
+    wrmsr(HYPE_MSR_EFER, hype_svm_efer_with_svme(efer));
+    wrmsr(HYPE_MSR_VM_HSAVE_PA, hsave_pa);
+    return 0;
+}
+
+/*
+ * Exempt from unit testing per AGENTS.md: real RDMSR/WRMSR, nothing to
+ * observe without a real CPU. hype_svm_efer_with_svme() in svm_bits.c
+ * holds the only real logic (what the new EFER value should be) and is
+ * fully tested.
+ */
 int hype_svm_enable(void) {
     uint64_t vm_cr;
-    uint64_t efer;
 
     /* Real-hardware debugging: VM_CR.SVMDIS (bit 4) can lock SVM off
      * independently of the "SVM enabled" BIOS toggle -- if it's set,
@@ -41,14 +57,9 @@ int hype_svm_enable(void) {
     vm_cr = rdmsr(HYPE_MSR_VM_CR);
     hype_debug_print("svm: VM_CR=0x%llx SVMDIS=%d\n", (unsigned long long)vm_cr,
                       (vm_cr & HYPE_MSR_VM_CR_SVMDIS) != 0);
-
-    efer = rdmsr(HYPE_MSR_EFER);
-    hype_debug_print("svm: EFER(before)=0x%llx -- about to WRMSR EFER (set SVME)...\n",
-                      (unsigned long long)efer);
-    wrmsr(HYPE_MSR_EFER, hype_svm_efer_with_svme(efer));
-    hype_debug_print("svm: EFER WRMSR done -- about to WRMSR VM_HSAVE_PA=0x%llx...\n",
+    hype_debug_print("svm: about to enable SVM (hsave=0x%llx)...\n",
                       (unsigned long long)(uint64_t)(uintptr_t)g_hsave_area);
-    wrmsr(HYPE_MSR_VM_HSAVE_PA, (uint64_t)g_hsave_area);
-    hype_debug_print("svm: VM_HSAVE_PA WRMSR done -- SVM enable complete\n");
+    hype_svm_enable_on((uint64_t)(uintptr_t)g_hsave_area);
+    hype_debug_print("svm: SVM enable complete\n");
     return 0;
 }

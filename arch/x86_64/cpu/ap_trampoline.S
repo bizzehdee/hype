@@ -91,8 +91,8 @@ long_entry:
     movl $1, (tramp_alive - hype_ap_tramp_start)(%rbx)   # signal the BSP: mode switch OK
 
     movq (tramp_entry - hype_ap_tramp_start)(%rbx), %rax
-    xorq %rcx, %rcx             # MS x64 ABI arg0 = 0 (unused for now)
-    callq *%rax                 # into hype_ap_entry(); it never returns
+    movq (tramp_arg - hype_ap_tramp_start)(%rbx), %rcx   # MS x64 ABI arg0
+    callq *%rax                 # into the C entry; it never returns
 1:  cli
     hlt
     jmp 1b
@@ -127,6 +127,10 @@ tramp_cr3:
 .globl hype_ap_tramp_entry
 hype_ap_tramp_entry:
 tramp_entry:
+    .quad 0
+.globl hype_ap_tramp_arg
+hype_ap_tramp_arg:
+tramp_arg:
     .quad 0
 .globl hype_ap_tramp_stack
 hype_ap_tramp_stack:

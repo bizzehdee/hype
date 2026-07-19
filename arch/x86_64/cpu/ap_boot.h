@@ -24,10 +24,14 @@
  *   stack_top  : top of a 16-byte-aligned stack for the AP (host address)
  *   tsc_hz     : host TSC frequency, for the INIT->SIPI->SIPI delays (0 -> a
  *                coarse fixed spin fallback)
+ *   entry      : the AP's 64-bit C landing (runs on the AP with `entry_arg` in
+ *                RCX). Pass hype_ap_entry for the bare bring-up smoketest, or a
+ *                caller-provided AP-main to run a guest on the AP (M8-0b-ii).
+ *   entry_arg  : opaque argument passed to `entry` (RCX per the MS x64 ABI).
  * Returns 0 if the AP reached the trampoline's long-mode stage within the
  * timeout, -1 otherwise. */
 int hype_ap_start(volatile uint32_t *lapic_base, uint8_t apic_id, void *tramp_page, uint64_t cr3,
-                  uint64_t stack_top, uint64_t tsc_hz);
+                  uint64_t stack_top, uint64_t tsc_hz, void (*entry)(void *), void *entry_arg);
 
 /* Set to 1 once an AP has actually entered hype_ap_entry() -- i.e. the 64-bit
  * C landing ran (proves the whole mode-switch + stack + call worked, a step

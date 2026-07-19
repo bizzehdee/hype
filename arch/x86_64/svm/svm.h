@@ -61,6 +61,12 @@ uint64_t hype_svm_efer_with_svme(uint64_t old_efer);
  */
 int hype_svm_enable(void);
 
+/* Enables SVM on the CURRENT core with the caller-supplied host-save page.
+ * SVME/VM_HSAVE_PA are per-core, so a second core (M8-0b AP) enabling SVM to
+ * run its own guest must call this with its own page. No console output (an
+ * AP calls it, and printing there would race the BSP). */
+int hype_svm_enable_on(uint64_t hsave_pa);
+
 /*
  * Enables AVIC on `vmcb` (M2-4) using this project's own statically-
  * reserved AVIC backing/logical/physical ID table pages and the

@@ -281,6 +281,25 @@ static uint64_t g_usable_ram_bytes;
 #define HYPE_AP_SMOKETEST 1
 static uint64_t g_ap_tramp_page;
 static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
+/* M8-0b-ii: the AP's own SVM host-save area (SVME/VM_HSAVE_PA are per-core) +
+ * a flag the AP sets once it has enabled SVM on its core without faulting. */
+static uint8_t g_ap_hsave[4096] __attribute__((aligned(4096)));
+static volatile uint32_t g_fw_1_ap_svm_ok;
+
+/* M8-0b-ii: the AP's C landing (runs on the second core, on hype's paging,
+ * with its own stack). Increment 1: prove the AP can become a hypervisor core
+ * -- enable SVM on it (its own host-save area) and report success. A later
+ * increment loads a per-AP GDT/IDT and runs run_fw_1_test(&g_vms[1]) here to
+ * put a second Alpine on this core. Never returns. */
+static void fw_1_ap_main(void *arg) {
+    (void)arg;
+    hype_svm_enable_on((uint64_t)(uintptr_t)g_ap_hsave); /* faults never return */
+    g_fw_1_ap_svm_ok = 1;
+    g_hype_ap_c_alive = 1;
+    for (;;) {
+        __asm__ volatile("cli; hlt");
+    }
+}
 /* PERF-1 (gaps #3/#4): the guest kernel's own clocksource + delay-calibration
  * dmesg lines, pinned so they survive to the login-time RT-3 nvlog snapshot
  * (they print too early to otherwise be in the 16 KB tail). Diagnostic aid for
@@ -7118,13 +7137,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             int ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 1u,
                                       (void *)(uintptr_t)g_ap_tramp_page, cr3,
                                       (uint64_t)(uintptr_t)(g_ap_stack + sizeof(g_ap_stack)),
-                                      g_fw_1_host_tsc_hz);
+                                      g_fw_1_host_tsc_hz, fw_1_ap_main, 0);
             hype_debug_print(
                 "fw-1 AP-SMOKETEST: apic_id=1 tramp=0x%llx cr3=0x%llx -> rc=%d (long-mode reached=%s), "
-                "last_phase=%u (0=none 1=real 2=prot 3=long) c_entry_ran=%u\n",
+                "last_phase=%u (0=none 1=real 2=prot 3=long) c_entry_ran=%u ap_svm_ok=%u\n",
                 (unsigned long long)g_ap_tramp_page, (unsigned long long)cr3, ap_rc,
                 (ap_rc == 0) ? "yes" : "NO", (unsigned int)g_hype_ap_last_phase,
-                (unsigned int)g_hype_ap_c_alive);
+                (unsigned int)g_hype_ap_c_alive, (unsigned int)g_fw_1_ap_svm_ok);
         }
     }
 #endif

@@ -9,6 +9,7 @@ extern uint8_t hype_ap_tramp_entry[];
 extern uint8_t hype_ap_tramp_stack[];
 extern uint8_t hype_ap_tramp_alive[];
 extern uint8_t hype_ap_tramp_phase[];
+extern uint8_t hype_ap_tramp_arg[];
 
 volatile uint32_t g_hype_ap_c_alive = 0;
 volatile uint32_t g_hype_ap_last_phase = 0;
@@ -56,7 +57,7 @@ static void ap_busy_wait_us(uint64_t tsc_hz, uint64_t us) {
 }
 
 int hype_ap_start(volatile uint32_t *lapic_base, uint8_t apic_id, void *tramp_page, uint64_t cr3,
-                  uint64_t stack_top, uint64_t tsc_hz) {
+                  uint64_t stack_top, uint64_t tsc_hz, void (*entry)(void *), void *entry_arg) {
     unsigned int size = (unsigned int)(hype_ap_tramp_end - hype_ap_tramp_start);
     unsigned int i;
     uint8_t *dst = (uint8_t *)tramp_page;
@@ -71,7 +72,9 @@ int hype_ap_start(volatile uint32_t *lapic_base, uint8_t apic_id, void *tramp_pa
     }
     *(volatile uint64_t *)(dst + (hype_ap_tramp_cr3 - hype_ap_tramp_start)) = cr3;
     *(volatile uint64_t *)(dst + (hype_ap_tramp_entry - hype_ap_tramp_start)) =
-        (uint64_t)(uintptr_t)&hype_ap_entry;
+        (uint64_t)(uintptr_t)entry;
+    *(volatile uint64_t *)(dst + (hype_ap_tramp_arg - hype_ap_tramp_start)) =
+        (uint64_t)(uintptr_t)entry_arg;
     *(volatile uint64_t *)(dst + (hype_ap_tramp_stack - hype_ap_tramp_start)) = stack_top;
     alive = (volatile uint32_t *)(dst + (hype_ap_tramp_alive - hype_ap_tramp_start));
     *alive = 0;

@@ -4342,3 +4342,18 @@ tick) should improve -> M8-0b-ii is now the MEASURED perf lever, not
 speculative. (sysvec_call_function hot = guest doing cross-CPU IPIs, worth
 a look -- is the guest SMP?)
 
+M8-0b-ii increment 1 (2026-07-19): the AP is now a HYPERVISOR-capable
+core. hype_ap_start() gained an explicit entry-fn + arg (trampoline loads
+the arg into RCX per the MS x64 ABI), so the FW-1 path supplies its own AP
+main (fw_1_ap_main) instead of the bare smoketest. svm_enable_hw.c factored
+into hype_svm_enable_on(hsave_pa) (per-core; SVME/VM_HSAVE_PA are per-core)
+-- the AP enables SVM with its own g_ap_hsave page. QEMU -smp 2:
+AP-SMOKETEST ... ap_svm_ok=1 (AP set EFER.SVME + VM_HSAVE_PA, no fault),
+c_entry_ran=1, BSP still boots Alpine to login. NEXT increments: load a
+per-AP GDT/IDT in fw_1_ap_main; allocate g_vms[1] RAM+firmware+ACPI+NPT
+(extend efi_main setup to build BOTH instances pre-EBS); run
+run_fw_1_test(&g_vms[1]) on the AP; handle the dedicated-core guest timer
+(no shared 1000Hz host tick -- rely on kvmclock + natural exits / an AP
+timer) + console routing. THEN the perf measurement: does the guest boot
+faster free of the 335K host-tick preemptions?
+
