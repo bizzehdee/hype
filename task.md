@@ -4492,3 +4492,18 @@ The DIRECTION still holds: single-digit-x (not 60x), I/O-VMEXIT overhead
 passthrough, batch ATAPI / virtio-blk boot) is valid regardless of the
 exact multiplier.
 
+GUEST-COMPLEXITY LADDER + M8-0b sequence (user direction 2026-07-19):
+stay on alpine-VIRT until BOTH multi-core milestones are confirmed, THEN
+climb the guest ladder. Order:
+  1. alpine-virt on its own AP (dedicated core) -- QEMU-confirmed
+     (apic_id=1); HW confirmation pending (fw-1 CORE line, package ready).
+  2. TWO alpine-virt on TWO APs concurrently (the real M8-0b-ii milestone:
+     bring up a 2nd AP, g_vms[1] resources, per-AP timer, console routing).
+  3. THEN alpine-STANDARD (fuller kernel; also the clean same-kernel perf
+     baseline vs the 90s native-standard) as an intermediate rung.
+  4. THEN a heavy distro (Fedora / Ubuntu).
+PERF-1 I/O-overhead work (per-port IOIO histogram, port-0x80 passthrough,
+virtio-blk boot) is deferred behind the multi-core milestone per this
+direction. alpine-standard-under-hype was tried once (278MB ISO) then
+reverted to alpine-virt to keep the milestone path clean.
+
