@@ -4,6 +4,8 @@
 
 #include "../../../core/fatal.h"
 
+#include "../../../devices/pvclock.h"
+
 /*
  * Concrete per-vCPU context for the SVM backend (M2-7). Opaque outside
  * this file per vmm_ops.h's hype_vcpu_ctx_t contract -- the dispatch
@@ -422,18 +424,6 @@ static inline void real_cpuid(uint32_t eax, uint32_t ecx, hype_cpuid_result_t *o
                       : "a"(eax), "c"(ecx));
 }
 
-/* PERF/M4-6b5: the calibrated host TSC frequency in kHz. Published once by
- * the FW-1 setup (hype_svm_vcpu_set_tsc_khz) so the CPUID leaf 0x15/0x16
- * emulation can hand the guest an exact tsc_khz -- all cores share one
- * physical TSC rate, so a single value is correct, not just a shortcut.
- * 0 (default) -> leaves 0x15/0x16 advertise nothing, guest calibrates as
- * before. */
-static uint32_t g_guest_tsc_khz = 0;
-
-void hype_svm_vcpu_set_tsc_khz(uint32_t khz) {
-    g_guest_tsc_khz = khz;
-}
-
 void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint32_t eax_in = (uint32_t)real->vmcb->save.rax;
@@ -442,7 +432,7 @@ void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     hype_cpuid_result_t out;
 
     real_cpuid(eax_in, ecx_in, &host_real);
-    hype_cpuid_emulate(eax_in, ecx_in, &host_real, g_guest_tsc_khz, &out);
+    hype_cpuid_emulate(eax_in, ecx_in, &host_real, &out);
 
     /* CPUID zero-extends all four registers to their full 64-bit width
      * in 64-bit mode -- assigning a uint32_t into a uint64_t field
@@ -863,11 +853,96 @@ uint64_t hype_svm_vcpu_get_cr3(hype_vcpu_ctx_t *ctx) {
     return real->vmcb->save.cr3;
 }
 
+/* PVCLOCK (kvmclock) state: the guest-memory map used to reach the pvclock
+ * pages, the host TSC frequency, and the pre-computed TSC->ns scale. A single
+ * instance is correct -- all cores share one TSC rate. Registered by the FW-1
+ * setup before the guest runs (hype_svm_vcpu_set_pvclock). */
+static const hype_gpa_map_t *g_pvclock_map = 0;
+static uint32_t g_pvclock_mul = 0;
+static int8_t g_pvclock_shift = 0;
+static uint64_t g_pvclock_system_msr = 0; /* last MSR_KVM_SYSTEM_TIME write (for RDMSR) */
+static uint64_t g_pvclock_wall_msr = 0;
+/* Times hype filled a pvclock time-info page -- nonzero proves the guest
+ * detected KVM and enabled kvmclock, and hype backed it. Read by the diag. */
+volatile uint32_t g_hype_pvclock_arm_count = 0;
+
+void hype_svm_vcpu_set_pvclock(const hype_gpa_map_t *map, uint64_t tsc_hz) {
+    g_pvclock_map = map;
+    hype_pvclock_calc_scale(tsc_hz, &g_pvclock_mul, &g_pvclock_shift);
+}
+
+/* Guest wrote MSR_KVM_SYSTEM_TIME: fill its per-vCPU time-info page so it can
+ * read time as system_time + scale(rdtsc - tsc_timestamp). We publish
+ * system_time = scale(now) with tsc_timestamp = now, so guest time == scale of
+ * the raw (passthrough) TSC -- monotonic, TSC_STABLE, no guest calibration. */
+static void hype_svm_pvclock_arm_system_time(uint64_t msr_value) {
+    uint64_t gpa, host, now, system_ns;
+    if ((msr_value & HYPE_KVM_SYSTEM_TIME_ENABLE) == 0 || g_pvclock_map == 0) {
+        return;
+    }
+    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
+    host = hype_gpa_to_host(g_pvclock_map, gpa, sizeof(struct hype_pvclock_vcpu_time_info));
+    if (host == 0) {
+        return;
+    }
+    now = real_rdtsc();
+    system_ns = hype_pvclock_scale_delta(now, g_pvclock_mul, g_pvclock_shift);
+    hype_pvclock_write_time_info((volatile struct hype_pvclock_vcpu_time_info *)(uintptr_t)host, now,
+                                 system_ns, g_pvclock_mul, g_pvclock_shift, HYPE_PVCLOCK_TSC_STABLE_BIT);
+    g_hype_pvclock_arm_count++;
+}
+
+/* Guest wrote MSR_KVM_WALL_CLOCK: fill the boot-wall-time page. hype has no
+ * RTC (CMOS returns 0), so publish epoch 0 -- the guest's monotonic clock
+ * (above) is correct; only wall-clock date is unknown, same as today. */
+static void hype_svm_pvclock_arm_wall_clock(uint64_t msr_value) {
+    uint64_t gpa, host;
+    if (g_pvclock_map == 0) {
+        return;
+    }
+    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
+    host = hype_gpa_to_host(g_pvclock_map, gpa, sizeof(struct hype_pvclock_wall_clock));
+    if (host == 0) {
+        return;
+    }
+    hype_pvclock_write_wall_clock((volatile struct hype_pvclock_wall_clock *)(uintptr_t)host, 0, 0);
+}
+
 int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int is_write = (real->vmcb->control.exitinfo1 & 0x1ULL) != 0;
     uint32_t msr_number = (uint32_t)real->gprs[1]; /* RCX */
     hype_msr_action_t action;
+
+    /* PVCLOCK (kvmclock): the guest arms the paravirt clock by writing the
+     * guest-physical address of its time-info page (| enable) to
+     * MSR_KVM_SYSTEM_TIME, and the wall-clock page to MSR_KVM_WALL_CLOCK.
+     * hype fills those pages from the host TSC (see helpers above), so the
+     * guest never runs its own (failing, on AMD) TSC calibration. */
+    if (msr_number == HYPE_MSR_KVM_SYSTEM_TIME_NEW || msr_number == HYPE_MSR_KVM_SYSTEM_TIME_OLD) {
+        if (is_write) {
+            g_pvclock_system_msr =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+            hype_svm_pvclock_arm_system_time(g_pvclock_system_msr);
+        } else {
+            real->vmcb->save.rax = (uint64_t)(uint32_t)g_pvclock_system_msr;
+            real->gprs[2] = (uint64_t)(uint32_t)(g_pvclock_system_msr >> 32);
+        }
+        real->vmcb->save.rip += 2;
+        return 0;
+    }
+    if (msr_number == HYPE_MSR_KVM_WALL_CLOCK_NEW || msr_number == HYPE_MSR_KVM_WALL_CLOCK_OLD) {
+        if (is_write) {
+            g_pvclock_wall_msr =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+            hype_svm_pvclock_arm_wall_clock(g_pvclock_wall_msr);
+        } else {
+            real->vmcb->save.rax = (uint64_t)(uint32_t)g_pvclock_wall_msr;
+            real->gprs[2] = (uint64_t)(uint32_t)(g_pvclock_wall_msr >> 32);
+        }
+        real->vmcb->save.rip += 2;
+        return 0;
+    }
 
     /* IA32_PAT (0x277): emulated into the VMCB's own g_pat, which VMRUN
      * loads for the guest under nested paging -- per-guest and isolated.

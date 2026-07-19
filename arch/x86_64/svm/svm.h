@@ -204,12 +204,6 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
  */
 void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
 
-/* Publishes the calibrated host TSC frequency (kHz) used by the CPUID
- * leaf 0x15/0x16 emulation so the guest reads an exact tsc_khz and keeps
- * the TSC as its clocksource (PERF-1). Call once before running the guest;
- * 0 (the default) advertises no TSC frequency. */
-void hype_svm_vcpu_set_tsc_khz(uint32_t khz);
-
 /*
  * FW-1 real-hardware/real-firmware debugging: decodes and returns the
  * most recent NPF's direction/faulting-guest-physical-address
@@ -571,6 +565,16 @@ uint64_t hype_svm_vcpu_get_cr3(hype_vcpu_ctx_t *ctx);
  * a rejected MSR.
  */
 int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx);
+
+/* PVCLOCK (kvmclock): register the guest-memory map (for reaching the pvclock
+ * pages) and the host TSC frequency, so the KVM SYSTEM_TIME/WALL_CLOCK MSR
+ * writes can fill the guest's pvclock pages. Call once before running the
+ * guest. Without it, those MSR writes are accepted but fill nothing. */
+void hype_svm_vcpu_set_pvclock(const hype_gpa_map_t *map, uint64_t tsc_hz);
+
+/* Count of pvclock time-info page fills -- nonzero proves the guest enabled
+ * kvmclock and hype backed it. Diagnostic. */
+extern volatile uint32_t g_hype_pvclock_arm_count;
 
 /*
  * Handles an NPF (M4-3) VM-exit against `pf`, an emulated CFI flash

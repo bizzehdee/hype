@@ -1885,7 +1885,7 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         __asm__ volatile("cpuid"
                           : "=a"(real.eax), "=b"(real.ebx), "=c"(real.ecx), "=d"(real.edx)
                           : "a"(eax_in), "c"(0));
-        hype_cpuid_emulate(eax_in, 0, &real, 0u, &expected);
+        hype_cpuid_emulate(eax_in, 0, &real, &expected);
 
         got_eax = (uint32_t)slot[0] | ((uint32_t)slot[1] << 8) | ((uint32_t)slot[2] << 16) |
                   ((uint32_t)slot[3] << 24);
@@ -4825,6 +4825,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_gpa_map_add(&g_fw_1_dma_map, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
                       g_fw_1_combined_size);
 
+    /* PVCLOCK (kvmclock): register the guest-memory map + host TSC frequency
+     * so the guest's KVM SYSTEM_TIME/WALL_CLOCK MSR writes fill its pvclock
+     * pages (which live in guest RAM, covered by dma_map above). This is what
+     * makes the KVM CPUID signature (cpuid_emulate.c) actually deliver a clock
+     * -- the guest reads time from the TSC via the page instead of running
+     * its own PIT-based calibration, which fails on AMD. */
+    hype_svm_vcpu_set_pvclock(&g_fw_1_dma_map, g_fw_1_host_tsc_hz);
+
     hype_debug_print(
         "fw-1: launching real OVMF at cs_base=0x%llx rip=0x%llx (guest-physical [0x%llx,0x100000000) -> "
         "host-physical 0x%llx)\n",
@@ -4837,13 +4845,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         hype_fatal("fw-1: vcpu_create failed");
     }
     hype_svm_vcpu_set_rip(ctx, reset_rip);
-    /* PERF-1: publish the calibrated host TSC frequency so CPUID leaf
-     * 0x15/0x16 hand the guest an exact tsc_khz -- Linux then keeps the
-     * (passthrough) TSC as its clocksource instead of failing PIT-based
-     * calibration ("could not calculate TSC khz" -> TSC unstable, seen on
-     * real HW). The guest TSC IS the host TSC (passthrough), so host_tsc_hz
-     * is the right frequency. */
-    hype_svm_vcpu_set_tsc_khz((uint32_t)(g_fw_1_host_tsc_hz / 1000ULL));
     /* M4-6: let the guest own every exception vector. OVMF and any OS it
      * boots (real Linux takes routine #PF/#GP/#UD/#NM) handle their own
      * faults via their own IDTs; intercepting exceptions -- the strict
@@ -5217,6 +5218,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (g_fw_1_clockfacts.len > 0) {
                     hype_debug_print("fw-1 CLOCKFACTS: %s\n", g_fw_1_clockfacts.buf);
                 }
+                /* PVCLOCK: nonzero => the guest detected KVM, enabled kvmclock,
+                 * and hype filled its pvclock page (the TSC-calibration fix). */
+                hype_debug_print("fw-1 PVCLOCK: arm_count=%u\n",
+                                 (unsigned int)g_hype_pvclock_arm_count);
             }
         }
 

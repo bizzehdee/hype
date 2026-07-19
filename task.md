@@ -4307,3 +4307,22 @@ SYSTEM_TIME/WALL_CLOCK MSRs, and fill the pvclock page (once, TSC_STABLE)
 via hype_gpa_to_host. Then QEMU + HW verify the "Marking TSC unstable"
 line is gone and boot time drops.
 
+PVCLOCK STEP 2 (kvmclock glue, 2026-07-19): the CPUID + MSR + page-fill
+wiring that makes kvmclock actually deliver a clock. (1) CPUID rework in
+cpuid_emulate.c: undid the dead Intel-only leaf 0x15/0x16 + XSAVE-clear +
+max-leaf-bump from e6f4517 (restored leaf 0 max=1, XSAVE); leaf 0x40000000
+now returns the "KVMKVMKVM" signature + max KVM leaf, and new leaf
+0x40000001 advertises ONLY the pvclock features (CLOCKSOURCE, CLOCKSOURCE2,
+TSC_STABLE) -- no other KVM paravirt, so the guest enables nothing hype
+doesn't back. (2) MSR trap in svm_vcpu.c: WRMSR to KVM SYSTEM_TIME/
+WALL_CLOCK translates the guest-physical page addr via the dma_map and
+fills the pvclock page (tsc_timestamp=rdtsc, system_time=scale(rdtsc),
+TSC_STABLE) -- guest then reads time from the passthrough TSC with no
+calibration. (3) run_fw_1_test registers hype_svm_vcpu_set_pvclock(dma_map,
+host_tsc_hz) before the guest runs. Diag: "fw-1 PVCLOCK: arm_count=N"
+(nonzero = guest enabled kvmclock, hype backed it). cpuid_emulate.c 100%
+cov; suite green. NOTE: had to land CPUID+MSR together -- advertising the
+KVM signature without the MSR fill would arm a clock over an unfilled page.
+AWAITING QEMU + HW verify: boot to login + arm_count>0 + "Marking TSC
+unstable" gone + faster boot.
+
