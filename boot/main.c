@@ -296,8 +296,11 @@ static uint64_t g_usable_ram_bytes;
  * (vec 0x3b) before login -- a SECOND multi-VM bug (in the AHCI/IRQ-injection
  * path), distinct from the per-vCPU pvclock dead-halt already fixed. Defaulted
  * to 0 (proven single-VM-on-AP: reaches login, HW-confirmed) until that wedge
- * is fixed; flip to 1 (with QEMU -m >= 8192, -smp 3) to continue the bring-up. */
-#define HYPE_RUN_TWO_VMS 0
+ * is fixed; flip to 1 (with QEMU -m >= 8192, -smp 3) to continue the bring-up.
+ *
+ * UPDATE (2026-07-19): the AHCI-IRQ wedge (BUG#2) was the shared single-slot
+ * pending-IRQ queue (g_pending_irq_*) -- now per-vCPU. Re-enabled (=1). */
+#define HYPE_RUN_TWO_VMS 1
 static uint64_t g_ap_tramp_page;
 static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
 /* Stashed for fw_1_ap_main to run the guest on the AP (set in efi_main). */

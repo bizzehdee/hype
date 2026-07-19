@@ -4560,3 +4560,21 @@ reaches login, HW-confirmed) until this is fixed. NEXT: debug the AHCI
 completion/IRQ path under two concurrent guests (per-VM ahci/atapi state looks
 isolated; suspect the shared-ISO concurrent-read path or a shared injection
 resource). Then M8-0c per-VM console routing (serial currently garbles).
+
+M8-0b-ii BUG#2 FIXED + STEP 2 MILESTONE (QEMU) 2026-07-19: TWO Alpines boot
+to login concurrently on two dedicated APs. BUG#2 was the same class as BUG#1:
+g_pending_irq_valid/g_pending_irq_vector (svm_vcpu.c) were a file-global
+single-slot deferred-IRQ queue SHARED by both vCPUs. Cross-VM, one guest's
+deferred AHCI IRQ (vec 0x3b) was overwritten by, or EVENTINJ-injected into, the
+OTHER guest and cleared -> the owner saw pending=0 and wedged. Moved the slot
+into the vCPU ctx (per-vCPU), reset in reset_gprs; the g_int_* counters stay
+global (diag aggregate). QEMU -m 8192 -smp 3 result: 4 Alpine banners + 4
+login prompts (two guests x getty on ttyS0+ttyS1), arm_count=2 (BOTH armed
+their own kvmclock), ZERO giveup/wedge/dead-halt/panic. Both guests idle-halt
+healthily at the prompt on apic_id=1 and apic_id=2.
+Two de-globalization fixes landed the milestone: per-vCPU pvclock map (BUG#1)
+and per-vCPU pending-IRQ slot (BUG#2). HYPE_RUN_TWO_VMS re-enabled (=1).
+HW-VALIDATION OWED (QEMU proves the logic; real AMD silicon is the bar -- the
+laptop needs enough RAM for two ~1GB guests + 2 OVMF copies). NEXT: build the
+HW package for the user to cold-boot test; then M8-0c per-VM console routing
+(the shared UART currently garbles the two guests' output together).
