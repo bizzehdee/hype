@@ -118,6 +118,33 @@ of every task — task.md is authoritative. (Considered and declined a
 GitHub-Projects kanban migration: it would exile the detailed notes out of
 the tree for little gain on a solo, terminal-native project.)
 
+### Priority-to-complete queue (reconciled 2026-07-20)
+
+Audit note: all `[~]` in-progress tasks were found to be **actually done** and
+were closed (`M4-6b`, `M4-6d4`, `FW-1f`) along with a batch of stale-`[ ]`
+completed work (`M8-0/0a/0b/0c`, `PERF-1`, `RT-2/2c/3`, `M4-6b5`). **Abandoned
+check:** no task is genuinely abandoned — every open task is either *deferred
+but still valid* or *future/not-started*. The remaining open work in priority
+order:
+
+1. **GLADDER (active): alpine-standard bring-up** — `GLADDER-1` (absorb+log
+   unhandled MMIO; the diagnostic enabler) → `GLADDER-2` (scope the enumerated
+   MMIO regions) → `GLADDER-3` (GRUB drive-through) → `GLADDER-4` (two
+   -standard on two cores + clean same-kernel perf baseline). Then a heavy
+   distro (Fedora/Ubuntu).
+2. **`M4-6b3` (IO-APIC)** — deferred M4-6 enhancement, now doubly relevant:
+   it's what a fuller kernel's chipset/interrupt path wants (GLADDER) *and* an
+   incremental-perf lever. **`M4-6b2` (ACPI MADT)** rides alongside it.
+3. **Incremental perf (optional, boot is already <15s):** one-shot deadline
+   host timer (trims the now-tiny 1kHz INTR waste); virtio-blk / virtio-console.
+4. **Install-to-disk:** `M5-3 → M5-4 → M5-5 → M5-6` (VALID-3 ✓).
+5. **Management UI:** `TERM-1`, `M8-1`/`M8-2`/`M8-5` → `M8-3` switcher.
+6. **Deferred-but-valid (pick up when their track activates):** `VALID-2/4`
+   (before NET-2 / other DMA), `VMX-1/2/3` (Intel path — future), `NET-*`,
+   `M6-*` (BSD), `M7-*` (Windows), `M8-4..10`, `M9-*`, `M10-*`.
+7. **Real-HW validation gates (need a physical run, not code):** `M0-5`,
+   `M2-8`, `M3-6`, `M8-10`.
+
 ---
 
 **Minimum supported guest target (plan.md §1, decided 2026-07-14): Windows
@@ -1215,7 +1242,7 @@ tasks — see updated deps below.*
   instruction (the kernel runs in virtual address space), addressed in
   the M4-6d/AHCI work.
   Deps: M4-6 infra (done).
-- [~] **M4-6b** — Guest timer-interrupt delivery at scale (the current
+- [x] **M4-6b** — Guest timer-interrupt delivery at scale (the current
   M4-6 blocker). IN PROGRESS. Fixed one half: dmesg showed "TSC deadline
   timer available", so the kernel armed its LAPIC timer via the
   IA32_TSC_DEADLINE MSR (0x6e0) -- a mode this project doesn't model, so
@@ -1308,7 +1335,7 @@ tasks — see updated deps below.*
   (PCI INTx via the PIC when a command completes with PxIE/GHC.IE set) is
   M4-6d2's core.* Deps: M4-6b1.
 
-- [ ] **M4-6b5** — Realistic guest LAPIC-timer clockevent so Linux keeps it
+- [x] **M4-6b5** — Realistic guest LAPIC-timer clockevent so Linux keeps it
   (the fix for the ~22x-slow real-HW boot). Discovered via the RT-2c boot-perf
   investigation (2026-07-19): symbolising the hot guest RIPs against the real
   Alpine 6.12.81 kernel (extracted from the ISO + its System.map) showed the
@@ -1895,7 +1922,7 @@ tasks — see updated deps below.*
   characterisation above is the deliverable. Session logs under the
   scratchpad (m46d3-*.log) hold the raw histograms.*
 
-- [~] **M4-6d4** — Real-hardware timer-tick starvation (soft lockups).
+- [x] **M4-6d4** — Real-hardware timer-tick starvation (soft lockups).
   IN PROGRESS 2026-07-17 (commits 098e857, ab110e4); BLOCKED on a
   real-HW log from the new build. On real AMD hardware the STOCK
   alpine-virt boot is no longer wedging or crashing (M4-6d3's serial-TX
@@ -2939,7 +2966,7 @@ Unit suite 52/52 green; npt.c and e820.c at 100% coverage; clean build.
   running" -- so the guest firmware's own console output is visible on
   real silicon, and the ~11k-line trace flood is gone.
 
-- [~] **FW-1f** — Guest console INPUT (drive the shell). PARTIAL: the
+- [x] **FW-1f** — Guest console INPUT (drive the shell). PARTIAL: the
   supporting work landed and is correct, but a keystroke does NOT yet
   actually drive OVMF -- root cause is deeper than a wire-up (see
   FW-1g). What was established/fixed:
@@ -3750,7 +3777,7 @@ observability channel) must land FIRST.*
     Deps: RT-1b.
   Deps: M1-6, core/logbuf, core/file_io.
 
-- [ ] **RT-2** — Move single-guest execution to post-ExitBootServices.
+- [x] **RT-2** — Move single-guest execution to post-ExitBootServices.
   - [x] **RT-2a** — DONE (QEMU-verified; HW handoff pending). Reordered
     efi_main: all setup stays pre-EBS (ISO + OVMF read, guest RAM/VMCB/NPT
     build, TSC calibration -- everything needing Boot Services); then
@@ -3812,7 +3839,7 @@ observability channel) must land FIRST.*
     with the spurious-IRQ fix): reached `localhost login` -- the post-EBS
     execution model (RT-2a+RT-2b) is CONFIRMED working end-to-end on real AMD
     hardware, not just QEMU. RT-2 boot-critical goal MET on HW.
-  - [ ] **RT-2c** — Adapt the guest timebase (M4-6b1) + console drain to the
+  - [x] **RT-2c** — Adapt the guest timebase (M4-6b1) + console drain to the
     post-EBS host-timer-driven loop (they currently assume the pre-EBS
     per-VM-exit cadence). Deps: RT-2a. NOT boot-critical (login reached
     without it). HW data captured at login (RT-3 tail) as input for this +
@@ -3825,7 +3852,7 @@ observability channel) must land FIRST.*
     partly from post-EBS GOP memcpy rendering across 640K exits.
   Deps: RT-1.
 
-- [ ] **RT-3** — Post-EBS diagnostic capture that survives a COLD power cycle
+- [x] **RT-3** — Post-EBS diagnostic capture that survives a COLD power cycle
   (new 2026-07-18, from the first RT-2a HW run: the test laptop is
   power-off-only + serial-less, so RT-1b's RAM scan can never recover a log
   there). Uses the one channel that both works post-EBS and persists across a
@@ -3867,7 +3894,7 @@ observability channel) must land FIRST.*
 
 ## PERF — FW-1 guest boot performance (measure-first; user-requested 2026-07-19)
 
-- [ ] **PERF-1** — Cut the ~340s FW-1 Alpine boot (guest execution; QEMU-hosted
+- [x] **PERF-1** — Cut the ~340s FW-1 Alpine boot (guest execution; QEMU-hosted
   hype ~60s, native QEMU/KVM ~15s). Pre-existing since M4-6 (~5 min). NOT a
   correctness blocker (reaches login on real HW) -- an iteration-speed one.
   Prior dead ends (do NOT repeat): guest LAPIC timer (M4-6b5 b5a rate +
@@ -3928,7 +3955,7 @@ observability channel) must land FIRST.*
 ## M8 — Multi-VM concurrency, dashboard, lifecycle control, fault isolation
 ## (plan.md §9 M8, §6b, §6f, §6g, §10 decisions #11/#12)
 
-- [ ] **M8-0** — VM-instance struct: de-globalize the single hardcoded
+- [x] **M8-0** — VM-instance struct: de-globalize the single hardcoded
   STEP 1 DONE (2026-07-19): all ~32 g_fw_1_* singletons (guest
   memory, ~18 emulated devices, per-run timing/diagnostics) gathered into
   hype_fw_vm_t; static g_vms[HYPE_FW_MAX_VMS(=2)]. Transitional
@@ -3986,19 +4013,19 @@ observability channel) must land FIRST.*
   as its own step so RAM/dispatch/console work builds on a clean instance
   model. Deps: RT-2 (de-globalize the FINAL post-EBS loop, not the pre-EBS
   scaffold), M4-6 (single-guest path complete), M1-1, ADM-1.
-- [ ] **M8-0a** — Per-VM RAM + NPT allocation: loop RAM-1/RAM-2's
+- [x] **M8-0a** — Per-VM RAM + NPT allocation: loop RAM-1/RAM-2's
   allocation over `cfg.vms[]` so each `hype_vm_t` gets its own AllocatePages
   region (sized from that VM's `mem_mb`) and its own NPT root, instead of
   the one region/NPT built today. Admission (ADM) already validated the
   totals fit. Deps: M8-0, RAM-2.
-- [ ] **M8-0b** — Concurrent dispatch on dedicated pCPUs: launch each
+- [x] **M8-0b** — Concurrent dispatch on dedicated pCPUs: launch each
   `hype_vm_t`'s vCPU on its own pinned pCPU (extend the single
   `hype_mp_pick_target_ap`/StartupThisAP dispatch and M3-2's 1:1 pinning
   to N VMs). One core per VM -- no scheduler needed while pCPUs are not
   oversubscribed (a time-slicing scheduler is a later task, only for
   oversubscription). This is what actually makes two guests run at the
   same time. Deps: M8-0, M8-0a, M3-2.
-- [ ] **M8-0c** — Per-VM console separation: today both guests' consoles
+- [x] **M8-0c** — Per-VM console separation: today both guests' consoles
   would collide on the one GOP/serial/log. Give each `hype_vm_t` its own
   console capture (per-VM logbuf + serial tag); a viewer/switcher is
   M8-1/M8-3's dashboard, but minimal separation (distinct \hype-log-N.txt
