@@ -5399,6 +5399,30 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                 (unsigned)lt[li].int_shadow);
                         }
                     }
+                    /* PERF-1 memory-type probe: the guest's effective-memory-type
+                     * inputs. cr0 CD(bit30)/NW(bit29): CD=1 => ALL guest memory is
+                     * UC (the catastrophic case). pat = the guest PAT the VMCB
+                     * loads under NPT (default power-on 0x0007040600070406 has WB
+                     * at index 0). MTRR rd/wr: if the guest reads MTRRs (which hype
+                     * stubs to 0 => "disabled => default UC") and never manages a
+                     * WB setup, memory-heavy phases run at UC speed. deftype_wr =
+                     * what the guest tried to write to MTRRdefType (E bit10, type
+                     * low 8: 6=WB) -- nonzero with type=6 means the guest WANTED WB
+                     * but hype ignored it. */
+                    {
+                        hype_svm_debug_state_t ds;
+                        unsigned long long mrd, mwr;
+                        uint64_t mdt, mvar;
+                        hype_svm_vcpu_get_debug_state(ctx, &ds);
+                        hype_svm_vcpu_get_mtrr_diag(&mrd, &mwr, &mdt, &mvar);
+                        hype_debug_print(
+                            "fw-1 MEMTYPE vm%u: cr0=0x%llx CD=%u NW=%u cr4=0x%llx pat=0x%llx | MTRR "
+                            "rd=%llu wr=%llu deftype_wr=0x%llx var_wr=0x%llx\n",
+                            (unsigned)(vm - g_vms), (unsigned long long)ds.cr0,
+                            (unsigned)((ds.cr0 >> 30) & 1u), (unsigned)((ds.cr0 >> 29) & 1u),
+                            (unsigned long long)ds.cr4, (unsigned long long)ds.g_pat, mrd, mwr,
+                            (unsigned long long)mdt, (unsigned long long)mvar);
+                    }
                 }
                 /* RT-2c: waiting-vs-working readout. A few kernel-space RIPs
                  * carrying most preemptions => guest spinning in a delay loop

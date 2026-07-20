@@ -499,9 +499,21 @@ typedef struct {
      * decode-assisted intercepts hardware fills this; captured as an
      * independent cross-check on the save-area rip. */
     uint64_t nrip;
+    /* PERF-1 memory-type probe: guest CR4 and the guest PAT the VMCB loads
+     * under nested paging. CR0.CD (bit30) forces UC for all guest memory; the
+     * guest PAT + page-table PAT index otherwise pick the type. */
+    uint64_t cr4;
+    uint64_t g_pat;
 } hype_svm_debug_state_t;
 
 void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out);
+
+/* PERF-1 memory-type probe: counts of guest MTRR MSR accesses (MTRRcap 0xFE,
+ * MTRRdefType 0x2FF, variable/fixed MTRRs) + the last values the guest tried to
+ * WRITE (hype currently stubs these, returning 0 on read). If the guest reads
+ * MTRRs as 0 -> "no MTRRs / disabled" -> x86 default memory type is UC. */
+void hype_svm_vcpu_get_mtrr_diag(unsigned long long *reads, unsigned long long *writes,
+                                 uint64_t *last_deftype_wr, uint64_t *last_var_wr);
 
 /*
  * FW-1: overrides the RIP hype_svm_vcpu_create() otherwise hardcodes to

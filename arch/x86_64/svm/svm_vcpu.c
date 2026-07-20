@@ -905,6 +905,33 @@ void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t 
     out->exitinfo2 = real->vmcb->control.exitinfo2;
     out->exitintinfo = real->vmcb->control.exitintinfo;
     out->nrip = real->vmcb->control.nrip;
+    out->cr4 = real->vmcb->save.cr4;
+    out->g_pat = real->vmcb->save.g_pat;
+}
+
+/* PERF-1 memory-type probe: guest MTRR MSR access counters (aggregate across
+ * VMs -- diagnostic). Reads currently return 0 (stubbed), writes are ignored;
+ * these count how often the guest touches MTRRs and what it tried to write, to
+ * tell whether the guest is left thinking its RAM is uncacheable. */
+static volatile unsigned long long g_mtrr_reads = 0;
+static volatile unsigned long long g_mtrr_writes = 0;
+static volatile uint64_t g_mtrr_last_deftype_wr = 0;
+static volatile uint64_t g_mtrr_last_var_wr = 0;
+
+void hype_svm_vcpu_get_mtrr_diag(unsigned long long *reads, unsigned long long *writes,
+                                 uint64_t *last_deftype_wr, uint64_t *last_var_wr) {
+    *reads = g_mtrr_reads;
+    *writes = g_mtrr_writes;
+    *last_deftype_wr = g_mtrr_last_deftype_wr;
+    *last_var_wr = g_mtrr_last_var_wr;
+}
+
+/* True for the MTRR MSR set: MTRRcap 0xFE, MTRRdefType 0x2FF, 8 variable
+ * base/mask pairs 0x200-0x20F, and the fixed MTRRs (0x250, 0x258/0x259,
+ * 0x268-0x26F). IA32_PAT (0x277) is handled separately, not counted here. */
+static int msr_is_mtrr(uint32_t n) {
+    return n == 0xFEu || n == 0x2FFu || (n >= 0x200u && n <= 0x20Fu) || n == 0x250u ||
+           n == 0x258u || n == 0x259u || (n >= 0x268u && n <= 0x26Fu);
 }
 
 void hype_svm_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip) {
@@ -987,6 +1014,23 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     int is_write = (real->vmcb->control.exitinfo1 & 0x1ULL) != 0;
     uint32_t msr_number = (uint32_t)real->gprs[1]; /* RCX */
     hype_msr_action_t action;
+
+    /* PERF-1 memory-type probe: count guest MTRR MSR traffic (does not change
+     * handling -- these still fall through to the stub path below). */
+    if (msr_is_mtrr(msr_number)) {
+        if (is_write) {
+            uint64_t wval =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+            g_mtrr_writes++;
+            if (msr_number == 0x2FFu) {
+                g_mtrr_last_deftype_wr = wval;
+            } else if (msr_number >= 0x200u && msr_number <= 0x20Fu) {
+                g_mtrr_last_var_wr = wval;
+            }
+        } else {
+            g_mtrr_reads++;
+        }
+    }
 
     /* PVCLOCK (kvmclock): the guest arms the paravirt clock by writing the
      * guest-physical address of its time-info page (| enable) to
