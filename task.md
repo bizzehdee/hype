@@ -4996,3 +4996,44 @@ HW-VALIDATION OWED for two -standard on two cores. NEXT: heavy distro
 (Fedora/Ubuntu) -- the next ladder rung; expect more unhandled MMIO/MSR/ports
 (GLADDER-1 absorb should carry many; scope real device models for any that
 need it, per GLADDER-2 method).
+
+## GLADDER extension — Fedora + Ubuntu (server), scoping (2026-07-20)
+
+User direction: climb to Fedora AND Ubuntu, SERVER editions (no GUI/framebuffer
+to satisfy -- serial console works; desktop is out of scope). Sequence: run ONE
+OF EACH single-VM first (diagnostic), THEN the two DIFFERENT distros TOGETHER on
+two cores.
+
+PREREQUISITE / BLOCKER: need the SERVER ISOs. Only ubuntu-26.04-DESKTOP (6.5GB)
+is on disk -- wrong edition AND too big for the load-whole-ISO-into-RAM model.
+Need Fedora Server (~2.3GB) + Ubuntu Server (~2.7GB) ISOs downloaded.
+
+TWO REAL CODE/RESOURCE PREREQS surfaced by scoping:
+- [ ] GLADDER-9 (blocks GLADDER-7): PER-VM ISO backing. g_iso_host_phys/g_iso_size
+  are single GLOBALS shared by both VMs (boot/main.c:275). Two of the SAME distro
+  share one ISO fine, but Fedora+Ubuntu TOGETHER need each VM its own ISO ->
+  de-globalize into hype_fw_vm_t (like combined_host_phys/ram_host_phys already
+  are), load two different \iso files. Does NOT need the ISOs to write -- can be
+  done in parallel with the download. Deps: none.
+- [ ] GLADDER-8: RAM budget for big ISOs + server installers. hype loads the
+  ENTIRE ISO into a host RAM buffer (AllocatePages). Fedora ~2.3GB + Ubuntu
+  ~2.7GB, and the TOGETHER test holds BOTH (~5GB) + 2x guest RAM + OVMF. Server
+  installers (subiquity/anaconda) also want >=~2GB guest RAM each (current
+  HYPE_FW_1_GUEST_RAM_BYTES=1GB may be too small). Bump guest RAM (per-VM/
+  configurable) + confirm host has the RAM (QEMU -m 12288+; laptop 16GB+).
+  Longer term, virtio-blk STREAMING (deferred) removes the load-into-RAM cost
+  entirely -- note as the real fix if RAM is the wall. Deps: none.
+
+THE RUNGS:
+- [ ] GLADDER-5: Fedora Server, single-VM. Boot to login, enumerate what breaks.
+  Expect: GRUB, dracut initramfs, systemd, far more HW probing than Alpine.
+  GLADDER-1 absorb should carry unmapped MMIO; scope real device models (GLADDER-2
+  method) only for hard stops. Likely needs the GLADDER-8 RAM bump. Deps:
+  Fedora Server ISO, GLADDER-8.
+- [ ] GLADDER-6: Ubuntu Server, single-VM. Same loop. Expect: subiquity
+  installer, cloud-init, casper live layer. Deps: Ubuntu Server ISO, GLADDER-8.
+- [ ] GLADDER-7: Fedora Server + Ubuntu Server TOGETHER on two cores -- the
+  mixed-distro concurrent milestone. Deps: GLADDER-5, GLADDER-6, GLADDER-9
+  (per-VM ISO), GLADDER-8 (RAM).
+These are diagnostic/measure-first rungs like alpine-standard was: run, read what
+breaks, scope tasks. Server (not desktop) keeps it serial-console-only.
