@@ -5029,8 +5029,39 @@ THE RUNGS:
   GLADDER-1 absorb should carry unmapped MMIO; scope real device models (GLADDER-2
   method) only for hard stops. Likely needs the GLADDER-8 RAM bump. Deps:
   Fedora Server ISO, GLADDER-8.
-- [ ] GLADDER-6: Ubuntu Server, single-VM. Same loop. Expect: subiquity
+- [~] GLADDER-6: Ubuntu Server, single-VM. Same loop. Expect: subiquity
   installer, cloud-init, casper live layer. Deps: Ubuntu Server ISO, GLADDER-8.
+  FIRST RUN (2026-07-20, ubuntu-26.04-live-server-amd64.iso, 2.72GB, QEMU
+  -m 8192, 2GB guest RAM, chunked ISO). What worked / what broke:
+    * wall #1 CLEARED: 2.72GB ISO loaded via GLADDER-10(a) chunked backing
+      (11 chunks), "iso-1: read a real 2918598656-byte ISO9660 image". 0 faults.
+    * wall #2 CLEARED (for Ubuntu size): built a ~3GB GPT + FAT32 ESP image
+      (parted + mkfs.fat + mtools, spliced at the 1MiB partition offset) and
+      OVMF-in-QEMU BOOTED it -- BOOTX64.EFI loaded, hype ran. So the ~4GB
+      FAT-driver hang is above ~3GB; Fedora's 3.64GB (=>~4GB volume) may still
+      hit it, Ubuntu's 2.72GB does not. Image kept: ~/Downloads/hype-ubuntu-test.img.
+    * hype ran the guest: OVMF -> El Torito -> GRUB 2.14 loaded and RENDERED its
+      menu on serial. Kernel/AHCI/PIT/PIC/LAPIC plumbing all live, 0 faults over
+      5.5min.
+    * BLOCKER (the "what breaks"): GRUB stops at its interactive boot menu and
+      never auto-boots. Symptoms: ATAPI reads frozen at 257 (no kernel/initrd
+      load), guest 94% idle in HLT, only timer/PIC exits climbing. hype's FW-1g
+      auto-Enter (512-consecutive-empty-0x64-poll heuristic) FIRED ONCE
+      ("feeding Enter to drive it forward") but GRUB then stopped polling BOTH
+      PS/2 (0x64 frozen at 1413) AND serial (0x3f8/0x3fd frozen) and still did
+      not boot -- so the single injected Enter did not advance it and the
+      heuristic never re-armed (needs 512 more empty 0x64 polls that never come).
+      Also a benign "error: can't find command `grub_platform'" before the menu.
+    * Diag: ~/Downloads/hype-ubuntu-gladder6-diag.txt. Follow-up: GLADDER-6b.
+- [ ] GLADDER-6b: drive Ubuntu's GRUB past its interactive menu (the GLADDER-6
+  blocker). Determine GRUB's actual input channel under hype (UEFI ConIn backed
+  by hype PS/2, vs serial terminal_input) and why one injected Enter neither
+  advanced it nor re-armed. Options: (a) make FW-1g re-arm on a broader idle
+  signal (not only 0x64 polls) and/or inject on the serial-input path GRUB uses;
+  (b) confirm whether GRUB has a timeout at all (the grub_platform error may
+  break the `set timeout` line) and, if so, why the PIT-based countdown does not
+  fire; (c) as a fallback, a one-key nudge on the video/console path. Deps:
+  GLADDER-6 findings. This is the real gate to Ubuntu login.
 - [ ] GLADDER-7: Fedora Server + Ubuntu Server TOGETHER on two cores -- the
   mixed-distro concurrent milestone. Deps: GLADDER-5, GLADDER-6, GLADDER-9
   (per-VM ISO), GLADDER-8 (RAM).
