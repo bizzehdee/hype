@@ -9,81 +9,76 @@ Checkbox = done. `Deps: —` = no prerequisites.
 
 ---
 
-## Execution status & dependency graph (reconciled 2026-07-18)
+## Execution status & dependency graph (reconciled 2026-07-20)
 
 Snapshot of all open tasks vs. what's actually done. Done through: SETUP,
 M0-1..4, M1, ADM, M2-1..7, M3-1..5, INT-1/2, INPUT-1..4, VIDEO-1/2/3,
-M4-1..6 (incl. M4-6a/b1/b4/c/d1..d4), CPUMSR-1/2, RAM-1/2, PCI-1/2,
-ISO-1/2, M5-1/2, FW-1a..h, FW-2, VALID-1/3, RT-1 (a/b/c/d), RT-2a/2b,
-RT-3 (a/b).
-**M4-6 (stock Alpine → userspace `localhost login`) is DONE and
-hardware-confirmed.** **The RT track's post-EBS execution model
-(RT-2a move + RT-2b host-tick preemption + 8259 spurious-IRQ handling) is
-HARDWARE-CONFIRMED: stock Alpine boots to `localhost login` running entirely
-after ExitBootServices on real AMD silicon.** Only RT-2c (timebase/console
-polish, non-boot-critical) remains in the RT track; M8-0 is effectively
-unblocked.
+M4-1..6 (incl. M4-6a/b1/b4/b5/c/d1..d4), CPUMSR-1/2, RAM-1/2, PCI-1/2,
+ISO-1/2, M5-1/2, FW-1a..h, FW-2, VALID-1/3, RT-1 (a/b/c/d), RT-2 (a/b),
+RT-3 (a/b), **M8-0, M8-0a, M8-0b (incl. own-AP bring-up + kvmclock +
+per-vCPU de-globalization), M8-0c, and PERF-1**.
 
-### Active frontier — RT track → M8-0 (the current dependency web)
+**THREE big HW-confirmed milestones since the last reconcile:**
+1. **M4-6 (stock Alpine → `localhost login`)** — DONE, running entirely
+   post-ExitBootServices on real AMD silicon.
+2. **M8-0..0c (two Alpines on two dedicated cores)** — HW-CONFIRMED: two
+   alpine-virt guests boot concurrently to `localhost login`, one per
+   pinned AP (apic_id=1 and 2). Required de-globalizing the FW-1 singleton
+   into `g_vms[]`, per-VM NPT, own-AP INIT-SIPI-SIPI bring-up, kvmclock,
+   two per-vCPU concurrency fixes (pvclock map, pending-IRQ slot), and
+   per-VM console routing.
+3. **PERF-1 (the ~5-min boot)** — SOLVED: the guest VMCB's `g_pat` was
+   uninitialized (=0=all-UC), so guest RAM was uncacheable under NPT. The
+   one-line WB-default fix took boot from ~350-450s to **<15s to login on
+   HW** (~25-30x; the stall VMRUN at RIP 0x835631 went 13629ms→94ms).
 
-Node colours: green = done · orange = in progress · blue = ready (no unmet
-dep) · grey = blocked.
+### Current frontier (the multi-VM foundation + fast boot are done)
+
+Node colours: green = done · blue = ready (no unmet dep) · grey = blocked.
 
 ```mermaid
 flowchart TD
-    RT1["RT-1 observability<br/>(logbuf + recovery + GOP)"]:::done
-    RT1d["RT-1d scan hardening"]:::done
-    RT2a["RT-2a post-EBS move"]:::done
-    RT2b["RT-2b host-tick preemption<br/>(fixes the post-EBS hang)"]:::done
-    RT2c["RT-2c timebase/console<br/>adapt to post-EBS loop"]:::ready
-    RT3a["RT-3a EFI-var diag write<br/>(cold-boot-surviving)"]:::done
-    RT3b["RT-3b next-boot readback"]:::done
-    M80["M8-0 de-globalize the VM"]:::blocked
-    M80a["M8-0a per-VM RAM/NPT"]:::blocked
-    M80b["M8-0b concurrent dispatch<br/>(own AP bring-up)"]:::blocked
-    M80c["M8-0c per-VM console"]:::blocked
+    M80["M8-0..0c two Alpines/two cores<br/>(HW-confirmed)"]:::done
+    PERF["PERF-1 fast boot<br/>(<15s, HW-confirmed)"]:::done
+    LADDER["Guest ladder: alpine-standard<br/>-> Fedora/Ubuntu"]:::ready
+    UI["Mgmt UI: TERM-1 / M8-1/2/5<br/>-> M8-3 switcher"]:::ready
+    INCR["Incremental perf (optional):<br/>deadline timer, IO-APIC, virtio"]:::ready
+    INSTALL["Install-to-disk: M5-3..6"]:::ready
 
-    RT1 --> RT1d
-    RT1 --> RT2a
-    RT2a --> RT2b
-    RT2a --> RT2c
-    RT1 --> RT3a
-    RT2a --> RT3a
-    RT3a --> RT3b
-    RT2b --> M80
-    RT2c --> M80
-    M80 --> M80a --> M80b --> M80c
+    M80 --> LADDER
+    M80 --> UI
+    PERF --> LADDER
+    PERF --> INCR
 
     classDef done fill:#1b5e20,stroke:#2e7d32,color:#fff;
-    classDef active fill:#e65100,stroke:#ef6c00,color:#fff;
     classDef ready fill:#0d47a1,stroke:#1565c0,color:#fff;
     classDef blocked fill:#424242,stroke:#616161,color:#fff;
 ```
 
-**READY NOW (no unmet dependency):**
-- `RT-2c` — adapt the M4-6b1 guest timebase + console drain to the
-  post-EBS host-timer loop (deps RT-2a ✓). The only RT item left; RT-2b
-  (host-tick preemption) is done, so this is now polish rather than
-  boot-critical.
-- Independent tracks (unchanged, pick up any time): `NET-1`,
-  `M7-1`/`M7-3`, `M8-1`/`M8-2`/`M8-5`, `TERM-1`. See their sections.
-- real-hardware-gated (need a physical run, not code): `M0-5`, `M2-8`,
-  `M3-6`, `M8-10`, plus RT-2a full-HW sign-off and RT-3 cold-boot survival.
-
-**Recommended order (value + dependency):**
-Finish the RT track first — it's the load-bearing prerequisite for M8:
-`RT-3a → RT-3b` (get post-EBS logs off the cold-boot laptop), then
-`RT-2b`/`RT-2c` (host-tick preemption + timebase adaptation), then the
-`M8-0 → M8-0a → M8-0b → M8-0c` de-globalization chain toward concurrent
-VMs. The install chain `VALID-3 ✓ → M5-3 → M5-4 → M5-5 → M5-6` and the
-independent tracks (`NET-1`, `M7-1`/`M7-3`, `M8-1`/`M8-2`/`M8-5`, `TERM-1`)
-can run in parallel whenever picked up.
+**READY NOW (no unmet dependency), roughly in value order:**
+- **Guest ladder** (per the 2026-07-19 roadmap, now unblocked by M8-0..0c
+  + PERF-1): boot **alpine-standard** under hype as the intermediate rung
+  (also the clean same-kernel perf baseline vs the 90s native-standard),
+  then a heavy distro (**Fedora/Ubuntu**).
+- **Management UI / multi-VM UX**: `TERM-1` (GOP terminal), `M8-1`/`M8-2`/
+  `M8-5`, → `M8-3` VM switcher — now that two VMs actually run.
+- **Install-to-disk chain**: `M5-3 → M5-4 → M5-5 → M5-6` (VALID-3 ✓ done).
+- **Optional incremental perf** (no longer urgent — boot is <15s): one-shot
+  deadline host timer (trims now-tiny 1kHz INTR waste), IO-APIC (M4-6b3),
+  virtio-blk/virtio-console. See the PERF-1 notes for why these were NOT the
+  root cause.
+- `RT-2c` (timebase/console polish) — minor leftover.
+- Independent tracks: `NET-1`, `M7-1`/`M7-3`.
+- real-hardware-gated (physical run, not code): `M0-5`, `M2-8`, `M3-6`.
 
 **Critical paths (→ = "then"):**
-- ~~Boot an OS installer: **FW-1h → M4-6**~~ — DONE (Alpine → login, HW-confirmed).
-- Post-EBS execution model (active): **RT-1 ✓ → RT-2a ✓ → {RT-2b ✓, RT-3a ✓
-  → RT-3b ✓}**; only RT-2c (timebase/console polish) remains → then M8-0.
-- Multi-VM foundation: **RT-2 → M8-0 → M8-0a → M8-0b → M8-0c**.
+- ~~Boot an OS installer: **FW-1h → M4-6**~~ — DONE (Alpine → login, HW).
+- ~~Post-EBS execution: **RT-1 → RT-2 → RT-3**~~ — DONE (HW).
+- ~~Multi-VM foundation: **M8-0 → M8-0a → M8-0b → M8-0c**~~ — DONE (two
+  Alpines on two cores, HW-confirmed).
+- ~~Fast boot: **PERF-1**~~ — DONE (<15s, HW-confirmed).
+- Guest ladder (next): **alpine-standard → Fedora/Ubuntu** (needs no new
+  infra; a driver/complexity climb + real-HW validation each rung).
 - Install an OS to disk: **VALID-3 ✓ → M5-3 → M5-4 → M5-5 → M5-6**
   (M5-5 also needs NET-5)
 - Networking: **NET-1 → {NET-2 (needs VALID-2), NET-3 (needs VALID-1 ✓),
@@ -97,13 +92,13 @@ can run in parallel whenever picked up.
   `DOCS-1`; deferred to v2: `V2-TELEM-*`, `V2-MGMT-1`
 
 **BLOCKED (immediate blocker in parens):**
-M8-0 (RT-2b/RT-2c) · M8-0a (M8-0) · M8-0b (M8-0a) · M8-0c (M8-0b) ·
 VALID-2/4 (VALID-1 ✓ — now unblocked) · NET-2 (VALID-2) · NET-4/4a/4b/5 (NET-1) ·
-M5-3 (VALID-3 ✓ — now unblocked) · M5-4 (M5-3) · M5-5 (M5-4/NET-5) · M5-6 (M5-5) ·
+M5-4 (M5-3) · M5-5 (M5-4/NET-5) · M5-6 (M5-5) ·
 M6-1 (M5-6) · M6-2 (M6-1) · M7-2 (M7-1) · M7-4 (M7-2/M7-3) ·
 M8-3 (M8-1) · M8-3a (M8-3) · M8-4 (M6-2/M7-4) · M8-6/M8-7 (M8-4) ·
 M8-8 (M8-7) · M8-9 (M8-3/5/6/8) · M8-10 (M8-9) · TERM-2 (M8) · TERM-3 (M8-3) ·
 M9/M10/STRETCH/DOCS (long chains) · V2-* (deferred).
+(M8-0..0c and PERF-1 are no longer blocked — all DONE.)
 
 **Decomposition status:** the READY set above is atomic and scoped (each is
 a single, self-contained task with detailed scope notes in its section). The
