@@ -5197,6 +5197,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * "last time the guest did real work". The idle detector measures
      * wall-clock since this to decide the guest is quiescent. */
     uint64_t last_progress_tsc = tb_last_tsc;
+    /* M4-6b2: last guest LAPIC EOI count acted on -- when it advances, the guest
+     * finished an ISR and broadcast EOI, so drop the AHCI level line's IO-APIC
+     * Remote-IRR (models the LAPIC->IO-APIC EOI broadcast; without it a fresh
+     * completion races a stuck Remote-IRR -> 30s ATAPI timeouts). */
+    uint64_t ahci_last_eoi = 0;
 
     hype_vt_filter_reset(&uart_filter);
     hype_vt_filter_reset(&uart_filter2);
@@ -5746,6 +5751,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * 11, a slave-PIC line). Only (re)raise when that line isn't
          * already in service, so a still-asserted level doesn't re-request
          * while the guest's ISR is running. */
+        /* M4-6b2: model the LAPIC->IO-APIC EOI broadcast. When the guest
+         * finishes an ISR it writes LAPIC EOI (eoi_count bumps); for the
+         * level-triggered AHCI line that is what clears Remote-IRR on real
+         * hardware. Doing it here (not only via the line-low deassert below)
+         * closes a race: if a fresh completion sets PxIS after the guest
+         * cleared the previous one but before hype's deassert runs,
+         * ahci_irq_pending stays true so the deassert branch is skipped and
+         * Remote-IRR would stay stuck-set, blocking the new completion's IRQ
+         * until libata's 30s timeout resets the port. Clearing on EOI lets the
+         * next raise (below) inject the pending completion immediately. */
+        if (g_fw_1_lapic.eoi_count != ahci_last_eoi) {
+            ahci_last_eoi = g_fw_1_lapic.eoi_count;
+            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
+        }
         if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
             if (line != 0u && line < 16u) {

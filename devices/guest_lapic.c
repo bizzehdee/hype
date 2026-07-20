@@ -15,6 +15,7 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->lvt_timer_armed_seen = 0;
     lapic->timer_irq_pending = 0;
     lapic->timer_in_service = 0;
+    lapic->eoi_count = 0;
 }
 
 uint32_t hype_guest_lapic_divisor(uint32_t divide_config) {
@@ -108,9 +109,12 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
             lapic->divide_config = value;
             return 0;
         case HYPE_GUEST_LAPIC_REG_EOI:
-            /* End-of-interrupt: the guest's timer ISR has finished;
-             * clear in-service so the next expiry can be delivered. */
+            /* End-of-interrupt: the guest's ISR has finished. Clear the timer
+             * in-service (so the next expiry can be delivered) and bump the EOI
+             * counter so the FW-1 loop can drop a level line's IO-APIC
+             * Remote-IRR (real hardware broadcasts this EOI to the IO-APIC). */
             lapic->timer_in_service = 0;
+            lapic->eoi_count++;
             return 0;
         case HYPE_GUEST_LAPIC_REG_ID:
         case HYPE_GUEST_LAPIC_REG_VERSION:

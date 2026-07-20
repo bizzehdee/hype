@@ -119,6 +119,22 @@ static void test_in_service_gates_next_irq(void) {
     CHECK_HEX("IRQ flows again after EOI", 1, hype_guest_lapic_take_timer_irq(&l, &vec));
 }
 
+/* M4-6b2: every LAPIC EOI (0xB0 write) bumps eoi_count -- the FW-1 loop uses it
+ * to know the guest broadcast EOI and to drop a level IO-APIC line's Remote-IRR. */
+static void test_eoi_count_advances_on_each_eoi(void) {
+    hype_guest_lapic_t l;
+    hype_guest_lapic_reset(&l);
+    CHECK_HEX("eoi_count 0 at reset", 0, (uint32_t)l.eoi_count);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+    CHECK_HEX("eoi_count 1 after one EOI", 1, (uint32_t)l.eoi_count);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+    CHECK_HEX("eoi_count 3 after three EOIs", 3, (uint32_t)l.eoi_count);
+    /* a non-EOI write does not bump it */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 1000u);
+    CHECK_HEX("eoi_count unchanged by non-EOI write", 3, (uint32_t)l.eoi_count);
+}
+
 static void test_masked_timer_never_fires(void) {
     hype_guest_lapic_t l;
     uint8_t vec = 0;
@@ -355,6 +371,7 @@ int main(void) {
     test_read_only_regs_ignore_writes();
     test_timer_fires_periodically();
     test_in_service_gates_next_irq();
+    test_eoi_count_advances_on_each_eoi();
     test_masked_timer_never_fires();
     test_disarmed_timer_never_fires();
     test_advance_periodic_fires_at_count();

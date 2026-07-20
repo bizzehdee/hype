@@ -85,6 +85,15 @@ typedef struct {
                                     * "tried then re-masked") */
     int timer_irq_pending; /* a timer IRQ is due but not yet delivered */
     int timer_in_service;  /* delivered, awaiting guest EOI -- at most one in flight */
+    uint64_t eoi_count;    /* M4-6b2: total guest LAPIC EOIs (0xB0 writes). The FW-1
+                            * loop watches this to know the guest finished an ISR and
+                            * broadcast EOI: for a level-triggered IO-APIC line (AHCI)
+                            * that is the signal to drop Remote-IRR so the next
+                            * assertion can inject -- real hardware clears Remote-IRR
+                            * on the LAPIC EOI broadcast, not on the device line going
+                            * low, and relying only on the line-low deassert races a
+                            * fresh completion into a stuck Remote-IRR (30s ATAPI
+                            * command timeouts + libata reset/retry). */
 } hype_guest_lapic_t;
 
 /*
