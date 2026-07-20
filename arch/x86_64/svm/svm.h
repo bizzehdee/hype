@@ -440,6 +440,12 @@ void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *o
 void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
                                  unsigned long long *window, unsigned long long *overwrite);
 
+/* M4-6b2: count of interrupt requests that found EVENTINJ already staged for
+ * the next VMRUN and QUEUED the vector in the IRR instead of clobbering it.
+ * Nonzero proves same-iteration IRQ collisions occur (they were previously an
+ * invisible lost-interrupt) -- now safely serialized, never dropped. */
+unsigned long long hype_svm_vcpu_get_eventinj_collisions(void);
+
 /*
  * INPUT-1: the reusable "a device wired to `chip` just raised `irq`"
  * entry point -- combines devices/pic.h's own real-hardware modeling

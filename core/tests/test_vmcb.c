@@ -488,6 +488,46 @@ static void test_disarm_vintr_request_clears_bits_preserves_others(void) {
     CHECK_HEX("unrelated bit (AVIC enable) preserved", 1, (disarmed & HYPE_SVM_INT_CTL_AVIC_ENABLE) != 0);
 }
 
+static void test_irr_set_any_highest_clear(void) {
+    uint32_t irr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    CHECK_HEX("empty IRR: any=0", 0, hype_svm_irr_any(irr));
+    CHECK_HEX("empty IRR: highest=-1", (unsigned long long)(long long)-1,
+              (unsigned long long)(long long)hype_svm_irr_highest(irr));
+
+    hype_svm_irr_set(irr, 0x20u); /* vector 32 -> word 1, bit 0 */
+    CHECK_HEX("set 0x20: word index", 1, (irr[1] != 0));
+    CHECK_HEX("set 0x20: bit", 0x1u, irr[1]);
+    CHECK_HEX("any after one set", 1, hype_svm_irr_any(irr));
+    CHECK_HEX("highest is 0x20", 0x20u, hype_svm_irr_highest(irr));
+
+    /* x86 delivers the highest-priority (highest-numbered) pending vector. */
+    hype_svm_irr_set(irr, 0xECu); /* the LAPIC timer vector seen in boots */
+    CHECK_HEX("highest is now 0xEC", 0xECu, hype_svm_irr_highest(irr));
+    hype_svm_irr_set(irr, 0x30u);
+    CHECK_HEX("highest still 0xEC (0x30 lower)", 0xECu, hype_svm_irr_highest(irr));
+
+    /* Clearing the top exposes the next-highest -- nothing was lost when they
+     * collided (the whole point of the bitmap vs a single overwrite slot). */
+    hype_svm_irr_clear(irr, 0xECu);
+    CHECK_HEX("after clearing 0xEC, highest is 0x30", 0x30u, hype_svm_irr_highest(irr));
+    hype_svm_irr_clear(irr, 0x30u);
+    CHECK_HEX("after clearing 0x30, highest is 0x20", 0x20u, hype_svm_irr_highest(irr));
+    hype_svm_irr_clear(irr, 0x20u);
+    CHECK_HEX("empty again after clearing all", 0, hype_svm_irr_any(irr));
+}
+
+static void test_irr_boundary_vectors(void) {
+    uint32_t irr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    hype_svm_irr_set(irr, 0u);    /* lowest vector -> word 0 bit 0 */
+    hype_svm_irr_set(irr, 255u);  /* highest vector -> word 7 bit 31 */
+    CHECK_HEX("vector 0 stored", 0x1u, irr[0]);
+    CHECK_HEX("vector 255 stored", 0x80000000u, irr[7]);
+    CHECK_HEX("highest of {0,255} is 255", 255u, hype_svm_irr_highest(irr));
+    hype_svm_irr_clear(irr, 255u);
+    CHECK_HEX("highest of {0} is 0", 0u, hype_svm_irr_highest(irr));
+    CHECK_HEX("still any (vector 0 set)", 1, hype_svm_irr_any(irr));
+}
+
 int main(void) {
     test_struct_sizes();
     test_field_offsets();
@@ -525,6 +565,8 @@ int main(void) {
     test_arm_vintr_request_sets_bits_preserves_others();
     test_arm_vintr_request_idempotent_over_stale_priority_bits();
     test_disarm_vintr_request_clears_bits_preserves_others();
+    test_irr_set_any_highest_clear();
+    test_irr_boundary_vectors();
 
     if (failures == 0) {
         printf("all tests passed\n");

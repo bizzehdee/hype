@@ -6761,7 +6761,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
         hype_svm_vcpu_get_int_diag(&ei, &df, &wn, &ov);
         hype_debug_print("fw-1: M4-6d2 int diag: EVENTINJ=%llu, VINTR-defer=%llu, VINTR-window=%llu, "
-                          "defer-overwrite=%llu\n", ei, df, wn, ov);
+                          "coalesced=%llu, eventinj-collisions=%llu\n", ei, df, wn, ov,
+                          hype_svm_vcpu_get_eventinj_collisions());
     }
 
     /* M4-6d3 real-HW diag: characterise WHY the loop gave up. On real

@@ -51,8 +51,14 @@ struct hype_vcpu_ctx {
      * the owner's IRQ vanished (pending=0) and it wedged waiting on it. One
      * pending vector per vCPU is all this project's single-IRQ-source scope
      * needs (see hype_svm_vcpu_request_interrupt). */
-    int pending_irq_valid;
-    uint8_t pending_irq_vector;
+    /* M4-6b2: pending-interrupt IRR bitmap (256 vectors), per-vCPU. Replaces the
+     * old single {valid,vector} slot: the run loop can request several vectors
+     * (timer + AHCI + serial + PIC) in ONE iteration, and hype can stage only
+     * one in EVENTINJ per VMRUN. A single slot -- and request_interrupt's
+     * unconditional EVENTINJ overwrite -- dropped every colliding vector but the
+     * last, killing a self-re-arming one-shot clockevent that lost its tick.
+     * Queue all requests here; drain highest-first, one per VMRUN. */
+    uint32_t pending_irr[8];
 };
 
 /* M8-0b-ii: per-vCPU state pool. Was a single g_vmcb/g_ctx (M2's one-vCPU
@@ -213,8 +219,12 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     ctx->pvclock_map = 0;
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
-    ctx->pending_irq_valid = 0;
-    ctx->pending_irq_vector = 0;
+    {
+        int i;
+        for (i = 0; i < 8; i++) {
+            ctx->pending_irr[i] = 0;
+        }
+    }
 }
 
 /* MSRs that VMSAVE/VMLOAD save+restore around VMRUN (AMD APM Vol 2
@@ -783,7 +793,13 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
 static unsigned long long g_int_eventinj = 0;   /* accepted immediately (direct EVENTINJ) */
 static unsigned long long g_int_vintr_defer = 0; /* couldn't accept -> VINTR window armed */
 static unsigned long long g_int_vintr_window = 0;/* VINTR window fired -> deferred inject */
-static unsigned long long g_int_defer_overwrite = 0; /* a deferral clobbered an unserviced pending vector */
+static unsigned long long g_int_defer_overwrite = 0; /* requested a vector already pending in the IRR (coalesced, not lost) */
+/* M4-6b2: times a request found EVENTINJ.V already staged for the next VMRUN
+ * and QUEUED the new vector in the IRR instead of clobbering the staged one.
+ * Under the old code this was an INVISIBLE lost interrupt (the direct-EVENTINJ
+ * path overwrote unconditionally and counted nothing) -- the actual cause of
+ * the one-shot-clockevent death. Now counted and never lost. */
+static unsigned long long g_int_eventinj_collision = 0;
 
 void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
                                  unsigned long long *window, unsigned long long *overwrite) {
@@ -791,6 +807,23 @@ void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long
     *defer = g_int_vintr_defer;
     *window = g_int_vintr_window;
     *overwrite = g_int_defer_overwrite;
+}
+
+unsigned long long hype_svm_vcpu_get_eventinj_collisions(void) {
+    return g_int_eventinj_collision;
+}
+
+/* Arm the VINTR interrupt-window intercept iff vectors are still queued in the
+ * IRR; disarm it once the queue drains. Keeps the "wake me when the guest can
+ * take an interrupt" request exactly as long as there is something to deliver. */
+static void hype_svm_sync_vintr(struct hype_vcpu_ctx *real) {
+    if (hype_svm_irr_any(real->pending_irr)) {
+        real->vmcb->control.vintr = hype_svm_arm_vintr_request(real->vmcb->control.vintr);
+        real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_VINTR;
+    } else {
+        real->vmcb->control.vintr = hype_svm_disarm_vintr_request(real->vmcb->control.vintr);
+        real->vmcb->control.intercept_misc1 &= ~HYPE_SVM_INTERCEPT_VINTR;
+    }
 }
 
 void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *out) {
@@ -801,44 +834,60 @@ void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *o
     out->vintr = real->vmcb->control.vintr;
     out->can_accept =
         hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow);
-    out->pending_valid = real->pending_irq_valid;
-    out->pending_vector = real->pending_irq_vector;
+    out->pending_valid = hype_svm_irr_any(real->pending_irr);
+    {
+        int hv = hype_svm_irr_highest(real->pending_irr);
+        out->pending_vector = (uint8_t)(hv < 0 ? 0 : hv);
+    }
 }
 
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int eventinj_busy = (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) != 0;
 
-    if (hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
+    /* Fast path: the guest can take an interrupt AND nothing is already staged
+     * for the next VMRUN -> inject directly. The eventinj_busy guard is the fix
+     * for the lost-interrupt bug: without it, a second request in the same run-
+     * loop iteration (timer, then AHCI/serial/PIT) unconditionally overwrote the
+     * first vector's EVENTINJ, silently dropping it -- fatal to a self-re-arming
+     * one-shot clockevent, which then never gets its next tick. */
+    if (!eventinj_busy &&
+        hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
         g_int_eventinj++;
         return;
     }
 
-    if (real->pending_irq_valid) {
-        g_int_defer_overwrite++; /* a second vector deferred before the first was delivered */
+    /* Otherwise queue the vector in the IRR (never overwrite a staged event or
+     * a differently-numbered pending vector) and arm the interrupt window so it
+     * drains as soon as the guest can accept it. Requesting an already-pending
+     * vector coalesces (correct IRR semantics: one delivery per set bit). */
+    if (eventinj_busy) {
+        g_int_eventinj_collision++;
     }
-    real->vmcb->control.vintr = hype_svm_arm_vintr_request(real->vmcb->control.vintr);
-    real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_VINTR;
-    real->pending_irq_valid = 1;
-    real->pending_irq_vector = vector;
+    if ((real->pending_irr[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0) {
+        g_int_defer_overwrite++; /* vector already pending -> coalesced (not lost) */
+    }
+    hype_svm_irr_set(real->pending_irr, vector);
+    hype_svm_sync_vintr(real);
     g_int_vintr_defer++;
 }
 
 void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
 
-    real->vmcb->control.vintr = hype_svm_disarm_vintr_request(real->vmcb->control.vintr);
-    real->vmcb->control.intercept_misc1 &= ~HYPE_SVM_INTERCEPT_VINTR;
-
-    if (real->pending_irq_valid) {
-        uint8_t vector = real->pending_irq_vector;
-        real->pending_irq_valid = 0;
+    /* The window fired -> the guest can accept an interrupt now. Stage the
+     * highest-priority queued vector into EVENTINJ (if EVENTINJ isn't already
+     * occupied), then re-sync the window: keep it armed while more remain,
+     * disarm once the IRR is empty. */
+    if (hype_svm_irr_any(real->pending_irr) &&
+        (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) == 0) {
+        int v = hype_svm_irr_highest(real->pending_irr);
+        hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         g_int_vintr_window++;
-        /* This window firing at all means the guest can accept an
-         * interrupt right now -- hype_svm_vcpu_request_interrupt()'s
-         * own can-accept check will take the direct-EVENTINJ path. */
-        hype_svm_vcpu_request_interrupt(ctx, vector);
     }
+    hype_svm_sync_vintr(real);
 }
 
 void hype_svm_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
@@ -866,7 +915,7 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
      * only then move it off the pending slot / disarm the window. Also
      * guards against EVENTINJ clobbering an event already staged this
      * entry. Returns 1 if it injected. */
-    if (!real->pending_irq_valid) {
+    if (!hype_svm_irr_any(real->pending_irr)) {
         return 0;
     }
     if ((real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) != 0) {
@@ -875,10 +924,13 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
     if (!hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         return 0;
     }
-    real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(real->pending_irq_vector);
-    real->pending_irq_valid = 0;
-    real->vmcb->control.vintr = hype_svm_disarm_vintr_request(real->vmcb->control.vintr);
-    real->vmcb->control.intercept_misc1 &= ~HYPE_SVM_INTERCEPT_VINTR;
+    {
+        int v = hype_svm_irr_highest(real->pending_irr);
+        hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
+    }
+    /* Keep the window armed if more vectors remain; disarm once drained. */
+    hype_svm_sync_vintr(real);
     g_int_eventinj++;
     return 1;
 }

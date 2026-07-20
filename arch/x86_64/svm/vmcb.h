@@ -512,6 +512,24 @@ uint64_t hype_svm_arm_vintr_request(uint64_t vintr);
 uint64_t hype_svm_disarm_vintr_request(uint64_t vintr);
 
 /*
+ * M4-6b2: pending-interrupt IRR bitmap (256 vectors, one bit each), modelling
+ * the LAPIC's Interrupt Request Register. hype can stage only one vector in
+ * VMCB EVENTINJ per VMRUN, but the run loop can request several IRQs (timer,
+ * AHCI, serial, PIC) in a single iteration -- the old single pending slot (and
+ * an unconditional EVENTINJ overwrite) silently dropped all but the last, which
+ * killed a self-re-arming one-shot clockevent that lost its tick. Queue every
+ * requested vector here and drain highest-first, one per VMRUN. Pure bit ops.
+ *   set/clear: set or clear the bit for `vector`.
+ *   any:       1 if any vector is pending, else 0.
+ *   highest:   the highest-numbered pending vector (APIC priority = vector), or
+ *              -1 if none. (x86 delivers the highest-priority pending vector.)
+ */
+void hype_svm_irr_set(uint32_t irr[8], uint8_t vector);
+void hype_svm_irr_clear(uint32_t irr[8], uint8_t vector);
+int hype_svm_irr_any(const uint32_t irr[8]);
+int hype_svm_irr_highest(const uint32_t irr[8]);
+
+/*
  * Packs a segment's access-rights byte and flags nibble into the
  * VMCB's compressed 16-bit `attrib` format (bits 7:0 = access rights
  * [P|DPL|S|Type], bits 11:8 = flags [G|D/B|L|AVL]) -- the same two

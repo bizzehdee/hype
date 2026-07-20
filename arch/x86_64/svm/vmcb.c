@@ -329,6 +329,39 @@ uint64_t hype_svm_disarm_vintr_request(uint64_t vintr) {
     return vintr & ~HYPE_SVM_VINTR_INJECTION_BITS_MASK;
 }
 
+void hype_svm_irr_set(uint32_t irr[8], uint8_t vector) {
+    irr[vector >> 5] |= (uint32_t)1u << (vector & 31u);
+}
+
+void hype_svm_irr_clear(uint32_t irr[8], uint8_t vector) {
+    irr[vector >> 5] &= ~((uint32_t)1u << (vector & 31u));
+}
+
+int hype_svm_irr_any(const uint32_t irr[8]) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        if (irr[i] != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int hype_svm_irr_highest(const uint32_t irr[8]) {
+    int i, b;
+    for (i = 7; i >= 0; i--) {
+        if (irr[i] == 0) {
+            continue;
+        }
+        for (b = 31; b >= 0; b--) {
+            if ((irr[i] & ((uint32_t)1u << b)) != 0) {
+                return i * 32 + b;
+            }
+        }
+    }
+    return -1;
+}
+
 void hype_vmcb_enable_nested_paging(hype_vmcb_t *vmcb, uint64_t npt_root_phys) {
     vmcb->control.np_enable = 1;
     vmcb->control.n_cr3 = npt_root_phys;
