@@ -5124,6 +5124,25 @@ THE RUNGS:
   exists; #78/#79 aren't the blocker -- string-I/O delivery is. Diags:
   ~/Downloads/hype-ubuntu-gladder6c-diag.txt + hype-ubuntu-kernel-console.txt.
 
+  SVM-STRIO (#104) IMPLEMENTED on branch `svm-strio` (39ba1de), NOT on main --
+  it works but exposes a further stall that regresses alpine (see below). What
+  it proved (all NEW vs baseline, measure-first): the string I/O emulation is
+  CORRECT -- OVMF's fw_cfg probe now succeeds (signature/revision read via
+  `rep insb`), OVMF reads the FILE_DIR (count=4, all 4 entries byte-correct:
+  etc/acpi/rsdp 0x24/sel0x20, etc/acpi/tables 0x1fa/0x21, etc/table-loader
+  0x780/0x22, etc/e820 0x14/0x23) and reads etc/e820 content via DMA. THEN it
+  STALLS: OVMF does not go on to read the ACPI files (table-loader/tables/rsdp),
+  the guest sits in DXE (no login, ~9KB serial, guest timer not yet started so
+  elapsed stays ~10ms; waited 5min). Because baseline alpine only boots by
+  failing the fw_cfg probe FAST (so OVMF skips fw_cfg), enabling the working
+  path regresses alpine -> kept off main. LEADING HYPOTHESIS for the stall: OVMF
+  now sizes/places memory from the fw_cfg `etc/e820` instead of the CMOS
+  fallback, relating to the original FW-1 "jump to (-1)" stack-placement root
+  cause (main.c's own e820/CMOS comments). NEXT (task #104): trace what OVMF does
+  right after reading etc/e820 (more fw_cfg? a fault? where?), fix the stall,
+  then land svm-strio on main. Reusable A/B harness: scratchpad/bootwait.sh
+  (isolated single-QEMU boot+wait; baseline=login/1921 reads, WIP=stall).
+
 GLADDER-6 serial-console TOOLING (reusable): Ubuntu's default entry is
 `linux /casper/vmlinuz ---` with NO console=ttyS0, so kernel output goes to the
 GOP framebuffer (invisible in headless QEMU; visible on the user's real HW). For
