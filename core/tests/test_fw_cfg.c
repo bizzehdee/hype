@@ -219,6 +219,33 @@ static void test_dma_execute_read_past_end_fills_zero(void) {
     CHECK_HEX("guest_buf[3] past end is 0", 0, guest_buf[3]);
 }
 
+static void test_dma_execute_read_absent_item_zero_fills_success(void) {
+    /* Reading a selector that isn't registered must behave like real QEMU
+     * fw_cfg (and this device's classic read_byte path): zero-fill the buffer
+     * and report SUCCESS, NOT a DMA error. Returning the error bit here made
+     * OVMF's DXE boot-config pass spin on absent standard items (e.g. 0x0e
+     * FW_CFG_BOOT_MENU). */
+    hype_fw_cfg_t fw;
+    uint8_t guest_buf[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    hype_fw_cfg_dma_op_t op;
+    uint32_t result;
+
+    hype_fw_cfg_reset(&fw);
+
+    op.control = HYPE_FW_CFG_DMA_CTL_SELECT | HYPE_FW_CFG_DMA_CTL_READ;
+    op.select_key = 0x0Eu; /* FW_CFG_BOOT_MENU -- not registered by this project */
+    op.length = 4;
+    op.address = 0;
+
+    result = hype_fw_cfg_dma_execute(&fw, &op, guest_buf);
+
+    CHECK_HEX("absent read reports success, not error", 0, result);
+    CHECK_HEX("absent read zero-fills [0]", 0, guest_buf[0]);
+    CHECK_HEX("absent read zero-fills [1]", 0, guest_buf[1]);
+    CHECK_HEX("absent read zero-fills [2]", 0, guest_buf[2]);
+    CHECK_HEX("absent read zero-fills [3]", 0, guest_buf[3]);
+}
+
 static void test_dma_execute_skip_advances_offset_without_data(void) {
     hype_fw_cfg_t fw;
     static const uint8_t payload[4] = {1, 2, 3, 4};
@@ -361,9 +388,14 @@ static void test_dma_execute_select_only_is_a_harmless_no_op(void) {
     CHECK_HEX("select actually took effect", (uint16_t)key, fw.selected_key);
 }
 
-static void test_dma_execute_unrecognized_key_rejected(void) {
+static void test_dma_execute_unrecognized_key_reads_zero(void) {
+    /* A READ of an unrecognized key is NOT an error: real QEMU fw_cfg returns
+     * zeroes with success for any absent selector, and the classic-port
+     * read_byte path already does the same. (Earlier this asserted the error
+     * bit -- that wrong behavior made OVMF's DXE spin on absent standard items
+     * like 0x0e FW_CFG_BOOT_MENU.) */
     hype_fw_cfg_t fw;
-    uint8_t guest_buf[1] = {0};
+    uint8_t guest_buf[1] = {0xFF};
     hype_fw_cfg_dma_op_t op;
     uint32_t result;
 
@@ -375,7 +407,8 @@ static void test_dma_execute_unrecognized_key_rejected(void) {
     op.address = 0;
     result = hype_fw_cfg_dma_execute(&fw, &op, guest_buf);
 
-    CHECK_HEX("unrecognized key rejected with the error bit set", HYPE_FW_CFG_DMA_CTL_ERROR, result);
+    CHECK_HEX("unrecognized-key read reports success", 0, result);
+    CHECK_HEX("unrecognized-key read returns 0", 0, guest_buf[0]);
 }
 
 int main(void) {
@@ -389,6 +422,7 @@ int main(void) {
     test_dma_decode();
     test_dma_execute_select_and_read();
     test_dma_execute_read_past_end_fills_zero();
+    test_dma_execute_read_absent_item_zero_fills_success();
     test_dma_execute_skip_advances_offset_without_data();
     test_dma_execute_write_rejected();
     test_writable_file_dma_write_lands_in_buffer();
@@ -396,7 +430,7 @@ int main(void) {
     test_writable_file_write_past_end_is_dropped();
     test_read_byte_unrecognized_key_returns_zero();
     test_dma_execute_select_only_is_a_harmless_no_op();
-    test_dma_execute_unrecognized_key_rejected();
+    test_dma_execute_unrecognized_key_reads_zero();
 
     if (failures == 0) {
         printf("all tests passed\n");

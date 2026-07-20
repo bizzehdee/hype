@@ -2209,6 +2209,16 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
         }
         hype_fw_cfg_dma_decode(raw, &op);
 
+        {
+            static unsigned n_dc = 0;
+            if (n_dc < 400) {
+                n_dc++;
+                hype_debug_print("DC%u: sel=0x%x ctl=0x%x len=%u addr=0x%llx\n", n_dc,
+                                 (unsigned int)fw->selected_key, (unsigned int)op.control,
+                                 (unsigned int)op.length, (unsigned long long)op.address);
+            }
+        }
+
         if (op.length != 0) {
             /* The data buffer is a separate guest-physical range: translate it
              * with its declared length before the transfer touches it. A bad

@@ -216,12 +216,21 @@ uint32_t hype_fw_cfg_dma_execute(hype_fw_cfg_t *fw, const hype_fw_cfg_dma_op_t *
     }
 
     if (op->control & HYPE_FW_CFG_DMA_CTL_READ) {
+        /* An unregistered/absent item is NOT a DMA error: real QEMU fw_cfg
+         * returns zeroes for a read of any absent selector (and this device's
+         * own classic-port hype_fw_cfg_read_byte() already does exactly that).
+         * Returning HYPE_FW_CFG_DMA_CTL_ERROR here instead made OVMF's DXE spin
+         * -- it reads standard items hype doesn't register (e.g. 0x0e
+         * FW_CFG_BOOT_MENU) via DMA and a spurious error stalls its boot-config
+         * pass. So on a missing item, zero-fill and report success, matching
+         * both QEMU and the classic-port path. */
         if (lookup_item(fw, fw->selected_key, &data, &size) != 0) {
-            return HYPE_FW_CFG_DMA_CTL_ERROR;
+            data = 0;
+            size = 0;
         }
         for (i = 0; i < op->length; i++) {
             uint32_t src_off = fw->offset + i;
-            guest_data_ptr[i] = (src_off < size) ? data[src_off] : 0;
+            guest_data_ptr[i] = (data != 0 && src_off < size) ? data[src_off] : 0;
         }
         fw->offset += op->length;
         return 0;
