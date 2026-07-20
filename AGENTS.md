@@ -20,8 +20,46 @@ changes — this file is the condensed rule set, not a replacement for either.
    covered by §10), resolve it and add it to `plan.md` §10 as a new
    numbered entry before writing the code that depends on it.
 
+## Diagnose first, decide on evidence — not assumptions
+
+- **When something breaks or behaves unexpectedly, diagnose it before
+  changing anything.** Get the root cause early and cheaply — read the
+  actual failure output, add a targeted trace/probe, compare a working path
+  against the broken one — rather than guessing at a cause and building a fix
+  on top of the guess. A fix aimed at an assumed cause usually wastes more
+  time than the diagnosis would have taken, and often masks the real bug.
+- **Back every non-trivial decision with evidence you actually gathered**,
+  not with a plausible-sounding theory. "The MADT must be missing, so build
+  MADT synthesis" is an assumption; a byte-level trace showing OVMF's fw_cfg
+  probe reading one byte instead of four is evidence — and it pointed at a
+  completely different fix (string-I/O emulation). If you catch yourself
+  saying "it's probably X," stop and get the measurement that confirms or
+  refutes X first.
+- **State what you measured and how, so the conclusion is checkable.** When
+  you report a root cause or close a task, cite the observation that proves
+  it (the log line, the trace, the diff in behavior), not just the
+  conclusion. If a belief is still an untested hypothesis, label it as one.
+- This is the same measure-first discipline the testing and real-hardware
+  gates enforce; it applies to debugging and design calls too, not only to
+  merging code.
+
 ## Hard invariants — do not weaken these without updating plan.md §10 first
 
+- **The host↔guest and guest↔guest security boundaries are paramount —
+  above performance, features, or convenience.** Nothing may cross either
+  boundary unintentionally. The host must never expose its own state, memory,
+  or hardware to a guest except through a deliberately designed, mediated
+  interface; one guest must never be able to observe or affect another guest
+  (its memory, its I/O, its timing side-channels, shared emulation state that
+  should be per-VM) except where the operator has *explicitly* configured a
+  channel between them. Intentional, configured inter-VM or external
+  communication (e.g. `net_peers` networking, or VMs talking over a real
+  network) is fine — the rule is against *unintentional* leakage, not against
+  designed communication. When in doubt, treat a potential cross-boundary
+  path as a leak and prove it isn't before relying on it; a performance or
+  simplicity win that erodes a boundary is not a win (see the rejected
+  port-0x80 passthrough and the per-vCPU de-globalization work for why
+  file-global emulation state is a guest↔guest leak).
 - **Guest isolation is the point of this project.** Every one of these
   exists because of `plan.md` §6g/§6j/§10's security-review decisions
   (#19–22):
