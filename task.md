@@ -5086,10 +5086,43 @@ THE RUNGS:
     (2) "[Firmware Bug]: CPU 0: APIC ID mismatch. CPUID: 0x0001 APIC: 0x0000":
         hype's CPUID returns initial-APIC-ID 1 (guest runs on physical AP1) but
         the guest LAPIC ID register reads 0. Real inconsistency; fix regardless.
-  NEXT: give the FW-1 guest a correct MADT (+ IO-APIC) and reconcile the APIC ID
-  (CPUID initial-APIC-ID vs guest LAPIC ID), then re-run. Diags:
+  ROOT CAUSE FOUND (2026-07-20, measure-first via fw_cfg byte-trace): the MADT
+  IS built correctly (devices/acpi.c, 1 CPU apic_id=0, IO-APIC 0xFEC00000) and
+  registered in fw_cfg (etc/acpi/rsdp, etc/acpi/tables, etc/table-loader,
+  etc/e820). The problem is DELIVERY: the guest kernel finds NO ACPI at all
+  ("ACPI: OSL: System description tables not found", AE_NOT_FOUND) because OVMF
+  never installs the tables. Traced OVMF's fw_cfg access: it selects only key
+  0x0 (signature) + 0x1 (ID) and then STOPS -- never reads FILE_DIR (0x19), never
+  DMAs. WHY: OVMF's QemuFwCfgLib reads the fw_cfg data port (0x511) with a STRING
+  instruction (`rep insb`, IoReadFifo8) to fetch the 4-byte signature/revision.
+  hype's IOIO decoder (hype_svm_decode_ioio_info1, vmcb.c) IGNORES the SVM
+  EXITINFO1 STR (bit2) and REP (bit3) bits and every IOIO handler treats the exit
+  as a REGISTER in/out: the 0x511 handler returns ONE byte in AL instead of
+  writing `count` bytes to guest memory at [ES:RDI]. Byte-trace proof: OVMF's
+  signature read yielded only byte[0]='Q' (0x51), never "QEMU"; so OVMF concludes
+  fw_cfg is unusable -> skips ALL ACPI table installation -> guest has no
+  RSDP/MADT -> Linux runs virtual-wire mode with no LAPIC timer -> Ubuntu's
+  SRCU/workqueue-timing-sensitive udev init (fsnotify mark teardown) hangs.
+  So GLADDER-6c is really TWO core-hypervisor fixes, NOT ACPI synthesis work:
+    (1) STRING I/O EMULATION (the real fix): decode STR/REP in the IOIO path and
+        emulate INS/OUTS -- transfer `count` (REP?RCX:1) units to/from guest
+        memory at [ES:RDI]/[DS:RSI], honoring RFLAGS.DF and address size, with
+        guest-phys->host translation (fw_1_guest_phys_to_host) + bounds-check
+        (core/guest_mem.h -- MUST NOT raw-deref a guest address; security
+        invariant). This unblocks OVMF's fw_cfg probe so it detects DMA and loads
+        ACPI. Pure decode logic gets unit tests (>=90%).
+    (2) fw_cfg DMA address translation: the DMA handler (svm_vcpu.c ~2159-2167)
+        raw-derefs the guest-physical access-struct + data addresses
+        ((uint8_t*)(uintptr_t)gpa) instead of translating via
+        fw_1_guest_phys_to_host. Never exercised before (OVMF never reached DMA),
+        but once (1) lets OVMF use DMA for the bulk table reads this must be
+        correct too (FW-1 guest RAM maps gpa 0 -> ram_host_phys, NOT identity).
+    (3) [secondary] APIC ID mismatch: CPUID leaf 1 EBX[31:24] returns the
+        PHYSICAL initial-APIC-ID (1, running on AP1); mask it to the guest's
+        virtual APIC ID (0) so it matches the guest LAPIC ID register.
+  The earlier "needs MADT + IO-APIC (#78/#79)" hypothesis was WRONG: the MADT
+  exists; #78/#79 aren't the blocker -- string-I/O delivery is. Diags:
   ~/Downloads/hype-ubuntu-gladder6c-diag.txt + hype-ubuntu-kernel-console.txt.
-  Deps: overlaps M4-6b2/M4-6b3.
 
 GLADDER-6 serial-console TOOLING (reusable): Ubuntu's default entry is
 `linux /casper/vmlinuz ---` with NO console=ttyS0, so kernel output goes to the
