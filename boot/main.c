@@ -210,6 +210,7 @@ typedef struct hype_fw_vm {
     hype_pci_t pci;
     hype_cmos_t cmos;
     hype_guest_lapic_t lapic; /* FW-1b: guest Local APIC (0xFEE00000) */
+    hype_ioapic_t ioapic;     /* M4-6b3: guest I/O APIC (0xFEC00000) */
     hype_guest_uart_t uart;   /* FW-1e: COM1 0x3F8 */
     hype_guest_uart_t uart2;  /* FW-1e: COM2 0x2F8 -- OVMF probes/uses both */
     hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
@@ -250,6 +251,7 @@ static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
 #define g_fw_1_pci (vm->pci)
 #define g_fw_1_cmos (vm->cmos)
 #define g_fw_1_lapic (vm->lapic)
+#define g_fw_1_ioapic (vm->ioapic)
 #define g_fw_1_uart (vm->uart)
 #define g_fw_1_uart2 (vm->uart2)
 #define g_fw_1_ps2 (vm->ps2)
@@ -543,6 +545,10 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * not-present by FW-1a's NPT map, so ECAM MMIO traps here as an NPF and
  * is serviced by PCI-1's own config-space model. */
 #define HYPE_FW_1_ECAM_GPA 0xE0000000ULL
+/* M4-6b3: guest I/O APIC MMIO base -- the address the FW-1 MADT advertises
+ * (devices/acpi.h cfg.io_apic_address). Not-present in the NPT like the LAPIC
+ * region, so a guest access faults into hype_svm_vcpu_handle_ioapic_npf. */
+#define HYPE_FW_1_IOAPIC_GPA 0xFEC00000ULL
 
 /* FW-1d: OVMF never executes HLT during DXE/BDS init -- its idle wait
  * (CpuSleep) HLTs only once everything is up. Empirically it reaches
@@ -4867,6 +4873,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_pic_emu_reset(&g_fw_1_pic);
     hype_pit_emu_reset(&g_fw_1_pit);
     hype_guest_lapic_reset(&g_fw_1_lapic);
+    hype_ioapic_reset(&g_fw_1_ioapic); /* M4-6b3: guest I/O APIC at 0xFEC00000 */
     hype_guest_uart_reset(&g_fw_1_uart);
     hype_guest_uart_reset(&g_fw_1_uart2);
     hype_ps2_kbd_reset(&g_fw_1_ps2);
@@ -5709,6 +5716,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * are PIT IRQ0 timer edges (M4-6b4). */
                 if (hype_pit_emu_advance(&g_fw_1_pit, ticks) != 0) {
                     hype_pic_emu_raise_irq(&g_fw_1_pic.master, 0);
+                    /* M4-6b3: the PIT output is also wired to the I/O APIC. The
+                     * MADT maps ISA IRQ0 -> GSI2 (the standard PC override), so
+                     * an ACPI-mode guest (PIC masked) receives the tick via the
+                     * IO-APIC RTE[2]. Raising both is how real chipsets wire it;
+                     * whichever the guest unmasked delivers. */
+                    {
+                        uint8_t iov;
+                        if (hype_ioapic_raise(&g_fw_1_ioapic, 2u, &iov)) {
+                            hype_svm_vcpu_request_interrupt(ctx, iov);
+                        }
+                    }
                 }
             }
         }
@@ -5732,6 +5750,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (!in_service) {
                     hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
                     ahci_irqs++;
+                }
+                /* M4-6b3: also route the AHCI line (GSI == its ISA IRQ, no
+                 * override) through the I/O APIC. Level-triggered: the RTE's
+                 * Remote-IRR gates re-injection until the guest EOIs, matching
+                 * the PIC in-service gate above. */
+                {
+                    uint8_t iov;
+                    if (hype_ioapic_raise(&g_fw_1_ioapic, (uint32_t)line, &iov)) {
+                        hype_svm_vcpu_request_interrupt(ctx, iov);
+                        ahci_irqs++;
+                    }
                 }
             }
         }
@@ -5757,6 +5786,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     (g_fw_1_pic.master.imr & bit) == 0 &&
                     (g_fw_1_pic.master.isr & bit) == 0) {
                     hype_pic_emu_raise_irq(&g_fw_1_pic.master, irqn);
+                }
+                /* M4-6b3: route the serial line (GSI == IRQ, no override)
+                 * through the I/O APIC too, for an ACPI-mode guest. */
+                {
+                    uint8_t iov;
+                    if (hype_guest_uart_irq_pending(uart) &&
+                        hype_ioapic_raise(&g_fw_1_ioapic, (uint32_t)irqn, &iov)) {
+                        hype_svm_vcpu_request_interrupt(ctx, iov);
+                    }
                 }
             }
         }
@@ -6088,6 +6126,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* FW-1b: the guest Local APIC at 0xFEE00000 is the expected
              * NPF here (the region is not-present by design). */
             if (hype_svm_vcpu_handle_lapic_npf(ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE, insn) == 0) {
+                continue;
+            }
+            /* M4-6b3: the guest I/O APIC at 0xFEC00000. Once ACPI is delivered
+             * the kernel masks the 8259 PIC and programs this chip's
+             * redirection table to route external IRQ lines (incl. the PIT via
+             * the MADT's IRQ0->GSI2 override) to LAPIC vectors. */
+            if (hype_svm_vcpu_handle_ioapic_npf(ctx, &g_fw_1_ioapic, HYPE_FW_1_IOAPIC_GPA, insn) == 0) {
                 continue;
             }
             /* FW-1c: PCI config space via MMCONFIG ECAM at 0xE0000000

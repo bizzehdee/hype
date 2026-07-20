@@ -19,6 +19,7 @@
 #include "../../../devices/ps2_mouse.h"
 #include "../../../devices/bochs_vbe.h"
 #include "../../../devices/guest_lapic.h"
+#include "../../../devices/ioapic.h"
 #include "../../../devices/guest_uart.h"
 #include "../../../devices/virtio_blk.h"
 #include "../../../devices/ata_disk.h"
@@ -854,6 +855,11 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
  */
 int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                     uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes);
+
+/* M4-6b3: FW-1's exempt NPF glue for the emulated I/O APIC (devices/ioapic.h)
+ * at 0xFEC00000 -- same shape/exemption reasoning as the LAPIC glue above. */
+int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
+                                    uint64_t ioapic_base_phys, const uint8_t *guest_insn_bytes);
 
 /*
  * FW-1e's exempt IOIO glue for the guest 16550 UART (devices/guest_uart.h)
