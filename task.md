@@ -5053,15 +5053,54 @@ THE RUNGS:
       heuristic never re-armed (needs 512 more empty 0x64 polls that never come).
       Also a benign "error: can't find command `grub_platform'" before the menu.
     * Diag: ~/Downloads/hype-ubuntu-gladder6-diag.txt. Follow-up: GLADDER-6b.
-- [ ] GLADDER-6b: drive Ubuntu's GRUB past its interactive menu (the GLADDER-6
-  blocker). Determine GRUB's actual input channel under hype (UEFI ConIn backed
-  by hype PS/2, vs serial terminal_input) and why one injected Enter neither
-  advanced it nor re-armed. Options: (a) make FW-1g re-arm on a broader idle
-  signal (not only 0x64 polls) and/or inject on the serial-input path GRUB uses;
-  (b) confirm whether GRUB has a timeout at all (the grub_platform error may
-  break the `set timeout` line) and, if so, why the PIT-based countdown does not
-  fire; (c) as a fallback, a one-key nudge on the video/console path. Deps:
-  GLADDER-6 findings. This is the real gate to Ubuntu login.
+- [x] GLADDER-6b: drive Ubuntu's GRUB past its interactive menu. DONE
+  (2026-07-20, commit aa425c3). ROOT CAUSE: hype's FW-1g auto-key injection
+  (built for the media-less OVMF-shell bring-up, FW-1e/f/g) fired a premature
+  Enter into GRUB, which consumed it, LEFT its menu-countdown loop, and stalled.
+  Ubuntu's grub.cfg already has `set timeout=30` and auto-boots entry 0 with NO
+  input -- so a bootable-ISO guest needs no injection at all. FIX: gate both
+  injection sites behind HYPE_FW_1_AUTO_KEY_INJECT (default 0). VERIFIED:
+  alpine-standard still boots to login (0 faults, 1921 reads, 0 injections --
+  isolinux auto-boots too); Ubuntu's 30s GRUB countdown now runs to 0 and boots
+  entry 0, handing off to the kernel. Grabbed authoritative grub.cfg via
+  osirrox; the `grub_platform` error is benign (bare command -> the EFI-only
+  extra menu entries are just skipped; default entry unaffected).
+- [~] GLADDER-6c: Ubuntu initramfs (casper) hangs -- udev/fsnotify SRCU teardown
+  never completes. THE blocker after 6b. With a serial console (see tooling
+  note) the Ubuntu kernel boots cleanly: unpacks initramfs, "Run /init", probes
+  hype's AHCI ("ahci 0000:00:02.0: AHCI vers 0001.0301"), attaches the CD
+  ("ata1.00: ATAPI: HYPE VIRTUAL CD-ROM", sr0/sg0). Then it HANGS -- three tasks
+  wedged in D-state (hung_task watchdog at 247s):
+    * kworker/u4:2 events_unbound fsnotify_connector_destroy_workfn -> wait_for_completion
+    * kworker/u4:3 events_unbound fsnotify_mark_destroy_workfn -> wait_for_completion
+    * udevadm:136 fsnotify_destroy_group -> fsnotify_wait_marks_destroyed -> __flush_work -> wait_for_completion
+  i.e. an SRCU grace period in fsnotify mark destruction never completes; udev
+  (systemd-udevd) blocks on it and casper never mounts the squashfs (ATAPI reads
+  frozen at 257). Alpine (busybox mdev) never exercises this path, which is why
+  it booted. TWO upstream hype issues visible in the boot log, the likely causes:
+    (1) "APIC: ACPI MADT or MP tables are not detected" -> "Switch to virtual
+        wire mode": the FW-1/OVMF guest gets NO MADT, so Linux runs a degraded
+        interrupt/timer config (no LAPIC timer / IO-APIC). == pending tasks
+        M4-6b2 (#78 MADT/DSDT) + M4-6b3 (#79 IO-APIC), deferred because alpine
+        didn't need them. Ubuntu's SRCU/workqueue-timing-sensitive init DOES.
+    (2) "[Firmware Bug]: CPU 0: APIC ID mismatch. CPUID: 0x0001 APIC: 0x0000":
+        hype's CPUID returns initial-APIC-ID 1 (guest runs on physical AP1) but
+        the guest LAPIC ID register reads 0. Real inconsistency; fix regardless.
+  NEXT: give the FW-1 guest a correct MADT (+ IO-APIC) and reconcile the APIC ID
+  (CPUID initial-APIC-ID vs guest LAPIC ID), then re-run. Diags:
+  ~/Downloads/hype-ubuntu-gladder6c-diag.txt + hype-ubuntu-kernel-console.txt.
+  Deps: overlaps M4-6b2/M4-6b3.
+
+GLADDER-6 serial-console TOOLING (reusable): Ubuntu's default entry is
+`linux /casper/vmlinuz ---` with NO console=ttyS0, so kernel output goes to the
+GOP framebuffer (invisible in headless QEMU; visible on the user's real HW). For
+QEMU diagnosis, rebuild the ISO with a serial console via xorriso, keeping El
+Torito:
+  xorriso -indev orig.iso -outdev serial.iso -boot_image any replay \
+          -map patched-grub.cfg /boot/grub/grub.cfg -commit
+patched grub.cfg adds: `serial --unit=0 --speed=115200`, `terminal_input/output
+serial console`, and `console=ttyS0,115200 console=tty0` on the linux line.
+Artifact: ~/Downloads/ubuntu-hype-serial.iso.
 - [ ] GLADDER-7: Fedora Server + Ubuntu Server TOGETHER on two cores -- the
   mixed-distro concurrent milestone. Deps: GLADDER-5, GLADDER-6, GLADDER-9
   (per-VM ISO), GLADDER-8 (RAM).
