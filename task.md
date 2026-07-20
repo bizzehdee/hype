@@ -4868,3 +4868,53 @@ reached login by ~13-15s and the rest is idle-at-login exit handling; guest
 EXECUTION is now ~native. The 1kHz forced-INTR waste the deadline timer targeted
 is now negligible (1546 exits) because the active boot is over in seconds --
 confirming that path would have optimised a now-tiny cost. PERF-1 CLOSED.
+
+## GLADDER — guest-complexity ladder: alpine-standard bring-up (scoping, 2026-07-20)
+
+Switched the test ISO to alpine-standard-3.21.7 (278MB; same kernel version as
+the -virt we had booting, so differences are config/driver-set, not kernel).
+Ran SINGLE-VM (HYPE_RUN_TWO_VMS temporarily 0) for a clean "what breaks" read.
+
+HOW FAR IT GOT: OVMF -> GRUB 2.12 menu (NEW: -standard ships a GRUB bootloader;
+-virt did not) -> kernel loaded and running (a kernel MODULE, guest_rip in the
+0xffffffffc0.. module area, was executing). So it boots meaningfully further than
+a "does it even start" check.
+
+THE HARD STOP:
+  PANIC: unhandled NPF at guest-physical 0xfed1f410 (read, guest_rip=0xffffffffc067d043)
+  0xFED1F410 = ICH9 RCBA region (Root Complex Base 0xFED1C000 + 0x3410) -- chipset
+  registers a fuller kernel's LPC/chipset driver (lpc_ich / iTCO / intel pmc-ish)
+  probes. hype models the Q35 MCH + AHCI but not the ICH9 LPC/RCBA. hype PANICS on
+  an unhandled MMIO NPF (unlike unhandled PORTS, which it absorbs+logs) -> we only
+  see the FIRST missing MMIO region, not all of them.
+
+NEW absorbed ports (handled fine, logged-once): 0x92 (A20 gate), 0x604, 0x87 (DMA
+page reg), 0xcfb, 0x2e9/0x3e9 (COM3/COM4 probe).
+NEW stubbed MSRs (RDMSR->0, fine for now): 0x8b (microcode rev), 0x179/0x17a
+(MCG_CAP/STATUS machine-check), 0xc0010015 (HWCR), 0xc001001f (NB_CFG),
+0xc0010200-0x20b + 0xc001029a/b (AMD perf counters), 0xc0011029 (DE_CFG),
+0xc0000103 (TSC_AUX), 0x0.
+
+SCOPED TASKS:
+- [ ] GLADDER-1 (DO FIRST -- diagnostic enabler): absorb-and-log unhandled guest
+  MMIO (NPF) instead of panicking. Mirror the existing unhandled-PORT behavior:
+  read -> return all-ones (0xFFFF.., what real HW returns for absent MMIO),
+  write -> drop, trace each distinct region ONCE. This matches real hardware AND
+  lets one run ENUMERATE every MMIO region -standard touches instead of
+  panic->fix->repeat. Likely also lets -standard boot much further immediately
+  (the RCBA probe would just read all-ones = "feature absent" and move on).
+  Needs a diagnostic gate + care: some NPFs are real device MMIO (LAPIC/AHCI/
+  pflash/ramfb) that MUST keep their handlers -- only truly-unmapped regions
+  absorb. Deps: none.
+- [ ] GLADDER-2: from GLADDER-1's enumerated list, decide per MMIO region: absorb
+  (all-ones) suffices / minimal model needed / stop advertising the device so the
+  driver never probes. First known region: ICH9 RCBA 0xFED1Cxxx. Deps: GLADDER-1.
+- [ ] GLADDER-3: confirm GRUB menu drive-through (key-injection or GRUB timeout)
+  is clean on -standard (kernel did boot, so likely OK; verify no stall there).
+- [ ] GLADDER-4: once it boots to login single-VM, re-enable HYPE_RUN_TWO_VMS=1
+  and confirm TWO alpine-standard on two cores (RAM budget: -standard rootfs is
+  bigger; may need >1GB/guest). Then the clean same-kernel PERF baseline vs the
+  90s native-standard. Deps: GLADDER-2.
+THEN: heavy distro (Fedora/Ubuntu) as the next rung.
+NOTE: HYPE_RUN_TWO_VMS is temporarily 0 in the tree for this bring-up; =1 (two-VM)
+remains the milestone default -- restore once -standard boots.
