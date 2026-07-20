@@ -31,11 +31,15 @@ static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
     hype_cpuid_emulate(1, 0, &real, &out);
 
     CHECK_HEX("eax passthrough", real.eax, out.eax);
-    CHECK_HEX("ebx passthrough", real.ebx, out.ebx);
+    /* ebx[31:24] (initial APIC ID) forced to 0; lower 24 bits pass through. */
+    CHECK_HEX("ebx initial-APIC-ID forced 0", 0, (out.ebx >> 24) & 0xFFu);
+    CHECK_HEX("ebx low 24 bits passthrough", real.ebx & 0x00FFFFFFu, out.ebx);
     CHECK_HEX("hypervisor-present bit forced set", 1, (out.ecx & (1u << 31)) != 0);
     CHECK_HEX("TSC_DEADLINE bit forced clear", 0, (out.ecx & (1u << 24)) != 0);
-    /* ecx = real | hypervisor-present, minus the TSC_DEADLINE bit. */
-    CHECK_HEX("ecx otherwise passthrough", (real.ecx | (1u << 31)) & ~(1u << 24), out.ecx);
+    CHECK_HEX("X2APIC bit forced clear", 0, (out.ecx & (1u << 21)) != 0);
+    /* ecx = real | hypervisor-present, minus the TSC_DEADLINE and X2APIC bits. */
+    CHECK_HEX("ecx otherwise passthrough",
+              (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21), out.ecx);
     CHECK_HEX("MTRR bit forced clear", 0, (out.edx & (1u << 12)) != 0);
     CHECK_HEX("edx otherwise passthrough", real.edx & ~(1u << 12), out.edx);
 }
