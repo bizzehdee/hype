@@ -4965,3 +4965,14 @@ OWED (QEMU decode-assist path differs from real AMD; confirm the RCBA absorb +
 login on silicon). NEXT: GLADDER-4 -- flip HYPE_RUN_TWO_VMS=1, confirm TWO
 alpine-standard on two cores (bigger rootfs -> may need >1GB/guest), take the
 clean same-kernel perf baseline vs the 90s native-standard, then Fedora/Ubuntu.
+
+GLADDER-1 HW-CONFIRMED (2026-07-20): on the real AMD laptop, alpine-standard
+(LTS kernel 6.12.81-0-lts, single-VM) boots to "localhost login". The RCBA
+absorb works on silicon (decode-assist decoded the insn): "unhandled MMIO
+0xfed1f410 read -- absorbing", and it is the ONLY unhandled MMIO region hit --
+confirming GLADDER-2 needs no device model. Boot ~7-8s (elapsed 30s, hlt_wait
+22.6s = ~75% idle-at-login by the first tick; even faster than -virt).
+max_single_vmrun=94ms (no stalls, PERF-1 g_pat WB fix holding), pat=..070106,
+zero panics/giveups. New MSRs stubbed + ports absorbed, all fine. Guest-ladder
+intermediate rung DONE. NEXT: GLADDER-4 (two -standard on two cores + same-kernel
+perf baseline vs 90s native), then Fedora/Ubuntu.
