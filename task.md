@@ -5037,3 +5037,36 @@ THE RUNGS:
   (per-VM ISO), GLADDER-8 (RAM).
 These are diagnostic/measure-first rungs like alpine-standard was: run, read what
 breaks, scope tasks. Server (not desktop) keeps it serial-console-only.
+
+GLADDER-5/8 WALL (2026-07-20): the heavy rung hit a hard ARCHITECTURAL wall
+before any kernel-probe diagnostic -- and it IS the key "what breaks" finding.
+hype loads the ENTIRE ISO into ONE CONTIGUOUS host RAM buffer (ISO-1/ISO-2:
+g_iso_host_phys via a single AllocatePages). That does not scale to multi-GB
+server ISOs (Fedora Server 3.64GB, Ubuntu Server 2.72GB). Two independent walls:
+  1. hype-side: AllocatePages(AnyPages, 955328 pages = 3.64GB) FAILS with
+     OUT_OF_RESOURCES at QEMU -m 8192 -- no contiguous 3.64GB region (the sub-4GB
+     area is under the PCI hole + holds the 2GB guest RAM + OVMF, and the
+     above-4GB area at 8GB is ~4GB, too tight). Needs a huge contiguous alloc.
+  2. test-harness: cannot easily boot a big-ISO image in QEMU. fat:rw:build/esp
+     (dir overlay) CAPS files at 2GB ("larger than 2GB"). The mtools whole-disk
+     FAT img (make-usb-package) boots on real HW but OVMF-in-QEMU is flaky/
+     "No bootable option" on it. A GPT+ESP img (parted+mtools, no root) boots
+     fine for SMALL ISOs (alpine, at -m 4096 AND -m 12288) but OVMF HANGS at the
+     screen-clear on the 4.14GB FAT32 volume Fedora needs (its FAT driver chokes
+     on a ~4GB volume). Confirmed -m 12288 itself is fine (small img boots).
+So: alpine (<=278MB ISO) works because it fits the load-into-RAM model; server
+distros do not. This is the real heavy-rung blocker, ahead of any device-model
+gap. FIX OPTIONS (scoped as GLADDER-10):
+  (a) CHUNKED / scatter ISO allocation -- allocate the ISO in N smaller
+      (e.g. 256MB) buffers, ATAPI/ISO read indexes chunk[off/chunksz]. Removes
+      the contiguous-3.64GB requirement (fixes wall #1) while staying RAM-
+      resident. Moderate change to ISO-1 load + atapi.c backing. Still needs the
+      total RAM, and does not fix the QEMU-boot-image issue (#2 -- separate
+      test-harness fix: a proper GPT ESP that OVMF likes at 4GB, or boot the ISO
+      off a second QEMU drive and teach hype to read it there).
+  (b) STREAMING block backend -- do NOT hold the ISO in RAM; read it on demand.
+      Post-EBS this needs hype own AHCI/NVMe host driver (M10) or a virtio-blk
+      path -- the real fix, also removes the RAM cost, but big (ties to M5-3/M10).
+RECOMMENDATION: (a) chunked alloc as the unblock for the diagnostic; (b) later.
+GLADDER-8 partial done: guest RAM bumped 1GB->2GB (server-installer minimum;
+Ubuntu 1.5GB / Fedora 1.5-2.0GB per user). HYPE_RUN_TWO_VMS temporarily 0.

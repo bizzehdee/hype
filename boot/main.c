@@ -157,7 +157,7 @@ static uint64_t g_ram_1_size_bytes;
  * territory this project has deliberately avoided all session).
  */
 /* Sizing constants (VM-independent). */
-#define HYPE_FW_1_GUEST_RAM_BYTES (1024ULL * 1024ULL * 1024ULL) /* 1 GiB; see hype_fw_vm_t.ram_host_phys */
+#define HYPE_FW_1_GUEST_RAM_BYTES (2048ULL * 1024ULL * 1024ULL) /* 2 GiB (GLADDER-8: server installers anaconda/subiquity want >=2GB; within HYPE_FW_1_NPT_GB=4 + under the 0xE0000000 hole); see hype_fw_vm_t.ram_host_phys */
 #define HYPE_SERIAL_COM2 0x2F8u
 #define HYPE_FW_1_KEY_ENTER_MAKE 0x1Cu /* Set-1 make code for Enter */
 #define HYPE_FW_1_DEBUG_PORT 0x402u    /* FW-1g: OVMF SEC/PEI PlatformDebugLibIoPort */
@@ -302,7 +302,7 @@ static uint64_t g_usable_ram_bytes;
  *
  * UPDATE (2026-07-19): the AHCI-IRQ wedge (BUG#2) was the shared single-slot
  * pending-IRQ queue (g_pending_irq_*) -- now per-vCPU. Re-enabled (=1). */
-#define HYPE_RUN_TWO_VMS 1
+#define HYPE_RUN_TWO_VMS 0
 static uint64_t g_ap_tramp_page;
 static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
 /* Stashed for fw_1_ap_main to run the guest on the AP (set in efi_main). */
