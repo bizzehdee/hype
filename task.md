@@ -4832,3 +4832,27 @@ shrinking. This likely supersedes the deadline timer AND virtio as the single
 biggest PERF-1 win. NEXT: HW boot with the fix -- expect the 13s early-boot
 stalls to collapse and overall boot to drop sharply. (Also a candidate root for
 part of the per-VMRUN cost + the guest's slow execution generally.)
+
+*** PERF-1 SOLVED (2026-07-20, HW-CONFIRMED) ***: the guest-PAT fix took the
+Alpine boot from ~350-450s to LOGIN IN UNDER 15 SECONDS on real hardware --
+a ~25-30x speedup from ONE LINE (init the guest VMCB save.g_pat to the x86 WB
+default instead of leaving it 0 = all-UC). This definitively confirms the root
+cause: guest RAM was UNCACHEABLE under NPT (PAT index 0 = 0 = UC), so the whole
+"slow boot" was the UC memory penalty, memory-bound throughout.
+RETROSPECTIVE -- this one bug explains EVERY prior red herring:
+  - the 13.6s IF=0 stalls (UC decompress/memset, rep stosq),
+  - the ~4x vmrun_tot / slow guest execution,
+  - its INVARIANCE to exit count (memory-type, not exits/timer),
+  - why kvmclock, the dedicated AP core, and the whole timer/preemption line of
+    investigation never moved the needle (none touched the memory type),
+  - and why the earlier "I/O-VMEXIT overhead" and "missed host ticks" framings,
+    though real observations, were NOT the dominant cost.
+MEASURE-FIRST vindicated: the per-port histogram -> long-VMRUN probe -> memory-
+type probe chain walked straight to a one-line root cause that no amount of
+timer/virtio work would have found. The deadline timer, IO-APIC, virtio-blk/
+console remain valid INCREMENTAL wins but are no longer urgent -- the ~5-min
+boot is gone. hype alpine-virt (<15s) is now FASTER than the 90s native
+alpine-standard baseline (cross-kernel, but the ~4x-slower story is over).
+PERF-1 DONE. Fix: commit 74b6104 (save.g_pat = 0x0007040600070406, both VMCB
+builders). Instrumentation (io_histogram, long-VMRUN, memory-type probe) kept
+for future perf work; gate off HYPE_IO_HISTOGRAM to reclaim its 256KB/VM.
