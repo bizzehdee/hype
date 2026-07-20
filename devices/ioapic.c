@@ -113,3 +113,10 @@ void hype_ioapic_eoi(hype_ioapic_t *io, uint8_t vector) {
         }
     }
 }
+
+void hype_ioapic_deassert(hype_ioapic_t *io, uint32_t gsi) {
+    if (gsi >= HYPE_IOAPIC_NUM_RTES) {
+        return;
+    }
+    io->rte[gsi] &= ~(uint64_t)HYPE_IOAPIC_RTE_REMOTE_IRR;
+}

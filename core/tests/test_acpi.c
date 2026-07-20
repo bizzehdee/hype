@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../devices/acpi.h"
+#include "../../devices/dsdt_aml.h"
 
 static int failures = 0;
 
@@ -194,11 +195,16 @@ static void test_build_tables_blob_layout(void) {
     CHECK_HEX("mcfg allocation base_address", 0xE0000000ULL, alloc->base_address);
     CHECK_HEX("mcfg allocation end_bus", 255, alloc->end_bus);
 
-    /* DSDT */
+    /* DSDT: SDT header followed by the compiled AML body (M4-6b2 _PRT). */
     {
         hype_acpi_sdt_header_t *dsdt = (hype_acpi_sdt_header_t *)(buf + layout.dsdt_offset);
         CHECK_MEM("dsdt signature", "DSDT", dsdt->signature, 4);
-        CHECK_HEX("dsdt is header-only (placeholder)", sizeof(hype_acpi_sdt_header_t), layout.dsdt_length);
+        CHECK_HEX("dsdt length = header + AML body", sizeof(hype_acpi_sdt_header_t) + HYPE_DSDT_AML_BODY_LEN,
+                  layout.dsdt_length);
+        CHECK_HEX("dsdt SDT-header length field matches", layout.dsdt_length, dsdt->length);
+        /* the AML body is copied verbatim after the header */
+        CHECK_MEM("dsdt AML body copied after header", hype_dsdt_aml_body,
+                  (uint8_t *)dsdt + sizeof(hype_acpi_sdt_header_t), HYPE_DSDT_AML_BODY_LEN);
     }
 }
 

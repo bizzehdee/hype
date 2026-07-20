@@ -107,4 +107,14 @@ int hype_ioapic_raise(hype_ioapic_t *io, uint32_t gsi, uint8_t *out_vector);
  */
 void hype_ioapic_eoi(hype_ioapic_t *io, uint8_t vector);
 
+/*
+ * A level-triggered device deasserted GSI `gsi` (its interrupt condition
+ * cleared): drops the entry's Remote-IRR so the next assertion can inject
+ * again. hype uses this to model a level line going low without having to
+ * decode which vector the guest EOIs (its minimal LAPIC tracks no external
+ * ISR). Edge entries, masked entries with no Remote-IRR, and out-of-range
+ * GSIs are no-ops. Pure.
+ */
+void hype_ioapic_deassert(hype_ioapic_t *io, uint32_t gsi);
+
 #endif /* HYPE_DEVICES_IOAPIC_H */

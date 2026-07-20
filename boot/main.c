@@ -549,6 +549,11 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * (devices/acpi.h cfg.io_apic_address). Not-present in the NPT like the LAPIC
  * region, so a guest access faults into hype_svm_vcpu_handle_ioapic_npf. */
 #define HYPE_FW_1_IOAPIC_GPA 0xFEC00000ULL
+/* M4-6b2/M4-6b3: the I/O APIC GSI the AHCI function's INTA is routed to. MUST
+ * match the DSDT _PRT (devices/dsdt.asl: dev 2 INTA -> GSI 0x10). In APIC mode
+ * the guest programs IO-APIC RTE[16] for AHCI and ignores the legacy PCI
+ * Interrupt Line, so hype raises the AHCI line here rather than on line 11. */
+#define HYPE_FW_1_AHCI_GSI 16u
 
 /* FW-1d: OVMF never executes HLT during DXE/BDS init -- its idle wait
  * (CpuSleep) HLTs only once everything is up. Empirically it reaches
@@ -5751,18 +5756,25 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
                     ahci_irqs++;
                 }
-                /* M4-6b3: also route the AHCI line (GSI == its ISA IRQ, no
-                 * override) through the I/O APIC. Level-triggered: the RTE's
-                 * Remote-IRR gates re-injection until the guest EOIs, matching
-                 * the PIC in-service gate above. */
-                {
-                    uint8_t iov;
-                    if (hype_ioapic_raise(&g_fw_1_ioapic, (uint32_t)line, &iov)) {
-                        hype_svm_vcpu_request_interrupt(ctx, iov);
-                        ahci_irqs++;
-                    }
+            }
+            /* M4-6b2/M4-6b3: APIC-mode path -- the DSDT _PRT maps AHCI INTA ->
+             * GSI 16 (HYPE_FW_1_AHCI_GSI), so an ACPI-mode guest programmed
+             * IO-APIC RTE[16] for it (NOT the legacy PCI line). Route through
+             * the IO-APIC on that GSI. Level-triggered: Remote-IRR gates
+             * re-injection until the line deasserts (below). */
+            {
+                uint8_t iov;
+                if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
+                    hype_svm_vcpu_request_interrupt(ctx, iov);
+                    ahci_irqs++;
                 }
             }
+        } else if (ahci_mapped) {
+            /* AHCI IRQ line deasserted (guest serviced it -> PxIS cleared):
+             * drop the IO-APIC Remote-IRR so the next completion re-injects.
+             * Models a level line going low; the guest's LAPIC EOI need not be
+             * decoded (hype's minimal LAPIC doesn't track the ISR vector). */
+            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
         }
         /* M4-6d3: raise the serial TX/RX interrupt (COM1=IRQ4, COM2=IRQ3)
          * when the guest has enabled it (IER.ETBEI/ERBFI). The kernel's

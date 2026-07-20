@@ -174,6 +174,22 @@ static void test_eoi_ignores_nonmatching(void) {
     CHECK_HEX("edge entry unaffected by EOI", 0x00000070u, (uint32_t)io.rte[6]);
 }
 
+static void test_deassert_clears_remote_irr(void) {
+    hype_ioapic_t io;
+    uint8_t vec = 0;
+    hype_ioapic_reset(&io);
+    /* level line, unmasked */
+    reg_write(&io, HYPE_IOAPIC_INDEX_REDIR_BASE + 16u * 2u, 0x80u | HYPE_IOAPIC_RTE_TRIGGER_LEVEL);
+    hype_ioapic_raise(&io, 16u, &vec);
+    CHECK_HEX("remote-IRR set after raise", HYPE_IOAPIC_RTE_REMOTE_IRR,
+              (uint32_t)io.rte[16] & HYPE_IOAPIC_RTE_REMOTE_IRR);
+    hype_ioapic_deassert(&io, 16u);
+    CHECK_HEX("deassert clears remote-IRR", 0, (uint32_t)io.rte[16] & HYPE_IOAPIC_RTE_REMOTE_IRR);
+    CHECK_HEX("re-injects after deassert", 1, hype_ioapic_raise(&io, 16u, &vec));
+    /* out-of-range gsi is a no-op (must not crash / touch memory) */
+    hype_ioapic_deassert(&io, HYPE_IOAPIC_NUM_RTES);
+}
+
 static void test_bad_offset_rejected(void) {
     hype_ioapic_t io;
     uint32_t v = 0;
@@ -198,6 +214,7 @@ int main(void) {
     test_unimplemented_index_reads_zero();
     test_readonly_registers_ignore_writes();
     test_eoi_ignores_nonmatching();
+    test_deassert_clears_remote_irr();
     test_bad_offset_rejected();
 
     if (failures == 0) {
