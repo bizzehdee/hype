@@ -591,6 +591,19 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * unambiguously an idle input-wait, not init. */
 #define HYPE_FW_1_KBD_POLL_INJECT_RUN 512ULL
 
+/* GLADDER-6b: auto keystroke injection (both the 0x64-poll and the HLT-idle
+ * sites below) exists ONLY to drive an EMPTY-OVMF bring-up past the BDS "press
+ * any key to enter the Boot Manager Menu" prompt and the UEFI Shell's "press
+ * any key to continue" countdown (FW-1e/f/g, tasks #67-69). A GLADDER guest
+ * boots a REAL bootable ISO instead: OVMF auto-launches the CD boot option (no
+ * key needed to interrupt into the menu) and hands off to GRUB, whose grub.cfg
+ * carries its own `set timeout=30` and auto-boots the default entry with no
+ * input at all. Injecting a premature Enter there is actively harmful -- it
+ * makes GRUB leave its menu-countdown loop early and stall (observed on Ubuntu
+ * Server: GRUB consumed the Enter, stopped polling input, and never booted).
+ * So default this OFF; flip to 1 only for a media-less OVMF-shell bring-up. */
+#define HYPE_FW_1_AUTO_KEY_INJECT 0
+
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
 static hype_pte_t g_npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
@@ -6252,7 +6265,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * then the shell -- rather than stalling. Re-arms only
                      * after another full poll run (kbd_poll_run reset to
                      * 0), so it never holds OBF perpetually set. */
-                    if (productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
+                    if (HYPE_FW_1_AUTO_KEY_INJECT &&
+                        productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
                         kbd_poll_run >= HYPE_FW_1_KBD_POLL_INJECT_RUN) {
                         if (!key_injected) {
                             hype_debug_print(
@@ -6477,7 +6491,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * and COM2 -- this build's DEBUG log is on COM2, so the
              * interactive Terminal ConIn may be on either; whichever OVMF
              * actually polls consumes it. */
-            if (!key_injected) {
+            if (HYPE_FW_1_AUTO_KEY_INJECT && !key_injected) {
                 hype_debug_print(
                     "fw-1: OVMF idle at its prompt -- injecting Enter via PS/2 + COM1/COM2 (ConIn test)\n");
                 /* PS/2 is OVMF's real ConIn here; serial RX is belt-and-
