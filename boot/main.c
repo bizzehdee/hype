@@ -494,14 +494,20 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
     }
 }
 #define HYPE_PIT_HZ 1193182ULL
-/* M4-6b5: the guest LAPIC timer's base (pre-divide) input frequency, expressed
- * as a multiple of PIT_HZ so it reuses the loop's already-computed real-elapsed
- * PIT-tick count without a second accumulator. PIT_HZ x 100 ~= 119.3 MHz -- a
- * realistic bus-clock LAPIC rate (was, wrongly, PIT_HZ x 1 = 1.19 MHz, ~100x
- * too slow, which made Linux calibrate an implausible frequency and abandon the
- * LAPIC timer for the coarse 100 Hz PIT). hype_guest_lapic_advance then divides
- * this by the guest's Divide Configuration Register. */
-#define HYPE_GUEST_LAPIC_MULT 100ULL
+/* M4-6b2: the guest LAPIC timer's base (pre-divide) input frequency in Hz.
+ * MUST be OVMF's advertised PcdFSBClock = 1,000,000,000 Hz (edk2
+ * OvmfPkgX64.dsc): OVMF's LocalApicTimerDxe programs its periodic Timer Arch
+ * Protocol tick as FSBClock/100 = 10,000,000 counts believing that is 10 ms,
+ * and every gBS timer event / Stall / GRUB menu countdown advances off that
+ * assumption. Running the LAPIC at any other rate makes OVMF's whole notion of
+ * time wrong: at the old PIT_HZ x 100 = 119.3 MHz, a 10,000,000-count "10 ms"
+ * tick took 83.8 ms (8.38x slow), so GRUB's timeout=1 never elapsed and the
+ * guest hung at the menu. Linux (which *measures* the LAPIC rate) adapts to
+ * 1 GHz fine -- it only needs a plausible non-tiny frequency. The FW-1 loop
+ * advances the LAPIC by (real elapsed / this rate) via a fractional accumulator
+ * (was: PIT-tick-count x MULT); hype_guest_lapic_advance divides by the guest's
+ * Divide Configuration Register. */
+#define HYPE_GUEST_LAPIC_HZ 1000000000ULL
 /* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
  * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
  * guest-physical address in the 32-bit PCI MMIO aperture, and enables
@@ -5193,6 +5199,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     /* M4-6b1: drive the guest timebase from real elapsed host TSC. */
     uint64_t tb_last_tsc = hype_rdtsc();
     uint64_t tb_accum = 0; /* fractional-tick carry (units of host TSC * PIT_HZ) */
+    uint64_t lapic_tick_accum = 0; /* M4-6b2: fractional carry converting PIT-rate
+                                    * ticks to the LAPIC's 1 GHz base rate */
     /* M4-6d2b: host TSC of the most recent productive (non-HLT) exit --
      * "last time the guest did real work". The idle detector measures
      * wall-clock since this to decide the guest is quiescent. */
@@ -5718,10 +5726,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 ticks = 1;
             }
             if (ticks != 0) {
-                /* M4-6b5: advance the LAPIC timer at its realistic base rate
-                 * (PIT_HZ x MULT), divided by the guest's DCR inside advance();
-                 * advance the PIT at its own 1.19 MHz rate. */
-                hype_guest_lapic_advance(&g_fw_1_lapic, ticks * HYPE_GUEST_LAPIC_MULT);
+                /* M4-6b2: advance the LAPIC timer at OVMF's advertised 1 GHz FSB
+                 * clock (HYPE_GUEST_LAPIC_HZ), converting the PIT-rate `ticks`
+                 * (at PIT_HZ) with a fractional accumulator so the base rate is
+                 * exactly 1 GHz regardless of loop granularity -- OVMF's timers
+                 * assume this rate (was PIT_HZ x 100 = 119.3 MHz, 8.38x slow ->
+                 * GRUB countdown never elapsed). advance() then divides by the
+                 * guest's DCR. No overflow: `ticks` is bounded by the 300 s delta
+                 * cap (<=~358M), and 358M x 1e9 < 2^64. */
+                {
+                    uint64_t lapic_ticks;
+                    lapic_tick_accum += (uint64_t)ticks * HYPE_GUEST_LAPIC_HZ;
+                    lapic_ticks = lapic_tick_accum / HYPE_PIT_HZ;
+                    lapic_tick_accum -= lapic_ticks * HYPE_PIT_HZ;
+                    hype_guest_lapic_advance(&g_fw_1_lapic, lapic_ticks);
+                }
+                /* advance the PIT at its own 1.19 MHz rate. */
                 /* Channel-0 terminal-count crossings during this advance
                  * are PIT IRQ0 timer edges (M4-6b4). */
                 if (hype_pit_emu_advance(&g_fw_1_pit, ticks) != 0) {
@@ -6682,19 +6702,32 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_svm_intr_state_t iw;
                 hype_svm_vcpu_get_intr_state(ctx, &iw);
                 if (((iw.rflags >> 9) & 1u) != 0) { /* IF=1: a real interrupt-wait */
-                    uint64_t ttn = 0; /* PIT ticks until the nearest armed timer edge */
+                    /* Host-TSC time until the nearest armed timer edge. M4-6b2:
+                     * the PIT counter (PIT_HZ) and the LAPIC current_count
+                     * (HYPE_GUEST_LAPIC_HZ / divisor) are DIFFERENT units, so
+                     * each is converted to TSC in its own rate and the minimum
+                     * TSC wait is taken -- NOT the min of the raw counts (which
+                     * previously, wrongly, ran the LAPIC value through PIT_HZ, so
+                     * a 50us one-shot deadline became a capped 10ms wait). */
+                    uint64_t wait_tsc = 0;
                     perf_hlt_if1++; /* PERF-1a */
                     if (g_fw_1_pit.channels[0].counter != 0u) {
-                        ttn = (uint64_t)g_fw_1_pit.channels[0].counter;
+                        wait_tsc = (uint64_t)g_fw_1_pit.channels[0].counter * g_fw_1_host_tsc_hz /
+                                   HYPE_PIT_HZ;
                     }
                     if (g_fw_1_lapic.init_count != 0u &&
                         (g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED) == 0 &&
                         g_fw_1_lapic.current_count != 0u) {
-                        uint64_t lt = (uint64_t)g_fw_1_lapic.current_count;
-                        if (ttn == 0u || lt < ttn) { ttn = lt; }
+                        uint32_t divisor = hype_guest_lapic_divisor(g_fw_1_lapic.divide_config);
+                        uint64_t cc = (uint64_t)g_fw_1_lapic.current_count;
+                        uint64_t lt_tsc;
+                        /* clamp far-future counts (>~1s) so cc*tsc_hz can't
+                         * overflow u64; they hit the 10ms cap below regardless. */
+                        if (cc > HYPE_GUEST_LAPIC_HZ) { cc = HYPE_GUEST_LAPIC_HZ; }
+                        lt_tsc = cc * g_fw_1_host_tsc_hz / HYPE_GUEST_LAPIC_HZ * (uint64_t)divisor;
+                        if (wait_tsc == 0u || lt_tsc < wait_tsc) { wait_tsc = lt_tsc; }
                     }
-                    if (ttn != 0u) {
-                        uint64_t wait_tsc = ttn * g_fw_1_host_tsc_hz / HYPE_PIT_HZ;
+                    if (wait_tsc != 0u) {
                         uint64_t cap = g_fw_1_host_tsc_hz / 100ULL; /* 10ms */
                         uint64_t start = hype_rdtsc();
                         if (wait_tsc > cap) { wait_tsc = cap; }
