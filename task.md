@@ -4813,3 +4813,22 @@ e.g. check MTRR-access handling (#GP fail-closed?), g_pat contents, and a guest
 memory-bandwidth probe. If UC: emulate MTRRs / fix the type -> potentially the
 biggest single win. This supersedes "deadline timer first" for the STALLS
 (deadline timer remains valid for the 1kHz waste).
+
+PERF-1 ROOT CAUSE FOUND + FIX (2026-07-20): the memory-type probe found it.
+The guest VMCB's save.g_pat was NEVER initialized (grep: vmcb.c never set it) ->
+g_pat=0 = all 8 PAT entries UC. QEMU MEMTYPE confirmed: cr0 CD=0 (not CR0), but
+pat=0x0. Under nested paging the VMCB g_pat IS the guest's PAT, and default
+guest pages use PAT index 0 -> index 0 = 0 = UC -> ALL guest RAM is uncacheable
+until the guest's own pat_init runs. So the memory-heavy early-boot phases
+(kernel decompress, initramfs, memset -- the RIPHOT rep stosq) executed at UC
+speed on real HW = the ~13s IF=0 stalls (UC writes ~10-50x slower; matches the
+~13x early-boot phase and the ~4x overall, and explains why it was invariant to
+exit count -- it is a memory-type bug, not an exit/timer bug).
+FIX (one line each, both VMCB builders): vmcb->save.g_pat =
+0x0007040600070406 (x86 power-on default: WB at index 0). Now normal guest RAM
+is write-back from the first instruction. QEMU cannot show the speedup (its
+memory is not UC-slow); the decisive test is HW boot time + the 13s stalls
+shrinking. This likely supersedes the deadline timer AND virtio as the single
+biggest PERF-1 win. NEXT: HW boot with the fix -- expect the 13s early-boot
+stalls to collapse and overall boot to drop sharply. (Also a candidate root for
+part of the per-VMRUN cost + the guest's slow execution generally.)

@@ -1,5 +1,11 @@
 #include "vmcb.h"
 
+/* x86 architectural power-on/RESET default IA32_PAT: entries (PA0..PA7) =
+ * WB(6), WT(4), UC-(7), UC(0), WB(6), WT(4), UC-(7), UC(0). Byte-packed
+ * high->low (PA7..PA0) = 00 07 04 06 00 07 04 06. Guest default pages use PAT
+ * index 0, which must be WB or all guest RAM is uncacheable under NPT. */
+#define HYPE_SVM_PAT_POWERON_DEFAULT 0x0007040600070406ULL
+
 uint16_t hype_vmcb_seg_attrib(uint8_t access, uint8_t flags) {
     return (uint16_t)access | (uint16_t)((flags & 0x0Fu) << 8);
 }
@@ -94,6 +100,14 @@ void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint
     vmcb->save.cr0 = 0x00000010; /* ET only -- paging and protection off, matches real mode */
     vmcb->save.cr3 = 0;
     vmcb->save.cr4 = 0;
+    /* PERF-1: guest PAT = x86 architectural power-on default. Under nested
+     * paging the VMCB's g_pat IS the guest's PAT. Leaving it 0 made all 8
+     * entries UC, so every default (PAT-index-0) guest page was UNCACHEABLE
+     * until the guest's own pat_init ran -- early-boot memory ops (kernel
+     * decompress, initramfs, memset) executed at UC speed (the ~13s IF=0
+     * stalls). This value puts WB at index 0 (PA0=WB WT UC- UC WB WT UC- UC),
+     * so normal guest RAM is write-back from the first instruction. */
+    vmcb->save.g_pat = HYPE_SVM_PAT_POWERON_DEFAULT;
     /* EFER.SVME (bit 12) must be set in the *guest's* saved EFER or
      * VMRUN itself refuses the VMCB (a state-consistency check,
      * independent of whether the guest itself ever uses SVM) --
@@ -169,6 +183,10 @@ void hype_vmcb_build_long_mode_guest(hype_vmcb_t *vmcb, uint64_t entry_rip, uint
     vmcb->save.cr0 = 0x80000001u; /* PG | PE */
     vmcb->save.cr3 = guest_cr3;
     vmcb->save.cr4 = 0x00000020u; /* PAE */
+    /* PERF-1: guest PAT = x86 power-on default (WB at index 0). See the same
+     * assignment in hype_vmcb_build_realmode_guest for why 0 (all-UC) is wrong
+     * under nested paging. */
+    vmcb->save.g_pat = HYPE_SVM_PAT_POWERON_DEFAULT;
     /* EFER: SVME (VMRUN requires it, see HYPE_SVM_SAVE_EFER_SVME) |
      * LME (bit 8) | LMA (bit 10) -- VMRUN loads guest state directly
      * rather than running the real activation sequence, so LMA (which
