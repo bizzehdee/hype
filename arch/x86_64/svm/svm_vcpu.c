@@ -1833,6 +1833,39 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
     return 0;
 }
 
+/* GLADDER-1: absorb an MMIO NPF to an UNMODELED guest-physical region. Real
+ * hardware returns all-ones for reads of absent MMIO and drops writes; hype
+ * previously PANICked on any unhandled NPF, so a fuller kernel probing a chipset
+ * region hype doesn't model (e.g. ICH9 RCBA 0xFED1Cxxx) killed the whole guest
+ * and we saw only the FIRST missing region. This mirrors the device handlers'
+ * decode/writeback/RIP-advance, but a read yields all-ones and a write is
+ * dropped. Returns 0 if it decoded + absorbed, -1 if the faulting instruction
+ * couldn't be decoded (the caller must NOT blindly advance RIP in that case).
+ * Callers must try every real device handler FIRST -- this is the fallback only
+ * for genuinely-unmapped regions. */
+int hype_svm_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_mmio_decode_t decoded;
+
+    if (guest_insn_bytes == 0 ||
+        hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (!decoded.is_write) {
+        uint64_t *reg = gpr_ptr(real, decoded.reg);
+        uint32_t allones;
+        if (reg == 0) {
+            return -1;
+        }
+        allones = (decoded.size_bytes >= 4u) ? 0xFFFFFFFFu
+                  : (decoded.size_bytes == 2u) ? 0xFFFFu : 0xFFu;
+        *reg = hype_mmio_merge_read_value(*reg, allones, decoded.size_bytes, decoded.zero_extend);
+    }
+    /* writes to absent MMIO are dropped */
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                     uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;

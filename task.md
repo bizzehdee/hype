@@ -4945,3 +4945,23 @@ SCOPED TASKS:
 THEN: heavy distro (Fedora/Ubuntu) as the next rung.
 NOTE: HYPE_RUN_TWO_VMS is temporarily 0 in the tree for this bring-up; =1 (two-VM)
 remains the milestone default -- restore once -standard boots.
+
+GLADDER-1 DONE + alpine-standard BOOTS (2026-07-20, QEMU): absorb+log unhandled
+MMIO NPF (new hype_svm_vcpu_absorb_mmio_npf: decode -> read=all-ones,
+write=dropped, advance RIP; undecodable stays a distinct fatal). RESULT: the
+alpine-standard LTS kernel (6.12.81-0-lts) boots to "localhost login" single-VM
+on QEMU. Only ONE unhandled MMIO region was ever hit -- 0xfed1f410 (ICH9 RCBA)
+-- and absorbing it (all-ones read) SUFFICED: the kernel read "feature absent"
+and moved on. Zero panics/giveups. So:
+  - GLADDER-2 (scope MMIO regions): effectively SATISFIED -- the single region
+    (RCBA) needs no device model; absorb-all-ones is correct + enough. Revisit
+    only if HW surfaces a region where a real model is needed.
+  - GLADDER-3 (GRUB drive-through): WORKS -- kernel booted past GRUB 2.12.
+  - New absorbed ports (all fine): 0x2e9/0x3e9 (COM3/4), 0x604, 0x87, 0x92,
+    0xcfb, 0x80. New MSRs stubbed (perf/MCE/microcode/HWCR) fine.
+GLADDER-1 is also arguably a CORRECTNESS fix (a hypervisor should not crash on
+a guest MMIO to absent hardware -- real silicon returns all-ones). HW-VALIDATION
+OWED (QEMU decode-assist path differs from real AMD; confirm the RCBA absorb +
+login on silicon). NEXT: GLADDER-4 -- flip HYPE_RUN_TWO_VMS=1, confirm TWO
+alpine-standard on two cores (bigger rootfs -> may need >1GB/guest), take the
+clean same-kernel perf baseline vs the 90s native-standard, then Fedora/Ubuntu.

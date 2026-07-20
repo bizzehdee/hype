@@ -6153,8 +6153,45 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
             hype_svm_vcpu_get_last_npf(ctx, &npf);
-            hype_fatal("fw-1: unhandled NPF at guest-physical 0x%llx (%s, guest_rip=0x%llx, "
-                       "decode_assist_bytes=%u insn[0..2]=%x %x %x)",
+            /* GLADDER-1: the NPF hit no modeled device. Instead of PANICking
+             * (which killed the guest at the FIRST unmodeled region and hid the
+             * rest), ABSORB it like real hardware does for absent MMIO: reads
+             * return all-ones, writes are dropped, RIP advances. This lets a
+             * fuller kernel (alpine-standard) probe chipset regions hype doesn't
+             * model (e.g. ICH9 RCBA) and move on -- and lets ONE run enumerate
+             * every such region. Each distinct 4KB region is logged ONCE (like
+             * the unhandled-port latch) so discovery works without a flood. */
+            if (hype_svm_vcpu_absorb_mmio_npf(ctx, insn) == 0) {
+                static uint64_t seen_mmio[128];
+                static unsigned seen_mmio_n = 0;
+                uint64_t page = npf.guest_phys_addr & ~0xFFFULL;
+                unsigned k;
+                int already = 0;
+                for (k = 0; k < seen_mmio_n; k++) {
+                    if (seen_mmio[k] == page) {
+                        already = 1;
+                        break;
+                    }
+                }
+                if (!already) {
+                    hype_debug_print("fw-1: unhandled MMIO 0x%llx %s -- absorbing (read=all-ones, "
+                                      "write=dropped; region silenced) rip=0x%llx\n",
+                                      (unsigned long long)npf.guest_phys_addr,
+                                      npf.is_write ? "write" : "read",
+                                      (unsigned long long)info.guest_rip);
+                    if (seen_mmio_n < 128u) {
+                        seen_mmio[seen_mmio_n++] = page;
+                    }
+                }
+                continue;
+            }
+            /* Could not DECODE the faulting instruction, so we can't safely
+             * advance RIP to absorb it -- this stays fatal (rare: an MMIO
+             * instruction form the decoder doesn't support, or insn bytes
+             * unavailable). Distinct message so it's not confused with an
+             * unmodeled-but-absorbed region. */
+            hype_fatal("fw-1: undecodable MMIO NPF at guest-physical 0x%llx (%s, guest_rip=0x%llx, "
+                       "decode_assist_bytes=%u insn[0..2]=%x %x %x) -- cannot absorb",
                        (unsigned long long)npf.guest_phys_addr, npf.is_write ? "write" : "read",
                        (unsigned long long)info.guest_rip, (unsigned int)insn_n,
                        insn_n > 0 ? insn[0] : 0, insn_n > 1 ? insn[1] : 0, insn_n > 2 ? insn[2] : 0);

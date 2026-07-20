@@ -247,6 +247,12 @@ void hype_svm_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *ou
  * (no RIP/RAX change) -- for per-port histogram instrumentation. */
 void hype_svm_vcpu_peek_ioio(hype_vcpu_ctx_t *ctx, hype_svm_ioio_t *out);
 
+/* GLADDER-1: absorb an MMIO NPF to an unmodeled region (read -> all-ones,
+ * write -> dropped, RIP advanced). Returns 0 if decoded+absorbed, -1 if the
+ * instruction couldn't be decoded (caller must not advance RIP). Fallback only,
+ * AFTER every real device handler has declined the address. */
+int hype_svm_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_insn_bytes);
+
 /*
  * FW-1: routes an IOIO VM-exit to `pci`'s legacy CF8/CFC config-space
  * ports (devices/pci.h's hype_pci_cf8_write()/_read()/
