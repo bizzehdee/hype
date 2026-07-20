@@ -274,6 +274,34 @@ static void test_advance_masked_or_disarmed_never_fires(void) {
     CHECK_HEX("disarmed timer never fires under advance", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
 }
 
+/* Real hardware: a MASKED but armed timer's count register STILL decrements
+ * (and a periodic one still reloads) -- the mask only suppresses the IRQ. Linux
+ * calibrates the LAPIC timer this way (mask the LVT, read current_count to
+ * measure the rate), so the counter must move or an ACPI-mode guest hangs. */
+static void test_advance_masked_timer_still_counts(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4,
+                           32u | HYPE_GUEST_LAPIC_LVT_MASKED); /* masked, one-shot */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_DIVIDE_CONFIG, 4, 0xBu); /* divide-by-1 */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 1000u);
+
+    hype_guest_lapic_advance(&l, 400);
+    CHECK_HEX("masked timer's counter still decrements", 600, l.current_count);
+    CHECK_HEX("but raises no IRQ while masked", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
+
+    /* A masked PERIODIC timer still reloads on expiry (counter keeps moving). */
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4,
+                           32u | HYPE_GUEST_LAPIC_LVT_MASKED | HYPE_GUEST_LAPIC_LVT_PERIODIC);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_DIVIDE_CONFIG, 4, 0xBu);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 500u);
+    hype_guest_lapic_advance(&l, 700); /* crosses terminal: 500 -> reload, 200 over */
+    CHECK_HEX("masked periodic still reloads", 300, l.current_count);
+    CHECK_HEX("masked periodic raises no IRQ", 0, hype_guest_lapic_take_timer_irq(&l, &vec));
+}
+
 /* M4-6b5: the Divide Configuration Register decode (SDM bits [3,1,0]). */
 static void test_divisor_decode(void) {
     CHECK_HEX("DCR 0x0 -> div 2", 2u, hype_guest_lapic_divisor(0x0u));
@@ -333,6 +361,7 @@ int main(void) {
     test_advance_one_shot_rearm_refires();
     test_advance_one_shot_fires_once();
     test_advance_masked_or_disarmed_never_fires();
+    test_advance_masked_timer_still_counts();
 
     if (failures == 0) {
         printf("all tests passed\n");
