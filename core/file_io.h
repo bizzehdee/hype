@@ -63,6 +63,11 @@ EFI_STATUS hype_file_get_size(EFI_FILE_PROTOCOL *root, EFI_BOOT_SERVICES *bs, CH
  */
 EFI_STATUS hype_file_read_into(EFI_FILE_PROTOCOL *root, CHAR16 *path, void *buffer, UINTN buffer_size);
 
+/* GLADDER-10(a): read `len` bytes at file byte `offset` into `buffer` (one
+ * chunk of a multi-GB ISO loaded into non-contiguous buffers). */
+EFI_STATUS hype_file_read_range(EFI_FILE_PROTOCOL *root, CHAR16 *path, UINT64 offset, void *buffer,
+                                UINTN len);
+
 /*
  * Writes `size` bytes of `buffer` to `path` (relative to `root`),
  * replacing any existing file (a stale longer copy is Delete()d first so

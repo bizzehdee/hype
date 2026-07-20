@@ -2,6 +2,7 @@
 #define HYPE_DEVICES_ATAPI_H
 
 #include <stdint.h>
+#include "../core/chunked_iso.h"
 
 /*
  * ATAPI/SCSI command layer for the virtual optical drive (M4-5). An
@@ -60,8 +61,13 @@
 #define HYPE_ATAPI_MAX_SYNTH_RESPONSE 36
 
 typedef struct {
-    const uint8_t *media_data; /* caller-owned backing ISO image */
-    uint32_t media_size;       /* bytes; must be a multiple of HYPE_ATAPI_SECTOR_SIZE */
+    const uint8_t *media_data; /* caller-owned backing ISO image (flat); NULL if chunked */
+    /* GLADDER-10(a): alternative CHUNKED backing for multi-GB ISOs that can't
+     * be one contiguous allocation. Exactly one of media_data / media_chunks is
+     * non-NULL. READ(10) still reports a logical byte offset (media_offset); the
+     * caller copies from whichever backing is set (see svm_vcpu.c AHCI glue). */
+    const hype_chunked_iso_t *media_chunks;
+    uint32_t media_size;       /* logical bytes; must be a multiple of HYPE_ATAPI_SECTOR_SIZE */
     /* Sense state left behind by the most recently failed command, for
      * a driver that follows a CHECK CONDITION status with REQUEST
      * SENSE -- cleared to NO_SENSE by a subsequent successful command,
@@ -102,6 +108,11 @@ typedef struct {
 /* Resets sense state to NO_SENSE and binds the backing media. Call on
  * every (re)start, same convention as every other device model here. */
 void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint32_t media_size);
+
+/* GLADDER-10(a): reset with a CHUNKED backing (multi-GB ISO split across
+ * non-contiguous buffers). media_size is taken from iso->total_bytes; the flat
+ * media_data pointer is cleared. */
+void hype_atapi_reset_chunked(hype_atapi_t *dev, const hype_chunked_iso_t *iso);
 
 /*
  * Executes a 16-byte CDB (shorter real CDBs, e.g. TEST UNIT READY's 6

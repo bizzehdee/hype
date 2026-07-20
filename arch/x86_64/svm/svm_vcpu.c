@@ -1202,6 +1202,11 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     hype_atapi_result_t result;
     uint8_t identify[HYPE_ATAPI_IDENTIFY_SIZE];
     const uint8_t *src;
+    /* Default 0: the ATA paths (IDENTIFY PACKET / SET FEATURES) and the synth
+     * ATAPI responses copy from a flat `src`; only a media-data ATAPI read on a
+     * chunked backing sets this to 1 (below). Must be initialised or those paths
+     * would take the chunked copy with a stale media_offset -> spurious failure. */
+    int chunked_media = 0;
     uint32_t remaining;
     uint32_t transferred;
     uint32_t prd_idx;
@@ -1302,7 +1307,14 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                 (unsigned int)(result.uses_media_data ? result.media_length : result.synth_length));
         }
 
-        src = result.uses_media_data ? (atapi->media_data + result.media_offset) : result.synth_data;
+        /* GLADDER-10(a): media may be backed by a CHUNKED (non-contiguous) ISO
+         * rather than a flat buffer. For flat media/synth, `src` is a plain
+         * pointer advanced per PRD; for chunked media, `src` is unused and each
+         * PRD reads from the chunk list at logical offset media_offset+transferred. */
+        chunked_media = result.uses_media_data && atapi->media_chunks != 0;
+        src = result.uses_media_data
+                  ? (chunked_media ? 0 : (atapi->media_data + result.media_offset))
+                  : result.synth_data;
         remaining = result.uses_media_data ? result.media_length : result.synth_length;
         /* ATA STATUS register: DRDY|DSC always, +ERR on CHECK_CONDITION.
          * ATAPI convention: a failed PACKET command's ERROR register
@@ -1334,10 +1346,17 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
         if (dst == 0) {
             return -1;
         }
-        for (j = 0; j < chunk; j++) {
-            dst[j] = src[j];
+        if (chunked_media) {
+            if (hype_chunked_iso_read(atapi->media_chunks, result.media_offset + transferred, dst,
+                                      chunk) != 0) {
+                return -1;
+            }
+        } else {
+            for (j = 0; j < chunk; j++) {
+                dst[j] = src[j];
+            }
+            src += chunk;
         }
-        src += chunk;
         remaining -= chunk;
         transferred += chunk;
         prd_idx++;

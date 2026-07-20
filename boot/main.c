@@ -271,9 +271,15 @@ static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
 #define g_fw_1_vmrun_max_tsc (vm->vmrun_max_tsc)
 #define g_fw_1_vmrun_over100ms (vm->vmrun_over100ms)
 
-/* ISO-1's loaded test.iso buffer -- shared: both VMs boot the same media. */
+/* ISO-1's loaded test.iso buffer -- shared: both VMs boot the same media.
+ * GLADDER-10(a): the real backing is g_iso_chunked (non-contiguous chunks, for
+ * multi-GB ISOs). g_iso_host_phys/g_iso_size are kept as flat aliases pointing
+ * at chunk 0 for the small-ISO consumers that read the buffer directly (the
+ * ISO-2 self-test and the load-time CD001 check) -- those only touch the first
+ * 256MB, which is chunk 0. FW-1's ATAPI uses the chunked backing directly. */
 static uint64_t g_iso_host_phys;
 static uint64_t g_iso_size;
+static hype_chunked_iso_t g_iso_chunked;
 /* Host usable-RAM total (UEFI memory map), reported by the guest CMOS model. */
 static uint64_t g_usable_ram_bytes;
 
@@ -4875,7 +4881,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * (hype_pci_get_interrupt_line), master or slave. */
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
     hype_ahci_reset(&g_fw_1_ahci);
-    hype_atapi_reset(&g_fw_1_atapi, (uint8_t *)(uintptr_t)g_iso_host_phys, (uint32_t)g_iso_size);
+    hype_atapi_reset_chunked(&g_fw_1_atapi, &g_iso_chunked); /* GLADDER-10(a): chunked backing */
     /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging
      * the CD-ROM discovery sequence -- hype_svm_set_ahci_trace(1) -- but
      * left off here: a real boot issues thousands of commands and each
@@ -7255,7 +7261,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             EFI_STATUS iso_status;
             UINT64 iso_size;
             uint64_t iso_host_phys;
-            UINTN iso_pages;
             const uint8_t *iso_bytes;
 
             iso_status = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
@@ -7274,15 +7279,45 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                            (unsigned long long)iso_size);
             }
 
-            iso_pages = (UINTN)((iso_size + 4095ULL) / 4096ULL);
-            iso_host_phys = hype_alloc_pages_any(SystemTable->BootServices, iso_pages);
-
-            iso_status =
-                hype_file_read_into(root, (CHAR16 *)L"\\iso\\test.iso", (void *)(uintptr_t)iso_host_phys,
-                                     iso_size);
-            if (iso_status != EFI_SUCCESS) {
-                hype_fatal("iso-1: hype_file_read_into(test.iso) failed: 0x%llx",
-                           (unsigned long long)iso_status);
+            /* GLADDER-10(a): load the ISO into fixed 256MB non-contiguous
+             * CHUNKS (one AllocatePages + range-read each) instead of a single
+             * contiguous allocation, which OUT_OF_RESOURCES's for a multi-GB
+             * server ISO (no contiguous region that large). The ATAPI model
+             * reads across chunks via g_iso_chunked. */
+            {
+                uint64_t chunk_bytes = 256ULL * 1024ULL * 1024ULL;
+                uint64_t n_chunks = (iso_size + chunk_bytes - 1ULL) / chunk_bytes;
+                uint64_t ci;
+                if (n_chunks > HYPE_ISO_MAX_CHUNKS) {
+                    hype_fatal("iso-1: ISO too big -- %llu bytes -> %llu chunks (max %u); raise "
+                               "HYPE_ISO_MAX_CHUNKS or the chunk size",
+                               (unsigned long long)iso_size, (unsigned long long)n_chunks,
+                               (unsigned int)HYPE_ISO_MAX_CHUNKS);
+                }
+                for (ci = 0; ci < n_chunks; ci++) {
+                    uint64_t this_len = iso_size - ci * chunk_bytes;
+                    UINTN this_pages;
+                    uint64_t base;
+                    EFI_STATUS rr;
+                    if (this_len > chunk_bytes) {
+                        this_len = chunk_bytes;
+                    }
+                    this_pages = (UINTN)((this_len + 4095ULL) / 4096ULL);
+                    base = hype_alloc_pages_any(SystemTable->BootServices, this_pages);
+                    rr = hype_file_read_range(root, (CHAR16 *)L"\\iso\\test.iso", ci * chunk_bytes,
+                                              (void *)(uintptr_t)base, (UINTN)this_len);
+                    if (rr != EFI_SUCCESS) {
+                        hype_fatal("iso-1: read chunk %llu (off 0x%llx len 0x%llx) failed: 0x%llx",
+                                   (unsigned long long)ci, (unsigned long long)(ci * chunk_bytes),
+                                   (unsigned long long)this_len, (unsigned long long)rr);
+                    }
+                    g_iso_chunked.chunk_base[ci] = base;
+                }
+                g_iso_chunked.chunk_bytes = chunk_bytes;
+                g_iso_chunked.total_bytes = iso_size;
+                g_iso_chunked.n_chunks = (unsigned)n_chunks;
+                /* flat aliases: chunk 0 (first 256MB) for the direct-read consumers */
+                iso_host_phys = g_iso_chunked.chunk_base[0];
             }
 
             iso_bytes = (const uint8_t *)(uintptr_t)iso_host_phys;

@@ -20,7 +20,7 @@ static void handle_test_unit_ready(hype_atapi_t *dev, hype_atapi_result_t *out) 
     out->uses_media_data = 0;
     out->synth_length = 0;
 
-    if (dev->media_data == 0 || dev->media_size == 0) {
+    if ((dev->media_data == 0 && dev->media_chunks == 0) || dev->media_size == 0) {
         set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
         return;
     }
@@ -64,7 +64,7 @@ static void handle_read_capacity(hype_atapi_t *dev, hype_atapi_result_t *out) {
     zero_synth(out);
     out->uses_media_data = 0;
 
-    if (dev->media_data == 0 || dev->media_size == 0) {
+    if ((dev->media_data == 0 && dev->media_chunks == 0) || dev->media_size == 0) {
         set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
         return;
     }
@@ -94,7 +94,7 @@ static void handle_read10(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_MA
     zero_synth(out);
     out->synth_length = 0;
 
-    if (dev->media_data == 0 || dev->media_size == 0) {
+    if ((dev->media_data == 0 && dev->media_chunks == 0) || dev->media_size == 0) {
         set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
         return;
     }
@@ -180,7 +180,22 @@ void hype_atapi_build_identify(const hype_atapi_t *dev, uint8_t out[HYPE_ATAPI_I
 
 void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint32_t media_size) {
     dev->media_data = media_data;
+    dev->media_chunks = 0;
     dev->media_size = media_size;
+    dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
+    dev->asc = 0;
+    dev->command_count = 0;
+    dev->read10_count = 0;
+    dev->last_cdb = 0;
+}
+
+void hype_atapi_reset_chunked(hype_atapi_t *dev, const hype_chunked_iso_t *iso) {
+    dev->media_data = 0;
+    dev->media_chunks = iso;
+    /* media_size is a uint32; a >4GB ISO would truncate here. Both current
+     * server ISOs are < 4GB (Fedora 3.64GB, Ubuntu 2.72GB) so this is fine,
+     * but a >=4GB ISO needs media_size widened (tracked with GLADDER-10). */
+    dev->media_size = (uint32_t)(iso ? iso->total_bytes : 0);
     dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
     dev->asc = 0;
     dev->command_count = 0;

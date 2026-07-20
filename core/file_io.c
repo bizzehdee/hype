@@ -83,6 +83,40 @@ EFI_STATUS hype_file_read_into(EFI_FILE_PROTOCOL *root, CHAR16 *path, void *buff
     return EFI_SUCCESS;
 }
 
+/* GLADDER-10(a): read `len` bytes starting at file byte `offset` into `buffer`.
+ * Used to load a multi-GB ISO into several non-contiguous chunk buffers (one
+ * range read per chunk) rather than one giant contiguous allocation. Opens,
+ * SetPosition(offset), Read, Close each call -- fine for a handful of chunks.
+ * (SetPosition is a void* placeholder in EFI_FILE_PROTOCOL; cast to its UEFI
+ * signature EFI_FILE_SET_POSITION(This, Position).) */
+EFI_STATUS hype_file_read_range(EFI_FILE_PROTOCOL *root, CHAR16 *path, UINT64 offset, void *buffer,
+                                UINTN len) {
+    EFI_FILE_PROTOCOL *file = 0;
+    EFI_STATUS status;
+    UINTN read_size = len;
+    EFI_STATUS(EFIAPI * set_position)(EFI_FILE_PROTOCOL *, UINT64);
+
+    status = root->Open(root, &file, path, EFI_FILE_MODE_READ, 0);
+    if (status != EFI_SUCCESS) {
+        return status;
+    }
+    set_position = (EFI_STATUS(EFIAPI *)(EFI_FILE_PROTOCOL *, UINT64))file->SetPosition;
+    status = set_position(file, offset);
+    if (status != EFI_SUCCESS) {
+        file->Close(file);
+        return status;
+    }
+    status = file->Read(file, &read_size, buffer);
+    file->Close(file);
+    if (status != EFI_SUCCESS) {
+        return status;
+    }
+    if (read_size != len) {
+        return EFI_ABORTED;
+    }
+    return EFI_SUCCESS;
+}
+
 EFI_STATUS hype_file_write_new(EFI_FILE_PROTOCOL *root, CHAR16 *path, const void *buffer, UINTN size) {
     EFI_FILE_PROTOCOL *file = 0;
     EFI_STATUS status;
