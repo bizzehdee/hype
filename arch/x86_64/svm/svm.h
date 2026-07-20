@@ -665,13 +665,19 @@ int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t p
  * versa) -- the caller's job to treat as fatal, matching this
  * project's other IOIO/NPF handlers' fail-closed convention. Advances
  * the guest's RIP to EXITINFO2 on success, same "next-RIP-for-free"
- * convenience as hype_svm_vcpu_handle_ioio(). Exempt from unit testing
- * -- reaches into the exempt VMCB fields this backend's real VMRUN
- * produces and does its own raw guest-memory access; every
- * hype_fw_cfg_*() call this dispatches to is already fully tested in
- * isolation.
+ * convenience as hype_svm_vcpu_handle_ioio(). Handles the classic
+ * select/data ports (0x510/0x511), the DMA ports (0x514/0x518), and
+ * SVM-STRIO string-IN (`rep insb/insw/insd`) on the data port -- the form
+ * OVMF's QemuFwCfgLib actually uses. `dma_map` translates + bounds-checks
+ * the guest-physical addresses the guest hands the DMA and string paths
+ * (NULL = trusted identity-mapped test guest; see guest_dma_xlate). Exempt
+ * from unit testing -- reaches into the exempt VMCB fields this backend's
+ * real VMRUN produces and does its own guest-memory access; the pure
+ * pieces it dispatches to (hype_fw_cfg_*(), hype_svm_build_string_io_plan())
+ * are each fully tested in isolation.
  */
-int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw);
+int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
+                                     const hype_gpa_map_t *dma_map);
 
 /*
  * Handles an NPF (M4-5) VM-exit against `ahci`, a single-port AHCI HBA

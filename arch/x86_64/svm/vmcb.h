@@ -313,8 +313,11 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  */
 #define HYPE_SVM_INTERRUPT_SHADOW_ACTIVE (1ULL << 0)
 
-/* Standard x86 RFLAGS.IF -- architectural, not AMD-SVM-specific. */
+/* Standard x86 RFLAGS.IF/DF -- architectural, not AMD-SVM-specific. DF (bit 10)
+ * selects the direction (0 = ascending addresses, 1 = descending) for string
+ * ops, including the INS/OUTS this project emulates on IOIO intercepts. */
 #define HYPE_RFLAGS_IF (1ULL << 9)
+#define HYPE_RFLAGS_DF (1ULL << 10)
 
 /* avic_apic_bar/avic_backing_page_ptr/avic_logical_table_ptr/
  * avic_physical_table_ptr all hold a page-aligned physical address in
@@ -373,23 +376,66 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  * IN/OUT), the same "next-RIP-for-free" convenience this project
  * already relies on for HLT.
  */
+/* EXITINFO1 bit layout, AMD APM vol.2 (research/24593_3.44_APM_Vol2.pdf)
+ * §15.10.2 table 15-8: bit0 TYPE(1=IN), bit2 STR(string INS/OUTS), bit3 REP
+ * (rep-prefixed), bits6:4 operand size (SZ8/16/32), bits9:7 address size
+ * (A16/A32/A64), bits31:16 port. */
 #define HYPE_SVM_IOIO_INFO1_TYPE_IN (1ULL << 0)
+#define HYPE_SVM_IOIO_INFO1_STR (1ULL << 2)
+#define HYPE_SVM_IOIO_INFO1_REP (1ULL << 3)
 #define HYPE_SVM_IOIO_INFO1_SIZE8 (1ULL << 4)
 #define HYPE_SVM_IOIO_INFO1_SIZE16 (1ULL << 5)
 #define HYPE_SVM_IOIO_INFO1_SIZE32 (1ULL << 6)
+#define HYPE_SVM_IOIO_INFO1_ADDR16 (1ULL << 7)
+#define HYPE_SVM_IOIO_INFO1_ADDR32 (1ULL << 8)
+#define HYPE_SVM_IOIO_INFO1_ADDR64 (1ULL << 9)
 #define HYPE_SVM_IOIO_INFO1_PORT_SHIFT 16
 
 typedef struct {
     int is_in;
     uint16_t port;
-    uint8_t size_bytes; /* 1, 2, or 4 */
+    uint8_t size_bytes;      /* operand size: 1, 2, or 4 */
+    int is_string;           /* STR: INS/OUTS (data moves to/from memory, not a GPR) */
+    int is_rep;              /* REP-prefixed (transfer (E)CX units, else exactly 1) */
+    uint8_t addr_size_bytes; /* address size: 2, 4, or 8 (indexes/masks (E/R)SI/(E/R)DI/(E/R)CX) */
 } hype_svm_ioio_t;
 
 /*
  * Decodes an IOIO intercept's EXITINFO1 value into direction/port/
- * operand size. Pure bit extraction, no CPU state touched.
+ * operand size and the string/rep/address-size fields. Pure bit
+ * extraction, no CPU state touched.
  */
 void hype_svm_decode_ioio_info1(uint64_t exitinfo1, hype_svm_ioio_t *out);
+
+/*
+ * SVM-STRIO: the fully-resolved plan for emulating one string I/O
+ * (INS/OUTS) intercept -- computed purely from the decoded op, the
+ * relevant index register ((E/R)DI for INS, (E/R)SI for OUTS), the
+ * count register ((E/R)CX), the segment base (0 in 64-bit mode), and
+ * RFLAGS. The caller then does the actual per-unit port access + the
+ * single bounds-checked guest-memory translation of [low_gpa, byte_count).
+ */
+typedef struct {
+    uint64_t count;         /* number of units to transfer (>=1) */
+    uint8_t unit_bytes;     /* bytes per unit (== operand size) */
+    uint64_t byte_count;    /* count * unit_bytes */
+    uint64_t start_gpa;     /* guest-linear addr of the FIRST unit (seg base + index) */
+    uint64_t low_gpa;       /* lowest guest-linear addr the transfer touches */
+    int descending;         /* RFLAGS.DF set: addresses walk downward */
+    uint64_t new_index_reg; /* index register value after the whole transfer */
+    uint64_t new_count_reg; /* count register value after (0 if rep, unchanged otherwise) */
+} hype_svm_string_io_plan_t;
+
+/*
+ * SVM-STRIO: build the transfer plan for a string I/O op. `index_reg`
+ * is (E/R)DI for INS or (E/R)SI for OUTS; `count_reg` is (E/R)CX;
+ * `seg_base` is the relevant segment base; `rflags` supplies DF.
+ * Values are masked/updated per `io->addr_size_bytes`. Returns 0 on
+ * success, -1 if `io` is not a string op or the transfer would overflow
+ * a 64-bit address range. Pure arithmetic -- no memory or I/O touched.
+ */
+int hype_svm_build_string_io_plan(const hype_svm_ioio_t *io, uint64_t index_reg, uint64_t count_reg,
+                                   uint64_t seg_base, uint64_t rflags, hype_svm_string_io_plan_t *out);
 
 /*
  * NPF (#VMEXIT_NPF, M4-3) EXITINFO1 mirrors the standard x86 #PF

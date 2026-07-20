@@ -228,6 +228,180 @@ static void test_decode_ioio_info1_32bit(void) {
     CHECK_HEX("decoded size", 4, io.size_bytes);
 }
 
+static void test_decode_ioio_info1_non_string_defaults(void) {
+    hype_svm_ioio_t io;
+    /* A plain register IN (no STR/REP) still decodes with string flags clear. */
+    uint64_t exitinfo1 = ((uint64_t)0x21u << HYPE_SVM_IOIO_INFO1_PORT_SHIFT) | HYPE_SVM_IOIO_INFO1_SIZE8 |
+                          HYPE_SVM_IOIO_INFO1_TYPE_IN;
+
+    hype_svm_decode_ioio_info1(exitinfo1, &io);
+
+    CHECK_HEX("not string", 0, io.is_string);
+    CHECK_HEX("not rep", 0, io.is_rep);
+    CHECK_HEX("addr size defaults to 4", 4, io.addr_size_bytes);
+}
+
+static void test_decode_ioio_info1_rep_insb_a64(void) {
+    hype_svm_ioio_t io;
+    /* `rep insb` on port 0x511, 64-bit address size: the fw_cfg-probe case. */
+    uint64_t exitinfo1 = ((uint64_t)0x511u << HYPE_SVM_IOIO_INFO1_PORT_SHIFT) | HYPE_SVM_IOIO_INFO1_TYPE_IN |
+                          HYPE_SVM_IOIO_INFO1_STR | HYPE_SVM_IOIO_INFO1_REP | HYPE_SVM_IOIO_INFO1_SIZE8 |
+                          HYPE_SVM_IOIO_INFO1_ADDR64;
+
+    hype_svm_decode_ioio_info1(exitinfo1, &io);
+
+    CHECK_HEX("in", 1, io.is_in);
+    CHECK_HEX("port", 0x511, io.port);
+    CHECK_HEX("unit 1 byte", 1, io.size_bytes);
+    CHECK_HEX("string", 1, io.is_string);
+    CHECK_HEX("rep", 1, io.is_rep);
+    CHECK_HEX("addr size 8", 8, io.addr_size_bytes);
+}
+
+static void test_decode_ioio_info1_addr16(void) {
+    hype_svm_ioio_t io;
+    hype_svm_decode_ioio_info1(HYPE_SVM_IOIO_INFO1_ADDR16 | HYPE_SVM_IOIO_INFO1_SIZE8, &io);
+    CHECK_HEX("addr size 2", 2, io.addr_size_bytes);
+}
+
+/* --- SVM-STRIO: hype_svm_build_string_io_plan --- */
+
+static void test_string_plan_non_string_rejected(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    io.is_string = 0;
+    CHECK_HEX("non-string -> -1", (uint64_t)-1, (uint64_t)hype_svm_build_string_io_plan(&io, 0, 0, 0, 0, &plan));
+}
+
+static void test_string_plan_rep_insb_ascending(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    int rc;
+    io.is_in = 1;
+    io.is_string = 1;
+    io.is_rep = 1;
+    io.size_bytes = 1;
+    io.addr_size_bytes = 8;
+    /* rep insb, RDI=0x8000, RCX=4, DF=0. */
+    rc = hype_svm_build_string_io_plan(&io, 0x8000, 4, 0, 0, &plan);
+    CHECK_HEX("rc", 0, rc);
+    CHECK_HEX("count", 4, plan.count);
+    CHECK_HEX("unit", 1, plan.unit_bytes);
+    CHECK_HEX("byte_count", 4, plan.byte_count);
+    CHECK_HEX("start", 0x8000, plan.start_gpa);
+    CHECK_HEX("low", 0x8000, plan.low_gpa);
+    CHECK_HEX("ascending", 0, plan.descending);
+    CHECK_HEX("new RDI", 0x8004, plan.new_index_reg);
+    CHECK_HEX("new RCX", 0, plan.new_count_reg);
+}
+
+static void test_string_plan_no_rep_single_unit(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    io.is_string = 1;
+    io.is_rep = 0; /* a plain INS transfers exactly one unit; RCX untouched */
+    io.size_bytes = 2;
+    io.addr_size_bytes = 8;
+    hype_svm_build_string_io_plan(&io, 0x1000, 0xDEAD, 0, 0, &plan);
+    CHECK_HEX("count 1", 1, plan.count);
+    CHECK_HEX("byte_count 2", 2, plan.byte_count);
+    CHECK_HEX("new index +2", 0x1002, plan.new_index_reg);
+    CHECK_HEX("RCX preserved", 0xDEAD, plan.new_count_reg);
+}
+
+static void test_string_plan_descending(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    io.is_string = 1;
+    io.is_rep = 1;
+    io.size_bytes = 4;
+    io.addr_size_bytes = 8;
+    /* DF=1, RDI=0x9000, RCX=3, unit 4: units at 0x9000,0x8FFC,0x8FF8. */
+    hype_svm_build_string_io_plan(&io, 0x9000, 3, 0, HYPE_RFLAGS_DF, &plan);
+    CHECK_HEX("descending", 1, plan.descending);
+    CHECK_HEX("count", 3, plan.count);
+    CHECK_HEX("byte_count", 12, plan.byte_count);
+    CHECK_HEX("start", 0x9000, plan.start_gpa);
+    CHECK_HEX("low = last unit", 0x8FF8, plan.low_gpa);
+    CHECK_HEX("new index 0x9000-12", 0x8FF4, plan.new_index_reg);
+}
+
+static void test_string_plan_rep_zero_count_noop(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    io.is_string = 1;
+    io.is_rep = 1;
+    io.size_bytes = 1;
+    io.addr_size_bytes = 8;
+    hype_svm_build_string_io_plan(&io, 0x2000, 0, 0, 0, &plan);
+    CHECK_HEX("count 0", 0, plan.count);
+    CHECK_HEX("byte_count 0", 0, plan.byte_count);
+    CHECK_HEX("index unchanged", 0x2000, plan.new_index_reg);
+}
+
+static void test_string_plan_addr32_zero_extends(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    io.is_string = 1;
+    io.is_rep = 1;
+    io.size_bytes = 1;
+    io.addr_size_bytes = 4;
+    /* 32-bit address size: only low 32 bits of the index register are used,
+     * and the result zero-extends (upper 32 bits cleared). */
+    hype_svm_build_string_io_plan(&io, 0xFFFFFFFF00001000ULL, 0x10, 0, 0, &plan);
+    CHECK_HEX("start uses low 32", 0x1000, plan.start_gpa);
+    CHECK_HEX("new index zero-extended", 0x1010, plan.new_index_reg);
+}
+
+static void test_string_plan_addr16_preserves_upper(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    io.is_string = 1;
+    io.is_rep = 1;
+    io.size_bytes = 1;
+    io.addr_size_bytes = 2;
+    /* 16-bit: only DI (low 16) updates; upper bits of the 64-bit reg preserved. */
+    hype_svm_build_string_io_plan(&io, 0xAAAA0010ULL, 4, 0, 0, &plan);
+    CHECK_HEX("start uses low 16", 0x10, plan.start_gpa);
+    CHECK_HEX("new index preserves upper, updates low16", 0xAAAA0014ULL, plan.new_index_reg);
+}
+
+static void test_string_plan_seg_base_added(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    io.is_string = 1;
+    io.is_rep = 0;
+    io.size_bytes = 1;
+    io.addr_size_bytes = 8;
+    /* seg base is added to the index to form the linear address. */
+    hype_svm_build_string_io_plan(&io, 0x100, 0, 0x40000, 0, &plan);
+    CHECK_HEX("start = base + index", 0x40100, plan.start_gpa);
+}
+
+static void test_string_plan_ascending_overflow_rejected(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    io.is_string = 1;
+    io.is_rep = 1;
+    io.size_bytes = 1;
+    io.addr_size_bytes = 8;
+    /* start near the top of the address space + a big count overflows. */
+    CHECK_HEX("overflow -> -1", (uint64_t)-1,
+              (uint64_t)hype_svm_build_string_io_plan(&io, 0xFFFFFFFFFFFFFFF0ULL, 0x100, 0, 0, &plan));
+}
+
+static void test_string_plan_descending_underflow_rejected(void) {
+    hype_svm_ioio_t io = {0};
+    hype_svm_string_io_plan_t plan;
+    io.is_string = 1;
+    io.is_rep = 1;
+    io.size_bytes = 4;
+    io.addr_size_bytes = 8;
+    /* DF=1 with index below (count-1)*unit underflows the low address. */
+    CHECK_HEX("underflow -> -1", (uint64_t)-1,
+              (uint64_t)hype_svm_build_string_io_plan(&io, 0x4, 0x100, 0, HYPE_RFLAGS_DF, &plan));
+}
+
 static void test_decode_npf_info_write(void) {
     hype_svm_npf_t npf;
     uint64_t exitinfo1 = HYPE_SVM_NPF_INFO1_WRITE;
@@ -325,6 +499,19 @@ int main(void) {
     test_decode_ioio_info1_out();
     test_decode_ioio_info1_in_16bit();
     test_decode_ioio_info1_32bit();
+    test_decode_ioio_info1_non_string_defaults();
+    test_decode_ioio_info1_rep_insb_a64();
+    test_decode_ioio_info1_addr16();
+    test_string_plan_non_string_rejected();
+    test_string_plan_rep_insb_ascending();
+    test_string_plan_no_rep_single_unit();
+    test_string_plan_descending();
+    test_string_plan_rep_zero_count_noop();
+    test_string_plan_addr32_zero_extends();
+    test_string_plan_addr16_preserves_upper();
+    test_string_plan_seg_base_added();
+    test_string_plan_ascending_overflow_rejected();
+    test_string_plan_descending_underflow_rejected();
     test_decode_npf_info_write();
     test_decode_npf_info_read();
     test_configure_avic();

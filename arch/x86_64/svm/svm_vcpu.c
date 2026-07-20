@@ -1161,16 +1161,18 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
  * legal-instruction-length limit. */
 #define HYPE_MMIO_MAX_INSTR_BYTES 15
 
-/* VALID-3 guest-physical -> host translation for the AHCI DMA path.
+/* VALID-3 guest-physical -> host translation for host-side guest-memory
+ * access (the AHCI DMA path, the fw_cfg DMA + string-I/O paths).
  * A NULL dma_map means "trusted identity-mapped guest" (the M4-5/ISO-2/
- * PCI-2/M5-2 cooperating test guests, whose NPT identity-maps RAM so
- * guest-physical == host and whose DMA addresses this project itself
+ * PCI-2/M5-2/M4-4/VIDEO-2 cooperating test guests, whose NPT identity-maps
+ * RAM so guest-physical == host and whose DMA addresses this project itself
  * wrote) -- return the address unchecked, preserving their exact prior
- * behavior. A non-NULL map (FW-1's real OVMF/OS guest) routes every
- * guest-supplied address through the bounds-checked VALID-1 lookup with
- * its access length; a 0 return (out of range / straddling / overrun /
- * overflow) propagates as "reject" to the caller. */
-static uint64_t ahci_dma_xlate(const hype_gpa_map_t *dma_map, uint64_t gpa, uint64_t len) {
+ * behavior. A non-NULL map (FW-1's real OVMF/OS guest, whose RAM is
+ * AllocateAnyPages-backed and NPT-remapped, so guest-physical != host)
+ * routes every guest-supplied address through the bounds-checked VALID-1
+ * lookup with its access length; a 0 return (out of range / straddling /
+ * overrun / overflow) propagates as "reject" to the caller. */
+static uint64_t guest_dma_xlate(const hype_gpa_map_t *dma_map, uint64_t gpa, uint64_t len) {
     if (dma_map == 0) {
         return gpa;
     }
@@ -1222,7 +1224,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * a rejected (0) translation fails the command rather than
      * dereferencing an out-of-range host pointer. The command header is
      * the 32-byte slot-0 entry. */
-    cmd_hdr_bytes = (uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, cmd_list_phys, 32u);
+    cmd_hdr_bytes = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, cmd_list_phys, 32u);
     if (cmd_hdr_bytes == 0) {
         return -1;
     }
@@ -1232,7 +1234,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * PRDT entries. A malicious prdtl that would run the table off the
      * region is caught here (the length is computed in 64-bit so it
      * cannot wrap before the check). */
-    cmd_table_bytes = (const uint8_t *)(uintptr_t)ahci_dma_xlate(
+    cmd_table_bytes = (const uint8_t *)(uintptr_t)guest_dma_xlate(
         dma_map, hdr.cmd_table_phys, (uint64_t)0x80u + (uint64_t)hdr.prdtl * 16u);
     if (cmd_table_bytes == 0) {
         return -1;
@@ -1342,7 +1344,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
          * [data_phys, data_phys+chunk) before writing the response into
          * it, so a guest-programmed PRD can never steer the copy at
          * hypervisor or another VM's memory. */
-        dst = (uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, prd.data_phys, chunk);
+        dst = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk);
         if (dst == 0) {
             return -1;
         }
@@ -1380,7 +1382,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * 20 bytes) as one range -- computing the +0x40 on the host pointer
      * after translation, so a near-top guest address cannot overflow
      * before the check. */
-    rx_fis_host = (uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
+    rx_fis_host = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
     if (rx_fis_host == 0) {
         return -1;
     }
@@ -1445,7 +1447,7 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
     } else if (real->vmcb->control.num_bytes_fetched != 0) {
         guest_bytes = real->vmcb->control.guest_instruction_bytes;
     } else {
-        guest_bytes = (const uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, real->vmcb->save.rip, 1u);
+        guest_bytes = (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, real->vmcb->save.rip, 1u);
         if (guest_bytes == 0) {
             return -1;
         }
@@ -2122,7 +2124,8 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
     return 0;
 }
 
-int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
+int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
+                                     const hype_gpa_map_t *dma_map) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
 
@@ -2135,9 +2138,45 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
         hype_fw_cfg_select(fw, (uint16_t)(real->vmcb->save.rax & 0xFFFFu));
     } else if (io.port == 0x511u) {
         if (!io.is_in) {
-            return -1; /* no writable fw_cfg files in this project's scope */
+            return -1; /* no writable fw_cfg files via the classic port in this scope */
         }
-        real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | hype_fw_cfg_read_byte(fw);
+        if (io.is_string) {
+            /* SVM-STRIO: `rep insb`/`insw`/`insd` from the data port. This is how
+             * OVMF's QemuFwCfgLib fetches the signature/revision and every classic
+             * (non-DMA) read: IoReadFifo8 -> one string-IN exit, not one exit per
+             * byte. Emulate the whole transfer, writing to guest memory at
+             * [ES:RDI], honoring REP count and RFLAGS.DF. Getting this wrong (the
+             * old 1-byte-to-AL behavior) corrupts OVMF's fw_cfg probe so it
+             * concludes fw_cfg is absent and installs no ACPI. */
+            hype_svm_string_io_plan_t plan;
+            uint64_t host;
+            uint64_t u;
+
+            if (hype_svm_build_string_io_plan(&io, real->gprs[7] /* RDI */, real->gprs[1] /* RCX */,
+                                              real->vmcb->save.es.base, real->vmcb->save.rflags,
+                                              &plan) != 0) {
+                return -1;
+            }
+            if (plan.byte_count != 0) {
+                host = guest_dma_xlate(dma_map, plan.low_gpa, plan.byte_count);
+                if (host == 0) {
+                    return -1; /* guest buffer out of range -> reject, don't scribble host memory */
+                }
+                for (u = 0; u < plan.count; u++) {
+                    uint64_t addr = plan.descending ? (plan.start_gpa - u * (uint64_t)plan.unit_bytes)
+                                                     : (plan.start_gpa + u * (uint64_t)plan.unit_bytes);
+                    uint64_t off = addr - plan.low_gpa;
+                    uint8_t b;
+                    for (b = 0; b < plan.unit_bytes; b++) {
+                        ((uint8_t *)(uintptr_t)host)[off + b] = hype_fw_cfg_read_byte(fw);
+                    }
+                }
+            }
+            real->gprs[7] = plan.new_index_reg; /* RDI */
+            real->gprs[1] = plan.new_count_reg; /* RCX */
+        } else {
+            real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | hype_fw_cfg_read_byte(fw);
+        }
     } else if (io.port == 0x514u) {
         if (io.is_in) {
             return -1;
@@ -2145,9 +2184,9 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
         hype_fw_cfg_dma_addr_high(fw, (uint32_t)(real->vmcb->save.rax & 0xFFFFFFFFu));
     } else if (io.port == 0x518u) {
         uint64_t access_phys;
+        uint64_t access_host;
         uint8_t raw[16];
         hype_fw_cfg_dma_op_t op;
-        uint8_t *guest_data;
         uint8_t *control_bytes;
         uint32_t result;
         int i;
@@ -2158,15 +2197,35 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
 
         access_phys = hype_fw_cfg_dma_addr_low(fw, (uint32_t)(real->vmcb->save.rax & 0xFFFFFFFFu));
 
+        /* The 16-byte fw_cfg DMA access struct lives in guest RAM: translate +
+         * bounds-check its guest-physical address (FW-1's RAM is NOT identity-
+         * mapped). */
+        access_host = guest_dma_xlate(dma_map, access_phys, 16);
+        if (access_host == 0) {
+            return -1;
+        }
         for (i = 0; i < 16; i++) {
-            raw[i] = ((const uint8_t *)(uintptr_t)access_phys)[i];
+            raw[i] = ((const uint8_t *)(uintptr_t)access_host)[i];
         }
         hype_fw_cfg_dma_decode(raw, &op);
 
-        guest_data = (uint8_t *)(uintptr_t)op.address;
-        result = hype_fw_cfg_dma_execute(fw, &op, guest_data);
+        if (op.length != 0) {
+            /* The data buffer is a separate guest-physical range: translate it
+             * with its declared length before the transfer touches it. A bad
+             * range reports a DMA error to the guest rather than scribbling
+             * arbitrary host memory. */
+            uint64_t data_host = guest_dma_xlate(dma_map, op.address, op.length);
+            if (data_host == 0) {
+                result = HYPE_FW_CFG_DMA_CTL_ERROR;
+            } else {
+                result = hype_fw_cfg_dma_execute(fw, &op, (uint8_t *)(uintptr_t)data_host);
+            }
+        } else {
+            /* SELECT-only / zero-length: no data buffer touched. */
+            result = hype_fw_cfg_dma_execute(fw, &op, 0);
+        }
 
-        control_bytes = (uint8_t *)(uintptr_t)access_phys;
+        control_bytes = (uint8_t *)(uintptr_t)access_host;
         control_bytes[0] = (uint8_t)(result >> 24);
         control_bytes[1] = (uint8_t)(result >> 16);
         control_bytes[2] = (uint8_t)(result >> 8);
