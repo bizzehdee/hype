@@ -4780,3 +4780,36 @@ guest does not spend 13s in that IF=0 region (RIP 0x835631 is at "Mounting boot
 media"); (b) NMI-based preemption (NMI ignores IF); (c) intercept an instruction
 the guest executes inside the region. AWAITING HW capture to confirm the 13.6s
 stall shows if=0 (QEMU already shows it at the same RIP).
+
+PERF-1 STEP 1b HW CONFIRMED + REFRAME (2026-07-20): the HW capture answers the
+expert's question definitively and reframes PERF-1.
+CONFIRMED -- "timer fired but SVM did NOT exit", guest IF=0:
+  vm0: 13629ms@0x835631 r0x7b<-0x7b isr+1 lvt=0x20050 ccr=0x118 irr2=0x0 if=0 shdw=0
+  vm1: 14116ms@0x835631 r0x7b<-0x7b isr+1 lvt=0x20050 ccr=0x116b irr2=0x0 if=0 shdw=0
+  lvt=0x20050 = armed/UNMASKED/periodic/vec0x50; ccr!=0 = counting; isr+1 = it
+  fired (one delivery at the post-exit stgi); if=0 = guest masked interrupts.
+  So the LAPIC timer is alive and fires, but V_INTR_MASKING + guest IF=0 blocks
+  the INTR #VMEXIT -> no preemption. EVERY long VMRUN in the capture has if=0.
+REFRAME (the important part): the ~13s stalls are IF=0 stretches of guest
+EXECUTION, not waits -- the guest runs code and exits on its OWN IOIO; hype
+simply cannot preempt it (IF=0). So NEITHER a periodic NOR a one-shot deadline
+preemption timer can fix the stalls (both rely on the INTR intercept, which IF=0
+masks). The dominant lever is GUEST EXECUTION SPEED: vmrun_tot is ~4x native
+overall, and the memory-heavy early-boot IF=0 phases are ~7-13x (this capture is
+at 30s elapsed, decompression/early boot; RIPHIST hottest insn 0x3ef0d353 =
+"f3 48 ab" = rep stosq / memset). Pattern (memory-heavy phases disproportionately
+slow) points at guest MEMORY execution being slow.
+LEADING HYPOTHESIS: guest memory effective type is wrong (UC-ish) during boot.
+hype does NOT emulate MTRRs (no MTRR MSR handling in msr_emulate.c); with MTRRs
+disabled the x86 default type is UC. NPT PTEs themselves are cacheable
+(PCD=0/PWT=0), and IA32_PAT (0x277) is emulated into g_pat, so Linux's PAT
+SHOULD give WB -- but this needs verifying (UC memory writes are ~10-50x slower,
+which matches the ~13x early-boot phase). Alt: inherent NPT 2D-walk TLB overhead
+(would be more uniform, ~4x, not phase-selective).
+REVISED PRIORITY: the deadline timer (step 2) still cuts wasted 1kHz exits but
+is NO LONGER the stall fix. NEXT MEASUREMENT: determine the guest's effective
+memory type / memory throughput (is RAM WB or UC during the slow phases?) --
+e.g. check MTRR-access handling (#GP fail-closed?), g_pat contents, and a guest
+memory-bandwidth probe. If UC: emulate MTRRs / fix the type -> potentially the
+biggest single win. This supersedes "deadline timer first" for the STALLS
+(deadline timer remains valid for the 1kHz waste).
