@@ -5015,14 +5015,13 @@ TWO REAL CODE/RESOURCE PREREQS surfaced by scoping:
   de-globalize into hype_fw_vm_t (like combined_host_phys/ram_host_phys already
   are), load two different \iso files. Does NOT need the ISOs to write -- can be
   done in parallel with the download. Deps: none.
-- [ ] GLADDER-8: RAM budget for big ISOs + server installers. hype loads the
-  ENTIRE ISO into a host RAM buffer (AllocatePages). Fedora ~2.3GB + Ubuntu
-  ~2.7GB, and the TOGETHER test holds BOTH (~5GB) + 2x guest RAM + OVMF. Server
-  installers (subiquity/anaconda) also want >=~2GB guest RAM each (current
-  HYPE_FW_1_GUEST_RAM_BYTES=1GB may be too small). Bump guest RAM (per-VM/
-  configurable) + confirm host has the RAM (QEMU -m 12288+; laptop 16GB+).
+- [x] GLADDER-8: RAM budget for big ISOs + server installers. DONE (4da813a):
+  guest RAM restored to 2GB (HYPE_FW_1_GUEST_RAM_BYTES); the multi-GB-ISO
+  host-buffer pressure is solved structurally by GLADDER-10(a) chunking (no
+  single contiguous AllocatePages for the ISO). 2GB meets Ubuntu (1.5GB) and
+  Fedora (1.5-2.0GB) minimums; bump per-VM if a real-HW installer OOMs.
   Longer term, virtio-blk STREAMING (deferred) removes the load-into-RAM cost
-  entirely -- note as the real fix if RAM is the wall. Deps: none.
+  entirely -- the real fix if total RAM ever becomes the wall.
 
 THE RUNGS:
 - [ ] GLADDER-5: Fedora Server, single-VM. Boot to login, enumerate what breaks.
@@ -5068,5 +5067,22 @@ gap. FIX OPTIONS (scoped as GLADDER-10):
       Post-EBS this needs hype own AHCI/NVMe host driver (M10) or a virtio-blk
       path -- the real fix, also removes the RAM cost, but big (ties to M5-3/M10).
 RECOMMENDATION: (a) chunked alloc as the unblock for the diagnostic; (b) later.
-GLADDER-8 partial done: guest RAM bumped 1GB->2GB (server-installer minimum;
-Ubuntu 1.5GB / Fedora 1.5-2.0GB per user). HYPE_RUN_TWO_VMS temporarily 0.
+
+GLADDER-10(a) DONE (2026-07-20, 4da813a): wall #1 SOLVED. ISO now loads into up
+to 48x256MB non-contiguous chunks (core/chunked_iso.{h,c}, pure/tested; ATAPI
+media_chunks backing; AHCI NPF chunked-read path; hype_file_read_range for
+per-chunk range loads). No contiguous multi-GB AllocatePages -> OUT_OF_RESOURCES
+gone. Verified: alpine-standard boots to login through a 2-chunk backing (1921
+READ(10) across the 256MB boundary, 0 faults, 2GB guest RAM). A regression
+(uninitialised chunked_media leaking into the ATA/IDENTIFY path -> spurious
+"unhandled AHCI ABAR MMIO" panic on the first command) was found and fixed.
+GLADDER-8 DONE alongside (guest RAM 2GB). HYPE_RUN_TWO_VMS temporarily 0.
+
+STILL OPEN after 10(a):
+  - wall #2 (test-harness delivery): OVMF-in-QEMU still can't boot a >2GB FAT
+    ESP to even load hype.efi + the big ISO file. Real-HW USB package
+    (make-usb-package.sh, FAT32 <4GB) can deliver it; so the honest path for
+    GLADDER-5/6 is a real-HW cold-boot test, OR a separate QEMU fix (2nd drive
+    holding the ISO, or a GPT ESP OVMF accepts at 4GB).
+  - GLADDER-10(b): widen ATAPI media_size past uint32 for a >=4GB ISO (both
+    current server ISOs are <4GB, so not yet blocking).
