@@ -4976,3 +4976,23 @@ max_single_vmrun=94ms (no stalls, PERF-1 g_pat WB fix holding), pat=..070106,
 zero panics/giveups. New MSRs stubbed + ports absorbed, all fine. Guest-ladder
 intermediate rung DONE. NEXT: GLADDER-4 (two -standard on two cores + same-kernel
 perf baseline vs 90s native), then Fedora/Ubuntu.
+
+GLADDER-4 (QEMU, 2026-07-20): TWO alpine-standard (LTS) on two dedicated cores.
+Both boot concurrently to an idle login prompt: arm_count=2 (both armed
+kvmclock), both hlt_if1~14300/hlt_if0=0 (both idle-halting at a prompt), vm1
+CORE on apic_id=2 + printed the getty login-banner kernel line (its exact
+"localhost login:" line lost to the shared-UART interleave -- the M8-0c cosmetic
+limit, same as the two -virt run). Only ONE absorbed MMIO region (0xfed1f410
+RCBA), zero panics/giveups. RAM held at 1GB/guest (no OOM) despite the heavier
+LTS rootfs. No AllocatePages failure at -m 8192.
+SAME-KERNEL PERF BASELINE (the number owed since PERF-1): hype alpine-standard
+boots to login in ~7-8s single-VM (HW-confirmed) / ~10-15s each two-VM (QEMU,
+contention) vs ~90s native alpine-standard (USB/Ventoy). So hype-standard is
+roughly 6-12x FASTER than native-standard. CAVEAT: hype serves the ISO from RAM
+(native reads USB), so it is not a pure execution-only comparison -- but the
+OLD "~4x SLOWER" framing is dead: with the g_pat WB fix guest execution is
+native-speed and hype out-boots native on this same LTS kernel.
+HW-VALIDATION OWED for two -standard on two cores. NEXT: heavy distro
+(Fedora/Ubuntu) -- the next ladder rung; expect more unhandled MMIO/MSR/ports
+(GLADDER-1 absorb should carry many; scope real device models for any that
+need it, per GLADDER-2 method).
