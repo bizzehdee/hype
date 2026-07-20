@@ -762,6 +762,11 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
 #define HYPE_FW_1_ACPI_PM_TIMER_PORT 0x608u
 #define HYPE_FW_1_ACPI_PM_TIMER_MASK 0x00FFFFFFu /* 24-bit -- TMR_VAL_EXT unset in this project's own FADT */
 
+/* M4-6b2: host TSC frequency, stashed at guest start (hype_svm_vcpu_set_pvclock)
+ * so the ACPI PM timer can scale the raw TSC down to the architectural
+ * 3.579545 MHz PM-timer rate the guest firmware expects. */
+static uint64_t g_acpi_pm_tsc_hz = 0;
+
 int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
@@ -773,7 +778,10 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
     }
 
     if (io.is_in) {
-        uint32_t value = (uint32_t)real_rdtsc() & HYPE_FW_1_ACPI_PM_TIMER_MASK;
+        /* M4-6b2: scale the host TSC to the ACPI PM timer's architectural
+         * 3.579545 MHz rate (was: raw ~GHz TSC, ~950x too fast -- which
+         * mis-scaled every guest-firmware delay/timeout that reads this port). */
+        uint32_t value = hype_acpi_pm_timer_scale(real_rdtsc(), g_acpi_pm_tsc_hz);
         real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFFFFFFFULL) | value;
     }
     /* A write to the PM Timer's own status/value port is not a real
@@ -1022,6 +1030,7 @@ void hype_svm_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, 
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->pvclock_map = map;
     hype_pvclock_calc_scale(tsc_hz, &g_pvclock_mul, &g_pvclock_shift);
+    g_acpi_pm_tsc_hz = tsc_hz; /* M4-6b2: also drive the ACPI PM timer's rate */
 }
 
 /* Guest wrote MSR_KVM_SYSTEM_TIME: fill its per-vCPU time-info page so it can

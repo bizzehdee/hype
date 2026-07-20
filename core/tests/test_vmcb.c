@@ -528,6 +528,27 @@ static void test_irr_boundary_vectors(void) {
     CHECK_HEX("still any (vector 0 set)", 1, hype_svm_irr_any(irr));
 }
 
+static void test_acpi_pm_timer_scale(void) {
+    /* At a 3.4 GHz host TSC, the divisor is 3400000000/3579545 = 949, so the
+     * PM timer advances ~3.58 MHz. A 1-second-worth TSC (3.4e9) should map to
+     * ~3.58e6 PM ticks (mod 2^24). */
+    uint64_t tsc_hz = 3400000000ULL;
+    uint64_t div = tsc_hz / 3579545ULL; /* 949 */
+    CHECK_HEX("divisor sanity", 949, div);
+    CHECK_HEX("tsc=0 -> 0", 0, hype_acpi_pm_timer_scale(0, tsc_hz));
+    CHECK_HEX("one divisor tick -> 1", 1, hype_acpi_pm_timer_scale(div, tsc_hz));
+    CHECK_HEX("scaled value masks to 24 bits",
+              (uint32_t)((tsc_hz / div) & 0x00FFFFFFu), hype_acpi_pm_timer_scale(tsc_hz, tsc_hz));
+    /* monotonic: a larger TSC never yields a smaller pre-wrap value */
+    if (hype_acpi_pm_timer_scale(1000u * div, tsc_hz) <= hype_acpi_pm_timer_scale(500u * div, tsc_hz)) {
+        printf("FAIL: pm timer not monotonic pre-wrap\n");
+        failures++;
+    }
+    /* Unknown host rate (0 / below the PM rate): fall back to the raw masked TSC. */
+    CHECK_HEX("tsc_hz=0 falls back to raw masked TSC", (uint32_t)(0x01234567u & 0x00FFFFFFu),
+              hype_acpi_pm_timer_scale(0x01234567u, 0));
+}
+
 int main(void) {
     test_struct_sizes();
     test_field_offsets();
@@ -567,6 +588,7 @@ int main(void) {
     test_disarm_vintr_request_clears_bits_preserves_others();
     test_irr_set_any_highest_clear();
     test_irr_boundary_vectors();
+    test_acpi_pm_timer_scale();
 
     if (failures == 0) {
         printf("all tests passed\n");

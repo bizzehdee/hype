@@ -362,6 +362,17 @@ int hype_svm_irr_highest(const uint32_t irr[8]) {
     return -1;
 }
 
+#define HYPE_ACPI_PM_TIMER_HZ 3579545ULL
+#define HYPE_ACPI_PM_TIMER_MASK 0x00FFFFFFu
+
+uint32_t hype_acpi_pm_timer_scale(uint64_t tsc, uint64_t tsc_hz) {
+    if (tsc_hz >= HYPE_ACPI_PM_TIMER_HZ) {
+        uint64_t div = tsc_hz / HYPE_ACPI_PM_TIMER_HZ;
+        return (uint32_t)((tsc / div) & HYPE_ACPI_PM_TIMER_MASK);
+    }
+    return (uint32_t)(tsc & HYPE_ACPI_PM_TIMER_MASK);
+}
+
 void hype_vmcb_enable_nested_paging(hype_vmcb_t *vmcb, uint64_t npt_root_phys) {
     vmcb->control.np_enable = 1;
     vmcb->control.n_cr3 = npt_root_phys;

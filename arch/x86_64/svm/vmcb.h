@@ -530,6 +530,19 @@ int hype_svm_irr_any(const uint32_t irr[8]);
 int hype_svm_irr_highest(const uint32_t irr[8]);
 
 /*
+ * M4-6b2: scale the host TSC down to the ACPI Power-Management timer's
+ * architectural 3.579545 MHz rate and mask to 24 bits (this project's FADT
+ * leaves TMR_VAL_EXT clear). The guest firmware's AcpiTimerLib
+ * (MicroSecondDelay/Stall/Metronome) and TSC/LAPIC calibration read this port
+ * expecting exactly 3.579545 MHz; returning the raw ~GHz TSC (as hype did)
+ * makes every firmware delay/timeout mis-scale. Divides rather than
+ * multiply-then-divides so a 64-bit TSC can't overflow; the divisor is ~950 on
+ * a 3.4 GHz host (<0.1% rate error). Falls back to the raw masked TSC when the
+ * host TSC rate isn't known yet (tsc_hz below the PM rate). Pure.
+ */
+uint32_t hype_acpi_pm_timer_scale(uint64_t tsc, uint64_t tsc_hz);
+
+/*
  * Packs a segment's access-rights byte and flags nibble into the
  * VMCB's compressed 16-bit `attrib` format (bits 7:0 = access rights
  * [P|DPL|S|Type], bits 11:8 = flags [G|D/B|L|AVL]) -- the same two
