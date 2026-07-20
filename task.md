@@ -4856,3 +4856,20 @@ alpine-standard baseline (cross-kernel, but the ~4x-slower story is over).
 PERF-1 DONE. Fix: commit 74b6104 (save.g_pat = 0x0007040600070406, both VMCB
 builders). Instrumentation (io_histogram, long-VMRUN, memory-type probe) kept
 for future perf work; gate off HYPE_IO_HISTOGRAM to reclaim its 256KB/VM.
+
+PERF-1 SOLVED -- HW ARTIFACT CONFIRMATION (2026-07-20): the diag proves it
+directly via the SAME-RIP comparison. The VMRUN at guest RIP 0x835631 that was
+13629ms before the g_pat fix is now 94ms (line: "LVMRUN vm0: 94ms@0x835631")
+-- ~145x for the identical code path, exactly the UC->WB ratio for that memory
+op. Full scoreboard (before -> after, both VMs):
+  max_single_vmrun: 13629ms -> 94ms;  vmruns_over_100ms: 12-18 -> 0
+  vmrun_tot (guest execution): ~350s -> ~1s (~350x)
+  forced intr exits: 356972 -> 1546;  io80: 67578 -> 2354
+  to localhost login: ~350-450s -> ~13-15s (stopwatch <15s)
+Both guests did the FULL boot (mount media, apk-install 25 pkgs to rootfs,
+OpenRC, firstboot) to login inside the window (pkgs done at kernel [13.35]).
+Note vmrun_tot is now ~1s and hype body_tot ~21s over a 30s window -- the guest
+reached login by ~13-15s and the rest is idle-at-login exit handling; guest
+EXECUTION is now ~native. The 1kHz forced-INTR waste the deadline timer targeted
+is now negligible (1546 exits) because the active boot is over in seconds --
+confirming that path would have optimised a now-tiny cost. PERF-1 CLOSED.
