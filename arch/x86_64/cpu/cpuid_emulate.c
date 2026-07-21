@@ -4,6 +4,31 @@
 #define HYPE_CPUID_LEAF1_EDX_MTRR_BIT (1u << 12)
 #define HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT (1u << 24)
 #define HYPE_CPUID_LEAF1_ECX_X2APIC_BIT (1u << 21)
+/* Highest basic leaf hype exposes. Must reach leaf 0xD (XSAVE state-component
+ * enumeration) so the guest sees a COHERENT instruction-capability picture:
+ * leaf 1 ECX passes the host's XSAVE(26)/OSXSAVE(27)/AVX(28)/FMA(12)/F16C(29)
+ * bits straight through, so leaf 7 (AVX2/AVX-512/BMI/...) and leaf 0xD (the
+ * XSAVE area sizes the guest needs to enable XCR0) must be reachable and
+ * truthful too -- otherwise glibc resolves ifunc string/memcpy routines to AVX
+ * variants off leaf 1 but the kernel never enabled XSAVE (leaf 0xD read as 0),
+ * and the first AVX instruction faults -> early-userspace coredump (observed:
+ * udevadm cores, fsnotify teardown hangs the Ubuntu/Fedora boot; musl/Alpine,
+ * using no AVX ifuncs, was unaffected). hype is a type-1 VMM with one pinned
+ * vCPU; SVM VMEXIT/VMRUN leave the x87/SSE/AVX register file untouched and
+ * hype's handlers use no vector state, so guest XSAVE/AVX state persists across
+ * exits with no explicit XSAVE/XRSTOR, and XSETBV is not intercepted (the guest
+ * sets XCR0 natively). */
+#define HYPE_CPUID_MAX_BASIC_LEAF 0x0Du
+#define HYPE_CPUID_LEAF_STRUCTURED_EXT 0x07u
+#define HYPE_CPUID_LEAF_XSAVE 0x0Du
+/* Leaf-7 sub-leaf-0 EDX speculation-control mitigation bits, forced clear
+ * because their control MSRs are not emulated: SPEC_CTRL(26)/STIBP(27)/
+ * SSBD(31) need IA32_SPEC_CTRL(0x48); L1D_FLUSH(28) needs IA32_FLUSH_CMD(0x10b);
+ * ARCH_CAPABILITIES(29) needs IA32_ARCH_CAPABILITIES(0x10a); CORE_CAPABILITIES(30)
+ * needs IA32_CORE_CAPABILITIES(0xcf). Advertising them while the MSR reads back
+ * dead leaves the guest's mitigation state self-inconsistent. */
+#define HYPE_CPUID_LEAF7_EDX_SPECCTRL_MASK                                     \
+    ((1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 30) | (1u << 31))
 #define HYPE_CPUID_EXT1_ECX_SVM_BIT (1u << 2)
 #define HYPE_CPUID_EXT7_EDX_INVARIANT_TSC_BIT (1u << 8)
 #define HYPE_CPUID_LEAF6_EAX_ARAT_BIT (1u << 2)
@@ -33,7 +58,7 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
     (void)ecx_in; /* no leaf handled here uses a sub-leaf */
 
     if (eax_in == 0) {
-        out->eax = 1; /* max basic leaf supported */
+        out->eax = HYPE_CPUID_MAX_BASIC_LEAF; /* max basic leaf supported (reaches 0xD XSAVE) */
         out->ebx = 0x68747541u; /* "Auth" */
         out->edx = 0x69746e65u; /* "enti" */
         out->ecx = 0x444d4163u; /* "cAMD" */
@@ -70,6 +95,12 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
          * working clockevent -- idle-hangs (observed hang at "Mounting boot
          * media" in APIC mode). Clearing it keeps the guest on the modeled
          * MMIO LAPIC. */
+        /* ECX passes the host's instruction-capability bits straight through
+         * (SSE/AVX/XSAVE/OSXSAVE/FMA/AES/...), so the guest sees the real CPU's
+         * feature set -- coherently, because leaf 7 and leaf 0xD are exposed too
+         * (see HYPE_CPUID_MAX_BASIC_LEAF). Only the two bits tied to hype's own
+         * unmodeled paths are forced off: TSC_DEADLINE (24, no MSR-armed LAPIC
+         * timer) and X2APIC (21, MMIO-LAPIC-only). Hypervisor-present (31) set. */
         out->ecx = (real->ecx | HYPE_CPUID_HYPERVISOR_PRESENT_BIT) &
                    ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT & ~HYPE_CPUID_LEAF1_ECX_X2APIC_BIT;
         return;
@@ -91,6 +122,40 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
         out->ebx = 0;
         out->ecx = 0;
         out->edx = 0;
+        return;
+    }
+
+    if (eax_in == HYPE_CPUID_LEAF_STRUCTURED_EXT) {
+        /* Structured extended features (AVX2/AVX-512/BMI/FSGSBASE/...): host
+         * passthrough for the requested sub-leaf (`real` was read as
+         * real_cpuid(eax_in, ecx_in), so it's sub-leaf-correct), EXCEPT the
+         * EDX speculation-control mitigation bits, which are forced clear:
+         * their control MSRs are NOT emulated (IA32_SPEC_CTRL 0x48 for
+         * SPEC_CTRL/STIBP/SSBD, IA32_FLUSH_CMD 0x10b for L1D_FLUSH,
+         * IA32_ARCH_CAPABILITIES 0x10a / IA32_CORE_CAPABILITIES 0xcf). hype
+         * currently absorbs those MSRs as no-ops, so a guest that saw the
+         * CPUID bit but got a dead MSR ended up inconsistent -- e.g. the
+         * kernel disabled SPEC_CTRL (dead MSR) yet kept SSBD from CPUID ->
+         * "x86 CPU feature dependency check failure: 18*32+31 enabled but
+         * 18*32+26 disabled". Clearing them (only meaningful on the leaf-7
+         * sub-leaf 0 EDX; other sub-leaves have these bits reserved/zero, so
+         * masking is harmless) keeps the advertised mitigation set to exactly
+         * what hype can back. */
+        out->eax = real->eax;
+        out->ebx = real->ebx;
+        out->ecx = real->ecx;
+        out->edx = real->edx & ~HYPE_CPUID_LEAF7_EDX_SPECCTRL_MASK;
+        return;
+    }
+
+    if (eax_in == HYPE_CPUID_LEAF_XSAVE) {
+        /* XSAVE state enumeration (leaf 0xD, per sub-leaf): full host
+         * passthrough so the guest can size its XSAVE area and enable XCR0 --
+         * the other half of making leaf 1's XSAVE/AVX bits coherent. */
+        out->eax = real->eax;
+        out->ebx = real->ebx;
+        out->ecx = real->ecx;
+        out->edx = real->edx;
         return;
     }
 

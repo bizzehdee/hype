@@ -18,7 +18,7 @@ static void test_leaf0_vendor_string(void) {
 
     hype_cpuid_emulate(0, 0, &real, &out);
 
-    CHECK_HEX("max basic leaf", 1, out.eax);
+    CHECK_HEX("max basic leaf", 0x0Du, out.eax); /* reaches leaf 0xD (XSAVE) */
     CHECK_HEX("ebx \"Auth\"", 0x68747541u, out.ebx);
     CHECK_HEX("edx \"enti\"", 0x69746e65u, out.edx);
     CHECK_HEX("ecx \"cAMD\"", 0x444d4163u, out.ecx);
@@ -37,7 +37,15 @@ static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
     CHECK_HEX("hypervisor-present bit forced set", 1, (out.ecx & (1u << 31)) != 0);
     CHECK_HEX("TSC_DEADLINE bit forced clear", 0, (out.ecx & (1u << 24)) != 0);
     CHECK_HEX("X2APIC bit forced clear", 0, (out.ecx & (1u << 21)) != 0);
-    /* ecx = real | hypervisor-present, minus the TSC_DEADLINE and X2APIC bits. */
+    /* XSAVE-domain instruction-capability bits pass straight through from the
+     * host (coherent with the exposed leaf 7/0xD): FMA(12)/XSAVE(26)/OSXSAVE(27)/
+     * AVX(28)/F16C(29) -- real.ecx has them all set, so they survive. */
+    CHECK_HEX("FMA bit passthrough", 1, (out.ecx & (1u << 12)) != 0);
+    CHECK_HEX("XSAVE bit passthrough", 1, (out.ecx & (1u << 26)) != 0);
+    CHECK_HEX("OSXSAVE bit passthrough", 1, (out.ecx & (1u << 27)) != 0);
+    CHECK_HEX("AVX bit passthrough", 1, (out.ecx & (1u << 28)) != 0);
+    CHECK_HEX("F16C bit passthrough", 1, (out.ecx & (1u << 29)) != 0);
+    /* ecx = real | hypervisor-present, minus only TSC_DEADLINE and X2APIC. */
     CHECK_HEX("ecx otherwise passthrough",
               (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21), out.ecx);
     CHECK_HEX("MTRR bit forced clear", 0, (out.edx & (1u << 12)) != 0);
@@ -158,6 +166,50 @@ static void test_kvm_features_leaf_advertises_only_pvclock(void) {
     CHECK_HEX("steal-time NOT advertised (bit 5)", 0, (out.eax & (1u << 5)) != 0);
 }
 
+static void test_leaf7_structured_ext_passthrough(void) {
+    /* Leaf 7 (AVX2/AVX-512/BMI/...) passes straight through from the host for
+     * the requested sub-leaf, so leaf 1's XSAVE/AVX advertisement is coherent. */
+    /* edx = 0xFC000000 sets exactly the speculation-control bits 26-31, which
+     * must be masked off (their control MSRs aren't emulated); eax/ebx/ecx pass
+     * through. ebx 0x239C27A9 carries AVX2(5)/BMI(3,8)/... which stay. */
+    hype_cpuid_result_t real = {0x00000001u, 0x239C27A9u, 0x00000000u, 0xFC000000u};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate(7, 0, &real, &out);
+
+    CHECK_HEX("leaf7 eax passthrough (max sub-leaf)", real.eax, out.eax);
+    CHECK_HEX("leaf7 ebx passthrough", real.ebx, out.ebx);
+    CHECK_HEX("leaf7 ecx passthrough", real.ecx, out.ecx);
+    CHECK_HEX("leaf7 edx spec-ctrl bits masked", 0u, out.edx);
+}
+
+static void test_leaf7_edx_nonspec_bits_survive_mask(void) {
+    /* Non-speculation EDX bits (e.g. FSRM=4, SERIALIZE=14) pass through; only
+     * bits 26-31 are cleared. real.edx = FSRM|SERIALIZE|SPEC_CTRL|SSBD. */
+    hype_cpuid_result_t real = {0, 0, 0, (1u << 4) | (1u << 14) | (1u << 26) | (1u << 31)};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate(7, 0, &real, &out);
+
+    CHECK_HEX("leaf7 edx keeps non-spec bits, clears spec bits",
+              (1u << 4) | (1u << 14), out.edx);
+}
+
+static void test_leafD_xsave_passthrough(void) {
+    /* Leaf 0xD (XSAVE state-component enumeration) passes through so the guest
+     * can size its XSAVE area / enable XCR0 -- without it, leaf 1's XSAVE bit is
+     * a lie and glibc's AVX ifunc path faults. Sub-leaf carried via `real`. */
+    hype_cpuid_result_t real = {0x00000207u, 0x00000340u, 0x00000340u, 0x00000000u};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate(0x0Du, 0, &real, &out);
+
+    CHECK_HEX("leafD eax passthrough (XCR0 low mask)", real.eax, out.eax);
+    CHECK_HEX("leafD ebx passthrough (enabled area size)", real.ebx, out.ebx);
+    CHECK_HEX("leafD ecx passthrough (max area size)", real.ecx, out.ecx);
+    CHECK_HEX("leafD edx passthrough (XCR0 high mask)", real.edx, out.edx);
+}
+
 static void test_unhandled_leaf_returns_all_zero(void) {
     hype_cpuid_result_t real = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
     hype_cpuid_result_t out;
@@ -191,6 +243,9 @@ int main(void) {
     test_leaf_ext1_svm_already_clear_is_idempotent();
     test_leaf_ext8_address_sizes_passthrough();
     test_leaf6_advertises_arat_only();
+    test_leaf7_structured_ext_passthrough();
+    test_leaf7_edx_nonspec_bits_survive_mask();
+    test_leafD_xsave_passthrough();
     test_leaf_ext7_advertises_invariant_tsc_only();
     test_hypervisor_signature_is_kvm();
     test_kvm_features_leaf_advertises_only_pvclock();

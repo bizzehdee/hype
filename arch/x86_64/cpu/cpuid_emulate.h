@@ -51,17 +51,34 @@ typedef struct {
  * leaf/subleaf). Pure logic, no CPU access of its own -- fully unit
  * tested. Handled leaves:
  *
- *   0            -- max basic leaf = 1; vendor string "AuthenticAMD"
+ *   0            -- max basic leaf = 0xD; vendor string "AuthenticAMD"
  *                    (this project only targets AMD hosts so far,
- *                    same scope as M2-8's own real-hardware gate).
+ *                    same scope as M2-8's own real-hardware gate). The
+ *                    max is raised to 0xD so leaf 7 and leaf 0xD are
+ *                    reachable -- required to make leaf 1's XSAVE/AVX
+ *                    advertisement coherent (see leaf 1 / leaf 7 / 0xD).
  *   1             -- EAX/EBX passthrough (family/model/stepping,
  *                    brand/APIC-id info -- not isolation-sensitive);
  *                    EDX passthrough except MTRR support (bit 12)
  *                    forced clear, so well-behaved guest software
  *                    never attempts an MTRR MSR access this project
  *                    doesn't emulate (CPUMSR-2); ECX passthrough
- *                    except the hypervisor-present bit (31) forced
- *                    set and TSC_DEADLINE (24) forced clear.
+ *                    (incl. the host's XSAVE/OSXSAVE/AVX/FMA/F16C
+ *                    instruction-capability bits) except the
+ *                    hypervisor-present bit (31) forced set and
+ *                    TSC_DEADLINE (24) + X2APIC (21) forced clear.
+ *   7             -- structured extended features (AVX2/AVX-512/BMI/
+ *                    FSGSBASE/...): host passthrough for the requested
+ *                    sub-leaf, so the guest sees the real vector ISA.
+ *   0xD           -- XSAVE state-component enumeration: host passthrough
+ *                    (per sub-leaf), so the guest can size its XSAVE
+ *                    area and enable XCR0. Exposing 7 and 0xD truthfully
+ *                    is what keeps leaf 1's XSAVE/AVX bits honest: a
+ *                    glibc userspace (Ubuntu/Fedora) resolves ifunc
+ *                    string/memcpy routines to AVX off leaf 1 and would
+ *                    fault on the first AVX instruction if the XSAVE
+ *                    enumeration were missing (musl/Alpine, using no AVX
+ *                    ifuncs, tolerated the old capped-at-1 leaf set).
  *   0x40000000    -- hypervisor signature leaf: "KVMKVMKVM" + max KVM
  *                    leaf, so a Linux/BSD guest enables kvmclock (the
  *                    paravirt clocksource that bypasses the guest's own
