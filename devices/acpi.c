@@ -1,4 +1,5 @@
 #include "acpi.h"
+#include "dsdt_aml.h" /* M4-6b2: compiled DSDT AML body (PCI host bridge + _PRT) */
 
 static const char HYPE_ACPI_OEM_ID[6] = {'H', 'Y', 'P', 'E', ' ', ' '};
 static const char HYPE_ACPI_CREATOR_ID[4] = {'H', 'Y', 'P', 'E'};
@@ -82,7 +83,7 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
                             (uint32_t)sizeof(hype_acpi_madt_interrupt_override_t);
     uint32_t mcfg_length =
         (uint32_t)sizeof(hype_acpi_mcfg_header_t) + (uint32_t)sizeof(hype_acpi_mcfg_allocation_t);
-    uint32_t dsdt_length = (uint32_t)sizeof(hype_acpi_sdt_header_t);
+    uint32_t dsdt_length = (uint32_t)sizeof(hype_acpi_sdt_header_t) + HYPE_DSDT_AML_BODY_LEN;
     uint32_t total = xsdt_length + fadt_length + madt_length + mcfg_length + dsdt_length;
     uint32_t i;
 
@@ -109,14 +110,20 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
     out->dsdt_length = dsdt_length;
     out->total_length = out->dsdt_offset + dsdt_length;
 
-    /* DSDT: header-only placeholder (no AML content at all -- see
-     * acpi.h's top comment on why this is an acceptable placeholder for
-     * this milestone's scope, and HYPE_ACPI_FADT_HW_REDUCED_ACPI's own
-     * comment on why hardware-reduced ACPI needs less from it than a
-     * classic DSDT would). */
+    /* DSDT: SDT header + the compiled AML body from devices/dsdt.asl
+     * (devices/dsdt_aml.h). M4-6b2: the body declares the PCI host bridge
+     * (_SB.PCI0) with a _PRT so an ACPI-mode kernel can route PCI device
+     * interrupts (notably AHCI INTA -> GSI 16) via the I/O APIC -- without it
+     * the AHCI driver fails to probe ("PCI INT A: no GSI"). fill_header sets
+     * the length (already includes the body) and the fw_cfg table-loader
+     * recomputes the checksum over header+body. */
     {
-        hype_acpi_sdt_header_t *dsdt = (hype_acpi_sdt_header_t *)(buf + out->dsdt_offset);
-        fill_header(dsdt, "DSDT", out->dsdt_length, 2, "HYPEDSDT");
+        uint8_t *dsdt = buf + out->dsdt_offset;
+        uint32_t j;
+        fill_header((hype_acpi_sdt_header_t *)dsdt, "DSDT", out->dsdt_length, 2, "HYPEDSDT");
+        for (j = 0; j < HYPE_DSDT_AML_BODY_LEN; j++) {
+            dsdt[sizeof(hype_acpi_sdt_header_t) + j] = hype_dsdt_aml_body[j];
+        }
     }
 
     /* FADT ("FACP") */

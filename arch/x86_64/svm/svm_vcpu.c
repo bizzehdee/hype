@@ -51,8 +51,14 @@ struct hype_vcpu_ctx {
      * the owner's IRQ vanished (pending=0) and it wedged waiting on it. One
      * pending vector per vCPU is all this project's single-IRQ-source scope
      * needs (see hype_svm_vcpu_request_interrupt). */
-    int pending_irq_valid;
-    uint8_t pending_irq_vector;
+    /* M4-6b2: pending-interrupt IRR bitmap (256 vectors), per-vCPU. Replaces the
+     * old single {valid,vector} slot: the run loop can request several vectors
+     * (timer + AHCI + serial + PIC) in ONE iteration, and hype can stage only
+     * one in EVENTINJ per VMRUN. A single slot -- and request_interrupt's
+     * unconditional EVENTINJ overwrite -- dropped every colliding vector but the
+     * last, killing a self-re-arming one-shot clockevent that lost its tick.
+     * Queue all requests here; drain highest-first, one per VMRUN. */
+    uint32_t pending_irr[8];
 };
 
 /* M8-0b-ii: per-vCPU state pool. Was a single g_vmcb/g_ctx (M2's one-vCPU
@@ -213,8 +219,12 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     ctx->pvclock_map = 0;
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
-    ctx->pending_irq_valid = 0;
-    ctx->pending_irq_vector = 0;
+    {
+        int i;
+        for (i = 0; i < 8; i++) {
+            ctx->pending_irr[i] = 0;
+        }
+    }
 }
 
 /* MSRs that VMSAVE/VMLOAD save+restore around VMRUN (AMD APM Vol 2
@@ -447,7 +457,22 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
                 real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
             }
         } else {
-            rc = hype_pic_emu_io_write(pic, io.port, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+            uint8_t pv = (uint8_t)(real->vmcb->save.rax & 0xFFu);
+            /* M4-6d7 DIAG: log OCW1 (IMR) writes whose IRQ4/IRQ3 mask bits
+             * CHANGE -- shows whether Linux ever wires the serial IRQ through
+             * the 8259 instead of the IO-APIC in APIC mode. */
+            if (io.port == 0x21u) {
+                uint8_t old = pic->master.imr;
+                if (((old ^ pv) & 0x1Au) != 0u) { /* IRQ1/3/4 mask-bit change */
+                    static unsigned imr_log_n = 0;
+                    if (imr_log_n < 32u) {
+                        imr_log_n++;
+                        hype_debug_print("fw-1 PICIMR 0x%x->0x%x rip=0x%llx\n", (unsigned)old,
+                                         (unsigned)pv, (unsigned long long)real->vmcb->save.rip);
+                    }
+                }
+            }
+            rc = hype_pic_emu_io_write(pic, io.port, pv);
         }
     } else if (io.port >= 0x40u && io.port <= 0x43u) {
         if (io.is_in) {
@@ -752,6 +777,11 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
 #define HYPE_FW_1_ACPI_PM_TIMER_PORT 0x608u
 #define HYPE_FW_1_ACPI_PM_TIMER_MASK 0x00FFFFFFu /* 24-bit -- TMR_VAL_EXT unset in this project's own FADT */
 
+/* M4-6b2: host TSC frequency, stashed at guest start (hype_svm_vcpu_set_pvclock)
+ * so the ACPI PM timer can scale the raw TSC down to the architectural
+ * 3.579545 MHz PM-timer rate the guest firmware expects. */
+static uint64_t g_acpi_pm_tsc_hz = 0;
+
 int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
@@ -763,7 +793,48 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
     }
 
     if (io.is_in) {
-        uint32_t value = (uint32_t)real_rdtsc() & HYPE_FW_1_ACPI_PM_TIMER_MASK;
+        /* M4-6b2: scale the host TSC to the ACPI PM timer's architectural
+         * 3.579545 MHz rate (was: raw ~GHz TSC, ~950x too fast -- which
+         * mis-scaled every guest-firmware delay/timeout that reads this port). */
+        uint64_t raw = real_rdtsc();
+        uint32_t value = hype_acpi_pm_timer_scale(raw, g_acpi_pm_tsc_hz);
+        /* M4-6d6 DIAG (GRUB-hang priority-0): PM-timer LIVENESS trace. GRUB's
+         * early-init calibration spins reading this port; log the first reads'
+         * (guest_rip, raw host TSC, returned 24-bit value, modular delta from
+         * the previous value) so we can tell apart: (a) value not advancing =
+         * emulation/order fault; (b) advancing at the wrong ratio = scale
+         * fault; (c) advancing correctly while GRUB still loops = it waits on
+         * something else (symbolize the RIP). Plus a ONE-SHOT host-side
+         * controlled-interval check: read the scaler, busy-wait exactly
+         * tsc_hz/1000 host TSC (=1ms), read again -- a correct 3.579545 MHz
+         * timer must advance ~3579 ticks in that window. */
+        static unsigned pm_trace_n = 0;
+        static uint32_t pm_prev = 0;
+        static int pm_selftest_done = 0;
+        if (!pm_selftest_done && g_acpi_pm_tsc_hz != 0) {
+            uint64_t t0 = real_rdtsc();
+            uint32_t v0 = hype_acpi_pm_timer_scale(t0, g_acpi_pm_tsc_hz);
+            uint64_t target = t0 + g_acpi_pm_tsc_hz / 1000ULL; /* 1ms of host TSC */
+            uint32_t v1;
+            uint64_t t1;
+            while ((t1 = real_rdtsc()) < target) { /* busy-wait ~1ms */ }
+            v1 = hype_acpi_pm_timer_scale(t1, g_acpi_pm_tsc_hz);
+            pm_selftest_done = 1;
+            hype_debug_print("fw-1 PMLIVE selftest: tsc_hz=%llu div=%llu | over 1ms (tsc +%llu) PM advanced "
+                             "%u ticks (expect ~3579) v0=0x%x v1=0x%x\n",
+                             (unsigned long long)g_acpi_pm_tsc_hz,
+                             (unsigned long long)(g_acpi_pm_tsc_hz / 3579545ULL),
+                             (unsigned long long)(t1 - t0),
+                             (unsigned)((v1 - v0) & HYPE_FW_1_ACPI_PM_TIMER_MASK), v0, v1);
+        }
+        if (pm_trace_n < 32u) {
+            hype_debug_print("fw-1 PMLIVE#%02u: rip=0x%llx raw_tsc=0x%llx pm=0x%06x d=%u\n",
+                             pm_trace_n, (unsigned long long)real->vmcb->save.rip,
+                             (unsigned long long)raw, (unsigned)value,
+                             (unsigned)((value - pm_prev) & HYPE_FW_1_ACPI_PM_TIMER_MASK));
+            pm_prev = value;
+            pm_trace_n++;
+        }
         real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFFFFFFFULL) | value;
     }
     /* A write to the PM Timer's own status/value port is not a real
@@ -783,7 +854,13 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
 static unsigned long long g_int_eventinj = 0;   /* accepted immediately (direct EVENTINJ) */
 static unsigned long long g_int_vintr_defer = 0; /* couldn't accept -> VINTR window armed */
 static unsigned long long g_int_vintr_window = 0;/* VINTR window fired -> deferred inject */
-static unsigned long long g_int_defer_overwrite = 0; /* a deferral clobbered an unserviced pending vector */
+static unsigned long long g_int_defer_overwrite = 0; /* requested a vector already pending in the IRR (coalesced, not lost) */
+/* M4-6b2: times a request found EVENTINJ.V already staged for the next VMRUN
+ * and QUEUED the new vector in the IRR instead of clobbering the staged one.
+ * Under the old code this was an INVISIBLE lost interrupt (the direct-EVENTINJ
+ * path overwrote unconditionally and counted nothing) -- the actual cause of
+ * the one-shot-clockevent death. Now counted and never lost. */
+static unsigned long long g_int_eventinj_collision = 0;
 
 void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
                                  unsigned long long *window, unsigned long long *overwrite) {
@@ -791,6 +868,23 @@ void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long
     *defer = g_int_vintr_defer;
     *window = g_int_vintr_window;
     *overwrite = g_int_defer_overwrite;
+}
+
+unsigned long long hype_svm_vcpu_get_eventinj_collisions(void) {
+    return g_int_eventinj_collision;
+}
+
+/* Arm the VINTR interrupt-window intercept iff vectors are still queued in the
+ * IRR; disarm it once the queue drains. Keeps the "wake me when the guest can
+ * take an interrupt" request exactly as long as there is something to deliver. */
+static void hype_svm_sync_vintr(struct hype_vcpu_ctx *real) {
+    if (hype_svm_irr_any(real->pending_irr)) {
+        real->vmcb->control.vintr = hype_svm_arm_vintr_request(real->vmcb->control.vintr);
+        real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_VINTR;
+    } else {
+        real->vmcb->control.vintr = hype_svm_disarm_vintr_request(real->vmcb->control.vintr);
+        real->vmcb->control.intercept_misc1 &= ~HYPE_SVM_INTERCEPT_VINTR;
+    }
 }
 
 void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *out) {
@@ -801,44 +895,60 @@ void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *o
     out->vintr = real->vmcb->control.vintr;
     out->can_accept =
         hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow);
-    out->pending_valid = real->pending_irq_valid;
-    out->pending_vector = real->pending_irq_vector;
+    out->pending_valid = hype_svm_irr_any(real->pending_irr);
+    {
+        int hv = hype_svm_irr_highest(real->pending_irr);
+        out->pending_vector = (uint8_t)(hv < 0 ? 0 : hv);
+    }
 }
 
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int eventinj_busy = (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) != 0;
 
-    if (hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
+    /* Fast path: the guest can take an interrupt AND nothing is already staged
+     * for the next VMRUN -> inject directly. The eventinj_busy guard is the fix
+     * for the lost-interrupt bug: without it, a second request in the same run-
+     * loop iteration (timer, then AHCI/serial/PIT) unconditionally overwrote the
+     * first vector's EVENTINJ, silently dropping it -- fatal to a self-re-arming
+     * one-shot clockevent, which then never gets its next tick. */
+    if (!eventinj_busy &&
+        hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
         g_int_eventinj++;
         return;
     }
 
-    if (real->pending_irq_valid) {
-        g_int_defer_overwrite++; /* a second vector deferred before the first was delivered */
+    /* Otherwise queue the vector in the IRR (never overwrite a staged event or
+     * a differently-numbered pending vector) and arm the interrupt window so it
+     * drains as soon as the guest can accept it. Requesting an already-pending
+     * vector coalesces (correct IRR semantics: one delivery per set bit). */
+    if (eventinj_busy) {
+        g_int_eventinj_collision++;
     }
-    real->vmcb->control.vintr = hype_svm_arm_vintr_request(real->vmcb->control.vintr);
-    real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_VINTR;
-    real->pending_irq_valid = 1;
-    real->pending_irq_vector = vector;
+    if ((real->pending_irr[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0) {
+        g_int_defer_overwrite++; /* vector already pending -> coalesced (not lost) */
+    }
+    hype_svm_irr_set(real->pending_irr, vector);
+    hype_svm_sync_vintr(real);
     g_int_vintr_defer++;
 }
 
 void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
 
-    real->vmcb->control.vintr = hype_svm_disarm_vintr_request(real->vmcb->control.vintr);
-    real->vmcb->control.intercept_misc1 &= ~HYPE_SVM_INTERCEPT_VINTR;
-
-    if (real->pending_irq_valid) {
-        uint8_t vector = real->pending_irq_vector;
-        real->pending_irq_valid = 0;
+    /* The window fired -> the guest can accept an interrupt now. Stage the
+     * highest-priority queued vector into EVENTINJ (if EVENTINJ isn't already
+     * occupied), then re-sync the window: keep it armed while more remain,
+     * disarm once the IRR is empty. */
+    if (hype_svm_irr_any(real->pending_irr) &&
+        (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) == 0) {
+        int v = hype_svm_irr_highest(real->pending_irr);
+        hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         g_int_vintr_window++;
-        /* This window firing at all means the guest can accept an
-         * interrupt right now -- hype_svm_vcpu_request_interrupt()'s
-         * own can-accept check will take the direct-EVENTINJ path. */
-        hype_svm_vcpu_request_interrupt(ctx, vector);
     }
+    hype_svm_sync_vintr(real);
 }
 
 void hype_svm_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
@@ -866,7 +976,7 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
      * only then move it off the pending slot / disarm the window. Also
      * guards against EVENTINJ clobbering an event already staged this
      * entry. Returns 1 if it injected. */
-    if (!real->pending_irq_valid) {
+    if (!hype_svm_irr_any(real->pending_irr)) {
         return 0;
     }
     if ((real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) != 0) {
@@ -875,10 +985,13 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
     if (!hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         return 0;
     }
-    real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(real->pending_irq_vector);
-    real->pending_irq_valid = 0;
-    real->vmcb->control.vintr = hype_svm_disarm_vintr_request(real->vmcb->control.vintr);
-    real->vmcb->control.intercept_misc1 &= ~HYPE_SVM_INTERCEPT_VINTR;
+    {
+        int v = hype_svm_irr_highest(real->pending_irr);
+        hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
+    }
+    /* Keep the window armed if more vectors remain; disarm once drained. */
+    hype_svm_sync_vintr(real);
     g_int_eventinj++;
     return 1;
 }
@@ -970,6 +1083,7 @@ void hype_svm_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, 
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->pvclock_map = map;
     hype_pvclock_calc_scale(tsc_hz, &g_pvclock_mul, &g_pvclock_shift);
+    g_acpi_pm_tsc_hz = tsc_hz; /* M4-6b2: also drive the ACPI PM timer's rate */
 }
 
 /* Guest wrote MSR_KVM_SYSTEM_TIME: fill its per-vCPU time-info page so it can
@@ -1161,16 +1275,18 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
  * legal-instruction-length limit. */
 #define HYPE_MMIO_MAX_INSTR_BYTES 15
 
-/* VALID-3 guest-physical -> host translation for the AHCI DMA path.
+/* VALID-3 guest-physical -> host translation for host-side guest-memory
+ * access (the AHCI DMA path, the fw_cfg DMA + string-I/O paths).
  * A NULL dma_map means "trusted identity-mapped guest" (the M4-5/ISO-2/
- * PCI-2/M5-2 cooperating test guests, whose NPT identity-maps RAM so
- * guest-physical == host and whose DMA addresses this project itself
+ * PCI-2/M5-2/M4-4/VIDEO-2 cooperating test guests, whose NPT identity-maps
+ * RAM so guest-physical == host and whose DMA addresses this project itself
  * wrote) -- return the address unchecked, preserving their exact prior
- * behavior. A non-NULL map (FW-1's real OVMF/OS guest) routes every
- * guest-supplied address through the bounds-checked VALID-1 lookup with
- * its access length; a 0 return (out of range / straddling / overrun /
- * overflow) propagates as "reject" to the caller. */
-static uint64_t ahci_dma_xlate(const hype_gpa_map_t *dma_map, uint64_t gpa, uint64_t len) {
+ * behavior. A non-NULL map (FW-1's real OVMF/OS guest, whose RAM is
+ * AllocateAnyPages-backed and NPT-remapped, so guest-physical != host)
+ * routes every guest-supplied address through the bounds-checked VALID-1
+ * lookup with its access length; a 0 return (out of range / straddling /
+ * overrun / overflow) propagates as "reject" to the caller. */
+static uint64_t guest_dma_xlate(const hype_gpa_map_t *dma_map, uint64_t gpa, uint64_t len) {
     if (dma_map == 0) {
         return gpa;
     }
@@ -1222,7 +1338,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * a rejected (0) translation fails the command rather than
      * dereferencing an out-of-range host pointer. The command header is
      * the 32-byte slot-0 entry. */
-    cmd_hdr_bytes = (uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, cmd_list_phys, 32u);
+    cmd_hdr_bytes = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, cmd_list_phys, 32u);
     if (cmd_hdr_bytes == 0) {
         return -1;
     }
@@ -1232,7 +1348,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * PRDT entries. A malicious prdtl that would run the table off the
      * region is caught here (the length is computed in 64-bit so it
      * cannot wrap before the check). */
-    cmd_table_bytes = (const uint8_t *)(uintptr_t)ahci_dma_xlate(
+    cmd_table_bytes = (const uint8_t *)(uintptr_t)guest_dma_xlate(
         dma_map, hdr.cmd_table_phys, (uint64_t)0x80u + (uint64_t)hdr.prdtl * 16u);
     if (cmd_table_bytes == 0) {
         return -1;
@@ -1342,7 +1458,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
          * [data_phys, data_phys+chunk) before writing the response into
          * it, so a guest-programmed PRD can never steer the copy at
          * hypervisor or another VM's memory. */
-        dst = (uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, prd.data_phys, chunk);
+        dst = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk);
         if (dst == 0) {
             return -1;
         }
@@ -1380,7 +1496,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * 20 bytes) as one range -- computing the +0x40 on the host pointer
      * after translation, so a near-top guest address cannot overflow
      * before the check. */
-    rx_fis_host = (uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
+    rx_fis_host = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
     if (rx_fis_host == 0) {
         return -1;
     }
@@ -1445,7 +1561,7 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
     } else if (real->vmcb->control.num_bytes_fetched != 0) {
         guest_bytes = real->vmcb->control.guest_instruction_bytes;
     } else {
-        guest_bytes = (const uint8_t *)(uintptr_t)ahci_dma_xlate(dma_map, real->vmcb->save.rip, 1u);
+        guest_bytes = (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, real->vmcb->save.rip, 1u);
         if (guest_bytes == 0) {
             return -1;
         }
@@ -1737,7 +1853,20 @@ int hype_svm_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart
         uint8_t value = hype_guest_uart_read(uart, offset);
         real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
     } else {
-        hype_guest_uart_write(uart, offset, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+        uint8_t wv = (uint8_t)(real->vmcb->save.rax & 0xFFu);
+        /* M4-6d7 DIAG: log COM1 IER writes (offset 1, DLAB clear). An IER write
+         * with THRI (bit1) / RDI (bit0) set is the 8250 driver's startup/tx
+         * path -- timestamps whether userspace ever opens or writes ttyS0. */
+        if (base_port == 0x3F8u && offset == 1u &&
+            (uart->lcr & 0x80u) == 0u && wv != 0u) {
+            static unsigned ier_log_n = 0;
+            if (ier_log_n < 64u) {
+                ier_log_n++;
+                hype_debug_print("fw-1 UARTIER=0x%x rip=0x%llx\n", (unsigned)wv,
+                                 (unsigned long long)real->vmcb->save.rip);
+            }
+        }
+        hype_guest_uart_write(uart, offset, wv);
     }
 
     /* EXITINFO2 is the resume RIP, same convenience the other IOIO
@@ -1924,6 +2053,75 @@ int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
     } else {
         uint32_t value = 0;
         if (hype_guest_lapic_read(lapic, offset, decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
+/* M4-6b3: route a guest MMIO access to the emulated I/O APIC (0xFEC00000).
+ * Same thin-shim shape as hype_svm_vcpu_handle_lapic_npf: decode the faulting
+ * instruction, dispatch a 32-bit read/write to the pure hype_ioapic_* model,
+ * advance RIP. Returns 0 if handled, -1 to let the caller try the next region
+ * / absorb. */
+int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
+                                    uint64_t ioapic_base_phys, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < ioapic_base_phys ||
+        npf.guest_phys_addr >= ioapic_base_phys + HYPE_IOAPIC_MMIO_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - ioapic_base_phys);
+
+    if (guest_insn_bytes == 0 ||
+        hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+    if (decoded.size_bytes != 4u) {
+        return -1; /* IOREGSEL/IOWIN are 32-bit accesses only */
+    }
+
+    reg = gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        /* M4-6d7 DIAG: RTE-write timeline. Log every redirection-entry write
+         * for the ISA GSIs of interest (1=kbd, 3=COM2, 4=COM1) plus the first
+         * 24 writes overall, with the resulting full RTE -- proves whether the
+         * guest ever unmasks the serial IRQ and what it programs. */
+        if (offset == HYPE_IOAPIC_REG_IOWIN && ioapic->ioregsel >= HYPE_IOAPIC_INDEX_REDIR_BASE) {
+            uint32_t rel = (ioapic->ioregsel & 0xFFu) - HYPE_IOAPIC_INDEX_REDIR_BASE;
+            uint32_t gsi = rel / 2u;
+            static unsigned rte_log_n = 0;
+            if (gsi == 1u || gsi == 3u || gsi == 4u || rte_log_n < 24u) {
+                rte_log_n++;
+                hype_debug_print("fw-1 RTEWR gsi=%u %s=0x%x rip=0x%llx\n", gsi,
+                                 (rel & 1u) ? "hi" : "lo", value,
+                                 (unsigned long long)real->vmcb->save.rip);
+            }
+        }
+        if (hype_ioapic_mmio_write(ioapic, offset, value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_ioapic_mmio_read(ioapic, offset, &value) != 0) {
             return -1;
         }
         *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
@@ -2122,7 +2320,8 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
     return 0;
 }
 
-int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
+int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
+                                     const hype_gpa_map_t *dma_map) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
 
@@ -2135,9 +2334,45 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
         hype_fw_cfg_select(fw, (uint16_t)(real->vmcb->save.rax & 0xFFFFu));
     } else if (io.port == 0x511u) {
         if (!io.is_in) {
-            return -1; /* no writable fw_cfg files in this project's scope */
+            return -1; /* no writable fw_cfg files via the classic port in this scope */
         }
-        real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | hype_fw_cfg_read_byte(fw);
+        if (io.is_string) {
+            /* SVM-STRIO: `rep insb`/`insw`/`insd` from the data port. This is how
+             * OVMF's QemuFwCfgLib fetches the signature/revision and every classic
+             * (non-DMA) read: IoReadFifo8 -> one string-IN exit, not one exit per
+             * byte. Emulate the whole transfer, writing to guest memory at
+             * [ES:RDI], honoring REP count and RFLAGS.DF. Getting this wrong (the
+             * old 1-byte-to-AL behavior) corrupts OVMF's fw_cfg probe so it
+             * concludes fw_cfg is absent and installs no ACPI. */
+            hype_svm_string_io_plan_t plan;
+            uint64_t host;
+            uint64_t u;
+
+            if (hype_svm_build_string_io_plan(&io, real->gprs[7] /* RDI */, real->gprs[1] /* RCX */,
+                                              real->vmcb->save.es.base, real->vmcb->save.rflags,
+                                              &plan) != 0) {
+                return -1;
+            }
+            if (plan.byte_count != 0) {
+                host = guest_dma_xlate(dma_map, plan.low_gpa, plan.byte_count);
+                if (host == 0) {
+                    return -1; /* guest buffer out of range -> reject, don't scribble host memory */
+                }
+                for (u = 0; u < plan.count; u++) {
+                    uint64_t addr = plan.descending ? (plan.start_gpa - u * (uint64_t)plan.unit_bytes)
+                                                     : (plan.start_gpa + u * (uint64_t)plan.unit_bytes);
+                    uint64_t off = addr - plan.low_gpa;
+                    uint8_t b;
+                    for (b = 0; b < plan.unit_bytes; b++) {
+                        ((uint8_t *)(uintptr_t)host)[off + b] = hype_fw_cfg_read_byte(fw);
+                    }
+                }
+            }
+            real->gprs[7] = plan.new_index_reg; /* RDI */
+            real->gprs[1] = plan.new_count_reg; /* RCX */
+        } else {
+            real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | hype_fw_cfg_read_byte(fw);
+        }
     } else if (io.port == 0x514u) {
         if (io.is_in) {
             return -1;
@@ -2145,9 +2380,9 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
         hype_fw_cfg_dma_addr_high(fw, (uint32_t)(real->vmcb->save.rax & 0xFFFFFFFFu));
     } else if (io.port == 0x518u) {
         uint64_t access_phys;
+        uint64_t access_host;
         uint8_t raw[16];
         hype_fw_cfg_dma_op_t op;
-        uint8_t *guest_data;
         uint8_t *control_bytes;
         uint32_t result;
         int i;
@@ -2158,15 +2393,45 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw) {
 
         access_phys = hype_fw_cfg_dma_addr_low(fw, (uint32_t)(real->vmcb->save.rax & 0xFFFFFFFFu));
 
+        /* The 16-byte fw_cfg DMA access struct lives in guest RAM: translate +
+         * bounds-check its guest-physical address (FW-1's RAM is NOT identity-
+         * mapped). */
+        access_host = guest_dma_xlate(dma_map, access_phys, 16);
+        if (access_host == 0) {
+            return -1;
+        }
         for (i = 0; i < 16; i++) {
-            raw[i] = ((const uint8_t *)(uintptr_t)access_phys)[i];
+            raw[i] = ((const uint8_t *)(uintptr_t)access_host)[i];
         }
         hype_fw_cfg_dma_decode(raw, &op);
 
-        guest_data = (uint8_t *)(uintptr_t)op.address;
-        result = hype_fw_cfg_dma_execute(fw, &op, guest_data);
+        {
+            static unsigned n_dc = 0;
+            if (n_dc < 400) {
+                n_dc++;
+                hype_debug_print("DC%u: sel=0x%x ctl=0x%x len=%u addr=0x%llx\n", n_dc,
+                                 (unsigned int)fw->selected_key, (unsigned int)op.control,
+                                 (unsigned int)op.length, (unsigned long long)op.address);
+            }
+        }
 
-        control_bytes = (uint8_t *)(uintptr_t)access_phys;
+        if (op.length != 0) {
+            /* The data buffer is a separate guest-physical range: translate it
+             * with its declared length before the transfer touches it. A bad
+             * range reports a DMA error to the guest rather than scribbling
+             * arbitrary host memory. */
+            uint64_t data_host = guest_dma_xlate(dma_map, op.address, op.length);
+            if (data_host == 0) {
+                result = HYPE_FW_CFG_DMA_CTL_ERROR;
+            } else {
+                result = hype_fw_cfg_dma_execute(fw, &op, (uint8_t *)(uintptr_t)data_host);
+            }
+        } else {
+            /* SELECT-only / zero-length: no data buffer touched. */
+            result = hype_fw_cfg_dma_execute(fw, &op, 0);
+        }
+
+        control_bytes = (uint8_t *)(uintptr_t)access_host;
         control_bytes[0] = (uint8_t)(result >> 24);
         control_bytes[1] = (uint8_t)(result >> 16);
         control_bytes[2] = (uint8_t)(result >> 8);

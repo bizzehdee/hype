@@ -15,6 +15,7 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->lvt_timer_armed_seen = 0;
     lapic->timer_irq_pending = 0;
     lapic->timer_in_service = 0;
+    lapic->eoi_count = 0;
 }
 
 uint32_t hype_guest_lapic_divisor(uint32_t divide_config) {
@@ -108,9 +109,12 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
             lapic->divide_config = value;
             return 0;
         case HYPE_GUEST_LAPIC_REG_EOI:
-            /* End-of-interrupt: the guest's timer ISR has finished;
-             * clear in-service so the next expiry can be delivered. */
+            /* End-of-interrupt: the guest's ISR has finished. Clear the timer
+             * in-service (so the next expiry can be delivered) and bump the EOI
+             * counter so the FW-1 loop can drop a level line's IO-APIC
+             * Remote-IRR (real hardware broadcasts this EOI to the IO-APIC). */
             lapic->timer_in_service = 0;
+            lapic->eoi_count++;
             return 0;
         case HYPE_GUEST_LAPIC_REG_ID:
         case HYPE_GUEST_LAPIC_REG_VERSION:
@@ -155,8 +159,16 @@ void hype_guest_lapic_tick(hype_guest_lapic_t *lapic) {
 void hype_guest_lapic_advance(hype_guest_lapic_t *lapic, uint64_t ticks) {
     uint32_t divisor;
     uint64_t total;
-    /* Timer disarmed (init_count == 0) or masked: nothing to do. */
-    if (lapic->init_count == 0 || (lapic->lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED) != 0) {
+    /* Timer disarmed (init_count == 0): nothing counts. NOTE: a MASKED timer is
+     * NOT disarmed -- on real hardware the count register keeps decrementing
+     * whenever init_count != 0, and the LVT mask bit only suppresses the
+     * *interrupt* on expiry, never the counting. Freezing the counter while
+     * masked broke Linux's LAPIC-timer calibration, which programs the timer,
+     * masks the LVT, and reads current_count to measure the rate: it saw a
+     * stuck counter, so an ACPI-mode guest (which uses the LAPIC timer as its
+     * clockevent) could never establish a working timer and hung in early boot
+     * waiting for the first tick. The mask is honored below, at IRQ time only. */
+    if (lapic->init_count == 0) {
         lapic->timer_irq_pending = 0;
         lapic->divide_accum = 0;
         return;
@@ -189,8 +201,13 @@ void hype_guest_lapic_advance(hype_guest_lapic_t *lapic, uint64_t ticks) {
     }
 
     if (ticks >= (uint64_t)lapic->current_count) {
-        /* Counter crossed terminal count -> the timer expired. */
-        lapic->timer_irq_pending = 1;
+        /* Counter crossed terminal count -> the timer expired. The mask bit
+         * gates only interrupt DELIVERY: a masked timer still expires/reloads
+         * (so the counter Linux reads keeps moving during calibration) but
+         * raises no IRQ. */
+        if ((lapic->lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED) == 0) {
+            lapic->timer_irq_pending = 1;
+        }
         if ((lapic->lvt_timer & HYPE_GUEST_LAPIC_LVT_PERIODIC) != 0) {
             /* Reload from init_count, carrying the overshoot forward so
              * the periodic phase stays roughly aligned to real time. */

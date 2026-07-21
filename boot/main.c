@@ -210,6 +210,7 @@ typedef struct hype_fw_vm {
     hype_pci_t pci;
     hype_cmos_t cmos;
     hype_guest_lapic_t lapic; /* FW-1b: guest Local APIC (0xFEE00000) */
+    hype_ioapic_t ioapic;     /* M4-6b3: guest I/O APIC (0xFEC00000) */
     hype_guest_uart_t uart;   /* FW-1e: COM1 0x3F8 */
     hype_guest_uart_t uart2;  /* FW-1e: COM2 0x2F8 -- OVMF probes/uses both */
     hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
@@ -250,6 +251,7 @@ static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
 #define g_fw_1_pci (vm->pci)
 #define g_fw_1_cmos (vm->cmos)
 #define g_fw_1_lapic (vm->lapic)
+#define g_fw_1_ioapic (vm->ioapic)
 #define g_fw_1_uart (vm->uart)
 #define g_fw_1_uart2 (vm->uart2)
 #define g_fw_1_ps2 (vm->ps2)
@@ -492,14 +494,20 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
     }
 }
 #define HYPE_PIT_HZ 1193182ULL
-/* M4-6b5: the guest LAPIC timer's base (pre-divide) input frequency, expressed
- * as a multiple of PIT_HZ so it reuses the loop's already-computed real-elapsed
- * PIT-tick count without a second accumulator. PIT_HZ x 100 ~= 119.3 MHz -- a
- * realistic bus-clock LAPIC rate (was, wrongly, PIT_HZ x 1 = 1.19 MHz, ~100x
- * too slow, which made Linux calibrate an implausible frequency and abandon the
- * LAPIC timer for the coarse 100 Hz PIT). hype_guest_lapic_advance then divides
- * this by the guest's Divide Configuration Register. */
-#define HYPE_GUEST_LAPIC_MULT 100ULL
+/* M4-6b2: the guest LAPIC timer's base (pre-divide) input frequency in Hz.
+ * MUST be OVMF's advertised PcdFSBClock = 1,000,000,000 Hz (edk2
+ * OvmfPkgX64.dsc): OVMF's LocalApicTimerDxe programs its periodic Timer Arch
+ * Protocol tick as FSBClock/100 = 10,000,000 counts believing that is 10 ms,
+ * and every gBS timer event / Stall / GRUB menu countdown advances off that
+ * assumption. Running the LAPIC at any other rate makes OVMF's whole notion of
+ * time wrong: at the old PIT_HZ x 100 = 119.3 MHz, a 10,000,000-count "10 ms"
+ * tick took 83.8 ms (8.38x slow), so GRUB's timeout=1 never elapsed and the
+ * guest hung at the menu. Linux (which *measures* the LAPIC rate) adapts to
+ * 1 GHz fine -- it only needs a plausible non-tiny frequency. The FW-1 loop
+ * advances the LAPIC by (real elapsed / this rate) via a fractional accumulator
+ * (was: PIT-tick-count x MULT); hype_guest_lapic_advance divides by the guest's
+ * Divide Configuration Register. */
+#define HYPE_GUEST_LAPIC_HZ 1000000000ULL
 /* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
  * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
  * guest-physical address in the 32-bit PCI MMIO aperture, and enables
@@ -543,6 +551,15 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * not-present by FW-1a's NPT map, so ECAM MMIO traps here as an NPF and
  * is serviced by PCI-1's own config-space model. */
 #define HYPE_FW_1_ECAM_GPA 0xE0000000ULL
+/* M4-6b3: guest I/O APIC MMIO base -- the address the FW-1 MADT advertises
+ * (devices/acpi.h cfg.io_apic_address). Not-present in the NPT like the LAPIC
+ * region, so a guest access faults into hype_svm_vcpu_handle_ioapic_npf. */
+#define HYPE_FW_1_IOAPIC_GPA 0xFEC00000ULL
+/* M4-6b2/M4-6b3: the I/O APIC GSI the AHCI function's INTA is routed to. MUST
+ * match the DSDT _PRT (devices/dsdt.asl: dev 2 INTA -> GSI 0x10). In APIC mode
+ * the guest programs IO-APIC RTE[16] for AHCI and ignores the legacy PCI
+ * Interrupt Line, so hype raises the AHCI line here rather than on line 11. */
+#define HYPE_FW_1_AHCI_GSI 16u
 
 /* FW-1d: OVMF never executes HLT during DXE/BDS init -- its idle wait
  * (CpuSleep) HLTs only once everything is up. Empirically it reaches
@@ -1385,7 +1402,7 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
-            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_m4_4_fw_cfg) != 0) {
+            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_m4_4_fw_cfg, 0) != 0) {
                 hype_fatal("m4-4: unhandled guest port I/O (qual=0x%llx guest_rip=0x%llx)",
                            (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
             }
@@ -1907,7 +1924,7 @@ static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t ki
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
-            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_video_2_fw_cfg) != 0) {
+            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_video_2_fw_cfg, 0) != 0) {
                 hype_fatal("video-2: unhandled guest port I/O (qual=0x%llx guest_rip=0x%llx)",
                            (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
             }
@@ -4631,6 +4648,33 @@ static const uint8_t *fw_1_insn_bytes_via_ptwalk(hype_fw_vm_t *vm, hype_vcpu_ctx
     return fw_1_guest_phys_to_host(vm, guest_rip);
 }
 
+/* M4-6d5 DIAG: copy `len` bytes from guest virtual address `gva` (translated
+ * through guest `cr3`) into `dst`. Per-4K-page translation, since a GVA range
+ * can straddle non-contiguous guest-physical pages. Returns 1 iff every byte
+ * was read. Read-only; touches no vcpu state. */
+static int fw_1_read_guest_va(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva, void *dst, uint64_t len) {
+    uint8_t *out = (uint8_t *)dst;
+    while (len != 0) {
+        uint64_t gpa = 0;
+        uint64_t page_off = gva & 0xFFFULL;
+        uint64_t chunk = 0x1000ULL - page_off;
+        const uint8_t *hp;
+        uint64_t i;
+        if (chunk > len) { chunk = len; }
+        if (fw_1_guest_virt_to_phys(vm, cr3, gva, &gpa) != 0) { return 0; }
+        hp = fw_1_guest_phys_to_host(vm, gpa);
+        if (hp == 0) { return 0; }
+        for (i = 0; i < chunk; i++) { out[i] = hp[i]; }
+        out += chunk; gva += chunk; len -= chunk;
+    }
+    return 1;
+}
+static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva, int *ok) {
+    uint64_t v = 0;
+    *ok = fw_1_read_guest_va(vm, cr3, gva, &v, 8);
+    return v;
+}
+
 /* FW-1e: drain the guest UART's transmit ring, strip terminal escape
  * sequences (hype's GOP console can't interpret them), and emit the
  * guest's console output to hype's own console (serial + GOP) one line
@@ -4867,6 +4911,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_pic_emu_reset(&g_fw_1_pic);
     hype_pit_emu_reset(&g_fw_1_pit);
     hype_guest_lapic_reset(&g_fw_1_lapic);
+    hype_ioapic_reset(&g_fw_1_ioapic); /* M4-6b3: guest I/O APIC at 0xFEC00000 */
     hype_guest_uart_reset(&g_fw_1_uart);
     hype_guest_uart_reset(&g_fw_1_uart2);
     hype_ps2_kbd_reset(&g_fw_1_ps2);
@@ -5181,10 +5226,62 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     /* M4-6b1: drive the guest timebase from real elapsed host TSC. */
     uint64_t tb_last_tsc = hype_rdtsc();
     uint64_t tb_accum = 0; /* fractional-tick carry (units of host TSC * PIT_HZ) */
+    /* M4-6b2 DIAG: NON-timer progress watchdog + one-shot idle-state probe. A
+     * self-rearming NOHZ LAPIC timer (HLT + LAPIC-MMIO NPF) must NOT count as
+     * forward progress, else a switch_root/OpenRC idle hang looks alive. Track
+     * device work only (IOIO, console output, AHCI completions); when there is
+     * none for ~2s, snapshot the full interrupt/timer state ONCE. */
+    uint64_t last_nontimer_tsc = tb_last_tsc;
+    unsigned long long nontimer_sig = 0;
+    int idle_probe_done = 0;
+    /* M4-6b2 DIAG: ring of the last 64 non-HLT, non-host-INTR exits before idle
+     * -- RIP + exit reason + qualification (IOIO port / NPF flags). Dumped once
+     * with IDLEPROBE to show what put the guest to sleep (a completed
+     * switch_root, an unfinished device op, or a no-runnable-task failure). */
+    uint64_t tr_rip[64];
+    uint32_t tr_reason[64];
+    uint64_t tr_qual[64];
+    unsigned tr_head = 0, tr_cnt = 0;
+    /* M4-6b2 DIAG: HLT idle-wait histogram. Buckets (us): [0]<100 [1]<1000
+     * [2]<10000 [3]>=10000. req = requested deadline BEFORE the 10ms cap; act =
+     * actual host time spun (after cap). src_* = which timer(s) were armed.
+     * zero = HLTs with no armed timer (immediate re-enter / spin). */
+    unsigned long long hltw_req[4] = {0, 0, 0, 0};
+    unsigned long long hltw_act[4] = {0, 0, 0, 0};
+    unsigned long long hltw_zero = 0, hltw_src_pit = 0, hltw_src_lapic = 0, hltw_src_both = 0;
+    uint64_t lapic_tick_accum = 0; /* M4-6b2: fractional carry converting PIT-rate
+                                    * ticks to the LAPIC's 1 GHz base rate */
     /* M4-6d2b: host TSC of the most recent productive (non-HLT) exit --
      * "last time the guest did real work". The idle detector measures
      * wall-clock since this to decide the guest is quiescent. */
     uint64_t last_progress_tsc = tb_last_tsc;
+    /* M4-6b2: last guest LAPIC EOI count acted on -- when it advances, the guest
+     * finished an ISR and broadcast EOI, so drop the AHCI level line's IO-APIC
+     * Remote-IRR (models the LAPIC->IO-APIC EOI broadcast; without it a fresh
+     * completion races a stuck Remote-IRR -> 30s ATAPI timeouts). */
+    uint64_t ahci_last_eoi = 0;
+    /* M4-6d5 DIAG: once the guest is detected idle at the switch_root/OpenRC
+     * handoff (idle_probe_done), inject Magic SysRq+w ("show blocked tasks")
+     * via the PS/2 keyboard so the guest kernel itself prints the sleeping
+     * tasks' backtraces on ttyS0 -- naming the exact wait site without a
+     * KASLR slide or module symbols. Scancode set 1 (controller translation
+     * on, atkbd's default): LeftAlt 0x38, SysRq 0x54 (Alt+PrintScreen's
+     * dedicated code -> KEY_SYSRQ arms sysrq), W 0x11 (the 'w' command), then
+     * their breaks (make|0x80). Each byte needs its own IRQ1 edge (GSI1): the
+     * i8042 ISR reads one byte per interrupt, so feed the next only once the
+     * guest has read the previous (kbd OBF clear). */
+    static const uint8_t sysrq_seq[] = { 0x38u, 0x54u, 0x11u, 0x91u, 0xD4u, 0xB8u };
+    unsigned sysrq_idx = 0;
+    int sysrq_active = 0;
+    uint64_t sysrq_feed_tsc = 0; /* host TSC when the current byte was fed (stall detect) */
+    int sysrq_stall_logged = 0;
+    /* M4-6d6 DIAG: the firmware/GRUB idle is a spin-wait for a 64-bit counter
+     * to change. Latch its guest-VA at the idle probe and sample it on each
+     * subsequent exit -- frozen => whatever should bump it (a timer/event ISR)
+     * isn't running; advancing => GRUB left this wait and is stuck elsewhere. */
+    uint64_t cw_addr = 0;
+    unsigned cw_n = 0;
+    uint64_t cw_prev = 0;
 
     hype_vt_filter_reset(&uart_filter);
     hype_vt_filter_reset(&uart_filter2);
@@ -5510,6 +5607,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      elapsed_ms, hlt_wait_ms,
                                      elapsed_ms ? (hlt_wait_ms * 100ULL / elapsed_ms) : 0ULL,
                                      perf_hlt_if1, perf_hlt_if0, perf_preempt_if1, perf_preempt_if0);
+                    hype_debug_print("fw-1 HLTWAIT: req[<100us=%llu <1ms=%llu <10ms=%llu >=10ms=%llu] "
+                                     "act[<100us=%llu <1ms=%llu <10ms=%llu >=10ms=%llu] zero=%llu | "
+                                     "src pit=%llu lapic=%llu both=%llu\n",
+                                     hltw_req[0], hltw_req[1], hltw_req[2], hltw_req[3],
+                                     hltw_act[0], hltw_act[1], hltw_act[2], hltw_act[3], hltw_zero,
+                                     hltw_src_pit, hltw_src_lapic, hltw_src_both);
                 }
                 /* M4-6d4: companion line to EXHIST. The real-HW soft lockups
                  * (blkid stuck 24s, kworker stuck 26s -- confirmed by a
@@ -5676,6 +5779,265 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             if (info.reason != HYPE_SVM_EXITCODE_HLT) {
                 last_progress_tsc = now_tsc;
             }
+            /* M4-6b2 DIAG: non-timer progress -- device port I/O (IOIO) or a
+             * change in guest console output / AHCI completions. NOHZ timer
+             * activity (HLT + LAPIC NPF + timer IRQ) deliberately excluded. */
+            {
+                unsigned long long ntsig = console_chars + ahci_irqs;
+                if (info.reason == HYPE_SVM_EXITCODE_IOIO || ntsig != nontimer_sig) {
+                    last_nontimer_tsc = now_tsc;
+                    nontimer_sig = ntsig;
+                }
+                /* transition ring: record non-HLT, non-host-INTR exits. For NPF,
+                 * store the fault GPA and EXCLUDE the LAPIC region (0xFEE00xxx):
+                 * that is just the NOHZ idle cycling (native_apic_mem_eoi +
+                 * timer re-arm), which would otherwise fill the ring during the
+                 * 2s idle and hide the real pre-idle transition we want. */
+                if (!idle_probe_done && info.reason != HYPE_SVM_EXITCODE_HLT &&
+                    info.reason != HYPE_SVM_EXITCODE_INTR) {
+                    uint64_t detail = info.qualification;
+                    int skip = 0;
+                    if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+                        hype_svm_debug_state_t d;
+                        hype_svm_vcpu_get_debug_state(ctx, &d);
+                        detail = d.exitinfo2;
+                        if ((detail & ~0xFFFULL) == 0xFEE00000ULL) { skip = 1; }
+                    }
+                    if (!skip) {
+                        tr_rip[tr_head] = info.guest_rip;
+                        tr_reason[tr_head] = (uint32_t)info.reason;
+                        tr_qual[tr_head] = detail;
+                        tr_head = (tr_head + 1u) % 64u;
+                        if (tr_cnt < 64u) tr_cnt++;
+                    }
+                }
+                if (!idle_probe_done && g_fw_1_host_tsc_hz != 0 &&
+                    now_tsc - last_nontimer_tsc >= 2ULL * g_fw_1_host_tsc_hz) {
+                    hype_svm_intr_state_t ip;
+                    const uint8_t *ib;
+                    idle_probe_done = 1;
+                    sysrq_active = 1; /* M4-6d5: begin the SysRq+w injection below */
+                    hype_svm_vcpu_get_intr_state(ctx, &ip);
+                    ib = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
+                    hype_debug_print(
+                        "fw-1 IDLEPROBE: rip=0x%llx IF=%d shadow=0x%llx eventinj=0x%llx vintr=0x%llx "
+                        "can_accept=%d irr_hi=%d/vec0x%x insn=%02x %02x %02x %02x\n",
+                        (unsigned long long)info.guest_rip, (int)((ip.rflags >> 9) & 1u),
+                        (unsigned long long)ip.interrupt_shadow, (unsigned long long)ip.eventinj,
+                        (unsigned long long)ip.vintr, ip.can_accept, ip.pending_valid,
+                        (unsigned int)ip.pending_vector, ib ? ib[0] : 0, ib ? ib[1] : 0,
+                        ib ? ib[2] : 0, ib ? ib[3] : 0);
+                    /* M4-6d6 DIAG: the firmware/GRUB idle is a pure memory-poll
+                     * spin (no I/O). Dump 64 bytes of code around RIP so the
+                     * loop body + the memory operand it polls can be decoded
+                     * offline -- that names the wait condition without OVMF
+                     * symbols. Guest CR3 here is OVMF's identity map. */
+                    {
+                        uint64_t cr3d = hype_svm_vcpu_get_cr3(ctx);
+                        uint64_t base = info.guest_rip - 0x20ULL;
+                        uint8_t win[64];
+                        unsigned r;
+                        for (r = 0; r < 64u; r++) { win[r] = 0; }
+                        fw_1_read_guest_va(vm, cr3d, base, win, 64);
+                        /* Locate the polled counter: find the `48 3b 05 <disp32>`
+                         * (cmp rax,[rip+d]) in the window and resolve its target. */
+                        for (r = 0; r + 7u <= 64u; r++) {
+                            if (win[r] == 0x48u && win[r+1] == 0x3bu && win[r+2] == 0x05u) {
+                                int32_t disp = (int32_t)((uint32_t)win[r+3] | ((uint32_t)win[r+4] << 8) |
+                                                         ((uint32_t)win[r+5] << 16) | ((uint32_t)win[r+6] << 24));
+                                cw_addr = (base + r + 7u) + (uint64_t)(int64_t)disp;
+                                break;
+                            }
+                        }
+                        hype_debug_print("fw-1 IDLECODE: polled-counter VA = 0x%llx\n",
+                                         (unsigned long long)cw_addr);
+                        for (r = 0; r < 64u; r += 16u) {
+                            hype_debug_print(
+                                "fw-1 IDLECODE 0x%llx: %02x %02x %02x %02x %02x %02x %02x %02x "
+                                "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                (unsigned long long)(base + r),
+                                win[r], win[r+1], win[r+2], win[r+3], win[r+4], win[r+5], win[r+6],
+                                win[r+7], win[r+8], win[r+9], win[r+10], win[r+11], win[r+12],
+                                win[r+13], win[r+14], win[r+15]);
+                        }
+                    }
+                    hype_debug_print(
+                        "fw-1 IDLEPROBE2: LAPIC lvt=0x%x tmr_pend=%d tmr_insvc=%d | ioRTE[16]=0x%llx "
+                        "ioRTE[8]=0x%llx ioRTE[4]=0x%llx ioRTE[3]=0x%llx ioRTE[1]=0x%llx\n",
+                        (unsigned int)g_fw_1_lapic.lvt_timer, g_fw_1_lapic.timer_irq_pending,
+                        g_fw_1_lapic.timer_in_service, (unsigned long long)g_fw_1_ioapic.rte[16],
+                        (unsigned long long)g_fw_1_ioapic.rte[8], (unsigned long long)g_fw_1_ioapic.rte[4],
+                        (unsigned long long)g_fw_1_ioapic.rte[3], (unsigned long long)g_fw_1_ioapic.rte[1]);
+                    hype_debug_print(
+                        "fw-1 IDLEPROBE3: mIRR=0x%x mISR=0x%x mIMR=0x%x sIRR=0x%x sISR=0x%x sIMR=0x%x | "
+                        "AHCI p_is=0x%x p_ie=0x%x p_ci=0x%x irq_pending=%d\n",
+                        (unsigned int)g_fw_1_pic.master.irr, (unsigned int)g_fw_1_pic.master.isr,
+                        (unsigned int)g_fw_1_pic.master.imr, (unsigned int)g_fw_1_pic.slave.irr,
+                        (unsigned int)g_fw_1_pic.slave.isr, (unsigned int)g_fw_1_pic.slave.imr,
+                        (unsigned int)g_fw_1_ahci.p_is, (unsigned int)g_fw_1_ahci.p_ie,
+                        (unsigned int)g_fw_1_ahci.p_ci, hype_ahci_irq_pending(&g_fw_1_ahci));
+                    /* Dump the transition ring oldest->newest. reason: 0x7b=IOIO
+                     * (qual bits 31:16 = port, bit0 = IN), 0x400=NPF, 0x72=CPUID,
+                     * 0x7c=MSR, 0x64=VINTR, ... */
+                    {
+                        unsigned i;
+                        for (i = 0; i < tr_cnt; i++) {
+                            unsigned idx = (tr_head + 64u - tr_cnt + i) % 64u;
+                            hype_debug_print("fw-1 TR#%02u: rip=0x%llx reason=0x%x qual=0x%llx\n", i,
+                                             (unsigned long long)tr_rip[idx], (unsigned)tr_reason[idx],
+                                             (unsigned long long)tr_qual[idx]);
+                        }
+                    }
+                    /* M4-6d5 DIAG: SysRq is undeliverable at this idle (the guest
+                     * has wired no console-input IRQ -- RTE[1] and RTE[4] both
+                     * masked), so read the blocked-task set straight from guest
+                     * RAM. Walk init_task.tasks, printing each process's comm,
+                     * scheduler __state and pid; for blocked (non-running) tasks
+                     * dump the kernel-text return addresses on its stack so the
+                     * wait site can be symbolized offline against System.map.
+                     * task_struct offsets are from the alpine 6.12.81-lts vmlinux
+                     * BTF; the KASLR slide is derived from the idle RIP
+                     * (pv_native_safe_halt+0xe, 2MB-aligned) and validated below
+                     * against init_task.comm == "swapper" before trusting the
+                     * walk. Read-only guest introspection; changes no guest state. */
+                    {
+                        const uint64_t SAFE_HALT_LINK = 0xffffffff81c81c20ULL;
+                        const uint64_t INIT_TASK_LINK = 0xffffffff82c10940ULL;
+                        const uint64_t KTEXT_LO = 0xffffffff81000000ULL;
+                        const uint64_t KIMG_HI = 0xffffffff83000000ULL;
+                        const uint64_t OFF_STATE = 24, OFF_PID = 1504;
+                        const uint64_t OFF_COMM = 2048, OFF_TASKS = 1296, OFF_THREAD_SP = 6936;
+                        uint64_t cr3 = hype_svm_vcpu_get_cr3(ctx);
+                        uint64_t slide = (info.guest_rip - SAFE_HALT_LINK) & ~0x1FFFFFULL;
+                        uint64_t init_task = INIT_TASK_LINK + slide;
+                        char comm[17];
+                        comm[16] = 0;
+                        fw_1_read_guest_va(vm, cr3, init_task + OFF_COMM, comm, 16);
+                        hype_debug_print("fw-1 TASKWALK: slide=0x%llx init_task=0x%llx comm=\"%s\" "
+                                         "(expect swapper)\n", (unsigned long long)slide,
+                                         (unsigned long long)init_task, comm);
+                        if (comm[0] == 's' && comm[1] == 'w') {
+                            int ok = 0;
+                            uint64_t node = fw_1_read_guest_u64(vm, cr3, init_task + OFF_TASKS, &ok);
+                            unsigned n;
+                            for (n = 0; ok && n < 512u; n++) {
+                                uint64_t task = node - OFF_TASKS;
+                                uint32_t st = 0xffffffffu, pid = 0;
+                                const char *tag;
+                                if (task == init_task) { break; }
+                                fw_1_read_guest_va(vm, cr3, task + OFF_STATE, &st, 4);
+                                fw_1_read_guest_va(vm, cr3, task + OFF_PID, &pid, 4);
+                                comm[16] = 0;
+                                if (!fw_1_read_guest_va(vm, cr3, task + OFF_COMM, comm, 16)) { break; }
+                                tag = (st == 0) ? "R" : (st & 2u) ? "D" : (st & 1u) ? "S" : "?";
+                                hype_debug_print("fw-1 TASK pid=%u state=0x%x [%s] comm=\"%s\"\n",
+                                                 (unsigned)pid, (unsigned)st, tag, comm);
+                                /* blocked task: dump kernel-image return addrs on its stack */
+                                if (st != 0) {
+                                    int oks = 0;
+                                    uint64_t sp = fw_1_read_guest_u64(vm, cr3, task + OFF_THREAD_SP, &oks);
+                                    if (oks && sp >= 0xffff800000000000ULL) {
+                                        unsigned k, hits = 0;
+                                        for (k = 0; k < 96u && hits < 14u; k++) {
+                                            int okv = 0;
+                                            uint64_t v = fw_1_read_guest_u64(vm, cr3, sp + (uint64_t)k * 8ULL, &okv);
+                                            if (!okv) { break; }
+                                            if (v >= KTEXT_LO + slide && v < KIMG_HI + slide) {
+                                                hype_debug_print("fw-1   stk+%03u=0x%llx link=0x%llx\n",
+                                                                 (unsigned)(k * 8u), (unsigned long long)v,
+                                                                 (unsigned long long)(v - slide));
+                                                hits++;
+                                            }
+                                        }
+                                    }
+                                }
+                                node = fw_1_read_guest_u64(vm, cr3, node, &ok);
+                            }
+                            hype_debug_print("fw-1 TASKWALK: done, %u tasks\n", n);
+                            /* M4-6d7 DIAG: dump the kernel's own vector->irq
+                             * routing table (per-CPU vector_irq[]) with each
+                             * descriptor's irq number, irqchip name and
+                             * handler (irqaction) name. Tells us directly
+                             * which chip Linux bound irq4/ttyS0 to (IO-APIC /
+                             * XT-PIC / none) without any console. Offsets from
+                             * the 6.12.81-lts vmlinux BTF: irq_desc.irq_data
+                             * +88 (irq +4, chip +24), .action +160;
+                             * irqaction.name +80; irq_chip.name +0.
+                             * vector_irq percpu offset 0x1bfe0;
+                             * __per_cpu_offset[] at 0xffffffff824db200. */
+                            {
+                                const uint64_t PCPU_OFF_TBL = 0xffffffff824db200ULL + slide;
+                                const uint64_t VECTOR_IRQ_PCPU = 0x1bfe0ULL;
+                                int okp = 0;
+                                uint64_t pcpu0 = fw_1_read_guest_u64(vm, cr3, PCPU_OFF_TBL, &okp);
+                                if (okp) {
+                                    uint64_t vtab = pcpu0 + VECTOR_IRQ_PCPU;
+                                    unsigned vec;
+                                    hype_debug_print("fw-1 VECMAP: pcpu0=0x%llx vector_irq=0x%llx\n",
+                                                     (unsigned long long)pcpu0,
+                                                     (unsigned long long)vtab);
+                                    for (vec = 0x20u; vec < 256u; vec++) {
+                                        int okd = 0;
+                                        uint64_t desc = fw_1_read_guest_u64(vm, cr3, vtab + (uint64_t)vec * 8ULL, &okd);
+                                        if (!okd || desc < 0xffff800000000000ULL) { continue; }
+                                        {
+                                            uint32_t irqn = 0xffffffffu;
+                                            uint64_t chip = 0, chip_name = 0, action = 0, act_name = 0;
+                                            char cn[17], an[17];
+                                            int okx = 0;
+                                            cn[0] = an[0] = 0; cn[16] = an[16] = 0;
+                                            fw_1_read_guest_va(vm, cr3, desc + 88u + 4u, &irqn, 4);
+                                            chip = fw_1_read_guest_u64(vm, cr3, desc + 88u + 24u, &okx);
+                                            if (okx && chip >= 0xffff800000000000ULL) {
+                                                chip_name = fw_1_read_guest_u64(vm, cr3, chip, &okx);
+                                                if (okx && chip_name >= 0xffff800000000000ULL) {
+                                                    fw_1_read_guest_va(vm, cr3, chip_name, cn, 16);
+                                                }
+                                            }
+                                            action = fw_1_read_guest_u64(vm, cr3, desc + 160u, &okx);
+                                            if (okx && action >= 0xffff800000000000ULL) {
+                                                act_name = fw_1_read_guest_u64(vm, cr3, action + 80u, &okx);
+                                                if (okx && act_name >= 0xffff800000000000ULL) {
+                                                    fw_1_read_guest_va(vm, cr3, act_name, an, 16);
+                                                }
+                                            }
+                                            hype_debug_print("fw-1 VEC 0x%x irq=%u chip=\"%s\" action=\"%s\"\n",
+                                                             vec, (unsigned)irqn, cn, an);
+                                        }
+                                    }
+                                    hype_debug_print("fw-1 VECMAP: done\n");
+                                }
+                            }
+                        } else {
+                            hype_debug_print("fw-1 TASKWALK: slide validation FAILED (comm != swapper) "
+                                             "-- not walking\n");
+                        }
+                    }
+                }
+            }
+            /* M4-6d6 DIAG: after idle is detected, sample the GRUB-spin polled
+             * counter on each subsequent exit. Frozen (d=0) => the timer/event
+             * ISR that should bump it isn't running; advancing => GRUB moved on
+             * and is wedged elsewhere. reason/rip show what exit we sampled at. */
+            if (idle_probe_done && cw_addr != 0 && cw_n < 24u) {
+                int okc = 0;
+                uint64_t v = fw_1_read_guest_u64(vm, hype_svm_vcpu_get_cr3(ctx), cw_addr, &okc);
+                if (okc) {
+                    uint64_t detail = info.qualification;
+                    if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+                        hype_svm_debug_state_t dd;
+                        hype_svm_vcpu_get_debug_state(ctx, &dd);
+                        detail = dd.exitinfo2; /* MMIO fault GPA */
+                    }
+                    hype_debug_print("fw-1 CWATCH#%02u: [0x%llx]=0x%llx d=%lld reason=0x%x rip=0x%llx "
+                                     "detail=0x%llx\n",
+                                     cw_n, (unsigned long long)cw_addr, (unsigned long long)v,
+                                     (long long)((int64_t)(v - cw_prev)), (unsigned)info.reason,
+                                     (unsigned long long)info.guest_rip, (unsigned long long)detail);
+                    cw_prev = v;
+                    cw_n++;
+                }
+            }
             if (g_fw_1_host_tsc_hz != 0) {
                 /* Cap the delta only to prevent the delta * PIT_HZ
                  * multiply from overflowing (UINT64_MAX / PIT_HZ is ~1.5e13
@@ -5701,14 +6063,37 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 ticks = 1;
             }
             if (ticks != 0) {
-                /* M4-6b5: advance the LAPIC timer at its realistic base rate
-                 * (PIT_HZ x MULT), divided by the guest's DCR inside advance();
-                 * advance the PIT at its own 1.19 MHz rate. */
-                hype_guest_lapic_advance(&g_fw_1_lapic, ticks * HYPE_GUEST_LAPIC_MULT);
+                /* M4-6b2: advance the LAPIC timer at OVMF's advertised 1 GHz FSB
+                 * clock (HYPE_GUEST_LAPIC_HZ), converting the PIT-rate `ticks`
+                 * (at PIT_HZ) with a fractional accumulator so the base rate is
+                 * exactly 1 GHz regardless of loop granularity -- OVMF's timers
+                 * assume this rate (was PIT_HZ x 100 = 119.3 MHz, 8.38x slow ->
+                 * GRUB countdown never elapsed). advance() then divides by the
+                 * guest's DCR. No overflow: `ticks` is bounded by the 300 s delta
+                 * cap (<=~358M), and 358M x 1e9 < 2^64. */
+                {
+                    uint64_t lapic_ticks;
+                    lapic_tick_accum += (uint64_t)ticks * HYPE_GUEST_LAPIC_HZ;
+                    lapic_ticks = lapic_tick_accum / HYPE_PIT_HZ;
+                    lapic_tick_accum -= lapic_ticks * HYPE_PIT_HZ;
+                    hype_guest_lapic_advance(&g_fw_1_lapic, lapic_ticks);
+                }
+                /* advance the PIT at its own 1.19 MHz rate. */
                 /* Channel-0 terminal-count crossings during this advance
                  * are PIT IRQ0 timer edges (M4-6b4). */
                 if (hype_pit_emu_advance(&g_fw_1_pit, ticks) != 0) {
                     hype_pic_emu_raise_irq(&g_fw_1_pic.master, 0);
+                    /* M4-6b3: the PIT output is also wired to the I/O APIC. The
+                     * MADT maps ISA IRQ0 -> GSI2 (the standard PC override), so
+                     * an ACPI-mode guest (PIC masked) receives the tick via the
+                     * IO-APIC RTE[2]. Raising both is how real chipsets wire it;
+                     * whichever the guest unmasked delivers. */
+                    {
+                        uint8_t iov;
+                        if (hype_ioapic_raise(&g_fw_1_ioapic, 2u, &iov)) {
+                            hype_svm_vcpu_request_interrupt(ctx, iov);
+                        }
+                    }
                 }
             }
         }
@@ -5723,6 +6108,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * 11, a slave-PIC line). Only (re)raise when that line isn't
          * already in service, so a still-asserted level doesn't re-request
          * while the guest's ISR is running. */
+        /* M4-6b2: model the LAPIC->IO-APIC EOI broadcast. When the guest
+         * finishes an ISR it writes LAPIC EOI (eoi_count bumps); for the
+         * level-triggered AHCI line that is what clears Remote-IRR on real
+         * hardware. Doing it here (not only via the line-low deassert below)
+         * closes a race: if a fresh completion sets PxIS after the guest
+         * cleared the previous one but before hype's deassert runs,
+         * ahci_irq_pending stays true so the deassert branch is skipped and
+         * Remote-IRR would stay stuck-set, blocking the new completion's IRQ
+         * until libata's 30s timeout resets the port. Clearing on EOI lets the
+         * next raise (below) inject the pending completion immediately. */
+        if (g_fw_1_lapic.eoi_count != ahci_last_eoi) {
+            ahci_last_eoi = g_fw_1_lapic.eoi_count;
+            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
+        }
         if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
             if (line != 0u && line < 16u) {
@@ -5734,6 +6133,24 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     ahci_irqs++;
                 }
             }
+            /* M4-6b2/M4-6b3: APIC-mode path -- the DSDT _PRT maps AHCI INTA ->
+             * GSI 16 (HYPE_FW_1_AHCI_GSI), so an ACPI-mode guest programmed
+             * IO-APIC RTE[16] for it (NOT the legacy PCI line). Route through
+             * the IO-APIC on that GSI. Level-triggered: Remote-IRR gates
+             * re-injection until the line deasserts (below). */
+            {
+                uint8_t iov;
+                if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
+                    hype_svm_vcpu_request_interrupt(ctx, iov);
+                    ahci_irqs++;
+                }
+            }
+        } else if (ahci_mapped) {
+            /* AHCI IRQ line deasserted (guest serviced it -> PxIS cleared):
+             * drop the IO-APIC Remote-IRR so the next completion re-injects.
+             * Models a level line going low; the guest's LAPIC EOI need not be
+             * decoded (hype's minimal LAPIC doesn't track the ISR vector). */
+            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
         }
         /* M4-6d3: raise the serial TX/RX interrupt (COM1=IRQ4, COM2=IRQ3)
          * when the guest has enabled it (IER.ETBEI/ERBFI). The kernel's
@@ -5758,8 +6175,61 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     (g_fw_1_pic.master.isr & bit) == 0) {
                     hype_pic_emu_raise_irq(&g_fw_1_pic.master, irqn);
                 }
+                /* M4-6b3: route the serial line (GSI == IRQ, no override)
+                 * through the I/O APIC too, for an ACPI-mode guest. */
+                {
+                    uint8_t iov;
+                    if (hype_guest_uart_irq_pending(uart) &&
+                        hype_ioapic_raise(&g_fw_1_ioapic, (uint32_t)irqn, &iov)) {
+                        hype_svm_vcpu_request_interrupt(ctx, iov);
+                    }
+                }
             }
         }
+        /* M4-6d5 DIAG: drive the Magic SysRq+w injection once the guest is
+         * detected idle. Feed one scancode at a time and pulse IRQ1 (edge,
+         * GSI1) for it; advance to the next byte only after the guest reads
+         * the current one (kbd output buffer clears), so the i8042 ISR sees
+         * exactly one byte per interrupt as real hardware delivers it. If the
+         * first byte is never consumed, IRQ1 isn't reaching the guest (RTE[1]
+         * masked / i8042 not using the IRQ) -- log that once, since it is
+         * itself the answer to "does the keyboard IRQ path work in APIC
+         * mode". request_interrupt queues into the pending IRR; the
+         * deliver_pending_if_ready call just below stages it into EVENTINJ. */
+        if (sysrq_active && sysrq_idx < (unsigned)sizeof(sysrq_seq)) {
+            if (!hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
+                uint8_t iov;
+                hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, sysrq_seq[sysrq_idx]);
+                sysrq_idx++;
+                sysrq_feed_tsc = hype_rdtsc();
+                if (sysrq_idx == 1u) {
+                    hype_debug_print("fw-1 SYSRQ: guest idle -- injecting Alt+SysRq+w "
+                                     "(show-blocked-tasks) via PS/2, one scancode per IRQ1 (GSI1)\n");
+                }
+                if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &iov)) {
+                    hype_svm_vcpu_request_interrupt(ctx, iov);
+                } else if (!sysrq_stall_logged) {
+                    hype_debug_print("fw-1 SYSRQ: IO-APIC RTE[1]=0x%llx did not deliver (masked / "
+                                     "not Fixed) -- keyboard IRQ1 not wired by the guest in APIC mode\n",
+                                     (unsigned long long)g_fw_1_ioapic.rte[1]);
+                    sysrq_stall_logged = 1;
+                }
+                if (sysrq_idx == (unsigned)sizeof(sysrq_seq)) {
+                    hype_debug_print("fw-1 SYSRQ: full Alt+SysRq+w sequence delivered -- "
+                                     "expect blocked-task backtraces on ttyS0 below\n");
+                }
+            } else if (!sysrq_stall_logged && g_fw_1_host_tsc_hz != 0 && sysrq_feed_tsc != 0 &&
+                       hype_rdtsc() - sysrq_feed_tsc >= 2ULL * g_fw_1_host_tsc_hz) {
+                /* the fed byte has sat unread in the output buffer for 2s: the
+                 * guest never took the IRQ1 that would drain it. */
+                hype_debug_print("fw-1 SYSRQ: scancode 0x%x unread for 2s (OBF still set) -- guest "
+                                 "not servicing IRQ1; RTE[1]=0x%llx\n",
+                                 (unsigned int)sysrq_seq[sysrq_idx - 1u],
+                                 (unsigned long long)g_fw_1_ioapic.rte[1]);
+                sysrq_stall_logged = 1;
+            }
+        }
+
         /* M4-6b4/M4-6d2: deliver the highest-priority pending PIC IRQ --
          * the PIT IRQ0 clockevent (master) or the AHCI completion IRQ
          * (master or slave, via the cascade). A fully-legacy guest (our
@@ -6090,6 +6560,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             if (hype_svm_vcpu_handle_lapic_npf(ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE, insn) == 0) {
                 continue;
             }
+            /* M4-6b3: the guest I/O APIC at 0xFEC00000. Once ACPI is delivered
+             * the kernel masks the 8259 PIC and programs this chip's
+             * redirection table to route external IRQ lines (incl. the PIT via
+             * the MADT's IRQ0->GSI2 override) to LAPIC vectors. */
+            if (hype_svm_vcpu_handle_ioapic_npf(ctx, &g_fw_1_ioapic, HYPE_FW_1_IOAPIC_GPA, insn) == 0) {
+                continue;
+            }
             /* FW-1c: PCI config space via MMCONFIG ECAM at 0xE0000000
              * (OVMF's Q35 PcdPciExpressBaseAddress). Reuses PCI-1's ECAM
              * config model over FW-1's own host bridge + LPC devices. */
@@ -6234,7 +6711,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             if (hype_svm_vcpu_handle_pci_cf8_ioio(ctx, &g_fw_1_pci) == 0) {
                 continue;
             }
-            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_fw_1_fw_cfg) == 0) {
+            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_fw_1_fw_cfg, &g_fw_1_dma_map) == 0) {
                 continue;
             }
             if (hype_svm_vcpu_handle_cmos_ioio(ctx, &g_fw_1_cmos) == 0) {
@@ -6606,35 +7083,63 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_svm_intr_state_t iw;
                 hype_svm_vcpu_get_intr_state(ctx, &iw);
                 if (((iw.rflags >> 9) & 1u) != 0) { /* IF=1: a real interrupt-wait */
-                    uint64_t ttn = 0; /* PIT ticks until the nearest armed timer edge */
+                    /* Host-TSC time until the nearest armed timer edge. M4-6b2:
+                     * the PIT counter (PIT_HZ) and the LAPIC current_count
+                     * (HYPE_GUEST_LAPIC_HZ / divisor) are DIFFERENT units, so
+                     * each is converted to TSC in its own rate and the minimum
+                     * TSC wait is taken -- NOT the min of the raw counts (which
+                     * previously, wrongly, ran the LAPIC value through PIT_HZ, so
+                     * a 50us one-shot deadline became a capped 10ms wait). */
+                    uint64_t wait_tsc = 0;
                     perf_hlt_if1++; /* PERF-1a */
-                    if (g_fw_1_pit.channels[0].counter != 0u) {
-                        ttn = (uint64_t)g_fw_1_pit.channels[0].counter;
+                    int pit_armed = (g_fw_1_pit.channels[0].counter != 0u);
+                    int lapic_armed = (g_fw_1_lapic.init_count != 0u &&
+                                       (g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED) == 0 &&
+                                       g_fw_1_lapic.current_count != 0u);
+                    if (pit_armed) {
+                        wait_tsc = (uint64_t)g_fw_1_pit.channels[0].counter * g_fw_1_host_tsc_hz /
+                                   HYPE_PIT_HZ;
                     }
-                    if (g_fw_1_lapic.init_count != 0u &&
-                        (g_fw_1_lapic.lvt_timer & HYPE_GUEST_LAPIC_LVT_MASKED) == 0 &&
-                        g_fw_1_lapic.current_count != 0u) {
-                        uint64_t lt = (uint64_t)g_fw_1_lapic.current_count;
-                        if (ttn == 0u || lt < ttn) { ttn = lt; }
+                    if (lapic_armed) {
+                        uint32_t divisor = hype_guest_lapic_divisor(g_fw_1_lapic.divide_config);
+                        uint64_t cc = (uint64_t)g_fw_1_lapic.current_count;
+                        uint64_t lt_tsc;
+                        /* clamp far-future counts (>~1s) so cc*tsc_hz can't
+                         * overflow u64; they hit the 10ms cap below regardless. */
+                        if (cc > HYPE_GUEST_LAPIC_HZ) { cc = HYPE_GUEST_LAPIC_HZ; }
+                        lt_tsc = cc * g_fw_1_host_tsc_hz / HYPE_GUEST_LAPIC_HZ * (uint64_t)divisor;
+                        if (wait_tsc == 0u || lt_tsc < wait_tsc) { wait_tsc = lt_tsc; }
                     }
-                    if (ttn != 0u) {
-                        uint64_t wait_tsc = ttn * g_fw_1_host_tsc_hz / HYPE_PIT_HZ;
+                    if (wait_tsc == 0u) {
+                        hltw_zero++; /* DIAG: HLT with no armed timer -> immediate re-enter */
+                    } else {
                         uint64_t cap = g_fw_1_host_tsc_hz / 100ULL; /* 10ms */
-                        uint64_t start = hype_rdtsc();
+                        uint64_t start, end;
+                        /* DIAG: bucket the REQUESTED (pre-cap) deadline + source. */
+                        {
+                            unsigned long long rus =
+                                (g_fw_1_host_tsc_hz ? wait_tsc * 1000000ULL / g_fw_1_host_tsc_hz : 0);
+                            hltw_req[rus < 100ULL ? 0 : rus < 1000ULL ? 1 : rus < 10000ULL ? 2 : 3]++;
+                            if (pit_armed && lapic_armed) hltw_src_both++;
+                            else if (lapic_armed) hltw_src_lapic++;
+                            else hltw_src_pit++;
+                        }
+                        start = hype_rdtsc();
                         if (wait_tsc > cap) { wait_tsc = cap; }
                         while (hype_rdtsc() - start < wait_tsc) {
                             __asm__ volatile("pause");
                         }
-                        /* Exclude this deliberate idle wait from the COSTHIST
-                         * loop-body accounting, so that metric keeps measuring
-                         * only real per-exit work (VMRUN vs handler code), not
-                         * time we intentionally spent halted. PERF-1a: but DO
-                         * accumulate it here -- this is the fast-forwardable
-                         * idle time (QEMU collapses it; hype honours it). */
+                        /* PERF-1a: this is the fast-forwardable idle time (QEMU
+                         * collapses it; hype honours it) -- accumulate but keep
+                         * it out of the per-exit COSTHIST accounting. */
+                        end = hype_rdtsc();
+                        perf_hlt_wait_tsc += end - start;
+                        g_fw_1_prev_post_tsc = end;
+                        /* DIAG: bucket the ACTUAL host time spun. */
                         {
-                            uint64_t end = hype_rdtsc();
-                            perf_hlt_wait_tsc += end - start;
-                            g_fw_1_prev_post_tsc = end;
+                            unsigned long long aus =
+                                (g_fw_1_host_tsc_hz ? (end - start) * 1000000ULL / g_fw_1_host_tsc_hz : 0);
+                            hltw_act[aus < 100ULL ? 0 : aus < 1000ULL ? 1 : aus < 10000ULL ? 2 : 3]++;
                         }
                     }
                 } else {
@@ -6685,7 +7190,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
         hype_svm_vcpu_get_int_diag(&ei, &df, &wn, &ov);
         hype_debug_print("fw-1: M4-6d2 int diag: EVENTINJ=%llu, VINTR-defer=%llu, VINTR-window=%llu, "
-                          "defer-overwrite=%llu\n", ei, df, wn, ov);
+                          "coalesced=%llu, eventinj-collisions=%llu\n", ei, df, wn, ov,
+                          hype_svm_vcpu_get_eventinj_collisions());
     }
 
     /* M4-6d3 real-HW diag: characterise WHY the loop gave up. On real

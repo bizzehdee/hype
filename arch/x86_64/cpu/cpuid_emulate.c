@@ -3,6 +3,7 @@
 #define HYPE_CPUID_HYPERVISOR_PRESENT_BIT (1u << 31)
 #define HYPE_CPUID_LEAF1_EDX_MTRR_BIT (1u << 12)
 #define HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT (1u << 24)
+#define HYPE_CPUID_LEAF1_ECX_X2APIC_BIT (1u << 21)
 #define HYPE_CPUID_EXT1_ECX_SVM_BIT (1u << 2)
 #define HYPE_CPUID_EXT7_EDX_INVARIANT_TSC_BIT (1u << 8)
 #define HYPE_CPUID_LEAF6_EAX_ARAT_BIT (1u << 2)
@@ -41,7 +42,13 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
 
     if (eax_in == 1) {
         out->eax = real->eax;
-        out->ebx = real->ebx;
+        /* EBX[31:24] is the initial local APIC ID. Passed through, it carries
+         * whichever pCPU the guest happened to run on (e.g. 1), but hype's
+         * guest LAPIC reports ID 0 for the single vCPU -- the kernel flags the
+         * disagreement ("[Firmware Bug]: APIC ID mismatch. CPUID: 0x0001 APIC:
+         * 0x0000"). Force it to 0 so CPUID agrees with the modeled LAPIC. (Each
+         * hype VM has exactly one 1:1-pinned vCPU whose LAPIC ID is 0.) */
+        out->ebx = real->ebx & 0x00FFFFFFu;
         out->edx = real->edx & ~HYPE_CPUID_LEAF1_EDX_MTRR_BIT;
         /* Hypervisor-present set; MTRR already cleared above. Also clear
          * TSC_DEADLINE (ECX bit 24): with it set, a guest OS arms its
@@ -51,9 +58,20 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
          * idle-HLTs forever right after unpacking its initramfs).
          * Clearing it makes the guest fall back to the LAPIC timer's
          * initial-count mode, which FW-1b's guest LAPIC model does drive
-         * and inject. */
+         * and inject.
+         *
+         * Clear X2APIC (ECX bit 21) for the same class of reason: with it
+         * advertised, Linux switches APIC access to the x2APIC MSR interface
+         * (MSRs 0x800-0x8FF -- APIC routing "physical x2apic"), but hype models
+         * only the xAPIC MMIO LAPIC (FW-1b, 0xFEE00000). In x2APIC mode every
+         * timer program / current-count read / EOI becomes an unmodeled
+         * RDMSR/WRMSR, so the kernel's APIC-timer calibration reads garbage,
+         * logs "APIC frequency too slow, disabling apic timer", and -- with no
+         * working clockevent -- idle-hangs (observed hang at "Mounting boot
+         * media" in APIC mode). Clearing it keeps the guest on the modeled
+         * MMIO LAPIC. */
         out->ecx = (real->ecx | HYPE_CPUID_HYPERVISOR_PRESENT_BIT) &
-                   ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT;
+                   ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT & ~HYPE_CPUID_LEAF1_ECX_X2APIC_BIT;
         return;
     }
 

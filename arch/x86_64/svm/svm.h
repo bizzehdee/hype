@@ -19,6 +19,7 @@
 #include "../../../devices/ps2_mouse.h"
 #include "../../../devices/bochs_vbe.h"
 #include "../../../devices/guest_lapic.h"
+#include "../../../devices/ioapic.h"
 #include "../../../devices/guest_uart.h"
 #include "../../../devices/virtio_blk.h"
 #include "../../../devices/ata_disk.h"
@@ -439,6 +440,12 @@ void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *o
 void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
                                  unsigned long long *window, unsigned long long *overwrite);
 
+/* M4-6b2: count of interrupt requests that found EVENTINJ already staged for
+ * the next VMRUN and QUEUED the vector in the IRR instead of clobbering it.
+ * Nonzero proves same-iteration IRQ collisions occur (they were previously an
+ * invisible lost-interrupt) -- now safely serialized, never dropped. */
+unsigned long long hype_svm_vcpu_get_eventinj_collisions(void);
+
 /*
  * INPUT-1: the reusable "a device wired to `chip` just raised `irq`"
  * entry point -- combines devices/pic.h's own real-hardware modeling
@@ -665,13 +672,19 @@ int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t p
  * versa) -- the caller's job to treat as fatal, matching this
  * project's other IOIO/NPF handlers' fail-closed convention. Advances
  * the guest's RIP to EXITINFO2 on success, same "next-RIP-for-free"
- * convenience as hype_svm_vcpu_handle_ioio(). Exempt from unit testing
- * -- reaches into the exempt VMCB fields this backend's real VMRUN
- * produces and does its own raw guest-memory access; every
- * hype_fw_cfg_*() call this dispatches to is already fully tested in
- * isolation.
+ * convenience as hype_svm_vcpu_handle_ioio(). Handles the classic
+ * select/data ports (0x510/0x511), the DMA ports (0x514/0x518), and
+ * SVM-STRIO string-IN (`rep insb/insw/insd`) on the data port -- the form
+ * OVMF's QemuFwCfgLib actually uses. `dma_map` translates + bounds-checks
+ * the guest-physical addresses the guest hands the DMA and string paths
+ * (NULL = trusted identity-mapped test guest; see guest_dma_xlate). Exempt
+ * from unit testing -- reaches into the exempt VMCB fields this backend's
+ * real VMRUN produces and does its own guest-memory access; the pure
+ * pieces it dispatches to (hype_fw_cfg_*(), hype_svm_build_string_io_plan())
+ * are each fully tested in isolation.
  */
-int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw);
+int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
+                                     const hype_gpa_map_t *dma_map);
 
 /*
  * Handles an NPF (M4-5) VM-exit against `ahci`, a single-port AHCI HBA
@@ -848,6 +861,11 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
  */
 int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                     uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes);
+
+/* M4-6b3: FW-1's exempt NPF glue for the emulated I/O APIC (devices/ioapic.h)
+ * at 0xFEC00000 -- same shape/exemption reasoning as the LAPIC glue above. */
+int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
+                                    uint64_t ioapic_base_phys, const uint8_t *guest_insn_bytes);
 
 /*
  * FW-1e's exempt IOIO glue for the guest 16550 UART (devices/guest_uart.h)

@@ -209,6 +209,99 @@ void hype_svm_decode_ioio_info1(uint64_t exitinfo1, hype_svm_ioio_t *out) {
     } else {
         out->size_bytes = 4;
     }
+    out->is_string = (exitinfo1 & HYPE_SVM_IOIO_INFO1_STR) != 0;
+    out->is_rep = (exitinfo1 & HYPE_SVM_IOIO_INFO1_REP) != 0;
+    if (exitinfo1 & HYPE_SVM_IOIO_INFO1_ADDR16) {
+        out->addr_size_bytes = 2;
+    } else if (exitinfo1 & HYPE_SVM_IOIO_INFO1_ADDR32) {
+        out->addr_size_bytes = 4;
+    } else {
+        /* A64 bit, or none set (older encodings default to 32-bit protected
+         * mode): treat as 64-bit only when A64 is explicitly flagged. */
+        out->addr_size_bytes = (exitinfo1 & HYPE_SVM_IOIO_INFO1_ADDR64) ? 8 : 4;
+    }
+}
+
+/* Mask for the low `addr_size_bytes` of an address/count register. */
+static uint64_t addr_mask_for(uint8_t addr_size_bytes) {
+    if (addr_size_bytes >= 8) {
+        return ~0ULL;
+    }
+    return (1ULL << (addr_size_bytes * 8u)) - 1ULL;
+}
+
+/* Apply an x86 register-width update: a result computed in `addr_size_bytes`
+ * width written back into a 64-bit GPR. 8/4-byte ops zero-extend (upper bits
+ * cleared for 4-byte, full value for 8-byte); a 2-byte op updates only the
+ * low 16 bits and preserves the rest, matching real 16-bit-addressing string
+ * ops. */
+static uint64_t apply_reg_width(uint64_t original, uint64_t result, uint8_t addr_size_bytes) {
+    if (addr_size_bytes >= 8) {
+        return result;
+    }
+    if (addr_size_bytes == 4) {
+        return result & 0xFFFFFFFFULL;
+    }
+    return (original & ~0xFFFFULL) | (result & 0xFFFFULL);
+}
+
+int hype_svm_build_string_io_plan(const hype_svm_ioio_t *io, uint64_t index_reg, uint64_t count_reg,
+                                   uint64_t seg_base, uint64_t rflags, hype_svm_string_io_plan_t *out) {
+    uint64_t mask;
+    uint64_t index;
+    uint64_t count;
+    uint64_t span;
+    uint64_t raw_new_index;
+
+    if (!io->is_string) {
+        return -1;
+    }
+
+    mask = addr_mask_for(io->addr_size_bytes);
+    index = index_reg & mask;
+    count = io->is_rep ? (count_reg & mask) : 1ULL;
+
+    out->unit_bytes = io->size_bytes;
+    out->count = count;
+    out->descending = (rflags & HYPE_RFLAGS_DF) != 0;
+    out->start_gpa = seg_base + index;
+    out->new_count_reg = io->is_rep ? apply_reg_width(count_reg, 0, io->addr_size_bytes) : count_reg;
+
+    if (count == 0) {
+        /* REP with (E)CX == 0: architecturally a no-op. No bytes move, index
+         * unchanged; the caller still retires the instruction. */
+        out->byte_count = 0;
+        out->low_gpa = out->start_gpa;
+        out->new_index_reg = index_reg;
+        return 0;
+    }
+
+    /* count * unit_bytes, overflow-checked. */
+    if (io->size_bytes != 0 && count > (~0ULL) / (uint64_t)io->size_bytes) {
+        return -1;
+    }
+    out->byte_count = count * (uint64_t)io->size_bytes;
+
+    /* span = distance from the first to the last unit's start = (count-1)*unit. */
+    span = (count - 1ULL) * (uint64_t)io->size_bytes;
+
+    if (out->descending) {
+        /* Walk downward: lowest address is the last unit's. Guard underflow. */
+        if (index < span) {
+            return -1;
+        }
+        out->low_gpa = seg_base + (index - span);
+        raw_new_index = index - count * (uint64_t)io->size_bytes;
+    } else {
+        /* Walk upward: lowest address is the first unit's. Guard overflow. */
+        if (out->start_gpa > (~0ULL) - out->byte_count) {
+            return -1;
+        }
+        out->low_gpa = out->start_gpa;
+        raw_new_index = index + count * (uint64_t)io->size_bytes;
+    }
+    out->new_index_reg = apply_reg_width(index_reg, raw_new_index, io->addr_size_bytes);
+    return 0;
 }
 
 void hype_svm_decode_npf_info(uint64_t exitinfo1, uint64_t exitinfo2, hype_svm_npf_t *out) {
@@ -234,6 +327,50 @@ uint64_t hype_svm_arm_vintr_request(uint64_t vintr) {
 
 uint64_t hype_svm_disarm_vintr_request(uint64_t vintr) {
     return vintr & ~HYPE_SVM_VINTR_INJECTION_BITS_MASK;
+}
+
+void hype_svm_irr_set(uint32_t irr[8], uint8_t vector) {
+    irr[vector >> 5] |= (uint32_t)1u << (vector & 31u);
+}
+
+void hype_svm_irr_clear(uint32_t irr[8], uint8_t vector) {
+    irr[vector >> 5] &= ~((uint32_t)1u << (vector & 31u));
+}
+
+int hype_svm_irr_any(const uint32_t irr[8]) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        if (irr[i] != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int hype_svm_irr_highest(const uint32_t irr[8]) {
+    int i, b;
+    for (i = 7; i >= 0; i--) {
+        if (irr[i] == 0) {
+            continue;
+        }
+        for (b = 31; b >= 0; b--) {
+            if ((irr[i] & ((uint32_t)1u << b)) != 0) {
+                return i * 32 + b;
+            }
+        }
+    }
+    return -1;
+}
+
+#define HYPE_ACPI_PM_TIMER_HZ 3579545ULL
+#define HYPE_ACPI_PM_TIMER_MASK 0x00FFFFFFu
+
+uint32_t hype_acpi_pm_timer_scale(uint64_t tsc, uint64_t tsc_hz) {
+    if (tsc_hz >= HYPE_ACPI_PM_TIMER_HZ) {
+        uint64_t div = tsc_hz / HYPE_ACPI_PM_TIMER_HZ;
+        return (uint32_t)((tsc / div) & HYPE_ACPI_PM_TIMER_MASK);
+    }
+    return (uint32_t)(tsc & HYPE_ACPI_PM_TIMER_MASK);
 }
 
 void hype_vmcb_enable_nested_paging(hype_vmcb_t *vmcb, uint64_t npt_root_phys) {
