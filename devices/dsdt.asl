@@ -58,5 +58,59 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                     0x0100)   /* length (256 buses) */
             })
         }
+
+        /* M4-6d7: legacy ISA devices. In ACPI/APIC mode Linux wires an ISA
+         * IRQ into the I/O APIC only when a namespace device claims it via
+         * _CRS (acpi_pnp -> acpi_register_gsi); with none declared, the 8250
+         * driver still probes ttyS0 at 0x3f8 but irq4 is never routed to any
+         * interrupt controller, so every userspace serial write stalls on a
+         * TX-empty IRQ that cannot arrive (and i8042 refuses to probe at all:
+         * "PNP: No PS/2 controller found"). These mirror what QEMU's Q35 DSDT
+         * declares, matching hype's existing COM1/COM2 + PS/2 models. */
+        Device (COM1)
+        {
+            Name (_HID, EisaId ("PNP0501"))  /* 16550-compatible UART */
+            Name (_UID, 0x01)
+            Name (_STA, 0x0F)
+            Name (_CRS, ResourceTemplate ()
+            {
+                IO (Decode16, 0x03F8, 0x03F8, 0x00, 0x08)
+                IRQNoFlags () {4}
+            })
+        }
+
+        Device (COM2)
+        {
+            Name (_HID, EisaId ("PNP0501"))
+            Name (_UID, 0x02)
+            Name (_STA, 0x0F)
+            Name (_CRS, ResourceTemplate ()
+            {
+                IO (Decode16, 0x02F8, 0x02F8, 0x00, 0x08)
+                IRQNoFlags () {3}
+            })
+        }
+
+        Device (KBD)
+        {
+            Name (_HID, EisaId ("PNP0303"))  /* PS/2 keyboard (i8042 port A) */
+            Name (_STA, 0x0F)
+            Name (_CRS, ResourceTemplate ()
+            {
+                IO (Decode16, 0x0060, 0x0060, 0x00, 0x01)
+                IO (Decode16, 0x0064, 0x0064, 0x00, 0x01)
+                IRQNoFlags () {1}
+            })
+        }
+
+        Device (MOU)
+        {
+            Name (_HID, EisaId ("PNP0F13"))  /* PS/2 mouse (i8042 port B) */
+            Name (_STA, 0x0F)
+            Name (_CRS, ResourceTemplate ()
+            {
+                IRQNoFlags () {12}
+            })
+        }
     }
 }
