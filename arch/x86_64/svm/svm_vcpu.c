@@ -457,7 +457,22 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
                 real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
             }
         } else {
-            rc = hype_pic_emu_io_write(pic, io.port, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+            uint8_t pv = (uint8_t)(real->vmcb->save.rax & 0xFFu);
+            /* M4-6d7 DIAG: log OCW1 (IMR) writes whose IRQ4/IRQ3 mask bits
+             * CHANGE -- shows whether Linux ever wires the serial IRQ through
+             * the 8259 instead of the IO-APIC in APIC mode. */
+            if (io.port == 0x21u) {
+                uint8_t old = pic->master.imr;
+                if (((old ^ pv) & 0x1Au) != 0u) { /* IRQ1/3/4 mask-bit change */
+                    static unsigned imr_log_n = 0;
+                    if (imr_log_n < 32u) {
+                        imr_log_n++;
+                        hype_debug_print("fw-1 PICIMR 0x%x->0x%x rip=0x%llx\n", (unsigned)old,
+                                         (unsigned)pv, (unsigned long long)real->vmcb->save.rip);
+                    }
+                }
+            }
+            rc = hype_pic_emu_io_write(pic, io.port, pv);
         }
     } else if (io.port >= 0x40u && io.port <= 0x43u) {
         if (io.is_in) {
@@ -781,7 +796,45 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
         /* M4-6b2: scale the host TSC to the ACPI PM timer's architectural
          * 3.579545 MHz rate (was: raw ~GHz TSC, ~950x too fast -- which
          * mis-scaled every guest-firmware delay/timeout that reads this port). */
-        uint32_t value = hype_acpi_pm_timer_scale(real_rdtsc(), g_acpi_pm_tsc_hz);
+        uint64_t raw = real_rdtsc();
+        uint32_t value = hype_acpi_pm_timer_scale(raw, g_acpi_pm_tsc_hz);
+        /* M4-6d6 DIAG (GRUB-hang priority-0): PM-timer LIVENESS trace. GRUB's
+         * early-init calibration spins reading this port; log the first reads'
+         * (guest_rip, raw host TSC, returned 24-bit value, modular delta from
+         * the previous value) so we can tell apart: (a) value not advancing =
+         * emulation/order fault; (b) advancing at the wrong ratio = scale
+         * fault; (c) advancing correctly while GRUB still loops = it waits on
+         * something else (symbolize the RIP). Plus a ONE-SHOT host-side
+         * controlled-interval check: read the scaler, busy-wait exactly
+         * tsc_hz/1000 host TSC (=1ms), read again -- a correct 3.579545 MHz
+         * timer must advance ~3579 ticks in that window. */
+        static unsigned pm_trace_n = 0;
+        static uint32_t pm_prev = 0;
+        static int pm_selftest_done = 0;
+        if (!pm_selftest_done && g_acpi_pm_tsc_hz != 0) {
+            uint64_t t0 = real_rdtsc();
+            uint32_t v0 = hype_acpi_pm_timer_scale(t0, g_acpi_pm_tsc_hz);
+            uint64_t target = t0 + g_acpi_pm_tsc_hz / 1000ULL; /* 1ms of host TSC */
+            uint32_t v1;
+            uint64_t t1;
+            while ((t1 = real_rdtsc()) < target) { /* busy-wait ~1ms */ }
+            v1 = hype_acpi_pm_timer_scale(t1, g_acpi_pm_tsc_hz);
+            pm_selftest_done = 1;
+            hype_debug_print("fw-1 PMLIVE selftest: tsc_hz=%llu div=%llu | over 1ms (tsc +%llu) PM advanced "
+                             "%u ticks (expect ~3579) v0=0x%x v1=0x%x\n",
+                             (unsigned long long)g_acpi_pm_tsc_hz,
+                             (unsigned long long)(g_acpi_pm_tsc_hz / 3579545ULL),
+                             (unsigned long long)(t1 - t0),
+                             (unsigned)((v1 - v0) & HYPE_FW_1_ACPI_PM_TIMER_MASK), v0, v1);
+        }
+        if (pm_trace_n < 32u) {
+            hype_debug_print("fw-1 PMLIVE#%02u: rip=0x%llx raw_tsc=0x%llx pm=0x%06x d=%u\n",
+                             pm_trace_n, (unsigned long long)real->vmcb->save.rip,
+                             (unsigned long long)raw, (unsigned)value,
+                             (unsigned)((value - pm_prev) & HYPE_FW_1_ACPI_PM_TIMER_MASK));
+            pm_prev = value;
+            pm_trace_n++;
+        }
         real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFFFFFFFULL) | value;
     }
     /* A write to the PM Timer's own status/value port is not a real
@@ -1800,7 +1853,20 @@ int hype_svm_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart
         uint8_t value = hype_guest_uart_read(uart, offset);
         real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
     } else {
-        hype_guest_uart_write(uart, offset, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+        uint8_t wv = (uint8_t)(real->vmcb->save.rax & 0xFFu);
+        /* M4-6d7 DIAG: log COM1 IER writes (offset 1, DLAB clear). An IER write
+         * with THRI (bit1) / RDI (bit0) set is the 8250 driver's startup/tx
+         * path -- timestamps whether userspace ever opens or writes ttyS0. */
+        if (base_port == 0x3F8u && offset == 1u &&
+            (uart->lcr & 0x80u) == 0u && wv != 0u) {
+            static unsigned ier_log_n = 0;
+            if (ier_log_n < 64u) {
+                ier_log_n++;
+                hype_debug_print("fw-1 UARTIER=0x%x rip=0x%llx\n", (unsigned)wv,
+                                 (unsigned long long)real->vmcb->save.rip);
+            }
+        }
+        hype_guest_uart_write(uart, offset, wv);
     }
 
     /* EXITINFO2 is the resume RIP, same convenience the other IOIO
@@ -2035,6 +2101,21 @@ int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
 
     if (decoded.is_write) {
         uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        /* M4-6d7 DIAG: RTE-write timeline. Log every redirection-entry write
+         * for the ISA GSIs of interest (1=kbd, 3=COM2, 4=COM1) plus the first
+         * 24 writes overall, with the resulting full RTE -- proves whether the
+         * guest ever unmasks the serial IRQ and what it programs. */
+        if (offset == HYPE_IOAPIC_REG_IOWIN && ioapic->ioregsel >= HYPE_IOAPIC_INDEX_REDIR_BASE) {
+            uint32_t rel = (ioapic->ioregsel & 0xFFu) - HYPE_IOAPIC_INDEX_REDIR_BASE;
+            uint32_t gsi = rel / 2u;
+            static unsigned rte_log_n = 0;
+            if (gsi == 1u || gsi == 3u || gsi == 4u || rte_log_n < 24u) {
+                rte_log_n++;
+                hype_debug_print("fw-1 RTEWR gsi=%u %s=0x%x rip=0x%llx\n", gsi,
+                                 (rel & 1u) ? "hi" : "lo", value,
+                                 (unsigned long long)real->vmcb->save.rip);
+            }
+        }
         if (hype_ioapic_mmio_write(ioapic, offset, value) != 0) {
             return -1;
         }
