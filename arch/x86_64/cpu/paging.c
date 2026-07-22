@@ -25,6 +25,27 @@ void hype_paging_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
     }
 }
 
+unsigned int hype_paging_map_mmio_1gb(hype_pte_t *pml4, hype_pte_t *pdpt, hype_pte_t *pd,
+                                       uint64_t phys) {
+    uint64_t gb = phys / HYPE_PAGING_1GB;
+    unsigned int pml4_idx = (unsigned int)(gb / HYPE_PAGING_ENTRIES_PER_TABLE);
+    unsigned int pdpt_idx = (unsigned int)(gb % HYPE_PAGING_ENTRIES_PER_TABLE);
+    uint64_t base = gb * HYPE_PAGING_1GB;
+    unsigned int j;
+
+    for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
+        pdpt[j] = 0; /* only pdpt_idx becomes present */
+    }
+    for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
+        pd[j] = hype_paging_encode_entry(base + (uint64_t)j * HYPE_PAGING_2MB,
+                                         HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE |
+                                             HYPE_PAGING_PS | HYPE_PAGING_PCD);
+    }
+    pdpt[pdpt_idx] = hype_paging_encode_entry((uint64_t)pd, HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE);
+    pml4[pml4_idx] = hype_paging_encode_entry((uint64_t)pdpt, HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE);
+    return pml4_idx;
+}
+
 unsigned int hype_paging_map_region_2mb(hype_pte_t *pdpt,
                                          hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                                          uint64_t phys_base, uint64_t size) {

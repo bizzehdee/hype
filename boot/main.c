@@ -20,6 +20,7 @@
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
 #include "../core/fat.h"
+#include "../core/nvme_host.h"
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
@@ -73,6 +74,10 @@ static hype_pte_t g_pd[HYPE_PAGING_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attr
  * in high MMIO above the low identity map (e.g. 256GB on Intel client
  * parts). Two tables cover a framebuffer that straddles a 1GB boundary. */
 static hype_pte_t g_fb_pd[2][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+/* M10-1b: page tables to map a host NVMe controller's BAR when firmware placed
+ * it in high 64-bit MMIO above the low identity map (QEMU q35 parks it ~56 TiB). */
+static hype_pte_t g_nvme_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_nvme_pd[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_gop_console_t g_gop_console;
 /* M8-1: the dashboard is rendered as its own vt_screen grid (built by the
  * console-owner core each frame it holds the dashboard view), then blitted to
@@ -8772,6 +8777,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * protective MBR / boot sector, ending in the 0x55AA signature); diagnostic
      * only. Bounded polling, so a non-responsive controller logs a failure
      * rather than hanging. */
+    /* M10-1b (#194): if the host storage controller is NVMe, prove the host
+     * NVMe driver can bring the controller up and read a real LBA post-EBS --
+     * the NVMe counterpart to the AHCI LBA0 probe below. Diagnostic; the GPT/
+     * FAT/streaming stack still runs over AHCI in this harness (wiring it over
+     * NVMe is a follow-on integration). */
+    {
+        static uint8_t g_nvme_probe[512] __attribute__((aligned(4096)));
+        hype_host_storage_t hn;
+        if (hype_host_pci_find_storage(hype_host_pci_read32_hw, 255u, &hn) &&
+            hn.kind == HYPE_HOST_STORAGE_NVME) {
+            /* The NVMe register BAR may sit in high 64-bit MMIO outside hype's
+             * low identity map (PML4[0] = [0,512GB)). When it needs a higher
+             * PML4 slot, map its 1 GiB (uncacheable) via a fresh PML4 entry and
+             * flush, before the first controller-register access -- otherwise
+             * that MMIO read #PFs. (map_mmio_1gb writes pml4[idx], so only use
+             * it when idx>=1; a BAR below 512GB is either already in the low map
+             * or would clobber PML4[0].) */
+            if (hn.bar_phys >= 512ULL * HYPE_PAGING_1GB) {
+                hype_paging_map_mmio_1gb(g_pml4, g_nvme_pdpt, g_nvme_pd, hn.bar_phys);
+                hype_paging_load(g_pml4);
+            }
+            if (hype_nvme_host_init(hn.bar_phys) != 0) {
+                hype_serial_print("host-nvme: controller init failed\n");
+            } else if (hype_nvme_host_read(hn.bar_phys, 0u, 1u, g_nvme_probe) == 0) {
+                hype_debug_print("host-nvme: init OK, LBA0 read OK -- mbrsig=%02x%02x\n",
+                                 (unsigned)g_nvme_probe[510], (unsigned)g_nvme_probe[511]);
+            } else {
+                hype_serial_print("host-nvme: LBA0 read FAILED\n");
+            }
+        }
+    }
+
     {
         static uint8_t g_hostdisk_probe[512] __attribute__((aligned(4096)));
         hype_host_storage_t hs;
