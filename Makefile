@@ -23,7 +23,7 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/admission.c core/file_io.c core/guest_mem.c core/logbuf.c core/nvlog.c \
              core/clockfacts.c core/io_histogram.c core/chunked_iso.c \
              core/host_pci.c core/host_pci_hw.c core/ahci_host.c core/ahci_host_hw.c \
-             core/gpt.c
+             core/gpt.c core/iso_stream.c
 ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
              arch/x86_64/cpu/paging.c arch/x86_64/cpu/paging_load.c \
