@@ -97,7 +97,7 @@ static uint64_t g_m2_7_guest_stack_top_phys;
  * same timing/ordering reasoning as g_m2_7_guest_code_phys. Sized from
  * HYPE_RAM_1_TEST_MEM_MB, standing in for a real per-VM mem_mb until a
  * real hype.cfg is actually read from the ESP (a separate, later piece
- * -- see task.md's RAM-1 note) -- gated by ADM-1's own already-tested
+ * -- see the RAM-1 ticket) -- gated by ADM-1's own already-tested
  * hype_adm_check_memory() against this machine's real usable RAM
  * (computed in efi_main(), see usable_ram_bytes), the first time that
  * check runs in the real boot path rather than only under its own
@@ -696,7 +696,7 @@ static const uint8_t g_m3_5_payload[] = {
  * flash (devices/pflash.h). Small on purpose -- this test only
  * exercises WRITE_BYTE and an array READ, not a full varstore image;
  * real persistence to a host file is explicitly deferred (M5's disk
- * driver doesn't exist yet -- see task.md's M4-3 scope note).
+ * driver doesn't exist yet -- see the M4-3 ticket).
  */
 static uint8_t g_m4_3_pflash_backing[4096] __attribute__((aligned(4096)));
 static hype_pflash_t g_m4_3_pflash;
@@ -1051,7 +1051,7 @@ static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t 
                        (unsigned long long)entry_rip, (unsigned long long)guest_cr3,
                        (unsigned long long)rsi);
 
-    /* No NPT for this first pass (0) -- see task.md's M3-5 scope note
+    /* No NPT for this first pass (0) -- see the M3-5 ticket
      * on why full AVIC interrupt-delivery validation is deferred. */
     ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
     if (ctx == 0) {
@@ -3699,7 +3699,7 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         hype_fatal("video-3: last pixel write did not land in the framebuffer");
     }
 
-    /* Prove the other half of VIDEO-3 (VIDEO-2's own task.md note: the
+    /* Prove the other half of VIDEO-3 (VIDEO-2's own ticket note: the
      * actual blit onto the host's real screen is this milestone's job)
      * against this device's own real, guest-programmed output -- not
      * just synthetic buffers in test_fb_blit.c's own unit tests. */
@@ -7745,7 +7745,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         /*
          * RAM-1: a synthetic one-VM config standing in for a real
          * parsed hype.cfg (reading one from the ESP is a separate,
-         * later piece -- see task.md's own note) exercises ADM-1's
+         * later piece -- see the relevant ticket) exercises ADM-1's
          * already-tested hype_adm_check_memory() against this
          * machine's real usable RAM for the first time in the actual
          * boot path, then allocates that many MB of real guest RAM.
@@ -7886,7 +7886,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         /*
          * ISO-1: reads a real installer ISO (\iso\test.iso -- a real
          * ISO9660 image the Makefile's own `run` target copies onto the
-         * ESP, per task.md's own "does not need M5" scoping) from the
+         * ESP, per the ticket's own "does not need M5" scoping) from the
          * same ESP hype.efi was booted from, reusing FW-1's own
          * core/file_io.h (already generic, not OVMF-specific). Verifies
          * both the read succeeded at the file's own real size (not just

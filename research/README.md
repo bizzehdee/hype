@@ -6,16 +6,16 @@ hardware/spec documents consulted while building this hypervisor. The
 rule is in `AGENTS.md` ("Hardware/spec research provenance"); the short
 version:
 
-**Check order before any web search or download:** (1) the relevant
-`task.md` task's summary/notes, then (2) this directory, then — only if
-neither has it — (3) the web. The per-task summaries in `task.md` are the
+**Check order before any web search or download:** (1) the relevant board
+ticket's description/comments, then (2) this directory, then — only if
+neither has it — (3) the web. The ticket description/comments are the
 first stop; this directory holds the full documents behind them.
 
 **When a manual/datasheet is fetched:** drop the PDF (or exact source
 document) here with a descriptive, versioned filename, add a row to the
 table below (what it is, revision, origin URL), and write the specific
 facts used — section/table numbers, field offsets, bit meanings, exact
-values — into the `task.md` entry it was for, pointing back at the file.
+values — into the ticket it was for, pointing back at the file.
 
 In-tree primary sources (the vendored `edk2/` tree, QEMU headers) are
 authoritative for their own formats and are cited by repo path instead;

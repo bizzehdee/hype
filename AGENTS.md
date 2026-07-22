@@ -2,17 +2,52 @@
 
 This repo builds a thin UEFI type-1 hypervisor. Full design lives in
 [`plan.md`](plan.md); the actionable, dependency-tracked breakdown of that
-design lives in [`task.md`](task.md). Read both before making non-trivial
-changes — this file is the condensed rule set, not a replacement for either.
+design lives on the **GitHub Project board** (see "Task tracking" below).
+Read `plan.md` before making non-trivial changes — this file is the condensed
+rule set, not a replacement for it.
+
+## Task tracking
+
+The **GitHub Project board is the single source of truth for task progress**:
+<https://github.com/users/bizzehdee/projects/3>. It has four Status columns —
+**To Do**, **Doing**, **Done**, **Rejected**. Each task is its own issue in
+`bizzehdee/hype` (never combine tasks into one ticket). A ticket carries:
+
+- the short task title (e.g. `GLADDER-5: Fedora Server, single-VM …`);
+- the full description in the issue body;
+- progress/engineering notes as issue **comments**;
+- the milestone as the native **Milestone** field (`GLADDER`, `M4`, `VALID`,
+  `VIDEO`, …) — *not* a label;
+- dependencies as native **"is blocked by"** relationships (a task is blocked
+  by every task it requires);
+- parent/child breakdowns (e.g. `M4-6` → `M4-6b` → `M4-6b2`) as **sub-issues**.
+
+Every task and its engineering notes live as board tickets (migrated from the
+old in-tree task list, whose history remains in git). `plan.md` remains the
+live design doc.
+
+### Task workflow
+
+- **New task** → create a new issue placed in **To Do**, with its full
+  description, the right **Milestone**, and honest **"is blocked by"** links to
+  whatever it depends on. Don't do undocumented work.
+- **Starting a task** → move it to **Doing**.
+- **Parked task** → add a comment saying why it's parked, then move it back to
+  **To Do**.
+- **Completed with a positive outcome** → move to **Done** (and close the
+  issue).
+- **No longer needed, with no outcome** → move to **Rejected**.
+- Reference the task ID (e.g. `M5-3`, `VALID-2`) in commit messages/PRs so the
+  dependency graph stays trustworthy.
 
 ## Before doing anything
 
-1. Check `task.md` for the task ID(s) covering the work. If none exists,
-   add one in the right epic with an honest `Deps:` list before starting —
-   don't do undocumented work.
-2. Check that a task's `Deps:` are actually checked off in `task.md`. If
-   they aren't, either do them first or stop and ask — do not skip ahead on
-   the assumption a prerequisite "probably doesn't matter yet."
+1. Find the board ticket covering the work. If none exists, create one (in
+   **To Do**, per the workflow above) before starting — don't do undocumented
+   work. Move the ticket you're starting to **Doing**.
+2. Check that the ticket's **"is blocked by"** links are all **Done**. If they
+   aren't, either do them first or stop and ask — do not skip ahead on the
+   assumption a prerequisite "probably doesn't matter yet."
 3. If the work touches something `plan.md` §10 already decided, follow that
    decision. If you think a decision is wrong, say so and get it changed in
    `plan.md` §10 — don't silently diverge from a documented decision in code.
@@ -157,28 +192,27 @@ changes — this file is the condensed rule set, not a replacement for either.
 
 ## Feature requests vs. bugfixes
 
-- A **bugfix** (existing behavior doesn't match what `plan.md`/`task.md`
+- A **bugfix** (existing behavior doesn't match what `plan.md` or the ticket
   already specify) can go straight to a code change — no planning detour
-  needed, just fix it and check the relevant `task.md` box if it wasn't
+  needed, just fix it and move the relevant ticket to **Done** if it wasn't
   already.
 - Anything bigger than a bugfix — new capabilities, new config surface, new
   devices/drivers, or any change to behavior beyond restoring the documented
   spec — **must go through `plan.md` first**: work out the design, log any
   new forks as numbered entries in §10 (with alternatives considered, same
   style as the existing entries), and update whichever `plan.md` section the
-  feature belongs to. Only after that's settled should it be **appended to
-  `task.md`** as new task ID(s), placed in the right epic, with an honest
-  `Deps:` list wired to whatever existing tasks it actually depends on (and
-  updating any downstream tasks'/epics' deps if the new work now sits in
-  front of them). Do not add net-new tasks to `task.md` without a
-  corresponding `plan.md` change to justify them — the two files must stay
-  in sync, not diverge.
+  feature belongs to. Only after that's settled should it become **a new
+  board ticket** (in **To Do**), assigned to the right Milestone, with honest
+  **"is blocked by"** links to whatever existing tasks it actually depends on
+  (and updating any downstream tickets' links if the new work now sits in
+  front of them). Do not add net-new tickets without a corresponding
+  `plan.md` change to justify them — design and tasks must stay in sync.
 
-## Keeping `plan.md` and `task.md` in sync
+## Keeping `plan.md` and the board in sync
 
-- `task.md` task IDs are referenced from commit messages/PRs where practical
+- Task IDs are referenced from commit messages/PRs where practical
   (e.g. `M5-3`, `VALID-2`) so the dependency graph stays trustworthy.
-- Check off a `task.md` box only when the task is actually done and
+- Move a ticket to **Done** only when the task is actually done and
   validated per its milestone's testing bar (QEMU + real hardware where
   applicable) — not when the code merely compiles.
 - If a change makes a `plan.md` §10 decision obsolete or wrong, update that
@@ -193,7 +227,7 @@ layout, an on-the-wire format, an errata) — must be archived so it is
 never re-fetched from the web:
 
 - **Check order, always, before any web search or download:** (1) the
-  relevant `task.md` task's summary/notes, then (2) the `research/`
+  relevant ticket's description/comments, then (2) the `research/`
   directory, then — only if neither has it — (3) the web. Reaching for
   a web search or download first is a process error; the whole point of
   this rule is that the answer is usually already captured.
@@ -202,8 +236,8 @@ never re-fetched from the web:
   (e.g. `research/amd-apm-vol2-24593-r3.44.pdf`), and record in
   `research/README.md` what it is, its version/revision, and where it
   came from.
-- **Capture the extract against the task:** in the `task.md` entry (or
-  entries) the research was for, write the specific facts used — the
+- **Capture the extract against the task:** in the ticket (or tickets) the
+  research was for, write the specific facts used — the
   section/table numbers, the field offsets, the bit meanings, the exact
   values — as a short summary with a pointer to the archived file
   (`research/<file>`, §/table). These per-task summaries are the
@@ -225,5 +259,5 @@ never re-fetched from the web:
   packaging/installer mechanism — must update `README.md` (and any other
   affected doc, e.g. `fw/README.md` for firmware-build-provenance changes)
   in the same change, not as a follow-up. Treat stale user-facing docs the
-  same as a stale `task.md`/`plan.md` — don't merge a behavior change
+  same as a stale ticket or `plan.md` — don't merge a behavior change
   without the doc that describes it.

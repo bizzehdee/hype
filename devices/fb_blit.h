@@ -6,7 +6,7 @@
 /*
  * VIDEO-3's other half: actually rendering a guest's own Bochs-VBE
  * framebuffer (devices/bochs_vbe.h) onto the host's real GOP screen,
- * which VIDEO-2's own task.md note explicitly reserved for this
+ * which VIDEO-2's own ticket note explicitly reserved for this
  * milestone rather than VIDEO-2 itself.
  *
  * Pure pixel-format conversion + row-copy logic, no hardware access --

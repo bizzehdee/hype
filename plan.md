@@ -879,12 +879,12 @@ runnable in QEMU+OVMF.
 
 ## 13. Future work (v2+, explicitly out of scope for v1)
 
-Ideas captured here are deliberately **not** on any `task.md` milestone —
+Ideas captured here are deliberately **not** on any project-board milestone —
 recording the intent now so it isn't lost, without pulling it into v1's
 scope or weakening any v1 hard invariant to make room for it. Nothing here
-should be implemented without first promoting it to a real `task.md` epic
+should be implemented without first promoting it to a real board milestone
 and, if it changes a v1 decision, updating §10 explicitly (per AGENTS.md's
-own "keeping plan.md and task.md in sync" rule).
+own "keeping plan.md and the board in sync" rule).
 
 - **Real vCPU scheduler, replacing 1:1 exclusive pCPU pinning** (noted
   2026-07-14). v1's hard invariant (§3, §10, AGENTS.md) is one vCPU
@@ -947,7 +947,7 @@ own "keeping plan.md and task.md in sync" rule).
   building on NET-*, a new API surface, a new UI, and a new inter-
   instance trust/protocol model) -- deserves its own dedicated design
   pass (auth model, wire protocol, master-vs-mesh topology choice) before
-  promotion to a real task.md epic, not just an API bolted onto existing
+  promotion to a real board milestone, not just an API bolted onto existing
   per-VM management code.
 
 - **Dynamically-sizable (thin-provisioned) virtual disks, pooled across
@@ -973,5 +973,5 @@ own "keeping plan.md and task.md in sync" rule).
   allocator, a pool-spanning-multiple-disks abstraction, per-VM key
   management/rotation, and probably a background reclamation/defrag
   story for thin-provisioned space) -- deserves its own design pass
-  before promotion to a task.md epic, likely building on M5's
+  before promotion to a board milestone, likely building on M5's
   `blk_backend` vtable rather than replacing it.
