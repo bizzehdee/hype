@@ -187,6 +187,126 @@ static void handle_request_sense(hype_atapi_t *dev, hype_atapi_result_t *out) {
      * project's own simplified model -- see each handler above). */
 }
 
+/* SCSI multi-byte fields are big-endian; these keep the MMC responses below
+ * readable. */
+static void put_be16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)v;
+}
+
+static void put_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+/* True while a disc is loaded (either backing). Shared by the media-detection
+ * handlers, which must report NOT READY with no media exactly like the reads. */
+static int media_present(const hype_atapi_t *dev) {
+    return (dev->media_data != 0 || dev->media_chunks != 0) && dev->media_size != 0;
+}
+
+/* GET CONFIGURATION (0x46): advertise a data-disc drive whose CURRENT profile
+ * is DVD-ROM. udev's cdrom_id reads the current-profile field of the feature
+ * header to conclude a disc is present (-> ID_CDROM_MEDIA=1). Returns the
+ * 8-byte Feature Header plus a Profile List feature (0x0000) listing CD-ROM
+ * and DVD-ROM, the latter marked current. RT/starting-feature in the CDB are
+ * ignored -- this minimal set is returned for every request type, which every
+ * RT value tolerates (RT=2 asks for one feature and still accepts feature 0). */
+static void handle_get_configuration(hype_atapi_t *dev, hype_atapi_result_t *out) {
+    zero_synth(out);
+    out->uses_media_data = 0;
+    if (!media_present(dev)) {
+        set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
+        return;
+    }
+    /* Feature header: bytes 0-3 data length (filled last), 4-5 reserved,
+     * 6-7 current profile. */
+    put_be16(out->synth_data + 6, (uint16_t)HYPE_ATAPI_PROFILE_DVD_ROM);
+    /* Profile List feature (0x0000). */
+    put_be16(out->synth_data + 8, 0x0000u); /* feature code */
+    out->synth_data[10] = 0x03u;             /* version=0, persistent=1, current=1 */
+    out->synth_data[11] = 8u;                /* additional length: two 4-byte descriptors */
+    put_be16(out->synth_data + 12, (uint16_t)HYPE_ATAPI_PROFILE_CD_ROM);
+    out->synth_data[14] = 0x00u;             /* CD-ROM present but not current */
+    put_be16(out->synth_data + 16, (uint16_t)HYPE_ATAPI_PROFILE_DVD_ROM);
+    out->synth_data[18] = 0x01u;             /* DVD-ROM is the current profile */
+    put_be32(out->synth_data + 0, 20u - 4u); /* data length = total - 4 */
+    out->synth_length = 20;
+    out->status = HYPE_ATAPI_STATUS_GOOD;
+    dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
+    dev->asc = 0;
+}
+
+/* GET EVENT STATUS NOTIFICATION (0x4A): report the Media event class with the
+ * disc present. cdrom_id polls this for media presence alongside GET
+ * CONFIGURATION. Always returns a media descriptor (NEA=0) rather than "no
+ * event available", so a steady-state poll still reflects the loaded disc. */
+static void handle_get_event_status(hype_atapi_t *dev, hype_atapi_result_t *out) {
+    zero_synth(out);
+    out->uses_media_data = 0;
+    /* Event header: descriptor length (bytes 0-1) = 6, notification class
+     * (byte 2) = 4 (Media), supported classes bitmap (byte 3) = Media (bit 4). */
+    put_be16(out->synth_data + 0, 6u);
+    out->synth_data[2] = 0x04u;
+    out->synth_data[3] = 0x10u;
+    /* Media event descriptor: event code (no change), media status. */
+    out->synth_data[4] = 0x00u;
+    out->synth_data[5] = (uint8_t)(media_present(dev) ? 0x02u : 0x00u); /* bit1 = media present */
+    out->synth_data[6] = 0x00u; /* start slot */
+    out->synth_data[7] = 0x00u; /* end slot */
+    out->synth_length = 8;
+    out->status = HYPE_ATAPI_STATUS_GOOD;
+    dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
+    dev->asc = 0;
+}
+
+/* READ TOC/PMA/ATIP (0x43): a single data track starting at LBA 0 with the
+ * lead-out at the media end. Answers the Formatted-TOC (format 0) and
+ * multisession (format 1) queries the Linux sr driver issues at probe time;
+ * without the latter sr logs "doesn't support multisession CD's" and cdrom_id
+ * loses a media-detection fallback. Formats other than 0/1 fall back to the
+ * formatted TOC (a valid response the drivers accept). */
+static void handle_read_toc(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_MAX],
+                            hype_atapi_result_t *out) {
+    uint32_t total_sectors;
+    uint8_t format = (uint8_t)(cdb[2] & 0x0Fu);
+
+    zero_synth(out);
+    out->uses_media_data = 0;
+    if (!media_present(dev)) {
+        set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
+        return;
+    }
+    total_sectors = dev->media_size / HYPE_ATAPI_SECTOR_SIZE;
+    if (format == 1u) {
+        /* Multisession: one session whose first track (1, data) is at LBA 0. */
+        put_be16(out->synth_data + 0, 10u); /* data length = total - 2 */
+        out->synth_data[2] = 1u;            /* first complete session */
+        out->synth_data[3] = 1u;            /* last complete session */
+        out->synth_data[5] = 0x14u;         /* ADR=1, control=4 (data track) */
+        out->synth_data[6] = 1u;            /* first track in last session */
+        put_be32(out->synth_data + 8, 0u);  /* track start LBA */
+        out->synth_length = 12;
+    } else {
+        /* Formatted TOC (format 0): track 1 (data) + lead-out (track 0xAA). */
+        put_be16(out->synth_data + 0, 18u); /* data length = total - 2 */
+        out->synth_data[2] = 1u;            /* first track */
+        out->synth_data[3] = 1u;            /* last track */
+        out->synth_data[5] = 0x14u;         /* track 1 ADR/control: data */
+        out->synth_data[6] = 1u;            /* track number 1 */
+        put_be32(out->synth_data + 8, 0u);  /* track 1 start LBA */
+        out->synth_data[13] = 0x14u;        /* lead-out ADR/control */
+        out->synth_data[14] = 0xAAu;        /* lead-out "track" number */
+        put_be32(out->synth_data + 16, total_sectors); /* lead-out start LBA */
+        out->synth_length = 20;
+    }
+    out->status = HYPE_ATAPI_STATUS_GOOD;
+    dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
+    dev->asc = 0;
+}
+
 static void write_swapped_ascii(uint8_t *out, const char *str, uint32_t field_bytes) {
     uint32_t len = 0;
     uint32_t i;
@@ -312,6 +432,15 @@ void hype_atapi_execute_cdb(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_
             return;
         case HYPE_ATAPI_CMD_REQUEST_SENSE:
             handle_request_sense(dev, out);
+            return;
+        case HYPE_ATAPI_CMD_READ_TOC:
+            handle_read_toc(dev, cdb, out);
+            return;
+        case HYPE_ATAPI_CMD_GET_CONFIGURATION:
+            handle_get_configuration(dev, out);
+            return;
+        case HYPE_ATAPI_CMD_GET_EVENT_STATUS:
+            handle_get_event_status(dev, out);
             return;
         default:
             set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_ILLEGAL_REQUEST,

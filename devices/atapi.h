@@ -13,10 +13,14 @@
  * AHCI/FIS/PRDT structure at all, matching devices/pflash.c's own
  * "pure protocol logic, hardware glue elsewhere" split. Scoped to
  * exactly the commands a real ATAPI driver (UEFI's own AhciBusDxe,
- * Linux's ata_piix/ahci+sr_mod) actually issues to enumerate and read
- * a read-only optical disc: TEST UNIT READY, INQUIRY, READ CAPACITY
- * (10), READ (10), and REQUEST SENSE (issued after a CHECK CONDITION
- * status to learn why). Backed by an in-memory ISO 9660 image buffer
+ * Linux's ata_piix/ahci+sr_mod) plus udev's cdrom_id helper actually
+ * issue to enumerate, detect media in, and read a read-only optical
+ * disc: TEST UNIT READY, INQUIRY, READ CAPACITY (10), READ (10)/(12),
+ * REQUEST SENSE (issued after a CHECK CONDITION status to learn why),
+ * and the media-detection trio READ TOC / GET CONFIGURATION / GET EVENT
+ * STATUS NOTIFICATION (GLADDER-5: cdrom_id needs these to set
+ * ID_CDROM_MEDIA, which Fedora's installer udev rules gate on).
+ * Backed by an in-memory ISO 9660 image buffer
  * for now -- real persistence/host-file reading needs a disk driver,
  * M5's job, the same circular-dependency situation M4-3's flash
  * emulation already had (build the primitive now, in-memory-backed;
@@ -43,6 +47,20 @@
 #define HYPE_ATAPI_CMD_READ_CAPACITY 0x25u
 #define HYPE_ATAPI_CMD_READ10 0x28u
 #define HYPE_ATAPI_CMD_READ12 0xA8u
+/* MMC media-detection commands. udev's cdrom_id helper issues these to decide
+ * a disc is present (it sets ID_CDROM_MEDIA=1); Fedora's 90-anaconda.rules gate
+ * the installer's source-mount on that property, so without these the anaconda
+ * dracut stage never mounts the CD and the boot times out. (Ubuntu's casper
+ * scans block devices directly and so never needed them -- which is why GLADDER-6
+ * worked before these existed and GLADDER-5 did not.) */
+#define HYPE_ATAPI_CMD_READ_TOC 0x43u
+#define HYPE_ATAPI_CMD_GET_CONFIGURATION 0x46u
+#define HYPE_ATAPI_CMD_GET_EVENT_STATUS 0x4Au
+
+/* MMC profile numbers reported by GET CONFIGURATION. The backing is a >4x-CD
+ * ISO image, so the current profile is DVD-ROM. */
+#define HYPE_ATAPI_PROFILE_CD_ROM 0x0008u
+#define HYPE_ATAPI_PROFILE_DVD_ROM 0x0010u
 
 /* SCSI status codes this project actually returns. */
 #define HYPE_ATAPI_STATUS_GOOD 0x00u
@@ -58,7 +76,9 @@
 
 /* Max size of a synthesized (non-media-streamed) response this
  * project's supported command set ever produces in one shot --
- * INQUIRY's 36-byte standard response is the largest. */
+ * INQUIRY's 36-byte standard response is the largest; the GET
+ * CONFIGURATION and READ TOC responses below (20 bytes each) and GET
+ * EVENT STATUS (8) all fit within it, so the buffer stays at 36. */
 #define HYPE_ATAPI_MAX_SYNTH_RESPONSE 36
 
 typedef struct {

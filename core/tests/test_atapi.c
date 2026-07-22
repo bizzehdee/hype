@@ -397,6 +397,94 @@ static void test_read10_size_profile_accumulates(void) {
     CHECK_HEX("hist[0] unchanged by no-op/OOR", 1, dev.read10_size_hist[0]);
 }
 
+static void test_get_configuration_reports_media(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+    unsigned cur_profile;
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    make_cdb(cdb, HYPE_ATAPI_CMD_GET_CONFIGURATION);
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("uses synthesized data", 0, out.uses_media_data);
+    CHECK_HEX("response length 20", 20, out.synth_length);
+    /* Feature-header data length = total - 4. */
+    CHECK_HEX("data length field = 16", 16u, ((unsigned)out.synth_data[2] << 8) | out.synth_data[3]);
+    cur_profile = ((unsigned)out.synth_data[6] << 8) | out.synth_data[7];
+    CHECK_HEX("current profile = DVD-ROM", HYPE_ATAPI_PROFILE_DVD_ROM, cur_profile);
+    CHECK_HEX("profile-list feature code 0x0000", 0x0000u,
+              ((unsigned)out.synth_data[8] << 8) | out.synth_data[9]);
+    CHECK_HEX("DVD-ROM descriptor marked current", 1u, out.synth_data[18] & 0x01u);
+}
+
+static void test_get_configuration_no_media(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, 0, 0);
+    make_cdb(cdb, HYPE_ATAPI_CMD_GET_CONFIGURATION);
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status CHECK_CONDITION", HYPE_ATAPI_STATUS_CHECK_CONDITION, out.status);
+    CHECK_HEX("sense key NOT_READY", HYPE_ATAPI_SENSE_KEY_NOT_READY, dev.sense_key);
+}
+
+static void test_get_event_status_media_present(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    make_cdb(cdb, HYPE_ATAPI_CMD_GET_EVENT_STATUS);
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("response length 8", 8, out.synth_length);
+    CHECK_HEX("notification class = media (4)", 0x04u, out.synth_data[2] & 0x07u);
+    CHECK_HEX("media-present bit set", 0x02u, out.synth_data[5] & 0x02u);
+}
+
+static void test_read_toc_formatted(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+    unsigned leadout_lba;
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media)); /* 4-sector media */
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ_TOC);
+    cdb[2] = 0x00; /* format 0: formatted TOC */
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("response length 20", 20, out.synth_length);
+    CHECK_HEX("first track = 1", 1u, out.synth_data[2]);
+    CHECK_HEX("last track = 1", 1u, out.synth_data[3]);
+    CHECK_HEX("track 1 is a data track (control nibble 0x4)", 0x14u, out.synth_data[5]);
+    CHECK_HEX("lead-out track number 0xAA", 0xAAu, out.synth_data[14]);
+    leadout_lba = ((unsigned)out.synth_data[16] << 24) | ((unsigned)out.synth_data[17] << 16) |
+                  ((unsigned)out.synth_data[18] << 8) | out.synth_data[19];
+    CHECK_HEX("lead-out LBA = total sectors (4)", 4u, leadout_lba);
+}
+
+static void test_read_toc_multisession(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ_TOC);
+    cdb[2] = 0x01; /* format 1: multisession info */
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("response length 12", 12, out.synth_length);
+    CHECK_HEX("first session = 1", 1u, out.synth_data[2]);
+    CHECK_HEX("last session = 1", 1u, out.synth_data[3]);
+}
+
 int main(void) {
     init_media();
 
@@ -420,6 +508,11 @@ int main(void) {
     test_diagnostic_counters();
     test_read10_size_bucket_boundaries();
     test_read10_size_profile_accumulates();
+    test_get_configuration_reports_media();
+    test_get_configuration_no_media();
+    test_get_event_status_media_present();
+    test_read_toc_formatted();
+    test_read_toc_multisession();
 
     if (failures == 0) {
         printf("all tests passed\n");
