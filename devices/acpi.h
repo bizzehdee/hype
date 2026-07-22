@@ -157,6 +157,14 @@ _Static_assert(sizeof(hype_acpi_fadt_t) == 276, "FADT must be 276 bytes (ACPI 6.
 #define HYPE_ACPI_FADT_SLP_BUTTON (1u << 5)    /* no fixed-hardware sleep button */
 #define HYPE_ACPI_FADT_HW_REDUCED_ACPI (1u << 20)
 
+/* M8-6: the QEMU/OVMF ACPI PM1a control register (classic ACPI, I/O 0x604) that
+ * a UEFI guest's OS ends up writing (via EFI ResetSystem -> OVMF) to power off.
+ * A write with PM1_CNT.SLP_EN (bit 13) set commits the sleep; with only \_S5
+ * declared, that is an orderly S5 power-off, which hype detects in the IOIO path
+ * (boot/main.c) and turns into an S5 lifecycle event. */
+#define HYPE_ACPI_PM1A_CNT_PORT 0x604u
+#define HYPE_ACPI_PM1_SLP_EN (1u << 13) /* PM1_CNT bit 13: commit the sleep */
+
 /* MADT ("APIC") header -- common SDT header plus the two MADT-specific
  * fields, before the variable-length list of subtables. */
 typedef struct {

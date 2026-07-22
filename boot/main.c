@@ -246,6 +246,7 @@ typedef struct hype_fw_vm {
      * to by the dashboard command layer (TERM-2). volatile: cross-core writes. */
     volatile hype_vm_lifecycle_t lifecycle;
     uint64_t shutdown_deadline_tsc; /* M8-6: force-off if S5 not reached by here */
+    uint16_t pm1a_cnt;              /* M8-6: modeled ACPI PM1a control register (I/O 0x604) */
     /* M8-4: a retained pristine copy of the loaded firmware image (OVMF), so a
      * VM Start can restore fresh firmware -- post-ExitBootServices the ESP file
      * I/O that first loaded it is gone, so it cannot be re-read from disk. */
@@ -5230,6 +5231,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx) {
     }
     hype_svm_vcpu_enable_intr_intercept(ctx);
     vm->shutdown_deadline_tsc = 0;
+    vm->pm1a_cnt = 0;
     hype_debug_print("fw-1: vm%u restarted (M8-4): pristine firmware restored, RAM zeroed, vcpu reset\n",
                      (unsigned)(vm - g_vms));
 }
@@ -5268,6 +5270,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     vm->media = "test.iso";
     vm->lifecycle = HYPE_VM_RUNNING; /* M8-4..7 */
     vm->shutdown_deadline_tsc = 0;
+    vm->pm1a_cnt = 0;
     /* One dashboard grid, sized to the panel, owned by the console-owner core. */
     if (vm == &g_vms[0] && !g_dashboard_ready) {
         hype_vt_screen_init(&g_dashboard_term, g_gop_console.cols, g_gop_console.rows);
@@ -7312,6 +7315,29 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
                 if (dr == 1) {
                     continue;
+                }
+            }
+            /* M8-6: detect the guest's ACPI power-off. A UEFI guest powers off via
+             * EFI ResetSystem -> OVMF, which writes the classic ACPI PM1a_CNT
+             * (I/O 0x604) with SLP_EN set; only \_S5 is declared, so that is an
+             * orderly S5. Peek the exit (don't consume it -- the write is absorbed
+             * by the unknown-IOIO handler below) and post an S5 lifecycle event so
+             * a guest that ran `poweroff` transitions cleanly to OFF instead of
+             * being force-killed by the shutdown grace timer. */
+            {
+                int slp_en = 0;
+                int pr = hype_svm_vcpu_handle_pm1_cnt_ioio(
+                    ctx, (uint16_t)HYPE_ACPI_PM1A_CNT_PORT, &vm->pm1a_cnt, &slp_en);
+                if (pr == 0) { /* OUT to PM1a_CNT */
+                    if (slp_en) {
+                        vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_S5);
+                        hype_debug_print("fw-1: vm%u guest ACPI soft-off (PM1a_CNT SLP_EN) -> OFF\n",
+                                         (unsigned)(vm - g_vms));
+                    }
+                    continue;
+                }
+                if (pr == 1) {
+                    continue; /* IN from PM1a_CNT -- RAX loaded */
                 }
             }
             if (hype_svm_vcpu_handle_acpi_pm_timer_ioio(ctx) == 0) {

@@ -140,8 +140,12 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
          * safe here since this whole blob is a handful of KB. */
         fadt->dsdt = out->dsdt_offset;
         fadt->x_dsdt = out->dsdt_offset;
-        /* SleepControl/SleepStatus left as all-zero GAS entries --
-         * not yet backed by a real device (M9's job, see acpi.h). */
+        /* M8-6: SleepControl/SleepStatus left zeroed. This guest is UEFI-booted,
+         * so its OS powers off via EFI ResetSystem -> OVMF, which on QEMU uses the
+         * classic ACPI PM1a_CNT register (I/O 0x604) with SLP_EN, NOT the
+         * reduced-hardware SleepControl. hype detects that PM1a_CNT write directly
+         * in the IOIO path (boot/main.c) and posts an S5 lifecycle event; \_S5 is
+         * declared in the DSDT so the SLP_TYP value is available. */
     }
 
     /* MADT ("APIC") */

@@ -328,6 +328,30 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, ui
     return ctx;
 }
 
+int hype_svm_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint16_t *value,
+                                      int *slp_en) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+    if (io.port != port) {
+        return -1;
+    }
+    if (io.is_in) {
+        /* SLP_EN (bit 13) is write-only -- always reads 0. */
+        real->vmcb->save.rax =
+            (real->vmcb->save.rax & ~0xFFFFULL) | ((uint64_t)(*value) & 0xDFFFu);
+        real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+        return 1;
+    }
+    {
+        uint16_t w = (uint16_t)(real->vmcb->save.rax & 0xFFFFu);
+        *slp_en = (w & (1u << 13)) ? 1 : 0;
+        *value = (uint16_t)(w & ~(uint16_t)(1u << 13)); /* store without SLP_EN */
+    }
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return 0;
+}
+
 void hype_svm_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
                                   uint64_t npt_root) {
     unsigned i;

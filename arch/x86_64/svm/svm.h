@@ -113,6 +113,18 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, ui
 void hype_svm_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
                                   uint64_t npt_root);
 
+/* M8-6: model the ACPI PM1a control register (16-bit) at I/O `port`. On an IN,
+ * load RAX with *value (SLP_EN, bit 13, always reads back 0 per ACPI) and return
+ * 1. On an OUT, store the written value (minus SLP_EN) into *value, set *slp_en
+ * to whether SLP_EN was written (a sleep/power-off request), and return 0.
+ * Returns -1 (no state change) if this exit isn't an access to `port`. Advances
+ * RIP when it handles the access. Modelling the register (vs. absorbing it as
+ * all-ones) is required: OVMF read-modify-writes PM1a_CNT during boot, and an
+ * all-ones read fed back as a write spuriously carries SLP_EN. Exempt from unit
+ * testing (real VMCB). */
+int hype_svm_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint16_t *value,
+                                      int *slp_en);
+
 /*
  * M3-5: creates this backend's (same single, static instance as
  * hype_svm_vcpu_create() -- calling one after the other simply

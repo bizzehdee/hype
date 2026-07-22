@@ -24,6 +24,19 @@
  */
 DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
 {
+    /* M8-6: S5 (soft-off) sleep package. On a hardware-reduced-ACPI guest the OS
+     * writes (_S5[0] << 2) | SLP_EN to the FADT SLEEP_CONTROL register to power
+     * off; hype detects that write and transitions the VM to OFF. Only S5 is
+     * declared (no S1-S4), so the sole SLEEP_CONTROL write is an orderly
+     * power-off. SLP_TYPa = 5 here must match boot/main.c's detect. */
+    Name (\_S5, Package (0x04)
+    {
+        0x05,  /* SLP_TYPa */
+        0x05,  /* SLP_TYPb */
+        0x00,
+        0x00
+    })
+
     Scope (\_SB)
     {
         Device (PCI0)
