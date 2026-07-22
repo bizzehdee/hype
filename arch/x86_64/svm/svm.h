@@ -103,6 +103,17 @@ void hype_svm_vcpu_enable_apic_accel(hype_vmcb_t *vmcb);
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root);
 
 /*
+ * M8-4 (VM Start/reboot): re-initialise an EXISTING real-mode vCPU context to
+ * fresh reset state, reusing its already-allocated pool slot / VMCB (unlike
+ * hype_svm_vcpu_create(), which allocates a new slot each call -- calling that
+ * on every reboot would exhaust the pool). Rebuilds the VMCB (real-mode guest,
+ * IOPM/MSRPM, nested paging) and zeroes the GPRs, exactly as create does. Exempt
+ * from unit testing (real VMCB layout), same as create.
+ */
+void hype_svm_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
+                                  uint64_t npt_root);
+
+/*
  * M3-5: creates this backend's (same single, static instance as
  * hype_svm_vcpu_create() -- calling one after the other simply
  * replaces the running test guest, which is fine, only one ever runs

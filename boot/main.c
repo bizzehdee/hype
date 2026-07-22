@@ -246,6 +246,10 @@ typedef struct hype_fw_vm {
      * to by the dashboard command layer (TERM-2). volatile: cross-core writes. */
     volatile hype_vm_lifecycle_t lifecycle;
     uint64_t shutdown_deadline_tsc; /* M8-6: force-off if S5 not reached by here */
+    /* M8-4: a retained pristine copy of the loaded firmware image (OVMF), so a
+     * VM Start can restore fresh firmware -- post-ExitBootServices the ESP file
+     * I/O that first loaded it is gone, so it cannot be re-read from disk. */
+    uint64_t fw_pristine_host_phys;
     hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
     hype_ps2_mouse_t mouse;   /* required by the shared PS/2 IOIO handler */
     hype_fw_cfg_t fw_cfg;
@@ -473,8 +477,13 @@ static void term_run_cmdline(void) {
                           hype_vm_lifecycle_name(g_vms[idx].lifecycle));
             break;
         case HYPE_CMD_START:
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
-                          "start: fresh re-boot lands in the M8-4 follow-up");
+            if (idx < 0) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "start: unknown vm '%s'", nm);
+                break;
+            }
+            term_post(idx, HYPE_VM_EV_START); /* OFF -> STARTING; the VM's loop re-boots it */
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: %s", nm,
+                          hype_vm_lifecycle_name(g_vms[idx].lifecycle));
             break;
         case HYPE_CMD_FOCUS:
             if (idx < 0) {
@@ -5159,6 +5168,72 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
     /* non-owner cores: skip GOP entirely (owner drives the panel). */
 }
 
+/* M8-4: fresh re-boot of a VM from OFF. Restores the pristine firmware image,
+ * re-zeroes guest RAM + stack, resets every stateful emulated device, and resets
+ * the vCPU (in place, reusing its VMCB slot) to the reset vector -- so the next
+ * VMRUN starts the guest exactly as a cold boot. The static parts of setup (NPT,
+ * gpa_map, ACPI/fw_cfg/e820 blobs) are not mutated by a run, so they are left
+ * intact and not rebuilt; OVMF re-selects the fw_cfg files itself on restart. */
+static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx) {
+    uint64_t reset_cs_base = 0x100000000ULL - 0x10000ULL; /* 0xFFFF0000 */
+    uint64_t reset_rip = 0xFFF0ULL;
+    uint64_t stack_top = (uint64_t)(uintptr_t)(g_fw_1_guest_stack + sizeof(g_fw_1_guest_stack));
+    uint64_t npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
+
+    if (vm->fw_pristine_host_phys != 0) {
+        hype_guest_ram_copy((void *)(uintptr_t)g_fw_1_combined_host_phys,
+                            (const void *)(uintptr_t)vm->fw_pristine_host_phys, g_fw_1_combined_size);
+    }
+    hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
+
+    hype_pic_emu_reset(&g_fw_1_pic);
+    hype_pit_emu_reset(&g_fw_1_pit);
+    hype_guest_lapic_reset(&g_fw_1_lapic);
+    hype_ioapic_reset(&g_fw_1_ioapic);
+    hype_guest_uart_reset(&g_fw_1_uart);
+    hype_guest_uart_reset(&g_fw_1_uart2);
+    hype_vt_screen_init(&vm->term, g_gop_console.cols, g_gop_console.rows);
+    hype_ps2_kbd_reset(&g_fw_1_ps2);
+    hype_ps2_mouse_reset(&g_fw_1_mouse);
+    hype_pci_reset(&g_fw_1_pci);
+    hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
+                         0x00, 0x00);
+    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ICH9_LPC, HYPE_FW_1_PCI_VENDOR_ID_INTEL,
+                         HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC, 0x06, 0x01, 0x00);
+    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u, 0x01, 0x06,
+                         0x01);
+    hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
+    hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
+    hype_ahci_reset(&g_fw_1_ahci);
+    if (g_iso_stream_ready) {
+        hype_atapi_reset_stream(&g_fw_1_atapi, &g_iso_stream);
+    } else {
+        hype_atapi_reset_chunked(&g_fw_1_atapi, &g_iso_chunked);
+    }
+    {
+        uint64_t above_16mb = (HYPE_FW_1_GUEST_RAM_BYTES > 16ULL * 1024 * 1024)
+                                  ? (HYPE_FW_1_GUEST_RAM_BYTES - 16ULL * 1024 * 1024)
+                                  : 0;
+        uint64_t units_64kb = above_16mb / 65536ULL;
+        if (units_64kb > 0xFFFFULL) units_64kb = 0xFFFFULL;
+        hype_cmos_reset(&g_fw_1_cmos);
+        hype_cmos_set_extended_memory_above_16mb(&g_fw_1_cmos, (uint16_t)units_64kb);
+    }
+
+    hype_svm_vcpu_reset_realmode(ctx, reset_cs_base, stack_top, npt_root_phys);
+    hype_svm_vcpu_set_pvclock(ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
+    hype_svm_vcpu_set_rip(ctx, reset_rip);
+    hype_svm_vcpu_set_exception_intercepts(ctx, (1u << 6) | (1u << 13));
+    if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
+        hype_svm_vcpu_enable_pause_filter(ctx, 65535u, 4096u);
+    }
+    hype_svm_vcpu_enable_intr_intercept(ctx);
+    vm->shutdown_deadline_tsc = 0;
+    hype_debug_print("fw-1: vm%u restarted (M8-4): pristine firmware restored, RAM zeroed, vcpu reset\n",
+                     (unsigned)(vm - g_vms));
+}
+
 static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
@@ -5675,10 +5750,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * wait keeps an idle VM off a 100%-spin. */
         if (!hype_vm_lifecycle_runs(vm->lifecycle)) {
             if (vm->lifecycle == HYPE_VM_STARTING) {
-                /* M8-4 Start = fresh re-boot (zero RAM + restore pristine firmware
-                 * + full device/vCPU reset). That machinery lands in the M8-4
-                 * follow-up; until then the command layer does not offer Start, so
-                 * this branch is unreached. Advance defensively to avoid a wedge. */
+                /* M8-4 Start: fresh re-boot of this guest, then -> RUNNING. */
+                fw_1_vm_reinit(vm, ctx);
+                perf_boot_start_tsc = 0; /* restart the uptime/idle timebase */
+                perf_hlt_wait_tsc = 0;
+                total_exits = 0;
+                ex_hlt = 0;
                 vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_STARTED);
             }
             fw_1_publish_and_render(vm, &last_gop_flush_tsc, &term_last_view,
@@ -8240,6 +8317,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "host-physical 0x%llx\n",
                 (unsigned long long)content_size, (unsigned long long)mapped_size,
                 (unsigned long long)g_fw_1_combined_host_phys);
+
+            /* M8-4: snapshot the freshly-loaded (pristine, no guest has run yet)
+             * firmware so a VM Start can restore it -- the ESP is unreachable
+             * post-EBS. Same 2MB-aligned allocator, done while Boot Services
+             * still exist. */
+            vm->fw_pristine_host_phys =
+                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, mapped_size);
+            hype_guest_ram_copy((void *)(uintptr_t)vm->fw_pristine_host_phys,
+                                (const void *)(uintptr_t)g_fw_1_combined_host_phys, mapped_size);
         }
 
         /*
@@ -8423,6 +8509,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             vm1->ram_host_phys =
                 hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, HYPE_FW_1_GUEST_RAM_BYTES);
             hype_guest_ram_zero((void *)(uintptr_t)vm1->ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+            /* M8-4: VM1's own pristine-firmware snapshot (copied from vm0's still-
+             * pristine image before either guest runs). */
+            vm1->fw_pristine_host_phys =
+                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->combined_size);
+            hype_guest_ram_copy((void *)(uintptr_t)vm1->fw_pristine_host_phys,
+                                (const void *)(uintptr_t)vm1->combined_host_phys, vm1->combined_size);
             vm1->host_tsc_hz = vm->host_tsc_hz;
             hype_debug_print(
                 "fw-1 VM1: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
