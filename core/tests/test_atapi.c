@@ -254,6 +254,69 @@ static void test_build_identify_packet_device(void) {
     CHECK_HEX("model string byte-swapped ('H' second)", 'H', id[55]);
 }
 
+static uint16_t id_word(const uint8_t *id, unsigned w) {
+    return (uint16_t)((uint16_t)id[2u * w] | ((uint16_t)id[2u * w + 1u] << 8));
+}
+
+static void test_build_identify_dma_words(void) {
+    /* task #105: the IDENTIFY must advertise DMA so libata drives the CD with
+     * the DMA protocol instead of PIO. */
+    hype_atapi_t dev;
+    uint8_t id[HYPE_ATAPI_IDENTIFY_SIZE];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    hype_atapi_build_identify(&dev, id);
+
+    CHECK_HEX("word 49 = 0x0F00 (DMA+LBA+IORDY)", 0x0F00u, id_word(id, 49));
+    CHECK_HEX("word 49 bit 8 (DMA supported) set", 1u, (id_word(id, 49) >> 8) & 1u);
+    CHECK_HEX("word 53 = 0x0006 (w64-70 + w88 valid)", 0x0006u, id_word(id, 53));
+    CHECK_HEX("word 53 bit 2 (word 88 valid) set", 1u, (id_word(id, 53) >> 2) & 1u);
+    CHECK_HEX("word 63 = 0x0007 (MWDMA 0-2 supported)", 0x0007u, id_word(id, 63));
+    CHECK_HEX("word 88 = 0x203F (UDMA 0-5 supported, mode 5 selected)", 0x203Fu, id_word(id, 88));
+    CHECK_HEX("word 88 bit 13 (UDMA5 selected) set", 1u, (id_word(id, 88) >> 13) & 1u);
+    /* word 0 must still mark an ATAPI CD-ROM -- the DMA words don't disturb it. */
+    CHECK_HEX("word 0 still 0x85C0", 0x85C0u, id_word(id, 0));
+}
+
+static void test_read12_valid(void) {
+    /* READ(12): 32-bit LBA at bytes 2-5, 32-bit block count at bytes 6-9. */
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media)); /* 4-sector media */
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ12);
+    cdb[5] = 1;  /* LBA = 1 */
+    cdb[9] = 3;  /* count = 3 blocks (bytes 6-9, big-endian) */
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("READ(12) status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("READ(12) streams from media", 1, out.uses_media_data);
+    CHECK_HEX("READ(12) media_offset = LBA 1 * 2048", 1u * HYPE_ATAPI_SECTOR_SIZE, out.media_offset);
+    CHECK_HEX("READ(12) media_length = 3 * 2048", 3u * HYPE_ATAPI_SECTOR_SIZE, out.media_length);
+    CHECK_HEX("read12_count incremented", 1, dev.read12_count);
+    CHECK_HEX("read10_count untouched by READ(12)", 0, dev.read10_count);
+    /* size profile shared with READ(10): 3 blocks -> bucket 1 (2-8). */
+    CHECK_HEX("READ(12) recorded in size profile", 3, dev.read10_sectors_total);
+    CHECK_HEX("READ(12) size bucket 1", 1, dev.read10_size_hist[1]);
+}
+
+static void test_read12_out_of_range(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ12);
+    cdb[5] = 100; /* LBA 100, past 4-sector media */
+    cdb[9] = 1;
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("READ(12) OOR -> CHECK_CONDITION", HYPE_ATAPI_STATUS_CHECK_CONDITION, out.status);
+    CHECK_HEX("READ(12) OOR sense ILLEGAL_REQUEST", HYPE_ATAPI_SENSE_KEY_ILLEGAL_REQUEST, dev.sense_key);
+    CHECK_HEX("READ(12) OOR not in size profile", 0, dev.read10_sectors_total);
+}
+
 static void test_diagnostic_counters(void) {
     hype_atapi_t dev;
     hype_atapi_result_t out;
@@ -278,6 +341,62 @@ static void test_diagnostic_counters(void) {
     CHECK_HEX("last_cdb = READ10", HYPE_ATAPI_CMD_READ10, dev.last_cdb);
 }
 
+static void test_read10_size_bucket_boundaries(void) {
+    /* Pure classifier: 1 / 2-8 / 9-16 / 17-64 / 65-256 / >256 blocks. */
+    CHECK_HEX("bucket(0) -> 0 (no-op)", 0, hype_atapi_read10_size_bucket(0));
+    CHECK_HEX("bucket(1) -> 0", 0, hype_atapi_read10_size_bucket(1));
+    CHECK_HEX("bucket(2) -> 1", 1, hype_atapi_read10_size_bucket(2));
+    CHECK_HEX("bucket(8) -> 1", 1, hype_atapi_read10_size_bucket(8));
+    CHECK_HEX("bucket(9) -> 2", 2, hype_atapi_read10_size_bucket(9));
+    CHECK_HEX("bucket(16) -> 2", 2, hype_atapi_read10_size_bucket(16));
+    CHECK_HEX("bucket(17) -> 3", 3, hype_atapi_read10_size_bucket(17));
+    CHECK_HEX("bucket(64) -> 3", 3, hype_atapi_read10_size_bucket(64));
+    CHECK_HEX("bucket(65) -> 4", 4, hype_atapi_read10_size_bucket(65));
+    CHECK_HEX("bucket(256) -> 4", 4, hype_atapi_read10_size_bucket(256));
+    CHECK_HEX("bucket(257) -> 5", 5, hype_atapi_read10_size_bucket(257));
+    CHECK_HEX("bucket(65535) -> 5", 5, hype_atapi_read10_size_bucket(65535));
+}
+
+static void test_read10_size_profile_accumulates(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media)); /* 4-sector media */
+    CHECK_HEX("reset zeroes sectors_total", 0, dev.read10_sectors_total);
+    CHECK_HEX("reset zeroes max_count", 0, dev.read10_max_count);
+    CHECK_HEX("reset zeroes hist[0]", 0, dev.read10_size_hist[0]);
+    CHECK_HEX("reset zeroes hist[1]", 0, dev.read10_size_hist[1]);
+
+    /* 1-sector read at LBA 0 -> bucket 0, total 1, max 1. */
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ10);
+    cdb[8] = 1;
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+    CHECK_HEX("sectors_total after 1-blk", 1, dev.read10_sectors_total);
+    CHECK_HEX("max_count after 1-blk", 1, dev.read10_max_count);
+    CHECK_HEX("hist[0] after 1-blk", 1, dev.read10_size_hist[0]);
+
+    /* 4-sector read at LBA 0 -> bucket 1, total 5, max 4. */
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ10);
+    cdb[8] = 4;
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+    CHECK_HEX("sectors_total after 4-blk", 5, dev.read10_sectors_total);
+    CHECK_HEX("max_count tracks largest", 4, dev.read10_max_count);
+    CHECK_HEX("hist[1] after 4-blk", 1, dev.read10_size_hist[1]);
+
+    /* A no-op (count 0) and an out-of-range read must NOT be counted --
+     * they transfer no data, so including them would skew the profile. */
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ10); /* count 0 */
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ10);
+    cdb[5] = 100; /* LBA 100, past 4-sector media */
+    cdb[8] = 1;
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+    CHECK_HEX("sectors_total unchanged by no-op/OOR", 5, dev.read10_sectors_total);
+    CHECK_HEX("max_count unchanged by no-op/OOR", 4, dev.read10_max_count);
+    CHECK_HEX("hist[0] unchanged by no-op/OOR", 1, dev.read10_size_hist[0]);
+}
+
 int main(void) {
     init_media();
 
@@ -295,7 +414,12 @@ int main(void) {
     test_request_sense_no_sense_by_default();
     test_unrecognized_opcode_rejected();
     test_build_identify_packet_device();
+    test_build_identify_dma_words();
+    test_read12_valid();
+    test_read12_out_of_range();
     test_diagnostic_counters();
+    test_read10_size_bucket_boundaries();
+    test_read10_size_profile_accumulates();
 
     if (failures == 0) {
         printf("all tests passed\n");

@@ -1310,6 +1310,24 @@ static uint64_t guest_dma_xlate(const hype_gpa_map_t *dma_map, uint64_t gpa, uin
     return hype_gpa_to_host(dma_map, gpa, len);
 }
 
+/* Copy n bytes 8 at a time (byte tail last) into a PRDT-described guest buffer.
+ * __builtin_memcpy with a constant size lowers to a single unaligned mov
+ * (x86_64 allows unaligned access), so there is no libc/memcpy dependency (this
+ * is a freestanding build) and no strict-aliasing UB. ~8x fewer store ops than
+ * the old byte loop for the flat-media / IDENTIFY PRDT copies. The chunked-media
+ * read path has its own equivalent in core/chunked_iso.c. */
+static void ahci_copy_fast(uint8_t *dst, const uint8_t *src, uint32_t n) {
+    uint32_t k = 0;
+    while (k + 8u <= n) {
+        __builtin_memcpy(dst + k, src + k, 8);
+        k += 8u;
+    }
+    while (k < n) {
+        dst[k] = src[k];
+        k++;
+    }
+}
+
 /* Walks the guest's Command List (slot 0 only, this project's own
  * single-outstanding-command scope) -> Command Table -> ATAPI CDB,
  * dispatches it, copies the response into the PRDT-described guest
@@ -1467,7 +1485,6 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
         hype_ahci_prdt_entry_t prd;
         uint32_t chunk;
         uint8_t *dst;
-        uint32_t j;
 
         hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)prd_idx * 16u, &prd);
         chunk = (prd.byte_count < remaining) ? prd.byte_count : remaining;
@@ -1485,9 +1502,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                 return -1;
             }
         } else {
-            for (j = 0; j < chunk; j++) {
-                dst[j] = src[j];
-            }
+            ahci_copy_fast(dst, src, chunk);
             src += chunk;
         }
         remaining -= chunk;
@@ -1753,22 +1768,17 @@ static int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *di
     while (remaining > 0 && prd_idx < hdr.prdtl) {
         hype_ahci_prdt_entry_t prd;
         uint32_t chunk;
-        uint32_t j;
 
         hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)prd_idx * 16u, &prd);
         chunk = (prd.byte_count < remaining) ? prd.byte_count : remaining;
 
         if (is_write_direction) {
             const uint8_t *guest_src = (const uint8_t *)(uintptr_t)prd.data_phys;
-            for (j = 0; j < chunk; j++) {
-                dst_media[j] = guest_src[j];
-            }
+            ahci_copy_fast(dst_media, guest_src, chunk);
             dst_media += chunk;
         } else {
             uint8_t *guest_dst = (uint8_t *)(uintptr_t)prd.data_phys;
-            for (j = 0; j < chunk; j++) {
-                guest_dst[j] = src[j];
-            }
+            ahci_copy_fast(guest_dst, src, chunk);
             src += chunk;
         }
         remaining -= chunk;

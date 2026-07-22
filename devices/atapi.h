@@ -42,6 +42,7 @@
 #define HYPE_ATAPI_CMD_INQUIRY 0x12u
 #define HYPE_ATAPI_CMD_READ_CAPACITY 0x25u
 #define HYPE_ATAPI_CMD_READ10 0x28u
+#define HYPE_ATAPI_CMD_READ12 0xA8u
 
 /* SCSI status codes this project actually returns. */
 #define HYPE_ATAPI_STATUS_GOOD 0x00u
@@ -84,8 +85,29 @@ typedef struct {
      * hype_atapi_reset. */
     uint32_t command_count;
     uint32_t read10_count;
+    uint32_t read12_count; /* READ(12) opcode 0xA8, issued by a DMA-capable libata */
     uint8_t last_cdb;
+    /* ATAPI-DMA (task #105) measure-first instrumentation: the READ(10)
+     * transfer-size profile, so a single boot reveals whether CD reads are
+     * bottlenecked by many small commands (each = one VM exit) or are already
+     * large. read10_sectors_total sums every READ(10)'s block count;
+     * read10_max_count is the largest single request; read10_size_hist buckets
+     * requests by block count -- [0]=1, [1]=2..8, [2]=9..16, [3]=17..64,
+     * [4]=65..256, [5]=>256 (2048-byte blocks, so bucket 4's ceiling is the
+     * 512 KiB / 256-block transfer a DMA-capable drive typically reaches).
+     * Purely observational; reset by hype_atapi_reset[_chunked]. */
+    uint64_t read10_sectors_total;
+    uint32_t read10_max_count;
+    uint32_t read10_size_hist[6];
 } hype_atapi_t;
+
+/* Number of READ(10) transfer-size buckets in hype_atapi_t::read10_size_hist. */
+#define HYPE_ATAPI_READ10_HIST_BUCKETS 6
+
+/* Maps a READ(10) block count to its read10_size_hist bucket index (0..5).
+ * A count of 0 (the legal no-op READ) maps to bucket 0. Pure classifier --
+ * exposed so the AHCI glue and the unit tests agree on the boundaries. */
+uint32_t hype_atapi_read10_size_bucket(uint32_t block_count);
 
 typedef struct {
     uint8_t status; /* HYPE_ATAPI_STATUS_* */

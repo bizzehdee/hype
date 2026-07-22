@@ -6671,6 +6671,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         {
                             static uint32_t last_reported_reads = 0;
                             static int first_cmd_reported = 0;
+                            static uint64_t read10_first_tsc = 0;
+                            if (read10_first_tsc == 0 && g_fw_1_atapi.read10_count >= 1) {
+                                read10_first_tsc = hype_rdtsc();
+                            }
                             if (!first_cmd_reported && g_fw_1_atapi.command_count > 0) {
                                 first_cmd_reported = 1;
                                 hype_debug_print("fw-1 DIAG: guest issued 1st ATAPI CDB (opcode=0x%x)\n",
@@ -6683,10 +6687,40 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                   (unsigned int)g_fw_1_atapi.command_count);
                             }
                             if (g_fw_1_atapi.read10_count >= last_reported_reads + 64) {
+                                /* task #105 measure-first: READ(10) size profile
+                                 * + throughput. avg = sectors/reads shows how big
+                                 * the guest's CD reads actually are; the hist
+                                 * buckets (1 / 2-8 / 9-16 / 17-64 / 65-256 / >256
+                                 * blocks) show whether they cluster small (many
+                                 * exits) or are already large. ms/KBps time the
+                                 * read-heavy phase from the first READ(10), so the
+                                 * real bottleneck (transfer size vs per-command
+                                 * latency) is visible rather than assumed. */
+                                uint64_t r10_ms = 0, r10_kbps = 0;
                                 last_reported_reads = g_fw_1_atapi.read10_count;
-                                hype_debug_print("fw-1 DIAG: ATAPI READ(10) count=%u (cmds=%u)\n",
+                                if (read10_first_tsc != 0 && g_fw_1_host_tsc_hz != 0) {
+                                    uint64_t dt = hype_rdtsc() - read10_first_tsc;
+                                    r10_ms = (dt * 1000ULL) / g_fw_1_host_tsc_hz;
+                                    if (r10_ms != 0) {
+                                        r10_kbps = (g_fw_1_atapi.read10_sectors_total * 2ULL * 1000ULL)
+                                                   / r10_ms; /* 2 KiB/block */
+                                    }
+                                }
+                                hype_debug_print("fw-1 DIAG: ATAPI READ(10) count=%u (cmds=%u) "
+                                                  "sectors=%llu max=%u hist=%u/%u/%u/%u/%u/%u "
+                                                  "elapsed=%llums thru=%lluKB/s\n",
                                                   (unsigned int)g_fw_1_atapi.read10_count,
-                                                  (unsigned int)g_fw_1_atapi.command_count);
+                                                  (unsigned int)g_fw_1_atapi.command_count,
+                                                  (unsigned long long)g_fw_1_atapi.read10_sectors_total,
+                                                  (unsigned int)g_fw_1_atapi.read10_max_count,
+                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[0],
+                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[1],
+                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[2],
+                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[3],
+                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[4],
+                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[5],
+                                                  (unsigned long long)r10_ms,
+                                                  (unsigned long long)r10_kbps);
                             }
                         }
                         continue;
