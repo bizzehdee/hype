@@ -104,6 +104,14 @@ int hype_ahci_host_init(uint64_t abar_phys, unsigned port) {
     wr32(pb, HYPE_AHCI_PREG_SERR, 0xFFFFFFFFu); /* clear sticky errors (write-1-to-clear) */
     wr32(pb, HYPE_AHCI_PREG_IS, 0xFFFFFFFFu);
 
+    /* Polled driver: mask this port's completion interrupts (PxIE) AND the HBA's
+     * global interrupt enable (GHC.IE), so the real controller never raises an IRQ
+     * into hype's host IDT while we poll PxCI. Firmware may have left them enabled;
+     * an unexpected AHCI interrupt landing on a vector hype doesn't handle was the
+     * suspected cause of the intermittent streaming-boot hang. */
+    wr32(pb, HYPE_AHCI_PREG_IE, 0u);
+    wr32(abar, HYPE_AHCI_REG_GHC, rd32(abar, HYPE_AHCI_REG_GHC) & ~HYPE_AHCI_GHC_IE);
+
     /* Re-enable the engines (FRE before ST). */
     wr32(pb, HYPE_AHCI_PREG_CMD, rd32(pb, HYPE_AHCI_PREG_CMD) | HYPE_AHCI_PCMD_FRE);
     wr32(pb, HYPE_AHCI_PREG_CMD, rd32(pb, HYPE_AHCI_PREG_CMD) | HYPE_AHCI_PCMD_ST);
