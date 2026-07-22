@@ -16,8 +16,21 @@
  * reading edk2/UefiCpuPkg/Library/BaseXApicX2ApicLib and MdePkg
  * Register/Intel/LocalApic.h): software-enable (SVR), ID/VERSION, the
  * APIC timer (LVT/init/current/divide + EOI), and benign LINT0/LINT1/
- * DFR/LDR. TPR and ICR (INIT/SIPI) are NOT touched by a uniprocessor
- * boot, so they are intentionally not modeled here.
+ * DFR/LDR. TPR is not touched by a uniprocessor boot, so it is
+ * intentionally not modeled here.
+ *
+ * GLADDER-6c: the ICR (0x300/0x310) IS modeled, but only for the one
+ * shape a uniprocessor guest actually sends: a FIXED-delivery IPI whose
+ * destination includes the local (only) CPU -- a self-IPI. Linux >= 6.16
+ * kernels drive SRCU grace-period startup through irq_work_queue(),
+ * which on x86 raises IRQ_WORK_VECTOR (0xf6) at the local CPU via an
+ * ICR write with the self destination shorthand. Dropping that write
+ * (the pre-GLADDER-6c behavior) silently killed every synchronize_srcu()
+ * in an Ubuntu 26.04 guest: the GP kick never arrived, fsnotify mark
+ * teardown never completed, and udevadm wedged the initramfs on exit.
+ * Self-targeted fixed IPIs are queued in a 256-bit pending set that the
+ * FW-1 loop drains into the normal EVENTINJ/VINTR injection path;
+ * INIT/SIPI/NMI and IPIs aimed at other (nonexistent) CPUs are ignored.
  *
  * OVMF's DXE timer (OvmfPkg/LocalApicTimerDxe) requires a *delivered*
  * periodic timer interrupt (vector from LVT_TIMER, = 32) to advance
@@ -39,6 +52,8 @@
 #define HYPE_GUEST_LAPIC_REG_LDR 0x0D0u
 #define HYPE_GUEST_LAPIC_REG_DFR 0x0E0u
 #define HYPE_GUEST_LAPIC_REG_SVR 0x0F0u
+#define HYPE_GUEST_LAPIC_REG_ICR_LOW 0x300u
+#define HYPE_GUEST_LAPIC_REG_ICR_HIGH 0x310u
 #define HYPE_GUEST_LAPIC_REG_LVT_TIMER 0x320u
 #define HYPE_GUEST_LAPIC_REG_LVT_LINT0 0x350u
 #define HYPE_GUEST_LAPIC_REG_LVT_LINT1 0x360u
@@ -55,6 +70,17 @@
 #define HYPE_GUEST_LAPIC_LVT_MASKED (1u << 16)
 #define HYPE_GUEST_LAPIC_LVT_PERIODIC (1u << 17)
 #define HYPE_GUEST_LAPIC_LVT_VECTOR_MASK 0xFFu
+
+/* ICR_LOW fields (Intel SDM Vol 3, "Interrupt Command Register"). */
+#define HYPE_GUEST_LAPIC_ICR_VECTOR_MASK 0xFFu
+#define HYPE_GUEST_LAPIC_ICR_DELMODE_MASK (0x7u << 8)   /* 000 = fixed */
+#define HYPE_GUEST_LAPIC_ICR_DESTMODE_LOGICAL (1u << 11)
+#define HYPE_GUEST_LAPIC_ICR_DELIVERY_STATUS (1u << 12) /* read-only, always idle here */
+#define HYPE_GUEST_LAPIC_ICR_SHORTHAND_MASK (0x3u << 18)
+#define HYPE_GUEST_LAPIC_ICR_SHORTHAND_NONE (0x0u << 18)
+#define HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF (0x1u << 18)
+#define HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL (0x2u << 18)
+#define HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_EXCL (0x3u << 18)
 
 /*
  * How many hype_guest_lapic_tick() calls (one per guest VM-exit in the
@@ -73,6 +99,10 @@ typedef struct {
     uint32_t lvt_lint1;
     uint32_t dfr;
     uint32_t ldr;
+    uint32_t icr_low;  /* last ICR_LOW written (delivery status reads as idle) */
+    uint32_t icr_high; /* destination field, bits 31:24 */
+    uint32_t self_ipi_pending[8]; /* 256-bit set of self-IPI vectors awaiting injection */
+    uint64_t self_ipi_count;      /* GLADDER-6c diag: total self-IPIs accepted */
     uint32_t divide_config;
     uint32_t init_count;
     uint32_t current_count;
@@ -147,5 +177,15 @@ void hype_guest_lapic_advance(hype_guest_lapic_t *lapic, uint64_t ticks);
  * state (in hype_guest_lapic_write), re-arming the next delivery.
  */
 int hype_guest_lapic_take_timer_irq(hype_guest_lapic_t *lapic, uint8_t *vector_out);
+
+/*
+ * GLADDER-6c: if any self-IPI vector is pending (an ICR write with fixed
+ * delivery whose destination included this CPU), returns 1, writes the
+ * lowest pending vector to *vector_out and clears it from the pending
+ * set. Returns 0 when the set is empty. The caller injects via the same
+ * request-interrupt path as every other source; its IRR coalesces
+ * duplicates, matching real fixed-IPI semantics.
+ */
+int hype_guest_lapic_take_self_ipi(hype_guest_lapic_t *lapic, uint8_t *vector_out);
 
 #endif /* HYPE_DEVICES_GUEST_LAPIC_H */

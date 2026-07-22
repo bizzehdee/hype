@@ -6101,6 +6101,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             hype_svm_vcpu_request_interrupt(ctx, timer_vector);
             timer_irqs++;
         }
+        /* GLADDER-6c: deliver guest self-IPIs (ICR fixed-delivery writes aimed
+         * at the local CPU). Linux >= 6.16 starts every SRCU grace period from
+         * irq_work_queue(), which raises vector 0xf6 as a self-IPI; dropping it
+         * deadlocked Ubuntu 26.04's initramfs in fsnotify teardown. The
+         * request-interrupt IRR coalesces repeats, so draining the whole set
+         * here loses nothing. */
+        {
+            uint8_t sipi_vector;
+            while (hype_guest_lapic_take_self_ipi(&g_fw_1_lapic, &sipi_vector)) {
+                hype_svm_vcpu_request_interrupt(ctx, sipi_vector);
+            }
+        }
         /* M4-6d2: raise the AHCI completion IRQ on the line the guest
          * actually programmed. hype_ahci_irq_pending() is level-sensitive
          * (GHC.IE && PxIS&PxIE); the line comes from the AHCI function's

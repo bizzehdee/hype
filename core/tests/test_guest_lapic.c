@@ -361,6 +361,119 @@ static void test_advance_honours_divide(void) {
               l.current_count);
 }
 
+/* GLADDER-6c: ICR self-IPI delivery. The one shape Linux's irq_work path
+ * sends on a UP guest: fixed delivery + self destination shorthand. */
+static void test_icr_self_shorthand_pends_vector(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    CHECK_HEX("nothing pending after reset", 0, hype_guest_lapic_take_self_ipi(&l, &vec));
+    /* Linux __default_send_IPI_shortcut(APIC_DEST_SELF, IRQ_WORK_VECTOR) */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF | 0xF6u);
+    CHECK_HEX("self-IPI pended", 1, hype_guest_lapic_take_self_ipi(&l, &vec));
+    CHECK_HEX("irq_work vector 0xf6", 0xF6u, vec);
+    CHECK_HEX("take drains the set", 0, hype_guest_lapic_take_self_ipi(&l, &vec));
+    CHECK_HEX("accepted-IPI diag counter", 1, l.self_ipi_count);
+}
+
+static void test_icr_physical_dest_matches_only_apic_id0(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    /* No shorthand, physical destination = 0 (our APIC ID) -> delivered. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4, 0u << 24);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4, 0x41u);
+    CHECK_HEX("physical dest 0 delivered", 1, hype_guest_lapic_take_self_ipi(&l, &vec));
+    CHECK_HEX("vector 0x41", 0x41u, vec);
+    /* Physical destination = 5 (no such CPU) -> dropped. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4, 5u << 24);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4, 0x41u);
+    CHECK_HEX("physical dest 5 dropped", 0, hype_guest_lapic_take_self_ipi(&l, &vec));
+    /* Physical broadcast 0xFF includes us. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4, 0xFFu << 24);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4, 0x42u);
+    CHECK_HEX("physical broadcast delivered", 1, hype_guest_lapic_take_self_ipi(&l, &vec));
+}
+
+static void test_icr_logical_dest_uses_ldr(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LDR, 4, 0x01000000u);
+    /* Logical dest 0x01 overlaps LDR -> delivered. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4, 0x01u << 24);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_DESTMODE_LOGICAL | 0x51u);
+    CHECK_HEX("logical match delivered", 1, hype_guest_lapic_take_self_ipi(&l, &vec));
+    /* Logical dest 0x02 does not overlap LDR 0x01 -> dropped. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4, 0x02u << 24);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_DESTMODE_LOGICAL | 0x51u);
+    CHECK_HEX("logical mismatch dropped", 0, hype_guest_lapic_take_self_ipi(&l, &vec));
+}
+
+static void test_icr_nondeliverable_shapes_dropped(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    /* All-excluding-self: no other CPU exists. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_EXCL | 0x60u);
+    CHECK_HEX("all-excl-self dropped", 0, hype_guest_lapic_take_self_ipi(&l, &vec));
+    /* All-including-self reaches us. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL | 0x60u);
+    CHECK_HEX("all-incl-self delivered", 1, hype_guest_lapic_take_self_ipi(&l, &vec));
+    /* INIT (delivery mode 101) to self: not a fixed IPI -> dropped. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF | (0x5u << 8));
+    CHECK_HEX("INIT dropped", 0, hype_guest_lapic_take_self_ipi(&l, &vec));
+    /* Illegal fixed vector (< 16) -> dropped, not pended. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF | 0x03u);
+    CHECK_HEX("vector < 16 dropped", 0, hype_guest_lapic_take_self_ipi(&l, &vec));
+}
+
+static void test_icr_coalesces_and_drains_multiple(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    /* Same vector twice coalesces to one delivery (IRR bit semantics). */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF | 0xF6u);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF | 0xF6u);
+    /* A second, distinct vector pends independently. */
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF | 0x20u);
+    CHECK_HEX("first take (lowest vector)", 1, hype_guest_lapic_take_self_ipi(&l, &vec));
+    CHECK_HEX("lowest pending vector first", 0x20u, vec);
+    CHECK_HEX("second take", 1, hype_guest_lapic_take_self_ipi(&l, &vec));
+    CHECK_HEX("coalesced 0xf6 delivered once", 0xF6u, vec);
+    CHECK_HEX("set now empty", 0, hype_guest_lapic_take_self_ipi(&l, &vec));
+}
+
+static void test_icr_readback_and_reset(void) {
+    hype_guest_lapic_t l;
+    uint32_t v;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4, 0xAB000000u);
+    hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4, &v);
+    CHECK_HEX("ICR_HIGH reads back", 0xAB000000u, v);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4,
+                           HYPE_GUEST_LAPIC_ICR_DELIVERY_STATUS |
+                           HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF | 0x30u);
+    hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4, &v);
+    CHECK_HEX("delivery status always reads idle",
+              HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF | 0x30u, v);
+    hype_guest_lapic_reset(&l);
+    CHECK_HEX("reset clears the pending set", 0, hype_guest_lapic_take_self_ipi(&l, &vec));
+    CHECK_HEX("reset clears ICR_HIGH", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4, &v), v));
+}
+
 int main(void) {
     test_divisor_decode();
     test_advance_honours_divide();
@@ -379,6 +492,12 @@ int main(void) {
     test_advance_one_shot_fires_once();
     test_advance_masked_or_disarmed_never_fires();
     test_advance_masked_timer_still_counts();
+    test_icr_self_shorthand_pends_vector();
+    test_icr_physical_dest_matches_only_apic_id0();
+    test_icr_logical_dest_uses_ldr();
+    test_icr_nondeliverable_shapes_dropped();
+    test_icr_coalesces_and_drains_multiple();
+    test_icr_readback_and_reset();
 
     if (failures == 0) {
         printf("all tests passed\n");

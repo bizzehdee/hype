@@ -1,12 +1,19 @@
 #include "guest_lapic.h"
 
 void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
+    unsigned int i;
     lapic->svr = 0x000000FFu; /* xAPIC reset: all-ones low byte, APIC software-disabled (bit 8 = 0) */
     lapic->lvt_timer = HYPE_GUEST_LAPIC_LVT_MASKED;
     lapic->lvt_lint0 = HYPE_GUEST_LAPIC_LVT_MASKED;
     lapic->lvt_lint1 = HYPE_GUEST_LAPIC_LVT_MASKED;
     lapic->dfr = 0xFFFFFFFFu;
     lapic->ldr = 0;
+    lapic->icr_low = 0;
+    lapic->icr_high = 0;
+    for (i = 0; i < 8u; i++) {
+        lapic->self_ipi_pending[i] = 0;
+    }
+    lapic->self_ipi_count = 0;
     lapic->divide_config = 0;
     lapic->init_count = 0;
     lapic->current_count = 0;
@@ -43,6 +50,14 @@ int hype_guest_lapic_read(hype_guest_lapic_t *lapic, uint32_t offset, unsigned i
             return 0;
         case HYPE_GUEST_LAPIC_REG_DFR:
             *out = lapic->dfr;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_ICR_LOW:
+            /* Delivery status (bit 12) always reads idle: sends complete
+             * synchronously in this model, so no send is ever "pending". */
+            *out = lapic->icr_low & ~HYPE_GUEST_LAPIC_ICR_DELIVERY_STATUS;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_ICR_HIGH:
+            *out = lapic->icr_high;
             return 0;
         case HYPE_GUEST_LAPIC_REG_LVT_TIMER:
             *out = lapic->lvt_timer;
@@ -84,6 +99,46 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
         case HYPE_GUEST_LAPIC_REG_DFR:
             lapic->dfr = value;
             return 0;
+        case HYPE_GUEST_LAPIC_REG_ICR_HIGH:
+            lapic->icr_high = value;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_ICR_LOW: {
+            /* Writing ICR_LOW latches and sends. Only FIXED delivery aimed at
+             * this (the only) CPU is deliverable; everything else -- INIT/SIPI/
+             * NMI, or a fixed IPI addressed to a nonexistent CPU -- is dropped.
+             * Vectors 0-15 are illegal for fixed delivery, so they are dropped
+             * too rather than pended into the IRR. */
+            int to_self = 0;
+            lapic->icr_low = value;
+            if ((value & HYPE_GUEST_LAPIC_ICR_DELMODE_MASK) == 0) {
+                switch (value & HYPE_GUEST_LAPIC_ICR_SHORTHAND_MASK) {
+                    case HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF:
+                    case HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL:
+                        to_self = 1;
+                        break;
+                    case HYPE_GUEST_LAPIC_ICR_SHORTHAND_NONE: {
+                        uint32_t dest = lapic->icr_high >> 24;
+                        if ((value & HYPE_GUEST_LAPIC_ICR_DESTMODE_LOGICAL) != 0) {
+                            to_self = (dest & (lapic->ldr >> 24)) != 0;
+                        } else {
+                            /* Physical: our APIC ID is 0; 0xFF broadcasts. */
+                            to_self = (dest == 0u) || (dest == 0xFFu);
+                        }
+                        break;
+                    }
+                    default: /* all-excluding-self: no other CPUs exist */
+                        break;
+                }
+            }
+            if (to_self) {
+                uint32_t vector = value & HYPE_GUEST_LAPIC_ICR_VECTOR_MASK;
+                if (vector >= 16u) {
+                    lapic->self_ipi_pending[vector >> 5] |= 1u << (vector & 31u);
+                    lapic->self_ipi_count++;
+                }
+            }
+            return 0;
+        }
         case HYPE_GUEST_LAPIC_REG_LVT_TIMER:
             lapic->lvt_timer = value;
             /* M4-6b5 diag: record if the guest ever unmasked the timer LVT
@@ -230,4 +285,23 @@ int hype_guest_lapic_take_timer_irq(hype_guest_lapic_t *lapic, uint8_t *vector_o
     lapic->timer_in_service = 1;
     *vector_out = (uint8_t)(lapic->lvt_timer & HYPE_GUEST_LAPIC_LVT_VECTOR_MASK);
     return 1;
+}
+
+int hype_guest_lapic_take_self_ipi(hype_guest_lapic_t *lapic, uint8_t *vector_out) {
+    unsigned int word;
+    for (word = 0; word < 8u; word++) {
+        uint32_t bits = lapic->self_ipi_pending[word];
+        unsigned int bit;
+        if (bits == 0) {
+            continue;
+        }
+        for (bit = 0; bit < 32u; bit++) {
+            if ((bits & (1u << bit)) != 0) {
+                lapic->self_ipi_pending[word] = bits & ~(1u << bit);
+                *vector_out = (uint8_t)(word * 32u + bit);
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
