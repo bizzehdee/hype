@@ -1,5 +1,6 @@
 #include "ahci_host.h"
 #include "../devices/ahci.h" /* HYPE_AHCI_REG_* / HYPE_AHCI_PREG_* / PxCMD bits / signatures */
+#include "fatal.h"           /* hype_debug_print -- temporary GLADDER-10 stall instrumentation */
 
 /*
  * Hardware shim for the host AHCI driver: real MMIO against the physical HBA.
@@ -122,6 +123,14 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);
     int rc = 0;
+    static unsigned dbg = 0; /* GLADDER-10 stall localization: trace the first few reads */
+    int trace = (dbg < 8u);
+    if (trace) {
+        dbg++;
+        hype_debug_print("ahci-rd[%u] enter lba=%llu cnt=%u tfd=0x%x ci=0x%x\n", dbg,
+                         (unsigned long long)lba, (unsigned)count,
+                         (unsigned)rd32(pb, HYPE_AHCI_PREG_TFD), (unsigned)rd32(pb, HYPE_AHCI_PREG_CI));
+    }
 
     /* Build slot 0's command header + a READ DMA EXT command table. The port was
      * already pointed at g_cmd_list / g_recv_fis by hype_ahci_host_init(). */
@@ -135,6 +144,9 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
     if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
         rc = -1;
     } else {
+        if (trace) {
+            hype_debug_print("ahci-rd[%u] ready, issuing\n", dbg);
+        }
         /* Issue slot 0 and poll PxCI until the HBA clears it (command complete). */
         wr32(pb, HYPE_AHCI_PREG_CI, 1u);
         if (wait_clear(pb, HYPE_AHCI_PREG_CI, 1u, SPIN_CMD) != 0) {
@@ -142,6 +154,9 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
         } else if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
             rc = -1; /* ATA error (TFD status ERR bit) */
         }
+    }
+    if (trace) {
+        hype_debug_print("ahci-rd[%u] done rc=%d\n", dbg, rc);
     }
     return rc;
 }
