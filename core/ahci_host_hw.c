@@ -73,14 +73,13 @@ int hype_ahci_host_find_sata_port(uint64_t abar_phys) {
     return -1;
 }
 
-int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst) {
+int hype_ahci_host_init(uint64_t abar_phys, unsigned port) {
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);
-    uint32_t cmd;
     unsigned i;
 
-    /* 1. Quiesce the port: clear ST, wait for the command-list engine (CR) to
-     *    stop; clear FRE, wait for the FIS-receive engine (FR) to stop. */
+    /* Quiesce the port: clear ST, wait for the command-list engine (CR) to stop;
+     * clear FRE, wait for the FIS-receive engine (FR) to stop. */
     wr32(pb, HYPE_AHCI_PREG_CMD, rd32(pb, HYPE_AHCI_PREG_CMD) & ~HYPE_AHCI_PCMD_ST);
     if (wait_clear(pb, HYPE_AHCI_PREG_CMD, HYPE_AHCI_PCMD_CR, SPIN_ENGINE) != 0) {
         return -1;
@@ -90,7 +89,8 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
         return -1;
     }
 
-    /* 2. Point the port at hype's own command list + received-FIS area. */
+    /* Point the port at hype's own command list + received-FIS area (they stay
+     * programmed for the life of the run; reads below only rewrite slot 0). */
     for (i = 0; i < sizeof(g_cmd_list); i++) {
         g_cmd_list[i] = 0;
     }
@@ -104,29 +104,34 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
     wr32(pb, HYPE_AHCI_PREG_SERR, 0xFFFFFFFFu); /* clear sticky errors (write-1-to-clear) */
     wr32(pb, HYPE_AHCI_PREG_IS, 0xFFFFFFFFu);
 
-    /* 3. Build slot 0's command header + a READ DMA EXT command table. */
+    /* Re-enable the engines (FRE before ST). */
+    wr32(pb, HYPE_AHCI_PREG_CMD, rd32(pb, HYPE_AHCI_PREG_CMD) | HYPE_AHCI_PCMD_FRE);
+    wr32(pb, HYPE_AHCI_PREG_CMD, rd32(pb, HYPE_AHCI_PREG_CMD) | HYPE_AHCI_PCMD_ST);
+    return 0;
+}
+
+int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst) {
+    volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
+    volatile uint8_t *pb = port_base(abar, port);
+
+    /* Build slot 0's command header + a READ DMA EXT command table. The port was
+     * already pointed at g_cmd_list / g_recv_fis by hype_ahci_host_init(). */
     if (hype_ahci_host_build_read_dma_ext(g_cmd_table, lba, count, (uint64_t)(uintptr_t)dst) != 0) {
         return -1;
     }
     hype_ahci_host_build_cmd_header(g_cmd_list, /*is_write=*/0, /*prdtl=*/1,
                                     (uint64_t)(uintptr_t)g_cmd_table);
 
-    /* 4. Re-enable the engines (FRE before ST). */
-    wr32(pb, HYPE_AHCI_PREG_CMD, rd32(pb, HYPE_AHCI_PREG_CMD) | HYPE_AHCI_PCMD_FRE);
-    wr32(pb, HYPE_AHCI_PREG_CMD, rd32(pb, HYPE_AHCI_PREG_CMD) | HYPE_AHCI_PCMD_ST);
-
-    /* 5. Wait for the device to be ready (not BSY, no DRQ) before issuing. */
+    /* Wait for the device to be ready (not BSY, no DRQ) before issuing. */
     if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
         return -1;
     }
-
-    /* 6. Issue slot 0 and poll PxCI until the HBA clears it (command complete). */
+    /* Issue slot 0 and poll PxCI until the HBA clears it (command complete). */
     wr32(pb, HYPE_AHCI_PREG_CI, 1u);
     if (wait_clear(pb, HYPE_AHCI_PREG_CI, 1u, SPIN_CMD) != 0) {
         return -1;
     }
-
-    /* 7. Surface an ATA error (TFD status ERR bit). */
+    /* Surface an ATA error (TFD status ERR bit). */
     if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
         return -1;
     }

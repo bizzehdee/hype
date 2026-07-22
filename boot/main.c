@@ -8274,7 +8274,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             int sp = hype_ahci_host_find_sata_port(hs.bar_phys);
             if (sp < 0) {
                 hype_serial_print("host-ahci: AHCI present but no SATA disk port\n");
-            } else if (hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 0u, 1u, g_hostdisk_probe) == 0) {
+            } else if (hype_ahci_host_init(hs.bar_phys, (unsigned)sp) == 0 &&
+                       hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 0u, 1u, g_hostdisk_probe) == 0) {
                 hype_debug_print(
                     "host-ahci: port %d LBA0 read OK -- bytes[0..3]=%02x%02x%02x%02x mbrsig=%02x%02x\n",
                     sp, (unsigned)g_hostdisk_probe[0], (unsigned)g_hostdisk_probe[1],

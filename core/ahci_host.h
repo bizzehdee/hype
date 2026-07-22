@@ -59,13 +59,23 @@ int hype_ahci_host_build_read_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t
 int hype_ahci_host_find_sata_port(uint64_t abar_phys);
 
 /*
- * Reads `count` sectors (1..8, one PRDT entry) starting at LBA `lba` from `port`
- * of the HBA at `abar_phys` into `dst` (a 512*count-byte, identity-mapped,
- * sector-aligned host buffer -- the HBA DMAs into its physical address).
- * Stops+reprograms the port onto hype's own command list / FIS buffers, issues
- * a polled READ DMA EXT, and waits (bounded spin) for completion. Returns 0 on
- * success, -1 on timeout or an ATA error. Post-ExitBootServices only (it owns
- * the real controller); x86 DMA is cache-coherent so no explicit flush needed.
+ * Prepares `port` of the HBA at `abar_phys` for hype-driven I/O: stops the port,
+ * points PxCLB/PxFB at hype's own command list / received-FIS buffers, clears
+ * sticky errors, and restarts the engines. Call ONCE before a run of reads (the
+ * streaming source does this at setup) -- hype_ahci_host_read() then reuses the
+ * already-programmed port per call rather than reprogramming it each time.
+ * Returns 0 on success, -1 if the port's DMA engines won't quiesce.
+ * Post-ExitBootServices only (it takes over the real controller).
+ */
+int hype_ahci_host_init(uint64_t abar_phys, unsigned port);
+
+/*
+ * Reads `count` sectors (1..8192, one PRDT entry, <=4 MiB) starting at LBA `lba`
+ * from an already-initialised `port` (see hype_ahci_host_init) into `dst` -- a
+ * 512*count-byte, identity-mapped, sector-aligned host buffer the HBA DMAs into.
+ * Builds slot 0 (READ DMA EXT), issues it, and polls PxCI (bounded spin) to
+ * completion. Returns 0 on success, -1 on timeout or an ATA error. x86 DMA is
+ * cache-coherent, so no explicit flush is needed.
  */
 int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst);
 
