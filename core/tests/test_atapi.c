@@ -126,7 +126,7 @@ static void test_read10_valid(void) {
 
     CHECK_HEX("status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
     CHECK_HEX("streams directly from media_data", 1, out.uses_media_data);
-    CHECK_HEX("media_offset = LBA 2 * 2048", 2u * HYPE_ATAPI_SECTOR_SIZE, out.media_offset);
+    CHECK_HEX("media_lba = 2 (start sector)", 2u, out.media_lba);
     CHECK_HEX("media_length = 1 * 2048", HYPE_ATAPI_SECTOR_SIZE, out.media_length);
 }
 
@@ -292,7 +292,7 @@ static void test_read12_valid(void) {
 
     CHECK_HEX("READ(12) status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
     CHECK_HEX("READ(12) streams from media", 1, out.uses_media_data);
-    CHECK_HEX("READ(12) media_offset = LBA 1 * 2048", 1u * HYPE_ATAPI_SECTOR_SIZE, out.media_offset);
+    CHECK_HEX("READ(12) media_lba = 1 (start sector)", 1u, out.media_lba);
     CHECK_HEX("READ(12) media_length = 3 * 2048", 3u * HYPE_ATAPI_SECTOR_SIZE, out.media_length);
     CHECK_HEX("read12_count incremented", 1, dev.read12_count);
     CHECK_HEX("read10_count untouched by READ(12)", 0, dev.read10_count);
@@ -485,6 +485,51 @@ static void test_read_toc_multisession(void) {
     CHECK_HEX("last session = 1", 1u, out.synth_data[3]);
 }
 
+static void test_reset_chunked_media_size_not_truncated(void) {
+    /* GLADDER-10(b): a >=4GB ISO's size must survive in the 64-bit media_size. */
+    hype_atapi_t dev;
+    hype_chunked_iso_t iso;
+    iso.chunk_bytes = 256ull * 1024 * 1024;
+    iso.total_bytes = 5ull * 1024 * 1024 * 1024; /* 5 GB */
+    iso.n_chunks = 20;
+    hype_atapi_reset_chunked(&dev, &iso);
+    CHECK_HEX("media_size preserves full 5GB (no uint32 truncation)",
+              5ull * 1024 * 1024 * 1024, dev.media_size);
+}
+
+static void test_read10_offset_no_uint32_overflow(void) {
+    /* GLADDER-10(b): past LBA ~2.1M, lba*2048 exceeds UINT32_MAX. The byte
+     * offset must be computed in 64-bit or it wraps and reads the wrong data. */
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    hype_chunked_iso_t iso;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+    uint32_t lba = 3000000u; /* start sector past the 4GB mark: 3e6 * 2048 = 6.144e9 */
+    /* The 64-bit byte offset the caller derives (media_lba * sector size). */
+    uint64_t byte_off = (uint64_t)lba * HYPE_ATAPI_SECTOR_SIZE;
+
+    iso.chunk_bytes = 256ull * 1024 * 1024;
+    iso.total_bytes = 8ull * 1024 * 1024 * 1024; /* 8 GB -> 4.19M sectors (lba in range) */
+    iso.n_chunks = 32;
+    hype_atapi_reset_chunked(&dev, &iso);
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ10);
+    cdb[2] = (uint8_t)(lba >> 24);
+    cdb[3] = (uint8_t)(lba >> 16);
+    cdb[4] = (uint8_t)(lba >> 8);
+    cdb[5] = (uint8_t)lba;
+    cdb[8] = 1; /* count = 1 block */
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status GOOD (read past 4GB accepted on 8GB media)", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("streams directly from media", 1, out.uses_media_data);
+    /* media_lba carries the full 32-bit start sector; the caller scales it to a
+     * 64-bit byte offset (verified here to exceed UINT32_MAX, i.e. no wrap). */
+    CHECK_HEX("media_lba = start sector (no truncation)", lba, out.media_lba);
+    CHECK_HEX("derived byte offset exceeds UINT32_MAX",
+              1u, (unsigned)((byte_off >> 32) != 0));
+    CHECK_HEX("media_length = 1 * 2048", HYPE_ATAPI_SECTOR_SIZE, out.media_length);
+}
+
 int main(void) {
     init_media();
 
@@ -513,6 +558,8 @@ int main(void) {
     test_get_event_status_media_present();
     test_read_toc_formatted();
     test_read_toc_multisession();
+    test_reset_chunked_media_size_not_truncated();
+    test_read10_offset_no_uint32_overflow();
 
     if (failures == 0) {
         printf("all tests passed\n");

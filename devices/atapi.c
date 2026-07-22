@@ -88,7 +88,9 @@ static void handle_read_capacity(hype_atapi_t *dev, hype_atapi_result_t *out) {
         return;
     }
 
-    last_lba = (dev->media_size / HYPE_ATAPI_SECTOR_SIZE) - 1u;
+    /* READ CAPACITY(10)'s LBA field is 32-bit; the 12GB-max backing (6.3M
+     * sectors) fits, so narrow after the 64-bit division. */
+    last_lba = (uint32_t)((dev->media_size / HYPE_ATAPI_SECTOR_SIZE) - 1u);
     out->synth_data[0] = (uint8_t)(last_lba >> 24);
     out->synth_data[1] = (uint8_t)(last_lba >> 16);
     out->synth_data[2] = (uint8_t)(last_lba >> 8);
@@ -109,7 +111,7 @@ static void handle_read_capacity(hype_atapi_t *dev, hype_atapi_result_t *out) {
  * AHCI glue does the actual PRDT copy. */
 static void handle_read(hype_atapi_t *dev, uint32_t lba, uint32_t count,
                         hype_atapi_result_t *out) {
-    uint32_t total_sectors;
+    uint64_t total_sectors;
 
     zero_synth(out);
     out->synth_length = 0;
@@ -143,7 +145,10 @@ static void handle_read(hype_atapi_t *dev, uint32_t lba, uint32_t count,
     dev->read10_size_hist[hype_atapi_read10_size_bucket(count)]++;
 
     out->uses_media_data = 1;
-    out->media_offset = lba * HYPE_ATAPI_SECTOR_SIZE;
+    /* GLADDER-10(b): report the start SECTOR, not a byte offset. lba*2048 would
+     * overflow 32 bits for a >=4GB ISO (lba ~2.1M+); the caller does the 64-bit
+     * scale. media_length is a byte count -- one CDB never transfers >4GB. */
+    out->media_lba = lba;
     out->media_length = count * HYPE_ATAPI_SECTOR_SIZE;
     out->status = HYPE_ATAPI_STATUS_GOOD;
     dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
@@ -270,7 +275,7 @@ static void handle_get_event_status(hype_atapi_t *dev, hype_atapi_result_t *out)
  * formatted TOC (a valid response the drivers accept). */
 static void handle_read_toc(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_MAX],
                             hype_atapi_result_t *out) {
-    uint32_t total_sectors;
+    uint64_t total_sectors;
     uint8_t format = (uint8_t)(cdb[2] & 0x0Fu);
 
     zero_synth(out);
@@ -299,7 +304,7 @@ static void handle_read_toc(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_
         put_be32(out->synth_data + 8, 0u);  /* track 1 start LBA */
         out->synth_data[13] = 0x14u;        /* lead-out ADR/control */
         out->synth_data[14] = 0xAAu;        /* lead-out "track" number */
-        put_be32(out->synth_data + 16, total_sectors); /* lead-out start LBA */
+        put_be32(out->synth_data + 16, (uint32_t)total_sectors); /* lead-out start LBA (32-bit TOC field) */
         out->synth_length = 20;
     }
     out->status = HYPE_ATAPI_STATUS_GOOD;
@@ -386,7 +391,7 @@ static void reset_state(hype_atapi_t *dev) {
     }
 }
 
-void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint32_t media_size) {
+void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint64_t media_size) {
     dev->media_data = media_data;
     dev->media_chunks = 0;
     dev->media_size = media_size;
@@ -396,10 +401,9 @@ void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint32_t med
 void hype_atapi_reset_chunked(hype_atapi_t *dev, const hype_chunked_iso_t *iso) {
     dev->media_data = 0;
     dev->media_chunks = iso;
-    /* media_size is a uint32; a >4GB ISO would truncate here. Both current
-     * server ISOs are < 4GB (Fedora 3.64GB, Ubuntu 2.72GB) so this is fine,
-     * but a >=4GB ISO needs media_size widened (tracked with GLADDER-10). */
-    dev->media_size = (uint32_t)(iso ? iso->total_bytes : 0);
+    /* GLADDER-10(b): media_size is 64-bit, so a >=4GB ISO's size (and every
+     * byte offset derived from it) is carried without truncation. */
+    dev->media_size = iso ? iso->total_bytes : 0;
     reset_state(dev);
 }
 

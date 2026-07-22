@@ -1694,7 +1694,7 @@ static void run_iso_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_guest_ram_zero(g_iso_2_guest_code, sizeof(g_iso_2_guest_code));
     hype_guest_ram_zero(g_iso_2_guest_stack, sizeof(g_iso_2_guest_stack));
 
-    hype_atapi_reset(&g_iso_2_atapi, (uint8_t *)(uintptr_t)g_iso_host_phys, (uint32_t)g_iso_size);
+    hype_atapi_reset(&g_iso_2_atapi, (uint8_t *)(uintptr_t)g_iso_host_phys, g_iso_size);
     hype_ahci_reset(&g_iso_2_ahci);
 
     cmd_list_phys = (uint64_t)(uintptr_t)g_iso_2_cmd_list;

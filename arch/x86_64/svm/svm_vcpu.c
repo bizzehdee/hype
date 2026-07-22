@@ -1358,6 +1358,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * chunked backing sets this to 1 (below). Must be initialised or those paths
      * would take the chunked copy with a stale media_offset -> spurious failure. */
     int chunked_media = 0;
+    uint64_t media_byte_off = 0; /* GLADDER-10(b): 64-bit byte offset = media_lba * sector size */
     uint32_t remaining;
     uint32_t transferred;
     uint32_t prd_idx;
@@ -1461,10 +1462,15 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
         /* GLADDER-10(a): media may be backed by a CHUNKED (non-contiguous) ISO
          * rather than a flat buffer. For flat media/synth, `src` is a plain
          * pointer advanced per PRD; for chunked media, `src` is unused and each
-         * PRD reads from the chunk list at logical offset media_offset+transferred. */
+         * PRD reads from the chunk list at logical offset media_byte_off+transferred.
+         * GLADDER-10(b): the byte offset is derived here from the 32-bit start
+         * sector (media_lba) with a 64-bit multiply, so a >=4GB ISO (byte offset
+         * past UINT32_MAX) addresses the right bytes without widening the
+         * size-sensitive result struct. */
+        media_byte_off = (uint64_t)result.media_lba * (uint64_t)HYPE_ATAPI_SECTOR_SIZE;
         chunked_media = result.uses_media_data && atapi->media_chunks != 0;
         src = result.uses_media_data
-                  ? (chunked_media ? 0 : (atapi->media_data + result.media_offset))
+                  ? (chunked_media ? 0 : (atapi->media_data + media_byte_off))
                   : result.synth_data;
         remaining = result.uses_media_data ? result.media_length : result.synth_length;
         /* ATA STATUS register: DRDY|DSC always, +ERR on CHECK_CONDITION.
@@ -1497,7 +1503,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
             return -1;
         }
         if (chunked_media) {
-            if (hype_chunked_iso_read(atapi->media_chunks, result.media_offset + transferred, dst,
+            if (hype_chunked_iso_read(atapi->media_chunks, media_byte_off + transferred, dst,
                                       chunk) != 0) {
                 return -1;
             }

@@ -85,10 +85,11 @@ typedef struct {
     const uint8_t *media_data; /* caller-owned backing ISO image (flat); NULL if chunked */
     /* GLADDER-10(a): alternative CHUNKED backing for multi-GB ISOs that can't
      * be one contiguous allocation. Exactly one of media_data / media_chunks is
-     * non-NULL. READ(10) still reports a logical byte offset (media_offset); the
-     * caller copies from whichever backing is set (see svm_vcpu.c AHCI glue). */
+     * non-NULL. READ(10) reports a start sector (media_lba); the caller scales
+     * it to a byte offset and copies from whichever backing is set (see
+     * svm_vcpu.c AHCI glue). */
     const hype_chunked_iso_t *media_chunks;
-    uint32_t media_size;       /* logical bytes; must be a multiple of HYPE_ATAPI_SECTOR_SIZE */
+    uint64_t media_size;       /* GLADDER-10(b): logical bytes (64-bit for >=4GB ISOs); multiple of HYPE_ATAPI_SECTOR_SIZE */
     /* Sense state left behind by the most recently failed command, for
      * a driver that follows a CHECK CONDITION status with REQUEST
      * SENSE -- cleared to NO_SENSE by a subsequent successful command,
@@ -141,7 +142,14 @@ typedef struct {
      * copies bytes into the guest's PRDT-described buffers either
      * way -- this struct only describes where those bytes come from. */
     int uses_media_data;
-    uint32_t media_offset;
+    /* GLADDER-10(b): the read position is the start LBA (a sector index), NOT a
+     * byte offset. A byte offset would need 64 bits for a >=4GB ISO (lba*2048 >
+     * UINT32_MAX), and widening this stack-resident struct reproducibly wedges
+     * the AHCI glue (see GLADDER-STRUCT). A sector index stays 32-bit (good to
+     * 8TB) and keeps the struct byte-identical to the proven layout; the caller
+     * scales it to a 64-bit byte offset (media_lba * HYPE_ATAPI_SECTOR_SIZE).
+     * media_length remains a byte count -- a single CDB never transfers >4GB. */
+    uint32_t media_lba;
     uint32_t media_length;
     uint8_t synth_data[HYPE_ATAPI_MAX_SYNTH_RESPONSE];
     uint32_t synth_length;
@@ -149,7 +157,7 @@ typedef struct {
 
 /* Resets sense state to NO_SENSE and binds the backing media. Call on
  * every (re)start, same convention as every other device model here. */
-void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint32_t media_size);
+void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint64_t media_size);
 
 /* GLADDER-10(a): reset with a CHUNKED backing (multi-GB ISO split across
  * non-contiguous buffers). media_size is taken from iso->total_bytes; the flat
