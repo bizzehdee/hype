@@ -11,6 +11,7 @@
 #include "../core/admission.h"
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
+#include "../core/ahci_host.h"
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
@@ -8257,6 +8258,33 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_serial_print("about to enable interrupts (sti)...\n");
     hype_sti();
     hype_serial_print("interrupts enabled -- host timer live\n");
+
+    /* GLADDER-10 (streaming backend, foundation): now that firmware is gone and
+     * hype owns the hardware, prove the host AHCI driver can read a real disk
+     * sector -- the mechanism a streaming ISO source will use to fetch bytes off
+     * the physical disk on demand. Read-only probe of LBA 0 (the boot disk's
+     * protective MBR / boot sector, ending in the 0x55AA signature); diagnostic
+     * only. Bounded polling, so a non-responsive controller logs a failure
+     * rather than hanging. */
+    {
+        static uint8_t g_hostdisk_probe[512] __attribute__((aligned(4096)));
+        hype_host_storage_t hs;
+        if (hype_host_pci_find_storage(hype_host_pci_read32_hw, 255u, &hs) &&
+            hs.kind == HYPE_HOST_STORAGE_AHCI) {
+            int sp = hype_ahci_host_find_sata_port(hs.bar_phys);
+            if (sp < 0) {
+                hype_serial_print("host-ahci: AHCI present but no SATA disk port\n");
+            } else if (hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 0u, 1u, g_hostdisk_probe) == 0) {
+                hype_debug_print(
+                    "host-ahci: port %d LBA0 read OK -- bytes[0..3]=%02x%02x%02x%02x mbrsig=%02x%02x\n",
+                    sp, (unsigned)g_hostdisk_probe[0], (unsigned)g_hostdisk_probe[1],
+                    (unsigned)g_hostdisk_probe[2], (unsigned)g_hostdisk_probe[3],
+                    (unsigned)g_hostdisk_probe[510], (unsigned)g_hostdisk_probe[511]);
+            } else {
+                hype_debug_print("host-ahci: port %d LBA0 read FAILED\n", sp);
+            }
+        }
+    }
 
 #if HYPE_AP_SMOKETEST
     /*

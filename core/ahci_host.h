@@ -48,4 +48,25 @@ void hype_ahci_host_build_cmd_header(uint8_t slot[32], int is_write, uint16_t pr
 int hype_ahci_host_build_read_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t count,
                                       uint64_t dst_phys);
 
+/* --- Hardware bring-up (host_pci_hw-style shim; real MMIO, not unit-tested) --- */
+
+/*
+ * Scans the HBA at `abar_phys` (identity-mapped MMIO) for a port with a SATA
+ * hard disk attached (PxSSTS.DET == 3 and the non-ATAPI signature 0x00000101).
+ * Returns the port number, or -1 if none. This is the disk the ESP -- and thus
+ * the installer ISO -- lives on in the QEMU harness.
+ */
+int hype_ahci_host_find_sata_port(uint64_t abar_phys);
+
+/*
+ * Reads `count` sectors (1..8, one PRDT entry) starting at LBA `lba` from `port`
+ * of the HBA at `abar_phys` into `dst` (a 512*count-byte, identity-mapped,
+ * sector-aligned host buffer -- the HBA DMAs into its physical address).
+ * Stops+reprograms the port onto hype's own command list / FIS buffers, issues
+ * a polled READ DMA EXT, and waits (bounded spin) for completion. Returns 0 on
+ * success, -1 on timeout or an ATA error. Post-ExitBootServices only (it owns
+ * the real controller); x86 DMA is cache-coherent so no explicit flush needed.
+ */
+int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst);
+
 #endif /* HYPE_CORE_AHCI_HOST_H */
