@@ -5153,6 +5153,31 @@ Torito:
 patched grub.cfg adds: `serial --unit=0 --speed=115200`, `terminal_input/output
 serial console`, and `console=ttyS0,115200 console=tty0` on the linux line.
 Artifact: ~/Downloads/ubuntu-hype-serial.iso.
+
+GLADDER-6c QEMU coredump A/B (2026-07-21, 6 GiB cap): ran the serial ISO
+through hype under the q35/AHCI topology (`-m 6144 -nodefaults -accel kvm
+-accel tcg -cpu host -smp 2`, outer OVMF pflash, `-device ahci` + `ide-hd`)
+with an initramfs override that sends the udev script's stdout/stderr to
+`/dev/ttyS0`, enables udev debug-to-kmsg, and sets `ulimit -c 0`. The patched
+initrd was extracted back from the remastered ISO and byte-compared before the
+run. It reached `Run /init`; `systemd-udevd` returned status 0 and both
+`udevadm trigger` calls returned status 0. The next command, `udevadm settle`,
+never returned. At guest time 247s the same `udevadm:136` was `Blocked by
+coredump`; its stack was `do_exit -> do_group_exit -> __x64_sys_exit_group`,
+followed by inotify/fsnotify destruction waiting on `synchronize_srcu`.
+There was still no glibc assertion/abort/SIGSYS text on ttyS0 and no observed
+#UD/#GP. Thus routing stderr and suppressing core-file output do not bypass the
+kernel coredump path; the cheap "trigger path/seccomp stderr" hypothesis is
+not sufficient. Raw serial: `build/diagnostics/ubuntu-ttys0-udev-ahci-kvm.serial`.
+
+A deliberately unsafe A/B that skipped only `scripts/init-top/udev`'s
+`udevadm settle` did pass that script (all preceding udev markers printed), but
+still settled into an idle wait before casper/installer output. The extracted
+initramfs contains many later settle calls (including casper helpers and
+`init-bottom/udev`), so this is evidence that bypassing one call is not a
+valid login workaround; it must not be treated as a fix. Raw serial:
+`build/diagnostics/ubuntu-skipsettle-ahci-kvm.serial`.
+
 - [ ] GLADDER-7: Fedora Server + Ubuntu Server TOGETHER on two cores -- the
   mixed-distro concurrent milestone. Deps: GLADDER-5, GLADDER-6, GLADDER-9
   (per-VM ISO), GLADDER-8 (RAM).

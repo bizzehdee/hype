@@ -382,6 +382,13 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx);
  */
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
 
+/* GLADDER-6c DIAG: reinject an intercepted guest exception via EVENTINJ so the
+ * guest takes it through its own IDT on the next VMRUN (used when hype
+ * intercepts a vector only to observe/log it). has_error_code + error_code for
+ * faults that push one (#GP/#PF/#DF); pass 0 for #UD and other no-error faults. */
+void hype_svm_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector,
+                                      int has_error_code, uint32_t error_code);
+
 /*
  * INT-2: handles an EXITCODE_VINTR VM-exit -- disarms the window
  * request (hype_svm_disarm_vintr_request(),

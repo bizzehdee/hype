@@ -934,6 +934,23 @@ void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     g_int_vintr_defer++;
 }
 
+/* GLADDER-6c DIAG: reinject a guest exception that hype intercepted purely to
+ * observe it -- staged in EVENTINJ so the guest takes it through its own IDT on
+ * the next VMRUN, exactly as if hype had never intercepted the vector. Type =
+ * EXCEPTION(3); EV + error code for faults that push one (#GP=13/#PF=14/#DF=8);
+ * #UD=6 pushes none. Does not touch the pending-IRR interrupt path. */
+void hype_svm_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector,
+                                      int has_error_code, uint32_t error_code) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    uint64_t einj = HYPE_SVM_EVENTINJ_V |
+                    (HYPE_SVM_EVENTINJ_TYPE_EXCEPTION << HYPE_SVM_EVENTINJ_TYPE_SHIFT) |
+                    ((uint64_t)vector & HYPE_SVM_EVENTINJ_VECTOR_MASK);
+    if (has_error_code) {
+        einj |= HYPE_SVM_EVENTINJ_EV | ((uint64_t)error_code << 32);
+    }
+    real->vmcb->control.eventinj = einj;
+}
+
 void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
 

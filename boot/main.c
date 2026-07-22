@@ -5124,8 +5124,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * faults via their own IDTs; intercepting exceptions -- the strict
      * default that caught the FW-1 bring-up faults -- is fatal to a real
      * guest. An unrecoverable triple fault still returns to us as
-     * HYPE_SVM_EXITCODE_SHUTDOWN. */
-    hype_svm_vcpu_set_exception_intercepts(ctx, 0);
+     * HYPE_SVM_EXITCODE_SHUTDOWN.
+     *
+     * GLADDER-6c DIAG: additionally OBSERVE #UD(6) and #GP(13) -- the two
+     * vectors a hype-specific mis-emulation would surface as (a bad/illegal
+     * instruction -> #UD; a bad segment/MSR/canonical access -> #GP). They are
+     * intercepted only to LOG (rip/cs/err/insn bytes) and then reinjected via
+     * hype_svm_vcpu_reinject_exception(), so the guest still delivers the fault
+     * through its own IDT exactly as before -- catches the invisible Ubuntu
+     * udevadm crash at its source without altering guest behavior. #PF(14) is
+     * deliberately NOT intercepted (routine, would flood + slow the boot). */
+    hype_svm_vcpu_set_exception_intercepts(ctx, (1u << 6) | (1u << 13));
 
     /* M4-6d4 #5: bound the guest's uninterrupted execution via SVM PAUSE-
      * filtering. Real HW showed a single 40s VMRUN with zero exits (PREEMPT
@@ -5655,6 +5664,34 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  (unsigned int)g_fw_1_lapic.lvt_timer_armed_seen,
                                  (unsigned int)g_fw_1_pic.master.imr, (unsigned int)g_fw_1_pic.slave.imr,
                                  (unsigned int)g_fw_1_pic.master.isr, (unsigned int)g_fw_1_pic.slave.isr);
+
+                /* GLADDER-6c DIAG: companion to TIMERHIST -- interrupt-INJECTION
+                 * health, so a diff of two lines across the wedge shows whether
+                 * each generated timer IRQ is actually reaching the guest.
+                 * eventinj = injected directly; defer = queued to pending IRR
+                 * (EVENTINJ busy); window = later drained via a VINTR window;
+                 * coalesced = a request found its own vector already pending
+                 * (folded, not a bug); collisions = EVENTINJ.V was already staged
+                 * (would have been a silent drop pre-M4-6b2, now deferred). If
+                 * lapic_irq climbs but eventinj+window stall, timer IRQs are
+                 * generated-but-not-delivered; if they track, delivery is fine
+                 * and the wedge is downstream (SRCU/workqueue/self-wakeup). Also
+                 * dumps the live pending-IRR occupancy + staged EVENTINJ. */
+                {
+                    hype_svm_intr_state_t idg;
+                    unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
+                    hype_svm_vcpu_get_int_diag(&ei, &df, &wn, &ov);
+                    hype_svm_vcpu_get_intr_state(ctx, &idg);
+                    hype_debug_print("fw-1 INTDIAG: eventinj=%llu defer=%llu window=%llu coalesced=%llu "
+                                     "collisions=%llu | pending=%d/vec0x%x staged_eventinj=0x%llx "
+                                     "IF=%d shadow=0x%llx\n",
+                                     ei, df, wn, ov,
+                                     hype_svm_vcpu_get_eventinj_collisions(),
+                                     idg.pending_valid, (unsigned int)idg.pending_vector,
+                                     (unsigned long long)idg.eventinj,
+                                     (int)((idg.rflags >> 9) & 1u),
+                                     (unsigned long long)idg.interrupt_shadow);
+                }
 
                 /* PERF-1 (gaps #3/#4): re-emit the guest's pinned clocksource +
                  * delay-calibration lines on every diag tick, so they're always
@@ -6837,6 +6874,44 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                 }
             }
+            continue;
+        }
+
+        /* GLADDER-6c DIAG: observe-and-reinject #UD(0x46)/#GP(0x4D). These are
+         * intercepted only to catch the invisible Ubuntu userspace crash at its
+         * source (print-fatal-signals stayed silent). Log the fault's vector,
+         * error code, RIP, CS (0x33=64-bit userspace, 0x10=kernel), and the
+         * faulting instruction bytes (read through the guest's own CR3, since a
+         * userspace RIP is a guest-virtual address), then REINJECT so the guest
+         * delivers the fault through its own IDT exactly as if unintercepted --
+         * benign kernel ud2/BUG or MSR-probe #GP just get logged+reinjected and
+         * the boot continues. Capped so a chatty guest can't flood the console. */
+        if (info.reason == HYPE_SVM_EXITCODE_EXCEPTION_BASE + 6 ||
+            info.reason == HYPE_SVM_EXITCODE_EXCEPTION_BASE + 13) {
+            unsigned vec = (unsigned)(info.reason - HYPE_SVM_EXITCODE_EXCEPTION_BASE);
+            int is_gp = (vec == 13u);
+            static unsigned guestexcp_log_n = 0;
+            if (guestexcp_log_n < 96u) {
+                hype_svm_debug_state_t xd;
+                uint8_t ib[12];
+                unsigned k;
+                guestexcp_log_n++;
+                for (k = 0; k < 12u; k++) { ib[k] = 0; }
+                hype_svm_vcpu_get_debug_state(ctx, &xd);
+                /* userspace/kernel RIP -> read insn bytes via the guest CR3 */
+                fw_1_read_guest_va(vm, xd.cr3, xd.rip, ib, 12);
+                hype_debug_print("fw-1 GUESTEXCP: #%s vec=%u err=0x%llx rip=0x%llx cs=0x%x rsp=0x%llx "
+                                 "insn=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                 is_gp ? "GP" : "UD", vec, (unsigned long long)info.qualification,
+                                 (unsigned long long)xd.rip, (unsigned int)xd.cs_selector,
+                                 (unsigned long long)xd.rsp,
+                                 ib[0], ib[1], ib[2], ib[3], ib[4], ib[5],
+                                 ib[6], ib[7], ib[8], ib[9], ib[10], ib[11]);
+            }
+            /* Reinject with the original error code (#GP pushes one; #UD does
+             * not). info.qualification == exitinfo1 == the exception error code. */
+            hype_svm_vcpu_reinject_exception(ctx, (uint8_t)vec, is_gp,
+                                             (uint32_t)info.qualification);
             continue;
         }
 
