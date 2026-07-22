@@ -21,7 +21,8 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/serial.c core/serial_hw.c core/font8x8.c core/gop.c core/gop_text.c \
              core/fatal.c core/strutil.c core/guest_ram.c core/mp.c core/linux_boot.c \
              core/admission.c core/file_io.c core/guest_mem.c core/logbuf.c core/nvlog.c \
-             core/clockfacts.c core/io_histogram.c core/chunked_iso.c
+             core/clockfacts.c core/io_histogram.c core/chunked_iso.c \
+             core/host_pci.c core/host_pci_hw.c
 ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
              arch/x86_64/cpu/paging.c arch/x86_64/cpu/paging_load.c \

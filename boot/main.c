@@ -10,6 +10,7 @@
 #include "../core/mp.h"
 #include "../core/admission.h"
 #include "../core/file_io.h"
+#include "../core/host_pci.h"
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
@@ -7721,6 +7722,24 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_debug_print("cpu: svm_feature_edx=0x%08x pause_filter=%d pause_threshold=%d\n",
                              svm_edx, hype_cpu_has_pause_filter(svm_edx),
                              hype_cpu_has_pause_threshold(svm_edx));
+        }
+        /* GLADDER-10 (streaming ISO backend, foundation): enumerate the REAL
+         * host PCI bus for the mass-storage controller hype must eventually
+         * drive itself -- post-ExitBootServices, where UEFI file I/O is gone --
+         * to stream an installer ISO off disk instead of holding it all in RAM.
+         * Read-only 0xCF8/0xCFC probe; diagnostic only for now, but it proves
+         * hype can locate and address the controller (its register BAR). */
+        {
+            hype_host_storage_t hs;
+            if (hype_host_pci_find_storage(hype_host_pci_read32_hw, 255u, &hs)) {
+                hype_debug_print(
+                    "host-pci: storage=%s at %02x:%02x.%x vid=%04x did=%04x bar=0x%llx\n",
+                    (hs.kind == HYPE_HOST_STORAGE_NVME) ? "NVMe" : "AHCI", (unsigned)hs.bus,
+                    (unsigned)hs.dev, (unsigned)hs.func, (unsigned)hs.vendor_id,
+                    (unsigned)hs.device_id, (unsigned long long)hs.bar_phys);
+            } else {
+                hype_debug_print("host-pci: no AHCI/NVMe storage controller found (buses 0-255)\n");
+            }
         }
 
         if (ops == 0) {
