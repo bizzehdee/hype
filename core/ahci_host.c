@@ -25,8 +25,13 @@ void hype_ahci_host_build_cmd_header(uint8_t slot[32], int is_write, uint16_t pr
     put_le32(slot + 12, (uint32_t)(cmd_table_phys >> 32)); /* CTBAU */
 }
 
-int hype_ahci_host_build_read_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t count,
-                                      uint64_t dst_phys) {
+/* Shared encoder for READ/WRITE DMA EXT: a H2D Register FIS carrying `ata_cmd`
+ * with the 48-bit LBA + 16-bit count, and a single PRDT entry for count*512
+ * bytes at `buf_phys` (the data source for a write, destination for a read).
+ * The read vs write direction the HBA acts on comes from the command-list
+ * header's W bit (hype_ahci_host_build_cmd_header), not from here. */
+static int build_rw_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t count, uint64_t buf_phys,
+                            uint8_t ata_cmd) {
     uint8_t *fis = cmd_table + HYPE_AHCI_HOST_CT_CFIS_OFF;
     uint8_t *prd = cmd_table + HYPE_AHCI_HOST_CT_PRDT_OFF;
     uint32_t bytes;
@@ -47,7 +52,7 @@ int hype_ahci_host_build_read_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t
     }
     fis[0] = 0x27u;                       /* FIS type: Register - Host to Device */
     fis[1] = 0x80u;                       /* C bit: this FIS carries a command */
-    fis[2] = HYPE_ATA_CMD_READ_DMA_EXT;   /* 0x25 */
+    fis[2] = ata_cmd;                     /* READ (0x25) or WRITE (0x35) DMA EXT */
     fis[4] = (uint8_t)(lba);
     fis[5] = (uint8_t)(lba >> 8);
     fis[6] = (uint8_t)(lba >> 16);
@@ -60,13 +65,87 @@ int hype_ahci_host_build_read_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t
 
     /* First PRDT entry -- inverse of hype_ahci_decode_prdt_entry(): 64-bit data
      * base, and DBC = bytes-1 in bits 21:0 (bit31 = interrupt-on-completion, left
-     * clear -- the read path polls PxCI). */
+     * clear -- the read/write path polls PxCI). */
     for (i = 0; i < HYPE_AHCI_HOST_PRDT_ENTRY_SIZE; i++) {
         prd[i] = 0;
     }
-    put_le32(prd + 0, (uint32_t)dst_phys);          /* DBA  */
-    put_le32(prd + 4, (uint32_t)(dst_phys >> 32));  /* DBAU */
+    put_le32(prd + 0, (uint32_t)buf_phys);          /* DBA  */
+    put_le32(prd + 4, (uint32_t)(buf_phys >> 32));  /* DBAU */
     dbc = (bytes - 1u) & 0x3FFFFFu;
     put_le32(prd + 12, dbc);
     return 0;
+}
+
+int hype_ahci_host_build_read_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t count,
+                                      uint64_t dst_phys) {
+    return build_rw_dma_ext(cmd_table, lba, count, dst_phys, HYPE_ATA_CMD_READ_DMA_EXT);
+}
+
+int hype_ahci_host_build_write_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t count,
+                                       uint64_t src_phys) {
+    return build_rw_dma_ext(cmd_table, lba, count, src_phys, HYPE_ATA_CMD_WRITE_DMA_EXT);
+}
+
+void hype_ahci_host_build_identify(uint8_t *cmd_table, uint64_t dst_phys) {
+    uint8_t *fis = cmd_table + HYPE_AHCI_HOST_CT_CFIS_OFF;
+    uint8_t *prd = cmd_table + HYPE_AHCI_HOST_CT_PRDT_OFF;
+    uint32_t dbc;
+    unsigned i;
+
+    /* H2D Register FIS carrying IDENTIFY DEVICE. Unlike READ DMA EXT there is
+     * no LBA/count and no LBA-mode device byte -- IDENTIFY takes none. */
+    for (i = 0; i < 20u; i++) {
+        fis[i] = 0;
+    }
+    fis[0] = 0x27u;                          /* FIS type: Register - Host to Device */
+    fis[1] = 0x80u;                          /* C bit: this FIS carries a command */
+    fis[2] = HYPE_ATA_CMD_IDENTIFY_DEVICE;   /* 0xEC */
+
+    /* Single PRDT entry for the 512-byte IDENTIFY response. DBC = bytes-1. */
+    for (i = 0; i < HYPE_AHCI_HOST_PRDT_ENTRY_SIZE; i++) {
+        prd[i] = 0;
+    }
+    put_le32(prd + 0, (uint32_t)dst_phys);
+    put_le32(prd + 4, (uint32_t)(dst_phys >> 32));
+    dbc = (HYPE_ATA_IDENTIFY_SIZE - 1u) & 0x3FFFFFu;
+    put_le32(prd + 12, dbc);
+}
+
+/* Inverse of devices/ata_disk.c's write_swapped_ascii: each ATA word stores the
+ * first character in its high byte (src[i+1]) and the second in its low byte
+ * (src[i]). Writes `field_bytes` chars + a NUL, then trims trailing spaces. */
+static void read_swapped_ascii(char *dst, const uint8_t *src, unsigned field_bytes) {
+    unsigned i;
+
+    for (i = 0; i < field_bytes; i += 2u) {
+        dst[i] = (char)src[i + 1u];
+        dst[i + 1u] = (char)src[i];
+    }
+    dst[field_bytes] = '\0';
+    while (field_bytes > 0u && dst[field_bytes - 1u] == ' ') {
+        dst[field_bytes - 1u] = '\0';
+        field_bytes--;
+    }
+}
+
+void hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t *out) {
+    uint64_t lba48 = 0;
+    uint32_t lba28;
+    unsigned i;
+
+    read_swapped_ascii(out->serial, id + 20, 20u); /* words 10-19 */
+    read_swapped_ascii(out->model, id + 54, 40u);  /* words 27-46 */
+
+    for (i = 0; i < 8u; i++) { /* words 100-103: 48-bit LBA capacity, 64-bit LE */
+        lba48 |= (uint64_t)id[200 + i] << (8u * i);
+    }
+    lba28 = (uint32_t)id[120] | ((uint32_t)id[121] << 8) |
+            ((uint32_t)id[122] << 16) | ((uint32_t)id[123] << 24); /* words 60-61 */
+
+    /* Word 83 bit 10 (high byte 167, bit 2 = 0x04) = 48-bit addressing supported. */
+    if ((id[167] & 0x04u) != 0u && lba48 != 0u) {
+        out->total_sectors = lba48;
+    } else {
+        out->total_sectors = lba28;
+    }
 }

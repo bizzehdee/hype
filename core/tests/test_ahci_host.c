@@ -1,8 +1,18 @@
 #include <stdio.h>
+#include <string.h>
 #include "../ahci_host.h"
-#include "../../devices/ahci.h" /* the decoders this encoder must round-trip against */
+#include "../../devices/ahci.h"     /* the decoders this encoder must round-trip against */
+#include "../../devices/ata_disk.h" /* hype_ata_disk_build_identify -- the parse inverse */
 
 static int failures = 0;
+
+#define CHECK_STR(desc, expected, actual) \
+    do { \
+        if (strcmp((expected), (actual)) != 0) { \
+            printf("FAIL: %s: expected \"%s\", got \"%s\"\n", (desc), (expected), (actual)); \
+            failures++; \
+        } \
+    } while (0)
 
 #define CHECK_HEX(desc, expected, actual) \
     do { \
@@ -72,11 +82,89 @@ static void test_read_dma_ext_bounds(void) {
               hype_ahci_host_build_read_dma_ext(ct, 0, 8192, 0x1000ull));
 }
 
+static void test_write_dma_ext_roundtrip(void) {
+    uint8_t ct[0x80 + 16];
+    hype_ahci_h2d_fis_t fis;
+    hype_ahci_prdt_entry_t prd;
+    int rc = hype_ahci_host_build_write_dma_ext(ct, /*lba=*/0x55AA55AAull, /*count=*/4,
+                                                /*src_phys=*/0x4000ull);
+    CHECK_HEX("build write ok", 0, rc);
+    hype_ahci_decode_h2d_fis(ct + HYPE_AHCI_HOST_CT_CFIS_OFF, &fis);
+    CHECK_HEX("command = WRITE DMA EXT (0x35)", HYPE_ATA_CMD_WRITE_DMA_EXT, fis.command);
+    CHECK_HEX("write 48-bit LBA round-trips", 0x55AA55AAull, fis.lba);
+    CHECK_HEX("write count = 4", 4u, fis.count);
+    hype_ahci_decode_prdt_entry(ct + HYPE_AHCI_HOST_CT_PRDT_OFF, &prd);
+    CHECK_HEX("write PRDT src base", 0x4000ull, prd.data_phys);
+    CHECK_HEX("write PRDT byte count", 4u * 512u, prd.byte_count);
+    /* count bounds shared with the read builder. */
+    CHECK_HEX("write count 0 rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_ahci_host_build_write_dma_ext(ct, 0, 0, 0x4000ull));
+}
+
+static void test_identify_cmd_table(void) {
+    uint8_t ct[0x80 + 16];
+    hype_ahci_h2d_fis_t fis;
+    hype_ahci_prdt_entry_t prd;
+
+    hype_ahci_host_build_identify(ct, /*dst_phys=*/0xCAFE1000ull);
+    hype_ahci_decode_h2d_fis(ct + HYPE_AHCI_HOST_CT_CFIS_OFF, &fis);
+    CHECK_HEX("command = IDENTIFY DEVICE (0xEC)", HYPE_ATA_CMD_IDENTIFY_DEVICE, fis.command);
+    CHECK_HEX("IDENTIFY carries no LBA", 0ull, fis.lba);
+    CHECK_HEX("IDENTIFY carries no count", 0u, fis.count);
+    CHECK_HEX("FIS type 0x27", 0x27u, ct[0]);
+    CHECK_HEX("C bit set", 0x80u, ct[1] & 0x80u);
+
+    hype_ahci_decode_prdt_entry(ct + HYPE_AHCI_HOST_CT_PRDT_OFF, &prd);
+    CHECK_HEX("PRDT data base round-trips", 0xCAFE1000ull, prd.data_phys);
+    CHECK_HEX("PRDT byte count = 512", 512u, prd.byte_count);
+}
+
+/* Strongest test of the parser: feed it the guest-side IDENTIFY *builder*'s
+ * output (devices/ata_disk.c) and confirm every field round-trips. */
+static void test_parse_identify_roundtrip(void) {
+    hype_ata_disk_t disk;
+    uint8_t id[HYPE_ATA_IDENTIFY_SIZE];
+    hype_host_disk_info_t info;
+
+    /* 4 GiB disk => 8388608 sectors, well within 48-bit. */
+    hype_ata_disk_reset(&disk, (uint8_t *)0, 8388608ull * 512ull);
+    hype_ata_disk_build_identify(&disk, id);
+    hype_ahci_host_parse_identify(id, &info);
+
+    CHECK_STR("serial round-trips + trims", "HYPE0000000000000001", info.serial);
+    CHECK_STR("model round-trips + trims trailing spaces", "HYPE VIRTUAL DISK", info.model);
+    CHECK_HEX("48-bit capacity round-trips", 8388608ull, info.total_sectors);
+}
+
+/* When 48-bit addressing is not advertised (word 83 bit 10 clear), the parser
+ * must fall back to the 28-bit words-60-61 capacity. */
+static void test_parse_identify_lba28_fallback(void) {
+    uint8_t id[512];
+    hype_host_disk_info_t info;
+    unsigned i;
+
+    for (i = 0; i < 512u; i++) {
+        id[i] = 0;
+    }
+    /* word 83 left 0 (no 48-bit); words 100-103 left 0; only 28-bit capacity set. */
+    id[120] = 0x00u; /* 0x00100000 = 1,048,576 sectors */
+    id[121] = 0x00u;
+    id[122] = 0x10u;
+    id[123] = 0x00u;
+    hype_ahci_host_parse_identify(id, &info);
+    CHECK_HEX("28-bit fallback capacity", 0x00100000ull, info.total_sectors);
+    CHECK_STR("empty serial trims to nothing", "", info.serial);
+}
+
 int main(void) {
     test_cmd_header_roundtrip();
     test_cmd_header_write_flag();
     test_read_dma_ext_roundtrip();
     test_read_dma_ext_bounds();
+    test_write_dma_ext_roundtrip();
+    test_identify_cmd_table();
+    test_parse_identify_roundtrip();
+    test_parse_identify_lba28_fallback();
 
     if (failures == 0) {
         printf("all tests passed\n");

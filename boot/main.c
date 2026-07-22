@@ -19,6 +19,7 @@
 #include "../core/ahci_host.h"
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
+#include "../core/fat.h"
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
@@ -8017,6 +8018,17 @@ static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     return hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, dst);
 }
 
+/* GLADDER-11: the host FS reader (core/fat.c) wants a VOLUME-relative reader --
+ * sector 0 == the FAT/exFAT ESP's boot sector. Offset every read by the ESP
+ * partition's first LBA so the same physical disk backs both this and the
+ * disk-absolute hostdisk_read(). */
+static uint64_t g_fat_esp_base;
+static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    (void)ctx;
+    return hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, g_fat_esp_base + lba,
+                               (uint16_t)count, dst);
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -8779,12 +8791,100 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 } else {
                     hype_debug_print("host-ahci: port %d LBA0 read FAILED\n", sp);
                 }
-                /* GLADDER-10: exercise the full streaming read stack end-to-end
-                 * against a real on-disk ISO -- GPT-locate partition 2 (the raw
-                 * ISO), then stream-read its ISO9660 PVD and verify the "CD001"
-                 * magic at byte 32769. Diagnostic only (does not yet back the
-                 * guest CD); proves gpt + ahci_host + iso_stream compose. */
+                /* M10-2: capture the physical disk's identity -- ATA serial +
+                 * model + real capacity (IDENTIFY DEVICE), plus the GPT disk
+                 * GUID. These are the fields a `physical:` target-disk safety
+                 * guard keys on (serial/GUID match) and a physical-disk block
+                 * backend needs for its own real-capacity bounds check. Logged
+                 * only for now -- no consumer writes to the disk yet. */
                 {
+                    static uint8_t g_hostdisk_id[512] __attribute__((aligned(4096)));
+                    if (hype_ahci_host_identify(hs.bar_phys, (unsigned)sp, g_hostdisk_id) == 0) {
+                        hype_host_disk_info_t di;
+                        uint8_t guid[16];
+                        hype_ahci_host_parse_identify(g_hostdisk_id, &di);
+                        hype_debug_print("host-disk: serial='%s' model='%s' sectors=%llu (%llu MiB)\n",
+                                         di.serial, di.model,
+                                         (unsigned long long)di.total_sectors,
+                                         (unsigned long long)(di.total_sectors / 2048ull));
+                        if (hype_gpt_disk_guid(hostdisk_read, 0, guid) == 0) {
+                            hype_debug_print(
+                                "host-disk: gpt-guid %02x%02x%02x%02x-%02x%02x-%02x%02x-"
+                                "%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+                                guid[0], guid[1], guid[2], guid[3], guid[4], guid[5], guid[6],
+                                guid[7], guid[8], guid[9], guid[10], guid[11], guid[12], guid[13],
+                                guid[14], guid[15]);
+                        }
+                    } else {
+                        hype_serial_print("host-disk: IDENTIFY failed\n");
+                    }
+                }
+                /* GLADDER-11: prefer streaming the ISO from a FILE on the FAT32/
+                 * exFAT ESP (GPT partition 1) -- the natural "copy hype.efi + an
+                 * ISO onto a stick" layout. Locate the ESP, resolve
+                 * \iso\test.iso to its on-disk extents via core/fat.c, and (for a
+                 * contiguous file) point the ISO stream straight at those disk
+                 * sectors. No RAM-resident copy. */
+                {
+                    hype_gpt_partition_t part;
+                    hype_fat_file_t file;
+                    int have_file = 0;
+                    unsigned pidx;
+                    /* Scan up to the first 4 GPT partitions for \iso\test.iso,
+                     * trying FAT32 then exFAT on each. This covers both the ISO
+                     * sitting on the FAT ESP itself and on a separate FAT/exFAT
+                     * data partition (a UEFI ESP must be FAT, so exFAT media is
+                     * always a non-ESP partition). */
+                    for (pidx = 1u; pidx <= 4u && !have_file; pidx++) {
+                        if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
+                            continue;
+                        }
+                        g_fat_esp_base = part.first_lba;
+                        if (hype_fat32_resolve(fatvol_read, 0, "\\iso\\test.iso", &file) == 0) {
+                            hype_debug_print("host-fat: resolved \\iso\\test.iso on FAT32 partition %u\n",
+                                             pidx);
+                            have_file = 1;
+                        } else if (hype_exfat_resolve(fatvol_read, 0, "\\iso\\test.iso", &file) == 0) {
+                            hype_debug_print("host-fat: resolved \\iso\\test.iso on exFAT partition %u\n",
+                                             pidx);
+                            have_file = 1;
+                        }
+                    }
+                    if (have_file && file.count == 1u) {
+                        static uint8_t cd[8];
+                        uint64_t abs_lba = g_fat_esp_base + file.extents[0].start_lba;
+                        hype_debug_print("host-fat: \\iso\\test.iso vol-LBA %llu -> disk-LBA %llu, "
+                                         "%llu bytes, %u extent(s)\n",
+                                         (unsigned long long)file.extents[0].start_lba,
+                                         (unsigned long long)abs_lba,
+                                         (unsigned long long)file.size_bytes, file.count);
+                        g_iso_stream.read = hostdisk_read;
+                        g_iso_stream.ctx = 0;
+                        g_iso_stream.part_start_lba = abs_lba;
+                        g_iso_stream.iso_size = file.size_bytes;
+                        if (hype_iso_stream_read(&g_iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+                            cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
+                            g_iso_stream_ready = 1;
+                            hype_serial_print("host-stream: CD001 verified streaming from a FILE on "
+                                              "the FAT/exFAT ESP -- backing guest CD via streaming\n");
+                        } else {
+                            hype_debug_print("host-stream: CD001 NOT found streaming the ESP file "
+                                             "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
+                                             (unsigned)cd[1], (unsigned)cd[2], (unsigned)cd[3],
+                                             (unsigned)cd[4]);
+                        }
+                    } else if (have_file) {
+                        hype_debug_print("host-fat: \\iso\\test.iso is fragmented (%u extents); "
+                                         "streaming needs a contiguous file -- falling back\n",
+                                         file.count);
+                    }
+                }
+                /* GLADDER-10: fall back to streaming the ISO from its own raw
+                 * partition (partition 2) if the FAT-file path above did not fire
+                 * -- GPT-locate partition 2, stream-read its ISO9660 PVD and
+                 * verify the "CD001" magic at byte 32769. Proves gpt + ahci_host +
+                 * iso_stream compose against a raw-partition backing too. */
+                if (!g_iso_stream_ready) {
                     hype_gpt_partition_t iso_part;
                     if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
                         hype_serial_print("host-gpt: no partition 2 (raw ISO) on the boot disk\n");
