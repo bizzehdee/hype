@@ -161,6 +161,32 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
     return rc;
 }
 
+int hype_ahci_host_write(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count,
+                         const void *src) {
+    volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
+    volatile uint8_t *pb = port_base(abar, port);
+    int rc = 0;
+
+    /* Mirror of hype_ahci_host_read() with a WRITE DMA EXT command table and the
+     * command-header W bit set. x86 DMA is cache-coherent, so no flush needed. */
+    if (hype_ahci_host_build_write_dma_ext(g_cmd_table, lba, count, (uint64_t)(uintptr_t)src) != 0) {
+        return -1;
+    }
+    hype_ahci_host_build_cmd_header(g_cmd_list, /*is_write=*/1, /*prdtl=*/1,
+                                    (uint64_t)(uintptr_t)g_cmd_table);
+
+    if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
+        return -1;
+    }
+    wr32(pb, HYPE_AHCI_PREG_CI, 1u);
+    if (wait_clear(pb, HYPE_AHCI_PREG_CI, 1u, SPIN_CMD) != 0) {
+        rc = -1;
+    } else if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
+        rc = -1;
+    }
+    return rc;
+}
+
 int hype_ahci_host_identify(uint64_t abar_phys, unsigned port, void *dst512) {
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);

@@ -49,6 +49,15 @@ int hype_ahci_host_build_read_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t
                                       uint64_t dst_phys);
 
 /*
+ * As hype_ahci_host_build_read_dma_ext but for WRITE DMA EXT (ATA 0x35): the
+ * PRDT points at `src_phys`, the guest data to be written out. The caller must
+ * set the command header's W bit (hype_ahci_host_build_cmd_header is_write=1).
+ * Same 1..8192-sector (<=4 MiB) limit; returns 0 on success, -1 otherwise. Pure.
+ */
+int hype_ahci_host_build_write_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t count,
+                                       uint64_t src_phys);
+
+/*
  * Fills a command table for IDENTIFY DEVICE (ATA 0xEC): a H2D Register FIS at
  * offset 0 (no LBA/count -- IDENTIFY takes none) and a single PRDT entry at
  * offset 0x80 pointing at `dst_phys` for the 512-byte response. Zeroes the FIS
@@ -116,5 +125,16 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
  * -1 on timeout or an ATA error. Post-ExitBootServices only.
  */
 int hype_ahci_host_identify(uint64_t abar_phys, unsigned port, void *dst512);
+
+/*
+ * Writes `count` sectors (1..8192, <=4 MiB) starting at LBA `lba` from `src` (a
+ * 512*count-byte, identity-mapped, sector-aligned host buffer) to an already-
+ * initialised `port`. Builds slot 0 (WRITE DMA EXT), issues it, polls PxCI.
+ * Returns 0 on success, -1 on timeout or an ATA error. Post-ExitBootServices
+ * only. DESTRUCTIVE: callers must have cleared the §6d safety guard (serial/GUID
+ * match + interactive confirm + non-empty-partition guard) before using this.
+ */
+int hype_ahci_host_write(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count,
+                         const void *src);
 
 #endif /* HYPE_CORE_AHCI_HOST_H */

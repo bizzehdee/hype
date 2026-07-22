@@ -82,6 +82,25 @@ static void test_read_dma_ext_bounds(void) {
               hype_ahci_host_build_read_dma_ext(ct, 0, 8192, 0x1000ull));
 }
 
+static void test_write_dma_ext_roundtrip(void) {
+    uint8_t ct[0x80 + 16];
+    hype_ahci_h2d_fis_t fis;
+    hype_ahci_prdt_entry_t prd;
+    int rc = hype_ahci_host_build_write_dma_ext(ct, /*lba=*/0x55AA55AAull, /*count=*/4,
+                                                /*src_phys=*/0x4000ull);
+    CHECK_HEX("build write ok", 0, rc);
+    hype_ahci_decode_h2d_fis(ct + HYPE_AHCI_HOST_CT_CFIS_OFF, &fis);
+    CHECK_HEX("command = WRITE DMA EXT (0x35)", HYPE_ATA_CMD_WRITE_DMA_EXT, fis.command);
+    CHECK_HEX("write 48-bit LBA round-trips", 0x55AA55AAull, fis.lba);
+    CHECK_HEX("write count = 4", 4u, fis.count);
+    hype_ahci_decode_prdt_entry(ct + HYPE_AHCI_HOST_CT_PRDT_OFF, &prd);
+    CHECK_HEX("write PRDT src base", 0x4000ull, prd.data_phys);
+    CHECK_HEX("write PRDT byte count", 4u * 512u, prd.byte_count);
+    /* count bounds shared with the read builder. */
+    CHECK_HEX("write count 0 rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_ahci_host_build_write_dma_ext(ct, 0, 0, 0x4000ull));
+}
+
 static void test_identify_cmd_table(void) {
     uint8_t ct[0x80 + 16];
     hype_ahci_h2d_fis_t fis;
@@ -142,6 +161,7 @@ int main(void) {
     test_cmd_header_write_flag();
     test_read_dma_ext_roundtrip();
     test_read_dma_ext_bounds();
+    test_write_dma_ext_roundtrip();
     test_identify_cmd_table();
     test_parse_identify_roundtrip();
     test_parse_identify_lba28_fallback();
