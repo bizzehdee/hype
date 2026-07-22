@@ -31,6 +31,7 @@
 #include "../arch/x86_64/cpu/timer.h"
 #include "../arch/x86_64/cpu/ps2_host.h"
 #include "../arch/x86_64/cpu/leader_chord.h"
+#include "../arch/x86_64/cpu/host_input.h"
 #include "../arch/x86_64/cpu/vmexit.h"
 #include "../arch/x86_64/cpu/vmm_select.h"
 #include "../arch/x86_64/svm/npt.h"
@@ -5249,6 +5250,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * ABAR window route to the (RAM-remap-aware) AHCI MMIO handler. */
     int ahci_mapped = 0;
     uint64_t ahci_abar = 0;
+    hype_host_input_t hostin; /* TERM-4: host keyboard -> focused guest routing state */
     /* M4-6b1: drive the guest timebase from real elapsed host TSC. */
     uint64_t tb_last_tsc = hype_rdtsc();
     uint64_t tb_accum = 0; /* fractional-tick carry (units of host TSC * PIT_HZ) */
@@ -5329,11 +5331,39 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * body -- batching turns N lines/flush-window into one push. */
     hype_debug_set_gop_deferred(1);
 
+    hype_host_input_reset(&hostin);
     for (;;) {
         uint8_t timer_vector;
 
         if (perf_boot_start_tsc == 0) {
             perf_boot_start_tsc = hype_rdtsc(); /* PERF-1a wall-clock base */
+        }
+
+        /* TERM-4 (step 1): deliver real operator keystrokes to the focused guest.
+         * Drain hype's owned host keyboard (INPUT-3), split leader chords (INPUT-4)
+         * off from typed keys (host_input/kbd_decode), and enqueue the typed bytes
+         * into the guest's serial-console RX (COM1). This replaces the retired
+         * FW-1g auto-injection (HYPE_FW_1_AUTO_KEY_INJECT=0) with actual input, so
+         * an operator drives GRUB/login themselves. Focus is vm0 until TERM-3 adds
+         * switching; the leader action is reported for now. USB HID (TERM-5) will
+         * feed the same host_input path unchanged. */
+        {
+            uint8_t sc;
+            while (hype_host_kbd_poll_scancode(&sc)) {
+                uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
+                unsigned kn = 0;
+                hype_chord_result_t cr = hype_host_input_feed(&hostin, sc, kb, sizeof(kb), &kn);
+                if (cr.action != HYPE_CHORD_ACTION_NONE) {
+                    /* Focus-switch / dashboard toggle is TERM-3's job; report for now. */
+                    hype_debug_print("term: leader chord action=%d vm_index=%u\n",
+                                     (int)cr.action, (unsigned)cr.vm_index);
+                } else {
+                    unsigned ki;
+                    for (ki = 0; ki < kn; ki++) {
+                        hype_guest_uart_rx_enqueue(&g_fw_1_uart, kb[ki]);
+                    }
+                }
+            }
         }
 
         /* M4-6d4: localise the ~219us/exit real-HW cost. Bracket VMRUN to
