@@ -3,6 +3,8 @@
 #include "../core/fatal.h"
 #include "../core/gop.h"
 #include "../core/gop_text.h"
+#include "../core/vt_screen.h"
+#include "../core/vt_render.h"
 #include "../core/halt.h"
 #include "../core/memmap.h"
 #include "../core/serial.h"
@@ -218,6 +220,7 @@ typedef struct hype_fw_vm {
     hype_ioapic_t ioapic;     /* M4-6b3: guest I/O APIC (0xFEC00000) */
     hype_guest_uart_t uart;   /* FW-1e: COM1 0x3F8 */
     hype_guest_uart_t uart2;  /* FW-1e: COM2 0x2F8 -- OVMF probes/uses both */
+    hype_vt_screen_t term;    /* TERM-1: on-screen terminal grid, fed from COM1 TX */
     hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
     hype_ps2_mouse_t mouse;   /* required by the shared PS/2 IOIO handler */
     hype_fw_cfg_t fw_cfg;
@@ -322,6 +325,41 @@ static uint64_t g_usable_ram_bytes;
  * UPDATE (2026-07-19): the AHCI-IRQ wedge (BUG#2) was the shared single-slot
  * pending-IRQ queue (g_pending_irq_*) -- now per-vCPU. Re-enabled (=1). */
 #define HYPE_RUN_TWO_VMS 0
+
+/* TERM-1/TERM-3: on-screen terminal focus, per the chosen "full-screen, cycle
+ * focus" UX. -1 = dashboard (the boot/diagnostic log, and the default so
+ * existing behaviour is unchanged until the operator switches); >=0 = the
+ * full-panel console of g_vms[that index], rendered from its per-VM vt_screen.
+ * The leader chord (INPUT-4, decoded by host_input) cycles/jumps this. Shared
+ * across cores, but only the console-owner core (the one running g_vms[0])
+ * ever reads it to drive input+display, so no cross-core GOP contention. */
+static volatile int g_term_view = -1;
+/* Number of VMs the operator can cycle through (mirrors HYPE_RUN_TWO_VMS). */
+#define HYPE_TERM_NVMS (HYPE_RUN_TWO_VMS ? 2 : 1)
+
+/* Apply a completed leader-chord action to the terminal focus. Cycling order
+ * is dashboard(-1) -> vm0 -> vm1 -> ... -> dashboard, wrapping both ways. */
+static void hype_term_apply_chord(hype_chord_result_t cr) {
+    switch (cr.action) {
+        case HYPE_CHORD_ACTION_CYCLE_NEXT:
+            g_term_view = (g_term_view + 1 > HYPE_TERM_NVMS - 1) ? -1 : g_term_view + 1;
+            break;
+        case HYPE_CHORD_ACTION_CYCLE_PREV:
+            g_term_view = (g_term_view <= -1) ? HYPE_TERM_NVMS - 1 : g_term_view - 1;
+            break;
+        case HYPE_CHORD_ACTION_JUMP_TO_VM:
+            /* chord vm_index is 1-based (leader+1 => VM #1 => g_vms[0]). */
+            if (cr.vm_index >= 1 && (int)cr.vm_index <= HYPE_TERM_NVMS)
+                g_term_view = (int)cr.vm_index - 1;
+            break;
+        case HYPE_CHORD_ACTION_TOGGLE_DASHBOARD:
+            g_term_view = (g_term_view >= 0) ? -1 : 0;
+            break;
+        default:
+            break;
+    }
+}
+
 static uint64_t g_ap_tramp_page;
 static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
 /* Stashed for fw_1_ap_main to run the guest on the AP (set in efi_main). */
@@ -4697,11 +4735,19 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
  * indistinguishable char-interleaved blur. */
 static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_filter_t *filter, char *line,
                                              unsigned int *line_len, unsigned int line_cap,
-                                             unsigned vm_idx, unsigned port) {
+                                             unsigned vm_idx, unsigned port, hype_vt_screen_t *term) {
     unsigned int emitted = 0;
     uint8_t b;
     while (hype_guest_uart_tx_dequeue(uart, &b)) {
         char c;
+        /* TERM-1: feed the RAW byte stream to the on-screen terminal grid, which
+         * does its own VT/ANSI interpretation (cursor addressing, erase, colour).
+         * The vt_filter path below is the separate escape-*stripping* used for the
+         * line-buffered serial/nvlog. Both consume the same bytes; the terminal
+         * must see them raw, so this precedes the filter. */
+        if (term) {
+            hype_vt_screen_feed(term, b);
+        }
         if (!hype_vt_filter(filter, b, &c)) {
             continue;
         }
@@ -4925,6 +4971,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_ioapic_reset(&g_fw_1_ioapic); /* M4-6b3: guest I/O APIC at 0xFEC00000 */
     hype_guest_uart_reset(&g_fw_1_uart);
     hype_guest_uart_reset(&g_fw_1_uart2);
+    /* TERM-1: size this VM's on-screen terminal to the physical panel (one 8x8
+     * cell per glyph). If there's no GOP (serial-only host), it clamps to 1x1
+     * and is simply never rendered. */
+    hype_vt_screen_init(&vm->term, g_gop_console.cols, g_gop_console.rows);
     hype_ps2_kbd_reset(&g_fw_1_ps2);
     hype_ps2_mouse_reset(&g_fw_1_mouse);
     hype_pci_reset(&g_fw_1_pci);
@@ -5201,6 +5251,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     uint64_t last_exhist_tsc = 0;
     uint64_t last_preempt_rip_tsc = 0; /* RT-2b: throttle the preemption-RIP sample log */
     uint64_t last_gop_flush_tsc = 0;   /* RT-2c: throttle deferred GOP framebuffer pushes to ~60 Hz */
+    int term_last_view = -2;           /* TERM-1: last on-screen view this core rendered (-2 = none yet) */
     /* PERF-1a: idle-wait-vs-active split + IF-state preemption profile. The
      * central question -- how much of the boot is fast-forwardable HLT idle
      * (hype waits real time; QEMU fast-forwards) vs genuine execution, and
@@ -5347,20 +5398,26 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * an operator drives GRUB/login themselves. Focus is vm0 until TERM-3 adds
          * switching; the leader action is reported for now. USB HID (TERM-5) will
          * feed the same host_input path unchanged. */
-        {
+        /* TERM-1/TERM-3: only the console-owner core (the one running g_vms[0])
+         * drains the single shared host keyboard, so scancodes are never split
+         * across cores. A leader chord switches on-screen focus (hype_term_apply_
+         * chord); ordinary keys are decoded and routed to the *focused* VM's COM1
+         * RX (defaulting to vm0 while the dashboard is up, so typing still lands
+         * on a guest). USB HID (TERM-5) will feed this same path unchanged. */
+        if (vm == &g_vms[0]) {
             uint8_t sc;
             while (hype_host_kbd_poll_scancode(&sc)) {
                 uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
                 unsigned kn = 0;
                 hype_chord_result_t cr = hype_host_input_feed(&hostin, sc, kb, sizeof(kb), &kn);
                 if (cr.action != HYPE_CHORD_ACTION_NONE) {
-                    /* Focus-switch / dashboard toggle is TERM-3's job; report for now. */
-                    hype_debug_print("term: leader chord action=%d vm_index=%u\n",
-                                     (int)cr.action, (unsigned)cr.vm_index);
+                    hype_term_apply_chord(cr);
                 } else {
+                    int f = (g_term_view >= 0) ? g_term_view : 0;
+                    hype_guest_uart_t *dst = &g_vms[f].uart;
                     unsigned ki;
                     for (ki = 0; ki < kn; ki++) {
-                        hype_guest_uart_rx_enqueue(&g_fw_1_uart, kb[ki]);
+                        hype_guest_uart_rx_enqueue(dst, kb[ki]);
                     }
                 }
             }
@@ -6451,10 +6508,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (info.reason != HYPE_SVM_EXITCODE_INTR) {
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line,
                                                      &uart_line_len, (unsigned int)sizeof(uart_line),
-                                                     (unsigned)(vm - g_vms), 0u);
+                                                     (unsigned)(vm - g_vms), 0u, &vm->term);
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2,
                                                      &uart_line_len2, (unsigned int)sizeof(uart_line2),
-                                                     (unsigned)(vm - g_vms), 1u);
+                                                     (unsigned)(vm - g_vms), 1u, (hype_vt_screen_t *)0);
         }
 
         /* RT-2c: push the deferred GOP shadow buffer to the real framebuffer
@@ -6466,7 +6523,31 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint64_t now_gf = hype_rdtsc();
             if (last_gop_flush_tsc == 0 || now_gf - last_gop_flush_tsc >= g_fw_1_host_tsc_hz / 60u) {
                 last_gop_flush_tsc = now_gf;
-                hype_debug_flush_gop();
+                /* TERM-1: when a VM is focused, the console-owner core repaints
+                 * that VM's terminal grid over the whole panel, then flushes; the
+                 * log text hype_debug_print wrote to the same shadow is overdrawn.
+                 * On the dashboard view (-1) the existing text-log-on-GOP behaviour
+                 * is preserved. A non-owner core never touches the GOP while a VM
+                 * is focused, so there is no cross-core contention over the panel. */
+                int view = g_term_view;
+                int is_owner = (vm == &g_vms[0]) && (g_gop_console.fb != (void *)0);
+                if (view >= 0 && is_owner) {
+                    if (term_last_view != view) {
+                        hype_gop_console_clear(&g_gop_console);
+                        term_last_view = view;
+                    }
+                    hype_vt_render(&g_vms[view].term, &g_gop_console, 1);
+                    hype_debug_flush_gop();
+                } else if (view < 0) {
+                    /* Leaving a terminal view: wipe its glyphs once so the dashboard
+                     * log isn't painted over a frozen console. */
+                    if (is_owner && term_last_view >= 0) {
+                        hype_gop_console_clear(&g_gop_console);
+                    }
+                    term_last_view = -1;
+                    hype_debug_flush_gop();
+                }
+                /* else (another VM focused, not the owner): skip GOP entirely. */
             }
         }
 
@@ -7332,9 +7413,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 
     /* Flush any console text the guest emitted right before it idled. */
     fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
-                             (unsigned int)sizeof(uart_line), (unsigned)(vm - g_vms), 0u);
+                             (unsigned int)sizeof(uart_line), (unsigned)(vm - g_vms), 0u, &vm->term);
     fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
-                             (unsigned int)sizeof(uart_line2), (unsigned)(vm - g_vms), 1u);
+                             (unsigned int)sizeof(uart_line2), (unsigned)(vm - g_vms), 1u, (hype_vt_screen_t *)0);
 
     /* M4-6b diagnostic: how many guest LAPIC-timer IRQs were actually
      * delivered, and whether one is still stuck in-service (never EOI'd
