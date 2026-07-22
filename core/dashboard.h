@@ -25,11 +25,14 @@ typedef struct {
 } hype_vm_dash_info_t;
 
 /* Render the dashboard into grid `s` (cleared first). host_uptime_s is shown
- * in the header. Rows beyond the grid height simply scroll off (the grid's
- * own behaviour); callers size the grid to the panel. */
+ * in the header. `cmdline` (the TERM-2 command being typed) and `result` (the
+ * last command's result message) render as a footer when non-NULL. Rows beyond
+ * the grid height scroll off (the grid's own behaviour); size the grid to the
+ * panel. */
 void hype_dashboard_render(hype_vt_screen_t *s,
                            const hype_vm_dash_info_t *vms, unsigned n,
-                           uint64_t host_uptime_s);
+                           uint64_t host_uptime_s,
+                           const char *cmdline, const char *result);
 
 /* Format `secs` as HH:MM:SS into buf (>= 9 bytes). Exposed for tests. */
 void hype_dashboard_fmt_uptime(char *buf, unsigned long long secs);

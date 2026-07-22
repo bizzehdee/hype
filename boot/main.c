@@ -6,6 +6,8 @@
 #include "../core/vt_screen.h"
 #include "../core/vt_render.h"
 #include "../core/dashboard.h"
+#include "../core/vm_lifecycle.h"
+#include "../core/cmdparse.h"
 #include "../core/halt.h"
 #include "../core/memmap.h"
 #include "../core/serial.h"
@@ -240,6 +242,10 @@ typedef struct hype_fw_vm {
     volatile uint64_t stat_uptime_ms;
     volatile uint64_t stat_idle_ms;
     volatile unsigned stat_cpu_pct;
+    /* M8-4..7: lifecycle state, read by this VM's loop each iteration and posted
+     * to by the dashboard command layer (TERM-2). volatile: cross-core writes. */
+    volatile hype_vm_lifecycle_t lifecycle;
+    uint64_t shutdown_deadline_tsc; /* M8-6: force-off if S5 not reached by here */
     hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
     hype_ps2_mouse_t mouse;   /* required by the shared PS/2 IOIO handler */
     hype_fw_cfg_t fw_cfg;
@@ -355,6 +361,9 @@ static uint64_t g_usable_ram_bytes;
 static volatile int g_term_view = -1;
 /* Number of VMs the operator can cycle through (mirrors HYPE_RUN_TWO_VMS). */
 #define HYPE_TERM_NVMS (HYPE_RUN_TWO_VMS ? 2 : 1)
+/* M8-6: seconds a guest gets to reach ACPI S5 after a shutdown request before
+ * hype escalates to a forced power-off. */
+#define HYPE_FW_1_SHUTDOWN_GRACE_S 10ull
 
 /* Apply a completed leader-chord action to the terminal focus. Cycling order
  * is dashboard(-1) -> vm0 -> vm1 -> ... -> dashboard, wrapping both ways. */
@@ -376,6 +385,123 @@ static void hype_term_apply_chord(hype_chord_result_t cr) {
             break;
         default:
             break;
+    }
+}
+
+/* TERM-2: dashboard command console. The command line is typed on the dashboard
+ * (M8-3a already keeps dashboard keys off every guest); Enter dispatches to the
+ * M8 lifecycle events / focus switch. Owner-core only, so single-writer. */
+#define HYPE_CMDLINE_MAX 96u
+static char g_cmdline[HYPE_CMDLINE_MAX];
+static unsigned g_cmdline_len;
+static char g_cmd_result[96];
+
+static int term_streq(const char *a, const char *b) {
+    unsigned i = 0;
+    for (; a[i] && b[i]; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return a[i] == b[i];
+}
+
+/* Resolve a command arg ("vm0"/"vm1" name or a 1-based index) to a VM index,
+ * or -1 if it names no known VM. */
+static int term_resolve_vm(const char *arg) {
+    if (!arg || !arg[0]) return -1;
+    for (int i = 0; i < HYPE_TERM_NVMS; i++) {
+        if (g_vms[i].name && term_streq(arg, g_vms[i].name)) return i;
+    }
+    if (arg[1] == '\0' && arg[0] >= '1' && arg[0] <= '9') {
+        int k = arg[0] - '1';
+        if (k < HYPE_TERM_NVMS) return k;
+    }
+    return -1;
+}
+
+static void term_post(int idx, hype_vm_event_t ev) {
+    g_vms[idx].lifecycle = hype_vm_lifecycle_next(g_vms[idx].lifecycle, ev);
+}
+
+/* Execute the current command line, setting g_cmd_result, then clear it. */
+static void term_run_cmdline(void) {
+    hype_cmd_t c = hype_cmd_parse(g_cmdline);
+    int idx = term_resolve_vm(c.arg);
+    const char *nm = (idx >= 0) ? g_vms[idx].name : (c.has_arg ? c.arg : "?");
+
+    switch (c.verb) {
+        case HYPE_CMD_NONE:
+            break;
+        case HYPE_CMD_HELP:
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                          "cmds: list status start stop resume shutdown off focus <vm>");
+            break;
+        case HYPE_CMD_LIST:
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%u VM(s) -- see table above",
+                          (unsigned)HYPE_TERM_NVMS);
+            break;
+        case HYPE_CMD_STATUS:
+            if (idx < 0) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "status: unknown vm '%s'", nm);
+            } else {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: %s, cpu %u%%, up %llus",
+                              nm, hype_vm_lifecycle_name(g_vms[idx].lifecycle),
+                              g_vms[idx].stat_cpu_pct,
+                              (unsigned long long)(g_vms[idx].stat_uptime_ms / 1000u));
+            }
+            break;
+        case HYPE_CMD_STOP:
+        case HYPE_CMD_RESUME:
+        case HYPE_CMD_POWEROFF:
+            if (idx < 0) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "unknown vm '%s'", nm);
+                break;
+            }
+            term_post(idx, (c.verb == HYPE_CMD_STOP) ? HYPE_VM_EV_STOP
+                          : (c.verb == HYPE_CMD_RESUME) ? HYPE_VM_EV_RESUME
+                          : HYPE_VM_EV_FORCE_OFF);
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: %s", nm,
+                          hype_vm_lifecycle_name(g_vms[idx].lifecycle));
+            break;
+        case HYPE_CMD_SHUTDOWN:
+            if (idx < 0) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "shutdown: unknown vm '%s'", nm);
+                break;
+            }
+            g_vms[idx].shutdown_deadline_tsc = 0; /* the VM's own loop arms the grace timer */
+            term_post(idx, HYPE_VM_EV_SHUTDOWN);
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: %s (grace, then off)", nm,
+                          hype_vm_lifecycle_name(g_vms[idx].lifecycle));
+            break;
+        case HYPE_CMD_START:
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                          "start: fresh re-boot lands in the M8-4 follow-up");
+            break;
+        case HYPE_CMD_FOCUS:
+            if (idx < 0) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focus: unknown vm '%s'", nm);
+                break;
+            }
+            g_term_view = idx;
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focused %s", nm);
+            break;
+        case HYPE_CMD_UNKNOWN:
+        default:
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "unknown command (try 'help')");
+            break;
+    }
+    g_cmdline[0] = '\0';
+    g_cmdline_len = 0;
+}
+
+/* Feed one decoded keystroke byte to the dashboard command line. */
+static void term_cmdline_key(uint8_t ch) {
+    if (ch == '\r' || ch == '\n') {
+        term_run_cmdline();
+    } else if (ch == 0x7Fu || ch == 0x08u) {
+        if (g_cmdline_len > 0) g_cmdline[--g_cmdline_len] = '\0';
+    } else if (ch >= 0x20u && ch < 0x7Fu && g_cmdline_len < HYPE_CMDLINE_MAX - 1) {
+        g_cmdline[g_cmdline_len++] = (char)ch;
+        g_cmdline[g_cmdline_len] = '\0';
     }
 }
 
@@ -4970,6 +5096,69 @@ static void fw_1_dump_prev_diag(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
  * code, and CS. So host faults are caught permanently and with more context,
  * without patching anyone else's IDT. */
 
+/* M8-1/M8-2: publish this VM's live stats, and -- on the console-owner core --
+ * repaint the panel at ~60 Hz (dashboard on view -1, focused VM's terminal on
+ * view >=0). Factored out of the loop so the lifecycle gate can keep the panel
+ * live and stats fresh even while this VM's own vCPU is paused/off. */
+static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_tsc,
+                                    int *term_last_view, uint64_t perf_boot_start_tsc,
+                                    uint64_t perf_hlt_wait_tsc, uint64_t total_exits,
+                                    uint64_t hlt_exits) {
+    if (g_fw_1_host_tsc_hz == 0) {
+        return;
+    }
+    uint64_t now_gf = hype_rdtsc();
+
+    if (perf_boot_start_tsc != 0) {
+        uint64_t up_ms = (now_gf - perf_boot_start_tsc) * 1000u / g_fw_1_host_tsc_hz;
+        uint64_t idle_ms = perf_hlt_wait_tsc * 1000u / g_fw_1_host_tsc_hz;
+        unsigned idle_pct = (up_ms > 0) ? (unsigned)((idle_ms >= up_ms) ? 100u : (idle_ms * 100u / up_ms)) : 0u;
+        vm->stat_uptime_ms = up_ms;
+        vm->stat_idle_ms = idle_ms;
+        vm->stat_total_exits = total_exits;
+        vm->stat_hlt_exits = hlt_exits;
+        vm->stat_cpu_pct = 100u - idle_pct;
+    }
+
+    if (*last_gop_flush_tsc != 0 && now_gf - *last_gop_flush_tsc < g_fw_1_host_tsc_hz / 60u) {
+        return;
+    }
+    *last_gop_flush_tsc = now_gf;
+
+    int view = g_term_view;
+    int is_owner = (vm == &g_vms[0]) && (g_gop_console.fb != (void *)0);
+    if (is_owner && view >= 0) {
+        if (*term_last_view != view) {
+            hype_gop_console_clear(&g_gop_console);
+            *term_last_view = view;
+        }
+        hype_vt_render(&g_vms[view].term, &g_gop_console, 1);
+        hype_debug_flush_gop();
+    } else if (is_owner /* dashboard view (-1) */) {
+        hype_vm_dash_info_t info[HYPE_FW_MAX_VMS];
+        unsigned ninfo = HYPE_TERM_NVMS;
+        for (unsigned i = 0; i < ninfo; i++) {
+            info[i].name = g_vms[i].name;
+            info[i].os_hint = g_vms[i].os_hint;
+            info[i].state = hype_vm_lifecycle_name(g_vms[i].lifecycle);
+            info[i].cpu_pct = (g_vms[i].lifecycle == HYPE_VM_RUNNING) ? g_vms[i].stat_cpu_pct : 0u;
+            info[i].mem_mb = g_vms[i].mem_mb;
+            info[i].uptime_s = g_vms[i].stat_uptime_ms / 1000u;
+            info[i].media = g_vms[i].media;
+            info[i].focused = 0;
+        }
+        if (*term_last_view != -1) {
+            hype_gop_console_clear(&g_gop_console);
+            *term_last_view = -1;
+        }
+        hype_dashboard_render(&g_dashboard_term, info, ninfo, vm->stat_uptime_ms / 1000u,
+                              g_cmdline, g_cmd_result);
+        hype_vt_render(&g_dashboard_term, &g_gop_console, 0);
+        hype_debug_flush_gop();
+    }
+    /* non-owner cores: skip GOP entirely (owner drives the panel). */
+}
+
 static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
@@ -5002,6 +5191,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     vm->os_hint = "linux";
     vm->mem_mb = (unsigned)(HYPE_FW_1_GUEST_RAM_BYTES / (1024ull * 1024ull));
     vm->media = "test.iso";
+    vm->lifecycle = HYPE_VM_RUNNING; /* M8-4..7 */
+    vm->shutdown_deadline_tsc = 0;
     /* One dashboard grid, sized to the panel, owned by the console-owner core. */
     if (vm == &g_vms[0] && !g_dashboard_ready) {
         hype_vt_screen_init(&g_dashboard_term, g_gop_console.cols, g_gop_console.rows);
@@ -5452,13 +5643,53 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         hype_guest_uart_rx_enqueue(dst, kb[ki]);
                     }
                 } else {
-                    /* M8-3a: dashboard has focus -> every keystroke is consumed
-                     * by the dashboard and forwarded to NO guest (explicit
-                     * focus-owner check; security-review finding, plan §10 #22).
-                     * kb[] is intentionally dropped here. */
-                    (void)kb;
+                    /* M8-3a + TERM-2: dashboard has focus -> keystrokes drive the
+                     * command line and reach NO guest (explicit focus-owner check;
+                     * security-review finding, plan §10 #22). */
+                    unsigned ki;
+                    for (ki = 0; ki < kn; ki++) {
+                        term_cmdline_key(kb[ki]);
+                    }
                 }
             }
+        }
+
+        /* M8-6 shutdown grace timer: on entering SHUTTING, arm a bounded
+         * deadline; the guest keeps running (so it can reach ACPI S5). If it
+         * hasn't powered off by the deadline, escalate to OFF. (Guest-driven S5
+         * detection -- the orderly path -- is the ACPI follow-up; until then this
+         * timeout is what completes a "shutdown".) */
+        if (vm->lifecycle == HYPE_VM_SHUTTING && g_fw_1_host_tsc_hz != 0) {
+            uint64_t now_sd = hype_rdtsc();
+            if (vm->shutdown_deadline_tsc == 0) {
+                vm->shutdown_deadline_tsc = now_sd + g_fw_1_host_tsc_hz * HYPE_FW_1_SHUTDOWN_GRACE_S;
+            } else if (now_sd >= vm->shutdown_deadline_tsc) {
+                vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_TIMEOUT);
+            }
+        }
+
+        /* M8-4..7 lifecycle gate. RUNNING/SHUTTING execute the guest below;
+         * PAUSED/OFF/STARTING do not. The owner core has already polled the
+         * keyboard above and still renders here, so the dashboard stays live and
+         * a paused/off VM can be resumed/started by a command. A brief real-time
+         * wait keeps an idle VM off a 100%-spin. */
+        if (!hype_vm_lifecycle_runs(vm->lifecycle)) {
+            if (vm->lifecycle == HYPE_VM_STARTING) {
+                /* M8-4 Start = fresh re-boot (zero RAM + restore pristine firmware
+                 * + full device/vCPU reset). That machinery lands in the M8-4
+                 * follow-up; until then the command layer does not offer Start, so
+                 * this branch is unreached. Advance defensively to avoid a wedge. */
+                vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_STARTED);
+            }
+            fw_1_publish_and_render(vm, &last_gop_flush_tsc, &term_last_view,
+                                    perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt);
+            {
+                uint64_t t0 = hype_rdtsc();
+                while (g_fw_1_host_tsc_hz != 0 && hype_rdtsc() - t0 < g_fw_1_host_tsc_hz / 1000u) {
+                    /* ~1ms */
+                }
+            }
+            continue;
         }
 
         /* M4-6d4: localise the ~219us/exit real-HW cost. Bracket VMRUN to
@@ -6557,64 +6788,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * push has accumulated in the shadow buffer (and RT-1c's dirty range);
          * this is the ONE framebuffer memcpy that pays the uncached-VRAM cost,
          * instead of one per printed line. */
-        if (g_fw_1_host_tsc_hz != 0) {
-            uint64_t now_gf = hype_rdtsc();
-
-            /* M8-2: publish THIS VM's live stats for the dashboard (cheap; from
-             * the loop's own running counters). Single-writer per VM. */
-            if (perf_boot_start_tsc != 0) {
-                uint64_t up_ms = (now_gf - perf_boot_start_tsc) * 1000u / g_fw_1_host_tsc_hz;
-                uint64_t idle_ms = perf_hlt_wait_tsc * 1000u / g_fw_1_host_tsc_hz;
-                unsigned idle_pct = (up_ms > 0) ? (unsigned)((idle_ms >= up_ms) ? 100u : (idle_ms * 100u / up_ms)) : 0u;
-                vm->stat_uptime_ms = up_ms;
-                vm->stat_idle_ms = idle_ms;
-                vm->stat_total_exits = total_exits;
-                vm->stat_hlt_exits = ex_hlt;
-                vm->stat_cpu_pct = 100u - idle_pct;
-            }
-
-            if (last_gop_flush_tsc == 0 || now_gf - last_gop_flush_tsc >= g_fw_1_host_tsc_hz / 60u) {
-                last_gop_flush_tsc = now_gf;
-                /* Panel rendering, owned by the console-owner core (running
-                 * g_vms[0]) so no cross-core GOP contention. A VM view (>=0)
-                 * repaints that VM's terminal grid; the dashboard view (-1)
-                 * renders the M8-1 VM table. Non-owner cores never touch the
-                 * GOP here. */
-                int view = g_term_view;
-                int is_owner = (vm == &g_vms[0]) && (g_gop_console.fb != (void *)0);
-                if (is_owner && view >= 0) {
-                    if (term_last_view != view) {
-                        hype_gop_console_clear(&g_gop_console);
-                        term_last_view = view;
-                    }
-                    hype_vt_render(&g_vms[view].term, &g_gop_console, 1);
-                    hype_debug_flush_gop();
-                } else if (is_owner /* && view < 0 */) {
-                    /* M8-1: structured VM dashboard (replaces the raw log on the
-                     * panel; the log still goes to serial + nvlog). */
-                    hype_vm_dash_info_t info[HYPE_FW_MAX_VMS];
-                    unsigned ninfo = HYPE_TERM_NVMS;
-                    for (unsigned i = 0; i < ninfo; i++) {
-                        info[i].name = g_vms[i].name;
-                        info[i].os_hint = g_vms[i].os_hint;
-                        info[i].state = "running"; /* lifecycle state added in M8-4/5 */
-                        info[i].cpu_pct = g_vms[i].stat_cpu_pct;
-                        info[i].mem_mb = g_vms[i].mem_mb;
-                        info[i].uptime_s = g_vms[i].stat_uptime_ms / 1000u;
-                        info[i].media = g_vms[i].media;
-                        info[i].focused = 0;
-                    }
-                    if (term_last_view != -1) {
-                        hype_gop_console_clear(&g_gop_console);
-                        term_last_view = -1;
-                    }
-                    hype_dashboard_render(&g_dashboard_term, info, ninfo, vm->stat_uptime_ms / 1000u);
-                    hype_vt_render(&g_dashboard_term, &g_gop_console, 0);
-                    hype_debug_flush_gop();
-                }
-                /* non-owner cores: skip GOP entirely (owner drives the panel). */
-            }
-        }
+        fw_1_publish_and_render(vm, &last_gop_flush_tsc, &term_last_view,
+                                perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt);
 
         /* M4-6d3: flush a buffered partial line that looks like an
          * interactive prompt (ends in ": ", "# ", "$ ", "> ") when the

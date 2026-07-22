@@ -38,7 +38,7 @@ int main(void) {
         { "alpine", "linux", "running", 3, 6144, 754, "test.iso", 1 },
         { "fedora", "linux", "off",     0, 6144, 0,   0,          0 },
     };
-    hype_dashboard_render(s, vms, 2, 45296);
+    hype_dashboard_render(s, vms, 2, 45296, "sto", "vm0: paused");
 
     CHECK("header line names product", row_has(s, 0, "hype - VM dashboard"));
     CHECK("header shows host uptime", row_has(s, 0, "12:34:56"));
@@ -65,7 +65,7 @@ int main(void) {
     hype_vm_dash_info_t big[1] = {
         { "a-really-long-vm-name-exceeding-the-column", "linux", "running", 100, 65536, 99999, "some-long-media-name.iso", 0 },
     };
-    hype_dashboard_render(s, big, 1, 0);
+    hype_dashboard_render(s, big, 1, 0, NULL, NULL);
     CHECK("long name truncated (col header intact on row2)", row_has(s, 2, "NAME"));
     CHECK("long-name row rendered something", row_has(s, 3, "a-really-long"));
 
@@ -73,14 +73,14 @@ int main(void) {
     hype_vt_screen_init(s, 80, 25);
     {
         hype_vm_dash_info_t nullish[1] = { { NULL, NULL, NULL, 0, 512, 0, NULL, 0 } };
-        hype_dashboard_render(s, nullish, 1, 0);
+        hype_dashboard_render(s, nullish, 1, 0, NULL, NULL);
         CHECK("null name -> '?'", row_has(s, 3, "?"));
         CHECK("null media -> '-'", row_has(s, 3, "-"));
     }
 
     /* --- zero VMs: header still renders, no crash --- */
     hype_vt_screen_init(s, 80, 25);
-    hype_dashboard_render(s, NULL, 0, 10);
+    hype_dashboard_render(s, NULL, 0, 10, "", "");
     CHECK("empty dashboard header", row_has(s, 0, "hype - VM dashboard"));
 
     free(s);

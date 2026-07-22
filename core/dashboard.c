@@ -36,7 +36,8 @@ static void emit_line(hype_vt_screen_t *s, const char *line) {
 
 void hype_dashboard_render(hype_vt_screen_t *s,
                            const hype_vm_dash_info_t *vms, unsigned n,
-                           uint64_t host_uptime_s) {
+                           uint64_t host_uptime_s,
+                           const char *cmdline, const char *result) {
     char line[160];
     char up[16];
 
@@ -83,5 +84,14 @@ void hype_dashboard_render(hype_vt_screen_t *s,
         put_field(line, &len, v->media ? v->media : "-", 16);
         line[len] = '\0';
         emit_line(s, line);
+    }
+
+    /* TERM-2 footer: the command prompt (with a '_' caret) + last result. */
+    emit_line(s, "");
+    emit_line(s, "type: help | list | status|start|stop|resume|shutdown|off|focus <vm>");
+    hype_snprintf(line, sizeof(line), "hype> %s_", cmdline ? cmdline : "");
+    emit_line(s, line);
+    if (result && result[0]) {
+        emit_line(s, result);
     }
 }
