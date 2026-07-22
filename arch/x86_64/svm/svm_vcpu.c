@@ -1507,8 +1507,18 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
         if (stream_media) {
             /* GLADDER-10: fetch these bytes on demand from the raw ISO partition
              * (disk read via hype_ahci_host_read) instead of a RAM copy. */
-            if (hype_iso_stream_read(atapi->media_stream, media_byte_off + transferred, dst,
-                                     chunk) != 0) {
+            static unsigned g_stream_dbg = 0;
+            int srr = hype_iso_stream_read(atapi->media_stream, media_byte_off + transferred, dst,
+                                           chunk);
+            if (g_stream_dbg < 6u || srr != 0) {
+                g_stream_dbg++;
+                hype_debug_print("stream-rd #%u: off=%llu chunk=%u lba0=%llu isosz=%llu ret=%d\n",
+                                 g_stream_dbg, (unsigned long long)(media_byte_off + transferred),
+                                 (unsigned)chunk,
+                                 (unsigned long long)atapi->media_stream->part_start_lba,
+                                 (unsigned long long)atapi->media_stream->iso_size, srr);
+            }
+            if (srr != 0) {
                 return -1;
             }
         } else if (chunked_media) {

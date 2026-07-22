@@ -113,6 +113,7 @@ int hype_ahci_host_init(uint64_t abar_phys, unsigned port) {
 int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst) {
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);
+    int rc = 0;
 
     /* Build slot 0's command header + a READ DMA EXT command table. The port was
      * already pointed at g_cmd_list / g_recv_fis by hype_ahci_host_init(). */
@@ -124,16 +125,15 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
 
     /* Wait for the device to be ready (not BSY, no DRQ) before issuing. */
     if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
-        return -1;
+        rc = -1;
+    } else {
+        /* Issue slot 0 and poll PxCI until the HBA clears it (command complete). */
+        wr32(pb, HYPE_AHCI_PREG_CI, 1u);
+        if (wait_clear(pb, HYPE_AHCI_PREG_CI, 1u, SPIN_CMD) != 0) {
+            rc = -1;
+        } else if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
+            rc = -1; /* ATA error (TFD status ERR bit) */
+        }
     }
-    /* Issue slot 0 and poll PxCI until the HBA clears it (command complete). */
-    wr32(pb, HYPE_AHCI_PREG_CI, 1u);
-    if (wait_clear(pb, HYPE_AHCI_PREG_CI, 1u, SPIN_CMD) != 0) {
-        return -1;
-    }
-    /* Surface an ATA error (TFD status ERR bit). */
-    if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
-        return -1;
-    }
-    return 0;
+    return rc;
 }
