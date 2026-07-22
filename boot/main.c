@@ -5,6 +5,7 @@
 #include "../core/gop_text.h"
 #include "../core/vt_screen.h"
 #include "../core/vt_render.h"
+#include "../core/dashboard.h"
 #include "../core/halt.h"
 #include "../core/memmap.h"
 #include "../core/serial.h"
@@ -70,6 +71,11 @@ static hype_pte_t g_pd[HYPE_PAGING_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attr
  * parts). Two tables cover a framebuffer that straddles a 1GB boundary. */
 static hype_pte_t g_fb_pd[2][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_gop_console_t g_gop_console;
+/* M8-1: the dashboard is rendered as its own vt_screen grid (built by the
+ * console-owner core each frame it holds the dashboard view), then blitted to
+ * the panel via the same vt_render path as a guest terminal. */
+static hype_vt_screen_t g_dashboard_term;
+static int g_dashboard_ready;
 
 /*
  * M2-7's hand-written test guest runs in real-address mode
@@ -221,6 +227,19 @@ typedef struct hype_fw_vm {
     hype_guest_uart_t uart;   /* FW-1e: COM1 0x3F8 */
     hype_guest_uart_t uart2;  /* FW-1e: COM2 0x2F8 -- OVMF probes/uses both */
     hype_vt_screen_t term;    /* TERM-1: on-screen terminal grid, fed from COM1 TX */
+    /* M8-1 identity (for the dashboard) + M8-2 live stats. The stats are written
+     * by THIS VM's own loop each render window and read by the console-owner
+     * core's dashboard renderer -- volatile, single-writer/single-reader, a torn
+     * 64-bit read at worst shows a momentarily-stale number, never a crash. */
+    const char *name;
+    const char *os_hint;    /* "linux" / "windows" / "bsd" */
+    unsigned mem_mb;
+    const char *media;      /* boot-media short name */
+    volatile uint64_t stat_total_exits;
+    volatile uint64_t stat_hlt_exits;
+    volatile uint64_t stat_uptime_ms;
+    volatile uint64_t stat_idle_ms;
+    volatile unsigned stat_cpu_pct;
     hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
     hype_ps2_mouse_t mouse;   /* required by the shared PS/2 IOIO handler */
     hype_fw_cfg_t fw_cfg;
@@ -4975,6 +4994,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * cell per glyph). If there's no GOP (serial-only host), it clamps to 1x1
      * and is simply never rendered. */
     hype_vt_screen_init(&vm->term, g_gop_console.cols, g_gop_console.rows);
+    /* M8-1: per-VM dashboard identity. No cfg->runtime wiring exists yet
+     * (mem is a compile constant, ISO a single global), so these mirror the
+     * current single-Linux-guest reality; multi-OS/config-driven values come
+     * with the config->VM plumbing (tracked separately). */
+    vm->name = (vm == &g_vms[0]) ? "vm0" : "vm1";
+    vm->os_hint = "linux";
+    vm->mem_mb = (unsigned)(HYPE_FW_1_GUEST_RAM_BYTES / (1024ull * 1024ull));
+    vm->media = "test.iso";
+    /* One dashboard grid, sized to the panel, owned by the console-owner core. */
+    if (vm == &g_vms[0] && !g_dashboard_ready) {
+        hype_vt_screen_init(&g_dashboard_term, g_gop_console.cols, g_gop_console.rows);
+        g_dashboard_ready = 1;
+    }
     hype_ps2_kbd_reset(&g_fw_1_ps2);
     hype_ps2_mouse_reset(&g_fw_1_mouse);
     hype_pci_reset(&g_fw_1_pci);
@@ -5412,13 +5444,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_chord_result_t cr = hype_host_input_feed(&hostin, sc, kb, sizeof(kb), &kn);
                 if (cr.action != HYPE_CHORD_ACTION_NONE) {
                     hype_term_apply_chord(cr);
-                } else {
-                    int f = (g_term_view >= 0) ? g_term_view : 0;
-                    hype_guest_uart_t *dst = &g_vms[f].uart;
+                } else if (g_term_view >= 0) {
+                    /* A VM is focused: typed bytes go to its console (COM1). */
+                    hype_guest_uart_t *dst = &g_vms[g_term_view].uart;
                     unsigned ki;
                     for (ki = 0; ki < kn; ki++) {
                         hype_guest_uart_rx_enqueue(dst, kb[ki]);
                     }
+                } else {
+                    /* M8-3a: dashboard has focus -> every keystroke is consumed
+                     * by the dashboard and forwarded to NO guest (explicit
+                     * focus-owner check; security-review finding, plan §10 #22).
+                     * kb[] is intentionally dropped here. */
+                    (void)kb;
                 }
             }
         }
@@ -6521,33 +6559,60 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * instead of one per printed line. */
         if (g_fw_1_host_tsc_hz != 0) {
             uint64_t now_gf = hype_rdtsc();
+
+            /* M8-2: publish THIS VM's live stats for the dashboard (cheap; from
+             * the loop's own running counters). Single-writer per VM. */
+            if (perf_boot_start_tsc != 0) {
+                uint64_t up_ms = (now_gf - perf_boot_start_tsc) * 1000u / g_fw_1_host_tsc_hz;
+                uint64_t idle_ms = perf_hlt_wait_tsc * 1000u / g_fw_1_host_tsc_hz;
+                unsigned idle_pct = (up_ms > 0) ? (unsigned)((idle_ms >= up_ms) ? 100u : (idle_ms * 100u / up_ms)) : 0u;
+                vm->stat_uptime_ms = up_ms;
+                vm->stat_idle_ms = idle_ms;
+                vm->stat_total_exits = total_exits;
+                vm->stat_hlt_exits = ex_hlt;
+                vm->stat_cpu_pct = 100u - idle_pct;
+            }
+
             if (last_gop_flush_tsc == 0 || now_gf - last_gop_flush_tsc >= g_fw_1_host_tsc_hz / 60u) {
                 last_gop_flush_tsc = now_gf;
-                /* TERM-1: when a VM is focused, the console-owner core repaints
-                 * that VM's terminal grid over the whole panel, then flushes; the
-                 * log text hype_debug_print wrote to the same shadow is overdrawn.
-                 * On the dashboard view (-1) the existing text-log-on-GOP behaviour
-                 * is preserved. A non-owner core never touches the GOP while a VM
-                 * is focused, so there is no cross-core contention over the panel. */
+                /* Panel rendering, owned by the console-owner core (running
+                 * g_vms[0]) so no cross-core GOP contention. A VM view (>=0)
+                 * repaints that VM's terminal grid; the dashboard view (-1)
+                 * renders the M8-1 VM table. Non-owner cores never touch the
+                 * GOP here. */
                 int view = g_term_view;
                 int is_owner = (vm == &g_vms[0]) && (g_gop_console.fb != (void *)0);
-                if (view >= 0 && is_owner) {
+                if (is_owner && view >= 0) {
                     if (term_last_view != view) {
                         hype_gop_console_clear(&g_gop_console);
                         term_last_view = view;
                     }
                     hype_vt_render(&g_vms[view].term, &g_gop_console, 1);
                     hype_debug_flush_gop();
-                } else if (view < 0) {
-                    /* Leaving a terminal view: wipe its glyphs once so the dashboard
-                     * log isn't painted over a frozen console. */
-                    if (is_owner && term_last_view >= 0) {
-                        hype_gop_console_clear(&g_gop_console);
+                } else if (is_owner /* && view < 0 */) {
+                    /* M8-1: structured VM dashboard (replaces the raw log on the
+                     * panel; the log still goes to serial + nvlog). */
+                    hype_vm_dash_info_t info[HYPE_FW_MAX_VMS];
+                    unsigned ninfo = HYPE_TERM_NVMS;
+                    for (unsigned i = 0; i < ninfo; i++) {
+                        info[i].name = g_vms[i].name;
+                        info[i].os_hint = g_vms[i].os_hint;
+                        info[i].state = "running"; /* lifecycle state added in M8-4/5 */
+                        info[i].cpu_pct = g_vms[i].stat_cpu_pct;
+                        info[i].mem_mb = g_vms[i].mem_mb;
+                        info[i].uptime_s = g_vms[i].stat_uptime_ms / 1000u;
+                        info[i].media = g_vms[i].media;
+                        info[i].focused = 0;
                     }
-                    term_last_view = -1;
+                    if (term_last_view != -1) {
+                        hype_gop_console_clear(&g_gop_console);
+                        term_last_view = -1;
+                    }
+                    hype_dashboard_render(&g_dashboard_term, info, ninfo, vm->stat_uptime_ms / 1000u);
+                    hype_vt_render(&g_dashboard_term, &g_gop_console, 0);
                     hype_debug_flush_gop();
                 }
-                /* else (another VM focused, not the owner): skip GOP entirely. */
+                /* non-owner cores: skip GOP entirely (owner drives the panel). */
             }
         }
 
