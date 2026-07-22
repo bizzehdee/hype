@@ -1358,6 +1358,7 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * chunked backing sets this to 1 (below). Must be initialised or those paths
      * would take the chunked copy with a stale media_offset -> spurious failure. */
     int chunked_media = 0;
+    int stream_media = 0; /* GLADDER-10: media served on demand from a raw disk partition */
     uint64_t media_byte_off = 0; /* GLADDER-10(b): 64-bit byte offset = media_lba * sector size */
     uint32_t remaining;
     uint32_t transferred;
@@ -1469,9 +1470,10 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
          * needs to carry a 32-bit sector index (good to 8TB). */
         media_byte_off = (uint64_t)result.media_lba * (uint64_t)HYPE_ATAPI_SECTOR_SIZE;
         chunked_media = result.uses_media_data && atapi->media_chunks != 0;
-        src = result.uses_media_data
-                  ? (chunked_media ? 0 : (atapi->media_data + media_byte_off))
-                  : result.synth_data;
+        stream_media = result.uses_media_data && atapi->media_stream != 0;
+        src = (result.uses_media_data && !chunked_media && !stream_media)
+                  ? (atapi->media_data + media_byte_off)
+                  : (result.uses_media_data ? 0 : result.synth_data);
         remaining = result.uses_media_data ? result.media_length : result.synth_length;
         /* ATA STATUS register: DRDY|DSC always, +ERR on CHECK_CONDITION.
          * ATAPI convention: a failed PACKET command's ERROR register
@@ -1502,7 +1504,14 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
         if (dst == 0) {
             return -1;
         }
-        if (chunked_media) {
+        if (stream_media) {
+            /* GLADDER-10: fetch these bytes on demand from the raw ISO partition
+             * (disk read via hype_ahci_host_read) instead of a RAM copy. */
+            if (hype_iso_stream_read(atapi->media_stream, media_byte_off + transferred, dst,
+                                     chunk) != 0) {
+                return -1;
+            }
+        } else if (chunked_media) {
             if (hype_chunked_iso_read(atapi->media_chunks, media_byte_off + transferred, dst,
                                       chunk) != 0) {
                 return -1;

@@ -286,6 +286,12 @@ static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
 static uint64_t g_iso_host_phys;
 static uint64_t g_iso_size;
 static hype_chunked_iso_t g_iso_chunked;
+/* GLADDER-10: when a raw ISO partition is found + verified post-EBS, this holds
+ * the streaming backing; run_fw_1_test() binds the guest CD to it (instead of the
+ * RAM-chunked copy) so the ISO is served on demand from disk. Declared here (not
+ * near efi_main) so run_fw_1_test, defined earlier, can see it. */
+static hype_iso_stream_t g_iso_stream;
+static int g_iso_stream_ready;
 /* Host usable-RAM total (UEFI memory map), reported by the guest CMOS model. */
 static uint64_t g_usable_ram_bytes;
 
@@ -4943,7 +4949,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * (hype_pci_get_interrupt_line), master or slave. */
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
     hype_ahci_reset(&g_fw_1_ahci);
-    hype_atapi_reset_chunked(&g_fw_1_atapi, &g_iso_chunked); /* GLADDER-10(a): chunked backing */
+    /* GLADDER-10: prefer the streaming backing (ISO served on demand from its raw
+     * disk partition) when one was found + verified post-EBS; otherwise fall back
+     * to the RAM-chunked copy (GLADDER-10a). */
+    if (g_iso_stream_ready) {
+        hype_atapi_reset_stream(&g_fw_1_atapi, &g_iso_stream);
+    } else {
+        hype_atapi_reset_chunked(&g_fw_1_atapi, &g_iso_chunked); /* GLADDER-10(a): chunked backing */
+    }
     /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging
      * the CD-ROM discovery sequence -- hype_svm_set_ahci_trace(1) -- but
      * left off here: a real boot issues thousands of commands and each
@@ -8307,20 +8320,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
                         hype_serial_print("host-gpt: no partition 2 (raw ISO) on the boot disk\n");
                     } else {
-                        static hype_iso_stream_t strm;
                         static uint8_t cd[8];
                         hype_debug_print("host-gpt: partition 2 = LBA %llu..%llu (%llu bytes)\n",
                                          (unsigned long long)iso_part.first_lba,
                                          (unsigned long long)iso_part.last_lba,
                                          (unsigned long long)iso_part.size_bytes);
-                        strm.read = hostdisk_read;
-                        strm.ctx = 0;
-                        strm.part_start_lba = iso_part.first_lba;
-                        strm.iso_size = iso_part.size_bytes;
-                        if (hype_iso_stream_read(&strm, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+                        g_iso_stream.read = hostdisk_read;
+                        g_iso_stream.ctx = 0;
+                        g_iso_stream.part_start_lba = iso_part.first_lba;
+                        g_iso_stream.iso_size = iso_part.size_bytes;
+                        if (hype_iso_stream_read(&g_iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                             cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
+                            /* Streaming read path verified -- back the guest CD with it. */
+                            g_iso_stream_ready = 1;
                             hype_serial_print("host-stream: CD001 verified via streaming from "
-                                              "partition 2 -- streaming read path OK\n");
+                                              "partition 2 -- backing guest CD via streaming\n");
                         } else {
                             hype_debug_print("host-stream: CD001 NOT found streaming part2 "
                                              "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],

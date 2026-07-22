@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "../core/chunked_iso.h"
+#include "../core/iso_stream.h"
 
 /*
  * ATAPI/SCSI command layer for the virtual optical drive (M4-5). An
@@ -89,6 +90,10 @@ typedef struct {
      * it to a byte offset and copies from whichever backing is set (see
      * svm_vcpu.c AHCI glue). */
     const hype_chunked_iso_t *media_chunks;
+    /* GLADDER-10: alternative STREAMING backing -- ISO bytes fetched on demand
+     * from a raw disk partition (core/iso_stream.c) instead of held in RAM. At
+     * most one of media_data / media_chunks / media_stream is non-NULL. */
+    hype_iso_stream_t *media_stream;
     uint64_t media_size;       /* GLADDER-10(b): logical bytes (64-bit for >=4GB ISOs); multiple of HYPE_ATAPI_SECTOR_SIZE */
     /* Sense state left behind by the most recently failed command, for
      * a driver that follows a CHECK CONDITION status with REQUEST
@@ -162,6 +167,11 @@ void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint64_t med
  * non-contiguous buffers). media_size is taken from iso->total_bytes; the flat
  * media_data pointer is cleared. */
 void hype_atapi_reset_chunked(hype_atapi_t *dev, const hype_chunked_iso_t *iso);
+
+/* GLADDER-10: reset with a STREAMING backing -- the ISO is served on demand from
+ * a raw disk partition via `stream` (core/iso_stream.c), not held in RAM.
+ * media_size is taken from stream->iso_size; the flat/chunked backings are cleared. */
+void hype_atapi_reset_stream(hype_atapi_t *dev, hype_iso_stream_t *stream);
 
 /*
  * Executes a 16-byte CDB (shorter real CDBs, e.g. TEST UNIT READY's 6

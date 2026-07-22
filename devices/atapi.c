@@ -39,7 +39,8 @@ static void handle_test_unit_ready(hype_atapi_t *dev, hype_atapi_result_t *out) 
     out->uses_media_data = 0;
     out->synth_length = 0;
 
-    if ((dev->media_data == 0 && dev->media_chunks == 0) || dev->media_size == 0) {
+    if ((dev->media_data == 0 && dev->media_chunks == 0 && dev->media_stream == 0) ||
+        dev->media_size == 0) {
         set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
         return;
     }
@@ -83,7 +84,8 @@ static void handle_read_capacity(hype_atapi_t *dev, hype_atapi_result_t *out) {
     zero_synth(out);
     out->uses_media_data = 0;
 
-    if ((dev->media_data == 0 && dev->media_chunks == 0) || dev->media_size == 0) {
+    if ((dev->media_data == 0 && dev->media_chunks == 0 && dev->media_stream == 0) ||
+        dev->media_size == 0) {
         set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
         return;
     }
@@ -116,7 +118,8 @@ static void handle_read(hype_atapi_t *dev, uint32_t lba, uint32_t count,
     zero_synth(out);
     out->synth_length = 0;
 
-    if ((dev->media_data == 0 && dev->media_chunks == 0) || dev->media_size == 0) {
+    if ((dev->media_data == 0 && dev->media_chunks == 0 && dev->media_stream == 0) ||
+        dev->media_size == 0) {
         set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
         return;
     }
@@ -209,7 +212,8 @@ static void put_be32(uint8_t *p, uint32_t v) {
 /* True while a disc is loaded (either backing). Shared by the media-detection
  * handlers, which must report NOT READY with no media exactly like the reads. */
 static int media_present(const hype_atapi_t *dev) {
-    return (dev->media_data != 0 || dev->media_chunks != 0) && dev->media_size != 0;
+    return (dev->media_data != 0 || dev->media_chunks != 0 || dev->media_stream != 0) &&
+           dev->media_size != 0;
 }
 
 /* GET CONFIGURATION (0x46): advertise a data-disc drive whose CURRENT profile
@@ -394,6 +398,7 @@ static void reset_state(hype_atapi_t *dev) {
 void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint64_t media_size) {
     dev->media_data = media_data;
     dev->media_chunks = 0;
+    dev->media_stream = 0;
     dev->media_size = media_size;
     reset_state(dev);
 }
@@ -401,9 +406,18 @@ void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint64_t med
 void hype_atapi_reset_chunked(hype_atapi_t *dev, const hype_chunked_iso_t *iso) {
     dev->media_data = 0;
     dev->media_chunks = iso;
+    dev->media_stream = 0;
     /* GLADDER-10(b): media_size is 64-bit, so a >=4GB ISO's size (and every
      * byte offset derived from it) is carried without truncation. */
     dev->media_size = iso ? iso->total_bytes : 0;
+    reset_state(dev);
+}
+
+void hype_atapi_reset_stream(hype_atapi_t *dev, hype_iso_stream_t *stream) {
+    dev->media_data = 0;
+    dev->media_chunks = 0;
+    dev->media_stream = stream;
+    dev->media_size = stream ? stream->iso_size : 0;
     reset_state(dev);
 }
 
