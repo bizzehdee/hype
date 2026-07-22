@@ -70,3 +70,67 @@ int hype_ahci_host_build_read_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t
     put_le32(prd + 12, dbc);
     return 0;
 }
+
+void hype_ahci_host_build_identify(uint8_t *cmd_table, uint64_t dst_phys) {
+    uint8_t *fis = cmd_table + HYPE_AHCI_HOST_CT_CFIS_OFF;
+    uint8_t *prd = cmd_table + HYPE_AHCI_HOST_CT_PRDT_OFF;
+    uint32_t dbc;
+    unsigned i;
+
+    /* H2D Register FIS carrying IDENTIFY DEVICE. Unlike READ DMA EXT there is
+     * no LBA/count and no LBA-mode device byte -- IDENTIFY takes none. */
+    for (i = 0; i < 20u; i++) {
+        fis[i] = 0;
+    }
+    fis[0] = 0x27u;                          /* FIS type: Register - Host to Device */
+    fis[1] = 0x80u;                          /* C bit: this FIS carries a command */
+    fis[2] = HYPE_ATA_CMD_IDENTIFY_DEVICE;   /* 0xEC */
+
+    /* Single PRDT entry for the 512-byte IDENTIFY response. DBC = bytes-1. */
+    for (i = 0; i < HYPE_AHCI_HOST_PRDT_ENTRY_SIZE; i++) {
+        prd[i] = 0;
+    }
+    put_le32(prd + 0, (uint32_t)dst_phys);
+    put_le32(prd + 4, (uint32_t)(dst_phys >> 32));
+    dbc = (HYPE_ATA_IDENTIFY_SIZE - 1u) & 0x3FFFFFu;
+    put_le32(prd + 12, dbc);
+}
+
+/* Inverse of devices/ata_disk.c's write_swapped_ascii: each ATA word stores the
+ * first character in its high byte (src[i+1]) and the second in its low byte
+ * (src[i]). Writes `field_bytes` chars + a NUL, then trims trailing spaces. */
+static void read_swapped_ascii(char *dst, const uint8_t *src, unsigned field_bytes) {
+    unsigned i;
+
+    for (i = 0; i < field_bytes; i += 2u) {
+        dst[i] = (char)src[i + 1u];
+        dst[i + 1u] = (char)src[i];
+    }
+    dst[field_bytes] = '\0';
+    while (field_bytes > 0u && dst[field_bytes - 1u] == ' ') {
+        dst[field_bytes - 1u] = '\0';
+        field_bytes--;
+    }
+}
+
+void hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t *out) {
+    uint64_t lba48 = 0;
+    uint32_t lba28;
+    unsigned i;
+
+    read_swapped_ascii(out->serial, id + 20, 20u); /* words 10-19 */
+    read_swapped_ascii(out->model, id + 54, 40u);  /* words 27-46 */
+
+    for (i = 0; i < 8u; i++) { /* words 100-103: 48-bit LBA capacity, 64-bit LE */
+        lba48 |= (uint64_t)id[200 + i] << (8u * i);
+    }
+    lba28 = (uint32_t)id[120] | ((uint32_t)id[121] << 8) |
+            ((uint32_t)id[122] << 16) | ((uint32_t)id[123] << 24); /* words 60-61 */
+
+    /* Word 83 bit 10 (high byte 167, bit 2 = 0x04) = 48-bit addressing supported. */
+    if ((id[167] & 0x04u) != 0u && lba48 != 0u) {
+        out->total_sectors = lba48;
+    } else {
+        out->total_sectors = lba28;
+    }
+}

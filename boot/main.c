@@ -8779,6 +8779,34 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 } else {
                     hype_debug_print("host-ahci: port %d LBA0 read FAILED\n", sp);
                 }
+                /* M10-2: capture the physical disk's identity -- ATA serial +
+                 * model + real capacity (IDENTIFY DEVICE), plus the GPT disk
+                 * GUID. These are the fields a `physical:` target-disk safety
+                 * guard keys on (serial/GUID match) and a physical-disk block
+                 * backend needs for its own real-capacity bounds check. Logged
+                 * only for now -- no consumer writes to the disk yet. */
+                {
+                    static uint8_t g_hostdisk_id[512] __attribute__((aligned(4096)));
+                    if (hype_ahci_host_identify(hs.bar_phys, (unsigned)sp, g_hostdisk_id) == 0) {
+                        hype_host_disk_info_t di;
+                        uint8_t guid[16];
+                        hype_ahci_host_parse_identify(g_hostdisk_id, &di);
+                        hype_debug_print("host-disk: serial='%s' model='%s' sectors=%llu (%llu MiB)\n",
+                                         di.serial, di.model,
+                                         (unsigned long long)di.total_sectors,
+                                         (unsigned long long)(di.total_sectors / 2048ull));
+                        if (hype_gpt_disk_guid(hostdisk_read, 0, guid) == 0) {
+                            hype_debug_print(
+                                "host-disk: gpt-guid %02x%02x%02x%02x-%02x%02x-%02x%02x-"
+                                "%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+                                guid[0], guid[1], guid[2], guid[3], guid[4], guid[5], guid[6],
+                                guid[7], guid[8], guid[9], guid[10], guid[11], guid[12], guid[13],
+                                guid[14], guid[15]);
+                        }
+                    } else {
+                        hype_serial_print("host-disk: IDENTIFY failed\n");
+                    }
+                }
                 /* GLADDER-10: exercise the full streaming read stack end-to-end
                  * against a real on-disk ISO -- GPT-locate partition 2 (the raw
                  * ISO), then stream-read its ISO9660 PVD and verify the "CD001"

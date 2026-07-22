@@ -48,6 +48,35 @@ void hype_ahci_host_build_cmd_header(uint8_t slot[32], int is_write, uint16_t pr
 int hype_ahci_host_build_read_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_t count,
                                       uint64_t dst_phys);
 
+/*
+ * Fills a command table for IDENTIFY DEVICE (ATA 0xEC): a H2D Register FIS at
+ * offset 0 (no LBA/count -- IDENTIFY takes none) and a single PRDT entry at
+ * offset 0x80 pointing at `dst_phys` for the 512-byte response. Zeroes the FIS
+ * and the PRDT entry it writes. Pure -- writes only into `cmd_table`.
+ */
+void hype_ahci_host_build_identify(uint8_t *cmd_table, uint64_t dst_phys);
+
+/*
+ * M10-2: the physical disk's captured identity -- the fields a `physical:`
+ * target-disk safety guard keys on (serial match) and a block backend needs
+ * for its own real-capacity bounds check (total_sectors). Strings are NUL-
+ * terminated and trailing-space-trimmed.
+ */
+typedef struct {
+    char serial[21];        /* ATA serial number (IDENTIFY words 10-19, 20 chars) */
+    char model[41];         /* ATA model number  (IDENTIFY words 27-46, 40 chars) */
+    uint64_t total_sectors; /* 48-bit LBA capacity if supported, else 28-bit */
+} hype_host_disk_info_t;
+
+/*
+ * Parses a 512-byte ATA IDENTIFY DEVICE response into *out: serial and model
+ * (byte-swapped ASCII per the ATA convention -- the exact inverse of
+ * devices/ata_disk.c's write_swapped_ascii), and the total sector count
+ * (48-bit words 100-103 when word 83 bit 10 marks 48-bit addressing supported,
+ * otherwise the 28-bit words 60-61 fallback). Pure.
+ */
+void hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t *out);
+
 /* --- Hardware bring-up (host_pci_hw-style shim; real MMIO, not unit-tested) --- */
 
 /*
@@ -78,5 +107,14 @@ int hype_ahci_host_init(uint64_t abar_phys, unsigned port);
  * cache-coherent, so no explicit flush is needed.
  */
 int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst);
+
+/*
+ * Issues IDENTIFY DEVICE to an already-initialised `port` (see
+ * hype_ahci_host_init) and copies the 512-byte response into `dst512` (a
+ * 512-byte, identity-mapped, sector-aligned host buffer). Builds slot 0
+ * (IDENTIFY), issues it, and polls PxCI to completion. Returns 0 on success,
+ * -1 on timeout or an ATA error. Post-ExitBootServices only.
+ */
+int hype_ahci_host_identify(uint64_t abar_phys, unsigned port, void *dst512);
 
 #endif /* HYPE_CORE_AHCI_HOST_H */

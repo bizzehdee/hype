@@ -41,4 +41,13 @@ typedef struct {
 int hype_gpt_find_partition(hype_gpt_read_lba_fn read, void *ctx, unsigned index,
                             hype_gpt_partition_t *out);
 
+/*
+ * Reads the 16-byte Disk GUID from the primary GPT header (LBA 1, offset 0x38,
+ * §5.3.2) into `out_guid`. Returns 0 on success, -1 if the header is invalid
+ * ("EFI PART" signature) or the sector read fails. Read-only. This is the
+ * partition-table-level disk identity (M10-2 "serial/GUID"), complementing the
+ * hardware serial from hype_ahci_host_parse_identify().
+ */
+int hype_gpt_disk_guid(hype_gpt_read_lba_fn read, void *ctx, uint8_t out_guid[16]);
+
 #endif /* HYPE_CORE_GPT_H */

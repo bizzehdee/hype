@@ -39,6 +39,12 @@ static void build_fake_gpt(void) {
     put_le64(hdr + 0x48, 2);   /* partition entries start at LBA 2 */
     put_le32(hdr + 0x50, 128); /* 128 entries */
     put_le32(hdr + 0x54, 128); /* 128 bytes each */
+    { /* disk GUID at offset 0x38: a recognizable 16-byte pattern */
+        unsigned g;
+        for (g = 0; g < 16u; g++) {
+            hdr[0x38 + g] = (uint8_t)(0xA0 + g);
+        }
+    }
 
     /* Entry 0 (used): FAT ESP, LBA 2048..4095. Type GUID = nonzero. */
     ents[0] = 0x28; /* any nonzero byte in the type GUID => used */
@@ -52,9 +58,11 @@ static void build_fake_gpt(void) {
     /* Entry 3 (unused). */
 }
 
+static uint64_t g_fail_lba = (uint64_t)-1; /* if set, fake_read fails on this LBA */
+
 static int fake_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
-    if (count != 1u || lba >= 4u) {
+    if (count != 1u || lba >= 4u || lba == g_fail_lba) {
         return -1;
     }
     memcpy(dst, g_disk[lba], 512);
@@ -94,11 +102,102 @@ static void test_bad_signature(void) {
               (unsigned long long)hype_gpt_find_partition(fake_read, 0, 1, &p));
 }
 
+/* Negative paths through hype_gpt_find_partition -- each pokes one field of an
+ * otherwise-valid table so a single guard fires. */
+static void test_header_read_fail(void) {
+    hype_gpt_partition_t p;
+    g_valid_sig = 1; build_fake_gpt();
+    g_fail_lba = 1; /* the GPT header read (LBA 1) fails */
+    CHECK_HEX("header read failure rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(fake_read, 0, 1, &p));
+    g_fail_lba = (uint64_t)-1;
+}
+
+static void test_entry_size_too_small(void) {
+    hype_gpt_partition_t p;
+    g_valid_sig = 1; build_fake_gpt();
+    put_le32(g_disk[1] + 0x54, 64); /* < 128-byte minimum */
+    CHECK_HEX("entry_size < 128 rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(fake_read, 0, 1, &p));
+}
+
+static void test_num_entries_zero(void) {
+    hype_gpt_partition_t p;
+    g_valid_sig = 1; build_fake_gpt();
+    put_le32(g_disk[1] + 0x50, 0);
+    CHECK_HEX("num_entries 0 rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(fake_read, 0, 1, &p));
+}
+
+static void test_num_entries_too_many(void) {
+    hype_gpt_partition_t p;
+    g_valid_sig = 1; build_fake_gpt();
+    put_le32(g_disk[1] + 0x50, 5000); /* > 4096 cap */
+    CHECK_HEX("num_entries > cap rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(fake_read, 0, 1, &p));
+}
+
+static void test_entry_size_not_128(void) {
+    hype_gpt_partition_t p;
+    g_valid_sig = 1; build_fake_gpt();
+    put_le32(g_disk[1] + 0x54, 256); /* valid-but-unsupported larger entry */
+    CHECK_HEX("entry_size != 128 rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(fake_read, 0, 1, &p));
+}
+
+static void test_entry_array_read_fail(void) {
+    hype_gpt_partition_t p;
+    g_valid_sig = 1; build_fake_gpt();
+    put_le64(g_disk[1] + 0x48, 10); /* entry array at LBA 10 -> read fails (disk is 4 sectors) */
+    CHECK_HEX("entry-array read failure rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(fake_read, 0, 1, &p));
+}
+
+static void test_entry_last_before_first(void) {
+    hype_gpt_partition_t p;
+    g_valid_sig = 1; build_fake_gpt();
+    put_le64(g_disk[2] + 0x20, 5000); /* entry 0 first_lba */
+    put_le64(g_disk[2] + 0x28, 100);  /* last_lba < first_lba => corrupt */
+    CHECK_HEX("last_lba < first_lba rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(fake_read, 0, 1, &p));
+}
+
+static void test_disk_guid(void) {
+    uint8_t guid[16];
+    unsigned g;
+    int mismatch = 0;
+
+    g_valid_sig = 1; build_fake_gpt();
+    CHECK_HEX("read disk GUID ok", 0, hype_gpt_disk_guid(fake_read, 0, guid));
+    for (g = 0; g < 16u; g++) {
+        if (guid[g] != (uint8_t)(0xA0 + g)) {
+            mismatch = 1;
+        }
+    }
+    CHECK_HEX("disk GUID bytes match", 0, mismatch);
+}
+
+static void test_disk_guid_bad_signature(void) {
+    uint8_t guid[16];
+    g_valid_sig = 0; build_fake_gpt();
+    CHECK_HEX("disk GUID rejected on bad signature", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_disk_guid(fake_read, 0, guid));
+}
+
 int main(void) {
     test_find_first_partition();
     test_find_second_partition();
     test_index_out_of_range();
     test_bad_signature();
+    test_header_read_fail();
+    test_entry_size_too_small();
+    test_num_entries_zero();
+    test_num_entries_too_many();
+    test_entry_size_not_128();
+    test_entry_array_read_fail();
+    test_entry_last_before_first();
+    test_disk_guid();
+    test_disk_guid_bad_signature();
 
     if (failures == 0) {
         printf("all tests passed\n");

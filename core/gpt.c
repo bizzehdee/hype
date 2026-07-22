@@ -2,6 +2,7 @@
 
 /* GPT header field offsets (UEFI spec §5.3.2), within the LBA-1 sector. */
 #define GPT_SIG_OFF 0x00u          /* 8 bytes: "EFI PART" */
+#define GPT_DISK_GUID_OFF 0x38u    /* 16 bytes: the disk's GUID */
 #define GPT_PART_ENTRY_LBA_OFF 0x48u /* u64: first LBA of the partition-entry array */
 #define GPT_NUM_ENTRIES_OFF 0x50u  /* u32: number of partition entries */
 #define GPT_ENTRY_SIZE_OFF 0x54u   /* u32: size of each entry (>= 128) */
@@ -92,4 +93,20 @@ int hype_gpt_find_partition(hype_gpt_read_lba_fn read, void *ctx, unsigned index
         }
     }
     return -1; /* fewer than `index` used partitions */
+}
+
+int hype_gpt_disk_guid(hype_gpt_read_lba_fn read, void *ctx, uint8_t out_guid[16]) {
+    uint8_t sector[HYPE_GPT_SECTOR_SIZE];
+    unsigned i;
+
+    if (read(ctx, HYPE_GPT_HEADER_LBA, 1u, sector) != 0) {
+        return -1;
+    }
+    if (rd_le64(sector + GPT_SIG_OFF) != GPT_SIGNATURE) {
+        return -1;
+    }
+    for (i = 0; i < 16u; i++) {
+        out_guid[i] = sector[GPT_DISK_GUID_OFF + i];
+    }
+    return 0;
 }

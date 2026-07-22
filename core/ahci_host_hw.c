@@ -160,3 +160,26 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
     }
     return rc;
 }
+
+int hype_ahci_host_identify(uint64_t abar_phys, unsigned port, void *dst512) {
+    volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
+    volatile uint8_t *pb = port_base(abar, port);
+    int rc = 0;
+
+    /* Same slot-0 mechanism as hype_ahci_host_read(), but an IDENTIFY command
+     * table -- a non-write data-in transfer of exactly 512 bytes into dst512. */
+    hype_ahci_host_build_identify(g_cmd_table, (uint64_t)(uintptr_t)dst512);
+    hype_ahci_host_build_cmd_header(g_cmd_list, /*is_write=*/0, /*prdtl=*/1,
+                                    (uint64_t)(uintptr_t)g_cmd_table);
+
+    if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
+        return -1;
+    }
+    wr32(pb, HYPE_AHCI_PREG_CI, 1u);
+    if (wait_clear(pb, HYPE_AHCI_PREG_CI, 1u, SPIN_CMD) != 0) {
+        rc = -1;
+    } else if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
+        rc = -1;
+    }
+    return rc;
+}
