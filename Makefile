@@ -6,8 +6,14 @@ CC      := clang
 LD      := ld.lld
 TARGET  := x86_64-unknown-uefi
 
+# -MMD -MP: emit a .d file of header prerequisites next to each .o, so editing a
+# header (e.g. a struct in devices/*.h) recompiles EVERY .c that includes it, not
+# just the .c whose timestamp changed. Without this, a stale .o with an outdated
+# struct layout links against freshly-built ones that disagree on field offsets --
+# which silently corrupted the ATAPI result struct across atapi.o/svm_vcpu.o and
+# looked like a mysterious "struct size sensitivity" (GLADDER-STRUCT / #180).
 CFLAGS  := --target=$(TARGET) -ffreestanding -fshort-wchar -mno-red-zone \
-           -Wall -Wextra -g -O1 -std=c11
+           -Wall -Wextra -g -O1 -std=c11 -MMD -MP
 LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 
 BUILD_DIR := build
@@ -59,6 +65,11 @@ ESP       := $(BUILD_DIR)/esp
 .PHONY: all clean test run
 
 all: $(OUT)
+
+# Pull in the per-object header-dependency files emitted by -MMD (leading '-'
+# so a first build, before any .d exists, doesn't error). This is what makes a
+# header edit trigger the right recompiles.
+-include $(OBJS:.o=.d)
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)

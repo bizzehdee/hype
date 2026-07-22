@@ -1465,8 +1465,8 @@ static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
          * PRD reads from the chunk list at logical offset media_byte_off+transferred.
          * GLADDER-10(b): the byte offset is derived here from the 32-bit start
          * sector (media_lba) with a 64-bit multiply, so a >=4GB ISO (byte offset
-         * past UINT32_MAX) addresses the right bytes without widening the
-         * size-sensitive result struct. */
+         * past UINT32_MAX) addresses the right bytes -- the result struct only
+         * needs to carry a 32-bit sector index (good to 8TB). */
         media_byte_off = (uint64_t)result.media_lba * (uint64_t)HYPE_ATAPI_SECTOR_SIZE;
         chunked_media = result.uses_media_data && atapi->media_chunks != 0;
         src = result.uses_media_data

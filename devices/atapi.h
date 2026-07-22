@@ -143,12 +143,11 @@ typedef struct {
      * way -- this struct only describes where those bytes come from. */
     int uses_media_data;
     /* GLADDER-10(b): the read position is the start LBA (a sector index), NOT a
-     * byte offset. A byte offset would need 64 bits for a >=4GB ISO (lba*2048 >
-     * UINT32_MAX), and widening this stack-resident struct reproducibly wedges
-     * the AHCI glue (see GLADDER-STRUCT). A sector index stays 32-bit (good to
-     * 8TB) and keeps the struct byte-identical to the proven layout; the caller
-     * scales it to a 64-bit byte offset (media_lba * HYPE_ATAPI_SECTOR_SIZE).
-     * media_length remains a byte count -- a single CDB never transfers >4GB. */
+     * byte offset. A 32-bit sector index reaches 8TB of media -- ample for any
+     * ISO -- whereas a byte offset would need 64 bits for a >=4GB ISO (lba*2048
+     * > UINT32_MAX). The caller scales it to a 64-bit byte offset
+     * (media_lba * HYPE_ATAPI_SECTOR_SIZE). media_length stays a byte count --
+     * a single CDB never transfers >4GB. */
     uint32_t media_lba;
     uint32_t media_length;
     uint8_t synth_data[HYPE_ATAPI_MAX_SYNTH_RESPONSE];
