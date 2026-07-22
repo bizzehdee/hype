@@ -12,6 +12,8 @@
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/ahci_host.h"
+#include "../core/gpt.h"
+#include "../core/iso_stream.h"
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
@@ -7538,6 +7540,16 @@ static void hype_spurious_irq15_isr(const hype_isr_frame_t *frame) {
     }
 }
 
+/* GLADDER-10 streaming: the ABAR + port the host AHCI driver reads through,
+ * bound once post-EBS. hostdisk_read() adapts hype_ahci_host_read() to the
+ * (ctx, lba, count, dst) callback that core/gpt.c and core/iso_stream.c expect. */
+static uint64_t g_hostdisk_abar;
+static unsigned g_hostdisk_port;
+static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    (void)ctx;
+    return hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, dst);
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -8274,15 +8286,49 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             int sp = hype_ahci_host_find_sata_port(hs.bar_phys);
             if (sp < 0) {
                 hype_serial_print("host-ahci: AHCI present but no SATA disk port\n");
-            } else if (hype_ahci_host_init(hs.bar_phys, (unsigned)sp) == 0 &&
-                       hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 0u, 1u, g_hostdisk_probe) == 0) {
-                hype_debug_print(
-                    "host-ahci: port %d LBA0 read OK -- bytes[0..3]=%02x%02x%02x%02x mbrsig=%02x%02x\n",
-                    sp, (unsigned)g_hostdisk_probe[0], (unsigned)g_hostdisk_probe[1],
-                    (unsigned)g_hostdisk_probe[2], (unsigned)g_hostdisk_probe[3],
-                    (unsigned)g_hostdisk_probe[510], (unsigned)g_hostdisk_probe[511]);
+            } else if (hype_ahci_host_init(hs.bar_phys, (unsigned)sp) != 0) {
+                hype_serial_print("host-ahci: port init failed\n");
             } else {
-                hype_debug_print("host-ahci: port %d LBA0 read FAILED\n", sp);
+                g_hostdisk_abar = hs.bar_phys;
+                g_hostdisk_port = (unsigned)sp;
+                if (hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 0u, 1u, g_hostdisk_probe) == 0) {
+                    hype_debug_print("host-ahci: port %d LBA0 read OK -- mbrsig=%02x%02x\n", sp,
+                                     (unsigned)g_hostdisk_probe[510], (unsigned)g_hostdisk_probe[511]);
+                } else {
+                    hype_debug_print("host-ahci: port %d LBA0 read FAILED\n", sp);
+                }
+                /* GLADDER-10: exercise the full streaming read stack end-to-end
+                 * against a real on-disk ISO -- GPT-locate partition 2 (the raw
+                 * ISO), then stream-read its ISO9660 PVD and verify the "CD001"
+                 * magic at byte 32769. Diagnostic only (does not yet back the
+                 * guest CD); proves gpt + ahci_host + iso_stream compose. */
+                {
+                    hype_gpt_partition_t iso_part;
+                    if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
+                        hype_serial_print("host-gpt: no partition 2 (raw ISO) on the boot disk\n");
+                    } else {
+                        static hype_iso_stream_t strm;
+                        static uint8_t cd[8];
+                        hype_debug_print("host-gpt: partition 2 = LBA %llu..%llu (%llu bytes)\n",
+                                         (unsigned long long)iso_part.first_lba,
+                                         (unsigned long long)iso_part.last_lba,
+                                         (unsigned long long)iso_part.size_bytes);
+                        strm.read = hostdisk_read;
+                        strm.ctx = 0;
+                        strm.part_start_lba = iso_part.first_lba;
+                        strm.iso_size = iso_part.size_bytes;
+                        if (hype_iso_stream_read(&strm, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+                            cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
+                            hype_serial_print("host-stream: CD001 verified via streaming from "
+                                              "partition 2 -- streaming read path OK\n");
+                        } else {
+                            hype_debug_print("host-stream: CD001 NOT found streaming part2 "
+                                             "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
+                                             (unsigned)cd[1], (unsigned)cd[2], (unsigned)cd[3],
+                                             (unsigned)cd[4]);
+                        }
+                    }
+                }
             }
         }
     }
