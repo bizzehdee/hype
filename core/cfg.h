@@ -66,6 +66,10 @@ typedef enum {
 typedef struct {
     hype_cfg_disk_kind_t kind;
     char path_or_id[HYPE_CFG_PATH_MAX];
+    /* M10-4/#124 physical-target qualifiers (docs/hype-cfg-spec.md §5.3). Only
+     * meaningful for kind==PHYSICAL; harmless/ignored for a file target. */
+    unsigned int partition;    /* 1-based GPT partition to scope to; 0 = whole disk (default) */
+    int allow_overwrite;       /* explicit override of the non-empty-partition-table guard */
 } hype_cfg_target_disk_t;
 
 typedef struct {

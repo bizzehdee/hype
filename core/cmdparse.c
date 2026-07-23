@@ -26,6 +26,7 @@ static hype_cmd_verb_t verb_of(const char *tok, unsigned len) {
     if (tok_eq(tok, len, "shutdown") || tok_eq(tok, len, "poweroff")) return HYPE_CMD_SHUTDOWN;
     if (tok_eq(tok, len, "off") || tok_eq(tok, len, "kill") || tok_eq(tok, len, "force")) return HYPE_CMD_POWEROFF;
     if (tok_eq(tok, len, "focus") || tok_eq(tok, len, "switch") || tok_eq(tok, len, "sw")) return HYPE_CMD_FOCUS;
+    if (tok_eq(tok, len, "confirm")) return HYPE_CMD_CONFIRM;
     return HYPE_CMD_UNKNOWN;
 }
 

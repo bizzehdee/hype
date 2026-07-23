@@ -26,6 +26,8 @@ int main(void) {
     CHECK("kill alias -> POWEROFF", P("kill vm0").verb == HYPE_CMD_POWEROFF);
     CHECK("focus", P("focus vm1")            .verb == HYPE_CMD_FOCUS);
     CHECK("switch alias -> FOCUS", P("switch 2").verb == HYPE_CMD_FOCUS);
+    CHECK("confirm", P("confirm S4EWNF0")     .verb == HYPE_CMD_CONFIRM);
+    CHECK("confirm carries serial arg", strcmp(P("confirm S4EWNF0").arg, "S4EWNF0") == 0);
     CHECK("garbage -> UNKNOWN", P("frobnicate").verb == HYPE_CMD_UNKNOWN);
 
     /* case-insensitive */

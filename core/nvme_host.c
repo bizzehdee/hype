@@ -92,6 +92,25 @@ int hype_nvme_parse_identify_ns(const uint8_t idns[4096], uint64_t *total_blocks
     return 0;
 }
 
+/* Copies a fixed-width, space-padded ASCII field [src, src+len) into out,
+ * trimming leading/trailing spaces and NUL-terminating. out has len+1 bytes. */
+static void copy_ascii_field(const uint8_t *src, unsigned len, char *out) {
+    unsigned start = 0, end = len;
+    unsigned i;
+    while (start < len && src[start] == ' ') start++;
+    while (end > start && src[end - 1] == ' ') end--;
+    for (i = 0; start + i < end; i++) {
+        out[i] = (char)src[start + i];
+    }
+    out[i] = '\0';
+}
+
+void hype_nvme_parse_identify_ctrl(const uint8_t idctrl[4096], char serial_out[21],
+                                   char model_out[41]) {
+    if (serial_out) copy_ascii_field(idctrl + 4, 20, serial_out);  /* SN */
+    if (model_out)  copy_ascii_field(idctrl + 24, 40, model_out);  /* MN */
+}
+
 uint32_t hype_nvme_cap_dstrd(uint64_t cap) {
     return (uint32_t)((cap >> 32) & 0x0Fu);
 }
