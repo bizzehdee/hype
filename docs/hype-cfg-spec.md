@@ -120,58 +120,96 @@ collide. Unknown kinds are ignored (§4.1).
 
 ### 5.2 `[vm.<name>]` — per VM
 
-Existing (M1-1) fields, unchanged: `vcpus`, `cpu_set`, `mem_mb`, `boot`
-(`installer`\|`disk`), `install_media` (path, required when `boot=installer`),
-`firmware` (`uefi`\|`legacy`), `os_hint` (`windows`\|`linux`\|`bsd`\|`none`),
-`net_mode` (`none`\|`nat`), `net_peers` (VM-name list).
+The section id `<name>` is the VM's **canonical name** (slug `[A-Za-z0-9_-]`,
+unique): it is used for cross-references (`net`/`peers`), for the state file, and
+as the default display name.
 
-Additions:
+| key | type / domain | default | notes |
+|---|---|---|---|
+| `label` | free text | the section `<name>` | **human display name surfaced in every management interface** (dashboard NAME column, TUI, future SSH mgmt). Lets a friendly "Windows 11 Workstation" show for id `win11`. |
+| `vcpus` | int, **1 .. host cores** | `1` | ≥1; admission caps at `host_cpu_budget` size (§10) |
+| `cpu_set` | cpu-list | (unpinned) | optional explicit pin subset of `host_cpu_budget` |
+| `mem_mb` | int, **1 .. host usable MB** | — (required) | ≥1 MB; admission caps at host RAM (§10) |
+| `boot` | `installer` \| `disk` | `installer` | two-phase (§5.4 / plan.md §6d) |
+| `firmware` | `uefi` \| `legacy` | `uefi` | |
+| `os_hint` | `windows`\|`linux`\|`bsd`\|`none` | `none` | drives `bus` defaults (§5.6) |
+| `disks` | `<disk-id>` list | (empty) | ordered hard disks (`type=disk` `[disk.*]`); **0..N**, mixed bus allowed (§5.7) |
+| `cdroms` | `<disk-id>` list | (empty) | ordered optical drives (`type=cdrom` `[disk.*]`); **0..N** (§5.4) |
+| `install_media` | path | (none) | sugar: an implicit boot `cdrom` (§5.4) |
+| `nics` | `<nic-id>` list | (empty) | ordered network devices (`[nic.*]`); **0..N** (§5.5) |
+| `boot_order` | device-id list | `cdroms` then `disks` | order BDS tries bootable targets |
+
+A VM may have **zero** disks, **zero** cdroms, and **zero** nics (a diskless
+and/or network-less guest is valid). `target_disk`/`target_disk_size_gb` (the
+inline single-disk form) stay valid as **sugar** for a one-disk VM (§7).
+
+### 5.3 `[disk.<id>]` — a named storage device (NEW)
+
+Decouples device definitions from VMs so a VM can attach several, of mixed type
+and bus (e.g. one SATA + two NVMe, or five SATA, or three NVMe). Each `[disk.*]`
+is one device; a VM references them by id in `disks =` / `cdroms =`.
 
 | key | type / domain | default | maps to |
 |---|---|---|---|
-| `disks` | `<disk-id>` list | (none) | references `[disk.<id>]` sections; ordered → `/dev/vda,vdb…` (multi-disk, §5.3) |
-| `boot_order` | disk/media id list | media then first disk | which target BDS boots first |
+| `type` | `disk` \| `cdrom` | `disk` | hard disk vs optical drive |
+| `backing` | `file` \| `physical` | `file` for cdrom; else required | blk_backend kind (#89) |
+| `path` | path | — | `backing=file`: image/ISO path on the ESP/host FS |
+| `format` | `raw` \| `qcow2` | `raw` | disk image format (#199 raw / #200 qcow2); ignored for cdrom (ISO) |
+| `size_gb` | int | — | `type=disk backing=file`: create at this size if absent |
+| `id_match` | serial-or-GUID string | — | `backing=physical`: identity phys_guard requires (#122/#124) |
+| `partition` | int (1-based) \| `whole` | `whole` | `backing=physical`: GPT partition vs whole disk |
+| `bus` | disk: `virtio-blk`\|`ahci-sata`\|`nvme`; cdrom: `ahci-atapi` | disk: per `os_hint` (§5.6); cdrom: `ahci-atapi` | guest-facing front-end (#196/#202) |
+| `read_only` | bool | `false` (disk); always `true` (cdrom) | |
+| `allow_overwrite` | bool | `false` | `backing=physical`: explicit per-disk override of the non-empty-table guard (#124/#195). Still ALSO needs runtime confirm (§6). |
 
-`target_disk` / `target_disk_size_gb` (the current inline single-disk form) stay
-valid as **sugar** for a one-disk VM (§7); `disks =` is the general form.
+### 5.4 Boot media / optical (CD/DVD)
 
-### 5.4 Boot media (CD/ISO)
+Optical drives are first-class `[disk.<id>] type=cdrom` devices; a VM attaches
+**any number** via `cdroms =` (`bus=ahci-atapi`, read-only, `backing=file` ISO).
+`install_media` stays as **sugar** for the common single-installer case: it
+creates one implicit boot cdrom and places it first in `boot_order`
+(maps to the per-VM ISO backing, #140). Use explicit `cdroms =` when a VM needs
+more than one (e.g. an installer ISO + a Windows storage-driver ISO).
 
-`install_media` (§5.2) stays the ergonomic key for a VM's **primary boot CD** —
-it is the common case, maps to the per-VM ISO backing (#140), and is
-conceptually distinct (read-only ATAPI optical, not a writable disk). It is NOT
-folded into `[disk.*]`. *Additional* optical media (e.g. a Windows virtio /
-storage-driver CD alongside the installer) is a reserved future capability via a
-`[disk.<id>]` with `backing=file`, read-only, `bus=ahci-atapi`.
+### 5.5 `[nic.<id>]` — a network device (NEW)
 
-### 5.5 `bus` default derivation
+A VM attaches **0..N** NICs via `nics =`. Each `[nic.<id>]`:
 
-When a disk's `bus` is not given, it defaults from the owning VM's `os_hint`:
+| key | type / domain | default | notes |
+|---|---|---|---|
+| `mode` | `none` \| `nat` | `[hype] default_net_mode` | plan.md §6e |
+| `mac` | MAC string | derived (stable per id) | optional explicit MAC |
+| `peers` | VM-name list | (none) | guest-to-guest forwarding (plan.md §6e `net_peers`) |
 
-| `os_hint` | default `bus` | why |
+`net_mode`/`net_peers` on `[vm.*]` remain **sugar** for a single implicit NIC
+(backward compat). Zero NICs = no `nics` and no `net_mode` (a network-less VM).
+
+### 5.6 `bus` default derivation
+
+When a `type=disk` device's `bus` is not given, it defaults from the owning VM's
+`os_hint`: **`windows` → `ahci-sata`** (no inbox virtio-blk — a virtio system
+disk is invisible at Windows install; AHCI/SATA is inbox on every supported
+Windows), **`linux`/`bsd`/`none` → `virtio-blk`** (inbox + fastest). An explicit
+`bus =` always wins. (Until the AHCI-SATA / NVMe guest front-ends land — #202 +
+a guest-AHCI-disk ticket — only `virtio-blk` is realizable; the default is
+correct for when they exist.)
+
+### 5.7 Resource multiplicity & ranges
+
+| resource | range | enforced |
 |---|---|---|
-| `windows` | `ahci-sata` | Windows has no inbox virtio-blk driver — a virtio system disk would be invisible at install time; AHCI/SATA is inbox on every supported Windows |
-| `linux` / `bsd` / `none` | `virtio-blk` | inbox + fastest paravirtual path |
+| hard disks / VM (`disks`) | 0 .. `HYPE_CFG_MAX_DISKS_PER_VM` (~24) | parser cap; guest bus limits (AHCI ≤ 32 ports, PCI slots) at admission |
+| optical / VM (`cdroms`) | 0 .. `HYPE_CFG_MAX_CDROMS_PER_VM` (~4) | parser cap |
+| NICs / VM (`nics`) | 0 .. `HYPE_CFG_MAX_NICS_PER_VM` (~8) | parser cap |
+| `vcpus` | 1 .. host core count | parser ≥1; **admission** caps at `host_cpu_budget` |
+| `mem_mb` | 1 .. host usable RAM (MB) | parser ≥1; **admission** caps at real free RAM |
 
-An explicit `bus =` always wins. (Until the AHCI-SATA / NVMe *guest front-ends*
-land — #202 + a guest-AHCI-disk ticket — only `virtio-blk` is actually
-realizable; the default is correct for when they exist.)
-
-### 5.3 `[disk.<id>]` — a named virtual disk (NEW)
-
-Decouples disk definitions from VMs so a VM can have several, and each disk's
-attributes are independently extensible. A `[vm.*]` attaches disks via `disks =`.
-
-| key | type / domain | default | maps to |
-|---|---|---|---|
-| `backing` | `file` \| `physical` | — (required) | blk_backend kind (#89) |
-| `path` | path | — | `backing=file`: image path on the ESP/host FS |
-| `format` | `raw` \| `qcow2` | `raw` | file format (#199 raw / #200 qcow2) |
-| `size_gb` | int | — | `backing=file`: create at this size if absent |
-| `id_match` | serial-or-GUID string | — | `backing=physical`: the drive identity phys_guard requires (#122/#124) |
-| `partition` | int (1-based) \| `whole` | `whole` | `backing=physical`: scope to a GPT partition vs the whole disk |
-| `bus` | `virtio-blk` \| `ahci-sata` \| `nvme` | **per `os_hint`** (§5.5) | guest-facing front-end (#196 / #202) |
-| `allow_overwrite` | bool | `false` | `backing=physical`: the explicit per-disk override for the non-empty-table guard (#124/#195). Still ALSO requires runtime confirm (§6). |
+The parser accepts any value ≥ the minimum and ≤ the compile cap; the
+**host-relative upper bounds** (cores, RAM) are an ADMISSION check (§10), since
+they depend on the machine, not the file. VM names/labels flow into the runtime
+`hype_fw_vm_t` (replacing today's hardcoded `vm0`/`vm1`) so the configured name
+surfaces in the dashboard/TUI — a config→runtime wiring item, tracked with the
+parser/admission integration.
 
 ---
 
@@ -227,11 +265,12 @@ host_cpu_budget = 1-6         ; leave core 0 for hype's own housekeeping
 default_net_mode = nat
 autostart = all
 
+; --- a minimal Linux VM: 1 disk, no NICs, no optical ---
 [vm.alpine]
+label = Alpine Sandbox
 vcpus = 1
 mem_mb = 2048
-boot = installer
-install_media = \iso\alpine-standard.iso
+boot = disk
 os_hint = linux
 disks = alpine-sys
 
@@ -240,24 +279,48 @@ backing = file
 path = \hype\disks\alpine.img
 format = qcow2
 size_gb = 8
-bus = virtio-blk
 
+; --- a Windows VM: mixed disks (1 SATA system + 2 NVMe data), 1 NIC, installer CD ---
 [vm.win11]
+label = Windows 11 Workstation
 vcpus = 4
 cpu_set = 3-6
 mem_mb = 8192
 boot = installer
-install_media = \iso\win11.iso
+install_media = \iso\win11.iso        ; sugar: the boot CD
 os_hint = windows
-disks = win11-sys
-net_mode = nat
+disks = win-sys, win-data1, win-data2  ; SATA + NVMe + NVMe, enumerated in this order
+nics = win-net0
 
-[disk.win11-sys]
-backing = physical
-id_match = SN-WDC-1234567890   ; must match the enumerated drive; still needs runtime confirm
-partition = whole
+[disk.win-sys]
+backing = file
+path = \hype\disks\win-sys.img
+size_gb = 128
+bus = ahci-sata                        ; (default for os_hint=windows anyway)
+
+[disk.win-data1]
+backing = file
+path = \hype\disks\win-data1.img
+size_gb = 512
 bus = nvme
-allow_overwrite = false
+
+[disk.win-data2]
+backing = file
+path = \hype\disks\win-data2.img
+size_gb = 512
+bus = nvme
+
+[nic.win-net0]
+mode = nat
+
+; --- a diskless, network-less compute node: 0 disks, 0 cdroms, 0 NICs ---
+[vm.compute]
+label = Compute Node
+vcpus = 8
+mem_mb = 16384
+boot = installer
+install_media = \iso\alpine-standard.iso
+os_hint = linux
 ```
 
 ---
