@@ -136,4 +136,14 @@ int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *
  */
 int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const void *src);
 
+/*
+ * M10-6a (#227): the identity + capacity captured by the last successful
+ * hype_nvme_host_init() -- the fields a `physical:` NVMe target needs (serial
+ * for the #124 guard match, total 512-byte sectors for the block backend's
+ * capacity bound). serial_out >= 21 bytes, model_out >= 41 bytes (either may be
+ * NULL). hype_nvme_host_total_sectors() returns 0 before a successful init.
+ */
+void hype_nvme_host_identity(char serial_out[21], char model_out[41]);
+uint64_t hype_nvme_host_total_sectors(void);
+
 #endif /* HYPE_CORE_NVME_HOST_H */
