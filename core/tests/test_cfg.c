@@ -226,6 +226,57 @@ static void test_error_cases(void) {
     }
 }
 
+static void test_physical_disk_qualifiers(void) {
+    /* physical target with partition + allow_overwrite (M10-4/#124 inputs) */
+    const char *cfg =
+        "[vm.a]\n"
+        "vcpus = 1\nmem_mb = 1\nboot = disk\nfirmware = uefi\nos_hint = linux\n"
+        "target_disk = physical:SN-ABC-999\n"
+        "partition = 3\n"
+        "allow_overwrite = true\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+    CHECK_INT("physical qualifiers parse OK", HYPE_CFG_OK, res.status);
+    CHECK_INT("kind physical", (int)HYPE_CFG_DISK_PHYSICAL, (int)out.vms[0].target_disk.kind);
+    CHECK_STR("id", "SN-ABC-999", out.vms[0].target_disk.path_or_id);
+    CHECK_INT("partition 3", 3, (int)out.vms[0].target_disk.partition);
+    CHECK_INT("allow_overwrite true", 1, out.vms[0].target_disk.allow_overwrite);
+
+    /* defaults: no partition/allow_overwrite -> whole disk, no override */
+    {
+        const char *cfg2 =
+            "[vm.a]\nvcpus=1\nmem_mb=1\nboot=disk\nfirmware=uefi\nos_hint=linux\n"
+            "target_disk = physical:SN-XYZ\n";
+        hype_cfg_t o2;
+        hype_cfg_result_t r2 = parse_copy(cfg2, &o2);
+        CHECK_INT("defaults parse OK", HYPE_CFG_OK, r2.status);
+        CHECK_INT("partition default 0 (whole)", 0, (int)o2.vms[0].target_disk.partition);
+        CHECK_INT("allow_overwrite default 0", 0, o2.vms[0].target_disk.allow_overwrite);
+    }
+
+    /* partition = whole is explicit 0 */
+    {
+        const char *cfg3 =
+            "[vm.a]\nvcpus=1\nmem_mb=1\nboot=disk\nfirmware=uefi\nos_hint=linux\n"
+            "target_disk = physical:SN-XYZ\npartition = whole\n";
+        hype_cfg_t o3;
+        hype_cfg_result_t r3 = parse_copy(cfg3, &o3);
+        CHECK_INT("partition=whole OK", HYPE_CFG_OK, r3.status);
+        CHECK_INT("partition whole -> 0", 0, (int)o3.vms[0].target_disk.partition);
+    }
+
+    /* bad values rejected */
+    {
+        hype_cfg_t o4;
+        CHECK_INT("partition 0 rejected (1-based)", HYPE_CFG_ERR_BAD_VALUE,
+                  parse_copy("[vm.a]\ntarget_disk=physical:x\npartition=0\n", &o4).status);
+        CHECK_INT("allow_overwrite bad rejected", HYPE_CFG_ERR_BAD_VALUE,
+                  parse_copy("[vm.a]\nallow_overwrite=maybe\n", &o4).status);
+        CHECK_INT("duplicate partition rejected", HYPE_CFG_ERR_DUPLICATE_KEY,
+                  parse_copy("[vm.a]\npartition=1\npartition=2\n", &o4).status);
+    }
+}
+
 static void test_too_many_vms(void) {
     char cfg[8192] = "";
     char section[128];
@@ -368,6 +419,7 @@ int main(void) {
     test_net_peers_multiple_unique();
     test_net_peer_name_too_long();
     test_target_disk_path_too_long();
+    test_physical_disk_qualifiers();
     test_no_trailing_newline();
     test_comments_and_blank_lines_ignored();
     test_no_vms_is_valid();
