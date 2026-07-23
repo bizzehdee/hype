@@ -103,6 +103,45 @@ void hype_xhci_trb_status_stage(uint32_t trb[4], int dir_in, int ioc, int cycle)
              (ioc ? (1u << 5) : 0u);
 }
 
+/* --- device/input context encoders (xHCI 6.2) --- */
+
+static void ctx_zero(uint32_t c[8]) { unsigned i; for (i = 0; i < 8u; i++) c[i] = 0u; }
+
+void hype_xhci_input_ctrl_ctx(uint32_t icc[8], uint32_t add_flags, uint32_t drop_flags) {
+    ctx_zero(icc);
+    icc[0] = drop_flags; /* D2..D31 (D0/D1 must be 0) */
+    icc[1] = add_flags;  /* A0..A31 */
+}
+
+void hype_xhci_slot_ctx(uint32_t sc[8], unsigned int route, unsigned int speed,
+                        unsigned int ctx_entries, unsigned int root_port) {
+    ctx_zero(sc);
+    /* dword0: Route String[19:0], Speed[23:20], Context Entries[31:27]. */
+    sc[0] = (route & 0xFFFFFu) | ((speed & 0xFu) << 20) | ((ctx_entries & 0x1Fu) << 27);
+    /* dword1: Root Hub Port Number[23:16]. */
+    sc[1] = (root_port & 0xFFu) << 16;
+}
+
+void hype_xhci_ep0_ctx(uint32_t ep[8], unsigned int max_packet, uint64_t tr_dequeue_phys, int dcs) {
+    ctx_zero(ep);
+    /* dword1: CErr[2:1]=3, EP Type[5:3]=4 (Control), Max Packet Size[31:16]. */
+    ep[1] = (3u << 1) | (4u << 3) | ((max_packet & 0xFFFFu) << 16);
+    /* dword2/3: TR Dequeue Pointer (16-byte aligned) | DCS[0]. */
+    ep[2] = (uint32_t)((tr_dequeue_phys & ~0xFull) | (dcs ? 1u : 0u));
+    ep[3] = (uint32_t)(tr_dequeue_phys >> 32);
+    /* dword4: Average TRB Length (8 is the conventional value for control). */
+    ep[4] = 8u;
+}
+
+unsigned int hype_xhci_default_mps(unsigned int speed_id) {
+    /* PORTSC speed ids: 1=Full,2=Low,3=High,4=SuperSpeed,5+=SSP. */
+    switch (speed_id) {
+        case 2:  return 8u;    /* Low speed */
+        case 4:  return 512u;  /* SuperSpeed */
+        default: return 64u;   /* Full/High (and >=5 use 512 via IN; 64 is safe start) */
+    }
+}
+
 /* --- event TRB decode --- */
 
 unsigned int hype_xhci_event_cc(const uint32_t trb[4]) { return (trb[2] >> 24) & 0xFFu; }

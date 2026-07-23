@@ -142,6 +142,28 @@ void hype_xhci_trb_data_stage(uint32_t trb[4], uint64_t buffer_phys, uint32_t le
 /* Status Stage: dir_in (1=IN), ioc (interrupt-on-completion), cycle. */
 void hype_xhci_trb_status_stage(uint32_t trb[4], int dir_in, int ioc, int cycle);
 
+/* --- device/input context encoders (xHCI 6.2), pure --- */
+/* Contexts are 32 or 64 bytes (CSZ); these fill the first 8 dwords (the rest is
+ * reserved/padding). Callers place them at ctx_size-byte strides in the
+ * input/device context. */
+
+/* Input Control Context: drop-context + add-context bitmaps (A0=slot, A1=EP0). */
+#define HYPE_XHCI_ADD_SLOT (1u << 0)
+#define HYPE_XHCI_ADD_EP0  (1u << 1)
+void hype_xhci_input_ctrl_ctx(uint32_t icc[8], uint32_t add_flags, uint32_t drop_flags);
+
+/* Slot Context: route string, PORTSC speed, context-entries (highest valid DCI),
+ * and the root-hub port number the device is attached to. */
+void hype_xhci_slot_ctx(uint32_t sc[8], unsigned int route, unsigned int speed,
+                        unsigned int ctx_entries, unsigned int root_port);
+
+/* Default-control Endpoint (EP0) Context: EP Type = Control(4), CErr = 3, the
+ * given Max Packet Size, and the TR Dequeue Pointer (+ DCS cycle bit). */
+void hype_xhci_ep0_ctx(uint32_t ep[8], unsigned int max_packet, uint64_t tr_dequeue_phys, int dcs);
+
+/* Initial control-endpoint Max Packet Size for a PORTSC speed id (xHCI/USB). */
+unsigned int hype_xhci_default_mps(unsigned int speed_id);
+
 /* --- event TRB decode (pure) --- */
 unsigned int hype_xhci_event_cc(const uint32_t trb[4]);       /* completion code, status[31:24] */
 unsigned int hype_xhci_event_slot_id(const uint32_t trb[4]);  /* control[31:24] */
@@ -199,5 +221,21 @@ unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_spee
  * on a command error or timeout. Exercises the command+event ring machinery.
  */
 int hype_xhci_enable_slot(hype_xhci_ctrl_t *c, unsigned int *out_slot);
+
+/*
+ * USB-1 (#213) pt3b: Address a freshly-enabled device on `slot` attached to
+ * `root_port` at PORTSC `speed`. Builds the Input Context (slot + EP0), points
+ * DCBAA[slot] at a fresh Device Context, sets up the EP0 transfer ring, and
+ * issues an Address Device command. Returns 0 on success, -1 on error/timeout.
+ */
+int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int root_port,
+                             unsigned int speed);
+
+/*
+ * Reads the 18-byte USB device descriptor from an addressed device via a
+ * GET_DESCRIPTOR control transfer on EP0 (Setup/Data/Status). Writes it to
+ * buf18 (>= 18 bytes). Returns 0 on success, -1 on error/timeout.
+ */
+int hype_xhci_get_device_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf18);
 
 #endif /* HYPE_CORE_XHCI_H */
