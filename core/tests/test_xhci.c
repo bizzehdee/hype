@@ -1,0 +1,152 @@
+#include <stdio.h>
+#include "../xhci.h"
+
+static int failures = 0;
+
+#define CHECK_HEX(desc, expected, actual) \
+    do { \
+        if ((unsigned long long)(expected) != (unsigned long long)(actual)) { \
+            printf("FAIL: %s: expected 0x%llx, got 0x%llx\n", (desc), \
+                   (unsigned long long)(expected), (unsigned long long)(actual)); \
+            failures++; \
+        } \
+    } while (0)
+
+static void test_reg_offsets(void) {
+    CHECK_HEX("op base = caplength", 0x20u, hype_xhci_op_base(0x20));
+    CHECK_HEX("portsc port 1", 0x400u, hype_xhci_portsc_offset(1));
+    CHECK_HEX("portsc port 2", 0x410u, hype_xhci_portsc_offset(2));
+    CHECK_HEX("portsc port 5", 0x440u, hype_xhci_portsc_offset(5));
+    /* DBOFF low 2 bits are RsvdZ; slot 0 = command doorbell. */
+    CHECK_HEX("doorbell slot 0", 0x3000u, hype_xhci_doorbell_offset(0x3000, 0));
+    CHECK_HEX("doorbell slot 1", 0x3004u, hype_xhci_doorbell_offset(0x3000, 1));
+    CHECK_HEX("doorbell masks low bits", 0x3000u, hype_xhci_doorbell_offset(0x3002, 0));
+    /* RTSOFF low 5 bits RsvdZ; IR0 at +0x20; ERDP at +0x18. */
+    CHECK_HEX("ir0 IMAN", 0x1020u, hype_xhci_ir0_offset(0x1000, HYPE_XHCI_IR_IMAN));
+    CHECK_HEX("ir0 ERDP", 0x1038u, hype_xhci_ir0_offset(0x1000, HYPE_XHCI_IR_ERDP));
+    CHECK_HEX("ir0 masks low bits", 0x1020u, hype_xhci_ir0_offset(0x101F, HYPE_XHCI_IR_IMAN));
+}
+
+static void test_cap_fields(void) {
+    /* MaxSlots=32(0x20), MaxIntrs=8(0x008<<8), MaxPorts=4(0x04<<24). */
+    uint32_t hcs1 = 0x04000820u;
+    CHECK_HEX("max slots", 0x20u, hype_xhci_max_slots(hcs1));
+    CHECK_HEX("max intrs", 0x08u, hype_xhci_max_intrs(hcs1));
+    CHECK_HEX("max ports", 0x04u, hype_xhci_max_ports(hcs1));
+
+    /* Max Scratchpad: Hi[25:21]=0, Lo[31:27]=3 -> 3. */
+    CHECK_HEX("scratchpads lo only", 3u, hype_xhci_max_scratchpads(3u << 27));
+    /* Hi=1 (<<21), Lo=0 -> 32. */
+    CHECK_HEX("scratchpads hi", 32u, hype_xhci_max_scratchpads(1u << 21));
+
+    CHECK_HEX("ac64 set", 1, hype_xhci_ac64(0x1u));
+    CHECK_HEX("ac64 clear", 0, hype_xhci_ac64(0x2u));
+    CHECK_HEX("ctx size 64 (CSZ set)", 64u, hype_xhci_context_size(1u << 2));
+    CHECK_HEX("ctx size 32 (CSZ clear)", 32u, hype_xhci_context_size(0u));
+    CHECK_HEX("xecp dword offset", 0x1234u, hype_xhci_xecp_offset(0x12340000u));
+}
+
+static void test_cmd_trbs(void) {
+    uint32_t t[4];
+
+    hype_xhci_trb_noop_cmd(t, 1);
+    CHECK_HEX("noop type", HYPE_XHCI_TRB_NOOP_CMD, hype_xhci_trb_type(t));
+    CHECK_HEX("noop cycle 1", 1, hype_xhci_trb_cycle(t));
+    hype_xhci_trb_noop_cmd(t, 0);
+    CHECK_HEX("noop cycle 0", 0, hype_xhci_trb_cycle(t));
+
+    hype_xhci_trb_enable_slot(t, 1);
+    CHECK_HEX("enable slot type", HYPE_XHCI_TRB_ENABLE_SLOT, hype_xhci_trb_type(t));
+
+    hype_xhci_trb_link(t, 0x1234000ull, 1);
+    CHECK_HEX("link type", HYPE_XHCI_TRB_LINK, hype_xhci_trb_type(t));
+    CHECK_HEX("link ptr low", 0x1234000u, t[0]);
+    CHECK_HEX("link ptr high", 0u, t[1]);
+    CHECK_HEX("link toggle-cycle bit", 1u, (t[3] >> 1) & 1u);
+
+    hype_xhci_trb_address_device(t, 0x2000ull, 7, 0, 1);
+    CHECK_HEX("addrdev type", HYPE_XHCI_TRB_ADDRESS_DEVICE, hype_xhci_trb_type(t));
+    CHECK_HEX("addrdev ctx ptr", 0x2000u, t[0]);
+    CHECK_HEX("addrdev slot id", 7u, (t[3] >> 24) & 0xFFu);
+    CHECK_HEX("addrdev bsr clear", 0u, (t[3] >> 9) & 1u);
+    hype_xhci_trb_address_device(t, 0x2000ull, 7, 1, 1);
+    CHECK_HEX("addrdev bsr set", 1u, (t[3] >> 9) & 1u);
+}
+
+static void test_control_transfer_trbs(void) {
+    uint32_t t[4];
+
+    /* GET_DESCRIPTOR(device): bmRequestType=0x80, bRequest=6, wValue=0x0100,
+     * wIndex=0, wLength=18, IN data. */
+    hype_xhci_trb_setup_stage(t, 0x80, 6, 0x0100, 0, 18, HYPE_XHCI_TRT_IN, 1);
+    CHECK_HEX("setup type", HYPE_XHCI_TRB_SETUP_STAGE, hype_xhci_trb_type(t));
+    CHECK_HEX("setup bmReqType+bReq+wValue", 0x01000680u, t[0]);
+    CHECK_HEX("setup wIndex+wLength", (18u << 16) | 0u, t[1]);
+    CHECK_HEX("setup xfer len 8", 8u, t[2]);
+    CHECK_HEX("setup IDT set", 1u, (t[3] >> 6) & 1u);
+    CHECK_HEX("setup TRT=IN", HYPE_XHCI_TRT_IN, (t[3] >> 16) & 0x3u);
+
+    hype_xhci_trb_data_stage(t, 0xABCD000ull, 18, 1, 1);
+    CHECK_HEX("data type", HYPE_XHCI_TRB_DATA_STAGE, hype_xhci_trb_type(t));
+    CHECK_HEX("data buf low", 0xABCD000u, t[0]);
+    CHECK_HEX("data length", 18u, t[2] & 0x1FFFFu);
+    CHECK_HEX("data dir IN", 1u, (t[3] >> 16) & 1u);
+
+    hype_xhci_trb_status_stage(t, 0, 1, 1);
+    CHECK_HEX("status type", HYPE_XHCI_TRB_STATUS_STAGE, hype_xhci_trb_type(t));
+    CHECK_HEX("status dir OUT", 0u, (t[3] >> 16) & 1u);
+    CHECK_HEX("status IOC set", 1u, (t[3] >> 5) & 1u);
+
+    /* opposite branches: OUT data stage, and status stage dir-IN with no IOC */
+    hype_xhci_trb_data_stage(t, 0x5000ull, 64, 0, 0);
+    CHECK_HEX("data dir OUT", 0u, (t[3] >> 16) & 1u);
+    CHECK_HEX("data cycle 0", 0, hype_xhci_trb_cycle(t));
+    hype_xhci_trb_status_stage(t, 1, 0, 1);
+    CHECK_HEX("status dir IN", 1u, (t[3] >> 16) & 1u);
+    CHECK_HEX("status IOC clear", 0u, (t[3] >> 5) & 1u);
+
+    /* link with cycle 0 (opposite of the cmd-trb test's cycle 1) */
+    hype_xhci_trb_link(t, 0x8000ull, 0);
+    CHECK_HEX("link cycle 0", 0, hype_xhci_trb_cycle(t));
+}
+
+static void test_event_decode(void) {
+    uint32_t t[4] = {0, 0, 0, 0};
+    /* Command Completion Event: TRB ptr in dw0/1, CC in status[31:24],
+     * slot in control[31:24], type in [15:10]. */
+    t[0] = 0x9000u;
+    t[1] = 0x1u;
+    t[2] = (HYPE_XHCI_CC_SUCCESS << 24) | 0u;
+    t[3] = ((uint32_t)HYPE_XHCI_TRB_CMD_COMPLETION << 10) | (5u << 24) | 1u;
+    CHECK_HEX("event type", HYPE_XHCI_TRB_CMD_COMPLETION, hype_xhci_trb_type(t));
+    CHECK_HEX("event cc success", HYPE_XHCI_CC_SUCCESS, hype_xhci_event_cc(t));
+    CHECK_HEX("event slot id", 5u, hype_xhci_event_slot_id(t));
+    CHECK_HEX("event cycle", 1, hype_xhci_trb_cycle(t));
+    CHECK_HEX("event trb ptr", 0x100009000ull, hype_xhci_event_trb_ptr(t));
+
+    /* Port Status Change Event: Port ID in param[31:24]. */
+    t[0] = (3u << 24);
+    t[3] = ((uint32_t)HYPE_XHCI_TRB_PORT_STATUS << 10);
+    CHECK_HEX("port status type", HYPE_XHCI_TRB_PORT_STATUS, hype_xhci_trb_type(t));
+    CHECK_HEX("port id", 3u, hype_xhci_event_port_id(t));
+
+    /* Transfer Event residue in status[23:0]. */
+    t[2] = 0x000004u | (HYPE_XHCI_CC_SHORT_PACKET << 24);
+    CHECK_HEX("xfer residue", 4u, hype_xhci_event_xfer_residue(t));
+    CHECK_HEX("xfer short-packet cc", HYPE_XHCI_CC_SHORT_PACKET, hype_xhci_event_cc(t));
+}
+
+int main(void) {
+    test_reg_offsets();
+    test_cap_fields();
+    test_cmd_trbs();
+    test_control_transfer_trbs();
+    test_event_decode();
+
+    if (failures == 0) {
+        printf("all tests passed\n");
+        return 0;
+    }
+    printf("%d test(s) failed\n", failures);
+    return 1;
+}
