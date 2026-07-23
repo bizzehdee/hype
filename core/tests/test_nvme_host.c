@@ -1,7 +1,16 @@
 #include <stdio.h>
+#include <string.h>
 #include "../nvme_host.h"
 
 static int failures = 0;
+
+#define CHECK_STR(desc, expected, actual) \
+    do { \
+        if (strcmp((expected), (actual)) != 0) { \
+            printf("FAIL: %s: expected '%s', got '%s'\n", (desc), (expected), (actual)); \
+            failures++; \
+        } \
+    } while (0)
 
 #define CHECK_HEX(desc, expected, actual) \
     do { \
@@ -96,6 +105,28 @@ static void test_parse_identify_ns(void) {
               (unsigned long long)hype_nvme_parse_identify_ns(id, &blocks, &bs));
 }
 
+static void test_parse_identify_ctrl(void) {
+    uint8_t id[4096] = {0};
+    char sn[21], mn[41];
+    /* SN "QEMU-SCRATCH-01" left-justified, space-padded to 20 bytes @ off 4. */
+    memcpy(id + 4, "QEMU-SCRATCH-01     ", 20);
+    /* MN "QEMU NVMe Ctrl" padded to 40 bytes @ off 24. */
+    memcpy(id + 24, "QEMU NVMe Ctrl                          ", 40);
+    hype_nvme_parse_identify_ctrl(id, sn, mn);
+    CHECK_STR("nvme serial trimmed", "QEMU-SCRATCH-01", sn);
+    CHECK_STR("nvme model trimmed", "QEMU NVMe Ctrl", mn);
+
+    /* leading spaces also trimmed; NULL outputs are skipped safely */
+    memcpy(id + 4, "   PADSN            ", 20);
+    hype_nvme_parse_identify_ctrl(id, sn, NULL);
+    CHECK_STR("nvme serial leading trim", "PADSN", sn);
+
+    /* an all-spaces field yields an empty string */
+    memset(id + 4, ' ', 20);
+    hype_nvme_parse_identify_ctrl(id, sn, NULL);
+    CHECK_STR("nvme empty serial", "", sn);
+}
+
 static void test_cap_and_doorbell(void) {
     /* CAP with DSTRD (bits 35:32) = 2 => stride 4 << 2 = 16 bytes. */
     uint64_t cap = ((uint64_t)2u << 32);
@@ -115,6 +146,7 @@ int main(void) {
     test_write_sqe();
     test_identify_sqe();
     test_cqe_decode();
+    test_parse_identify_ctrl();
     test_parse_identify_ns();
     test_cap_and_doorbell();
 
