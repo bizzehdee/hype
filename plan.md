@@ -125,6 +125,7 @@ firmware runtime except UEFI Runtime Services we explicitly keep mapped
 ## 5. Multi-guest / multi-OS-family model
 
 - Config file (`hype.cfg`, simple key=value / TOML-ish, parsed by our own
+  <!-- Full extensible schema: docs/hype-cfg-spec.md (CONFIG-1 #220) -->
   tiny parser — no libc) enumerates guest definitions:
   ```
   [vm.win11]
