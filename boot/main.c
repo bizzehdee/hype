@@ -15,6 +15,8 @@
 #include "../core/mp.h"
 #include "../core/admission.h"
 #include "../core/cfg.h"
+#include "../core/phys_guard.h"
+#include "../core/phys_confirm.h"
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/ahci_host.h"
@@ -432,6 +434,15 @@ static char g_cmdline[HYPE_CMDLINE_MAX];
 static unsigned g_cmdline_len;
 static char g_cmd_result[96];
 
+/*
+ * M10-5 (#125): the one pending physical-write confirmation. A `physical:`
+ * target that has PASSED the #124 guard (identity match + non-empty/override)
+ * still may not be written until the operator, shown the real drive's
+ * model/serial/size on the dashboard, re-types its serial (`confirm <serial>`).
+ * Owner-core only, like the rest of the dashboard command state.
+ */
+static hype_phys_confirm_t g_phys_confirm;
+
 static int term_streq(const char *a, const char *b) {
     unsigned i = 0;
     for (; a[i] && b[i]; i++) {
@@ -469,7 +480,7 @@ static void term_run_cmdline(void) {
             break;
         case HYPE_CMD_HELP:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
-                          "cmds: list status start stop resume shutdown off focus <vm>");
+                          "cmds: list status start stop resume shutdown off focus <vm> | confirm <sn>");
             break;
         case HYPE_CMD_LIST:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%u VM(s) -- see table above",
@@ -525,6 +536,27 @@ static void term_run_cmdline(void) {
             g_term_view = idx;
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focused %s", nm);
             break;
+        case HYPE_CMD_CONFIRM: {
+            /* M10-5: the operator authorises the pending physical write by
+             * re-typing the target drive's serial. Only phys_confirm's ACCEPTED
+             * state lets the install path later pass operator_confirmed=1 to the
+             * #124 guard -- this command never writes to the disk itself. */
+            hype_phys_confirm_submit_t sr =
+                hype_phys_confirm_submit(&g_phys_confirm, c.has_arg ? c.arg : "");
+            if (sr == HYPE_PHYS_CONFIRM_SUBMIT_NONE_PENDING) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "confirm: no physical write pending");
+            } else if (sr == HYPE_PHYS_CONFIRM_SUBMIT_ACCEPTED) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "physical write CONFIRMED for '%s'", g_phys_confirm.vm_name);
+                hype_debug_print("phys-write: operator CONFIRMED via dashboard -- vm '%s' sn '%s'\n",
+                                 g_phys_confirm.vm_name, g_phys_confirm.serial);
+            } else {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "confirm: serial mismatch -- type: confirm <drive-serial>");
+            }
+            break;
+        }
         case HYPE_CMD_UNKNOWN:
         default:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "unknown command (try 'help')");
@@ -5215,8 +5247,19 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
             hype_gop_console_clear(&g_gop_console);
             *term_last_view = -1;
         }
-        hype_dashboard_render(&g_dashboard_term, info, ninfo, vm->stat_uptime_ms / 1000u,
-                              g_cmdline, g_cmd_result);
+        {
+            /* M10-5: a pending/accepted physical-write confirmation is the most
+             * important thing on screen, so it takes over the footer result
+             * line (drive model/serial/size + the exact command to type). */
+            const char *result_line = g_cmd_result;
+            static char confirm_footer[192];
+            if (g_phys_confirm.state != HYPE_PHYS_CONFIRM_IDLE) {
+                result_line = hype_phys_confirm_prompt(&g_phys_confirm, confirm_footer,
+                                                       sizeof(confirm_footer));
+            }
+            hype_dashboard_render(&g_dashboard_term, info, ninfo, vm->stat_uptime_ms / 1000u,
+                                  g_cmdline, result_line);
+        }
         hype_vt_render(&g_dashboard_term, &g_gop_console, 0);
         hype_debug_flush_gop();
     }
@@ -8334,6 +8377,58 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     }
 }
 
+/*
+ * M10-5 (#125): the one pending physical-write confirmation. A `physical:`
+ * target that has PASSED the #124 guard (identity match + non-empty/override)
+ * M10-5 (#125): given a REAL enumerated physical drive (serial + model + LBA
+ * capacity + optional GPT GUID + its first two sectors), test every configured
+ * `physical:` target against it with the #124 arm-time guard
+ * (operator_confirmed=0) and, for the VM whose target this drive satisfies
+ * pending only confirmation, arm the interactive dashboard confirmation. A
+ * drive that fails identity match, or is non-empty without allow_overwrite, is
+ * logged and NEVER armed -- a config entry alone is never sufficient (§6d/§10).
+ * Called from the host-AHCI enumeration path with the identity it already reads.
+ */
+static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_serial,
+                                       const char *drive_model, uint64_t total_sectors,
+                                       const uint8_t *disk_guid, const uint8_t *sector0,
+                                       const uint8_t *sector1) {
+    unsigned int vi;
+    if (!cfg) return;
+    for (vi = 0; vi < cfg->vm_count; vi++) {
+        const hype_cfg_vm_t *v = &cfg->vms[vi];
+        const hype_cfg_target_disk_t *d = &v->target_disk;
+        hype_phys_guard_result_t r;
+        if (d->kind != HYPE_CFG_DISK_PHYSICAL || d->path_or_id[0] == '\0') {
+            continue;
+        }
+        r = hype_phys_guard_arm(d->path_or_id, drive_serial, disk_guid, sector0, sector1,
+                                d->allow_overwrite, /*operator_confirmed=*/0);
+        if (r == HYPE_PHYS_GUARD_DENY_ID_MISMATCH) {
+            hype_debug_print("phys-write: vm '%s' target '%s' != enumerated drive (sn '%s') "
+                             "-- not armed\n", v->name, d->path_or_id,
+                             drive_serial ? drive_serial : "(none)");
+            continue;
+        }
+        if (r == HYPE_PHYS_GUARD_DENY_NONEMPTY) {
+            hype_debug_print("phys-write: vm '%s' target '%s' drive is NOT BLANK and "
+                             "allow_overwrite is unset -- refusing (not armed)\n",
+                             v->name, d->path_or_id);
+            continue;
+        }
+        /* identity matched + disk state OK (guard returned NEEDS_CONFIRM): the
+         * only remaining gate is the operator's interactive confirmation. */
+        hype_phys_confirm_request(&g_phys_confirm, v->name, drive_model, drive_serial,
+                                  total_sectors * 512ull);
+        {
+            char pbuf[192];
+            hype_debug_print("phys-write: %s\n",
+                             hype_phys_confirm_prompt(&g_phys_confirm, pbuf, sizeof(pbuf)));
+        }
+        return; /* at most one pending confirmation at a time */
+    }
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -9212,21 +9307,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * only for now -- no consumer writes to the disk yet. */
                 {
                     static uint8_t g_hostdisk_id[512] __attribute__((aligned(4096)));
+                    static uint8_t g_hostdisk_lba1[512] __attribute__((aligned(4096)));
                     if (hype_ahci_host_identify(hs.bar_phys, (unsigned)sp, g_hostdisk_id) == 0) {
                         hype_host_disk_info_t di;
                         uint8_t guid[16];
+                        int have_guid = 0;
                         hype_ahci_host_parse_identify(g_hostdisk_id, &di);
                         hype_debug_print("host-disk: serial='%s' model='%s' sectors=%llu (%llu MiB)\n",
                                          di.serial, di.model,
                                          (unsigned long long)di.total_sectors,
                                          (unsigned long long)(di.total_sectors / 2048ull));
                         if (hype_gpt_disk_guid(hostdisk_read, 0, guid) == 0) {
+                            have_guid = 1;
                             hype_debug_print(
                                 "host-disk: gpt-guid %02x%02x%02x%02x-%02x%02x-%02x%02x-"
                                 "%02x%02x-%02x%02x%02x%02x%02x%02x\n",
                                 guid[0], guid[1], guid[2], guid[3], guid[4], guid[5], guid[6],
                                 guid[7], guid[8], guid[9], guid[10], guid[11], guid[12], guid[13],
                                 guid[14], guid[15]);
+                        }
+                        /* M10-5 (#125): match this REAL drive against every
+                         * configured `physical:` target and, if one passes the
+                         * #124 identity + non-empty guard, arm the interactive
+                         * dashboard confirmation. Needs the first two sectors:
+                         * LBA0 is g_hostdisk_probe (read above); read LBA1 (the
+                         * GPT header) here for the guard's non-empty check. */
+                        if (hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 1u, 1u,
+                                                g_hostdisk_lba1) != 0) {
+                            hype_serial_print("host-disk: LBA1 read failed -- phys-write not armed\n");
+                        } else {
+                            arm_physical_write_confirm(&g_hype_cfg, di.serial, di.model,
+                                                       di.total_sectors, have_guid ? guid : 0,
+                                                       g_hostdisk_probe, g_hostdisk_lba1);
                         }
                     } else {
                         hype_serial_print("host-disk: IDENTIFY failed\n");
