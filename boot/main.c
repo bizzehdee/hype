@@ -64,6 +64,12 @@
  * core). The machinery they check is HW-proven, so off by default. */
 #define HYPE_RUN_SELFTEST_GUESTS 0
 
+/* M10-1c (#197): a DESTRUCTIVE write-readback self-test of the host NVMe write
+ * path, against a scratch LBA on the enumerated NVMe controller. OFF by default
+ * -- it writes to a real drive when one is present, so only enable it for a
+ * QEMU boot with a `-device nvme` SCRATCH disk, NEVER on real hardware. */
+#define HYPE_NVME_WRITE_SELFTEST 0
+
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
 static hype_gdt_entry_t g_gdt[HYPE_GDT_ENTRY_COUNT];
@@ -9053,6 +9059,31 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             } else {
                 hype_serial_print("host-nvme: LBA0 read FAILED\n");
             }
+#if HYPE_NVME_WRITE_SELFTEST
+            {
+                static uint8_t g_nvme_wr[512] __attribute__((aligned(4096)));
+                static uint8_t g_nvme_rd[512] __attribute__((aligned(4096)));
+                uint64_t test_lba = 2048u; /* scratch region, well past any MBR/GPT */
+                unsigned k;
+                int ok = 1;
+                for (k = 0; k < 512u; k++) {
+                    g_nvme_wr[k] = (uint8_t)(0xA5u ^ (k & 0xFFu));
+                }
+                if (hype_nvme_host_write(hn.bar_phys, test_lba, 1u, g_nvme_wr) != 0) {
+                    hype_serial_print("host-nvme: WRITE-SELFTEST write FAILED\n");
+                } else if (hype_nvme_host_read(hn.bar_phys, test_lba, 1u, g_nvme_rd) != 0) {
+                    hype_serial_print("host-nvme: WRITE-SELFTEST readback FAILED\n");
+                } else {
+                    for (k = 0; k < 512u; k++) {
+                        if (g_nvme_rd[k] != g_nvme_wr[k]) { ok = 0; break; }
+                    }
+                    hype_debug_print(
+                        "host-nvme: WRITE-SELFTEST lba=%llu roundtrip %s (b0=%02x b511=%02x)\n",
+                        (unsigned long long)test_lba, ok ? "OK" : "MISMATCH",
+                        (unsigned)g_nvme_rd[0], (unsigned)g_nvme_rd[511]);
+                }
+            }
+#endif
         }
     }
 

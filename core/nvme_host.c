@@ -40,6 +40,19 @@ void hype_nvme_build_read_sqe(uint8_t sqe[64], uint16_t cid, uint32_t nsid, uint
     put_le32(sqe + 48, (uint32_t)nlb_0based); /* CDW12[15:0]: 0-based block count */
 }
 
+void hype_nvme_build_write_sqe(uint8_t sqe[64], uint16_t cid, uint32_t nsid, uint64_t slba,
+                               uint16_t nlb_0based, uint64_t prp1, uint64_t prp2) {
+    zero_sqe(sqe);
+    sqe[0] = HYPE_NVME_IO_WRITE;        /* CDW0: opcode 0x01 */
+    sqe[2] = (uint8_t)cid;              /* CDW0[31:16]: command id */
+    sqe[3] = (uint8_t)(cid >> 8);
+    put_le32(sqe + 4, nsid);            /* CDW1: NSID */
+    put_le64(sqe + 24, prp1);           /* PRP1 */
+    put_le64(sqe + 32, prp2);           /* PRP2 */
+    put_le64(sqe + 40, slba);           /* CDW10-11: starting LBA */
+    put_le32(sqe + 48, (uint32_t)nlb_0based); /* CDW12[15:0]: 0-based block count */
+}
+
 void hype_nvme_build_identify_sqe(uint8_t sqe[64], uint16_t cid, uint32_t cns, uint32_t nsid,
                                   uint64_t prp1) {
     zero_sqe(sqe);

@@ -1,5 +1,6 @@
 #include "blk_phys.h"
 #include "ahci_host.h"
+#include "nvme_host.h"
 
 /*
  * Coverage-exempt runtime binding for the physical blk_backend: the injected
@@ -25,4 +26,21 @@ void hype_blk_phys_ahci_init(hype_blk_phys_t *p, hype_blk_phys_ahci_t *hw, hype_
     hw->abar_phys = abar_phys;
     hw->port = port;
     hype_blk_phys_init(p, be, ahci_read_adapter, ahci_write_adapter, hw, total_sectors);
+}
+
+/* M10-1c (#197): NVMe adapters -- same shape, driving core/nvme_host's MMIO. */
+static int nvme_read_adapter(void *hw, uint64_t lba, uint32_t count, void *buf) {
+    hype_blk_phys_nvme_t *a = (hype_blk_phys_nvme_t *)hw;
+    return hype_nvme_host_read(a->abar_phys, lba, (uint16_t)count, buf);
+}
+
+static int nvme_write_adapter(void *hw, uint64_t lba, uint32_t count, const void *buf) {
+    hype_blk_phys_nvme_t *a = (hype_blk_phys_nvme_t *)hw;
+    return hype_nvme_host_write(a->abar_phys, lba, (uint16_t)count, buf);
+}
+
+void hype_blk_phys_nvme_init(hype_blk_phys_t *p, hype_blk_phys_nvme_t *hw, hype_blk_backend_t *be,
+                             uint64_t abar_phys, uint64_t total_sectors) {
+    hw->abar_phys = abar_phys;
+    hype_blk_phys_init(p, be, nvme_read_adapter, nvme_write_adapter, hw, total_sectors);
 }

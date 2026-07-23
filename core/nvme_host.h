@@ -39,6 +39,7 @@
 #define HYPE_NVME_ADM_CREATE_IO_CQ 0x05u
 #define HYPE_NVME_ADM_IDENTIFY 0x06u
 #define HYPE_NVME_IO_READ 0x02u
+#define HYPE_NVME_IO_WRITE 0x01u
 #define HYPE_NVME_CNS_NAMESPACE 0x00u
 #define HYPE_NVME_CNS_CONTROLLER 0x01u
 
@@ -55,6 +56,14 @@
  */
 void hype_nvme_build_read_sqe(uint8_t sqe[64], uint16_t cid, uint32_t nsid, uint64_t slba,
                               uint16_t nlb_0based, uint64_t prp1, uint64_t prp2);
+
+/*
+ * M10-1c (#197): builds a 64-byte WRITE (I/O) Submission Queue Entry -- identical
+ * field layout to READ but opcode 0x01 (data flows guest/host -> device). Zeroes
+ * the whole entry first. Pure.
+ */
+void hype_nvme_build_write_sqe(uint8_t sqe[64], uint16_t cid, uint32_t nsid, uint64_t slba,
+                               uint16_t nlb_0based, uint64_t prp1, uint64_t prp2);
 
 /*
  * Builds a 64-byte IDENTIFY Submission Queue Entry: opcode 0x06, `cns`
@@ -104,5 +113,15 @@ int hype_nvme_host_init(uint64_t abar_phys);
  * timeout or an NVMe error. Signature matches hype_ahci_host_read.
  */
 int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *dst);
+
+/*
+ * M10-1c (#197): writes `count` 512-byte sectors from `src` to LBA `lba` on the
+ * initialised controller, via I/O WRITE commands polled to completion (DMA
+ * bounced through the page-aligned host buffer, PRP1/PRP2/PRP-list like the
+ * read path). Returns 0 on success, -1 on timeout or an NVMe error. DESTRUCTIVE
+ * -- gated by the §6d/phys_guard policy at the caller, never issued blindly.
+ * Signature matches hype_ahci_host_write.
+ */
+int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const void *src);
 
 #endif /* HYPE_CORE_NVME_HOST_H */

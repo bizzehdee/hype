@@ -197,3 +197,45 @@ int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *
     }
     return 0;
 }
+
+/* M10-1c (#197): mirror of hype_nvme_host_read with a WRITE (0x01) SQE and the
+ * copy direction reversed -- src is staged into the DMA bounce buffer BEFORE the
+ * command is submitted. DESTRUCTIVE; caller must have passed the §6d/phys_guard
+ * gate. */
+int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const void *src) {
+    volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)abar_phys;
+    const uint8_t *in = (const uint8_t *)src;
+    uint16_t done = 0;
+
+    while (done < count) {
+        uint16_t nsec = (uint16_t)((count - done > BOUNCE_SECTORS) ? BOUNCE_SECTORS
+                                                                   : (count - done));
+        uint32_t bytes = (uint32_t)nsec * HYPE_NVME_SECTOR_SIZE;
+        uint32_t pages = (bytes + PAGE - 1u) / PAGE;
+        uint64_t prp1 = phys(g_bounce);
+        uint64_t prp2 = 0;
+        uint8_t sqe[64];
+        uint32_t i;
+
+        for (i = 0; i < bytes; i++) {
+            g_bounce[i] = in[i];
+        }
+        if (pages == 2u) {
+            prp2 = phys(g_bounce) + PAGE;
+        } else if (pages > 2u) {
+            for (i = 0; i + 1u < pages; i++) {
+                *(uint64_t *)(g_prp_list + i * 8u) = phys(g_bounce) + (uint64_t)(i + 1u) * PAGE;
+            }
+            prp2 = phys(g_prp_list);
+        }
+
+        hype_nvme_build_write_sqe(sqe, ++g_cid, 1u, lba + done, (uint16_t)(nsec - 1u), prp1, prp2);
+        if (submit_and_poll(bar, g_io_sq, g_io_cq, 1, &g_io_sq_tail, &g_io_cq_head, &g_io_phase,
+                            sqe) != 0) {
+            return -1;
+        }
+        in += bytes;
+        done = (uint16_t)(done + nsec);
+    }
+    return 0;
+}

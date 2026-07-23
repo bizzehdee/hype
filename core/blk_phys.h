@@ -63,4 +63,19 @@ typedef struct {
 void hype_blk_phys_ahci_init(hype_blk_phys_t *p, hype_blk_phys_ahci_t *hw, hype_blk_backend_t *be,
                              uint64_t abar_phys, unsigned port, uint64_t total_sectors);
 
+/* M10-1c (#197): NVMe counterpart. Owns the controller BAR0 the adapter
+ * callbacks drive. Caller-allocated, must outlive the backend. */
+typedef struct {
+    uint64_t abar_phys; /* NVMe BAR0 (already hype_nvme_host_init'd) */
+} hype_blk_phys_nvme_t;
+
+/*
+ * Binds `be` to an NVMe namespace-1 disk at `abar_phys` (already
+ * hype_nvme_host_init'd), with `total_sectors` the namespace's real IDENTIFY
+ * capacity. read/write go through hype_nvme_host_read/write. DESTRUCTIVE on
+ * write -- same §6d/phys_guard contract as the AHCI path.
+ */
+void hype_blk_phys_nvme_init(hype_blk_phys_t *p, hype_blk_phys_nvme_t *hw, hype_blk_backend_t *be,
+                             uint64_t abar_phys, uint64_t total_sectors);
+
 #endif /* HYPE_CORE_BLK_PHYS_H */

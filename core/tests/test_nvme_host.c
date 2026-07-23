@@ -31,6 +31,19 @@ static void test_read_sqe(void) {
     CHECK_HEX("read nlb (0-based, 8 blocks)", 7u, rd16(sqe + 48));
 }
 
+static void test_write_sqe(void) {
+    uint8_t sqe[64];
+    hype_nvme_build_write_sqe(sqe, /*cid=*/0x2345, /*nsid=*/1, /*slba=*/0x00B0C0D0E0ull,
+                              /*nlb_0based=*/15, /*prp1=*/0xDEAD000ull, /*prp2=*/0xF00D000ull);
+    CHECK_HEX("write opcode 0x01", 0x01u, sqe[0]);
+    CHECK_HEX("write cid", 0x2345u, rd16(sqe + 2));
+    CHECK_HEX("write nsid", 1u, rd32(sqe + 4));
+    CHECK_HEX("write prp1", 0xDEAD000ull, rd64(sqe + 24));
+    CHECK_HEX("write prp2", 0xF00D000ull, rd64(sqe + 32));
+    CHECK_HEX("write slba", 0x00B0C0D0E0ull, rd64(sqe + 40));
+    CHECK_HEX("write nlb (0-based, 16 blocks)", 15u, rd16(sqe + 48));
+}
+
 static void test_identify_sqe(void) {
     uint8_t sqe[64];
     hype_nvme_build_identify_sqe(sqe, /*cid=*/0x9, /*cns=*/HYPE_NVME_CNS_NAMESPACE, /*nsid=*/1,
@@ -99,6 +112,7 @@ static void test_cap_and_doorbell(void) {
 
 int main(void) {
     test_read_sqe();
+    test_write_sqe();
     test_identify_sqe();
     test_cqe_decode();
     test_parse_identify_ns();
