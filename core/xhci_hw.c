@@ -49,6 +49,87 @@ static int wait_bits(volatile uint8_t *bar, uint32_t off, uint32_t mask, uint32_
 }
 static void short_delay(void) { volatile unsigned s = 200000u; while (s-- != 0u) { } }
 
+/* --- command + event ring state (single controller) --- */
+static unsigned int g_cmd_enq;   /* command-ring enqueue index */
+static unsigned int g_cmd_cyc;   /* command-ring producer cycle bit */
+static unsigned int g_evt_deq;   /* event-ring dequeue index */
+static unsigned int g_evt_cyc;   /* event-ring consumer cycle bit */
+
+static void ring_state_reset(void) { g_cmd_enq = 0; g_cmd_cyc = 1; g_evt_deq = 0; g_evt_cyc = 1; }
+
+/* Volatile read of dword `dw` of TRB `idx` in a ring (controller DMAs into it). */
+static uint32_t trb_dw(const uint8_t *ring, unsigned int idx, unsigned int dw) {
+    return *(volatile uint32_t *)(ring + idx * HYPE_XHCI_TRB_BYTES + dw * 4u);
+}
+
+/* Enqueue a fully-built command TRB (cycle already stamped by the caller as
+ * g_cmd_cyc) onto the command ring, handling the Link-TRB wrap. */
+static void cmd_enqueue(const uint32_t trb[4]) {
+    uint8_t *slot = g_cmd_ring + g_cmd_enq * HYPE_XHCI_TRB_BYTES;
+    put_le32(slot + 0, trb[0]);
+    put_le32(slot + 4, trb[1]);
+    put_le32(slot + 8, trb[2]);
+    put_le32(slot + 12, trb[3]);
+    g_cmd_enq++;
+    if (g_cmd_enq == RING_TRBS - 1u) { /* reached the Link TRB slot */
+        uint32_t link[4];
+        hype_xhci_trb_link(link, phys(g_cmd_ring), g_cmd_cyc); /* match current producer cycle */
+        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
+        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
+        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
+        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
+        g_cmd_enq = 0;
+        g_cmd_cyc ^= 1u;
+    }
+}
+
+/* Poll the event ring for the next valid event (cycle == consumer cycle),
+ * copy it to out[4], advance the dequeue pointer + ERDP. -1 on timeout. */
+static int next_event(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
+    unsigned int spins = SPIN;
+    while (spins-- != 0u) {
+        uint32_t d3 = trb_dw(g_evt_ring, g_evt_deq, 3);
+        if ((int)(d3 & 1u) == (int)g_evt_cyc) {
+            out[0] = trb_dw(g_evt_ring, g_evt_deq, 0);
+            out[1] = trb_dw(g_evt_ring, g_evt_deq, 1);
+            out[2] = trb_dw(g_evt_ring, g_evt_deq, 2);
+            out[3] = d3;
+            g_evt_deq++;
+            if (g_evt_deq >= RING_TRBS) { g_evt_deq = 0; g_evt_cyc ^= 1u; }
+            /* ERDP = address of the new dequeue slot, with EHB (bit3) written 1 to clear. */
+            wr64(bar, hype_xhci_ir0_offset(rtsoff, HYPE_XHCI_IR_ERDP),
+                 (phys(g_evt_ring) + (uint64_t)g_evt_deq * HYPE_XHCI_TRB_BYTES) | (1u << 3));
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Enqueue a command TRB, ring the command doorbell (DB[0]), and consume events
+ * until the matching Command Completion Event. Returns it in evt[4], or -1. */
+static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]) {
+    volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    unsigned int guard = 64u; /* bound the number of skipped (e.g. port-change) events */
+    cmd_enqueue(cmd);
+    wr32(bar, hype_xhci_doorbell_offset(c->dboff, 0), 0u); /* command doorbell, target 0 */
+    while (guard-- != 0u) {
+        if (next_event(bar, c->rtsoff, evt) != 0) return -1;
+        if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_CMD_COMPLETION) return 0;
+        /* else: a Port Status Change or other event queued earlier -- skip it. */
+    }
+    return -1;
+}
+
+int hype_xhci_enable_slot(hype_xhci_ctrl_t *c, unsigned int *out_slot) {
+    uint32_t cmd[4], evt[4];
+    if (!c->inited) return -1;
+    hype_xhci_trb_enable_slot(cmd, (int)g_cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    if (out_slot) *out_slot = hype_xhci_event_slot_id(evt);
+    return 0;
+}
+
 int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)bar_phys;
     uint8_t caplen = rd8(bar, HYPE_XHCI_CAP_CAPLENGTH);
@@ -133,6 +214,7 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
          rd32(bar, op + HYPE_XHCI_OP_USBCMD) | HYPE_XHCI_USBCMD_RS);
     if (wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_HCH, 0) != 0) return -1;
 
+    ring_state_reset();
     out->inited = 1;
     return 0;
 }

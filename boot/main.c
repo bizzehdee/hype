@@ -9441,8 +9441,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  xc.max_slots, xc.max_ports, xc.ctx_size);
                 port = hype_xhci_detect_device(&xc, &speed);
                 if (port) {
+                    unsigned int slot = 0;
                     hype_debug_print("host-xhci: USB device attached at port %u (speed id %u)\n",
                                      port, speed);
+                    /* Exercise the command+event ring: ask the controller for a
+                     * device slot. Proves ring machinery before Address Device. */
+                    if (hype_xhci_enable_slot(&xc, &slot) == 0) {
+                        hype_debug_print("host-xhci: Enable Slot OK -- device slot id %u\n", slot);
+                    } else {
+                        hype_serial_print("host-xhci: Enable Slot FAILED\n");
+                    }
                 } else {
                     hype_debug_print("host-xhci: no USB device attached on any root port\n");
                 }

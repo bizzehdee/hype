@@ -192,4 +192,12 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out);
  */
 unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_speed);
 
+/*
+ * USB-1 (#213) pt3: issue an Enable Slot command on the command ring and wait
+ * (via the event ring) for its Command Completion Event. On success stores the
+ * assigned device slot id (1..MaxSlots) in *out_slot and returns 0; returns -1
+ * on a command error or timeout. Exercises the command+event ring machinery.
+ */
+int hype_xhci_enable_slot(hype_xhci_ctrl_t *c, unsigned int *out_slot);
+
 #endif /* HYPE_CORE_XHCI_H */
