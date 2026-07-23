@@ -159,11 +159,21 @@ static void test_context_encoders(void) {
     CHECK_HEX("icc drop flags 0", 0u, c[0]);
     CHECK_HEX("icc add flags A0|A1", 0x3u, c[1]);
 
-    /* route 0, speed 4 (SS), ctx entries 1, root port 3 */
-    hype_xhci_slot_ctx(c, 0, 4, 1, 3);
+    /* route 0, speed 4 (SS), ctx entries 1, root port 3, no TT */
+    hype_xhci_slot_ctx(c, 0, 4, 1, 3, 0, 0);
     CHECK_HEX("slot speed field", 4u, (c[0] >> 20) & 0xFu);
     CHECK_HEX("slot ctx entries", 1u, (c[0] >> 27) & 0x1Fu);
     CHECK_HEX("slot root port", 3u, (c[1] >> 16) & 0xFFu);
+    CHECK_HEX("slot no TT", 0u, c[2]);
+    /* route 0x21 (tier2 port2, tier1 port1), FS behind HS hub slot 4 port 3 */
+    hype_xhci_slot_ctx(c, 0x21, 1, 1, 7, 4, 3);
+    CHECK_HEX("slot route string", 0x21u, c[0] & 0xFFFFFu);
+    CHECK_HEX("slot TT hub slot", 4u, c[2] & 0xFFu);
+    CHECK_HEX("slot TT port", 3u, (c[2] >> 8) & 0xFFu);
+
+    CHECK_HEX("route tier1 port5", 0x5u, hype_xhci_route_append(0, 1, 5));
+    CHECK_HEX("route tier2 port2 on 0x5", 0x25u, hype_xhci_route_append(0x5u, 2, 2));
+    CHECK_HEX("route tier0 ignored", 0x5u, hype_xhci_route_append(0x5u, 0, 9));
 
     /* EP0: MPS 512, TR dequeue 0x9000, DCS 1 */
     hype_xhci_ep0_ctx(c, 512, 0x9000ull, 1);
@@ -183,6 +193,33 @@ static void test_context_encoders(void) {
     CHECK_HEX("mps Low", 8u, hype_xhci_default_mps(2));
     CHECK_HEX("mps High", 64u, hype_xhci_default_mps(3));
     CHECK_HEX("mps Full default", 64u, hype_xhci_default_mps(1));
+}
+
+static void test_hub_helpers(void) {
+    uint8_t devdesc[18] = {0};
+    uint8_t hubdesc[8] = {0};
+
+    /* Device-descriptor class byte (offset 4) drives hub detection. */
+    devdesc[4] = HYPE_USB_CLASS_HUB;
+    CHECK_HEX("dev is hub", 1u, (unsigned)hype_xhci_dev_is_hub(devdesc));
+    devdesc[4] = HYPE_USB_CLASS_MSC;
+    CHECK_HEX("dev not hub", 0u, (unsigned)hype_xhci_dev_is_hub(devdesc));
+
+    /* bNbrPorts (hub descriptor offset 2), clamped at 15. */
+    hubdesc[2] = 4u;
+    CHECK_HEX("hub 4 ports", 4u, hype_xhci_hub_nbr_ports(hubdesc));
+    hubdesc[2] = 200u;
+    CHECK_HEX("hub ports clamp", 15u, hype_xhci_hub_nbr_ports(hubdesc));
+
+    /* TT is required only for a LS/FS device behind a HS hub. */
+    CHECK_HEX("TT HS->FS", 1u,
+              (unsigned)hype_xhci_tt_required(HYPE_USB_SPEED_HIGH, HYPE_USB_SPEED_FULL));
+    CHECK_HEX("TT HS->LS", 1u,
+              (unsigned)hype_xhci_tt_required(HYPE_USB_SPEED_HIGH, HYPE_USB_SPEED_LOW));
+    CHECK_HEX("TT HS->HS no", 0u,
+              (unsigned)hype_xhci_tt_required(HYPE_USB_SPEED_HIGH, HYPE_USB_SPEED_HIGH));
+    CHECK_HEX("TT SS->FS no", 0u,
+              (unsigned)hype_xhci_tt_required(4u, HYPE_USB_SPEED_FULL));
 }
 
 static void test_msc_config_parse(void) {
@@ -265,6 +302,7 @@ static void test_msc_config_parse(void) {
 int main(void) {
     test_reg_offsets();
     test_context_encoders();
+    test_hub_helpers();
     test_msc_config_parse();
     test_cap_fields();
     test_cmd_trbs();

@@ -22,13 +22,41 @@ static uint8_t g_evt_ring[XPAGE] __attribute__((aligned(XPAGE)));    /* event ri
 static uint8_t g_erst[64] __attribute__((aligned(64)));              /* event ring segment table */
 static uint8_t g_scratch_arr[XPAGE] __attribute__((aligned(XPAGE))); /* scratchpad buffer array */
 static uint8_t g_scratch_pages[MAX_SCRATCH][XPAGE] __attribute__((aligned(XPAGE)));
-/* pt3b: one addressed device's Input/Device contexts, EP0 ring + a transfer buf. */
+/* Device pool: hub descent (#231 pt5b) needs several devices addressed at once
+ * (a hub plus the device behind it), so each addressed device owns its own
+ * Device Context + EP0 ring + ring cursor, keyed by its slot id. The Input
+ * Context is shared -- the controller only reads it transiently during Address
+ * Device / Configure Endpoint. */
+#define DEVPOOL 8u
 static uint8_t g_input_ctx[XPAGE] __attribute__((aligned(XPAGE)));
-static uint8_t g_dev_ctx[XPAGE] __attribute__((aligned(XPAGE)));
-static uint8_t g_ep0_ring[XPAGE] __attribute__((aligned(XPAGE)));
+static uint8_t g_dev_ctx[DEVPOOL][XPAGE] __attribute__((aligned(XPAGE)));
+static uint8_t g_ep0_ring[DEVPOOL][XPAGE] __attribute__((aligned(XPAGE)));
 static uint8_t g_xfer_buf[XPAGE] __attribute__((aligned(XPAGE)));
-static unsigned int g_ep0_enq;
-static unsigned int g_ep0_cyc;
+static unsigned int g_ep0_enq[DEVPOOL];
+static unsigned int g_ep0_cyc[DEVPOOL];
+static unsigned int g_dev_used[DEVPOOL];      /* 1 if this pool slot is in use */
+static unsigned int g_slot_dev[256];          /* slot id -> pool index + 1 (0 = none) */
+
+static int dev_alloc(unsigned int slot) {
+    unsigned int i;
+    for (i = 0; i < DEVPOOL; i++) {
+        if (!g_dev_used[i]) {
+            g_dev_used[i] = 1;
+            g_slot_dev[slot & 0xFFu] = i + 1u;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+static int dev_index(unsigned int slot) {
+    unsigned int v = g_slot_dev[slot & 0xFFu];
+    return v ? (int)(v - 1u) : -1;
+}
+static void dev_free(unsigned int slot) {
+    int i = dev_index(slot);
+    if (i >= 0) g_dev_used[i] = 0;
+    g_slot_dev[slot & 0xFFu] = 0;
+}
 /* MSC bulk endpoint transfer rings. */
 static uint8_t g_bulk_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
 static uint8_t g_bulk_out_ring[XPAGE] __attribute__((aligned(XPAGE)));
@@ -158,49 +186,57 @@ static void write_ctx(uint8_t *base, unsigned int off, const uint32_t c[8]) {
     for (i = 0; i < 8u; i++) put_le32(base + off + i * 4u, c[i]);
 }
 
-static void ep0_enqueue(const uint32_t trb[4]) {
-    ring_enqueue(g_ep0_ring, &g_ep0_enq, &g_ep0_cyc, trb);
+static void ep0_enqueue(unsigned int di, const uint32_t trb[4]) {
+    ring_enqueue(g_ep0_ring[di], &g_ep0_enq[di], &g_ep0_cyc[di], trb);
 }
 
-int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int root_port,
-                             unsigned int speed) {
+int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
+                             const hype_xhci_devpath_t *path) {
     unsigned int cs = c->ctx_size;
     uint32_t ctx[8];
     uint32_t cmd[4], evt[4];
+    int di;
+    uint8_t *dctx, *ep0;
 
     if (!c->inited || slot == 0u) return -1;
+    di = dev_index(slot);
+    if (di < 0) di = dev_alloc(slot);
+    if (di < 0) return -1; /* device pool exhausted */
+    dctx = g_dev_ctx[di];
+    ep0 = g_ep0_ring[di];
 
-    /* Fresh Input/Device contexts + EP0 transfer ring (Link TRB at the end). */
+    /* Fresh Input/Device contexts + this device's EP0 transfer ring. */
     zero(g_input_ctx, XPAGE);
-    zero(g_dev_ctx, XPAGE);
-    zero(g_ep0_ring, XPAGE);
+    zero(dctx, XPAGE);
+    zero(ep0, XPAGE);
     {
         uint32_t link[4];
-        hype_xhci_trb_link(link, phys(g_ep0_ring), 1);
-        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
-        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
-        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
-        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
+        hype_xhci_trb_link(link, phys(ep0), 1);
+        put_le32(ep0 + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
+        put_le32(ep0 + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
+        put_le32(ep0 + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
+        put_le32(ep0 + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
     }
-    g_ep0_enq = 0;
-    g_ep0_cyc = 1;
+    g_ep0_enq[di] = 0;
+    g_ep0_cyc[di] = 1;
 
     /* Input Control Context (offset 0): add the slot + EP0 contexts. */
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | HYPE_XHCI_ADD_EP0, 0);
     write_ctx(g_input_ctx, 0, ctx);
-    /* Slot Context (offset 1*ctx_size): route 0, 1 valid context entry (EP0). */
-    hype_xhci_slot_ctx(ctx, 0, speed, 1, root_port);
+    /* Slot Context (offset 1*ctx_size): full topology, 1 valid context entry (EP0). */
+    hype_xhci_slot_ctx(ctx, path->route, path->speed, 1, path->root_port,
+                       path->tt_hub_slot, path->tt_port);
     write_ctx(g_input_ctx, cs, ctx);
     /* EP0 Context (offset 2*ctx_size). */
-    hype_xhci_ep0_ctx(ctx, hype_xhci_default_mps(speed), phys(g_ep0_ring), 1);
+    hype_xhci_ep0_ctx(ctx, hype_xhci_default_mps(path->speed), phys(ep0), 1);
     write_ctx(g_input_ctx, 2u * cs, ctx);
 
-    /* DCBAA[slot] -> the output Device Context. */
-    put_le64(g_dcbaa + slot * 8u, phys(g_dev_ctx));
+    /* DCBAA[slot] -> this device's output Device Context. */
+    put_le64(g_dcbaa + slot * 8u, phys(dctx));
 
     hype_xhci_trb_address_device(cmd, phys(g_input_ctx), slot, 0, (int)g_cmd_cyc);
-    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
-    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    if (cmd_submit_wait(c, cmd, evt) != 0) { dev_free(slot); return -1; }
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) { dev_free(slot); return -1; }
     return 0;
 }
 
@@ -217,8 +253,11 @@ static int control_transfer(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t bm_r
     uint32_t t[4], evt[4];
     unsigned int guard = 64u;
     unsigned int trt, status_dir_in, i;
+    int di;
 
     if (!c->inited || slot == 0u || len > XPAGE) return -1;
+    di = dev_index(slot);
+    if (di < 0) return -1;
     trt = (len == 0u) ? HYPE_XHCI_TRT_NO_DATA : (dir_in ? HYPE_XHCI_TRT_IN : HYPE_XHCI_TRT_OUT);
 
     if (len && !dir_in && buf) {
@@ -227,16 +266,17 @@ static int control_transfer(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t bm_r
         zero(g_xfer_buf, XPAGE);
     }
 
-    hype_xhci_trb_setup_stage(t, bm_req, b_req, wvalue, windex, (uint16_t)len, trt, (int)g_ep0_cyc);
-    ep0_enqueue(t);
+    hype_xhci_trb_setup_stage(t, bm_req, b_req, wvalue, windex, (uint16_t)len, trt,
+                              (int)g_ep0_cyc[di]);
+    ep0_enqueue(di, t);
     if (len) {
-        hype_xhci_trb_data_stage(t, phys(g_xfer_buf), len, dir_in, (int)g_ep0_cyc);
-        ep0_enqueue(t);
+        hype_xhci_trb_data_stage(t, phys(g_xfer_buf), len, dir_in, (int)g_ep0_cyc[di]);
+        ep0_enqueue(di, t);
     }
     /* Status stage direction is opposite the data direction (IN if no data). */
     status_dir_in = (len && dir_in) ? 0u : 1u;
-    hype_xhci_trb_status_stage(t, (int)status_dir_in, 1, (int)g_ep0_cyc);
-    ep0_enqueue(t);
+    hype_xhci_trb_status_stage(t, (int)status_dir_in, 1, (int)g_ep0_cyc[di]);
+    ep0_enqueue(di, t);
 
     wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), 1u); /* DCI 1 = EP0 */
 
@@ -292,7 +332,7 @@ static void ring_init_link(uint8_t *ring) {
 }
 
 int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
-                                       unsigned int root_port, unsigned int speed,
+                                       const hype_xhci_devpath_t *path,
                                        const hype_xhci_msc_eps_t *msc) {
     unsigned int cs = c->ctx_size;
     unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
@@ -310,11 +350,13 @@ int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
     g_bin_enq = 0; g_bin_cyc = 1;
     g_bout_enq = 0; g_bout_cyc = 1;
 
-    /* Input Context: add the Slot + both bulk endpoint contexts. */
+    /* Input Context: add the Slot + both bulk endpoint contexts. The Slot
+     * Context must re-provide the device's full topology (route/root/TT). */
     zero(g_input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci_in) | (1u << dci_out), 0);
     write_ctx(g_input_ctx, 0, ctx);
-    hype_xhci_slot_ctx(ctx, 0, speed, max_dci, root_port); /* context entries = highest DCI */
+    hype_xhci_slot_ctx(ctx, path->route, path->speed, max_dci, path->root_port,
+                       path->tt_hub_slot, path->tt_port); /* context entries = highest DCI */
     write_ctx(g_input_ctx, cs, ctx);
     hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_IN, msc->bulk_in_mps, phys(g_bulk_in_ring), 1);
     write_ctx(g_input_ctx, (1u + dci_in) * cs, ctx);
@@ -554,10 +596,144 @@ unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_spee
     return 0;
 }
 
+/* --- USB hub class requests (bmRequestType per USB 2.0 §11.24) --- */
+
+/* Hub-class feature selectors (USB 2.0 Table 11-17). */
+#define HUB_FEAT_PORT_RESET        4u
+#define HUB_FEAT_PORT_POWER        8u
+#define HUB_FEAT_C_PORT_CONNECTION 16u
+#define HUB_FEAT_C_PORT_RESET      20u
+
+static int hub_get_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf,
+                              unsigned int len) {
+    /* GET_DESCRIPTOR(HUB): class/IN/device (0xA0), wValue=0x2900, IN. */
+    return control_transfer(c, slot, 0xA0, 6, (uint16_t)(HYPE_USB_DESC_HUB << 8), 0, buf, len, 1);
+}
+static int hub_set_port_feature(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int feat,
+                                unsigned int port) {
+    /* SET_FEATURE: class/OUT/other (0x23), bRequest=3, wValue=feature, wIndex=port. */
+    return control_transfer(c, slot, 0x23, 3, (uint16_t)feat, (uint16_t)port, 0, 0u, 0);
+}
+static int hub_clear_port_feature(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int feat,
+                                  unsigned int port) {
+    /* CLEAR_FEATURE: class/OUT/other (0x23), bRequest=1. */
+    return control_transfer(c, slot, 0x23, 1, (uint16_t)feat, (uint16_t)port, 0, 0u, 0);
+}
+static int hub_get_port_status(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int port,
+                               uint8_t st[4]) {
+    /* GET_STATUS: class/IN/other (0xA3), bRequest=0 -> wPortStatus[0:1] + wPortChange[2:3]. */
+    return control_transfer(c, slot, 0xA3, 0, 0, (uint16_t)port, st, 4u, 1);
+}
+/* Downstream-port speed from wPortStatus (USB 2.0: bit9 LS, bit10 HS, else FS). */
+static unsigned int hub_port_speed(const uint8_t st[4]) {
+    if (st[1] & 0x02u) return HYPE_USB_SPEED_LOW;
+    if (st[1] & 0x04u) return HYPE_USB_SPEED_HIGH;
+    return HYPE_USB_SPEED_FULL;
+}
+
+int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
+                           const hype_xhci_devpath_t *hub_path, unsigned int tier,
+                           unsigned int *out_slot, hype_xhci_devpath_t *out_path,
+                           hype_xhci_msc_eps_t *out_msc) {
+    uint8_t hubdesc[16];
+    unsigned int nports, port;
+
+    if (!c->inited || hub_slot == 0u) return -1;
+    if (tier == 0u || tier > 5u) return -1; /* xHCI route strings are 5 hub tiers deep */
+
+    if (hub_get_descriptor(c, hub_slot, hubdesc, sizeof hubdesc) != 0) return -1;
+    if (hubdesc[1] != HYPE_USB_DESC_HUB) return -1;
+    nports = hype_xhci_hub_nbr_ports(hubdesc);
+
+    for (port = 1u; port <= nports; port++) {
+        uint8_t st[4];
+        uint8_t devdesc[18];
+        uint8_t cfg[256];
+        unsigned int cfg_len = 0;
+        unsigned int child_speed;
+        unsigned int child_slot = 0;
+        hype_xhci_devpath_t cp;
+        unsigned int guard;
+
+        /* Power the port and see if anything is attached. */
+        hub_set_port_feature(c, hub_slot, HUB_FEAT_PORT_POWER, port);
+        short_delay();
+        if (hub_get_port_status(c, hub_slot, port, st) != 0) continue;
+        if (!(st[0] & 0x01u)) continue; /* PORT_CONNECTION clear */
+
+        /* Reset the port and wait for the reset-complete change bit. */
+        if (hub_set_port_feature(c, hub_slot, HUB_FEAT_PORT_RESET, port) != 0) continue;
+        for (guard = 0; guard < 20u; guard++) {
+            short_delay();
+            if (hub_get_port_status(c, hub_slot, port, st) != 0) break;
+            if (st[2] & 0x10u) break; /* C_PORT_RESET */
+        }
+        hub_clear_port_feature(c, hub_slot, HUB_FEAT_C_PORT_RESET, port);
+        hub_clear_port_feature(c, hub_slot, HUB_FEAT_C_PORT_CONNECTION, port);
+        if (hub_get_port_status(c, hub_slot, port, st) != 0) continue;
+        if (!(st[0] & 0x02u)) continue; /* PORT_ENABLE clear -> reset didn't take */
+
+        child_speed = hub_port_speed(st);
+
+        /* Extend the topology: append this port at `tier`, carry the root port,
+         * and pick the Transaction Translator for a LS/FS child. */
+        cp.root_port = hub_path->root_port;
+        cp.route = hype_xhci_route_append(hub_path->route, tier, port);
+        cp.speed = child_speed;
+        if (hype_xhci_tt_required(hub_path->speed, child_speed)) {
+            cp.tt_hub_slot = hub_slot; /* this HS hub is the child's TT */
+            cp.tt_port = port;
+        } else if ((child_speed == HYPE_USB_SPEED_LOW || child_speed == HYPE_USB_SPEED_FULL) &&
+                   hub_path->tt_hub_slot) {
+            cp.tt_hub_slot = hub_path->tt_hub_slot; /* inherit the upstream HS hub's TT */
+            cp.tt_port = hub_path->tt_port;
+        } else {
+            cp.tt_hub_slot = 0;
+            cp.tt_port = 0;
+        }
+
+        /* Enumerate the device on this port. */
+        if (hype_xhci_enable_slot(c, &child_slot) != 0 || child_slot == 0u) continue;
+        if (hype_xhci_address_device(c, child_slot, &cp) != 0) {
+            hype_xhci_disable_slot(c, child_slot);
+            continue;
+        }
+        if (hype_xhci_get_device_descriptor(c, child_slot, devdesc) != 0) {
+            hype_xhci_disable_slot(c, child_slot);
+            continue;
+        }
+
+        if (hype_xhci_dev_is_hub(devdesc)) {
+            /* A nested hub: configure it, then descend one tier deeper. */
+            if (hype_xhci_get_config_descriptor(c, child_slot, cfg, sizeof cfg, &cfg_len) == 0 &&
+                cfg_len >= 6u &&
+                hype_xhci_set_configuration(c, child_slot, cfg[5]) == 0) {
+                if (hype_xhci_hub_find_msc(c, child_slot, &cp, tier + 1u,
+                                           out_slot, out_path, out_msc) == 0) {
+                    return 0; /* storage found somewhere below this nested hub */
+                }
+            }
+            hype_xhci_disable_slot(c, child_slot); /* nothing storage-like below it */
+            continue;
+        }
+
+        /* A leaf device: is it a bulk-only SCSI mass-storage device? */
+        if (hype_xhci_get_config_descriptor(c, child_slot, cfg, sizeof cfg, &cfg_len) == 0 &&
+            hype_xhci_msc_find_endpoints(cfg, cfg_len, out_msc) == 0) {
+            *out_slot = child_slot;
+            *out_path = cp;
+            return 0; /* left addressed; caller does SET_CONFIGURATION + Configure Endpoint */
+        }
+        hype_xhci_disable_slot(c, child_slot); /* not storage */
+    }
+    return -1;
+}
+
 int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot) {
     uint32_t cmd[4], evt[4];
     if (!c->inited || slot == 0u) return -1;
     hype_xhci_trb_disable_slot(cmd, slot, (int)g_cmd_cyc);
-    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    if (cmd_submit_wait(c, cmd, evt) != 0) { dev_free(slot); return -1; }
+    dev_free(slot); /* release the pool entry regardless of the controller's verdict */
     return (hype_xhci_event_cc(evt) == HYPE_XHCI_CC_SUCCESS) ? 0 : -1;
 }
