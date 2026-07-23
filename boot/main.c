@@ -277,6 +277,14 @@ typedef struct hype_fw_vm {
     hype_chunked_iso_t iso_chunked;
     hype_iso_stream_t iso_stream;
     int iso_stream_ready;
+    /* M5-7 (#196): per-VM virtio-blk disk + its block backend. vblk is the
+     * device-register model; vblk_be is the hype_blk_backend the datapath drives
+     * (file-backed over vblk_backing_phys for now). Per-VM so two guests get
+     * independent writable disks. */
+    hype_virtio_blk_t vblk;
+    hype_blk_backend_t vblk_be;
+    hype_blk_file_t vblk_file;
+    uint64_t vblk_backing_phys; /* host-physical base of this VM's scratch disk */
     hype_gpa_map_t dma_map; /* VALID-1/3: guest-phys->host layout for DMA bounds */
     /* --- per-run timing + diagnostics (M4-6b1/M4-6d4/PERF-1a) --- */
     uint64_t host_tsc_hz;   /* calibrated CPU freq; drives the guest timebase */
@@ -318,6 +326,8 @@ static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
 #define g_fw_1_loader_script (vm->loader_script)
 #define g_fw_1_ahci (vm->ahci)
 #define g_fw_1_atapi (vm->atapi)
+#define g_fw_1_vblk (vm->vblk)
+#define g_fw_1_vblk_be (vm->vblk_be)
 #define g_fw_1_dma_map (vm->dma_map)
 #define g_fw_1_host_tsc_hz (vm->host_tsc_hz)
 #define g_fw_1_vmrun_tsc (vm->vmrun_tsc)
@@ -778,6 +788,23 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * the guest programs IO-APIC RTE[16] for AHCI and ignores the legacy PCI
  * Interrupt Line, so hype raises the AHCI line here rather than on line 11. */
 #define HYPE_FW_1_AHCI_GSI 16u
+
+/* M5-7 (#196): the live guest's virtio-blk disk. Device 3 on the PCI bus (dev 2
+ * is the AHCI CD-ROM), a modern virtio-pci device with its config-region window
+ * at BAR4. INTA is routed to GSI 20 (0x14) -- MUST match the DSDT _PRT entry for
+ * dev 3 (devices/dsdt.asl); clear of the dev-2 pin block (GSI 16-19). The
+ * per-VM scratch backing is a small RAM-backed blk_file for now (later steps
+ * swap the backend to a raw file / physical disk without touching the frontend). */
+#define HYPE_FW_1_PCI_DEV_VIRTIO_BLK 3u
+#define HYPE_FW_1_VIRTIO_BAR_INDEX 4u
+#define HYPE_FW_1_VIRTIO_GSI 20u
+#define HYPE_FW_1_VDISK_BYTES (64ULL * 1024ULL * 1024ULL) /* 64 MiB scratch virtual disk */
+/* virtio-pci capability-list offsets within the device's config space (reusing
+ * the same generic CFG_TYPE / PCI-status constants M5-1 established). */
+#define HYPE_FW_1_VIRTIO_CAP_COMMON_OFF 0x40u
+#define HYPE_FW_1_VIRTIO_CAP_NOTIFY_OFF 0x50u
+#define HYPE_FW_1_VIRTIO_CAP_ISR_OFF 0x64u
+#define HYPE_FW_1_VIRTIO_CAP_DEVICE_OFF 0x74u
 
 /* FW-1d: OVMF never executes HLT during DXE/BDS init -- its idle wait
  * (CpuSleep) HLTs only once everything is up. Empirically it reaches
@@ -4340,7 +4367,7 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
             if (mmio_mapped &&
                 hype_svm_vcpu_handle_virtio_blk_npf(ctx, &g_m5_1_virtio_blk, &g_m5_1_be,
-                                                     /*dma_map=*/0, mmio_mapped_base) == 0) {
+                                                     /*dma_map=*/0, mmio_mapped_base, /*insn=*/0) == 0) {
                 continue;
             }
 
@@ -5195,6 +5222,45 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
  * VMRUN starts the guest exactly as a cold boot. The static parts of setup (NPT,
  * gpa_map, ACPI/fw_cfg/e820 blobs) are not mutated by a run, so they are left
  * intact and not rebuilt; OVMF re-selects the fw_cfg files itself on restart. */
+/* M5-7 (#196): attach this VM's virtio-blk disk -- register model + block
+ * backend (RAM-backed blk_file over the pre-EBS-allocated vblk_backing_phys) +
+ * PCI device 3 with its virtio-pci capability list (config regions at BAR4) and
+ * INTA interrupt. Shared by the initial boot (run_fw_1_test) and a VM restart
+ * (fw_1_vm_reinit). The vCPU loop latches the BAR OVMF assigns, dispatches BAR
+ * MMIO to the (GPA-translated, VALID-3) virtio handler, and raises the
+ * completion IRQ on GSI 20. */
+static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
+    uint8_t *config;
+    hype_virtio_blk_reset(&vm->vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
+    hype_blk_file_init(&vm->vblk_file, &vm->vblk_be, (uint8_t *)(uintptr_t)vm->vblk_backing_phys,
+                       HYPE_FW_1_VDISK_BYTES);
+    hype_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
+                        HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
+                        HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE);
+    hype_pci_set_bar_size(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, HYPE_FW_1_VIRTIO_BAR_INDEX,
+                          HYPE_VIRTIO_BLK_BAR_SIZE);
+    /* INTA, legacy line 10 (PIC-mode fallback); APIC-mode guests route via the
+     * DSDT _PRT (dev 3 INTA -> GSI 20). */
+    hype_pci_set_interrupt(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, 1, 10);
+    config = vm->pci.devices[HYPE_FW_1_PCI_DEV_VIRTIO_BLK].config;
+    config[HYPE_M5_1_PCI_STATUS_OFFSET] |= HYPE_M5_1_PCI_STATUS_CAP_LIST;
+    config[HYPE_M5_1_PCI_CAP_POINTER_OFFSET] = HYPE_FW_1_VIRTIO_CAP_COMMON_OFF;
+    hype_write_virtio_pci_cap(config, HYPE_FW_1_VIRTIO_CAP_COMMON_OFF, HYPE_FW_1_VIRTIO_CAP_NOTIFY_OFF, 16,
+                              HYPE_M5_1_CFG_TYPE_COMMON, HYPE_FW_1_VIRTIO_BAR_INDEX,
+                              HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET, HYPE_VIRTIO_COMMON_CFG_SIZE);
+    hype_write_virtio_pci_cap(config, HYPE_FW_1_VIRTIO_CAP_NOTIFY_OFF, HYPE_FW_1_VIRTIO_CAP_ISR_OFF, 20,
+                              HYPE_M5_1_CFG_TYPE_NOTIFY, HYPE_FW_1_VIRTIO_BAR_INDEX,
+                              HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET, 4);
+    hype_write_le32(config + HYPE_FW_1_VIRTIO_CAP_NOTIFY_OFF + 16,
+                    HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_MULTIPLIER);
+    hype_write_virtio_pci_cap(config, HYPE_FW_1_VIRTIO_CAP_ISR_OFF, HYPE_FW_1_VIRTIO_CAP_DEVICE_OFF, 16,
+                              HYPE_M5_1_CFG_TYPE_ISR, HYPE_FW_1_VIRTIO_BAR_INDEX,
+                              HYPE_VIRTIO_BLK_BAR_ISR_CFG_OFFSET, 1);
+    hype_write_virtio_pci_cap(config, HYPE_FW_1_VIRTIO_CAP_DEVICE_OFF, 0, 16, HYPE_M5_1_CFG_TYPE_DEVICE,
+                              HYPE_FW_1_VIRTIO_BAR_INDEX, HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET,
+                              HYPE_VIRTIO_BLK_CFG_SIZE);
+}
+
 static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx) {
     uint64_t reset_cs_base = 0x100000000ULL - 0x10000ULL; /* 0xFFFF0000 */
     uint64_t reset_rip = 0xFFF0ULL;
@@ -5227,6 +5293,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx) {
     hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
     hype_ahci_reset(&g_fw_1_ahci);
+    fw_1_setup_virtio_blk(vm); /* M5-7 (#196): attach this VM's writable virtio-blk disk */
     if (vm->iso_stream_ready) {
         hype_atapi_reset_stream(&g_fw_1_atapi, &vm->iso_stream);
     } else {
@@ -5321,6 +5388,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * (hype_pci_get_interrupt_line), master or slave. */
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
     hype_ahci_reset(&g_fw_1_ahci);
+    fw_1_setup_virtio_blk(vm); /* M5-7 (#196): attach this VM's writable virtio-blk disk */
     /* GLADDER-10: prefer the streaming backing (ISO served on demand from its raw
      * disk partition) when one was found + verified post-EBS; otherwise fall back
      * to the RAM-chunked copy (GLADDER-10a). */
@@ -5622,6 +5690,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * ABAR window route to the (RAM-remap-aware) AHCI MMIO handler. */
     int ahci_mapped = 0;
     uint64_t ahci_abar = 0;
+    int vblk_mapped = 0;    /* M5-7 (#196): virtio-blk BAR4 latched + routed */
+    uint64_t vblk_bar = 0;
     hype_host_input_t hostin; /* TERM-4: host keyboard -> focused guest routing state */
     /* M4-6b1: drive the guest timebase from real elapsed host TSC. */
     uint64_t tb_last_tsc = hype_rdtsc();
@@ -6643,6 +6713,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (g_fw_1_lapic.eoi_count != ahci_last_eoi) {
             ahci_last_eoi = g_fw_1_lapic.eoi_count;
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
+            /* M5-7 (#196): same for the virtio-blk line -- on the guest's LAPIC
+             * EOI, drop GSI 20's Remote-IRR so the NEXT completion re-injects.
+             * Without this the level line stuck after the first completion and
+             * vda I/O hung. The raise below re-fires while isr_status != 0. */
+            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
         }
         if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
@@ -6673,6 +6748,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * Models a level line going low; the guest's LAPIC EOI need not be
              * decoded (hype's minimal LAPIC doesn't track the ISR vector). */
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
+        }
+        /* M5-7 (#196): virtio-blk completion IRQ on GSI 20 (its own line, no
+         * interference with the boot-critical AHCI CD line). The device sets
+         * isr_status when it consumes a request; the guest's ISR reads the ISR
+         * register (NPF handler -> hype_virtio_blk_isr_read clears it), so this
+         * is level-triggered on isr_status. */
+        if (vblk_mapped && g_fw_1_vblk.isr_status != 0u) {
+            uint8_t iov;
+            uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK);
+            if (line != 0u && line < 16u) {
+                int in_service = (line < 8u)
+                    ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
+                    : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
+                if (!in_service) {
+                    hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
+                }
+            }
+            if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI, &iov)) {
+                hype_svm_vcpu_request_interrupt(ctx, iov);
+            }
+        } else if (vblk_mapped) {
+            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
         }
         /* M4-6d3: raise the serial TX/RX interrupt (COM1=IRQ4, COM2=IRQ3)
          * when the guest has enabled it (IER.ETBEI/ERBFI). The kernel's
@@ -7110,6 +7207,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                           (unsigned long long)bar5);
                     }
                 }
+                /* M5-7 (#196): same latch for the virtio-blk device's BAR4 window.
+                 * No NPT map needed -- it sits in the not-present 32-bit PCI
+                 * aperture, so its MMIO already faults as an NPF (routed below). */
+                if (!vblk_mapped &&
+                    hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK)) {
+                    uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK,
+                                                          HYPE_FW_1_VIRTIO_BAR_INDEX);
+                    if (bar != 0) {
+                        vblk_bar = bar;
+                        vblk_mapped = 1;
+                        hype_debug_print("fw-1: virtio-blk BAR%u enabled at guest-physical 0x%llx -- "
+                                          "routing its MMIO to the virtio-blk model now\n",
+                                          (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX, (unsigned long long)bar);
+                    }
+                }
                 continue;
             }
             /* FW-1h: AHCI ABAR MMIO. Gate on the faulting guest-physical
@@ -7197,6 +7309,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                "guest_rip=0x%llx)",
                                (unsigned long long)ahci_npf.guest_phys_addr,
                                ahci_npf.is_write ? "write" : "read", (unsigned long long)info.guest_rip);
+                }
+            }
+            /* M5-7 (#196): virtio-blk BAR4 MMIO -> the VALID-3, GPA-translated
+             * virtio handler (guest RAM remap handled inside via &g_fw_1_dma_map).
+             * Gated on the fault landing in the device's BAR window. */
+            if (vblk_mapped) {
+                hype_svm_vcpu_get_last_npf(ctx, &npf);
+                if (npf.guest_phys_addr >= vblk_bar &&
+                    npf.guest_phys_addr < vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
+                    if (hype_svm_vcpu_handle_virtio_blk_npf(ctx, &g_fw_1_vblk, &g_fw_1_vblk_be,
+                                                            &g_fw_1_dma_map, vblk_bar, insn) == 0) {
+                        continue;
+                    }
+                    hype_fatal("fw-1: unhandled virtio-blk MMIO at guest-physical 0x%llx",
+                               (unsigned long long)npf.guest_phys_addr);
                 }
             }
             hype_svm_vcpu_get_last_npf(ctx, &npf);
@@ -8584,6 +8711,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             g_vms[0].iso_size = iso_size;
         }
 
+        /* M5-7 (#196): allocate vm0's virtio-blk scratch disk backing pre-EBS
+         * (AllocatePages is gone afterward), zeroed so the guest sees a blank
+         * disk. Later steps swap the backend to a raw file / physical disk. */
+        {
+            UINTN vdisk_pages = (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL);
+            g_vms[0].vblk_backing_phys = hype_alloc_pages_any(SystemTable->BootServices, vdisk_pages);
+            hype_guest_ram_zero((void *)(uintptr_t)g_vms[0].vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
+            hype_debug_print("fw-1: vm0 virtio-blk scratch disk @0x%llx (%llu MiB)\n",
+                             (unsigned long long)g_vms[0].vblk_backing_phys,
+                             (unsigned long long)(HYPE_FW_1_VDISK_BYTES / (1024ULL * 1024ULL)));
+        }
+
         /* M4-6b1: calibrate the real host TSC frequency once, while Boot
          * Services (and its Stall) are still available, so the FW-1 guest
          * can drive its PIT/LAPIC timebase from real elapsed TSC. Stall
@@ -8645,6 +8784,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_guest_ram_copy((void *)(uintptr_t)vm1->fw_pristine_host_phys,
                                 (const void *)(uintptr_t)vm1->combined_host_phys, vm1->combined_size);
             vm1->host_tsc_hz = vm->host_tsc_hz;
+            /* M5-7 (#196): vm1's own virtio-blk scratch disk backing (pre-EBS). */
+            vm1->vblk_backing_phys =
+                hype_alloc_pages_any(SystemTable->BootServices, (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL));
+            hype_guest_ram_zero((void *)(uintptr_t)vm1->vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
             /* GLADDER-9: distinct media for vm1 if \iso\vm1.iso exists, else share
              * vm0's read-only ISO backing. (The streaming case, when vm0 later
              * ends up served from a host disk, is propagated to a sharing vm1

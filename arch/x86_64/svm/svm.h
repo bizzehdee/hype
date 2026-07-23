@@ -985,7 +985,7 @@ void hype_svm_set_msr_trace(int enabled);
  */
 int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
                                          const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
-                                         uint64_t mmio_base_phys);
+                                         uint64_t mmio_base_phys, const uint8_t *insn);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */
