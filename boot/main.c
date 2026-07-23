@@ -9478,6 +9478,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     static uint8_t desc[18];
                     static uint8_t cfgbuf[256];
                     hype_xhci_msc_eps_t msc;
+                    hype_xhci_devpath_t path;      /* the root-port device's topology */
+                    hype_xhci_devpath_t msc_path;  /* the confirmed MSC's topology */
+                    unsigned int msc_slot = 0;
+                    int have_msc = 0;
 
                     if (!hype_xhci_reset_port(&xc, rp, &speed)) {
                         continue; /* nothing connected on this root port */
@@ -9487,7 +9491,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         hype_serial_print("host-xhci: Enable Slot FAILED\n");
                         continue;
                     }
-                    if (hype_xhci_address_device(&xc, slot, rp, speed) != 0) {
+                    /* Root-port device: no hubs above it (route 0, no TT). */
+                    path.root_port = rp;
+                    path.route = 0u;
+                    path.speed = speed;
+                    path.tt_hub_slot = 0u;
+                    path.tt_port = 0u;
+                    if (hype_xhci_address_device(&xc, slot, &path) != 0) {
                         hype_serial_print("host-xhci: Address Device FAILED\n");
                         hype_xhci_disable_slot(&xc, slot);
                         continue;
@@ -9502,35 +9512,62 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                      (unsigned)desc[4], (unsigned)desc[7],
                                      (unsigned)(desc[8] | (desc[9] << 8)),
                                      (unsigned)(desc[10] | (desc[11] << 8)));
+
                     if (hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
-                                                        &cfglen) != 0 ||
-                        hype_xhci_msc_find_endpoints(cfgbuf, cfglen, &msc) != 0) {
-                        hype_debug_print("host-xhci: port %u dev is not bulk-only MSC "
-                                         "(class=%02x, cfg %u bytes)%s -- skipping\n",
-                                         rp, (unsigned)desc[4], cfglen,
-                                         desc[4] == 0x09u ? " [USB hub -- descent is #231 pt5b]" : "");
+                                                        &cfglen) == 0 &&
+                        hype_xhci_msc_find_endpoints(cfgbuf, cfglen, &msc) == 0) {
+                        /* Bulk-only MSC directly on the root port. */
+                        msc_slot = slot;
+                        msc_path = path;
+                        have_msc = 1;
+                    } else if (hype_xhci_dev_is_hub(desc)) {
+                        /* USB-8 (#231) pt5b: descend into the hub. Configure it first
+                         * (so its downstream ports can be powered/reset), then walk. */
+                        hype_debug_print("host-xhci: port %u is a USB hub -- descending (#231 pt5b)\n",
+                                         rp);
+                        if (hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
+                                                            &cfglen) == 0 && cfglen >= 6u &&
+                            hype_xhci_set_configuration(&xc, slot, cfgbuf[5]) == 0 &&
+                            hype_xhci_hub_find_msc(&xc, slot, &path, 1u,
+                                                   &msc_slot, &msc_path, &msc) == 0) {
+                            hype_debug_print("host-xhci: MSC found behind hub on port %u -- "
+                                             "slot %u route 0x%05x speed %u\n", rp, msc_slot,
+                                             msc_path.route, msc_path.speed);
+                            have_msc = 1; /* NB: keep the hub slot addressed as topology parent */
+                        }
+                        if (!have_msc) {
+                            hype_debug_print("host-xhci: no storage behind hub on port %u\n", rp);
+                            hype_xhci_disable_slot(&xc, slot);
+                            continue;
+                        }
+                    } else {
+                        hype_debug_print("host-xhci: port %u dev is not MSC or hub "
+                                         "(class=%02x, cfg %u bytes) -- skipping\n",
+                                         rp, (unsigned)desc[4], cfglen);
                         hype_xhci_disable_slot(&xc, slot);
                         continue;
                     }
-                    if (hype_xhci_set_configuration(&xc, slot, msc.config_value) != 0) {
+
+                    /* Shared MSC datapath, whether direct or behind a hub. */
+                    if (hype_xhci_set_configuration(&xc, msc_slot, msc.config_value) != 0) {
                         hype_serial_print("host-xhci: SET_CONFIGURATION FAILED\n");
-                        hype_xhci_disable_slot(&xc, slot);
+                        hype_xhci_disable_slot(&xc, msc_slot);
                         continue;
                     }
-                    hype_debug_print("host-xhci: MSC at port %u -- cfg=%u iface=%u bulk-in=0x%02x "
-                                     "bulk-out=0x%02x mps=%u\n", rp, msc.config_value,
+                    hype_debug_print("host-xhci: MSC -- slot %u cfg=%u iface=%u bulk-in=0x%02x "
+                                     "bulk-out=0x%02x mps=%u\n", msc_slot, msc.config_value,
                                      msc.interface_num, msc.bulk_in_ep, msc.bulk_out_ep,
                                      msc.bulk_in_mps);
-                    if (hype_xhci_configure_bulk_endpoints(&xc, slot, rp, speed, &msc) != 0) {
+                    if (hype_xhci_configure_bulk_endpoints(&xc, msc_slot, &msc_path, &msc) != 0) {
                         hype_serial_print("host-xhci: Configure Endpoint FAILED\n");
-                        hype_xhci_disable_slot(&xc, slot);
+                        hype_xhci_disable_slot(&xc, msc_slot);
                         continue;
                     }
                     msc_found = 1;
                     {
                         uint32_t last_lba = 0, bsz = 0;
                         hype_debug_print("host-xhci: bulk endpoints configured -- MSC datapath ready\n");
-                        if (hype_xhci_msc_read_capacity(&xc, slot, &msc, &last_lba, &bsz) != 0) {
+                        if (hype_xhci_msc_read_capacity(&xc, msc_slot, &msc, &last_lba, &bsz) != 0) {
                             hype_serial_print("host-xhci: SCSI READ CAPACITY FAILED\n");
                         } else {
                             static uint8_t sec0[512];
@@ -9539,7 +9576,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              (unsigned long long)(((uint64_t)last_lba + 1u) * bsz
                                                  / (1024ull * 1024ull)));
                             if (bsz == 512u &&
-                                hype_xhci_msc_read(&xc, slot, &msc, 0u, 1u, 512u, sec0) == 0) {
+                                hype_xhci_msc_read(&xc, msc_slot, &msc, 0u, 1u, 512u, sec0) == 0) {
                                 hype_debug_print("host-xhci: SCSI READ(10) LBA0 OK -- mbrsig=%02x%02x\n",
                                                  (unsigned)sec0[510], (unsigned)sec0[511]);
                             } else if (bsz == 512u) {
@@ -9550,7 +9587,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 static hype_blk_phys_t uphys;
                                 static hype_blk_backend_t ube;
                                 static uint8_t bsec[512];
-                                hype_blk_usb_init(&ubk, &uphys, &ube, &xc, slot, &msc, 512u,
+                                hype_blk_usb_init(&ubk, &uphys, &ube, &xc, msc_slot, &msc, 512u,
                                                   (uint64_t)last_lba + 1u);
                                 if (hype_blk_backend_read(&ube, 0u, 1u, bsec) == 0) {
                                     hype_debug_print("host-xhci: blk_usb backend read LBA0 OK -- "
@@ -9567,9 +9604,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 uint32_t test_lba = 1024u; /* scratch */
                                 unsigned k; int ok = 1;
                                 for (k = 0; k < 512u; k++) wr[k] = (uint8_t)(0x3Cu ^ (k & 0xFFu));
-                                if (hype_xhci_msc_write(&xc, slot, &msc, test_lba, 1u, 512u, wr) != 0) {
+                                if (hype_xhci_msc_write(&xc, msc_slot, &msc, test_lba, 1u, 512u, wr) != 0) {
                                     hype_serial_print("host-xhci: WRITE(10) self-test write FAILED\n");
-                                } else if (hype_xhci_msc_read(&xc, slot, &msc, test_lba, 1u, 512u, rd) != 0) {
+                                } else if (hype_xhci_msc_read(&xc, msc_slot, &msc, test_lba, 1u, 512u, rd) != 0) {
                                     hype_serial_print("host-xhci: WRITE(10) self-test readback FAILED\n");
                                 } else {
                                     for (k = 0; k < 512u; k++) { if (rd[k] != wr[k]) { ok = 0; break; } }
@@ -9583,8 +9620,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     }
                 }
                 if (!msc_found) {
-                    hype_debug_print("host-xhci: no bulk-only USB mass-storage on any root port "
-                                     "(a hub, if present, is not yet descended -- #231 pt5b)\n");
+                    hype_debug_print("host-xhci: no bulk-only USB mass-storage found on any root "
+                                     "port or behind any hub\n");
                 }
             }
         } else {

@@ -127,12 +127,22 @@ void hype_xhci_input_ctrl_ctx(uint32_t icc[8], uint32_t add_flags, uint32_t drop
 }
 
 void hype_xhci_slot_ctx(uint32_t sc[8], unsigned int route, unsigned int speed,
-                        unsigned int ctx_entries, unsigned int root_port) {
+                        unsigned int ctx_entries, unsigned int root_port,
+                        unsigned int tt_hub_slot, unsigned int tt_port) {
     ctx_zero(sc);
     /* dword0: Route String[19:0], Speed[23:20], Context Entries[31:27]. */
     sc[0] = (route & 0xFFFFFu) | ((speed & 0xFu) << 20) | ((ctx_entries & 0x1Fu) << 27);
     /* dword1: Root Hub Port Number[23:16]. */
     sc[1] = (root_port & 0xFFu) << 16;
+    /* dword2: TT Hub Slot ID[7:0] + TT Port Number[15:8] -- LS/FS behind a HS hub. */
+    if (tt_hub_slot) {
+        sc[2] = (tt_hub_slot & 0xFFu) | ((tt_port & 0xFFu) << 8);
+    }
+}
+
+unsigned int hype_xhci_route_append(unsigned int parent_route, unsigned int tier, unsigned int port) {
+    if (tier == 0u || tier > 5u) return parent_route; /* xHCI supports 5 hub tiers */
+    return parent_route | ((port & 0xFu) << ((tier - 1u) * 4u));
 }
 
 void hype_xhci_ep_ctx(uint32_t ep[8], unsigned int ep_type, unsigned int max_packet,

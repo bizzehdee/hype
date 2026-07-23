@@ -162,9 +162,27 @@ void hype_xhci_trb_normal(uint32_t trb[4], uint64_t buffer_phys, uint32_t length
 void hype_xhci_input_ctrl_ctx(uint32_t icc[8], uint32_t add_flags, uint32_t drop_flags);
 
 /* Slot Context: route string, PORTSC speed, context-entries (highest valid DCI),
- * and the root-hub port number the device is attached to. */
+ * the root-hub port the device's topology hangs off, and (for a LS/FS device
+ * behind a HS hub) the Transaction Translator hub slot id + port -- pass
+ * tt_hub_slot 0 for a direct/HS/SS device (no TT). */
 void hype_xhci_slot_ctx(uint32_t sc[8], unsigned int route, unsigned int speed,
-                        unsigned int ctx_entries, unsigned int root_port);
+                        unsigned int ctx_entries, unsigned int root_port,
+                        unsigned int tt_hub_slot, unsigned int tt_port);
+
+/* A device's topology path, needed to Address Device + Configure Endpoints for
+ * a device that may sit behind one or more hubs. root_port is the ROOT port the
+ * chain hangs off; route is the xHCI Route String (nibble per hub tier). */
+typedef struct {
+    unsigned int root_port;
+    unsigned int route;
+    unsigned int speed;        /* PORTSC/hub-status speed id */
+    unsigned int tt_hub_slot;  /* 0 = no TT (direct or HS/SS device) */
+    unsigned int tt_port;
+} hype_xhci_devpath_t;
+
+/* Compose a Route String: append downstream `port` at hub `tier` (1-based) to a
+ * parent route. Tier 1 occupies bits 3:0, tier 2 bits 7:4, ... (xHCI 8.9). */
+unsigned int hype_xhci_route_append(unsigned int parent_route, unsigned int tier, unsigned int port);
 
 /* Endpoint Context EP Type field (dword1 bits 5:3), xHCI 6.2.3. */
 #define HYPE_XHCI_EP_TYPE_ISOCH_OUT 1u
@@ -213,6 +231,33 @@ static inline uint32_t hype_xhci_portsc_write_preserve(uint32_t current, uint32_
 #define HYPE_USB_DESC_CONFIG     0x02u
 #define HYPE_USB_DESC_INTERFACE  0x04u
 #define HYPE_USB_DESC_ENDPOINT   0x05u
+/* USB hub class (device descriptor bDeviceClass == 0x09). */
+#define HYPE_USB_CLASS_HUB       0x09u
+#define HYPE_USB_DESC_HUB        0x29u /* wValue high byte for GET hub descriptor */
+
+/* PORTSC/hub speed ids (shared with hype_xhci_default_mps). */
+#define HYPE_USB_SPEED_FULL  1u
+#define HYPE_USB_SPEED_LOW   2u
+#define HYPE_USB_SPEED_HIGH  3u
+
+/* A standard USB device descriptor is 18 bytes; bDeviceClass is byte 4. Returns
+ * 1 if this device is a hub (its interface may instead carry the class, but the
+ * device-descriptor class is authoritative for hubs). */
+static inline int hype_xhci_dev_is_hub(const uint8_t *devdesc18) {
+    return devdesc18[4] == HYPE_USB_CLASS_HUB;
+}
+/* bNbrPorts is byte 2 of a hub descriptor. Clamp to a sane maximum so a bogus
+ * descriptor can't drive an unbounded downstream-port loop. */
+static inline unsigned int hype_xhci_hub_nbr_ports(const uint8_t *hubdesc) {
+    unsigned int n = hubdesc[2];
+    return (n > 15u) ? 15u : n;
+}
+/* A LS/FS device behind a HS hub needs that hub named as its Transaction
+ * Translator; direct/HS/SS chains do not. */
+static inline int hype_xhci_tt_required(unsigned int hub_speed, unsigned int child_speed) {
+    return hub_speed == HYPE_USB_SPEED_HIGH &&
+           (child_speed == HYPE_USB_SPEED_LOW || child_speed == HYPE_USB_SPEED_FULL);
+}
 
 typedef struct {
     int found;                   /* 1 if a bulk-only SCSI MSC interface with both bulk EPs */
@@ -291,8 +336,8 @@ int hype_xhci_enable_slot(hype_xhci_ctrl_t *c, unsigned int *out_slot);
  * DCBAA[slot] at a fresh Device Context, sets up the EP0 transfer ring, and
  * issues an Address Device command. Returns 0 on success, -1 on error/timeout.
  */
-int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int root_port,
-                             unsigned int speed);
+int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
+                             const hype_xhci_devpath_t *path);
 
 /*
  * Reads the 18-byte USB device descriptor from an addressed device via a
@@ -320,8 +365,22 @@ int hype_xhci_set_configuration(hype_xhci_ctrl_t *c, unsigned int slot, unsigned
  * After this, bulk transfers on those endpoints are possible.
  */
 int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
-                                       unsigned int root_port, unsigned int speed,
+                                       const hype_xhci_devpath_t *path,
                                        const hype_xhci_msc_eps_t *msc);
+
+/*
+ * USB-8 (#231) pt5b: descend into a USB hub. `hub_slot` is an addressed+
+ * configured hub whose own path is *hub_path (speed in it); `tier` is its hub
+ * tier (1 for a root-port hub). Powers/resets each downstream port, enumerates
+ * the device on it (Enable Slot -> Address Device with the extended route/TT
+ * path -> descriptors), recursing into nested hubs. On finding the first bulk-
+ * only mass-storage device, fills *out_slot (addressed), *out_path, *out_msc and
+ * returns 0; returns -1 if none is found below this hub.
+ */
+int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
+                           const hype_xhci_devpath_t *hub_path, unsigned int tier,
+                           unsigned int *out_slot, hype_xhci_devpath_t *out_path,
+                           hype_xhci_msc_eps_t *out_msc);
 
 /*
  * USB-3 (#215) block I/O over Bulk-Only Transport (SCSI). Require the device to
