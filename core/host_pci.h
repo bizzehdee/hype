@@ -111,6 +111,17 @@ void hype_host_pci_disable_interrupts(hype_host_pci_read32_fn read32,
 int hype_host_pci_find_storage(hype_host_pci_read32_fn read32, uint8_t max_bus,
                                hype_host_storage_t *out);
 
+/*
+ * Resumable scan: finds the first AHCI/NVMe controller whose PCI position
+ * (bdf = bus<<8 | dev<<3 | func) is >= start_bdf, filling *out (incl. its
+ * bus/dev/func). Returns 1 if found, else 0. Enumerate ALL storage controllers
+ * by looping with start_bdf = ((out->bus<<8)|(out->dev<<3)|out->func) + 1 --
+ * needed on real hardware with multiple NVMe drives + a SATA controller, where
+ * the plain find_storage() returns only the first. Pure.
+ */
+int hype_host_pci_find_storage_from(hype_host_pci_read32_fn read32, uint8_t max_bus,
+                                    uint32_t start_bdf, hype_host_storage_t *out);
+
 typedef struct {
     uint8_t bus;
     uint8_t dev;

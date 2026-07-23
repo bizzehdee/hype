@@ -100,8 +100,8 @@ static uint64_t read_mem_bar(hype_host_pci_read32_fn read32, uint8_t bus, uint8_
     return base;
 }
 
-int hype_host_pci_find_storage(hype_host_pci_read32_fn read32, uint8_t max_bus,
-                               hype_host_storage_t *out) {
+int hype_host_pci_find_storage_from(hype_host_pci_read32_fn read32, uint8_t max_bus,
+                                    uint32_t start_bdf, hype_host_storage_t *out) {
     unsigned bus;
     unsigned dev;
 
@@ -114,19 +114,26 @@ int hype_host_pci_find_storage(hype_host_pci_read32_fn read32, uint8_t max_bus,
             unsigned func;
 
             for (func = 0; func <= last_func; func++) {
-                uint32_t vd = read32((uint8_t)bus, (uint8_t)dev, (uint8_t)func, CFG_VENDOR_DEVICE);
+                uint32_t vd;
                 uint32_t cls;
                 uint8_t class_base;
                 uint8_t subclass;
+                uint32_t bdf = ((uint32_t)bus << 8) | ((uint32_t)dev << 3) | (uint32_t)func;
 
+                vd = read32((uint8_t)bus, (uint8_t)dev, (uint8_t)func, CFG_VENDOR_DEVICE);
                 if ((vd & 0xFFFFu) == VENDOR_INVALID) {
                     continue; /* no device/function here */
                 }
+                /* Still probe func0's MF bit even below start_bdf, so a later
+                 * function of a multi-function device isn't missed on resume. */
                 if (func == 0u) {
-                    uint32_t hdr = read32((uint8_t)bus, (uint8_t)dev, 0u, CFG_HEADER_TYPE);
-                    if (((hdr >> 16) & 0x80u) != 0u) {
-                        last_func = 7u; /* multi-function device: probe all eight */
+                    uint32_t hdr0 = read32((uint8_t)bus, (uint8_t)dev, 0u, CFG_HEADER_TYPE);
+                    if (((hdr0 >> 16) & 0x80u) != 0u) {
+                        last_func = 7u;
                     }
+                }
+                if (bdf < start_bdf) {
+                    continue; /* resume: skip everything up to the caller's cursor */
                 }
 
                 cls = read32((uint8_t)bus, (uint8_t)dev, (uint8_t)func, CFG_CLASS_REVISION);
@@ -157,6 +164,11 @@ int hype_host_pci_find_storage(hype_host_pci_read32_fn read32, uint8_t max_bus,
         }
     }
     return 0;
+}
+
+int hype_host_pci_find_storage(hype_host_pci_read32_fn read32, uint8_t max_bus,
+                               hype_host_storage_t *out) {
+    return hype_host_pci_find_storage_from(read32, max_bus, 0u, out);
 }
 
 int hype_host_pci_find_xhci(hype_host_pci_read32_fn read32, uint8_t max_bus,

@@ -8764,13 +8764,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * hype can locate and address the controller (its register BAR). */
         {
             hype_host_storage_t hs;
-            if (hype_host_pci_find_storage(hype_host_pci_read32_hw, 255u, &hs)) {
+            uint32_t cur = 0;
+            unsigned found = 0;
+            /* List EVERY AHCI/NVMe controller (real HW: multiple NVMe + a SATA). */
+            while (hype_host_pci_find_storage_from(hype_host_pci_read32_hw, 255u, cur, &hs)) {
+                cur = (((uint32_t)hs.bus << 8) | ((uint32_t)hs.dev << 3) | (uint32_t)hs.func) + 1u;
+                found++;
                 hype_debug_print(
-                    "host-pci: storage=%s at %02x:%02x.%x vid=%04x did=%04x bar=0x%llx\n",
-                    (hs.kind == HYPE_HOST_STORAGE_NVME) ? "NVMe" : "AHCI", (unsigned)hs.bus,
+                    "host-pci: storage[%u]=%s at %02x:%02x.%x vid=%04x did=%04x bar=0x%llx\n",
+                    found, (hs.kind == HYPE_HOST_STORAGE_NVME) ? "NVMe" : "AHCI", (unsigned)hs.bus,
                     (unsigned)hs.dev, (unsigned)hs.func, (unsigned)hs.vendor_id,
                     (unsigned)hs.device_id, (unsigned long long)hs.bar_phys);
-            } else {
+            }
+            if (found == 0u) {
                 hype_debug_print("host-pci: no AHCI/NVMe storage controller found (buses 0-255)\n");
             }
         }
@@ -9353,8 +9359,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     {
         static uint8_t g_nvme_probe[512] __attribute__((aligned(4096)));
         hype_host_storage_t hn;
-        if (hype_host_pci_find_storage(hype_host_pci_read32_hw, 255u, &hn) &&
-            hn.kind == HYPE_HOST_STORAGE_NVME) {
+        uint32_t nvme_cur = 0;
+        /* Enumerate EVERY storage controller (real HW has multiple NVMe + a
+         * SATA controller); probe each NVMe. */
+        while (hype_host_pci_find_storage_from(hype_host_pci_read32_hw, 255u, nvme_cur, &hn)) {
+            nvme_cur = (((uint32_t)hn.bus << 8) | ((uint32_t)hn.dev << 3) | (uint32_t)hn.func) + 1u;
+            if (hn.kind != HYPE_HOST_STORAGE_NVME) { continue; }
             /* Polled driver: authoritatively silence the controller's interrupts
              * at the PCI level (INTx-disable + MSI/MSI-X enables) before touching
              * any register, so it can never raise an IRQ into hype's host IDT. */
@@ -9576,8 +9586,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     {
         static uint8_t g_hostdisk_probe[512] __attribute__((aligned(4096)));
         hype_host_storage_t hs;
-        if (hype_host_pci_find_storage(hype_host_pci_read32_hw, 255u, &hs) &&
-            hs.kind == HYPE_HOST_STORAGE_AHCI) {
+        uint32_t ahci_cur = 0;
+        /* Enumerate EVERY storage controller; probe each AHCI (the NVMe loop
+         * above skipped these). Finds a SATA SSD alongside NVMe drives. */
+        while (hype_host_pci_find_storage_from(hype_host_pci_read32_hw, 255u, ahci_cur, &hs)) {
+            ahci_cur = (((uint32_t)hs.bus << 8) | ((uint32_t)hs.dev << 3) | (uint32_t)hs.func) + 1u;
+            if (hs.kind != HYPE_HOST_STORAGE_AHCI) { continue; }
             int sp;
             /* Polled driver: silence the controller's interrupts at the PCI level
              * (INTx-disable + MSI/MSI-X enables) before bring-up, so it can never
