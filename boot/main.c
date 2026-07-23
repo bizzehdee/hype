@@ -265,6 +265,17 @@ typedef struct hype_fw_vm {
     hype_acpi_loader_entry_t loader_script[HYPE_ACPI_LOADER_SCRIPT_ENTRIES];
     hype_ahci_t ahci;   /* FW-1h: AHCI/ATAPI CD-ROM (backed by the loaded ISO) */
     hype_atapi_t atapi;
+    /* GLADDER-9 (#140): per-VM ISO backing, so two guests can boot DIFFERENT
+     * media (Fedora on vm0, Ubuntu on vm1) rather than one shared global. The
+     * backing is either a RAM-loaded chunk list (iso_chunked, the QEMU/no-host-
+     * disk path) or an on-demand stream off a host disk partition/file
+     * (iso_stream, when iso_stream_ready). iso_host_phys/iso_size are the flat
+     * chunk-0 aliases the direct-read consumers (CD001 check) use. */
+    uint64_t iso_host_phys;
+    uint64_t iso_size;
+    hype_chunked_iso_t iso_chunked;
+    hype_iso_stream_t iso_stream;
+    int iso_stream_ready;
     hype_gpa_map_t dma_map; /* VALID-1/3: guest-phys->host layout for DMA bounds */
     /* --- per-run timing + diagnostics (M4-6b1/M4-6d4/PERF-1a) --- */
     uint64_t host_tsc_hz;   /* calibrated CPU freq; drives the guest timebase */
@@ -317,21 +328,13 @@ static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
 #define g_fw_1_vmrun_max_tsc (vm->vmrun_max_tsc)
 #define g_fw_1_vmrun_over100ms (vm->vmrun_over100ms)
 
-/* ISO-1's loaded test.iso buffer -- shared: both VMs boot the same media.
- * GLADDER-10(a): the real backing is g_iso_chunked (non-contiguous chunks, for
- * multi-GB ISOs). g_iso_host_phys/g_iso_size are kept as flat aliases pointing
- * at chunk 0 for the small-ISO consumers that read the buffer directly (the
- * ISO-2 self-test and the load-time CD001 check) -- those only touch the first
- * 256MB, which is chunk 0. FW-1's ATAPI uses the chunked backing directly. */
-static uint64_t g_iso_host_phys;
-static uint64_t g_iso_size;
-static hype_chunked_iso_t g_iso_chunked;
-/* GLADDER-10: when a raw ISO partition is found + verified post-EBS, this holds
- * the streaming backing; run_fw_1_test() binds the guest CD to it (instead of the
- * RAM-chunked copy) so the ISO is served on demand from disk. Declared here (not
- * near efi_main) so run_fw_1_test, defined earlier, can see it. */
-static hype_iso_stream_t g_iso_stream;
-static int g_iso_stream_ready;
+/* GLADDER-9 (#140): the loaded ISO backing is now PER-VM (hype_fw_vm_t.iso_*),
+ * so two guests can boot different media. What used to be the g_iso_* globals
+ * lives in g_vms[N].{iso_host_phys,iso_size,iso_chunked,iso_stream,
+ * iso_stream_ready}: the RAM chunk list (iso_chunked, the QEMU/no-host-disk
+ * path), the on-demand host-disk stream (iso_stream, when iso_stream_ready),
+ * and the flat chunk-0 aliases (iso_host_phys/iso_size) the direct-read
+ * consumers (ISO-2 self-test, load-time CD001 check) use. */
 /* Host usable-RAM total (UEFI memory map), reported by the guest CMOS model. */
 static uint64_t g_usable_ram_bytes;
 
@@ -1876,7 +1879,7 @@ static hype_atapi_t g_iso_2_atapi;
 
 /*
  * ISO-2: backs M4-5's own AHCI/ATAPI in-memory model with ISO-1's real
- * loaded \iso\test.iso buffer (g_iso_host_phys/g_iso_size) instead of a
+ * loaded \iso\test.iso buffer (g_vms[0].iso_host_phys/iso_size) instead of a
  * synthetic pattern -- otherwise an exact copy of M4-5's own test
  * guest (same payload template, same fixed-address convention; PCI
  * discovery is PCI-2's own separate concern, not needed here). Reads
@@ -1908,7 +1911,7 @@ static void run_iso_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_guest_ram_zero(g_iso_2_guest_code, sizeof(g_iso_2_guest_code));
     hype_guest_ram_zero(g_iso_2_guest_stack, sizeof(g_iso_2_guest_stack));
 
-    hype_atapi_reset(&g_iso_2_atapi, (uint8_t *)(uintptr_t)g_iso_host_phys, g_iso_size);
+    hype_atapi_reset(&g_iso_2_atapi, (uint8_t *)(uintptr_t)g_vms[0].iso_host_phys, g_vms[0].iso_size);
     hype_ahci_reset(&g_iso_2_ahci);
 
     cmd_list_phys = (uint64_t)(uintptr_t)g_iso_2_cmd_list;
@@ -1983,7 +1986,7 @@ static void run_iso_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
 
-    iso_bytes = (const uint8_t *)(uintptr_t)g_iso_host_phys;
+    iso_bytes = (const uint8_t *)(uintptr_t)g_vms[0].iso_host_phys;
     for (i = 0; i < HYPE_ATAPI_SECTOR_SIZE; i++) {
         uint64_t file_offset = (uint64_t)HYPE_ISO_2_PVD_LBA * HYPE_ATAPI_SECTOR_SIZE + i;
         if (g_iso_2_dest_buffer[i] != iso_bytes[file_offset]) {
@@ -5217,10 +5220,10 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx) {
     hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
     hype_ahci_reset(&g_fw_1_ahci);
-    if (g_iso_stream_ready) {
-        hype_atapi_reset_stream(&g_fw_1_atapi, &g_iso_stream);
+    if (vm->iso_stream_ready) {
+        hype_atapi_reset_stream(&g_fw_1_atapi, &vm->iso_stream);
     } else {
-        hype_atapi_reset_chunked(&g_fw_1_atapi, &g_iso_chunked);
+        hype_atapi_reset_chunked(&g_fw_1_atapi, &vm->iso_chunked);
     }
     {
         uint64_t above_16mb = (HYPE_FW_1_GUEST_RAM_BYTES > 16ULL * 1024 * 1024)
@@ -5314,10 +5317,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     /* GLADDER-10: prefer the streaming backing (ISO served on demand from its raw
      * disk partition) when one was found + verified post-EBS; otherwise fall back
      * to the RAM-chunked copy (GLADDER-10a). */
-    if (g_iso_stream_ready) {
-        hype_atapi_reset_stream(&g_fw_1_atapi, &g_iso_stream);
+    if (vm->iso_stream_ready) {
+        hype_atapi_reset_stream(&g_fw_1_atapi, &vm->iso_stream);
     } else {
-        hype_atapi_reset_chunked(&g_fw_1_atapi, &g_iso_chunked); /* GLADDER-10(a): chunked backing */
+        hype_atapi_reset_chunked(&g_fw_1_atapi, &vm->iso_chunked); /* GLADDER-10(a): chunked backing */
     }
     /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging
      * the CD-ROM discovery sequence -- hype_svm_set_ahci_trace(1) -- but
@@ -8038,6 +8041,75 @@ static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
                                (uint16_t)count, dst);
 }
 
+/* GLADDER-9 (#140): field-by-field copy of a chunk list (freestanding hype has
+ * no memcpy, so whole-struct assignment of the 48-entry chunk_base can't be
+ * used). Used to let a sharing vm1 point at vm0's read-only backing. */
+static void chunked_iso_copy(hype_chunked_iso_t *dst, const hype_chunked_iso_t *src) {
+    unsigned i;
+    for (i = 0; i < HYPE_ISO_MAX_CHUNKS; i++) {
+        dst->chunk_base[i] = src->chunk_base[i];
+    }
+    dst->chunk_bytes = src->chunk_bytes;
+    dst->total_bytes = src->total_bytes;
+    dst->n_chunks = src->n_chunks;
+}
+
+/* GLADDER-9 (#140): load an ISO file from the boot ESP into `vm`'s OWN RAM
+ * chunk list (iso_chunked + the flat iso_host_phys/iso_size aliases), so a
+ * second guest can be given DIFFERENT media than the first. Same 256MB-chunk
+ * scheme as vm0's inline load. Returns 0 on success, -1 if the file is
+ * absent / too small / unreadable / too big / not an ISO9660 image -- the
+ * caller then falls back to sharing another VM's (read-only) backing. Pre-EBS
+ * only: uses UEFI Simple File System + AllocatePages. */
+static int load_iso_into_vm(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable,
+                            CHAR16 *path, hype_fw_vm_t *vm) {
+    EFI_FILE_PROTOCOL *root = 0;
+    UINT64 iso_size = 0;
+    const uint64_t chunk_bytes = 256ULL * 1024ULL * 1024ULL;
+    uint64_t n_chunks, ci;
+    const uint8_t *iso_bytes;
+
+    if (hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root) != EFI_SUCCESS) {
+        return -1;
+    }
+    if (hype_file_get_size(root, SystemTable->BootServices, path, &iso_size) != EFI_SUCCESS) {
+        return -1; /* file absent */
+    }
+    if (iso_size < 32769 + 5) {
+        return -1;
+    }
+    n_chunks = (iso_size + chunk_bytes - 1ULL) / chunk_bytes;
+    if (n_chunks > HYPE_ISO_MAX_CHUNKS) {
+        return -1;
+    }
+    for (ci = 0; ci < n_chunks; ci++) {
+        uint64_t this_len = iso_size - ci * chunk_bytes;
+        UINTN this_pages;
+        uint64_t base;
+        if (this_len > chunk_bytes) {
+            this_len = chunk_bytes;
+        }
+        this_pages = (UINTN)((this_len + 4095ULL) / 4096ULL);
+        base = hype_alloc_pages_any(SystemTable->BootServices, this_pages);
+        if (hype_file_read_range(root, path, ci * chunk_bytes, (void *)(uintptr_t)base,
+                                 (UINTN)this_len) != EFI_SUCCESS) {
+            return -1;
+        }
+        vm->iso_chunked.chunk_base[ci] = base;
+    }
+    vm->iso_chunked.chunk_bytes = chunk_bytes;
+    vm->iso_chunked.total_bytes = iso_size;
+    vm->iso_chunked.n_chunks = (unsigned)n_chunks;
+    vm->iso_host_phys = vm->iso_chunked.chunk_base[0];
+    vm->iso_size = iso_size;
+    iso_bytes = (const uint8_t *)(uintptr_t)vm->iso_host_phys;
+    if (iso_bytes[32769] != 'C' || iso_bytes[32770] != 'D' || iso_bytes[32771] != '0' ||
+        iso_bytes[32772] != '0' || iso_bytes[32773] != '1') {
+        return -1; /* not a real ISO9660 image */
+    }
+    return 0;
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -8453,7 +8525,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * CHUNKS (one AllocatePages + range-read each) instead of a single
              * contiguous allocation, which OUT_OF_RESOURCES's for a multi-GB
              * server ISO (no contiguous region that large). The ATAPI model
-             * reads across chunks via g_iso_chunked. */
+             * reads across chunks via the per-VM iso_chunked. */
             {
                 uint64_t chunk_bytes = 256ULL * 1024ULL * 1024ULL;
                 uint64_t n_chunks = (iso_size + chunk_bytes - 1ULL) / chunk_bytes;
@@ -8481,13 +8553,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                    (unsigned long long)ci, (unsigned long long)(ci * chunk_bytes),
                                    (unsigned long long)this_len, (unsigned long long)rr);
                     }
-                    g_iso_chunked.chunk_base[ci] = base;
+                    g_vms[0].iso_chunked.chunk_base[ci] = base;
                 }
-                g_iso_chunked.chunk_bytes = chunk_bytes;
-                g_iso_chunked.total_bytes = iso_size;
-                g_iso_chunked.n_chunks = (unsigned)n_chunks;
+                g_vms[0].iso_chunked.chunk_bytes = chunk_bytes;
+                g_vms[0].iso_chunked.total_bytes = iso_size;
+                g_vms[0].iso_chunked.n_chunks = (unsigned)n_chunks;
                 /* flat aliases: chunk 0 (first 256MB) for the direct-read consumers */
-                iso_host_phys = g_iso_chunked.chunk_base[0];
+                iso_host_phys = g_vms[0].iso_chunked.chunk_base[0];
             }
 
             iso_bytes = (const uint8_t *)(uintptr_t)iso_host_phys;
@@ -8501,8 +8573,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "identifier verified at offset 32769\n",
                 (unsigned long long)iso_size);
 
-            g_iso_host_phys = iso_host_phys;
-            g_iso_size = iso_size;
+            g_vms[0].iso_host_phys = iso_host_phys;
+            g_vms[0].iso_size = iso_size;
         }
 
         /* M4-6b1: calibrate the real host TSC frequency once, while Boot
@@ -8539,10 +8611,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          *  - Guest RAM: a fresh, zeroed HYPE_FW_1_GUEST_RAM_BYTES region (the
          *    guest-RAM-zeroed-before-first-run invariant, per guest_ram.h).
          *  - host_tsc_hz: same physical CPU, so reuse the BSP's calibration.
+         *  - ISO (GLADDER-9 #140): vm1 gets its OWN per-VM backing. If a distinct
+         *    \iso\vm1.iso is present it is loaded into vm1's own chunk list
+         *    (mixed-distro: Fedora on vm0, Ubuntu on vm1); otherwise vm1 shares
+         *    vm0's read-only backing (safe for two concurrent readers).
          *
-         * The ISO (g_iso_host_phys) stays shared: it is read-only, so two
-         * guests reading the same backing concurrently is safe. run_fw_1_test
-         * builds each VM's own NPT/devices/VMCB/ACPI from these fields.
+         * run_fw_1_test builds each VM's own NPT/devices/VMCB/ACPI from these
+         * fields.
          */
         {
             hype_fw_vm_t *vm1 = &g_vms[1];
@@ -8563,6 +8638,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_guest_ram_copy((void *)(uintptr_t)vm1->fw_pristine_host_phys,
                                 (const void *)(uintptr_t)vm1->combined_host_phys, vm1->combined_size);
             vm1->host_tsc_hz = vm->host_tsc_hz;
+            /* GLADDER-9: distinct media for vm1 if \iso\vm1.iso exists, else share
+             * vm0's read-only ISO backing. (The streaming case, when vm0 later
+             * ends up served from a host disk, is propagated to a sharing vm1
+             * after the post-EBS stream-setup block below.) */
+            if (load_iso_into_vm(ImageHandle, SystemTable, (CHAR16 *)L"\\iso\\vm1.iso", vm1) == 0) {
+                hype_debug_print("fw-1 VM1: loaded DISTINCT media \\iso\\vm1.iso (%llu bytes)\n",
+                                 (unsigned long long)vm1->iso_size);
+            } else {
+                chunked_iso_copy(&vm1->iso_chunked, &vm->iso_chunked);
+                vm1->iso_host_phys = vm->iso_host_phys;
+                vm1->iso_size = vm->iso_size;
+                hype_debug_print("fw-1 VM1: no \\iso\\vm1.iso -- sharing vm0's ISO backing\n");
+            }
             hype_debug_print(
                 "fw-1 VM1: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
                 (unsigned long long)vm1->combined_host_phys, (unsigned long long)vm1->combined_size,
@@ -8912,13 +9000,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                          (unsigned long long)file.extents[0].start_lba,
                                          (unsigned long long)abs_lba,
                                          (unsigned long long)file.size_bytes, file.count);
-                        g_iso_stream.read = hostdisk_read;
-                        g_iso_stream.ctx = 0;
-                        g_iso_stream.part_start_lba = abs_lba;
-                        g_iso_stream.iso_size = file.size_bytes;
-                        if (hype_iso_stream_read(&g_iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+                        g_vms[0].iso_stream.read = hostdisk_read;
+                        g_vms[0].iso_stream.ctx = 0;
+                        g_vms[0].iso_stream.part_start_lba = abs_lba;
+                        g_vms[0].iso_stream.iso_size = file.size_bytes;
+                        if (hype_iso_stream_read(&g_vms[0].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                             cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
-                            g_iso_stream_ready = 1;
+                            g_vms[0].iso_stream_ready = 1;
                             hype_serial_print("host-stream: CD001 verified streaming from a FILE on "
                                               "the FAT/exFAT ESP -- backing guest CD via streaming\n");
                         } else {
@@ -8938,7 +9026,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * -- GPT-locate partition 2, stream-read its ISO9660 PVD and
                  * verify the "CD001" magic at byte 32769. Proves gpt + ahci_host +
                  * iso_stream compose against a raw-partition backing too. */
-                if (!g_iso_stream_ready) {
+                if (!g_vms[0].iso_stream_ready) {
                     hype_gpt_partition_t iso_part;
                     if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
                         hype_serial_print("host-gpt: no partition 2 (raw ISO) on the boot disk\n");
@@ -8948,14 +9036,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                          (unsigned long long)iso_part.first_lba,
                                          (unsigned long long)iso_part.last_lba,
                                          (unsigned long long)iso_part.size_bytes);
-                        g_iso_stream.read = hostdisk_read;
-                        g_iso_stream.ctx = 0;
-                        g_iso_stream.part_start_lba = iso_part.first_lba;
-                        g_iso_stream.iso_size = iso_part.size_bytes;
-                        if (hype_iso_stream_read(&g_iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+                        g_vms[0].iso_stream.read = hostdisk_read;
+                        g_vms[0].iso_stream.ctx = 0;
+                        g_vms[0].iso_stream.part_start_lba = iso_part.first_lba;
+                        g_vms[0].iso_stream.iso_size = iso_part.size_bytes;
+                        if (hype_iso_stream_read(&g_vms[0].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                             cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
                             /* Streaming read path verified -- back the guest CD with it. */
-                            g_iso_stream_ready = 1;
+                            g_vms[0].iso_stream_ready = 1;
                             hype_serial_print("host-stream: CD001 verified via streaming from "
                                               "partition 2 -- backing guest CD via streaming\n");
                         } else {
@@ -8969,6 +9057,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             }
         }
     }
+
+#if HYPE_RUN_TWO_VMS
+    /* GLADDER-9 (#140): if vm0 ended up STREAMING its ISO from a host disk and
+     * vm1 is sharing vm0's backing (identical chunk-0 base -> no distinct
+     * \iso\vm1.iso was loaded), point vm1 at the same read-only stream. A vm1
+     * with its own RAM-loaded distinct media keeps that (iso_stream_ready 0). */
+    if (g_vms[0].iso_stream_ready &&
+        g_vms[1].iso_chunked.chunk_base[0] == g_vms[0].iso_chunked.chunk_base[0]) {
+        g_vms[1].iso_stream.read = g_vms[0].iso_stream.read;
+        g_vms[1].iso_stream.ctx = g_vms[0].iso_stream.ctx;
+        g_vms[1].iso_stream.part_start_lba = g_vms[0].iso_stream.part_start_lba;
+        g_vms[1].iso_stream.iso_size = g_vms[0].iso_stream.iso_size;
+        g_vms[1].iso_stream_ready = 1;
+    }
+#endif
 
 #if HYPE_AP_SMOKETEST
     /*
