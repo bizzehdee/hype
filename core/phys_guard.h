@@ -60,4 +60,32 @@ int hype_phys_guid_parse(const char *s, uint8_t out16[16]);
  */
 hype_phys_guard_result_t hype_phys_guard_check(const hype_phys_guard_ctx_t *c);
 
+/*
+ * M10-4 (#124): detects whether a disk ALREADY carries a partition table, from
+ * its first two 512-byte sectors -- the input to the guard's non-empty refusal,
+ * computed from the real drive at arm time (not a config flag). Returns 1 if:
+ *   - GPT: sector 1 begins with the "EFI PART" signature, OR
+ *   - MBR: sector 0 ends with the 0x55AA boot signature AND at least one of the
+ *     four partition-table entries has a non-zero type byte.
+ * Returns 0 for a blank/zeroed disk. Pure -- caller supplies the sector bytes
+ * (read via the host AHCI/NVMe driver). Either pointer may be NULL (treated as
+ * absent -> that check contributes nothing).
+ */
+int hype_phys_part_table_nonempty(const uint8_t *sector0, const uint8_t *sector1);
+
+/*
+ * M10-4 (#124): the arm-time "match-before-write" decision, composed from the
+ * detection helper + the guard. Given the config target id, the ENUMERATED
+ * drive identity (serial + GPT GUID, #122), the disk's first two sectors, and
+ * the overwrite/confirm flags, returns the guard result. The caller creates a
+ * WRITABLE physical blk_backend ONLY on HYPE_PHYS_GUARD_ALLOW, and must refuse
+ * (never arm writes) otherwise -- a `physical:` config entry is never by itself
+ * sufficient (§6d/§10). Pure: derives partition_table_nonempty from the sectors,
+ * then applies hype_phys_guard_check.
+ */
+hype_phys_guard_result_t hype_phys_guard_arm(const char *configured_id, const char *drive_serial,
+                                             const uint8_t *disk_guid, const uint8_t *sector0,
+                                             const uint8_t *sector1, int allow_overwrite,
+                                             int operator_confirmed);
+
 #endif /* HYPE_CORE_PHYS_GUARD_H */
