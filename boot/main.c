@@ -102,6 +102,16 @@
 #define HYPE_XHCI_MSC_WRITE_SELFTEST 0
 #endif
 
+/* Real-HW diagnostic build: after the read-only host-controller probes (PCI /
+ * xHCI+USB / NVMe / AHCI enumeration), flush the log to the GOP screen + the
+ * RT-3 NV variable and HALT -- before any guest runs. Gives a serial-less,
+ * cold-boot laptop a photographable frozen screen AND a cold-boot-surviving log
+ * tail of exactly the probe output (which the full guest boot would otherwise
+ * evict). Purely read-only; no FS writes. OFF by default. */
+#ifndef HYPE_DIAG_PROBE_ONLY
+#define HYPE_DIAG_PROBE_ONLY 0
+#endif
+
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
 static hype_gdt_entry_t g_gdt[HYPE_GDT_ENTRY_COUNT];
@@ -9744,6 +9754,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         g_vms[1].iso_stream.part_start_lba = g_vms[0].iso_stream.part_start_lba;
         g_vms[1].iso_stream.iso_size = g_vms[0].iso_stream.iso_size;
         g_vms[1].iso_stream_ready = 1;
+    }
+#endif
+
+#if HYPE_DIAG_PROBE_ONLY
+    /* Real-HW diagnostic: the read-only host/USB/NVMe/AHCI probes above have all
+     * run + logged. Capture the log (frozen GOP screen + RT-3 NV tail) and halt
+     * before any guest -- so the whole captured log IS the probe output. */
+    {
+        hype_debug_print("diag: PROBE-ONLY build -- host enumeration complete, capturing + halting\n");
+        hype_debug_flush_gop();
+        if (g_hype_rt) {
+            (void)hype_nvlog_write(g_hype_rt, hype_logbuf_data(), hype_logbuf_len());
+        }
+        hype_debug_print("diag: log captured to GOP + RT-3 variable; system halted (power-cycle to "
+                         "recover the tail as \\hype-diag-prev.txt on the next boot)\n");
+        hype_debug_flush_gop();
+        for (;;) {
+            __asm__ volatile("cli; hlt");
+        }
     }
 #endif
 
