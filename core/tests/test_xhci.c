@@ -110,6 +110,13 @@ static void test_control_transfer_trbs(void) {
     CHECK_HEX("status dir IN", 1u, (t[3] >> 16) & 1u);
     CHECK_HEX("status IOC clear", 0u, (t[3] >> 5) & 1u);
 
+    hype_xhci_trb_normal(t, 0xCC00ull, 512, 1);
+    CHECK_HEX("normal type", HYPE_XHCI_TRB_NORMAL, hype_xhci_trb_type(t));
+    CHECK_HEX("normal buf", 0xCC00u, t[0]);
+    CHECK_HEX("normal len", 512u, t[2] & 0x1FFFFu);
+    CHECK_HEX("normal IOC", 1u, (t[3] >> 5) & 1u);
+    CHECK_HEX("normal ISP", 1u, (t[3] >> 2) & 1u);
+
     /* link with cycle 0 (opposite of the cmd-trb test's cycle 1) */
     hype_xhci_trb_link(t, 0x8000ull, 0);
     CHECK_HEX("link cycle 0", 0, hype_xhci_trb_cycle(t));

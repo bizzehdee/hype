@@ -94,6 +94,13 @@
 #define HYPE_M10_6_WRITE_SELFTEST 0
 #endif
 
+/* USB-3 (#215): round-trip a pattern to a scratch LBA on the detected USB
+ * mass-storage device (write, read back, verify) to prove the SCSI WRITE(10)
+ * path. DESTRUCTIVE to that LBA; OFF by default, QEMU-usb-storage only. */
+#ifndef HYPE_XHCI_MSC_WRITE_SELFTEST
+#define HYPE_XHCI_MSC_WRITE_SELFTEST 0
+#endif
+
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
 static hype_gdt_entry_t g_gdt[HYPE_GDT_ENTRY_COUNT];
@@ -9482,8 +9489,46 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                                        &msc) != 0) {
                                     hype_serial_print("host-xhci: Configure Endpoint FAILED\n");
                                 } else {
+                                    uint32_t last_lba = 0, bsz = 0;
                                     hype_debug_print("host-xhci: bulk endpoints configured -- "
                                                      "MSC datapath ready\n");
+                                    if (hype_xhci_msc_read_capacity(&xc, slot, &msc, &last_lba,
+                                                                    &bsz) != 0) {
+                                        hype_serial_print("host-xhci: SCSI READ CAPACITY FAILED\n");
+                                    } else {
+                                        static uint8_t sec0[512];
+                                        hype_debug_print("host-xhci: USB disk -- last LBA %u, block "
+                                                         "%u bytes (%llu MiB)\n", last_lba, bsz,
+                                                         (unsigned long long)(((uint64_t)last_lba + 1u)
+                                                             * bsz / (1024ull * 1024ull)));
+                                        if (bsz == 512u &&
+                                            hype_xhci_msc_read(&xc, slot, &msc, 0u, 1u, 512u,
+                                                               sec0) == 0) {
+                                            hype_debug_print("host-xhci: SCSI READ(10) LBA0 OK -- "
+                                                             "mbrsig=%02x%02x\n",
+                                                             (unsigned)sec0[510], (unsigned)sec0[511]);
+                                        } else if (bsz == 512u) {
+                                            hype_serial_print("host-xhci: SCSI READ(10) LBA0 FAILED\n");
+                                        }
+#if HYPE_XHCI_MSC_WRITE_SELFTEST
+                                        if (bsz == 512u) {
+                                            static uint8_t wr[512], rd[512];
+                                            uint32_t test_lba = 1024u; /* scratch */
+                                            unsigned k; int ok = 1;
+                                            for (k = 0; k < 512u; k++) wr[k] = (uint8_t)(0x3Cu ^ (k & 0xFFu));
+                                            if (hype_xhci_msc_write(&xc, slot, &msc, test_lba, 1u, 512u, wr) != 0) {
+                                                hype_serial_print("host-xhci: WRITE(10) self-test write FAILED\n");
+                                            } else if (hype_xhci_msc_read(&xc, slot, &msc, test_lba, 1u, 512u, rd) != 0) {
+                                                hype_serial_print("host-xhci: WRITE(10) self-test readback FAILED\n");
+                                            } else {
+                                                for (k = 0; k < 512u; k++) { if (rd[k] != wr[k]) { ok = 0; break; } }
+                                                hype_debug_print("host-xhci: WRITE(10) self-test lba=%u roundtrip %s "
+                                                                 "(b0=%02x b511=%02x)\n", test_lba, ok ? "OK" : "MISMATCH",
+                                                                 (unsigned)rd[0], (unsigned)rd[511]);
+                                            }
+                                        }
+#endif
+                                    }
                                 }
                             }
                         }

@@ -1,4 +1,5 @@
 #include "xhci.h"
+#include "usb_msc.h"
 
 /*
  * Hardware shim for the xHCI host driver: real MMIO bring-up + port reset.
@@ -32,6 +33,11 @@ static unsigned int g_ep0_cyc;
 static uint8_t g_bulk_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
 static uint8_t g_bulk_out_ring[XPAGE] __attribute__((aligned(XPAGE)));
 static unsigned int g_bin_enq, g_bin_cyc, g_bout_enq, g_bout_cyc;
+/* BOT command/status wrappers + a bulk data bounce buffer. */
+static uint8_t g_cbw[64] __attribute__((aligned(64)));
+static uint8_t g_csw[64] __attribute__((aligned(64)));
+static uint8_t g_data[XPAGE] __attribute__((aligned(XPAGE)));
+static uint32_t g_bot_tag;
 
 static inline uint8_t  rd8(volatile uint8_t *b, uint32_t o)  { return *(volatile uint8_t *)(b + o); }
 static inline uint32_t rd32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
@@ -73,25 +79,30 @@ static uint32_t trb_dw(const uint8_t *ring, unsigned int idx, unsigned int dw) {
     return *(volatile uint32_t *)(ring + idx * HYPE_XHCI_TRB_BYTES + dw * 4u);
 }
 
-/* Enqueue a fully-built command TRB (cycle already stamped by the caller as
- * g_cmd_cyc) onto the command ring, handling the Link-TRB wrap. */
-static void cmd_enqueue(const uint32_t trb[4]) {
-    uint8_t *slot = g_cmd_ring + g_cmd_enq * HYPE_XHCI_TRB_BYTES;
+/* Enqueue a fully-built TRB (cycle already = *cyc) onto any producer ring,
+ * handling the Link-TRB wrap + producer-cycle toggle. */
+static void ring_enqueue(uint8_t *ring, unsigned int *enq, unsigned int *cyc,
+                         const uint32_t trb[4]) {
+    uint8_t *slot = ring + (*enq) * HYPE_XHCI_TRB_BYTES;
     put_le32(slot + 0, trb[0]);
     put_le32(slot + 4, trb[1]);
     put_le32(slot + 8, trb[2]);
     put_le32(slot + 12, trb[3]);
-    g_cmd_enq++;
-    if (g_cmd_enq == RING_TRBS - 1u) { /* reached the Link TRB slot */
+    (*enq)++;
+    if (*enq == RING_TRBS - 1u) { /* reached the Link TRB slot */
         uint32_t link[4];
-        hype_xhci_trb_link(link, phys(g_cmd_ring), g_cmd_cyc); /* match current producer cycle */
-        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
-        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
-        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
-        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
-        g_cmd_enq = 0;
-        g_cmd_cyc ^= 1u;
+        hype_xhci_trb_link(link, phys(ring), *cyc); /* match current producer cycle */
+        put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
+        put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
+        put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
+        put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
+        *enq = 0;
+        *cyc ^= 1u;
     }
+}
+
+static void cmd_enqueue(const uint32_t trb[4]) {
+    ring_enqueue(g_cmd_ring, &g_cmd_enq, &g_cmd_cyc, trb);
 }
 
 /* Poll the event ring for the next valid event (cycle == consumer cycle),
@@ -147,25 +158,8 @@ static void write_ctx(uint8_t *base, unsigned int off, const uint32_t c[8]) {
     for (i = 0; i < 8u; i++) put_le32(base + off + i * 4u, c[i]);
 }
 
-/* Enqueue a transfer TRB (cycle already = g_ep0_cyc) on the EP0 ring, with the
- * same Link-TRB wrap handling as the command ring. */
 static void ep0_enqueue(const uint32_t trb[4]) {
-    uint8_t *slot = g_ep0_ring + g_ep0_enq * HYPE_XHCI_TRB_BYTES;
-    put_le32(slot + 0, trb[0]);
-    put_le32(slot + 4, trb[1]);
-    put_le32(slot + 8, trb[2]);
-    put_le32(slot + 12, trb[3]);
-    g_ep0_enq++;
-    if (g_ep0_enq == RING_TRBS - 1u) {
-        uint32_t link[4];
-        hype_xhci_trb_link(link, phys(g_ep0_ring), g_ep0_cyc);
-        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
-        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
-        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
-        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
-        g_ep0_enq = 0;
-        g_ep0_cyc ^= 1u;
-    }
+    ring_enqueue(g_ep0_ring, &g_ep0_enq, &g_ep0_cyc, trb);
 }
 
 int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int root_port,
@@ -331,6 +325,96 @@ int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
     if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
     return 0;
+}
+
+/* One bulk transfer: enqueue a Normal TRB on `ring`, ring the slot doorbell for
+ * `dci`, and wait its Transfer Event. Returns 0 on success/short-packet. */
+static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsigned int *cyc,
+                     unsigned int slot, unsigned int dci, uint64_t buf_phys, unsigned int len) {
+    volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    uint32_t t[4], evt[4];
+    unsigned int guard = 64u;
+
+    hype_xhci_trb_normal(t, buf_phys, len, (int)(*cyc));
+    ring_enqueue(ring, enq, cyc, t);
+    wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
+    while (guard-- != 0u) {
+        if (next_event(bar, c->rtsoff, evt) != 0) return -1;
+        if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_TRANSFER_EVENT) {
+            unsigned int cc = hype_xhci_event_cc(evt);
+            return (cc == HYPE_XHCI_CC_SUCCESS || cc == HYPE_XHCI_CC_SHORT_PACKET) ? 0 : -1;
+        }
+    }
+    return -1;
+}
+
+/* Bulk-Only Transport: CBW (out) -> optional data phase -> CSW (in). Data flows
+ * through g_data (bounced). Returns 0 iff the CSW reports command-passed. */
+static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
+                    const uint8_t *cdb, unsigned int cdb_len, uint8_t *data, unsigned int data_len,
+                    int dir_in) {
+    unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
+    unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
+    uint32_t tag = ++g_bot_tag;
+    unsigned int i;
+
+    if (data_len > XPAGE) return -1;
+
+    /* CBW on the bulk OUT endpoint. */
+    hype_usb_bot_cbw(g_cbw, tag, data_len, dir_in, 0, cdb, cdb_len);
+    if (bulk_xfer(c, g_bulk_out_ring, &g_bout_enq, &g_bout_cyc, slot, dci_out,
+                  phys(g_cbw), HYPE_USB_CBW_LEN) != 0) return -1;
+
+    /* Data phase (bounced through g_data). */
+    if (data_len) {
+        if (dir_in) {
+            if (bulk_xfer(c, g_bulk_in_ring, &g_bin_enq, &g_bin_cyc, slot, dci_in,
+                          phys(g_data), data_len) != 0) return -1;
+            for (i = 0; i < data_len; i++) data[i] = g_data[i];
+        } else {
+            for (i = 0; i < data_len; i++) g_data[i] = data[i];
+            if (bulk_xfer(c, g_bulk_out_ring, &g_bout_enq, &g_bout_cyc, slot, dci_out,
+                          phys(g_data), data_len) != 0) return -1;
+        }
+    }
+
+    /* CSW on the bulk IN endpoint. */
+    if (bulk_xfer(c, g_bulk_in_ring, &g_bin_enq, &g_bin_cyc, slot, dci_in,
+                  phys(g_csw), HYPE_USB_CSW_LEN) != 0) return -1;
+    return hype_usb_bot_csw_ok(g_csw, tag) ? 0 : -1;
+}
+
+int hype_xhci_msc_read_capacity(hype_xhci_ctrl_t *c, unsigned int slot,
+                                const hype_xhci_msc_eps_t *msc, uint32_t *last_lba,
+                                uint32_t *block_size) {
+    uint8_t cdb[10];
+    uint8_t rc[8];
+    hype_scsi_cdb_read_capacity10(cdb);
+    if (bot_scsi(c, slot, msc, cdb, 10u, rc, 8u, 1) != 0) return -1;
+    hype_scsi_parse_read_capacity10(rc, last_lba, block_size);
+    return 0;
+}
+
+int hype_xhci_msc_read(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
+                       uint32_t lba, unsigned int blocks, unsigned int block_size, void *buf) {
+    uint8_t cdb[10];
+    unsigned int len = blocks * block_size;
+    if (len == 0u || len > XPAGE) return -1;
+    hype_scsi_cdb_read10(cdb, lba, (uint16_t)blocks);
+    return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)buf, len, 1);
+}
+
+int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
+                        uint32_t lba, unsigned int blocks, unsigned int block_size, const void *buf) {
+    uint8_t cdb[10];
+    unsigned int len = blocks * block_size;
+    unsigned int i;
+    if (len == 0u || len > XPAGE) return -1;
+    /* stage the caller's data (bot_scsi bounces from g_data for OUT). */
+    for (i = 0; i < len; i++) ((uint8_t *)g_data)[i] = ((const uint8_t *)buf)[i];
+    hype_scsi_cdb_write10(cdb, lba, (uint16_t)blocks);
+    /* pass g_data as the data pointer so bot_scsi's OUT copy is a self-copy. */
+    return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)g_data, len, 0);
 }
 
 int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
