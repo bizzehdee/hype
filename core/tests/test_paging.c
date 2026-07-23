@@ -133,8 +133,36 @@ static void test_map_region_out_of_range_and_empty(void) {
               hype_paging_map_region_2mb(g_pdpt, g_fb_pd, 0x4000000000ULL, 0));
 }
 
+static hype_pte_t g_mmio_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_mmio_pd[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+
+static void test_map_mmio_1gb_high(void) {
+    /* An NVMe BAR QEMU placed at ~56 TiB (0x380000000000) -- above PML4[0]. */
+    uint64_t bar = 0x380000000000ULL;
+    uint64_t gb = bar / HYPE_PAGING_1GB; /* 57344 */
+    unsigned int idx;
+
+    hype_paging_build_identity(g_pml4, g_pdpt, g_pd, 4);
+    idx = hype_paging_map_mmio_1gb(g_pml4, g_mmio_pdpt, g_mmio_pd, bar);
+    CHECK_HEX("pml4 index = 57344/512 = 112", 112u, idx);
+    CHECK_HEX("pml4[112] present+write", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE,
+              g_pml4[112] & 0xFFFULL);
+    CHECK_HEX("pml4[112] -> mmio pdpt", (uint64_t)g_mmio_pdpt,
+              g_pml4[112] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("pdpt[0] present -> mmio pd", (uint64_t)g_mmio_pd,
+              g_mmio_pdpt[gb % HYPE_PAGING_ENTRIES_PER_TABLE] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("pd[0] present+write+PS+PCD (uncacheable MMIO)",
+              HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_PS | HYPE_PAGING_PCD,
+              g_mmio_pd[0] & 0xFFFULL);
+    CHECK_HEX("pd[0] maps the BAR's 1GB base", bar, g_mmio_pd[0] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("pd[1] = base + 2MB", bar + HYPE_PAGING_2MB, g_mmio_pd[1] & 0x000FFFFFFFFFF000ULL);
+    /* PML4[0] low identity map untouched. */
+    CHECK_HEX("pml4[0] still present", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE, g_pml4[0] & 0xFFFULL);
+}
+
 int main(void) {
     test_encode_entry();
+    test_map_mmio_1gb_high();
     test_encode_entry_masks_low_bits_of_address();
     test_encode_entry_nx_bit();
     test_encode_entry_flags_masked_to_allowed_bits();

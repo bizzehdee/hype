@@ -32,6 +32,8 @@
 #define HYPE_PAGING_PRESENT (1ULL << 0)
 #define HYPE_PAGING_WRITE (1ULL << 1)
 #define HYPE_PAGING_USER (1ULL << 2)
+#define HYPE_PAGING_PWT (1ULL << 3)
+#define HYPE_PAGING_PCD (1ULL << 4) /* page cache disable -- uncacheable (MMIO) */
 #define HYPE_PAGING_PS (1ULL << 7)
 
 typedef uint64_t hype_pte_t;
@@ -75,6 +77,19 @@ void hype_paging_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
  * of GB slots mapped, 0 if the region is out of PML4[0] range or empty.
  * Pure table-filling, no CPU state touched.
  */
+/*
+ * Maps the 1 GiB region containing `phys` into `pml4` at its natural PML4/PDPT
+ * index, using caller-owned `pdpt` and `pd` tables (each a 4KB-aligned
+ * 512-entry array), via 512 uncacheable (PCD) 2MB PS pages. Unlike
+ * hype_paging_map_region_2mb this reaches ANY address, including above
+ * PML4[0]'s low 512 GiB -- e.g. a 64-bit MMIO BAR firmware placed high (an
+ * NVMe controller's register window). PCD is set because MTRR coverage of a
+ * high 64-bit MMIO hole can't be assumed. Returns the PML4 index populated.
+ * Pure: touches only the three supplied tables.
+ */
+unsigned int hype_paging_map_mmio_1gb(hype_pte_t *pml4, hype_pte_t *pdpt, hype_pte_t *pd,
+                                       uint64_t phys);
+
 unsigned int hype_paging_map_region_2mb(hype_pte_t *pdpt,
                                          hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                                          uint64_t phys_base, uint64_t size);
