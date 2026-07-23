@@ -75,6 +75,37 @@ static int identity_matches(const hype_phys_guard_ctx_t *c) {
     return 0;
 }
 
+int hype_phys_part_table_nonempty(const uint8_t *sector0, const uint8_t *sector1) {
+    /* GPT: the header sits in LBA 1 and begins with "EFI PART" (ECMA/UEFI). */
+    if (sector1 != 0) {
+        static const uint8_t gpt_sig[8] = {'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T'};
+        int gpt = 1;
+        unsigned i;
+        for (i = 0; i < 8u; i++) {
+            if (sector1[i] != gpt_sig[i]) {
+                gpt = 0;
+                break;
+            }
+        }
+        if (gpt) {
+            return 1;
+        }
+    }
+    /* MBR: 0x55AA boot signature at bytes 510-511 + a non-zero partition type in
+     * any of the four 16-byte entries at offset 446 (type byte at entry+4). */
+    if (sector0 != 0) {
+        if (sector0[510] == 0x55u && sector0[511] == 0xAAu) {
+            unsigned e;
+            for (e = 0; e < 4u; e++) {
+                if (sector0[446u + e * 16u + 4u] != 0u) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 hype_phys_guard_result_t hype_phys_guard_check(const hype_phys_guard_ctx_t *c) {
     if (!identity_matches(c)) {
         return HYPE_PHYS_GUARD_DENY_ID_MISMATCH;
@@ -86,4 +117,18 @@ hype_phys_guard_result_t hype_phys_guard_check(const hype_phys_guard_ctx_t *c) {
         return HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM;
     }
     return HYPE_PHYS_GUARD_ALLOW;
+}
+
+hype_phys_guard_result_t hype_phys_guard_arm(const char *configured_id, const char *drive_serial,
+                                             const uint8_t *disk_guid, const uint8_t *sector0,
+                                             const uint8_t *sector1, int allow_overwrite,
+                                             int operator_confirmed) {
+    hype_phys_guard_ctx_t c;
+    c.configured_id = configured_id;
+    c.drive_serial = drive_serial;
+    c.disk_guid = disk_guid;
+    c.partition_table_nonempty = hype_phys_part_table_nonempty(sector0, sector1);
+    c.allow_overwrite = allow_overwrite;
+    c.operator_confirmed = operator_confirmed;
+    return hype_phys_guard_check(&c);
 }

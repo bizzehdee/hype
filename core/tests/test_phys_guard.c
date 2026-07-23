@@ -136,10 +136,66 @@ static void test_deny_paths(void) {
               hype_phys_guard_check(&c));
 }
 
+static void test_part_table_nonempty(void) {
+    uint8_t s0[512], s1[512];
+    unsigned i;
+    for (i = 0; i < 512u; i++) { s0[i] = 0; s1[i] = 0; }
+
+    /* blank disk -> empty */
+    CHECK_HEX("blank -> 0", 0, hype_phys_part_table_nonempty(s0, s1));
+
+    /* GPT header on sector 1 -> nonempty */
+    { const char *sig = "EFI PART"; for (i = 0; i < 8u; i++) s1[i] = (uint8_t)sig[i]; }
+    CHECK_HEX("GPT sig -> 1", 1, hype_phys_part_table_nonempty(s0, s1));
+    CHECK_HEX("GPT sig, s0 NULL -> 1", 1, hype_phys_part_table_nonempty((const uint8_t *)0, s1));
+    for (i = 0; i < 8u; i++) s1[i] = 0; /* clear GPT */
+
+    /* MBR boot sig but all partition types zero -> empty */
+    s0[510] = 0x55u; s0[511] = 0xAAu;
+    CHECK_HEX("MBR sig, no partitions -> 0", 0, hype_phys_part_table_nonempty(s0, s1));
+
+    /* MBR sig + a non-zero partition type (entry 2, type byte) -> nonempty */
+    s0[446u + 1u * 16u + 4u] = 0x83u; /* Linux partition type */
+    CHECK_HEX("MBR + partition -> 1", 1, hype_phys_part_table_nonempty(s0, s1));
+
+    /* partition-looking bytes but NO boot sig -> empty (not a valid MBR) */
+    s0[510] = 0; s0[511] = 0;
+    CHECK_HEX("partition byte but no 0x55AA -> 0", 0, hype_phys_part_table_nonempty(s0, s1));
+
+    /* both NULL -> 0 */
+    CHECK_HEX("both NULL -> 0", 0,
+              hype_phys_part_table_nonempty((const uint8_t *)0, (const uint8_t *)0));
+}
+
+static void test_arm(void) {
+    uint8_t s0[512], s1[512];
+    unsigned i;
+    for (i = 0; i < 512u; i++) { s0[i] = 0; s1[i] = 0; }
+
+    /* matched serial, blank disk, confirmed -> ALLOW */
+    CHECK_HEX("arm: match+blank+confirmed => ALLOW", HYPE_PHYS_GUARD_ALLOW,
+              hype_phys_guard_arm("QM00013", "QM00013", GUID, s0, s1, 0, 1));
+    /* mismatch -> DENY_ID_MISMATCH regardless */
+    CHECK_HEX("arm: mismatch => DENY", HYPE_PHYS_GUARD_DENY_ID_MISMATCH,
+              hype_phys_guard_arm("WRONG", "QM00013", GUID, s0, s1, 0, 1));
+    /* matched but unconfirmed -> NEEDS_CONFIRM */
+    CHECK_HEX("arm: unconfirmed => NEEDS_CONFIRM", HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM,
+              hype_phys_guard_arm("QM00013", "QM00013", GUID, s0, s1, 0, 0));
+    /* GPT on disk, matched, confirmed, no override -> DENY_NONEMPTY */
+    { const char *sig = "EFI PART"; for (i = 0; i < 8u; i++) s1[i] = (uint8_t)sig[i]; }
+    CHECK_HEX("arm: nonempty disk => DENY_NONEMPTY", HYPE_PHYS_GUARD_DENY_NONEMPTY,
+              hype_phys_guard_arm("QM00013", "QM00013", GUID, s0, s1, 0, 1));
+    /* ... unless overwrite explicitly allowed -> ALLOW */
+    CHECK_HEX("arm: nonempty + allow_overwrite => ALLOW", HYPE_PHYS_GUARD_ALLOW,
+              hype_phys_guard_arm("QM00013", "QM00013", GUID, s0, s1, 1, 1));
+}
+
 int main(void) {
     test_guid_parse();
     test_allow_paths();
     test_deny_paths();
+    test_part_table_nonempty();
+    test_arm();
 
     if (failures == 0) {
         printf("all tests passed\n");
