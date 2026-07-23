@@ -206,38 +206,81 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot, unsigned in
     return 0;
 }
 
-int hype_xhci_get_device_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf18) {
+/*
+ * A control transfer on EP0: Setup [+ Data] + Status, doorbell DCI 1, wait the
+ * Transfer Event. dir_in selects IN(1)/OUT(0) for a data stage; len==0 = no data
+ * (status defaults IN). For IN the received bytes are copied to buf; for OUT the
+ * buf bytes are staged before the transfer. Returns 0 on success/short-packet.
+ */
+static int control_transfer(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t bm_req, uint8_t b_req,
+                            uint16_t wvalue, uint16_t windex, void *buf, unsigned int len,
+                            int dir_in) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     uint32_t t[4], evt[4];
     unsigned int guard = 64u;
-    unsigned int i;
+    unsigned int trt, status_dir_in, i;
 
-    if (!c->inited || slot == 0u) return -1;
-    zero(g_xfer_buf, XPAGE);
+    if (!c->inited || slot == 0u || len > XPAGE) return -1;
+    trt = (len == 0u) ? HYPE_XHCI_TRT_NO_DATA : (dir_in ? HYPE_XHCI_TRT_IN : HYPE_XHCI_TRT_OUT);
 
-    /* GET_DESCRIPTOR(device): bmRequestType=0x80 (IN, standard, device),
-     * bRequest=6 (GET_DESCRIPTOR), wValue=0x0100 (DEVICE, index 0), wLength=18. */
-    hype_xhci_trb_setup_stage(t, 0x80, 6, 0x0100, 0, 18, HYPE_XHCI_TRT_IN, (int)g_ep0_cyc);
+    if (len && !dir_in && buf) {
+        for (i = 0; i < len; i++) g_xfer_buf[i] = ((const uint8_t *)buf)[i];
+    } else {
+        zero(g_xfer_buf, XPAGE);
+    }
+
+    hype_xhci_trb_setup_stage(t, bm_req, b_req, wvalue, windex, (uint16_t)len, trt, (int)g_ep0_cyc);
     ep0_enqueue(t);
-    hype_xhci_trb_data_stage(t, phys(g_xfer_buf), 18, 1, (int)g_ep0_cyc);
-    ep0_enqueue(t);
-    hype_xhci_trb_status_stage(t, 0, 1, (int)g_ep0_cyc);
+    if (len) {
+        hype_xhci_trb_data_stage(t, phys(g_xfer_buf), len, dir_in, (int)g_ep0_cyc);
+        ep0_enqueue(t);
+    }
+    /* Status stage direction is opposite the data direction (IN if no data). */
+    status_dir_in = (len && dir_in) ? 0u : 1u;
+    hype_xhci_trb_status_stage(t, (int)status_dir_in, 1, (int)g_ep0_cyc);
     ep0_enqueue(t);
 
-    /* Ring the slot's doorbell targeting EP0 (DCI 1). */
-    wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), 1u);
+    wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), 1u); /* DCI 1 = EP0 */
 
-    /* Consume events until the Transfer Event for this control transfer. */
     while (guard-- != 0u) {
         if (next_event(bar, c->rtsoff, evt) != 0) return -1;
         if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_TRANSFER_EVENT) {
             unsigned int cc = hype_xhci_event_cc(evt);
             if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) return -1;
-            for (i = 0; i < 18u; i++) buf18[i] = g_xfer_buf[i];
+            if (len && dir_in && buf) {
+                for (i = 0; i < len; i++) ((uint8_t *)buf)[i] = g_xfer_buf[i];
+            }
             return 0;
         }
     }
     return -1;
+}
+
+int hype_xhci_get_device_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf18) {
+    /* GET_DESCRIPTOR(DEVICE, index 0), 18 bytes, IN. */
+    return control_transfer(c, slot, 0x80, 6, 0x0100, 0, buf18, 18u, 1);
+}
+
+int hype_xhci_get_config_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf,
+                                    unsigned int maxlen, unsigned int *out_len) {
+    uint8_t hdr[9];
+    unsigned int total;
+
+    /* First read the 9-byte config header to learn wTotalLength. */
+    if (control_transfer(c, slot, 0x80, 6, 0x0200, 0, hdr, 9u, 1) != 0) return -1;
+    total = (unsigned int)hdr[2] | ((unsigned int)hdr[3] << 8);
+    if (total < 9u) return -1;
+    if (total > maxlen) total = maxlen;
+    /* Re-read the full config (config + interface + endpoint descriptors). */
+    if (control_transfer(c, slot, 0x80, 6, 0x0200, 0, buf, total, 1) != 0) return -1;
+    if (out_len) *out_len = total;
+    return 0;
+}
+
+int hype_xhci_set_configuration(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int config_value) {
+    /* SET_CONFIGURATION: bmRequestType=0x00 (OUT/standard/device), bRequest=9,
+     * wValue=config, no data stage. */
+    return control_transfer(c, slot, 0x00, 9, (uint16_t)config_value, 0, 0, 0u, 0);
 }
 
 int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {

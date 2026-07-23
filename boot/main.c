@@ -9454,12 +9454,31 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         } else if (hype_xhci_get_device_descriptor(&xc, slot, desc) != 0) {
                             hype_serial_print("host-xhci: GET_DESCRIPTOR FAILED\n");
                         } else {
+                            static uint8_t cfgbuf[256];
+                            unsigned int cfglen = 0;
+                            hype_xhci_msc_eps_t msc;
                             hype_debug_print("host-xhci: device descriptor -- USB %x.%02x class=%02x "
                                              "mps0=%u vid=%04x pid=%04x\n",
                                              (unsigned)desc[3], (unsigned)desc[2], (unsigned)desc[4],
                                              (unsigned)desc[7],
                                              (unsigned)(desc[8] | (desc[9] << 8)),
                                              (unsigned)(desc[10] | (desc[11] << 8)));
+                            /* Read + parse the config descriptor, find the bulk-only
+                             * MSC endpoints, and select the configuration. */
+                            if (hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
+                                                                &cfglen) != 0) {
+                                hype_serial_print("host-xhci: GET config descriptor FAILED\n");
+                            } else if (hype_xhci_msc_find_endpoints(cfgbuf, cfglen, &msc) != 0) {
+                                hype_debug_print("host-xhci: no bulk-only SCSI MSC interface "
+                                                 "(cfg %u bytes)\n", cfglen);
+                            } else if (hype_xhci_set_configuration(&xc, slot, msc.config_value) != 0) {
+                                hype_serial_print("host-xhci: SET_CONFIGURATION FAILED\n");
+                            } else {
+                                hype_debug_print("host-xhci: MSC configured -- cfg=%u iface=%u "
+                                                 "bulk-in=0x%02x bulk-out=0x%02x mps=%u\n",
+                                                 msc.config_value, msc.interface_num,
+                                                 msc.bulk_in_ep, msc.bulk_out_ep, msc.bulk_in_mps);
+                            }
                         }
                     } else {
                         hype_serial_print("host-xhci: Enable Slot FAILED\n");
