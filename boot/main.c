@@ -25,6 +25,7 @@
 #include "../core/fat.h"
 #include "../core/nvme_host.h"
 #include "../core/blk_backend.h"
+#include "../core/blk_phys.h"
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
@@ -72,6 +73,25 @@
  * -- it writes to a real drive when one is present, so only enable it for a
  * QEMU boot with a `-device nvme` SCRATCH disk, NEVER on real hardware. */
 #define HYPE_NVME_WRITE_SELFTEST 0
+
+/* M10-6a (#227): auto-accept the physical-write confirmation at arm time,
+ * WITHOUT the interactive `confirm <serial>` keystroke. OFF by default -- the
+ * whole point of #125 is that a human confirms a destructive write. Enable ONLY
+ * for a headless QEMU-scratch validation (a `-device nvme` SCRATCH disk whose
+ * serial matches the config target), NEVER on real hardware. */
+#ifndef HYPE_M10_6_AUTOCONFIRM
+#define HYPE_M10_6_AUTOCONFIRM 0
+#endif
+
+/* M10-6a (#227): after a confirmed physical target attaches as a guest's
+ * virtio-blk backend, round-trip a known pattern through the guest-facing
+ * hype_blk_backend to a SCRATCH LBA (write, read back, verify) to prove guest
+ * writes reach the real disk. DESTRUCTIVE within that one scratch LBA; OFF by
+ * default, QEMU-scratch only. Requires HYPE_M10_6_AUTOCONFIRM to reach a
+ * confirmed backend headlessly. */
+#ifndef HYPE_M10_6_WRITE_SELFTEST
+#define HYPE_M10_6_WRITE_SELFTEST 0
+#endif
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -294,6 +314,12 @@ typedef struct hype_fw_vm {
     hype_blk_backend_t vblk_be;
     hype_blk_file_t vblk_file;
     uint64_t vblk_backing_phys; /* host-physical base of this VM's scratch disk */
+    /* M10-6a (#227): when this VM's confirmed target is a `physical:` disk, the
+     * backend above is instead a writable physical backend over the enumerated
+     * host NVMe scratch. Which backing is live is decided in fw_1_setup_virtio_blk. */
+    hype_blk_phys_t vblk_phys;
+    hype_blk_phys_nvme_t vblk_phys_nvme;
+    int vblk_is_physical;
     hype_gpa_map_t dma_map; /* VALID-1/3: guest-phys->host layout for DMA bounds */
     /* --- per-run timing + diagnostics (M4-6b1/M4-6d4/PERF-1a) --- */
     uint64_t host_tsc_hz;   /* calibrated CPU freq; drives the guest timebase */
@@ -442,6 +468,16 @@ static char g_cmd_result[96];
  * Owner-core only, like the rest of the dashboard command state.
  */
 static hype_phys_confirm_t g_phys_confirm;
+
+/* M10-6a (#227): the enumerated NVMe scratch target for a confirmed `physical:`
+ * write. hype boots off the AHCI ESP, so an NVMe controller is a SEPARATE disk
+ * -- the safe destructive-write target under test. Captured at the host-nvme
+ * enumeration block; consumed by fw_1_setup_virtio_blk when the confirmed
+ * target serial matches g_hostnvme_serial. */
+static int g_hostnvme_present;
+static uint64_t g_hostnvme_bar;
+static uint64_t g_hostnvme_total_sectors;
+static char g_hostnvme_serial[21];
 
 static int term_streq(const char *a, const char *b) {
     unsigned i = 0;
@@ -5279,11 +5315,81 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
  * (fw_1_vm_reinit). The vCPU loop latches the BAR OVMF assigns, dispatches BAR
  * MMIO to the (GPA-translated, VALID-3) virtio handler, and raises the
  * completion IRQ on GSI 20. */
+/* M10-6a (#227): at most one VM claims the single enumerated physical scratch. */
+static int g_phys_backend_claimed_vm = -1;
+
+/* True iff this VM should back its virtio-blk with the CONFIRMED writable NVMe
+ * scratch instead of the RAM/file disk: a scratch was enumerated, the #125
+ * confirm is ACCEPTED, its serial matches the scratch, and no other VM already
+ * claimed it. (VM-name<->config wiring is a later CONFIG item, so the confirmed
+ * physical disk attaches to the first eligible guest, matched by serial.) */
+static int fw_1_vblk_use_physical(hype_fw_vm_t *vm) {
+    int idx = (int)(vm - &g_vms[0]);
+    if (!g_hostnvme_present) return 0;
+    if (!hype_phys_confirm_is_accepted(&g_phys_confirm)) return 0;
+    if (!term_streq(g_phys_confirm.serial, g_hostnvme_serial)) return 0;
+    if (g_phys_backend_claimed_vm >= 0 && g_phys_backend_claimed_vm != idx) return 0;
+    return 1;
+}
+
+#if HYPE_M10_6_WRITE_SELFTEST
+/* Round-trips a known pattern through the guest-facing blk_backend to a scratch
+ * LBA (well past any partition table) to prove guest writes reach the physical
+ * disk. DESTRUCTIVE within that one LBA; gated OFF by default. */
+static void fw_1_vblk_write_selftest(hype_fw_vm_t *vm) {
+    static uint8_t wr[512], rd[512];
+    uint64_t lba = 4096u;
+    unsigned k;
+    int ok = 1;
+    for (k = 0; k < 512u; k++) wr[k] = (uint8_t)(0x5Au ^ (k & 0xFFu));
+    if (hype_blk_backend_write(&vm->vblk_be, lba, 1u, wr) != 0) {
+        hype_serial_print("virtio-blk: M10-6 WRITE-SELFTEST write FAILED\n");
+        return;
+    }
+    for (k = 0; k < 512u; k++) rd[k] = 0;
+    if (hype_blk_backend_read(&vm->vblk_be, lba, 1u, rd) != 0) {
+        hype_serial_print("virtio-blk: M10-6 WRITE-SELFTEST readback FAILED\n");
+        return;
+    }
+    for (k = 0; k < 512u; k++) { if (rd[k] != wr[k]) { ok = 0; break; } }
+    hype_debug_print("virtio-blk: M10-6 WRITE-SELFTEST lba=%llu roundtrip %s (b0=%02x b511=%02x)\n",
+                     (unsigned long long)lba, ok ? "OK" : "MISMATCH",
+                     (unsigned)rd[0], (unsigned)rd[511]);
+}
+#endif
+
 static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
     uint8_t *config;
-    hype_virtio_blk_reset(&vm->vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
-    hype_blk_file_init(&vm->vblk_file, &vm->vblk_be, (uint8_t *)(uintptr_t)vm->vblk_backing_phys,
-                       HYPE_FW_1_VDISK_BYTES);
+    if (fw_1_vblk_use_physical(vm)) {
+        /* CONFIRMED `physical:` target -> writable NVMe scratch backend. Guest
+         * writes to /dev/vda now land on the real (QEMU scratch) disk. */
+        /* The NVMe register BAR can sit in high MMIO (QEMU puts it at
+         * 0x380000000000) that only lives in g_pml4 via the map_mmio_1gb entry
+         * the host-nvme enumeration installed. Guest setup runs later under a
+         * g_pml4 that may have been rebuilt since, so RE-ESTABLISH the mapping
+         * before any controller-register access from the backend -- otherwise
+         * the first doorbell write #PFs. */
+        if (g_hostnvme_bar >= 512ULL * HYPE_PAGING_1GB) {
+            hype_paging_map_mmio_1gb(g_pml4, g_nvme_pdpt, g_nvme_pd, g_hostnvme_bar);
+            hype_paging_load(g_pml4);
+        }
+        hype_blk_phys_nvme_init(&vm->vblk_phys, &vm->vblk_phys_nvme, &vm->vblk_be,
+                                g_hostnvme_bar, g_hostnvme_total_sectors);
+        vm->vblk_is_physical = 1;
+        g_phys_backend_claimed_vm = (int)(vm - &g_vms[0]);
+        hype_virtio_blk_reset(&vm->vblk, g_hostnvme_total_sectors);
+        hype_debug_print("virtio-blk[vm %d]: WRITABLE PHYSICAL NVMe backend (sn '%s', %llu sectors)\n",
+                         (int)(vm - &g_vms[0]), g_hostnvme_serial,
+                         (unsigned long long)g_hostnvme_total_sectors);
+#if HYPE_M10_6_WRITE_SELFTEST
+        fw_1_vblk_write_selftest(vm);
+#endif
+    } else {
+        vm->vblk_is_physical = 0;
+        hype_virtio_blk_reset(&vm->vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
+        hype_blk_file_init(&vm->vblk_file, &vm->vblk_be, (uint8_t *)(uintptr_t)vm->vblk_backing_phys,
+                           HYPE_FW_1_VDISK_BYTES);
+    }
     hype_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
                         HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
                         HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE);
@@ -8425,6 +8531,13 @@ static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_
             hype_debug_print("phys-write: %s\n",
                              hype_phys_confirm_prompt(&g_phys_confirm, pbuf, sizeof(pbuf)));
         }
+#if HYPE_M10_6_AUTOCONFIRM
+        /* Headless QEMU-scratch validation only: skip the interactive keystroke
+         * by submitting the (known) serial ourselves. Compiled out by default. */
+        (void)hype_phys_confirm_submit(&g_phys_confirm, drive_serial);
+        hype_debug_print("phys-write: AUTO-CONFIRMED (HYPE_M10_6_AUTOCONFIRM) for vm '%s'\n",
+                         v->name);
+#endif
         return; /* at most one pending confirmation at a time */
     }
 }
@@ -9239,8 +9352,29 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             if (hype_nvme_host_init(hn.bar_phys) != 0) {
                 hype_serial_print("host-nvme: controller init failed\n");
             } else if (hype_nvme_host_read(hn.bar_phys, 0u, 1u, g_nvme_probe) == 0) {
+                static uint8_t g_nvme_lba1[512] __attribute__((aligned(4096)));
+                char nvme_model[41];
                 hype_debug_print("host-nvme: init OK, LBA0 read OK -- mbrsig=%02x%02x\n",
                                  (unsigned)g_nvme_probe[510], (unsigned)g_nvme_probe[511]);
+                /* M10-6a: capture this NVMe namespace as the physical scratch
+                 * target + match it against the config via the #124 guard, then
+                 * (on match) arm the #125 dashboard confirm. Separate controller
+                 * from the AHCI boot disk -> safe destructive-write target. */
+                hype_nvme_host_identity(g_hostnvme_serial, nvme_model);
+                g_hostnvme_present = 1;
+                g_hostnvme_bar = hn.bar_phys;
+                g_hostnvme_total_sectors = hype_nvme_host_total_sectors();
+                hype_debug_print("host-nvme: serial='%s' model='%s' sectors=%llu (%llu MiB)\n",
+                                 g_hostnvme_serial, nvme_model,
+                                 (unsigned long long)g_hostnvme_total_sectors,
+                                 (unsigned long long)(g_hostnvme_total_sectors / 2048ull));
+                if (hype_nvme_host_read(hn.bar_phys, 1u, 1u, g_nvme_lba1) != 0) {
+                    hype_serial_print("host-nvme: LBA1 read failed -- phys-write not armed\n");
+                } else {
+                    arm_physical_write_confirm(&g_hype_cfg, g_hostnvme_serial, nvme_model,
+                                               g_hostnvme_total_sectors, 0,
+                                               g_nvme_probe, g_nvme_lba1);
+                }
             } else {
                 hype_serial_print("host-nvme: LBA0 read FAILED\n");
             }
