@@ -77,8 +77,19 @@ static int submit_and_poll(volatile uint8_t *bar, uint8_t *sq, uint8_t *cq, unsi
                 *phase ^= 1u; /* phase flips each time the CQ wraps */
             }
             wr32(bar, hype_nvme_doorbell_offset(qid, 1, g_dstrd), *cq_head);
+            if (!ok) {
+                extern void hype_debug_print(const char *fmt, ...);
+                static int e1 = 0;
+                if (e1++ < 4) hype_debug_print("#229dbg nvme: CQ ERROR status (qid=%u)\n", qid);
+            }
             return ok ? 0 : -1;
         }
+    }
+    {
+        extern void hype_debug_print(const char *fmt, ...);
+        static int t1 = 0;
+        if (t1++ < 4) hype_debug_print("#229dbg nvme: TIMEOUT (qid=%u sq_tail=%u cq_head=%u phase=%u)\n",
+                                       qid, *sq_tail, *cq_head, *phase);
     }
     return -1; /* completion never posted */
 }
