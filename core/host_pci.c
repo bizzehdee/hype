@@ -158,3 +158,49 @@ int hype_host_pci_find_storage(hype_host_pci_read32_fn read32, uint8_t max_bus,
     }
     return 0;
 }
+
+int hype_host_pci_find_xhci(hype_host_pci_read32_fn read32, uint8_t max_bus,
+                            hype_host_xhci_t *out) {
+    unsigned bus;
+    unsigned dev;
+
+    out->bar_phys = 0u;
+    for (bus = 0; bus <= (unsigned)max_bus; bus++) {
+        for (dev = 0; dev < 32u; dev++) {
+            unsigned last_func = 0u;
+            unsigned func;
+
+            for (func = 0; func <= last_func; func++) {
+                uint32_t vd = read32((uint8_t)bus, (uint8_t)dev, (uint8_t)func, CFG_VENDOR_DEVICE);
+                uint32_t cls;
+
+                if ((vd & 0xFFFFu) == VENDOR_INVALID) {
+                    continue;
+                }
+                if (func == 0u) {
+                    uint32_t hdr = read32((uint8_t)bus, (uint8_t)dev, 0u, CFG_HEADER_TYPE);
+                    if (((hdr >> 16) & 0x80u) != 0u) {
+                        last_func = 7u;
+                    }
+                }
+
+                cls = read32((uint8_t)bus, (uint8_t)dev, (uint8_t)func, CFG_CLASS_REVISION);
+                if (((cls >> 24) & 0xFFu) != HYPE_HOST_PCI_CLASS_SERIAL_BUS ||
+                    ((cls >> 16) & 0xFFu) != HYPE_HOST_PCI_SUBCLASS_USB ||
+                    ((cls >> 8) & 0xFFu) != HYPE_HOST_PCI_PROGIF_XHCI) {
+                    continue;
+                }
+
+                out->bus = (uint8_t)bus;
+                out->dev = (uint8_t)dev;
+                out->func = (uint8_t)func;
+                out->vendor_id = (uint16_t)(vd & 0xFFFFu);
+                out->device_id = (uint16_t)((vd >> 16) & 0xFFFFu);
+                out->bar_phys = read_mem_bar(read32, (uint8_t)bus, (uint8_t)dev, (uint8_t)func,
+                                             CFG_BAR0);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}

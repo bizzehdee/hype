@@ -43,6 +43,33 @@ static uint32_t cfg_nvme(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
     }
 }
 
+/* xHCI USB controller at 00:14.0 (class 0C/03/30) with a 64-bit BAR0. */
+static uint32_t cfg_xhci(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
+    if (bus != 0 || dev != 0x14 || func != 0) {
+        return 0xFFFFFFFFu;
+    }
+    switch (off) {
+        case 0x00: return 0x1e318086u;           /* vendor/device */
+        case 0x08: return 0x0c033000u;           /* class 0C, subclass 03 (USB), prog-if 30 (xHCI) */
+        case 0x0C: return 0x00000000u;
+        case 0x10: return 0xE0000004u;           /* BAR0 lo: 64-bit mem, base low 0xE0000000 */
+        case 0x14: return 0x00000003u;           /* BAR0 hi */
+        default:   return 0x00000000u;
+    }
+}
+
+/* A USB controller that is NOT xHCI (EHCI, prog-if 0x20) -- must be skipped. */
+static uint32_t cfg_ehci(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
+    if (bus != 0 || dev != 0x1d || func != 0) {
+        return 0xFFFFFFFFu;
+    }
+    switch (off) {
+        case 0x00: return 0x1e2d8086u;
+        case 0x08: return 0x0c032000u;           /* class 0C/03/20 = EHCI, not xHCI */
+        default:   return 0x00000000u;
+    }
+}
+
 /* No storage anywhere: a lone display controller at 00:02.0 (class 03). */
 static uint32_t cfg_no_storage(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
     if (bus != 0 || dev != 2 || func != 0) {
@@ -197,6 +224,18 @@ static void test_disable_interrupts(void) {
     CHECK_HEX("INTx set even without caps", 0x0400u, g_cfg[0x04 / 4] & 0x0400u);
 }
 
+static void test_find_xhci(void) {
+    hype_host_xhci_t x;
+    CHECK_HEX("xHCI found", 1, hype_host_pci_find_xhci(cfg_xhci, 0, &x));
+    CHECK_HEX("xHCI dev", 0x14, x.dev);
+    CHECK_HEX("xHCI vendor", 0x8086, x.vendor_id);
+    CHECK_HEX("xHCI BAR0 (64-bit assembled, low masked)", 0x3E0000000ull, x.bar_phys);
+    /* EHCI (prog-if 0x20) is not xHCI -> not matched. */
+    CHECK_HEX("EHCI not matched as xHCI", 0, hype_host_pci_find_xhci(cfg_ehci, 0, &x));
+    /* no USB at all */
+    CHECK_HEX("no xHCI in storage-only space", 0, hype_host_pci_find_xhci(cfg_ahci, 0, &x));
+}
+
 int main(void) {
     test_find_ahci();
     test_find_nvme_64bit_bar();
@@ -204,6 +243,7 @@ int main(void) {
     test_multifunction_storage();
     test_find_cap();
     test_disable_interrupts();
+    test_find_xhci();
 
     if (failures == 0) {
         printf("all tests passed\n");

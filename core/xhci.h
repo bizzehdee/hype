@@ -149,4 +149,47 @@ uint64_t hype_xhci_event_trb_ptr(const uint32_t trb[4]);      /* dword0/1: TRB p
 unsigned int hype_xhci_event_port_id(const uint32_t trb[4]);  /* Port Status Change: param[31:24] */
 unsigned int hype_xhci_event_xfer_residue(const uint32_t trb[4]); /* status[23:0] bytes not transferred */
 
+/*
+ * PORTSC is a minefield of RW1C ("write-1-to-clear") change bits plus PED which
+ * also clears-on-1. To set an RW bit (e.g. PR) without accidentally clearing a
+ * change bit or disabling the port, always write
+ *   (current & ~HYPE_XHCI_PORTSC_RW1C) | bits_to_set
+ * This mask names every bit that must be written as 0 to be left untouched.
+ */
+#define HYPE_XHCI_PORTSC_RW1C  ((1u<<1) | (1u<<17) | (1u<<18) | (1u<<19) | \
+                                (1u<<20) | (1u<<21) | (1u<<22) | (1u<<23))
+static inline uint32_t hype_xhci_portsc_write_preserve(uint32_t current, uint32_t bits_to_set) {
+    return (current & ~HYPE_XHCI_PORTSC_RW1C) | bits_to_set;
+}
+
+/* --- hardware bring-up (coverage-exempt shim core/xhci_hw.c; real MMIO). --- */
+
+/* Captured controller geometry + register bases, filled by hype_xhci_host_init. */
+typedef struct {
+    uint64_t bar;            /* xHCI MMIO BAR0 (identity-mapped) */
+    uint32_t op;             /* operational-register base offset (= CAPLENGTH) */
+    uint32_t dboff;          /* raw DBOFF */
+    uint32_t rtsoff;         /* raw RTSOFF */
+    unsigned int max_slots;
+    unsigned int max_ports;
+    unsigned int ctx_size;   /* 32 or 64 (CSZ) */
+    int inited;
+} hype_xhci_ctrl_t;
+
+/*
+ * Brings up the xHCI controller at bar_phys (identity-mapped MMIO): waits ready,
+ * stops + resets, programs MaxSlotsEn + DCBAA (+ scratchpads), the command ring
+ * (CRCR) and event ring (ERST/ERDP), then sets Run. Fills *out. Returns 0 on
+ * success, -1 on a timeout/error. Post-ExitBootServices only.
+ */
+int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out);
+
+/*
+ * Powers + resets every root port and returns the 1-based number of the first
+ * port that comes up connected + enabled, with its PORTSC speed field in
+ * *out_speed; returns 0 if no device is present. Pure PORTSC polling (no event
+ * ring needed for detection).
+ */
+unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_speed);
+
 #endif /* HYPE_CORE_XHCI_H */
