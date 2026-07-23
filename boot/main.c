@@ -5409,6 +5409,21 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
             hype_paging_map_mmio_1gb(g_pml4, g_nvme_pdpt, g_nvme_pd, g_hostnvme_bar);
             hype_paging_load(g_pml4);
         }
+        /* #229: the controller was reset + its admin/IO queues created on the
+         * BSP during pre-dispatch enumeration. This VM's guest I/O runs on THIS
+         * core (an AP), and the first guest read intermittently times out
+         * waiting on a completion that never posts -- a cross-core queue-handoff
+         * race. Re-init the controller HERE, on the servicing core, so the
+         * queues are (re)created + owned by the core that will poll them. */
+        if (hype_nvme_host_init(g_hostnvme_bar) != 0) {
+            hype_serial_print("virtio-blk: NVMe re-init on servicing core FAILED -- "
+                              "falling back to file backend\n");
+            vm->vblk_is_physical = 0;
+            hype_virtio_blk_reset(&vm->vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
+            hype_blk_file_init(&vm->vblk_file, &vm->vblk_be,
+                               (uint8_t *)(uintptr_t)vm->vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
+            goto vblk_pci;
+        }
         hype_blk_phys_nvme_init(&vm->vblk_phys, &vm->vblk_phys_nvme, &vm->vblk_be,
                                 g_hostnvme_bar, g_hostnvme_total_sectors);
         vm->vblk_is_physical = 1;
@@ -5429,6 +5444,7 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         hype_blk_file_init(&vm->vblk_file, &vm->vblk_be, (uint8_t *)(uintptr_t)vm->vblk_backing_phys,
                            HYPE_FW_1_VDISK_BYTES);
     }
+vblk_pci:
     hype_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
                         HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
                         HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE);
