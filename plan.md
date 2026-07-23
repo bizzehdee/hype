@@ -414,10 +414,22 @@ to fetch the base system, and any online-account/update flow does too.
   guests to talk to each other opts in explicitly via `net_peers` (below);
   the hypervisor then adds a narrow host-mediated forwarding rule between
   exactly that pair — still not a shared broadcast domain, so every VM not
-  named in that pairing stays fully isolated from both of them. No VLANs,
-  no general-purpose virtual switch — kept intentionally minimal, matching
-  "thin," while still supporting deliberate guest-to-guest use cases (e.g.
-  a database VM and an app-server VM that are meant to talk to each other).
+  named in that pairing stays fully isolated from both of them. This pairwise
+  `net_peers` mechanism covers point-to-point use cases (e.g. a database VM and
+  an app-server VM that are meant to talk to each other).
+- **Opt-in shared L2 segment (virtual switch, NET-6 #223)**: for the case where
+  *several* VMs must genuinely share one network (broadcast/ARP/DHCP among all
+  members — not O(N²) pairwise rules), an operator may define a named virtual
+  switch and place specific VMs' NICs on it. This is a **deliberate opt-in that
+  supersedes the earlier "no virtual switch" stance**: per-guest isolation
+  remains the default (a VM is never on a shared switch unless configured onto
+  one), so the inter-VM ARP-spoof/sniffing surface a shared broadcast domain
+  reintroduces is scoped to exactly that switch's members and opt-in — every VM
+  not on it stays fully isolated. Each switch is either fully private
+  (`uplink = none`) or NAT-uplinked to the WAN via the host NIC (`uplink = nat`,
+  reusing the NAT path above). L3 routing *between* switches, and VLAN tagging,
+  are deferred (a future NET-7). No always-on general-purpose switch — kept
+  minimal, matching "thin," but the shared-network use case is now expressible.
 - **Config**: per-VM `net_mode = none | nat` in `hype.cfg` (default `none`
   for VMs that don't need it, to avoid the NIC driver and NAT path
   mattering for purely offline installs), plus an optional `net_peers =

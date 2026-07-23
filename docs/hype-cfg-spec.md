@@ -100,9 +100,10 @@ default, per §4.1). Renames/removals require a `config_version` bump + a
 migration in the serializer.
 
 ### 4.6 Reserved namespaces
-Section kinds `hype`, `vm`, `disk` are defined here; `net`, `media`, `snapshot`,
-`profile` are **reserved** for future use so third-party/experimental keys don't
-collide. Unknown kinds are ignored (§4.1).
+Section kinds `hype`, `vm`, `disk`, `nic`, `switch` are defined here; `router`,
+`media`, `snapshot`, `profile` are **reserved** for future use (e.g. `router` for
+the deferred L3 element) so third-party/experimental keys don't collide. Unknown
+kinds are ignored (§4.1).
 
 ---
 
@@ -171,18 +172,30 @@ creates one implicit boot cdrom and places it first in `boot_order`
 (maps to the per-VM ISO backing, #140). Use explicit `cdroms =` when a VM needs
 more than one (e.g. an installer ISO + a Windows storage-driver ISO).
 
-### 5.5 `[nic.<id>]` — a network device (NEW)
+### 5.5 `[nic.<id>]` — a network device + `[switch.<id>]` — a virtual network (NEW)
 
 A VM attaches **0..N** NICs via `nics =`. Each `[nic.<id>]`:
 
 | key | type / domain | default | notes |
 |---|---|---|---|
-| `mode` | `none` \| `nat` | `[hype] default_net_mode` | plan.md §6e |
+| `switch` | `<switch-id>` | an implicit **private, isolated** per-NIC segment | which virtual network this NIC is on |
 | `mac` | MAC string | derived (stable per id) | optional explicit MAC |
-| `peers` | VM-name list | (none) | guest-to-guest forwarding (plan.md §6e `net_peers`) |
 
-`net_mode`/`net_peers` on `[vm.*]` remain **sugar** for a single implicit NIC
-(backward compat). Zero NICs = no `nics` and no `net_mode` (a network-less VM).
+A `[switch.<id>]` is one **isolated L2 broadcast domain** (NET-6 #223); every NIC
+that names it in `switch =` is on the **same shared network** and can communicate
+freely (unicast + broadcast + ARP + DHCP). VMs NOT on that switch stay fully
+isolated from its members.
+
+| key | type / domain | default | notes |
+|---|---|---|---|
+| `uplink` | `none` \| `nat` | `none` | `none` = fully private inter-VM LAN; `nat` = members also get outbound WAN via the host NIC (plan.md §6e) |
+
+**Isolation is the default** (§6e): a NIC with no `switch` sits on its own private
+segment — put 3 VMs' NICs on the same `[switch.lan0]` and those 3 (and only those
+3) share a network. `net_mode`/`net_peers` on `[vm.*]` remain **sugar**
+(`net_mode = nat` → one implicit NIC on an implicit `uplink=nat` switch;
+`net_peers` → the legacy pairwise point-to-point forward). Zero NICs = no `nics`
+(a network-less VM). L3 routing *between* switches is deferred (future NET-7).
 
 ### 5.6 `bus` default derivation
 
@@ -321,6 +334,38 @@ mem_mb = 16384
 boot = installer
 install_media = \iso\alpine-standard.iso
 os_hint = linux
+```
+
+Three VMs sharing one network (opt-in), with WAN uplink — only these three can
+see each other; every other VM stays isolated:
+
+```ini
+[switch.lab-lan]
+uplink = nat                 ; members also reach the WAN via the host NIC
+
+[vm.db]
+label = Database
+mem_mb = 4096
+os_hint = linux
+nics = db-eth0
+[nic.db-eth0]
+switch = lab-lan
+
+[vm.app]
+label = App Server
+mem_mb = 4096
+os_hint = linux
+nics = app-eth0
+[nic.app-eth0]
+switch = lab-lan
+
+[vm.web]
+label = Web Frontend
+mem_mb = 2048
+os_hint = linux
+nics = web-eth0
+[nic.web-eth0]
+switch = lab-lan
 ```
 
 ---
