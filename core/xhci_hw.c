@@ -21,6 +21,13 @@ static uint8_t g_evt_ring[XPAGE] __attribute__((aligned(XPAGE)));    /* event ri
 static uint8_t g_erst[64] __attribute__((aligned(64)));              /* event ring segment table */
 static uint8_t g_scratch_arr[XPAGE] __attribute__((aligned(XPAGE))); /* scratchpad buffer array */
 static uint8_t g_scratch_pages[MAX_SCRATCH][XPAGE] __attribute__((aligned(XPAGE)));
+/* pt3b: one addressed device's Input/Device contexts, EP0 ring + a transfer buf. */
+static uint8_t g_input_ctx[XPAGE] __attribute__((aligned(XPAGE)));
+static uint8_t g_dev_ctx[XPAGE] __attribute__((aligned(XPAGE)));
+static uint8_t g_ep0_ring[XPAGE] __attribute__((aligned(XPAGE)));
+static uint8_t g_xfer_buf[XPAGE] __attribute__((aligned(XPAGE)));
+static unsigned int g_ep0_enq;
+static unsigned int g_ep0_cyc;
 
 static inline uint8_t  rd8(volatile uint8_t *b, uint32_t o)  { return *(volatile uint8_t *)(b + o); }
 static inline uint32_t rd32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
@@ -128,6 +135,109 @@ int hype_xhci_enable_slot(hype_xhci_ctrl_t *c, unsigned int *out_slot) {
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
     if (out_slot) *out_slot = hype_xhci_event_slot_id(evt);
     return 0;
+}
+
+/* Write an 8-dword context into `base` at byte offset `off`. */
+static void write_ctx(uint8_t *base, unsigned int off, const uint32_t c[8]) {
+    unsigned int i;
+    for (i = 0; i < 8u; i++) put_le32(base + off + i * 4u, c[i]);
+}
+
+/* Enqueue a transfer TRB (cycle already = g_ep0_cyc) on the EP0 ring, with the
+ * same Link-TRB wrap handling as the command ring. */
+static void ep0_enqueue(const uint32_t trb[4]) {
+    uint8_t *slot = g_ep0_ring + g_ep0_enq * HYPE_XHCI_TRB_BYTES;
+    put_le32(slot + 0, trb[0]);
+    put_le32(slot + 4, trb[1]);
+    put_le32(slot + 8, trb[2]);
+    put_le32(slot + 12, trb[3]);
+    g_ep0_enq++;
+    if (g_ep0_enq == RING_TRBS - 1u) {
+        uint32_t link[4];
+        hype_xhci_trb_link(link, phys(g_ep0_ring), g_ep0_cyc);
+        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
+        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
+        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
+        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
+        g_ep0_enq = 0;
+        g_ep0_cyc ^= 1u;
+    }
+}
+
+int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int root_port,
+                             unsigned int speed) {
+    unsigned int cs = c->ctx_size;
+    uint32_t ctx[8];
+    uint32_t cmd[4], evt[4];
+
+    if (!c->inited || slot == 0u) return -1;
+
+    /* Fresh Input/Device contexts + EP0 transfer ring (Link TRB at the end). */
+    zero(g_input_ctx, XPAGE);
+    zero(g_dev_ctx, XPAGE);
+    zero(g_ep0_ring, XPAGE);
+    {
+        uint32_t link[4];
+        hype_xhci_trb_link(link, phys(g_ep0_ring), 1);
+        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
+        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
+        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
+        put_le32(g_ep0_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
+    }
+    g_ep0_enq = 0;
+    g_ep0_cyc = 1;
+
+    /* Input Control Context (offset 0): add the slot + EP0 contexts. */
+    hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | HYPE_XHCI_ADD_EP0, 0);
+    write_ctx(g_input_ctx, 0, ctx);
+    /* Slot Context (offset 1*ctx_size): route 0, 1 valid context entry (EP0). */
+    hype_xhci_slot_ctx(ctx, 0, speed, 1, root_port);
+    write_ctx(g_input_ctx, cs, ctx);
+    /* EP0 Context (offset 2*ctx_size). */
+    hype_xhci_ep0_ctx(ctx, hype_xhci_default_mps(speed), phys(g_ep0_ring), 1);
+    write_ctx(g_input_ctx, 2u * cs, ctx);
+
+    /* DCBAA[slot] -> the output Device Context. */
+    put_le64(g_dcbaa + slot * 8u, phys(g_dev_ctx));
+
+    hype_xhci_trb_address_device(cmd, phys(g_input_ctx), slot, 0, (int)g_cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    return 0;
+}
+
+int hype_xhci_get_device_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf18) {
+    volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    uint32_t t[4], evt[4];
+    unsigned int guard = 64u;
+    unsigned int i;
+
+    if (!c->inited || slot == 0u) return -1;
+    zero(g_xfer_buf, XPAGE);
+
+    /* GET_DESCRIPTOR(device): bmRequestType=0x80 (IN, standard, device),
+     * bRequest=6 (GET_DESCRIPTOR), wValue=0x0100 (DEVICE, index 0), wLength=18. */
+    hype_xhci_trb_setup_stage(t, 0x80, 6, 0x0100, 0, 18, HYPE_XHCI_TRT_IN, (int)g_ep0_cyc);
+    ep0_enqueue(t);
+    hype_xhci_trb_data_stage(t, phys(g_xfer_buf), 18, 1, (int)g_ep0_cyc);
+    ep0_enqueue(t);
+    hype_xhci_trb_status_stage(t, 0, 1, (int)g_ep0_cyc);
+    ep0_enqueue(t);
+
+    /* Ring the slot's doorbell targeting EP0 (DCI 1). */
+    wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), 1u);
+
+    /* Consume events until the Transfer Event for this control transfer. */
+    while (guard-- != 0u) {
+        if (next_event(bar, c->rtsoff, evt) != 0) return -1;
+        if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_TRANSFER_EVENT) {
+            unsigned int cc = hype_xhci_event_cc(evt);
+            if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) return -1;
+            for (i = 0; i < 18u; i++) buf18[i] = g_xfer_buf[i];
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {

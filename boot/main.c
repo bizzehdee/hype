@@ -9447,7 +9447,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     /* Exercise the command+event ring: ask the controller for a
                      * device slot. Proves ring machinery before Address Device. */
                     if (hype_xhci_enable_slot(&xc, &slot) == 0) {
+                        static uint8_t desc[18];
                         hype_debug_print("host-xhci: Enable Slot OK -- device slot id %u\n", slot);
+                        if (hype_xhci_address_device(&xc, slot, port, speed) != 0) {
+                            hype_serial_print("host-xhci: Address Device FAILED\n");
+                        } else if (hype_xhci_get_device_descriptor(&xc, slot, desc) != 0) {
+                            hype_serial_print("host-xhci: GET_DESCRIPTOR FAILED\n");
+                        } else {
+                            hype_debug_print("host-xhci: device descriptor -- USB %x.%02x class=%02x "
+                                             "mps0=%u vid=%04x pid=%04x\n",
+                                             (unsigned)desc[3], (unsigned)desc[2], (unsigned)desc[4],
+                                             (unsigned)desc[7],
+                                             (unsigned)(desc[8] | (desc[9] << 8)),
+                                             (unsigned)(desc[10] | (desc[11] << 8)));
+                        }
                     } else {
                         hype_serial_print("host-xhci: Enable Slot FAILED\n");
                     }

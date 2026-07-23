@@ -136,8 +136,36 @@ static void test_event_decode(void) {
     CHECK_HEX("xfer short-packet cc", HYPE_XHCI_CC_SHORT_PACKET, hype_xhci_event_cc(t));
 }
 
+static void test_context_encoders(void) {
+    uint32_t c[8];
+
+    hype_xhci_input_ctrl_ctx(c, HYPE_XHCI_ADD_SLOT | HYPE_XHCI_ADD_EP0, 0);
+    CHECK_HEX("icc drop flags 0", 0u, c[0]);
+    CHECK_HEX("icc add flags A0|A1", 0x3u, c[1]);
+
+    /* route 0, speed 4 (SS), ctx entries 1, root port 3 */
+    hype_xhci_slot_ctx(c, 0, 4, 1, 3);
+    CHECK_HEX("slot speed field", 4u, (c[0] >> 20) & 0xFu);
+    CHECK_HEX("slot ctx entries", 1u, (c[0] >> 27) & 0x1Fu);
+    CHECK_HEX("slot root port", 3u, (c[1] >> 16) & 0xFFu);
+
+    /* EP0: MPS 512, TR dequeue 0x9000, DCS 1 */
+    hype_xhci_ep0_ctx(c, 512, 0x9000ull, 1);
+    CHECK_HEX("ep0 CErr=3", 3u, (c[1] >> 1) & 0x3u);
+    CHECK_HEX("ep0 type=Control(4)", 4u, (c[1] >> 3) & 0x7u);
+    CHECK_HEX("ep0 max packet 512", 512u, (c[1] >> 16) & 0xFFFFu);
+    CHECK_HEX("ep0 TR dequeue + DCS", 0x9001u, c[2]);
+    CHECK_HEX("ep0 avg trb len 8", 8u, c[4]);
+
+    CHECK_HEX("mps SuperSpeed", 512u, hype_xhci_default_mps(4));
+    CHECK_HEX("mps Low", 8u, hype_xhci_default_mps(2));
+    CHECK_HEX("mps High", 64u, hype_xhci_default_mps(3));
+    CHECK_HEX("mps Full default", 64u, hype_xhci_default_mps(1));
+}
+
 int main(void) {
     test_reg_offsets();
+    test_context_encoders();
     test_cap_fields();
     test_cmd_trbs();
     test_control_transfer_trbs();
