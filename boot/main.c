@@ -9463,119 +9463,128 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             if (hype_xhci_host_init(hx.bar_phys, &xc) != 0) {
                 hype_serial_print("host-xhci: controller bring-up FAILED\n");
             } else {
-                unsigned int speed = 0;
-                unsigned int port;
+                unsigned int rp;
+                unsigned int msc_found = 0;
                 hype_debug_print("host-xhci: up -- slots=%u ports=%u ctx=%uB\n",
                                  xc.max_slots, xc.max_ports, xc.ctx_size);
-                port = hype_xhci_detect_device(&xc, &speed);
-                if (port) {
-                    unsigned int slot = 0;
-                    hype_debug_print("host-xhci: USB device attached at port %u (speed id %u)\n",
-                                     port, speed);
-                    /* Exercise the command+event ring: ask the controller for a
-                     * device slot. Proves ring machinery before Address Device. */
-                    if (hype_xhci_enable_slot(&xc, &slot) == 0) {
-                        static uint8_t desc[18];
-                        hype_debug_print("host-xhci: Enable Slot OK -- device slot id %u\n", slot);
-                        if (hype_xhci_address_device(&xc, slot, port, speed) != 0) {
-                            hype_serial_print("host-xhci: Address Device FAILED\n");
-                        } else if (hype_xhci_get_device_descriptor(&xc, slot, desc) != 0) {
-                            hype_serial_print("host-xhci: GET_DESCRIPTOR FAILED\n");
+                /* USB-8 (#231): enumerate EVERY root port, not just the first --
+                 * on real HW the boot stick may be on a later port (or behind a
+                 * hub; hub descent is #231 pt5b). For each connected device:
+                 * Enable Slot -> Address Device -> GET_DESCRIPTOR; the first
+                 * bulk-only mass-storage device found is used (others, incl.
+                 * hubs, are logged + their slot freed). */
+                for (rp = 1u; rp <= xc.max_ports && !msc_found; rp++) {
+                    unsigned int speed = 0, slot = 0, cfglen = 0;
+                    static uint8_t desc[18];
+                    static uint8_t cfgbuf[256];
+                    hype_xhci_msc_eps_t msc;
+
+                    if (!hype_xhci_reset_port(&xc, rp, &speed)) {
+                        continue; /* nothing connected on this root port */
+                    }
+                    hype_debug_print("host-xhci: port %u connected (speed id %u)\n", rp, speed);
+                    if (hype_xhci_enable_slot(&xc, &slot) != 0) {
+                        hype_serial_print("host-xhci: Enable Slot FAILED\n");
+                        continue;
+                    }
+                    if (hype_xhci_address_device(&xc, slot, rp, speed) != 0) {
+                        hype_serial_print("host-xhci: Address Device FAILED\n");
+                        hype_xhci_disable_slot(&xc, slot);
+                        continue;
+                    }
+                    if (hype_xhci_get_device_descriptor(&xc, slot, desc) != 0) {
+                        hype_serial_print("host-xhci: GET_DESCRIPTOR FAILED\n");
+                        hype_xhci_disable_slot(&xc, slot);
+                        continue;
+                    }
+                    hype_debug_print("host-xhci: port %u dev -- USB %x.%02x class=%02x mps0=%u "
+                                     "vid=%04x pid=%04x\n", rp, (unsigned)desc[3], (unsigned)desc[2],
+                                     (unsigned)desc[4], (unsigned)desc[7],
+                                     (unsigned)(desc[8] | (desc[9] << 8)),
+                                     (unsigned)(desc[10] | (desc[11] << 8)));
+                    if (hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
+                                                        &cfglen) != 0 ||
+                        hype_xhci_msc_find_endpoints(cfgbuf, cfglen, &msc) != 0) {
+                        hype_debug_print("host-xhci: port %u dev is not bulk-only MSC "
+                                         "(class=%02x, cfg %u bytes)%s -- skipping\n",
+                                         rp, (unsigned)desc[4], cfglen,
+                                         desc[4] == 0x09u ? " [USB hub -- descent is #231 pt5b]" : "");
+                        hype_xhci_disable_slot(&xc, slot);
+                        continue;
+                    }
+                    if (hype_xhci_set_configuration(&xc, slot, msc.config_value) != 0) {
+                        hype_serial_print("host-xhci: SET_CONFIGURATION FAILED\n");
+                        hype_xhci_disable_slot(&xc, slot);
+                        continue;
+                    }
+                    hype_debug_print("host-xhci: MSC at port %u -- cfg=%u iface=%u bulk-in=0x%02x "
+                                     "bulk-out=0x%02x mps=%u\n", rp, msc.config_value,
+                                     msc.interface_num, msc.bulk_in_ep, msc.bulk_out_ep,
+                                     msc.bulk_in_mps);
+                    if (hype_xhci_configure_bulk_endpoints(&xc, slot, rp, speed, &msc) != 0) {
+                        hype_serial_print("host-xhci: Configure Endpoint FAILED\n");
+                        hype_xhci_disable_slot(&xc, slot);
+                        continue;
+                    }
+                    msc_found = 1;
+                    {
+                        uint32_t last_lba = 0, bsz = 0;
+                        hype_debug_print("host-xhci: bulk endpoints configured -- MSC datapath ready\n");
+                        if (hype_xhci_msc_read_capacity(&xc, slot, &msc, &last_lba, &bsz) != 0) {
+                            hype_serial_print("host-xhci: SCSI READ CAPACITY FAILED\n");
                         } else {
-                            static uint8_t cfgbuf[256];
-                            unsigned int cfglen = 0;
-                            hype_xhci_msc_eps_t msc;
-                            hype_debug_print("host-xhci: device descriptor -- USB %x.%02x class=%02x "
-                                             "mps0=%u vid=%04x pid=%04x\n",
-                                             (unsigned)desc[3], (unsigned)desc[2], (unsigned)desc[4],
-                                             (unsigned)desc[7],
-                                             (unsigned)(desc[8] | (desc[9] << 8)),
-                                             (unsigned)(desc[10] | (desc[11] << 8)));
-                            /* Read + parse the config descriptor, find the bulk-only
-                             * MSC endpoints, and select the configuration. */
-                            if (hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
-                                                                &cfglen) != 0) {
-                                hype_serial_print("host-xhci: GET config descriptor FAILED\n");
-                            } else if (hype_xhci_msc_find_endpoints(cfgbuf, cfglen, &msc) != 0) {
-                                hype_debug_print("host-xhci: no bulk-only SCSI MSC interface "
-                                                 "(cfg %u bytes)\n", cfglen);
-                            } else if (hype_xhci_set_configuration(&xc, slot, msc.config_value) != 0) {
-                                hype_serial_print("host-xhci: SET_CONFIGURATION FAILED\n");
-                            } else {
-                                hype_debug_print("host-xhci: MSC configured -- cfg=%u iface=%u "
-                                                 "bulk-in=0x%02x bulk-out=0x%02x mps=%u\n",
-                                                 msc.config_value, msc.interface_num,
-                                                 msc.bulk_in_ep, msc.bulk_out_ep, msc.bulk_in_mps);
-                                if (hype_xhci_configure_bulk_endpoints(&xc, slot, port, speed,
-                                                                       &msc) != 0) {
-                                    hype_serial_print("host-xhci: Configure Endpoint FAILED\n");
+                            static uint8_t sec0[512];
+                            hype_debug_print("host-xhci: USB disk -- last LBA %u, block %u bytes "
+                                             "(%llu MiB)\n", last_lba, bsz,
+                                             (unsigned long long)(((uint64_t)last_lba + 1u) * bsz
+                                                 / (1024ull * 1024ull)));
+                            if (bsz == 512u &&
+                                hype_xhci_msc_read(&xc, slot, &msc, 0u, 1u, 512u, sec0) == 0) {
+                                hype_debug_print("host-xhci: SCSI READ(10) LBA0 OK -- mbrsig=%02x%02x\n",
+                                                 (unsigned)sec0[510], (unsigned)sec0[511]);
+                            } else if (bsz == 512u) {
+                                hype_serial_print("host-xhci: SCSI READ(10) LBA0 FAILED\n");
+                            }
+                            if (bsz == 512u) {
+                                static hype_blk_usb_t ubk;
+                                static hype_blk_phys_t uphys;
+                                static hype_blk_backend_t ube;
+                                static uint8_t bsec[512];
+                                hype_blk_usb_init(&ubk, &uphys, &ube, &xc, slot, &msc, 512u,
+                                                  (uint64_t)last_lba + 1u);
+                                if (hype_blk_backend_read(&ube, 0u, 1u, bsec) == 0) {
+                                    hype_debug_print("host-xhci: blk_usb backend read LBA0 OK -- "
+                                                     "mbrsig=%02x%02x (cap %llu sectors)\n",
+                                                     (unsigned)bsec[510], (unsigned)bsec[511],
+                                                     (unsigned long long)ube.total_sectors);
                                 } else {
-                                    uint32_t last_lba = 0, bsz = 0;
-                                    hype_debug_print("host-xhci: bulk endpoints configured -- "
-                                                     "MSC datapath ready\n");
-                                    if (hype_xhci_msc_read_capacity(&xc, slot, &msc, &last_lba,
-                                                                    &bsz) != 0) {
-                                        hype_serial_print("host-xhci: SCSI READ CAPACITY FAILED\n");
-                                    } else {
-                                        static uint8_t sec0[512];
-                                        hype_debug_print("host-xhci: USB disk -- last LBA %u, block "
-                                                         "%u bytes (%llu MiB)\n", last_lba, bsz,
-                                                         (unsigned long long)(((uint64_t)last_lba + 1u)
-                                                             * bsz / (1024ull * 1024ull)));
-                                        if (bsz == 512u &&
-                                            hype_xhci_msc_read(&xc, slot, &msc, 0u, 1u, 512u,
-                                                               sec0) == 0) {
-                                            hype_debug_print("host-xhci: SCSI READ(10) LBA0 OK -- "
-                                                             "mbrsig=%02x%02x\n",
-                                                             (unsigned)sec0[510], (unsigned)sec0[511]);
-                                        } else if (bsz == 512u) {
-                                            hype_serial_print("host-xhci: SCSI READ(10) LBA0 FAILED\n");
-                                        }
-                                        /* USB-4 (#216): wrap the device as a hype_blk_backend and
-                                         * read LBA0 through that generic path -- proves blk_usb. */
-                                        if (bsz == 512u) {
-                                            static hype_blk_usb_t ubk;
-                                            static hype_blk_phys_t uphys;
-                                            static hype_blk_backend_t ube;
-                                            static uint8_t bsec[512];
-                                            hype_blk_usb_init(&ubk, &uphys, &ube, &xc, slot, &msc,
-                                                              512u, (uint64_t)last_lba + 1u);
-                                            if (hype_blk_backend_read(&ube, 0u, 1u, bsec) == 0) {
-                                                hype_debug_print("host-xhci: blk_usb backend read LBA0 OK "
-                                                                 "-- mbrsig=%02x%02x (cap %llu sectors)\n",
-                                                                 (unsigned)bsec[510], (unsigned)bsec[511],
-                                                                 (unsigned long long)ube.total_sectors);
-                                            } else {
-                                                hype_serial_print("host-xhci: blk_usb backend read FAILED\n");
-                                            }
-                                        }
-#if HYPE_XHCI_MSC_WRITE_SELFTEST
-                                        if (bsz == 512u) {
-                                            static uint8_t wr[512], rd[512];
-                                            uint32_t test_lba = 1024u; /* scratch */
-                                            unsigned k; int ok = 1;
-                                            for (k = 0; k < 512u; k++) wr[k] = (uint8_t)(0x3Cu ^ (k & 0xFFu));
-                                            if (hype_xhci_msc_write(&xc, slot, &msc, test_lba, 1u, 512u, wr) != 0) {
-                                                hype_serial_print("host-xhci: WRITE(10) self-test write FAILED\n");
-                                            } else if (hype_xhci_msc_read(&xc, slot, &msc, test_lba, 1u, 512u, rd) != 0) {
-                                                hype_serial_print("host-xhci: WRITE(10) self-test readback FAILED\n");
-                                            } else {
-                                                for (k = 0; k < 512u; k++) { if (rd[k] != wr[k]) { ok = 0; break; } }
-                                                hype_debug_print("host-xhci: WRITE(10) self-test lba=%u roundtrip %s "
-                                                                 "(b0=%02x b511=%02x)\n", test_lba, ok ? "OK" : "MISMATCH",
-                                                                 (unsigned)rd[0], (unsigned)rd[511]);
-                                            }
-                                        }
-#endif
-                                    }
+                                    hype_serial_print("host-xhci: blk_usb backend read FAILED\n");
                                 }
                             }
+#if HYPE_XHCI_MSC_WRITE_SELFTEST
+                            if (bsz == 512u) {
+                                static uint8_t wr[512], rd[512];
+                                uint32_t test_lba = 1024u; /* scratch */
+                                unsigned k; int ok = 1;
+                                for (k = 0; k < 512u; k++) wr[k] = (uint8_t)(0x3Cu ^ (k & 0xFFu));
+                                if (hype_xhci_msc_write(&xc, slot, &msc, test_lba, 1u, 512u, wr) != 0) {
+                                    hype_serial_print("host-xhci: WRITE(10) self-test write FAILED\n");
+                                } else if (hype_xhci_msc_read(&xc, slot, &msc, test_lba, 1u, 512u, rd) != 0) {
+                                    hype_serial_print("host-xhci: WRITE(10) self-test readback FAILED\n");
+                                } else {
+                                    for (k = 0; k < 512u; k++) { if (rd[k] != wr[k]) { ok = 0; break; } }
+                                    hype_debug_print("host-xhci: WRITE(10) self-test lba=%u roundtrip %s "
+                                                     "(b0=%02x b511=%02x)\n", test_lba, ok ? "OK" : "MISMATCH",
+                                                     (unsigned)rd[0], (unsigned)rd[511]);
+                                }
+                            }
+#endif
                         }
-                    } else {
-                        hype_serial_print("host-xhci: Enable Slot FAILED\n");
                     }
-                } else {
-                    hype_debug_print("host-xhci: no USB device attached on any root port\n");
+                }
+                if (!msc_found) {
+                    hype_debug_print("host-xhci: no bulk-only USB mass-storage on any root port "
+                                     "(a hub, if present, is not yet descended -- #231 pt5b)\n");
                 }
             }
         } else {

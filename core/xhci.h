@@ -74,6 +74,7 @@ typedef enum {
     HYPE_XHCI_TRB_STATUS_STAGE    = 4,
     HYPE_XHCI_TRB_LINK            = 6,
     HYPE_XHCI_TRB_ENABLE_SLOT     = 9,
+    HYPE_XHCI_TRB_DISABLE_SLOT    = 10,
     HYPE_XHCI_TRB_ADDRESS_DEVICE  = 11,
     HYPE_XHCI_TRB_CONFIG_EP       = 12,
     HYPE_XHCI_TRB_NOOP_CMD        = 23,
@@ -128,6 +129,7 @@ void hype_xhci_trb_noop_cmd(uint32_t trb[4], int cycle);
 void hype_xhci_trb_enable_slot(uint32_t trb[4], int cycle);
 void hype_xhci_trb_address_device(uint32_t trb[4], uint64_t input_ctx_phys,
                                   unsigned int slot_id, int bsr, int cycle);
+void hype_xhci_trb_disable_slot(uint32_t trb[4], unsigned int slot_id, int cycle);
 void hype_xhci_trb_configure_endpoint(uint32_t trb[4], uint64_t input_ctx_phys,
                                       unsigned int slot_id, int cycle);
 
@@ -262,6 +264,18 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out);
  * ring needed for detection).
  */
 unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_speed);
+
+/*
+ * USB-8 (#231): power + reset ONE root port; returns 1 if it comes up
+ * connected + enabled (PORTSC speed id in *out_speed), 0 if nothing is there.
+ * Lets the caller enumerate EVERY root port (not just the first), which real
+ * hardware needs -- the boot medium is often behind a hub or on a later port.
+ */
+int hype_xhci_reset_port(hype_xhci_ctrl_t *c, unsigned int port, unsigned int *out_speed);
+
+/* Disable (free) a device slot -- used to release a slot between enumeration
+ * probes when the device isn't the one we're after. */
+int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot);
 
 /*
  * USB-1 (#213) pt3: issue an Enable Slot command on the command ring and wait

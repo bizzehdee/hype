@@ -506,45 +506,58 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
     return 0;
 }
 
-unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_speed) {
+int hype_xhci_reset_port(hype_xhci_ctrl_t *c, unsigned int port, unsigned int *out_speed) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
-    unsigned int port;
+    uint32_t off = c->op + hype_xhci_portsc_offset(port);
+    uint32_t sc = rd32(bar, off);
 
     if (out_speed) *out_speed = 0;
-    for (port = 1u; port <= c->max_ports; port++) {
-        uint32_t off = c->op + hype_xhci_portsc_offset(port);
-        uint32_t sc = rd32(bar, off);
 
-        /* Power the port if it isn't already. */
-        if (!(sc & HYPE_XHCI_PORTSC_PP)) {
-            wr32(bar, off, hype_xhci_portsc_write_preserve(sc, HYPE_XHCI_PORTSC_PP));
-            short_delay();
-            sc = rd32(bar, off);
-        }
-        if (!(sc & HYPE_XHCI_PORTSC_CCS)) continue; /* nothing attached */
+    /* Power the port if it isn't already. */
+    if (!(sc & HYPE_XHCI_PORTSC_PP)) {
+        wr32(bar, off, hype_xhci_portsc_write_preserve(sc, HYPE_XHCI_PORTSC_PP));
+        short_delay();
+        sc = rd32(bar, off);
+    }
+    if (!(sc & HYPE_XHCI_PORTSC_CCS)) return 0; /* nothing attached */
 
-        /* USB3 ports enable themselves on connect; USB2 need an explicit reset. */
-        if (!(sc & HYPE_XHCI_PORTSC_PED)) {
-            wr32(bar, off, hype_xhci_portsc_write_preserve(sc, HYPE_XHCI_PORTSC_PR));
-            /* wait for reset to complete (PRC) or the port to enable */
-            {
-                unsigned int s = SPIN;
-                while (s-- != 0u) {
-                    sc = rd32(bar, off);
-                    if (sc & (HYPE_XHCI_PORTSC_PRC | HYPE_XHCI_PORTSC_PED)) break;
-                }
+    /* USB3 ports enable themselves on connect; USB2 need an explicit reset. */
+    if (!(sc & HYPE_XHCI_PORTSC_PED)) {
+        wr32(bar, off, hype_xhci_portsc_write_preserve(sc, HYPE_XHCI_PORTSC_PR));
+        {
+            unsigned int s = SPIN;
+            while (s-- != 0u) {
+                sc = rd32(bar, off);
+                if (sc & (HYPE_XHCI_PORTSC_PRC | HYPE_XHCI_PORTSC_PED)) break;
             }
-            sc = rd32(bar, off);
         }
-        if (sc & HYPE_XHCI_PORTSC_PED) {
-            if (out_speed) {
-                *out_speed = (sc >> HYPE_XHCI_PORTSC_SPEED_SHIFT) & HYPE_XHCI_PORTSC_SPEED_MASK;
-            }
-            /* ack the reset/connect change bits */
-            wr32(bar, off, hype_xhci_portsc_write_preserve(sc,
-                 HYPE_XHCI_PORTSC_PRC | HYPE_XHCI_PORTSC_CSC));
-            return port;
+        sc = rd32(bar, off);
+    }
+    if (sc & HYPE_XHCI_PORTSC_PED) {
+        if (out_speed) {
+            *out_speed = (sc >> HYPE_XHCI_PORTSC_SPEED_SHIFT) & HYPE_XHCI_PORTSC_SPEED_MASK;
         }
+        /* ack the reset/connect change bits */
+        wr32(bar, off, hype_xhci_portsc_write_preserve(sc,
+             HYPE_XHCI_PORTSC_PRC | HYPE_XHCI_PORTSC_CSC));
+        return 1;
     }
     return 0;
+}
+
+unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_speed) {
+    unsigned int port;
+    if (out_speed) *out_speed = 0;
+    for (port = 1u; port <= c->max_ports; port++) {
+        if (hype_xhci_reset_port(c, port, out_speed)) return port;
+    }
+    return 0;
+}
+
+int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot) {
+    uint32_t cmd[4], evt[4];
+    if (!c->inited || slot == 0u) return -1;
+    hype_xhci_trb_disable_slot(cmd, slot, (int)g_cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    return (hype_xhci_event_cc(evt) == HYPE_XHCI_CC_SUCCESS) ? 0 : -1;
 }
