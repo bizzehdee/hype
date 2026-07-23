@@ -28,6 +28,9 @@
 #define HYPE_HOST_PCI_CLASS_STORAGE 0x01u
 #define HYPE_HOST_PCI_SUBCLASS_AHCI 0x06u /* SATA controller; prog-if 0x01 = AHCI 1.0 */
 #define HYPE_HOST_PCI_SUBCLASS_NVME 0x08u /* Non-Volatile Memory; prog-if 0x02 = NVMe */
+#define HYPE_HOST_PCI_CLASS_SERIAL_BUS 0x0Cu
+#define HYPE_HOST_PCI_SUBCLASS_USB 0x03u  /* USB controller; prog-if 0x30 = xHCI */
+#define HYPE_HOST_PCI_PROGIF_XHCI 0x30u
 
 typedef enum {
     HYPE_HOST_STORAGE_NONE = 0,
@@ -107,6 +110,24 @@ void hype_host_pci_disable_interrupts(hype_host_pci_read32_fn read32,
  */
 int hype_host_pci_find_storage(hype_host_pci_read32_fn read32, uint8_t max_bus,
                                hype_host_storage_t *out);
+
+typedef struct {
+    uint8_t bus;
+    uint8_t dev;
+    uint8_t func;
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint64_t bar_phys; /* xHCI register window = BAR0 (64-bit memory BAR) */
+} hype_host_xhci_t;
+
+/*
+ * USB-1 (#213): scans buses 0..max_bus for the first xHCI USB host controller
+ * (class 0x0C / subclass 0x03 / prog-if 0x30), filling *out with its location +
+ * BAR0. Returns 1 if found, else 0. Same MF-bit-gated probe as find_storage;
+ * pure given read32.
+ */
+int hype_host_pci_find_xhci(hype_host_pci_read32_fn read32, uint8_t max_bus,
+                            hype_host_xhci_t *out);
 
 /*
  * Real config read via the legacy 0xCF8 (address) / 0xCFC (data) mechanism.

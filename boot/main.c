@@ -19,6 +19,7 @@
 #include "../core/phys_confirm.h"
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
+#include "../core/xhci.h"
 #include "../core/ahci_host.h"
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
@@ -108,6 +109,9 @@ static hype_pte_t g_fb_pd[2][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((align
  * it in high 64-bit MMIO above the low identity map (QEMU q35 parks it ~56 TiB). */
 static hype_pte_t g_nvme_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_nvme_pd[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+/* USB-1 (#213): same for the xHCI register BAR when it lands in high MMIO. */
+static hype_pte_t g_xhci_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_xhci_pd[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_gop_console_t g_gop_console;
 /* M8-1: the dashboard is rendered as its own vt_screen grid (built by the
  * console-owner core each frame it holds the dashboard view), then blitted to
@@ -9403,6 +9407,48 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 }
             }
 #endif
+        }
+    }
+
+    /* USB-1 (#213): find + bring up the host xHCI controller, then reset its
+     * root ports and report the first attached USB device (port + speed) -- the
+     * foundation of hype's own post-EBS USB stack. Diagnostic for now (proves
+     * hype can drive the controller); device enumeration (control transfers) +
+     * mass-storage/HID + the USB debug-log sink build on top. */
+    {
+        hype_host_xhci_t hx;
+        if (hype_host_pci_find_xhci(hype_host_pci_read32_hw, 255u, &hx)) {
+            hype_xhci_ctrl_t xc;
+            hype_debug_print("host-xhci: controller at %02x:%02x.%x vid=%04x did=%04x bar=0x%llx\n",
+                             (unsigned)hx.bus, (unsigned)hx.dev, (unsigned)hx.func,
+                             (unsigned)hx.vendor_id, (unsigned)hx.device_id,
+                             (unsigned long long)hx.bar_phys);
+            /* Polled driver -- silence its interrupts at the PCI level first. */
+            hype_host_pci_disable_interrupts(hype_host_pci_read32_hw, hype_host_pci_write32_hw,
+                                             hx.bus, hx.dev, hx.func);
+            /* Map the register BAR if it sits in high MMIO (as on real HW); QEMU
+             * parks qemu-xhci below 4 GiB, already in the low identity map. */
+            if (hx.bar_phys >= 512ULL * HYPE_PAGING_1GB) {
+                hype_paging_map_mmio_1gb(g_pml4, g_xhci_pdpt, g_xhci_pd, hx.bar_phys);
+                hype_paging_load(g_pml4);
+            }
+            if (hype_xhci_host_init(hx.bar_phys, &xc) != 0) {
+                hype_serial_print("host-xhci: controller bring-up FAILED\n");
+            } else {
+                unsigned int speed = 0;
+                unsigned int port;
+                hype_debug_print("host-xhci: up -- slots=%u ports=%u ctx=%uB\n",
+                                 xc.max_slots, xc.max_ports, xc.ctx_size);
+                port = hype_xhci_detect_device(&xc, &speed);
+                if (port) {
+                    hype_debug_print("host-xhci: USB device attached at port %u (speed id %u)\n",
+                                     port, speed);
+                } else {
+                    hype_debug_print("host-xhci: no USB device attached on any root port\n");
+                }
+            }
+        } else {
+            hype_debug_print("host-xhci: no xHCI controller found (buses 0-255)\n");
         }
     }
 
