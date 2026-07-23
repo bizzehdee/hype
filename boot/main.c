@@ -20,6 +20,7 @@
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/xhci.h"
+#include "../core/blk_usb.h"
 #include "../core/ahci_host.h"
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
@@ -9509,6 +9510,24 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                              (unsigned)sec0[510], (unsigned)sec0[511]);
                                         } else if (bsz == 512u) {
                                             hype_serial_print("host-xhci: SCSI READ(10) LBA0 FAILED\n");
+                                        }
+                                        /* USB-4 (#216): wrap the device as a hype_blk_backend and
+                                         * read LBA0 through that generic path -- proves blk_usb. */
+                                        if (bsz == 512u) {
+                                            static hype_blk_usb_t ubk;
+                                            static hype_blk_phys_t uphys;
+                                            static hype_blk_backend_t ube;
+                                            static uint8_t bsec[512];
+                                            hype_blk_usb_init(&ubk, &uphys, &ube, &xc, slot, &msc,
+                                                              512u, (uint64_t)last_lba + 1u);
+                                            if (hype_blk_backend_read(&ube, 0u, 1u, bsec) == 0) {
+                                                hype_debug_print("host-xhci: blk_usb backend read LBA0 OK "
+                                                                 "-- mbrsig=%02x%02x (cap %llu sectors)\n",
+                                                                 (unsigned)bsec[510], (unsigned)bsec[511],
+                                                                 (unsigned long long)ube.total_sectors);
+                                            } else {
+                                                hype_serial_print("host-xhci: blk_usb backend read FAILED\n");
+                                            }
                                         }
 #if HYPE_XHCI_MSC_WRITE_SELFTEST
                                         if (bsz == 512u) {
