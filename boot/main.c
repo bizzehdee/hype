@@ -14,6 +14,7 @@
 #include "../core/guest_ram.h"
 #include "../core/mp.h"
 #include "../core/admission.h"
+#include "../core/cfg.h"
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/ahci_host.h"
@@ -8250,6 +8251,89 @@ static int load_iso_into_vm(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTabl
     return 0;
 }
 
+/*
+ * CONFIG-4 (#225): the ESP loader half of the hype.cfg layer. The parser
+ * (core/cfg.c) is pure text-in/struct-out and fully unit-tested; this is the
+ * thin, hardware-facing counterpart that gets the file into memory -- it reads
+ * "\hype.cfg" off the ESP via the same UEFI Simple File System path the ISO
+ * loader uses, NUL-terminates it, and parses it into g_hype_cfg.
+ *
+ * Policy: hype.cfg is ADVISORY here -- a missing, oversized, or malformed file
+ * is logged and treated as an empty config (vm_count 0), never a boot failure,
+ * so hype falls back to its built-in guest setup. The first real consumers are
+ * #125 (dashboard confirm) + #126 (install-to-real-drive), which read the
+ * parsed physical target + partition + allow_overwrite qualifiers.
+ */
+static hype_cfg_t g_hype_cfg;                 /* parsed config; vm_count 0 => none/fallback */
+static char g_hype_cfg_text[16384];           /* scratch; parser mutates in place */
+
+static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+    EFI_FILE_PROTOCOL *root = 0;
+    EFI_STATUS st;
+    UINT64 sz = 0;
+    hype_cfg_result_t res;
+
+    g_hype_cfg.vm_count = 0;
+
+    st = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
+    if (st != EFI_SUCCESS || root == 0) {
+        hype_debug_print("cfg: cannot open ESP root (0x%llx) -- using built-in defaults\n",
+                         (unsigned long long)st);
+        return;
+    }
+
+    st = hype_file_get_size(root, SystemTable->BootServices, (CHAR16 *)L"\\hype.cfg", &sz);
+    if (st != EFI_SUCCESS) {
+        hype_debug_print("cfg: no \\hype.cfg on ESP -- using built-in defaults\n");
+        return;
+    }
+    if (sz == 0 || sz >= sizeof(g_hype_cfg_text)) {
+        hype_debug_print("cfg: \\hype.cfg size %llu unusable (1..%llu) -- ignoring config\n",
+                         (unsigned long long)sz,
+                         (unsigned long long)(sizeof(g_hype_cfg_text) - 1));
+        return;
+    }
+
+    st = hype_file_read_range(root, (CHAR16 *)L"\\hype.cfg", 0, g_hype_cfg_text, (UINTN)sz);
+    if (st != EFI_SUCCESS) {
+        hype_debug_print("cfg: read \\hype.cfg failed (0x%llx) -- ignoring config\n",
+                         (unsigned long long)st);
+        return;
+    }
+    g_hype_cfg_text[sz] = '\0';
+
+    res = hype_cfg_parse(g_hype_cfg_text, &g_hype_cfg);
+    if (res.status != HYPE_CFG_OK) {
+        hype_debug_print("cfg: \\hype.cfg parse error (status=%d, line=%u) -- ignoring config\n",
+                         (int)res.status, res.line);
+        g_hype_cfg.vm_count = 0;
+        return;
+    }
+
+    hype_debug_print("cfg: loaded \\hype.cfg (%llu bytes) -- %u VM(s)\n",
+                     (unsigned long long)sz, g_hype_cfg.vm_count);
+    {
+        unsigned int vi;
+        for (vi = 0; vi < g_hype_cfg.vm_count; vi++) {
+            const hype_cfg_vm_t *v = &g_hype_cfg.vms[vi];
+            const hype_cfg_target_disk_t *d = &v->target_disk;
+            hype_debug_print("cfg:   vm[%u] '%s' vcpus=%u mem=%uMB target=%s:%s",
+                             vi, v->name, v->vcpus, v->mem_mb,
+                             d->kind == HYPE_CFG_DISK_PHYSICAL ? "physical" : "file",
+                             d->path_or_id);
+            if (d->kind == HYPE_CFG_DISK_PHYSICAL) {
+                if (d->partition) {
+                    hype_debug_print(" part=%u", d->partition);
+                } else {
+                    hype_debug_print(" part=whole");
+                }
+                hype_debug_print(" allow_overwrite=%d", d->allow_overwrite);
+            }
+            hype_debug_print("\n");
+        }
+    }
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -8321,6 +8405,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * EFI variable (survives a cold power cycle, unlike RT-1b's RAM scan) and
      * dump it to \hype-diag-prev.txt while Boot Services file I/O is up. */
     fw_1_dump_prev_diag(ImageHandle, SystemTable->BootServices, g_hype_rt);
+
+    /* CONFIG-4 (#225): load + parse \hype.cfg off the ESP now, while Boot
+     * Services file I/O is still up (pre-EBS), into g_hype_cfg. Advisory:
+     * absent/malformed -> empty config + built-in fallback, never a boot stop.
+     * #125/#126 consume the parsed physical target + partition qualifiers. */
+    load_hype_cfg(ImageHandle, SystemTable);
 
     SystemTable->BootServices->FreePool(map);
 
