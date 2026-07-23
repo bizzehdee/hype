@@ -6,8 +6,79 @@
 #define CFG_HEADER_TYPE 0x0Cu /* byte 2 (bits [23:16]): bit7 = multi-function */
 #define CFG_BAR0 0x10u
 #define CFG_BAR5 0x24u
+#define CFG_COMMAND_STATUS 0x04u /* [15:0] command, [31:16] status */
+#define CFG_CAP_PTR 0x34u        /* byte 0: offset of the first capability */
+
+#define CMD_INTX_DISABLE (1u << 10) /* Command[10]: legacy interrupt disable */
+#define STATUS_CAP_LIST (1u << 4)   /* Status[4] (== dword bit 20): capabilities list present */
+
+#define MSGCTL_MSI_ENABLE (1u << 0)   /* MSI Message Control[0] */
+#define MSGCTL_MSIX_ENABLE (1u << 15) /* MSI-X Message Control[15] */
 
 #define VENDOR_INVALID 0xFFFFu
+
+/* A malformed `next` pointer chain cannot exceed 256 bytes / 4 = 64 entries;
+ * bound the walk well above that so a self-referential list still terminates. */
+#define CAP_WALK_MAX 48u
+
+uint8_t hype_host_pci_find_cap(hype_host_pci_read32_fn read32, uint8_t bus, uint8_t dev,
+                               uint8_t func, uint8_t cap_id) {
+    uint32_t cmd_status = read32(bus, dev, func, CFG_COMMAND_STATUS);
+    uint8_t ptr;
+    unsigned guard;
+
+    if ((cmd_status & (STATUS_CAP_LIST << 16)) == 0u) {
+        return 0u; /* device does not implement a capability list */
+    }
+    /* Capability pointers are dword-aligned; the low two bits are reserved. */
+    ptr = (uint8_t)(read32(bus, dev, func, CFG_CAP_PTR) & 0xFCu);
+    for (guard = 0; guard < CAP_WALK_MAX && ptr != 0u; guard++) {
+        uint32_t dw = read32(bus, dev, func, ptr);
+        if ((uint8_t)(dw & 0xFFu) == cap_id) {
+            return ptr;
+        }
+        ptr = (uint8_t)((dw >> 8) & 0xFCu); /* next-pointer, also dword-aligned */
+    }
+    return 0u;
+}
+
+void hype_host_pci_disable_interrupts(hype_host_pci_read32_fn read32,
+                                      hype_host_pci_write32_fn write32, uint8_t bus, uint8_t dev,
+                                      uint8_t func) {
+    uint8_t cap;
+
+    /* Walk + disable the MSI/MSI-X capabilities FIRST, while the Status register
+     * (and its "Capabilities List" bit, which hype_host_pci_find_cap keys on) is
+     * still pristine -- the Command write below zeroes the status half, and a
+     * flat config model would then read the cap-list bit as clear. Message
+     * Control is the high 16 bits of the capability's first dword
+     * ([id | next | msg-control]); the id/next low half is written back intact. */
+    cap = hype_host_pci_find_cap(read32, bus, dev, func, HYPE_HOST_PCI_CAP_MSI);
+    if (cap != 0u) {
+        uint32_t dw = read32(bus, dev, func, cap);
+        uint32_t ctl = (dw >> 16) & 0xFFFFu;
+        ctl &= (uint32_t)~MSGCTL_MSI_ENABLE; /* MSI Enable */
+        write32(bus, dev, func, cap, (dw & 0x0000FFFFu) | (ctl << 16));
+    }
+
+    cap = hype_host_pci_find_cap(read32, bus, dev, func, HYPE_HOST_PCI_CAP_MSIX);
+    if (cap != 0u) {
+        uint32_t dw = read32(bus, dev, func, cap);
+        uint32_t ctl = (dw >> 16) & 0xFFFFu;
+        ctl &= (uint32_t)~MSGCTL_MSIX_ENABLE; /* MSI-X Enable */
+        write32(bus, dev, func, cap, (dw & 0x0000FFFFu) | (ctl << 16));
+    }
+
+    /* Legacy INTx: set Command[10]. Write the command half back with the status
+     * half zeroed -- writing 0 to the RW1C status bits leaves them untouched
+     * (RO bits like the cap-list ignore the write entirely), so this cannot
+     * inadvertently clear a latched error. */
+    {
+        uint32_t cmd_status = read32(bus, dev, func, CFG_COMMAND_STATUS);
+        uint32_t cmd = (cmd_status & 0xFFFFu) | CMD_INTX_DISABLE;
+        write32(bus, dev, func, CFG_COMMAND_STATUS, cmd);
+    }
+}
 
 /* Assemble a memory BAR's base address from `read32`, handling the 64-bit BAR
  * form (type bits [2:1] == 10b: the high dword lives in the next BAR). Returns

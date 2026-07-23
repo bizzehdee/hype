@@ -19,9 +19,18 @@ static inline uint32_t inl(uint16_t port) {
 
 /* 0xCF8 CONFIG_ADDRESS layout: bit31 enable, [23:16] bus, [15:11] device,
  * [10:8] function, [7:2] register (dword-aligned). */
+static inline uint32_t cf8_addr(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset) {
+    return 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)(dev & 0x1Fu) << 11) |
+           ((uint32_t)(func & 0x7u) << 8) | ((uint32_t)offset & 0xFCu);
+}
+
 uint32_t hype_host_pci_read32_hw(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset) {
-    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)(dev & 0x1Fu) << 11) |
-                    ((uint32_t)(func & 0x7u) << 8) | ((uint32_t)offset & 0xFCu);
-    outl(0xCF8u, addr);
+    outl(0xCF8u, cf8_addr(bus, dev, func, offset));
     return inl(0xCFCu);
+}
+
+void hype_host_pci_write32_hw(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset,
+                              uint32_t value) {
+    outl(0xCF8u, cf8_addr(bus, dev, func, offset));
+    outl(0xCFCu, value);
 }
