@@ -22,6 +22,7 @@
 #include "../../../devices/ioapic.h"
 #include "../../../devices/guest_uart.h"
 #include "../../../devices/virtio_blk.h"
+#include "../../../core/blk_backend.h"
 #include "../../../devices/ata_disk.h"
 #include "../../../core/guest_mem.h"
 #include "vmcb.h"
@@ -982,8 +983,8 @@ void hype_svm_set_msr_trace(int enabled);
  * hype_virtio_blk_*_cfg_read/write()/hype_virtio_blk_is_queue_ready()
  * call it makes are already fully tested in isolation.
  */
-int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev, uint8_t *backing,
-                                         uint64_t backing_bytes, uint64_t mmio_base_phys);
+int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
+                                         const hype_blk_backend_t *be, uint64_t mmio_base_phys);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */

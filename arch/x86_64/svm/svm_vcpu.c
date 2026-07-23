@@ -2231,7 +2231,7 @@ int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
  * virtio_blk_npf()'s own doc comment for why). Returns -1 if a chain
  * doesn't have that exact shape (malformed guest request); 0 otherwise.
  */
-static int process_virtio_blk_queue(hype_virtio_blk_t *dev, uint8_t *backing, uint64_t backing_bytes) {
+static int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *be) {
     const uint8_t *avail_base = (const uint8_t *)(uintptr_t)dev->queue_driver;
     const uint8_t *desc_base = (const uint8_t *)(uintptr_t)dev->queue_desc;
     uint8_t *used_base = (uint8_t *)(uintptr_t)dev->queue_device;
@@ -2283,24 +2283,33 @@ static int process_virtio_blk_queue(hype_virtio_blk_t *dev, uint8_t *backing, ui
                  ((uint64_t)hdr[11] << 24) | ((uint64_t)hdr[12] << 32) | ((uint64_t)hdr[13] << 40) |
                  ((uint64_t)hdr[14] << 48) | ((uint64_t)hdr[15] << 56);
         byte_offset = sector * HYPE_VIRTIO_BLK_SECTOR_SIZE;
+        (void)byte_offset; /* I/O is now sector-based via the blk_backend, not a flat buffer */
 
-        if (byte_offset + data_desc.len > backing_bytes) {
-            status_value = HYPE_VIRTIO_BLK_S_IOERR;
-            used_len = 1;
-        } else if (req_type == HYPE_VIRTIO_BLK_T_OUT) {
-            const uint8_t *src = (const uint8_t *)(uintptr_t)data_desc.addr;
-            for (j = 0; j < data_desc.len; j++) {
-                backing[byte_offset + j] = src[j];
+        /* GLADDER/M5-7a: dispatch through the bounds-gated hype_blk_backend vtable
+         * (#89) instead of a raw host buffer, so the frontend is backend-agnostic
+         * (file / physical / qcow2). virtio-blk data is always a whole-sector
+         * multiple; the LBA+count bounds check lives inside hype_blk_backend_*. */
+        if (req_type == HYPE_VIRTIO_BLK_T_OUT || req_type == HYPE_VIRTIO_BLK_T_IN) {
+            uint32_t nsec = data_desc.len / HYPE_VIRTIO_BLK_SECTOR_SIZE;
+            void *gbuf = (void *)(uintptr_t)data_desc.addr;
+            int rc;
+            if ((data_desc.len % HYPE_VIRTIO_BLK_SECTOR_SIZE) != 0u || nsec == 0u) {
+                status_value = HYPE_VIRTIO_BLK_S_IOERR;
+                used_len = 1;
+            } else if (req_type == HYPE_VIRTIO_BLK_T_OUT) {
+                rc = hype_blk_backend_write(be, sector, nsec, gbuf);
+                status_value = (rc == 0) ? HYPE_VIRTIO_BLK_S_OK : HYPE_VIRTIO_BLK_S_IOERR;
+                used_len = 1;
+            } else { /* HYPE_VIRTIO_BLK_T_IN */
+                rc = hype_blk_backend_read(be, sector, nsec, gbuf);
+                status_value = (rc == 0) ? HYPE_VIRTIO_BLK_S_OK : HYPE_VIRTIO_BLK_S_IOERR;
+                used_len = (rc == 0) ? (data_desc.len + 1u) : 1u;
             }
+        } else if (req_type == HYPE_VIRTIO_BLK_T_FLUSH) {
+            /* Synchronous backend: writes already durable, so FLUSH is a no-op ACK
+             * (a real guest issues FLUSH; returning UNSUPP would stall its I/O). */
             status_value = HYPE_VIRTIO_BLK_S_OK;
             used_len = 1;
-        } else if (req_type == HYPE_VIRTIO_BLK_T_IN) {
-            uint8_t *dst = (uint8_t *)(uintptr_t)data_desc.addr;
-            for (j = 0; j < data_desc.len; j++) {
-                dst[j] = backing[byte_offset + j];
-            }
-            status_value = HYPE_VIRTIO_BLK_S_OK;
-            used_len = data_desc.len + 1u;
         } else {
             status_value = HYPE_VIRTIO_BLK_S_UNSUPP;
             used_len = 1;
@@ -2330,8 +2339,8 @@ static int process_virtio_blk_queue(hype_virtio_blk_t *dev, uint8_t *backing, ui
     return 0;
 }
 
-int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev, uint8_t *backing,
-                                         uint64_t backing_bytes, uint64_t mmio_base_phys) {
+int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
+                                         const hype_blk_backend_t *be, uint64_t mmio_base_phys) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_npf_t npf;
     hype_mmio_decode_t decoded;
@@ -2379,7 +2388,7 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
                offset < HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET + 4u) {
         if (decoded.is_write) {
             if (hype_virtio_blk_is_queue_ready(dev)) {
-                if (process_virtio_blk_queue(dev, backing, backing_bytes) != 0) {
+                if (process_virtio_blk_queue(dev, be) != 0) {
                     return -1;
                 }
             }
