@@ -8787,6 +8787,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_host_storage_t hn;
         if (hype_host_pci_find_storage(hype_host_pci_read32_hw, 255u, &hn) &&
             hn.kind == HYPE_HOST_STORAGE_NVME) {
+            /* Polled driver: authoritatively silence the controller's interrupts
+             * at the PCI level (INTx-disable + MSI/MSI-X enables) before touching
+             * any register, so it can never raise an IRQ into hype's host IDT. */
+            hype_host_pci_disable_interrupts(hype_host_pci_read32_hw, hype_host_pci_write32_hw,
+                                             hn.bus, hn.dev, hn.func);
             /* The NVMe register BAR may sit in high 64-bit MMIO outside hype's
              * low identity map (PML4[0] = [0,512GB)). When it needs a higher
              * PML4 slot, map its 1 GiB (uncacheable) via a fresh PML4 entry and
@@ -8814,7 +8819,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_host_storage_t hs;
         if (hype_host_pci_find_storage(hype_host_pci_read32_hw, 255u, &hs) &&
             hs.kind == HYPE_HOST_STORAGE_AHCI) {
-            int sp = hype_ahci_host_find_sata_port(hs.bar_phys);
+            int sp;
+            /* Polled driver: silence the controller's interrupts at the PCI level
+             * (INTx-disable + MSI/MSI-X enables) before bring-up, so it can never
+             * raise an IRQ into hype's host IDT -- the AHCI-internal PxIE/GHC.IE
+             * masking in hype_ahci_host_init alone left an MSI path open, the
+             * suspected residual cause of the intermittent streaming-boot fault. */
+            hype_host_pci_disable_interrupts(hype_host_pci_read32_hw, hype_host_pci_write32_hw,
+                                             hs.bus, hs.dev, hs.func);
+            sp = hype_ahci_host_find_sata_port(hs.bar_phys);
             if (sp < 0) {
                 hype_serial_print("host-ahci: AHCI present but no SATA disk port\n");
             } else if (hype_ahci_host_init(hs.bar_phys, (unsigned)sp) != 0) {

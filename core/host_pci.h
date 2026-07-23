@@ -57,6 +57,49 @@ typedef struct {
 typedef uint32_t (*hype_host_pci_read32_fn)(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset);
 
 /*
+ * Writes the 32-bit config dword at (bus,dev,func,offset); `offset` is
+ * dword-aligned (low two bits ignored). Injected alongside read32 so the
+ * interrupt-disable orchestration below can be unit-tested against a mutable
+ * synthetic config space.
+ */
+typedef void (*hype_host_pci_write32_fn)(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset,
+                                         uint32_t value);
+
+/* PCI capability IDs (config offset `cap`, byte 0) walked by
+ * hype_host_pci_find_cap / disabled by hype_host_pci_disable_interrupts. */
+#define HYPE_HOST_PCI_CAP_MSI 0x05u
+#define HYPE_HOST_PCI_CAP_MSIX 0x11u
+
+/*
+ * Walks the PCI capabilities linked list (Status[4] "Capabilities List" bit +
+ * the capabilities pointer at config 0x34) looking for capability `cap_id`.
+ * Returns its dword-aligned config offset (>=0x40), or 0 if the device has no
+ * capability list or the id is absent. The walk is bounded (a malformed
+ * self-referential `next` pointer cannot loop forever). Pure.
+ */
+uint8_t hype_host_pci_find_cap(hype_host_pci_read32_fn read32, uint8_t bus, uint8_t dev,
+                               uint8_t func, uint8_t cap_id);
+
+/*
+ * GLADDER-10 reliability: hype drives the host storage controller as a strictly
+ * POLLED driver, so it must never receive an interrupt from it. Masking the
+ * AHCI-internal enables (PxIE + GHC.IE) proved insufficient on real hardware --
+ * firmware often leaves MSI enabled, and an MSI is delivered independently of
+ * the legacy INTx path, landing on a host IDT vector hype has no handler for
+ * (-> hype_fatal / a silent fault on the AP running a guest). This authoritatively
+ * silences the controller at the PCI level, which gates every delivery mode:
+ *   - sets Command[10] "Interrupt Disable" (masks legacy INTx),
+ *   - clears MSI Enable (Message Control[0]) in the MSI capability, if present,
+ *   - clears MSI-X Enable (Message Control[15]) in the MSI-X capability, if present.
+ * A read-modify-write on each affected dword via the injected callbacks; pure
+ * given them, so unit-tested against a mutable fake config space. The real
+ * 0xCF8/0xCFC read/write pair lives in the host_pci_hw.c shim.
+ */
+void hype_host_pci_disable_interrupts(hype_host_pci_read32_fn read32,
+                                      hype_host_pci_write32_fn write32, uint8_t bus, uint8_t dev,
+                                      uint8_t func);
+
+/*
  * Scans buses 0..max_bus for the first AHCI or NVMe mass-storage controller,
  * filling *out. Returns 1 if one was found (out->kind != NONE), else 0.
  * Multi-function devices are probed only when the header-type MF bit is set,
@@ -70,5 +113,12 @@ int hype_host_pci_find_storage(hype_host_pci_read32_fn read32, uint8_t max_bus,
  * The hardware-touching shim (host_pci_hw.c); usable pre- or post-EBS.
  */
 uint32_t hype_host_pci_read32_hw(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset);
+
+/*
+ * Real config write via the legacy 0xCF8 (address) / 0xCFC (data) mechanism.
+ * The hardware-touching shim (host_pci_hw.c); usable pre- or post-EBS.
+ */
+void hype_host_pci_write32_hw(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset,
+                              uint32_t value);
 
 #endif /* HYPE_CORE_HOST_PCI_H */
