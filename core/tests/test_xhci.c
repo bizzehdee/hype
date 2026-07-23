@@ -71,6 +71,11 @@ static void test_cmd_trbs(void) {
     CHECK_HEX("addrdev bsr clear", 0u, (t[3] >> 9) & 1u);
     hype_xhci_trb_address_device(t, 0x2000ull, 7, 1, 1);
     CHECK_HEX("addrdev bsr set", 1u, (t[3] >> 9) & 1u);
+
+    hype_xhci_trb_configure_endpoint(t, 0x3000ull, 7, 1);
+    CHECK_HEX("configep type", HYPE_XHCI_TRB_CONFIG_EP, hype_xhci_trb_type(t));
+    CHECK_HEX("configep ctx ptr", 0x3000u, t[0]);
+    CHECK_HEX("configep slot id", 7u, (t[3] >> 24) & 0xFFu);
 }
 
 static void test_control_transfer_trbs(void) {
@@ -156,6 +161,12 @@ static void test_context_encoders(void) {
     CHECK_HEX("ep0 max packet 512", 512u, (c[1] >> 16) & 0xFFFFu);
     CHECK_HEX("ep0 TR dequeue + DCS", 0x9001u, c[2]);
     CHECK_HEX("ep0 avg trb len 8", 8u, c[4]);
+
+    /* generic EP context: bulk IN, MPS 1024 */
+    hype_xhci_ep_ctx(c, HYPE_XHCI_EP_TYPE_BULK_IN, 1024, 0x7000ull, 1);
+    CHECK_HEX("bulk-in ep type=6", 6u, (c[1] >> 3) & 0x7u);
+    CHECK_HEX("bulk-in mps 1024", 1024u, (c[1] >> 16) & 0xFFFFu);
+    CHECK_HEX("bulk-in TR dq + DCS", 0x7001u, c[2]);
 
     CHECK_HEX("mps SuperSpeed", 512u, hype_xhci_default_mps(4));
     CHECK_HEX("mps Low", 8u, hype_xhci_default_mps(2));
