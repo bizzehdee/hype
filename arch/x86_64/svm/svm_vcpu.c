@@ -2382,7 +2382,7 @@ static int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backe
 
 int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
                                          const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
-                                         uint64_t mmio_base_phys) {
+                                         uint64_t mmio_base_phys, const uint8_t *insn) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_npf_t npf;
     hype_mmio_decode_t decoded;
@@ -2398,7 +2398,11 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
     }
     offset = (uint32_t)(npf.guest_phys_addr - mmio_base_phys);
 
-    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    /* Prefer caller-supplied instruction bytes (fetched via guest page-walk):
+     * the guest RIP is a guest-VIRTUAL address, only dereferenceable as a host
+     * pointer for an identity-mapped guest (M5-1). A paging/RAM-remapping guest
+     * (FW-1) must pass `insn`; NULL keeps the identity fast-path. */
+    guest_bytes = (insn != 0) ? insn : (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
     if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
         return -1;
     }

@@ -50,13 +50,16 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
             /* {PCI address (dev<<16 | 0xFFFF = all functions), INTx pin (0=A..3=D),
              *  source (0 = routed directly to a global interrupt), source_index (GSI)}.
              * AHCI is device 2; only INTA is used by the model, but all four pins
-             * are mapped for completeness. GSIs 16-19 sit above the 16 ISA lines. */
+             * are mapped for completeness. GSIs 16-19 sit above the 16 ISA lines.
+             * M5-7 (#196): virtio-blk is device 3, INTA -> GSI 20 (clear of the
+             * dev-2 block); must match HYPE_FW_1_VIRTIO_GSI in boot/main.c. */
             Name (_PRT, Package ()
             {
                 Package () { 0x0002FFFF, 0x00, 0x00, 0x10 },  /* dev 2 INTA -> GSI 16 */
                 Package () { 0x0002FFFF, 0x01, 0x00, 0x11 },  /* dev 2 INTB -> GSI 17 */
                 Package () { 0x0002FFFF, 0x02, 0x00, 0x12 },  /* dev 2 INTC -> GSI 18 */
                 Package () { 0x0002FFFF, 0x03, 0x00, 0x13 },  /* dev 2 INTD -> GSI 19 */
+                Package () { 0x0003FFFF, 0x00, 0x00, 0x14 },  /* dev 3 INTA -> GSI 20 (virtio-blk) */
             })
 
             /* Minimal resource template: claim bus 0 so the kernel associates
