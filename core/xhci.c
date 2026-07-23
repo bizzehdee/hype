@@ -142,6 +142,54 @@ unsigned int hype_xhci_default_mps(unsigned int speed_id) {
     }
 }
 
+/* --- USB Mass Storage endpoint discovery --- */
+
+int hype_xhci_msc_find_endpoints(const uint8_t *cfg, unsigned int len, hype_xhci_msc_eps_t *out) {
+    unsigned int i = 0;
+    int in_msc_iface = 0;
+
+    out->found = 0;
+    out->bulk_in_ep = out->bulk_out_ep = 0;
+    out->bulk_in_mps = out->bulk_out_mps = 0;
+    out->interface_num = 0;
+    out->config_value = 0;
+
+    while (i + 2u <= len) {
+        unsigned int blen = cfg[i];
+        unsigned int btype = cfg[i + 1u];
+        if (blen < 2u || i + blen > len) break; /* malformed / truncated */
+
+        if (btype == HYPE_USB_DESC_CONFIG && blen >= 6u) {
+            out->config_value = cfg[i + 5u]; /* bConfigurationValue */
+        } else if (btype == HYPE_USB_DESC_INTERFACE && blen >= 9u) {
+            in_msc_iface = (cfg[i + 5u] == HYPE_USB_CLASS_MSC &&
+                            cfg[i + 6u] == HYPE_USB_SUBCLASS_SCSI &&
+                            cfg[i + 7u] == HYPE_USB_PROTO_BOT);
+            if (in_msc_iface) out->interface_num = cfg[i + 2u];
+        } else if (btype == HYPE_USB_DESC_ENDPOINT && blen >= 7u && in_msc_iface) {
+            unsigned int addr = cfg[i + 2u];
+            unsigned int attr = cfg[i + 3u];
+            unsigned int mps = (unsigned int)cfg[i + 4u] | ((unsigned int)cfg[i + 5u] << 8);
+            if ((attr & 0x3u) == 0x2u) { /* bulk */
+                if (addr & 0x80u) { out->bulk_in_ep = addr; out->bulk_in_mps = mps; }
+                else              { out->bulk_out_ep = addr; out->bulk_out_mps = mps; }
+            }
+        }
+        i += blen;
+    }
+
+    if (out->bulk_in_ep && out->bulk_out_ep) {
+        out->found = 1;
+        return 0;
+    }
+    return -1;
+}
+
+unsigned int hype_xhci_ep_dci(unsigned int ep_addr) {
+    /* DCI = (endpoint number * 2) + direction (IN=1, OUT=0). */
+    return ((ep_addr & 0x0Fu) * 2u) + ((ep_addr & 0x80u) ? 1u : 0u);
+}
+
 /* --- event TRB decode --- */
 
 unsigned int hype_xhci_event_cc(const uint32_t trb[4]) { return (trb[2] >> 24) & 0xFFu; }

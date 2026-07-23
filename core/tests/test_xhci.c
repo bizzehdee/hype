@@ -163,9 +163,87 @@ static void test_context_encoders(void) {
     CHECK_HEX("mps Full default", 64u, hype_xhci_default_mps(1));
 }
 
+static void test_msc_config_parse(void) {
+    /* config(9) + interface(9, MSC/SCSI/BOT) + EP OUT(7, bulk) + EP IN(7, bulk) */
+    uint8_t cfg[] = {
+        9, 0x02, 32, 0, 1, 1, 0, 0x80, 50,          /* config: total len 32, cfgValue 1 */
+        9, 0x04, 0, 0, 2, 0x08, 0x06, 0x50, 0,       /* interface 0: MSC/SCSI/BOT, 2 EPs */
+        7, 0x05, 0x81, 0x02, 0x00, 0x02, 0,          /* EP 0x81 IN bulk, MPS 512 */
+        7, 0x05, 0x02, 0x02, 0x00, 0x02, 0           /* EP 0x02 OUT bulk, MPS 512 */
+    };
+    hype_xhci_msc_eps_t m;
+    CHECK_HEX("msc parse ok", 0, hype_xhci_msc_find_endpoints(cfg, sizeof(cfg), &m));
+    CHECK_HEX("msc found", 1, m.found);
+    CHECK_HEX("msc config value", 1u, m.config_value);
+    CHECK_HEX("msc iface num", 0u, m.interface_num);
+    CHECK_HEX("bulk in ep", 0x81u, m.bulk_in_ep);
+    CHECK_HEX("bulk out ep", 0x02u, m.bulk_out_ep);
+    CHECK_HEX("bulk in mps", 512u, m.bulk_in_mps);
+
+    /* a non-MSC interface -> not found (endpoints ignored) */
+    {
+        uint8_t cfg2[] = {
+            9, 0x02, 25, 0, 1, 1, 0, 0x80, 50,
+            9, 0x04, 0, 0, 1, 0x03, 0x00, 0x00, 0,   /* HID interface, not MSC */
+            7, 0x05, 0x81, 0x03, 0x08, 0x00, 10      /* interrupt EP */
+        };
+        hype_xhci_msc_eps_t m2;
+        CHECK_HEX("non-msc not found", -1, hype_xhci_msc_find_endpoints(cfg2, sizeof(cfg2), &m2));
+    }
+
+    /* DCI mapping */
+    CHECK_HEX("dci ep0-in style (0x81)", 3u, hype_xhci_ep_dci(0x81)); /* num1 IN -> 2*1+1 */
+    CHECK_HEX("dci 0x02 OUT", 4u, hype_xhci_ep_dci(0x02));            /* num2 OUT -> 2*2+0 */
+
+    /* malformed: a zero-length descriptor stops the walk -> not found */
+    {
+        uint8_t bad[] = { 9, 0x02, 20, 0, 1, 1, 0, 0x80, 50, 0, 0, 0 };
+        hype_xhci_msc_eps_t mb;
+        CHECK_HEX("zero-len desc -> not found", -1,
+                  hype_xhci_msc_find_endpoints(bad, sizeof(bad), &mb));
+    }
+    /* truncated: bLength claims more than the buffer holds -> stop */
+    {
+        uint8_t trunc[] = { 9, 0x02, 32, 0, 1, 1, 0, 0x80, 50,
+                            9, 0x04, 0, 0, 2, 0x08, 0x06, 0x50 }; /* iface cut short */
+        hype_xhci_msc_eps_t mt;
+        CHECK_HEX("truncated -> not found", -1,
+                  hype_xhci_msc_find_endpoints(trunc, sizeof(trunc), &mt));
+    }
+    /* endpoint before any interface + a non-bulk EP + only a bulk IN (no OUT) */
+    {
+        uint8_t partial[] = {
+            9, 0x02, 39, 0, 1, 1, 0, 0x80, 50,
+            7, 0x05, 0x83, 0x02, 0x00, 0x02, 0,       /* bulk EP before any interface -> ignored */
+            9, 0x04, 0, 0, 2, 0x08, 0x06, 0x50, 0,    /* MSC interface */
+            7, 0x05, 0x84, 0x03, 0x08, 0x00, 10,      /* interrupt EP (not bulk) -> ignored */
+            7, 0x05, 0x81, 0x02, 0x00, 0x02, 0        /* bulk IN only, no OUT */
+        };
+        hype_xhci_msc_eps_t mp;
+        CHECK_HEX("only bulk-in -> not found", -1,
+                  hype_xhci_msc_find_endpoints(partial, sizeof(partial), &mp));
+        CHECK_HEX("bulk-in recorded", 0x81u, mp.bulk_in_ep);
+        CHECK_HEX("no bulk-out", 0u, mp.bulk_out_ep);
+    }
+    /* short config descriptor (blen<6): config value left 0, still parses iface */
+    {
+        uint8_t shortcfg[] = {
+            5, 0x02, 0, 0, 1,                          /* config desc too short for cfgValue */
+            9, 0x04, 0, 0, 2, 0x08, 0x06, 0x50, 0,
+            7, 0x05, 0x81, 0x02, 0x00, 0x02, 0,
+            7, 0x05, 0x02, 0x02, 0x00, 0x02, 0
+        };
+        hype_xhci_msc_eps_t ms;
+        CHECK_HEX("short cfg still finds eps", 0,
+                  hype_xhci_msc_find_endpoints(shortcfg, sizeof(shortcfg), &ms));
+        CHECK_HEX("short cfg value stays 0", 0u, ms.config_value);
+    }
+}
+
 int main(void) {
     test_reg_offsets();
     test_context_encoders();
+    test_msc_config_parse();
     test_cap_fields();
     test_cmd_trbs();
     test_control_transfer_trbs();

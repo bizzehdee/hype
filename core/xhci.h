@@ -184,6 +184,38 @@ static inline uint32_t hype_xhci_portsc_write_preserve(uint32_t current, uint32_
     return (current & ~HYPE_XHCI_PORTSC_RW1C) | bits_to_set;
 }
 
+/* --- USB Mass Storage endpoint discovery (pure, xHCI-independent USB descr) --- */
+
+/* USB Mass Storage class/subclass/protocol (bulk-only SCSI). */
+#define HYPE_USB_CLASS_MSC       0x08u
+#define HYPE_USB_SUBCLASS_SCSI   0x06u
+#define HYPE_USB_PROTO_BOT       0x50u
+/* USB descriptor types. */
+#define HYPE_USB_DESC_CONFIG     0x02u
+#define HYPE_USB_DESC_INTERFACE  0x04u
+#define HYPE_USB_DESC_ENDPOINT   0x05u
+
+typedef struct {
+    int found;                   /* 1 if a bulk-only SCSI MSC interface with both bulk EPs */
+    unsigned int interface_num;
+    unsigned int config_value;   /* bConfigurationValue to SET_CONFIGURATION */
+    unsigned int bulk_in_ep;     /* endpoint address incl. 0x80 direction bit */
+    unsigned int bulk_out_ep;
+    unsigned int bulk_in_mps;    /* wMaxPacketSize */
+    unsigned int bulk_out_mps;
+} hype_xhci_msc_eps_t;
+
+/*
+ * Walks a USB configuration descriptor blob [cfg, cfg+len) (config + interface +
+ * endpoint descriptors) and, if it contains a bulk-only-transport SCSI Mass
+ * Storage interface (class 08 / sub 06 / proto 50) with a bulk IN and bulk OUT
+ * endpoint, fills *out (found=1). Returns 0 if found, -1 otherwise. Pure.
+ */
+int hype_xhci_msc_find_endpoints(const uint8_t *cfg, unsigned int len, hype_xhci_msc_eps_t *out);
+
+/* Endpoint Context DCI for an endpoint address: (num*2) + (IN?1:0). EP0 = 1. */
+unsigned int hype_xhci_ep_dci(unsigned int ep_addr);
+
 /* --- hardware bring-up (coverage-exempt shim core/xhci_hw.c; real MMIO). --- */
 
 /* Captured controller geometry + register bases, filled by hype_xhci_host_init. */
@@ -237,5 +269,17 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot, unsigned in
  * buf18 (>= 18 bytes). Returns 0 on success, -1 on error/timeout.
  */
 int hype_xhci_get_device_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf18);
+
+/*
+ * Reads the full configuration descriptor (config + interface + endpoint
+ * descriptors) into buf (capped at maxlen), setting *out_len to the byte count.
+ * Two control transfers: the 9-byte header for wTotalLength, then the whole
+ * thing. Returns 0 on success, -1 on error.
+ */
+int hype_xhci_get_config_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf,
+                                    unsigned int maxlen, unsigned int *out_len);
+
+/* SET_CONFIGURATION(config_value) control transfer (no data). 0 on success. */
+int hype_xhci_set_configuration(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int config_value);
 
 #endif /* HYPE_CORE_XHCI_H */
