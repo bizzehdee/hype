@@ -43,6 +43,36 @@ static uint32_t cfg_nvme(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
     }
 }
 
+/* Two storage controllers: NVMe at 00:01.0 + AHCI at 00:1f.2 (real HW has
+ * several; the plain find_storage returns only the first). */
+static uint32_t cfg_two_storage(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
+    if (bus == 0 && dev == 1 && func == 0) {
+        switch (off) {
+            case 0x00: return 0x00111d1eu;
+            case 0x08: return 0x01080200u;       /* NVMe */
+            case 0x10: return 0xF0000004u; case 0x14: return 0x00000001u; /* 64-bit BAR0 */
+            default:   return 0u;
+        }
+    }
+    if (bus == 0 && dev == 0x1f && func == 0) { /* LPC bridge, multi-function bit set */
+        switch (off) {
+            case 0x00: return 0x9c438086u;       /* vendor 8086 */
+            case 0x08: return 0x06010000u;       /* class 06 (bridge) -- not storage */
+            case 0x0C: return 0x00800000u;       /* header-type byte (bits 23:16) MF bit set */
+            default:   return 0u;
+        }
+    }
+    if (bus == 0 && dev == 0x1f && func == 2) {
+        switch (off) {
+            case 0x00: return 0x8c028086u;       /* vendor 8086 */
+            case 0x08: return 0x01060102u;       /* AHCI */
+            case 0x24: return 0xFEBF1000u;       /* ABAR (BAR5) */
+            default:   return 0u;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
 /* xHCI USB controller at 00:14.0 (class 0C/03/30) with a 64-bit BAR0. */
 static uint32_t cfg_xhci(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
     if (bus != 0 || dev != 0x14 || func != 0) {
@@ -236,8 +266,30 @@ static void test_find_xhci(void) {
     CHECK_HEX("no xHCI in storage-only space", 0, hype_host_pci_find_xhci(cfg_ahci, 0, &x));
 }
 
+static void test_find_all_storage(void) {
+    /* Enumerate ALL storage controllers by looping find_storage_from. */
+    hype_host_storage_t st;
+    uint32_t cur = 0;
+    int n = 0, saw_nvme = 0, saw_ahci = 0;
+    while (hype_host_pci_find_storage_from(cfg_two_storage, 0, cur, &st)) {
+        if (st.kind == HYPE_HOST_STORAGE_NVME) saw_nvme = 1;
+        if (st.kind == HYPE_HOST_STORAGE_AHCI) saw_ahci = 1;
+        n++;
+        cur = ((uint32_t)st.bus << 8) | ((uint32_t)st.dev << 3) | (uint32_t)st.func;
+        cur += 1u;
+        if (n > 8) break; /* safety */
+    }
+    CHECK_HEX("found both storage controllers", 2, n);
+    CHECK_HEX("saw NVMe", 1, saw_nvme);
+    CHECK_HEX("saw AHCI", 1, saw_ahci);
+    /* plain find_storage still returns just the first (NVMe, lower bdf) */
+    CHECK_HEX("find_storage returns first", HYPE_HOST_STORAGE_NVME,
+              (hype_host_pci_find_storage(cfg_two_storage, 0, &st), st.kind));
+}
+
 int main(void) {
     test_find_ahci();
+    test_find_all_storage();
     test_find_nvme_64bit_bar();
     test_no_storage();
     test_multifunction_storage();
