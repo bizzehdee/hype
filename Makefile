@@ -26,7 +26,7 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/gpt.c core/iso_stream.c core/fat.c core/nvme_host.c core/nvme_host_hw.c core/blk_backend.c core/blk_phys.c core/blk_phys_hw.c core/phys_guard.c \
              core/kbd_decode.c core/vt_screen.c core/vt_render.c core/dashboard.c core/vm_lifecycle.c core/cmdparse.c \
              core/cfg.c core/phys_confirm.c core/xhci.c core/xhci_hw.c core/usb_msc.c core/blk_usb.c \
-             core/fat_write.c core/fat_write_fs.c
+             core/fat_write.c core/fat_write_fs.c core/log_sink.c
 ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
              arch/x86_64/cpu/paging.c arch/x86_64/cpu/paging_load.c \

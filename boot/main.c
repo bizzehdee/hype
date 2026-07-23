@@ -25,6 +25,8 @@
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
 #include "../core/fat.h"
+#include "../core/fat_write_fs.h"
+#include "../core/log_sink.h"
 #include "../core/nvme_host.h"
 #include "../core/blk_backend.h"
 #include "../core/blk_phys.h"
@@ -108,6 +110,11 @@
  * cold-boot laptop a photographable frozen screen AND a cold-boot-surviving log
  * tail of exactly the probe output (which the full guest boot would otherwise
  * evict). Purely read-only; no FS writes. OFF by default. */
+/* #230: USB debug-log sink helpers (defined just above efi_main); forward-
+ * declared here because the post-EBS run loop (well above the definition) flushes
+ * the sink on the RT-3 cadence. */
+static void usb_log_flush(void);
+
 #ifndef HYPE_DIAG_PROBE_ONLY
 #define HYPE_DIAG_PROBE_ONLY 0
 #endif
@@ -6510,6 +6517,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                              (unsigned long long)st);
                         }
                     }
+                    /* #230: on the same throttled cadence, stream the log's new
+                     * bytes to \HYPEFULL.LOG on the USB stick (no-op if none). */
+                    usb_log_flush();
                 }
             }
         }
@@ -8564,6 +8574,75 @@ static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_
     }
 }
 
+/*
+ * #230: stream the full in-RAM log to \HYPEFULL.LOG on the USB stick's FAT32
+ * volume, so a real-HW debug run leaves the WHOLE log on the medium it booted
+ * from (the RT-3 NV tail stays as a backup for the last few KB). The sink is
+ * volume-relative; usblog_ctx_t adds the FAT partition's base LBA so the same
+ * blk_usb backend serves both the raw probe reads and the filesystem writes.
+ */
+typedef struct {
+    const hype_blk_backend_t *be;
+    uint64_t base; /* partition-relative -> disk LBA offset */
+} usblog_ctx_t;
+
+static hype_log_sink_t g_usb_log;
+static int g_usb_log_ready;
+static usblog_ctx_t g_usb_log_ctx;
+
+/* Persistent copies of the USB block path the sink writes through. The probe's
+ * own xc/msc are block-locals that die when the probe scope closes; the sink
+ * lives for the whole post-EBS run (and the diagnostic halt), so its backend
+ * must reference file-global storage. hype_xhci_ctrl_t is pure geometry (all
+ * ring state is in xhci_hw.c file-statics), so a value copy is safe. */
+static hype_xhci_ctrl_t g_usb_xc;
+static hype_xhci_msc_eps_t g_usb_msc;
+static hype_blk_usb_t g_usb_ubk;
+static hype_blk_phys_t g_usb_uphys;
+static hype_blk_backend_t g_usb_ube;
+
+static int usblog_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    usblog_ctx_t *c = (usblog_ctx_t *)ctx;
+    return hype_blk_backend_read(c->be, c->base + lba, count, dst);
+}
+static int usblog_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    usblog_ctx_t *c = (usblog_ctx_t *)ctx;
+    return hype_blk_backend_write(c->be, c->base + lba, count, src);
+}
+
+/* Try to mount a FAT32 volume on the stick (superfloppy at LBA 0, else the
+ * first/second GPT partition -- typically the ESP) and open the log file on it.
+ * Writes only touch free clusters + our own file, never a raw partition-table
+ * overwrite, so this is safe on the boot medium and needs no confirm. */
+static void usb_log_setup(const hype_blk_backend_t *be) {
+    uint64_t bases[3];
+    unsigned int nb = 0, i;
+    hype_gpt_partition_t part;
+
+    g_usb_log_ctx.be = be;
+    g_usb_log_ctx.base = 0u;
+    bases[nb++] = 0u; /* superfloppy: FAT boot sector at LBA 0 */
+    if (hype_gpt_find_partition(usblog_read, &g_usb_log_ctx, 1u, &part) == 0) bases[nb++] = part.first_lba;
+    if (hype_gpt_find_partition(usblog_read, &g_usb_log_ctx, 2u, &part) == 0) bases[nb++] = part.first_lba;
+
+    for (i = 0; i < nb; i++) {
+        g_usb_log_ctx.base = bases[i];
+        if (hype_log_sink_open(&g_usb_log, usblog_read, usblog_write, &g_usb_log_ctx,
+                               "HYPEFULL.LOG") == 0) {
+            g_usb_log_ready = 1;
+            hype_debug_print("usb-log: streaming full log to \\HYPEFULL.LOG "
+                             "(FAT32 at disk LBA %llu)\n", (unsigned long long)bases[i]);
+            return;
+        }
+    }
+    hype_debug_print("usb-log: no writable FAT32 volume on the USB stick "
+                     "(RT-3 NV tail remains the backup)\n");
+}
+
+static void usb_log_flush(void) {
+    if (g_usb_log_ready) (void)hype_log_sink_flush(&g_usb_log);
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -9597,6 +9676,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 } else {
                                     hype_serial_print("host-xhci: blk_usb backend read FAILED\n");
                                 }
+                                /* #230: attach the USB debug-log sink. Use file-global copies
+                                 * of the controller + MSC endpoints + backend so the sink
+                                 * outlives this probe scope (it streams for the whole run and
+                                 * at the diagnostic halt). Stream whatever's been logged so far;
+                                 * flushed again on the RT-3 cadence and at the probe halt. */
+                                g_usb_xc = xc;
+                                g_usb_msc = msc;
+                                hype_blk_usb_init(&g_usb_ubk, &g_usb_uphys, &g_usb_ube, &g_usb_xc,
+                                                  msc_slot, &g_usb_msc, 512u,
+                                                  (uint64_t)last_lba + 1u);
+                                usb_log_setup(&g_usb_ube);
                             }
 #if HYPE_XHCI_MSC_WRITE_SELFTEST
                             if (bsz == 512u) {
@@ -9827,8 +9917,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         if (g_hype_rt) {
             (void)hype_nvlog_write(g_hype_rt, hype_logbuf_data(), hype_logbuf_len());
         }
-        hype_debug_print("diag: log captured to GOP + RT-3 variable; system halted (power-cycle to "
-                         "recover the tail as \\hype-diag-prev.txt on the next boot)\n");
+        /* #230: flush the full log to \HYPEFULL.LOG on the USB stick (if one was
+         * found + mounted); this is the complete run, not just the RT-3 tail. */
+        usb_log_flush();
+        hype_debug_print("diag: log captured to GOP + RT-3 variable%s; system halted (power-cycle "
+                         "to recover the tail as \\hype-diag-prev.txt on the next boot)\n",
+                         g_usb_log_ready ? " + \\HYPEFULL.LOG on USB" : "");
+        /* One more flush so the final "captured/halted" lines land on the stick too. */
+        usb_log_flush();
         hype_debug_flush_gop();
         for (;;) {
             __asm__ volatile("cli; hlt");
