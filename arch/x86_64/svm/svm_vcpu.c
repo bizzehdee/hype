@@ -2231,69 +2231,105 @@ int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
  * virtio_blk_npf()'s own doc comment for why). Returns -1 if a chain
  * doesn't have that exact shape (malformed guest request); 0 otherwise.
  */
-static int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *be) {
-    const uint8_t *avail_base = (const uint8_t *)(uintptr_t)dev->queue_driver;
-    const uint8_t *desc_base = (const uint8_t *)(uintptr_t)dev->queue_desc;
-    uint8_t *used_base = (uint8_t *)(uintptr_t)dev->queue_device;
-    uint16_t avail_idx = (uint16_t)(avail_base[2] | (avail_base[3] << 8));
+static int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *be,
+                                    const hype_gpa_map_t *dma_map) {
+    /* VALID-3: the virtqueue base addresses (desc/avail/used), every descriptor
+     * index, and every buffer pointer are guest-supplied. Each guest-physical
+     * address is translated through this VM's bounds-checked gpa map
+     * (guest_dma_xlate -> 0 when out of range) BEFORE it is dereferenced, so a
+     * malicious/garbled queue can never steer a read or write at hype's own or
+     * another VM's memory. For an identity-mapped caller (M5-1) dma_map is NULL
+     * and the translation returns the address unchanged. Descriptor indices are
+     * additionally bounded by queue_size. */
+    uint16_t qsz = dev->queue_size;
+    const uint8_t *avail_base;
+    uint8_t *used_base;
+    uint16_t avail_idx;
+
+    if (qsz == 0u) {
+        return -1;
+    }
+    /* avail ring: flags(2) + idx(2) + ring(2*qsz) + used_event(2). */
+    avail_base = (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, dev->queue_driver,
+                                                             4u + 2u * (uint64_t)qsz + 2u);
+    /* used ring: flags(2) + idx(2) + elems(8*qsz) + avail_event(2). */
+    used_base = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, dev->queue_device,
+                                                      4u + 8u * (uint64_t)qsz + 2u);
+    if (avail_base == 0 || used_base == 0) {
+        return -1;
+    }
+    avail_idx = (uint16_t)(avail_base[2] | (avail_base[3] << 8));
 
     while (dev->last_avail_idx != avail_idx) {
-        uint16_t ring_index = (uint16_t)(dev->last_avail_idx % dev->queue_size);
+        uint16_t ring_index = (uint16_t)(dev->last_avail_idx % qsz);
         uint16_t head_desc =
             (uint16_t)(avail_base[4 + 2 * ring_index] | (avail_base[4 + 2 * ring_index + 1] << 8));
-        uint8_t raw_desc[16];
         hype_virtq_desc_t header_desc, data_desc, status_desc;
+        const uint8_t *dp;
         const uint8_t *hdr;
         uint32_t req_type;
         uint64_t sector;
-        uint64_t byte_offset;
         uint8_t status_value;
         uint32_t used_len;
         uint16_t used_idx;
         uint16_t used_ring_index;
         uint32_t elem_off;
-        uint32_t j;
 
-        for (j = 0; j < 16u; j++) {
-            raw_desc[j] = desc_base[(uint32_t)head_desc * 16u + j];
-        }
-        hype_virtq_decode_desc(raw_desc, &header_desc);
-        if ((header_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0) {
+        /* Walk the 3-descriptor chain (header -> data -> status), translating +
+         * bounding each 16-byte descriptor entry. An index >= queue_size or an
+         * untranslatable descriptor address aborts the whole notify. */
+        if (head_desc >= qsz) {
             return -1;
         }
-        for (j = 0; j < 16u; j++) {
-            raw_desc[j] = desc_base[(uint32_t)header_desc.next * 16u + j];
-        }
-        hype_virtq_decode_desc(raw_desc, &data_desc);
-        if ((data_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0) {
+        dp = (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map,
+                                                         dev->queue_desc + (uint64_t)head_desc * 16u, 16u);
+        if (dp == 0) {
             return -1;
         }
-        for (j = 0; j < 16u; j++) {
-            raw_desc[j] = desc_base[(uint32_t)data_desc.next * 16u + j];
+        hype_virtq_decode_desc(dp, &header_desc);
+        if ((header_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0 || header_desc.next >= qsz) {
+            return -1;
         }
-        hype_virtq_decode_desc(raw_desc, &status_desc);
+        dp = (const uint8_t *)(uintptr_t)guest_dma_xlate(
+            dma_map, dev->queue_desc + (uint64_t)header_desc.next * 16u, 16u);
+        if (dp == 0) {
+            return -1;
+        }
+        hype_virtq_decode_desc(dp, &data_desc);
+        if ((data_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0 || data_desc.next >= qsz) {
+            return -1;
+        }
+        dp = (const uint8_t *)(uintptr_t)guest_dma_xlate(
+            dma_map, dev->queue_desc + (uint64_t)data_desc.next * 16u, 16u);
+        if (dp == 0) {
+            return -1;
+        }
+        hype_virtq_decode_desc(dp, &status_desc);
         if ((status_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) != 0) {
             return -1; /* status must be the chain's last descriptor */
         }
 
-        hdr = (const uint8_t *)(uintptr_t)header_desc.addr;
+        /* virtio_blk_req header: type(4) + reserved(4) + sector(8) = 16 bytes. */
+        hdr = (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, header_desc.addr, 16u);
+        if (hdr == 0) {
+            return -1;
+        }
         req_type = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) | ((uint32_t)hdr[2] << 16) |
                    ((uint32_t)hdr[3] << 24);
         sector = (uint64_t)hdr[8] | ((uint64_t)hdr[9] << 8) | ((uint64_t)hdr[10] << 16) |
                  ((uint64_t)hdr[11] << 24) | ((uint64_t)hdr[12] << 32) | ((uint64_t)hdr[13] << 40) |
                  ((uint64_t)hdr[14] << 48) | ((uint64_t)hdr[15] << 56);
-        byte_offset = sector * HYPE_VIRTIO_BLK_SECTOR_SIZE;
-        (void)byte_offset; /* I/O is now sector-based via the blk_backend, not a flat buffer */
 
         /* GLADDER/M5-7a: dispatch through the bounds-gated hype_blk_backend vtable
          * (#89) instead of a raw host buffer, so the frontend is backend-agnostic
          * (file / physical / qcow2). virtio-blk data is always a whole-sector
-         * multiple; the LBA+count bounds check lives inside hype_blk_backend_*. */
+         * multiple; the LBA+count bounds check lives inside hype_blk_backend_*.
+         * The guest data buffer is itself translated+bounded before the copy. */
         if (req_type == HYPE_VIRTIO_BLK_T_OUT || req_type == HYPE_VIRTIO_BLK_T_IN) {
             uint32_t nsec = data_desc.len / HYPE_VIRTIO_BLK_SECTOR_SIZE;
-            void *gbuf = (void *)(uintptr_t)data_desc.addr;
+            void *gbuf = (void *)(uintptr_t)guest_dma_xlate(dma_map, data_desc.addr, data_desc.len);
             int rc;
-            if ((data_desc.len % HYPE_VIRTIO_BLK_SECTOR_SIZE) != 0u || nsec == 0u) {
+            if ((data_desc.len % HYPE_VIRTIO_BLK_SECTOR_SIZE) != 0u || nsec == 0u || gbuf == 0) {
                 status_value = HYPE_VIRTIO_BLK_S_IOERR;
                 used_len = 1;
             } else if (req_type == HYPE_VIRTIO_BLK_T_OUT) {
@@ -2315,7 +2351,12 @@ static int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backe
             used_len = 1;
         }
 
-        *(uint8_t *)(uintptr_t)status_desc.addr = status_value;
+        {
+            uint8_t *st = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, status_desc.addr, 1u);
+            if (st != 0) {
+                *st = status_value;
+            }
+        }
 
         used_idx = (uint16_t)(used_base[2] | (used_base[3] << 8));
         used_ring_index = (uint16_t)(used_idx % dev->queue_size);
@@ -2340,7 +2381,8 @@ static int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backe
 }
 
 int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
-                                         const hype_blk_backend_t *be, uint64_t mmio_base_phys) {
+                                         const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
+                                         uint64_t mmio_base_phys) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_npf_t npf;
     hype_mmio_decode_t decoded;
@@ -2388,7 +2430,7 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
                offset < HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET + 4u) {
         if (decoded.is_write) {
             if (hype_virtio_blk_is_queue_ready(dev)) {
-                if (process_virtio_blk_queue(dev, be) != 0) {
+                if (process_virtio_blk_queue(dev, be, dma_map) != 0) {
                     return -1;
                 }
             }

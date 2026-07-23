@@ -4340,7 +4340,7 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
             if (mmio_mapped &&
                 hype_svm_vcpu_handle_virtio_blk_npf(ctx, &g_m5_1_virtio_blk, &g_m5_1_be,
-                                                     mmio_mapped_base) == 0) {
+                                                     /*dma_map=*/0, mmio_mapped_base) == 0) {
                 continue;
             }
 
