@@ -21,6 +21,7 @@
 #include "../core/iso_stream.h"
 #include "../core/fat.h"
 #include "../core/nvme_host.h"
+#include "../core/blk_backend.h"
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
@@ -3971,6 +3972,11 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 static uint8_t g_m5_1_guest_code[512] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_guest_stack[4096] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_backing[0x10000] __attribute__((aligned(4096))); /* 128 sectors */
+/* M5-7a: the virtio-blk frontend now drives a hype_blk_backend, not a raw buffer.
+ * For M5-1 the backend is a file-backed store over g_m5_1_backing (same bytes the
+ * test seeds + verifies), so the refactor is behaviour-preserving here. */
+static hype_blk_file_t g_m5_1_blk_file;
+static hype_blk_backend_t g_m5_1_be;
 static uint8_t g_m5_1_desc_table[128] __attribute__((aligned(4096)));  /* 8 * 16 bytes */
 static uint8_t g_m5_1_avail[22] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_used[70] __attribute__((aligned(4096)));
@@ -4236,6 +4242,7 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_write_le16(g_m5_1_avail + 6, 3); /* ring[1] = head descriptor of chain 2 */
 
     hype_virtio_blk_reset(&g_m5_1_virtio_blk, HYPE_M5_1_CAPACITY_SECTORS);
+    hype_blk_file_init(&g_m5_1_blk_file, &g_m5_1_be, g_m5_1_backing, sizeof(g_m5_1_backing));
     hype_pci_reset(&g_m5_1_pci);
     hype_pci_add_device(&g_m5_1_pci, HYPE_M5_1_VIRTIO_DEV, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
                          HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
@@ -4332,8 +4339,8 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
 
             if (mmio_mapped &&
-                hype_svm_vcpu_handle_virtio_blk_npf(ctx, &g_m5_1_virtio_blk, g_m5_1_backing,
-                                                     sizeof(g_m5_1_backing), mmio_mapped_base) == 0) {
+                hype_svm_vcpu_handle_virtio_blk_npf(ctx, &g_m5_1_virtio_blk, &g_m5_1_be,
+                                                     mmio_mapped_base) == 0) {
                 continue;
             }
 
