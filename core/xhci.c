@@ -203,6 +203,14 @@ unsigned int hype_xhci_ep_dci(unsigned int ep_addr) {
     return ((ep_addr & 0x0Fu) * 2u) + ((ep_addr & 0x80u) ? 1u : 0u);
 }
 
+void hype_xhci_trb_normal(uint32_t trb[4], uint64_t buffer_phys, uint32_t length, int cycle) {
+    trb[0] = (uint32_t)(buffer_phys & 0xFFFFFFFFull);
+    trb[1] = (uint32_t)(buffer_phys >> 32);
+    trb[2] = length & 0x1FFFFu; /* TRB Transfer Length [16:0]; TD size/intr target 0 */
+    /* IOC (bit5) + ISP (bit2) so a single-TRB bulk transfer always events. */
+    trb[3] = ctrl(HYPE_XHCI_TRB_NORMAL, cycle) | (1u << 5) | (1u << 2);
+}
+
 /* --- event TRB decode --- */
 
 unsigned int hype_xhci_event_cc(const uint32_t trb[4]) { return (trb[2] >> 24) & 0xFFu; }

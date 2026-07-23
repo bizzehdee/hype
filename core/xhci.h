@@ -145,6 +145,10 @@ void hype_xhci_trb_data_stage(uint32_t trb[4], uint64_t buffer_phys, uint32_t le
 /* Status Stage: dir_in (1=IN), ioc (interrupt-on-completion), cycle. */
 void hype_xhci_trb_status_stage(uint32_t trb[4], int dir_in, int ioc, int cycle);
 
+/* Normal TRB for a bulk transfer: data buffer + length, with IOC + Interrupt-on-
+ * Short-Packet set so a single-TRB transfer always yields a Transfer Event. */
+void hype_xhci_trb_normal(uint32_t trb[4], uint64_t buffer_phys, uint32_t length, int cycle);
+
 /* --- device/input context encoders (xHCI 6.2), pure --- */
 /* Contexts are 32 or 64 bytes (CSZ); these fill the first 8 dwords (the rest is
  * reserved/padding). Callers place them at ctx_size-byte strides in the
@@ -304,5 +308,19 @@ int hype_xhci_set_configuration(hype_xhci_ctrl_t *c, unsigned int slot, unsigned
 int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
                                        unsigned int root_port, unsigned int speed,
                                        const hype_xhci_msc_eps_t *msc);
+
+/*
+ * USB-3 (#215) block I/O over Bulk-Only Transport (SCSI). Require the device to
+ * be Enable-Slot'd, Address'd, SET_CONFIGURATION'd and its bulk endpoints
+ * Configure-Endpoint'd (see above). All bounce through an internal page, so
+ * `blocks * block_size` must be <= 4096. Return 0 on success.
+ */
+int hype_xhci_msc_read_capacity(hype_xhci_ctrl_t *c, unsigned int slot,
+                                const hype_xhci_msc_eps_t *msc, uint32_t *last_lba,
+                                uint32_t *block_size);
+int hype_xhci_msc_read(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
+                       uint32_t lba, unsigned int blocks, unsigned int block_size, void *buf);
+int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
+                        uint32_t lba, unsigned int blocks, unsigned int block_size, const void *buf);
 
 #endif /* HYPE_CORE_XHCI_H */
