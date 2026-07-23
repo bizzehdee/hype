@@ -76,6 +76,10 @@ static void test_cmd_trbs(void) {
     CHECK_HEX("configep type", HYPE_XHCI_TRB_CONFIG_EP, hype_xhci_trb_type(t));
     CHECK_HEX("configep ctx ptr", 0x3000u, t[0]);
     CHECK_HEX("configep slot id", 7u, (t[3] >> 24) & 0xFFu);
+
+    hype_xhci_trb_disable_slot(t, 5, 1);
+    CHECK_HEX("disable-slot type", HYPE_XHCI_TRB_DISABLE_SLOT, hype_xhci_trb_type(t));
+    CHECK_HEX("disable-slot id", 5u, (t[3] >> 24) & 0xFFu);
 }
 
 static void test_control_transfer_trbs(void) {

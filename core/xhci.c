@@ -78,6 +78,11 @@ void hype_xhci_trb_address_device(uint32_t trb[4], uint64_t input_ctx_phys,
              ((slot_id & 0xFFu) << 24);
 }
 
+void hype_xhci_trb_disable_slot(uint32_t trb[4], unsigned int slot_id, int cycle) {
+    hype_xhci_trb_zero(trb);
+    trb[3] = ctrl(HYPE_XHCI_TRB_DISABLE_SLOT, cycle) | ((slot_id & 0xFFu) << 24);
+}
+
 void hype_xhci_trb_configure_endpoint(uint32_t trb[4], uint64_t input_ctx_phys,
                                       unsigned int slot_id, int cycle) {
     trb[0] = (uint32_t)(input_ctx_phys & ~0xFull);
