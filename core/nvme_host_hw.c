@@ -70,6 +70,13 @@ static int submit_and_poll(volatile uint8_t *bar, uint8_t *sq, uint8_t *cq, unsi
 
     centry = cq + (*cq_head) * HYPE_NVME_CQE_SIZE;
     while (spins-- != 0u) {
+        /* #229: hype busy-polls the CQ for a completion the HOST emulates
+         * (QEMU NVMe). A tight spin can starve QEMU's device thread of a host
+         * timeslice, so the CQE intermittently never posts within the window.
+         * PAUSE both hints a spin-wait to the CPU and, under KVM pause-loop-
+         * exiting, yields a lightweight #VMEXIT so the host can run the device
+         * model and post the completion. */
+        __asm__ volatile("pause");
         if (hype_nvme_cqe_phase(centry) == (int)(*phase)) {
             int ok = hype_nvme_cqe_success(centry);
             *cq_head = (*cq_head + 1u) % Q_ENTRIES;
@@ -88,8 +95,21 @@ static int submit_and_poll(volatile uint8_t *bar, uint8_t *sq, uint8_t *cq, unsi
     {
         extern void hype_debug_print(const char *fmt, ...);
         static int t1 = 0;
-        if (t1++ < 4) hype_debug_print("#229dbg nvme: TIMEOUT (qid=%u sq_tail=%u cq_head=%u phase=%u)\n",
-                                       qid, *sq_tail, *cq_head, *phase);
+        if (t1++ < 4) {
+            /* Dump the polled CQE's status word + phase bit, plus CC/CSTS and
+             * the SQ/CQ doorbell offsets. If the CQE status word is nonzero the
+             * controller DID post (phase/head tracking bug); if it's zero the
+             * controller never wrote it (doorbell/queue-setup issue). */
+            uint16_t sw = (uint16_t)(centry[14] | (centry[15] << 8));
+            hype_debug_print("#229dbg TIMEOUT qid=%u sq_tail=%u cq_head=%u want_phase=%u "
+                             "cqe_sw=0x%04x cqe_phase=%u CC=0x%08x CSTS=0x%08x dstrd=%u "
+                             "sqdb_off=0x%x cqdb_off=0x%x\n",
+                             qid, *sq_tail, *cq_head, *phase, (unsigned)sw,
+                             (unsigned)(sw & 1u), rd32(bar, HYPE_NVME_REG_CC),
+                             rd32(bar, HYPE_NVME_REG_CSTS), g_dstrd,
+                             hype_nvme_doorbell_offset(qid, 0, g_dstrd),
+                             hype_nvme_doorbell_offset(qid, 1, g_dstrd));
+        }
     }
     return -1; /* completion never posted */
 }
@@ -160,6 +180,14 @@ int hype_nvme_host_init(uint64_t abar_phys) {
                             &g_admin_phase, sqe) != 0) {
             return -1;
         }
+    }
+    {
+        extern void hype_debug_print(const char *fmt, ...);
+        hype_debug_print("#229dbg init: io_sq=0x%llx io_cq=0x%llx admin_sq=0x%llx admin_cq=0x%llx "
+                         "bounce=0x%llx\n",
+                         (unsigned long long)phys(g_io_sq), (unsigned long long)phys(g_io_cq),
+                         (unsigned long long)phys(g_admin_sq), (unsigned long long)phys(g_admin_cq),
+                         (unsigned long long)phys(g_bounce));
     }
     /* IDENTIFY namespace 1 -> geometry. */
     hype_nvme_build_identify_sqe(sqe, ++g_cid, HYPE_NVME_CNS_NAMESPACE, 1u, phys(g_id_buf));
