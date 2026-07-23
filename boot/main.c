@@ -30,6 +30,13 @@
 #include "../core/nvme_host.h"
 #include "../core/blk_backend.h"
 #include "../core/blk_phys.h"
+
+/* #229 debug: read the active host CR3 (which page-table root this core runs under). */
+static inline uint64_t hype_dbg_read_cr3(void) {
+    uint64_t v;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(v));
+    return v;
+}
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
@@ -5410,6 +5417,9 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         hype_debug_print("virtio-blk[vm %d]: WRITABLE PHYSICAL NVMe backend (sn '%s', %llu sectors)\n",
                          (int)(vm - &g_vms[0]), g_hostnvme_serial,
                          (unsigned long long)g_hostnvme_total_sectors);
+        hype_debug_print("#229dbg setup: CR3=0x%llx g_pml4=0x%llx g_ap_cr3=0x%llx nvme_bar=0x%llx\n",
+                         (unsigned long long)hype_dbg_read_cr3(), (unsigned long long)(uintptr_t)g_pml4,
+                         (unsigned long long)g_ap_cr3, (unsigned long long)g_hostnvme_bar);
 #if HYPE_M10_6_WRITE_SELFTEST
         fw_1_vblk_write_selftest(vm);
 #endif
@@ -7506,6 +7516,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_svm_vcpu_get_last_npf(ctx, &npf);
                 if (npf.guest_phys_addr >= vblk_bar &&
                     npf.guest_phys_addr < vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
+                    if (vm->vblk_is_physical) {
+                        static int dbg229_once = 0;
+                        if (!dbg229_once) {
+                            dbg229_once = 1;
+                            hype_debug_print("#229dbg npf: CR3=0x%llx g_pml4=0x%llx nvme_bar=0x%llx\n",
+                                             (unsigned long long)hype_dbg_read_cr3(),
+                                             (unsigned long long)(uintptr_t)g_pml4,
+                                             (unsigned long long)g_hostnvme_bar);
+                        }
+                    }
                     if (hype_svm_vcpu_handle_virtio_blk_npf(ctx, &g_fw_1_vblk, &g_fw_1_vblk_be,
                                                             &g_fw_1_dma_map, vblk_bar, insn) == 0) {
                         continue;
