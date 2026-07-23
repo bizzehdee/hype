@@ -6713,6 +6713,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (g_fw_1_lapic.eoi_count != ahci_last_eoi) {
             ahci_last_eoi = g_fw_1_lapic.eoi_count;
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
+            /* M5-7 (#196): same for the virtio-blk line -- on the guest's LAPIC
+             * EOI, drop GSI 20's Remote-IRR so the NEXT completion re-injects.
+             * Without this the level line stuck after the first completion and
+             * vda I/O hung. The raise below re-fires while isr_status != 0. */
+            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
         }
         if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
