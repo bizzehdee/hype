@@ -39,11 +39,15 @@ Rationale: best serves the FAT-drop UX; makes write-back (CONFIG-3) a
 parse-mutate-reserialize of one file rather than a multi-file merge; matches the
 current single-file parser; v1 scale is ≤16 VMs.
 
-**Reserved for later, additive:** an optional drop-in directory (`hype.d/*.cfg`,
-merged in filename order after `hype.cfg`) for operators who prefer physical
-per-VM files. Not in v1; the format must not preclude it (§4). Blast-radius
-isolation that per-VM files would give is instead provided by **per-section
-lenient parsing** (§4.3).
+**Reserved for later, additive:** an optional drop-in directory (`hype.d/*.cfg`)
+for operators who prefer physical per-VM files. Not in v1; the format must not
+preclude it (§4). Precedence when it lands: `hype.cfg` is read first, then
+`hype.d/*.cfg` in ascending filename order; **last definition wins per key**
+(systemd-style), and new sections accumulate. The **GUI/TUI writes only
+`hype.cfg`** — never into `hype.d/` (those are operator-managed overrides); an
+edit to a VM defined in a drop-in is written as an overriding entry in
+`hype.cfg`, which then wins by precedence. Blast-radius isolation that per-VM
+files would give is instead provided by **per-section lenient parsing** (§4.3).
 
 ---
 
@@ -131,6 +135,28 @@ Additions:
 `target_disk` / `target_disk_size_gb` (the current inline single-disk form) stay
 valid as **sugar** for a one-disk VM (§7); `disks =` is the general form.
 
+### 5.4 Boot media (CD/ISO)
+
+`install_media` (§5.2) stays the ergonomic key for a VM's **primary boot CD** —
+it is the common case, maps to the per-VM ISO backing (#140), and is
+conceptually distinct (read-only ATAPI optical, not a writable disk). It is NOT
+folded into `[disk.*]`. *Additional* optical media (e.g. a Windows virtio /
+storage-driver CD alongside the installer) is a reserved future capability via a
+`[disk.<id>]` with `backing=file`, read-only, `bus=ahci-atapi`.
+
+### 5.5 `bus` default derivation
+
+When a disk's `bus` is not given, it defaults from the owning VM's `os_hint`:
+
+| `os_hint` | default `bus` | why |
+|---|---|---|
+| `windows` | `ahci-sata` | Windows has no inbox virtio-blk driver — a virtio system disk would be invisible at install time; AHCI/SATA is inbox on every supported Windows |
+| `linux` / `bsd` / `none` | `virtio-blk` | inbox + fastest paravirtual path |
+
+An explicit `bus =` always wins. (Until the AHCI-SATA / NVMe *guest front-ends*
+land — #202 + a guest-AHCI-disk ticket — only `virtio-blk` is actually
+realizable; the default is correct for when they exist.)
+
 ### 5.3 `[disk.<id>]` — a named virtual disk (NEW)
 
 Decouples disk definitions from VMs so a VM can have several, and each disk's
@@ -144,7 +170,7 @@ attributes are independently extensible. A `[vm.*]` attaches disks via `disks =`
 | `size_gb` | int | — | `backing=file`: create at this size if absent |
 | `id_match` | serial-or-GUID string | — | `backing=physical`: the drive identity phys_guard requires (#122/#124) |
 | `partition` | int (1-based) \| `whole` | `whole` | `backing=physical`: scope to a GPT partition vs the whole disk |
-| `bus` | `virtio-blk` \| `ahci-sata` \| `nvme` | `virtio-blk` | guest-facing front-end (#196 / #202) |
+| `bus` | `virtio-blk` \| `ahci-sata` \| `nvme` | **per `os_hint`** (§5.5) | guest-facing front-end (#196 / #202) |
 | `allow_overwrite` | bool | `false` | `backing=physical`: the explicit per-disk override for the non-empty-table guard (#124/#195). Still ALSO requires runtime confirm (§6). |
 
 ---
@@ -247,14 +273,29 @@ allow_overwrite = false
 
 ---
 
-## 11. Open questions (to resolve as the spec firms up)
+## 11. Operator config vs runtime state (decision)
 
-- Should `bus` default per `os_hint` (e.g. Windows → `nvme`/`ahci-sata` since it
-  lacks inbox virtio) rather than always `virtio-blk`?
-- CD/ISO as a first-class `[disk.*]` with `bus=ahci-atapi`, vs the current
-  dedicated `install_media` key?
-- Drop-in `hype.d/` precedence + whether the GUI writes there or only to
-  `hype.cfg`.
-- Snapshot/state records (§6h/§9) — same file (`[snapshot.*]`) or a sibling
-  state file? (Leaning sibling: it's hype-written runtime state, not operator
-  config.)
+`hype.cfg` is **operator/GUI-authored configuration only**. Hype-**written**
+runtime state — which VMs were running at shutdown and their lifecycle state, for
+the auto-Start-on-boot cycle (plan.md §6h/§9) — lives in a **sibling
+`hype.state`** file on the ESP, NOT in `hype.cfg` and NOT in a `[snapshot.*]`
+section.
+
+Rationale: keeping machine-written volatile state out of the hand-edited config
+avoids the state writer and the GUI write-back (§8) fighting over the same file
+(and risking a clobber of operator edits), and keeps `hype.cfg` round-trip clean
+(only config churns it, not per-boot state). `hype.state` is hype-owned, has no
+round-trip/comment-preservation obligation, and can use whatever compact format
+suits it.
+
+## 12. Resolved / remaining
+
+Resolved this pass: one-file + `[hype]` (§2); `bus` defaults per `os_hint`
+(§5.5); `install_media` kept, extra optical reserved as `[disk.*] bus=ahci-atapi`
+(§5.4); `hype.d/` precedence + GUI-writes-only-`hype.cfg` (§2); runtime state in a
+sibling `hype.state` (§11).
+
+Still open (fold in as the implementation firms up): exact `hype.state` format;
+whether `cpu_set`/`vcpus` interact with the SMP milestone's per-vCPU model
+(#185+); and whether `net_peers` graduates to a richer `[net]` section when NET
+lands.
