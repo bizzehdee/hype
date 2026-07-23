@@ -88,6 +88,18 @@ uint16_t hype_nvme_cqe_cid(const uint8_t cqe[16]);    /* command id echoed back 
 int hype_nvme_parse_identify_ns(const uint8_t idns[4096], uint64_t *total_blocks,
                                 uint32_t *block_bytes);
 
+/*
+ * M10-6a (#227): parses the ASCII Serial Number (SN, bytes 4..23) and Model
+ * Number (MN, bytes 24..63) out of an IDENTIFY CONTROLLER (CNS=1) 4096-byte
+ * structure -- the fields the `physical:` target-disk guard (#124) keys on for
+ * an NVMe drive, complementing the AHCI ATA serial (hype_ahci_host_parse_
+ * identify). Both are left-justified, space-padded fixed fields; this trims
+ * surrounding whitespace and NUL-terminates. serial_out must be >= 21 bytes,
+ * model_out >= 41 bytes; either may be NULL to skip that field. Pure.
+ */
+void hype_nvme_parse_identify_ctrl(const uint8_t idctrl[4096], char serial_out[21],
+                                   char model_out[41]);
+
 /* CAP helpers (NVMe 1.4 §3.1.1): DSTRD (doorbell stride) is CAP[35:32]; the
  * doorbell for queue `qid` (is_cq selects the completion doorbell) sits at
  * DOORBELL_BASE + (2*qid + is_cq) * (4 << DSTRD). */
@@ -123,5 +135,15 @@ int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *
  * Signature matches hype_ahci_host_write.
  */
 int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const void *src);
+
+/*
+ * M10-6a (#227): the identity + capacity captured by the last successful
+ * hype_nvme_host_init() -- the fields a `physical:` NVMe target needs (serial
+ * for the #124 guard match, total 512-byte sectors for the block backend's
+ * capacity bound). serial_out >= 21 bytes, model_out >= 41 bytes (either may be
+ * NULL). hype_nvme_host_total_sectors() returns 0 before a successful init.
+ */
+void hype_nvme_host_identity(char serial_out[21], char model_out[41]);
+uint64_t hype_nvme_host_total_sectors(void);
 
 #endif /* HYPE_CORE_NVME_HOST_H */

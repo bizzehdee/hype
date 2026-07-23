@@ -12,8 +12,25 @@ enum {
     F_FIRMWARE = 1u << 7,
     F_OS_HINT = 1u << 8,
     F_NET_MODE = 1u << 9,
-    F_NET_PEERS = 1u << 10
+    F_NET_PEERS = 1u << 10,
+    F_PARTITION = 1u << 11,
+    F_ALLOW_OVERWRITE = 1u << 12
 };
+
+/* Parses a boolean value: true/false, yes/no, on/off, 1/0. */
+static hype_cfg_status_t parse_bool_field(const char *val, int *out) {
+    if (hype_streq(val, "true") || hype_streq(val, "yes") || hype_streq(val, "on") ||
+        hype_streq(val, "1")) {
+        *out = 1;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(val, "false") || hype_streq(val, "no") || hype_streq(val, "off") ||
+        hype_streq(val, "0")) {
+        *out = 0;
+        return HYPE_CFG_OK;
+    }
+    return HYPE_CFG_ERR_BAD_VALUE;
+}
 
 static char *find_char(char *s, char c) {
     while (*s && *s != c) {
@@ -279,6 +296,26 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         st = parse_net_peers(val, vm);
         if (st != HYPE_CFG_OK) return st;
         *seen |= F_NET_PEERS;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "partition")) {
+        if (*seen & F_PARTITION) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_streq(val, "whole")) {
+            vm->target_disk.partition = 0; /* whole disk */
+        } else {
+            hype_cfg_status_t st = parse_uint_field(val, &vm->target_disk.partition);
+            if (st != HYPE_CFG_OK) return st;
+            if (vm->target_disk.partition == 0) return HYPE_CFG_ERR_BAD_VALUE; /* 1-based */
+        }
+        *seen |= F_PARTITION;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "allow_overwrite")) {
+        hype_cfg_status_t st;
+        if (*seen & F_ALLOW_OVERWRITE) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        st = parse_bool_field(val, &vm->target_disk.allow_overwrite);
+        if (st != HYPE_CFG_OK) return st;
+        *seen |= F_ALLOW_OVERWRITE;
         return HYPE_CFG_OK;
     }
     return HYPE_CFG_ERR_UNKNOWN_KEY;

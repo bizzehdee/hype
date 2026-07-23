@@ -14,6 +14,9 @@
 #include "../core/guest_ram.h"
 #include "../core/mp.h"
 #include "../core/admission.h"
+#include "../core/cfg.h"
+#include "../core/phys_guard.h"
+#include "../core/phys_confirm.h"
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/ahci_host.h"
@@ -22,6 +25,7 @@
 #include "../core/fat.h"
 #include "../core/nvme_host.h"
 #include "../core/blk_backend.h"
+#include "../core/blk_phys.h"
 #include "../core/logbuf.h"
 #include "../core/nvlog.h"
 #include "../core/clockfacts.h"
@@ -69,6 +73,25 @@
  * -- it writes to a real drive when one is present, so only enable it for a
  * QEMU boot with a `-device nvme` SCRATCH disk, NEVER on real hardware. */
 #define HYPE_NVME_WRITE_SELFTEST 0
+
+/* M10-6a (#227): auto-accept the physical-write confirmation at arm time,
+ * WITHOUT the interactive `confirm <serial>` keystroke. OFF by default -- the
+ * whole point of #125 is that a human confirms a destructive write. Enable ONLY
+ * for a headless QEMU-scratch validation (a `-device nvme` SCRATCH disk whose
+ * serial matches the config target), NEVER on real hardware. */
+#ifndef HYPE_M10_6_AUTOCONFIRM
+#define HYPE_M10_6_AUTOCONFIRM 0
+#endif
+
+/* M10-6a (#227): after a confirmed physical target attaches as a guest's
+ * virtio-blk backend, round-trip a known pattern through the guest-facing
+ * hype_blk_backend to a SCRATCH LBA (write, read back, verify) to prove guest
+ * writes reach the real disk. DESTRUCTIVE within that one scratch LBA; OFF by
+ * default, QEMU-scratch only. Requires HYPE_M10_6_AUTOCONFIRM to reach a
+ * confirmed backend headlessly. */
+#ifndef HYPE_M10_6_WRITE_SELFTEST
+#define HYPE_M10_6_WRITE_SELFTEST 0
+#endif
 
 /* Static storage: still valid (and unmoving) once these get built and
  * loaded, after ExitBootServices() below. */
@@ -291,6 +314,12 @@ typedef struct hype_fw_vm {
     hype_blk_backend_t vblk_be;
     hype_blk_file_t vblk_file;
     uint64_t vblk_backing_phys; /* host-physical base of this VM's scratch disk */
+    /* M10-6a (#227): when this VM's confirmed target is a `physical:` disk, the
+     * backend above is instead a writable physical backend over the enumerated
+     * host NVMe scratch. Which backing is live is decided in fw_1_setup_virtio_blk. */
+    hype_blk_phys_t vblk_phys;
+    hype_blk_phys_nvme_t vblk_phys_nvme;
+    int vblk_is_physical;
     hype_gpa_map_t dma_map; /* VALID-1/3: guest-phys->host layout for DMA bounds */
     /* --- per-run timing + diagnostics (M4-6b1/M4-6d4/PERF-1a) --- */
     uint64_t host_tsc_hz;   /* calibrated CPU freq; drives the guest timebase */
@@ -431,6 +460,25 @@ static char g_cmdline[HYPE_CMDLINE_MAX];
 static unsigned g_cmdline_len;
 static char g_cmd_result[96];
 
+/*
+ * M10-5 (#125): the one pending physical-write confirmation. A `physical:`
+ * target that has PASSED the #124 guard (identity match + non-empty/override)
+ * still may not be written until the operator, shown the real drive's
+ * model/serial/size on the dashboard, re-types its serial (`confirm <serial>`).
+ * Owner-core only, like the rest of the dashboard command state.
+ */
+static hype_phys_confirm_t g_phys_confirm;
+
+/* M10-6a (#227): the enumerated NVMe scratch target for a confirmed `physical:`
+ * write. hype boots off the AHCI ESP, so an NVMe controller is a SEPARATE disk
+ * -- the safe destructive-write target under test. Captured at the host-nvme
+ * enumeration block; consumed by fw_1_setup_virtio_blk when the confirmed
+ * target serial matches g_hostnvme_serial. */
+static int g_hostnvme_present;
+static uint64_t g_hostnvme_bar;
+static uint64_t g_hostnvme_total_sectors;
+static char g_hostnvme_serial[21];
+
 static int term_streq(const char *a, const char *b) {
     unsigned i = 0;
     for (; a[i] && b[i]; i++) {
@@ -468,7 +516,7 @@ static void term_run_cmdline(void) {
             break;
         case HYPE_CMD_HELP:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
-                          "cmds: list status start stop resume shutdown off focus <vm>");
+                          "cmds: list status start stop resume shutdown off focus <vm> | confirm <sn>");
             break;
         case HYPE_CMD_LIST:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%u VM(s) -- see table above",
@@ -524,6 +572,27 @@ static void term_run_cmdline(void) {
             g_term_view = idx;
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focused %s", nm);
             break;
+        case HYPE_CMD_CONFIRM: {
+            /* M10-5: the operator authorises the pending physical write by
+             * re-typing the target drive's serial. Only phys_confirm's ACCEPTED
+             * state lets the install path later pass operator_confirmed=1 to the
+             * #124 guard -- this command never writes to the disk itself. */
+            hype_phys_confirm_submit_t sr =
+                hype_phys_confirm_submit(&g_phys_confirm, c.has_arg ? c.arg : "");
+            if (sr == HYPE_PHYS_CONFIRM_SUBMIT_NONE_PENDING) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "confirm: no physical write pending");
+            } else if (sr == HYPE_PHYS_CONFIRM_SUBMIT_ACCEPTED) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "physical write CONFIRMED for '%s'", g_phys_confirm.vm_name);
+                hype_debug_print("phys-write: operator CONFIRMED via dashboard -- vm '%s' sn '%s'\n",
+                                 g_phys_confirm.vm_name, g_phys_confirm.serial);
+            } else {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "confirm: serial mismatch -- type: confirm <drive-serial>");
+            }
+            break;
+        }
         case HYPE_CMD_UNKNOWN:
         default:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "unknown command (try 'help')");
@@ -5214,8 +5283,19 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
             hype_gop_console_clear(&g_gop_console);
             *term_last_view = -1;
         }
-        hype_dashboard_render(&g_dashboard_term, info, ninfo, vm->stat_uptime_ms / 1000u,
-                              g_cmdline, g_cmd_result);
+        {
+            /* M10-5: a pending/accepted physical-write confirmation is the most
+             * important thing on screen, so it takes over the footer result
+             * line (drive model/serial/size + the exact command to type). */
+            const char *result_line = g_cmd_result;
+            static char confirm_footer[192];
+            if (g_phys_confirm.state != HYPE_PHYS_CONFIRM_IDLE) {
+                result_line = hype_phys_confirm_prompt(&g_phys_confirm, confirm_footer,
+                                                       sizeof(confirm_footer));
+            }
+            hype_dashboard_render(&g_dashboard_term, info, ninfo, vm->stat_uptime_ms / 1000u,
+                                  g_cmdline, result_line);
+        }
         hype_vt_render(&g_dashboard_term, &g_gop_console, 0);
         hype_debug_flush_gop();
     }
@@ -5235,11 +5315,81 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
  * (fw_1_vm_reinit). The vCPU loop latches the BAR OVMF assigns, dispatches BAR
  * MMIO to the (GPA-translated, VALID-3) virtio handler, and raises the
  * completion IRQ on GSI 20. */
+/* M10-6a (#227): at most one VM claims the single enumerated physical scratch. */
+static int g_phys_backend_claimed_vm = -1;
+
+/* True iff this VM should back its virtio-blk with the CONFIRMED writable NVMe
+ * scratch instead of the RAM/file disk: a scratch was enumerated, the #125
+ * confirm is ACCEPTED, its serial matches the scratch, and no other VM already
+ * claimed it. (VM-name<->config wiring is a later CONFIG item, so the confirmed
+ * physical disk attaches to the first eligible guest, matched by serial.) */
+static int fw_1_vblk_use_physical(hype_fw_vm_t *vm) {
+    int idx = (int)(vm - &g_vms[0]);
+    if (!g_hostnvme_present) return 0;
+    if (!hype_phys_confirm_is_accepted(&g_phys_confirm)) return 0;
+    if (!term_streq(g_phys_confirm.serial, g_hostnvme_serial)) return 0;
+    if (g_phys_backend_claimed_vm >= 0 && g_phys_backend_claimed_vm != idx) return 0;
+    return 1;
+}
+
+#if HYPE_M10_6_WRITE_SELFTEST
+/* Round-trips a known pattern through the guest-facing blk_backend to a scratch
+ * LBA (well past any partition table) to prove guest writes reach the physical
+ * disk. DESTRUCTIVE within that one LBA; gated OFF by default. */
+static void fw_1_vblk_write_selftest(hype_fw_vm_t *vm) {
+    static uint8_t wr[512], rd[512];
+    uint64_t lba = 4096u;
+    unsigned k;
+    int ok = 1;
+    for (k = 0; k < 512u; k++) wr[k] = (uint8_t)(0x5Au ^ (k & 0xFFu));
+    if (hype_blk_backend_write(&vm->vblk_be, lba, 1u, wr) != 0) {
+        hype_serial_print("virtio-blk: M10-6 WRITE-SELFTEST write FAILED\n");
+        return;
+    }
+    for (k = 0; k < 512u; k++) rd[k] = 0;
+    if (hype_blk_backend_read(&vm->vblk_be, lba, 1u, rd) != 0) {
+        hype_serial_print("virtio-blk: M10-6 WRITE-SELFTEST readback FAILED\n");
+        return;
+    }
+    for (k = 0; k < 512u; k++) { if (rd[k] != wr[k]) { ok = 0; break; } }
+    hype_debug_print("virtio-blk: M10-6 WRITE-SELFTEST lba=%llu roundtrip %s (b0=%02x b511=%02x)\n",
+                     (unsigned long long)lba, ok ? "OK" : "MISMATCH",
+                     (unsigned)rd[0], (unsigned)rd[511]);
+}
+#endif
+
 static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
     uint8_t *config;
-    hype_virtio_blk_reset(&vm->vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
-    hype_blk_file_init(&vm->vblk_file, &vm->vblk_be, (uint8_t *)(uintptr_t)vm->vblk_backing_phys,
-                       HYPE_FW_1_VDISK_BYTES);
+    if (fw_1_vblk_use_physical(vm)) {
+        /* CONFIRMED `physical:` target -> writable NVMe scratch backend. Guest
+         * writes to /dev/vda now land on the real (QEMU scratch) disk. */
+        /* The NVMe register BAR can sit in high MMIO (QEMU puts it at
+         * 0x380000000000) that only lives in g_pml4 via the map_mmio_1gb entry
+         * the host-nvme enumeration installed. Guest setup runs later under a
+         * g_pml4 that may have been rebuilt since, so RE-ESTABLISH the mapping
+         * before any controller-register access from the backend -- otherwise
+         * the first doorbell write #PFs. */
+        if (g_hostnvme_bar >= 512ULL * HYPE_PAGING_1GB) {
+            hype_paging_map_mmio_1gb(g_pml4, g_nvme_pdpt, g_nvme_pd, g_hostnvme_bar);
+            hype_paging_load(g_pml4);
+        }
+        hype_blk_phys_nvme_init(&vm->vblk_phys, &vm->vblk_phys_nvme, &vm->vblk_be,
+                                g_hostnvme_bar, g_hostnvme_total_sectors);
+        vm->vblk_is_physical = 1;
+        g_phys_backend_claimed_vm = (int)(vm - &g_vms[0]);
+        hype_virtio_blk_reset(&vm->vblk, g_hostnvme_total_sectors);
+        hype_debug_print("virtio-blk[vm %d]: WRITABLE PHYSICAL NVMe backend (sn '%s', %llu sectors)\n",
+                         (int)(vm - &g_vms[0]), g_hostnvme_serial,
+                         (unsigned long long)g_hostnvme_total_sectors);
+#if HYPE_M10_6_WRITE_SELFTEST
+        fw_1_vblk_write_selftest(vm);
+#endif
+    } else {
+        vm->vblk_is_physical = 0;
+        hype_virtio_blk_reset(&vm->vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
+        hype_blk_file_init(&vm->vblk_file, &vm->vblk_be, (uint8_t *)(uintptr_t)vm->vblk_backing_phys,
+                           HYPE_FW_1_VDISK_BYTES);
+    }
     hype_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
                         HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
                         HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE);
@@ -8250,6 +8400,148 @@ static int load_iso_into_vm(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTabl
     return 0;
 }
 
+/*
+ * CONFIG-4 (#225): the ESP loader half of the hype.cfg layer. The parser
+ * (core/cfg.c) is pure text-in/struct-out and fully unit-tested; this is the
+ * thin, hardware-facing counterpart that gets the file into memory -- it reads
+ * "\hype.cfg" off the ESP via the same UEFI Simple File System path the ISO
+ * loader uses, NUL-terminates it, and parses it into g_hype_cfg.
+ *
+ * Policy: hype.cfg is ADVISORY here -- a missing, oversized, or malformed file
+ * is logged and treated as an empty config (vm_count 0), never a boot failure,
+ * so hype falls back to its built-in guest setup. The first real consumers are
+ * #125 (dashboard confirm) + #126 (install-to-real-drive), which read the
+ * parsed physical target + partition + allow_overwrite qualifiers.
+ */
+static hype_cfg_t g_hype_cfg;                 /* parsed config; vm_count 0 => none/fallback */
+static char g_hype_cfg_text[16384];           /* scratch; parser mutates in place */
+
+static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+    EFI_FILE_PROTOCOL *root = 0;
+    EFI_STATUS st;
+    UINT64 sz = 0;
+    hype_cfg_result_t res;
+
+    g_hype_cfg.vm_count = 0;
+
+    st = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
+    if (st != EFI_SUCCESS || root == 0) {
+        hype_debug_print("cfg: cannot open ESP root (0x%llx) -- using built-in defaults\n",
+                         (unsigned long long)st);
+        return;
+    }
+
+    st = hype_file_get_size(root, SystemTable->BootServices, (CHAR16 *)L"\\hype.cfg", &sz);
+    if (st != EFI_SUCCESS) {
+        hype_debug_print("cfg: no \\hype.cfg on ESP -- using built-in defaults\n");
+        return;
+    }
+    if (sz == 0 || sz >= sizeof(g_hype_cfg_text)) {
+        hype_debug_print("cfg: \\hype.cfg size %llu unusable (1..%llu) -- ignoring config\n",
+                         (unsigned long long)sz,
+                         (unsigned long long)(sizeof(g_hype_cfg_text) - 1));
+        return;
+    }
+
+    st = hype_file_read_range(root, (CHAR16 *)L"\\hype.cfg", 0, g_hype_cfg_text, (UINTN)sz);
+    if (st != EFI_SUCCESS) {
+        hype_debug_print("cfg: read \\hype.cfg failed (0x%llx) -- ignoring config\n",
+                         (unsigned long long)st);
+        return;
+    }
+    g_hype_cfg_text[sz] = '\0';
+
+    res = hype_cfg_parse(g_hype_cfg_text, &g_hype_cfg);
+    if (res.status != HYPE_CFG_OK) {
+        hype_debug_print("cfg: \\hype.cfg parse error (status=%d, line=%u) -- ignoring config\n",
+                         (int)res.status, res.line);
+        g_hype_cfg.vm_count = 0;
+        return;
+    }
+
+    hype_debug_print("cfg: loaded \\hype.cfg (%llu bytes) -- %u VM(s)\n",
+                     (unsigned long long)sz, g_hype_cfg.vm_count);
+    {
+        unsigned int vi;
+        for (vi = 0; vi < g_hype_cfg.vm_count; vi++) {
+            const hype_cfg_vm_t *v = &g_hype_cfg.vms[vi];
+            const hype_cfg_target_disk_t *d = &v->target_disk;
+            hype_debug_print("cfg:   vm[%u] '%s' vcpus=%u mem=%uMB target=%s:%s",
+                             vi, v->name, v->vcpus, v->mem_mb,
+                             d->kind == HYPE_CFG_DISK_PHYSICAL ? "physical" : "file",
+                             d->path_or_id);
+            if (d->kind == HYPE_CFG_DISK_PHYSICAL) {
+                if (d->partition) {
+                    hype_debug_print(" part=%u", d->partition);
+                } else {
+                    hype_debug_print(" part=whole");
+                }
+                hype_debug_print(" allow_overwrite=%d", d->allow_overwrite);
+            }
+            hype_debug_print("\n");
+        }
+    }
+}
+
+/*
+ * M10-5 (#125): the one pending physical-write confirmation. A `physical:`
+ * target that has PASSED the #124 guard (identity match + non-empty/override)
+ * M10-5 (#125): given a REAL enumerated physical drive (serial + model + LBA
+ * capacity + optional GPT GUID + its first two sectors), test every configured
+ * `physical:` target against it with the #124 arm-time guard
+ * (operator_confirmed=0) and, for the VM whose target this drive satisfies
+ * pending only confirmation, arm the interactive dashboard confirmation. A
+ * drive that fails identity match, or is non-empty without allow_overwrite, is
+ * logged and NEVER armed -- a config entry alone is never sufficient (§6d/§10).
+ * Called from the host-AHCI enumeration path with the identity it already reads.
+ */
+static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_serial,
+                                       const char *drive_model, uint64_t total_sectors,
+                                       const uint8_t *disk_guid, const uint8_t *sector0,
+                                       const uint8_t *sector1) {
+    unsigned int vi;
+    if (!cfg) return;
+    for (vi = 0; vi < cfg->vm_count; vi++) {
+        const hype_cfg_vm_t *v = &cfg->vms[vi];
+        const hype_cfg_target_disk_t *d = &v->target_disk;
+        hype_phys_guard_result_t r;
+        if (d->kind != HYPE_CFG_DISK_PHYSICAL || d->path_or_id[0] == '\0') {
+            continue;
+        }
+        r = hype_phys_guard_arm(d->path_or_id, drive_serial, disk_guid, sector0, sector1,
+                                d->allow_overwrite, /*operator_confirmed=*/0);
+        if (r == HYPE_PHYS_GUARD_DENY_ID_MISMATCH) {
+            hype_debug_print("phys-write: vm '%s' target '%s' != enumerated drive (sn '%s') "
+                             "-- not armed\n", v->name, d->path_or_id,
+                             drive_serial ? drive_serial : "(none)");
+            continue;
+        }
+        if (r == HYPE_PHYS_GUARD_DENY_NONEMPTY) {
+            hype_debug_print("phys-write: vm '%s' target '%s' drive is NOT BLANK and "
+                             "allow_overwrite is unset -- refusing (not armed)\n",
+                             v->name, d->path_or_id);
+            continue;
+        }
+        /* identity matched + disk state OK (guard returned NEEDS_CONFIRM): the
+         * only remaining gate is the operator's interactive confirmation. */
+        hype_phys_confirm_request(&g_phys_confirm, v->name, drive_model, drive_serial,
+                                  total_sectors * 512ull);
+        {
+            char pbuf[192];
+            hype_debug_print("phys-write: %s\n",
+                             hype_phys_confirm_prompt(&g_phys_confirm, pbuf, sizeof(pbuf)));
+        }
+#if HYPE_M10_6_AUTOCONFIRM
+        /* Headless QEMU-scratch validation only: skip the interactive keystroke
+         * by submitting the (known) serial ourselves. Compiled out by default. */
+        (void)hype_phys_confirm_submit(&g_phys_confirm, drive_serial);
+        hype_debug_print("phys-write: AUTO-CONFIRMED (HYPE_M10_6_AUTOCONFIRM) for vm '%s'\n",
+                         v->name);
+#endif
+        return; /* at most one pending confirmation at a time */
+    }
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -8321,6 +8613,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * EFI variable (survives a cold power cycle, unlike RT-1b's RAM scan) and
      * dump it to \hype-diag-prev.txt while Boot Services file I/O is up. */
     fw_1_dump_prev_diag(ImageHandle, SystemTable->BootServices, g_hype_rt);
+
+    /* CONFIG-4 (#225): load + parse \hype.cfg off the ESP now, while Boot
+     * Services file I/O is still up (pre-EBS), into g_hype_cfg. Advisory:
+     * absent/malformed -> empty config + built-in fallback, never a boot stop.
+     * #125/#126 consume the parsed physical target + partition qualifiers. */
+    load_hype_cfg(ImageHandle, SystemTable);
 
     SystemTable->BootServices->FreePool(map);
 
@@ -9054,8 +9352,29 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             if (hype_nvme_host_init(hn.bar_phys) != 0) {
                 hype_serial_print("host-nvme: controller init failed\n");
             } else if (hype_nvme_host_read(hn.bar_phys, 0u, 1u, g_nvme_probe) == 0) {
+                static uint8_t g_nvme_lba1[512] __attribute__((aligned(4096)));
+                char nvme_model[41];
                 hype_debug_print("host-nvme: init OK, LBA0 read OK -- mbrsig=%02x%02x\n",
                                  (unsigned)g_nvme_probe[510], (unsigned)g_nvme_probe[511]);
+                /* M10-6a: capture this NVMe namespace as the physical scratch
+                 * target + match it against the config via the #124 guard, then
+                 * (on match) arm the #125 dashboard confirm. Separate controller
+                 * from the AHCI boot disk -> safe destructive-write target. */
+                hype_nvme_host_identity(g_hostnvme_serial, nvme_model);
+                g_hostnvme_present = 1;
+                g_hostnvme_bar = hn.bar_phys;
+                g_hostnvme_total_sectors = hype_nvme_host_total_sectors();
+                hype_debug_print("host-nvme: serial='%s' model='%s' sectors=%llu (%llu MiB)\n",
+                                 g_hostnvme_serial, nvme_model,
+                                 (unsigned long long)g_hostnvme_total_sectors,
+                                 (unsigned long long)(g_hostnvme_total_sectors / 2048ull));
+                if (hype_nvme_host_read(hn.bar_phys, 1u, 1u, g_nvme_lba1) != 0) {
+                    hype_serial_print("host-nvme: LBA1 read failed -- phys-write not armed\n");
+                } else {
+                    arm_physical_write_confirm(&g_hype_cfg, g_hostnvme_serial, nvme_model,
+                                               g_hostnvme_total_sectors, 0,
+                                               g_nvme_probe, g_nvme_lba1);
+                }
             } else {
                 hype_serial_print("host-nvme: LBA0 read FAILED\n");
             }
@@ -9122,21 +9441,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * only for now -- no consumer writes to the disk yet. */
                 {
                     static uint8_t g_hostdisk_id[512] __attribute__((aligned(4096)));
+                    static uint8_t g_hostdisk_lba1[512] __attribute__((aligned(4096)));
                     if (hype_ahci_host_identify(hs.bar_phys, (unsigned)sp, g_hostdisk_id) == 0) {
                         hype_host_disk_info_t di;
                         uint8_t guid[16];
+                        int have_guid = 0;
                         hype_ahci_host_parse_identify(g_hostdisk_id, &di);
                         hype_debug_print("host-disk: serial='%s' model='%s' sectors=%llu (%llu MiB)\n",
                                          di.serial, di.model,
                                          (unsigned long long)di.total_sectors,
                                          (unsigned long long)(di.total_sectors / 2048ull));
                         if (hype_gpt_disk_guid(hostdisk_read, 0, guid) == 0) {
+                            have_guid = 1;
                             hype_debug_print(
                                 "host-disk: gpt-guid %02x%02x%02x%02x-%02x%02x-%02x%02x-"
                                 "%02x%02x-%02x%02x%02x%02x%02x%02x\n",
                                 guid[0], guid[1], guid[2], guid[3], guid[4], guid[5], guid[6],
                                 guid[7], guid[8], guid[9], guid[10], guid[11], guid[12], guid[13],
                                 guid[14], guid[15]);
+                        }
+                        /* M10-5 (#125): match this REAL drive against every
+                         * configured `physical:` target and, if one passes the
+                         * #124 identity + non-empty guard, arm the interactive
+                         * dashboard confirmation. Needs the first two sectors:
+                         * LBA0 is g_hostdisk_probe (read above); read LBA1 (the
+                         * GPT header) here for the guard's non-empty check. */
+                        if (hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 1u, 1u,
+                                                g_hostdisk_lba1) != 0) {
+                            hype_serial_print("host-disk: LBA1 read failed -- phys-write not armed\n");
+                        } else {
+                            arm_physical_write_confirm(&g_hype_cfg, di.serial, di.model,
+                                                       di.total_sectors, have_guid ? guid : 0,
+                                                       g_hostdisk_probe, g_hostdisk_lba1);
                         }
                     } else {
                         hype_serial_print("host-disk: IDENTIFY failed\n");

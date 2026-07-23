@@ -22,6 +22,7 @@ typedef enum {
     HYPE_CMD_SHUTDOWN,   /* orderly, guest-driven S5 (M8-6) */
     HYPE_CMD_POWEROFF,   /* force power off (M8-7) */
     HYPE_CMD_FOCUS,      /* switch console focus */
+    HYPE_CMD_CONFIRM,    /* M10-5: confirm a pending physical-disk write (arg = drive serial) */
     HYPE_CMD_UNKNOWN,
 } hype_cmd_verb_t;
 

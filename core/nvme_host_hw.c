@@ -28,6 +28,11 @@ static uint8_t g_prp_list[PAGE] __attribute__((aligned(PAGE)));
 
 static uint32_t g_dstrd;
 static uint16_t g_cid;
+
+/* M10-6a: identity + capacity of the initialised namespace (see accessors). */
+static char g_nvme_serial[21];
+static char g_nvme_model[41];
+static uint64_t g_nvme_total_sectors;
 static unsigned g_admin_sq_tail, g_admin_cq_head, g_admin_phase;
 static unsigned g_io_sq_tail, g_io_cq_head, g_io_phase;
 
@@ -157,7 +162,33 @@ int hype_nvme_host_init(uint64_t abar_phys) {
     if (block_bytes != HYPE_NVME_SECTOR_SIZE) {
         return -1; /* only 512-byte-block namespaces supported by the 512-sector callers */
     }
+    g_nvme_total_sectors = total_blocks;
+
+    /* M10-6a: IDENTIFY CONTROLLER (CNS=1) -> serial/model, for the `physical:`
+     * NVMe target guard match. Non-fatal: a controller that refuses it just
+     * leaves the identity empty (the guard then denies on serial mismatch). */
+    g_nvme_serial[0] = '\0';
+    g_nvme_model[0] = '\0';
+    hype_nvme_build_identify_sqe(sqe, ++g_cid, HYPE_NVME_CNS_CONTROLLER, 0u, phys(g_id_buf));
+    if (submit_and_poll(bar, g_admin_sq, g_admin_cq, 0, &g_admin_sq_tail, &g_admin_cq_head,
+                        &g_admin_phase, sqe) == 0) {
+        hype_nvme_parse_identify_ctrl(g_id_buf, g_nvme_serial, g_nvme_model);
+    }
     return 0;
+}
+
+void hype_nvme_host_identity(char serial_out[21], char model_out[41]) {
+    unsigned i;
+    if (serial_out) {
+        for (i = 0; i < sizeof(g_nvme_serial); i++) serial_out[i] = g_nvme_serial[i];
+    }
+    if (model_out) {
+        for (i = 0; i < sizeof(g_nvme_model); i++) model_out[i] = g_nvme_model[i];
+    }
+}
+
+uint64_t hype_nvme_host_total_sectors(void) {
+    return g_nvme_total_sectors;
 }
 
 int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *dst) {
