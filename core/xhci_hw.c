@@ -28,6 +28,10 @@ static uint8_t g_ep0_ring[XPAGE] __attribute__((aligned(XPAGE)));
 static uint8_t g_xfer_buf[XPAGE] __attribute__((aligned(XPAGE)));
 static unsigned int g_ep0_enq;
 static unsigned int g_ep0_cyc;
+/* MSC bulk endpoint transfer rings. */
+static uint8_t g_bulk_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
+static uint8_t g_bulk_out_ring[XPAGE] __attribute__((aligned(XPAGE)));
+static unsigned int g_bin_enq, g_bin_cyc, g_bout_enq, g_bout_cyc;
 
 static inline uint8_t  rd8(volatile uint8_t *b, uint32_t o)  { return *(volatile uint8_t *)(b + o); }
 static inline uint32_t rd32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
@@ -281,6 +285,52 @@ int hype_xhci_set_configuration(hype_xhci_ctrl_t *c, unsigned int slot, unsigned
     /* SET_CONFIGURATION: bmRequestType=0x00 (OUT/standard/device), bRequest=9,
      * wValue=config, no data stage. */
     return control_transfer(c, slot, 0x00, 9, (uint16_t)config_value, 0, 0, 0u, 0);
+}
+
+/* Stamp a Link TRB (toggle-cycle, cycle=1) at the end of a fresh transfer ring. */
+static void ring_init_link(uint8_t *ring) {
+    uint32_t link[4];
+    hype_xhci_trb_link(link, phys(ring), 1);
+    put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
+    put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
+    put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
+    put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
+}
+
+int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
+                                       unsigned int root_port, unsigned int speed,
+                                       const hype_xhci_msc_eps_t *msc) {
+    unsigned int cs = c->ctx_size;
+    unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
+    unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
+    unsigned int max_dci = (dci_in > dci_out) ? dci_in : dci_out;
+    uint32_t ctx[8], cmd[4], evt[4];
+
+    if (!c->inited || slot == 0u) return -1;
+
+    /* Fresh bulk transfer rings. */
+    zero(g_bulk_in_ring, XPAGE);
+    zero(g_bulk_out_ring, XPAGE);
+    ring_init_link(g_bulk_in_ring);
+    ring_init_link(g_bulk_out_ring);
+    g_bin_enq = 0; g_bin_cyc = 1;
+    g_bout_enq = 0; g_bout_cyc = 1;
+
+    /* Input Context: add the Slot + both bulk endpoint contexts. */
+    zero(g_input_ctx, XPAGE);
+    hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci_in) | (1u << dci_out), 0);
+    write_ctx(g_input_ctx, 0, ctx);
+    hype_xhci_slot_ctx(ctx, 0, speed, max_dci, root_port); /* context entries = highest DCI */
+    write_ctx(g_input_ctx, cs, ctx);
+    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_IN, msc->bulk_in_mps, phys(g_bulk_in_ring), 1);
+    write_ctx(g_input_ctx, (1u + dci_in) * cs, ctx);
+    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_OUT, msc->bulk_out_mps, phys(g_bulk_out_ring), 1);
+    write_ctx(g_input_ctx, (1u + dci_out) * cs, ctx);
+
+    hype_xhci_trb_configure_endpoint(cmd, phys(g_input_ctx), slot, (int)g_cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    return 0;
 }
 
 int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {

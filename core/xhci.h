@@ -75,6 +75,7 @@ typedef enum {
     HYPE_XHCI_TRB_LINK            = 6,
     HYPE_XHCI_TRB_ENABLE_SLOT     = 9,
     HYPE_XHCI_TRB_ADDRESS_DEVICE  = 11,
+    HYPE_XHCI_TRB_CONFIG_EP       = 12,
     HYPE_XHCI_TRB_NOOP_CMD        = 23,
     HYPE_XHCI_TRB_TRANSFER_EVENT  = 32,
     HYPE_XHCI_TRB_CMD_COMPLETION  = 33,
@@ -127,6 +128,8 @@ void hype_xhci_trb_noop_cmd(uint32_t trb[4], int cycle);
 void hype_xhci_trb_enable_slot(uint32_t trb[4], int cycle);
 void hype_xhci_trb_address_device(uint32_t trb[4], uint64_t input_ctx_phys,
                                   unsigned int slot_id, int bsr, int cycle);
+void hype_xhci_trb_configure_endpoint(uint32_t trb[4], uint64_t input_ctx_phys,
+                                      unsigned int slot_id, int cycle);
 
 /*
  * Control-transfer TRBs (on a device's default-control endpoint transfer ring).
@@ -157,8 +160,18 @@ void hype_xhci_input_ctrl_ctx(uint32_t icc[8], uint32_t add_flags, uint32_t drop
 void hype_xhci_slot_ctx(uint32_t sc[8], unsigned int route, unsigned int speed,
                         unsigned int ctx_entries, unsigned int root_port);
 
-/* Default-control Endpoint (EP0) Context: EP Type = Control(4), CErr = 3, the
- * given Max Packet Size, and the TR Dequeue Pointer (+ DCS cycle bit). */
+/* Endpoint Context EP Type field (dword1 bits 5:3), xHCI 6.2.3. */
+#define HYPE_XHCI_EP_TYPE_ISOCH_OUT 1u
+#define HYPE_XHCI_EP_TYPE_BULK_OUT  2u
+#define HYPE_XHCI_EP_TYPE_INT_OUT   3u
+#define HYPE_XHCI_EP_TYPE_CONTROL   4u
+#define HYPE_XHCI_EP_TYPE_BULK_IN   6u
+#define HYPE_XHCI_EP_TYPE_INT_IN    7u
+
+/* Generic Endpoint Context: EP Type, CErr=3, Max Packet Size, TR Dequeue (+DCS). */
+void hype_xhci_ep_ctx(uint32_t ep[8], unsigned int ep_type, unsigned int max_packet,
+                      uint64_t tr_dequeue_phys, int dcs);
+/* Default-control Endpoint (EP0) Context = ep_ctx with EP Type = Control. */
 void hype_xhci_ep0_ctx(uint32_t ep[8], unsigned int max_packet, uint64_t tr_dequeue_phys, int dcs);
 
 /* Initial control-endpoint Max Packet Size for a PORTSC speed id (xHCI/USB). */
@@ -281,5 +294,15 @@ int hype_xhci_get_config_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint
 
 /* SET_CONFIGURATION(config_value) control transfer (no data). 0 on success. */
 int hype_xhci_set_configuration(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int config_value);
+
+/*
+ * Issues a Configure Endpoint command adding the MSC bulk IN + bulk OUT
+ * endpoints (from *msc) to `slot`'s device context, each with a fresh transfer
+ * ring. root_port/speed re-provide the input Slot Context. Returns 0 on success.
+ * After this, bulk transfers on those endpoints are possible.
+ */
+int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
+                                       unsigned int root_port, unsigned int speed,
+                                       const hype_xhci_msc_eps_t *msc);
 
 #endif /* HYPE_CORE_XHCI_H */

@@ -9478,6 +9478,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                  "bulk-in=0x%02x bulk-out=0x%02x mps=%u\n",
                                                  msc.config_value, msc.interface_num,
                                                  msc.bulk_in_ep, msc.bulk_out_ep, msc.bulk_in_mps);
+                                if (hype_xhci_configure_bulk_endpoints(&xc, slot, port, speed,
+                                                                       &msc) != 0) {
+                                    hype_serial_print("host-xhci: Configure Endpoint FAILED\n");
+                                } else {
+                                    hype_debug_print("host-xhci: bulk endpoints configured -- "
+                                                     "MSC datapath ready\n");
+                                }
                             }
                         }
                     } else {

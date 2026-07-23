@@ -78,6 +78,14 @@ void hype_xhci_trb_address_device(uint32_t trb[4], uint64_t input_ctx_phys,
              ((slot_id & 0xFFu) << 24);
 }
 
+void hype_xhci_trb_configure_endpoint(uint32_t trb[4], uint64_t input_ctx_phys,
+                                      unsigned int slot_id, int cycle) {
+    trb[0] = (uint32_t)(input_ctx_phys & ~0xFull);
+    trb[1] = (uint32_t)(input_ctx_phys >> 32);
+    trb[2] = 0u;
+    trb[3] = ctrl(HYPE_XHCI_TRB_CONFIG_EP, cycle) | ((slot_id & 0xFFu) << 24);
+}
+
 void hype_xhci_trb_setup_stage(uint32_t trb[4], uint8_t bm_request_type, uint8_t b_request,
                                uint16_t w_value, uint16_t w_index, uint16_t w_length,
                                unsigned int trt, int cycle) {
@@ -122,15 +130,20 @@ void hype_xhci_slot_ctx(uint32_t sc[8], unsigned int route, unsigned int speed,
     sc[1] = (root_port & 0xFFu) << 16;
 }
 
-void hype_xhci_ep0_ctx(uint32_t ep[8], unsigned int max_packet, uint64_t tr_dequeue_phys, int dcs) {
+void hype_xhci_ep_ctx(uint32_t ep[8], unsigned int ep_type, unsigned int max_packet,
+                      uint64_t tr_dequeue_phys, int dcs) {
     ctx_zero(ep);
-    /* dword1: CErr[2:1]=3, EP Type[5:3]=4 (Control), Max Packet Size[31:16]. */
-    ep[1] = (3u << 1) | (4u << 3) | ((max_packet & 0xFFFFu) << 16);
+    /* dword1: CErr[2:1]=3, EP Type[5:3], Max Packet Size[31:16]. */
+    ep[1] = (3u << 1) | ((ep_type & 0x7u) << 3) | ((max_packet & 0xFFFFu) << 16);
     /* dword2/3: TR Dequeue Pointer (16-byte aligned) | DCS[0]. */
     ep[2] = (uint32_t)((tr_dequeue_phys & ~0xFull) | (dcs ? 1u : 0u));
     ep[3] = (uint32_t)(tr_dequeue_phys >> 32);
-    /* dword4: Average TRB Length (8 is the conventional value for control). */
+    /* dword4: Average TRB Length (8 is the conventional value; informational). */
     ep[4] = 8u;
+}
+
+void hype_xhci_ep0_ctx(uint32_t ep[8], unsigned int max_packet, uint64_t tr_dequeue_phys, int dcs) {
+    hype_xhci_ep_ctx(ep, HYPE_XHCI_EP_TYPE_CONTROL, max_packet, tr_dequeue_phys, dcs);
 }
 
 unsigned int hype_xhci_default_mps(unsigned int speed_id) {
