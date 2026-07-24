@@ -13,6 +13,8 @@
 #include "../../../devices/pflash.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
+#include "../../../devices/ps2_keyboard.h"
+#include "../../../devices/ps2_mouse.h"
 #include "../cpu/cpuid_emulate.h"
 #include "../cpu/mmio_decode.h"
 #include "../cpu/msr_emulate.h"
@@ -965,6 +967,106 @@ int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
 
     vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
     return 0;
+}
+
+/*
+ * VMX PS/2 keyboard IOIO handler (VMX-2, input-1): mirror of
+ * hype_svm_vcpu_handle_ps2_kbd_ioio. Byte IN/OUT to the 0x60/0x64 ports routed
+ * to the keyboard model; value in RAX (gprs[0] low byte).
+ */
+int hype_vmx_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok, rc;
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    uint16_t port = (uint16_t)((qual >> 16) & 0xFFFFu);
+    int is_in = (int)((qual >> 3) & 1u);
+
+    if (is_in) {
+        uint8_t value = 0;
+        rc = hype_ps2_kbd_io_read(kbd, port, &value);
+        if (rc == 0) {
+            real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
+        }
+    } else {
+        rc = hype_ps2_kbd_io_write(kbd, port, (uint8_t)(real->gprs[0] & 0xFFu));
+    }
+    if (rc != 0) {
+        return -1;
+    }
+    vmx_advance_rip();
+    return 0;
+}
+
+/*
+ * VMX PS/2 keyboard+mouse IOIO handler (VMX-2, input-2): mirror of
+ * hype_svm_vcpu_handle_ps2_ioio. The 0x60 data port returns/consumes a mouse
+ * byte when the mouse has one (or the aux-data-write flag is set), else the
+ * keyboard; the 0x64 status port merges the mouse-pending bits into the kbd
+ * status. out_kbd_wait (FW-1 idle detection) is unused by the microtest.
+ */
+int hype_vmx_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse,
+                                  int *out_kbd_wait) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok;
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    uint16_t port = (uint16_t)((qual >> 16) & 0xFFFFu);
+    int is_in = (int)((qual >> 3) & 1u);
+
+    if (out_kbd_wait != 0) {
+        *out_kbd_wait = 0;
+    }
+
+    if (port == HYPE_PS2_PORT_DATA) {
+        if (is_in) {
+            uint8_t value;
+            if (hype_ps2_mouse_has_pending_byte(mouse)) {
+                value = hype_ps2_mouse_read_byte(mouse);
+            } else {
+                hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_DATA, &value);
+            }
+            real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
+        } else {
+            uint8_t value = (uint8_t)(real->gprs[0] & 0xFFu);
+            if (hype_ps2_kbd_take_aux_data_write(kbd)) {
+                hype_ps2_mouse_write_command(mouse, value);
+            } else {
+                hype_ps2_kbd_io_write(kbd, HYPE_PS2_PORT_DATA, value);
+            }
+        }
+    } else if (port == HYPE_PS2_PORT_STATUS_COMMAND) {
+        if (is_in) {
+            uint8_t status = 0;
+            hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_STATUS_COMMAND, &status);
+            if (hype_ps2_mouse_has_pending_byte(mouse)) {
+                status |= HYPE_PS2_STATUS_OUTPUT_FULL | HYPE_PS2_STATUS_AUX_DATA;
+            }
+            if (out_kbd_wait != 0 && (status & HYPE_PS2_STATUS_OUTPUT_FULL) == 0) {
+                *out_kbd_wait = 1;
+            }
+            real->gprs[0] = (real->gprs[0] & ~0xFFULL) | status;
+        } else {
+            hype_ps2_kbd_io_write(kbd, HYPE_PS2_PORT_STATUS_COMMAND, (uint8_t)(real->gprs[0] & 0xFFu));
+        }
+    } else {
+        return -1;
+    }
+
+    vmx_advance_rip();
+    return 0;
+}
+
+/*
+ * VMX PIC IRQ delivery (VMX-2, input-1/2): mirror of
+ * hype_svm_vcpu_deliver_pic_irq. Raises the line on the emulated PIC chip,
+ * acknowledges the highest-priority pending IRQ, and queues that vector for
+ * injection (via the interrupt-window path in hype_vmx_vcpu_request_interrupt).
+ */
+void hype_vmx_vcpu_deliver_pic_irq(hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip, uint8_t irq) {
+    uint8_t vector;
+    hype_pic_emu_raise_irq(chip, irq);
+    if (hype_pic_emu_acknowledge_highest_priority(chip, &vector)) {
+        hype_vmx_vcpu_request_interrupt(ctx, vector);
+    }
 }
 
 /* Guest-DMA address translation, VMX flavour: dma_map == 0 means the guest is

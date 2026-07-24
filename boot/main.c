@@ -1436,6 +1436,11 @@ static int vmm_reason_is_msr(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_reason_is_hlt(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_handle_fw_cfg_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
                                   const hype_gpa_map_t *dma_map);
+static int vmm_handle_ps2_kbd_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd);
+static int vmm_handle_ps2_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd,
+                               hype_ps2_mouse_t *mouse, int *out_kbd_wait);
+static void vmm_deliver_pic_irq(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip,
+                                uint8_t irq);
 static int vmm_reason_is_ioio(hype_vmm_kind_t kind, uint64_t reason);
 static void vmm_handle_cpuid(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx);
 static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason);
@@ -2576,6 +2581,27 @@ static int vmm_handle_fw_cfg_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hy
     }
     return hype_svm_vcpu_handle_fw_cfg_ioio(ctx, fw, dma_map);
 }
+static int vmm_handle_ps2_kbd_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_ps2_kbd_ioio(ctx, kbd);
+    }
+    return hype_svm_vcpu_handle_ps2_kbd_ioio(ctx, kbd);
+}
+static int vmm_handle_ps2_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd,
+                               hype_ps2_mouse_t *mouse, int *out_kbd_wait) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_ps2_ioio(ctx, kbd, mouse, out_kbd_wait);
+    }
+    return hype_svm_vcpu_handle_ps2_ioio(ctx, kbd, mouse, out_kbd_wait);
+}
+static void vmm_deliver_pic_irq(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip,
+                                uint8_t irq) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_deliver_pic_irq(ctx, chip, irq);
+    } else {
+        hype_svm_vcpu_deliver_pic_irq(ctx, chip, irq);
+    }
+}
 static int vmm_reason_is_ioio(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_IO_INSTRUCTION)
                                      : (reason == HYPE_SVM_EXITCODE_IOIO);
@@ -3125,11 +3151,7 @@ static void run_input_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_vcpu_ctx_t *ctx;
     hype_vmexit_info_t info;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("input-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n",
-                           ops->name);
-        return;
-    }
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_input_1_idt, sizeof(g_input_1_idt));
     hype_guest_ram_zero(g_input_1_guest_code, sizeof(g_input_1_guest_code));
@@ -3178,14 +3200,14 @@ static void run_input_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_debug_print("input-1: entry_rip=0x%llx isr_phys=0x%llx\n", (unsigned long long)entry_rip,
                       (unsigned long long)isr_phys);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
     if (ctx == 0) {
         hype_fatal("input-1: vcpu_create_long_mode failed");
     }
 
-    hype_svm_vcpu_set_gdt(ctx, gdt_phys, (uint16_t)(sizeof(g_input_1_gdt) - 1));
-    hype_svm_vcpu_set_idt(ctx, idt_phys, (uint16_t)(sizeof(g_input_1_idt) - 1));
-    hype_svm_vcpu_set_cs_ss_selectors(ctx, 0x08u, 0x10u);
+    vmm_set_gdt(kind, ctx, gdt_phys, (uint16_t)(sizeof(g_input_1_gdt) - 1));
+    vmm_set_idt(kind, ctx, idt_phys, (uint16_t)(sizeof(g_input_1_idt) - 1));
+    vmm_set_cs_ss_selectors(kind, ctx, 0x08u, 0x10u);
 
     /* The key press itself: enqueue the scancode in the PS/2 device,
      * then, once the guest's own PIC initialization has genuinely
@@ -3212,20 +3234,20 @@ static void run_input_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 hype_fatal("input-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
             }
 
-            if (info.reason == HYPE_SVM_EXITCODE_VINTR) {
-                hype_svm_vcpu_handle_vintr_window(ctx);
+            if (vmm_reason_is_intr_window(kind, info.reason)) {
+                vmm_handle_intr_window(kind, ctx);
                 continue;
             }
 
-            if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
-                if (hype_svm_vcpu_handle_ioio(ctx, &g_input_1_pic, &g_input_1_pit) == 0) {
+            if (vmm_reason_is_ioio(kind, info.reason)) {
+                if (vmm_handle_ioio(kind, ctx, &g_input_1_pic, &g_input_1_pit) == 0) {
                     if (!irq1_delivered && g_input_1_pic.master.init_state == 0) {
-                        hype_svm_vcpu_deliver_pic_irq(ctx, &g_input_1_pic.master, 1);
+                        vmm_deliver_pic_irq(kind, ctx, &g_input_1_pic.master, 1);
                         irq1_delivered = 1;
                     }
                     continue;
                 }
-                if (hype_svm_vcpu_handle_ps2_kbd_ioio(ctx, &g_input_1_ps2) == 0) {
+                if (vmm_handle_ps2_kbd_ioio(kind, ctx, &g_input_1_ps2) == 0) {
                     continue;
                 }
                 hype_fatal("input-1: unhandled IOIO access (qual=0x%llx guest_rip=0x%llx)",
@@ -3236,7 +3258,7 @@ static void run_input_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("input-1: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
@@ -3429,11 +3451,17 @@ static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_vcpu_ctx_t *ctx;
     hype_vmexit_info_t info;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("input-2: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n",
-                           ops->name);
+    /* VMX-2: ported like input-1, but skipped on VMX pending a fix -- input-1
+     * (PS/2 keyboard) passes, so the PS/2 IOIO + PIC-IRQ + injection chain
+     * works; input-2's PS/2 MOUSE handshake doesn't complete under VMX (the
+     * guest waits on a mouse IRQ that's never delivered because
+     * reporting_enabled never latches), so it spins. Mouse-specific; own pass.
+     * Runs on SVM unchanged. */
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_serial_print("input-2: skipped on VMX -- PS/2 mouse handshake incomplete (see comment)\n");
         return;
     }
+    (void)ops;
 
     hype_guest_ram_zero(g_input_2_idt, sizeof(g_input_2_idt));
     hype_guest_ram_zero(g_input_2_guest_code, sizeof(g_input_2_guest_code));
@@ -3480,14 +3508,14 @@ static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_debug_print("input-2: entry_rip=0x%llx isr_phys=0x%llx\n", (unsigned long long)entry_rip,
                       (unsigned long long)isr_phys);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
     if (ctx == 0) {
         hype_fatal("input-2: vcpu_create_long_mode failed");
     }
 
-    hype_svm_vcpu_set_gdt(ctx, gdt_phys, (uint16_t)(sizeof(g_input_2_gdt) - 1));
-    hype_svm_vcpu_set_idt(ctx, idt_phys, (uint16_t)(sizeof(g_input_2_idt) - 1));
-    hype_svm_vcpu_set_cs_ss_selectors(ctx, 0x08u, 0x10u);
+    vmm_set_gdt(kind, ctx, gdt_phys, (uint16_t)(sizeof(g_input_2_gdt) - 1));
+    vmm_set_idt(kind, ctx, idt_phys, (uint16_t)(sizeof(g_input_2_idt) - 1));
+    vmm_set_cs_ss_selectors(kind, ctx, 0x08u, 0x10u);
 
     {
         int event_delivered = 0;
@@ -3497,16 +3525,16 @@ static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                 hype_fatal("input-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
             }
 
-            if (info.reason == HYPE_SVM_EXITCODE_VINTR) {
-                hype_svm_vcpu_handle_vintr_window(ctx);
+            if (vmm_reason_is_intr_window(kind, info.reason)) {
+                vmm_handle_intr_window(kind, ctx);
                 continue;
             }
 
-            if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
-                if (hype_svm_vcpu_handle_ioio(ctx, &g_input_2_pic, &g_input_2_pit) == 0) {
+            if (vmm_reason_is_ioio(kind, info.reason)) {
+                if (vmm_handle_ioio(kind, ctx, &g_input_2_pic, &g_input_2_pit) == 0) {
                     continue;
                 }
-                if (hype_svm_vcpu_handle_ps2_ioio(ctx, &g_input_2_kbd, &g_input_2_mouse, 0) == 0) {
+                if (vmm_handle_ps2_ioio(kind, ctx, &g_input_2_kbd, &g_input_2_mouse, 0) == 0) {
                     /* Mirrors run_input_1_test()'s own "wait for the
                      * guest to genuinely be ready" gate, extended with
                      * the mouse-specific readiness condition: reporting
@@ -3531,7 +3559,7 @@ static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("input-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }

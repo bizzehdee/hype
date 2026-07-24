@@ -13,6 +13,8 @@
 #include "../../../devices/virtio_blk.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
+#include "../../../devices/ps2_keyboard.h"
+#include "../../../devices/ps2_mouse.h"
 #include "../cpu/vmm_ops.h"
 #include "vmcs_fields.h"
 
@@ -87,6 +89,11 @@ int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
 /* fw_cfg IOIO (DMA interface): select/data/DMA ports (0x510/0x511/0x514/0x518). */
 int hype_vmx_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
                                      const hype_gpa_map_t *dma_map);
+/* PS/2 keyboard (+ mouse) IOIO on 0x60/0x64, and PIC-acknowledged IRQ delivery. */
+int hype_vmx_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd);
+int hype_vmx_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse,
+                                  int *out_kbd_wait);
+void hype_vmx_vcpu_deliver_pic_irq(hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip, uint8_t irq);
 /* MMIO via EPT violation (reason 48): decode the faulting instruction at guest
  * RIP and dispatch to the emulated pflash at [pf_base_phys, ...). */
 int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t pf_base_phys);
