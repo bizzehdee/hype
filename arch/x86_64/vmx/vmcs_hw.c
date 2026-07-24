@@ -2,13 +2,17 @@
 #include "vmx.h"
 
 #include "../../../core/fatal.h"
+#include "../../../devices/pflash.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
 #include "../cpu/cpuid_emulate.h"
+#include "../cpu/mmio_decode.h"
 #include "../cpu/msr_emulate.h"
 #include "../cpu/paging.h"
 #include "../cpu/vmm_ops.h"
 #include "ept.h"
+
+#define HYPE_VMX_MMIO_MAX_INSTR_BYTES 15u
 
 /* UNVALIDATED -- see vmx.h and vmcs.h. */
 
@@ -497,6 +501,22 @@ uint64_t hype_vmx_make_eptp(uint64_t pml4_phys) {
 }
 
 /*
+ * Punch an MMIO hole in the (internal, identity) EPT: clear the 2MB EPT PDE
+ * covering `gpa` so a guest access there causes an EPT violation (reason 48)
+ * instead of silently hitting RAM -- the VMX analogue of
+ * hype_npt_mark_not_present. Call AFTER vcpu_create_long_mode (which rebuilds
+ * the identity EPT). The device must own its own 2MB-aligned page, same
+ * granularity constraint the NPT side already relies on.
+ */
+void hype_vmx_ept_mark_mmio_hole(uint64_t gpa) {
+    unsigned gb = (unsigned)(gpa / HYPE_PAGING_1GB);
+    unsigned pd_idx = (unsigned)((gpa % HYPE_PAGING_1GB) / HYPE_PAGING_2MB);
+    if (gb < HYPE_EPT_MAX_GB) {
+        g_ept_pd[gb][pd_idx] = 0; /* R/W/X all clear -> not present */
+    }
+}
+
+/*
  * VMX vcpu_create (M2-8, VMX-1). Builds an identity EPT (guest-physical ==
  * host-physical, matching the SVM NPT identity map) and a launchable VMCS for
  * a real-mode guest entering at physical guest_rip with stack guest_rsp, then
@@ -747,6 +767,75 @@ int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
         return -1;
     }
     vmx_advance_rip();
+    return 0;
+}
+
+/* Guest GPR by ModRM.reg encoding, VMX flavour. Unlike SVM (RAX in the VMCB),
+ * every VMX guest GPR lives in ctx->gprs, so this is a straight index -- except
+ * RSP (index 4), which no MMIO operand can legally be (reject, matching SVM). */
+static uint64_t *vmx_gpr_ptr(struct hype_vcpu_ctx *real, uint8_t reg) {
+    if (reg == 4u || reg >= 16u) {
+        return 0;
+    }
+    return &real->gprs[reg];
+}
+
+/*
+ * VMX MMIO handler for the emulated pflash (VMX-2): mirror of
+ * hype_svm_vcpu_handle_npf, driven by an EPT violation (reason 48) instead of
+ * an NPF. The faulting GPA comes from GUEST_PHYSICAL_ADDRESS, the write bit
+ * from EXIT_QUALIFICATION bit 1. The faulting instruction is decoded straight
+ * out of guest memory at GUEST_RIP -- valid as a host pointer because the test
+ * guests are a flat identity map (guest-linear == guest-physical == host, via
+ * identity guest paging + identity EPT), the same assumption the SVM NPF path
+ * and the microtests' payload-write already rely on. Returns 0 if handled, -1
+ * to reject (fault outside the pflash window, decode failure, or dir mismatch).
+ */
+int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
+                                    uint64_t pf_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    int ok;
+    uint64_t gpa = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    int is_write = (int)((qual >> 1) & 1u);
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    if (gpa < pf_base_phys) {
+        return -1;
+    }
+    offset = (uint32_t)(gpa - pf_base_phys);
+
+    guest_bytes = (const uint8_t *)(uintptr_t)rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_VMX_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != is_write) {
+        return -1;
+    }
+
+    reg = vmx_gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        if (hype_pflash_write(pf, offset, decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_pflash_read(pf, offset, decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
     return 0;
 }
 

@@ -158,6 +158,9 @@
 
 /* Natural-width read-only fields (Table B-13). */
 #define HYPE_VMCS_EXIT_QUALIFICATION 0x6400u
+/* Guest-physical address (0x2400, 64-bit read-only): the faulting GPA reported
+ * on an EPT violation -- the VMX analogue of SVM NPF's EXITINFO2. */
+#define HYPE_VMCS_GUEST_PHYSICAL_ADDRESS 0x2400u
 
 /* Natural-width guest-state fields (Table B-14). */
 #define HYPE_VMCS_GUEST_CR0 0x6800u

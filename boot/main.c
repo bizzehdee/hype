@@ -1440,6 +1440,9 @@ static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t r
 static void vmm_set_rsi(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rsi);
 static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic,
                            hype_pit_emu_t *pit);
+static int vmm_reason_is_npf(hype_vmm_kind_t kind, uint64_t reason);
+static int vmm_handle_pflash_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
+                                 uint64_t pf_base_phys);
 
 /*
  * M3-5: builds the synthetic bzImage (real setup_header validated
@@ -1572,10 +1575,7 @@ static void run_m4_3_pflash_mmio_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t
     hype_vcpu_ctx_t *ctx;
     hype_vmexit_info_t info;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("m4-3: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
-        return;
-    }
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     /* M2-6 hard invariant: zero every byte of this guest's reserved
      * RAM before its first VM-entry, on every (re)start. NOT applied to
@@ -1616,9 +1616,15 @@ static void run_m4_3_pflash_mmio_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t
                        (unsigned long long)entry_rip, (unsigned long long)guest_cr3,
                        (unsigned long long)npt_root_phys, (unsigned long long)HYPE_M4_3_PFLASH_GPA);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
     if (ctx == 0) {
         hype_fatal("m4-3: vcpu_create_long_mode failed");
+    }
+    /* VMX builds its own identity EPT inside create (ignoring npt_root_phys),
+     * so the pflash MMIO hole -- punched into the SVM NPT above -- must be
+     * punched into the EPT too, else the guest access hits RAM with no exit. */
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_ept_mark_mmio_hole(HYPE_M4_3_PFLASH_GPA);
     }
 
     for (;;) {
@@ -1626,8 +1632,8 @@ static void run_m4_3_pflash_mmio_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t
             hype_fatal("m4-3: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_npf(ctx, &g_m4_3_pflash, HYPE_M4_3_PFLASH_GPA) != 0) {
+        if (vmm_reason_is_npf(kind, info.reason)) {
+            if (vmm_handle_pflash_npf(kind, ctx, &g_m4_3_pflash, HYPE_M4_3_PFLASH_GPA) != 0) {
                 hype_fatal("m4-3: unhandled/unrecognized MMIO access (qual=0x%llx guest_rip=0x%llx)",
                            (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
             }
@@ -1637,7 +1643,7 @@ static void run_m4_3_pflash_mmio_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("m4-3: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
@@ -2560,6 +2566,17 @@ static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_
         return hype_vmx_vcpu_handle_ioio(ctx, pic, pit);
     }
     return hype_svm_vcpu_handle_ioio(ctx, pic, pit);
+}
+static int vmm_reason_is_npf(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_EPT_VIOLATION)
+                                     : (reason == HYPE_SVM_EXITCODE_NPF);
+}
+static int vmm_handle_pflash_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
+                                 uint64_t pf_base_phys) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_pflash_npf(ctx, pf, pf_base_phys);
+    }
+    return hype_svm_vcpu_handle_npf(ctx, pf, pf_base_phys);
 }
 
 static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {

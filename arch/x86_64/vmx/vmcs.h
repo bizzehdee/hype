@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+#include "../../../devices/pflash.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
 #include "../cpu/vmm_ops.h"
@@ -47,6 +48,10 @@ int hype_vmx_vmcs_build_long_mode_guest(uint64_t entry_rip, uint64_t guest_cr3, 
 /* Assembles an EPT pointer (WB, 4-level) from a PML4 physical address. */
 uint64_t hype_vmx_make_eptp(uint64_t pml4_phys);
 
+/* Punch a 2MB MMIO hole in the internal identity EPT (call after
+ * vcpu_create_long_mode) so a guest access to `gpa` causes an EPT violation. */
+void hype_vmx_ept_mark_mmio_hole(uint64_t gpa);
+
 /*
  * VMX vcpu_create/vcpu_run (M2-8, VMX-1) -- the hype_vmm_ops_t hooks. create
  * builds an identity EPT + launchable VMCS for a real-mode guest at guest_rip
@@ -72,6 +77,9 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write);
  * emulates a port-I/O exit (reason 30) against the PIC/PIT models. */
 void hype_vmx_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi);
 int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit);
+/* MMIO via EPT violation (reason 48): decode the faulting instruction at guest
+ * RIP and dispatch to the emulated pflash at [pf_base_phys, ...). */
+int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t pf_base_phys);
 
 /*
  * VMX-1 smoke test: launches a self-contained 3-byte guest (CPUID; HLT) via
