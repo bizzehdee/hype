@@ -94,6 +94,16 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #define HYPE_M10_6_AUTOCONFIRM 0
 #endif
 
+/* #229 real-HW repro: attach the confirmed physical NVMe as the guest disk but
+ * READ-ONLY (null the backend's write fn), so the guest-on-AP read path -- the
+ * one whose completions flake under QEMU nested virt -- is exercised on real
+ * hardware with ZERO write risk to the real disk. Reads are non-destructive, so
+ * this is safe to run against any drive; guest writes are rejected by the
+ * bounds-gated hype_blk_backend_write. OFF by default. */
+#ifndef HYPE_229_RO_PHYS
+#define HYPE_229_RO_PHYS 0
+#endif
+
 /* M10-6a (#227): after a confirmed physical target attaches as a guest's
  * virtio-blk backend, round-trip a known pattern through the guest-facing
  * hype_blk_backend to a SCRATCH LBA (write, read back, verify) to prove guest
@@ -5426,12 +5436,20 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         }
         hype_blk_phys_nvme_init(&vm->vblk_phys, &vm->vblk_phys_nvme, &vm->vblk_be,
                                 g_hostnvme_bar, g_hostnvme_total_sectors);
+#if HYPE_229_RO_PHYS
+        /* #229 real-HW repro: strip the write fn so the guest can READ the real
+         * NVMe (reproducing the AP read-completion flake) but never write it. */
+        vm->vblk_be.write = 0;
+        hype_debug_print("#229: PHYSICAL NVMe backend forced READ-ONLY (writes rejected) "
+                         "-- safe real-HW read-path repro\n");
+#endif
         vm->vblk_is_physical = 1;
         g_phys_backend_claimed_vm = (int)(vm - &g_vms[0]);
         hype_virtio_blk_reset(&vm->vblk, g_hostnvme_total_sectors);
-        hype_debug_print("virtio-blk[vm %d]: WRITABLE PHYSICAL NVMe backend (sn '%s', %llu sectors)\n",
+        hype_debug_print("virtio-blk[vm %d]: PHYSICAL NVMe backend (sn '%s', %llu sectors)%s\n",
                          (int)(vm - &g_vms[0]), g_hostnvme_serial,
-                         (unsigned long long)g_hostnvme_total_sectors);
+                         (unsigned long long)g_hostnvme_total_sectors,
+                         vm->vblk_be.write ? " [writable]" : " [READ-ONLY #229]");
         hype_debug_print("#229dbg setup: CR3=0x%llx g_pml4=0x%llx g_ap_cr3=0x%llx nvme_bar=0x%llx\n",
                          (unsigned long long)hype_dbg_read_cr3(), (unsigned long long)(uintptr_t)g_pml4,
                          (unsigned long long)g_ap_cr3, (unsigned long long)g_hostnvme_bar);
