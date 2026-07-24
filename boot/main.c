@@ -9502,6 +9502,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * any register, so it can never raise an IRQ into hype's host IDT. */
             hype_host_pci_disable_interrupts(hype_host_pci_read32_hw, hype_host_pci_write32_hw,
                                              hn.bus, hn.dev, hn.func);
+            /* Wake to D0 + enable MMIO decode before any register access (a
+             * controller left in D3 / MEM-disabled reads its BAR as all-0xFF). */
+            {
+                uint16_t cmd = hype_host_pci_wake_enable_mmio(hype_host_pci_read32_hw,
+                                                              hype_host_pci_write32_hw,
+                                                              hn.bus, hn.dev, hn.func);
+                hype_debug_print("host-nvme: %02x:%02x.%x woke to D0, Command=0x%04x\n",
+                                 (unsigned)hn.bus, (unsigned)hn.dev, (unsigned)hn.func,
+                                 (unsigned)cmd);
+            }
             /* The NVMe register BAR may sit in high 64-bit MMIO outside hype's
              * low identity map (PML4[0] = [0,512GB)). When it needs a higher
              * PML4 slot, map its 1 GiB (uncacheable) via a fresh PML4 entry and
@@ -9814,6 +9824,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * suspected residual cause of the intermittent streaming-boot fault. */
             hype_host_pci_disable_interrupts(hype_host_pci_read32_hw, hype_host_pci_write32_hw,
                                              hs.bus, hs.dev, hs.func);
+            /* Wake the controller to D0 + enable MMIO decode: on some boots the
+             * FCH SATA controller comes up in D3 / MEM-disabled so its ABAR reads
+             * all-0xFF and the disk looks absent. Log the resulting Command reg. */
+            {
+                uint16_t cmd = hype_host_pci_wake_enable_mmio(hype_host_pci_read32_hw,
+                                                              hype_host_pci_write32_hw,
+                                                              hs.bus, hs.dev, hs.func);
+                hype_debug_print("host-ahci: %02x:%02x.%x woke to D0, Command=0x%04x "
+                                 "(MEM=%u BME=%u)\n", (unsigned)hs.bus, (unsigned)hs.dev,
+                                 (unsigned)hs.func, (unsigned)cmd, (unsigned)((cmd >> 1) & 1u),
+                                 (unsigned)((cmd >> 2) & 1u));
+            }
             sp = hype_ahci_host_find_sata_port(hs.bar_phys);
             if (sp < 0) {
                 hype_debug_print("host-ahci: controller at %02x:%02x.%x (bar 0x%llx) present but "

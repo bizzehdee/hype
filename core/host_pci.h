@@ -72,6 +72,7 @@ typedef void (*hype_host_pci_write32_fn)(uint8_t bus, uint8_t dev, uint8_t func,
  * hype_host_pci_find_cap / disabled by hype_host_pci_disable_interrupts. */
 #define HYPE_HOST_PCI_CAP_MSI 0x05u
 #define HYPE_HOST_PCI_CAP_MSIX 0x11u
+#define HYPE_HOST_PCI_CAP_PM 0x01u /* power management */
 
 /*
  * Walks the PCI capabilities linked list (Status[4] "Capabilities List" bit +
@@ -101,6 +102,21 @@ uint8_t hype_host_pci_find_cap(hype_host_pci_read32_fn read32, uint8_t bus, uint
 void hype_host_pci_disable_interrupts(hype_host_pci_read32_fn read32,
                                       hype_host_pci_write32_fn write32, uint8_t bus, uint8_t dev,
                                       uint8_t func);
+
+/*
+ * Bring a host controller into a usable MMIO state before hype touches its BAR.
+ * On some machines/boots the firmware leaves a controller (seen: the AMD FCH
+ * SATA/AHCI) in low-power D3 and/or with Memory-Space decode disabled, so every
+ * BAR register reads 0xFFFFFFFF and the driver sees a dead controller. This:
+ *   - walks the PM capability (if present) and forces PowerState -> D0,
+ *   - sets Command[1] Memory Space Enable + Command[2] Bus Master Enable.
+ * Returns the Command register value AFTER the write (low 16 bits meaningful),
+ * so a caller can log what state the device was coaxed into. Read-modify-write
+ * via the injected callbacks; pure given them, unit-tested.
+ */
+uint16_t hype_host_pci_wake_enable_mmio(hype_host_pci_read32_fn read32,
+                                        hype_host_pci_write32_fn write32, uint8_t bus,
+                                        uint8_t dev, uint8_t func);
 
 /*
  * Scans buses 0..max_bus for the first AHCI or NVMe mass-storage controller,
