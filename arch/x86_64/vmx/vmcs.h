@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "../../../devices/pic.h"
+#include "../../../devices/pit.h"
 #include "../cpu/vmm_ops.h"
 #include "vmcs_fields.h"
 
@@ -66,6 +68,10 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info);
  * (31); returns 0 if handled, -1 to reject. */
 void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
 int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write);
+/* set_rsi seeds guest RSI before entry (Linux zero-page ptr, m3-5). handle_ioio
+ * emulates a port-I/O exit (reason 30) against the PIC/PIT models. */
+void hype_vmx_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi);
+int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit);
 
 /*
  * VMX-1 smoke test: launches a self-contained 3-byte guest (CPUID; HLT) via

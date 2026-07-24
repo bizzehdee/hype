@@ -1427,14 +1427,27 @@ static void EFIAPI run_test_guest(void *arg) {
                       (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
 }
 
+/* VMX-2 vendor-dispatch shims -- forward declarations (defined just before
+ * run_cpumsr_test). Let each microtest's exit loop stay vendor-neutral. */
+static hype_vcpu_ctx_t *vmm_create_long_mode(hype_vmm_kind_t kind, uint64_t entry_rip,
+                                             uint64_t guest_cr3, uint64_t rsp, uint64_t root);
+static int vmm_reason_is_cpuid(hype_vmm_kind_t kind, uint64_t reason);
+static int vmm_reason_is_msr(hype_vmm_kind_t kind, uint64_t reason);
+static int vmm_reason_is_hlt(hype_vmm_kind_t kind, uint64_t reason);
+static int vmm_reason_is_ioio(hype_vmm_kind_t kind, uint64_t reason);
+static void vmm_handle_cpuid(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx);
+static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason);
+static void vmm_set_rsi(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rsi);
+static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic,
+                           hype_pit_emu_t *pit);
+
 /*
  * M3-5: builds the synthetic bzImage (real setup_header validated
  * through core/linux_boot.h's shim, not bypassed), builds guest
  * identity page tables, launches the long-mode test guest, and runs a
  * real VM-exit loop that keeps resuming the guest across IOIO exits
- * (routed to devices/pic.h and devices/pit.h) until it halts. SVM-only
- * -- VMX's vcpu_create/vcpu_run stay NULL past M2-7 (vmx_ops.c), same
- * as the M2-7/M3-1/M3-2 test guest above.
+ * (routed to devices/pic.h and devices/pit.h) until it halts. VMX-2:
+ * runs under SVM and VMX now via the vmm_* dispatch shims.
  */
 static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_linux_setup_header_t hdr;
@@ -1448,10 +1461,7 @@ static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t 
     hype_vcpu_ctx_t *ctx;
     hype_vmexit_info_t info;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("m3-5: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
-        return;
-    }
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     /* M2-6 hard invariant: zero every byte of this guest's reserved
      * RAM before its first VM-entry, on every (re)start. */
@@ -1507,19 +1517,19 @@ static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t 
 
     /* No NPT for this first pass (0) -- see the M3-5 ticket
      * on why full AVIC interrupt-delivery validation is deferred. */
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
     if (ctx == 0) {
         hype_fatal("m3-5: vcpu_create_long_mode failed");
     }
-    hype_svm_vcpu_set_rsi(ctx, rsi);
+    vmm_set_rsi(kind, ctx, rsi);
 
     for (;;) {
         if (ops->vcpu_run(ctx, &info) != 0) {
             hype_fatal("m3-5: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
-            if (hype_svm_vcpu_handle_ioio(ctx, &g_m3_5_pic, &g_m3_5_pit) != 0) {
+        if (vmm_reason_is_ioio(kind, info.reason)) {
+            if (vmm_handle_ioio(kind, ctx, &g_m3_5_pic, &g_m3_5_pit) != 0) {
                 hype_fatal("m3-5: unhandled guest port I/O (qual=0x%llx)",
                            (unsigned long long)info.qualification);
             }
@@ -1529,7 +1539,7 @@ static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t 
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("m3-5: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx "
                    "expected_entry=0x%llx qual=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
@@ -2532,6 +2542,24 @@ static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t r
         return hype_vmx_vcpu_handle_msr(ctx, reason == HYPE_VMX_EXIT_REASON_WRMSR);
     }
     return hype_svm_vcpu_handle_msr(ctx);
+}
+static int vmm_reason_is_ioio(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_IO_INSTRUCTION)
+                                     : (reason == HYPE_SVM_EXITCODE_IOIO);
+}
+static void vmm_set_rsi(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rsi) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_set_rsi(ctx, rsi);
+    } else {
+        hype_svm_vcpu_set_rsi(ctx, rsi);
+    }
+}
+static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic,
+                           hype_pit_emu_t *pit) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_ioio(ctx, pic, pit);
+    }
+    return hype_svm_vcpu_handle_ioio(ctx, pic, pit);
 }
 
 static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {

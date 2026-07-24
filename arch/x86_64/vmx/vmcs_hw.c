@@ -2,6 +2,8 @@
 #include "vmx.h"
 
 #include "../../../core/fatal.h"
+#include "../../../devices/pic.h"
+#include "../../../devices/pit.h"
 #include "../cpu/cpuid_emulate.h"
 #include "../cpu/msr_emulate.h"
 #include "../cpu/paging.h"
@@ -679,6 +681,69 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
     }
     case HYPE_MSR_ACTION_REJECT:
     default:
+        return -1;
+    }
+    vmx_advance_rip();
+    return 0;
+}
+
+/* VMX set_rsi (VMX-2): mirror of hype_svm_vcpu_set_rsi. RSI is index 6 in the
+ * ctx GPR array; the trampoline loads it into the real RSI at VM-entry (e.g.
+ * the Linux boot protocol's zero-page pointer for m3-5). */
+void hype_vmx_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->gprs[6] = rsi;
+}
+
+/*
+ * VMX IOIO handler (VMX-2): mirror of hype_svm_vcpu_handle_ioio. The IO exit
+ * (reason 30) records port/direction/size in EXIT_QUALIFICATION (bits 31:16 =
+ * port, bit 3 = 1 for IN, bits 2:0 = size-1) rather than SVM's EXITINFO1. The
+ * I/O value is the low byte of RAX (gprs[0]) -- these ports (PIC 0x20/0x21/
+ * 0xA0/0xA1, PIT 0x40-0x43, port 0x61) are all byte-wide, same as the SVM
+ * side. Dispatches to the identical PIC/PIT device models, then advances RIP.
+ * Returns 0 if handled, -1 for an unmodelled port.
+ */
+int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok, rc;
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    uint16_t port = (uint16_t)((qual >> 16) & 0xFFFFu);
+    int is_in = (int)((qual >> 3) & 1u);
+    uint8_t rax = (uint8_t)(real->gprs[0] & 0xFFu);
+
+    if (port == 0x20u || port == 0x21u || port == 0xA0u || port == 0xA1u) {
+        if (is_in) {
+            uint8_t value = 0;
+            rc = hype_pic_emu_io_read(pic, port, &value);
+            if (rc == 0) {
+                real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
+            }
+        } else {
+            rc = hype_pic_emu_io_write(pic, port, rax);
+        }
+    } else if (port >= 0x40u && port <= 0x43u) {
+        if (is_in) {
+            uint8_t value = 0;
+            rc = hype_pit_emu_io_read(pit, port, &value);
+            if (rc == 0) {
+                real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
+            }
+        } else {
+            rc = hype_pit_emu_io_write(pit, port, rax);
+        }
+    } else if (port == 0x61u) {
+        if (is_in) {
+            real->gprs[0] = (real->gprs[0] & ~0xFFULL) | hype_pit_emu_port61_read(pit);
+        } else {
+            hype_pit_emu_port61_write(pit, rax);
+        }
+        rc = 0;
+    } else {
+        return -1;
+    }
+
+    if (rc != 0) {
         return -1;
     }
     vmx_advance_rip();
