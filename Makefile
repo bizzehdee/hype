@@ -13,7 +13,7 @@ TARGET  := x86_64-unknown-uefi
 # which silently corrupted the ATAPI result struct across atapi.o/svm_vcpu.o and
 # looked like a mysterious "struct size sensitivity" (GLADDER-STRUCT / #180).
 CFLAGS  := --target=$(TARGET) -ffreestanding -fshort-wchar -mno-red-zone \
-           -Wall -Wextra -g -O1 -std=c11 -MMD -MP
+           -Wall -Wextra -g -O1 -std=c11 -MMD -MP $(EXTRA_CFLAGS)
 LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 
 BUILD_DIR := build
