@@ -2,6 +2,7 @@
 #include "vmx.h"
 
 #include "../../../core/fatal.h"
+#include "../../../devices/pci.h"
 #include "../../../devices/pflash.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
@@ -832,6 +833,54 @@ int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
         if (hype_pflash_read(pf, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
+    return 0;
+}
+
+/*
+ * VMX MMIO handler for the PCI ECAM window (VMX-2): mirror of
+ * hype_svm_vcpu_handle_pci_ecam_npf, driven by an EPT violation. Same
+ * decode-at-RIP + RIP-advance shape as the pflash handler; here the faulting
+ * GPA's offset into the ECAM window selects a PCI config address, dispatched
+ * to hype_pci_config_read/write. Bounds-checked to [ecam_base, +BUS0_SIZE).
+ */
+int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
+                                      uint64_t ecam_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_mmio_decode_t decoded;
+    hype_pci_ecam_addr_t addr;
+    uint64_t *reg;
+    int ok;
+    uint64_t gpa = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    int is_write = (int)((qual >> 1) & 1u);
+
+    if (gpa < ecam_base_phys || gpa >= ecam_base_phys + HYPE_PCI_ECAM_BUS0_SIZE) {
+        return -1;
+    }
+    if (hype_mmio_decode((const uint8_t *)(uintptr_t)rip, HYPE_VMX_MMIO_MAX_INSTR_BYTES, &decoded) !=
+        0) {
+        return -1;
+    }
+    if (decoded.is_write != is_write) {
+        return -1;
+    }
+    reg = vmx_gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    hype_pci_decode_ecam_offset(gpa - ecam_base_phys, &addr);
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        hype_pci_config_write(pci, &addr, decoded.size_bytes, value);
+    } else {
+        uint32_t value = 0;
+        hype_pci_config_read(pci, &addr, decoded.size_bytes, &value);
         *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
     }
 

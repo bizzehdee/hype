@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+#include "../../../devices/pci.h"
 #include "../../../devices/pflash.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
@@ -80,6 +81,10 @@ int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
 /* MMIO via EPT violation (reason 48): decode the faulting instruction at guest
  * RIP and dispatch to the emulated pflash at [pf_base_phys, ...). */
 int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t pf_base_phys);
+/* MMIO via EPT violation to the PCI ECAM window: decode at RIP, dispatch to
+ * hype_pci_config_read/write. */
+int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
+                                      uint64_t ecam_base_phys);
 
 /*
  * VMX-1 smoke test: launches a self-contained 3-byte guest (CPUID; HLT) via

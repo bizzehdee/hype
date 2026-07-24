@@ -1443,6 +1443,8 @@ static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_
 static int vmm_reason_is_npf(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_handle_pflash_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
                                  uint64_t pf_base_phys);
+static int vmm_handle_pci_ecam_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
+                                   uint64_t ecam_base_phys, uint64_t guest_rip);
 
 /*
  * M3-5: builds the synthetic bzImage (real setup_header validated
@@ -2578,6 +2580,14 @@ static int vmm_handle_pflash_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hyp
     }
     return hype_svm_vcpu_handle_npf(ctx, pf, pf_base_phys);
 }
+static int vmm_handle_pci_ecam_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
+                                   uint64_t ecam_base_phys, uint64_t guest_rip) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_pci_ecam_npf(ctx, pci, ecam_base_phys);
+    }
+    return hype_svm_vcpu_handle_pci_ecam_npf(ctx, pci, ecam_base_phys,
+                                             (const uint8_t *)(uintptr_t)guest_rip);
+}
 
 static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     unsigned long long i;
@@ -3632,10 +3642,7 @@ static void run_pci_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_vmexit_info_t info;
     uint32_t got_hostbridge_id, got_hostbridge_class, got_absent, got_bar_mask, got_bar_addr;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("pci-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
-        return;
-    }
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_pci_1_guest_code, sizeof(g_pci_1_guest_code));
     hype_guest_ram_zero(g_pci_1_guest_stack, sizeof(g_pci_1_guest_stack));
@@ -3669,9 +3676,12 @@ static void run_pci_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                       (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
                       (unsigned long long)result_buf_phys);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
     if (ctx == 0) {
         hype_fatal("pci-1: vcpu_create_long_mode failed");
+    }
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_ept_mark_mmio_hole(HYPE_PCI_1_ECAM_GPA);
     }
 
     for (;;) {
@@ -3679,9 +3689,9 @@ static void run_pci_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_fatal("pci-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_pci_1_pci, HYPE_PCI_1_ECAM_GPA,
-                                                (const uint8_t *)(uintptr_t)info.guest_rip) != 0) {
+        if (vmm_reason_is_npf(kind, info.reason)) {
+            if (vmm_handle_pci_ecam_npf(kind, ctx, &g_pci_1_pci, HYPE_PCI_1_ECAM_GPA,
+                                        info.guest_rip) != 0) {
                 hype_fatal("pci-1: unhandled guest ECAM access (qual=0x%llx guest_rip=0x%llx)",
                            (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
             }
@@ -3691,7 +3701,7 @@ static void run_pci_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("pci-1: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
