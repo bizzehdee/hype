@@ -3,10 +3,13 @@
 
 #include <stdint.h>
 
+#include "../../../core/blk_backend.h"
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
+#include "../../../devices/bochs_vbe.h"
 #include "../../../devices/pci.h"
 #include "../../../devices/pflash.h"
+#include "../../../devices/virtio_blk.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
 #include "../cpu/vmm_ops.h"
@@ -92,6 +95,14 @@ int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
  * process_ahci_command_slot(). */
 int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
                                   uint64_t ahci_base_phys);
+/* MMIO via EPT violation to a SATA disk behind AHCI, the Bochs VBE display, and
+ * the virtio-blk BAR -- each decode-at-RIP then dispatch to its device model. */
+int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                       hype_ata_disk_t *disk, uint64_t ahci_base_phys);
+int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
+                                       uint64_t mmio_base_phys);
+int hype_vmx_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
+                                        const hype_blk_backend_t *be, uint64_t mmio_base_phys);
 /* Guest interrupt delivery (VMX-2, INT-1/INT-2): set guest GDTR/IDTR, request a
  * vector (deferred via interrupt-window exiting), inject it when the window
  * fires (reason 7 -> handle_intr_window). Mirrors the SVM EVENTINJ/VINTR path. */

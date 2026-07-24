@@ -1447,6 +1447,13 @@ static int vmm_handle_pci_ecam_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, h
                                    uint64_t ecam_base_phys, uint64_t guest_rip);
 static int vmm_handle_ahci_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
                                hype_atapi_t *atapi, uint64_t ahci_base_phys);
+static int vmm_handle_ahci_disk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                    hype_ata_disk_t *disk, uint64_t ahci_base_phys);
+static int vmm_handle_bochs_vbe_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
+                                    uint64_t mmio_base_phys);
+static int vmm_handle_virtio_blk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
+                                     const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
+                                     uint64_t mmio_base_phys, uint64_t guest_rip);
 static void vmm_set_gdt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
 static void vmm_set_idt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
 static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t cs,
@@ -2603,6 +2610,29 @@ static int vmm_handle_ahci_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_
         return hype_vmx_vcpu_handle_ahci_npf(ctx, ahci, atapi, ahci_base_phys);
     }
     return hype_svm_vcpu_handle_ahci_npf(ctx, ahci, atapi, ahci_base_phys);
+}
+static int vmm_handle_ahci_disk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                    hype_ata_disk_t *disk, uint64_t ahci_base_phys) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_ahci_disk_npf(ctx, ahci, disk, ahci_base_phys);
+    }
+    return hype_svm_vcpu_handle_ahci_disk_npf(ctx, ahci, disk, ahci_base_phys);
+}
+static int vmm_handle_bochs_vbe_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
+                                    uint64_t mmio_base_phys) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys);
+    }
+    return hype_svm_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys);
+}
+static int vmm_handle_virtio_blk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
+                                     const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
+                                     uint64_t mmio_base_phys, uint64_t guest_rip) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_virtio_blk_npf(ctx, dev, be, mmio_base_phys);
+    }
+    return hype_svm_vcpu_handle_virtio_blk_npf(ctx, dev, be, dma_map, mmio_base_phys,
+                                               (const uint8_t *)(uintptr_t)guest_rip);
 }
 static void vmm_set_gdt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
     if (kind == HYPE_VMM_KIND_VMX) {
@@ -4197,11 +4227,7 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t mmio_mapped_base;
     hype_bochs_vbe_mode_t mode;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("video-3: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n",
-                           ops->name);
-        return;
-    }
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_video_3_guest_code, sizeof(g_video_3_guest_code));
     hype_guest_ram_zero(g_video_3_guest_stack, sizeof(g_video_3_guest_stack));
@@ -4250,9 +4276,12 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                       (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
                       (unsigned long long)fb_phys, (unsigned long long)mmio_phys);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
     if (ctx == 0) {
         hype_fatal("video-3: vcpu_create_long_mode failed");
+    }
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_ept_mark_mmio_hole(HYPE_PCI_1_ECAM_GPA);
     }
 
     mmio_mapped = 0;
@@ -4263,17 +4292,20 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_fatal("video-3: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_video_3_pci, HYPE_PCI_1_ECAM_GPA,
-                                                (const uint8_t *)(uintptr_t)info.guest_rip) == 0) {
+        if (vmm_reason_is_npf(kind, info.reason)) {
+            if (vmm_handle_pci_ecam_npf(kind, ctx, &g_video_3_pci, HYPE_PCI_1_ECAM_GPA,
+                                        info.guest_rip) == 0) {
                 if (!mmio_mapped && hype_pci_memory_space_enabled(&g_video_3_pci, HYPE_VIDEO_3_DISPLAY_DEV)) {
                     uint64_t bar2 = hype_pci_get_bar_value(&g_video_3_pci, HYPE_VIDEO_3_DISPLAY_DEV, 2);
                     if (bar2 != 0) {
                         hype_npt_mark_not_present(g_npt_pd, bar2);
+                        if (kind == HYPE_VMM_KIND_VMX) {
+                            hype_vmx_ept_mark_mmio_hole(bar2);
+                        }
                         mmio_mapped_base = bar2;
                         mmio_mapped = 1;
                         hype_debug_print(
-                            "video-3: display BAR2 (MMIO) enabled at 0x%llx -- NPT-mapping it now\n",
+                            "video-3: display BAR2 (MMIO) enabled at 0x%llx -- mapping it now\n",
                             (unsigned long long)bar2);
                     }
                 }
@@ -4281,7 +4313,7 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
 
             if (mmio_mapped &&
-                hype_svm_vcpu_handle_bochs_vbe_npf(ctx, &g_video_3_bochs_vbe, mmio_mapped_base) == 0) {
+                vmm_handle_bochs_vbe_npf(kind, ctx, &g_video_3_bochs_vbe, mmio_mapped_base) == 0) {
                 continue;
             }
 
@@ -4292,7 +4324,7 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("video-3: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
@@ -4576,10 +4608,19 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t mmio_mapped_base;
     uint64_t sector10_offset;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("m5-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+    /* VMX-2: ported to the vmm_* shims like the other M5 tests, but skipped on
+     * VMX pending a fix. Under VMX the two request chains' data buffers come out
+     * cross-assigned in process_virtio_blk_queue() (the WRITE reads the READ's
+     * buffer and vice versa; the WRITE source reads 0, so the write persists
+     * zeros). The virtqueue base addresses are programmed correctly (verified),
+     * and AHCI DMA over the same guest-RAM range works, so this is a
+     * virtio-specific descriptor/avail-ring read anomaly under VMX -- its own
+     * focused debug pass. Runs on SVM unchanged. */
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_serial_print("m5-1: skipped on VMX -- virtio-blk descriptor-read anomaly (see comment)\n");
         return;
     }
+    (void)ops;
 
     hype_guest_ram_zero(g_m5_1_guest_code, sizeof(g_m5_1_guest_code));
     hype_guest_ram_zero(g_m5_1_guest_stack, sizeof(g_m5_1_guest_stack));
@@ -4704,9 +4745,12 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                       (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
                       (unsigned long long)mmio_phys);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
     if (ctx == 0) {
         hype_fatal("m5-1: vcpu_create_long_mode failed");
+    }
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_ept_mark_mmio_hole(HYPE_PCI_1_ECAM_GPA);
     }
 
     mmio_mapped = 0;
@@ -4717,17 +4761,20 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_fatal("m5-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_m5_1_pci, HYPE_PCI_1_ECAM_GPA,
-                                                (const uint8_t *)(uintptr_t)info.guest_rip) == 0) {
+        if (vmm_reason_is_npf(kind, info.reason)) {
+            if (vmm_handle_pci_ecam_npf(kind, ctx, &g_m5_1_pci, HYPE_PCI_1_ECAM_GPA,
+                                        info.guest_rip) == 0) {
                 if (!mmio_mapped && hype_pci_memory_space_enabled(&g_m5_1_pci, HYPE_M5_1_VIRTIO_DEV)) {
                     uint64_t bar4 = hype_pci_get_bar_value(&g_m5_1_pci, HYPE_M5_1_VIRTIO_DEV,
                                                             HYPE_M5_1_BAR_INDEX);
                     if (bar4 != 0) {
                         hype_npt_mark_not_present(g_npt_pd, bar4);
+                        if (kind == HYPE_VMM_KIND_VMX) {
+                            hype_vmx_ept_mark_mmio_hole(bar4);
+                        }
                         mmio_mapped_base = bar4;
                         mmio_mapped = 1;
-                        hype_debug_print("m5-1: virtio-blk BAR%u (MMIO) enabled at 0x%llx -- NPT-mapping "
+                        hype_debug_print("m5-1: virtio-blk BAR%u (MMIO) enabled at 0x%llx -- mapping "
                                           "it now\n",
                                           HYPE_M5_1_BAR_INDEX, (unsigned long long)bar4);
                     }
@@ -4736,8 +4783,8 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
 
             if (mmio_mapped &&
-                hype_svm_vcpu_handle_virtio_blk_npf(ctx, &g_m5_1_virtio_blk, &g_m5_1_be,
-                                                     /*dma_map=*/0, mmio_mapped_base, /*insn=*/0) == 0) {
+                vmm_handle_virtio_blk_npf(kind, ctx, &g_m5_1_virtio_blk, &g_m5_1_be,
+                                          /*dma_map=*/0, mmio_mapped_base, info.guest_rip) == 0) {
                 continue;
             }
 
@@ -4748,7 +4795,7 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("m5-1: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
@@ -4969,10 +5016,7 @@ static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t ahci_mapped_base;
     uint64_t write_sector_offset, read_sector_offset;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("m5-2: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
-        return;
-    }
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_m5_2_cmd_list, sizeof(g_m5_2_cmd_list));
     hype_guest_ram_zero(g_m5_2_cmd_table, sizeof(g_m5_2_cmd_table));
@@ -5070,9 +5114,12 @@ static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                       (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
                       (unsigned long long)HYPE_M5_2_AHCI_GPA);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
     if (ctx == 0) {
         hype_fatal("m5-2: vcpu_create_long_mode failed");
+    }
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_ept_mark_mmio_hole(HYPE_PCI_1_ECAM_GPA);
     }
 
     ahci_mapped = 0;
@@ -5083,17 +5130,20 @@ static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_fatal("m5-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_m5_2_pci, HYPE_PCI_1_ECAM_GPA,
-                                                (const uint8_t *)(uintptr_t)info.guest_rip) == 0) {
+        if (vmm_reason_is_npf(kind, info.reason)) {
+            if (vmm_handle_pci_ecam_npf(kind, ctx, &g_m5_2_pci, HYPE_PCI_1_ECAM_GPA,
+                                        info.guest_rip) == 0) {
                 if (!ahci_mapped &&
                     hype_pci_memory_space_enabled(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV)) {
                     uint64_t bar5 = hype_pci_get_bar_value(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV, 5);
                     if (bar5 != 0) {
                         hype_npt_mark_not_present(g_npt_pd, bar5);
+                        if (kind == HYPE_VMM_KIND_VMX) {
+                            hype_vmx_ept_mark_mmio_hole(bar5);
+                        }
                         ahci_mapped_base = bar5;
                         ahci_mapped = 1;
-                        hype_debug_print("m5-2: ATA disk BAR5 enabled at 0x%llx -- NPT-mapping it now\n",
+                        hype_debug_print("m5-2: ATA disk BAR5 enabled at 0x%llx -- mapping it now\n",
                                           (unsigned long long)bar5);
                     }
                 }
@@ -5101,7 +5151,7 @@ static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
 
             if (ahci_mapped &&
-                hype_svm_vcpu_handle_ahci_disk_npf(ctx, &g_m5_2_ahci, &g_m5_2_disk, ahci_mapped_base) ==
+                vmm_handle_ahci_disk_npf(kind, ctx, &g_m5_2_ahci, &g_m5_2_disk, ahci_mapped_base) ==
                     0) {
                 continue;
             }
@@ -5113,7 +5163,7 @@ static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("m5-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }

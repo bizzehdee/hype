@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "../core/guest_mem.h" /* hype_gpa_map_t (command-slot DMA) */
+#include "ata_disk.h"          /* hype_ata_disk_t (SATA disk command semantics) */
 #include "atapi.h"             /* hype_atapi_t (ATAPI command semantics) */
 
 /*
@@ -205,6 +206,12 @@ int hype_ahci_irq_pending(const hype_ahci_t *ahci);
  */
 int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                               const hype_gpa_map_t *dma_map, unsigned slot);
+
+/* Processes AHCI command slot 0 against a SATA (non-ATAPI) disk model -- the
+ * disk counterpart of process_ahci_command_slot(). Vendor-neutral; the SVM and
+ * VMX ahci_disk MMIO handlers both call it on a PxCI slot-0 write. Defined in
+ * arch/x86_64/svm/svm_vcpu.c. Returns 0 on success, -1 on error. */
+int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk);
 
 /* Command Header (32 bytes, Command List entry). */
 typedef struct {

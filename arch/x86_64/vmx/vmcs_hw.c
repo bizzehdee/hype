@@ -1,10 +1,13 @@
 #include "vmcs.h"
 #include "vmx.h"
 
+#include "../../../core/blk_backend.h"
 #include "../../../core/fatal.h"
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
+#include "../../../devices/bochs_vbe.h"
 #include "../../../devices/pci.h"
+#include "../../../devices/virtio_blk.h"
 #include "../../../devices/pflash.h"
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
@@ -957,6 +960,182 @@ int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
     }
 
     vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
+    return 0;
+}
+
+/*
+ * Common EPT-violation MMIO decode (VMX-2): reads the faulting GPA, write-bit,
+ * and RIP; bounds-checks [base, base+size); decodes the instruction at RIP and
+ * resolves the operand register. Fills the vmx_mmio_access fields on success
+ * (0); returns -1 to reject. Factors the shared preamble out of the
+ * device MMIO handlers below (the earlier pflash/ecam/ahci handlers predate it
+ * and open-code the same steps).
+ */
+struct vmx_mmio_access {
+    uint32_t offset;
+    int is_write;
+    uint64_t *reg;
+    hype_mmio_decode_t decoded;
+    uint64_t rip;
+};
+static int vmx_mmio_begin(struct hype_vcpu_ctx *real, uint64_t base, uint64_t size,
+                          struct vmx_mmio_access *m) {
+    int ok;
+    uint64_t gpa = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    m->rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    m->is_write = (int)((qual >> 1) & 1u);
+    if (gpa < base || gpa >= base + size) {
+        return -1;
+    }
+    m->offset = (uint32_t)(gpa - base);
+    if (hype_mmio_decode((const uint8_t *)(uintptr_t)m->rip, HYPE_VMX_MMIO_MAX_INSTR_BYTES,
+                         &m->decoded) != 0) {
+        return -1;
+    }
+    if (m->decoded.is_write != m->is_write) {
+        return -1;
+    }
+    m->reg = vmx_gpr_ptr(real, m->decoded.reg);
+    return (m->reg == 0) ? -1 : 0;
+}
+static void vmx_mmio_end(struct vmx_mmio_access *m) {
+    vmwrite(HYPE_VMCS_GUEST_RIP, m->rip + m->decoded.instr_len);
+}
+
+/* VMX MMIO handler for a SATA disk behind AHCI (VMX-2): mirror of
+ * hype_svm_vcpu_handle_ahci_disk_npf. On a PxCI slot-0 write, runs the shared
+ * process_ahci_ata_command_slot0() (SATA command + guest-RAM DMA). */
+int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                       hype_ata_disk_t *disk, uint64_t ahci_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+    if (vmx_mmio_begin(real, ahci_base_phys, HYPE_AHCI_MMIO_SIZE, &m) != 0) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        if (hype_ahci_mmio_write(ahci, m.offset, m.decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+        if (m.offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
+            if (process_ahci_ata_command_slot0(ahci, disk) != 0) {
+                return -1;
+            }
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_ahci_mmio_read(ahci, m.offset, m.decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
+/* VMX MMIO handler for the Bochs VBE (DISPI) display (VMX-2): mirror of
+ * hype_svm_vcpu_handle_bochs_vbe_npf. DISPI registers are 16-bit only. */
+int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
+                                       uint64_t mmio_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+    if (vmx_mmio_begin(real, mmio_base_phys, HYPE_BOCHS_VBE_MMIO_SIZE, &m) != 0) {
+        return -1;
+    }
+    if (m.decoded.size_bytes != 2u) {
+        return -1; /* DISPI registers are architecturally 16-bit only */
+    }
+    if (m.offset < HYPE_BOCHS_VBE_DISPI_OFFSET ||
+        m.offset >= HYPE_BOCHS_VBE_DISPI_OFFSET + HYPE_BOCHS_VBE_DISPI_SIZE) {
+        if (!m.decoded.is_write) {
+            *m.reg = hype_mmio_merge_read_value(*m.reg, 0, m.decoded.size_bytes, m.decoded.zero_extend);
+        }
+        vmx_mmio_end(&m);
+        return 0;
+    }
+    if (m.decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        if (hype_bochs_vbe_mmio_write(dev, m.offset - HYPE_BOCHS_VBE_DISPI_OFFSET, (uint16_t)value) !=
+            0) {
+            return -1;
+        }
+    } else {
+        uint16_t value = 0;
+        if (hype_bochs_vbe_mmio_read(dev, m.offset - HYPE_BOCHS_VBE_DISPI_OFFSET, &value) != 0) {
+            return -1;
+        }
+        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
+/* VMX MMIO handler for the virtio-blk BAR (VMX-2): mirror of
+ * hype_svm_vcpu_handle_virtio_blk_npf. Routes the BAR offset to the virtio
+ * common/notify/ISR/device-config regions; a notify write kicks the queue,
+ * drained by the shared process_virtio_blk_queue() (dma_map 0 = identity). */
+int hype_vmx_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
+                                        const hype_blk_backend_t *be, uint64_t mmio_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+    uint32_t off;
+    if (vmx_mmio_begin(real, mmio_base_phys, HYPE_VIRTIO_BLK_BAR_SIZE, &m) != 0) {
+        return -1;
+    }
+    off = m.offset;
+
+    if (off >= HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET &&
+        off < HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET + HYPE_VIRTIO_COMMON_CFG_SIZE) {
+        uint32_t ro = off - HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET;
+        if (m.decoded.is_write) {
+            uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+            if (hype_virtio_blk_common_cfg_write(dev, ro, m.decoded.size_bytes, value) != 0) {
+                return -1;
+            }
+        } else {
+            uint32_t value = 0;
+            if (hype_virtio_blk_common_cfg_read(dev, ro, m.decoded.size_bytes, &value) != 0) {
+                return -1;
+            }
+            *m.reg =
+                hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        }
+    } else if (off >= HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET &&
+               off < HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET + 4u) {
+        if (m.decoded.is_write) {
+            if (hype_virtio_blk_is_queue_ready(dev)) {
+                if (process_virtio_blk_queue(dev, be, 0) != 0) {
+                    return -1;
+                }
+            }
+        } else {
+            *m.reg = hype_mmio_merge_read_value(*m.reg, 0, m.decoded.size_bytes, m.decoded.zero_extend);
+        }
+    } else if (off == HYPE_VIRTIO_BLK_BAR_ISR_CFG_OFFSET) {
+        if (!m.decoded.is_write) {
+            uint8_t value = hype_virtio_blk_isr_read(dev);
+            *m.reg =
+                hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        }
+    } else if (off >= HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET &&
+               off < HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET + HYPE_VIRTIO_BLK_CFG_SIZE) {
+        if (!m.decoded.is_write) {
+            uint32_t value = 0;
+            uint32_t ro = off - HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET;
+            if (hype_virtio_blk_device_cfg_read(dev, ro, m.decoded.size_bytes, &value) != 0) {
+                return -1;
+            }
+            *m.reg =
+                hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        }
+    } else {
+        if (!m.decoded.is_write) {
+            *m.reg = hype_mmio_merge_read_value(*m.reg, 0, m.decoded.size_bytes, m.decoded.zero_extend);
+        }
+    }
+
+    vmx_mmio_end(&m);
     return 0;
 }
 

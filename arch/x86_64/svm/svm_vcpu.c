@@ -1771,7 +1771,7 @@ static void complete_ahci_command_slot0(hype_ahci_t *ahci, uint64_t rx_fis_phys,
  * command FIS at all, or the command byte isn't one this project
  * models) so the caller can fall through to whichever other handler
  * actually owns it. */
-static int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
+int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
     uint64_t cmd_list_phys = (uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32);
     uint64_t rx_fis_phys = (uint64_t)ahci->p_fb | ((uint64_t)ahci->p_fbu << 32);
     const uint8_t *cmd_hdr_bytes = (const uint8_t *)(uintptr_t)cmd_list_phys;
@@ -2235,8 +2235,8 @@ int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
  * virtio_blk_npf()'s own doc comment for why). Returns -1 if a chain
  * doesn't have that exact shape (malformed guest request); 0 otherwise.
  */
-static int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *be,
-                                    const hype_gpa_map_t *dma_map) {
+int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *be,
+                             const hype_gpa_map_t *dma_map) {
     /* VALID-3: the virtqueue base addresses (desc/avail/used), every descriptor
      * index, and every buffer pointer are guest-supplied. Each guest-physical
      * address is translated through this VM's bounds-checked gpa map

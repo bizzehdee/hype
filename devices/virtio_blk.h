@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+#include "../core/blk_backend.h" /* hype_blk_backend_t (queue backing) */
+#include "../core/guest_mem.h"   /* hype_gpa_map_t (descriptor DMA) */
+
 /*
  * M5-1: a modern (non-transitional, virtio 1.x) virtio-blk PCI device
  * -- what a real Linux/BSD guest's own inbox virtio_blk driver
@@ -227,5 +230,13 @@ typedef struct {
 } hype_virtq_desc_t;
 
 void hype_virtq_decode_desc(const uint8_t raw[16], hype_virtq_desc_t *out);
+
+/* Drains a virtio-blk virtqueue: walks the available ring, executes each
+ * request against the block backend, DMAs data to/from guest RAM (dma_map;
+ * 0 = identity), and posts completions to the used ring. Vendor-neutral; the
+ * SVM and VMX virtio-blk MMIO handlers both call it when a queue is kicked.
+ * Defined in arch/x86_64/svm/svm_vcpu.c. Returns 0 on success, -1 on error. */
+int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *be,
+                             const hype_gpa_map_t *dma_map);
 
 #endif /* HYPE_DEVICES_VIRTIO_BLK_H */
