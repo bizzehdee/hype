@@ -470,7 +470,9 @@ static uint64_t g_usable_ram_bytes;
  * GLADDER-4 (#139, 2026-07-23): re-enabled for the two-alpine-standard-on-two-
  * cores concurrency validation + same-kernel perf baseline. QEMU: -smp 3,
  * -m 8192. Both guests share the read-only ISO backing (per-VM ISO is #140). */
+#ifndef HYPE_RUN_TWO_VMS
 #define HYPE_RUN_TWO_VMS 1
+#endif
 
 /* TERM-1/TERM-3: on-screen terminal focus, per the chosen "full-screen, cycle
  * focus" UX. -1 = dashboard (the boot/diagnostic log, and the default so
