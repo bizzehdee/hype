@@ -80,6 +80,16 @@ static inline uint64_t hype_dbg_read_cr3(void) {
  * core). The machinery they check is HW-proven, so off by default. */
 #define HYPE_RUN_SELFTEST_GUESTS 0
 
+/* VMX-1 (#35): run the self-contained VMX round-trip smoke test (CPUID->HLT
+ * guest via the VMLAUNCH/VMRESUME trampoline) right after the VMM enables, on
+ * an Intel/VMX backend. Off by default; flip to 1 (or -DHYPE_VMX_SMOKE_TEST=1)
+ * to validate the VMX vcpu_run path on real Intel hardware. Independent of the
+ * SVM-modelled M2-M4-5 microtests (those are VMX-2). Prototype in vmx/vmcs.h. */
+#ifndef HYPE_VMX_SMOKE_TEST
+#define HYPE_VMX_SMOKE_TEST 0
+#endif
+int hype_vmx_smoke_test(void);
+
 /* M10-1c (#197): a DESTRUCTIVE write-readback self-test of the host NVMe write
  * path, against a scratch LBA on the enumerated NVMe controller. OFF by default
  * -- it writes to a real drive when one is present, so only enable it for a
@@ -9624,6 +9634,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_fatal("vmm: %s enable failed", args.ops->name);
     }
     hype_debug_print("vmm: %s enabled\n", args.ops->name);
+
+    /* VMX-1: prove the VMLAUNCH/VMRESUME trampoline + EPT round trip on real
+     * Intel hardware before any real guest depends on it. Gated + VMX-only. */
+    if (HYPE_VMX_SMOKE_TEST && args.kind == HYPE_VMM_KIND_VMX) {
+        hype_debug_print("vmx-smoke: starting VMX-1 round-trip validation...\n");
+        (void)hype_vmx_smoke_test();
+    }
 
     /*
      * RT-2a: run the guests HERE -- post-ExitBootServices, on the BSP, under

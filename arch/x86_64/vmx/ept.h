@@ -28,10 +28,14 @@ typedef uint64_t hype_ept_pte_t;
 
 #define HYPE_EPT_ENTRIES_PER_TABLE 512
 
-/* Generous default for a single test/dev guest -- revisit once real
- * per-VM memory sizing (hype.cfg's mem_mb) drives this instead of a
- * fixed constant (same rationale as HYPE_NPT_MAX_GB). */
-#define HYPE_EPT_MAX_GB 4
+/* Identity-map coverage. Must span every guest-physical address a VMX guest
+ * can touch -- crucially including where hype's OWN static buffers land (the
+ * test-guest code blobs live in .efi BSS, which UEFI loads high: observed at
+ * ~5GB under QEMU -m 8192). 4GB was too small (EPT-violation / control-field
+ * failures for a high-loaded guest); 16GB covers the QEMU RAM sizes hype runs
+ * with plus headroom. Revisit once per-VM mem_mb sizing drives this (same
+ * rationale as HYPE_NPT_MAX_GB). 16 * 512 * 8B = 64KB of PD tables. */
+#define HYPE_EPT_MAX_GB 16
 
 /*
  * Encodes one EPT paging-structure entry (PML4E/PDPTE/PDE, all the

@@ -1,15 +1,84 @@
 #include "vmcs.h"
 #include "vmx.h"
 
+#include "../../../core/fatal.h"
+#include "../cpu/paging.h"
+#include "../cpu/vmm_ops.h"
+#include "ept.h"
+
 /* UNVALIDATED -- see vmx.h and vmcs.h. */
 
 static uint8_t g_vmcs_region[4096] __attribute__((aligned(4096)));
 static uint8_t g_virtual_apic_page[4096] __attribute__((aligned(4096)));
 
+/* EPT paging structures for the (currently single) VMX test vCPU. Identity
+ * map, built once in hype_vmx_vcpu_create() when no external root is passed.
+ * Same shape/ownership as the SVM NPT tables; page-aligned as EPT requires. */
+static hype_ept_pte_t g_ept_pml4[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_ept_pte_t g_ept_pdpt[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_ept_pte_t g_ept_pd[HYPE_EPT_MAX_GB][HYPE_EPT_ENTRIES_PER_TABLE]
+    __attribute__((aligned(4096)));
+
+/* Guest paging (ordinary long-mode PTEs) for a long-mode VMX guest that builds
+ * its own CR3 -- e.g. the VMX-1 smoke test. Microtests supply their own
+ * guest_cr3 (like the SVM side), so these back only the smoke path. */
+static hype_pte_t g_vmx_guest_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_vmx_guest_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+static hype_pte_t g_vmx_guest_pd[HYPE_PAGING_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE]
+    __attribute__((aligned(4096)));
+
+/*
+ * The VMX VM-entry/exit trampoline (vmx_run.S). Loads ctx->gprs into the real
+ * GPRs, VMWRITEs HOST_RSP/HOST_RIP to return into itself, then VMLAUNCH (first
+ * entry, launched=0) or VMRESUME (launched=1). Returns 0 on a clean VM-exit
+ * (guest GPRs saved back into ctx), 1 on VM-entry failure (guest never ran).
+ */
+extern uint64_t hype_vmx_launch(hype_vcpu_ctx_t *ctx, uint64_t launched);
+
+/*
+ * VMX vCPU context. Mirrors the SVM struct's gprs[] contract (x86 register
+ * encoding order, 0=RAX..15=R15, index 4=RSP unused since RSP lives in the
+ * VMCS) so the same MMIO-decode register indexing works vendor-agnostically.
+ * gprs[] MUST be first: vmx_run.S addresses it at a fixed zero offset. Unlike
+ * SVM's VMCB (which auto-manages RAX/RSP/RIP/RFLAGS), VMX saves/restores NO
+ * GPRs across VM-entry -- the trampoline moves all of them by hand.
+ */
+struct hype_vcpu_ctx {
+    uint64_t gprs[16];
+    int launched; /* 0 until the first successful VMLAUNCH; VMRESUME thereafter. */
+};
+
+/* Single test vCPU: the M2-M4-5 microtests run sequentially on the BSP, so
+ * one static slot suffices (contrast the SVM pool, which runs two guests on
+ * two cores concurrently). Revisit if VMX ever dispatches concurrent guests. */
+static struct hype_vcpu_ctx g_vmx_ctx;
+
 static void hype_vmx_host_exit_stub(void) {
     for (;;) {
         __asm__ volatile("hlt");
     }
+}
+
+/*
+ * VMREAD (M2-8): read a VMCS field. AT&T operand order is the reverse of
+ * VMWRITE's -- Intel's "VMREAD r/m64, r64" reads the field named by the
+ * second (source-position) operand into the first (dest). In AT&T that's
+ * "vmread field, dest". Returns the field value; sets *ok to 0 on failure
+ * (CF/ZF set, e.g. unsupported field or no current VMCS).
+ */
+static inline uint64_t vmread(uint64_t field, int *ok) {
+    uint64_t value = 0;
+    uint8_t fail_zf, fail_cf;
+    __asm__ volatile("vmread %3, %0\n\t"
+                      "setz %1\n\t"
+                      "setc %2"
+                      : "=r"(value), "=q"(fail_zf), "=q"(fail_cf)
+                      : "r"(field)
+                      : "cc");
+    if (ok) {
+        *ok = (fail_zf || fail_cf) ? 0 : 1;
+    }
+    return value;
 }
 
 static inline uint64_t rdmsr(uint32_t msr) {
@@ -158,7 +227,14 @@ static int write_realmode_guest_segment(uint32_t selector_field, uint32_t base_f
     return rc;
 }
 
-int hype_vmx_vmcs_build_realmode_guest(uint16_t entry_seg, uint64_t stack_phys) {
+/*
+ * Shared VMCS builder. long_mode=0 builds a real-mode guest entering at
+ * cs_base:rip (CS.base = cs_base); long_mode=1 builds a flat 64-bit guest at
+ * linear rip with paging root guest_cr3 (cs_base ignored). Public wrappers
+ * hype_vmx_vmcs_build_guest / _long_mode_guest pin the mode.
+ */
+static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp,
+                              int long_mode, uint64_t guest_cr3) {
     int rc = 0;
 
     for (unsigned i = 0; i < sizeof(g_vmcs_region); i++) {
@@ -178,30 +254,48 @@ int hype_vmx_vmcs_build_realmode_guest(uint16_t entry_seg, uint64_t stack_phys) 
 
     int have_true_ctls = (vmx_basic & HYPE_VMX_BASIC_HAS_TRUE_CTLS) != 0;
 
-    uint32_t pin_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_PINBASED_CTLS
-                                             : HYPE_MSR_IA32_VMX_PINBASED_CTLS);
-    uint32_t proc_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_PROCBASED_CTLS
-                                              : HYPE_MSR_IA32_VMX_PROCBASED_CTLS);
-    uint32_t proc2_cap = rdmsr(HYPE_MSR_IA32_VMX_PROCBASED_CTLS2);
-    uint32_t exit_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_EXIT_CTLS
-                                              : HYPE_MSR_IA32_VMX_EXIT_CTLS);
-    uint32_t entry_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_ENTRY_CTLS
-                                               : HYPE_MSR_IA32_VMX_ENTRY_CTLS);
+    /* These MUST be uint64_t: hype_vmx_adjust_controls() reads the allowed-1
+     * mask from the HIGH 32 bits (allowed-0 from the low 32). Truncating the
+     * capability MSR to uint32_t here zeroed the allowed-1 half, so
+     * (desired|allowed0)&allowed1 collapsed every control field to 0 -- the
+     * missing required-1 bits made VM-entry fail with instruction-error 7.
+     * (Latent until M2-8: the M2-6 build only VMWROTE the VMCS, never
+     * launched it.) */
+    uint64_t pin_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_PINBASED_CTLS
+                                            : HYPE_MSR_IA32_VMX_PINBASED_CTLS);
+    uint64_t proc_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_PROCBASED_CTLS
+                                             : HYPE_MSR_IA32_VMX_PROCBASED_CTLS);
+    uint64_t proc2_cap = rdmsr(HYPE_MSR_IA32_VMX_PROCBASED_CTLS2);
+    uint64_t exit_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_EXIT_CTLS
+                                             : HYPE_MSR_IA32_VMX_EXIT_CTLS);
+    uint64_t entry_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_ENTRY_CTLS
+                                              : HYPE_MSR_IA32_VMX_ENTRY_CTLS);
 
     uint32_t pin_ctls = hype_vmx_adjust_controls(0, pin_cap);
-    /* TPR shadow (M2-4) needs neither EPT nor "virtualize APIC
-     * accesses" -- see vmcs_fields.h's comment on why it and the
-     * secondary APICv bits below are safe to enable ahead of M3's
-     * EPT. */
+    /* M2-8: a launchable guest. Primary controls activate the secondary
+     * controls (for EPT + unrestricted guest below) and enable HLT-exiting
+     * (so a guest HLT returns to hype). The APICv secondary bits the M2-4
+     * struct-only build set (APIC_REGISTER_VIRT / VIRTUAL_INTERRUPT_DELIVERY,
+     * and USE_TPR_SHADOW) are dropped here: they require a fully wired
+     * virtual-APIC/posted-interrupt setup to pass VM-entry control checks,
+     * and none of the M2-M4-5 test guests exercise APICv -- keeping the
+     * control set minimal removes VM-entry failure surface. */
     uint32_t proc_ctls = hype_vmx_adjust_controls(
-        HYPE_VMX_PROCBASED_ACTIVATE_SECONDARY_CONTROLS | HYPE_VMX_PROCBASED_USE_TPR_SHADOW,
-        proc_cap);
+        HYPE_VMX_PROCBASED_ACTIVATE_SECONDARY_CONTROLS | HYPE_VMX_PROCBASED_HLT_EXITING, proc_cap);
+    /* Unrestricted guest (lets the guest run with CR0.PE=0 / CR0.PG=0, i.e.
+     * real mode) architecturally REQUIRES EPT -- so both bits go together. */
     uint32_t proc2_ctls = hype_vmx_adjust_controls(
-        HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST | HYPE_VMX_PROCBASED2_APIC_REGISTER_VIRT |
-            HYPE_VMX_PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY,
-        proc2_cap);
-    uint32_t exit_ctls = hype_vmx_adjust_controls(0, exit_cap);
-    uint32_t entry_ctls = hype_vmx_adjust_controls(0, entry_cap);
+        HYPE_VMX_PROCBASED2_ENABLE_EPT | HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST, proc2_cap);
+    /* Host address-space size MUST be set: hype's host is 64-bit (see the
+     * constant's comment) -- omitting it is the classic error-7 VM-entry
+     * failure. Entry controls stay 0 (real-mode guest, not IA-32e). */
+    uint32_t exit_ctls = hype_vmx_adjust_controls(HYPE_VMX_EXIT_HOST_ADDR_SPACE_SIZE, exit_cap);
+    /* A long-mode guest needs IA-32e-mode-guest + load-IA32_EFER so the CPU
+     * establishes EFER.LME/LMA consistently with CR0.PG/CR4.PAE. A real-mode
+     * guest needs neither (entry controls stay just the required-1 bits). */
+    uint32_t entry_desired =
+        long_mode ? (HYPE_VMX_ENTRY_IA32E_MODE_GUEST | HYPE_VMX_ENTRY_LOAD_IA32_EFER) : 0;
+    uint32_t entry_ctls = hype_vmx_adjust_controls(entry_desired, entry_cap);
 
     rc |= vmwrite(HYPE_VMCS_PIN_BASED_VM_EXEC_CONTROL, pin_ctls);
     rc |= vmwrite(HYPE_VMCS_CPU_BASED_VM_EXEC_CONTROL, proc_ctls);
@@ -210,6 +304,11 @@ int hype_vmx_vmcs_build_realmode_guest(uint16_t entry_seg, uint64_t stack_phys) 
     rc |= vmwrite(HYPE_VMCS_VM_ENTRY_CONTROLS, entry_ctls);
     rc |= vmwrite(HYPE_VMCS_EXCEPTION_BITMAP, 0);
 
+    /* EPT pointer (M2-8/M3-1): required now that ENABLE_EPT is set. Caller
+     * passes the fully-formed EPTP (PML4 phys | memtype WB | walk-length-1 |
+     * flags -- see hype_vmx_make_eptp()). */
+    rc |= vmwrite(HYPE_VMCS_EPT_POINTER, eptp);
+
     /* TPR shadow/APICv (M2-4): only takes effect if the capability
      * negotiation above actually granted USE_TPR_SHADOW (older CPUs
      * without it will simply ignore VIRTUAL_APIC_PAGE_ADDR/
@@ -217,21 +316,57 @@ int hype_vmx_vmcs_build_realmode_guest(uint16_t entry_seg, uint64_t stack_phys) 
     rc |= vmwrite(HYPE_VMCS_VIRTUAL_APIC_PAGE_ADDR, (uint64_t)(uintptr_t)g_virtual_apic_page);
     rc |= vmwrite(HYPE_VMCS_TPR_THRESHOLD, 0);
 
-    /* Guest state: flat real-mode-like guest at entry_seg:0, matching
-     * hype_vmcb_build_realmode_guest()'s convention on the SVM side. */
-    rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_CS_SELECTOR, HYPE_VMCS_GUEST_CS_BASE,
-                                        HYPE_VMCS_GUEST_CS_LIMIT, HYPE_VMCS_GUEST_CS_AR_BYTES,
-                                        entry_seg, 1);
-    rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_DS_SELECTOR, HYPE_VMCS_GUEST_DS_BASE,
-                                        HYPE_VMCS_GUEST_DS_LIMIT, HYPE_VMCS_GUEST_DS_AR_BYTES, 0, 0);
-    rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_ES_SELECTOR, HYPE_VMCS_GUEST_ES_BASE,
-                                        HYPE_VMCS_GUEST_ES_LIMIT, HYPE_VMCS_GUEST_ES_AR_BYTES, 0, 0);
-    rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_SS_SELECTOR, HYPE_VMCS_GUEST_SS_BASE,
-                                        HYPE_VMCS_GUEST_SS_LIMIT, HYPE_VMCS_GUEST_SS_AR_BYTES, 0, 0);
-    rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_FS_SELECTOR, HYPE_VMCS_GUEST_FS_BASE,
-                                        HYPE_VMCS_GUEST_FS_LIMIT, HYPE_VMCS_GUEST_FS_AR_BYTES, 0, 0);
-    rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_GS_SELECTOR, HYPE_VMCS_GUEST_GS_BASE,
-                                        HYPE_VMCS_GUEST_GS_LIMIT, HYPE_VMCS_GUEST_GS_AR_BYTES, 0, 0);
+    /* Guest segments. Long mode: flat 64-bit -- base 0, 4GB limit, CS is a
+     * long-mode code segment (AR 0xA09B: type=exec/read/accessed, S, P, L,
+     * G), data segments AR 0xC093 (type=RW/accessed, S, P, D/B, G). Real mode:
+     * CS.base = cs_base (written manually so an entry base beyond a 16-bit
+     * selector*16 works under unrestricted guest), DS/ES/SS/FS/GS base 0. */
+    if (long_mode) {
+        rc |= vmwrite(HYPE_VMCS_GUEST_CS_SELECTOR, 0x08u);
+        rc |= vmwrite(HYPE_VMCS_GUEST_CS_BASE, 0);
+        rc |= vmwrite(HYPE_VMCS_GUEST_CS_LIMIT, 0xFFFFFFFFu);
+        rc |= vmwrite(HYPE_VMCS_GUEST_CS_AR_BYTES, 0xA09Bu);
+        struct {
+            uint32_t sel, base, limit, ar;
+        } dseg[5] = {
+            {HYPE_VMCS_GUEST_DS_SELECTOR, HYPE_VMCS_GUEST_DS_BASE, HYPE_VMCS_GUEST_DS_LIMIT,
+             HYPE_VMCS_GUEST_DS_AR_BYTES},
+            {HYPE_VMCS_GUEST_ES_SELECTOR, HYPE_VMCS_GUEST_ES_BASE, HYPE_VMCS_GUEST_ES_LIMIT,
+             HYPE_VMCS_GUEST_ES_AR_BYTES},
+            {HYPE_VMCS_GUEST_SS_SELECTOR, HYPE_VMCS_GUEST_SS_BASE, HYPE_VMCS_GUEST_SS_LIMIT,
+             HYPE_VMCS_GUEST_SS_AR_BYTES},
+            {HYPE_VMCS_GUEST_FS_SELECTOR, HYPE_VMCS_GUEST_FS_BASE, HYPE_VMCS_GUEST_FS_LIMIT,
+             HYPE_VMCS_GUEST_FS_AR_BYTES},
+            {HYPE_VMCS_GUEST_GS_SELECTOR, HYPE_VMCS_GUEST_GS_BASE, HYPE_VMCS_GUEST_GS_LIMIT,
+             HYPE_VMCS_GUEST_GS_AR_BYTES},
+        };
+        for (unsigned s = 0; s < 5; s++) {
+            rc |= vmwrite(dseg[s].sel, 0x10u);
+            rc |= vmwrite(dseg[s].base, 0);
+            rc |= vmwrite(dseg[s].limit, 0xFFFFFFFFu);
+            rc |= vmwrite(dseg[s].ar, 0xC093u);
+        }
+    } else {
+        rc |= vmwrite(HYPE_VMCS_GUEST_CS_SELECTOR, (cs_base >> 4) & 0xFFFFu);
+        rc |= vmwrite(HYPE_VMCS_GUEST_CS_BASE, cs_base);
+        rc |= vmwrite(HYPE_VMCS_GUEST_CS_LIMIT, 0xFFFFu);
+        rc |= vmwrite(HYPE_VMCS_GUEST_CS_AR_BYTES, 0x9Bu);
+        rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_DS_SELECTOR, HYPE_VMCS_GUEST_DS_BASE,
+                                           HYPE_VMCS_GUEST_DS_LIMIT, HYPE_VMCS_GUEST_DS_AR_BYTES, 0,
+                                           0);
+        rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_ES_SELECTOR, HYPE_VMCS_GUEST_ES_BASE,
+                                           HYPE_VMCS_GUEST_ES_LIMIT, HYPE_VMCS_GUEST_ES_AR_BYTES, 0,
+                                           0);
+        rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_SS_SELECTOR, HYPE_VMCS_GUEST_SS_BASE,
+                                           HYPE_VMCS_GUEST_SS_LIMIT, HYPE_VMCS_GUEST_SS_AR_BYTES, 0,
+                                           0);
+        rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_FS_SELECTOR, HYPE_VMCS_GUEST_FS_BASE,
+                                           HYPE_VMCS_GUEST_FS_LIMIT, HYPE_VMCS_GUEST_FS_AR_BYTES, 0,
+                                           0);
+        rc |= write_realmode_guest_segment(HYPE_VMCS_GUEST_GS_SELECTOR, HYPE_VMCS_GUEST_GS_BASE,
+                                           HYPE_VMCS_GUEST_GS_LIMIT, HYPE_VMCS_GUEST_GS_AR_BYTES, 0,
+                                           0);
+    }
 
     rc |= vmwrite(HYPE_VMCS_GUEST_LDTR_SELECTOR, 0);
     rc |= vmwrite(HYPE_VMCS_GUEST_LDTR_LIMIT, 0);
@@ -248,16 +383,28 @@ int hype_vmx_vmcs_build_realmode_guest(uint16_t entry_seg, uint64_t stack_phys) 
     rc |= vmwrite(HYPE_VMCS_GUEST_IDTR_BASE, 0);
     rc |= vmwrite(HYPE_VMCS_GUEST_IDTR_LIMIT, 0x3FFu);
 
-    rc |= vmwrite(HYPE_VMCS_GUEST_CR0, 0x00000010u); /* ET-only, matching the SVM side */
-    rc |= vmwrite(HYPE_VMCS_GUEST_CR3, 0);
-    rc |= vmwrite(HYPE_VMCS_GUEST_CR4, 0);
+    /* Guest CR0/CR3/CR4/EFER must satisfy the VMX fixed-bit MSRs (observed on
+     * this Intel box: CR0_FIXED0=0x80000021 -> PE|NE|PG required; CR4_FIXED0
+     * =0x2000 -> VMXE required). Unrestricted guest relaxes only CR0.PE and
+     * CR0.PG, so NE (bit5) and CR4.VMXE (bit13) are mandatory in BOTH modes.
+     *   real mode: CR0 = ET|NE (PE=PG=0, allowed by unrestricted guest).
+     *   long mode: CR0 = PG|PE|NE|ET; CR4 += PAE; CR3 = guest paging root;
+     *              EFER = LME|LMA (loaded via the entry control set above). */
+    uint64_t guest_cr0 = long_mode ? 0x80000031ull /* PG|NE|ET|PE */ : 0x00000030ull /* ET|NE */;
+    uint64_t guest_cr4 = long_mode ? 0x00002020ull /* PAE|VMXE */ : 0x00002000ull /* VMXE */;
+    rc |= vmwrite(HYPE_VMCS_GUEST_CR0, guest_cr0);
+    rc |= vmwrite(HYPE_VMCS_GUEST_CR3, long_mode ? guest_cr3 : 0);
+    rc |= vmwrite(HYPE_VMCS_GUEST_CR4, guest_cr4);
+    if (long_mode) {
+        rc |= vmwrite(HYPE_VMCS_GUEST_IA32_EFER, 0x500ull); /* LME|LMA */
+    }
     rc |= vmwrite(HYPE_VMCS_CR0_GUEST_HOST_MASK, 0);
     rc |= vmwrite(HYPE_VMCS_CR4_GUEST_HOST_MASK, 0);
-    rc |= vmwrite(HYPE_VMCS_CR0_READ_SHADOW, 0x00000010u);
-    rc |= vmwrite(HYPE_VMCS_CR4_READ_SHADOW, 0);
+    rc |= vmwrite(HYPE_VMCS_CR0_READ_SHADOW, guest_cr0);
+    rc |= vmwrite(HYPE_VMCS_CR4_READ_SHADOW, guest_cr4);
     rc |= vmwrite(HYPE_VMCS_GUEST_DR7, 0x400u);
     rc |= vmwrite(HYPE_VMCS_GUEST_RSP, stack_phys);
-    rc |= vmwrite(HYPE_VMCS_GUEST_RIP, 0);
+    rc |= vmwrite(HYPE_VMCS_GUEST_RIP, rip);
     rc |= vmwrite(HYPE_VMCS_GUEST_RFLAGS, 0x2u);
     rc |= vmwrite(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE, 0);
     rc |= vmwrite(HYPE_VMCS_GUEST_ACTIVITY_STATE, 0);
@@ -271,16 +418,44 @@ int hype_vmx_vmcs_build_realmode_guest(uint16_t entry_seg, uint64_t stack_phys) 
      * this once the VM-exit handler exists; nothing here is wired into
      * an actual VMLAUNCH yet (that's M2-7).
      */
+    uint16_t host_cs = read_cs() & 0xF8u;
+    uint16_t host_tr = read_tr() & 0xF8u;
+    /* VMX host-state check: the TR selector cannot be null (SDM 26.2.3). hype
+     * never executes LTR post-EBS, so TR is often 0 here -> VM-instruction-
+     * error 8 (invalid host-state field). On VM-exit the host TR *base* comes
+     * from HOST_TR_BASE (below), limit is forced to 0x67, and the GDT is not
+     * consulted (SDM 27.5.2) -- so any non-null selector with RPL=TI=0 works;
+     * hype never uses the TSS during a guest run. Borrow the (valid, non-null)
+     * host CS selector when TR is null. */
+    if (host_tr == 0) {
+        host_tr = host_cs;
+    }
+    /* One-shot: the host state is identical for every vCPU, so log it once
+     * (VMX-2 builds many VMCSes) -- enough to diagnose a host-state VM-entry
+     * failure without spamming the log per microtest. */
+    {
+        static int host_diag_printed;
+        if (!host_diag_printed) {
+            host_diag_printed = 1;
+            hype_debug_print("vmx: host sel cs=0x%x ss=0x%x ds=0x%x tr(raw=0x%x used=0x%x) "
+                             "cr0=0x%llx cr4=0x%llx\n",
+                             (unsigned)host_cs, (unsigned)(read_ss() & 0xF8u),
+                             (unsigned)(read_ds() & 0xF8u), (unsigned)(read_tr() & 0xF8u),
+                             (unsigned)host_tr, (unsigned long long)read_cr0(),
+                             (unsigned long long)read_cr4());
+        }
+    }
+
     rc |= vmwrite(HYPE_VMCS_HOST_CR0, read_cr0());
     rc |= vmwrite(HYPE_VMCS_HOST_CR3, read_cr3());
     rc |= vmwrite(HYPE_VMCS_HOST_CR4, read_cr4());
-    rc |= vmwrite(HYPE_VMCS_HOST_CS_SELECTOR, read_cs() & 0xF8u);
+    rc |= vmwrite(HYPE_VMCS_HOST_CS_SELECTOR, host_cs);
     rc |= vmwrite(HYPE_VMCS_HOST_SS_SELECTOR, read_ss() & 0xF8u);
     rc |= vmwrite(HYPE_VMCS_HOST_DS_SELECTOR, read_ds() & 0xF8u);
     rc |= vmwrite(HYPE_VMCS_HOST_ES_SELECTOR, read_es() & 0xF8u);
     rc |= vmwrite(HYPE_VMCS_HOST_FS_SELECTOR, read_fs() & 0xF8u);
     rc |= vmwrite(HYPE_VMCS_HOST_GS_SELECTOR, read_gs() & 0xF8u);
-    rc |= vmwrite(HYPE_VMCS_HOST_TR_SELECTOR, read_tr() & 0xF8u);
+    rc |= vmwrite(HYPE_VMCS_HOST_TR_SELECTOR, host_tr);
     rc |= vmwrite(HYPE_VMCS_HOST_FS_BASE, 0);
     rc |= vmwrite(HYPE_VMCS_HOST_GS_BASE, 0);
     rc |= vmwrite(HYPE_VMCS_HOST_TR_BASE, 0);
@@ -288,7 +463,201 @@ int hype_vmx_vmcs_build_realmode_guest(uint16_t entry_seg, uint64_t stack_phys) 
     rc |= vmwrite(HYPE_VMCS_HOST_IDTR_BASE, read_idtr_base());
     rc |= vmwrite(HYPE_VMCS_HOST_IA32_SYSENTER_CS, 0);
     rc |= vmwrite(HYPE_VMCS_HOST_RSP, (uint64_t)&g_vmcs_region[sizeof(g_vmcs_region)]);
+    /* HOST_RIP/HOST_RSP are placeholders here: hype_vmx_vcpu_run()'s trampoline
+     * (vmx_run.S) VMWRITEs the real values (its own .Lvmexit label + live stack)
+     * on every entry, overriding these. The stub only keeps the field non-zero
+     * for a build that never launches (M2-6 struct validation). */
     rc |= vmwrite(HYPE_VMCS_HOST_RIP, (uint64_t)&hype_vmx_host_exit_stub);
 
     return rc;
+}
+
+/* Public builders: real-mode guest at cs_base:rip; flat 64-bit guest at linear
+ * entry_rip with paging root guest_cr3. Both take a prebuilt EPT pointer. */
+int hype_vmx_vmcs_build_guest(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp) {
+    return build_guest_common(cs_base, rip, stack_phys, eptp, 0, 0);
+}
+
+int hype_vmx_vmcs_build_long_mode_guest(uint64_t entry_rip, uint64_t guest_cr3, uint64_t stack_phys,
+                                        uint64_t eptp) {
+    return build_guest_common(0, entry_rip, stack_phys, eptp, 1, guest_cr3);
+}
+
+/*
+ * Assembles an EPT pointer from a PML4 physical address: memory type WB (6),
+ * page-walk length 4 encoded as (4-1)<<3 = 0x18, giving a low byte of 0x1E.
+ * Accessed/dirty flags left disabled (bit 6 = 0). Intel SDM Vol 3C, EPTP.
+ */
+uint64_t hype_vmx_make_eptp(uint64_t pml4_phys) {
+    return (pml4_phys & ~0xFFFULL) | 0x1EULL;
+}
+
+/*
+ * VMX vcpu_create (M2-8, VMX-1). Builds an identity EPT (guest-physical ==
+ * host-physical, matching the SVM NPT identity map) and a launchable VMCS for
+ * a real-mode guest entering at physical guest_rip with stack guest_rsp, then
+ * returns the (single, static) vCPU context.
+ *
+ * ept_or_npt_root is currently ignored: the ops contract passes whatever root
+ * the caller built, but the M2-M4-5 microtests build it with the SVM NPT
+ * helper (ordinary long-mode PTEs), which is NOT a valid EPT structure (EPT
+ * uses a distinct entry format -- see ept.h). Rather than misinterpret it,
+ * VMX builds its own identity EPT here. Revisit if a caller ever hands VMX a
+ * real EPT root.
+ */
+hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
+                                      uint64_t ept_or_npt_root) {
+    struct hype_vcpu_ctx *ctx = &g_vmx_ctx;
+    uint64_t eptp;
+    unsigned i;
+
+    (void)ept_or_npt_root;
+
+    hype_ept_build_identity(g_ept_pml4, g_ept_pdpt, g_ept_pd, HYPE_EPT_MAX_GB);
+    eptp = hype_vmx_make_eptp((uint64_t)(uintptr_t)g_ept_pml4);
+
+    /* cs_base = guest_rip, rip = 0: the guest starts executing at physical
+     * guest_rip in real mode (CS.base:IP = guest_rip:0). */
+    if (hype_vmx_vmcs_build_guest(guest_rip, 0, guest_rsp, eptp) != 0) {
+        return 0;
+    }
+
+    for (i = 0; i < 16; i++) {
+        ctx->gprs[i] = 0;
+    }
+    ctx->launched = 0;
+    return (hype_vcpu_ctx_t *)ctx;
+}
+
+/*
+ * VMX vcpu_create_long_mode (M2-8, VMX-2). The VMX mirror of
+ * hype_svm_vcpu_create_long_mode(): builds an identity EPT and a flat 64-bit
+ * guest VMCS entering at linear entry_rip with the caller-supplied guest CR3
+ * (the caller builds guest paging, exactly as the SVM microtests already do).
+ * This is what the M2-M4-5 microtests use; the real-mode vcpu_create() above
+ * is only the ops-vtable/FW-1 entry point. ept_or_npt_root is ignored for the
+ * same reason as vcpu_create() (VMX builds its own EPT).
+ */
+hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t guest_cr3,
+                                                uint64_t guest_rsp, uint64_t ept_or_npt_root) {
+    struct hype_vcpu_ctx *ctx = &g_vmx_ctx;
+    uint64_t eptp;
+    unsigned i;
+
+    (void)ept_or_npt_root;
+
+    hype_ept_build_identity(g_ept_pml4, g_ept_pdpt, g_ept_pd, HYPE_EPT_MAX_GB);
+    eptp = hype_vmx_make_eptp((uint64_t)(uintptr_t)g_ept_pml4);
+
+    if (hype_vmx_vmcs_build_long_mode_guest(entry_rip, guest_cr3, guest_rsp, eptp) != 0) {
+        return 0;
+    }
+
+    for (i = 0; i < 16; i++) {
+        ctx->gprs[i] = 0;
+    }
+    ctx->launched = 0;
+    return (hype_vcpu_ctx_t *)ctx;
+}
+
+/*
+ * VMX vcpu_run (M2-8, VMX-1). Enters the guest via the VMLAUNCH/VMRESUME
+ * trampoline and, on a clean VM-exit, populates *info from the VMCS
+ * (VM_EXIT_REASON / EXIT_QUALIFICATION / GUEST_RIP) via VMREAD. Returns 0 on a
+ * VM-exit, -1 on a VM-entry failure (VMLAUNCH/VMRESUME faulted before the guest
+ * ran -- info->reason then carries the VM-instruction-error code with bit 63
+ * set as a marker so the caller can tell it apart from a real exit reason).
+ *
+ * Note a VM-entry failure due to invalid guest state does NOT fault the
+ * instruction; it causes a normal VM-exit to HOST_RIP whose reason has bit 31
+ * set (HYPE_VMX_EXIT_ENTRY_FAILURE) -- surfaced verbatim in info->reason.
+ */
+int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    uint64_t failed;
+    int ok;
+
+    failed = hype_vmx_launch(ctx, (uint64_t)real->launched);
+    if (failed) {
+        uint64_t err = vmread(HYPE_VMCS_VM_INSTRUCTION_ERROR, &ok);
+        info->reason = (1ULL << 63) | (ok ? err : 0);
+        info->qualification = 0;
+        info->guest_rip = 0;
+        return -1;
+    }
+
+    real->launched = 1;
+    info->reason = vmread(HYPE_VMCS_VM_EXIT_REASON, &ok);
+    info->qualification = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    info->guest_rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    return 0;
+}
+
+/*
+ * VMX-1 self-contained smoke test. Proves the whole VM-entry/exit round trip
+ * (vcpu_create -> EPT + launchable VMCS -> hype_vmx_launch VMLAUNCH -> VM-exit
+ * -> exit info -> VMRESUME) on real VMX hardware, independent of the M2-M4-5
+ * microtest guest ABI (that's VMX-2). The guest is three bytes at a static,
+ * EPT-identity-mapped address: CPUID (0F A2), then HLT (F4). CPUID exits
+ * unconditionally (no control needed); HLT exits because HLT-exiting is set.
+ * Expected: run 0 -> reason 10 (CPUID), advance RIP, run 1 -> reason 12 (HLT).
+ * Returns 0 on that exact sequence, -1 otherwise. Gated off in normal boot;
+ * called only when boot/main.c requests it on an Intel/VMX backend.
+ */
+static uint8_t g_smoke_guest[16] __attribute__((aligned(16)));
+static uint8_t g_smoke_stack[4096] __attribute__((aligned(16)));
+
+int hype_vmx_smoke_test(void) {
+    hype_vcpu_ctx_t *ctx;
+    hype_vmexit_info_t info;
+    int i, ok;
+
+    uint64_t guest_cr3;
+
+    g_smoke_guest[0] = 0x0F; /* CPUID */
+    g_smoke_guest[1] = 0xA2;
+    g_smoke_guest[2] = 0xF4; /* HLT  */
+
+    /* Long-mode guest: flat 64-bit, so the guest RIP can be the blob's actual
+     * (high) load address -- real mode's CS.base==selector<<4 rule caps that at
+     * ~1MB. Guest paging identity-maps linear==physical so the RIP resolves. */
+    hype_paging_build_identity(g_vmx_guest_pml4, g_vmx_guest_pdpt, g_vmx_guest_pd,
+                               HYPE_PAGING_MAX_GB);
+    guest_cr3 = (uint64_t)(uintptr_t)g_vmx_guest_pml4;
+
+    ctx = hype_vmx_vcpu_create_long_mode((uint64_t)(uintptr_t)g_smoke_guest, guest_cr3,
+                                         (uint64_t)(uintptr_t)&g_smoke_stack[sizeof(g_smoke_stack)],
+                                         0);
+    if (ctx == 0) {
+        hype_debug_print("vmx-smoke: vcpu_create FAILED (VMCS build error)\n");
+        return -1;
+    }
+    hype_debug_print("vmx-smoke: guest at 0x%llx, launching...\n",
+                     (unsigned long long)(uintptr_t)g_smoke_guest);
+
+    for (i = 0; i < 4; i++) {
+        int rc = hype_vmx_vcpu_run(ctx, &info);
+        uint64_t reason = info.reason & 0xFFFFu;
+        hype_debug_print("vmx-smoke: run%d rc=%d reason=0x%llx qual=0x%llx rip=0x%llx\n", i, rc,
+                         (unsigned long long)info.reason, (unsigned long long)info.qualification,
+                         (unsigned long long)info.guest_rip);
+        if (rc < 0) {
+            hype_debug_print("vmx-smoke: VM-ENTRY FAILURE (instr err=0x%llx)\n",
+                             (unsigned long long)(info.reason & ~(1ULL << 63)));
+            return -1;
+        }
+        if (reason == HYPE_VMX_EXIT_REASON_HLT) {
+            hype_debug_print("vmx-smoke: HLT exit -- VMX round trip PASS\n");
+            return 0;
+        }
+        if (reason == HYPE_VMX_EXIT_REASON_CPUID) {
+            uint64_t len = vmread(HYPE_VMCS_VM_EXIT_INSTRUCTION_LEN, &ok);
+            vmwrite(HYPE_VMCS_GUEST_RIP, info.guest_rip + len);
+            continue;
+        }
+        hype_debug_print("vmx-smoke: unexpected exit reason -- FAIL\n");
+        return -1;
+    }
+    hype_debug_print("vmx-smoke: no HLT within 4 exits -- FAIL\n");
+    return -1;
 }

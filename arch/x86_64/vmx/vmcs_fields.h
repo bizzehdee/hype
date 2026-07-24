@@ -47,6 +47,11 @@
  * unlike vmcs_fields.h's M2-3 batch above.
  */
 #define HYPE_VMX_PROCBASED_USE_TPR_SHADOW (1u << 21)
+/* HLT exiting (primary proc-based control, bit 7): a guest HLT causes a
+ * VM-exit (reason 12) instead of parking the logical processor -- without
+ * it a guest that halts (every test guest's terminal instruction, and any
+ * real OS idle loop) would never return control to hype. */
+#define HYPE_VMX_PROCBASED_HLT_EXITING (1u << 7)
 /* Secondary processor-based VM-execution control bits used here. */
 /* "Unrestricted guest" (below) requires "enable EPT" to also be 1 --
  * Intel SDM: an unrestricted guest can run with paging disabled, and
@@ -71,6 +76,18 @@
  * NOT set -- this project's minimal test guest starts in unpaged
  * real-address mode (via "unrestricted guest" above), not long mode. */
 #define HYPE_VMX_ENTRY_IA32E_MODE_GUEST (1u << 9)
+/* VM-entry control "load IA32_EFER" (bit 15): load guest EFER from the
+ * GUEST_IA32_EFER VMCS field on entry, so a long-mode guest gets LME/LMA set
+ * consistently with IA32E_MODE_GUEST + CR0.PG + CR4.PAE. */
+#define HYPE_VMX_ENTRY_LOAD_IA32_EFER (1u << 15)
+
+/* VM-exit control: "host address-space size" (bit 9). MUST be 1 whenever the
+ * host runs in IA-32e (64-bit) mode -- which hype always does post-EBS -- or
+ * VM-entry fails the control-field checks with VM-instruction-error 7. This is
+ * the classic first-VMLAUNCH failure: adjust_controls(0, ...) only forces the
+ * MSR's required-1 bits, and this bit is NOT one of them, so it must be
+ * requested explicitly. */
+#define HYPE_VMX_EXIT_HOST_ADDR_SPACE_SIZE (1u << 9)
 
 /* 16-bit fields (Table B-2/B-3). */
 #define HYPE_VMCS_GUEST_ES_SELECTOR 0x0800u
@@ -93,6 +110,7 @@
 #define HYPE_VMCS_VIRTUAL_APIC_PAGE_ADDR 0x2012u /* full; +1 = high (M2-4) */
 #define HYPE_VMCS_EPT_POINTER 0x201Au /* full; +1 = high (M3-1) */
 #define HYPE_VMCS_VMCS_LINK_POINTER 0x2800u /* full; +1 = high */
+#define HYPE_VMCS_GUEST_IA32_EFER 0x2806u    /* 64-bit guest-state field */
 
 /* 32-bit control fields (Table B-8). */
 #define HYPE_VMCS_PIN_BASED_VM_EXEC_CONTROL 0x4000u
@@ -174,6 +192,10 @@
 
 /* VMX basic exit reasons (Appendix C) this project checks for. */
 #define HYPE_VMX_EXIT_REASON_TRIPLE_FAULT 2u
+#define HYPE_VMX_EXIT_REASON_CPUID 10u
 #define HYPE_VMX_EXIT_REASON_HLT 12u
+/* VM-exit instruction length (0x440C): bytes of the instruction that caused
+ * the exit, used to advance guest RIP past an emulated instruction. */
+#define HYPE_VMCS_VM_EXIT_INSTRUCTION_LEN 0x440Cu
 
 #endif /* HYPE_ARCH_VMX_VMCS_FIELDS_H */

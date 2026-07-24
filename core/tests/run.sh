@@ -42,11 +42,18 @@ done
 rm -f test_*.profraw coverage.profdata
 binaries=""
 
+# vmx_run.S defines hype_vmx_launch, referenced by vmcs_hw.c (linked but
+# coverage-exempt above). It's the VMX VM-entry/exit trampoline -- real VMX
+# instructions + win64 ABI, never CALLED by a test (only vcpu_run() in
+# vmcs_hw.c calls it, and that itself is exempt/unrun on the host); it just
+# has to resolve at link time. Assembling it for the host target does that.
+asm_srcs="../../arch/x86_64/vmx/vmx_run.S"
+
 for src in test_*.c; do
     name="${src%.c}"
     clang -std=c11 -Wall -Wextra -g \
         -fprofile-instr-generate -fcoverage-mapping \
-        -o "$name" "$src" $lib_srcs
+        -o "$name" "$src" $lib_srcs $asm_srcs
     LLVM_PROFILE_FILE="$name.profraw" "./$name"
     binaries="$binaries $name"
 done
