@@ -5579,6 +5579,10 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         hype_debug_print("virtio-blk[vm %d]: PHYSICAL AHCI/SATA backend (sn '%s', %llu sectors) "
                          "[writable]\n", idx, g_hostdisk_serial,
                          (unsigned long long)g_hostdisk_total_sectors);
+        /* Real-HW install: guarantee this "attached writable" confirmation reaches
+         * \HYPEFULL.LOG immediately, before the guest install phase (whose auto-
+         * streaming can stall) -- so the log always proves the physical attach. */
+        usb_log_flush();
 #if HYPE_M10_6_WRITE_SELFTEST
         fw_1_vblk_write_selftest(vm);
 #endif
