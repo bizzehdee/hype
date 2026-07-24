@@ -2,6 +2,8 @@
 #include "vmx.h"
 
 #include "../../../core/fatal.h"
+#include "../cpu/cpuid_emulate.h"
+#include "../cpu/msr_emulate.h"
 #include "../cpu/paging.h"
 #include "../cpu/vmm_ops.h"
 #include "ept.h"
@@ -590,6 +592,96 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     info->reason = vmread(HYPE_VMCS_VM_EXIT_REASON, &ok);
     info->qualification = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
     info->guest_rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    return 0;
+}
+
+/* Advance guest RIP past the instruction that caused the exit, using the exact
+ * length the CPU recorded (VM_EXIT_INSTRUCTION_LEN) -- the VMX analogue of
+ * SVM's "rip += 2" for CPUID/RDMSR/WRMSR (all coincidentally 2 bytes, but the
+ * VMCS field is authoritative and works for any emulated instruction). */
+static void vmx_advance_rip(void) {
+    int ok;
+    uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    uint64_t len = vmread(HYPE_VMCS_VM_EXIT_INSTRUCTION_LEN, &ok);
+    vmwrite(HYPE_VMCS_GUEST_RIP, rip + len);
+}
+
+static inline void vmx_real_cpuid(uint32_t eax, uint32_t ecx, hype_cpuid_result_t *out) {
+    __asm__ volatile("cpuid"
+                     : "=a"(out->eax), "=b"(out->ebx), "=c"(out->ecx), "=d"(out->edx)
+                     : "a"(eax), "c"(ecx));
+}
+
+/*
+ * VMX CPUID handler (VMX-2): mirror of hype_svm_vcpu_handle_cpuid. Guest GPRs
+ * live in ctx->gprs after the exit (0=RAX,1=RCX,2=RDX,3=RBX). Read the CPUID
+ * input (EAX/ECX), synthesize via the shared hype_cpuid_emulate(), write the
+ * four result registers back, and advance past the 2-byte CPUID.
+ */
+void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    uint32_t eax_in = (uint32_t)real->gprs[0];
+    uint32_t ecx_in = (uint32_t)real->gprs[1];
+    hype_cpuid_result_t host_real, out;
+
+    vmx_real_cpuid(eax_in, ecx_in, &host_real);
+    hype_cpuid_emulate(eax_in, ecx_in, &host_real, &out);
+
+    real->gprs[0] = out.eax; /* RAX */
+    real->gprs[3] = out.ebx; /* RBX */
+    real->gprs[1] = out.ecx; /* RCX */
+    real->gprs[2] = out.edx; /* RDX */
+    vmx_advance_rip();
+}
+
+/*
+ * VMX MSR handler (VMX-2): mirror of hype_svm_vcpu_handle_msr's general path.
+ * is_write distinguishes WRMSR (exit reason 32) from RDMSR (31) -- the VMX
+ * analogue of SVM's exitinfo1 bit 0. Reuses the vendor-neutral
+ * hype_msr_decide(); MSR number in ECX (gprs[1]), value in EDX:EAX
+ * (gprs[2]:gprs[0]). Guest EFER lives in the VMCS GUEST_IA32_EFER field (not a
+ * GPR), so it is VMREAD/VMWRITE'd. Returns 0 if handled, -1 to reject.
+ *
+ * The pvclock / MTRR / PAT special-casing the SVM handler carries is omitted:
+ * the M2-M4-5 microtests (the VMX validation set) touch only APIC_BASE + EFER;
+ * a full guest OS on VMX would need those ported too (future work).
+ */
+int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    uint32_t msr_number = (uint32_t)real->gprs[1];
+    hype_msr_action_t action = hype_msr_decide(msr_number, is_write);
+    int ok;
+
+    switch (action) {
+    case HYPE_MSR_ACTION_READ_APIC_BASE: {
+        uint64_t value = hype_msr_apic_base_value();
+        real->gprs[0] = (uint64_t)(uint32_t)value;
+        real->gprs[2] = (uint64_t)(uint32_t)(value >> 32);
+        break;
+    }
+    case HYPE_MSR_ACTION_READWRITE_EFER:
+        if (is_write) {
+            uint64_t value =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+            vmwrite(HYPE_VMCS_GUEST_IA32_EFER, value);
+        } else {
+            uint64_t efer = vmread(HYPE_VMCS_GUEST_IA32_EFER, &ok);
+            real->gprs[0] = (uint64_t)(uint32_t)efer;
+            real->gprs[2] = (uint64_t)(uint32_t)(efer >> 32);
+        }
+        break;
+    case HYPE_MSR_ACTION_READ_TSC: {
+        uint64_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        real->gprs[0] = (uint64_t)(uint32_t)lo;
+        real->gprs[2] = (uint64_t)(uint32_t)hi;
+        break;
+    }
+    case HYPE_MSR_ACTION_REJECT:
+    default:
+        return -1;
+    }
+    vmx_advance_rip();
     return 0;
 }
 

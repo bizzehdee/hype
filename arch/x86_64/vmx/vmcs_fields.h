@@ -194,6 +194,10 @@
 #define HYPE_VMX_EXIT_REASON_TRIPLE_FAULT 2u
 #define HYPE_VMX_EXIT_REASON_CPUID 10u
 #define HYPE_VMX_EXIT_REASON_HLT 12u
+#define HYPE_VMX_EXIT_REASON_RDMSR 31u
+#define HYPE_VMX_EXIT_REASON_WRMSR 32u
+#define HYPE_VMX_EXIT_REASON_IO_INSTRUCTION 30u
+#define HYPE_VMX_EXIT_REASON_EPT_VIOLATION 48u
 /* VM-exit instruction length (0x440C): bytes of the instruction that caused
  * the exit, used to advance guest RIP past an emulated instruction. */
 #define HYPE_VMCS_VM_EXIT_INSTRUCTION_LEN 0x440Cu

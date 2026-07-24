@@ -60,6 +60,13 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
                                                 uint64_t guest_rsp, uint64_t ept_or_npt_root);
 int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info);
 
+/* VMX exit handlers (VMX-2), mirrors of the SVM ones: emulate CPUID / MSR
+ * against the guest GPRs in ctx (+ the VMCS for guest EFER) and advance guest
+ * RIP. handle_msr's is_write distinguishes WRMSR (exit reason 32) from RDMSR
+ * (31); returns 0 if handled, -1 to reject. */
+void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
+int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write);
+
 /*
  * VMX-1 smoke test: launches a self-contained 3-byte guest (CPUID; HLT) via
  * vcpu_create/vcpu_run and checks the CPUID->HLT VM-exit sequence. Returns 0

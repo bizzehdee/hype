@@ -60,6 +60,7 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #include "../arch/x86_64/cpu/vmm_select.h"
 #include "../arch/x86_64/svm/npt.h"
 #include "../arch/x86_64/svm/svm.h"
+#include "../arch/x86_64/vmx/vmcs.h" /* VMX-2: vcpu_create_long_mode + handlers */
 #include "../core/linux_boot.h"
 #include "../devices/pic.h"
 #include "../devices/pit.h"
@@ -77,8 +78,12 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 /* RT-2c: run the M2-M5/VIDEO/INPUT regression self-test guests before the
  * FW-1 Alpine guest? 0 = skip (a normal boot goes straight to Alpine -- less
  * startup time + log clutter); 1 = run the suite (after touching the VM-exit
- * core). The machinery they check is HW-proven, so off by default. */
+ * core). The machinery they check is HW-proven, so off by default.
+ * #ifndef-guarded so -DHYPE_RUN_SELFTEST_GUESTS=1 on the build line wins (used
+ * to validate VMX-2's microtest port on the Intel box). */
+#ifndef HYPE_RUN_SELFTEST_GUESTS
 #define HYPE_RUN_SELFTEST_GUESTS 0
+#endif
 
 /* VMX-1 (#35): run the self-contained VMX round-trip smoke test (CPUID->HLT
  * guest via the VMLAUNCH/VMRESUME trampoline) right after the VMM enables, on
@@ -2489,6 +2494,46 @@ static const uint8_t g_cpumsr_1_payload_template[] = {
 };
 #define HYPE_CPUMSR_1_PAYLOAD_RDI_IMM_OFFSET 2
 
+/*
+ * VMX-2 vendor dispatch. SVM and VMX expose parallel create_long_mode + CPUID/
+ * MSR handlers, but with different exit-reason encodings; these thin shims pick
+ * the right one by kind so a microtest's exit loop stays vendor-neutral. Lets
+ * the M2-M4-5 self-tests run under either backend from one body.
+ */
+static hype_vcpu_ctx_t *vmm_create_long_mode(hype_vmm_kind_t kind, uint64_t entry_rip,
+                                             uint64_t guest_cr3, uint64_t rsp, uint64_t root) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, root);
+    }
+    return hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, root);
+}
+static int vmm_reason_is_cpuid(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_CPUID)
+                                     : (reason == HYPE_SVM_EXITCODE_CPUID);
+}
+static int vmm_reason_is_msr(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX
+               ? (reason == HYPE_VMX_EXIT_REASON_RDMSR || reason == HYPE_VMX_EXIT_REASON_WRMSR)
+               : (reason == HYPE_SVM_EXITCODE_MSR);
+}
+static int vmm_reason_is_hlt(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_HLT)
+                                     : (reason == HYPE_SVM_EXITCODE_HLT);
+}
+static void vmm_handle_cpuid(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_handle_cpuid(ctx);
+    } else {
+        hype_svm_vcpu_handle_cpuid(ctx);
+    }
+}
+static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_msr(ctx, reason == HYPE_VMX_EXIT_REASON_WRMSR);
+    }
+    return hype_svm_vcpu_handle_msr(ctx);
+}
+
 static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     unsigned long long i;
     uint64_t entry_rip, guest_cr3, rsp, result_buf_phys;
@@ -2496,11 +2541,8 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_vmexit_info_t info;
     hype_cpuid_result_t real, expected;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("cpumsr: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n",
-                           ops->name);
-        return;
-    }
+    /* VMX-2: runs under SVM and VMX now (was SVM-only). */
+    (void)ops;
 
     hype_guest_ram_zero(g_cpumsr_1_guest_code, sizeof(g_cpumsr_1_guest_code));
     hype_guest_ram_zero(g_cpumsr_1_guest_stack, sizeof(g_cpumsr_1_guest_stack));
@@ -2525,7 +2567,7 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     /* No NPT for this test -- pure register/memory-write test, no
      * MMIO-trapped device involved (same reasoning as M4-4's fw_cfg
      * test). */
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
     if (ctx == 0) {
         hype_fatal("cpumsr: vcpu_create_long_mode failed");
     }
@@ -2535,12 +2577,12 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_fatal("cpumsr: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
-            hype_svm_vcpu_handle_cpuid(ctx);
+        if (vmm_reason_is_cpuid(kind, info.reason)) {
+            vmm_handle_cpuid(kind, ctx);
             continue;
         }
-        if (info.reason == HYPE_SVM_EXITCODE_MSR) {
-            if (hype_svm_vcpu_handle_msr(ctx) != 0) {
+        if (vmm_reason_is_msr(kind, info.reason)) {
+            if (vmm_handle_msr(kind, ctx, info.reason) != 0) {
                 hype_fatal("cpumsr: unhandled guest MSR access (qual=0x%llx guest_rip=0x%llx)",
                            (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
             }
@@ -2550,7 +2592,7 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("cpumsr: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
@@ -2623,7 +2665,15 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_fatal("cpumsr: RDMSR(APIC_BASE) mismatch (got 0x%llx, expected 0x%llx)",
                        (unsigned long long)got_apic_base, (unsigned long long)apic_base_expected);
         }
-        if ((got_efer & HYPE_SVM_SAVE_EFER_SVME) == 0) {
+        /* EFER plausibility differs by backend: an SVM guest runs with SVME
+         * set (it's inside VMRUN); a VMX guest instead has LME|LMA (long mode)
+         * and never SVME. Check the bit that must be set for THIS backend. */
+        if (kind == HYPE_VMM_KIND_VMX) {
+            if ((got_efer & 0x400ULL) == 0) { /* LMA */
+                hype_fatal("cpumsr: RDMSR(EFER) implausible -- LMA bit not set (0x%llx)",
+                           (unsigned long long)got_efer);
+            }
+        } else if ((got_efer & HYPE_SVM_SAVE_EFER_SVME) == 0) {
             hype_fatal("cpumsr: RDMSR(EFER) implausible -- SVME bit not set (0x%llx)",
                        (unsigned long long)got_efer);
         }
