@@ -217,8 +217,12 @@ static void cfg_reset(void) {
     g_cfg[0x34 / 4] = 0x00000050u;                 /* capabilities pointer -> 0x50 */
     /* MSI capability @0x50: id=0x05, next=0x70, message-control (high16)=0x0001 (enabled). */
     g_cfg[0x50 / 4] = (0x0001u << 16) | (0x70u << 8) | 0x05u;
-    /* MSI-X capability @0x70: id=0x11, next=0x00, message-control=0x8003 (enabled + table size). */
-    g_cfg[0x70 / 4] = (0x8003u << 16) | (0x00u << 8) | 0x11u;
+    /* MSI-X capability @0x70: id=0x11, next=0x90, message-control=0x8003 (enabled + table size). */
+    g_cfg[0x70 / 4] = (0x8003u << 16) | (0x90u << 8) | 0x11u;
+    /* PM capability @0x90: id=0x01, next=0x00, PM caps (high16) irrelevant here. */
+    g_cfg[0x90 / 4] = (0x0000u << 16) | (0x00u << 8) | 0x01u;
+    /* PMCSR @0x94: PowerState (bits [1:0]) = 0 (D0) by default. */
+    g_cfg[0x94 / 4] = 0u;
 }
 
 static uint32_t cfg_rw_read(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
@@ -274,6 +278,28 @@ static void test_disable_interrupts(void) {
     g_cfg[0x04 / 4] &= ~(STATUS_CAPS << 16); /* drop the capability list */
     hype_host_pci_disable_interrupts(cfg_rw_read, cfg_rw_write, 0, 31, 0);
     CHECK_HEX("INTx set even without caps", 0x0400u, g_cfg[0x04 / 4] & 0x0400u);
+}
+
+static void test_wake_enable_mmio(void) {
+    uint16_t cmd;
+    /* Device left in D3 with Memory-Space + Bus-Master disabled (the dead-BAR
+     * state seen on the AMD FCH SATA on some boots). */
+    cfg_reset();
+    g_cfg[0x94 / 4] = 0x3u;             /* PMCSR PowerState = D3hot */
+    g_cfg[0x04 / 4] &= ~0x0006u;        /* clear Command MEM + BME */
+    cmd = hype_host_pci_wake_enable_mmio(cfg_rw_read, cfg_rw_write, 0, 31, 0);
+    CHECK_HEX("PowerState forced to D0", 0u, g_cfg[0x94 / 4] & 0x3u);
+    CHECK_HEX("Memory-Space enable set", 0x0002u, g_cfg[0x04 / 4] & 0x0002u);
+    CHECK_HEX("Bus-Master enable set", 0x0004u, g_cfg[0x04 / 4] & 0x0004u);
+    CHECK_HEX("status half zeroed on write", 0u, g_cfg[0x04 / 4] >> 16);
+    CHECK_HEX("returned command has MEM|BME", 0x0006u, cmd & 0x0006u);
+
+    /* No PM capability: MEM|BME still enabled, no crash. */
+    cfg_reset();
+    g_cfg[0x04 / 4] &= ~(STATUS_CAPS << 16); /* drop the capability list */
+    g_cfg[0x04 / 4] &= ~0x0006u;
+    (void)hype_host_pci_wake_enable_mmio(cfg_rw_read, cfg_rw_write, 0, 31, 0);
+    CHECK_HEX("MEM|BME set without PM cap", 0x0006u, g_cfg[0x04 / 4] & 0x0006u);
 }
 
 static void test_find_xhci(void) {
@@ -333,6 +359,7 @@ int main(void) {
     test_multifunction_storage();
     test_find_cap();
     test_disable_interrupts();
+    test_wake_enable_mmio();
     test_find_xhci();
 
     if (failures == 0) {

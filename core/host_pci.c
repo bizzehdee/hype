@@ -80,6 +80,31 @@ void hype_host_pci_disable_interrupts(hype_host_pci_read32_fn read32,
     }
 }
 
+uint16_t hype_host_pci_wake_enable_mmio(hype_host_pci_read32_fn read32,
+                                        hype_host_pci_write32_fn write32, uint8_t bus,
+                                        uint8_t dev, uint8_t func) {
+    uint8_t pm = hype_host_pci_find_cap(read32, bus, dev, func, HYPE_HOST_PCI_CAP_PM);
+    uint32_t cs, cmd;
+
+    /* PM capability present -> force PowerState D0 (PMCSR bits [1:0] in the dword
+     * at pm+4). A device left in D3hot ignores its BAR (reads 0xFFFFFFFF). */
+    if (pm != 0u) {
+        uint32_t pmcsr = read32(bus, dev, func, (uint8_t)(pm + 4u));
+        if ((pmcsr & 0x3u) != 0u) {
+            write32(bus, dev, func, (uint8_t)(pm + 4u), pmcsr & ~0x3u);
+        }
+    }
+
+    /* Enable Memory-Space decode (Command[1]) + Bus Master (Command[2]). Write
+     * the command half with the status half zeroed -- the RW1C status bits
+     * ignore a 0, so this can't clear a latched error (same as
+     * hype_host_pci_disable_interrupts). */
+    cs = read32(bus, dev, func, CFG_COMMAND_STATUS);
+    cmd = (cs & 0xFFFFu) | (1u << 1) | (1u << 2);
+    write32(bus, dev, func, CFG_COMMAND_STATUS, cmd);
+    return (uint16_t)(cmd & 0xFFFFu);
+}
+
 /* Assemble a memory BAR's base address from `read32`, handling the 64-bit BAR
  * form (type bits [2:1] == 10b: the high dword lives in the next BAR). Returns
  * 0 for an I/O-space BAR (bit0 set) -- storage register windows are always
