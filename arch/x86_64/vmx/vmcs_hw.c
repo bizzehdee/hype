@@ -302,8 +302,10 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * virtual-APIC/posted-interrupt setup to pass VM-entry control checks,
      * and none of the M2-M4-5 test guests exercise APICv -- keeping the
      * control set minimal removes VM-entry failure surface. */
-    uint32_t proc_ctls = hype_vmx_adjust_controls(
-        HYPE_VMX_PROCBASED_ACTIVATE_SECONDARY_CONTROLS | HYPE_VMX_PROCBASED_HLT_EXITING, proc_cap);
+    uint32_t proc_ctls = hype_vmx_adjust_controls(HYPE_VMX_PROCBASED_ACTIVATE_SECONDARY_CONTROLS |
+                                                      HYPE_VMX_PROCBASED_HLT_EXITING |
+                                                      HYPE_VMX_PROCBASED_UNCOND_IO_EXITING,
+                                                  proc_cap);
     /* Unrestricted guest (lets the guest run with CR0.PE=0 / CR0.PG=0, i.e.
      * real mode) architecturally REQUIRES EPT -- so both bits go together. */
     uint32_t proc2_ctls = hype_vmx_adjust_controls(

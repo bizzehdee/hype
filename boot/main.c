@@ -1797,11 +1797,7 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
      * that buffer as 0 -- hype's write isn't visible to the guest's later read.
      * The control field in the same page IS seen (the guest's poll completes),
      * so it's a narrow visibility/caching anomaly. Runs on SVM unchanged. */
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_serial_print("m4-4: skipped on VMX -- guest<->hype DMA-result visibility (see m5-1)\n");
-        return;
-    }
-    (void)ops;
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_m4_4_guest_code, sizeof(g_m4_4_guest_code));
     hype_guest_ram_zero(g_m4_4_guest_stack, sizeof(g_m4_4_guest_stack));
@@ -2345,14 +2341,7 @@ static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t ki
     hype_vmexit_info_t info;
     hype_ramfb_config_t decoded;
 
-    /* VMX-2: ported but skipped on VMX, same guest<->hype visibility issue as
-     * m4-4/m5-1 -- the guest's poll of the fw_cfg DMA completion never sees
-     * hype's control-field write, so it spins. Runs on SVM unchanged. */
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_serial_print("video-2: skipped on VMX -- guest<->hype fw_cfg-DMA visibility (see m5-1)\n");
-        return;
-    }
-    (void)ops;
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_video_2_guest_code, sizeof(g_video_2_guest_code));
     hype_guest_ram_zero(g_video_2_guest_stack, sizeof(g_video_2_guest_stack));

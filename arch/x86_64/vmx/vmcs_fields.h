@@ -52,6 +52,12 @@
  * it a guest that halts (every test guest's terminal instruction, and any
  * real OS idle loop) would never return control to hype. */
 #define HYPE_VMX_PROCBASED_HLT_EXITING (1u << 7)
+/* Unconditional I/O exiting (primary proc-based control, bit 24): every guest
+ * IN/OUT causes a VM-exit (reason 30) regardless of port -- without it (and
+ * without I/O bitmaps) guest port I/O executes straight on real hardware
+ * instead of trapping to hype's device models. Simpler than I/O bitmaps and
+ * correct for this project (hype intercepts all guest I/O). */
+#define HYPE_VMX_PROCBASED_UNCOND_IO_EXITING (1u << 24)
 /* Interrupt-window exiting (primary proc-based control, bit 2): VM-exit (reason
  * 7) as soon as the guest can accept an external interrupt (RFLAGS.IF=1, no
  * interrupt/NMI shadow) -- the VMX analogue of SVM's VINTR window, used to
