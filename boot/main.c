@@ -9525,6 +9525,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * hype can drive the controller); device enumeration (control transfers) +
      * mass-storage/HID + the USB debug-log sink build on top. */
     {
+        /* Give the driver the calibrated TSC so it can honor real USB timing
+         * (post-reset settle, SET_ADDRESS recovery) -- critical on real HW where
+         * High-Speed devices NAK a too-early Address Device. */
+        hype_xhci_set_tsc_hz(g_fw_1_host_tsc_hz);
         /* USB-8 (#231): real HW has MULTIPLE xHCI controllers (chipset + add-in),
          * multiple ports each, and the boot stick may be on ANY of them (behind a
          * hub or not). Scan EVERY xHCI controller via the resumable find_xhci_from,
