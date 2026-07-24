@@ -175,8 +175,15 @@ int hype_xhci_enable_slot(hype_xhci_ctrl_t *c, unsigned int *out_slot) {
     uint32_t cmd[4], evt[4];
     if (!c->inited) return -1;
     hype_xhci_trb_enable_slot(cmd, (int)g_cmd_cyc);
-    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
-    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    if (cmd_submit_wait(c, cmd, evt) != 0) {
+        hype_debug_print("host-xhci:     Enable Slot: no command completion event (timeout)\n");
+        return -1;
+    }
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
+        hype_debug_print("host-xhci:     Enable Slot: completion code %u\n",
+                         hype_xhci_event_cc(evt));
+        return -1;
+    }
     if (out_slot) *out_slot = hype_xhci_event_slot_id(evt);
     return 0;
 }
@@ -236,8 +243,21 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
     put_le64(g_dcbaa + slot * 8u, phys(dctx));
 
     hype_xhci_trb_address_device(cmd, phys(g_input_ctx), slot, 0, (int)g_cmd_cyc);
-    if (cmd_submit_wait(c, cmd, evt) != 0) { dev_free(slot); return -1; }
-    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) { dev_free(slot); return -1; }
+    if (cmd_submit_wait(c, cmd, evt) != 0) {
+        hype_debug_print("host-xhci:     Address Device slot %u: no completion event (timeout)\n",
+                         slot);
+        dev_free(slot);
+        return -1;
+    }
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
+        /* Completion codes worth knowing here: 5=TRB Error, 11=Context State,
+         * 17=Parameter Error, 4=USB Transaction Error. */
+        hype_debug_print("host-xhci:     Address Device slot %u: completion code %u "
+                         "(ctx_size=%uB speed=%u route=0x%05x)\n", slot,
+                         hype_xhci_event_cc(evt), c->ctx_size, path->speed, path->route);
+        dev_free(slot);
+        return -1;
+    }
     return 0;
 }
 
@@ -501,7 +521,20 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
     wr32(bar, op + HYPE_XHCI_OP_CONFIG, max_slots);
 
     /* Scratchpad buffers, if the controller wants any: DCBAA[0] points at an
-     * array of page pointers, each a hype .bss page. */
+     * array of page pointers, each a hype .bss page. Real HW (unlike qemu-xhci,
+     * which asks for none) usually requires these -- if we under-provide, the
+     * controller DMAs to zero/garbage scratchpad slots and Address Device fails
+     * with no obvious reason, so log the count + PAGESIZE and flag a clamp. */
+    {
+        uint32_t pagesize = rd32(bar, op + HYPE_XHCI_OP_PAGESIZE);
+        hype_debug_print("host-xhci: caps -- slots=%u ports=%u ctx=%uB scratchpads=%u pagesize=0x%04x\n",
+                         max_slots, max_ports, out->ctx_size, nscratch, pagesize & 0xFFFFu);
+        if (nscratch > MAX_SCRATCH) {
+            hype_debug_print("host-xhci: WARNING -- controller wants %u scratchpad buffers but "
+                             "hype provides only %u; Address Device will likely FAIL\n",
+                             nscratch, MAX_SCRATCH);
+        }
+    }
     zero(g_dcbaa, XPAGE);
     if (nscratch > 0u) {
         if (nscratch > MAX_SCRATCH) nscratch = MAX_SCRATCH;

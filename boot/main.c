@@ -9461,7 +9461,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 hype_paging_load(g_pml4);
             }
             if (hype_nvme_host_init(hn.bar_phys) != 0) {
-                hype_serial_print("host-nvme: controller init failed\n");
+                hype_debug_print("host-nvme: controller at %02x:%02x.%x init FAILED\n",
+                                 (unsigned)hn.bus, (unsigned)hn.dev, (unsigned)hn.func);
             } else if (hype_nvme_host_read(hn.bar_phys, 0u, 1u, g_nvme_probe) == 0) {
                 static uint8_t g_nvme_lba1[512] __attribute__((aligned(4096)));
                 char nvme_model[41];
@@ -9487,7 +9488,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                g_nvme_probe, g_nvme_lba1);
                 }
             } else {
-                hype_serial_print("host-nvme: LBA0 read FAILED\n");
+                hype_debug_print("host-nvme: controller at %02x:%02x.%x LBA0 read FAILED\n",
+                                 (unsigned)hn.bus, (unsigned)hn.dev, (unsigned)hn.func);
             }
 #if HYPE_NVME_WRITE_SELFTEST
             {
@@ -9757,9 +9759,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              hs.bus, hs.dev, hs.func);
             sp = hype_ahci_host_find_sata_port(hs.bar_phys);
             if (sp < 0) {
-                hype_serial_print("host-ahci: AHCI present but no SATA disk port\n");
+                hype_debug_print("host-ahci: controller at %02x:%02x.%x (bar 0x%llx) present but "
+                                 "no active SATA disk port found\n", (unsigned)hs.bus,
+                                 (unsigned)hs.dev, (unsigned)hs.func,
+                                 (unsigned long long)hs.bar_phys);
             } else if (hype_ahci_host_init(hs.bar_phys, (unsigned)sp) != 0) {
-                hype_serial_print("host-ahci: port init failed\n");
+                hype_debug_print("host-ahci: controller at %02x:%02x.%x port %d init FAILED\n",
+                                 (unsigned)hs.bus, (unsigned)hs.dev, (unsigned)hs.func, sp);
             } else {
                 g_hostdisk_abar = hs.bar_phys;
                 g_hostdisk_port = (unsigned)sp;
