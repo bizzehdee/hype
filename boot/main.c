@@ -115,6 +115,15 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #define HYPE_229_RO_SATA 0
 #endif
 
+/* #229 isolation microtest: instead of running a guest, have the AP issue a few
+ * hype_ahci_host_read()s on the host SATA disk directly, timing each, then park.
+ * Removes OVMF/virtio-blk/capacity confounds -- a clean yes/no on whether host
+ * AHCI reads complete cross-core (from the AP) as they do on the BSP. Read-only,
+ * OFF by default. Best paired with -DHYPE_RUN_TWO_VMS=0 (only AP1 used). */
+#ifndef HYPE_229_AP_AHCI_PROBE
+#define HYPE_229_AP_AHCI_PROBE 0
+#endif
+
 /* M10-6a (#227): after a confirmed physical target attaches as a guest's
  * virtio-blk backend, round-trip a known pattern through the guest-facing
  * hype_blk_backend to a SCRATCH LBA (write, read back, verify) to prove guest
@@ -765,6 +774,34 @@ static void fw_1_ap_main(void *arg) {
     hype_svm_enable_on((uint64_t)(uintptr_t)g_ap_hsave[vm_idx]); /* faults never return */
     g_fw_1_ap_svm_ok = 1;
     g_hype_ap_c_alive = 1;
+#if HYPE_229_AP_AHCI_PROBE
+    /* #229 isolation microtest: does hype_ahci_host_read complete when issued
+     * from THIS AP core (vs the BSP, which reads fine at setup)? Read a few LBAs,
+     * timing each, then PARK -- no guest, so nothing (OVMF, virtio-blk, the ~1TB
+     * capacity) confounds the answer. Read-only. hype_ahci_host_read's own
+     * ahci-rd[] enter/issuing/done trace shows if a read hangs mid-flight. */
+    if (g_hostdisk_present) {
+        static uint8_t ap_probe_buf[512] __attribute__((aligned(4096)));
+        uint64_t hz = g_vms[vm_idx].host_tsc_hz;
+        unsigned k;
+        hype_debug_print("#229 AP-AHCI-PROBE: apic_id=%u reads SATA LBA0..7 (abar=0x%llx port=%u) "
+                         "-- BSP reads completed at setup; do they on the AP?\n",
+                         vm_idx + 1u, (unsigned long long)g_hostdisk_abar, g_hostdisk_port);
+        for (k = 0; k < 8u; k++) {
+            uint64_t t0 = hype_rdtsc();
+            int rc = hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, (uint64_t)k, 1u,
+                                         ap_probe_buf);
+            uint64_t dt = hype_rdtsc() - t0;
+            uint64_t us = (hz != 0u) ? (dt * 1000000ull / hz) : 0u;
+            hype_debug_print("#229 AP-AHCI-PROBE[%u]: lba=%u rc=%d elapsed=%lluus lastbytes=%02x%02x\n",
+                             k, k, rc, (unsigned long long)us,
+                             (unsigned)ap_probe_buf[510], (unsigned)ap_probe_buf[511]);
+        }
+        hype_debug_print("#229 AP-AHCI-PROBE: done -- AP parked (no guest). rc=0 fast => AHCI "
+                         "works cross-core (hang is OVMF/virtio); rc=-1 or ~50ms => #229 real on HW\n");
+        for (;;) { __asm__ volatile("cli; hlt"); }
+    }
+#endif
 #if HYPE_RUN_GUEST_ON_AP
     /* inc 5: give this core a periodic timer so the guest gets forced exits
      * (timer delivery), else it soft-locks in wait loops (HW). Software-enable
