@@ -787,6 +787,10 @@ static void fw_1_ap_main(void *arg) {
         hype_debug_print("#229 AP-AHCI-PROBE: apic_id=%u reads SATA LBA0..7 (abar=0x%llx port=%u) "
                          "-- BSP reads completed at setup; do they on the AP?\n",
                          vm_idx + 1u, (unsigned long long)g_hostdisk_abar, g_hostdisk_port);
+        /* Flush now (from the AP -- proven to work, guest logs streamed from an AP
+         * before): captures everything up to here in case a read hangs hard. No
+         * guest runs in this build, so nothing else drives the log flush. */
+        usb_log_flush();
         for (k = 0; k < 8u; k++) {
             uint64_t t0 = hype_rdtsc();
             int rc = hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, (uint64_t)k, 1u,
@@ -796,9 +800,11 @@ static void fw_1_ap_main(void *arg) {
             hype_debug_print("#229 AP-AHCI-PROBE[%u]: lba=%u rc=%d elapsed=%lluus lastbytes=%02x%02x\n",
                              k, k, rc, (unsigned long long)us,
                              (unsigned)ap_probe_buf[510], (unsigned)ap_probe_buf[511]);
+            usb_log_flush(); /* flush each result so a later hang can't lose it */
         }
         hype_debug_print("#229 AP-AHCI-PROBE: done -- AP parked (no guest). rc=0 fast => AHCI "
                          "works cross-core (hang is OVMF/virtio); rc=-1 or ~50ms => #229 real on HW\n");
+        usb_log_flush();
         for (;;) { __asm__ volatile("cli; hlt"); }
     }
 #endif
