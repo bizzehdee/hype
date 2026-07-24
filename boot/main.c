@@ -104,6 +104,17 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #define HYPE_229_RO_PHYS 0
 #endif
 
+/* #229 SATA counterpart: attach the REAL SATA disk (host AHCI) as vm0's guest
+ * vda, READ-ONLY, bypassing the destructive-write confirm entirely (reads are
+ * non-destructive, so no serial-match/confirm is needed -- and this MUST stay
+ * read-only: the laptop's SATA disk is its real OS disk). Exercises guest-on-AP
+ * AHCI reads to see whether they flake like the NVMe path (#229). The write fn
+ * is force-nulled so hype_blk_backend_write rejects any guest write. OFF by
+ * default; the only physical medium hype has on the laptop (it has no NVMe). */
+#ifndef HYPE_229_RO_SATA
+#define HYPE_229_RO_SATA 0
+#endif
+
 /* M10-6a (#227): after a confirmed physical target attaches as a guest's
  * virtio-blk backend, round-trip a known pattern through the guest-facing
  * hype_blk_backend to a SCRATCH LBA (write, read back, verify) to prove guest
@@ -524,6 +535,17 @@ static int g_hostnvme_present;
 static uint64_t g_hostnvme_bar;
 static uint64_t g_hostnvme_total_sectors;
 static char g_hostnvme_serial[21];
+
+/* Host SATA disk (AHCI): ABAR/port bound at probe (also used by the GLADDER-10
+ * streaming reader), plus presence + capacity for the #229 read-only SATA guest
+ * repro. Declared here so fw_1_setup_virtio_blk (below) can see them. */
+static uint64_t g_hostdisk_abar;
+static unsigned g_hostdisk_port;
+static int g_hostdisk_present;
+static uint64_t g_hostdisk_total_sectors;
+#if HYPE_229_RO_SATA
+static hype_blk_phys_ahci_t g_hostdisk_ahci; /* backend hw ctx (outlives the VM) */
+#endif
 
 static int term_streq(const char *a, const char *b) {
     unsigned i = 0;
@@ -5406,6 +5428,30 @@ static void fw_1_vblk_write_selftest(hype_fw_vm_t *vm) {
 
 static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
     uint8_t *config;
+#if HYPE_229_RO_SATA
+    /* #229 SATA repro (laptop has no NVMe): attach the REAL SATA disk as this
+     * guest's vda, READ-ONLY, no confirm (reads are non-destructive; the write
+     * fn is force-nulled so hype_blk_backend_write rejects any guest write). Only
+     * the first VM claims it. Exercises guest-on-AP AHCI reads to check whether
+     * they flake like the NVMe path (#229). */
+    if (g_hostdisk_present && g_phys_backend_claimed_vm < 0) {
+        hype_blk_phys_ahci_init(&vm->vblk_phys, &g_hostdisk_ahci, &vm->vblk_be,
+                                g_hostdisk_abar, g_hostdisk_port, g_hostdisk_total_sectors);
+        vm->vblk_be.write = 0; /* enforce read-only -- laptop's real OS disk */
+        vm->vblk_is_physical = 1;
+        g_phys_backend_claimed_vm = (int)(vm - &g_vms[0]);
+        hype_virtio_blk_reset(&vm->vblk, g_hostdisk_total_sectors);
+        hype_debug_print("virtio-blk[vm %d]: READ-ONLY PHYSICAL SATA backend #229 "
+                         "(abar 0x%llx port %u, %llu sectors) -- writes rejected\n",
+                         (int)(vm - &g_vms[0]), (unsigned long long)g_hostdisk_abar,
+                         g_hostdisk_port, (unsigned long long)g_hostdisk_total_sectors);
+        hype_debug_print("#229dbg SATA setup: CR3=0x%llx g_pml4=0x%llx g_ap_cr3=0x%llx abar=0x%llx\n",
+                         (unsigned long long)hype_dbg_read_cr3(),
+                         (unsigned long long)(uintptr_t)g_pml4, (unsigned long long)g_ap_cr3,
+                         (unsigned long long)g_hostdisk_abar);
+        goto vblk_pci;
+    }
+#endif
     if (fw_1_vblk_use_physical(vm)) {
         /* CONFIRMED `physical:` target -> writable NVMe scratch backend. Guest
          * writes to /dev/vda now land on the real (QEMU scratch) disk. */
@@ -8396,11 +8442,9 @@ static void hype_spurious_irq15_isr(const hype_isr_frame_t *frame) {
     }
 }
 
-/* GLADDER-10 streaming: the ABAR + port the host AHCI driver reads through,
- * bound once post-EBS. hostdisk_read() adapts hype_ahci_host_read() to the
- * (ctx, lba, count, dst) callback that core/gpt.c and core/iso_stream.c expect. */
-static uint64_t g_hostdisk_abar;
-static unsigned g_hostdisk_port;
+/* GLADDER-10 streaming: hostdisk_read() adapts hype_ahci_host_read() to the
+ * (ctx, lba, count, dst) callback that core/gpt.c and core/iso_stream.c expect.
+ * The ABAR/port it reads are declared up with the other host-device globals. */
 static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
     return hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, dst);
@@ -9924,6 +9968,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         uint8_t guid[16];
                         int have_guid = 0;
                         hype_ahci_host_parse_identify(g_hostdisk_id, &di);
+                        /* #229 SATA repro: record presence + capacity so this disk
+                         * can be attached as a read-only guest vda. */
+                        g_hostdisk_present = 1;
+                        g_hostdisk_total_sectors = di.total_sectors;
                         hype_debug_print("host-disk: serial='%s' model='%s' sectors=%llu (%llu MiB)\n",
                                          di.serial, di.model,
                                          (unsigned long long)di.total_sectors,
