@@ -46,6 +46,28 @@ unsigned int hype_paging_map_mmio_1gb(hype_pte_t *pml4, hype_pte_t *pdpt, hype_p
     return pml4_idx;
 }
 
+void hype_paging_mark_region_wc(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                                uint64_t base, uint64_t size, unsigned int gb_mapped) {
+    uint64_t first, last, p;
+
+    if (size == 0) {
+        return;
+    }
+    first = base & ~(HYPE_PAGING_2MB - 1ULL);
+    last = (base + size - 1ULL) & ~(HYPE_PAGING_2MB - 1ULL);
+    for (p = first; p <= last; p += HYPE_PAGING_2MB) {
+        unsigned int gb = (unsigned int)(p / HYPE_PAGING_1GB);
+        unsigned int idx = (unsigned int)((p % HYPE_PAGING_1GB) / HYPE_PAGING_2MB);
+        if (gb >= gb_mapped) {
+            break;
+        }
+        /* Only a present 2MB page gets WC; leave holes untouched. */
+        if (pd_tables[gb][idx] & HYPE_PAGING_PRESENT) {
+            pd_tables[gb][idx] = (pd_tables[gb][idx] & ~HYPE_PAGING_PCD) | HYPE_PAGING_PWT;
+        }
+    }
+}
+
 unsigned int hype_paging_map_region_2mb(hype_pte_t *pdpt,
                                          hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                                          uint64_t phys_base, uint64_t size) {
