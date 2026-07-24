@@ -88,6 +88,28 @@ static uint32_t cfg_xhci(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
     }
 }
 
+/* Two xHCI controllers on different buses (chipset + add-in), to exercise the
+ * resumable find_xhci_from enumeration. Both are single-function. */
+static uint32_t cfg_two_xhci(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
+    if (bus == 0 && dev == 0x14 && func == 0) {
+        switch (off) {
+            case 0x00: return 0x1e318086u;
+            case 0x08: return 0x0c033000u;
+            case 0x10: return 0xE0000004u; case 0x14: return 0x00000003u;
+            default:   return 0x00000000u;
+        }
+    }
+    if (bus == 3 && dev == 0 && func == 0) {
+        switch (off) {
+            case 0x00: return 0x43ee1022u;           /* AMD xHCI */
+            case 0x08: return 0x0c033000u;
+            case 0x10: return 0xFC8A0004u; case 0x14: return 0x00000000u;
+            default:   return 0x00000000u;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
 /* A USB controller that is NOT xHCI (EHCI, prog-if 0x20) -- must be skipped. */
 static uint32_t cfg_ehci(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
     if (bus != 0 || dev != 0x1d || func != 0) {
@@ -264,6 +286,22 @@ static void test_find_xhci(void) {
     CHECK_HEX("EHCI not matched as xHCI", 0, hype_host_pci_find_xhci(cfg_ehci, 0, &x));
     /* no USB at all */
     CHECK_HEX("no xHCI in storage-only space", 0, hype_host_pci_find_xhci(cfg_ahci, 0, &x));
+
+    /* Enumerate ALL xHCI controllers by looping find_xhci_from (buses 0..3). */
+    {
+        uint32_t cur = 0, bdf = 0;
+        int n = 0, saw_intel = 0, saw_amd = 0;
+        while (hype_host_pci_find_xhci_from(cfg_two_xhci, 3, cur, &x, &bdf)) {
+            if (x.vendor_id == 0x8086) saw_intel = 1;
+            if (x.vendor_id == 0x1022) saw_amd = 1;
+            n++;
+            cur = bdf + 1u;
+            if (n > 8) break; /* guard */
+        }
+        CHECK_HEX("found both xHCI controllers", 2, n);
+        CHECK_HEX("saw intel xHCI", 1, saw_intel);
+        CHECK_HEX("saw amd xHCI", 1, saw_amd);
+    }
 }
 
 static void test_find_all_storage(void) {
