@@ -8662,6 +8662,37 @@ static void usb_log_flush(void) {
     if (g_usb_log_ready) (void)hype_log_sink_flush(&g_usb_log);
 }
 
+/* Diagnostic: log EVERY PCI function present (bus:dev.func, vendor/device,
+ * class/subclass/prog-if). A full census -- so a real-HW log shows exactly what
+ * hardware the machine exposes (e.g. whether an NVMe M.2 is a standard NVMe-class
+ * device, a RAID/RST-remapped one, or absent). Read-only config-space reads. */
+static void pci_dump_all(void) {
+    unsigned bus, dev, func;
+    unsigned count = 0;
+    hype_debug_print("pci-dump: full device census (buses 0-255)\n");
+    for (bus = 0; bus < 256u; bus++) {
+        for (dev = 0; dev < 32u; dev++) {
+            unsigned last_func = 0u;
+            for (func = 0; func <= last_func; func++) {
+                uint32_t vd = hype_host_pci_read32_hw((uint8_t)bus, (uint8_t)dev, (uint8_t)func, 0x00u);
+                uint32_t cls;
+                if ((vd & 0xFFFFu) == 0xFFFFu) continue; /* no function here */
+                if (func == 0u) {
+                    uint32_t hdr = hype_host_pci_read32_hw((uint8_t)bus, (uint8_t)dev, 0u, 0x0Cu);
+                    if (((hdr >> 16) & 0x80u) != 0u) last_func = 7u; /* multi-function */
+                }
+                cls = hype_host_pci_read32_hw((uint8_t)bus, (uint8_t)dev, (uint8_t)func, 0x08u);
+                hype_debug_print("pci-dump: %02x:%02x.%x vid=%04x did=%04x class=%02x sub=%02x pi=%02x\n",
+                                 bus, dev, func, (unsigned)(vd & 0xFFFFu), (unsigned)((vd >> 16) & 0xFFFFu),
+                                 (unsigned)((cls >> 24) & 0xFFu), (unsigned)((cls >> 16) & 0xFFu),
+                                 (unsigned)((cls >> 8) & 0xFFu));
+                count++;
+            }
+        }
+    }
+    hype_debug_print("pci-dump: %u PCI functions total\n", count);
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -9454,6 +9485,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * the NVMe counterpart to the AHCI LBA0 probe below. Diagnostic; the GPT/
      * FAT/streaming stack still runs over AHCI in this harness (wiring it over
      * NVMe is a follow-on integration). */
+    /* Diagnostic census FIRST: log every PCI function so the real-HW log shows
+     * exactly what the machine exposes before the per-class probes run. */
+    pci_dump_all();
     {
         static uint8_t g_nvme_probe[512] __attribute__((aligned(4096)));
         hype_host_storage_t hn;
@@ -9786,6 +9820,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  "no active SATA disk port found\n", (unsigned)hs.bus,
                                  (unsigned)hs.dev, (unsigned)hs.func,
                                  (unsigned long long)hs.bar_phys);
+                /* Real HW: dump every implemented port so we can see WHY (DET/SIG). */
+                hype_ahci_host_dump_ports(hs.bar_phys);
             } else if (hype_ahci_host_init(hs.bar_phys, (unsigned)sp) != 0) {
                 hype_debug_print("host-ahci: controller at %02x:%02x.%x port %d init FAILED\n",
                                  (unsigned)hs.bus, (unsigned)hs.dev, (unsigned)hs.func, sp);

@@ -97,6 +97,14 @@ void hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t 
 int hype_ahci_host_find_sata_port(uint64_t abar_phys);
 
 /*
+ * Diagnostic: log CAP + PI and, for each implemented port, PxSSTS (DET/SPD/IPM),
+ * PxSIG, PxCMD, PxTFD. Read-only. Called when find_sata_port finds nothing so a
+ * real-HW log shows WHY (e.g. DET != 3 -> no PHY / disk asleep, or a signature
+ * find_sata_port doesn't match).
+ */
+void hype_ahci_host_dump_ports(uint64_t abar_phys);
+
+/*
  * Prepares `port` of the HBA at `abar_phys` for hype-driven I/O: stops the port,
  * points PxCLB/PxFB at hype's own command list / received-FIS buffers, clears
  * sticky errors, and restarts the engines. Call ONCE before a run of reads (the
