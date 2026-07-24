@@ -1434,6 +1434,8 @@ static hype_vcpu_ctx_t *vmm_create_long_mode(hype_vmm_kind_t kind, uint64_t entr
 static int vmm_reason_is_cpuid(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_reason_is_msr(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_reason_is_hlt(hype_vmm_kind_t kind, uint64_t reason);
+static int vmm_handle_fw_cfg_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
+                                  const hype_gpa_map_t *dma_map);
 static int vmm_reason_is_ioio(hype_vmm_kind_t kind, uint64_t reason);
 static void vmm_handle_cpuid(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx);
 static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason);
@@ -1789,10 +1791,17 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
     hype_acpi_config_t cfg;
     uint32_t loader_entries;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("m4-4: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+    /* VMX-2: ported to the vmm_* shims, but skipped on VMX pending the same
+     * guest<->hype memory-coherency fix as m5-1: the fw_cfg DMA writes the
+     * result into guest RAM correctly (host-verified), but the GUEST then reads
+     * that buffer as 0 -- hype's write isn't visible to the guest's later read.
+     * The control field in the same page IS seen (the guest's poll completes),
+     * so it's a narrow visibility/caching anomaly. Runs on SVM unchanged. */
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_serial_print("m4-4: skipped on VMX -- guest<->hype DMA-result visibility (see m5-1)\n");
         return;
     }
+    (void)ops;
 
     hype_guest_ram_zero(g_m4_4_guest_code, sizeof(g_m4_4_guest_code));
     hype_guest_ram_zero(g_m4_4_guest_stack, sizeof(g_m4_4_guest_stack));
@@ -1879,7 +1888,7 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
     /* No NPT for this test -- everything here is ordinary port I/O
      * plus plain guest-RAM reads/writes, no MMIO-trapped device
      * involved (unlike M4-3's pflash test). */
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
     if (ctx == 0) {
         hype_fatal("m4-4: vcpu_create_long_mode failed");
     }
@@ -1889,8 +1898,8 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
             hype_fatal("m4-4: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
-            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_m4_4_fw_cfg, 0) != 0) {
+        if (vmm_reason_is_ioio(kind, info.reason)) {
+            if (vmm_handle_fw_cfg_ioio(kind, ctx, &g_m4_4_fw_cfg, 0) != 0) {
                 hype_fatal("m4-4: unhandled guest port I/O (qual=0x%llx guest_rip=0x%llx)",
                            (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
             }
@@ -1900,7 +1909,7 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("m4-4: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
@@ -2336,10 +2345,14 @@ static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t ki
     hype_vmexit_info_t info;
     hype_ramfb_config_t decoded;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("video-2: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
+    /* VMX-2: ported but skipped on VMX, same guest<->hype visibility issue as
+     * m4-4/m5-1 -- the guest's poll of the fw_cfg DMA completion never sees
+     * hype's control-field write, so it spins. Runs on SVM unchanged. */
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_serial_print("video-2: skipped on VMX -- guest<->hype fw_cfg-DMA visibility (see m5-1)\n");
         return;
     }
+    (void)ops;
 
     hype_guest_ram_zero(g_video_2_guest_code, sizeof(g_video_2_guest_code));
     hype_guest_ram_zero(g_video_2_guest_stack, sizeof(g_video_2_guest_stack));
@@ -2401,7 +2414,7 @@ static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t ki
                       (unsigned long long)entry_rip, (unsigned long long)access_struct_phys,
                       (unsigned long long)config_buf_phys, ramfb_key);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
     if (ctx == 0) {
         hype_fatal("video-2: vcpu_create_long_mode failed");
     }
@@ -2411,8 +2424,8 @@ static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t ki
             hype_fatal("video-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
-            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_video_2_fw_cfg, 0) != 0) {
+        if (vmm_reason_is_ioio(kind, info.reason)) {
+            if (vmm_handle_fw_cfg_ioio(kind, ctx, &g_video_2_fw_cfg, 0) != 0) {
                 hype_fatal("video-2: unhandled guest port I/O (qual=0x%llx guest_rip=0x%llx)",
                            (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
             }
@@ -2422,7 +2435,7 @@ static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t ki
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("video-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
@@ -2566,6 +2579,13 @@ static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t r
         return hype_vmx_vcpu_handle_msr(ctx, reason == HYPE_VMX_EXIT_REASON_WRMSR);
     }
     return hype_svm_vcpu_handle_msr(ctx);
+}
+static int vmm_handle_fw_cfg_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
+                                  const hype_gpa_map_t *dma_map) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_fw_cfg_ioio(ctx, fw, dma_map);
+    }
+    return hype_svm_vcpu_handle_fw_cfg_ioio(ctx, fw, dma_map);
 }
 static int vmm_reason_is_ioio(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_IO_INSTRUCTION)

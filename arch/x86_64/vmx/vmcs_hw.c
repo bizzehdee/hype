@@ -3,9 +3,11 @@
 
 #include "../../../core/blk_backend.h"
 #include "../../../core/fatal.h"
+#include "../../../core/guest_mem.h"
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
 #include "../../../devices/bochs_vbe.h"
+#include "../../../devices/fw_cfg.h"
 #include "../../../devices/pci.h"
 #include "../../../devices/virtio_blk.h"
 #include "../../../devices/pflash.h"
@@ -960,6 +962,96 @@ int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
     }
 
     vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
+    return 0;
+}
+
+/* Guest-DMA address translation, VMX flavour: dma_map == 0 means the guest is
+ * identity-mapped (guest-physical == host), the common case for the test guests;
+ * otherwise bounds-check + translate via the map. Mirrors svm_vcpu.c's
+ * guest_dma_xlate without exposing that static helper. */
+static uint64_t vmx_dma_xlate(const hype_gpa_map_t *map, uint64_t gpa, uint64_t len) {
+    if (map == 0) {
+        return gpa;
+    }
+    return hype_gpa_to_host(map, gpa, len);
+}
+
+/*
+ * VMX fw_cfg IOIO handler (VMX-2): mirror of hype_svm_vcpu_handle_fw_cfg_ioio,
+ * DMA-interface subset (the M4-4 / video-2 test guests use the DMA path, not
+ * the classic string-read port). 0x510 selects a key; 0x511 reads one data
+ * byte; 0x514 latches the DMA address high dword; 0x518 latches the low dword,
+ * reads the 16-byte DMA access struct from guest RAM, executes the transfer
+ * against guest RAM, and writes the big-endian result back into the struct's
+ * control field. Reuses the vendor-neutral hype_fw_cfg_dma_* helpers. String
+ * INS/OUTS to fw_cfg is rejected (not needed by these tests).
+ */
+int hype_vmx_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
+                                     const hype_gpa_map_t *dma_map) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok;
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    uint16_t port = (uint16_t)((qual >> 16) & 0xFFFFu);
+    int is_in = (int)((qual >> 3) & 1u);
+    int is_string = (int)((qual >> 4) & 1u);
+    uint64_t rax = real->gprs[0];
+
+    if (is_string) {
+        return -1;
+    }
+
+    if (port == 0x510u) {
+        if (is_in) {
+            return -1;
+        }
+        hype_fw_cfg_select(fw, (uint16_t)(rax & 0xFFFFu));
+    } else if (port == 0x511u) {
+        if (!is_in) {
+            return -1;
+        }
+        real->gprs[0] = (rax & ~0xFFULL) | hype_fw_cfg_read_byte(fw);
+    } else if (port == 0x514u) {
+        if (is_in) {
+            return -1;
+        }
+        hype_fw_cfg_dma_addr_high(fw, (uint32_t)(rax & 0xFFFFFFFFu));
+    } else if (port == 0x518u) {
+        uint64_t access_phys, access_host;
+        uint8_t raw[16];
+        hype_fw_cfg_dma_op_t op;
+        uint8_t *control_bytes;
+        uint32_t result;
+        int i;
+
+        if (is_in) {
+            return -1;
+        }
+        access_phys = hype_fw_cfg_dma_addr_low(fw, (uint32_t)(rax & 0xFFFFFFFFu));
+        access_host = vmx_dma_xlate(dma_map, access_phys, 16);
+        if (access_host == 0) {
+            return -1;
+        }
+        for (i = 0; i < 16; i++) {
+            raw[i] = ((const uint8_t *)(uintptr_t)access_host)[i];
+        }
+        hype_fw_cfg_dma_decode(raw, &op);
+        if (op.length != 0) {
+            uint64_t data_host = vmx_dma_xlate(dma_map, op.address, op.length);
+            result = (data_host == 0) ? HYPE_FW_CFG_DMA_CTL_ERROR
+                                      : hype_fw_cfg_dma_execute(fw, &op, (uint8_t *)(uintptr_t)data_host);
+        } else {
+            result = hype_fw_cfg_dma_execute(fw, &op, 0);
+        }
+        control_bytes = (uint8_t *)(uintptr_t)access_host;
+        control_bytes[0] = (uint8_t)(result >> 24);
+        control_bytes[1] = (uint8_t)(result >> 16);
+        control_bytes[2] = (uint8_t)(result >> 8);
+        control_bytes[3] = (uint8_t)result;
+    } else {
+        return -1;
+    }
+
+    vmx_advance_rip();
     return 0;
 }
 
