@@ -75,5 +75,10 @@ void hype_debug_print(const char *fmt, ...);
  * hype_fatal() flushes unconditionally, so panics are never deferred away. */
 void hype_debug_set_gop_deferred(int deferred);
 void hype_debug_flush_gop(void);
+/* Rendering isolation: disable (0) hype_debug_print's tee to the GOP framebuffer
+ * once the guest loop's terminal renderer owns the screen, so relayed VM serial +
+ * diagnostics go only to serial+logbuf and never bleed onto the focused view.
+ * Re-enable (1) is unused today (boot starts enabled). Panics paint GOP directly. */
+void hype_debug_set_gop_enabled(int enabled);
 
 #endif /* HYPE_FATAL_H */
