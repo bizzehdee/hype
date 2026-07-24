@@ -282,6 +282,11 @@ unsigned int hype_xhci_ep_dci(unsigned int ep_addr);
 
 /* --- hardware bring-up (coverage-exempt shim core/xhci_hw.c; real MMIO). --- */
 
+/* Provide the calibrated host-TSC frequency so the driver can honor real USB
+ * timing (post-reset settle, SET_ADDRESS recovery). Optional -- without it the
+ * driver falls back to a coarse busy-spin. Call once after TSC calibration. */
+void hype_xhci_set_tsc_hz(uint64_t hz);
+
 /* Captured controller geometry + register bases, filled by hype_xhci_host_init. */
 typedef struct {
     uint64_t bar;            /* xHCI MMIO BAR0 (identity-mapped) */

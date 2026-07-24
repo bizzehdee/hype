@@ -95,6 +95,28 @@ static int wait_bits(volatile uint8_t *bar, uint32_t off, uint32_t mask, uint32_
 }
 static void short_delay(void) { volatile unsigned s = 200000u; while (s-- != 0u) { } }
 
+/* Real-time millisecond delay for USB timing (post-reset settle, the 2 ms
+ * SET_ADDRESS recovery, etc.). Uses the host TSC when its frequency has been
+ * provided (hype_xhci_set_tsc_hz, called from boot once TSC is calibrated);
+ * falls back to a coarse busy-spin otherwise. USB timing only needs a floor, so
+ * over-delaying is harmless -- correctness over precision. */
+static uint64_t g_tsc_hz;
+void hype_xhci_set_tsc_hz(uint64_t hz) { g_tsc_hz = hz; }
+static inline uint64_t rdtsc_now(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+static void delay_ms(unsigned int ms) {
+    if (g_tsc_hz != 0u) {
+        uint64_t end = rdtsc_now() + (g_tsc_hz / 1000ull) * (uint64_t)ms;
+        while (rdtsc_now() < end) { }
+    } else {
+        unsigned int k;
+        for (k = 0; k < ms; k++) short_delay(); /* coarse fallback */
+    }
+}
+
 /* --- command + event ring state (single controller) --- */
 static unsigned int g_cmd_enq;   /* command-ring enqueue index */
 static unsigned int g_cmd_cyc;   /* command-ring producer cycle bit */
@@ -242,22 +264,35 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
     /* DCBAA[slot] -> this device's output Device Context. */
     put_le64(g_dcbaa + slot * 8u, phys(dctx));
 
-    hype_xhci_trb_address_device(cmd, phys(g_input_ctx), slot, 0, (int)g_cmd_cyc);
-    if (cmd_submit_wait(c, cmd, evt) != 0) {
-        hype_debug_print("host-xhci:     Address Device slot %u: no completion event (timeout)\n",
-                         slot);
-        dev_free(slot);
-        return -1;
+    /* Real HW (esp. High-Speed devices) intermittently NAKs the SET_ADDRESS the
+     * controller issues during Address Device -> a USB Transaction Error (cc 4)
+     * or a slow/absent completion. USB enumeration is expected to retry, so
+     * attempt it a few times with a settle delay between tries. */
+    {
+        unsigned int attempt;
+        int ok = 0;
+        for (attempt = 0; attempt < 3u && !ok; attempt++) {
+            unsigned int cc;
+            if (attempt != 0u) delay_ms(10); /* let the device settle before re-issue */
+            hype_xhci_trb_address_device(cmd, phys(g_input_ctx), slot, 0, (int)g_cmd_cyc);
+            if (cmd_submit_wait(c, cmd, evt) != 0) {
+                hype_debug_print("host-xhci:     Address Device slot %u try %u: no completion "
+                                 "event (timeout)\n", slot, attempt + 1u);
+                continue;
+            }
+            cc = hype_xhci_event_cc(evt);
+            if (cc == HYPE_XHCI_CC_SUCCESS) { ok = 1; break; }
+            /* cc: 5=TRB Error, 11=Context State, 17=Parameter Error, 4=USB Transaction Error. */
+            hype_debug_print("host-xhci:     Address Device slot %u try %u: completion code %u "
+                             "(ctx_size=%uB speed=%u route=0x%05x)\n", slot, attempt + 1u, cc,
+                             c->ctx_size, path->speed, path->route);
+        }
+        if (!ok) { dev_free(slot); return -1; }
     }
-    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
-        /* Completion codes worth knowing here: 5=TRB Error, 11=Context State,
-         * 17=Parameter Error, 4=USB Transaction Error. */
-        hype_debug_print("host-xhci:     Address Device slot %u: completion code %u "
-                         "(ctx_size=%uB speed=%u route=0x%05x)\n", slot,
-                         hype_xhci_event_cc(evt), c->ctx_size, path->speed, path->route);
-        dev_free(slot);
-        return -1;
-    }
+    /* USB 2.0 §9.2.6.3: a device needs up to 2 ms of recovery after SET_ADDRESS
+     * before it will respond at its new address -- without this the immediately
+     * following GET_DESCRIPTOR fails (seen on real HW). Give it a wide margin. */
+    delay_ms(10);
     return 0;
 }
 
@@ -616,6 +651,10 @@ int hype_xhci_reset_port(hype_xhci_ctrl_t *c, unsigned int port, unsigned int *o
         /* ack the reset/connect change bits */
         wr32(bar, off, hype_xhci_portsc_write_preserve(sc,
              HYPE_XHCI_PORTSC_PRC | HYPE_XHCI_PORTSC_CSC));
+        /* USB 2.0 reset recovery: a device needs >=10 ms after reset before it
+         * is ready for Address Device -- skipping this makes real HS devices
+         * NAK the SET_ADDRESS (USB Transaction Error / timeout). */
+        delay_ms(15);
         return 1;
     }
     return 0;
@@ -715,6 +754,7 @@ int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
         hub_clear_port_feature(c, hub_slot, HUB_FEAT_C_PORT_CONNECTION, port);
         if (hub_get_port_status(c, hub_slot, port, st) != 0) continue;
         if (!(st[0] & 0x02u)) continue; /* PORT_ENABLE clear -> reset didn't take */
+        delay_ms(15); /* USB reset recovery before Address Device (see reset_port) */
 
         child_speed = hub_port_speed(st);
         hype_debug_print("host-xhci:   hub slot %u port %u: device attached (speed id %u)\n",
