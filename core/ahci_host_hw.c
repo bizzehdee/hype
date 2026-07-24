@@ -74,6 +74,32 @@ int hype_ahci_host_find_sata_port(uint64_t abar_phys) {
     return -1;
 }
 
+void hype_ahci_host_dump_ports(uint64_t abar_phys) {
+    volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
+    uint32_t cap = rd32(abar, HYPE_AHCI_REG_CAP);
+    uint32_t pi = rd32(abar, HYPE_AHCI_REG_PI);
+    unsigned p;
+
+    hype_debug_print("host-ahci: dump -- CAP=0x%08x PI=0x%08x (NP=%u ports impl)\n",
+                     cap, pi, (unsigned)__builtin_popcount(pi));
+    for (p = 0; p < 32u; p++) {
+        volatile uint8_t *pb;
+        uint32_t ssts, sig, cmd, tfd;
+        if ((pi & (1u << p)) == 0u) continue;
+        pb = port_base(abar, p);
+        ssts = rd32(pb, HYPE_AHCI_PREG_SSTS);
+        sig = rd32(pb, HYPE_AHCI_PREG_SIG);
+        cmd = rd32(pb, HYPE_AHCI_PREG_CMD);
+        tfd = rd32(pb, HYPE_AHCI_PREG_TFD);
+        /* DET (SSTS[3:0]): 0=no dev, 1=dev-no-PHY, 3=dev+PHY. SPD (SSTS[7:4]) =
+         * negotiated gen. SIG: 0x00000101 SATA disk, 0xEB140101 ATAPI. */
+        hype_debug_print("host-ahci:   port %u: SSTS=0x%08x (DET=%u SPD=%u IPM=%u) SIG=0x%08x "
+                         "CMD=0x%08x TFD=0x%08x\n", p, ssts, (unsigned)(ssts & 0xFu),
+                         (unsigned)((ssts >> 4) & 0xFu), (unsigned)((ssts >> 8) & 0xFu),
+                         sig, cmd, tfd);
+    }
+}
+
 int hype_ahci_host_init(uint64_t abar_phys, unsigned port) {
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);
