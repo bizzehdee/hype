@@ -4447,10 +4447,10 @@ static uint8_t g_m5_1_desc_table[128] __attribute__((aligned(4096)));  /* 8 * 16
 static uint8_t g_m5_1_avail[22] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_used[70] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_req1_header[16] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_req1_data[16] __attribute__((aligned(4096)));
+static uint8_t g_m5_1_req1_data[512] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_req1_status[1] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_req2_header[16] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_req2_data[16] __attribute__((aligned(4096)));
+static uint8_t g_m5_1_req2_data[512] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_req2_status[1] __attribute__((aligned(4096)));
 static hype_pci_t g_m5_1_pci;
 static hype_virtio_blk_t g_m5_1_virtio_blk;
@@ -4464,7 +4464,11 @@ static hype_virtio_blk_t g_m5_1_virtio_blk;
 #define HYPE_M5_1_CAPACITY_SECTORS 128u
 #define HYPE_M5_1_REQ1_SECTOR 3ull
 #define HYPE_M5_1_REQ2_SECTOR 10ull
-#define HYPE_M5_1_DATA_LEN 16u
+/* One full sector: the virtio-blk data descriptor length MUST be a
+ * sector multiple, or hype_blk_backend_write/read reject it (VALID-3, added in
+ * #205 -- which silently regressed this test's original 16-byte descriptor,
+ * exposed when the microtests were first re-run under VMX-2). */
+#define HYPE_M5_1_DATA_LEN HYPE_VIRTIO_BLK_SECTOR_SIZE
 
 #define HYPE_M5_1_CAP_COMMON_OFF 0x40u
 #define HYPE_M5_1_CAP_NOTIFY_OFF 0x50u
@@ -4653,11 +4657,7 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * and AHCI DMA over the same guest-RAM range works, so this is a
      * virtio-specific descriptor/avail-ring read anomaly under VMX -- its own
      * focused debug pass. Runs on SVM unchanged. */
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_serial_print("m5-1: skipped on VMX -- virtio-blk descriptor-read anomaly (see comment)\n");
-        return;
-    }
-    (void)ops;
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_m5_1_guest_code, sizeof(g_m5_1_guest_code));
     hype_guest_ram_zero(g_m5_1_guest_stack, sizeof(g_m5_1_guest_stack));
