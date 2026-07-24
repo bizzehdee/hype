@@ -3916,10 +3916,7 @@ static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     int ahci_mapped;
     uint64_t ahci_mapped_base;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("pci-2: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
-        return;
-    }
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_pci_2_cmd_list, sizeof(g_pci_2_cmd_list));
     hype_guest_ram_zero(g_pci_2_cmd_table, sizeof(g_pci_2_cmd_table));
@@ -3987,9 +3984,12 @@ static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                       (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
                       (unsigned long long)HYPE_PCI_2_AHCI_GPA);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
     if (ctx == 0) {
         hype_fatal("pci-2: vcpu_create_long_mode failed");
+    }
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_ept_mark_mmio_hole(HYPE_PCI_1_ECAM_GPA);
     }
 
     ahci_mapped = 0;
@@ -4000,9 +4000,9 @@ static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_fatal("pci-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_pci_2_pci, HYPE_PCI_1_ECAM_GPA,
-                                                (const uint8_t *)(uintptr_t)info.guest_rip) == 0) {
+        if (vmm_reason_is_npf(kind, info.reason)) {
+            if (vmm_handle_pci_ecam_npf(kind, ctx, &g_pci_2_pci, HYPE_PCI_1_ECAM_GPA,
+                                        info.guest_rip) == 0) {
                 /* A config-space write may just have set Memory Space
                  * Enable with a valid BAR5 already programmed -- if
                  * so, this is the exact moment a real PCI-aware
@@ -4015,9 +4015,16 @@ static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                     uint64_t bar5 = hype_pci_get_bar_value(&g_pci_2_pci, HYPE_PCI_2_AHCI_DEV, 5);
                     if (bar5 != 0) {
                         hype_npt_mark_not_present(g_npt_pd, bar5);
+                        /* VMX ignores the NPT root, so punch the EPT hole too --
+                         * dynamically, at the moment BAR5 is enabled. Safe
+                         * without INVEPT: the guest hasn't accessed bar5 yet
+                         * (no stale present EPT TLB entry to flush). */
+                        if (kind == HYPE_VMM_KIND_VMX) {
+                            hype_vmx_ept_mark_mmio_hole(bar5);
+                        }
                         ahci_mapped_base = bar5;
                         ahci_mapped = 1;
-                        hype_debug_print("pci-2: AHCI BAR5 enabled at 0x%llx -- NPT-mapping it now\n",
+                        hype_debug_print("pci-2: AHCI BAR5 enabled at 0x%llx -- MMIO-mapping it now\n",
                                           (unsigned long long)bar5);
                     }
                 }
@@ -4025,7 +4032,7 @@ static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
 
             if (ahci_mapped &&
-                hype_svm_vcpu_handle_ahci_npf(ctx, &g_pci_2_ahci, &g_pci_2_atapi, ahci_mapped_base) == 0) {
+                vmm_handle_ahci_npf(kind, ctx, &g_pci_2_ahci, &g_pci_2_atapi, ahci_mapped_base) == 0) {
                 continue;
             }
 
@@ -4036,7 +4043,7 @@ static void run_pci_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("pci-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
