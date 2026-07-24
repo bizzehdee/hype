@@ -8610,20 +8610,39 @@ static int usblog_write(void *ctx, uint64_t lba, uint32_t count, const void *src
     return hype_blk_backend_write(c->be, c->base + lba, count, src);
 }
 
-/* Try to mount a FAT32 volume on the stick (superfloppy at LBA 0, else the
- * first/second GPT partition -- typically the ESP) and open the log file on it.
- * Writes only touch free clusters + our own file, never a raw partition-table
- * overwrite, so this is safe on the boot medium and needs no confirm. */
+/* Try to mount a FAT32 volume on the stick and open the log file on it. The FAT
+ * can live at LBA 0 (superfloppy), inside an MBR partition (LBA 0 is a Master
+ * Boot Record -- the common "format a stick as FAT32" layout), or a GPT
+ * partition. Try each candidate base LBA; hype_fat32_fs_mount validates the BPB
+ * so a wrong guess just fails cleanly. Writes only touch free clusters + our own
+ * file, never a partition table, so this is safe on the boot medium. */
 static void usb_log_setup(const hype_blk_backend_t *be) {
-    uint64_t bases[3];
+    uint64_t bases[8];
     unsigned int nb = 0, i;
     hype_gpt_partition_t part;
+    static uint8_t mbr[512];
 
     g_usb_log_ctx.be = be;
     g_usb_log_ctx.base = 0u;
     bases[nb++] = 0u; /* superfloppy: FAT boot sector at LBA 0 */
-    if (hype_gpt_find_partition(usblog_read, &g_usb_log_ctx, 1u, &part) == 0) bases[nb++] = part.first_lba;
-    if (hype_gpt_find_partition(usblog_read, &g_usb_log_ctx, 2u, &part) == 0) bases[nb++] = part.first_lba;
+
+    /* MBR partition table: 4 entries at offset 0x1BE, each 16 bytes; the
+     * partition's first LBA is a little-endian u32 at entry offset +8. A
+     * FAT32-formatted stick almost always lands here (type 0x0B/0x0C/0xEF). */
+    if (hype_blk_backend_read(be, 0u, 1u, mbr) == 0 && mbr[510] == 0x55u && mbr[511] == 0xAAu) {
+        for (i = 0; i < 4u && nb < 8u; i++) {
+            const uint8_t *e = mbr + 0x1BEu + i * 16u;
+            uint32_t start = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
+                             ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+            if (e[4] != 0u && start != 0u) bases[nb++] = start; /* non-empty partition type */
+        }
+    }
+
+    /* GPT partitions 1/2 (also covers a protective-MBR + real GPT layout). */
+    if (hype_gpt_find_partition(usblog_read, &g_usb_log_ctx, 1u, &part) == 0 && nb < 8u)
+        bases[nb++] = part.first_lba;
+    if (hype_gpt_find_partition(usblog_read, &g_usb_log_ctx, 2u, &part) == 0 && nb < 8u)
+        bases[nb++] = part.first_lba;
 
     for (i = 0; i < nb; i++) {
         g_usb_log_ctx.base = bases[i];
@@ -8635,8 +8654,8 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
             return;
         }
     }
-    hype_debug_print("usb-log: no writable FAT32 volume on the USB stick "
-                     "(RT-3 NV tail remains the backup)\n");
+    hype_debug_print("usb-log: no mountable FAT32 volume among %u candidate base LBA(s) on the "
+                     "USB stick (RT-3 NV tail remains the backup)\n", nb);
 }
 
 static void usb_log_flush(void) {
