@@ -181,14 +181,6 @@ int hype_nvme_host_init(uint64_t abar_phys) {
             return -1;
         }
     }
-    {
-        extern void hype_debug_print(const char *fmt, ...);
-        hype_debug_print("#229dbg init: io_sq=0x%llx io_cq=0x%llx admin_sq=0x%llx admin_cq=0x%llx "
-                         "bounce=0x%llx\n",
-                         (unsigned long long)phys(g_io_sq), (unsigned long long)phys(g_io_cq),
-                         (unsigned long long)phys(g_admin_sq), (unsigned long long)phys(g_admin_cq),
-                         (unsigned long long)phys(g_bounce));
-    }
     /* IDENTIFY namespace 1 -> geometry. */
     hype_nvme_build_identify_sqe(sqe, ++g_cid, HYPE_NVME_CNS_NAMESPACE, 1u, phys(g_id_buf));
     if (submit_and_poll(bar, g_admin_sq, g_admin_cq, 0, &g_admin_sq_tail, &g_admin_cq_head,
