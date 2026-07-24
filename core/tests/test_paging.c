@@ -160,8 +160,40 @@ static void test_map_mmio_1gb_high(void) {
     CHECK_HEX("pml4[0] still present", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE, g_pml4[0] & 0xFFFULL);
 }
 
+static void test_mark_region_wc(void) {
+    /* PERF-2 (#234): OR PWT into the 2MB PDEs covering the framebuffer, clear PCD,
+     * leave everything else (and other pages) untouched. */
+    static hype_pte_t pml4[HYPE_PAGING_ENTRIES_PER_TABLE];
+    static hype_pte_t pdpt[HYPE_PAGING_ENTRIES_PER_TABLE];
+    static hype_pte_t pd[8][HYPE_PAGING_ENTRIES_PER_TABLE];
+    uint64_t fb = 0xE0000000ULL, sz = 0x7E9000ULL; /* real AMD-laptop FB: spans 4 2MB pages */
+    unsigned gb = 3, first = 256, last = 259, i;
+
+    hype_paging_build_identity(pml4, pdpt, pd, 8);
+    /* Pre-set PCD on the first FB page to prove it's cleared when WC is applied. */
+    pd[gb][first] |= HYPE_PAGING_PCD;
+    hype_paging_mark_region_wc(pd, fb, sz, 8);
+
+    for (i = first; i <= last; i++) {
+        CHECK_HEX("wc: PWT set on covering page", HYPE_PAGING_PWT, pd[gb][i] & HYPE_PAGING_PWT);
+        CHECK_HEX("wc: PCD cleared on covering page", 0, pd[gb][i] & HYPE_PAGING_PCD);
+        CHECK_HEX("wc: page still present+PS", HYPE_PAGING_PRESENT | HYPE_PAGING_PS,
+                  pd[gb][i] & (HYPE_PAGING_PRESENT | HYPE_PAGING_PS));
+    }
+    /* Neighbours untouched. */
+    CHECK_HEX("wc: page before region has no PWT", 0, pd[gb][first - 1] & HYPE_PAGING_PWT);
+    CHECK_HEX("wc: page after region has no PWT", 0, pd[gb][last + 1] & HYPE_PAGING_PWT);
+
+    /* size==0 is a no-op; a region beyond gb_mapped stops at the bound (no OOB). */
+    hype_paging_mark_region_wc(pd, fb, 0, 8);
+    hype_paging_mark_region_wc(pd, (uint64_t)8 * HYPE_PAGING_1GB, HYPE_PAGING_2MB, 8);
+    CHECK_HEX("wc: zero-size left page unchanged", HYPE_PAGING_PWT,
+              pd[gb][first] & HYPE_PAGING_PWT);
+}
+
 int main(void) {
     test_encode_entry();
+    test_mark_region_wc();
     test_map_mmio_1gb_high();
     test_encode_entry_masks_low_bits_of_address();
     test_encode_entry_nx_bit();

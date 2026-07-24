@@ -98,4 +98,20 @@ unsigned int hype_paging_map_region_2mb(hype_pte_t *pdpt,
  * paging_load.c. */
 void hype_paging_load(const hype_pte_t *pml4);
 
+/* PERF-2 (#234): mark the 2MB identity pages covering [base, base+size) as
+ * write-combining, by OR-ing PWT (bit 3) into their PDEs. Combined with a PAT
+ * whose slot 1 is WC (hype_paging_set_pat_wc), the effective type becomes WC even
+ * where MTRRs mark the region UC -- e.g. the GOP framebuffer, so hype's per-frame
+ * blit isn't ~30x slowed by uncached MMIO writes. `pd_tables` is the same
+ * [gb][512] array passed to hype_paging_build_identity; `gb_mapped` bounds it.
+ * Only touches PDEs already present (built as PS 2MB pages). Pure. */
+void hype_paging_mark_region_wc(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                                uint64_t base, uint64_t size, unsigned int gb_mapped);
+
+/* Programs IA32_PAT (MSR 0x277) so slot 1 = WC (the default, but with PA1 changed
+ * from WT to WC): 0x0007040600070106. Selected by a PDE/PTE with PWT=1,PCD=0,
+ * PAT=0. Must run on every core that blits the framebuffer (each has its own PAT).
+ * Never unit tested (wrmsr) -- see paging_load.c. */
+void hype_paging_set_pat_wc(void);
+
 #endif /* HYPE_ARCH_PAGING_H */

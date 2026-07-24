@@ -168,6 +168,10 @@ static hype_pte_t g_pd[HYPE_PAGING_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attr
  * in high MMIO above the low identity map (e.g. 256GB on Intel client
  * parts). Two tables cover a framebuffer that straddles a 1GB boundary. */
 static hype_pte_t g_fb_pd[2][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+/* PERF-2 (#234): GOP framebuffer phys base/size, stashed at GOP discovery so both
+ * the AP page-table build (earlier) and the BSP paging build can mark it WC. */
+static uint64_t g_fb_base;
+static uint64_t g_fb_size;
 /* M10-1b: page tables to map a host NVMe controller's BAR when firmware placed
  * it in high 64-bit MMIO above the low identity map (QEMU q35 parks it ~56 TiB). */
 static hype_pte_t g_nvme_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
@@ -772,6 +776,7 @@ static void fw_1_ap_main(void *arg) {
      * trampoline left the AP on its own flat GDT and no IDT. */
     hype_gdt_load(g_gdt, HYPE_GDT_ENTRY_COUNT);
     hype_idt_load(g_idt, HYPE_IDT_ENTRY_COUNT);
+    hype_paging_set_pat_wc(); /* PERF-2 (#234): PAT slot 1 = WC on this AP (it blits the FB) */
     hype_svm_enable_on((uint64_t)(uintptr_t)g_ap_hsave[vm_idx]); /* faults never return */
     g_fw_1_ap_svm_ok = 1;
     g_hype_ap_c_alive = 1;
@@ -6131,6 +6136,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * VRAM a full-frame scroll memcpy per console line dominated the loop
      * body -- batching turns N lines/flush-window into one push. */
     hype_debug_set_gop_deferred(1);
+    /* Rendering isolation (#235): from here the terminal/dashboard renderer owns the
+     * GOP framebuffer, so stop hype_debug_print (relayed VM serial + diagnostics,
+     * from every core) teeing onto the shared shadow -- otherwise one VM's output
+     * bleeds onto the focused view/dashboard for a frame. Prints still go to
+     * serial + \HYPEFULL.LOG; panics still paint the GOP directly. */
+    hype_debug_set_gop_enabled(0);
 
     hype_host_input_reset(&hostin);
     for (;;) {
@@ -9023,6 +9034,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_debug_print("gop: FrameBufferBase=0x%llx FrameBufferSize=0x%llx\n",
                           (unsigned long long)gop->Mode->FrameBufferBase,
                           (unsigned long long)gop->Mode->FrameBufferSize);
+        /* PERF-2 (#234): remember the framebuffer range for the WC mapping below. */
+        g_fb_base = (uint64_t)gop->Mode->FrameBufferBase;
+        g_fb_size = (uint64_t)gop->Mode->FrameBufferSize;
     }
 
     /*
@@ -9255,6 +9269,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 (hype_pte_t(*)[HYPE_PAGING_ENTRIES_PER_TABLE])(uintptr_t)(base + 8192ULL);
             hype_guest_ram_zero((void *)(uintptr_t)base, ap_pt_pages * 4096ULL);
             hype_paging_build_identity(ap_pml4, ap_pdpt, ap_pd, HYPE_PAGING_MAX_GB);
+            /* PERF-2 (#234): the console-owner guest runs on an AP and blits the
+             * framebuffer using THIS page table, so mark the FB pages WC here too
+             * (the AP also programs PAT slot 1 = WC in fw_1_ap_main). */
+            if (g_fb_size != 0 &&
+                g_fb_base + g_fb_size <= (uint64_t)HYPE_PAGING_MAX_GB * HYPE_PAGING_1GB) {
+                hype_paging_mark_region_wc(ap_pd, g_fb_base, g_fb_size, HYPE_PAGING_MAX_GB);
+            }
             g_ap_cr3 = base; /* AllocateMaxAddress(<4GB) guarantees base < 4GB */
         }
         hype_debug_print("fw-1: guest RAM %llu MiB backed at host-physical 0x%llx\n",
@@ -9550,9 +9571,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 hype_debug_print("paging: WARNING framebuffer BAR out of PML4[0] range -- "
                                   "console will go dark after CR3 load\n");
             }
+        } else if (fb_size != 0) {
+            /* PERF-2 (#234): the framebuffer sits within the low identity map, so
+             * it's a plain (MTRR-UC) 2MB page. Mark it write-combining before the
+             * CR3 load so hype's per-frame blit isn't crippled (~56ms/exit was seen
+             * on the AMD laptop from uncached MMIO writes). Paired with
+             * hype_paging_set_pat_wc() below (PAT slot 1 = WC). */
+            hype_paging_mark_region_wc(g_pd, fb_base, fb_size, HYPE_PAGING_MAX_GB);
+            hype_debug_print("paging: framebuffer 0x%llx+0x%llx marked write-combining (PERF-2)\n",
+                              (unsigned long long)fb_base, (unsigned long long)fb_size);
         }
     }
     hype_paging_load(g_pml4);
+    hype_paging_set_pat_wc(); /* PERF-2: PAT slot 1 = WC (this core) */
     hype_debug_print("own paging loaded\n");
 
     hype_debug_print("about to load own IDT...\n");
