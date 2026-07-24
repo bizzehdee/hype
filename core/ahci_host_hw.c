@@ -58,13 +58,25 @@ int hype_ahci_host_find_sata_port(uint64_t abar_phys) {
 
     for (p = 0; p < 32u; p++) {
         volatile uint8_t *pb;
+        uint32_t ssts;
+        unsigned spins = SPIN_READY;
         if ((pi & (1u << p)) == 0u) {
             continue;
         }
         pb = port_base(abar, p);
-        /* DET (PxSSTS[3:0]) == 3: device present + PHY comm established. */
-        if ((rd32(pb, HYPE_AHCI_PREG_SSTS) & 0xFu) != 3u) {
-            continue;
+        /* Wait for the SATA PHY to establish the link (DET (PxSSTS[3:0]) == 3).
+         * On a cold boot the link/disk isn't ready the instant we probe, so an
+         * immediate read intermittently sees the port as empty -- the real-HW
+         * "no active SATA disk port" flake seen on the AMD laptop (the SATA SSD
+         * is present but was found only on some boots). Poll up to the ceiling. */
+        do {
+            ssts = rd32(pb, HYPE_AHCI_PREG_SSTS);
+            if ((ssts & 0xFu) == 3u) {
+                break;
+            }
+        } while (spins-- != 0u);
+        if ((ssts & 0xFu) != 3u) {
+            continue; /* PHY never came up -> genuinely no device on this port */
         }
         /* Non-ATAPI SATA disk signature (ATAPI/CD would be 0xEB140101). */
         if (rd32(pb, HYPE_AHCI_PREG_SIG) == 0x00000101u) {
