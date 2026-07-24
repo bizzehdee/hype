@@ -3454,10 +3454,7 @@ static void run_ram_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint8_t *guest_code;
     unsigned long long i;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("ram-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
-        return;
-    }
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     gb_to_map = hype_ram_1_gb_to_map(g_ram_1_base_phys + g_ram_1_size_bytes);
 
@@ -3483,7 +3480,7 @@ static void run_ram_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                       (unsigned long long)g_ram_1_base_phys, (unsigned long long)g_ram_1_size_bytes,
                       gb_to_map);
 
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, npt_root_phys);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
     if (ctx == 0) {
         hype_fatal("ram-1: vcpu_create_long_mode failed");
     }
@@ -3492,7 +3489,7 @@ static void run_ram_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         hype_fatal("ram-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("ram-1: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
