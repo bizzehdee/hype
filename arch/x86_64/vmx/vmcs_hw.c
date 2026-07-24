@@ -2,6 +2,8 @@
 #include "vmx.h"
 
 #include "../../../core/fatal.h"
+#include "../../../devices/ahci.h"
+#include "../../../devices/atapi.h"
 #include "../../../devices/pci.h"
 #include "../../../devices/pflash.h"
 #include "../../../devices/pic.h"
@@ -889,6 +891,68 @@ int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
     } else {
         uint32_t value = 0;
         hype_pci_config_read(pci, &addr, decoded.size_bytes, &value);
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
+    return 0;
+}
+
+/*
+ * VMX MMIO handler for the AHCI HBA (VMX-2): mirror of hype_svm_vcpu_handle_
+ * ahci_npf. Same EPT-violation decode-at-RIP shape; on a write to PxCI (command
+ * issue) it runs each issued slot through the shared, vendor-neutral
+ * process_ahci_command_slot() (command-list/PRDT/FIS DMA -- dma_map 0 = identity
+ * for the identity-mapped test guest). atapi carries the ATAPI/SCSI semantics.
+ */
+int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                  uint64_t ahci_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    int ok;
+    uint64_t gpa = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    int is_write = (int)((qual >> 1) & 1u);
+    uint32_t offset;
+
+    if (gpa < ahci_base_phys || gpa >= ahci_base_phys + HYPE_AHCI_MMIO_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(gpa - ahci_base_phys);
+    if (hype_mmio_decode((const uint8_t *)(uintptr_t)rip, HYPE_VMX_MMIO_MAX_INSTR_BYTES, &decoded) !=
+        0) {
+        return -1;
+    }
+    if (decoded.is_write != is_write) {
+        return -1;
+    }
+    reg = vmx_gpr_ptr(real, decoded.reg);
+    if (reg == 0) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && ahci->p_ci != 0) {
+            unsigned slot;
+            for (slot = 0; slot < 32u; slot++) {
+                if ((ahci->p_ci & (1u << slot)) != 0) {
+                    if (process_ahci_command_slot(ahci, atapi, 0, slot) != 0) {
+                        return -1;
+                    }
+                }
+            }
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_ahci_mmio_read(ahci, offset, decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
         *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
     }
 

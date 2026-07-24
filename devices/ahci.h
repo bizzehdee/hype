@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+#include "../core/guest_mem.h" /* hype_gpa_map_t (command-slot DMA) */
+#include "atapi.h"             /* hype_atapi_t (ATAPI command semantics) */
+
 /*
  * Minimal single-port AHCI HBA register model (M4-5), backing the
  * virtual optical drive (devices/atapi.h carries the actual ATAPI/SCSI
@@ -191,6 +194,17 @@ int hype_ahci_mmio_write(hype_ahci_t *ahci, uint32_t offset, uint8_t size_bytes,
  * the caller (the vCPU loop) turns a transition-to-pending into a raised
  * PIC IRQ line, and the guest deasserts by clearing PxIS/IS (RW1C). */
 int hype_ahci_irq_pending(const hype_ahci_t *ahci);
+
+/*
+ * Processes one issued AHCI command slot: walks the guest's Command List ->
+ * Command Table -> PRDT, executes the SATA/ATAPI command against the device
+ * models, DMAs data to/from guest RAM (translated via dma_map; 0 = identity),
+ * writes the receive FIS, and clears the slot's PxCI bit. Vendor-neutral (no
+ * vcpu context) -- the SVM and VMX MMIO handlers both call it on a PxCI write.
+ * Defined in arch/x86_64/svm/svm_vcpu.c. Returns 0 on success, -1 on error.
+ */
+int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
+                              const hype_gpa_map_t *dma_map, unsigned slot);
 
 /* Command Header (32 bytes, Command List entry). */
 typedef struct {

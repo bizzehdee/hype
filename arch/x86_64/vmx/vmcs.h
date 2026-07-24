@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "../../../devices/ahci.h"
+#include "../../../devices/atapi.h"
 #include "../../../devices/pci.h"
 #include "../../../devices/pflash.h"
 #include "../../../devices/pic.h"
@@ -85,6 +87,11 @@ int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uin
  * hype_pci_config_read/write. */
 int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
                                       uint64_t ecam_base_phys);
+/* MMIO via EPT violation to the AHCI HBA: decode at RIP, dispatch to the AHCI
+ * register model, and run issued command slots (PxCI write) via the shared
+ * process_ahci_command_slot(). */
+int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                  uint64_t ahci_base_phys);
 /* Guest interrupt delivery (VMX-2, INT-1/INT-2): set guest GDTR/IDTR, request a
  * vector (deferred via interrupt-window exiting), inject it when the window
  * fires (reason 7 -> handle_intr_window). Mirrors the SVM EVENTINJ/VINTR path. */

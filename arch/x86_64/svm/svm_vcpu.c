@@ -1380,8 +1380,12 @@ static void ahci_copy_fast(uint8_t *dst, const uint8_t *src, uint32_t n) {
  * is "one ATAPI CD-ROM," never a raw ATA disk on this port, so
  * anything else is fail-closed rather than guessed at, matching every
  * other MMIO/NPF handler's convention here. */
-static int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
-                                      const hype_gpa_map_t *dma_map, unsigned slot) {
+/* Non-static (VMX-2): vendor-neutral AHCI command-slot processor -- takes no
+ * vcpu context, only the device models + guest DMA map, so the VMX MMIO handler
+ * (vmcs_hw.c) reuses it verbatim rather than duplicating the command-list/PRDT/
+ * FIS DMA. Declared in devices/ahci.h. */
+int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
+                              const hype_gpa_map_t *dma_map, unsigned slot) {
     uint64_t cmd_list_phys =
         ((uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32)) + (uint64_t)slot * 32u;
     uint64_t rx_fis_phys = (uint64_t)ahci->p_fb | ((uint64_t)ahci->p_fbu << 32);
