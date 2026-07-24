@@ -55,6 +55,12 @@ extern uint64_t hype_vmx_launch(hype_vcpu_ctx_t *ctx, uint64_t launched);
 struct hype_vcpu_ctx {
     uint64_t gprs[16];
     int launched; /* 0 until the first successful VMLAUNCH; VMRESUME thereafter. */
+    /* Pending external interrupt (INT-1/INT-2 on VMX). One vector is all this
+     * project's single-IRQ-source test scope needs (mirrors the SVM comment).
+     * Staged into VM_ENTRY_INTR_INFO once the guest can accept it, via an
+     * interrupt-window exit. */
+    int intr_pending;
+    uint8_t intr_vector;
 };
 
 /* Single test vCPU: the M2-M4-5 microtests run sequentially on the BSP, so
@@ -551,6 +557,7 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
         ctx->gprs[i] = 0;
     }
     ctx->launched = 0;
+    ctx->intr_pending = 0;
     return (hype_vcpu_ctx_t *)ctx;
 }
 
@@ -582,6 +589,7 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
         ctx->gprs[i] = 0;
     }
     ctx->launched = 0;
+    ctx->intr_pending = 0;
     return (hype_vcpu_ctx_t *)ctx;
 }
 
@@ -886,6 +894,66 @@ int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
 
     vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
     return 0;
+}
+
+/* VMX guest GDTR/IDTR setup (VMX-2, INT): mirrors of hype_svm_vcpu_set_gdt/idt.
+ * Real interrupt delivery reloads CS from the guest GDT and vectors through the
+ * guest IDT, so both must point at real tables (VMWRITE base+limit). */
+void hype_vmx_vcpu_set_gdt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
+    (void)ctx;
+    vmwrite(HYPE_VMCS_GUEST_GDTR_BASE, base);
+    vmwrite(HYPE_VMCS_GUEST_GDTR_LIMIT, limit);
+}
+void hype_vmx_vcpu_set_idt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
+    (void)ctx;
+    vmwrite(HYPE_VMCS_GUEST_IDTR_BASE, base);
+    vmwrite(HYPE_VMCS_GUEST_IDTR_LIMIT, limit);
+}
+
+/* Arm/disarm interrupt-window exiting in the live VMCS's primary proc-based
+ * controls (read-modify-write, preserving every other bit). */
+static void vmx_set_intr_window(int on) {
+    int ok;
+    uint64_t ctls = vmread(HYPE_VMCS_CPU_BASED_VM_EXEC_CONTROL, &ok);
+    if (on) {
+        ctls |= HYPE_VMX_PROCBASED_INTERRUPT_WINDOW_EXITING;
+    } else {
+        ctls &= ~(uint64_t)HYPE_VMX_PROCBASED_INTERRUPT_WINDOW_EXITING;
+    }
+    vmwrite(HYPE_VMCS_CPU_BASED_VM_EXEC_CONTROL, ctls);
+}
+
+/*
+ * VMX interrupt request (VMX-2, INT-1/INT-2): mirror of
+ * hype_svm_vcpu_request_interrupt. Records one pending vector and arms
+ * interrupt-window exiting so the vector is injected as soon as the guest can
+ * accept it (RFLAGS.IF=1, no shadow) -- surfaced as an interrupt-window VM-exit
+ * (reason 7), handled by hype_vmx_vcpu_handle_intr_window below. Deferring
+ * unconditionally (rather than trying to inject inline) is correct because the
+ * guest's RFLAGS at request time is its initial state (IF=0), before it STIs.
+ */
+void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->intr_pending = 1;
+    real->intr_vector = vector;
+    vmx_set_intr_window(1);
+}
+
+/*
+ * VMX interrupt-window handler (VMX-2): mirror of
+ * hype_svm_vcpu_handle_vintr_window. The window fired -> the guest can accept
+ * an interrupt now, so stage the pending vector into VM_ENTRY_INTR_INFO (valid
+ * | type 0 external | vector) for the next VM-entry and disarm the window. The
+ * CPU delivers it through the guest IDT on VMRESUME.
+ */
+void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real->intr_pending) {
+        uint32_t info = 0x80000000u | (uint32_t)real->intr_vector; /* valid | type0 | vector */
+        vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, info);
+        real->intr_pending = 0;
+    }
+    vmx_set_intr_window(0);
 }
 
 /*

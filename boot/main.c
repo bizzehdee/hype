@@ -1445,6 +1445,13 @@ static int vmm_handle_pflash_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hyp
                                  uint64_t pf_base_phys);
 static int vmm_handle_pci_ecam_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
                                    uint64_t ecam_base_phys, uint64_t guest_rip);
+static void vmm_set_gdt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
+static void vmm_set_idt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
+static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t cs,
+                                    uint16_t ss);
+static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector);
+static int vmm_reason_is_intr_window(hype_vmm_kind_t kind, uint64_t reason);
+static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx);
 
 /*
  * M3-5: builds the synthetic bzImage (real setup_header validated
@@ -2588,6 +2595,50 @@ static int vmm_handle_pci_ecam_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, h
     return hype_svm_vcpu_handle_pci_ecam_npf(ctx, pci, ecam_base_phys,
                                              (const uint8_t *)(uintptr_t)guest_rip);
 }
+static void vmm_set_gdt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_set_gdt(ctx, base, limit);
+    } else {
+        hype_svm_vcpu_set_gdt(ctx, base, limit);
+    }
+}
+static void vmm_set_idt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_set_idt(ctx, base, limit);
+    } else {
+        hype_svm_vcpu_set_idt(ctx, base, limit);
+    }
+}
+static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t cs,
+                                    uint16_t ss) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        /* No-op: the VMX long-mode guest is already built with CS=0x08 / SS=0x10
+         * (build_guest_common), matching g_int_gdt's own descriptor layout. */
+        (void)ctx;
+        (void)cs;
+        (void)ss;
+        return;
+    }
+    hype_svm_vcpu_set_cs_ss_selectors(ctx, cs, ss);
+}
+static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_request_interrupt(ctx, vector);
+    } else {
+        hype_svm_vcpu_request_interrupt(ctx, vector);
+    }
+}
+static int vmm_reason_is_intr_window(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_INTERRUPT_WINDOW)
+                                     : (reason == HYPE_SVM_EXITCODE_VINTR);
+}
+static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_handle_intr_window(ctx);
+    } else {
+        hype_svm_vcpu_handle_vintr_window(ctx);
+    }
+}
 
 static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     unsigned long long i;
@@ -2830,10 +2881,7 @@ static void run_int_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_vcpu_ctx_t *ctx;
     hype_vmexit_info_t info;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("int: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
-        return;
-    }
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_int_idt, sizeof(g_int_idt));
     hype_guest_ram_zero(g_int_guest_code, sizeof(g_int_guest_code));
@@ -2880,30 +2928,30 @@ static void run_int_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     /* No NPT for this test -- pure register/memory + real IDT/GDT
      * descriptor-table content, no MMIO-trapped device involved (same
      * reasoning as CPUMSR's own test). */
-    ctx = hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
+    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
     if (ctx == 0) {
         hype_fatal("int: vcpu_create_long_mode failed");
     }
 
-    hype_svm_vcpu_set_gdt(ctx, gdt_phys, (uint16_t)(sizeof(g_int_gdt) - 1));
-    hype_svm_vcpu_set_idt(ctx, idt_phys, (uint16_t)(sizeof(g_int_idt) - 1));
-    hype_svm_vcpu_set_cs_ss_selectors(ctx, 0x08u, 0x10u); /* g_int_gdt's own code/data selectors */
-    hype_svm_vcpu_request_interrupt(ctx, HYPE_INT_TEST_VECTOR);
+    vmm_set_gdt(kind, ctx, gdt_phys, (uint16_t)(sizeof(g_int_gdt) - 1));
+    vmm_set_idt(kind, ctx, idt_phys, (uint16_t)(sizeof(g_int_idt) - 1));
+    vmm_set_cs_ss_selectors(kind, ctx, 0x08u, 0x10u); /* g_int_gdt's own code/data selectors */
+    vmm_request_interrupt(kind, ctx, HYPE_INT_TEST_VECTOR);
 
     for (;;) {
         if (ops->vcpu_run(ctx, &info) != 0) {
             hype_fatal("int: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_VINTR) {
-            hype_svm_vcpu_handle_vintr_window(ctx);
+        if (vmm_reason_is_intr_window(kind, info.reason)) {
+            vmm_handle_intr_window(kind, ctx);
             continue;
         }
 
         break;
     }
 
-    if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+    if (!vmm_reason_is_hlt(kind, info.reason)) {
         hype_fatal("int: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }

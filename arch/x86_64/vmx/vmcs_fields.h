@@ -52,6 +52,11 @@
  * it a guest that halts (every test guest's terminal instruction, and any
  * real OS idle loop) would never return control to hype. */
 #define HYPE_VMX_PROCBASED_HLT_EXITING (1u << 7)
+/* Interrupt-window exiting (primary proc-based control, bit 2): VM-exit (reason
+ * 7) as soon as the guest can accept an external interrupt (RFLAGS.IF=1, no
+ * interrupt/NMI shadow) -- the VMX analogue of SVM's VINTR window, used to
+ * deliver a pending vector the guest wasn't ready for at request time. */
+#define HYPE_VMX_PROCBASED_INTERRUPT_WINDOW_EXITING (1u << 2)
 /* Secondary processor-based VM-execution control bits used here. */
 /* "Unrestricted guest" (below) requires "enable EPT" to also be 1 --
  * Intel SDM: an unrestricted guest can run with paging disabled, and
@@ -195,6 +200,7 @@
 
 /* VMX basic exit reasons (Appendix C) this project checks for. */
 #define HYPE_VMX_EXIT_REASON_TRIPLE_FAULT 2u
+#define HYPE_VMX_EXIT_REASON_INTERRUPT_WINDOW 7u
 #define HYPE_VMX_EXIT_REASON_CPUID 10u
 #define HYPE_VMX_EXIT_REASON_HLT 12u
 #define HYPE_VMX_EXIT_REASON_RDMSR 31u
@@ -204,5 +210,9 @@
 /* VM-exit instruction length (0x440C): bytes of the instruction that caused
  * the exit, used to advance guest RIP past an emulated instruction. */
 #define HYPE_VMCS_VM_EXIT_INSTRUCTION_LEN 0x440Cu
+/* VM-entry interruption-information field (0x4016): stages an event for the
+ * next VM-entry. Bits 7:0 vector, 10:8 type (0=external interrupt), bit 31
+ * valid. The VMX analogue of SVM's EVENTINJ. */
+#define HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD 0x4016u
 
 #endif /* HYPE_ARCH_VMX_VMCS_FIELDS_H */

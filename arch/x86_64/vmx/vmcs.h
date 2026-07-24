@@ -85,6 +85,13 @@ int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uin
  * hype_pci_config_read/write. */
 int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
                                       uint64_t ecam_base_phys);
+/* Guest interrupt delivery (VMX-2, INT-1/INT-2): set guest GDTR/IDTR, request a
+ * vector (deferred via interrupt-window exiting), inject it when the window
+ * fires (reason 7 -> handle_intr_window). Mirrors the SVM EVENTINJ/VINTR path. */
+void hype_vmx_vcpu_set_gdt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
+void hype_vmx_vcpu_set_idt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
+void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
+void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx);
 
 /*
  * VMX-1 smoke test: launches a self-contained 3-byte guest (CPUID; HLT) via
