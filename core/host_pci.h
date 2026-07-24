@@ -141,6 +141,17 @@ int hype_host_pci_find_xhci(hype_host_pci_read32_fn read32, uint8_t max_bus,
                             hype_host_xhci_t *out);
 
 /*
+ * USB-8 (#231): like find_xhci but resumable -- scans from `start_bdf`
+ * (bus<<8 | dev<<3 | func) so a caller can enumerate EVERY xHCI controller by
+ * re-calling with out->bdf()+1. Real HW commonly has several xHCI controllers
+ * (chipset + add-in), and the boot USB stick may be on any of them -- scanning
+ * only the first misses it. Returns 1 if found (also sets *out_bdf to the found
+ * controller's bdf so the caller can resume past it), else 0. Pure.
+ */
+int hype_host_pci_find_xhci_from(hype_host_pci_read32_fn read32, uint8_t max_bus,
+                                 uint32_t start_bdf, hype_host_xhci_t *out, uint32_t *out_bdf);
+
+/*
  * Real config read via the legacy 0xCF8 (address) / 0xCFC (data) mechanism.
  * The hardware-touching shim (host_pci_hw.c); usable pre- or post-EBS.
  */

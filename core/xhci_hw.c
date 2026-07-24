@@ -1,5 +1,6 @@
 #include "xhci.h"
 #include "usb_msc.h"
+#include "fatal.h" /* hype_debug_print -- hub-descent diagnostics (real HW visibility) */
 
 /*
  * Hardware shim for the xHCI host driver: real MMIO bring-up + port reset.
@@ -641,9 +642,18 @@ int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
     if (!c->inited || hub_slot == 0u) return -1;
     if (tier == 0u || tier > 5u) return -1; /* xHCI route strings are 5 hub tiers deep */
 
-    if (hub_get_descriptor(c, hub_slot, hubdesc, sizeof hubdesc) != 0) return -1;
-    if (hubdesc[1] != HYPE_USB_DESC_HUB) return -1;
+    if (hub_get_descriptor(c, hub_slot, hubdesc, sizeof hubdesc) != 0) {
+        hype_debug_print("host-xhci:   hub slot %u GET hub-descriptor FAILED\n", hub_slot);
+        return -1;
+    }
+    if (hubdesc[1] != HYPE_USB_DESC_HUB) {
+        hype_debug_print("host-xhci:   hub slot %u bad hub-descriptor type 0x%02x\n",
+                         hub_slot, (unsigned)hubdesc[1]);
+        return -1;
+    }
     nports = hype_xhci_hub_nbr_ports(hubdesc);
+    hype_debug_print("host-xhci:   hub slot %u (tier %u) has %u downstream port(s)\n",
+                     hub_slot, tier, nports);
 
     for (port = 1u; port <= nports; port++) {
         uint8_t st[4];
@@ -674,6 +684,8 @@ int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
         if (!(st[0] & 0x02u)) continue; /* PORT_ENABLE clear -> reset didn't take */
 
         child_speed = hub_port_speed(st);
+        hype_debug_print("host-xhci:   hub slot %u port %u: device attached (speed id %u)\n",
+                         hub_slot, port, child_speed);
 
         /* Extend the topology: append this port at `tier`, carry the root port,
          * and pick the Transaction Translator for a LS/FS child. */
@@ -693,15 +705,28 @@ int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
         }
 
         /* Enumerate the device on this port. */
-        if (hype_xhci_enable_slot(c, &child_slot) != 0 || child_slot == 0u) continue;
+        if (hype_xhci_enable_slot(c, &child_slot) != 0 || child_slot == 0u) {
+            hype_debug_print("host-xhci:   hub slot %u port %u Enable Slot FAILED\n",
+                             hub_slot, port);
+            continue;
+        }
         if (hype_xhci_address_device(c, child_slot, &cp) != 0) {
+            hype_debug_print("host-xhci:   hub slot %u port %u Address Device FAILED "
+                             "(route 0x%05x tt_hub=%u tt_port=%u)\n", hub_slot, port,
+                             cp.route, cp.tt_hub_slot, cp.tt_port);
             hype_xhci_disable_slot(c, child_slot);
             continue;
         }
         if (hype_xhci_get_device_descriptor(c, child_slot, devdesc) != 0) {
+            hype_debug_print("host-xhci:   hub slot %u port %u GET_DESCRIPTOR FAILED\n",
+                             hub_slot, port);
             hype_xhci_disable_slot(c, child_slot);
             continue;
         }
+        hype_debug_print("host-xhci:   hub slot %u port %u dev class=%02x vid=%04x pid=%04x\n",
+                         hub_slot, port, (unsigned)devdesc[4],
+                         (unsigned)(devdesc[8] | (devdesc[9] << 8)),
+                         (unsigned)(devdesc[10] | (devdesc[11] << 8)));
 
         if (hype_xhci_dev_is_hub(devdesc)) {
             /* A nested hub: configure it, then descend one tier deeper. */

@@ -9523,11 +9523,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * hype can drive the controller); device enumeration (control transfers) +
      * mass-storage/HID + the USB debug-log sink build on top. */
     {
+        /* USB-8 (#231): real HW has MULTIPLE xHCI controllers (chipset + add-in),
+         * multiple ports each, and the boot stick may be on ANY of them (behind a
+         * hub or not). Scan EVERY xHCI controller via the resumable find_xhci_from,
+         * stopping at the first that yields a USB mass-storage device. */
         hype_host_xhci_t hx;
-        if (hype_host_pci_find_xhci(hype_host_pci_read32_hw, 255u, &hx)) {
+        uint32_t xhci_cur = 0, xhci_bdf = 0;
+        unsigned int xhci_count = 0;
+        int msc_found_any = 0;
+        while (!msc_found_any &&
+               hype_host_pci_find_xhci_from(hype_host_pci_read32_hw, 255u, xhci_cur, &hx,
+                                            &xhci_bdf)) {
             hype_xhci_ctrl_t xc;
-            hype_debug_print("host-xhci: controller at %02x:%02x.%x vid=%04x did=%04x bar=0x%llx\n",
-                             (unsigned)hx.bus, (unsigned)hx.dev, (unsigned)hx.func,
+            xhci_count++;
+            xhci_cur = xhci_bdf + 1u; /* resume past this controller next iteration */
+            hype_debug_print("host-xhci: controller[%u] at %02x:%02x.%x vid=%04x did=%04x bar=0x%llx\n",
+                             xhci_count, (unsigned)hx.bus, (unsigned)hx.dev, (unsigned)hx.func,
                              (unsigned)hx.vendor_id, (unsigned)hx.device_id,
                              (unsigned long long)hx.bar_phys);
             /* Polled driver -- silence its interrupts at the PCI level first. */
@@ -9540,7 +9551,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 hype_paging_load(g_pml4);
             }
             if (hype_xhci_host_init(hx.bar_phys, &xc) != 0) {
-                hype_serial_print("host-xhci: controller bring-up FAILED\n");
+                hype_debug_print("host-xhci: controller[%u] bring-up FAILED\n", xhci_count);
+                continue; /* try the next controller */
             } else {
                 unsigned int rp;
                 unsigned int msc_found = 0;
@@ -9567,7 +9579,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     }
                     hype_debug_print("host-xhci: port %u connected (speed id %u)\n", rp, speed);
                     if (hype_xhci_enable_slot(&xc, &slot) != 0) {
-                        hype_serial_print("host-xhci: Enable Slot FAILED\n");
+                        hype_debug_print("host-xhci: port %u Enable Slot FAILED\n", rp);
                         continue;
                     }
                     /* Root-port device: no hubs above it (route 0, no TT). */
@@ -9577,12 +9589,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     path.tt_hub_slot = 0u;
                     path.tt_port = 0u;
                     if (hype_xhci_address_device(&xc, slot, &path) != 0) {
-                        hype_serial_print("host-xhci: Address Device FAILED\n");
+                        hype_debug_print("host-xhci: port %u (speed %u) Address Device FAILED\n",
+                                         rp, speed);
                         hype_xhci_disable_slot(&xc, slot);
                         continue;
                     }
                     if (hype_xhci_get_device_descriptor(&xc, slot, desc) != 0) {
-                        hype_serial_print("host-xhci: GET_DESCRIPTOR FAILED\n");
+                        hype_debug_print("host-xhci: port %u GET_DESCRIPTOR FAILED\n", rp);
                         hype_xhci_disable_slot(&xc, slot);
                         continue;
                     }
@@ -9629,7 +9642,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
                     /* Shared MSC datapath, whether direct or behind a hub. */
                     if (hype_xhci_set_configuration(&xc, msc_slot, msc.config_value) != 0) {
-                        hype_serial_print("host-xhci: SET_CONFIGURATION FAILED\n");
+                        hype_debug_print("host-xhci: slot %u SET_CONFIGURATION FAILED\n", msc_slot);
                         hype_xhci_disable_slot(&xc, msc_slot);
                         continue;
                     }
@@ -9638,7 +9651,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                      msc.interface_num, msc.bulk_in_ep, msc.bulk_out_ep,
                                      msc.bulk_in_mps);
                     if (hype_xhci_configure_bulk_endpoints(&xc, msc_slot, &msc_path, &msc) != 0) {
-                        hype_serial_print("host-xhci: Configure Endpoint FAILED\n");
+                        hype_debug_print("host-xhci: slot %u Configure Endpoint FAILED\n", msc_slot);
                         hype_xhci_disable_slot(&xc, msc_slot);
                         continue;
                     }
@@ -9647,7 +9660,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         uint32_t last_lba = 0, bsz = 0;
                         hype_debug_print("host-xhci: bulk endpoints configured -- MSC datapath ready\n");
                         if (hype_xhci_msc_read_capacity(&xc, msc_slot, &msc, &last_lba, &bsz) != 0) {
-                            hype_serial_print("host-xhci: SCSI READ CAPACITY FAILED\n");
+                            hype_debug_print("host-xhci: slot %u SCSI READ CAPACITY FAILED\n", msc_slot);
                         } else {
                             static uint8_t sec0[512];
                             hype_debug_print("host-xhci: USB disk -- last LBA %u, block %u bytes "
@@ -9659,7 +9672,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 hype_debug_print("host-xhci: SCSI READ(10) LBA0 OK -- mbrsig=%02x%02x\n",
                                                  (unsigned)sec0[510], (unsigned)sec0[511]);
                             } else if (bsz == 512u) {
-                                hype_serial_print("host-xhci: SCSI READ(10) LBA0 FAILED\n");
+                                hype_debug_print("host-xhci: slot %u SCSI READ(10) LBA0 FAILED\n",
+                                                 msc_slot);
                             }
                             if (bsz == 512u) {
                                 static hype_blk_usb_t ubk;
@@ -9674,7 +9688,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                      (unsigned)bsec[510], (unsigned)bsec[511],
                                                      (unsigned long long)ube.total_sectors);
                                 } else {
-                                    hype_serial_print("host-xhci: blk_usb backend read FAILED\n");
+                                    hype_debug_print("host-xhci: blk_usb backend read FAILED\n");
                                 }
                                 /* #230: attach the USB debug-log sink. Use file-global copies
                                  * of the controller + MSC endpoints + backend so the sink
@@ -9710,12 +9724,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     }
                 }
                 if (!msc_found) {
-                    hype_debug_print("host-xhci: no bulk-only USB mass-storage found on any root "
-                                     "port or behind any hub\n");
+                    hype_debug_print("host-xhci: controller[%u] -- no USB mass-storage on any root "
+                                     "port or behind any hub\n", xhci_count);
                 }
+                if (msc_found) msc_found_any = 1; /* stop scanning further controllers */
             }
-        } else {
+        } /* while (each xHCI controller) */
+        if (xhci_count == 0u) {
             hype_debug_print("host-xhci: no xHCI controller found (buses 0-255)\n");
+        } else if (!msc_found_any) {
+            hype_debug_print("host-xhci: scanned %u xHCI controller(s) -- NO USB mass-storage "
+                             "found on any of them\n", xhci_count);
         }
     }
 
