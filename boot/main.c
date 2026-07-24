@@ -15,6 +15,7 @@
 #include "../core/mp.h"
 #include "../core/admission.h"
 #include "../core/cfg.h"
+#include "../core/strutil.h"
 #include "../core/phys_guard.h"
 #include "../core/phys_confirm.h"
 #include "../core/file_io.h"
@@ -554,9 +555,9 @@ static uint64_t g_hostdisk_abar;
 static unsigned g_hostdisk_port;
 static int g_hostdisk_present;
 static uint64_t g_hostdisk_total_sectors;
-#if HYPE_229_RO_SATA
+static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
+                                    * `physical:` target, exactly as g_hostnvme_serial */
 static hype_blk_phys_ahci_t g_hostdisk_ahci; /* backend hw ctx (outlives the VM) */
-#endif
 
 static int term_streq(const char *a, const char *b) {
     unsigned i = 0;
@@ -5445,6 +5446,20 @@ static int fw_1_vblk_use_physical(hype_fw_vm_t *vm) {
     return 1;
 }
 
+/* M10-6b (#228): AHCI/SATA counterpart of fw_1_vblk_use_physical -- the laptop
+ * has no NVMe, so a confirmed `physical:` target there resolves to the FCH SATA
+ * disk enumerated as g_hostdisk_*. Same three gates as the NVMe path: operator
+ * confirmation ACCEPTED, the confirmed serial matches THIS enumerated drive, and
+ * the single writable physical backend isn't already claimed by another VM. */
+static int fw_1_vblk_use_physical_ahci(hype_fw_vm_t *vm) {
+    int idx = (int)(vm - &g_vms[0]);
+    if (!g_hostdisk_present) return 0;
+    if (!hype_phys_confirm_is_accepted(&g_phys_confirm)) return 0;
+    if (!term_streq(g_phys_confirm.serial, g_hostdisk_serial)) return 0;
+    if (g_phys_backend_claimed_vm >= 0 && g_phys_backend_claimed_vm != idx) return 0;
+    return 1;
+}
+
 #if HYPE_M10_6_WRITE_SELFTEST
 /* Round-trips a known pattern through the guest-facing blk_backend to a scratch
  * LBA (well past any partition table) to prove guest writes reach the physical
@@ -5544,6 +5559,26 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         hype_debug_print("#229dbg setup: CR3=0x%llx g_pml4=0x%llx g_ap_cr3=0x%llx nvme_bar=0x%llx\n",
                          (unsigned long long)hype_dbg_read_cr3(), (unsigned long long)(uintptr_t)g_pml4,
                          (unsigned long long)g_ap_cr3, (unsigned long long)g_hostnvme_bar);
+#if HYPE_M10_6_WRITE_SELFTEST
+        fw_1_vblk_write_selftest(vm);
+#endif
+    } else if (fw_1_vblk_use_physical_ahci(vm)) {
+        /* M10-6b (#228): CONFIRMED `physical:` AHCI/SATA target -> writable AHCI
+         * backend. Unlike the HYPE_229_RO_SATA diagnostic above, the write fn is
+         * LEFT INTACT -- guest writes to /dev/vda land on the real disk. Reaching
+         * here already means the #124 identity + non-empty guard passed AND the
+         * operator (or HYPE_M10_6_AUTOCONFIRM in QEMU) confirmed the serial. The
+         * host AHCI ABAR is low MMIO (<4GB), already in g_pml4's identity map, so
+         * -- unlike the high-BAR NVMe path -- no remap/re-init is needed here. */
+        int idx = (int)(vm - &g_vms[0]);
+        hype_blk_phys_ahci_init(&vm->vblk_phys, &g_hostdisk_ahci, &vm->vblk_be,
+                                g_hostdisk_abar, g_hostdisk_port, g_hostdisk_total_sectors);
+        vm->vblk_is_physical = 1;
+        g_phys_backend_claimed_vm = idx;
+        hype_virtio_blk_reset(&vm->vblk, g_hostdisk_total_sectors);
+        hype_debug_print("virtio-blk[vm %d]: PHYSICAL AHCI/SATA backend (sn '%s', %llu sectors) "
+                         "[writable]\n", idx, g_hostdisk_serial,
+                         (unsigned long long)g_hostdisk_total_sectors);
 #if HYPE_M10_6_WRITE_SELFTEST
         fw_1_vblk_write_selftest(vm);
 #endif
@@ -10017,6 +10052,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                          * can be attached as a read-only guest vda. */
                         g_hostdisk_present = 1;
                         g_hostdisk_total_sectors = di.total_sectors;
+                        (void)hype_strlcpy(g_hostdisk_serial, di.serial, sizeof(g_hostdisk_serial));
                         hype_debug_print("host-disk: serial='%s' model='%s' sectors=%llu (%llu MiB)\n",
                                          di.serial, di.model,
                                          (unsigned long long)di.total_sectors,
