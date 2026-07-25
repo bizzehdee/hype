@@ -160,6 +160,49 @@ static void test_map_mmio_1gb_high(void) {
     CHECK_HEX("pml4[0] still present", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE, g_pml4[0] & 0xFFFULL);
 }
 
+/*
+ * #240: the real-hardware case the two older helpers left uncovered -- a BAR
+ * above the low identity map but INSIDE PML4[0]. The whole point is that the
+ * surrounding low map survives, which is what map_mmio_1gb would have destroyed
+ * by overwriting pml4[0].
+ */
+static void test_map_mmio_1gb_into_pdpt_preserves_low_map(void) {
+    /* The Intel i5-13420H's xHCI BAR: 0x6001120000 = 384 GiB. */
+    uint64_t bar = 0x6001120000ULL;
+    uint64_t gb = bar / HYPE_PAGING_1GB; /* 384 */
+    uint64_t gb_base = gb * HYPE_PAGING_1GB;
+    unsigned int idx;
+
+    hype_paging_build_identity(g_pml4, g_pdpt, g_pd, 4);
+    CHECK_HEX("precondition: the BAR's GB slot starts out absent", 0u, g_pdpt[384] & 1ULL);
+
+    idx = hype_paging_map_mmio_1gb_into_pdpt(g_pdpt, g_mmio_pd, bar);
+
+    CHECK_HEX("pdpt index = 384 % 512", 384u, idx);
+    CHECK_HEX("pdpt[384] present+write", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE,
+              g_pdpt[384] & 0xFFFULL);
+    CHECK_HEX("pdpt[384] -> the supplied pd", (uint64_t)g_mmio_pd,
+              g_pdpt[384] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("pd[0] present+write+PS+PCD (device registers must be uncacheable)",
+              HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_PS | HYPE_PAGING_PCD,
+              g_mmio_pd[0] & 0xFFFULL);
+    CHECK_HEX("pd[0] maps the containing GB, not the BAR offset", gb_base,
+              g_mmio_pd[0] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("pd[511] covers the top of that GB", gb_base + 511ULL * HYPE_PAGING_2MB,
+              g_mmio_pd[511] & 0x000FFFFFFFFFF000ULL);
+
+    /* The reason this helper exists: nothing else in the live tables moved. */
+    CHECK_HEX("pml4[0] untouched (map_mmio_1gb would have replaced it)",
+              (uint64_t)g_pdpt, g_pml4[0] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("pdpt[0] (low identity GB 0) still present", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE,
+              g_pdpt[0] & 0xFFFULL);
+    CHECK_HEX("pdpt[0] still points at the identity pd", (uint64_t)g_pd,
+              g_pdpt[0] & 0x000FFFFFFFFFF000ULL);
+    CHECK_HEX("pdpt[3] (last mapped identity GB) still present",
+              HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE, g_pdpt[3] & 0xFFFULL);
+    CHECK_HEX("an unrelated unmapped slot stays absent", 0u, g_pdpt[100] & 1ULL);
+}
+
 static void test_mark_region_wc(void) {
     /* PERF-2 (#234): OR PWT into the 2MB PDEs covering the framebuffer, clear PCD,
      * leave everything else (and other pages) untouched. */
@@ -195,6 +238,7 @@ int main(void) {
     test_encode_entry();
     test_mark_region_wc();
     test_map_mmio_1gb_high();
+    test_map_mmio_1gb_into_pdpt_preserves_low_map();
     test_encode_entry_masks_low_bits_of_address();
     test_encode_entry_nx_bit();
     test_encode_entry_flags_masked_to_allowed_bits();

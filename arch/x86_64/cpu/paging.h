@@ -90,6 +90,28 @@ void hype_paging_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
 unsigned int hype_paging_map_mmio_1gb(hype_pte_t *pml4, hype_pte_t *pdpt, hype_pte_t *pd,
                                        uint64_t phys);
 
+/*
+ * Same job as hype_paging_map_mmio_1gb -- one uncacheable (PCD) 1 GiB identity
+ * window for a device register BAR -- but wired into an EXISTING `pdpt` rather
+ * than a dedicated one installed at a fresh PML4 slot. Sets only pdpt[gb % 512]
+ * and fills `pd`; never touches the PML4 or any other PDPT entry, so the low
+ * identity map around it survives.
+ *
+ * This covers the gap the two existing helpers left open (#240): a 64-bit BAR
+ * above the low identity map (HYPE_PAGING_MAX_GB) but still inside PML4[0]'s
+ * 512 GiB. hype_paging_map_mmio_1gb cannot be used there -- it writes
+ * pml4[0], replacing the whole low map with a near-empty PDPT -- and
+ * hype_paging_map_region_2mb reaches it but maps cacheable pages, which is
+ * wrong for device registers. Real firmware lands squarely in that gap: an
+ * Intel i5-13420H parks its xHCI BAR at 0x6001120000 (384 GiB), i.e. ~6x above
+ * the 64 GiB map yet well inside PML4[0], and the first register read #PF'd.
+ *
+ * `phys` must be below 512 GiB (assert-by-construction: the caller picks this
+ * helper precisely because it is). Returns the PDPT index populated. Pure
+ * table-filling, no CPU state touched -- the caller reloads CR3.
+ */
+unsigned int hype_paging_map_mmio_1gb_into_pdpt(hype_pte_t *pdpt, hype_pte_t *pd, uint64_t phys);
+
 unsigned int hype_paging_map_region_2mb(hype_pte_t *pdpt,
                                          hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                                          uint64_t phys_base, uint64_t size);

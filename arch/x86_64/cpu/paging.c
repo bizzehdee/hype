@@ -46,6 +46,23 @@ unsigned int hype_paging_map_mmio_1gb(hype_pte_t *pml4, hype_pte_t *pdpt, hype_p
     return pml4_idx;
 }
 
+unsigned int hype_paging_map_mmio_1gb_into_pdpt(hype_pte_t *pdpt, hype_pte_t *pd, uint64_t phys) {
+    uint64_t gb = phys / HYPE_PAGING_1GB;
+    unsigned int pdpt_idx = (unsigned int)(gb % HYPE_PAGING_ENTRIES_PER_TABLE);
+    uint64_t base = gb * HYPE_PAGING_1GB;
+    unsigned int j;
+
+    /* Deliberately NOT zeroing pdpt: every other GB slot in it is the live low
+     * identity map. Only this one entry changes. */
+    for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
+        pd[j] = hype_paging_encode_entry(base + (uint64_t)j * HYPE_PAGING_2MB,
+                                         HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE |
+                                             HYPE_PAGING_PS | HYPE_PAGING_PCD);
+    }
+    pdpt[pdpt_idx] = hype_paging_encode_entry((uint64_t)pd, HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE);
+    return pdpt_idx;
+}
+
 void hype_paging_mark_region_wc(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                                 uint64_t base, uint64_t size, unsigned int gb_mapped) {
     uint64_t first, last, p;

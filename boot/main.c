@@ -5885,6 +5885,11 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         if (g_hostnvme_bar >= 512ULL * HYPE_PAGING_1GB) {
             hype_paging_map_mmio_1gb(g_pml4, g_nvme_pdpt, g_nvme_pd, g_hostnvme_bar);
             hype_paging_load(g_pml4);
+        } else if (g_hostnvme_bar >= (uint64_t)HYPE_PAGING_MAX_GB * HYPE_PAGING_1GB) {
+            /* #240: same gap as the enumeration site -- above the 64GB identity
+             * map but inside PML4[0]. */
+            hype_paging_map_mmio_1gb_into_pdpt(g_pdpt, g_nvme_pd, g_hostnvme_bar);
+            hype_paging_load(g_pml4);
         }
         /* #229: the controller was reset + its admin/IO queues created on the
          * BSP during pre-dispatch enumeration. This VM's guest I/O runs on THIS
@@ -10119,15 +10124,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  (unsigned)cmd);
             }
             /* The NVMe register BAR may sit in high 64-bit MMIO outside hype's
-             * low identity map (PML4[0] = [0,512GB)). When it needs a higher
-             * PML4 slot, map its 1 GiB (uncacheable) via a fresh PML4 entry and
-             * flush, before the first controller-register access -- otherwise
-             * that MMIO read #PFs. (map_mmio_1gb writes pml4[idx], so only use
-             * it when idx>=1; a BAR below 512GB is either already in the low map
-             * or would clobber PML4[0].) */
+             * low identity map. Map its 1 GiB (uncacheable) and flush before the
+             * first controller-register access -- otherwise that MMIO read #PFs.
+             *
+             * #240: the low map is HYPE_PAGING_MAX_GB (64 GiB), NOT PML4[0]'s
+             * 512 GiB reach -- the old single 512 GiB threshold left everything
+             * in between unmapped. (map_mmio_1gb writes pml4[idx], so it is only
+             * safe when idx>=1; inside PML4[0] use the _into_pdpt variant, which
+             * adds one entry to the live pdpt instead of replacing pml4[0].)
+             * This machine's NVMe BAR happened to be low (0x50500000) so only
+             * xHCI actually faulted -- the same latent bug, one lucky device. */
             if (hn.bar_phys >= 512ULL * HYPE_PAGING_1GB) {
                 hype_paging_map_mmio_1gb(g_pml4, g_nvme_pdpt, g_nvme_pd, hn.bar_phys);
                 hype_paging_load(g_pml4);
+            } else if (hn.bar_phys >= (uint64_t)HYPE_PAGING_MAX_GB * HYPE_PAGING_1GB) {
+                hype_paging_map_mmio_1gb_into_pdpt(g_pdpt, g_nvme_pd, hn.bar_phys);
+                hype_paging_load(g_pml4);
+                hype_debug_print("host-nvme: BAR 0x%llx is above the %uGB identity map -- mapped 1 "
+                                  "uncacheable GB into PML4[0]\n",
+                                  (unsigned long long)hn.bar_phys, HYPE_PAGING_MAX_GB);
             }
             if (hype_nvme_host_init(hn.bar_phys) != 0) {
                 hype_debug_print("host-nvme: controller at %02x:%02x.%x init FAILED\n",
@@ -10219,11 +10234,35 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             /* Polled driver -- silence its interrupts at the PCI level first. */
             hype_host_pci_disable_interrupts(hype_host_pci_read32_hw, hype_host_pci_write32_hw,
                                              hx.bus, hx.dev, hx.func);
-            /* Map the register BAR if it sits in high MMIO (as on real HW); QEMU
-             * parks qemu-xhci below 4 GiB, already in the low identity map. */
+            /*
+             * Map the register BAR if it sits in high MMIO (as on real HW); QEMU
+             * parks qemu-xhci below 4 GiB, already in the low identity map.
+             *
+             * #240: the threshold used to be 512 GiB, which silently skipped the
+             * mapping for any BAR between the top of the low identity map
+             * (HYPE_PAGING_MAX_GB, 64 GiB) and 512 GiB -- the comment assumed
+             * "below 512GB" meant "already in the low map", conflating PML4[0]'s
+             * 512 GiB *reach* with the 64 GiB actually mapped. An Intel
+             * i5-13420H puts this BAR at 0x6001120000 (384 GiB), landing exactly
+             * in that gap, so the first capability read #PF'd
+             * (vector=14 error_code=0x0) and killed the boot before the USB log
+             * sink even opened -- which is why that machine could not produce a
+             * log at all. Both branches below need the CR3 reload: these tables
+             * are already live.
+             */
             if (hx.bar_phys >= 512ULL * HYPE_PAGING_1GB) {
+                /* Outside PML4[0] entirely -- needs its own PML4 slot. */
                 hype_paging_map_mmio_1gb(g_pml4, g_xhci_pdpt, g_xhci_pd, hx.bar_phys);
                 hype_paging_load(g_pml4);
+            } else if (hx.bar_phys >= (uint64_t)HYPE_PAGING_MAX_GB * HYPE_PAGING_1GB) {
+                /* Above the low identity map but inside PML4[0]: add one
+                 * uncacheable GB to the LIVE pdpt (see the helper's comment for
+                 * why neither other helper fits). */
+                hype_paging_map_mmio_1gb_into_pdpt(g_pdpt, g_xhci_pd, hx.bar_phys);
+                hype_paging_load(g_pml4);
+                hype_debug_print("host-xhci: BAR 0x%llx is above the %uGB identity map -- mapped 1 "
+                                  "uncacheable GB into PML4[0]\n",
+                                  (unsigned long long)hx.bar_phys, HYPE_PAGING_MAX_GB);
             }
             if (hype_xhci_host_init(hx.bar_phys, &xc) != 0) {
                 hype_debug_print("host-xhci: controller[%u] bring-up FAILED\n", xhci_count);
