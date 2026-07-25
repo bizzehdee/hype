@@ -5605,6 +5605,52 @@ static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
  * write side runs in the post-EBS FW-1 loop (throttled), this read side runs
  * pre-EBS here where Boot-Services file I/O can dump it to a file. */
 static EFI_RUNTIME_SERVICES *g_hype_rt = 0;
+
+/*
+ * RT-3c: persist the log tail when hype_fatal() is about to halt.
+ *
+ * core/fatal.h has declared this hook since RT-1, but nothing ever registered
+ * it -- so a post-EBS panic left NOTHING behind. The USB sink is opened late in
+ * the boot (and on a machine whose xHCI bring-up is itself what faulted, it
+ * never opens at all), and the periodic NV write lives in the FW-1 loop, which
+ * a panic before that point never reaches. The frozen GOP screen was the only
+ * record, which is exactly why the Intel bare-metal xHCI page fault (#240) had
+ * to be captured by photographing the display.
+ *
+ * SetVariable is a Runtime Service: valid post-EBS under hype's own identity
+ * map, and independent of USB/xHCI/FAT -- i.e. the one channel that still works
+ * when the storage path is the thing that died. RT-3b recovers it into
+ * \hype-diag-prev.txt on the next boot, so a panic becomes readable text rather
+ * than a photograph.
+ *
+ * Deliberately NOT flushing the USB sink here as well: hype_fatal() can be
+ * reached from any core, and driving the xHCI/FAT write path from an AP faults
+ * (see #239), so a panic handler is the last place to attempt it. Best-effort
+ * and NULL-guarded; hype_fatal() paints the GOP *before* calling this, so the
+ * on-screen evidence is never at risk even if the firmware's SetVariable is
+ * slow or refuses.
+ */
+static void hype_panic_persist_tail(void) {
+    EFI_STATUS st;
+
+    if (g_hype_rt == 0) {
+        hype_debug_print("RT-3c: no Runtime Services -- panic tail NOT saved (screen is the only "
+                          "record)\n");
+        return;
+    }
+    st = hype_nvlog_write(g_hype_rt, hype_logbuf_data(), hype_logbuf_len());
+    /* Say which it was, on the screen that is about to freeze: whether there is
+     * a recoverable log waiting on the next boot is the first thing you want to
+     * know when standing in front of a panicked, serial-less machine. */
+    if (st == EFI_SUCCESS) {
+        hype_debug_print("RT-3c: panic tail saved to NV (%u bytes captured) -- reboot and read "
+                          "\\hype-diag-prev.txt\n", (unsigned int)hype_logbuf_len());
+    } else {
+        hype_debug_print("RT-3c: panic tail NOT saved -- SetVariable failed (0x%llx); this firmware "
+                          "refuses post-EBS NV writes, so photograph the screen\n",
+                          (unsigned long long)st);
+    }
+}
 /* Throttle the post-EBS variable writes; multiplied by the calibrated host
  * TSC Hz at use. ~60s between flash writes bounds wear on a long-idle guest. */
 #define HYPE_NVLOG_WRITE_INTERVAL_SECS 60ull
@@ -9249,6 +9295,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * ExitBootServices (under our identity map), which is what lets the FW-1
      * loop write the diagnostic tail to an NV EFI variable post-EBS. */
     g_hype_rt = SystemTable->RuntimeServices;
+    /* RT-3c: from here on, a panic persists its own tail -- see
+     * hype_panic_persist_tail(). Registered as early as possible (right after
+     * the Runtime Services pointer exists) so it covers the whole rest of the
+     * boot, including the host device probing where #240 dies. */
+    hype_fatal_set_flush_hook(hype_panic_persist_tail);
 
     hype_console_print(SystemTable, "hype\n");
 
