@@ -3621,9 +3621,44 @@ static unsigned int hype_ram_1_gb_to_map(uint64_t end_phys) {
     return gb;
 }
 
+static uint64_t hype_ram_1_max_u64(uint64_t a, uint64_t b) { return a > b ? a : b; }
+
+/*
+ * The NPT has to cover strictly more than the dynamic RAM allocation.
+ * EVERY guest-physical address the guest touches is translated through
+ * it -- and that includes the guest's own page tables, which are static
+ * arrays in hype's image (g_guest_pml4/pdpt/pd), placed wherever UEFI
+ * loaded that image: observed ~5.4GB under QEMU -m 8192, far above the
+ * ~2GB region AllocatePages() handed back for guest RAM.
+ *
+ * Sizing the NPT to the RAM region alone (what this test did until
+ * #206) therefore left the guest CR3 walk itself untranslatable, so the
+ * very first instruction fetch took an NPF with nothing retired --
+ * reason=0x400, guest_rip still == entry_rip. This is the same bug
+ * class as HYPE_NPT_MAX_GB/HYPE_M3_5_GUEST_PAGING_GB above, one level
+ * down: a map that reaches the guest's RAM is useless if it does not
+ * also reach the tables that describe that RAM. (Every other test guest
+ * here sidesteps it by mapping HYPE_NPT_MAX_GB unconditionally; only
+ * this one computes its own coverage, which is the point of RAM-2 --
+ * so it is the only one that has to get this right.)
+ *
+ * Returns the highest guest-physical address that walk can touch: past
+ * the end of the RAM region, or past whichever paging-structure array
+ * the linker placed highest (their relative order is not guaranteed, so
+ * all three are considered).
+ */
+static uint64_t hype_ram_1_npt_end_phys(void) {
+    uint64_t end = g_ram_1_base_phys + g_ram_1_size_bytes;
+
+    end = hype_ram_1_max_u64(end, (uint64_t)(uintptr_t)g_guest_pml4 + sizeof(g_guest_pml4));
+    end = hype_ram_1_max_u64(end, (uint64_t)(uintptr_t)g_guest_pdpt + sizeof(g_guest_pdpt));
+    end = hype_ram_1_max_u64(end, (uint64_t)(uintptr_t)g_guest_pd + sizeof(g_guest_pd));
+    return end;
+}
+
 static void run_ram_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
-    unsigned int gb_to_map;
+    unsigned int gb_to_map, npt_gb_to_map;
     hype_vcpu_ctx_t *ctx;
     hype_vmexit_info_t info;
     uint8_t *guest_code;
@@ -3631,7 +3666,12 @@ static void run_ram_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
     (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
+    /* Guest CR3 only ever resolves the guest's own code/stack, both inside the
+     * RAM region, so it stays sized to the allocation -- that dynamic sizing is
+     * exactly what RAM-2 is validating. The NPT needs the wider figure; see
+     * hype_ram_1_npt_end_phys(). */
     gb_to_map = hype_ram_1_gb_to_map(g_ram_1_base_phys + g_ram_1_size_bytes);
+    npt_gb_to_map = hype_ram_1_gb_to_map(hype_ram_1_npt_end_phys());
 
     /* M2-6 hard invariant: zero the WHOLE allocated region before this
      * guest's first VM-entry, not just the bytes written below. */
@@ -3648,12 +3688,12 @@ static void run_ram_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, gb_to_map);
     guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
 
-    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, gb_to_map);
+    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, npt_gb_to_map);
     npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
 
-    hype_debug_print("ram-1: base_phys=0x%llx size=0x%llx gb_to_map=%u\n",
+    hype_debug_print("ram-1: base_phys=0x%llx size=0x%llx gb_to_map=%u npt_gb_to_map=%u (guest_pml4=0x%llx)\n",
                       (unsigned long long)g_ram_1_base_phys, (unsigned long long)g_ram_1_size_bytes,
-                      gb_to_map);
+                      gb_to_map, npt_gb_to_map, (unsigned long long)(uintptr_t)g_guest_pml4);
 
     ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
     if (ctx == 0) {
@@ -3671,9 +3711,9 @@ static void run_ram_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
 
     hype_debug_print(
         "ram-1: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- %u MB dynamic guest "
-        "RAM, NPT sized to %u GB\n",
+        "RAM, guest CR3 sized to %u GB, NPT sized to %u GB\n",
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_RAM_1_TEST_MEM_MB,
-        gb_to_map);
+        gb_to_map, npt_gb_to_map);
 }
 
 /*
@@ -8006,11 +8046,36 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * instruction form the decoder doesn't support, or insn bytes
              * unavailable). Distinct message so it's not confused with an
              * unmodeled-but-absorbed region. */
-            hype_fatal("fw-1: undecodable MMIO NPF at guest-physical 0x%llx (%s, guest_rip=0x%llx, "
-                       "decode_assist_bytes=%u insn[0..2]=%x %x %x) -- cannot absorb",
-                       (unsigned long long)npf.guest_phys_addr, npf.is_write ? "write" : "read",
-                       (unsigned long long)info.guest_rip, (unsigned int)insn_n,
-                       insn_n > 0 ? insn[0] : 0, insn_n > 1 ? insn[1] : 0, insn_n > 2 ? insn[2] : 0);
+            /* Print the bytes the decoder ACTUALLY saw, not the decode-assist
+             * count: on the ptwalk fallback path (insn_n == 0, the norm under
+             * QEMU+KVM nested SVM) the old message always read "insn=0 0 0"
+             * whatever `insn` held, which pointed diagnosis at a missing fetch
+             * when the real cause was an unsupported instruction FORM. `insn`
+             * is NULL only if the fetch itself failed -- now distinguishable.
+             *
+             * The VM index and control state matter just as much: with two VMs
+             * sharing one log, "which guest" is otherwise a guess, and an
+             * all-zero `insn` from a SUCCESSFUL fetch means the guest is
+             * executing a zeroed page (i.e. it has already jumped off the
+             * rails), which is a completely different bug from a decoder gap. */
+            {
+                hype_svm_debug_state_t dbg;
+                hype_svm_vcpu_get_debug_state(ctx, &dbg);
+                hype_fatal("fw-1: undecodable MMIO NPF on vm%u at guest-physical 0x%llx (%s, "
+                           "guest_rip=0x%llx, decode_assist_bytes=%u insn=%s %02x %02x %02x %02x "
+                           "%02x %02x %02x %02x | cr0=0x%llx cr3=0x%llx cr4=0x%llx rflags=0x%llx "
+                           "cs_base=0x%llx nrip=0x%llx rsp=0x%llx) -- cannot absorb",
+                           (unsigned int)(vm - g_vms), (unsigned long long)npf.guest_phys_addr,
+                           npf.is_write ? "write" : "read", (unsigned long long)info.guest_rip,
+                           (unsigned int)insn_n,
+                           insn ? (insn_n ? "(assist)" : "(ptwalk)") : "(FETCH FAILED)",
+                           insn ? insn[0] : 0, insn ? insn[1] : 0, insn ? insn[2] : 0, insn ? insn[3] : 0,
+                           insn ? insn[4] : 0, insn ? insn[5] : 0, insn ? insn[6] : 0, insn ? insn[7] : 0,
+                           (unsigned long long)dbg.cr0, (unsigned long long)dbg.cr3,
+                           (unsigned long long)dbg.cr4, (unsigned long long)dbg.rflags,
+                           (unsigned long long)dbg.cs_base, (unsigned long long)dbg.nrip,
+                           (unsigned long long)dbg.rsp);
+            }
         }
 
         if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
