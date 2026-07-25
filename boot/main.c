@@ -1539,7 +1539,18 @@ static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t 
     rsp = (uint64_t)(uintptr_t)(g_m3_5_guest_stack + sizeof(g_m3_5_guest_stack));
     rsi = (uint64_t)(uintptr_t)&g_m3_5_zero_page;
 
-    hype_serial_print("m3-5: entry_rip=0x%llx guest_cr3=0x%llx zero_page=0x%llx\n",
+    /*
+     * #238: hype_debug_print(), NOT hype_serial_print() -- this and every other
+     * result line in the battery. hype_serial_print() writes ONLY to the UART,
+     * and the machines this battery exists to validate have no serial port, so
+     * such a record reaches neither \HYPEFULL.LOG (no logbuf tee) nor the GOP
+     * screen (no framebuffer tee). m3-5/m4-3/m4-4/m4-5 were the only tests
+     * using it, and that is exactly why their confirmations were missing from
+     * the 2026-07-25 AMD log AND from the Intel bare-metal screen photo, while
+     * every neighbouring test's lines came through -- the results existed only
+     * on a wire nobody was listening to. Keep new test output on this call.
+     */
+    hype_debug_print("m3-5: entry_rip=0x%llx guest_cr3=0x%llx zero_page=0x%llx\n",
                        (unsigned long long)entry_rip, (unsigned long long)guest_cr3,
                        (unsigned long long)rsi);
 
@@ -1574,7 +1585,7 @@ static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t 
                    (unsigned long long)entry_rip, (unsigned long long)info.qualification);
     }
 
-    hype_serial_print(
+    hype_debug_print(
         "m3-5: Linux boot-protocol shim test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx, "
         "PIC master IMR=0x%x, PIT ch0 latch_pending=%d)\n",
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip, g_m3_5_pic.master.imr,
@@ -1637,7 +1648,7 @@ static void run_m4_3_pflash_mmio_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t
     hype_npt_mark_not_present(g_npt_pd, HYPE_M4_3_PFLASH_GPA);
     npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
 
-    hype_serial_print("m4-3: entry_rip=0x%llx guest_cr3=0x%llx npt_root=0x%llx pflash_gpa=0x%llx\n",
+    hype_debug_print("m4-3: entry_rip=0x%llx guest_cr3=0x%llx npt_root=0x%llx pflash_gpa=0x%llx\n",
                        (unsigned long long)entry_rip, (unsigned long long)guest_cr3,
                        (unsigned long long)npt_root_phys, (unsigned long long)HYPE_M4_3_PFLASH_GPA);
 
@@ -1684,7 +1695,7 @@ static void run_m4_3_pflash_mmio_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t
             g_m4_3_pflash_backing[0x100]);
     }
 
-    hype_serial_print(
+    hype_debug_print(
         "m4-3: pflash MMIO test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx, backing[0]=0x%x "
         "backing[0x100]=0x%x -- write and read-back round trip both verified)\n",
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip, g_m4_3_pflash_backing[0],
@@ -1882,7 +1893,7 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
     hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
     guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
 
-    hype_serial_print("m4-4: entry_rip=0x%llx access_struct=0x%llx dest_buffer=0x%llx rsdp_key=0x%x\n",
+    hype_debug_print("m4-4: entry_rip=0x%llx access_struct=0x%llx dest_buffer=0x%llx rsdp_key=0x%x\n",
                        (unsigned long long)entry_rip, (unsigned long long)access_struct_phys,
                        (unsigned long long)dest_buffer_phys, rsdp_key);
 
@@ -1923,7 +1934,7 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
         }
     }
 
-    hype_serial_print(
+    hype_debug_print(
         "m4-4: fw_cfg DMA test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- %llu-byte "
         "etc/acpi/rsdp round trip verified byte-for-byte\n",
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
@@ -2100,7 +2111,7 @@ static void run_m4_5_ahci_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) 
     hype_npt_mark_not_present(g_npt_pd, HYPE_M4_5_AHCI_GPA);
     npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
 
-    hype_serial_print("m4-5: entry_rip=0x%llx ahci_gpa=0x%llx cmd_list=0x%llx cmd_table=0x%llx\n",
+    hype_debug_print("m4-5: entry_rip=0x%llx ahci_gpa=0x%llx cmd_list=0x%llx cmd_table=0x%llx\n",
                        (unsigned long long)entry_rip, (unsigned long long)ahci_gpa,
                        (unsigned long long)cmd_list_phys, (unsigned long long)cmd_table_phys);
 
@@ -2140,7 +2151,7 @@ static void run_m4_5_ahci_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) 
         }
     }
 
-    hype_serial_print(
+    hype_debug_print(
         "m4-5: AHCI/ATAPI test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- %u-byte "
         "READ(10) round trip verified byte-for-byte\n",
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_ATAPI_SECTOR_SIZE);
