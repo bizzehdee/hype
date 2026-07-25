@@ -31,6 +31,34 @@ uint16_t hype_serial_divisor_for_baud(uint32_t baud);
  * needs the explicit CR). Pure iteration, testable via a mock putc. */
 void hype_serial_write_via(hype_serial_putc_fn putc, const char *s);
 
+/*
+ * #238: the size of one log record, shared by every log producer
+ * (hype_serial_print, hype_debug_print, hype_fatal). Was 192/256 in three
+ * separate places, which silently cut the longest -- and most
+ * information-dense -- records: the microtests' own "verified byte-for-byte"
+ * confirmations, the FW-1 TIMERHIST/INTDIAG summaries, and (worst) panic
+ * messages. On a serial-less machine the log is the only evidence channel,
+ * so a record that doesn't fit is a validation result that doesn't exist.
+ */
+#define HYPE_LOG_RECORD_MAX 512u
+
+/*
+ * Formats one log record into `buf`. Differs from a bare vsnprintf in two
+ * ways that matter for a log rather than a string:
+ *
+ *  - a record that doesn't fit is marked "...[TRUNCATED]", so loss is
+ *    visible in the log instead of being indistinguishable from a message
+ *    that was simply short;
+ *  - the marker ends in '\n', so a truncated record still terminates its
+ *    line. Plain truncation cut the trailing newline off, which made the
+ *    NEXT record continue on the same line -- two records reading as one,
+ *    and the reason #238's losses looked like reordering.
+ *
+ * Returns 1 if the record was truncated, 0 if it fitted. Pure formatting;
+ * no I/O, so it's testable directly.
+ */
+int hype_serial_format_record(char *buf, unsigned long long bufsz, const char *fmt, va_list ap);
+
 /* Formats fmt/ap into a fixed-size stack buffer, then
  * hype_serial_write_via()s it. Testable via a mock putc. */
 void hype_serial_vprint_via(hype_serial_putc_fn putc, const char *fmt, va_list ap);
