@@ -3457,11 +3457,7 @@ static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * guest waits on a mouse IRQ that's never delivered because
      * reporting_enabled never latches), so it spins. Mouse-specific; own pass.
      * Runs on SVM unchanged. */
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_serial_print("input-2: skipped on VMX -- PS/2 mouse handshake incomplete (see comment)\n");
-        return;
-    }
-    (void)ops;
+    (void)ops; /* VMX-2: runs under SVM and VMX now. */
 
     hype_guest_ram_zero(g_input_2_idt, sizeof(g_input_2_idt));
     hype_guest_ram_zero(g_input_2_guest_code, sizeof(g_input_2_guest_code));
@@ -3546,7 +3542,7 @@ static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                         g_input_2_pic.slave.init_state == 0) {
                         hype_ps2_mouse_enqueue_movement(&g_input_2_mouse, HYPE_INPUT_2_TEST_STATUS,
                                                          HYPE_INPUT_2_TEST_DX, HYPE_INPUT_2_TEST_DY);
-                        hype_svm_vcpu_deliver_pic_irq(ctx, &g_input_2_pic.slave, 4);
+                        vmm_deliver_pic_irq(kind, ctx, &g_input_2_pic.slave, 4);
                         event_delivered = 1;
                     }
                     continue;
