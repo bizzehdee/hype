@@ -1,4 +1,3 @@
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include "../serial.h"
@@ -71,83 +70,12 @@ static void test_print_via(void) {
     CHECK_STR("print_via formats and expands newline", "x=7\r\n", g_captured);
 }
 
-/* hype_serial_format_record() takes a va_list; this is the varargs front door
- * the tests call, mirroring how hype_serial_print()/hype_debug_print() use it. */
-static int fmt_record(char *buf, unsigned long long bufsz, const char *fmt, ...) {
-    va_list ap;
-    int truncated;
-
-    va_start(ap, fmt);
-    truncated = hype_serial_format_record(buf, bufsz, fmt, ap);
-    va_end(ap);
-    return truncated;
-}
-
-/* #238: a record that fits must be byte-identical to plain formatting -- no
- * marker, no padding, nothing appended. */
-static void test_format_record_fits(void) {
-    char buf[64];
-    int truncated = fmt_record(buf, sizeof(buf), "abc=%d\n", 7);
-
-    CHECK_INT("format_record reports not-truncated when it fits", 0, truncated);
-    CHECK_STR("format_record leaves a fitting record untouched", "abc=7\n", buf);
-}
-
-/*
- * The bug #238 was actually about: an over-long record used to be cut wherever
- * the buffer ended, which (a) looked exactly like a short message and (b) ate
- * the trailing newline, so the NEXT record continued on the same line and two
- * records read as one. Both properties are asserted here.
- */
-static void test_format_record_truncates_visibly(void) {
-    char buf[24];
-    int truncated = fmt_record(buf, sizeof(buf), "%s", "0123456789abcdefghijklmnopqrstuvwxyz");
-
-    CHECK_INT("format_record reports truncation", 1, truncated);
-    CHECK_INT("format_record still NUL-terminates within the buffer", 0, buf[sizeof(buf) - 1]);
-    CHECK_INT("truncated record length is bufsz-1", (int)(sizeof(buf) - 1), (int)strlen(buf));
-    CHECK_STR("truncated record is marked and still ends in a newline",
-              "01234567" "...[TRUNCATED]\n", buf);
-    CHECK_INT("truncated record ends in '\\n' so the next record starts a new line",
-              '\n', buf[strlen(buf) - 1]);
-}
-
-/* Exactly-full is the boundary vsnprintf's return value makes easy to get
- * wrong: "would have written bufsz-1" fits, "would have written bufsz" does not. */
-static void test_format_record_exact_fit(void) {
-    char buf[8];
-    int truncated = fmt_record(buf, sizeof(buf), "%s", "1234567"); /* 7 chars + NUL == 8 */
-
-    CHECK_INT("a record filling the buffer exactly is not truncated", 0, truncated);
-    CHECK_STR("exact-fit record is intact", "1234567", buf);
-}
-
-/* Degenerate buffers must not be written out of bounds. A buffer too small to
- * hold even the marker keeps plain truncation rather than corrupting memory. */
-static void test_format_record_tiny_buffer(void) {
-    char buf[4];
-    int truncated = fmt_record(buf, sizeof(buf), "%s", "abcdefgh");
-
-    CHECK_INT("tiny buffer still reports truncation", 1, truncated);
-    CHECK_INT("tiny buffer stays NUL-terminated", 0, buf[sizeof(buf) - 1]);
-    CHECK_INT("tiny buffer holds bufsz-1 chars", 3, (int)strlen(buf));
-
-    /* bufsz == 0 must be a no-op, not a write to buf[-1]. */
-    CHECK_INT("zero-size buffer reports not-truncated and writes nothing", 0,
-              fmt_record(buf, 0, "%s", "x"));
-    CHECK_INT("NULL buffer is refused", 0, fmt_record(0, 16, "%s", "x"));
-}
-
 int main(void) {
     test_divisor_for_baud();
     test_write_via_plain();
     test_write_via_expands_newline();
     test_write_via_empty();
     test_print_via();
-    test_format_record_fits();
-    test_format_record_truncates_visibly();
-    test_format_record_exact_fit();
-    test_format_record_tiny_buffer();
 
     if (failures == 0) {
         printf("all tests passed\n");

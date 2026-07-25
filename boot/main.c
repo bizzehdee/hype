@@ -5598,7 +5598,6 @@ static EFI_RUNTIME_SERVICES *g_hype_rt = 0;
  * TSC Hz at use. ~60s between flash writes bounds wear on a long-idle guest. */
 #define HYPE_NVLOG_WRITE_INTERVAL_SECS 60ull
 
-
 /* RT-3b: recover the previous run's diagnostic tail from the EFI variable and
  * write it to \hype-diag-prev.txt, then clear the variable so a stale tail
  * can't be mistaken for a fresh one. Best-effort; runs pre-EBS. */
@@ -7003,23 +7002,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                     }
                     /* #230: on the same throttled cadence, stream the log's new
-                     * bytes to \HYPEFULL.LOG on the USB stick (no-op if none).
-                     *
-                     * #238: this placement is a KNOWN LIMITATION, kept
-                     * deliberately. It couples the USB stream to RT-3's fate --
-                     * a firmware that refuses a post-EBS NV SetVariable latches
-                     * nvlog_disabled, and the stream stops with it (measured
-                     * under QEMU+OVMF: \HYPEFULL.LOG frozen at the sink's
-                     * initial backlog, 94 lines, while the serial log reached
-                     * 1389). The obvious fix -- flushing on an independent
-                     * cadence from this loop -- does NOT work: this loop runs on
-                     * an AP, and driving the xHCI/FAT write path from an AP core
-                     * faults hype itself (observed: #PF vector=14
-                     * error_code=0x2, i.e. a not-present WRITE, killing both
-                     * VMs). Same family as #229's AP-core device I/O. Fixing it
-                     * properly needs an AP-safe USB path or a BSP-side drain,
-                     * which is more than a logging change; tracked in #238.
-                     * Real hardware, where RT-3 works, streams fine. */
+                     * bytes to \HYPEFULL.LOG on the USB stick (no-op if none). */
                     usb_log_flush();
                 }
             }
@@ -9122,10 +9105,6 @@ typedef struct {
 
 static hype_log_sink_t g_usb_log;
 static int g_usb_log_ready;
-/* #238: one-shot latches so each log-integrity warning is emitted once, not on
- * every flush (which would itself consume what little room is left). */
-static int g_logbuf_full_reported;
-static int g_usb_log_failed;
 static usblog_ctx_t g_usb_log_ctx;
 
 /* Persistent copies of the USB block path the sink writes through. The probe's
@@ -9197,36 +9176,7 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
 }
 
 static void usb_log_flush(void) {
-    if (g_usb_log_ready) {
-        /* #238: a failing flush used to be discarded with a (void) cast, so the
-         * stream could die mid-run and \HYPEFULL.LOG would just... stop -- with
-         * nothing in it saying so, which reads exactly like a clean end. Say it
-         * once, on the serial line AND (via the logbuf) in whatever of the file
-         * did get written, so a short log is never mistaken for a complete one.
-         *
-         * Known trigger: the live-guest loop runs on an AP, and physical device
-         * I/O from an AP core fails under QEMU nested virt (#229) -- harmless
-         * there, but the same latch covers a genuinely failing stick. */
-        if (hype_log_sink_flush(&g_usb_log) != 0 && !g_usb_log_failed) {
-            g_usb_log_failed = 1;
-            hype_debug_print("usb-log: STREAM FAILED after %u bytes -- \\HYPEFULL.LOG is INCOMPLETE "
-                             "from here on (serial/GOP and the RT-3 tail are unaffected)\n",
-                             (unsigned int)hype_logbuf_len());
-        }
-    }
-
-    /* #238: the capture buffer silently stops accepting appends once it fills
-     * (logbuf.c sets `truncated` and drops the rest), so a long run could lose
-     * its tail with nothing in the log to say so -- the same "absence looks
-     * like it never happened" failure the truncation marker fixes one level
-     * down. Say it once, the moment it happens. Only the current run's buffer;
-     * the RT-1b *recovered* prior log reports its own flag separately. */
-    if (!g_logbuf_full_reported && hype_logbuf_truncated()) {
-        g_logbuf_full_reported = 1;
-        hype_debug_print("logbuf: CAPTURE BUFFER FULL (%u bytes) -- records from here on are LOST "
-                         "from \\HYPEFULL.LOG; anything below this line is incomplete\n",
-                         (unsigned int)HYPE_LOGBUF_CAPACITY);
-    }
+    if (g_usb_log_ready) (void)hype_log_sink_flush(&g_usb_log);
 }
 
 /* Diagnostic: log EVERY PCI function present (bus:dev.func, vendor/device,

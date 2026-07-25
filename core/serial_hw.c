@@ -1,4 +1,3 @@
-#include "logbuf.h"
 #include "serial.h"
 
 /*
@@ -45,32 +44,10 @@ void hype_serial_putc(char c) {
     outb(g_serial_port, (uint8_t)c);
 }
 
-/*
- * #238: also tee into the in-memory capture, not just the UART.
- *
- * On the real target there IS no serial port, so \HYPEFULL.LOG (and the RT-3
- * variable tail) is the only place a record can be read afterwards. Every
- * caller that reached for hype_serial_print() instead of hype_debug_print()
- * was therefore writing to a channel nobody could read -- which is exactly
- * how the m3-5/m4-3/m4-4/m4-5 microtest confirmations went missing from the
- * 2026-07-25 AMD validation run while every neighbouring test's lines
- * survived: those four tests, alone in the battery, print via this function.
- * Teeing here fixes all 27 such call sites at once instead of converting
- * them one by one and re-introducing the same asymmetry with the next one.
- *
- * Deliberately NOT also mirrored to the GOP: hype_debug_print() owns that
- * (with its own deferral/enable gating for the framebuffer cost and for
- * rendering isolation against the dashboard), and a serial print should not
- * silently start painting the screen.
- */
 void hype_serial_print(const char *fmt, ...) {
-    char msg[HYPE_LOG_RECORD_MAX];
     va_list ap;
 
     va_start(ap, fmt);
-    hype_serial_format_record(msg, sizeof(msg), fmt, ap);
+    hype_serial_vprint_via(hype_serial_putc, fmt, ap);
     va_end(ap);
-
-    hype_serial_write_via(hype_serial_putc, msg);
-    hype_logbuf_append(msg);
 }

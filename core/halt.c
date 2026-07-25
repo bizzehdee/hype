@@ -26,21 +26,15 @@ void hype_wait_for_interrupt(void) {
  * and are fully unit tested.
  */
 __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
-    char msg[HYPE_LOG_RECORD_MAX];
+    char msg[192];
     va_list ap;
     hype_gop_console_t *gop;
 
     va_start(ap, fmt);
-    hype_serial_format_record(msg, sizeof(msg), fmt, ap);
+    hype_vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    /* #238: write to the UART directly rather than via hype_serial_print(),
-     * which now tees into the logbuf itself -- going through it would append
-     * the panic twice (once there, once via the explicit appends below).
-     * Split into three writes so it matches those appends exactly. */
-    hype_serial_write_via(hype_serial_putc, "PANIC: ");
-    hype_serial_write_via(hype_serial_putc, msg);
-    hype_serial_write_via(hype_serial_putc, "\n");
+    hype_serial_print("PANIC: %s\n", msg);
     /* Capture the panic in the console log, then flush it to disk (if a
      * hook is registered) before halting -- so a mid-run panic on real
      * hardware still leaves \hype-log.txt ending with the cause. */
@@ -102,17 +96,15 @@ void hype_debug_flush_gop(void) {
 }
 
 void hype_debug_print(const char *fmt, ...) {
-    char msg[HYPE_LOG_RECORD_MAX];
+    char msg[192];
     va_list ap;
     hype_gop_console_t *gop;
 
     va_start(ap, fmt);
-    hype_serial_format_record(msg, sizeof(msg), fmt, ap);
+    hype_vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    /* #238: straight to the UART -- hype_serial_print() now tees into the
-     * logbuf, so calling it here would append every record twice. */
-    hype_serial_write_via(hype_serial_putc, msg);
+    hype_serial_print("%s", msg);
     /* Tee into the in-memory capture so boot/main.c can flush the whole
      * console to a file on the boot volume before ExitBootServices --
      * the serial-less real-hardware debug path (core/logbuf.h). */
