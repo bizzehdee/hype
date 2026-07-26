@@ -102,6 +102,17 @@ static void short_delay(void) { volatile unsigned s = 200000u; while (s-- != 0u)
  * over-delaying is harmless -- correctness over precision. */
 static uint64_t g_tsc_hz;
 void hype_xhci_set_tsc_hz(uint64_t hz) { g_tsc_hz = hz; }
+
+/*
+ * Connect-detect settle after a host-controller reset, and the per-port budget
+ * for waiting on CCS. USB 2.0's attach debounce (TATTDB) is 100 ms and a
+ * SuperSpeed port adds link training, so 150 ms is the floor with margin. Any
+ * port that still reports nothing after its own 150 ms window genuinely has
+ * nothing attached. Applies to every controller equally -- where a device is
+ * plugged in must not matter, and a reset blinds every port the same way.
+ */
+#define HYPE_XHCI_CONNECT_DEBOUNCE_MS 150u
+#define HYPE_XHCI_PORT_CCS_WAIT_MS 150u
 static inline uint64_t rdtsc_now(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
@@ -612,6 +623,23 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
          rd32(bar, op + HYPE_XHCI_OP_USBCMD) | HYPE_XHCI_USBCMD_RS);
     if (wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_HCH, 0) != 0) return -1;
 
+    /*
+     * Let attached devices be re-detected before anyone reads PORTSC.
+     *
+     * The HCRST above cleared all port state, so every port restarts in
+     * RxDetect with CCS=0 regardless of what is plugged in, and the controller
+     * needs real time to notice a connection again: USB 2.0's connect debounce
+     * alone is 100 ms (TATTDB), and a SuperSpeed port has link training on top.
+     * Without this the very first port scan samples CCS too early and every
+     * port looks empty -- which is exactly what an Intel i5-13420H reported:
+     * all 18 ports across both controllers reading PORTSC=0x000002a0
+     * (PP=1, CCS=0, PLS=5/RxDetect) on a machine that had just booted from a
+     * stick on one of them, and whose PCH controller also has internal devices
+     * (webcam, Bluetooth) that cannot all be absent. The AMD box got away with
+     * it only marginally -- its Address Device needed two attempts.
+     */
+    delay_ms(HYPE_XHCI_CONNECT_DEBOUNCE_MS);
+
     ring_state_reset();
     out->inited = 1;
     return 0;
@@ -635,6 +663,22 @@ int hype_xhci_reset_port(hype_xhci_ctrl_t *c, unsigned int port, unsigned int *o
         wr32(bar, off, hype_xhci_portsc_write_preserve(sc, HYPE_XHCI_PORTSC_PP));
         short_delay();
         sc = rd32(bar, off);
+    }
+    /*
+     * Give the port its own window to report a connection rather than believing
+     * a single sample. Powering a port starts the same detect sequence a reset
+     * does, and a device attached across a controller reset can take the full
+     * debounce to reappear -- sampling once here is what made every port on
+     * this machine look empty. Polling in millisecond steps keeps a genuinely
+     * empty port cheap (it still costs its window, but only once per boot).
+     */
+    if (!(sc & HYPE_XHCI_PORTSC_CCS)) {
+        unsigned int waited;
+        for (waited = 0u; waited < HYPE_XHCI_PORT_CCS_WAIT_MS; waited++) {
+            delay_ms(1);
+            sc = rd32(bar, off);
+            if (sc & HYPE_XHCI_PORTSC_CCS) break;
+        }
     }
     if (!(sc & HYPE_XHCI_PORTSC_CCS)) return 0; /* nothing attached */
 
