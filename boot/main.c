@@ -85,6 +85,17 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #define HYPE_RUN_SELFTEST_GUESTS 0
 #endif
 
+/*
+ * HYPE_USB_PROBE: build a single-purpose diagnostic image that halts right after
+ * the host xHCI enumeration, so the port scan is the last thing on the display
+ * and one photograph is a complete record. For machines with no serial port, no
+ * working USB log sink, and cold-boot-only resets. #ifndef-guarded so
+ * -DHYPE_USB_PROBE=1 on the build line wins.
+ */
+#ifndef HYPE_USB_PROBE
+#define HYPE_USB_PROBE 0
+#endif
+
 /* VMX-1 (#35): run the self-contained VMX round-trip smoke test (CPUID->HLT
  * guest via the VMLAUNCH/VMRESUME trampoline) right after the VMM enables, on
  * an Intel/VMX backend. Off by default; flip to 1 (or -DHYPE_VMX_SMOKE_TEST=1)
@@ -193,7 +204,19 @@ static hype_pte_t g_nvme_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((alig
 static hype_pte_t g_nvme_pd[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 /* USB-1 (#213): same for the xHCI register BAR when it lands in high MMIO. */
 static hype_pte_t g_xhci_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
-static hype_pte_t g_xhci_pd[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+/*
+ * One PD per xHCI controller, not one shared by all of them. A machine can have
+ * several: this Raptor Lake laptop exposes 00:0d.0 (TCSS, the USB-C side) and
+ * 00:14.0 (PCH, which owns the USB-A ports). Each gets its BAR's 1 GiB mapped,
+ * and with a single shared PD the second mapping re-fills it for the second
+ * BAR's GB while the FIRST controller's pdpt entry still points at it -- so
+ * controller 1's register window silently starts resolving into controller 2's
+ * GB. Harmless while only one controller had a high BAR (nothing exercised the
+ * second call); #240's threshold fix is what made both map for real.
+ */
+#define HYPE_XHCI_MAX_MAPPED 4u
+static hype_pte_t g_xhci_pd[HYPE_XHCI_MAX_MAPPED][HYPE_PAGING_ENTRIES_PER_TABLE]
+    __attribute__((aligned(4096)));
 static hype_gop_console_t g_gop_console;
 /* M8-1: the dashboard is rendered as its own vt_screen grid (built by the
  * console-owner core each frame it holds the dashboard view), then blitted to
@@ -10278,19 +10301,27 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * log at all. Both branches below need the CR3 reload: these tables
              * are already live.
              */
-            if (hx.bar_phys >= 512ULL * HYPE_PAGING_1GB) {
-                /* Outside PML4[0] entirely -- needs its own PML4 slot. */
-                hype_paging_map_mmio_1gb(g_pml4, g_xhci_pdpt, g_xhci_pd, hx.bar_phys);
-                hype_paging_load(g_pml4);
-            } else if (hx.bar_phys >= (uint64_t)HYPE_PAGING_MAX_GB * HYPE_PAGING_1GB) {
-                /* Above the low identity map but inside PML4[0]: add one
-                 * uncacheable GB to the LIVE pdpt (see the helper's comment for
-                 * why neither other helper fits). */
-                hype_paging_map_mmio_1gb_into_pdpt(g_pdpt, g_xhci_pd, hx.bar_phys);
-                hype_paging_load(g_pml4);
-                hype_debug_print("host-xhci: BAR 0x%llx is above the %uGB identity map -- mapped 1 "
-                                  "uncacheable GB into PML4[0]\n",
-                                  (unsigned long long)hx.bar_phys, HYPE_PAGING_MAX_GB);
+            /* This controller's own PD (see HYPE_XHCI_MAX_MAPPED). Clamped so a
+             * machine with more xHCI controllers than we have tables reuses the
+             * last one rather than writing past the array. */
+            {
+                unsigned int pdi = (xhci_count - 1u) < HYPE_XHCI_MAX_MAPPED
+                                       ? (xhci_count - 1u)
+                                       : (HYPE_XHCI_MAX_MAPPED - 1u);
+                if (hx.bar_phys >= 512ULL * HYPE_PAGING_1GB) {
+                    /* Outside PML4[0] entirely -- needs its own PML4 slot. */
+                    hype_paging_map_mmio_1gb(g_pml4, g_xhci_pdpt, g_xhci_pd[pdi], hx.bar_phys);
+                    hype_paging_load(g_pml4);
+                } else if (hx.bar_phys >= (uint64_t)HYPE_PAGING_MAX_GB * HYPE_PAGING_1GB) {
+                    /* Above the low identity map but inside PML4[0]: add one
+                     * uncacheable GB to the LIVE pdpt (see the helper's comment
+                     * for why neither other helper fits). */
+                    hype_paging_map_mmio_1gb_into_pdpt(g_pdpt, g_xhci_pd[pdi], hx.bar_phys);
+                    hype_paging_load(g_pml4);
+                    hype_debug_print("host-xhci: BAR 0x%llx is above the %uGB identity map -- mapped "
+                                      "1 uncacheable GB into PML4[0] (pd slot %u)\n",
+                                      (unsigned long long)hx.bar_phys, HYPE_PAGING_MAX_GB, pdi);
+                }
             }
             if (hype_xhci_host_init(hx.bar_phys, &xc) != 0) {
                 hype_debug_print("host-xhci: controller[%u] bring-up FAILED\n", xhci_count);
@@ -10493,6 +10524,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_debug_print("host-xhci: scanned %u xHCI controller(s) -- NO USB mass-storage "
                              "found on any of them\n", xhci_count);
         }
+    }
+
+    /*
+     * HYPE_USB_PROBE: stop here, deliberately, with the USB enumeration as the
+     * LAST thing on the display.
+     *
+     * On a machine with no serial port, no USB log sink (that is the very thing
+     * being diagnosed) and only cold-boot resets -- so RT-1b's in-RAM recovery
+     * is gone and RT-3c's NV tail has proven unreliable there -- the screen is
+     * the only channel left, and everything after this point (AP smoke tests,
+     * guest launch, any resulting fault storm) scrolls the answer away before
+     * it can be photographed. Halting here makes ONE photo of the final screen
+     * a complete record of the port scan. Off by default; nothing in a normal
+     * build changes.
+     */
+    if (HYPE_USB_PROBE) {
+        hype_debug_print("usb-probe: STOP -- this is a diagnostic build (-DHYPE_USB_PROBE=1); the "
+                          "xHCI enumeration above is the whole payload. Photograph this screen.\n");
+        hype_debug_flush_gop();
+        hype_halt_forever();
     }
 
     {
