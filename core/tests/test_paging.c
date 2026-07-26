@@ -203,6 +203,39 @@ static void test_map_mmio_1gb_into_pdpt_preserves_low_map(void) {
     CHECK_HEX("an unrelated unmapped slot stays absent", 0u, g_pdpt[100] & 1ULL);
 }
 
+/*
+ * PERF-2 for the high-mapped framebuffer (the Intel i5-13420H case). The point
+ * is the relative indexing: pd_tables slot 0 is the GB containing base, so a
+ * 256GB framebuffer must land in g_fb_pd[0], not g_fb_pd[256] (which would be
+ * out of bounds -- the bug this replaces).
+ */
+static void test_mark_region_wc_relative_high_framebuffer(void) {
+    uint64_t fb_base = 0x4000000000ULL; /* 256 GiB, as reported by that firmware */
+    uint64_t fb_size = 0x7e9000ULL;     /* ~8.3 MB -> 4 x 2MB pages */
+    unsigned int mapped;
+
+    hype_paging_build_identity(g_pml4, g_pdpt, g_pd, 4);
+    mapped = hype_paging_map_region_2mb(g_pdpt, g_fb_pd, fb_base, fb_size);
+    CHECK_HEX("framebuffer maps into one GB slot", 1u, mapped);
+    CHECK_HEX("precondition: mapped as plain WB (no PWT)", 0u, g_fb_pd[0][0] & HYPE_PAGING_PWT);
+
+    hype_paging_mark_region_wc_relative(g_fb_pd, fb_base, fb_size, mapped);
+
+    /* 0x7e9000 spans 2MB pages 0..3 within the GB. */
+    CHECK_HEX("pd[0] now PWT (PAT slot 1 = WC)", HYPE_PAGING_PWT, g_fb_pd[0][0] & HYPE_PAGING_PWT);
+    CHECK_HEX("pd[0] PCD cleared (PWT alone selects WC, not UC)", 0u, g_fb_pd[0][0] & HYPE_PAGING_PCD);
+    CHECK_HEX("pd[3] (last page of the ~8.3MB region) PWT", HYPE_PAGING_PWT,
+              g_fb_pd[0][3] & HYPE_PAGING_PWT);
+    CHECK_HEX("pd[0] still present+write+PS", HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_PS,
+              g_fb_pd[0][0] & (HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_PS));
+    CHECK_HEX("pd[0] address unchanged", fb_base, g_fb_pd[0][0] & 0x000FFFFFFFFFF000ULL);
+    /* Pages beyond the framebuffer keep the default type. */
+    CHECK_HEX("pd[4] (past the region) untouched", 0u, g_fb_pd[0][4] & HYPE_PAGING_PWT);
+    /* Zero size is a no-op, not a stray write. */
+    hype_paging_mark_region_wc_relative(g_fb_pd, fb_base, 0, mapped);
+    CHECK_HEX("zero size leaves pd[4] alone", 0u, g_fb_pd[0][4] & HYPE_PAGING_PWT);
+}
+
 static void test_mark_region_wc(void) {
     /* PERF-2 (#234): OR PWT into the 2MB PDEs covering the framebuffer, clear PCD,
      * leave everything else (and other pages) untouched. */
@@ -239,6 +272,7 @@ int main(void) {
     test_mark_region_wc();
     test_map_mmio_1gb_high();
     test_map_mmio_1gb_into_pdpt_preserves_low_map();
+    test_mark_region_wc_relative_high_framebuffer();
     test_encode_entry_masks_low_bits_of_address();
     test_encode_entry_nx_bit();
     test_encode_entry_flags_masked_to_allowed_bits();

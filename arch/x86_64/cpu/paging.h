@@ -116,6 +116,26 @@ unsigned int hype_paging_map_region_2mb(hype_pte_t *pdpt,
                                          hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                                          uint64_t phys_base, uint64_t size);
 
+/*
+ * PERF-2 companion for regions mapped by hype_paging_map_region_2mb: same
+ * write-combining marking as hype_paging_mark_region_wc, but for `pd_tables`
+ * whose slot 0 is the GB containing `base` rather than GB 0.
+ *
+ * The absolute-indexed version cannot be used on those tables at all: for a
+ * framebuffer at 256 GiB it would index pd_tables[256] and run off the end of
+ * the 2-entry array the caller owns (and its `gb >= gb_mapped` bound would
+ * reject the region outright). That mismatch is why a high-mapped framebuffer
+ * silently stayed uncached: the low-map branch marks WC, the high-map branch
+ * had no way to. Every console blit then paid full uncached-MMIO cost -- the
+ * ~30x the PERF-2 note above describes -- which is what made pre-EBS visibly
+ * slower on an Intel i5-13420H (framebuffer at 256 GiB) than on the AMD box
+ * (framebuffer at 0xe0000000, inside the low map and therefore already WC).
+ *
+ * `gb_mapped` is hype_paging_map_region_2mb's return value. Pure.
+ */
+void hype_paging_mark_region_wc_relative(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                                          uint64_t base, uint64_t size, unsigned int gb_mapped);
+
 /* Loads `pml4`'s physical address into CR3. Never unit tested -- see
  * paging_load.c. */
 void hype_paging_load(const hype_pte_t *pml4);

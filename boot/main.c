@@ -5631,7 +5631,22 @@ static EFI_RUNTIME_SERVICES *g_hype_rt = 0;
  * slow or refuses.
  */
 static void hype_panic_persist_tail(void) {
+    static volatile int in_hook = 0;
     EFI_STATUS st;
+
+    /*
+     * Re-entrancy guard. A panic handler must survive its own failure: if
+     * anything below faults -- a firmware SetVariable that does not tolerate
+     * being called post-EBS, or a second core panicking concurrently -- the
+     * fault lands back in hype_fatal(), which calls this hook again, and the
+     * result is an endless PANIC storm that scrolls the original cause off the
+     * only screen we have. Run once, ever; a second entrant returns
+     * immediately and lets hype_fatal() get on with halting.
+     */
+    if (in_hook) {
+        return;
+    }
+    in_hook = 1;
 
     if (g_hype_rt == 0) {
         hype_debug_print("RT-3c: no Runtime Services -- panic tail NOT saved (screen is the only "
@@ -9961,6 +9976,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             if (mapped == 0) {
                 hype_debug_print("paging: WARNING framebuffer BAR out of PML4[0] range -- "
                                   "console will go dark after CR3 load\n");
+            } else {
+                /* PERF-2 (#234) for the HIGH-mapped case too. This was missing:
+                 * only the low-map branch below marked the framebuffer
+                 * write-combining, so on a machine whose firmware parks the
+                 * framebuffer in high MMIO (Intel i5-13420H: 256 GiB) every
+                 * console blit stayed fully uncached and paid the ~30x penalty
+                 * that note describes -- which is what made pre-EBS visibly
+                 * slower there than on the AMD box, whose framebuffer at
+                 * 0xe0000000 falls in the low map and was already being fixed. */
+                hype_paging_mark_region_wc_relative(g_fb_pd, fb_base, fb_size, mapped);
+                hype_debug_print("paging: high framebuffer 0x%llx+0x%llx marked write-combining "
+                                  "(PERF-2, %u GB slot(s))\n",
+                                  (unsigned long long)fb_base, (unsigned long long)fb_size, mapped);
             }
         } else if (fb_size != 0) {
             /* PERF-2 (#234): the framebuffer sits within the low identity map, so

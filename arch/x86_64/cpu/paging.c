@@ -46,6 +46,31 @@ unsigned int hype_paging_map_mmio_1gb(hype_pte_t *pml4, hype_pte_t *pdpt, hype_p
     return pml4_idx;
 }
 
+void hype_paging_mark_region_wc_relative(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                                          uint64_t base, uint64_t size, unsigned int gb_mapped) {
+    uint64_t first, last, p, base_gb;
+
+    if (size == 0) {
+        return;
+    }
+    /* Slot 0 of pd_tables is the GB containing `base` -- the only difference
+     * from hype_paging_mark_region_wc, and the whole reason this exists. */
+    base_gb = base / HYPE_PAGING_1GB;
+    first = base & ~(HYPE_PAGING_2MB - 1ULL);
+    last = (base + size - 1ULL) & ~(HYPE_PAGING_2MB - 1ULL);
+    for (p = first; p <= last; p += HYPE_PAGING_2MB) {
+        unsigned int gb_rel = (unsigned int)((p / HYPE_PAGING_1GB) - base_gb);
+        unsigned int idx = (unsigned int)((p % HYPE_PAGING_1GB) / HYPE_PAGING_2MB);
+        if (gb_rel >= gb_mapped) {
+            break;
+        }
+        /* Only a present 2MB page gets WC; leave holes untouched. */
+        if (pd_tables[gb_rel][idx] & HYPE_PAGING_PRESENT) {
+            pd_tables[gb_rel][idx] = (pd_tables[gb_rel][idx] & ~HYPE_PAGING_PCD) | HYPE_PAGING_PWT;
+        }
+    }
+}
+
 unsigned int hype_paging_map_mmio_1gb_into_pdpt(hype_pte_t *pdpt, hype_pte_t *pd, uint64_t phys) {
     uint64_t gb = phys / HYPE_PAGING_1GB;
     unsigned int pdpt_idx = (unsigned int)(gb % HYPE_PAGING_ENTRIES_PER_TABLE);
