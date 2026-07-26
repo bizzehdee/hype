@@ -617,6 +617,12 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
     return 0;
 }
 
+uint32_t hype_xhci_port_status(const hype_xhci_ctrl_t *c, unsigned int port) {
+    volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
+
+    return rd32(bar, c->op + hype_xhci_portsc_offset(port));
+}
+
 int hype_xhci_reset_port(hype_xhci_ctrl_t *c, unsigned int port, unsigned int *out_speed) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     uint32_t off = c->op + hype_xhci_portsc_offset(port);

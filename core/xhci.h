@@ -323,6 +323,18 @@ unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_spee
  */
 int hype_xhci_reset_port(hype_xhci_ctrl_t *c, unsigned int port, unsigned int *out_speed);
 
+/*
+ * Raw PORTSC of a 1-based root port, for diagnostics only.
+ *
+ * hype_xhci_reset_port() collapses every "not usable" outcome into 0, so a scan
+ * that finds nothing cannot say WHY -- no device attached, port unpowered, reset
+ * never completed, and a port that does not exist all look identical. On the
+ * Intel i5-13420H all 16 root ports came back empty even though the machine had
+ * just booted from a stick on one of them, and with no port state logged there
+ * was nothing to go on. Read-only; touches no controller state.
+ */
+uint32_t hype_xhci_port_status(const hype_xhci_ctrl_t *c, unsigned int port);
+
 /* Disable (free) a device slot -- used to release a slot between enumeration
  * probes when the device isn't the one we're after. */
 int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot);

@@ -10317,6 +10317,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     int have_msc = 0;
 
                     if (!hype_xhci_reset_port(&xc, rp, &speed)) {
+                        /* Say WHY, per port. reset_port() collapses "no device",
+                         * "unpowered", "reset never completed" and "port does not
+                         * exist" all into 0, so a controller that finds nothing --
+                         * as happened on the Intel box across all 16 ports of a
+                         * machine that had just booted from a stick on one of them
+                         * -- left nothing to diagnose from. CCS=connected,
+                         * PED=enabled, PP=powered, PR=reset in progress. */
+                        uint32_t sc = hype_xhci_port_status(&xc, rp);
+                        hype_debug_print("host-xhci:   port %u down: PORTSC=0x%08x (CCS=%u PED=%u "
+                                          "PP=%u PR=%u speed=%u)\n",
+                                          rp, sc, (unsigned)((sc >> 0) & 1u),
+                                          (unsigned)((sc >> 1) & 1u), (unsigned)((sc >> 9) & 1u),
+                                          (unsigned)((sc >> 4) & 1u),
+                                          (unsigned)((sc >> HYPE_XHCI_PORTSC_SPEED_SHIFT) &
+                                                     HYPE_XHCI_PORTSC_SPEED_MASK));
                         continue; /* nothing connected on this root port */
                     }
                     hype_debug_print("host-xhci: port %u connected (speed id %u)\n", rp, speed);
