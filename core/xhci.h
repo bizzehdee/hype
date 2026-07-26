@@ -335,6 +335,28 @@ int hype_xhci_reset_port(hype_xhci_ctrl_t *c, unsigned int port, unsigned int *o
  */
 uint32_t hype_xhci_port_status(const hype_xhci_ctrl_t *c, unsigned int port);
 
+/*
+ * Stop a controller (clear Run/Stop, wait for HCHalted) and mark it uninited.
+ *
+ * Required before bringing up ANOTHER controller, because the DMA structures in
+ * xhci_hw.c -- DCBAA, command ring, event ring, ERST -- plus the ring cursors
+ * are single-instance, deliberately "single controller" (see their comments).
+ * hype_xhci_host_init() leaves the controller Running, so on a machine with two
+ * xHCI controllers the second one gets pointed at the exact memory the first is
+ * still live on: two controllers DMAing into one event ring, sharing one
+ * consumer cycle/dequeue state. The result is precisely what an Intel
+ * i5-13420H showed -- the first command on the second controller succeeds, then
+ * Address Device never sees its completion and the command after it reads a
+ * foreign event ("completion code 19"). A single-xHCI machine (the AMD laptop)
+ * never exercises it.
+ *
+ * Quiescing the ones we are finished with keeps exactly one controller live
+ * against the shared rings. The proper fix -- per-controller rings, so several
+ * can be up at once -- is required by #241 (full device inventory) and belongs
+ * there.
+ */
+void hype_xhci_host_quiesce(hype_xhci_ctrl_t *c);
+
 /* Disable (free) a device slot -- used to release a slot between enumeration
  * probes when the device isn't the one we're after. */
 int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot);

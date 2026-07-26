@@ -10548,7 +10548,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     hype_debug_print("host-xhci: controller[%u] -- no USB mass-storage on any root "
                                      "port or behind any hub\n", xhci_count);
                 }
-                if (msc_found) msc_found_any = 1; /* stop scanning further controllers */
+                if (msc_found) {
+                    msc_found_any = 1; /* stop scanning further controllers */
+                } else {
+                    /* Nothing here -- stop this controller before the next one is
+                     * brought up. The DCBAA / command ring / event ring in
+                     * xhci_hw.c are single-instance, so leaving this one Running
+                     * would leave two controllers DMAing into the same rings with
+                     * one shared cycle/dequeue state (see hype_xhci_host_quiesce).
+                     * That is what broke the Intel box, which is the first
+                     * two-xHCI machine this has run on. */
+                    hype_xhci_host_quiesce(&xc);
+                    hype_debug_print("host-xhci: controller[%u] quiesced (shared rings released for "
+                                      "the next controller)\n", xhci_count);
+                }
             }
         } /* while (each xHCI controller) */
         if (xhci_count == 0u) {

@@ -645,6 +645,26 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
     return 0;
 }
 
+void hype_xhci_host_quiesce(hype_xhci_ctrl_t *c) {
+    volatile uint8_t *bar;
+    uint32_t op;
+
+    if (c == 0 || !c->inited) {
+        return;
+    }
+    bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    op = c->op;
+    /* Clear Run/Stop and wait for HCHalted, so this controller stops touching
+     * the shared DCBAA / command ring / event ring before another is pointed at
+     * them. Bounded wait: a controller that will not halt must not wedge the
+     * boot -- we are giving up on it either way. */
+    wr32(bar, op + HYPE_XHCI_OP_USBCMD,
+         rd32(bar, op + HYPE_XHCI_OP_USBCMD) & ~HYPE_XHCI_USBCMD_RS);
+    (void)wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_HCH,
+                    HYPE_XHCI_USBSTS_HCH);
+    c->inited = 0;
+}
+
 uint32_t hype_xhci_port_status(const hype_xhci_ctrl_t *c, unsigned int port) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
 
