@@ -10337,6 +10337,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * Enable Slot -> Address Device -> GET_DESCRIPTOR; the first
                  * bulk-only mass-storage device found is used (others, incl.
                  * hubs, are logged + their slot freed). */
+                /*
+                 * Per-flag bitmaps across all root ports (bit N-1 = port N),
+                 * summarised on ONE line after the loop.
+                 *
+                 * The per-port lines below are right for a text log but useless
+                 * as the only channel on a screen-photo machine: 16 short lines
+                 * of 8px text per controller photograph as an illegible column.
+                 * One wide line of bitmaps carries the same answer -- which
+                 * ports see a device (CCS), which are powered (PP), which
+                 * enabled (PED) -- and stays readable in a phone photo.
+                 */
+                uint32_t ccs_mask = 0, ped_mask = 0, pp_mask = 0;
                 for (rp = 1u; rp <= xc.max_ports && !msc_found; rp++) {
                     unsigned int speed = 0, slot = 0, cfglen = 0;
                     static uint8_t desc[18];
@@ -10346,8 +10358,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     hype_xhci_devpath_t msc_path;  /* the confirmed MSC's topology */
                     unsigned int msc_slot = 0;
                     int have_msc = 0;
+                    int port_up;
 
-                    if (!hype_xhci_reset_port(&xc, rp, &speed)) {
+                    /* Record this port's state whether or not it comes up, so the
+                     * summary line describes every port scanned rather than only
+                     * the failures (which would report CCS=0 even on a controller
+                     * where a device was found). */
+                    port_up = hype_xhci_reset_port(&xc, rp, &speed);
+                    {
+                        uint32_t s0 = hype_xhci_port_status(&xc, rp);
+                        if (s0 & 1u) ccs_mask |= (1u << (rp - 1u));
+                        if (s0 & 2u) ped_mask |= (1u << (rp - 1u));
+                        if (s0 & (1u << 9)) pp_mask |= (1u << (rp - 1u));
+                    }
+                    if (!port_up) {
                         /* Say WHY, per port. reset_port() collapses "no device",
                          * "unpowered", "reset never completed" and "port does not
                          * exist" all into 0, so a controller that finds nothing --
@@ -10511,6 +10535,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         }
                     }
                 }
+                /* The one line that matters when the screen is the only channel.
+                 * Read it as: any CCS bit set => a device IS visible there and
+                 * our reset/enable path is what failed; CCS=0 with PP set on the
+                 * controller that owns the USB-A ports => the port is powered but
+                 * reports nothing attached, i.e. not routed to this controller. */
+                hype_debug_print("usb-probe: ctrl[%u] %02x:%02x.%x ports=%u CCS=0x%04x PED=0x%04x "
+                                  "PP=0x%04x (bit0=port1)\n",
+                                  xhci_count, (unsigned)hx.bus, (unsigned)hx.dev, (unsigned)hx.func,
+                                  xc.max_ports, ccs_mask, ped_mask, pp_mask);
                 if (!msc_found) {
                     hype_debug_print("host-xhci: controller[%u] -- no USB mass-storage on any root "
                                      "port or behind any hub\n", xhci_count);
@@ -10540,8 +10573,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * build changes.
      */
     if (HYPE_USB_PROBE) {
-        hype_debug_print("usb-probe: STOP -- this is a diagnostic build (-DHYPE_USB_PROBE=1); the "
-                          "xHCI enumeration above is the whole payload. Photograph this screen.\n");
+        /* Deliberately reuse RT-3c's capture: this is not a panic, but the same
+         * NV tail is exactly what we want persisted, so the result survives to
+         * the next boot as \hype-diag-prev.txt and the photo becomes a backup
+         * rather than the only copy. */
+        hype_panic_persist_tail();
+        hype_debug_print("usb-probe: STOP -- diagnostic build (-DHYPE_USB_PROBE=1). The usb-probe "
+                          "ctrl[] line(s) above are the payload; photograph them, and the same text "
+                          "is saved to NV -- reboot once and read \\hype-diag-prev.txt.\n");
         hype_debug_flush_gop();
         hype_halt_forever();
     }
