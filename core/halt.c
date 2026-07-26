@@ -26,9 +26,35 @@ void hype_wait_for_interrupt(void) {
  * and are fully unit tested.
  */
 __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
+    static volatile int in_panic = 0;
     char msg[192];
     va_list ap;
     hype_gop_console_t *gop;
+
+    /*
+     * A panic must survive faulting inside its own handler.
+     *
+     * Everything below this point can fault: the GOP paint writes to a
+     * framebuffer that may be exactly what is broken, and the flush hook calls
+     * firmware. Any such fault lands in the ISR, which calls hype_fatal()
+     * again, which paints again... An Intel i5-13420H showed the full shape of
+     * it: one real GP fault, then ~120 identical page faults at the same rip
+     * with interrupts already masked, terminating in a Double Fault as the
+     * stack ran out. The genuine first cause scrolled off the screen and ate
+     * the whole 16KB NV tail, so every diagnostic channel returned noise --
+     * which is precisely when a panic handler has to be at its most boring.
+     *
+     * Second and later entrants therefore say nothing and halt: the first
+     * panic's message is already out on serial + logbuf, and that is the one
+     * that matters. Interrupts are masked first so nothing interleaves.
+     */
+    __asm__ volatile("cli"); /* inline, like hype_halt_forever's hlt -- keeps the
+                              * panic path free of any dependency that could
+                              * itself be the thing that is broken. */
+    if (in_panic) {
+        hype_halt_forever();
+    }
+    in_panic = 1;
 
     va_start(ap, fmt);
     hype_vsnprintf(msg, sizeof(msg), fmt, ap);
