@@ -12,8 +12,17 @@ TARGET  := x86_64-unknown-uefi
 # struct layout links against freshly-built ones that disagree on field offsets --
 # which silently corrupted the ATAPI result struct across atapi.o/svm_vcpu.o and
 # looked like a mysterious "struct size sensitivity" (GLADDER-STRUCT / #180).
+# Build stamp, printed at boot and included in the RT-3c panic-tail line so any
+# captured log or screen photo says which build produced it. Real-hardware
+# debugging on a machine with no serial port means comparing captures that all
+# begin with identical boilerplate -- without a stamp there is no way to tell a
+# fresh capture from a stale one, which has repeatedly wasted whole cycles.
+# "-dirty" flags uncommitted changes, so an unreproducible build is obvious.
+HYPE_BUILD_ID := $(shell git describe --always --dirty --abbrev=7 2>/dev/null || echo unknown)
+
 CFLAGS  := --target=$(TARGET) -ffreestanding -fshort-wchar -mno-red-zone \
-           -Wall -Wextra -g -O1 -std=c11 -MMD -MP $(EXTRA_CFLAGS)
+           -Wall -Wextra -g -O1 -std=c11 -MMD -MP \
+           -DHYPE_BUILD_ID='"$(HYPE_BUILD_ID)"' $(EXTRA_CFLAGS)
 LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 
 BUILD_DIR := build

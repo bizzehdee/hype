@@ -96,6 +96,12 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #define HYPE_USB_PROBE 0
 #endif
 
+/* Build stamp from the Makefile (git describe). Defaulted so any build that
+ * does not pass it still compiles. */
+#ifndef HYPE_BUILD_ID
+#define HYPE_BUILD_ID "unknown"
+#endif
+
 /* VMX-1 (#35): run the self-contained VMX round-trip smoke test (CPUID->HLT
  * guest via the VMLAUNCH/VMRESUME trampoline) right after the VMM enables, on
  * an Intel/VMX backend. Off by default; flip to 1 (or -DHYPE_VMX_SMOKE_TEST=1)
@@ -5681,8 +5687,9 @@ static void hype_panic_persist_tail(void) {
      * a recoverable log waiting on the next boot is the first thing you want to
      * know when standing in front of a panicked, serial-less machine. */
     if (st == EFI_SUCCESS) {
-        hype_debug_print("RT-3c: panic tail saved to NV (%u bytes captured) -- reboot and read "
-                          "\\hype-diag-prev.txt\n", (unsigned int)hype_logbuf_len());
+        hype_debug_print("RT-3c: panic tail saved to NV (build " HYPE_BUILD_ID ", %u bytes) -- "
+                          "reboot and read \\hype-diag-prev.txt\n",
+                          (unsigned int)hype_logbuf_len());
     } else {
         hype_debug_print("RT-3c: panic tail NOT saved -- SetVariable failed (0x%llx); this firmware "
                           "refuses post-EBS NV writes, so photograph the screen\n",
@@ -9343,6 +9350,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * the Runtime Services pointer exists) so it covers the whole rest of the
      * boot, including the host device probing where #240 dies. */
     hype_fatal_set_flush_hook(hype_panic_persist_tail);
+
+    /* First thing in every log: which build this is. Captures from a
+     * serial-less machine otherwise all start with identical boilerplate. */
+    hype_debug_print("hype: build " HYPE_BUILD_ID "\n");
 
     hype_console_print(SystemTable, "hype\n");
 

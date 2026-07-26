@@ -68,17 +68,35 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
     hype_logbuf_append(msg);
     hype_logbuf_append("\n");
 
-    gop = hype_fatal_get_gop();
-    if (gop != 0) {
-        hype_gop_print(gop, "PANIC: %s\n", msg);
-        hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());
-    }
-
+    /*
+     * Persist BEFORE painting. Ordering here is load-bearing, and getting it
+     * wrong cost two real-hardware boots.
+     *
+     * The GOP paint is the least reliable step in this function -- it is MMIO to
+     * a framebuffer that may be exactly what is broken -- and the flush hook is
+     * the most valuable, being the only thing that survives to the next boot on
+     * a machine with no serial port. With the paint first, a faulting paint took
+     * the hook down with it: the nested fault re-enters, sees the latch above,
+     * and halts, so the tail was never written. (Before the latch existed the
+     * storm accidentally papered over this -- of ~120 re-entries, some got past
+     * the paint and did reach the hook, which is the only reason earlier
+     * captures existed at all. Adding the latch removed that accident and with
+     * it the capture, which is how this was found.)
+     *
+     * Cheapest and safest first (serial + logbuf, already done above), then the
+     * hook, then the paint as a best-effort extra.
+     */
     {
         hype_flush_hook_t flush = hype_fatal_get_flush_hook();
         if (flush != 0) {
             flush();
         }
+    }
+
+    gop = hype_fatal_get_gop();
+    if (gop != 0) {
+        hype_gop_print(gop, "PANIC: %s\n", msg);
+        hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());
     }
 
     hype_halt_forever();
