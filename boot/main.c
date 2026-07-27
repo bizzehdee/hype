@@ -8941,26 +8941,70 @@ static void run_pause_filter_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kin
                           : "filter never fired -- nested pause-filtering not honored here");
 }
 
+/*
+ * #237 bisect knob: run only the FIRST N tests of the battery. Default = all.
+ * Exists because #237 ("the FW-1 guest dies after the battery runs in the same
+ * boot") needs the culprit narrowed to a single test, and the target machine is
+ * cold-boot-only + serial-less -- so the search has to happen under QEMU, where
+ * one -DHYPE_SELFTEST_LIMIT=N build per probe is far cheaper than editing this
+ * list by hand and risking a mis-edit between runs.
+ */
+#ifndef HYPE_SELFTEST_LIMIT
+#define HYPE_SELFTEST_LIMIT 18
+#endif
+#define HYPE_ST_RUN(idx, call)                                                                     \
+    do {                                                                                           \
+        if ((idx) < HYPE_SELFTEST_LIMIT) {                                                         \
+            call;                                                                                  \
+        }                                                                                          \
+    } while (0)
+
 static void EFIAPI run_all_test_guests(void *arg) {
     hype_test_guest_args_t *args = (hype_test_guest_args_t *)arg;
-    run_test_guest(arg);
-    run_m3_5_linux_shim_test(args->ops, args->kind);
-    run_m4_3_pflash_mmio_test(args->ops, args->kind);
-    run_m4_4_fw_cfg_test(args->ops, args->kind);
-    run_m4_5_ahci_test(args->ops, args->kind);
-    run_video_2_ramfb_test(args->ops, args->kind);
-    run_cpumsr_test(args->ops, args->kind);
-    run_int_test(args->ops, args->kind);
-    run_input_1_test(args->ops, args->kind);
-    run_input_2_test(args->ops, args->kind);
-    run_ram_1_test(args->ops, args->kind);
-    run_pci_1_test(args->ops, args->kind);
-    run_pci_2_test(args->ops, args->kind);
-    run_iso_2_test(args->ops, args->kind);
-    run_video_3_test(args->ops, args->kind);
-    run_m5_1_test(args->ops, args->kind);
-    run_m5_2_test(args->ops, args->kind);
-    run_pause_filter_test(args->ops, args->kind); /* M4-6d4 #3: preemption mechanism proof */
+#if HYPE_SELFTEST_LIMIT != 18
+    hype_debug_print("selftest: BISECT BUILD -- running only the first %d of 18 battery tests "
+                     "(#237 search); this is NOT a full battery run\n",
+                     (int)HYPE_SELFTEST_LIMIT);
+#endif
+    HYPE_ST_RUN(0, run_test_guest(arg));
+    HYPE_ST_RUN(1, run_m3_5_linux_shim_test(args->ops, args->kind));
+    HYPE_ST_RUN(2, run_m4_3_pflash_mmio_test(args->ops, args->kind));
+    HYPE_ST_RUN(3, run_m4_4_fw_cfg_test(args->ops, args->kind));
+    HYPE_ST_RUN(4, run_m4_5_ahci_test(args->ops, args->kind));
+    HYPE_ST_RUN(5, run_video_2_ramfb_test(args->ops, args->kind));
+    HYPE_ST_RUN(6, run_cpumsr_test(args->ops, args->kind));
+    HYPE_ST_RUN(7, run_int_test(args->ops, args->kind));
+    HYPE_ST_RUN(8, run_input_1_test(args->ops, args->kind));
+    HYPE_ST_RUN(9, run_input_2_test(args->ops, args->kind));
+    HYPE_ST_RUN(10, run_ram_1_test(args->ops, args->kind));
+    HYPE_ST_RUN(11, run_pci_1_test(args->ops, args->kind));
+    HYPE_ST_RUN(12, run_pci_2_test(args->ops, args->kind));
+    HYPE_ST_RUN(13, run_iso_2_test(args->ops, args->kind));
+    HYPE_ST_RUN(14, run_video_3_test(args->ops, args->kind));
+    HYPE_ST_RUN(15, run_m5_1_test(args->ops, args->kind));
+    HYPE_ST_RUN(16, run_m5_2_test(args->ops, args->kind));
+    /* M4-6d4 #3: preemption mechanism proof */
+    HYPE_ST_RUN(17, run_pause_filter_test(args->ops, args->kind));
+
+    /*
+     * #237: hand the vCPU slots back before the real guests are created.
+     *
+     * The SVM pool has one slot per CONCURRENT vCPU (HYPE_SVM_MAX_VCPUS = 2, for
+     * vm0 and vm1). Every test guest above allocates a slot and never releases
+     * it, so with the battery enabled the counter is already past the end by the
+     * time run_fw_1_test() creates vm0's and vm1's vCPUs -- and the allocator's
+     * exhaustion clamp then hands BOTH of them the same slot. Two cores VMRUN the
+     * same VMCB and register-save context, the second guest reads garbage, and
+     * OVMF wanders into unwritten memory: under QEMU that surfaces as
+     * "undecodable MMIO NPF ... insn=(ptwalk) 00 00 00 00", on real AMD hardware
+     * it wedges the machine at the dashboard with no panic at all.
+     *
+     * That is why #237 only ever appeared in battery+guest builds and never in
+     * the live-only build, and why ONE test guest is enough to trigger it. The
+     * battery is strictly sequential and strictly earlier than the concurrent
+     * guests, so releasing here restores the invariant the pool documents.
+     */
+    hype_svm_vcpu_pool_reset();
     /* RT-2b: run_fw_1_test is deliberately NOT run here. The quick regression
      * guests above all run under `cli` (no host timer, no INTR intercept) --
      * they halt in milliseconds and need no timekeeping. efi_main brings up

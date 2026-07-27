@@ -72,6 +72,13 @@ int hype_svm_enable_on(uint64_t hsave_pa);
 /* vmm_ops.enable_on adapter for hype_svm_enable_on() -- see vmm_ops.h. */
 int hype_svm_enable_on_page(void *percore_page);
 
+/* #237: releases every vCPU slot in the SVM pool. The pool is sized for the
+ * CONCURRENT guests; the sequential self-test battery consumes slots first and
+ * would otherwise force vm0 and vm1 to share one VMCB (two cores, one VMCB).
+ * Call ONLY when no vCPU is live -- i.e. after the battery, before the real
+ * guests are created. */
+void hype_svm_vcpu_pool_reset(void);
+
 /*
  * Enables AVIC on `vmcb` (M2-4) using this project's own statically-
  * reserved AVIC backing/logical/physical ID table pages and the
