@@ -88,6 +88,14 @@ uint32_t hype_vmx_adjust_controls(uint32_t desired, uint64_t capability_msr);
  */
 int hype_vmx_enable(void);
 
+/* Enters VMX operation on the CALLING core using the caller's own VMXON region
+ * (4KB-aligned, and must stay live while that core is in VMX operation). VMXON
+ * is per-logical-processor, so every core that will VMLAUNCH needs its own --
+ * the exact analogue of SVM's per-core hype_svm_enable_on(hsave_pa), and what
+ * makes the AP landing in boot/main.c vendor-neutral. Silent by design (an AP
+ * printing here would race the BSP's console). */
+int hype_vmx_enable_on(void *vmxon_region);
+
 extern const hype_vmm_ops_t hype_vmx_ops;
 
 #endif /* HYPE_ARCH_VMX_H */

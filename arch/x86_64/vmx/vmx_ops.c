@@ -11,9 +11,10 @@
  * APICv secondary controls were dropped from the launchable VMCS build).
  */
 const hype_vmm_ops_t hype_vmx_ops = {
-    "VMX",
-    hype_vmx_enable,
-    hype_vmx_vcpu_create,
-    0,
-    hype_vmx_vcpu_run
+    .name = "VMX",
+    .enable = hype_vmx_enable,
+    .enable_on = hype_vmx_enable_on, /* #242: per-core, for the AP landing */
+    .vcpu_create = hype_vmx_vcpu_create,
+    /* .vcpu_enable_apic_accel deliberately unset -- see above. */
+    .vcpu_run = hype_vmx_vcpu_run
 };

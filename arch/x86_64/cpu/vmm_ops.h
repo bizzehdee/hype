@@ -30,8 +30,26 @@ typedef struct {
     const char *name;
 
     /* Enables VMX/SVM operation on the calling physical CPU (VMXON /
-     * setting EFER.SVME). Returns 0 on success, non-zero on failure. */
+     * setting EFER.SVME). Returns 0 on success, non-zero on failure.
+     * Uses the backend's own single static per-CPU page, so it is the
+     * BSP's entry point; a second core must use enable_on() below. */
     int (*enable)(void);
+
+    /*
+     * Same, but on the CALLING core using a caller-owned 4KB-aligned page
+     * (SVM: the VM_HSAVE_PA host-save area; VMX: the VMXON region). Both are
+     * per-logical-processor and stay in use for as long as that core is in
+     * VMX/SVM operation, so every core that will VMRUN/VMLAUNCH needs its own
+     * -- which is all the page means here; what goes in it is the backend's
+     * business, and that is exactly why this is in the vtable.
+     *
+     * #242: it is in the vtable because the AP landing previously called
+     * hype_svm_enable_on() directly. That was correct when SVM was the only
+     * backend and silently wrong afterwards -- on Intel the AP set EFER.SVME,
+     * a reserved bit there, and #GP'd on every boot. Going through the ops
+     * table means an AP has no backend left to pick wrongly.
+     */
+    int (*enable_on)(void *percore_page);
 
     /*
      * Allocates and minimally initializes a vCPU context: the guest

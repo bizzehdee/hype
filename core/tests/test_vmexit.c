@@ -74,7 +74,7 @@ static int mock_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
 
 static void test_dispatch_loop_guest_halted(void) {
     struct fake_ctx fake;
-    hype_vmm_ops_t ops = {"mock", 0, 0, 0, mock_vcpu_run};
+    hype_vmm_ops_t ops = {.name = "mock", .vcpu_run = mock_vcpu_run};
     hype_vmexit_info_t info;
 
     g_mock_entry_fails = 0;
@@ -86,7 +86,7 @@ static void test_dispatch_loop_guest_halted(void) {
 
 static void test_dispatch_loop_fatal_exit(void) {
     struct fake_ctx fake;
-    hype_vmm_ops_t ops = {"mock", 0, 0, 0, mock_vcpu_run};
+    hype_vmm_ops_t ops = {.name = "mock", .vcpu_run = mock_vcpu_run};
     hype_vmexit_info_t info;
 
     g_mock_entry_fails = 0;
@@ -98,7 +98,7 @@ static void test_dispatch_loop_fatal_exit(void) {
 
 static void test_dispatch_loop_entry_failure(void) {
     struct fake_ctx fake;
-    hype_vmm_ops_t ops = {"mock", 0, 0, 0, mock_vcpu_run};
+    hype_vmm_ops_t ops = {.name = "mock", .vcpu_run = mock_vcpu_run};
     hype_vmexit_info_t info;
 
     g_mock_entry_fails = 1;

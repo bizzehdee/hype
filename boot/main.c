@@ -61,6 +61,7 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #include "../arch/x86_64/svm/npt.h"
 #include "../arch/x86_64/svm/svm.h"
 #include "../arch/x86_64/vmx/vmcs.h" /* VMX-2: vcpu_create_long_mode + handlers */
+#include "../arch/x86_64/vmx/vmx.h"  /* #242: hype_vmx_enable_on for the AP landing */
 #include "../core/linux_boot.h"
 #include "../devices/pic.h"
 #include "../devices/pit.h"
@@ -747,11 +748,16 @@ static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
 /* Stashed for fw_1_ap_main to run the guest on the AP (set in efi_main). */
 static const hype_vmm_ops_t *g_fw_1_ops;
 static hype_vmm_kind_t g_fw_1_kind;
-/* M8-0b-ii: each AP's own SVM host-save area (SVME/VM_HSAVE_PA are per-core, so
- * two APs VMRUNning concurrently MUST NOT share one) + a flag an AP sets once
- * it has enabled SVM on its core without faulting. Indexed by VM/AP index. */
-static uint8_t g_ap_hsave[HYPE_FW_MAX_VMS][4096] __attribute__((aligned(4096)));
-static volatile uint32_t g_fw_1_ap_svm_ok;
+/* M8-0b-ii: each AP's own per-core VMM page + a flag an AP sets once it has
+ * enabled the VMM on its core without faulting. Indexed by VM/AP index.
+ *
+ * #242: one array serves both backends. SVM's VM_HSAVE_PA host-save area and
+ * VMX's VMXON region are both a 4KB-aligned page that is per-logical-processor
+ * and stays in use for as long as that core is in SVM/VMX operation -- so two
+ * APs MUST NOT share one, and which of the two it *is* is the backend's
+ * business, reached through ops->enable_on (see vmm_ops.h). */
+static uint8_t g_ap_vmm_page[HYPE_FW_MAX_VMS][4096] __attribute__((aligned(4096)));
+static volatile uint32_t g_fw_1_ap_vmm_ok;
 /* AP-bring-up result, latched so the diag tick can re-emit it (the one-shot
  * AP-SMOKETEST line prints too early to survive in the 16KB nvlog tail).
  * -2 = smoketest not reached; -3 = skipped (no <1MB trampoline page);
@@ -821,8 +827,30 @@ static void fw_1_ap_main(void *arg) {
     hype_gdt_load(g_gdt, HYPE_GDT_ENTRY_COUNT);
     hype_idt_load(g_idt, HYPE_IDT_ENTRY_COUNT);
     hype_paging_set_pat_wc(); /* PERF-2 (#234): PAT slot 1 = WC on this AP (it blits the FB) */
-    hype_svm_enable_on((uint64_t)(uintptr_t)g_ap_hsave[vm_idx]); /* faults never return */
-    g_fw_1_ap_svm_ok = 1;
+    /*
+     * #242: enable the VMM on this core through the SAME vendor dispatch the BSP
+     * used, not a hardcoded backend.
+     *
+     * This line used to call hype_svm_enable_on() unconditionally -- written
+     * during M8-0b, when SVM was the only backend, and never revisited when the
+     * VMX backend landed. On an Intel i5-13420H the AP therefore reached
+     * hype_svm_enable_on and executed `wrmsr` with ECX=0xC0000080 setting
+     * EFER.SVME (bit 12), which is a RESERVED bit on Intel: #GP(0), i.e. exactly
+     * the "vector=13 error_code=0x0 rip=0x14002160f" panic that ended every
+     * Intel boot. It was invisible on AMD for the obvious reason, and invisible
+     * to the microtests because those all run on the BSP.
+     *
+     * Going through ops->enable_on leaves no backend for this core to pick
+     * wrongly: g_fw_1_ops is the table the BSP already selected by vendor. A
+     * NULL ops (HYPE_VMM_KIND_NONE -- no usable VMM) is a real case, and then we
+     * touch neither MSR: on such a core both writes fault, and there is nothing
+     * for the AP to VMRUN anyway.
+     */
+    if (g_fw_1_ops != 0 && g_fw_1_ops->enable_on != 0) {
+        /* SVM's variant faults rather than returning non-zero, so on AMD a
+         * non-fatal return is already success; VMX's reports VMXON's CF. */
+        g_fw_1_ap_vmm_ok = (g_fw_1_ops->enable_on(g_ap_vmm_page[vm_idx]) == 0) ? 1u : 0u;
+    }
     g_hype_ap_c_alive = 1;
 #if HYPE_229_AP_AHCI_PROBE
     /* #229 isolation microtest: does hype_ahci_host_read complete when issued
@@ -7027,14 +7055,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  (unsigned int)g_hype_pvclock_arm_count);
                 /* M8-0b: re-emit the AP bring-up result every tick so it survives
                  * in the nvlog tail to login (the one-shot AP-SMOKETEST prints too
-                 * early). rc=0 + svm_ok=1 => the second core came up on real HW. */
+                 * early). rc=0 + vmm_ok=1 => the second core came up on real HW. */
                 hype_debug_print(
                     "fw-1 AP: rc=%d tramp=0x%llx host_cr3=0x%llx ap_cr3=0x%llx phase=%u "
-                    "c_alive=%u svm_ok=%u\n",
+                    "c_alive=%u vmm_ok=%u\n",
                     g_fw_1_ap_rc, (unsigned long long)g_ap_tramp_page,
                     (unsigned long long)g_fw_1_ap_cr3, (unsigned long long)g_ap_cr3,
                     (unsigned int)g_hype_ap_last_phase, (unsigned int)g_hype_ap_c_alive,
-                    (unsigned int)g_fw_1_ap_svm_ok);
+                    (unsigned int)g_fw_1_ap_vmm_ok);
                 /* STEP 2a: second AP (apic_id=2) bring-up result, likewise
                  * re-emitted so it survives to login. rc=0 => hype started a
                  * SECOND core -- the foundation for two Alpines on two cores. */
@@ -10875,10 +10903,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             g_fw_1_ap_rc = ap_rc;
             hype_debug_print(
                 "fw-1 AP-SMOKETEST: apic_id=1 tramp=0x%llx cr3=0x%llx -> rc=%d (long-mode reached=%s), "
-                "last_phase=%u (0=none 1=real 2=prot 3=long) c_entry_ran=%u ap_svm_ok=%u\n",
+                "last_phase=%u (0=none 1=real 2=prot 3=long) c_entry_ran=%u ap_vmm_ok=%u\n",
                 (unsigned long long)g_ap_tramp_page, (unsigned long long)cr3, ap_rc,
                 (ap_rc == 0) ? "yes" : "NO", (unsigned int)g_hype_ap_last_phase,
-                (unsigned int)g_hype_ap_c_alive, (unsigned int)g_fw_1_ap_svm_ok);
+                (unsigned int)g_hype_ap_c_alive, (unsigned int)g_fw_1_ap_vmm_ok);
 
             /*
              * STEP 2a: bring up a SECOND AP (apic_id=2) to prove hype can start

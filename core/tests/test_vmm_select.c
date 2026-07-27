@@ -40,11 +40,41 @@ static void test_select_invalid_kind(void) {
     }
 }
 
+/*
+ * #242 regression guard. The AP landing enables the VMM on its own core via
+ * ops->enable_on; it used to call SVM's version directly, which on Intel wrote
+ * EFER.SVME -- reserved there -- and #GP'd on every boot. A backend that leaves
+ * enable_on NULL would silently bring an AP up with no VMM enabled and fault at
+ * the first VMRUN/VMLAUNCH instead, so assert BOTH are wired, and that each
+ * backend has its own (a copy-paste of the wrong one is the original bug back).
+ */
+static void test_both_backends_wire_percore_enable(void) {
+    if (hype_svm_ops.enable_on == 0) {
+        printf("FAIL: hype_svm_ops.enable_on is NULL -- an AP could not enable SVM\n");
+        failures++;
+    }
+    if (hype_vmx_ops.enable_on == 0) {
+        printf("FAIL: hype_vmx_ops.enable_on is NULL -- an AP could not enable VMX\n");
+        failures++;
+    }
+    if (hype_svm_ops.enable_on == hype_vmx_ops.enable_on) {
+        printf("FAIL: SVM and VMX share one enable_on -- one vendor is running the "
+               "other's per-core enable (that IS #242)\n");
+        failures++;
+    }
+    /* Same for the BSP's entry point, for the same reason. */
+    if (hype_svm_ops.enable == hype_vmx_ops.enable) {
+        printf("FAIL: SVM and VMX share one enable\n");
+        failures++;
+    }
+}
+
 int main(void) {
     test_select_vmx();
     test_select_svm();
     test_select_none();
     test_select_invalid_kind();
+    test_both_backends_wire_percore_enable();
 
     if (failures == 0) {
         printf("all tests passed\n");

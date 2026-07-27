@@ -69,6 +69,9 @@ int hype_svm_enable(void);
  * AP calls it, and printing there would race the BSP). */
 int hype_svm_enable_on(uint64_t hsave_pa);
 
+/* vmm_ops.enable_on adapter for hype_svm_enable_on() -- see vmm_ops.h. */
+int hype_svm_enable_on_page(void *percore_page);
+
 /*
  * Enables AVIC on `vmcb` (M2-4) using this project's own statically-
  * reserved AVIC backing/logical/physical ID table pages and the

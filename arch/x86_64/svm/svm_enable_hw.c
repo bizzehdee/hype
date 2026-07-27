@@ -38,6 +38,13 @@ int hype_svm_enable_on(uint64_t hsave_pa) {
     return 0;
 }
 
+/* vmm_ops.enable_on adapter: the vtable speaks in "this core's own 4KB page"
+ * (see vmm_ops.h) while SVM's own API takes the host-save area's physical
+ * address. hype is identity-mapped, so the pointer IS the physical address. */
+int hype_svm_enable_on_page(void *percore_page) {
+    return hype_svm_enable_on((uint64_t)(uintptr_t)percore_page);
+}
+
 /*
  * Exempt from unit testing per AGENTS.md: real RDMSR/WRMSR, nothing to
  * observe without a real CPU. hype_svm_efer_with_svme() in svm_bits.c
