@@ -10,7 +10,12 @@
 #include "../../../devices/fw_cfg.h"
 #include "../../../devices/pci.h"
 #include "../../../devices/virtio_blk.h"
+#include "../../../devices/cmos.h"
+#include "../../../devices/guest_lapic.h"
+#include "../../../devices/guest_uart.h"
+#include "../../../devices/ioapic.h"
 #include "../../../devices/pflash.h"
+#include "../../../devices/pvclock.h" /* VMX-4: hype_pvclock_calc_scale */
 #include "../../../devices/pic.h"
 #include "../../../devices/pit.h"
 #include "../../../devices/ps2_keyboard.h"
@@ -20,6 +25,17 @@
 #include "../cpu/msr_emulate.h"
 #include "../cpu/paging.h"
 #include "../cpu/vmm_ops.h"
+/*
+ * VMX-4 (#236): for the pending-interrupt IRR bit helpers (hype_svm_irr_set/
+ * clear/any/highest) and hype_svm_can_accept_interrupt(). These are pure,
+ * unit-tested bit logic with no VMCB access, and the VMX interrupt path needs
+ * exactly the same rules -- so it calls them rather than growing a second
+ * implementation to drift out of sync. #242 was a duplicated vendor path that
+ * diverged, and re-deriving interrupt priority per backend is the same trap.
+ * (Follow-up worth doing: relocate them to a vendor-neutral arch/x86_64/cpu
+ * home so VMX need not include an SVM header at all.)
+ */
+#include "../svm/vmcb.h"
 #include "ept.h"
 
 #define HYPE_VMX_MMIO_MAX_INSTR_BYTES 15u
@@ -64,18 +80,45 @@ extern uint64_t hype_vmx_launch(hype_vcpu_ctx_t *ctx, uint64_t launched);
 struct hype_vcpu_ctx {
     uint64_t gprs[16];
     int launched; /* 0 until the first successful VMLAUNCH; VMRESUME thereafter. */
-    /* Pending external interrupt (INT-1/INT-2 on VMX). One vector is all this
-     * project's single-IRQ-source test scope needs (mirrors the SVM comment).
-     * Staged into VM_ENTRY_INTR_INFO once the guest can accept it, via an
-     * interrupt-window exit. */
-    int intr_pending;
-    uint8_t intr_vector;
+    /*
+     * Pending external interrupts (INT-1/INT-2 on VMX), staged into
+     * VM_ENTRY_INTR_INFO once the guest can accept one.
+     *
+     * VMX-4 (#236): this was a single `intr_pending`/`intr_vector` slot, which
+     * was fine for the microtests (one IRQ source, one vector in flight) but
+     * silently WRONG for a live guest: FW-1 has five sources -- PIT IRQ0,
+     * keyboard IRQ1, COM1 IRQ4, mouse IRQ12 and the LAPIC timer -- so a second
+     * vector arriving before the first was injected would overwrite it and the
+     * interrupt would be lost. Now a 256-bit IRR, matching the SVM ctx.
+     */
+    uint32_t pending_irr[8];
+    /* M4-6b1: the guest's pvclock shared page, if it enabled one. */
+    const hype_gpa_map_t *pvclock_map;
 };
 
-/* Single test vCPU: the M2-M4-5 microtests run sequentially on the BSP, so
+/*
+ * Single test vCPU: the M2-M4-5 microtests run sequentially on the BSP, so
  * one static slot suffices (contrast the SVM pool, which runs two guests on
- * two cores concurrently). Revisit if VMX ever dispatches concurrent guests. */
+ * two cores concurrently).
+ *
+ * VMX-4 (#236): this is the VMX analogue of #237 and MUST be fixed before two
+ * concurrent Intel guests. #237 was the SVM slot pool silently clamping so vm0
+ * and vm1 shared one VMCB on two cores -- here there is not even a pool, just
+ * one ctx and one VMCS, so two guests would collide outright. A single live
+ * guest (this ticket's first bar) is safe; two is not. Fixing it means a pool
+ * of ctx + VMCS regions AND per-VM EPT roots + VPID, since the EPT here is one
+ * global identity map.
+ */
 static struct hype_vcpu_ctx g_vmx_ctx;
+
+/* Clear the per-entry pending state a fresh vCPU must not inherit. */
+static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
+    unsigned i;
+    for (i = 0; i < 8u; i++) {
+        ctx->pending_irr[i] = 0;
+    }
+    ctx->pvclock_map = 0;
+}
 
 static void hype_vmx_host_exit_stub(void) {
     for (;;) {
@@ -553,10 +596,24 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
     uint64_t eptp;
     unsigned i;
 
-    (void)ept_or_npt_root;
-
-    hype_ept_build_identity(g_ept_pml4, g_ept_pdpt, g_ept_pd, HYPE_EPT_MAX_GB);
-    eptp = hype_vmx_make_eptp((uint64_t)(uintptr_t)g_ept_pml4);
+    /*
+     * VMX-4 (#236): a NON-ZERO ept_or_npt_root is the caller's own EPT PML4
+     * physical address, used verbatim. That is how the FW-1 live guest gets a
+     * non-identity address space -- its RAM sits wherever UEFI allocated it but
+     * must appear at guest-physical 0, which an identity EPT cannot express.
+     * Zero keeps the built-in identity EPT, which is what the microtests want
+     * (their guests genuinely are identity-mapped).
+     *
+     * The parameter is named for SVM's NPT root because it is a shared vtable
+     * slot; on VMX the value must be an EPT PML4, never an NPT one -- the two
+     * encodings are not interchangeable, so the caller picks per backend.
+     */
+    if (ept_or_npt_root != 0) {
+        eptp = hype_vmx_make_eptp(ept_or_npt_root);
+    } else {
+        hype_ept_build_identity(g_ept_pml4, g_ept_pdpt, g_ept_pd, HYPE_EPT_MAX_GB);
+        eptp = hype_vmx_make_eptp((uint64_t)(uintptr_t)g_ept_pml4);
+    }
 
     /* cs_base = guest_rip, rip = 0: the guest starts executing at physical
      * guest_rip in real mode (CS.base:IP = guest_rip:0). */
@@ -568,7 +625,7 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
         ctx->gprs[i] = 0;
     }
     ctx->launched = 0;
-    ctx->intr_pending = 0;
+    vmx_ctx_reset_pending(ctx);
     return (hype_vcpu_ctx_t *)ctx;
 }
 
@@ -600,7 +657,7 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
         ctx->gprs[i] = 0;
     }
     ctx->launched = 0;
-    ctx->intr_pending = 0;
+    vmx_ctx_reset_pending(ctx);
     return (hype_vcpu_ctx_t *)ctx;
 }
 
@@ -641,6 +698,13 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
  * length the CPU recorded (VM_EXIT_INSTRUCTION_LEN) -- the VMX analogue of
  * SVM's "rip += 2" for CPUID/RDMSR/WRMSR (all coincidentally 2 bytes, but the
  * VMCS field is authoritative and works for any emulated instruction). */
+/* Host TSC. The ACPI PM timer scales from this, as SVM's real_rdtsc() does. */
+static inline uint64_t vmx_real_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
 static void vmx_advance_rip(void) {
     int ok;
     uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
@@ -1174,26 +1238,21 @@ struct vmx_mmio_access {
     hype_mmio_decode_t decoded;
     uint64_t rip;
 };
+static int vmx_mmio_begin_insn(struct hype_vcpu_ctx *real, uint64_t base, uint64_t size,
+                               const uint8_t *insn, struct vmx_mmio_access *m);
+
+/*
+ * EPT-violation preamble for a guest whose linear==physical==host (the
+ * microtests): decode the faulting instruction straight out of guest memory at
+ * GUEST_RIP. FW-1's live guest is NOT such a guest -- it remaps guest RAM and
+ * the flash window away from identity -- so that path uses
+ * vmx_mmio_begin_insn() with caller-resolved bytes instead (VMX-4, #236).
+ */
 static int vmx_mmio_begin(struct hype_vcpu_ctx *real, uint64_t base, uint64_t size,
                           struct vmx_mmio_access *m) {
     int ok;
-    uint64_t gpa = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
-    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
-    m->rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
-    m->is_write = (int)((qual >> 1) & 1u);
-    if (gpa < base || gpa >= base + size) {
-        return -1;
-    }
-    m->offset = (uint32_t)(gpa - base);
-    if (hype_mmio_decode((const uint8_t *)(uintptr_t)m->rip, HYPE_VMX_MMIO_MAX_INSTR_BYTES,
-                         &m->decoded) != 0) {
-        return -1;
-    }
-    if (m->decoded.is_write != m->is_write) {
-        return -1;
-    }
-    m->reg = vmx_gpr_ptr(real, m->decoded.reg);
-    return (m->reg == 0) ? -1 : 0;
+    uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    return vmx_mmio_begin_insn(real, base, size, (const uint8_t *)(uintptr_t)rip, m);
 }
 static void vmx_mmio_end(struct vmx_mmio_access *m) {
     vmwrite(HYPE_VMCS_GUEST_RIP, m->rip + m->decoded.instr_len);
@@ -1271,12 +1330,18 @@ int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
  * hype_svm_vcpu_handle_virtio_blk_npf. Routes the BAR offset to the virtio
  * common/notify/ISR/device-config regions; a notify write kicks the queue,
  * drained by the shared process_virtio_blk_queue() (dma_map 0 = identity). */
-int hype_vmx_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
-                                        const hype_blk_backend_t *be, uint64_t mmio_base_phys) {
-    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+/*
+ * Common virtio-blk MMIO body (VMX-4, #236). Was the whole of
+ * hype_vmx_vcpu_handle_virtio_blk_npf; now shared with the live-guest entry
+ * point below, which differs only in supplying real instruction bytes and a
+ * real dma_map. Mirrors how the SVM side shares hype_svm_ahci_atapi_npf_common.
+ */
+static int vmx_virtio_blk_npf_common(struct hype_vcpu_ctx *real, hype_virtio_blk_t *dev,
+                                     const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
+                                     uint64_t mmio_base_phys, const uint8_t *insn) {
     struct vmx_mmio_access m;
     uint32_t off;
-    if (vmx_mmio_begin(real, mmio_base_phys, HYPE_VIRTIO_BLK_BAR_SIZE, &m) != 0) {
+    if (vmx_mmio_begin_insn(real, mmio_base_phys, HYPE_VIRTIO_BLK_BAR_SIZE, insn, &m) != 0) {
         return -1;
     }
     off = m.offset;
@@ -1301,7 +1366,7 @@ int hype_vmx_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
                off < HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET + 4u) {
         if (m.decoded.is_write) {
             if (hype_virtio_blk_is_queue_ready(dev)) {
-                if (process_virtio_blk_queue(dev, be, 0) != 0) {
+                if (process_virtio_blk_queue(dev, be, dma_map) != 0) {
                     return -1;
                 }
             }
@@ -1371,11 +1436,70 @@ static void vmx_set_intr_window(int on) {
  * unconditionally (rather than trying to inject inline) is correct because the
  * guest's RFLAGS at request time is its initial state (IF=0), before it STIs.
  */
+/* VM_ENTRY_INTR_INFO for an external interrupt: valid (bit 31) | type 0 | vector. */
+#define HYPE_VMX_ENTRY_INTR_EXT(vec) (0x80000000u | (uint32_t)(vec))
+/* Is an event already staged for the next VM-entry? Must never be clobbered. */
+static int vmx_entry_event_staged(void) {
+    int ok;
+    return (int)((vmread(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, &ok) >> 31) & 1u);
+}
+/* Can the guest accept an external interrupt right now? Shares SVM's
+ * unit-tested predicate rather than re-deriving the IF/shadow rules here --
+ * #242 was precisely a duplicated-and-diverged vendor path. */
+static int vmx_can_accept_interrupt(void) {
+    int ok;
+    uint64_t rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
+    uint64_t block = vmread(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE, &ok);
+    return hype_svm_can_accept_interrupt(rflags, block);
+}
+
 void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
-    real->intr_pending = 1;
-    real->intr_vector = vector;
-    vmx_set_intr_window(1);
+    /* VMX-4: queue into the IRR instead of overwriting a single slot, then
+     * inject immediately if the guest is ready (INT-1) or arm an
+     * interrupt-window exit to inject later (INT-2). Same shape as SVM's
+     * hype_svm_vcpu_request_interrupt. */
+    hype_svm_irr_set(real->pending_irr, vector);
+    if (!vmx_entry_event_staged() && vmx_can_accept_interrupt()) {
+        int v = hype_svm_irr_highest(real->pending_irr);
+        if (v >= 0) {
+            hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+            vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
+        }
+    }
+    /* Keep the window armed while anything remains queued. */
+    vmx_set_intr_window(hype_svm_irr_any(real->pending_irr) ? 1 : 0);
+}
+
+/*
+ * VMX-4: the analogue of hype_svm_vcpu_deliver_pending_if_ready -- poll-inject
+ * a queued vector the moment the guest can take it, rather than relying solely
+ * on the interrupt-window exit firing. On SVM this fixed a real wedge (a
+ * deferred PIT IRQ0 stranded while the guest was ready, freezing jiffies and
+ * hanging libata's post-COMRESET msleep); the same failure mode applies here.
+ * Returns 1 if it injected.
+ */
+int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int v;
+
+    if (!hype_svm_irr_any(real->pending_irr)) {
+        return 0;
+    }
+    if (vmx_entry_event_staged()) {
+        return 0; /* an event is already staged for the next VM-entry */
+    }
+    if (!vmx_can_accept_interrupt()) {
+        return 0;
+    }
+    v = hype_svm_irr_highest(real->pending_irr);
+    if (v < 0) {
+        return 0;
+    }
+    hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+    vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
+    vmx_set_intr_window(hype_svm_irr_any(real->pending_irr) ? 1 : 0);
+    return 1;
 }
 
 /*
@@ -1387,12 +1511,14 @@ void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
  */
 void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
-    if (real->intr_pending) {
-        uint32_t info = 0x80000000u | (uint32_t)real->intr_vector; /* valid | type0 | vector */
-        vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, info);
-        real->intr_pending = 0;
+    int v = hype_svm_irr_highest(real->pending_irr);
+    if (v >= 0 && !vmx_entry_event_staged()) {
+        hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
     }
-    vmx_set_intr_window(0);
+    /* VMX-4: stay armed if more vectors are queued -- disarming unconditionally
+     * here would strand every vector after the first. */
+    vmx_set_intr_window(hype_svm_irr_any(real->pending_irr) ? 1 : 0);
 }
 
 /*
@@ -1462,4 +1588,656 @@ int hype_vmx_smoke_test(void) {
     }
     hype_debug_print("vmx-smoke: no HLT within 4 exits -- FAIL\n");
     return -1;
+}
+
+/* ===================================================================== *
+ * VMX-4 (#236): the vCPU state accessors the FW-1 live-guest loop needs.
+ *
+ * Each is the VMX counterpart of an identically-named hype_svm_vcpu_*
+ * function, reached through the vmm_* shims in boot/main.c. Where SVM reads
+ * or writes a VMCB field directly, VMX uses VMREAD/VMWRITE on the equivalent
+ * VMCS field; the semantics the caller sees are identical.
+ * ===================================================================== */
+
+uint64_t hype_vmx_vcpu_get_cr3(hype_vcpu_ctx_t *ctx) {
+    int ok;
+    (void)ctx;
+    return vmread(HYPE_VMCS_GUEST_CR3, &ok);
+}
+
+void hype_vmx_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip) {
+    (void)ctx;
+    vmwrite(HYPE_VMCS_GUEST_RIP, rip);
+}
+
+/*
+ * No Decode Assist on VMX: the VMCS has no analogue of SVM's
+ * num_bytes_fetched/guest_instruction_bytes, so report "none fetched" and let
+ * the caller fall back to its page-table walk (fw_1_insn_bytes_via_ptwalk()).
+ * That is not a loss -- svm_vcpu.c does not trust Decode Assist either (its own
+ * comment records it as not reliably populated under nested SVM even when CPUID
+ * advertises it), so the ptwalk path is the one both backends actually use.
+ */
+const uint8_t *hype_vmx_vcpu_guest_insn_bytes(hype_vcpu_ctx_t *ctx, uint8_t *out_num) {
+    (void)ctx;
+    if (out_num != 0) {
+        *out_num = 0;
+    }
+    return 0;
+}
+
+/* The EPT violation that caused this exit, in the vendor-neutral shape. */
+void hype_vmx_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_vmm_npf_t *out) {
+    int ok;
+    (void)ctx;
+    out->guest_phys_addr = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
+    out->is_write = (int)((vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok) >> 1) & 1u);
+}
+
+/*
+ * Decode the I/O exit qualification (SDM Table 28-5) without consuming the
+ * exit: bits 2:0 size (0/1/3 => 1/2/4 bytes), bit 3 direction (1=IN), bit 4
+ * string, bit 5 REP, bits 31:16 port.
+ *
+ * Note VMX reports the *operand* size here but not the address size, which SVM
+ * does carry (ADDR16/32/64 in EXITINFO1). For string I/O the address size is
+ * needed to index (E/R)SI/(E/R)DI, so derive it from the guest's current mode
+ * rather than guessing: 64-bit if EFER.LMA, else 32 if CS.D, else 16.
+ */
+static void vmx_decode_ioio(hype_vmm_ioio_t *out) {
+    int ok;
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    uint32_t sz = (uint32_t)(qual & 7u);
+    out->port = (uint16_t)((qual >> 16) & 0xFFFFu);
+    out->is_in = (int)((qual >> 3) & 1u);
+    out->is_string = (int)((qual >> 4) & 1u);
+    out->is_rep = (int)((qual >> 5) & 1u);
+    out->size_bytes = (uint8_t)(sz == 0u ? 1u : (sz == 1u ? 2u : 4u));
+    {
+        uint64_t efer = vmread(HYPE_VMCS_GUEST_IA32_EFER, &ok);
+        uint64_t cs_ar = vmread(HYPE_VMCS_GUEST_CS_AR_BYTES, &ok);
+        if ((efer & (1ULL << 10)) != 0) { /* EFER.LMA: 64-bit mode */
+            out->addr_size_bytes = 8u;
+        } else if ((cs_ar & (1ULL << 14)) != 0) { /* CS.D */
+            out->addr_size_bytes = 4u;
+        } else {
+            out->addr_size_bytes = 2u;
+        }
+    }
+}
+
+void hype_vmx_vcpu_peek_ioio(hype_vcpu_ctx_t *ctx, hype_vmm_ioio_t *out) {
+    (void)ctx;
+    vmx_decode_ioio(out);
+}
+
+/* Unhandled port I/O: report it and step over the instruction so the guest
+ * makes progress (GLADDER-1's absorb-rather-than-die posture). */
+void hype_vmx_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_vmm_ioio_t *out) {
+    (void)ctx;
+    vmx_decode_ioio(out);
+    if (out->is_in) {
+        /* An unmodelled port reads as all-ones, the same "nothing there" answer
+         * real hardware gives on an unclaimed port. */
+        struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+        uint64_t mask = (out->size_bytes == 1u) ? 0xFFULL
+                                               : ((out->size_bytes == 2u) ? 0xFFFFULL : 0xFFFFFFFFULL);
+        real->gprs[0] |= mask;
+    }
+    vmx_advance_rip();
+}
+
+void hype_vmx_vcpu_set_exception_intercepts(hype_vcpu_ctx_t *ctx, uint32_t mask) {
+    (void)ctx;
+    vmwrite(HYPE_VMCS_EXCEPTION_BITMAP, mask);
+}
+
+/*
+ * Exit on an external interrupt, so host timekeeping stays alive while a guest
+ * runs (SVM's INTR intercept). Read-modify-write: the pin-based controls also
+ * carry bits the VMCS build set, and clobbering them would fail VM-entry.
+ */
+void hype_vmx_vcpu_enable_intr_intercept(hype_vcpu_ctx_t *ctx) {
+    int ok;
+    uint64_t pin = vmread(HYPE_VMCS_PIN_BASED_VM_EXEC_CONTROL, &ok);
+    (void)ctx;
+    vmwrite(HYPE_VMCS_PIN_BASED_VM_EXEC_CONTROL, pin | HYPE_VMX_PINBASED_EXT_INTR_EXITING);
+}
+
+/*
+ * PAUSE-loop exiting, the VMX analogue of SVM's pause filter.
+ *
+ * The units genuinely differ and are not interchangeable: SVM counts PAUSE
+ * *executions* (count, with an inter-PAUSE threshold), while VMX counts TSC
+ * ticks (PLE_WINDOW, with PLE_GAP as the max inter-PAUSE gap). So this does not
+ * pass the caller's numbers through -- it takes them as "SVM-shaped intent" and
+ * applies VMX-appropriate values instead. `count` being SVM's saturated 65535
+ * (i.e. "effectively never filter") maps to leaving PLE off entirely, which is
+ * the honest translation rather than inventing a tick count.
+ */
+void hype_vmx_vcpu_enable_pause_filter(hype_vcpu_ctx_t *ctx, uint16_t count, uint16_t threshold) {
+    int ok;
+    uint64_t proc, proc2;
+    (void)ctx;
+    if (count == 0xFFFFu) {
+        return; /* caller asked for no effective filtering */
+    }
+    proc = vmread(HYPE_VMCS_CPU_BASED_VM_EXEC_CONTROL, &ok);
+    proc2 = vmread(HYPE_VMCS_SECONDARY_VM_EXEC_CONTROL, &ok);
+    vmwrite(HYPE_VMCS_PLE_GAP, threshold);
+    vmwrite(HYPE_VMCS_PLE_WINDOW, (uint64_t)count);
+    vmwrite(HYPE_VMCS_CPU_BASED_VM_EXEC_CONTROL, proc | HYPE_VMX_PROCBASED_PAUSE_EXITING);
+    vmwrite(HYPE_VMCS_SECONDARY_VM_EXEC_CONTROL, proc2 | HYPE_VMX_PROCBASED2_PAUSE_LOOP_EXITING);
+}
+
+/*
+ * Re-inject an intercepted exception so the guest takes it through its own IDT.
+ * VMX splits what SVM packs into one EVENTINJ across three fields: the info
+ * field (valid | type 3 = hardware exception | vector, plus bit 11 when an
+ * error code is present), the error code itself, and the instruction length.
+ */
+void hype_vmx_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector, int has_error_code,
+                                      uint32_t error_code) {
+    int ok;
+    uint32_t info = 0x80000000u | (3u << 8) | (uint32_t)vector;
+    (void)ctx;
+    if (has_error_code) {
+        info |= (1u << 11); /* deliver-error-code */
+        vmwrite(HYPE_VMCS_VM_ENTRY_EXCEPTION_ERROR_CODE, error_code);
+    }
+    vmwrite(HYPE_VMCS_VM_ENTRY_INSTRUCTION_LEN, vmread(HYPE_VMCS_VM_EXIT_INSTRUCTION_LEN, &ok));
+    vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, info);
+}
+
+/*
+ * Model an interrupt waking a halted guest. Two things must happen or a
+ * `sti; hlt` idle wait deadlocks (the SVM comment explains the failure in
+ * full): the HLT must retire so the guest resumes AFTER it, and the STI shadow
+ * that covered it must be consumed. HLT is a 1-byte opcode, so past-it is
+ * RIP+1. VMX additionally records halted-ness in GUEST_ACTIVITY_STATE, which
+ * has to go back to active or VM-entry re-halts immediately.
+ */
+void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
+    int ok;
+    uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    uint64_t block = vmread(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE, &ok);
+    (void)ctx;
+    vmwrite(HYPE_VMCS_GUEST_RIP, rip + 1u);
+    vmwrite(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE,
+            block & ~(uint64_t)HYPE_VMX_INTERRUPTIBILITY_BLOCKING_BY_STI);
+    vmwrite(HYPE_VMCS_GUEST_ACTIVITY_STATE, HYPE_VMX_ACTIVITY_STATE_ACTIVE);
+}
+
+void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok;
+    out->rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
+    out->interrupt_shadow = vmread(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE, &ok);
+    out->eventinj = vmread(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, &ok);
+    /* "vintr" means "is an interrupt window armed" -- on VMX that is the
+     * interrupt-window-exiting control, not a dedicated field. */
+    out->vintr = (vmread(HYPE_VMCS_CPU_BASED_VM_EXEC_CONTROL, &ok) &
+                  HYPE_VMX_PROCBASED_INTERRUPT_WINDOW_EXITING)
+                     ? 1u
+                     : 0u;
+    out->can_accept = hype_svm_can_accept_interrupt(out->rflags, out->interrupt_shadow);
+    out->pending_valid = hype_svm_irr_any(real->pending_irr);
+    {
+        int hv = hype_svm_irr_highest(real->pending_irr);
+        out->pending_vector = (uint8_t)(hv < 0 ? 0 : hv);
+    }
+}
+
+/*
+ * pvclock scaling + the ACPI PM timer's rate. Separate from the SVM backend's
+ * equivalents by design: these are per-backend file-scope state, and only one
+ * backend is ever live in a given boot.
+ */
+static uint32_t g_vmx_pvclock_mul;
+static int8_t g_vmx_pvclock_shift;
+static uint64_t g_vmx_acpi_pm_tsc_hz;
+
+void hype_vmx_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, uint64_t tsc_hz) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->pvclock_map = map;
+    hype_pvclock_calc_scale(tsc_hz, &g_vmx_pvclock_mul, &g_vmx_pvclock_shift);
+    g_vmx_acpi_pm_tsc_hz = tsc_hz; /* M4-6b2: also drives the ACPI PM timer's rate */
+}
+
+/* ===================================================================== *
+ * VMX-4 (#236): the FW-1 device adapters.
+ *
+ * Each mirrors the identically-named hype_svm_vcpu_* handler. Three
+ * differences apply throughout and are not repeated per function:
+ *
+ *  1. The faulting instruction's bytes are passed IN rather than decoded at
+ *     GUEST_RIP. FW-1's EPT/NPT deliberately remaps guest RAM and the firmware
+ *     flash window away from an identity map, so treating GUEST_RIP as a host
+ *     pointer -- which the microtest handlers above legitimately do, their
+ *     guests being flat identity maps -- reads the wrong memory here. The
+ *     caller resolves RIP through its own page-table walk first.
+ *  2. RAX lives in ctx->gprs[0], not in a save area: VMX saves every guest GPR
+ *     through the trampoline, where SVM's VMCB holds RAX specially.
+ *  3. Resume RIP comes from VM_EXIT_INSTRUCTION_LEN (vmx_advance_rip()), where
+ *     SVM reads EXITINFO2's "next RIP for free". Same result, different source.
+ * ===================================================================== */
+
+/*
+ * vmx_mmio_begin() with caller-supplied instruction bytes -- see note 1 above.
+ * vmx_mmio_begin() itself now delegates here, so the range check / direction
+ * cross-check / GPR resolution exist once rather than twice.
+ */
+static int vmx_mmio_begin_insn(struct hype_vcpu_ctx *real, uint64_t base, uint64_t size,
+                               const uint8_t *insn, struct vmx_mmio_access *m) {
+    int ok;
+    uint64_t gpa = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    m->rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    m->is_write = (int)((qual >> 1) & 1u);
+    if (gpa < base || gpa >= base + size) {
+        return -1;
+    }
+    m->offset = (uint32_t)(gpa - base);
+    if (insn == 0 || hype_mmio_decode(insn, HYPE_VMX_MMIO_MAX_INSTR_BYTES, &m->decoded) != 0) {
+        return -1;
+    }
+    if (m->decoded.is_write != m->is_write) {
+        return -1;
+    }
+    m->reg = vmx_gpr_ptr(real, m->decoded.reg);
+    return (m->reg == 0) ? -1 : 0;
+}
+
+/* Guest Local APIC MMIO. xAPIC registers are 32-bit only, so a non-4-byte
+ * access fails closed rather than being half-emulated. */
+int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
+                                   uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+
+    if (vmx_mmio_begin_insn(real, lapic_base_phys, HYPE_GUEST_LAPIC_MMIO_SIZE, guest_insn_bytes,
+                            &m) != 0) {
+        return -1;
+    }
+    if (m.decoded.size_bytes != 4u) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        if (hype_guest_lapic_write(lapic, m.offset, m.decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_guest_lapic_read(lapic, m.offset, m.decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
+/* Guest I/O APIC MMIO. IOREGSEL/IOWIN are 32-bit only. */
+int hype_vmx_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
+                                    uint64_t ioapic_base_phys, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+
+    if (vmx_mmio_begin_insn(real, ioapic_base_phys, HYPE_IOAPIC_MMIO_SIZE, guest_insn_bytes, &m) !=
+        0) {
+        return -1;
+    }
+    if (m.decoded.size_bytes != 4u) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        if (hype_ioapic_mmio_write(ioapic, m.offset, value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_ioapic_mmio_read(ioapic, m.offset, &value) != 0) {
+            return -1;
+        }
+        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
+/*
+ * AHCI HBA MMIO for the live guest: like hype_vmx_vcpu_handle_ahci_npf above,
+ * but with caller-supplied instruction bytes and a real dma_map, because FW-1's
+ * guest-physical addresses are not host-physical. The command-list/PRDT/FIS DMA
+ * itself is the shared, vendor-neutral process_ahci_command_slot().
+ */
+int hype_vmx_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                      uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map,
+                                      const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+
+    if (vmx_mmio_begin_insn(real, ahci_base_phys, HYPE_AHCI_MMIO_SIZE, guest_insn_bytes, &m) != 0) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        if (hype_ahci_mmio_write(ahci, m.offset, m.decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+        if (m.offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && ahci->p_ci != 0) {
+            unsigned slot;
+            for (slot = 0; slot < 32u; slot++) {
+                if ((ahci->p_ci & (1u << slot)) != 0) {
+                    if (process_ahci_command_slot(ahci, atapi, dma_map, slot) != 0) {
+                        return -1;
+                    }
+                }
+            }
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_ahci_mmio_read(ahci, m.offset, m.decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
+/*
+ * GLADDER-1: absorb an EPT violation in a region hype does not model, rather
+ * than dying. Reads answer all-ones (what an unclaimed bus returns), writes are
+ * dropped, and the guest steps forward. Unlike the handlers above there is no
+ * address range to check -- the caller has already tried every modelled region.
+ */
+int hype_vmx_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_mmio_decode_t decoded;
+    int ok;
+    uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+
+    if (guest_insn_bytes == 0 ||
+        hype_mmio_decode(guest_insn_bytes, HYPE_VMX_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (!decoded.is_write) {
+        uint64_t *reg = vmx_gpr_ptr(real, decoded.reg);
+        uint32_t allones;
+        if (reg == 0) {
+            return -1;
+        }
+        allones = (decoded.size_bytes >= 4u)  ? 0xFFFFFFFFu
+                  : (decoded.size_bytes == 2u) ? 0xFFFFu
+                                               : 0xFFu;
+        *reg = hype_mmio_merge_read_value(*reg, allones, decoded.size_bytes, decoded.zero_extend);
+    }
+    /* writes to absent MMIO are dropped */
+    vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
+    return 0;
+}
+
+/* ---- port I/O ------------------------------------------------------- *
+ * All of these take the port/direction from the I/O exit qualification via
+ * vmx_decode_ioio(), operate on RAX in ctx->gprs[0], and advance RIP by
+ * VM_EXIT_INSTRUCTION_LEN. Return -1 when the port is not theirs, so the
+ * caller's dispatch chain falls through to the next handler.
+ * -------------------------------------------------------------------- */
+
+/* Guest 16550 UART. Byte-wide registers at base_port + offset. */
+int hype_vmx_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart,
+                                   uint16_t base_port) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_vmm_ioio_t io;
+    uint32_t offset;
+
+    vmx_decode_ioio(&io);
+    if (io.port < base_port || io.port >= (uint32_t)base_port + HYPE_GUEST_UART_NREGS) {
+        return -1;
+    }
+    offset = (uint32_t)io.port - base_port;
+    if (io.is_in) {
+        uint8_t value = hype_guest_uart_read(uart, offset);
+        real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
+    } else {
+        hype_guest_uart_write(uart, offset, (uint8_t)(real->gprs[0] & 0xFFu));
+    }
+    vmx_advance_rip();
+    return 0;
+}
+
+/* CMOS/RTC index (0x70) + data (0x71). */
+int hype_vmx_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_vmm_ioio_t io;
+
+    vmx_decode_ioio(&io);
+    if (io.port == 0x70u) {
+        if (io.is_in) {
+            /* Real hardware allows reading the index back; answering is
+             * strictly better than failing, even with no caller that does. */
+            real->gprs[0] = (real->gprs[0] & ~0xFFULL) | cmos->index;
+        } else {
+            hype_cmos_index_write(cmos, (uint8_t)(real->gprs[0] & 0xFFu));
+        }
+    } else if (io.port == 0x71u) {
+        if (io.is_in) {
+            real->gprs[0] = (real->gprs[0] & ~0xFFULL) | hype_cmos_data_read(cmos);
+        } else {
+            hype_cmos_data_write(cmos, (uint8_t)(real->gprs[0] & 0xFFu));
+        }
+    } else {
+        return -1;
+    }
+    vmx_advance_rip();
+    return 0;
+}
+
+/*
+ * ACPI PM1a_CNT. Returns 1 for a read (caller supplied the value), 0 for a
+ * write (caller inspects *value / *slp_en), -1 if not this port -- the same
+ * three-way contract as the SVM original, which the shutdown path relies on.
+ * SLP_EN (bit 13) is write-only and always reads back 0.
+ */
+int hype_vmx_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint16_t *value,
+                                      int *slp_en) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_vmm_ioio_t io;
+
+    vmx_decode_ioio(&io);
+    if (io.port != port) {
+        return -1;
+    }
+    if (io.is_in) {
+        real->gprs[0] = (real->gprs[0] & ~0xFFFFULL) | ((uint64_t)(*value) & 0xDFFFu);
+        vmx_advance_rip();
+        return 1;
+    }
+    {
+        uint16_t w = (uint16_t)(real->gprs[0] & 0xFFFFu);
+        *slp_en = (w & (1u << 13)) ? 1 : 0;
+        *value = (uint16_t)(w & ~(uint16_t)(1u << 13)); /* store without SLP_EN */
+    }
+    vmx_advance_rip();
+    return 0;
+}
+
+/* Legacy PCI config access via CF8/CFC. */
+int hype_vmx_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_vmm_ioio_t io;
+
+    vmx_decode_ioio(&io);
+    if (io.port == HYPE_PCI_CF8_PORT) {
+        if (io.is_in) {
+            uint32_t value = hype_pci_cf8_read(pci);
+            real->gprs[0] =
+                hype_mmio_merge_read_value(real->gprs[0], value, io.size_bytes, io.size_bytes == 4);
+        } else {
+            hype_pci_cf8_write(pci, hype_mmio_extract_write_value(real->gprs[0], io.size_bytes));
+        }
+    } else if (io.port >= HYPE_PCI_CFC_PORT && io.port <= HYPE_PCI_CFC_PORT + 3) {
+        unsigned int byte_offset = io.port - HYPE_PCI_CFC_PORT;
+        if (io.is_in) {
+            uint32_t value = 0;
+            hype_pci_cf8_config_read(pci, byte_offset, io.size_bytes, &value);
+            real->gprs[0] =
+                hype_mmio_merge_read_value(real->gprs[0], value, io.size_bytes, io.size_bytes == 4);
+        } else {
+            hype_pci_cf8_config_write(pci, byte_offset, io.size_bytes,
+                                      hype_mmio_extract_write_value(real->gprs[0], io.size_bytes));
+        }
+    } else {
+        return -1;
+    }
+    vmx_advance_rip();
+    return 0;
+}
+
+/*
+ * OVMF's PlatformDebugLibIoPort channel. Returns 0 for a write (caller takes
+ * *out_byte), 1 for a read, -1 if not this port. 0xE9 is the presence signature
+ * OVMF probes for before enabling the channel.
+ */
+int hype_vmx_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port,
+                                         uint8_t *out_byte) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_vmm_ioio_t io;
+    int is_write;
+
+    vmx_decode_ioio(&io);
+    if (io.port != base_port) {
+        return -1;
+    }
+    is_write = !io.is_in;
+    if (io.is_in) {
+        real->gprs[0] = (real->gprs[0] & ~0xFFULL) | 0xE9u;
+    } else {
+        *out_byte = (uint8_t)(real->gprs[0] & 0xFFu);
+    }
+    vmx_advance_rip();
+    return is_write ? 0 : 1;
+}
+
+/*
+ * ACPI PM timer. Scaled from the host TSC to the architectural 3.579545 MHz
+ * rate -- returning the raw ~GHz TSC would mis-scale every firmware delay that
+ * reads this port (M4-6b2 fixed exactly that on SVM, ~950x too fast). A write
+ * is silently ignored: this register has no writable semantics on real
+ * hardware, matching the other "nothing to do" IOIO writes here.
+ */
+int hype_vmx_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_vmm_ioio_t io;
+
+    vmx_decode_ioio(&io);
+    if (io.port != HYPE_FW_1_ACPI_PM_TIMER_PORT) {
+        return -1;
+    }
+    if (io.is_in) {
+        uint32_t value = hype_acpi_pm_timer_scale(vmx_real_rdtsc(), g_vmx_acpi_pm_tsc_hz);
+        real->gprs[0] = (real->gprs[0] & ~0xFFFFFFFFULL) | value;
+    }
+    vmx_advance_rip();
+    return 0;
+}
+
+/*
+ * VMX-4 (#236): which exception did the guest take, and what error code did it
+ * push? SVM answers the first from the exit code alone and delivers the second
+ * as EXITINFO1; VMX needs VM_EXIT_INTR_INFO (vector in bits 7:0, bit 11 = an
+ * error code is present, bit 31 = the field is valid) plus its own error-code
+ * field. Returns -1 if no valid interruption is recorded.
+ */
+int hype_vmx_vcpu_exit_exception_vector(hype_vcpu_ctx_t *ctx) {
+    int ok;
+    uint64_t info = vmread(HYPE_VMCS_VM_EXIT_INTR_INFO, &ok);
+    (void)ctx;
+    if (((info >> 31) & 1u) == 0u) {
+        return -1;
+    }
+    return (int)(info & 0xFFu);
+}
+
+uint32_t hype_vmx_vcpu_exit_exception_error_code(hype_vcpu_ctx_t *ctx) {
+    int ok;
+    uint64_t info = vmread(HYPE_VMCS_VM_EXIT_INTR_INFO, &ok);
+    (void)ctx;
+    if (((info >> 31) & 1u) == 0u || ((info >> 11) & 1u) == 0u) {
+        return 0; /* no valid interruption, or this vector pushes no error code */
+    }
+    return (uint32_t)vmread(HYPE_VMCS_VM_EXIT_INTR_ERROR_CODE, &ok);
+}
+
+/*
+ * virtio-blk MMIO, microtest flavour: identity-mapped guest, so decode at
+ * GUEST_RIP and DMA needs no translation (dma_map 0 = identity).
+ */
+int hype_vmx_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
+                                        const hype_blk_backend_t *be, uint64_t mmio_base_phys) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok;
+    uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    return vmx_virtio_blk_npf_common(real, dev, be, 0, mmio_base_phys,
+                                     (const uint8_t *)(uintptr_t)rip);
+}
+
+/* virtio-blk MMIO, live-guest flavour (VMX-4): caller-resolved instruction
+ * bytes and a real dma_map, because FW-1's guest-physical != host-physical. */
+int hype_vmx_vcpu_handle_virtio_blk_npf_map(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
+                                            const hype_blk_backend_t *be,
+                                            const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                            const uint8_t *guest_insn_bytes) {
+    return vmx_virtio_blk_npf_common((struct hype_vcpu_ctx *)ctx, dev, be, dma_map, mmio_base_phys,
+                                     guest_insn_bytes);
+}
+
+/*
+ * PCI ECAM config space, live-guest flavour (VMX-4). Same body as
+ * hype_vmx_vcpu_handle_pci_ecam_npf but with caller-resolved instruction bytes.
+ * ECAM config accesses touch no guest memory, so there is no dma_map here.
+ */
+int hype_vmx_vcpu_handle_pci_ecam_npf_insn(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
+                                           uint64_t ecam_base_phys,
+                                           const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+    hype_pci_ecam_addr_t addr;
+
+    if (vmx_mmio_begin_insn(real, ecam_base_phys, HYPE_PCI_ECAM_BUS0_SIZE, guest_insn_bytes, &m) !=
+        0) {
+        return -1;
+    }
+    hype_pci_decode_ecam_offset(m.offset, &addr);
+    if (m.decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        hype_pci_config_write(pci, &addr, m.decoded.size_bytes, value);
+    } else {
+        uint32_t value = 0;
+        hype_pci_config_read(pci, &addr, m.decoded.size_bytes, &value);
+        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
+/*
+ * VMX-4 (#236): restart this vCPU as a fresh real-mode guest at
+ * guest_rip:0 with the given EPT root -- the counterpart of
+ * hype_svm_vcpu_reset_realmode(), used when FW-1 relaunches a VM (a guest
+ * reboot, or the second VM's first start) without tearing anything down.
+ *
+ * Rebuilding the VMCS guest area is exactly what vcpu_create does, so this
+ * delegates rather than duplicating the state setup; the extra work is clearing
+ * the GPRs and the pending-interrupt state so nothing leaks from the previous
+ * incarnation, and forcing launched=0 so the next entry is a VMLAUNCH rather
+ * than a VMRESUME of a VMCS that no longer describes the same guest.
+ */
+void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
+                                  uint64_t ept_root) {
+    (void)ctx; /* single static ctx today -- see #245 */
+    (void)hype_vmx_vcpu_create(guest_rip, guest_rsp, ept_root);
 }

@@ -846,8 +846,7 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
     return 0;
 }
 
-#define HYPE_FW_1_ACPI_PM_TIMER_PORT 0x608u
-#define HYPE_FW_1_ACPI_PM_TIMER_MASK 0x00FFFFFFu /* 24-bit -- TMR_VAL_EXT unset in this project's own FADT */
+/* HYPE_FW_1_ACPI_PM_TIMER_PORT/_MASK now live in vmcb.h -- shared with VMX (#236). */
 
 /* M4-6b2: host TSC frequency, stashed at guest start (hype_svm_vcpu_set_pvclock)
  * so the ACPI PM timer can scale the raw TSC down to the architectural

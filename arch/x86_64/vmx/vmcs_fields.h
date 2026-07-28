@@ -213,6 +213,27 @@
 #define HYPE_VMX_EXIT_REASON_WRMSR 32u
 #define HYPE_VMX_EXIT_REASON_IO_INSTRUCTION 30u
 #define HYPE_VMX_EXIT_REASON_EPT_VIOLATION 48u
+/*
+ * VMX-4 (#236): the remaining exit reasons the FW-1 loop dispatches on.
+ *
+ * EXCEPTION_NMI (0) is where VMX and SVM differ most in shape: SVM encodes the
+ * faulting vector INTO the exit code (EXITCODE_EXCEPTION_BASE + vector), while
+ * VMX reports one reason for all of them and puts the vector in
+ * VM_EXIT_INTR_INFO bits 7:0. So "was this a #PF" is one comparison on SVM and
+ * two on VMX -- see vmm_reason_is_exception() in boot/main.c.
+ *
+ * SHUTDOWN has no exact VMX analogue; a guest triple fault is the equivalent
+ * "the guest destroyed itself" exit, which is what the FW-1 loop treats
+ * SHUTDOWN as.
+ */
+#define HYPE_VMX_EXIT_REASON_EXCEPTION_NMI 0u
+#define HYPE_VMX_EXIT_REASON_EXTERNAL_INTERRUPT 1u
+#define HYPE_VMX_EXIT_REASON_PAUSE 40u
+/* VM-exit interruption-information (0x4404): bits 7:0 vector, 10:8 type,
+ * bit 11 error-code-valid, bit 31 valid. The read side of VM_ENTRY_INTR_INFO. */
+#define HYPE_VMCS_VM_EXIT_INTR_INFO 0x4404u
+/* VM-exit interruption error code (0x4406), valid when bit 11 above is set. */
+#define HYPE_VMCS_VM_EXIT_INTR_ERROR_CODE 0x4406u
 /* VM-exit instruction length (0x440C): bytes of the instruction that caused
  * the exit, used to advance guest RIP past an emulated instruction. */
 #define HYPE_VMCS_VM_EXIT_INSTRUCTION_LEN 0x440Cu
@@ -220,5 +241,50 @@
  * next VM-entry. Bits 7:0 vector, 10:8 type (0=external interrupt), bit 31
  * valid. The VMX analogue of SVM's EVENTINJ. */
 #define HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD 0x4016u
+/*
+ * VMX-4 (#236), all needed by the FW-1 live-guest path.
+ *
+ * VM-entry exception error code (0x4018) and VM-entry instruction length
+ * (0x401A) accompany the field above when re-injecting a fault: unlike SVM's
+ * EVENTINJ, which carries the error code inside the same 64-bit field, VMX
+ * splits them across three fields. Instruction length matters only for
+ * software exceptions/interrupts (type 4-6), but writing it is harmless
+ * otherwise.
+ */
+#define HYPE_VMCS_VM_ENTRY_EXCEPTION_ERROR_CODE 0x4018u
+#define HYPE_VMCS_VM_ENTRY_INSTRUCTION_LEN 0x401Au
+/*
+ * PLE (Pause-Loop Exiting) gap and window (0x4020/0x4022), the VMX analogue of
+ * SVM's pause filter: PLE_GAP is the max TSC gap between two PAUSEs for them to
+ * count as being in the same loop, PLE_WINDOW the max TSC window before a PAUSE
+ * exits. Note the units differ from SVM's, which counts *PAUSE executions*
+ * (count/threshold) rather than TSC ticks -- so the two backends cannot share a
+ * number, and the shim converts rather than passing values through.
+ */
+#define HYPE_VMCS_PLE_GAP 0x4020u
+#define HYPE_VMCS_PLE_WINDOW 0x4022u
+
+/* Interruptibility-state bits (0x4824, Table 25-3): guest blocking that
+ * prevents an interrupt being delivered right now. Bits 0/1 are the STI and
+ * MOV-SS shadows -- SVM's single INTERRUPT_SHADOW covers the same ground. */
+#define HYPE_VMX_INTERRUPTIBILITY_BLOCKING_BY_STI (1u << 0)
+#define HYPE_VMX_INTERRUPTIBILITY_BLOCKING_BY_MOV_SS (1u << 1)
+
+/* Guest activity state (0x4826, Table 25-4): 0=active, 1=HLT. Written to wake
+ * a halted guest, which on SVM is instead implicit in resuming past the
+ * intercepted HLT. */
+#define HYPE_VMX_ACTIVITY_STATE_ACTIVE 0u
+#define HYPE_VMX_ACTIVITY_STATE_HLT 1u
+
+/* Pin-based control: exit on an external interrupt (the VMX analogue of SVM's
+ * INTR intercept, which is how hype keeps host timekeeping alive while a guest
+ * runs). */
+#define HYPE_VMX_PINBASED_EXT_INTR_EXITING (1u << 0)
+
+/* Primary control: exit on PAUSE. Used with the PLE fields above; the
+ * secondary PAUSE-loop-exiting control (bit 10) is the one PLE_GAP/WINDOW
+ * actually gate, so both are needed for a real pause filter. */
+#define HYPE_VMX_PROCBASED_PAUSE_EXITING (1u << 30)
+#define HYPE_VMX_PROCBASED2_PAUSE_LOOP_EXITING (1u << 10)
 
 #endif /* HYPE_ARCH_VMX_VMCS_FIELDS_H */

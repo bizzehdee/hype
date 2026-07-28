@@ -455,20 +455,17 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);
  * blocked and the guest never wakes. Exempt VMCB glue. */
 void hype_svm_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
 
-/* M4-6d2 DIAG: snapshot of the guest's interrupt-acceptance state, for
- * dumping at a suspected timer-IRQ wedge -- tells whether the guest is
- * blocked with interrupts disabled (rflags IF=0 / interrupt_shadow set /
- * !can_accept) versus ready-but-not-delivered, and whether an EVENTINJ is
- * staged / a VINTR window armed / a vector still pending. */
-typedef struct {
-    uint64_t rflags;
-    uint64_t interrupt_shadow;
-    uint64_t eventinj;
-    uint64_t vintr;
-    int can_accept;
-    int pending_valid;
-    uint8_t pending_vector;
-} hype_svm_intr_state_t;
+/*
+ * M4-6d2 DIAG: snapshot of the guest's interrupt-acceptance state -- see
+ * hype_vmm_intr_state_t in ../cpu/vmm_ops.h, where the struct itself now
+ * lives.
+ *
+ * VMX-4 (#236) moved it there because the FW-1 loop reads it to make real
+ * decisions, not just to log: it gates `pic_ready` and drives the HLT
+ * idle-wait path, so VMX needs to fill the same shape. This alias keeps every
+ * existing SVM use (and the name in the diagnostics) working unchanged.
+ */
+typedef hype_vmm_intr_state_t hype_svm_intr_state_t;
 
 void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *out);
 

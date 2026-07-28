@@ -58,4 +58,19 @@ void hype_ept_build_identity(hype_ept_pte_t *pml4, hype_ept_pte_t *pdpt,
                               hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
                               unsigned int gb_to_map);
 
+/*
+ * VMX-4 (#236): the EPT counterparts of hype_npt_map_range() /
+ * hype_npt_mark_not_present() / hype_npt_mark_range_not_present(). A live guest
+ * needs both -- its RAM is not identity-mapped, and its MMIO windows must fault
+ * into hype's device models. Same 2MB-page index arithmetic and the same
+ * 2MB-alignment requirements as the NPT versions; only the entry encoding
+ * differs. Pure struct-filling, no CPU state touched.
+ */
+void hype_ept_map_range(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                        uint64_t guest_phys_base, uint64_t host_phys_base, uint64_t size);
+void hype_ept_mark_not_present(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                               uint64_t phys_addr);
+void hype_ept_mark_range_not_present(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                                     uint64_t base, uint64_t size);
+
 #endif /* HYPE_ARCH_VMX_EPT_H */

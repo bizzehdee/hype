@@ -4,11 +4,16 @@
 #include <stdint.h>
 
 #include "../../../core/blk_backend.h"
+#include "../../../core/guest_mem.h" /* VMX-4: hype_gpa_map_t (set_pvclock) */
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
 #include "../../../devices/bochs_vbe.h"
 #include "../../../devices/fw_cfg.h"
 #include "../../../devices/pci.h"
+#include "../../../devices/cmos.h"
+#include "../../../devices/guest_lapic.h"
+#include "../../../devices/guest_uart.h"
+#include "../../../devices/ioapic.h"
 #include "../../../devices/pflash.h"
 #include "../../../devices/virtio_blk.h"
 #include "../../../devices/pic.h"
@@ -129,5 +134,63 @@ void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx);
  * EPT round trip on real VMX hardware, independent of the microtest ABI.
  */
 int hype_vmx_smoke_test(void);
+
+/*
+ * VMX-4 (#236): vCPU state accessors the FW-1 live-guest loop needs. Each is
+ * the counterpart of the identically-named hype_svm_vcpu_* function and is
+ * reached through the vmm_* shims in boot/main.c; see vmcs_hw.c for the
+ * VMCS-field mapping and for where VMX and SVM genuinely differ (pause-filter
+ * units, exception error codes, activity state, absent Decode Assist).
+ */
+uint64_t hype_vmx_vcpu_get_cr3(hype_vcpu_ctx_t *ctx);
+void hype_vmx_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip);
+const uint8_t *hype_vmx_vcpu_guest_insn_bytes(hype_vcpu_ctx_t *ctx, uint8_t *out_num);
+void hype_vmx_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_vmm_npf_t *out);
+void hype_vmx_vcpu_peek_ioio(hype_vcpu_ctx_t *ctx, hype_vmm_ioio_t *out);
+void hype_vmx_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_vmm_ioio_t *out);
+void hype_vmx_vcpu_set_exception_intercepts(hype_vcpu_ctx_t *ctx, uint32_t mask);
+void hype_vmx_vcpu_enable_intr_intercept(hype_vcpu_ctx_t *ctx);
+void hype_vmx_vcpu_enable_pause_filter(hype_vcpu_ctx_t *ctx, uint16_t count, uint16_t threshold);
+void hype_vmx_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector, int has_error_code,
+                                      uint32_t error_code);
+void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
+void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out);
+int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);
+void hype_vmx_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, uint64_t tsc_hz);
+
+/* VMX-4 (#236): FW-1 device adapters. Unlike the microtest handlers above,
+ * the MMIO ones take the faulting instruction's bytes as a parameter -- FW-1
+ * remaps guest RAM away from identity, so GUEST_RIP is not a host pointer
+ * there and the caller resolves it via its own page-table walk. */
+int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
+                                   uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes);
+int hype_vmx_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
+                                    uint64_t ioapic_base_phys, const uint8_t *guest_insn_bytes);
+int hype_vmx_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
+                                      uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map,
+                                      const uint8_t *guest_insn_bytes);
+int hype_vmx_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_insn_bytes);
+int hype_vmx_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart, uint16_t base_port);
+int hype_vmx_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos);
+int hype_vmx_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint16_t *value,
+                                      int *slp_en);
+int hype_vmx_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci);
+int hype_vmx_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port,
+                                         uint8_t *out_byte);
+int hype_vmx_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx);
+
+int hype_vmx_vcpu_exit_exception_vector(hype_vcpu_ctx_t *ctx);
+uint32_t hype_vmx_vcpu_exit_exception_error_code(hype_vcpu_ctx_t *ctx);
+
+int hype_vmx_vcpu_handle_virtio_blk_npf_map(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
+                                            const hype_blk_backend_t *be,
+                                            const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                            const uint8_t *guest_insn_bytes);
+int hype_vmx_vcpu_handle_pci_ecam_npf_insn(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
+                                           uint64_t ecam_base_phys,
+                                           const uint8_t *guest_insn_bytes);
+
+void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
+                                  uint64_t ept_root);
 
 #endif /* HYPE_ARCH_VMX_VMCS_H */

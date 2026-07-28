@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+/* For hype_vmm_npf_t / hype_vmm_ioio_t, which the hype_svm_* names below alias
+ * (VMX-4, #236). */
+#include "../cpu/vmm_ops.h"
+
 /*
  * VMCB layout (M2-3), per the AMD64 Architecture Programmer's Manual
  * Volume 2: System Programming, Rev 3.39, Appendix B ("Layout of
@@ -391,14 +395,11 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 #define HYPE_SVM_IOIO_INFO1_ADDR64 (1ULL << 9)
 #define HYPE_SVM_IOIO_INFO1_PORT_SHIFT 16
 
-typedef struct {
-    int is_in;
-    uint16_t port;
-    uint8_t size_bytes;      /* operand size: 1, 2, or 4 */
-    int is_string;           /* STR: INS/OUTS (data moves to/from memory, not a GPR) */
-    int is_rep;              /* REP-prefixed (transfer (E)CX units, else exactly 1) */
-    uint8_t addr_size_bytes; /* address size: 2, 4, or 8 (indexes/masks (E/R)SI/(E/R)DI/(E/R)CX) */
-} hype_svm_ioio_t;
+/* The struct itself is hype_vmm_ioio_t in ../cpu/vmm_ops.h -- VMX-4 (#236)
+ * moved it there so the VMX backend can fill the same shape (its content was
+ * never SVM-specific; only EXITINFO1-vs-EXIT_QUALIFICATION is). This alias
+ * keeps every existing SVM use working unchanged. */
+typedef hype_vmm_ioio_t hype_svm_ioio_t;
 
 /*
  * Decodes an IOIO intercept's EXITINFO1 value into direction/port/
@@ -455,10 +456,9 @@ int hype_svm_build_string_io_plan(const hype_svm_ioio_t *io, uint64_t index_reg,
 #define HYPE_SVM_NPF_INFO1_PRESENT (1ULL << 0)
 #define HYPE_SVM_NPF_INFO1_WRITE (1ULL << 1)
 
-typedef struct {
-    int is_write;
-    uint64_t guest_phys_addr;
-} hype_svm_npf_t;
+/* The struct itself is hype_vmm_npf_t in ../cpu/vmm_ops.h -- see the
+ * hype_svm_ioio_t alias above for why. */
+typedef hype_vmm_npf_t hype_svm_npf_t;
 
 /*
  * Decodes an NPF intercept's EXITINFO1/EXITINFO2 into write-vs-read
@@ -541,6 +541,15 @@ int hype_svm_irr_highest(const uint32_t irr[8]);
  * host TSC rate isn't known yet (tsc_hz below the PM rate). Pure.
  */
 uint32_t hype_acpi_pm_timer_scale(uint64_t tsc, uint64_t tsc_hz);
+
+/*
+ * The port the synthesized FADT points the ACPI PM timer at, and its width.
+ * Shared (VMX-4, #236) rather than defined per backend: both SVM's and VMX's
+ * IOIO handler must claim the SAME port the FADT advertises, and two private
+ * copies of a magic number are exactly how vendor paths drift apart.
+ */
+#define HYPE_FW_1_ACPI_PM_TIMER_PORT 0x608u
+#define HYPE_FW_1_ACPI_PM_TIMER_MASK 0x00FFFFFFu /* 24-bit -- TMR_VAL_EXT unset in this project's own FADT */
 
 /*
  * Packs a segment's access-rights byte and flags nibble into the

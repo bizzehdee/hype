@@ -26,6 +26,61 @@ typedef struct {
  * which is what keeps them vendor-agnostic (plan.md §4). */
 typedef struct hype_vcpu_ctx hype_vcpu_ctx_t;
 
+/*
+ * Snapshot of the guest's interrupt-acceptance state (M4-6d2), filled by
+ * whichever backend ran the vCPU. Says whether the guest is blocked with
+ * interrupts disabled (`rflags` IF=0 / `interrupt_shadow` set / !can_accept)
+ * versus ready-but-not-delivered, and whether an event is staged for entry /
+ * an interrupt window is armed / a vector is still pending.
+ *
+ * Vendor-neutral (VMX-4, #236) because the FW-1 loop uses it to DECIDE, not
+ * only to log -- it gates `pic_ready` and the HLT idle-wait path. The two
+ * fields whose names come from SVM mean the architectural equivalent on VMX:
+ *   eventinj -- SVM's VMCB EVENTINJ / VMX's VM_ENTRY_INTR_INFO_FIELD
+ *   vintr    -- whether an interrupt window is armed: SVM's V_IRQ in the VINTR
+ *               control / VMX's interrupt-window-exiting proc-based control
+ * `interrupt_shadow` is SVM's INTERRUPT_SHADOW / VMX's
+ * GUEST_INTERRUPTIBILITY_STATE (blocking by STI or by MOV SS).
+ */
+typedef struct {
+    uint64_t rflags;
+    uint64_t interrupt_shadow;
+    uint64_t eventinj;
+    uint64_t vintr;
+    int can_accept;
+    int pending_valid;
+    uint8_t pending_vector;
+} hype_vmm_intr_state_t;
+
+/*
+ * Decoded nested-paging fault (SVM NPF / VMX EPT violation). Vendor-neutral
+ * because the *content* always was: which guest-physical address faulted, and
+ * whether it was a write. Only where the two fields come from differs -- SVM's
+ * EXITINFO1/EXITINFO2 versus VMX's EXIT_QUALIFICATION bit 1 and
+ * GUEST_PHYSICAL_ADDRESS.
+ */
+typedef struct {
+    int is_write;
+    uint64_t guest_phys_addr;
+} hype_vmm_npf_t;
+
+/*
+ * Decoded port-I/O intercept. Again the content is vendor-neutral; the source
+ * is SVM's EXITINFO1 versus VMX's I/O EXIT_QUALIFICATION.
+ *
+ * is_string/is_rep/addr_size_bytes exist for INS/OUTS emulation (SVM-STRIO),
+ * where the data moves to/from memory rather than a GPR and (E/R)SI/(E/R)DI/
+ * (E/R)CX are indexed at the guest's current address size.
+ */
+typedef struct {
+    int is_in;
+    uint16_t port;
+    uint8_t size_bytes;      /* operand size: 1, 2, or 4 */
+    int is_string;           /* STR: INS/OUTS (data moves to/from memory, not a GPR) */
+    int is_rep;              /* REP-prefixed (transfer (E)CX units, else exactly 1) */
+    uint8_t addr_size_bytes; /* address size: 2, 4, or 8 (indexes/masks (E/R)SI/(E/R)DI/(E/R)CX) */
+} hype_vmm_ioio_t;
+
 typedef struct {
     const char *name;
 

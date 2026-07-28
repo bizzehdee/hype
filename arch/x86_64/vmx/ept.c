@@ -28,3 +28,57 @@ void hype_ept_build_identity(hype_ept_pte_t *pml4, hype_ept_pte_t *pdpt,
         }
     }
 }
+
+/*
+ * VMX-4 (#236): remap a guest-physical range onto different host-physical
+ * memory, and punch not-present holes. The EPT counterparts of
+ * hype_npt_map_range() / hype_npt_mark_range_not_present(), and needed for the
+ * same reason: a live guest's RAM is NOT identity-mapped (FW-1 allocates host
+ * RAM wherever UEFI gives it and presents it to the guest at guest-physical 0),
+ * and MMIO windows must fault so hype's device models see them.
+ *
+ * Identical index arithmetic to the NPT versions -- 2MB pages, pd_tables[gb]
+ * selected by the GUEST-physical address, entry contents built from the HOST
+ * address. Only the entry encoding differs (R/W/X + memory type rather than
+ * Present/Write/User), which hype_ept_encode_entry() already handles.
+ *
+ * Callers must keep `size` a whole multiple of 2MB and both bases 2MB-aligned,
+ * exactly as the NPT versions require.
+ */
+void hype_ept_map_range(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                        uint64_t guest_phys_base, uint64_t host_phys_base, uint64_t size) {
+    uint64_t page_flags =
+        HYPE_EPT_READ | HYPE_EPT_WRITE | HYPE_EPT_EXEC | HYPE_EPT_MEMTYPE_WB | HYPE_EPT_PS;
+    uint64_t offset;
+
+    for (offset = 0; offset < size; offset += HYPE_PAGING_2MB) {
+        uint64_t guest_phys = guest_phys_base + offset;
+        uint64_t host_phys = host_phys_base + offset;
+        unsigned int gb = (unsigned int)(guest_phys / HYPE_PAGING_1GB);
+        unsigned int pd_index = (unsigned int)((guest_phys % HYPE_PAGING_1GB) / HYPE_PAGING_2MB);
+
+        pd_tables[gb][pd_index] = hype_ept_encode_entry(host_phys, page_flags);
+    }
+}
+
+/*
+ * Make a guest-physical 2MB page fault on any access. Zero is the not-present
+ * encoding for EPT as it is for ordinary paging: with R/W/X all clear the entry
+ * grants nothing, so any access raises an EPT violation (exit reason 48).
+ */
+void hype_ept_mark_not_present(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                               uint64_t phys_addr) {
+    unsigned int gb = (unsigned int)(phys_addr / HYPE_PAGING_1GB);
+    unsigned int pd_index = (unsigned int)((phys_addr % HYPE_PAGING_1GB) / HYPE_PAGING_2MB);
+
+    pd_tables[gb][pd_index] = 0;
+}
+
+void hype_ept_mark_range_not_present(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                                     uint64_t base, uint64_t size) {
+    uint64_t offset;
+
+    for (offset = 0; offset < size; offset += HYPE_PAGING_2MB) {
+        hype_ept_mark_not_present(pd_tables, base + offset);
+    }
+}
