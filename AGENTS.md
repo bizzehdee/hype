@@ -31,12 +31,31 @@ live design doc.
 - **New task** → create a new issue placed in **To Do**, with its full
   description, the right **Milestone**, and honest **"is blocked by"** links to
   whatever it depends on. Don't do undocumented work.
+- **Every new issue MUST end up on project 3 with Status = To Do. No ticket may
+  exist outside the board.** The board is the single source of truth for
+  progress, so a ticket missing from it is invisible — it will not be picked up,
+  ordered, or counted. Repo automation currently adds new issues to the project
+  and sets To Do for you, so in practice this means **verify, don't assume**:
+  after creating an issue, check it (`gh issue view <n> --json projectItems`) and
+  add it plus set its Status yourself if the automation did not. An issue left
+  off the board is unfinished work, not a shortcut.
 - **Starting a task** → move it to **Doing**.
 - **Parked task** → add a comment saying why it's parked, then move it back to
   **To Do**.
 - **Completed with a positive outcome** → move to **Done** (and close the
   issue).
 - **No longer needed, with no outcome** → move to **Rejected**.
+- **Never move a closed issue back to To Do or Doing. Raise a follow-up instead.**
+  If work has to resume on something already closed — a regression, an
+  incomplete fix, a reverted change — create a **new** issue in **To Do** that
+  references the original by number and says what brought it back. Leave the
+  original closed and in **Done**.
+  A closed ticket in an active column is a contradiction (the board says there
+  is work to do, the issue says there is not), and reopening it is worse than it
+  looks: it rewrites the record so the original's close date, its Done state and
+  any release notes derived from them silently become false. A follow-up keeps
+  the history of what was actually finished and when, and makes the *reason* work
+  resumed a first-class, reviewable thing rather than a status flip.
 - Reference the task ID (e.g. `M5-3`, `VALID-2`) in commit messages/PRs so the
   dependency graph stays trustworthy.
 
