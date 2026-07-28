@@ -1022,4 +1022,7 @@ void hype_svm_set_vmrun_trace(int enabled);
 
 extern const hype_vmm_ops_t hype_svm_ops;
 
+/* The MSR index (guest RCX) at the last MSR intercept, for diagnostics. */
+uint32_t hype_svm_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx);
+
 #endif /* HYPE_ARCH_SVM_H */

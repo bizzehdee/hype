@@ -2750,3 +2750,14 @@ int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t p
     real->vmcb->save.rip += decoded.instr_len;
     return 0;
 }
+
+/*
+ * The MSR the guest was accessing at the last MSR intercept (guest RCX).
+ * Exists so the "unhandled guest MSR access" fatal can NAME the register:
+ * without it the message carries only the read/write bit and a RIP, which is
+ * not enough to decide whether to model the MSR or to look for a bug.
+ */
+uint32_t hype_svm_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    return (uint32_t)real->gprs[1]; /* RCX */
+}

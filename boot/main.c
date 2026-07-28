@@ -7933,8 +7933,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
         if (info.reason == HYPE_SVM_EXITCODE_MSR) {
             if (hype_svm_vcpu_handle_msr(ctx) != 0) {
-                hype_fatal("fw-1: unhandled guest MSR access (qual=0x%llx guest_rip=0x%llx)",
-                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+                hype_fatal("fw-1: unhandled guest MSR access msr=0x%x %s (guest_rip=0x%llx)",
+                           (unsigned int)hype_svm_vcpu_get_msr_index(ctx),
+                           (info.qualification & 1ull) ? "write" : "read",
+                           (unsigned long long)info.guest_rip);
             }
             continue;
         }

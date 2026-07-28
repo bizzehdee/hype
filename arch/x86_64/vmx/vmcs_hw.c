@@ -2241,3 +2241,9 @@ void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
     (void)ctx; /* single static ctx today -- see #245 */
     (void)hype_vmx_vcpu_create(guest_rip, guest_rsp, ept_root);
 }
+
+/* Same as the SVM accessor: the MSR index (guest RCX) at the last MSR exit. */
+uint32_t hype_vmx_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    return (uint32_t)real->gprs[1]; /* RCX */
+}

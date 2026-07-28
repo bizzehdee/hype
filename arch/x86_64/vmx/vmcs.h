@@ -193,4 +193,6 @@ int hype_vmx_vcpu_handle_pci_ecam_npf_insn(hype_vcpu_ctx_t *ctx, hype_pci_t *pci
 void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
                                   uint64_t ept_root);
 
+uint32_t hype_vmx_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx);
+
 #endif /* HYPE_ARCH_VMX_VMCS_H */
