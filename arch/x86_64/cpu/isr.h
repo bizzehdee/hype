@@ -56,4 +56,24 @@ int hype_isr_register(uint8_t vector, hype_isr_handler_fn handler);
  */
 void hype_isr_dispatch(const hype_isr_frame_t *frame);
 
+/*
+ * #248: run the handler for `vector` without a trampoline frame, reporting
+ * whether one existed instead of panicking when it did not.
+ *
+ * Needed because VMX's "acknowledge interrupt on exit" has the CPU perform the
+ * interrupt-acknowledge cycle during the VM exit: the interrupt is consumed, so
+ * the host IDT never fires for it, and hype must invoke the handler itself using
+ * the vector reported in VM_EXIT_INTR_INFO.
+ *
+ * Deliberately NOT hype_isr_dispatch() with a hand-built frame: that panics via
+ * hype_fatal() on an unregistered vector, which is wrong for an interrupt the
+ * hardware acknowledged and hype merely has no interest in -- and it would mean
+ * synthesising 21 register fields we do not have, inviting exactly the
+ * uninitialised-struct class of bug this codebase has been bitten by. Returns 1
+ * if a handler ran, 0 if none was registered (caller decides what that means).
+ * The frame passed to the handler is fully zeroed except `vector`; handlers that
+ * need real register state must not be dispatched this way.
+ */
+int hype_isr_dispatch_vector(uint8_t vector);
+
 #endif /* HYPE_ARCH_ISR_H */

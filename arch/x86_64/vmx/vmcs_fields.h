@@ -99,6 +99,24 @@
  * MSR's required-1 bits, and this bit is NOT one of them, so it must be
  * requested explicitly. */
 #define HYPE_VMX_EXIT_HOST_ADDR_SPACE_SIZE (1u << 9)
+/*
+ * VM-exit control: "acknowledge interrupt on exit" (bit 15). #248.
+ *
+ * With this CLEAR, an external-interrupt VM exit leaves the interrupt PENDING and
+ * unacknowledged at the LAPIC/PIC. Since a VM exit also forces host RFLAGS to
+ * 0x2 (IF=0), nothing takes it, and re-entering the guest exits again on the very
+ * same interrupt -- an unbounded storm (13.8M exits observed on Intel).
+ *
+ * With it SET, the CPU performs the interrupt acknowledge cycle itself and
+ * reports the vector in VM_EXIT_INTR_INFO, so the interrupt is no longer pending
+ * and hype dispatches it from that field rather than relying on its own IDT
+ * firing during a hand-opened STI window.
+ *
+ * Like HOST_ADDR_SPACE_SIZE this is not a required-1 bit, so it must be requested
+ * explicitly -- and requested through adjust_controls(), because a CPU (or an L0
+ * hypervisor when nested) is permitted not to support it.
+ */
+#define HYPE_VMX_EXIT_ACK_INTR_ON_EXIT (1u << 15)
 
 /* 16-bit fields (Table B-2/B-3). */
 #define HYPE_VMCS_GUEST_ES_SELECTOR 0x0800u

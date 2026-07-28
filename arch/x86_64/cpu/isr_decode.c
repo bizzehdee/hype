@@ -63,6 +63,30 @@ int hype_isr_register(uint8_t vector, hype_isr_handler_fn handler) {
  * test binary rather than verify anything, same reasoning as
  * hype_fatal() itself (halt.h).
  */
+int hype_isr_dispatch_vector(uint8_t vector) {
+    hype_isr_frame_t frame;
+    hype_isr_handler_fn handler = g_handlers[vector];
+
+    if (handler == 0) {
+        return 0;
+    }
+    /*
+     * Zeroed field-by-field on purpose. Aggregate initialisation of a struct
+     * this size emits a memset call, which does not link on the freestanding
+     * UEFI target (no libc) -- and leaving the fields uninitialised would hand a
+     * handler stack garbage as register state.
+     */
+    frame.r15 = 0; frame.r14 = 0; frame.r13 = 0; frame.r12 = 0;
+    frame.r11 = 0; frame.r10 = 0; frame.r9 = 0; frame.r8 = 0;
+    frame.rbp = 0; frame.rdi = 0; frame.rsi = 0; frame.rdx = 0;
+    frame.rcx = 0; frame.rbx = 0; frame.rax = 0;
+    frame.vector = (uint64_t)vector;
+    frame.error_code = 0;
+    frame.rip = 0; frame.cs = 0; frame.rflags = 0; frame.rsp = 0; frame.ss = 0;
+    handler(&frame);
+    return 1;
+}
+
 void hype_isr_dispatch(const hype_isr_frame_t *frame) {
     char msg[192];
     hype_isr_handler_fn handler;

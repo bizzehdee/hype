@@ -3,6 +3,7 @@
 
 #include "../../../core/blk_backend.h"
 #include "../../../core/fatal.h"
+#include "../cpu/isr.h"
 #include "../../../core/guest_mem.h"
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
@@ -44,6 +45,14 @@
 
 static uint8_t g_vmcs_region[4096] __attribute__((aligned(4096)));
 static uint8_t g_virtual_apic_page[4096] __attribute__((aligned(4096)));
+
+/* #248: did the CPU actually grant acknowledge-interrupt-on-exit? Set from the
+ * ADJUSTED exit controls in hype_vmx_vcpu_create(), never from what was
+ * requested -- adjust_controls() silently drops unsupported bits, and an L0
+ * hypervisor need not offer this one. It selects which of the two
+ * interrupt-consumption paths hype_vmx_vcpu_run() must take, and guessing wrong
+ * either loses every host timer tick or reinstates the exit storm. */
+static int g_vmx_ack_intr_on_exit = 0;
 
 /* EPT paging structures for the (currently single) VMX test vCPU. Identity
  * map, built once in hype_vmx_vcpu_create() when no external root is passed.
@@ -358,7 +367,21 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     /* Host address-space size MUST be set: hype's host is 64-bit (see the
      * constant's comment) -- omitting it is the classic error-7 VM-entry
      * failure. Entry controls stay 0 (real-mode guest, not IA-32e). */
-    uint32_t exit_ctls = hype_vmx_adjust_controls(HYPE_VMX_EXIT_HOST_ADDR_SPACE_SIZE, exit_cap);
+    /* #248: also request acknowledge-interrupt-on-exit, so the CPU performs the
+     * interrupt-acknowledge cycle itself and reports the vector in
+     * VM_EXIT_INTR_INFO. adjust_controls() drops it if this CPU (or the L0
+     * hypervisor, when nested) does not support it -- hence the read-back below
+     * rather than assuming it took. */
+    uint32_t exit_ctls = hype_vmx_adjust_controls(
+        HYPE_VMX_EXIT_HOST_ADDR_SPACE_SIZE | HYPE_VMX_EXIT_ACK_INTR_ON_EXIT, exit_cap);
+    g_vmx_ack_intr_on_exit = (exit_ctls & HYPE_VMX_EXIT_ACK_INTR_ON_EXIT) != 0u;
+    /* Say which interrupt-consumption path is live. Without this the two are
+     * indistinguishable in a log -- both stop the storm -- and there would be no
+     * way to tell whether the CPU (or L0, when nested) granted the control or
+     * quietly dropped it, leaving the dispatch path as dead code. */
+    hype_debug_print("vmx: ack-intr-on-exit=%s (exit_ctls=0x%x) -- interrupts consumed by %s\n",
+                     g_vmx_ack_intr_on_exit ? "yes" : "no", (unsigned int)exit_ctls,
+                     g_vmx_ack_intr_on_exit ? "explicit dispatch" : "STI window");
     /* A long-mode guest needs IA-32e-mode-guest + load-IA32_EFER so the CPU
      * establishes EFER.LME/LMA consistently with CR0.PG/CR4.PAE. A real-mode
      * guest needs neither (entry controls stay just the required-1 bits). */
@@ -710,6 +733,27 @@ static inline void vmx_take_pending_host_interrupt(void) {
     __asm__ volatile("sti\n\tnop\n\tcli" ::: "memory");
 }
 
+/*
+ * #248: the acknowledge-interrupt-on-exit route. When that VM-exit control is
+ * active the CPU has already acknowledged the interrupt by the time we get here,
+ * so it is NOT pending any more and the STI window above would find nothing to
+ * deliver -- hype must call the handler itself, using the vector the CPU recorded
+ * in VM_EXIT_INTR_INFO (valid only when bit 31 is set).
+ *
+ * An unregistered vector is not an error: the hardware acknowledged an interrupt
+ * hype has no handler for, and the correct response is to carry on rather than
+ * panic. It is logged nowhere on purpose -- this runs on every host tick.
+ */
+static void vmx_dispatch_acked_interrupt(void) {
+    int ok;
+    uint64_t intr_info = vmread(HYPE_VMCS_VM_EXIT_INTR_INFO, &ok);
+
+    if (!ok || (intr_info & (1ull << 31)) == 0ull) {
+        return;
+    }
+    (void)hype_isr_dispatch_vector((uint8_t)(intr_info & 0xFFull));
+}
+
 int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint64_t failed;
@@ -729,12 +773,24 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     info->qualification = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
     info->guest_rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
 
-    /* #248: consume the interrupt that caused this exit before the caller can
+    /*
+     * #248: consume the interrupt that caused this exit before the caller can
      * resume the guest, or it re-exits on the same one indefinitely. Placed here
      * rather than in the FW-1 loop so every VMX guest benefits, matching where
-     * the SVM backend does its stgi(). */
+     * the SVM backend does its stgi().
+     *
+     * Which mechanism applies is decided by whether the CPU actually granted
+     * acknowledge-interrupt-on-exit, not by preference: if it did, the interrupt
+     * is already acknowledged and only an explicit dispatch can run its handler;
+     * if it did not, the interrupt is still pending and only opening an interrupt
+     * window can deliver it. Doing the wrong one silently loses host timer ticks.
+     */
     if (info->reason == HYPE_VMX_EXIT_REASON_EXTERNAL_INTERRUPT) {
-        vmx_take_pending_host_interrupt();
+        if (g_vmx_ack_intr_on_exit) {
+            vmx_dispatch_acked_interrupt();
+        } else {
+            vmx_take_pending_host_interrupt();
+        }
     }
     return 0;
 }
