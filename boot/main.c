@@ -7599,11 +7599,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
                 if (!idle_probe_done && g_fw_1_host_tsc_hz != 0 &&
                     now_tsc - last_nontimer_tsc >= 2ULL * g_fw_1_host_tsc_hz) {
-                    hype_svm_intr_state_t ip;
+                    hype_vmm_intr_state_t ip;
                     const uint8_t *ib;
                     idle_probe_done = 1;
                     sysrq_active = 1; /* M4-6d5: begin the SysRq+w injection below */
-                    hype_svm_vcpu_get_intr_state(ctx, &ip);
+                    vmm_get_intr_state(kind, ctx, &ip);
                     ib = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
                     hype_debug_print(
                         "fw-1 IDLEPROBE: rip=0x%llx IF=%d shadow=0x%llx eventinj=0x%llx vintr=0x%llx "
@@ -7619,7 +7619,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * offline -- that names the wait condition without OVMF
                      * symbols. Guest CR3 here is OVMF's identity map. */
                     {
-                        uint64_t cr3d = hype_svm_vcpu_get_cr3(ctx);
+                        uint64_t cr3d = vmm_get_cr3(kind, ctx);
                         uint64_t base = info.guest_rip - 0x20ULL;
                         uint8_t win[64];
                         unsigned r;
@@ -7693,7 +7693,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         const uint64_t KIMG_HI = 0xffffffff83000000ULL;
                         const uint64_t OFF_STATE = 24, OFF_PID = 1504;
                         const uint64_t OFF_COMM = 2048, OFF_TASKS = 1296, OFF_THREAD_SP = 6936;
-                        uint64_t cr3 = hype_svm_vcpu_get_cr3(ctx);
+                        uint64_t cr3 = vmm_get_cr3(kind, ctx);
                         uint64_t slide = (info.guest_rip - SAFE_HALT_LINK) & ~0x1FFFFFULL;
                         uint64_t init_task = INIT_TASK_LINK + slide;
                         char comm[17];
@@ -7807,12 +7807,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * and is wedged elsewhere. reason/rip show what exit we sampled at. */
             if (idle_probe_done && cw_addr != 0 && cw_n < 24u) {
                 int okc = 0;
-                uint64_t v = fw_1_read_guest_u64(vm, hype_svm_vcpu_get_cr3(ctx), cw_addr, &okc);
+                uint64_t v = fw_1_read_guest_u64(vm, vmm_get_cr3(kind, ctx), cw_addr, &okc);
                 if (okc) {
                     uint64_t detail = info.qualification;
-                    if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+                    if (vmm_reason_is_npf(kind, info.reason)) {
                         hype_svm_debug_state_t dd;
-                        hype_svm_vcpu_get_debug_state(ctx, &dd);
+                        (void)vmm_get_debug_state(kind, ctx, &dd);
                         detail = dd.exitinfo2; /* MMIO fault GPA */
                     }
                     hype_debug_print("fw-1 CWATCH#%02u: [0x%llx]=0x%llx d=%lld reason=0x%x rip=0x%llx "
@@ -7877,14 +7877,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     {
                         uint8_t iov;
                         if (hype_ioapic_raise(&g_fw_1_ioapic, 2u, &iov)) {
-                            hype_svm_vcpu_request_interrupt(ctx, iov);
+                            vmm_request_interrupt(kind, ctx, iov);
                         }
                     }
                 }
             }
         }
         if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
-            hype_svm_vcpu_request_interrupt(ctx, timer_vector);
+            vmm_request_interrupt(kind, ctx, timer_vector);
             timer_irqs++;
         }
         /* GLADDER-6c: deliver guest self-IPIs (ICR fixed-delivery writes aimed
@@ -7896,7 +7896,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         {
             uint8_t sipi_vector;
             while (hype_guest_lapic_take_self_ipi(&g_fw_1_lapic, &sipi_vector)) {
-                hype_svm_vcpu_request_interrupt(ctx, sipi_vector);
+                vmm_request_interrupt(kind, ctx, sipi_vector);
             }
         }
         /* M4-6d2: raise the AHCI completion IRQ on the line the guest
@@ -7944,7 +7944,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             {
                 uint8_t iov;
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
-                    hype_svm_vcpu_request_interrupt(ctx, iov);
+                    vmm_request_interrupt(kind, ctx, iov);
                     ahci_irqs++;
                 }
             }
@@ -7972,7 +7972,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
             if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI, &iov)) {
-                hype_svm_vcpu_request_interrupt(ctx, iov);
+                vmm_request_interrupt(kind, ctx, iov);
             }
         } else if (vblk_mapped) {
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
@@ -8006,7 +8006,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     uint8_t iov;
                     if (hype_guest_uart_irq_pending(uart) &&
                         hype_ioapic_raise(&g_fw_1_ioapic, (uint32_t)irqn, &iov)) {
-                        hype_svm_vcpu_request_interrupt(ctx, iov);
+                        vmm_request_interrupt(kind, ctx, iov);
                     }
                 }
             }
@@ -8032,7 +8032,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      "(show-blocked-tasks) via PS/2, one scancode per IRQ1 (GSI1)\n");
                 }
                 if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &iov)) {
-                    hype_svm_vcpu_request_interrupt(ctx, iov);
+                    vmm_request_interrupt(kind, ctx, iov);
                 } else if (!sysrq_stall_logged) {
                     hype_debug_print("fw-1 SYSRQ: IO-APIC RTE[1]=0x%llx did not deliver (masked / "
                                      "not Fixed) -- keyboard IRQ1 not wired by the guest in APIC mode\n",
@@ -8070,11 +8070,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * that gap stranded the timer tick and froze jiffies). If it
          * injected, skip acknowledging a new one this iteration so the
          * freshly-staged EVENTINJ isn't clobbered. */
-        if (!hype_svm_vcpu_deliver_pending_if_ready(ctx) &&
+        if (!vmm_deliver_pending_if_ready(kind, ctx) &&
             g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
             uint8_t pic_vector;
             if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
-                hype_svm_vcpu_request_interrupt(ctx, pic_vector);
+                vmm_request_interrupt(kind, ctx, pic_vector);
                 /* Attribute by the master vector base: IRQ0 = PIT
                  * clockevent, anything else = the AHCI line. */
                 if (pic_vector == g_fw_1_pic.master.irq_offset) {
@@ -8102,8 +8102,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     int isr_busy = (g_fw_1_pic.master.isr != 0 || g_fw_1_pic.slave.isr != 0);
                     g_fw_1_irq0_pending_tsc += dt; /* IF-agnostic: total tick lateness */
                     if (isr_busy) {
-                        hype_svm_intr_state_t sb;
-                        hype_svm_vcpu_get_intr_state(ctx, &sb);
+                        hype_vmm_intr_state_t sb;
+                        vmm_get_intr_state(kind, ctx, &sb);
                         if (((sb.rflags >> 9) & 1u) != 0 && sb.interrupt_shadow == 0) {
                             /* Blocked ONLY by the in-service gate, guest able
                              * to accept -- what a priority fix reclaims. */
@@ -8149,11 +8149,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     irq0_raised_since = now_sv;
                 } else if (!starve_dumped &&
                            now_sv - irq0_raised_since >= 2ULL * g_fw_1_host_tsc_hz) {
-                    hype_svm_intr_state_t sv;
+                    hype_vmm_intr_state_t sv;
                     unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
                     starve_dumped = 1;
-                    hype_svm_vcpu_get_intr_state(ctx, &sv);
-                    hype_svm_vcpu_get_int_diag(&ei, &df, &wn, &ov);
+                    vmm_get_intr_state(kind, ctx, &sv);
+                    (void)vmm_get_int_diag(kind, &ei, &df, &wn, &ov);
                     hype_debug_print(
                         "fw-1 TIMER-STARVE: IRQ0 undelivered >2s | IF=%d shadow=0x%llx can_accept=%d "
                         "pending=%d/vec0x%x eventinj=0x%llx | mIRR=0x%x mISR=0x%x mIMR=0x%x "
@@ -8177,7 +8177,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * to an injected keystroke. RT-2c: skip on host-tick (INTR) exits --
          * the guest wrote nothing, so draining an empty UART FIFO twice per
          * host tick (~55% of all exits) is pure waste. */
-        if (info.reason != HYPE_SVM_EXITCODE_INTR) {
+        if (!vmm_reason_is_intr(kind, info.reason)) {
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line,
                                                      &uart_line_len, (unsigned int)sizeof(uart_line),
                                                      (unsigned)(vm - g_vms), 0u, &vm->term);
@@ -8201,7 +8201,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * surface it -- yet it's the very milestone we care about. Only
          * prompt-suffixed partials are flushed, so ordinary mid-line
          * output isn't fragmented. */
-        if (info.reason == HYPE_SVM_EXITCODE_HLT) {
+        if (vmm_reason_is_hlt(kind, info.reason)) {
             char *bufs[2];
             unsigned int *lens[2];
             unsigned bi;
@@ -8234,7 +8234,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             key_reacted = 1;
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_PAUSE) {
+        if (vmm_reason_is_pause(kind, info.reason)) {
             /* M4-6d4 #5: pause-filter tripped -- the guest was spinning on
              * PAUSE (cpu_relax). We've simply regained control; the loop-top
              * timebase advance + PIC/timer injection already ran this
@@ -8244,7 +8244,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * seconds. */
             continue;
         }
-        if (info.reason == HYPE_SVM_EXITCODE_INTR) {
+        if (vmm_reason_is_intr(kind, info.reason)) {
             /* RT-2b: hype's periodic host timer tick preempted the guest. The
              * pending tick was already taken by hype_timer_isr at the loop's
              * STGI, and the loop-top timebase advance already staged any due
@@ -8266,8 +8266,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * fraction => lots of time in interrupts-disabled critical
                  * sections (delays delivery; part of the scheduler churn). */
                 {
-                    hype_svm_intr_state_t ps;
-                    hype_svm_vcpu_get_intr_state(ctx, &ps);
+                    hype_vmm_intr_state_t ps;
+                    vmm_get_intr_state(kind, ctx, &ps);
                     if (((ps.rflags >> 9) & 1u) != 0) {
                         perf_preempt_if1++;
                     } else {
@@ -8321,29 +8321,29 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
             continue;
         }
-        if (info.reason == HYPE_SVM_EXITCODE_CPUID) {
-            hype_svm_vcpu_handle_cpuid(ctx);
+        if (vmm_reason_is_cpuid(kind, info.reason)) {
+            vmm_handle_cpuid(kind, ctx);
             continue;
         }
-        if (info.reason == HYPE_SVM_EXITCODE_MSR) {
-            if (hype_svm_vcpu_handle_msr(ctx) != 0) {
+        if (vmm_reason_is_msr(kind, info.reason)) {
+            if (vmm_handle_msr(kind, ctx, info.reason) != 0) {
                 hype_fatal("fw-1: unhandled guest MSR access msr=0x%x %s (guest_rip=0x%llx)",
-                           (unsigned int)hype_svm_vcpu_get_msr_index(ctx),
+                           (unsigned int)vmm_get_msr_index(kind, ctx),
                            (info.qualification & 1ull) ? "write" : "read",
                            (unsigned long long)info.guest_rip);
             }
             continue;
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_VINTR) {
+        if (vmm_reason_is_intr_window(kind, info.reason)) {
             /* The VINTR window opened -- the guest can now take the
              * pending timer IRQ (INT-2). */
-            hype_svm_vcpu_handle_vintr_window(ctx);
+            vmm_handle_intr_window(kind, ctx);
             continue;
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_NPF) {
-            hype_svm_npf_t npf;
+        if (vmm_reason_is_npf(kind, info.reason)) {
+            hype_vmm_npf_t npf;
             /* Faulting-instruction bytes for MMIO decode. Prefer AMD's
              * decode-assist capture (valid regardless of guest paging):
              * once a guest runs its own virtual address space (a Linux
@@ -8353,7 +8353,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * translation of RIP for an identity-paged guest (OVMF) on a
              * CPU without decode assists. */
             uint8_t insn_n = 0;
-            const uint8_t *insn = hype_svm_vcpu_guest_insn_bytes(ctx, &insn_n);
+            const uint8_t *insn = vmm_guest_insn_bytes(kind, ctx, &insn_n);
             /* M4-6 real-AMD DIAG: the decode-assist path (insn_n > 0) is
              * used only on real AMD -- QEMU+KVM nested SVM never populates
              * num_bytes_fetched, so it's the ptwalk fallback there and this
@@ -8379,20 +8379,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
             /* FW-1b: the guest Local APIC at 0xFEE00000 is the expected
              * NPF here (the region is not-present by design). */
-            if (hype_svm_vcpu_handle_lapic_npf(ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE, insn) == 0) {
+            if (vmm_handle_lapic_npf(kind, ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE, insn) == 0) {
                 continue;
             }
             /* M4-6b3: the guest I/O APIC at 0xFEC00000. Once ACPI is delivered
              * the kernel masks the 8259 PIC and programs this chip's
              * redirection table to route external IRQ lines (incl. the PIT via
              * the MADT's IRQ0->GSI2 override) to LAPIC vectors. */
-            if (hype_svm_vcpu_handle_ioapic_npf(ctx, &g_fw_1_ioapic, HYPE_FW_1_IOAPIC_GPA, insn) == 0) {
+            if (vmm_handle_ioapic_npf(kind, ctx, &g_fw_1_ioapic, HYPE_FW_1_IOAPIC_GPA, insn) == 0) {
                 continue;
             }
             /* FW-1c: PCI config space via MMCONFIG ECAM at 0xE0000000
              * (OVMF's Q35 PcdPciExpressBaseAddress). Reuses PCI-1's ECAM
              * config model over FW-1's own host bridge + LPC devices. */
-            if (hype_svm_vcpu_handle_pci_ecam_npf(ctx, &g_fw_1_pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
+            if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &g_fw_1_pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
                 /* FW-1h: an ECAM config write may have just programmed
                  * BAR5 and set Memory Space Enable on the AHCI function.
                  * That is the moment OVMF's PciBusDxe finalizes the
@@ -8440,11 +8440,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * adds g_fw_1_ram_host_phys to every guest-physical DMA
              * pointer OVMF programmed, since FW-1 remaps guest RAM. */
             if (ahci_mapped) {
-                hype_svm_npf_t ahci_npf;
-                hype_svm_vcpu_get_last_npf(ctx, &ahci_npf);
+                hype_vmm_npf_t ahci_npf;
+                vmm_get_last_npf(kind, ctx, &ahci_npf);
                 if (ahci_npf.guest_phys_addr >= ahci_abar &&
                     ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
-                    if (hype_svm_vcpu_handle_ahci_npf_map(ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
+                    if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
                                                            &g_fw_1_dma_map, insn) == 0) {
                         ex_ahci_npf++; /* exit-histogram sub-bucket */
                         /* M4-6 real-AMD DIAG (compact, screen-only-friendly):
@@ -8523,7 +8523,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * virtio handler (guest RAM remap handled inside via &g_fw_1_dma_map).
              * Gated on the fault landing in the device's BAR window. */
             if (vblk_mapped) {
-                hype_svm_vcpu_get_last_npf(ctx, &npf);
+                vmm_get_last_npf(kind, ctx, &npf);
                 if (npf.guest_phys_addr >= vblk_bar &&
                     npf.guest_phys_addr < vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
                     if (vm->vblk_is_physical) {
@@ -8536,7 +8536,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                              (unsigned long long)g_hostnvme_bar);
                         }
                     }
-                    if (hype_svm_vcpu_handle_virtio_blk_npf(ctx, &g_fw_1_vblk, &g_fw_1_vblk_be,
+                    if (vmm_handle_virtio_blk_npf_map(kind, ctx, &g_fw_1_vblk, &g_fw_1_vblk_be,
                                                             &g_fw_1_dma_map, vblk_bar, insn) == 0) {
                         continue;
                     }
@@ -8544,7 +8544,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                (unsigned long long)npf.guest_phys_addr);
                 }
             }
-            hype_svm_vcpu_get_last_npf(ctx, &npf);
+            vmm_get_last_npf(kind, ctx, &npf);
             /* GLADDER-1: the NPF hit no modeled device. Instead of PANICking
              * (which killed the guest at the FIRST unmodeled region and hid the
              * rest), ABSORB it like real hardware does for absent MMIO: reads
@@ -8553,7 +8553,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * model (e.g. ICH9 RCBA) and move on -- and lets ONE run enumerate
              * every such region. Each distinct 4KB region is logged ONCE (like
              * the unhandled-port latch) so discovery works without a flood. */
-            if (hype_svm_vcpu_absorb_mmio_npf(ctx, insn) == 0) {
+            if (vmm_absorb_mmio_npf(kind, ctx, insn) == 0) {
                 static uint64_t seen_mmio[128];
                 static unsigned seen_mmio_n = 0;
                 uint64_t page = npf.guest_phys_addr & ~0xFFFULL;
@@ -8596,7 +8596,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * rails), which is a completely different bug from a decoder gap. */
             {
                 hype_svm_debug_state_t dbg;
-                hype_svm_vcpu_get_debug_state(ctx, &dbg);
+                (void)vmm_get_debug_state(kind, ctx, &dbg);
                 hype_fatal("fw-1: undecodable MMIO NPF on vm%u at guest-physical 0x%llx (%s, "
                            "guest_rip=0x%llx, decode_assist_bytes=%u insn=%s %02x %02x %02x %02x "
                            "%02x %02x %02x %02x | cr0=0x%llx cr3=0x%llx cr4=0x%llx rflags=0x%llx "
@@ -8614,28 +8614,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_IOIO) {
+        if (vmm_reason_is_ioio(kind, info.reason)) {
 #if HYPE_IO_HISTOGRAM
             /* PERF-1: record EVERY I/O exit's port before the handler cascade
              * runs (peek = decode only, no RIP advance), so the histogram covers
              * handled ports (serial/PCI/PIT/PIC/CMOS) as well as absorbed ones,
              * not just the 0x80/AHCI sub-buckets the EXHIST line already tracks. */
             {
-                hype_svm_ioio_t io_peek;
-                hype_svm_vcpu_peek_ioio(ctx, &io_peek);
+                hype_vmm_ioio_t io_peek;
+                vmm_peek_ioio(kind, ctx, &io_peek);
                 hype_io_hist_record(g_fw_1_io_hist[vm - g_vms], HYPE_IO_HIST_PORTS, io_peek.port);
             }
 #endif
-            if (hype_svm_vcpu_handle_ioio(ctx, &g_fw_1_pic, &g_fw_1_pit) == 0) {
+            if (vmm_handle_ioio(kind, ctx, &g_fw_1_pic, &g_fw_1_pit) == 0) {
                 continue;
             }
-            if (hype_svm_vcpu_handle_pci_cf8_ioio(ctx, &g_fw_1_pci) == 0) {
+            if (vmm_handle_pci_cf8_ioio(kind, ctx, &g_fw_1_pci) == 0) {
                 continue;
             }
-            if (hype_svm_vcpu_handle_fw_cfg_ioio(ctx, &g_fw_1_fw_cfg, &g_fw_1_dma_map) == 0) {
+            if (vmm_handle_fw_cfg_ioio(kind, ctx, &g_fw_1_fw_cfg, &g_fw_1_dma_map) == 0) {
                 continue;
             }
-            if (hype_svm_vcpu_handle_cmos_ioio(ctx, &g_fw_1_cmos) == 0) {
+            if (vmm_handle_cmos_ioio(kind, ctx, &g_fw_1_cmos) == 0) {
                 continue;
             }
             /* FW-1f/g: guest PS/2 keyboard/mouse (0x60/0x64) -- OVMF's
@@ -8649,7 +8649,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * command writes, which reset the run to 0. */
             {
                 int kbd_wait = 0;
-                if (hype_svm_vcpu_handle_ps2_ioio(ctx, &g_fw_1_ps2, &g_fw_1_mouse, &kbd_wait) == 0) {
+                if (vmm_handle_ps2_ioio(kind, ctx, &g_fw_1_ps2, &g_fw_1_mouse, &kbd_wait) == 0) {
                     if (kbd_wait) {
                         kbd_poll_run++;
                     } else {
@@ -8686,10 +8686,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* FW-1e: guest COM1 UART (0x3F8-0x3FF). TX bytes are buffered
              * in the model and drained to hype's console at the top of
              * the loop. */
-            if (hype_svm_vcpu_handle_uart_ioio(ctx, &g_fw_1_uart, HYPE_SERIAL_COM1) == 0) {
+            if (vmm_handle_uart_ioio(kind, ctx, &g_fw_1_uart, HYPE_SERIAL_COM1) == 0) {
                 continue;
             }
-            if (hype_svm_vcpu_handle_uart_ioio(ctx, &g_fw_1_uart2, HYPE_SERIAL_COM2) == 0) {
+            if (vmm_handle_uart_ioio(kind, ctx, &g_fw_1_uart2, HYPE_SERIAL_COM2) == 0) {
                 continue;
             }
             /* FW-1g: OVMF's SEC/PEI debug-io port (0x402). Forward the
@@ -8697,7 +8697,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * harmless otherwise). */
             {
                 uint8_t dbg_byte = 0;
-                int dr = hype_svm_vcpu_handle_debug_port_ioio(ctx, HYPE_FW_1_DEBUG_PORT, &dbg_byte);
+                int dr = vmm_handle_debug_port_ioio(kind, ctx, HYPE_FW_1_DEBUG_PORT, &dbg_byte);
                 if (dr == 0) {
                     fw_1_debug_feed(&dbg_filter, dbg_line, &dbg_line_len, (unsigned int)sizeof(dbg_line),
                                     dbg_byte);
@@ -8716,8 +8716,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * being force-killed by the shutdown grace timer. */
             {
                 int slp_en = 0;
-                int pr = hype_svm_vcpu_handle_pm1_cnt_ioio(
-                    ctx, (uint16_t)HYPE_ACPI_PM1A_CNT_PORT, &vm->pm1a_cnt, &slp_en);
+                int pr = vmm_handle_pm1_cnt_ioio(kind, ctx, (uint16_t)HYPE_ACPI_PM1A_CNT_PORT,
+                                                &vm->pm1a_cnt, &slp_en);
                 if (pr == 0) { /* OUT to PM1a_CNT */
                     if (slp_en) {
                         vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_S5);
@@ -8730,12 +8730,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     continue; /* IN from PM1a_CNT -- RAX loaded */
                 }
             }
-            if (hype_svm_vcpu_handle_acpi_pm_timer_ioio(ctx) == 0) {
+            if (vmm_handle_acpi_pm_timer_ioio(kind, ctx) == 0) {
                 continue;
             }
 
             {
-                hype_svm_ioio_t io;
+                hype_vmm_ioio_t io;
                 /* Absorb every access to an unmodeled port (harmless), but
                  * trace each distinct (port,direction) only ONCE. Linux's
                  * io_delay writes port 0x80 after nearly every inb/outb, so
@@ -8748,7 +8748,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 uint32_t key;
                 unsigned int k;
                 int already = 0;
-                hype_svm_vcpu_handle_unknown_ioio(ctx, &io);
+                vmm_handle_unknown_ioio(kind, ctx, &io);
                 if (io.port == 0x80u) {
                     ex_io80++; /* exit-histogram sub-bucket: io_delay port */
                 }
@@ -8781,9 +8781,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * delivers the fault through its own IDT exactly as if unintercepted --
          * benign kernel ud2/BUG or MSR-probe #GP just get logged+reinjected and
          * the boot continues. Capped so a chatty guest can't flood the console. */
-        if (info.reason == HYPE_SVM_EXITCODE_EXCEPTION_BASE + 6 ||
-            info.reason == HYPE_SVM_EXITCODE_EXCEPTION_BASE + 13) {
-            unsigned vec = (unsigned)(info.reason - HYPE_SVM_EXITCODE_EXCEPTION_BASE);
+        if (vmm_reason_is_exception(kind, ctx, info.reason, 6) ||
+            vmm_reason_is_exception(kind, ctx, info.reason, 13)) {
+            unsigned vec = (unsigned)vmm_exception_vector(kind, ctx, info.reason);
             int is_gp = (vec == 13u);
             static unsigned guestexcp_log_n = 0;
             if (guestexcp_log_n < 96u) {
@@ -8792,7 +8792,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 unsigned k;
                 guestexcp_log_n++;
                 for (k = 0; k < 12u; k++) { ib[k] = 0; }
-                hype_svm_vcpu_get_debug_state(ctx, &xd);
+                (void)vmm_get_debug_state(kind, ctx, &xd);
                 /* userspace/kernel RIP -> read insn bytes via the guest CR3 */
                 fw_1_read_guest_va(vm, xd.cr3, xd.rip, ib, 12);
                 hype_debug_print("fw-1 GUESTEXCP: #%s vec=%u err=0x%llx rip=0x%llx cs=0x%x rsp=0x%llx "
@@ -8804,17 +8804,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  ib[6], ib[7], ib[8], ib[9], ib[10], ib[11]);
             }
             /* Reinject with the original error code (#GP pushes one; #UD does
-             * not). info.qualification == exitinfo1 == the exception error code. */
-            hype_svm_vcpu_reinject_exception(ctx, (uint8_t)vec, is_gp,
-                                             (uint32_t)info.qualification);
+             * not). vmm_exception_error_code() picks the right source: SVM
+             * delivers it as EXITINFO1 (== info.qualification), VMX in its own
+             * VM_EXIT_INTR_ERROR_CODE field. */
+            vmm_reinject_exception(kind, ctx, (uint8_t)vec, is_gp,
+                                   vmm_exception_error_code(kind, ctx, &info));
             continue;
         }
 
-        if (info.reason >= HYPE_SVM_EXITCODE_EXCEPTION_BASE &&
-            info.reason <= HYPE_SVM_EXITCODE_EXCEPTION_BASE + 31) {
+        if (vmm_reason_is_any_exception(kind, info.reason)) {
             hype_svm_debug_state_t dbg;
             uint8_t *fault_bytes;
-            hype_svm_vcpu_get_debug_state(ctx, &dbg);
+            (void)vmm_get_debug_state(kind, ctx, &dbg);
 
             /* Core fault summary. Printed FIRST, via hype_debug_print()
              * (not hype_fatal(), which halts and would make the deeper
@@ -8830,7 +8831,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * NULL-pointer deref -- it was never written for this exit.
              * cr2 is kept in the dump only to show it is stale/ignored. */
             hype_debug_print("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr3=0x%llx rip=0x%llx (cr2=0x%llx STALE)\n",
-                              (unsigned long long)(info.reason - HYPE_SVM_EXITCODE_EXCEPTION_BASE),
+                              (unsigned long long)vmm_exception_vector(kind, ctx, info.reason),
                               (unsigned long long)info.qualification, (unsigned long long)dbg.cr0,
                               (unsigned long long)dbg.cr3, (unsigned long long)dbg.rip,
                               (unsigned long long)dbg.cr2);
@@ -8928,13 +8929,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
 
             hype_fatal("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr3=0x%llx rip=0x%llx faultaddr=0x%llx",
-                       (unsigned long long)(info.reason - HYPE_SVM_EXITCODE_EXCEPTION_BASE),
+                       (unsigned long long)vmm_exception_vector(kind, ctx, info.reason),
                        (unsigned long long)info.qualification, (unsigned long long)dbg.cr0,
                        (unsigned long long)dbg.cr3, (unsigned long long)dbg.rip,
                        (unsigned long long)dbg.exitinfo2);
         }
 
-        if (info.reason == HYPE_SVM_EXITCODE_HLT) {
+        if (vmm_reason_is_hlt(kind, info.reason)) {
             /* OVMF's idle wait (CpuSleep). It never HLTs during DXE/BDS
              * init, so a HLT past HYPE_FW_1_BOOTED_EXITS productive exits
              * means the firmware finished booting and is idle-waiting for
@@ -8975,21 +8976,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * deliverable => fall through and keep re-halting (advancing
              * time) until one comes due. */
             {
-                hype_svm_intr_state_t is;
+                hype_vmm_intr_state_t is;
                 int if_set, pic_ready;
-                hype_svm_vcpu_get_intr_state(ctx, &is);
+                vmm_get_intr_state(kind, ctx, &is);
                 if_set = (int)((is.rflags >> 9) & 1u);
                 pic_ready = (g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) &&
                             (((g_fw_1_pic.master.irr & (uint8_t)~g_fw_1_pic.master.imr) != 0) ||
                              ((g_fw_1_pic.slave.irr & (uint8_t)~g_fw_1_pic.slave.imr) != 0 &&
                               (g_fw_1_pic.master.imr & (uint8_t)(1u << 2)) == 0));
                 if (if_set && (is.pending_valid || pic_ready)) {
-                    hype_svm_vcpu_wake_hlt(ctx); /* retire HLT + clear STI shadow */
-                    if (!hype_svm_vcpu_deliver_pending_if_ready(ctx) &&
+                    vmm_wake_hlt(kind, ctx); /* retire HLT + clear STI shadow */
+                    if (!vmm_deliver_pending_if_ready(kind, ctx) &&
                         g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
                         uint8_t v;
                         if (hype_pic_emu_acknowledge(&g_fw_1_pic, &v)) {
-                            hype_svm_vcpu_request_interrupt(ctx, v);
+                            vmm_request_interrupt(kind, ctx, v);
                             if (v == g_fw_1_pic.master.irq_offset) {
                                 pit_irqs++;
                             } else {
@@ -9022,9 +9023,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (!wedge_dumped && g_fw_1_host_tsc_hz != 0 &&
                     tb_last_tsc - last_progress_tsc >= 2ULL * g_fw_1_host_tsc_hz &&
                     (g_fw_1_pic.master.isr != 0 || g_fw_1_pic.slave.isr != 0)) {
-                    hype_svm_intr_state_t is;
+                    hype_vmm_intr_state_t is;
                     wedge_dumped = 1;
-                    hype_svm_vcpu_get_intr_state(ctx, &is);
+                    vmm_get_intr_state(kind, ctx, &is);
                     hype_debug_print("fw-1: M4-6d2 WEDGE: IF=%d shadow=0x%llx eventinj=0x%llx vintr=0x%llx "
                                       "can_accept=%d pending=%d/vec0x%x (master ISR=0x%x IMR=0x%x, "
                                       "slave ISR=0x%x IMR=0x%x)\n",
@@ -9062,8 +9063,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * at 10ms so the periodic flush, host input, and the idle-giveup
              * stay responsive; a longer idle just re-waits in 10ms steps. */
             if (g_fw_1_host_tsc_hz != 0) {
-                hype_svm_intr_state_t iw;
-                hype_svm_vcpu_get_intr_state(ctx, &iw);
+                hype_vmm_intr_state_t iw;
+                vmm_get_intr_state(kind, ctx, &iw);
                 if (((iw.rflags >> 9) & 1u) != 0) { /* IF=1: a real interrupt-wait */
                     /* Host-TSC time until the nearest armed timer edge. M4-6b2:
                      * the PIT counter (PIT_HZ) and the LAPIC current_count
@@ -9170,10 +9171,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * (or AHCI) IRQ delivery wedges, defer >> window or overwrite > 0
          * shows deferred injections stuck/lost via the VINTR path. */
         unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
-        hype_svm_vcpu_get_int_diag(&ei, &df, &wn, &ov);
+        (void)vmm_get_int_diag(kind, &ei, &df, &wn, &ov);
         hype_debug_print("fw-1: M4-6d2 int diag: EVENTINJ=%llu, VINTR-defer=%llu, VINTR-window=%llu, "
                           "coalesced=%llu, eventinj-collisions=%llu\n", ei, df, wn, ov,
-                          hype_svm_vcpu_get_eventinj_collisions());
+                          vmm_get_eventinj_collisions(kind));
     }
 
     /* M4-6d3 real-HW diag: characterise WHY the loop gave up. On real
@@ -9185,8 +9186,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * partial console line (a panic header has no trailing newline, so the
      * line-buffered drain never emitted it). */
     if (booted) {
-        hype_svm_intr_state_t gs;
-        hype_svm_vcpu_get_intr_state(ctx, &gs);
+        hype_vmm_intr_state_t gs;
+        vmm_get_intr_state(kind, ctx, &gs);
         if (uart_line_len > 0) {
             uart_line[uart_line_len] = '\0';
             hype_debug_print("fw-1: last ttyS0 (unterminated): %s\n", uart_line);
