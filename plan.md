@@ -852,6 +852,52 @@ isn't lost.
     mode as part of their own normal boot sequence (e.g. a Linux bzImage's
     own decompression stub); that's the guest's own boot code, not a
     32-bit-guest support path this project needs to build.
+24. **Writable host exFAT (#198) — decided: FAT-chained growth, an up-case
+    table hype can reproduce exactly, and no directory creation.** The
+    read-only host FS reader (#181) resolves a path to extents; persisting
+    guest writes to a backing file that lives *on* a filesystem needs a
+    writer, and exFAT's allocation bitmap, entry-set checksums and up-case
+    table each force a choice:
+    - **Growth always produces a FAT-chained (`NoFatChain == 0`)
+      allocation**, and a file that was contiguous gets its FAT chain
+      materialised the first time it grows. The alternative — keep files
+      contiguous by demanding the next physical cluster — is less
+      bookkeeping but fails whenever that cluster is already taken, which
+      is precisely the "backing file on a stick that already holds data"
+      case this work exists to serve. In-place writes to a pre-allocated
+      file never move or relink anything, so the contiguous fast path is
+      preserved for the case that matters most.
+    - **The up-case table is checksum-verified against its own
+      `TableChecksum` at mount, and only its first 256 code points are
+      decompressed and cached.** A name containing a character outside that
+      cache is *refused at creation* rather than written with a `NameHash`
+      derived from a guessed identity mapping — a hash other exFAT
+      implementations disagree with leaves the file unfindable to them.
+      Decompressing the whole 65536-entry table would cost 128 KiB of
+      hypervisor memory for names hype itself generates (ASCII log and
+      image paths), which is disproportionate. Refusing to mount a volume
+      whose table fails its checksum is deliberate for the same reason:
+      hype must fold names the way every other driver does, or not at all.
+    - **A volume whose allocation bitmap is not physically contiguous is
+      refused at mount.** No formatter produces one, and hype indexes the
+      bitmap with plain sector arithmetic; rejecting beats silently reading
+      the wrong sector.
+    - **Directory creation, removal and rename stay out of scope.** hype
+      writes to a path the operator or the installer has already created.
+    - **`VolumeDirty` is set on the medium before the first structural
+      change and cleared, together with `PercentInUse`, by an explicit
+      flush.** Both fields sit at the only boot-sector offsets the
+      boot-region checksum excludes, so neither update requires
+      recomputing that checksum — which is why an interrupted write can be
+      made visible to the next mounter for free.
+    - The reader was tightened to match: it now **enforces the
+      directory-entry-set checksum, honours the active-FAT selection when a
+      volume has two FATs, and honours `NoFatChain` on a directory's own
+      allocation** (a contiguous multi-cluster directory has no FAT chain
+      to follow, so the previous FAT walk found nothing past its first
+      cluster). A volume with a corrupt entry set, an allocation outside
+      the cluster heap, or a chain shorter than the recorded file size is
+      now refused rather than half-parsed.
 
 ## 11. Pre-M0 readiness checklist
 

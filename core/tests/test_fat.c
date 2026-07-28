@@ -72,7 +72,8 @@ static void build_fat32(void) {
     put32(fat_entry_ptr(3), 0x0FFFFFFFu);
     put32(fat_entry_ptr(4), 5u);
     put32(fat_entry_ptr(5), 0x0FFFFFFFu);
-    put32(fat_entry_ptr(6), 0x0FFFFFFFu);
+    put32(fat_entry_ptr(6), 8u);          /* verylongname.iso: 6 -> 8, 1000B = 2 sectors */
+    put32(fat_entry_ptr(8), 0x0FFFFFFFu);
     put32(fat_entry_ptr(7), 9u);          /* frag.bin: 7 -> 9 (non-contiguous) */
     put32(fat_entry_ptr(9), 0x0FFFFFFFu);
 
@@ -150,7 +151,10 @@ static void test_fat32_lfn_match(void) {
     CHECK_HEX("resolve LFN \\verylongname.iso ok", 0,
               hype_fat32_resolve(vol_read, 0, "\\verylongname.iso", &f));
     CHECK_HEX("LFN file size", 1000u, f.size_bytes);
+    /* clusters 6 then 8 -> sectors 37 and 39: not adjacent, so two extents. */
+    CHECK_HEX("LFN two extents", 2u, f.count);
     CHECK_HEX("LFN cluster6 -> sector 37", 37ull, f.extents[0].start_lba);
+    CHECK_HEX("LFN cluster8 -> sector 39", 39ull, f.extents[1].start_lba);
 }
 
 static void test_fat32_not_found_and_dir_as_file(void) {
@@ -179,15 +183,42 @@ static void test_fat32_bad_bpb(void) {
 }
 
 /* ---- exFAT synthetic volume ----
- * spc=1 (shift 0). fat_offset=8, cluster_heap=16, root=cluster2 (sector16).
+ * spc=1 (shift 0). The first 24 sectors are the two boot regions, so:
+ * FatOffset=24, FatLength=4 (512 FAT entries), ClusterHeapOffset=32,
+ * ClusterCount=360, root=cluster2 (sector 32); cluster N => sector 32+(N-2).
  * root dir: File set for contiguous "test.iso" (cluster3, 700B, NoFatChain)
  *           File set for a directory "sub" (cluster4)
- *   sub/  : File set for chained "big.bin" (cluster5->6, 700B). */
+ *   sub/  : File set for chained "big.bin" (cluster5->6->8, 1200B). */
+#define EX_FAT_LBA 24u
+#define EX_FAT_LEN 4u
+#define EX_HEAP_LBA 32u
+#define EX_CLUSTERS 360u
+
+/*
+ * The exFAT entry-set checksum, spelled out here straight from the spec's
+ * EntrySetChecksum pseudocode rather than calling the implementation, so the
+ * tests are checking the code against the spec and not against itself.
+ */
+static uint16_t exfat_set_checksum(const uint8_t *entries, unsigned secondary) {
+    unsigned n = (secondary + 1u) * 32u, i;
+    uint16_t s = 0;
+    for (i = 0; i < n; i++) {
+        if (i == 2u || i == 3u) continue;
+        s = (uint16_t)(((s & 1u) ? 0x8000u : 0u) + (uint16_t)(s >> 1) + (uint16_t)entries[i]);
+    }
+    return s;
+}
+
 static void exfat_name_entry(uint8_t *e, const char *name, unsigned n) {
     unsigned i;
     memset(e, 0, 32);
     e[0] = 0xC1u;
     for (i = 0; i < n && i < 15u; i++) put16(e + 2u + i * 2u, (uint16_t)name[i]);
+}
+/* Recomputes and stores the set checksum of a `secondary`-secondary set. */
+static void exfat_fix_checksum(uint8_t *base, unsigned secondary) {
+    base[1] = (uint8_t)secondary;
+    put16(base + 2, exfat_set_checksum(base, secondary));
 }
 static void exfat_file_set(uint8_t *base, const char *name, uint8_t is_dir, uint8_t no_fat_chain,
                            uint32_t first_cl, uint64_t data_len) {
@@ -195,28 +226,47 @@ static void exfat_file_set(uint8_t *base, const char *name, uint8_t is_dir, uint
     uint8_t *file = base, *stream = base + 32, *nm = base + 64;
     memset(file, 0, 96);
     file[0] = 0x85u;      /* File */
-    file[1] = 2u;         /* secondary count: stream + 1 name entry */
     put16(file + 4, is_dir ? 0x0010u : 0x0020u); /* attributes */
     stream[0] = 0xC0u;    /* Stream Extension */
     stream[1] = (uint8_t)(0x01u | (no_fat_chain ? 0x02u : 0x00u)); /* AllocPossible + NoFatChain */
+    stream[3] = (uint8_t)nlen; /* NameLength */
     put32(stream + 0x14, first_cl);
     put64(stream + 0x18, data_len);
     exfat_name_entry(nm, name, nlen);
+    exfat_fix_checksum(base, 2u); /* stream + 1 name entry */
 }
-static uint8_t *exfat_cluster(uint32_t cl) { return g_vol + (16u + (cl - 2u)) * HYPE_FAT_SECTOR_SIZE; }
-static uint8_t *exfat_fat_entry(uint32_t cl) { return g_vol + 8u * HYPE_FAT_SECTOR_SIZE + cl * 4u; }
+static uint8_t *exfat_cluster(uint32_t cl) {
+    return g_vol + (EX_HEAP_LBA + (cl - 2u)) * HYPE_FAT_SECTOR_SIZE;
+}
+static uint8_t *exfat_fat_entry(uint32_t cl) {
+    return g_vol + EX_FAT_LBA * HYPE_FAT_SECTOR_SIZE + cl * 4u;
+}
+/* As exfat_cluster but for a volume with more than one sector per cluster. */
+static uint8_t *exfat_cluster_spc(uint32_t cl, uint32_t spc) {
+    return g_vol + (EX_HEAP_LBA + (cl - 2u) * spc) * HYPE_FAT_SECTOR_SIZE;
+}
+
+/* Fills in the boot-sector fields every exFAT volume must have. */
+static void exfat_boot(uint8_t *b, uint32_t heap_lba, uint32_t clusters, uint8_t spc_shift) {
+    unsigned i;
+    b[3] = 'E'; b[4] = 'X'; b[5] = 'F'; b[6] = 'A'; b[7] = 'T';
+    for (i = 8u; i < 11u; i++) b[i] = ' ';       /* "EXFAT   " is eight bytes */
+    put64(b + 0x48, VOL_SECTORS);                /* VolumeLength */
+    put32(b + 0x50, EX_FAT_LBA);                 /* FatOffset */
+    put32(b + 0x54, EX_FAT_LEN);                 /* FatLength */
+    put32(b + 0x58, heap_lba);                   /* ClusterHeapOffset */
+    put32(b + 0x5C, clusters);                   /* ClusterCount */
+    put32(b + 0x60, 2);                          /* FirstClusterOfRootDirectory */
+    b[0x6C] = 9;                                 /* BytesPerSectorShift = 512 */
+    b[0x6D] = spc_shift;                         /* SectorsPerClusterShift */
+    b[0x6E] = 1;                                 /* NumberOfFats */
+}
 
 static void build_exfat(void) {
-    uint8_t *b = g_vol;
     memset(g_vol, 0, sizeof(g_vol));
-    b[3] = 'E'; b[4] = 'X'; b[5] = 'F'; b[6] = 'A'; b[7] = 'T';
-    put32(b + 0x50, 8);   /* FatOffset */
-    put32(b + 0x58, 16);  /* ClusterHeapOffset */
-    put32(b + 0x60, 2);   /* root cluster */
-    b[0x6C] = 9;          /* BytesPerSectorShift = 512 */
-    b[0x6D] = 0;          /* SectorsPerClusterShift = 1 */
+    exfat_boot(g_vol, EX_HEAP_LBA, EX_CLUSTERS, 0u);
 
-    /* root dir (cluster 2, sector 16). */
+    /* root dir (cluster 2, sector 32). */
     exfat_file_set(exfat_cluster(2) + 0,   "test.iso", 0, 1, 3u, 700u); /* contiguous @cl3 */
     exfat_file_set(exfat_cluster(2) + 96,  "sub",      1, 1, 4u, 0u);   /* subdir @cl4 */
     exfat_file_set(exfat_cluster(2) + 192, "empty",    0, 1, 3u, 0u);   /* zero-length */
@@ -230,7 +280,7 @@ static void build_exfat(void) {
         put32(exfat_fat_entry(230u), 0xFFFFFFFFu);
     }
 
-    /* sub dir (cluster 4, sector 18): chained big.bin @cl5->6->8 (5,6 adjacent so
+    /* sub dir (cluster 4, sector 34): chained big.bin @cl5->6->8 (5,6 adjacent so
      * they coalesce; 8 is non-contiguous so it opens a second extent). 1200B => 3 sectors. */
     exfat_file_set(exfat_cluster(4) + 0, "big.bin", 0, 0, 5u, 1200u);
     put32(exfat_fat_entry(5), 6u);
@@ -244,7 +294,7 @@ static void test_exfat_contiguous(void) {
     CHECK_HEX("exfat resolve \\test.iso ok", 0, hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
     CHECK_HEX("exfat size", 700u, f.size_bytes);
     CHECK_HEX("exfat one extent", 1u, f.count);
-    CHECK_HEX("exfat cluster3 -> sector 17", 17ull, f.extents[0].start_lba);
+    CHECK_HEX("exfat cluster3 -> sector 33", 33ull, f.extents[0].start_lba);
     CHECK_HEX("exfat 2 sectors", 2ull, f.extents[0].sector_count);
 }
 
@@ -313,11 +363,11 @@ static void test_exfat_chained_multi_extent(void) {
     build_exfat();
     CHECK_HEX("exfat chained big.bin ok", 0, hype_exfat_resolve(vol_read, 0, "\\sub\\big.bin", &f));
     CHECK_HEX("exfat 1200B size", 1200u, f.size_bytes);
-    /* clusters 5,6 coalesce (sectors 19,20), 8 separate (sector 22) => 2 extents. */
+    /* clusters 5,6 coalesce (sectors 35,36), 8 separate (sector 38) => 2 extents. */
     CHECK_HEX("exfat two extents", 2u, f.count);
-    CHECK_HEX("exfat ext0 start", 19ull, f.extents[0].start_lba);
+    CHECK_HEX("exfat ext0 start", 35ull, f.extents[0].start_lba);
     CHECK_HEX("exfat ext0 sectors (coalesced)", 2ull, f.extents[0].sector_count);
-    CHECK_HEX("exfat ext1 start", 22ull, f.extents[1].start_lba);
+    CHECK_HEX("exfat ext1 start", 38ull, f.extents[1].start_lba);
     CHECK_HEX("exfat ext1 sectors", 1ull, f.extents[1].sector_count);
 }
 
@@ -328,7 +378,7 @@ static void test_exfat_read_failures(void) {
     CHECK_HEX("exfat boot read failure", (unsigned long long)(-1),
               (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
     build_exfat();
-    g_fail_lba = 16; /* root dir read fails */
+    g_fail_lba = EX_HEAP_LBA; /* root dir read fails */
     CHECK_HEX("exfat dir read failure", (unsigned long long)(-1),
               (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
     g_fail_lba = (uint64_t)-1;
@@ -402,14 +452,21 @@ static void build_exfat_bigdir(void) {
         exfat_cluster(2)[i * 32u] = 0x05u;
     }
     /* far.iso set straddles the boundary: File @ei15 (cluster 2), Stream @ei16
-     * and Name @ei17 (cluster 10). */
+     * and Name @ei17 (cluster 10). Built in a contiguous scratch buffer so the
+     * set checksum can be taken over the bytes as a whole, then split across the
+     * two clusters -- the checksum must survive the boundary. */
     {
-        uint8_t *file = exfat_cluster(2) + 15u * 32u;   /* ei15 */
-        uint8_t *stream = exfat_cluster(10) + 0u;       /* ei16 */
-        uint8_t *nm = exfat_cluster(10) + 32u;          /* ei17 */
-        file[0] = 0x85u; file[1] = 2u; put16(file + 4, 0x0020u);
-        stream[0] = 0xC0u; stream[1] = 0x03u; put32(stream + 0x14, 3u); put64(stream + 0x18, 700u);
+        static uint8_t set[96];
+        uint8_t *file = set, *stream = set + 32, *nm = set + 64;
+        memset(set, 0, sizeof set);
+        file[0] = 0x85u; put16(file + 4, 0x0020u);
+        stream[0] = 0xC0u; stream[1] = 0x03u; stream[3] = 7u;
+        put32(stream + 0x14, 3u); put64(stream + 0x18, 700u);
         exfat_name_entry(nm, "far.iso", 7u);
+        exfat_fix_checksum(set, 2u);
+        memcpy(exfat_cluster(2) + 15u * 32u, file, 32);   /* ei15 */
+        memcpy(exfat_cluster(10) + 0u, stream, 32);       /* ei16 */
+        memcpy(exfat_cluster(10) + 32u, nm, 32);          /* ei17 */
     }
     /* Fill the rest of cluster 10 (ei18..31) with unused fillers and NO 0x00
      * terminator, so scanning for a missing name runs off the end of the chain
@@ -425,18 +482,13 @@ static void build_exfat_bigdir(void) {
 /* exFAT volume with 2-sector clusters (SectorsPerClusterShift=1), used to hit
  * the partial-last-cluster path in the chained extent builder. */
 static void build_exfat_spc2(void) {
-    uint8_t *b = g_vol;
     memset(g_vol, 0, sizeof(g_vol));
-    b[3] = 'E'; b[4] = 'X'; b[5] = 'F'; b[6] = 'A'; b[7] = 'T';
-    put32(b + 0x50, 8);   /* FatOffset */
-    put32(b + 0x58, 16);  /* ClusterHeapOffset */
-    put32(b + 0x60, 2);   /* root cluster */
-    b[0x6C] = 9;          /* 512-byte sectors */
-    b[0x6D] = 1;          /* SectorsPerClusterShift = 1 => 2 sectors/cluster */
-    /* root dir @cluster2 (sectors 16,17): chained "p.bin" @cl3->4, 1536 bytes
-     * (3 sectors). cl3=>sector 18, cl4=>sector 20; 3 sectors over 2 clusters
+    /* 2 sectors/cluster, so only (VOL_SECTORS - heap)/2 clusters fit. */
+    exfat_boot(g_vol, EX_HEAP_LBA, (VOL_SECTORS - EX_HEAP_LBA) / 2u, 1u);
+    /* root dir @cluster2 (sectors 32,33): chained "p.bin" @cl3->4, 1536 bytes
+     * (3 sectors). cl3=>sector 34, cl4=>sector 36; 3 sectors over 2 clusters
      * leaves a 1-sector (partial) final cluster. */
-    exfat_file_set(exfat_cluster(2) + 0, "p.bin", 0, 0, 3u, 1536u);
+    exfat_file_set(exfat_cluster_spc(2, 2u) + 0, "p.bin", 0, 0, 3u, 1536u);
     put32(exfat_fat_entry(3), 4u);
     put32(exfat_fat_entry(4), 0xFFFFFFFFu);
 }
@@ -447,28 +499,31 @@ static void test_exfat_multicluster_dir(void) {
     CHECK_HEX("exfat cross-cluster file set ok", 0,
               hype_exfat_resolve(vol_read, 0, "\\far.iso", &f));
     CHECK_HEX("far.iso size", 700u, f.size_bytes);
-    /* mid-set read failure: cluster-10 sector (24) fails while reading the set. */
+    /* mid-set read failure: cluster 10's sector fails while reading the set. */
     build_exfat_bigdir();
-    g_fail_lba = 24;
+    g_fail_lba = EX_HEAP_LBA + 8u;
     CHECK_HEX("exfat mid-set read failure => not found", (unsigned long long)(-1),
               (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\far.iso", &f));
     g_fail_lba = (uint64_t)-1;
 }
 
+/*
+ * Failing the FAT sector mid-chain makes the chain look like it ends early. That
+ * must be an error, not a short extent list reported as success: a caller handed
+ * fewer extents than the file's size needs would read whatever happens to follow
+ * the data it did get.
+ */
 static void test_fat_chain_read_failures(void) {
     hype_fat_file_t f;
-    /* FAT32: failing the FAT sector while following a chain truncates the chain
-     * (fat32_next returns EOC) rather than erroring -- still returns a file. */
     build_fat32();
     g_fail_lba = 32; /* the FAT sector */
-    CHECK_HEX("fat32 chain read-fail truncates (still ok)", 0,
-              hype_fat32_resolve(vol_read, 0, "\\frag.bin", &f));
-    CHECK_HEX("fat32 truncated to first extent", 1u, f.count);
-    /* exFAT: same, on its FAT (sector 8) while following big.bin's chain. */
+    CHECK_HEX("fat32 chain read-fail rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_fat32_resolve(vol_read, 0, "\\frag.bin", &f));
+    /* exFAT: same, on its FAT while following big.bin's chain. */
     build_exfat();
-    g_fail_lba = 8;
-    CHECK_HEX("exfat chain read-fail truncates (still ok)", 0,
-              hype_exfat_resolve(vol_read, 0, "\\sub\\big.bin", &f));
+    g_fail_lba = EX_FAT_LBA;
+    CHECK_HEX("exfat chain read-fail rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\sub\\big.bin", &f));
     g_fail_lba = (uint64_t)-1;
 }
 
@@ -524,7 +579,7 @@ static void test_exfat_spc2_partial_cluster(void) {
     CHECK_HEX("exfat spc=2 size", 1536u, f.size_bytes);
     /* cl3(sec18,2) + cl4(sec20, partial 1) coalesce => one extent [18,3]. */
     CHECK_HEX("exfat spc=2 one extent", 1u, f.count);
-    CHECK_HEX("exfat spc=2 start 18", 18ull, f.extents[0].start_lba);
+    CHECK_HEX("exfat spc=2 start 34", 34ull, f.extents[0].start_lba);
     CHECK_HEX("exfat spc=2 3 sectors", 3ull, f.extents[0].sector_count);
 }
 
@@ -535,7 +590,210 @@ static void test_exfat_scan_past_chain_end(void) {
               (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\zzzzzzz", &f));
 }
 
+/* Patches a 32-bit Stream Extension field of an already-built set and restores
+ * the set checksum, so only the field under test is out of spec. */
+static void exfat_patch_stream32(uint8_t *base, unsigned off, uint32_t v) {
+    put32(base + 32u + off, v);
+    exfat_fix_checksum(base, base[1]);
+}
+
+/*
+ * A subdirectory whose own allocation is NoFatChain: its clusters are
+ * consecutive and the FAT holds NOTHING for them. Walking the FAT there follows
+ * zeroes straight off the end of the directory, so the flag has to be honoured
+ * when addressing a directory's second and later clusters -- the single-cluster
+ * directories in the other fixtures never reach that code.
+ */
+static void build_exfat_contig_dir(void) {
+    unsigned i;
+    build_exfat();
+    /* "cdir": contiguous 2-cluster directory at clusters 20,21 (sectors 50,51). */
+    exfat_file_set(exfat_cluster(2) + 384, "cdir", 1, 1, 20u, 1024u);
+    memset(exfat_cluster(20), 0, HYPE_FAT_SECTOR_SIZE);
+    memset(exfat_cluster(21), 0, HYPE_FAT_SECTOR_SIZE);
+    /* Deliberately leave FAT[20] and FAT[21] at zero, exactly as a real
+     * NoFatChain allocation does. */
+    for (i = 0; i < 16u; i++) {
+        exfat_cluster(20)[i * 32u] = 0x05u; /* not-in-use filler: keep scanning */
+    }
+    /* deep.bin lives at entry index 16 -- the first entry of the SECOND cluster. */
+    exfat_file_set(exfat_cluster(21) + 0, "deep.bin", 0, 1, 30u, 700u);
+}
+
+static void test_exfat_contiguous_directory(void) {
+    hype_fat_file_t f;
+    build_exfat_contig_dir();
+    CHECK_HEX("exfat NoFatChain dir descent ok", 0,
+              hype_exfat_resolve(vol_read, 0, "\\cdir\\deep.bin", &f));
+    CHECK_HEX("deep.bin size", 700u, f.size_bytes);
+    CHECK_HEX("deep.bin one extent", 1u, f.count);
+    CHECK_HEX("deep.bin cluster30 -> sector 60", 60ull, f.extents[0].start_lba);
+    /* Trailing separator still means "last component". */
+    build_exfat_contig_dir();
+    CHECK_HEX("exfat trailing separator names a dir, rejected as a file",
+              (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\cdir\\", &f));
+}
+
+/* The entry-set checksum must actually be enforced: a set whose bytes changed
+ * without its checksum being updated is corrupt and must not be acted on. */
+static void test_exfat_set_checksum_enforced(void) {
+    hype_fat_file_t f;
+    build_exfat();
+    CHECK_HEX("baseline resolves", 0, hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    /* Flip a byte of the Stream entry, leaving the stored checksum stale. */
+    build_exfat();
+    exfat_cluster(2)[32u + 0x14u] ^= 0x04u; /* first cluster, checksum NOT refreshed */
+    CHECK_HEX("stale set checksum rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    /* Flip a byte of a File Name entry the same way. */
+    build_exfat();
+    exfat_cluster(2)[64u + 4u] ^= 0x20u;
+    CHECK_HEX("stale name checksum rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    /* A set with SecondaryCount 0 has no Stream entry at all. */
+    build_exfat();
+    exfat_fix_checksum(exfat_cluster(2), 0u);
+    CHECK_HEX("SecondaryCount 0 rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    /* A deleted set (InUse bit clear) is not a name. */
+    build_exfat();
+    exfat_cluster(2)[0] = 0x05u;
+    CHECK_HEX("deleted set skipped", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+}
+
+/* NameLength has to agree with the File Name entries actually present, or the
+ * comparison would run past the characters the set really carries. */
+static void test_exfat_name_length_guard(void) {
+    hype_fat_file_t f;
+    build_exfat();
+    exfat_cluster(2)[32u + 3u] = 30u; /* claims 30 chars; one name entry holds 15 */
+    exfat_fix_checksum(exfat_cluster(2), 2u);
+    CHECK_HEX("over-long NameLength rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    build_exfat();
+    exfat_cluster(2)[32u + 3u] = 0u; /* a zero-length name is not a name */
+    exfat_fix_checksum(exfat_cluster(2), 2u);
+    CHECK_HEX("zero NameLength rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+}
+
+/* An allocation named by a directory entry must lie inside the cluster heap. */
+static void test_exfat_allocation_range(void) {
+    hype_fat_file_t f;
+    build_exfat();
+    exfat_patch_stream32(exfat_cluster(2), 0x14u, EX_CLUSTERS + 2u); /* one past the last */
+    CHECK_HEX("first cluster past the heap rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    build_exfat();
+    exfat_patch_stream32(exfat_cluster(2), 0x14u, 1u); /* clusters start at 2 */
+    CHECK_HEX("first cluster below 2 rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    /* Contiguous run that starts inside the heap but ends past its last cluster. */
+    build_exfat();
+    exfat_patch_stream32(exfat_cluster(2), 0x14u, EX_CLUSTERS + 1u); /* last cluster, needs 2 */
+    CHECK_HEX("contiguous run past the heap rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    /* A non-zero DataLength with no allocation at all. */
+    build_exfat();
+    exfat_patch_stream32(exfat_cluster(2), 0x14u, 0u);
+    CHECK_HEX("zero first cluster with data rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+}
+
+/* A chain that ends before DataLength says it should is an error, not a short
+ * extent list handed back as success. */
+static void test_exfat_short_chain(void) {
+    hype_fat_file_t f;
+    build_exfat();
+    put32(exfat_fat_entry(5), 0xFFFFFFFFu); /* big.bin (1200B, 3 sectors) now 1 cluster */
+    CHECK_HEX("chain shorter than DataLength rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\sub\\big.bin", &f));
+}
+
+/* With two FATs, VolumeFlags bit 0 selects the live copy. Reading the stale one
+ * follows chains that no longer exist, so the bit has to be honoured. */
+static void test_exfat_active_fat(void) {
+    hype_fat_file_t f;
+    unsigned s;
+    build_exfat();
+    g_vol[0x6E] = 2; /* NumberOfFats */
+    /* Move every FAT sector to the second copy and blank the first. */
+    for (s = 0; s < EX_FAT_LEN; s++) {
+        memcpy(g_vol + (EX_FAT_LBA + EX_FAT_LEN + s) * HYPE_FAT_SECTOR_SIZE,
+               g_vol + (EX_FAT_LBA + s) * HYPE_FAT_SECTOR_SIZE, HYPE_FAT_SECTOR_SIZE);
+        memset(g_vol + (EX_FAT_LBA + s) * HYPE_FAT_SECTOR_SIZE, 0, HYPE_FAT_SECTOR_SIZE);
+    }
+    put16(g_vol + 0x6A, 0x0001u); /* ActiveFat = 1 */
+    CHECK_HEX("chain followed through the ACTIVE (second) FAT", 0,
+              hype_exfat_resolve(vol_read, 0, "\\sub\\big.bin", &f));
+    CHECK_HEX("active-FAT big.bin size", 1200u, f.size_bytes);
+    put16(g_vol + 0x6A, 0x0000u); /* now point at the blanked first FAT */
+    CHECK_HEX("stale FAT gives no chain", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\sub\\big.bin", &f));
+    /* NumberOfFats must be 1 or 2. */
+    build_exfat();
+    g_vol[0x6E] = 3;
+    CHECK_HEX("NumberOfFats 3 rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    build_exfat();
+    g_vol[0x6E] = 0;
+    CHECK_HEX("NumberOfFats 0 rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+}
+
+/* Boot-sector geometry that would make a structure overlap another, or run off
+ * the volume, must be refused before any of it is believed. */
+static void test_exfat_geometry_guards(void) {
+    hype_fat_file_t f;
+    struct { const char *desc; unsigned off; int width; uint32_t val; } cases[] = {
+        {"FatOffset inside the boot regions", 0x50, 32, 8u},
+        {"FatLength 0", 0x54, 32, 0u},
+        {"heap overlapping the FAT", 0x58, 32, EX_FAT_LBA + EX_FAT_LEN - 1u},
+        {"ClusterCount 0", 0x5C, 32, 0u},
+        {"ClusterCount beyond the FAT's reach", 0x5C, 32, EX_FAT_LEN * 128u},
+        {"heap running past the volume", 0x5C, 32, VOL_SECTORS},
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        build_exfat();
+        put32(g_vol + cases[i].off, cases[i].val);
+        CHECK_HEX(cases[i].desc, (unsigned long long)(-1),
+                  (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    }
+    /* The signature is eight bytes: the three trailing spaces count too. */
+    for (i = 8u; i <= 10u; i++) {
+        build_exfat();
+        g_vol[i] = 'X';
+        CHECK_HEX("exfat signature padding mismatch", (unsigned long long)(-1),
+                  (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    }
+    /* A root cluster outside the heap. */
+    build_exfat();
+    put32(g_vol + 0x60, EX_CLUSTERS + 2u);
+    CHECK_HEX("root cluster past the heap rejected", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\test.iso", &f));
+    /* A path component longer than the resolver's buffer. */
+    {
+        char longpath[200];
+        memset(longpath, 'a', sizeof longpath);
+        longpath[0] = '\\';
+        longpath[sizeof longpath - 1] = '\0';
+        build_exfat();
+        CHECK_HEX("over-long path component rejected", (unsigned long long)(-1),
+                  (unsigned long long)hype_exfat_resolve(vol_read, 0, longpath, &f));
+    }
+}
+
 int main(void) {
+    test_exfat_contiguous_directory();
+    test_exfat_set_checksum_enforced();
+    test_exfat_name_length_guard();
+    test_exfat_allocation_range();
+    test_exfat_short_chain();
+    test_exfat_active_fat();
+    test_exfat_geometry_guards();
     test_fat32_nested_file();
     test_fat32_bpb_guards();
     test_exfat_multicluster_dir();
