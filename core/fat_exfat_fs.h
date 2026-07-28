@@ -75,6 +75,9 @@ typedef struct {
     uint32_t used_clusters;   /* allocated clusters, or HYPE_EXFAT_USED_UNKNOWN */
     uint8_t dirty;            /* 1 == VolumeDirty has been set on the medium */
     hype_exfat_upcase_t upcase;
+    /* Wall-clock snapshot for directory entries; zeroed (invalid) by mount so
+     * the 1980 epoch is used until hype_exfat_fs_set_time() supplies one. */
+    hype_rtc_time_t now;
 } hype_exfat_fs_t;
 
 #define HYPE_EXFAT_USED_UNKNOWN 0xFFFFFFFFu
@@ -149,5 +152,8 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
  * -1 on I/O error.
  */
 int hype_exfat_fs_sync(hype_exfat_fs_t *fs);
+
+/* Sets the timestamp stamped into subsequently written entry sets. */
+void hype_exfat_fs_set_time(hype_exfat_fs_t *fs, const hype_rtc_time_t *now);
 
 #endif /* HYPE_CORE_FAT_EXFAT_FS_H */

@@ -2,6 +2,8 @@
 #define HYPE_CORE_FAT_WRITE_FS_H
 
 #include <stdint.h>
+
+#include "rtc.h"
 #include "fat.h" /* hype_fat_read_fn, HYPE_FAT_SECTOR_SIZE */
 
 /*
@@ -40,6 +42,14 @@ typedef struct {
     uint32_t fsinfo_sector; /* FSInfo sector LBA (0 == none) */
     uint32_t free_count;    /* running free-cluster count (unknown == 0xFFFFFFFF) */
     uint32_t next_free;     /* next-free-cluster search hint */
+    /*
+     * Wall-clock snapshot stamped into directory entries. Zeroed (i.e. invalid)
+     * by mount, which reproduces the old all-zero-timestamp behaviour; call
+     * hype_fat32_fs_set_time() to supply a real one. Held rather than read
+     * on demand so this layer stays free of hardware access -- same reason its
+     * block I/O is injected callbacks.
+     */
+    hype_rtc_time_t now;
 } hype_fat32_fs_t;
 
 typedef struct {
@@ -73,5 +83,12 @@ int hype_fat32_create(hype_fat32_fs_t *fs, const char *name, hype_fat32_wfile_t 
  * to FSInfo. Returns 0 on success, -1 on I/O error or when the volume is full.
  */
 int hype_fat32_append(hype_fat32_wfile_t *f, const void *data, unsigned int len);
+
+/*
+ * Sets the timestamp stamped into subsequently written directory entries. Pass
+ * the result of hype_rtc_read(). Safe to call repeatedly -- a long-lived log
+ * should refresh it so its modification time advances.
+ */
+void hype_fat32_fs_set_time(hype_fat32_fs_t *fs, const hype_rtc_time_t *now);
 
 #endif /* HYPE_CORE_FAT_WRITE_FS_H */

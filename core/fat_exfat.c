@@ -218,16 +218,23 @@ static void ent_zero(uint8_t ent[32]) {
     }
 }
 
-void hype_exfat_file_entry(uint8_t ent[32], uint16_t attributes, uint8_t secondary_count) {
+void hype_exfat_file_entry(uint8_t ent[32], uint16_t attributes, uint8_t secondary_count,
+                           const hype_rtc_time_t *now) {
     ent_zero(ent);
     ent[0] = HYPE_EXFAT_ENT_FILE;
     ent[1] = secondary_count;
     /* ent[2..3] (SetChecksum) stays zero so a checksum taken over the built set
      * matches -- hype_exfat_set_checksum_update skips those bytes anyway. */
     wr16(ent + 4, attributes);
-    wr32(ent + 8, HYPE_EXFAT_TIMESTAMP_EPOCH);  /* CreateTimestamp */
-    wr32(ent + 12, HYPE_EXFAT_TIMESTAMP_EPOCH); /* LastModifiedTimestamp */
-    wr32(ent + 16, HYPE_EXFAT_TIMESTAMP_EPOCH); /* LastAccessedTimestamp */
+    {
+        /* hype_exfat_encode_timestamp() returns the 1980-01-01 epoch for an
+         * absent/invalid time, so this keeps the previous behaviour when there
+         * is no clock. */
+        uint32_t ts = hype_exfat_encode_timestamp(now);
+        wr32(ent + 8, ts);  /* CreateTimestamp */
+        wr32(ent + 12, ts); /* LastModifiedTimestamp */
+        wr32(ent + 16, ts); /* LastAccessedTimestamp */
+    }
 }
 
 void hype_exfat_stream_entry(uint8_t ent[32], unsigned int name_length, uint16_t name_hash,

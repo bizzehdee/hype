@@ -62,11 +62,20 @@ void hype_fat_shortname_83(const char *name, uint8_t out11[11]) {
 }
 
 void hype_fat_dirent_build(uint8_t ent[32], const uint8_t name11[11], uint8_t attr,
-                           uint32_t first_cluster, uint32_t size) {
+                           uint32_t first_cluster, uint32_t size, const hype_rtc_time_t *now) {
     unsigned int i;
     for (i = 0; i < 32u; i++) ent[i] = 0;
     for (i = 0; i < 11u; i++) ent[i] = name11[i];
     ent[11] = attr;
+    /* Timestamps (FAT spec sec 6). The encoders return 0 for an absent or
+     * invalid time, so this reproduces the old all-zero behaviour rather than
+     * writing a confidently wrong date when the clock is unreadable. */
+    ent[13] = hype_fat_encode_time_tenths(now);      /* CrtTimeTenth */
+    wr16(ent + 14, hype_fat_encode_time(now));       /* CrtTime */
+    wr16(ent + 16, hype_fat_encode_date(now));       /* CrtDate */
+    wr16(ent + 18, hype_fat_encode_date(now));       /* LstAccDate (date only) */
+    wr16(ent + 22, hype_fat_encode_time(now));       /* WrtTime */
+    wr16(ent + 24, hype_fat_encode_date(now));       /* WrtDate */
     wr16(ent + 20, (uint16_t)(first_cluster >> 16)); /* first cluster high */
     wr16(ent + 26, (uint16_t)(first_cluster & 0xFFFFu)); /* first cluster low */
     wr32(ent + 28, size);

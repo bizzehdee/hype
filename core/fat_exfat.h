@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "rtc.h"
+
 /*
  * #198 (STORAGE: writable FAT32/exFAT) -- pure exFAT primitives, shared by the
  * read-only resolver (core/fat.c) and the block-backed writer
@@ -180,8 +182,15 @@ void hype_exfat_entry_pos(uint32_t ei, uint32_t sec_per_cluster, uint32_t *out_c
  * zeroes the field so a checksum computed over the built bytes is correct.
  */
 
-/* Primary File entry (0x85). Timestamps are set to HYPE_EXFAT_TIMESTAMP_EPOCH. */
-void hype_exfat_file_entry(uint8_t ent[32], uint16_t attributes, uint8_t secondary_count);
+/*
+ * Primary File entry (0x85). `now` fills Create/LastModified/LastAccessed; pass
+ * 0 (or an invalid time) for HYPE_EXFAT_TIMESTAMP_EPOCH, which is what this did
+ * unconditionally before. Note the epoch, NOT zero, is the fallback: exFAT's
+ * month and day fields are 1-based, so an all-zero timestamp is out of spec and
+ * trips fsck.
+ */
+void hype_exfat_file_entry(uint8_t ent[32], uint16_t attributes, uint8_t secondary_count,
+                           const hype_rtc_time_t *now);
 
 /* Stream Extension entry (0xC0). */
 void hype_exfat_stream_entry(uint8_t ent[32], unsigned int name_length, uint16_t name_hash,

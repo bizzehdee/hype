@@ -72,7 +72,7 @@ static void test_shortname(void) {
 static void test_dirent(void) {
     uint8_t name[11], ent[32];
     hype_fat_shortname_83("HYPELOG.TXT", name);
-    hype_fat_dirent_build(ent, name, HYPE_FAT_ATTR_ARCHIVE, 0x00031234, 4096);
+    hype_fat_dirent_build(ent, name, HYPE_FAT_ATTR_ARCHIVE, 0x00031234, 4096, 0);
     CHECK_HEX("dirent name", 0, memcmp(ent, "HYPELOG TXT", 11));
     CHECK_HEX("dirent attr", HYPE_FAT_ATTR_ARCHIVE, ent[11]);
     CHECK_HEX("dirent cluster roundtrip", 0x00031234u, hype_fat_dirent_cluster(ent));

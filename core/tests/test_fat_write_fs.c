@@ -367,7 +367,51 @@ static void test_fault_sweep(void) {
     CHECK("fault sweep completed without crashing", 1);
 }
 
+
+/*
+ * #198 follow-up: a real timestamp must reach the directory entry. Before the
+ * RTC existed these fields were always zero, which is why hype's own log showed
+ * as the Unix epoch. Checks the encoded bytes at their spec offsets, and that
+ * clearing the clock restores the old unset behaviour.
+ */
+static void test_dirent_timestamp_from_clock(void) {
+    hype_fat32_fs_t fs;
+    hype_rtc_time_t now;
+    uint8_t ent[32];
+    uint8_t name[11];
+    uint16_t d, t;
+
+    now.year = 2026; now.month = 7; now.day = 28;
+    now.hour = 14; now.minute = 35; now.second = 6;
+
+    hype_fat_shortname_83("HYPEFULL.LOG", name);
+    hype_fat_dirent_build(ent, name, HYPE_FAT_ATTR_ARCHIVE, 3, 100, &now);
+    d = (uint16_t)((uint16_t)ent[16] | ((uint16_t)ent[17] << 8));
+    t = (uint16_t)((uint16_t)ent[14] | ((uint16_t)ent[15] << 8));
+    CHECK_HEX("dirent CrtDate", (46u << 9) | (7u << 5) | 28u, d);
+    CHECK_HEX("dirent CrtTime", (14u << 11) | (35u << 5) | 3u, t);
+    /* WrtDate/WrtTime and LstAccDate carry the same stamp. */
+    CHECK_HEX("dirent WrtDate", d, (uint16_t)((uint16_t)ent[24] | ((uint16_t)ent[25] << 8)));
+    CHECK_HEX("dirent WrtTime", t, (uint16_t)((uint16_t)ent[22] | ((uint16_t)ent[23] << 8)));
+    CHECK_HEX("dirent LstAccDate", d, (uint16_t)((uint16_t)ent[18] | ((uint16_t)ent[19] << 8)));
+
+    /* No clock -> zeroes, exactly as before. */
+    hype_fat_dirent_build(ent, name, HYPE_FAT_ATTR_ARCHIVE, 3, 100, 0);
+    CHECK_HEX("dirent no clock -> zero date", 0,
+              (uint16_t)((uint16_t)ent[16] | ((uint16_t)ent[17] << 8)));
+
+    /* set_time stores it; passing 0 invalidates it again. */
+    fs.now.year = 0;
+    hype_fat32_fs_set_time(&fs, &now);
+    CHECK_HEX("set_time stored year", 2026, fs.now.year);
+    CHECK_HEX("set_time stored second", 6, fs.now.second);
+    hype_fat32_fs_set_time(&fs, 0);
+    CHECK_HEX("set_time(0) invalidates", 0, fs.now.year);
+    hype_fat32_fs_set_time(0, &now); /* must not crash */
+}
+
 int main(void) {
+    test_dirent_timestamp_from_clock();
     test_create_append();
     test_truncate_and_second_file();
     test_reject_bad_volume();

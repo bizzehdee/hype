@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "fat_write_fs.h"
+#include "rtc.h"
 
 /*
  * #230 (USB debug-log sink): stream hype's in-RAM capture buffer (core/logbuf.c)
@@ -30,8 +31,10 @@ typedef struct {
  * and streams whatever the logbuf already holds. Returns 0 on success, -1 if the
  * volume is not FAT32 or any I/O fails (the sink is left inactive).
  */
+/* `now` stamps the created file's directory entry; pass 0 for none (the
+ * timestamps are then zeroed, as they were before the RTC existed). */
 int hype_log_sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
-                       void *ctx, const char *filename);
+                       void *ctx, const char *filename, const hype_rtc_time_t *now);
 
 /*
  * Appends the logbuf bytes captured since the previous flush (or open). A no-op

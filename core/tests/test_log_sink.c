@@ -90,7 +90,7 @@ static void test_sink_streams_logbuf(void) {
     hype_logbuf_append("host-xhci: up\n");
     hype_logbuf_append("host-nvme: 2 drives\n");
 
-    CHECK_HEX("open ok", 0, hype_log_sink_open(&sink, vol_read, vol_write, NULL, "HYPEFULL.LOG"));
+    CHECK_HEX("open ok", 0, hype_log_sink_open(&sink, vol_read, vol_write, NULL, "HYPEFULL.LOG", 0));
     len = hype_logbuf_len();
     CHECK("logbuf non-empty", len > 0u);
     CHECK_HEX("file size == logbuf len", len, (unsigned)sink.file.size);
@@ -123,7 +123,7 @@ static void test_open_rejects_non_fat(void) {
     hype_log_sink_t sink;
     build_vol();
     put16(g_vol + 0x0B, 2048); /* non-512 sector -> not a supported volume */
-    CHECK("open fails on bad volume", hype_log_sink_open(&sink, vol_read, vol_write, NULL, "X.LOG") != 0);
+    CHECK("open fails on bad volume", hype_log_sink_open(&sink, vol_read, vol_write, NULL, "X.LOG", 0) != 0);
     CHECK_HEX("sink inactive", 0, (unsigned)sink.active);
     CHECK("flush on inactive sink fails", hype_log_sink_flush(&sink) != 0);
 }
@@ -137,7 +137,7 @@ static void test_open_create_failure(void) {
      * fails -> open must report failure and leave the sink inactive. */
     g_fail_write_lba = RESERVED;
     CHECK("open fails when create can't write", hype_log_sink_open(&sink, vol_read, vol_write,
-                                                                   NULL, "C.LOG") != 0);
+                                                                   NULL, "C.LOG", 0) != 0);
     CHECK_HEX("sink inactive after create failure", 0, (unsigned)sink.active);
     g_fail_write_lba = (uint64_t)-1;
 }
@@ -147,7 +147,7 @@ static void test_flush_append_failure(void) {
     build_vol();
     hype_logbuf_reset();
     hype_logbuf_append("first\n");
-    CHECK_HEX("open ok", 0, hype_log_sink_open(&sink, vol_read, vol_write, NULL, "F.LOG"));
+    CHECK_HEX("open ok", 0, hype_log_sink_open(&sink, vol_read, vol_write, NULL, "F.LOG", 0));
     /* New output arrives, but the data-cluster write now fails. */
     hype_logbuf_append("second line that must be flushed\n");
     g_fail_write_lba = clba(sink.file.tail_cluster);

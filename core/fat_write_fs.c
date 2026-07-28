@@ -105,6 +105,10 @@ int hype_fat32_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ct
     uint8_t bpb[SECSZ];
     uint32_t total_sectors, data_sectors, data_clusters, fat_capacity;
 
+    /* Invalidate the timestamp snapshot FIRST: a caller with a stack-allocated
+     * hype_fat32_fs_t would otherwise stamp directory entries from uninitialised
+     * memory, i.e. random dates. Callers opt in via hype_fat32_fs_set_time(). */
+    out->now.year = 0;
     if (read(ctx, 0u, 1u, bpb) != 0) return -1;
     if (rd16(bpb + 0x0B) != SECSZ) return -1;      /* bytes/sector must be 512 */
     if (rd16(bpb + 0x16) != 0u || rd32(bpb + 0x24) == 0u) return -1; /* FAT16 shape / no FAT32 size */
@@ -156,7 +160,8 @@ static int flush_metadata(hype_fat32_wfile_t *f) {
     uint32_t sz = (f->size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)f->size;
 
     if (fs->read(fs->ctx, f->dirent_lba, 1u, sec) != 0) return -1;
-    hype_fat_dirent_build(ent, f->name11, HYPE_FAT_ATTR_ARCHIVE, f->first_cluster, sz);
+    hype_fat_dirent_build(ent, f->name11, HYPE_FAT_ATTR_ARCHIVE, f->first_cluster, sz,
+                          &f->fs->now);
     bcopy(sec + f->dirent_off, ent, DIRENT_SIZE);
     if (fs->write(fs->ctx, f->dirent_lba, 1u, sec) != 0) return -1;
 
@@ -285,4 +290,24 @@ int hype_fat32_append(hype_fat32_wfile_t *f, const void *data, unsigned int len)
         f->size += n;
     }
     return flush_metadata(f);
+}
+
+void hype_fat32_fs_set_time(hype_fat32_fs_t *fs, const hype_rtc_time_t *now) {
+    if (fs == 0) {
+        return;
+    }
+    if (now == 0) {
+        fs->now.year = 0; /* invalid -> encoders emit the old zero timestamps */
+        return;
+    }
+    /* Field-by-field: whole-struct assignment of anything containing an array
+     * emits a memcpy call, which does not exist in this freestanding build.
+     * hype_rtc_time_t has no array today, but copying explicitly keeps that
+     * true if a field is ever added. */
+    fs->now.year = now->year;
+    fs->now.month = now->month;
+    fs->now.day = now->day;
+    fs->now.hour = now->hour;
+    fs->now.minute = now->minute;
+    fs->now.second = now->second;
 }

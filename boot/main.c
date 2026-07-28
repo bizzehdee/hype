@@ -30,6 +30,7 @@
 #include "../core/log_sink.h"
 #include "../core/nvme_host.h"
 #include "../core/blk_backend.h"
+#include "../core/rtc.h"
 #include "../core/blk_phys.h"
 
 /* #229 debug: read the active host CR3 (which page-table root this core runs under). */
@@ -747,6 +748,10 @@ static uint64_t g_ap_tramp_page;
 static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
 /* Stashed for fw_1_ap_main to run the guest on the AP (set in efi_main). */
 static const hype_vmm_ops_t *g_fw_1_ops;
+/* Host wall clock, sampled once at startup. See the read in efi_main(). */
+static hype_rtc_time_t g_host_time;
+static int g_host_time_valid;
+
 static hype_vmm_kind_t g_fw_1_kind;
 /* M8-0b-ii: each AP's own per-core VMM page + a flag an AP sets once it has
  * enabled the VMM on its core without faulting. Indexed by VM/AP index.
@@ -9343,7 +9348,7 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
     for (i = 0; i < nb; i++) {
         g_usb_log_ctx.base = bases[i];
         if (hype_log_sink_open(&g_usb_log, usblog_read, usblog_write, &g_usb_log_ctx,
-                               "HYPEFULL.LOG") == 0) {
+                               "HYPEFULL.LOG", g_host_time_valid ? &g_host_time : 0) == 0) {
             g_usb_log_ready = 1;
             hype_debug_print("usb-log: streaming full log to \\HYPEFULL.LOG "
                              "(FAT32 at disk LBA %llu)\n", (unsigned long long)bases[i]);
@@ -9426,6 +9431,24 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* First thing in every log: which build this is. Captures from a
      * serial-less machine otherwise all start with identical boilerplate. */
     hype_debug_print("hype: build " HYPE_BUILD_ID "\n");
+    /*
+     * Host wall clock, read once here and reused wherever a timestamp is needed
+     * (currently the FAT32 log file's directory entry). Read at boot rather than
+     * at first use so it is (a) visible in every log, which is the only way to
+     * tell a working RTC from an unset one on a machine with no other output,
+     * and (b) not buried in a path that may never run -- the first version of
+     * this sat inside the USB-log setup and so produced nothing under QEMU,
+     * where there is no USB mass-storage device.
+     */
+    g_host_time_valid = (hype_rtc_read(&g_host_time) == 0) ? 1 : 0;
+    if (g_host_time_valid) {
+        hype_debug_print("rtc: host clock %04u-%02u-%02u %02u:%02u:%02u\n",
+                         (unsigned)g_host_time.year, (unsigned)g_host_time.month,
+                         (unsigned)g_host_time.day, (unsigned)g_host_time.hour,
+                         (unsigned)g_host_time.minute, (unsigned)g_host_time.second);
+    } else {
+        hype_debug_print("rtc: host clock unreadable -- file timestamps left unset\n");
+    }
 
     hype_console_print(SystemTable, "hype\n");
 

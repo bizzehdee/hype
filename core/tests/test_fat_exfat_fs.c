@@ -1355,7 +1355,38 @@ static void test_multi_sector_bitmap(void) {
     build_vol(); /* leave the small layout in place for the tests that follow */
 }
 
+
+/* exFAT's fallback must be the 1980 epoch, never zero: month/day are 1-based
+ * there, so an all-zero timestamp is out of spec and trips fsck. */
+static void test_exfat_set_time(void) {
+    hype_exfat_fs_t fs;
+    hype_rtc_time_t now;
+    uint8_t ent[32];
+    uint32_t ts;
+
+    now.year = 2026; now.month = 7; now.day = 28;
+    now.hour = 14; now.minute = 35; now.second = 6;
+
+    fs.now.year = 0;
+    hype_exfat_fs_set_time(&fs, &now);
+    CHECK_HEX("exfat set_time stored", 2026, fs.now.year);
+    hype_exfat_fs_set_time(&fs, 0);
+    CHECK_HEX("exfat set_time(0) invalidates", 0, fs.now.year);
+    hype_exfat_fs_set_time(0, &now); /* must not crash */
+
+    hype_exfat_file_entry(ent, HYPE_EXFAT_ATTR_ARCHIVE, 2u, &now);
+    ts = (uint32_t)ent[8] | ((uint32_t)ent[9] << 8) | ((uint32_t)ent[10] << 16) |
+         ((uint32_t)ent[11] << 24);
+    CHECK_HEX("exfat entry stamp", hype_exfat_encode_timestamp(&now), ts);
+
+    hype_exfat_file_entry(ent, HYPE_EXFAT_ATTR_ARCHIVE, 2u, 0);
+    ts = (uint32_t)ent[8] | ((uint32_t)ent[9] << 8) | ((uint32_t)ent[10] << 16) |
+         ((uint32_t)ent[11] << 24);
+    CHECK_HEX("exfat entry no clock -> epoch", 0x00210000u, ts);
+}
+
 int main(void) {
+    test_exfat_set_time();
     test_multi_sector_bitmap();
     test_bad_allocations();
     test_corrupt_chains();

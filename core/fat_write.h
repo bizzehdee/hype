@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "rtc.h"
+
 /*
  * #198 (STORAGE: writable FAT32) -- pure write primitives. The read-only reader
  * (core/fat.c) resolves paths to extents; this adds the encode/locate pieces a
@@ -45,10 +47,16 @@ void hype_fat_shortname_83(const char *name, uint8_t out11[11]);
 
 /*
  * Builds a 32-byte directory entry: 8.3 name, attribute byte, first cluster
- * (split hi/lo per FAT32) and file size. Timestamps are zeroed. Pure.
+ * (split hi/lo per FAT32) and file size.
+ *
+ * `now` fills the creation/write/access timestamps. Pass 0 (or an invalid time)
+ * to leave them zeroed, which is what this did unconditionally before -- and is
+ * why hype's own log showed up as the Unix epoch in a file manager. A zero FAT
+ * date decodes as year 1980, month 0, day 0: not a real date, so readers render
+ * it however they please. Pure.
  */
 void hype_fat_dirent_build(uint8_t ent[32], const uint8_t name11[11], uint8_t attr,
-                           uint32_t first_cluster, uint32_t size);
+                           uint32_t first_cluster, uint32_t size, const hype_rtc_time_t *now);
 
 /* Reads the first cluster + size back out of a 32-byte directory entry. */
 uint32_t hype_fat_dirent_cluster(const uint8_t ent[32]);

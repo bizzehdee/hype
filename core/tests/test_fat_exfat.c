@@ -378,7 +378,7 @@ static void test_encoders(void) {
     uint16_t chars[20];
     unsigned i;
 
-    hype_exfat_file_entry(ent, HYPE_EXFAT_ATTR_ARCHIVE, 3u);
+    hype_exfat_file_entry(ent, HYPE_EXFAT_ATTR_ARCHIVE, 3u, 0);
     CHECK_HEX("File entry type", 0x85u, ent[0]);
     CHECK_HEX("SecondaryCount", 3u, ent[1]);
     CHECK_HEX("checksum field starts zeroed", 0u, get16(ent + 2));
@@ -468,7 +468,7 @@ static void build_set(const char *name, unsigned name_entries, uint16_t attr, ui
     unsigned i;
     memset(g_dir, 0, sizeof g_dir);
     for (i = 0; i < nlen; i++) chars[i] = (uint16_t)name[i];
-    hype_exfat_file_entry(g_dir, attr, (uint8_t)(1u + name_entries));
+    hype_exfat_file_entry(g_dir, attr, (uint8_t)(1u + name_entries), 0);
     hype_exfat_stream_entry(g_dir + 32u, nlen, 0u, len, first_cl, len, 0);
     for (k = 0; k < name_entries; k++) {
         unsigned off = k * 15u;

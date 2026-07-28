@@ -2,10 +2,13 @@
 #include "logbuf.h"
 
 int hype_log_sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
-                       void *ctx, const char *filename) {
+                       void *ctx, const char *filename, const hype_rtc_time_t *now) {
     s->active = 0;
     s->flushed = 0;
     if (hype_fat32_fs_mount(read, write, ctx, &s->fs) != 0) return -1;
+    /* Before create(), so the new file's directory entry carries a real date
+     * rather than the zeroes that made hype's log show as the Unix epoch. */
+    hype_fat32_fs_set_time(&s->fs, now);
     if (hype_fat32_create(&s->fs, filename, &s->file) != 0) return -1;
     s->active = 1;
     return hype_log_sink_flush(s);

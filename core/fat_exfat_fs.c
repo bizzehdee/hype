@@ -545,6 +545,10 @@ int hype_exfat_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ct
     int have_upcase = 0;
     int contiguous = 0;
 
+    /* Same reason as the FAT32 mount: an uninitialised snapshot would produce
+     * random timestamps in entry sets. Invalid until set_time() supplies one. */
+    out->now.year = 0;
+
     if (read(ctx, 0u, 1u, boot) != 0) {
         return -1;
     }
@@ -999,7 +1003,7 @@ int hype_exfat_create(hype_exfat_fs_t *fs, const char *name, hype_exfat_wfile_t 
 
     /* Build the whole set in memory so its checksum covers exactly the bytes
      * that land on the medium. */
-    hype_exfat_file_entry(entries, HYPE_EXFAT_ATTR_ARCHIVE, (uint8_t)(need - 1u));
+    hype_exfat_file_entry(entries, HYPE_EXFAT_ATTR_ARCHIVE, (uint8_t)(need - 1u), &fs->now);
     hype_exfat_stream_entry(entries + ENTSZ, nlen, hash, 0u, 0u, 0u, 0);
     for (k = 0; k < name_entries; k++) {
         unsigned int off = k * HYPE_EXFAT_NAME_CHARS_PER_ENTRY;
@@ -1290,4 +1294,20 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
         f->size += n;
     }
     return set_flush(f);
+}
+
+void hype_exfat_fs_set_time(hype_exfat_fs_t *fs, const hype_rtc_time_t *now) {
+    if (fs == 0) {
+        return;
+    }
+    if (now == 0) {
+        fs->now.year = 0; /* invalid -> encoders emit the 1980 epoch */
+        return;
+    }
+    fs->now.year = now->year;
+    fs->now.month = now->month;
+    fs->now.day = now->day;
+    fs->now.hour = now->hour;
+    fs->now.minute = now->minute;
+    fs->now.second = now->second;
 }
