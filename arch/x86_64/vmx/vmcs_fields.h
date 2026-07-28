@@ -214,6 +214,29 @@
 #define HYPE_VMX_EXIT_REASON_IO_INSTRUCTION 30u
 #define HYPE_VMX_EXIT_REASON_EPT_VIOLATION 48u
 /*
+ * Control-register access (SDM Vol 3C, Table C-1, "Control-register accesses").
+ * Taken whenever the guest touches a CR bit the host owns via
+ * CR0/CR4_GUEST_HOST_MASK. hype needs this because IA32_VMX_CR4_FIXED0 requires
+ * CR4.VMXE in VMX operation while guest firmware, not knowing it is
+ * virtualised, writes CR4 with VMXE clear -- letting that reach GUEST_CR4
+ * raises #GP(0) (#248).
+ *
+ * EXIT_QUALIFICATION layout for a MOV to CR: bits 3:0 = CR number,
+ * bits 5:4 = access type (0 = MOV to CR), bits 11:8 = the source GPR.
+ */
+#define HYPE_VMX_EXIT_REASON_CR_ACCESS 28u
+#define HYPE_VMX_CR_ACCESS_CR_MASK 0x0Fu
+#define HYPE_VMX_CR_ACCESS_TYPE_SHIFT 4u
+#define HYPE_VMX_CR_ACCESS_TYPE_MASK 0x03u
+#define HYPE_VMX_CR_ACCESS_TYPE_MOV_TO_CR 0u
+#define HYPE_VMX_CR_ACCESS_GPR_SHIFT 8u
+#define HYPE_VMX_CR_ACCESS_GPR_MASK 0x0Fu
+/* Bits the host must keep set regardless of what the guest writes. CR4.VMXE is
+ * required by IA32_VMX_CR4_FIXED0; CR0.NE likewise (unrestricted guest relaxes
+ * only CR0.PE and CR0.PG, so NE stays mandatory in both modes). */
+#define HYPE_VMX_CR4_VMXE 0x2000ull
+#define HYPE_VMX_CR0_NE 0x0020ull
+/*
  * VMX-4 (#236): the remaining exit reasons the FW-1 loop dispatches on.
  *
  * EXCEPTION_NMI (0) is where VMX and SVM differ most in shape: SVM encodes the

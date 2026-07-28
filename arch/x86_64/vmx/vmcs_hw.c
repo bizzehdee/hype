@@ -467,10 +467,28 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     if (long_mode) {
         rc |= vmwrite(HYPE_VMCS_GUEST_IA32_EFER, 0x500ull); /* LME|LMA */
     }
-    rc |= vmwrite(HYPE_VMCS_CR0_GUEST_HOST_MASK, 0);
-    rc |= vmwrite(HYPE_VMCS_CR4_GUEST_HOST_MASK, 0);
-    rc |= vmwrite(HYPE_VMCS_CR0_READ_SHADOW, guest_cr0);
-    rc |= vmwrite(HYPE_VMCS_CR4_READ_SHADOW, guest_cr4);
+    /*
+     * #248: the host must OWN the fixed bits, not merely set them once here.
+     * Satisfying the fixed-bit MSRs for the initial VMCS is not enough -- the
+     * guest goes on to write these registers itself. Real firmware does not know
+     * it is virtualised, so OVMF's reset vector writes CR4=0x640
+     * (MCE|OSFXSR|OSXMMEXCPT) with VMXE clear; with a mask of 0 that value
+     * reached GUEST_CR4 directly, violated CR4_FIXED0's VMXE requirement and
+     * raised #GP(0) on the very first CR4 load.
+     *
+     * Owning the bit routes guest writes through a CR-access VM exit
+     * (hype_vmx_vcpu_handle_cr_access), which re-adds the required bit to
+     * GUEST_CR* and records what the guest *thinks* it wrote in the read
+     * shadow. The guest reads back its own value, exactly as on real hardware.
+     *
+     * The read shadows therefore start WITHOUT the host-owned bits: a guest that
+     * reads CR4 here must not see VMXE, or it would conclude the CPU is already
+     * in VMX operation.
+     */
+    rc |= vmwrite(HYPE_VMCS_CR0_GUEST_HOST_MASK, HYPE_VMX_CR0_NE);
+    rc |= vmwrite(HYPE_VMCS_CR4_GUEST_HOST_MASK, HYPE_VMX_CR4_VMXE);
+    rc |= vmwrite(HYPE_VMCS_CR0_READ_SHADOW, guest_cr0 & ~HYPE_VMX_CR0_NE);
+    rc |= vmwrite(HYPE_VMCS_CR4_READ_SHADOW, guest_cr4 & ~HYPE_VMX_CR4_VMXE);
     rc |= vmwrite(HYPE_VMCS_GUEST_DR7, 0x400u);
     rc |= vmwrite(HYPE_VMCS_GUEST_RSP, stack_phys);
     rc |= vmwrite(HYPE_VMCS_GUEST_RIP, rip);
@@ -2261,6 +2279,45 @@ void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
 uint32_t hype_vmx_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     return (uint32_t)real->gprs[1]; /* RCX */
+}
+
+int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok;
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    unsigned crn = (unsigned)(qual & HYPE_VMX_CR_ACCESS_CR_MASK);
+    unsigned type =
+        (unsigned)((qual >> HYPE_VMX_CR_ACCESS_TYPE_SHIFT) & HYPE_VMX_CR_ACCESS_TYPE_MASK);
+    unsigned gpr = (unsigned)((qual >> HYPE_VMX_CR_ACCESS_GPR_SHIFT) & HYPE_VMX_CR_ACCESS_GPR_MASK);
+    uint64_t value;
+
+    /* Only MOV-to-CR is modelled. CLTS/LMSW/MOV-from-CR do not exit with the
+     * masks hype sets (reads are served from the read shadow by hardware), so
+     * anything else here is unexpected -- report it rather than silently
+     * skipping an instruction we did not emulate. */
+    if (type != HYPE_VMX_CR_ACCESS_TYPE_MOV_TO_CR) {
+        return 0;
+    }
+    if (real == 0 || gpr >= 16u) {
+        return 0;
+    }
+    value = real->gprs[gpr];
+
+    if (crn == 4u) {
+        /* Hardware keeps VMXE; the guest sees precisely what it wrote. */
+        (void)vmwrite(HYPE_VMCS_GUEST_CR4, value | HYPE_VMX_CR4_VMXE);
+        (void)vmwrite(HYPE_VMCS_CR4_READ_SHADOW, value);
+    } else if (crn == 0u) {
+        (void)vmwrite(HYPE_VMCS_GUEST_CR0, value | HYPE_VMX_CR0_NE);
+        (void)vmwrite(HYPE_VMCS_CR0_READ_SHADOW, value);
+    } else {
+        /* CR3 loads are not host-owned (no bit in the CR3 target list here) and
+         * CR8 does not apply -- do not pretend to have handled them. */
+        return 0;
+    }
+
+    vmx_advance_rip();
+    return 1;
 }
 
 void hype_vmx_vcpu_get_cr_diag(hype_vcpu_ctx_t *ctx, unsigned gpr, hype_vmx_cr_diag_t *out) {

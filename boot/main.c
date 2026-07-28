@@ -3074,6 +3074,22 @@ static int vmm_reason_is_pause(hype_vmm_kind_t kind, uint64_t reason) {
                                      : (reason == HYPE_SVM_EXITCODE_PAUSE);
 }
 /*
+ * #248: control-register access. VMX-only by nature, not merely unported -- SVM
+ * requires no particular CR bit to be set while the guest runs, so there is
+ * nothing for the host to own and shadow, and this exit simply does not arise
+ * there. On VMX the host must own CR4.VMXE (IA32_VMX_CR4_FIXED0) and CR0.NE, so
+ * guest writes to those registers trap here.
+ */
+static int vmm_reason_is_cr_access(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX && reason == HYPE_VMX_EXIT_REASON_CR_ACCESS;
+}
+static int vmm_handle_cr_access(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind != HYPE_VMM_KIND_VMX) {
+        return 0;
+    }
+    return hype_vmx_vcpu_handle_cr_access(ctx);
+}
+/*
  * "Did the guest take exception `vector`?" This is the one exit whose SHAPE
  * differs between the backends rather than just its number: SVM encodes the
  * vector into the exit code (EXITCODE_EXCEPTION_BASE + vector), so the reason
@@ -8269,6 +8285,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             key_reacted = 1;
         }
 
+        if (vmm_reason_is_cr_access(kind, info.reason)) {
+            /* #248: guest wrote a CR whose bits the host owns (CR4.VMXE /
+             * CR0.NE). Re-apply the required bit and let the guest read back its
+             * own value. If the access is one this does not model, fall through
+             * WITHOUT continuing -- RIP was not advanced, so silently resuming
+             * would re-execute the same instruction forever. */
+            if (vmm_handle_cr_access(kind, ctx)) {
+                continue;
+            }
+            hype_debug_print("fw-1 CR-ACCESS: unmodelled control-register exit "
+                             "(qual=0x%llx guest_rip=0x%llx) -- not resuming blind\n",
+                             (unsigned long long)info.qualification,
+                             (unsigned long long)info.guest_rip);
+        }
         if (vmm_reason_is_pause(kind, info.reason)) {
             /* M4-6d4 #5: pause-filter tripped -- the guest was spinning on
              * PAUSE (cpu_relax). We've simply regained control; the loop-top

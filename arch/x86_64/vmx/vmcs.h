@@ -227,4 +227,15 @@ typedef struct {
  * decoded from the faulting instruction's ModRM r/m field. */
 void hype_vmx_vcpu_get_cr_diag(hype_vcpu_ctx_t *ctx, unsigned gpr, hype_vmx_cr_diag_t *out);
 
+/*
+ * #248: service a control-register access exit for a MOV to CR0/CR4, keeping the
+ * bits the fixed-bit MSRs require set in GUEST_CR* while the read shadow reports
+ * the guest's own value back to it. Advances guest RIP past the instruction.
+ *
+ * Returns 1 if the access was emulated, 0 if it was not (a CR number or access
+ * type this does not model) -- in which case the caller must NOT treat the exit
+ * as handled, because RIP has deliberately not been advanced.
+ */
+int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx);
+
 #endif /* HYPE_ARCH_VMX_VMCS_H */
