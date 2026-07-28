@@ -1341,15 +1341,31 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
                     }
                 }
             }
-            if (!is_write) {
-                real->vmcb->save.rax = 0;
-                real->gprs[2] = 0;
-            }
-            /* permissive: WRMSR ignored, RDMSR returns 0 -- discovery only */
-            real->vmcb->save.rip += 2;
-            return 0;
         }
-        return -1;
+        /*
+         * Absorb the unmodelled MSR: WRMSR ignored, RDMSR returns 0.
+         *
+         * This used to sit INSIDE the `if (g_msr_trace)` above, which coupled
+         * "tolerate an unknown MSR" to "trace MSR accesses" -- so turning
+         * tracing off silently made every unmodelled MSR fatal. That is not a
+         * theoretical hazard: it killed a working guest the moment the trace
+         * call was treated as pure diagnostics and gated, and it presented as
+         * `unhandled guest MSR access msr=0x8b` (IA32_BIOS_SIGN_ID, read by
+         * Linux's microcode init) at a kernel RIP, with nothing pointing at the
+         * trace flag.
+         *
+         * Absorbing is BEHAVIOUR and belongs here unconditionally -- the same
+         * absorb-rather-than-die posture GLADDER-1 established for unmodelled
+         * MMIO. Tracing is diagnostics and stays gated above. A guest that
+         * reads an MSR hype does not model gets 0, which is what it would get
+         * from a CPU lacking the feature, rather than taking down the host.
+         */
+        if (!is_write) {
+            real->vmcb->save.rax = 0;
+            real->gprs[2] = 0;
+        }
+        real->vmcb->save.rip += 2;
+        return 0;
     }
 
     real->vmcb->save.rip += 2; /* RDMSR/WRMSR are always exactly 2 bytes (0F 32 / 0F 30) */

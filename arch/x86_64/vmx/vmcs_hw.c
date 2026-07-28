@@ -785,7 +785,22 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
     }
     case HYPE_MSR_ACTION_REJECT:
     default:
-        return -1;
+        /*
+         * Absorb the unmodelled MSR, matching the SVM path: WRMSR ignored,
+         * RDMSR returns 0. This returned -1 (fatal) unconditionally, so the
+         * first MSR a live Intel guest touched that hype does not model would
+         * have killed it -- Linux reads IA32_BIOS_SIGN_ID (0x8b) during
+         * microcode init, so that was reachable immediately. Reading 0 is what
+         * a CPU without the feature would report.
+         */
+        if (!is_write) {
+            /* Only on a READ: a WRMSR's RAX/RDX hold the value the guest is
+             * writing, and zeroing them would corrupt guest state rather than
+             * merely ignoring the write. */
+            real->gprs[0] = 0; /* RAX */
+            real->gprs[2] = 0; /* RDX */
+        }
+        break;
     }
     vmx_advance_rip();
     return 0;
