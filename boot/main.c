@@ -30,6 +30,7 @@
 #include "../core/log_sink.h"
 #include "../core/nvme_host.h"
 #include "../core/blk_backend.h"
+#include "../core/fw1_debug.h"
 #include "../core/rtc.h"
 #include "../core/blk_phys.h"
 
@@ -62,6 +63,7 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #include "../arch/x86_64/svm/npt.h"
 #include "../arch/x86_64/svm/svm.h"
 #include "../arch/x86_64/vmx/vmcs.h" /* VMX-2: vcpu_create_long_mode + handlers */
+#include "../arch/x86_64/vmx/ept.h" /* VMX-4 (#236): per-VM EPT build */
 #include "../arch/x86_64/vmx/vmx.h"  /* #242: hype_vmx_enable_on for the AP landing */
 #include "../core/linux_boot.h"
 #include "../devices/pic.h"
@@ -325,7 +327,23 @@ static uint64_t g_ram_1_size_bytes;
  * territory this project has deliberately avoided all session).
  */
 /* Sizing constants (VM-independent). */
-#define HYPE_FW_1_GUEST_RAM_BYTES (2048ULL * 1024ULL * 1024ULL) /* 2 GiB (GLADDER-8: server installers anaconda/subiquity want >=2GB; within HYPE_FW_1_NPT_GB=4 + under the 0xE0000000 hole); see hype_fw_vm_t.ram_host_phys */
+/*
+ * Per-VM guest RAM. 2 GiB by default (GLADDER-8: server installers
+ * anaconda/subiquity want >=2GB; within HYPE_FW_1_NPT_GB=4 and under the
+ * 0xE0000000 hole); see hype_fw_vm_t.ram_host_phys.
+ *
+ * #ifndef-guarded so -DHYPE_FW_1_GUEST_RAM_MB=N on the build line wins. That
+ * exists for validation hosts that cannot afford the default: two VMs at 2 GiB
+ * needs a >=8192MB QEMU, which the Intel nested-VMX box (7.6GB total) has not
+ * got -- it panicked in AllocatePages(524800 pages) with EFI_OUT_OF_RESOURCES.
+ * 1024 there fits two VMs and is ample for an Alpine login prompt; the 2 GiB
+ * floor is a *server-installer* requirement, not a Linux-boot one. Sized in MB
+ * rather than bytes so the override is a plain number on the command line.
+ */
+#ifndef HYPE_FW_1_GUEST_RAM_MB
+#define HYPE_FW_1_GUEST_RAM_MB 2048ULL
+#endif
+#define HYPE_FW_1_GUEST_RAM_BYTES (HYPE_FW_1_GUEST_RAM_MB * 1024ULL * 1024ULL)
 #define HYPE_SERIAL_COM2 0x2F8u
 #define HYPE_FW_1_KEY_ENTER_MAKE 0x1Cu /* Set-1 make code for Enter */
 #define HYPE_FW_1_DEBUG_PORT 0x402u    /* FW-1g: OVMF SEC/PEI PlatformDebugLibIoPort */
@@ -372,6 +390,21 @@ typedef struct hype_fw_vm {
     hype_pte_t npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     hype_pte_t npt_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     hype_pte_t npt_pd[HYPE_FW_1_NPT_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+    /*
+     * VMX-4 (#236): the same thing for Intel. EPT uses its own entry encoding
+     * (R/W/X + memory type rather than Present/Write/User), so the tables cannot
+     * be shared with the NPT ones above even though the LAYOUT they describe is
+     * identical -- built by the same three calls, just the EPT flavour.
+     *
+     * Per-VM for exactly the reason the NPT is: a live guest's RAM is not
+     * identity-mapped, and two guests must map guest-physical 0 to different
+     * host RAM. (Note the microtests still use a single global identity EPT in
+     * vmcs_hw.c; that is fine for them and is what #245 tracks for concurrent
+     * guests, along with VPID.)
+     */
+    hype_ept_pte_t ept_pml4[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+    hype_ept_pte_t ept_pdpt[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+    hype_ept_pte_t ept_pd[HYPE_FW_1_NPT_GB][HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     /* --- emulated devices --- */
     hype_pic_emu_t pic;
     hype_pit_emu_t pit;
@@ -2617,7 +2650,12 @@ static const uint8_t g_cpumsr_1_payload_template[] = {
 static hype_vcpu_ctx_t *vmm_create_long_mode(hype_vmm_kind_t kind, uint64_t entry_rip,
                                              uint64_t guest_cr3, uint64_t rsp, uint64_t root) {
     if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, root);
+        /* 0, deliberately: `root` is an SVM NPT root here (the microtests build
+         * one), and an NPT table is not a valid EPT table. 0 selects VMX's own
+         * identity EPT, which is correct for these identity-mapped guests.
+         * VMX-4 (#236) made a non-zero root meaningful, so passing it through
+         * would now silently install a bogus EPT rather than being ignored. */
+        return hype_vmx_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
     }
     return hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, root);
 }
@@ -2785,6 +2823,301 @@ static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
     } else {
         hype_svm_vcpu_handle_vintr_window(ctx);
     }
+}
+
+/*
+ * VMX-4 (#236): the rest of the vendor dispatch, for the FW-1 live-guest loop.
+ *
+ * Same pattern as the microtest shims above -- pick the backend by kind so
+ * run_fw_1_test()'s body stays vendor-neutral. Split out here because these are
+ * the ones the *live* guest needs (vCPU state, interrupt acceptance, the device
+ * MMIO/IOIO surface) rather than the microtests' narrower set.
+ *
+ * Two conventions worth stating once:
+ *  - Functions returning `int` where the SVM original returns void report
+ *    "was this even available on this backend" (1 = filled, 0 = not), so a
+ *    caller can skip an SVM-only diagnostic rather than print zeros as if they
+ *    were real readings. Silent zeros in a diagnostic are worse than no
+ *    diagnostic: #237's bisect was nearly derailed by results that defaulted to
+ *    looking clean.
+ *  - Purely SVM-side counters (EVENTINJ collisions, MTRR access counts) have no
+ *    VMX equivalent at all and are reported as unavailable, not as zero.
+ */
+static uint64_t vmm_get_cr3(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_cr3(ctx) : hype_svm_vcpu_get_cr3(ctx);
+}
+static void vmm_set_rip(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rip) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_set_rip(ctx, rip);
+    } else {
+        hype_svm_vcpu_set_rip(ctx, rip);
+    }
+}
+static const uint8_t *vmm_guest_insn_bytes(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                           uint8_t *out_num) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_guest_insn_bytes(ctx, out_num)
+                                     : hype_svm_vcpu_guest_insn_bytes(ctx, out_num);
+}
+static void vmm_get_last_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_vmm_npf_t *out) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_get_last_npf(ctx, out);
+    } else {
+        hype_svm_vcpu_get_last_npf(ctx, out);
+    }
+}
+static void vmm_peek_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_vmm_ioio_t *out) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_peek_ioio(ctx, out);
+    } else {
+        hype_svm_vcpu_peek_ioio(ctx, out);
+    }
+}
+static void vmm_handle_unknown_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                    hype_vmm_ioio_t *out) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_handle_unknown_ioio(ctx, out);
+    } else {
+        hype_svm_vcpu_handle_unknown_ioio(ctx, out);
+    }
+}
+static void vmm_set_exception_intercepts(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint32_t mask) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_set_exception_intercepts(ctx, mask);
+    } else {
+        hype_svm_vcpu_set_exception_intercepts(ctx, mask);
+    }
+}
+static void vmm_enable_intr_intercept(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_enable_intr_intercept(ctx);
+    } else {
+        hype_svm_vcpu_enable_intr_intercept(ctx);
+    }
+}
+static void vmm_enable_pause_filter(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t count,
+                                    uint16_t threshold) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_enable_pause_filter(ctx, count, threshold);
+    } else {
+        hype_svm_vcpu_enable_pause_filter(ctx, count, threshold);
+    }
+}
+static void vmm_reinject_exception(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector,
+                                   int has_error_code, uint32_t error_code) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_reinject_exception(ctx, vector, has_error_code, error_code);
+    } else {
+        hype_svm_vcpu_reinject_exception(ctx, vector, has_error_code, error_code);
+    }
+}
+static void vmm_wake_hlt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_wake_hlt(ctx);
+    } else {
+        hype_svm_vcpu_wake_hlt(ctx);
+    }
+}
+static void vmm_get_intr_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                               hype_vmm_intr_state_t *out) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_get_intr_state(ctx, out);
+    } else {
+        hype_svm_vcpu_get_intr_state(ctx, out);
+    }
+}
+static int vmm_deliver_pending_if_ready(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_deliver_pending_if_ready(ctx)
+                                     : hype_svm_vcpu_deliver_pending_if_ready(ctx);
+}
+static void vmm_set_pvclock(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map,
+                            uint64_t tsc_hz) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_set_pvclock(ctx, map, tsc_hz);
+    } else {
+        hype_svm_vcpu_set_pvclock(ctx, map, tsc_hz);
+    }
+}
+
+/*
+ * SVM-only diagnostics. Each returns 0 on VMX so the caller skips the print
+ * entirely rather than reporting fabricated zeros.
+ *
+ * These are deliberately NOT ported. hype_svm_debug_state_t is an SVM
+ * investigation artifact -- EXITINFO2, EXITINTINFO, NRIP, G_PAT are VMCB fields
+ * with no VMCS counterpart, and several exist specifically to answer questions
+ * about AMD save-area behaviour. Likewise the EVENTINJ-collision and MTRR
+ * counters are file-scope tallies inside svm_vcpu.c. Porting an SVM debugging
+ * apparatus is not what Intel parity requires; running a guest is.
+ */
+static int vmm_get_debug_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                               hype_svm_debug_state_t *out) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return 0;
+    }
+    hype_svm_vcpu_get_debug_state(ctx, out);
+    return 1;
+}
+static int vmm_get_int_diag(hype_vmm_kind_t kind, unsigned long long *eventinj,
+                            unsigned long long *defer, unsigned long long *window,
+                            unsigned long long *overwrite) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return 0;
+    }
+    hype_svm_vcpu_get_int_diag(eventinj, defer, window, overwrite);
+    return 1;
+}
+#if HYPE_FW1_DEBUG
+static int vmm_get_mtrr_diag(hype_vmm_kind_t kind, unsigned long long *reads,
+                             unsigned long long *writes, uint64_t *last_deftype_wr,
+                             uint64_t *last_var_wr) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return 0;
+    }
+    hype_svm_vcpu_get_mtrr_diag(reads, writes, last_deftype_wr, last_var_wr);
+    return 1;
+}
+#endif
+/* The MSR the guest was accessing, so the unhandled-MSR fatal can name it. */
+static uint32_t vmm_get_msr_index(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_msr_index(ctx)
+                                     : hype_svm_vcpu_get_msr_index(ctx);
+}
+static unsigned long long vmm_get_eventinj_collisions(hype_vmm_kind_t kind) {
+    return kind == HYPE_VMM_KIND_VMX ? 0ull : hype_svm_vcpu_get_eventinj_collisions();
+}
+
+/* VMX-4 (#236): the FW-1 device surface. */
+static int vmm_handle_lapic_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                hype_guest_lapic_t *lapic, uint64_t base, const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_lapic_npf(ctx, lapic, base, insn)
+                                     : hype_svm_vcpu_handle_lapic_npf(ctx, lapic, base, insn);
+}
+static int vmm_handle_ioapic_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
+                                 uint64_t base, const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_ioapic_npf(ctx, ioapic, base, insn)
+                                     : hype_svm_vcpu_handle_ioapic_npf(ctx, ioapic, base, insn);
+}
+static int vmm_handle_ahci_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                   hype_atapi_t *atapi, uint64_t base,
+                                   const hype_gpa_map_t *dma_map, const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX
+               ? hype_vmx_vcpu_handle_ahci_npf_map(ctx, ahci, atapi, base, dma_map, insn)
+               : hype_svm_vcpu_handle_ahci_npf_map(ctx, ahci, atapi, base, dma_map, insn);
+}
+static int vmm_absorb_mmio_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_absorb_mmio_npf(ctx, insn)
+                                     : hype_svm_vcpu_absorb_mmio_npf(ctx, insn);
+}
+static int vmm_handle_uart_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart,
+                                uint16_t base_port) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_uart_ioio(ctx, uart, base_port)
+                                     : hype_svm_vcpu_handle_uart_ioio(ctx, uart, base_port);
+}
+static int vmm_handle_cmos_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_cmos_ioio(ctx, cmos)
+                                     : hype_svm_vcpu_handle_cmos_ioio(ctx, cmos);
+}
+static int vmm_handle_pm1_cnt_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t port,
+                                   uint16_t *value, int *slp_en) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_pm1_cnt_ioio(ctx, port, value, slp_en)
+                                     : hype_svm_vcpu_handle_pm1_cnt_ioio(ctx, port, value, slp_en);
+}
+static int vmm_handle_pci_cf8_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_pci_cf8_ioio(ctx, pci)
+                                     : hype_svm_vcpu_handle_pci_cf8_ioio(ctx, pci);
+}
+static int vmm_handle_debug_port_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t base_port,
+                                      uint8_t *out_byte) {
+    return kind == HYPE_VMM_KIND_VMX
+               ? hype_vmx_vcpu_handle_debug_port_ioio(ctx, base_port, out_byte)
+               : hype_svm_vcpu_handle_debug_port_ioio(ctx, base_port, out_byte);
+}
+static int vmm_handle_acpi_pm_timer_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_acpi_pm_timer_ioio(ctx)
+                                     : hype_svm_vcpu_handle_acpi_pm_timer_ioio(ctx);
+}
+
+/* VMX-4 (#236): the remaining exit-reason predicates the FW-1 loop dispatches on. */
+static int vmm_reason_is_intr(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_EXTERNAL_INTERRUPT)
+                                     : (reason == HYPE_SVM_EXITCODE_INTR);
+}
+static int vmm_reason_is_pause(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_PAUSE)
+                                     : (reason == HYPE_SVM_EXITCODE_PAUSE);
+}
+/*
+ * "Did the guest take exception `vector`?" This is the one exit whose SHAPE
+ * differs between the backends rather than just its number: SVM encodes the
+ * vector into the exit code (EXITCODE_EXCEPTION_BASE + vector), so the reason
+ * alone answers it; VMX reports a single EXCEPTION_NMI reason for every vector
+ * and puts the vector in VM_EXIT_INTR_INFO. Hence the ctx parameter, which the
+ * SVM side does not need.
+ */
+/* Was this exit ANY guest exception? SVM: one of the 32 codes in the exception
+ * block. VMX: the single EXCEPTION_NMI reason. */
+static int vmm_reason_is_any_exception(hype_vmm_kind_t kind, uint64_t reason) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return reason == HYPE_VMX_EXIT_REASON_EXCEPTION_NMI;
+    }
+    return reason >= HYPE_SVM_EXITCODE_EXCEPTION_BASE &&
+           reason <= HYPE_SVM_EXITCODE_EXCEPTION_BASE + 31;
+}
+/* Which vector, given such an exit: subtract the base on SVM, read
+ * VM_EXIT_INTR_INFO on VMX. Returns -1 if VMX records no valid interruption. */
+static int vmm_exception_vector(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_exit_exception_vector(ctx);
+    }
+    return (int)(reason - HYPE_SVM_EXITCODE_EXCEPTION_BASE);
+}
+static int vmm_reason_is_exception(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason,
+                                   uint8_t vector) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return reason == HYPE_VMX_EXIT_REASON_EXCEPTION_NMI &&
+               hype_vmx_vcpu_exit_exception_vector(ctx) == (int)vector;
+    }
+    return reason == (uint64_t)(HYPE_SVM_EXITCODE_EXCEPTION_BASE + vector);
+}
+/*
+ * The error code the faulting exception pushed. Takes the exit info because the
+ * two backends deliver it differently: on SVM it arrives as EXITINFO1, which
+ * the dispatch loop has already captured as info->qualification, whereas VMX
+ * puts EXIT_QUALIFICATION to a completely different use for an exception and
+ * carries the error code in its own VM_EXIT_INTR_ERROR_CODE field. Reading
+ * info->qualification on VMX would silently reinject a garbage error code.
+ */
+static uint32_t vmm_exception_error_code(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                         const hype_vmexit_info_t *info) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_exit_exception_error_code(ctx)
+                                     : (uint32_t)info->qualification;
+}
+
+static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t guest_rip,
+                               uint64_t guest_rsp, uint64_t table_root) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_reset_realmode(ctx, guest_rip, guest_rsp, table_root);
+    } else {
+        hype_svm_vcpu_reset_realmode(ctx, guest_rip, guest_rsp, table_root);
+    }
+}
+/* ECAM / virtio-blk with caller-resolved instruction bytes -- the live-guest
+ * flavour. Distinct from the microtest shims above, which pass a guest RIP for
+ * the backend to dereference; FW-1's guest RAM is not identity-mapped, so the
+ * caller must have already translated it. */
+static int vmm_handle_pci_ecam_npf_insn(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
+                                        uint64_t ecam_base_phys, const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX
+               ? hype_vmx_vcpu_handle_pci_ecam_npf_insn(ctx, pci, ecam_base_phys, insn)
+               : hype_svm_vcpu_handle_pci_ecam_npf(ctx, pci, ecam_base_phys, insn);
+}
+static int vmm_handle_virtio_blk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                         hype_virtio_blk_t *dev, const hype_blk_backend_t *be,
+                                         const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                         const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX
+               ? hype_vmx_vcpu_handle_virtio_blk_npf_map(ctx, dev, be, dma_map, mmio_base_phys, insn)
+               : hype_svm_vcpu_handle_virtio_blk_npf(ctx, dev, be, dma_map, mmio_base_phys, insn);
 }
 
 static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
@@ -6064,7 +6397,7 @@ vblk_pci:
                               HYPE_VIRTIO_BLK_CFG_SIZE);
 }
 
-static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx) {
+static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base = 0x100000000ULL - 0x10000ULL; /* 0xFFFF0000 */
     uint64_t reset_rip = 0xFFF0ULL;
     uint64_t stack_top = (uint64_t)(uintptr_t)(g_fw_1_guest_stack + sizeof(g_fw_1_guest_stack));
@@ -6112,14 +6445,14 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx) {
         hype_cmos_set_extended_memory_above_16mb(&g_fw_1_cmos, (uint16_t)units_64kb);
     }
 
-    hype_svm_vcpu_reset_realmode(ctx, reset_cs_base, stack_top, npt_root_phys);
-    hype_svm_vcpu_set_pvclock(ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
-    hype_svm_vcpu_set_rip(ctx, reset_rip);
-    hype_svm_vcpu_set_exception_intercepts(ctx, (1u << 6) | (1u << 13));
+    vmm_reset_realmode(kind, ctx, reset_cs_base, stack_top, npt_root_phys);
+    vmm_set_pvclock(kind, ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
+    vmm_set_rip(kind, ctx, reset_rip);
+    vmm_set_exception_intercepts(kind, ctx, (1u << 6) | (1u << 13));
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
-        hype_svm_vcpu_enable_pause_filter(ctx, 65535u, 4096u);
+        vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
     }
-    hype_svm_vcpu_enable_intr_intercept(ctx);
+    vmm_enable_intr_intercept(kind, ctx);
     vm->shutdown_deadline_tsc = 0;
     vm->pm1a_cnt = 0;
     hype_debug_print("fw-1: vm%u restarted (M8-4): pristine firmware restored, RAM zeroed, vcpu reset\n",
@@ -6134,10 +6467,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * annotated with what hype did right before the guest ran long. */
     uint64_t prev_exit_reason = 0;
 
-    if (kind != HYPE_VMM_KIND_SVM) {
-        hype_serial_print("fw-1: skipped -- %s has no working vcpu_run yet (see vmx_ops.c)\n", ops->name);
-        return;
-    }
+    /*
+     * VMX-4 (#236): the gate is gone -- this loop is vendor-neutral now, going
+     * through the vmm_* shims for every vCPU-state read, device MMIO/IOIO
+     * handler and exit-reason test. The old message ("no working vcpu_run yet")
+     * was already stale: VMX's vcpu_run has worked since VMX-1, and the whole
+     * M2-M4-5 battery has run on it since VMX-2. What was actually missing was
+     * this handler surface, plus a non-identity EPT for a guest whose RAM is
+     * not identity-mapped.
+     *
+     * Still single-guest on Intel: see #245 (one static vCPU ctx, one VMCS, and
+     * no VPID), which is the remaining gap before two concurrent Intel guests.
+     */
 
     hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
     hype_pic_emu_reset(&g_fw_1_pic);
@@ -6214,7 +6555,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * flag is per-run and only FW-1 sets it). VMSAVE/VMLOAD-managed and
      * VMCB-backed MSRs (FS/GS/syscall/sysenter, PAT, EFER) are handled
      * for real, not stubbed -- see configure_guest_msrpm(). */
-    hype_svm_set_msr_trace(1);
+#if HYPE_FW1_DEBUG
+    /* Per-MSR-access tracing. SVM-only, and firmly a hot path -- a real OVMF
+     * boot touches MSRs constantly, and each traced line is GOP-rendered. It
+     * was previously left on unconditionally in production. */
+    if (kind == HYPE_VMM_KIND_SVM) {
+        hype_svm_set_msr_trace(1);
+    }
+#endif
     /* FW-1g: per-access PS/2 tracing (hype_svm_set_ps2_trace(1)) is
      * available for debugging the keyboard handshake, left off -- an
      * interactive prompt busy-polls 0x64 thousands of times and each
@@ -6346,6 +6694,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      (0x100000000ULL - g_fw_1_combined_size) - HYPE_FW_1_GUEST_RAM_BYTES);
     npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
 
+    /*
+     * VMX-4 (#236): the identical layout in EPT form, for an Intel host. Kept
+     * adjacent to the NPT build on purpose -- these three ranges, the
+     * g_fw_1_dma_map below, and the guest's own e820 must all describe the same
+     * memory, and the surest way to keep four descriptions consistent is to
+     * derive them from the same constants in the same place. Built for both
+     * vendors rather than under an `if`, so a layout edit cannot be applied to
+     * one backend and forgotten on the other; the unused set costs 24KB of BSS
+     * and no runtime work.
+     */
+#if 0 /* BISECT: EPT build disabled */
+    hype_ept_build_identity(vm->ept_pml4, vm->ept_pdpt, vm->ept_pd, HYPE_FW_1_NPT_GB);
+    hype_ept_map_range(vm->ept_pd, 0, g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_ept_map_range(vm->ept_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
+                       g_fw_1_combined_size);
+    hype_ept_mark_range_not_present(vm->ept_pd, HYPE_FW_1_GUEST_RAM_BYTES,
+                                    (0x100000000ULL - g_fw_1_combined_size) - HYPE_FW_1_GUEST_RAM_BYTES);
+    if (g_fw_1_kind == HYPE_VMM_KIND_VMX) {
+        npt_root_phys = (uint64_t)(uintptr_t)vm->ept_pml4;
+    }
+#endif
+
     /* VALID-1/VALID-3: the guest-physical -> host map, mirroring the two
      * hype_npt_map_range() calls above exactly. The AHCI DMA path
      * bounds-checks every guest-supplied address against this before
@@ -6363,7 +6733,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         (unsigned long long)(0x100000000ULL - g_fw_1_combined_size),
         (unsigned long long)g_fw_1_combined_host_phys);
 
-    ctx = hype_svm_vcpu_create(reset_cs_base, stack_top, npt_root_phys);
+    /* VMX-4 (#236): through the vtable, not the SVM entry point. npt_root_phys
+     * was already set to this VM's EPT root above when the backend is VMX. */
+    ctx = ops->vcpu_create(reset_cs_base, stack_top, npt_root_phys);
     if (ctx == 0) {
         hype_fatal("fw-1: vcpu_create failed");
     }
@@ -6377,8 +6749,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * AMD. Must be after vcpu_create (the map is stored per-vCPU in the ctx):
      * with two concurrent guests each needs its OWN map, else one guest's
      * pvclock writes land in the other's RAM (M8-0b STEP 2 dead-halt bug). */
-    hype_svm_vcpu_set_pvclock(ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
-    hype_svm_vcpu_set_rip(ctx, reset_rip);
+    vmm_set_pvclock(kind, ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
+    vmm_set_rip(kind, ctx, reset_rip);
     /* M4-6: let the guest own every exception vector. OVMF and any OS it
      * boots (real Linux takes routine #PF/#GP/#UD/#NM) handle their own
      * faults via their own IDTs; intercepting exceptions -- the strict
@@ -6394,7 +6766,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * through its own IDT exactly as before -- catches the invisible Ubuntu
      * udevadm crash at its source without altering guest behavior. #PF(14) is
      * deliberately NOT intercepted (routine, would flood + slow the boot). */
-    hype_svm_vcpu_set_exception_intercepts(ctx, (1u << 6) | (1u << 13));
+    vmm_set_exception_intercepts(kind, ctx, (1u << 6) | (1u << 13));
 
     /* M4-6d4 #5: bound the guest's uninterrupted execution via SVM PAUSE-
      * filtering. Real HW showed a single 40s VMRUN with zero exits (PREEMPT
@@ -6408,7 +6780,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * the CPU/hypervisor exposes it (else INTERCEPT_PAUSE would trap EVERY
      * pause). Proven in isolation by run_pause_filter_test. */
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
-        hype_svm_vcpu_enable_pause_filter(ctx, 65535u, 4096u);
+        vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
         hype_debug_print("fw-1: SVM pause-filtering armed (count=65535) -- guest spin loops now "
                           "yield control for tick injection\n");
     } else {
@@ -6424,7 +6796,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * loop-top timebase advance run and inject any due guest tick, so jiffies
      * keep moving even through a non-intercepting stretch -- the post-EBS
      * replacement for the ambient firmware-timer preemption RT-2a removed. */
-    hype_svm_vcpu_enable_intr_intercept(ctx);
+    vmm_enable_intr_intercept(kind, ctx);
     hype_debug_print("fw-1: INTR-intercept armed -- host timer ticks now preempt the guest "
                       "(RT-2b)\n");
 
@@ -6653,7 +7025,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (!hype_vm_lifecycle_runs(vm->lifecycle)) {
             if (vm->lifecycle == HYPE_VM_STARTING) {
                 /* M8-4 Start: fresh re-boot of this guest, then -> RUNNING. */
-                fw_1_vm_reinit(vm, ctx);
+                fw_1_vm_reinit(vm, ctx, kind);
                 perf_boot_start_tsc = 0; /* restart the uptime/idle timebase */
                 perf_hlt_wait_tsc = 0;
                 total_exits = 0;
@@ -6720,9 +7092,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         /* step 1b: sample the state that distinguishes "timer
                          * never fired" from "timer fired but SVM didn't exit". */
                         volatile uint8_t *lb = (volatile uint8_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE;
-                        hype_svm_intr_state_t ps;
+                        hype_vmm_intr_state_t ps;
                         hype_longvmrun_t e;
-                        hype_svm_vcpu_get_intr_state(ctx, &ps);
+                        vmm_get_intr_state(kind, ctx, &ps);
                         e.ms = this_ms;
                         e.rip = info.guest_rip;
                         e.reason = (uint32_t)info.reason;
@@ -6750,25 +7122,40 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         /* FW-1e: keep the first (riskiest) VMRUN traced, then silence the
          * per-exit CLGI/VMLOAD/VMRUN spam -- real OVMF does thousands of
          * exits and each trace line is GOP-rendered. */
-        if (total_exits == 1) {
+#if HYPE_FW1_DEBUG
+        /* SVM-only: VMX has no equivalent per-VMRUN trace to silence. */
+        if (total_exits == 1 && kind == HYPE_VMM_KIND_SVM) {
             hype_svm_set_vmrun_trace(0);
         }
-        if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+#endif
+        if (!vmm_reason_is_hlt(kind, info.reason)) {
             productive_exits++;
         }
 
         /* Per-exit-reason tally (see the ex_* declarations). Sub-buckets
          * (io80/msr_spec/ahci) are bumped at their handlers below. */
-        switch (info.reason) {
-            case HYPE_SVM_EXITCODE_HLT:   ex_hlt++;   break;
-            case HYPE_SVM_EXITCODE_NPF:   ex_npf++;   break;
-            case HYPE_SVM_EXITCODE_IOIO:  ex_ioio++;  break;
-            case HYPE_SVM_EXITCODE_MSR:   ex_msr++;   break;
-            case HYPE_SVM_EXITCODE_CPUID: ex_cpuid++; break;
-            case HYPE_SVM_EXITCODE_VINTR: ex_vintr++; break;
-            case HYPE_SVM_EXITCODE_PAUSE: ex_pause++; break;
-            case HYPE_SVM_EXITCODE_INTR:  ex_intr++;  break;
-            default:                      ex_other++; break;
+        /* An if-chain rather than a switch: SVM's #VMEXIT codes and VMX's exit
+         * reasons are different numbering spaces, so there is no single set of
+         * case labels that means the same thing on both. The predicates below
+         * are the only place that mapping lives. */
+        if (vmm_reason_is_hlt(kind, info.reason)) {
+            ex_hlt++;
+        } else if (vmm_reason_is_npf(kind, info.reason)) {
+            ex_npf++;
+        } else if (vmm_reason_is_ioio(kind, info.reason)) {
+            ex_ioio++;
+        } else if (vmm_reason_is_msr(kind, info.reason)) {
+            ex_msr++;
+        } else if (vmm_reason_is_cpuid(kind, info.reason)) {
+            ex_cpuid++;
+        } else if (vmm_reason_is_intr_window(kind, info.reason)) {
+            ex_vintr++;
+        } else if (vmm_reason_is_pause(kind, info.reason)) {
+            ex_pause++;
+        } else if (vmm_reason_is_intr(kind, info.reason)) {
+            ex_intr++;
+        } else {
+            ex_other++;
         }
         /* Dump the histogram every ~5s of wall-clock. The periodic flush
          * below writes it to \hype-log.txt, so diffing two EXHIST lines
@@ -6886,7 +7273,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * what the guest tried to write to MTRRdefType (E bit10, type
                      * low 8: 6=WB) -- nonzero with type=6 means the guest WANTED WB
                      * but hype ignored it. */
-                    {
+#if HYPE_FW1_DEBUG
+                    /* PERF-1 memory-type probe. That investigation is closed
+                     * (guest RAM was uncacheable, g_pat=0; fixed by the WB-PAT
+                     * change), and every field here is VMCB-only, so it is gated
+                     * rather than ported: SVM reads real values, VMX has no
+                     * equivalent to read. */
+                    if (kind == HYPE_VMM_KIND_SVM) {
                         hype_svm_debug_state_t ds;
                         unsigned long long mrd, mwr;
                         uint64_t mdt, mvar;
@@ -6900,6 +7293,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             (unsigned long long)ds.cr4, (unsigned long long)ds.g_pat, mrd, mwr,
                             (unsigned long long)mdt, (unsigned long long)mvar);
                     }
+#endif
                 }
                 /* RT-2c: waiting-vs-working readout. A few kernel-space RIPs
                  * carrying most preemptions => guest spinning in a delay loop
@@ -7030,15 +7424,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * and the wedge is downstream (SRCU/workqueue/self-wakeup). Also
                  * dumps the live pending-IRR occupancy + staged EVENTINJ. */
                 {
-                    hype_svm_intr_state_t idg;
+                    hype_vmm_intr_state_t idg;
                     unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
-                    hype_svm_vcpu_get_int_diag(&ei, &df, &wn, &ov);
-                    hype_svm_vcpu_get_intr_state(ctx, &idg);
+                    (void)vmm_get_int_diag(kind, &ei, &df, &wn, &ov);
+                    vmm_get_intr_state(kind, ctx, &idg);
                     hype_debug_print("fw-1 INTDIAG: eventinj=%llu defer=%llu window=%llu coalesced=%llu "
                                      "collisions=%llu | pending=%d/vec0x%x staged_eventinj=0x%llx "
                                      "IF=%d shadow=0x%llx\n",
                                      ei, df, wn, ov,
-                                     hype_svm_vcpu_get_eventinj_collisions(),
+                                     vmm_get_eventinj_collisions(kind),
                                      idg.pending_valid, (unsigned int)idg.pending_vector,
                                      (unsigned long long)idg.eventinj,
                                      (int)((idg.rflags >> 9) & 1u),
@@ -7168,7 +7562,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* M4-6d2b: any non-HLT exit is the guest doing real work
              * (MMIO, port I/O, NPF, CPUID/MSR ...) -- mark progress so the
              * idle detector only fires after a true quiescent stretch. */
-            if (info.reason != HYPE_SVM_EXITCODE_HLT) {
+            if (!vmm_reason_is_hlt(kind, info.reason)) {
                 last_progress_tsc = now_tsc;
             }
             /* M4-6b2 DIAG: non-timer progress -- device port I/O (IOIO) or a
@@ -7176,7 +7570,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * activity (HLT + LAPIC NPF + timer IRQ) deliberately excluded. */
             {
                 unsigned long long ntsig = console_chars + ahci_irqs;
-                if (info.reason == HYPE_SVM_EXITCODE_IOIO || ntsig != nontimer_sig) {
+                if (vmm_reason_is_ioio(kind, info.reason) || ntsig != nontimer_sig) {
                     last_nontimer_tsc = now_tsc;
                     nontimer_sig = ntsig;
                 }
@@ -7185,13 +7579,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * that is just the NOHZ idle cycling (native_apic_mem_eoi +
                  * timer re-arm), which would otherwise fill the ring during the
                  * 2s idle and hide the real pre-idle transition we want. */
-                if (!idle_probe_done && info.reason != HYPE_SVM_EXITCODE_HLT &&
-                    info.reason != HYPE_SVM_EXITCODE_INTR) {
+                if (!idle_probe_done && !vmm_reason_is_hlt(kind, info.reason) &&
+                    !vmm_reason_is_intr(kind, info.reason)) {
                     uint64_t detail = info.qualification;
                     int skip = 0;
-                    if (info.reason == HYPE_SVM_EXITCODE_NPF) {
+                    if (vmm_reason_is_npf(kind, info.reason)) {
                         hype_svm_debug_state_t d;
-                        hype_svm_vcpu_get_debug_state(ctx, &d);
+                        (void)vmm_get_debug_state(kind, ctx, &d);
                         detail = d.exitinfo2;
                         if ((detail & ~0xFFFULL) == 0xFEE00000ULL) { skip = 1; }
                     }
