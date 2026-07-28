@@ -8843,14 +8843,72 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 unsigned k;
                 guestexcp_log_n++;
                 for (k = 0; k < 12u; k++) { ib[k] = 0; }
-                /* userspace/kernel RIP -> read insn bytes via the guest CR3 */
-                fw_1_read_guest_va(vm, xcr3, xrip, ib, 12);
+                /*
+                 * userspace/kernel RIP -> read insn bytes via the guest CR3, but
+                 * fall back to a PHYSICAL read when paging is off (#250). With
+                 * cr3=0 a page walk cannot resolve anything and silently yields
+                 * zeros, which are indistinguishable from a real run of zero
+                 * bytes -- and early-firmware faults (reset vector, no paging, no
+                 * IDT) are exactly the ones where the opcode matters most. FW-1's
+                 * guest paging is identity, so RIP doubles as the GPA here.
+                 */
+                if (xcr3 == 0 || !fw_1_read_guest_va(vm, xcr3, xrip, ib, 12)) {
+                    const uint8_t *phys = fw_1_guest_phys_to_host(vm, xrip);
+                    if (phys != 0) {
+                        for (k = 0; k < 12u; k++) { ib[k] = phys[k]; }
+                    }
+                }
                 hype_debug_print("fw-1 GUESTEXCP: #%s vec=%u err=0x%llx rip=0x%llx cr3=0x%llx "
                                  "insn=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
                                  is_gp ? "GP" : "UD", vec, (unsigned long long)info.qualification,
                                  (unsigned long long)xrip, (unsigned long long)xcr3,
                                  ib[0], ib[1], ib[2], ib[3], ib[4], ib[5],
                                  ib[6], ib[7], ib[8], ib[9], ib[10], ib[11]);
+                /*
+                 * #236/#248 CR-write probe. A #GP on `MOV CRn, r32` under VMX is
+                 * usually the fixed-bit MSRs talking: IA32_VMX_CR4_FIXED0 requires
+                 * CR4.VMXE, but firmware does not know it is virtualised and writes
+                 * CR4 with VMXE clear. Unless the host owns that bit via
+                 * CR4_GUEST_HOST_MASK (GUEST_CR4 keeps VMXE set while
+                 * CR4_READ_SHADOW reports it clear), the write faults.
+                 *
+                 * 0F 22 /r = MOV CRn, r/m32: ModRM reg field picks n, r/m picks the
+                 * source GPR. No REX handling needed -- this fires in 16/32-bit
+                 * firmware. Capped separately and tightly: the interesting data is
+                 * identical on every repeat of the same fault.
+                 */
+                if (kind == HYPE_VMM_KIND_VMX && ib[0] == 0x0Fu && ib[1] == 0x22u) {
+                    static unsigned cr_probe_n = 0;
+                    if (cr_probe_n < 4u) {
+                        hype_vmx_cr_diag_t cd;
+                        unsigned crn = (unsigned)((ib[2] >> 3) & 7u);
+                        unsigned rm = (unsigned)(ib[2] & 7u);
+                        cr_probe_n++;
+                        hype_vmx_vcpu_get_cr_diag(ctx, rm, &cd);
+                        hype_debug_print(
+                            "fw-1 CRPROBE: MOV CR%u, gpr%u -> attempted=0x%llx | GUEST_CR0=0x%llx "
+                            "GUEST_CR4=0x%llx | cr0_mask=0x%llx cr4_mask=0x%llx | cr0_shadow=0x%llx "
+                            "cr4_shadow=0x%llx | CR0_FIXED0=0x%llx CR0_FIXED1=0x%llx "
+                            "CR4_FIXED0=0x%llx CR4_FIXED1=0x%llx\n",
+                            crn, rm, (unsigned long long)cd.attempted,
+                            (unsigned long long)cd.guest_cr0, (unsigned long long)cd.guest_cr4,
+                            (unsigned long long)cd.cr0_mask, (unsigned long long)cd.cr4_mask,
+                            (unsigned long long)cd.cr0_shadow, (unsigned long long)cd.cr4_shadow,
+                            (unsigned long long)cd.cr0_fixed0, (unsigned long long)cd.cr0_fixed1,
+                            (unsigned long long)cd.cr4_fixed0, (unsigned long long)cd.cr4_fixed1);
+                        /* Spell out the verdict rather than leaving it to be
+                         * re-derived from twelve hex values at 2am. */
+                        if (crn == 4u) {
+                            uint64_t missing = cd.cr4_fixed0 & ~cd.attempted;
+                            uint64_t unsupported = cd.attempted & ~cd.cr4_fixed1;
+                            hype_debug_print("fw-1 CRPROBE: CR4 fixed0-required-but-clear=0x%llx "
+                                             "not-permitted-by-fixed1=0x%llx host_owns=0x%llx\n",
+                                             (unsigned long long)missing,
+                                             (unsigned long long)unsupported,
+                                             (unsigned long long)cd.cr4_mask);
+                        }
+                    }
+                }
             }
             /* Reinject with the original error code (#GP pushes one; #UD does
              * not). vmm_exception_error_code() picks the right source: SVM

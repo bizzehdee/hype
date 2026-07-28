@@ -195,4 +195,36 @@ void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
 
 uint32_t hype_vmx_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx);
 
+/*
+ * #236/#248 probe: everything needed to explain a guest #GP on MOV to CR0/CR4.
+ *
+ * In VMX non-root operation a guest write to CR0/CR4 that violates the fixed-bit
+ * MSRs raises #GP(0). IA32_VMX_CR4_FIXED0 requires CR4.VMXE (bit 13) on this
+ * hardware, but real firmware does not know it is virtualised and writes CR4
+ * with VMXE clear -- so unless the host *owns* that bit via
+ * CR4_GUEST_HOST_MASK (keeping VMXE set in GUEST_CR4 while CR4_READ_SHADOW
+ * reports it clear to the guest), the write faults.
+ *
+ * `attempted` is the value the guest was loading (from the GPR the instruction
+ * names), which is the field that makes the fault self-explanatory: compare it
+ * against cr4_fixed0 and the mask.
+ */
+typedef struct {
+    uint64_t attempted; /* value the guest was loading into the CR */
+    uint64_t guest_cr0;
+    uint64_t guest_cr4;
+    uint64_t cr0_mask; /* CR0_GUEST_HOST_MASK: 1 = host owns the bit */
+    uint64_t cr4_mask; /* CR4_GUEST_HOST_MASK */
+    uint64_t cr0_shadow; /* CR0_READ_SHADOW: what the guest sees */
+    uint64_t cr4_shadow; /* CR4_READ_SHADOW */
+    uint64_t cr0_fixed0; /* bits that MUST be 1 in VMX operation */
+    uint64_t cr0_fixed1; /* bits that MAY be 1 */
+    uint64_t cr4_fixed0;
+    uint64_t cr4_fixed1;
+} hype_vmx_cr_diag_t;
+
+/* `gpr` selects which of ctx->gprs[] supplied the value (0=RAX ... 15=R15), as
+ * decoded from the faulting instruction's ModRM r/m field. */
+void hype_vmx_vcpu_get_cr_diag(hype_vcpu_ctx_t *ctx, unsigned gpr, hype_vmx_cr_diag_t *out);
+
 #endif /* HYPE_ARCH_VMX_VMCS_H */

@@ -2262,3 +2262,23 @@ uint32_t hype_vmx_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     return (uint32_t)real->gprs[1]; /* RCX */
 }
+
+void hype_vmx_vcpu_get_cr_diag(hype_vcpu_ctx_t *ctx, unsigned gpr, hype_vmx_cr_diag_t *out) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok;
+
+    if (out == 0) {
+        return;
+    }
+    out->attempted = (real != 0 && gpr < 16u) ? real->gprs[gpr] : 0;
+    out->guest_cr0 = vmread(HYPE_VMCS_GUEST_CR0, &ok);
+    out->guest_cr4 = vmread(HYPE_VMCS_GUEST_CR4, &ok);
+    out->cr0_mask = vmread(HYPE_VMCS_CR0_GUEST_HOST_MASK, &ok);
+    out->cr4_mask = vmread(HYPE_VMCS_CR4_GUEST_HOST_MASK, &ok);
+    out->cr0_shadow = vmread(HYPE_VMCS_CR0_READ_SHADOW, &ok);
+    out->cr4_shadow = vmread(HYPE_VMCS_CR4_READ_SHADOW, &ok);
+    out->cr0_fixed0 = rdmsr(HYPE_MSR_IA32_VMX_CR0_FIXED0);
+    out->cr0_fixed1 = rdmsr(HYPE_MSR_IA32_VMX_CR0_FIXED1);
+    out->cr4_fixed0 = rdmsr(HYPE_MSR_IA32_VMX_CR4_FIXED0);
+    out->cr4_fixed1 = rdmsr(HYPE_MSR_IA32_VMX_CR4_FIXED1);
+}
