@@ -691,6 +691,25 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
  * instruction; it causes a normal VM-exit to HOST_RIP whose reason has bit 31
  * set (HYPE_VMX_EXIT_ENTRY_FAILURE) -- surfaced verbatim in info->reason.
  */
+/*
+ * #248: hand a pending external interrupt to hype's own IDT.
+ *
+ * On VM exit the CPU forces host RFLAGS to 0x2, so IF=0 and the interrupt that
+ * caused the exit stays PENDING. Without "acknowledge interrupt on exit" set in
+ * the VM-exit controls, nothing acknowledges it either -- so re-entering the
+ * guest exits again immediately on the same interrupt, forever. That is exactly
+ * what happened on Intel: EXHIST total=13813772 with intr=13813771 and guest RIP
+ * pinned. This is the VMX counterpart of the SVM path's post-VMRUN stgi(), which
+ * lets hype_timer_isr run with host IF=1.
+ *
+ * The NOP is load-bearing. STI's effect is delayed by one instruction (its
+ * interrupt shadow), so `sti; cli` back-to-back would re-mask before any
+ * interrupt could ever be delivered -- a window that looks open and never is.
+ */
+static inline void vmx_take_pending_host_interrupt(void) {
+    __asm__ volatile("sti\n\tnop\n\tcli" ::: "memory");
+}
+
 int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint64_t failed;
@@ -709,6 +728,14 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     info->reason = vmread(HYPE_VMCS_VM_EXIT_REASON, &ok);
     info->qualification = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
     info->guest_rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+
+    /* #248: consume the interrupt that caused this exit before the caller can
+     * resume the guest, or it re-exits on the same one indefinitely. Placed here
+     * rather than in the FW-1 loop so every VMX guest benefits, matching where
+     * the SVM backend does its stgi(). */
+    if (info->reason == HYPE_VMX_EXIT_REASON_EXTERNAL_INTERRUPT) {
+        vmx_take_pending_host_interrupt();
+    }
     return 0;
 }
 
