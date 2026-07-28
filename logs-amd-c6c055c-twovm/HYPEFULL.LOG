@@ -1,0 +1,137 @@
+hype: build c6c055c
+RT-1b: no prior boot log found in RAM (expected after a cold power cycle -- see RT-3 for cold-boot-surviving capture)
+RT-3: recovered 12225 bytes of the previous run's post-EBS diagnostic tail (EFI var) -> \hype-diag-prev.txt
+cfg: no \hype.cfg on ESP -- using built-in defaults
+gop: FrameBufferBase=0xe0000000 FrameBufferSize=0x7e9000
+cpu: vendor=AMD vmx=0 svm=1
+cpu: svm_feature_edx=0x0001bcff pause_filter=1 pause_threshold=1
+host-pci: storage[1]=NVMe at 02:00.0 vid=1c5c did=1d59 bar=0xfce00000
+host-pci: storage[2]=AHCI at 04:00.0 vid=1022 did=7901 bar=0xfcd00000
+vmm: SVM detected
+fw-1: OVMF_VARS.fd+OVMF_CODE.fd (4194304 bytes content, 4194304 bytes mapped) loaded at host-physical 0x54200000
+fw-1: guest RAM 2048 MiB backed at host-physical 0x29f200000
+iso-1: read a real 278921216-byte ISO9660 image from \iso\test.iso, "CD001" identifier verified at offset 32769
+fw-1: vm0 virtio-blk scratch disk @0x3f187000 (64 MiB)
+fw-1: host TSC calibrated at 2096616900 Hz (2096 MHz)
+fw-1 VM1: no \iso\vm1.iso -- sharing vm0's ISO backing
+fw-1 VM1: firmware@0x3ec00000 (4194304 B) ram@0x21f000000 (2048 MiB) tsc=2096616900 Hz -- STEP 2b
+about to call ExitBootServices...
+ExitBootServices returned
+interrupts masked (cli)
+about to load own GDT...
+own GDT loaded
+about to load own paging (identity-mapping 64 GB)...
+paging: framebuffer 0xe0000000+0x7e9000 marked write-combining (PERF-2)
+own paging loaded
+about to load own IDT...
+own IDT loaded
+vmm: about to enable SVM...
+svm: VM_CR=0x8 SVMDIS=0
+svm: about to enable SVM (hsave=0x1405ac000)...
+svm: SVM enable complete
+vmm: SVM enabled
+vmm: SVM test guest: entry_phys=0x58fff000 stack_phys=0x59001000
+vmm: SVM NPT identity map built (root=0x14014a000, 64 GB)
+vmm: about to call SVM vcpu_create...
+vmm: SVM vcpu_create done -- entering dispatch loop...
+vmm: SVM test guest halted cleanly (reason=0x78, guest_rip=0x0)
+m3-5: entry_rip=0x14014bc00 guest_cr3=0x140191000 zero_page=0x14014e000
+m3-5: Linux boot-protocol shim test guest halted cleanly (reason=0x78, guest_rip=0x14014bc0c, PIC master IMR=0xff, PIT ch0 latch_pending=0)
+m4-3: entry_rip=0x140192000 guest_cr3=0x140191000 npt_root=0x14014a000 pflash_gpa=0xc0000000
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 2 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+m4-3: pflash MMIO test guest halted cleanly (reason=0x78, guest_rip=0x140192024, backing[0]=0xab backing[0x100]=0xab -- write and read-back round trip both verified)
+m4-4: entry_rip=0x140196000 access_struct=0x140198000 dest_buffer=0x140198010 rsdp_key=0x20
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 3 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+DC1: sel=0x0 ctl=0x20000a len=36 addr=0x140198010
+m4-4: fw_cfg DMA test guest halted cleanly (reason=0x78, guest_rip=0x140196024) -- 36-byte etc/acpi/rsdp round trip verified byte-for-byte
+m4-5: entry_rip=0x14019e000 ahci_gpa=0xc0200000 cmd_list=0x14019a000 cmd_table=0x14019b000
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 4 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+m4-5: AHCI/ATAPI test guest halted cleanly (reason=0x78, guest_rip=0x14019e05e) -- 2048-byte READ(10) round trip verified byte-for-byte
+video-2: entry_rip=0x1401a3000 access_struct=0x1401a5000 config_buf=0x1401a5010 ramfb_key=0x20
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 5 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+DC2: sel=0x0 ctl=0x200018 len=28 addr=0x1401a5010
+video-2: ramfb test guest halted cleanly (reason=0x78, guest_rip=0x1401a3024) -- etc/ramfb DMA write verified byte-for-byte (framebuffer=0x1401a5080 800x600 XRGB8888)
+cpumsr: entry_rip=0x1401a6000 result_buf=0x1401a8000
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 6 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+cpumsr: test guest halted cleanly (reason=0x78, guest_rip=0x1401a605d) -- CPUID leaves 0/1/0x40000000 and RDMSR(APIC_BASE/EFER) all verified via the real VM-exit path
+int: entry_rip=0x1401aa000 isr_phys=0x1401aa020 marker_phys=0x1401ac000
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 7 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+int: test guest halted cleanly (reason=0x78, guest_rip=0x1401aa010) -- vector 0x31 delivered via an armed VINTR window (INT-2) then direct EVENTINJ (INT-1), ISR ran and set the marker
+input-1: entry_rip=0x1401ae000 isr_phys=0x1401ae040
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 8 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+fw-1 PICIMR 0x0->0xfd rip=0x1401ae02a
+input-1: test guest halted cleanly (reason=0x78, guest_rip=0x1401ae031) -- scancode 0x1e delivered via PS/2 -> PIC (vector 0x21) -> INT-1/INT-2, ISR read it back correctly
+input-2: entry_rip=0x1401b4000 isr_phys=0x1401b4060
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 9 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+fw-1 PICIMR 0x0->0xfb rip=0x1401b402a
+input-2: test guest halted cleanly (reason=0x78, guest_rip=0x1401b405a) -- mouse packet 0x8/0x5/0xfb delivered via PS/2 -> PIC (vector 0x2c) -> INT-1/INT-2, ISR read it back correctly
+ram-1: base_phys=0x547d5000 size=0x4000000 gb_to_map=2 npt_gb_to_map=6 (guest_pml4=0x140191000)
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 10 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+ram-1: test guest halted cleanly (reason=0x78, guest_rip=0x547d5000) -- 64 MB dynamic guest RAM, guest CR3 sized to 2 GB, NPT sized to 6 GB
+pci-1: entry_rip=0x1401b9000 ecam_gpa=0x100000000 result_buf=0x1401bb000
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 11 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+pci-1: test guest halted cleanly (reason=0x78, guest_rip=0x1401b9051) -- host bridge id/class, absent-device probe, BAR sizing all verified via ECAM
+pci-2: entry_rip=0x1401c2000 ecam_gpa=0x100000000 chosen_ahci_gpa=0xc0400000
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 12 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+pci-2: AHCI BAR5 enabled at 0xc0400000 -- MMIO-mapping it now
+pci-2: test guest halted cleanly (reason=0x78, guest_rip=0x1401c207e) -- AHCI discovered via PCI BAR5=0xc0400000, 2048-byte READ(10) round trip verified byte-for-byte
+iso-2: entry_rip=0x1401cd000 ahci_gpa=0xc0400000 reading real ISO LBA 16
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 13 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+iso-2: AHCI/ATAPI test guest halted cleanly (reason=0x78, guest_rip=0x1401cd05e) -- real ISO LBA 16 read byte-for-byte via emulated hardware, "CD001" identifier verified
+video-3: entry_rip=0x1401d0000 ecam_gpa=0x100000000 fb_addr=0x1401d2000 mmio_addr=0xc0400000
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 14 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+video-3: display BAR2 (MMIO) enabled at 0xc0400000 -- mapping it now
+video-3: test guest halted cleanly (reason=0x78, guest_rip=0x1401d007d) -- display adapter discovered via PCI BAR0=0x1401d2000/BAR2=0xc0400000, 320x200@32bpp mode decoded correctly, first/lasm5-1: entry_rip=0x140255000 ecam_gpa=0x100000000 mmio_addr=0xc0400000
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 15 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+m5-1: virtio-blk BAR4 (MMIO) enabled at 0xc0400000 -- mapping it now
+m5-1: test guest halted cleanly (reason=0x78, guest_rip=0x1402550f4) -- virtio-blk discovered via PCI BAR4=0xc0400000, feature negotiation + queue setup succeeded, WRITE and READ requests botm5-2: entry_rip=0x140275000 ecam_gpa=0x100000000 chosen_ahci_gpa=0xc0400000
+svm: vCPU slot pool EXHAUSTED (2 slots) -- slot 16 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+m5-2: ATA disk BAR5 enabled at 0xc0400000 -- mapping it now
+m5-2: test guest halted cleanly (reason=0x78, guest_rip=0x140275122) -- ATA disk discovered via PCI BAR5=0xc0400000, IDENTIFY DEVICE + WRITE DMA EXT + READ DMA EXT all round-tripped correctlysvm: vCPU slot pool EXHAUSTED (2 slots) -- slot 17 aliased to 1. Safe ONLY if these guests never run concurrently (see #237)
+pause-test: PASS -- 131 PAUSE intercepts before HLT (host reclaimed control from a spinning guest -- preemption mechanism works)
+pci-dump: full device census (buses 0-255)
+pci-dump: 00:00.0 vid=1022 did=15d0 class=06 sub=00 pi=00
+pci-dump: 00:00.2 vid=1022 did=15d1 class=08 sub=06 pi=00
+pci-dump: 00:01.0 vid=1022 did=1452 class=06 sub=00 pi=00
+pci-dump: 00:01.2 vid=1022 did=15d3 class=06 sub=04 pi=00
+pci-dump: 00:01.3 vid=1022 did=15d3 class=06 sub=04 pi=00
+pci-dump: 00:08.0 vid=1022 did=1452 class=06 sub=00 pi=00
+pci-dump: 00:08.1 vid=1022 did=15db class=06 sub=04 pi=00
+pci-dump: 00:08.2 vid=1022 did=15dc class=06 sub=04 pi=00
+pci-dump: 00:14.0 vid=1022 did=790b class=0c sub=05 pi=00
+pci-dump: 00:14.3 vid=1022 did=790e class=06 sub=01 pi=00
+pci-dump: 00:18.0 vid=1022 did=15e8 class=06 sub=00 pi=00
+pci-dump: 00:18.1 vid=1022 did=15e9 class=06 sub=00 pi=00
+pci-dump: 00:18.2 vid=1022 did=15ea class=06 sub=00 pi=00
+pci-dump: 00:18.3 vid=1022 did=15eb class=06 sub=00 pi=00
+pci-dump: 00:18.4 vid=1022 did=15ec class=06 sub=00 pi=00
+pci-dump: 00:18.5 vid=1022 did=15ed class=06 sub=00 pi=00
+pci-dump: 00:18.6 vid=1022 did=15ee class=06 sub=00 pi=00
+pci-dump: 00:18.7 vid=1022 did=15ef class=06 sub=00 pi=00
+pci-dump: 01:00.0 vid=8086 did=2723 class=02 sub=80 pi=00
+pci-dump: 02:00.0 vid=1c5c did=1d59 class=01 sub=08 pi=02
+pci-dump: 03:00.0 vid=1002 did=15d8 class=03 sub=00 pi=00
+pci-dump: 03:00.1 vid=1002 did=15de class=04 sub=03 pi=00
+pci-dump: 03:00.2 vid=1022 did=15df class=10 sub=80 pi=00
+pci-dump: 03:00.3 vid=1022 did=15e0 class=0c sub=03 pi=30
+pci-dump: 03:00.4 vid=1022 did=15e1 class=0c sub=03 pi=30
+pci-dump: 03:00.5 vid=1022 did=15e2 class=04 sub=80 pi=00
+pci-dump: 03:00.6 vid=1022 did=15e3 class=04 sub=03 pi=00
+pci-dump: 04:00.0 vid=1022 did=7901 class=01 sub=06 pi=01
+pci-dump: 28 PCI functions total
+host-nvme: 02:00.0 woke to D0, Command=0x0406
+host-nvme: init OK, LBA0 read OK -- mbrsig=55aa
+host-nvme: serial='5YDCT00331OA0CD2L' model='SKHynix_HFS256GEJ4X112N' sectors=500118192 (244198 MiB)
+host-xhci: controller[1] at 03:00.3 vid=1022 did=15e0 bar=0xfca00000
+host-xhci: caps -- slots=64 ports=8 ctx=64B scratchpads=2 pagesize=0x0001
+host-xhci: up -- slots=64 ports=8 ctx=64B
+host-xhci:   port 1 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+host-xhci: port 2 connected (speed id 3)
+host-xhci:     Address Device slot 1 try 1: no completion event (timeout)
+host-xhci:     Address Device slot 1 try 2: no completion event (timeout)
+host-xhci: port 2 dev -- USB 2.10 class=00 mps0=64 vid=0781 pid=5567
+host-xhci: MSC -- slot 1 cfg=1 iface=0 bulk-in=0x81 bulk-out=0x02 mps=512
+host-xhci: bulk endpoints configured -- MSC datapath ready
+host-xhci: USB disk -- last LBA 15630335, block 512 bytes (7632 MiB)
+host-xhci: SCSI READ(10) LBA0 OK -- mbrsig=55aa
+host-xhci: blk_usb backend read LBA0 OK -- mbrsig=55aa (cap 15630336 sectors)
