@@ -2952,6 +2952,33 @@ static void vmm_set_pvclock(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, const hy
 static int vmm_get_debug_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                hype_svm_debug_state_t *out) {
     if (kind == HYPE_VMM_KIND_VMX) {
+        /*
+         * ZERO the struct rather than leaving it untouched, even though the
+         * return value already says "nothing here". Callers declare it on the
+         * stack and several read fields without checking the return -- so on
+         * VMX they were reading uninitialised stack, and two of them fed
+         * .cr3/.rip straight into a guest page-table walk, i.e. dereferencing
+         * through a garbage root. Zeroing makes that deterministic and inert
+         * instead of wild. Check the return value if you need to know whether
+         * the contents mean anything; zeros are not a valid guest state.
+         *
+         * Field-by-field, not `*out = (hype_svm_debug_state_t){0}` -- this is a
+         * freestanding UEFI target with no libc, and aggregate assignment emits
+         * a call to memcpy/memset that fails at link time (see AGENTS.md).
+         */
+        out->cs_selector = 0;
+        out->cs_base = 0;
+        out->cr0 = 0;
+        out->cr2 = 0;
+        out->cr3 = 0;
+        out->rip = 0;
+        out->rflags = 0;
+        out->rsp = 0;
+        out->exitinfo2 = 0;
+        out->exitintinfo = 0;
+        out->nrip = 0;
+        out->cr4 = 0;
+        out->g_pat = 0;
         return 0;
     }
     hype_svm_vcpu_get_debug_state(ctx, out);
@@ -7585,9 +7612,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     int skip = 0;
                     if (vmm_reason_is_npf(kind, info.reason)) {
                         hype_svm_debug_state_t d;
-                        (void)vmm_get_debug_state(kind, ctx, &d);
-                        detail = d.exitinfo2;
-                        if ((detail & ~0xFFFULL) == 0xFEE00000ULL) { skip = 1; }
+                        /* Only EXITINFO2 carries the fault GPA, and only on SVM.
+                         * Keep info.qualification as the fallback on VMX rather
+                         * than overwriting it with an unavailable (zero) field --
+                         * a zero GPA would also defeat the LAPIC-region skip
+                         * below and let NOHZ idle churn flood the ring. */
+                        if (vmm_get_debug_state(kind, ctx, &d)) {
+                            detail = d.exitinfo2;
+                            if ((detail & ~0xFFFULL) == 0xFEE00000ULL) { skip = 1; }
+                        }
                     }
                     if (!skip) {
                         tr_rip[tr_head] = info.guest_rip;
@@ -7812,8 +7845,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     uint64_t detail = info.qualification;
                     if (vmm_reason_is_npf(kind, info.reason)) {
                         hype_svm_debug_state_t dd;
-                        (void)vmm_get_debug_state(kind, ctx, &dd);
-                        detail = dd.exitinfo2; /* MMIO fault GPA */
+                        /* SVM-only field; on VMX keep info.qualification. */
+                        if (vmm_get_debug_state(kind, ctx, &dd)) {
+                            detail = dd.exitinfo2; /* MMIO fault GPA */
+                        }
                     }
                     hype_debug_print("fw-1 CWATCH#%02u: [0x%llx]=0x%llx d=%lld reason=0x%x rip=0x%llx "
                                      "detail=0x%llx\n",
@@ -8787,19 +8822,33 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             int is_gp = (vec == 13u);
             static unsigned guestexcp_log_n = 0;
             if (guestexcp_log_n < 96u) {
-                hype_svm_debug_state_t xd;
+                /*
+                 * Take RIP/CR3 from the VENDOR-NEUTRAL exit info, not from
+                 * hype_svm_debug_state_t. vmm_get_debug_state() is SVM-only: on
+                 * VMX it returns 0 without writing the struct, so reading
+                 * xd.rip/xd.cr3/xd.cs_selector/xd.rsp yielded uninitialised
+                 * stack, and fw_1_read_guest_va() then walked guest memory
+                 * through a garbage CR3. On Intel that printed
+                 * "rip=0x0 cs=0x0 rsp=0x0 insn=00 00 ..." on every #GP, which
+                 * reads as "the guest is executing at address 0" and is instead
+                 * pure noise -- it cost real time chasing a guest that was fine.
+                 *
+                 * CS and RSP have no vendor-neutral accessor, so they are simply
+                 * not printed. A field that is honestly absent beats one that
+                 * is confidently wrong.
+                 */
+                uint64_t xrip = info.guest_rip;
+                uint64_t xcr3 = vmm_get_cr3(kind, ctx);
                 uint8_t ib[12];
                 unsigned k;
                 guestexcp_log_n++;
                 for (k = 0; k < 12u; k++) { ib[k] = 0; }
-                (void)vmm_get_debug_state(kind, ctx, &xd);
                 /* userspace/kernel RIP -> read insn bytes via the guest CR3 */
-                fw_1_read_guest_va(vm, xd.cr3, xd.rip, ib, 12);
-                hype_debug_print("fw-1 GUESTEXCP: #%s vec=%u err=0x%llx rip=0x%llx cs=0x%x rsp=0x%llx "
+                fw_1_read_guest_va(vm, xcr3, xrip, ib, 12);
+                hype_debug_print("fw-1 GUESTEXCP: #%s vec=%u err=0x%llx rip=0x%llx cr3=0x%llx "
                                  "insn=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
                                  is_gp ? "GP" : "UD", vec, (unsigned long long)info.qualification,
-                                 (unsigned long long)xd.rip, (unsigned int)xd.cs_selector,
-                                 (unsigned long long)xd.rsp,
+                                 (unsigned long long)xrip, (unsigned long long)xcr3,
                                  ib[0], ib[1], ib[2], ib[3], ib[4], ib[5],
                                  ib[6], ib[7], ib[8], ib[9], ib[10], ib[11]);
             }
