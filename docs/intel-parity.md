@@ -35,7 +35,18 @@ Verified on the nested-VMX box (`192.168.0.144`, i5-13420H, `kvm_intel nested=Y`
   Fixed: neutral `info.guest_rip` + `vmm_get_cr3()`, CS/RSP dropped rather than
   faked, the shim now zeroes the struct on VMX, and the two `detail = .exitinfo2`
   sites keep their `info.qualification` fallback. **Needs an Intel re-run.**
-- [ ] **A2. Diagnose the `#GP` storm** with real RIP/CR3 data.
+- [x] **A2a. Localise the `#GP`.** Done — it is `MOV CR4, EAX` in the OVMF reset
+  vector (`0xFFFF0000 + 0xFE94`), `cr3=0`, `IF=0`, `reason=0x0`
+  (`EXIT_REASON_EXCEPTION_NMI`). Bytes `0f 22 e0` = `0F 22` + ModRM `E0`
+  (reg=100 → CR4, r/m=000 → EAX). The 85 repeats are hype reinjecting into a guest
+  with no IDT yet, not 85 distinct faults. Entry works and the guest executes real
+  firmware — it dies on one control-register write.
+- [ ] **A2b. Find out why the CR4 load faults.** Next probe: guest RAX (the value
+  written), guest CR0/CR4, VMCS `CR4_GUEST_HOST_MASK`/`CR4_READ_SHADOW`, and host
+  `IA32_VMX_CR4_FIXED0`/`FIXED1`. Leading candidate: the guest sets a CR4 bit that is
+  0 in `IA32_VMX_CR4_FIXED1` (architectural `#GP(0)` for a VMX guest, and what L0 KVM
+  exposes nested may be narrower than what OVMF wants). Then hype's CR4
+  load-exiting/mask handling, then real-mode guest state.
 - [ ] **A3. Timer + interrupt delivery on VMX.** Nothing is ever armed, so this
   is likely the bigger half: `VM_ENTRY_INTR_INFO` injection,
   `GUEST_INTERRUPTIBILITY_STATE`, `GUEST_ACTIVITY_STATE`, and the PIT/LAPIC/
