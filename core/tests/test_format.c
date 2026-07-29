@@ -29,7 +29,54 @@ static int fmt(char *buf, unsigned long long bufsz, const char *f, ...) {
     return r;
 }
 
+
+/* #238: the visible-truncation marker. */
+static void test_mark_truncated(void) {
+    char buf[32];
+    int n;
+
+    /* Fits: untouched, reports 0. */
+    n = hype_snprintf(buf, sizeof buf, "short line\n");
+    CHECK_INT("fit not marked", 0, hype_format_mark_truncated(buf, sizeof buf, n));
+    CHECK_INT("fit content intact", 1, buf[10] == '\n' && buf[11] == '\0');
+
+    /* Exactly full (written == bufsz-1): still a fit. */
+    n = hype_snprintf(buf, sizeof buf, "%031d", 7); /* 31 chars + NUL */
+    CHECK_INT("exact fit not marked", 0, hype_format_mark_truncated(buf, sizeof buf, n));
+
+    /* One over: marked, ends with the marker AND a newline before the NUL. */
+    n = hype_snprintf(buf, sizeof buf, "%032d", 7);
+    CHECK_INT("overflow marked", 1, hype_format_mark_truncated(buf, sizeof buf, n));
+    CHECK_STR("marker at the tail", "...[TRUNCATED]\n", buf + 16);
+
+    /* A wildly over-long record is the same case. */
+    n = hype_snprintf(buf, sizeof buf, "%0200d", 7);
+    CHECK_INT("way-overflow marked", 1, hype_format_mark_truncated(buf, sizeof buf, n));
+    CHECK_INT("still NUL-terminated with newline", 1, buf[31] == '\0' && buf[30] == '\n');
+
+    /* Degenerate buffers: too small for the marker, left alone. */
+    {
+        char tiny[8];
+        n = hype_snprintf(tiny, sizeof tiny, "0123456789");
+        CHECK_INT("tiny buffer not marked", 0,
+                  hype_format_mark_truncated(tiny, sizeof tiny, n));
+        CHECK_INT("tiny buffer NUL intact", 1, tiny[7] == '\0');
+    }
+    CHECK_INT("bufsz 0 tolerated", 0, hype_format_mark_truncated(buf, 0u, 100));
+    CHECK_INT("negative written treated as fit", 0,
+              hype_format_mark_truncated(buf, sizeof buf, -1));
+    /* Exactly marker-sized buffer: the whole content becomes the marker. */
+    {
+        char m[16];
+        n = hype_snprintf(m, sizeof m, "AAAAAAAAAAAAAAAAAAAA");
+        CHECK_INT("marker-sized buffer marked", 1,
+                  hype_format_mark_truncated(m, sizeof m, n));
+        CHECK_STR("entirely the marker", "...[TRUNCATED]\n", m);
+    }
+}
+
 int main(void) {
+    test_mark_truncated();
     char buf[64];
 
     fmt(buf, sizeof(buf), "hype");

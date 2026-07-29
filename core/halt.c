@@ -140,13 +140,28 @@ void hype_debug_flush_gop(void) {
 }
 
 void hype_debug_print(const char *fmt, ...) {
-    char msg[192];
+    /*
+     * #238 mechanism 1: at 192 this cut every record over 191 chars
+     * mid-sentence AND ate its trailing newline, so the next record merged
+     * onto the same line -- 14 such merges in one real-hardware run, always
+     * on the most information-dense lines (the microtests' byte-for-byte
+     * verification messages, TIMERHIST/INTDIAG). The longest real record
+     * measured is 272 chars; 512 doubles that. Raised HERE ALONE, per the
+     * ticket: an earlier attempt that raised three buffers at once (plus a
+     * serial tee) produced a 0-byte \HYPEFULL.LOG on real AMD hardware and
+     * never reproduced under QEMU, so each site gets its own
+     * hardware-validated step. Anything still longer is marked, never
+     * silently cut (hype_format_mark_truncated).
+     */
+    char msg[512];
+    int n;
     va_list ap;
     hype_gop_console_t *gop;
 
     va_start(ap, fmt);
-    hype_vsnprintf(msg, sizeof(msg), fmt, ap);
+    n = hype_vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    (void)hype_format_mark_truncated(msg, sizeof(msg), n);
 
     hype_serial_print("%s", msg);
     /* Tee into the in-memory capture so boot/main.c can flush the whole

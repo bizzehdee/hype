@@ -25,4 +25,16 @@
 int hype_vsnprintf(char *buf, unsigned long long bufsz, const char *fmt, va_list ap);
 int hype_snprintf(char *buf, unsigned long long bufsz, const char *fmt, ...);
 
+/*
+ * #238: makes a truncated record VISIBLY truncated. When `written` (the
+ * hype_vsnprintf return value) says the formatted output did not fit in
+ * `bufsz`, the end of the buffer is overwritten with "...[TRUNCATED]\n" --
+ * so a cut is never silent, and the record never loses its trailing
+ * newline (an unterminated record makes the NEXT one merge onto the same
+ * line, which is how #238's log lost its most information-dense lines).
+ * Returns 1 if the marker was applied, 0 if the record fit (buffer
+ * untouched). A buffer too small for even the marker is left alone.
+ */
+int hype_format_mark_truncated(char *buf, unsigned long long bufsz, int written);
+
 #endif /* HYPE_FORMAT_H */

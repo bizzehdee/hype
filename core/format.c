@@ -182,6 +182,24 @@ done:
     return (int)written;
 }
 
+int hype_format_mark_truncated(char *buf, unsigned long long bufsz, int written) {
+    static const char mark[] = "...[TRUNCATED]\n"; /* 15 chars + NUL */
+    unsigned long long marklen = sizeof(mark) - 1u;
+    unsigned long long i;
+
+    if (written < 0 || (unsigned long long)written < bufsz) {
+        return 0; /* it fit (vsnprintf wrote written chars + NUL) */
+    }
+    if (bufsz < marklen + 1u) {
+        return 0; /* nowhere to even put the marker: leave the buffer alone */
+    }
+    for (i = 0; i < marklen; i++) {
+        buf[bufsz - 1u - marklen + i] = mark[i];
+    }
+    buf[bufsz - 1u] = '\0';
+    return 1;
+}
+
 int hype_snprintf(char *buf, unsigned long long bufsz, const char *fmt, ...) {
     va_list ap;
     int r;
