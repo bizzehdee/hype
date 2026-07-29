@@ -187,6 +187,12 @@
 
 /* Natural-width read-only fields (Table B-13). */
 #define HYPE_VMCS_EXIT_QUALIFICATION 0x6400u
+/* Guest-linear address (0x640A, natural-width read-only). Meaningful for an EPT
+ * violation caused by a linear-address translation (as opposed to a page-table
+ * walk of the guest's own tables). Pairs with GUEST_PHYSICAL_ADDRESS to tell
+ * "the guest touched THIS address, which mapped to THAT GPA" from "the EPT walk
+ * of the guest's page tables itself faulted" -- #248/#236. */
+#define HYPE_VMCS_GUEST_LINEAR_ADDRESS 0x640Au
 /* Guest-physical address (0x2400, 64-bit read-only): the faulting GPA reported
  * on an EPT violation -- the VMX analogue of SVM NPF's EXITINFO2. */
 #define HYPE_VMCS_GUEST_PHYSICAL_ADDRESS 0x2400u

@@ -238,4 +238,16 @@ void hype_vmx_vcpu_get_cr_diag(hype_vcpu_ctx_t *ctx, unsigned gpr, hype_vmx_cr_d
  */
 int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx);
 
+/*
+ * #248/#236 probe: dump the raw VMCS state behind an EPT violation, so an
+ * unexplained one can be told apart from a misattributed exit without guessing.
+ *
+ * Prints the exit reason and qualification as the CPU reported them, the faulting
+ * GPA and guest-linear address, GUEST_RIP, the guest's paging registers, and the
+ * VM-entry controls + EFER (which is where a real->protected->long mode
+ * transition goes wrong if the VMCS is not kept in step with the guest's own
+ * CR0.PG/CR4.PAE writes).
+ */
+void hype_vmx_vcpu_dump_ept_violation(hype_vcpu_ctx_t *ctx);
+
 #endif /* HYPE_ARCH_VMX_VMCS_H */

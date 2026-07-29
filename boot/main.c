@@ -8687,6 +8687,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      "cr3=0x%llx from the vendor-neutral accessor\n",
                                      (unsigned long long)vmm_get_cr3(kind, ctx));
                 }
+                /* #248: on VMX, dump the raw VMCS behind this fault before dying.
+                 * The Intel case reports a GPA that is bit-for-bit the operand of
+                 * the CR0 write just before it, with guest_rip=0 -- which is
+                 * either a genuine EPT violation or an exit that reached this path
+                 * without being one. Reading the reason straight from the VMCS
+                 * settles that rather than reasoning about it. */
+                if (kind == HYPE_VMM_KIND_VMX) {
+                    hype_vmx_vcpu_dump_ept_violation(ctx);
+                }
                 hype_fatal("fw-1: undecodable MMIO NPF on vm%u at guest-physical 0x%llx (%s, "
                            "guest_rip=0x%llx, decode_assist_bytes=%u insn=%s %02x %02x %02x %02x "
                            "%02x %02x %02x %02x) -- cannot absorb",
@@ -8957,6 +8966,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                              (unsigned long long)unsupported,
                                              (unsigned long long)cd.cr4_mask);
                         }
+                        /*
+                         * Dump the full VMCS paging/mode state AT THE FAULT. The
+                         * EPT-violation site already does this, but by the time it
+                         * fires the guest has derailed (RIP=0, touching unmapped
+                         * memory), so that state describes the aftermath rather
+                         * than the cause. A CR0 write that enables PG while
+                         * EFER.LME=1 and CR4.PAE=1 is a long-mode transition, and
+                         * whether entry_ctls' IA-32e-mode-guest bit and
+                         * GUEST_IA32_EFER are in step with it is the thing to see
+                         * here.
+                         */
+                        hype_vmx_vcpu_dump_ept_violation(ctx);
                     }
                 }
             }

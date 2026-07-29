@@ -2403,6 +2403,30 @@ int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx) {
     return 1;
 }
 
+void hype_vmx_vcpu_dump_ept_violation(hype_vcpu_ctx_t *ctx) {
+    int ok;
+    (void)ctx;
+    /* Read the reason back from the VMCS rather than trusting a value threaded
+     * through the caller: the whole point is to find out whether this exit really
+     * is an EPT violation (48) or something else that reached the NPF path. */
+    hype_debug_print("vmx EPTDUMP: reason=%llu qual=0x%llx gpa=0x%llx gla=0x%llx rip=0x%llx\n",
+                     (unsigned long long)vmread(HYPE_VMCS_VM_EXIT_REASON, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_LINEAR_ADDRESS, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_RIP, &ok));
+    hype_debug_print("vmx EPTDUMP: cr0=0x%llx cr3=0x%llx cr4=0x%llx efer=0x%llx "
+                     "entry_ctls=0x%llx rflags=0x%llx cs=0x%llx cs_base=0x%llx\n",
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_CR0, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_CR3, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_CR4, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_IA32_EFER, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_VM_ENTRY_CONTROLS, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_RFLAGS, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_CS_SELECTOR, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_CS_BASE, &ok));
+}
+
 void hype_vmx_vcpu_get_cr_diag(hype_vcpu_ctx_t *ctx, unsigned gpr, hype_vmx_cr_diag_t *out) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok;
