@@ -2511,6 +2511,25 @@ void hype_vmx_vcpu_dump_ept_violation(hype_vcpu_ctx_t *ctx) {
                      (unsigned long long)vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok),
                      (unsigned long long)vmread(HYPE_VMCS_GUEST_LINEAR_ADDRESS, &ok),
                      (unsigned long long)vmread(HYPE_VMCS_GUEST_RIP, &ok));
+    /*
+     * #251: the segment bases a kernel per-CPU access depends on. Printed because
+     * the #GP on `MOV RAX, GS:[0x28]` is only explained by GS base being wrong,
+     * and the value distinguishes the possibilities: 0 would fault as #PF
+     * (canonical but unmapped), so a #GP implies a NON-CANONICAL base, i.e. stale
+     * garbage rather than a plausible address. host_kgsbase is what SWAPGS would
+     * install if the guest shares the host's IA32_KERNEL_GS_BASE -- which it does,
+     * since hype neither models that MSR nor uses the entry/exit MSR areas.
+     */
+    hype_debug_print("vmx EPTDUMP: fs_base=0x%llx gs_base=0x%llx host_kgsbase=0x%llx "
+                     "gs_sel=0x%llx gs_ar=0x%llx gs_lim=0x%llx fs_ar=0x%llx ss_ar=0x%llx\n",
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_FS_BASE, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_GS_BASE, &ok),
+                     (unsigned long long)rdmsr(0xC0000102u),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_GS_SELECTOR, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_GS_AR_BYTES, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_GS_LIMIT, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_FS_AR_BYTES, &ok),
+                     (unsigned long long)vmread(HYPE_VMCS_GUEST_SS_AR_BYTES, &ok));
     hype_debug_print("vmx EPTDUMP: cr0=0x%llx cr3=0x%llx cr4=0x%llx efer=0x%llx "
                      "entry_ctls=0x%llx rflags=0x%llx cs=0x%llx cs_base=0x%llx\n",
                      (unsigned long long)vmread(HYPE_VMCS_GUEST_CR0, &ok),

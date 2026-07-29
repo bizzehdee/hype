@@ -8936,6 +8936,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * firmware. Capped separately and tightly: the interesting data is
                  * identical on every repeat of the same fault.
                  */
+                /*
+                 * #251: dump the VMCS mode/segment state for the FIRST few guest
+                 * exceptions of any kind, not just CR writes. The CR-specific
+                 * probe below is keyed on 0F 22, so it stayed silent for the
+                 * kernel's `MOV RAX, GS:[0x28]` fault -- the one case where the
+                 * segment bases are the whole question. Capped tightly because
+                 * this is three lines per fault and the fault repeats.
+                 */
+                if (kind == HYPE_VMM_KIND_VMX) {
+                    static unsigned excdump_n = 0;
+                    if (excdump_n < 3u) {
+                        excdump_n++;
+                        hype_vmx_vcpu_dump_ept_violation(ctx);
+                    }
+                }
                 if (kind == HYPE_VMM_KIND_VMX && ib[0] == 0x0Fu && ib[1] == 0x22u) {
                     static unsigned cr_probe_n = 0;
                     if (cr_probe_n < 4u) {
