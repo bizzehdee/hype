@@ -33,6 +33,8 @@
 #include "../core/fw1_debug.h"
 #include "../core/rtc.h"
 #include "../core/blk_phys.h"
+#include "../core/blk_image.h"
+#include "../core/ext.h"
 
 /* #229 debug: read the active host CR3 (which page-table root this core runs under). */
 static inline uint64_t hype_dbg_read_cr3(void) {
@@ -463,6 +465,7 @@ typedef struct hype_fw_vm {
     hype_virtio_blk_t vblk;
     hype_blk_backend_t vblk_be;
     hype_blk_file_t vblk_file;
+    hype_blk_image_t vblk_image; /* M5-8 (#199): raw image FILE backend */
     uint64_t vblk_backing_phys; /* host-physical base of this VM's scratch disk */
     /* M10-6a (#227): when this VM's confirmed target is a `physical:` disk, the
      * backend above is instead a writable physical backend over the enumerated
@@ -6301,10 +6304,82 @@ static int fw_1_vblk_use_physical_ahci(hype_fw_vm_t *vm) {
     return 1;
 }
 
+/*
+ * M5-8 (#199): resolve a raw disk-image FILE on a host filesystem and attach it
+ * as this VM's writable virtio-blk backend.
+ *
+ * Tries every one of hype's host-FS resolvers on GPT partitions 1..4 -- FAT32
+ * and exFAT (#181) and ext2/3/4 (#203) -- because they all emit the same extent
+ * contract, so the image works wherever the operator put it. The image must be
+ * pre-created FULLY ALLOCATED (tools/make-disk-image.sh, #90): this path writes
+ * guest sectors straight into the file's own extents and never grows it, which
+ * is exactly what makes persisting writes post-EBS safe -- no directory entry,
+ * no bitmap, no journal is touched, so a volume the host OS also knows about
+ * cannot be corrupted by us.
+ *
+ * Returns 1 on attach, 0 if no such image was found (caller falls back).
+ */
+#ifndef HYPE_M5_8_IMAGE_PATH
+#define HYPE_M5_8_IMAGE_PATH "\\hype\\disks\\vm0.img"
+#endif
+
+/* Defined with the other host-device plumbing further down (the disk-absolute
+ * and volume-relative AHCI adapters + the volume base the FS resolvers use). */
+static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
+static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src);
+static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
+static uint64_t g_fat_esp_base;
+
+static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
+    hype_gpt_partition_t part;
+    hype_fat_file_t file;
+    const char *path = HYPE_M5_8_IMAGE_PATH;
+    const char *fs = 0;
+    unsigned pidx;
+
+    if (g_hostdisk_abar == 0) {
+        return 0; /* no host disk enumerated: nothing to resolve against */
+    }
+    for (pidx = 1u; pidx <= 4u && fs == 0; pidx++) {
+        if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
+            continue;
+        }
+        g_fat_esp_base = part.first_lba;
+        if (hype_fat32_resolve(fatvol_read, 0, path, &file) == 0) {
+            fs = "FAT32";
+        } else if (hype_exfat_resolve(fatvol_read, 0, path, &file) == 0) {
+            fs = "exFAT";
+        } else if (hype_ext_resolve(fatvol_read, 0, path, &file) == 0) {
+            fs = "ext2/3/4";
+        }
+    }
+    if (fs == 0) {
+        return 0;
+    }
+    if (hype_blk_image_init(&vm->vblk_image, &vm->vblk_be, &file, g_fat_esp_base,
+                            hostdisk_read, hostdisk_write, 0) != 0) {
+        /* A sparse or short-mapped image: refuse rather than serve a disk whose
+         * later sectors would fail mid-install. #90's --check reports why. */
+        hype_debug_print("m5-8: %s on %s is NOT usable as a disk (fragmented beyond the extent "
+                         "cap, sparse, or short) -- run tools/make-disk-image.sh --check\n",
+                         path, fs);
+        return 0;
+    }
+    vm->vblk_is_physical = 0;
+    hype_virtio_blk_reset(&vm->vblk, vm->vblk_be.total_sectors);
+    hype_debug_print("m5-8: FILE-backed guest disk %s on %s -- %llu bytes, %u extent(s), "
+                     "%llu sectors [writable, persists to the file]\n",
+                     path, fs, (unsigned long long)file.size_bytes, file.count,
+                     (unsigned long long)vm->vblk_be.total_sectors);
+    usb_log_flush(); /* prove the attach reached the log before the guest runs */
+    return 1;
+}
+
 #if HYPE_M10_6_WRITE_SELFTEST
 /* Round-trips a known pattern through the guest-facing blk_backend to a scratch
  * LBA (well past any partition table) to prove guest writes reach the physical
  * disk. DESTRUCTIVE within that one LBA; gated OFF by default. */
+
 static void fw_1_vblk_write_selftest(hype_fw_vm_t *vm) {
     static uint8_t wr[512], rd[512];
     uint64_t lba = 4096u;
@@ -6432,6 +6507,8 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
 #if HYPE_M10_6_WRITE_SELFTEST
         fw_1_vblk_write_selftest(vm);
 #endif
+    } else if (fw_1_vblk_use_image_file(vm)) {
+        /* M5-8 (#199): a raw image FILE on a host FS -- guest writes persist. */
     } else {
         vm->vblk_is_physical = 0;
         hype_virtio_blk_reset(&vm->vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
@@ -9714,11 +9791,20 @@ static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     return hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, dst);
 }
 
+/* M5-8 (#199): the disk-absolute WRITE counterpart of hostdisk_read, for the
+ * raw file-backed guest disk. DESTRUCTIVE by nature -- it only ever runs
+ * against sectors inside an image file's own resolved extents (blk_image
+ * splits every transfer at extent boundaries), so it cannot touch filesystem
+ * metadata or any other file. */
+static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    return hype_ahci_host_write(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, src);
+}
+
 /* GLADDER-11: the host FS reader (core/fat.c) wants a VOLUME-relative reader --
  * sector 0 == the FAT/exFAT ESP's boot sector. Offset every read by the ESP
  * partition's first LBA so the same physical disk backs both this and the
  * disk-absolute hostdisk_read(). */
-static uint64_t g_fat_esp_base;
 static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
     return hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, g_fat_esp_base + lba,

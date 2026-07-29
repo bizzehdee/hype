@@ -24,13 +24,25 @@
 #     avoids by construction.
 #
 # Preallocation strategy, best first:
-#   fallocate  - real allocation, instant on ext4/xfs/btrfs, and it also works
-#                on Linux's vfat/exfat drivers (measured: a 1 GiB image on a
-#                real FAT32 volume came out fully allocated via fallocate)
+#   fallocate  - real allocation, instant on ext4/xfs/btrfs and on Linux's vfat
 #   xfs_io     - same, where fallocate(1) itself is unavailable
 #   dd         - portable fallback; writes real zeros, so it is slow but honest
-# Whichever path runs, the result is VERIFIED below rather than trusted. Note
-# FAT32's 4 GiB-minus-1-byte per-file ceiling, checked separately.
+#
+# exFAT is DELIBERATELY EXCLUDED from the fast paths (#199 finding, measured):
+# exFAT directory entries carry BOTH DataLength and ValidDataLength, and
+# fallocate sets only the former. The exFAT driver then returns ZEROS for every
+# read past ValidDataLength no matter what is physically in those clusters. The
+# guest's writes would be on the medium and invisible to every other exFAT
+# reader -- an image nothing but hype could use. Writing the bytes for real is
+# the only way to make VDL == DataLength, so on exFAT this always takes the dd
+# path. (Measured: fallocate on exFAT left ValidDataLength at 512 for a 1 GiB
+# file; a host read at 512 MiB returned zeros while hype's own bytes were
+# provably present on disk.)
+#
+# Whichever path runs, the result is VERIFIED below rather than trusted --
+# including an end-of-file read-back probe that catches exactly this class of
+# "allocated but not valid" image on ANY filesystem.
+# Note also FAT32's 4 GiB-minus-1-byte per-file ceiling, checked separately.
 #
 # Usage:
 #   tools/make-disk-image.sh <path> <size_gb> [--force]
@@ -119,6 +131,31 @@ report_size() {
     stat -c '%s %b %B' "$1" 2>/dev/null | awk '{print $1" "$2*$3}'
 }
 
+# Tail probe: write a magic pattern into the LAST sector, read it back, restore
+# zeros. It proves the end of the file is genuinely writable+readable (a sparse
+# hole on a full volume fails here).
+#
+# NOTE, measured: on exFAT this write also makes the driver EXTEND
+# ValidDataLength to cover the offset, so the probe REPAIRS a short-VDL image
+# rather than reporting it -- it cannot detect that state after the fact,
+# because probing fixes it. That is why creation on exFAT does not rely on the
+# probe at all and takes the dd path unconditionally: VDL is then correct by
+# construction. Running --check on a fallocate-made exFAT image therefore
+# silently makes it usable, which is a fine outcome but is a side effect, not a
+# diagnosis.
+probe_tail_valid() {
+    probe_img=$1
+    probe_size=$2
+    probe_off=$((probe_size - 512))
+    printf 'HYPE-IMAGE-TAIL-PROBE' | dd of="$probe_img" bs=1 seek="$probe_off" \
+        conv=notrunc status=none
+    probe_got=$(dd if="$probe_img" bs=1 skip="$probe_off" count=21 status=none 2>/dev/null || true)
+    # restore the sector to zeros either way
+    dd if=/dev/zero of="$probe_img" bs=512 seek=$((probe_off / 512)) count=1 \
+        conv=notrunc status=none 2>/dev/null || true
+    [ "$probe_got" = "HYPE-IMAGE-TAIL-PROBE" ]
+}
+
 # --- --check: verify only -------------------------------------------------
 if [ "$CHECK_ONLY" -eq 1 ]; then
     [ -f "$IMG" ] || { echo "$PROG: no such image: $IMG" >&2; exit 1; }
@@ -138,8 +175,15 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
         echo "$PROG: re-create it with: $PROG '$IMG' $SIZE_GB --force" >&2
         RC=1
     fi
+    if [ "$RC" -eq 0 ] && ! probe_tail_valid "$IMG" "$WANT_BYTES"; then
+        echo "$PROG: NOT USABLE: a write+read at the end of $IMG did not survive." >&2
+        echo "$PROG: the end of the image is not really writable (a hole on a full" >&2
+        echo "$PROG: volume, or a read-only mount). Re-create with:" >&2
+        echo "$PROG:   $PROG '$IMG' $SIZE_GB --force" >&2
+        RC=1
+    fi
     if [ "$RC" -eq 0 ]; then
-        echo "$PROG: OK: $IMG is ${SIZE_GB} GiB ($WANT_BYTES bytes), fully allocated"
+        echo "$PROG: OK: $IMG is ${SIZE_GB} GiB ($WANT_BYTES bytes), fully allocated and valid"
     fi
     exit "$RC"
 fi
@@ -163,15 +207,24 @@ fi
 echo "$PROG: creating $IMG -- ${SIZE_GB} GiB ($WANT_BYTES bytes), fully allocated, on $FSTYPE"
 
 rm -f "$IMG"
-if command -v fallocate > /dev/null 2>&1 && fallocate -l "$WANT_BYTES" "$IMG" 2>/dev/null; then
+FAST_OK=1
+case "$FSTYPE" in
+    exfat) FAST_OK=0 ;; # ValidDataLength, see the header comment
+esac
+if [ "$FAST_OK" -eq 1 ] && command -v fallocate > /dev/null 2>&1 &&
+   fallocate -l "$WANT_BYTES" "$IMG" 2>/dev/null; then
     METHOD=fallocate
-elif command -v xfs_io > /dev/null 2>&1 &&
+elif [ "$FAST_OK" -eq 1 ] && command -v xfs_io > /dev/null 2>&1 &&
      xfs_io -f -c "falloc 0 $WANT_BYTES" "$IMG" > /dev/null 2>&1; then
     METHOD=xfs_io
 else
     # Portable fallback: write real zeros. Slow, but every byte is allocated,
     # which is the property that matters. 1 MiB blocks keep it reasonable.
-    echo "$PROG: no fast preallocation on $FSTYPE -- writing zeros (this will take a while)"
+    if [ "$FAST_OK" -eq 0 ]; then
+        echo "$PROG: $FSTYPE needs every byte written (ValidDataLength) -- writing zeros"
+    else
+        echo "$PROG: no fast preallocation on $FSTYPE -- writing zeros (this will take a while)"
+    fi
     rm -f "$IMG"
     dd if=/dev/zero of="$IMG" bs=1048576 count=$((WANT_BYTES / 1048576)) \
        status=progress conv=fsync 2>&1 | tail -1
@@ -193,7 +246,13 @@ if [ "$ALLOC_BYTES" -lt "$HAVE_BYTES" ]; then
     exit 1
 fi
 
-echo "$PROG: OK: $IMG ${SIZE_GB} GiB, fully allocated via $METHOD"
+if ! probe_tail_valid "$IMG" "$WANT_BYTES"; then
+    echo "$PROG: FAILED: $IMG is allocated but its tail does not read back (via $METHOD)." >&2
+    echo "$PROG: the image would read as zeros past some point for other readers." >&2
+    exit 1
+fi
+
+echo "$PROG: OK: $IMG ${SIZE_GB} GiB, fully allocated and valid via $METHOD"
 echo "$PROG: point hype.cfg at it, e.g.:"
 echo "$PROG:   target_disk = file:$IMG"
 echo "$PROG:   target_disk_size_gb = $SIZE_GB"
