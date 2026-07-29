@@ -1,6 +1,12 @@
 # Intel (VT-x/VMX) → AMD parity: what is left
 
-Status as of 2026-07-29, `ceae540`.
+Status as of 2026-07-29, `8a476c5`.
+
+> ## PARKED — no Intel hardware access
+> The nested-VMX box (`192.168.0.144`) is unavailable, and every remaining item in
+> section A needs it: the failures are only observable by running the guest. Nothing
+> here is blocked on knowing what to do next — see "Resume here" below. Do not delete
+> the diagnostics added for this; they are what made the last five fixes findable.
 
 ## The bar (where AMD is)
 
@@ -10,73 +16,82 @@ on **real AMD hardware**. That is the target Intel has to match.
 
 ## Where Intel actually is
 
-Verified on the nested-VMX box (`192.168.0.144`, i5-13420H, `kvm_intel nested=Y`):
+The guest boots firmware -> GRUB -> the Linux kernel, and is **still running** when the
+capture window closes. Last observed:
 
-- Boots, enables VMX on the BSP **and** on an AP (`ap_vmm_ok=1` — #242's fix
-  confirmed on Intel).
-- All **17 microtests** run (M2–M4-5 battery).
-- The **live FW-1 guest now enters** — the `kind != SVM` bail-out is gone, the
-  device adapters are ported, and an EPT is built. Log grew 312 → 584 lines when
-  the final re-land hunks landed.
-- Two blockers found and fixed today (see the log below): the CR4 `#GP` storm
-  (85 -> 0) and the external-interrupt storm (13,813,771 -> 0).
-- It gets through real mode into protected mode, sets CR4 (`GUEST_CR4=0x2660`,
-  its own `0x660` with VMXE preserved), and **now dies enabling paging**:
-  `#GP` on `MOV CR0, EAX` with `attempted=0x80000023`, plus a panic
-  "undecodable MMIO NPF at guest-physical 0x80000023".
-- **Never run on bare Intel metal** — nested only.
+```
+x86/fpu: Enabled xstate features 0x207, context size is 840 bytes
+[    0.420422] ... kernel still executing
+LAPIC timer IRQs=254, PIT IRQ0 IRQs=28      <- interrupts ARE being delivered
+```
 
-### Fixed today
-| Commit | What |
+It has not reached userspace/login. The one open guest-side complaint is a
+**WARNING** (not an oops) at `arch/x86/kernel/fpu/xstate.c:332`, which the kernel
+runs past.
+
+### Fixed today, in order found
+| Commit | Root cause |
 |---|---|
-| `354e151` | Dumps stopped fabricating guest state (SVM-only struct read on VMX) |
-| `281186a` | CR-write probe; physical insn-byte fallback when `cr3=0` |
-| `84e14b5` | Host owns CR4.VMXE / CR0.NE + CR-access handler -> `#GP` 85 to 0 |
-| `3bb58ad` | STI window consumes the exit's interrupt -> `intr` storm to 0 |
+| `354e151` | Dumps fabricated guest state on VMX (SVM-only struct read) |
+| `281186a` | CR-write probe + physical insn-byte fallback when `cr3=0` |
+| `84e14b5` | Host must OWN CR4.VMXE / CR0.NE -- CR4 `#GP` 85 -> 0 |
+| `3bb58ad` | STI window consumes the exit's interrupt -- storm 13.8M -> 0 |
 | `ceae540` | acknowledge-interrupt-on-exit + `hype_isr_dispatch_vector()` |
+| `f9bac5e` | **LOAD_IA32_EFER never requested** -- guest ran on the HOST's EFER |
+| `96ff51b` | Guest FS/GS base never applied AND segments left "unusable" -- `#GP` 96 -> 0 |
+| `9b760b6` | Guest introspection used an SVM-only CR3, blind on VMX |
+| `c227ff5` | VM-entry/exit MSR areas (KERNEL_GS_BASE, SYSCALL MSRs) |
+| `237fb60` | pvclock never armed; `IA32_PAT` discarded (guest saw PAT=0 = all-UC) |
+| `825f283` | **INVPCID `#UD`** -- the "enable INVPCID" control was never set |
+| `8a476c5` | **XSETBV** unhandled; CR4.OSXSAVE per-context; CPUID 0xD vs guest XCR0 |
 
-## A. #236 (VMX-4) — make the live guest work on Intel
+### The pattern worth internalising
+Every one of these is the same shape: **a feature SVM gets for free that VMX gates or
+requires the hypervisor to emulate.** `vmload`/`vmsave` hands SVM the FS/GS bases and
+SYSCALL MSRs; SVM has no INVPCID gate and leaves XSETBV unintercepted; the VMCB carries
+PAT and EFER without extra controls. Anything in that category is a candidate for the
+next fault. Check the VMX secondary controls and the unconditional-exit list against
+what CPUID advertises.
 
-- [x] **A1. Get a truthful `#GP` dump.** Was unusable: `xd` came from
-  `vmm_get_debug_state()`, which is SVM-only and returned 0 **without writing
-  the struct**, so on Intel the dump printed uninitialised stack —
-  `rip=0x0 cs=0x0 rsp=0x0 insn=00 00 ...` — and fed a garbage CR3 into a guest
-  page-table walk. It reads as "guest executing at address 0" and is pure noise.
-  Fixed: neutral `info.guest_rip` + `vmm_get_cr3()`, CS/RSP dropped rather than
-  faked, the shim now zeroes the struct on VMX, and the two `detail = .exitinfo2`
-  sites keep their `info.qualification` fallback. **Needs an Intel re-run.**
-- [x] **A2a. Localise the `#GP`.** Done — it is `MOV CR4, EAX` in the OVMF reset
-  vector (`0xFFFF0000 + 0xFE94`), `cr3=0`, `IF=0`, `reason=0x0`
-  (`EXIT_REASON_EXCEPTION_NMI`). Bytes `0f 22 e0` = `0F 22` + ModRM `E0`
-  (reg=100 → CR4, r/m=000 → EAX). The 85 repeats are hype reinjecting into a guest
-  with no IDT yet, not 85 distinct faults. Entry works and the guest executes real
-  firmware — it dies on one control-register write.
-- [x] **A2b. Why the CR4 load faulted.** `IA32_VMX_CR4_FIXED0` requires CR4.VMXE;
-  firmware writes CR4 without it; `CR4_GUEST_HOST_MASK` was 0 so the write reached
-  `GUEST_CR4` and violated the fixed-bit rule. Fixed in `84e14b5`.
-- [x] **A2c. The external-interrupt storm.** Fixed twice over in `3bb58ad` /
-  `ceae540`; hype picks the path the hardware granted.
-- [ ] **A2d. NEXT BLOCKER — `#GP` on `MOV CR0` enabling paging.**
-  `attempted=0x80000023` (PG|NE|MP|PE) **satisfies** `CR0_FIXED0=0x80000021`, so
-  unlike the CR4 case this is *not* a fixed-bit violation. Accompanied by
-  `PANIC: undecodable MMIO NPF on vm0 at guest-physical 0x80000023` — and that
-  "GPA" is bit-for-bit the CR0 operand, which is either a misattributed exit or
-  an EPT gap for the guest's new page-table root (`cr3=0x800000`). Not yet
-  determined; do not guess. Start by confirming which exit reason actually
-  arrives, since a CR-access exit misread as an EPT violation would explain the
-  operand appearing as an address.
-- [ ] **A3. Guest-facing timer + interrupt injection on VMX.** Still unproven:
-  `VM_ENTRY_INTR_INFO` injection, `GUEST_INTERRUPTIBILITY_STATE`,
-  `GUEST_ACTIVITY_STATE`, and the PIT/LAPIC/IO-APIC arm path — the VMX equivalent
-  of M4-6b4 (#80), which is what got AMD ticking past `/init`. Note this is
-  DOWNSTREAM of A2d, not parallel: the guest cannot arm a timer while it is
-  dying in early firmware, so "nothing ever armed" is a symptom of how far it
-  gets, not necessarily a second defect. Re-measure after A2d before sizing it.
-- [ ] **A4. One Intel guest to an Alpine login prompt** (the M4-6d3 bar).
-- [ ] **A5. The 14 remaining raw `hype_svm_*` calls** in the FW-1 region —
-  decide port vs. gate for each. Mostly deliberate SVM-only diagnostics
-  (`get_debug_state`, `get_mtrr_diag`), but `hype_svm_set_msr_trace(1)` is
-  called unconditionally, including on Intel.
+### How they were found (this is the transferable part)
+Five feature guesses in a row failed. What worked was making the guest report its own
+fault:
+
+- **`earlycon=uart8250,io,0x3f8,115200n8` — NOT `earlyprintk`.** earlyprintk is
+  initialised in `setup_arch()`, i.e. *after* these faults, so it can never show them.
+  earlycon is honoured earlier and produced full oopses with call traces.
+- **`nokaslr`** pins the kernel base so a RIP is directly readable.
+- ISO kept at `~/Downloads/alpine-hype-earlycon.iso`; rebuild recipe is
+  `xorriso -indev X -outdev Y -boot_image any replay -map cfg /boot/grub/grub.cfg -commit`
+  (the `replay` is what preserves El Torito/EFI bootability).
+- `test.iso` in the bisect dir is the STANDARD image; swap deliberately and `mv` it back
+  (it has ~47 hard links, so never overwrite in place).
+
+## A. #236 / #251 — finish the live guest on Intel  [BLOCKED: needs the box]
+
+Everything below is observation-driven. Do not attempt any of it without hardware; the
+last five fixes came from reading guest oopses, not from reasoning about VMX.
+
+### Resume here (exact steps)
+1. `cp ~/Downloads/alpine-hype-earlycon.iso /mnt/data/hype-bisect/test.iso`
+   (first `mv` the existing `test.iso` aside — do NOT overwrite, it has ~47 hard links).
+2. `intel-probe.sh <label> "-DHYPE_RUN_SELFTEST_GUESTS=1 -DHYPE_VMX_SMOKE_TEST=1 \
+    -DHYPE_FW_1_GUEST_RAM_MB=1024 -DHYPE_RUN_TWO_VMS=0"`
+   Single VM matters: two VMs share one VMCS (#245) and inject a spurious
+   VM-instruction-error 7 that contaminates every reading.
+3. Read the log for the next kernel oops / hype panic and fix that. Repeat.
+4. `mv` the original `test.iso` back when done.
+
+- [ ] **A1. The xstate.c:332 WARNING.** Non-fatal, guest runs past it, but it is the one
+  outstanding guest-side complaint and likely reflects a residual XSAVE/XCR0 mismatch
+  from `8a476c5`. Read the full WARNING text before theorising.
+- [ ] **A2. Whatever the guest hits next**, following the resume loop above. It was still
+  running at 0.420s when the capture ended, so the next fault is unobserved -- there may
+  be none at all until userspace.
+- [ ] **A3. Reach an Alpine login prompt** (the M4-6d3 bar, and AMD's).
+- [ ] **A4. The 14 remaining raw `hype_svm_*` calls** in the FW-1 region (#249). One was
+  already a real bug (`9b760b6`: the guest page walk). The rest are mostly SVM-only
+  diagnostics that want gating, not porting.
 
 ## B. #245 — VMX singletons (blocks two concurrent Intel guests)
 
@@ -120,6 +135,22 @@ VMX-3, plus the **Intel halves** of #13 (M0-5), #43 (M3-6), #173 (M8-10).
   one serial port — it shredded `fw-1 EXHIST:` and reported `exits=0` where the
   real value was 1. Verdicts were right, the number wasn't.
 - [ ] **E4.** The SONY validation stick still carries the `c6c055c` build.
+
+## Work that does NOT need the Intel box
+
+Available now, in rough value order:
+
+- **#245 (pooled VMX ctx/VMCS, per-VM EPT roots, VPID).** The code can be written and
+  AMD-regression-tested locally; only the two-guest *validation* needs Intel. Doing this
+  first also removes the error-7 contamination from every future two-VM Intel reading.
+- **#250 tail:** nothing outstanding -- all four `vmm_get_debug_state()` sites are
+  guarded. Ticket can be closed on review.
+- **#236 hygiene:** gate the M4-6d5/M4-6d6 diagnostic region behind `HYPE_FW1_DEBUG`.
+  NOTE: this grew today (CRPROBE, EPTDUMP, MSRTRACE, CPUIDRING). Gate them, do not delete
+  them -- they are the reason the last five root causes were findable, and the Intel work
+  is not finished.
+- **SONY validation stick** still carries `c6c055c`; nothing to validate on metal until
+  Intel returns, so low priority.
 
 ## Lessons that cost real time here — worth not repeating
 
