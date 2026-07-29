@@ -25,10 +25,16 @@
  *     rewriting the directory entry set (with a fresh set checksum) as it goes;
  *   - flushes the volume: clears VolumeDirty and refreshes PercentInUse.
  *
- * What it deliberately does not do: create or remove directories, and rename.
+ * #246 added the directory-manipulation half #198 scoped out: create a
+ * directory, remove an (empty) directory, delete a file, and rename/move an
+ * entry -- and generalised create to an arbitrary parent directory, growing
+ * that parent (and keeping its DataLength in its own parent's entry set
+ * honest) when the new entry set does not fit.
+ *
  * Growth always produces a FAT-chained (NoFatChain == 0) allocation, and a file
- * that was contiguous gets its FAT chain materialised the first time it grows,
- * so a fragmented volume is handled correctly rather than corrupted.
+ * (or directory) that was contiguous gets its FAT chain materialised the first
+ * time it grows, so a fragmented volume is handled correctly rather than
+ * corrupted.
  *
  * Two mount-time restrictions are worth knowing about, both `plan.md` §10
  * decision #24: a volume whose allocation bitmap is not physically contiguous is
@@ -120,12 +126,49 @@ int hype_exfat_lookup(hype_exfat_fs_t *fs, const char *path, int want_dir,
                       hype_exfat_wfile_t *out);
 
 /*
- * Creates `name` in the root directory, or truncates it to empty if it already
- * exists (freeing its old chain). No data cluster is allocated until the first
- * append. Returns 0 on success, -1 on I/O error, an invalid/unsupported name, or
- * a full volume/root directory.
+ * Creates the file named by `path` ('\\' or '/' separated; every directory on
+ * the way must already exist), or truncates it to empty if it already exists
+ * (freeing its old chain). No data cluster is allocated until the first append.
+ * Returns 0 on success, -1 on I/O error, an invalid/unsupported name, a
+ * missing parent directory, or a full volume/directory.
  */
-int hype_exfat_create(hype_exfat_fs_t *fs, const char *name, hype_exfat_wfile_t *out);
+int hype_exfat_create(hype_exfat_fs_t *fs, const char *path, hype_exfat_wfile_t *out);
+
+/*
+ * Deletes the file named by `path`: frees its allocation (FAT chain and bitmap
+ * bits) and retires its whole entry set. Refuses a directory. Returns 0 on
+ * success, -1 on I/O error or if the path does not name a file.
+ */
+int hype_exfat_unlink(hype_exfat_fs_t *fs, const char *path);
+
+/*
+ * Creates the directory named by `path` (every directory on the way must
+ * already exist; no mkdir -p). The new directory gets one zeroed cluster --
+ * exFAT directories have no '.'/'..' entries -- and a DataLength of exactly
+ * that cluster. Refuses an existing name of either kind. Returns 0 on success,
+ * -1 on error.
+ */
+int hype_exfat_mkdir(hype_exfat_fs_t *fs, const char *path);
+
+/*
+ * Removes the directory named by `path`. The directory must be empty (no
+ * in-use entry of any type); the root directory cannot be removed. Frees its
+ * allocation and retires its entry set. Returns 0 on success, -1 on error or a
+ * non-empty directory.
+ */
+int hype_exfat_rmdir(hype_exfat_fs_t *fs, const char *path);
+
+/*
+ * Renames (and/or moves) `from` to `to`. `to`'s parent directory must exist,
+ * `to` itself must not (rename never replaces), and a directory cannot be
+ * moved into itself or a descendant of itself. Because lookup is
+ * case-insensitive, a rename that only changes a name's case is refused as
+ * "target exists". The entry keeps its attributes, timestamps and allocation;
+ * only its name (and, when moving, its directory) change. The new entry set is
+ * written before the old one is retired, so an interruption leaves the entry
+ * findable under at least one name. Returns 0 on success, -1 on error.
+ */
+int hype_exfat_rename(hype_exfat_fs_t *fs, const char *from, const char *to);
 
 /*
  * Overwrites `len` bytes at byte `offset` of the file. The range must lie wholly

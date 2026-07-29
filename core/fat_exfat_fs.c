@@ -812,43 +812,252 @@ int hype_exfat_lookup(hype_exfat_fs_t *fs, const char *path, int want_dir,
     }
 }
 
-/* ---- create ---- */
+/* ---- directory references ---- */
+
+/*
+ * A directory hype is about to insert into, scan, or grow -- together with
+ * where that directory's OWN entry set lives. Growing a subdirectory changes
+ * its DataLength (and, if its allocation was NoFatChain, its flags), and both
+ * live in its parent's entry set; the root directory is described only by the
+ * boot sector and has no such set, hence `has_owner`.
+ */
+typedef struct {
+    uint32_t first;    /* first cluster of the directory itself */
+    uint64_t size;     /* its DataLength (unused for the root directory) */
+    uint8_t contiguous; /* 1 == NoFatChain */
+    uint8_t has_owner; /* 0 == the root directory */
+    uint32_t owner_dir; /* directory holding this directory's entry set */
+    uint8_t owner_contig;
+    uint32_t owner_set; /* entry index of its File entry there */
+    uint8_t owner_secondary;
+} dirref_t;
+
+static void dirref_root(const hype_exfat_fs_t *fs, dirref_t *d) {
+    d->first = fs->root_cluster;
+    d->size = 0u;
+    d->contiguous = 0u;
+    d->has_owner = 0u;
+    d->owner_dir = 0u;
+    d->owner_contig = 0u;
+    d->owner_set = 0u;
+    d->owner_secondary = 0u;
+}
+
+/* Writes the directory's current allocation back into its own entry set (a
+ * no-op for the root, which has none). */
+static int dirref_flush(hype_exfat_fs_t *fs, const dirref_t *d) {
+    hype_exfat_wfile_t f;
+    if (!d->has_owner) {
+        return 0;
+    }
+    f.fs = fs;
+    f.dir_cluster = d->owner_dir;
+    f.dir_contiguous = d->owner_contig;
+    f.set_index = d->owner_set;
+    f.secondary = d->owner_secondary;
+    f.first_cluster = d->first;
+    f.size = d->size;
+    f.contiguous = d->contiguous;
+    return set_flush(&f);
+}
+
+/* ---- path handling ----
+ *
+ * Every mutating entry point takes a full path. path_split finds the final
+ * component; resolve_parent walks everything before it. Names being LOOKED UP
+ * (unlink/rmdir/rename's source, and existence checks) are widened as-is, the
+ * same way lookup treats them; names being WRITTEN go through name_prepare,
+ * which enforces exFAT's character rules and the volume's up-case coverage.
+ */
+
+/* Byte offset of the final path component. -1 if there is none ("", "\"). A
+ * trailing separator is accepted and ignored. */
+static int path_split(const char *path, unsigned int *out_leaf) {
+    unsigned int i;
+    unsigned int leaf = 0;
+    int have = 0;
+    int in_sep = 1;
+    for (i = 0; path[i] != '\0'; i++) {
+        if (path[i] == '\\' || path[i] == '/') {
+            in_sep = 1;
+        } else {
+            if (in_sep) {
+                leaf = i;
+                have = 1;
+            }
+            in_sep = 0;
+        }
+    }
+    if (!have) {
+        return -1;
+    }
+    *out_leaf = leaf;
+    return 0;
+}
+
+/* Copies the final component (which starts at byte `leaf`) into a
+ * NUL-terminated buffer for the validating name encoder. */
+static int leaf_string(const char *path, unsigned int leaf, char *out, unsigned int cap) {
+    unsigned int n = 0;
+    while (path[leaf + n] != '\0' && path[leaf + n] != '\\' && path[leaf + n] != '/') {
+        if (n + 1u >= cap) {
+            return -1;
+        }
+        out[n] = path[leaf + n];
+        n++;
+    }
+    out[n] = '\0';
+    return 0;
+}
+
+/* Widens the final component for a directory search (no validation: this is a
+ * name that already exists on the medium). Returns the length, 0 on error. */
+static unsigned int leaf_component(const char *path, unsigned int leaf,
+                                   uint16_t out[HYPE_EXFAT_MAX_NAME]) {
+    unsigned int pos = leaf;
+    int overflow = 0;
+    unsigned int n = path_component(path, &pos, out, HYPE_EXFAT_MAX_NAME, &overflow);
+    return overflow ? 0u : n;
+}
+
+/*
+ * Resolves the parent directory of the entry `path` names: walks every
+ * component before the final one (at byte `leaf`). When `forbid` is a non-zero
+ * cluster, a walk that passes through the directory starting at that cluster
+ * fails -- rename uses this to refuse moving a directory into itself or a
+ * descendant of itself. Returns 0 on success, -1 otherwise.
+ */
+static int resolve_parent(hype_exfat_fs_t *fs, const char *path, unsigned int leaf,
+                          uint32_t forbid, dirref_t *dir) {
+    dirref_root(fs, dir);
+    {
+        unsigned int pos = 0;
+        for (;;) {
+            uint16_t comp[HYPE_EXFAT_MAX_NAME];
+            hype_exfat_set_t set;
+            unsigned int nlen;
+            int overflow = 0;
+            uint32_t ei = 0;
+
+            while (path[pos] == '\\' || path[pos] == '/') {
+                pos++;
+            }
+            if (pos >= leaf) {
+                return 0; /* everything before the final component resolved */
+            }
+            nlen = path_component(path, &pos, comp, HYPE_EXFAT_MAX_NAME, &overflow);
+            if (nlen == 0u || overflow) {
+                return -1;
+            }
+            if (dir_find(fs, dir->first, dir->contiguous, comp, nlen, &ei, &set) != 1) {
+                return -1;
+            }
+            if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) == 0u) {
+                return -1; /* a non-final component is not a directory */
+            }
+            if (forbid != 0u && set.first_cluster == forbid) {
+                return -1;
+            }
+            /* The current directory becomes the owner of the next one. */
+            dir->owner_dir = dir->first;
+            dir->owner_contig = dir->contiguous;
+            dir->owner_set = ei;
+            dir->owner_secondary = set.secondary;
+            dir->has_owner = 1u;
+            dir->first = set.first_cluster;
+            dir->size = set.data_length;
+            dir->contiguous = set.contiguous;
+        }
+    }
+}
+
+/* Encodes and validates a name hype is about to WRITE: exFAT's forbidden
+ * characters, and exact up-case coverage -- a NameHash built on a guessed fold
+ * would disagree with every other implementation's. */
+static int name_prepare(hype_exfat_fs_t *fs, const char *name,
+                        uint16_t chars[HYPE_EXFAT_MAX_NAME], unsigned int *out_len,
+                        uint16_t *out_hash) {
+    uint16_t upcased[HYPE_EXFAT_MAX_NAME];
+    int nlen_signed = hype_exfat_name_to_utf16(name, chars, HYPE_EXFAT_MAX_NAME);
+    unsigned int i, nlen;
+    if (nlen_signed <= 0) {
+        return -1;
+    }
+    nlen = (unsigned int)nlen_signed;
+    for (i = 0; i < nlen; i++) {
+        if (!hype_exfat_upcase_exact(&fs->upcase, chars[i])) {
+            return -1; /* the volume's table does not cover this character, so the
+                        * NameHash hype wrote would not match another driver's */
+        }
+        upcased[i] = hype_exfat_upcase(&fs->upcase, chars[i]);
+    }
+    *out_hash = hype_exfat_name_hash_update(0u, upcased, nlen);
+    *out_len = nlen;
+    return 0;
+}
+
+/* ---- entry-set placement, removal ---- */
+
+/* Retires a whole entry set: clears the InUse bit on EVERY entry of the set,
+ * not only the primary, so no stale secondary is left looking like part of a
+ * neighbouring set. */
+static int set_delete(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uint32_t ei,
+                      uint8_t secondary) {
+    unsigned int k;
+    for (k = 0; k <= secondary; k++) {
+        uint8_t ent[ENTSZ];
+        if (entry_read(fs, dir_first, dir_contig, ei + k, ent) != 0) {
+            return -1;
+        }
+        ent[0] = (uint8_t)(ent[0] & (uint8_t)~(uint8_t)HYPE_EXFAT_ENT_INUSE);
+        if (entry_write(fs, dir_first, dir_contig, ei + k, ent) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
 
 /*
  * Scans a directory for `need` consecutive unused entry slots. An exFAT entry set
  * must be contiguous, so a run that would spill past the directory's current
  * allocation does not count. Returns 1 found, 0 not found, -1 on I/O error.
  */
-static int dir_scan_slots(hype_exfat_fs_t *fs, uint32_t dir_first, unsigned int need,
+static int dir_scan_slots(hype_exfat_fs_t *fs, const dirref_t *d, unsigned int need,
                           uint32_t *out_index) {
     uint32_t entries_per_cluster = fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR;
     uint32_t clusters = 0;
-    uint32_t cl = dir_first;
     uint32_t capacity;
     uint32_t ei;
     uint32_t run_start = 0;
     unsigned int run = 0;
-    unsigned int guard = 0;
 
-    while (guard++ < WALK_GUARD) {
-        uint32_t next;
-        if (fat_get(fs, cl, &next) != 0) {
-            return -1;
+    if (d->contiguous) {
+        /* A NoFatChain directory's extent comes from its DataLength, which its
+         * own entry set carries (range-checked by set_read on the way here). */
+        clusters = (uint32_t)clusters_for(fs, d->size);
+    } else {
+        uint32_t cl = d->first;
+        unsigned int guard = 0;
+        while (guard++ < WALK_GUARD) {
+            uint32_t next;
+            if (fat_get(fs, cl, &next) != 0) {
+                return -1;
+            }
+            clusters++;
+            if (next >= HYPE_EXFAT_EOC) {
+                break;
+            }
+            cl = next;
         }
-        clusters++;
-        if (next >= HYPE_EXFAT_EOC) {
-            break;
+        if (guard >= WALK_GUARD) {
+            return -1; /* the directory's chain loops */
         }
-        cl = next;
-    }
-    if (guard >= WALK_GUARD) {
-        return -1; /* the directory's chain loops */
     }
     capacity = clusters * entries_per_cluster;
 
     for (ei = 0; ei < capacity; ei++) {
         uint8_t ent[ENTSZ];
-        if (entry_read(fs, dir_first, 0, ei, ent) != 0) {
+        if (entry_read(fs, d->first, d->contiguous, ei, ent) != 0) {
             return -1;
         }
         if (ent[0] == 0x00u || (ent[0] & HYPE_EXFAT_ENT_INUSE) == 0u) {
@@ -870,17 +1079,39 @@ static int dir_scan_slots(hype_exfat_fs_t *fs, uint32_t dir_first, unsigned int 
     return 0;
 }
 
-/* Appends one zeroed cluster to a FAT-chained directory. A zeroed entry reads as
- * the end-of-directory marker, which is exactly what a fresh cluster must look
- * like. */
-static int dir_grow(hype_exfat_fs_t *fs, uint32_t dir_first) {
+/*
+ * Appends one zeroed cluster to a directory. A zeroed entry reads as the
+ * end-of-directory marker, which is exactly what a fresh cluster must look
+ * like. A NoFatChain directory gets its FAT chain materialised first (the next
+ * physical cluster cannot be assumed free), which -- like the growth itself --
+ * must be reflected in the directory's own entry set, so both changes are
+ * flushed to its owner as they happen.
+ */
+static int dir_grow(hype_exfat_fs_t *fs, dirref_t *d) {
     uint32_t newcl;
-    uint32_t cl = dir_first;
-    uint32_t last = dir_first;
+    uint32_t cl = d->first;
+    uint32_t last = d->first;
     unsigned int guard = 0;
     uint8_t zero[SECSZ];
     unsigned int s;
 
+    if (d->contiguous) {
+        uint64_t n = clusters_for(fs, d->size);
+        uint64_t i;
+        if (n == 0u || !cluster_valid(fs, d->first + (uint32_t)(n - 1u))) {
+            return -1;
+        }
+        for (i = 0; i < n; i++) {
+            uint32_t c = d->first + (uint32_t)i;
+            if (fat_set(fs, c, (i + 1u < n) ? (c + 1u) : EOC_MARK) != 0) {
+                return -1;
+            }
+        }
+        d->contiguous = 0u;
+        if (dirref_flush(fs, d) != 0) {
+            return -1; /* the flags byte must never claim NoFatChain again */
+        }
+    }
     while (guard++ < WALK_GUARD) {
         uint32_t next;
         if (fat_get(fs, cl, &next) != 0) {
@@ -904,107 +1135,46 @@ static int dir_grow(hype_exfat_fs_t *fs, uint32_t dir_first) {
             return -1;
         }
     }
-    return fat_set(fs, last, newcl);
+    if (fat_set(fs, last, newcl) != 0) {
+        return -1;
+    }
+    d->size += cluster_bytes(fs);
+    return dirref_flush(fs, d);
 }
 
 /*
  * Finds `need` consecutive unused directory-entry slots, growing the directory a
- * cluster at a time until they fit. Only ever called for the root directory,
- * whose allocation is always FAT-chained. The attempt cap bounds the work: one
- * grow is enough unless the entry set is larger than a whole cluster's worth of
- * entries, which needs a name of well over 200 characters on a 512-byte cluster.
+ * cluster at a time until they fit. The attempt cap bounds the work: one grow is
+ * enough unless the entry set is larger than a whole cluster's worth of entries,
+ * which needs a name of well over 200 characters on a 512-byte cluster.
  */
-static int dir_find_slots(hype_exfat_fs_t *fs, uint32_t dir_first, unsigned int need,
+static int dir_find_slots(hype_exfat_fs_t *fs, dirref_t *d, unsigned int need,
                           uint32_t *out_index) {
     unsigned int attempt;
     for (attempt = 0; attempt < 4u; attempt++) {
-        int rc = dir_scan_slots(fs, dir_first, need, out_index);
+        int rc = dir_scan_slots(fs, d, need, out_index);
         if (rc < 0) {
             return -1;
         }
         if (rc == 1) {
             return 0;
         }
-        if (dir_grow(fs, dir_first) != 0) {
+        if (dir_grow(fs, d) != 0) {
             return -1;
         }
     }
     return -1;
 }
 
-int hype_exfat_create(hype_exfat_fs_t *fs, const char *name, hype_exfat_wfile_t *out) {
-    uint16_t chars[HYPE_EXFAT_MAX_NAME];
-    uint16_t upcased[HYPE_EXFAT_MAX_NAME];
-    uint8_t entries[MAX_SET_ENTRIES * ENTSZ];
-    hype_exfat_set_t set;
-    int nlen_signed;
-    unsigned int nlen, name_entries, need, i, k;
-    uint16_t hash = 0u;
-    uint16_t sum = 0u;
-    uint32_t ei = 0;
-    int rc;
+/* Builds a complete entry set in `entries` so its checksum covers exactly the
+ * bytes that land on the medium, then writes it at `ei`. The File and Stream
+ * entries are already in place; this fills the name entries and the checksum. */
+static int set_place(hype_exfat_fs_t *fs, const dirref_t *d, uint32_t ei, uint8_t *entries,
+                     const uint16_t *chars, unsigned int nlen, unsigned int need) {
+    unsigned int name_entries = need - 2u;
+    unsigned int k;
+    uint16_t sum;
 
-    if (fs->write == 0) {
-        return -1;
-    }
-    nlen_signed = hype_exfat_name_to_utf16(name, chars, HYPE_EXFAT_MAX_NAME);
-    if (nlen_signed <= 0) {
-        return -1;
-    }
-    nlen = (unsigned int)nlen_signed;
-    for (i = 0; i < nlen; i++) {
-        if (!hype_exfat_upcase_exact(&fs->upcase, chars[i])) {
-            return -1; /* the volume's table does not cover this character, so the
-                        * NameHash hype wrote would not match another driver's */
-        }
-        upcased[i] = hype_exfat_upcase(&fs->upcase, chars[i]);
-    }
-    hash = hype_exfat_name_hash_update(0u, upcased, nlen);
-    name_entries = (nlen + HYPE_EXFAT_NAME_CHARS_PER_ENTRY - 1u) / HYPE_EXFAT_NAME_CHARS_PER_ENTRY;
-    need = 2u + name_entries;
-
-    if (mark_dirty(fs) != 0) {
-        return -1;
-    }
-
-    /* An existing file of the same name is truncated. Its name is identical, so
-     * the replacement set is normally exactly the same shape and the slot can be
-     * reused in place; a set carrying extra secondary entries hype does not
-     * generate is retired wholesale instead, so no stale entry is left inside a
-     * set whose checksum no longer covers it. */
-    rc = dir_find(fs, fs->root_cluster, 0, chars, nlen, &ei, &set);
-    if (rc < 0) {
-        return -1;
-    }
-    if (rc == 1) {
-        if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) != 0u) {
-            return -1; /* refuse to clobber a directory */
-        }
-        if (free_allocation(fs, set.first_cluster, set.contiguous, set.data_length) != 0) {
-            return -1;
-        }
-        if (set.secondary != (uint8_t)(need - 1u)) {
-            for (k = 0; k <= set.secondary; k++) {
-                uint8_t ent[ENTSZ];
-                if (entry_read(fs, fs->root_cluster, 0, ei + k, ent) != 0) {
-                    return -1;
-                }
-                ent[0] = (uint8_t)(ent[0] & (uint8_t)~(uint8_t)HYPE_EXFAT_ENT_INUSE);
-                if (entry_write(fs, fs->root_cluster, 0, ei + k, ent) != 0) {
-                    return -1;
-                }
-            }
-            rc = 0;
-        }
-    }
-    if (rc != 1 && dir_find_slots(fs, fs->root_cluster, need, &ei) != 0) {
-        return -1;
-    }
-
-    /* Build the whole set in memory so its checksum covers exactly the bytes
-     * that land on the medium. */
-    hype_exfat_file_entry(entries, HYPE_EXFAT_ATTR_ARCHIVE, (uint8_t)(need - 1u), &fs->now);
-    hype_exfat_stream_entry(entries + ENTSZ, nlen, hash, 0u, 0u, 0u, 0);
     for (k = 0; k < name_entries; k++) {
         unsigned int off = k * HYPE_EXFAT_NAME_CHARS_PER_ENTRY;
         unsigned int count = nlen - off;
@@ -1017,14 +1187,81 @@ int hype_exfat_create(hype_exfat_fs_t *fs, const char *name, hype_exfat_wfile_t 
     hype_exfat_file_entry_set_checksum(entries, sum);
 
     for (k = 0; k < need; k++) {
-        if (entry_write(fs, fs->root_cluster, 0, ei + k, entries + k * ENTSZ) != 0) {
+        if (entry_write(fs, d->first, d->contiguous, ei + k, entries + k * ENTSZ) != 0) {
             return -1;
         }
     }
+    return 0;
+}
+
+/* ---- create ---- */
+
+int hype_exfat_create(hype_exfat_fs_t *fs, const char *path, hype_exfat_wfile_t *out) {
+    uint16_t chars[HYPE_EXFAT_MAX_NAME];
+    char leafbuf[HYPE_EXFAT_MAX_NAME + 1u];
+    uint8_t entries[MAX_SET_ENTRIES * ENTSZ];
+    dirref_t dir;
+    hype_exfat_set_t set;
+    unsigned int leaf, nlen, name_entries, need;
+    uint16_t hash = 0u;
+    uint32_t ei = 0;
+    int rc;
+
+    if (fs->write == 0) {
+        return -1;
+    }
+    if (path_split(path, &leaf) != 0 || leaf_string(path, leaf, leafbuf, sizeof leafbuf) != 0) {
+        return -1;
+    }
+    if (resolve_parent(fs, path, leaf, 0u, &dir) != 0) {
+        return -1;
+    }
+    if (name_prepare(fs, leafbuf, chars, &nlen, &hash) != 0) {
+        return -1;
+    }
+    name_entries = (nlen + HYPE_EXFAT_NAME_CHARS_PER_ENTRY - 1u) / HYPE_EXFAT_NAME_CHARS_PER_ENTRY;
+    need = 2u + name_entries;
+
+    if (mark_dirty(fs) != 0) {
+        return -1;
+    }
+
+    /* An existing file of the same name is truncated. Its name is identical, so
+     * the replacement set is normally exactly the same shape and the slot can be
+     * reused in place; a set carrying extra secondary entries hype does not
+     * generate is retired wholesale instead, so no stale entry is left inside a
+     * set whose checksum no longer covers it. */
+    rc = dir_find(fs, dir.first, dir.contiguous, chars, nlen, &ei, &set);
+    if (rc < 0) {
+        return -1;
+    }
+    if (rc == 1) {
+        if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) != 0u) {
+            return -1; /* refuse to clobber a directory */
+        }
+        if (free_allocation(fs, set.first_cluster, set.contiguous, set.data_length) != 0) {
+            return -1;
+        }
+        if (set.secondary != (uint8_t)(need - 1u)) {
+            if (set_delete(fs, dir.first, dir.contiguous, ei, set.secondary) != 0) {
+                return -1;
+            }
+            rc = 0;
+        }
+    }
+    if (rc != 1 && dir_find_slots(fs, &dir, need, &ei) != 0) {
+        return -1;
+    }
+
+    hype_exfat_file_entry(entries, HYPE_EXFAT_ATTR_ARCHIVE, (uint8_t)(need - 1u), &fs->now);
+    hype_exfat_stream_entry(entries + ENTSZ, nlen, hash, 0u, 0u, 0u, 0);
+    if (set_place(fs, &dir, ei, entries, chars, nlen, need) != 0) {
+        return -1;
+    }
 
     out->fs = fs;
-    out->dir_cluster = fs->root_cluster;
-    out->dir_contiguous = 0u;
+    out->dir_cluster = dir.first;
+    out->dir_contiguous = dir.contiguous;
     out->set_index = ei;
     out->secondary = (uint8_t)(need - 1u);
     out->first_cluster = 0u;
@@ -1035,6 +1272,251 @@ int hype_exfat_create(hype_exfat_fs_t *fs, const char *name, hype_exfat_wfile_t 
     out->seek_index = 0u;
     out->seek_cluster = 0u;
     return 0;
+}
+
+/* ---- unlink, mkdir, rmdir, rename (#246) ---- */
+
+int hype_exfat_unlink(hype_exfat_fs_t *fs, const char *path) {
+    uint16_t comp[HYPE_EXFAT_MAX_NAME];
+    dirref_t dir;
+    hype_exfat_set_t set;
+    unsigned int leaf, nlen;
+    uint32_t ei = 0;
+
+    if (fs->write == 0) {
+        return -1;
+    }
+    if (path_split(path, &leaf) != 0 || resolve_parent(fs, path, leaf, 0u, &dir) != 0) {
+        return -1;
+    }
+    nlen = leaf_component(path, leaf, comp);
+    if (nlen == 0u) {
+        return -1;
+    }
+    if (dir_find(fs, dir.first, dir.contiguous, comp, nlen, &ei, &set) != 1) {
+        return -1;
+    }
+    if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) != 0u) {
+        return -1; /* directories go through rmdir, which checks emptiness */
+    }
+    if (mark_dirty(fs) != 0) {
+        return -1;
+    }
+    if (free_allocation(fs, set.first_cluster, set.contiguous, set.data_length) != 0) {
+        return -1;
+    }
+    return set_delete(fs, dir.first, dir.contiguous, ei, set.secondary);
+}
+
+int hype_exfat_mkdir(hype_exfat_fs_t *fs, const char *path) {
+    uint16_t chars[HYPE_EXFAT_MAX_NAME];
+    char leafbuf[HYPE_EXFAT_MAX_NAME + 1u];
+    uint8_t entries[MAX_SET_ENTRIES * ENTSZ];
+    uint8_t zero[SECSZ];
+    dirref_t dir;
+    hype_exfat_set_t set;
+    unsigned int leaf, nlen, need, s;
+    uint16_t hash = 0u;
+    uint32_t ei = 0;
+    uint32_t cl = 0;
+
+    if (fs->write == 0) {
+        return -1;
+    }
+    if (path_split(path, &leaf) != 0 || leaf_string(path, leaf, leafbuf, sizeof leafbuf) != 0) {
+        return -1;
+    }
+    if (resolve_parent(fs, path, leaf, 0u, &dir) != 0) {
+        return -1;
+    }
+    if (name_prepare(fs, leafbuf, chars, &nlen, &hash) != 0) {
+        return -1;
+    }
+    if (dir_find(fs, dir.first, dir.contiguous, chars, nlen, &ei, &set) != 0) {
+        return -1; /* an existing entry of EITHER kind, or an I/O error */
+    }
+    need = 2u + (nlen + HYPE_EXFAT_NAME_CHARS_PER_ENTRY - 1u) / HYPE_EXFAT_NAME_CHARS_PER_ENTRY;
+
+    if (mark_dirty(fs) != 0) {
+        return -1;
+    }
+    /* Place the entry set's slots before allocating the directory's cluster:
+     * failing between the two leaks at worst directory SLACK (extra room in the
+     * parent), never an allocated cluster nothing references. */
+    if (dir_find_slots(fs, &dir, need, &ei) != 0) {
+        return -1;
+    }
+    /*
+     * One zeroed whole cluster: an exFAT directory has no '.'/'..' entries, its
+     * unused entries must read 0x00 (the end-of-directory marker -- garbage here
+     * would misparse), and its DataLength is a whole multiple of the cluster
+     * size. alloc_cluster has already made its FAT entry end-of-chain.
+     */
+    if (alloc_cluster(fs, &cl) != 0) {
+        return -1;
+    }
+    bzero(zero, SECSZ);
+    for (s = 0; s < fs->spc; s++) {
+        if (fs->write(fs->ctx, clba(fs, cl) + s, 1u, zero) != 0) {
+            return -1;
+        }
+    }
+
+    hype_exfat_file_entry(entries, HYPE_EXFAT_ATTR_DIRECTORY, (uint8_t)(need - 1u), &fs->now);
+    hype_exfat_stream_entry(entries + ENTSZ, nlen, hash, cluster_bytes(fs), cl, cluster_bytes(fs),
+                            0);
+    return set_place(fs, &dir, ei, entries, chars, nlen, need);
+}
+
+/*
+ * 1 == the directory holds no in-use entry of any type, 0 == something is
+ * still there, -1 on a sector-read failure (which must not read as "empty":
+ * removing a directory that still has entries orphans them). Bounded by the
+ * allocation itself: DataLength for a NoFatChain directory, the FAT chain (with
+ * the usual loop guard) otherwise.
+ */
+static int dir_is_empty(hype_exfat_fs_t *fs, uint32_t first, int contiguous, uint64_t size) {
+    uint64_t cap = contiguous
+                       ? clusters_for(fs, size) * (uint64_t)(fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR)
+                       : (uint64_t)WALK_GUARD;
+    uint64_t ei;
+    for (ei = 0; ei < cap; ei++) {
+        uint8_t sec[SECSZ];
+        uint64_t lba;
+        unsigned int off;
+        if (entry_lba(fs, first, contiguous, (uint32_t)ei, &lba, &off) != 0) {
+            return 1; /* past the end of the allocation */
+        }
+        if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
+            return -1;
+        }
+        if (sec[off] == 0x00u) {
+            return 1; /* end-of-directory marker */
+        }
+        if ((sec[off] & HYPE_EXFAT_ENT_INUSE) != 0u) {
+            return 0;
+        }
+    }
+    return -1; /* the walk guard tripped: never treat a looping chain as empty */
+}
+
+int hype_exfat_rmdir(hype_exfat_fs_t *fs, const char *path) {
+    uint16_t comp[HYPE_EXFAT_MAX_NAME];
+    dirref_t dir;
+    hype_exfat_set_t set;
+    unsigned int leaf, nlen;
+    uint32_t ei = 0;
+
+    if (fs->write == 0) {
+        return -1;
+    }
+    /* The root directory has no final component, so path_split refuses it. */
+    if (path_split(path, &leaf) != 0 || resolve_parent(fs, path, leaf, 0u, &dir) != 0) {
+        return -1;
+    }
+    nlen = leaf_component(path, leaf, comp);
+    if (nlen == 0u) {
+        return -1;
+    }
+    if (dir_find(fs, dir.first, dir.contiguous, comp, nlen, &ei, &set) != 1) {
+        return -1;
+    }
+    if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) == 0u) {
+        return -1;
+    }
+    if (dir_is_empty(fs, set.first_cluster, set.contiguous, set.data_length) != 1) {
+        return -1;
+    }
+    if (mark_dirty(fs) != 0) {
+        return -1;
+    }
+    if (free_allocation(fs, set.first_cluster, set.contiguous, set.data_length) != 0) {
+        return -1;
+    }
+    return set_delete(fs, dir.first, dir.contiguous, ei, set.secondary);
+}
+
+int hype_exfat_rename(hype_exfat_fs_t *fs, const char *from, const char *to) {
+    uint16_t fcomp[HYPE_EXFAT_MAX_NAME];
+    uint16_t tchars[HYPE_EXFAT_MAX_NAME];
+    char leafbuf[HYPE_EXFAT_MAX_NAME + 1u];
+    uint8_t entries[MAX_SET_ENTRIES * ENTSZ];
+    dirref_t fdir, tdir;
+    hype_exfat_set_t fset, tset;
+    unsigned int fleaf, tleaf, fnlen, tnlen, need;
+    uint16_t hash = 0u;
+    uint32_t fei = 0;
+    uint32_t tei = 0;
+    uint32_t forbid = 0;
+
+    if (fs->write == 0) {
+        return -1;
+    }
+    /* The source, which must exist. */
+    if (path_split(from, &fleaf) != 0 || resolve_parent(fs, from, fleaf, 0u, &fdir) != 0) {
+        return -1;
+    }
+    fnlen = leaf_component(from, fleaf, fcomp);
+    if (fnlen == 0u) {
+        return -1;
+    }
+    if (dir_find(fs, fdir.first, fdir.contiguous, fcomp, fnlen, &fei, &fset) != 1) {
+        return -1;
+    }
+    /*
+     * The destination parent, which must not be reached THROUGH the source: a
+     * directory moved into its own subtree becomes an unreachable cycle. Every
+     * directory on the destination walk is checked against the source's first
+     * cluster, which is exactly the set of ancestors the target would have.
+     */
+    if ((fset.attributes & HYPE_EXFAT_ATTR_DIRECTORY) != 0u) {
+        forbid = fset.first_cluster;
+    }
+    if (path_split(to, &tleaf) != 0 || leaf_string(to, tleaf, leafbuf, sizeof leafbuf) != 0) {
+        return -1;
+    }
+    if (resolve_parent(fs, to, tleaf, forbid, &tdir) != 0) {
+        return -1;
+    }
+    if (name_prepare(fs, leafbuf, tchars, &tnlen, &hash) != 0) {
+        return -1;
+    }
+    /* Rename never replaces. NOTE this also refuses a pure case change of the
+     * same name -- the case-insensitive search finds the source itself. */
+    if (dir_find(fs, tdir.first, tdir.contiguous, tchars, tnlen, &tei, &tset) != 0) {
+        return -1;
+    }
+    need = 2u + (tnlen + HYPE_EXFAT_NAME_CHARS_PER_ENTRY - 1u) / HYPE_EXFAT_NAME_CHARS_PER_ENTRY;
+
+    if (mark_dirty(fs) != 0) {
+        return -1;
+    }
+    /*
+     * The original File entry carries the attributes and timestamps, which a
+     * rename preserves; only its SecondaryCount (the name may need a different
+     * number of entries) and checksum change. The Stream entry is rebuilt
+     * around the SAME allocation -- ValidDataLength included, which append never
+     * leaves short but another writer may have.
+     */
+    if (entry_read(fs, fdir.first, fdir.contiguous, fei, entries) != 0) {
+        return -1;
+    }
+    entries[1] = (uint8_t)(need - 1u);
+    entries[2] = 0u;
+    entries[3] = 0u;
+    hype_exfat_stream_entry(entries + ENTSZ, tnlen, hash, fset.valid_length, fset.first_cluster,
+                            fset.data_length, fset.contiguous ? 1 : 0);
+    /* The new set is written before the old one is retired, so an interruption
+     * leaves the entry findable under at least one of its names. Growing the
+     * destination directory never moves existing entries, so the source set's
+     * index stays valid even when both are the same directory. */
+    if (dir_find_slots(fs, &tdir, need, &tei) != 0) {
+        return -1;
+    }
+    if (set_place(fs, &tdir, tei, entries, tchars, tnlen, need) != 0) {
+        return -1;
+    }
+    return set_delete(fs, fdir.first, fdir.contiguous, fei, fset.secondary);
 }
 
 /* ---- data access ---- */

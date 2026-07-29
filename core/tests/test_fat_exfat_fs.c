@@ -998,6 +998,328 @@ static void test_recreate_odd_shaped_set(void) {
     CHECK_HEX("new set size", 3ull, f.size);
 }
 
+/* ---- #246: unlink, mkdir, rmdir, rename, arbitrary-parent create ---- */
+
+static void test_unlink(void) {
+    hype_exfat_wfile_t f;
+    unsigned k;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create ok", 0, hype_exfat_create(&g_fs, "dead.dat", &f));
+    CHECK_HEX("append ok", 0, hype_exfat_append(&f, "0123456789", 10u));
+    CHECK_HEX("unlink ok", 0, hype_exfat_unlink(&g_fs, "\\dead.dat"));
+    CHECK_HEX("name no longer resolves", -1, hype_exfat_lookup(&g_fs, "\\dead.dat", 0, &f));
+    CHECK_HEX("data cluster freed", 0, bit_used(5u));
+    CHECK_HEX("FAT entry cleared", 0u, fat_get(5u));
+    /* EVERY entry of the set is retired, not only the primary. */
+    for (k = 0; k < 3u; k++) {
+        CHECK_HEX("set entry retired", 0u,
+                  cluster(ROOT_CL)[(3u + k) * 32u] & HYPE_EXFAT_ENT_INUSE);
+    }
+    CHECK_HEX("only the fixture clusters remain", 3u, used_count());
+    CHECK_HEX("unlinking it again fails", -1, hype_exfat_unlink(&g_fs, "\\dead.dat"));
+    CHECK_HEX("unlinking a missing name fails", -1, hype_exfat_unlink(&g_fs, "\\ghost.dat"));
+    CHECK_HEX("unlinking the root fails", -1, hype_exfat_unlink(&g_fs, "\\"));
+
+    /* A NoFatChain (contiguous) file: its clusters have no FAT chain, so the
+     * free walk must come from its DataLength. */
+    build_vol_with_files();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("unlink a contiguous file", 0, hype_exfat_unlink(&g_fs, "\\image.img"));
+    CHECK_HEX("contiguous cluster 10 freed", 0, bit_used(10u));
+    CHECK_HEX("contiguous cluster 11 freed", 0, bit_used(11u));
+    CHECK_HEX("contiguous cluster 12 freed", 0, bit_used(12u));
+    CHECK_HEX("gone from the directory", -1, hype_exfat_lookup(&g_fs, "\\image.img", 0, &f));
+    /* Inside a subdirectory, by path. */
+    CHECK_HEX("unlink in a subdirectory", 0, hype_exfat_unlink(&g_fs, "\\subdir\\deep.bin"));
+    CHECK_HEX("deep.bin clusters freed", 0, bit_used(30u));
+    CHECK_HEX("deep.bin chain freed", 0, bit_used(32u));
+    /* A directory is not a file. */
+    CHECK_HEX("unlink refuses a directory", -1, hype_exfat_unlink(&g_fs, "\\subdir"));
+    CHECK_HEX("the directory survived", 0, hype_exfat_lookup(&g_fs, "\\subdir", 1, &f));
+}
+
+static void test_mkdir(void) {
+    hype_exfat_wfile_t f;
+    uint32_t dcl;
+    unsigned i;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("mkdir ok", 0, hype_exfat_mkdir(&g_fs, "\\d1"));
+    CHECK_HEX("resolves as a directory", 0, hype_exfat_lookup(&g_fs, "\\d1", 1, &f));
+    CHECK_HEX("directory attribute", 1u, f.is_dir);
+    CHECK_HEX("one whole cluster", (uint64_t)SECSZ, f.size);
+    dcl = f.first_cluster;
+    CHECK("a cluster was allocated", dcl >= 5u);
+    CHECK_HEX("its bitmap bit is set", 1, bit_used(dcl));
+    CHECK_HEX("its FAT entry is end-of-chain", 0xFFFFFFFFu, fat_get(dcl));
+    /* The cluster must be all zero -- no '.'/'..', and garbage would misparse. */
+    for (i = 0; i < SECSZ; i++) {
+        if (cluster(dcl)[i] != 0u) { CHECK("new directory cluster zeroed", 0); break; }
+    }
+    /* Creating a file inside it: the arbitrary-parent create path. */
+    CHECK_HEX("create in the new directory", 0, hype_exfat_create(&g_fs, "\\d1\\note.txt", &f));
+    CHECK_HEX("append there", 0, hype_exfat_append(&f, "hello", 5u));
+    CHECK_HEX("path resolves", 0, hype_exfat_lookup(&g_fs, "\\d1\\note.txt", 0, &f));
+    CHECK_HEX("its size", 5ull, f.size);
+    /* Nested directories. */
+    CHECK_HEX("nested mkdir", 0, hype_exfat_mkdir(&g_fs, "\\d1\\d2"));
+    CHECK_HEX("nested path resolves", 0, hype_exfat_lookup(&g_fs, "\\d1\\d2", 1, &f));
+    CHECK_HEX("create two levels down", 0, hype_exfat_create(&g_fs, "\\d1\\d2\\deep.txt", &f));
+    CHECK_HEX("truncate two levels down", 0, hype_exfat_create(&g_fs, "\\d1\\d2\\deep.txt", &f));
+    /* Refusals. */
+    CHECK_HEX("mkdir over a directory", -1, hype_exfat_mkdir(&g_fs, "\\d1"));
+    CHECK_HEX("mkdir over a file", -1, hype_exfat_mkdir(&g_fs, "\\d1\\note.txt"));
+    CHECK_HEX("mkdir under a missing parent", -1, hype_exfat_mkdir(&g_fs, "\\nope\\d3"));
+    CHECK_HEX("mkdir under a file", -1, hype_exfat_mkdir(&g_fs, "\\d1\\note.txt\\d3"));
+    CHECK_HEX("mkdir of the root", -1, hype_exfat_mkdir(&g_fs, "\\"));
+    CHECK_HEX("mkdir with a bad name", -1, hype_exfat_mkdir(&g_fs, "\\d?1"));
+    /* A trailing separator is accepted. */
+    CHECK_HEX("mkdir with a trailing separator", 0, hype_exfat_mkdir(&g_fs, "\\d1\\d3\\"));
+    CHECK_HEX("it resolves", 0, hype_exfat_lookup(&g_fs, "\\d1\\d3", 1, &f));
+}
+
+static void test_rmdir(void) {
+    hype_exfat_wfile_t f;
+    uint32_t dcl;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("mkdir ok", 0, hype_exfat_mkdir(&g_fs, "\\d1"));
+    CHECK_HEX("lookup ok", 0, hype_exfat_lookup(&g_fs, "\\d1", 1, &f));
+    dcl = f.first_cluster;
+    CHECK_HEX("create inside", 0, hype_exfat_create(&g_fs, "\\d1\\a.txt", &f));
+    /* Not empty: refused, and nothing was freed. */
+    CHECK_HEX("rmdir refuses a non-empty directory", -1, hype_exfat_rmdir(&g_fs, "\\d1"));
+    CHECK_HEX("directory still there", 0, hype_exfat_lookup(&g_fs, "\\d1", 1, &f));
+    CHECK_HEX("its content still there", 0, hype_exfat_lookup(&g_fs, "\\d1\\a.txt", 0, &f));
+    /* Empty it, then remove it. */
+    CHECK_HEX("unlink the content", 0, hype_exfat_unlink(&g_fs, "\\d1\\a.txt"));
+    CHECK_HEX("rmdir ok once empty", 0, hype_exfat_rmdir(&g_fs, "\\d1"));
+    CHECK_HEX("gone", -1, hype_exfat_lookup(&g_fs, "\\d1", 1, &f));
+    CHECK_HEX("its cluster freed", 0, bit_used(dcl));
+    CHECK_HEX("its FAT entry cleared", 0u, fat_get(dcl));
+    CHECK_HEX("only the fixture clusters remain", 3u, used_count());
+    /* Refusals. */
+    CHECK_HEX("rmdir of a missing name", -1, hype_exfat_rmdir(&g_fs, "\\d1"));
+    CHECK_HEX("rmdir of the root", -1, hype_exfat_rmdir(&g_fs, "\\"));
+    build_vol_with_files();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("rmdir of a file", -1, hype_exfat_rmdir(&g_fs, "\\image.img"));
+    CHECK_HEX("rmdir of a populated fixture directory", -1, hype_exfat_rmdir(&g_fs, "\\subdir"));
+    /* cdir's first cluster holds only DELETED entries and its second holds one
+     * deleted set and one live one: still not empty. */
+    CHECK_HEX("in-use entry behind deleted ones still counts", -1,
+              hype_exfat_rmdir(&g_fs, "\\cdir"));
+    /* Once that last live set is gone, a CONTIGUOUS directory can be removed --
+     * freeing has to come from DataLength, there is no FAT chain. But not yet:
+     * the fixture "deleted" gone.bin the sloppy way, clearing InUse only on the
+     * File entry, so its 0xC0/0xC1 secondaries are still in-use orphans -- and
+     * ANY in-use entry, orphan or not, keeps a directory non-empty. */
+    CHECK_HEX("unlink cdir's live file", 0, hype_exfat_unlink(&g_fs, "\\cdir\\inner.bin"));
+    CHECK_HEX("orphan in-use secondaries still count", -1, hype_exfat_rmdir(&g_fs, "\\cdir"));
+    cluster(41u)[1 * 32u] &= (uint8_t)~(uint8_t)HYPE_EXFAT_ENT_INUSE;
+    cluster(41u)[2 * 32u] &= (uint8_t)~(uint8_t)HYPE_EXFAT_ENT_INUSE;
+    CHECK_HEX("rmdir of the contiguous directory", 0, hype_exfat_rmdir(&g_fs, "\\cdir"));
+    CHECK_HEX("cdir cluster 40 freed", 0, bit_used(40u));
+    CHECK_HEX("cdir cluster 41 freed", 0, bit_used(41u));
+}
+
+static void test_rename(void) {
+    hype_exfat_wfile_t f;
+    static uint8_t back[16];
+    uint32_t old_first;
+    uint32_t old_index;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create ok", 0, hype_exfat_create(&g_fs, "a-name-of-twenty-chs", &f));
+    CHECK_HEX("two name entries", 3u, f.secondary);
+    CHECK_HEX("append ok", 0, hype_exfat_append(&f, "payload!", 8u));
+    old_first = f.first_cluster;
+
+    /* SHRINK: 20 chars -> 5 chars drops a name entry. */
+    CHECK_HEX("rename shrinking the name", 0,
+              hype_exfat_rename(&g_fs, "\\a-name-of-twenty-chs", "\\s.txt"));
+    CHECK_HEX("old name gone", -1, hype_exfat_lookup(&g_fs, "\\a-name-of-twenty-chs", 0, &f));
+    CHECK_HEX("new name resolves", 0, hype_exfat_lookup(&g_fs, "\\s.txt", 0, &f));
+    CHECK_HEX("one name entry now", 2u, f.secondary);
+    CHECK_HEX("same allocation", old_first, f.first_cluster);
+    CHECK_HEX("same size", 8ull, f.size);
+    CHECK_HEX("read the data back", 0, hype_exfat_read_at(&f, 0u, back, 8u));
+    CHECK("content preserved", memcmp(back, "payload!", 8) == 0);
+    verify_set("renamed (shrunk)", f.set_index, "s.txt", old_first, 8u, 0);
+
+    /* GROW: 5 chars -> 40 chars needs three name entries. */
+    CHECK_HEX("rename growing the name", 0,
+              hype_exfat_rename(&g_fs, "\\s.txt", "\\a-considerably-longer-name-40-chars.dat"));
+    CHECK_HEX("grown name resolves", 0,
+              hype_exfat_lookup(&g_fs, "\\a-considerably-longer-name-40-chars.dat", 0, &f));
+    CHECK_HEX("three name entries", 4u, f.secondary);
+    CHECK_HEX("allocation still the same", old_first, f.first_cluster);
+    verify_set("renamed (grown)", f.set_index, "a-considerably-longer-name-40-chars.dat",
+               old_first, 8u, 0);
+
+    /* Refusals. */
+    CHECK_HEX("create a bystander", 0, hype_exfat_create(&g_fs, "other.txt", &f));
+    CHECK_HEX("rename onto an existing name", -1,
+              hype_exfat_rename(&g_fs, "\\other.txt", "\\a-considerably-longer-name-40-chars.dat"));
+    CHECK_HEX("rename of a missing source", -1, hype_exfat_rename(&g_fs, "\\nope", "\\x"));
+    CHECK_HEX("case-only rename is 'exists'", -1,
+              hype_exfat_rename(&g_fs, "\\other.txt", "\\OTHER.TXT"));
+    CHECK_HEX("rename to a bad name", -1, hype_exfat_rename(&g_fs, "\\other.txt", "\\o<o"));
+    CHECK_HEX("rename to a missing parent", -1,
+              hype_exfat_rename(&g_fs, "\\other.txt", "\\nodir\\o.txt"));
+    CHECK_HEX("rename of the root", -1, hype_exfat_rename(&g_fs, "\\", "\\r"));
+
+    /* MOVE across directories, including a directory itself. */
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("mkdir d1", 0, hype_exfat_mkdir(&g_fs, "\\d1"));
+    CHECK_HEX("mkdir d1/d2", 0, hype_exfat_mkdir(&g_fs, "\\d1\\d2"));
+    CHECK_HEX("create f.dat", 0, hype_exfat_create(&g_fs, "\\f.dat", &f));
+    CHECK_HEX("append", 0, hype_exfat_append(&f, "moved-data", 10u));
+    old_first = f.first_cluster;
+    CHECK_HEX("move a file into a subdirectory", 0,
+              hype_exfat_rename(&g_fs, "\\f.dat", "\\d1\\d2\\f.dat"));
+    CHECK_HEX("old path gone", -1, hype_exfat_lookup(&g_fs, "\\f.dat", 0, &f));
+    CHECK_HEX("new path resolves", 0, hype_exfat_lookup(&g_fs, "\\d1\\d2\\f.dat", 0, &f));
+    CHECK_HEX("allocation moved with it", old_first, f.first_cluster);
+    CHECK_HEX("read at the new path", 0, hype_exfat_read_at(&f, 0u, back, 10u));
+    CHECK("content intact after the move", memcmp(back, "moved-data", 10) == 0);
+    /* Renaming a directory keeps its children reachable. */
+    CHECK_HEX("rename the directory", 0, hype_exfat_rename(&g_fs, "\\d1", "\\dx"));
+    CHECK_HEX("children reachable under the new name", 0,
+              hype_exfat_lookup(&g_fs, "\\dx\\d2\\f.dat", 0, &f));
+    CHECK_HEX("old directory name gone", -1, hype_exfat_lookup(&g_fs, "\\d1", 1, &f));
+    /* A directory cannot be moved into itself or its own subtree. */
+    CHECK_HEX("move into itself", -1, hype_exfat_rename(&g_fs, "\\dx", "\\dx\\sub"));
+    CHECK_HEX("move into a descendant", -1, hype_exfat_rename(&g_fs, "\\dx", "\\dx\\d2\\sub"));
+    CHECK_HEX("the directory survived the refusals", 0, hype_exfat_lookup(&g_fs, "\\dx", 1, &f));
+    /* Moving a directory ELSEWHERE is fine (the forbid check must not misfire). */
+    CHECK_HEX("mkdir target", 0, hype_exfat_mkdir(&g_fs, "\\elsewhere"));
+    CHECK_HEX("move a directory sideways", 0,
+              hype_exfat_rename(&g_fs, "\\dx\\d2", "\\elsewhere\\d2"));
+    CHECK_HEX("its file came along", 0, hype_exfat_lookup(&g_fs, "\\elsewhere\\d2\\f.dat", 0, &f));
+
+    /* A NoFatChain file keeps its flag and its ValidDataLength through a rename. */
+    build_vol_with_files();
+    /* Hand-shorten image.img's ValidDataLength so it differs from DataLength. */
+    put64(cluster(ROOT_CL) + 96 + 32 + 8, 1000u);
+    put16(cluster(ROOT_CL) + 96 + 2, ref_set_checksum(cluster(ROOT_CL) + 96, 3u * 32u));
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("rename the contiguous file", 0,
+              hype_exfat_rename(&g_fs, "\\image.img", "\\renamed.img"));
+    CHECK_HEX("resolves", 0, hype_exfat_lookup(&g_fs, "\\renamed.img", 0, &f));
+    CHECK_HEX("still contiguous", 1u, f.contiguous);
+    CHECK_HEX("DataLength preserved", 1400ull, f.size);
+    {
+        /* ValidDataLength is not surfaced by the handle: check the raw set. */
+        uint8_t *stream = cluster(ROOT_CL) + (f.set_index + 1u) * 32u;
+        CHECK_HEX("ValidDataLength preserved", 1000ull, get64(stream + 8));
+        CHECK_HEX("NoFatChain flag preserved", 0x03u, stream[1]);
+    }
+
+    /* A rename that cannot fit in the directory's current allocation forces the
+     * new set into a grown cluster: the set MOVES. */
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create tiny", 0, hype_exfat_create(&g_fs, "t", &f));
+    old_index = f.set_index;
+    /* Fill the rest of the root's first cluster: 3 fixture + 3 for "t" leaves
+     * 10 slots; three 3-entry files leave 1, so a 4-entry replacement set for
+     * "t" cannot fit anywhere in the first cluster. */
+    CHECK_HEX("filler 1", 0, hype_exfat_create(&g_fs, "fill1.bin", &f));
+    CHECK_HEX("filler 2", 0, hype_exfat_create(&g_fs, "fill2.bin", &f));
+    CHECK_HEX("filler 3", 0, hype_exfat_create(&g_fs, "fill3.bin", &f));
+    CHECK_HEX("rename into a moved set", 0,
+              hype_exfat_rename(&g_fs, "\\t", "\\a-name-long-enough-for-two-entries"));
+    CHECK_HEX("moved set resolves", 0,
+              hype_exfat_lookup(&g_fs, "\\a-name-long-enough-for-two-entries", 0, &f));
+    CHECK("the set landed at a new index", f.set_index != old_index);
+    CHECK("the root grew a second cluster", fat_get(ROOT_CL) >= 2u && fat_get(ROOT_CL) < 0xFFFFFFF8u);
+    CHECK_HEX("the old slot was retired", 0u,
+              cluster(ROOT_CL)[old_index * 32u] & HYPE_EXFAT_ENT_INUSE);
+}
+
+/* Growing a SUBdirectory must update its DataLength in its own entry set in the
+ * parent -- the root, which the old growth path handled, has no such set. */
+static void test_subdir_growth(void) {
+    hype_exfat_wfile_t f;
+    char path[32];
+    unsigned i;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("mkdir d1", 0, hype_exfat_mkdir(&g_fs, "\\d1"));
+    CHECK_HEX("fresh directory DataLength", 0, hype_exfat_lookup(&g_fs, "\\d1", 1, &f));
+    CHECK_HEX("one cluster", (uint64_t)SECSZ, f.size);
+    /* 16 entries per cluster, 3 per file: the 6th create must grow d1. */
+    for (i = 0; i < 9u; i++) {
+        snprintf(path, sizeof path, "\\d1\\f%u.dat", i);
+        CHECK_HEX("create in d1", 0, hype_exfat_create(&g_fs, path, &f));
+        CHECK_HEX("append in d1", 0, hype_exfat_append(&f, path, (unsigned)strlen(path)));
+    }
+    /* The lookup goes through set_read, so a stale checksum in d1's entry set
+     * would fail here -- this asserts DataLength AND the recomputed checksum. */
+    CHECK_HEX("d1 still resolves", 0, hype_exfat_lookup(&g_fs, "\\d1", 1, &f));
+    CHECK_HEX("d1 grew to two clusters", (uint64_t)(2u * SECSZ), f.size);
+    CHECK("d1's chain extended", fat_get(f.first_cluster) >= 2u &&
+                                     fat_get(f.first_cluster) < 0xFFFFFFF8u);
+    /* Every file is still reachable, including those past the cluster seam. */
+    for (i = 0; i < 9u; i++) {
+        snprintf(path, sizeof path, "\\d1\\f%u.dat", i);
+        CHECK_HEX("file findable after subdir growth", 0, hype_exfat_lookup(&g_fs, path, 0, &f));
+        CHECK_HEX("its size", strlen(path), f.size);
+    }
+}
+
+/* Growing a CONTIGUOUS (NoFatChain) subdirectory: the chain must be materialised
+ * in the FAT first, and BOTH the flag flip and the new DataLength must land in
+ * the directory's entry set in the parent. */
+static void test_contiguous_subdir_growth(void) {
+    hype_exfat_wfile_t f;
+    char path[32];
+    unsigned i;
+
+    build_vol_with_files();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("cdir starts contiguous", 0, hype_exfat_lookup(&g_fs, "\\cdir", 1, &f));
+    CHECK_HEX("cdir NoFatChain", 1u, f.contiguous);
+    /* mkdir inside a contiguous directory works too. */
+    CHECK_HEX("mkdir inside cdir", 0, hype_exfat_mkdir(&g_fs, "\\cdir\\sub"));
+    /* cdir has 32 slots; ~22 are free-ish. Ten more files force a grow. */
+    for (i = 0; i < 10u; i++) {
+        snprintf(path, sizeof path, "\\cdir\\g%u.dat", i);
+        CHECK_HEX("create in cdir", 0, hype_exfat_create(&g_fs, path, &f));
+    }
+    CHECK_HEX("cdir still resolves", 0, hype_exfat_lookup(&g_fs, "\\cdir", 1, &f));
+    CHECK_HEX("cdir is now FAT-chained", 0u, f.contiguous);
+    CHECK_HEX("cdir grew to three clusters", (uint64_t)(3u * SECSZ), f.size);
+    CHECK_HEX("materialised link 40 -> 41", 41u, fat_get(40u));
+    CHECK("cluster 41 links to the grown cluster", fat_get(41u) >= 2u &&
+                                                       fat_get(41u) < 0xFFFFFFF8u);
+    /* Everything in it is still reachable -- the original file included. */
+    CHECK_HEX("original file still reachable", 0,
+              hype_exfat_lookup(&g_fs, "\\cdir\\inner.bin", 0, &f));
+    CHECK_HEX("mkdir'd sub still reachable", 0, hype_exfat_lookup(&g_fs, "\\cdir\\sub", 1, &f));
+    for (i = 0; i < 10u; i++) {
+        snprintf(path, sizeof path, "\\cdir\\g%u.dat", i);
+        CHECK_HEX("created file still reachable", 0, hype_exfat_lookup(&g_fs, path, 0, &f));
+    }
+}
+
+static void test_dir_ops_read_only(void) {
+    build_vol_with_files();
+    CHECK_HEX("read-only mount", 0, hype_exfat_fs_mount(vol_read, 0, 0, &g_fs));
+    CHECK_HEX("unlink refused", -1, hype_exfat_unlink(&g_fs, "\\image.img"));
+    CHECK_HEX("mkdir refused", -1, hype_exfat_mkdir(&g_fs, "\\d1"));
+    CHECK_HEX("rmdir refused", -1, hype_exfat_rmdir(&g_fs, "\\subdir"));
+    CHECK_HEX("rename refused", -1, hype_exfat_rename(&g_fs, "\\image.img", "\\x.img"));
+}
+
 /*
  * Sweep an injected I/O failure across every operation of a full lifecycle. The
  * results are intentionally ignored: the point is that no ordering of failures
@@ -1014,12 +1336,19 @@ static void run_cycle(void) {
     (void)hype_exfat_read_at(&f, 100u, buf, 900u);
     (void)hype_exfat_lookup(&g_fs, "\\sweep.log", 0, &f);
     (void)hype_exfat_create(&g_fs, "sweep.log", &f); /* truncate path */
+    (void)hype_exfat_mkdir(&g_fs, "swpdir");
+    (void)hype_exfat_create(&g_fs, "\\swpdir\\in.dat", &f);
+    (void)hype_exfat_rename(&g_fs, "\\swpdir\\in.dat", "\\swpdir\\longer-renamed-name.dat");
+    (void)hype_exfat_rename(&g_fs, "\\sweep.log", "\\swpdir\\sweep.log");
+    (void)hype_exfat_unlink(&g_fs, "\\swpdir\\longer-renamed-name.dat");
+    (void)hype_exfat_unlink(&g_fs, "\\swpdir\\sweep.log");
+    (void)hype_exfat_rmdir(&g_fs, "\\swpdir");
     (void)hype_exfat_fs_sync(&g_fs);
 }
 
 static void test_fault_sweep(void) {
     long k;
-    for (k = 0; k < 220; k++) {
+    for (k = 0; k < 520; k++) {
         build_vol();
         g_read_countdown = k;
         g_write_countdown = -1;
@@ -1031,7 +1360,7 @@ static void test_fault_sweep(void) {
     }
     /* Same sweep over a volume that already holds files, so the lookup,
      * contiguous-grow and free-chain legs are exercised under failure too. */
-    for (k = 0; k < 200; k++) {
+    for (k = 0; k < 420; k++) {
         hype_exfat_wfile_t f;
         static uint8_t buf[900];
         int pass;
@@ -1049,6 +1378,9 @@ static void test_fault_sweep(void) {
             (void)hype_exfat_append(&f, buf, sizeof buf);
             /* Truncating image.img exercises freeing a CONTIGUOUS allocation. */
             (void)hype_exfat_create(&g_fs, "image.img", &f);
+            (void)hype_exfat_rename(&g_fs, "\\subdir\\deep.bin", "\\cdir\\deep.bin");
+            (void)hype_exfat_unlink(&g_fs, "\\cdir\\inner.bin");
+            (void)hype_exfat_rmdir(&g_fs, "\\subdir");
         }
     }
     g_read_countdown = -1;
@@ -1411,6 +1743,13 @@ int main(void) {
     test_volume_full();
     test_read_only_mount();
     test_recreate_odd_shaped_set();
+    test_unlink();
+    test_mkdir();
+    test_rmdir();
+    test_rename();
+    test_subdir_growth();
+    test_contiguous_subdir_growth();
+    test_dir_ops_read_only();
     test_io_failures();
     test_fault_sweep();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
