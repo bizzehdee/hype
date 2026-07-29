@@ -27,7 +27,21 @@ void hype_wait_for_interrupt(void) {
  */
 __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
     static volatile int in_panic = 0;
-    char msg[192];
+    /*
+     * #238 step 2: the panic message was cut at 191 chars too (the enriched
+     * "undecodable MMIO" record ended at cr4=0x660 with its last four fields
+     * missing). Raised to 512, but as a STATIC buffer, not a bigger stack
+     * frame: a panic often fires exactly when the active stack is nearly
+     * exhausted or corrupt (the i5-13420H storm described below ended in a
+     * Double Fault as the stack ran out), so the panic path should need
+     * LESS stack than before, not 320 bytes more. Single-writer safety
+     * comes from the in_panic latch -- made a real atomic exchange below,
+     * closing the two-cores-panic-simultaneously race the plain check had.
+     * A side benefit: the message survives in a known static location for
+     * post-mortem RAM inspection.
+     */
+    static char msg[512];
+    int n;
     va_list ap;
     hype_gop_console_t *gop;
 
@@ -51,14 +65,17 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
     __asm__ volatile("cli"); /* inline, like hype_halt_forever's hlt -- keeps the
                               * panic path free of any dependency that could
                               * itself be the thing that is broken. */
-    if (in_panic) {
+    /* Atomic exchange, not check-then-set: two CORES panicking in the same
+     * instant must not both pass the latch -- with `msg` now static, a second
+     * writer would garble the first (and only) message that matters. */
+    if (__atomic_exchange_n(&in_panic, 1, __ATOMIC_ACQ_REL)) {
         hype_halt_forever();
     }
-    in_panic = 1;
 
     va_start(ap, fmt);
-    hype_vsnprintf(msg, sizeof(msg), fmt, ap);
+    n = hype_vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    (void)hype_format_mark_truncated(msg, sizeof(msg), n);
 
     hype_serial_print("PANIC: %s\n", msg);
     /* Capture the panic in the console log, then flush it to disk (if a
