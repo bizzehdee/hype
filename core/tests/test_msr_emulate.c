@@ -45,7 +45,44 @@ static void test_apic_base_value(void) {
     CHECK_HEX("x2APIC bit clear", 0, (value & (1ULL << 10)) != 0);
 }
 
+/*
+ * #251: FS/GS base are read/write BOTH ways, unlike APIC_BASE and TSC. Rejecting
+ * the write is what left a 64-bit guest with no usable GS base, faulting on the
+ * kernel's first `MOV RAX, GS:[0x28]`.
+ */
+static void test_fs_gs_base_readwrite(void) {
+    CHECK_HEX("FS_BASE read", HYPE_MSR_ACTION_READWRITE_FS_BASE,
+              hype_msr_decide(0xC0000100u, 0));
+    CHECK_HEX("FS_BASE write", HYPE_MSR_ACTION_READWRITE_FS_BASE,
+              hype_msr_decide(0xC0000100u, 1));
+    CHECK_HEX("GS_BASE read", HYPE_MSR_ACTION_READWRITE_GS_BASE,
+              hype_msr_decide(0xC0000101u, 0));
+    CHECK_HEX("GS_BASE write", HYPE_MSR_ACTION_READWRITE_GS_BASE,
+              hype_msr_decide(0xC0000101u, 1));
+}
+
+static void test_fs_gs_base_are_distinct_actions(void) {
+    /* One action for both would force the caller to re-decode the MSR number to
+     * pick a VMCS field -- exactly the kind of duplicated decision this module
+     * exists to remove. */
+    CHECK_HEX("FS_BASE action differs from GS_BASE", 1,
+              (unsigned)(hype_msr_decide(0xC0000100u, 1) != hype_msr_decide(0xC0000101u, 1)));
+}
+
+static void test_kernel_gs_base_still_rejected(void) {
+    /* IA32_KERNEL_GS_BASE (0xC0000102) is deliberately NOT modelled: it has no
+     * VMCS field, and SWAPGS does not exit, so a value captured at WRMSR time
+     * would be wrong the moment the guest swaps. It needs the MSR-load/store
+     * areas instead -- until then it must stay absorbed, not silently mapped
+     * onto GS_BASE. */
+    CHECK_HEX("KERNEL_GS_BASE not modelled yet", HYPE_MSR_ACTION_REJECT,
+              hype_msr_decide(0xC0000102u, 1));
+}
+
 int main(void) {
+    test_fs_gs_base_readwrite();
+    test_fs_gs_base_are_distinct_actions();
+    test_kernel_gs_base_still_rejected();
     test_apic_base_read_allowed();
     test_apic_base_write_rejected();
     test_efer_read_and_write_allowed();

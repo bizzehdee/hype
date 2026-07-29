@@ -147,6 +147,16 @@
 /* CR0.PG. Host-owned (#248) so hype sees the guest enabling/disabling paging and
  * can keep EFER.LMA and the IA-32e-mode-guest entry control in step with it. */
 #define HYPE_VMX_CR0_PG (1ull << 31)
+/*
+ * A usable flat data-segment AR byte (#251): P=1, DPL=0, S=1, type=3
+ * (data, read/write, accessed), D/B=1, G=1 -- and crucially WITHOUT bit 16, the
+ * "unusable" bit. hype's real-mode segment setup leaves FS/GS/SS unusable
+ * (measured gs_ar=0x1c000), and an access through an unusable segment raises
+ * #GP(0) no matter what its base holds.
+ */
+#define HYPE_VMX_AR_DATA_USABLE 0xC093u
+/* The unusable bit itself, for reading such a field back. */
+#define HYPE_VMX_AR_UNUSABLE (1u << 16)
 
 /* 16-bit fields (Table B-2/B-3). */
 #define HYPE_VMCS_GUEST_ES_SELECTOR 0x0800u

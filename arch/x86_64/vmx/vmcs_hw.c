@@ -57,6 +57,7 @@ static int g_vmx_ack_intr_on_exit = 0;
 /* #248: defined next to the CR-access handler, but the EFER WRMSR path above it
  * needs it too -- either of CR0.PG and EFER.LME changing can flip long mode. */
 static void vmx_sync_long_mode(void);
+static void vmx_make_fs_gs_usable(void);
 
 /* #248: the VM-entry-controls capability MSR, cached at VMCS setup so a later
  * mode transition can re-adjust the controls instead of writing them raw.
@@ -928,6 +929,31 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
             real->gprs[2] = (uint64_t)(uint32_t)(efer >> 32);
         }
         break;
+    /*
+     * #251: apply the guest's FS/GS base to the VMCS field that actually takes
+     * effect. Absorbing these writes is what left a long-mode guest faulting on
+     * its first `MOV RAX, GS:[0x28]`.
+     */
+    case HYPE_MSR_ACTION_READWRITE_FS_BASE:
+    case HYPE_MSR_ACTION_READWRITE_GS_BASE: {
+        uint64_t field = (action == HYPE_MSR_ACTION_READWRITE_FS_BASE)
+                             ? HYPE_VMCS_GUEST_FS_BASE
+                             : HYPE_VMCS_GUEST_GS_BASE;
+        if (is_write) {
+            uint64_t value =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+            vmwrite(field, value);
+            /* A base is only usable if the segment itself is: hype set FS/GS up
+             * for a real-mode guest and marked them unusable, and an access
+             * through an unusable segment raises #GP(0) whatever the base says. */
+            vmx_make_fs_gs_usable();
+        } else {
+            uint64_t base = vmread(field, &ok);
+            real->gprs[0] = (uint64_t)(uint32_t)base;
+            real->gprs[2] = (uint64_t)(uint32_t)(base >> 32);
+        }
+        break;
+    }
     case HYPE_MSR_ACTION_READ_TSC: {
         uint64_t lo, hi;
         __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
@@ -2430,6 +2456,29 @@ uint32_t hype_vmx_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx) {
  * hardware-maintained, and a guest setting it directly is not something to
  * honour.
  */
+/*
+ * #251: make FS and GS usable data segments.
+ *
+ * hype builds the guest's segments once, for a real-mode guest, and marks FS/GS/SS
+ * UNUSABLE (AR byte bit 16). Nothing revisited them as the guest moved to
+ * protected and then long mode, so the measured state at the kernel's first
+ * per-CPU access was gs_ar=0x1c000 -- unusable, type 0, not present. An access
+ * through an unusable segment raises #GP(0) regardless of its base, which is why
+ * this is a #GP and not the #PF a merely-wrong base would give.
+ *
+ * 0xC093 = present, DPL 0, S=1, type 3 (data, read/write, accessed), D/B, G. In
+ * 64-bit mode the base comes from the MSR and the limit is ignored, but the
+ * descriptor still has to be usable, and VM entry checks the attribute bits
+ * against the selector -- so set a properly-formed descriptor rather than only
+ * clearing bit 16.
+ */
+static void vmx_make_fs_gs_usable(void) {
+    (void)vmwrite(HYPE_VMCS_GUEST_FS_AR_BYTES, HYPE_VMX_AR_DATA_USABLE);
+    (void)vmwrite(HYPE_VMCS_GUEST_GS_AR_BYTES, HYPE_VMX_AR_DATA_USABLE);
+    (void)vmwrite(HYPE_VMCS_GUEST_FS_LIMIT, 0xFFFFFFFFu);
+    (void)vmwrite(HYPE_VMCS_GUEST_GS_LIMIT, 0xFFFFFFFFu);
+}
+
 static void vmx_sync_long_mode(void) {
     int ok;
     uint64_t cr0 = vmread(HYPE_VMCS_GUEST_CR0, &ok);

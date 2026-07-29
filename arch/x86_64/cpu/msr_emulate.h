@@ -29,6 +29,11 @@
 
 #define HYPE_MSR_NUMBER_APIC_BASE 0x1Bu
 #define HYPE_MSR_NUMBER_TSC 0x10u
+/* IA32_FS_BASE / IA32_GS_BASE (#251). Duplicated here rather than pulled from a
+ * backend header, same as HYPE_MSR_NUMBER_EFER above: these are architectural
+ * constants, and this module deliberately depends on nothing. */
+#define HYPE_MSR_NUMBER_FS_BASE 0xC0000100u
+#define HYPE_MSR_NUMBER_GS_BASE 0xC0000101u
 
 typedef enum {
     /* Unknown MSR, or a write to a read-only one -- the caller's job
@@ -43,7 +48,25 @@ typedef enum {
     HYPE_MSR_ACTION_READWRITE_EFER,
     /* Read-only: caller computes real rdtsc() + the VMCB's own
      * tsc_offset control field. */
-    HYPE_MSR_ACTION_READ_TSC
+    HYPE_MSR_ACTION_READ_TSC,
+    /*
+     * Read/write the guest's FS/GS segment base (#251). Distinct actions rather
+     * than one "segment base" action because the two land in different fields and
+     * the caller must not have to re-decode the MSR number to tell them apart.
+     *
+     * These exist because a 64-bit guest addresses per-CPU data through GS, so
+     * absorbing the write is not benign: the Linux kernel's very first
+     * `MOV RAX, GS:[0x28]` (stack canary / per-CPU) faults. AMD never needed them
+     * -- SVM's vmload/vmsave save and restore FS.base/GS.base architecturally --
+     * so on VMX they must be applied to GUEST_FS_BASE/GUEST_GS_BASE by hand.
+     *
+     * IA32_KERNEL_GS_BASE is deliberately NOT here: it has no VMCS field, and
+     * SWAPGS does not cause a VM exit, so a value tracked only at WRMSR time
+     * would be wrong the moment the guest swaps. It needs the VM-entry/exit
+     * MSR-load/store areas or bitmap passthrough instead.
+     */
+    HYPE_MSR_ACTION_READWRITE_FS_BASE,
+    HYPE_MSR_ACTION_READWRITE_GS_BASE
 } hype_msr_action_t;
 
 /*

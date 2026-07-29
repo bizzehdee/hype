@@ -18,6 +18,15 @@ hype_msr_action_t hype_msr_decide(uint32_t msr_number, int is_write) {
     if (msr_number == HYPE_MSR_NUMBER_TSC) {
         return is_write ? HYPE_MSR_ACTION_REJECT : HYPE_MSR_ACTION_READ_TSC;
     }
+    /* #251: read/write BOTH ways. Unlike APIC_BASE and TSC these are genuinely
+     * writable guest state -- rejecting the write is what left a 64-bit guest
+     * with no usable GS base. */
+    if (msr_number == HYPE_MSR_NUMBER_FS_BASE) {
+        return HYPE_MSR_ACTION_READWRITE_FS_BASE;
+    }
+    if (msr_number == HYPE_MSR_NUMBER_GS_BASE) {
+        return HYPE_MSR_ACTION_READWRITE_GS_BASE;
+    }
     return HYPE_MSR_ACTION_REJECT;
 }
 
