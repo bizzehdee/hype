@@ -6138,6 +6138,18 @@ static void hype_panic_persist_tail(void) {
  * TSC Hz at use. ~60s between flash writes bounds wear on a long-idle guest. */
 #define HYPE_NVLOG_WRITE_INTERVAL_SECS 60ull
 
+/*
+ * #239: the USB log stream must NOT share the NV cadence. 60 s exists to bound
+ * SPI-flash wear on the firmware's NV store; a USB stick has no such limit, and
+ * a log that lags a minute behind is nearly useless exactly when the machine
+ * freezes. Worse, it made short runs look like total failures: the 23:26
+ * PERF-2 boot ran 420 s and produced NO \HYPEFULL.LOG, and a 23:42 control run
+ * on an older build produced a log truncated at the pre-EBS backlog -- both
+ * purely because the first USB flush had not come round yet. 3 s keeps a
+ * frozen machine's log within a few lines of the freeze.
+ */
+#define HYPE_USBLOG_WRITE_INTERVAL_SECS 3ull
+
 /* RT-3b: recover the previous run's diagnostic tail from the EFI variable and
  * write it to \hype-diag-prev.txt, then clear the variable so a stale tail
  * can't be mistaken for a fresh one. Best-effort; runs pre-EBS. */
@@ -7730,9 +7742,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                              (unsigned long long)st);
                         }
                     }
-                    /* #230: on the same throttled cadence, stream the log's new
-                     * bytes to \HYPEFULL.LOG on the USB stick (no-op if none). */
-                    usb_log_flush();
+                }
+            }
+            /*
+             * #239: stream to \HYPEFULL.LOG on its OWN, much shorter cadence,
+             * and OUTSIDE the nvlog_disabled gate -- a firmware that refuses a
+             * post-EBS NV SetVariable used to silently stop the USB stream with
+             * it, which is how a healthy run could leave an empty log.
+             */
+            if (g_fw_1_host_tsc_hz != 0) {
+                static uint64_t usblog_last_tsc = 0;
+                uint64_t now_u = hype_rdtsc();
+                uint64_t usb_interval = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_fw_1_host_tsc_hz;
+                if (usblog_last_tsc == 0 || now_u - usblog_last_tsc >= usb_interval) {
+                    usblog_last_tsc = now_u;
+                    usb_log_flush(); /* no-op when no USB sink is open */
                 }
             }
         }
