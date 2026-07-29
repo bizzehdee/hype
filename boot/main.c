@@ -6190,6 +6190,17 @@ static void fw_1_dump_prev_diag(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
  * repaint the panel at ~60 Hz (dashboard on view -1, focused VM's terminal on
  * view >=0). Factored out of the loop so the lifecycle gate can keep the panel
  * live and stats fresh even while this VM's own vCPU is paused/off. */
+/* PERF-2 (#234): the dashboard's diffing-render cache (file-scope so both the
+ * view-switch invalidation and the render below reach it). */
+static hype_vt_render_cache_t g_dash_render_cache;
+
+/* PERF-2 (#234) evidence: how much the diffing renderer actually saves. Before
+ * it, every render redrew cols*rows cells and pushed the whole framebuffer;
+ * RENDERHIST reports what really happened so the win is measured, not assumed. */
+static uint64_t g_render_calls;
+static uint64_t g_render_pushes;
+static uint64_t g_render_cells_drawn;
+
 static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_tsc,
                                     int *term_last_view, uint64_t perf_boot_start_tsc,
                                     uint64_t perf_hlt_wait_tsc, uint64_t total_exits,
@@ -6218,12 +6229,30 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
     int view = g_term_view;
     int is_owner = (vm == &g_vms[0]) && (g_gop_console.fb != (void *)0);
     if (is_owner && view >= 0) {
+        /*
+         * PERF-2 (#234) part 2: render only the cells that CHANGED. The old
+         * unconditional full redraw marked the whole console dirty, so
+         * core/gop.c blitted all 8 MB of (uncached) VRAM on every exit -- the
+         * 56-140 ms/exit that stopped OVMF's DXE ever reaching the installer.
+         * One cache PER VIEW: a shared cache would diff one VM's terminal
+         * against another's leftovers and paint a mixture of the two.
+         */
+        static hype_vt_render_cache_t term_cache[HYPE_FW_MAX_VMS];
         if (*term_last_view != view) {
             hype_gop_console_clear(&g_gop_console);
+            hype_vt_render_cache_invalidate(&term_cache[view]);
             *term_last_view = view;
         }
-        hype_vt_render(&g_vms[view].term, &g_gop_console, 1);
-        hype_debug_flush_gop();
+        {
+            unsigned drawn = hype_vt_render_cached(&g_vms[view].term, &g_gop_console, 1,
+                                                  &term_cache[view]);
+            g_render_cells_drawn += drawn;
+            g_render_calls++;
+            if (drawn != 0u) {
+                g_render_pushes++;
+                hype_debug_flush_gop(); /* only push when something changed */
+            }
+        }
     } else if (is_owner /* dashboard view (-1) */) {
         hype_vm_dash_info_t info[HYPE_FW_MAX_VMS];
         unsigned ninfo = HYPE_TERM_NVMS;
@@ -6239,6 +6268,7 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
         }
         if (*term_last_view != -1) {
             hype_gop_console_clear(&g_gop_console);
+            hype_vt_render_cache_invalidate(&g_dash_render_cache);
             *term_last_view = -1;
         }
         {
@@ -6254,8 +6284,18 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
             hype_dashboard_render(&g_dashboard_term, info, ninfo, vm->stat_uptime_ms / 1000u,
                                   g_cmdline, result_line);
         }
-        hype_vt_render(&g_dashboard_term, &g_gop_console, 0);
-        hype_debug_flush_gop();
+        /* PERF-2 (#234): same diffing treatment for the dashboard. It only
+         * changes when a stat/second ticks, so most frames push nothing. */
+        {
+            unsigned drawn = hype_vt_render_cached(&g_dashboard_term, &g_gop_console, 0,
+                                                  &g_dash_render_cache);
+            g_render_cells_drawn += drawn;
+            g_render_calls++;
+            if (drawn != 0u) {
+                g_render_pushes++;
+                hype_debug_flush_gop();
+            }
+        }
     }
     /* non-owner cores: skip GOP entirely (owner drives the panel). */
 }
@@ -7598,6 +7638,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * and hype filled its pvclock page (the TSC-calibration fix). */
                 hype_debug_print("fw-1 PVCLOCK: arm_count=%u\n",
                                  (unsigned int)g_hype_pvclock_arm_count);
+                /* PERF-2 (#234) evidence: what the diffing renderer saved. A
+                 * full redraw is cols*rows cells AND a whole-framebuffer push,
+                 * every call; pushes<<calls is the win. */
+                hype_debug_print("fw-1 RENDERHIST: calls=%llu pushes=%llu cells_drawn=%llu "
+                                 "(full redraw would be %u cells/call) -- PERF-2\n",
+                                 (unsigned long long)g_render_calls,
+                                 (unsigned long long)g_render_pushes,
+                                 (unsigned long long)g_render_cells_drawn,
+                                 (unsigned int)(g_gop_console.cols * g_gop_console.rows));
                 /* M8-0b: re-emit the AP bring-up result every tick so it survives
                  * in the nvlog tail to login (the one-shot AP-SMOKETEST prints too
                  * early). rc=0 + vmm_ok=1 => the second core came up on real HW. */

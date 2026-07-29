@@ -109,6 +109,108 @@ int main(void) {
     }
 
     free(fb); free(s);
+
+    /* --- PERF-2 (#234) part 2: the DIFFING renderer -------------------- */
+    {
+        unsigned W2 = 80 * 8, H2 = 25 * 8;
+        unsigned int *fb2 = calloc((size_t)W2 * H2, sizeof(unsigned int));
+        hype_gop_console_t c2;
+        hype_vt_render_cache_t *cache = malloc(sizeof(*cache));
+        hype_vt_screen_t *s2 = malloc(sizeof(*s2));
+        unsigned n;
+
+        hype_gop_console_init(&c2, fb2, W2, H2, W2, 0xAAAAAAu, 0x000000u);
+        hype_vt_screen_init(s2, 80, 25);
+        hype_vt_render_cache_invalidate(cache);
+
+        /* First render draws every cell (nothing is cached yet). */
+        n = hype_vt_render_cached(s2, &c2, 0, cache);
+        CHECK_HEX("first cached render draws the whole screen", 80u * 25u, n);
+
+        /* An identical second render draws NOTHING -- the whole point: no
+         * dirty rows means core/gop.c pushes no pixels to VRAM at all. */
+        n = hype_vt_render_cached(s2, &c2, 0, cache);
+        CHECK_HEX("unchanged screen draws 0 cells", 0u, n);
+
+        /* One new character redraws exactly one cell. */
+        hype_vt_screen_write(s2, (const uint8_t *)"X", 1);
+        n = hype_vt_render_cached(s2, &c2, 0, cache);
+        CHECK_HEX("one changed cell draws 1", 1u, n);
+        CHECK("the changed cell was actually painted", cell_has_fg(fb2, W2, 0, 0, 0xAAAAAAu));
+
+        /* ... and its content is now cached, so a repeat draws nothing. */
+        CHECK_HEX("repeat after a change draws 0", 0u, hype_vt_render_cached(s2, &c2, 0, cache));
+
+        /* Turning the cursor ON repaints just the cursor cell. */
+        n = hype_vt_render_cached(s2, &c2, 1, cache);
+        CHECK_HEX("cursor appearing draws 1 cell", 1u, n);
+        CHECK_HEX("cursor steady draws 0", 0u, hype_vt_render_cached(s2, &c2, 1, cache));
+
+        /* Moving the cursor must repaint BOTH the old and the new cell --
+         * the cursor is a colour swap, so the vacated cell needs restoring. */
+        hype_vt_screen_write(s2, (const uint8_t *)"Y", 1); /* advances the cursor */
+        n = hype_vt_render_cached(s2, &c2, 1, cache);
+        CHECK("cursor move + new char repaints at least 2 cells", n >= 2u);
+        CHECK_HEX("then steady again", 0u, hype_vt_render_cached(s2, &c2, 1, cache));
+
+        /* Explicit invalidation forces a full repaint (what a view switch does). */
+        hype_vt_render_cache_invalidate(cache);
+        CHECK_HEX("invalidate forces a full redraw", 80u * 25u,
+                  hype_vt_render_cached(s2, &c2, 1, cache));
+
+        /* A geometry change also forces a full redraw rather than diffing
+         * against cells that no longer mean the same position. */
+        {
+            unsigned sw = 40 * 8, sh = 10 * 8;
+            unsigned int *small = calloc((size_t)sw * sh, sizeof(unsigned int));
+            hype_gop_console_t sc;
+            hype_gop_console_init(&sc, small, sw, sh, sw, 0xAAAAAAu, 0x000000u);
+            n = hype_vt_render_cached(s2, &sc, 0, cache);
+            CHECK_HEX("smaller console redraws all of its own cells", 40u * 10u, n);
+            CHECK_HEX("and is then steady", 0u, hype_vt_render_cached(s2, &sc, 0, cache));
+            free(small);
+        }
+
+        /* A NULL cache degrades to the plain full renderer (no crash). */
+        CHECK_HEX("NULL cache renders everything", 80u * 25u,
+                  hype_vt_render_cached(s2, &c2, 0, 0));
+
+        /* The diffing renderer's OUTPUT must match the plain one byte-for-byte
+         * -- an optimisation that changes what is on screen is a bug. */
+        {
+            unsigned int *fb_ref = calloc((size_t)W2 * H2, sizeof(unsigned int));
+            unsigned int *fb_dif = calloc((size_t)W2 * H2, sizeof(unsigned int));
+            hype_gop_console_t cref, cdif;
+            hype_vt_render_cache_t *c3 = malloc(sizeof(*c3));
+            hype_vt_screen_t *s3 = malloc(sizeof(*s3));
+            unsigned step;
+
+            hype_gop_console_init(&cref, fb_ref, W2, H2, W2, 0xAAAAAAu, 0x000000u);
+            hype_gop_console_init(&cdif, fb_dif, W2, H2, W2, 0xAAAAAAu, 0x000000u);
+            hype_vt_screen_init(s3, 80, 25);
+            hype_vt_render_cache_invalidate(c3);
+            /* Drive a realistic sequence: text, colours, newlines, scrolling. */
+            for (step = 0; step < 60u; step++) {
+                char line[64];
+                int len = snprintf(line, sizeof line,
+                                   "\x1b[3%um step %u: booting the guest\r\n",
+                                   (unsigned)(step % 8u), step);
+                hype_vt_screen_write(s3, (const uint8_t *)line, (unsigned)len);
+                hype_vt_render(s3, &cref, 1);
+                hype_vt_render_cached(s3, &cdif, 1, c3);
+                if (memcmp(fb_ref, fb_dif, (size_t)W2 * H2 * sizeof(unsigned int)) != 0) {
+                    CHECK("diffing output matches the plain renderer", 0);
+                    break;
+                }
+            }
+            if (step == 60u) {
+                CHECK("diffing output matches the plain renderer over 60 frames", 1);
+            }
+            free(fb_ref); free(fb_dif); free(c3); free(s3);
+        }
+        free(fb2); free(cache); free(s2);
+    }
+
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;

@@ -45,3 +45,63 @@ void hype_vt_render(const hype_vt_screen_t *s, hype_gop_console_t *con, int show
         }
     }
 }
+
+void hype_vt_render_cache_invalidate(hype_vt_render_cache_t *cache) {
+    if (cache != 0) {
+        cache->valid = 0;
+    }
+}
+
+/* Same output as hype_vt_render, but only the cells that changed. */
+unsigned hype_vt_render_cached(const hype_vt_screen_t *s, hype_gop_console_t *con, int show_cursor,
+                               hype_vt_render_cache_t *cache) {
+    unsigned max_cols = (s->cols < con->cols) ? s->cols : con->cols;
+    unsigned max_rows = (s->rows < con->rows) ? s->rows : con->rows;
+    unsigned drawn = 0;
+    int full;
+
+    if (cache == 0) {
+        hype_vt_render(s, con, show_cursor);
+        return max_cols * max_rows;
+    }
+    if (max_cols > HYPE_VT_MAX_COLS) max_cols = HYPE_VT_MAX_COLS;
+    if (max_rows > HYPE_VT_MAX_ROWS) max_rows = HYPE_VT_MAX_ROWS;
+
+    /* A different geometry invalidates every cached cell position. */
+    full = (!cache->valid || cache->cols != max_cols || cache->rows != max_rows);
+
+    for (unsigned r = 0; r < max_rows; r++) {
+        for (unsigned c = 0; c < max_cols; c++) {
+            hype_vt_cell_t cell = hype_vt_screen_cell(s, c, r);
+            hype_vt_cell_t was = cache->cells[r][c];
+            int is_cursor_now = (show_cursor && c == s->cur_col && r == s->cur_row);
+            int was_cursor = (!full && cache->cursor_shown && c == cache->cur_col &&
+                             r == cache->cur_row);
+            unsigned int fg, bg;
+
+            /* Redraw when the content changed, or when this cell gained or lost
+             * the cursor -- the cursor is drawn by swapping fg/bg, so the old
+             * position must be repainted even though its character is the same. */
+            if (!full && cell.ch == was.ch && cell.attr == was.attr &&
+                is_cursor_now == was_cursor) {
+                continue;
+            }
+            hype_vt_render_colors(cell.attr, &fg, &bg);
+            if (is_cursor_now) {
+                unsigned int t = fg; fg = bg; bg = t;
+            }
+            con->fg = fg;
+            con->bg = bg;
+            hype_gop_draw_glyph(con, c, r, (unsigned char)cell.ch);
+            cache->cells[r][c] = cell;
+            drawn++;
+        }
+    }
+    cache->valid = 1;
+    cache->cols = max_cols;
+    cache->rows = max_rows;
+    cache->cur_col = s->cur_col;
+    cache->cur_row = s->cur_row;
+    cache->cursor_shown = show_cursor ? 1 : 0;
+    return drawn;
+}
