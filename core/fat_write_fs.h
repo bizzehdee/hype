@@ -15,10 +15,13 @@
  * the cluster chain, updating every FAT copy, the directory entry's size/first
  * cluster, and the FSInfo free-cluster accounting as it goes.
  *
- * The intended consumer is #230: streaming hype's post-EBS debug log to a file
- * on the USB stick's FAT32 ESP. Root-directory, 8.3-short-name files only (no
- * LFN generation, no subdirectory creation) -- sufficient for a fixed log path.
- * 512-byte logical sectors; little-endian on disk.
+ * The original consumer is #230: streaming hype's post-EBS debug log to a file
+ * on the USB stick's FAT32 ESP. #247 added the rest of the mutating surface:
+ * file delete, directory create/remove, rename/move, arbitrary-parent paths,
+ * and Long File Name handling -- names that do not fit a strict 8.3 short name
+ * get a spec-shaped LFN run over a collision-avoiding "LONGFI~1.TXT" short
+ * name, and deleting/renaming retires an entry's whole validated LFN run with
+ * it. 512-byte logical sectors; little-endian on disk.
  *
  * All LBAs are VOLUME-RELATIVE (sector 0 = the boot sector); a partitioned
  * medium wraps read/write so the callback adds the partition's first LBA.
@@ -70,12 +73,50 @@ int hype_fat32_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ct
                         hype_fat32_fs_t *out);
 
 /*
- * Creates `name` (8.3) in the root directory, truncating it to empty if it
- * already exists (its old cluster chain is freed). Allocates one initial data
- * cluster and writes the directory entry. Fills *out ready for append. Returns
- * 0 on success, -1 on any I/O error or if the volume/root directory is full.
+ * Creates the file named by `path` ('\\' or '/' separated; every directory on
+ * the way must already exist), truncating it to empty if it already exists
+ * (its old cluster chain is freed and its directory entry -- LFN run included
+ * -- is kept in place). A name that is not a strict 8.3 short name gets an LFN
+ * run over a generated "~N" short name. Allocates one initial data cluster and
+ * writes the directory entry. Fills *out ready for append. Returns 0 on
+ * success, -1 on any I/O error, an invalid name, a missing parent, or a full
+ * volume/directory.
  */
-int hype_fat32_create(hype_fat32_fs_t *fs, const char *name, hype_fat32_wfile_t *out);
+int hype_fat32_create(hype_fat32_fs_t *fs, const char *path, hype_fat32_wfile_t *out);
+
+/*
+ * Deletes the file named by `path`: frees its cluster chain, updates FSInfo,
+ * and marks its directory entry AND its whole (validated) LFN run 0xE5.
+ * Refuses a directory. Returns 0 on success, -1 otherwise.
+ */
+int hype_fat32_unlink(hype_fat32_fs_t *fs, const char *path);
+
+/*
+ * Creates the directory named by `path` (parents must exist; no mkdir -p).
+ * The new directory gets one zeroed cluster whose first two entries are '.'
+ * and '..' -- with '..' holding the parent's first cluster, or 0 when the
+ * parent is the root, per the FAT spec. Returns 0 on success, -1 on error or
+ * an existing name of either kind.
+ */
+int hype_fat32_mkdir(hype_fat32_fs_t *fs, const char *path);
+
+/*
+ * Removes the directory named by `path`. It must contain nothing but its own
+ * '.' and '..' entries (deleted slots excepted); the root cannot be removed.
+ * Returns 0 on success, -1 on error or a non-empty directory.
+ */
+int hype_fat32_rmdir(hype_fat32_fs_t *fs, const char *path);
+
+/*
+ * Renames (and/or moves) `from` to `to`. `to`'s parent must exist, `to` itself
+ * must not (rename never replaces), and a directory cannot be moved into
+ * itself or a descendant. The entry keeps its attributes, timestamps, size and
+ * cluster chain; a moved directory gets its '..' entry re-pointed at the new
+ * parent. Because lookup is case-insensitive, a rename that only changes case
+ * is refused as "target exists". The new entry is written before the old one
+ * is deleted. Returns 0 on success, -1 otherwise.
+ */
+int hype_fat32_rename(hype_fat32_fs_t *fs, const char *from, const char *to);
 
 /*
  * Appends `len` bytes of `data` to the file, growing the chain as needed, then

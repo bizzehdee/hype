@@ -326,6 +326,443 @@ static void test_fat_write_failure(void) {
     g_fail_write_lba = (uint64_t)-1;
 }
 
+/* ---- #247: unlink, mkdir, rmdir, rename, LFN generation ---- */
+
+/* Test-side raw dirent pointer (root cluster 2, spc == 1: index < 16). */
+static uint8_t *root_ent(unsigned int i) { return g_vol + clba(2) * SECSZ + i * 32u; }
+
+static void test_unlink_fat(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    uint32_t first, free_before;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    free_before = fs.free_count;
+    CHECK_HEX("create ok", 0, hype_fat32_create(&fs, "DEAD.DAT", &f));
+    CHECK_HEX("append ok", 0, hype_fat32_append(&f, "0123456789", 10u));
+    first = f.first_cluster;
+    CHECK_HEX("unlink ok", 0, hype_fat32_unlink(&fs, "\\DEAD.DAT"));
+    CHECK_HEX("dirent marked deleted", 0xE5u, root_ent(0)[0]);
+    CHECK_HEX("chain freed", 0u, fat0(first));
+    CHECK_HEX("fsinfo free count restored", free_before,
+              get32(g_vol + 1u * SECSZ + 0x1E8));
+    CHECK("unlink again fails", hype_fat32_unlink(&fs, "\\DEAD.DAT") != 0);
+    CHECK("unlink missing fails", hype_fat32_unlink(&fs, "\\NOPE.DAT") != 0);
+    CHECK("unlink the root fails", hype_fat32_unlink(&fs, "\\") != 0);
+    /* Directories are refused. */
+    CHECK_HEX("mkdir ok", 0, hype_fat32_mkdir(&fs, "\\D1"));
+    CHECK("unlink refuses a directory", hype_fat32_unlink(&fs, "\\D1") != 0);
+}
+
+static void test_mkdir_fat(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    uint32_t d1, d2;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("mkdir D1", 0, hype_fat32_mkdir(&fs, "\\D1"));
+    CHECK_HEX("dirent attr DIRECTORY", HYPE_FAT_ATTR_DIRECTORY, root_ent(0)[11]);
+    CHECK_HEX("dirent size 0", 0u, hype_fat_dirent_size(root_ent(0)));
+    d1 = hype_fat_dirent_cluster(root_ent(0));
+    CHECK("a cluster was allocated", d1 >= 3u);
+    CHECK_HEX("FAT entry end-of-chain", 0x0FFFFFFFu, fat0(d1));
+    /* '.' and '..' lead the new cluster; '..' is 0 because the parent is the
+     * ROOT -- the classic off-by-one the ticket calls out. */
+    {
+        uint8_t *dot = g_vol + clba(d1) * SECSZ;
+        uint8_t *dotdot = dot + 32u;
+        CHECK("'.' name", memcmp(dot, ".          ", 11) == 0);
+        CHECK_HEX("'.' attr", HYPE_FAT_ATTR_DIRECTORY, dot[11]);
+        CHECK_HEX("'.' cluster is its own", d1, hype_fat_dirent_cluster(dot));
+        CHECK("'..' name", memcmp(dotdot, "..         ", 11) == 0);
+        CHECK_HEX("'..' cluster 0 for a root parent", 0u, hype_fat_dirent_cluster(dotdot));
+        CHECK_HEX("terminator after them", 0x00u, dot[64]);
+    }
+    /* Nested: '..' must carry the REAL parent cluster. */
+    CHECK_HEX("mkdir D1/D2", 0, hype_fat32_mkdir(&fs, "\\D1\\D2"));
+    {
+        uint8_t ent[32];
+        /* D2's entry is the first in D1 (after no '.'/'..' confusion: D1's own
+         * cluster starts with '.','..', then D2's entry). */
+        uint8_t *e2 = g_vol + clba(d1) * SECSZ + 64u;
+        CHECK_HEX("D2 attr", HYPE_FAT_ATTR_DIRECTORY, e2[11]);
+        d2 = hype_fat_dirent_cluster(e2);
+        memcpy(ent, g_vol + clba(d2) * SECSZ + 32u, 32u);
+        CHECK_HEX("D2's '..' points at D1", d1, hype_fat_dirent_cluster(ent));
+    }
+    /* Files by path, two levels down. */
+    CHECK_HEX("create in D1/D2", 0, hype_fat32_create(&fs, "\\D1\\D2\\F.TXT", &f));
+    CHECK_HEX("append there", 0, hype_fat32_append(&f, "deep", 4u));
+    CHECK("content landed", memcmp(g_vol + clba(f.first_cluster) * SECSZ, "deep", 4) == 0);
+    CHECK_HEX("truncate by path", 0, hype_fat32_create(&fs, "\\D1\\D2\\F.TXT", &f));
+    CHECK_HEX("truncated size", 0u, (unsigned)f.size);
+    /* Refusals. */
+    CHECK("mkdir over a directory", hype_fat32_mkdir(&fs, "\\D1") != 0);
+    CHECK("mkdir over a file", hype_fat32_mkdir(&fs, "\\D1\\D2\\F.TXT") != 0);
+    CHECK("mkdir under a missing parent", hype_fat32_mkdir(&fs, "\\NOPE\\D3") != 0);
+    CHECK("mkdir under a file", hype_fat32_mkdir(&fs, "\\D1\\D2\\F.TXT\\D3") != 0);
+    CHECK("mkdir of the root", hype_fat32_mkdir(&fs, "\\") != 0);
+    CHECK("mkdir with a bad name", hype_fat32_mkdir(&fs, "\\D?1") != 0);
+    CHECK("mkdir '.'", hype_fat32_mkdir(&fs, "\\.") != 0);
+}
+
+static void test_rmdir_fat(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    uint32_t d1;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("mkdir ok", 0, hype_fat32_mkdir(&fs, "\\D1"));
+    d1 = hype_fat_dirent_cluster(root_ent(0));
+    CHECK_HEX("create inside", 0, hype_fat32_create(&fs, "\\D1\\A.TXT", &f));
+    CHECK("rmdir refuses a non-empty directory", hype_fat32_rmdir(&fs, "\\D1") != 0);
+    CHECK_HEX("unlink the content", 0, hype_fat32_unlink(&fs, "\\D1\\A.TXT"));
+    CHECK_HEX("rmdir once empty ('.' and '..' don't count)", 0, hype_fat32_rmdir(&fs, "\\D1"));
+    CHECK_HEX("its dirent deleted", 0xE5u, root_ent(0)[0]);
+    CHECK_HEX("its cluster freed", 0u, fat0(d1));
+    CHECK("rmdir of a missing name", hype_fat32_rmdir(&fs, "\\D1") != 0);
+    CHECK("rmdir of the root", hype_fat32_rmdir(&fs, "\\") != 0);
+    CHECK_HEX("create a plain file", 0, hype_fat32_create(&fs, "\\F.TXT", &f));
+    CHECK("rmdir of a file", hype_fat32_rmdir(&fs, "\\F.TXT") != 0);
+}
+
+/* A name that cannot be 8.3 gets a spec-shaped LFN run over a "~N" short name;
+ * a second colliding long name gets "~2". */
+static void test_lfn_generation(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    /* 20 characters -> 2 LFN entries + the 8.3 entry. */
+    CHECK_HEX("create long-named", 0, hype_fat32_create(&fs, "A Long FileName.txt", &f));
+    {
+        uint8_t *l1 = root_ent(0); /* physical first: logically-last piece */
+        uint8_t *l2 = root_ent(1);
+        uint8_t *de = root_ent(2);
+        uint8_t chk = hype_fat_shortname_checksum(de);
+        CHECK_HEX("run head sequence | LAST", 0x42u, l1[0]);
+        CHECK_HEX("run head attr", 0x0Fu, l1[11]);
+        CHECK_HEX("run head checksum", chk, l1[13]);
+        CHECK_HEX("second piece sequence", 0x01u, l2[0]);
+        CHECK_HEX("second piece checksum", chk, l2[13]);
+        CHECK("short name is ALONGF~1.TXT", memcmp(de, "ALONGF~1TXT", 11) == 0);
+        /* Chars land at their spec offsets: piece 1 carries 'A',' ','L'... */
+        CHECK_HEX("piece 1 char 0", 'A', l2[1]);
+        CHECK_HEX("piece 1 char 1", ' ', l2[3]);
+        /* The terminator sits right after the name's last char (the name is 19
+         * chars, so within-piece index 6 == spec offset 16), 0xFFFF after. */
+        CHECK_HEX("terminator after the last char", 0x0000u,
+                  (unsigned)((unsigned)l1[16] | ((unsigned)l1[17] << 8)));
+        CHECK_HEX("0xFFFF fill after the terminator", 0xFFFFu,
+                  (unsigned)((unsigned)l1[18] | ((unsigned)l1[19] << 8)));
+    }
+    CHECK_HEX("append via the long name", 0, hype_fat32_append(&f, "hello", 5u));
+    /* A different long name colliding on the same stem takes ~2. */
+    CHECK_HEX("create colliding long name", 0, hype_fat32_create(&fs, "A Long FileNamf.txt", &f));
+    CHECK("second short name is ALONGF~2.TXT", memcmp(root_ent(5), "ALONGF~2TXT", 11) == 0);
+    /* Both resolve independently -- and deleting one takes its WHOLE run. */
+    CHECK_HEX("unlink the first by long name", 0, hype_fat32_unlink(&fs, "\\A Long FileName.txt"));
+    CHECK_HEX("LFN piece 1 deleted", 0xE5u, root_ent(0)[0]);
+    CHECK_HEX("LFN piece 2 deleted", 0xE5u, root_ent(1)[0]);
+    CHECK_HEX("dirent deleted", 0xE5u, root_ent(2)[0]);
+    CHECK("its long name no longer resolves",
+          hype_fat32_unlink(&fs, "\\A Long FileName.txt") != 0);
+    CHECK("the second survives (case-insensitive lookup)",
+          hype_fat32_unlink(&fs, "\\a long filenamF.TXT") == 0);
+    /* Truncating an LFN file by its long name reuses the same slot. */
+    CHECK_HEX("recreate long-named", 0, hype_fat32_create(&fs, "A Long FileName.txt", &f));
+    CHECK_HEX("recreate again (truncate path)", 0,
+              hype_fat32_create(&fs, "A LONG FILENAME.TXT", &f));
+}
+
+static void test_rename_fat(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    uint32_t first, d1, d2;
+    uint8_t before[32];
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("create ok", 0, hype_fat32_create(&fs, "OLD.TXT", &f));
+    CHECK_HEX("append ok", 0, hype_fat32_append(&f, "payload!", 8u));
+    first = f.first_cluster;
+    memcpy(before, root_ent(0), 32u);
+
+    /* 8.3 -> 8.3: everything but the name survives byte-for-byte. */
+    CHECK_HEX("rename 8.3 to 8.3", 0, hype_fat32_rename(&fs, "\\OLD.TXT", "\\NEW.TXT"));
+    CHECK_HEX("old slot deleted", 0xE5u, root_ent(0)[0]);
+    {
+        uint8_t *ne = root_ent(1);
+        CHECK("new name", memcmp(ne, "NEW     TXT", 11) == 0);
+        CHECK("attrs + stamps + cluster + size preserved", memcmp(ne + 11, before + 11, 21) == 0);
+    }
+    CHECK("old name gone", hype_fat32_unlink(&fs, "\\OLD.TXT") != 0);
+
+    /* 8.3 -> long name (grows an LFN run), then back (shrinks it away). */
+    CHECK_HEX("rename to a long name", 0,
+              hype_fat32_rename(&fs, "\\NEW.TXT", "\\A Much Longer Name.dat"));
+    CHECK("old 8.3 slot deleted", root_ent(1)[0] == 0xE5u);
+    CHECK_HEX("rename back to 8.3", 0,
+              hype_fat32_rename(&fs, "\\A Much Longer Name.dat", "\\BACK.TXT"));
+    {
+        /* The data followed the entry through both renames. */
+        uint8_t got[8];
+        memcpy(got, g_vol + clba(first) * SECSZ, 8u);
+        CHECK("content intact", memcmp(got, "payload!", 8) == 0);
+    }
+
+    /* Refusals. */
+    CHECK_HEX("create bystander", 0, hype_fat32_create(&fs, "OTHER.TXT", &f));
+    CHECK("rename onto an existing name", hype_fat32_rename(&fs, "\\OTHER.TXT", "\\BACK.TXT") != 0);
+    CHECK("rename a missing source", hype_fat32_rename(&fs, "\\NOPE.TXT", "\\X.TXT") != 0);
+    CHECK("case-only rename is 'exists'", hype_fat32_rename(&fs, "\\OTHER.TXT", "\\other.txt") != 0);
+    CHECK("rename to a bad name", hype_fat32_rename(&fs, "\\OTHER.TXT", "\\o<o") != 0);
+    CHECK("rename to a missing parent", hype_fat32_rename(&fs, "\\OTHER.TXT", "\\NODIR\\O.TXT") != 0);
+    CHECK("rename the root", hype_fat32_rename(&fs, "\\", "\\R") != 0);
+
+    /* Moves. A directory moved between parents gets its '..' re-pointed. */
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("mkdir D1", 0, hype_fat32_mkdir(&fs, "\\D1"));
+    CHECK_HEX("mkdir D2", 0, hype_fat32_mkdir(&fs, "\\D2"));
+    d1 = hype_fat_dirent_cluster(root_ent(0));
+    d2 = hype_fat_dirent_cluster(root_ent(1));
+    CHECK_HEX("create in D2", 0, hype_fat32_create(&fs, "\\D2\\F.TXT", &f));
+    CHECK_HEX("'..' of D2 starts at root (0)", 0u,
+              hype_fat_dirent_cluster(g_vol + clba(d2) * SECSZ + 32u));
+    CHECK_HEX("move D2 into D1", 0, hype_fat32_rename(&fs, "\\D2", "\\D1\\D2"));
+    CHECK_HEX("'..' re-pointed at D1", d1,
+              hype_fat_dirent_cluster(g_vol + clba(d2) * SECSZ + 32u));
+    CHECK_HEX("children reachable at the new path", 0,
+              hype_fat32_unlink(&fs, "\\D1\\D2\\F.TXT"));
+    CHECK("old path gone", hype_fat32_unlink(&fs, "\\D2\\F.TXT") != 0);
+    /* Cycle guard. */
+    CHECK("move into itself", hype_fat32_rename(&fs, "\\D1", "\\D1\\SUB") != 0);
+    CHECK("move into a descendant", hype_fat32_rename(&fs, "\\D1", "\\D1\\D2\\SUB") != 0);
+    /* Move a file into a subdirectory and rename it at once. */
+    CHECK_HEX("create in root", 0, hype_fat32_create(&fs, "\\MOVE.ME", &f));
+    CHECK_HEX("append", 0, hype_fat32_append(&f, "xyz", 3u));
+    CHECK_HEX("move + rename", 0, hype_fat32_rename(&fs, "\\MOVE.ME", "\\D1\\Long Moved Name.bin"));
+    CHECK_HEX("unlink at the destination", 0, hype_fat32_unlink(&fs, "\\D1\\Long Moved Name.bin"));
+}
+
+
+/* Corrupt volumes and boundary shapes: every defensive leg the clean-path
+ * tests cannot reach. A broken chain must fail fast, never spin or "succeed". */
+static void test_corrupt_and_boundary(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+
+    /* A looping root chain: create must fail, quickly. */
+    build_vol();
+    put32(g_vol + RESERVED * SECSZ + 2u * 4u, 3u);
+    put32(g_vol + RESERVED * SECSZ + 3u * 4u, 2u); /* 2 -> 3 -> 2 */
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK("create over a looping root fails", hype_fat32_create(&fs, "X.TXT", &f) != 0);
+
+    /* A root chain pointing at a nonsense cluster. */
+    build_vol();
+    put32(g_vol + RESERVED * SECSZ + 2u * 4u, 999u);
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK("create over a broken root fails", hype_fat32_create(&fs, "X.TXT", &f) != 0);
+    CHECK("mkdir over a broken root fails", hype_fat32_mkdir(&fs, "\\D") != 0);
+
+    /* rmdir of a directory whose own chain loops: refused, not "empty". */
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("mkdir ok", 0, hype_fat32_mkdir(&fs, "\\D1"));
+    {
+        uint32_t d1 = hype_fat_dirent_cluster(root_ent(0));
+        put32(g_vol + RESERVED * SECSZ + d1 * 4u, d1); /* self-loop */
+        CHECK("rmdir of a looping directory refused", hype_fat32_rmdir(&fs, "\\D1") != 0);
+    }
+
+    /* Crafted LFN pieces that must be ignored: sequence 0 with the LAST bit,
+     * and a sequence past the name maximum. The 8.3 entry after them still
+     * resolves by its short name. */
+    build_vol();
+    {
+        uint8_t name11[11];
+        memcpy(name11, "REAL    TXT", 11);
+        memset(root_ent(0), 0, 32); root_ent(0)[0] = 0x40u; root_ent(0)[11] = 0x0Fu;
+        memset(root_ent(1), 0, 32); root_ent(1)[0] = 0x7Fu; root_ent(1)[11] = 0x0Fu;
+        memcpy(root_ent(2), name11, 11); root_ent(2)[11] = 0x20u;
+        /* A volume label after it is skipped, not matched. */
+        memcpy(root_ent(3), "NOLABEL    ", 11); root_ent(3)[11] = 0x08u;
+    }
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("entry behind junk LFN pieces resolves", 0,
+              hype_fat32_rename(&fs, "\\REAL.TXT", "\\STILL.TXT"));
+    CHECK("volume label not matched as a file", hype_fat32_unlink(&fs, "\\NOLABEL") != 0);
+
+    /* An out-of-order LFN run (wrong sequence) is not credited to the entry. */
+    build_vol();
+    {
+        uint8_t chk;
+        memcpy(root_ent(2), "WRONG   TXT", 11); root_ent(2)[11] = 0x20u;
+        chk = hype_fat_shortname_checksum(root_ent(2));
+        hype_fat_lfn_entry_build(root_ent(0), "wrongname.txt", 13u, 2u, 1, chk);
+        hype_fat_lfn_entry_build(root_ent(1), "wrongname.txt", 13u, 2u, 0, chk); /* 2 again */
+    }
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK("broken run does not name the entry",
+          hype_fat32_unlink(&fs, "\\wrongname.txt") != 0);
+    CHECK_HEX("its short name still works", 0, hype_fat32_unlink(&fs, "\\WRONG.TXT"));
+
+    /* A checksum-mismatched run is orphaned: ignored for matching. */
+    build_vol();
+    {
+        memcpy(root_ent(1), "MISM    TXT", 11); root_ent(1)[11] = 0x20u;
+        hype_fat_lfn_entry_build(root_ent(0), "mismatch.txt", 12u, 1u, 1, 0xEEu); /* bad chk */
+    }
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK("orphan run not matched", hype_fat32_unlink(&fs, "\\mismatch.txt") != 0);
+    /* Deleting by short name must NOT take the orphan run with it. */
+    CHECK_HEX("unlink by short name", 0, hype_fat32_unlink(&fs, "\\MISM.TXT"));
+    CHECK("orphan LFN piece left alone", root_ent(0)[0] != 0xE5u);
+
+    /* A file entry with cluster 0 (empty file shape): unlink has no chain to
+     * free; truncate-create must not call free_chain either. */
+    build_vol();
+    {
+        memcpy(root_ent(0), "ZERO    DAT", 11); root_ent(0)[11] = 0x20u; /* cluster 0, size 0 */
+    }
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("truncate over a chainless entry", 0, hype_fat32_create(&fs, "ZERO.DAT", &f));
+    CHECK_HEX("unlink it", 0, hype_fat32_unlink(&fs, "\\ZERO.DAT"));
+
+    /* rmdir of a directory dirent whose cluster field is junk. */
+    build_vol();
+    {
+        memcpy(root_ent(0), "BADDIR     ", 11); root_ent(0)[11] = 0x10u;
+        put16(root_ent(0) + 26, 999u);
+    }
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK("rmdir of an out-of-range directory refused", hype_fat32_rmdir(&fs, "\\BADDIR") != 0);
+    CHECK("descending through it fails too", hype_fat32_create(&fs, "\\BADDIR\\F.TXT", &f) != 0);
+
+    /* A moved directory whose '.'/'..' pair was destroyed: the move still
+     * completes -- there is no '..' to re-point -- rather than corrupting
+     * whatever sits in those bytes. */
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("mkdir A", 0, hype_fat32_mkdir(&fs, "\\A"));
+    CHECK_HEX("mkdir B", 0, hype_fat32_mkdir(&fs, "\\B"));
+    {
+        uint32_t a = hype_fat_dirent_cluster(root_ent(0));
+        memset(g_vol + clba(a) * SECSZ, 0, 64u); /* wipe '.' and '..' */
+        CHECK_HEX("move still completes", 0, hype_fat32_rename(&fs, "\\A", "\\B\\A"));
+    }
+
+    /* FSInfo that goes bad AFTER mount: flushes are skipped, ops still work. */
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    put32(g_vol + 1u * SECSZ, 0xBADBAD00u);
+    CHECK_HEX("create with a corrupt FSInfo", 0, hype_fat32_create(&fs, "OK.TXT", &f));
+    CHECK_HEX("unlink with a corrupt FSInfo", 0, hype_fat32_unlink(&fs, "\\OK.TXT"));
+
+    /* The dirent size field saturates at 4 GiB - 1. */
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("create ok", 0, hype_fat32_create(&fs, "BIG.BIN", &f));
+    f.size = 0x100000001ull;
+    CHECK_HEX("append(0) still flushes", 0, hype_fat32_append(&f, "", 0u));
+    CHECK_HEX("size clamped in the dirent", 0xFFFFFFFFu, hype_fat_dirent_size(root_ent(0)));
+
+    /* 16-bit BPB total-sector field takes precedence when non-zero. */
+    build_vol();
+    put16(g_vol + 0x13, (uint16_t)VOL_SECTORS);
+    put32(g_vol + 0x20, 0u);
+    CHECK_HEX("mount with TotSec16", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("same geometry", 127u, fs.max_cluster);
+
+    /* spc > 1 with too few data sectors for even one cluster. */
+    build_vol();
+    g_vol[0x0D] = 8u;
+    put32(g_vol + 0x20, DATA_START + 7u); /* 7 data sectors < one 8-sector cluster */
+    CHECK("no-cluster volume rejected", hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs) != 0);
+
+    /* Rename with no final component on either side. */
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("create ok", 0, hype_fat32_create(&fs, "R.TXT", &f));
+    CHECK("rename to the root", hype_fat32_rename(&fs, "\\R.TXT", "\\") != 0);
+
+    /* Stale free-cluster hints are tolerated by the allocator. */
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    fs.next_free = 0u; /* out of range: the scan restarts from 2 */
+    CHECK_HEX("alloc with a junk hint", 0, hype_fat32_create(&fs, "H.TXT", &f));
+    fs.next_free = 0u;
+    CHECK_HEX("free with a zero hint", 0, hype_fat32_unlink(&fs, "\\H.TXT"));
+    /* FSInfo carrying a next-free below 2 is clamped at mount. */
+    build_vol();
+    put32(g_vol + 1u * SECSZ + 0x1EC, 1u);
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("low next_free clamped", 2u, fs.next_free);
+}
+
+
+/* Remaining defensive legs: allocator hints, forward slashes, over-long
+ * components, and LFN runs broken in yet other ways. */
+static void test_more_edges(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    char big[300];
+    unsigned int i;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    /* Forward slashes are separators too. */
+    CHECK_HEX("mkdir with forward slashes", 0, hype_fat32_mkdir(&fs, "/FWD"));
+    CHECK_HEX("create with forward slashes", 0, hype_fat32_create(&fs, "/FWD/F.TXT", &f));
+    CHECK_HEX("unlink with forward slashes", 0, hype_fat32_unlink(&fs, "/FWD/F.TXT"));
+    /* create refuses to clobber a directory, and refuses the root. */
+    CHECK("create over a directory", hype_fat32_create(&fs, "FWD", &f) != 0);
+    CHECK("create of the root", hype_fat32_create(&fs, "\\", &f) != 0);
+    /* A path component longer than any legal name. */
+    big[0] = '\\';
+    for (i = 1; i < sizeof big - 1u; i++) big[i] = 'a';
+    big[sizeof big - 1u] = '\0';
+    CHECK("over-long leaf rejected", hype_fat32_create(&fs, big, &f) != 0);
+    big[260] = '\\'; big[261] = 'f'; big[262] = '\0';
+    CHECK("over-long mid component rejected", hype_fat32_create(&fs, big, &f) != 0);
+    /* Allocator hint out of range, and a free count already at zero. */
+    fs.next_free = 200u;
+    fs.free_count = 0u;
+    CHECK_HEX("alloc survives both", 0, hype_fat32_create(&fs, "HINT.TXT", &f));
+    /* A dirent whose chain starts past the volume: freeing it is a no-op walk. */
+    {
+        /* Slot 2 is the first slot before the 0x00 terminator region. */
+        memcpy(root_ent(2), "OOR     DAT", 11); root_ent(2)[11] = 0x20u;
+        put16(root_ent(2) + 26, 200u); /* > max_cluster 127 */
+    }
+    CHECK_HEX("unlink an out-of-range chain", 0, hype_fat32_unlink(&fs, "\\OOR.DAT"));
+    /* A root cluster number the FAT cannot address: mount accepts the BPB shape
+     * but every directory walk must refuse it. */
+    build_vol();
+    put32(g_vol + 0x2C, 999u);
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK("walks refuse an out-of-range root", hype_fat32_create(&fs, "X.TXT", &f) != 0);
+    /* An LFN run whose SECOND piece carries the wrong checksum byte. */
+    build_vol();
+    {
+        uint8_t chk;
+        memcpy(root_ent(2), "CHKM    TXT", 11); root_ent(2)[11] = 0x20u;
+        chk = hype_fat_shortname_checksum(root_ent(2));
+        hype_fat_lfn_entry_build(root_ent(0), "chk mismatch.txt", 16u, 2u, 1, chk);
+        hype_fat_lfn_entry_build(root_ent(1), "chk mismatch.txt", 16u, 1u, 0, (uint8_t)(chk ^ 0xFFu));
+    }
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK("mid-run checksum break orphans the run",
+          hype_fat32_unlink(&fs, "\\chk mismatch.txt") != 0);
+    CHECK_HEX("short name still resolves", 0, hype_fat32_unlink(&fs, "\\CHKM.TXT"));
+}
+
 /* Sweep a read/write failure across successive I/O operations of a full
  * create + multi-cluster append + truncate cycle, exercising every defensive
  * "I/O failed" error leg. Results are intentionally ignored -- the point is
@@ -338,10 +775,17 @@ static void run_cycle(void) {
     if (hype_fat32_create(&fs, "SWEEP.TXT", &f) != 0) return;
     if (hype_fat32_append(&f, buf, sizeof buf) != 0) return; /* spans 3 clusters */
     (void)hype_fat32_create(&fs, "SWEEP.TXT", &f); /* re-create -> free_chain path */
+    (void)hype_fat32_mkdir(&fs, "SWPDIR");
+    (void)hype_fat32_create(&fs, "\\SWPDIR\\A Long Sweep Name.dat", &f);
+    (void)hype_fat32_rename(&fs, "\\SWPDIR\\A Long Sweep Name.dat", "\\SWPDIR\\S.DAT");
+    (void)hype_fat32_rename(&fs, "\\SWEEP.TXT", "\\SWPDIR\\SWEEP.TXT");
+    (void)hype_fat32_unlink(&fs, "\\SWPDIR\\S.DAT");
+    (void)hype_fat32_unlink(&fs, "\\SWPDIR\\SWEEP.TXT");
+    (void)hype_fat32_rmdir(&fs, "\\SWPDIR");
 }
 static void test_fault_sweep(void) {
     long k;
-    for (k = 0; k < 60; k++) {
+    for (k = 0; k < 1400; k += (k < 300 ? 1 : 7)) {
         build_vol();
         g_read_countdown = k; g_write_countdown = -1;
         run_cycle();
@@ -423,6 +867,13 @@ int main(void) {
     test_fsinfo_variants();
     test_lfn_skip();
     test_fat_write_failure();
+    test_unlink_fat();
+    test_mkdir_fat();
+    test_rmdir_fat();
+    test_lfn_generation();
+    test_rename_fat();
+    test_corrupt_and_boundary();
+    test_more_edges();
     test_fault_sweep();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
