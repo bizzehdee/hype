@@ -5832,7 +5832,18 @@ static int fw_1_guest_virt_to_phys(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva,
  * guest such as OVMF). Used only when decode assists gave nothing. */
 static const uint8_t *fw_1_insn_bytes_via_ptwalk(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, uint64_t guest_rip) {
     uint64_t gpa = 0;
-    if (fw_1_guest_virt_to_phys(vm, hype_svm_vcpu_get_cr3(ctx), guest_rip, &gpa) == 0) {
+    /*
+     * #249: vendor-neutral CR3. This used hype_svm_vcpu_get_cr3() directly, so on
+     * VMX the page walk started from a meaningless root and silently failed --
+     * every caller then fell back to the identity path or reported zeros. That is
+     * why the Intel idle probe printed "insn=00 00 00 00" and TASKWALK could not
+     * validate its slide: the guest-introspection diagnostics were blind on Intel
+     * while looking like they had simply found nothing.
+     *
+     * g_fw_1_kind rather than a new parameter: this helper is only ever called
+     * from the FW-1 guest path, which is precisely what sets that global.
+     */
+    if (fw_1_guest_virt_to_phys(vm, vmm_get_cr3(g_fw_1_kind, ctx), guest_rip, &gpa) == 0) {
         const uint8_t *p = fw_1_guest_phys_to_host(vm, gpa);
         if (p != 0) {
             return p;
