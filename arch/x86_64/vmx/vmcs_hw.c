@@ -432,7 +432,9 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     /* Unrestricted guest (lets the guest run with CR0.PE=0 / CR0.PG=0, i.e.
      * real mode) architecturally REQUIRES EPT -- so both bits go together. */
     uint32_t proc2_ctls = hype_vmx_adjust_controls(
-        HYPE_VMX_PROCBASED2_ENABLE_EPT | HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST, proc2_cap);
+        HYPE_VMX_PROCBASED2_ENABLE_EPT | HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST |
+            HYPE_VMX_PROCBASED2_ENABLE_INVPCID,
+        proc2_cap);
     /* Host address-space size MUST be set: hype's host is 64-bit (see the
      * constant's comment) -- omitting it is the classic error-7 VM-entry
      * failure. Entry controls stay 0 (real-mode guest, not IA-32e). */

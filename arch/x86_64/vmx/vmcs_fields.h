@@ -76,6 +76,21 @@
  * hardware regardless. */
 #define HYPE_VMX_PROCBASED2_ENABLE_EPT (1u << 1)
 #define HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST (1u << 7)
+/*
+ * "Enable INVPCID" (secondary control, bit 12) -- #251.
+ *
+ * Not an optimisation: with this control CLEAR, a guest executing INVPCID takes
+ * #UD (SDM Vol 3C, "Changes to Instruction Behavior in VMX Non-Root Operation").
+ * hype passes the host's CPUID leaf 7 through, so an Intel guest sees INVPCID
+ * advertised and Linux uses it in native_flush_tlb_global() -- the very first
+ * global TLB flush, from cache_cpu_init() during setup_arch(). The guest then
+ * faulted before its console existed and parked in a hlt;jmp loop.
+ *
+ * SVM has no equivalent gate, which is why AMD never hit this: INVPCID simply
+ * executes. Requested through adjust_controls() so it is dropped if unsupported,
+ * in which case the CPUID bit ought to be masked instead.
+ */
+#define HYPE_VMX_PROCBASED2_ENABLE_INVPCID (1u << 12)
 /* APIC-register virtualization / virtual-interrupt delivery (M2-4):
  * both operate on the virtual-APIC page directly, not through EPT, so
  * (unlike "virtualize APIC accesses", intentionally not used here)
