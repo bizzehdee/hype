@@ -255,4 +255,9 @@ void hype_vmx_vcpu_dump_ept_violation(hype_vcpu_ctx_t *ctx);
  * in a hlt;jmp loop a few instructions past a CPUID enumeration. */
 void hype_vmx_vcpu_dump_cpuid_ring(void);
 
+/* #251: emulate a guest XSETBV (exit reason 55, unconditional on VMX). Returns 0
+ * if emulated, -1 for a form this does not model -- in which case RIP has NOT
+ * been advanced and the caller must not treat the exit as handled. */
+int hype_vmx_vcpu_handle_xsetbv(hype_vcpu_ctx_t *ctx);
+
 #endif /* HYPE_ARCH_VMX_VMCS_H */

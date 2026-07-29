@@ -353,6 +353,14 @@
  * bits 5:4 = access type (0 = MOV to CR), bits 11:8 = the source GPR.
  */
 #define HYPE_VMX_EXIT_REASON_CR_ACCESS 28u
+/*
+ * XSETBV (#251). UNCONDITIONAL: no VM-execution control gates it, so a guest
+ * setting XCR0 always exits and the hypervisor must emulate it. SVM makes it an
+ * optional intercept that hype does not take, so there it simply executes -- the
+ * same vendor asymmetry as INVPCID, and it surfaced immediately after that fix
+ * as "exited the initial dispatch loop (reason=0x37)".
+ */
+#define HYPE_VMX_EXIT_REASON_XSETBV 55u
 #define HYPE_VMX_CR_ACCESS_CR_MASK 0x0Fu
 #define HYPE_VMX_CR_ACCESS_TYPE_SHIFT 4u
 #define HYPE_VMX_CR_ACCESS_TYPE_MASK 0x03u

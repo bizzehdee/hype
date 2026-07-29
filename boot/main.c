@@ -3090,6 +3090,20 @@ static int vmm_handle_cr_access(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
     return hype_vmx_vcpu_handle_cr_access(ctx);
 }
 /*
+ * #251: XSETBV. VMX-only in the same sense as the CR-access exit -- SVM leaves it
+ * as an optional intercept hype does not take, so the instruction just executes
+ * there. On VMX it exits unconditionally and must be emulated.
+ */
+static int vmm_reason_is_xsetbv(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX && reason == HYPE_VMX_EXIT_REASON_XSETBV;
+}
+static int vmm_handle_xsetbv(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind != HYPE_VMM_KIND_VMX) {
+        return 0;
+    }
+    return hype_vmx_vcpu_handle_xsetbv(ctx) == 0;
+}
+/*
  * "Did the guest take exception `vector`?" This is the one exit whose SHAPE
  * differs between the backends rather than just its number: SVM encodes the
  * vector into the exit code (EXITCODE_EXCEPTION_BASE + vector), so the reason
@@ -8300,6 +8314,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             key_reacted = 1;
         }
 
+        if (vmm_reason_is_xsetbv(kind, info.reason)) {
+            /* #251: guest enabling XSAVE state. Same fall-through discipline as
+             * the CR-access exit -- if the form is not modelled, do NOT continue,
+             * because RIP was not advanced and resuming would re-execute it. */
+            if (vmm_handle_xsetbv(kind, ctx)) {
+                continue;
+            }
+            hype_debug_print("fw-1 XSETBV: unmodelled form (ecx!=0) at guest_rip=0x%llx "
+                             "-- not resuming blind\n",
+                             (unsigned long long)info.guest_rip);
+        }
         if (vmm_reason_is_cr_access(kind, info.reason)) {
             /* #248: guest wrote a CR whose bits the host owns (CR4.VMXE /
              * CR0.NE). Re-apply the required bit and let the guest read back its

@@ -73,6 +73,63 @@ static void vmx_pvclock_arm_wall_clock(struct hype_vcpu_ctx *real, uint64_t msr_
 static uint64_t g_vmx_entry_cap = 0;
 
 /*
+ * #251: guest XCR0. XSETBV always exits on VMX, and there is no VMCS field for
+ * XCR0, so hype has to hold the guest's value itself and swap it around each
+ * entry/exit -- otherwise the guest's XSAVE configuration would leak into host
+ * context, where hype's own FPU/XSAVE state is interpreted under it.
+ *
+ * g_vmx_host_xcr0 is captured once at VMCS build. The swap only happens after the
+ * guest has actually executed an XSETBV (g_vmx_guest_xcr0_valid), so the common
+ * case costs nothing.
+ */
+static uint64_t g_vmx_host_xcr0 = 0;
+static uint64_t g_vmx_guest_xcr0 = 0;
+static int g_vmx_guest_xcr0_valid = 0;
+
+/* Defined further down; needed by the XCR0 helpers below. */
+static inline uint64_t read_cr4(void);
+static void vmx_real_cpuid(uint32_t leaf, uint32_t subleaf, hype_cpuid_result_t *out);
+
+/*
+ * #251: XGETBV/XSETBV are #UD unless CR4.OSXSAVE (bit 18) is set -- and that is a
+ * per-context bit. The GUEST sets it in its own CR4 before using XSETBV; hype's
+ * host CR4 is separate and does not have it, so hype executing XSETBV to service
+ * the guest faulted #UD in HOST context and took hype down (observed:
+ * "unhandled interrupt: vector=6 (Invalid Opcode) rip=0x14002b15a cs=0x8").
+ *
+ * A hypervisor that virtualises XSAVE has to be able to touch XCR0, so enable
+ * OSXSAVE for hype once, on demand, when the CPU reports XSAVE support
+ * (CPUID.1:ECX bit 26). Enabling it only permits XGETBV/XSETBV; it changes
+ * nothing else about how hype runs. Returns 0 if XCR0 cannot be managed at all,
+ * in which case the caller must NOT execute either instruction.
+ */
+static int vmx_ensure_osxsave(void) {
+    hype_cpuid_result_t c1;
+    uint64_t cr4 = read_cr4();
+
+    if ((cr4 & (1ull << 18)) != 0ull) {
+        return 1;
+    }
+    vmx_real_cpuid(1u, 0u, &c1);
+    if ((c1.ecx & (1u << 26)) == 0u) { /* no XSAVE on this CPU */
+        return 0;
+    }
+    cr4 |= (1ull << 18);
+    __asm__ volatile("mov %0, %%cr4" ::"r"(cr4) : "memory");
+    return 1;
+}
+
+static inline uint64_t xgetbv0(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+static inline void xsetbv0(uint64_t val) {
+    __asm__ volatile("xsetbv" ::"a"((uint32_t)val), "d"((uint32_t)(val >> 32)), "c"(0) : "memory");
+}
+
+/*
  * #251 slice 2: the VM-entry/exit MSR areas.
  *
  * Layout is fixed by the SDM (Table 24-14): 32-bit MSR index, 32 reserved bits,
@@ -591,6 +648,11 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * handles other MSRs. */
     rc |= vmwrite(HYPE_VMCS_GUEST_IA32_PAT, HYPE_VMX_PAT_RESET_VALUE);
     rc |= vmwrite(HYPE_VMCS_HOST_IA32_PAT, rdmsr(HYPE_MSR_IA32_PAT));
+    /* #251: remember hype's own XCR0 so an XSETBV-ing guest can be swapped in and
+     * out around VM entry. Guarded on CR4.OSXSAVE -- XGETBV faults without it. */
+    if (vmx_ensure_osxsave()) {
+        g_vmx_host_xcr0 = xgetbv0();
+    }
 
     /*
      * #251 slice 2: populate and wire the MSR areas.
@@ -902,7 +964,14 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     uint64_t failed;
     int ok;
 
+    /* #251: run the guest under its own XCR0, and put hype's back afterwards. */
+    if (g_vmx_guest_xcr0_valid && vmx_ensure_osxsave()) {
+        xsetbv0(g_vmx_guest_xcr0);
+    }
     failed = hype_vmx_launch(ctx, (uint64_t)real->launched);
+    if (g_vmx_guest_xcr0_valid && g_vmx_host_xcr0 != 0ull) {
+        xsetbv0(g_vmx_host_xcr0);
+    }
     if (failed) {
         uint64_t err = vmread(HYPE_VMCS_VM_INSTRUCTION_ERROR, &ok);
         info->reason = (1ULL << 63) | (ok ? err : 0);
@@ -986,6 +1055,48 @@ static struct {
 static unsigned g_vmx_cpuid_ring_head = 0;
 static unsigned g_vmx_cpuid_ring_n = 0;
 
+/*
+ * #251: emulate XSETBV for the guest.
+ *
+ * The guest's requested XCR0 is masked to what the host actually supports (CPUID
+ * leaf 0xD, EDX:EAX) rather than passed through blindly: XSETBV with an
+ * unsupported bit raises #GP, and faulting the guest for asking is worse than
+ * giving it the intersection. In practice they are equal, because hype passes the
+ * host's XSAVE CPUID through, so the guest only ever asks for what exists -- a
+ * divergence is logged rather than silently narrowed.
+ *
+ * Returns 0 if emulated. Only XCR0 (ECX=0) is defined; anything else is left
+ * unhandled for the caller to report rather than quietly skipped.
+ */
+int hype_vmx_vcpu_handle_xsetbv(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    uint64_t requested, supported;
+    hype_cpuid_result_t xs;
+
+    if ((uint32_t)real->gprs[1] != 0u) { /* ECX: only XCR0 exists */
+        return -1;
+    }
+    if (!vmx_ensure_osxsave()) {
+        /* Cannot touch XCR0 at all on this host -- report unhandled rather than
+         * faulting hype, and leave RIP unadvanced so the caller says so. */
+        return -1;
+    }
+    requested = ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+
+    vmx_real_cpuid(0xDu, 0u, &xs);
+    supported = ((uint64_t)xs.edx << 32) | (uint64_t)xs.eax;
+    if ((requested & ~supported) != 0ull) {
+        hype_debug_print("vmx XSETBV: guest asked for 0x%llx, host supports 0x%llx -- masking\n",
+                         (unsigned long long)requested, (unsigned long long)supported);
+    }
+    /* XCR0.x87 (bit 0) must be set; a value clearing it would #GP. */
+    g_vmx_guest_xcr0 = (requested & supported) | 1ull;
+    g_vmx_guest_xcr0_valid = 1;
+    xsetbv0(g_vmx_guest_xcr0);
+    vmx_advance_rip();
+    return 0;
+}
+
 void hype_vmx_vcpu_dump_cpuid_ring(void) {
     unsigned i;
     for (i = 0; i < g_vmx_cpuid_ring_n; i++) {
@@ -1010,7 +1121,21 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     uint32_t ecx_in = (uint32_t)real->gprs[1];
     hype_cpuid_result_t host_real, out;
 
-    vmx_real_cpuid(eax_in, ecx_in, &host_real);
+    /*
+     * #251: CPUID leaf 0xD reports XSAVE area sizes FOR THE CURRENTLY ACTIVE XCR0
+     * (EBX especially). hype runs the real CPUID in host context, where hype's own
+     * XCR0 is loaded -- so a guest that has set its own XCR0 would be told a size
+     * computed for the wrong feature set, and Linux's fpu__init_system_xstate()
+     * cross-checks that size and dies when it disagrees. Load the guest's XCR0 for
+     * the duration of this one CPUID so the answer describes the guest.
+     */
+    if (eax_in == 0xDu && g_vmx_guest_xcr0_valid && g_vmx_host_xcr0 != 0ull) {
+        xsetbv0(g_vmx_guest_xcr0);
+        vmx_real_cpuid(eax_in, ecx_in, &host_real);
+        xsetbv0(g_vmx_host_xcr0);
+    } else {
+        vmx_real_cpuid(eax_in, ecx_in, &host_real);
+    }
     hype_cpuid_emulate(eax_in, ecx_in, &host_real, &out);
 
     real->gprs[0] = out.eax; /* RAX */
