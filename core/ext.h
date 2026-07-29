@@ -3,7 +3,8 @@
 
 #include <stdint.h>
 
-#include "fat.h" /* hype_fat_read_fn, hype_fat_file_t: the shared extent contract */
+#include "fat.h"          /* hype_fat_read_fn, hype_fat_file_t: the shared extent contract */
+#include "fat_write_fs.h" /* hype_fat_write_fn (shared with the FAT32/exFAT writers) */
 
 /*
  * #203 (STORAGE: ext2/3/4 host filesystem READ) -- the ext counterpart of the
@@ -50,5 +51,53 @@
  * are. Path separators may be '/' or '\\'.
  */
 int hype_ext_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fat_file_t *out);
+
+/*
+ * #204 (STORAGE: ext2/3/4 host filesystem WRITE) -- IN-PLACE writes to an
+ * existing, fully-allocated backing file, the ext counterpart of
+ * hype_exfat_write_at(): persist guest disk writes back into a raw image
+ * file that lives on an ext-formatted host volume. Implemented in
+ * core/ext_write.c on top of the resolver above: the file's extents never
+ * move, so writes are plain sector I/O through the injected write callback
+ * (the same hype_fat_write_fn the FAT32/exFAT writers use, carried by
+ * blk_phys over AHCI/NVMe/USB).
+ *
+ * THE JOURNAL CONSTRAINT (the ticket's hard part, resolved by scoping):
+ * ext3/4 journal METADATA. In-place data writes to an already-allocated
+ * file touch no metadata at all -- no bitmaps, no size, no extent tree, no
+ * journal -- so they cannot race or corrupt a jbd2 journal. What is NOT
+ * safe is trusting the metadata of a volume that crashed while mounted, so
+ * hype_ext_open_rw() refuses any volume that is not CLEANLY UNMOUNTED:
+ * s_state must say VALID and not ERROR, and the resolver already refuses an
+ * unreplayed journal (INCOMPAT_RECOVER). Growing/allocating files stays a
+ * follow-on; hype must also be the volume's only writer while it holds it
+ * (true by construction post-ExitBootServices).
+ */
+typedef struct {
+    hype_fat_file_t map; /* the file's resolved extents (they never move) */
+    hype_fat_read_fn read;
+    hype_fat_write_fn write;
+    void *ctx;
+} hype_ext_wfile_t;
+
+/*
+ * Resolves `path` for in-place read/write. Returns 0 on success; -1 on any
+ * resolver failure, a NULL write callback, or a volume that is not cleanly
+ * unmounted (mounted-dirty or marked with errors).
+ */
+int hype_ext_open_rw(hype_fat_read_fn read, hype_fat_write_fn write, void *ctx,
+                     const char *path, hype_ext_wfile_t *out);
+
+/*
+ * Overwrites `len` bytes at byte `offset` of the file. The range must lie
+ * wholly inside the file -- this path NEVER grows or moves an allocation
+ * (offset+len validation per AGENTS.md; a guest-steered range outside the
+ * file is refused, not clamped). Whole aligned sectors are written in bulk
+ * runs per extent; ragged edges read-modify-write. Returns 0 or -1.
+ */
+int hype_ext_write_at(hype_ext_wfile_t *f, uint64_t offset, const void *data, unsigned int len);
+
+/* Reads `len` bytes at byte `offset`. Bounds-checked exactly as above. */
+int hype_ext_read_at(hype_ext_wfile_t *f, uint64_t offset, void *out, unsigned int len);
 
 #endif /* HYPE_CORE_EXT_H */

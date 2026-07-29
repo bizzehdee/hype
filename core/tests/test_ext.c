@@ -73,6 +73,7 @@ static void superblock(uint32_t incompat) {
     put32(sb + 0x18, 0u);          /* log_block_size: 1024 */
     put32(sb + 0x28, 64u);         /* inodes_per_group */
     put16(sb + 0x38, 0xEF53u);     /* magic */
+    put16(sb + 0x3A, 0x0001u);     /* state: cleanly unmounted */
     put32(sb + 0x4C, 1u);          /* rev_level: dynamic */
     put16(sb + 0x58, INODE_SIZE);  /* inode_size */
     put32(sb + 0x60, incompat);
@@ -752,6 +753,116 @@ static void test_more_bounds(void) {
     CHECK_HEX("doubled separators", 0, hype_ext_resolve(vol_read, 0, "//sub//deep.bin", &f));
 }
 
+
+/* ---- #204: in-place writes ---- */
+
+static long g_write_countdown = -1;
+static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    if ((lba + count) * 512u > sizeof g_vol) return -1;
+    if (g_write_countdown >= 0 && g_write_countdown-- == 0) return -1;
+    memcpy(g_vol + lba * 512u, src, (size_t)count * 512u);
+    return 0;
+}
+
+static void test_write_at(void) {
+    hype_ext_wfile_t f;
+    static uint8_t buf[12000];
+    static uint8_t back[12000];
+    unsigned int i;
+
+    build_vol();
+    CHECK_HEX("open_rw ok", 0, hype_ext_open_rw(vol_read, vol_write, 0, "/img.bin", &f));
+    CHECK_HEX("open size", 20000u, (unsigned)f.map.size_bytes);
+    /* Read the pre-existing pattern through the writer's own read_at. */
+    CHECK_HEX("read_at", 0, hype_ext_read_at(&f, 0u, back, 4000u));
+    for (i = 0; i < 4000u; i++) {
+        if (back[i] != pat(i)) { CHECK_HEX("pre-existing byte", pat(i), back[i]); break; }
+    }
+    /* An unaligned span crossing the extent seam at byte 10240. */
+    for (i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(0xC3u ^ (i * 11u));
+    CHECK_HEX("write_at across the seam", 0, hype_ext_write_at(&f, 9000u, buf, 3000u));
+    CHECK_HEX("read it back", 0, hype_ext_read_at(&f, 9000u, back, 3000u));
+    CHECK("seam span round-trips", memcmp(back, buf, 3000u) == 0);
+    CHECK_HEX("byte before untouched", pat(8999u), blk(40u + 8999u / BS)[8999u % BS]);
+    CHECK_HEX("byte after untouched", pat(12000u), blk(60u + 12000u / BS - 10u)[12000u % BS]);
+    /* Whole-sector aligned bulk write (no read-modify-write on that leg). */
+    CHECK_HEX("aligned bulk write", 0, hype_ext_write_at(&f, 1024u, buf, 2048u));
+    CHECK("bulk landed", memcmp(blk(41u), buf, 1024u) == 0);
+    /* Ragged head, bulk middle, ragged tail in one call. */
+    CHECK_HEX("mixed write", 0, hype_ext_write_at(&f, 100u, buf, 2000u));
+    CHECK_HEX("read the mix back", 0, hype_ext_read_at(&f, 100u, back, 2000u));
+    CHECK("mixed round-trips", memcmp(back, buf, 2000u) == 0);
+    /* The very last byte. */
+    CHECK_HEX("last byte", 0, hype_ext_write_at(&f, 19999u, buf, 1u));
+    CHECK_HEX("zero length is a no-op", 0, hype_ext_write_at(&f, 0u, buf, 0u));
+    /* Out of range in every direction: refused, never clamped. */
+    CHECK_HEX("write past the end", -1, hype_ext_write_at(&f, 20000u, buf, 1u));
+    CHECK_HEX("write straddling the end", -1, hype_ext_write_at(&f, 19999u, buf, 2u));
+    CHECK_HEX("read past the end", -1, hype_ext_read_at(&f, 20000u, back, 1u));
+    CHECK_HEX("absurd offset", -1, hype_ext_write_at(&f, 0xFFFFFFFFFFFFFFFFull, buf, 1u));
+    CHECK_HEX("null data", -1, hype_ext_write_at(&f, 0u, 0, 1u));
+    CHECK_HEX("null read buffer", -1, hype_ext_read_at(&f, 0u, 0, 1u));
+    /* The resolver still sees a healthy file afterwards (no metadata moved). */
+    {
+        hype_fat_file_t m;
+        CHECK_HEX("re-resolve after writes", 0, hype_ext_resolve(vol_read, 0, "/img.bin", &m));
+        CHECK_HEX("same size", 20000u, (unsigned)m.size_bytes);
+        CHECK_HEX("same extents", 2u, m.count);
+    }
+    /* An indirect-mapped file writes the same way. */
+    CHECK_HEX("open ind.bin", 0, hype_ext_open_rw(vol_read, vol_write, 0, "/ind.bin", &f));
+    CHECK_HEX("write into the indirect region", 0, hype_ext_write_at(&f, 13000u, buf, 600u));
+    CHECK_HEX("read it back", 0, hype_ext_read_at(&f, 13000u, back, 600u));
+    CHECK("indirect round-trips", memcmp(back, buf, 600u) == 0);
+}
+
+static void test_write_gate(void) {
+    hype_ext_wfile_t f;
+    /* No write callback. */
+    build_vol();
+    CHECK_HEX("NULL write callback refused", -1,
+              hype_ext_open_rw(vol_read, 0, 0, "/img.bin", &f));
+    /* A volume that was not cleanly unmounted. */
+    build_vol();
+    put16(g_vol + 1024 + 0x3A, 0x0000u);
+    CHECK_HEX("mounted-dirty volume refused", -1,
+              hype_ext_open_rw(vol_read, vol_write, 0, "/img.bin", &f));
+    /* A volume with recorded errors. */
+    build_vol();
+    put16(g_vol + 1024 + 0x3A, 0x0003u);
+    CHECK_HEX("errors-recorded volume refused", -1,
+              hype_ext_open_rw(vol_read, vol_write, 0, "/img.bin", &f));
+    /* Resolver failures surface through open_rw too. */
+    build_vol();
+    CHECK_HEX("missing file", -1, hype_ext_open_rw(vol_read, vol_write, 0, "/nope", &f));
+    CHECK_HEX("sparse file refused for writing too", -1,
+              hype_ext_open_rw(vol_read, vol_write, 0, "/hole.bin", &f));
+    /* Superblock unreadable. */
+    build_vol();
+    g_fail_read_lba = 2u;
+    CHECK_HEX("unreadable superblock", -1, hype_ext_open_rw(vol_read, vol_write, 0, "/img.bin", &f));
+    g_fail_read_lba = (uint64_t)-1;
+}
+
+static void test_write_io_errors(void) {
+    hype_ext_wfile_t f;
+    static uint8_t buf[2048];
+    long k;
+    build_vol();
+    CHECK_HEX("open ok", 0, hype_ext_open_rw(vol_read, vol_write, 0, "/img.bin", &f));
+    for (k = 0; k < 12; k++) {
+        g_write_countdown = k;
+        (void)hype_ext_write_at(&f, 100u, buf, sizeof buf);
+        g_read_countdown = k;
+        (void)hype_ext_write_at(&f, 100u, buf, sizeof buf); /* RMW read leg */
+        (void)hype_ext_read_at(&f, 100u, buf, sizeof buf);
+        g_read_countdown = -1;
+    }
+    g_write_countdown = -1;
+    CHECK("write fault sweep completed", 1);
+}
+
 /* Fault sweep: an injected read failure at every successive read of a full
  * resolve (both mapping schemes) must fail cleanly, never crash or spin. */
 static void test_fault_sweep(void) {
@@ -775,6 +886,9 @@ int main(void) {
     test_refusals();
     test_mount_refusals();
     test_corrupt_structures();
+    test_write_at();
+    test_write_gate();
+    test_write_io_errors();
     test_more_bounds();
     test_64bit_feature();
     test_triple_indirect();
