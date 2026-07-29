@@ -250,4 +250,9 @@ int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx);
  */
 void hype_vmx_vcpu_dump_ept_violation(hype_vcpu_ctx_t *ctx);
 
+/* #251: dump the last few guest CPUIDs (leaf/subleaf and what hype answered).
+ * Called when the guest is detected idle, which for the Intel guest means parked
+ * in a hlt;jmp loop a few instructions past a CPUID enumeration. */
+void hype_vmx_vcpu_dump_cpuid_ring(void);
+
 #endif /* HYPE_ARCH_VMX_VMCS_H */

@@ -7695,7 +7695,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                 break;
                             }
                         }
-                        hype_debug_print("fw-1 IDLECODE: polled-counter VA = 0x%llx\n",
+                        /* #251: what CPUIDs immediately preceded the guest parking? */
+                    if (kind == HYPE_VMM_KIND_VMX) {
+                        hype_vmx_vcpu_dump_cpuid_ring();
+                    }
+                    hype_debug_print("fw-1 IDLECODE: polled-counter VA = 0x%llx\n",
                                          (unsigned long long)cw_addr);
                         for (r = 0; r < 64u; r += 16u) {
                             hype_debug_print(

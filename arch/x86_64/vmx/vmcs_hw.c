@@ -966,6 +966,42 @@ static inline void vmx_real_cpuid(uint32_t eax, uint32_t ecx, hype_cpuid_result_
  * input (EAX/ECX), synthesize via the shared hype_cpuid_emulate(), write the
  * four result registers back, and advance past the 2-byte CPUID.
  */
+/*
+ * #251: ring of the most recent CPUIDs, dumped when the guest is detected idle.
+ *
+ * A flat cap like the MSR trace is useless here -- the guest issues ~35k CPUID
+ * exits, so the first 48 are all firmware. What matters is the LAST few before it
+ * parks: the transition ring shows it enumerating CPUID at one RIP and then
+ * halting ~0x4a bytes later, which is the shape of a feature check that fails.
+ * hype_cpuid_emulate() is shared between backends but starts from the REAL host
+ * CPUID, so what hype hands back genuinely differs on Intel.
+ */
+#define HYPE_VMX_CPUID_RING 12u
+static struct {
+    uint32_t eax_in, ecx_in, eax, ebx, ecx, edx;
+    uint64_t rip;
+} g_vmx_cpuid_ring[HYPE_VMX_CPUID_RING];
+static unsigned g_vmx_cpuid_ring_head = 0;
+static unsigned g_vmx_cpuid_ring_n = 0;
+
+void hype_vmx_vcpu_dump_cpuid_ring(void) {
+    unsigned i;
+    for (i = 0; i < g_vmx_cpuid_ring_n; i++) {
+        unsigned idx =
+            (g_vmx_cpuid_ring_head + HYPE_VMX_CPUID_RING - g_vmx_cpuid_ring_n + i) %
+            HYPE_VMX_CPUID_RING;
+        hype_debug_print("vmx CPUIDRING#%02u: leaf=0x%x sub=0x%x -> eax=0x%x ebx=0x%x ecx=0x%x "
+                         "edx=0x%x rip=0x%llx\n",
+                         i, (unsigned int)g_vmx_cpuid_ring[idx].eax_in,
+                         (unsigned int)g_vmx_cpuid_ring[idx].ecx_in,
+                         (unsigned int)g_vmx_cpuid_ring[idx].eax,
+                         (unsigned int)g_vmx_cpuid_ring[idx].ebx,
+                         (unsigned int)g_vmx_cpuid_ring[idx].ecx,
+                         (unsigned int)g_vmx_cpuid_ring[idx].edx,
+                         (unsigned long long)g_vmx_cpuid_ring[idx].rip);
+    }
+}
+
 void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint32_t eax_in = (uint32_t)real->gprs[0];
@@ -979,6 +1015,19 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     real->gprs[3] = out.ebx; /* RBX */
     real->gprs[1] = out.ecx; /* RCX */
     real->gprs[2] = out.edx; /* RDX */
+    {
+        int ok2;
+        unsigned h = g_vmx_cpuid_ring_head;
+        g_vmx_cpuid_ring[h].eax_in = eax_in;
+        g_vmx_cpuid_ring[h].ecx_in = ecx_in;
+        g_vmx_cpuid_ring[h].eax = out.eax;
+        g_vmx_cpuid_ring[h].ebx = out.ebx;
+        g_vmx_cpuid_ring[h].ecx = out.ecx;
+        g_vmx_cpuid_ring[h].edx = out.edx;
+        g_vmx_cpuid_ring[h].rip = vmread(HYPE_VMCS_GUEST_RIP, &ok2);
+        g_vmx_cpuid_ring_head = (h + 1u) % HYPE_VMX_CPUID_RING;
+        if (g_vmx_cpuid_ring_n < HYPE_VMX_CPUID_RING) { g_vmx_cpuid_ring_n++; }
+    }
     vmx_advance_rip();
 }
 
