@@ -91,4 +91,14 @@ void hype_pvclock_write_time_info(volatile struct hype_pvclock_vcpu_time_info *t
 void hype_pvclock_write_wall_clock(volatile struct hype_pvclock_wall_clock *wc, uint32_t sec,
                                     uint32_t nsec);
 
+/*
+ * Count of pvclock time-info page fills; nonzero proves a guest actually armed
+ * kvmclock. Declared here rather than in svm.h (its historical home) because BOTH
+ * backends arm pvclock now -- leaving it SVM-owned meant the VMX path could not
+ * increment it, so the "PVCLOCK arm_count" diagnostic would read 0 on Intel even
+ * once kvmclock worked. Still DEFINED in svm_vcpu.c; moving the definition is a
+ * tidy-up for whenever pvclock gets its own translation unit.
+ */
+extern volatile uint32_t g_hype_pvclock_arm_count;
+
 #endif /* HYPE_DEVICES_PVCLOCK_H */

@@ -166,6 +166,24 @@
 #define HYPE_MSR_IA32_CSTAR 0xC0000083u
 #define HYPE_MSR_IA32_SFMASK 0xC0000084u
 
+/*
+ * IA32_PAT (#251). SVM writes the guest's PAT into the VMCB's save.g_pat, which
+ * VMRUN loads; VMX has a VMCS field plus load/save controls and hype used neither,
+ * so a guest WRMSR to 0x277 was absorbed and its RDMSR answered 0. A guest that
+ * reads PAT as 0 concludes every memory type is UC -- this project has already
+ * paid for that once: PERF-1's ~5-minute guest boot was uncacheable guest RAM
+ * from g_pat=0.
+ */
+#define HYPE_VMCS_GUEST_IA32_PAT 0x2804u
+#define HYPE_VMCS_HOST_IA32_PAT 0x2C00u
+#define HYPE_VMX_ENTRY_LOAD_IA32_PAT (1u << 14)
+#define HYPE_VMX_EXIT_SAVE_IA32_PAT (1u << 18)
+#define HYPE_VMX_EXIT_LOAD_IA32_PAT (1u << 19)
+#define HYPE_MSR_IA32_PAT 0x277u
+/* x86 reset value: PAT0..7 = WB,WT,UC-,UC,WB,WT,UC-,UC. Used as the guest's
+ * starting PAT so memory is cacheable before the guest sets its own. */
+#define HYPE_VMX_PAT_RESET_VALUE 0x0007040600070406ull
+
 /* Host IA32_EFER (0x2C02, 64-bit host-state field), source for the above. */
 #define HYPE_VMCS_HOST_IA32_EFER 0x2C02u
 /* IA32_EFER's MSR number. Defined here rather than including the SVM header for

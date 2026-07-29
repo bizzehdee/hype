@@ -58,6 +58,10 @@ static int g_vmx_ack_intr_on_exit = 0;
  * needs it too -- either of CR0.PG and EFER.LME changing can flip long mode. */
 static void vmx_sync_long_mode(void);
 static void vmx_make_fs_gs_usable(void);
+/* #251: defined beside hype_vmx_vcpu_set_pvclock(), which owns the scale globals
+ * they read; the MSR handler above needs them. */
+static void vmx_pvclock_arm_system_time(struct hype_vcpu_ctx *real, uint64_t msr_value);
+static void vmx_pvclock_arm_wall_clock(struct hype_vcpu_ctx *real, uint64_t msr_value);
 
 /* #248: the VM-entry-controls capability MSR, cached at VMCS setup so a later
  * mode transition can re-adjust the controls instead of writing them raw.
@@ -160,6 +164,10 @@ struct hype_vcpu_ctx {
     uint32_t pending_irr[8];
     /* M4-6b1: the guest's pvclock shared page, if it enabled one. */
     const hype_gpa_map_t *pvclock_map;
+    /* #251: last value the guest wrote to each pvclock MSR, so a RDMSR reads back
+     * what it set. Mirrors the SVM ctx's fields of the same name. */
+    uint64_t pvclock_system_msr;
+    uint64_t pvclock_wall_msr;
 };
 
 /*
@@ -184,6 +192,10 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
         ctx->pending_irr[i] = 0;
     }
     ctx->pvclock_map = 0;
+    /* A slot reused by a later guest must not inherit a prior guest's armed
+     * pvclock pages -- same reasoning as the SVM path's reset. */
+    ctx->pvclock_system_msr = 0;
+    ctx->pvclock_wall_msr = 0;
 }
 
 static void hype_vmx_host_exit_stub(void) {
@@ -431,7 +443,8 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * rather than assuming it took. */
     uint32_t exit_ctls = hype_vmx_adjust_controls(
         HYPE_VMX_EXIT_HOST_ADDR_SPACE_SIZE | HYPE_VMX_EXIT_ACK_INTR_ON_EXIT |
-            HYPE_VMX_EXIT_SAVE_IA32_EFER | HYPE_VMX_EXIT_LOAD_IA32_EFER,
+            HYPE_VMX_EXIT_SAVE_IA32_EFER | HYPE_VMX_EXIT_LOAD_IA32_EFER |
+            HYPE_VMX_EXIT_SAVE_IA32_PAT | HYPE_VMX_EXIT_LOAD_IA32_PAT,
         exit_cap);
     g_vmx_ack_intr_on_exit = (exit_ctls & HYPE_VMX_EXIT_ACK_INTR_ON_EXIT) != 0u;
     /* Say which interrupt-consumption path is live. Without this the two are
@@ -458,7 +471,7 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * IA-32e-mode-guest stays mode-dependent and is kept in step from then on by
      * vmx_sync_long_mode() on every CR0.PG or EFER.LME change.
      */
-    uint32_t entry_desired = HYPE_VMX_ENTRY_LOAD_IA32_EFER |
+    uint32_t entry_desired = HYPE_VMX_ENTRY_LOAD_IA32_EFER | HYPE_VMX_ENTRY_LOAD_IA32_PAT |
                              (long_mode ? HYPE_VMX_ENTRY_IA32E_MODE_GUEST : 0u);
     uint32_t entry_ctls = hype_vmx_adjust_controls(entry_desired, entry_cap);
     g_vmx_entry_cap = entry_cap; /* #248: for vmx_sync_long_mode()'s re-adjust */
@@ -571,6 +584,11 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * synthesising one: hype's own EFER carries NXE/SCE that its page tables and
      * syscall path depend on. */
     rc |= vmwrite(HYPE_VMCS_HOST_IA32_EFER, rdmsr(HYPE_MSR_IA32_EFER));
+    /* #251: start the guest with a cacheable PAT rather than 0, and restore hype's
+     * own on exit -- PAT is not context-switched for us the way SVM's VMSAVE
+     * handles other MSRs. */
+    rc |= vmwrite(HYPE_VMCS_GUEST_IA32_PAT, HYPE_VMX_PAT_RESET_VALUE);
+    rc |= vmwrite(HYPE_VMCS_HOST_IA32_PAT, rdmsr(HYPE_MSR_IA32_PAT));
 
     /*
      * #251 slice 2: populate and wire the MSR areas.
@@ -1008,6 +1026,62 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
         return 0;
     }
 
+    /*
+     * PVCLOCK (kvmclock) -- #251/#236.
+     *
+     * hype advertises the KVM pvclock feature in CPUID leaf 0x40000001, whose own
+     * comment promises "the guest enables nothing hype doesn't back". That promise
+     * was SVM-only: these two MSRs were special-cased in svm_vcpu.c and nowhere
+     * else, so on VMX the guest armed kvmclock, the write fell through to the
+     * absorb path, and the time-info page was never filled -- PVCLOCK arm_count=0,
+     * a guest reading time from a page nothing writes.
+     *
+     * hype_vmx_vcpu_set_pvclock() already established the map and scale, so only
+     * the arming half was missing. Handled ahead of the action switch for the same
+     * reason SVM does it: these are not in msr_emulate's table.
+     */
+    if (msr_number == HYPE_MSR_KVM_SYSTEM_TIME_NEW || msr_number == HYPE_MSR_KVM_SYSTEM_TIME_OLD) {
+        if (is_write) {
+            real->pvclock_system_msr =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+            vmx_pvclock_arm_system_time(real, real->pvclock_system_msr);
+        } else {
+            real->gprs[0] = (uint64_t)(uint32_t)real->pvclock_system_msr;
+            real->gprs[2] = (uint64_t)(uint32_t)(real->pvclock_system_msr >> 32);
+        }
+        vmx_advance_rip();
+        return 0;
+    }
+    if (msr_number == HYPE_MSR_KVM_WALL_CLOCK_NEW || msr_number == HYPE_MSR_KVM_WALL_CLOCK_OLD) {
+        if (is_write) {
+            real->pvclock_wall_msr =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+            vmx_pvclock_arm_wall_clock(real, real->pvclock_wall_msr);
+        } else {
+            real->gprs[0] = (uint64_t)(uint32_t)real->pvclock_wall_msr;
+            real->gprs[2] = (uint64_t)(uint32_t)(real->pvclock_wall_msr >> 32);
+        }
+        vmx_advance_rip();
+        return 0;
+    }
+
+    /* #251: IA32_PAT into the VMCS field the CPU loads, mirroring what SVM does
+     * with save.g_pat. Must stay intercepted rather than passed through: PAT is
+     * not restored for hype automatically, and a guest write reaching the physical
+     * MSR would corrupt the host's own page-attribute table. */
+    if (msr_number == HYPE_MSR_IA32_PAT) {
+        if (is_write) {
+            vmwrite(HYPE_VMCS_GUEST_IA32_PAT,
+                    ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0]);
+        } else {
+            uint64_t pat = vmread(HYPE_VMCS_GUEST_IA32_PAT, &ok);
+            real->gprs[0] = (uint64_t)(uint32_t)pat;
+            real->gprs[2] = (uint64_t)(uint32_t)(pat >> 32);
+        }
+        vmx_advance_rip();
+        return 0;
+    }
+
     switch (action) {
     case HYPE_MSR_ACTION_READ_APIC_BASE: {
         uint64_t value = hype_msr_apic_base_value();
@@ -1074,6 +1148,29 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
          * microcode init, so that was reachable immediately. Reading 0 is what
          * a CPU without the feature would report.
          */
+        /*
+         * Name the MSRs being absorbed. "Absorb and continue" is the right
+         * default -- it is what keeps a guest alive past MSRs hype does not model
+         * -- but it is also silent, and a guest that reads a required MSR as 0 can
+         * decide to give up. The Intel guest halts in a `hlt; jmp` loop a few
+         * instructions after an RDMSR/WRMSR pair (visible in the transition ring),
+         * with no console output to say why, so the MSR number is the missing
+         * fact. SVM has had hype_svm_set_msr_trace() for this; VMX had nothing.
+         *
+         * Capped, and logs the WRMSR value too: for a write, what the guest was
+         * trying to set is usually more informative than the register number.
+         */
+        {
+            static unsigned msrtrace_n = 0;
+            if (msrtrace_n < 48u) {
+                msrtrace_n++;
+                hype_debug_print("vmx MSRTRACE: %s msr=0x%x value=0x%llx rip=0x%llx (absorbed)\n",
+                                 is_write ? "WRMSR" : "RDMSR", (unsigned int)msr_number,
+                                 (unsigned long long)(((uint64_t)(uint32_t)real->gprs[2] << 32) |
+                                                      (uint64_t)(uint32_t)real->gprs[0]),
+                                 (unsigned long long)vmread(HYPE_VMCS_GUEST_RIP, &ok));
+            }
+        }
         if (!is_write) {
             /* Only on a READ: a WRMSR's RAX/RDX hold the value the guest is
              * writing, and zeroing them would corrupt guest state rather than
@@ -2092,6 +2189,37 @@ void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *o
 static uint32_t g_vmx_pvclock_mul;
 static int8_t g_vmx_pvclock_shift;
 static uint64_t g_vmx_acpi_pm_tsc_hz;
+
+static void vmx_pvclock_arm_system_time(struct hype_vcpu_ctx *real, uint64_t msr_value) {
+    uint64_t gpa, host, now, system_ns;
+    if ((msr_value & HYPE_KVM_SYSTEM_TIME_ENABLE) == 0 || real->pvclock_map == 0) {
+        return;
+    }
+    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
+    host = hype_gpa_to_host(real->pvclock_map, gpa, sizeof(struct hype_pvclock_vcpu_time_info));
+    if (host == 0) {
+        return;
+    }
+    now = vmx_real_rdtsc();
+    system_ns = hype_pvclock_scale_delta(now, g_vmx_pvclock_mul, g_vmx_pvclock_shift);
+    hype_pvclock_write_time_info((volatile struct hype_pvclock_vcpu_time_info *)(uintptr_t)host, now,
+                                 system_ns, g_vmx_pvclock_mul, g_vmx_pvclock_shift,
+                                 HYPE_PVCLOCK_TSC_STABLE_BIT);
+    g_hype_pvclock_arm_count++;
+}
+
+static void vmx_pvclock_arm_wall_clock(struct hype_vcpu_ctx *real, uint64_t msr_value) {
+    uint64_t gpa, host;
+    if (real->pvclock_map == 0) {
+        return;
+    }
+    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
+    host = hype_gpa_to_host(real->pvclock_map, gpa, sizeof(struct hype_pvclock_wall_clock));
+    if (host == 0) {
+        return;
+    }
+    hype_pvclock_write_wall_clock((volatile struct hype_pvclock_wall_clock *)(uintptr_t)host, 0, 0);
+}
 
 void hype_vmx_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, uint64_t tsc_hz) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
