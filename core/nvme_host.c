@@ -64,6 +64,21 @@ void hype_nvme_build_identify_sqe(uint8_t sqe[64], uint16_t cid, uint32_t cns, u
     put_le32(sqe + 40, cns);            /* CDW10: CNS */
 }
 
+void hype_nvme_build_set_num_queues_sqe(uint8_t sqe[64], uint16_t cid, uint16_t nsq,
+                                        uint16_t ncq) {
+    zero_sqe(sqe);
+    sqe[0] = HYPE_NVME_ADM_SET_FEATURES;
+    sqe[2] = (uint8_t)cid;
+    sqe[3] = (uint8_t)(cid >> 8);
+    put_le32(sqe + 40, HYPE_NVME_FEAT_NUM_QUEUES); /* CDW10: FID */
+    /* CDW11: number REQUESTED, 0-based in both halves. */
+    put_le32(sqe + 44, ((uint32_t)(ncq - 1u) << 16) | (uint32_t)(nsq - 1u));
+}
+
+uint32_t hype_nvme_cqe_dw0(const uint8_t cqe[16]) {
+    return rd_le32(cqe + 0);
+}
+
 int hype_nvme_cqe_phase(const uint8_t cqe[16]) {
     return (int)(rd_le16(cqe + 14) & 1u);
 }

@@ -38,6 +38,8 @@
 #define HYPE_NVME_ADM_CREATE_IO_SQ 0x01u
 #define HYPE_NVME_ADM_CREATE_IO_CQ 0x05u
 #define HYPE_NVME_ADM_IDENTIFY 0x06u
+#define HYPE_NVME_ADM_SET_FEATURES 0x09u
+#define HYPE_NVME_FEAT_NUM_QUEUES 0x07u
 #define HYPE_NVME_IO_READ 0x02u
 #define HYPE_NVME_IO_WRITE 0x01u
 #define HYPE_NVME_CNS_NAMESPACE 0x00u
@@ -71,6 +73,21 @@ void hype_nvme_build_write_sqe(uint8_t sqe[64], uint16_t cid, uint32_t nsid, uin
  */
 void hype_nvme_build_identify_sqe(uint8_t sqe[64], uint16_t cid, uint32_t cns, uint32_t nsid,
                                   uint64_t prp1);
+
+/*
+ * #255: Set Features -- Number of Queues (FID 0x07). The host is required to
+ * NEGOTIATE how many I/O queues it will use before creating any; QEMU forgives
+ * skipping this, but real controllers may accept Create I/O CQ/SQ and then
+ * never service the queue (observed on SK hynix 1c5c:1d59: I/O CQE never
+ * posted, admin path fine). CDW11 = (NCQR-1)<<16 | (NSQR-1). The completion's
+ * DWORD0 reports how many the controller actually allocated, same encoding.
+ */
+void hype_nvme_build_set_num_queues_sqe(uint8_t sqe[64], uint16_t cid, uint16_t nsq,
+                                        uint16_t ncq);
+
+/* Completion entry DWORD0 (command-specific result -- e.g. Set Features
+ * Number of Queues returns the allocated counts here). */
+uint32_t hype_nvme_cqe_dw0(const uint8_t cqe[16]);
 
 /* CQE decoders (NVMe 1.4 §4.6). The status word is CQE bytes 14-15: bit0 is the
  * phase tag, bits 15:1 are the Status Field (Status Code + Status Code Type). */

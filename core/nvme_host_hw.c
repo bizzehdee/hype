@@ -36,7 +36,10 @@ static uint64_t g_nvme_total_sectors;
 static unsigned g_admin_sq_tail, g_admin_cq_head, g_admin_phase;
 static unsigned g_io_sq_tail, g_io_cq_head, g_io_phase;
 
-#define SPIN 20000000u
+/* #255: ~5x longer than the original 20M -- on the 2.1 GHz AMD laptop the old
+ * window was only ~0.3s of PAUSE loops, marginal for a drive's first medium
+ * access out of power-on. Only a FAILING command ever waits this long. */
+#define SPIN 100000000u
 
 static inline uint32_t rd32(volatile uint8_t *b, uint32_t off) {
     return *(volatile uint32_t *)(b + off);
@@ -151,6 +154,39 @@ int hype_nvme_host_init(uint64_t abar_phys) {
         if (spins-- == 0u) { return -1; }
     }
 
+    /*
+     * #255: NEGOTIATE the I/O queue count (Set Features, FID 0x07) BEFORE
+     * creating any I/O queue. The spec expects this and every OS driver does
+     * it; QEMU forgives skipping it, but the SK hynix 1c5c:1d59 in the AMD
+     * laptop accepted Create I/O CQ/SQ without it and then never serviced the
+     * I/O queue (CQE never posted, admin path fine -- see the ticket). The
+     * completion's DWORD0 reports the ALLOCATED counts; we need 1+1, and a
+     * controller allocating zero is a hard init failure, reported loudly.
+     */
+    {
+        unsigned k;
+        for (k = 0; k < 64u; k++) { sqe[k] = 0; }
+        hype_nvme_build_set_num_queues_sqe(sqe, ++g_cid, 1u, 1u);
+        if (submit_and_poll(bar, g_admin_sq, g_admin_cq, 0, &g_admin_sq_tail, &g_admin_cq_head,
+                            &g_admin_phase, sqe) != 0) {
+            extern void hype_debug_print(const char *fmt, ...);
+            hype_debug_print("#255dbg nvme: Set Features (Number of Queues) FAILED\n");
+            return -1;
+        }
+        {
+            extern void hype_debug_print(const char *fmt, ...);
+            /* DW0 of the completion we just consumed: cq_head already advanced,
+             * so look one entry back (with wrap). */
+            unsigned prev = (g_admin_cq_head + Q_ENTRIES - 1u) % Q_ENTRIES;
+            uint32_t dw0 = hype_nvme_cqe_dw0(g_admin_cq + prev * HYPE_NVME_CQE_SIZE);
+            hype_debug_print("#255dbg nvme: queues allocated NSQA=%u NCQA=%u (dw0=0x%08x)\n",
+                             (unsigned)(dw0 & 0xFFFFu) + 1u, (unsigned)(dw0 >> 16) + 1u, dw0);
+            if ((dw0 & 0xFFFFu) + 1u < 1u || (dw0 >> 16) + 1u < 1u) {
+                return -1;
+            }
+        }
+    }
+
     /* Create the I/O completion queue (qid 1), physically contiguous. */
     {
         unsigned k;
@@ -163,6 +199,8 @@ int hype_nvme_host_init(uint64_t abar_phys) {
         *(uint32_t *)(sqe + 44) = 0x1u;                          /* CDW11: PC=1, IEN=0 */
         if (submit_and_poll(bar, g_admin_sq, g_admin_cq, 0, &g_admin_sq_tail, &g_admin_cq_head,
                             &g_admin_phase, sqe) != 0) {
+            extern void hype_debug_print(const char *fmt, ...);
+            hype_debug_print("#255dbg nvme: Create I/O CQ FAILED\n");
             return -1;
         }
     }
@@ -178,6 +216,8 @@ int hype_nvme_host_init(uint64_t abar_phys) {
         *(uint32_t *)(sqe + 44) = (1u << 16) | 0x1u;             /* CDW11: CQID=1, PC=1 */
         if (submit_and_poll(bar, g_admin_sq, g_admin_cq, 0, &g_admin_sq_tail, &g_admin_cq_head,
                             &g_admin_phase, sqe) != 0) {
+            extern void hype_debug_print(const char *fmt, ...);
+            hype_debug_print("#255dbg nvme: Create I/O SQ FAILED\n");
             return -1;
         }
     }

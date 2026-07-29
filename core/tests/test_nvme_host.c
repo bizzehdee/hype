@@ -141,7 +141,41 @@ static void test_cap_and_doorbell(void) {
     CHECK_HEX("cq0 head, dstrd 0", 0x1000u + 4u, hype_nvme_doorbell_offset(0, 1, 0));
 }
 
+
+/* #255: Set Features (Number of Queues) builder + completion DW0 reader. */
+static void test_set_num_queues(void) {
+    uint8_t sqe[64];
+    uint8_t cqe[16] = {0};
+    unsigned i;
+
+    hype_nvme_build_set_num_queues_sqe(sqe, 0x1234u, 1u, 1u);
+    CHECK_HEX("opcode is Set Features", HYPE_NVME_ADM_SET_FEATURES, sqe[0]);
+    CHECK_HEX("cid lo", 0x34u, sqe[2]);
+    CHECK_HEX("cid hi", 0x12u, sqe[3]);
+    CHECK_HEX("CDW10 = FID 0x07", HYPE_NVME_FEAT_NUM_QUEUES,
+              (uint32_t)sqe[40] | ((uint32_t)sqe[41] << 8) | ((uint32_t)sqe[42] << 16) |
+                  ((uint32_t)sqe[43] << 24));
+    /* 1 SQ + 1 CQ, 0-based in both halves: CDW11 == 0. */
+    CHECK_HEX("CDW11 for 1+1", 0u,
+              (uint32_t)sqe[44] | ((uint32_t)sqe[45] << 8) | ((uint32_t)sqe[46] << 16) |
+                  ((uint32_t)sqe[47] << 24));
+    /* No NSID, no PRPs on this command. */
+    for (i = 4; i < 40u; i++) {
+        if (sqe[i] != 0u) { CHECK_HEX("no stray bytes", 0u, sqe[i]); break; }
+    }
+    /* A larger ask encodes 0-based. */
+    hype_nvme_build_set_num_queues_sqe(sqe, 1u, 4u, 2u);
+    CHECK_HEX("CDW11 for 4 SQ + 2 CQ", (1u << 16) | 3u,
+              (uint32_t)sqe[44] | ((uint32_t)sqe[45] << 8) | ((uint32_t)sqe[46] << 16) |
+                  ((uint32_t)sqe[47] << 24));
+
+    /* DW0 comes back little-endian from the CQE's first four bytes. */
+    cqe[0] = 0x03u; cqe[1] = 0x00u; cqe[2] = 0x01u; cqe[3] = 0x00u; /* NSQA=4, NCQA=2 */
+    CHECK_HEX("cqe dw0", 0x00010003u, hype_nvme_cqe_dw0(cqe));
+}
+
 int main(void) {
+    test_set_num_queues();
     test_read_sqe();
     test_write_sqe();
     test_identify_sqe();
