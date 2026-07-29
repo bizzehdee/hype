@@ -68,6 +68,49 @@ static void vmx_make_fs_gs_usable(void);
  * combination the hardware rejects at the next entry. */
 static uint64_t g_vmx_entry_cap = 0;
 
+/*
+ * #251 slice 2: the VM-entry/exit MSR areas.
+ *
+ * Layout is fixed by the SDM (Table 24-14): 32-bit MSR index, 32 reserved bits,
+ * then the 64-bit value; the area must be 16-byte aligned.
+ *
+ * g_vmx_msr_guest is used for BOTH entry-load and exit-store. That is the point:
+ * SWAPGS exchanges GS.base with IA32_KERNEL_GS_BASE without causing a VM exit, so
+ * hype cannot observe it. Storing on exit into the same table the next entry loads
+ * from means the guest's value survives regardless of how it changed.
+ *
+ * g_vmx_msr_host is exit-load-only, capturing hype's own values so the host does
+ * not resume on the guest's SYSCALL targets or per-CPU base.
+ */
+typedef struct {
+    uint32_t index;
+    uint32_t reserved;
+    uint64_t value;
+} hype_vmx_msr_entry_t;
+
+static const uint32_t g_vmx_msr_list[] = {
+    HYPE_MSR_IA32_KERNEL_GS_BASE, HYPE_MSR_IA32_STAR, HYPE_MSR_IA32_LSTAR,
+    HYPE_MSR_IA32_CSTAR,          HYPE_MSR_IA32_SFMASK,
+};
+#define HYPE_VMX_MSR_AREA_COUNT (sizeof(g_vmx_msr_list) / sizeof(g_vmx_msr_list[0]))
+
+static hype_vmx_msr_entry_t g_vmx_msr_guest[HYPE_VMX_MSR_AREA_COUNT]
+    __attribute__((aligned(16)));
+static hype_vmx_msr_entry_t g_vmx_msr_host[HYPE_VMX_MSR_AREA_COUNT]
+    __attribute__((aligned(16)));
+
+/* Index into g_vmx_msr_guest for `msr`, or -1. Used by the RDMSR/WRMSR handler so
+ * the guest reads back what it wrote even between transitions. */
+static int vmx_msr_area_slot(uint32_t msr) {
+    unsigned i;
+    for (i = 0; i < HYPE_VMX_MSR_AREA_COUNT; i++) {
+        if (g_vmx_msr_list[i] == msr) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 /* EPT paging structures for the (currently single) VMX test vCPU. Identity
  * map, built once in hype_vmx_vcpu_create() when no external root is passed.
  * Same shape/ownership as the SVM NPT tables; page-aligned as EPT requires. */
@@ -528,6 +571,40 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * synthesising one: hype's own EFER carries NXE/SCE that its page tables and
      * syscall path depend on. */
     rc |= vmwrite(HYPE_VMCS_HOST_IA32_EFER, rdmsr(HYPE_MSR_IA32_EFER));
+
+    /*
+     * #251 slice 2: populate and wire the MSR areas.
+     *
+     * The HOST side is snapshotted from the live MSRs so a VM exit restores hype's
+     * own per-CPU base and SYSCALL targets. The GUEST side starts at 0 -- a fresh
+     * guest has no per-CPU area or syscall handlers, and 0 is what real hardware
+     * presents after reset.
+     *
+     * Without this, IA32_KERNEL_GS_BASE simply is not virtualised: the guest and
+     * hype share the physical MSR, so a guest SWAPGS installs whatever hype last
+     * put there (measured: 0). A Linux guest's early per-CPU access then reads
+     * through a zero base and faults before its IDT exists -- which is how it ends
+     * up parked in `hlt; jmp` with no console output.
+     */
+    {
+        unsigned i;
+        for (i = 0; i < HYPE_VMX_MSR_AREA_COUNT; i++) {
+            g_vmx_msr_host[i].index = g_vmx_msr_list[i];
+            g_vmx_msr_host[i].reserved = 0;
+            g_vmx_msr_host[i].value = rdmsr(g_vmx_msr_list[i]);
+            g_vmx_msr_guest[i].index = g_vmx_msr_list[i];
+            g_vmx_msr_guest[i].reserved = 0;
+            g_vmx_msr_guest[i].value = 0;
+        }
+    }
+    rc |= vmwrite(HYPE_VMCS_VM_ENTRY_MSR_LOAD_ADDR, (uint64_t)(uintptr_t)g_vmx_msr_guest);
+    rc |= vmwrite(HYPE_VMCS_VM_ENTRY_MSR_LOAD_COUNT, (uint64_t)HYPE_VMX_MSR_AREA_COUNT);
+    /* Same area as the entry list on purpose -- see the declaration: this is what
+     * lets a SWAPGS-driven change survive, since that instruction never exits. */
+    rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_STORE_ADDR, (uint64_t)(uintptr_t)g_vmx_msr_guest);
+    rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_STORE_COUNT, (uint64_t)HYPE_VMX_MSR_AREA_COUNT);
+    rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_LOAD_ADDR, (uint64_t)(uintptr_t)g_vmx_msr_host);
+    rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_LOAD_COUNT, (uint64_t)HYPE_VMX_MSR_AREA_COUNT);
     /*
      * #248: the host must OWN the fixed bits, not merely set them once here.
      * Satisfying the fixed-bit MSRs for the initial VMCS is not enough -- the
@@ -904,6 +981,32 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
     uint32_t msr_number = (uint32_t)real->gprs[1];
     hype_msr_action_t action = hype_msr_decide(msr_number, is_write);
     int ok;
+    int area_slot = vmx_msr_area_slot(msr_number);
+
+    /*
+     * #251 slice 2: MSRs carried in the VM-entry/exit areas are serviced from that
+     * same table, ahead of the action switch.
+     *
+     * They are deliberately absent from msr_emulate's action list: hardware loads
+     * and stores them around every transition, and hype only sees the accesses at
+     * all because there is no MSR bitmap yet, so every RDMSR/WRMSR exits. Reading
+     * and writing the table keeps ONE source of truth -- letting these fall to the
+     * absorb path instead would discard a guest write that the next entry-load
+     * would then contradict, and satisfy a guest read with 0 while the hardware
+     * held something else.
+     */
+    if (area_slot >= 0) {
+        if (is_write) {
+            g_vmx_msr_guest[area_slot].value =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+        } else {
+            uint64_t v = g_vmx_msr_guest[area_slot].value;
+            real->gprs[0] = (uint64_t)(uint32_t)v;
+            real->gprs[2] = (uint64_t)(uint32_t)(v >> 32);
+        }
+        vmx_advance_rip();
+        return 0;
+    }
 
     switch (action) {
     case HYPE_MSR_ACTION_READ_APIC_BASE: {

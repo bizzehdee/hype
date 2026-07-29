@@ -135,6 +135,37 @@
  */
 #define HYPE_VMX_EXIT_SAVE_IA32_EFER (1u << 20)
 #define HYPE_VMX_EXIT_LOAD_IA32_EFER (1u << 21)
+/*
+ * VM-entry / VM-exit MSR areas (#251 slice 2). Appendix B, 64-bit control fields.
+ *
+ * Needed for MSRs that have NO VMCS field and that the guest can change without
+ * a VM exit. IA32_KERNEL_GS_BASE is the motivating case: SWAPGS exchanges it with
+ * GS.base and does not exit, so a value hype captured at WRMSR time would be
+ * stale the moment the guest swaps. The hardware areas avoid that -- it loads and
+ * stores them itself around every transition.
+ *
+ * The guest area is used for BOTH entry-load and exit-store, deliberately: the
+ * exit stores whatever the guest ended up with (including via SWAPGS) into the
+ * same table the next entry loads from, so guest changes persist without hype
+ * observing them. The host area is separate and exit-load-only.
+ */
+#define HYPE_VMCS_VM_EXIT_MSR_STORE_ADDR 0x2006u
+#define HYPE_VMCS_VM_EXIT_MSR_LOAD_ADDR 0x2008u
+#define HYPE_VMCS_VM_ENTRY_MSR_LOAD_ADDR 0x200Au
+#define HYPE_VMCS_VM_EXIT_MSR_STORE_COUNT 0x400Eu
+#define HYPE_VMCS_VM_EXIT_MSR_LOAD_COUNT 0x4010u
+#define HYPE_VMCS_VM_ENTRY_MSR_LOAD_COUNT 0x4014u
+
+/* MSRs carried in those areas. KERNEL_GS_BASE is the one that matters for a Linux
+ * guest reaching userspace; the SYSCALL set is included because it has exactly the
+ * same shape -- no VMCS field, changed by the guest, and supplied free by
+ * vmload/vmsave on SVM -- so finding each one via its own fault would be waste. */
+#define HYPE_MSR_IA32_KERNEL_GS_BASE 0xC0000102u
+#define HYPE_MSR_IA32_STAR 0xC0000081u
+#define HYPE_MSR_IA32_LSTAR 0xC0000082u
+#define HYPE_MSR_IA32_CSTAR 0xC0000083u
+#define HYPE_MSR_IA32_SFMASK 0xC0000084u
+
 /* Host IA32_EFER (0x2C02, 64-bit host-state field), source for the above. */
 #define HYPE_VMCS_HOST_IA32_EFER 0x2C02u
 /* IA32_EFER's MSR number. Defined here rather than including the SVM header for
