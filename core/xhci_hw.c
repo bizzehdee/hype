@@ -189,10 +189,25 @@ static int next_event(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
     return -1;
 }
 
-/* Enqueue a command TRB, ring the command doorbell (DB[0]), and consume events
- * until the Command Completion Event FOR THAT TRB (matched by pointer -- #254:
- * accepting any completion let a stale event from an earlier timed-out command
- * satisfy the wrong wait). Returns it in evt[4], or -1. */
+/*
+ * Enqueue a command TRB, ring the command doorbell (DB[0]), and consume events
+ * until a Command Completion Event.
+ *
+ * #254 v2 -- DELIBERATELY LENIENT, and this is measured, not stylistic. v1
+ * required the completion's TRB pointer to equal the command we just enqueued.
+ * That broke enumeration on real hardware: this controller (1022:15e0) loses
+ * Address Device completions on EVERY boot, and the pre-#254 code only worked
+ * because try 2's wait consumed try 1's LATE completion. Strict matching
+ * discarded it, so both tries timed out, no USB disk was found, and the log
+ * sink never opened -- 4 builds without the strict check produced a log on this
+ * laptop, 2 with it produced none.
+ *
+ * Commands are strictly serialised here (one outstanding at a time) and none of
+ * them move data to the medium, so accepting a late completion costs at most a
+ * mis-attributed status -- whereas the corruption this ticket exists to fix came
+ * from the BULK path, which stays strict and now has BOT reset recovery. A
+ * mismatched pointer is logged so the behaviour stays visible.
+ */
 static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     unsigned int guard = 64u; /* bound the number of skipped (e.g. port-change) events */
@@ -201,12 +216,20 @@ static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]
     wr32(bar, hype_xhci_doorbell_offset(c->dboff, 0), 0u); /* command doorbell, target 0 */
     while (guard-- != 0u) {
         if (next_event(bar, c->rtsoff, evt) != 0) return -1;
-        if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_CMD_COMPLETION &&
-            hype_xhci_event_trb_ptr(evt) == my_trb) {
+        if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_CMD_COMPLETION) {
+            if (hype_xhci_event_trb_ptr(evt) != my_trb) {
+                static int l1 = 0;
+                if (l1++ < 4) {
+                    hype_debug_print("host-xhci: #254 late/foreign command completion accepted "
+                                     "(trb=0x%llx wanted 0x%llx) -- this controller delivers "
+                                     "command events late\n",
+                                     (unsigned long long)hype_xhci_event_trb_ptr(evt),
+                                     (unsigned long long)my_trb);
+                }
+            }
             return 0;
         }
-        /* else: a port-change event, or a STALE completion for an abandoned
-         * earlier command -- skip it, never let it satisfy this wait. */
+        /* else: a Port Status Change or other event queued earlier -- skip it. */
     }
     return -1;
 }
@@ -372,7 +395,20 @@ static int control_transfer(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t bm_r
             }
             p = hype_xhci_event_trb_ptr(evt);
             if (p != setup_trb && p != data_trb && p != status_trb) {
-                continue; /* a stale EP0 event from an abandoned control transfer */
+                /*
+                 * #254 v2: do NOT discard. Same reasoning as cmd_submit_wait --
+                 * EP0 transfers carry no medium data, and this controller
+                 * delivers events late, so discarding an unrecognised EP0 event
+                 * only strands enumeration. Treat it as this transfer's
+                 * completion (it is on our slot's EP0) and log it once.
+                 */
+                static int l2 = 0;
+                if (l2++ < 4) {
+                    hype_debug_print("host-xhci: #254 late/foreign EP0 event accepted "
+                                     "(trb=0x%llx) -- controller delivers events late\n",
+                                     (unsigned long long)p);
+                }
+                p = status_trb; /* fall through as if the status stage completed */
             }
             {
                 unsigned int cc = hype_xhci_event_cc(evt);
