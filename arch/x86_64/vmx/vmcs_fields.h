@@ -117,6 +117,36 @@
  * hypervisor when nested) is permitted not to support it.
  */
 #define HYPE_VMX_EXIT_ACK_INTR_ON_EXIT (1u << 15)
+/*
+ * VM-exit controls for IA32_EFER (#248). These pair with the entry-side
+ * LOAD_IA32_EFER: once the guest runs on its OWN EFER, the host's must be put
+ * back on exit and the guest's preserved.
+ *
+ * "load IA32_EFER" (bit 21) restores EFER from HOST_IA32_EFER on VM exit. Not
+ * strictly required -- with "host address-space size" set, an exit forces
+ * EFER.LME/LMA to 1 anyway, which is what a 64-bit host needs -- but the other
+ * EFER bits (NXE, SCE) would otherwise keep the GUEST's values in host context.
+ * NXE in particular changes how the host's own page tables are interpreted, so
+ * restore it explicitly rather than relying on the two bits the exit fixes up.
+ *
+ * "save IA32_EFER" (bit 20) writes the guest's EFER back to GUEST_IA32_EFER on
+ * exit, so a change the guest made through a path hype did not intercept is not
+ * silently reverted by the next entry.
+ */
+#define HYPE_VMX_EXIT_SAVE_IA32_EFER (1u << 20)
+#define HYPE_VMX_EXIT_LOAD_IA32_EFER (1u << 21)
+/* Host IA32_EFER (0x2C02, 64-bit host-state field), source for the above. */
+#define HYPE_VMCS_HOST_IA32_EFER 0x2C02u
+/* IA32_EFER's MSR number. Defined here rather than including the SVM header for
+ * it -- the two backends share the architectural constant, not each other's
+ * headers (svm.h has its own HYPE_MSR_EFER for the same register). */
+#define HYPE_MSR_IA32_EFER 0xC0000080u
+/* EFER bits hype has to keep consistent with CR0.PG for a mode transition. */
+#define HYPE_VMX_EFER_LME (1ull << 8)
+#define HYPE_VMX_EFER_LMA (1ull << 10)
+/* CR0.PG. Host-owned (#248) so hype sees the guest enabling/disabling paging and
+ * can keep EFER.LMA and the IA-32e-mode-guest entry control in step with it. */
+#define HYPE_VMX_CR0_PG (1ull << 31)
 
 /* 16-bit fields (Table B-2/B-3). */
 #define HYPE_VMCS_GUEST_ES_SELECTOR 0x0800u

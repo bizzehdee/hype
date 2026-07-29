@@ -54,6 +54,19 @@ static uint8_t g_virtual_apic_page[4096] __attribute__((aligned(4096)));
  * either loses every host timer tick or reinstates the exit storm. */
 static int g_vmx_ack_intr_on_exit = 0;
 
+/* #248: defined next to the CR-access handler, but the EFER WRMSR path above it
+ * needs it too -- either of CR0.PG and EFER.LME changing can flip long mode. */
+static void vmx_sync_long_mode(void);
+
+/* #248: the VM-entry-controls capability MSR, cached at VMCS setup so a later
+ * mode transition can re-adjust the controls instead of writing them raw.
+ * Writing a raw value is how the first version of vmx_sync_long_mode() produced
+ * VM-instruction-error 7 (invalid control fields): hype_vmx_adjust_controls()
+ * forces the required-1 bits and masks off anything the CPU -- or an L0
+ * hypervisor, when nested -- does not allow, and skipping it means writing a
+ * combination the hardware rejects at the next entry. */
+static uint64_t g_vmx_entry_cap = 0;
+
 /* EPT paging structures for the (currently single) VMX test vCPU. Identity
  * map, built once in hype_vmx_vcpu_create() when no external root is passed.
  * Same shape/ownership as the SVM NPT tables; page-aligned as EPT requires. */
@@ -373,7 +386,9 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * hypervisor, when nested) does not support it -- hence the read-back below
      * rather than assuming it took. */
     uint32_t exit_ctls = hype_vmx_adjust_controls(
-        HYPE_VMX_EXIT_HOST_ADDR_SPACE_SIZE | HYPE_VMX_EXIT_ACK_INTR_ON_EXIT, exit_cap);
+        HYPE_VMX_EXIT_HOST_ADDR_SPACE_SIZE | HYPE_VMX_EXIT_ACK_INTR_ON_EXIT |
+            HYPE_VMX_EXIT_SAVE_IA32_EFER | HYPE_VMX_EXIT_LOAD_IA32_EFER,
+        exit_cap);
     g_vmx_ack_intr_on_exit = (exit_ctls & HYPE_VMX_EXIT_ACK_INTR_ON_EXIT) != 0u;
     /* Say which interrupt-consumption path is live. Without this the two are
      * indistinguishable in a log -- both stop the storm -- and there would be no
@@ -382,12 +397,27 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     hype_debug_print("vmx: ack-intr-on-exit=%s (exit_ctls=0x%x) -- interrupts consumed by %s\n",
                      g_vmx_ack_intr_on_exit ? "yes" : "no", (unsigned int)exit_ctls,
                      g_vmx_ack_intr_on_exit ? "explicit dispatch" : "STI window");
-    /* A long-mode guest needs IA-32e-mode-guest + load-IA32_EFER so the CPU
-     * establishes EFER.LME/LMA consistently with CR0.PG/CR4.PAE. A real-mode
-     * guest needs neither (entry controls stay just the required-1 bits). */
-    uint32_t entry_desired =
-        long_mode ? (HYPE_VMX_ENTRY_IA32E_MODE_GUEST | HYPE_VMX_ENTRY_LOAD_IA32_EFER) : 0;
+    /*
+     * IA-32e-mode-guest depends on the mode the guest is in; load-IA32_EFER does
+     * NOT and is now requested unconditionally (#248).
+     *
+     * The old "a real-mode guest needs neither" was wrong in a way that only a
+     * guest which CHANGES mode could expose. Without load-IA32_EFER the CPU never
+     * loads EFER from GUEST_IA32_EFER on entry, so the guest runs on the HOST's
+     * EFER -- and hype's host is 64-bit, i.e. EFER.LMA=1. The guest was therefore
+     * executing with LMA set while its own CR0.PG was 0, an architecturally
+     * impossible pair, and OVMF's long-mode trampoline took #GP the moment it
+     * tried to set CR0.PG. hype's WRMSR handler had been dutifully recording the
+     * guest's EFER writes into GUEST_IA32_EFER all along; nothing was loading
+     * them.
+     *
+     * IA-32e-mode-guest stays mode-dependent and is kept in step from then on by
+     * vmx_sync_long_mode() on every CR0.PG or EFER.LME change.
+     */
+    uint32_t entry_desired = HYPE_VMX_ENTRY_LOAD_IA32_EFER |
+                             (long_mode ? HYPE_VMX_ENTRY_IA32E_MODE_GUEST : 0u);
     uint32_t entry_ctls = hype_vmx_adjust_controls(entry_desired, entry_cap);
+    g_vmx_entry_cap = entry_cap; /* #248: for vmx_sync_long_mode()'s re-adjust */
 
     rc |= vmwrite(HYPE_VMCS_PIN_BASED_VM_EXEC_CONTROL, pin_ctls);
     rc |= vmwrite(HYPE_VMCS_CPU_BASED_VM_EXEC_CONTROL, proc_ctls);
@@ -487,9 +517,16 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     rc |= vmwrite(HYPE_VMCS_GUEST_CR0, guest_cr0);
     rc |= vmwrite(HYPE_VMCS_GUEST_CR3, long_mode ? guest_cr3 : 0);
     rc |= vmwrite(HYPE_VMCS_GUEST_CR4, guest_cr4);
-    if (long_mode) {
-        rc |= vmwrite(HYPE_VMCS_GUEST_IA32_EFER, 0x500ull); /* LME|LMA */
-    }
+    /* #248: write GUEST_IA32_EFER in BOTH cases now that load-IA32_EFER is always
+     * on. A real-mode guest must start from a clean EFER=0 -- leaving the field
+     * unwritten would have the guest inherit whatever it held, and the whole
+     * point of this change is that the guest no longer runs on the host's EFER. */
+    rc |= vmwrite(HYPE_VMCS_GUEST_IA32_EFER,
+                  long_mode ? (HYPE_VMX_EFER_LME | HYPE_VMX_EFER_LMA) : 0ull);
+    /* Source for the exit-side restore. Read the live host value rather than
+     * synthesising one: hype's own EFER carries NXE/SCE that its page tables and
+     * syscall path depend on. */
+    rc |= vmwrite(HYPE_VMCS_HOST_IA32_EFER, rdmsr(HYPE_MSR_IA32_EFER));
     /*
      * #248: the host must OWN the fixed bits, not merely set them once here.
      * Satisfying the fixed-bit MSRs for the initial VMCS is not enough -- the
@@ -507,8 +544,16 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * The read shadows therefore start WITHOUT the host-owned bits: a guest that
      * reads CR4 here must not see VMXE, or it would conclude the CPU is already
      * in VMX operation.
+     *
+     * CR0.PG is owned too, for a different reason from CR0.NE: not because the
+     * hardware requires a value, but because hype needs to SEE the guest change
+     * it. Enabling paging with EFER.LME set is the long-mode transition, and both
+     * EFER.LMA and the IA-32e-mode-guest entry control have to move with it
+     * (#248). An unowned PG loads silently and hype would never know. PG is NOT
+     * masked out of the read shadow below -- unlike VMXE and NE it is the guest's
+     * own bit, so it must read back exactly as the guest set it.
      */
-    rc |= vmwrite(HYPE_VMCS_CR0_GUEST_HOST_MASK, HYPE_VMX_CR0_NE);
+    rc |= vmwrite(HYPE_VMCS_CR0_GUEST_HOST_MASK, HYPE_VMX_CR0_NE | HYPE_VMX_CR0_PG);
     rc |= vmwrite(HYPE_VMCS_CR4_GUEST_HOST_MASK, HYPE_VMX_CR4_VMXE);
     rc |= vmwrite(HYPE_VMCS_CR0_READ_SHADOW, guest_cr0 & ~HYPE_VMX_CR0_NE);
     rc |= vmwrite(HYPE_VMCS_CR4_READ_SHADOW, guest_cr4 & ~HYPE_VMX_CR4_VMXE);
@@ -871,6 +916,12 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
             uint64_t value =
                 ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
             vmwrite(HYPE_VMCS_GUEST_IA32_EFER, value);
+            /* #248: LME may just have changed. Long mode is CR0.PG && EFER.LME,
+             * so the same recompute the CR0 path does is needed here -- the guest
+             * sets LME first and PG second, and either order must leave the VMCS
+             * self-consistent. Also re-derives LMA, so a guest writing LME|LMA by
+             * hand cannot claim long mode before enabling paging. */
+            vmx_sync_long_mode();
         } else {
             uint64_t efer = vmread(HYPE_VMCS_GUEST_IA32_EFER, &ok);
             real->gprs[0] = (uint64_t)(uint32_t)efer;
@@ -2364,6 +2415,48 @@ uint32_t hype_vmx_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx) {
     return (uint32_t)real->gprs[1]; /* RCX */
 }
 
+/*
+ * #248: keep EFER.LMA and the IA-32e-mode-guest entry control in step with the
+ * guest's CR0.PG and EFER.LME.
+ *
+ * Long mode is active exactly when CR0.PG and EFER.LME are both set, and VMX
+ * requires the VMCS to agree: VM entry checks that IA-32e-mode-guest matches
+ * EFER.LMA (and that CR0.PG is set when it is). The guest performs this
+ * transition itself, in stages -- set CR4.PAE, set EFER.LME, then set CR0.PG --
+ * so hype has to recompute after each of the two events that can change the
+ * answer, not once at creation.
+ *
+ * Derives LMA rather than trusting whatever the guest wrote into EFER: LMA is
+ * hardware-maintained, and a guest setting it directly is not something to
+ * honour.
+ */
+static void vmx_sync_long_mode(void) {
+    int ok;
+    uint64_t cr0 = vmread(HYPE_VMCS_GUEST_CR0, &ok);
+    uint64_t efer = vmread(HYPE_VMCS_GUEST_IA32_EFER, &ok);
+    uint32_t entry = (uint32_t)vmread(HYPE_VMCS_VM_ENTRY_CONTROLS, &ok);
+    int lma = ((cr0 & HYPE_VMX_CR0_PG) != 0ull) && ((efer & HYPE_VMX_EFER_LME) != 0ull);
+
+    if (lma) {
+        efer |= HYPE_VMX_EFER_LMA;
+        entry |= HYPE_VMX_ENTRY_IA32E_MODE_GUEST;
+    } else {
+        efer &= ~HYPE_VMX_EFER_LMA;
+        entry &= ~HYPE_VMX_ENTRY_IA32E_MODE_GUEST;
+    }
+    (void)vmwrite(HYPE_VMCS_GUEST_IA32_EFER, efer);
+    /*
+     * Re-adjust rather than writing `entry` straight back. The read-modify-write
+     * above preserves whatever was there, but a control field still has to satisfy
+     * the capability MSR's allowed-0/allowed-1 masks, and writing an unfiltered
+     * value gave VM-instruction-error 7 (invalid control fields) at the next
+     * entry. adjust_controls() also re-forces the required-1 bits, so this cannot
+     * drift out of spec however often a guest flips modes.
+     */
+    (void)vmwrite(HYPE_VMCS_VM_ENTRY_CONTROLS,
+                  (uint64_t)hype_vmx_adjust_controls(entry, g_vmx_entry_cap));
+}
+
 int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok;
@@ -2393,6 +2486,9 @@ int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx) {
     } else if (crn == 0u) {
         (void)vmwrite(HYPE_VMCS_GUEST_CR0, value | HYPE_VMX_CR0_NE);
         (void)vmwrite(HYPE_VMCS_CR0_READ_SHADOW, value);
+        /* PG may just have changed: re-derive long-mode state before the next
+         * entry, or entry fails its guest-state checks (#248). */
+        vmx_sync_long_mode();
     } else {
         /* CR3 loads are not host-owned (no bit in the CR3 target list here) and
          * CR8 does not apply -- do not pretend to have handled them. */
