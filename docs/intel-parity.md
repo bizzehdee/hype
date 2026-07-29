@@ -1,6 +1,6 @@
 # Intel (VT-x/VMX) → AMD parity: what is left
 
-Status as of 2026-07-28, `329f435` + uncommitted diagnostic fixes.
+Status as of 2026-07-29, `ceae540`.
 
 ## The bar (where AMD is)
 
@@ -18,12 +18,22 @@ Verified on the nested-VMX box (`192.168.0.144`, i5-13420H, `kvm_intel nested=Y`
 - The **live FW-1 guest now enters** — the `kind != SVM` bail-out is gone, the
   device adapters are ported, and an EPT is built. Log grew 312 → 584 lines when
   the final re-land hunks landed.
-- It does **not progress**. Two symptoms, from `run-intel-full68.log`:
-  - a repeating **injected `#GP`** — `staged_eventinj=0xb0d` decodes as type 3
-    (hardware exception), vector 0x0D, error-code-valid;
-  - **nothing ever armed**: `pit_irq0=0 lapic_irq=0 ahci_irq=0`, LAPIC
-    `lvt=0x10000(masked)`, `ever_armed=0x0`, PIC `mIMR=0xff sIMR=0xff`.
+- Two blockers found and fixed today (see the log below): the CR4 `#GP` storm
+  (85 -> 0) and the external-interrupt storm (13,813,771 -> 0).
+- It gets through real mode into protected mode, sets CR4 (`GUEST_CR4=0x2660`,
+  its own `0x660` with VMXE preserved), and **now dies enabling paging**:
+  `#GP` on `MOV CR0, EAX` with `attempted=0x80000023`, plus a panic
+  "undecodable MMIO NPF at guest-physical 0x80000023".
 - **Never run on bare Intel metal** — nested only.
+
+### Fixed today
+| Commit | What |
+|---|---|
+| `354e151` | Dumps stopped fabricating guest state (SVM-only struct read on VMX) |
+| `281186a` | CR-write probe; physical insn-byte fallback when `cr3=0` |
+| `84e14b5` | Host owns CR4.VMXE / CR0.NE + CR-access handler -> `#GP` 85 to 0 |
+| `3bb58ad` | STI window consumes the exit's interrupt -> `intr` storm to 0 |
+| `ceae540` | acknowledge-interrupt-on-exit + `hype_isr_dispatch_vector()` |
 
 ## A. #236 (VMX-4) — make the live guest work on Intel
 
@@ -41,17 +51,27 @@ Verified on the nested-VMX box (`192.168.0.144`, i5-13420H, `kvm_intel nested=Y`
   (reg=100 → CR4, r/m=000 → EAX). The 85 repeats are hype reinjecting into a guest
   with no IDT yet, not 85 distinct faults. Entry works and the guest executes real
   firmware — it dies on one control-register write.
-- [ ] **A2b. Find out why the CR4 load faults.** Next probe: guest RAX (the value
-  written), guest CR0/CR4, VMCS `CR4_GUEST_HOST_MASK`/`CR4_READ_SHADOW`, and host
-  `IA32_VMX_CR4_FIXED0`/`FIXED1`. Leading candidate: the guest sets a CR4 bit that is
-  0 in `IA32_VMX_CR4_FIXED1` (architectural `#GP(0)` for a VMX guest, and what L0 KVM
-  exposes nested may be narrower than what OVMF wants). Then hype's CR4
-  load-exiting/mask handling, then real-mode guest state.
-- [ ] **A3. Timer + interrupt delivery on VMX.** Nothing is ever armed, so this
-  is likely the bigger half: `VM_ENTRY_INTR_INFO` injection,
-  `GUEST_INTERRUPTIBILITY_STATE`, `GUEST_ACTIVITY_STATE`, and the PIT/LAPIC/
-  IO-APIC arm path. This is the VMX equivalent of M4-6b4, which is what got AMD
-  ticking past `/init`.
+- [x] **A2b. Why the CR4 load faulted.** `IA32_VMX_CR4_FIXED0` requires CR4.VMXE;
+  firmware writes CR4 without it; `CR4_GUEST_HOST_MASK` was 0 so the write reached
+  `GUEST_CR4` and violated the fixed-bit rule. Fixed in `84e14b5`.
+- [x] **A2c. The external-interrupt storm.** Fixed twice over in `3bb58ad` /
+  `ceae540`; hype picks the path the hardware granted.
+- [ ] **A2d. NEXT BLOCKER — `#GP` on `MOV CR0` enabling paging.**
+  `attempted=0x80000023` (PG|NE|MP|PE) **satisfies** `CR0_FIXED0=0x80000021`, so
+  unlike the CR4 case this is *not* a fixed-bit violation. Accompanied by
+  `PANIC: undecodable MMIO NPF on vm0 at guest-physical 0x80000023` — and that
+  "GPA" is bit-for-bit the CR0 operand, which is either a misattributed exit or
+  an EPT gap for the guest's new page-table root (`cr3=0x800000`). Not yet
+  determined; do not guess. Start by confirming which exit reason actually
+  arrives, since a CR-access exit misread as an EPT violation would explain the
+  operand appearing as an address.
+- [ ] **A3. Guest-facing timer + interrupt injection on VMX.** Still unproven:
+  `VM_ENTRY_INTR_INFO` injection, `GUEST_INTERRUPTIBILITY_STATE`,
+  `GUEST_ACTIVITY_STATE`, and the PIT/LAPIC/IO-APIC arm path — the VMX equivalent
+  of M4-6b4 (#80), which is what got AMD ticking past `/init`. Note this is
+  DOWNSTREAM of A2d, not parallel: the guest cannot arm a timer while it is
+  dying in early firmware, so "nothing ever armed" is a symptom of how far it
+  gets, not necessarily a second defect. Re-measure after A2d before sizing it.
 - [ ] **A4. One Intel guest to an Alpine login prompt** (the M4-6d3 bar).
 - [ ] **A5. The 14 remaining raw `hype_svm_*` calls** in the FW-1 region —
   decide port vs. gate for each. Mostly deliberate SVM-only diagnostics
@@ -90,10 +110,12 @@ VMX-3, plus the **Intel halves** of #13 (M0-5), #43 (M3-6), #173 (M8-10).
   exists (`core/fw1_debug.h`, default 0) and gates only 4 blocks. Note this is
   *not* a blocker any more — post-re-land those blocks go through the vendor
   shims, so it is perf/clarity, not Intel-blocking.
-- [ ] **E2.** Two dump sites (`boot/main.c` ~8634 undecodable-MMIO `hype_fatal`,
-  ~8867 any-exception dump) still print SVM debug state that is now
-  deterministically **zero** on VMX. Mark those fields `n/a` so zeros are never
-  mistaken for readings.
+- [ ] **E2.** Two dump sites (undecodable-MMIO `hype_fatal`, any-exception dump)
+  still print SVM debug state that is now deterministically **zero** on VMX —
+  mark those `n/a` (#250). The `GUESTEXCP` insn-bytes half is DONE (`281186a`:
+  physical read when `cr3=0`), and it paid for itself immediately by naming
+  `MOV CR4, EAX` and then `MOV CR0, EAX`. This matters right now: the A2d panic
+  is one of these two sites.
 - [ ] **E3.** `probe.sh`'s progress check is fooled by two VMs interleaving on
   one serial port — it shredded `fw-1 EXHIST:` and reported `exits=0` where the
   real value was 1. Verdicts were right, the number wasn't.
