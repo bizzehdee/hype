@@ -8661,21 +8661,41 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * rails), which is a completely different bug from a decoder gap. */
             {
                 hype_svm_debug_state_t dbg;
-                (void)vmm_get_debug_state(kind, ctx, &dbg);
+                /*
+                 * #250: the CR/RFLAGS group comes from an SVM-ONLY snapshot. On
+                 * VMX vmm_get_debug_state() reports nothing and (since the shim
+                 * zeroes the struct) every field would print as 0x0 -- inside the
+                 * one message that is the primary evidence when hype dies. That
+                 * is how the earlier Intel #GP hunt lost time to
+                 * "rip=0x0 cs=0x0 rsp=0x0".
+                 *
+                 * So the vendor-specific group is emitted SEPARATELY and only
+                 * when it means something, via hype_debug_print() before the
+                 * noreturn hype_fatal() -- same ordering trick the any-exception
+                 * dump below uses, and it keeps the fatal message itself
+                 * vendor-neutral rather than duplicating a 20-argument format.
+                 */
+                if (vmm_get_debug_state(kind, ctx, &dbg)) {
+                    hype_debug_print("fw-1 NPF-REGS: cr0=0x%llx cr3=0x%llx cr4=0x%llx "
+                                     "rflags=0x%llx cs_base=0x%llx nrip=0x%llx rsp=0x%llx\n",
+                                     (unsigned long long)dbg.cr0, (unsigned long long)dbg.cr3,
+                                     (unsigned long long)dbg.cr4, (unsigned long long)dbg.rflags,
+                                     (unsigned long long)dbg.cs_base, (unsigned long long)dbg.nrip,
+                                     (unsigned long long)dbg.rsp);
+                } else {
+                    hype_debug_print("fw-1 NPF-REGS: n/a on this backend (SVM-only snapshot); "
+                                     "cr3=0x%llx from the vendor-neutral accessor\n",
+                                     (unsigned long long)vmm_get_cr3(kind, ctx));
+                }
                 hype_fatal("fw-1: undecodable MMIO NPF on vm%u at guest-physical 0x%llx (%s, "
                            "guest_rip=0x%llx, decode_assist_bytes=%u insn=%s %02x %02x %02x %02x "
-                           "%02x %02x %02x %02x | cr0=0x%llx cr3=0x%llx cr4=0x%llx rflags=0x%llx "
-                           "cs_base=0x%llx nrip=0x%llx rsp=0x%llx) -- cannot absorb",
+                           "%02x %02x %02x %02x) -- cannot absorb",
                            (unsigned int)(vm - g_vms), (unsigned long long)npf.guest_phys_addr,
                            npf.is_write ? "write" : "read", (unsigned long long)info.guest_rip,
                            (unsigned int)insn_n,
                            insn ? (insn_n ? "(assist)" : "(ptwalk)") : "(FETCH FAILED)",
                            insn ? insn[0] : 0, insn ? insn[1] : 0, insn ? insn[2] : 0, insn ? insn[3] : 0,
-                           insn ? insn[4] : 0, insn ? insn[5] : 0, insn ? insn[6] : 0, insn ? insn[7] : 0,
-                           (unsigned long long)dbg.cr0, (unsigned long long)dbg.cr3,
-                           (unsigned long long)dbg.cr4, (unsigned long long)dbg.rflags,
-                           (unsigned long long)dbg.cs_base, (unsigned long long)dbg.nrip,
-                           (unsigned long long)dbg.rsp);
+                           insn ? insn[4] : 0, insn ? insn[5] : 0, insn ? insn[6] : 0, insn ? insn[7] : 0);
             }
         }
 
@@ -8952,7 +8972,37 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (vmm_reason_is_any_exception(kind, info.reason)) {
             hype_svm_debug_state_t dbg;
             uint8_t *fault_bytes;
-            (void)vmm_get_debug_state(kind, ctx, &dbg);
+            /*
+             * #250: everything from here down is SVM VMCB forensics -- EXITINFO2
+             * as the authoritative #PF address, EXITINTINFO's nested-delivery
+             * check, NRIP, the save-area CR2 staleness rule. None of those fields
+             * exist in a VMCS, so on VMX the snapshot reports nothing and (thanks
+             * to the shim zeroing it) the whole dump would render as a confident
+             * page of 0x0 -- including "FAULT ADDR (exitinfo2)=0x0", which reads
+             * as a NULL-pointer dereference that never happened. The comments
+             * below record two separate occasions where a misread field in this
+             * very dump sent an investigation the wrong way; emitting fabricated
+             * zeros here would be a third.
+             *
+             * So on a backend without the snapshot, say what IS known -- from the
+             * vendor-neutral accessors -- and stop. hype_fatal() is noreturn, so
+             * this returns nothing to the SVM path below.
+             */
+            if (!vmm_get_debug_state(kind, ctx, &dbg)) {
+                hype_debug_print("fw-1: exc vec=%llu err=0x%llx rip=0x%llx cr3=0x%llx\n",
+                                 (unsigned long long)vmm_exception_vector(kind, ctx, info.reason),
+                                 (unsigned long long)info.qualification,
+                                 (unsigned long long)info.guest_rip,
+                                 (unsigned long long)vmm_get_cr3(kind, ctx));
+                hype_debug_print("fw-1: exc regs/exitinfo2/exitintinfo/nrip = n/a on this backend "
+                                 "(SVM VMCB fields, no VMCS counterpart) -- not printing zeros\n");
+                hype_fatal("fw-1: unhandled guest exception vec=%llu err=0x%llx rip=0x%llx "
+                           "cr3=0x%llx (svm_regs=n/a)",
+                           (unsigned long long)vmm_exception_vector(kind, ctx, info.reason),
+                           (unsigned long long)info.qualification,
+                           (unsigned long long)info.guest_rip,
+                           (unsigned long long)vmm_get_cr3(kind, ctx));
+            }
 
             /* Core fault summary. Printed FIRST, via hype_debug_print()
              * (not hype_fatal(), which halts and would make the deeper
