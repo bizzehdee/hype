@@ -230,6 +230,27 @@ void hype_xhci_trb_normal(uint32_t trb[4], uint64_t buffer_phys, uint32_t length
 
 unsigned int hype_xhci_event_cc(const uint32_t trb[4]) { return (trb[2] >> 24) & 0xFFu; }
 unsigned int hype_xhci_event_slot_id(const uint32_t trb[4]) { return (trb[3] >> 24) & 0xFFu; }
+unsigned int hype_xhci_event_ep_id(const uint32_t trb[4]) { return (trb[3] >> 16) & 0x1Fu; }
+
+void hype_xhci_trb_stop_endpoint(uint32_t trb[4], unsigned int slot, unsigned int dci, int cycle) {
+    hype_xhci_trb_zero(trb);
+    trb[3] = ctrl(HYPE_XHCI_TRB_STOP_EP, cycle) | ((slot & 0xFFu) << 24) | ((dci & 0x1Fu) << 16);
+}
+
+void hype_xhci_trb_reset_endpoint(uint32_t trb[4], unsigned int slot, unsigned int dci, int cycle) {
+    hype_xhci_trb_zero(trb);
+    trb[3] = ctrl(HYPE_XHCI_TRB_RESET_EP, cycle) | ((slot & 0xFFu) << 24) | ((dci & 0x1Fu) << 16);
+}
+
+void hype_xhci_trb_set_tr_dequeue(uint32_t trb[4], uint64_t dequeue_dcs, unsigned int slot,
+                                  unsigned int dci, int cycle) {
+    trb[0] = (uint32_t)(dequeue_dcs & 0xFFFFFFFFull);
+    trb[1] = (uint32_t)(dequeue_dcs >> 32);
+    trb[2] = 0;
+    trb[3] = ctrl(HYPE_XHCI_TRB_SET_TR_DEQUEUE, cycle) | ((slot & 0xFFu) << 24) |
+             ((dci & 0x1Fu) << 16);
+}
+
 uint64_t hype_xhci_event_trb_ptr(const uint32_t trb[4]) {
     return (uint64_t)trb[0] | ((uint64_t)trb[1] << 32);
 }

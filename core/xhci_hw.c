@@ -190,16 +190,23 @@ static int next_event(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
 }
 
 /* Enqueue a command TRB, ring the command doorbell (DB[0]), and consume events
- * until the matching Command Completion Event. Returns it in evt[4], or -1. */
+ * until the Command Completion Event FOR THAT TRB (matched by pointer -- #254:
+ * accepting any completion let a stale event from an earlier timed-out command
+ * satisfy the wrong wait). Returns it in evt[4], or -1. */
 static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     unsigned int guard = 64u; /* bound the number of skipped (e.g. port-change) events */
+    uint64_t my_trb = phys(g_cmd_ring) + (uint64_t)g_cmd_enq * HYPE_XHCI_TRB_BYTES;
     cmd_enqueue(cmd);
     wr32(bar, hype_xhci_doorbell_offset(c->dboff, 0), 0u); /* command doorbell, target 0 */
     while (guard-- != 0u) {
         if (next_event(bar, c->rtsoff, evt) != 0) return -1;
-        if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_CMD_COMPLETION) return 0;
-        /* else: a Port Status Change or other event queued earlier -- skip it. */
+        if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_CMD_COMPLETION &&
+            hype_xhci_event_trb_ptr(evt) == my_trb) {
+            return 0;
+        }
+        /* else: a port-change event, or a STALE completion for an abandoned
+         * earlier command -- skip it, never let it satisfy this wait. */
     }
     return -1;
 }
@@ -333,25 +340,47 @@ static int control_transfer(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t bm_r
         zero(g_xfer_buf, XPAGE);
     }
 
-    hype_xhci_trb_setup_stage(t, bm_req, b_req, wvalue, windex, (uint16_t)len, trt,
-                              (int)g_ep0_cyc[di]);
-    ep0_enqueue(di, t);
-    if (len) {
-        hype_xhci_trb_data_stage(t, phys(g_xfer_buf), len, dir_in, (int)g_ep0_cyc[di]);
+    {
+        /* #254: remember this transfer's own TRB addresses so the wait below
+         * can tell OUR events from stale ones (same reasoning as bulk_xfer). */
+        uint64_t ring_base = phys(g_ep0_ring[di]);
+        uint64_t setup_trb, data_trb = 0, status_trb;
+
+        setup_trb = ring_base + (uint64_t)g_ep0_enq[di] * HYPE_XHCI_TRB_BYTES;
+        hype_xhci_trb_setup_stage(t, bm_req, b_req, wvalue, windex, (uint16_t)len, trt,
+                                  (int)g_ep0_cyc[di]);
         ep0_enqueue(di, t);
-    }
-    /* Status stage direction is opposite the data direction (IN if no data). */
-    status_dir_in = (len && dir_in) ? 0u : 1u;
-    hype_xhci_trb_status_stage(t, (int)status_dir_in, 1, (int)g_ep0_cyc[di]);
-    ep0_enqueue(di, t);
+        if (len) {
+            data_trb = ring_base + (uint64_t)g_ep0_enq[di] * HYPE_XHCI_TRB_BYTES;
+            hype_xhci_trb_data_stage(t, phys(g_xfer_buf), len, dir_in, (int)g_ep0_cyc[di]);
+            ep0_enqueue(di, t);
+        }
+        /* Status stage direction is opposite the data direction (IN if no data). */
+        status_dir_in = (len && dir_in) ? 0u : 1u;
+        status_trb = ring_base + (uint64_t)g_ep0_enq[di] * HYPE_XHCI_TRB_BYTES;
+        hype_xhci_trb_status_stage(t, (int)status_dir_in, 1, (int)g_ep0_cyc[di]);
+        ep0_enqueue(di, t);
 
-    wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), 1u); /* DCI 1 = EP0 */
+        wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), 1u); /* DCI 1 = EP0 */
 
-    while (guard-- != 0u) {
-        if (next_event(bar, c->rtsoff, evt) != 0) return -1;
-        if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_TRANSFER_EVENT) {
-            unsigned int cc = hype_xhci_event_cc(evt);
-            if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) return -1;
+        while (guard-- != 0u) {
+            uint64_t p;
+            if (next_event(bar, c->rtsoff, evt) != 0) return -1;
+            if (hype_xhci_trb_type(evt) != HYPE_XHCI_TRB_TRANSFER_EVENT) continue;
+            if (hype_xhci_event_slot_id(evt) != slot || hype_xhci_event_ep_id(evt) != 1u) {
+                continue; /* another endpoint's (or a stale) event */
+            }
+            p = hype_xhci_event_trb_ptr(evt);
+            if (p != setup_trb && p != data_trb && p != status_trb) {
+                continue; /* a stale EP0 event from an abandoned control transfer */
+            }
+            {
+                unsigned int cc = hype_xhci_event_cc(evt);
+                if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) return -1;
+            }
+            if (p != status_trb) {
+                continue; /* setup/data stage completed fine: wait for status */
+            }
             if (len && dir_in && buf) {
                 for (i = 0; i < len; i++) ((uint8_t *)buf)[i] = g_xfer_buf[i];
             }
@@ -443,6 +472,7 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     uint32_t t[4], evt[4];
     unsigned int guard = 64u;
+    uint64_t my_trb = phys(ring) + (uint64_t)(*enq) * HYPE_XHCI_TRB_BYTES;
 
     hype_xhci_trb_normal(t, buf_phys, len, (int)(*cyc));
     ring_enqueue(ring, enq, cyc, t);
@@ -450,16 +480,104 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
     while (guard-- != 0u) {
         if (next_event(bar, c->rtsoff, evt) != 0) return -1;
         if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_TRANSFER_EVENT) {
-            unsigned int cc = hype_xhci_event_cc(evt);
-            return (cc == HYPE_XHCI_CC_SUCCESS || cc == HYPE_XHCI_CC_SHORT_PACKET) ? 0 : -1;
+            /*
+             * #254: the event must be for THIS TRB on THIS endpoint. This
+             * controller (1022:15e0) demonstrably delivers events late; the
+             * old accept-anything wait let a late completion for an abandoned
+             * transfer stand in for the current one, after which host and
+             * device disagreed about the BOT stage and a CBW was written to
+             * the medium as sector data.
+             */
+            if (hype_xhci_event_slot_id(evt) == slot && hype_xhci_event_ep_id(evt) == dci &&
+                hype_xhci_event_trb_ptr(evt) == my_trb) {
+                unsigned int cc = hype_xhci_event_cc(evt);
+                return (cc == HYPE_XHCI_CC_SUCCESS || cc == HYPE_XHCI_CC_SHORT_PACKET) ? 0 : -1;
+            }
+            {
+                static int s1 = 0;
+                if (s1++ < 4) {
+                    hype_debug_print("host-xhci: #254 discarding stale transfer event "
+                                     "(slot=%u ep=%u trb=0x%llx, wanted slot=%u ep=%u trb=0x%llx)\n",
+                                     hype_xhci_event_slot_id(evt), hype_xhci_event_ep_id(evt),
+                                     (unsigned long long)hype_xhci_event_trb_ptr(evt), slot, dci,
+                                     (unsigned long long)my_trb);
+                }
+            }
+            continue;
         }
     }
     return -1;
 }
 
+/*
+ * #254: endpoint + ring recovery after a failed transfer. A timed-out TRB is
+ * still owned by the controller; issuing more work on the same ring invites a
+ * late completion to collide with it. Sequence per xHCI 4.6.9/4.6.8/4.6.10:
+ * Stop Endpoint (Running -> Stopped), Reset Endpoint (Halted -> Stopped;
+ * harmlessly errors when not halted), then Set TR Dequeue Pointer to a
+ * zeroed, restarted ring. Software ring state resets to enq=0/cycle=1.
+ */
+static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, uint8_t *ring,
+                      unsigned int *enq, unsigned int *cyc) {
+    uint32_t cmd[4], evt[4];
+    unsigned int i;
+
+    hype_xhci_trb_stop_endpoint(cmd, slot, dci, (int)g_cmd_cyc);
+    (void)cmd_submit_wait(c, cmd, evt); /* result deliberately ignored: the EP may
+                                         * already be stopped or halted */
+    hype_xhci_trb_reset_endpoint(cmd, slot, dci, (int)g_cmd_cyc);
+    (void)cmd_submit_wait(c, cmd, evt); /* errors when the EP is not halted: fine */
+
+    for (i = 0; i < XPAGE; i++) { ring[i] = 0; }
+    *enq = 0;
+    *cyc = 1;
+    hype_xhci_trb_set_tr_dequeue(cmd, phys(ring) | 1u /* DCS=1 */, slot, dci, (int)g_cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0 || hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
+        hype_debug_print("host-xhci: #254 Set TR Dequeue failed (slot=%u dci=%u)\n", slot, dci);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * #254: Bulk-Only Transport Reset Recovery (USB MSC BOT spec 5.3.4): after ANY
+ * failed stage -- a lost completion, an error CC, a bad CSW -- the host may not
+ * simply issue the next CBW: the device may still be inside the old transaction
+ * and will consume that CBW as DATA (observed on real hardware: a byte-exact
+ * CBW written into a log sector). Recovery = Bulk-Only Mass Storage Reset,
+ * Clear-HALT on both bulk endpoints, plus xHCI-side ring recovery on both.
+ */
+static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc) {
+    unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
+    unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
+    int rc = 0;
+
+    hype_debug_print("host-xhci: #254 BOT reset recovery (slot=%u)\n", slot);
+
+    /* Quiesce both rings first so nothing is in flight during the reset. */
+    if (ep_recover(c, slot, dci_in, g_bulk_in_ring, &g_bin_enq, &g_bin_cyc) != 0) rc = -1;
+    if (ep_recover(c, slot, dci_out, g_bulk_out_ring, &g_bout_enq, &g_bout_cyc) != 0) rc = -1;
+
+    /* Bulk-Only Mass Storage Reset: class request 0xFF to the interface. */
+    if (control_transfer(c, slot, 0x21, 0xFF, 0, (uint16_t)msc->interface_num, 0, 0, 0) != 0) {
+        hype_debug_print("host-xhci: #254 Bulk-Only Mass Storage Reset failed\n");
+        rc = -1;
+    }
+    /* CLEAR_FEATURE(ENDPOINT_HALT) on bulk IN, then bulk OUT (spec order). */
+    if (control_transfer(c, slot, 0x02, 0x01, 0, (uint16_t)msc->bulk_in_ep, 0, 0, 0) != 0) {
+        hype_debug_print("host-xhci: #254 Clear-HALT (bulk IN) failed\n");
+        rc = -1;
+    }
+    if (control_transfer(c, slot, 0x02, 0x01, 0, (uint16_t)msc->bulk_out_ep, 0, 0, 0) != 0) {
+        hype_debug_print("host-xhci: #254 Clear-HALT (bulk OUT) failed\n");
+        rc = -1;
+    }
+    return rc;
+}
+
 /* Bulk-Only Transport: CBW (out) -> optional data phase -> CSW (in). Data flows
  * through g_data (bounced). Returns 0 iff the CSW reports command-passed. */
-static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
+static int bot_scsi_once(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                     const uint8_t *cdb, unsigned int cdb_len, uint8_t *data, unsigned int data_len,
                     int dir_in) {
     unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
@@ -491,6 +609,24 @@ static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_
     if (bulk_xfer(c, g_bulk_in_ring, &g_bin_enq, &g_bin_cyc, slot, dci_in,
                   phys(g_csw), HYPE_USB_CSW_LEN) != 0) return -1;
     return hype_usb_bot_csw_ok(g_csw, tag) ? 0 : -1;
+}
+
+/*
+ * #254: one transaction, and on ANY failure a full BOT reset recovery followed
+ * by exactly one retry. Never a bare retry without recovery -- that is what
+ * wrote a CBW into a sector. If the retry fails too the error surfaces to the
+ * caller (visible, not silent: blk_usb -> log sink -> reported once).
+ */
+static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
+                    const uint8_t *cdb, unsigned int cdb_len, uint8_t *data, unsigned int data_len,
+                    int dir_in) {
+    if (bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in) == 0) {
+        return 0;
+    }
+    if (bot_recover(c, slot, msc) != 0) {
+        return -1; /* recovery itself failed: the backend is not trustworthy */
+    }
+    return bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in);
 }
 
 int hype_xhci_msc_read_capacity(hype_xhci_ctrl_t *c, unsigned int slot,

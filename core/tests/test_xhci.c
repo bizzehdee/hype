@@ -299,7 +299,42 @@ static void test_msc_config_parse(void) {
     }
 }
 
+
+/* #254: the endpoint-recovery command TRBs and the endpoint-ID decoder. */
+static void test_recovery_trbs(void) {
+    uint32_t t[4];
+    uint32_t evt[4] = {0, 0, 0, 0};
+
+    hype_xhci_trb_stop_endpoint(t, 5u, 3u, 1);
+    CHECK_HEX("stop-ep type", HYPE_XHCI_TRB_STOP_EP, (t[3] >> 10) & 0x3Fu);
+    CHECK_HEX("stop-ep slot", 5u, (t[3] >> 24) & 0xFFu);
+    CHECK_HEX("stop-ep dci", 3u, (t[3] >> 16) & 0x1Fu);
+    CHECK_HEX("stop-ep cycle", 1u, t[3] & 1u);
+    CHECK_HEX("stop-ep params zero", 0u, t[0] | t[1] | t[2]);
+
+    hype_xhci_trb_reset_endpoint(t, 63u, 31u, 0);
+    CHECK_HEX("reset-ep type", HYPE_XHCI_TRB_RESET_EP, (t[3] >> 10) & 0x3Fu);
+    CHECK_HEX("reset-ep slot", 63u, (t[3] >> 24) & 0xFFu);
+    CHECK_HEX("reset-ep dci", 31u, (t[3] >> 16) & 0x1Fu);
+    CHECK_HEX("reset-ep cycle", 0u, t[3] & 1u);
+
+    hype_xhci_trb_set_tr_dequeue(t, 0x123456789ABCD001ull, 2u, 4u, 1);
+    CHECK_HEX("set-deq type", HYPE_XHCI_TRB_SET_TR_DEQUEUE, (t[3] >> 10) & 0x3Fu);
+    CHECK_HEX("set-deq ptr lo (incl. DCS)", 0x9ABCD001u, t[0]);
+    CHECK_HEX("set-deq ptr hi", 0x12345678u, t[1]);
+    CHECK_HEX("set-deq slot", 2u, (t[3] >> 24) & 0xFFu);
+    CHECK_HEX("set-deq dci", 4u, (t[3] >> 16) & 0x1Fu);
+
+    /* The Transfer Event endpoint-ID field (dword3 bits 20:16). */
+    evt[3] = (7u << 24) | (3u << 16);
+    CHECK_HEX("event ep id", 3u, hype_xhci_event_ep_id(evt));
+    CHECK_HEX("event slot id", 7u, hype_xhci_event_slot_id(evt));
+    evt[3] = (1u << 24) | (31u << 16);
+    CHECK_HEX("event ep id max", 31u, hype_xhci_event_ep_id(evt));
+}
+
 int main(void) {
+    test_recovery_trbs();
     test_reg_offsets();
     test_context_encoders();
     test_hub_helpers();

@@ -77,6 +77,9 @@ typedef enum {
     HYPE_XHCI_TRB_DISABLE_SLOT    = 10,
     HYPE_XHCI_TRB_ADDRESS_DEVICE  = 11,
     HYPE_XHCI_TRB_CONFIG_EP       = 12,
+    HYPE_XHCI_TRB_RESET_EP        = 14,
+    HYPE_XHCI_TRB_STOP_EP         = 15,
+    HYPE_XHCI_TRB_SET_TR_DEQUEUE  = 16,
     HYPE_XHCI_TRB_NOOP_CMD        = 23,
     HYPE_XHCI_TRB_TRANSFER_EVENT  = 32,
     HYPE_XHCI_TRB_CMD_COMPLETION  = 33,
@@ -205,6 +208,20 @@ unsigned int hype_xhci_default_mps(unsigned int speed_id);
 unsigned int hype_xhci_event_cc(const uint32_t trb[4]);       /* completion code, status[31:24] */
 unsigned int hype_xhci_event_slot_id(const uint32_t trb[4]);  /* control[31:24] */
 uint64_t hype_xhci_event_trb_ptr(const uint32_t trb[4]);      /* dword0/1: TRB pointer (cmd/xfer) */
+unsigned int hype_xhci_event_ep_id(const uint32_t trb[4]);    /* dword3 [20:16]: endpoint DCI */
+
+/*
+ * #254: endpoint-recovery command TRBs (xHCI 4.6.9 / 4.6.8 / 4.6.10). Used by
+ * the Bulk-Only reset recovery: a timed-out transfer leaves its TRB owned by
+ * the controller, so before any retry the endpoint is stopped (and reset, if
+ * halted) and its transfer ring re-pointed -- otherwise a LATE completion for
+ * the abandoned TRB desynchronises every later transfer on the ring.
+ */
+void hype_xhci_trb_stop_endpoint(uint32_t trb[4], unsigned int slot, unsigned int dci, int cycle);
+void hype_xhci_trb_reset_endpoint(uint32_t trb[4], unsigned int slot, unsigned int dci, int cycle);
+/* `dequeue_dcs` = new dequeue pointer with the DCS (cycle) bit ORed into bit 0. */
+void hype_xhci_trb_set_tr_dequeue(uint32_t trb[4], uint64_t dequeue_dcs, unsigned int slot,
+                                  unsigned int dci, int cycle);
 unsigned int hype_xhci_event_port_id(const uint32_t trb[4]);  /* Port Status Change: param[31:24] */
 unsigned int hype_xhci_event_xfer_residue(const uint32_t trb[4]); /* status[23:0] bytes not transferred */
 
