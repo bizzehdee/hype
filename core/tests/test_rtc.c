@@ -243,6 +243,101 @@ static void test_decode_then_encode(void) {
     CHECK("round-trip exfat not epoch", hype_exfat_encode_timestamp(&t) != 0x00210000u);
 }
 
+
+/* ---- #253: the 10ms increment and the TSC-driven advance ---- */
+
+static void test_exfat_10ms(void) {
+    hype_rtc_time_t t;
+    t.year = 2026; t.month = 7; t.day = 29; t.hour = 10; t.minute = 0; t.second = 41;
+    CHECK_HEX("odd second -> 100 x 10ms", 100u, hype_exfat_encode_10ms(&t));
+    t.second = 40;
+    CHECK_HEX("even second -> 0", 0u, hype_exfat_encode_10ms(&t));
+    t.month = 0;
+    CHECK_HEX("invalid time -> 0", 0u, hype_exfat_encode_10ms(&t));
+}
+
+static void check_time(const char *what, const hype_rtc_time_t *t, unsigned y, unsigned mo,
+                       unsigned d, unsigned h, unsigned mi, unsigned se) {
+    char desc[96];
+    snprintf(desc, sizeof desc, "%s (y)", what); CHECK_HEX(desc, y, t->year);
+    snprintf(desc, sizeof desc, "%s (mo)", what); CHECK_HEX(desc, mo, t->month);
+    snprintf(desc, sizeof desc, "%s (d)", what); CHECK_HEX(desc, d, t->day);
+    snprintf(desc, sizeof desc, "%s (h)", what); CHECK_HEX(desc, h, t->hour);
+    snprintf(desc, sizeof desc, "%s (mi)", what); CHECK_HEX(desc, mi, t->minute);
+    snprintf(desc, sizeof desc, "%s (s)", what); CHECK_HEX(desc, se, t->second);
+}
+
+static void test_advance(void) {
+    hype_rtc_time_t base, out;
+    base.year = 2026; base.month = 7; base.day = 29;
+    base.hour = 10; base.minute = 58; base.second = 30;
+
+    hype_rtc_advance(&base, 0u, &out);
+    check_time("advance by 0", &out, 2026, 7, 29, 10, 58, 30);
+    hype_rtc_advance(&base, 29u, &out);
+    check_time("within the minute", &out, 2026, 7, 29, 10, 58, 59);
+    hype_rtc_advance(&base, 30u, &out);
+    check_time("minute rollover", &out, 2026, 7, 29, 10, 59, 0);
+    hype_rtc_advance(&base, 90u + 3600u, &out);
+    check_time("hour rollover", &out, 2026, 7, 29, 12, 0, 0);
+
+    /* Midnight, month end, year end. */
+    base.hour = 23; base.minute = 59; base.second = 59;
+    hype_rtc_advance(&base, 1u, &out);
+    check_time("midnight rollover", &out, 2026, 7, 30, 0, 0, 0);
+    base.day = 31;
+    hype_rtc_advance(&base, 1u, &out);
+    check_time("month rollover", &out, 2026, 8, 1, 0, 0, 0);
+    base.month = 12;
+    hype_rtc_advance(&base, 1u, &out);
+    check_time("year rollover", &out, 2027, 1, 1, 0, 0, 0);
+
+    /* Leap handling: 2028-02-28 has a 29th; 2027 does not; 2100 is NOT a
+     * leap year (divisible by 100, not by 400). */
+    base.year = 2028; base.month = 2; base.day = 28;
+    base.hour = 12; base.minute = 0; base.second = 0;
+    hype_rtc_advance(&base, 86400u, &out);
+    check_time("into Feb 29", &out, 2028, 2, 29, 12, 0, 0);
+    hype_rtc_advance(&base, 2u * 86400u, &out);
+    check_time("across Feb 29", &out, 2028, 3, 1, 12, 0, 0);
+    base.year = 2027;
+    hype_rtc_advance(&base, 86400u, &out);
+    check_time("non-leap Feb 28 + 1d", &out, 2027, 3, 1, 12, 0, 0);
+    base.year = 2100; /* century non-leap */
+    hype_rtc_advance(&base, 86400u, &out);
+    check_time("2100 is not a leap year", &out, 2100, 3, 1, 12, 0, 0);
+
+    /* A long uptime: 400 days from mid-2026 crosses a leap boundary region. */
+    base.year = 2026; base.month = 7; base.day = 29;
+    base.hour = 10; base.minute = 0; base.second = 0;
+    hype_rtc_advance(&base, 400ull * 86400u, &out);
+    check_time("400 days later", &out, 2027, 9, 2, 10, 0, 0);
+
+    /* An invalid base yields an invalid (all-zero) result, never a plausible
+     * fake -- the encoders then fall back to their unset behaviour. */
+    base.month = 0;
+    hype_rtc_advance(&base, 5u, &out);
+    check_time("invalid base zeroed", &out, 0, 0, 0, 0, 0, 0);
+}
+
+/* The 1980 epoch boundary and the FAT year ceiling, both ways. */
+static void test_epoch_bounds(void) {
+    hype_rtc_time_t t;
+    t.year = 1980; t.month = 1; t.day = 1; t.hour = 0; t.minute = 0; t.second = 0;
+    CHECK_HEX("exFAT epoch encodes as the epoch constant", 0x00210000u,
+              hype_exfat_encode_timestamp(&t));
+    CHECK_HEX("FAT epoch date", (0u << 9) | (1u << 5) | 1u, hype_fat_encode_date(&t));
+    t.year = 1979; t.month = 12; t.day = 31;
+    CHECK_HEX("pre-epoch is invalid (exFAT falls back to the epoch)", 0x00210000u,
+              hype_exfat_encode_timestamp(&t));
+    CHECK_HEX("pre-epoch FAT date is unset", 0u, hype_fat_encode_date(&t));
+    t.year = 2107; t.month = 12; t.day = 31; t.hour = 23; t.minute = 59; t.second = 58;
+    CHECK("ceiling year encodes", hype_fat_encode_date(&t) != 0u);
+    CHECK_HEX("ceiling year field", 127u, (unsigned)(hype_fat_encode_date(&t) >> 9));
+    t.year = 2108;
+    CHECK_HEX("past the 7-bit year is unset", 0u, hype_fat_encode_date(&t));
+}
+
 int main(void) {
     test_bcd_to_bin();
     test_decode_bcd_24h();
@@ -254,6 +349,9 @@ int main(void) {
     test_fat_encoding();
     test_exfat_encoding();
     test_decode_then_encode();
+    test_exfat_10ms();
+    test_advance();
+    test_epoch_bounds();
 
     if (failures == 0) {
         printf("all tests passed\n");

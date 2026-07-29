@@ -1711,6 +1711,15 @@ static void test_exfat_set_time(void) {
          ((uint32_t)ent[11] << 24);
     CHECK_HEX("exfat entry stamp", hype_exfat_encode_timestamp(&now), ts);
 
+    /* #253: the odd second lands in the 10msIncrement bytes; UtcOffset stays
+     * "unknown" (0) because the CMOS timezone is unknowable. */
+    now.second = 7;
+    hype_exfat_file_entry(ent, HYPE_EXFAT_ATTR_ARCHIVE, 2u, &now);
+    CHECK_HEX("Create10msIncrement carries the odd second", 100u, ent[20]);
+    CHECK_HEX("LastModified10msIncrement too", 100u, ent[21]);
+    CHECK_HEX("UtcOffset deliberately unknown", 0u, ent[22]);
+    now.second = 6;
+
     hype_exfat_file_entry(ent, HYPE_EXFAT_ATTR_ARCHIVE, 2u, 0);
     ts = (uint32_t)ent[8] | ((uint32_t)ent[9] << 8) | ((uint32_t)ent[10] << 16) |
          ((uint32_t)ent[11] << 24);

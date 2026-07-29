@@ -231,9 +231,21 @@ void hype_exfat_file_entry(uint8_t ent[32], uint16_t attributes, uint8_t seconda
          * absent/invalid time, so this keeps the previous behaviour when there
          * is no clock. */
         uint32_t ts = hype_exfat_encode_timestamp(now);
+        uint8_t ms10 = hype_exfat_encode_10ms(now);
         wr32(ent + 8, ts);  /* CreateTimestamp */
         wr32(ent + 12, ts); /* LastModifiedTimestamp */
         wr32(ent + 16, ts); /* LastAccessedTimestamp */
+        ent[20] = ms10; /* Create10msIncrement: the odd second (#253) */
+        ent[21] = ms10; /* LastModified10msIncrement */
+        /*
+         * UtcOffset bytes (22..24) stay 0x00 == "offset from UTC unknown",
+         * DELIBERATELY (#253): the CMOS RTC's timezone is unknowable from
+         * here (Windows machines keep it in local time, Linux installs in
+         * UTC), and claiming UTC (0x80) when the clock is local would shift
+         * every displayed timestamp by the timezone. "Unknown" makes readers
+         * treat the stamp as local time, which matches both conventions'
+         * expectations closely enough for log forensics.
+         */
     }
 }
 

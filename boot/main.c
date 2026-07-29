@@ -784,6 +784,7 @@ static const hype_vmm_ops_t *g_fw_1_ops;
 /* Host wall clock, sampled once at startup. See the read in efi_main(). */
 static hype_rtc_time_t g_host_time;
 static int g_host_time_valid;
+static uint64_t g_host_time_tsc; /* rdtsc at the moment g_host_time was read (#253) */
 
 static hype_vmm_kind_t g_fw_1_kind;
 /* M8-0b-ii: each AP's own per-core VMM page + a flag an AP sets once it has
@@ -10020,7 +10021,22 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
 }
 
 static void usb_log_flush(void) {
-    if (g_usb_log_ready) (void)hype_log_sink_flush(&g_usb_log);
+    if (!g_usb_log_ready) return;
+    /*
+     * Keep the log's modification time moving (#253): derive "now" from the
+     * boot-time RTC snapshot plus TSC-measured elapsed seconds -- pure
+     * arithmetic. Deliberately NOT a fresh CMOS read: flushes run from guest
+     * dispatch paths on APs, and an AP driving host port I/O mid-flight is
+     * exactly the #229/#239 class of mistake. Before TSC calibration
+     * (host_tsc_hz still 0) the stamp simply stays at boot time.
+     */
+    if (g_host_time_valid && g_vms[0].host_tsc_hz != 0) {
+        hype_rtc_time_t now;
+        hype_rtc_advance(&g_host_time, (hype_rdtsc() - g_host_time_tsc) / g_vms[0].host_tsc_hz,
+                         &now);
+        hype_fat32_fs_set_time(&g_usb_log.fs, &now);
+    }
+    (void)hype_log_sink_flush(&g_usb_log);
 }
 
 /* Diagnostic: log EVERY PCI function present (bus:dev.func, vendor/device,
@@ -10101,6 +10117,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * where there is no USB mass-storage device.
      */
     g_host_time_valid = (hype_rtc_read(&g_host_time) == 0) ? 1 : 0;
+    g_host_time_tsc = hype_rdtsc();
     if (g_host_time_valid) {
         hype_debug_print("rtc: host clock %04u-%02u-%02u %02u:%02u:%02u\n",
                          (unsigned)g_host_time.year, (unsigned)g_host_time.month,

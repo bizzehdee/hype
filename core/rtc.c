@@ -133,6 +133,79 @@ uint8_t hype_fat_encode_time_tenths(const hype_rtc_time_t *t) {
     return (uint8_t)((t->second & 1u) ? 100u : 0u);
 }
 
+uint8_t hype_exfat_encode_10ms(const hype_rtc_time_t *t) {
+    if (!hype_rtc_time_valid(t)) {
+        return 0u;
+    }
+    /* Same job as hype_fat_encode_time_tenths, in exFAT's 10ms unit. */
+    return (uint8_t)((t->second & 1u) ? 100u : 0u);
+}
+
+static uint8_t month_days(uint16_t y, uint8_t m) {
+    if (m == 2u && is_leap(y)) {
+        return 29u;
+    }
+    return g_days_in_month[m - 1u];
+}
+
+void hype_rtc_advance(const hype_rtc_time_t *base, uint64_t seconds, hype_rtc_time_t *out) {
+    uint64_t s;
+    if (!hype_rtc_time_valid(base)) {
+        out->year = 0;
+        out->month = 0;
+        out->day = 0;
+        out->hour = 0;
+        out->minute = 0;
+        out->second = 0;
+        return;
+    }
+    out->year = base->year;
+    out->month = base->month;
+    out->day = base->day;
+    out->hour = base->hour;
+    out->minute = base->minute;
+    out->second = base->second;
+
+    /* Whole days first (cheap division), then the sub-day remainder. */
+    s = seconds % 86400u;
+    out->second = (uint8_t)(out->second + s % 60u);
+    s /= 60u;
+    out->minute = (uint8_t)(out->minute + s % 60u);
+    out->hour = (uint8_t)(out->hour + s / 60u);
+    if (out->second >= 60u) {
+        out->second -= 60u;
+        out->minute++;
+    }
+    if (out->minute >= 60u) {
+        out->minute -= 60u;
+        out->hour++;
+    }
+    {
+        uint64_t days = seconds / 86400u;
+        if (out->hour >= 24u) {
+            out->hour -= 24u;
+            days++;
+        }
+        while (days > 0u) {
+            uint8_t md = month_days(out->year, out->month);
+            if (out->day < md) {
+                uint64_t left = (uint64_t)(md - out->day);
+                uint64_t step = (days < left) ? days : left;
+                out->day = (uint8_t)(out->day + step);
+                days -= step;
+            } else {
+                out->day = 1u;
+                out->month++;
+                if (out->month > 12u) {
+                    out->month = 1u;
+                    out->year++;
+                }
+                days--;
+            }
+        }
+    }
+}
+
 uint32_t hype_exfat_encode_timestamp(const hype_rtc_time_t *t) {
     if (!hype_rtc_time_valid(t)) {
         /* 1980-01-01 00:00:00 -- month and day are 1-based in exFAT, so zero is

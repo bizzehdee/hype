@@ -101,6 +101,24 @@ uint8_t hype_fat_encode_time_tenths(const hype_rtc_time_t *t);
 uint32_t hype_exfat_encode_timestamp(const hype_rtc_time_t *t);
 
 /*
+ * exFAT's Create/LastModified10msIncrement byte: the timestamp field holds
+ * second/2, and this carries the odd second back as 100 x 10ms (the RTC has no
+ * sub-second resolution). 0 for an invalid time. Pure.
+ */
+uint8_t hype_exfat_encode_10ms(const hype_rtc_time_t *t);
+
+/*
+ * Advances a wall-clock snapshot by `seconds` of real, calendar-aware time
+ * (leap years included). This is how long-lived writers keep timestamps
+ * moving without re-touching hardware: the RTC is read ONCE at boot on the
+ * BSP, and later stamps derive from that snapshot plus TSC-measured elapsed
+ * seconds -- pure arithmetic, safe from any context, where re-reading the
+ * CMOS from an AP mid-flight would repeat the #229/#239 class of mistake.
+ * An invalid base yields an invalid (zeroed) result. Pure.
+ */
+void hype_rtc_advance(const hype_rtc_time_t *base, uint64_t seconds, hype_rtc_time_t *out);
+
+/*
  * Reads the host CMOS RTC. Retries across an update-in-progress window and
  * re-reads to guard against a rollover mid-read (the classic RTC hazard:
  * reading 01:59:59 then 02:00:00's minute field yields 01:00:59). Returns 0 and
