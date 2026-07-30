@@ -195,6 +195,32 @@ for f in kmod-33-r2.apk linux-lts-6.12.98-r0.apk; do
 done
 say "CD-INTEGRITY host truth: kmod=d12d08369d580c866ca0492196811b8e linux-lts=e4f2fbabbb3992158eb28c44b6667997"
 
+# CRYPTO probe (#259). The CD reads byte-perfect -- md5 matches the host exactly --
+# yet apk still rejects linux-lts with "BAD signature". So the CONTENT is fine and
+# the VERIFICATION is what fails. busybox's md5/sha are plain C; apk's signature
+# check goes through libcrypto, which dispatches on CPU features (SHA-NI/AVX2) that
+# hype passes through from the host in leaf 1 ECX / leaf 7. If an accelerated digest
+# path is wrong under hype, a plain-C digest would still be right -- which is
+# exactly the pattern observed. Compare the two implementations on the same bytes.
+say "CRYPTO probe: guest cpu flags:"
+say "$(grep -m1 '^flags' /proc/cpuinfo | cut -c1-400)"
+apk add openssl >/dev/null 2>&1 && say "CRYPTO openssl installed" || say "CRYPTO openssl install FAILED"
+for f in kmod-33-r2.apk linux-lts-6.12.98-r0.apk; do
+    t="$REPO/x86_64/$f"
+    [ -f "$t" ] || continue
+    bb=$(sha256sum "$t" 2>/dev/null | cut -d' ' -f1)
+    ol=$(openssl dgst -sha256 -r "$t" 2>/dev/null | cut -d' ' -f1)
+    say "CRYPTO $f busybox=$bb"
+    say "CRYPTO $f openssl=$ol"
+    if [ -n "$ol" ] && [ "$bb" != "$ol" ]; then
+        say "CRYPTO $f MISMATCH -- accelerated digest disagrees with plain C!"
+    else
+        say "CRYPTO $f implementations agree"
+    fi
+done
+say "CRYPTO host truth sha256: kmod=b603af1eb4520d149550c74362647cb0ca2c85590b7e9a9d5598f5facb4a6f15"
+say "CRYPTO host truth sha256: linux-lts=cbdf8fe27388ef0fbea4f16c5a6293a358fb635b16f48b0f040c0f9c54ee1350"
+
 export ERASE_DISKS=/dev/vda
 export BOOTLOADER=grub
 # Bounded, so an unforeseen prompt becomes a diagnosable failure with a COMPLETE
