@@ -172,6 +172,29 @@ if target_already_installed && [ "$FORCE" != yes ]; then
 fi
 say "target check: no existing #228 install found (force=$FORCE) -- proceeding"
 
+# CD-read integrity probe. `linux-lts` (the largest package, ~121 MiB) fails apk's
+# signature check deterministically when the CD is served by hype, while the very
+# same ISO installs cleanly in bare QEMU. Checksum it twice off the medium so the
+# log distinguishes three different faults:
+#   both == host        -> reads are fine, the problem is apk/keys
+#   both equal, != host -> DETERMINISTIC corruption at a fixed offset
+#   the two differ      -> NON-deterministic corruption (races/DMA)
+# A small file is checksummed as a control, to show short reads are unaffected.
+say "CD-INTEGRITY probe starting"
+for f in kmod-33-r2.apk linux-lts-6.12.98-r0.apk; do
+    p1="$REPO/x86_64/$f"
+    [ -f "$p1" ] || { say "CD-INTEGRITY $f MISSING"; continue; }
+    sz=$(wc -c < "$p1")
+    a=$(md5sum "$p1" | cut -d' ' -f1)
+    b=$(md5sum "$p1" | cut -d' ' -f1)
+    if [ "$a" = "$b" ]; then
+        say "CD-INTEGRITY $f size=$sz md5=$a (stable across 2 reads)"
+    else
+        say "CD-INTEGRITY $f size=$sz md5=$a then $b -- NON-DETERMINISTIC, reads differ!"
+    fi
+done
+say "CD-INTEGRITY host truth: kmod=d12d08369d580c866ca0492196811b8e linux-lts=e4f2fbabbb3992158eb28c44b6667997"
+
 export ERASE_DISKS=/dev/vda
 export BOOTLOADER=grub
 # Bounded, so an unforeseen prompt becomes a diagnosable failure with a COMPLETE
@@ -198,9 +221,17 @@ ROOTDEV=$(blkid | sed -n 's|^\(/dev/[a-z0-9]*\): .*TYPE="ext4".*|\1|p' | head -1
 ESPDEV=$(blkid | sed -n 's|^\(/dev/[a-z0-9]*\): .*TYPE="vfat".*|\1|p' | head -1)
 say "post-install: rootdev='$ROOTDEV' espdev='$ESPDEV'"
 installed=no
+# setup-disk does not reliably unmount the target: in bare QEMU /mnt came back
+# empty, but through hype the re-mount failed with "Resource busy" because it was
+# still mounted. Handle both -- reuse the existing mountpoint if there is one.
+existing=$(awk -v d="$ROOTDEV" '$1 == d { print $2; exit }' /proc/mounts)
+if [ -n "$existing" ]; then
+    say "$ROOTDEV is already mounted at $existing -- reusing it"
+    ROOT="$existing"
+fi
 if [ -n "$ROOTDEV" ]; then
     mkdir -p "$ROOT"
-    if mount -t ext4 "$ROOTDEV" "$ROOT" 2>&1; then
+    if [ -n "$existing" ] || mount -t ext4 "$ROOTDEV" "$ROOT" 2>&1; then
         say "re-mounted $ROOTDEV at $ROOT; contents: $(ls "$ROOT" | tr '\n' ' ')"
         [ -d "$ROOT/etc" ] && [ -d "$ROOT/boot" ] && installed=yes
     else
