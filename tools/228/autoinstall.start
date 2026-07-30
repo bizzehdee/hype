@@ -1,0 +1,267 @@
+#!/bin/sh
+# #228 unattended Alpine install to hype's guest disk (/dev/vda).
+# Runs from the CD's apkovl at the `local` runlevel. Everything is echoed to the
+# console because hype relays the guest's ttyS0 into \HYPEFULL.LOG -- that log is
+# the only telemetry we get from a real-HW run.
+exec >/dev/console 2>&1
+set -x
+say() { echo "### HYPE228: $*"; }
+
+say "autoinstall starting"
+
+# SAFETY. This script performs a DESTRUCTIVE full-disk install. setup-alpine copies
+# /etc (including this file) onto the target, so without a guard the installed system
+# re-runs the installer on every boot -- and under hype the seeded ISO stays attached,
+# so it WOULD find the repo and re-wipe the disk in a loop. Observed for real: a
+# boot-from-disk run re-entered this script and only stopped because no CD was there.
+#
+# A live Alpine boot has a tmpfs/overlay root; an installed system has a real one.
+# This guard therefore holds regardless of what files were left behind.
+rootfs_type=$(awk '$2 == "/" { print $3; exit }' /proc/mounts)
+case "$rootfs_type" in
+    tmpfs|overlay|overlayfs|squashfs|rootfs) : ;;
+    *)
+        say "REFUSING TO RUN: root filesystem is '$rootfs_type', not a live boot."
+        say "This looks like an already-installed system; an installer must not run here."
+        exit 0
+        ;;
+esac
+# GUARD 2 (defence in depth): explicit marker, in case the removal below ever fails.
+if [ -f /etc/hype-228-installed ]; then
+    say "REFUSING TO RUN: /etc/hype-228-installed marker present"
+    exit 0
+fi
+say "safety checks passed (live boot, rootfs=$rootfs_type)"
+
+# (1) THE blocker from the earlier attempts: under an apkovl boot the modloop
+# OpenRC service does not run, so /lib/modules stays empty, so nls_cp437 cannot
+# load, so mkfs.fat's ESP will not mount. Start it explicitly and wait for it.
+rc-service modloop start || say "modloop start returned $?"
+i=0
+while [ $i -lt 30 ]; do
+    [ -n "$(ls -A /lib/modules 2>/dev/null)" ] && break
+    sleep 1; i=$((i+1))
+done
+say "modloop: /lib/modules='$(ls /lib/modules 2>/dev/null)' after ${i}s"
+# Load EVERY filesystem/driver module the install needs while modloop is still
+# mounted, and make them resident -- setup-alpine re-enters the default runlevel
+# partway through (see the "Call to flock failed" + "Unmounting /.modloop" pair in
+# the logs), after which /lib/modules is gone and modprobe cannot help us.
+#
+# NOTE: `modprobe a b c` does NOT load three modules -- args 2+ are module
+# PARAMETERS ("vfat: unknown parameter 'ext4' ignored"). One call per module.
+for m in nls_cp437 nls_iso8859-1 vfat fat ext4 ext2 jbd2 mbcache crc16 \
+         virtio_blk virtio_pci virtio_scsi sd_mod; do
+    if modprobe "$m" 2>/dev/null; then say "modprobe $m ok"; else say "modprobe $m failed"; fi
+done
+
+# ext4 is the one that must be resident: setup-disk mounts the new root before it
+# can install anything, and a missing ext4 shows up only as the misleading
+# "mount: mounting /dev/vda3 on /mnt failed: No such device".
+if ! grep -qw ext4 /proc/filesystems; then
+    say "ext4 NOT registered -- retrying modloop then ext4"
+    rc-service modloop start 2>&1
+    modprobe ext4 2>&1
+fi
+if grep -qw ext4 /proc/filesystems; then
+    say "ext4 REGISTERED (setup-disk can mount the new root)"
+else
+    say "FATAL ext4 still unavailable -- setup-disk WILL fail at 'mount /dev/vda3'"
+fi
+say "registered filesystems: $(awk '{print $NF}' /proc/filesystems | tr '\n' ' ')"
+say "loaded modules: $(cut -d" " -f1 /proc/modules | tr '\n' ' ')"
+
+# setup-alpine re-enters the default runlevel partway through, which stops the
+# modloop service and takes /lib/modules with it. Rather than depend on guessing
+# every module in advance, keep a watchdog that puts it back whenever it vanishes.
+KVER=$(ls /lib/modules 2>/dev/null | head -1)
+(
+    while :; do
+        [ -n "$KVER" ] && [ -d "/lib/modules/$KVER/kernel" ] || rc-service modloop start >/dev/null 2>&1
+        sleep 2
+    done
+) &
+WATCHDOG=$!
+say "modloop watchdog started (pid $WATCHDOG, kver=$KVER)"
+
+# (An earlier vfat loop-mount preflight lived here. It reported FAILED on a run
+# whose real ESP mount SUCCEEDED -- a busybox `-o loop` artifact, not a real
+# signal -- so it was removed rather than left to mislead the next reader.)
+
+# (2) Find the offline repo on the boot medium. Reference it DIRECTLY -- copying
+# the ~140MB tree into tmpfs truncated on a small-RAM guest.
+REPO=""
+for m in /media/sr0 /media/cdrom /media/vda /media/usb; do
+    [ -d "$m/apks-hype/x86_64" ] && { REPO="$m/apks-hype"; break; }
+done
+if [ -z "$REPO" ]; then
+    for d in /media/*/apks-hype; do [ -d "$d/x86_64" ] && { REPO="$d"; break; }; done
+fi
+say "repo='$REPO'"
+[ -n "$REPO" ] || { say "FATAL no offline repo found"; exit 1; }
+
+# (3) The repo is unsigned. setup-disk shells out to `apk` itself, so the
+# --allow-untrusted has to come from a PATH shim, not from our own argv.
+mkdir -p /usr/local/sbin
+cat > /usr/local/sbin/apk <<'EOA'
+#!/bin/sh
+exec /sbin/apk --allow-untrusted "$@"
+EOA
+chmod +x /usr/local/sbin/apk
+export PATH=/usr/local/sbin:$PATH
+say "apk shim: $(command -v apk)"
+
+echo "$REPO" > /etc/apk/repositories
+apk update && say "apk update ok" || say "apk update rc=$?"
+
+# (4) Full answerfile. Every one of these must be set: any unset option makes
+# setup-alpine prompt, and a prompt is an unattended hang with no operator.
+cat > /tmp/answers <<EOF
+KEYMAPOPTS="us us"
+HOSTNAMEOPTS="-n hype-guest"
+DEVDOPTS="mdev"
+INTERFACESOPTS="auto lo
+iface lo inet loopback
+"
+DNSOPTS="-d hype 1.1.1.1"
+TIMEZONEOPTS="-z UTC"
+PROXYOPTS="none"
+APKREPOSOPTS="$REPO"
+USEROPTS="-a -u -g audio,video,netdev hypeuser"
+SSHDOPTS="-c openssh"
+NTPOPTS="-c chrony"
+DISKOPTS="-m sys /dev/vda"
+LBUOPTS="none"
+APKCACHEOPTS="none"
+EOF
+say "answerfile:"; cat /tmp/answers
+
+# (5) ERASE_DISKS suppresses setup-disk's destructive-write confirmation; without
+# it setup-disk waits on stdin forever.
+# GUARD 4 (the one that actually matters under hype). hype keeps the seeded ISO
+# attached, so after a successful install the LIVE ISO can boot again -- a tmpfs
+# root with a fresh /etc, which sails past guards 1 and 2 and would re-wipe the
+# disk on every single boot. So ask the TARGET whether it is already installed.
+# Override by putting a file named HYPE228_FORCE on the boot medium.
+target_already_installed() {
+    _found=1
+    mkdir -p /tmp/probe
+    for _p in /dev/vda3 /dev/vda2 /dev/vda1; do
+        [ -b "$_p" ] || continue
+        if mount -o ro "$_p" /tmp/probe 2>/dev/null; then
+            [ -f /tmp/probe/etc/hype-228-installed ] && _found=0
+            umount /tmp/probe 2>/dev/null
+        fi
+        [ $_found -eq 0 ] && break
+    done
+    return $_found
+}
+FORCE=no
+for _m in /media/sr0 /media/cdrom /media/*; do
+    [ -f "$_m/HYPE228_FORCE" ] && FORCE=yes
+done
+if target_already_installed && [ "$FORCE" != yes ]; then
+    say "REFUSING TO INSTALL: /dev/vda already carries a completed #228 install"
+    say "(found /etc/hype-228-installed on the target). This is the re-wipe guard."
+    say "To install anyway, put a file named HYPE228_FORCE on the boot medium."
+    say "powering off without touching the disk"
+    kill "$WATCHDOG" 2>/dev/null
+    sync; sleep 2
+    poweroff -f
+    exit 0
+fi
+say "target check: no existing #228 install found (force=$FORCE) -- proceeding"
+
+export ERASE_DISKS=/dev/vda
+export BOOTLOADER=grub
+# Bounded, so an unforeseen prompt becomes a diagnosable failure with a COMPLETE
+# log + a clean poweroff, instead of a dead hang. On real HW a hang costs a whole
+# cold-boot cycle and yields a truncated log, which is how the earlier attempts
+# burned runs.
+say "running setup-alpine"
+timeout 900 setup-alpine -e -f /tmp/answers
+rc=$?
+say "setup-alpine rc=$rc"
+if [ $rc -eq 124 ]; then
+    say "setup-alpine TIMED OUT -- it almost certainly hit an interactive prompt."
+    say "last console lines above show which step; add the missing package or answerfile key."
+fi
+
+# (6) Post-install: make the target bootable under the guest's OVMF, which has no
+# NVRAM boot entry -- only the removable fallback path is tried. A hand-copied
+# grubx64.efi lands in a bare grub> shell (wrong prefix), so use grub-install.
+ROOT=/mnt
+# setup-disk unmounts the target once it is done, so re-attach it. Devices are
+# discovered, not hardcoded: busybox blkid has no `-o value -s TYPE`, so parse its
+# default `/dev/X: ... TYPE="y"` output.
+ROOTDEV=$(blkid | sed -n 's|^\(/dev/[a-z0-9]*\): .*TYPE="ext4".*|\1|p' | head -1)
+ESPDEV=$(blkid | sed -n 's|^\(/dev/[a-z0-9]*\): .*TYPE="vfat".*|\1|p' | head -1)
+say "post-install: rootdev='$ROOTDEV' espdev='$ESPDEV'"
+installed=no
+if [ -n "$ROOTDEV" ]; then
+    mkdir -p "$ROOT"
+    if mount -t ext4 "$ROOTDEV" "$ROOT" 2>&1; then
+        say "re-mounted $ROOTDEV at $ROOT; contents: $(ls "$ROOT" | tr '\n' ' ')"
+        [ -d "$ROOT/etc" ] && [ -d "$ROOT/boot" ] && installed=yes
+    else
+        say "could not re-mount $ROOTDEV"
+    fi
+fi
+
+if [ "$installed" = yes ]; then
+    say "target rootfs verified on $ROOTDEV -- fixing bootloader + console"
+    [ -n "$ESPDEV" ] && { mkdir -p "$ROOT/boot/efi"; mount -t vfat "$ESPDEV" "$ROOT/boot/efi" 2>&1; }
+    mount --bind /dev  "$ROOT/dev"  2>/dev/null
+    mount --bind /proc "$ROOT/proc" 2>/dev/null
+    mount --bind /sys  "$ROOT/sys"  2>/dev/null
+    cat > "$ROOT/etc/default/grub" <<'EOG'
+GRUB_DISTRIBUTOR="Alpine"
+GRUB_TIMEOUT=1
+GRUB_DISABLE_SUBMENU=y
+GRUB_DISABLE_RECOVERY=true
+GRUB_TERMINAL="serial console"
+GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
+GRUB_CMDLINE_LINUX_DEFAULT="console=ttyS0,115200 rootfstype=ext4"
+EOG
+    # #232 territory: give the target initramfs the drivers hype actually presents.
+    mkdir -p "$ROOT/etc/mkinitfs"
+    cat > "$ROOT/etc/mkinitfs/mkinitfs.conf" <<'EOM'
+features="base virtio scsi usb ext4 keymap kms"
+EOM
+    chroot "$ROOT" /bin/sh -euxc '
+        export PATH=/usr/local/sbin:$PATH
+        KV=$(ls /lib/modules | head -1)
+        echo "### HYPE228: target kernel modules dir = $KV"
+        mkinitfs -c /etc/mkinitfs/mkinitfs.conf "$KV"
+        grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram
+        grub-mkconfig -o /boot/grub/grub.cfg
+        grep -E "linux|root=" /boot/grub/grub.cfg | head -8
+    ' 2>&1
+    say "post-install chroot rc=$?"
+    say "ESP contents: $(ls -R "$ROOT/boot/efi/EFI" 2>/dev/null | tr '\n' ' ')"
+    # Do not leave a destructive installer on the installed system.
+    rm -f "$ROOT/etc/local.d/autoinstall.start"
+    : > "$ROOT/etc/hype-228-installed"
+    if [ -e "$ROOT/etc/local.d/autoinstall.start" ]; then
+        say "WARNING could not remove autoinstall.start from the target"
+    else
+        say "removed autoinstall.start from the target + left the installed marker"
+    fi
+    sync
+    umount "$ROOT/dev" "$ROOT/proc" "$ROOT/sys" "$ROOT/boot/efi" 2>/dev/null
+    umount "$ROOT" 2>/dev/null
+    sync
+fi
+
+# Honest verdict: only claim success if setup-alpine succeeded AND a real target
+# rootfs exists. An unconditional "COMPLETE" is how a failed run gets mistaken for
+# a good one when all you have is the log.
+if [ "$rc" -eq 0 ] && [ "$installed" = yes ]; then
+    say "INSTALL SUCCEEDED (setup-alpine rc=0, rootfs + bootloader written to $ROOTDEV)"
+else
+    say "INSTALL FAILED (setup-alpine rc=$rc, target rootfs verified=$installed)"
+fi
+kill "$WATCHDOG" 2>/dev/null
+say "powering off"
+sync; sleep 2
+poweroff -f
