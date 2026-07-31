@@ -861,6 +861,33 @@ static void fw_1_ap_main(void *arg) {
     if (vm_idx >= HYPE_FW_MAX_VMS) {
         vm_idx = 0u;
     }
+    /*
+     * #257: move this core onto the BSP's page table.
+     *
+     * The AP boots on its own root (g_ap_cr3) purely because the trampoline sets
+     * CR3 with a 32-bit `mov` and so needs a root below 4GB, which g_pml4 is not
+     * guaranteed to be (observed at 0x140099000 on real HW). That root is only a
+     * flat [0, 64GB) identity map, and NOTHING else is ever added to it -- so a
+     * host controller whose MMIO BAR lives above 64GB is simply absent from the
+     * page table this core executes on. QEMU's q35 puts the xHCI BAR at
+     * 0x380000000000 (56 TiB), and the doorbell write in bulk_xfer then faulted
+     * hype outright: "vector=14 (Page Fault) error_code=0x2" -- a supervisor write
+     * to a not-present page. Real hardware has only hidden it by keeping its BARs
+     * below 4GB.
+     *
+     * The BSP's g_pml4 already carries every window (hype_paging_map_mmio_1gb for
+     * the NVMe and xHCI BARs, plus the PERF-2 write-combining marking), and by the
+     * time this core runs, all of them are established. Switching here -- rather
+     * than mirroring each mapping into a second hierarchy -- means the two views
+     * cannot drift apart again, and any window the BSP adds later is visible to
+     * this core for free. We are in long mode and in C, so a 64-bit CR3 is fine.
+     *
+     * Must come FIRST: everything below (and every device this core touches after)
+     * assumes the BSP's view of memory. The stack is safe across the switch --
+     * g_ap_stack is a static in hype's image, inside the identity map in both
+     * tables -- and so is the code, for the same reason.
+     */
+    hype_paging_load(g_pml4);
     /* Give the AP a valid host environment before it can VMRUN: hype's own
      * GDT (reloads CS/segments via lretq) and IDT (for any exception during
      * host execution). Both are shared with the BSP -- safe because
@@ -10640,9 +10667,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 (hype_pte_t(*)[HYPE_PAGING_ENTRIES_PER_TABLE])(uintptr_t)(base + 8192ULL);
             hype_guest_ram_zero((void *)(uintptr_t)base, ap_pt_pages * 4096ULL);
             hype_paging_build_identity(ap_pml4, ap_pdpt, ap_pd, HYPE_PAGING_MAX_GB);
-            /* PERF-2 (#234): the console-owner guest runs on an AP and blits the
-             * framebuffer using THIS page table, so mark the FB pages WC here too
-             * (the AP also programs PAT slot 1 = WC in fw_1_ap_main). */
+            /* PERF-2 (#234): mark the FB pages WC in the AP's own table too (the
+             * AP also programs PAT slot 1 = WC in fw_1_ap_main).
+             *
+             * #257 moved the AP onto g_pml4 at the top of fw_1_ap_main, so this
+             * now only covers the trampoline window before that switch, during
+             * which nothing blits. It is kept deliberately rather than deleted:
+             * the CR3 switch still needs real-hardware validation, and bundling a
+             * perf-sensitive removal with a paging change is exactly the kind of
+             * multi-change slice that has cost this project a bisect before. */
             if (g_fb_size != 0 &&
                 g_fb_base + g_fb_size <= (uint64_t)HYPE_PAGING_MAX_GB * HYPE_PAGING_1GB) {
                 hype_paging_mark_region_wc(ap_pd, g_fb_base, g_fb_size, HYPE_PAGING_MAX_GB);
