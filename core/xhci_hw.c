@@ -170,8 +170,25 @@ static void cmd_enqueue(const uint32_t trb[4]) {
 
 /* Poll the event ring for the next valid event (cycle == consumer cycle),
  * copy it to out[4], advance the dequeue pointer + ERDP. -1 on timeout. */
-static int next_event(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
-    unsigned int spins = SPIN;
+/*
+ * #266 measurement. The failures on this controller all report "no event arrived":
+ * next_event polls its whole budget and the cycle bit never flips. That is a stall,
+ * not a mis-ordering -- but "the completion is very late" and "the completion never
+ * comes" demand completely different fixes (waiting strategy vs a missed doorbell or
+ * ERDP/interrupter bug), and the two are indistinguishable from a fixed-budget poll.
+ *
+ * So: the budget is a parameter, and how many spins each event actually took is
+ * recorded. A caller that times out can then re-poll with a far larger budget and
+ * settle the question, and the normal-case statistics say how far the outliers
+ * really are from typical.
+ */
+static unsigned int g_evt_spin_max;      /* worst spin count for an event that DID arrive */
+static unsigned long long g_evt_spin_sum; /* for a mean; unsigned long long: SPIN is 2e7 */
+static unsigned long long g_evt_count;
+
+static int next_event_budget(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4],
+                             unsigned int budget, unsigned int *spins_used) {
+    unsigned int spins = budget;
     while (spins-- != 0u) {
         uint32_t d3 = trb_dw(g_evt_ring, g_evt_deq, 3);
         if ((int)(d3 & 1u) == (int)g_evt_cyc) {
@@ -184,10 +201,22 @@ static int next_event(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
             /* ERDP = address of the new dequeue slot, with EHB (bit3) written 1 to clear. */
             wr64(bar, hype_xhci_ir0_offset(rtsoff, HYPE_XHCI_IR_ERDP),
                  (phys(g_evt_ring) + (uint64_t)g_evt_deq * HYPE_XHCI_TRB_BYTES) | (1u << 3));
+            {
+                unsigned int used = budget - spins - 1u;
+                if (spins_used != 0) *spins_used = used;
+                if (used > g_evt_spin_max) g_evt_spin_max = used;
+                g_evt_spin_sum += (unsigned long long)used;
+                g_evt_count++;
+            }
             return 0;
         }
     }
+    if (spins_used != 0) *spins_used = budget;
     return -1;
+}
+
+static int next_event(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
+    return next_event_budget(bar, rtsoff, out, SPIN, 0);
 }
 
 /*
@@ -521,11 +550,41 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
     wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
     while (guard-- != 0u) {
         if (next_event(bar, c->rtsoff, evt) != 0) {
-            /* #266: "no event arrived" and "events arrived, none of them ours" are
-             * different faults and were indistinguishable in the log. */
-            hype_debug_print("host-xhci: #266 bulk TIMEOUT waiting for slot=%u ep=%u "
-                             "trb=0x%llx (no event arrived; %u foreign seen this boot)\n",
+            /*
+             * #266 THE decisive measurement. Every observed failure says "no event
+             * arrived", which is a stall rather than a mis-ordering -- but a
+             * completion that is merely very late and one that never comes need
+             * opposite fixes (wait differently vs find the missed doorbell / ERDP /
+             * interrupter bug), and a fixed-budget poll cannot tell them apart.
+             *
+             * So re-poll with 10x the budget before giving up. Consuming the event if
+             * it does turn up is fine and is what we want: the transfer has already
+             * failed, recovery follows, and recovery drains the ring anyway.
+             */
+            unsigned int extra = 0;
+            uint32_t late[4];
+            int arrived = next_event_budget(bar, c->rtsoff, late, SPIN * 10u, &extra);
+            hype_debug_print("host-xhci: #266 bulk TIMEOUT waiting for slot=%u ep=%u trb=0x%llx "
+                             "(%u foreign seen this boot)\n",
                              slot, dci, (unsigned long long)my_trb, g_bulk_foreign_seen);
+            if (arrived == 0) {
+                hype_debug_print("host-xhci: #266   -> the event WAS only LATE: arrived after "
+                                 "%u more spins (%ux the normal budget); type=%u slot=%u ep=%u "
+                                 "trb=0x%llx cc=%u. FIX = waiting strategy, not a lost event.\n",
+                                 extra, (extra / SPIN) + 1u, hype_xhci_trb_type(late),
+                                 hype_xhci_event_slot_id(late), hype_xhci_event_ep_id(late),
+                                 (unsigned long long)hype_xhci_event_trb_ptr(late),
+                                 hype_xhci_event_cc(late));
+            } else {
+                hype_debug_print("host-xhci: #266   -> STILL nothing after 11x the budget: the "
+                                 "completion is NOT merely late. Look upstream (doorbell / ERDP / "
+                                 "interrupter), not at the wait.\n");
+            }
+            hype_debug_print("host-xhci: #266   event latency so far: max=%u spins, mean=%llu "
+                             "over %llu events (normal budget %u)\n",
+                             g_evt_spin_max,
+                             (g_evt_count != 0ull) ? (g_evt_spin_sum / g_evt_count) : 0ull,
+                             g_evt_count, (unsigned int)SPIN);
             return -1;
         }
         if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_TRANSFER_EVENT) {
