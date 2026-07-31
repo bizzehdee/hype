@@ -100,3 +100,25 @@ char *hype_str_trim(char *s) {
     s[end] = '\0';
     return s;
 }
+
+int hype_ascii_to_utf16(const char *src, uint16_t *dst, unsigned long long dst_words) {
+    unsigned long long i;
+
+    if (src == 0 || dst == 0 || dst_words == 0ull) {
+        return -1;
+    }
+    for (i = 0; src[i] != '\0'; i++) {
+        unsigned char ch = (unsigned char)src[i];
+        if (i + 1ull >= dst_words) {
+            dst[0] = 0u; /* leave nothing half-widened for a caller to misuse */
+            return -1;   /* would truncate */
+        }
+        if (ch > 0x7Fu) {
+            dst[0] = 0u;
+            return -1; /* not ASCII: zero-extension would be a guess */
+        }
+        dst[i] = (uint16_t)ch;
+    }
+    dst[i] = 0u;
+    return 0;
+}

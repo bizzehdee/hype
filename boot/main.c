@@ -10687,96 +10687,56 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                           (unsigned long long)g_fw_1_ram_host_phys);
 
         /*
-         * ISO-1: reads a real installer ISO (\iso\test.iso -- a real
-         * ISO9660 image the Makefile's own `run` target copies onto the
-         * ESP, per the ticket's own "does not need M5" scoping) from the
-         * same ESP hype.efi was booted from, reusing FW-1's own
-         * core/file_io.h (already generic, not OVMF-specific). Verifies
-         * both the read succeeded at the file's own real size (not just
-         * a fixed/guessed buffer) and that a real ISO9660 Primary Volume
-         * Descriptor's "CD001" standard identifier
-         * (ECMA-119 SS7.1.1/7.1.2, always at byte offset 32769 -- the
-         * 2nd byte of the 17th 2048-byte sector) is genuinely present
-         * in what was read back -- proof this is real ISO content, not
-         * garbage/a short read that happened to return success.
+         * ISO-1 / #261: give vm0 its installer media.
+         *
+         * This used to be ~80 lines duplicating load_iso_into_vm() (GLADDER-9,
+         * #140) with a HARDCODED L"\\iso\\test.iso" and hype_fatal() on every
+         * failure. That duplication is why the hardcoded path survived: hype.cfg's
+         * `boot` and `install_media` were parsed and validated by core/cfg.c and
+         * then never consulted here, so a perfectly valid `boot = disk` config --
+         * exactly what you need to boot a guest hype has just installed -- died on
+         * "iso-1: hype_file_get_size(test.iso) failed". Now it routes through the
+         * one loader, honours the config, and refuses rather than panicking.
          */
         {
-            EFI_FILE_PROTOCOL *root = 0;
-            EFI_STATUS iso_status;
-            UINT64 iso_size;
-            uint64_t iso_host_phys;
-            const uint8_t *iso_bytes;
+            const hype_cfg_vm_t *cv = (g_hype_cfg.vm_count > 0u) ? &g_hype_cfg.vms[0] : 0;
+            static uint16_t iso_path_w[HYPE_CFG_PATH_MAX];
+            CHAR16 *iso_path = (CHAR16 *)L"\\iso\\test.iso";
 
-            iso_status = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
-            if (iso_status != EFI_SUCCESS) {
-                hype_fatal("iso-1: hype_file_locate_root failed: 0x%llx", (unsigned long long)iso_status);
-            }
-
-            iso_status = hype_file_get_size(root, SystemTable->BootServices, (CHAR16 *)L"\\iso\\test.iso",
-                                             &iso_size);
-            if (iso_status != EFI_SUCCESS) {
-                hype_fatal("iso-1: hype_file_get_size(test.iso) failed: 0x%llx",
-                           (unsigned long long)iso_status);
-            }
-            if (iso_size < 32769 + 5) {
-                hype_fatal("iso-1: test.iso is too small to be a real ISO9660 image (%llu bytes)",
-                           (unsigned long long)iso_size);
-            }
-
-            /* GLADDER-10(a): load the ISO into fixed 256MB non-contiguous
-             * CHUNKS (one AllocatePages + range-read each) instead of a single
-             * contiguous allocation, which OUT_OF_RESOURCES's for a multi-GB
-             * server ISO (no contiguous region that large). The ATAPI model
-             * reads across chunks via the per-VM iso_chunked. */
-            {
-                uint64_t chunk_bytes = 256ULL * 1024ULL * 1024ULL;
-                uint64_t n_chunks = (iso_size + chunk_bytes - 1ULL) / chunk_bytes;
-                uint64_t ci;
-                if (n_chunks > HYPE_ISO_MAX_CHUNKS) {
-                    hype_fatal("iso-1: ISO too big -- %llu bytes -> %llu chunks (max %u); raise "
-                               "HYPE_ISO_MAX_CHUNKS or the chunk size",
-                               (unsigned long long)iso_size, (unsigned long long)n_chunks,
-                               (unsigned int)HYPE_ISO_MAX_CHUNKS);
-                }
-                for (ci = 0; ci < n_chunks; ci++) {
-                    uint64_t this_len = iso_size - ci * chunk_bytes;
-                    UINTN this_pages;
-                    uint64_t base;
-                    EFI_STATUS rr;
-                    if (this_len > chunk_bytes) {
-                        this_len = chunk_bytes;
+            if (cv != 0 && cv->boot == HYPE_CFG_BOOT_DISK) {
+                /* Boot from the guest's own disk: no optical media at all, so the
+                 * guest firmware has only the disk to boot -- which is what the
+                 * removable EFI/BOOT/BOOTX64.EFI an install writes is for. */
+                g_vms[0].iso_host_phys = 0;
+                g_vms[0].iso_size = 0;
+                hype_debug_print("iso-1: vm0 boot=disk -- no installer media attached\n");
+            } else {
+                if (cv != 0 && cv->has_install_media && cv->install_media[0] != '\0') {
+                    if (hype_ascii_to_utf16(cv->install_media, iso_path_w,
+                                            (unsigned long long)HYPE_CFG_PATH_MAX) == 0) {
+                        iso_path = (CHAR16 *)iso_path_w;
+                    } else {
+                        hype_debug_print("iso-1: install_media '%s' is not a usable path "
+                                         "(too long or non-ASCII) -- falling back to the default\n",
+                                         cv->install_media);
                     }
-                    this_pages = (UINTN)((this_len + 4095ULL) / 4096ULL);
-                    base = hype_alloc_pages_any(SystemTable->BootServices, this_pages);
-                    rr = hype_file_read_range(root, (CHAR16 *)L"\\iso\\test.iso", ci * chunk_bytes,
-                                              (void *)(uintptr_t)base, (UINTN)this_len);
-                    if (rr != EFI_SUCCESS) {
-                        hype_fatal("iso-1: read chunk %llu (off 0x%llx len 0x%llx) failed: 0x%llx",
-                                   (unsigned long long)ci, (unsigned long long)(ci * chunk_bytes),
-                                   (unsigned long long)this_len, (unsigned long long)rr);
-                    }
-                    g_vms[0].iso_chunked.chunk_base[ci] = base;
                 }
-                g_vms[0].iso_chunked.chunk_bytes = chunk_bytes;
-                g_vms[0].iso_chunked.total_bytes = iso_size;
-                g_vms[0].iso_chunked.n_chunks = (unsigned)n_chunks;
-                /* flat aliases: chunk 0 (first 256MB) for the direct-read consumers */
-                iso_host_phys = g_vms[0].iso_chunked.chunk_base[0];
+                if (load_iso_into_vm(ImageHandle, SystemTable, iso_path, &g_vms[0]) != 0) {
+                    /* A refusal, not a panic: absent or unreadable media is an
+                     * operator/config mistake, and it must be diagnosable from the
+                     * log rather than taking hype down with it. vm0 simply gets no
+                     * optical drive, and its firmware falls through to the disk. */
+                    g_vms[0].iso_host_phys = 0;
+                    g_vms[0].iso_size = 0;
+                    hype_debug_print("iso-1: could not load installer media for vm0 -- "
+                                     "no optical drive attached (absent, unreadable, too big, "
+                                     "or not an ISO9660 image)\n");
+                } else {
+                    hype_debug_print("iso-1: vm0 installer media loaded -- %llu bytes, "
+                                     "\"CD001\" verified\n",
+                                     (unsigned long long)g_vms[0].iso_size);
+                }
             }
-
-            iso_bytes = (const uint8_t *)(uintptr_t)iso_host_phys;
-            if (iso_bytes[32769] != 'C' || iso_bytes[32770] != 'D' || iso_bytes[32771] != '0' ||
-                iso_bytes[32772] != '0' || iso_bytes[32773] != '1') {
-                hype_fatal("iso-1: test.iso is missing the ISO9660 \"CD001\" standard identifier");
-            }
-
-            hype_debug_print(
-                "iso-1: read a real %llu-byte ISO9660 image from \\iso\\test.iso, \"CD001\" "
-                "identifier verified at offset 32769\n",
-                (unsigned long long)iso_size);
-
-            g_vms[0].iso_host_phys = iso_host_phys;
-            g_vms[0].iso_size = iso_size;
         }
 
         /* M5-7 (#196): allocate vm0's virtio-blk scratch disk backing pre-EBS

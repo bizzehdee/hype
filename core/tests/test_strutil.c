@@ -93,7 +93,50 @@ static void test_str_trim(void) {
     CHECK_STR("trim tabs/newlines", "tab and newline", hype_str_trim(d));
 }
 
+
+static void test_ascii_to_utf16(void) {
+    uint16_t buf[8];
+
+    /* #261: config paths are ASCII char; the UEFI file protocols take CHAR16. */
+    if (hype_ascii_to_utf16("\\iso\\a.iso", buf, 16u) != 0) {
+        printf("FAIL: widening a normal path should succeed\n");
+        failures++;
+    }
+
+    if (hype_ascii_to_utf16("abc", buf, 8u) != 0 || buf[0] != 'a' || buf[1] != 'b' ||
+        buf[2] != 'c' || buf[3] != 0u) {
+        printf("FAIL: 'abc' should widen to a NUL-terminated a,b,c\n");
+        failures++;
+    }
+
+    /* Exactly fits: 7 chars + NUL in 8 words. */
+    if (hype_ascii_to_utf16("1234567", buf, 8u) != 0 || buf[7] != 0u) {
+        printf("FAIL: a string that exactly fits should succeed\n");
+        failures++;
+    }
+
+    /* One too long must be REFUSED, not truncated -- silently truncating a path
+     * means opening the wrong file. */
+    if (hype_ascii_to_utf16("12345678", buf, 8u) == 0) {
+        printf("FAIL: an over-long path must be refused, not truncated\n");
+        failures++;
+    }
+
+    /* Non-ASCII cannot be widened by zero-extension; refuse rather than guess. */
+    if (hype_ascii_to_utf16("a\xc3\xa9" "b", buf, 8u) == 0) {
+        printf("FAIL: a non-ASCII byte must be refused\n");
+        failures++;
+    }
+
+    if (hype_ascii_to_utf16(0, buf, 8u) == 0 || hype_ascii_to_utf16("a", 0, 8u) == 0 ||
+        hype_ascii_to_utf16("a", buf, 0u) == 0) {
+        printf("FAIL: NULL/zero-length arguments must be refused\n");
+        failures++;
+    }
+}
+
 int main(void) {
+    test_ascii_to_utf16();
     test_strlen();
     test_streq();
     test_strneq();
