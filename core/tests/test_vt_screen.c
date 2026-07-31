@@ -22,7 +22,56 @@ static void row_text(const hype_vt_screen_t *s, unsigned row, char *out) {
     out[s->cols] = '\0';
 }
 
+
+static void test_decsc_decrc_redraws_in_place(void) {
+    hype_vt_screen_t s;
+    char row[HYPE_VT_MAX_COLS + 1];
+
+    /* The exact shape apk emits for a progress bar: save cursor, draw, restore,
+     * erase to end of line, draw again. Before DECSC/DECRC were implemented the
+     * ESC 7 / ESC 8 pair was swallowed by the ESC state, so each update APPENDED
+     * after the previous one instead of redrawing in place -- which is what showed
+     * up on the real on-screen terminal. Only CSI s / CSI u existed; apk uses the
+     * two-byte forms. Escapes are split ("\x1b" "7") because a hex escape would
+     * otherwise swallow the following digit. */
+    hype_vt_screen_init(&s, 8u, 2u);
+    feed_str(&s, "\x1b" "7");        /* DECSC at col 0 */
+    feed_str(&s, "  5%");
+    feed_str(&s, "\x1b" "8");        /* DECRC back to col 0 */
+    feed_str(&s, "\x1b" "[0K");      /* EL: erase to end of line */
+    feed_str(&s, " 99%");
+
+    CHECK_EQ("DECRC returns to the saved row", 0u, s.cur_row);
+    CHECK_EQ("cursor sits after the redrawn text, not after both", 4u, s.cur_col);
+    row_text(&s, 0u, row);
+    CHECK("the redraw overwrote in place", strncmp(row, " 99%", 4) == 0);
+    CHECK("nothing of the first draw survives", strstr(row, "5%") == NULL);
+}
+
+static void test_decsc_decrc_match_the_csi_spellings(void) {
+    hype_vt_screen_t esc_form, csi_form;
+    char r_esc[HYPE_VT_MAX_COLS + 1], r_csi[HYPE_VT_MAX_COLS + 1];
+
+    /* One behaviour, two spellings -- they share an implementation so they cannot
+     * drift apart, and this pins that. (Named esc_form/csi_form rather than a/b:
+     * CHECK_EQ declares locals `e` and `a`, so a screen called `a` expands into
+     * the macro's own variable.) */
+    hype_vt_screen_init(&esc_form, 8u, 2u);
+    hype_vt_screen_init(&csi_form, 8u, 2u);
+    feed_str(&esc_form, "ab" "\x1b" "7" "cd" "\x1b" "8" "X");      /* DECSC / DECRC */
+    feed_str(&csi_form, "ab" "\x1b" "[s" "cd" "\x1b" "[u" "X");    /* SCOSC / SCORC */
+
+    CHECK_EQ("ESC 7/8 and CSI s/u agree on the column", csi_form.cur_col, esc_form.cur_col);
+    CHECK_EQ("ESC 7/8 and CSI s/u agree on the row", csi_form.cur_row, esc_form.cur_row);
+    row_text(&esc_form, 0u, r_esc);
+    row_text(&csi_form, 0u, r_csi);
+    CHECK("both spellings put X back at the saved column", strncmp(r_esc, r_csi, 4) == 0);
+    CHECK("and that column is 2 (over the 'c')", r_esc[2] == 'X');
+}
+
 int main(void) {
+    test_decsc_decrc_redraws_in_place();
+    test_decsc_decrc_match_the_csi_spellings();
     hype_vt_screen_t *s = malloc(sizeof(*s));
     char buf[HYPE_VT_MAX_COLS + 1];
 

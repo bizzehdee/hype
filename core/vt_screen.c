@@ -83,6 +83,20 @@ static void clamp_cursor(hype_vt_screen_t *s) {
     if (s->cur_col >= s->cols) s->cur_col = s->cols - 1;
     if (s->cur_row >= s->rows) s->cur_row = s->rows - 1;
 }
+/* Cursor save/restore. Two spellings reach these: CSI s / CSI u (SCOSC/SCORC)
+ * and the two-byte ESC 7 / ESC 8 (DECSC/DECRC). They are one behaviour, so they
+ * share one implementation -- only the CSI pair existed before, and apk uses the
+ * ESC pair, which is why progress bars appended instead of redrawing in place. */
+static void save_cursor(hype_vt_screen_t *s) {
+    s->saved_col = s->cur_col;
+    s->saved_row = s->cur_row;
+}
+
+static void restore_cursor(hype_vt_screen_t *s) {
+    s->cur_col = s->saved_col;
+    s->cur_row = s->saved_row;
+    clamp_cursor(s);
+}
 
 static void erase_cells(hype_vt_screen_t *s, unsigned r, unsigned c0, unsigned c1) {
     for (unsigned c = c0; c < c1 && c < s->cols; c++)
@@ -181,14 +195,11 @@ static void dispatch_csi(hype_vt_screen_t *s, uint8_t final) {
         case 'm': /* SGR */
             apply_sgr(s);
             break;
-        case 's': /* save cursor */
-            s->saved_col = s->cur_col;
-            s->saved_row = s->cur_row;
+        case 's': /* SCOSC: save cursor */
+            save_cursor(s);
             break;
-        case 'u': /* restore cursor */
-            s->cur_col = s->saved_col;
-            s->cur_row = s->saved_row;
-            clamp_cursor(s);
+        case 'u': /* SCORC: restore cursor */
+            restore_cursor(s);
             break;
         default:
             /* h/l (mode set/reset incl. DEC private), r (scroll region),
@@ -237,6 +248,10 @@ void hype_vt_screen_feed(hype_vt_screen_t *s, uint8_t b) {
             } else {
                 if (b == (uint8_t)'c') { /* RIS: full reset */
                     hype_vt_screen_init(s, s->cols, s->rows);
+                } else if (b == (uint8_t)'7') { /* DECSC: save cursor */
+                    save_cursor(s);
+                } else if (b == (uint8_t)'8') { /* DECRC: restore cursor */
+                    restore_cursor(s);
                 }
                 /* ESC ( / ESC ) charset selectors eat one more byte, but
                  * treating that byte as normal text is harmless in practice
