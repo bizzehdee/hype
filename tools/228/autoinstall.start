@@ -292,7 +292,13 @@ GRUB_DISABLE_SUBMENU=y
 GRUB_DISABLE_RECOVERY=true
 GRUB_TERMINAL="serial console"
 GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
-GRUB_CMDLINE_LINUX_DEFAULT="console=ttyS0,115200 rootfstype=ext4"
+# Both consoles, deliberately. ttyS0 is what hype relays into \HYPEFULL.LOG, so it
+# has to be there -- but listing ONLY ttyS0 makes the installed system invisible on a
+# physical screen, which is exactly the machine it has to boot on for #226 (the AMD
+# test laptop has no serial port at all). Linux sends output to every console= given
+# and takes the LAST as /dev/console, so ttyS0 stays primary for the log while tty0
+# still shows the boot.
+GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200 rootfstype=ext4"
 EOG
     # #232 territory: give the target initramfs the drivers hype actually presents.
     mkdir -p "$ROOT/etc/mkinitfs"
