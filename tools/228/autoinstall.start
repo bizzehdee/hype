@@ -302,8 +302,22 @@ GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200 rootfstype=ext4"
 EOG
     # #232 territory: give the target initramfs the drivers hype actually presents.
     mkdir -p "$ROOT/etc/mkinitfs"
+    # Alpine's OWN sys-install default, verbatim -- do not hand-curate this.
+    #
+    # It used to read "base virtio scsi usb ext4 keymap kms", which boots fine under
+    # hype (the guest disk is virtio-blk, so `virtio` covers it) and CANNOT boot on
+    # bare metal: the missing feature is `ata` (libata/ahci), so on a real machine
+    # the initramfs has no driver for the SATA disk it just installed to, the root
+    # UUID resolves to nothing, and you land in the initramfs emergency shell --
+    # observed on the AMD laptop for #226:
+    #   UUID=40df75f7-...: Can't lookup blockdev
+    #   mount: mounting UUID=40df75f7-... on /sysroot failed
+    # `nvme`, `mmc`, `raid` and `cdrom` were missing for the same reason, and would
+    # each have bitten on a different machine. Tracking the distro's list means a
+    # target that boots wherever it is plugged in, which is the entire point of
+    # checking the install produced a normal OS.
     cat > "$ROOT/etc/mkinitfs/mkinitfs.conf" <<'EOM'
-features="base virtio scsi usb ext4 keymap kms"
+features="ata base cdrom ext4 keymap kms mmc nvme raid scsi usb virtio"
 EOM
     chroot "$ROOT" /bin/sh -euxc '
         export PATH=/usr/local/sbin:$PATH
