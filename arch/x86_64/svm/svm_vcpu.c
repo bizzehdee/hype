@@ -1841,6 +1841,7 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
     uint8_t *dst_media = 0;
     uint32_t remaining;
     uint32_t prd_idx;
+    uint64_t transferred = 0; /* #262: byte offset within this command, for backend LBAs */
     uint8_t status_reg;
     uint8_t error_reg;
     int is_write_direction = 0;
@@ -1866,8 +1867,9 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
         remaining = HYPE_ATA_IDENTIFY_SIZE;
     } else if (fis.command == HYPE_ATA_CMD_READ_DMA_EXT) {
         uint32_t sector_count = hype_ata_disk_resolve_sector_count(fis.count);
-        if (hype_ata_disk_range_in_bounds(disk, fis.lba, sector_count)) {
-            src = disk->media + fis.lba * HYPE_ATA_SECTOR_SIZE;
+        if (disk->be != 0 ? ((uint64_t)fis.lba + sector_count <= disk->be->total_sectors)
+                          : hype_ata_disk_range_in_bounds(disk, fis.lba, sector_count)) {
+            src = (disk->be != 0) ? 0 : disk->media + fis.lba * HYPE_ATA_SECTOR_SIZE;
             remaining = sector_count * HYPE_ATA_SECTOR_SIZE;
         } else {
             status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
@@ -1876,8 +1878,9 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
     } else if (fis.command == HYPE_ATA_CMD_WRITE_DMA_EXT) {
         uint32_t sector_count = hype_ata_disk_resolve_sector_count(fis.count);
         is_write_direction = 1;
-        if (hype_ata_disk_range_in_bounds(disk, fis.lba, sector_count)) {
-            dst_media = disk->media + fis.lba * HYPE_ATA_SECTOR_SIZE;
+        if (disk->be != 0 ? ((uint64_t)fis.lba + sector_count <= disk->be->total_sectors)
+                          : hype_ata_disk_range_in_bounds(disk, fis.lba, sector_count)) {
+            dst_media = (disk->be != 0) ? 0 : disk->media + fis.lba * HYPE_ATA_SECTOR_SIZE;
             remaining = sector_count * HYPE_ATA_SECTOR_SIZE;
         } else {
             status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
@@ -1898,7 +1901,36 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
         hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)prd_idx * 16u, &prd);
         chunk = (prd.byte_count < remaining) ? prd.byte_count : remaining;
 
-        if (is_write_direction) {
+        if (disk->be != 0 && fis.command != HYPE_ATA_CMD_IDENTIFY_DEVICE) {
+            /*
+             * #262 slice 1: storage lives behind a blk_backend, so DMA straight
+             * between guest RAM and the backend instead of a RAM `media` array.
+             * IDENTIFY is excluded: it is a synthesised response, not disk content.
+             */
+            uint64_t lba_off;
+            uint32_t nsec;
+            if (hype_ata_prd_sector_range(transferred, chunk, &lba_off, &nsec) != 0) {
+                status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
+                error_reg = 0x04u; /* ABRT: a PRD that splits a sector is not a transfer
+                                    * we model, and guessing would hide the mismatch */
+                break;
+            }
+            if (is_write_direction) {
+                if (hype_blk_backend_write(disk->be, fis.lba + lba_off, nsec,
+                                           (const void *)(uintptr_t)prd.data_phys) != 0) {
+                    status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
+                    error_reg = 0x10u;
+                    break;
+                }
+            } else {
+                if (hype_blk_backend_read(disk->be, fis.lba + lba_off, nsec,
+                                          (void *)(uintptr_t)prd.data_phys) != 0) {
+                    status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
+                    error_reg = 0x10u;
+                    break;
+                }
+            }
+        } else if (is_write_direction) {
             const uint8_t *guest_src = (const uint8_t *)(uintptr_t)prd.data_phys;
             ahci_copy_fast(dst_media, guest_src, chunk);
             dst_media += chunk;
@@ -1907,6 +1939,7 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
             ahci_copy_fast(guest_dst, src, chunk);
             src += chunk;
         }
+        transferred += chunk;
         remaining -= chunk;
         prd_idx++;
     }

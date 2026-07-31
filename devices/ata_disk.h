@@ -2,6 +2,7 @@
 #define HYPE_DEVICES_ATA_DISK_H
 
 #include <stdint.h>
+#include "../core/blk_backend.h"
 
 /*
  * M5-2: a plain ATA hard-disk device behind its own, second AHCI HBA
@@ -47,6 +48,7 @@
 
 typedef struct {
     uint8_t *media;
+    hype_blk_backend_t *be; /* #262: when set, storage comes from here, not `media` */
     uint64_t media_bytes;
     uint64_t total_sectors; /* media_bytes / HYPE_ATA_SECTOR_SIZE */
 } hype_ata_disk_t;
@@ -56,6 +58,35 @@ typedef struct {
  * guest-memory access -- mirrors hype_atapi_reset()'s own
  * media/media_size parameters. */
 void hype_ata_disk_reset(hype_ata_disk_t *disk, uint8_t *media, uint64_t media_bytes);
+
+/*
+ * #262 slice 1: back this disk with a hype_blk_backend_t instead of a fixed RAM
+ * buffer, so an ATA disk can serve a real file or physical target -- the same shape
+ * virtio-blk was given in #205, where the device model takes the backend rather than
+ * owning storage.
+ *
+ * WHY THIS EXISTS. hype installs a guest to a real disk and cannot then boot it,
+ * because the guest firmware will not boot hype's virtio-blk (#262). The firmware DOES
+ * already boot this controller class -- every guest today boots the ATAPI optical
+ * drive on AHCI -- so presenting the installed disk as SATA is the shorter route to a
+ * bootable guest. That needs the ATA path to reach a real backend, which is this.
+ *
+ * `media` stays supported and takes precedence when no backend is set, so M5-2's
+ * microtest (a fixed RAM buffer) is untouched.
+ */
+void hype_ata_disk_set_backend(hype_ata_disk_t *disk, hype_blk_backend_t *be);
+
+/*
+ * Convert a PRD's byte range within a transfer into whole sectors.
+ *
+ * Returns 0 and fills *lba_off (sectors from the command's starting LBA) and *nsec on
+ * success; -1 if the range is not sector-aligned in both offset and length. Refusing
+ * is deliberate: ATA DMA transfers whole sectors and real PRD tables are aligned, so a
+ * split sector means either a guest bug or an assumption of ours being wrong, and
+ * silently read-modify-writing around it would hide that. Pure: unit-tested.
+ */
+int hype_ata_prd_sector_range(uint64_t byte_off, uint32_t byte_len, uint64_t *lba_off,
+                              uint32_t *nsec);
 
 /*
  * Synthesizes a 512-byte IDENTIFY DEVICE response into `out`.

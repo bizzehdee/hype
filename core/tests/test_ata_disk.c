@@ -135,7 +135,73 @@ static void test_identify_strings_are_byte_swapped_per_word(void) {
               identify[49]);
 }
 
+
+/* #262 slice 1: PRD byte ranges -> whole sectors for the blk_backend path. */
+static void test_prd_sector_range(void) {
+    uint64_t lba_off;
+    uint32_t nsec;
+
+    if (hype_ata_prd_sector_range(0u, 512u, &lba_off, &nsec) != 0 || lba_off != 0u || nsec != 1u) {
+        printf("FAIL: one sector at offset 0 should be lba_off=0 nsec=1\n");
+        failures++;
+    }
+    if (hype_ata_prd_sector_range(4096u, 8192u, &lba_off, &nsec) != 0 || lba_off != 8u ||
+        nsec != 16u) {
+        printf("FAIL: 8KiB at offset 4KiB should be lba_off=8 nsec=16\n");
+        failures++;
+    }
+
+    /* Refusing is the point: ATA DMA moves whole sectors, so a PRD that splits one
+     * means an assumption is wrong, and read-modify-writing around it would hide
+     * that rather than surface it. */
+    if (hype_ata_prd_sector_range(0u, 500u, &lba_off, &nsec) == 0) {
+        printf("FAIL: a non-sector-multiple LENGTH must be refused\n");
+        failures++;
+    }
+    if (hype_ata_prd_sector_range(100u, 512u, &lba_off, &nsec) == 0) {
+        printf("FAIL: a non-sector-aligned OFFSET must be refused\n");
+        failures++;
+    }
+    if (hype_ata_prd_sector_range(0u, 0u, &lba_off, &nsec) != 0 || nsec != 0u) {
+        printf("FAIL: a zero-length range is aligned and yields nsec=0\n");
+        failures++;
+    }
+    if (hype_ata_prd_sector_range(0u, 512u, 0, &nsec) == 0 ||
+        hype_ata_prd_sector_range(0u, 512u, &lba_off, 0) == 0) {
+        printf("FAIL: NULL out-parameters must be refused\n");
+        failures++;
+    }
+
+    /* A large offset must not overflow into a wrong sector number. */
+    if (hype_ata_prd_sector_range(4294967296ull, 512u, &lba_off, &nsec) != 0 ||
+        lba_off != 8388608ull) {
+        printf("FAIL: a 4GiB offset should map to sector 8388608, got %llu\n",
+               (unsigned long long)lba_off);
+        failures++;
+    }
+}
+
+static void test_set_backend(void) {
+    hype_ata_disk_t d;
+    static uint8_t media[1024];
+    hype_blk_backend_t be;
+
+    hype_ata_disk_reset(&d, media, sizeof(media));
+    if (d.be != 0) {
+        printf("FAIL: reset must clear the backend so a RAM-media disk stays RAM-backed\n");
+        failures++;
+    }
+    hype_ata_disk_set_backend(&d, &be);
+    if (d.be != &be) {
+        printf("FAIL: set_backend should attach the backend\n");
+        failures++;
+    }
+    hype_ata_disk_set_backend(0, &be); /* must not crash */
+}
+
 int main(void) {
+    test_prd_sector_range();
+    test_set_backend();
     test_reset_computes_total_sectors();
     test_resolve_sector_count();
     test_range_in_bounds();

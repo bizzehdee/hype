@@ -2,6 +2,7 @@
 
 void hype_ata_disk_reset(hype_ata_disk_t *disk, uint8_t *media, uint64_t media_bytes) {
     disk->media = media;
+    disk->be = 0;
     disk->media_bytes = media_bytes;
     disk->total_sectors = media_bytes / HYPE_ATA_SECTOR_SIZE;
 }
@@ -76,4 +77,23 @@ uint32_t hype_ata_disk_resolve_sector_count(uint16_t raw_count) {
 
 int hype_ata_disk_range_in_bounds(const hype_ata_disk_t *disk, uint64_t lba, uint32_t sector_count) {
     return (lba + (uint64_t)sector_count) <= disk->total_sectors;
+}
+
+void hype_ata_disk_set_backend(hype_ata_disk_t *disk, hype_blk_backend_t *be) {
+    if (disk != 0) {
+        disk->be = be;
+    }
+}
+
+int hype_ata_prd_sector_range(uint64_t byte_off, uint32_t byte_len, uint64_t *lba_off,
+                              uint32_t *nsec) {
+    if (lba_off == 0 || nsec == 0) {
+        return -1;
+    }
+    if ((byte_off % HYPE_ATA_SECTOR_SIZE) != 0u || (byte_len % HYPE_ATA_SECTOR_SIZE) != 0u) {
+        return -1; /* a PRD splitting a sector: refuse rather than paper over it */
+    }
+    *lba_off = byte_off / HYPE_ATA_SECTOR_SIZE;
+    *nsec = byte_len / HYPE_ATA_SECTOR_SIZE;
+    return 0;
 }
