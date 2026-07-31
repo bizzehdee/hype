@@ -1,4 +1,5 @@
 #include "vmcs.h"
+#include "../cpu/fpu_state.h"
 #include "vmx.h"
 
 #include "../../../core/blk_backend.h"
@@ -206,6 +207,9 @@ extern uint64_t hype_vmx_launch(hype_vcpu_ctx_t *ctx, uint64_t launched);
  */
 struct hype_vcpu_ctx {
     uint64_t gprs[16];
+    /* #260: guest x87/SSE state. Neither VMX nor SVM saves it for us and hype's
+     * own handlers use XMM, so it is saved/restored around VM entry. Per-vCPU. */
+    hype_fpu_area_t fpu;
     int launched; /* 0 until the first successful VMLAUNCH; VMRESUME thereafter. */
     /*
      * Pending external interrupts (INT-1/INT-2 on VMX), staged into
@@ -870,6 +874,9 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
     for (i = 0; i < 16; i++) {
         ctx->gprs[i] = 0;
     }
+    /* #260: architectural reset image, not zeros -- a zeroed FXSAVE image sets
+     * MXCSR=0, which unmasks every SIMD exception. */
+    hype_fpu_area_reset(&ctx->fpu);
     ctx->launched = 0;
     vmx_ctx_reset_pending(ctx);
     return (hype_vcpu_ctx_t *)ctx;
@@ -968,7 +975,13 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     if (g_vmx_guest_xcr0_valid && vmx_ensure_osxsave()) {
         xsetbv0(g_vmx_guest_xcr0);
     }
+    /* #260: restore AFTER the XCR0 switch (XSETBV can reinitialise state
+     * components, discarding whatever we had just loaded) and save BEFORE
+     * switching XCR0 back, for the same reason. Nothing between the restore and
+     * the launch may touch vector registers. */
+    hype_fpu_restore(&real->fpu);
     failed = hype_vmx_launch(ctx, (uint64_t)real->launched);
+    hype_fpu_save(&real->fpu);
     if (g_vmx_guest_xcr0_valid && g_vmx_host_xcr0 != 0ull) {
         xsetbv0(g_vmx_host_xcr0);
     }

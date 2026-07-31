@@ -1,4 +1,5 @@
 #include "svm.h"
+#include "../cpu/fpu_state.h"
 
 #include "../../../core/guest_mem.h"
 
@@ -36,6 +37,12 @@ struct hype_vcpu_ctx {
      * raw ModRM.reg encoding hype_mmio_decode() reports directly,
      * avoiding a translation table in the NPF/MMIO decode path. */
     uint64_t gprs[16];
+    /* #260: the guest's x87/SSE state. SVM does not save it in the VMCB and
+     * hype's own handlers use XMM, so it is saved/restored around VMRUN here.
+     * Per-vCPU, not file-global: two guests run concurrently on two cores, and a
+     * shared area would have each core's exit stomp the other's registers --
+     * the same class of bug as #237's shared VMCB slot. */
+    hype_fpu_area_t fpu;
     /* PVCLOCK (kvmclock), per-vCPU. M8-0b STEP 2: two guests run concurrently,
      * each with its OWN guest-physical->host map, so the map (and each guest's
      * last KVM SYSTEM_TIME/WALL_CLOCK MSR value) MUST be per-vCPU -- a single
@@ -246,6 +253,9 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     for (i = 0; i < 16; i++) {
         ctx->gprs[i] = 0;
     }
+    /* #260: a zeroed FXSAVE image would set MXCSR=0, unmasking every SIMD
+     * exception; load the architectural reset image instead. */
+    hype_fpu_area_reset(&ctx->fpu);
     /* Also clear the per-vCPU pvclock state (M8-0b STEP 2): a slot reused by a
      * later guest must not inherit a prior guest's pvclock map/MSR values. */
     ctx->pvclock_map = 0;
@@ -2677,9 +2687,15 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
         hype_debug_print("svm: about to CLGI/VMLOAD/VMRUN (vmcb_phys=0x%llx)...\n",
                           (unsigned long long)vmcb_phys);
     }
+    /* #260: load the guest's x87/SSE state LAST -- after the trace print above,
+     * which uses XMM like any other compiled C here -- and save it back FIRST on
+     * exit, before the trace print below. Nothing between these two calls may
+     * touch vector registers; clgi/vmload/vmsave/stgi are bare instructions. */
+    hype_fpu_restore(&real->fpu);
     clgi();
     vmload(vmcb_phys);
     vmrun_full(real, vmcb_phys);
+    hype_fpu_save(&real->fpu);
     if (g_vmrun_trace) {
         hype_debug_print("svm: VMRUN returned -- about to VMSAVE/STGI...\n");
     }

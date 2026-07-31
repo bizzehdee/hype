@@ -46,6 +46,7 @@ ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/id
              arch/x86_64/cpu/ps2_host.c arch/x86_64/cpu/ps2_host_hw.c \
              arch/x86_64/cpu/leader_chord.c arch/x86_64/cpu/host_input.c \
              arch/x86_64/cpu/cpu_features.c arch/x86_64/cpu/cpu_features_hw.c \
+             arch/x86_64/cpu/fpu_state.c arch/x86_64/cpu/fpu_state_hw.c \
              arch/x86_64/cpu/vmm_select.c arch/x86_64/cpu/vmexit.c arch/x86_64/cpu/mmio_decode.c \
              arch/x86_64/cpu/cpuid_emulate.c arch/x86_64/cpu/msr_emulate.c \
              arch/x86_64/cpu/ap_boot.c \
@@ -98,6 +99,7 @@ $(BUILD_DIR)/%.o: %.S
 
 $(OUT): $(OBJS)
 	$(LD) $(LDFLAGS) -out:$@ $(OBJS)
+	@tools/check-no-vex.sh $(OUT)
 
 test:
 	core/tests/run.sh
