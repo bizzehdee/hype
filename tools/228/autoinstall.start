@@ -76,6 +76,14 @@ say "loaded modules: $(cut -d" " -f1 /proc/modules | tr '\n' ' ')"
 # every module in advance, keep a watchdog that puts it back whenever it vanishes.
 KVER=$(ls /lib/modules 2>/dev/null | head -1)
 (
+    # set +x and >/dev/null: under the script's `set -x` this loop traced three
+    # lines to the console every 2 seconds for the whole run, which is pure noise
+    # in \HYPEFULL.LOG -- and that log is the only telemetry a cold-boot run
+    # produces, so wasting it is expensive. Failures still surface: if modloop
+    # cannot be kept mounted, the modules it provides go missing and the install
+    # fails loudly further down.
+    set +x
+    exec >/dev/null 2>&1
     while :; do
         [ -n "$KVER" ] && [ -d "/lib/modules/$KVER/kernel" ] || rc-service modloop start >/dev/null 2>&1
         sleep 2

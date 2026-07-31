@@ -41,6 +41,17 @@ initrd	/boot/initramfs-lts
 }
 EOF
 cp "$B/hype.apkovl.tar.gz" "$B/inj/"
+
+# HYPE_228_FORCE=1 drops the re-wipe override INSIDE the ISO. It has to live here,
+# not on hype's ESP: autoinstall.start looks for it on the GUEST's boot medium
+# (/media/sr0, /media/cdrom), and the guest never sees the USB stick hype booted
+# from -- it sees only this CD and its target disk.
+if [ "${HYPE_228_FORCE:-0}" = "1" ]; then
+    : > "$B/inj/HYPE228_FORCE"
+    echo "make-install-iso: HYPE228_FORCE included -- the re-wipe guard will be overridden"
+else
+    rm -f "$B/inj/HYPE228_FORCE"
+fi
 rm -rf "$B/inj/apks-hype"
 cp -a "$B/apks-hype" "$B/inj/"
 
@@ -50,6 +61,7 @@ xorriso -indev "$BASE" -outdev "$OUT" \
     -map "$B/inj/boot/grub/grub.cfg" /boot/grub/grub.cfg \
     -map "$B/inj/hype.apkovl.tar.gz" /hype.apkovl.tar.gz \
     -map "$B/inj/apks-hype" /apks-hype \
+    $( [ -f "$B/inj/HYPE228_FORCE" ] && printf -- '-map %s /HYPE228_FORCE' "$B/inj/HYPE228_FORCE" ) \
     -commit
 
 # A missing El Torito record means the guest OVMF will not boot it -- fail loudly
