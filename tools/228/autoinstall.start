@@ -240,8 +240,14 @@ timeout 900 setup-alpine -e -f /tmp/answers
 rc=$?
 say "setup-alpine rc=$rc"
 if [ $rc -eq 124 ]; then
-    say "setup-alpine TIMED OUT -- it almost certainly hit an interactive prompt."
-    say "last console lines above show which step; add the missing package or answerfile key."
+    say "setup-alpine TIMED OUT after 900s. TWO causes, and they look different:"
+    say "  (a) an interactive prompt -- the last console line is a question, and the"
+    say "      fix is the missing package or answerfile key."
+    say "  (b) simply too slow -- the last line is a step making progress, typically"
+    say "      mkfs.* on a physical target. hype's write path issues one AHCI command"
+    say "      at a time and waits for it, so small metadata writes are latency-bound"
+    say "      (#265). That is NOT a prompt and NOT an install defect."
+    say "Check WHICH step the last line names before concluding anything."
 fi
 
 # (6) Post-install: make the target bootable under the guest's OVMF, which has no
