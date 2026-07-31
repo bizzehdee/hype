@@ -27,9 +27,23 @@ typedef struct {
 } hype_log_sink_t;
 
 /*
+ * Distinct failure stages. Every one of these used to collapse into -1, so a
+ * volume that mounted and a file that was created could still be reported as
+ * "no mountable FAT32 volume" when it was the WRITE that failed -- observed on
+ * real hardware, where a 0-byte HYPEFULL.LOG on the stick proved both the mount
+ * and the create had in fact succeeded. Losing the log is bad; misdescribing why
+ * is worse, because it sends the next person to the wrong layer.
+ */
+#define HYPE_LOG_SINK_OK 0
+#define HYPE_LOG_SINK_ERR_MOUNT (-1)  /* not a FAT32 volume at this base LBA */
+#define HYPE_LOG_SINK_ERR_CREATE (-2) /* mounted, but the file could not be created */
+#define HYPE_LOG_SINK_ERR_WRITE (-3)  /* created, but the first append failed (block I/O) */
+
+/*
  * Mounts the FAT32 volume, creates (truncating) `filename` (8.3) in its root,
- * and streams whatever the logbuf already holds. Returns 0 on success, -1 if the
- * volume is not FAT32 or any I/O fails (the sink is left inactive).
+ * and streams whatever the logbuf already holds. Returns HYPE_LOG_SINK_OK, or one
+ * of the ERR codes above -- which stage failed is the useful part. The sink is
+ * left inactive on any failure.
  */
 /* `now` stamps the created file's directory entry; pass 0 for none (the
  * timestamps are then zeroed, as they were before the RTC existed). */

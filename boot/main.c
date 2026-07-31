@@ -10136,6 +10136,7 @@ typedef struct {
 
 static hype_log_sink_t g_usb_log;
 static int g_usb_log_ready;
+static int g_usb_log_flush_failed; /* emitted once, not every interval */
 static usblog_ctx_t g_usb_log_ctx;
 
 /* Persistent copies of the USB block path the sink writes through. The probe's
@@ -10193,17 +10194,32 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
         bases[nb++] = part.first_lba;
 
     for (i = 0; i < nb; i++) {
+        int rc;
         g_usb_log_ctx.base = bases[i];
-        if (hype_log_sink_open(&g_usb_log, usblog_read, usblog_write, &g_usb_log_ctx,
-                               "HYPEFULL.LOG", g_host_time_valid ? &g_host_time : 0) == 0) {
+        rc = hype_log_sink_open(&g_usb_log, usblog_read, usblog_write, &g_usb_log_ctx,
+                                "HYPEFULL.LOG", g_host_time_valid ? &g_host_time : 0);
+        if (rc == HYPE_LOG_SINK_OK) {
             g_usb_log_ready = 1;
             hype_debug_print("usb-log: streaming full log to \\HYPEFULL.LOG "
                              "(FAT32 at disk LBA %llu)\n", (unsigned long long)bases[i]);
             return;
         }
+        /* Name the stage. "no mountable FAT32 volume" was printed even when the
+         * volume HAD mounted and the file HAD been created and only the write
+         * failed -- which points the reader at the filesystem when the fault is in
+         * the block path underneath it. */
+        hype_debug_print("usb-log: base LBA %llu -- %s\n", (unsigned long long)bases[i],
+                         (rc == HYPE_LOG_SINK_ERR_MOUNT)    ? "not a FAT32 volume"
+                         : (rc == HYPE_LOG_SINK_ERR_CREATE) ? "FAT32 mounted but HYPEFULL.LOG "
+                                                              "could not be created"
+                         : (rc == HYPE_LOG_SINK_ERR_WRITE)
+                             ? "FAT32 mounted and HYPEFULL.LOG created, but the FIRST WRITE "
+                               "FAILED -- the USB block path (xHCI/MSC), not the filesystem"
+                             : "unknown failure");
     }
-    hype_debug_print("usb-log: no mountable FAT32 volume among %u candidate base LBA(s) on the "
-                     "USB stick (RT-3 NV tail remains the backup)\n", nb);
+    hype_debug_print("usb-log: could not open a log sink on any of %u candidate base LBA(s) "
+                     "(RT-3 NV tail remains the backup -- and note an EMPTY \\HYPEFULL.LOG on "
+                     "the stick means the file was created and the write failed)\n", nb);
 }
 
 static void usb_log_flush(void) {
@@ -10222,7 +10238,19 @@ static void usb_log_flush(void) {
                          &now);
         hype_fat32_fs_set_time(&g_usb_log.fs, &now);
     }
-    (void)hype_log_sink_flush(&g_usb_log);
+    /* Do NOT discard this. A flush that starts failing mid-run used to be silent,
+     * so the log simply stopped growing and a perfectly healthy hype was
+     * indistinguishable from one that had died -- that misread has cost this
+     * project real time more than once. Report the first failure only: it repeats
+     * every interval, and the report itself goes through the logbuf, which the
+     * RT-3 NV tail still captures even when the USB sink is gone. */
+    if (hype_log_sink_flush(&g_usb_log) != 0 && !g_usb_log_flush_failed) {
+        g_usb_log_flush_failed = 1;
+        hype_debug_print("usb-log: FLUSH FAILED -- \\HYPEFULL.LOG has stopped growing and is "
+                         "now INCOMPLETE. hype itself is unaffected; this is the USB block path "
+                         "(xHCI/MSC). Read the RT-3 NV tail (\\hype-diag-prev.txt) for the rest "
+                         "of this run.\n");
+    }
 }
 
 /* Diagnostic: log EVERY PCI function present (bus:dev.func, vendor/device,
