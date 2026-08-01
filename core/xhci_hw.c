@@ -15,6 +15,10 @@
 #define RING_TRBS 16u
 #define MAX_SCRATCH 64u
 #define SPIN 20000000u
+/* #266: one second, chosen against the measured distribution (mean 493,692 spins,
+ * worst observed ~36,000,000 spins). Generous by design -- being early is what
+ * caused the bug. */
+#define HYPE_XHCI_EVENT_TIMEOUT_US 1000000u
 
 /* DMA-visible controller structures (physically contiguous, hype .bss). */
 static uint8_t g_dcbaa[XPAGE] __attribute__((aligned(XPAGE)));       /* device context base addr array */
@@ -186,6 +190,23 @@ static unsigned int g_evt_spin_max;      /* worst spin count for an event that D
 static unsigned long long g_evt_spin_sum; /* for a mean; unsigned long long: SPIN is 2e7 */
 static unsigned long long g_evt_count;
 
+/*
+ * #266 RESOLVED by measurement. A 35-minute real-hardware run answered it: of every
+ * bulk timeout, 4 of 4 were events that DID arrive (all cc=1, i.e. the transfers had
+ * SUCCEEDED) and 0 were genuinely absent. So nine BOT recoveries were triggered on
+ * transfers that were about to complete, and the datapath was being torn down for no
+ * reason.
+ *
+ * The numbers say why. Mean arrival was 493,692 spins over 8,215 events; the late
+ * ones needed up to 15,950,630 spins ON TOP of the 20,000,000 budget -- about 36M
+ * total, roughly 70x the mean. The budget sat squarely in the middle of the tail.
+ *
+ * A spin count was the wrong unit to begin with: it means different amounts of time
+ * on different CPUs, at different frequencies, with different cache behaviour, so it
+ * can be generous on one machine and far too short on another. The budget is now a
+ * real deadline in microseconds, with the spin count kept only as a fallback for
+ * before the TSC frequency is known.
+ */
 static int next_event_budget(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4],
                              unsigned int budget, unsigned int *spins_used) {
     unsigned int spins = budget;
@@ -215,8 +236,34 @@ static int next_event_budget(volatile uint8_t *bar, uint32_t rtsoff, uint32_t ou
     return -1;
 }
 
+/*
+ * Wait up to `timeout_us` of real time. Falls back to the spin budget when the TSC
+ * frequency has not been supplied yet (early bring-up), which is the same
+ * correctness-over-precision trade delay_ms() above already makes.
+ */
+static int next_event_timed(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4],
+                            unsigned int timeout_us, unsigned int *spins_used) {
+    uint64_t end;
+
+    if (g_tsc_hz == 0u) {
+        return next_event_budget(bar, rtsoff, out, SPIN, spins_used);
+    }
+    end = rdtsc_now() + (g_tsc_hz / 1000000ull) * (uint64_t)timeout_us;
+    for (;;) {
+        if (next_event_budget(bar, rtsoff, out, SPIN / 64u, spins_used) == 0) {
+            return 0;
+        }
+        if (rdtsc_now() >= end) {
+            return -1;
+        }
+    }
+}
+
 static int next_event(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
-    return next_event_budget(bar, rtsoff, out, SPIN, 0);
+    /* One second. Far beyond any healthy completion -- the measured mean is under a
+     * millisecond of equivalent work -- and still bounded, so a genuinely dead device
+     * still fails rather than hanging hype. */
+    return next_event_timed(bar, rtsoff, out, HYPE_XHCI_EVENT_TIMEOUT_US, 0);
 }
 
 /*
