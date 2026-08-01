@@ -1797,12 +1797,36 @@ int hype_svm_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, h
  * already builds for ATAPI. */
 static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, uint8_t status_reg,
                                        uint8_t error_reg, const hype_gpa_map_t *dma_map,
-                                       unsigned slot) {
+                                       unsigned slot, uint32_t pis_bit, uint32_t xfer_bytes) {
     /* #262 slice 3: rx_fis_phys is GUEST-physical. Identity holds for M5-2's
      * microtest (dma_map == 0) but not for the FW-1 guest, which remaps its RAM. */
-    uint8_t *d2h_fis =
-        (uint8_t *)(uintptr_t)(guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u) + 0x40);
+    uint64_t rx_fis_host = guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
+    uint8_t *d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_host + 0x40);
     unsigned i;
+
+    /*
+     * #262 slice 4: a PIO data-in command must also deliver a PIO Setup FIS at
+     * receive-area offset 0x20. EDK2 drives the two device classes down different
+     * paths -- ATAPI through AhciPacketCommandExecute, which waits on the D2H FIS
+     * at 0x40, but plain-ATA PIO (IDENTIFY DEVICE) through AhciPioTransfer, which
+     * waits at 0x20. Writing only the D2H FIS is enough for the CD and for Linux
+     * (it polls PxCI), and is why the optical drive has always booted while the
+     * disk did not: the guest firmware issued exactly one IDENTIFY, waited at 0x20
+     * for a FIS that never arrived, and dropped the device.
+     */
+    if (pis_bit == HYPE_AHCI_PIS_PSS) {
+        uint8_t *pio_fis = (uint8_t *)(uintptr_t)(rx_fis_host + 0x20);
+        for (i = 0; i < 20u; i++) {
+            pio_fis[i] = 0;
+        }
+        pio_fis[0] = 0x5F;       /* FIS type: PIO Setup - Device to Host */
+        pio_fis[1] = 0x60;       /* I (interrupt) + D (device-to-host direction) */
+        pio_fis[2] = status_reg; /* Status at the start of the transfer */
+        pio_fis[3] = error_reg;
+        pio_fis[15] = status_reg; /* E_Status: status at the END of the transfer */
+        pio_fis[16] = (uint8_t)(xfer_bytes & 0xFFu); /* Transfer Count, 16-bit */
+        pio_fis[17] = (uint8_t)((xfer_bytes >> 8) & 0xFFu);
+    }
 
     ahci->p_tfd = (uint32_t)status_reg | ((uint32_t)error_reg << 8);
 
@@ -1819,7 +1843,7 @@ static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, 
      * the ATAPI path; the M4-5/M5-2 cooperating test guests polled PxCI
      * and never depended on this bit). Latch the global IS port bit for
      * an interrupt-driven guest, same as the ATAPI path (M4-6d2). */
-    ahci->p_is |= HYPE_AHCI_PIS_DHRS;
+    ahci->p_is |= pis_bit;
     if ((ahci->p_is & ahci->p_ie) != 0) {
         ahci->is |= HYPE_AHCI_IS_PORT0;
     }
@@ -1855,6 +1879,19 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
     uint64_t lba_base = 0;    /* decoded per address size -- NOT fis.lba, which is the raw 48-bit field */
     uint8_t status_reg;
     uint8_t error_reg;
+    /*
+     * #262 slice 4: which PxIS bit signals completion depends on the command's
+     * PROTOCOL, not just on success. IDENTIFY DEVICE is PIO data-in, and EDK2's
+     * AhciPioTransfer waits on PxIS.PSS for it -- exactly as the ATAPI path
+     * already does for IDENTIFY PACKET. Everything else here is DMA or no-data,
+     * which completes with a D2H Register FIS (PxIS.DHRS).
+     *
+     * Signalling DHRS for IDENTIFY is invisible to Linux, which polls PxCI, but
+     * the guest FIRMWARE times out waiting for PSS and drops the device: OVMF
+     * issued one IDENTIFY, never read a sector, and reported "No bootable option
+     * or device was found" -- with a perfectly good installed disk attached.
+     */
+    uint32_t pis_bit = HYPE_AHCI_PIS_DHRS;
     int is_write_direction = 0;
 
     hype_ahci_decode_cmd_header(cmd_hdr_bytes, &hdr);
@@ -1869,7 +1906,7 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
     }
     hype_ahci_decode_h2d_fis(cmd_table_bytes, &fis);
 
-    status_reg = HYPE_ATA_STATUS_DRDY;
+    status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_DSC);
     error_reg = 0;
     remaining = 0;
 
@@ -1877,6 +1914,7 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
         hype_ata_disk_build_identify(disk, identify);
         src = identify;
         remaining = HYPE_ATA_IDENTIFY_SIZE;
+        pis_bit = HYPE_AHCI_PIS_PSS;
     } else if (fis.command == HYPE_ATA_CMD_READ_DMA_EXT || fis.command == HYPE_ATA_CMD_READ_DMA ||
                fis.command == HYPE_ATA_CMD_WRITE_DMA_EXT || fis.command == HYPE_ATA_CMD_WRITE_DMA) {
         int lba48 = hype_ata_cmd_is_lba48(fis.command);
@@ -1981,7 +2019,8 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
         prd_idx++;
     }
 
-    complete_ahci_command_slot(ahci, rx_fis_phys, status_reg, error_reg, dma_map, slot);
+    complete_ahci_command_slot(ahci, rx_fis_phys, status_reg, error_reg, dma_map, slot, pis_bit,
+                               (uint32_t)transferred);
     return 0;
 }
 

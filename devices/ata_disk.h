@@ -47,6 +47,10 @@
  * ATAPI completion path; the full set, for the plain-ATA path). */
 #define HYPE_ATA_STATUS_BSY 0x80u
 #define HYPE_ATA_STATUS_DRDY 0x40u
+/* Seek/Drive Seek Complete. Real drives assert it with DRDY on a good completion,
+ * and hype's ATAPI model already returns DRDY|DSC (0x50) on the path the guest
+ * firmware is known to accept. */
+#define HYPE_ATA_STATUS_DSC 0x10u
 #define HYPE_ATA_STATUS_DF 0x20u
 #define HYPE_ATA_STATUS_DRQ 0x08u
 #define HYPE_ATA_STATUS_ERR 0x01u
