@@ -1962,8 +1962,18 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
     return 0;
 }
 
-int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_ata_disk_t *disk,
-                                        uint64_t ahci_base_phys) {
+/*
+ * #262 slice 3: shared body. `dma_map` is 0 for a trusted identity-mapped guest
+ * (M5-2's microtest) and the VM's real map for the FW-1 guest, which remaps its RAM.
+ * `guest_insn_bytes` lets the caller supply already-fetched instruction bytes; when
+ * it is 0 the bytes are read at the guest RIP, translated through the same map. Both
+ * mirror hype_svm_ahci_atapi_npf_common's contract, so the two controllers are
+ * handled the same way rather than each having its own rules.
+ */
+static int hype_svm_ahci_disk_npf_common(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                         hype_ata_disk_t *disk, uint64_t ahci_base_phys,
+                                         const hype_gpa_map_t *dma_map,
+                                         const uint8_t *guest_insn_bytes) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_npf_t npf;
     hype_mmio_decode_t decoded;
@@ -1979,7 +1989,15 @@ int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, 
     }
     offset = (uint32_t)(npf.guest_phys_addr - ahci_base_phys);
 
-    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    /* save.rip is a GUEST virtual/physical address. Dereferencing it as a host
+     * pointer is what page-faulted hype when slice 2's routing was first wired up. */
+    guest_bytes = (guest_insn_bytes != 0)
+                      ? guest_insn_bytes
+                      : (const uint8_t *)(uintptr_t)guest_dma_xlate(
+                            dma_map, real->vmcb->save.rip, HYPE_MMIO_MAX_INSTR_BYTES);
+    if (guest_bytes == 0) {
+        return -1;
+    }
     if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
         return -1;
     }
@@ -1998,10 +2016,7 @@ int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, 
             return -1;
         }
         if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
-            /* 0 = identity: this is the non-map handler, used only by M5-2's
-             * identity-mapped microtest. The FW-1 guest goes through the _map
-             * variant, which passes its real DMA map. */
-            if (process_ahci_ata_command_slot0(ahci, disk, 0) != 0) {
+            if (process_ahci_ata_command_slot0(ahci, disk, dma_map) != 0) {
                 return -1;
             }
         }
@@ -2015,6 +2030,21 @@ int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, 
 
     real->vmcb->save.rip += decoded.instr_len;
     return 0;
+}
+
+int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                       hype_ata_disk_t *disk, uint64_t ahci_base_phys) {
+    /* Identity-mapped callers (M5-2's microtest): no map, fetch the instruction
+     * bytes at the guest RIP. Behaviour is exactly as before this slice. */
+    return hype_svm_ahci_disk_npf_common(ctx, ahci, disk, ahci_base_phys, 0, 0);
+}
+
+int hype_svm_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                           hype_ata_disk_t *disk, uint64_t ahci_base_phys,
+                                           const hype_gpa_map_t *dma_map,
+                                           const uint8_t *guest_insn_bytes) {
+    return hype_svm_ahci_disk_npf_common(ctx, ahci, disk, ahci_base_phys, dma_map,
+                                         guest_insn_bytes);
 }
 
 int hype_svm_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port, uint8_t *out_byte) {

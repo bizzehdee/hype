@@ -115,6 +115,17 @@ int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
  * the virtio-blk BAR -- each decode-at-RIP then dispatch to its device model. */
 int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
                                        hype_ata_disk_t *disk, uint64_t ahci_base_phys);
+
+/*
+ * #262 slice 3: remapped-guest variant. `dma_map` translates every guest-physical
+ * address the command carries and `guest_insn_bytes` supplies already-fetched
+ * instruction bytes, so nothing dereferences a guest RIP as a host pointer. Mirrors
+ * hype_vmx_vcpu_handle_ahci_npf_map for the ATAPI controller, and the SVM twin.
+ */
+int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                           hype_ata_disk_t *disk, uint64_t ahci_base_phys,
+                                           const hype_gpa_map_t *dma_map,
+                                           const uint8_t *guest_insn_bytes);
 int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                        uint64_t mmio_base_phys);
 int hype_vmx_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,

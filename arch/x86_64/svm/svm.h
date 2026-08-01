@@ -816,6 +816,18 @@ int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, 
                                         uint64_t ahci_base_phys);
 
 /*
+ * #262 slice 3: as above, but for a guest whose RAM is remapped. `dma_map` translates
+ * every guest-physical address the command carries -- command list, command table,
+ * each PRD data pointer, the RX FIS -- and `guest_insn_bytes` supplies already-fetched
+ * instruction bytes (pass 0 to read them at the guest RIP through the same map).
+ * Mirrors hype_svm_vcpu_handle_ahci_npf_map's contract for the ATAPI controller.
+ */
+int hype_svm_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                           hype_ata_disk_t *disk, uint64_t ahci_base_phys,
+                                           const hype_gpa_map_t *dma_map,
+                                           const uint8_t *guest_insn_bytes);
+
+/*
  * Handles an NPF (PCI-1) VM-exit against `pci`, this project's own
  * minimal ECAM-based PCI configuration-space model (devices/pci.h),
  * mapped starting at guest-physical address `ecam_base_phys` and

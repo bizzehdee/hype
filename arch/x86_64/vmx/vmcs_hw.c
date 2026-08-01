@@ -1874,6 +1874,45 @@ int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
     return 0;
 }
 
+/*
+ * #262 slice 3: the remapped-guest variant, mirroring
+ * hype_vmx_vcpu_handle_ahci_npf_map for the ATAPI controller. vmx_mmio_begin_insn
+ * takes the already-fetched instruction bytes so nothing dereferences a guest RIP as
+ * a host pointer, and dma_map translates every guest-physical address the command
+ * carries.
+ */
+int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
+                                           hype_ata_disk_t *disk, uint64_t ahci_base_phys,
+                                           const hype_gpa_map_t *dma_map,
+                                           const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+
+    if (vmx_mmio_begin_insn(real, ahci_base_phys, HYPE_AHCI_MMIO_SIZE, guest_insn_bytes, &m) != 0) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        if (hype_ahci_mmio_write(ahci, m.offset, m.decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+        if (m.offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
+            if (process_ahci_ata_command_slot0(ahci, disk, dma_map) != 0) {
+                return -1;
+            }
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_ahci_mmio_read(ahci, m.offset, m.decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        *m.reg =
+            hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
 /* VMX MMIO handler for the Bochs VBE (DISPI) display (VMX-2): mirror of
  * hype_svm_vcpu_handle_bochs_vbe_npf. DISPI registers are 16-bit only. */
 int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
