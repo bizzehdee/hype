@@ -60,6 +60,13 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                 Package () { 0x0002FFFF, 0x02, 0x00, 0x12 },  /* dev 2 INTC -> GSI 18 */
                 Package () { 0x0002FFFF, 0x03, 0x00, 0x13 },  /* dev 2 INTD -> GSI 19 */
                 Package () { 0x0003FFFF, 0x00, 0x00, 0x14 },  /* dev 3 INTA -> GSI 20 (virtio-blk) */
+                /* #262: the SATA-disk AHCI HBA is device 4, INTA -> GSI 21. Without an
+                 * entry here the guest reports "can't derive routing for PCI INT A" /
+                 * "PCI INT A: no GSI" and libata's probe fails with -22: ahci needs an
+                 * interrupt, and its forced-polling fallback WARNs and stalls instead
+                 * (the same M4-6d2 behaviour that made device 2 need its own entry).
+                 * Must stay clear of the dev-2 block (16-19) and dev 3 (20). */
+                Package () { 0x0004FFFF, 0x00, 0x00, 0x15 },  /* dev 4 INTA -> GSI 21 (SATA disk) */
             })
 
             /* Minimal resource template: claim bus 0 so the kernel associates

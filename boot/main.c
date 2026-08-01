@@ -3081,6 +3081,14 @@ static int vmm_handle_ahci_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, h
                ? hype_vmx_vcpu_handle_ahci_npf_map(ctx, ahci, atapi, base, dma_map, insn)
                : hype_svm_vcpu_handle_ahci_npf_map(ctx, ahci, atapi, base, dma_map, insn);
 }
+/* #262 slice 3: same dispatch for the SATA-disk controller. */
+static int vmm_handle_ahci_disk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                        hype_ahci_t *ahci, hype_ata_disk_t *disk, uint64_t base,
+                                        const hype_gpa_map_t *dma_map, const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX
+               ? hype_vmx_vcpu_handle_ahci_disk_npf_map(ctx, ahci, disk, base, dma_map, insn)
+               : hype_svm_vcpu_handle_ahci_disk_npf_map(ctx, ahci, disk, base, dma_map, insn);
+}
 static int vmm_absorb_mmio_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, const uint8_t *insn) {
     return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_absorb_mmio_npf(ctx, insn)
                                      : hype_svm_vcpu_absorb_mmio_npf(ctx, insn);
@@ -6680,10 +6688,28 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
     hype_ahci_reset(&g_fw_1_ata_ahci);
-    /* Explicitly an EMPTY disk: slice 2 only proves the guest firmware enumerates the
-     * HBA. Slice 3 attaches the real backend. Zero sectors means every LBA is out of
-     * bounds, so a guest that probes it gets a clean IDNF rather than stale memory. */
+    /* #262: this HBA carries a real disk, not the optical drive, so it must report
+     * the plain-ATA signature. With the default ATAPI one the guest probes it with
+     * IDENTIFY PACKET DEVICE and times out. */
+    hype_ahci_set_signature(&g_fw_1_ata_ahci, HYPE_AHCI_SIG_ATA);
+    /*
+     * #262 slice 3: the SATA disk carries the SAME backend as virtio-blk -- whatever
+     * this VM's target resolved to (physical disk, raw image file, or the RAM
+     * scratch). Two guest-visible devices over one backend is deliberate and
+     * temporary: it is what lets the guest firmware BOOT the installed system over
+     * AHCI, which it cannot do over virtio-blk (#262), while Linux keeps the faster
+     * virtio path once it is up.
+     *
+     * It is also a hazard worth naming: two devices onto one storage is only safe
+     * while the guest treats them as the same disk, which it does here because they
+     * are. Deciding whether an installed guest should get both, and which one the
+     * installer writes through, is the last item on this ticket.
+     *
+     * Reset first (so `media` is cleared and the model is in a known state), then
+     * attach -- with a backend present the media pointer is never consulted.
+     */
     hype_ata_disk_reset(&g_fw_1_ata_disk, 0, 0);
+    hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
     fw_1_setup_virtio_blk(vm); /* M5-7 (#196): attach this VM's writable virtio-blk disk */
     if (vm->iso_stream_ready) {
         hype_atapi_reset_stream(&g_fw_1_atapi, &vm->iso_stream);
@@ -6794,10 +6820,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
     hype_ahci_reset(&g_fw_1_ata_ahci);
-    /* Explicitly an EMPTY disk: slice 2 only proves the guest firmware enumerates the
-     * HBA. Slice 3 attaches the real backend. Zero sectors means every LBA is out of
-     * bounds, so a guest that probes it gets a clean IDNF rather than stale memory. */
+    /* #262: this HBA carries a real disk, not the optical drive, so it must report
+     * the plain-ATA signature. With the default ATAPI one the guest probes it with
+     * IDENTIFY PACKET DEVICE and times out. */
+    hype_ahci_set_signature(&g_fw_1_ata_ahci, HYPE_AHCI_SIG_ATA);
+    /*
+     * #262 slice 3: the SATA disk carries the SAME backend as virtio-blk -- whatever
+     * this VM's target resolved to (physical disk, raw image file, or the RAM
+     * scratch). Two guest-visible devices over one backend is deliberate and
+     * temporary: it is what lets the guest firmware BOOT the installed system over
+     * AHCI, which it cannot do over virtio-blk (#262), while Linux keeps the faster
+     * virtio path once it is up.
+     *
+     * It is also a hazard worth naming: two devices onto one storage is only safe
+     * while the guest treats them as the same disk, which it does here because they
+     * are. Deciding whether an installed guest should get both, and which one the
+     * installer writes through, is the last item on this ticket.
+     *
+     * Reset first (so `media` is cleared and the model is in a known state), then
+     * attach -- with a backend present the media pointer is never consulted.
+     */
     hype_ata_disk_reset(&g_fw_1_ata_disk, 0, 0);
+    hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
     fw_1_setup_virtio_blk(vm); /* M5-7 (#196): attach this VM's writable virtio-blk disk */
     /* GLADDER-10: prefer the streaming backing (ISO served on demand from its raw
      * disk partition) when one was found + verified post-EBS; otherwise fall back
@@ -7131,7 +7175,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * ABAR window route to the (RAM-remap-aware) AHCI MMIO handler. */
     int ahci_mapped = 0;
     uint64_t ahci_abar = 0;
-    int ata_mapped = 0; /* #262 slice 2: latched once the firmware places the HBA's BAR5 */
+    uint64_t ata_abar = 0; /* #262: the SATA-disk HBA's ABAR, once the firmware places it */
+    int ata_mapped = 0;
     int vblk_mapped = 0;    /* M5-7 (#196): virtio-blk BAR4 latched + routed */
     uint64_t vblk_bar = 0;
     hype_host_input_t hostin; /* TERM-4: host keyboard -> focused guest routing state */
@@ -8744,6 +8789,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (!ata_mapped && hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA)) {
                     uint64_t abar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5);
                     if (abar != 0) {
+                        ata_abar = abar;
                         ata_mapped = 1;
                         hype_debug_print("fw-1: #262 SATA-disk AHCI BAR5 (ABAR) enabled at "
                                           "guest-physical 0x%llx -- the guest firmware has "
@@ -8775,21 +8821,24 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * adds g_fw_1_ram_host_phys to every guest-physical DMA
              * pointer OVMF programmed, since FW-1 remaps guest RAM. */
             /*
-             * #262 slice 2 stops at ENUMERATION on purpose: the HBA is a PCI function
-             * the guest firmware sizes and places, but its MMIO is deliberately NOT
-             * routed to the ATA model yet, so GLADDER-1 absorbs those accesses and the
-             * guest reads zeros (0 ports implemented) and moves on.
-             *
-             * Routing it needs a _map variant of the handler, which is why the ATAPI
-             * path calls vmm_handle_ahci_npf_map with g_fw_1_dma_map. The plain
-             * handler treats guest-physical addresses as host pointers -- true for
-             * M5-2's identity-mapped microtest, false for this guest, which remaps its
-             * RAM. Wiring it up naively page-faulted hype inside hype_mmio_decode on
-             * the very first MMIO access, dereferencing save.rip as a host address.
-             * Translating RIP, the command list, the command table and every PRD data
-             * pointer through the DMA map is slice 3's work, alongside attaching the
-             * backend -- the two belong together, since neither is useful alone.
+             * #262 slice 3: route the SATA-disk HBA's MMIO to the ATA model, through
+             * the _map handler with this VM's DMA map and the instruction bytes the
+             * loop already fetched. Slice 2 deliberately left this unrouted because
+             * the plain handler treats guest-physical addresses as host pointers and
+             * page-faulted hype on the first access; that is what 3a/3b fixed.
              */
+            if (ata_mapped) {
+                hype_vmm_npf_t ata_npf;
+                vmm_get_last_npf(kind, ctx, &ata_npf);
+                if (ata_npf.guest_phys_addr >= ata_abar &&
+                    ata_npf.guest_phys_addr < ata_abar + HYPE_AHCI_MMIO_SIZE) {
+                    if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ata_ahci,
+                                                     &g_fw_1_ata_disk, ata_abar, &g_fw_1_dma_map,
+                                                     insn) == 0) {
+                        continue; /* the handler advances RIP, as M5-2's caller assumes */
+                    }
+                }
+            }
             if (ahci_mapped) {
                 hype_vmm_npf_t ahci_npf;
                 vmm_get_last_npf(kind, ctx, &ahci_npf);

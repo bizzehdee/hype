@@ -164,3 +164,9 @@ void hype_ahci_decode_h2d_fis(const uint8_t raw[20], hype_ahci_h2d_fis_t *out) {
     out->device = raw[7];
     out->count = (uint16_t)(raw[12] | (raw[13] << 8));
 }
+
+void hype_ahci_set_signature(hype_ahci_t *ahci, uint32_t sig) {
+    if (ahci != 0) {
+        ahci->p_sig = sig;
+    }
+}

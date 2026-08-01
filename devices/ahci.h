@@ -115,6 +115,15 @@
  * recognized way an AHCI port announces "an ATAPI device is attached
  * here" (a plain SATA disk instead reports 0x00000101). */
 #define HYPE_AHCI_SIG_ATAPI 0xEB140101u
+/*
+ * #262: plain (non-packet) SATA disk signature -- LBA_HIGH/LBA_MID zero, sector
+ * count and LBA_LOW 1. hype_ahci_reset() defaults every instance to ATAPI because
+ * the model was written for M4-5's optical drive; a second HBA carrying a real disk
+ * must say so, or the guest issues IDENTIFY PACKET DEVICE (0xA1) instead of IDENTIFY
+ * DEVICE (0xEC), which the ATA path does not implement -- observed as
+ * "ata2.00: qc timeout after 5000 msecs (cmd 0xa1)" followed by failed IDENTIFY.
+ */
+#define HYPE_AHCI_SIG_ATA 0x00000101u
 
 typedef struct {
     uint32_t cap;
@@ -156,6 +165,10 @@ typedef struct {
  * after its own init sequence" conventions elsewhere in this project.
  */
 void hype_ahci_reset(hype_ahci_t *ahci);
+
+/* Override the port signature after reset, so one HBA can present a plain SATA disk
+ * while another presents the optical drive (#262). */
+void hype_ahci_set_signature(hype_ahci_t *ahci, uint32_t sig);
 
 /*
  * Reads the 32-bit register at `offset` (must be 4-byte aligned;
