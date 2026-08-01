@@ -1795,8 +1795,9 @@ int hype_svm_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, h
  * 0 -- shared tail shape between the ATAPI and plain-ATA command
  * paths, byte-for-byte the same fields process_ahci_command_slot0()
  * already builds for ATAPI. */
-static void complete_ahci_command_slot0(hype_ahci_t *ahci, uint64_t rx_fis_phys, uint8_t status_reg,
-                                         uint8_t error_reg, const hype_gpa_map_t *dma_map) {
+static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, uint8_t status_reg,
+                                       uint8_t error_reg, const hype_gpa_map_t *dma_map,
+                                       unsigned slot) {
     /* #262 slice 3: rx_fis_phys is GUEST-physical. Identity holds for M5-2's
      * microtest (dma_map == 0) but not for the FW-1 guest, which remaps its RAM. */
     uint8_t *d2h_fis =
@@ -1812,7 +1813,7 @@ static void complete_ahci_command_slot0(hype_ahci_t *ahci, uint64_t rx_fis_phys,
     d2h_fis[2] = status_reg;
     d2h_fis[3] = error_reg;
 
-    ahci->p_ci &= ~0x1u;
+    ahci->p_ci &= ~(1u << slot);
     /* PxIS.DHRS -- the D2H Register FIS interrupt bit a real driver
      * polls for a plain-ATA command's completion (same correction as
      * the ATAPI path; the M4-5/M5-2 cooperating test guests polled PxCI
@@ -1831,9 +1832,10 @@ static void complete_ahci_command_slot0(hype_ahci_t *ahci, uint64_t rx_fis_phys,
  * command FIS at all, or the command byte isn't one this project
  * models) so the caller can fall through to whichever other handler
  * actually owns it. */
-int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
-                                   const hype_gpa_map_t *dma_map) {
-    uint64_t cmd_list_phys = (uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32);
+int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
+                                  const hype_gpa_map_t *dma_map, unsigned slot) {
+    uint64_t cmd_list_phys =
+        ((uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32)) + (uint64_t)slot * 32u;
     uint64_t rx_fis_phys = (uint64_t)ahci->p_fb | ((uint64_t)ahci->p_fbu << 32);
     /* #262 slice 3: every address the guest hands us here is GUEST-physical, so it
      * goes through guest_dma_xlate. A NULL map means the trusted identity-mapped
@@ -1850,6 +1852,7 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
     uint32_t remaining;
     uint32_t prd_idx;
     uint64_t transferred = 0; /* #262: byte offset within this command, for backend LBAs */
+    uint64_t lba_base = 0;    /* decoded per address size -- NOT fis.lba, which is the raw 48-bit field */
     uint8_t status_reg;
     uint8_t error_reg;
     int is_write_direction = 0;
@@ -1874,31 +1877,51 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
         hype_ata_disk_build_identify(disk, identify);
         src = identify;
         remaining = HYPE_ATA_IDENTIFY_SIZE;
-    } else if (fis.command == HYPE_ATA_CMD_READ_DMA_EXT) {
-        uint32_t sector_count = hype_ata_disk_resolve_sector_count(fis.count);
-        if (disk->be != 0 ? ((uint64_t)fis.lba + sector_count <= disk->be->total_sectors)
-                          : hype_ata_disk_range_in_bounds(disk, fis.lba, sector_count)) {
-            src = (disk->be != 0) ? 0 : disk->media + fis.lba * HYPE_ATA_SECTOR_SIZE;
+    } else if (fis.command == HYPE_ATA_CMD_READ_DMA_EXT || fis.command == HYPE_ATA_CMD_READ_DMA ||
+               fis.command == HYPE_ATA_CMD_WRITE_DMA_EXT || fis.command == HYPE_ATA_CMD_WRITE_DMA) {
+        int lba48 = hype_ata_cmd_is_lba48(fis.command);
+        uint32_t sector_count = lba48 ? hype_ata_disk_resolve_sector_count(fis.count)
+                                      : hype_ata_resolve_sector_count28(fis.count);
+        lba_base = lba48 ? fis.lba : hype_ata_lba28_from_fis(fis.lba, fis.device);
+        is_write_direction = (fis.command == HYPE_ATA_CMD_WRITE_DMA_EXT ||
+                              fis.command == HYPE_ATA_CMD_WRITE_DMA)
+                                 ? 1
+                                 : 0;
+        if (disk->be != 0 ? (lba_base + sector_count <= disk->be->total_sectors)
+                          : hype_ata_disk_range_in_bounds(disk, lba_base, sector_count)) {
+            uint8_t *media_at = (disk->be != 0) ? 0 : disk->media + lba_base * HYPE_ATA_SECTOR_SIZE;
+            if (is_write_direction) {
+                dst_media = media_at;
+            } else {
+                src = media_at;
+            }
             remaining = sector_count * HYPE_ATA_SECTOR_SIZE;
         } else {
             status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
             error_reg = 0x10u; /* IDNF -- ID Not Found, the real ATA convention for an out-of-range LBA */
         }
-    } else if (fis.command == HYPE_ATA_CMD_WRITE_DMA_EXT) {
-        uint32_t sector_count = hype_ata_disk_resolve_sector_count(fis.count);
-        is_write_direction = 1;
-        if (disk->be != 0 ? ((uint64_t)fis.lba + sector_count <= disk->be->total_sectors)
-                          : hype_ata_disk_range_in_bounds(disk, fis.lba, sector_count)) {
-            dst_media = (disk->be != 0) ? 0 : disk->media + fis.lba * HYPE_ATA_SECTOR_SIZE;
-            remaining = sector_count * HYPE_ATA_SECTOR_SIZE;
-        } else {
-            status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
-            error_reg = 0x10u;
-        }
-    } else if (fis.command == HYPE_ATA_CMD_FLUSH_CACHE_EXT) {
-        /* Nothing to stream -- an immediate, no-data completion. */
+    } else if (fis.command == HYPE_ATA_CMD_FLUSH_CACHE_EXT ||
+               fis.command == HYPE_ATA_CMD_FLUSH_CACHE ||
+               fis.command == HYPE_ATA_CMD_STANDBY_IMMEDIATE ||
+               fis.command == HYPE_ATA_CMD_SET_FEATURES) {
+        /*
+         * Nothing to stream -- an immediate, no-data completion. SET FEATURES is
+         * not optional: libata issues it to select the UDMA mode that IDENTIFY
+         * advertises, and an unrecognized command here returns -1, which never
+         * completes the slot and shows up in the guest as a qc timeout rather
+         * than as an unsupported command.
+         */
     } else {
-        return -1; /* unrecognized command -- outside this project's own modeled ATA subset */
+        /*
+         * An unmodelled command byte must still COMPLETE, with ABRT, the way real
+         * hardware retires a command it does not support. Returning -1 here leaves
+         * the slot's PxCI bit set and the MMIO write unhandled, so the guest retries
+         * the same instruction forever and the whole vCPU wedges -- not just its
+         * disk I/O. (Returning -1 stays correct for the ATAPI-header case above:
+         * that genuinely belongs to another handler, which will clear the slot.)
+         */
+        status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
+        error_reg = 0x04u; /* ABRT */
     }
 
     prdt_bytes = cmd_table_bytes + 0x80;
@@ -1926,7 +1949,7 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
             }
             if (is_write_direction) {
                 if (hype_blk_backend_write(
-                        disk->be, fis.lba + lba_off, nsec,
+                        disk->be, lba_base + lba_off, nsec,
                         (const void *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk)) !=
                     0) {
                     status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
@@ -1935,7 +1958,7 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
                 }
             } else {
                 if (hype_blk_backend_read(
-                        disk->be, fis.lba + lba_off, nsec,
+                        disk->be, lba_base + lba_off, nsec,
                         (void *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk)) != 0) {
                     status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
                     error_reg = 0x10u;
@@ -1958,7 +1981,7 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
         prd_idx++;
     }
 
-    complete_ahci_command_slot0(ahci, rx_fis_phys, status_reg, error_reg, dma_map);
+    complete_ahci_command_slot(ahci, rx_fis_phys, status_reg, error_reg, dma_map, slot);
     return 0;
 }
 
@@ -2015,9 +2038,20 @@ static int hype_svm_ahci_disk_npf_common(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci
         if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
             return -1;
         }
-        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
-            if (process_ahci_ata_command_slot0(ahci, disk, dma_map) != 0) {
-                return -1;
+        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && ahci->p_ci != 0) {
+            /* #262 slice 3: same lesson the ATAPI path already learned in M4-6d2 --
+             * libata issues by tag, so a command is NOT always in slot 0. Only its
+             * internal commands (IDENTIFY, SET FEATURES) get tag 0; the first
+             * block-layer read lands in another slot. Handling slot 0 alone left
+             * that read sitting in PxCI forever: the guest enumerated sda, then
+             * silently never read it -- no error, no timeout, just no partitions. */
+            unsigned slot;
+            for (slot = 0; slot < 32u; slot++) {
+                if ((ahci->p_ci & (1u << slot)) != 0) {
+                    if (process_ahci_ata_command_slot(ahci, disk, dma_map, slot) != 0) {
+                        return -1;
+                    }
+                }
             }
         }
     } else {

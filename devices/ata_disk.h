@@ -34,6 +34,11 @@
 #define HYPE_ATA_CMD_READ_DMA_EXT 0x25u
 #define HYPE_ATA_CMD_WRITE_DMA_EXT 0x35u
 #define HYPE_ATA_CMD_FLUSH_CACHE_EXT 0xEAu
+#define HYPE_ATA_CMD_READ_DMA 0xC8u
+#define HYPE_ATA_CMD_WRITE_DMA 0xCAu
+#define HYPE_ATA_CMD_FLUSH_CACHE 0xE7u
+#define HYPE_ATA_CMD_STANDBY_IMMEDIATE 0xE0u
+#define HYPE_ATA_CMD_SET_FEATURES 0xEFu
 
 #define HYPE_ATA_SECTOR_SIZE 512u
 #define HYPE_ATA_IDENTIFY_SIZE 512u
@@ -110,6 +115,21 @@ void hype_ata_disk_build_identify(const hype_ata_disk_t *disk, uint8_t out[HYPE_
  * convention for 48-bit EXT commands (0 -> 65536, not 0 sectors).
  */
 uint32_t hype_ata_disk_resolve_sector_count(uint16_t raw_count);
+
+/*
+ * The 28-bit counterparts. libata does NOT use the EXT commands for everything:
+ * ata_build_rw_tf() prefers 28-bit READ/WRITE DMA whenever the request fits, so a
+ * model that only handles 0x25/0x35 sees the probe succeed and then every real
+ * block read arrive as an unmodelled 0xC8.
+ *
+ * A 28-bit command splits its LBA differently -- bits 0-23 in the three LBA bytes,
+ * bits 24-27 in the low nibble of the device register (the high LBA bytes are not
+ * used) -- and its count is 8-bit with 0 meaning 256, not the 48-bit rule of 65536.
+ * Decoding one as the other silently reads the wrong sector.
+ */
+uint64_t hype_ata_lba28_from_fis(uint64_t fis_lba, uint8_t device);
+uint32_t hype_ata_resolve_sector_count28(uint16_t raw_count);
+int hype_ata_cmd_is_lba48(uint8_t command);
 
 /*
  * True if [lba, lba+sector_count) lies entirely within the disk's own

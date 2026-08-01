@@ -231,8 +231,8 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
  * as the ATAPI path's own convention. The FW-1 guest remaps its RAM, so passing 0
  * there dereferences guest addresses as host pointers and faults hype.
  */
-int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
-                                   const hype_gpa_map_t *dma_map);
+int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
+                                  const hype_gpa_map_t *dma_map, unsigned slot);
 
 /* Command Header (32 bytes, Command List entry). */
 typedef struct {

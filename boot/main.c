@@ -1152,6 +1152,9 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
 #define HYPE_FW_1_PCI_DEV_ATA 4u
 #define HYPE_FW_1_VIRTIO_BAR_INDEX 4u
 #define HYPE_FW_1_VIRTIO_GSI 20u
+/* #262: the SATA-disk AHCI HBA (PCI dev 4) INTA -> GSI 21. Must match the _PRT entry
+ * in devices/dsdt.asl; clear of the dev-2 block (16-19) and virtio-blk (20). */
+#define HYPE_FW_1_ATA_GSI 21u
 #define HYPE_FW_1_VDISK_BYTES (64ULL * 1024ULL * 1024ULL) /* 64 MiB scratch virtual disk */
 /* virtio-pci capability-list offsets within the device's config space (reusing
  * the same generic CFG_TYPE / PCI-status constants M5-1 established). */
@@ -6709,8 +6712,15 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
      * attach -- with a backend present the media pointer is never consulted.
      */
     hype_ata_disk_reset(&g_fw_1_ata_disk, 0, 0);
-    hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
     fw_1_setup_virtio_blk(vm); /* M5-7 (#196): attach this VM's writable virtio-blk disk */
+    /* AFTER fw_1_setup_virtio_blk: that is what chooses this VM's backend (physical
+     * target, raw image file, or RAM scratch) and fills in its capacity. Attaching
+     * before it snapshots total_sectors == 0, and a zero-sector LBA disk makes libata
+     * fall back to CHS and fail the probe with INIT_DEV_PARAMS. */
+    hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
+    hype_debug_print("fw-1: #262 SATA disk attached -- %llu sectors (%llu MiB)\n",
+                     (unsigned long long)g_fw_1_ata_disk.total_sectors,
+                     (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
     if (vm->iso_stream_ready) {
         hype_atapi_reset_stream(&g_fw_1_atapi, &vm->iso_stream);
     } else {
@@ -6841,8 +6851,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * attach -- with a backend present the media pointer is never consulted.
      */
     hype_ata_disk_reset(&g_fw_1_ata_disk, 0, 0);
-    hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
     fw_1_setup_virtio_blk(vm); /* M5-7 (#196): attach this VM's writable virtio-blk disk */
+    /* AFTER fw_1_setup_virtio_blk: that is what chooses this VM's backend (physical
+     * target, raw image file, or RAM scratch) and fills in its capacity. Attaching
+     * before it snapshots total_sectors == 0, and a zero-sector LBA disk makes libata
+     * fall back to CHS and fail the probe with INIT_DEV_PARAMS. */
+    hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
+    hype_debug_print("fw-1: #262 SATA disk attached -- %llu sectors (%llu MiB)\n",
+                     (unsigned long long)g_fw_1_ata_disk.total_sectors,
+                     (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
     /* GLADDER-10: prefer the streaming backing (ISO served on demand from its raw
      * disk partition) when one was found + verified post-EBS; otherwise fall back
      * to the RAM-chunked copy (GLADDER-10a). */
@@ -8269,6 +8286,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * Without this the level line stuck after the first completion and
              * vda I/O hung. The raise below re-fires while isr_status != 0. */
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
+            /* #262: and the SATA-disk line, for the same reason -- without an EOI
+             * deassert its Remote-IRR sticks after the first completion and every
+             * later command waits out libata's 30s timeout. */
+            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI);
         }
         if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
@@ -8321,6 +8342,32 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
         } else if (vblk_mapped) {
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
+        }
+        /*
+         * #262: completion IRQ for the SATA-disk HBA on its own GSI 21. The model
+         * sets PxIS.DHRS when it completes a command, but nothing was raising the
+         * guest's interrupt for this function -- so libata issued IDENTIFY DEVICE,
+         * the model completed it, and the guest sat waiting through a 5s/10s/30s
+         * timeout ladder for an interrupt that never came. Same level-triggered shape
+         * as the optical HBA above: raise while PxIS is set, deassert once the guest
+         * has cleared it (and on LAPIC EOI, above).
+         */
+        if (ata_mapped && hype_ahci_irq_pending(&g_fw_1_ata_ahci)) {
+            uint8_t iov;
+            uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA);
+            if (line != 0u && line < 16u) {
+                int in_service = (line < 8u)
+                    ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
+                    : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
+                if (!in_service) {
+                    hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
+                }
+            }
+            if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI, &iov)) {
+                vmm_request_interrupt(kind, ctx, iov);
+            }
+        } else if (ata_mapped) {
+            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI);
         }
         /* M4-6d3: raise the serial TX/RX interrupt (COM1=IRQ4, COM2=IRQ3)
          * when the guest has enabled it (IER.ETBEI/ERBFI). The kernel's

@@ -1842,7 +1842,7 @@ static void vmx_mmio_end(struct vmx_mmio_access *m) {
 
 /* VMX MMIO handler for a SATA disk behind AHCI (VMX-2): mirror of
  * hype_svm_vcpu_handle_ahci_disk_npf. On a PxCI slot-0 write, runs the shared
- * process_ahci_ata_command_slot0() (SATA command + guest-RAM DMA). */
+ * process_ahci_ata_command_slot() (SATA command + guest-RAM DMA). */
 int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
                                        hype_ata_disk_t *disk, uint64_t ahci_base_phys) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
@@ -1855,12 +1855,17 @@ int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
         if (hype_ahci_mmio_write(ahci, m.offset, m.decoded.size_bytes, value) != 0) {
             return -1;
         }
-        if (m.offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
+        if (m.offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && ahci->p_ci != 0) {
             /* 0 = identity: this is the non-map handler, used only by M5-2's
              * identity-mapped microtest. The FW-1 guest goes through the _map
              * variant, which passes its real DMA map. */
-            if (process_ahci_ata_command_slot0(ahci, disk, 0) != 0) {
-                return -1;
+            unsigned slot;
+            for (slot = 0; slot < 32u; slot++) {
+                if ((ahci->p_ci & (1u << slot)) != 0) {
+                    if (process_ahci_ata_command_slot(ahci, disk, 0, slot) != 0) {
+                        return -1;
+                    }
+                }
             }
         }
     } else {
@@ -1896,9 +1901,14 @@ int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ah
         if (hype_ahci_mmio_write(ahci, m.offset, m.decoded.size_bytes, value) != 0) {
             return -1;
         }
-        if (m.offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
-            if (process_ahci_ata_command_slot0(ahci, disk, dma_map) != 0) {
-                return -1;
+        if (m.offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && ahci->p_ci != 0) {
+            unsigned slot;
+            for (slot = 0; slot < 32u; slot++) {
+                if ((ahci->p_ci & (1u << slot)) != 0) {
+                    if (process_ahci_ata_command_slot(ahci, disk, dma_map, slot) != 0) {
+                        return -1;
+                    }
+                }
             }
         }
     } else {

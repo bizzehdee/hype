@@ -191,12 +191,115 @@ static void test_set_backend(void) {
         printf("FAIL: reset must clear the backend so a RAM-media disk stays RAM-backed\n");
         failures++;
     }
+    be.total_sectors = 4096u;
     hype_ata_disk_set_backend(&d, &be);
     if (d.be != &be) {
         printf("FAIL: set_backend should attach the backend\n");
         failures++;
     }
+    /* Capacity must follow the backend. A zero-sector LBA disk makes libata fall
+     * back to CHS and issue INIT_DEV_PARAMS, which this model does not implement. */
+    if (d.total_sectors != 4096u) {
+        printf("FAIL: capacity should come from the backend, got %llu\n",
+               (unsigned long long)d.total_sectors);
+        failures++;
+    }
+    if (d.media_bytes != 4096ull * 512ull) {
+        printf("FAIL: media_bytes should match the backend capacity\n");
+        failures++;
+    }
     hype_ata_disk_set_backend(0, &be); /* must not crash */
+}
+
+static void test_lba28_decode(void) {
+    /* Bits 24-27 live in the device register's low nibble, not in the high LBA
+     * bytes -- the whole reason a 28-bit command cannot reuse the 48-bit path. */
+    if (hype_ata_lba28_from_fis(0x000000ull, 0xE0u) != 0ull) {
+        printf("FAIL: lba28 of an all-zero address should be 0\n");
+        failures++;
+    }
+    if (hype_ata_lba28_from_fis(0xABCDEFull, 0xE7u) != 0x7ABCDEFull) {
+        printf("FAIL: lba28 must fold device[3:0] in as bits 24-27, got %llu\n",
+               (unsigned long long)hype_ata_lba28_from_fis(0xABCDEFull, 0xE7u));
+        failures++;
+    }
+    /* The high 24 bits of the raw FIS field belong to LBA48 only and must be
+     * ignored here, or a 28-bit read lands at a wildly wrong sector. */
+    if (hype_ata_lba28_from_fis(0xFFFFFFFFFFFFull, 0xE0u) != 0xFFFFFFull) {
+        printf("FAIL: lba28 must ignore the LBA48-only high bytes\n");
+        failures++;
+    }
+}
+
+static void test_resolve_sector_count28(void) {
+    if (hype_ata_resolve_sector_count28(1u) != 1u) {
+        printf("FAIL: 28-bit count 1 should be 1 sector\n");
+        failures++;
+    }
+    if (hype_ata_resolve_sector_count28(255u) != 255u) {
+        printf("FAIL: 28-bit count 255 should be 255 sectors\n");
+        failures++;
+    }
+    /* 0 means 256 for a 28-bit command, NOT the 65536 of the 48-bit rule. */
+    if (hype_ata_resolve_sector_count28(0u) != 256u) {
+        printf("FAIL: 28-bit count 0 should mean 256 sectors\n");
+        failures++;
+    }
+    /* Only the low byte is a count in a 28-bit command. */
+    if (hype_ata_resolve_sector_count28(0x1234u) != 0x34u) {
+        printf("FAIL: 28-bit count must use only the low byte\n");
+        failures++;
+    }
+    if (hype_ata_resolve_sector_count28(0xFF00u) != 256u) {
+        printf("FAIL: 28-bit count with a zero low byte should mean 256\n");
+        failures++;
+    }
+}
+
+static void test_cmd_is_lba48(void) {
+    if (!hype_ata_cmd_is_lba48(HYPE_ATA_CMD_READ_DMA_EXT) ||
+        !hype_ata_cmd_is_lba48(HYPE_ATA_CMD_WRITE_DMA_EXT) ||
+        !hype_ata_cmd_is_lba48(HYPE_ATA_CMD_FLUSH_CACHE_EXT)) {
+        printf("FAIL: the EXT commands are 48-bit\n");
+        failures++;
+    }
+    if (hype_ata_cmd_is_lba48(HYPE_ATA_CMD_READ_DMA) ||
+        hype_ata_cmd_is_lba48(HYPE_ATA_CMD_WRITE_DMA) ||
+        hype_ata_cmd_is_lba48(HYPE_ATA_CMD_FLUSH_CACHE) ||
+        hype_ata_cmd_is_lba48(HYPE_ATA_CMD_IDENTIFY_DEVICE)) {
+        printf("FAIL: the non-EXT commands are 28-bit\n");
+        failures++;
+    }
+}
+
+static void test_identify_declares_version_and_dma(void) {
+    hype_ata_disk_t d;
+    uint8_t id[HYPE_ATA_IDENTIFY_SIZE];
+    hype_ata_disk_reset(&d, 0, 0);
+    d.total_sectors = 8388608ull;
+    hype_ata_disk_build_identify(&d, id);
+
+    /* Word 80 must name a major version >= 4, or libata takes the pre-ATA-4 path
+     * and fails the probe with INIT_DEV_PARAMS before issuing anything. */
+    if ((uint16_t)(id[160] | (id[161] << 8)) != 0x01F0u) {
+        printf("FAIL: word 80 must declare ATA-4..ATA8-ACS\n");
+        failures++;
+    }
+    /* Word 49 bit 9 = LBA, bit 8 = DMA. Both matter: no DMA means libata picks
+     * PIO, which the AHCI disk glue does not implement. */
+    if (((uint16_t)(id[98] | (id[99] << 8)) & 0x0300u) != 0x0300u) {
+        printf("FAIL: word 49 must advertise both LBA and DMA\n");
+        failures++;
+    }
+    if ((uint16_t)(id[176] | (id[177] << 8)) != 0x203Fu) {
+        printf("FAIL: word 88 must advertise UDMA modes\n");
+        failures++;
+    }
+    /* A valid CHS tuple keeps even the legacy path harmless rather than fatal. */
+    if (id[6] != 16u || id[12] != 63u) {
+        printf("FAIL: words 3/6 must carry a valid heads/sectors geometry\n");
+        failures++;
+    }
 }
 
 int main(void) {
@@ -209,6 +312,10 @@ int main(void) {
     test_identify_capacity_fields_small_disk();
     test_identify_capacity_capped_for_huge_disk();
     test_identify_strings_are_byte_swapped_per_word();
+    test_lba28_decode();
+    test_resolve_sector_count28();
+    test_cmd_is_lba48();
+    test_identify_declares_version_and_dma();
 
     if (failures == 0) {
         printf("all tests passed\n");

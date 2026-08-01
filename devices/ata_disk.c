@@ -47,8 +47,33 @@ void hype_ata_disk_build_identify(const hype_ata_disk_t *disk, uint8_t out[HYPE_
     write_swapped_ascii(out + 46, "1.0", 8u);                   /* words 23-26: firmware revision */
     write_swapped_ascii(out + 54, "HYPE VIRTUAL DISK", 40u);    /* words 27-46: model number */
 
-    out[98] = 0x00u; /* word 49: capabilities -- bit 9 = LBA supported */
-    out[99] = 0x02u;
+    /*
+     * #262: libata refuses a disk whose IDENTIFY looks pre-ATA-4. ata_dev_read_id()
+     * takes the legacy path when `ata_id_major_version(id) < 4 || !ata_id_has_lba(id)`,
+     * and that path calls ata_dev_init_params(dev, id[3], id[6]) -- which returns
+     * AC_ERR_INVALID outright when heads/sectors are zero, without issuing anything.
+     * A zero word 80 alone is enough to trigger it: the probe fails with
+     * "failed to IDENTIFY (INIT_DEV_PARAMS failed, err_mask=0x80)" even though the
+     * IDENTIFY itself succeeded and reported the right capacity. So declare a version
+     * and a CHS geometry, and advertise DMA for the same reason the ATAPI model does
+     * (hype_atapi_build_identify): without it libata configures PIO, which the AHCI
+     * disk glue does not implement.
+     *   w1/w3/w6 = 16383/16/63: the conventional CHS tuple every large drive reports,
+     *              so even the legacy path would be valid rather than fatal.
+     *   w49  = 0x0F00: DMA(8)+LBA(9)+IORDYdis(10)+IORDY(11).
+     *   w53  = 0x0006: words 64-70 valid(1) + word 88 valid(2).
+     *   w63  = 0x0007: MultiWord DMA modes 0-2 supported.
+     *   w80  = 0x01F0: ATA-4..ATA8-ACS, so ata_id_major_version() reports 8.
+     *   w88  = 0x203F: UDMA modes 0-5 supported, mode 5 selected.
+     */
+    out[2] = 0xFFu;   out[3] = 0x3Fu;   /* word 1  = 16383 cylinders */
+    out[6] = 0x10u;   out[7] = 0x00u;   /* word 3  = 16 heads */
+    out[12] = 0x3Fu;  out[13] = 0x00u;  /* word 6  = 63 sectors/track */
+    out[98] = 0x00u;  out[99] = 0x0Fu;  /* word 49 = 0x0F00 */
+    out[106] = 0x06u; out[107] = 0x00u; /* word 53 = 0x0006 */
+    out[126] = 0x07u; out[127] = 0x00u; /* word 63 = 0x0007 */
+    out[160] = 0xF0u; out[161] = 0x01u; /* word 80 = 0x01F0 */
+    out[176] = 0x3Fu; out[177] = 0x20u; /* word 88 = 0x203F */
 
     lba28_capacity =
         (disk->total_sectors > 0x0FFFFFFFull) ? 0x0FFFFFFFu : (uint32_t)disk->total_sectors;
@@ -75,13 +100,42 @@ uint32_t hype_ata_disk_resolve_sector_count(uint16_t raw_count) {
     return (raw_count == 0u) ? 65536u : (uint32_t)raw_count;
 }
 
+uint64_t hype_ata_lba28_from_fis(uint64_t fis_lba, uint8_t device) {
+    return (fis_lba & 0xFFFFFFull) | ((uint64_t)(device & 0x0Fu) << 24);
+}
+
+uint32_t hype_ata_resolve_sector_count28(uint16_t raw_count) {
+    uint32_t n = (uint32_t)(raw_count & 0xFFu);
+    return (n == 0u) ? 256u : n;
+}
+
+int hype_ata_cmd_is_lba48(uint8_t command) {
+    return (command == HYPE_ATA_CMD_READ_DMA_EXT || command == HYPE_ATA_CMD_WRITE_DMA_EXT ||
+            command == HYPE_ATA_CMD_FLUSH_CACHE_EXT)
+               ? 1
+               : 0;
+}
+
 int hype_ata_disk_range_in_bounds(const hype_ata_disk_t *disk, uint64_t lba, uint32_t sector_count) {
     return (lba + (uint64_t)sector_count) <= disk->total_sectors;
 }
 
 void hype_ata_disk_set_backend(hype_ata_disk_t *disk, hype_blk_backend_t *be) {
-    if (disk != 0) {
-        disk->be = be;
+    if (disk == 0) {
+        return;
+    }
+    disk->be = be;
+    /*
+     * Capacity must come from the backend, or IDENTIFY reports a zero-sector disk.
+     * That is not a harmless cosmetic: libata sees an LBA-capable drive of size 0,
+     * decides it must be a legacy CHS device, and issues INITIALIZE DEVICE PARAMETERS
+     * (0x91) -- which this model does not implement -- so the probe fails with
+     * "failed to IDENTIFY (INIT_DEV_PARAMS failed)". Observed exactly that when the
+     * backend was attached after a reset(disk, 0, 0) and the size was left behind.
+     */
+    if (be != 0) {
+        disk->total_sectors = be->total_sectors;
+        disk->media_bytes = be->total_sectors * (uint64_t)HYPE_ATA_SECTOR_SIZE;
     }
 }
 
