@@ -1796,8 +1796,11 @@ int hype_svm_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, h
  * paths, byte-for-byte the same fields process_ahci_command_slot0()
  * already builds for ATAPI. */
 static void complete_ahci_command_slot0(hype_ahci_t *ahci, uint64_t rx_fis_phys, uint8_t status_reg,
-                                         uint8_t error_reg) {
-    uint8_t *d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_phys + 0x40);
+                                         uint8_t error_reg, const hype_gpa_map_t *dma_map) {
+    /* #262 slice 3: rx_fis_phys is GUEST-physical. Identity holds for M5-2's
+     * microtest (dma_map == 0) but not for the FW-1 guest, which remaps its RAM. */
+    uint8_t *d2h_fis =
+        (uint8_t *)(uintptr_t)(guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u) + 0x40);
     unsigned i;
 
     ahci->p_tfd = (uint32_t)status_reg | ((uint32_t)error_reg << 8);
@@ -1828,10 +1831,15 @@ static void complete_ahci_command_slot0(hype_ahci_t *ahci, uint64_t rx_fis_phys,
  * command FIS at all, or the command byte isn't one this project
  * models) so the caller can fall through to whichever other handler
  * actually owns it. */
-int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
+int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
+                                   const hype_gpa_map_t *dma_map) {
     uint64_t cmd_list_phys = (uint64_t)ahci->p_clb | ((uint64_t)ahci->p_clbu << 32);
     uint64_t rx_fis_phys = (uint64_t)ahci->p_fb | ((uint64_t)ahci->p_fbu << 32);
-    const uint8_t *cmd_hdr_bytes = (const uint8_t *)(uintptr_t)cmd_list_phys;
+    /* #262 slice 3: every address the guest hands us here is GUEST-physical, so it
+     * goes through guest_dma_xlate. A NULL map means the trusted identity-mapped
+     * microtest, matching the ATAPI path's convention exactly. */
+    const uint8_t *cmd_hdr_bytes =
+        (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, cmd_list_phys, 32u);
     hype_ahci_cmd_header_t hdr;
     const uint8_t *cmd_table_bytes;
     const uint8_t *prdt_bytes;
@@ -1851,7 +1859,8 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
         return -1; /* not this handler's command -- the ATAPI path owns it */
     }
 
-    cmd_table_bytes = (const uint8_t *)(uintptr_t)hdr.cmd_table_phys;
+    cmd_table_bytes = (const uint8_t *)(uintptr_t)guest_dma_xlate(
+        dma_map, hdr.cmd_table_phys, (uint64_t)0x80u + (uint64_t)hdr.prdtl * 16u);
     if (cmd_table_bytes[0] != 0x27u || (cmd_table_bytes[1] & 0x80u) == 0u) {
         return -1; /* not a valid H2D Register FIS carrying a command */
     }
@@ -1916,26 +1925,31 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
                 break;
             }
             if (is_write_direction) {
-                if (hype_blk_backend_write(disk->be, fis.lba + lba_off, nsec,
-                                           (const void *)(uintptr_t)prd.data_phys) != 0) {
+                if (hype_blk_backend_write(
+                        disk->be, fis.lba + lba_off, nsec,
+                        (const void *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk)) !=
+                    0) {
                     status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
                     error_reg = 0x10u;
                     break;
                 }
             } else {
-                if (hype_blk_backend_read(disk->be, fis.lba + lba_off, nsec,
-                                          (void *)(uintptr_t)prd.data_phys) != 0) {
+                if (hype_blk_backend_read(
+                        disk->be, fis.lba + lba_off, nsec,
+                        (void *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk)) != 0) {
                     status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
                     error_reg = 0x10u;
                     break;
                 }
             }
         } else if (is_write_direction) {
-            const uint8_t *guest_src = (const uint8_t *)(uintptr_t)prd.data_phys;
+            const uint8_t *guest_src =
+                (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk);
             ahci_copy_fast(dst_media, guest_src, chunk);
             dst_media += chunk;
         } else {
-            uint8_t *guest_dst = (uint8_t *)(uintptr_t)prd.data_phys;
+            uint8_t *guest_dst =
+                (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk);
             ahci_copy_fast(guest_dst, src, chunk);
             src += chunk;
         }
@@ -1944,7 +1958,7 @@ int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk) {
         prd_idx++;
     }
 
-    complete_ahci_command_slot0(ahci, rx_fis_phys, status_reg, error_reg);
+    complete_ahci_command_slot0(ahci, rx_fis_phys, status_reg, error_reg, dma_map);
     return 0;
 }
 
@@ -1984,7 +1998,10 @@ int hype_svm_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, 
             return -1;
         }
         if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
-            if (process_ahci_ata_command_slot0(ahci, disk) != 0) {
+            /* 0 = identity: this is the non-map handler, used only by M5-2's
+             * identity-mapped microtest. The FW-1 guest goes through the _map
+             * variant, which passes its real DMA map. */
+            if (process_ahci_ata_command_slot0(ahci, disk, 0) != 0) {
                 return -1;
             }
         }

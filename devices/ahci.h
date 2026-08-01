@@ -211,7 +211,15 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
  * disk counterpart of process_ahci_command_slot(). Vendor-neutral; the SVM and
  * VMX ahci_disk MMIO handlers both call it on a PxCI slot-0 write. Defined in
  * arch/x86_64/svm/svm_vcpu.c. Returns 0 on success, -1 on error. */
-int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk);
+/*
+ * #262 slice 3: `dma_map` translates the GUEST-physical addresses the command carries
+ * (command list, command table, each PRD's data pointer, the RX FIS) into host
+ * addresses. Pass 0 for a trusted identity-mapped guest -- M5-2's microtest -- exactly
+ * as the ATAPI path's own convention. The FW-1 guest remaps its RAM, so passing 0
+ * there dereferences guest addresses as host pointers and faults hype.
+ */
+int process_ahci_ata_command_slot0(hype_ahci_t *ahci, hype_ata_disk_t *disk,
+                                   const hype_gpa_map_t *dma_map);
 
 /* Command Header (32 bytes, Command List entry). */
 typedef struct {

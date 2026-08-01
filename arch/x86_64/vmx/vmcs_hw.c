@@ -1856,7 +1856,10 @@ int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
             return -1;
         }
         if (m.offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && (ahci->p_ci & 0x1u) != 0) {
-            if (process_ahci_ata_command_slot0(ahci, disk) != 0) {
+            /* 0 = identity: this is the non-map handler, used only by M5-2's
+             * identity-mapped microtest. The FW-1 guest goes through the _map
+             * variant, which passes its real DMA map. */
+            if (process_ahci_ata_command_slot0(ahci, disk, 0) != 0) {
                 return -1;
             }
         }
