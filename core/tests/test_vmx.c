@@ -92,12 +92,51 @@ static void test_adjust_controls(void) {
     CHECK_HEX("optional bit clear when not desired", 0u, hype_vmx_adjust_controls(0x0u, cap) & 4u);
 }
 
+static void test_vpid_for_slot(void) {
+    /* VPID 0000H is reserved for VMX root operation, and VM entry fails if
+     * ENABLE_VPID is set with a zero VPID -- so slot 0 must NOT map to 0. */
+    CHECK_INT("slot 0 -> VPID 1, never 0", 1, hype_vmx_vpid_for_slot(0u, 4u));
+    CHECK_INT("slot 1 -> VPID 2", 2, hype_vmx_vpid_for_slot(1u, 4u));
+    CHECK_INT("last slot -> VPID max_slots", 4, hype_vmx_vpid_for_slot(3u, 4u));
+
+    /* Distinctness is the whole point: two different slots must never collide. */
+    CHECK_INT("slots 0 and 1 differ", 0,
+              hype_vmx_vpid_for_slot(0u, 4u) == hype_vmx_vpid_for_slot(1u, 4u));
+
+    /* An out-of-range slot shares the last VPID, matching vmx_alloc_slot()'s
+     * documented aliasing of an exhausted pool onto the last ctx. */
+    CHECK_INT("slot at the cap aliases onto the last VPID", 4,
+              hype_vmx_vpid_for_slot(4u, 4u));
+    CHECK_INT("slot far past the cap aliases too", 4, hype_vmx_vpid_for_slot(99u, 4u));
+    CHECK_INT("degenerate max_slots=0 still yields a legal non-zero VPID", 1,
+              hype_vmx_vpid_for_slot(0u, 0u));
+}
+
+static void test_vpid_usable(void) {
+    uint64_t invvpid = HYPE_VMX_EPT_VPID_CAP_INVVPID;
+    uint64_t single = HYPE_VMX_EPT_VPID_CAP_INVVPID_SINGLE;
+
+    CHECK_INT("INVVPID + single-context -> usable", 1, hype_vmx_vpid_usable(invvpid | single));
+    /* hype recycles pool slots and therefore VPIDs, so a VPID it cannot flush is
+     * one it must refuse to enable -- both halves are required. */
+    CHECK_INT("INVVPID without single-context -> refuse", 0, hype_vmx_vpid_usable(invvpid));
+    CHECK_INT("single-context claimed without INVVPID -> refuse", 0,
+              hype_vmx_vpid_usable(single));
+    CHECK_INT("no VPID capability at all -> refuse", 0, hype_vmx_vpid_usable(0));
+    /* EPT capability bits live in the low half of the same MSR and must not be
+     * mistaken for VPID support. */
+    CHECK_INT("unrelated low EPT-cap bits do not imply VPID support", 0,
+              hype_vmx_vpid_usable(0xFFFFFFFFULL));
+}
+
 int main(void) {
     test_feature_control_allows_vmxon();
     test_feature_control_with_vmxon_enabled();
     test_cr4_with_vmxe();
     test_cr_with_fixed_bits();
     test_adjust_controls();
+    test_vpid_for_slot();
+    test_vpid_usable();
 
     if (failures == 0) {
         printf("all tests passed\n");

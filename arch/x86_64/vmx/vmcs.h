@@ -51,14 +51,17 @@
  * VMCLEAR/VMPTRLD/VMWRITE, nothing to observe without a real CPU.
  * hype_vmx_adjust_controls() in vmx_bits.c holds the only real logic
  * (capability negotiation) and is fully tested.
+ *
+ * `vpid` (#273) tags the guest's TLB entries; 0 leaves VPID disabled, and so
+ * does any CPU whose IA32_VMX_EPT_VPID_CAP cannot also invalidate it.
  */
 int hype_vmx_vmcs_build_guest(uint64_t cs_base, uint64_t rip, uint64_t stack_phys,
-                              uint64_t eptp, uint8_t *vmcs_region);
+                              uint64_t eptp, uint8_t *vmcs_region, uint16_t vpid);
 
 /* Long-mode variant: flat 64-bit guest at linear entry_rip with paging root
  * guest_cr3 (the caller builds guest paging, as the SVM microtests do). */
 int hype_vmx_vmcs_build_long_mode_guest(uint64_t entry_rip, uint64_t guest_cr3, uint64_t stack_phys,
-                                        uint64_t eptp, uint8_t *vmcs_region);
+                                        uint64_t eptp, uint8_t *vmcs_region, uint16_t vpid);
 
 /* Assembles an EPT pointer (WB, 4-level) from a PML4 physical address. */
 uint64_t hype_vmx_make_eptp(uint64_t pml4_phys);

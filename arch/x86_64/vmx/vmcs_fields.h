@@ -23,6 +23,7 @@
 #define HYPE_MSR_IA32_VMX_CR4_FIXED0 0x488u
 #define HYPE_MSR_IA32_VMX_CR4_FIXED1 0x489u
 #define HYPE_MSR_IA32_VMX_PROCBASED_CTLS2 0x48Bu
+#define HYPE_MSR_IA32_VMX_EPT_VPID_CAP 0x48Cu
 #define HYPE_MSR_IA32_VMX_TRUE_PINBASED_CTLS 0x48Du
 #define HYPE_MSR_IA32_VMX_TRUE_PROCBASED_CTLS 0x48Eu
 #define HYPE_MSR_IA32_VMX_TRUE_EXIT_CTLS 0x48Fu
@@ -108,6 +109,29 @@
  * (leaf 0x80000001 EDX bit 27) ought to be masked instead.
  */
 #define HYPE_VMX_PROCBASED2_ENABLE_RDTSCP (1u << 3)
+/*
+ * "Enable VPID" (secondary control, bit 5) -- #273.
+ *
+ * This is a PERFORMANCE control, not a correctness one, and #273's original
+ * premise ("TLB entries alias across VMs today") was wrong. SDM Vol 3C 28.3.3.1:
+ * with this control CLEAR, every VM entry "invalidates linear mappings and
+ * combined mappings associated with VPID 0000H (for all PCIDs)", and combined
+ * mappings for VPID 0000H are invalidated "for all EP4TA values". So today's
+ * VPID-0 configuration is safe by brute force -- each transition throws the
+ * translations away, which is precisely why nothing has ever aliased. hype also
+ * pins each vCPU to its own AP core, so two guests never share a TLB anyway.
+ *
+ * Setting the control REMOVES that automatic flush, which is the whole point
+ * (hype exits often, and each exit currently costs a full TLB refill) but also
+ * means staleness is no longer masked. Hence the paired requirements below: only
+ * enable it when INVVPID single-context is available, and invalidate a VPID when
+ * a pool slot is handed to a new guest.
+ *
+ * Guest-physical mappings are NOT VPID-tagged -- they are tagged by EP4TA and
+ * governed by INVEPT. Per-VM EPT roots (#272) already keep those apart, which is
+ * also why #274's isolation does not actually depend on this ticket.
+ */
+#define HYPE_VMX_PROCBASED2_ENABLE_VPID (1u << 5)
 /* APIC-register virtualization / virtual-interrupt delivery (M2-4):
  * both operate on the virtual-APIC page directly, not through EPT, so
  * (unlike "virtualize APIC accesses", intentionally not used here)
@@ -247,6 +271,10 @@
 #define HYPE_VMX_AR_UNUSABLE (1u << 16)
 
 /* 16-bit fields (Table B-2/B-3). */
+/* 16-bit control field: the guest's VPID (#273). Must be non-zero whenever
+ * ENABLE_VPID is set, or VM entry fails the control-field checks -- VPID 0000H
+ * is reserved for VMX root operation (the host). */
+#define HYPE_VMCS_VIRTUAL_PROCESSOR_ID 0x0000u
 #define HYPE_VMCS_GUEST_ES_SELECTOR 0x0800u
 #define HYPE_VMCS_GUEST_CS_SELECTOR 0x0802u
 #define HYPE_VMCS_GUEST_SS_SELECTOR 0x0804u

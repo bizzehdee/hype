@@ -467,6 +467,35 @@ static inline int vmptrld(const void *vmcs_phys_addr_ptr) {
     return fail_zf ? -1 : 0;
 }
 
+/*
+ * INVVPID, single-context (#273): drop every linear and combined mapping tagged
+ * with `vpid`. Issued when a pool slot is handed to a new guest -- the slot's
+ * VPID is stable, so without this a fresh guest could inherit its predecessor's
+ * translations. The descriptor is 128 bits: VPID in bits 15:0, bits 127:64 a
+ * linear address the single-context type ignores.
+ */
+static inline int invvpid_single_context(uint16_t vpid) {
+    struct {
+        uint64_t vpid_and_reserved;
+        uint64_t linear_address;
+    } desc;
+    uint8_t fail_zf, fail_cf;
+
+    /* Field-by-field, never whole-struct assignment: this is a freestanding
+     * build with no libc, and an aggregate copy emits a memcpy call that fails
+     * to link (see AGENTS.md). */
+    desc.vpid_and_reserved = (uint64_t)vpid;
+    desc.linear_address = 0;
+
+    __asm__ volatile("invvpid %2, %3\n\t"
+                      "setz %0\n\t"
+                      "setc %1"
+                      : "=q"(fail_zf), "=q"(fail_cf)
+                      : "m"(desc), "r"(HYPE_VMX_INVVPID_SINGLE_CONTEXT)
+                      : "cc", "memory");
+    return (fail_zf || fail_cf) ? -1 : 0;
+}
+
 static int write_realmode_guest_segment(uint32_t selector_field, uint32_t base_field,
                                          uint32_t limit_field, uint32_t ar_field,
                                          uint16_t selector, uint8_t code) {
@@ -491,7 +520,8 @@ static int write_realmode_guest_segment(uint32_t selector_field, uint32_t base_f
  * hype_vmx_vmcs_build_guest / _long_mode_guest pin the mode.
  */
 static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp,
-                              int long_mode, uint64_t guest_cr3, uint8_t *vmcs_region) {
+                              int long_mode, uint64_t guest_cr3, uint8_t *vmcs_region,
+                              uint16_t vpid) {
     int rc = 0;
     /* #271: the region is passed in, not taken from a "current slot" global -- two
      * APs can be building their own vCPUs at the same time, and a shared global
@@ -552,10 +582,19 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
                                                   proc_cap);
     /* Unrestricted guest (lets the guest run with CR0.PE=0 / CR0.PG=0, i.e.
      * real mode) architecturally REQUIRES EPT -- so both bits go together. */
+    /* #273: request VPID only when this CPU can also invalidate it, and only for
+     * a non-zero VPID -- ENABLE_VPID with VPID 0000H fails VM entry outright. */
+    int want_vpid = (vpid != 0u) && hype_vmx_vpid_usable(rdmsr(HYPE_MSR_IA32_VMX_EPT_VPID_CAP));
     uint32_t proc2_ctls = hype_vmx_adjust_controls(
         HYPE_VMX_PROCBASED2_ENABLE_EPT | HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST |
-            HYPE_VMX_PROCBASED2_ENABLE_INVPCID | HYPE_VMX_PROCBASED2_ENABLE_RDTSCP,
+            HYPE_VMX_PROCBASED2_ENABLE_INVPCID | HYPE_VMX_PROCBASED2_ENABLE_RDTSCP |
+            (want_vpid ? HYPE_VMX_PROCBASED2_ENABLE_VPID : 0u),
         proc2_cap);
+    /* Read back what adjust_controls() actually granted rather than what was
+     * asked for: if the capability MSR forbids VPID the bit is gone, and writing
+     * a VPID (or issuing INVVPID) on that basis would be reasoning from a
+     * request instead of from the machine. Same discipline as ack-intr-on-exit. */
+    int vpid_enabled = (proc2_ctls & HYPE_VMX_PROCBASED2_ENABLE_VPID) != 0u;
     /* Host address-space size MUST be set: hype's host is 64-bit (see the
      * constant's comment) -- omitting it is the classic error-7 VM-entry
      * failure. Entry controls stay 0 (real-mode guest, not IA-32e). */
@@ -605,6 +644,30 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     rc |= vmwrite(HYPE_VMCS_VM_EXIT_CONTROLS, exit_ctls);
     rc |= vmwrite(HYPE_VMCS_VM_ENTRY_CONTROLS, entry_ctls);
     rc |= vmwrite(HYPE_VMCS_EXCEPTION_BITMAP, 0);
+
+    /*
+     * #273: tag this guest, then flush the tag. The flush matters because the
+     * VPID comes from a POOL SLOT, so a slot recycled after
+     * hype_vmx_vcpu_pool_reset() hands the new guest its predecessor's VPID; the
+     * automatic every-entry flush that made VPID 0 safe is exactly what enabling
+     * this control gives up.
+     */
+    if (vpid_enabled) {
+        rc |= vmwrite(HYPE_VMCS_VIRTUAL_PROCESSOR_ID, vpid);
+        if (invvpid_single_context(vpid) != 0) {
+            /* The capability MSR said this type exists, so a failure here means
+             * the CPU and its own capability report disagree -- refuse to launch
+             * rather than run a guest on translations that may not be its own. */
+            hype_debug_print("vmx: INVVPID(single, vpid=%u) FAILED despite EPT_VPID_CAP "
+                             "advertising it -- refusing to launch (#273)\n",
+                             (unsigned int)vpid);
+            return -1;
+        }
+    }
+    /* Printed per vCPU on purpose: #274 needs to show two guests carrying two
+     * DIFFERENT VPIDs, and "we asked for one" is not evidence of that. */
+    hype_debug_print("vmx: vpid=%u enabled=%s (proc2=0x%x)\n", (unsigned int)vpid,
+                     vpid_enabled ? "yes" : "no", (unsigned int)proc2_ctls);
 
     /* EPT pointer (M2-8/M3-1): required now that ENABLE_EPT is set. Caller
      * passes the fully-formed EPTP (PML4 phys | memtype WB | walk-length-1 |
@@ -854,13 +917,13 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
 /* Public builders: real-mode guest at cs_base:rip; flat 64-bit guest at linear
  * entry_rip with paging root guest_cr3. Both take a prebuilt EPT pointer. */
 int hype_vmx_vmcs_build_guest(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp,
-                              uint8_t *vmcs_region) {
-    return build_guest_common(cs_base, rip, stack_phys, eptp, 0, 0, vmcs_region);
+                              uint8_t *vmcs_region, uint16_t vpid) {
+    return build_guest_common(cs_base, rip, stack_phys, eptp, 0, 0, vmcs_region, vpid);
 }
 
 int hype_vmx_vmcs_build_long_mode_guest(uint64_t entry_rip, uint64_t guest_cr3, uint64_t stack_phys,
-                                        uint64_t eptp, uint8_t *vmcs_region) {
-    return build_guest_common(0, entry_rip, stack_phys, eptp, 1, guest_cr3, vmcs_region);
+                                        uint64_t eptp, uint8_t *vmcs_region, uint16_t vpid) {
+    return build_guest_common(0, entry_rip, stack_phys, eptp, 1, guest_cr3, vmcs_region, vpid);
 }
 
 /*
@@ -929,7 +992,8 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
 
     /* cs_base = guest_rip, rip = 0: the guest starts executing at physical
      * guest_rip in real mode (CS.base:IP = guest_rip:0). */
-    if (hype_vmx_vmcs_build_guest(guest_rip, 0, guest_rsp, eptp, g_vmcs_pool[slot]) != 0) {
+    if (hype_vmx_vmcs_build_guest(guest_rip, 0, guest_rsp, eptp, g_vmcs_pool[slot],
+                                  hype_vmx_vpid_for_slot(slot, HYPE_VMX_MAX_VCPUS)) != 0) {
         return 0;
     }
 
@@ -966,7 +1030,8 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
     eptp = hype_vmx_make_eptp((uint64_t)(uintptr_t)g_ept_pml4);
 
     if (hype_vmx_vmcs_build_long_mode_guest(entry_rip, guest_cr3, guest_rsp, eptp,
-                                            g_vmcs_pool[slot]) != 0) {
+                                            g_vmcs_pool[slot],
+                                            hype_vmx_vpid_for_slot(slot, HYPE_VMX_MAX_VCPUS)) != 0) {
         return 0;
     }
 

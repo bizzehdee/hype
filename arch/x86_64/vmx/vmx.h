@@ -36,6 +36,16 @@
 
 #define HYPE_CR4_VMXE (1ULL << 13)
 
+/* IA32_VMX_EPT_VPID_CAP bits consulted by hype_vmx_vpid_usable() (#273):
+ * bit 32 = the INVVPID instruction exists at all, bit 41 = it supports the
+ * single-context invalidation type (type 1), which is the one hype issues when
+ * a pool slot changes hands. SDM Vol 3C, Appendix A.10. */
+#define HYPE_VMX_EPT_VPID_CAP_INVVPID (1ULL << 32)
+#define HYPE_VMX_EPT_VPID_CAP_INVVPID_SINGLE (1ULL << 41)
+
+/* INVVPID descriptor types (SDM Vol 3C, "INVVPID"). Only single-context is used. */
+#define HYPE_VMX_INVVPID_SINGLE_CONTEXT 1ULL
+
 /* Whether IA32_FEATURE_CONTROL's current value permits VMXON: either
  * it isn't locked yet (we can configure and lock it ourselves), or it's
  * locked with VMX-outside-SMX already enabled. Locked-and-disabled
@@ -73,6 +83,26 @@ uint64_t hype_vmx_cr_with_fixed_bits(uint64_t cr, uint64_t fixed0, uint64_t fixe
  * is the caller's job (vmcs_hw.c).
  */
 uint32_t hype_vmx_adjust_controls(uint32_t desired, uint64_t capability_msr);
+
+/*
+ * #273. VPID for a vCPU pool slot: slot + 1, because VPID 0000H is reserved for
+ * VMX root operation and VM entry fails outright if ENABLE_VPID is set with a
+ * zero VPID. Slots at or beyond max_slots share the last VPID -- vmx_alloc_slot()
+ * already aliases such a slot onto the last ctx and says so loudly, and inventing
+ * a distinct VPID for a ctx that is itself shared would only misrepresent that.
+ */
+uint16_t hype_vmx_vpid_for_slot(unsigned slot, unsigned max_slots);
+
+/*
+ * #273. Whether IA32_VMX_EPT_VPID_CAP permits hype to turn VPID on.
+ *
+ * Requires BOTH the INVVPID instruction (bit 32) and the single-context
+ * invalidation type (bit 41). ENABLE_VPID may architecturally be set without
+ * INVVPID, but hype reuses pool slots -- and therefore VPIDs -- across guests,
+ * so a VPID it cannot flush is a VPID it must not enable. Returning 0 keeps the
+ * pre-#273 behaviour, which is safe: VPID 0 flushes on every transition.
+ */
+int hype_vmx_vpid_usable(uint64_t ept_vpid_cap);
 
 /*
  * Enables VMX on the calling physical CPU: unlocks/enables
