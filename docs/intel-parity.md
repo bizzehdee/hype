@@ -128,9 +128,21 @@ last five fixes came from reading guest oopses, not from reasoning about VMX.
 - [x] **A3. Alpine login prompt on Intel — REACHED `ab93854`.** "localhost login:" on
   ttyS0, single VM, after a full OpenRC boot. Matches the AMD bar (M4-6d3).
 
-- [ ] **A4. The 14 remaining raw `hype_svm_*` calls** in the FW-1 region (#249). One was
-  already a real bug (`9b760b6`: the guest page walk). The rest are mostly SVM-only
-  diagnostics that want gating, not porting.
+- [x] **A4. The raw `hype_svm_*` calls (#249) — DONE.** Audited every call site in
+  boot/main.c by enclosing function. Six real ones remain outside the `vmm_*`
+  dispatchers, and all six are now gated so none can execute on Intel:
+    set_msr_trace / set_vmrun_trace      -- gated, and behind HYPE_FW1_DEBUG
+    get_debug_state / get_mtrr_diag      -- gated (EXITINFO2/NRIP/G_PAT have no VMCS
+                                            counterpart; nothing to port them to)
+    enable_pause_filter                  -- inside a function that early-returns on
+                                            non-SVM and prints SKIP
+    vcpu_pool_reset                      -- gated here; VMX has no pool (#245)
+  The `hype_svm_debug_state_t` locals the ticket flagged are the SVM snapshot's own
+  type, deliberately, and every site calls the shim AND CHECKS ITS RETURN, printing an
+  honest "n/a on this backend" rather than fabricated zeros. Documented at the shim.
+
+  Audit gotcha: match `hype_svm_[a-z_]*\s*\(` and skip comment lines, or references
+  inside explanatory comments inflate the count 4x (24 vs 6).
 
 ## B. #245 — VMX singletons (blocks two concurrent Intel guests)
 

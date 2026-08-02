@@ -3012,6 +3012,12 @@ static void vmm_set_pvclock(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, const hy
  * counters are file-scope tallies inside svm_vcpu.c. Porting an SVM debugging
  * apparatus is not what Intel parity requires; running a guest is.
  */
+/*
+ * #249: the SVM-named struct in a vendor-neutral shim is deliberate, not an
+ * oversight. It IS the SVM snapshot -- EXITINFO2 / EXITINTINFO / NRIP / G_PAT have
+ * no VMCS counterpart -- so there is no neutral type to promote it to. The shim
+ * exists to answer "is that snapshot available?", and returns 0 on VMX.
+ */
 static int vmm_get_debug_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                hype_svm_debug_state_t *out) {
     if (kind == HYPE_VMM_KIND_VMX) {
@@ -10157,7 +10163,17 @@ static void EFIAPI run_all_test_guests(void *arg) {
      * battery is strictly sequential and strictly earlier than the concurrent
      * guests, so releasing here restores the invariant the pool documents.
      */
-    hype_svm_vcpu_pool_reset();
+    /*
+     * #249: SVM-only, and the last raw hype_svm_* call left in this path that could
+     * run on Intel. It releases VMCB pool slots; VMX has no pool to release (#245:
+     * one static VMCS), so on Intel the call is inert but semantically wrong -- it
+     * asserts ownership of a structure that backend does not have. Gated rather
+     * than shimmed, for the same reason as the EXITINFO2/NRIP snapshots: there is
+     * nothing on the other side to port it to.
+     */
+    if (args->kind == HYPE_VMM_KIND_SVM) {
+        hype_svm_vcpu_pool_reset();
+    }
     /* RT-2b: run_fw_1_test is deliberately NOT run here. The quick regression
      * guests above all run under `cli` (no host timer, no INTR intercept) --
      * they halt in milliseconds and need no timekeeping. efi_main brings up
