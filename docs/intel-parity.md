@@ -91,13 +91,25 @@ last five fixes came from reading guest oopses, not from reasoning about VMX.
 3. Read the log for the next kernel oops / hype panic and fix that. Repeat.
 4. `mv` the original `test.iso` back when done.
 
-- [~] **A1. The xstate.c:332 WARNING.** Full text captured 2026-08-02 (see #252). Two
-  disagreeing sizes: `R12=R14=0x348` (840 = the guest's own enabled set 0x207, x87+SSE+
-  AVX+PKRU, 832+8) and `R15=0xa88` (2696 = a full AVX-512 XSAVE area). Consistent with a
-  CPUID leaf 0xD size taken from the HOST's capability set while the guest's XCR0 only
-  enables 0x207 -- the same class as `8a476c5`. HYPOTHESIS ONLY: next step is to read
-  what hype returns for leaf 0xD subleaf 0 EBX/ECX versus the per-component subleaves
-  and compare against the guest's XCR0, not to patch on the arithmetic.
+- [~] **A1. The xstate.c:332 WARNING — ROOT CAUSE CONFIRMED 2026-08-02 (#252).** hype's
+  own CPUID ring shows leaf 0xD returning DIFFERENT values on two consecutive passes:
+  sub-leaf 0 EBX goes 0x240 -> 0xa88 and sub-leaf 1 EBX goes 0x240 -> 0x348, while the
+  static per-component sub-leaves (2, 9) are identical both times. Those two are exactly
+  the XCR0-dependent fields in leaf 0xD.
+
+  Cause: `cpuid_emulate.c` passes ALL of leaf 0xD through from the host, but sub-leaf 0
+  EBX ("size of the XSAVE area for states enabled in XCR0") and sub-leaf 1 EBX are read
+  under whatever XCR0 is loaded at that instant. On VMX hype swaps XCR0 only after the
+  guest's first XSETBV, so the two passes straddle the transition. The guest asks the
+  same question twice and gets two answers -- CPUID stops being a pure function of
+  (leaf, sub-leaf, guest XCR0). The WARNING's R12/R14=0x348 and R15=0xa88 are those two
+  readings.
+
+  Fix shape: derive both XCR0-dependent fields from the GUEST's XCR0 (VMX already tracks
+  `g_vmx_guest_xcr0`; architectural reset value is 1 before the first XSETBV) by summing
+  per-component sizes for the enabled bits. Leave the rest of leaf 0xD passthrough.
+  CHECK SVM TOO: the leaf 0xD code is shared and SVM does not intercept XSETBV at all,
+  so host/guest XCR0 can diverge there as well. Validate on both vendors.
 - [ ] **A2. Whatever the guest hits next**, following the resume loop above. It was still
   running at 0.420s when the capture ended, so the next fault is unobserved -- there may
   be none at all until userspace.
