@@ -104,21 +104,30 @@ last five fixes came from reading guest oopses, not from reasoning about VMX.
   logs it), which showed every leaf 0xD reading was CORRECT for its XCR0, plus
   reading Linux's actual xstate.c instead of recalling it.
 
-- [~] **A2. The guest spins in queued_spin_lock_slowpath.** Console ends at 0.8405s
-  just after fpu init; 15 of 17 preempt samples sit at `queued_spin_lock_slowpath+0x161`
-  (resolved against the ISO's own System.map -- the earlycon ISO boots nokaslr).
-  Single vCPU, and `rflags=0x10002` so IF is CLEAR. hype's timers tick
-  (`pit_irq0=56 lapic_irq=471`).
+- [x] **A2. The qspinlock deadlock — FIXED `ab93854`.** Two guest #UDs, both the
+  "what SVM gets free that VMX gates" pattern:
+    RDTSCP  -> #UD unless secondary control bit 3 (ENABLE_RDTSCP) is set. Linux uses
+               it in pvclock_clocksource_read_nowd(), i.e. every clocksource read.
+               Fixed by requesting the control (the ENABLE_INVPCID shape, 825f283).
+    TPAUSE  -> #UD unless "enable user wait and pause" is set; doing it properly also
+               needs IA32_UMWAIT_CONTROL, which hype does not model. Linux uses it in
+               delay_halt_tpause(), i.e. every udelay(). Fixed by masking WAITPKG
+               (leaf 7 sub-leaf 0 ECX bit 5), as MONITOR is masked in leaf 1.
+  A #UD on every clocksource read AND every delay is what parked the guest in
+  queued_spin_lock_slowpath with IF clear.
 
-  BLOCKED ON INSTRUMENTATION, not on ideas: `vmm_get_int_diag()` in boot/main.c
-  returns 0 for HYPE_VMM_KIND_VMX, so the INTDIAG line prints zeros on Intel no
-  matter what happens. Do NOT read `eventinj=0` there as "nothing was injected" --
-  it is a reporting gap. Implement the VMX half first (vmm_ops.h already defines the
-  field as "SVM's VMCB EVENTINJ / VMX's VM_ENTRY_INTR_INFO_FIELD", and both
-  hype_vmx_vcpu_request_interrupt() and HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD exist).
-  This is #248's territory.
+  Interrupt delivery was NOT the problem, contrary to #248's premise. The VMX half of
+  vmm_get_int_diag() (added here) measures eventinj=484 defer=47 window=44 against
+  528 timer events, i.e. every one delivered.
 
-- [ ] **A3. Reach an Alpine login prompt** (the M4-6d3 bar, and AMD's).
+  METHOD: hype already logged the #UDs; resolving them was the missing step. The
+  earlycon ISO boots nokaslr and ships its own System.map, so RIPs resolve directly.
+  Use EXACT integer arithmetic -- awk's strtonum loses precision above 2^63 and names
+  a symbol ABOVE the address.
+
+- [x] **A3. Alpine login prompt on Intel — REACHED `ab93854`.** "localhost login:" on
+  ttyS0, single VM, after a full OpenRC boot. Matches the AMD bar (M4-6d3).
+
 - [ ] **A4. The 14 remaining raw `hype_svm_*` calls** in the FW-1 region (#249). One was
   already a real bug (`9b760b6`: the guest page walk). The rest are mostly SVM-only
   diagnostics that want gating, not porting.
