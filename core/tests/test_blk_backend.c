@@ -115,6 +115,123 @@ static void test_partial_trailing_sector_unreachable(void) {
               (unsigned long long)hype_blk_backend_read(&be, 2, 1, buf));
 }
 
+/* --- #265 write-side instrumentation --- */
+
+static uint64_t fake_now_value;
+static uint64_t fake_now(void) { return fake_now_value; }
+
+static void test_wstats_buckets(void) {
+    /* Bucket 0 is the pathological case the histogram exists to expose: one AHCI
+     * round trip per single sector. Boundaries are checked on both sides. */
+    struct { uint32_t count; unsigned want; } cases[] = {
+        {0u, 0u}, {1u, 0u}, {2u, 1u}, {7u, 1u}, {8u, 2u}, {31u, 2u},
+        {32u, 3u}, {127u, 3u}, {128u, 4u}, {1023u, 4u}, {1024u, 5u}, {8192u, 5u},
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        unsigned got = hype_blk_wstats_bucket(cases[i].count);
+        if (got != cases[i].want) {
+            printf("FAIL: bucket(%u) = %u, want %u\n", cases[i].count, got, cases[i].want);
+            failures++;
+        }
+        if (got >= HYPE_BLK_WSTATS_BUCKETS) {
+            printf("FAIL: bucket(%u) = %u is out of range\n", cases[i].count, got);
+            failures++;
+        }
+    }
+}
+
+static void test_wstats_record_accumulates(void) {
+    hype_blk_wstats_t s;
+    hype_blk_wstats_set_clock(0);
+    hype_blk_wstats_reset(&s);
+    hype_blk_wstats_record(&s, 1u);
+    hype_blk_wstats_record(&s, 1u);
+    hype_blk_wstats_record(&s, 64u);
+    if (s.writes != 3u || s.sectors != 66u) {
+        printf("FAIL: expected 3 writes / 66 sectors, got %llu / %llu\n",
+               (unsigned long long)s.writes, (unsigned long long)s.sectors);
+        failures++;
+    }
+    if (s.max_count != 64u) {
+        printf("FAIL: max_count should track the largest request, got %u\n", s.max_count);
+        failures++;
+    }
+    if (s.hist[0] != 2u || s.hist[3] != 1u) {
+        printf("FAIL: histogram should be 2 in bucket 0 and 1 in bucket 3, got %u/%u\n",
+               s.hist[0], s.hist[3]);
+        failures++;
+    }
+    hype_blk_wstats_record(0, 1u); /* must not crash */
+    hype_blk_wstats_reset(0);
+}
+
+static void test_wstats_first_tsc_is_the_first_write(void) {
+    hype_blk_wstats_t s;
+    hype_blk_wstats_reset(&s);
+    hype_blk_wstats_set_clock(fake_now);
+    fake_now_value = 1000u;
+    hype_blk_wstats_record(&s, 8u);
+    fake_now_value = 9999u;
+    hype_blk_wstats_record(&s, 8u);
+    /* Stamped once, at the FIRST write -- measuring from boot instead would dilute
+     * the write phase's throughput with everything that preceded it. */
+    if (s.first_tsc != 1000u) {
+        printf("FAIL: first_tsc should be the first write's clock, got %llu\n",
+               (unsigned long long)s.first_tsc);
+        failures++;
+    }
+    hype_blk_wstats_set_clock(0);
+    hype_blk_wstats_reset(&s);
+    hype_blk_wstats_record(&s, 8u);
+    if (s.first_tsc != 0u) {
+        printf("FAIL: with no clock installed first_tsc must stay 0\n");
+        failures++;
+    }
+}
+
+static void test_wstats_kbps(void) {
+    hype_blk_wstats_t s;
+    hype_blk_wstats_set_clock(0);
+    hype_blk_wstats_reset(&s);
+    /* 2048 sectors = 1024 KB. Over 1000 ms that is 1024 KB/s. */
+    hype_blk_wstats_record(&s, 2048u);
+    if (hype_blk_wstats_kbps(&s, 1000u) != 1024u) {
+        printf("FAIL: 2048 sectors in 1000ms should be 1024 KB/s, got %llu\n",
+               (unsigned long long)hype_blk_wstats_kbps(&s, 1000u));
+        failures++;
+    }
+    /* Must not divide by zero before any time has elapsed. */
+    if (hype_blk_wstats_kbps(&s, 0u) != 0u) {
+        printf("FAIL: zero elapsed must yield 0, not a division by zero\n");
+        failures++;
+    }
+    if (hype_blk_wstats_kbps(0, 1000u) != 0u) {
+        printf("FAIL: NULL stats must yield 0\n");
+        failures++;
+    }
+}
+
+static void test_backend_write_records_only_on_success(void) {
+    /* A failed write must not inflate the counters -- otherwise a failing disk would
+     * read as healthy throughput. */
+    hype_blk_wstats_t *g = hype_blk_wstats();
+    uint64_t before = g->writes;
+    hype_blk_backend_t ro;
+    ro.read = 0;
+    ro.write = 0; /* read-only backend: the write is rejected */
+    ro.ctx = 0;
+    ro.total_sectors = 16u;
+    if (hype_blk_backend_write(&ro, 0u, 1u, "x") == 0) {
+        printf("FAIL: a write through a read-only backend must be rejected\n");
+        failures++;
+    }
+    if (g->writes != before) {
+        printf("FAIL: a rejected write must not be counted\n");
+        failures++;
+    }
+}
+
 int main(void) {
     test_range_in_bounds();
     test_file_read();
@@ -122,6 +239,12 @@ int main(void) {
     test_bounds_gate_rejects_oob();
     test_dispatch_null_guards();
     test_partial_trailing_sector_unreachable();
+
+    test_wstats_buckets();
+    test_wstats_record_accumulates();
+    test_wstats_first_tsc_is_the_first_write();
+    test_wstats_kbps();
+    test_backend_write_records_only_on_success();
 
     if (failures == 0) {
         printf("all tests passed\n");

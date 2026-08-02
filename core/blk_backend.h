@@ -51,6 +51,67 @@ int hype_blk_range_in_bounds(uint64_t total_sectors, uint64_t lba, uint32_t coun
  * backend reports an error. These are the ONLY entry points a frontend should
  * call -- never be->read/be->write directly, which would skip the bounds gate.
  */
+/*
+ * #265: write-side throughput instrumentation.
+ *
+ * The read path has reported throughput per batch for a long time; the write path
+ * reported NOTHING, so "mkfs.fat takes minutes on real hardware" could be perceived
+ * but never quantified -- there was no way to tell from a log whether writes ran at
+ * 200 KB/s or 20 MB/s. On a cold-boot-only machine the log is the only telemetry, so
+ * that is the blocking issue: this project's PERF-1 discipline is measure-first.
+ *
+ * The size histogram is the point, not a decoration. The physical write path issues
+ * ONE AHCI command at a time and spins for completion, so throughput is 1/latency and
+ * is independent of transfer size. That makes the distribution of REQUEST SIZES the
+ * thing that decides whether a workload is fast or slow: many 1-sector metadata writes
+ * cost one full round trip each, while the same bytes in few large requests do not.
+ * The histogram settles which of those is happening without another hardware run.
+ *
+ * Counters are aggregate across VMs and are updated without locking -- they are
+ * diagnostics, and a lost increment under concurrency is preferable to putting a lock
+ * on the I/O path.
+ */
+#define HYPE_BLK_WSTATS_BUCKETS 6u
+
+typedef struct {
+    uint64_t writes;    /* completed write requests */
+    uint64_t sectors;   /* total sectors written */
+    uint64_t first_tsc; /* clock reading at the FIRST write; 0 if no clock installed */
+    uint32_t max_count; /* largest single request, in sectors */
+    uint32_t hist[HYPE_BLK_WSTATS_BUCKETS];
+} hype_blk_wstats_t;
+
+/*
+ * Install the clock used to stamp `first_tsc`. Keeps this file free of any platform
+ * clock dependency (and lets tests inject a fake). Elapsed must be measured from the
+ * first write, not from boot, or the write phase's throughput is diluted by whatever
+ * ran before it. With no clock installed, first_tsc stays 0 and callers skip the rate.
+ */
+void hype_blk_wstats_set_clock(uint64_t (*now)(void));
+
+/*
+ * Bucket index for a request of `count` sectors:
+ *   0: 1        (the pathological case -- one round trip per 512 bytes)
+ *   1: 2-7      2: 8-31     3: 32-127    4: 128-1023    5: >=1024
+ * count==0 is not a real transfer and maps to bucket 0. Pure.
+ */
+unsigned hype_blk_wstats_bucket(uint32_t count);
+
+void hype_blk_wstats_reset(hype_blk_wstats_t *s);
+
+/* Fold one completed write of `count` sectors into `s`. Pure (no clock). */
+void hype_blk_wstats_record(hype_blk_wstats_t *s, uint32_t count);
+
+/*
+ * Throughput in KB/s over `elapsed_ms`. Returns 0 when elapsed_ms is 0 rather than
+ * dividing by zero. Pure, so the rate arithmetic is unit-tested rather than only ever
+ * exercised on hardware.
+ */
+uint64_t hype_blk_wstats_kbps(const hype_blk_wstats_t *s, uint64_t elapsed_ms);
+
+/* The process-wide write stats that hype_blk_backend_write() folds into. */
+hype_blk_wstats_t *hype_blk_wstats(void);
+
 int hype_blk_backend_read(const hype_blk_backend_t *be, uint64_t lba, uint32_t count, void *buf);
 int hype_blk_backend_write(const hype_blk_backend_t *be, uint64_t lba, uint32_t count,
                            const void *buf);

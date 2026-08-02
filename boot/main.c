@@ -7611,6 +7611,35 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_debug_print("%s\n", hline);
                 }
 #endif
+                /*
+                 * #265: the write-side counterpart of the ATAPI READ(10) DIAG line.
+                 * `hist` is the request-size distribution in sectors
+                 * (1 / 2-7 / 8-31 / 32-127 / 128-1023 / >=1024): because the physical
+                 * write path keeps only one AHCI command in flight and spins for it,
+                 * throughput is 1/latency, so a left-heavy histogram means many small
+                 * round trips and IS the explanation for a slow mkfs -- no further
+                 * hardware run needed to tell that apart from low bandwidth.
+                 * Elapsed runs from the FIRST write, so KB/s covers the write phase
+                 * rather than being diluted by the boot that preceded it.
+                 */
+                {
+                    const hype_blk_wstats_t *ws = hype_blk_wstats();
+                    if (ws->writes != 0) {
+                        uint64_t w_ms = 0;
+                        if (ws->first_tsc != 0 && g_fw_1_host_tsc_hz != 0) {
+                            w_ms = ((hype_rdtsc() - ws->first_tsc) * 1000ULL) / g_fw_1_host_tsc_hz;
+                        }
+                        hype_debug_print("fw-1 DIAG: BLK WRITE count=%llu sectors=%llu max=%u "
+                                         "hist=%u/%u/%u/%u/%u/%u elapsed=%llums thru=%lluKB/s\n",
+                                         (unsigned long long)ws->writes,
+                                         (unsigned long long)ws->sectors,
+                                         (unsigned)ws->max_count, (unsigned)ws->hist[0],
+                                         (unsigned)ws->hist[1], (unsigned)ws->hist[2],
+                                         (unsigned)ws->hist[3], (unsigned)ws->hist[4],
+                                         (unsigned)ws->hist[5], (unsigned long long)w_ms,
+                                         (unsigned long long)hype_blk_wstats_kbps(ws, w_ms));
+                    }
+                }
                 /* M4-6d4: mean per-exit cost split VMRUN world-switch vs our
                  * loop body, in nanoseconds (TSC / host_tsc_hz * 1e9). Tells
                  * whether the ~219us/exit is the CPU's world-switch (VMRUN
@@ -11053,6 +11082,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             uint64_t t0 = hype_rdtsc();
             stall_fn(20000);
             g_fw_1_host_tsc_hz = (hype_rdtsc() - t0) * 50ULL; /* *(1e6/20000) */
+            /* #265: from here on the write stats can stamp their first write. */
+            hype_blk_wstats_set_clock(hype_rdtsc);
             hype_debug_print("fw-1: host TSC calibrated at %llu Hz (%llu MHz)\n",
                               (unsigned long long)g_fw_1_host_tsc_hz,
                               (unsigned long long)(g_fw_1_host_tsc_hz / 1000000ULL));
