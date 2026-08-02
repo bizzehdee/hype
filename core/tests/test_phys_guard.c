@@ -190,12 +190,53 @@ static void test_arm(void) {
               hype_phys_guard_arm("QM00013", "QM00013", GUID, s0, s1, 1, 1));
 }
 
+static void test_attach_mode_separates_attach_from_write(void) {
+    /* #267: only an identity mismatch means "not this drive". Every other guard
+     * refusal is a refusal to WRITE -- the disk may still be attached read-only so
+     * the guest can boot it. Conflating the two made a boot=disk run silently fall
+     * back to a blank RAM scratch. */
+    if (hype_phys_attach_mode(HYPE_PHYS_GUARD_DENY_ID_MISMATCH) != HYPE_PHYS_ATTACH_NONE) {
+        printf("FAIL: an identity mismatch must not attach at all\n");
+        failures++;
+    }
+    if (hype_phys_attach_mode(HYPE_PHYS_GUARD_ALLOW) != HYPE_PHYS_ATTACH_WRITABLE) {
+        printf("FAIL: a full guard pass must attach writable\n");
+        failures++;
+    }
+    /* The case behind the bug: an already-installed (non-blank) disk with no
+     * allow_overwrite. Booting it is not installing to it. */
+    if (hype_phys_attach_mode(HYPE_PHYS_GUARD_DENY_NONEMPTY) != HYPE_PHYS_ATTACH_READ_ONLY) {
+        printf("FAIL: a non-blank disk must still attach READ-ONLY so it can be booted\n");
+        failures++;
+    }
+    if (hype_phys_attach_mode(HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM) != HYPE_PHYS_ATTACH_READ_ONLY) {
+        printf("FAIL: an unconfirmed disk must still attach READ-ONLY\n");
+        failures++;
+    }
+}
+
+static void test_attach_mode_never_writable_without_full_pass(void) {
+    /* The safety invariant, stated independently of the mapping above: WRITABLE is
+     * reachable from HYPE_PHYS_GUARD_ALLOW and from nothing else. */
+    int r;
+    for (r = 0; r <= (int)HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM; r++) {
+        hype_phys_attach_mode_t m = hype_phys_attach_mode((hype_phys_guard_result_t)r);
+        if (m == HYPE_PHYS_ATTACH_WRITABLE && r != (int)HYPE_PHYS_GUARD_ALLOW) {
+            printf("FAIL: guard result %d must not yield a writable attach\n", r);
+            failures++;
+        }
+    }
+}
+
 int main(void) {
     test_guid_parse();
     test_allow_paths();
     test_deny_paths();
     test_part_table_nonempty();
     test_arm();
+
+    test_attach_mode_separates_attach_from_write();
+    test_attach_mode_never_writable_without_full_pass();
 
     if (failures == 0) {
         printf("all tests passed\n");

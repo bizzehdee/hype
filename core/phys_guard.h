@@ -88,4 +88,32 @@ hype_phys_guard_result_t hype_phys_guard_arm(const char *configured_id, const ch
                                              const uint8_t *sector1, int allow_overwrite,
                                              int operator_confirmed);
 
+/*
+ * #267: how a `physical:` target should be ATTACHED, which is a separate question
+ * from whether it may be WRITTEN.
+ *
+ * The two were conflated: the backend attached only on a full guard pass, so a
+ * `boot = disk` run over an already-installed drive -- non-empty, and with no
+ * reason to set allow_overwrite -- got no physical disk at all and silently fell
+ * back to a blank RAM scratch. The guest then had nothing to boot, which read as
+ * a firmware bug rather than a declined attach.
+ *
+ * Booting a disk is not installing to it. Identity match alone is enough to hand
+ * the drive to the guest READ-ONLY; only the full guard (identity + safe disk
+ * state + operator confirmation) may install the backend's write path. So the
+ * safe configuration can boot its own disk without ever asserting "yes, wipe it".
+ */
+typedef enum {
+    HYPE_PHYS_ATTACH_NONE = 0,  /* not this target -- do not attach at all */
+    HYPE_PHYS_ATTACH_READ_ONLY, /* attach so the guest can boot it; writes refused */
+    HYPE_PHYS_ATTACH_WRITABLE   /* full guard passed -- guest writes reach the disk */
+} hype_phys_attach_mode_t;
+
+/*
+ * Maps a guard result to an attach mode. Only an identity mismatch means "not
+ * this drive"; every other refusal is a refusal to WRITE, not a refusal to
+ * attach. Pure.
+ */
+hype_phys_attach_mode_t hype_phys_attach_mode(hype_phys_guard_result_t guard);
+
 #endif /* HYPE_CORE_PHYS_GUARD_H */

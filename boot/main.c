@@ -647,6 +647,14 @@ static uint64_t g_hostdisk_abar;
 static unsigned g_hostdisk_port;
 static int g_hostdisk_present;
 static uint64_t g_hostdisk_total_sectors;
+/*
+ * #267: the serial of the enumerated drive that identity-matched a configured
+ * `physical:` target, recorded at arm time INDEPENDENTLY of whether writing to
+ * it was ever confirmed. Attach is keyed off this; only the write path is keyed
+ * off the confirm. Empty until arm_physical_write_confirm() matches a drive.
+ */
+static char g_phys_target_serial[21];
+
 static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
                                     * `physical:` target, exactly as g_hostnvme_serial */
 static hype_blk_phys_ahci_t g_hostdisk_ahci; /* backend hw ctx (outlives the VM) */
@@ -6385,6 +6393,20 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
 /* M10-6a (#227): at most one VM claims the single enumerated physical scratch. */
 static int g_phys_backend_claimed_vm = -1;
 
+/* #267: `drive_serial` is the target a config entry named (identity matched at
+ * arm time). Enough on its own to ATTACH the drive -- see hype_phys_attach_mode. */
+static int fw_1_phys_target_matches(const char *drive_serial) {
+    return (g_phys_target_serial[0] != '\0') && term_streq(g_phys_target_serial, drive_serial);
+}
+
+/* #267: ...but writing to it additionally requires the destructive-write confirm
+ * (#125) to have been ACCEPTED for this same drive. Evaluated at attach time, not
+ * arm time, because the operator may confirm interactively after arming. */
+static int fw_1_phys_write_permitted(const char *drive_serial) {
+    return hype_phys_confirm_is_accepted(&g_phys_confirm) &&
+           term_streq(g_phys_confirm.serial, drive_serial);
+}
+
 /* True iff this VM should back its virtio-blk with the CONFIRMED writable NVMe
  * scratch instead of the RAM/file disk: a scratch was enumerated, the #125
  * confirm is ACCEPTED, its serial matches the scratch, and no other VM already
@@ -6393,8 +6415,7 @@ static int g_phys_backend_claimed_vm = -1;
 static int fw_1_vblk_use_physical(hype_fw_vm_t *vm) {
     int idx = (int)(vm - &g_vms[0]);
     if (!g_hostnvme_present) return 0;
-    if (!hype_phys_confirm_is_accepted(&g_phys_confirm)) return 0;
-    if (!term_streq(g_phys_confirm.serial, g_hostnvme_serial)) return 0;
+    if (!fw_1_phys_target_matches(g_hostnvme_serial)) return 0;
     if (g_phys_backend_claimed_vm >= 0 && g_phys_backend_claimed_vm != idx) return 0;
     return 1;
 }
@@ -6407,8 +6428,7 @@ static int fw_1_vblk_use_physical(hype_fw_vm_t *vm) {
 static int fw_1_vblk_use_physical_ahci(hype_fw_vm_t *vm) {
     int idx = (int)(vm - &g_vms[0]);
     if (!g_hostdisk_present) return 0;
-    if (!hype_phys_confirm_is_accepted(&g_phys_confirm)) return 0;
-    if (!term_streq(g_phys_confirm.serial, g_hostdisk_serial)) return 0;
+    if (!fw_1_phys_target_matches(g_hostdisk_serial)) return 0;
     if (g_phys_backend_claimed_vm >= 0 && g_phys_backend_claimed_vm != idx) return 0;
     return 1;
 }
@@ -6579,13 +6599,19 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         hype_debug_print("#229: PHYSICAL NVMe backend forced READ-ONLY (writes rejected) "
                          "-- safe real-HW read-path repro\n");
 #endif
+        /* #267: same split as the AHCI path -- attach on identity match, but install
+         * the write path only when the #125 confirm accepted THIS drive. */
+        if (!fw_1_phys_write_permitted(g_hostnvme_serial)) {
+            vm->vblk_be.write = 0;
+        }
         vm->vblk_is_physical = 1;
         g_phys_backend_claimed_vm = (int)(vm - &g_vms[0]);
         hype_virtio_blk_reset(&vm->vblk, g_hostnvme_total_sectors);
         hype_debug_print("virtio-blk[vm %d]: PHYSICAL NVMe backend (sn '%s', %llu sectors)%s\n",
                          (int)(vm - &g_vms[0]), g_hostnvme_serial,
                          (unsigned long long)g_hostnvme_total_sectors,
-                         vm->vblk_be.write ? " [writable]" : " [READ-ONLY #229]");
+                         vm->vblk_be.write ? " [writable]"
+                                           : " [READ-ONLY -- boot only, no write confirm]");
         hype_debug_print("#229dbg setup: CR3=0x%llx g_pml4=0x%llx g_ap_cr3=0x%llx nvme_bar=0x%llx\n",
                          (unsigned long long)hype_dbg_read_cr3(), (unsigned long long)(uintptr_t)g_pml4,
                          (unsigned long long)g_ap_cr3, (unsigned long long)g_hostnvme_bar);
@@ -6593,22 +6619,31 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         fw_1_vblk_write_selftest(vm);
 #endif
     } else if (fw_1_vblk_use_physical_ahci(vm)) {
-        /* M10-6b (#228): CONFIRMED `physical:` AHCI/SATA target -> writable AHCI
-         * backend. Unlike the HYPE_229_RO_SATA diagnostic above, the write fn is
-         * LEFT INTACT -- guest writes to /dev/vda land on the real disk. Reaching
-         * here already means the #124 identity + non-empty guard passed AND the
-         * operator (or HYPE_M10_6_AUTOCONFIRM in QEMU) confirmed the serial. The
-         * host AHCI ABAR is low MMIO (<4GB), already in g_pml4's identity map, so
-         * -- unlike the high-BAR NVMe path -- no remap/re-init is needed here. */
+        /* M10-6b (#228): a `physical:` AHCI/SATA target whose identity matched.
+         * Reaching here means the #124 identity check passed -- NOT that writing was
+         * confirmed (#267): the disk state and operator gates decide `writable`
+         * below, and an unconfirmed drive attaches read-only so the guest can boot
+         * it without being able to damage it. The host AHCI ABAR is low MMIO (<4GB),
+         * already in g_pml4's identity map, so -- unlike the high-BAR NVMe path --
+         * no remap/re-init is needed here. */
         int idx = (int)(vm - &g_vms[0]);
+        int writable = fw_1_phys_write_permitted(g_hostdisk_serial);
         hype_blk_phys_ahci_init(&vm->vblk_phys, &g_hostdisk_ahci, &vm->vblk_be,
                                 g_hostdisk_abar, g_hostdisk_port, g_hostdisk_total_sectors);
+        /* #267: identity match earned the ATTACH; only the confirm earns the write
+         * path. Nulling `write` is what hype_blk_backend_write checks, so a
+         * read-only attach cannot damage the disk however the guest behaves. */
+        if (!writable) {
+            vm->vblk_be.write = 0;
+        }
         vm->vblk_is_physical = 1;
         g_phys_backend_claimed_vm = idx;
         hype_virtio_blk_reset(&vm->vblk, g_hostdisk_total_sectors);
         hype_debug_print("virtio-blk[vm %d]: PHYSICAL AHCI/SATA backend (sn '%s', %llu sectors) "
-                         "[writable]\n", idx, g_hostdisk_serial,
-                         (unsigned long long)g_hostdisk_total_sectors);
+                         "%s\n", idx, g_hostdisk_serial,
+                         (unsigned long long)g_hostdisk_total_sectors,
+                         writable ? "[writable -- #125 confirm accepted]"
+                                  : "[READ-ONLY -- boot only; no write confirm (#267)]");
         /* Real-HW install: guarantee this "attached writable" confirmation reaches
          * \HYPEFULL.LOG immediately, before the guest install phase (whose auto-
          * streaming can stall) -- so the log always proves the physical attach. */
@@ -10260,9 +10295,15 @@ static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_
                              drive_serial ? drive_serial : "(none)");
             continue;
         }
+        /* #267: identity matched, so this IS the drive the operator named. Record
+         * it now -- the guest may attach it read-only to boot from even if every
+         * remaining gate refuses the write. */
+        (void)hype_strlcpy(g_phys_target_serial, drive_serial ? drive_serial : "",
+                           sizeof(g_phys_target_serial));
         if (r == HYPE_PHYS_GUARD_DENY_NONEMPTY) {
             hype_debug_print("phys-write: vm '%s' target '%s' drive is NOT BLANK and "
-                             "allow_overwrite is unset -- refusing (not armed)\n",
+                             "allow_overwrite is unset -- writes REFUSED; attaching "
+                             "READ-ONLY so the guest can still boot it (#267)\n",
                              v->name, d->path_or_id);
             continue;
         }
@@ -10938,7 +10979,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             UINTN vdisk_pages = (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL);
             g_vms[0].vblk_backing_phys = hype_alloc_pages_any(SystemTable->BootServices, vdisk_pages);
             hype_guest_ram_zero((void *)(uintptr_t)g_vms[0].vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
-            hype_debug_print("fw-1: vm0 virtio-blk scratch disk @0x%llx (%llu MiB)\n",
+            /* #267: this is the RAM fallback being RESERVED, not the backend being
+             * chosen -- that happens later in fw_1_setup_virtio_blk. Say so: read as
+             * a backend announcement it hides a declined physical attach. */
+            hype_debug_print("fw-1: vm0 virtio-blk fallback RAM scratch reserved @0x%llx "
+                             "(%llu MiB) -- backend chosen later\n",
                              (unsigned long long)g_vms[0].vblk_backing_phys,
                              (unsigned long long)(HYPE_FW_1_VDISK_BYTES / (1024ULL * 1024ULL)));
         }

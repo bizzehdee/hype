@@ -132,3 +132,16 @@ hype_phys_guard_result_t hype_phys_guard_arm(const char *configured_id, const ch
     c.operator_confirmed = operator_confirmed;
     return hype_phys_guard_check(&c);
 }
+
+hype_phys_attach_mode_t hype_phys_attach_mode(hype_phys_guard_result_t guard) {
+    switch (guard) {
+        case HYPE_PHYS_GUARD_ALLOW:
+            return HYPE_PHYS_ATTACH_WRITABLE;
+        case HYPE_PHYS_GUARD_DENY_NONEMPTY:
+        case HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM:
+            return HYPE_PHYS_ATTACH_READ_ONLY;
+        case HYPE_PHYS_GUARD_DENY_ID_MISMATCH:
+        default:
+            return HYPE_PHYS_ATTACH_NONE;
+    }
+}
