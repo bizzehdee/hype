@@ -1906,6 +1906,27 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
     }
     hype_ahci_decode_h2d_fis(cmd_table_bytes, &fis);
 
+    /*
+     * #262: trace the first commands this disk is ever asked for.
+     *
+     * The whole difficulty on this ticket has been not knowing WHICH half is
+     * failing: "the guest firmware never issued a command to the disk" and "it
+     * issued commands and rejected what came back" both present identically as
+     * `BdsDxe: No bootable option or device was found.`, and they have nothing in
+     * common as fixes. Three hypotheses were already spent guessing at the second
+     * without evidence for it. Bounded to the first few so a live guest's steady
+     * read traffic cannot flood the log.
+     */
+    {
+        static unsigned trace_n = 0;
+        if (trace_n < 12u) {
+            trace_n++;
+            hype_debug_print("fw-1 #262 ATACMD#%02u: cmd=0x%02x lba=0x%llx count=%u prdtl=%u\n",
+                             trace_n, (unsigned)fis.command, (unsigned long long)fis.lba,
+                             (unsigned)fis.count, (unsigned)hdr.prdtl);
+        }
+    }
+
     status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_DSC);
     error_reg = 0;
     remaining = 0;
