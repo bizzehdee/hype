@@ -99,6 +99,89 @@ static void test_uptime_null_safe(void) {
     }
 }
 
+/* --- #264: CPU% must be measured, and must be able to read something other than 0/100 --- */
+
+static void test_cpu_reports_intermediate_values(void) {
+    /* The whole point: the old metric could only ever be 0 or 100. A guest busy for a
+     * quarter of the window must read 25. */
+    hype_vm_cpu_t c;
+    hype_vm_cpu_reset(&c);
+    hype_vm_cpu_sample(&c, 1000ULL, 10000ULL); /* baseline */
+    hype_vm_cpu_sample(&c, 1250ULL, 11000ULL); /* busy 250 of 1000 */
+    if (hype_vm_cpu_pct(&c) != 25u) {
+        printf("FAIL: 250/1000 busy should read 25%%, got %u\n", hype_vm_cpu_pct(&c));
+        failures++;
+    }
+    hype_vm_cpu_sample(&c, 1300ULL, 12000ULL); /* busy 50 of 1000 -- it must MOVE */
+    if (hype_vm_cpu_pct(&c) != 5u) {
+        printf("FAIL: the window should track load and read 5%%, got %u\n",
+               hype_vm_cpu_pct(&c));
+        failures++;
+    }
+}
+
+static void test_cpu_first_sample_is_baseline_only(void) {
+    /* Treating the cumulative totals as a window would report a lifetime mean, which
+     * is the behaviour this replaces. */
+    hype_vm_cpu_t c;
+    hype_vm_cpu_reset(&c);
+    hype_vm_cpu_sample(&c, 900ULL, 1000ULL);
+    if (hype_vm_cpu_pct(&c) != 0u) {
+        printf("FAIL: the first sample must not report a percentage, got %u\n",
+               hype_vm_cpu_pct(&c));
+        failures++;
+    }
+}
+
+static void test_cpu_clamps_and_handles_degenerate_windows(void) {
+    hype_vm_cpu_t c;
+    hype_vm_cpu_reset(&c);
+    hype_vm_cpu_sample(&c, 0ULL, 0ULL);
+    hype_vm_cpu_sample(&c, 5000ULL, 1000ULL); /* busy > wall: jitter, must clamp */
+    if (hype_vm_cpu_pct(&c) != 100u) {
+        printf("FAIL: busy exceeding wall must clamp to 100, got %u\n", hype_vm_cpu_pct(&c));
+        failures++;
+    }
+    hype_vm_cpu_sample(&c, 5500ULL, 1000ULL); /* no wall elapsed: keep last reading */
+    if (hype_vm_cpu_pct(&c) != 100u) {
+        printf("FAIL: a zero-length window must keep the previous reading, got %u\n",
+               hype_vm_cpu_pct(&c));
+        failures++;
+    }
+}
+
+static void test_cpu_rebases_on_counter_going_backwards(void) {
+    hype_vm_cpu_t c;
+    hype_vm_cpu_reset(&c);
+    hype_vm_cpu_sample(&c, 1000ULL, 10000ULL);
+    hype_vm_cpu_sample(&c, 1500ULL, 11000ULL); /* 50% */
+    if (hype_vm_cpu_pct(&c) != 50u) {
+        printf("FAIL: expected 50%%, got %u\n", hype_vm_cpu_pct(&c));
+        failures++;
+    }
+    hype_vm_cpu_sample(&c, 10ULL, 20ULL);      /* counters reset: rebase, do not spike */
+    if (hype_vm_cpu_pct(&c) != 50u) {
+        printf("FAIL: a backwards counter must keep the last reading, got %u\n",
+               hype_vm_cpu_pct(&c));
+        failures++;
+    }
+    hype_vm_cpu_sample(&c, 110ULL, 220ULL);    /* 100 busy of 200 wall */
+    if (hype_vm_cpu_pct(&c) != 50u) {
+        printf("FAIL: should resume measuring after a rebase, got %u\n",
+               hype_vm_cpu_pct(&c));
+        failures++;
+    }
+}
+
+static void test_cpu_null_safe(void) {
+    hype_vm_cpu_reset(0);
+    hype_vm_cpu_sample(0, 1ULL, 1ULL);
+    if (hype_vm_cpu_pct(0) != 0u) {
+        printf("FAIL: NULL accumulator should read 0\n");
+        failures++;
+    }
+}
+
 int main(void) {
     /* --- uptime formatting --- */
     char up[16];
@@ -166,6 +249,12 @@ int main(void) {
     test_uptime_first_sample_banks_nothing();
     test_uptime_ignores_time_going_backwards();
     test_uptime_null_safe();
+
+    test_cpu_reports_intermediate_values();
+    test_cpu_first_sample_is_baseline_only();
+    test_cpu_clamps_and_handles_degenerate_windows();
+    test_cpu_rebases_on_counter_going_backwards();
+    test_cpu_null_safe();
 
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);

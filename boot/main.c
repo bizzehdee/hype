@@ -429,6 +429,7 @@ typedef struct hype_fw_vm {
     volatile uint64_t stat_hlt_exits;
     volatile uint64_t stat_uptime_ms; /* #263: accumulated RUNNING time, not wall-clock */
     hype_vm_uptime_t uptime_acc;      /* #263: the accumulator behind it */
+    hype_vm_cpu_t cpu_acc;            /* #264: sliding-window busy-time CPU% */
     volatile uint64_t stat_idle_ms;
     volatile unsigned stat_cpu_pct;
     /* M8-4..7: lifecycle state, read by this VM's loop each iteration and posted
@@ -6353,7 +6354,17 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
         vm->stat_idle_ms = idle_ms;
         vm->stat_total_exits = total_exits;
         vm->stat_hlt_exits = hlt_exits;
-        vm->stat_cpu_pct = 100u - idle_pct;
+        /*
+         * #264: CPU% is now MEASURED -- time actually spent executing the guest
+         * (g_fw_1_vmrun_tsc, which the exit-cost instrumentation already accumulates)
+         * against wall-clock, over the window since the previous sample. The old
+         * "100 - HLT-wait fraction" could only ever read 0 or 100: the guest never
+         * HLTed (#256), so the idle term was permanently zero. Both inputs are raw
+         * TSC, which is fine -- only their ratio is used.
+         */
+        hype_vm_cpu_sample(&vm->cpu_acc, g_fw_1_vmrun_tsc, now_gf);
+        vm->stat_cpu_pct = hype_vm_cpu_pct(&vm->cpu_acc);
+        (void)idle_pct;
     }
 
     if (*last_gop_flush_tsc != 0 && now_gf - *last_gop_flush_tsc < g_fw_1_host_tsc_hz / 60u) {
@@ -7619,6 +7630,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_debug_print("%s\n", hline);
                 }
 #endif
+                /*
+                 * #263/#264: both per-VM metrics are rendered to the GOP dashboard,
+                 * which does not exist on a headless run -- and on the cold-boot-only
+                 * laptop the log is the only telemetry there is. Emit them so an
+                 * uptime that froze while stopped, or a CPU% that actually moves, can
+                 * be confirmed from a captured log instead of a photograph.
+                 */
+                hype_debug_print("fw-1 VMSTAT vm%u: state=%d uptime=%llus cpu=%u%%\n",
+                                 (unsigned)(vm - g_vms), (int)vm->lifecycle,
+                                 (unsigned long long)(vm->stat_uptime_ms / 1000u),
+                                 (unsigned)vm->stat_cpu_pct);
                 /*
                  * #265: the write-side counterpart of the ATAPI READ(10) DIAG line.
                  * `hist` is the request-size distribution in sectors

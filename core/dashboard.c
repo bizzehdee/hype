@@ -51,6 +51,52 @@ unsigned long long hype_vm_uptime_ms(const hype_vm_uptime_t *u) {
     return (u == (const hype_vm_uptime_t *)0) ? 0ULL : u->accum_ms;
 }
 
+void hype_vm_cpu_reset(hype_vm_cpu_t *c) {
+    if (c == (hype_vm_cpu_t *)0) {
+        return;
+    }
+    c->last_busy = 0;
+    c->last_wall = 0;
+    c->pct = 0;
+    c->started = 0;
+}
+
+void hype_vm_cpu_sample(hype_vm_cpu_t *c, unsigned long long busy_total,
+                        unsigned long long wall_total) {
+    unsigned long long dbusy, dwall;
+    if (c == (hype_vm_cpu_t *)0) {
+        return;
+    }
+    if (!c->started) {
+        /* First sample only establishes the baseline: with no previous reading there
+         * is no window to average over, and treating the totals as a window would
+         * report the lifetime mean -- exactly the behaviour this replaces. */
+        c->started = 1;
+        c->last_busy = busy_total;
+        c->last_wall = wall_total;
+        return;
+    }
+    if (busy_total < c->last_busy || wall_total < c->last_wall) {
+        /* A counter went backwards (reset or wrap): rebase and keep the last reading
+         * rather than computing a nonsense window. */
+        c->last_busy = busy_total;
+        c->last_wall = wall_total;
+        return;
+    }
+    dbusy = busy_total - c->last_busy;
+    dwall = wall_total - c->last_wall;
+    c->last_busy = busy_total;
+    c->last_wall = wall_total;
+    if (dwall == 0u) {
+        return; /* no window elapsed; keep the previous percentage */
+    }
+    c->pct = (unsigned)((dbusy >= dwall) ? 100u : ((dbusy * 100u) / dwall));
+}
+
+unsigned hype_vm_cpu_pct(const hype_vm_cpu_t *c) {
+    return (c == (const hype_vm_cpu_t *)0) ? 0u : c->pct;
+}
+
 void hype_dashboard_fmt_uptime(char *buf, unsigned long long secs) {
     unsigned long long h = secs / 3600ull;
     unsigned m = (unsigned)((secs / 60ull) % 60ull);

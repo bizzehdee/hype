@@ -74,4 +74,45 @@ void hype_vm_uptime_sample(hype_vm_uptime_t *u, unsigned long long now_ms, int r
 
 unsigned long long hype_vm_uptime_ms(const hype_vm_uptime_t *u);
 
+/*
+ * #264: per-VM CPU%, measured rather than inferred.
+ *
+ * The old figure was 100 minus the fraction of wall-clock spent waiting in HLT. Two
+ * things made that structurally incapable of showing anything but 0% or 100%: the
+ * guest never executed HLT at all (#256 -- it idled via an un-intercepted MWAIT), so
+ * the idle term was always zero and the result always exactly 100; and the render
+ * substituted a literal 0 whenever the VM was not RUNNING. The metric was not coarse,
+ * it was measuring something that could not move.
+ *
+ * This measures busy time DIRECTLY: time actually spent inside the guest (which the
+ * exit-cost instrumentation already accumulates as VMRUN time) against wall-clock.
+ * Both inputs are monotonic cumulative counters in the same unit, and the percentage
+ * is computed from the DELTA between consecutive samples, so it is a sliding window
+ * that responds to load instead of converging on a lifetime mean.
+ *
+ * Deliberately unit-agnostic (TSC ticks, ns, ms -- whatever the caller uses), because
+ * the ratio is all that matters and that keeps this pure and testable. As with the
+ * uptime accumulator, the formatter was already tested while the DERIVATION had no
+ * tests, which is how a permanently-constant metric survived.
+ */
+typedef struct {
+    unsigned long long last_busy; /* cumulative busy at the previous sample */
+    unsigned long long last_wall; /* cumulative wall-clock at the previous sample */
+    unsigned pct;                 /* most recent window's percentage, 0..100 */
+    int started;
+} hype_vm_cpu_t;
+
+void hype_vm_cpu_reset(hype_vm_cpu_t *c);
+
+/*
+ * Fold one sample. `busy_total` and `wall_total` are cumulative and must be in the
+ * same unit. A window with no elapsed wall time, or either counter going backwards,
+ * leaves the previous reading in place rather than producing a spike. The result is
+ * clamped to 100 so measurement jitter cannot report an impossible figure.
+ */
+void hype_vm_cpu_sample(hype_vm_cpu_t *c, unsigned long long busy_total,
+                        unsigned long long wall_total);
+
+unsigned hype_vm_cpu_pct(const hype_vm_cpu_t *c);
+
 #endif /* HYPE_DASHBOARD_H */
