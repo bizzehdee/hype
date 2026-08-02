@@ -57,7 +57,10 @@
  */
 #define HYPE_VMX_MAX_VCPUS 4u
 static uint8_t g_vmcs_pool[HYPE_VMX_MAX_VCPUS][4096] __attribute__((aligned(4096)));
-static uint8_t g_virtual_apic_page[4096] __attribute__((aligned(4096)));
+/* #277: one virtual-APIC page PER vCPU slot. A single shared page went into every
+ * VMCS as VIRTUAL_APIC_PAGE_ADDR, so two guests would share one TPR the moment the
+ * capability negotiation granted USE_TPR_SHADOW. Same shape as #276's MSR areas. */
+static uint8_t g_virtual_apic_page[HYPE_VMX_MAX_VCPUS][4096] __attribute__((aligned(4096)));
 
 /* #248: did the CPU actually grant acknowledge-interrupt-on-exit? Set from the
  * ADJUSTED exit controls in hype_vmx_vcpu_create(), never from what was
@@ -92,12 +95,10 @@ static uint64_t g_vmx_entry_cap = 0;
  * context, where hype's own FPU/XSAVE state is interpreted under it.
  *
  * g_vmx_host_xcr0 is captured once at VMCS build. The swap only happens after the
- * guest has actually executed an XSETBV (g_vmx_guest_xcr0_valid), so the common
+ * guest has actually executed an XSETBV (ctx->guest_xcr0_valid, #277), so the common
  * case costs nothing.
  */
 static uint64_t g_vmx_host_xcr0 = 0;
-static uint64_t g_vmx_guest_xcr0 = 0;
-static int g_vmx_guest_xcr0_valid = 0;
 
 /* Defined further down; needed by the XCR0 helpers below. */
 static inline uint64_t read_cr4(void);
@@ -264,6 +265,16 @@ struct hype_vcpu_ctx {
      * what it set. Mirrors the SVM ctx's fields of the same name. */
     uint64_t pvclock_system_msr;
     uint64_t pvclock_wall_msr;
+    /*
+     * #277: this guest's XCR0, and whether it has executed an XSETBV yet. Was a
+     * file-global pair, so with two guests whichever set XCR0 last decided the
+     * feature set BOTH ran under and both saw reported by CPUID leaf 0xD. That
+     * corrupts vector state silently rather than crashing -- the #260 failure
+     * mode -- so it belongs in the ctx like the pvclock fields above.
+     * The HOST's XCR0 stays global: there is genuinely only one of it.
+     */
+    uint64_t guest_xcr0;
+    int guest_xcr0_valid;
 };
 
 /*
@@ -333,6 +344,10 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
      * pvclock pages -- same reasoning as the SVM path's reset. */
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
+    /* #277: a recycled slot must not inherit the previous guest's XCR0 -- the
+     * architectural reset value is x87-only, which `valid == 0` stands for. */
+    ctx->guest_xcr0 = 0;
+    ctx->guest_xcr0_valid = 0;
 }
 
 static void hype_vmx_host_exit_stub(void) {
@@ -707,7 +722,7 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * negotiation above actually granted USE_TPR_SHADOW (older CPUs
      * without it will simply ignore VIRTUAL_APIC_PAGE_ADDR/
      * TPR_THRESHOLD). 0 threshold = no TPR-masking VM-exits. */
-    rc |= vmwrite(HYPE_VMCS_VIRTUAL_APIC_PAGE_ADDR, (uint64_t)(uintptr_t)g_virtual_apic_page);
+    rc |= vmwrite(HYPE_VMCS_VIRTUAL_APIC_PAGE_ADDR, (uint64_t)(uintptr_t)g_virtual_apic_page[slot]);
     rc |= vmwrite(HYPE_VMCS_TPR_THRESHOLD, 0);
 
     /* Guest segments. Long mode: flat 64-bit -- base 0, 4GB limit, CS is a
@@ -1128,8 +1143,8 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     int ok;
 
     /* #251: run the guest under its own XCR0, and put hype's back afterwards. */
-    if (g_vmx_guest_xcr0_valid && vmx_ensure_osxsave()) {
-        xsetbv0(g_vmx_guest_xcr0);
+    if (real->guest_xcr0_valid && vmx_ensure_osxsave()) {
+        xsetbv0(real->guest_xcr0);
     }
     /* #260: restore AFTER the XCR0 switch (XSETBV can reinitialise state
      * components, discarding whatever we had just loaded) and save BEFORE
@@ -1138,7 +1153,7 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     hype_fpu_restore(&real->fpu);
     failed = hype_vmx_launch(ctx, (uint64_t)real->launched);
     hype_fpu_save(&real->fpu);
-    if (g_vmx_guest_xcr0_valid && g_vmx_host_xcr0 != 0ull) {
+    if (real->guest_xcr0_valid && g_vmx_host_xcr0 != 0ull) {
         xsetbv0(g_vmx_host_xcr0);
     }
     if (failed) {
@@ -1263,9 +1278,9 @@ int hype_vmx_vcpu_handle_xsetbv(hype_vcpu_ctx_t *ctx) {
                          (unsigned long long)requested, (unsigned long long)supported);
     }
     /* XCR0.x87 (bit 0) must be set; a value clearing it would #GP. */
-    g_vmx_guest_xcr0 = (requested & supported) | 1ull;
-    g_vmx_guest_xcr0_valid = 1;
-    xsetbv0(g_vmx_guest_xcr0);
+    real->guest_xcr0 = (requested & supported) | 1ull;
+    real->guest_xcr0_valid = 1;
+    xsetbv0(real->guest_xcr0);
     vmx_advance_rip();
     return 0;
 }
@@ -1305,7 +1320,7 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
      */
     /*
      * #252: ...but the swap must ALSO happen before the guest's first XSETBV. It used
-     * to be gated on g_vmx_guest_xcr0_valid, so until then hype read the leaf under
+     * to be gated on the guest-XCR0-valid flag, so until then hype read the leaf under
      * the HOST's live XCR0 and handed the guest a size describing the host. The
      * guest's XCR0 before its first XSETBV is not "whatever the host has" -- it is
      * the architectural reset value, 1 (x87 only). Linux reads this leaf during
@@ -1313,7 +1328,7 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
      * the one that was wrong.
      */
     if (eax_in == 0xDu && g_vmx_host_xcr0 != 0ull) {
-        uint64_t guest_xcr0 = g_vmx_guest_xcr0_valid ? g_vmx_guest_xcr0 : 1ull;
+        uint64_t guest_xcr0 = real->guest_xcr0_valid ? real->guest_xcr0 : 1ull;
         xsetbv0(guest_xcr0);
         vmx_real_cpuid(eax_in, ecx_in, &host_real);
         xsetbv0(g_vmx_host_xcr0);
@@ -1335,7 +1350,7 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
         g_vmx_cpuid_ring[h].ebx = out.ebx;
         g_vmx_cpuid_ring[h].ecx = out.ecx;
         g_vmx_cpuid_ring[h].edx = out.edx;
-        g_vmx_cpuid_ring[h].xcr0 = g_vmx_guest_xcr0_valid ? g_vmx_guest_xcr0 : 1ull;
+        g_vmx_cpuid_ring[h].xcr0 = real->guest_xcr0_valid ? real->guest_xcr0 : 1ull;
         g_vmx_cpuid_ring[h].rip = vmread(HYPE_VMCS_GUEST_RIP, &ok2);
         g_vmx_cpuid_ring_head = (h + 1u) % HYPE_VMX_CPUID_RING;
         if (g_vmx_cpuid_ring_n < HYPE_VMX_CPUID_RING) { g_vmx_cpuid_ring_n++; }
