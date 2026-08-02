@@ -265,6 +265,53 @@ static void test_leaf1_masks_monitor_mwait(void) {
     }
 }
 
+static void test_leafd_masks_xsaves(void) {
+    /* #252/#269: XSAVES manages SUPERVISOR state through IA32_XSS (0xDA0), and hype
+     * models no such MSR -- guest writes are absorbed. Advertising the instruction
+     * while its control register is dead is the same inconsistency leaf 7 guards
+     * against for the speculation-control bits.
+     *
+     * It also made Linux disagree with itself: kernel_size came from the compacted
+     * path (because XSAVES was advertised) while `size` was computed on the
+     * uncompacted layout, and fpu__init_system_xstate WARNed that 840 != 2696.
+     * Masking the bit removed the WARNING on real Intel hardware. */
+    hype_cpuid_result_t real, out;
+    real.eax = 0xFu; /* XSAVEOPT|XSAVEC|XGETBV1|XSAVES, as the host reports */
+    real.ebx = 0x348u; real.ecx = 0u; real.edx = 0u;
+
+    hype_cpuid_emulate(0xDu, 1u, &real, &out);
+    if ((out.eax & (1u << 3)) != 0u) {
+        printf("FAIL: leaf 0xD sub-leaf 1 must mask XSAVES (EAX bit 3)\n");
+        failures++;
+    }
+    /* XSAVEOPT/XSAVEC/XGETBV1 must survive -- masking has to be surgical, or the
+     * guest loses the compacted XSAVE it legitimately can use. */
+    if ((out.eax & 0x7u) != 0x7u) {
+        printf("FAIL: XSAVEOPT/XSAVEC/XGETBV1 must still pass through, got 0x%x\n", out.eax);
+        failures++;
+    }
+    /* The size fields are untouched -- only the capability bit is masked. */
+    if (out.ebx != 0x348u) {
+        printf("FAIL: sub-leaf 1 EBX must pass through unchanged, got 0x%x\n", out.ebx);
+        failures++;
+    }
+
+    /* Other sub-leaves must be untouched: sub-leaf 0 EAX is the XCR0-supported
+     * feature mask, where bit 3 has an entirely different meaning. */
+    real.eax = 0x207u;
+    hype_cpuid_emulate(0xDu, 0u, &real, &out);
+    if (out.eax != 0x207u) {
+        printf("FAIL: sub-leaf 0 EAX must pass through unmasked, got 0x%x\n", out.eax);
+        failures++;
+    }
+    real.eax = 0x100u;
+    hype_cpuid_emulate(0xDu, 2u, &real, &out);
+    if (out.eax != 0x100u) {
+        printf("FAIL: per-component sub-leaves must pass through, got 0x%x\n", out.eax);
+        failures++;
+    }
+}
+
 int main(void) {
     test_leaf0_vendor_string();
     test_leaf1_forces_hypervisor_bit_and_clears_mtrr();
@@ -284,6 +331,7 @@ int main(void) {
     test_unhandled_extended_leaf_returns_all_zero();
 
     test_leaf1_masks_monitor_mwait();
+    test_leafd_masks_xsaves();
 
     if (failures == 0) {
         printf("all tests passed\n");

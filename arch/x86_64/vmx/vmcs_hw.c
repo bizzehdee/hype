@@ -1064,6 +1064,10 @@ static inline void vmx_real_cpuid(uint32_t eax, uint32_t ecx, hype_cpuid_result_
 static struct {
     uint32_t eax_in, ecx_in, eax, ebx, ecx, edx;
     uint64_t rip;
+    uint64_t xcr0; /* #252: XCR0 IN FORCE for this CPUID -- leaf 0xD EBX depends on it,
+                    * so a reading is meaningless without the context it was taken in.
+                    * Pairing them by eye from the WARNING's registers produced two
+                    * wrong root causes; record it instead of inferring it. */
 } g_vmx_cpuid_ring[HYPE_VMX_CPUID_RING];
 static unsigned g_vmx_cpuid_ring_head = 0;
 static unsigned g_vmx_cpuid_ring_n = 0;
@@ -1117,13 +1121,14 @@ void hype_vmx_vcpu_dump_cpuid_ring(void) {
             (g_vmx_cpuid_ring_head + HYPE_VMX_CPUID_RING - g_vmx_cpuid_ring_n + i) %
             HYPE_VMX_CPUID_RING;
         hype_debug_print("vmx CPUIDRING#%02u: leaf=0x%x sub=0x%x -> eax=0x%x ebx=0x%x ecx=0x%x "
-                         "edx=0x%x rip=0x%llx\n",
+                         "edx=0x%x xcr0=0x%llx rip=0x%llx\n",
                          i, (unsigned int)g_vmx_cpuid_ring[idx].eax_in,
                          (unsigned int)g_vmx_cpuid_ring[idx].ecx_in,
                          (unsigned int)g_vmx_cpuid_ring[idx].eax,
                          (unsigned int)g_vmx_cpuid_ring[idx].ebx,
                          (unsigned int)g_vmx_cpuid_ring[idx].ecx,
                          (unsigned int)g_vmx_cpuid_ring[idx].edx,
+                         (unsigned long long)g_vmx_cpuid_ring[idx].xcr0,
                          (unsigned long long)g_vmx_cpuid_ring[idx].rip);
     }
 }
@@ -1174,6 +1179,7 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
         g_vmx_cpuid_ring[h].ebx = out.ebx;
         g_vmx_cpuid_ring[h].ecx = out.ecx;
         g_vmx_cpuid_ring[h].edx = out.edx;
+        g_vmx_cpuid_ring[h].xcr0 = g_vmx_guest_xcr0_valid ? g_vmx_guest_xcr0 : 1ull;
         g_vmx_cpuid_ring[h].rip = vmread(HYPE_VMCS_GUEST_RIP, &ok2);
         g_vmx_cpuid_ring_head = (h + 1u) % HYPE_VMX_CPUID_RING;
         if (g_vmx_cpuid_ring_n < HYPE_VMX_CPUID_RING) { g_vmx_cpuid_ring_n++; }
