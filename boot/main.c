@@ -1244,6 +1244,19 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
 
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
+/*
+ * #262: a copy of the IDENTIFY DEVICE response from the REAL host disk that the
+ * guest firmware demonstrably accepts (QEMU's ide-hd, which the control run boots
+ * to a Shell prompt). Kept so hype can diff its own synthesised IDENTIFY against a
+ * known-good one word by word.
+ *
+ * This beats reasoning about EDK2's internals, which has already cost this ticket
+ * three wrong hypotheses: same firmware, two disks, one accepted and one rejected,
+ * so the differing words ARE the candidate set. No inference required.
+ */
+static uint8_t g_262_good_id[512];
+static int g_262_good_id_valid = 0;
+
 static hype_pte_t g_npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_npt_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
 static hype_pte_t g_npt_pd[HYPE_NPT_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
@@ -6773,6 +6786,84 @@ vblk_pci:
                               HYPE_VIRTIO_BLK_CFG_SIZE);
 }
 
+/*
+ * #262: diff hype's synthesised IDENTIFY against the REAL disk's, which this same
+ * guest firmware accepts and boots. Called from both SATA-disk attach sites --
+ * they are duplicated, and putting the diff inline in only one of them is exactly
+ * how the first attempt produced no output at all.
+ *
+ * Capacity and identity strings are expected to differ (different disks) and are
+ * skipped; everything else that differs is a candidate for why the firmware takes
+ * one disk and drops the other. This is deliberately a comparison against a
+ * known-good sample rather than more reasoning about EDK2 internals, which has
+ * already cost this ticket three wrong hypotheses.
+ */
+static void fw_1_262_id_diff(hype_ata_disk_t *disk) {
+    static uint8_t mine[HYPE_ATA_IDENTIFY_SIZE];
+    unsigned w, shown = 0, diffs = 0;
+
+    if (!g_262_good_id_valid) {
+        hype_debug_print("fw-1 #262 IDDIFF: no known-good IDENTIFY captured -- no host disk?\n");
+        return;
+    }
+    hype_ata_disk_build_identify(disk, mine);
+#if HYPE_262_USE_ACCEPTED_ID
+    /*
+     * #262 discriminator, not a fix. Serve the REAL disk's IDENTIFY verbatim, with
+     * only our own capacity words patched back in, and see whether the guest
+     * firmware then boots.
+     *
+     * This splits the ticket in one run instead of guessing word by word:
+     *   boots  -> the rejection IS the IDENTIFY content, and the 28-word diff is
+     *             the candidate set to bisect.
+     *   fails  -> IDENTIFY content is NOT the cause, and every hypothesis about
+     *             words 49/53/64/82/106/... is dead. Look at completion signalling,
+     *             PxSIG, or the AHCI port state instead.
+     * Three hypotheses have already been spent on this side of the boundary; this
+     * is the cheapest thing that can rule out the whole class.
+     */
+    {
+        unsigned ci;
+        uint64_t cap = disk->total_sectors;
+        uint32_t cap28 = (cap > 0x0FFFFFFFull) ? 0x0FFFFFFFu : (uint32_t)cap;
+        for (ci = 0; ci < 512u; ci++) {
+            mine[ci] = g_262_good_id[ci];
+        }
+        mine[120] = (uint8_t)(cap28 & 0xFFu);
+        mine[121] = (uint8_t)((cap28 >> 8) & 0xFFu);
+        mine[122] = (uint8_t)((cap28 >> 16) & 0xFFu);
+        mine[123] = (uint8_t)((cap28 >> 24) & 0xFFu);
+        for (ci = 0; ci < 8u; ci++) {
+            mine[200 + ci] = (uint8_t)((cap >> (8u * ci)) & 0xFFu);
+        }
+        hype_ata_disk_set_identify_override(disk, mine);
+        hype_debug_print("fw-1 #262: serving the ACCEPTED IDENTIFY verbatim (capacity patched) "
+                         "-- discriminator run\n");
+    }
+#endif
+    for (w = 0; w < 256u; w++) {
+        unsigned gv =
+            (unsigned)g_262_good_id[w * 2u] | ((unsigned)g_262_good_id[w * 2u + 1u] << 8);
+        unsigned mv = (unsigned)mine[w * 2u] | ((unsigned)mine[w * 2u + 1u] << 8);
+        if (gv == mv) {
+            continue;
+        }
+        if ((w >= 10u && w <= 19u) || (w >= 23u && w <= 46u) || w == 57u || w == 58u || w == 60u ||
+            w == 61u || (w >= 100u && w <= 103u)) {
+            continue;
+        }
+        diffs++;
+        if (shown < 28u) {
+            shown++;
+            /* No width specifiers: hype_debug_print does not implement them, and
+             * "%-3u" printed literally -- which silently shifted every value one
+             * vararg left, so the word number appeared under "accepted=". */
+            hype_debug_print("fw-1 #262 IDDIFF w%u: accepted=0x%04x hype=0x%04x\n", w, gv, mv);
+        }
+    }
+    hype_debug_print("fw-1 #262 IDDIFF: %u differing word(s) outside id/capacity fields\n", diffs);
+}
+
 static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base = 0x100000000ULL - 0x10000ULL; /* 0xFFFF0000 */
     uint64_t reset_rip = 0xFFF0ULL;
@@ -6842,6 +6933,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     hype_debug_print("fw-1: #262 SATA disk attached -- %llu sectors (%llu MiB)\n",
                      (unsigned long long)g_fw_1_ata_disk.total_sectors,
                      (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
+    fw_1_262_id_diff(&g_fw_1_ata_disk);
     if (vm->iso_stream_ready) {
         hype_atapi_reset_stream(&g_fw_1_atapi, &vm->iso_stream);
     } else {
@@ -6981,6 +7073,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_debug_print("fw-1: #262 SATA disk attached -- %llu sectors (%llu MiB)\n",
                      (unsigned long long)g_fw_1_ata_disk.total_sectors,
                      (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
+    fw_1_262_id_diff(&g_fw_1_ata_disk);
     /* GLADDER-10: prefer the streaming backing (ISO served on demand from its raw
      * disk partition) when one was found + verified post-EBS; otherwise fall back
      * to the RAM-chunked copy (GLADDER-10a). */
@@ -12015,6 +12108,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         uint8_t guid[16];
                         int have_guid = 0;
                         hype_ahci_host_parse_identify(g_hostdisk_id, &di);
+                        { /* #262: keep the accepted-by-firmware IDENTIFY for diffing */
+                            unsigned ci;
+                            for (ci = 0; ci < 512u; ci++) {
+                                g_262_good_id[ci] = g_hostdisk_id[ci];
+                            }
+                            g_262_good_id_valid = 1;
+                        }
                         /* #229 SATA repro: record presence + capacity so this disk
                          * can be attached as a read-only guest vda. */
                         g_hostdisk_present = 1;

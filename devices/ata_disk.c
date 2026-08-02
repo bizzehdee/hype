@@ -5,6 +5,8 @@ void hype_ata_disk_reset(hype_ata_disk_t *disk, uint8_t *media, uint64_t media_b
     disk->be = 0;
     disk->media_bytes = media_bytes;
     disk->total_sectors = media_bytes / HYPE_ATA_SECTOR_SIZE;
+    /* A reset disk must not inherit a previous one's IDENTIFY override (#262). */
+    disk->identify_override = 0;
 }
 
 /* ATA convention: each word's first character lands in the high byte,
@@ -32,6 +34,16 @@ void hype_ata_disk_build_identify(const hype_ata_disk_t *disk, uint8_t out[HYPE_
     uint32_t i;
     uint32_t lba28_capacity;
     uint64_t lba48_capacity;
+
+    /* #262 discriminator: serve a captured real-disk response verbatim when one has
+     * been installed, so "the firmware rejects our IDENTIFY content" can be tested
+     * rather than argued about. Never set in a normal build. */
+    if (disk->identify_override != 0) {
+        for (i = 0; i < HYPE_ATA_IDENTIFY_SIZE; i++) {
+            out[i] = disk->identify_override[i];
+        }
+        return;
+    }
 
     for (i = 0; i < HYPE_ATA_IDENTIFY_SIZE; i++) {
         out[i] = 0;
@@ -137,6 +149,10 @@ int hype_ata_cmd_is_lba48(uint8_t command) {
 
 int hype_ata_disk_range_in_bounds(const hype_ata_disk_t *disk, uint64_t lba, uint32_t sector_count) {
     return (lba + (uint64_t)sector_count) <= disk->total_sectors;
+}
+
+void hype_ata_disk_set_identify_override(hype_ata_disk_t *disk, const uint8_t *id) {
+    disk->identify_override = id;
 }
 
 void hype_ata_disk_set_backend(hype_ata_disk_t *disk, hype_blk_backend_t *be) {

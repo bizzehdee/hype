@@ -58,6 +58,7 @@
 typedef struct {
     uint8_t *media;
     hype_blk_backend_t *be; /* #262: when set, storage comes from here, not `media` */
+    const uint8_t *identify_override; /* #262 discriminator; 0 = synthesise normally */
     uint64_t media_bytes;
     uint64_t total_sectors; /* media_bytes / HYPE_ATA_SECTOR_SIZE */
 } hype_ata_disk_t;
@@ -84,6 +85,16 @@ void hype_ata_disk_reset(hype_ata_disk_t *disk, uint8_t *media, uint64_t media_b
  * microtest (a fixed RAM buffer) is untouched.
  */
 void hype_ata_disk_set_backend(hype_ata_disk_t *disk, hype_blk_backend_t *be);
+
+/*
+ * #262 discriminator hook: serve `id` (512 bytes) verbatim as this disk's IDENTIFY
+ * DEVICE response instead of the synthesised one. Exists to answer one question --
+ * is the guest firmware rejecting the disk because of the IDENTIFY CONTENT, or for
+ * some other reason -- by handing it a response a real disk gave and the same
+ * firmware demonstrably accepted. Pass 0 to go back to the synthesised response.
+ * Not a production path: nothing sets this unless HYPE_262_USE_ACCEPTED_ID is on.
+ */
+void hype_ata_disk_set_identify_override(hype_ata_disk_t *disk, const uint8_t *id);
 
 /*
  * Convert a PRD's byte range within a transfer into whole sectors.

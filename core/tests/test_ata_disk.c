@@ -302,6 +302,44 @@ static void test_identify_declares_version_and_dma(void) {
     }
 }
 
+static void test_identify_override(void) {
+    hype_ata_disk_t d;
+    uint8_t forced[HYPE_ATA_IDENTIFY_SIZE];
+    uint8_t out[HYPE_ATA_IDENTIFY_SIZE];
+    unsigned i;
+
+    for (i = 0; i < HYPE_ATA_IDENTIFY_SIZE; i++) {
+        forced[i] = (uint8_t)(i & 0xFFu);
+    }
+    hype_ata_disk_reset(&d, 0, 1024ull * 512ull);
+
+    /* #262 discriminator hook: an installed override is served byte-for-byte, so a
+     * captured real-disk response can be tested against the guest firmware without
+     * the synthesiser altering it -- which would defeat the entire point. */
+    hype_ata_disk_set_identify_override(&d, forced);
+    hype_ata_disk_build_identify(&d, out);
+    for (i = 0; i < HYPE_ATA_IDENTIFY_SIZE; i++) {
+        if (out[i] != forced[i]) {
+            printf("FAIL: override byte %u: expected 0x%02x, got 0x%02x\n", i, forced[i], out[i]);
+            failures++;
+            break;
+        }
+    }
+
+    /* Clearing it returns to the synthesised response (word 0 = 0x0040, fixed ATA
+     * disk) rather than leaving the stale pointer live. */
+    hype_ata_disk_set_identify_override(&d, 0);
+    hype_ata_disk_build_identify(&d, out);
+    CHECK_HEX("override cleared -> synthesised word 0", 0x40u, out[0]);
+
+    /* reset() must drop it too: a recycled disk serving a previous disk's IDENTIFY
+     * would report someone else's geometry and capacity. */
+    hype_ata_disk_set_identify_override(&d, forced);
+    hype_ata_disk_reset(&d, 0, 1024ull * 512ull);
+    hype_ata_disk_build_identify(&d, out);
+    CHECK_HEX("reset drops the override", 0x40u, out[0]);
+}
+
 int main(void) {
     test_prd_sector_range();
     test_set_backend();
@@ -316,6 +354,7 @@ int main(void) {
     test_resolve_sector_count28();
     test_cmd_is_lba48();
     test_identify_declares_version_and_dma();
+    test_identify_override();
 
     if (failures == 0) {
         printf("all tests passed\n");
