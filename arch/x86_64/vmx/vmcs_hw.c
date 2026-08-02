@@ -179,9 +179,21 @@ static const uint32_t g_vmx_msr_list[] = {
 };
 #define HYPE_VMX_MSR_AREA_COUNT (sizeof(g_vmx_msr_list) / sizeof(g_vmx_msr_list[0]))
 
-static hype_vmx_msr_entry_t g_vmx_msr_guest[HYPE_VMX_MSR_AREA_COUNT]
+/*
+ * #276: PER vCPU SLOT, not one global pair.
+ *
+ * These were single arrays whose addresses went into every VMCS, so two
+ * concurrent guests shared one MSR-load/store area. Guest A's exit STORED its
+ * IA32_KERNEL_GS_BASE here and guest B's entry then LOADED it, resuming B on
+ * A's per-CPU base; the first swapgs-dependent entry dereferenced another
+ * guest's per-CPU data, faulted on the entry stack, and double-faulted. Both
+ * Intel guests died that way just after /init, when userspace starts issuing
+ * syscalls. Indexed exactly like g_vmcs_pool/g_vmx_ctx_pool (#271) -- pooling
+ * the VMCS is not enough on its own if what the VMCS POINTS AT stays shared.
+ */
+static hype_vmx_msr_entry_t g_vmx_msr_guest[HYPE_VMX_MAX_VCPUS][HYPE_VMX_MSR_AREA_COUNT]
     __attribute__((aligned(16)));
-static hype_vmx_msr_entry_t g_vmx_msr_host[HYPE_VMX_MSR_AREA_COUNT]
+static hype_vmx_msr_entry_t g_vmx_msr_host[HYPE_VMX_MAX_VCPUS][HYPE_VMX_MSR_AREA_COUNT]
     __attribute__((aligned(16)));
 
 /* Index into g_vmx_msr_guest for `msr`, or -1. Used by the RDMSR/WRMSR handler so
@@ -295,6 +307,19 @@ static unsigned vmx_alloc_slot(void) {
  */
 void hype_vmx_vcpu_pool_reset(void) {
     __atomic_store_n(&g_vmx_vcpu_count, 0u, __ATOMIC_SEQ_CST);
+}
+
+/*
+ * #276: which pool slot a ctx came from, so the MSR handler reaches THIS guest's
+ * MSR area rather than a fixed one. The ctx is always &g_vmx_ctx_pool[slot], so
+ * the index is recoverable by pointer arithmetic; anything outside the pool
+ * (never expected) falls back to slot 0 rather than indexing out of bounds.
+ */
+static unsigned vmx_ctx_slot(const struct hype_vcpu_ctx *ctx) {
+    if (ctx >= &g_vmx_ctx_pool[0] && ctx < &g_vmx_ctx_pool[HYPE_VMX_MAX_VCPUS]) {
+        return (unsigned)(ctx - &g_vmx_ctx_pool[0]);
+    }
+    return 0;
 }
 
 /* Clear the per-entry pending state a fresh vCPU must not inherit. */
@@ -521,8 +546,12 @@ static int write_realmode_guest_segment(uint32_t selector_field, uint32_t base_f
  */
 static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp,
                               int long_mode, uint64_t guest_cr3, uint8_t *vmcs_region,
-                              uint16_t vpid) {
+                              unsigned slot) {
     int rc = 0;
+    /* #276: ONE index drives every per-guest resource -- VMCS region, MSR areas,
+     * VPID. Deriving them separately is how the MSR areas stayed shared while the
+     * VMCS pool looked done. */
+    uint16_t vpid = hype_vmx_vpid_for_slot(slot, HYPE_VMX_MAX_VCPUS);
     /* #271: the region is passed in, not taken from a "current slot" global -- two
      * APs can be building their own vCPUs at the same time, and a shared global
      * would be the very race this pool exists to remove. VMPTRLD makes it current
@@ -798,21 +827,21 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     {
         unsigned i;
         for (i = 0; i < HYPE_VMX_MSR_AREA_COUNT; i++) {
-            g_vmx_msr_host[i].index = g_vmx_msr_list[i];
-            g_vmx_msr_host[i].reserved = 0;
-            g_vmx_msr_host[i].value = rdmsr(g_vmx_msr_list[i]);
-            g_vmx_msr_guest[i].index = g_vmx_msr_list[i];
-            g_vmx_msr_guest[i].reserved = 0;
-            g_vmx_msr_guest[i].value = 0;
+            g_vmx_msr_host[slot][i].index = g_vmx_msr_list[i];
+            g_vmx_msr_host[slot][i].reserved = 0;
+            g_vmx_msr_host[slot][i].value = rdmsr(g_vmx_msr_list[i]);
+            g_vmx_msr_guest[slot][i].index = g_vmx_msr_list[i];
+            g_vmx_msr_guest[slot][i].reserved = 0;
+            g_vmx_msr_guest[slot][i].value = 0;
         }
     }
-    rc |= vmwrite(HYPE_VMCS_VM_ENTRY_MSR_LOAD_ADDR, (uint64_t)(uintptr_t)g_vmx_msr_guest);
+    rc |= vmwrite(HYPE_VMCS_VM_ENTRY_MSR_LOAD_ADDR, (uint64_t)(uintptr_t)g_vmx_msr_guest[slot]);
     rc |= vmwrite(HYPE_VMCS_VM_ENTRY_MSR_LOAD_COUNT, (uint64_t)HYPE_VMX_MSR_AREA_COUNT);
     /* Same area as the entry list on purpose -- see the declaration: this is what
      * lets a SWAPGS-driven change survive, since that instruction never exits. */
-    rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_STORE_ADDR, (uint64_t)(uintptr_t)g_vmx_msr_guest);
+    rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_STORE_ADDR, (uint64_t)(uintptr_t)g_vmx_msr_guest[slot]);
     rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_STORE_COUNT, (uint64_t)HYPE_VMX_MSR_AREA_COUNT);
-    rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_LOAD_ADDR, (uint64_t)(uintptr_t)g_vmx_msr_host);
+    rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_LOAD_ADDR, (uint64_t)(uintptr_t)g_vmx_msr_host[slot]);
     rc |= vmwrite(HYPE_VMCS_VM_EXIT_MSR_LOAD_COUNT, (uint64_t)HYPE_VMX_MSR_AREA_COUNT);
     /*
      * #248: the host must OWN the fixed bits, not merely set them once here.
@@ -917,13 +946,13 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
 /* Public builders: real-mode guest at cs_base:rip; flat 64-bit guest at linear
  * entry_rip with paging root guest_cr3. Both take a prebuilt EPT pointer. */
 int hype_vmx_vmcs_build_guest(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp,
-                              uint8_t *vmcs_region, uint16_t vpid) {
-    return build_guest_common(cs_base, rip, stack_phys, eptp, 0, 0, vmcs_region, vpid);
+                              uint8_t *vmcs_region, unsigned slot) {
+    return build_guest_common(cs_base, rip, stack_phys, eptp, 0, 0, vmcs_region, slot);
 }
 
 int hype_vmx_vmcs_build_long_mode_guest(uint64_t entry_rip, uint64_t guest_cr3, uint64_t stack_phys,
-                                        uint64_t eptp, uint8_t *vmcs_region, uint16_t vpid) {
-    return build_guest_common(0, entry_rip, stack_phys, eptp, 1, guest_cr3, vmcs_region, vpid);
+                                        uint64_t eptp, uint8_t *vmcs_region, unsigned slot) {
+    return build_guest_common(0, entry_rip, stack_phys, eptp, 1, guest_cr3, vmcs_region, slot);
 }
 
 /*
@@ -992,8 +1021,7 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
 
     /* cs_base = guest_rip, rip = 0: the guest starts executing at physical
      * guest_rip in real mode (CS.base:IP = guest_rip:0). */
-    if (hype_vmx_vmcs_build_guest(guest_rip, 0, guest_rsp, eptp, g_vmcs_pool[slot],
-                                  hype_vmx_vpid_for_slot(slot, HYPE_VMX_MAX_VCPUS)) != 0) {
+    if (hype_vmx_vmcs_build_guest(guest_rip, 0, guest_rsp, eptp, g_vmcs_pool[slot], slot) != 0) {
         return 0;
     }
 
@@ -1030,8 +1058,7 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
     eptp = hype_vmx_make_eptp((uint64_t)(uintptr_t)g_ept_pml4);
 
     if (hype_vmx_vmcs_build_long_mode_guest(entry_rip, guest_cr3, guest_rsp, eptp,
-                                            g_vmcs_pool[slot],
-                                            hype_vmx_vpid_for_slot(slot, HYPE_VMX_MAX_VCPUS)) != 0) {
+                                            g_vmcs_pool[slot], slot) != 0) {
         return 0;
     }
 
@@ -1348,11 +1375,13 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
      * held something else.
      */
     if (area_slot >= 0) {
+        /* #276: this guest's area, not a shared one. */
+        hype_vmx_msr_entry_t *area = g_vmx_msr_guest[vmx_ctx_slot(real)];
         if (is_write) {
-            g_vmx_msr_guest[area_slot].value =
+            area[area_slot].value =
                 ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
         } else {
-            uint64_t v = g_vmx_msr_guest[area_slot].value;
+            uint64_t v = area[area_slot].value;
             real->gprs[0] = (uint64_t)(uint32_t)v;
             real->gprs[2] = (uint64_t)(uint32_t)(v >> 32);
         }
