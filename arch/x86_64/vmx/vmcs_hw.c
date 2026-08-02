@@ -1142,8 +1142,18 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
      * cross-checks that size and dies when it disagrees. Load the guest's XCR0 for
      * the duration of this one CPUID so the answer describes the guest.
      */
-    if (eax_in == 0xDu && g_vmx_guest_xcr0_valid && g_vmx_host_xcr0 != 0ull) {
-        xsetbv0(g_vmx_guest_xcr0);
+    /*
+     * #252: ...but the swap must ALSO happen before the guest's first XSETBV. It used
+     * to be gated on g_vmx_guest_xcr0_valid, so until then hype read the leaf under
+     * the HOST's live XCR0 and handed the guest a size describing the host. The
+     * guest's XCR0 before its first XSETBV is not "whatever the host has" -- it is
+     * the architectural reset value, 1 (x87 only). Linux reads this leaf during
+     * fpu__init_system_xstate BEFORE enabling anything, so that early read is exactly
+     * the one that was wrong.
+     */
+    if (eax_in == 0xDu && g_vmx_host_xcr0 != 0ull) {
+        uint64_t guest_xcr0 = g_vmx_guest_xcr0_valid ? g_vmx_guest_xcr0 : 1ull;
+        xsetbv0(guest_xcr0);
         vmx_real_cpuid(eax_in, ecx_in, &host_real);
         xsetbv0(g_vmx_host_xcr0);
     } else {
