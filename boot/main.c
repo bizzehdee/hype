@@ -7143,7 +7143,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * one backend and forgotten on the other; the unused set costs 24KB of BSS
      * and no runtime work.
      */
-#if 0 /* BISECT: EPT build disabled */
+    /*
+     * #272: re-enabled. eab9570's incremental re-land left this whole block behind
+     * an "#if 0 -- BISECT: EPT build disabled" guard and never restored it, so on
+     * VMX npt_root_phys stayed at vm->npt_pml4 and hype handed an NPT table to
+     * VMPTRLD as an EPT root.
+     *
+     * It appeared to work because the permission bits coincide: an NPT entry with
+     * present|RW|US set is 0b111, which an EPT walker reads as read|write|execute.
+     * What does NOT coincide is the EPT memory type (bits 5:3), which stays 0 --
+     * uncacheable. That is the same trap PERF-1 hit on AMD, where an all-UC guest
+     * turned a 15-second boot into five minutes.
+     */
     hype_ept_build_identity(vm->ept_pml4, vm->ept_pdpt, vm->ept_pd, HYPE_FW_1_NPT_GB);
     hype_ept_map_range(vm->ept_pd, 0, g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
     hype_ept_map_range(vm->ept_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
@@ -7153,7 +7164,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     if (g_fw_1_kind == HYPE_VMM_KIND_VMX) {
         npt_root_phys = (uint64_t)(uintptr_t)vm->ept_pml4;
     }
-#endif
 
     /* VALID-1/VALID-3: the guest-physical -> host map, mirroring the two
      * hype_npt_map_range() calls above exactly. The AHCI DMA path
