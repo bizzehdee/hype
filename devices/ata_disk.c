@@ -71,6 +71,23 @@ void hype_ata_disk_build_identify(const hype_ata_disk_t *disk, uint8_t out[HYPE_
     out[12] = 0x3Fu;  out[13] = 0x00u;  /* word 6  = 63 sectors/track */
     out[98] = 0x00u;  out[99] = 0x0Fu;  /* word 49 = 0x0F00 */
     out[106] = 0x06u; out[107] = 0x00u; /* word 53 = 0x0006 */
+    /*
+     * #262 slice 4: word 53 bit 1 above declares "words 64-70 are valid", so word 64
+     * (advanced PIO modes) MUST actually say something. Leaving it zero while claiming
+     * validity is self-contradictory, and it is what silently lost the disk: EDK2's
+     * AhciModeInitialization calls IdeInit->CalculateMode -> CalculateBestPioMode,
+     * which reads word 64, finds no supported mode, and fails -- so the driver drops
+     * the device right after IDENTIFY without issuing SET FEATURES, a read, or even a
+     * retry. Confirmed by diffing against a DEBUG-OVMF trace of QEMU's own disk, which
+     * logs "CalculateBestPioMode: AdvancedPioMode = 3" and proceeds.
+     * Values match what QEMU's IDE model reports, i.e. what OVMF is known to accept.
+     */
+    out[102] = 0x00u; out[103] = 0x02u; /* word 51 = 0x0200, PIO mode 2 timing */
+    out[128] = 0x03u; out[129] = 0x00u; /* word 64 = 0x0003, PIO modes 3 and 4 */
+    out[130] = 0x78u; out[131] = 0x00u; /* word 65 = 120ns min MWDMA cycle */
+    out[132] = 0x78u; out[133] = 0x00u; /* word 66 = 120ns recommended MWDMA cycle */
+    out[134] = 0x78u; out[135] = 0x00u; /* word 67 = 120ns min PIO cycle */
+    out[136] = 0x78u; out[137] = 0x00u; /* word 68 = 120ns min PIO cycle w/ IORDY */
     out[126] = 0x07u; out[127] = 0x00u; /* word 63 = 0x0007 */
     out[160] = 0xF0u; out[161] = 0x01u; /* word 80 = 0x01F0 */
     out[176] = 0x3Fu; out[177] = 0x20u; /* word 88 = 0x203F */
@@ -82,13 +99,15 @@ void hype_ata_disk_build_identify(const hype_ata_disk_t *disk, uint8_t out[HYPE_
     out[122] = (uint8_t)((lba28_capacity >> 16) & 0xFFu);
     out[123] = (uint8_t)((lba28_capacity >> 24) & 0xFFu);
 
-    /* Word 83: 48-bit Address feature set supported (bit 10 = 0x0400)
-     * plus the words-82-84 validity marker (bit 14 set, bit 15
-     * clear) -- combined 0x4400. */
+    /* Word 83 = 0x7400: 48-bit Address (bit 10), FLUSH CACHE (bit 12) and FLUSH
+     * CACHE EXT (bit 13) supported, plus the words-82-84 validity marker (bit 14
+     * set, bit 15 clear). The two cache bits are truthful -- the AHCI disk glue
+     * models 0xE7 and 0xEA -- and match what QEMU's disk reports to the same
+     * firmware. Word 86 = 0x3400 mirrors them as ENABLED. */
     out[166] = 0x00u;
-    out[167] = 0x44u;
-    out[172] = 0x00u; /* word 86: 48-bit Address feature set enabled (bit 10) */
-    out[173] = 0x04u;
+    out[167] = 0x74u;
+    out[172] = 0x00u;
+    out[173] = 0x34u;
 
     lba48_capacity = disk->total_sectors;
     for (i = 0; i < 8u; i++) { /* words 100-103: 48-bit LBA capacity, 64-bit LE */

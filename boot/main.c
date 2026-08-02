@@ -6009,6 +6009,54 @@ static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_fil
     return emitted;
 }
 
+/*
+ * A DEBUG OVMF emits ~8 MB of trace. Echoing all of it costs an intercepted I/O
+ * write per byte AND a host serial line per line, which at 115200 baud takes many
+ * minutes -- long enough that the guest looks hung (it is not; it is crawling).
+ * HYPE_FW1_OVMF_DBG_KEYS narrows the forwarded lines to the subsystem under
+ * investigation, which is what makes a DEBUG firmware usable under hype at all.
+ * Empty (the default) forwards everything, preserving FW-1g's behaviour.
+ */
+#ifndef HYPE_FW1_OVMF_DBG_KEYS
+#define HYPE_FW1_OVMF_DBG_KEYS ""
+#endif
+static int fw_1_line_contains(const char *hay, const char *needle) {
+    unsigned i, j;
+    for (i = 0; hay[i] != '\0'; i++) {
+        for (j = 0; needle[j] != '\0' && hay[i + j] == needle[j]; j++) {
+        }
+        if (needle[j] == '\0') {
+            return 1;
+        }
+    }
+    return 0;
+}
+/* `keys` is a comma-separated substring list; a line is kept if it contains any. */
+static int fw_1_debug_line_wanted(const char *line) {
+    static const char keys[] = HYPE_FW1_OVMF_DBG_KEYS;
+    char one[32];
+    unsigned k = 0, n = 0;
+    if (keys[0] == '\0') {
+        return 1;
+    }
+    for (k = 0;; k++) {
+        if (keys[k] == ',' || keys[k] == '\0') {
+            one[n] = '\0';
+            if (n > 0 && fw_1_line_contains(line, one)) {
+                return 1;
+            }
+            n = 0;
+            if (keys[k] == '\0') {
+                return 0;
+            }
+            continue;
+        }
+        if (n < sizeof(one) - 1) {
+            one[n++] = keys[k];
+        }
+    }
+}
+
 /* FW-1g: feed one byte of the guest's OVMF debug-io-port (0x402) log to
  * hype's console, a line at a time, tagged so it's distinguishable from
  * the guest's ConOut console and hype's own output. Debug text is plain
@@ -6021,7 +6069,9 @@ static void fw_1_debug_feed(hype_vt_filter_t *filter, char *line, unsigned int *
     }
     if (c == '\n') {
         line[*line_len] = '\0';
-        hype_debug_print("fw-1 ovmf-dbg| %s\n", line);
+        if (fw_1_debug_line_wanted(line)) {
+            hype_debug_print("fw-1 ovmf-dbg| %s\n", line);
+        }
         *line_len = 0;
         return;
     }
