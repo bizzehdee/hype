@@ -91,25 +91,28 @@ last five fixes came from reading guest oopses, not from reasoning about VMX.
 3. Read the log for the next kernel oops / hype panic and fix that. Repeat.
 4. `mv` the original `test.iso` back when done.
 
-- [~] **A1. The xstate.c:332 WARNING — ROOT CAUSE CONFIRMED 2026-08-02 (#252).** hype's
-  own CPUID ring shows leaf 0xD returning DIFFERENT values on two consecutive passes:
-  sub-leaf 0 EBX goes 0x240 -> 0xa88 and sub-leaf 1 EBX goes 0x240 -> 0x348, while the
-  static per-component sub-leaves (2, 9) are identical both times. Those two are exactly
-  the XCR0-dependent fields in leaf 0xD.
+- [~] **A1. The xstate.c:332 WARNING.** Full text captured 2026-08-02 (#252): the guest
+  enables 0x207 (x87+SSE+AVX+PKRU), computes a context size of 840, and the WARNING's
+  registers carry `R12=R14=0x348` (840) and `R15=0xa88` (2696).
 
-  Cause: `cpuid_emulate.c` passes ALL of leaf 0xD through from the host, but sub-leaf 0
-  EBX ("size of the XSAVE area for states enabled in XCR0") and sub-leaf 1 EBX are read
-  under whatever XCR0 is loaded at that instant. On VMX hype swaps XCR0 only after the
-  guest's first XSETBV, so the two passes straddle the transition. The guest asks the
-  same question twice and gets two answers -- CPUID stops being a pure function of
-  (leaf, sub-leaf, guest XCR0). The WARNING's R12/R14=0x348 and R15=0xa88 are those two
-  readings.
+  **CAUSE STILL UNIDENTIFIED.** A "confirmed root cause" was posted on #252 and then
+  retracted -- it claimed leaf 0xD EBX changing across two CPUID passes was the defect.
+  It is not: EBX is defined as the XSAVE size for the states enabled in XCR0, the guest
+  ran XSETBV between the passes, and BOTH readings are arithmetically correct
+  (uncompacted 2688+8 = 2696; compacted 576+256+8 = 840). hype returns correct leaf 0xD
+  values, and `vmcs_hw.c` ALREADY loads the guest's XCR0 for the duration of a leaf 0xD
+  CPUID. Do not re-derive that theory.
 
-  Fix shape: derive both XCR0-dependent fields from the GUEST's XCR0 (VMX already tracks
-  `g_vmx_guest_xcr0`; architectural reset value is 1 before the first XSETBV) by summing
-  per-component sizes for the enabled bits. Leave the rest of leaf 0xD passthrough.
-  CHECK SVM TOO: the leaf 0xD code is shared and SVM does not intercept XSETBV at all,
-  so host/guest XCR0 can diverge there as well. Validate on both vendors.
+  Next step: read Linux 6.12 `arch/x86/kernel/fpu/xstate.c` near line 332 and identify
+  which two quantities it actually compares. Do not infer it from register values --
+  four wrong calls in one session came from reasoning about kernel/firmware internals
+  from memory instead of reading the source.
+
+  Separately (small, real, not the cause): the guest-XCR0 swap for leaf 0xD is gated on
+  `g_vmx_guest_xcr0_valid`, set only after the guest's FIRST XSETBV. Before that hype
+  reads the leaf under the HOST's live XCR0 rather than the guest's architectural reset
+  value of 1. Harmless in this trace but not correct by construction.
+
 - [ ] **A2. Whatever the guest hits next**, following the resume loop above. It was still
   running at 0.420s when the capture ended, so the next fault is unobserved -- there may
   be none at all until userspace.
