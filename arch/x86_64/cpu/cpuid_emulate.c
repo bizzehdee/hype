@@ -4,6 +4,7 @@
 #define HYPE_CPUID_LEAF1_EDX_MTRR_BIT (1u << 12)
 #define HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT (1u << 24)
 #define HYPE_CPUID_LEAF1_ECX_X2APIC_BIT (1u << 21)
+#define HYPE_CPUID_LEAF1_ECX_MONITOR_BIT (1u << 3)
 /* Highest basic leaf hype exposes. Must reach leaf 0xD (XSAVE state-component
  * enumeration) so the guest sees a COHERENT instruction-capability picture:
  * leaf 1 ECX passes the host's XSAVE(26)/OSXSAVE(27)/AVX(28)/FMA(12)/F16C(29)
@@ -98,11 +99,22 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
         /* ECX passes the host's instruction-capability bits straight through
          * (SSE/AVX/XSAVE/OSXSAVE/FMA/AES/...), so the guest sees the real CPU's
          * feature set -- coherently, because leaf 7 and leaf 0xD are exposed too
-         * (see HYPE_CPUID_MAX_BASIC_LEAF). Only the two bits tied to hype's own
+         * (see HYPE_CPUID_MAX_BASIC_LEAF). Only the bits tied to hype's own
          * unmodeled paths are forced off: TSC_DEADLINE (24, no MSR-armed LAPIC
-         * timer) and X2APIC (21, MMIO-LAPIC-only). Hypervisor-present (31) set. */
+         * timer), X2APIC (21, MMIO-LAPIC-only), and MONITOR (3).
+         * Hypervisor-present (31) set.
+         *
+         * #256: MONITOR/MWAIT must be masked. hype intercepts neither instruction,
+         * and an un-intercepted MWAIT never exits -- so passing the host's bit
+         * through let Linux pick MWAIT for its idle loop and the guest NEVER executed
+         * HLT (hlt=0 across 655k exits). hype then had no idle signal at all, which
+         * is why the dashboard's CPU%, derived from HLT-wait time, sat pinned at
+         * exactly 100% for an idle guest (#264). Masking the bit is what any
+         * hypervisor that does not emulate MONITOR/MWAIT does; Linux falls back to
+         * HLT idle, which hype already models. */
         out->ecx = (real->ecx | HYPE_CPUID_HYPERVISOR_PRESENT_BIT) &
-                   ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT & ~HYPE_CPUID_LEAF1_ECX_X2APIC_BIT;
+                   ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT & ~HYPE_CPUID_LEAF1_ECX_X2APIC_BIT &
+                   ~HYPE_CPUID_LEAF1_ECX_MONITOR_BIT;
         return;
     }
 

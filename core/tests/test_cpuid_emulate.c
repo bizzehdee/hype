@@ -45,9 +45,10 @@ static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
     CHECK_HEX("OSXSAVE bit passthrough", 1, (out.ecx & (1u << 27)) != 0);
     CHECK_HEX("AVX bit passthrough", 1, (out.ecx & (1u << 28)) != 0);
     CHECK_HEX("F16C bit passthrough", 1, (out.ecx & (1u << 29)) != 0);
-    /* ecx = real | hypervisor-present, minus only TSC_DEADLINE and X2APIC. */
+    /* ecx = real | hypervisor-present, minus TSC_DEADLINE, X2APIC and MONITOR (#256:
+     * an un-intercepted MWAIT never exits, so the guest must not be offered it). */
     CHECK_HEX("ecx otherwise passthrough",
-              (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21), out.ecx);
+              (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21) & ~(1u << 3), out.ecx);
     CHECK_HEX("MTRR bit forced clear", 0, (out.edx & (1u << 12)) != 0);
     CHECK_HEX("edx otherwise passthrough", real.edx & ~(1u << 12), out.edx);
 }
@@ -234,6 +235,36 @@ static void test_unhandled_extended_leaf_returns_all_zero(void) {
     CHECK_HEX("edx", 0, out.edx);
 }
 
+static void test_leaf1_masks_monitor_mwait(void) {
+    /* #256: hype does not intercept MONITOR/MWAIT, and an un-intercepted MWAIT never
+     * exits -- so a guest that picks MWAIT for its idle loop never yields and hype
+     * gets no idle signal at all (hlt=0 across 655k exits). Mask the bit so Linux
+     * falls back to HLT idle, which hype does model. */
+    hype_cpuid_result_t real, out;
+    real.eax = 0; real.ebx = 0; real.edx = 0;
+    real.ecx = 0xFFFFFFFFu; /* a host advertising everything, MONITOR included */
+    hype_cpuid_emulate(1u, 0u, &real, &out);
+    if ((out.ecx & (1u << 3)) != 0u) {
+        printf("FAIL: leaf 1 ECX MONITOR (bit 3) must be masked\n");
+        failures++;
+    }
+    /* The neighbours it sits with must stay masked too, and hypervisor-present set. */
+    if ((out.ecx & (1u << 24)) != 0u || (out.ecx & (1u << 21)) != 0u) {
+        printf("FAIL: TSC_DEADLINE and X2APIC must stay masked\n");
+        failures++;
+    }
+    if ((out.ecx & (1u << 31)) == 0u) {
+        printf("FAIL: hypervisor-present (bit 31) must be set\n");
+        failures++;
+    }
+    /* Everything else still passes through -- masking must be surgical, not a
+     * wholesale clear that would cost the guest SSE/AVX/XSAVE. */
+    if ((out.ecx & (1u << 0)) == 0u || (out.ecx & (1u << 26)) == 0u) {
+        printf("FAIL: unrelated ECX feature bits must still pass through\n");
+        failures++;
+    }
+}
+
 int main(void) {
     test_leaf0_vendor_string();
     test_leaf1_forces_hypervisor_bit_and_clears_mtrr();
@@ -251,6 +282,8 @@ int main(void) {
     test_kvm_features_leaf_advertises_only_pvclock();
     test_unhandled_leaf_returns_all_zero();
     test_unhandled_extended_leaf_returns_all_zero();
+
+    test_leaf1_masks_monitor_mwait();
 
     if (failures == 0) {
         printf("all tests passed\n");
