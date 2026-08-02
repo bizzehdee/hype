@@ -76,6 +76,26 @@ fault:
 - `test.iso` in the bisect dir is the STANDARD image; swap deliberately and `mv` it back
   (it has ~47 hard links, so never overwrite in place).
 
+
+## B. Two-VM Intel (#245) — split into probeable slices
+
+Single-VM Intel is done (A1-A4). Two concurrent Intel guests need three separate fixes,
+now tracked as native sub-issues of #245 so the board's blocked-by gate can read them:
+
+  #271  pool the vCPU ctx + VMCS region      (startable; loud on exhaustion, per #237)
+  #272  per-VM EPT roots                     (startable; THIS is the isolation guarantee)
+  #273  distinct VPID per guest              (blocked by #272 -- nothing to separate before)
+  #274  two isolated guests, both at login   (blocked by #271, #272, #273)
+
+#271 and #272 are independent of each other and deliberately NOT linked; inventing a
+dependency would make the board claim work is gated when it is not.
+
+Do not attempt these as one change. A one-shot 68-hunk VMX-4 change stalled the AMD guest
+and never bisected -- probe each slice separately, on BOTH vendors.
+
+#244 is the SVM ASID twin of #273 (same mistake, other dialect). Siblings, not a
+dependency.
+
 ## A. #236 / #251 — finish the live guest on Intel  [BLOCKED: needs the box]
 
 Everything below is observation-driven. Do not attempt any of it without hardware; the
