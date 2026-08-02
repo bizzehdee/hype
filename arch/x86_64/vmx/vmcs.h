@@ -52,12 +52,13 @@
  * hype_vmx_adjust_controls() in vmx_bits.c holds the only real logic
  * (capability negotiation) and is fully tested.
  */
-int hype_vmx_vmcs_build_guest(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp);
+int hype_vmx_vmcs_build_guest(uint64_t cs_base, uint64_t rip, uint64_t stack_phys,
+                              uint64_t eptp, uint8_t *vmcs_region);
 
 /* Long-mode variant: flat 64-bit guest at linear entry_rip with paging root
  * guest_cr3 (the caller builds guest paging, as the SVM microtests do). */
 int hype_vmx_vmcs_build_long_mode_guest(uint64_t entry_rip, uint64_t guest_cr3, uint64_t stack_phys,
-                                        uint64_t eptp);
+                                        uint64_t eptp, uint8_t *vmcs_region);
 
 /* Assembles an EPT pointer (WB, 4-level) from a PML4 physical address. */
 uint64_t hype_vmx_make_eptp(uint64_t pml4_phys);
@@ -137,6 +138,10 @@ void hype_vmx_vcpu_set_gdt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
 void hype_vmx_vcpu_set_idt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
 void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
 void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx);
+
+/* #271: release every vCPU slot. Mirrors hype_svm_vcpu_pool_reset() -- call between
+ * the sequential battery and the concurrent guests, never while a vCPU is live. */
+void hype_vmx_vcpu_pool_reset(void);
 
 /* #248: the VMX half of the interrupt-delivery counters. Same field meanings as
  * hype_svm_vcpu_get_int_diag() so the INTDIAG log line reads identically on both

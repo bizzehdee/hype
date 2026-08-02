@@ -44,7 +44,19 @@
 
 /* UNVALIDATED -- see vmx.h and vmcs.h. */
 
-static uint8_t g_vmcs_region[4096] __attribute__((aligned(4096)));
+/*
+ * #271: per-vCPU VMCS pool. Was a single g_vmcs_region, which was correct while
+ * only the sequential BSP-only microtests used VMX. It stops being correct the
+ * moment run_fw_1_test() dispatches each VM to its own AP: two cores would share
+ * one VMCS.
+ *
+ * Sized for the CONCURRENT guests. The sequential self-test battery allocates
+ * first, so hype_vmx_vcpu_pool_reset() hands the slots back before the concurrent
+ * guests are created -- without that the battery drains the pool and the real VMs
+ * both clamp to the same slot, which is #237 exactly.
+ */
+#define HYPE_VMX_MAX_VCPUS 4u
+static uint8_t g_vmcs_pool[HYPE_VMX_MAX_VCPUS][4096] __attribute__((aligned(4096)));
 static uint8_t g_virtual_apic_page[4096] __attribute__((aligned(4096)));
 
 /* #248: did the CPU actually grant acknowledge-interrupt-on-exit? Set from the
@@ -255,7 +267,35 @@ struct hype_vcpu_ctx {
  * of ctx + VMCS regions AND per-VM EPT roots + VPID, since the EPT here is one
  * global identity map.
  */
-static struct hype_vcpu_ctx g_vmx_ctx;
+static struct hype_vcpu_ctx g_vmx_ctx_pool[HYPE_VMX_MAX_VCPUS];
+static unsigned g_vmx_vcpu_count = 0;
+
+/*
+ * #271/#237: allocate a slot, and be LOUD when there are none left. #237's SVM pool
+ * clamped silently, so two guests quietly shared one control block and it presented
+ * on real hardware as a dashboard freeze with no panic -- nothing downstream can
+ * detect a shared VMCS, so it has to be said here.
+ */
+static unsigned vmx_alloc_slot(void) {
+    unsigned slot = __atomic_fetch_add(&g_vmx_vcpu_count, 1u, __ATOMIC_SEQ_CST);
+    if (slot < HYPE_VMX_MAX_VCPUS) {
+        return slot;
+    }
+    hype_debug_print("vmx: vCPU slot pool EXHAUSTED (%u slots) -- slot %u aliased to %u. Safe ONLY "
+                     "if these guests never run concurrently (see #237/#245)\n",
+                     HYPE_VMX_MAX_VCPUS, slot, HYPE_VMX_MAX_VCPUS - 1u);
+    return HYPE_VMX_MAX_VCPUS - 1u;
+}
+
+/*
+ * #271: hand every slot back. The pool is sized for the concurrent guests; the
+ * battery runs strictly earlier and strictly sequentially, so resetting once it
+ * finishes restores the invariant the pool was designed around. Mirrors
+ * hype_svm_vcpu_pool_reset(). Not for use while any vCPU is live.
+ */
+void hype_vmx_vcpu_pool_reset(void) {
+    __atomic_store_n(&g_vmx_vcpu_count, 0u, __ATOMIC_SEQ_CST);
+}
 
 /* Clear the per-entry pending state a fresh vCPU must not inherit. */
 static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
@@ -451,21 +491,30 @@ static int write_realmode_guest_segment(uint32_t selector_field, uint32_t base_f
  * hype_vmx_vmcs_build_guest / _long_mode_guest pin the mode.
  */
 static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp,
-                              int long_mode, uint64_t guest_cr3) {
+                              int long_mode, uint64_t guest_cr3, uint8_t *vmcs_region) {
     int rc = 0;
-
-    for (unsigned i = 0; i < sizeof(g_vmcs_region); i++) {
-        g_vmcs_region[i] = 0;
+    /* #271: the region is passed in, not taken from a "current slot" global -- two
+     * APs can be building their own vCPUs at the same time, and a shared global
+     * would be the very race this pool exists to remove. VMPTRLD makes it current
+     * for THIS logical CPU, which is per-core state, so each AP lands on its own.
+     *
+     * Pass `vmcs_region` to vmclear/vmptrld, NOT its address: those helpers bind
+     * "=m" to the PARAMETER, so the pointer's VALUE is the operand the instruction
+     * reads as the VMCS address. Passing &local adds a level of indirection and the
+     * CPU treats the stack slot's address as the VMCS -- VMCS build then fails and
+     * vcpu_create panics. */
+    for (unsigned i = 0; i < 4096u; i++) {
+        vmcs_region[i] = 0;
     }
 
     uint64_t vmx_basic = rdmsr(HYPE_MSR_IA32_VMX_BASIC);
     uint32_t revision_id = (uint32_t)(vmx_basic & 0x7FFFFFFFu);
-    *(uint32_t *)g_vmcs_region = revision_id;
+    *(uint32_t *)vmcs_region = revision_id;
 
-    if (vmclear(&g_vmcs_region) != 0) {
+    if (vmclear(vmcs_region) != 0) {
         return -1;
     }
-    if (vmptrld(&g_vmcs_region) != 0) {
+    if (vmptrld(vmcs_region) != 0) {
         return -1;
     }
 
@@ -792,7 +841,7 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     rc |= vmwrite(HYPE_VMCS_HOST_GDTR_BASE, read_gdtr_base());
     rc |= vmwrite(HYPE_VMCS_HOST_IDTR_BASE, read_idtr_base());
     rc |= vmwrite(HYPE_VMCS_HOST_IA32_SYSENTER_CS, 0);
-    rc |= vmwrite(HYPE_VMCS_HOST_RSP, (uint64_t)&g_vmcs_region[sizeof(g_vmcs_region)]);
+    rc |= vmwrite(HYPE_VMCS_HOST_RSP, (uint64_t)&vmcs_region[4096]);
     /* HOST_RIP/HOST_RSP are placeholders here: hype_vmx_vcpu_run()'s trampoline
      * (vmx_run.S) VMWRITEs the real values (its own .Lvmexit label + live stack)
      * on every entry, overriding these. The stub only keeps the field non-zero
@@ -804,13 +853,14 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
 
 /* Public builders: real-mode guest at cs_base:rip; flat 64-bit guest at linear
  * entry_rip with paging root guest_cr3. Both take a prebuilt EPT pointer. */
-int hype_vmx_vmcs_build_guest(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp) {
-    return build_guest_common(cs_base, rip, stack_phys, eptp, 0, 0);
+int hype_vmx_vmcs_build_guest(uint64_t cs_base, uint64_t rip, uint64_t stack_phys, uint64_t eptp,
+                              uint8_t *vmcs_region) {
+    return build_guest_common(cs_base, rip, stack_phys, eptp, 0, 0, vmcs_region);
 }
 
 int hype_vmx_vmcs_build_long_mode_guest(uint64_t entry_rip, uint64_t guest_cr3, uint64_t stack_phys,
-                                        uint64_t eptp) {
-    return build_guest_common(0, entry_rip, stack_phys, eptp, 1, guest_cr3);
+                                        uint64_t eptp, uint8_t *vmcs_region) {
+    return build_guest_common(0, entry_rip, stack_phys, eptp, 1, guest_cr3, vmcs_region);
 }
 
 /*
@@ -853,7 +903,8 @@ void hype_vmx_ept_mark_mmio_hole(uint64_t gpa) {
  */
 hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
                                       uint64_t ept_or_npt_root) {
-    struct hype_vcpu_ctx *ctx = &g_vmx_ctx;
+    unsigned slot = vmx_alloc_slot(); /* #271 */
+    struct hype_vcpu_ctx *ctx = &g_vmx_ctx_pool[slot];
     uint64_t eptp;
     unsigned i;
 
@@ -878,7 +929,7 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
 
     /* cs_base = guest_rip, rip = 0: the guest starts executing at physical
      * guest_rip in real mode (CS.base:IP = guest_rip:0). */
-    if (hype_vmx_vmcs_build_guest(guest_rip, 0, guest_rsp, eptp) != 0) {
+    if (hype_vmx_vmcs_build_guest(guest_rip, 0, guest_rsp, eptp, g_vmcs_pool[slot]) != 0) {
         return 0;
     }
 
@@ -904,7 +955,8 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
  */
 hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t guest_cr3,
                                                 uint64_t guest_rsp, uint64_t ept_or_npt_root) {
-    struct hype_vcpu_ctx *ctx = &g_vmx_ctx;
+    unsigned slot = vmx_alloc_slot(); /* #271 */
+    struct hype_vcpu_ctx *ctx = &g_vmx_ctx_pool[slot];
     uint64_t eptp;
     unsigned i;
 
@@ -913,7 +965,8 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
     hype_ept_build_identity(g_ept_pml4, g_ept_pdpt, g_ept_pd, HYPE_EPT_MAX_GB);
     eptp = hype_vmx_make_eptp((uint64_t)(uintptr_t)g_ept_pml4);
 
-    if (hype_vmx_vmcs_build_long_mode_guest(entry_rip, guest_cr3, guest_rsp, eptp) != 0) {
+    if (hype_vmx_vmcs_build_long_mode_guest(entry_rip, guest_cr3, guest_rsp, eptp,
+                                            g_vmcs_pool[slot]) != 0) {
         return 0;
     }
 

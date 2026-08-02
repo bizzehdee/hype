@@ -10173,6 +10173,12 @@ static void EFIAPI run_all_test_guests(void *arg) {
      */
     if (args->kind == HYPE_VMM_KIND_SVM) {
         hype_svm_vcpu_pool_reset();
+    } else if (args->kind == HYPE_VMM_KIND_VMX) {
+        /* #271: same reasoning on Intel. The battery allocates VMX slots first and
+         * strictly sequentially; without handing them back, vm0 and vm1 would both
+         * clamp to the last slot and share one VMCS across two cores -- #237's
+         * failure, which does not panic, it just wedges. */
+        hype_vmx_vcpu_pool_reset();
     }
     /* RT-2b: run_fw_1_test is deliberately NOT run here. The quick regression
      * guests above all run under `cli` (no host timer, no INTR intercept) --
