@@ -138,6 +138,13 @@ void hype_vmx_vcpu_set_idt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
 void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
 void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx);
 
+/* #248: the VMX half of the interrupt-delivery counters. Same field meanings as
+ * hype_svm_vcpu_get_int_diag() so the INTDIAG log line reads identically on both
+ * vendors; without these the line printed all-zeros on Intel regardless. */
+void hype_vmx_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
+                                unsigned long long *window, unsigned long long *overwrite);
+unsigned long long hype_vmx_vcpu_get_eventinj_collisions(void);
+
 /*
  * VMX-1 smoke test: launches a self-contained 3-byte guest (CPUID; HLT) via
  * vcpu_create/vcpu_run and checks the CPUID->HLT VM-exit sequence. Returns 0

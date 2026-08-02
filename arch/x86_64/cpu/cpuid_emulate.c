@@ -6,6 +6,7 @@
 #define HYPE_CPUID_LEAF1_ECX_X2APIC_BIT (1u << 21)
 #define HYPE_CPUID_LEAF1_ECX_MONITOR_BIT (1u << 3)
 #define HYPE_CPUID_LEAFD_SUB1_EAX_XSAVES_BIT (1u << 3)
+#define HYPE_CPUID_LEAF7_ECX_WAITPKG_BIT (1u << 5)
 /* Highest basic leaf hype exposes. Must reach leaf 0xD (XSAVE state-component
  * enumeration) so the guest sees a COHERENT instruction-capability picture:
  * leaf 1 ECX passes the host's XSAVE(26)/OSXSAVE(27)/AVX(28)/FMA(12)/F16C(29)
@@ -157,6 +158,19 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
         out->eax = real->eax;
         out->ebx = real->ebx;
         out->ecx = real->ecx;
+        /*
+         * #252/A2: WAITPKG (sub-leaf 0, ECX bit 5) is masked for the same reason as
+         * the EDX bits below and as MONITOR in leaf 1: hype cannot back it. On VMX,
+         * TPAUSE/UMWAIT/UMONITOR take #UD unless the "enable user wait and pause"
+         * secondary control is set, and honouring them properly also means modelling
+         * IA32_UMWAIT_CONTROL, which hype does not. Linux uses TPAUSE in
+         * delay_halt_tpause(), i.e. inside udelay() -- so leaving this advertised
+         * produced a #UD on every delay. Masked, Linux falls back to the ordinary
+         * PAUSE delay loop, which needs nothing from the hypervisor.
+         */
+        if (ecx_in == 0u) {
+            out->ecx = real->ecx & ~HYPE_CPUID_LEAF7_ECX_WAITPKG_BIT;
+        }
         out->edx = real->edx & ~HYPE_CPUID_LEAF7_EDX_SPECCTRL_MASK;
         return;
     }

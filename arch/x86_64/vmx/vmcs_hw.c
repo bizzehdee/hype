@@ -494,7 +494,7 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * real mode) architecturally REQUIRES EPT -- so both bits go together. */
     uint32_t proc2_ctls = hype_vmx_adjust_controls(
         HYPE_VMX_PROCBASED2_ENABLE_EPT | HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST |
-            HYPE_VMX_PROCBASED2_ENABLE_INVPCID,
+            HYPE_VMX_PROCBASED2_ENABLE_INVPCID | HYPE_VMX_PROCBASED2_ENABLE_RDTSCP,
         proc2_cap);
     /* Host address-space size MUST be set: hype's host is 64-bit (see the
      * constant's comment) -- omitting it is the classic error-7 VM-entry
@@ -2103,19 +2103,66 @@ static int vmx_can_accept_interrupt(void) {
     return hype_svm_can_accept_interrupt(rflags, block);
 }
 
+/*
+ * #248/#252: interrupt-delivery counters, the VMX half of what SVM has had since
+ * INT-1/INT-2. vmm_get_int_diag() short-circuited for VMX and returned 0, so the
+ * INTDIAG line printed all-zeros on Intel no matter what happened -- the one
+ * instrument that says whether interrupts reach the guest reported nothing on the
+ * vendor where that is the open question. Semantics deliberately match
+ * hype_svm_vcpu_get_int_diag()'s so the same line means the same thing on both:
+ *   eventinj   -- injected immediately, guest was ready
+ *   defer      -- queued in the IRR instead of injected
+ *   window     -- injected later, drained once the guest could accept it
+ *   overwrite  -- vector was already pending -> coalesced (one delivery per IRR bit)
+ *   collision  -- wanted to inject but an event was already staged for VM-entry
+ */
+static unsigned long long g_vmx_int_eventinj = 0;
+static unsigned long long g_vmx_int_defer = 0;
+static unsigned long long g_vmx_int_window = 0;
+static unsigned long long g_vmx_int_overwrite = 0;
+static unsigned long long g_vmx_int_collision = 0;
+
+void hype_vmx_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
+                                unsigned long long *window, unsigned long long *overwrite) {
+    *eventinj = g_vmx_int_eventinj;
+    *defer = g_vmx_int_defer;
+    *window = g_vmx_int_window;
+    *overwrite = g_vmx_int_overwrite;
+}
+
+unsigned long long hype_vmx_vcpu_get_eventinj_collisions(void) {
+    return g_vmx_int_collision;
+}
+
 void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int staged = vmx_entry_event_staged();
+    int ready = vmx_can_accept_interrupt();
+    /* Sampled BEFORE the IRR set, or "already pending" is always true of the bit
+     * we are about to set and the coalesce count is meaningless. */
+    int already_pending =
+        (real->pending_irr[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0;
+
     /* VMX-4: queue into the IRR instead of overwriting a single slot, then
      * inject immediately if the guest is ready (INT-1) or arm an
      * interrupt-window exit to inject later (INT-2). Same shape as SVM's
      * hype_svm_vcpu_request_interrupt. */
     hype_svm_irr_set(real->pending_irr, vector);
-    if (!vmx_entry_event_staged() && vmx_can_accept_interrupt()) {
+    if (!staged && ready) {
         int v = hype_svm_irr_highest(real->pending_irr);
         if (v >= 0) {
             hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
             vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
+            g_vmx_int_eventinj++;
         }
+    } else {
+        if (staged) {
+            g_vmx_int_collision++;
+        }
+        if (already_pending) {
+            g_vmx_int_overwrite++;
+        }
+        g_vmx_int_defer++;
     }
     /* Keep the window armed while anything remains queued. */
     vmx_set_intr_window(hype_svm_irr_any(real->pending_irr) ? 1 : 0);
@@ -2148,6 +2195,7 @@ int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
     }
     hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
     vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
+    g_vmx_int_window++; /* drained from the queue once the guest could accept it */
     vmx_set_intr_window(hype_svm_irr_any(real->pending_irr) ? 1 : 0);
     return 1;
 }

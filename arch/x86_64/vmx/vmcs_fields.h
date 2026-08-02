@@ -91,6 +91,23 @@
  * in which case the CPUID bit ought to be masked instead.
  */
 #define HYPE_VMX_PROCBASED2_ENABLE_INVPCID (1u << 12)
+/*
+ * "Enable RDTSCP" (secondary control, bit 3) -- #252/A2, and the exact same shape
+ * as ENABLE_INVPCID above.
+ *
+ * With this control CLEAR, a guest executing RDTSCP takes #UD regardless of what
+ * CPUID says (SDM Vol 3C, "Changes to Instruction Behavior in VMX Non-Root
+ * Operation"). hype passes the host's extended CPUID through, so an Intel guest
+ * sees RDTSCP advertised and Linux uses it in pvclock_clocksource_read_nowd() --
+ * i.e. on EVERY clocksource read. Observed as a #UD storm at
+ * pvclock_clocksource_read_nowd+0xe which left the guest parked in
+ * queued_spin_lock_slowpath.
+ *
+ * SVM has no equivalent gate, which is why AMD never hit it. Requested through
+ * adjust_controls() so it is dropped if unsupported, in which case the CPUID bit
+ * (leaf 0x80000001 EDX bit 27) ought to be masked instead.
+ */
+#define HYPE_VMX_PROCBASED2_ENABLE_RDTSCP (1u << 3)
 /* APIC-register virtualization / virtual-interrupt delivery (M2-4):
  * both operate on the virtual-APIC page directly, not through EPT, so
  * (unlike "virtualize APIC accesses", intentionally not used here)

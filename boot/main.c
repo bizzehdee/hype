@@ -3051,7 +3051,8 @@ static int vmm_get_int_diag(hype_vmm_kind_t kind, unsigned long long *eventinj,
                             unsigned long long *defer, unsigned long long *window,
                             unsigned long long *overwrite) {
     if (kind == HYPE_VMM_KIND_VMX) {
-        return 0;
+        hype_vmx_vcpu_get_int_diag(eventinj, defer, window, overwrite);
+        return 1;
     }
     hype_svm_vcpu_get_int_diag(eventinj, defer, window, overwrite);
     return 1;
@@ -3073,7 +3074,8 @@ static uint32_t vmm_get_msr_index(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
                                      : hype_svm_vcpu_get_msr_index(ctx);
 }
 static unsigned long long vmm_get_eventinj_collisions(hype_vmm_kind_t kind) {
-    return kind == HYPE_VMM_KIND_VMX ? 0ull : hype_svm_vcpu_get_eventinj_collisions();
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_eventinj_collisions()
+                                     : hype_svm_vcpu_get_eventinj_collisions();
 }
 
 /* VMX-4 (#236): the FW-1 device surface. */
