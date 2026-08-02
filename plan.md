@@ -607,6 +607,64 @@ checking them:
   up. If passthrough is ever added later (explicitly out of scope for v1),
   this invariant must be revisited alongside an IOMMU requirement.
 
+## 6k. Scripted guest input (headless validation)
+
+§6c covers a *human* driving a guest through the console. This covers the
+other case: hype driving a guest itself, with nobody watching.
+
+The need is a validation one, not an install one. Several claims about hype
+can only be settled from *inside* a guest — "these two VMs cannot see each
+other's files", "the installed system boots from the target disk", "this
+distro's installer completed" — and every one of them currently requires an
+operator at a keyboard. That makes them expensive, unrepeatable, and in
+practice skipped, which is exactly how a two-guest test comes to prove
+liveness and quietly not prove isolation.
+
+**Model.** Each VM may have an expect-style script dropped on the ESP as
+`\input\vm0.txt`, `\input\vm1.txt`, mirroring the existing per-VM
+`\iso\vm1.iso` convention. Absent file means no scripting and byte-identical
+behaviour to today — the capability is inert unless deliberately armed, and
+nothing in the normal boot path depends on it.
+
+**Language.** Line-oriented and deliberately small; this is a test fixture,
+not a shell:
+
+```
+timeout 120000                       # ms, applies to each expect
+expect  localhost login:
+send    root\n
+expect  ~#
+send    echo vm0-marker > /tmp/m\n
+expect  ~#
+send    cat /tmp/m\n
+expect  vm0-marker
+fail-if vm1-marker                   # seeing the OTHER guest's marker is the bug
+pass    two-vm-isolation-vm0
+```
+
+`expect` waits for a substring in that VM's console output; `send` types into
+it; `delay` pauses; `pass`/`fail` end the script with a verdict; `fail-if`
+arms a substring that fails the run if it ever appears. An expect that times
+out is a failure, not a hang — a validation harness that can wedge is one that
+reports nothing, which is the failure mode being designed out.
+
+**Transport.** v1 injects into the per-VM guest UART receive path, because
+that is where the guests actually take input (`ttyS0`). PS/2 scancode
+injection comes later and, when it does, retires the `HYPE_FW_1_AUTO_KEY_INJECT`
+one-shot hack (GLADDER-6b) that exists today only to clear a firmware prompt.
+
+**Verdict.** `pass`/`fail` produce a definitive log line and per-VM dashboard
+state. This is the part that makes it a validation tool rather than a typing
+gadget: a headless run must self-report, because on the cold-boot-only test
+laptop the log is the only telemetry there is (§6b), and silence is not
+evidence of success.
+
+**Safety.** A script can type into a root shell, so: it is per-VM and cannot
+address another guest; it is armed only by a file the operator put on the ESP;
+and it grants no new authority — the physical-write confirmation (§6d) and the
+target-matching guard stay in force, so a script cannot cause a destructive
+write that an operator has not separately confirmed.
+
 ## 7. Repository layout (proposed)
 
 ```
