@@ -37,4 +37,41 @@ void hype_dashboard_render(hype_vt_screen_t *s,
 /* Format `secs` as HH:MM:SS into buf (>= 9 bytes). Exposed for tests. */
 void hype_dashboard_fmt_uptime(char *buf, unsigned long long secs);
 
+/*
+ * #263: accumulated RUNNING time for one VM.
+ *
+ * UPTIME used to be recomputed on every render as wall-clock since a fixed
+ * perf_boot_start_tsc, so it kept climbing while the VM's state read `off` --
+ * nothing subtracted stopped time and nothing re-based the origin. The CPU column
+ * immediately above it already gated on lifecycle, so the two neighbours disagreed.
+ *
+ * "Uptime" here means what an operator means by it, and what virsh/Hyper-V show:
+ * time the VM has actually been running, frozen while stopped and continuing on
+ * resume. That cannot be derived from a fixed origin -- it has to accumulate.
+ *
+ * Kept pure and clock-free (the caller passes wall-clock milliseconds) because the
+ * formatter was already tested while the DERIVATION had no tests at all, which is
+ * exactly why a metric that never stopped counting went unnoticed.
+ */
+typedef struct {
+    unsigned long long accum_ms;   /* running time banked before the current sample */
+    unsigned long long last_ms;    /* wall-clock at the previous sample */
+    int running;                   /* whether the VM was running as of that sample */
+    int started;                   /* whether any sample has been taken yet */
+} hype_vm_uptime_t;
+
+void hype_vm_uptime_reset(hype_vm_uptime_t *u);
+
+/*
+ * Fold the interval since the previous sample into the total. An interval is credited
+ * only when the VM was running at BOTH ends of it, so a stop freezes the figure and a
+ * resume continues it; this can under-credit by at most one sample period around a
+ * transition, which is preferable to advancing while the state reads `off`.
+ * `now_ms` must be non-decreasing; a decreasing reading is ignored rather than
+ * credited as a huge interval.
+ */
+void hype_vm_uptime_sample(hype_vm_uptime_t *u, unsigned long long now_ms, int running);
+
+unsigned long long hype_vm_uptime_ms(const hype_vm_uptime_t *u);
+
 #endif /* HYPE_DASHBOARD_H */

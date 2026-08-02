@@ -22,6 +22,83 @@ static int row_has(const hype_vt_screen_t *s, unsigned r, const char *needle) {
     return strstr(buf, needle) != NULL;
 }
 
+/* --- #263: uptime must accumulate RUNNING time, not wall-clock --- */
+
+static void test_uptime_freezes_while_stopped(void) {
+    /* The reported bug: the column kept climbing while the VM's state read `off`. */
+    hype_vm_uptime_t u;
+    hype_vm_uptime_reset(&u);
+    hype_vm_uptime_sample(&u, 1000ULL, 1);   /* origin */
+    hype_vm_uptime_sample(&u, 3000ULL, 1);   /* +2000 running */
+    if (hype_vm_uptime_ms(&u) != 2000ULL) {
+        printf("FAIL: running time should be 2000ms, got %llu\n", hype_vm_uptime_ms(&u));
+        failures++;
+    }
+    hype_vm_uptime_sample(&u, 9000ULL, 0);   /* stopped for this interval: no credit */
+    if (hype_vm_uptime_ms(&u) != 2000ULL) {
+        printf("FAIL: uptime must FREEZE while stopped, got %llu\n", hype_vm_uptime_ms(&u));
+        failures++;
+    }
+    hype_vm_uptime_sample(&u, 90000ULL, 0);  /* still stopped, long gap */
+    if (hype_vm_uptime_ms(&u) != 2000ULL) {
+        printf("FAIL: a long stopped gap must not be credited, got %llu\n", hype_vm_uptime_ms(&u));
+        failures++;
+    }
+}
+
+static void test_uptime_resumes_after_stop(void) {
+    hype_vm_uptime_t u;
+    hype_vm_uptime_reset(&u);
+    hype_vm_uptime_sample(&u, 0ULL, 1);
+    hype_vm_uptime_sample(&u, 500ULL, 1);    /* +500 */
+    hype_vm_uptime_sample(&u, 5000ULL, 0);   /* stopped */
+    hype_vm_uptime_sample(&u, 6000ULL, 1);   /* running again from here */
+    hype_vm_uptime_sample(&u, 6750ULL, 1);   /* +750 */
+    if (hype_vm_uptime_ms(&u) != 1250ULL) {
+        printf("FAIL: resume should continue the total (expect 1250ms), got %llu\n",
+               hype_vm_uptime_ms(&u));
+        failures++;
+    }
+}
+
+static void test_uptime_first_sample_banks_nothing(void) {
+    /* The first sample only establishes the origin. Crediting now_ms here would bank
+     * everything that happened before the VM existed as its uptime. */
+    hype_vm_uptime_t u;
+    hype_vm_uptime_reset(&u);
+    hype_vm_uptime_sample(&u, 123456ULL, 1);
+    if (hype_vm_uptime_ms(&u) != 0ULL) {
+        printf("FAIL: the first sample must bank nothing, got %llu\n", hype_vm_uptime_ms(&u));
+        failures++;
+    }
+}
+
+static void test_uptime_ignores_time_going_backwards(void) {
+    hype_vm_uptime_t u;
+    hype_vm_uptime_reset(&u);
+    hype_vm_uptime_sample(&u, 5000ULL, 1);
+    hype_vm_uptime_sample(&u, 4000ULL, 1);   /* clock went backwards */
+    if (hype_vm_uptime_ms(&u) != 0ULL) {
+        printf("FAIL: a backwards clock must not be credited, got %llu\n", hype_vm_uptime_ms(&u));
+        failures++;
+    }
+    hype_vm_uptime_sample(&u, 4500ULL, 1);   /* forward again from the new origin */
+    if (hype_vm_uptime_ms(&u) != 500ULL) {
+        printf("FAIL: should resume accumulating after a backwards step, got %llu\n",
+               hype_vm_uptime_ms(&u));
+        failures++;
+    }
+}
+
+static void test_uptime_null_safe(void) {
+    hype_vm_uptime_reset(0);
+    hype_vm_uptime_sample(0, 1ULL, 1);
+    if (hype_vm_uptime_ms(0) != 0ULL) {
+        printf("FAIL: NULL accumulator should read 0\n");
+        failures++;
+    }
+}
+
 int main(void) {
     /* --- uptime formatting --- */
     char up[16];
@@ -84,6 +161,12 @@ int main(void) {
     CHECK("empty dashboard header", row_has(s, 0, "hype - VM dashboard"));
 
     free(s);
+    test_uptime_freezes_while_stopped();
+    test_uptime_resumes_after_stop();
+    test_uptime_first_sample_banks_nothing();
+    test_uptime_ignores_time_going_backwards();
+    test_uptime_null_safe();
+
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;

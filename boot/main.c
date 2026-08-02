@@ -427,7 +427,8 @@ typedef struct hype_fw_vm {
     const char *media;      /* boot-media short name */
     volatile uint64_t stat_total_exits;
     volatile uint64_t stat_hlt_exits;
-    volatile uint64_t stat_uptime_ms;
+    volatile uint64_t stat_uptime_ms; /* #263: accumulated RUNNING time, not wall-clock */
+    hype_vm_uptime_t uptime_acc;      /* #263: the accumulator behind it */
     volatile uint64_t stat_idle_ms;
     volatile unsigned stat_cpu_pct;
     /* M8-4..7: lifecycle state, read by this VM's loop each iteration and posted
@@ -6341,7 +6342,14 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
         uint64_t up_ms = (now_gf - perf_boot_start_tsc) * 1000u / g_fw_1_host_tsc_hz;
         uint64_t idle_ms = perf_hlt_wait_tsc * 1000u / g_fw_1_host_tsc_hz;
         unsigned idle_pct = (up_ms > 0) ? (unsigned)((idle_ms >= up_ms) ? 100u : (idle_ms * 100u / up_ms)) : 0u;
-        vm->stat_uptime_ms = up_ms;
+        /*
+         * #263: credit the interval since the last sample only while this VM is
+         * RUNNING, so the figure freezes on stop and continues on resume. `up_ms`
+         * (wall-clock since first start) is still the right denominator for the
+         * idle percentage below -- it is only wrong as an "uptime".
+         */
+        hype_vm_uptime_sample(&vm->uptime_acc, up_ms, vm->lifecycle == HYPE_VM_RUNNING);
+        vm->stat_uptime_ms = hype_vm_uptime_ms(&vm->uptime_acc);
         vm->stat_idle_ms = idle_ms;
         vm->stat_total_exits = total_exits;
         vm->stat_hlt_exits = hlt_exits;

@@ -13,6 +13,44 @@ static void put_field(char *line, unsigned *len, const char *s, unsigned width) 
     line[(*len)++] = ' ';
 }
 
+void hype_vm_uptime_reset(hype_vm_uptime_t *u) {
+    if (u == (hype_vm_uptime_t *)0) {
+        return;
+    }
+    u->accum_ms = 0;
+    u->last_ms = 0;
+    u->running = 0;
+    u->started = 0;
+}
+
+void hype_vm_uptime_sample(hype_vm_uptime_t *u, unsigned long long now_ms, int running) {
+    if (u == (hype_vm_uptime_t *)0) {
+        return;
+    }
+    if (!u->started) {
+        /* First sample establishes the origin only -- there is no interval to credit
+         * yet, and crediting `now_ms` here would bank all of host boot as VM uptime. */
+        u->started = 1;
+        u->last_ms = now_ms;
+        u->running = running ? 1 : 0;
+        return;
+    }
+    /* Credit only when the VM was running at BOTH ends of the interval. Crediting on
+     * the start state alone banks an interval the VM stopped part-way through, which
+     * is the reported symptom (the figure advancing while the state reads `off`).
+     * This can under-credit by at most one sample period around a transition -- the
+     * right trade for a dashboard, and never wrong in the direction users noticed. */
+    if (now_ms > u->last_ms && u->running && running) {
+        u->accum_ms += now_ms - u->last_ms;
+    }
+    u->last_ms = now_ms;
+    u->running = running ? 1 : 0;
+}
+
+unsigned long long hype_vm_uptime_ms(const hype_vm_uptime_t *u) {
+    return (u == (const hype_vm_uptime_t *)0) ? 0ULL : u->accum_ms;
+}
+
 void hype_dashboard_fmt_uptime(char *buf, unsigned long long secs) {
     unsigned long long h = secs / 3600ull;
     unsigned m = (unsigned)((secs / 60ull) % 60ull);
