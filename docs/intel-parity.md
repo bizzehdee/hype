@@ -2,11 +2,20 @@
 
 Status as of 2026-07-29, `8a476c5`.
 
-> ## PARKED — no Intel hardware access
-> The nested-VMX box (`192.168.0.144`) is unavailable, and every remaining item in
-> section A needs it: the failures are only observable by running the guest. Nothing
-> here is blocked on knowing what to do next — see "Resume here" below. Do not delete
-> the diagnostics added for this; they are what made the last five fixes findable.
+> ## UNPARKED 2026-08-02 — hardware access restored
+> The nested-VMX box is back, now at **`192.168.0.150`** (log in as `darren@`; `usbuntu`
+> is the hostname, not the login). Re-verified reproducing on 2026-08-02: Intel/VMX
+> selected, Linux 6.12.81 boots, the xstate.c:332 WARNING fires, guest still executing.
+>
+> `~/hype-bisect` on the box was empty, so the harness lives in `~/vmxrun` instead:
+> `scp` hype.efi to `~/vmxrun/esp/EFI/BOOT/BOOTX64.EFI`, the guest firmware pair to
+> `~/vmxrun/esp/EFI/hype/`, and the earlycon ISO to `~/vmxrun/esp/iso/test.iso`, then
+> `RUNSECS=180 ./run.sh` (log: `/tmp/vmx.log`). **`run.sh` shipped with `-m 8192`, which
+> does not fit this 7 GB box** — it is now 4096.
+>
+> Everything below still applies: the failures are only observable by running the guest.
+> Do not delete the diagnostics added for this; they are what made the last five fixes
+> findable.
 
 ## The bar (where AMD is)
 
@@ -82,9 +91,13 @@ last five fixes came from reading guest oopses, not from reasoning about VMX.
 3. Read the log for the next kernel oops / hype panic and fix that. Repeat.
 4. `mv` the original `test.iso` back when done.
 
-- [ ] **A1. The xstate.c:332 WARNING.** Non-fatal, guest runs past it, but it is the one
-  outstanding guest-side complaint and likely reflects a residual XSAVE/XCR0 mismatch
-  from `8a476c5`. Read the full WARNING text before theorising.
+- [~] **A1. The xstate.c:332 WARNING.** Full text captured 2026-08-02 (see #252). Two
+  disagreeing sizes: `R12=R14=0x348` (840 = the guest's own enabled set 0x207, x87+SSE+
+  AVX+PKRU, 832+8) and `R15=0xa88` (2696 = a full AVX-512 XSAVE area). Consistent with a
+  CPUID leaf 0xD size taken from the HOST's capability set while the guest's XCR0 only
+  enables 0x207 -- the same class as `8a476c5`. HYPOTHESIS ONLY: next step is to read
+  what hype returns for leaf 0xD subleaf 0 EBX/ECX versus the per-component subleaves
+  and compare against the guest's XCR0, not to patch on the arithmetic.
 - [ ] **A2. Whatever the guest hits next**, following the resume loop above. It was still
   running at 0.420s when the capture ended, so the next fault is unobserved -- there may
   be none at all until userspace.
