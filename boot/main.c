@@ -6,6 +6,7 @@
 #include "../core/vt_screen.h"
 #include "../core/vt_render.h"
 #include "../core/dashboard.h"
+#include "../core/vm_isolation.h"
 #include "../core/vm_lifecycle.h"
 #include "../core/cmdparse.h"
 #include "../core/halt.h"
@@ -407,6 +408,14 @@ typedef struct hype_fw_vm {
     hype_ept_pte_t ept_pml4[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     hype_ept_pte_t ept_pdpt[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     hype_ept_pte_t ept_pd[HYPE_FW_1_NPT_GB][HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+    /*
+     * #274: the second-level translation root this VM was ACTUALLY launched
+     * with -- recorded at vcpu_create, not inferred from which array exists.
+     * #272 was precisely a case where the struct held a correct per-VM EPT and
+     * the value handed to the hardware was a different table entirely, so
+     * comparing &vm->ept_pml4 between VMs would have proved nothing.
+     */
+    uint64_t used_root;
     /* --- emulated devices --- */
     hype_pic_emu_t pic;
     hype_pit_emu_t pit;
@@ -7188,6 +7197,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     if (ctx == 0) {
         hype_fatal("fw-1: vcpu_create failed");
     }
+    vm->used_root = npt_root_phys; /* #274 */
 
     /* PVCLOCK (kvmclock): register THIS vCPU's guest-memory map + host TSC
      * frequency so the guest's KVM SYSTEM_TIME/WALL_CLOCK MSR writes fill its
@@ -7655,10 +7665,37 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * uptime that froze while stopped, or a CPU% that actually moves, can
                  * be confirmed from a captured log instead of a photograph.
                  */
-                hype_debug_print("fw-1 VMSTAT vm%u: state=%d uptime=%llus cpu=%u%%\n",
-                                 (unsigned)(vm - g_vms), (int)vm->lifecycle,
-                                 (unsigned long long)(vm->stat_uptime_ms / 1000u),
-                                 (unsigned)vm->stat_cpu_pct);
+                hype_debug_print(
+                    "fw-1 VMSTAT vm%u: state=%d uptime=%llus cpu=%u%% roots=[0x%llx,0x%llx]\n",
+                    (unsigned)(vm - g_vms), (int)vm->lifecycle,
+                    (unsigned long long)(vm->stat_uptime_ms / 1000u), (unsigned)vm->stat_cpu_pct,
+                    (unsigned long long)g_vms[0].used_root,
+                    (unsigned long long)g_vms[1].used_root);
+#if HYPE_RUN_TWO_VMS
+                /*
+                 * #274: two login prompts prove liveness, not isolation -- a pair of
+                 * guests sharing one translation root would print exactly the same
+                 * two prompts. Check the separation itself, once, as soon as both
+                 * guests have actually been launched, and say so in the log either
+                 * way. Silence is not evidence, so this prints on PASS too -- and it
+                 * repeats with each VMSTAT tick rather than latching once, because a
+                 * one-shot flag is one more thing that can be wrong and quietly
+                 * suppress the very verdict this exists to produce.
+                 */
+                if (g_vms[0].used_root != 0 && g_vms[1].used_root != 0) {
+                    unsigned iso = hype_vm_isolation_check(
+                        g_vms[0].ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES, g_vms[0].used_root,
+                        g_vms[1].ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES, g_vms[1].used_root);
+                    hype_debug_print(
+                        "fw-1 ISOLATION: %s -- vm0 ram@0x%llx root=0x%llx | vm1 ram@0x%llx "
+                        "root=0x%llx (flags=0x%x)\n",
+                        hype_vm_isolation_describe(iso),
+                        (unsigned long long)g_vms[0].ram_host_phys,
+                        (unsigned long long)g_vms[0].used_root,
+                        (unsigned long long)g_vms[1].ram_host_phys,
+                        (unsigned long long)g_vms[1].used_root, iso);
+                }
+#endif
                 /*
                  * #265: the write-side counterpart of the ATAPI READ(10) DIAG line.
                  * `hist` is the request-size distribution in sectors
