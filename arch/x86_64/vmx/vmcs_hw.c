@@ -153,6 +153,17 @@ typedef struct {
 static const uint32_t g_vmx_msr_list[] = {
     HYPE_MSR_IA32_KERNEL_GS_BASE, HYPE_MSR_IA32_STAR, HYPE_MSR_IA32_LSTAR,
     HYPE_MSR_IA32_CSTAR,          HYPE_MSR_IA32_SFMASK,
+    /*
+     * #270: IA32_TSC_AUX belongs here for exactly the same reason as the SYSCALL
+     * MSRs above -- it is guest state the CPU consumes directly (RDTSCP returns it
+     * in ECX), so it has to be swapped around every transition rather than
+     * emulated on access. Putting it in this area gets that for free: hardware
+     * loads the guest's value on entry and stores it back on exit, and
+     * vmx_msr_area_slot() makes the RDMSR/WRMSR handler read and write the same
+     * slot, so the guest sees what it wrote. Previously the write was absorbed and
+     * RDTSCP returned the HOST's value.
+     */
+    HYPE_MSR_IA32_TSC_AUX,
 };
 #define HYPE_VMX_MSR_AREA_COUNT (sizeof(g_vmx_msr_list) / sizeof(g_vmx_msr_list[0]))
 

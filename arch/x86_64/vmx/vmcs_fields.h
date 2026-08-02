@@ -197,6 +197,13 @@
 #define HYPE_MSR_IA32_LSTAR 0xC0000082u
 #define HYPE_MSR_IA32_CSTAR 0xC0000083u
 #define HYPE_MSR_IA32_SFMASK 0xC0000084u
+/*
+ * #270: IA32_TSC_AUX. RDTSCP returns it in ECX, and Linux stores the CPU (and node)
+ * number there for getcpu()/the vDSO. It became load-bearing only when ab93854
+ * enabled the ENABLE_RDTSCP secondary control -- before that RDTSCP took #UD, so the
+ * MSR was unreachable and its absence cost nothing.
+ */
+#define HYPE_MSR_IA32_TSC_AUX 0xC0000103u
 
 /*
  * IA32_PAT (#251). SVM writes the guest's PAT into the VMCB's save.g_pat, which
