@@ -91,31 +91,33 @@ last five fixes came from reading guest oopses, not from reasoning about VMX.
 3. Read the log for the next kernel oops / hype panic and fix that. Repeat.
 4. `mv` the original `test.iso` back when done.
 
-- [~] **A1. The xstate.c:332 WARNING.** Full text captured 2026-08-02 (#252): the guest
-  enables 0x207 (x87+SSE+AVX+PKRU), computes a context size of 840, and the WARNING's
-  registers carry `R12=R14=0x348` (840) and `R15=0xa88` (2696).
+- [x] **A1. The xstate.c:332 WARNING — FIXED `0d0cf7a`.** hype advertised XSAVES (leaf
+  0xD sub-leaf 1 EAX bit 3) by passthrough while IA32_XSS (0xDA0), the MSR that
+  configures it, is not modelled at all (#269) -- the same advertise-a-dead-feature
+  shape leaf 7 already guards against. It made Linux disagree with itself:
+  paranoid_xstate_size_valid() took the COMPACTED path for kernel_size but computed
+  `size` UNCOMPACTED, which is the 840-vs-2696 pair in the register dump. Masking the
+  bit took xstate.c:332 occurrences 2 -> 0. Shared code, so AMD was re-validated too.
 
-  **CAUSE STILL UNIDENTIFIED.** A "confirmed root cause" was posted on #252 and then
-  retracted -- it claimed leaf 0xD EBX changing across two CPUID passes was the defect.
-  It is not: EBX is defined as the XSAVE size for the states enabled in XCR0, the guest
-  ran XSETBV between the passes, and BOTH readings are arithmetically correct
-  (uncompacted 2688+8 = 2696; compacted 576+256+8 = 840). hype returns correct leaf 0xD
-  values, and `vmcs_hw.c` ALREADY loads the guest's XCR0 for the duration of a leaf 0xD
-  CPUID. Do not re-derive that theory.
+  Two wrong root causes were posted and retracted on #252 first, both from pairing
+  numbers by eye. What worked: recording the XCR0 in force per CPUID (the ring now
+  logs it), which showed every leaf 0xD reading was CORRECT for its XCR0, plus
+  reading Linux's actual xstate.c instead of recalling it.
 
-  Next step: read Linux 6.12 `arch/x86/kernel/fpu/xstate.c` near line 332 and identify
-  which two quantities it actually compares. Do not infer it from register values --
-  four wrong calls in one session came from reasoning about kernel/firmware internals
-  from memory instead of reading the source.
+- [~] **A2. The guest spins in queued_spin_lock_slowpath.** Console ends at 0.8405s
+  just after fpu init; 15 of 17 preempt samples sit at `queued_spin_lock_slowpath+0x161`
+  (resolved against the ISO's own System.map -- the earlycon ISO boots nokaslr).
+  Single vCPU, and `rflags=0x10002` so IF is CLEAR. hype's timers tick
+  (`pit_irq0=56 lapic_irq=471`).
 
-  Separately (small, real, not the cause): the guest-XCR0 swap for leaf 0xD is gated on
-  `g_vmx_guest_xcr0_valid`, set only after the guest's FIRST XSETBV. Before that hype
-  reads the leaf under the HOST's live XCR0 rather than the guest's architectural reset
-  value of 1. Harmless in this trace but not correct by construction.
+  BLOCKED ON INSTRUMENTATION, not on ideas: `vmm_get_int_diag()` in boot/main.c
+  returns 0 for HYPE_VMM_KIND_VMX, so the INTDIAG line prints zeros on Intel no
+  matter what happens. Do NOT read `eventinj=0` there as "nothing was injected" --
+  it is a reporting gap. Implement the VMX half first (vmm_ops.h already defines the
+  field as "SVM's VMCB EVENTINJ / VMX's VM_ENTRY_INTR_INFO_FIELD", and both
+  hype_vmx_vcpu_request_interrupt() and HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD exist).
+  This is #248's territory.
 
-- [ ] **A2. Whatever the guest hits next**, following the resume loop above. It was still
-  running at 0.420s when the capture ended, so the next fault is unobserved -- there may
-  be none at all until userspace.
 - [ ] **A3. Reach an Alpine login prompt** (the M4-6d3 bar, and AMD's).
 - [ ] **A4. The 14 remaining raw `hype_svm_*` calls** in the FW-1 region (#249). One was
   already a real bug (`9b760b6`: the guest page walk). The rest are mostly SVM-only
