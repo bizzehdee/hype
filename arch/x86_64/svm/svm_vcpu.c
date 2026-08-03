@@ -50,6 +50,18 @@ struct hype_vcpu_ctx {
      * leaving its own page unfilled -> garbage clocksource -> dead-halt. The
      * TSC->ns scale (mul/shift) stays global: all cores share one TSC rate. */
     const hype_gpa_map_t *pvclock_map;
+    /*
+     * #275: this vCPU's IA32_TSC_AUX. PER-vCPU on purpose: the whole point is that
+     * RDTSCP must return THIS guest's CPU encoding, so a shared value would be the
+     * same class of bug as #276/#277 and would defeat the fix.
+     *
+     * SVM has no MSR-load area, unlike VMX where #270 was one list entry. VMSAVE /
+     * VMLOAD cover FS, GS, TR, LDTR, KernelGsBase, STAR, LSTAR, CSTAR, SFMASK and the
+     * SYSENTER MSRs -- TSC_AUX is not among them -- so it has to be swapped by hand
+     * around VMRUN.
+     */
+    uint64_t tsc_aux;
+    int tsc_aux_valid; /* the guest has written it; skip the swap entirely until then */
     uint64_t pvclock_system_msr;
     uint64_t pvclock_wall_msr;
     /* Deferred-interrupt slot, per-vCPU. M8-0b STEP 2: two guests run
@@ -307,6 +319,10 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     /* Also clear the per-vCPU pvclock state (M8-0b STEP 2): a slot reused by a
      * later guest must not inherit a prior guest's pvclock map/MSR values. */
     ctx->pvclock_map = 0;
+    /* #275: a recycled slot must not inherit the previous guest's CPU encoding --
+     * RDTSCP would then report the wrong CPU to the new guest. */
+    ctx->tsc_aux = 0;
+    ctx->tsc_aux_valid = 0;
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
     {
@@ -1277,11 +1293,58 @@ static void hype_svm_pvclock_arm_wall_clock(struct hype_vcpu_ctx *real, uint64_t
     hype_pvclock_write_wall_clock((volatile struct hype_pvclock_wall_clock *)(uintptr_t)host, 0, 0);
 }
 
+/* #275: IA32_TSC_AUX, read by RDTSCP into ECX. Not covered by VMSAVE/VMLOAD. */
+#define HYPE_SVM_MSR_TSC_AUX 0xC0000103u
+
+static inline uint64_t svm_rdmsr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void svm_wrmsr(uint32_t msr, uint64_t value) {
+    __asm__ volatile("wrmsr" ::"a"((uint32_t)value), "d"((uint32_t)(value >> 32)), "c"(msr));
+}
+
 int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int is_write = (real->vmcb->control.exitinfo1 & 0x1ULL) != 0;
     uint32_t msr_number = (uint32_t)real->gprs[1]; /* RCX */
     hype_msr_action_t action;
+
+    /*
+     * #275: IA32_TSC_AUX. Guest writes used to fall through to the absorb path, so a
+     * guest RDTSCP read the HOST's value. Worse on AMD than it was on Intel: VMX gated
+     * RDTSCP behind ENABLE_RDTSCP so the exposure was new, whereas on SVM RDTSCP has
+     * always simply executed.
+     *
+     * Serviced ahead of the action switch, and deliberately NOT added to msr_emulate's
+     * action list, for the same reason #251 gave for the VMX MSR-area MSRs: keeping
+     * one source of truth. Letting it fall to absorb would discard a guest write that
+     * the next entry then contradicts.
+     */
+    if (msr_number == HYPE_SVM_MSR_TSC_AUX) {
+        if (is_write) {
+            real->tsc_aux =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+            if (!real->tsc_aux_valid) {
+                /* Say it once: this is the moment the swap below becomes active, and
+                 * without it "the fix is wired in" is unfalsifiable from a log. */
+                hype_debug_print("svm: guest wrote TSC_AUX=0x%llx -- per-guest RDTSCP value now "
+                                 "swapped around VMRUN (#275)\n",
+                                 (unsigned long long)(((uint64_t)(uint32_t)real->gprs[2] << 32) |
+                                                      (uint64_t)(uint32_t)real->vmcb->save.rax));
+            }
+            real->tsc_aux_valid = 1;
+        } else {
+            real->vmcb->save.rax = (uint64_t)(uint32_t)real->tsc_aux;
+            real->gprs[2] = (uint64_t)(uint32_t)(real->tsc_aux >> 32);
+        }
+        /* WRMSR/RDMSR are 2 bytes; SVM hands the next RIP in EXITINFO2, which the
+         * other MSR paths here already use rather than adding a length. */
+        real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+        return 0;
+    }
 
     /* PERF-1 memory-type probe: count guest MTRR MSR traffic (does not change
      * handling -- these still fall through to the stub path below). */
@@ -2936,6 +2999,7 @@ void hype_svm_set_vmrun_trace(int enabled) {
 
 int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    uint64_t host_tsc_aux = 0; /* #275 */
     uint64_t vmcb_phys = (uint64_t)(uintptr_t)real->vmcb;
 
     /* Real-hardware debugging: this brackets the single riskiest
@@ -2954,6 +3018,17 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
      * which uses XMM like any other compiled C here -- and save it back FIRST on
      * exit, before the trace print below. Nothing between these two calls may
      * touch vector registers; clgi/vmload/vmsave/stgi are bare instructions. */
+    /*
+     * #275: run the guest under ITS TSC_AUX, and put hype's back afterwards.
+     *
+     * Skipped entirely until the guest has actually written the MSR, so the common
+     * case costs nothing -- same gating as the VMX XCR0 swap. Two RDMSR/WRMSR pairs
+     * per entry is not free, which is why it is conditional rather than unconditional.
+     */
+    if (real->tsc_aux_valid) {
+        host_tsc_aux = svm_rdmsr(HYPE_SVM_MSR_TSC_AUX);
+        svm_wrmsr(HYPE_SVM_MSR_TSC_AUX, real->tsc_aux);
+    }
     hype_fpu_restore(&real->fpu);
     clgi();
     vmload(vmcb_phys);
@@ -2968,6 +3043,9 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
         real->vmcb->control.guest_asid_tlb_ctl &= 0xFFFFFFFFull;
     }
     hype_fpu_save(&real->fpu);
+    if (real->tsc_aux_valid) {
+        svm_wrmsr(HYPE_SVM_MSR_TSC_AUX, host_tsc_aux); /* #275 */
+    }
     if (g_vmrun_trace) {
         hype_debug_print("svm: VMRUN returned -- about to VMSAVE/STGI...\n");
     }
