@@ -6928,6 +6928,26 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
                         0x06, 0x01);
     hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
+#if HYPE_262_DISK_ON_FIRST_HBA
+    /*
+     * #262 PROBE: separate the last two tangled variables. The firmware fully drives
+     * the ATAPI device on HBA 1 (it boots from it) and will not drive the ATA disk on
+     * HBA 2. Is that because of the DEVICE TYPE or because of WHICH CONTROLLER?
+     *
+     * Put a plain ATA disk on HBA 1 -- the controller the firmware demonstrably
+     * works -- and see what happens:
+     *   configured + read -> "which controller" is the variable; look at how the
+     *                        second HBA is presented/enumerated.
+     *   still one IDENTIFY -> "device type" is the variable; the firmware never
+     *                        drives a plain ATA disk from hype at all, on any
+     *                        controller, and the ATAPI path's success is irrelevant.
+     * Not a candidate fix either way -- a hypervisor that can only offer a disk on
+     * the CD's controller is not a design, it is a coincidence.
+     */
+    hype_ahci_set_signature(&g_fw_1_ahci, HYPE_AHCI_SIG_ATA);
+    hype_debug_print("fw-1 #262 PROBE: HBA1 presents a plain ATA disk (SIG_ATA) -- "
+                     "device-type vs which-controller test\n");
+#endif
     hype_ahci_reset(&g_fw_1_ata_ahci);
     /* #262: this HBA carries a real disk, not the optical drive, so it must report
      * the plain-ATA signature. With the default ATAPI one the guest probes it with
@@ -7068,6 +7088,26 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         0x06, 0x01);
     hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
+#if HYPE_262_DISK_ON_FIRST_HBA
+    /*
+     * #262 PROBE: separate the last two tangled variables. The firmware fully drives
+     * the ATAPI device on HBA 1 (it boots from it) and will not drive the ATA disk on
+     * HBA 2. Is that because of the DEVICE TYPE or because of WHICH CONTROLLER?
+     *
+     * Put a plain ATA disk on HBA 1 -- the controller the firmware demonstrably
+     * works -- and see what happens:
+     *   configured + read -> "which controller" is the variable; look at how the
+     *                        second HBA is presented/enumerated.
+     *   still one IDENTIFY -> "device type" is the variable; the firmware never
+     *                        drives a plain ATA disk from hype at all, on any
+     *                        controller, and the ATAPI path's success is irrelevant.
+     * Not a candidate fix either way -- a hypervisor that can only offer a disk on
+     * the CD's controller is not a design, it is a coincidence.
+     */
+    hype_ahci_set_signature(&g_fw_1_ahci, HYPE_AHCI_SIG_ATA);
+    hype_debug_print("fw-1 #262 PROBE: HBA1 presents a plain ATA disk (SIG_ATA) -- "
+                     "device-type vs which-controller test\n");
+#endif
     hype_ahci_reset(&g_fw_1_ata_ahci);
     /* #262: this HBA carries a real disk, not the optical drive, so it must report
      * the plain-ATA signature. With the default ATAPI one the guest probes it with
@@ -9241,6 +9281,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             if (ahci_mapped) {
                 hype_vmm_npf_t ahci_npf;
                 vmm_get_last_npf(kind, ctx, &ahci_npf);
+#if HYPE_262_DISK_ON_FIRST_HBA
+                /* #262 PROBE (see the SIG_ATA note above): serve HBA1 from the ATA
+                 * disk model instead of the ATAPI one. */
+                if (ahci_npf.guest_phys_addr >= ahci_abar &&
+                    ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
+                    if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_ata_disk,
+                                                     ahci_abar, &g_fw_1_dma_map, insn) == 0) {
+                        continue;
+                    }
+                }
+#endif
                 if (ahci_npf.guest_phys_addr >= ahci_abar &&
                     ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
                     if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
