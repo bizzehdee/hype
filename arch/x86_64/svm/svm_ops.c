@@ -11,5 +11,6 @@ const hype_vmm_ops_t hype_svm_ops = {
     .enable_on = hype_svm_enable_on_page, /* #242: per-core, for the AP landing */
     .vcpu_create = hype_svm_vcpu_create,
     .vcpu_enable_apic_accel = hype_svm_vcpu_enable_apic_accel_ops,
-    .vcpu_run = hype_svm_vcpu_run
+    .vcpu_run = hype_svm_vcpu_run,
+    .vcpu_tlb_tag = hype_svm_vcpu_tlb_tag /* #244: ASID */
 };

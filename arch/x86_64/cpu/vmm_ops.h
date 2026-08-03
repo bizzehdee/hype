@@ -126,6 +126,27 @@ typedef struct {
      * this distinctly from a real exit).
      */
     int (*vcpu_run)(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info);
+
+    /*
+     * This vCPU's hardware TLB tag: the SVM ASID (#244) or the VMX VPID (#273).
+     * 0 means "none assigned", which for SVM is the dangerous case -- a guest on
+     * ASID 0 shares the host's TLB tag.
+     *
+     * In the vtable rather than as an SVM entry point because both vendors tag
+     * guest TLB entries, just under different names, and the question asked of
+     * it is the same on both: do two concurrent guests have DIFFERENT tags?
+     *
+     * It exists because that question could not be answered from a log. The
+     * assignment is announced by a hype_debug_print inside the SVM create path,
+     * but in a two-VM AMD run two cores contend for one UART and whole lines are
+     * lost -- a run where both guests provably reached a login prompt contained
+     * not one fragment of either ASID line, nor of the "launching real OVMF"
+     * line printed immediately before it. So per #288's own conclusion, anything
+     * that needs measuring has to be self-checking inside hype rather than
+     * grepped: the owner core reads BOTH VMs' tags and prints them in ONE line,
+     * exactly as the #274 isolation probe does for the NPT/EPT roots.
+     */
+    uint32_t (*vcpu_tlb_tag)(hype_vcpu_ctx_t *ctx);
 } hype_vmm_ops_t;
 
 #endif /* HYPE_ARCH_VMM_OPS_H */

@@ -444,6 +444,10 @@ typedef struct hype_fw_vm {
      * comparing &vm->ept_pml4 between VMs would have proved nothing.
      */
     uint64_t used_root;
+    /* #244/#273: the hardware TLB tag this VM's vCPU runs under (SVM ASID /
+     * VMX VPID). Recorded per VM so the owner core can print BOTH VMs' tags in
+     * one line -- two cores printing their own is what loses the evidence. */
+    uint32_t used_tlb_tag;
     /* --- emulated devices --- */
     hype_pic_emu_t pic;
     hype_pit_emu_t pit;
@@ -7435,6 +7439,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         hype_fatal("fw-1: vcpu_create failed");
     }
     vm->used_root = npt_root_phys; /* #274 */
+    /* #244/#273: latch the tag the hardware will actually use for this guest. */
+    vm->used_tlb_tag = (ops->vcpu_tlb_tag != 0) ? ops->vcpu_tlb_tag(ctx) : 0u;
     /* INPUT-7 (#280): start this VM's script clock alongside its guest. */
     if (vm->in_script_armed) {
         vm->in_started_ms = fw_1_script_now_ms(vm, hype_rdtsc());
@@ -7970,13 +7976,38 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         g_vms[0].ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES, g_vms[0].used_root,
                         g_vms[1].ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES, g_vms[1].used_root);
                     hype_debug_print(
-                        "fw-1 ISOLATION: %s -- vm0 ram@0x%llx root=0x%llx | vm1 ram@0x%llx "
-                        "root=0x%llx (flags=0x%x)\n",
+                        "fw-1 ISOLATION: %s -- vm0 ram@0x%llx root=0x%llx tag=%u | vm1 ram@0x%llx "
+                        "root=0x%llx tag=%u (flags=0x%x)\n",
                         hype_vm_isolation_describe(iso),
                         (unsigned long long)g_vms[0].ram_host_phys,
                         (unsigned long long)g_vms[0].used_root,
+                        (unsigned)g_vms[0].used_tlb_tag,
                         (unsigned long long)g_vms[1].ram_host_phys,
-                        (unsigned long long)g_vms[1].used_root, iso);
+                        (unsigned long long)g_vms[1].used_root,
+                        (unsigned)g_vms[1].used_tlb_tag, iso);
+                    /*
+                     * #244/#273: the TLB-tag verdict, stated rather than left to
+                     * be inferred from the two numbers above. Same reasoning as
+                     * the isolation verdict itself: a reader should not have to
+                     * compare fields by eye to learn whether two guests share a
+                     * TLB tag, and a shared tag is the bug #244 fixed.
+                     *
+                     * Printed by the OWNER core reading both VMs' latched tags,
+                     * because the per-guest assignment lines this replaces were
+                     * lost outright in a two-VM AMD run (#288).
+                     */
+                    if (g_vms[0].used_tlb_tag == 0u || g_vms[1].used_tlb_tag == 0u) {
+                        hype_debug_print("fw-1 TLBTAG: UNTAGGED -- at least one guest has no "
+                                         "ASID/VPID, so it shares the host's TLB tag (#244)\n");
+                    } else if (g_vms[0].used_tlb_tag == g_vms[1].used_tlb_tag) {
+                        hype_debug_print("fw-1 TLBTAG: SHARED (%u) -- both guests run under ONE "
+                                         "tag; their TLB entries can alias (#244)\n",
+                                         (unsigned)g_vms[0].used_tlb_tag);
+                    } else {
+                        hype_debug_print("fw-1 TLBTAG: distinct -- vm0=%u vm1=%u (#244)\n",
+                                         (unsigned)g_vms[0].used_tlb_tag,
+                                         (unsigned)g_vms[1].used_tlb_tag);
+                    }
                 }
 #endif
                 /*

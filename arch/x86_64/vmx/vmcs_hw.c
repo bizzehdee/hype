@@ -248,6 +248,15 @@ struct hype_vcpu_ctx {
     hype_fpu_area_t fpu;
     int launched; /* 0 until the first successful VMLAUNCH; VMRESUME thereafter. */
     /*
+     * #273: the VPID actually programmed into this vCPU's VMCS, or 0 when the
+     * CPU's EPT_VPID_CAP did not support enabling VPID (in which case the guest
+     * genuinely runs on VPID 0 and every VM-entry flushes it). Recorded rather
+     * than recomputed from the slot so it reports what the hardware will use,
+     * not what was intended, and readable outside vcpu_run where the VMCS is not
+     * current so vmread is unavailable.
+     */
+    uint16_t vpid;
+    /*
      * Pending external interrupts (INT-1/INT-2 on VMX), staged into
      * VM_ENTRY_INTR_INFO once the guest can accept one.
      *
@@ -696,6 +705,15 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * automatic every-entry flush that made VPID 0 safe is exactly what enabling
      * this control gives up.
      */
+    /*
+     * Record the EFFECTIVE tag for this slot -- the value the hardware will use,
+     * which is 0 when the CPU would not let us enable VPID at all. Written via
+     * the slot index (the ctx pool is indexed by it) rather than through a
+     * "current vCPU" global, so two APs building their own vCPUs concurrently
+     * cannot clobber each other -- the same reasoning that made vmcs_region a
+     * parameter here.
+     */
+    g_vmx_ctx_pool[slot].vpid = vpid_enabled ? vpid : 0u;
     if (vpid_enabled) {
         rc |= vmwrite(HYPE_VMCS_VIRTUAL_PROCESSOR_ID, vpid);
         if (invvpid_single_context(vpid) != 0) {
@@ -1135,6 +1153,19 @@ static void vmx_dispatch_acked_interrupt(void) {
         return;
     }
     (void)hype_isr_dispatch_vector((uint8_t)(intr_info & 0xFFull));
+}
+
+
+/*
+ * #273: the VPID this vCPU actually runs under (0 = none, every entry flushes).
+ * See hype_vmm_ops_t.vcpu_tlb_tag for why this is a vtable entry.
+ */
+uint32_t hype_vmx_vcpu_tlb_tag(hype_vcpu_ctx_t *ctx) {
+    const struct hype_vcpu_ctx *real = (const struct hype_vcpu_ctx *)ctx;
+    if (real == 0) {
+        return 0u;
+    }
+    return (uint32_t)real->vpid;
 }
 
 int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {

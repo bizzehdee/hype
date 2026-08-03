@@ -142,6 +142,9 @@ void hype_svm_vcpu_enable_apic_accel(hype_vmcb_t *vmcb);
  */
 hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, uint64_t ept_or_npt_root);
 
+/* #244: this vCPU's ASID (0 = none, i.e. sharing the host tag). */
+uint32_t hype_svm_vcpu_tlb_tag(hype_vcpu_ctx_t *ctx);
+
 /*
  * M8-4 (VM Start/reboot): re-initialise an EXISTING real-mode vCPU context to
  * fresh reset state, reusing its already-allocated pool slot / VMCB (unlike

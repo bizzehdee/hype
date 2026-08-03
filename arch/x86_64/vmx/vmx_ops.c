@@ -16,5 +16,6 @@ const hype_vmm_ops_t hype_vmx_ops = {
     .enable_on = hype_vmx_enable_on, /* #242: per-core, for the AP landing */
     .vcpu_create = hype_vmx_vcpu_create,
     /* .vcpu_enable_apic_accel deliberately unset -- see above. */
-    .vcpu_run = hype_vmx_vcpu_run
+    .vcpu_run = hype_vmx_vcpu_run,
+    .vcpu_tlb_tag = hype_vmx_vcpu_tlb_tag /* #273: VPID */
 };

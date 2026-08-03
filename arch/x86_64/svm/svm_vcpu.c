@@ -1306,6 +1306,22 @@ static inline void svm_wrmsr(uint32_t msr, uint64_t value) {
     __asm__ volatile("wrmsr" ::"a"((uint32_t)value), "d"((uint32_t)(value >> 32)), "c"(msr));
 }
 
+
+/*
+ * #244: the ASID this vCPU actually runs under, read straight out of the VMCB
+ * field VMRUN consumes rather than recomputed from the slot -- so it reports
+ * what the hardware will use, not what was intended. 0 would mean the guest
+ * shares the host's TLB tag. See hype_vmm_ops_t.vcpu_tlb_tag for why this is a
+ * vtable entry rather than a log line.
+ */
+uint32_t hype_svm_vcpu_tlb_tag(hype_vcpu_ctx_t *ctx) {
+    const struct hype_vcpu_ctx *real = (const struct hype_vcpu_ctx *)ctx;
+    if (real == 0 || real->vmcb == 0) {
+        return 0u;
+    }
+    return (uint32_t)(real->vmcb->control.guest_asid_tlb_ctl & 0xFFFFFFFFull);
+}
+
 int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int is_write = (real->vmcb->control.exitinfo1 & 0x1ULL) != 0;
