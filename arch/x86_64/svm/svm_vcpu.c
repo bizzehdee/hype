@@ -1340,9 +1340,31 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
             real->vmcb->save.rax = (uint64_t)(uint32_t)real->tsc_aux;
             real->gprs[2] = (uint64_t)(uint32_t)(real->tsc_aux >> 32);
         }
-        /* WRMSR/RDMSR are 2 bytes; SVM hands the next RIP in EXITINFO2, which the
-         * other MSR paths here already use rather than adding a length. */
-        real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+        /*
+         * WRMSR/RDMSR are 2 bytes. Advance by 2, exactly as every other MSR path
+         * in this function does.
+         *
+         * This used to read `save.rip = control.exitinfo2`, with a comment
+         * claiming SVM hands the next RIP there and that the neighbouring paths
+         * already used it. Both halves were wrong. For an MSR intercept SVM
+         * defines EXITINFO1 as the read/write flag and leaves EXITINFO2
+         * RESERVED -- the next-sequential-RIP lives in the VMCB's separate nRIP
+         * field, not there -- and the other paths a few lines below plainly do
+         * `save.rip += 2`.
+         *
+         * EXITINFO2 read as 0, so the guest resumed executing at address 0. It
+         * cost a guest boot: Linux writes this MSR from setup_getcpu() inside
+         * cpu_init_exception_handling(), so the first guest to touch TSC_AUX
+         * died in trap_init() with `RIP: 0010:0x0`, a NULL-pointer Oops, and
+         * "Attempted to kill the idle task!" -- with RCX still holding
+         * 0xC0000103 from the WRMSR, which is what identified it.
+         *
+         * It hid because #275 shipped against a guest that never wrote TSC_AUX,
+         * so this line never executed and the feature was correctly reported as
+         * dormant. Dormant code is untested code: the first guest that woke it
+         * did not survive.
+         */
+        real->vmcb->save.rip += 2;
         return 0;
     }
 
