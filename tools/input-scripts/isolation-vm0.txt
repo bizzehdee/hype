@@ -1,0 +1,15 @@
+# INPUT-10 (#283): prove vm0 cannot see vm1's files.
+# fail-if is armed FIRST so it is live for the whole run, not just at the end.
+timeout 240000
+fail-if vm1-only-file
+expect localhost login:
+send root\n
+expect ~#
+send echo mine > /tmp/vm0-only-file\n
+expect ~#
+# give the other guest time to write its own marker, so a SHARED filesystem
+# would definitely show it by the time we list the directory
+delay 15000
+send ls /tmp\n
+expect vm0-only-file
+pass isolation-vm0

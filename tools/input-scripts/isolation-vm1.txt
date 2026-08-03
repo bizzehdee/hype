@@ -1,0 +1,12 @@
+# INPUT-10 (#283): the mirror -- prove vm1 cannot see vm0's files.
+timeout 240000
+fail-if vm0-only-file
+expect localhost login:
+send root\n
+expect ~#
+send echo mine > /tmp/vm1-only-file\n
+expect ~#
+delay 15000
+send ls /tmp\n
+expect vm1-only-file
+pass isolation-vm1
