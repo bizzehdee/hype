@@ -1,0 +1,32 @@
+# Real-hardware validation script (#13 M0-5, #43 M3-6).
+#
+# The AMD laptop and the Intel box are both serial-less and cold-boot-only, so
+# "did it work?" cannot be answered by watching a console. This turns the live
+# guest into a self-checking test whose verdict lands in \HYPEFULL.LOG on the
+# stick and in the RT-3 NV tail, both readable after the fact.
+#
+# Generous timeout: a cold machine booting Alpine off a streamed ISO takes far
+# longer than QEMU, and a timeout firing early would report a failure that isn't
+# one. 300s is well past the ~40s seen under QEMU with room for slow silicon.
+timeout 300000
+
+# The bar for M3-6/M0-5: hype got a real guest all the way to userspace on real
+# silicon. Anything short of a login prompt is a fail, and the runner reports
+# WHICH pattern it was still waiting for.
+expect localhost login:
+send root\n
+expect ~#
+
+# Prove the guest is genuinely executing, not just painting a cached prompt:
+# make it compute something and echo a marker back. A guest that reached the
+# login prompt and then wedged would pass the expect above but fail here.
+send echo HWVAL-$((6*7))\n
+expect HWVAL-42
+
+# Read back the guest's own view of the CPU vendor. This is the one line that
+# differs between the two machines, so it makes each captured log
+# self-identifying -- no risk of grading the AMD run against the Intel log.
+send grep -m1 vendor_id /proc/cpuinfo\n
+expect ~#
+
+pass hwval-m0-5-m3-6

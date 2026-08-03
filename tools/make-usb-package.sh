@@ -44,8 +44,23 @@ for tool in mformat mmd mcopy dd; do
     fi
 done
 
+# EXTRA_CFLAGS is passed through so a validation stick can select a build
+# variant (e.g. -DHYPE_RUN_SELFTEST_GUESTS=1 to run the M2-M5 battery AND the
+# live guest in ONE cold boot, which is what a serial-less machine needs).
+#
+# A `make clean` first when EXTRA_CFLAGS is set is deliberate and not
+# belt-and-braces: make does NOT track changes to the compiler flags, so a tree
+# already built with different EXTRA_CFLAGS is "up to date" and the flags are
+# silently ignored. That has already cost a wasted hardware run -- the stick
+# looked freshly built and carried the previous variant. A validation image is
+# exactly where that must not happen, so correctness wins over build time here.
+if [ -n "$EXTRA_CFLAGS" ]; then
+    echo "make-usb-package.sh: EXTRA_CFLAGS set ($EXTRA_CFLAGS) -- clean rebuild"
+    echo "  (make does not track flag changes; a stale object would ship the wrong variant)"
+    make -C "$REPO_ROOT" clean >/dev/null
+fi
 echo "make-usb-package.sh: building hype.efi..."
-make -C "$REPO_ROOT"
+make -C "$REPO_ROOT" EXTRA_CFLAGS="$EXTRA_CFLAGS"
 
 echo "make-usb-package.sh: writing directory tree to $OUT_DIR..."
 rm -rf "$OUT_DIR"
@@ -59,6 +74,16 @@ cp "$SCRIPT_DIR/usb-package-README.md" "$OUT_DIR/README.md"
 # to (see Makefile's own `run` target).
 mkdir -p "$OUT_DIR/EFI/hype"
 cp "$REPO_ROOT/fw/OVMF_CODE.fd" "$REPO_ROOT/fw/OVMF_VARS.fd" "$OUT_DIR/EFI/hype/"
+
+# INPUT-8 (#280): optional per-VM scripted input, read from \input\vmN.txt.
+# On a serial-less machine this is what turns "it seemed to boot" into a
+# self-checking PASS/FAIL verdict in the log, so a validation stick usually
+# wants it. Absent = no scripted input, which is the normal default.
+if [ -n "$INPUT_VM0" ] || [ -n "$INPUT_VM1" ]; then
+    mkdir -p "$OUT_DIR/input"
+    [ -n "$INPUT_VM0" ] && cp "$INPUT_VM0" "$OUT_DIR/input/vm0.txt"
+    [ -n "$INPUT_VM1" ] && cp "$INPUT_VM1" "$OUT_DIR/input/vm1.txt"
+fi
 
 if [ -f "$TEST_ISO" ]; then
     mkdir -p "$OUT_DIR/iso"
@@ -96,10 +121,19 @@ mmd -i "$IMG_PATH" ::/EFI/hype
 mcopy -i "$IMG_PATH" "$REPO_ROOT/build/hype.efi" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG_PATH" "$REPO_ROOT/fw/OVMF_CODE.fd" ::/EFI/hype/OVMF_CODE.fd
 mcopy -i "$IMG_PATH" "$REPO_ROOT/fw/OVMF_VARS.fd" ::/EFI/hype/OVMF_VARS.fd
+if [ -n "$INPUT_VM0" ] || [ -n "$INPUT_VM1" ]; then
+    mmd -i "$IMG_PATH" ::/input
+    [ -n "$INPUT_VM0" ] && mcopy -i "$IMG_PATH" "$INPUT_VM0" ::/input/vm0.txt
+    [ -n "$INPUT_VM1" ] && mcopy -i "$IMG_PATH" "$INPUT_VM1" ::/input/vm1.txt
+fi
 if [ -f "$TEST_ISO" ]; then
     mmd -i "$IMG_PATH" ::/iso
     mcopy -i "$IMG_PATH" "$TEST_ISO" ::/iso/test.iso
 fi
+
+# Deliberately NO hype.cfg. That file is what arms a physical-target write, so a
+# validation stick must not carry one: booting this image can never touch a real
+# disk. Adding a hype.cfg is a separate, explicit decision (see #207/#210).
 
 echo
 echo "make-usb-package.sh: done."
