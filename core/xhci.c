@@ -256,3 +256,72 @@ uint64_t hype_xhci_event_trb_ptr(const uint32_t trb[4]) {
 }
 unsigned int hype_xhci_event_port_id(const uint32_t trb[4]) { return (trb[0] >> 24) & 0xFFu; }
 unsigned int hype_xhci_event_xfer_residue(const uint32_t trb[4]) { return trb[2] & 0xFFFFFFu; }
+
+void hype_xhci_parked_reset(hype_xhci_parked_t *p) {
+    unsigned i;
+    for (i = 0; i < HYPE_XHCI_PARKED_MAX; i++) {
+        p->e[i].used = 0;
+        p->e[i].slot = 0;
+        p->e[i].dci = 0;
+        p->e[i].trb = 0;
+        p->e[i].cc = 0;
+    }
+    p->next = 0;
+}
+
+void hype_xhci_parked_put(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, uint64_t trb,
+                          uint32_t cc) {
+    unsigned i;
+
+    /* Replace an existing entry for the same transfer rather than adding a duplicate:
+     * a controller that re-reports a completion must not fill the table. */
+    for (i = 0; i < HYPE_XHCI_PARKED_MAX; i++) {
+        if (p->e[i].used && p->e[i].slot == slot && p->e[i].dci == dci && p->e[i].trb == trb) {
+            p->e[i].cc = cc;
+            return;
+        }
+    }
+    for (i = 0; i < HYPE_XHCI_PARKED_MAX; i++) {
+        if (!p->e[i].used) {
+            p->e[i].used = 1;
+            p->e[i].slot = slot;
+            p->e[i].dci = dci;
+            p->e[i].trb = trb;
+            p->e[i].cc = cc;
+            return;
+        }
+    }
+    /* Full: evict round-robin. A stale parked event is worth less than a fresh one, and
+     * silently refusing to record the newest would recreate the discard bug. */
+    i = p->next % HYPE_XHCI_PARKED_MAX;
+    p->next = (p->next + 1u) % HYPE_XHCI_PARKED_MAX;
+    p->e[i].used = 1;
+    p->e[i].slot = slot;
+    p->e[i].dci = dci;
+    p->e[i].trb = trb;
+    p->e[i].cc = cc;
+}
+
+int hype_xhci_parked_take(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, uint64_t trb,
+                          uint32_t *out_cc) {
+    unsigned i;
+    for (i = 0; i < HYPE_XHCI_PARKED_MAX; i++) {
+        if (p->e[i].used && p->e[i].slot == slot && p->e[i].dci == dci && p->e[i].trb == trb) {
+            if (out_cc != 0) {
+                *out_cc = p->e[i].cc;
+            }
+            p->e[i].used = 0; /* consumed: one event must not satisfy two waits */
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void hype_xhci_parked_drop_slot(hype_xhci_parked_t *p, uint32_t slot) {
+    unsigned i;
+    for (i = 0; i < HYPE_XHCI_PARKED_MAX; i++) {
+        if (p->e[i].used && p->e[i].slot == slot) {
+            p->e[i].used = 0;
+        }
+    }
+}

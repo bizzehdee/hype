@@ -585,6 +585,10 @@ int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
 
 /* One bulk transfer: enqueue a Normal TRB on `ring`, ring the slot doorbell for
  * `dci`, and wait its Transfer Event. Returns 0 on success/short-packet. */
+/* #266 defect 1: completions that arrive for another endpoint are parked here rather
+ * than discarded. See core/xhci.h for why discarding was the bug. */
+static hype_xhci_parked_t g_parked;
+
 static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsigned int *cyc,
                      unsigned int slot, unsigned int dci, uint64_t buf_phys, unsigned int len) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
@@ -595,6 +599,20 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
     hype_xhci_trb_normal(t, buf_phys, len, (int)(*cyc));
     ring_enqueue(ring, enq, cyc, t);
     wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
+    /*
+     * #266: a completion for THIS transfer may already have been parked while another
+     * endpoint was being waited on. Claim it before spinning -- otherwise we would burn
+     * the whole budget waiting for an event that has already been delivered, which is
+     * the same stall by a different route.
+     */
+    {
+        uint32_t parked_cc = 0;
+        if (hype_xhci_parked_take(&g_parked, slot, dci, my_trb, &parked_cc)) {
+            return (parked_cc == HYPE_XHCI_CC_SUCCESS || parked_cc == HYPE_XHCI_CC_SHORT_PACKET)
+                       ? 0
+                       : -1;
+        }
+    }
     while (guard-- != 0u) {
         if (next_event(bar, c->rtsoff, evt) != 0) {
             /*
@@ -651,8 +669,23 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
             {
                 static int s1 = 0;
                 g_bulk_foreign_seen++;
+                /*
+                 * #266: PARK it, do not discard it. This controller delivers events late
+                 * (the command ring already needed the same leniency, #254), so this is
+                 * usually the OTHER direction's completion arriving out of order -- not
+                 * corruption. Discarding it stranded the transfer that was waiting on its
+                 * own endpoint, BOT declared a lost completion, and the write path died.
+                 *
+                 * Attribution stays strict: the parked event can only ever be claimed by
+                 * the exact (slot, dci, trb) it names, so no data can land in the wrong
+                 * buffer. Strictness protects attribution; it must not demand an arrival
+                 * ORDER this controller declines to provide.
+                 */
+                hype_xhci_parked_put(&g_parked, hype_xhci_event_slot_id(evt),
+                                     hype_xhci_event_ep_id(evt), hype_xhci_event_trb_ptr(evt),
+                                     hype_xhci_event_cc(evt));
                 if (s1++ < 8) {
-                    hype_debug_print("host-xhci: #254 discarding stale transfer event "
+                    hype_debug_print("host-xhci: #266 parking out-of-order transfer event "
                                      "(slot=%u ep=%u trb=0x%llx cc=%u, wanted slot=%u ep=%u "
                                      "trb=0x%llx)\n",
                                      hype_xhci_event_slot_id(evt), hype_xhci_event_ep_id(evt),
@@ -746,11 +779,19 @@ static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, 
  * Clear-HALT on both bulk endpoints, plus xHCI-side ring recovery on both.
  */
 static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc) {
+    /*
+     * #266: discard this slot's parked completions FIRST. ep_recover() restarts the
+     * transfer rings at index 0, so the retry's first TRB lands at the same physical
+     * address the abandoned transfer used -- a parked event for the torn-down state would
+     * then be claimed by the retry and report someone else's result. Keeping the parking
+     * table without this would trade the discard bug for #254's mis-attribution bug.
+     */
     unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
     unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
     int rc = 0;
 
     hype_debug_print("host-xhci: #254 BOT reset recovery (slot=%u)\n", slot);
+    hype_xhci_parked_drop_slot(&g_parked, slot);
 
     /* Quiesce both rings first so nothing is in flight during the reset. */
     if (ep_recover(c, slot, dci_in, g_bulk_in_ring, &g_bin_enq, &g_bin_cyc) != 0) rc = -1;

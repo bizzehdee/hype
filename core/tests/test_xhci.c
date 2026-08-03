@@ -333,6 +333,74 @@ static void test_recovery_trbs(void) {
     CHECK_HEX("event ep id max", 31u, hype_xhci_event_ep_id(evt));
 }
 
+static void test_parked_events(void) {
+    hype_xhci_parked_t p;
+    uint32_t cc = 0;
+
+    hype_xhci_parked_reset(&p);
+    /* #266: nothing parked yet. */
+    CHECK_HEX("empty table takes nothing", 0, hype_xhci_parked_take(&p, 1, 4, 0x1000, &cc));
+
+    /* The observed case: a completion for ep=3 arrives while ep=4 is awaited. It must be
+     * REMEMBERED, not discarded -- discarding is what stranded the BOT state machine. */
+    hype_xhci_parked_put(&p, 1, 3, 0x140425000ull, 1);
+    CHECK_HEX("wrong endpoint does not claim it", 0,
+              hype_xhci_parked_take(&p, 1, 4, 0x140425000ull, &cc));
+    CHECK_HEX("wrong trb does not claim it", 0, hype_xhci_parked_take(&p, 1, 3, 0x999, &cc));
+    CHECK_HEX("wrong slot does not claim it", 0,
+              hype_xhci_parked_take(&p, 2, 3, 0x140425000ull, &cc));
+    /* Only the exact (slot,dci,trb) may claim it -- that is what keeps data out of the
+     * wrong buffer, which is #254's original corruption. */
+    CHECK_HEX("exact match claims it", 1, hype_xhci_parked_take(&p, 1, 3, 0x140425000ull, &cc));
+    CHECK_HEX("completion code carried through", 1, cc);
+    /* Consumed: one event must never satisfy two waits. */
+    CHECK_HEX("not claimable twice", 0, hype_xhci_parked_take(&p, 1, 3, 0x140425000ull, &cc));
+}
+
+static void test_parked_no_duplicates(void) {
+    hype_xhci_parked_t p;
+    uint32_t cc = 0;
+    unsigned i;
+    hype_xhci_parked_reset(&p);
+    /* A controller that re-reports the same completion must not fill the table. */
+    for (i = 0; i < HYPE_XHCI_PARKED_MAX * 3u; i++) {
+        hype_xhci_parked_put(&p, 1, 3, 0x2000, 1);
+    }
+    CHECK_HEX("re-reported event stored once", 1, hype_xhci_parked_take(&p, 1, 3, 0x2000, &cc));
+    CHECK_HEX("and only once", 0, hype_xhci_parked_take(&p, 1, 3, 0x2000, &cc));
+}
+
+static void test_parked_overflow_keeps_newest(void) {
+    hype_xhci_parked_t p;
+    uint32_t cc = 0;
+    unsigned i;
+    hype_xhci_parked_reset(&p);
+    for (i = 0; i < HYPE_XHCI_PARKED_MAX + 2u; i++) {
+        hype_xhci_parked_put(&p, 1, 3, 0x3000ull + i, i);
+    }
+    /* The newest must still be there: silently refusing to record it would recreate the
+     * discard bug this whole table exists to fix. */
+    CHECK_HEX("newest survives overflow", 1,
+              hype_xhci_parked_take(&p, 1, 3, 0x3000ull + HYPE_XHCI_PARKED_MAX + 1u, &cc));
+}
+
+static void test_parked_drop_slot(void) {
+    hype_xhci_parked_t p;
+    uint32_t cc = 0;
+    hype_xhci_parked_reset(&p);
+    hype_xhci_parked_put(&p, 1, 3, 0x4000, 1);
+    hype_xhci_parked_put(&p, 2, 3, 0x4000, 1);
+    /*
+     * After a reset the rings restart at index 0, so a parked event for the torn-down
+     * state carries a TRB address the RETRY is about to reuse -- and would be claimed by
+     * the wrong transfer. Dropping the slot's parked events is what stops the fix from
+     * reintroducing #254's mis-attribution.
+     */
+    hype_xhci_parked_drop_slot(&p, 1);
+    CHECK_HEX("slot 1 dropped", 0, hype_xhci_parked_take(&p, 1, 3, 0x4000, &cc));
+    CHECK_HEX("other slot untouched", 1, hype_xhci_parked_take(&p, 2, 3, 0x4000, &cc));
+}
+
 int main(void) {
     test_recovery_trbs();
     test_reg_offsets();
@@ -343,6 +411,11 @@ int main(void) {
     test_cmd_trbs();
     test_control_transfer_trbs();
     test_event_decode();
+
+    test_parked_events();
+    test_parked_no_duplicates();
+    test_parked_overflow_keeps_newest();
+    test_parked_drop_slot();
 
     if (failures == 0) {
         printf("all tests passed\n");

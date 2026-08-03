@@ -452,4 +452,64 @@ int hype_xhci_msc_read(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
 int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                         uint32_t lba, unsigned int blocks, unsigned int block_size, const void *buf);
 
+/*
+ * #266 defect 1: a parking table for transfer completions that arrive for an endpoint
+ * OTHER than the one currently being waited on.
+ *
+ * Controller 1022:15e0 demonstrably delivers events late -- the command ring already
+ * needed leniency for exactly this (#254), and the log says so in as many words. On the
+ * BULK rings matching was kept strict, because mis-attributing a DATA completion is
+ * what caused #254's original corruption (a CBW written into the medium as sector
+ * data). But strict was implemented as DISCARD, and that is the bug: the late event for
+ * the other direction was thrown away, the transfer waiting on its own endpoint never
+ * completed, and BOT declared a lost completion. Recovery then ran three times and the
+ * write path stayed dead.
+ *
+ * Parking keeps both properties at once: an event is still only ever applied to the
+ * exact (slot, dci, trb) it names -- so no data can land in the wrong buffer -- but it
+ * is REMEMBERED instead of dropped, so the endpoint it belongs to can consume it when
+ * its turn comes. Strictness protects attribution; it must not require events to arrive
+ * in an order this controller declines to deliver them in.
+ *
+ * Small and fixed-size: only a handful of transfers are ever outstanding (one bulk-in
+ * and one bulk-out per BOT stage), so 8 slots is generous. A full table drops the
+ * OLDEST entry, since a stale parked event is worth less than a fresh one.
+ */
+#define HYPE_XHCI_PARKED_MAX 8u
+
+typedef struct {
+    uint32_t slot;
+    uint32_t dci;
+    uint64_t trb;
+    uint32_t cc;
+    int used;
+} hype_xhci_parked_evt_t;
+
+typedef struct {
+    hype_xhci_parked_evt_t e[HYPE_XHCI_PARKED_MAX];
+    uint32_t next; /* round-robin victim when full */
+} hype_xhci_parked_t;
+
+void hype_xhci_parked_reset(hype_xhci_parked_t *p);
+
+/* Remember a completion that is not the one currently awaited. */
+void hype_xhci_parked_put(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, uint64_t trb,
+                          uint32_t cc);
+
+/*
+ * Claim a previously parked completion for exactly this (slot, dci, trb). Returns 1 and
+ * writes *out_cc when found, and REMOVES it so a single event cannot satisfy two waits.
+ * Returns 0 otherwise.
+ */
+int hype_xhci_parked_take(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, uint64_t trb,
+                          uint32_t *out_cc);
+
+/*
+ * Drop every parked event for a slot. Called after a reset/recovery: the transfer rings
+ * restart at index 0, so a parked event for the torn-down state would carry a TRB
+ * address the RETRY is about to reuse -- and would then be claimed by the wrong
+ * transfer. That is precisely the mis-attribution strictness exists to prevent.
+ */
+void hype_xhci_parked_drop_slot(hype_xhci_parked_t *p, uint32_t slot);
+
 #endif /* HYPE_CORE_XHCI_H */
