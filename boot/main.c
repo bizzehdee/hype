@@ -419,6 +419,17 @@ typedef struct hype_fw_vm {
     hype_input_script_t in_script;
     hype_input_runner_t in_runner;
     int in_script_armed; /* a script loaded and parsed cleanly for THIS vm */
+    int in_verdict_reported; /* INPUT-9 (#282): verdict line already emitted */
+    uint64_t in_started_ms;  /* for the elapsed figure in the verdict line */
+    /*
+     * #282: a ring of the guest's most recent console bytes. A bare
+     * "expected X, not seen" sends the reader back into a 2000-line interleaved log
+     * to find out what the guest said INSTEAD, which on the cold-boot-only laptop
+     * may not even be recoverable. So keep the tail and print it with a failure.
+     */
+    uint8_t in_tail[256];
+    uint32_t in_tail_len;
+    uint32_t in_tail_head;
 
     /*
      * #274: the second-level translation root this VM was ACTUALLY launched
@@ -6015,6 +6026,22 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
  * (0/1) and which UART (ttyS0/ttyS1) it came from, so the two concurrent
  * guests' output is line-attributable on the shared host UART instead of an
  * indistinguishable char-interleaved blur. */
+/* INPUT-7 (#280): defined with the rest of the scripted-input plumbing further down. */
+static void fw_1_script_feed(hype_fw_vm_t *vm, uint8_t byte);
+static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uart_t *uart,
+                             uint64_t now_ms);
+/*
+ * #280: milliseconds since this VM started, from the host TSC.
+ *
+ * The runner takes the clock as a parameter precisely so it can be unit-tested (#279);
+ * this is the one place that turns real hardware time into that parameter. Divides
+ * first to keep the intermediate away from overflowing on a long run.
+ */
+static uint64_t fw_1_script_now_ms(const hype_fw_vm_t *vm, uint64_t tsc) {
+    uint64_t khz = vm->host_tsc_hz / 1000ull;
+    return (khz == 0ull) ? 0ull : (tsc / khz);
+}
+
 static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_filter_t *filter, char *line,
                                              unsigned int *line_len, unsigned int line_cap,
                                              unsigned vm_idx, unsigned port, hype_vt_screen_t *term) {
@@ -6030,6 +6057,16 @@ static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_fil
         if (term) {
             hype_vt_screen_feed(term, b);
         }
+        /*
+         * INPUT-7 (#280): the scripted-input runner sees the RAW byte, before escape
+         * stripping and before line buffering.
+         *
+         * Raw because that is what the guest actually sent and what the expect
+         * patterns are written against; before line buffering because
+         * `localhost login:` has NO trailing newline, so a matcher fed only complete
+         * lines would never see the one prompt this feature exists to wait for.
+         */
+        fw_1_script_feed(&g_vms[vm_idx], b);
         if (!hype_vt_filter(filter, b, &c)) {
             continue;
         }
@@ -7391,6 +7428,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         hype_fatal("fw-1: vcpu_create failed");
     }
     vm->used_root = npt_root_phys; /* #274 */
+    /* INPUT-7 (#280): start this VM's script clock alongside its guest. */
+    if (vm->in_script_armed) {
+        vm->in_started_ms = fw_1_script_now_ms(vm, hype_rdtsc());
+        vm->in_verdict_reported = 0;
+        vm->in_tail_len = 0;
+        vm->in_tail_head = 0;
+        hype_input_runner_init(&vm->in_runner, &vm->in_script, vm->in_started_ms);
+        hype_debug_print("fw-1 SCRIPT vm%u: armed, %u directive(s) -- driving this guest\n",
+                         (unsigned)(vm - g_vms), vm->in_script.count);
+    }
 
     /* PVCLOCK (kvmclock): register THIS vCPU's guest-memory map + host TSC
      * frequency so the guest's KVM SYSTEM_TIME/WALL_CLOCK MSR writes fill its
@@ -8981,6 +9028,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                      &uart_line_len2, (unsigned int)sizeof(uart_line2),
                                                      (unsigned)(vm - g_vms), 1u, (hype_vt_screen_t *)0);
         }
+
+        /*
+         * INPUT-7 (#280): advance this VM's script every iteration, not on the ~30s
+         * dashboard tick -- a `send` that waits half a minute after its prompt would
+         * miss a countdown, and the expect timeouts are measured in seconds.
+         *
+         * Deliberately OUTSIDE the drain guard above: a script may be waiting on a
+         * `delay`, or on an expect timeout, with the guest emitting nothing at all.
+         * Gating this on "the guest produced output" would hang exactly the scripts
+         * whose job is to notice that it did not.
+         */
+        fw_1_script_step(vm, (unsigned)(vm - g_vms), &g_fw_1_uart,
+                         fw_1_script_now_ms(vm, hype_rdtsc()));
 
         /* RT-2c: push the deferred GOP shadow buffer to the real framebuffer
          * at ~60 Hz. All hype_debug_print/guest-console text since the last
@@ -10659,6 +10719,140 @@ static void load_input_script(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTa
     vm->in_script_armed = 1;
     hype_debug_print("input: vm%u armed %s (%llu bytes, %u directive(s))\n", vm_index, pname,
                      (unsigned long long)sz, vm->in_script.count);
+}
+
+/*
+ * INPUT-9 (#282): report a VM's script verdict.
+ *
+ * This is the slice that makes §6k a validation tool rather than a typing gadget: a
+ * headless run must SELF-REPORT, because on the cold-boot-only laptop the log is the
+ * only telemetry there is and silence is not evidence of success.
+ *
+ * Prints on PASS as well as FAIL, and the latch here is per-VM and set only AFTER
+ * the line is emitted -- the #274 isolation probe was first written with a one-shot
+ * flag that silently suppressed the very verdict it guarded, so the ordering matters.
+ */
+static void fw_1_report_script_verdict(hype_fw_vm_t *vm, unsigned vm_index, uint64_t now_ms) {
+    hype_input_verdict_t v;
+    hype_input_reason_t reason;
+
+    if (!vm->in_script_armed || vm->in_verdict_reported) {
+        return;
+    }
+    v = hype_input_runner_verdict(&vm->in_runner);
+    if (v == HYPE_INPUT_VERDICT_PENDING) {
+        return;
+    }
+    reason = hype_input_runner_reason(&vm->in_runner);
+
+    hype_debug_print("fw-1 SCRIPT vm%u: %s %s (%u directive(s), %llums)\n", vm_index,
+                     (v == HYPE_INPUT_VERDICT_PASS) ? "PASS" : "FAIL",
+                     hype_input_reason_str(reason), vm->in_script.count,
+                     (unsigned long long)(now_ms - vm->in_started_ms));
+
+    /*
+     * One small stack buffer, printed in chunks, for BOTH the label and the guest
+     * tail. Two larger buffers pushed the frame past the UEFI stack-probe threshold
+     * and the link failed with an undefined __chkstk -- a freestanding build has no
+     * stack-probe helper, so a big frame is a link error rather than a runtime cost.
+     * Not `static`: two VMs report from their own cores and would race on it.
+     */
+    {
+        char buf[64];
+        uint32_t i, n;
+
+        /* Name the label / pattern involved. Non-printables shown as '.' so a stray
+         * control byte cannot scramble the log line it is reported on. */
+        n = 0;
+        for (i = 0; i < vm->in_runner.detail_len; i++) {
+            uint8_t c = vm->in_runner.detail[i];
+            buf[n] = (c >= 0x20u && c < 0x7Fu) ? (char)c : '.';
+            n++;
+            if (n == sizeof(buf) - 1u) {
+                buf[n] = '\0';
+                hype_debug_print("fw-1 SCRIPT vm%u:   at line %u: %s\n", vm_index,
+                                 vm->in_runner.detail_line, buf);
+                n = 0;
+            }
+        }
+        if (n != 0) {
+            buf[n] = '\0';
+            hype_debug_print("fw-1 SCRIPT vm%u:   at line %u: %s\n", vm_index,
+                             vm->in_runner.detail_line, buf);
+        }
+
+        /* On failure, the guest's last words -- oldest first out of the ring. A bare
+         * "expected X, not seen" otherwise sends the reader back into a 2000-line
+         * interleaved log to find what the guest said instead, which on the
+         * cold-boot-only laptop may not be recoverable at all. */
+        if (v == HYPE_INPUT_VERDICT_FAIL && vm->in_tail_len != 0) {
+            uint32_t total = vm->in_tail_len;
+            uint32_t start = (vm->in_tail_head + (uint32_t)sizeof(vm->in_tail) - total) %
+                             (uint32_t)sizeof(vm->in_tail);
+            n = 0;
+            for (i = 0; i < total; i++) {
+                uint8_t c = vm->in_tail[(start + i) % (uint32_t)sizeof(vm->in_tail)];
+                buf[n] = (c >= 0x20u && c < 0x7Fu) ? (char)c : '.';
+                n++;
+                if (n == sizeof(buf) - 1u) {
+                    buf[n] = '\0';
+                    hype_debug_print("fw-1 SCRIPT vm%u:   tail| %s\n", vm_index, buf);
+                    n = 0;
+                }
+            }
+            if (n != 0) {
+                buf[n] = '\0';
+                hype_debug_print("fw-1 SCRIPT vm%u:   tail| %s\n", vm_index, buf);
+            }
+        }
+    }
+
+    vm->in_verdict_reported = 1;
+}
+
+/*
+ * INPUT-7 (#280): advance this VM's script -- deliver any SEND into the guest's own
+ * UART receive ring, and report the verdict once it settles.
+ *
+ * Injected bytes go through hype_guest_uart_rx_enqueue, the SAME queue and the same
+ * IRQ path a real received character takes, so the guest cannot tell scripted input
+ * from a human at a keyboard. Deliberately not shortcut past the UART model: a
+ * back-door that bypassed it would be testing something the guest never sees.
+ *
+ * Per-VM throughout -- runner, tail and target UART all come from `vm`.
+ */
+static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uart_t *uart,
+                             uint64_t now_ms) {
+    hype_input_action_t act;
+
+    if (!vm->in_script_armed) {
+        return;
+    }
+    for (;;) {
+        hype_input_action_kind_t k = hype_input_runner_poll(&vm->in_runner, now_ms, &act);
+        if (k == HYPE_INPUT_ACTION_SEND) {
+            uint32_t i;
+            for (i = 0; i < act.len; i++) {
+                hype_guest_uart_rx_enqueue(uart, act.data[i]);
+            }
+            continue; /* a script may send twice in a row */
+        }
+        break;
+    }
+    fw_1_report_script_verdict(vm, vm_index, now_ms);
+}
+
+/* Feed one guest console byte to this VM's runner and keep the failure-context tail. */
+static void fw_1_script_feed(hype_fw_vm_t *vm, uint8_t byte) {
+    if (!vm->in_script_armed) {
+        return;
+    }
+    vm->in_tail[vm->in_tail_head] = byte;
+    vm->in_tail_head = (vm->in_tail_head + 1u) % sizeof(vm->in_tail);
+    if (vm->in_tail_len < sizeof(vm->in_tail)) {
+        vm->in_tail_len++;
+    }
+    hype_input_runner_feed(&vm->in_runner, byte);
 }
 
 static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
