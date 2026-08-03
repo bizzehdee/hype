@@ -6,6 +6,8 @@
 #include "../core/vt_screen.h"
 #include "../core/vt_render.h"
 #include "../core/dashboard.h"
+#include "../core/input_runner.h"
+#include "../core/input_script.h"
 #include "../core/vm_isolation.h"
 #include "../core/vm_lifecycle.h"
 #include "../core/cmdparse.h"
@@ -408,6 +410,16 @@ typedef struct hype_fw_vm {
     hype_ept_pte_t ept_pml4[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     hype_ept_pte_t ept_pdpt[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     hype_ept_pte_t ept_pd[HYPE_FW_1_NPT_GB][HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+    /*
+     * INPUT-8 (#281): this VM's own scripted-input state -- the parsed script and the
+     * runner driving it. PER-VM, never file-scope: a shared script buffer would type
+     * guest 0's root password into guest 1, which is the same class of bug as #276
+     * and #277 and the reason those exist.
+     */
+    hype_input_script_t in_script;
+    hype_input_runner_t in_runner;
+    int in_script_armed; /* a script loaded and parsed cleanly for THIS vm */
+
     /*
      * #274: the second-level translation root this VM was ACTUALLY launched
      * with -- recorded at vcpu_create, not inferred from which array exists.
@@ -10579,6 +10591,76 @@ static int load_iso_into_vm(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTabl
 static hype_cfg_t g_hype_cfg;                 /* parsed config; vm_count 0 => none/fallback */
 static char g_hype_cfg_text[16384];           /* scratch; parser mutates in place */
 
+/*
+ * INPUT-8 (#281): load this VM's expect script from the ESP.
+ *
+ * Path convention mirrors the per-VM ISO drop (GLADDER-9): \input\vm0.txt,
+ * \input\vm1.txt. A separate file rather than a hype.cfg key on purpose --
+ * hype.cfg has the all-or-nothing required-fields rule, so a malformed test script
+ * must not be able to invalidate the machine's whole configuration.
+ *
+ * ABSENT FILE = NO SCRIPTING, byte-identical behaviour to before. That matters
+ * beyond tidiness: the SONY validation stick deliberately ships without a hype.cfg
+ * so nothing destructive can be armed by accident, and a test facility must not
+ * become the exception that reintroduces implicit behaviour.
+ *
+ * Every outcome is logged, including absence. "No script line in the log" must never
+ * be ambiguous between not-armed and failed-to-load -- the #274 isolation probe
+ * already caught me out once with a silent path.
+ */
+static char g_in_script_text[8192];
+
+static void load_input_script(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable,
+                              hype_fw_vm_t *vm, unsigned vm_index) {
+    EFI_FILE_PROTOCOL *root = 0;
+    EFI_STATUS st;
+    UINT64 sz = 0;
+    hype_input_parse_result_t pr;
+    CHAR16 *path = (vm_index == 0u) ? (CHAR16 *)L"\\input\\vm0.txt" : (CHAR16 *)L"\\input\\vm1.txt";
+    const char *pname = (vm_index == 0u) ? "\\input\\vm0.txt" : "\\input\\vm1.txt";
+
+    vm->in_script_armed = 0;
+    vm->in_script.count = 0;
+
+    st = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
+    if (st != EFI_SUCCESS || root == 0) {
+        hype_debug_print("input: vm%u cannot open ESP root (0x%llx) -- no scripted input\n",
+                         vm_index, (unsigned long long)st);
+        return;
+    }
+    st = hype_file_get_size(root, SystemTable->BootServices, path, &sz);
+    if (st != EFI_SUCCESS) {
+        hype_debug_print("input: vm%u no %s -- no scripted input (this is the default)\n", vm_index,
+                         pname);
+        return;
+    }
+    if (sz == 0 || sz >= sizeof(g_in_script_text)) {
+        hype_debug_print("input: vm%u %s size %llu unusable (1..%llu) -- no scripted input\n",
+                         vm_index, pname, (unsigned long long)sz,
+                         (unsigned long long)(sizeof(g_in_script_text) - 1u));
+        return;
+    }
+    st = hype_file_read_range(root, path, 0, g_in_script_text, (UINTN)sz);
+    if (st != EFI_SUCCESS) {
+        hype_debug_print("input: vm%u read %s failed (0x%llx) -- no scripted input\n", vm_index,
+                         pname, (unsigned long long)st);
+        return;
+    }
+
+    pr = hype_input_script_parse(g_in_script_text, (uint32_t)sz, &vm->in_script);
+    if (pr.status != HYPE_INPUT_PARSE_OK) {
+        /* Loud and specific, with the line number, and NOT half-armed: a script that
+         * partly ran would type a fragment of a command into a root shell. */
+        hype_debug_print("input: vm%u %s PARSE ERROR line %u: %s -- refusing to arm\n", vm_index,
+                         pname, pr.line, hype_input_parse_status_str(pr.status));
+        vm->in_script.count = 0;
+        return;
+    }
+    vm->in_script_armed = 1;
+    hype_debug_print("input: vm%u armed %s (%llu bytes, %u directive(s))\n", vm_index, pname,
+                     (unsigned long long)sz, vm->in_script.count);
+}
+
 static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_FILE_PROTOCOL *root = 0;
     EFI_STATUS st;
@@ -10978,6 +11060,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * absent/malformed -> empty config + built-in fallback, never a boot stop.
      * #125/#126 consume the parsed physical target + partition qualifiers. */
     load_hype_cfg(ImageHandle, SystemTable);
+    /*
+     * INPUT-8 (#281): load each VM's expect script here, PRE-EBS, because this is the
+     * last point where the UEFI Simple File System is usable. Both VMs are loaded
+     * unconditionally even when only one runs -- an absent file is the normal case
+     * and costs one log line.
+     */
+    load_input_script(ImageHandle, SystemTable, &g_vms[0], 0u);
+#if HYPE_RUN_TWO_VMS
+    load_input_script(ImageHandle, SystemTable, &g_vms[1], 1u);
+#endif
 
     SystemTable->BootServices->FreePool(map);
 
