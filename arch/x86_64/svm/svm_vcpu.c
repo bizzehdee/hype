@@ -2670,6 +2670,25 @@ void hype_virtio_blk_set_reject_sink(void (*sink)(const char *why)) {
     g_virtio_blk_rejects = 0;
 }
 
+/* Variant that names the offending value. A reject reason without the number is
+ * half a diagnostic: "unsupported request type" sent the reader back to the spec
+ * to guess which, on the first real-hardware run this logging ever did. */
+static void virtio_blk_reject_val(const char *why, uint32_t value) {
+    g_virtio_blk_rejects++;
+    if (g_virtio_blk_rejects > HYPE_VIRTIO_BLK_REJECT_LOG_MAX) {
+        return;
+    }
+    if (g_virtio_blk_reject_sink != 0) {
+        g_virtio_blk_reject_sink(why);
+        return;
+    }
+    hype_debug_print("virtio-blk: request REJECTED (#%u): %s (0x%x)\n",
+                     (unsigned)g_virtio_blk_rejects, why, (unsigned)value);
+    if (g_virtio_blk_rejects == HYPE_VIRTIO_BLK_REJECT_LOG_MAX) {
+        hype_debug_print("virtio-blk: further rejections will not be logged\n");
+    }
+}
+
 static void virtio_blk_reject(const char *why) {
     g_virtio_blk_rejects++;
     if (g_virtio_blk_rejects > HYPE_VIRTIO_BLK_REJECT_LOG_MAX) {
@@ -2951,7 +2970,7 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
             status_value = HYPE_VIRTIO_BLK_S_OK;
             used_len = 1;
         } else {
-            virtio_blk_reject("unsupported request type");
+            virtio_blk_reject_val("unsupported request type", req_type);
             status_value = HYPE_VIRTIO_BLK_S_UNSUPP;
             used_len = 1;
         }
