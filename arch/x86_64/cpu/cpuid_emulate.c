@@ -62,9 +62,32 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
 
     if (eax_in == 0) {
         out->eax = HYPE_CPUID_MAX_BASIC_LEAF; /* max basic leaf supported (reaches 0xD XSAVE) */
-        out->ebx = 0x68747541u; /* "Auth" */
-        out->edx = 0x69746e65u; /* "enti" */
-        out->ecx = 0x444d4163u; /* "cAMD" */
+        /*
+         * #298: the vendor string is PASSED THROUGH from the real CPU. It used to
+         * be hardcoded to "AuthenticAMD" here and at leaf 0x80000000, which meant
+         * every guest was told it was on AMD whatever the silicon.
+         *
+         * That was accurate for as long as hype was SVM-only, and stayed accurate
+         * on the AMD box, so only a cross-vendor hardware run could expose it. On
+         * the Intel box the guest's /proc/cpuinfo read "AuthenticAMD" and Linux
+         * acted on it -- it probed amd_pstate, AMD's cpufreq driver, on an Intel
+         * CPU.
+         *
+         * Worse than a wrong label: leaf 1 below passes the REAL
+         * family/model/stepping through, so the guest saw genuine Intel model IDs
+         * wearing an AMD vendor string and decoded them under AMD rules. Vendor
+         * also steers speculative-execution mitigation selection, so a false one
+         * is a security-relevant input, not a cosmetic string.
+         *
+         * Deliberately NOT hardcoded to Intel instead -- that just reproduces the
+         * same bug on the other machine. The only correct source is the CPU.
+         *
+         * EAX stays synthesized: the max-leaf clamp is the one part of this leaf
+         * hype must own, because it bounds which leaves a guest will ask for.
+         */
+        out->ebx = real->ebx;
+        out->edx = real->edx;
+        out->ecx = real->ecx;
         return;
     }
 
@@ -204,9 +227,14 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
 
     if (eax_in == 0x80000000u) {
         out->eax = 0x80000008u; /* max extended leaf supported */
-        out->ebx = 0x68747541u; /* "Auth" */
-        out->edx = 0x69746e65u; /* "enti" */
-        out->ecx = 0x444d4163u; /* "cAMD" */
+        /* #298: real vendor, same reasoning as leaf 0 -- and it must agree with
+         * leaf 0, since a guest reading both and finding them different has no
+         * sane interpretation available. Both extended leaves hype then models
+         * (0x80000001/7/8) are defined on Intel too, and 0x80000001 already masks
+         * the SVM bit off, so nothing here depended on the guest believing AMD. */
+        out->ebx = real->ebx;
+        out->edx = real->edx;
+        out->ecx = real->ecx;
         return;
     }
 

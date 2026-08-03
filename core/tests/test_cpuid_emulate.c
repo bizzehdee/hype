@@ -12,16 +12,66 @@ static int failures = 0;
         } \
     } while (0)
 
-static void test_leaf0_vendor_string(void) {
-    hype_cpuid_result_t real = {0, 0, 0, 0}; /* unused for leaf 0 */
+/* Vendor strings as CPUID returns them, in EBX/EDX/ECX order. */
+#define VENDOR_INTEL_EBX 0x756E6547u /* "Genu" */
+#define VENDOR_INTEL_EDX 0x49656E69u /* "ineI" */
+#define VENDOR_INTEL_ECX 0x6C65746Eu /* "ntel" */
+#define VENDOR_AMD_EBX 0x68747541u   /* "Auth" */
+#define VENDOR_AMD_EDX 0x69746E65u   /* "enti" */
+#define VENDOR_AMD_ECX 0x444D4163u   /* "cAMD" */
+
+/*
+ * #298: the vendor string must come from the REAL CPU, not a constant.
+ *
+ * The test this replaces asserted the opposite -- it passed real={0,0,0,0} with
+ * the comment "unused for leaf 0" and then checked for the AMD constants. So the
+ * bug was not merely untested, it was pinned by a green test that made a
+ * hardcoded vendor look like the intended design. A hardware run on Intel is
+ * what eventually caught it: the guest read "AuthenticAMD" and probed amd_pstate
+ * on an Intel CPU.
+ *
+ * Both vendors are exercised deliberately. Checking only one cannot distinguish
+ * "passes the vendor through" from "hardcodes the vendor I happened to test".
+ */
+static void test_leaf0_vendor_is_passed_through(void) {
     hype_cpuid_result_t out;
 
-    hype_cpuid_emulate(0, 0, &real, &out);
+    {
+        hype_cpuid_result_t intel = {0x00000020u, VENDOR_INTEL_EBX, VENDOR_INTEL_ECX,
+                                     VENDOR_INTEL_EDX};
+        hype_cpuid_emulate(0, 0, &intel, &out);
+        CHECK_HEX("Intel host: max basic leaf still clamped", 0x0Du, out.eax);
+        CHECK_HEX("Intel host: ebx \"Genu\"", VENDOR_INTEL_EBX, out.ebx);
+        CHECK_HEX("Intel host: edx \"ineI\"", VENDOR_INTEL_EDX, out.edx);
+        CHECK_HEX("Intel host: ecx \"ntel\"", VENDOR_INTEL_ECX, out.ecx);
+    }
+    {
+        hype_cpuid_result_t amd = {0x00000010u, VENDOR_AMD_EBX, VENDOR_AMD_ECX, VENDOR_AMD_EDX};
+        hype_cpuid_emulate(0, 0, &amd, &out);
+        CHECK_HEX("AMD host: max basic leaf still clamped", 0x0Du, out.eax);
+        CHECK_HEX("AMD host: ebx \"Auth\"", VENDOR_AMD_EBX, out.ebx);
+        CHECK_HEX("AMD host: edx \"enti\"", VENDOR_AMD_EDX, out.edx);
+        CHECK_HEX("AMD host: ecx \"cAMD\"", VENDOR_AMD_ECX, out.ecx);
+    }
+}
 
-    CHECK_HEX("max basic leaf", 0x0Du, out.eax); /* reaches leaf 0xD (XSAVE) */
-    CHECK_HEX("ebx \"Auth\"", 0x68747541u, out.ebx);
-    CHECK_HEX("edx \"enti\"", 0x69746e65u, out.edx);
-    CHECK_HEX("ecx \"cAMD\"", 0x444d4163u, out.ecx);
+/* Extended leaf 0x80000000 carries the vendor string too, and it must AGREE with
+ * leaf 0 -- a guest that reads both and finds them different has no sane
+ * interpretation available. Asserted as equality between the two leaves rather
+ * than against a constant, so the requirement is "they match", which is the
+ * thing that actually matters. */
+static void test_ext_leaf0_vendor_matches_basic_leaf0(void) {
+    hype_cpuid_result_t intel = {0x00000020u, VENDOR_INTEL_EBX, VENDOR_INTEL_ECX,
+                                 VENDOR_INTEL_EDX};
+    hype_cpuid_result_t basic, ext;
+
+    hype_cpuid_emulate(0, 0, &intel, &basic);
+    hype_cpuid_emulate(0x80000000u, 0, &intel, &ext);
+
+    CHECK_HEX("max extended leaf", 0x80000008u, ext.eax);
+    CHECK_HEX("ext vendor ebx matches leaf 0", basic.ebx, ext.ebx);
+    CHECK_HEX("ext vendor edx matches leaf 0", basic.edx, ext.edx);
+    CHECK_HEX("ext vendor ecx matches leaf 0", basic.ecx, ext.ecx);
 }
 
 static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
@@ -60,18 +110,6 @@ static void test_leaf1_mtrr_already_clear_is_idempotent(void) {
     hype_cpuid_emulate(1, 0, &real, &out);
 
     CHECK_HEX("edx unchanged when MTRR bit already clear", real.edx, out.edx);
-}
-
-static void test_leaf_extended_max_vendor_string(void) {
-    hype_cpuid_result_t real = {0, 0, 0, 0};
-    hype_cpuid_result_t out;
-
-    hype_cpuid_emulate(0x80000000u, 0, &real, &out);
-
-    CHECK_HEX("max extended leaf", 0x80000008u, out.eax);
-    CHECK_HEX("ebx \"Auth\"", 0x68747541u, out.ebx);
-    CHECK_HEX("edx \"enti\"", 0x69746e65u, out.edx);
-    CHECK_HEX("ecx \"cAMD\"", 0x444d4163u, out.ecx);
 }
 
 static void test_leaf_ext1_clears_svm_bit(void) {
@@ -313,10 +351,10 @@ static void test_leafd_masks_xsaves(void) {
 }
 
 int main(void) {
-    test_leaf0_vendor_string();
+    test_leaf0_vendor_is_passed_through();
+    test_ext_leaf0_vendor_matches_basic_leaf0();
     test_leaf1_forces_hypervisor_bit_and_clears_mtrr();
     test_leaf1_mtrr_already_clear_is_idempotent();
-    test_leaf_extended_max_vendor_string();
     test_leaf_ext1_clears_svm_bit();
     test_leaf_ext1_svm_already_clear_is_idempotent();
     test_leaf_ext8_address_sizes_passthrough();

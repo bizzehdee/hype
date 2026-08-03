@@ -51,7 +51,9 @@ typedef struct {
  * leaf/subleaf). Pure logic, no CPU access of its own -- fully unit
  * tested. Handled leaves:
  *
- *   0            -- max basic leaf = 0xD; vendor string "AuthenticAMD"
+ *   0            -- max basic leaf = 0xD; vendor string passed through from
+ *                   the real CPU (#298 -- it was hardcoded "AuthenticAMD", which
+ *                   told an Intel-hosted guest it was on AMD)
  *                    (this project only targets AMD hosts so far,
  *                    same scope as M2-8's own real-hardware gate). The
  *                    max is raised to 0xD so leaf 7 and leaf 0xD are
