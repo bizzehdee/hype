@@ -1016,11 +1016,12 @@ void hype_svm_set_msr_trace(int enabled);
  * already-allocated in-memory buffer standing in for a real disk --
  * a genuine host-file-backed store (blk_backend) is M5-3's job, not
  * this one's, matching M4-3 pflash's own "primitive now, integration
- * later" precedent. Descriptor-chain walking assumes exactly 3
- * descriptors per chain (header, one data segment, status) -- no
- * scatter-gather across multiple data descriptors, this project's own
- * single-segment simplification (mirrors AHCI's own "single ATAPI
- * device, one command at a time" scope-narrowing). Guest-supplied
+ * later" precedent. Descriptor-chain walking handles a header, ANY
+ * number of data segments, and a status descriptor (#268 -- it used to
+ * require exactly 3, which capped every request at one contiguous
+ * segment and made a dataless FLUSH chain uncompletable). No
+ * segment-count limit is imposed, so there is nothing to advertise via
+ * VIRTIO_BLK_F_SEG_MAX. Guest-supplied
  * descriptor addresses/lengths are dereferenced directly, the same
  * established (if VALID-1..4-pending) convention every other device
  * handler here already follows -- not a new gap this task introduces.

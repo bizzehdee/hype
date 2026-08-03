@@ -1,5 +1,7 @@
 #include <stdio.h>
+#include <string.h>
 #include "../../devices/virtio_blk.h"
+#include "../blk_backend.h"
 
 static int failures = 0;
 
@@ -388,6 +390,401 @@ static void test_virtq_decode_desc(void) {
     CHECK_HEX("next decoded", 5u, desc.next);
 }
 
+
+/*
+ * #268: descriptor-chain walking. These drive process_virtio_blk_queue() directly
+ * with dma_map == 0, which means "trusted identity-mapped guest" -- so the device
+ * treats these host addresses as guest-physical ones, the same path the M5-1
+ * cooperating test guest uses. That makes the chain walk testable on the host even
+ * though it lives in the (coverage-exempt) SVM backend file.
+ */
+#define TQ_QSZ 8u
+#define TQ_SECTORS 16u
+
+typedef struct {
+    uint8_t desc[TQ_QSZ * 16u];
+    uint8_t avail[4u + 2u * TQ_QSZ + 2u];
+    uint8_t used[4u + 8u * TQ_QSZ + 2u];
+    uint8_t hdr[16];
+    uint8_t status;
+    uint8_t img[TQ_SECTORS * 512u];
+    uint8_t gbuf[8u * 512u]; /* guest data buffer the segments point into */
+    hype_virtio_blk_t dev;
+    hype_blk_file_t file;
+    hype_blk_backend_t be;
+} tq_t;
+
+static void tq_put64(uint8_t *p, uint64_t v) {
+    unsigned i;
+    for (i = 0; i < 8u; i++) {
+        p[i] = (uint8_t)((v >> (8u * i)) & 0xFFu);
+    }
+}
+
+static void tq_put32(uint8_t *p, uint32_t v) {
+    unsigned i;
+    for (i = 0; i < 4u; i++) {
+        p[i] = (uint8_t)((v >> (8u * i)) & 0xFFu);
+    }
+}
+
+static void tq_put16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static uint16_t tq_get16(const uint8_t *p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t tq_get32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void tq_desc(tq_t *q, unsigned i, const void *addr, uint32_t len, uint16_t flags,
+                    uint16_t next) {
+    uint8_t *d = q->desc + i * 16u;
+    tq_put64(d, (uint64_t)(uintptr_t)addr);
+    tq_put32(d + 8, len);
+    tq_put16(d + 12, flags);
+    tq_put16(d + 14, next);
+}
+
+
+/* Capture rejection reasons so a test can assert WHY a request was refused, and
+ * so the walk runs at all on the host (the default sink is hype_debug_print,
+ * which reaches a real UART through port I/O and faults in a user process). */
+static char tq_reject_last[128];
+static unsigned tq_reject_count;
+
+static void tq_reject_sink(const char *why) {
+    unsigned i;
+    tq_reject_count++;
+    for (i = 0; i + 1u < sizeof(tq_reject_last) && why[i] != 0; i++) {
+        tq_reject_last[i] = why[i];
+    }
+    tq_reject_last[i] = 0;
+}
+
+static int tq_reject_says(const char *needle) {
+    return strstr(tq_reject_last, needle) != 0;
+}
+
+/* Reset the rig: an empty queue, a sector-patterned backing image, and a device
+ * pointed at the three rings. Nothing is submitted yet. */
+static void tq_init(tq_t *q, uint32_t req_type, uint64_t sector) {
+    unsigned s;
+
+    memset(q, 0, sizeof(*q));
+    hype_virtio_blk_set_reject_sink(tq_reject_sink); /* also resets the rate limit */
+    tq_reject_count = 0;
+    tq_reject_last[0] = 0;
+    for (s = 0; s < TQ_SECTORS; s++) {
+        memset(q->img + s * 512u, (int)(0x10u + s), 512u);
+    }
+    q->status = 0xEE; /* poison, so "status untouched" is distinguishable from OK */
+
+    tq_put32(q->hdr, req_type);
+    tq_put64(q->hdr + 8, sector);
+
+    hype_virtio_blk_reset(&q->dev, TQ_SECTORS);
+    q->dev.queue_size = (uint16_t)TQ_QSZ;
+    q->dev.queue_desc = (uint64_t)(uintptr_t)q->desc;
+    q->dev.queue_driver = (uint64_t)(uintptr_t)q->avail;
+    q->dev.queue_device = (uint64_t)(uintptr_t)q->used;
+
+    hype_blk_file_init(&q->file, &q->be, q->img, sizeof(q->img));
+}
+
+/* Submit one chain whose head is descriptor `head`. */
+static void tq_submit(tq_t *q, uint16_t head) {
+    uint16_t idx = tq_get16(q->avail + 2);
+    tq_put16(q->avail + 4 + 2u * (idx % TQ_QSZ), head);
+    tq_put16(q->avail + 2, (uint16_t)(idx + 1u));
+}
+
+static int tq_run(tq_t *q) {
+    return process_virtio_blk_queue(&q->dev, &q->be, 0);
+}
+
+/* Build header -> `nsegs` data segments -> status, with segment i covering
+ * seg_len[i] bytes of q->gbuf laid end to end. Descriptor 0 is the header,
+ * 1..nsegs the segments, nsegs+1 the status. */
+static void tq_chain(tq_t *q, const uint32_t *seg_len, unsigned nsegs, uint16_t data_flags) {
+    unsigned i;
+    uint32_t off = 0;
+
+    tq_desc(q, 0, q->hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    for (i = 0; i < nsegs; i++) {
+        tq_desc(q, 1u + i, q->gbuf + off, seg_len[i],
+                (uint16_t)(HYPE_VIRTQ_DESC_F_NEXT | data_flags), (uint16_t)(2u + i));
+        off += seg_len[i];
+    }
+    tq_desc(q, 1u + nsegs, &q->status, 1u, 0, 0);
+}
+
+static void test_chain_single_segment_write_still_works(void) {
+    tq_t q;
+    uint32_t len[1] = {512u};
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 3);
+    memset(q.gbuf, 0xA5, 512u);
+    tq_chain(&q, len, 1, 0);
+    tq_submit(&q, 0);
+
+    CHECK_HEX("single-segment write returns 0", 0, tq_run(&q));
+    CHECK_HEX("single-segment write status OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("sector 3 written", 0xA5u, q.img[3u * 512u]);
+    CHECK_HEX("sector 2 untouched", 0x12u, q.img[2u * 512u]);
+    CHECK_HEX("sector 4 untouched", 0x14u, q.img[4u * 512u]);
+    CHECK_HEX("used idx advanced", 1u, tq_get16(q.used + 2));
+    CHECK_HEX("used elem id is the chain head", 0u, tq_get32(q.used + 4));
+    CHECK_HEX("write used_len is just the status byte", 1u, tq_get32(q.used + 8));
+    CHECK_HEX("last_avail_idx consumed the chain", 1u, q.dev.last_avail_idx);
+}
+
+/* The bug: header + 3 data + status was rejected outright, capping every request
+ * at one contiguous segment. */
+static void test_chain_multi_segment_write(void) {
+    tq_t q;
+    uint32_t len[3] = {512u, 1024u, 512u};
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    memset(q.gbuf + 0, 0xB1, 512u);     /* -> sector 1 */
+    memset(q.gbuf + 512, 0xB2, 1024u);  /* -> sectors 2,3 */
+    memset(q.gbuf + 1536, 0xB3, 512u);  /* -> sector 4 */
+    tq_chain(&q, len, 3, 0);
+    tq_submit(&q, 0);
+
+    CHECK_HEX("3-segment write accepted", 0, tq_run(&q));
+    CHECK_HEX("3-segment write status OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    /* The scattered buffer must land as ONE contiguous run, LBA advancing by
+     * each segment's sector count. */
+    CHECK_HEX("segment 0 -> sector 1", 0xB1u, q.img[1u * 512u]);
+    CHECK_HEX("segment 1 -> sector 2", 0xB2u, q.img[2u * 512u]);
+    CHECK_HEX("segment 1 -> sector 3", 0xB2u, q.img[3u * 512u]);
+    CHECK_HEX("segment 2 -> sector 4", 0xB3u, q.img[4u * 512u]);
+    CHECK_HEX("sector 0 untouched", 0x10u, q.img[0]);
+    CHECK_HEX("sector 5 untouched", 0x15u, q.img[5u * 512u]);
+}
+
+static void test_chain_multi_segment_read(void) {
+    tq_t q;
+    uint32_t len[3] = {1024u, 512u, 512u};
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_IN, 2);
+    tq_chain(&q, len, 3, HYPE_VIRTQ_DESC_F_WRITE);
+    tq_submit(&q, 0);
+
+    CHECK_HEX("3-segment read accepted", 0, tq_run(&q));
+    CHECK_HEX("3-segment read status OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("gbuf[0] is sector 2", 0x12u, q.gbuf[0]);
+    CHECK_HEX("gbuf[512] is sector 3", 0x13u, q.gbuf[512]);
+    CHECK_HEX("gbuf[1024] is sector 4", 0x14u, q.gbuf[1024]);
+    CHECK_HEX("gbuf[1536] is sector 5", 0x15u, q.gbuf[1536]);
+    /* A read's used_len is every data byte written plus the status byte. */
+    CHECK_HEX("read used_len covers all 4 sectors + status", 2048u + 1u, tq_get32(q.used + 8));
+}
+
+/*
+ * A FLUSH chain is header -> status with NO data descriptor. The old walk did not
+ * merely refuse it: returning -1 aborted the notify without advancing
+ * last_avail_idx or writing a status byte, so the guest waited on it forever.
+ */
+static void test_chain_flush_has_no_data_descriptor(void) {
+    tq_t q;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_FLUSH, 0);
+    tq_chain(&q, 0, 0, 0);
+    tq_submit(&q, 0);
+
+    CHECK_HEX("2-descriptor FLUSH accepted", 0, tq_run(&q));
+    CHECK_HEX("FLUSH acknowledged OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("FLUSH completed into the used ring", 1u, tq_get16(q.used + 2));
+    CHECK_HEX("FLUSH consumed its avail entry", 1u, q.dev.last_avail_idx);
+}
+
+/*
+ * A cyclic NEXT list must terminate the walk. The indices are guest-controlled,
+ * so without the queue_size hop bound this spins inside hype forever and takes
+ * the VM's dispatch loop with it. The assertion that matters most here is simply
+ * that this test RETURNS.
+ */
+static void test_chain_cycle_is_rejected(void) {
+    tq_t q;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    tq_desc(&q, 0, q.hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    tq_desc(&q, 1, q.gbuf, 512u, HYPE_VIRTQ_DESC_F_NEXT, 2);
+    tq_desc(&q, 2, q.gbuf, 512u, HYPE_VIRTQ_DESC_F_NEXT, 1); /* 1 -> 2 -> 1 */
+    tq_submit(&q, 0);
+
+    CHECK_HEX("cyclic chain rejected", (unsigned long long)(-1), (unsigned long long)tq_run(&q));
+    CHECK_HEX("cyclic chain wrote no status", 0xEEu, q.status);
+    CHECK_HEX("cyclic chain posted no completion", 0u, tq_get16(q.used + 2));
+    CHECK_HEX("cyclic chain was logged", 1u, tq_reject_count);
+    CHECK_HEX("cycle logged as a malformed chain", 1, tq_reject_says("malformed descriptor chain"));
+}
+
+/* A malformed chain must be rejected having changed nothing -- the property the
+ * old fixed-3 walk had for free and the variable-length walk has to earn. */
+static void test_chain_malformed_shapes_change_nothing(void) {
+    tq_t q;
+    uint32_t len[1] = {512u};
+
+    /* Head index beyond the queue. */
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    memset(q.gbuf, 0xC1, 512u);
+    tq_chain(&q, len, 1, 0);
+    tq_submit(&q, (uint16_t)(TQ_QSZ + 1u));
+    CHECK_HEX("out-of-range head rejected", (unsigned long long)(-1), (unsigned long long)tq_run(&q));
+    CHECK_HEX("out-of-range head wrote nothing", 0x11u, q.img[1u * 512u]);
+    CHECK_HEX("out-of-range head posted no completion", 0u, tq_get16(q.used + 2));
+
+    /* A header with no NEXT has nowhere to put the status byte. */
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    tq_desc(&q, 0, q.hdr, 16u, 0, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("header without NEXT rejected", (unsigned long long)(-1),
+              (unsigned long long)tq_run(&q));
+    CHECK_HEX("header without NEXT posted no completion", 0u, tq_get16(q.used + 2));
+
+    /* A NEXT pointing past the queue, found partway along the chain. */
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    memset(q.gbuf, 0xC3, 512u);
+    tq_desc(&q, 0, q.hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    tq_desc(&q, 1, q.gbuf, 512u, HYPE_VIRTQ_DESC_F_NEXT, (uint16_t)TQ_QSZ);
+    tq_submit(&q, 0);
+    CHECK_HEX("mid-chain out-of-range NEXT rejected", (unsigned long long)(-1),
+              (unsigned long long)tq_run(&q));
+    CHECK_HEX("mid-chain rejection wrote no data", 0x11u, q.img[1u * 512u]);
+}
+
+/*
+ * A segment that is not a whole number of sectors, a read/write carrying no data
+ * segment at all, and an out-of-bounds LBA are all COMPLETED with IOERR rather
+ * than left dangling. That distinction is the point: an uncompleted request is a
+ * guest hang, whereas IOERR is an error the guest can see and report.
+ */
+static void test_chain_bad_requests_complete_with_ioerr(void) {
+    tq_t q;
+    uint32_t ragged[1] = {500u};
+    uint32_t ok[1] = {512u};
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    tq_chain(&q, ragged, 1, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("ragged segment does not abort the notify", 0, tq_run(&q));
+    CHECK_HEX("ragged segment reported IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+    CHECK_HEX("ragged segment was completed", 1u, tq_get16(q.used + 2));
+    CHECK_HEX("ragged segment named in the log", 1, tq_reject_says("whole number of sectors"));
+
+    /* Legal chain SHAPE (it is what FLUSH uses) but meaningless for a read. */
+    tq_init(&q, HYPE_VIRTIO_BLK_T_IN, 1);
+    tq_chain(&q, 0, 0, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("dataless read does not abort the notify", 0, tq_run(&q));
+    CHECK_HEX("dataless read reported IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+    CHECK_HEX("dataless read was completed", 1u, tq_get16(q.used + 2));
+    CHECK_HEX("dataless read named in the log", 1, tq_reject_says("no data segment"));
+
+    /* Out-of-bounds LBA: the backend's VALID-3 gate refuses it. */
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, TQ_SECTORS);
+    tq_chain(&q, ok, 1, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("out-of-bounds LBA does not abort the notify", 0, tq_run(&q));
+    CHECK_HEX("out-of-bounds LBA reported IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+
+    /* A multi-segment write that runs off the end mid-chain: the backend refuses
+     * the offending segment, and the request reports IOERR. */
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, TQ_SECTORS - 1u);
+    {
+        uint32_t two[2] = {512u, 512u};
+        tq_chain(&q, two, 2, 0);
+        tq_submit(&q, 0);
+        CHECK_HEX("write straddling the end reported IOERR", 0, tq_run(&q));
+        CHECK_HEX("straddling write status IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+    }
+}
+
+static void test_chain_unsupported_type_is_completed(void) {
+    tq_t q;
+    uint32_t len[1] = {512u};
+
+    tq_init(&q, 0x777u, 1);
+    tq_chain(&q, len, 1, 0);
+    tq_submit(&q, 0);
+
+    CHECK_HEX("unsupported type does not abort the notify", 0, tq_run(&q));
+    CHECK_HEX("unsupported type reported UNSUPP", HYPE_VIRTIO_BLK_S_UNSUPP, q.status);
+    CHECK_HEX("unsupported type was completed", 1u, tq_get16(q.used + 2));
+    CHECK_HEX("unsupported type named in the log", 1, tq_reject_says("unsupported request type"));
+}
+
+/* Several chains submitted before a single notify must all drain, and a second
+ * notify with nothing new must be a no-op. */
+static void test_chain_multiple_pending_chains_all_drain(void) {
+    tq_t q;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    /* chain A: desc 0,1,2 -> sector 1 ; chain B: desc 3,4,5 -> sector 6 */
+    memset(q.gbuf, 0xD1, 512u);
+    memset(q.gbuf + 512, 0xD2, 512u);
+    tq_desc(&q, 0, q.hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    tq_desc(&q, 1, q.gbuf, 512u, HYPE_VIRTQ_DESC_F_NEXT, 2);
+    tq_desc(&q, 2, &q.status, 1u, 0, 0);
+
+    {
+        static uint8_t hdr_b[16];
+        static uint8_t status_b;
+        tq_put32(hdr_b, HYPE_VIRTIO_BLK_T_OUT);
+        tq_put64(hdr_b + 8, 6);
+        status_b = 0xEE;
+        tq_desc(&q, 3, hdr_b, 16u, HYPE_VIRTQ_DESC_F_NEXT, 4);
+        tq_desc(&q, 4, q.gbuf + 512, 512u, HYPE_VIRTQ_DESC_F_NEXT, 5);
+        tq_desc(&q, 5, &status_b, 1u, 0, 0);
+
+        tq_submit(&q, 0);
+        tq_submit(&q, 3);
+
+        CHECK_HEX("both chains drained", 0, tq_run(&q));
+        CHECK_HEX("chain A wrote sector 1", 0xD1u, q.img[1u * 512u]);
+        CHECK_HEX("chain B wrote sector 6", 0xD2u, q.img[6u * 512u]);
+        CHECK_HEX("chain A status OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+        CHECK_HEX("chain B status OK", HYPE_VIRTIO_BLK_S_OK, status_b);
+        CHECK_HEX("two completions posted", 2u, tq_get16(q.used + 2));
+        CHECK_HEX("second used elem id is chain B head", 3u, tq_get32(q.used + 12));
+
+        CHECK_HEX("re-notify with nothing new is a no-op", 0, tq_run(&q));
+        CHECK_HEX("no extra completion posted", 2u, tq_get16(q.used + 2));
+    }
+}
+
+/* A zero queue_size is not a usable queue. */
+static void test_chain_zero_queue_size_rejected(void) {
+    tq_t q;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    q.dev.queue_size = 0;
+    CHECK_HEX("zero queue_size rejected", (unsigned long long)(-1), (unsigned long long)tq_run(&q));
+}
+
+
+/* The reject log is rate-limited: one bad guest must not bury the rest of the
+ * log, which is the failure mode #238 was about. */
+static void test_chain_reject_log_is_rate_limited(void) {
+    tq_t q;
+    unsigned i;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    tq_desc(&q, 0, q.hdr, 16u, 0, 0); /* header with no NEXT -- always rejected */
+    for (i = 0; i < 40u; i++) {
+        tq_submit(&q, 0);
+        (void)tq_run(&q);
+    }
+    CHECK_HEX("rejection logging capped", 8u, tq_reject_count);
+}
+
 int main(void) {
     test_reset_sets_capacity_and_default_queue_size();
     test_feature_negotiation_offers_only_version_1();
@@ -403,6 +800,17 @@ int main(void) {
     test_isr_read_clears_pending_status();
     test_is_queue_ready();
     test_virtq_decode_desc();
+    test_chain_single_segment_write_still_works();
+    test_chain_multi_segment_write();
+    test_chain_multi_segment_read();
+    test_chain_flush_has_no_data_descriptor();
+    test_chain_cycle_is_rejected();
+    test_chain_malformed_shapes_change_nothing();
+    test_chain_bad_requests_complete_with_ioerr();
+    test_chain_unsupported_type_is_completed();
+    test_chain_multiple_pending_chains_all_drain();
+    test_chain_zero_queue_size_rejected();
+    test_chain_reject_log_is_rate_limited();
 
     if (failures == 0) {
         printf("all tests passed\n");

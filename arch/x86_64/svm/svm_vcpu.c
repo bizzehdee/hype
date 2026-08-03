@@ -2611,12 +2611,152 @@ int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
 }
 
 /*
- * Walks every newly-submitted chain in the (single) virtqueue since
- * this device's own last_avail_idx bookkeeping, processing each as a
- * virtio_blk_req: exactly 3 descriptors (header, one data segment,
- * status), a single-segment simplification (see hype_svm_vcpu_handle_
- * virtio_blk_npf()'s own doc comment for why). Returns -1 if a chain
- * doesn't have that exact shape (malformed guest request); 0 otherwise.
+ * #268: say something when a request is refused. Before this, a rejected chain
+ * failed silently from the operator's point of view, which is how a spec-legal
+ * guest request came to present as a mysterious stall with nothing in the log.
+ *
+ * Rate-limited to the first few, and deliberately so: this sits on the I/O path,
+ * and a guest that produces one bad chain usually produces thousands. An
+ * unbounded print would bury the rest of the log -- the exact failure mode #238
+ * was about -- and the first occurrence is the informative one anyway. The
+ * counter is unsynchronised across VMs for the same reason the write stats are:
+ * a lost increment on a diagnostic beats a lock on the I/O path.
+ */
+#define HYPE_VIRTIO_BLK_REJECT_LOG_MAX 8u
+
+static uint32_t g_virtio_blk_rejects;
+static void (*g_virtio_blk_reject_sink)(const char *why);
+
+void hype_virtio_blk_set_reject_sink(void (*sink)(const char *why)) {
+    g_virtio_blk_reject_sink = sink;
+    g_virtio_blk_rejects = 0;
+}
+
+static void virtio_blk_reject(const char *why) {
+    g_virtio_blk_rejects++;
+    if (g_virtio_blk_rejects > HYPE_VIRTIO_BLK_REJECT_LOG_MAX) {
+        return;
+    }
+    if (g_virtio_blk_reject_sink != 0) {
+        g_virtio_blk_reject_sink(why);
+        return;
+    }
+    hype_debug_print("virtio-blk: request REJECTED (#%u): %s\n", (unsigned)g_virtio_blk_rejects,
+                     why);
+    if (g_virtio_blk_rejects == HYPE_VIRTIO_BLK_REJECT_LOG_MAX) {
+        hype_debug_print("virtio-blk: further rejections will not be logged\n");
+    }
+}
+
+/*
+ * Fetch descriptor `index` from this device's descriptor table, bounds-checking
+ * the index against queue_size and translating the 16-byte entry through the
+ * VALID-3 gpa map. Returns -1 if either check fails.
+ */
+static int virtq_fetch_desc(const hype_virtio_blk_t *dev, const hype_gpa_map_t *dma_map,
+                            uint16_t index, hype_virtq_desc_t *out) {
+    const uint8_t *dp;
+
+    if (index >= dev->queue_size) {
+        return -1;
+    }
+    dp = (const uint8_t *)(uintptr_t)guest_dma_xlate(
+        dma_map, dev->queue_desc + (uint64_t)index * 16u, 16u);
+    if (dp == 0) {
+        return -1;
+    }
+    hype_virtq_decode_desc(dp, out);
+    return 0;
+}
+
+/*
+ * #268: validate a whole request chain and locate its status descriptor WITHOUT
+ * performing any I/O, then let the caller re-walk it to transfer data.
+ *
+ * The two passes are the point. Validating as we transferred would leave a
+ * half-applied write behind whenever a chain turned out to be malformed
+ * partway through -- so a malformed chain is rejected having changed nothing,
+ * which is the property the old fixed-3 walk had for free and which the
+ * variable-length walk has to earn.
+ *
+ * This covers the chain's SHAPE, which is the part that is guest-controlled
+ * bookkeeping rather than data. It is deliberately not a promise of atomicity
+ * for the transfer itself: a segment whose length is unusable, or a backend that
+ * errors on the third of four segments, still completes the request with IOERR
+ * after earlier segments have already landed. That matches a real disk, where an
+ * error partway through a transfer does not un-write what preceded it -- IOERR
+ * means "distrust this whole request", not "nothing happened".
+ *
+ * Chain shape per the virtio spec: header -> zero or more data segments ->
+ * status. Every descriptor except the last carries NEXT, so the status
+ * descriptor is exactly the one without it, and the data segments are exactly
+ * the descriptors between. ZERO data segments is legal, not an error: a FLUSH
+ * request carries no data at all, so its chain is just header -> status.
+ */
+static int virtq_validate_chain(const hype_virtio_blk_t *dev, const hype_gpa_map_t *dma_map,
+                                uint16_t head, hype_virtq_desc_t *out_header,
+                                hype_virtq_desc_t *out_status) {
+    hype_virtq_desc_t d;
+    uint32_t steps = 0;
+    uint16_t cur;
+
+    if (virtq_fetch_desc(dev, dma_map, head, out_header) != 0) {
+        return -1;
+    }
+    /* A chain with no NEXT on its header has nowhere to put the status byte. */
+    if ((out_header->flags & HYPE_VIRTQ_DESC_F_NEXT) == 0) {
+        return -1;
+    }
+    cur = out_header->next;
+    for (;;) {
+        if (virtq_fetch_desc(dev, dma_map, cur, &d) != 0) {
+            return -1;
+        }
+        /*
+         * A legal chain visits each descriptor at most once, so more than
+         * queue_size hops proves the guest built a cycle (A -> B -> A). The
+         * bound is mandatory rather than defensive: the descriptor indices are
+         * guest-controlled, and an unbounded follow-the-NEXT loop would spin
+         * this core inside hype forever, taking that VM's dispatch loop with
+         * it. The old fixed-3 walk could not loop at all, so the bound has to
+         * arrive together with the loop that needs it.
+         */
+        steps++;
+        if (steps > (uint32_t)dev->queue_size) {
+            return -1;
+        }
+        if ((d.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0) {
+            *out_status = d;
+            return 0;
+        }
+        cur = d.next;
+    }
+}
+
+/*
+ * Walks every newly-submitted chain in the (single) virtqueue since this
+ * device's own last_avail_idx bookkeeping, processing each as a virtio_blk_req:
+ * a header descriptor, any number of data segments, and a status descriptor.
+ * Returns -1 if a chain is malformed (bad index, untranslatable address, cyclic
+ * NEXT list, or no status descriptor); 0 otherwise.
+ *
+ * #268: this used to require EXACTLY three descriptors and reject anything
+ * else. Two consequences, both fixed here:
+ *   - A header + N-data + status chain was refused outright, capping every
+ *     request at one contiguous segment. Linux produces multi-segment chains
+ *     whenever a request spans non-contiguous physical pages, which is the
+ *     normal case above a page once memory is fragmented -- and since hype
+ *     advertises no VIRTIO_BLK_F_SEG_MAX, a conforming driver has no way to
+ *     learn of a limit and is entitled to send them.
+ *   - A 2-descriptor FLUSH chain (header -> status, no data) hit the same
+ *     rejection. That path did not merely refuse the request: returning -1
+ *     aborts the notify WITHOUT advancing last_avail_idx or writing a status
+ *     byte, so the request is never completed and the guest waits on it
+ *     forever. The FLUSH branch below was therefore unreachable in practice.
+ *
+ * No segment-count limit is imposed, so there is nothing to advertise via
+ * VIRTIO_BLK_F_SEG_MAX: the walk streams one segment at a time and needs no
+ * array to hold them.
  */
 int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *be,
                              const hype_gpa_map_t *dma_map) {
@@ -2651,8 +2791,7 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
         uint16_t ring_index = (uint16_t)(dev->last_avail_idx % qsz);
         uint16_t head_desc =
             (uint16_t)(avail_base[4 + 2 * ring_index] | (avail_base[4 + 2 * ring_index + 1] << 8));
-        hype_virtq_desc_t header_desc, data_desc, status_desc;
-        const uint8_t *dp;
+        hype_virtq_desc_t header_desc, status_desc;
         const uint8_t *hdr;
         uint32_t req_type;
         uint64_t sector;
@@ -2662,38 +2801,11 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
         uint16_t used_ring_index;
         uint32_t elem_off;
 
-        /* Walk the 3-descriptor chain (header -> data -> status), translating +
-         * bounding each 16-byte descriptor entry. An index >= queue_size or an
-         * untranslatable descriptor address aborts the whole notify. */
-        if (head_desc >= qsz) {
+        /* Validate the whole chain first (bounds, translatability, no cycle) so a
+         * malformed request is rejected before any data moves. */
+        if (virtq_validate_chain(dev, dma_map, head_desc, &header_desc, &status_desc) != 0) {
+            virtio_blk_reject("malformed descriptor chain");
             return -1;
-        }
-        dp = (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map,
-                                                         dev->queue_desc + (uint64_t)head_desc * 16u, 16u);
-        if (dp == 0) {
-            return -1;
-        }
-        hype_virtq_decode_desc(dp, &header_desc);
-        if ((header_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0 || header_desc.next >= qsz) {
-            return -1;
-        }
-        dp = (const uint8_t *)(uintptr_t)guest_dma_xlate(
-            dma_map, dev->queue_desc + (uint64_t)header_desc.next * 16u, 16u);
-        if (dp == 0) {
-            return -1;
-        }
-        hype_virtq_decode_desc(dp, &data_desc);
-        if ((data_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0 || data_desc.next >= qsz) {
-            return -1;
-        }
-        dp = (const uint8_t *)(uintptr_t)guest_dma_xlate(
-            dma_map, dev->queue_desc + (uint64_t)data_desc.next * 16u, 16u);
-        if (dp == 0) {
-            return -1;
-        }
-        hype_virtq_decode_desc(dp, &status_desc);
-        if ((status_desc.flags & HYPE_VIRTQ_DESC_F_NEXT) != 0) {
-            return -1; /* status must be the chain's last descriptor */
         }
 
         /* virtio_blk_req header: type(4) + reserved(4) + sector(8) = 16 bytes. */
@@ -2713,27 +2825,94 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
          * multiple; the LBA+count bounds check lives inside hype_blk_backend_*.
          * The guest data buffer is itself translated+bounded before the copy. */
         if (req_type == HYPE_VIRTIO_BLK_T_OUT || req_type == HYPE_VIRTIO_BLK_T_IN) {
-            uint32_t nsec = data_desc.len / HYPE_VIRTIO_BLK_SECTOR_SIZE;
-            void *gbuf = (void *)(uintptr_t)guest_dma_xlate(dma_map, data_desc.addr, data_desc.len);
-            int rc;
-            if ((data_desc.len % HYPE_VIRTIO_BLK_SECTOR_SIZE) != 0u || nsec == 0u || gbuf == 0) {
+            /*
+             * #268: transfer every data segment in the chain, not just the first.
+             * The LBA advances by each segment's sector count, so a scattered
+             * buffer lands as one contiguous run on the backend -- which is
+             * exactly what the guest asked for and what a real device does.
+             */
+            uint16_t cur = header_desc.next;
+            uint64_t seg_lba = sector;
+            uint64_t xfer_bytes = 0;
+            uint32_t nsegs = 0;
+            const char *err = 0;
+
+            for (;;) {
+                hype_virtq_desc_t seg;
+                uint32_t nsec;
+                void *gbuf;
+                int rc;
+
+                /* Cannot fail: virtq_validate_chain() already walked this exact
+                 * list. Checked anyway rather than assuming, since a failure here
+                 * would otherwise be a dereference of an untranslated address. */
+                if (virtq_fetch_desc(dev, dma_map, cur, &seg) != 0) {
+                    err = "descriptor vanished mid-chain";
+                    break;
+                }
+                if ((seg.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0) {
+                    break; /* this is the status descriptor -- chain done */
+                }
+                nsec = seg.len / HYPE_VIRTIO_BLK_SECTOR_SIZE;
+                /*
+                 * Each segment must itself be a whole number of sectors. The spec
+                 * only constrains the total, but the backend is addressed in
+                 * sectors, so a segment that splits one would need a bounce
+                 * buffer this freestanding build has nowhere to allocate. Such a
+                 * request is COMPLETED with IOERR rather than left dangling: the
+                 * guest gets an error it can report, instead of an I/O that never
+                 * returns. Linux's block layer aligns every segment to the
+                 * logical block size, so this is not a case it can produce.
+                 */
+                if ((seg.len % HYPE_VIRTIO_BLK_SECTOR_SIZE) != 0u || nsec == 0u) {
+                    err = "data segment is not a whole number of sectors";
+                    break;
+                }
+                gbuf = (void *)(uintptr_t)guest_dma_xlate(dma_map, seg.addr, seg.len);
+                if (gbuf == 0) {
+                    err = "data segment failed bounds check";
+                    break;
+                }
+                rc = (req_type == HYPE_VIRTIO_BLK_T_OUT)
+                         ? hype_blk_backend_write(be, seg_lba, nsec, gbuf)
+                         : hype_blk_backend_read(be, seg_lba, nsec, gbuf);
+                if (rc != 0) {
+                    err = "backend rejected the transfer";
+                    break;
+                }
+                seg_lba += nsec;
+                xfer_bytes += seg.len;
+                nsegs++;
+                cur = seg.next;
+            }
+
+            if (err == 0 && nsegs == 0u) {
+                /* A read/write with no data buffer at all. Not a chain-shape
+                 * error (the shape is legal, it is what FLUSH uses) -- it is a
+                 * meaningless request, so complete it with IOERR. */
+                err = "read/write request carries no data segment";
+            }
+            if (err != 0) {
+                virtio_blk_reject(err);
                 status_value = HYPE_VIRTIO_BLK_S_IOERR;
                 used_len = 1;
-            } else if (req_type == HYPE_VIRTIO_BLK_T_OUT) {
-                rc = hype_blk_backend_write(be, sector, nsec, gbuf);
-                status_value = (rc == 0) ? HYPE_VIRTIO_BLK_S_OK : HYPE_VIRTIO_BLK_S_IOERR;
-                used_len = 1;
-            } else { /* HYPE_VIRTIO_BLK_T_IN */
-                rc = hype_blk_backend_read(be, sector, nsec, gbuf);
-                status_value = (rc == 0) ? HYPE_VIRTIO_BLK_S_OK : HYPE_VIRTIO_BLK_S_IOERR;
-                used_len = (rc == 0) ? (data_desc.len + 1u) : 1u;
+            } else {
+                status_value = HYPE_VIRTIO_BLK_S_OK;
+                /* used_len counts what the DEVICE wrote into guest memory: the
+                 * data for a read, and the status byte in both directions. */
+                used_len = (req_type == HYPE_VIRTIO_BLK_T_IN) ? (uint32_t)(xfer_bytes + 1u) : 1u;
             }
         } else if (req_type == HYPE_VIRTIO_BLK_T_FLUSH) {
             /* Synchronous backend: writes already durable, so FLUSH is a no-op ACK
-             * (a real guest issues FLUSH; returning UNSUPP would stall its I/O). */
+             * (a real guest issues FLUSH; returning UNSUPP would stall its I/O).
+             * #268: this branch is only now REACHABLE. A FLUSH chain carries no
+             * data descriptor, so the old exactly-3-descriptor requirement failed
+             * it before this switch was ever consulted -- and failed it by
+             * aborting the notify, which never completed the request at all. */
             status_value = HYPE_VIRTIO_BLK_S_OK;
             used_len = 1;
         } else {
+            virtio_blk_reject("unsupported request type");
             status_value = HYPE_VIRTIO_BLK_S_UNSUPP;
             used_len = 1;
         }

@@ -239,4 +239,17 @@ void hype_virtq_decode_desc(const uint8_t raw[16], hype_virtq_desc_t *out);
 int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *be,
                              const hype_gpa_map_t *dma_map);
 
+/*
+ * #268: where request-rejection diagnostics go. NULL (the default) means
+ * hype_debug_print, rate-limited to the first few so one bad guest cannot bury
+ * the rest of the log.
+ *
+ * Injectable for two reasons. It is what makes the chain walk host-testable at
+ * all -- hype_debug_print reaches the real UART through port I/O, which faults
+ * in a user process -- and it lets a test assert on WHY a request was refused
+ * rather than only on the status byte the guest sees. Installing a sink also
+ * resets the rate-limit counter, so each test starts from a clean slate.
+ */
+void hype_virtio_blk_set_reject_sink(void (*sink)(const char *why));
+
 #endif /* HYPE_DEVICES_VIRTIO_BLK_H */
