@@ -325,3 +325,115 @@ void hype_xhci_parked_drop_slot(hype_xhci_parked_t *p, uint32_t slot) {
         }
     }
 }
+
+/* --- USB-7 (#241): device inventory --- */
+
+void hype_usb_inventory_reset(hype_usb_inventory_t *inv) {
+    unsigned int i;
+    if (inv == (hype_usb_inventory_t *)0) {
+        return;
+    }
+    inv->count = 0;
+    inv->overflow = 0;
+    for (i = 0; i < HYPE_USB_INVENTORY_MAX; i++) {
+        inv->dev[i].controller = 0;
+        inv->dev[i].root_port = 0;
+        inv->dev[i].route = 0;
+        inv->dev[i].slot = 0;
+        inv->dev[i].speed = 0;
+        inv->dev[i].vid = 0;
+        inv->dev[i].pid = 0;
+        inv->dev[i].dev_class = 0;
+        inv->dev[i].dev_subclass = 0;
+        inv->dev[i].dev_protocol = 0;
+        inv->dev[i].owner = (uint8_t)HYPE_USB_OWNER_NONE;
+    }
+}
+
+int hype_usb_inventory_find(const hype_usb_inventory_t *inv, unsigned int controller,
+                            unsigned int root_port, unsigned int route) {
+    unsigned int i;
+    if (inv == (const hype_usb_inventory_t *)0) {
+        return -1;
+    }
+    for (i = 0; i < inv->count; i++) {
+        if (inv->dev[i].controller == controller && inv->dev[i].root_port == root_port &&
+            inv->dev[i].route == route) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+int hype_usb_inventory_add(hype_usb_inventory_t *inv, const hype_usb_devinfo_t *d) {
+    int existing;
+    if (inv == (hype_usb_inventory_t *)0 || d == (const hype_usb_devinfo_t *)0) {
+        return -1;
+    }
+    existing = hype_usb_inventory_find(inv, d->controller, d->root_port, d->route);
+    if (existing >= 0) {
+        /* Same physical position: update in place. The sweep can revisit a
+         * position (descending a hub re-reads its parent), and two rows for one
+         * port would make "what is on port N" ambiguous. */
+        uint8_t keep_owner = inv->dev[existing].owner;
+        inv->dev[existing] = *d;
+        /* An update must not silently un-claim a device hype is already using. */
+        if (keep_owner != (uint8_t)HYPE_USB_OWNER_NONE &&
+            d->owner == (uint8_t)HYPE_USB_OWNER_NONE) {
+            inv->dev[existing].owner = keep_owner;
+        }
+        return existing;
+    }
+    if (inv->count >= HYPE_USB_INVENTORY_MAX) {
+        inv->overflow++;
+        return -1;
+    }
+    inv->dev[inv->count] = *d;
+    inv->count++;
+    return (int)(inv->count - 1u);
+}
+
+void hype_usb_inventory_claim(hype_usb_inventory_t *inv, int index, hype_usb_owner_t owner) {
+    if (inv == (hype_usb_inventory_t *)0 || index < 0 || (unsigned int)index >= inv->count) {
+        return;
+    }
+    inv->dev[index].owner = (uint8_t)owner;
+}
+
+int hype_usb_inventory_next_unclaimed_class(const hype_usb_inventory_t *inv, uint8_t dev_class,
+                                            int after) {
+    unsigned int i;
+    if (inv == (const hype_usb_inventory_t *)0) {
+        return -1;
+    }
+    for (i = (after < 0) ? 0u : (unsigned int)(after + 1); i < inv->count; i++) {
+        if (inv->dev[i].dev_class == dev_class &&
+            inv->dev[i].owner == (uint8_t)HYPE_USB_OWNER_NONE) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+unsigned int hype_usb_inventory_count_owner(const hype_usb_inventory_t *inv,
+                                            hype_usb_owner_t owner) {
+    unsigned int i, n = 0;
+    if (inv == (const hype_usb_inventory_t *)0) {
+        return 0;
+    }
+    for (i = 0; i < inv->count; i++) {
+        if (inv->dev[i].owner == (uint8_t)owner) {
+            n++;
+        }
+    }
+    return n;
+}
+
+const char *hype_usb_owner_str(hype_usb_owner_t owner) {
+    switch (owner) {
+        case HYPE_USB_OWNER_NONE: return "free";
+        case HYPE_USB_OWNER_HYPE: return "hype";
+        case HYPE_USB_OWNER_GUEST: return "guest";
+        default: return "?";
+    }
+}

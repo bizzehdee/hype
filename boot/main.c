@@ -724,6 +724,10 @@ static char g_cmd_result[96];
  * Owner-core only, like the rest of the dashboard command state.
  */
 static hype_phys_confirm_t g_phys_confirm;
+/* USB-7 (#241): every USB device the host sweep enumerated, on every controller.
+ * Persistent across the sweep so #217/#219 can find a HID keyboard hype may take,
+ * and so a later passthrough feature has a topology to offer a guest. */
+static hype_usb_inventory_t g_usb_inv;
 
 /* M10-6a (#227): the enumerated NVMe scratch target for a confirmed `physical:`
  * write. hype boots off the AHCI ESP, so an NVMe controller is a SEPARATE disk
@@ -12545,6 +12549,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         uint32_t xhci_cur = 0, xhci_bdf = 0;
         unsigned int xhci_count = 0;
         int msc_found_any = 0;
+        hype_usb_inventory_reset(&g_usb_inv); /* #241 */
         while (!msc_found_any &&
                hype_host_pci_find_xhci_from(hype_host_pci_read32_hw, 255u, xhci_cur, &hx,
                                             &xhci_bdf)) {
@@ -12622,7 +12627,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * enabled (PED) -- and stays readable in a phone photo.
                  */
                 uint32_t ccs_mask = 0, ped_mask = 0, pp_mask = 0;
-                for (rp = 1u; rp <= xc.max_ports && !msc_found; rp++) {
+                /* USB-7 (#241): sweep EVERY root port even after the boot medium is
+                 * found. The loop used to exit on the first bulk-only MSC, so any
+                 * device on a later port -- a keyboard, a hub, a second stick -- was
+                 * never even looked at. The inventory is the deliverable; claiming
+                 * one MSC for hype's own use is now a side effect of the sweep
+                 * rather than its terminating condition. */
+                for (rp = 1u; rp <= xc.max_ports; rp++) {
                     unsigned int speed = 0, slot = 0, cfglen = 0;
                     static uint8_t desc[18];
                     static uint8_t cfgbuf[256];
@@ -12690,6 +12701,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                      (unsigned)(desc[8] | (desc[9] << 8)),
                                      (unsigned)(desc[10] | (desc[11] << 8)));
 
+                    /* USB-7 (#241): record it BEFORE deciding whether hype wants it.
+                     * Everything below may free the slot and `continue`; doing the
+                     * bookkeeping first is what makes the inventory complete rather
+                     * than a list of things that happened to be useful. */
+                    {
+                        hype_usb_devinfo_t di;
+                        di.controller = xhci_count;
+                        di.root_port = rp;
+                        di.route = 0u;
+                        di.slot = slot;
+                        di.speed = speed;
+                        di.vid = (uint16_t)(desc[8] | (desc[9] << 8));
+                        di.pid = (uint16_t)(desc[10] | (desc[11] << 8));
+                        di.dev_class = desc[4];
+                        di.dev_subclass = desc[5];
+                        di.dev_protocol = desc[6];
+                        di.owner = (uint8_t)HYPE_USB_OWNER_NONE;
+                        (void)hype_usb_inventory_add(&g_usb_inv, &di);
+                    }
+
                     if (hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
                                                         &cfglen) == 0 &&
                         hype_xhci_msc_find_endpoints(cfgbuf, cfglen, &msc) == 0) {
@@ -12725,6 +12756,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         continue;
                     }
 
+                    /*
+                     * USB-7 (#241): hype takes exactly ONE mass-storage device -- its
+                     * log/boot medium. Now that the sweep continues past it, a second
+                     * stick would otherwise run this whole datapath again and re-point
+                     * the log sink at a different disk mid-boot. It is already in the
+                     * inventory (recorded above, before any of these decisions), so
+                     * leaving it addressed-then-released loses nothing a passthrough
+                     * feature will need beyond its position and identity.
+                     */
+                    if (msc_found) {
+                        hype_debug_print("host-xhci: port %u is a second MSC -- inventoried, not "
+                                         "claimed (hype already has its medium) [#241]\n", rp);
+                        hype_xhci_disable_slot(&xc, msc_slot);
+                        continue;
+                    }
+
                     /* Shared MSC datapath, whether direct or behind a hub. */
                     if (hype_xhci_set_configuration(&xc, msc_slot, msc.config_value) != 0) {
                         hype_debug_print("host-xhci: slot %u SET_CONFIGURATION FAILED\n", msc_slot);
@@ -12741,6 +12788,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         continue;
                     }
                     msc_found = 1;
+                    /* #241: this is the one hype uses -- mark it so a later passthrough
+                     * feature can never offer hype's own boot medium to a guest. Looked
+                     * up by POSITION (controller, root port, route), which is what makes
+                     * it the same device across a re-scan; msc_path.route is non-zero
+                     * when it sits behind a hub. */
+                    hype_usb_inventory_claim(&g_usb_inv,
+                                             hype_usb_inventory_find(&g_usb_inv, xhci_count, rp,
+                                                                     msc_path.route),
+                                             HYPE_USB_OWNER_HYPE);
                     {
                         uint32_t last_lba = 0, bsz = 0;
                         hype_debug_print("host-xhci: bulk endpoints configured -- MSC datapath ready\n");
@@ -12837,6 +12893,52 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 }
             }
         } /* while (each xHCI controller) */
+        /*
+         * USB-7 (#241): the inventory dump. One line per device, so the topology is
+         * observable rather than inferred from a failure trace -- which is what the
+         * per-port diagnostics used to be, printed only when something went wrong.
+         *
+         * `owner` matters for what comes next: `hype` is the boot/log medium (or, once
+         * #217 lands, the host keyboard) and must never be offered to a guest; `free`
+         * is a passthrough candidate.
+         */
+        {
+            unsigned int i;
+            hype_debug_print("host-usb: INVENTORY -- %u device(s) across %u controller(s) "
+                             "(%u claimed by hype, %u free)%s [#241]\n",
+                             g_usb_inv.count, xhci_count,
+                             hype_usb_inventory_count_owner(&g_usb_inv, HYPE_USB_OWNER_HYPE),
+                             hype_usb_inventory_count_owner(&g_usb_inv, HYPE_USB_OWNER_NONE),
+                             g_usb_inv.overflow ? " -- TABLE FULL, some devices NOT listed" : "");
+            for (i = 0; i < g_usb_inv.count; i++) {
+                const hype_usb_devinfo_t *d = &g_usb_inv.dev[i];
+                hype_debug_print("host-usb:   [%u] ctrl%u port%u route=0x%05x slot%u speed%u "
+                                 "%04x:%04x class=%02x/%02x/%02x owner=%s\n", i, d->controller,
+                                 d->root_port, d->route, d->slot, d->speed, (unsigned)d->vid,
+                                 (unsigned)d->pid, (unsigned)d->dev_class, (unsigned)d->dev_subclass,
+                                 (unsigned)d->dev_protocol,
+                                 hype_usb_owner_str((hype_usb_owner_t)d->owner));
+            }
+            if (g_usb_inv.overflow != 0u) {
+                hype_debug_print("host-usb: %u device(s) seen but NOT inventoried -- table holds %u "
+                                 "[#241]\n", g_usb_inv.overflow, HYPE_USB_INVENTORY_MAX);
+            }
+            /*
+             * Honest limit, stated where it will be read. The sweep covers every root
+             * port of every controller it BRINGS UP, but it stops bringing up further
+             * controllers once one yields hype's medium -- because the DCBAA, command
+             * ring and event ring in xhci_hw.c are single-instance, so starting the
+             * next controller requires quiescing this one, which would tear down the
+             * very medium this log is being written to. A genuinely complete
+             * cross-controller inventory needs per-controller ring state; the device
+             * on the other controller is not "missed", it is unreachable today.
+             */
+            if (msc_found_any && xhci_count > 1u) {
+                hype_debug_print("host-usb: NOTE -- controllers after the one holding hype's medium "
+                                 "were not enumerated (single-instance xHCI rings); needs "
+                                 "per-controller ring state [#241]\n");
+            }
+        }
         if (xhci_count == 0u) {
             hype_debug_print("host-xhci: no xHCI controller found (buses 0-255)\n");
         } else if (!msc_found_any) {

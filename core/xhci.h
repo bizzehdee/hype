@@ -512,4 +512,100 @@ int hype_xhci_parked_take(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, ui
  */
 void hype_xhci_parked_drop_slot(hype_xhci_parked_t *p, uint32_t slot);
 
+
+/* --- USB-7 (#241): device inventory across all controllers/ports --- */
+
+/*
+ * A persistent record of EVERY USB device the host sweep enumerated, on every
+ * controller, root port, and hub port.
+ *
+ * Groundwork for passthrough, and immediately useful for USB HID host input
+ * (#217/#219): today's scan is written to find one bulk-only mass-storage device
+ * and stop, freeing the slot of anything else it meets. A keyboard on a port
+ * after the stick is therefore never even seen. Recording what the sweep finds
+ * costs nothing and makes the topology observable rather than inferred from a
+ * failure trace.
+ *
+ * Deliberately just DATA plus pure operations -- no xHCI register access, no
+ * transfers -- so the bookkeeping (capacity, de-duplication, claim marking,
+ * lookup) is unit-tested rather than exercised only against real silicon on a
+ * machine with no serial port.
+ */
+#define HYPE_USB_INVENTORY_MAX 32u
+
+/* Who owns a device, so hype's own boot medium / keyboard is never offered to a
+ * guest by a later passthrough feature. */
+typedef enum {
+    HYPE_USB_OWNER_NONE = 0,  /* enumerated, unclaimed -- a passthrough candidate */
+    HYPE_USB_OWNER_HYPE,      /* hype uses it itself (log/boot medium, host HID) */
+    HYPE_USB_OWNER_GUEST      /* passed through to a guest (reserved; no user yet) */
+} hype_usb_owner_t;
+
+typedef struct {
+    unsigned int controller;   /* index of the xHCI controller in PCI scan order */
+    unsigned int root_port;    /* 1-based root port on that controller */
+    unsigned int route;        /* xHCI Route String; 0 = directly on the root port */
+    unsigned int slot;         /* xHCI slot id, 0 if the slot was released */
+    unsigned int speed;        /* PORTSC/hub speed id */
+    uint16_t vid;
+    uint16_t pid;
+    uint8_t dev_class;         /* bDeviceClass from the device descriptor */
+    uint8_t dev_subclass;
+    uint8_t dev_protocol;
+    uint8_t owner;             /* hype_usb_owner_t */
+} hype_usb_devinfo_t;
+
+typedef struct {
+    hype_usb_devinfo_t dev[HYPE_USB_INVENTORY_MAX];
+    unsigned int count;
+    /* Devices seen but NOT recorded because the table was full. Counted rather
+     * than dropped silently: an inventory that quietly truncates would report a
+     * complete topology while hiding ports, which is worse than saying so. */
+    unsigned int overflow;
+} hype_usb_inventory_t;
+
+void hype_usb_inventory_reset(hype_usb_inventory_t *inv);
+
+/*
+ * Record one enumerated device. Returns the new entry's index, or -1 when the
+ * table is full (bumping `overflow`).
+ *
+ * Identity is (controller, root_port, route) -- the physical position, which is
+ * what makes a device the same device across re-scans. Re-adding the same
+ * position UPDATES that entry instead of duplicating it, because the sweep can
+ * legitimately revisit a position (a hub descent re-reads its parent) and two
+ * entries for one port would make any later "which device is on port N" answer
+ * ambiguous. VID/PID deliberately do NOT participate: two identical sticks in
+ * two ports are two devices.
+ */
+int hype_usb_inventory_add(hype_usb_inventory_t *inv, const hype_usb_devinfo_t *d);
+
+/* Position lookup; -1 if absent. */
+int hype_usb_inventory_find(const hype_usb_inventory_t *inv, unsigned int controller,
+                            unsigned int root_port, unsigned int route);
+
+/* Mark the device at `index` as owned. No-op for an out-of-range index. */
+void hype_usb_inventory_claim(hype_usb_inventory_t *inv, int index, hype_usb_owner_t owner);
+
+/*
+ * First device matching `dev_class` that is still unclaimed, or -1. `after` is an
+ * exclusive start index so a caller can walk every match (pass -1 to start).
+ * Used by #217 to find a HID keyboard hype can take without stealing the boot
+ * medium.
+ */
+int hype_usb_inventory_next_unclaimed_class(const hype_usb_inventory_t *inv, uint8_t dev_class,
+                                            int after);
+
+/* Count of entries with the given owner -- for the summary line. */
+unsigned int hype_usb_inventory_count_owner(const hype_usb_inventory_t *inv,
+                                            hype_usb_owner_t owner);
+
+const char *hype_usb_owner_str(hype_usb_owner_t owner);
+
+/* USB HID class, and the boot-protocol subclass/protocols #217/#219 need. */
+#define HYPE_USB_CLASS_HID        0x03u
+#define HYPE_USB_SUBCLASS_BOOT    0x01u
+#define HYPE_USB_PROTO_KEYBOARD   0x01u
+#define HYPE_USB_PROTO_MOUSE      0x02u
+
 #endif /* HYPE_CORE_XHCI_H */

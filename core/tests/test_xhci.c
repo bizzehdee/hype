@@ -401,7 +401,161 @@ static void test_parked_drop_slot(void) {
     CHECK_HEX("other slot untouched", 1, hype_xhci_parked_take(&p, 2, 3, 0x4000, &cc));
 }
 
+
+/* --- USB-7 (#241): device inventory --- */
+
+static hype_usb_devinfo_t mk_dev(unsigned ctrl, unsigned port, unsigned route, uint16_t vid,
+                                 uint8_t cls) {
+    hype_usb_devinfo_t d;
+    d.controller = ctrl; d.root_port = port; d.route = route; d.slot = 1u; d.speed = 3u;
+    d.vid = vid; d.pid = 0x1234u; d.dev_class = cls; d.dev_subclass = 0; d.dev_protocol = 0;
+    d.owner = (uint8_t)HYPE_USB_OWNER_NONE;
+    return d;
+}
+
+static void test_inventory_add_and_find(void) {
+    hype_usb_inventory_t inv;
+    hype_usb_devinfo_t a = mk_dev(0u, 1u, 0u, 0x0781u, HYPE_USB_CLASS_MSC);
+    hype_usb_devinfo_t b = mk_dev(0u, 2u, 0u, 0x046Du, HYPE_USB_CLASS_HID);
+
+    hype_usb_inventory_reset(&inv);
+    CHECK_HEX("empty", 0, (int)inv.count);
+    CHECK_HEX("add a -> index 0", 0, hype_usb_inventory_add(&inv, &a));
+    CHECK_HEX("add b -> index 1", 1, hype_usb_inventory_add(&inv, &b));
+    CHECK_HEX("count 2", 2, (int)inv.count);
+    CHECK_HEX("find a by position", 0, hype_usb_inventory_find(&inv, 0u, 1u, 0u));
+    CHECK_HEX("find b by position", 1, hype_usb_inventory_find(&inv, 0u, 2u, 0u));
+    CHECK_HEX("absent position", -1, hype_usb_inventory_find(&inv, 0u, 9u, 0u));
+    /* Same port on a DIFFERENT controller is a different device -- the whole point
+     * of keying on position is that it must include which controller. */
+    CHECK_HEX("other controller absent", -1, hype_usb_inventory_find(&inv, 1u, 1u, 0u));
+}
+
+static void test_inventory_dedupes_by_position_not_identity(void) {
+    hype_usb_inventory_t inv;
+    /* TWO IDENTICAL sticks in two ports are two devices; the same stick re-read at
+     * one position is one. Keying on VID/PID would get both of these wrong. */
+    hype_usb_devinfo_t p1 = mk_dev(0u, 1u, 0u, 0x0781u, HYPE_USB_CLASS_MSC);
+    hype_usb_devinfo_t p2 = mk_dev(0u, 2u, 0u, 0x0781u, HYPE_USB_CLASS_MSC);
+    hype_usb_devinfo_t p1_again = mk_dev(0u, 1u, 0u, 0x0781u, HYPE_USB_CLASS_MSC);
+
+    hype_usb_inventory_reset(&inv);
+    (void)hype_usb_inventory_add(&inv, &p1);
+    (void)hype_usb_inventory_add(&inv, &p2);
+    CHECK_HEX("identical devices in two ports are two entries", 2, (int)inv.count);
+    CHECK_HEX("re-adding one position updates it", 0, hype_usb_inventory_add(&inv, &p1_again));
+    CHECK_HEX("still two entries", 2, (int)inv.count);
+}
+
+static void test_inventory_update_cannot_unclaim(void) {
+    hype_usb_inventory_t inv;
+    hype_usb_devinfo_t d = mk_dev(0u, 1u, 0u, 0x0781u, HYPE_USB_CLASS_MSC);
+    int i;
+
+    hype_usb_inventory_reset(&inv);
+    i = hype_usb_inventory_add(&inv, &d);
+    hype_usb_inventory_claim(&inv, i, HYPE_USB_OWNER_HYPE);
+    /* A re-scan re-adds with owner=NONE. That must NOT silently release hype's own
+     * boot medium -- which would make it a passthrough candidate and let a guest be
+     * handed the disk the log is being written to. */
+    (void)hype_usb_inventory_add(&inv, &d);
+    CHECK_HEX("re-add preserves hype's claim", (int)HYPE_USB_OWNER_HYPE, (int)inv.dev[0].owner);
+}
+
+static void test_inventory_next_unclaimed_class(void) {
+    hype_usb_inventory_t inv;
+    hype_usb_devinfo_t msc = mk_dev(0u, 1u, 0u, 0x0781u, HYPE_USB_CLASS_MSC);
+    hype_usb_devinfo_t kbd = mk_dev(0u, 2u, 0u, 0x046Du, HYPE_USB_CLASS_HID);
+    hype_usb_devinfo_t kbd2 = mk_dev(0u, 3u, 0u, 0x1234u, HYPE_USB_CLASS_HID);
+    int first;
+
+    hype_usb_inventory_reset(&inv);
+    (void)hype_usb_inventory_add(&inv, &msc);
+    (void)hype_usb_inventory_add(&inv, &kbd);
+    (void)hype_usb_inventory_add(&inv, &kbd2);
+
+    first = hype_usb_inventory_next_unclaimed_class(&inv, HYPE_USB_CLASS_HID, -1);
+    CHECK_HEX("first HID is index 1", 1, first);
+    CHECK_HEX("second HID is index 2", 2,
+              hype_usb_inventory_next_unclaimed_class(&inv, HYPE_USB_CLASS_HID, first));
+    CHECK_HEX("no third HID", -1,
+              hype_usb_inventory_next_unclaimed_class(&inv, HYPE_USB_CLASS_HID, 2));
+
+    /* A claimed device is skipped -- that is how #217 avoids taking the boot medium. */
+    hype_usb_inventory_claim(&inv, 1, HYPE_USB_OWNER_HYPE);
+    CHECK_HEX("claimed HID skipped", 2,
+              hype_usb_inventory_next_unclaimed_class(&inv, HYPE_USB_CLASS_HID, -1));
+    CHECK_HEX("one owned by hype", 1,
+              (int)hype_usb_inventory_count_owner(&inv, HYPE_USB_OWNER_HYPE));
+    CHECK_HEX("two still free", 2,
+              (int)hype_usb_inventory_count_owner(&inv, HYPE_USB_OWNER_NONE));
+}
+
+static void test_inventory_overflow_is_counted_not_silent(void) {
+    hype_usb_inventory_t inv;
+    unsigned i;
+
+    hype_usb_inventory_reset(&inv);
+    for (i = 0; i < HYPE_USB_INVENTORY_MAX + 3u; i++) {
+        hype_usb_devinfo_t d = mk_dev(0u, i + 1u, 0u, 0x1u, HYPE_USB_CLASS_HID);
+        int r = hype_usb_inventory_add(&inv, &d);
+        if (i < HYPE_USB_INVENTORY_MAX) {
+            CHECK_HEX("in-capacity add succeeds", (int)i, r);
+        } else {
+            CHECK_HEX("over-capacity add refused", -1, r);
+        }
+    }
+    CHECK_HEX("count capped", (int)HYPE_USB_INVENTORY_MAX, (int)inv.count);
+    /* A truncating inventory that said nothing would report a complete topology
+     * while hiding ports -- worse than admitting it. */
+    CHECK_HEX("overflow counted", 3, (int)inv.overflow);
+}
+
+static void test_inventory_null_safe(void) {
+    hype_usb_devinfo_t d = mk_dev(0u, 1u, 0u, 1u, HYPE_USB_CLASS_HID);
+    hype_usb_inventory_t inv;
+    hype_usb_inventory_reset(0);
+    CHECK_HEX("add to NULL", -1, hype_usb_inventory_add(0, &d));
+    hype_usb_inventory_reset(&inv);
+    CHECK_HEX("add NULL dev", -1, hype_usb_inventory_add(&inv, 0));
+    CHECK_HEX("find in NULL", -1, hype_usb_inventory_find(0, 0u, 1u, 0u));
+    CHECK_HEX("class scan in NULL", -1, hype_usb_inventory_next_unclaimed_class(0, 3u, -1));
+    CHECK_HEX("count in NULL", 0, (int)hype_usb_inventory_count_owner(0, HYPE_USB_OWNER_HYPE));
+    hype_usb_inventory_claim(0, 0, HYPE_USB_OWNER_HYPE);      /* must not crash */
+    hype_usb_inventory_claim(&inv, -1, HYPE_USB_OWNER_HYPE);  /* out of range */
+    hype_usb_inventory_claim(&inv, 99, HYPE_USB_OWNER_HYPE);
+}
+
+
+static void test_inventory_owner_strings_and_explicit_owner(void) {
+    hype_usb_inventory_t inv;
+    hype_usb_devinfo_t d = mk_dev(0u, 1u, 0u, 1u, HYPE_USB_CLASS_HID);
+
+    CHECK_HEX("free", 1, hype_usb_owner_str(HYPE_USB_OWNER_NONE)[0] == 'f');
+    CHECK_HEX("hype", 1, hype_usb_owner_str(HYPE_USB_OWNER_HYPE)[0] == 'h');
+    CHECK_HEX("guest", 1, hype_usb_owner_str(HYPE_USB_OWNER_GUEST)[0] == 'g');
+    CHECK_HEX("unknown owner", 1, hype_usb_owner_str((hype_usb_owner_t)99)[0] == '?');
+
+    /* An add that arrives ALREADY owned must set that owner, not be treated as the
+     * "do not un-claim" case -- the guard exists to protect an existing claim from a
+     * neutral re-scan, not to ignore a deliberate one. */
+    hype_usb_inventory_reset(&inv);
+    (void)hype_usb_inventory_add(&inv, &d);
+    hype_usb_inventory_claim(&inv, 0, HYPE_USB_OWNER_HYPE);
+    d.owner = (uint8_t)HYPE_USB_OWNER_GUEST;
+    (void)hype_usb_inventory_add(&inv, &d);
+    CHECK_HEX("explicit new owner wins over the old claim", (int)HYPE_USB_OWNER_GUEST,
+              (int)inv.dev[0].owner);
+}
+
 int main(void) {
+    test_inventory_add_and_find();
+    test_inventory_dedupes_by_position_not_identity();
+    test_inventory_update_cannot_unclaim();
+    test_inventory_next_unclaimed_class();
+    test_inventory_overflow_is_counted_not_silent();
+    test_inventory_null_safe();
+    test_inventory_owner_strings_and_explicit_owner();
     test_recovery_trbs();
     test_reg_offsets();
     test_context_encoders();
