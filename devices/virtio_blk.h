@@ -169,7 +169,29 @@ typedef struct {
  * settable -- mirrors hype_atapi_reset()'s own `media`/`media_size`
  * parameters).
  */
-#define HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX 8u
+/*
+ * Virtqueue size this device advertises (and the ceiling it clamps a driver's
+ * own request to).
+ *
+ * #265: this was 8, and 8 is why the write path looked latency-bound with
+ * nothing to be done about it. A virtio-blk request needs a MINIMUM of three
+ * descriptors -- header, one data segment, status -- so an 8-entry queue can
+ * hold at most floor(8/3) = 2 requests. A measured queue depth of "max 2, mean
+ * 1.30" therefore said nothing whatsoever about how deeply the guest wanted to
+ * queue: it was this constant, reflected back.
+ *
+ * That mattered because the depth measurement was taken to decide whether
+ * coalescing adjacent requests could help the physical write path, and a depth
+ * of 2 says it cannot. The number was real and the reading of it was wrong --
+ * the ceiling was hype's, not the guest's.
+ *
+ * 256 matches what QEMU's own virtio-blk advertises, so a Linux guest here
+ * queues the way it would against a real device. The rings themselves live in
+ * GUEST memory and are allocated by the driver, so this costs hype nothing per
+ * queue; what it costs is that anything sizing its own rings from this constant
+ * must actually do so (see g_m5_1_* in boot/main.c) rather than hardcode 8.
+ */
+#define HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX 256u
 
 void hype_virtio_blk_reset(hype_virtio_blk_t *dev, uint64_t capacity_sectors);
 

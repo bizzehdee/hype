@@ -869,6 +869,36 @@ static void test_depth_is_recorded_by_the_drain(void) {
     hype_virtio_blk_depth_reset(d);
 }
 
+
+/*
+ * #265: the advertised queue size bounds how many requests can be in flight at
+ * once, because every virtio-blk request costs a MINIMUM of three descriptors
+ * (header, one data segment, status). At the old value of 8 that ceiling was 2,
+ * which is exactly the "max depth 2" the queue-depth DIAG measured -- a number
+ * that looked like guest behaviour and was actually this constant. Asserted here
+ * so the relationship is recorded rather than rediscovered.
+ */
+static void test_queue_size_bounds_requests_in_flight(void) {
+    unsigned max_in_flight = HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX / 3u;
+
+    /* Enough depth for a guest to pipeline, rather than submit-and-wait. A
+     * regression back to single digits would silently reimpose the ceiling. */
+    if (max_in_flight < 16u) {
+        printf("FAIL: queue size %u allows only %u requests in flight -- too shallow "
+               "for a guest to keep the write path busy (#265)\n",
+               HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX, max_in_flight);
+        failures++;
+    }
+    /* A driver may still negotiate DOWN; the device only caps. */
+    {
+        hype_virtio_blk_t dev;
+        hype_virtio_blk_reset(&dev, 128);
+        common_write(&dev, HYPE_VIRTIO_COMMON_CFG_QUEUE_SIZE, 2u, 8u);
+        CHECK_HEX("a driver may negotiate a smaller queue", 8u,
+                  common_read(&dev, HYPE_VIRTIO_COMMON_CFG_QUEUE_SIZE, 2u));
+    }
+}
+
 int main(void) {
     test_reset_sets_capacity_and_default_queue_size();
     test_feature_negotiation_offers_only_version_1();
@@ -895,6 +925,7 @@ int main(void) {
     test_chain_multiple_pending_chains_all_drain();
     test_chain_zero_queue_size_rejected();
     test_chain_reject_log_is_rate_limited();
+    test_queue_size_bounds_requests_in_flight();
     test_depth_buckets();
     test_depth_record_accumulates();
     test_depth_is_recorded_by_the_drain();

@@ -5075,9 +5075,22 @@ static uint8_t g_m5_1_backing[0x10000] __attribute__((aligned(4096))); /* 128 se
  * test seeds + verifies), so the refactor is behaviour-preserving here. */
 static hype_blk_file_t g_m5_1_blk_file;
 static hype_blk_backend_t g_m5_1_be;
-static uint8_t g_m5_1_desc_table[128] __attribute__((aligned(4096)));  /* 8 * 16 bytes */
-static uint8_t g_m5_1_avail[22] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_used[70] __attribute__((aligned(4096)));
+/*
+ * Sized FROM the advertised queue size, not hardcoded. This guest never writes
+ * QUEUE_SIZE, so it runs at whatever the device advertises -- and
+ * process_virtio_blk_queue() reads the avail ring as 4 + 2*qsz + 2 bytes and
+ * writes the used ring as 4 + 8*qsz + 2. These are identity-mapped (dma_map is
+ * NULL for the cooperating test guests, so there is no bounds check to catch
+ * it), so hardcoding 8 here while raising the advertised size to 256 would have
+ * been an out-of-bounds read and write inside hype's own BSS. Deriving them
+ * means the two cannot drift apart again.
+ */
+static uint8_t g_m5_1_desc_table[HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX * 16u]
+    __attribute__((aligned(4096)));
+static uint8_t g_m5_1_avail[4u + 2u * HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX + 2u]
+    __attribute__((aligned(4096)));
+static uint8_t g_m5_1_used[4u + 8u * HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX + 2u]
+    __attribute__((aligned(4096)));
 static uint8_t g_m5_1_req1_header[16] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_req1_data[512] __attribute__((aligned(4096)));
 static uint8_t g_m5_1_req1_status[1] __attribute__((aligned(4096)));
