@@ -34,6 +34,11 @@ static void set_check_condition(hype_atapi_t *dev, hype_atapi_result_t *out, uin
     out->synth_length = 0;
 }
 
+void hype_atapi_set_media_error(hype_atapi_t *dev, uint8_t sense_key, uint8_t asc) {
+    dev->sense_key = sense_key;
+    dev->asc = asc;
+}
+
 static void handle_test_unit_ready(hype_atapi_t *dev, hype_atapi_result_t *out) {
     zero_synth(out);
     out->uses_media_data = 0;

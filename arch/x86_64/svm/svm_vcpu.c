@@ -1509,6 +1509,7 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     uint8_t *rx_fis_host;
     hype_atapi_result_t result;
     uint8_t identify[HYPE_ATAPI_IDENTIFY_SIZE];
+    int media_read_failed = 0; /* #287: backing-store read failed -> complete with ERR */
     const uint8_t *src;
     /* Default 0: the ATA paths (IDENTIFY PACKET / SET FEATURES) and the synth
      * ATAPI responses copy from a flat `src`; only a media-data ATAPI read on a
@@ -1676,12 +1677,32 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                                  (unsigned long long)atapi->media_stream->iso_size, srr);
             }
             if (srr != 0) {
-                return -1;
+                /*
+                 * #287: a BACKING-STORE failure is not "this is not my command".
+                 *
+                 * Returning -1 here meant the caller fell through to its
+                 * unhandled-MMIO path and PANICKED on the guest's next perfectly
+                 * ordinary ABAR write -- blaming a register that is in fact modelled,
+                 * eleven log lines away from the read that actually failed. Any
+                 * transient host-disk error took down the hypervisor and every guest.
+                 *
+                 * Report what a real drive reports instead: MEDIUM ERROR / unrecovered
+                 * read error. Guests and firmware both know how to handle that, and
+                 * hype stays up. Same spirit as GLADDER-1 absorbing unhandled MMIO
+                 * rather than dying.
+                 */
+                hype_atapi_set_media_error(atapi, HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR,
+                                           HYPE_ATAPI_ASC_UNRECOVERED_READ_ERROR);
+                media_read_failed = 1;
+                break;
             }
         } else if (chunked_media) {
             if (hype_chunked_iso_read(atapi->media_chunks, media_byte_off + transferred, dst,
                                       chunk) != 0) {
-                return -1;
+                hype_atapi_set_media_error(atapi, HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR,
+                                           HYPE_ATAPI_ASC_UNRECOVERED_READ_ERROR);
+                media_read_failed = 1; /* #287: same reasoning as the streamed path */
+                break;
             }
         } else {
             ahci_copy_fast(dst, src, chunk);
@@ -1690,6 +1711,18 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
         remaining -= chunk;
         transferred += chunk;
         prd_idx++;
+    }
+
+    /*
+     * #287: a backing-store read failed part-way. Complete the command with ERR set
+     * and the sense already stashed, rather than returning early -- an early return
+     * leaves PxCI set and the guest waits on a command that will never finish, which
+     * is a hang instead of an error. PRDBC below reports the partial count, which is
+     * what a real drive does on a short/failed transfer.
+     */
+    if (media_read_failed) {
+        status_reg = (uint8_t)(0x50u | 0x01u); /* DRDY|DSC|ERR */
+        error_reg = (uint8_t)(atapi->sense_key << 4);
     }
 
     /* PRDBC (Command Header dword 1, byte offset 4): the count of bytes

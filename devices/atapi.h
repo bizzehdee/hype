@@ -71,9 +71,17 @@
 #define HYPE_ATAPI_SENSE_KEY_NO_SENSE 0x00u
 #define HYPE_ATAPI_SENSE_KEY_NOT_READY 0x02u
 #define HYPE_ATAPI_SENSE_KEY_ILLEGAL_REQUEST 0x05u
+/* #287: MEDIUM ERROR -- the drive acknowledged the command but could not read the
+ * data. What hype must report when its own backing-store read fails. */
+#define HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR 0x03u
 #define HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT 0x3Au
 #define HYPE_ATAPI_ASC_INVALID_COMMAND_OPCODE 0x20u
 #define HYPE_ATAPI_ASC_LBA_OUT_OF_RANGE 0x21u
+/* #287: unrecovered read error in the data area -- what a real drive reports when it
+ * cannot read a sector it acknowledged. Used when hype's own BACKING STORE read fails
+ * (a host-disk read error behind a streamed ISO), so the guest sees a media error it
+ * knows how to handle instead of the hypervisor dying. */
+#define HYPE_ATAPI_ASC_UNRECOVERED_READ_ERROR 0x11u
 
 /* Max size of a synthesized (non-media-streamed) response this
  * project's supported command set ever produces in one shot --
@@ -197,5 +205,15 @@ void hype_atapi_execute_cdb(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_
  * no CPU/guest-memory access.
  */
 void hype_atapi_build_identify(const hype_atapi_t *dev, uint8_t out[HYPE_ATAPI_IDENTIFY_SIZE]);
+
+/*
+ * #287: raise a media error on this device from outside atapi.c.
+ *
+ * The AHCI/ATAPI glue lives in svm_vcpu.c and is where a backing-store read failure is
+ * actually detected; it needs to turn that into a CHECK CONDITION the guest can see,
+ * rather than returning "not my command" and letting the caller fall through to an
+ * unhandled-MMIO panic (which is what #287 was).
+ */
+void hype_atapi_set_media_error(hype_atapi_t *dev, uint8_t sense_key, uint8_t asc);
 
 #endif /* HYPE_DEVICES_ATAPI_H */

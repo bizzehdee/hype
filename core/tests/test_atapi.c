@@ -530,6 +530,36 @@ static void test_read10_offset_no_uint32_overflow(void) {
     CHECK_HEX("media_length = 1 * 2048", HYPE_ATAPI_SECTOR_SIZE, out.media_length);
 }
 
+static void test_set_media_error(void) {
+    hype_atapi_t dev;
+    hype_atapi_reset(&dev, 0, 0);
+
+    /* #287: the AHCI glue lives in another translation unit and needs to raise a
+     * media error when ITS backing-store read fails. Before this existed it returned
+     * "not my command" instead, and the caller's fall-through panicked on the guest's
+     * next ordinary ABAR write -- blaming a register that was modelled. */
+    hype_atapi_set_media_error(&dev, HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR,
+                               HYPE_ATAPI_ASC_UNRECOVERED_READ_ERROR);
+    CHECK_HEX("sense key recorded", HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR, dev.sense_key);
+    CHECK_HEX("asc recorded", HYPE_ATAPI_ASC_UNRECOVERED_READ_ERROR, dev.asc);
+
+    /* A later REQUEST SENSE must report it, or the guest cannot tell what went
+     * wrong and retries forever. */
+    {
+        uint8_t cdb[12];
+        hype_atapi_result_t out;
+        unsigned i;
+        for (i = 0; i < sizeof(cdb); i++) { cdb[i] = 0; }
+        cdb[0] = HYPE_ATAPI_CMD_REQUEST_SENSE;
+        cdb[4] = 18u;
+        hype_atapi_execute_cdb(&dev, cdb, &out);
+        CHECK_HEX("request sense reports MEDIUM ERROR", HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR,
+                  out.synth_data[2] & 0x0Fu);
+        CHECK_HEX("request sense reports the ASC", HYPE_ATAPI_ASC_UNRECOVERED_READ_ERROR,
+                  out.synth_data[12]);
+    }
+}
+
 int main(void) {
     init_media();
 
@@ -560,6 +590,8 @@ int main(void) {
     test_read_toc_multisession();
     test_reset_chunked_media_size_not_truncated();
     test_read10_offset_no_uint32_overflow();
+
+    test_set_media_error();
 
     if (failures == 0) {
         printf("all tests passed\n");
