@@ -58,4 +58,28 @@ EFI_STATUS hype_exit_boot_services(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *b
  */
 UINT64 hype_memmap_usable_bytes(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size, UINTN desc_size);
 
+
+/*
+ * #290: the largest SINGLE contiguous EfiConventionalMemory block, in bytes.
+ *
+ * AllocateAnyPages needs one contiguous run, so a request can fail with
+ * gigabytes free -- measured on this project: a 524800-page (2051 MiB) guest RAM
+ * allocation failed against a largest free block of 522626 pages, short by 2174
+ * pages with plenty free elsewhere in the map. An EFI_OUT_OF_RESOURCES on a host
+ * with free memory reads as a hype bug until you know that, and establishing it
+ * previously took a manual memory-map read.
+ *
+ * Only EfiConventionalMemory counts. BootServicesCode/Data are included in
+ * hype_memmap_usable_bytes()'s total because they become free after
+ * ExitBootServices, but they are NOT available to an AllocatePages call made
+ * before it -- and the failures this exists to explain all happen pre-EBS.
+ *
+ * Pure. Adjacent descriptors of the same type are NOT merged: firmware may split
+ * one physical run across several entries, so this is a lower bound on the true
+ * largest run, which is the safe direction for a diagnostic (it can understate
+ * what is available, never overstate).
+ */
+UINT64 hype_memmap_largest_conventional_bytes(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
+                                              UINTN desc_size);
+
 #endif /* HYPE_MEMMAP_H */

@@ -448,7 +448,55 @@ static void test_usable_bytes_empty(void) {
     CHECK_INT("usable_bytes of an empty map is zero", 0, (long long)result);
 }
 
+
+/*
+ * #290: largest SINGLE contiguous Conventional block. This is the number that
+ * explains an EFI_OUT_OF_RESOURCES on a host with gigabytes free -- AllocateAnyPages
+ * needs one contiguous run, and a request can be refused while the TOTAL free far
+ * exceeds it.
+ */
+static void test_largest_conventional_block(void) {
+    EFI_MEMORY_DESCRIPTOR m[5];
+    UINT64 got;
+
+    memset(m, 0, sizeof(m));
+    /* Two Conventional runs, the smaller one FIRST so a buggy "take the first"
+     * implementation is caught, plus non-Conventional types that must be ignored. */
+    m[0].Type = EfiConventionalMemory; m[0].PhysicalStart = 0x100000;   m[0].NumberOfPages = 100;
+    m[1].Type = EfiBootServicesData;   m[1].PhysicalStart = 0x1000000;  m[1].NumberOfPages = 9999;
+    m[2].Type = EfiConventionalMemory; m[2].PhysicalStart = 0x2000000;  m[2].NumberOfPages = 500;
+    m[3].Type = EfiACPIMemoryNVS;      m[3].PhysicalStart = 0x3000000;  m[3].NumberOfPages = 8888;
+    m[4].Type = EfiConventionalMemory; m[4].PhysicalStart = 0x4000000;  m[4].NumberOfPages = 250;
+
+    got = hype_memmap_largest_conventional_bytes(m, sizeof(m), sizeof(m[0]));
+    CHECK_INT("largest is the 500-page run", 500ULL * 4096ULL, got);
+
+    /*
+     * BootServicesCode/Data must NOT count, even though hype_memmap_usable_bytes()
+     * includes them in its total: they only become free AFTER ExitBootServices, and
+     * every allocation failure this diagnostic explains happens BEFORE it. m[1] is
+     * 9999 pages -- far larger than any Conventional run here -- so counting it
+     * would be obvious.
+     */
+    if (got >= 9999ULL * 4096ULL) {
+        printf("FAIL: BootServicesData counted as available pre-EBS\n");
+        failures++;
+    }
+
+    /* An all-non-Conventional map has no usable contiguous run at all. */
+    memset(m, 0, sizeof(m));
+    m[0].Type = EfiACPIMemoryNVS; m[0].NumberOfPages = 1000;
+    CHECK_INT("no Conventional -> 0", 0ULL,
+              hype_memmap_largest_conventional_bytes(m, sizeof(m[0]), sizeof(m[0])));
+
+    /* Degenerate inputs must not divide by zero or deref. */
+    CHECK_INT("NULL map -> 0", 0ULL, hype_memmap_largest_conventional_bytes(0, 64, 8));
+    CHECK_INT("desc_size 0 -> 0", 0ULL, hype_memmap_largest_conventional_bytes(m, 64, 0));
+    CHECK_INT("empty map -> 0", 0ULL, hype_memmap_largest_conventional_bytes(m, 0, sizeof(m[0])));
+}
+
 int main(void) {
+    test_largest_conventional_block();
     test_type_name();
     test_get_success();
     test_get_probe_error();

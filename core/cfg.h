@@ -134,4 +134,43 @@ typedef struct {
  */
 hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out);
 
+
+/*
+ * #290: resolve the guest RAM size a VM should actually get, in MB.
+ *
+ * Exists because `mem_mb` was a required, validated, echoed config key that was
+ * then ignored -- boot/main.c assigned the VM struct's mem_mb *from* the
+ * compile-time default, so the config value was overwritten before use and the
+ * echo read as confirmation of a setting that had no effect.
+ *
+ * The status is the point, not a decoration. Reporting only the number cannot
+ * distinguish "your 512 was applied" from "your 512 was clamped to 128" from
+ * "your config was ignored and you got the built-in default" -- and it was
+ * exactly that ambiguity (an echo that looked like confirmation) which made the
+ * original bug survive. The caller is expected to LOG which of these happened.
+ *
+ * cfg_mem_mb == 0 means "no config value present".
+ * Pure; no clock, no allocation, no I/O.
+ */
+typedef enum {
+    HYPE_CFG_RAM_DEFAULTED = 0,   /* no config value -- built-in default applied */
+    HYPE_CFG_RAM_APPLIED,         /* config value used exactly as written */
+    HYPE_CFG_RAM_CLAMPED_LOW,     /* config value below min_mb; min applied */
+    HYPE_CFG_RAM_CLAMPED_HIGH     /* config value above max_mb; max applied */
+} hype_cfg_ram_status_t;
+
+/*
+ * Writes the MB figure to apply into *out_mb (never NULL-derefs: a NULL out_mb
+ * is a no-op returning the status only) and returns which case applied.
+ * min_mb/max_mb are the platform's own limits; max_mb must be >= min_mb, and if
+ * a caller passes them inverted the floor wins, because booting a too-small
+ * guest fails visibly whereas overrunning the address space hole corrupts.
+ */
+hype_cfg_ram_status_t hype_cfg_resolve_mem_mb(unsigned int cfg_mem_mb, unsigned int default_mb,
+                                              unsigned int min_mb, unsigned int max_mb,
+                                              unsigned int *out_mb);
+
+/* Human-readable form of the above, for the log line that accompanies it. */
+const char *hype_cfg_ram_status_str(hype_cfg_ram_status_t st);
+
 #endif /* HYPE_CFG_H */

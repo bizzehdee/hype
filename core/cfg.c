@@ -456,3 +456,56 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
 
     return res;
 }
+
+hype_cfg_ram_status_t hype_cfg_resolve_mem_mb(unsigned int cfg_mem_mb, unsigned int default_mb,
+                                              unsigned int min_mb, unsigned int max_mb,
+                                              unsigned int *out_mb) {
+    unsigned int applied;
+    hype_cfg_ram_status_t st;
+
+    /* Inverted limits: the floor wins. A guest that is too small fails loudly at
+     * its own boot; one sized past the platform's ceiling corrupts whatever lives
+     * above it, which is far harder to attribute. */
+    if (max_mb < min_mb) {
+        max_mb = min_mb;
+    }
+
+    if (cfg_mem_mb == 0u) {
+        applied = default_mb;
+        st = HYPE_CFG_RAM_DEFAULTED;
+    } else if (cfg_mem_mb < min_mb) {
+        applied = min_mb;
+        st = HYPE_CFG_RAM_CLAMPED_LOW;
+    } else if (cfg_mem_mb > max_mb) {
+        applied = max_mb;
+        st = HYPE_CFG_RAM_CLAMPED_HIGH;
+    } else {
+        applied = cfg_mem_mb;
+        st = HYPE_CFG_RAM_APPLIED;
+    }
+
+    /* The DEFAULT is clamped too. A built-in default that exceeds the platform
+     * ceiling is still an overrun, and the compile-time override
+     * (-DHYPE_FW_1_GUEST_RAM_MB=N) can set it to anything. */
+    if (applied < min_mb) {
+        applied = min_mb;
+    }
+    if (applied > max_mb) {
+        applied = max_mb;
+    }
+
+    if (out_mb != (unsigned int *)0) {
+        *out_mb = applied;
+    }
+    return st;
+}
+
+const char *hype_cfg_ram_status_str(hype_cfg_ram_status_t st) {
+    switch (st) {
+        case HYPE_CFG_RAM_DEFAULTED: return "built-in default (no hype.cfg value)";
+        case HYPE_CFG_RAM_APPLIED: return "from hype.cfg";
+        case HYPE_CFG_RAM_CLAMPED_LOW: return "hype.cfg value RAISED to the minimum";
+        case HYPE_CFG_RAM_CLAMPED_HIGH: return "hype.cfg value LOWERED to the maximum";
+        default: return "unknown";
+    }
+}

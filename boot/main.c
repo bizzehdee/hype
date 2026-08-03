@@ -350,6 +350,20 @@ static uint64_t g_ram_1_size_bytes;
 #define HYPE_FW_1_GUEST_RAM_MB 2048ULL
 #endif
 #define HYPE_FW_1_GUEST_RAM_BYTES (HYPE_FW_1_GUEST_RAM_MB * 1024ULL * 1024ULL)
+
+/*
+ * #290: bounds for a config-supplied mem_mb.
+ *
+ * The floor is what a Linux guest needs to reach userspace off a streamed ISO at
+ * all; below it the guest dies in its own boot and the operator blames hype.
+ *
+ * The ceiling is the Q35 32-bit MMIO hole at 0xE0000000 minus the firmware image
+ * mapped just under 4GB -- guest RAM starts at guest-physical 0 and must not
+ * reach either. Kept well clear rather than exactly at the hole, since the NPT/EPT
+ * "not present" range above RAM is computed against it.
+ */
+#define HYPE_FW_1_GUEST_RAM_MIN_MB 128u
+#define HYPE_FW_1_GUEST_RAM_MAX_MB 3072u
 #define HYPE_SERIAL_COM2 0x2F8u
 #define HYPE_FW_1_KEY_ENTER_MAKE 0x1Cu /* Set-1 make code for Enter */
 #define HYPE_FW_1_DEBUG_PORT 0x402u    /* FW-1g: OVMF SEC/PEI PlatformDebugLibIoPort */
@@ -388,6 +402,20 @@ typedef struct hype_fw_vm {
      * Must stay 2MB-aligned and <= 0xE0000000 (the Q35 32-bit MMIO hole base
      * OVMF asserts low RAM stays under). See HYPE_FW_1_GUEST_RAM_BYTES. */
     uint64_t ram_host_phys;
+    /*
+     * #290: this VM's guest RAM SIZE in bytes, resolved once from hype.cfg's
+     * mem_mb (or the built-in default) before the region is allocated. Every
+     * consumer -- the allocation, the NPT/EPT map extent, the E820 the guest
+     * sees, the DMA gpa map, the isolation probe -- reads it from here.
+     *
+     * It replaces direct use of HYPE_FW_1_GUEST_RAM_BYTES at those sites. That
+     * constant was the single source of truth, which is why a configured mem_mb
+     * could be echoed and then ignored: vm->mem_mb was assigned FROM the
+     * constant, so the config value was overwritten before anything read it.
+     * mem_mb is now derived from this field instead, so the number reported to
+     * the operator cannot disagree with the number allocated.
+     */
+    uint64_t ram_bytes;
     uint8_t e820_blob[HYPE_E820_ENTRY_SIZE * 8];
     uint8_t guest_stack[65536] __attribute__((aligned(4096)));
     /* M8-0a: this instance's own NPT (nested page tables). Per-VM so two
@@ -543,6 +571,30 @@ static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
 #define g_fw_1_code_size (vm->code_size)
 #define g_fw_1_vars_size (vm->vars_size)
 #define g_fw_1_ram_host_phys (vm->ram_host_phys)
+
+/*
+ * #290: settle this VM's guest RAM size from hype.cfg (or the built-in default),
+ * store it, and SAY which source won and why. The saying is the fix as much as
+ * the wiring: the bug was a config value that got echoed and then discarded, so a
+ * log that only repeated the request could not distinguish applied from ignored.
+ */
+static void fw_1_resolve_guest_ram(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigned vm_index) {
+    unsigned cfg_mb = 0u;
+    unsigned applied_mb = 0u;
+    hype_cfg_ram_status_t st;
+
+    if (cfg != 0 && vm_index < cfg->vm_count) {
+        cfg_mb = cfg->vms[vm_index].mem_mb;
+    }
+    st = hype_cfg_resolve_mem_mb(cfg_mb, (unsigned)HYPE_FW_1_GUEST_RAM_MB,
+                                 HYPE_FW_1_GUEST_RAM_MIN_MB, HYPE_FW_1_GUEST_RAM_MAX_MB,
+                                 &applied_mb);
+    vmp->ram_bytes = (uint64_t)applied_mb * 1024ULL * 1024ULL;
+    vmp->mem_mb = applied_mb;
+    hype_debug_print("fw-1: vm%u guest RAM %u MiB -- %s (requested %u, limits %u..%u) [#290]\n",
+                     vm_index, applied_mb, hype_cfg_ram_status_str(st), cfg_mb,
+                     HYPE_FW_1_GUEST_RAM_MIN_MB, HYPE_FW_1_GUEST_RAM_MAX_MB);
+}
 #define g_fw_1_e820_blob (vm->e820_blob)
 #define g_fw_1_guest_stack (vm->guest_stack)
 #define g_fw_1_pic (vm->pic)
@@ -1533,8 +1585,44 @@ static uint64_t hype_alloc_pages_any(EFI_BOOT_SERVICES *bs, UINTN pages) {
     EFI_PHYSICAL_ADDRESS mem = 0;
     EFI_STATUS status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData, pages, &mem);
     if (status != EFI_SUCCESS) {
-        hype_fatal("AllocatePages(AnyPages, %u pages) failed: 0x%llx", (unsigned int)pages,
-                   (unsigned long long)status);
+        /*
+         * #290: say WHY, because the bare status reads as a hype bug.
+         *
+         * AllocateAnyPages needs one CONTIGUOUS run, so this fails with gigabytes
+         * still free. Measured here: a 2051 MiB request refused against a largest
+         * free block of 2041 MiB -- short by 8.5 MB with plenty free elsewhere.
+         * Establishing that took a manual memory-map read and cost more than one
+         * run, twice mistaken for a code regression. The numbers now come out with
+         * the failure.
+         *
+         * Re-fetching the map here is safe in the way that matters: it is a small
+         * AllocatePool, not another huge contiguous page run, so the condition that
+         * just failed does not prevent it. If it fails anyway, that is reported
+         * rather than papered over -- a diagnostic that silently substitutes 0
+         * would be worse than none, since 0 looks like "no memory at all".
+         */
+        EFI_MEMORY_DESCRIPTOR *map = 0;
+        UINTN map_size = 0, desc_size = 0, map_key = 0;
+        uint64_t want = (uint64_t)pages * 4096ULL;
+        EFI_STATUS mstat = hype_memmap_get(bs, &map, &map_size, &desc_size, &map_key);
+
+        if (mstat == EFI_SUCCESS) {
+            uint64_t largest = hype_memmap_largest_conventional_bytes(map, map_size, desc_size);
+            uint64_t usable = hype_memmap_usable_bytes(map, map_size, desc_size);
+            hype_fatal("AllocatePages(AnyPages, %u pages = %llu MiB) failed: 0x%llx -- needs ONE "
+                       "CONTIGUOUS run; largest free Conventional block is %llu MiB (%llu MiB "
+                       "usable in total, but fragmented). Not out of memory: out of contiguity. "
+                       "Lower the guest RAM (hype.cfg mem_mb, or -DHYPE_FW_1_GUEST_RAM_MB=N) or "
+                       "give the VM more host RAM. [#290]",
+                       (unsigned int)pages, (unsigned long long)(want / (1024ULL * 1024ULL)),
+                       (unsigned long long)status,
+                       (unsigned long long)(largest / (1024ULL * 1024ULL)),
+                       (unsigned long long)(usable / (1024ULL * 1024ULL)));
+        }
+        hype_fatal("AllocatePages(AnyPages, %u pages = %llu MiB) failed: 0x%llx (memory map "
+                   "unavailable too: 0x%llx -- cannot report the largest contiguous block)",
+                   (unsigned int)pages, (unsigned long long)(want / (1024ULL * 1024ULL)),
+                   (unsigned long long)status, (unsigned long long)mstat);
     }
     return (uint64_t)mem;
 }
@@ -5924,7 +6012,7 @@ static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
  * hype_npt_map_range() calls in the NPT build below. */
 static const uint8_t *fw_1_guest_phys_to_host(hype_fw_vm_t *vm, uint64_t gpa) {
     uint64_t flash_base = 0x100000000ULL - g_fw_1_combined_size;
-    if (gpa < HYPE_FW_1_GUEST_RAM_BYTES) {
+    if (gpa < vm->ram_bytes) {
         return (const uint8_t *)(uintptr_t)(g_fw_1_ram_host_phys + gpa);
     }
     if (gpa >= flash_base && gpa < 0x100000000ULL) {
@@ -6973,7 +7061,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
         hype_guest_ram_copy((void *)(uintptr_t)g_fw_1_combined_host_phys,
                             (const void *)(uintptr_t)vm->fw_pristine_host_phys, g_fw_1_combined_size);
     }
-    hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
     hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
 
     hype_pic_emu_reset(&g_fw_1_pic);
@@ -7059,8 +7147,8 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
         hype_atapi_reset_chunked(&g_fw_1_atapi, &vm->iso_chunked);
     }
     {
-        uint64_t above_16mb = (HYPE_FW_1_GUEST_RAM_BYTES > 16ULL * 1024 * 1024)
-                                  ? (HYPE_FW_1_GUEST_RAM_BYTES - 16ULL * 1024 * 1024)
+        uint64_t above_16mb = (vm->ram_bytes > 16ULL * 1024 * 1024)
+                                  ? (vm->ram_bytes - 16ULL * 1024 * 1024)
                                   : 0;
         uint64_t units_64kb = above_16mb / 65536ULL;
         if (units_64kb > 0xFFFFULL) units_64kb = 0xFFFFULL;
@@ -7120,7 +7208,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * with the config->VM plumbing (tracked separately). */
     vm->name = (vm == &g_vms[0]) ? "vm0" : "vm1";
     vm->os_hint = "linux";
-    vm->mem_mb = (unsigned)(HYPE_FW_1_GUEST_RAM_BYTES / (1024ull * 1024ull));
+    /* #290: mem_mb is set by fw_1_resolve_guest_ram() from vm->ram_bytes. It used
+     * to be assigned here FROM the compile-time constant, which is precisely what
+     * discarded a configured mem_mb after echoing it. */
     vm->media = "test.iso";
     vm->lifecycle = HYPE_VM_RUNNING; /* M8-4..7 */
     vm->shutdown_deadline_tsc = 0;
@@ -7330,7 +7420,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             hype_e820_region_t ram_region;
             int e820_len;
             ram_region.base = 0;
-            ram_region.length = HYPE_FW_1_GUEST_RAM_BYTES;
+            ram_region.length = vm->ram_bytes;
             ram_region.type = HYPE_E820_TYPE_RAM;
             e820_len = hype_e820_build(g_fw_1_e820_blob, (uint32_t)sizeof(g_fw_1_e820_blob), &ram_region, 1);
             if (e820_len < 0) {
@@ -7349,8 +7439,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * 0x3F00 units, well under the register's 16-bit range; the clamp
      * stays only as a fail-safe. */
     {
-        uint64_t above_16mb = (HYPE_FW_1_GUEST_RAM_BYTES > 16ULL * 1024 * 1024)
-                                  ? (HYPE_FW_1_GUEST_RAM_BYTES - 16ULL * 1024 * 1024)
+        uint64_t above_16mb = (vm->ram_bytes > 16ULL * 1024 * 1024)
+                                  ? (vm->ram_bytes - 16ULL * 1024 * 1024)
                                   : 0;
         uint64_t units_64kb = above_16mb / 65536ULL;
         if (units_64kb > 0xFFFFULL) {
@@ -7389,11 +7479,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * 2MB-aligned combined size); GUEST_RAM and 4GB are 2MB-aligned too,
      * so every range below is 2MB-granular. */
     hype_npt_build_identity(vm->npt_pml4, vm->npt_pdpt, vm->npt_pd, HYPE_FW_1_NPT_GB);
-    hype_npt_map_range(vm->npt_pd, 0, g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_npt_map_range(vm->npt_pd, 0, g_fw_1_ram_host_phys, vm->ram_bytes);
     hype_npt_map_range(vm->npt_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
                         g_fw_1_combined_size);
-    hype_npt_mark_range_not_present(vm->npt_pd, HYPE_FW_1_GUEST_RAM_BYTES,
-                                     (0x100000000ULL - g_fw_1_combined_size) - HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_npt_mark_range_not_present(vm->npt_pd, vm->ram_bytes,
+                                     (0x100000000ULL - g_fw_1_combined_size) - vm->ram_bytes);
     npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
 
     /*
@@ -7419,11 +7509,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * turned a 15-second boot into five minutes.
      */
     hype_ept_build_identity(vm->ept_pml4, vm->ept_pdpt, vm->ept_pd, HYPE_FW_1_NPT_GB);
-    hype_ept_map_range(vm->ept_pd, 0, g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_ept_map_range(vm->ept_pd, 0, g_fw_1_ram_host_phys, vm->ram_bytes);
     hype_ept_map_range(vm->ept_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
                        g_fw_1_combined_size);
-    hype_ept_mark_range_not_present(vm->ept_pd, HYPE_FW_1_GUEST_RAM_BYTES,
-                                    (0x100000000ULL - g_fw_1_combined_size) - HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_ept_mark_range_not_present(vm->ept_pd, vm->ram_bytes,
+                                    (0x100000000ULL - g_fw_1_combined_size) - vm->ram_bytes);
     if (g_fw_1_kind == HYPE_VMM_KIND_VMX) {
         npt_root_phys = (uint64_t)(uintptr_t)vm->ept_pml4;
     }
@@ -7434,7 +7524,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * dereferencing it, so OVMF/the guest OS can never steer a device
      * DMA outside its own RAM/flash. */
     hype_gpa_map_reset(&g_fw_1_dma_map);
-    hype_gpa_map_add(&g_fw_1_dma_map, 0, g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+    hype_gpa_map_add(&g_fw_1_dma_map, 0, g_fw_1_ram_host_phys, vm->ram_bytes);
     hype_gpa_map_add(&g_fw_1_dma_map, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
                       g_fw_1_combined_size);
 
@@ -7986,8 +8076,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  */
                 if (g_vms[0].used_root != 0 && g_vms[1].used_root != 0) {
                     unsigned iso = hype_vm_isolation_check(
-                        g_vms[0].ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES, g_vms[0].used_root,
-                        g_vms[1].ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES, g_vms[1].used_root);
+                        g_vms[0].ram_host_phys, g_vms[0].ram_bytes, g_vms[0].used_root,
+                        g_vms[1].ram_host_phys, g_vms[1].ram_bytes, g_vms[1].used_root);
                     hype_debug_print(
                         "fw-1 ISOLATION: %s -- vm0 ram@0x%llx root=0x%llx tag=%u | vm1 ram@0x%llx "
                         "root=0x%llx tag=%u (flags=0x%x)\n",
@@ -11742,9 +11832,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * buffer above. Zeroed so OVMF's reset-vector page-table build
          * at guest-physical 0x800000 and its SEC/PEI temp RAM start from
          * clean memory. */
+        /* #290: settle the SIZE from hype.cfg before allocating it. Ordered here
+         * deliberately -- the config is parsed pre-EBS well above, and this is the
+         * first point that consumes it, so a configured mem_mb now decides the
+         * allocation instead of being overwritten after the fact. */
+        fw_1_resolve_guest_ram(vm, &g_hype_cfg, 0u);
         g_fw_1_ram_host_phys =
-            hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, HYPE_FW_1_GUEST_RAM_BYTES);
-        hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+            hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm->ram_bytes);
+        hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
 
         /* M8-0b: grab a <1MB page now (Boot Services only) to stage the AP
          * startup trampoline in; the post-EBS smoketest below uses it. */
@@ -11781,7 +11876,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             g_ap_cr3 = base; /* AllocateMaxAddress(<4GB) guarantees base < 4GB */
         }
         hype_debug_print("fw-1: guest RAM %llu MiB backed at host-physical 0x%llx\n",
-                          (unsigned long long)(HYPE_FW_1_GUEST_RAM_BYTES / (1024ULL * 1024ULL)),
+                          (unsigned long long)(vm->ram_bytes / (1024ULL * 1024ULL)),
                           (unsigned long long)g_fw_1_ram_host_phys);
 
         /*
@@ -11906,9 +12001,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->combined_size);
             hype_guest_ram_copy((void *)(uintptr_t)vm1->combined_host_phys,
                                 (const void *)(uintptr_t)vm->combined_host_phys, vm1->combined_size);
+            /* #290: vm1 gets its own configured size (cfg vm[1]), not vm0's. */
+            fw_1_resolve_guest_ram(vm1, &g_hype_cfg, 1u);
             vm1->ram_host_phys =
-                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, HYPE_FW_1_GUEST_RAM_BYTES);
-            hype_guest_ram_zero((void *)(uintptr_t)vm1->ram_host_phys, HYPE_FW_1_GUEST_RAM_BYTES);
+                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->ram_bytes);
+            hype_guest_ram_zero((void *)(uintptr_t)vm1->ram_host_phys, vm1->ram_bytes);
             /* M8-4: VM1's own pristine-firmware snapshot (copied from vm0's still-
              * pristine image before either guest runs). */
             vm1->fw_pristine_host_phys =
@@ -11937,7 +12034,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "fw-1 VM1: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
                 (unsigned long long)vm1->combined_host_phys, (unsigned long long)vm1->combined_size,
                 (unsigned long long)vm1->ram_host_phys,
-                (unsigned long long)(HYPE_FW_1_GUEST_RAM_BYTES / (1024ULL * 1024ULL)),
+                (unsigned long long)(vm1->ram_bytes / (1024ULL * 1024ULL)),
                 (unsigned long long)vm1->host_tsc_hz);
         }
 #endif

@@ -408,7 +408,68 @@ static void test_error_reports_line_number(void) {
     CHECK_INT("bad mem_mb line number", 3, res.line);
 }
 
+
+/*
+ * #290: guest-RAM resolution. The bug being fixed was not a bad number -- it was
+ * that mem_mb was validated, echoed, and then discarded, so the operator's log
+ * read as confirmation of a setting with no effect. These pin both the value AND
+ * the status, because the status is what makes "applied" distinguishable from
+ * "ignored" in a log.
+ */
+static void test_resolve_mem_mb(void) {
+    unsigned mb;
+
+    /* No config value -> built-in default, reported as such. */
+    CHECK_INT("no cfg -> DEFAULTED", HYPE_CFG_RAM_DEFAULTED,
+              (int)hype_cfg_resolve_mem_mb(0u, 2048u, 128u, 3072u, &mb));
+    CHECK_INT("no cfg -> default applied", 2048, (int)mb);
+
+    /* In-range config value -> used exactly, which is the whole point. */
+    CHECK_INT("in range -> APPLIED", HYPE_CFG_RAM_APPLIED,
+              (int)hype_cfg_resolve_mem_mb(512u, 2048u, 128u, 3072u, &mb));
+    CHECK_INT("in range -> 512 applied", 512, (int)mb);
+
+    /* Boundaries are inclusive: exactly min and exactly max are APPLIED, not clamped. */
+    CHECK_INT("exactly min -> APPLIED", HYPE_CFG_RAM_APPLIED,
+              (int)hype_cfg_resolve_mem_mb(128u, 2048u, 128u, 3072u, &mb));
+    CHECK_INT("exactly min value", 128, (int)mb);
+    CHECK_INT("exactly max -> APPLIED", HYPE_CFG_RAM_APPLIED,
+              (int)hype_cfg_resolve_mem_mb(3072u, 2048u, 128u, 3072u, &mb));
+    CHECK_INT("exactly max value", 3072, (int)mb);
+
+    /* Out of range clamps, and SAYS it clamped -- silently honouring 8 MB would
+     * hand the operator a guest that dies in its own boot. */
+    CHECK_INT("too small -> CLAMPED_LOW", HYPE_CFG_RAM_CLAMPED_LOW,
+              (int)hype_cfg_resolve_mem_mb(8u, 2048u, 128u, 3072u, &mb));
+    CHECK_INT("too small -> raised to min", 128, (int)mb);
+    CHECK_INT("too big -> CLAMPED_HIGH", HYPE_CFG_RAM_CLAMPED_HIGH,
+              (int)hype_cfg_resolve_mem_mb(65536u, 2048u, 128u, 3072u, &mb));
+    CHECK_INT("too big -> lowered to max", 3072, (int)mb);
+
+    /* The DEFAULT is clamped too. -DHYPE_FW_1_GUEST_RAM_MB=N can set it to
+     * anything, and a default past the platform ceiling is still an overrun. */
+    CHECK_INT("oversized default still reported DEFAULTED", HYPE_CFG_RAM_DEFAULTED,
+              (int)hype_cfg_resolve_mem_mb(0u, 99999u, 128u, 3072u, &mb));
+    CHECK_INT("oversized default clamped to max", 3072, (int)mb);
+    CHECK_INT("undersized default clamped to min", HYPE_CFG_RAM_DEFAULTED,
+              (int)hype_cfg_resolve_mem_mb(0u, 1u, 128u, 3072u, &mb));
+    CHECK_INT("undersized default value", 128, (int)mb);
+
+    /* Inverted limits: the floor wins. A too-small guest fails visibly at its own
+     * boot; one sized past the address-space hole corrupts what lives above it. */
+    CHECK_INT("inverted limits -> floor wins", 512,
+              (hype_cfg_resolve_mem_mb(4096u, 2048u, 512u, 128u, &mb), (int)mb));
+
+    /* NULL out_mb must not deref -- callers that only want the status. */
+    CHECK_INT("NULL out_mb still returns a status", HYPE_CFG_RAM_APPLIED,
+              (int)hype_cfg_resolve_mem_mb(512u, 2048u, 128u, 3072u, 0));
+
+    CHECK_STR("status string, applied", "from hype.cfg",
+              hype_cfg_ram_status_str(HYPE_CFG_RAM_APPLIED));
+}
+
 int main(void) {
+    test_resolve_mem_mb();
     test_full_example_from_plan();
     test_cpu_set_comma_list();
     test_boot_disk_no_install_media_required();
