@@ -6798,6 +6798,32 @@ vblk_pci:
  * known-good sample rather than more reasoning about EDK2 internals, which has
  * already cost this ticket three wrong hypotheses.
  */
+/*
+ * #262: dump one HBA's register state.
+ *
+ * The IDENTIFY CONTENT is already excluded (5611ca7), so what is left is how the
+ * two controllers are PRESENTED and how the command completes. hype has a working
+ * comparison sitting right next to the broken one: the ATAPI CD on its own HBA,
+ * which this same firmware boots (#70), and the SATA disk on a second HBA, which it
+ * refuses -- same model code, same completion function. Diffing the two is a
+ * hype-vs-hype comparison needing no EDK2 knowledge, which is exactly the move that
+ * settled the IDENTIFY question.
+ */
+static void fw_1_262_hba_dump(const char *tag, const hype_ahci_t *a) {
+    hype_debug_print("fw-1 #262 HBA[%s]: cap=0x%08x ghc=0x%08x is=0x%08x pi=0x%08x vs=0x%08x\n",
+                     tag, (unsigned)a->cap, (unsigned)a->ghc, (unsigned)a->is, (unsigned)a->pi,
+                     (unsigned)a->vs);
+    hype_debug_print("fw-1 #262 HBA[%s]: p_is=0x%08x p_ie=0x%08x p_cmd=0x%08x p_tfd=0x%08x "
+                     "p_sig=0x%08x\n",
+                     tag, (unsigned)a->p_is, (unsigned)a->p_ie, (unsigned)a->p_cmd,
+                     (unsigned)a->p_tfd, (unsigned)a->p_sig);
+    hype_debug_print("fw-1 #262 HBA[%s]: p_ssts=0x%08x p_sctl=0x%08x p_serr=0x%08x p_sact=0x%08x "
+                     "p_ci=0x%08x clb=0x%08x fb=0x%08x\n",
+                     tag, (unsigned)a->p_ssts, (unsigned)a->p_sctl, (unsigned)a->p_serr,
+                     (unsigned)a->p_sact, (unsigned)a->p_ci, (unsigned)a->p_clb,
+                     (unsigned)a->p_fb);
+}
+
 static void fw_1_262_id_diff(hype_ata_disk_t *disk) {
     static uint8_t mine[HYPE_ATA_IDENTIFY_SIZE];
     unsigned w, shown = 0, diffs = 0;
@@ -7758,6 +7784,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * uptime that froze while stopped, or a CPU% that actually moves, can
                  * be confirmed from a captured log instead of a photograph.
                  */
+                {
+                    /* #262: both HBAs side by side, bounded. The CD's controller is
+                     * booted by this same firmware; the SATA disk's is refused. Any
+                     * register that differs is a candidate, and unlike EDK2 internals
+                     * it is directly observable from here. */
+                    static unsigned hba_dumps = 0;
+                    if (hba_dumps < 3u) {
+                        hba_dumps++;
+                        fw_1_262_hba_dump("cd-works", &g_fw_1_ahci);
+                        fw_1_262_hba_dump("sata-fails", &g_fw_1_ata_ahci);
+                    }
+                }
                 hype_debug_print(
                     "fw-1 VMSTAT vm%u: state=%d uptime=%llus cpu=%u%% roots=[0x%llx,0x%llx]\n",
                     (unsigned)(vm - g_vms), (int)vm->lifecycle,
