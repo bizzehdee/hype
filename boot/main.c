@@ -9,6 +9,7 @@
 #include "../core/input_runner.h"
 #include "../core/input_script.h"
 #include "../core/vm_isolation.h"
+#include "../core/vm_watchdog.h"
 #include "../core/vm_lifecycle.h"
 #include "../core/cmdparse.h"
 #include "../core/halt.h"
@@ -420,6 +421,10 @@ typedef struct hype_fw_vm {
     hype_input_runner_t in_runner;
     int in_script_armed; /* a script loaded and parsed cleanly for THIS vm */
     int in_verdict_reported; /* INPUT-9 (#282): verdict line already emitted */
+    /* M8-8 (#171): this VM's own fault watchdog. Per-VM so a faulted guest is forced
+     * off ALONE -- condemning a healthy sibling would be worse than the hang. */
+    hype_vm_watchdog_t watchdog;
+    int watchdog_fired;
     uint64_t in_started_ms;  /* for the elapsed figure in the verdict line */
     /*
      * #282: a ring of the guest's most recent console bytes. A bare
@@ -6028,6 +6033,8 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
  * indistinguishable char-interleaved blur. */
 /* INPUT-7 (#280): defined with the rest of the scripted-input plumbing further down. */
 static void fw_1_script_feed(hype_fw_vm_t *vm, uint8_t byte);
+static void fw_1_watchdog_observe(hype_fw_vm_t *vm, unsigned vm_index, uint64_t reason,
+                                  uint64_t rip, int handled, int is_shutdown);
 static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uart_t *uart,
                              uint64_t now_ms);
 /*
@@ -9475,6 +9482,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * model (e.g. ICH9 RCBA) and move on -- and lets ONE run enumerate
              * every such region. Each distinct 4KB region is logged ONCE (like
              * the unhandled-port latch) so discovery works without a flood. */
+            /*
+             * M8-8 (#171): this is the one place in the loop where an exit is known to
+             * have hit NO modelled device -- exactly the "unrecognized VM-exit" the
+             * watchdog is about. Observed only here, on purpose: a guest doing normal
+             * serviced traffic never reaches this point, so it can never be shot by a
+             * false positive, which matters far more than reaction latency for a guest
+             * that is already stuck.
+             *
+             * Caveat worth stating: a guest alternating one failing instruction with
+             * serviced exits still trips, because only unhandled exits are counted. A
+             * guest that repeatedly cannot get past one instruction is genuinely stuck,
+             * so that is the intended reading rather than an accident.
+             */
+            fw_1_watchdog_observe(vm, (unsigned)(vm - g_vms), (uint64_t)info.reason,
+                                  info.guest_rip, 0, 0);
             if (vmm_absorb_mmio_npf(kind, ctx, insn) == 0) {
                 static uint64_t seen_mmio[128];
                 static unsigned seen_mmio_n = 0;
@@ -10840,6 +10862,29 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
         break;
     }
     fw_1_report_script_verdict(vm, vm_index, now_ms);
+}
+
+/*
+ * M8-8 (#171): hand one exit to this VM's watchdog and, if it declares the guest
+ * faulted, force THAT VM off -- alone.
+ *
+ * The force-off goes through the same M8 lifecycle event an operator would use, so a
+ * watchdog kill and a manual kill leave the VM in the same state; a bespoke teardown
+ * here would be a second, less-tested path to the same place.
+ */
+static void fw_1_watchdog_observe(hype_fw_vm_t *vm, unsigned vm_index, uint64_t reason,
+                                  uint64_t rip, int handled, int is_shutdown) {
+    hype_vm_health_t h = hype_vm_watchdog_observe(&vm->watchdog, reason, rip, handled, is_shutdown);
+
+    if (h == HYPE_VM_HEALTH_OK || vm->watchdog_fired) {
+        return;
+    }
+    vm->watchdog_fired = 1;
+    hype_debug_print("fw-1 WATCHDOG vm%u: %s (reason=0x%llx rip=0x%llx, %u repeats) -- forcing "
+                     "THIS vm off; others keep running\n",
+                     vm_index, hype_vm_health_str(h), (unsigned long long)reason,
+                     (unsigned long long)rip, (unsigned)vm->watchdog.repeats);
+    vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_FORCE_OFF);
 }
 
 /* Feed one guest console byte to this VM's runner and keep the failure-context tail. */
