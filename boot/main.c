@@ -928,6 +928,8 @@ static int g_fw_1_ap2_rc = -2;
 
 /* Defined much later; used by fw_1_ap_main (which precedes their definitions). */
 static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind);
+
+
 static inline uint64_t hype_rdtsc(void);
 
 /* M8-0b-ii inc 5: the AP's periodic-timer vector + ISR. The AP doesn't receive
@@ -11219,6 +11221,125 @@ static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_
 }
 
 /*
+ * #233: the operator gate for a physical-target write, run ON THE BSP, BEFORE the
+ * guest's core is started.
+ *
+ * The ticket proposed polling for the confirm inside fw_1_setup_virtio_blk(). That
+ * deadlocks by construction: the only code that processes the operator's typed
+ * `confirm` is term_cmdline_key(), reached solely from the FW-1 dispatch loop in
+ * run_fw_1_test() -- and fw_1_setup_virtio_blk() is called from that same function
+ * BEFORE the loop begins. A core cannot be simultaneously blocked waiting for input
+ * and be the only core able to read it; the operator would type forever.
+ *
+ * So the wait belongs here, on the BSP, before hype_ap_start(). The guest genuinely
+ * is not running during it -- which is the property the ticket wanted, and it also
+ * avoids the confirm-into-a-running-guest freeze the ticket reported.
+ *
+ * Verified reachable rather than assumed: hype_host_kbd_init() runs at the host-timer
+ * setup above and `sti` immediately after, both well before AP dispatch, so this core
+ * really does receive scancodes here.
+ *
+ * BOUNDED. An unbounded wait for a human on a cold-boot-only, serial-less machine is
+ * how an unattributable hang happens, and this ticket already reports one freeze. On
+ * timeout the guest proceeds with the disk attached READ-ONLY (#267 makes that safe --
+ * a NULL write pointer cannot damage it) and the log says the install will fail for
+ * want of a confirm, rather than producing a silently broken install.
+ *
+ * Does nothing at all unless a confirm is actually PENDING, so the normal boot and the
+ * -DHYPE_M10_6_AUTOCONFIRM path (which accepts during setup) are untouched.
+ */
+#ifndef HYPE_M10_6_CONFIRM_WAIT_SECS
+#define HYPE_M10_6_CONFIRM_WAIT_SECS 120ull
+#endif
+
+static void fw_1_await_phys_confirm_on_bsp(void) {
+    char line[HYPE_CMD_ARG_MAX + 16];
+    unsigned line_len = 0;
+    hype_kbd_decode_t dec;
+    uint64_t hz = g_vms[0].host_tsc_hz;
+    uint64_t start, deadline, last_notice;
+
+    if (g_phys_confirm.state != HYPE_PHYS_CONFIRM_PENDING) {
+        return; /* nothing armed, or already accepted (autoconfirm) */
+    }
+    if (hz == 0) {
+        /* No calibrated clock means no bound, and an unbounded wait is the one
+         * outcome this must not have. Say why and carry on read-only. */
+        hype_debug_print("phys-write: confirm PENDING but no calibrated clock -- not waiting "
+                         "(guest gets the disk READ-ONLY) [#233]\n");
+        return;
+    }
+
+    {
+        char prompt[160];
+        hype_debug_print("phys-write: %s\n", hype_phys_confirm_prompt(&g_phys_confirm, prompt,
+                                                                     (unsigned)sizeof(prompt)));
+    }
+    hype_debug_print("phys-write: WAITING up to %llus for the operator to confirm, on the BSP, "
+                     "before the guest is started. Type it and press Enter. [#233]\n",
+                     (unsigned long long)HYPE_M10_6_CONFIRM_WAIT_SECS);
+    usb_log_flush();
+
+    hype_kbd_decode_reset(&dec);
+    start = hype_rdtsc();
+    last_notice = start;
+    deadline = start + HYPE_M10_6_CONFIRM_WAIT_SECS * hz;
+
+    while (hype_rdtsc() < deadline) {
+        uint8_t sc;
+        while (hype_host_kbd_poll_scancode(&sc)) {
+            uint8_t chars[HYPE_KBD_DECODE_MAX_OUT];
+            unsigned n = hype_kbd_decode_feed(&dec, sc, chars, (unsigned)sizeof(chars));
+            unsigned i;
+            for (i = 0; i < n; i++) {
+                uint8_t ch = chars[i];
+                if (ch == '\r' || ch == '\n') {
+                    hype_cmd_t c;
+                    line[line_len] = '\0';
+                    /* Accept BOTH what the prompt tells the operator to type
+                     * ("confirm <serial>") and a bare serial -- the prompt says the
+                     * former, and refusing the latter would be a gratuitous way to
+                     * fail a destructive-write confirmation at the keyboard. */
+                    c = hype_cmd_parse(line);
+                    (void)hype_phys_confirm_submit(&g_phys_confirm,
+                                                   (c.verb == HYPE_CMD_CONFIRM && c.has_arg)
+                                                       ? c.arg
+                                                       : line);
+                    line_len = 0;
+                    if (hype_phys_confirm_is_accepted(&g_phys_confirm)) {
+                        hype_debug_print("phys-write: operator CONFIRMED on the BSP -- the guest "
+                                         "will get the physical disk WRITABLE [#233]\n");
+                        usb_log_flush();
+                        return;
+                    }
+                    hype_debug_print("phys-write: that did not match the drive serial -- try "
+                                     "again\n");
+                } else if (ch == '\b' || ch == 0x7F) {
+                    if (line_len > 0) line_len--;
+                } else if (ch >= 0x20 && line_len + 1u < (unsigned)sizeof(line)) {
+                    line[line_len++] = (char)ch;
+                }
+            }
+        }
+        /* Progress, so a watching operator can tell this from a hang -- and so the
+         * captured log shows the wait happened rather than leaving a silent gap. */
+        if (hype_rdtsc() - last_notice >= 15ull * hz) {
+            last_notice = hype_rdtsc();
+            hype_debug_print("phys-write: still waiting for confirm (%llus left)\n",
+                             (unsigned long long)((deadline - hype_rdtsc()) / hz));
+            usb_log_flush();
+        }
+        __asm__ volatile("pause");
+    }
+
+    hype_debug_print("phys-write: confirm TIMED OUT after %llus -- guest starts with the physical "
+                     "disk attached READ-ONLY. An install WILL FAIL: it cannot write. Re-run and "
+                     "confirm, or build with -DHYPE_M10_6_AUTOCONFIRM=1. [#233]\n",
+                     (unsigned long long)HYPE_M10_6_CONFIRM_WAIT_SECS);
+    usb_log_flush();
+}
+
+/*
  * #230: stream the full in-RAM log to \HYPEFULL.LOG on the USB stick's FAT32
  * volume, so a real-HW debug run leaves the WHOLE log on the medium it booted
  * from (the RT-3 NV tail stays as a backup for the last few KB). The sink is
@@ -13042,6 +13163,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             /* #239: latch which core owns USB I/O before any AP exists, so an AP
              * can never be mistaken for the owner (and so the LAPIC is only read
              * once it is known good -- INIT/SIPI is sent through it right here). */
+            /* #233: give the operator the physical-write decision BEFORE the guest's
+             * core starts -- on this core, which is the only one that can read the
+             * keyboard right now. */
+            fw_1_await_phys_confirm_on_bsp();
             usb_log_latch_bsp_core();
             int ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 1u,
                                       (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
