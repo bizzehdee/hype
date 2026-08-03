@@ -33,7 +33,14 @@ typedef enum {
     HYPE_PHYS_GUARD_ALLOW = 0,
     HYPE_PHYS_GUARD_DENY_ID_MISMATCH,   /* configured serial/GUID != enumerated drive */
     HYPE_PHYS_GUARD_DENY_NONEMPTY,      /* non-empty partition table, no allow-overwrite */
-    HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM  /* operator has not confirmed the first write */
+    HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM, /* operator has not confirmed the first write */
+    /*
+     * #243: the sector bytes cannot be trusted, so "is this disk empty?" has no
+     * answer. Distinct from DENY_NONEMPTY on purpose -- an operator told "non-empty"
+     * looks for data they recognise, whereas the truth here is "this drive is lying to
+     * us", which is a different action (replace the disk, not pick another target).
+     */
+    HYPE_PHYS_GUARD_DENY_UNTRUSTWORTHY_SECTORS
 } hype_phys_guard_result_t;
 
 typedef struct {
@@ -43,6 +50,18 @@ typedef struct {
     int partition_table_nonempty;   /* 1 if the disk already has a non-empty part table */
     int allow_overwrite;            /* explicit per-disk override flag from config */
     int operator_confirmed;         /* dashboard confirmation given for this disk */
+    /*
+     * #243: 0 when the sector bytes are not believable -- either they were implausible
+     * (see hype_phys_sectors_trustworthy) or two reads of the same LBAs disagreed.
+     *
+     * This exists because `partition_table_nonempty == 0` used to conflate two states
+     * that call for opposite actions: a genuinely blank disk (safe) and a disk whose
+     * sectors read back as zeros WITHOUT an I/O error (full of data, and the last
+     * thing that should be written). A WD Blue SN5000 on the dev box does exactly the
+     * latter -- it reads as empty while full, and reformatting produced a
+     * plausible-looking table that was not real.
+     */
+    int sectors_trustworthy;
 } hype_phys_guard_ctx_t;
 
 /*
@@ -72,6 +91,32 @@ hype_phys_guard_result_t hype_phys_guard_check(const hype_phys_guard_ctx_t *c);
  * absent -> that check contributes nothing).
  */
 int hype_phys_part_table_nonempty(const uint8_t *sector0, const uint8_t *sector1);
+
+/*
+ * #243: are these sector bytes believable at all?
+ *
+ * Returns 0 (NOT trustworthy) when LBA0 and LBA1 are BOTH entirely zero. A truly blank
+ * disk from any mainstream tool still carries something -- a protective MBR, or at
+ * least the 0x55AA signature -- so two fully-zero sectors is the signature of a drive
+ * that returned nothing useful without reporting an error, which is what a dying disk
+ * does. Fails CLOSED: the caller denies rather than treating it as blank.
+ *
+ * Deliberately narrow. It is not a general health check and cannot detect a disk that
+ * returns plausible garbage; hype_phys_sectors_agree() covers the case where the drive
+ * is inconsistent instead of empty. Pure.
+ */
+int hype_phys_sectors_trustworthy(const uint8_t *sector0, const uint8_t *sector1);
+
+/*
+ * #243: do two independent reads of the same two sectors agree?
+ *
+ * A drive whose content changes between back-to-back reads is lying, whatever the
+ * bytes say. Returns 1 when both pairs match, 0 otherwise. Cheap, and it catches the
+ * exact failure mode observed: a disk presenting a plausible-but-fabricated table.
+ * Pure -- the caller performs the two reads.
+ */
+int hype_phys_sectors_agree(const uint8_t *a0, const uint8_t *a1, const uint8_t *b0,
+                            const uint8_t *b1);
 
 /*
  * M10-4 (#124): the arm-time "match-before-write" decision, composed from the

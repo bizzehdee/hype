@@ -58,6 +58,9 @@ static hype_phys_guard_ctx_t base_ctx(void) {
     c.partition_table_nonempty = 0;
     c.allow_overwrite = 0;
     c.operator_confirmed = 1;
+    /* #243: the default fixture is a believable disk, so the existing cases keep
+     * testing what they were written to test. The untrustworthy path has its own. */
+    c.sectors_trustworthy = 1;
     return c;
 }
 
@@ -171,6 +174,15 @@ static void test_arm(void) {
     uint8_t s0[512], s1[512];
     unsigned i;
     for (i = 0; i < 512u; i++) { s0[i] = 0; s1[i] = 0; }
+    /*
+     * #243: a REAL blank disk is not two zeroed sectors -- every mainstream tool leaves
+     * a protective MBR or at least 0x55AA. These tests used all-zero sectors as
+     * "blank", which the trustworthiness check now (correctly) refuses, so give them a
+     * plausible blank disk: boot signature present, all four partition types zero.
+     * The all-zero case is exercised on purpose in test_arm_all_zero_is_refused().
+     */
+    s0[510] = 0x55u;
+    s0[511] = 0xAAu;
 
     /* matched serial, blank disk, confirmed -> ALLOW */
     CHECK_HEX("arm: match+blank+confirmed => ALLOW", HYPE_PHYS_GUARD_ALLOW,
@@ -228,6 +240,105 @@ static void test_attach_mode_never_writable_without_full_pass(void) {
     }
 }
 
+static void test_sectors_trustworthy(void) {
+    static uint8_t z0[512], z1[512];
+    static uint8_t mbr[512], gpt[512];
+    unsigned i;
+    for (i = 0; i < 512u; i++) { z0[i] = 0; z1[i] = 0; mbr[i] = 0; gpt[i] = 0; }
+
+    /* #243: two fully-zero sectors is a dying drive returning nothing without an
+     * error, NOT a blank disk -- any mainstream tool leaves a protective MBR or at
+     * least 0x55AA behind. Fails closed. */
+    CHECK_HEX("all-zero LBA0+LBA1 is NOT trustworthy", 0, hype_phys_sectors_trustworthy(z0, z1));
+
+    mbr[510] = 0x55u; mbr[511] = 0xAAu;
+    CHECK_HEX("a boot signature makes it believable", 1, hype_phys_sectors_trustworthy(mbr, z1));
+    gpt[0] = 'E'; gpt[1] = 'F'; gpt[2] = 'I';
+    CHECK_HEX("content in LBA1 alone is enough", 1, hype_phys_sectors_trustworthy(z0, gpt));
+    /* NULL is the least trustworthy state there is. */
+    CHECK_HEX("NULL sector0", 0, hype_phys_sectors_trustworthy(0, z1));
+    CHECK_HEX("NULL sector1", 0, hype_phys_sectors_trustworthy(z0, 0));
+}
+
+static void test_sectors_agree(void) {
+    static uint8_t a0[512], a1[512], b0[512], b1[512];
+    unsigned i;
+    for (i = 0; i < 512u; i++) { a0[i] = (uint8_t)i; a1[i] = (uint8_t)(i ^ 0xFFu);
+                                 b0[i] = (uint8_t)i; b1[i] = (uint8_t)(i ^ 0xFFu); }
+    CHECK_HEX("identical reads agree", 1, hype_phys_sectors_agree(a0, a1, b0, b1));
+
+    /* A drive whose content changes between back-to-back reads is lying whatever the
+     * bytes say -- this is the observed SN5000 failure mode. */
+    b0[17] ^= 0x01u;
+    CHECK_HEX("a single differing byte in LBA0 disagrees", 0,
+              hype_phys_sectors_agree(a0, a1, b0, b1));
+    b0[17] ^= 0x01u;
+    b1[511] ^= 0x80u;
+    CHECK_HEX("a differing LAST byte of LBA1 disagrees", 0,
+              hype_phys_sectors_agree(a0, a1, b0, b1));
+    b1[511] ^= 0x80u;
+    CHECK_HEX("restored, agrees again", 1, hype_phys_sectors_agree(a0, a1, b0, b1));
+    CHECK_HEX("NULL never agrees", 0, hype_phys_sectors_agree(0, a1, b0, b1));
+}
+
+static void test_untrustworthy_denies_and_beats_allow_overwrite(void) {
+    hype_phys_guard_ctx_t c;
+    c.configured_id = "SN123";
+    c.drive_serial = "SN123";
+    c.disk_guid = 0;
+    c.partition_table_nonempty = 0; /* looks blank -- which is exactly the trap */
+    c.allow_overwrite = 0;
+    c.operator_confirmed = 1;
+    c.sectors_trustworthy = 0;
+    CHECK_HEX("untrustworthy sectors deny even when the table looks empty",
+              HYPE_PHYS_GUARD_DENY_UNTRUSTWORTHY_SECTORS, hype_phys_guard_check(&c));
+
+    /* allow_overwrite means "I know there is data here, wipe it" -- an informed choice
+     * about KNOWN content. It cannot express consent about content nobody can read, so
+     * it must not override this. */
+    c.allow_overwrite = 1;
+    CHECK_HEX("allow_overwrite does NOT override untrustworthy sectors",
+              HYPE_PHYS_GUARD_DENY_UNTRUSTWORTHY_SECTORS, hype_phys_guard_check(&c));
+
+    /* Identity still reported first: an operator who aimed at the wrong drive must
+     * hear that, not a health complaint about a disk they never meant to touch. */
+    c.drive_serial = "OTHER";
+    CHECK_HEX("identity mismatch still wins", HYPE_PHYS_GUARD_DENY_ID_MISMATCH,
+              hype_phys_guard_check(&c));
+
+    /* And a trustworthy blank disk still passes, so this did not just deny everything. */
+    c.drive_serial = "SN123";
+    c.sectors_trustworthy = 1;
+    c.allow_overwrite = 0;
+    CHECK_HEX("trustworthy blank disk still allowed", HYPE_PHYS_GUARD_ALLOW,
+              hype_phys_guard_check(&c));
+}
+
+static void test_untrustworthy_attaches_nothing(void) {
+    /* NONE rather than READ_ONLY: this disk cannot be trusted as a data SOURCE either,
+     * and an install that "succeeds" against fabricated content is worse than no disk. */
+    CHECK_HEX("untrustworthy -> attach nothing", HYPE_PHYS_ATTACH_NONE,
+              hype_phys_attach_mode(HYPE_PHYS_GUARD_DENY_UNTRUSTWORTHY_SECTORS));
+}
+
+static void test_arm_all_zero_is_refused(void) {
+    uint8_t s0[512], s1[512];
+    unsigned i;
+    for (i = 0; i < 512u; i++) { s0[i] = 0; s1[i] = 0; }
+    /*
+     * #243, end to end through arm(): a disk whose first two sectors read back as all
+     * zeros is refused rather than treated as blank. This is the exact shape of the
+     * observed SN5000 failure -- reads succeed, content is empty, the disk is full.
+     */
+    CHECK_HEX("arm: all-zero sectors => DENY_UNTRUSTWORTHY",
+              HYPE_PHYS_GUARD_DENY_UNTRUSTWORTHY_SECTORS,
+              hype_phys_guard_arm("QM00013", "QM00013", GUID, s0, s1, 0, 1));
+    /* And not rescued by allow_overwrite, which is consent about KNOWN content. */
+    CHECK_HEX("arm: all-zero + allow_overwrite still denied",
+              HYPE_PHYS_GUARD_DENY_UNTRUSTWORTHY_SECTORS,
+              hype_phys_guard_arm("QM00013", "QM00013", GUID, s0, s1, 1, 1));
+}
+
 int main(void) {
     test_guid_parse();
     test_allow_paths();
@@ -237,6 +348,12 @@ int main(void) {
 
     test_attach_mode_separates_attach_from_write();
     test_attach_mode_never_writable_without_full_pass();
+
+    test_sectors_trustworthy();
+    test_sectors_agree();
+    test_untrustworthy_denies_and_beats_allow_overwrite();
+    test_untrustworthy_attaches_nothing();
+    test_arm_all_zero_is_refused();
 
     if (failures == 0) {
         printf("all tests passed\n");

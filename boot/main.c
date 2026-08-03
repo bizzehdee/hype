@@ -12585,9 +12585,32 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                 g_hostdisk_lba1) != 0) {
                             hype_serial_print("host-disk: LBA1 read failed -- phys-write not armed\n");
                         } else {
-                            arm_physical_write_confirm(&g_hype_cfg, di.serial, di.model,
-                                                       di.total_sectors, have_guid ? guid : 0,
-                                                       g_hostdisk_probe, g_hostdisk_lba1);
+                            /*
+                             * #243: read BOTH sectors a second time and require the two
+                             * reads to agree. A drive whose content changes between
+                             * back-to-back reads is lying whatever the bytes say -- which
+                             * is exactly the observed SN5000 behaviour, where a
+                             * reformat produced a plausible table that was not real.
+                             * Refusing here is free; a wrong answer is not.
+                             */
+                            static uint8_t v0[512] __attribute__((aligned(4096)));
+                            static uint8_t v1[512] __attribute__((aligned(4096)));
+                            int reread_ok =
+                                hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 0u, 1u, v0) == 0 &&
+                                hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 1u, 1u, v1) == 0;
+                            if (!reread_ok) {
+                                hype_serial_print("host-disk: verification re-read failed -- "
+                                                  "phys-write not armed (#243)\n");
+                            } else if (!hype_phys_sectors_agree(g_hostdisk_probe, g_hostdisk_lba1,
+                                                               v0, v1)) {
+                                hype_serial_print("host-disk: two reads of LBA0/LBA1 DISAGREE -- "
+                                                  "this drive is unreliable; phys-write not armed "
+                                                  "(#243)\n");
+                            } else {
+                                arm_physical_write_confirm(&g_hype_cfg, di.serial, di.model,
+                                                           di.total_sectors, have_guid ? guid : 0,
+                                                           g_hostdisk_probe, g_hostdisk_lba1);
+                            }
                         }
                     } else {
                         hype_serial_print("host-disk: IDENTIFY failed\n");

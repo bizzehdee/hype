@@ -7,6 +7,46 @@ static int hexval(char c) {
     return -1;
 }
 
+static int sector_all_zero(const uint8_t *s) {
+    unsigned i;
+    if (s == (const uint8_t *)0) {
+        return 0; /* nothing to judge; the caller's read-failure path owns NULL */
+    }
+    for (i = 0; i < 512u; i++) {
+        if (s[i] != 0u) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int hype_phys_sectors_trustworthy(const uint8_t *sector0, const uint8_t *sector1) {
+    if (sector0 == (const uint8_t *)0 || sector1 == (const uint8_t *)0) {
+        return 0; /* no bytes at all is the least trustworthy state there is */
+    }
+    /* Both sectors entirely zero: a real blank disk still carries a protective MBR or
+     * at minimum 0x55AA, so this is the signature of a drive that returned nothing
+     * useful WITHOUT reporting an error. */
+    if (sector_all_zero(sector0) && sector_all_zero(sector1)) {
+        return 0;
+    }
+    return 1;
+}
+
+int hype_phys_sectors_agree(const uint8_t *a0, const uint8_t *a1, const uint8_t *b0,
+                            const uint8_t *b1) {
+    unsigned i;
+    if (a0 == 0 || a1 == 0 || b0 == 0 || b1 == 0) {
+        return 0;
+    }
+    for (i = 0; i < 512u; i++) {
+        if (a0[i] != b0[i] || a1[i] != b1[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int hype_phys_guid_parse(const char *s, uint8_t out16[16]) {
     unsigned n = 0; /* nibble count consumed into out16 */
 
@@ -110,6 +150,21 @@ hype_phys_guard_result_t hype_phys_guard_check(const hype_phys_guard_ctx_t *c) {
     if (!identity_matches(c)) {
         return HYPE_PHYS_GUARD_DENY_ID_MISMATCH;
     }
+    /*
+     * #243: refuse BEFORE the empty/non-empty question, because when the sectors are
+     * not believable that question has no answer. Ordered after identity so an
+     * operator who aimed at the wrong drive still hears about that first -- a
+     * "untrustworthy sectors" message about a disk they never meant to touch would
+     * send them debugging the wrong thing.
+     *
+     * Deliberately NOT overridable by allow_overwrite. That flag means "yes, I know
+     * there is data here, wipe it" -- an informed choice about known content. It
+     * cannot express consent about content nobody can read, so honouring it here would
+     * be reading it as permission the operator never gave.
+     */
+    if (!c->sectors_trustworthy) {
+        return HYPE_PHYS_GUARD_DENY_UNTRUSTWORTHY_SECTORS;
+    }
     if (c->partition_table_nonempty && !c->allow_overwrite) {
         return HYPE_PHYS_GUARD_DENY_NONEMPTY;
     }
@@ -128,6 +183,7 @@ hype_phys_guard_result_t hype_phys_guard_arm(const char *configured_id, const ch
     c.drive_serial = drive_serial;
     c.disk_guid = disk_guid;
     c.partition_table_nonempty = hype_phys_part_table_nonempty(sector0, sector1);
+    c.sectors_trustworthy = hype_phys_sectors_trustworthy(sector0, sector1); /* #243 */
     c.allow_overwrite = allow_overwrite;
     c.operator_confirmed = operator_confirmed;
     return hype_phys_guard_check(&c);
@@ -140,6 +196,16 @@ hype_phys_attach_mode_t hype_phys_attach_mode(hype_phys_guard_result_t guard) {
         case HYPE_PHYS_GUARD_DENY_NONEMPTY:
         case HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM:
             return HYPE_PHYS_ATTACH_READ_ONLY;
+        /*
+         * #243: NONE, not READ_ONLY.
+         *
+         * READ_ONLY is right for a disk we simply must not write; this disk cannot be
+         * trusted as a data SOURCE either. Handing a guest fabricated content is how an
+         * install "succeeds" against something that was never really there, which is
+         * worse than having no disk. It also forces the operator to deal with the drive
+         * rather than route around it.
+         */
+        case HYPE_PHYS_GUARD_DENY_UNTRUSTWORTHY_SECTORS:
         case HYPE_PHYS_GUARD_DENY_ID_MISMATCH:
         default:
             return HYPE_PHYS_ATTACH_NONE;
