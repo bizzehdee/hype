@@ -7548,10 +7548,35 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     }
     int booted = 0;
     hype_vt_filter_t uart_filter;
-    char uart_line[256];
+    /*
+     * The three 256-byte console line-assembly buffers live in per-VM file scope
+     * rather than on this function's stack.
+     *
+     * run_fw_1_test()'s frame had crept to ~4.1 KB -- not from any one big local
+     * but from dozens of small diagnostic structs in nested blocks whose
+     * lifetimes interleave, so the compiler cannot overlap them. Crossing 4 KB
+     * makes clang emit a __chkstk stack probe, and this is a freestanding UEFI
+     * build with no such helper to link against, so the build simply fails with
+     * "undefined symbol: __chkstk". It was 8 bytes over with
+     * -DHYPE_RUN_TWO_VMS=0 and 8 bytes under with the default, which is why only
+     * the single-VM probe build broke -- and that is the build
+     * docs/intel-parity.md tells the next session to start from.
+     *
+     * Indexed PER VM, not shared: each VM relays its own guest's console from
+     * its own core, so one shared buffer would interleave two guests' output
+     * into single corrupted lines. That is the same reasoning that kept the
+     * earlier __chkstk fix's buffer off file scope; the answer is per-VM state,
+     * not less state.
+     */
+#define FW_1_LINE_BUF 256u
+    static char g_uart_line[HYPE_FW_MAX_VMS][FW_1_LINE_BUF];
+    static char g_uart_line2[HYPE_FW_MAX_VMS][FW_1_LINE_BUF];
+    static char g_dbg_line[HYPE_FW_MAX_VMS][FW_1_LINE_BUF];
+    char *const uart_line = g_uart_line[vm - g_vms];
+    char *const uart_line2 = g_uart_line2[vm - g_vms];
+    char *const dbg_line = g_dbg_line[vm - g_vms];
     unsigned int uart_line_len = 0;
     hype_vt_filter_t uart_filter2;
-    char uart_line2[256];
     unsigned int uart_line_len2 = 0;
     int key_injected = 0;
     int key_reacted = 0;
@@ -7564,7 +7589,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     unsigned long long inject_productive = 0;
     unsigned long long inject_total = 0;
     hype_vt_filter_t dbg_filter;
-    char dbg_line[256];
     unsigned int dbg_line_len = 0;
     /* FW-1h: set once OVMF has sized+placed BAR5 and enabled Memory
      * Space on the AHCI function -- from then on, faults inside the
@@ -9057,10 +9081,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * host tick (~55% of all exits) is pure waste. */
         if (!vmm_reason_is_intr(kind, info.reason)) {
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line,
-                                                     &uart_line_len, (unsigned int)sizeof(uart_line),
+                                                     &uart_line_len, FW_1_LINE_BUF,
                                                      (unsigned)(vm - g_vms), 0u, &vm->term);
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2,
-                                                     &uart_line_len2, (unsigned int)sizeof(uart_line2),
+                                                     &uart_line_len2, FW_1_LINE_BUF,
                                                      (unsigned)(vm - g_vms), 1u, (hype_vt_screen_t *)0);
         }
 
@@ -9700,7 +9724,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 uint8_t dbg_byte = 0;
                 int dr = vmm_handle_debug_port_ioio(kind, ctx, HYPE_FW_1_DEBUG_PORT, &dbg_byte);
                 if (dr == 0) {
-                    fw_1_debug_feed(&dbg_filter, dbg_line, &dbg_line_len, (unsigned int)sizeof(dbg_line),
+                    fw_1_debug_feed(&dbg_filter, dbg_line, &dbg_line_len, FW_1_LINE_BUF,
                                     dbg_byte);
                     continue;
                 }
@@ -10277,9 +10301,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 
     /* Flush any console text the guest emitted right before it idled. */
     fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line, &uart_line_len,
-                             (unsigned int)sizeof(uart_line), (unsigned)(vm - g_vms), 0u, &vm->term);
+                             FW_1_LINE_BUF, (unsigned)(vm - g_vms), 0u, &vm->term);
     fw_1_drain_uart_console(&g_fw_1_uart2, &uart_filter2, uart_line2, &uart_line_len2,
-                             (unsigned int)sizeof(uart_line2), (unsigned)(vm - g_vms), 1u, (hype_vt_screen_t *)0);
+                             FW_1_LINE_BUF, (unsigned)(vm - g_vms), 1u, (hype_vt_screen_t *)0);
 
     /* M4-6b diagnostic: how many guest LAPIC-timer IRQs were actually
      * delivered, and whether one is still stuck in-service (never EOI'd
