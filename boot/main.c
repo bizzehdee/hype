@@ -7108,6 +7108,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     } else {
         hype_atapi_reset_chunked(&g_fw_1_atapi, &vm->iso_chunked); /* GLADDER-10(a): chunked backing */
     }
+#if HYPE_262_HIDE_EMPTY_CD
+    /*
+     * #262 PROBE, not a fix. With boot=disk there is no optical media, and BOTH
+     * devices then receive exactly one command and are abandoned -- the CD one
+     * INQUIRY, the SATA disk one IDENTIFY. Two unrelated models failing identically
+     * points at EDK2's shared ATA/ATAPI enumeration pass dying on the empty drive
+     * and taking the disk down with it.
+     *
+     * Report NO DEVICE on the CD's port (PxSSTS DET=0, PI=0) so the firmware skips
+     * it entirely, and see whether the SATA disk then gets SET FEATURES and reads.
+     * If it does, causation is established.
+     *
+     * Deliberately NOT a candidate fix: a real machine has empty optical drives and
+     * its firmware copes, so hiding the drive would paper over whatever hype's ATAPI
+     * model is getting wrong. This exists only to prove where to look.
+     */
+    if (vm->iso_size == 0) {
+        g_fw_1_ahci.p_ssts = 0;
+        g_fw_1_ahci.pi = 0;
+        hype_debug_print("fw-1 #262 PROBE: empty CD hidden (PxSSTS=0, PI=0) -- causation test\n");
+    }
+#endif
     /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging
      * the CD-ROM discovery sequence -- hype_svm_set_ahci_trace(1) -- but
      * left off here: a real boot issues thousands of commands and each
