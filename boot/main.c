@@ -12107,9 +12107,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 if (hype_nvme_host_read(hn.bar_phys, 1u, 1u, g_nvme_lba1) != 0) {
                     hype_serial_print("host-nvme: LBA1 read failed -- phys-write not armed\n");
                 } else {
-                    arm_physical_write_confirm(&g_hype_cfg, g_hostnvme_serial, nvme_model,
-                                               g_hostnvme_total_sectors, 0,
-                                               g_nvme_probe, g_nvme_lba1);
+                    /* #243: same verification re-read as the AHCI path. Leaving one
+                     * enumeration path unverified would mean the guard's strength
+                     * depended on which bus the target happened to be on, which is
+                     * exactly the kind of asymmetry that gets forgotten. */
+                    static uint8_t nv0[512] __attribute__((aligned(4096)));
+                    static uint8_t nv1[512] __attribute__((aligned(4096)));
+                    int reread_ok = hype_nvme_host_read(hn.bar_phys, 0u, 1u, nv0) == 0 &&
+                                    hype_nvme_host_read(hn.bar_phys, 1u, 1u, nv1) == 0;
+                    if (!reread_ok) {
+                        hype_serial_print("host-nvme: verification re-read failed -- phys-write "
+                                          "not armed (#243)\n");
+                    } else if (!hype_phys_sectors_agree(g_nvme_probe, g_nvme_lba1, nv0, nv1)) {
+                        hype_serial_print("host-nvme: two reads of LBA0/LBA1 DISAGREE -- this "
+                                          "drive is unreliable; phys-write not armed (#243)\n");
+                    } else {
+                        arm_physical_write_confirm(&g_hype_cfg, g_hostnvme_serial, nvme_model,
+                                                   g_hostnvme_total_sectors, 0,
+                                                   g_nvme_probe, g_nvme_lba1);
+                    }
                 }
             } else {
                 hype_debug_print("host-nvme: controller at %02x:%02x.%x LBA0 read FAILED\n",
