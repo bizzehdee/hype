@@ -55,6 +55,35 @@
 uint64_t hype_svm_efer_with_svme(uint64_t old_efer);
 
 /*
+ * #244: SVM ASID allocation.
+ *
+ * AMD-V tags TLB entries by ASID, and a TLB hit is decided by the ASID tag plus the
+ * linear page frame -- the nested-paging root (nCR3) does NOT participate in the tag.
+ * So two guests running with the SAME ASID and DIFFERENT nCR3 can genuinely alias
+ * each other's translations. This is the load-bearing difference from the VMX side:
+ * there, combined mappings are tagged by EP4TA as well, which is why distinct EPT
+ * roots kept guests apart regardless of VPID and why #273 was NOT a correctness fix.
+ * Here it is one.
+ *
+ * ASID 0 is reserved for the host, so usable guest ASIDs are 1..NASID-1.
+ */
+
+/* Fn8000_000A EBX is NASID, the number of ASIDs the CPU implements. */
+uint32_t hype_svm_nasid_from_cpuid_ebx(uint32_t ebx);
+
+/*
+ * A distinct nonzero ASID for a vCPU pool slot, clamped to what this CPU supports.
+ * Returns 0 only if the CPU reports it cannot support even one guest ASID, which the
+ * caller must treat as "do not run a guest" rather than as ASID 0 (the host's).
+ */
+uint32_t hype_svm_asid_for_slot(unsigned slot, uint32_t nasid);
+
+/* VMCB TLB_CONTROL values (APM: VMCB offset 0x058, bits 39:32). */
+#define HYPE_SVM_TLB_CTL_NOTHING 0u
+#define HYPE_SVM_TLB_CTL_FLUSH_ALL 1u
+#define HYPE_SVM_TLB_CTL_FLUSH_GUEST 3u
+
+/*
  * Enables SVM on the calling physical CPU: sets EFER.SVME and points
  * VM_HSAVE_PA at a host save area. Returns 0 on success. Exempt from
  * unit testing per AGENTS.md -- real RDMSR/WRMSR, nothing to observe

@@ -87,6 +87,54 @@ _Static_assert(sizeof(hype_vmcb_t) == 4096, "VMCB must be 4KB for per-element pa
  * bump MUST be atomic -- a plain read-modify-write could hand both cores slot
  * 0, i.e. two cores VMRUNning the same VMCB/ctx pair (memory corruption). A
  * lock-free fetch-add gives each caller a distinct index regardless of timing. */
+/*
+ * #244: give this vCPU its own ASID, and flush that ASID's stale entries once.
+ *
+ * AMD-V decides a TLB hit from the ASID tag plus the linear page frame; the nested
+ * paging root does NOT participate. Two guests sharing ASID 1 with different nCR3 --
+ * which is what hype did until now -- can therefore alias each other's translations.
+ * That is the real difference from the VMX side, where EP4TA is part of the tag and
+ * distinct EPT roots kept guests apart on their own (see #273, which turned out not
+ * to be a correctness fix at all).
+ *
+ * TLB_CONTROL is set to flush-this-guest for the first entry, because a pool slot --
+ * and therefore an ASID -- is recycled across guests, and a reused ASID must not
+ * inherit its predecessor's translations. hype_svm_vcpu_run() clears it after the
+ * first VMRUN so the flush does not repeat on every entry.
+ */
+/* #244: which pool slot a ctx came from, so a RESET path (which reuses an existing
+ * VMCB and has no slot in hand) still assigns that vCPU's own ASID. Mirrors
+ * vmx_ctx_slot() from #276. */
+static unsigned svm_ctx_slot(const struct hype_vcpu_ctx *ctx) {
+    if (ctx >= &g_ctx_pool[0] && ctx < &g_ctx_pool[HYPE_SVM_MAX_VCPUS]) {
+        return (unsigned)(ctx - &g_ctx_pool[0]);
+    }
+    return 0;
+}
+
+static void svm_assign_asid(hype_vmcb_t *vmcb, unsigned slot) {
+    uint32_t eax, ebx, ecx, edx;
+    uint32_t nasid;
+    uint32_t asid;
+
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x8000000Au));
+    (void)eax; (void)ecx; (void)edx;
+    nasid = hype_svm_nasid_from_cpuid_ebx(ebx);
+    asid = hype_svm_asid_for_slot(slot, nasid);
+    if (asid == 0u) {
+        /* Nothing downstream can detect a guest silently sharing the HOST's ASID
+         * tag, so it has to be said here. */
+        hype_debug_print("svm: CPU reports NASID=%u -- no usable guest ASID; guest would share "
+                         "the host's TLB tag (#244)\n",
+                         (unsigned)nasid);
+        return;
+    }
+    vmcb->control.guest_asid_tlb_ctl =
+        (uint64_t)asid | ((uint64_t)HYPE_SVM_TLB_CTL_FLUSH_GUEST << 32);
+    hype_debug_print("svm: slot %u -> ASID %u (NASID=%u), flush-this-guest armed (#244)\n", slot,
+                     (unsigned)asid, (unsigned)nasid);
+}
+
 static unsigned svm_alloc_vcpu_slot(void) {
     unsigned slot = __atomic_fetch_add(&g_vcpu_count, 1u, __ATOMIC_SEQ_CST);
     if (slot < HYPE_SVM_MAX_VCPUS) {
@@ -356,6 +404,9 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp, ui
 
     hype_vmcb_build_realmode_guest(vmcb, guest_rip, guest_rsp, (uint64_t)(uintptr_t)g_iopm,
                                     (uint64_t)(uintptr_t)g_msrpm);
+    /* AFTER the build: it zeroes the VMCB and hardcodes ASID 1, so assigning before
+     * would be silently overwritten (#244). */
+    svm_assign_asid(vmcb, slot);
 
     /* 0 means "no nested paging" (M2's original, still-supported
      * scope) -- a real NPT root is always a nonzero, page-aligned
@@ -404,6 +455,10 @@ void hype_svm_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
     configure_guest_msrpm(g_msrpm);
     hype_vmcb_build_realmode_guest(vmcb, guest_rip, guest_rsp, (uint64_t)(uintptr_t)g_iopm,
                                     (uint64_t)(uintptr_t)g_msrpm);
+    /* AFTER the build: it zeroes the VMCB and hardcodes ASID 1, so assigning before
+     * would be silently overwritten (#244). A reset reuses this vCPU's slot, and its
+     * ASID is recycled with it -- hence the flush this re-arms. */
+    svm_assign_asid(vmcb, svm_ctx_slot((const struct hype_vcpu_ctx *)ctx));
     if (npt_root != 0) {
         hype_vmcb_enable_nested_paging(vmcb, npt_root);
     }
@@ -441,6 +496,7 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
 
     hype_vmcb_build_long_mode_guest(vmcb, entry_rip, guest_cr3, rsp, (uint64_t)(uintptr_t)g_iopm,
                                      (uint64_t)(uintptr_t)g_msrpm);
+    svm_assign_asid(vmcb, slot); /* #244 -- after the build, which resets ASID to 1 */
 
     if (npt_root != 0) {
         hype_vmcb_enable_nested_paging(vmcb, npt_root);
@@ -2869,6 +2925,15 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     clgi();
     vmload(vmcb_phys);
     vmrun_full(real, vmcb_phys);
+    /*
+     * #244: the flush-this-guest armed at create has now happened. Clear TLB_CONTROL
+     * so it does not repeat on every entry -- a permanent per-VMRUN flush would be
+     * correct but would throw away this guest's whole nested TLB on every exit, and
+     * hype exits often. The ASID field (bits 31:0) is left alone.
+     */
+    if ((real->vmcb->control.guest_asid_tlb_ctl >> 32) != 0ull) {
+        real->vmcb->control.guest_asid_tlb_ctl &= 0xFFFFFFFFull;
+    }
     hype_fpu_save(&real->fpu);
     if (g_vmrun_trace) {
         hype_debug_print("svm: VMRUN returned -- about to VMSAVE/STGI...\n");
