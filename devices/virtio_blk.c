@@ -252,6 +252,65 @@ int hype_virtio_blk_is_queue_ready(const hype_virtio_blk_t *dev) {
            dev->queue_size != 0 && dev->queue_desc != 0;
 }
 
+
+/* #265 step 3 decision data -- see hype_virtio_blk_depth_t in the header. */
+static hype_virtio_blk_depth_t g_depth;
+
+hype_virtio_blk_depth_t *hype_virtio_blk_depth(void) {
+    return &g_depth;
+}
+
+unsigned hype_virtio_blk_depth_bucket(uint32_t depth) {
+    if (depth <= 1u) {
+        return 0u;
+    }
+    if (depth < 4u) {
+        return 1u;
+    }
+    if (depth < 8u) {
+        return 2u;
+    }
+    if (depth < 16u) {
+        return 3u;
+    }
+    if (depth < 32u) {
+        return 4u;
+    }
+    return 5u;
+}
+
+void hype_virtio_blk_depth_reset(hype_virtio_blk_depth_t *d) {
+    unsigned i;
+    if (d == (hype_virtio_blk_depth_t *)0) {
+        return;
+    }
+    d->kicks = 0;
+    d->chains = 0;
+    d->max_depth = 0;
+    for (i = 0; i < HYPE_VIRTIO_BLK_DEPTH_BUCKETS; i++) {
+        d->hist[i] = 0;
+    }
+}
+
+void hype_virtio_blk_depth_record(hype_virtio_blk_depth_t *d, uint32_t depth) {
+    if (d == (hype_virtio_blk_depth_t *)0 || depth == 0u) {
+        return;
+    }
+    d->kicks++;
+    d->chains += (uint64_t)depth;
+    if (depth > d->max_depth) {
+        d->max_depth = depth;
+    }
+    d->hist[hype_virtio_blk_depth_bucket(depth)]++;
+}
+
+uint32_t hype_virtio_blk_depth_mean_x100(const hype_virtio_blk_depth_t *d) {
+    if (d == (const hype_virtio_blk_depth_t *)0 || d->kicks == 0u) {
+        return 0u;
+    }
+    return (uint32_t)((d->chains * 100ULL) / d->kicks);
+}
+
 void hype_virtq_decode_desc(const uint8_t raw[16], hype_virtq_desc_t *out) {
     out->addr = (uint64_t)raw[0] | ((uint64_t)raw[1] << 8) | ((uint64_t)raw[2] << 16) |
                 ((uint64_t)raw[3] << 24) | ((uint64_t)raw[4] << 32) | ((uint64_t)raw[5] << 40) |

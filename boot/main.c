@@ -7984,6 +7984,34 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                          (unsigned long long)hype_blk_wstats_kbps(ws, w_ms));
                     }
                 }
+                /*
+                 * #265 step 3: queue depth per kick -- the number that decides
+                 * WHICH fix the latency-bound write path needs. `mean` is
+                 * scaled by 100 (250 = 2.50 chains/kick); `hist` buckets are
+                 * 1 / 2-3 / 4-7 / 8-15 / 16-31 / >=32 chains.
+                 *
+                 * depth==1 everywhere means the guest waits for each completion,
+                 * so there is never a second request to merge with and
+                 * coalescing cannot help -- only per-command latency can. A
+                 * routinely deeper queue means adjacent requests can be gathered
+                 * into one multi-PRDT AHCI command, turning N round trips into
+                 * one. The write-size histogram above cannot tell these apart:
+                 * many 1-sector writes look identical either way.
+                 */
+                {
+                    const hype_virtio_blk_depth_t *qd = hype_virtio_blk_depth();
+                    if (qd->kicks != 0) {
+                        hype_debug_print("fw-1 DIAG: VBLK QDEPTH kicks=%llu chains=%llu "
+                                         "mean_x100=%u max=%u hist=%u/%u/%u/%u/%u/%u\n",
+                                         (unsigned long long)qd->kicks,
+                                         (unsigned long long)qd->chains,
+                                         (unsigned)hype_virtio_blk_depth_mean_x100(qd),
+                                         (unsigned)qd->max_depth, (unsigned)qd->hist[0],
+                                         (unsigned)qd->hist[1], (unsigned)qd->hist[2],
+                                         (unsigned)qd->hist[3], (unsigned)qd->hist[4],
+                                         (unsigned)qd->hist[5]);
+                    }
+                }
                 /* M4-6d4: mean per-exit cost split VMRUN world-switch vs our
                  * loop body, in nanoseconds (TSC / host_tsc_hz * 1e9). Tells
                  * whether the ~219us/exit is the CPU's world-switch (VMRUN

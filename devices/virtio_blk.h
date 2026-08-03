@@ -231,6 +231,57 @@ typedef struct {
 
 void hype_virtq_decode_desc(const uint8_t raw[16], hype_virtq_desc_t *out);
 
+
+/*
+ * #265 step 3: queue-depth instrumentation -- how many requests were already
+ * pending when the guest kicked the queue.
+ *
+ * This ONE number decides between two opposite fixes, which is why it is
+ * measured before either is built (the ticket's own measure-first rule).
+ *
+ * The physical write path keeps a single AHCI command in flight and spins for
+ * it, so throughput is 1/latency. If the guest always has exactly ONE request
+ * pending per kick, it is waiting for each completion before submitting the
+ * next -- there is never a second request to merge with, coalescing adjacent
+ * requests cannot help at all, and the only lever is per-command latency. If
+ * the depth is routinely greater than one, then adjacent requests can be
+ * gathered into a single multi-PRDT AHCI command, turning N round trips into
+ * one -- the real fix for a latency-bound path.
+ *
+ * The write-size histogram (hype_blk_wstats) already established that requests
+ * are small; it cannot distinguish these two cases, because "many 1-sector
+ * writes" looks identical whether they arrive one at a time or forty at a time.
+ *
+ * Aggregate across VMs and updated without locking, for the same reason the
+ * write stats are: a lost increment on a diagnostic beats a lock on the I/O
+ * path.
+ */
+#define HYPE_VIRTIO_BLK_DEPTH_BUCKETS 6u
+
+typedef struct {
+    uint64_t kicks;      /* queue notifies that found at least one new chain */
+    uint64_t chains;     /* total chains drained across those kicks */
+    uint32_t max_depth;  /* deepest single kick */
+    uint32_t hist[HYPE_VIRTIO_BLK_DEPTH_BUCKETS];
+} hype_virtio_blk_depth_t;
+
+/*
+ * Bucket index for a kick that drained `depth` chains:
+ *   0: 1  (the decisive case -- nothing to coalesce)
+ *   1: 2-3   2: 4-7   3: 8-15   4: 16-31   5: >=32
+ * depth==0 is not a recorded kick and maps to bucket 0. Pure.
+ */
+unsigned hype_virtio_blk_depth_bucket(uint32_t depth);
+void hype_virtio_blk_depth_reset(hype_virtio_blk_depth_t *d);
+/* Fold one kick that drained `depth` chains into `d`. A depth of 0 is ignored:
+ * a notify that found no new work says nothing about how deep the guest queues. */
+void hype_virtio_blk_depth_record(hype_virtio_blk_depth_t *d, uint32_t depth);
+/* Mean chains per kick, scaled by 100 so it needs no float (freestanding, and
+ * hype_debug_print has no %f). 250 means 2.50 chains per kick. */
+uint32_t hype_virtio_blk_depth_mean_x100(const hype_virtio_blk_depth_t *d);
+/* The process-wide depth stats process_virtio_blk_queue() folds into. */
+hype_virtio_blk_depth_t *hype_virtio_blk_depth(void);
+
 /* Drains a virtio-blk virtqueue: walks the available ring, executes each
  * request against the block backend, DMAs data to/from guest RAM (dma_map;
  * 0 = identity), and posts completions to the used ring. Vendor-neutral; the

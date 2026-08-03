@@ -785,6 +785,90 @@ static void test_chain_reject_log_is_rate_limited(void) {
     CHECK_HEX("rejection logging capped", 8u, tq_reject_count);
 }
 
+
+/* #265: queue-depth instrumentation. Pure, so the bucket boundaries and the
+ * scaled mean are checked here rather than only ever on hardware -- where a
+ * misplaced boundary would silently mis-report the one number that decides
+ * which fix the write path gets. */
+static void test_depth_buckets(void) {
+    struct { uint32_t depth; unsigned bucket; } cases[] = {
+        {0u, 0u}, {1u, 0u},
+        {2u, 1u}, {3u, 1u},
+        {4u, 2u}, {7u, 2u},
+        {8u, 3u}, {15u, 3u},
+        {16u, 4u}, {31u, 4u},
+        {32u, 5u}, {1000u, 5u},
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        unsigned got = hype_virtio_blk_depth_bucket(cases[i].depth);
+        if (got != cases[i].bucket) {
+            printf("FAIL: depth %u -> bucket %u, expected %u\n", cases[i].depth, got,
+                   cases[i].bucket);
+            failures++;
+        }
+    }
+}
+
+static void test_depth_record_accumulates(void) {
+    hype_virtio_blk_depth_t d;
+
+    hype_virtio_blk_depth_reset(&d);
+    CHECK_HEX("no kicks recorded yet", 0u, (unsigned)d.kicks);
+    CHECK_HEX("mean of no kicks is 0, not a divide by zero", 0u,
+              hype_virtio_blk_depth_mean_x100(&d));
+
+    hype_virtio_blk_depth_record(&d, 1u);
+    hype_virtio_blk_depth_record(&d, 1u);
+    hype_virtio_blk_depth_record(&d, 4u);
+
+    CHECK_HEX("three kicks", 3u, (unsigned)d.kicks);
+    CHECK_HEX("six chains", 6u, (unsigned)d.chains);
+    CHECK_HEX("max depth 4", 4u, d.max_depth);
+    CHECK_HEX("two kicks in bucket 0", 2u, d.hist[0]);
+    CHECK_HEX("one kick in bucket 2", 1u, d.hist[2]);
+    /* 6 chains / 3 kicks = 2.00 */
+    CHECK_HEX("mean is 200 (2.00 chains/kick)", 200u, hype_virtio_blk_depth_mean_x100(&d));
+
+    /* A depth of 0 is not a kick: an empty notify says nothing about how deeply
+     * the guest queues, and counting it would drag the mean toward 1 and hide
+     * exactly the signal this exists to find. */
+    hype_virtio_blk_depth_record(&d, 0u);
+    CHECK_HEX("empty notify not counted as a kick", 3u, (unsigned)d.kicks);
+    CHECK_HEX("empty notify did not change the mean", 200u, hype_virtio_blk_depth_mean_x100(&d));
+
+    /* Null-safe, like the write stats. */
+    hype_virtio_blk_depth_record(0, 1u);
+    hype_virtio_blk_depth_reset(0);
+    CHECK_HEX("mean of NULL is 0", 0u, hype_virtio_blk_depth_mean_x100(0));
+}
+
+/* The drain must report the depth it actually saw, so the DIAG number is the
+ * guest's behaviour and not an artefact of how the counter is wired. */
+static void test_depth_is_recorded_by_the_drain(void) {
+    tq_t q;
+    hype_virtio_blk_depth_t *d = hype_virtio_blk_depth();
+
+    hype_virtio_blk_depth_reset(d);
+
+    /* One kick carrying two chains (the same rig as the multi-chain drain test). */
+    tq_init(&q, HYPE_VIRTIO_BLK_T_FLUSH, 0);
+    tq_desc(&q, 0, q.hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    tq_desc(&q, 1, &q.status, 1u, 0, 0);
+    tq_submit(&q, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("drain ok", 0, tq_run(&q));
+    CHECK_HEX("one kick recorded", 1u, (unsigned)d->kicks);
+    CHECK_HEX("depth 2 recorded", 2u, (unsigned)d->chains);
+    CHECK_HEX("max depth 2", 2u, d->max_depth);
+
+    /* A re-notify with nothing new must not be counted. */
+    CHECK_HEX("re-drain ok", 0, tq_run(&q));
+    CHECK_HEX("empty kick not recorded", 1u, (unsigned)d->kicks);
+
+    hype_virtio_blk_depth_reset(d);
+}
+
 int main(void) {
     test_reset_sets_capacity_and_default_queue_size();
     test_feature_negotiation_offers_only_version_1();
@@ -811,6 +895,9 @@ int main(void) {
     test_chain_multiple_pending_chains_all_drain();
     test_chain_zero_queue_size_rejected();
     test_chain_reject_log_is_rate_limited();
+    test_depth_buckets();
+    test_depth_record_accumulates();
+    test_depth_is_recorded_by_the_drain();
 
     if (failures == 0) {
         printf("all tests passed\n");

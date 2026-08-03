@@ -2772,6 +2772,7 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
     const uint8_t *avail_base;
     uint8_t *used_base;
     uint16_t avail_idx;
+    uint32_t drained = 0; /* #265: chains this kick found already pending */
 
     if (qsz == 0u) {
         return -1;
@@ -2941,8 +2942,13 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
 
         dev->isr_status |= 0x01u;
         dev->last_avail_idx = (uint16_t)(dev->last_avail_idx + 1u);
+        drained++;
     }
 
+    /* #265: record the queue depth this kick saw. Counted here rather than from
+     * avail_idx arithmetic so a kick that found nothing new contributes nothing
+     * -- an empty notify says nothing about how deeply the guest queues. */
+    hype_virtio_blk_depth_record(hype_virtio_blk_depth(), drained);
     return 0;
 }
 
