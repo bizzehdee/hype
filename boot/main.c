@@ -11228,8 +11228,62 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
                      "the stick means the file was created and the write failed)\n", nb);
 }
 
+/*
+ * #239: which core owns the USB write path.
+ *
+ * Latched on the BSP immediately before the APs are started, at a point where
+ * the LAPIC is demonstrably usable (the very next thing done with it is sending
+ * INIT/SIPI). Until then it stays invalid, and an invalid marker means "no AP
+ * exists yet, so whoever is calling IS the BSP" -- which is why the early,
+ * pre-MP flush call sites still work. Reading the LAPIC unconditionally from
+ * usb_log_flush() instead would have meant touching LAPIC MMIO from the
+ * pre-MP-dispatch call sites, before this code has established that window.
+ */
+static uint32_t g_usb_log_bsp_apic_id;
+static int g_usb_log_bsp_apic_id_valid;
+
+/* The physical LAPIC ID of the core executing this call. Reg 0x20, bits 31:24 --
+ * the same read the dispatch loop's which-core check uses. */
+static uint32_t usb_log_exec_apic_id(void) {
+    return (*(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + 0x20u)) >> 24;
+}
+
+static void usb_log_latch_bsp_core(void) {
+    g_usb_log_bsp_apic_id = usb_log_exec_apic_id();
+    g_usb_log_bsp_apic_id_valid = 1;
+}
+
+/* 1 when this core owns USB I/O. Pre-MP (marker not yet latched) only the BSP
+ * runs, so that case is the owner by definition. */
+static int usb_log_this_core_owns_usb(void) {
+    if (!g_usb_log_bsp_apic_id_valid) {
+        return 1;
+    }
+    return usb_log_exec_apic_id() == g_usb_log_bsp_apic_id;
+}
+
 static void usb_log_flush(void) {
     if (!g_usb_log_ready) return;
+    /*
+     * #239: ONLY the BSP may drive the USB write path. Driving xHCI/FAT from an
+     * AP faulted hype itself -- `PANIC: unhandled interrupt: vector=14 (Page
+     * Fault) error_code=0x2`, a not-present WRITE in hype's own code, which took
+     * both VMs down with it. Same family as #229 (AP-core device I/O).
+     *
+     * Enforced HERE rather than at the call sites, because there are several and
+     * a new one would silently reintroduce the fault. An AP's call becomes a
+     * no-op; the AP only ever appends to the logbuf, which is already safe from
+     * any core, and the BSP drains that buffer on its own cadence from its idle
+     * loop. That is the ticket's own preferred shape and matches how the host
+     * controller is already owned.
+     *
+     * Note this makes the guest-loop call site a no-op when the guest runs on an
+     * AP (HYPE_RUN_GUEST_ON_AP, the default) and a real flush when it runs on the
+     * BSP -- both correct, without the call site needing to know which.
+     */
+    if (!usb_log_this_core_owns_usb()) {
+        return;
+    }
     /*
      * Keep the log's modification time moving (#253): derive "now" from the
      * boot-time RTC snapshot plus TSC-measured elapsed seconds -- pure
@@ -12888,6 +12942,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         } else {
             /* Use the AP's own <4GB identity-map root (g_ap_cr3), NOT hype's
              * host CR3 which UEFI may have placed above 4GB. */
+            /* #239: latch which core owns USB I/O before any AP exists, so an AP
+             * can never be mistaken for the owner (and so the LAPIC is only read
+             * once it is known good -- INIT/SIPI is sent through it right here). */
+            usb_log_latch_bsp_core();
             int ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 1u,
                                       (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                                       (uint64_t)(uintptr_t)(g_ap_stack + sizeof(g_ap_stack)),
@@ -12956,9 +13014,44 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      */
 #if HYPE_RUN_GUEST_ON_AP
     (void)vm;
-    hype_debug_print("fw-1: guest dispatched to the AP (dedicated core); BSP idle\n");
-    for (;;) {
-        __asm__ volatile("hlt");
+    hype_debug_print("fw-1: guest dispatched to the AP (dedicated core); BSP idle -- "
+                     "draining \\HYPEFULL.LOG from here every %llus (#239)\n",
+                     (unsigned long long)HYPE_USBLOG_WRITE_INTERVAL_SECS);
+    /*
+     * #239: the BSP-side USB log drain.
+     *
+     * The guest runs on an AP and only ever APPENDS to the in-memory logbuf,
+     * which is safe from any core. All USB I/O happens here, on the BSP, which
+     * already owns the host controller -- so the xHCI/FAT write path is never
+     * entered from an AP, where it page-faulted hype itself and killed both VMs.
+     *
+     * This loop is not merely idle any more, which is the point: before this the
+     * only flush was in the AP's guest loop, so on a firmware without post-EBS NV
+     * writes the entire live-guest log was lost. The BSP was sitting in HLT with
+     * nothing to do while the one core that must not do the work did it.
+     *
+     * hype's 1000 Hz timer is live here with interrupts enabled, so HLT wakes
+     * every tick and the interval check below is what sets the real cadence.
+     *
+     * A concurrent AP append during a flush can at worst leave a partially
+     * appended record for the next flush to pick up -- the sink writes only the
+     * bytes appended before it sampled the length. That is a diagnostic-quality
+     * race and strictly better than the previous arrangement, where an AP both
+     * appended and flushed.
+     */
+    {
+        uint64_t drain_last_tsc = 0;
+        for (;;) {
+            __asm__ volatile("hlt");
+            if (g_vms[0].host_tsc_hz != 0) {
+                uint64_t now_d = hype_rdtsc();
+                uint64_t iv = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_vms[0].host_tsc_hz;
+                if (drain_last_tsc == 0 || now_d - drain_last_tsc >= iv) {
+                    drain_last_tsc = now_d;
+                    usb_log_flush(); /* no-op until a USB sink is open */
+                }
+            }
+        }
     }
 #else
     run_fw_1_test(vm, args.ops, args.kind);
