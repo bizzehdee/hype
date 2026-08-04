@@ -1762,9 +1762,29 @@ void hype_ahci_tl_arm(void) {
 }
 
 void hype_ahci_tl(const char *tag, unsigned int v) {
+    static const char *last_tag = 0;
+    static unsigned int last_v = 0;
+    static unsigned int run = 0;
+
     if (!g_tl_armed || g_tl_n >= 60u) {
         return;
     }
+    /*
+     * Consecutive identical events are counted, not printed. A raise storm otherwise consumes the
+     * whole budget and hides the one thing being looked for: the first GUEST event after the
+     * completion. The run length is reported when the run ends, so nothing is silently dropped --
+     * a bounded log that hides its own truncation is what misled this ticket five times.
+     */
+    if (tag == last_tag && v == last_v) {
+        run++;
+        return;
+    }
+    if (run > 0u) {
+        hype_debug_print("fw-1 TL   (previous event repeated %ux)\n", run + 1u);
+        run = 0;
+    }
+    last_tag = tag;
+    last_v = v;
     g_tl_n++;
     /* No timestamp: hype_rdtsc() is main.c-local, and the log is serial so its ORDER is the
      * measurement. Plumbing a clock in for a diagnostic is not worth a new dependency. */
