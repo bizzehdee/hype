@@ -1979,13 +1979,16 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
         return -1;
     }
 
-    reg = gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store carries its value in the instruction and has NO source
+     * register -- the ModRM reg field is an opcode extension -- so the GPR lookup is
+     * skipped rather than resolving register 0 and writing RAX to the device. */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
 
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
         if (g_ahci_trace) {
             hype_debug_print("ahci-trace: ABAR write off=0x%x val=0x%x\n", (unsigned int)offset,
                               (unsigned int)value);
@@ -2336,13 +2339,16 @@ static int hype_svm_ahci_disk_npf_common(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci
         return -1;
     }
 
-    reg = gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store carries its value in the instruction and has NO source
+     * register -- the ModRM reg field is an opcode extension -- so the GPR lookup is
+     * skipped rather than resolving register 0 and writing RAX to the device. */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
 
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
         if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
             return -1;
         }
@@ -2527,15 +2533,18 @@ int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uin
         return -1;
     }
 
-    reg = gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store carries its value in the instruction and has NO source
+     * register -- the ModRM reg field is an opcode extension -- so the GPR lookup is
+     * skipped rather than resolving register 0 and writing RAX to the device. */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
 
     hype_pci_decode_ecam_offset(npf.guest_phys_addr - ecam_base_phys, &addr);
 
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
         hype_pci_config_write(pci, &addr, decoded.size_bytes, value);
     } else {
         uint32_t value = 0;
@@ -2575,8 +2584,11 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
         return -1; /* DISPI registers are architecturally 16-bit only */
     }
 
-    reg = gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store carries its value in the instruction and has NO source
+     * register -- the ModRM reg field is an opcode extension -- so the GPR lookup is
+     * skipped rather than resolving register 0 and writing RAX to the device. */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
 
@@ -2591,7 +2603,7 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
     }
 
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
         if (hype_bochs_vbe_mmio_write(dev, offset - HYPE_BOCHS_VBE_DISPI_OFFSET, (uint16_t)value) != 0) {
             return -1;
         }
@@ -2626,7 +2638,9 @@ int hype_svm_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_ins
         return -1;
     }
     if (!decoded.is_write) {
-        uint64_t *reg = gpr_ptr(real, decoded.reg);
+        /* #306: see the note on the other handlers -- an immediate store has no source
+         * register. */
+        uint64_t *reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
         uint32_t allones;
         if (reg == 0) {
             return -1;
@@ -3182,8 +3196,11 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
         return -1;
     }
 
-    reg = gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store carries its value in the instruction and has NO source
+     * register -- the ModRM reg field is an opcode extension -- so the GPR lookup is
+     * skipped rather than resolving register 0 and writing RAX to the device. */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
 
@@ -3191,7 +3208,7 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
         offset < HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET + HYPE_VIRTIO_COMMON_CFG_SIZE) {
         uint32_t region_offset = offset - HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET;
         if (decoded.is_write) {
-            uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+            uint32_t value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
             if (hype_virtio_blk_common_cfg_write(dev, region_offset, decoded.size_bytes, value) != 0) {
                 return -1;
             }
@@ -3492,13 +3509,16 @@ int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t p
         return -1;
     }
 
-    reg = gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store carries its value in the instruction and has NO source
+     * register -- the ModRM reg field is an opcode extension -- so the GPR lookup is
+     * skipped rather than resolving register 0 and writing RAX to the device. */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
 
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
         if (hype_pflash_write(pf, offset, decoded.size_bytes, value) != 0) {
             return -1;
         }
