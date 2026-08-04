@@ -196,12 +196,16 @@ explicit design:
   only if we want to support installers that insist on legacy boot. Treat as
   stretch goal; UEFI-only is enough for a first release given all three OS
   families support UEFI installers today.
-- **Storage presented to guest**: virtio-blk as primary (Linux/BSD have inbox
-  drivers; Windows needs the virtio-win driver injected — see §6a). Also
-  support emulated AHCI as a Windows-friendly fallback that needs no drivers
-  at install time, at the cost of more emulation complexity. Recommend:
-  *AHCI for Windows installer boot disk, virtio-blk for Linux/BSD*, both
-  implemented in the device model, chosen via `os_hint`.
+- **Storage presented to guest**: **three** guest-facing front-ends, and the
+  operator chooses per disk — `virtio-blk` (Linux/BSD inbox drivers, fastest,
+  but Windows needs the virtio-win driver injected — see §6a), `ahci-sata`
+  (Windows-friendly, no drivers at install time, more emulation complexity),
+  and `nvme` (also inbox on Windows, and what a modern machine looks like).
+  `os_hint` supplies only the **default** (`windows` → `ahci-sata`, otherwise
+  `virtio-blk`); an explicit `bus =` in `hype.cfg` always wins. A VM may have
+  **any number of disks, each with its own bus** — see §6d and §10 decision
+  26. `docs/hype-cfg-spec.md` is the authority for the config surface itself
+  and already specifies these keys.
 - **Network**: virtio-net, optional; not required for offline installs.
 - **Video**: two phases, same underlying mechanism. Pre-OS-driver, the
   guest's own firmware renders through the GOP protocol we expose, into a
@@ -334,10 +338,26 @@ as §6b, with one addition:
 ## 6d. Installation workflow: ISO → virtual disk or physical disk
 
 Two independent axes: where the *install media* comes from (always an ISO in
-v1), and where the *install target* lives (a host-file-backed virtual disk,
-or a real physical drive). Both targets are exposed to the guest through the
-same block-device frontend (AHCI or virtio-blk, per `os_hint` as in §6/§6a) —
-the installer never knows or cares which backend it's writing to.
+v1), and where the *install target* lives. Every target is exposed to the
+guest through the same block-device front-end abstraction, so the installer
+never knows or cares which backing it is writing to.
+
+A VM may be given **any number of disks**, and each disk independently
+specifies:
+
+- its **backing** — one of four, all presenting identically to the guest:
+  a whole **physical disk** (SATA/AHCI or NVMe), a **partition** on such a
+  disk, a **raw file**, or a **qcow2 file** (§10 decision 3), where a file
+  lives on a host volume formatted **FAT32, exFAT or ext**;
+- its **bus** — the guest-facing front-end: `virtio-blk`, `ahci-sata` or
+  `nvme`, defaulting from `os_hint` and overridable per disk (§6, §10
+  decision 26).
+
+The backing and the bus are fully independent: a qcow2 file on an ext
+volume can be presented as NVMe, and a physical partition as `ahci-sata`.
+That independence is what `struct blk_backend` buys — see below.
+`docs/hype-cfg-spec.md`'s `[disk.<id>]` stanza is the authoritative config
+surface for all of this.
 
 - **Install media (ISO)**: read from a host block device, exposed to the
   guest as a virtual optical drive (AHCI/ATAPI CD-ROM, or a virtio-scsi
@@ -371,9 +391,22 @@ the installer never knows or cares which backend it's writing to.
   own a minimal **host-side block driver** (AHCI + NVMe covers the vast
   majority of real hardware) so it can issue raw reads/writes after
   `ExitBootServices()`, since UEFI's Block I/O protocol is gone by then. The
-  block backend abstraction (`struct blk_backend` with `file` and
-  `physical` implementations behind one vtable) is what lets the same
-  virtio-blk/AHCI frontend serve either case unmodified.
+  block backend abstraction (`struct blk_backend` — `file`, `image`,
+  `physical` (AHCI/NVMe/USB) and `qcow2` implementations behind one vtable)
+  is what lets **every** front-end serve **every** backing unmodified: a
+  front-end takes a `blk_backend *` and nothing else, which is why adding a
+  bus costs no backend work and adding a backing costs no front-end work.
+  The single security-critical bounds check (guest LBA+count against the
+  backend's real capacity, §6j) lives in `blk_backend`'s dispatcher rather
+  than in any implementation, so no backing can forget it.
+- **Partition target (`partition = <n>`)**: a physical target may be scoped
+  to one GPT partition instead of the whole drive, so a machine's spare
+  partition can host a guest without dedicating the disk. Scoping is a base
+  LBA plus a **clamped capacity** in the physical backend, which means the
+  existing bounds check confines the guest to that partition for free. The
+  non-empty-partition-table guard (below) must become partition-aware to
+  match — checking LBA 0/1 of the whole disk says nothing about whether the
+  target partition holds data.
 - **Disk identification safety**: physical targets are matched by drive
   **serial number or GUID**, captured during a pre-`ExitBootServices`
   enumeration pass (walking UEFI Block I/O handles, which is available for
@@ -798,6 +831,23 @@ isn't lost.
    COW format or qcow2. Simplest, hardest to get wrong, no format-parsing
    surface inside the trusted hypervisor. Revisit only if snapshotting
    becomes a real ask (currently a stretch goal).
+   **SUPERSEDED (#200, M5-9): qcow2 is now supported alongside raw.** Kept
+   above rather than rewritten, because the reasoning was sound and the
+   trade-off is what changed, not the analysis. What changed: images
+   pre-created by `tools/make-disk-image.sh` must be **fully allocated**
+   anyway (a sparse hole is a sector the filesystem has not assigned, and
+   hype's post-`ExitBootServices` writer cannot assign one — §6d), so "raw
+   sparse" lost the space advantage that motivated it, while operators
+   already have qcow2 images from other tools. The format-parsing surface
+   this entry worried about was contained by refusing rather than guessing:
+   compressed clusters, any encryption, `refcount_order != 4`, any v3
+   incompatible-feature bit, snapshot-shared clusters (COPIED clear) and
+   refcount-table growth are all rejected outright. Also note the format is
+   **sniffed from the header magic, not configured** — deliberately, so an
+   operator swapping a raw image for a qcow2 one does not also have to
+   remember to edit `hype.cfg`; a raw image cannot be mistaken for a qcow2
+   because none begins with `QFI\xfb` *and* passes the header validation.
+   Raw remains the default and the recommended format.
 4. **Testing strategy — decided: QEMU/KVM nested virtualization
    (`-cpu host,+vmx`) for fast day-to-day iteration through M0–M6, plus a
    mandatory real-hardware validation pass at every milestone gate** — not
@@ -1038,6 +1088,42 @@ isn't lost.
     by construction and is the only step that touches existing paths.
     No change is needed to how the drive is presented to the guest: hype
     already reports DVD-ROM as the current MMC profile.
+
+26. **Guest disk front-end selection and multi-disk VMs — decided: any
+    number of disks per VM, each naming its own bus (`virtio-blk` |
+    `ahci-sata` | `nvme`), with `os_hint` supplying only the default.**
+    §6 previously had the front-end *derived* from `os_hint` with no way to
+    override it, and named only two front-ends. Three things forced a
+    decision:
+    - **Derivation is not selection.** An operator installing Windows to one
+      disk and keeping a Linux data disk on another needs different buses on
+      the same VM, which a per-VM `os_hint` cannot express. So `os_hint`
+      becomes the default (`windows` → `ahci-sata`, else `virtio-blk`) and an
+      explicit per-disk `bus =` always wins. `docs/hype-cfg-spec.md` already
+      specified exactly this, including the defaults — the spec was ahead of
+      both the code and this plan, and this entry brings the plan level.
+    - **A guest NVMe front-end is required, and does not exist.** §6a
+      mentioned "AHCI + emulated NVMe" once, in passing; there is no guest
+      NVMe model in the tree at all. It is the largest single piece of work
+      in this area, and it is worth it because NVMe is inbox on every
+      supported guest OS *and* is what a modern machine looks like, so it is
+      the least surprising thing to present.
+    - **v1 ships the NVMe front-end INTx-only**, not MSI/MSI-X. hype's PCI
+      model has no capability-list support beyond hand-written vendor caps,
+      256-byte config space, 32-bit BARs and INTx delivery only — and
+      virtio-blk already declines MSI-X (`0xFFFF` NO_VECTOR) and works.
+      NVMe 1.4 permits pin-based interrupts. Rejected alternative: build
+      MSI/MSI-X first. That is a guest-LAPIC message-write path plus
+      capability modelling, i.e. a second large piece of work stacked in
+      front of this one, on the *assumption* that INTx is insufficient.
+      Whether OVMF's `NvmExpressDxe` and Windows' `stornvme` bind over INTx
+      is to be settled by **experiment before any of it is written** — #262's
+      history is a direct warning against guessing what EDK2 will accept.
+    Sequencing: the `[disk.<id>]` config parser lands first, because every
+    other item needs somewhere to be configured from; the AHCI-SATA
+    front-end is made *selectable* before the NVMe one is *written*, since
+    it already exists and only lacks a switch; partition-scoped physical
+    targets are independent of both and can land in parallel.
 
 ## 11. Pre-M0 readiness checklist
 
