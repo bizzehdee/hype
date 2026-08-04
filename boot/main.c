@@ -235,6 +235,18 @@ static unsigned long long g_sendkey_codes;
  * are different claims, and on a machine whose only channel is a captured log the second
  * one has to be measured rather than assumed.
  */
+/*
+ * #286: OVMF debug-port (0x402) traffic, split by DIRECTION.
+ *
+ * IOHIST counts accesses to the port but not which way they go, and that is exactly the
+ * distinction the DEBUG-firmware investigation turns on: 15,192 accesses with ZERO
+ * forwarded lines means either the firmware never writes (so its debug channel is dead and
+ * the presence check is looping) or it writes without newlines (so hype is holding the
+ * output). Those need opposite fixes, and one counter pair settles it.
+ */
+static unsigned long long g_dbgport_writes;
+static unsigned long long g_dbgport_reads;
+static unsigned long long g_dbgport_lines;
 static unsigned long long g_hostkbd_scancodes;
 static unsigned long long g_hostkbd_chords;
 
@@ -6529,6 +6541,7 @@ static void fw_1_debug_feed(hype_vt_filter_t *filter, char *line, unsigned int *
     }
     if (c == '\n') {
         line[*line_len] = '\0';
+        g_dbgport_lines++;
         if (fw_1_debug_line_wanted(line)) {
             hype_debug_print("fw-1 ovmf-dbg| %s\n", line);
         }
@@ -8764,6 +8777,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 /* PERF-2 (#234) evidence: what the diffing renderer saved. A
                  * full redraw is cols*rows cells AND a whole-framebuffer push,
                  * every call; pushes<<calls is the win. */
+                /*
+                 * #286: UNCONDITIONAL, and in the always-printed dump rather than the
+                 * periodic DIAG block -- that block does not run for a guest that only
+                 * spins, which is exactly the case this counter exists to diagnose. All
+                 * zeros is itself the finding (the handler was never reached), so it must
+                 * not be suppressed by a "nothing to report" guard.
+                 */
+                hype_debug_print("fw-1 OVMF-DBGPORT: writes=%llu reads=%llu lines=%llu [#286]\n",
+                                 g_dbgport_writes, g_dbgport_reads, g_dbgport_lines);
                 hype_debug_print("fw-1 RENDERHIST: calls=%llu pushes=%llu cells_drawn=%llu "
                                  "(full redraw would be %u cells/call) -- PERF-2\n",
                                  (unsigned long long)g_render_calls,
@@ -10163,11 +10185,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 uint8_t dbg_byte = 0;
                 int dr = vmm_handle_debug_port_ioio(kind, ctx, HYPE_FW_1_DEBUG_PORT, &dbg_byte);
                 if (dr == 0) {
+                    g_dbgport_writes++;
                     fw_1_debug_feed(&dbg_filter, dbg_line, &dbg_line_len, FW_1_LINE_BUF,
                                     dbg_byte);
                     continue;
                 }
                 if (dr == 1) {
+                    g_dbgport_reads++;
                     continue;
                 }
             }
