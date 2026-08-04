@@ -212,6 +212,16 @@ static unsigned long long g_hid_poll_errs;
  * bytes reached its keyboard driver, which is a different (and checkable) claim from
  * whatever the guest then does with them. */
 static unsigned long long g_sendkey_codes;
+/*
+ * #217: host keystrokes that reached the leader-chord/host-input layer, and how many
+ * became a recognised chord. Counted at the layer both the PS/2 and the USB HID keyboard
+ * feed, because they SHARE it by design -- a separate USB counter would invite the two
+ * paths to drift. "Reports arrived" and "keystrokes reached the layer that acts on them"
+ * are different claims, and on a machine whose only channel is a captured log the second
+ * one has to be measured rather than assumed.
+ */
+static unsigned long long g_hostkbd_scancodes;
+static unsigned long long g_hostkbd_chords;
 
 #ifndef HYPE_DIAG_PROBE_ONLY
 #define HYPE_DIAG_PROBE_ONLY 0
@@ -8022,7 +8032,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
                 unsigned kn = 0;
                 hype_chord_result_t cr = hype_host_input_feed(&hostin, sc, kb, sizeof(kb), &kn);
+                g_hostkbd_scancodes++;
                 if (cr.action != HYPE_CHORD_ACTION_NONE) {
+                    g_hostkbd_chords++;
                     hype_term_apply_chord(cr);
                 } else if (g_term_view >= 0) {
                     /* A VM is focused: typed bytes go to its console (COM1). */
@@ -8369,9 +8381,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
                 if (g_hid_ready) {
                     hype_debug_print("fw-1 DIAG: HID polls=%llu reports=%llu errors=%llu "
-                                     "(slot%u ep=0x%02x) [#217]\n",
+                                     "(slot%u ep=0x%02x) | host-kbd scancodes=%llu chords=%llu "
+                                     "[#217]\n",
                                      g_hid_polls, g_hid_reports, g_hid_poll_errs,
-                                     g_hid_slot, g_hid_ep);
+                                     g_hid_slot, g_hid_ep, g_hostkbd_scancodes,
+                                     g_hostkbd_chords);
                 }
                 {
                     const hype_virtio_blk_depth_t *qd = hype_virtio_blk_depth();
