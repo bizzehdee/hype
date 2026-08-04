@@ -21,9 +21,16 @@
  * masked off here since this project has no NMI model to disable);
  * port 0x71 reads/writes the selected register's own byte in a
  * 128-byte register file. This project only ever gives registers
- * 0x34/0x35 a meaningful value (the real memory-size fallback path);
- * every other register defaults to 0 (RTC time/date fields read as
- * midnight/day zero -- irrelevant to boot correctness, not modeled).
+ * 0x34/0x35 a meaningful value (the real memory-size fallback path).
+ *
+ * #286: the RTC half is NOT optional after all, and "irrelevant to boot correctness" was
+ * wrong. Register D's VRT bit ("RAM and time are valid") read back as 0 because every
+ * register defaulted to 0, and EDK2's PcRtc treats that as fatal: RtcWaitToUpdate()
+ * returns EFI_DEVICE_ERROR whenever VRT is clear, so EVERY RTC read failed. A release
+ * OVMF ignores the error and carries on; a DEBUG build turns it into
+ * `ASSERT_EFI_ERROR (Status = Device Error)` at PcRtcEntry.c:181 and dead-loops -- which
+ * is exactly why a DEBUG guest firmware never reached its console. A day-zero,
+ * month-zero date also fails PcRtc's own RtcTimeFieldsValid().
  */
 
 #define HYPE_CMOS_SIZE 128u
@@ -31,14 +38,68 @@
 #define HYPE_CMOS_REG_EXTMEM_LOW 0x34u
 #define HYPE_CMOS_REG_EXTMEM_HIGH 0x35u
 
+/* RTC time/date + status registers (standard MC146818 layout). */
+#define HYPE_CMOS_REG_SECONDS 0x00u
+#define HYPE_CMOS_REG_MINUTES 0x02u
+#define HYPE_CMOS_REG_HOURS 0x04u
+#define HYPE_CMOS_REG_DAY_OF_WEEK 0x06u
+#define HYPE_CMOS_REG_DAY 0x07u
+#define HYPE_CMOS_REG_MONTH 0x08u
+#define HYPE_CMOS_REG_YEAR 0x09u
+#define HYPE_CMOS_REG_STATUS_A 0x0Au
+#define HYPE_CMOS_REG_STATUS_B 0x0Bu
+#define HYPE_CMOS_REG_STATUS_C 0x0Cu
+#define HYPE_CMOS_REG_STATUS_D 0x0Du
+#define HYPE_CMOS_REG_CENTURY 0x32u
+
+/*
+ * Reset values for the status registers.
+ *
+ * A = 0x26: the conventional divider (010) + rate selector (0110), with UIP clear -- an
+ * update is never "in progress" here because the register file is only written between
+ * guest accesses, so a guest polling for UIP to clear always succeeds immediately.
+ *
+ * B = 0x02: 24-hour mode, BCD time (DM clear). BCD because that is what a real PC and
+ * QEMU default to, so guest firmware that skips reading register B still decodes
+ * correctly.
+ *
+ * D = 0x80: VRT set. See the header comment -- this single bit is what a DEBUG OVMF
+ * dead-loops on when it is clear.
+ */
+#define HYPE_CMOS_STATUS_A_RESET 0x26u
+#define HYPE_CMOS_STATUS_B_RESET 0x02u
+#define HYPE_CMOS_STATUS_D_RESET 0x80u
+#define HYPE_CMOS_STATUS_B_BINARY 0x04u /* DM: time is binary, not BCD */
+#define HYPE_CMOS_STATUS_B_24HOUR 0x02u
+
 typedef struct {
     uint8_t index;
     uint8_t registers[HYPE_CMOS_SIZE];
 } hype_cmos_t;
 
-/* Resets to index 0, every register 0. Call on every (re)start, same
- * convention as every other device model here. */
+/*
+ * Resets to index 0 and every register 0, EXCEPT the RTC status registers, which get the
+ * values above. Call on every (re)start, same convention as every other device model here.
+ *
+ * The status registers are not zeroed because zero is not a legal power-on state for them:
+ * VRT clear means "the time is not valid", and guest firmware is entitled to treat that as
+ * a broken RTC (EDK2 does, fatally, in a DEBUG build).
+ */
 void hype_cmos_reset(hype_cmos_t *cmos);
+
+/*
+ * Seed the RTC time/date registers, honouring register B's DM bit (BCD by default) and
+ * 24-hour bit. `year` is the full year; register 0x09 gets the two low digits and the
+ * century register 0x32 the rest, which is what firmware that reads a century register
+ * expects.
+ *
+ * Values are range-checked and a nonsensical date is REFUSED (returns -1) rather than
+ * written: month 0 or day 0 fails EDK2's own RtcTimeFieldsValid(), so writing one would
+ * reproduce the very failure this exists to prevent. Returns 0 on success.
+ */
+int hype_cmos_set_time(hype_cmos_t *cmos, unsigned int year, unsigned int month,
+                       unsigned int day, unsigned int hour, unsigned int minute,
+                       unsigned int second);
 
 /*
  * Populates registers 0x34/0x35 with `size_64kb_units` (the standard
@@ -57,8 +118,16 @@ void hype_cmos_index_write(hype_cmos_t *cmos, uint8_t value);
  * read. */
 uint8_t hype_cmos_data_read(const hype_cmos_t *cmos);
 
-/* Port 0x71 write: stores into the currently-selected register. Pure
- * struct mutation. */
+/*
+ * Port 0x71 write: stores into the currently-selected register, EXCEPT for the read-only
+ * status bits -- register D's VRT is preserved, register A's UIP is held clear, and
+ * register C is not writable at all. Pure struct mutation.
+ *
+ * #286: this is not pedantry. EDK2's PcRtcInit() writes 0 to register D and then requires
+ * VRT to still be set; a plain read/write model let the firmware destroy the bit it was
+ * about to check, which dead-looped a DEBUG OVMF and left a release one running on a clock
+ * it had been told was invalid.
+ */
 void hype_cmos_data_write(hype_cmos_t *cmos, uint8_t value);
 
 #endif /* HYPE_DEVICES_CMOS_H */

@@ -64,7 +64,168 @@ static void test_index_out_of_bounds_wraps_within_register_file(void) {
     CHECK_HEX("last register readable", 0x42u, hype_cmos_data_read(&cmos));
 }
 
+/* --- #286: the RTC status registers and the seeded clock --- */
+
+static void test_reset_leaves_a_legal_rtc_power_on_state(void) {
+    /*
+     * The bug this pins: every register reset to 0, so register D's VRT bit read back
+     * clear. EDK2's RtcWaitToUpdate() returns EFI_DEVICE_ERROR whenever VRT is clear, so
+     * every RTC read failed -- which a release OVMF ignores and a DEBUG build turns into
+     * ASSERT_EFI_ERROR at PcRtcEntry.c:181 and dead-loops on.
+     */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_D);
+    CHECK_HEX("register D has VRT set", HYPE_CMOS_STATUS_D_RESET, hype_cmos_data_read(&c));
+    CHECK_HEX("VRT bit specifically", 0x80u, hype_cmos_data_read(&c) & 0x80u);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_A);
+    CHECK_HEX("register A UIP clear", 0u, hype_cmos_data_read(&c) & 0x80u);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_B);
+    CHECK_HEX("register B 24-hour", HYPE_CMOS_STATUS_B_24HOUR,
+              hype_cmos_data_read(&c) & HYPE_CMOS_STATUS_B_24HOUR);
+    CHECK_HEX("register B BCD (DM clear)", 0u,
+              hype_cmos_data_read(&c) & HYPE_CMOS_STATUS_B_BINARY);
+    /* The memory-size registers are still zero -- reset must not invent those. */
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_EXTMEM_LOW);
+    CHECK_HEX("extmem low still zero", 0u, hype_cmos_data_read(&c));
+}
+
+static void test_set_time_writes_bcd_by_default(void) {
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    CHECK_HEX("set_time accepted", 0u,
+              (unsigned)hype_cmos_set_time(&c, 2026u, 8u, 4u, 7u, 21u, 23u));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_SECONDS);
+    CHECK_HEX("seconds 23 -> 0x23", 0x23u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_MINUTES);
+    CHECK_HEX("minutes 21 -> 0x21", 0x21u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_HOURS);
+    CHECK_HEX("hours 7 -> 0x07", 0x07u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_DAY);
+    CHECK_HEX("day 4 -> 0x04", 0x04u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_MONTH);
+    CHECK_HEX("month 8 -> 0x08", 0x08u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_YEAR);
+    CHECK_HEX("year 2026 -> 0x26", 0x26u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_CENTURY);
+    CHECK_HEX("century 20 -> 0x20", 0x20u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_DAY_OF_WEEK);
+    CHECK_HEX("day-of-week is never 0", 1u, hype_cmos_data_read(&c));
+}
+
+static void test_set_time_honours_the_binary_mode_bit(void) {
+    /* A guest that sets DM before reading expects binary, and writing BCD there would
+     * hand it a date like "0x26" read as 38. */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_B);
+    hype_cmos_data_write(&c, HYPE_CMOS_STATUS_B_RESET | HYPE_CMOS_STATUS_B_BINARY);
+    CHECK_HEX("set_time accepted", 0u,
+              (unsigned)hype_cmos_set_time(&c, 2026u, 12u, 31u, 23u, 59u, 58u));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_SECONDS);
+    CHECK_HEX("seconds binary", 58u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_MONTH);
+    CHECK_HEX("month binary", 12u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_YEAR);
+    CHECK_HEX("year binary", 26u, hype_cmos_data_read(&c));
+}
+
+static void test_set_time_refuses_an_invalid_date(void) {
+    /*
+     * Refused, not clamped: month 0 and day 0 are exactly what EDK2's
+     * RtcTimeFieldsValid() rejects, so writing a corrected-looking date would reproduce
+     * the failure this function exists to prevent, and silently.
+     */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    CHECK_HEX("month 0 refused", (unsigned)-1,
+              (unsigned)hype_cmos_set_time(&c, 2026u, 0u, 4u, 0u, 0u, 0u));
+    CHECK_HEX("day 0 refused", (unsigned)-1,
+              (unsigned)hype_cmos_set_time(&c, 2026u, 8u, 0u, 0u, 0u, 0u));
+    CHECK_HEX("month 13 refused", (unsigned)-1,
+              (unsigned)hype_cmos_set_time(&c, 2026u, 13u, 1u, 0u, 0u, 0u));
+    CHECK_HEX("hour 24 refused", (unsigned)-1,
+              (unsigned)hype_cmos_set_time(&c, 2026u, 8u, 4u, 24u, 0u, 0u));
+    CHECK_HEX("second 60 refused", (unsigned)-1,
+              (unsigned)hype_cmos_set_time(&c, 2026u, 8u, 4u, 0u, 0u, 60u));
+    CHECK_HEX("year 1979 refused", (unsigned)-1,
+              (unsigned)hype_cmos_set_time(&c, 1979u, 8u, 4u, 0u, 0u, 0u));
+    CHECK_HEX("NULL refused", (unsigned)-1,
+              (unsigned)hype_cmos_set_time(0, 2026u, 8u, 4u, 0u, 0u, 0u));
+    /* A refusal leaves the registers alone rather than half-written. */
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_MONTH);
+    CHECK_HEX("month untouched by a refusal", 0u, hype_cmos_data_read(&c));
+}
+
+static void test_register_d_vrt_survives_a_guest_write(void) {
+    /*
+     * The exact sequence EDK2's PcRtcInit() performs: write register D with
+     * PcdInitialValueRtcRegisterD (0), then require VRT to still be set. On real hardware
+     * VRT is read-only -- it reflects whether the CMOS battery kept the time valid. With a
+     * plain read/write model the firmware destroyed the bit it was about to check,
+     * RtcWaitToUpdate returned EFI_DEVICE_ERROR, and a DEBUG OVMF dead-looped at
+     * PcRtcEntry.c:181.
+     */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_D);
+    hype_cmos_data_write(&c, 0x00u);
+    CHECK_HEX("VRT survives a write of 0", 0x80u, hype_cmos_data_read(&c) & 0x80u);
+    /* And a guest cannot set the reserved bits either. */
+    hype_cmos_data_write(&c, 0xFFu);
+    CHECK_HEX("reserved bits stay clear", HYPE_CMOS_STATUS_D_RESET, hype_cmos_data_read(&c));
+}
+
+static void test_register_a_uip_is_held_clear(void) {
+    /* A guest that could set UIP would then poll forever for its own bit to clear. */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_A);
+    hype_cmos_data_write(&c, 0xFFu);
+    CHECK_HEX("UIP held clear", 0u, hype_cmos_data_read(&c) & 0x80u);
+    CHECK_HEX("the writable divider/rate bits still take", 0x7Fu, hype_cmos_data_read(&c));
+}
+
+static void test_register_c_is_read_only(void) {
+    /* Interrupt flags are set by the device, never by software -- a writable register C
+     * would let a guest invent RTC interrupts for itself. */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_C);
+    hype_cmos_data_write(&c, 0xF0u);
+    CHECK_HEX("register C ignored the write", 0u, hype_cmos_data_read(&c));
+}
+
+static void test_ordinary_registers_are_still_writable(void) {
+    /* The read-only handling must not have made the whole file read-only -- the
+     * memory-size fallback registers this model exists for are plain storage. */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_EXTMEM_LOW);
+    hype_cmos_data_write(&c, 0xA5u);
+    CHECK_HEX("extmem low writable", 0xA5u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_B);
+    hype_cmos_data_write(&c, 0x06u);
+    CHECK_HEX("register B writable", 0x06u, hype_cmos_data_read(&c));
+}
+
 int main(void) {
+    test_register_d_vrt_survives_a_guest_write();
+    test_register_a_uip_is_held_clear();
+    test_register_c_is_read_only();
+    test_ordinary_registers_are_still_writable();
+    test_reset_leaves_a_legal_rtc_power_on_state();
+    test_set_time_writes_bcd_by_default();
+    test_set_time_honours_the_binary_mode_bit();
+    test_set_time_refuses_an_invalid_date();
     test_reset_is_all_zero();
     test_index_write_masks_nmi_disable_bit();
     test_data_read_write_roundtrip();

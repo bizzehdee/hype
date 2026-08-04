@@ -1096,10 +1096,38 @@ static int bot_scsi_once(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci
  * wrote a CBW into a sector. If the retry fails too the error surfaces to the
  * caller (visible, not silent: blk_usb -> log sink -> reported once).
  */
+/*
+ * #289: fault injection, off by default. Set to N to make the Nth SCSI command behave as
+ * though its transfer was lost, forcing bot_recover() to run on a LIVE datapath and letting
+ * the existing "post-recovery retry SUCCEEDED/FAILED" line answer the ticket's actual
+ * question -- does Stop -> Reset -> Set TR Dequeue -> BOT reset return the endpoint to a
+ * usable state?
+ *
+ * This does not reproduce the AMD controller's late-completion behaviour, which is what
+ * TRIGGERED recovery on real hardware; it exercises the recovery path itself, which is the
+ * part that can be tested anywhere. The trigger belongs with a hardware run.
+ */
+#ifndef HYPE_XHCI_BOT_RECOVER_SELFTEST
+#define HYPE_XHCI_BOT_RECOVER_SELFTEST 0
+#endif
+
 static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                     const uint8_t *cdb, unsigned int cdb_len, uint8_t *data, unsigned int data_len,
                     int dir_in) {
-    if (bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in) == 0) {
+    int forced_fail = 0;
+
+#if HYPE_XHCI_BOT_RECOVER_SELFTEST
+    {
+        static unsigned int seen = 0;
+        seen++;
+        if (seen == (unsigned int)HYPE_XHCI_BOT_RECOVER_SELFTEST) {
+            forced_fail = 1;
+            hype_debug_print("host-xhci: #289 SELFTEST -- treating SCSI command %u as a lost "
+                             "transfer so bot_recover() runs on a live datapath\n", seen);
+        }
+    }
+#endif
+    if (!forced_fail && bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in) == 0) {
         return 0;
     }
     if (bot_recover(c, slot, msc) != 0) {

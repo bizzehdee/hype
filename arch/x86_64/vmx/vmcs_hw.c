@@ -3088,23 +3088,46 @@ int hype_vmx_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
  * OVMF probes for before enabling the channel.
  */
 int hype_vmx_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port,
-                                         uint8_t *out_byte) {
+                                         const hype_gpa_map_t *dma_map, uint8_t *out_bytes,
+                                         unsigned int out_cap, unsigned int *out_n) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_vmm_ioio_t io;
-    int is_write;
 
+    (void)dma_map;
+    if (out_bytes == 0 || out_n == 0 || out_cap == 0u) {
+        return -1;
+    }
+    *out_n = 0;
     vmx_decode_ioio(&io);
     if (io.port != base_port) {
         return -1;
     }
-    is_write = !io.is_in;
     if (io.is_in) {
         real->gprs[0] = (real->gprs[0] & ~0xFFULL) | 0xE9u;
-    } else {
-        *out_byte = (uint8_t)(real->gprs[0] & 0xFFu);
+        vmx_advance_rip();
+        return 1;
     }
+    if (io.is_string) {
+        /*
+         * #286: NOT emulated here, and said out loud once rather than silently producing a
+         * garbage byte. The SVM side reads the string from guest memory; doing the same on
+         * VMX needs an EPT-aware translation this backend does not yet have (#236). The
+         * instruction is still retired so the guest makes progress -- losing diagnostic
+         * text is acceptable, wedging the firmware is not.
+         */
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            hype_debug_print("host-vmx: debug-port string I/O (rep outs) is not emulated on VMX -- "
+                             "guest DEBUG output is dropped, not corrupted [#286]\n");
+        }
+        vmx_advance_rip();
+        return 0;
+    }
+    out_bytes[0] = (uint8_t)(real->gprs[0] & 0xFFu);
+    *out_n = 1u;
     vmx_advance_rip();
-    return is_write ? 0 : 1;
+    return 0;
 }
 
 /*

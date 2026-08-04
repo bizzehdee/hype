@@ -976,7 +976,19 @@ int hype_svm_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart
  * *out_byte), 1 if it was a read (handled, nothing to forward), or -1
  * if the port wasn't `base_port`. Advances RIP when handled.
  */
-int hype_svm_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port, uint8_t *out_byte);
+/*
+ * #286: returns 0 when the guest WROTE to the debug port, with *out_n bytes placed in
+ * out_bytes; 1 for a read (the presence signature is answered internally); -1 when the
+ * exit is not this port.
+ *
+ * A buffer rather than one byte because EDK2's PlatformDebugLibIoPort emits its DEBUG text
+ * with `rep outsb` -- the data lives in guest memory at DS:RSI, so ONE exit carries a whole
+ * string. `dma_map` is the guest's bounds-checked translation (VALID-1); a range outside it
+ * is refused rather than read out of host memory.
+ */
+int hype_svm_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port,
+                                         const hype_gpa_map_t *dma_map, uint8_t *out_bytes,
+                                         unsigned int out_cap, unsigned int *out_n);
 
 /* FW-1g: enable/disable per-access tracing of guest 0x60/0x64 (PS/2)
  * accesses in hype_svm_vcpu_handle_ps2_ioio (default off). FW-1 turns it

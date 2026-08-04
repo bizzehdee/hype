@@ -7,6 +7,58 @@ void hype_cmos_reset(hype_cmos_t *cmos) {
     for (i = 0; i < HYPE_CMOS_SIZE; i++) {
         cmos->registers[i] = 0;
     }
+    /* #286: zero is not a legal power-on state for these -- see cmos.h. */
+    cmos->registers[HYPE_CMOS_REG_STATUS_A] = HYPE_CMOS_STATUS_A_RESET;
+    cmos->registers[HYPE_CMOS_REG_STATUS_B] = HYPE_CMOS_STATUS_B_RESET;
+    cmos->registers[HYPE_CMOS_REG_STATUS_D] = HYPE_CMOS_STATUS_D_RESET;
+}
+
+/* Binary -> BCD for one two-digit field. */
+static uint8_t bin_to_bcd(unsigned int v) {
+    return (uint8_t)(((v / 10u) << 4) | (v % 10u));
+}
+
+int hype_cmos_set_time(hype_cmos_t *cmos, unsigned int year, unsigned int month,
+                       unsigned int day, unsigned int hour, unsigned int minute,
+                       unsigned int second) {
+    int binary;
+
+    if (cmos == 0) {
+        return -1;
+    }
+    /*
+     * Refused rather than clamped. A month or day of 0 fails EDK2's RtcTimeFieldsValid()
+     * and is what made a DEBUG OVMF dead-loop, so writing a nonsense date here would
+     * reproduce the bug this function exists to fix -- and a silently corrected date is
+     * worse than a caller that learns its clock read failed.
+     */
+    if (year < 1980u || year > 2099u || month < 1u || month > 12u || day < 1u || day > 31u ||
+        hour > 23u || minute > 59u || second > 59u) {
+        return -1;
+    }
+    binary = (cmos->registers[HYPE_CMOS_REG_STATUS_B] & HYPE_CMOS_STATUS_B_BINARY) != 0;
+
+    if (binary) {
+        cmos->registers[HYPE_CMOS_REG_SECONDS] = (uint8_t)second;
+        cmos->registers[HYPE_CMOS_REG_MINUTES] = (uint8_t)minute;
+        cmos->registers[HYPE_CMOS_REG_HOURS] = (uint8_t)hour;
+        cmos->registers[HYPE_CMOS_REG_DAY] = (uint8_t)day;
+        cmos->registers[HYPE_CMOS_REG_MONTH] = (uint8_t)month;
+        cmos->registers[HYPE_CMOS_REG_YEAR] = (uint8_t)(year % 100u);
+        cmos->registers[HYPE_CMOS_REG_CENTURY] = (uint8_t)(year / 100u);
+    } else {
+        cmos->registers[HYPE_CMOS_REG_SECONDS] = bin_to_bcd(second);
+        cmos->registers[HYPE_CMOS_REG_MINUTES] = bin_to_bcd(minute);
+        cmos->registers[HYPE_CMOS_REG_HOURS] = bin_to_bcd(hour);
+        cmos->registers[HYPE_CMOS_REG_DAY] = bin_to_bcd(day);
+        cmos->registers[HYPE_CMOS_REG_MONTH] = bin_to_bcd(month);
+        cmos->registers[HYPE_CMOS_REG_YEAR] = bin_to_bcd(year % 100u);
+        cmos->registers[HYPE_CMOS_REG_CENTURY] = bin_to_bcd(year / 100u);
+    }
+    /* Day-of-week is 1-based with Sunday = 1. Nothing in this project's scope reads it,
+     * but a zero there is another "invalid" a validator can trip on. */
+    cmos->registers[HYPE_CMOS_REG_DAY_OF_WEEK] = 1u;
+    return 0;
 }
 
 void hype_cmos_set_extended_memory_above_16mb(hype_cmos_t *cmos, uint16_t size_64kb_units) {
@@ -23,5 +75,40 @@ uint8_t hype_cmos_data_read(const hype_cmos_t *cmos) {
 }
 
 void hype_cmos_data_write(hype_cmos_t *cmos, uint8_t value) {
-    cmos->registers[cmos->index] = value;
+    /*
+     * #286: some RTC status bits are READ-ONLY on real hardware, and treating the whole
+     * register file as plain storage is what stopped a DEBUG OVMF from booting.
+     *
+     * EDK2's PcRtcInit() does exactly this, in this order:
+     *
+     *     RtcWrite (RTC_ADDRESS_REGISTER_D, PcdInitialValueRtcRegisterD);  // 0x00
+     *     Status = RtcWaitToUpdate (...);   // requires RegisterD.Bits.Vrt != 0
+     *
+     * On a real MC146818 that write cannot clear VRT -- the bit reflects whether the CMOS
+     * battery has kept the time valid, and it is read-only. With a read/write model the
+     * firmware destroyed the very bit it was about to require, RtcWaitToUpdate returned
+     * EFI_DEVICE_ERROR, and PcRtcEntry.c:181's ASSERT_EFI_ERROR dead-looped the DEBUG
+     * build. A release build takes the same error and carries on -- so its RTC was quietly
+     * broken too, and every guest EFI GetTime() was answering from a dead clock.
+     */
+    switch (cmos->index) {
+        case HYPE_CMOS_REG_STATUS_A:
+            /* UIP (bit 7) is set by the update cycle, not by software. Held clear: the
+             * register file is only touched between guest accesses, so an update is never
+             * genuinely in progress and a guest polling for it always makes progress. */
+            cmos->registers[cmos->index] = (uint8_t)(value & 0x7Fu);
+            return;
+        case HYPE_CMOS_REG_STATUS_C:
+            /* Interrupt-flags register: read-only, and cleared by reading. Nothing to
+             * store, and letting a guest set flags would invent interrupts. */
+            return;
+        case HYPE_CMOS_REG_STATUS_D:
+            /* VRT preserved; everything else is reserved and reads 0. */
+            cmos->registers[cmos->index] =
+                (uint8_t)(cmos->registers[cmos->index] & HYPE_CMOS_STATUS_D_RESET);
+            return;
+        default:
+            cmos->registers[cmos->index] = value;
+            return;
+    }
 }

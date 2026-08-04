@@ -214,7 +214,8 @@ int hype_vmx_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint1
                                       int *slp_en);
 int hype_vmx_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci);
 int hype_vmx_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port,
-                                         uint8_t *out_byte);
+                                         const hype_gpa_map_t *dma_map, uint8_t *out_bytes,
+                                         unsigned int out_cap, unsigned int *out_n);
 int hype_vmx_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx);
 
 int hype_vmx_vcpu_exit_exception_vector(hype_vcpu_ctx_t *ctx);

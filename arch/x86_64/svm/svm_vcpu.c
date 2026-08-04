@@ -2389,27 +2389,78 @@ int hype_svm_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ah
                                          guest_insn_bytes);
 }
 
-int hype_svm_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port, uint8_t *out_byte) {
+int hype_svm_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port,
+                                         const hype_gpa_map_t *dma_map, uint8_t *out_bytes,
+                                         unsigned int out_cap, unsigned int *out_n) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_ioio_t io;
-    int is_write;
 
+    if (out_bytes == 0 || out_n == 0 || out_cap == 0u) {
+        return -1;
+    }
+    *out_n = 0;
     hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
     if (io.port != base_port) {
         return -1;
     }
 
-    is_write = !io.is_in;
     if (io.is_in) {
         /* 0xE9 = the QEMU/bochs debug-port presence signature OVMF's
          * PlatformDebugLibIoPort checks before enabling the channel. */
         real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | 0xE9u;
+        real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+        return 1;
+    }
+
+    /*
+     * #286: OUTS/`rep outsb`, not a byte in AL.
+     *
+     * EDK2's PlatformDebugLibIoPort writes its DEBUG text with IoWriteFifo8(), which
+     * compiles to `rep outsb` -- so the data lives in guest memory at DS:RSI, not in RAX.
+     * Taking RAX's low byte gave one unrelated byte per exit and discarded the string,
+     * which is why a DEBUG firmware produced 13,900 port writes and not one readable line:
+     * every byte failed the printable-ASCII filter and was dropped. Same shape as the
+     * fw_cfg string-IN bug SVM-STRIO (#104) fixed, in the other direction.
+     */
+    if (io.is_string) {
+        hype_svm_string_io_plan_t plan;
+        uint64_t host;
+        uint64_t u;
+
+        if (hype_svm_build_string_io_plan(&io, real->gprs[6] /* RSI */, real->gprs[1] /* RCX */,
+                                          real->vmcb->save.ds.base, real->vmcb->save.rflags,
+                                          &plan) != 0) {
+            return -1;
+        }
+        if (plan.byte_count != 0u) {
+            host = guest_dma_xlate(dma_map, plan.low_gpa, plan.byte_count);
+            if (host == 0) {
+                return -1; /* guest buffer out of range -- reject, never read host memory */
+            }
+            for (u = 0; u < plan.count && *out_n < out_cap; u++) {
+                uint64_t addr = plan.descending
+                                    ? (plan.start_gpa - u * (uint64_t)plan.unit_bytes)
+                                    : (plan.start_gpa + u * (uint64_t)plan.unit_bytes);
+                uint64_t off = addr - plan.low_gpa;
+                uint8_t b;
+                for (b = 0; b < plan.unit_bytes && *out_n < out_cap; b++) {
+                    out_bytes[(*out_n)++] = ((const uint8_t *)(uintptr_t)host)[off + b];
+                }
+            }
+        }
+        /* The whole transfer is consumed whether or not it fitted the caller's buffer:
+         * this is a diagnostic sink, and leaving RCX/RSI mid-string would have the guest
+         * re-issue bytes hype already took. A truncated line is visible; a desynchronised
+         * rep would corrupt the firmware's own state. */
+        real->gprs[6] = plan.new_index_reg; /* RSI */
+        real->gprs[1] = plan.new_count_reg; /* RCX */
     } else {
-        *out_byte = (uint8_t)(real->vmcb->save.rax & 0xFFu);
+        out_bytes[0] = (uint8_t)(real->vmcb->save.rax & 0xFFu);
+        *out_n = 1u;
     }
 
     real->vmcb->save.rip = real->vmcb->control.exitinfo2;
-    return is_write ? 0 : 1;
+    return 0;
 }
 
 int hype_svm_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart, uint16_t base_port) {

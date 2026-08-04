@@ -247,6 +247,7 @@ static unsigned long long g_sendkey_codes;
 static unsigned long long g_dbgport_writes;
 static unsigned long long g_dbgport_reads;
 static unsigned long long g_dbgport_lines;
+static unsigned long long g_dbgport_bytes; /* #286: bytes extracted, which a string op makes != writes */
 static unsigned long long g_hostkbd_scancodes;
 static unsigned long long g_hostkbd_chords;
 
@@ -3567,10 +3568,13 @@ static int vmm_handle_pci_cf8_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, h
                                      : hype_svm_vcpu_handle_pci_cf8_ioio(ctx, pci);
 }
 static int vmm_handle_debug_port_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t base_port,
-                                      uint8_t *out_byte) {
+                                      const hype_gpa_map_t *dma_map, uint8_t *out_bytes,
+                                      unsigned int out_cap, unsigned int *out_n) {
     return kind == HYPE_VMM_KIND_VMX
-               ? hype_vmx_vcpu_handle_debug_port_ioio(ctx, base_port, out_byte)
-               : hype_svm_vcpu_handle_debug_port_ioio(ctx, base_port, out_byte);
+               ? hype_vmx_vcpu_handle_debug_port_ioio(ctx, base_port, dma_map, out_bytes, out_cap,
+                                                      out_n)
+               : hype_svm_vcpu_handle_debug_port_ioio(ctx, base_port, dma_map, out_bytes, out_cap,
+                                                      out_n);
 }
 static int vmm_handle_acpi_pm_timer_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
     return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_acpi_pm_timer_ioio(ctx)
@@ -7471,6 +7475,17 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
         if (units_64kb > 0xFFFFULL) units_64kb = 0xFFFFULL;
         hype_cmos_reset(&g_fw_1_cmos);
         hype_cmos_set_extended_memory_above_16mb(&g_fw_1_cmos, (uint16_t)units_64kb);
+        /*
+         * #286: give the guest a real date. The registers reset to a legal power-on state
+         * (VRT set), but a day-zero month-zero date still fails EDK2's own
+         * RtcTimeFieldsValid(), and hype already knows the wall clock -- so hand it over
+         * rather than leaving the guest to invent one.
+         */
+        if (g_host_time_valid) {
+            (void)hype_cmos_set_time(&g_fw_1_cmos, g_host_time.year, g_host_time.month,
+                                     g_host_time.day, g_host_time.hour, g_host_time.minute,
+                                     g_host_time.second);
+        }
     }
 
     vmm_reset_realmode(kind, ctx, reset_cs_base, stack_top, npt_root_phys);
@@ -7768,6 +7783,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
         hype_cmos_reset(&g_fw_1_cmos);
         hype_cmos_set_extended_memory_above_16mb(&g_fw_1_cmos, (uint16_t)units_64kb);
+        /*
+         * #286: give the guest a real date. The registers reset to a legal power-on state
+         * (VRT set), but a day-zero month-zero date still fails EDK2's own
+         * RtcTimeFieldsValid(), and hype already knows the wall clock -- so hand it over
+         * rather than leaving the guest to invent one.
+         */
+        if (g_host_time_valid) {
+            (void)hype_cmos_set_time(&g_fw_1_cmos, g_host_time.year, g_host_time.month,
+                                     g_host_time.day, g_host_time.hour, g_host_time.minute,
+                                     g_host_time.second);
+        }
     }
 
     /* Real x86 reset state is CS.base=0xFFFF0000, RIP=0xFFF0 -- NOT
@@ -8365,9 +8391,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * (the 0x402 handler never reached), so it must not be suppressed by a
                      * "nothing to report" guard.
                      */
-                    hype_debug_print("fw-1 OVMF-DBGPORT: writes=%llu reads=%llu lines=%llu "
-                                     "[#286]\n",
-                                     g_dbgport_writes, g_dbgport_reads, g_dbgport_lines);
+                    hype_debug_print("fw-1 OVMF-DBGPORT: writes=%llu bytes=%llu reads=%llu "
+                                     "lines=%llu [#286]\n",
+                                     g_dbgport_writes, g_dbgport_bytes, g_dbgport_reads,
+                                     g_dbgport_lines);
                     int off = hype_snprintf(hline, sizeof(hline), "fw-1 IOHIST vm%u total=%llu:",
                                             (unsigned)(vm - g_vms),
                                             (unsigned long long)hype_io_hist_total(
@@ -10212,12 +10239,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * log to hype's console (only active in a DEBUG OVMF build;
              * harmless otherwise). */
             {
-                uint8_t dbg_byte = 0;
-                int dr = vmm_handle_debug_port_ioio(kind, ctx, HYPE_FW_1_DEBUG_PORT, &dbg_byte);
+                /* #286: one exit can carry a whole string (`rep outsb`), so this takes a
+                 * buffer. 256 covers a DEBUG line; a longer transfer is consumed and
+                 * truncated rather than left half-done, which would desynchronise the
+                 * guest's own rep. */
+                static uint8_t dbg_bytes[256];
+                unsigned int dbg_n = 0;
+                int dr = vmm_handle_debug_port_ioio(kind, ctx, HYPE_FW_1_DEBUG_PORT,
+                                                    &g_fw_1_dma_map, dbg_bytes,
+                                                    (unsigned)sizeof(dbg_bytes), &dbg_n);
                 if (dr == 0) {
+                    unsigned int dbi;
                     g_dbgport_writes++;
-                    fw_1_debug_feed(&dbg_filter, dbg_line, &dbg_line_len, FW_1_LINE_BUF,
-                                    dbg_byte);
+                    g_dbgport_bytes += dbg_n;
+                    for (dbi = 0; dbi < dbg_n; dbi++) {
+                        fw_1_debug_feed(&dbg_filter, dbg_line, &dbg_line_len, FW_1_LINE_BUF,
+                                        dbg_bytes[dbi]);
+                    }
                     continue;
                 }
                 if (dr == 1) {
