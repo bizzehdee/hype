@@ -11,7 +11,7 @@ install-to-physical-disk path end to end.
 ./run-boot-installed.sh     # bare QEMU: boot the result, no CD, fresh vars
 ```
 
-Artifacts land in `$HYPE_228_BUILD` (default `~/Downloads/hype-228-build`).
+Artifacts land in `$HYPE_228_BUILD` (default `disk-images/hype-228-build`).
 Do **not** put them in a scratchpad — an earlier set was lost to cleanup.
 
 ## Validated (bare QEMU, 2026-07-30)

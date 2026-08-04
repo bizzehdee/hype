@@ -51,3 +51,13 @@ core/tests/test_*
 # FW-1g: locally-built DEBUG guest firmware (regenerate with FW_TARGET=DEBUG tools/build-fw.sh)
 fw/OVMF_CODE.debug.fd
 fw/OVMF_VARS.debug.fd
+
+# Disk images and installer media -- every image, base or modified, lives here
+# (disk-images/). None of it is source: the base ISOs are upstream downloads and
+# the rest are regenerable ESP/scratch images built by tools/ and the QEMU rigs.
+#
+# Deliberately one directory rather than scattered: these are multi-GB files, and
+# keeping them off /tmp matters because /tmp is a tmpfs -- RAM that a guest's own
+# -m allocation needs. A 2 GB ESP image there competes with the VM it is meant to
+# boot, and filling it takes the whole shell down with it.
+disk-images/

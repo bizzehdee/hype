@@ -12,8 +12,12 @@
 # tried and is NOT what fixes the modloop problem -- see autoinstall.start.
 set -euo pipefail
 
-B=${HYPE_228_BUILD:-$HOME/Downloads/hype-228-build}
-BASE=${HYPE_228_BASE_ISO:-$HOME/Downloads/alpine-standard-3.21.7-x86_64.iso}
+# Every image -- base ISOs and everything built from them -- lives in one place:
+# <repo>/disk-images, gitignored. Kept off /tmp deliberately, because /tmp is a
+# tmpfs and a multi-GB image there eats the RAM a guest's own -m allocation needs.
+HYPE_DISK_IMAGES=${HYPE_DISK_IMAGES:-$(cd "$(dirname "$0")/../.." && pwd)/disk-images}
+B=${HYPE_228_BUILD:-$HYPE_DISK_IMAGES/hype-228-build}
+BASE=${HYPE_228_BASE_ISO:-$HYPE_DISK_IMAGES/alpine-standard-3.21.7-x86_64.iso}
 OUT=${HYPE_228_OUT_ISO:-$B/alpine-hype-228.iso}
 HERE=$(cd "$(dirname "$0")" && pwd)
 

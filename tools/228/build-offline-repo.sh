@@ -6,7 +6,11 @@
 #  - the repo needs BOTH x86_64/ and noarch/ subdirs: apk fetches A:noarch
 #    packages from <repo>/noarch/, not from <repo>/x86_64/.
 set -euo pipefail
-B=${HYPE_228_BUILD:-$HOME/Downloads/hype-228-build}
+# Every image -- base ISOs and everything built from them -- lives in one place:
+# <repo>/disk-images, gitignored. Kept off /tmp deliberately, because /tmp is a
+# tmpfs and a multi-GB image there eats the RAM a guest's own -m allocation needs.
+HYPE_DISK_IMAGES=${HYPE_DISK_IMAGES:-$(cd "$(dirname "$0")/../.." && pwd)/disk-images}
+B=${HYPE_228_BUILD:-$HYPE_DISK_IMAGES/hype-228-build}
 REPO=$B/apks-hype
 rm -rf "$REPO"; mkdir -p "$REPO/x86_64" "$REPO/noarch"
 

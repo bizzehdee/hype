@@ -70,7 +70,7 @@ fault:
   initialised in `setup_arch()`, i.e. *after* these faults, so it can never show them.
   earlycon is honoured earlier and produced full oopses with call traces.
 - **`nokaslr`** pins the kernel base so a RIP is directly readable.
-- ISO kept at `~/Downloads/alpine-hype-earlycon.iso`; rebuild recipe is
+- ISO kept at `disk-images/alpine-hype-earlycon.iso`; rebuild recipe is
   `xorriso -indev X -outdev Y -boot_image any replay -map cfg /boot/grub/grub.cfg -commit`
   (the `replay` is what preserves El Torito/EFI bootability).
 - `test.iso` in the bisect dir is the STANDARD image; swap deliberately and `mv` it back
@@ -102,7 +102,7 @@ Everything below is observation-driven. Do not attempt any of it without hardwar
 last five fixes came from reading guest oopses, not from reasoning about VMX.
 
 ### Resume here (exact steps)
-1. `cp ~/Downloads/alpine-hype-earlycon.iso /mnt/data/hype-bisect/test.iso`
+1. `cp disk-images/alpine-hype-earlycon.iso /mnt/data/hype-bisect/test.iso`
    (first `mv` the existing `test.iso` aside — do NOT overwrite, it has ~47 hard links).
 2. `intel-probe.sh <label> "-DHYPE_RUN_SELFTEST_GUESTS=1 -DHYPE_VMX_SMOKE_TEST=1 \
     -DHYPE_FW_1_GUEST_RAM_MB=1024 -DHYPE_RUN_TWO_VMS=0"`
