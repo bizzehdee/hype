@@ -2215,6 +2215,32 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
         if (hype_ahci_mmio_read(ahci, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
+        /*
+         * #311: what hype hands back for the two registers FreeBSD's completion path hinges on.
+         * Having read the driver source, ahci_ch_intr_main() computes
+         *   cstatus = PxSACT (only when NCQ slots exist) | PxCI
+         *   ok      = ch->rslots & ~cstatus
+         * and calls ahci_end_transaction(ERR_NONE) -> CAM_REQ_CMP for every bit in ok. A timeout
+         * is therefore only reachable if cstatus still holds the slot bit when the ISR reads it.
+         * These are the reads that decide it.
+         */
+        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI ||
+            offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS ||
+            offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_SACT) {
+            static unsigned int rd_n = 0;
+            static unsigned int rd_total = 0;
+            rd_total++;
+            if (rd_n < 30u) {
+                rd_n++;
+                hype_debug_print("fw-1 RD#%02u off=0x%x -> 0x%x (p_ci=0x%x p_is=0x%x p_sact=0x%x)\n",
+                                 rd_n, (unsigned int)offset, (unsigned int)value,
+                                 (unsigned int)ahci->p_ci, (unsigned int)ahci->p_is,
+                                 (unsigned int)ahci->p_sact);
+            }
+            if (rd_total == 100u || rd_total == 1000u) {
+                hype_debug_print("fw-1 RD-TOTAL=%u\n", rd_total);
+            }
+        }
         if (g_ahci_trace) {
             hype_debug_print("ahci-trace: ABAR read  off=0x%x val=0x%x\n", (unsigned int)offset,
                               (unsigned int)value);
