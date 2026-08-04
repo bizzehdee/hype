@@ -31,6 +31,44 @@
  * project doesn't recognize is not safe to approximate.
  */
 
+/*
+ * #305: which operation the instruction performs on the memory operand.
+ *
+ * MOV is the original behaviour and sets no flags. The rest are the memory-SOURCE ALU
+ * group, which hype needs because FreeBSD reads LAPIC registers with them rather than with
+ * MOV: its Spurious Interrupt Vector read is `and edx, dword [rcx+0xf0]`, and hype used to
+ * panic on it as undecodable. Linux happens to use MOV for the same registers, which is
+ * why this went unnoticed.
+ *
+ * CMP and TEST compute flags and write NO register -- see hype_mmio_alu_writes_reg().
+ */
+typedef enum {
+    HYPE_MMIO_ALU_MOV = 0,
+    HYPE_MMIO_ALU_ADD,
+    HYPE_MMIO_ALU_OR,
+    HYPE_MMIO_ALU_AND,
+    HYPE_MMIO_ALU_SUB,
+    HYPE_MMIO_ALU_XOR,
+    HYPE_MMIO_ALU_CMP,
+    HYPE_MMIO_ALU_TEST
+} hype_mmio_alu_op_t;
+
+/* 1 if `op` writes its destination register; 0 for the compare-only forms. */
+int hype_mmio_alu_writes_reg(hype_mmio_alu_op_t op);
+
+/*
+ * Apply `op` to (dst_value, mem_value) at `size_bytes`, returning the result and updating
+ * `*rflags` in place.
+ *
+ * The flags are the point, and why this is a separate pure function rather than inline in
+ * the NPF handler: emulating the value but not the flags would leave the guest's next
+ * conditional branch reading stale ones -- a silent wrong branch, which is worse than the
+ * honest panic this replaces. Per Intel/AMD: the bitwise ops clear CF and OF and leave AF
+ * undefined (so AF is left alone here); the arithmetic ops set all six.
+ */
+uint32_t hype_mmio_alu_apply(hype_mmio_alu_op_t op, uint32_t dst_value, uint32_t mem_value,
+                             uint8_t size_bytes, uint64_t *rflags);
+
 typedef struct {
     int is_write;       /* 1 = register -> memory (store), 0 = memory -> register (load) */
     uint8_t size_bytes; /* 1, 2, or 4 */
@@ -47,6 +85,8 @@ typedef struct {
      * advances the guest's RIP by exactly this much to resume just
      * past the emulated access. */
     uint8_t instr_len;
+    /* #305: MOV unless the instruction was one of the memory-source ALU forms. */
+    hype_mmio_alu_op_t op;
 } hype_mmio_decode_t;
 
 /*

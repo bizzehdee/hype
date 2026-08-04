@@ -2681,7 +2681,34 @@ int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
         if (hype_guest_lapic_read(lapic, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        if (decoded.op == HYPE_MMIO_ALU_MOV) {
+            *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes,
+                                              decoded.zero_extend);
+        } else {
+            /*
+             * #305: an ALU form with the LAPIC register as its memory SOURCE. FreeBSD
+             * reads the Spurious Interrupt Vector this way -- `and edx, [rcx+0xf0]` --
+             * where Linux uses a plain MOV, which is why hype only ever needed MOV before
+             * and panicked here as "undecodable MMIO NPF".
+             *
+             * The flags are as much of the instruction as the value: emulating the load
+             * and leaving RFLAGS stale would give the guest a silently wrong conditional
+             * branch, which is worse than the panic this replaces. CMP and TEST write no
+             * register at all -- only flags.
+             */
+            uint32_t result = hype_mmio_alu_apply(decoded.op,
+                                                  hype_mmio_extract_write_value(*reg,
+                                                                                decoded.size_bytes),
+                                                  value, decoded.size_bytes,
+                                                  &real->vmcb->save.rflags);
+            if (hype_mmio_alu_writes_reg(decoded.op)) {
+                /* A 32-bit result zero-extends the whole 64-bit register, exactly as a
+                 * native ALU op would. */
+                *reg = (decoded.size_bytes == 4u)
+                           ? (uint64_t)result
+                           : hype_mmio_merge_read_value(*reg, result, decoded.size_bytes, 0);
+            }
+        }
     }
 
     real->vmcb->save.rip += decoded.instr_len;
