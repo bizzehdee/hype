@@ -3626,6 +3626,23 @@ static int vmm_handle_cr_access(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
  * as an optional intercept hype does not take, so the instruction just executes
  * there. On VMX it exits unconditionally and must be emulated.
  */
+/*
+ * #317: the guest executed an SVM instruction. It can only reach here because hype must run
+ * every guest with EFER.SVME set (VMRUN refuses the VMCB otherwise), so these instructions do
+ * not #UD on their own the way they would on a CPU with SVM disabled.
+ *
+ * SVM-only by construction: on Intel the analogous instructions are VMX's, which are not
+ * enabled for the guest at all.
+ */
+static int vmm_reason_is_svm_insn(hype_vmm_kind_t kind, uint64_t reason) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return 0;
+    }
+    return reason == HYPE_SVM_EXITCODE_VMRUN_INSN || reason == HYPE_SVM_EXITCODE_VMLOAD ||
+           reason == HYPE_SVM_EXITCODE_VMSAVE || reason == HYPE_SVM_EXITCODE_STGI ||
+           reason == HYPE_SVM_EXITCODE_CLGI || reason == HYPE_SVM_EXITCODE_SKINIT ||
+           reason == HYPE_SVM_EXITCODE_INVLPGA;
+}
 static int vmm_reason_is_xsetbv(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX && reason == HYPE_VMX_EXIT_REASON_XSETBV;
 }
@@ -9739,6 +9756,29 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * FW-1h needs the CD to boot and M4-6 needs the kernel to start,
          * both of which happen only if the loop runs on past the first
          * prompt rather than terminating at it. */
+        if (vmm_reason_is_svm_insn(kind, info.reason)) {
+            /*
+             * #317: the guest executed VMRUN/VMLOAD/VMSAVE/STGI/CLGI/SKINIT/INVLPGA. Answer
+             * with #UD -- exactly what a CPU with EFER.SVME clear would have raised, which is
+             * the machine hype's own CPUID describes (it clears the SVM feature bit) and what
+             * #316 makes the guest's EFER read report. So the guest sees a consistent,
+             * architecturally correct answer rather than being allowed to execute it.
+             *
+             * Reinjecting rather than halting keeps a misbehaving guest torn down alone
+             * (AGENTS.md): CLGI in particular would otherwise mask physical interrupts on this
+             * guest's pinned core, taking the host's timer tick with it.
+             */
+            static unsigned long long svm_insn_n = 0;
+            svm_insn_n++;
+            if (svm_insn_n <= 8ull) {
+                hype_debug_print("fw-1 %s: guest executed an SVM instruction (exit=0x%llx) at "
+                                 "guest_rip=0x%llx -- injecting #UD (#%llu)\n",
+                                 vm->name, (unsigned long long)info.reason,
+                                 (unsigned long long)info.guest_rip, svm_insn_n);
+            }
+            vmm_reinject_exception(kind, ctx, 6u, 0, 0u); /* #UD pushes no error code */
+            continue;
+        }
         if (vmm_reason_is_xsetbv(kind, info.reason)) {
             /* #251: guest enabling XSAVE state. Same fall-through discipline as
              * the CR-access exit -- if the form is not modelled, do NOT continue,

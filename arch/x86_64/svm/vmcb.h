@@ -220,6 +220,45 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  * set regardless of the nested-specific requirement above. */
 #define HYPE_SVM_INTERCEPT_VMRUN (1u << 0)
 
+/*
+ * #317: the REST of the SVM instruction set, intercepted for reason (2) above -- which the
+ * comment already stated as an invariant while only VMRUN actually got the bit.
+ *
+ * These matter because hype has no choice about EFER.SVME: VMRUN refuses a VMCB whose GUEST
+ * EFER has SVME clear (APM §15.5.1's first illegal-state condition), and #316 makes that bit
+ * permanently set across guest EFER writes. With SVME set, these instructions do NOT #UD in
+ * the guest -- they execute, at guest CPL 0, unless intercepted here.
+ *
+ * CLGI is the sharp one. It clears GIF, masking ALL physical interrupts on the core the guest
+ * is pinned to, including hype's own timer tick -- a guest holding a pCPU against the
+ * hypervisor, from one instruction, and invisible to the per-vCPU watchdog because that runs
+ * on those ticks. SKINIT is a secure-init primitive; VMLOAD/VMSAVE load and store a block of
+ * segment and MSR state from an address in RAX.
+ *
+ * Bit numbers from APM Table B-1 (VMCB control area, offset 010h). VMMCALL is bit 1 and is
+ * deliberately NOT here: it is the hypercall instruction, and servicing it is #300's design
+ * work -- intercepting it without a handler would only change which way a Windows guest fails.
+ */
+#define HYPE_SVM_INTERCEPT_VMLOAD (1u << 2)
+#define HYPE_SVM_INTERCEPT_VMSAVE (1u << 3)
+#define HYPE_SVM_INTERCEPT_STGI (1u << 4)
+#define HYPE_SVM_INTERCEPT_CLGI (1u << 5)
+#define HYPE_SVM_INTERCEPT_SKINIT (1u << 6)
+
+/*
+ * Every SVM instruction a guest must never execute, as one mask. Defined as a set rather than
+ * OR-ed at each use site because the failure mode here is "someone adds an instruction and
+ * forgets one builder" -- there are two builders, and that is exactly how VMRUN ended up being
+ * the only one of the seven that was covered.
+ */
+#define HYPE_SVM_INTERCEPT_SVM_INSNS                                                              \
+    (HYPE_SVM_INTERCEPT_VMRUN | HYPE_SVM_INTERCEPT_VMLOAD | HYPE_SVM_INTERCEPT_VMSAVE |           \
+     HYPE_SVM_INTERCEPT_STGI | HYPE_SVM_INTERCEPT_CLGI | HYPE_SVM_INTERCEPT_SKINIT)
+
+/* intercept_misc1 bit 26: INVLPGA, the remaining SVM instruction, which lives in the other
+ * intercept word (APM Table B-1, offset 00Ch). Same reasoning as the five above. */
+#define HYPE_SVM_INTERCEPT_INVLPGA (1u << 26)
+
 /* save.efer bit 12: VMRUN requires this bit set in the *guest's* saved
  * EFER or it refuses the VMCB outright (EXITCODE =
  * HYPE_SVM_EXITCODE_INVALID, no VM-entry at all) -- a state-consistency
@@ -339,6 +378,19 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 #define HYPE_SVM_EXITCODE_CPUID 0x72ULL
 #define HYPE_SVM_EXITCODE_MSR 0x7CULL
 #define HYPE_SVM_EXITCODE_NPF 0x400ULL
+/*
+ * #317: the SVM-instruction #VMEXITs (APM Appendix C, exit-code table). Reached only because
+ * hype now intercepts them; the handler injects #UD, which is precisely what the guest would
+ * have received from a CPU whose EFER.SVME was clear -- the state a guest is entitled to
+ * believe it is in, since hype's CPUID reports no SVM.
+ */
+#define HYPE_SVM_EXITCODE_INVLPGA 0x7AULL
+#define HYPE_SVM_EXITCODE_VMRUN_INSN 0x80ULL
+#define HYPE_SVM_EXITCODE_VMLOAD 0x82ULL
+#define HYPE_SVM_EXITCODE_VMSAVE 0x83ULL
+#define HYPE_SVM_EXITCODE_STGI 0x84ULL
+#define HYPE_SVM_EXITCODE_CLGI 0x85ULL
+#define HYPE_SVM_EXITCODE_SKINIT 0x86ULL
 /* RT-2b: physical-interrupt intercept exit (APM Vol 2 Appendix C,
  * VMEXIT_INTR = 0x60). Raised when HYPE_SVM_INTERCEPT_INTR is set and a host
  * physical interrupt (e.g. hype's periodic timer tick) arrives during guest

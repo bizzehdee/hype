@@ -55,8 +55,10 @@ void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint
      * IN/OUT execute natively against the real host CPU/hardware. */
     vmcb->control.intercept_misc1 = HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN |
                                      HYPE_SVM_INTERCEPT_CPUID | HYPE_SVM_INTERCEPT_MSR_PROT |
-                                     HYPE_SVM_INTERCEPT_IOIO_PROT;
-    vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_VMRUN;
+                                     HYPE_SVM_INTERCEPT_IOIO_PROT | HYPE_SVM_INTERCEPT_INVLPGA;
+    /* #317: every SVM instruction, not just VMRUN. The guest's EFER.SVME is necessarily set
+     * (VMRUN requires it), so these do not #UD on their own -- see the mask's own comment. */
+    vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_SVM_INSNS;
 
     /* FW-1: intercept every guest exception vector (see
      * HYPE_SVM_EXITCODE_EXCEPTION_BASE's own comment) -- real firmware
@@ -158,8 +160,8 @@ void hype_vmcb_build_long_mode_guest(hype_vmcb_t *vmcb, uint64_t entry_rip, uint
      * hype_vmcb_build_realmode_guest() above. */
     vmcb->control.intercept_misc1 =
         HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN | HYPE_SVM_INTERCEPT_IOIO_PROT |
-        HYPE_SVM_INTERCEPT_CPUID | HYPE_SVM_INTERCEPT_MSR_PROT;
-    vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_VMRUN;
+        HYPE_SVM_INTERCEPT_CPUID | HYPE_SVM_INTERCEPT_MSR_PROT | HYPE_SVM_INTERCEPT_INVLPGA;
+    vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_SVM_INSNS; /* #317 */
 
     vmcb->control.iopm_base_pa = iopm_phys;
     vmcb->control.msrpm_base_pa = msrpm_phys;

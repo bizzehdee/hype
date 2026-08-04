@@ -79,6 +79,17 @@ static void test_build_realmode_guest(void) {
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_SHUTDOWN);
     CHECK_HEX("VMRUN is intercepted", HYPE_SVM_INTERCEPT_VMRUN,
               vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_VMRUN);
+    /*
+     * #317: EVERY SVM instruction, not just VMRUN. Asserted as the whole mask rather than bit
+     * by bit because the failure this guards is "an instruction was added and one builder was
+     * missed" -- which is how VMRUN came to be the only one of the seven that was covered. The
+     * guest's EFER.SVME is necessarily set (VMRUN requires it), so an unintercepted SVM
+     * instruction executes at guest CPL 0 instead of faulting.
+     */
+    CHECK_HEX("every SVM instruction is intercepted", HYPE_SVM_INTERCEPT_SVM_INSNS,
+              vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_SVM_INSNS);
+    CHECK_HEX("INVLPGA is intercepted", HYPE_SVM_INTERCEPT_INVLPGA,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_INVLPGA);
     CHECK_HEX("ASID is nonzero", 1, vmcb.control.guest_asid_tlb_ctl);
     CHECK_HEX("nested paging disabled", 0, vmcb.control.np_enable);
 
@@ -179,6 +190,17 @@ static void test_build_long_mode_guest(void) {
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_IOIO_PROT);
     CHECK_HEX("VMRUN is intercepted", HYPE_SVM_INTERCEPT_VMRUN,
               vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_VMRUN);
+    /*
+     * #317: EVERY SVM instruction, not just VMRUN. Asserted as the whole mask rather than bit
+     * by bit because the failure this guards is "an instruction was added and one builder was
+     * missed" -- which is how VMRUN came to be the only one of the seven that was covered. The
+     * guest's EFER.SVME is necessarily set (VMRUN requires it), so an unintercepted SVM
+     * instruction executes at guest CPL 0 instead of faulting.
+     */
+    CHECK_HEX("every SVM instruction is intercepted", HYPE_SVM_INTERCEPT_SVM_INSNS,
+              vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_SVM_INSNS);
+    CHECK_HEX("INVLPGA is intercepted", HYPE_SVM_INTERCEPT_INVLPGA,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_INVLPGA);
     CHECK_HEX("nested paging starts disabled (caller opts in)", 0, vmcb.control.np_enable);
     CHECK_HEX("IOPM base wired through", 0x400000ULL, vmcb.control.iopm_base_pa);
     CHECK_HEX("MSRPM base wired through", 0x500000ULL, vmcb.control.msrpm_base_pa);
