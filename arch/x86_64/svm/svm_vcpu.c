@@ -2227,15 +2227,25 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
         if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI ||
             offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS ||
             offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_SACT) {
+            /* Gated on a KERNEL rip. Five times on this ticket a capped sample has shown the
+             * wrong era: OVMF polls these same registers through one MmioRead32 helper long
+             * before the kernel starts, and it fills any small sample with reads that are not
+             * the ones in question. Kernel text is at 0xffffffff8-------, the loader is not. */
             static unsigned int rd_n = 0;
             static unsigned int rd_total = 0;
             rd_total++;
-            if (rd_n < 30u) {
+            if (real->vmcb->save.rip >= 0xffffffff80000000ull && rd_n < 30u) {
                 rd_n++;
-                hype_debug_print("fw-1 RD#%02u off=0x%x -> 0x%x (p_ci=0x%x p_is=0x%x p_sact=0x%x)\n",
+                /* RIP and instr_len: if both reads of a pair share a RIP the instruction is
+                 * re-executing and the decoder's length is the suspect; if they differ, the
+                 * driver genuinely reads twice and the pairing is innocent. */
+                hype_debug_print("fw-1 RD#%02u off=0x%x -> 0x%x rip=0x%llx len=%u sz=%u "
+                                 "(p_ci=0x%x p_is=0x%x)\n",
                                  rd_n, (unsigned int)offset, (unsigned int)value,
-                                 (unsigned int)ahci->p_ci, (unsigned int)ahci->p_is,
-                                 (unsigned int)ahci->p_sact);
+                                 (unsigned long long)real->vmcb->save.rip,
+                                 (unsigned int)decoded.instr_len,
+                                 (unsigned int)decoded.size_bytes, (unsigned int)ahci->p_ci,
+                                 (unsigned int)ahci->p_is);
             }
             if (rd_total == 100u || rd_total == 1000u) {
                 hype_debug_print("fw-1 RD-TOTAL=%u\n", rd_total);
