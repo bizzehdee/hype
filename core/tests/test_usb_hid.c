@@ -297,7 +297,100 @@ static void test_find_keyboard_short_descriptors(void) {
     }
 }
 
+/* --- USB-6 (#219): boot-protocol mouse --- */
+
+static void test_find_mouse_picks_the_mouse_interface(void) {
+    /* A composite device with BOTH a keyboard and a mouse interface -- which is what a
+     * wireless receiver presents. The finder must pick the one it was asked for, or a
+     * mouse claim binds to the keyboard's endpoint and reports never make sense. */
+    static const uint8_t cfg[] = {
+        9, 0x02, 0, 0, 2, 1, 0, 0xA0, 50,
+        9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0,   /* iface 0: HID boot KEYBOARD */
+        9, 0x21, 0x11, 0x01, 0, 1, 0x22, 65, 0,  /* HID descriptor */
+        7, 0x05, 0x81, 0x03, 0x08, 0x00, 10,     /* int IN, keyboard */
+        9, 0x04, 1, 0, 1, 0x03, 0x01, 0x02, 0,   /* iface 1: HID boot MOUSE */
+        9, 0x21, 0x11, 0x01, 0, 1, 0x22, 52, 0,
+        7, 0x05, 0x82, 0x03, 0x04, 0x00, 7,      /* int IN, mouse */
+    };
+    hype_usb_hid_kbd_t m, k;
+
+    CHECK_HEX("mouse found", 0, hype_usb_hid_find_mouse(cfg, (unsigned)sizeof(cfg), &m));
+    CHECK_HEX("mouse interface number", 1, (int)m.interface_num);
+    CHECK_HEX("mouse endpoint", 0x82u, m.int_in_ep);
+    CHECK_HEX("mouse mps", 4, (int)m.mps);
+    CHECK_HEX("mouse interval", 7, (int)m.interval);
+
+    CHECK_HEX("keyboard still found", 0, hype_usb_hid_find_keyboard(cfg, (unsigned)sizeof(cfg), &k));
+    CHECK_HEX("keyboard endpoint is the other one", 0x81u, k.int_in_ep);
+}
+
+static void test_find_mouse_refuses_a_non_boot_mouse(void) {
+    /* Report-protocol HID: its bytes need the report descriptor parsed to interpret, so
+     * it is refused rather than guessed at. */
+    static const uint8_t cfg[] = {
+        9, 0x02, 0, 0, 1, 1, 0, 0xA0, 50,
+        9, 0x04, 0, 0, 1, 0x03, 0x00, 0x02, 0,   /* subclass 0 = NOT boot */
+        7, 0x05, 0x81, 0x03, 0x04, 0x00, 7,
+    };
+    hype_usb_hid_kbd_t m;
+
+    CHECK_HEX("non-boot mouse refused", -1, hype_usb_hid_find_mouse(cfg, (unsigned)sizeof(cfg), &m));
+    CHECK_HEX("found flag clear", 0, m.found);
+}
+
+static void test_mouse_report_inverts_y(void) {
+    /* HID +Y is DOWN, PS/2 +Y is UP. Getting this wrong gives a pointer that moves
+     * vertically backwards, which reads as a broken mouse rather than a sign error. */
+    const uint8_t rep[4] = {0x00, 5, 7, 0}; /* no buttons, +5 right, +7 down */
+    uint8_t ps2[HYPE_USB_HID_PS2_PACKET_LEN];
+
+    CHECK_HEX("packet written", 3, (int)hype_usb_hid_mouse_report_to_ps2(rep, 4u, ps2, 3u));
+    CHECK_HEX("dx passes through", 5u, ps2[1]);
+    CHECK_HEX("dy is negated", (uint8_t)(-7), ps2[2]);
+    /* dx positive -> X sign clear; dy now negative -> Y sign SET. Bit 3 always set. */
+    CHECK_HEX("status: bit3 set, Y sign set, X sign clear", 0x28u, ps2[0]);
+}
+
+static void test_mouse_report_buttons_and_signs_agree(void) {
+    const uint8_t rep[3] = {0x05, (uint8_t)(-3), 0x00}; /* left+middle, -3 left, no Y */
+    uint8_t ps2[3];
+
+    CHECK_HEX("packet written", 3, (int)hype_usb_hid_mouse_report_to_ps2(rep, 3u, ps2, 3u));
+    CHECK_HEX("left+middle carried through", 0x05u, ps2[0] & 0x07u);
+    CHECK_HEX("X sign set for a negative dx", 0x10u, ps2[0] & 0x10u);
+    CHECK_HEX("Y sign clear for zero dy", 0u, ps2[0] & 0x20u);
+    CHECK_HEX("dx byte", (uint8_t)(-3), ps2[1]);
+    CHECK_HEX("dy byte", 0u, ps2[2]);
+}
+
+static void test_mouse_report_clamps_rather_than_wraps(void) {
+    /* -128 has no positive counterpart in 8-bit two's complement, so negating it would
+     * wrap to -128 again -- a large upward movement becoming a large DOWNWARD one. */
+    const uint8_t rep[3] = {0x00, 0x00, 0x80}; /* dy = -128 */
+    uint8_t ps2[3];
+
+    CHECK_HEX("packet written", 3, (int)hype_usb_hid_mouse_report_to_ps2(rep, 3u, ps2, 3u));
+    CHECK_HEX("clamped to +127, not wrapped to -128", 127u, ps2[2]);
+    CHECK_HEX("Y sign clear -- the movement is positive", 0u, ps2[0] & 0x20u);
+}
+
+static void test_mouse_report_rejects_bad_input(void) {
+    const uint8_t rep[3] = {0, 1, 1};
+    uint8_t ps2[3];
+
+    CHECK_HEX("NULL report", 0, (int)hype_usb_hid_mouse_report_to_ps2(0, 3u, ps2, 3u));
+    CHECK_HEX("NULL out", 0, (int)hype_usb_hid_mouse_report_to_ps2(rep, 3u, 0, 3u));
+    CHECK_HEX("report too short", 0, (int)hype_usb_hid_mouse_report_to_ps2(rep, 2u, ps2, 3u));
+    CHECK_HEX("output too small", 0, (int)hype_usb_hid_mouse_report_to_ps2(rep, 3u, ps2, 2u));
+}
+
 int main(void) {
+    test_find_mouse_picks_the_mouse_interface();
+    test_find_mouse_refuses_a_non_boot_mouse();
+    test_mouse_report_inverts_y();
+    test_mouse_report_buttons_and_signs_agree();
+    test_mouse_report_clamps_rather_than_wraps();
+    test_mouse_report_rejects_bad_input();
     test_usage_mapping();
     test_press_and_release();
     test_held_key_emits_nothing();

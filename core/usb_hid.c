@@ -79,7 +79,12 @@ uint8_t hype_usb_hid_usage_to_scancode(uint8_t usage) {
     return g_usage_to_set1[usage];
 }
 
-int hype_usb_hid_find_keyboard(const uint8_t *cfg, unsigned int len, hype_usb_hid_kbd_t *out) {
+/* Shared walker: find a boot-protocol HID interface with `protocol` and its interrupt-IN
+ * endpoint. One implementation for keyboard and mouse -- the descriptor walk, the
+ * malformed-length guard and the "skip the interrupt-OUT" rule are identical, and two
+ * copies would be two places for them to drift. */
+static int find_boot_hid(const uint8_t *cfg, unsigned int len, unsigned int protocol,
+                         hype_usb_hid_kbd_t *out) {
     unsigned int off = 0;
     int in_kbd_iface = 0;
     unsigned int cfg_value = 0;
@@ -113,7 +118,7 @@ int hype_usb_hid_find_keyboard(const uint8_t *cfg, unsigned int len, hype_usb_hi
              * rather than guessed at. */
             in_kbd_iface = (cfg[off + 5u] == HYPE_USB_CLASS_HID &&
                             cfg[off + 6u] == HYPE_USB_SUBCLASS_BOOT &&
-                            cfg[off + 7u] == HYPE_USB_PROTO_KEYBOARD);
+                            cfg[off + 7u] == protocol);
             if (in_kbd_iface) {
                 out->interface_num = cfg[off + 2u];
             }
@@ -136,6 +141,14 @@ int hype_usb_hid_find_keyboard(const uint8_t *cfg, unsigned int len, hype_usb_hi
         off += dlen;
     }
     return -1;
+}
+
+int hype_usb_hid_find_keyboard(const uint8_t *cfg, unsigned int len, hype_usb_hid_kbd_t *out) {
+    return find_boot_hid(cfg, len, HYPE_USB_PROTO_KEYBOARD, out);
+}
+
+int hype_usb_hid_find_mouse(const uint8_t *cfg, unsigned int len, hype_usb_hid_kbd_t *out) {
+    return find_boot_hid(cfg, len, HYPE_USB_PROTO_MOUSE, out);
 }
 
 /* Is `usage` present in a report's 6-key array? */
@@ -211,4 +224,44 @@ unsigned int hype_usb_hid_report_to_scancodes(const uint8_t *prev, const uint8_t
         }
     }
     return n;
+}
+
+/* Clamp a HID delta into the 8-bit signed range PS/2 carries. */
+static int clamp_delta(int v) {
+    if (v > 127) {
+        return 127;
+    }
+    if (v < -127) {
+        return -127;
+    }
+    return v;
+}
+
+unsigned int hype_usb_hid_mouse_report_to_ps2(const uint8_t *report, unsigned int len,
+                                              uint8_t *out, unsigned int out_cap) {
+    int dx, dy;
+    uint8_t status;
+
+    if (report == (const uint8_t *)0 || out == (uint8_t *)0 ||
+        len < HYPE_USB_HID_MOUSE_REPORT_MIN || out_cap < HYPE_USB_HID_PS2_PACKET_LEN) {
+        return 0;
+    }
+    dx = clamp_delta((int)(int8_t)report[1]);
+    /* PS/2 +Y is UP, HID +Y is DOWN. Negating here is what keeps a pointer from moving
+     * vertically backwards. -128 has no positive counterpart in 8-bit two's complement,
+     * so clamp_delta's -127 floor is applied to the HID value first. */
+    dy = -clamp_delta((int)(int8_t)report[2]);
+
+    status = 0x08u; /* bit 3 always set (PS/2 mouse packet marker) */
+    status |= (uint8_t)(report[0] & 0x07u); /* left/right/middle, same bit order */
+    if (dx < 0) {
+        status |= 0x10u;
+    }
+    if (dy < 0) {
+        status |= 0x20u;
+    }
+    out[0] = status;
+    out[1] = (uint8_t)dx;
+    out[2] = (uint8_t)dy;
+    return HYPE_USB_HID_PS2_PACKET_LEN;
 }

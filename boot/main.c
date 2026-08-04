@@ -200,6 +200,7 @@ static void usb_log_flush(void);
 /* USB-5 (#217): defined with the other USB globals, used by the FW-1 dispatch loop and
  * the #233 confirm gate, both of which appear earlier in this file. */
 static unsigned int usb_hid_drain(void);
+static int usb_mouse_drain(hype_ps2_mouse_t *dst);
 /* #217: HID poll counters, declared early so the periodic DIAG block can read them. */
 static int g_hid_ready;
 static unsigned int g_hid_slot;
@@ -207,6 +208,20 @@ static unsigned int g_hid_ep;
 static unsigned long long g_hid_polls;
 static unsigned long long g_hid_reports;
 static unsigned long long g_hid_poll_errs;
+/*
+ * USB-6 (#219): the claimed USB boot MOUSE. Declared here beside the keyboard counters so
+ * the periodic DIAG block can read them. A separate controller copy from the keyboard's,
+ * because the two can be on different controllers -- an internal touchpad and an external
+ * keyboard routinely are, which is only reachable at all since #299.
+ */
+static int g_mouse_ready;
+static unsigned int g_mouse_slot;
+static unsigned int g_mouse_ep;
+static unsigned int g_mouse_mps;
+static unsigned long long g_mouse_polls;
+static unsigned long long g_mouse_reports;
+static unsigned long long g_mouse_poll_errs;
+static unsigned long long g_mouse_packets;
 /* #284: scancodes handed to the guest's keyboard by `sendkey`, and how many it has not
  * yet read. The pair is the proof the transport works: a guest DRAINING them means the
  * bytes reached its keyboard driver, which is a different (and checkable) claim from
@@ -849,6 +864,75 @@ static uint8_t fw_1_usb_record(hype_usb_inventory_t *inv, unsigned int controlle
                                                       HYPE_USB_MAX_ENDPOINTS);
     (void)hype_usb_inventory_add(inv, &di);
     return di.dev_class;
+}
+
+
+/*
+ * USB-5/USB-6 (#217/#219): claim ONE boot-protocol HID device of `protocol` for hype's own
+ * input, if the sweep found one nothing else owns.
+ *
+ * Shared between keyboard and mouse because everything except which find_* function to
+ * call is identical -- inventory search by class, boot-protocol-only filter,
+ * SET_CONFIGURATION, Configure Endpoint, claim, and the log line. Two copies would be two
+ * places for the "skip anything already claimed" rule to drift, and that rule is what
+ * stops hype's own boot medium being mistaken for an input device.
+ *
+ * Searched through the inventory rather than by re-walking the bus, which is what #241
+ * exists to make possible.
+ */
+static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, const char *what,
+                                int *ready, hype_xhci_ctrl_t *xc_out, unsigned int *slot_out,
+                                unsigned int *ep_out, unsigned int *mps_out) {
+    int hi = hype_usb_inventory_next_unclaimed_class(&g_usb_inv, HYPE_USB_CLASS_HID, -1);
+
+    while (hi >= 0 && !*ready) {
+        const hype_usb_devinfo_t *d = &g_usb_inv.dev[hi];
+
+        /* Boot protocol only -- a non-boot HID needs its report descriptor parsed, and
+         * misreading a report layout invents keystrokes or clicks. */
+        if (d->dev_subclass == HYPE_USB_SUBCLASS_BOOT && d->dev_protocol == protocol &&
+            d->slot != 0u) {
+            static uint8_t hidcfg[256];
+            unsigned int hidlen = 0;
+            hype_usb_hid_kbd_t hid;
+            int found = 0;
+
+            if (hype_xhci_get_config_descriptor(xc, d->slot, hidcfg, sizeof(hidcfg), &hidlen) == 0) {
+                found = (protocol == HYPE_USB_PROTO_KEYBOARD)
+                            ? (hype_usb_hid_find_keyboard(hidcfg, hidlen, &hid) == 0)
+                            : (hype_usb_hid_find_mouse(hidcfg, hidlen, &hid) == 0);
+            }
+            if (found && hype_xhci_set_configuration(xc, d->slot, hid.config_value) == 0) {
+                hype_xhci_devpath_t hpath;
+                hpath.root_port = d->root_port;
+                hpath.route = d->route;
+                hpath.speed = d->speed;
+                hpath.tt_hub_slot = 0u;
+                hpath.tt_port = 0u;
+                if (hype_xhci_configure_int_in_endpoint(xc, d->slot, &hpath, hid.int_in_ep,
+                                                        hid.mps, hid.interval) == 0) {
+                    *xc_out = *xc;
+                    *slot_out = d->slot;
+                    *ep_out = hid.int_in_ep;
+                    *mps_out = hid.mps;
+                    *ready = 1;
+                    hype_usb_inventory_claim(&g_usb_inv, hi, HYPE_USB_OWNER_HYPE);
+                    hype_debug_print("host-hid: USB %s CLAIMED -- %04x:%04x port%u slot%u "
+                                     "ep=0x%02x mps=%u; host input now reaches hype\n",
+                                     what, (unsigned)d->vid, (unsigned)d->pid, d->root_port,
+                                     d->slot, hid.int_in_ep, hid.mps);
+                } else {
+                    hype_debug_print("host-hid: %s %04x:%04x found but Configure Endpoint "
+                                     "FAILED -- no host %s\n", what, (unsigned)d->vid,
+                                     (unsigned)d->pid, what);
+                }
+            } else if (found) {
+                hype_debug_print("host-hid: %s %04x:%04x SET_CONFIGURATION FAILED\n", what,
+                                 (unsigned)d->vid, (unsigned)d->pid);
+            }
+        }
+        hi = hype_usb_inventory_next_unclaimed_class(&g_usb_inv, HYPE_USB_CLASS_HID, hi);
+    }
 }
 
 /* Visitor context for the hub descent: records everything, keeps the first MSC. */
@@ -8028,6 +8112,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * into the same queue this loop already drains, so the chord recognizer and
              * command line below need no knowledge of which keyboard it came from. */
             (void)usb_hid_drain();
+            /*
+             * USB-6 (#219): and any pointer movement, straight into THIS VM's PS/2 mouse
+             * plus its IRQ12. A pointer has no host-side meaning -- unlike a keystroke,
+             * which may be a leader chord -- so it goes to the guest rather than through
+             * the host-input layer. The IO-APIC path first with a PIC fallback, the same
+             * shape every other guest IRQ here uses.
+             */
+            if (usb_mouse_drain(&g_fw_1_mouse)) {
+                uint8_t miov;
+                if (hype_ioapic_raise(&g_fw_1_ioapic, 12u, &miov)) {
+                    vmm_request_interrupt(kind, ctx, miov);
+                } else {
+                    hype_pic_emu_raise_global_irq(&g_fw_1_pic, 12u);
+                }
+            }
             while (hype_host_kbd_poll_scancode(&sc)) {
                 uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
                 unsigned kn = 0;
@@ -8378,6 +8477,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_debug_print("fw-1 DIAG: SENDKEY codes=%llu still_pending=%d [#284]\n",
                                      g_sendkey_codes,
                                      hype_ps2_kbd_has_pending_byte(&vm->ps2));
+                }
+                if (g_mouse_ready) {
+                    hype_debug_print("fw-1 DIAG: MOUSE polls=%llu reports=%llu errors=%llu "
+                                     "packets=%llu (slot%u ep=0x%02x) [#219]\n",
+                                     g_mouse_polls, g_mouse_reports, g_mouse_poll_errs,
+                                     g_mouse_packets, g_mouse_slot, g_mouse_ep);
                 }
                 if (g_hid_ready) {
                     hype_debug_print("fw-1 DIAG: HID polls=%llu reports=%llu errors=%llu "
@@ -11647,6 +11752,7 @@ static hype_xhci_ctrl_t g_usb_xc;
  * values, not pointers into the sweep's locals.
  */
 static hype_xhci_ctrl_t g_hid_xc;
+static hype_xhci_ctrl_t g_mouse_xc; /* #219: may be a DIFFERENT controller from g_hid_xc */
 static unsigned int g_hid_mps;
 static uint8_t g_hid_prev[HYPE_USB_HID_REPORT_LEN];
 static int g_hid_have_prev;
@@ -11696,6 +11802,51 @@ static unsigned int usb_hid_drain(void) {
         hype_host_kbd_inject_scancode(codes[i]);
     }
     return n;
+}
+
+/*
+ * USB-6 (#219): poll the claimed USB mouse and hand any movement to a guest's PS/2 mouse.
+ *
+ * Delivered to the guest rather than to a host-side layer, because unlike a keystroke --
+ * which may be a leader chord for hype itself -- a pointer movement has no host meaning:
+ * the only consumer is whatever the operator is looking at. Returns 1 if a packet was
+ * queued, so the caller knows to raise IRQ12.
+ */
+static int usb_mouse_drain(hype_ps2_mouse_t *dst) {
+    uint8_t report[8];
+    uint8_t packet[HYPE_USB_HID_PS2_PACKET_LEN];
+    unsigned int n;
+    int r;
+
+    if (!g_mouse_ready || dst == 0) {
+        return 0;
+    }
+    g_mouse_polls++;
+    r = hype_xhci_int_in_poll(&g_mouse_xc, g_mouse_slot, g_mouse_ep, report,
+                              (unsigned)sizeof(report));
+    if (r < 0) {
+        g_mouse_poll_errs++;
+    }
+    if (r <= 0) {
+        return 0; /* 0 = idle, the normal case; -1 leaves the endpoint armed for a retry */
+    }
+    g_mouse_reports++;
+    if (g_mouse_reports == 1u) {
+        /* Said once, for the same reason the keyboard says it: "endpoint configured" and
+         * "reports actually arrive" are different claims, and on a machine where the log
+         * is all there is they must be distinguishable. */
+        hype_debug_print("host-hid: FIRST mouse report received -- USB pointer is live [#219]\n");
+    }
+    n = hype_usb_hid_mouse_report_to_ps2(report, (unsigned)sizeof(report), packet,
+                                         (unsigned)sizeof(packet));
+    if (n != HYPE_USB_HID_PS2_PACKET_LEN) {
+        return 0;
+    }
+    /* Dropped by the model unless the guest has enabled reporting, which is what a real
+     * mouse does too -- so a guest that never issued Enable Data Reporting sees nothing. */
+    hype_ps2_mouse_enqueue_movement(dst, packet[0], packet[1], packet[2]);
+    g_mouse_packets++;
+    return 1;
 }
 static hype_xhci_msc_eps_t g_usb_msc;
 static hype_blk_usb_t g_usb_ubk;
@@ -13271,63 +13422,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * already claimed so hype's own boot medium can never be mistaken for an
                  * input device.
                  */
-                {
-                    int hi = hype_usb_inventory_next_unclaimed_class(&g_usb_inv, HYPE_USB_CLASS_HID,
-                                                                     -1);
-                    while (hi >= 0 && !g_hid_ready) {
-                        const hype_usb_devinfo_t *d = &g_usb_inv.dev[hi];
-                        /* Boot protocol only -- a non-boot HID needs its report descriptor
-                         * parsed, and misreading a report layout invents keystrokes. */
-                        if (d->dev_subclass == HYPE_USB_SUBCLASS_BOOT &&
-                            d->dev_protocol == HYPE_USB_PROTO_KEYBOARD && d->slot != 0u) {
-                            static uint8_t hidcfg[256];
-                            unsigned int hidlen = 0;
-                            hype_usb_hid_kbd_t kbd;
-                            if (hype_xhci_get_config_descriptor(&xc, d->slot, hidcfg, sizeof(hidcfg),
-                                                                &hidlen) == 0 &&
-                                hype_usb_hid_find_keyboard(hidcfg, hidlen, &kbd) == 0 &&
-                                hype_xhci_set_configuration(&xc, d->slot, kbd.config_value) == 0) {
-                                hype_xhci_devpath_t kpath;
-                                kpath.root_port = d->root_port;
-                                kpath.route = d->route;
-                                kpath.speed = d->speed;
-                                kpath.tt_hub_slot = 0u;
-                                kpath.tt_port = 0u;
-                                if (hype_xhci_configure_int_in_endpoint(&xc, d->slot, &kpath,
-                                                                        kbd.int_in_ep, kbd.mps,
-                                                                        kbd.interval) == 0) {
-                                    g_hid_xc = xc;
-                                    g_hid_slot = d->slot;
-                                    g_hid_ep = kbd.int_in_ep;
-                                    g_hid_mps = kbd.mps;
-                                    g_hid_have_prev = 0;
-                                    g_hid_ready = 1;
-                                    hype_usb_inventory_claim(&g_usb_inv, hi, HYPE_USB_OWNER_HYPE);
-                                    hype_debug_print("host-hid: USB keyboard CLAIMED -- %04x:%04x "
-                                                     "port%u slot%u ep=0x%02x mps=%u; host keystrokes "
-                                                     "now reach hype [#217]\n",
-                                                     (unsigned)d->vid, (unsigned)d->pid, d->root_port,
-                                                     d->slot, kbd.int_in_ep, kbd.mps);
-                                } else {
-                                    hype_debug_print("host-hid: keyboard %04x:%04x found but "
-                                                     "Configure Endpoint FAILED -- no host keyboard "
-                                                     "[#217]\n", (unsigned)d->vid, (unsigned)d->pid);
-                                }
-                            } else {
-                                hype_debug_print("host-hid: HID device %04x:%04x is not a usable boot "
-                                                 "keyboard -- skipped [#217]\n",
-                                                 (unsigned)d->vid, (unsigned)d->pid);
-                            }
-                        }
-                        hi = hype_usb_inventory_next_unclaimed_class(&g_usb_inv, HYPE_USB_CLASS_HID,
-                                                                     hi);
-                    }
-                    /* The "no keyboard found" verdict is printed once AFTER the whole
-                     * sweep, not here: this runs per controller, so on a two-controller
-                     * machine it announced "no USB boot keyboard" for the storage
-                     * controller and then claimed one on the next -- two contradictory
-                     * lines in the log an operator has to read after the fact. */
+                fw_1_claim_boot_hid(&xc, HYPE_USB_PROTO_KEYBOARD, "keyboard", &g_hid_ready,
+                                    &g_hid_xc, &g_hid_slot, &g_hid_ep, &g_hid_mps);
+                if (g_hid_ready) {
+                    g_hid_have_prev = 0; /* first report has no predecessor to diff against */
                 }
+                /* USB-6 (#219): and a pointer, independently. It may be on a different
+                 * controller from the keyboard -- an internal touchpad and an external
+                 * keyboard routinely are -- which is only reachable at all since #299. */
+                fw_1_claim_boot_hid(&xc, HYPE_USB_PROTO_MOUSE, "mouse", &g_mouse_ready,
+                                    &g_mouse_xc, &g_mouse_slot, &g_mouse_ep, &g_mouse_mps);
+                /* The "nothing found" verdicts are printed once AFTER the whole sweep, not
+                 * here: this runs per controller, so on a two-controller machine it
+                 * announced "no USB boot keyboard" for the storage controller and then
+                 * claimed one on the next -- two contradictory lines in a log an operator
+                 * has to read after the fact. */
                 /*
                  * #299: quiesce ONLY a controller nothing was kept on. Keeping the
                  * medium's controller Running is the whole point; and a keyboard claimed
@@ -13339,7 +13448,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 if (msc_found) {
                     msc_found_any = 1;
                 }
-                if (!msc_found && !(g_hid_ready && g_hid_xc.bar == xc.bar)) {
+                if (!msc_found && !(g_hid_ready && g_hid_xc.bar == xc.bar) &&
+                    !(g_mouse_ready && g_mouse_xc.bar == xc.bar)) {
                     hype_xhci_host_quiesce(&xc);
                     hype_debug_print("host-xhci: controller[%u] quiesced -- nothing kept on it; "
                                       "ring block returned to the pool [#299]\n", xhci_count);
@@ -13409,6 +13519,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             if (!g_hid_ready) {
                 hype_debug_print("host-hid: no USB boot keyboard on any controller (PS/2 host "
                                  "keyboard only) [#217]\n");
+            }
+            if (!g_mouse_ready) {
+                hype_debug_print("host-hid: no USB boot mouse on any controller (PS/2 host "
+                                 "pointer only) [#219]\n");
             }
             if (xhci_count > HYPE_XHCI_MAX_CTRL) {
                 hype_debug_print("host-usb: NOTE -- %u xHCI controller(s) present but only %u "

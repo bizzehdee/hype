@@ -74,4 +74,55 @@ unsigned int hype_usb_hid_report_to_scancodes(const uint8_t *prev, const uint8_t
 /* Set-1 make code for a HID keyboard usage id, or 0 if unmapped. Exposed for tests. */
 uint8_t hype_usb_hid_usage_to_scancode(uint8_t usage);
 
+/*
+ * USB-6 (#219): USB HID boot-protocol MOUSE, as a HOST pointer device.
+ *
+ * Same shape as the keyboard above and for the same reason: rather than add a second
+ * pointer path, a boot mouse report is translated into the standard PS/2 3-byte movement
+ * packet and handed to the guest's PS/2 mouse model (INPUT-2), which every consumer
+ * already drives. One translation to maintain, and a USB pointer and a PS/2 pointer
+ * cannot drift apart in behaviour.
+ *
+ * Boot protocol only, for the reason the keyboard gives: a non-boot HID needs its report
+ * DESCRIPTOR parsed to know what its bytes mean, and misreading a pointer report produces
+ * phantom clicks.
+ */
+
+/* A boot-protocol mouse report is at least 3 bytes: buttons, then signed X and Y. Many
+ * devices append a wheel byte; it is read when present and ignored otherwise, because the
+ * guest PS/2 model here is the 3-byte (non-IntelliMouse) protocol. */
+#define HYPE_USB_HID_MOUSE_REPORT_MIN 3u
+
+/* PS/2 movement packet: status, dx, dy. */
+#define HYPE_USB_HID_PS2_PACKET_LEN 3u
+
+/*
+ * Find a boot-protocol mouse interface and its interrupt-IN endpoint. Returns 0 on
+ * success (and sets out->found), -1 otherwise. Shares hype_usb_hid_kbd_t because the
+ * fields wanted are identical -- interface, config value, endpoint, mps, interval.
+ */
+int hype_usb_hid_find_mouse(const uint8_t *cfg, unsigned int len, hype_usb_hid_kbd_t *out);
+
+/*
+ * Translate one boot mouse report into a PS/2 movement packet. Returns the number of
+ * bytes written (3), or 0 if the report is too short or the output too small.
+ *
+ * Two conversions that are easy to get wrong and are therefore unit-tested rather than
+ * judged by watching a cursor:
+ *
+ *  - PS/2 Y is INVERTED relative to HID. HID reports +Y as "toward the user" (down the
+ *    screen); PS/2 reports +Y as up. Getting this wrong gives a pointer that moves
+ *    vertically backwards, which looks like a broken mouse rather than a sign error.
+ *  - The status byte carries the SIGN of each delta in bits 4 and 5 and the deltas
+ *    themselves as 8-bit two's complement, plus bit 3 always set. A guest that ignores
+ *    the sign bits still works; one that honours them sees the wrong direction if they
+ *    disagree with the byte, so they are derived from the same value.
+ *
+ * Deltas outside the 8-bit signed range are CLAMPED, not truncated, and the overflow bits
+ * are left clear: truncation wraps a large movement into a movement the other way, which
+ * is worse than a short one.
+ */
+unsigned int hype_usb_hid_mouse_report_to_ps2(const uint8_t *report, unsigned int len,
+                                              uint8_t *out, unsigned int out_cap);
+
 #endif /* HYPE_CORE_USB_HID_H */
