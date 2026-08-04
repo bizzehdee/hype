@@ -2006,6 +2006,31 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                          slot, (unsigned long long)rx_fis_phys);
         return -1;
     }
+    /*
+     * #314: a PIO data-in command must ALSO deliver a PIO Setup FIS at receive-area offset
+     * 0x20, not merely latch PxIS.PSS.
+     *
+     * #262 slice 4 added this to the plain-ATA path and its comment claims the ATAPI path
+     * "already does" it for IDENTIFY PACKET -- it does not; it sets the bit and nothing else,
+     * so this receive area stayed whatever the guest left there. EDK2 waits on the PxIS.PSS
+     * BIT, so the CD has always worked; FreeBSD reads the FIS itself, and its
+     * ATAPI_IDENTIFY timed out on a completion hype had already finished (cs 00000000,
+     * tfd 50, is 00000002).
+     */
+    if (pis_bit == HYPE_AHCI_PIS_PSS) {
+        uint8_t *pio_fis = rx_fis_host + 0x20;
+        for (i = 0; i < 20u; i++) {
+            pio_fis[i] = 0;
+        }
+        pio_fis[0] = 0x5F;       /* FIS type: PIO Setup - Device to Host */
+        pio_fis[1] = 0x60;       /* I (interrupt) + D (device-to-host direction) */
+        pio_fis[2] = status_reg; /* Status at the START of the transfer */
+        pio_fis[3] = error_reg;
+        pio_fis[15] = status_reg;                      /* E_Status: status at the END */
+        pio_fis[16] = (uint8_t)(transferred & 0xFFu);  /* Transfer Count, 16-bit */
+        pio_fis[17] = (uint8_t)((transferred >> 8) & 0xFFu);
+    }
+
     d2h_fis = rx_fis_host + 0x40;
     for (i = 0; i < 20; i++) {
         d2h_fis[i] = 0;
