@@ -1023,13 +1023,8 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
  * guest's rip is reported at the NEXT exit: if the interrupt was taken, that rip is inside FreeBSD's
  * interrupt stub, not back at the instruction the guest was running.
  */
-static int g_inj30_pending = 0;
-static uint64_t g_inj30_rip_before = 0;
-static unsigned int g_inj30_n = 0;
 
 static unsigned long long g_int_eventinj = 0;   /* accepted immediately (direct EVENTINJ) */
-static unsigned int g_int_poll_trace_n = 0;     /* #313: bounds the poll-inject trace */
-static unsigned long long g_int_poll_total = 0; /* #311: the COUNT, so the cap is not read as one */
 static unsigned long long g_int_vintr_defer = 0; /* couldn't accept -> VINTR window armed */
 static unsigned long long g_int_vintr_window = 0;/* VINTR window fired -> deferred inject */
 static unsigned long long g_int_defer_overwrite = 0; /* requested a vector already pending in the IRR (coalesced, not lost) */
@@ -1129,10 +1124,6 @@ trace_done:
         hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
         g_int_eventinj++;
-        if (vector == 0x30u && !g_inj30_pending) {
-            g_inj30_pending = 1;
-            g_inj30_rip_before = real->vmcb->save.rip;
-        }
         return;
     }
 
@@ -1181,10 +1172,6 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         g_int_vintr_window++;
-        if ((uint8_t)v == 0x30u && !g_inj30_pending) {
-            g_inj30_pending = 1;
-            g_inj30_rip_before = real->vmcb->save.rip;
-        }
     }
     hype_svm_sync_vintr(real);
 }
@@ -1227,21 +1214,6 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
         int v = hype_svm_irr_highest(real->pending_irr);
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
-        /* #313: which vector the per-iteration drain actually wins with. If this only ever
-         * reports the timer while a device vector is logged pending, the timer's IRR bit is
-         * never clear and priority-by-vector-number starves everything below it -- which is
-         * candidate (2) on the ticket, and a different fix from candidate (1). */
-        g_int_poll_total++;
-        if (g_int_poll_total == 50u || g_int_poll_total == 200u || g_int_poll_total == 1000u) {
-            hype_debug_print("fw-1 POLLINJ-TOTAL=%llu (last vec=0x%02x)\n",
-                             (unsigned long long)g_int_poll_total, (unsigned int)v);
-        }
-        if (g_int_poll_trace_n < 20u) {
-            g_int_poll_trace_n++;
-            hype_debug_print("fw-1 POLLINJ#%02u vec=0x%02x more_pending=%d\n",
-                             (unsigned int)g_int_poll_trace_n, (unsigned int)v,
-                             hype_svm_irr_any(real->pending_irr));
-        }
     }
     /* Keep the window armed if more vectors remain; disarm once drained. */
     hype_svm_sync_vintr(real);
@@ -1763,52 +1735,6 @@ static int complete_ahci_soft_reset(hype_ahci_t *ahci, uint64_t rx_fis_phys,
     return 0;
 }
 
-/*
- * #311: one timeline for one command. Every VALUE in the completion decision is now measured and
- * correct, so what is left is ORDER: when the completion interrupt is delivered relative to the
- * window in which the guest has recorded the slot outstanding and hype has set PxIS.
- *
- * Armed by the first kernel-era AHCI access, because OVMF drives the same registers for a long
- * time first and swamped five earlier attempts at this. The log is serial, so its order IS the
- * evidence; the TSC delta only says whether a gap is microseconds or seconds.
- */
-static int g_tl_armed = 0;
-static unsigned int g_tl_n = 0;
-
-void hype_ahci_tl_arm(void) {
-    g_tl_armed = 1;
-}
-
-void hype_ahci_tl(const char *tag, unsigned int v) {
-    static const char *last_tag = 0;
-    static unsigned int last_v = 0;
-    static unsigned int run = 0;
-
-    if (!g_tl_armed || g_tl_n >= 60u) {
-        return;
-    }
-    /*
-     * Consecutive identical events are counted, not printed. A raise storm otherwise consumes the
-     * whole budget and hides the one thing being looked for: the first GUEST event after the
-     * completion. The run length is reported when the run ends, so nothing is silently dropped --
-     * a bounded log that hides its own truncation is what misled this ticket five times.
-     */
-    if (tag == last_tag && v == last_v) {
-        run++;
-        return;
-    }
-    if (run > 0u) {
-        hype_debug_print("fw-1 TL   (previous event repeated %ux)\n", run + 1u);
-        run = 0;
-    }
-    last_tag = tag;
-    last_v = v;
-    g_tl_n++;
-    /* No timestamp: hype_rdtsc() is main.c-local, and the log is serial so its ORDER is the
-     * measurement. Plumbing a clock in for a diagnostic is not worth a new dependency. */
-    hype_debug_print("fw-1 TL%02u %s v=0x%x\n", g_tl_n, tag, v);
-}
-
 int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                               const hype_gpa_map_t *dma_map, unsigned slot) {
     uint64_t cmd_list_phys =
@@ -2094,28 +2020,6 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     d2h_fis = rx_fis_host + 0x40;
     hype_ahci_build_d2h_fis(d2h_fis, 0, status_reg, error_reg);
 
-    /* #311: the exact bytes hype leaves for the guest to read after a completion -- the command
-     * header (PRDBC is DW1 at offset 4) and both received FISes. Everything about delivery is
-     * proven working, so what FreeBSD reads to decide a slot finished is the only place left, and
-     * this is a byte-level record of it rather than another hypothesis. First few only. */
-    {
-        static unsigned int cmpl_dump_n = 0;
-        if (cmpl_dump_n < 4000u) { /* large: the interesting completions are the KERNEL's, which are far past any small cap -- OVMF probes the CD first and swamped a 4-entry dump */
-            cmpl_dump_n++;
-            hype_debug_print("fw-1 CMPL#%u hdr=%02x%02x%02x%02x prdbc=%02x%02x%02x%02x "
-                             "pio20=%02x %02x %02x %02x .. e_st=%02x cnt=%02x%02x "
-                             "d2h40=%02x %02x %02x %02x tfd=0x%x xfer=%u\n",
-                             cmpl_dump_n, cmd_hdr_bytes[0], cmd_hdr_bytes[1], cmd_hdr_bytes[2],
-                             cmd_hdr_bytes[3], cmd_hdr_bytes[4], cmd_hdr_bytes[5],
-                             cmd_hdr_bytes[6], cmd_hdr_bytes[7], rx_fis_host[0x20],
-                             rx_fis_host[0x21], rx_fis_host[0x22], rx_fis_host[0x23],
-                             rx_fis_host[0x2F], rx_fis_host[0x31], rx_fis_host[0x30],
-                             rx_fis_host[0x40], rx_fis_host[0x41], rx_fis_host[0x42],
-                             rx_fis_host[0x43], (unsigned int)ahci->p_tfd,
-                             (unsigned int)transferred);
-        }
-    }
-    hype_ahci_tl("C-complete", (unsigned int)ahci->p_is);
     ahci->p_ci &= (uint32_t)~(1u << slot); /* this slot complete */
     /* Completion interrupt-status bit (PxIS.DHRS for D2H completions,
      * PxIS.PSS for PIO-in). A guest that polls waits on this directly;
@@ -2216,7 +2120,6 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
              * "12 acks" off a trace capped at 12 is what sent #311 chasing a PSS-vs-DHRS split
              * that may not exist. */
             if (real->vmcb->save.rip >= 0xffffffff80000000ull) {
-                hype_ahci_tl("A-ack-pxis", (unsigned int)value);
             }
             static unsigned int pis_trace_n = 0;
             static unsigned int pis_total = 0;
@@ -2241,8 +2144,6 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
              * the line hundreds of times for one command" -- the two readings of 500+
              * acknowledgements, with completely different fixes. Totals, not a capped sample. */
             if (real->vmcb->save.rip >= 0xffffffff80000000ull) {
-                hype_ahci_tl_arm();
-                hype_ahci_tl("W-issue-ci", (unsigned int)value);
             }
             {
                 static unsigned int ci_total = 0;
@@ -2271,47 +2172,6 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
         uint32_t value = 0;
         if (hype_ahci_mmio_read(ahci, offset, decoded.size_bytes, &value) != 0) {
             return -1;
-        }
-        /*
-         * #311: what hype hands back for the two registers FreeBSD's completion path hinges on.
-         * Having read the driver source, ahci_ch_intr_main() computes
-         *   cstatus = PxSACT (only when NCQ slots exist) | PxCI
-         *   ok      = ch->rslots & ~cstatus
-         * and calls ahci_end_transaction(ERR_NONE) -> CAM_REQ_CMP for every bit in ok. A timeout
-         * is therefore only reachable if cstatus still holds the slot bit when the ISR reads it.
-         * These are the reads that decide it.
-         */
-        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI ||
-            offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS ||
-            offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_SACT ||
-            offset == HYPE_AHCI_REG_IS) { /* the GLOBAL IS: what ahci_intr() reads to pick a port */
-            /* Gated on a KERNEL rip. Five times on this ticket a capped sample has shown the
-             * wrong era: OVMF polls these same registers through one MmioRead32 helper long
-             * before the kernel starts, and it fills any small sample with reads that are not
-             * the ones in question. Kernel text is at 0xffffffff8-------, the loader is not. */
-            if (real->vmcb->save.rip >= 0xffffffff80000000ull &&
-                offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS) {
-                hype_ahci_tl("I-isr-read", (unsigned int)value);
-            }
-            static unsigned int rd_n = 0;
-            static unsigned int rd_total = 0;
-            rd_total++;
-            if (real->vmcb->save.rip >= 0xffffffff80000000ull && rd_n < 30u) {
-                rd_n++;
-                /* RIP and instr_len: if both reads of a pair share a RIP the instruction is
-                 * re-executing and the decoder's length is the suspect; if they differ, the
-                 * driver genuinely reads twice and the pairing is innocent. */
-                hype_debug_print("fw-1 RD#%02u off=0x%x -> 0x%x rip=0x%llx len=%u sz=%u "
-                                 "(p_ci=0x%x p_is=0x%x)\n",
-                                 rd_n, (unsigned int)offset, (unsigned int)value,
-                                 (unsigned long long)real->vmcb->save.rip,
-                                 (unsigned int)decoded.instr_len,
-                                 (unsigned int)decoded.size_bytes, (unsigned int)ahci->p_ci,
-                                 (unsigned int)ahci->p_is);
-            }
-            if (rd_total == 100u || rd_total == 1000u) {
-                hype_debug_print("fw-1 RD-TOTAL=%u\n", rd_total);
-            }
         }
         if (g_ahci_trace) {
             hype_debug_print("ahci-trace: ABAR read  off=0x%x val=0x%x\n", (unsigned int)offset,
@@ -3147,12 +3007,19 @@ int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
         if (offset == HYPE_IOAPIC_REG_IOWIN && ioapic->ioregsel >= HYPE_IOAPIC_INDEX_REDIR_BASE) {
             uint32_t rel = (ioapic->ioregsel & 0xFFu) - HYPE_IOAPIC_INDEX_REDIR_BASE;
             uint32_t gsi = rel / 2u;
-            static unsigned rte_log_n = 0;
-            if (gsi == 1u || gsi == 3u || gsi == 4u || gsi == 16u || gsi == 20u || gsi == 21u ||
-                rte_log_n < 24u) { /* the device GSIs are always logged: the 24-write cap hid
-                                    * whether a guest ever UNMASKED them, which is the whole
-                                    * question when a completion goes undelivered */
-                rte_log_n++;
+            /*
+             * Bounded PER GSI rather than globally. A single global cap let one chatty line
+             * consume the whole budget and hide the others; exempting the device GSIs from the
+             * cap entirely (as #311 briefly did, to see whether the guest ever unmasked them)
+             * is worse -- a guest that masks a level source for the duration of each handler,
+             * as FreeBSD's intr_execute_handlers does, rewrites that entry on EVERY interrupt.
+             * Uncapped that produced 500+ lines and 95% of a boot log, drowning the guest
+             * console this trace exists to be read beside. Four per GSI answers "did it ever
+             * get programmed, and unmasked" without being able to flood.
+             */
+            static unsigned rte_log_n[24] = {0};
+            if (gsi < 24u && rte_log_n[gsi] < 4u) {
+                rte_log_n[gsi]++;
                 hype_debug_print("fw-1 RTEWR gsi=%u %s=0x%x rip=0x%llx\n", gsi,
                                  (rel & 1u) ? "hi" : "lo", value,
                                  (unsigned long long)real->vmcb->save.rip);
@@ -3823,18 +3690,6 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
      */
     if ((real->vmcb->control.guest_asid_tlb_ctl >> 32) != 0ull) {
         real->vmcb->control.guest_asid_tlb_ctl &= 0xFFFFFFFFull;
-    }
-    if (g_inj30_pending) {
-        g_inj30_pending = 0;
-        if (g_inj30_n < 12u) {
-            g_inj30_n++;
-            hype_debug_print("fw-1 INJ30#%02u rip_before=0x%llx rip_after=0x%llx exit=0x%llx "
-                             "einj=0x%llx\n",
-                             g_inj30_n, (unsigned long long)g_inj30_rip_before,
-                             (unsigned long long)real->vmcb->save.rip,
-                             (unsigned long long)real->vmcb->control.exitcode,
-                             (unsigned long long)real->vmcb->control.eventinj);
-        }
     }
     hype_fpu_save(&real->fpu);
     if (real->tsc_aux_valid) {

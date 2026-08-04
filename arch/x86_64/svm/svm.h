@@ -452,8 +452,6 @@ void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
  * the same registers long before, and swamped five earlier attempts at this measurement), then a
  * bounded serial event log shared by the device path and the FW-1 loop's raise. The log is serial,
  * so its ORDER is the measurement. */
-void hype_ahci_tl_arm(void);
-void hype_ahci_tl(const char *tag, unsigned int v);
 
 /* GLADDER-6c DIAG: reinject an intercepted guest exception via EVENTINJ so the
  * guest takes it through its own IDT on the next VMRUN (used when hype

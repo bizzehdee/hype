@@ -9379,48 +9379,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * re-injection until the line deasserts (below). */
             {
                 uint8_t iov;
+                /*
+                 * A declined raise is NORMAL, not a fault: hype_ioapic_raise() refuses while
+                 * the RTE is masked or its Remote-IRR is still latched, which is exactly the
+                 * state FreeBSD leaves the entry in for the duration of its own handler
+                 * (intr_execute_handlers masks a level source and re-enables on EOI). The
+                 * device re-raises while PxIS stays pending, so a refusal here costs nothing.
+                 */
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
                     vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
                     ahci_irqs++;
-                    hype_ahci_tl("R-raise", (unsigned int)g_fw_1_ahci.p_is);
-                    /* #311: raises of THIS line with the PxIS that justified each. Paired with
-                     * PxCI-ISSUE-TOTAL it separates "the guest re-issues hundreds of commands"
-                     * from "hype re-asserts hundreds of times for one" -- which turned out to be
-                     * the former, and settled a question three earlier traces had muddled. */
-                    {
-                        static unsigned int raise_total = 0;
-                        raise_total++;
-                        if (raise_total == 5u || raise_total == 20u || raise_total == 50u ||
-                            raise_total == 200u || raise_total == 500u) {
-                            hype_debug_print("fw-1 AHCI-RAISE-TOTAL=%u p_is=0x%x p_ie=0x%x "
-                                             "vec=0x%x\n",
-                                             raise_total, (unsigned int)g_fw_1_ahci.p_is,
-                                             (unsigned int)g_fw_1_ahci.p_ie, (unsigned int)iov);
-                        }
-                    }
-                } else {
-                    /* A completion is pending and the IO-APIC will not deliver it. Masked,
-                     * never programmed (vector 0), and Remote-IRR stuck from a previous
-                     * interrupt are three different bugs, and the guest's timeout ladder
-                     * looks identical for all three -- so report the entry, once. */
-                    /* Reported on a rising count rather than once: the FIRST undelivered
-                     * completion can be a transient the guest recovers from, and the one that
-                     * matters is the one that never clears. eoi_count vs ahci_last_eoi says
-                     * whether the guest has stopped acknowledging interrupts entirely or hype
-                     * is failing to drop the line despite EOIs. */
-                    static unsigned int undelivered_n = 0;
-                    if (undelivered_n < 8u) {
-                        undelivered_n++;
-                        hype_debug_print("fw-1 AHCI-IRQ-UNDELIVERED#%u: gsi=%u rte=0x%llx "
-                                         "p_is=0x%x p_ie=0x%x ghc=0x%x pci_line=%u eoi=%llu/%llu\n",
-                                         undelivered_n, (unsigned int)HYPE_FW_1_AHCI_GSI,
-                                         (unsigned long long)g_fw_1_ioapic.rte[HYPE_FW_1_AHCI_GSI],
-                                         (unsigned int)g_fw_1_ahci.p_is,
-                                         (unsigned int)g_fw_1_ahci.p_ie,
-                                         (unsigned int)g_fw_1_ahci.ghc, (unsigned int)line,
-                                         (unsigned long long)g_fw_1_lapic.eoi_count,
-                                         (unsigned long long)ahci_last_eoi);
-                    }
                 }
             }
         } else if (ahci_mapped) {
