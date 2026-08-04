@@ -2162,6 +2162,19 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
             return -1;
         }
         if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && ahci->p_ci != 0) {
+            /* #311: how many commands the guest actually ISSUES. Paired with PxIS-ACK-TOTAL
+             * this separates "the guest re-issues hundreds of commands" from "hype re-asserts
+             * the line hundreds of times for one command" -- the two readings of 500+
+             * acknowledgements, with completely different fixes. Totals, not a capped sample. */
+            {
+                static unsigned int ci_total = 0;
+                ci_total++;
+                if (ci_total == 5u || ci_total == 20u || ci_total == 50u || ci_total == 200u ||
+                    ci_total == 500u) {
+                    hype_debug_print("fw-1 PxCI-ISSUE-TOTAL=%u (p_ci=0x%x)\n", ci_total,
+                                     (unsigned int)ahci->p_ci);
+                }
+            }
             /* The guest issues a command by setting that slot's PxCI bit;
              * libata cycles command slots by tag, so it is NOT always slot
              * 0 (a slot-1 command was exactly what stalled the CD-ROM scan

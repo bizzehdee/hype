@@ -9371,6 +9371,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
                     vmm_request_interrupt(kind, ctx, iov);
                     ahci_irqs++;
+                    /* #311: raises of THIS line with the PxIS that justified each. Paired with
+                     * PxCI-ISSUE-TOTAL it separates "the guest re-issues hundreds of commands"
+                     * from "hype re-asserts hundreds of times for one" -- which turned out to be
+                     * the former, and settled a question three earlier traces had muddled. */
+                    {
+                        static unsigned int raise_total = 0;
+                        raise_total++;
+                        if (raise_total == 5u || raise_total == 20u || raise_total == 50u ||
+                            raise_total == 200u || raise_total == 500u) {
+                            hype_debug_print("fw-1 AHCI-RAISE-TOTAL=%u p_is=0x%x p_ie=0x%x "
+                                             "vec=0x%x\n",
+                                             raise_total, (unsigned int)g_fw_1_ahci.p_is,
+                                             (unsigned int)g_fw_1_ahci.p_ie, (unsigned int)iov);
+                        }
+                    }
                 } else {
                     /* A completion is pending and the IO-APIC will not deliver it. Masked,
                      * never programmed (vector 0), and Remote-IRR stuck from a previous
