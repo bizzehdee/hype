@@ -22,7 +22,8 @@
 
 typedef enum {
     HYPE_INPUT_ACTION_WAIT = 0, /* nothing to do yet -- keep feeding output */
-    HYPE_INPUT_ACTION_SEND,     /* type data[0..len) into the guest */
+    HYPE_INPUT_ACTION_SEND,     /* type data[0..len) into the guest's serial port */
+    HYPE_INPUT_ACTION_SENDKEY,  /* #284: type it into the guest's KEYBOARD instead */
     HYPE_INPUT_ACTION_DONE      /* finished; read the verdict */
 } hype_input_action_kind_t;
 

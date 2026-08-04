@@ -34,7 +34,13 @@
 
 typedef enum {
     HYPE_INPUT_OP_EXPECT = 0, /* wait for `text` to appear in the guest's output */
-    HYPE_INPUT_OP_SEND,       /* type `text` into the guest */
+    HYPE_INPUT_OP_SEND,       /* type `text` into the guest over ttyS0 */
+    /*
+     * INPUT-11 (#284): type `text` into the guest's emulated KEYBOARD instead of its
+     * serial port -- for firmware and guests that read a keyboard: OVMF's boot menu,
+     * GRUB, graphical installers. Same runner, second transport.
+     */
+    HYPE_INPUT_OP_SENDKEY,
     HYPE_INPUT_OP_DELAY,      /* pause `ms` */
     HYPE_INPUT_OP_TIMEOUT,    /* set the per-expect timeout to `ms` */
     HYPE_INPUT_OP_FAIL_IF,    /* arm `text`: if it EVER appears, the run fails */

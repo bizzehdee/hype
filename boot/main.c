@@ -26,6 +26,7 @@
 #include "../core/host_pci.h"
 #include "../core/xhci.h"
 #include "../core/usb_hid.h" /* USB-5 (#217): HID boot-keyboard host input */
+#include "../core/scancode.h"  /* INPUT-11 (#284): ASCII -> PS/2 Set-1 for `sendkey` */
 #include "../core/blk_usb.h"
 #include "../core/ahci_host.h"
 #include "../core/gpt.h"
@@ -205,6 +206,11 @@ static unsigned int g_hid_ep;
 static unsigned long long g_hid_polls;
 static unsigned long long g_hid_reports;
 static unsigned long long g_hid_poll_errs;
+/* #284: scancodes handed to the guest's keyboard by `sendkey`, and how many it has not
+ * yet read. The pair is the proof the transport works: a guest DRAINING them means the
+ * bytes reached its keyboard driver, which is a different (and checkable) claim from
+ * whatever the guest then does with them. */
+static unsigned long long g_sendkey_codes;
 
 #ifndef HYPE_DIAG_PROBE_ONLY
 #define HYPE_DIAG_PROBE_ONLY 0
@@ -376,7 +382,6 @@ static uint64_t g_ram_1_size_bytes;
 #define HYPE_FW_1_GUEST_RAM_MIN_MB 128u
 #define HYPE_FW_1_GUEST_RAM_MAX_MB 3072u
 #define HYPE_SERIAL_COM2 0x2F8u
-#define HYPE_FW_1_KEY_ENTER_MAKE 0x1Cu /* Set-1 make code for Enter */
 #define HYPE_FW_1_DEBUG_PORT 0x402u    /* FW-1g: OVMF SEC/PEI PlatformDebugLibIoPort */
 /* M8-0a: the FW-1 guest only ever maps the low 4 GiB of guest-physical space
  * (1 GiB RAM at 0, the OVMF flash window just under 4 GiB, everything between
@@ -1319,7 +1324,6 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * guest stays idle for HYPE_FW_1_KEY_WAIT_EXITS total VM-exits after the
  * key, it didn't consume it on a ConIn source we feed -- don't claim it
  * advanced. */
-#define HYPE_FW_1_KEY_REACTION_CHARS 40ULL  /* new console chars after the key => menu rendered => reacted */
 #define HYPE_FW_1_KEY_REARM_INTERVAL 256ULL /* re-arm the scancode every N exits (leaves OBF-clear windows) */
 #define HYPE_FW_1_KEY_WAIT_EXITS 20000ULL   /* give up waiting for a reaction after this many exits post-key */
 /* FW-1g: inject a key once the guest has done this many *consecutive*
@@ -1328,20 +1332,20 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * polls port 0x64 thousands of times). Keyboard init interleaves data
  * reads/command writes, which reset the run, so a run this long is
  * unambiguously an idle input-wait, not init. */
-#define HYPE_FW_1_KBD_POLL_INJECT_RUN 512ULL
 
-/* GLADDER-6b: auto keystroke injection (both the 0x64-poll and the HLT-idle
- * sites below) exists ONLY to drive an EMPTY-OVMF bring-up past the BDS "press
- * any key to enter the Boot Manager Menu" prompt and the UEFI Shell's "press
- * any key to continue" countdown (FW-1e/f/g, tasks #67-69). A GLADDER guest
- * boots a REAL bootable ISO instead: OVMF auto-launches the CD boot option (no
- * key needed to interrupt into the menu) and hands off to GRUB, whose grub.cfg
- * carries its own `set timeout=30` and auto-boots the default entry with no
- * input at all. Injecting a premature Enter there is actively harmful -- it
- * makes GRUB leave its menu-countdown loop early and stall (observed on Ubuntu
- * Server: GRUB consumed the Enter, stopped polling input, and never booted).
- * So default this OFF; flip to 1 only for a media-less OVMF-shell bring-up. */
-#define HYPE_FW_1_AUTO_KEY_INJECT 0
+/*
+ * INPUT-11 (#284): HYPE_FW_1_AUTO_KEY_INJECT is GONE.
+ *
+ * It existed to press "any key" at a firmware prompt by guessing from exit counts and
+ * keyboard-poll runs. It was compiled off by default because guessing wrong is
+ * actively harmful: on Ubuntu Server it fed GRUB a premature Enter, GRUB left its
+ * menu-countdown loop, stopped polling input, and never booted.
+ *
+ * The scripted `sendkey` directive is the correct version of the same idea -- it waits
+ * for a SPECIFIC prompt with `expect` before typing, so it cannot fire early. Keeping
+ * the blunt one alongside it would leave a second, dumber input path that only differs
+ * by being wrong sometimes.
+ */
 
 /* M3-1: NPT identity map for the same test guest, built fresh on
  * every (re)start like everything else here. */
@@ -7704,16 +7708,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     unsigned int uart_line_len = 0;
     hype_vt_filter_t uart_filter2;
     unsigned int uart_line_len2 = 0;
-    int key_injected = 0;
-    int key_reacted = 0;
-    unsigned long long kbd_poll_run = 0; /* FW-1g: consecutive empty keyboard status polls */
     unsigned long long timer_irqs = 0;   /* M4-6b: guest LAPIC-timer IRQs actually delivered */
     unsigned long long pit_irqs = 0;     /* M4-6b4: PIT IRQ0 (legacy clockevent) IRQs delivered */
     unsigned long long ahci_irqs = 0;    /* M4-6d2: AHCI completion IRQs raised on the guest's line */
     unsigned long long console_chars = 0;
-    unsigned long long inject_chars = 0;
-    unsigned long long inject_productive = 0;
-    unsigned long long inject_total = 0;
     hype_vt_filter_t dbg_filter;
     unsigned int dbg_line_len = 0;
     /* FW-1h: set once OVMF has sized+placed BAR5 and enabled Memory
@@ -8184,6 +8182,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * reached, or simply nobody typing, and on a serial-less machine the
                  * log is the only way to tell.
                  */
+                if (g_sendkey_codes != 0u) {
+                    hype_debug_print("fw-1 DIAG: SENDKEY codes=%llu still_pending=%d [#284]\n",
+                                     g_sendkey_codes,
+                                     hype_ps2_kbd_has_pending_byte(&vm->ps2));
+                }
                 if (g_hid_ready) {
                     hype_debug_print("fw-1 DIAG: HID polls=%llu reports=%llu errors=%llu "
                                      "(slot%u ep=0x%02x) [#217]\n",
@@ -9312,11 +9315,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * FW-1h needs the CD to boot and M4-6 needs the kernel to start,
          * both of which happen only if the loop runs on past the first
          * prompt rather than terminating at it. */
-        if (key_injected && !key_reacted &&
-            console_chars - inject_chars >= HYPE_FW_1_KEY_REACTION_CHARS) {
-            key_reacted = 1;
-        }
-
         if (vmm_reason_is_xsetbv(kind, info.reason)) {
             /* #251: guest enabling XSAVE state. Same fall-through discipline as
              * the CR-access exit -- if the form is not modelled, do NOT continue,
@@ -9843,36 +9841,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             {
                 int kbd_wait = 0;
                 if (vmm_handle_ps2_ioio(kind, ctx, &g_fw_1_ps2, &g_fw_1_mouse, &kbd_wait) == 0) {
-                    if (kbd_wait) {
-                        kbd_poll_run++;
-                    } else {
-                        kbd_poll_run = 0;
-                    }
-                    /* Feed Enter whenever the guest has clearly settled
-                     * into an input-wait (a long run of empty status
-                     * polls) past the boot threshold. This UNBLOCKS the
-                     * prompt so the guest proceeds -- the early OVMF/BDS
-                     * "press a key to continue" prompt, then GRUB's menu,
-                     * then the shell -- rather than stalling. Re-arms only
-                     * after another full poll run (kbd_poll_run reset to
-                     * 0), so it never holds OBF perpetually set. */
-                    if (HYPE_FW_1_AUTO_KEY_INJECT &&
-                        productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
-                        kbd_poll_run >= HYPE_FW_1_KBD_POLL_INJECT_RUN) {
-                        if (!key_injected) {
-                            hype_debug_print(
-                                "fw-1: guest polling the keyboard at an interactive prompt (%llu "
-                                "consecutive empty status reads, %llu productive exits) -- feeding Enter "
-                                "to drive it forward (FW-1g)\n",
-                                (unsigned long long)kbd_poll_run, (unsigned long long)productive_exits);
-                        }
-                        hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, HYPE_FW_1_KEY_ENTER_MAKE);
-                        kbd_poll_run = 0;
-                        key_injected = 1;
-                        inject_chars = console_chars;
-                        inject_productive = productive_exits;
-                        inject_total = total_exits;
-                    }
+                    /* #284: the empty-poll run used to trigger a guessed Enter
+                     * injection. A script's `expect` + `sendkey` waits for the actual
+                     * prompt instead, so there is nothing to count here any more. */
+                    (void)kbd_wait;
                     continue;
                 }
             }
@@ -10273,20 +10245,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * and COM2 -- this build's DEBUG log is on COM2, so the
              * interactive Terminal ConIn may be on either; whichever OVMF
              * actually polls consumes it. */
-            if (HYPE_FW_1_AUTO_KEY_INJECT && !key_injected) {
-                hype_debug_print(
-                    "fw-1: OVMF idle at its prompt -- injecting Enter via PS/2 + COM1/COM2 (ConIn test)\n");
-                /* PS/2 is OVMF's real ConIn here; serial RX is belt-and-
-                 * suspenders in case the Terminal console is active. */
-                hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, HYPE_FW_1_KEY_ENTER_MAKE);
-                hype_guest_uart_rx_enqueue(&g_fw_1_uart, (uint8_t)'\r');
-                hype_guest_uart_rx_enqueue(&g_fw_1_uart2, (uint8_t)'\r');
-                key_injected = 1;
-                inject_chars = console_chars;
-                inject_productive = productive_exits;
-                inject_total = total_exits;
-                continue;
-            }
             /* M4-6d2: a HLT with IF=1 is an interrupt-wait (Linux idle /
              * msleep does `sti; hlt`). Because we intercept the HLT before
              * it retires, the STI interrupt-shadow that covered it never
@@ -10364,7 +10322,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     booted = 1;
                     break;
                 }
-            } else if (total_exits - inject_total >= HYPE_FW_1_KEY_WAIT_EXITS) {
+            } else if (total_exits >= HYPE_FW_1_KEY_WAIT_EXITS) {
                 booted = 1;
                 break;
             }
@@ -10559,17 +10517,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                           g_fw_1_lapic.timer_irq_pending, g_fw_1_lapic.timer_in_service);
     }
 
-    if (booted && key_reacted) {
-        hype_debug_print(
-            "fw-1: real OVMF BOOTED + INTERACTIVE (FW-1g) -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2, "
-            "AHCI CD-ROM) with %llu chars of console output forwarded, and the injected PS/2 Enter was "
-            "READ by the guest's keyboard driver at its interactive prompt (the guest polled 0x64, we set "
-            "OBF, it read scancode 0x1C off 0x60) and REACTED with %llu productive exits + new console "
-            "output -- guest ConIn confirmed end-to-end. guest_rip=0x%llx.\n",
-            (unsigned long long)console_chars, (unsigned long long)(productive_exits - inject_productive),
-            (unsigned long long)info.guest_rip);
-        return;
-    }
     if (booted) {
         hype_debug_print(
             "fw-1: real OVMF BOOTED -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2, AHCI CD-ROM), %llu "
@@ -11078,6 +11025,36 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
                 hype_guest_uart_rx_enqueue(uart, act.data[i]);
             }
             continue; /* a script may send twice in a row */
+        }
+        if (k == HYPE_INPUT_ACTION_SENDKEY) {
+            /*
+             * INPUT-11 (#284): the keyboard transport. Same runner, same script, but the
+             * bytes become PS/2 Set-1 scancodes in this VM's emulated keyboard -- which
+             * is the only thing OVMF's boot menu and GRUB read.
+             *
+             * Per character rather than whole-string so an unmappable character stops
+             * exactly there: hype_ascii_string_to_set1 would stop too, but doing it here
+             * lets the log name the character, and a script that cannot type what it
+             * asked for should say so rather than type a different string.
+             */
+            uint32_t i;
+            for (i = 0; i < act.len; i++) {
+                uint8_t codes[HYPE_SCANCODE_MAX_PER_CHAR];
+                unsigned int n = hype_ascii_to_set1((char)act.data[i], codes,
+                                                    (unsigned)sizeof(codes));
+                unsigned int j;
+                if (n == 0u) {
+                    hype_debug_print("fw-1 SCRIPT vm%u: sendkey cannot type byte 0x%02x -- "
+                                     "no Set-1 mapping; stopping this sendkey [#284]\n",
+                                     vm_index, (unsigned)act.data[i]);
+                    break;
+                }
+                for (j = 0; j < n; j++) {
+                    hype_ps2_kbd_enqueue_scancode(&vm->ps2, codes[j]);
+                    g_sendkey_codes++;
+                }
+            }
+            continue;
         }
         break;
     }

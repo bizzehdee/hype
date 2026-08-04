@@ -162,6 +162,12 @@ hype_input_parse_result_t hype_input_script_parse(const char *text, uint32_t len
             uint32_t kwlen = kw_end - kw_start;
             if (keyword_is(kw, kwlen, "expect")) {
                 d->op = HYPE_INPUT_OP_EXPECT;
+            } else if (keyword_is(kw, kwlen, "sendkey")) {
+                /* Checked BEFORE "send" would be a prefix problem only if the matcher
+                 * were a prefix match; keyword_is compares the whole token, so order is
+                 * not load-bearing here -- but keeping sendkey adjacent to send makes
+                 * the pair obvious to a reader. */
+                d->op = HYPE_INPUT_OP_SENDKEY;
             } else if (keyword_is(kw, kwlen, "send")) {
                 d->op = HYPE_INPUT_OP_SEND;
             } else if (keyword_is(kw, kwlen, "delay")) {
