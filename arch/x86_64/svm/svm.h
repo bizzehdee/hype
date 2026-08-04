@@ -39,6 +39,66 @@
 #define HYPE_EFER_SVME (1ULL << 12)
 #define HYPE_MSR_VM_HSAVE_PA 0xC0010117u
 
+/*
+ * #316: EFER field layout, from AMD APM Vol 2 §3.1.7 / Figure 3-9
+ * (research/24593_3.44_APM_Vol2.pdf p.56). Needed because a guest's WRMSR to EFER is
+ * INTERCEPTED and emulated, so hype -- not hardware -- is what enforces the rules.
+ */
+#define HYPE_EFER_SCE (1ULL << 0)   /* SysCall extensions */
+#define HYPE_EFER_LME (1ULL << 8)   /* Long Mode Enable */
+#define HYPE_EFER_LMA (1ULL << 10)  /* Long Mode Active -- hardware-owned, see below */
+#define HYPE_EFER_NXE (1ULL << 11)  /* No-Execute Enable */
+/* Bits 7:1 are RAZ (read as zero), so a write to them is dropped rather than faulted. */
+#define HYPE_EFER_RAZ 0x00000000000000FEULL
+/*
+ * Bits that must be zero: 9, 16, 19 and 63:22. Writing any of them is a #GP on real
+ * hardware, and leaving one set in the VMCB makes VMRUN fail its "Any MBZ bit of EFER is
+ * set" consistency check (APM §15.5.1) -- which kills the hypervisor, not the guest.
+ */
+#define HYPE_EFER_MBZ 0xFFFFFFFFFFC90200ULL
+
+/* CR bits the EFER cross-checks in APM §15.5.1's illegal-state list depend on. */
+#define HYPE_CR0_PE (1ULL << 0)
+#define HYPE_CR0_PG (1ULL << 31)
+#define HYPE_CR4_PAE (1ULL << 5)
+
+/*
+ * #316: decide what a guest's WRMSR to EFER should actually put in the VMCB.
+ *
+ * Returns 0 and writes *out when the write is legal, or -1 when a real WRMSR would raise
+ * #GP(0) and the caller should inject that instead of storing the value.
+ *
+ * This exists because storing the guest's value verbatim is a guest-triggerable way to kill
+ * hype. VMRUN refuses a VMCB whose GUEST EFER has SVME clear (APM §15.5.1's very first
+ * illegal-state condition), and the APM says so in as many words at §3.1.7:
+ *
+ *     "The effect of turning off EFER.SVME while a guest is running is undefined; therefore,
+ *      the VMM should always prevent guests from writing EFER."
+ *
+ * OpenBSD 7.9 is the guest that found it. Its kernel's long-mode re-entry rebuilds EFER from
+ * scratch rather than read-modify-writing it -- `rdmsr; mov %eax,%ebx; xor %eax,%eax; or
+ * $0x101,%eax; ... wrmsr` -- so the value it writes has SVME clear. Linux, FreeBSD and OVMF
+ * all happen to OR into the value they read, which preserved hype's SVME bit by accident and
+ * is why no guest had exposed this before.
+ *
+ * So: SVME is forced back on, LMA is taken from the CURRENT value (hardware owns it; the APM
+ * requires software to preserve it and faults a mismatch), RAZ bits are dropped, and anything
+ * that would leave an illegal EFER/CR0/CR4 combination is refused as #GP rather than handed to
+ * VMRUN. Pure, so it is unit tested directly.
+ */
+int hype_svm_guest_efer_write(uint64_t current_efer, uint64_t requested, uint64_t cr0,
+                              uint64_t cr4, uint64_t *out);
+
+/*
+ * #316: what a guest's RDMSR of EFER should report -- the stored value with SVME masked off.
+ *
+ * The guest never asked for SVME; hype forces it in because VMRUN requires it. Reporting it
+ * back would tell the guest SVM is available while hype's own CPUID clears the SVM feature bit
+ * (arch/x86_64/cpu/cpuid_emulate.c), and a guest that believed it could then try to use SVM
+ * instructions. Masking keeps the two answers consistent.
+ */
+uint64_t hype_svm_guest_efer_read(uint64_t stored_efer);
+
 /* VM_CR (AMD SDM Vol 2, 15.31): bit 4 (SVMDIS) can be set by firmware
  * to lock SVM off independently of the "SVM enabled" BIOS toggle the
  * user sees -- if set, the EFER.SVME WRMSR in hype_svm_enable() below

@@ -1559,12 +1559,26 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     }
     case HYPE_MSR_ACTION_READWRITE_EFER:
         if (is_write) {
-            uint64_t value =
+            uint64_t requested =
                 ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+            uint64_t value = 0;
+            /*
+             * #316: never store the guest's value verbatim. VMRUN refuses a VMCB whose guest
+             * EFER has SVME clear, so a guest that rebuilds EFER from zero -- OpenBSD's kernel
+             * does exactly that -- used to take hype down with it on the next entry. An illegal
+             * write now becomes the guest's own #GP(0), which is what real hardware does, and
+             * keeps a faulted guest contained to itself (AGENTS.md).
+             */
+            if (hype_svm_guest_efer_write(real->vmcb->save.efer, requested, real->vmcb->save.cr0,
+                                          real->vmcb->save.cr4, &value) != 0) {
+                hype_svm_vcpu_reinject_exception(ctx, 13u, 1, 0u); /* #GP(0) */
+                return 0;                                         /* faulted: do NOT skip the WRMSR */
+            }
             real->vmcb->save.efer = value;
         } else {
-            real->vmcb->save.rax = (uint64_t)(uint32_t)real->vmcb->save.efer;
-            real->gprs[2] = (uint64_t)(uint32_t)(real->vmcb->save.efer >> 32);
+            uint64_t value = hype_svm_guest_efer_read(real->vmcb->save.efer);
+            real->vmcb->save.rax = (uint64_t)(uint32_t)value;
+            real->gprs[2] = (uint64_t)(uint32_t)(value >> 32);
         }
         break;
     case HYPE_MSR_ACTION_READ_TSC: {
