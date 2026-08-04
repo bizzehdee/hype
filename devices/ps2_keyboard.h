@@ -107,13 +107,26 @@ void hype_ps2_kbd_reset(hype_ps2_kbd_t *kbd);
  * Host-facing: a real key press/release event arrives as an
  * already-encoded scancode byte (the caller's job to encode Set 1/2/3
  * as appropriate -- this module is scancode-set-agnostic, it just
- * buffers whatever byte it's given). Overwrites any unread previous
- * byte (this project's own single-pending-byte scope) and sets OBF.
+ * buffers whatever byte it's given). Discards anything the guest has not
+ * yet read and sets OBF -- see try_enqueue below for when that is wrong.
  * Does not raise IRQ1 itself -- that needs a vcpu context this pure
  * module never touches (the exempt glue's job, see this file's own
  * top comment).
  */
 void hype_ps2_kbd_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode);
+
+/*
+ * #301: append a scancode only if the FIFO has room; returns 1 if it was queued, 0 if
+ * the caller must retry later.
+ *
+ * Needed because hype_ps2_kbd_enqueue_scancode() above DISCARDS whatever the guest has
+ * not read yet. For one keystroke from a human that is the right trade. For a sequence
+ * it is not: a shifted character is four bytes (shift-make, key-make, key-break,
+ * shift-break), and clobbering meant the guest saw only the shift RELEASE -- so
+ * scripted `sendkey` (#284) could deliver at most one unshifted keystroke and silently
+ * dropped everything else. A caller that pushes a sequence must be able to WAIT.
+ */
+int hype_ps2_kbd_try_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode);
 
 /*
  * Port 0x60 (data) and 0x64 (status/command) dispatch. Returns 0 if

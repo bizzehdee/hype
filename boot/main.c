@@ -465,7 +465,26 @@ typedef struct hype_fw_vm {
     hype_input_script_t in_script;
     hype_input_runner_t in_runner;
     int in_script_armed; /* a script loaded and parsed cleanly for THIS vm */
-    int in_verdict_reported; /* INPUT-9 (#282): verdict line already emitted */
+    int in_verdict_reported;
+    /*
+     * #301: bytes of the CURRENT send/sendkey directive still to be delivered.
+     *
+     * The injector used to push a whole directive into the device model in one go and
+     * ignore the result. The guest UART's receive ring holds 63 usable bytes and the PS/2
+     * keyboard's enqueue DISCARDED anything unread, so a long `send` arrived truncated
+     * (no newline -> the shell never ran it) and a `sendkey` of more than one keystroke
+     * arrived as its last scancode. Both made the script run a DIFFERENT command and
+     * report "expect timed out", which is a harness lying about what it did.
+     *
+     * So a directive is now staged here and drained at whatever rate the device accepts,
+     * and the script does not advance until it is fully delivered. Sized for the longest
+     * directive at its worst expansion: every character shifted, four scancodes each.
+     */
+    uint8_t in_send_buf[HYPE_INPUT_SCRIPT_MAX_ARG * HYPE_SCANCODE_MAX_PER_CHAR];
+    uint32_t in_send_len;
+    uint32_t in_send_pos;
+    int in_send_is_key;
+    unsigned int in_send_stalls; /* INPUT-9 (#282): verdict line already emitted */
     /* M8-8 (#171): this VM's own fault watchdog. Per-VM so a faulted guest is forced
      * off ALONE -- condemning a healthy sibling would be worse than the hang. */
     hype_vm_watchdog_t watchdog;
@@ -11081,6 +11100,45 @@ static void fw_1_report_script_verdict(hype_fw_vm_t *vm, unsigned vm_index, uint
  *
  * Per-VM throughout -- runner, tail and target UART all come from `vm`.
  */
+/*
+ * #301: push as much of the staged directive as the target device will take, and say
+ * whether it all went. Returns 1 when the directive is fully delivered, 0 when the
+ * caller must come back on a later dispatch iteration.
+ *
+ * A stall counter bounds it: a device that never drains means the guest is not reading
+ * its input at all, and a script that waits forever for that reports nothing. Failing
+ * with a named reason is the point -- the old code's silent truncation is what made a
+ * mis-delivered command look like a guest that ignored it.
+ */
+#define HYPE_SCRIPT_SEND_MAX_STALLS 2000000u
+
+static int fw_1_script_drain_send(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uart_t *uart) {
+    while (vm->in_send_pos < vm->in_send_len) {
+        uint8_t b = vm->in_send_buf[vm->in_send_pos];
+        int accepted = vm->in_send_is_key ? hype_ps2_kbd_try_enqueue_scancode(&vm->ps2, b)
+                                          : hype_guest_uart_rx_enqueue(uart, b);
+        if (!accepted) {
+            if (++vm->in_send_stalls >= HYPE_SCRIPT_SEND_MAX_STALLS) {
+                hype_debug_print("fw-1 SCRIPT vm%u: guest never drained its input -- %u of %u "
+                                 "byte(s) of this %s undelivered; abandoning it rather than "
+                                 "sending a truncated command [#301]\n",
+                                 vm_index, (unsigned)(vm->in_send_len - vm->in_send_pos),
+                                 (unsigned)vm->in_send_len,
+                                 vm->in_send_is_key ? "sendkey" : "send");
+                vm->in_send_pos = vm->in_send_len; /* give up on the remainder */
+                return 1;
+            }
+            return 0;
+        }
+        vm->in_send_pos++;
+        vm->in_send_stalls = 0;
+        if (vm->in_send_is_key) {
+            g_sendkey_codes++;
+        }
+    }
+    return 1;
+}
+
 static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uart_t *uart,
                              uint64_t now_ms) {
     hype_input_action_t act;
@@ -11088,12 +11146,24 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
     if (!vm->in_script_armed) {
         return;
     }
+    /* Finish whatever the previous iteration could not fit before touching the script:
+     * advancing with bytes still staged would interleave two directives. */
+    if (vm->in_send_pos < vm->in_send_len && !fw_1_script_drain_send(vm, vm_index, uart)) {
+        return;
+    }
     for (;;) {
         hype_input_action_kind_t k = hype_input_runner_poll(&vm->in_runner, now_ms, &act);
         if (k == HYPE_INPUT_ACTION_SEND) {
             uint32_t i;
-            for (i = 0; i < act.len; i++) {
-                hype_guest_uart_rx_enqueue(uart, act.data[i]);
+            for (i = 0; i < act.len && i < (uint32_t)sizeof(vm->in_send_buf); i++) {
+                vm->in_send_buf[i] = act.data[i];
+            }
+            vm->in_send_len = i;
+            vm->in_send_pos = 0;
+            vm->in_send_is_key = 0;
+            vm->in_send_stalls = 0;
+            if (!fw_1_script_drain_send(vm, vm_index, uart)) {
+                return; /* device full -- resume on the next dispatch iteration */
             }
             continue; /* a script may send twice in a row */
         }
@@ -11109,6 +11179,7 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
              * asked for should say so rather than type a different string.
              */
             uint32_t i;
+            vm->in_send_len = 0;
             for (i = 0; i < act.len; i++) {
                 uint8_t codes[HYPE_SCANCODE_MAX_PER_CHAR];
                 unsigned int n = hype_ascii_to_set1((char)act.data[i], codes,
@@ -11121,9 +11192,16 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
                     break;
                 }
                 for (j = 0; j < n; j++) {
-                    hype_ps2_kbd_enqueue_scancode(&vm->ps2, codes[j]);
-                    g_sendkey_codes++;
+                    if (vm->in_send_len < (uint32_t)sizeof(vm->in_send_buf)) {
+                        vm->in_send_buf[vm->in_send_len++] = codes[j];
+                    }
                 }
+            }
+            vm->in_send_pos = 0;
+            vm->in_send_is_key = 1;
+            vm->in_send_stalls = 0;
+            if (!fw_1_script_drain_send(vm, vm_index, uart)) {
+                return;
             }
             continue;
         }
@@ -12689,8 +12767,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         unsigned int xhci_count = 0;
         int msc_found_any = 0;
         hype_usb_inventory_reset(&g_usb_inv); /* #241 */
-        while (!msc_found_any &&
-               hype_host_pci_find_xhci_from(hype_host_pci_read32_hw, 255u, xhci_cur, &hx,
+        /*
+         * #299: sweep EVERY controller. This used to stop at the first one holding a USB
+         * mass-storage device, because the xHCI ring state was single-instance and the
+         * only way to look at the next controller was to quiesce this one -- which is
+         * exactly what must not happen to the controller carrying hype's log medium. Now
+         * each controller owns its own rings, so several can be Running at once and a
+         * keyboard on the PCH controller is reachable while storage streams from the
+         * TCSS one. The bound is the ring-block pool (HYPE_XHCI_MAX_CTRL); a controller
+         * that cannot get a block says so and is skipped.
+         */
+        while (hype_host_pci_find_xhci_from(hype_host_pci_read32_hw, 255u, xhci_cur, &hx,
                                             &xhci_bdf)) {
             hype_xhci_ctrl_t xc;
             xhci_count++;
@@ -13016,12 +13103,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  * outlives this probe scope (it streams for the whole run and
                                  * at the diagnostic halt). Stream whatever's been logged so far;
                                  * flushed again on the RT-3 cadence and at the probe halt. */
-                                g_usb_xc = xc;
-                                g_usb_msc = msc;
-                                hype_blk_usb_init(&g_usb_ubk, &g_usb_uphys, &g_usb_ube, &g_usb_xc,
-                                                  msc_slot, &g_usb_msc, 512u,
-                                                  (uint64_t)last_lba + 1u);
-                                usb_log_setup(&g_usb_ube);
+                                /* #299: the sweep now continues past this controller, so a
+                                 * second USB disk must not re-point the log sink at itself
+                                 * mid-run. First one wins. */
+                                if (!msc_found_any) {
+                                    g_usb_xc = xc;
+                                    g_usb_msc = msc;
+                                    hype_blk_usb_init(&g_usb_ubk, &g_usb_uphys, &g_usb_ube,
+                                                      &g_usb_xc, msc_slot, &g_usb_msc, 512u,
+                                                      (uint64_t)last_lba + 1u);
+                                    usb_log_setup(&g_usb_ube);
+                                }
                             }
 #if HYPE_XHCI_MSC_WRITE_SELFTEST
                             if (bsz == 512u) {
@@ -13120,24 +13212,27 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         hi = hype_usb_inventory_next_unclaimed_class(&g_usb_inv, HYPE_USB_CLASS_HID,
                                                                      hi);
                     }
-                    if (!g_hid_ready) {
-                        hype_debug_print("host-hid: no USB boot keyboard claimed (PS/2 host keyboard "
-                                         "only) [#217]\n");
-                    }
+                    /* The "no keyboard found" verdict is printed once AFTER the whole
+                     * sweep, not here: this runs per controller, so on a two-controller
+                     * machine it announced "no USB boot keyboard" for the storage
+                     * controller and then claimed one on the next -- two contradictory
+                     * lines in the log an operator has to read after the fact. */
                 }
+                /*
+                 * #299: quiesce ONLY a controller nothing was kept on. Keeping the
+                 * medium's controller Running is the whole point; and a keyboard claimed
+                 * here (g_hid_xc) needs its controller Running too, or the very first
+                 * poll finds a halted controller. Releasing an idle controller's ring
+                 * block returns it to the pool, which is what lets a third controller be
+                 * looked at on a machine that has more controllers than blocks.
+                 */
                 if (msc_found) {
-                    msc_found_any = 1; /* stop scanning further controllers */
-                } else {
-                    /* Nothing here -- stop this controller before the next one is
-                     * brought up. The DCBAA / command ring / event ring in
-                     * xhci_hw.c are single-instance, so leaving this one Running
-                     * would leave two controllers DMAing into the same rings with
-                     * one shared cycle/dequeue state (see hype_xhci_host_quiesce).
-                     * That is what broke the Intel box, which is the first
-                     * two-xHCI machine this has run on. */
+                    msc_found_any = 1;
+                }
+                if (!msc_found && !(g_hid_ready && g_hid_xc.bar == xc.bar)) {
                     hype_xhci_host_quiesce(&xc);
-                    hype_debug_print("host-xhci: controller[%u] quiesced (shared rings released for "
-                                      "the next controller)\n", xhci_count);
+                    hype_debug_print("host-xhci: controller[%u] quiesced -- nothing kept on it; "
+                                      "ring block returned to the pool [#299]\n", xhci_count);
                 }
             }
         } /* while (each xHCI controller) */
@@ -13181,10 +13276,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * cross-controller inventory needs per-controller ring state; the device
              * on the other controller is not "missed", it is unreachable today.
              */
-            if (msc_found_any && xhci_count > 1u) {
-                hype_debug_print("host-usb: NOTE -- controllers after the one holding hype's medium "
-                                 "were not enumerated (single-instance xHCI rings); needs "
-                                 "per-controller ring state [#241]\n");
+            if (!g_hid_ready) {
+                hype_debug_print("host-hid: no USB boot keyboard on any controller (PS/2 host "
+                                 "keyboard only) [#217]\n");
+            }
+            if (xhci_count > HYPE_XHCI_MAX_CTRL) {
+                hype_debug_print("host-usb: NOTE -- %u xHCI controller(s) present but only %u "
+                                 "per-controller ring blocks exist, so the last %u could not be "
+                                 "enumerated [#299]\n",
+                                 xhci_count, HYPE_XHCI_MAX_CTRL,
+                                 xhci_count - HYPE_XHCI_MAX_CTRL);
             }
         }
         if (xhci_count == 0u) {

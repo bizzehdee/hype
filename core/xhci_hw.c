@@ -14,81 +14,126 @@
 #define XPAGE 4096u
 #define RING_TRBS 16u
 #define MAX_SCRATCH 64u
+#define DEVPOOL 8u
 #define SPIN 20000000u
 /* #266: one second, chosen against the measured distribution (mean 493,692 spins,
  * worst observed ~36,000,000 spins). Generous by design -- being early is what
  * caused the bug. */
 #define HYPE_XHCI_EVENT_TIMEOUT_US 1000000u
 
-/* DMA-visible controller structures (physically contiguous, hype .bss). */
-static uint8_t g_dcbaa[XPAGE] __attribute__((aligned(XPAGE)));       /* device context base addr array */
-static uint8_t g_cmd_ring[XPAGE] __attribute__((aligned(XPAGE)));    /* command ring */
-static uint8_t g_evt_ring[XPAGE] __attribute__((aligned(XPAGE)));    /* event ring segment 0 */
-static uint8_t g_erst[64] __attribute__((aligned(64)));              /* event ring segment table */
-static uint8_t g_scratch_arr[XPAGE] __attribute__((aligned(XPAGE))); /* scratchpad buffer array */
-static uint8_t g_scratch_pages[MAX_SCRATCH][XPAGE] __attribute__((aligned(XPAGE)));
-/* USB-5 (#217): the HID keyboard's interrupt-IN transfer ring and report buffer. Kept
- * separate from the bulk rings so a keyboard poll can never disturb the MSC datapath
- * the log sink depends on. */
-static uint8_t g_int_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
-static uint8_t g_hid_report[64] __attribute__((aligned(64)));
-static unsigned int g_iin_enq;
-static unsigned int g_iin_cyc = 1u;
 /*
- * Is a report transfer currently OUTSTANDING?
+ * #299: every controller-owned DMA structure and ring cursor, in ONE block, with a small
+ * fixed pool of them (HYPE_XHCI_MAX_CTRL, see xhci.h for why it is bounded and why these
+ * cannot be shared).
  *
- * An interrupt endpoint needs exactly ONE transfer queued at a time, re-armed after
- * each completion. Enqueuing on every poll call -- which the guest dispatch loop makes
- * thousands of times a second -- fills the 256-TRB ring in a fraction of a second and
- * the keyboard goes silent, which is precisely what the first QEMU test showed: the
- * endpoint configured, the device claimed, and not one report ever delivered.
+ * Note slot_dev/dev_used live here too: xHCI slot IDs are assigned PER CONTROLLER, so a
+ * shared slot table would have controller B's slot 1 overwrite controller A's.
  */
-static int g_iin_armed;
-static uint64_t g_iin_pending_trb;
-/* Device pool: hub descent (#231 pt5b) needs several devices addressed at once
- * (a hub plus the device behind it), so each addressed device owns its own
- * Device Context + EP0 ring + ring cursor, keyed by its slot id. The Input
- * Context is shared -- the controller only reads it transiently during Address
- * Device / Configure Endpoint. */
-#define DEVPOOL 8u
-static uint8_t g_input_ctx[XPAGE] __attribute__((aligned(XPAGE)));
-static uint8_t g_dev_ctx[DEVPOOL][XPAGE] __attribute__((aligned(XPAGE)));
-static uint8_t g_ep0_ring[DEVPOOL][XPAGE] __attribute__((aligned(XPAGE)));
-static uint8_t g_xfer_buf[XPAGE] __attribute__((aligned(XPAGE)));
-static unsigned int g_ep0_enq[DEVPOOL];
-static unsigned int g_ep0_cyc[DEVPOOL];
-static unsigned int g_dev_used[DEVPOOL];      /* 1 if this pool slot is in use */
-static unsigned int g_slot_dev[256];          /* slot id -> pool index + 1 (0 = none) */
+typedef struct {
+    int in_use;
 
-static int dev_alloc(unsigned int slot) {
+    /* Controller-wide structures. */
+    uint8_t dcbaa[XPAGE] __attribute__((aligned(XPAGE)));       /* device context base addr array */
+    uint8_t cmd_ring[XPAGE] __attribute__((aligned(XPAGE)));    /* command ring */
+    uint8_t evt_ring[XPAGE] __attribute__((aligned(XPAGE)));    /* event ring segment 0 */
+    uint8_t erst[64] __attribute__((aligned(64)));              /* event ring segment table */
+    uint8_t scratch_arr[XPAGE] __attribute__((aligned(XPAGE))); /* scratchpad buffer array */
+    uint8_t scratch_pages[MAX_SCRATCH][XPAGE] __attribute__((aligned(XPAGE)));
+
+    unsigned int cmd_enq; /* command-ring enqueue index */
+    unsigned int cmd_cyc; /* command-ring producer cycle bit */
+    unsigned int evt_deq; /* event-ring dequeue index */
+    unsigned int evt_cyc; /* event-ring consumer cycle bit */
+
+    /* USB-5 (#217): the HID keyboard's interrupt-IN transfer ring and report buffer. Kept
+     * separate from the bulk rings so a keyboard poll can never disturb the MSC datapath
+     * the log sink depends on. */
+    uint8_t int_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
+    uint8_t hid_report[64] __attribute__((aligned(64)));
+    unsigned int iin_enq;
+    unsigned int iin_cyc;
+    /*
+     * Is a report transfer currently OUTSTANDING?
+     *
+     * An interrupt endpoint needs exactly ONE transfer queued at a time, re-armed after
+     * each completion. Enqueuing on every poll call -- which the guest dispatch loop makes
+     * thousands of times a second -- fills the 256-TRB ring in a fraction of a second and
+     * the keyboard goes silent, which is precisely what the first QEMU test showed: the
+     * endpoint configured, the device claimed, and not one report ever delivered.
+     */
+    int iin_armed;
+    uint64_t iin_pending_trb;
+
+    /* Device pool: hub descent (#231 pt5b) needs several devices addressed at once
+     * (a hub plus the device behind it), so each addressed device owns its own
+     * Device Context + EP0 ring + ring cursor, keyed by its slot id. The Input
+     * Context is shared -- the controller only reads it transiently during Address
+     * Device / Configure Endpoint. */
+    uint8_t input_ctx[XPAGE] __attribute__((aligned(XPAGE)));
+    uint8_t dev_ctx[DEVPOOL][XPAGE] __attribute__((aligned(XPAGE)));
+    uint8_t ep0_ring[DEVPOOL][XPAGE] __attribute__((aligned(XPAGE)));
+    uint8_t xfer_buf[XPAGE] __attribute__((aligned(XPAGE)));
+    unsigned int ep0_enq[DEVPOOL];
+    unsigned int ep0_cyc[DEVPOOL];
+    unsigned int dev_used[DEVPOOL]; /* 1 if this pool slot is in use */
+    unsigned int slot_dev[256];     /* slot id -> pool index + 1 (0 = none) */
+
+    /* MSC bulk endpoint transfer rings. */
+    uint8_t bulk_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
+    uint8_t bulk_out_ring[XPAGE] __attribute__((aligned(XPAGE)));
+    unsigned int bin_enq, bin_cyc, bout_enq, bout_cyc;
+    /* BOT command/status wrappers + a bulk data bounce buffer. */
+    uint8_t cbw[64] __attribute__((aligned(64)));
+    uint8_t csw[64] __attribute__((aligned(64)));
+    uint8_t data[XPAGE] __attribute__((aligned(XPAGE)));
+    uint32_t bot_tag;
+
+    /*
+     * #266 defect 1: completions that arrive for another endpoint are parked here rather
+     * than discarded. See core/xhci.h for why discarding was the bug.
+     *
+     * #299: per-controller. Attribution was already safe when this was shared, because a
+     * parked event can only be claimed by the exact (slot, dci, TRB pointer) it names and
+     * the TRB pointer is unique across ring blocks. What was NOT safe is capacity: one
+     * controller's late events could fill a fixed table and starve the other's, which on
+     * the controller carrying hype's log is a stall in the datapath the log depends on.
+     */
+    hype_xhci_parked_t parked;
+} xhci_hw_t;
+
+static xhci_hw_t g_hw[HYPE_XHCI_MAX_CTRL];
+
+/* This controller's block. hw_slot is set by hype_xhci_host_init() and is only
+ * meaningful while c->inited; it is clamped so a caller that hands over an
+ * uninitialised hype_xhci_ctrl_t cannot index outside the pool. */
+static xhci_hw_t *HW(const hype_xhci_ctrl_t *c) {
+    unsigned int i = c->hw_slot;
+    if (i >= HYPE_XHCI_MAX_CTRL) {
+        i = 0;
+    }
+    return &g_hw[i];
+}
+
+static int dev_alloc(xhci_hw_t *hw, unsigned int slot) {
     unsigned int i;
     for (i = 0; i < DEVPOOL; i++) {
-        if (!g_dev_used[i]) {
-            g_dev_used[i] = 1;
-            g_slot_dev[slot & 0xFFu] = i + 1u;
+        if (!hw->dev_used[i]) {
+            hw->dev_used[i] = 1;
+            hw->slot_dev[slot & 0xFFu] = i + 1u;
             return (int)i;
         }
     }
     return -1;
 }
-static int dev_index(unsigned int slot) {
-    unsigned int v = g_slot_dev[slot & 0xFFu];
+static int dev_index(const xhci_hw_t *hw, unsigned int slot) {
+    unsigned int v = hw->slot_dev[slot & 0xFFu];
     return v ? (int)(v - 1u) : -1;
 }
-static void dev_free(unsigned int slot) {
-    int i = dev_index(slot);
-    if (i >= 0) g_dev_used[i] = 0;
-    g_slot_dev[slot & 0xFFu] = 0;
+static void dev_free(xhci_hw_t *hw, unsigned int slot) {
+    int i = dev_index(hw, slot);
+    if (i >= 0) hw->dev_used[i] = 0;
+    hw->slot_dev[slot & 0xFFu] = 0;
 }
-/* MSC bulk endpoint transfer rings. */
-static uint8_t g_bulk_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
-static uint8_t g_bulk_out_ring[XPAGE] __attribute__((aligned(XPAGE)));
-static unsigned int g_bin_enq, g_bin_cyc, g_bout_enq, g_bout_cyc;
-/* BOT command/status wrappers + a bulk data bounce buffer. */
-static uint8_t g_cbw[64] __attribute__((aligned(64)));
-static uint8_t g_csw[64] __attribute__((aligned(64)));
-static uint8_t g_data[XPAGE] __attribute__((aligned(XPAGE)));
-static uint32_t g_bot_tag;
 
 static inline uint8_t  rd8(volatile uint8_t *b, uint32_t o)  { return *(volatile uint8_t *)(b + o); }
 static inline uint32_t rd32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
@@ -150,14 +195,13 @@ static void delay_ms(unsigned int ms) {
     }
 }
 
-/* --- command + event ring state (single controller) --- */
-static unsigned int g_cmd_enq;   /* command-ring enqueue index */
-static unsigned int g_cmd_cyc;   /* command-ring producer cycle bit */
-static unsigned int g_evt_deq;   /* event-ring dequeue index */
-static unsigned int g_bulk_foreign_seen; /* #266: foreign transfer events discarded, cumulative */
-static unsigned int g_evt_cyc;   /* event-ring consumer cycle bit */
+/* #266: foreign transfer events discarded, cumulative. Aggregate across controllers on
+ * purpose -- it is a diagnostic counter, not per-controller state. */
+static unsigned int g_bulk_foreign_seen;
 
-static void ring_state_reset(void) { g_cmd_enq = 0; g_cmd_cyc = 1; g_evt_deq = 0; g_evt_cyc = 1; }
+static void ring_state_reset(xhci_hw_t *hw) {
+    hw->cmd_enq = 0; hw->cmd_cyc = 1; hw->evt_deq = 0; hw->evt_cyc = 1;
+}
 
 /* Volatile read of dword `dw` of TRB `idx` in a ring (controller DMAs into it). */
 static uint32_t trb_dw(const uint8_t *ring, unsigned int idx, unsigned int dw) {
@@ -186,8 +230,8 @@ static void ring_enqueue(uint8_t *ring, unsigned int *enq, unsigned int *cyc,
     }
 }
 
-static void cmd_enqueue(const uint32_t trb[4]) {
-    ring_enqueue(g_cmd_ring, &g_cmd_enq, &g_cmd_cyc, trb);
+static void cmd_enqueue(xhci_hw_t *hw, const uint32_t trb[4]) {
+    ring_enqueue(hw->cmd_ring, &hw->cmd_enq, &hw->cmd_cyc, trb);
 }
 
 /* Poll the event ring for the next valid event (cycle == consumer cycle),
@@ -225,21 +269,21 @@ static unsigned long long g_evt_count;
  * real deadline in microseconds, with the spin count kept only as a fallback for
  * before the TSC frequency is known.
  */
-static int next_event_budget(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4],
-                             unsigned int budget, unsigned int *spins_used) {
+static int next_event_budget(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtsoff,
+                             uint32_t out[4], unsigned int budget, unsigned int *spins_used) {
     unsigned int spins = budget;
     while (spins-- != 0u) {
-        uint32_t d3 = trb_dw(g_evt_ring, g_evt_deq, 3);
-        if ((int)(d3 & 1u) == (int)g_evt_cyc) {
-            out[0] = trb_dw(g_evt_ring, g_evt_deq, 0);
-            out[1] = trb_dw(g_evt_ring, g_evt_deq, 1);
-            out[2] = trb_dw(g_evt_ring, g_evt_deq, 2);
+        uint32_t d3 = trb_dw(hw->evt_ring, hw->evt_deq, 3);
+        if ((int)(d3 & 1u) == (int)hw->evt_cyc) {
+            out[0] = trb_dw(hw->evt_ring, hw->evt_deq, 0);
+            out[1] = trb_dw(hw->evt_ring, hw->evt_deq, 1);
+            out[2] = trb_dw(hw->evt_ring, hw->evt_deq, 2);
             out[3] = d3;
-            g_evt_deq++;
-            if (g_evt_deq >= RING_TRBS) { g_evt_deq = 0; g_evt_cyc ^= 1u; }
+            hw->evt_deq++;
+            if (hw->evt_deq >= RING_TRBS) { hw->evt_deq = 0; hw->evt_cyc ^= 1u; }
             /* ERDP = address of the new dequeue slot, with EHB (bit3) written 1 to clear. */
             wr64(bar, hype_xhci_ir0_offset(rtsoff, HYPE_XHCI_IR_ERDP),
-                 (phys(g_evt_ring) + (uint64_t)g_evt_deq * HYPE_XHCI_TRB_BYTES) | (1u << 3));
+                 (phys(hw->evt_ring) + (uint64_t)hw->evt_deq * HYPE_XHCI_TRB_BYTES) | (1u << 3));
             {
                 unsigned int used = budget - spins - 1u;
                 if (spins_used != 0) *spins_used = used;
@@ -259,16 +303,16 @@ static int next_event_budget(volatile uint8_t *bar, uint32_t rtsoff, uint32_t ou
  * frequency has not been supplied yet (early bring-up), which is the same
  * correctness-over-precision trade delay_ms() above already makes.
  */
-static int next_event_timed(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4],
-                            unsigned int timeout_us, unsigned int *spins_used) {
+static int next_event_timed(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtsoff,
+                            uint32_t out[4], unsigned int timeout_us, unsigned int *spins_used) {
     uint64_t end;
 
     if (g_tsc_hz == 0u) {
-        return next_event_budget(bar, rtsoff, out, SPIN, spins_used);
+        return next_event_budget(hw, bar, rtsoff, out, SPIN, spins_used);
     }
     end = rdtsc_now() + (g_tsc_hz / 1000000ull) * (uint64_t)timeout_us;
     for (;;) {
-        if (next_event_budget(bar, rtsoff, out, SPIN / 64u, spins_used) == 0) {
+        if (next_event_budget(hw, bar, rtsoff, out, SPIN / 64u, spins_used) == 0) {
             return 0;
         }
         if (rdtsc_now() >= end) {
@@ -277,11 +321,11 @@ static int next_event_timed(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out
     }
 }
 
-static int next_event(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
+static int next_event(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
     /* One second. Far beyond any healthy completion -- the measured mean is under a
      * millisecond of equivalent work -- and still bounded, so a genuinely dead device
      * still fails rather than hanging hype. */
-    return next_event_timed(bar, rtsoff, out, HYPE_XHCI_EVENT_TIMEOUT_US, 0);
+    return next_event_timed(hw, bar, rtsoff, out, HYPE_XHCI_EVENT_TIMEOUT_US, 0);
 }
 
 /*
@@ -304,13 +348,14 @@ static int next_event(volatile uint8_t *bar, uint32_t rtsoff, uint32_t out[4]) {
  * mismatched pointer is logged so the behaviour stays visible.
  */
 static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]) {
+    xhci_hw_t *hw = HW(c);
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     unsigned int guard = 64u; /* bound the number of skipped (e.g. port-change) events */
-    uint64_t my_trb = phys(g_cmd_ring) + (uint64_t)g_cmd_enq * HYPE_XHCI_TRB_BYTES;
-    cmd_enqueue(cmd);
+    uint64_t my_trb = phys(hw->cmd_ring) + (uint64_t)hw->cmd_enq * HYPE_XHCI_TRB_BYTES;
+    cmd_enqueue(hw, cmd);
     wr32(bar, hype_xhci_doorbell_offset(c->dboff, 0), 0u); /* command doorbell, target 0 */
     while (guard-- != 0u) {
-        if (next_event(bar, c->rtsoff, evt) != 0) {
+        if (next_event(hw, bar, c->rtsoff, evt) != 0) {
             /* #266: distinguish "nothing arrived" from "things arrived, none ours". */
             hype_debug_print("host-xhci: #266 command TIMEOUT waiting for trb=0x%llx "
                              "(no event arrived)\n", (unsigned long long)my_trb);
@@ -335,9 +380,10 @@ static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]
 }
 
 int hype_xhci_enable_slot(hype_xhci_ctrl_t *c, unsigned int *out_slot) {
+    xhci_hw_t *hw = HW(c);
     uint32_t cmd[4], evt[4];
     if (!c->inited) return -1;
-    hype_xhci_trb_enable_slot(cmd, (int)g_cmd_cyc);
+    hype_xhci_trb_enable_slot(cmd, (int)hw->cmd_cyc);
     if (cmd_submit_wait(c, cmd, evt) != 0) {
         hype_debug_print("host-xhci:     Enable Slot: no command completion event (timeout)\n");
         return -1;
@@ -357,12 +403,13 @@ static void write_ctx(uint8_t *base, unsigned int off, const uint32_t c[8]) {
     for (i = 0; i < 8u; i++) put_le32(base + off + i * 4u, c[i]);
 }
 
-static void ep0_enqueue(unsigned int di, const uint32_t trb[4]) {
-    ring_enqueue(g_ep0_ring[di], &g_ep0_enq[di], &g_ep0_cyc[di], trb);
+static void ep0_enqueue(xhci_hw_t *hw, unsigned int di, const uint32_t trb[4]) {
+    ring_enqueue(hw->ep0_ring[di], &hw->ep0_enq[di], &hw->ep0_cyc[di], trb);
 }
 
 int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
                              const hype_xhci_devpath_t *path) {
+    xhci_hw_t *hw = HW(c);
     unsigned int cs = c->ctx_size;
     uint32_t ctx[8];
     uint32_t cmd[4], evt[4];
@@ -370,14 +417,14 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
     uint8_t *dctx, *ep0;
 
     if (!c->inited || slot == 0u) return -1;
-    di = dev_index(slot);
-    if (di < 0) di = dev_alloc(slot);
+    di = dev_index(hw, slot);
+    if (di < 0) di = dev_alloc(hw, slot);
     if (di < 0) return -1; /* device pool exhausted */
-    dctx = g_dev_ctx[di];
-    ep0 = g_ep0_ring[di];
+    dctx = hw->dev_ctx[di];
+    ep0 = hw->ep0_ring[di];
 
     /* Fresh Input/Device contexts + this device's EP0 transfer ring. */
-    zero(g_input_ctx, XPAGE);
+    zero(hw->input_ctx, XPAGE);
     zero(dctx, XPAGE);
     zero(ep0, XPAGE);
     {
@@ -388,22 +435,22 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
         put_le32(ep0 + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
         put_le32(ep0 + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
     }
-    g_ep0_enq[di] = 0;
-    g_ep0_cyc[di] = 1;
+    hw->ep0_enq[di] = 0;
+    hw->ep0_cyc[di] = 1;
 
     /* Input Control Context (offset 0): add the slot + EP0 contexts. */
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | HYPE_XHCI_ADD_EP0, 0);
-    write_ctx(g_input_ctx, 0, ctx);
+    write_ctx(hw->input_ctx, 0, ctx);
     /* Slot Context (offset 1*ctx_size): full topology, 1 valid context entry (EP0). */
     hype_xhci_slot_ctx(ctx, path->route, path->speed, 1, path->root_port,
                        path->tt_hub_slot, path->tt_port);
-    write_ctx(g_input_ctx, cs, ctx);
+    write_ctx(hw->input_ctx, cs, ctx);
     /* EP0 Context (offset 2*ctx_size). */
     hype_xhci_ep0_ctx(ctx, hype_xhci_default_mps(path->speed), phys(ep0), 1);
-    write_ctx(g_input_ctx, 2u * cs, ctx);
+    write_ctx(hw->input_ctx, 2u * cs, ctx);
 
     /* DCBAA[slot] -> this device's output Device Context. */
-    put_le64(g_dcbaa + slot * 8u, phys(dctx));
+    put_le64(hw->dcbaa + slot * 8u, phys(dctx));
 
     /* Real HW (esp. High-Speed devices) intermittently NAKs the SET_ADDRESS the
      * controller issues during Address Device -> a USB Transaction Error (cc 4)
@@ -415,7 +462,7 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
         for (attempt = 0; attempt < 3u && !ok; attempt++) {
             unsigned int cc;
             if (attempt != 0u) delay_ms(10); /* let the device settle before re-issue */
-            hype_xhci_trb_address_device(cmd, phys(g_input_ctx), slot, 0, (int)g_cmd_cyc);
+            hype_xhci_trb_address_device(cmd, phys(hw->input_ctx), slot, 0, (int)hw->cmd_cyc);
             if (cmd_submit_wait(c, cmd, evt) != 0) {
                 hype_debug_print("host-xhci:     Address Device slot %u try %u: no completion "
                                  "event (timeout)\n", slot, attempt + 1u);
@@ -428,7 +475,7 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
                              "(ctx_size=%uB speed=%u route=0x%05x)\n", slot, attempt + 1u, cc,
                              c->ctx_size, path->speed, path->route);
         }
-        if (!ok) { dev_free(slot); return -1; }
+        if (!ok) { dev_free(hw, slot); return -1; }
     }
     /* USB 2.0 §9.2.6.3: a device needs up to 2 ms of recovery after SET_ADDRESS
      * before it will respond at its new address -- without this the immediately
@@ -446,6 +493,7 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
 static int control_transfer(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t bm_req, uint8_t b_req,
                             uint16_t wvalue, uint16_t windex, void *buf, unsigned int len,
                             int dir_in) {
+    xhci_hw_t *hw = HW(c);
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     uint32_t t[4], evt[4];
     unsigned int guard = 64u;
@@ -453,42 +501,42 @@ static int control_transfer(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t bm_r
     int di;
 
     if (!c->inited || slot == 0u || len > XPAGE) return -1;
-    di = dev_index(slot);
+    di = dev_index(hw, slot);
     if (di < 0) return -1;
     trt = (len == 0u) ? HYPE_XHCI_TRT_NO_DATA : (dir_in ? HYPE_XHCI_TRT_IN : HYPE_XHCI_TRT_OUT);
 
     if (len && !dir_in && buf) {
-        for (i = 0; i < len; i++) g_xfer_buf[i] = ((const uint8_t *)buf)[i];
+        for (i = 0; i < len; i++) hw->xfer_buf[i] = ((const uint8_t *)buf)[i];
     } else {
-        zero(g_xfer_buf, XPAGE);
+        zero(hw->xfer_buf, XPAGE);
     }
 
     {
         /* #254: remember this transfer's own TRB addresses so the wait below
          * can tell OUR events from stale ones (same reasoning as bulk_xfer). */
-        uint64_t ring_base = phys(g_ep0_ring[di]);
+        uint64_t ring_base = phys(hw->ep0_ring[di]);
         uint64_t setup_trb, data_trb = 0, status_trb;
 
-        setup_trb = ring_base + (uint64_t)g_ep0_enq[di] * HYPE_XHCI_TRB_BYTES;
+        setup_trb = ring_base + (uint64_t)hw->ep0_enq[di] * HYPE_XHCI_TRB_BYTES;
         hype_xhci_trb_setup_stage(t, bm_req, b_req, wvalue, windex, (uint16_t)len, trt,
-                                  (int)g_ep0_cyc[di]);
-        ep0_enqueue(di, t);
+                                  (int)hw->ep0_cyc[di]);
+        ep0_enqueue(hw, di, t);
         if (len) {
-            data_trb = ring_base + (uint64_t)g_ep0_enq[di] * HYPE_XHCI_TRB_BYTES;
-            hype_xhci_trb_data_stage(t, phys(g_xfer_buf), len, dir_in, (int)g_ep0_cyc[di]);
-            ep0_enqueue(di, t);
+            data_trb = ring_base + (uint64_t)hw->ep0_enq[di] * HYPE_XHCI_TRB_BYTES;
+            hype_xhci_trb_data_stage(t, phys(hw->xfer_buf), len, dir_in, (int)hw->ep0_cyc[di]);
+            ep0_enqueue(hw, di, t);
         }
         /* Status stage direction is opposite the data direction (IN if no data). */
         status_dir_in = (len && dir_in) ? 0u : 1u;
-        status_trb = ring_base + (uint64_t)g_ep0_enq[di] * HYPE_XHCI_TRB_BYTES;
-        hype_xhci_trb_status_stage(t, (int)status_dir_in, 1, (int)g_ep0_cyc[di]);
-        ep0_enqueue(di, t);
+        status_trb = ring_base + (uint64_t)hw->ep0_enq[di] * HYPE_XHCI_TRB_BYTES;
+        hype_xhci_trb_status_stage(t, (int)status_dir_in, 1, (int)hw->ep0_cyc[di]);
+        ep0_enqueue(hw, di, t);
 
         wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), 1u); /* DCI 1 = EP0 */
 
         while (guard-- != 0u) {
             uint64_t p;
-            if (next_event(bar, c->rtsoff, evt) != 0) return -1;
+            if (next_event(hw, bar, c->rtsoff, evt) != 0) return -1;
             if (hype_xhci_trb_type(evt) != HYPE_XHCI_TRB_TRANSFER_EVENT) continue;
             if (hype_xhci_event_slot_id(evt) != slot || hype_xhci_event_ep_id(evt) != 1u) {
                 continue; /* another endpoint's (or a stale) event */
@@ -518,7 +566,7 @@ static int control_transfer(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t bm_r
                 continue; /* setup/data stage completed fine: wait for status */
             }
             if (len && dir_in && buf) {
-                for (i = 0; i < len; i++) ((uint8_t *)buf)[i] = g_xfer_buf[i];
+                for (i = 0; i < len; i++) ((uint8_t *)buf)[i] = hw->xfer_buf[i];
             }
             return 0;
         }
@@ -566,6 +614,7 @@ static void ring_init_link(uint8_t *ring) {
 int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
                                        const hype_xhci_devpath_t *path,
                                        const hype_xhci_msc_eps_t *msc) {
+    xhci_hw_t *hw = HW(c);
     unsigned int cs = c->ctx_size;
     unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
     unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
@@ -575,27 +624,27 @@ int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
     if (!c->inited || slot == 0u) return -1;
 
     /* Fresh bulk transfer rings. */
-    zero(g_bulk_in_ring, XPAGE);
-    zero(g_bulk_out_ring, XPAGE);
-    ring_init_link(g_bulk_in_ring);
-    ring_init_link(g_bulk_out_ring);
-    g_bin_enq = 0; g_bin_cyc = 1;
-    g_bout_enq = 0; g_bout_cyc = 1;
+    zero(hw->bulk_in_ring, XPAGE);
+    zero(hw->bulk_out_ring, XPAGE);
+    ring_init_link(hw->bulk_in_ring);
+    ring_init_link(hw->bulk_out_ring);
+    hw->bin_enq = 0; hw->bin_cyc = 1;
+    hw->bout_enq = 0; hw->bout_cyc = 1;
 
     /* Input Context: add the Slot + both bulk endpoint contexts. The Slot
      * Context must re-provide the device's full topology (route/root/TT). */
-    zero(g_input_ctx, XPAGE);
+    zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci_in) | (1u << dci_out), 0);
-    write_ctx(g_input_ctx, 0, ctx);
+    write_ctx(hw->input_ctx, 0, ctx);
     hype_xhci_slot_ctx(ctx, path->route, path->speed, max_dci, path->root_port,
                        path->tt_hub_slot, path->tt_port); /* context entries = highest DCI */
-    write_ctx(g_input_ctx, cs, ctx);
-    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_IN, msc->bulk_in_mps, phys(g_bulk_in_ring), 1);
-    write_ctx(g_input_ctx, (1u + dci_in) * cs, ctx);
-    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_OUT, msc->bulk_out_mps, phys(g_bulk_out_ring), 1);
-    write_ctx(g_input_ctx, (1u + dci_out) * cs, ctx);
+    write_ctx(hw->input_ctx, cs, ctx);
+    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_IN, msc->bulk_in_mps, phys(hw->bulk_in_ring), 1);
+    write_ctx(hw->input_ctx, (1u + dci_in) * cs, ctx);
+    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_OUT, msc->bulk_out_mps, phys(hw->bulk_out_ring), 1);
+    write_ctx(hw->input_ctx, (1u + dci_out) * cs, ctx);
 
-    hype_xhci_trb_configure_endpoint(cmd, phys(g_input_ctx), slot, (int)g_cmd_cyc);
+    hype_xhci_trb_configure_endpoint(cmd, phys(hw->input_ctx), slot, (int)hw->cmd_cyc);
     if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
     return 0;
@@ -603,10 +652,6 @@ int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
 
 /* One bulk transfer: enqueue a Normal TRB on `ring`, ring the slot doorbell for
  * `dci`, and wait its Transfer Event. Returns 0 on success/short-packet. */
-/* #266 defect 1: completions that arrive for another endpoint are parked here rather
- * than discarded. See core/xhci.h for why discarding was the bug. */
-static hype_xhci_parked_t g_parked;
-
 /*
  * USB-5 (#217): configure the HID keyboard's interrupt-IN endpoint.
  *
@@ -617,30 +662,31 @@ static hype_xhci_parked_t g_parked;
 int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
                                        const hype_xhci_devpath_t *path, unsigned int ep_addr,
                                        unsigned int mps, unsigned int interval) {
+    xhci_hw_t *hw = HW(c);
     unsigned int cs = c->ctx_size;
     unsigned int dci = hype_xhci_ep_dci(ep_addr);
     uint32_t ctx[8], cmd[4], evt[4];
 
     if (!c->inited || slot == 0u || path == (const hype_xhci_devpath_t *)0) return -1;
-    if (mps == 0u || mps > sizeof(g_hid_report)) return -1;
+    if (mps == 0u || mps > sizeof(hw->hid_report)) return -1;
 
-    zero(g_int_in_ring, XPAGE);
-    ring_init_link(g_int_in_ring);
-    g_iin_enq = 0; g_iin_cyc = 1; g_iin_armed = 0; g_iin_pending_trb = 0;
+    zero(hw->int_in_ring, XPAGE);
+    ring_init_link(hw->int_in_ring);
+    hw->iin_enq = 0; hw->iin_cyc = 1; hw->iin_armed = 0; hw->iin_pending_trb = 0;
 
-    zero(g_input_ctx, XPAGE);
+    zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
-    write_ctx(g_input_ctx, 0, ctx);
+    write_ctx(hw->input_ctx, 0, ctx);
     hype_xhci_slot_ctx(ctx, path->route, path->speed, dci, path->root_port,
                        path->tt_hub_slot, path->tt_port);
-    write_ctx(g_input_ctx, cs, ctx);
+    write_ctx(hw->input_ctx, cs, ctx);
     /* #217: the Interval is what gives the controller a schedule to poll on. Without
      * it the endpoint configures cleanly and never reports. */
-    hype_xhci_ep_ctx_interval(ctx, HYPE_XHCI_EP_TYPE_INT_IN, mps, phys(g_int_in_ring), 1,
+    hype_xhci_ep_ctx_interval(ctx, HYPE_XHCI_EP_TYPE_INT_IN, mps, phys(hw->int_in_ring), 1,
                               hype_xhci_interval_encode(path->speed, interval));
-    write_ctx(g_input_ctx, (1u + dci) * cs, ctx);
+    write_ctx(hw->input_ctx, (1u + dci) * cs, ctx);
 
-    hype_xhci_trb_configure_endpoint(cmd, phys(g_input_ctx), slot, (int)g_cmd_cyc);
+    hype_xhci_trb_configure_endpoint(cmd, phys(hw->input_ctx), slot, (int)hw->cmd_cyc);
     if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
     return 0;
@@ -662,6 +708,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
  */
 int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
                           uint8_t *out, unsigned int len) {
+    xhci_hw_t *hw = HW(c);
     volatile uint8_t *bar;
     unsigned int dci = hype_xhci_ep_dci(ep_addr);
     uint32_t t[4], evt[4];
@@ -670,57 +717,58 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
     unsigned int i;
 
     if (!c->inited || slot == 0u || out == (uint8_t *)0 || len == 0u ||
-        len > sizeof(g_hid_report)) {
+        len > sizeof(hw->hid_report)) {
         return -1;
     }
     bar = (volatile uint8_t *)(uintptr_t)c->bar;
-    my_trb = phys(g_int_in_ring) + (uint64_t)g_iin_enq * HYPE_XHCI_TRB_BYTES;
+    my_trb = phys(hw->int_in_ring) + (uint64_t)hw->iin_enq * HYPE_XHCI_TRB_BYTES;
 
     /* Arm exactly one transfer, and only when none is outstanding. */
-    if (!g_iin_armed) {
-        hype_xhci_trb_normal(t, phys(g_hid_report), len, (int)g_iin_cyc);
-        ring_enqueue(g_int_in_ring, &g_iin_enq, &g_iin_cyc, t);
+    if (!hw->iin_armed) {
+        hype_xhci_trb_normal(t, phys(hw->hid_report), len, (int)hw->iin_cyc);
+        ring_enqueue(hw->int_in_ring, &hw->iin_enq, &hw->iin_cyc, t);
         wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
-        g_iin_armed = 1;
-        g_iin_pending_trb = my_trb;
+        hw->iin_armed = 1;
+        hw->iin_pending_trb = my_trb;
     }
-    my_trb = g_iin_pending_trb;
+    my_trb = hw->iin_pending_trb;
 
     /* #266: a completion for this transfer may already be parked from a previous
      * pass -- claim it before spinning, same reasoning as the bulk path. */
     {
         uint32_t parked_cc = 0;
-        if (hype_xhci_parked_take(&g_parked, slot, dci, my_trb, &parked_cc)) {
-            g_iin_armed = 0; /* consumed -- next poll re-arms */
+        if (hype_xhci_parked_take(&hw->parked, slot, dci, my_trb, &parked_cc)) {
+            hw->iin_armed = 0; /* consumed -- next poll re-arms */
             if (parked_cc != HYPE_XHCI_CC_SUCCESS && parked_cc != HYPE_XHCI_CC_SHORT_PACKET) {
                 return -1;
             }
-            for (i = 0; i < len; i++) out[i] = g_hid_report[i];
+            for (i = 0; i < len; i++) out[i] = hw->hid_report[i];
             return 1;
         }
     }
-    if (next_event_budget(bar, c->rtsoff, evt, SPIN / 1024u, &spins) != 0) {
+    if (next_event_budget(hw, bar, c->rtsoff, evt, SPIN / 1024u, &spins) != 0) {
         return 0; /* idle -- the common case, NOT an error */
     }
     if (hype_xhci_event_slot_id(evt) != slot || hype_xhci_event_ep_id(evt) != dci) {
         /* Someone else's completion. Park it rather than discard: discarding is the
          * #266 bug, and the MSC datapath may be waiting for exactly this. */
-        (void)hype_xhci_parked_put(&g_parked, hype_xhci_event_slot_id(evt),
+        (void)hype_xhci_parked_put(&hw->parked, hype_xhci_event_slot_id(evt),
                                    hype_xhci_event_ep_id(evt),
                                    hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt));
         return 0;
     }
-    g_iin_armed = 0; /* our completion arrived -- re-arm on the next poll */
+    hw->iin_armed = 0; /* our completion arrived -- re-arm on the next poll */
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS &&
         hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SHORT_PACKET) {
         return -1;
     }
-    for (i = 0; i < len; i++) out[i] = g_hid_report[i];
+    for (i = 0; i < len; i++) out[i] = hw->hid_report[i];
     return 1;
 }
 
 static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsigned int *cyc,
                      unsigned int slot, unsigned int dci, uint64_t buf_phys, unsigned int len) {
+    xhci_hw_t *hw = HW(c);
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     uint32_t t[4], evt[4];
     unsigned int guard = 64u;
@@ -737,14 +785,14 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
      */
     {
         uint32_t parked_cc = 0;
-        if (hype_xhci_parked_take(&g_parked, slot, dci, my_trb, &parked_cc)) {
+        if (hype_xhci_parked_take(&hw->parked, slot, dci, my_trb, &parked_cc)) {
             return (parked_cc == HYPE_XHCI_CC_SUCCESS || parked_cc == HYPE_XHCI_CC_SHORT_PACKET)
                        ? 0
                        : -1;
         }
     }
     while (guard-- != 0u) {
-        if (next_event(bar, c->rtsoff, evt) != 0) {
+        if (next_event(hw, bar, c->rtsoff, evt) != 0) {
             /*
              * #266 THE decisive measurement. Every observed failure says "no event
              * arrived", which is a stall rather than a mis-ordering -- but a
@@ -758,7 +806,7 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
              */
             unsigned int extra = 0;
             uint32_t late[4];
-            int arrived = next_event_budget(bar, c->rtsoff, late, SPIN * 10u, &extra);
+            int arrived = next_event_budget(hw, bar, c->rtsoff, late, SPIN * 10u, &extra);
             hype_debug_print("host-xhci: #266 bulk TIMEOUT waiting for slot=%u ep=%u trb=0x%llx "
                              "(%u foreign seen this boot)\n",
                              slot, dci, (unsigned long long)my_trb, g_bulk_foreign_seen);
@@ -811,7 +859,7 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
                  * buffer. Strictness protects attribution; it must not demand an arrival
                  * ORDER this controller declines to provide.
                  */
-                hype_xhci_parked_put(&g_parked, hype_xhci_event_slot_id(evt),
+                hype_xhci_parked_put(&hw->parked, hype_xhci_event_slot_id(evt),
                                      hype_xhci_event_ep_id(evt), hype_xhci_event_trb_ptr(evt),
                                      hype_xhci_event_cc(evt));
                 if (s1++ < 8) {
@@ -851,21 +899,21 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
  * is direct evidence of the late-delivery behaviour this controller has already
  * demonstrated on its command ring.
  */
-static unsigned int drain_events(volatile uint8_t *bar, uint32_t rtsoff) {
+static unsigned int drain_events(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtsoff) {
     unsigned int drained = 0;
     for (;;) {
-        uint32_t d3 = trb_dw(g_evt_ring, g_evt_deq, 3);
-        if ((int)(d3 & 1u) != (int)g_evt_cyc) {
+        uint32_t d3 = trb_dw(hw->evt_ring, hw->evt_deq, 3);
+        if ((int)(d3 & 1u) != (int)hw->evt_cyc) {
             break; /* ring empty: cycle bit says the controller has not written here */
         }
-        g_evt_deq++;
-        if (g_evt_deq >= RING_TRBS) { g_evt_deq = 0; g_evt_cyc ^= 1u; }
+        hw->evt_deq++;
+        if (hw->evt_deq >= RING_TRBS) { hw->evt_deq = 0; hw->evt_cyc ^= 1u; }
         drained++;
         if (drained > RING_TRBS) break; /* paranoia: never spin forever on a wedged ring */
     }
     if (drained != 0u) {
         wr64(bar, hype_xhci_ir0_offset(rtsoff, HYPE_XHCI_IR_ERDP),
-             (phys(g_evt_ring) + (uint64_t)g_evt_deq * HYPE_XHCI_TRB_BYTES) | (1u << 3));
+             (phys(hw->evt_ring) + (uint64_t)hw->evt_deq * HYPE_XHCI_TRB_BYTES) | (1u << 3));
     }
     return drained;
 }
@@ -880,19 +928,20 @@ static unsigned int drain_events(volatile uint8_t *bar, uint32_t rtsoff) {
  */
 static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, uint8_t *ring,
                       unsigned int *enq, unsigned int *cyc) {
+    xhci_hw_t *hw = HW(c);
     uint32_t cmd[4], evt[4];
     unsigned int i;
 
-    hype_xhci_trb_stop_endpoint(cmd, slot, dci, (int)g_cmd_cyc);
+    hype_xhci_trb_stop_endpoint(cmd, slot, dci, (int)hw->cmd_cyc);
     (void)cmd_submit_wait(c, cmd, evt); /* result deliberately ignored: the EP may
                                          * already be stopped or halted */
-    hype_xhci_trb_reset_endpoint(cmd, slot, dci, (int)g_cmd_cyc);
+    hype_xhci_trb_reset_endpoint(cmd, slot, dci, (int)hw->cmd_cyc);
     (void)cmd_submit_wait(c, cmd, evt); /* errors when the EP is not halted: fine */
 
     for (i = 0; i < XPAGE; i++) { ring[i] = 0; }
     *enq = 0;
     *cyc = 1;
-    hype_xhci_trb_set_tr_dequeue(cmd, phys(ring) | 1u /* DCS=1 */, slot, dci, (int)g_cmd_cyc);
+    hype_xhci_trb_set_tr_dequeue(cmd, phys(ring) | 1u /* DCS=1 */, slot, dci, (int)hw->cmd_cyc);
     if (cmd_submit_wait(c, cmd, evt) != 0 || hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
         hype_debug_print("host-xhci: #254 Set TR Dequeue failed (slot=%u dci=%u)\n", slot, dci);
         return -1;
@@ -909,6 +958,7 @@ static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, 
  * Clear-HALT on both bulk endpoints, plus xHCI-side ring recovery on both.
  */
 static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc) {
+    xhci_hw_t *hw = HW(c);
     /*
      * #266: discard this slot's parked completions FIRST. ep_recover() restarts the
      * transfer rings at index 0, so the retry's first TRB lands at the same physical
@@ -921,11 +971,11 @@ static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
     int rc = 0;
 
     hype_debug_print("host-xhci: #254 BOT reset recovery (slot=%u)\n", slot);
-    hype_xhci_parked_drop_slot(&g_parked, slot);
+    hype_xhci_parked_drop_slot(&hw->parked, slot);
 
     /* Quiesce both rings first so nothing is in flight during the reset. */
-    if (ep_recover(c, slot, dci_in, g_bulk_in_ring, &g_bin_enq, &g_bin_cyc) != 0) rc = -1;
-    if (ep_recover(c, slot, dci_out, g_bulk_out_ring, &g_bout_enq, &g_bout_cyc) != 0) rc = -1;
+    if (ep_recover(c, slot, dci_in, hw->bulk_in_ring, &hw->bin_enq, &hw->bin_cyc) != 0) rc = -1;
+    if (ep_recover(c, slot, dci_out, hw->bulk_out_ring, &hw->bout_enq, &hw->bout_cyc) != 0) rc = -1;
 
     /* Bulk-Only Mass Storage Reset: class request 0xFF to the interface. */
     if (control_transfer(c, slot, 0x21, 0xFF, 0, (uint16_t)msc->interface_num, 0, 0, 0) != 0) {
@@ -950,7 +1000,7 @@ static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
      */
     {
         volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
-        unsigned int drained = drain_events(bar, c->rtsoff);
+        unsigned int drained = drain_events(hw, bar, c->rtsoff);
         hype_debug_print("host-xhci: #266 BOT recovery finished rc=%d, drained %u stale event(s) "
                          "(foreign seen so far this boot: %u)\n",
                          rc, drained, g_bulk_foreign_seen);
@@ -959,39 +1009,40 @@ static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
 }
 
 /* Bulk-Only Transport: CBW (out) -> optional data phase -> CSW (in). Data flows
- * through g_data (bounced). Returns 0 iff the CSW reports command-passed. */
+ * through hw->data (bounced). Returns 0 iff the CSW reports command-passed. */
 static int bot_scsi_once(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                     const uint8_t *cdb, unsigned int cdb_len, uint8_t *data, unsigned int data_len,
                     int dir_in) {
+    xhci_hw_t *hw = HW(c);
     unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
     unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
-    uint32_t tag = ++g_bot_tag;
+    uint32_t tag = ++hw->bot_tag;
     unsigned int i;
 
     if (data_len > XPAGE) return -1;
 
     /* CBW on the bulk OUT endpoint. */
-    hype_usb_bot_cbw(g_cbw, tag, data_len, dir_in, 0, cdb, cdb_len);
-    if (bulk_xfer(c, g_bulk_out_ring, &g_bout_enq, &g_bout_cyc, slot, dci_out,
-                  phys(g_cbw), HYPE_USB_CBW_LEN) != 0) return -1;
+    hype_usb_bot_cbw(hw->cbw, tag, data_len, dir_in, 0, cdb, cdb_len);
+    if (bulk_xfer(c, hw->bulk_out_ring, &hw->bout_enq, &hw->bout_cyc, slot, dci_out,
+                  phys(hw->cbw), HYPE_USB_CBW_LEN) != 0) return -1;
 
-    /* Data phase (bounced through g_data). */
+    /* Data phase (bounced through hw->data). */
     if (data_len) {
         if (dir_in) {
-            if (bulk_xfer(c, g_bulk_in_ring, &g_bin_enq, &g_bin_cyc, slot, dci_in,
-                          phys(g_data), data_len) != 0) return -1;
-            for (i = 0; i < data_len; i++) data[i] = g_data[i];
+            if (bulk_xfer(c, hw->bulk_in_ring, &hw->bin_enq, &hw->bin_cyc, slot, dci_in,
+                          phys(hw->data), data_len) != 0) return -1;
+            for (i = 0; i < data_len; i++) data[i] = hw->data[i];
         } else {
-            for (i = 0; i < data_len; i++) g_data[i] = data[i];
-            if (bulk_xfer(c, g_bulk_out_ring, &g_bout_enq, &g_bout_cyc, slot, dci_out,
-                          phys(g_data), data_len) != 0) return -1;
+            for (i = 0; i < data_len; i++) hw->data[i] = data[i];
+            if (bulk_xfer(c, hw->bulk_out_ring, &hw->bout_enq, &hw->bout_cyc, slot, dci_out,
+                          phys(hw->data), data_len) != 0) return -1;
         }
     }
 
     /* CSW on the bulk IN endpoint. */
-    if (bulk_xfer(c, g_bulk_in_ring, &g_bin_enq, &g_bin_cyc, slot, dci_in,
-                  phys(g_csw), HYPE_USB_CSW_LEN) != 0) return -1;
-    return hype_usb_bot_csw_ok(g_csw, tag) ? 0 : -1;
+    if (bulk_xfer(c, hw->bulk_in_ring, &hw->bin_enq, &hw->bin_cyc, slot, dci_in,
+                  phys(hw->csw), HYPE_USB_CSW_LEN) != 0) return -1;
+    return hype_usb_bot_csw_ok(hw->csw, tag) ? 0 : -1;
 }
 
 /*
@@ -1044,15 +1095,16 @@ int hype_xhci_msc_read(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
 
 int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                         uint32_t lba, unsigned int blocks, unsigned int block_size, const void *buf) {
+    xhci_hw_t *hw = HW(c);
     uint8_t cdb[10];
     unsigned int len = blocks * block_size;
     unsigned int i;
     if (len == 0u || len > XPAGE) return -1;
-    /* stage the caller's data (bot_scsi bounces from g_data for OUT). */
-    for (i = 0; i < len; i++) ((uint8_t *)g_data)[i] = ((const uint8_t *)buf)[i];
+    /* stage the caller's data (bot_scsi bounces from hw->data for OUT). */
+    for (i = 0; i < len; i++) ((uint8_t *)hw->data)[i] = ((const uint8_t *)buf)[i];
     hype_scsi_cdb_write10(cdb, lba, (uint16_t)blocks);
-    /* pass g_data as the data pointer so bot_scsi's OUT copy is a self-copy. */
-    return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)g_data, len, 0);
+    /* pass hw->data as the data pointer so bot_scsi's OUT copy is a self-copy. */
+    return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)hw->data, len, 0);
 }
 
 int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
@@ -1066,8 +1118,60 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
     unsigned int max_ports = hype_xhci_max_ports(hcs1);
     unsigned int nscratch = hype_xhci_max_scratchpads(hcs2);
     unsigned int i;
+    xhci_hw_t *hw;
 
     out->inited = 0;
+    /*
+     * #299: claim a per-controller DMA/ring block. Refusing here rather than sharing one
+     * is the whole point: two Running controllers on one command ring, one event ring and
+     * one dequeue/cycle pair is what broke the Intel box. A machine with more controllers
+     * than blocks loses the extra controllers, which is a bounded loss; sharing would
+     * corrupt the one carrying hype's log.
+     */
+    out->hw_slot = HYPE_XHCI_MAX_CTRL;
+    for (i = 0; i < HYPE_XHCI_MAX_CTRL; i++) {
+        if (!g_hw[i].in_use) {
+            out->hw_slot = i;
+            break;
+        }
+    }
+    if (out->hw_slot >= HYPE_XHCI_MAX_CTRL) {
+        hype_debug_print("host-xhci: bar=0x%llx SKIPPED -- all %u per-controller ring blocks "
+                         "are in use; this controller's devices are unreachable this boot "
+                         "[#299]\n",
+                         (unsigned long long)bar_phys, HYPE_XHCI_MAX_CTRL);
+        out->hw_slot = 0; /* keep HW() in range; inited stays 0 so nothing uses it */
+        return -1;
+    }
+    hw = &g_hw[out->hw_slot];
+    hw->in_use = 1;
+    /*
+     * Reset the block's bookkeeping. Necessary because a block can be RE-claimed after a
+     * quiesce, and stale dev_used/slot_dev would have the new controller hand out a pool
+     * entry the old one still "owns" -- a device context pointing at the wrong device.
+     * These cursors were never reset between controllers when they were file-static
+     * either; that was latent only because the sweep never got as far as a second
+     * controller.
+     */
+    {
+        unsigned int k;
+        for (k = 0; k < DEVPOOL; k++) {
+            hw->dev_used[k] = 0;
+            hw->ep0_enq[k] = 0;
+            hw->ep0_cyc[k] = 0;
+        }
+        for (k = 0; k < 256u; k++) {
+            hw->slot_dev[k] = 0;
+        }
+        hw->iin_enq = 0;
+        hw->iin_cyc = 1u;
+        hw->iin_armed = 0;
+        hw->iin_pending_trb = 0;
+        hw->bin_enq = 0; hw->bin_cyc = 0; hw->bout_enq = 0; hw->bout_cyc = 0;
+        hw->bot_tag = 0;
+        hype_xhci_parked_reset(&hw->parked);
+    }
+
     out->bar = bar_phys;
     out->op = op;
     out->dboff = rd32(bar, HYPE_XHCI_CAP_DBOFF);
@@ -1077,20 +1181,20 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
     out->ctx_size = hype_xhci_context_size(hcc1);
 
     /* Wait for the controller to be ready (CNR clear). */
-    if (wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_CNR, 0) != 0) return -1;
+    if (wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_CNR, 0) != 0) { hw->in_use = 0; return -1; }
 
     /* Stop, then wait halted. */
     wr32(bar, op + HYPE_XHCI_OP_USBCMD,
          rd32(bar, op + HYPE_XHCI_OP_USBCMD) & ~HYPE_XHCI_USBCMD_RS);
     if (wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_HCH,
-                  HYPE_XHCI_USBSTS_HCH) != 0) return -1;
+                  HYPE_XHCI_USBSTS_HCH) != 0) { hw->in_use = 0; return -1; }
 
     /* Reset (HCRST); wait it self-clears + CNR clears. */
     wr32(bar, op + HYPE_XHCI_OP_USBCMD, HYPE_XHCI_USBCMD_HCRST);
-    if (wait_bits(bar, op + HYPE_XHCI_OP_USBCMD, HYPE_XHCI_USBCMD_HCRST, 0) != 0) return -1;
-    if (wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_CNR, 0) != 0) return -1;
+    if (wait_bits(bar, op + HYPE_XHCI_OP_USBCMD, HYPE_XHCI_USBCMD_HCRST, 0) != 0) { hw->in_use = 0; return -1; }
+    if (wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_CNR, 0) != 0) { hw->in_use = 0; return -1; }
 
-    if (max_slots == 0u) return -1;
+    if (max_slots == 0u) { hw->in_use = 0; return -1; }
 
     /* Program the number of enabled device slots. */
     wr32(bar, op + HYPE_XHCI_OP_CONFIG, max_slots);
@@ -1110,47 +1214,47 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
                              nscratch, MAX_SCRATCH);
         }
     }
-    zero(g_dcbaa, XPAGE);
+    zero(hw->dcbaa, XPAGE);
     if (nscratch > 0u) {
         if (nscratch > MAX_SCRATCH) nscratch = MAX_SCRATCH;
-        zero(g_scratch_arr, XPAGE);
+        zero(hw->scratch_arr, XPAGE);
         for (i = 0; i < nscratch; i++) {
-            zero(g_scratch_pages[i], XPAGE);
-            put_le64(g_scratch_arr + i * 8u, phys(g_scratch_pages[i]));
+            zero(hw->scratch_pages[i], XPAGE);
+            put_le64(hw->scratch_arr + i * 8u, phys(hw->scratch_pages[i]));
         }
-        put_le64(g_dcbaa + 0, phys(g_scratch_arr)); /* DCBAA[0] = scratchpad array */
+        put_le64(hw->dcbaa + 0, phys(hw->scratch_arr)); /* DCBAA[0] = scratchpad array */
     }
-    wr64(bar, op + HYPE_XHCI_OP_DCBAAP, phys(g_dcbaa));
+    wr64(bar, op + HYPE_XHCI_OP_DCBAAP, phys(hw->dcbaa));
 
     /* Command ring: zeroed TRBs with a Link TRB (toggle-cycle) at the end,
      * pointing back to the start. CRCR = ring | RCS(1). */
-    zero(g_cmd_ring, XPAGE);
+    zero(hw->cmd_ring, XPAGE);
     {
         uint32_t link[4];
-        hype_xhci_trb_link(link, phys(g_cmd_ring), 1);
-        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
-        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
-        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
-        put_le32(g_cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
+        hype_xhci_trb_link(link, phys(hw->cmd_ring), 1);
+        put_le32(hw->cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
+        put_le32(hw->cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
+        put_le32(hw->cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
+        put_le32(hw->cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
     }
-    wr64(bar, op + HYPE_XHCI_OP_CRCR, phys(g_cmd_ring) | 1u /* RCS */);
+    wr64(bar, op + HYPE_XHCI_OP_CRCR, phys(hw->cmd_ring) | 1u /* RCS */);
 
     /* Event ring: one segment, described by a single-entry ERST. */
-    zero(g_evt_ring, XPAGE);
-    zero(g_erst, 64);
-    put_le64(g_erst + 0, phys(g_evt_ring)); /* segment base */
-    put_le32(g_erst + 8, RING_TRBS);        /* segment size (TRBs) */
+    zero(hw->evt_ring, XPAGE);
+    zero(hw->erst, 64);
+    put_le64(hw->erst + 0, phys(hw->evt_ring)); /* segment base */
+    put_le32(hw->erst + 8, RING_TRBS);        /* segment size (TRBs) */
     {
         uint32_t ir = out->rtsoff;
         wr32(bar, hype_xhci_ir0_offset(ir, HYPE_XHCI_IR_ERSTSZ), 1u); /* one segment */
-        wr64(bar, hype_xhci_ir0_offset(ir, HYPE_XHCI_IR_ERDP), phys(g_evt_ring));
-        wr64(bar, hype_xhci_ir0_offset(ir, HYPE_XHCI_IR_ERSTBA), phys(g_erst));
+        wr64(bar, hype_xhci_ir0_offset(ir, HYPE_XHCI_IR_ERDP), phys(hw->evt_ring));
+        wr64(bar, hype_xhci_ir0_offset(ir, HYPE_XHCI_IR_ERSTBA), phys(hw->erst));
     }
 
     /* Run. */
     wr32(bar, op + HYPE_XHCI_OP_USBCMD,
          rd32(bar, op + HYPE_XHCI_OP_USBCMD) | HYPE_XHCI_USBCMD_RS);
-    if (wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_HCH, 0) != 0) return -1;
+    if (wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_HCH, 0) != 0) { hw->in_use = 0; return -1; }
 
     /*
      * Let attached devices be re-detected before anyone reads PORTSC.
@@ -1169,7 +1273,7 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
      */
     delay_ms(HYPE_XHCI_CONNECT_DEBOUNCE_MS);
 
-    ring_state_reset();
+    ring_state_reset(hw);
     out->inited = 1;
     return 0;
 }
@@ -1183,14 +1287,21 @@ void hype_xhci_host_quiesce(hype_xhci_ctrl_t *c) {
     }
     bar = (volatile uint8_t *)(uintptr_t)c->bar;
     op = c->op;
-    /* Clear Run/Stop and wait for HCHalted, so this controller stops touching
-     * the shared DCBAA / command ring / event ring before another is pointed at
-     * them. Bounded wait: a controller that will not halt must not wedge the
-     * boot -- we are giving up on it either way. */
+    /*
+     * Clear Run/Stop, wait for HCHalted, then release this controller's ring block.
+     *
+     * #299 changed what this is FOR. It used to be mandatory before bringing up another
+     * controller, because the DCBAA / command ring / event ring were shared; now each
+     * controller owns its own, so this is a genuine per-controller teardown that a caller
+     * uses when it is finished with a controller -- and the block goes back to the pool
+     * for a later one. Bounded wait: a controller that will not halt must not wedge the
+     * boot, since we are giving up on it either way.
+     */
     wr32(bar, op + HYPE_XHCI_OP_USBCMD,
          rd32(bar, op + HYPE_XHCI_OP_USBCMD) & ~HYPE_XHCI_USBCMD_RS);
     (void)wait_bits(bar, op + HYPE_XHCI_OP_USBSTS, HYPE_XHCI_USBSTS_HCH,
                     HYPE_XHCI_USBSTS_HCH);
+    HW(c)->in_use = 0;
     c->inited = 0;
 }
 
@@ -1427,10 +1538,11 @@ int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
 }
 
 int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot) {
+    xhci_hw_t *hw = HW(c);
     uint32_t cmd[4], evt[4];
     if (!c->inited || slot == 0u) return -1;
-    hype_xhci_trb_disable_slot(cmd, slot, (int)g_cmd_cyc);
-    if (cmd_submit_wait(c, cmd, evt) != 0) { dev_free(slot); return -1; }
-    dev_free(slot); /* release the pool entry regardless of the controller's verdict */
+    hype_xhci_trb_disable_slot(cmd, slot, (int)hw->cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) { dev_free(hw, slot); return -1; }
+    dev_free(hw, slot); /* release the pool entry regardless of the controller's verdict */
     return (hype_xhci_event_cc(evt) == HYPE_XHCI_CC_SUCCESS) ? 0 : -1;
 }

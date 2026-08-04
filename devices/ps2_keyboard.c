@@ -21,12 +21,23 @@ static void push_output(hype_ps2_kbd_t *kbd, uint8_t value) {
 }
 
 void hype_ps2_kbd_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode) {
-    /* A key event overwrites any unread previous byte -- this project's
-     * own single-pending-scancode scope (a real controller FIFOs them,
-     * but nothing here sends scancodes faster than the guest reads). */
+    /*
+     * A live typist outrunning the guest: keep the NEWEST byte, since a keystroke the
+     * guest is too slow to collect is better lost than delivered minutes late. Callers
+     * that must not lose a byte -- anything sending a multi-byte sequence, where losing
+     * one produces a different keystroke -- use try_enqueue below instead.
+     */
     kbd->out_head = 0;
     kbd->out_count = 0;
     push_output(kbd, scancode);
+}
+
+int hype_ps2_kbd_try_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode) {
+    if (kbd->out_count >= HYPE_PS2_KBD_FIFO_SIZE) {
+        return 0;
+    }
+    push_output(kbd, scancode);
+    return 1;
 }
 
 static void stage_response(hype_ps2_kbd_t *kbd, uint8_t value) {

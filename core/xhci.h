@@ -305,6 +305,26 @@ unsigned int hype_xhci_ep_dci(unsigned int ep_addr);
 void hype_xhci_set_tsc_hz(uint64_t hz);
 
 /* Captured controller geometry + register bases, filled by hype_xhci_host_init. */
+/*
+ * #299: how many controllers can be Running at once.
+ *
+ * Each needs its own DCBAA, command ring, event ring, ERST, scratchpad array, device
+ * pool and dequeue/cycle state -- they used to be file-static singletons in xhci_hw.c,
+ * which meant the host sweep had to stop controller N before bringing up N+1. Two
+ * Running controllers DMAing into one command ring and one event ring with one shared
+ * dequeue/cycle pair is what broke the Intel box, the first two-xHCI machine this ran
+ * on. But quiescing the controller holding hype's log/boot medium is not an option, so
+ * devices on every OTHER controller were unreachable -- which on a laptop with the boot
+ * stick and the internal keyboard on different controllers is the normal case.
+ *
+ * Bounded because each block is ~380 KB of .bss (64 scratchpad pages dominate), so this
+ * is a real memory tradeoff, not an arbitrary number. Two covers the machines in hand
+ * and the case that matters: storage on one controller, keyboard on the other. A third
+ * controller does not fail the boot -- it is refused a block, logged by name, and
+ * skipped, degrading to fewer controllers rather than back to sharing.
+ */
+#define HYPE_XHCI_MAX_CTRL 2u
+
 typedef struct {
     uint64_t bar;            /* xHCI MMIO BAR0 (identity-mapped) */
     uint32_t op;             /* operational-register base offset (= CAPLENGTH) */
@@ -314,6 +334,14 @@ typedef struct {
     unsigned int max_ports;
     unsigned int ctx_size;   /* 32 or 64 (CSZ) */
     int inited;
+    /*
+     * #299: which per-controller DMA/ring block in xhci_hw.c this controller owns.
+     * Assigned by hype_xhci_host_init(), released by hype_xhci_host_quiesce(). Opaque to
+     * everyone outside that file -- it exists so two controllers can be Running at once,
+     * each with its own command ring, event ring and dequeue/cycle state, which is what
+     * lets a keyboard on one controller be polled while storage streams from another.
+     */
+    unsigned int hw_slot;
 } hype_xhci_ctrl_t;
 
 /*

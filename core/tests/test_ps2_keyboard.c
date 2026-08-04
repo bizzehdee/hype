@@ -219,7 +219,65 @@ static void test_status_has_no_transmit_timeout_bit(void) {
     CHECK_HEX("transmit-timeout bit (0x20) never set", 0, status & 0x20u);
 }
 
+static void test_try_enqueue_appends_a_whole_sequence(void) {
+    /* #301: the four scancodes of a shifted character must ALL survive. The clobbering
+     * enqueue below left only the last one, so `sendkey A` delivered a bare shift
+     * release -- a script that typed a different string than it asked for. */
+    hype_ps2_kbd_t kbd;
+    const uint8_t seq[4] = {0x2A, 0x1E, 0x9E, 0xAA}; /* shift, a, a-break, shift-break */
+    unsigned int i;
+    uint8_t got;
+
+    hype_ps2_kbd_reset(&kbd);
+    for (i = 0; i < 4u; i++) {
+        CHECK_HEX("sequence byte accepted", 1,
+                  hype_ps2_kbd_try_enqueue_scancode(&kbd, seq[i]));
+    }
+    for (i = 0; i < 4u; i++) {
+        CHECK_HEX("read", 0, hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got));
+        CHECK_HEX("byte in order", seq[i], got);
+    }
+}
+
+static void test_try_enqueue_refuses_when_full_instead_of_dropping(void) {
+    /* Refusing is what lets the caller WAIT. Dropping is the bug. */
+    hype_ps2_kbd_t kbd;
+    unsigned int i;
+    uint8_t got;
+
+    hype_ps2_kbd_reset(&kbd);
+    for (i = 0; i < HYPE_PS2_KBD_FIFO_SIZE; i++) {
+        CHECK_HEX("fills up to capacity", 1,
+                  hype_ps2_kbd_try_enqueue_scancode(&kbd, (uint8_t)(0x10u + i)));
+    }
+    CHECK_HEX("refuses past capacity", 0, hype_ps2_kbd_try_enqueue_scancode(&kbd, 0xFF));
+    /* Nothing already queued was disturbed by the refusal. */
+    CHECK_HEX("read", 0, hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got));
+    CHECK_HEX("oldest byte still first", 0x10u, got);
+    /* And a drained slot makes room again. */
+    CHECK_HEX("accepts after a drain", 1, hype_ps2_kbd_try_enqueue_scancode(&kbd, 0xFF));
+}
+
+static void test_clobbering_enqueue_is_unchanged(void) {
+    /* The live-typist path keeps its behaviour: newest wins. Pinned so the #301 fix
+     * cannot quietly change what a real keystroke does. */
+    hype_ps2_kbd_t kbd;
+    uint8_t got;
+
+    hype_ps2_kbd_reset(&kbd);
+    hype_ps2_kbd_enqueue_scancode(&kbd, 0x1E);
+    hype_ps2_kbd_enqueue_scancode(&kbd, 0x30);
+    CHECK_HEX("read", 0, hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got));
+    CHECK_HEX("newest keystroke wins", 0x30u, got);
+    /* And nothing else is queued: the discarded first keystroke is gone, not pending. */
+    CHECK_HEX("read", 0, hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, &got));
+    CHECK_HEX("OBF clear -- no second byte", 0, got & HYPE_PS2_STATUS_OUTPUT_FULL);
+}
+
 int main(void) {
+    test_try_enqueue_appends_a_whole_sequence();
+    test_try_enqueue_refuses_when_full_instead_of_dropping();
+    test_clobbering_enqueue_is_unchanged();
     test_reset_state();
     test_unrecognized_port_rejected();
     test_enqueue_scancode_sets_obf_and_reads_back();
