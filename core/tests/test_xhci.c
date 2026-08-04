@@ -613,7 +613,52 @@ static void test_first_iface_class(void) {
     CHECK_HEX("NULL cfg", 0, hype_usb_first_iface_class(0, 9u, &c, 0, 0));
 }
 
+
+/* #217: interrupt-endpoint Interval encoding. The two speed families encode
+ * DIFFERENTLY and conflating them is the easy mistake -- and getting it wrong yields an
+ * endpoint that configures cleanly and never reports, which is indistinguishable from
+ * a dead keyboard. */
+static void test_interval_encode(void) {
+    /* High speed and above: bInterval is already an exponent -> Interval = bInterval-1. */
+    CHECK_HEX("HS bInterval 10 -> 9", 9, hype_xhci_interval_encode(HYPE_USB_SPEED_HIGH, 10));
+    CHECK_HEX("HS bInterval 1 -> 0", 0, hype_xhci_interval_encode(HYPE_USB_SPEED_HIGH, 1));
+    CHECK_HEX("SS bInterval 4 -> 3", 3, hype_xhci_interval_encode(4u, 4));
+    /* Clamped to the field's legal range rather than wrapping. */
+    CHECK_HEX("HS oversized clamps to 15", 15, hype_xhci_interval_encode(HYPE_USB_SPEED_HIGH, 99));
+    CHECK_HEX("HS zero -> 0", 0, hype_xhci_interval_encode(HYPE_USB_SPEED_HIGH, 0));
+
+    /* Full/low speed: bInterval is a FRAME COUNT -> log2 + 3. */
+    CHECK_HEX("FS 1 frame -> 3", 3, hype_xhci_interval_encode(HYPE_USB_SPEED_FULL, 1));
+    CHECK_HEX("FS 8 frames -> 6", 6, hype_xhci_interval_encode(HYPE_USB_SPEED_FULL, 8));
+    CHECK_HEX("LS 10 frames -> 6", 6, hype_xhci_interval_encode(HYPE_USB_SPEED_LOW, 10));
+    CHECK_HEX("FS 128 frames -> 10", 10, hype_xhci_interval_encode(HYPE_USB_SPEED_FULL, 128));
+    CHECK_HEX("FS 255 frames clamps to 10", 10, hype_xhci_interval_encode(HYPE_USB_SPEED_FULL, 255));
+    /* An illegal 0 must not reach log2(0) -- polling too fast still works, never
+     * polling does not. */
+    CHECK_HEX("FS zero -> fastest legal", 3, hype_xhci_interval_encode(HYPE_USB_SPEED_FULL, 0));
+
+    /* The same bInterval means different things at different speeds -- the assertion
+     * that a single shared formula would fail. */
+    if (hype_xhci_interval_encode(HYPE_USB_SPEED_HIGH, 8) ==
+        hype_xhci_interval_encode(HYPE_USB_SPEED_FULL, 8)) {
+        printf("FAIL: HS and FS bInterval 8 must not encode identically\n");
+        failures++;
+    }
+}
+
+static void test_ep_ctx_interval_field(void) {
+    uint32_t ep[8];
+    hype_xhci_ep_ctx_interval(ep, HYPE_XHCI_EP_TYPE_INT_IN, 8u, 0x1000u, 1, 9u);
+    CHECK_HEX("Interval lands in dword0 bits 23:16", 9u, (ep[0] >> 16) & 0xFFu);
+    /* And must not disturb what the bulk builder already set. */
+    CHECK_HEX("EP type preserved", HYPE_XHCI_EP_TYPE_INT_IN, (ep[1] >> 3) & 0x7u);
+    CHECK_HEX("max packet preserved", 8u, (ep[1] >> 16) & 0xFFFFu);
+    CHECK_HEX("dequeue ptr preserved", 0x1001u, ep[2]);
+}
+
 int main(void) {
+    test_interval_encode();
+    test_ep_ctx_interval_field();
     test_first_iface_class();
     test_inventory_add_and_find();
     test_inventory_dedupes_by_position_not_identity();

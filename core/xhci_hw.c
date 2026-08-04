@@ -27,6 +27,24 @@ static uint8_t g_evt_ring[XPAGE] __attribute__((aligned(XPAGE)));    /* event ri
 static uint8_t g_erst[64] __attribute__((aligned(64)));              /* event ring segment table */
 static uint8_t g_scratch_arr[XPAGE] __attribute__((aligned(XPAGE))); /* scratchpad buffer array */
 static uint8_t g_scratch_pages[MAX_SCRATCH][XPAGE] __attribute__((aligned(XPAGE)));
+/* USB-5 (#217): the HID keyboard's interrupt-IN transfer ring and report buffer. Kept
+ * separate from the bulk rings so a keyboard poll can never disturb the MSC datapath
+ * the log sink depends on. */
+static uint8_t g_int_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
+static uint8_t g_hid_report[64] __attribute__((aligned(64)));
+static unsigned int g_iin_enq;
+static unsigned int g_iin_cyc = 1u;
+/*
+ * Is a report transfer currently OUTSTANDING?
+ *
+ * An interrupt endpoint needs exactly ONE transfer queued at a time, re-armed after
+ * each completion. Enqueuing on every poll call -- which the guest dispatch loop makes
+ * thousands of times a second -- fills the 256-TRB ring in a fraction of a second and
+ * the keyboard goes silent, which is precisely what the first QEMU test showed: the
+ * endpoint configured, the device claimed, and not one report ever delivered.
+ */
+static int g_iin_armed;
+static uint64_t g_iin_pending_trb;
 /* Device pool: hub descent (#231 pt5b) needs several devices addressed at once
  * (a hub plus the device behind it), so each addressed device owns its own
  * Device Context + EP0 ring + ring cursor, keyed by its slot id. The Input
@@ -588,6 +606,118 @@ int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
 /* #266 defect 1: completions that arrive for another endpoint are parked here rather
  * than discarded. See core/xhci.h for why discarding was the bug. */
 static hype_xhci_parked_t g_parked;
+
+/*
+ * USB-5 (#217): configure the HID keyboard's interrupt-IN endpoint.
+ *
+ * Structurally the bulk sibling above, with EP_TYPE_INT_IN and its own ring. The
+ * Slot Context has to re-provide the device's full topology (route/root/TT) for the
+ * same reason it does there -- a Configure Endpoint command replaces it.
+ */
+int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
+                                       const hype_xhci_devpath_t *path, unsigned int ep_addr,
+                                       unsigned int mps, unsigned int interval) {
+    unsigned int cs = c->ctx_size;
+    unsigned int dci = hype_xhci_ep_dci(ep_addr);
+    uint32_t ctx[8], cmd[4], evt[4];
+
+    if (!c->inited || slot == 0u || path == (const hype_xhci_devpath_t *)0) return -1;
+    if (mps == 0u || mps > sizeof(g_hid_report)) return -1;
+
+    zero(g_int_in_ring, XPAGE);
+    ring_init_link(g_int_in_ring);
+    g_iin_enq = 0; g_iin_cyc = 1; g_iin_armed = 0; g_iin_pending_trb = 0;
+
+    zero(g_input_ctx, XPAGE);
+    hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
+    write_ctx(g_input_ctx, 0, ctx);
+    hype_xhci_slot_ctx(ctx, path->route, path->speed, dci, path->root_port,
+                       path->tt_hub_slot, path->tt_port);
+    write_ctx(g_input_ctx, cs, ctx);
+    /* #217: the Interval is what gives the controller a schedule to poll on. Without
+     * it the endpoint configures cleanly and never reports. */
+    hype_xhci_ep_ctx_interval(ctx, HYPE_XHCI_EP_TYPE_INT_IN, mps, phys(g_int_in_ring), 1,
+                              hype_xhci_interval_encode(path->speed, interval));
+    write_ctx(g_input_ctx, (1u + dci) * cs, ctx);
+
+    hype_xhci_trb_configure_endpoint(cmd, phys(g_input_ctx), slot, (int)g_cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    return 0;
+}
+
+/*
+ * Poll for one HID report. Returns 1 when a report was copied out, 0 when none has
+ * arrived yet, -1 on a transfer error.
+ *
+ * The three-way return is the whole point. A keyboard is idle almost all the time, so
+ * "nothing yet" is the NORMAL case and must be distinguishable from a fault -- the
+ * bulk path collapses both into -1, which is right for a disk read that must succeed
+ * and wrong here: treating idle as an error would disable the keyboard the moment
+ * nobody typed, and treating a fault as idle would hide a dead endpoint forever.
+ *
+ * Deliberately a SHORT budget. This is called from the guest dispatch loop, so a long
+ * spin waiting for a keystroke would stall the guest -- the cost of missing a report
+ * is that it is picked up on the next pass a moment later.
+ */
+int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
+                          uint8_t *out, unsigned int len) {
+    volatile uint8_t *bar;
+    unsigned int dci = hype_xhci_ep_dci(ep_addr);
+    uint32_t t[4], evt[4];
+    unsigned int spins = 0;
+    uint64_t my_trb;
+    unsigned int i;
+
+    if (!c->inited || slot == 0u || out == (uint8_t *)0 || len == 0u ||
+        len > sizeof(g_hid_report)) {
+        return -1;
+    }
+    bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    my_trb = phys(g_int_in_ring) + (uint64_t)g_iin_enq * HYPE_XHCI_TRB_BYTES;
+
+    /* Arm exactly one transfer, and only when none is outstanding. */
+    if (!g_iin_armed) {
+        hype_xhci_trb_normal(t, phys(g_hid_report), len, (int)g_iin_cyc);
+        ring_enqueue(g_int_in_ring, &g_iin_enq, &g_iin_cyc, t);
+        wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
+        g_iin_armed = 1;
+        g_iin_pending_trb = my_trb;
+    }
+    my_trb = g_iin_pending_trb;
+
+    /* #266: a completion for this transfer may already be parked from a previous
+     * pass -- claim it before spinning, same reasoning as the bulk path. */
+    {
+        uint32_t parked_cc = 0;
+        if (hype_xhci_parked_take(&g_parked, slot, dci, my_trb, &parked_cc)) {
+            g_iin_armed = 0; /* consumed -- next poll re-arms */
+            if (parked_cc != HYPE_XHCI_CC_SUCCESS && parked_cc != HYPE_XHCI_CC_SHORT_PACKET) {
+                return -1;
+            }
+            for (i = 0; i < len; i++) out[i] = g_hid_report[i];
+            return 1;
+        }
+    }
+    if (next_event_budget(bar, c->rtsoff, evt, SPIN / 1024u, &spins) != 0) {
+        return 0; /* idle -- the common case, NOT an error */
+    }
+    if (hype_xhci_event_slot_id(evt) != slot || hype_xhci_event_ep_id(evt) != dci) {
+        /* Someone else's completion. Park it rather than discard: discarding is the
+         * #266 bug, and the MSC datapath may be waiting for exactly this. */
+        (void)hype_xhci_parked_put(&g_parked, hype_xhci_event_slot_id(evt),
+                                   hype_xhci_event_ep_id(evt),
+                                   hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt));
+        return 0;
+    }
+    g_iin_armed = 0; /* our completion arrived -- re-arm on the next poll */
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS &&
+        hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SHORT_PACKET) {
+        return -1;
+    }
+    for (i = 0; i < len; i++) out[i] = g_hid_report[i];
+    return 1;
+}
 
 static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsigned int *cyc,
                      unsigned int slot, unsigned int dci, uint64_t buf_phys, unsigned int len) {

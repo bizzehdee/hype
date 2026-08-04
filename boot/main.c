@@ -25,6 +25,7 @@
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/xhci.h"
+#include "../core/usb_hid.h" /* USB-5 (#217): HID boot-keyboard host input */
 #include "../core/blk_usb.h"
 #include "../core/ahci_host.h"
 #include "../core/gpt.h"
@@ -194,6 +195,16 @@ int hype_vmx_smoke_test(void);
  * declared here because the post-EBS run loop (well above the definition) flushes
  * the sink on the RT-3 cadence. */
 static void usb_log_flush(void);
+/* USB-5 (#217): defined with the other USB globals, used by the FW-1 dispatch loop and
+ * the #233 confirm gate, both of which appear earlier in this file. */
+static unsigned int usb_hid_drain(void);
+/* #217: HID poll counters, declared early so the periodic DIAG block can read them. */
+static int g_hid_ready;
+static unsigned int g_hid_slot;
+static unsigned int g_hid_ep;
+static unsigned long long g_hid_polls;
+static unsigned long long g_hid_reports;
+static unsigned long long g_hid_poll_errs;
 
 #ifndef HYPE_DIAG_PROBE_ONLY
 #define HYPE_DIAG_PROBE_ONLY 0
@@ -7825,6 +7836,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * on a guest). USB HID (TERM-5) will feed this same path unchanged. */
         if (vm == &g_vms[0]) {
             uint8_t sc;
+            /* USB-5 (#217): pull any USB HID keyboard report and inject its scancodes
+             * into the same queue this loop already drains, so the chord recognizer and
+             * command line below need no knowledge of which keyboard it came from. */
+            (void)usb_hid_drain();
             while (hype_host_kbd_poll_scancode(&sc)) {
                 uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
                 unsigned kn = 0;
@@ -8162,6 +8177,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * one. The write-size histogram above cannot tell these apart:
                  * many 1-sector writes look identical either way.
                  */
+                /*
+                 * #217: separate "hype never polled" from "hype polled and the device
+                 * sent nothing". Without this split an absent keystroke is
+                 * unattributable -- it could be the endpoint, the drain not being
+                 * reached, or simply nobody typing, and on a serial-less machine the
+                 * log is the only way to tell.
+                 */
+                if (g_hid_ready) {
+                    hype_debug_print("fw-1 DIAG: HID polls=%llu reports=%llu errors=%llu "
+                                     "(slot%u ep=0x%02x) [#217]\n",
+                                     g_hid_polls, g_hid_reports, g_hid_poll_errs,
+                                     g_hid_slot, g_hid_ep);
+                }
                 {
                     const hype_virtio_blk_depth_t *qd = hype_virtio_blk_depth();
                     if (qd->kicks != 0) {
@@ -11291,6 +11319,10 @@ static void fw_1_await_phys_confirm_on_bsp(void) {
 
     while (hype_rdtsc() < deadline) {
         uint8_t sc;
+        /* USB-5 (#217): the reason #233 was blocked on this ticket -- on the AMD laptop
+         * the operator types on USB, so without this drain the confirm prompt below can
+         * never be answered on that machine. */
+        (void)usb_hid_drain();
         while (hype_host_kbd_poll_scancode(&sc)) {
             uint8_t chars[HYPE_KBD_DECODE_MAX_OUT];
             unsigned n = hype_kbd_decode_feed(&dec, sc, chars, (unsigned)sizeof(chars));
@@ -11366,6 +11398,63 @@ static usblog_ctx_t g_usb_log_ctx;
  * must reference file-global storage. hype_xhci_ctrl_t is pure geometry (all
  * ring state is in xhci_hw.c file-statics), so a value copy is safe. */
 static hype_xhci_ctrl_t g_usb_xc;
+/*
+ * USB-5 (#217): the HID keyboard hype claimed for its OWN input, if any.
+ *
+ * A copy of the controller struct, as the MSC path does -- it holds BAR/rtsoff/dboff
+ * values, not pointers into the sweep's locals.
+ */
+static hype_xhci_ctrl_t g_hid_xc;
+static unsigned int g_hid_mps;
+static uint8_t g_hid_prev[HYPE_USB_HID_REPORT_LEN];
+static int g_hid_have_prev;
+
+/*
+ * Poll the claimed USB keyboard and inject any resulting scancodes into the host
+ * queue. Returns the number of scancodes injected.
+ *
+ * Called from wherever hype already drains host keystrokes; a no-op until a keyboard
+ * has been claimed, so machines without one are unaffected.
+ */
+static unsigned int usb_hid_drain(void) {
+    uint8_t report[HYPE_USB_HID_REPORT_LEN];
+    uint8_t codes[HYPE_USB_HID_MAX_SCANCODES];
+    unsigned int n, i;
+    int r;
+
+    if (!g_hid_ready) {
+        return 0;
+    }
+    g_hid_polls++;
+    r = hype_xhci_int_in_poll(&g_hid_xc, g_hid_slot, g_hid_ep, report, HYPE_USB_HID_REPORT_LEN);
+    if (r < 0) {
+        g_hid_poll_errs++;
+    }
+    if (r <= 0) {
+        /* 0 = idle, the normal case. -1 = a transfer error; the endpoint is left armed
+         * and retried next pass rather than torn down, since a single failed poll on
+         * an input device is not worth losing the keyboard over. */
+        return 0;
+    }
+    g_hid_reports++;
+    if (g_hid_reports == 1u) {
+        /* Say it ONCE. "Endpoint configured" and "reports actually arrive" are
+         * different claims, and only the second means the operator can type -- without
+         * this line a keyboard that enumerates but never reports looks identical to a
+         * working one in the log, on machines where the log is all there is. */
+        hype_debug_print("host-hid: FIRST report received -- USB keyboard is live [#217]\n");
+    }
+    n = hype_usb_hid_report_to_scancodes(g_hid_have_prev ? g_hid_prev : 0, report, codes,
+                                        (unsigned)sizeof(codes));
+    for (i = 0; i < HYPE_USB_HID_REPORT_LEN; i++) {
+        g_hid_prev[i] = report[i];
+    }
+    g_hid_have_prev = 1;
+    for (i = 0; i < n; i++) {
+        hype_host_kbd_inject_scancode(codes[i]);
+    }
+    return n;
+}
 static hype_xhci_msc_eps_t g_usb_msc;
 static hype_blk_usb_t g_usb_ubk;
 static hype_blk_phys_t g_usb_uphys;
@@ -12638,6 +12727,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     static uint8_t desc[18];
                     static uint8_t cfgbuf[256];
                     hype_xhci_msc_eps_t msc;
+                    uint8_t di_class_for_slot = 0; /* #217: resolved device class */
                     hype_xhci_devpath_t path;      /* the root-port device's topology */
                     hype_xhci_devpath_t msc_path;  /* the confirmed MSC's topology */
                     unsigned int msc_slot = 0;
@@ -12733,6 +12823,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                              &di.dev_subclass, &di.dev_protocol);
                         }
                         di.owner = (uint8_t)HYPE_USB_OWNER_NONE;
+                        di_class_for_slot = di.dev_class; /* #217: needed by the skip branch */
                         (void)hype_usb_inventory_add(&g_usb_inv, &di);
                     }
 
@@ -12764,10 +12855,34 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             continue;
                         }
                     } else {
+                        /*
+                         * USB-5 (#217): RETAIN the slot for a HID device instead of
+                         * releasing it. Claiming a keyboard later needs its slot still
+                         * addressed -- measured: the claim found the keyboard in the
+                         * inventory, then failed at GET_DESCRIPTOR because this line had
+                         * already disabled its slot, and reported "not a usable boot
+                         * keyboard" for a keyboard that was perfectly usable.
+                         *
+                         * Only HID is retained, not everything. Slots are a finite
+                         * per-controller resource and nothing else has a claimant yet;
+                         * the general "keep every slot addressed" that passthrough wants
+                         * belongs with #299's per-controller work.
+                         */
+                        int is_hid = (di_class_for_slot == HYPE_USB_CLASS_HID);
                         hype_debug_print("host-xhci: port %u dev is not MSC or hub "
-                                         "(class=%02x, cfg %u bytes) -- skipping\n",
-                                         rp, (unsigned)desc[4], cfglen);
-                        hype_xhci_disable_slot(&xc, slot);
+                                         "(class=%02x, cfg %u bytes) -- %s\n",
+                                         rp, (unsigned)desc[4], cfglen,
+                                         is_hid ? "HID: slot RETAINED for #217" : "skipping");
+                        if (!is_hid) {
+                            /* The inventory must not advertise a slot that no longer
+                             * exists -- a later claimant would try to use it and fail
+                             * confusingly, which is exactly what just happened. */
+                            int ii = hype_usb_inventory_find(&g_usb_inv, xhci_count, rp, 0u);
+                            if (ii >= 0) {
+                                g_usb_inv.dev[ii].slot = 0u;
+                            }
+                            hype_xhci_disable_slot(&xc, slot);
+                        }
                         continue;
                     }
 
@@ -12891,6 +13006,74 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 if (!msc_found) {
                     hype_debug_print("host-xhci: controller[%u] -- no USB mass-storage on any root "
                                      "port or behind any hub\n", xhci_count);
+                }
+                /*
+                 * USB-5 (#217): claim a HID boot keyboard for hype's own input, if the
+                 * sweep found one that nothing else owns. This is what gives hype a
+                 * keyboard on a USB-keyboard-only, serial-less machine -- without it the
+                 * operator cannot type a leader chord, a dashboard command, or the #233
+                 * physical-write confirm on that hardware.
+                 *
+                 * Searched by CLASS through the inventory rather than re-walking the bus,
+                 * which is what #241 exists to make possible, and it skips anything
+                 * already claimed so hype's own boot medium can never be mistaken for an
+                 * input device.
+                 */
+                {
+                    int hi = hype_usb_inventory_next_unclaimed_class(&g_usb_inv, HYPE_USB_CLASS_HID,
+                                                                     -1);
+                    while (hi >= 0 && !g_hid_ready) {
+                        const hype_usb_devinfo_t *d = &g_usb_inv.dev[hi];
+                        /* Boot protocol only -- a non-boot HID needs its report descriptor
+                         * parsed, and misreading a report layout invents keystrokes. */
+                        if (d->dev_subclass == HYPE_USB_SUBCLASS_BOOT &&
+                            d->dev_protocol == HYPE_USB_PROTO_KEYBOARD && d->slot != 0u) {
+                            static uint8_t hidcfg[256];
+                            unsigned int hidlen = 0;
+                            hype_usb_hid_kbd_t kbd;
+                            if (hype_xhci_get_config_descriptor(&xc, d->slot, hidcfg, sizeof(hidcfg),
+                                                                &hidlen) == 0 &&
+                                hype_usb_hid_find_keyboard(hidcfg, hidlen, &kbd) == 0 &&
+                                hype_xhci_set_configuration(&xc, d->slot, kbd.config_value) == 0) {
+                                hype_xhci_devpath_t kpath;
+                                kpath.root_port = d->root_port;
+                                kpath.route = d->route;
+                                kpath.speed = d->speed;
+                                kpath.tt_hub_slot = 0u;
+                                kpath.tt_port = 0u;
+                                if (hype_xhci_configure_int_in_endpoint(&xc, d->slot, &kpath,
+                                                                        kbd.int_in_ep, kbd.mps,
+                                                                        kbd.interval) == 0) {
+                                    g_hid_xc = xc;
+                                    g_hid_slot = d->slot;
+                                    g_hid_ep = kbd.int_in_ep;
+                                    g_hid_mps = kbd.mps;
+                                    g_hid_have_prev = 0;
+                                    g_hid_ready = 1;
+                                    hype_usb_inventory_claim(&g_usb_inv, hi, HYPE_USB_OWNER_HYPE);
+                                    hype_debug_print("host-hid: USB keyboard CLAIMED -- %04x:%04x "
+                                                     "port%u slot%u ep=0x%02x mps=%u; host keystrokes "
+                                                     "now reach hype [#217]\n",
+                                                     (unsigned)d->vid, (unsigned)d->pid, d->root_port,
+                                                     d->slot, kbd.int_in_ep, kbd.mps);
+                                } else {
+                                    hype_debug_print("host-hid: keyboard %04x:%04x found but "
+                                                     "Configure Endpoint FAILED -- no host keyboard "
+                                                     "[#217]\n", (unsigned)d->vid, (unsigned)d->pid);
+                                }
+                            } else {
+                                hype_debug_print("host-hid: HID device %04x:%04x is not a usable boot "
+                                                 "keyboard -- skipped [#217]\n",
+                                                 (unsigned)d->vid, (unsigned)d->pid);
+                            }
+                        }
+                        hi = hype_usb_inventory_next_unclaimed_class(&g_usb_inv, HYPE_USB_CLASS_HID,
+                                                                     hi);
+                    }
+                    if (!g_hid_ready) {
+                        hype_debug_print("host-hid: no USB boot keyboard claimed (PS/2 host keyboard "
+                                         "only) [#217]\n");
+                    }
                 }
                 if (msc_found) {
                     msc_found_any = 1; /* stop scanning further controllers */

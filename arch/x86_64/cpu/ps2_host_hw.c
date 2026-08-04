@@ -27,3 +27,9 @@ void hype_host_kbd_isr(const hype_isr_frame_t *frame) {
 int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
     return hype_host_kbd_buffer_pop(&g_host_kbd_buffer, out_scancode);
 }
+
+void hype_host_kbd_inject_scancode(uint8_t scancode) {
+    /* Same buffer the ISR pushes into -- see the header for why USB HID joins the
+     * queue rather than adding a parallel path. */
+    hype_host_kbd_buffer_push(&g_host_kbd_buffer, scancode);
+}

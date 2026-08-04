@@ -94,4 +94,19 @@ void hype_host_kbd_isr(const hype_isr_frame_t *frame);
  */
 int hype_host_kbd_poll_scancode(uint8_t *out_scancode);
 
+/*
+ * USB-5 (#217): push a scancode into the SAME host queue the PS/2 ISR feeds.
+ *
+ * This is the whole integration point for USB HID keyboard input. A USB keyboard's
+ * reports are translated to PS/2 Set-1 scancodes (core/usb_hid.c) and injected here,
+ * so every existing consumer -- the leader-chord recognizer, the dashboard command
+ * line, the #233 physical-write confirm gate -- works with no change at all and
+ * cannot behave differently for a USB keyboard than for a PS/2 one.
+ *
+ * The alternative was a second poll call at every consumption site, which is where
+ * the two paths would have drifted: a site that forgot the second call would silently
+ * work for one keyboard type and not the other.
+ */
+void hype_host_kbd_inject_scancode(uint8_t scancode);
+
 #endif /* HYPE_ARCH_PS2_HOST_H */

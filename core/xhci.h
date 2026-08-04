@@ -627,4 +627,36 @@ const char *hype_usb_owner_str(hype_usb_owner_t owner);
  */
 int hype_usb_first_iface_class(const uint8_t *cfg, unsigned int len, uint8_t *out_class,
                                uint8_t *out_subclass, uint8_t *out_protocol);
+
+/* USB-5 (#217): configure a HID keyboard's interrupt-IN endpoint, then poll it.
+ * hype_xhci_int_in_poll returns 1 = report copied, 0 = none yet (the normal idle
+ * case), -1 = transfer error. The three-way return matters: collapsing idle into an
+ * error would disable the keyboard whenever nobody typed. */
+int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
+                                       const hype_xhci_devpath_t *path, unsigned int ep_addr,
+                                       unsigned int mps, unsigned int interval);
+int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
+                          uint8_t *out, unsigned int len);
+
+/*
+ * USB-5 (#217): encode a descriptor bInterval into the xHCI Endpoint Context Interval
+ * field (xHCI 6.2.3.6), for the given PORTSC speed id.
+ *
+ * Mandatory for INTERRUPT endpoints and ignored for bulk -- which is why
+ * hype_xhci_ep_ctx() never set it and why a keyboard configured through that path
+ * enumerated correctly and then delivered no reports at all: Interval 0 leaves the
+ * controller with no schedule on which to poll the device.
+ *
+ * The two speed families encode differently, and conflating them is the easy mistake:
+ *   - High speed and above: bInterval is ALREADY an exponent (period = 2^(bInterval-1)
+ *     microframes), so Interval = bInterval - 1.
+ *   - Full and low speed: bInterval is a frame COUNT (1..255), so it must be converted
+ *     to an exponent: Interval = log2(bInterval) + 3.
+ * Results are clamped to the field's legal range rather than truncated.
+ */
+unsigned int hype_xhci_interval_encode(unsigned int speed_id, unsigned int b_interval);
+
+/* Endpoint context with an explicit Interval -- for interrupt (and isoch) endpoints. */
+void hype_xhci_ep_ctx_interval(uint32_t ep[8], unsigned int ep_type, unsigned int max_packet,
+                               uint64_t tr_dequeue_phys, int dcs, unsigned int interval);
 #endif /* HYPE_CORE_XHCI_H */

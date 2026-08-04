@@ -464,3 +464,34 @@ int hype_usb_first_iface_class(const uint8_t *cfg, unsigned int len, uint8_t *ou
     }
     return 0;
 }
+
+unsigned int hype_xhci_interval_encode(unsigned int speed_id, unsigned int b_interval) {
+    if (speed_id == HYPE_USB_SPEED_FULL || speed_id == HYPE_USB_SPEED_LOW) {
+        /* bInterval is a frame count; convert to an exponent. A count of 0 is illegal
+         * in the descriptor -- treat it as the fastest legal poll rather than
+         * computing log2(0), since a keyboard that polls too often still works while
+         * one that never polls does not. */
+        unsigned int exp = 0;
+        unsigned int v = (b_interval == 0u) ? 1u : b_interval;
+        while ((v >> 1) != 0u) { exp++; v >>= 1; }
+        exp += 3u;
+        if (exp < 3u) exp = 3u;
+        if (exp > 10u) exp = 10u;
+        return exp;
+    }
+    /* High speed and above: already an exponent. */
+    if (b_interval == 0u) {
+        return 0u;
+    }
+    if (b_interval - 1u > 15u) {
+        return 15u;
+    }
+    return b_interval - 1u;
+}
+
+void hype_xhci_ep_ctx_interval(uint32_t ep[8], unsigned int ep_type, unsigned int max_packet,
+                               uint64_t tr_dequeue_phys, int dcs, unsigned int interval) {
+    hype_xhci_ep_ctx(ep, ep_type, max_packet, tr_dequeue_phys, dcs);
+    /* dword0: Interval[23:16]. */
+    ep[0] = (ep[0] & ~0x00FF0000u) | ((interval & 0xFFu) << 16);
+}
