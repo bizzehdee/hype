@@ -926,6 +926,32 @@ static unsigned int drain_events(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t 
  * harmlessly errors when not halted), then Set TR Dequeue Pointer to a
  * zeroed, restarted ring. Software ring state resets to enq=0/cycle=1.
  */
+/*
+ * #289: report each recovery step and its completion code.
+ *
+ * Stop and Reset Endpoint legitimately fail (the endpoint may already be stopped, or not
+ * halted), so their result cannot gate the recovery -- but "we do not act on it" is not a
+ * reason to throw the evidence away. bot_recover() ran three times on real hardware and
+ * the write path never came back, and the log said only "BOT reset recovery" without
+ * saying which of the three commands actually completed. On this controller, whose late
+ * completions already forced #254's lenient command matching, "the command completed but
+ * we gave up waiting" is a live possibility that this distinguishes: a TIMEOUT and a
+ * completion with a non-success code look identical in a log that reports neither.
+ */
+static void ep_recover_step(hype_xhci_ctrl_t *c, uint32_t cmd[4], const char *what,
+                            unsigned int slot, unsigned int dci) {
+    uint32_t evt[4];
+
+    if (cmd_submit_wait(c, cmd, evt) != 0) {
+        hype_debug_print("host-xhci: #289 %s (slot=%u dci=%u) NO COMPLETION (timed out)\n", what,
+                         slot, dci);
+        return;
+    }
+    hype_debug_print("host-xhci: #289 %s (slot=%u dci=%u) cc=%u%s\n", what, slot, dci,
+                     hype_xhci_event_cc(evt),
+                     hype_xhci_event_cc(evt) == HYPE_XHCI_CC_SUCCESS ? " (success)" : "");
+}
+
 static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, uint8_t *ring,
                       unsigned int *enq, unsigned int *cyc) {
     xhci_hw_t *hw = HW(c);
@@ -933,19 +959,38 @@ static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, 
     unsigned int i;
 
     hype_xhci_trb_stop_endpoint(cmd, slot, dci, (int)hw->cmd_cyc);
-    (void)cmd_submit_wait(c, cmd, evt); /* result deliberately ignored: the EP may
-                                         * already be stopped or halted */
+    ep_recover_step(c, cmd, "Stop Endpoint", slot, dci);
     hype_xhci_trb_reset_endpoint(cmd, slot, dci, (int)hw->cmd_cyc);
-    (void)cmd_submit_wait(c, cmd, evt); /* errors when the EP is not halted: fine */
+    ep_recover_step(c, cmd, "Reset Endpoint", slot, dci);
 
     for (i = 0; i < XPAGE; i++) { ring[i] = 0; }
+    /*
+     * #289: put the Link TRB back. The wipe above clears the whole page INCLUDING the
+     * toggle-cycle Link at the last slot that ring_init_link() installed at configure
+     * time, so without this a recovered ring is structurally different from a freshly
+     * configured one -- it has no Link until the producer happens to wrap and write one.
+     * ring_enqueue() does write it on wrap, which is why this has not visibly broken, but
+     * "correct only because nobody reached the end yet" is not a state to leave a DMA
+     * structure in after a recovery whose whole purpose is to restore a known-good one.
+     */
+    ring_init_link(ring);
     *enq = 0;
     *cyc = 1;
     hype_xhci_trb_set_tr_dequeue(cmd, phys(ring) | 1u /* DCS=1 */, slot, dci, (int)hw->cmd_cyc);
-    if (cmd_submit_wait(c, cmd, evt) != 0 || hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
-        hype_debug_print("host-xhci: #254 Set TR Dequeue failed (slot=%u dci=%u)\n", slot, dci);
+    if (cmd_submit_wait(c, cmd, evt) != 0) {
+        hype_debug_print("host-xhci: #289 Set TR Dequeue (slot=%u dci=%u) NO COMPLETION "
+                         "(timed out) -- endpoint left in an unknown ring position\n", slot, dci);
         return -1;
     }
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
+        hype_debug_print("host-xhci: #289 Set TR Dequeue (slot=%u dci=%u) cc=%u -- controller and "
+                         "driver now disagree about the ring position\n", slot, dci,
+                         hype_xhci_event_cc(evt));
+        return -1;
+    }
+    hype_debug_print("host-xhci: #289 Set TR Dequeue (slot=%u dci=%u) cc=%u (success) -- ring "
+                     "restarted at index 0, producer cycle 1\n", slot, dci,
+                     hype_xhci_event_cc(evt));
     return 0;
 }
 
