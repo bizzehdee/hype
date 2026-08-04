@@ -608,4 +608,23 @@ const char *hype_usb_owner_str(hype_usb_owner_t owner);
 #define HYPE_USB_PROTO_KEYBOARD   0x01u
 #define HYPE_USB_PROTO_MOUSE      0x02u
 
+
+/*
+ * #241: class/subclass/protocol of the FIRST interface in a configuration
+ * descriptor, for devices whose bDeviceClass is 0.
+ *
+ * Needed because a composite device -- which is most USB peripherals, including
+ * QEMU's usb-kbd and usb-storage -- reports bDeviceClass 0 and puts the real class
+ * in its interface descriptors. Measured: hype's inventory recorded both a keyboard
+ * and a mass-storage stick as class=00/00/00, so a class lookup for HID (what #217
+ * needs to find a keyboard) matched neither.
+ *
+ * Returns 1 and fills the outputs when an interface descriptor is found, 0
+ * otherwise. Pure -- walks the caller's buffer only. Takes the FIRST interface: a
+ * multi-function device needs per-interface handling that nothing needs yet, and
+ * guessing which of several is "the" class would be worse than reporting the first
+ * and saying so.
+ */
+int hype_usb_first_iface_class(const uint8_t *cfg, unsigned int len, uint8_t *out_class,
+                               uint8_t *out_subclass, uint8_t *out_protocol);
 #endif /* HYPE_CORE_XHCI_H */

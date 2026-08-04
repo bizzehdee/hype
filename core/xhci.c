@@ -437,3 +437,30 @@ const char *hype_usb_owner_str(hype_usb_owner_t owner) {
         default: return "?";
     }
 }
+
+int hype_usb_first_iface_class(const uint8_t *cfg, unsigned int len, uint8_t *out_class,
+                               uint8_t *out_subclass, uint8_t *out_protocol) {
+    unsigned int off = 0;
+
+    if (cfg == (const uint8_t *)0) {
+        return 0;
+    }
+    while (off + 2u <= len) {
+        unsigned int dlen = cfg[off];
+        unsigned int dtype = cfg[off + 1u];
+        /* A zero/short length would loop forever on a malformed descriptor -- the
+         * buffer is device-supplied, so it gets the same treatment as any other
+         * untrusted input rather than being trusted to terminate. */
+        if (dlen < 2u || off + dlen > len) {
+            return 0;
+        }
+        if (dtype == HYPE_USB_DESC_INTERFACE && dlen >= 9u) {
+            if (out_class != (uint8_t *)0) *out_class = cfg[off + 5u];
+            if (out_subclass != (uint8_t *)0) *out_subclass = cfg[off + 6u];
+            if (out_protocol != (uint8_t *)0) *out_protocol = cfg[off + 7u];
+            return 1;
+        }
+        off += dlen;
+    }
+    return 0;
+}

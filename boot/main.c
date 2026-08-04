@@ -12717,6 +12717,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         di.dev_class = desc[4];
                         di.dev_subclass = desc[5];
                         di.dev_protocol = desc[6];
+                        /*
+                         * #241: bDeviceClass is 0 on a COMPOSITE device -- which is most
+                         * peripherals -- and the real class lives in its interface
+                         * descriptor. Recording the device-descriptor value alone made
+                         * both a keyboard and a mass-storage stick appear as
+                         * class=00/00/00, so a class lookup for HID matched neither.
+                         * Fall back to the first interface when the device declines to
+                         * say.
+                         */
+                        if (di.dev_class == 0u &&
+                            hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
+                                                            &cfglen) == 0) {
+                            (void)hype_usb_first_iface_class(cfgbuf, cfglen, &di.dev_class,
+                                                             &di.dev_subclass, &di.dev_protocol);
+                        }
                         di.owner = (uint8_t)HYPE_USB_OWNER_NONE;
                         (void)hype_usb_inventory_add(&g_usb_inv, &di);
                     }

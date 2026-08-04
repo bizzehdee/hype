@@ -548,7 +548,73 @@ static void test_inventory_owner_strings_and_explicit_owner(void) {
               (int)inv.dev[0].owner);
 }
 
+
+/* #241: composite devices report bDeviceClass 0 and put the class in the interface
+ * descriptor. Measured on QEMU: a usb-kbd and a usb-storage both inventoried as
+ * class 00/00/00, so a HID lookup found neither. */
+static void test_first_iface_class(void) {
+    /* config(9) + interface(9) -- HID boot keyboard. */
+    static const uint8_t cfg_kbd[] = {
+        9, HYPE_USB_DESC_CONFIG, 18, 0, 1, 1, 0, 0xA0, 50,
+        9, HYPE_USB_DESC_INTERFACE, 0, 0, 1, HYPE_USB_CLASS_HID, HYPE_USB_SUBCLASS_BOOT,
+        HYPE_USB_PROTO_KEYBOARD, 0
+    };
+    uint8_t c = 0xFF, sc = 0xFF, pr = 0xFF;
+
+    CHECK_HEX("found an interface", 1,
+              hype_usb_first_iface_class(cfg_kbd, (unsigned)sizeof(cfg_kbd), &c, &sc, &pr));
+    CHECK_HEX("HID class", HYPE_USB_CLASS_HID, c);
+    CHECK_HEX("boot subclass", HYPE_USB_SUBCLASS_BOOT, sc);
+    CHECK_HEX("keyboard protocol", HYPE_USB_PROTO_KEYBOARD, pr);
+
+    /* Skips non-interface descriptors to reach the interface. */
+    {
+        static const uint8_t cfg_skip[] = {
+            9, HYPE_USB_DESC_CONFIG, 25, 0, 1, 1, 0, 0xA0, 50,
+            7, 0x0B, 0, 2, 0, 0, 0,                          /* interface association */
+            9, HYPE_USB_DESC_INTERFACE, 0, 0, 2, HYPE_USB_CLASS_MSC, HYPE_USB_SUBCLASS_SCSI,
+            HYPE_USB_PROTO_BOT, 0
+        };
+        c = 0;
+        CHECK_HEX("skips to the interface", 1,
+                  hype_usb_first_iface_class(cfg_skip, (unsigned)sizeof(cfg_skip), &c, 0, 0));
+        CHECK_HEX("MSC class", HYPE_USB_CLASS_MSC, c);
+    }
+
+    /* No interface descriptor at all. */
+    {
+        static const uint8_t cfg_none[] = {9, HYPE_USB_DESC_CONFIG, 9, 0, 1, 1, 0, 0xA0, 50};
+        CHECK_HEX("no interface -> 0", 0,
+                  hype_usb_first_iface_class(cfg_none, (unsigned)sizeof(cfg_none), &c, 0, 0));
+    }
+
+    /*
+     * Malformed input must TERMINATE. The buffer is device-supplied, so a zero-length
+     * descriptor is a hostile-input case, not a theoretical one: without the guard the
+     * walk advances by 0 and loops forever inside hype during host enumeration.
+     */
+    {
+        static const uint8_t cfg_zero[] = {0, HYPE_USB_DESC_INTERFACE, 0, 0, 0, 3, 1, 1, 0};
+        CHECK_HEX("zero-length descriptor refused, does not hang", 0,
+                  hype_usb_first_iface_class(cfg_zero, (unsigned)sizeof(cfg_zero), &c, 0, 0));
+    }
+    /* A descriptor claiming to run past the buffer end. */
+    {
+        static const uint8_t cfg_over[] = {200, HYPE_USB_DESC_INTERFACE, 0, 0, 0, 3, 1, 1, 0};
+        CHECK_HEX("overlong descriptor refused", 0,
+                  hype_usb_first_iface_class(cfg_over, (unsigned)sizeof(cfg_over), &c, 0, 0));
+    }
+    /* An interface descriptor too short to hold the class triple. */
+    {
+        static const uint8_t cfg_short[] = {4, HYPE_USB_DESC_INTERFACE, 0, 0};
+        CHECK_HEX("short interface refused", 0,
+                  hype_usb_first_iface_class(cfg_short, (unsigned)sizeof(cfg_short), &c, 0, 0));
+    }
+    CHECK_HEX("NULL cfg", 0, hype_usb_first_iface_class(0, 9u, &c, 0, 0));
+}
+
 int main(void) {
+    test_first_iface_class();
     test_inventory_add_and_find();
     test_inventory_dedupes_by_position_not_identity();
     test_inventory_update_cannot_unclaim();
