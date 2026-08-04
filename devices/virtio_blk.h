@@ -108,6 +108,21 @@
 #define HYPE_VIRTIO_BLK_T_IN 0u  /* read */
 #define HYPE_VIRTIO_BLK_T_OUT 1u /* write */
 #define HYPE_VIRTIO_BLK_T_FLUSH 4u
+/*
+ * #310: GET_ID -- the driver asks the device for its serial-number string.
+ *
+ * The vendored edk2 tree's IndustryStandard/VirtioBlk.h predates this request type (its list
+ * stops at VIRTIO_BLK_T_FLUSH_OUT), so unlike most formats in this project there is no in-tree
+ * primary source for it; the values come from the OASIS VIRTIO spec §5.2.6, where the field is
+ * VIRTIO_BLK_ID_BYTES = 20 bytes of ASCII, NUL-PADDED rather than NUL-terminated (a full
+ * 20-character serial fills the field with no terminator).
+ *
+ * FreeBSD's vtblk issues it during attach and complains when it fails --
+ * "error getting device identifier: 45" (ENOTSUP, the direct translation of S_UNSUPP). Linux's
+ * virtio_blk issues it too but swallows the failure, which is why this went unnoticed.
+ */
+#define HYPE_VIRTIO_BLK_T_GET_ID 8u
+#define HYPE_VIRTIO_BLK_ID_BYTES 20u
 
 /* virtio_blk_req status byte values (spec §5.2.6). */
 #define HYPE_VIRTIO_BLK_S_OK 0x00u
@@ -158,6 +173,15 @@ typedef struct {
      * chains. Real hardware keeps the equivalent of this privately
      * too -- it's not part of the virtio wire format. */
     uint16_t last_avail_idx;
+    /*
+     * #310: the GET_ID serial string, exactly HYPE_VIRTIO_BLK_ID_BYTES of NUL-padded ASCII.
+     *
+     * Device IDENTITY, not negotiation state, so it is set by hype_virtio_blk_reset() and NOT
+     * by reset_negotiation_state() -- a driver writing device_status = 0 resets the device it
+     * is talking to, and a disk whose serial changed under that write would look to the guest
+     * like the disk had been swapped mid-boot.
+     */
+    uint8_t serial[HYPE_VIRTIO_BLK_ID_BYTES];
 } hype_virtio_blk_t;
 
 /*
@@ -194,6 +218,17 @@ typedef struct {
 #define HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX 256u
 
 void hype_virtio_blk_reset(hype_virtio_blk_t *dev, uint64_t capacity_sectors);
+
+/*
+ * #310: set the GET_ID serial string. `name` is NUL-terminated ASCII; up to
+ * HYPE_VIRTIO_BLK_ID_BYTES characters are taken and the remainder of the field is NUL-padded,
+ * per the spec's fixed-width field. Longer names are truncated rather than refused -- the field
+ * is a fixed 20 bytes and a caller cannot make it bigger.
+ *
+ * Optional: hype_virtio_blk_reset() already installs a default, so a caller that does not care
+ * about per-VM distinctness gets a valid, stable serial for free.
+ */
+void hype_virtio_blk_set_serial(hype_virtio_blk_t *dev, const char *name);
 
 /*
  * Reads/writes the common configuration register at `offset` (byte

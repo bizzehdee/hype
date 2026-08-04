@@ -3366,6 +3366,49 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
                  * data for a read, and the status byte in both directions. */
                 used_len = (req_type == HYPE_VIRTIO_BLK_T_IN) ? (uint32_t)(xfer_bytes + 1u) : 1u;
             }
+        } else if (req_type == HYPE_VIRTIO_BLK_T_GET_ID) {
+            /*
+             * #310: hand back the device's serial string. FreeBSD's vtblk issues this during
+             * attach and reports "error getting device identifier: 45" when it is refused.
+             *
+             * Deliberately NOT folded into the T_IN path above: that path requires every
+             * segment to be a whole-sector multiple, and this one carries a single 20-byte
+             * device-writable segment, so reusing it would IOERR the request instead.
+             */
+            hype_virtq_desc_t seg;
+
+            if (virtq_fetch_desc(dev, dma_map, header_desc.next, &seg) != 0) {
+                virtio_blk_reject("GET_ID: data descriptor vanished mid-chain");
+                status_value = HYPE_VIRTIO_BLK_S_IOERR;
+                used_len = 1;
+            } else if ((seg.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0) {
+                /* No data descriptor at all -- the next link is already the status byte. */
+                virtio_blk_reject("GET_ID: chain carries no data descriptor");
+                status_value = HYPE_VIRTIO_BLK_S_IOERR;
+                used_len = 1;
+            } else {
+                /*
+                 * Write at most what the guest offered AND at most the field width, then
+                 * translate for exactly that many bytes. A short buffer is the guest's
+                 * business; overrunning it would be hype's.
+                 */
+                uint32_t n = (seg.len < HYPE_VIRTIO_BLK_ID_BYTES) ? seg.len
+                                                                  : HYPE_VIRTIO_BLK_ID_BYTES;
+                uint8_t *gbuf = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, seg.addr, n);
+                if (gbuf == 0) {
+                    virtio_blk_reject("GET_ID: data segment failed bounds check");
+                    status_value = HYPE_VIRTIO_BLK_S_IOERR;
+                    used_len = 1;
+                } else {
+                    uint32_t i;
+                    for (i = 0; i < n; i++) {
+                        gbuf[i] = dev->serial[i];
+                    }
+                    status_value = HYPE_VIRTIO_BLK_S_OK;
+                    /* used_len counts what the device wrote, plus the status byte. */
+                    used_len = n + 1u;
+                }
+            }
         } else if (req_type == HYPE_VIRTIO_BLK_T_FLUSH) {
             /* Synchronous backend: writes already durable, so FLUSH is a no-op ACK
              * (a real guest issues FLUSH; returning UNSUPP would stall its I/O).

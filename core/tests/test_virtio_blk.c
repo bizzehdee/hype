@@ -707,6 +707,165 @@ static void test_chain_bad_requests_complete_with_ioerr(void) {
     }
 }
 
+/* #310 --------------------------------------------------------------------------------- */
+
+static void test_get_id_returns_the_serial_nul_padded(void) {
+    /*
+     * #310: FreeBSD's vtblk issues GET_ID during attach and reported
+     * "error getting device identifier: 45" (ENOTSUP == S_UNSUPP) when hype refused it.
+     *
+     * The field is a fixed 20 bytes of ASCII, NUL-PADDED rather than NUL-terminated, and
+     * used_len must count what the device wrote PLUS the status byte.
+     */
+    tq_t q;
+    uint32_t len[1] = {HYPE_VIRTIO_BLK_ID_BYTES};
+    unsigned i;
+    unsigned nonzero = 0;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_GET_ID, 0);
+    hype_virtio_blk_set_serial(&q.dev, "vm0");
+    tq_chain(&q, len, 1, HYPE_VIRTQ_DESC_F_WRITE);
+    tq_submit(&q, 0);
+
+    CHECK_HEX("GET_ID does not abort the notify", 0, tq_run(&q));
+    CHECK_HEX("GET_ID reported OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("GET_ID was completed", 1u, tq_get16(q.used + 2));
+    CHECK_HEX("used_len is the 20 bytes written plus the status byte",
+              HYPE_VIRTIO_BLK_ID_BYTES + 1u, tq_get32(q.used + 8));
+    CHECK_HEX("serial byte 0", 'v', q.gbuf[0]);
+    CHECK_HEX("serial byte 1", 'm', q.gbuf[1]);
+    CHECK_HEX("serial byte 2", '0', q.gbuf[2]);
+    /* Everything past the name must be NUL padding, not stale buffer contents. */
+    for (i = 3; i < HYPE_VIRTIO_BLK_ID_BYTES; i++) {
+        CHECK_HEX("padded with NUL", 0, q.gbuf[i]);
+        nonzero += (q.gbuf[i] != 0) ? 1u : 0u;
+    }
+    CHECK_HEX("no stale bytes in the padding", 0, nonzero);
+}
+
+static void test_get_id_is_stable_across_calls(void) {
+    /*
+     * The ticket's own acceptance point: the identifier must be UNCHANGED across two calls. A
+     * serial that varied would make a guest OS think the disk had been swapped.
+     */
+    tq_t q;
+    uint32_t len[1] = {HYPE_VIRTIO_BLK_ID_BYTES};
+    uint8_t first[HYPE_VIRTIO_BLK_ID_BYTES];
+    unsigned i;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_GET_ID, 0);
+    tq_chain(&q, len, 1, HYPE_VIRTQ_DESC_F_WRITE);
+    tq_submit(&q, 0);
+    (void)tq_run(&q);
+    for (i = 0; i < HYPE_VIRTIO_BLK_ID_BYTES; i++) {
+        first[i] = q.gbuf[i];
+        q.gbuf[i] = 0xEE; /* poison, so an unwritten buffer cannot pass by looking unchanged */
+    }
+
+    tq_submit(&q, 0);
+    (void)tq_run(&q);
+    for (i = 0; i < HYPE_VIRTIO_BLK_ID_BYTES; i++) {
+        CHECK_HEX("serial identical on the second call", first[i], q.gbuf[i]);
+    }
+}
+
+static void test_get_id_default_serial_is_a_valid_20_byte_field(void) {
+    /* A device nobody named still has to answer GET_ID with something sane. */
+    hype_virtio_blk_t dev;
+    unsigned i;
+    unsigned printable = 0;
+
+    hype_virtio_blk_reset(&dev, 128u);
+    for (i = 0; i < HYPE_VIRTIO_BLK_ID_BYTES; i++) {
+        if (dev.serial[i] >= 0x20u && dev.serial[i] < 0x7Fu) {
+            printable++;
+        }
+    }
+    CHECK_HEX("reset installs a full 20-character printable default", HYPE_VIRTIO_BLK_ID_BYTES,
+              printable);
+}
+
+static void test_serial_survives_a_driver_reset(void) {
+    /*
+     * device_status = 0 is a DRIVER reset: it clears negotiation state. The serial is device
+     * IDENTITY and must survive it -- a disk whose serial changed mid-boot under the driver's
+     * own reset would look to the guest like the disk had been swapped.
+     */
+    hype_virtio_blk_t dev;
+    uint8_t before[HYPE_VIRTIO_BLK_ID_BYTES];
+    unsigned i;
+
+    hype_virtio_blk_reset(&dev, 128u);
+    hype_virtio_blk_set_serial(&dev, "vm1");
+    for (i = 0; i < HYPE_VIRTIO_BLK_ID_BYTES; i++) {
+        before[i] = dev.serial[i];
+    }
+    common_write(&dev, HYPE_VIRTIO_COMMON_CFG_DEVICE_STATUS, 1, 0);
+    for (i = 0; i < HYPE_VIRTIO_BLK_ID_BYTES; i++) {
+        CHECK_HEX("serial unchanged by a driver reset", before[i], dev.serial[i]);
+    }
+}
+
+static void test_set_serial_truncates_and_keeps_the_default_for_no_name(void) {
+    hype_virtio_blk_t dev;
+    unsigned i;
+
+    /* Longer than the field: truncated to 20, no overrun, no terminator. */
+    hype_virtio_blk_reset(&dev, 128u);
+    hype_virtio_blk_set_serial(&dev, "0123456789ABCDEFGHIJ-OVERFLOW");
+    for (i = 0; i < HYPE_VIRTIO_BLK_ID_BYTES; i++) {
+        CHECK_HEX("truncated to the field width", "0123456789ABCDEFGHIJ"[i], dev.serial[i]);
+    }
+
+    /* A NULL or empty name keeps the default rather than blanking the field. */
+    hype_virtio_blk_reset(&dev, 128u);
+    hype_virtio_blk_set_serial(&dev, 0);
+    CHECK_HEX("NULL name keeps the default", 'H', dev.serial[0]);
+    hype_virtio_blk_set_serial(&dev, "");
+    CHECK_HEX("empty name keeps the default", 'H', dev.serial[0]);
+}
+
+static void test_get_id_short_buffer_is_not_overrun(void) {
+    /*
+     * The guest offered fewer than 20 bytes. hype must write only what was offered -- a short
+     * buffer is the guest's business, overrunning it would be hype's.
+     */
+    tq_t q;
+    uint32_t len[1] = {4u};
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_GET_ID, 0);
+    hype_virtio_blk_set_serial(&q.dev, "vm0");
+    tq_chain(&q, len, 1, HYPE_VIRTQ_DESC_F_WRITE);
+    q.gbuf[4] = 0xEE; /* sentinel immediately past the offered buffer */
+    tq_submit(&q, 0);
+
+    CHECK_HEX("short GET_ID still succeeds", 0, tq_run(&q));
+    CHECK_HEX("short GET_ID reported OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("used_len counts only what was written, plus status", 5u, tq_get32(q.used + 8));
+    CHECK_HEX("wrote the offered bytes", 'v', q.gbuf[0]);
+    CHECK_HEX("byte past the buffer untouched", 0xEE, q.gbuf[4]);
+}
+
+static void test_get_id_with_no_data_descriptor_is_rejected_not_ignored(void) {
+    /*
+     * A GET_ID whose chain is header-then-status carries nowhere to put the answer. It must be
+     * completed with an error rather than silently reported OK, which would tell the guest a
+     * serial had been written into a buffer that does not exist.
+     */
+    tq_t q;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_GET_ID, 0);
+    /* header (desc 0) -> status (desc 1), no data segment */
+    tq_desc(&q, 0, q.hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    tq_desc(&q, 1, &q.status, 1u, HYPE_VIRTQ_DESC_F_WRITE, 0);
+    tq_submit(&q, 0);
+
+    CHECK_HEX("does not abort the notify", 0, tq_run(&q));
+    CHECK_HEX("reported IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+    CHECK_HEX("was completed", 1u, tq_get16(q.used + 2));
+    CHECK_HEX("named in the log", 1, tq_reject_says("no data descriptor"));
+}
+
 static void test_chain_unsupported_type_is_completed(void) {
     tq_t q;
     uint32_t len[1] = {512u};
@@ -921,6 +1080,13 @@ int main(void) {
     test_chain_cycle_is_rejected();
     test_chain_malformed_shapes_change_nothing();
     test_chain_bad_requests_complete_with_ioerr();
+    test_get_id_returns_the_serial_nul_padded();
+    test_get_id_is_stable_across_calls();
+    test_get_id_default_serial_is_a_valid_20_byte_field();
+    test_serial_survives_a_driver_reset();
+    test_set_serial_truncates_and_keeps_the_default_for_no_name();
+    test_get_id_short_buffer_is_not_overrun();
+    test_get_id_with_no_data_descriptor_is_rejected_not_ignored();
     test_chain_unsupported_type_is_completed();
     test_chain_multiple_pending_chains_all_drain();
     test_chain_zero_queue_size_rejected();

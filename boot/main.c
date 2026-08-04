@@ -7273,6 +7273,16 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
                            HYPE_FW_1_VDISK_BYTES);
     }
 vblk_pci:
+    /*
+     * #310: give this VM's disk its own GET_ID serial. Done ONCE here, where every backend
+     * branch above converges, rather than beside each of the six hype_virtio_blk_reset() calls
+     * -- a per-site call is the "someone adds a branch and forgets one" failure #317 was about,
+     * and the default installed by hype_virtio_blk_reset() would silently mask the omission.
+     *
+     * Per VM, because a serial that is identical across VMs tells each guest the same disk
+     * identity for two genuinely different disks; constant across reboots, because vm->name is.
+     */
+    hype_virtio_blk_set_serial(&vm->vblk, vm->name);
     hype_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
                         HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
                         HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE);

@@ -15,9 +15,38 @@ static void reset_negotiation_state(hype_virtio_blk_t *dev) {
     dev->last_avail_idx = 0;
 }
 
+void hype_virtio_blk_set_serial(hype_virtio_blk_t *dev, const char *name) {
+    unsigned int n = 0;
+    unsigned int i;
+
+    /* No name: keep what is already there. hype_virtio_blk_reset() installed a valid default,
+     * and an all-NUL serial would be a worse answer than a generic one. */
+    if (name == 0 || name[0] == '\0') {
+        return;
+    }
+    while (n < HYPE_VIRTIO_BLK_ID_BYTES && name[n] != '\0') {
+        n++;
+    }
+    /* Fixed-width and NUL-PADDED, not NUL-terminated: a 20-character serial fills the field. */
+    for (i = 0; i < HYPE_VIRTIO_BLK_ID_BYTES; i++) {
+        dev->serial[i] = (i < n) ? (uint8_t)name[i] : (uint8_t)0;
+    }
+}
+
 void hype_virtio_blk_reset(hype_virtio_blk_t *dev, uint64_t capacity_sectors) {
     reset_negotiation_state(dev);
     dev->capacity_sectors = capacity_sectors;
+    /*
+     * #310: the serial is set HERE and not in reset_negotiation_state(), because that runs again
+     * whenever a driver writes device_status = 0. It is device identity, not negotiation state,
+     * and a disk whose serial changed under a driver reset would look to the guest like the disk
+     * had been swapped mid-boot.
+     *
+     * Default matches the string the ATA/ATAPI IDENTIFY paths already report
+     * (devices/ata_disk.c, devices/atapi.c), which is exactly 20 characters, so hype answers
+     * consistently across its disk frontends. boot/main.c overrides it per VM.
+     */
+    hype_virtio_blk_set_serial(dev, "HYPE0000000000000001");
 }
 
 int hype_virtio_blk_common_cfg_read(const hype_virtio_blk_t *dev, uint32_t offset, uint8_t size_bytes,
