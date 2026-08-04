@@ -1019,6 +1019,7 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
  * per-vCPU (struct hype_vcpu_ctx.pending_irq_*). */
 static unsigned long long g_int_eventinj = 0;   /* accepted immediately (direct EVENTINJ) */
 static unsigned int g_int_poll_trace_n = 0;     /* #313: bounds the poll-inject trace */
+static unsigned long long g_int_poll_total = 0; /* #311: the COUNT, so the cap is not read as one */
 static unsigned long long g_int_vintr_defer = 0; /* couldn't accept -> VINTR window armed */
 static unsigned long long g_int_vintr_window = 0;/* VINTR window fired -> deferred inject */
 static unsigned long long g_int_defer_overwrite = 0; /* requested a vector already pending in the IRR (coalesced, not lost) */
@@ -1212,6 +1213,11 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
          * reports the timer while a device vector is logged pending, the timer's IRR bit is
          * never clear and priority-by-vector-number starves everything below it -- which is
          * candidate (2) on the ticket, and a different fix from candidate (1). */
+        g_int_poll_total++;
+        if (g_int_poll_total == 50u || g_int_poll_total == 200u || g_int_poll_total == 1000u) {
+            hype_debug_print("fw-1 POLLINJ-TOTAL=%llu (last vec=0x%02x)\n",
+                             (unsigned long long)g_int_poll_total, (unsigned int)v);
+        }
         if (g_int_poll_trace_n < 20u) {
             g_int_poll_trace_n++;
             hype_debug_print("fw-1 POLLINJ#%02u vec=0x%02x more_pending=%d\n",
@@ -2134,12 +2140,22 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
          * acknowledges a completion -- so its absence means the handler was never entered,
          * whatever hype staged for injection. */
         if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS) {
+            /* The COUNT is reported separately from the samples, and on a rising decade, so a
+             * trace cap can never again be mistaken for the guest's actual behaviour: reading
+             * "12 acks" off a trace capped at 12 is what sent #311 chasing a PSS-vs-DHRS split
+             * that may not exist. */
             static unsigned int pis_trace_n = 0;
+            static unsigned int pis_total = 0;
+            pis_total++;
             if (pis_trace_n < 12u) {
                 pis_trace_n++;
                 hype_debug_print("fw-1 PxIS-ACK#%02u val=0x%x p_is_before=0x%x\n",
                                  (unsigned int)pis_trace_n, (unsigned int)value,
                                  (unsigned int)ahci->p_is);
+            }
+            if (pis_total == 20u || pis_total == 50u || pis_total == 100u ||
+                pis_total == 500u || pis_total == 1000u) {
+                hype_debug_print("fw-1 PxIS-ACK-TOTAL=%u (still acking)\n", pis_total);
             }
         }
         if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
