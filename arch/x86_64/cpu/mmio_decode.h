@@ -96,6 +96,22 @@ typedef struct {
      */
     int has_imm;
     uint32_t imm_value;
+    /*
+     * #307: memory is the DESTINATION operand of an ALU op, not the source -- a genuine
+     * read-modify-write of one device register (`orl $2, (%rdx)`, which is how FreeBSD
+     * sets AHCI GHC.IE). The other operand is the immediate when has_imm is set, else the
+     * register in `reg`.
+     *
+     * Direction is a separate field rather than folded into `op` because it changes the
+     * arithmetic: `sub (%rax), %ecx` computes ecx-mem, while `subl $2, (%rax)` computes
+     * mem-2. A handler must read the device register, combine, and write the result back
+     * -- see hype_mmio_rmw_value().
+     *
+     * is_write is always 1 alongside this: only the ops that write their destination are
+     * decoded at all, so the fault is always reported as a write and there is no path on
+     * which a mem-destination form updates a GPR.
+     */
+    int mem_is_dst;
 } hype_mmio_decode_t;
 
 /*
@@ -145,5 +161,18 @@ uint32_t hype_mmio_extract_write_value(uint64_t reg_value, uint8_t size_bytes);
  * accidentally write a GPR's contents to a device when the instruction meant a constant.
  */
 uint32_t hype_mmio_store_value(const hype_mmio_decode_t *d, uint64_t reg_value);
+
+/*
+ * #307: the value a memory-DESTINATION ALU instruction writes back, given the device
+ * register's current contents. `mem_value` is what the handler just read from the device,
+ * `reg_value` the source register's 64-bit contents (ignored when the source is an
+ * immediate), and `*rflags` is updated in place exactly as the real instruction would.
+ *
+ * Only meaningful when d->mem_is_dst; returns mem_value unchanged otherwise, so a handler
+ * that reaches here on a plain store writes back what it read rather than corrupting the
+ * register.
+ */
+uint32_t hype_mmio_rmw_value(const hype_mmio_decode_t *d, uint64_t reg_value, uint32_t mem_value,
+                             uint64_t *rflags);
 
 #endif /* HYPE_ARCH_MMIO_DECODE_H */

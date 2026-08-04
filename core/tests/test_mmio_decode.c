@@ -117,7 +117,9 @@ static void test_movzx_word(void) {
 }
 
 static void test_rejects_unrecognized_opcode(void) {
-    uint8_t bytes[] = {0x01u, 0x03u}; /* ADD, not a MOV form we support */
+    /* XCHG r/m32, r32 -- a genuine memory-touching instruction this project does not
+     * emulate. (This test used to use ADD r/m32,r32, which #307 now supports on purpose.) */
+    uint8_t bytes[] = {0x87u, 0x03u};
     expect_decode_fail("unrecognized opcode", bytes, sizeof(bytes));
 }
 
@@ -472,6 +474,250 @@ static void test_store_value_falls_back_to_the_register(void) {
               hype_mmio_store_value(&d, 0x1234BEEFu) & 0xFFFFu);
 }
 
+/* --- #307: memory-destination read-modify-write --- */
+
+static void test_decodes_the_freebsd_ahci_ghc_write(void) {
+    /*
+     * The exact instruction FreeBSD 15.0 panicked hype on, byte for byte, from the run log:
+     * `83 0a 02` = orl $0x2,(%rdx) -- AHCI GHC.IE. Group 1, extension /1 (OR), imm8.
+     */
+    static const uint8_t insn[] = {0x83, 0x0A, 0x02};
+    hype_mmio_decode_t d;
+    uint64_t rflags = 0;
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(insn, 3u, &d));
+    CHECK_HEX("memory is the destination", 1u, (unsigned)d.mem_is_dst);
+    CHECK_HEX("reported as a write", 1u, (unsigned)d.is_write);
+    CHECK_HEX("dword", 4u, d.size_bytes);
+    CHECK_HEX("op is OR", (unsigned)HYPE_MMIO_ALU_OR, (unsigned)d.op);
+    CHECK_HEX("carries an immediate", 1u, (unsigned)d.has_imm);
+    CHECK_HEX("immediate", 2u, d.imm_value);
+    CHECK_HEX("length opcode+modrm+imm8", 3u, d.instr_len);
+    /* GHC already had AE (bit 31) set, so the write-back must PRESERVE it and add IE. */
+    CHECK_HEX("result ORs into the register's current value", 0x80000002u,
+              hype_mmio_rmw_value(&d, 0u, 0x80000000u, &rflags));
+}
+
+static void test_group1_ops_and_widths(void) {
+    struct { uint8_t opcode; uint8_t modrm; int op; uint8_t size; const char *name; } cases[] = {
+        {0x83u, 0x02u, (int)HYPE_MMIO_ALU_ADD, 4u, "addl imm8"},
+        {0x83u, 0x0Au, (int)HYPE_MMIO_ALU_OR, 4u, "orl imm8"},
+        {0x83u, 0x22u, (int)HYPE_MMIO_ALU_AND, 4u, "andl imm8"},
+        {0x83u, 0x2Au, (int)HYPE_MMIO_ALU_SUB, 4u, "subl imm8"},
+        {0x83u, 0x32u, (int)HYPE_MMIO_ALU_XOR, 4u, "xorl imm8"},
+        {0x80u, 0x0Au, (int)HYPE_MMIO_ALU_OR, 1u, "orb imm8"},
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t insn[3];
+        hype_mmio_decode_t d;
+        insn[0] = cases[i].opcode;
+        insn[1] = cases[i].modrm;
+        insn[2] = 0x05u;
+        CHECK_HEX(cases[i].name, 0u, (unsigned)hype_mmio_decode(insn, 3u, &d));
+        CHECK_HEX("op", (unsigned)cases[i].op, (unsigned)d.op);
+        CHECK_HEX("size", cases[i].size, d.size_bytes);
+        CHECK_HEX("mem_is_dst", 1u, (unsigned)d.mem_is_dst);
+        CHECK_HEX("instr_len", 3u, d.instr_len);
+    }
+}
+
+static void test_group1_imm32_and_word_widths(void) {
+    /* 0x81 carries a full-width immediate, and the 0x66 prefix shortens BOTH the operand
+     * and the immediate to 16 bits -- a length mistake here resumes mid-instruction. */
+    static const uint8_t dword[] = {0x81, 0x0A, 0x78, 0x56, 0x34, 0x12};
+    static const uint8_t word[] = {0x66, 0x81, 0x0A, 0x34, 0x12};
+    hype_mmio_decode_t d;
+
+    CHECK_HEX("imm32 decodes", 0u, (unsigned)hype_mmio_decode(dword, 6u, &d));
+    CHECK_HEX("imm32 value", 0x12345678u, d.imm_value);
+    CHECK_HEX("imm32 length", 6u, d.instr_len);
+    CHECK_HEX("imm32 width", 4u, d.size_bytes);
+
+    CHECK_HEX("imm16 decodes", 0u, (unsigned)hype_mmio_decode(word, 5u, &d));
+    CHECK_HEX("imm16 value", 0x1234u, d.imm_value);
+    CHECK_HEX("imm16 length prefix+opcode+modrm+imm16", 5u, d.instr_len);
+    CHECK_HEX("imm16 width", 2u, d.size_bytes);
+}
+
+static void test_group1_imm8_is_sign_extended(void) {
+    /*
+     * `andl $-2,(%rdx)` is `83 22 fe`: a single 0xFE byte meaning 0xFFFFFFFE. Zero-extending
+     * it instead would compute mem & 0xFE and silently clear the top 24 bits of a device
+     * register the guest meant to leave alone -- exactly how a driver's carefully preserved
+     * configuration gets wiped.
+     */
+    static const uint8_t insn[] = {0x83, 0x22, 0xFE};
+    hype_mmio_decode_t d;
+    uint64_t rflags = 0;
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(insn, 3u, &d));
+    CHECK_HEX("immediate sign-extended", 0xFFFFFFFEu, d.imm_value);
+    CHECK_HEX("clears only the low bit", 0xDEADBEEEu,
+              hype_mmio_rmw_value(&d, 0u, 0xDEADBEEFu, &rflags));
+}
+
+static void test_reg_to_mem_ops(void) {
+    struct { uint8_t opcode; int op; uint8_t size; const char *name; } cases[] = {
+        {0x01u, (int)HYPE_MMIO_ALU_ADD, 4u, "add r/m32, r32"},
+        {0x09u, (int)HYPE_MMIO_ALU_OR, 4u, "or  r/m32, r32"},
+        {0x21u, (int)HYPE_MMIO_ALU_AND, 4u, "and r/m32, r32"},
+        {0x29u, (int)HYPE_MMIO_ALU_SUB, 4u, "sub r/m32, r32"},
+        {0x31u, (int)HYPE_MMIO_ALU_XOR, 4u, "xor r/m32, r32"},
+        {0x00u, (int)HYPE_MMIO_ALU_ADD, 1u, "add r/m8, r8"},
+        {0x08u, (int)HYPE_MMIO_ALU_OR, 1u, "or  r/m8, r8"},
+        {0x20u, (int)HYPE_MMIO_ALU_AND, 1u, "and r/m8, r8"},
+        {0x28u, (int)HYPE_MMIO_ALU_SUB, 1u, "sub r/m8, r8"},
+        {0x30u, (int)HYPE_MMIO_ALU_XOR, 1u, "xor r/m8, r8"},
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t insn[2];
+        hype_mmio_decode_t d;
+        insn[0] = cases[i].opcode;
+        insn[1] = 0x11u; /* mod=00 reg=010(edx/dl) rm=001([rcx]) */
+        CHECK_HEX(cases[i].name, 0u, (unsigned)hype_mmio_decode(insn, 2u, &d));
+        CHECK_HEX("op", (unsigned)cases[i].op, (unsigned)d.op);
+        CHECK_HEX("size", cases[i].size, d.size_bytes);
+        CHECK_HEX("mem_is_dst", 1u, (unsigned)d.mem_is_dst);
+        CHECK_HEX("source register is EDX", 2u, d.reg);
+        CHECK_HEX("no immediate", 0u, (unsigned)d.has_imm);
+    }
+}
+
+static void test_rmw_source_is_the_register_when_there_is_no_immediate(void) {
+    static const uint8_t insn[] = {0x09, 0x11}; /* or (%rcx), %edx */
+    hype_mmio_decode_t d;
+    uint64_t rflags = 0;
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(insn, 2u, &d));
+    CHECK_HEX("register supplies the operand", 0x0000000Fu,
+              hype_mmio_rmw_value(&d, 0xFFFFFFFF00000005u, 0x0000000Au, &rflags));
+}
+
+static void test_rmw_direction_matters_for_subtraction(void) {
+    /*
+     * The whole reason direction is a separate field: `subl $2,(%rax)` is mem-2, and the
+     * memory-SOURCE form `sub (%rax),%ecx` is reg-mem. Computing one as the other is
+     * invisible for AND/OR/XOR and wrong for ADD/SUB, so it is pinned explicitly.
+     */
+    static const uint8_t mem_dst[] = {0x83, 0x28, 0x02}; /* subl $2,(%rax) */
+    hype_mmio_decode_t d;
+    uint64_t rflags = 0;
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(mem_dst, 3u, &d));
+    CHECK_HEX("op is SUB", (unsigned)HYPE_MMIO_ALU_SUB, (unsigned)d.op);
+    CHECK_HEX("computes mem - imm, not imm - mem", 8u, hype_mmio_rmw_value(&d, 0u, 10u, &rflags));
+    CHECK_HEX("no borrow", 0u, (unsigned)(rflags & 0x1u));
+
+    /* And a borrow the other way sets CF, so the guest's next JB is right. */
+    CHECK_HEX("wraps", 0xFFFFFFFFu, hype_mmio_rmw_value(&d, 0u, 1u, &rflags));
+    CHECK_HEX("borrow set", 1u, (unsigned)(rflags & 0x1u));
+}
+
+static void test_rmw_sets_flags_from_the_result(void) {
+    static const uint8_t insn[] = {0x83, 0x22, 0x00}; /* andl $0,(%rdx) */
+    hype_mmio_decode_t d;
+    uint64_t rflags = 0x8D5u; /* CF and OF set going in */
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(insn, 3u, &d));
+    CHECK_HEX("result", 0u, hype_mmio_rmw_value(&d, 0u, 0xFFFFFFFFu, &rflags));
+    CHECK_HEX("ZF set", 0x40u, (unsigned)(rflags & 0x40u));
+    CHECK_HEX("CF cleared by the bitwise op", 0u, (unsigned)(rflags & 0x1u));
+    CHECK_HEX("OF cleared by the bitwise op", 0u, (unsigned)(rflags & 0x800u));
+}
+
+static void test_rmw_refuses_adc_sbb_and_cmp(void) {
+    /*
+     * /2 ADC and /3 SBB need carry-in this decoder does not model; /7 CMP writes no
+     * destination and would take a different path in every handler. All three must panic
+     * visibly with the bytes in the message rather than be approximated -- a device register
+     * updated with the wrong carry is silent corruption.
+     */
+    struct { uint8_t modrm; const char *name; } cases[] = {
+        {0x12u, "ADC (/2)"}, {0x1Au, "SBB (/3)"}, {0x3Au, "CMP (/7)"},
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t insn[3];
+        hype_mmio_decode_t d;
+        insn[0] = 0x83u;
+        insn[1] = cases[i].modrm;
+        insn[2] = 0x01u;
+        CHECK_HEX(cases[i].name, (unsigned)-1, (unsigned)hype_mmio_decode(insn, 3u, &d));
+    }
+    /* The memory-SOURCE CMP (0x3B) is a different instruction and stays supported. */
+    {
+        static const uint8_t src_cmp[] = {0x3B, 0x01};
+        hype_mmio_decode_t d;
+        CHECK_HEX("mem-source CMP still decodes", 0u, (unsigned)hype_mmio_decode(src_cmp, 2u, &d));
+        CHECK_HEX("and memory is NOT its destination", 0u, (unsigned)d.mem_is_dst);
+    }
+}
+
+static void test_rmw_rejects_a_truncated_immediate(void) {
+    static const uint8_t insn[] = {0x83, 0x0A}; /* immediate missing entirely */
+    hype_mmio_decode_t d;
+
+    CHECK_HEX("rejected", (unsigned)-1, (unsigned)hype_mmio_decode(insn, 2u, &d));
+}
+
+static void test_rmw_length_across_addressing_forms(void) {
+    struct { const char *name; uint8_t b[12]; unsigned len; unsigned expect; } cases[] = {
+        {"no disp", {0x83, 0x0A, 0x02}, 3u, 3u},
+        {"disp8", {0x83, 0x4A, 0x04, 0x02}, 4u, 4u},
+        {"disp32", {0x83, 0x8A, 0x04, 0x00, 0x00, 0x00, 0x02}, 7u, 7u},
+        {"SIB", {0x83, 0x0C, 0x08, 0x02}, 4u, 4u},
+        {"imm32 + disp8", {0x81, 0x4A, 0x04, 0x78, 0x56, 0x34, 0x12}, 7u, 7u},
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        hype_mmio_decode_t d;
+        CHECK_HEX(cases[i].name, 0u, (unsigned)hype_mmio_decode(cases[i].b, cases[i].len, &d));
+        CHECK_HEX("instr_len", cases[i].expect, d.instr_len);
+    }
+}
+
+static void test_rmw_value_is_a_no_op_for_a_plain_store(void) {
+    /* A handler that reaches the RMW resolver on a non-RMW decode must write back what it
+     * read, not a value derived from an operand the instruction never had. */
+    static const uint8_t insn[] = {0x89, 0x01}; /* mov (%rcx), %eax */
+    hype_mmio_decode_t d;
+    uint64_t rflags = 0x1u;
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(insn, 2u, &d));
+    CHECK_HEX("returns the memory value untouched", 0x1234u,
+              hype_mmio_rmw_value(&d, 0xFFFFu, 0x1234u, &rflags));
+    CHECK_HEX("and leaves flags alone", 0x1u, (unsigned)rflags);
+    CHECK_HEX("a null decode is also safe", 0x99u,
+              hype_mmio_rmw_value((const hype_mmio_decode_t *)0, 0u, 0x99u, &rflags));
+}
+
+static void test_rejects_unaddressable_byte_registers(void) {
+    /*
+     * Without REX, ModRM.reg 4-7 name AH/CH/DH/BH. Every caller resolves an encoding to a
+     * whole 64-bit register and takes its low byte, which cannot express a high-byte
+     * operand -- so `mov %ch,(%rax)` would transfer CL's value instead of CH's. Refused.
+     */
+    static const uint8_t no_rex[] = {0x88, 0x28};      /* mov %ch,(%rax) : reg=101 */
+    static const uint8_t with_rex[] = {0x40, 0x88, 0x28}; /* mov %bpl,(%rax) : REX makes it legal */
+    hype_mmio_decode_t d;
+
+    CHECK_HEX("high-byte register refused", (unsigned)-1, (unsigned)hype_mmio_decode(no_rex, 2u, &d));
+    CHECK_HEX("REX form accepted", 0u, (unsigned)hype_mmio_decode(with_rex, 3u, &d));
+    CHECK_HEX("and it is register 5", 5u, d.reg);
+    /* The dword forms are unaffected -- reg 4-7 are plain ESP/EBP/ESI/EDI there. */
+    {
+        static const uint8_t dword[] = {0x89, 0x28}; /* mov %ebp,(%rax) */
+        CHECK_HEX("dword reg 5 still fine", 0u, (unsigned)hype_mmio_decode(dword, 2u, &d));
+        CHECK_HEX("reg", 5u, d.reg);
+    }
+}
+
 int main(void) {
     test_decodes_mov_m32_imm32();
     test_decodes_mov_m8_imm8();
@@ -521,6 +767,20 @@ int main(void) {
     test_rejects_truncated_sib();
     test_rejects_truncated_disp8();
     test_rejects_truncated_disp32();
+
+    test_decodes_the_freebsd_ahci_ghc_write();
+    test_group1_ops_and_widths();
+    test_group1_imm32_and_word_widths();
+    test_group1_imm8_is_sign_extended();
+    test_reg_to_mem_ops();
+    test_rmw_source_is_the_register_when_there_is_no_immediate();
+    test_rmw_direction_matters_for_subtraction();
+    test_rmw_sets_flags_from_the_result();
+    test_rmw_refuses_adc_sbb_and_cmp();
+    test_rmw_rejects_a_truncated_immediate();
+    test_rmw_length_across_addressing_forms();
+    test_rmw_value_is_a_no_op_for_a_plain_store();
+    test_rejects_unaddressable_byte_registers();
 
     if (failures == 0) {
         printf("all tests passed\n");

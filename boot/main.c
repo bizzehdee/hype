@@ -10044,10 +10044,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                         continue;
                     }
+                    /* Same evidence the generic undecodable-NPF fatal prints, for the
+                     * same reason: without the bytes, "unhandled" cannot be told apart
+                     * from "undecodable" or "the register model refused the offset", and
+                     * three separate causes wear one message. */
                     hype_fatal("fw-1: unhandled AHCI ABAR MMIO at guest-physical 0x%llx (%s, "
-                               "guest_rip=0x%llx)",
+                               "guest_rip=0x%llx, decode_assist_bytes=%u insn=%s %02x %02x %02x "
+                               "%02x %02x %02x %02x %02x)",
                                (unsigned long long)ahci_npf.guest_phys_addr,
-                               ahci_npf.is_write ? "write" : "read", (unsigned long long)info.guest_rip);
+                               ahci_npf.is_write ? "write" : "read", (unsigned long long)info.guest_rip,
+                               (unsigned int)insn_n,
+                               insn ? (insn_n ? "(assist)" : "(ptwalk)") : "(FETCH FAILED)",
+                               insn ? insn[0] : 0, insn ? insn[1] : 0, insn ? insn[2] : 0,
+                               insn ? insn[3] : 0, insn ? insn[4] : 0, insn ? insn[5] : 0,
+                               insn ? insn[6] : 0, insn ? insn[7] : 0);
                 }
             }
             /* M5-7 (#196): virtio-blk BAR4 MMIO -> the VALID-3, GPA-translated

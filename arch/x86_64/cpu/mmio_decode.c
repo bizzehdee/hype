@@ -53,6 +53,46 @@ static int decode_modrm_tail(const uint8_t *bytes, uint8_t num_bytes, uint8_t mo
     return 0;
 }
 
+/*
+ * #307: 8-bit register operands. WITHOUT a REX prefix, ModRM.reg values 4-7 name
+ * AH/CH/DH/BH -- the HIGH bytes of the first four registers -- not the low bytes of
+ * RSP/RBP/RSI/RDI. Every caller resolves a register encoding to a whole 64-bit register and
+ * takes its low byte, which cannot express that, so such a form would silently transfer the
+ * wrong byte. Refused instead: a panic naming the instruction is recoverable, a device
+ * register written from the wrong half of a register is not.
+ *
+ * `raw_reg_field` is the ModRM field BEFORE REX.R is folded in, since REX.R is what makes
+ * the low-byte encodings available in the first place.
+ */
+static int byte_reg_unaddressable(int has_rex, uint8_t raw_reg_field) {
+    return !has_rex && raw_reg_field >= 4u;
+}
+
+/*
+ * #307: opcode-extension groups (0x80/0x81/0x83, and 0xC6/0xC7) map ModRM.reg to an
+ * operation rather than to a register. REX.R is not part of that extension, so the raw
+ * 3-bit field is what selects it.
+ *
+ * Returns 0 and sets *out_op for the ops whose destination this project is willing to
+ * update, -1 for the rest:
+ *   /2 ADC and /3 SBB consume carry-in, which is not modelled here -- writing a device
+ *   register with the wrong CF is silent corruption;
+ *   /7 CMP writes no destination at all, so it is a flags-only form that would take a
+ *   different code path in every handler (the fault is a READ, not a write). Refused
+ *   rather than half-supported, so no handler can reach a mem-destination CMP believing
+ *   it has a value to store.
+ */
+static int group1_op(uint8_t raw_reg_field, hype_mmio_alu_op_t *out_op) {
+    switch (raw_reg_field & 0x07u) {
+        case 0u: *out_op = HYPE_MMIO_ALU_ADD; return 0;
+        case 1u: *out_op = HYPE_MMIO_ALU_OR; return 0;
+        case 4u: *out_op = HYPE_MMIO_ALU_AND; return 0;
+        case 5u: *out_op = HYPE_MMIO_ALU_SUB; return 0;
+        case 6u: *out_op = HYPE_MMIO_ALU_XOR; return 0;
+        default: return -1;
+    }
+}
+
 int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t *out) {
     uint8_t i = 0;
     uint8_t rex = 0;
@@ -60,6 +100,7 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
     int operand16 = 0;
     uint8_t opcode;
     uint8_t reg_field;
+    uint8_t raw_reg_field = 0;
     int tail_len;
     uint8_t modrm_index;
 
@@ -109,6 +150,7 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
         out->op = HYPE_MMIO_ALU_MOV;
         out->has_imm = 0;
         out->imm_value = 0;
+        out->mem_is_dst = 0;
 
         if (opcode2 == 0xB6u) { /* MOVZX r32/r64, r/m8 */
             out->is_write = 0;
@@ -134,6 +176,7 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
     if (decode_modrm_tail(bytes, num_bytes, modrm_index, &reg_field, &tail_len) != 0) {
         return -1;
     }
+    raw_reg_field = reg_field;
     if (has_rex && (rex & 0x04u)) {
         reg_field = (uint8_t)(reg_field | 0x08u);
     }
@@ -141,15 +184,22 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
     out->op = HYPE_MMIO_ALU_MOV; /* #305: overridden below only by the ALU forms */
     out->has_imm = 0;            /* #306: set only by the imm store forms */
     out->imm_value = 0;
+    out->mem_is_dst = 0;         /* #307: set only by the memory-destination ALU forms */
 
     switch (opcode) {
         case 0x88u: /* MOV r/m8, r8 (store) */
+            if (byte_reg_unaddressable(has_rex, raw_reg_field)) {
+                return -1;
+            }
             out->is_write = 1;
             out->size_bytes = 1;
             out->reg = reg_field;
             out->zero_extend = 0;
             return 0;
         case 0x8Au: /* MOV r8, r/m8 (load) */
+            if (byte_reg_unaddressable(has_rex, raw_reg_field)) {
+                return -1;
+            }
             out->is_write = 0;
             out->size_bytes = 1;
             out->reg = reg_field;
@@ -177,9 +227,7 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
          * computes the result from the OLD register value, so it must not have been
          * clobbered first. The caller writes the full 64-bit register itself.
          *
-         * The memory-DESTINATION direction (0x01/0x09/0x21/0x29/0x31/0x39) is deliberately
-         * absent: on MMIO that is a genuine read-modify-write, two device accesses with
-         * ordering consequences, and no guest here has been observed needing it.
+         * The memory-DESTINATION direction is the separate #307 group below.
          */
         case 0x03u: /* ADD r16/r32, r/m16/r32 */
         case 0x0Bu: /* OR  */
@@ -237,6 +285,84 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
             out->instr_len = (uint8_t)(imm_index + imm_len);
             return 0;
         }
+        /*
+         * #307: `<op> r/m, r` -- the memory-DESTINATION ALU forms. FreeBSD enables AHCI
+         * interrupts with `orl $0x2, (%rdx)` and hype panicked on it as undecodable; these
+         * are the register-source counterparts of the same group.
+         *
+         * A read-modify-write is two device accesses, so the handler must read the register,
+         * combine, and write back -- mem_is_dst says so. The fault is reported as a write
+         * because that is what EXITINFO1/the exit qualification report for an RMW, and only
+         * ops that actually write their destination are decoded here, so is_write is always
+         * 1 and never disagrees.
+         */
+        case 0x00u: /* ADD r/m8, r8 */
+        case 0x08u: /* OR  */
+        case 0x20u: /* AND */
+        case 0x28u: /* SUB */
+        case 0x30u: /* XOR */
+        case 0x01u: /* ADD r/m16/r32, r16/r32 */
+        case 0x09u: /* OR  */
+        case 0x21u: /* AND */
+        case 0x29u: /* SUB */
+        case 0x31u: /* XOR */
+            if ((opcode & 0x01u) == 0u && byte_reg_unaddressable(has_rex, raw_reg_field)) {
+                return -1;
+            }
+            out->is_write = 1;
+            out->mem_is_dst = 1;
+            out->size_bytes = (opcode & 0x01u) == 0u ? 1u : (operand16 ? 2u : 4u);
+            out->reg = reg_field;
+            out->zero_extend = 0;
+            out->op = (opcode == 0x00u || opcode == 0x01u)   ? HYPE_MMIO_ALU_ADD
+                      : (opcode == 0x08u || opcode == 0x09u) ? HYPE_MMIO_ALU_OR
+                      : (opcode == 0x20u || opcode == 0x21u) ? HYPE_MMIO_ALU_AND
+                      : (opcode == 0x28u || opcode == 0x29u) ? HYPE_MMIO_ALU_SUB
+                                                             : HYPE_MMIO_ALU_XOR;
+            return 0;
+        /*
+         * #307: group 1 -- `<op> r/m, imm`. This is the form FreeBSD's AHCI GHC.IE write
+         * actually takes (`83 0a 02`). ModRM.reg is an opcode extension selecting the
+         * operation; group1_op() refuses the ones this project will not emulate.
+         *
+         * 0x83's immediate is a single byte SIGN-EXTENDED to the operand width, which is why
+         * `andl $-2, (%mem)` is three bytes rather than six. Zero-extending it instead would
+         * clear the top 24 bits of a device register that the guest meant to preserve.
+         */
+        case 0x80u:   /* <op> r/m8, imm8 */
+        case 0x81u:   /* <op> r/m16, imm16 or r/m32, imm32 */
+        case 0x83u: { /* <op> r/m16/r/m32, imm8 (sign-extended) */
+            unsigned int imm_index = (unsigned int)(modrm_index + 1 + tail_len);
+            unsigned int imm_len;
+            hype_mmio_alu_op_t op;
+
+            if (group1_op(raw_reg_field, &op) != 0) {
+                return -1;
+            }
+            out->size_bytes = (opcode == 0x80u) ? 1u : (operand16 ? 2u : 4u);
+            imm_len = (opcode == 0x81u) ? (operand16 ? 2u : 4u) : 1u;
+            if (imm_index + imm_len > num_bytes) {
+                return -1;
+            }
+            out->is_write = 1;
+            out->mem_is_dst = 1;
+            out->reg = 0;
+            out->zero_extend = 0;
+            out->has_imm = 1;
+            out->op = op;
+            out->imm_value = 0;
+            {
+                unsigned int k;
+                for (k = 0; k < imm_len; k++) {
+                    out->imm_value |= ((uint32_t)bytes[imm_index + k]) << (8u * k);
+                }
+            }
+            if (opcode == 0x83u && (out->imm_value & 0x80u) != 0u) {
+                out->imm_value |= 0xFFFFFF00u; /* sign-extend imm8; masked to width on use */
+            }
+            out->instr_len = (uint8_t)(imm_index + imm_len);
+            return 0;
+        }
         default:
             return -1;
     }
@@ -259,6 +385,20 @@ uint32_t hype_mmio_store_value(const hype_mmio_decode_t *d, uint64_t reg_value) 
         return hype_mmio_extract_write_value((uint64_t)d->imm_value, d->size_bytes);
     }
     return hype_mmio_extract_write_value(reg_value, d ? d->size_bytes : 4u);
+}
+
+uint32_t hype_mmio_rmw_value(const hype_mmio_decode_t *d, uint64_t reg_value, uint32_t mem_value,
+                             uint64_t *rflags) {
+    uint32_t src;
+
+    if (d == (const hype_mmio_decode_t *)0 || !d->mem_is_dst) {
+        return mem_value; /* not an RMW: write back what was read rather than inventing a value */
+    }
+    src = d->has_imm ? hype_mmio_extract_write_value((uint64_t)d->imm_value, d->size_bytes)
+                     : hype_mmio_extract_write_value(reg_value, d->size_bytes);
+    /* Memory is the DESTINATION, so it is the first operand: `subl $2,(%rax)` is mem-2, not
+     * 2-mem. Getting this backwards is invisible for AND/OR/XOR and wrong for ADD/SUB. */
+    return hype_mmio_alu_apply(d->op, mem_value, src, d->size_bytes, rflags);
 }
 
 uint32_t hype_mmio_extract_write_value(uint64_t reg_value, uint8_t size_bytes) {
