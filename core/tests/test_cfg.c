@@ -12,6 +12,16 @@ static int failures = 0;
         } \
     } while (0)
 
+/* #331: 64-bit byte counts do not fit CHECK_INT's int comparison. */
+#define CHECK_HEX(desc, expected, actual) \
+    do { \
+        if ((unsigned long long)(expected) != (unsigned long long)(actual)) { \
+            printf("FAIL: %s: expected 0x%llx, got 0x%llx\n", (desc), \
+                   (unsigned long long)(expected), (unsigned long long)(actual)); \
+            failures++; \
+        } \
+    } while (0)
+
 #define CHECK_STR(desc, expected, actual) \
     do { \
         if (strcmp((expected), (actual)) != 0) { \
@@ -468,7 +478,27 @@ static void test_resolve_mem_mb(void) {
               hype_cfg_ram_status_str(HYPE_CFG_RAM_APPLIED));
 }
 
+static void test_size_gb_to_bytes(void) {
+    /*
+     * #331: target_disk_size_gb is GiB, not decimal GB -- the same unit
+     * tools/make-disk-image.sh allocates in, so a config and the image it describes agree. That
+     * unit choice is the whole point of pinning this: a GB/GiB mix-up would make every
+     * correctly-sized image look 7% wrong, which is exactly the kind of warning an operator
+     * learns to ignore.
+     */
+    CHECK_HEX("1 GiB", 1073741824ull, hype_cfg_size_gb_to_bytes(1));
+    CHECK_HEX("64 GiB", 68719476736ull, hype_cfg_size_gb_to_bytes(64));
+    CHECK_HEX("128 GiB (the spec's own example)", 137438953472ull, hype_cfg_size_gb_to_bytes(128));
+    /* NOT the decimal-GB answer for the same input -- the mistake this guards. */
+    CHECK_HEX("64 GiB is not 64e9", 1, hype_cfg_size_gb_to_bytes(64) != 64000000000ull);
+    /* 0 means "not declared"; the parser already rejects an explicit 0. */
+    CHECK_HEX("0 declares nothing", 0ull, hype_cfg_size_gb_to_bytes(0));
+    /* A large value must not wrap: 4 TiB is a plausible modern disk. */
+    CHECK_HEX("4096 GiB does not wrap", 4398046511104ull, hype_cfg_size_gb_to_bytes(4096));
+}
+
 int main(void) {
+    test_size_gb_to_bytes();
     test_resolve_mem_mb();
     test_full_example_from_plan();
     test_cpu_set_comma_list();

@@ -509,3 +509,9 @@ const char *hype_cfg_ram_status_str(hype_cfg_ram_status_t st) {
         default: return "unknown";
     }
 }
+
+uint64_t hype_cfg_size_gb_to_bytes(unsigned int gb) {
+    /* unsigned int caps at ~4.3e9, so 4.3e9 * 2^30 stays inside 64 bits -- no overflow guard
+     * needed, and one would be dead code. */
+    return (uint64_t)gb * 1024ull * 1024ull * 1024ull;
+}

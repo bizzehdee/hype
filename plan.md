@@ -381,11 +381,19 @@ surface for all of this.
   Guest-facing, the drive presents as a **DVD-ROM with a data disc in it** —
   `GET CONFIGURATION`'s current profile is DVD-ROM — so a guest treats it
   exactly as a physical DVD-ROM presenting a real disc. See §10 decision 25.
-- **Virtual disk target (`target_disk = file:<path>`)**: a raw sparse file
-  on host storage. If it doesn't exist yet, the hypervisor (or the `/tools`
-  prep script, run ahead of time) creates it at `target_disk_size_gb`. Reads
-  and writes from the guest are just file I/O against the host filesystem
-  driver already needed to load ISOs and guest firmware/varstore.
+- **Virtual disk target (`target_disk = file:<path>`)**: a raw (or qcow2,
+  §10 decision 3) file on host storage, **created ahead of time by
+  `tools/make-disk-image.sh`** — *not* by the hypervisor. hype creates
+  nothing: post-`ExitBootServices()` it has no filesystem allocator, and by
+  design it only ever writes **in place** into an already-allocated file, so
+  the image must be **fully allocated** before hype sees it (a sparse hole is
+  a sector the filesystem has not assigned, and this layer cannot assign
+  one). `target_disk_size_gb` is therefore a **declaration of intent that
+  hype validates**, not a creation instruction: hype compares it against the
+  resolved image's real size and reports a mismatch, which catches a VM
+  pointed at a stale or truncated image. Reads and writes from the guest are
+  file I/O against the host filesystem driver already needed to load ISOs and
+  guest firmware/varstore.
 - **Physical disk target (`target_disk = physical:<serial-or-guid>`)**: the
   guest's writes go straight to a real drive. This needs the hypervisor to
   own a minimal **host-side block driver** (AHCI + NVMe covers the vast

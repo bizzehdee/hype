@@ -7150,6 +7150,29 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
         }
         return 0;
     }
+    /*
+     * #331: target_disk_size_gb was parsed, range-checked, stored -- and never read by anything.
+     * plan.md §6d used to say hype (or tools/) "creates it at target_disk_size_gb", but hype
+     * creates nothing: it has no post-EBS filesystem allocator and only ever writes in place, so
+     * the image must already be fully allocated. §6d is corrected; the key becomes a declaration
+     * hype VALIDATES rather than an instruction it obeys.
+     *
+     * Worth doing rather than deleting the key: the real size is already known from the resolved
+     * extents, so the check is free, and a config that disagrees with its image is exactly the
+     * quiet wrongness this project refuses elsewhere (blk_image refuses a short map; #243 refuses
+     * a disk that lies about its capacity). A warning, not a refusal -- the image is usable, it is
+     * the operator's expectation that is wrong, and saying which is more useful than declining.
+     */
+    if (cv != 0 && cv->has_target_disk_size_gb && cv->target_disk_size_gb != 0u) {
+        uint64_t want = hype_cfg_size_gb_to_bytes(cv->target_disk_size_gb);
+        if (file.size_bytes != want) {
+            hype_serial_print("m5-8: WARNING %s is %llu bytes but target_disk_size_gb = %u says "
+                              "%llu -- using the file's real size; the config or the image is "
+                              "stale\n",
+                              path, (unsigned long long)file.size_bytes,
+                              cv->target_disk_size_gb, (unsigned long long)want);
+        }
+    }
     if (hype_blk_image_init(&vm->vblk_image, &vm->vblk_raw_be, &file, g_media.part_base_lba,
                             hostdisk_read, hostdisk_write, 0) != 0) {
         /* A sparse or short-mapped image: refuse rather than serve a disk whose

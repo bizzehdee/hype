@@ -1,6 +1,8 @@
 #ifndef HYPE_CFG_H
 #define HYPE_CFG_H
 
+#include <stdint.h>
+
 /*
  * hype.cfg parser (M1-1, plan.md §5). Parses a whole config file already
  * read into memory (how it gets there -- ESP file read via UEFI Simple
@@ -172,5 +174,17 @@ hype_cfg_ram_status_t hype_cfg_resolve_mem_mb(unsigned int cfg_mem_mb, unsigned 
 
 /* Human-readable form of the above, for the log line that accompanies it. */
 const char *hype_cfg_ram_status_str(hype_cfg_ram_status_t st);
+
+/*
+ * #331: the byte count a `target_disk_size_gb` value declares.
+ *
+ * GiB, not decimal GB -- the same unit tools/make-disk-image.sh allocates in, so a config and the
+ * image it describes agree. That choice is the one thing here actually worth pinning: a GB/GiB
+ * mismatch would make every correctly-sized image look wrong by 7%, which is exactly the sort of
+ * warning an operator learns to ignore.
+ *
+ * Returns 0 for a 0 input (the parser already rejects that, so it means "not declared").
+ */
+uint64_t hype_cfg_size_gb_to_bytes(unsigned int gb);
 
 #endif /* HYPE_CFG_H */
