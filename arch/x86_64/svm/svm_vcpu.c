@@ -1018,6 +1018,7 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
  * across all vCPUs (a diagnostic aggregate); the pending-IRQ slot itself is
  * per-vCPU (struct hype_vcpu_ctx.pending_irq_*). */
 static unsigned long long g_int_eventinj = 0;   /* accepted immediately (direct EVENTINJ) */
+static unsigned int g_int_poll_trace_n = 0;     /* #313: bounds the poll-inject trace */
 static unsigned long long g_int_vintr_defer = 0; /* couldn't accept -> VINTR window armed */
 static unsigned long long g_int_vintr_window = 0;/* VINTR window fired -> deferred inject */
 static unsigned long long g_int_defer_overwrite = 0; /* requested a vector already pending in the IRR (coalesced, not lost) */
@@ -1207,6 +1208,16 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
         int v = hype_svm_irr_highest(real->pending_irr);
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
+        /* #313: which vector the per-iteration drain actually wins with. If this only ever
+         * reports the timer while a device vector is logged pending, the timer's IRR bit is
+         * never clear and priority-by-vector-number starves everything below it -- which is
+         * candidate (2) on the ticket, and a different fix from candidate (1). */
+        if (g_int_poll_trace_n < 20u) {
+            g_int_poll_trace_n++;
+            hype_debug_print("fw-1 POLLINJ#%02u vec=0x%02x more_pending=%d\n",
+                             (unsigned int)g_int_poll_trace_n, (unsigned int)v,
+                             hype_svm_irr_any(real->pending_irr));
+        }
     }
     /* Keep the window armed if more vectors remain; disarm once drained. */
     hype_svm_sync_vintr(real);
