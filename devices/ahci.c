@@ -170,3 +170,50 @@ void hype_ahci_set_signature(hype_ahci_t *ahci, uint32_t sig) {
         ahci->p_sig = sig;
     }
 }
+
+int hype_ahci_h2d_is_control_write(const uint8_t raw[20]) {
+    return (raw[1] & HYPE_AHCI_FIS_H2D_FLAG_C) == 0u;
+}
+
+int hype_ahci_soft_reset(hype_ahci_t *ahci, uint8_t control_byte, unsigned slot) {
+    ahci->p_ci &= ~(1u << slot);
+
+    if ((control_byte & HYPE_AHCI_ATA_CONTROL_SRST) != 0u) {
+        /* First half: the device would go BSY here and stay there until SRST is released.
+         * No FIS is posted for this one -- the driver is not waiting for one yet. */
+        ahci->srst_asserted = 1;
+        ahci->p_tfd = (uint32_t)HYPE_ATA_STATUS_BSY;
+        return 0;
+    }
+    if (!ahci->srst_asserted) {
+        /*
+         * A Control write with SRST already clear and no reset in progress. Drivers do write
+         * the Control register for other reasons (nIEN), so this is accepted and completed
+         * rather than refused -- but it announces nothing, so no signature FIS is posted.
+         * Posting one unasked would tell the driver a reset finished that never started.
+         */
+        return 0;
+    }
+    ahci->srst_asserted = 0;
+    ahci->p_serr = 0;
+    ahci->p_tfd = (uint32_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_DSC);
+    return 1;
+}
+
+void hype_ahci_build_signature_fis(uint8_t fis[20], uint8_t status_reg, uint8_t error_reg,
+                                   uint32_t sig) {
+    unsigned int i;
+
+    for (i = 0; i < 20u; i++) {
+        fis[i] = 0;
+    }
+    fis[0] = 0x34u; /* FIS type: Register - Device to Host */
+    fis[1] = 0x40u; /* I: interrupt */
+    fis[2] = status_reg;
+    fis[3] = error_reg;
+    /* PxSIG packs the same four registers: (LBA_HIGH<<24)|(LBA_MID<<16)|(LBA_LOW<<8)|COUNT. */
+    fis[4] = (uint8_t)((sig >> 8) & 0xFFu);  /* LBA low */
+    fis[5] = (uint8_t)((sig >> 16) & 0xFFu); /* LBA mid */
+    fis[6] = (uint8_t)((sig >> 24) & 0xFFu); /* LBA high */
+    fis[12] = (uint8_t)(sig & 0xFFu);        /* sector count low */
+}

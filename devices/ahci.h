@@ -153,6 +153,13 @@ typedef struct {
     uint32_t p_sact;
     uint32_t p_ci;
     uint32_t p_sntf;
+
+    /*
+     * #309: whether the guest has asserted SRST and not yet released it. A software reset is
+     * TWO commands, and only the second one completes with a device signature, so the model
+     * has to remember it saw the first. Cleared by hype_ahci_reset().
+     */
+    int srst_asserted;
 } hype_ahci_t;
 
 /*
@@ -169,6 +176,41 @@ void hype_ahci_reset(hype_ahci_t *ahci);
 /* Override the port signature after reset, so one HBA can present a plain SATA disk
  * while another presents the optical drive (#262). */
 void hype_ahci_set_signature(hype_ahci_t *ahci, uint32_t sig);
+
+/*
+ * #309: AHCI software reset (AHCI 1.3.1 SS10.4.1).
+ *
+ * A Register H2D FIS whose C bit is CLEAR is not a command at all -- it is a write to the
+ * device's Control register. A driver resets a port with two of them: the first with SRST
+ * set, the second with it clear. Both carry ATA command 0x00, which is why hype used to
+ * refuse them as "unmodelled ATA command 0x0", and why FreeBSD never issued a single
+ * IDENTIFY -- it resets a port before probing it, so refusing the reset meant the attached
+ * device was never identified at all.
+ */
+#define HYPE_AHCI_FIS_H2D_FLAG_C 0x80u /* raw[1] bit 7: this FIS updates the Command register */
+#define HYPE_AHCI_ATA_CONTROL_SRST 0x04u /* raw[15] bit 2: Device Control register's SRST */
+
+/* 1 if `raw` is a Control-register write rather than a command (C bit clear). */
+int hype_ahci_h2d_is_control_write(const uint8_t raw[20]);
+
+/*
+ * Advance the port's reset state for a Control-register write carrying `control_byte`, and
+ * clear command slot `slot`. Returns 1 if the caller must now deliver a D2H Register FIS
+ * carrying the port signature (the reset has completed), 0 if not.
+ *
+ * The reset is modelled as INSTANTANEOUS, exactly as GHC.HR already is: real hardware
+ * asserts BSY and clears it when the reset finishes, and a guest polling for that clearing
+ * must not be made to wait out a timeout.
+ */
+int hype_ahci_soft_reset(hype_ahci_t *ahci, uint8_t control_byte, unsigned slot);
+
+/*
+ * Build the 20-byte D2H Register FIS that completes a software reset. The LBA and
+ * sector-count fields carry `sig` (a PxSIG value), which is how the driver learns whether it
+ * reset a packet device or a plain disk -- an all-zero FIS would leave it unable to tell.
+ */
+void hype_ahci_build_signature_fis(uint8_t fis[20], uint8_t status_reg, uint8_t error_reg,
+                                   uint32_t sig);
 
 /*
  * Reads the 32-bit register at `offset` (must be 4-byte aligned;

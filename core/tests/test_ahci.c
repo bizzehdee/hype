@@ -384,6 +384,112 @@ static void test_decode_h2d_fis(void) {
     CHECK_HEX("16-bit count decoded", 0x1234u, fis.count);
 }
 
+/* --- #309: software reset --- */
+
+/* A Register H2D FIS: type 0x27, C bit per `c_bit`, command 0x00, Control byte `control`. */
+static void build_control_fis(uint8_t fis[20], int c_bit, uint8_t control) {
+    unsigned int i;
+    for (i = 0; i < 20u; i++) {
+        fis[i] = 0;
+    }
+    fis[0] = 0x27u;
+    fis[1] = c_bit ? HYPE_AHCI_FIS_H2D_FLAG_C : 0u;
+    fis[15] = control;
+}
+
+static void test_control_write_is_told_apart_from_a_command(void) {
+    uint8_t fis[20];
+
+    build_control_fis(fis, 0, HYPE_AHCI_ATA_CONTROL_SRST);
+    CHECK_HEX("C clear is a Control write", 1, hype_ahci_h2d_is_control_write(fis));
+    build_control_fis(fis, 1, 0);
+    CHECK_HEX("C set is a command", 0, hype_ahci_h2d_is_control_write(fis));
+}
+
+static void test_soft_reset_sequence(void) {
+    hype_ahci_t ahci;
+
+    hype_ahci_reset(&ahci);
+    CHECK_HEX("no reset in progress after power-on", 0, ahci.srst_asserted);
+
+    /* First half: SRST asserted. The device goes BSY and posts NOTHING -- the driver is not
+     * waiting on a FIS yet, and posting one here would report a completed reset. */
+    ahci.p_ci = 0x5u; /* slots 0 and 2 outstanding */
+    CHECK_HEX("SRST posts no FIS", 0, hype_ahci_soft_reset(&ahci, HYPE_AHCI_ATA_CONTROL_SRST, 0u));
+    CHECK_HEX("reset recorded", 1, ahci.srst_asserted);
+    CHECK_HEX("device is BSY", 0x80u, ahci.p_tfd);
+    CHECK_HEX("slot 0 completed", 0x4u, ahci.p_ci);
+
+    /* Second half: SRST released. NOW the signature FIS is delivered. */
+    CHECK_HEX("release posts a FIS", 1, hype_ahci_soft_reset(&ahci, 0u, 2u));
+    CHECK_HEX("reset no longer in progress", 0, ahci.srst_asserted);
+    CHECK_HEX("device ready, not busy", 0x50u, ahci.p_tfd);
+    CHECK_HEX("slot 2 completed", 0u, ahci.p_ci);
+}
+
+static void test_release_without_an_asserted_reset_posts_nothing(void) {
+    /*
+     * Drivers write the Control register for reasons other than reset (nIEN), so this is
+     * accepted and the slot completed -- but announcing a reset that never started would tell
+     * the driver the device had just re-identified itself.
+     */
+    hype_ahci_t ahci;
+
+    hype_ahci_reset(&ahci);
+    ahci.p_ci = 0x1u;
+    CHECK_HEX("no FIS posted", 0, hype_ahci_soft_reset(&ahci, 0u, 0u));
+    CHECK_HEX("slot still completed", 0u, ahci.p_ci);
+    CHECK_HEX("task file untouched", 0x50u, ahci.p_tfd);
+}
+
+static void test_soft_reset_clears_serr(void) {
+    hype_ahci_t ahci;
+
+    hype_ahci_reset(&ahci);
+    ahci.p_serr = 0xDEADBEEFu;
+    (void)hype_ahci_soft_reset(&ahci, HYPE_AHCI_ATA_CONTROL_SRST, 0u);
+    CHECK_HEX("SERR survives the assert half", 0xDEADBEEFu, ahci.p_serr);
+    (void)hype_ahci_soft_reset(&ahci, 0u, 0u);
+    CHECK_HEX("and is cleared by the completed reset", 0u, ahci.p_serr);
+}
+
+static void test_signature_fis_carries_the_atapi_signature(void) {
+    /*
+     * The signature is the whole point of the completion FIS: it is how the driver learns
+     * whether it reset a packet device or a disk. PxSIG packs the four registers as
+     * (LBA_HIGH<<24)|(LBA_MID<<16)|(LBA_LOW<<8)|COUNT, so 0xEB140101 must land as
+     * LBA high 0xEB / mid 0x14 / low 0x01 / count 1.
+     */
+    uint8_t fis[20];
+    unsigned int i;
+
+    hype_ahci_build_signature_fis(fis, 0x50u, 0u, HYPE_AHCI_SIG_ATAPI);
+    CHECK_HEX("D2H Register FIS", 0x34u, fis[0]);
+    CHECK_HEX("interrupt bit", 0x40u, fis[1]);
+    CHECK_HEX("status", 0x50u, fis[2]);
+    CHECK_HEX("error", 0u, fis[3]);
+    CHECK_HEX("LBA low", 0x01u, fis[4]);
+    CHECK_HEX("LBA mid", 0x14u, fis[5]);
+    CHECK_HEX("LBA high", 0xEBu, fis[6]);
+    CHECK_HEX("sector count", 0x01u, fis[12]);
+    /* Everything else must be zeroed, not left holding whatever was on the stack. */
+    for (i = 7u; i < 12u; i++) {
+        CHECK_HEX("reserved byte zeroed", 0u, fis[i]);
+    }
+    CHECK_HEX("count high zeroed", 0u, fis[13]);
+}
+
+static void test_signature_fis_carries_the_plain_disk_signature(void) {
+    /* #262's second HBA presents a disk; a driver that reset it must not be told ATAPI. */
+    uint8_t fis[20];
+
+    hype_ahci_build_signature_fis(fis, 0x50u, 0u, HYPE_AHCI_SIG_ATA);
+    CHECK_HEX("LBA low", 0x01u, fis[4]);
+    CHECK_HEX("LBA mid zero", 0u, fis[5]);
+    CHECK_HEX("LBA high zero", 0u, fis[6]);
+    CHECK_HEX("sector count", 0x01u, fis[12]);
+}
+
 int main(void) {
     test_reset_state();
     test_read_write_clb_fb();
@@ -401,6 +507,13 @@ int main(void) {
     test_decode_cmd_header_write_bit();
     test_decode_prdt_entry();
     test_decode_h2d_fis();
+
+    test_control_write_is_told_apart_from_a_command();
+    test_soft_reset_sequence();
+    test_release_without_an_asserted_reset_posts_nothing();
+    test_soft_reset_clears_serr();
+    test_signature_fis_carries_the_atapi_signature();
+    test_signature_fis_carries_the_plain_disk_signature();
 
     if (failures == 0) {
         printf("all tests passed\n");

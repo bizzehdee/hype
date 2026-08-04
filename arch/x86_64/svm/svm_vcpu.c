@@ -1656,6 +1656,43 @@ static void ahci_copy_fast(uint8_t *dst, const uint8_t *src, uint32_t n) {
  * vcpu context, only the device models + guest DMA map, so the VMX MMIO handler
  * (vmcs_hw.c) reuses it verbatim rather than duplicating the command-list/PRDT/
  * FIS DMA. Declared in devices/ahci.h. */
+/*
+ * #309: complete an AHCI software reset. See hype_ahci_soft_reset() for the protocol; this
+ * is the part that needs the guest's Received-FIS area, so it lives with the other
+ * DMA-touching code rather than in the device model.
+ *
+ * Returns 0 on success (the slot is completed either way), -1 only if the guest's FIS area
+ * fails its VALID-3 bounds check.
+ */
+static int complete_ahci_soft_reset(hype_ahci_t *ahci, uint64_t rx_fis_phys,
+                                    const hype_gpa_map_t *dma_map, unsigned slot,
+                                    uint8_t control_byte) {
+    uint8_t fis[20];
+    uint8_t *rx_fis_host;
+    unsigned i;
+
+    if (!hype_ahci_soft_reset(ahci, control_byte, slot)) {
+        return 0; /* SRST asserted, or a Control write announcing nothing: no FIS to post */
+    }
+
+    rx_fis_host = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
+    if (rx_fis_host == 0) {
+        hype_debug_print("ahci: slot %u reset -- received-FIS area gpa 0x%llx out of bounds\n",
+                         slot, (unsigned long long)rx_fis_phys);
+        return -1;
+    }
+    hype_ahci_build_signature_fis(fis, (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_DSC), 0,
+                                  ahci->p_sig);
+    for (i = 0; i < 20u; i++) {
+        rx_fis_host[0x40 + i] = fis[i];
+    }
+    ahci->p_is |= HYPE_AHCI_PIS_DHRS;
+    if ((ahci->p_is & ahci->p_ie) != 0) {
+        ahci->is |= HYPE_AHCI_IS_PORT0;
+    }
+    return 0;
+}
+
 int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                               const hype_gpa_map_t *dma_map, unsigned slot) {
     uint64_t cmd_list_phys =
@@ -1694,6 +1731,13 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * the 32-byte slot-0 entry. */
     cmd_hdr_bytes = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, cmd_list_phys, 32u);
     if (cmd_hdr_bytes == 0) {
+        /* #309: every refusal here is reported unconditionally, not behind g_ahci_trace.
+         * The only caller treats -1 as fatal and panics with "unhandled AHCI ABAR MMIO",
+         * which names the PxCI register rather than the command that was actually refused
+         * -- one message covering a decoder gap, an unmodelled register and a rejected
+         * command. Whatever the reason, it is worth a line when the guest is about to die. */
+        hype_debug_print("ahci: slot %u refused -- command list at gpa 0x%llx out of bounds\n",
+                         slot, (unsigned long long)cmd_list_phys);
         return -1;
     }
 
@@ -1705,6 +1749,9 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     cmd_table_bytes = (const uint8_t *)(uintptr_t)guest_dma_xlate(
         dma_map, hdr.cmd_table_phys, (uint64_t)0x80u + (uint64_t)hdr.prdtl * 16u);
     if (cmd_table_bytes == 0) {
+        hype_debug_print("ahci: slot %u refused -- command table at gpa 0x%llx (prdtl=%u) out of "
+                         "bounds\n",
+                         slot, (unsigned long long)hdr.cmd_table_phys, (unsigned int)hdr.prdtl);
         return -1;
     }
 
@@ -1720,11 +1767,14 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
          *     (D2H FIS, PxIS.DHRS). */
         uint8_t ata_cmd = cmd_table_bytes[2];
         if (cmd_table_bytes[0] != 0x27u) {
-            if (g_ahci_trace) {
-                hype_debug_print("ahci-trace: non-ATAPI slot0 with bad FIS type=0x%x cmd=0x%x\n",
-                                  (unsigned int)cmd_table_bytes[0], (unsigned int)ata_cmd);
-            }
+            hype_debug_print("ahci: slot %u refused -- not a Register H2D FIS (type=0x%x cmd=0x%x)\n",
+                             slot, (unsigned int)cmd_table_bytes[0], (unsigned int)ata_cmd);
             return -1;
+        }
+        /* #309: a Control-register write (C bit clear), not a command -- the software-reset
+         * protocol FreeBSD runs before it will probe the port at all. */
+        if (hype_ahci_h2d_is_control_write(cmd_table_bytes)) {
+            return complete_ahci_soft_reset(ahci, rx_fis_phys, dma_map, slot, cmd_table_bytes[15]);
         }
         if (ata_cmd == HYPE_AHCI_ATA_CMD_IDENTIFY_PACKET_DEVICE) {
             hype_atapi_build_identify(atapi, identify);
@@ -1746,21 +1796,19 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                 hype_debug_print("ahci-trace: SET FEATURES (0xEF) -> no-data ack\n");
             }
         } else {
-            if (g_ahci_trace) {
-                hype_debug_print("ahci-trace: unhandled non-ATAPI command slot0 -- FIS type=0x%x cmd=0x%x\n",
-                                  (unsigned int)cmd_table_bytes[0], (unsigned int)ata_cmd);
-            }
+            hype_debug_print("ahci: slot %u refused -- unmodelled ATA command 0x%x on the ATAPI "
+                             "port (FIS type=0x%x)\n",
+                             slot, (unsigned int)ata_cmd, (unsigned int)cmd_table_bytes[0]);
             return -1;
         }
     } else {
         uint8_t cdb[HYPE_ATAPI_CDB_MAX];
         if (cmd_table_bytes[0] != 0x27u || cmd_table_bytes[2] != 0xA0u) {
-            if (g_ahci_trace) {
-                hype_debug_print(
-                    "ahci-trace: ATAPI slot0 but FIS type/cmd unexpected (fistype=0x%x cmd=0x%x)\n",
-                    (unsigned int)cmd_table_bytes[0], (unsigned int)cmd_table_bytes[2]);
-            }
-            return -1; /* not a Register H2D FIS carrying ATA_CMD_PACKET (0xA0) */
+            /* not a Register H2D FIS carrying ATA_CMD_PACKET (0xA0) */
+            hype_debug_print("ahci: slot %u refused -- ATAPI header but FIS type=0x%x cmd=0x%x, "
+                             "expected 0x27/0xa0\n",
+                             slot, (unsigned int)cmd_table_bytes[0], (unsigned int)cmd_table_bytes[2]);
+            return -1;
         }
         for (i = 0; i < HYPE_ATAPI_CDB_MAX; i++) {
             cdb[i] = cmd_table_bytes[0x40 + i];
@@ -1819,6 +1867,10 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
          * hypervisor or another VM's memory. */
         dst = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk);
         if (dst == 0) {
+            hype_debug_print("ahci: slot %u refused -- PRD %u buffer gpa 0x%llx len %u out of "
+                             "bounds\n",
+                             slot, (unsigned int)prd_idx, (unsigned long long)prd.data_phys,
+                             (unsigned int)chunk);
             return -1;
         }
         if (stream_media) {
@@ -1904,6 +1956,8 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * before the check. */
     rx_fis_host = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
     if (rx_fis_host == 0) {
+        hype_debug_print("ahci: slot %u refused -- received-FIS area gpa 0x%llx out of bounds\n",
+                         slot, (unsigned long long)rx_fis_phys);
         return -1;
     }
     d2h_fis = rx_fis_host + 0x40;
@@ -2164,8 +2218,22 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
 
     cmd_table_bytes = (const uint8_t *)(uintptr_t)guest_dma_xlate(
         dma_map, hdr.cmd_table_phys, (uint64_t)0x80u + (uint64_t)hdr.prdtl * 16u);
-    if (cmd_table_bytes[0] != 0x27u || (cmd_table_bytes[1] & 0x80u) == 0u) {
-        return -1; /* not a valid H2D Register FIS carrying a command */
+    if (cmd_table_bytes == 0) {
+        /* VALID-3: a rejected translation was being dereferenced immediately below -- the
+         * ATAPI path has always checked this, the disk path never did. */
+        hype_debug_print("ahci-disk: slot %u refused -- command table at gpa 0x%llx (prdtl=%u) out "
+                         "of bounds\n",
+                         slot, (unsigned long long)hdr.cmd_table_phys, (unsigned int)hdr.prdtl);
+        return -1;
+    }
+    if (cmd_table_bytes[0] != 0x27u) {
+        return -1; /* not a Register H2D FIS at all */
+    }
+    /* #309: the C bit distinguishes a command from a Control-register write. The disk HBA gets
+     * reset the same way the optical one does -- FreeBSD attaches a channel on both -- so
+     * handling this only on the path that happened to panic would just move the failure. */
+    if (hype_ahci_h2d_is_control_write(cmd_table_bytes)) {
+        return complete_ahci_soft_reset(ahci, rx_fis_phys, dma_map, slot, cmd_table_bytes[15]);
     }
     hype_ahci_decode_h2d_fis(cmd_table_bytes, &fis);
 
