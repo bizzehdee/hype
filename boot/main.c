@@ -7077,6 +7077,11 @@ typedef struct {
 
 static hype_media_dev_t g_media;
 
+/* #285: the parsed hype.cfg, defined with the config loader further down. Forward-declared here
+ * because the guest-disk setup above it needs the configured image path, and consulting the
+ * config from the file that defaults the value is the whole point of that fix. */
+static hype_cfg_t g_hype_cfg;
+
 /* 1 once a media device has been selected. Replaces the old `g_hostdisk_abar == 0` test, which
  * asked an AHCI-specific question to mean "is there a host disk at all". */
 static int media_present(void) {
@@ -7089,6 +7094,30 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     const char *path = HYPE_M5_8_IMAGE_PATH;
     const char *fs = 0;
     unsigned pidx;
+    /*
+     * #285: use the path hype.cfg actually named.
+     *
+     * `target_disk = file:<path>` was parsed into path_or_id and then never consulted here, so
+     * this function resolved the compile-time HYPE_M5_8_IMAGE_PATH regardless. The parsed value
+     * reached exactly one place: a log line. A config naming win11.img therefore silently got
+     * vm0.img whenever that existed -- the guest got THE WRONG DISK, with nothing in the log to
+     * say so.
+     *
+     * Same cause as the ISO bug fixed in load_iso_into_vm(), whose comment records it: the value
+     * was validated in core/cfg.c and defaulted in a different file, so nothing ever failed
+     * loudly. Fixed the same way -- consult the config, fall back to the constant only when no
+     * path was configured, and refuse rather than substitute when a configured one will not
+     * resolve.
+     */
+    unsigned vi = (unsigned)(vm - &g_vms[0]);
+    const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+    int path_configured = 0;
+
+    if (cv != 0 && cv->target_disk.kind == HYPE_CFG_DISK_FILE &&
+        cv->target_disk.path_or_id[0] != '\0') {
+        path = cv->target_disk.path_or_id;
+        path_configured = 1;
+    }
 
     if (!media_present()) {
         return 0; /* no media device selected: nothing to resolve against */
@@ -7107,6 +7136,18 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
         }
     }
     if (fs == 0) {
+        /*
+         * #285: a path the operator explicitly named and hype could not find is an error, not a
+         * reason to quietly hand the guest something else. Falling through here gives it the RAM
+         * scratch disk, so an install would appear to succeed and then evaporate on reboot --
+         * report it with the path that was actually looked for, which is the diagnostic the old
+         * behaviour could not give (it named the hardcoded default instead).
+         */
+        if (path_configured) {
+            hype_serial_print("m5-8: target_disk = file:%s NOT FOUND on any of GPT partitions 1-4 "
+                              "(FAT32/exFAT/ext) -- refusing to substitute a scratch disk\n",
+                              path);
+        }
         return 0;
     }
     if (hype_blk_image_init(&vm->vblk_image, &vm->vblk_raw_be, &file, g_media.part_base_lba,
@@ -11419,7 +11460,8 @@ static int load_iso_into_vm(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTabl
  * #125 (dashboard confirm) + #126 (install-to-real-drive), which read the
  * parsed physical target + partition + allow_overwrite qualifiers.
  */
-static hype_cfg_t g_hype_cfg;                 /* parsed config; vm_count 0 => none/fallback */
+/* g_hype_cfg is declared up with the media-device plumbing (#285): parsed config;
+ * vm_count 0 => none/fallback. */
 static char g_hype_cfg_text[16384];           /* scratch; parser mutates in place */
 
 /*
