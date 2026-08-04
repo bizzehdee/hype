@@ -2932,7 +2932,10 @@ int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
             uint32_t rel = (ioapic->ioregsel & 0xFFu) - HYPE_IOAPIC_INDEX_REDIR_BASE;
             uint32_t gsi = rel / 2u;
             static unsigned rte_log_n = 0;
-            if (gsi == 1u || gsi == 3u || gsi == 4u || rte_log_n < 24u) {
+            if (gsi == 1u || gsi == 3u || gsi == 4u || gsi == 16u || gsi == 20u || gsi == 21u ||
+                rte_log_n < 24u) { /* the device GSIs are always logged: the 24-write cap hid
+                                    * whether a guest ever UNMASKED them, which is the whole
+                                    * question when a completion goes undelivered */
                 rte_log_n++;
                 hype_debug_print("fw-1 RTEWR gsi=%u %s=0x%x rip=0x%llx\n", gsi,
                                  (rel & 1u) ? "hi" : "lo", value,

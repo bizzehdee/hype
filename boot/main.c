@@ -9361,6 +9361,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
                     vmm_request_interrupt(kind, ctx, iov);
                     ahci_irqs++;
+                } else {
+                    /* A completion is pending and the IO-APIC will not deliver it. Masked,
+                     * never programmed (vector 0), and Remote-IRR stuck from a previous
+                     * interrupt are three different bugs, and the guest's timeout ladder
+                     * looks identical for all three -- so report the entry, once. */
+                    static int undelivered_reported = 0;
+                    if (!undelivered_reported) {
+                        undelivered_reported = 1;
+                        hype_debug_print("fw-1 AHCI-IRQ-UNDELIVERED: gsi=%u rte=0x%llx p_is=0x%x "
+                                         "p_ie=0x%x ghc=0x%x pci_line=%u\n",
+                                         (unsigned int)HYPE_FW_1_AHCI_GSI,
+                                         (unsigned long long)g_fw_1_ioapic.rte[HYPE_FW_1_AHCI_GSI],
+                                         (unsigned int)g_fw_1_ahci.p_is,
+                                         (unsigned int)g_fw_1_ahci.p_ie,
+                                         (unsigned int)g_fw_1_ahci.ghc, (unsigned int)line);
+                    }
                 }
             }
         } else if (ahci_mapped) {
@@ -9414,6 +9430,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
             if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI, &iov)) {
                 vmm_request_interrupt(kind, ctx, iov);
+            } else {
+                static int ata_undelivered_reported = 0;
+                if (!ata_undelivered_reported) {
+                    ata_undelivered_reported = 1;
+                    hype_debug_print("fw-1 ATA-IRQ-UNDELIVERED: gsi=%u rte=0x%llx p_is=0x%x "
+                                     "p_ie=0x%x ghc=0x%x pci_line=%u\n",
+                                     (unsigned int)HYPE_FW_1_ATA_GSI,
+                                     (unsigned long long)g_fw_1_ioapic.rte[HYPE_FW_1_ATA_GSI],
+                                     (unsigned int)g_fw_1_ata_ahci.p_is,
+                                     (unsigned int)g_fw_1_ata_ahci.p_ie,
+                                     (unsigned int)g_fw_1_ata_ahci.ghc, (unsigned int)line);
+                }
             }
         } else if (ata_mapped) {
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI);
