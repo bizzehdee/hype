@@ -48,6 +48,25 @@
 
 #define HYPE_IOAPIC_VERSION 0x11u
 
+/*
+ * #312: the IO-APIC's own APIC ID, and the SINGLE definition of it.
+ *
+ * The 82093AA resets this register to 0 and expects platform firmware to program it; on a
+ * real machine the BIOS does that and then declares the value it chose in the MADT. hype is
+ * both the chipset and the firmware, so there is no second agent to do the programming --
+ * which is how the model came to reset to 0 while hype's own MADT declared 1, and FreeBSD
+ * said so out loud: `ioapic0: MADT APIC ID 1 != hw id 0`.
+ *
+ * Resolved in favour of 1, not 0, because 0 is the LAPIC's APIC ID on hype's single-vCPU
+ * guest and the IO-APIC shares that ID space. Declaring 0 would trade FreeBSD's warning for
+ * a genuine collision that Linux detects and silently renumbers around
+ * (`io_apic_unique_id()`), which is a worse answer than agreeing on a free ID.
+ *
+ * The MADT builder's `io_apic_id` and hype_ioapic_reset() must both use this constant so the
+ * two cannot drift apart again; core/tests/test_ioapic.c pins that they agree.
+ */
+#define HYPE_IOAPIC_DEFAULT_ID 1u
+
 /* Redirection-entry bit fields (low 32 bits unless noted). */
 #define HYPE_IOAPIC_RTE_VECTOR_MASK 0x000000FFu
 #define HYPE_IOAPIC_RTE_DELMODE_SHIFT 8

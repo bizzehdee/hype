@@ -2416,7 +2416,7 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
     }
     cfg.cpu_count = 1;
     cfg.local_apic_address = 0xFEE00000u;
-    cfg.io_apic_id = 1;
+    cfg.io_apic_id = (uint8_t)HYPE_IOAPIC_DEFAULT_ID; /* #312: one definition, shared with the model */
     cfg.io_apic_address = 0xFEC00000u;
     cfg.io_apic_gsi_base = 0;
     cfg.mcfg_base_address = 0xE0000000ULL;
@@ -7729,7 +7729,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
         cfg.cpu_count = 1;
         cfg.local_apic_address = 0xFEE00000u;
-        cfg.io_apic_id = 1;
+        cfg.io_apic_id = (uint8_t)HYPE_IOAPIC_DEFAULT_ID; /* #312: one definition, shared with the model */
         cfg.io_apic_address = 0xFEC00000u;
         cfg.io_apic_gsi_base = 0;
         cfg.mcfg_base_address = HYPE_FW_1_ECAM_GPA;

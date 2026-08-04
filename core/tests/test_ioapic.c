@@ -31,7 +31,9 @@ static void test_reset_all_masked(void) {
     uint8_t vec = 0;
     hype_ioapic_reset(&io);
     CHECK_HEX("ioregsel 0 at reset", 0, io.ioregsel);
-    CHECK_HEX("id 0 at reset", 0, io.id);
+    /* #312: the programmed ID, not the 82093AA's power-on 0 -- hype is its own platform
+     * firmware, so nothing else will ever program this, and hype's MADT declares it. */
+    CHECK_HEX("id is the declared default at reset", HYPE_IOAPIC_DEFAULT_ID, io.id);
     for (i = 0; i < HYPE_IOAPIC_NUM_RTES; i++) {
         CHECK_HEX("rte masked at reset", HYPE_IOAPIC_RTE_MASK, (uint32_t)io.rte[i]);
         /* a masked line never delivers */
@@ -153,12 +155,17 @@ static void test_unimplemented_index_reads_zero(void) {
 static void test_readonly_registers_ignore_writes(void) {
     hype_ioapic_t io;
     uint32_t ver_before;
+    uint32_t arb_before;
     hype_ioapic_reset(&io);
     ver_before = reg_read(&io, HYPE_IOAPIC_INDEX_VER);
+    /* #312: captured rather than hardcoded to 0. ARB mirrors the ID, so asserting a literal
+     * here made this test a hidden assertion about the reset ID -- and it duly broke when the
+     * ID changed, for a reason that has nothing to do with what it is testing. */
+    arb_before = reg_read(&io, HYPE_IOAPIC_INDEX_ARB);
     reg_write(&io, HYPE_IOAPIC_INDEX_VER, 0xDEADBEEFu);  /* VER is read-only */
     reg_write(&io, HYPE_IOAPIC_INDEX_ARB, 0xDEADBEEFu);  /* ARB is read-only */
     CHECK_HEX("VER unchanged by write", ver_before, reg_read(&io, HYPE_IOAPIC_INDEX_VER));
-    CHECK_HEX("ARB unchanged by write (id still 0)", 0, reg_read(&io, HYPE_IOAPIC_INDEX_ARB));
+    CHECK_HEX("ARB unchanged by write", arb_before, reg_read(&io, HYPE_IOAPIC_INDEX_ARB));
 }
 
 static void test_eoi_ignores_nonmatching(void) {
@@ -200,8 +207,32 @@ static void test_bad_offset_rejected(void) {
               (uint32_t)hype_ioapic_mmio_write(&io, 0x08u, 0));
 }
 
+static void test_reset_id_is_readable_through_mmio(void) {
+    /*
+     * #312: the guest learns the hardware ID by reading register 0, and FreeBSD compares what
+     * it reads there against the MADT's declared ID -- so it is not enough for the struct
+     * field to be right, the MMIO read has to surface it, in bits 27:24.
+     *
+     * `ioapic0: MADT APIC ID 1 != hw id 0` was that comparison failing.
+     */
+    hype_ioapic_t io;
+    uint32_t v = 0;
+
+    hype_ioapic_reset(&io);
+    hype_ioapic_mmio_write(&io, HYPE_IOAPIC_REG_IOREGSEL, HYPE_IOAPIC_INDEX_ID);
+    CHECK_HEX("MMIO read of register 0 returns the default ID in bits 27:24",
+              HYPE_IOAPIC_DEFAULT_ID << 24,
+              (hype_ioapic_mmio_read(&io, HYPE_IOAPIC_REG_IOWIN, &v), v));
+
+    /* The chosen ID must not collide with the LAPIC's APIC ID (0 on a single-vCPU guest);
+     * they share one ID space, and Linux renumbers the IO-APIC if they clash. */
+    CHECK_HEX("default IO-APIC ID does not collide with LAPIC APIC ID 0", 1,
+              HYPE_IOAPIC_DEFAULT_ID != 0u);
+}
+
 int main(void) {
     test_reset_all_masked();
+    test_reset_id_is_readable_through_mmio();
     test_version_register();
     test_id_read_write();
     test_ioregsel_latches();

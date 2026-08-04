@@ -2,6 +2,7 @@
 #include <string.h>
 #include "../../devices/acpi.h"
 #include "../../devices/dsdt_aml.h"
+#include "../../devices/ioapic.h" /* #312: the ID the model resets to must be the one declared */
 
 static int failures = 0;
 
@@ -65,7 +66,7 @@ static hype_acpi_config_t make_config(uint8_t cpu_count) {
     }
     cfg.cpu_count = cpu_count;
     cfg.local_apic_address = 0xFEE00000u;
-    cfg.io_apic_id = 1;
+    cfg.io_apic_id = (uint8_t)HYPE_IOAPIC_DEFAULT_ID;
     cfg.io_apic_address = 0xFEC00000u;
     cfg.io_apic_gsi_base = 0;
     cfg.mcfg_base_address = 0xE0000000ULL;
@@ -181,7 +182,11 @@ static void test_build_tables_blob_layout(void) {
     CHECK_HEX("lapic1 apic_id", 1, lapic1->apic_id);
     ioapic = (hype_acpi_madt_io_apic_t *)((uint8_t *)lapic1 + sizeof(*lapic1));
     CHECK_HEX("ioapic type", HYPE_ACPI_MADT_TYPE_IO_APIC, ioapic->header.type);
-    CHECK_HEX("ioapic id", 1, ioapic->io_apic_id);
+    /* #312: pinned against the model's own constant, not a literal. A literal here is
+     * exactly how the MADT came to declare 1 while hype_ioapic_reset() left the register 0,
+     * which FreeBSD reported as `ioapic0: MADT APIC ID 1 != hw id 0`. */
+    CHECK_HEX("ioapic id matches the model's reset ID", HYPE_IOAPIC_DEFAULT_ID,
+              ioapic->io_apic_id);
     CHECK_HEX("ioapic address", 0xFEC00000u, ioapic->io_apic_address);
     iso = (hype_acpi_madt_interrupt_override_t *)((uint8_t *)ioapic + sizeof(*ioapic));
     CHECK_HEX("iso type", HYPE_ACPI_MADT_TYPE_INTERRUPT_OVERRIDE, iso->header.type);

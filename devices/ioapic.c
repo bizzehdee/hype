@@ -3,7 +3,10 @@
 void hype_ioapic_reset(hype_ioapic_t *io) {
     uint32_t i;
     io->ioregsel = 0;
-    io->id = 0;
+    /* #312: the ID hype's own MADT declares, not the 82093AA's power-on 0 -- see
+     * HYPE_IOAPIC_DEFAULT_ID. hype is its own platform firmware, so the value a guest first
+     * reads here has to be the programmed one; nothing else is going to program it. */
+    io->id = HYPE_IOAPIC_DEFAULT_ID;
     for (i = 0; i < HYPE_IOAPIC_NUM_RTES; i++) {
         /* 82093AA reset: every entry masked, all other fields clear. */
         io->rte[i] = (uint64_t)HYPE_IOAPIC_RTE_MASK;
