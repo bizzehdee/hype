@@ -217,7 +217,138 @@ static void test_ordinary_registers_are_still_writable(void) {
     CHECK_HEX("register B writable", 0x06u, hype_cmos_data_read(&c));
 }
 
+/* --- #304: the RTC must tick --- */
+
+static unsigned int bcd(uint8_t v) { return (unsigned)((v >> 4) * 10u + (v & 0x0Fu)); }
+
+static void test_advance_moves_the_clock(void) {
+    /*
+     * The defect: seeded once at VM setup and never updated, so every read returned the
+     * same instant and a guest computing `now - start` got 0 for ever. FreeBSD's loader
+     * menu never reached its countdown.
+     */
+    hype_cmos_t c;
+    uint8_t v = 0;
+
+    hype_cmos_reset(&c);
+    CHECK_HEX("seed", 0u, (unsigned)hype_cmos_set_time(&c, 2026u, 8u, 4u, 10u, 30u, 0u));
+    hype_cmos_advance_to(&c, 65u); /* +1m05s */
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_SECONDS);
+    CHECK_HEX("seconds advanced to 5", 5u, bcd(hype_cmos_data_read(&c)));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_MINUTES);
+    CHECK_HEX("minutes advanced to 31", 31u, bcd(hype_cmos_data_read(&c)));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_HOURS);
+    CHECK_HEX("hours unchanged", 10u, bcd(hype_cmos_data_read(&c)));
+    (void)v;
+}
+
+static void test_advance_rolls_across_midnight_and_month(void) {
+    /* The carry is hype_rtc_advance()'s job, but a wrong hand-off here would show up as a
+     * date that goes backwards -- which is worse than one that is merely late. */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    CHECK_HEX("seed 23:59:59 on the last day of a month", 0u,
+              (unsigned)hype_cmos_set_time(&c, 2026u, 8u, 31u, 23u, 59u, 59u));
+    hype_cmos_advance_to(&c, 1u);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_SECONDS);
+    CHECK_HEX("seconds roll to 0", 0u, bcd(hype_cmos_data_read(&c)));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_HOURS);
+    CHECK_HEX("hour rolls to 0", 0u, bcd(hype_cmos_data_read(&c)));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_DAY);
+    CHECK_HEX("day rolls to 1", 1u, bcd(hype_cmos_data_read(&c)));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_MONTH);
+    CHECK_HEX("month rolls to September", 9u, bcd(hype_cmos_data_read(&c)));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_YEAR);
+    CHECK_HEX("year unchanged", 26u, bcd(hype_cmos_data_read(&c)));
+}
+
+static void test_advance_is_idempotent_for_one_elapsed_value(void) {
+    /* The IOIO glue calls this on every CMOS access, so repeating the same elapsed value
+     * must not creep the clock forward -- otherwise the time would depend on how many
+     * registers a guest happened to read. */
+    hype_cmos_t c;
+    unsigned int first, second;
+
+    hype_cmos_reset(&c);
+    (void)hype_cmos_set_time(&c, 2026u, 8u, 4u, 10u, 30u, 0u);
+    hype_cmos_advance_to(&c, 42u);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_SECONDS);
+    first = bcd(hype_cmos_data_read(&c));
+    hype_cmos_advance_to(&c, 42u);
+    hype_cmos_advance_to(&c, 42u);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_SECONDS);
+    second = bcd(hype_cmos_data_read(&c));
+    CHECK_HEX("same elapsed -> same time", first, second);
+    CHECK_HEX("and it is the expected value", 42u, second);
+}
+
+static void test_advance_without_a_seed_does_nothing(void) {
+    /* A guest reading a clock hype never set should see the unchanging zeros it had
+     * before, not an invented date that drifts. */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    hype_cmos_advance_to(&c, 10000u);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_MONTH);
+    CHECK_HEX("month still zero", 0u, hype_cmos_data_read(&c));
+    hype_cmos_advance_to(0, 10u); /* must not fault */
+}
+
+static void test_advance_honours_binary_mode(void) {
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_B);
+    hype_cmos_data_write(&c, HYPE_CMOS_STATUS_B_RESET | HYPE_CMOS_STATUS_B_BINARY);
+    (void)hype_cmos_set_time(&c, 2026u, 8u, 4u, 10u, 30u, 0u);
+    hype_cmos_advance_to(&c, 90u);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_SECONDS);
+    CHECK_HEX("seconds binary 30", 30u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_MINUTES);
+    CHECK_HEX("minutes binary 31", 31u, hype_cmos_data_read(&c));
+}
+
+static void test_advance_rolls_the_year_and_century(void) {
+    /* A year carry also has to update the century register, which is a separate register
+     * a guest may or may not read -- leaving it stale would put the guest a century out
+     * on New Year's Eve. */
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    CHECK_HEX("seed 1999-12-31 23:59:59", 0u,
+              (unsigned)hype_cmos_set_time(&c, 1999u, 12u, 31u, 23u, 59u, 59u));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_CENTURY);
+    CHECK_HEX("century starts at 19", 0x19u, hype_cmos_data_read(&c));
+    hype_cmos_advance_to(&c, 1u);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_YEAR);
+    CHECK_HEX("year rolls to 00", 0u, bcd(hype_cmos_data_read(&c)));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_CENTURY);
+    CHECK_HEX("century rolls to 20", 0x20u, hype_cmos_data_read(&c));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_MONTH);
+    CHECK_HEX("month rolls to January", 1u, bcd(hype_cmos_data_read(&c)));
+}
+
+static void test_advance_of_zero_leaves_the_seed(void) {
+    hype_cmos_t c;
+
+    hype_cmos_reset(&c);
+    (void)hype_cmos_set_time(&c, 2026u, 8u, 4u, 10u, 30u, 15u);
+    hype_cmos_advance_to(&c, 0u);
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_SECONDS);
+    CHECK_HEX("seconds unchanged", 15u, bcd(hype_cmos_data_read(&c)));
+    hype_cmos_index_write(&c, HYPE_CMOS_REG_DAY);
+    CHECK_HEX("day unchanged", 4u, bcd(hype_cmos_data_read(&c)));
+}
+
 int main(void) {
+    test_advance_rolls_the_year_and_century();
+    test_advance_of_zero_leaves_the_seed();
+    test_advance_moves_the_clock();
+    test_advance_rolls_across_midnight_and_month();
+    test_advance_is_idempotent_for_one_elapsed_value();
+    test_advance_without_a_seed_does_nothing();
+    test_advance_honours_binary_mode();
     test_register_d_vrt_survives_a_guest_write();
     test_register_a_uip_is_held_clear();
     test_register_c_is_read_only();

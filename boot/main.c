@@ -579,6 +579,10 @@ typedef struct hype_fw_vm {
      * 64-bit read at worst shows a momentarily-stale number, never a crash. */
     const char *name;
     const char *os_hint;    /* "linux" / "windows" / "bsd" / "none" */
+    /* #304: host TSC when this VM's CMOS clock was seeded, so a guest read can be
+     * answered as base + elapsed. 0 = never seeded, so the clock stays frozen (and
+     * visibly so) rather than drifting from an invented base. */
+    uint64_t cmos_base_tsc;
     /* M7-1 (#91): show this guest the Hyper-V CPUID leaves + synthetic MSRs. Derived
      * from os_hint by fw_1_resolve_os_hint(); per-VM because two guests with different
      * hints run concurrently. */
@@ -7485,6 +7489,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
             (void)hype_cmos_set_time(&g_fw_1_cmos, g_host_time.year, g_host_time.month,
                                      g_host_time.day, g_host_time.hour, g_host_time.minute,
                                      g_host_time.second);
+            vm->cmos_base_tsc = hype_rdtsc(); /* #304: anchor for the advance */
         }
     }
 
@@ -7793,6 +7798,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             (void)hype_cmos_set_time(&g_fw_1_cmos, g_host_time.year, g_host_time.month,
                                      g_host_time.day, g_host_time.hour, g_host_time.minute,
                                      g_host_time.second);
+            vm->cmos_base_tsc = hype_rdtsc(); /* #304: anchor for the advance */
         }
     }
 
@@ -10203,6 +10209,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
             if (vmm_handle_fw_cfg_ioio(kind, ctx, &g_fw_1_fw_cfg, &g_fw_1_dma_map) == 0) {
                 continue;
+            }
+            /*
+             * #304: advance the guest's RTC before answering. Seeded once and never
+             * updated, it read back the same instant for ever, so a guest computing
+             * `now - start` got 0 -- FreeBSD's loader menu never reached its countdown and
+             * Alpine's `date` reported its image's build year.
+             *
+             * Re-encoded on every CMOS access rather than latched on a read sequence:
+             * the value only changes once per second, so the window in which a guest could
+             * read a rolled minute against an unrolled hour is microseconds wide and is
+             * exactly the hazard real hardware has (guests guard it by re-reading when UIP
+             * is set). Latching would need to guess where a guest's read sequence begins,
+             * and guests do not agree on that.
+             */
+            if (vm->cmos_base_tsc != 0 && g_fw_1_host_tsc_hz != 0) {
+                hype_cmos_advance_to(&g_fw_1_cmos,
+                                     (hype_rdtsc() - vm->cmos_base_tsc) / g_fw_1_host_tsc_hz);
             }
             if (vmm_handle_cmos_ioio(kind, ctx, &g_fw_1_cmos) == 0) {
                 continue;

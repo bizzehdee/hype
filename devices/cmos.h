@@ -72,9 +72,31 @@
 #define HYPE_CMOS_STATUS_B_BINARY 0x04u /* DM: time is binary, not BCD */
 #define HYPE_CMOS_STATUS_B_24HOUR 0x02u
 
+/*
+ * #304: the RTC has to TICK.
+ *
+ * #286 seeded the time/date registers once at VM setup and nothing updated them, so every
+ * guest read returned the same instant and any guest computing `now - start` got 0 for
+ * ever. FreeBSD's loader menu never reached its "Autoboot in 10 seconds" countdown --
+ * 15.8M ACPI-PM-timer reads and no progress -- and Alpine's `date` reported its image's
+ * build year. A frozen clock is a different defect from #286's invalid one, and fixing
+ * that exposed this.
+ *
+ * The base snapshot plus a caller-supplied elapsed-seconds count is all this needs; the
+ * calendar arithmetic is hype_rtc_advance()'s (core/rtc.h), and keeping the elapsed
+ * measurement outside this file is what keeps the model free of any platform clock. The
+ * whole time is recomputed and re-encoded in ONE call so a guest cannot read a rolled
+ * minute against an unrolled hour -- real hardware exposes that hazard through UIP, which
+ * hype deliberately holds clear (#286), so the snapshot has to be atomic here instead.
+ */
 typedef struct {
     uint8_t index;
     uint8_t registers[HYPE_CMOS_SIZE];
+    /* Seeded wall clock, and whether it is usable. Kept alongside the register file so a
+     * re-encode never has to go back to the host. */
+    uint16_t base_year;
+    uint8_t base_month, base_day, base_hour, base_minute, base_second;
+    int base_valid;
 } hype_cmos_t;
 
 /*
@@ -100,6 +122,21 @@ void hype_cmos_reset(hype_cmos_t *cmos);
 int hype_cmos_set_time(hype_cmos_t *cmos, unsigned int year, unsigned int month,
                        unsigned int day, unsigned int hour, unsigned int minute,
                        unsigned int second);
+
+/*
+ * #304: re-encode the time/date registers as the seeded base advanced by `elapsed_seconds`.
+ *
+ * Call before answering a guest read of a time/date register; the caller owns the elapsed
+ * measurement (a TSC delta), which is what keeps this module free of a platform clock, the
+ * same split hype_blk_wstats_set_clock() uses. A no-op if no valid base was seeded -- a
+ * guest reading a clock hype never set should see the unchanging zeros it had before,
+ * not an invented date that drifts.
+ *
+ * Idempotent for a given `elapsed_seconds`, so calling it on every register read of a
+ * multi-register sequence yields a self-consistent time as long as the caller passes the
+ * same value for that sequence.
+ */
+void hype_cmos_advance_to(hype_cmos_t *cmos, uint64_t elapsed_seconds);
 
 /*
  * Populates registers 0x34/0x35 with `size_64kb_units` (the standard

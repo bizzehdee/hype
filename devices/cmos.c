@@ -1,5 +1,7 @@
 #include "cmos.h"
 
+#include "../core/rtc.h"
+
 void hype_cmos_reset(hype_cmos_t *cmos) {
     unsigned int i;
 
@@ -11,6 +13,13 @@ void hype_cmos_reset(hype_cmos_t *cmos) {
     cmos->registers[HYPE_CMOS_REG_STATUS_A] = HYPE_CMOS_STATUS_A_RESET;
     cmos->registers[HYPE_CMOS_REG_STATUS_B] = HYPE_CMOS_STATUS_B_RESET;
     cmos->registers[HYPE_CMOS_REG_STATUS_D] = HYPE_CMOS_STATUS_D_RESET;
+    cmos->base_valid = 0;
+    cmos->base_year = 0;
+    cmos->base_month = 0;
+    cmos->base_day = 0;
+    cmos->base_hour = 0;
+    cmos->base_minute = 0;
+    cmos->base_second = 0;
 }
 
 /* Binary -> BCD for one two-digit field. */
@@ -18,25 +27,11 @@ static uint8_t bin_to_bcd(unsigned int v) {
     return (uint8_t)(((v / 10u) << 4) | (v % 10u));
 }
 
-int hype_cmos_set_time(hype_cmos_t *cmos, unsigned int year, unsigned int month,
-                       unsigned int day, unsigned int hour, unsigned int minute,
-                       unsigned int second) {
-    int binary;
-
-    if (cmos == 0) {
-        return -1;
-    }
-    /*
-     * Refused rather than clamped. A month or day of 0 fails EDK2's RtcTimeFieldsValid()
-     * and is what made a DEBUG OVMF dead-loop, so writing a nonsense date here would
-     * reproduce the bug this function exists to fix -- and a silently corrected date is
-     * worse than a caller that learns its clock read failed.
-     */
-    if (year < 1980u || year > 2099u || month < 1u || month > 12u || day < 1u || day > 31u ||
-        hour > 23u || minute > 59u || second > 59u) {
-        return -1;
-    }
-    binary = (cmos->registers[HYPE_CMOS_REG_STATUS_B] & HYPE_CMOS_STATUS_B_BINARY) != 0;
+/* Write one wall clock into the time/date registers, honouring register B's DM bit. */
+static void encode_time(hype_cmos_t *cmos, unsigned int year, unsigned int month,
+                        unsigned int day, unsigned int hour, unsigned int minute,
+                        unsigned int second) {
+    int binary = (cmos->registers[HYPE_CMOS_REG_STATUS_B] & HYPE_CMOS_STATUS_B_BINARY) != 0;
 
     if (binary) {
         cmos->registers[HYPE_CMOS_REG_SECONDS] = (uint8_t)second;
@@ -58,6 +53,60 @@ int hype_cmos_set_time(hype_cmos_t *cmos, unsigned int year, unsigned int month,
     /* Day-of-week is 1-based with Sunday = 1. Nothing in this project's scope reads it,
      * but a zero there is another "invalid" a validator can trip on. */
     cmos->registers[HYPE_CMOS_REG_DAY_OF_WEEK] = 1u;
+}
+
+void hype_cmos_advance_to(hype_cmos_t *cmos, uint64_t elapsed_seconds) {
+    hype_rtc_time_t base, now;
+
+    if (cmos == 0 || !cmos->base_valid) {
+        return;
+    }
+    base.year = cmos->base_year;
+    base.month = cmos->base_month;
+    base.day = cmos->base_day;
+    base.hour = cmos->base_hour;
+    base.minute = cmos->base_minute;
+    base.second = cmos->base_second;
+    hype_rtc_advance(&base, elapsed_seconds, &now);
+    if (now.year == 0u) {
+        /*
+         * hype_rtc_advance() rejected the base. Unreachable from outside this file --
+         * hype_cmos_set_time() range-checks before storing, so a stored base is always
+         * valid -- and kept anyway because the alternative is writing zeros into the
+         * guest's date registers, which is exactly the day-0/month-0 state #286 had to
+         * fix. This is the one branch coverage cannot reach here (89.5% on this file).
+         */
+        return;
+    }
+    encode_time(cmos, now.year, now.month, now.day, now.hour, now.minute, now.second);
+}
+
+int hype_cmos_set_time(hype_cmos_t *cmos, unsigned int year, unsigned int month,
+                       unsigned int day, unsigned int hour, unsigned int minute,
+                       unsigned int second) {
+    if (cmos == 0) {
+        return -1;
+    }
+    /*
+     * Refused rather than clamped. A month or day of 0 fails EDK2's RtcTimeFieldsValid()
+     * and is what made a DEBUG OVMF dead-loop, so writing a nonsense date here would
+     * reproduce the bug this function exists to fix -- and a silently corrected date is
+     * worse than a caller that learns its clock read failed.
+     */
+    if (year < 1980u || year > 2099u || month < 1u || month > 12u || day < 1u || day > 31u ||
+        hour > 23u || minute > 59u || second > 59u) {
+        return -1;
+    }
+    encode_time(cmos, year, month, day, hour, minute, second);
+    /* #304: keep the base so a later hype_cmos_advance_to() can re-encode without going
+     * back to the host clock -- which an AP must never do (#229/#239). */
+    cmos->base_year = (uint16_t)year;
+    cmos->base_month = (uint8_t)month;
+    cmos->base_day = (uint8_t)day;
+    cmos->base_hour = (uint8_t)hour;
+    cmos->base_minute = (uint8_t)minute;
+    cmos->base_second = (uint8_t)second;
+    cmos->base_valid = 1;
     return 0;
 }
 
