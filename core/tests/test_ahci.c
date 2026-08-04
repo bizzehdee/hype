@@ -490,6 +490,100 @@ static void test_signature_fis_carries_the_plain_disk_signature(void) {
     CHECK_HEX("sector count", 0x01u, fis[12]);
 }
 
+static void test_d2h_fis_reports_the_result_registers(void) {
+    /*
+     * #314: the D2H Register FIS is what a driver reads to learn a command's outcome. The
+     * completion paths pass flags 0 (hype sets PxIS itself), so the I bit must NOT appear
+     * unasked -- that would tell a driver the device requested an interrupt hype never
+     * modelled through this FIS.
+     */
+    uint8_t fis[20];
+    unsigned int i;
+
+    for (i = 0; i < 20u; i++) {
+        fis[i] = 0xAAu; /* poison: the builder must zero what it does not set */
+    }
+    hype_ahci_build_d2h_fis(fis, 0u, 0x50u, 0u);
+    CHECK_HEX("D2H Register FIS type", HYPE_AHCI_FIS_TYPE_D2H_REGISTER, fis[0]);
+    CHECK_HEX("no interrupt bit when not asked", 0u, fis[1]);
+    CHECK_HEX("status", 0x50u, fis[2]);
+    CHECK_HEX("error", 0u, fis[3]);
+    for (i = 4u; i < 20u; i++) {
+        CHECK_HEX("trailing byte zeroed", 0u, fis[i]);
+    }
+}
+
+static void test_d2h_fis_passes_flags_through_and_reports_an_error(void) {
+    /* The signature path asks for I; an error completion must carry a non-zero Error byte. */
+    uint8_t fis[20];
+
+    hype_ahci_build_d2h_fis(fis, (uint8_t)HYPE_AHCI_FIS_D2H_FLAG_I, 0x51u, 0x04u);
+    CHECK_HEX("interrupt bit passed through", HYPE_AHCI_FIS_D2H_FLAG_I, fis[1]);
+    CHECK_HEX("error status", 0x51u, fis[2]);
+    CHECK_HEX("error register", 0x04u, fis[3]);
+}
+
+static void test_pio_setup_fis_carries_e_status_and_transfer_count(void) {
+    /*
+     * #314: FreeBSD ends a PIO-in transaction from THIS FIS's E_Status (byte 15) and 16-bit
+     * Transfer Count (bytes 16-17), not from the PxIS.PSS bit EDK2 waits on. A 512-byte
+     * IDENTIFY must therefore report 0x0200 split little-endian across two bytes -- getting
+     * the byte order wrong here reads as a 2-byte transfer and is exactly the class of bug
+     * that made ATAPI_IDENTIFY time out on a command hype had completed correctly.
+     */
+    uint8_t fis[20];
+    unsigned int i;
+
+    for (i = 0; i < 20u; i++) {
+        fis[i] = 0xAAu;
+    }
+    hype_ahci_build_pio_setup_fis(fis, 0x50u, 0u, 512u);
+    CHECK_HEX("PIO Setup FIS type", HYPE_AHCI_FIS_TYPE_PIO_SETUP, fis[0]);
+    CHECK_HEX("I + D flags", HYPE_AHCI_FIS_D2H_FLAG_I | HYPE_AHCI_FIS_PIO_FLAG_D, fis[1]);
+    CHECK_HEX("status at the start of the transfer", 0x50u, fis[2]);
+    CHECK_HEX("error", 0u, fis[3]);
+    CHECK_HEX("E_Status at the end of the transfer", 0x50u, fis[15]);
+    CHECK_HEX("transfer count low", 0x00u, fis[16]);
+    CHECK_HEX("transfer count high", 0x02u, fis[17]);
+    /* The register block between Error and E_Status must be zeroed, not poison. */
+    for (i = 4u; i < 15u; i++) {
+        CHECK_HEX("register byte zeroed", 0u, fis[i]);
+    }
+    CHECK_HEX("trailing reserved zeroed", 0u, fis[18]);
+    CHECK_HEX("trailing reserved zeroed", 0u, fis[19]);
+}
+
+static void test_pio_setup_fis_truncates_transfer_count_to_16_bits(void) {
+    /*
+     * The Transfer Count field is 16 bits wide. A caller handing over a larger byte count
+     * must not have the excess spill into the reserved bytes past it.
+     */
+    uint8_t fis[20];
+
+    hype_ahci_build_pio_setup_fis(fis, 0x50u, 0u, 0x1234ABCDu);
+    CHECK_HEX("transfer count low", 0xCDu, fis[16]);
+    CHECK_HEX("transfer count high", 0xABu, fis[17]);
+    CHECK_HEX("no spill past the 16-bit field", 0u, fis[18]);
+    CHECK_HEX("no spill past the 16-bit field", 0u, fis[19]);
+}
+
+static void test_signature_fis_is_a_d2h_fis(void) {
+    /*
+     * #314 folded three hand-rolled FIS builders into one definition. Pin that the signature
+     * FIS really is the D2H builder plus the signature registers, so the two cannot drift
+     * apart again -- drift between two such copies is what this ticket was filed for.
+     */
+    uint8_t sig_fis[20];
+    uint8_t d2h_fis[20];
+    unsigned int i;
+
+    hype_ahci_build_signature_fis(sig_fis, 0x50u, 0u, HYPE_AHCI_SIG_ATAPI);
+    hype_ahci_build_d2h_fis(d2h_fis, (uint8_t)HYPE_AHCI_FIS_D2H_FLAG_I, 0x50u, 0u);
+    for (i = 0; i < 4u; i++) {
+        CHECK_HEX("header byte matches the plain D2H builder", d2h_fis[i], sig_fis[i]);
+    }
+}
+
 static void test_global_is_reflects_the_port_level(void) {
     /*
      * #311: IS.IPS is a level reflection of (PxIS & PxIE), not a latch. FreeBSD's ahci_intr()
@@ -553,6 +647,11 @@ int main(void) {
     test_soft_reset_clears_serr();
     test_signature_fis_carries_the_atapi_signature();
     test_signature_fis_carries_the_plain_disk_signature();
+    test_d2h_fis_reports_the_result_registers();
+    test_d2h_fis_passes_flags_through_and_reports_an_error();
+    test_pio_setup_fis_carries_e_status_and_transfer_count();
+    test_pio_setup_fis_truncates_transfer_count_to_16_bits();
+    test_signature_fis_is_a_d2h_fis();
     test_global_is_reflects_the_port_level();
 
     if (failures == 0) {

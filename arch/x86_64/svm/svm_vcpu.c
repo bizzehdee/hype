@@ -2088,26 +2088,11 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * tfd 50, is 00000002).
      */
     if (pis_bit == HYPE_AHCI_PIS_PSS) {
-        uint8_t *pio_fis = rx_fis_host + 0x20;
-        for (i = 0; i < 20u; i++) {
-            pio_fis[i] = 0;
-        }
-        pio_fis[0] = 0x5F;       /* FIS type: PIO Setup - Device to Host */
-        pio_fis[1] = 0x60;       /* I (interrupt) + D (device-to-host direction) */
-        pio_fis[2] = status_reg; /* Status at the START of the transfer */
-        pio_fis[3] = error_reg;
-        pio_fis[15] = status_reg;                      /* E_Status: status at the END */
-        pio_fis[16] = (uint8_t)(transferred & 0xFFu);  /* Transfer Count, 16-bit */
-        pio_fis[17] = (uint8_t)((transferred >> 8) & 0xFFu);
+        hype_ahci_build_pio_setup_fis(rx_fis_host + 0x20, status_reg, error_reg, transferred);
     }
 
     d2h_fis = rx_fis_host + 0x40;
-    for (i = 0; i < 20; i++) {
-        d2h_fis[i] = 0;
-    }
-    d2h_fis[0] = 0x34; /* FIS type: Register - Device to Host */
-    d2h_fis[2] = status_reg;
-    d2h_fis[3] = error_reg;
+    hype_ahci_build_d2h_fis(d2h_fis, 0, status_reg, error_reg);
 
     /* #311: the exact bytes hype leaves for the guest to read after a completion -- the command
      * header (PRDBC is DW1 at offset 4) and both received FISes. Everything about delivery is
@@ -2365,7 +2350,6 @@ static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, 
      * microtest (dma_map == 0) but not for the FW-1 guest, which remaps its RAM. */
     uint64_t rx_fis_host = guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
     uint8_t *d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_host + 0x40);
-    unsigned i;
 
     /*
      * #262 slice 4: a PIO data-in command must also deliver a PIO Setup FIS at
@@ -2378,27 +2362,13 @@ static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, 
      * for a FIS that never arrived, and dropped the device.
      */
     if (pis_bit == HYPE_AHCI_PIS_PSS) {
-        uint8_t *pio_fis = (uint8_t *)(uintptr_t)(rx_fis_host + 0x20);
-        for (i = 0; i < 20u; i++) {
-            pio_fis[i] = 0;
-        }
-        pio_fis[0] = 0x5F;       /* FIS type: PIO Setup - Device to Host */
-        pio_fis[1] = 0x60;       /* I (interrupt) + D (device-to-host direction) */
-        pio_fis[2] = status_reg; /* Status at the start of the transfer */
-        pio_fis[3] = error_reg;
-        pio_fis[15] = status_reg; /* E_Status: status at the END of the transfer */
-        pio_fis[16] = (uint8_t)(xfer_bytes & 0xFFu); /* Transfer Count, 16-bit */
-        pio_fis[17] = (uint8_t)((xfer_bytes >> 8) & 0xFFu);
+        hype_ahci_build_pio_setup_fis((uint8_t *)(uintptr_t)(rx_fis_host + 0x20), status_reg,
+                                      error_reg, xfer_bytes);
     }
 
     ahci->p_tfd = (uint32_t)status_reg | ((uint32_t)error_reg << 8);
 
-    for (i = 0; i < 20; i++) {
-        d2h_fis[i] = 0;
-    }
-    d2h_fis[0] = 0x34; /* FIS type: Register - Device to Host */
-    d2h_fis[2] = status_reg;
-    d2h_fis[3] = error_reg;
+    hype_ahci_build_d2h_fis(d2h_fis, 0, status_reg, error_reg);
 
     ahci->p_ci &= ~(1u << slot);
     /* PxIS.DHRS -- the D2H Register FIS interrupt bit a real driver

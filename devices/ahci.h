@@ -205,6 +205,45 @@ int hype_ahci_h2d_is_control_write(const uint8_t raw[20]);
 int hype_ahci_soft_reset(hype_ahci_t *ahci, uint8_t control_byte, unsigned slot);
 
 /*
+ * #314: the received-FIS builders.
+ *
+ * Every command hype completes has to leave bytes in the port's Received FIS area for the
+ * guest to read, and there were three separate hand-rolled copies of "build a completion
+ * FIS" -- one per completion path plus the signature one. They had already drifted: the
+ * ATAPI path set PxIS.PSS for a PIO-in without ever writing the PIO Setup FIS that goes with
+ * it, which is what made FreeBSD's ATAPI_IDENTIFY time out on a command hype had finished
+ * correctly. These builders are the single definition, and are unit-tested directly.
+ *
+ * Offsets within the Received FIS area (AHCI 1.3.1 SS4.2.1) are the caller's business: the
+ * D2H Register FIS goes at 0x40 and the PIO Setup FIS at 0x20.
+ */
+#define HYPE_AHCI_FIS_TYPE_D2H_REGISTER 0x34u /* fis[0] of a Register Device-to-Host FIS */
+#define HYPE_AHCI_FIS_TYPE_PIO_SETUP 0x5Fu    /* fis[0] of a PIO Setup Device-to-Host FIS */
+#define HYPE_AHCI_FIS_D2H_FLAG_I 0x40u        /* fis[1] bit 6: interrupt */
+#define HYPE_AHCI_FIS_PIO_FLAG_D 0x20u        /* fis[1] bit 5: device-to-host direction */
+
+/*
+ * Build the 20-byte Register Device-to-Host FIS that reports a command's result registers.
+ * `flags` is fis[1] verbatim -- callers that want the port interrupt asked for in the FIS
+ * itself pass HYPE_AHCI_FIS_D2H_FLAG_I. hype sets PxIS explicitly either way, so the two
+ * existing completion paths pass 0 and keep the exact bytes EDK2 already accepts; whether
+ * they should assert I is a separate question from de-duplicating them.
+ */
+void hype_ahci_build_d2h_fis(uint8_t fis[20], uint8_t flags, uint8_t status_reg,
+                             uint8_t error_reg);
+
+/*
+ * Build the 20-byte PIO Setup Device-to-Host FIS that a PIO data-in command must deliver in
+ * ADDITION to latching PxIS.PSS. `xfer_bytes` is the byte count actually transferred.
+ *
+ * Latching the bit alone is not enough: EDK2's AhciPioTransfer waits on the PxIS.PSS bit, but
+ * FreeBSD reads this FIS's E_Status and Transfer Count to end the transaction, so for FreeBSD
+ * a completion signalled only through the bit never happens at all.
+ */
+void hype_ahci_build_pio_setup_fis(uint8_t fis[20], uint8_t status_reg, uint8_t error_reg,
+                                   uint32_t xfer_bytes);
+
+/*
  * Build the 20-byte D2H Register FIS that completes a software reset. The LBA and
  * sector-count fields carry `sig` (a PxSIG value), which is how the driver learns whether it
  * reset a packet device or a plain disk -- an all-zero FIS would leave it unable to tell.

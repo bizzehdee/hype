@@ -221,17 +221,38 @@ int hype_ahci_soft_reset(hype_ahci_t *ahci, uint8_t control_byte, unsigned slot)
     return 1;
 }
 
-void hype_ahci_build_signature_fis(uint8_t fis[20], uint8_t status_reg, uint8_t error_reg,
-                                   uint32_t sig) {
+void hype_ahci_build_d2h_fis(uint8_t fis[20], uint8_t flags, uint8_t status_reg,
+                             uint8_t error_reg) {
     unsigned int i;
 
     for (i = 0; i < 20u; i++) {
         fis[i] = 0;
     }
-    fis[0] = 0x34u; /* FIS type: Register - Device to Host */
-    fis[1] = 0x40u; /* I: interrupt */
+    fis[0] = (uint8_t)HYPE_AHCI_FIS_TYPE_D2H_REGISTER;
+    fis[1] = flags;
     fis[2] = status_reg;
     fis[3] = error_reg;
+}
+
+void hype_ahci_build_pio_setup_fis(uint8_t fis[20], uint8_t status_reg, uint8_t error_reg,
+                                   uint32_t xfer_bytes) {
+    unsigned int i;
+
+    for (i = 0; i < 20u; i++) {
+        fis[i] = 0;
+    }
+    fis[0] = (uint8_t)HYPE_AHCI_FIS_TYPE_PIO_SETUP;
+    fis[1] = (uint8_t)(HYPE_AHCI_FIS_D2H_FLAG_I | HYPE_AHCI_FIS_PIO_FLAG_D);
+    fis[2] = status_reg; /* Status at the START of the transfer */
+    fis[3] = error_reg;
+    fis[15] = status_reg;                          /* E_Status: status at the END */
+    fis[16] = (uint8_t)(xfer_bytes & 0xFFu);       /* Transfer Count, 16-bit */
+    fis[17] = (uint8_t)((xfer_bytes >> 8) & 0xFFu);
+}
+
+void hype_ahci_build_signature_fis(uint8_t fis[20], uint8_t status_reg, uint8_t error_reg,
+                                   uint32_t sig) {
+    hype_ahci_build_d2h_fis(fis, (uint8_t)HYPE_AHCI_FIS_D2H_FLAG_I, status_reg, error_reg);
     /* PxSIG packs the same four registers: (LBA_HIGH<<24)|(LBA_MID<<16)|(LBA_LOW<<8)|COUNT. */
     fis[4] = (uint8_t)((sig >> 8) & 0xFFu);  /* LBA low */
     fis[5] = (uint8_t)((sig >> 16) & 0xFFu); /* LBA mid */
