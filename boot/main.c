@@ -9371,6 +9371,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
                     vmm_request_interrupt(kind, ctx, iov);
                     ahci_irqs++;
+                    hype_ahci_tl("R-raise", (unsigned int)g_fw_1_ahci.p_is);
                     /* #311: raises of THIS line with the PxIS that justified each. Paired with
                      * PxCI-ISSUE-TOTAL it separates "the guest re-issues hundreds of commands"
                      * from "hype re-asserts hundreds of times for one" -- which turned out to be

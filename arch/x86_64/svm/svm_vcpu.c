@@ -1745,6 +1745,32 @@ static int complete_ahci_soft_reset(hype_ahci_t *ahci, uint64_t rx_fis_phys,
     return 0;
 }
 
+/*
+ * #311: one timeline for one command. Every VALUE in the completion decision is now measured and
+ * correct, so what is left is ORDER: when the completion interrupt is delivered relative to the
+ * window in which the guest has recorded the slot outstanding and hype has set PxIS.
+ *
+ * Armed by the first kernel-era AHCI access, because OVMF drives the same registers for a long
+ * time first and swamped five earlier attempts at this. The log is serial, so its order IS the
+ * evidence; the TSC delta only says whether a gap is microseconds or seconds.
+ */
+static int g_tl_armed = 0;
+static unsigned int g_tl_n = 0;
+
+void hype_ahci_tl_arm(void) {
+    g_tl_armed = 1;
+}
+
+void hype_ahci_tl(const char *tag, unsigned int v) {
+    if (!g_tl_armed || g_tl_n >= 60u) {
+        return;
+    }
+    g_tl_n++;
+    /* No timestamp: hype_rdtsc() is main.c-local, and the log is serial so its ORDER is the
+     * measurement. Plumbing a clock in for a diagnostic is not worth a new dependency. */
+    hype_debug_print("fw-1 TL%02u %s v=0x%x\n", g_tl_n, tag, v);
+}
+
 int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                               const hype_gpa_map_t *dma_map, unsigned slot) {
     uint64_t cmd_list_phys =
@@ -2066,6 +2092,7 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                              (unsigned int)transferred);
         }
     }
+    hype_ahci_tl("C-complete", (unsigned int)ahci->p_is);
     ahci->p_ci &= (uint32_t)~(1u << slot); /* this slot complete */
     /* Completion interrupt-status bit (PxIS.DHRS for D2H completions,
      * PxIS.PSS for PIO-in). A guest that polls waits on this directly;
@@ -2165,6 +2192,9 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
              * trace cap can never again be mistaken for the guest's actual behaviour: reading
              * "12 acks" off a trace capped at 12 is what sent #311 chasing a PSS-vs-DHRS split
              * that may not exist. */
+            if (real->vmcb->save.rip >= 0xffffffff80000000ull) {
+                hype_ahci_tl("A-ack-pxis", (unsigned int)value);
+            }
             static unsigned int pis_trace_n = 0;
             static unsigned int pis_total = 0;
             pis_total++;
@@ -2187,6 +2217,10 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
              * this separates "the guest re-issues hundreds of commands" from "hype re-asserts
              * the line hundreds of times for one command" -- the two readings of 500+
              * acknowledgements, with completely different fixes. Totals, not a capped sample. */
+            if (real->vmcb->save.rip >= 0xffffffff80000000ull) {
+                hype_ahci_tl_arm();
+                hype_ahci_tl("W-issue-ci", (unsigned int)value);
+            }
             {
                 static unsigned int ci_total = 0;
                 ci_total++;
@@ -2231,6 +2265,10 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
              * wrong era: OVMF polls these same registers through one MmioRead32 helper long
              * before the kernel starts, and it fills any small sample with reads that are not
              * the ones in question. Kernel text is at 0xffffffff8-------, the loader is not. */
+            if (real->vmcb->save.rip >= 0xffffffff80000000ull &&
+                offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS) {
+                hype_ahci_tl("I-isr-read", (unsigned int)value);
+            }
             static unsigned int rd_n = 0;
             static unsigned int rd_total = 0;
             rd_total++;
