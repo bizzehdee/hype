@@ -1017,6 +1017,16 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
 /* M4-6d2 DIAG: interrupt-injection path counters (INT-1/INT-2). Cumulative
  * across all vCPUs (a diagnostic aggregate); the pending-IRQ slot itself is
  * per-vCPU (struct hype_vcpu_ctx.pending_irq_*). */
+/*
+ * #311: did an injection of the AHCI vector actually get TAKEN? Staging EVENTINJ proves hype asked;
+ * it does not prove the guest vectored through its IDT. So the vector is flagged when staged and the
+ * guest's rip is reported at the NEXT exit: if the interrupt was taken, that rip is inside FreeBSD's
+ * interrupt stub, not back at the instruction the guest was running.
+ */
+static int g_inj30_pending = 0;
+static uint64_t g_inj30_rip_before = 0;
+static unsigned int g_inj30_n = 0;
+
 static unsigned long long g_int_eventinj = 0;   /* accepted immediately (direct EVENTINJ) */
 static unsigned int g_int_poll_trace_n = 0;     /* #313: bounds the poll-inject trace */
 static unsigned long long g_int_poll_total = 0; /* #311: the COUNT, so the cap is not read as one */
@@ -1119,6 +1129,10 @@ trace_done:
         hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
         g_int_eventinj++;
+        if (vector == 0x30u && !g_inj30_pending) {
+            g_inj30_pending = 1;
+            g_inj30_rip_before = real->vmcb->save.rip;
+        }
         return;
     }
 
@@ -1167,6 +1181,10 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         g_int_vintr_window++;
+        if ((uint8_t)v == 0x30u && !g_inj30_pending) {
+            g_inj30_pending = 1;
+            g_inj30_rip_before = real->vmcb->save.rip;
+        }
     }
     hype_svm_sync_vintr(real);
 }
@@ -2280,7 +2298,8 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
          */
         if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI ||
             offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS ||
-            offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_SACT) {
+            offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_SACT ||
+            offset == HYPE_AHCI_REG_IS) { /* the GLOBAL IS: what ahci_intr() reads to pick a port */
             /* Gated on a KERNEL rip. Five times on this ticket a capped sample has shown the
              * wrong era: OVMF polls these same registers through one MmioRead32 helper long
              * before the kernel starts, and it fills any small sample with reads that are not
@@ -3834,6 +3853,18 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
      */
     if ((real->vmcb->control.guest_asid_tlb_ctl >> 32) != 0ull) {
         real->vmcb->control.guest_asid_tlb_ctl &= 0xFFFFFFFFull;
+    }
+    if (g_inj30_pending) {
+        g_inj30_pending = 0;
+        if (g_inj30_n < 12u) {
+            g_inj30_n++;
+            hype_debug_print("fw-1 INJ30#%02u rip_before=0x%llx rip_after=0x%llx exit=0x%llx "
+                             "einj=0x%llx\n",
+                             g_inj30_n, (unsigned long long)g_inj30_rip_before,
+                             (unsigned long long)real->vmcb->save.rip,
+                             (unsigned long long)real->vmcb->control.exitcode,
+                             (unsigned long long)real->vmcb->control.eventinj);
+        }
     }
     hype_fpu_save(&real->fpu);
     if (real->tsc_aux_valid) {

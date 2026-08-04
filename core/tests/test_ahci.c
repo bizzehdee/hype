@@ -490,6 +490,45 @@ static void test_signature_fis_carries_the_plain_disk_signature(void) {
     CHECK_HEX("sector count", 0x01u, fis[12]);
 }
 
+static void test_global_is_reflects_the_port_level(void) {
+    /*
+     * #311: IS.IPS is a level reflection of (PxIS & PxIE), not a latch. FreeBSD's ahci_intr()
+     * reads the global IS to decide which port fired and dispatches to nobody if the bit is clear,
+     * so a latch that cannot come back after an RW1C clear silently strands every completion.
+     */
+    hype_ahci_t ahci;
+    uint32_t v = 0;
+
+    hype_ahci_reset(&ahci);
+    CHECK_HEX("no port interrupt at reset", 0u, (hype_ahci_mmio_read(&ahci, HYPE_AHCI_REG_IS, 4u, &v),
+                                                v));
+
+    /* A completion sets PxIS; with PxIE enabling it, the global bit must read set. */
+    ahci.p_is = 0x2u;
+    ahci.p_ie = 0x2u;
+    (void)hype_ahci_mmio_read(&ahci, HYPE_AHCI_REG_IS, 4u, &v);
+    CHECK_HEX("port bit reads set while the port has a pending interrupt", HYPE_AHCI_IS_PORT0,
+              v & HYPE_AHCI_IS_PORT0);
+
+    /* The guest clears IS (RW1C). While the PORT condition persists, the bit must come BACK. */
+    (void)hype_ahci_mmio_write(&ahci, HYPE_AHCI_REG_IS, 4u, 0xFFFFFFFFu);
+    (void)hype_ahci_mmio_read(&ahci, HYPE_AHCI_REG_IS, 4u, &v);
+    CHECK_HEX("and comes back after an RW1C clear, because the port is still asserting",
+              HYPE_AHCI_IS_PORT0, v & HYPE_AHCI_IS_PORT0);
+
+    /* Once the guest acknowledges PxIS the condition is gone and the bit must read clear. */
+    (void)hype_ahci_mmio_write(&ahci, HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS, 4u, 0x2u);
+    (void)hype_ahci_mmio_read(&ahci, HYPE_AHCI_REG_IS, 4u, &v);
+    CHECK_HEX("clear once PxIS is acknowledged", 0u, v & HYPE_AHCI_IS_PORT0);
+
+    /* A bit PxIE does not enable must not raise the global bit -- same gate as the line. */
+    ahci.p_is = 0x8u;
+    ahci.p_ie = 0x2u;
+    (void)hype_ahci_mmio_read(&ahci, HYPE_AHCI_REG_IS, 4u, &v);
+    CHECK_HEX("a PxIE-disabled status bit does not assert IS", 0u, v & HYPE_AHCI_IS_PORT0);
+    CHECK_HEX("and the line agrees", 0, hype_ahci_irq_pending(&ahci));
+}
+
 int main(void) {
     test_reset_state();
     test_read_write_clb_fb();
@@ -514,6 +553,7 @@ int main(void) {
     test_soft_reset_clears_serr();
     test_signature_fis_carries_the_atapi_signature();
     test_signature_fis_carries_the_plain_disk_signature();
+    test_global_is_reflects_the_port_level();
 
     if (failures == 0) {
         printf("all tests passed\n");

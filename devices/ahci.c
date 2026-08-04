@@ -27,7 +27,28 @@ int hype_ahci_mmio_read(const hype_ahci_t *ahci, uint32_t offset, uint8_t size_b
     switch (offset) {
         case HYPE_AHCI_REG_CAP: *out_value = ahci->cap; return 0;
         case HYPE_AHCI_REG_GHC: *out_value = ahci->ghc; return 0;
-        case HYPE_AHCI_REG_IS: *out_value = ahci->is; return 0;
+        case HYPE_AHCI_REG_IS:
+            /*
+             * #311: IS.IPS is a LEVEL reflection of the port's pending interrupt (AHCI 1.3.1
+             * SS3.1.4), not a one-shot latch. hype set the bit only at completion time, so once the
+             * guest cleared IS (it is RW1C, and FreeBSD's ahci_start() clears it during every
+             * channel reset) the bit never came back even while PxIS & PxIE stayed set.
+             *
+             * That is fatal to FreeBSD specifically: ahci_intr() reads the GLOBAL IS to decide
+             * which port fired, and dispatches to the channel handler only for ports whose bit is
+             * set. With IS reading 0 it dispatched to nobody -- so the interrupt was delivered and
+             * taken, the stub ran, no stray was reported, and ahci_ch_intr() never acknowledged
+             * PxIS. The command then timed out, the channel was reset, and the whole thing repeated
+             * about fifty times a second.
+             *
+             * Derived from the same predicate hype_ahci_irq_pending() already uses for the line, so
+             * the register the guest reads and the line hype raises can no longer disagree.
+             */
+            *out_value = ahci->is;
+            if ((ahci->p_is & ahci->p_ie) != 0) {
+                *out_value |= HYPE_AHCI_IS_PORT0;
+            }
+            return 0;
         case HYPE_AHCI_REG_PI: *out_value = ahci->pi; return 0;
         case HYPE_AHCI_REG_VS: *out_value = ahci->vs; return 0;
         case HYPE_AHCI_REG_CCC_CTL: *out_value = ahci->ccc_ctl; return 0;
