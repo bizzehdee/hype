@@ -2055,7 +2055,8 @@ static void vmm_set_gdt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t bas
 static void vmm_set_idt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
 static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t cs,
                                     uint16_t ss);
-static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector);
+static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                  hype_guest_lapic_t *lapic, uint8_t vector);
 static int vmm_reason_is_intr_window(hype_vmm_kind_t kind, uint64_t reason);
 static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx);
 
@@ -3301,7 +3302,17 @@ static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, 
     }
     hype_svm_vcpu_set_cs_ss_selectors(ctx, cs, ss);
 }
-static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector) {
+/*
+ * #311: `lapic` may be 0 for the M2/VMX microtests, which run a bare guest with no LAPIC model
+ * at all. Every live-guest caller must pass one -- a guest that reads the ISR to find out what
+ * it is servicing (FreeBSD does; see devices/guest_lapic.h) sees nothing otherwise, and
+ * silently discards the interrupt.
+ */
+static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                  hype_guest_lapic_t *lapic, uint8_t vector) {
+    if (lapic != 0) {
+        hype_guest_lapic_accept_vector(lapic, vector);
+    }
     if (kind == HYPE_VMM_KIND_VMX) {
         hype_vmx_vcpu_request_interrupt(ctx, vector);
     } else {
@@ -3994,7 +4005,7 @@ static void run_int_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     vmm_set_gdt(kind, ctx, gdt_phys, (uint16_t)(sizeof(g_int_gdt) - 1));
     vmm_set_idt(kind, ctx, idt_phys, (uint16_t)(sizeof(g_int_idt) - 1));
     vmm_set_cs_ss_selectors(kind, ctx, 0x08u, 0x10u); /* g_int_gdt's own code/data selectors */
-    vmm_request_interrupt(kind, ctx, HYPE_INT_TEST_VECTOR);
+    vmm_request_interrupt(kind, ctx, 0, HYPE_INT_TEST_VECTOR);
 
     for (;;) {
         if (ops->vcpu_run(ctx, &info) != 0) {
@@ -8180,7 +8191,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             if (usb_mouse_drain(&g_fw_1_mouse)) {
                 uint8_t miov;
                 if (hype_ioapic_raise(&g_fw_1_ioapic, 12u, &miov)) {
-                    vmm_request_interrupt(kind, ctx, miov);
+                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, miov);
                 } else {
                     hype_pic_emu_raise_global_irq(&g_fw_1_pic, 12u);
                 }
@@ -9288,14 +9299,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     {
                         uint8_t iov;
                         if (hype_ioapic_raise(&g_fw_1_ioapic, 2u, &iov)) {
-                            vmm_request_interrupt(kind, ctx, iov);
+                            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
                         }
                     }
                 }
             }
         }
         if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
-            vmm_request_interrupt(kind, ctx, timer_vector);
+            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, timer_vector);
             timer_irqs++;
         }
         /* GLADDER-6c: deliver guest self-IPIs (ICR fixed-delivery writes aimed
@@ -9307,7 +9318,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         {
             uint8_t sipi_vector;
             while (hype_guest_lapic_take_self_ipi(&g_fw_1_lapic, &sipi_vector)) {
-                vmm_request_interrupt(kind, ctx, sipi_vector);
+                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, sipi_vector);
             }
         }
         /* M4-6d2: raise the AHCI completion IRQ on the line the guest
@@ -9369,7 +9380,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             {
                 uint8_t iov;
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
-                    vmm_request_interrupt(kind, ctx, iov);
+                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
                     ahci_irqs++;
                     hype_ahci_tl("R-raise", (unsigned int)g_fw_1_ahci.p_is);
                     /* #311: raises of THIS line with the PxIS that justified each. Paired with
@@ -9436,7 +9447,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
             if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI, &iov)) {
-                vmm_request_interrupt(kind, ctx, iov);
+                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
             }
         } else if (vblk_mapped) {
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
@@ -9462,7 +9473,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
             if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI, &iov)) {
-                vmm_request_interrupt(kind, ctx, iov);
+                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
             } else {
                 static int ata_undelivered_reported = 0;
                 if (!ata_undelivered_reported) {
@@ -9508,7 +9519,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     uint8_t iov;
                     if (hype_guest_uart_irq_pending(uart) &&
                         hype_ioapic_raise(&g_fw_1_ioapic, (uint32_t)irqn, &iov)) {
-                        vmm_request_interrupt(kind, ctx, iov);
+                        vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
                     }
                 }
             }
@@ -9534,7 +9545,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      "(show-blocked-tasks) via PS/2, one scancode per IRQ1 (GSI1)\n");
                 }
                 if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &iov)) {
-                    vmm_request_interrupt(kind, ctx, iov);
+                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
                 } else if (!sysrq_stall_logged) {
                     hype_debug_print("fw-1 SYSRQ: IO-APIC RTE[1]=0x%llx did not deliver (masked / "
                                      "not Fixed) -- keyboard IRQ1 not wired by the guest in APIC mode\n",
@@ -9576,7 +9587,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
             uint8_t pic_vector;
             if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
-                vmm_request_interrupt(kind, ctx, pic_vector);
+                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, pic_vector);
                 /* Attribute by the master vector base: IRQ0 = PIT
                  * clockevent, anything else = the AHCI line. */
                 if (pic_vector == g_fw_1_pic.master.irq_offset) {
@@ -9711,7 +9722,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint8_t kiov;
             vm->in_sendkey_needs_irq = 0;
             if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &kiov)) {
-                vmm_request_interrupt(kind, ctx, kiov);
+                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, kiov);
             } else {
                 hype_pic_emu_raise_global_irq(&g_fw_1_pic, 1u);
             }
@@ -10755,7 +10766,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
                         uint8_t v;
                         if (hype_pic_emu_acknowledge(&g_fw_1_pic, &v)) {
-                            vmm_request_interrupt(kind, ctx, v);
+                            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, v);
                             if (v == g_fw_1_pic.master.irq_offset) {
                                 pit_irqs++;
                             } else {

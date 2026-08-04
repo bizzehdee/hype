@@ -48,7 +48,15 @@
 #define HYPE_GUEST_LAPIC_MMIO_SIZE 0x1000u
 #define HYPE_GUEST_LAPIC_REG_ID 0x020u
 #define HYPE_GUEST_LAPIC_REG_VERSION 0x030u
+#define HYPE_GUEST_LAPIC_REG_TPR 0x080u
+#define HYPE_GUEST_LAPIC_REG_PPR 0x0A0u
 #define HYPE_GUEST_LAPIC_REG_EOI 0x0B0u
+/*
+ * #311: the In-Service Register, eight dwords at 16-byte spacing covering all 256 vectors
+ * (ISR0 at 0x100 holds vectors 0-31, ISR1 at 0x110 holds 32-63, ... ISR7 at 0x170).
+ */
+#define HYPE_GUEST_LAPIC_REG_ISR_BASE 0x100u
+#define HYPE_GUEST_LAPIC_REG_ISR_LAST 0x170u
 #define HYPE_GUEST_LAPIC_REG_LDR 0x0D0u
 #define HYPE_GUEST_LAPIC_REG_DFR 0x0E0u
 #define HYPE_GUEST_LAPIC_REG_SVR 0x0F0u
@@ -93,6 +101,29 @@
 #define HYPE_GUEST_LAPIC_TICK_EXITS 64u
 
 typedef struct {
+    /*
+     * #311: the In-Service Register, as a 256-bit set. This is not decoration -- a guest
+     * reads it to find out WHICH vector it is handling.
+     *
+     * FreeBSD shares one interrupt stub across each block of 32 vectors and recovers the
+     * vector by reading the matching ISR dword and taking the index of its highest set bit:
+     *
+     *     mov  0x110(%rdx),%eax   ; ISR1 (vectors 32-63)
+     *     bsr  %eax,%eax
+     *     je   3f                 ; ISR1 == 0 -> skip the handler entirely
+     *     add  $0x20,%eax
+     *     call lapic_handle_intr
+     *  3: jmp  doreti
+     *
+     * While these offsets read as 0, that `je` is always taken and EVERY I/O interrupt is
+     * discarded by the guest before its handler runs -- interrupts hype delivered correctly.
+     * FreeBSD's LAPIC timer survived it only because Xtimerint is a dedicated stub that calls
+     * lapic_handle_timer without consulting the ISR, which is why this presented as a working
+     * hypervisor with one broken AHCI device. Linux never noticed because it uses one IDT
+     * entry per vector, so the vector is implicit in the entry point.
+     */
+    uint32_t isr[8];
+    uint32_t tpr; /* Task Priority Register (0x080); PPR (0x0A0) is derived from it and isr */
     uint32_t svr;
     uint32_t lvt_timer;
     uint32_t lvt_lint0;
@@ -187,5 +218,39 @@ int hype_guest_lapic_take_timer_irq(hype_guest_lapic_t *lapic, uint8_t *vector_o
  * duplicates, matching real fixed-IPI semantics.
  */
 int hype_guest_lapic_take_self_ipi(hype_guest_lapic_t *lapic, uint8_t *vector_out);
+
+/*
+ * #311: record that `vector` has been committed to the guest, by setting its ISR bit.
+ *
+ * Call this wherever hype hands a vector to the guest, so that a guest which reads the ISR
+ * to identify what it is servicing gets the truth. The matching clear happens on the guest's
+ * EOI write, which clears the HIGHEST set ISR bit -- so nested delivery behaves as a stack,
+ * the way real hardware and a guest's LIFO EOI order both expect.
+ *
+ * "Committed" rather than "delivered" is deliberate and is the honest limit of this model:
+ * hype does not queue interrupts at the LAPIC (a vector that cannot be injected immediately
+ * is queued in the VMCB/VMCS layer's pending set, not here), so this is the last moment the
+ * LAPIC model is told anything. The bit can therefore be set marginally before the guest
+ * actually takes the interrupt. That does not affect the readers this exists for: a guest
+ * reads the ISR from *inside* its handler, which is strictly after delivery.
+ *
+ * For the same reason the IRR (0x200-0x270) is deliberately NOT modelled: there is no point
+ * in this design where a vector is known to be requested-but-not-delivered, so any value put
+ * there would be invented. Those offsets keep reading 0.
+ */
+void hype_guest_lapic_accept_vector(hype_guest_lapic_t *lapic, uint8_t vector);
+
+/*
+ * The highest vector currently marked in service, or -1 if none. This is the SDM's ISRV, and
+ * it is what a guest's `bsr` over an ISR dword is computing.
+ */
+int hype_guest_lapic_isr_highest(const hype_guest_lapic_t *lapic);
+
+/*
+ * The Processor Priority Register value (MMIO 0x0A0), derived per Intel SDM Vol 3 "Task and
+ * Processor Priorities": the priority class is the greater of TPR's and that of the highest
+ * in-service vector, and the sub-class is TPR's only when TPR's class wins outright.
+ */
+uint32_t hype_guest_lapic_ppr(const hype_guest_lapic_t *lapic);
 
 #endif /* HYPE_DEVICES_GUEST_LAPIC_H */

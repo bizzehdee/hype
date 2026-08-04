@@ -474,7 +474,196 @@ static void test_icr_readback_and_reset(void) {
               (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4, &v), v));
 }
 
+/* #311 --------------------------------------------------------------------------------- */
+
+static void test_isr_reads_zero_until_a_vector_is_accepted(void) {
+    /*
+     * The bug this block exists for: while ISR1 read 0, FreeBSD's shared Xapic_isr1 stub took
+     * its `bsr`/`jz` and jumped to doreti, discarding every I/O interrupt hype delivered. The
+     * whole ISR block must read 0 at reset and the accepted vector's bit must appear in the
+     * RIGHT dword -- vector 0x30 is bit 16 of ISR1 at offset 0x110, not of ISR0.
+     */
+    hype_guest_lapic_t l;
+    uint32_t v = 0xDEADBEEFu;
+    uint32_t off;
+
+    hype_guest_lapic_reset(&l);
+    for (off = HYPE_GUEST_LAPIC_REG_ISR_BASE; off <= HYPE_GUEST_LAPIC_REG_ISR_LAST; off += 0x10u) {
+        CHECK_HEX("ISR dword reads 0 at reset", 0, (hype_guest_lapic_read(&l, off, 4, &v), v));
+    }
+    CHECK_HEX("nothing in service at reset", -1, hype_guest_lapic_isr_highest(&l));
+
+    hype_guest_lapic_accept_vector(&l, 0x30u);
+    CHECK_HEX("ISR0 still clear", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ISR_BASE, 4, &v), v));
+    CHECK_HEX("vector 0x30 is bit 16 of ISR1", 1u << 16,
+              (hype_guest_lapic_read(&l, 0x110u, 4, &v), v));
+    CHECK_HEX("highest in service", 0x30, hype_guest_lapic_isr_highest(&l));
+}
+
+static void test_isr_bit_lands_in_the_right_dword_across_the_whole_range(void) {
+    /*
+     * A guest stub reads exactly one ISR dword, so a vector placed one dword out is invisible
+     * to it. Walk one vector per dword, including the top block (0xEF, FreeBSD's LAPIC timer,
+     * lives in ISR7) and vector 0.
+     */
+    unsigned int word;
+
+    for (word = 0; word < 8u; word++) {
+        hype_guest_lapic_t l;
+        uint8_t vector = (uint8_t)(word * 32u + 5u);
+        uint32_t v = 0;
+        unsigned int other;
+
+        hype_guest_lapic_reset(&l);
+        hype_guest_lapic_accept_vector(&l, vector);
+        CHECK_HEX("bit 5 set in the vector's own dword", 1u << 5,
+                  (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ISR_BASE + word * 0x10u, 4, &v),
+                   v));
+        for (other = 0; other < 8u; other++) {
+            if (other == word) {
+                continue;
+            }
+            CHECK_HEX("no other dword disturbed", 0,
+                      (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ISR_BASE + other * 0x10u, 4,
+                                             &v),
+                       v));
+        }
+    }
+}
+
+static void test_eoi_retires_the_highest_in_service_vector(void) {
+    /*
+     * Nested delivery must unwind as a stack: the guest EOIs in reverse delivery order, so
+     * each EOI has to retire the highest-priority in-service vector, not the oldest and not
+     * all of them. Clearing all of them would strand a lower-priority handler's source; not
+     * clearing at all would leave the stub re-dispatching a vector for ever.
+     */
+    hype_guest_lapic_t l;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_accept_vector(&l, 0x30u);
+    hype_guest_lapic_accept_vector(&l, 0xEFu);
+    CHECK_HEX("timer outranks the device vector", 0xEF, hype_guest_lapic_isr_highest(&l));
+
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+    CHECK_HEX("EOI retires the timer, leaving the device vector", 0x30,
+              hype_guest_lapic_isr_highest(&l));
+
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+    CHECK_HEX("second EOI retires the device vector", -1, hype_guest_lapic_isr_highest(&l));
+
+    /* An EOI with nothing in service must be harmless, not corrupt the set. */
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+    CHECK_HEX("EOI with an empty ISR stays empty", -1, hype_guest_lapic_isr_highest(&l));
+}
+
+static void test_accepting_the_same_vector_twice_coalesces(void) {
+    /* A level line re-raised before its EOI must not need two EOIs to retire. */
+    hype_guest_lapic_t l;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_accept_vector(&l, 0x30u);
+    hype_guest_lapic_accept_vector(&l, 0x30u);
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+    CHECK_HEX("one EOI retires a coalesced vector", -1, hype_guest_lapic_isr_highest(&l));
+}
+
+static void test_eoi_still_clears_the_timer_in_service_flag(void) {
+    /*
+     * The ISR is additional to, not a replacement for, the existing timer gate -- dropping
+     * that would stop the next timer expiry being delivered.
+     */
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+
+    hype_guest_lapic_reset(&l);
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4,
+                                 HYPE_GUEST_LAPIC_LVT_PERIODIC | 0xEFu);
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_DIVIDE_CONFIG, 4, 0xBu); /* /1 */
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT, 4, 100);
+    hype_guest_lapic_advance(&l, 100);
+    CHECK_HEX("timer IRQ taken", 1, hype_guest_lapic_take_timer_irq(&l, &vec));
+    CHECK_HEX("timer in service", 1, l.timer_in_service);
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_EOI, 4, 0);
+    CHECK_HEX("EOI clears the timer gate", 0, l.timer_in_service);
+}
+
+static void test_isr_range_ignores_unaligned_offsets(void) {
+    /*
+     * xAPIC registers sit at 16-byte spacing; an offset inside the ISR range that is not
+     * 16-byte aligned is not a register. It must read as a benign 0 rather than aliasing onto
+     * a neighbouring dword, which would hand a guest a vector nothing is servicing.
+     */
+    hype_guest_lapic_t l;
+    uint32_t v = 0xDEADBEEFu;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_accept_vector(&l, 0x30u);
+    CHECK_HEX("unaligned offset inside the ISR range reads 0", 0,
+              (hype_guest_lapic_read(&l, 0x114u, 4, &v), v));
+    CHECK_HEX("offset just past the ISR range reads 0", 0,
+              (hype_guest_lapic_read(&l, 0x180u, 4, &v), v));
+}
+
+static void test_isr_is_read_only_and_reset_clears_it(void) {
+    hype_guest_lapic_t l;
+    uint32_t v = 0;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_accept_vector(&l, 0x30u);
+    (void)hype_guest_lapic_write(&l, 0x110u, 4, 0);
+    CHECK_HEX("a write cannot clear an in-service vector", 1u << 16,
+              (hype_guest_lapic_read(&l, 0x110u, 4, &v), v));
+    hype_guest_lapic_reset(&l);
+    CHECK_HEX("reset clears the ISR", -1, hype_guest_lapic_isr_highest(&l));
+}
+
+static void test_tpr_roundtrips_and_ppr_is_derived(void) {
+    /*
+     * Intel SDM Vol 3, "Task and Processor Priorities": PPR's class is the greater of TPR's
+     * and the highest in-service vector's, and TPR's sub-class survives only when TPR's class
+     * wins outright. FreeBSD writes TPR(0) at lapic_init, so a wrong readback here is visible
+     * on the boot path.
+     */
+    hype_guest_lapic_t l;
+    uint32_t v = 0;
+
+    hype_guest_lapic_reset(&l);
+    CHECK_HEX("TPR reads 0 at reset", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_TPR, 4, &v), v));
+    CHECK_HEX("PPR is 0 with nothing in service", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_PPR, 4, &v), v));
+
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TPR, 4, 0x42u);
+    CHECK_HEX("TPR roundtrips", 0x42u,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_TPR, 4, &v), v));
+    CHECK_HEX("TPR class wins, sub-class survives", 0x42u, hype_guest_lapic_ppr(&l));
+
+    /* An in-service vector of a HIGHER class takes the class and zeroes the sub-class. */
+    hype_guest_lapic_accept_vector(&l, 0xEFu);
+    CHECK_HEX("in-service class wins, sub-class zeroed", 0xE0u, hype_guest_lapic_ppr(&l));
+
+    /* Equal classes: TPR does not lose, so its sub-class is kept. */
+    hype_guest_lapic_reset(&l);
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_TPR, 4, 0x3Au);
+    hype_guest_lapic_accept_vector(&l, 0x30u);
+    CHECK_HEX("equal classes keep TPR's sub-class", 0x3Au, hype_guest_lapic_ppr(&l));
+
+    /* PPR is read-only. */
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_PPR, 4, 0xFFu);
+    CHECK_HEX("PPR ignores writes", 0x3Au, hype_guest_lapic_ppr(&l));
+}
+
 int main(void) {
+    test_isr_reads_zero_until_a_vector_is_accepted();
+    test_isr_bit_lands_in_the_right_dword_across_the_whole_range();
+    test_eoi_retires_the_highest_in_service_vector();
+    test_accepting_the_same_vector_twice_coalesces();
+    test_eoi_still_clears_the_timer_in_service_flag();
+    test_isr_range_ignores_unaligned_offsets();
+    test_isr_is_read_only_and_reset_clears_it();
+    test_tpr_roundtrips_and_ppr_is_derived();
     test_divisor_decode();
     test_advance_honours_divide();
     test_reset_defaults();

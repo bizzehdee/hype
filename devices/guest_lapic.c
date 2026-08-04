@@ -12,7 +12,9 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->icr_high = 0;
     for (i = 0; i < 8u; i++) {
         lapic->self_ipi_pending[i] = 0;
+        lapic->isr[i] = 0;
     }
+    lapic->tpr = 0;
     lapic->self_ipi_count = 0;
     lapic->divide_config = 0;
     lapic->init_count = 0;
@@ -25,6 +27,53 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->eoi_count = 0;
 }
 
+void hype_guest_lapic_accept_vector(hype_guest_lapic_t *lapic, uint8_t vector) {
+    lapic->isr[vector >> 5] |= 1u << (vector & 31u);
+}
+
+int hype_guest_lapic_isr_highest(const hype_guest_lapic_t *lapic) {
+    unsigned int word = 8u;
+
+    /* Scan from the top: the highest set bit anywhere is the highest-priority vector. */
+    while (word-- > 0u) {
+        uint32_t bits = lapic->isr[word];
+        unsigned int bit = 32u;
+        if (bits == 0u) {
+            continue;
+        }
+        while (bit-- > 0u) {
+            if ((bits & (1u << bit)) != 0u) {
+                return (int)(word * 32u + bit);
+            }
+        }
+    }
+    return -1;
+}
+
+/* Clears the highest set ISR bit -- the vector the guest is EOIing. No-op when none is set. */
+static void hype_guest_lapic_clear_highest_isr(hype_guest_lapic_t *lapic) {
+    int v = hype_guest_lapic_isr_highest(lapic);
+    if (v >= 0) {
+        lapic->isr[(unsigned int)v >> 5] &= ~(1u << ((unsigned int)v & 31u));
+    }
+}
+
+uint32_t hype_guest_lapic_ppr(const hype_guest_lapic_t *lapic) {
+    int isrv = hype_guest_lapic_isr_highest(lapic);
+    uint32_t tpr_class = lapic->tpr & 0xF0u;
+    uint32_t isrv_class = (isrv < 0) ? 0u : ((uint32_t)isrv & 0xF0u);
+
+    /*
+     * Intel SDM Vol 3, "Task and Processor Priorities": the sub-class bits survive only when
+     * TPR's priority class strictly dominates the in-service one -- otherwise the in-service
+     * vector sets the class and the sub-class reads 0.
+     */
+    if (tpr_class >= isrv_class) {
+        return lapic->tpr & 0xFFu;
+    }
+    return isrv_class;
+}
+
 uint32_t hype_guest_lapic_divisor(uint32_t divide_config) {
     /* Divisor encoded in bits [3,1,0] (bit 2 reserved). */
     uint32_t d = ((divide_config & 0x8u) >> 1) | (divide_config & 0x3u);
@@ -35,9 +84,26 @@ int hype_guest_lapic_read(hype_guest_lapic_t *lapic, uint32_t offset, unsigned i
     if (size != 4u) {
         return -1;
     }
+    /*
+     * #311: the ISR block is a range of eight dwords at 16-byte spacing, so it cannot be a
+     * switch label. An offset inside the range that is not 16-byte aligned is not a register
+     * at all and falls through to the benign 0 below, same as any other unmodelled offset.
+     */
+    if (offset >= HYPE_GUEST_LAPIC_REG_ISR_BASE && offset <= HYPE_GUEST_LAPIC_REG_ISR_LAST &&
+        (offset & 0xFu) == 0u) {
+        *out = lapic->isr[(offset - HYPE_GUEST_LAPIC_REG_ISR_BASE) >> 4];
+        return 0;
+    }
+
     switch (offset) {
         case HYPE_GUEST_LAPIC_REG_ID:
             *out = 0; /* single vCPU -> APIC ID 0 */
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_TPR:
+            *out = lapic->tpr;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_PPR:
+            *out = hype_guest_lapic_ppr(lapic);
             return 0;
         case HYPE_GUEST_LAPIC_REG_VERSION:
             *out = HYPE_GUEST_LAPIC_VERSION_VALUE;
@@ -169,10 +235,17 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
              * counter so the FW-1 loop can drop a level line's IO-APIC
              * Remote-IRR (real hardware broadcasts this EOI to the IO-APIC). */
             lapic->timer_in_service = 0;
+            /* #311: and retire the highest-priority in-service vector, so nested delivery
+             * unwinds as a stack in the same LIFO order the guest EOIs in. */
+            hype_guest_lapic_clear_highest_isr(lapic);
             lapic->eoi_count++;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_TPR:
+            lapic->tpr = value & 0xFFu;
             return 0;
         case HYPE_GUEST_LAPIC_REG_ID:
         case HYPE_GUEST_LAPIC_REG_VERSION:
+        case HYPE_GUEST_LAPIC_REG_PPR:
             /* Read-only -- ignore writes. */
             return 0;
         default:
