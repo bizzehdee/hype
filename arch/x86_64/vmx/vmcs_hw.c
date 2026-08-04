@@ -1720,6 +1720,14 @@ static uint64_t *vmx_gpr_ptr(struct hype_vcpu_ctx *real, uint8_t reg) {
     return &real->gprs[reg];
 }
 
+/* #308: shared MMIO value/flags helpers, defined further down with the vmx_mmio_access struct.
+ * Declared here because the four handlers that predate that struct and resolve their own GPR sit
+ * above it and must use the same logic -- see their definitions for what they do. */
+static uint32_t vmx_mmio_store_val_at(const hype_mmio_decode_t *d, uint64_t *reg, uint32_t cur,
+                                      uint64_t *rflags);
+static void vmx_mmio_finish_read_at(const hype_mmio_decode_t *d, uint64_t *reg, uint32_t value,
+                                    uint64_t *rflags);
+
 /*
  * VMX MMIO handler for the emulated pflash (VMX-2): mirror of
  * hype_svm_vcpu_handle_npf, driven by an EPT violation (reason 48) instead of
@@ -1736,6 +1744,7 @@ int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_mmio_decode_t decoded;
     uint64_t *reg;
+    uint64_t rflags; /* #308 */
     int ok;
     uint64_t gpa = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
     uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
@@ -1757,13 +1766,22 @@ int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
         return -1;
     }
 
-    reg = vmx_gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store has no source register -- the ModRM reg field is an opcode
+     * extension -- so the GPR lookup is skipped rather than resolving register 0. */
+    reg = decoded.has_imm ? 0 : vmx_gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
+    rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok); /* #308 */
 
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t cur = 0;
+        uint32_t value;
+        /* #307: an RMW combines with the register's current value, so read it back first. */
+        if (decoded.mem_is_dst && hype_pflash_read(pf, offset, decoded.size_bytes, &cur) != 0) {
+            return -1;
+        }
+        value = vmx_mmio_store_val_at(&decoded, reg, cur, &rflags);
         if (hype_pflash_write(pf, offset, decoded.size_bytes, value) != 0) {
             return -1;
         }
@@ -1772,8 +1790,9 @@ int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
         if (hype_pflash_read(pf, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        vmx_mmio_finish_read_at(&decoded, reg, value, &rflags);
     }
+    vmwrite(HYPE_VMCS_GUEST_RFLAGS, rflags); /* #308 */
 
     vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
     return 0;
@@ -1792,6 +1811,7 @@ int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
     hype_mmio_decode_t decoded;
     hype_pci_ecam_addr_t addr;
     uint64_t *reg;
+    uint64_t rflags; /* #308 */
     int ok;
     uint64_t gpa = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
     uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
@@ -1808,20 +1828,30 @@ int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
     if (decoded.is_write != is_write) {
         return -1;
     }
-    reg = vmx_gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store has no source register -- the ModRM reg field is an opcode
+     * extension -- so the GPR lookup is skipped rather than resolving register 0. */
+    reg = decoded.has_imm ? 0 : vmx_gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
+    rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok); /* #308 */
 
     hype_pci_decode_ecam_offset(gpa - ecam_base_phys, &addr);
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t cur = 0;
+        uint32_t value;
+        /* #307: an RMW combines with the register's current value, so read it back first. */
+        if (decoded.mem_is_dst) {
+            hype_pci_config_read(pci, &addr, decoded.size_bytes, &cur);
+        }
+        value = vmx_mmio_store_val_at(&decoded, reg, cur, &rflags);
         hype_pci_config_write(pci, &addr, decoded.size_bytes, value);
     } else {
         uint32_t value = 0;
         hype_pci_config_read(pci, &addr, decoded.size_bytes, &value);
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        vmx_mmio_finish_read_at(&decoded, reg, value, &rflags);
     }
+    vmwrite(HYPE_VMCS_GUEST_RFLAGS, rflags); /* #308 */
 
     vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
     return 0;
@@ -1839,6 +1869,7 @@ int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_mmio_decode_t decoded;
     uint64_t *reg;
+    uint64_t rflags; /* #308 */
     int ok;
     uint64_t gpa = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
     uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
@@ -1857,13 +1888,23 @@ int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
     if (decoded.is_write != is_write) {
         return -1;
     }
-    reg = vmx_gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store has no source register -- the ModRM reg field is an opcode
+     * extension -- so the GPR lookup is skipped rather than resolving register 0. */
+    reg = decoded.has_imm ? 0 : vmx_gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
+    rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok); /* #308 */
 
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t cur = 0;
+        uint32_t value;
+        /* #307: an RMW combines with the register's current value, so read it back first. */
+        if (decoded.mem_is_dst &&
+            hype_ahci_mmio_read(ahci, offset, (uint8_t)decoded.size_bytes, &cur) != 0) {
+            return -1;
+        }
+        value = vmx_mmio_store_val_at(&decoded, reg, cur, &rflags);
         if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
             return -1;
         }
@@ -1882,8 +1923,9 @@ int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
         if (hype_ahci_mmio_read(ahci, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        vmx_mmio_finish_read_at(&decoded, reg, value, &rflags);
     }
+    vmwrite(HYPE_VMCS_GUEST_RFLAGS, rflags); /* #308 */
 
     vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
     return 0;
@@ -2093,6 +2135,15 @@ struct vmx_mmio_access {
     uint64_t *reg;
     hype_mmio_decode_t decoded;
     uint64_t rip;
+    /*
+     * #308: guest RFLAGS, for the ALU forms #305/#307 added. Unlike SVM -- where the flags live in
+     * vmcb->save.rflags and can be handed to the decoder helpers as a plain pointer -- VMX keeps
+     * them ONLY in a VMCS field, so they are read into here on entry and written back by
+     * vmx_mmio_end(). The struct is the natural home: every helper-based handler then gets the
+     * write-back for free, and one that forgets it is the kind of silent-stale-flags bug #305
+     * exists to prevent.
+     */
+    uint64_t rflags;
 };
 static int vmx_mmio_begin_insn(struct hype_vcpu_ctx *real, uint64_t base, uint64_t size,
                                const uint8_t *insn, struct vmx_mmio_access *m);
@@ -2111,7 +2162,79 @@ static int vmx_mmio_begin(struct hype_vcpu_ctx *real, uint64_t base, uint64_t si
     return vmx_mmio_begin_insn(real, base, size, (const uint8_t *)(uintptr_t)rip, m);
 }
 static void vmx_mmio_end(struct vmx_mmio_access *m) {
+    /* #308: the ALU/RMW helpers mutate m->rflags in place; VMX keeps guest RFLAGS only in the
+     * VMCS, so the write-back has to happen here or every flag update is silently discarded. */
+    vmwrite(HYPE_VMCS_GUEST_RFLAGS, m->rflags);
     vmwrite(HYPE_VMCS_GUEST_RIP, m->rip + m->decoded.instr_len);
+}
+
+/*
+ * #308: the value to write to a device register for this access.
+ *
+ * `cur` is the register's CURRENT value, which the caller must have just read from the device --
+ * needed only for the read-modify-write forms (#307), where the instruction combines with what is
+ * already there. For a plain store it is ignored, so a caller that cannot cheaply read the device
+ * back may pass 0 *provided* it has checked !decoded.mem_is_dst.
+ *
+ * Also handles #306's immediate stores: m->reg is 0 for those, and the value comes from the
+ * instruction, so this must never be bypassed with a bare *m->reg.
+ */
+/*
+ * #308: the value to write to a device register for this access.
+ *
+ * `cur` is the register's CURRENT value, which the caller must have just read from the device --
+ * needed only for the read-modify-write forms (#307), where the instruction combines with what is
+ * already there. For a plain store it is ignored, so a caller may pass 0 provided it has checked
+ * !d->mem_is_dst.
+ *
+ * Also handles #306's immediate stores: `reg` is 0 for those and the value comes from the
+ * instruction, so this must never be bypassed with a bare *reg.
+ *
+ * Takes the decode/reg/rflags separately rather than a vmx_mmio_access, so the four handlers that
+ * predate that struct and resolve their own GPR can share this instead of each growing a copy --
+ * three divergent copies of ALU emulation is how #308 came about on this backend in the first
+ * place.
+ */
+static uint32_t vmx_mmio_store_val_at(const hype_mmio_decode_t *d, uint64_t *reg, uint32_t cur,
+                                      uint64_t *rflags) {
+    if (d->mem_is_dst) {
+        return hype_mmio_rmw_value(d, reg ? *reg : 0u, cur, rflags);
+    }
+    return hype_mmio_store_value(d, reg ? *reg : 0u);
+}
+
+/*
+ * #308: complete a device read into the destination register.
+ *
+ * A plain MOV merges per width/zero-extension. An ALU form with the device register as its memory
+ * SOURCE (#305) instead combines it with the register and sets flags -- and CMP/TEST write no
+ * register at all, only flags, which is why the write-back is conditional. Leaving RFLAGS stale
+ * here would hand the guest a silently wrong conditional branch, which is worse than the panic
+ * #305 replaced.
+ */
+static void vmx_mmio_finish_read_at(const hype_mmio_decode_t *d, uint64_t *reg, uint32_t value,
+                                    uint64_t *rflags) {
+    if (d->op == HYPE_MMIO_ALU_MOV) {
+        *reg = hype_mmio_merge_read_value(*reg, value, d->size_bytes, d->zero_extend);
+        return;
+    }
+    {
+        uint32_t result = hype_mmio_alu_apply(d->op,
+                                             hype_mmio_extract_write_value(*reg, d->size_bytes),
+                                             value, d->size_bytes, rflags);
+        if (hype_mmio_alu_writes_reg(d->op)) {
+            /* A 32-bit result zero-extends the whole 64-bit register, as a native ALU op would. */
+            *reg = (d->size_bytes == 4u) ? (uint64_t)result
+                                         : hype_mmio_merge_read_value(*reg, result, d->size_bytes, 0);
+        }
+    }
+}
+
+static uint32_t vmx_mmio_store_val(struct vmx_mmio_access *m, uint32_t cur) {
+    return vmx_mmio_store_val_at(&m->decoded, m->reg, cur, &m->rflags);
+}
+static void vmx_mmio_finish_read(struct vmx_mmio_access *m, uint32_t value) {
+    vmx_mmio_finish_read_at(&m->decoded, m->reg, value, &m->rflags);
 }
 
 /* VMX MMIO handler for a SATA disk behind AHCI (VMX-2): mirror of
@@ -2125,7 +2248,15 @@ int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
         return -1;
     }
     if (m.decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        uint32_t cur = 0;
+        /* #307: a read-modify-write of this device register needs its CURRENT value, so the
+         * instruction can combine with what is already there rather than storing the other
+         * operand alone. Only read it back when the form actually needs it. */
+        if (m.decoded.mem_is_dst &&
+            hype_ahci_mmio_read(ahci, m.offset, (uint8_t)m.decoded.size_bytes, &cur) != 0) {
+            return -1;
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
         if (hype_ahci_mmio_write(ahci, m.offset, m.decoded.size_bytes, value) != 0) {
             return -1;
         }
@@ -2147,7 +2278,7 @@ int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
         if (hype_ahci_mmio_read(ahci, m.offset, m.decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        vmx_mmio_finish_read(&m, value);
     }
     vmx_mmio_end(&m);
     return 0;
@@ -2171,7 +2302,15 @@ int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ah
         return -1;
     }
     if (m.decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        uint32_t cur = 0;
+        /* #307: a read-modify-write of this device register needs its CURRENT value, so the
+         * instruction can combine with what is already there rather than storing the other
+         * operand alone. Only read it back when the form actually needs it. */
+        if (m.decoded.mem_is_dst &&
+            hype_ahci_mmio_read(ahci, m.offset, (uint8_t)m.decoded.size_bytes, &cur) != 0) {
+            return -1;
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
         if (hype_ahci_mmio_write(ahci, m.offset, m.decoded.size_bytes, value) != 0) {
             return -1;
         }
@@ -2190,8 +2329,7 @@ int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ah
         if (hype_ahci_mmio_read(ahci, m.offset, m.decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        *m.reg =
-            hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        vmx_mmio_finish_read(&m, value);
     }
     vmx_mmio_end(&m);
     return 0;
@@ -2212,13 +2350,23 @@ int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
     if (m.offset < HYPE_BOCHS_VBE_DISPI_OFFSET ||
         m.offset >= HYPE_BOCHS_VBE_DISPI_OFFSET + HYPE_BOCHS_VBE_DISPI_SIZE) {
         if (!m.decoded.is_write) {
-            *m.reg = hype_mmio_merge_read_value(*m.reg, 0, m.decoded.size_bytes, m.decoded.zero_extend);
+            vmx_mmio_finish_read(&m, 0);
         }
         vmx_mmio_end(&m);
         return 0;
     }
     if (m.decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        uint32_t cur = 0;
+        /* #307: RMW needs the current value. This device's registers are 16-bit, so the
+         * read-back goes through a uint16_t and widens -- the decoder works in 32. */
+        if (m.decoded.mem_is_dst) {
+            uint16_t cur16 = 0;
+            if (hype_bochs_vbe_mmio_read(dev, m.offset - HYPE_BOCHS_VBE_DISPI_OFFSET, &cur16) != 0) {
+                return -1;
+            }
+            cur = (uint32_t)cur16;
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
         if (hype_bochs_vbe_mmio_write(dev, m.offset - HYPE_BOCHS_VBE_DISPI_OFFSET, (uint16_t)value) !=
             0) {
             return -1;
@@ -2228,7 +2376,7 @@ int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
         if (hype_bochs_vbe_mmio_read(dev, m.offset - HYPE_BOCHS_VBE_DISPI_OFFSET, &value) != 0) {
             return -1;
         }
-        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        vmx_mmio_finish_read(&m, value);
     }
     vmx_mmio_end(&m);
     return 0;
@@ -2258,7 +2406,13 @@ static int vmx_virtio_blk_npf_common(struct hype_vcpu_ctx *real, hype_virtio_blk
         off < HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET + HYPE_VIRTIO_COMMON_CFG_SIZE) {
         uint32_t ro = off - HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET;
         if (m.decoded.is_write) {
-            uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+            uint32_t cur = 0;
+            /* #307: RMW needs the register's current value -- see the AHCI handler. */
+            if (m.decoded.mem_is_dst &&
+                hype_virtio_blk_common_cfg_read(dev, ro, m.decoded.size_bytes, &cur) != 0) {
+                return -1;
+            }
+            uint32_t value = vmx_mmio_store_val(&m, cur);
             if (hype_virtio_blk_common_cfg_write(dev, ro, m.decoded.size_bytes, value) != 0) {
                 return -1;
             }
@@ -2267,8 +2421,7 @@ static int vmx_virtio_blk_npf_common(struct hype_vcpu_ctx *real, hype_virtio_blk
             if (hype_virtio_blk_common_cfg_read(dev, ro, m.decoded.size_bytes, &value) != 0) {
                 return -1;
             }
-            *m.reg =
-                hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+            vmx_mmio_finish_read(&m, value);
         }
     } else if (off >= HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET &&
                off < HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET + 4u) {
@@ -2279,13 +2432,12 @@ static int vmx_virtio_blk_npf_common(struct hype_vcpu_ctx *real, hype_virtio_blk
                 }
             }
         } else {
-            *m.reg = hype_mmio_merge_read_value(*m.reg, 0, m.decoded.size_bytes, m.decoded.zero_extend);
+            vmx_mmio_finish_read(&m, 0);
         }
     } else if (off == HYPE_VIRTIO_BLK_BAR_ISR_CFG_OFFSET) {
         if (!m.decoded.is_write) {
             uint8_t value = hype_virtio_blk_isr_read(dev);
-            *m.reg =
-                hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+            vmx_mmio_finish_read(&m, value);
         }
     } else if (off >= HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET &&
                off < HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET + HYPE_VIRTIO_BLK_CFG_SIZE) {
@@ -2295,12 +2447,11 @@ static int vmx_virtio_blk_npf_common(struct hype_vcpu_ctx *real, hype_virtio_blk
             if (hype_virtio_blk_device_cfg_read(dev, ro, m.decoded.size_bytes, &value) != 0) {
                 return -1;
             }
-            *m.reg =
-                hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+            vmx_mmio_finish_read(&m, value);
         }
     } else {
         if (!m.decoded.is_write) {
-            *m.reg = hype_mmio_merge_read_value(*m.reg, 0, m.decoded.size_bytes, m.decoded.zero_extend);
+            vmx_mmio_finish_read(&m, 0);
         }
     }
 
@@ -2829,8 +2980,17 @@ static int vmx_mmio_begin_insn(struct hype_vcpu_ctx *real, uint64_t base, uint64
     if (m->decoded.is_write != m->is_write) {
         return -1;
     }
-    m->reg = vmx_gpr_ptr(real, m->decoded.reg);
-    return (m->reg == 0) ? -1 : 0;
+    /*
+     * #306: an immediate store carries its value in the instruction and has NO source register --
+     * the ModRM reg field is an opcode extension -- so the GPR lookup is skipped rather than
+     * resolving register 0 and writing RAX to the device.
+     */
+    m->reg = m->decoded.has_imm ? 0 : vmx_gpr_ptr(real, m->decoded.reg);
+    if (m->reg == 0 && !m->decoded.has_imm) {
+        return -1;
+    }
+    m->rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok); /* #308 */
+    return 0;
 }
 
 /* Guest Local APIC MMIO. xAPIC registers are 32-bit only, so a non-4-byte
@@ -2848,7 +3008,15 @@ int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
         return -1;
     }
     if (m.decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        uint32_t cur = 0;
+        /* #307: a read-modify-write of this device register needs its CURRENT value, so the
+         * instruction can combine with what is already there rather than storing the other
+         * operand alone. Only read it back when the form actually needs it. */
+        if (m.decoded.mem_is_dst &&
+            hype_guest_lapic_read(lapic, m.offset, m.decoded.size_bytes, &cur) != 0) {
+            return -1;
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
         if (hype_guest_lapic_write(lapic, m.offset, m.decoded.size_bytes, value) != 0) {
             return -1;
         }
@@ -2857,7 +3025,7 @@ int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
         if (hype_guest_lapic_read(lapic, m.offset, m.decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        vmx_mmio_finish_read(&m, value);
     }
     vmx_mmio_end(&m);
     return 0;
@@ -2877,7 +3045,14 @@ int hype_vmx_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
         return -1;
     }
     if (m.decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        uint32_t cur = 0;
+        /* #307: a read-modify-write of this device register needs its CURRENT value, so the
+         * instruction can combine with what is already there rather than storing the other
+         * operand alone. Only read it back when the form actually needs it. */
+        if (m.decoded.mem_is_dst && hype_ioapic_mmio_read(ioapic, m.offset, &cur) != 0) {
+            return -1;
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
         if (hype_ioapic_mmio_write(ioapic, m.offset, value) != 0) {
             return -1;
         }
@@ -2886,7 +3061,7 @@ int hype_vmx_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
         if (hype_ioapic_mmio_read(ioapic, m.offset, &value) != 0) {
             return -1;
         }
-        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        vmx_mmio_finish_read(&m, value);
     }
     vmx_mmio_end(&m);
     return 0;
@@ -2908,7 +3083,15 @@ int hype_vmx_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, h
         return -1;
     }
     if (m.decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        uint32_t cur = 0;
+        /* #307: a read-modify-write of this device register needs its CURRENT value, so the
+         * instruction can combine with what is already there rather than storing the other
+         * operand alone. Only read it back when the form actually needs it. */
+        if (m.decoded.mem_is_dst &&
+            hype_ahci_mmio_read(ahci, m.offset, (uint8_t)m.decoded.size_bytes, &cur) != 0) {
+            return -1;
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
         if (hype_ahci_mmio_write(ahci, m.offset, m.decoded.size_bytes, value) != 0) {
             return -1;
         }
@@ -2927,7 +3110,7 @@ int hype_vmx_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, h
         if (hype_ahci_mmio_read(ahci, m.offset, m.decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        vmx_mmio_finish_read(&m, value);
     }
     vmx_mmio_end(&m);
     return 0;
@@ -2949,16 +3132,28 @@ int hype_vmx_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_ins
         hype_mmio_decode(guest_insn_bytes, HYPE_VMX_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
         return -1;
     }
-    if (!decoded.is_write) {
-        uint64_t *reg = vmx_gpr_ptr(real, decoded.reg);
-        uint32_t allones;
-        if (reg == 0) {
+    {
+        /* #306: an immediate store has no source register. */
+        uint64_t *reg = decoded.has_imm ? 0 : vmx_gpr_ptr(real, decoded.reg);
+        uint64_t rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok); /* #308 */
+        uint32_t allones = (decoded.size_bytes >= 4u)   ? 0xFFFFFFFFu
+                           : (decoded.size_bytes == 2u) ? 0xFFFFu
+                                                        : 0xFFu;
+        if (reg == 0 && !decoded.has_imm) {
             return -1;
         }
-        allones = (decoded.size_bytes >= 4u)  ? 0xFFFFFFFFu
-                  : (decoded.size_bytes == 2u) ? 0xFFFFu
-                                               : 0xFFu;
-        *reg = hype_mmio_merge_read_value(*reg, allones, decoded.size_bytes, decoded.zero_extend);
+        if (!decoded.is_write) {
+            vmx_mmio_finish_read_at(&decoded, reg, allones, &rflags);
+        } else if (decoded.mem_is_dst) {
+            /*
+             * #307: the write half is dropped like any other, but the FLAGS an RMW sets are still
+             * observable to the guest's next branch, and they are computed against the all-ones an
+             * absent bus returns. Leaving them stale is the silent-wrong-branch failure #305 exists
+             * to avoid.
+             */
+            (void)hype_mmio_rmw_value(&decoded, reg ? *reg : 0u, allones, &rflags);
+        }
+        vmwrite(HYPE_VMCS_GUEST_RFLAGS, rflags); /* #308 */
     }
     /* writes to absent MMIO are dropped */
     vmwrite(HYPE_VMCS_GUEST_RIP, rip + decoded.instr_len);
@@ -3221,12 +3416,19 @@ int hype_vmx_vcpu_handle_pci_ecam_npf_insn(hype_vcpu_ctx_t *ctx, hype_pci_t *pci
     }
     hype_pci_decode_ecam_offset(m.offset, &addr);
     if (m.decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*m.reg, m.decoded.size_bytes);
+        uint32_t cur = 0;
+        /* #307: a read-modify-write of this device register needs its CURRENT value, so the
+         * instruction can combine with what is already there rather than storing the other
+         * operand alone. Only read it back when the form actually needs it. */
+        if (m.decoded.mem_is_dst) {
+            hype_pci_config_read(pci, &addr, m.decoded.size_bytes, &cur);
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
         hype_pci_config_write(pci, &addr, m.decoded.size_bytes, value);
     } else {
         uint32_t value = 0;
         hype_pci_config_read(pci, &addr, m.decoded.size_bytes, &value);
-        *m.reg = hype_mmio_merge_read_value(*m.reg, value, m.decoded.size_bytes, m.decoded.zero_extend);
+        vmx_mmio_finish_read(&m, value);
     }
     vmx_mmio_end(&m);
     return 0;
