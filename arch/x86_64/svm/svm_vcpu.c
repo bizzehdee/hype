@@ -78,6 +78,16 @@ struct hype_vcpu_ctx {
      * last, killing a self-re-arming one-shot clockevent that lost its tick.
      * Queue all requests here; drain highest-first, one per VMRUN. */
     uint32_t pending_irr[8];
+    /* M7-1 (#91): the guest's Hyper-V OS identity and hypercall-page MSR values.
+     * Per-vCPU for the same reason pvclock_map is: two guests run concurrently and
+     * each writes its own. Stored so a read returns what was written; hype services
+     * no hypercalls through the page (#300). */
+    uint64_t hv_guest_os_id;
+    uint64_t hv_hypercall;
+    /* M7-1 (#91): does THIS guest see the Hyper-V hypervisor identity? Per-vCPU, not
+     * file-global: VM0 may be Windows while VM1 is Linux, and the two cores take
+     * CPUID exits concurrently. */
+    int hv_enabled;
 };
 
 /* M8-0b-ii: per-vCPU state pool. Was a single g_vmcb/g_ctx (M2's one-vCPU
@@ -325,6 +335,9 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     ctx->tsc_aux_valid = 0;
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
+    ctx->hv_guest_os_id = 0;
+    ctx->hv_hypercall = 0;
+    ctx->hv_enabled = 0;
     {
         int i;
         for (i = 0; i < 8; i++) {
@@ -683,7 +696,7 @@ void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     hype_cpuid_result_t out;
 
     real_cpuid(eax_in, ecx_in, &host_real);
-    hype_cpuid_emulate(eax_in, ecx_in, &host_real, &out);
+    hype_cpuid_emulate_ex(eax_in, ecx_in, real->hv_enabled, &host_real, &out);
 
     /* CPUID zero-extends all four registers to their full 64-bit width
      * in 64-bit mode -- assigning a uint32_t into a uint64_t field
@@ -1322,6 +1335,13 @@ uint32_t hype_svm_vcpu_tlb_tag(hype_vcpu_ctx_t *ctx) {
     return (uint32_t)(real->vmcb->control.guest_asid_tlb_ctl & 0xFFFFFFFFull);
 }
 
+/* RDMSR result convention on SVM: low half in the VMCB's own RAX, high half in the
+ * shadow RDX. Factored out because the Hyper-V MSRs below all return one value. */
+static void svm_msr_return(struct hype_vcpu_ctx *real, uint64_t value) {
+    real->vmcb->save.rax = (uint64_t)(uint32_t)value;
+    real->gprs[2] = (uint64_t)(uint32_t)(value >> 32);
+}
+
 int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int is_write = (real->vmcb->control.exitinfo1 & 0x1ULL) != 0;
@@ -1448,9 +1468,47 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
         return 0;
     }
 
-    action = hype_msr_decide(msr_number, is_write);
+    action = hype_msr_decide_ex(msr_number, is_write, real->hv_enabled);
 
     switch (action) {
+    /*
+     * M7-1 (#91): Hyper-V synthetic MSRs. Only reachable when the Hyper-V CPUID
+     * leaves are enabled -- hype_msr_decide() gates them on that, so a Linux guest
+     * still gets the fail-closed absorb here.
+     */
+    case HYPE_MSR_ACTION_READWRITE_HV_GUEST_OS_ID:
+    case HYPE_MSR_ACTION_READWRITE_HV_HYPERCALL: {
+        uint64_t *slot = (action == HYPE_MSR_ACTION_READWRITE_HV_GUEST_OS_ID)
+                             ? &real->hv_guest_os_id
+                             : &real->hv_hypercall;
+        if (is_write) {
+            *slot = (((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax);
+        } else {
+            svm_msr_return(real, *slot);
+        }
+        break;
+    }
+    case HYPE_MSR_ACTION_READ_HV_VP_INDEX:
+        /*
+         * Always 0. hype gives each guest exactly one vCPU, so this guest IS
+         * VP 0 -- the pool slot index (1 for VM1) would be a lie: it is hype's
+         * index across partitions, and a one-VP partition reporting VP 1 makes
+         * Windows address a processor that does not exist. When guest SMP lands
+         * this becomes the vCPU-within-VM index.
+         */
+        svm_msr_return(real, 0ULL);
+        break;
+    case HYPE_MSR_ACTION_READ_HV_TIME_REF_COUNT: {
+        /*
+         * 100ns ticks. Measured from the raw host TSC rather than a per-partition
+         * epoch: a guest only ever uses DIFFERENCES of this counter, and using the
+         * raw TSC keeps it monotonic across the guest's own reset without needing a
+         * base to maintain.
+         */
+        svm_msr_return(real, hype_msr_hv_ref_count_from_tsc(real_rdtsc(), g_acpi_pm_tsc_hz / 1000u));
+        break;
+    }
+
     case HYPE_MSR_ACTION_READ_APIC_BASE: {
         uint64_t value = hype_msr_apic_base_value();
         real->vmcb->save.rax = (uint64_t)(uint32_t)value;
@@ -3384,4 +3442,8 @@ int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t p
 uint32_t hype_svm_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     return (uint32_t)real->gprs[1]; /* RCX */
+}
+
+void hype_svm_vcpu_set_hv_enabled(hype_vcpu_ctx_t *ctx, int enabled) {
+    ((struct hype_vcpu_ctx *)ctx)->hv_enabled = enabled ? 1 : 0;
 }

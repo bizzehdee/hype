@@ -36,12 +36,11 @@
 #define HYPE_CPUID_EXT7_EDX_INVARIANT_TSC_BIT (1u << 8)
 #define HYPE_CPUID_LEAF6_EAX_ARAT_BIT (1u << 2)
 
-/* KVM paravirt CPUID (kvmclock). Signature leaf 0x40000000 reports "KVMKVMKVM"
- * (EBX/ECX/EDX) and the max KVM leaf (EAX); the features leaf 0x40000001 EAX
- * carries the KVM_FEATURE_* bits. Kept here (CPUID domain) rather than pulled
+/* KVM paravirt CPUID (kvmclock). The signature leaf (base, see
+ * hype_cpuid_kvm_base()) reports "KVMKVMKVM" (EBX/ECX/EDX) and the max KVM leaf
+ * (EAX); base+1 EAX carries the KVM_FEATURE_* bits. Kept here (CPUID domain) rather than pulled
  * from devices/pvclock.h to avoid an arch->devices header dependency; the two
  * must agree (a mismatch just means the guest doesn't enable kvmclock). */
-#define HYPE_CPUID_KVM_FEATURES_LEAF 0x40000001u
 #define HYPE_CPUID_KVM_SIG_EBX 0x4b4d564bu /* "KVMK" */
 #define HYPE_CPUID_KVM_SIG_ECX 0x564b4d56u /* "VMKV" */
 #define HYPE_CPUID_KVM_SIG_EDX 0x0000004du /* "M\0\0\0" */
@@ -56,8 +55,105 @@ static void zero_result(hype_cpuid_result_t *out) {
     out->edx = 0;
 }
 
+/* --- M7-1 (#91): Hyper-V-compatible hypervisor leaves --- */
+
+/*
+ * Hyper-V leaf constants. Signature bytes are transcribed from the Hypervisor
+ * Top-Level Functional Specification, not reconstructed -- a wrong byte here means
+ * Windows silently declines every enlightenment, with no error to trace.
+ */
+#define HV_SIG_EAX 0x31237648u        /* "Hv#1" -- interface signature (leaf 0x40000001) */
+#define HV_VENDOR_EBX 0x7263694du     /* "Micr" */
+#define HV_VENDOR_ECX 0x666F736Fu     /* "osof" */
+#define HV_VENDOR_EDX 0x76482074u     /* "t Hv" */
+#define HV_MAX_LEAF 0x40000006u
+
+/*
+ * Leaf 0x40000003 EAX -- the partition privilege mask, i.e. which synthetic MSR
+ * groups the guest may touch. Set ONLY the groups hype actually backs in
+ * hype_msr_decide(): advertising a group whose MSRs then #GP is the
+ * advertise-a-feature-that-is-not-there mistake that has already cost this project
+ * guest boots.
+ *
+ * Notably absent: AccessPartitionReferenceTsc (bit 9). It would require hype to
+ * maintain a guest-visible reference-TSC PAGE with a live sequence/scale/offset;
+ * there is none, so the bit stays clear and the guest uses the reference counter
+ * MSR instead.
+ */
+#define HV_PRIV_REF_COUNTER (1u << 1) /* HV_X64_MSR_TIME_REF_COUNT readable */
+#define HV_PRIV_HYPERCALL_MSRS (1u << 5) /* GUEST_OS_ID + HYPERCALL MSRs */
+#define HV_PRIV_VP_INDEX (1u << 6) /* HV_X64_MSR_VP_INDEX readable */
+
+uint32_t hype_cpuid_kvm_base(int hv_enabled) {
+    /* When Hyper-V holds 0x40000000, KVM moves up a block -- the same relocation QEMU
+     * performs when both are present, so a Linux guest still finds kvmclock. */
+    return hv_enabled ? 0x40000100u : 0x40000000u;
+}
+
+int hype_cpuid_hv_leaf(uint32_t leaf, uint32_t vp_index, hype_cpuid_result_t *out) {
+    (void)vp_index; /* no leaf reports it -- VP index is delivered via its MSR */
+    if (out == (hype_cpuid_result_t *)0) {
+        return 0;
+    }
+    switch (leaf) {
+        case 0x40000000u:
+            /* Vendor signature + the highest leaf we implement. */
+            out->eax = HV_MAX_LEAF;
+            out->ebx = HV_VENDOR_EBX;
+            out->ecx = HV_VENDOR_ECX;
+            out->edx = HV_VENDOR_EDX;
+            return 1;
+        case 0x40000001u:
+            /* Interface signature. "Hv#1" is what says "this is the Hyper-V
+             * interface"; anything else and Windows treats the hypervisor as unknown. */
+            out->eax = HV_SIG_EAX;
+            out->ebx = 0; out->ecx = 0; out->edx = 0;
+            return 1;
+        case 0x40000002u:
+            /* Hypervisor version. Build/major/minor are ours to choose; they are
+             * reported, not matched against a real Hyper-V. */
+            out->eax = 1u;                 /* build number */
+            out->ebx = (6u << 16) | 3u;    /* major 6, minor 3 */
+            out->ecx = 0u;                 /* service pack */
+            out->edx = 0u;                 /* service branch/number */
+            return 1;
+        case 0x40000003u:
+            out->eax = HV_PRIV_REF_COUNTER | HV_PRIV_HYPERCALL_MSRS | HV_PRIV_VP_INDEX;
+            out->ebx = 0u;                 /* privilege mask high -- nothing granted */
+            out->ecx = 0u;
+            out->edx = 0u;                 /* no misc features */
+            return 1;
+        case 0x40000004u:
+            /*
+             * Recommended enlightenments. ALL ZERO deliberately: each bit tells Windows
+             * to REPLACE a native operation with a hypercall, and hype implements no
+             * hypercalls yet. Recommending one hype does not service would turn a
+             * working native path into a call into nothing.
+             */
+            out->eax = 0u; out->ebx = 0u; out->ecx = 0u; out->edx = 0u;
+            return 1;
+        case 0x40000005u:
+            /* Implementation limits. 0 means "no limit specified", which is legal and
+             * is the honest answer -- hype has no partition/VP accounting to report. */
+            out->eax = 0u; out->ebx = 0u; out->ecx = 0u; out->edx = 0u;
+            return 1;
+        case 0x40000006u:
+            /* Hardware features the hypervisor is USING. Zero: hype does not expose
+             * APICv/AVIC or nested paging to the guest as Hyper-V features. */
+            out->eax = 0u; out->ebx = 0u; out->ecx = 0u; out->edx = 0u;
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_result_t *real,
                          hype_cpuid_result_t *out) {
+    hype_cpuid_emulate_ex(eax_in, ecx_in, 0, real, out);
+}
+
+void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
+                            const hype_cpuid_result_t *real, hype_cpuid_result_t *out) {
     (void)ecx_in; /* no leaf handled here uses a sub-leaf */
 
     if (eax_in == 0) {
@@ -284,33 +380,50 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
         return;
     }
 
-    if (eax_in == 0x40000000u) {
-        /* Hypervisor signature leaf. Presents the KVM identity ("KVMKVMKVM")
-         * so a Linux/BSD guest enables kvmclock -- a paravirt clocksource that
-         * bypasses the guest's own (failing) TSC calibration. This is NOT
-         * pretending broad KVM compatibility: only the pvclock feature is
-         * advertised in leaf 0x40000001 below; every other KVM paravirt
-         * feature (async PF, PV EOI, steal time, PV IPI) is left off, so the
-         * guest enables nothing hype doesn't back. EAX = max KVM leaf. */
-        out->eax = HYPE_CPUID_KVM_FEATURES_LEAF;
-        out->ebx = HYPE_CPUID_KVM_SIG_EBX; /* "KVMK" */
-        out->ecx = HYPE_CPUID_KVM_SIG_ECX; /* "VMKV" */
-        out->edx = HYPE_CPUID_KVM_SIG_EDX; /* "M\0\0\0" */
-        return;
+    /*
+     * Hypervisor leaves. When the Hyper-V set is enabled (os_hint = windows) it takes
+     * the architectural 0x40000000 block and KVM relocates to 0x40000100 -- so this
+     * dispatch is written against hype_cpuid_kvm_base(), not a fixed leaf number.
+     * Order matters: HV is tried first, because when both are present HV owns
+     * 0x40000000 and KVM does not.
+     */
+    if (hv_enabled && eax_in >= 0x40000000u && eax_in <= HV_MAX_LEAF) {
+        if (hype_cpuid_hv_leaf(eax_in, 0, out)) {
+            return;
+        }
     }
 
-    if (eax_in == HYPE_CPUID_KVM_FEATURES_LEAF) {
-        /* KVM paravirt feature bits (EAX). Advertise only the pvclock
-         * clocksources: CLOCKSOURCE2 (the modern MSR pair 0x4b564d0x) plus
-         * CLOCKSOURCE (the legacy pair) for older guests, and TSC_STABLE_BIT
-         * -- hype's guest TSC is invariant, passthrough, and 1:1-pinned (no
-         * migration), so the guest may trust it for a vDSO fast read. */
-        out->eax = HYPE_CPUID_KVM_FEAT_CLOCKSOURCE | HYPE_CPUID_KVM_FEAT_CLOCKSOURCE2 |
-                   HYPE_CPUID_KVM_FEAT_CLOCKSOURCE_STABLE;
-        out->ebx = 0;
-        out->ecx = 0;
-        out->edx = 0;
-        return;
+    {
+        uint32_t kvm_base = hype_cpuid_kvm_base(hv_enabled);
+
+        if (eax_in == kvm_base) {
+            /* Hypervisor signature leaf. Presents the KVM identity ("KVMKVMKVM")
+             * so a Linux/BSD guest enables kvmclock -- a paravirt clocksource that
+             * bypasses the guest's own (failing) TSC calibration. This is NOT
+             * pretending broad KVM compatibility: only the pvclock feature is
+             * advertised in the features leaf below; every other KVM paravirt
+             * feature (async PF, PV EOI, steal time, PV IPI) is left off, so the
+             * guest enables nothing hype doesn't back. EAX = max KVM leaf. */
+            out->eax = kvm_base + 1u;
+            out->ebx = HYPE_CPUID_KVM_SIG_EBX; /* "KVMK" */
+            out->ecx = HYPE_CPUID_KVM_SIG_ECX; /* "VMKV" */
+            out->edx = HYPE_CPUID_KVM_SIG_EDX; /* "M\0\0\0" */
+            return;
+        }
+
+        if (eax_in == kvm_base + 1u) {
+            /* KVM paravirt feature bits (EAX). Advertise only the pvclock
+             * clocksources: CLOCKSOURCE2 (the modern MSR pair 0x4b564d0x) plus
+             * CLOCKSOURCE (the legacy pair) for older guests, and TSC_STABLE_BIT
+             * -- hype's guest TSC is invariant, passthrough, and 1:1-pinned (no
+             * migration), so the guest may trust it for a vDSO fast read. */
+            out->eax = HYPE_CPUID_KVM_FEAT_CLOCKSOURCE | HYPE_CPUID_KVM_FEAT_CLOCKSOURCE2 |
+                       HYPE_CPUID_KVM_FEAT_CLOCKSOURCE_STABLE;
+            out->ebx = 0;
+            out->ecx = 0;
+            out->edx = 0;
+            return;
+        }
     }
 
     zero_result(out);

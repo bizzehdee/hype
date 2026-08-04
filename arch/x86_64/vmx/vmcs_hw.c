@@ -274,6 +274,13 @@ struct hype_vcpu_ctx {
      * what it set. Mirrors the SVM ctx's fields of the same name. */
     uint64_t pvclock_system_msr;
     uint64_t pvclock_wall_msr;
+    /* M7-1 (#91): this guest's Hyper-V OS identity and hypercall-page MSR values.
+     * Per-vCPU for the same reason pvclock_map is -- each guest writes its own. */
+    uint64_t hv_guest_os_id;
+    uint64_t hv_hypercall;
+    /* M7-1 (#91): does THIS guest see the Hyper-V identity? Per-vCPU -- see
+     * cpuid_emulate.h on why this cannot be a file-global flag. */
+    int hv_enabled;
     /*
      * #277: this guest's XCR0, and whether it has executed an XSETBV yet. Was a
      * file-global pair, so with two guests whichever set XCR0 last decided the
@@ -353,6 +360,9 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
      * pvclock pages -- same reasoning as the SVM path's reset. */
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
+    ctx->hv_guest_os_id = 0;
+    ctx->hv_hypercall = 0;
+    ctx->hv_enabled = 0;
     /* #277: a recycled slot must not inherit the previous guest's XCR0 -- the
      * architectural reset value is x87-only, which `valid == 0` stands for. */
     ctx->guest_xcr0 = 0;
@@ -1366,7 +1376,7 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     } else {
         vmx_real_cpuid(eax_in, ecx_in, &host_real);
     }
-    hype_cpuid_emulate(eax_in, ecx_in, &host_real, &out);
+    hype_cpuid_emulate_ex(eax_in, ecx_in, real->hv_enabled, &host_real, &out);
 
     real->gprs[0] = out.eax; /* RAX */
     real->gprs[3] = out.ebx; /* RBX */
@@ -1401,6 +1411,18 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
  * the M2-M4-5 microtests (the VMX validation set) touch only APIC_BASE + EFER;
  * a full guest OS on VMX would need those ported too (future work).
  */
+/* Host TSC frequency, stashed at guest start (hype_vmx_vcpu_set_pvclock). Declared
+ * here rather than beside the other pvclock file-scope state below because the
+ * Hyper-V reference counter (M7-1) reads it from the MSR handler. */
+static uint64_t g_vmx_acpi_pm_tsc_hz;
+
+/* RDMSR result convention: low half in the shadow RAX, high half in RDX. Factored
+ * out because the Hyper-V MSRs all return a single value. */
+static void vmx_msr_return(struct hype_vcpu_ctx *real, uint64_t value) {
+    real->gprs[0] = (uint64_t)(uint32_t)value;
+    real->gprs[2] = (uint64_t)(uint32_t)(value >> 32);
+}
+
 int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint32_t msr_number = (uint32_t)real->gprs[1];
@@ -1492,6 +1514,38 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
     }
 
     switch (action) {
+    /*
+     * M7-1 (#91): Hyper-V synthetic MSRs. Only reachable when the Hyper-V CPUID
+     * leaves are enabled -- hype_msr_decide() gates them on that, so a Linux guest
+     * still falls through to the absorb below.
+     */
+    case HYPE_MSR_ACTION_READWRITE_HV_GUEST_OS_ID:
+    case HYPE_MSR_ACTION_READWRITE_HV_HYPERCALL: {
+        uint64_t *slot = (action == HYPE_MSR_ACTION_READWRITE_HV_GUEST_OS_ID)
+                             ? &real->hv_guest_os_id
+                             : &real->hv_hypercall;
+        if (is_write) {
+            *slot = ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+        } else {
+            vmx_msr_return(real, *slot);
+        }
+        break;
+    }
+    case HYPE_MSR_ACTION_READ_HV_VP_INDEX:
+        /*
+         * Always 0. hype gives each guest exactly one vCPU, so this guest IS VP 0 --
+         * reporting hype's own pool index would make a one-VP partition claim a
+         * processor that does not exist. Becomes the vCPU-within-VM index when
+         * guest SMP lands.
+         */
+        vmx_msr_return(real, 0ULL);
+        break;
+    case HYPE_MSR_ACTION_READ_HV_TIME_REF_COUNT:
+        /* 100ns ticks from the raw host TSC -- a guest only uses differences of
+         * this counter, so no per-partition epoch has to be maintained. */
+        vmx_msr_return(real, hype_msr_hv_ref_count_from_tsc(vmx_real_rdtsc(),
+                                                            g_vmx_acpi_pm_tsc_hz / 1000u));
+        break;
     case HYPE_MSR_ACTION_READ_APIC_BASE: {
         uint64_t value = hype_msr_apic_base_value();
         real->gprs[0] = (uint64_t)(uint32_t)value;
@@ -2697,8 +2751,6 @@ void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *o
  */
 static uint32_t g_vmx_pvclock_mul;
 static int8_t g_vmx_pvclock_shift;
-static uint64_t g_vmx_acpi_pm_tsc_hz;
-
 static void vmx_pvclock_arm_system_time(struct hype_vcpu_ctx *real, uint64_t msr_value) {
     uint64_t gpa, host, now, system_ns;
     if ((msr_value & HYPE_KVM_SYSTEM_TIME_ENABLE) == 0 || real->pvclock_map == 0) {
@@ -3349,4 +3401,8 @@ void hype_vmx_vcpu_get_cr_diag(hype_vcpu_ctx_t *ctx, unsigned gpr, hype_vmx_cr_d
     out->cr0_fixed1 = rdmsr(HYPE_MSR_IA32_VMX_CR0_FIXED1);
     out->cr4_fixed0 = rdmsr(HYPE_MSR_IA32_VMX_CR4_FIXED0);
     out->cr4_fixed1 = rdmsr(HYPE_MSR_IA32_VMX_CR4_FIXED1);
+}
+
+void hype_vmx_vcpu_set_hv_enabled(hype_vcpu_ctx_t *ctx, int enabled) {
+    ((struct hype_vcpu_ctx *)ctx)->hv_enabled = enabled ? 1 : 0;
 }

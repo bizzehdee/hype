@@ -350,6 +350,113 @@ static void test_leafd_masks_xsaves(void) {
     }
 }
 
+/* --- M7-1 (#91): Hyper-V leaves, opt-in per vCPU --- */
+
+static void test_hv_disabled_leaves_kvm_identity_untouched(void) {
+    /* The regression that matters most: with hv off, nothing about the leaves the
+     * working Linux/BSD guests read may change. */
+    hype_cpuid_result_t real = {0, 0, 0, 0};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate_ex(0x40000000u, 0, 0, &real, &out);
+    CHECK_HEX("hv off: 0x40000000 still \"KVMK\"", 0x4b4d564bu, out.ebx);
+    CHECK_HEX("hv off: kvm base is 0x40000000", 0x40000000u, hype_cpuid_kvm_base(0));
+
+    hype_cpuid_emulate_ex(0x40000001u, 0, 0, &real, &out);
+    CHECK_HEX("hv off: pvclock bits at 0x40000001", (1u << 0) | (1u << 3) | (1u << 24), out.eax);
+
+    /* And the Hyper-V leaves must not appear at all. */
+    hype_cpuid_emulate_ex(0x40000002u, 0, 0, &real, &out);
+    CHECK_HEX("hv off: 0x40000002 is all-zero", 0u, out.eax | out.ebx | out.ecx | out.edx);
+}
+
+static void test_hv_enabled_reports_microsoft_hv_signature(void) {
+    hype_cpuid_result_t real = {0, 0, 0, 0};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate_ex(0x40000000u, 0, 1, &real, &out);
+    CHECK_HEX("hv max leaf", 0x40000006u, out.eax);
+    CHECK_HEX("ebx \"Micr\"", 0x7263694du, out.ebx);
+    CHECK_HEX("ecx \"osof\"", 0x666F736Fu, out.ecx);
+    CHECK_HEX("edx \"t Hv\"", 0x76482074u, out.edx);
+
+    hype_cpuid_emulate_ex(0x40000001u, 0, 1, &real, &out);
+    CHECK_HEX("interface signature \"Hv#1\"", 0x31237648u, out.eax);
+}
+
+static void test_hv_enabled_relocates_kvm_leaves(void) {
+    /* Windows takes 0x40000000, so kvmclock must still be findable one block up --
+     * otherwise enabling the Hyper-V identity would silently cost a Linux guest the
+     * paravirt clocksource PERF-1's fix depends on. */
+    hype_cpuid_result_t real = {0, 0, 0, 0};
+    hype_cpuid_result_t out;
+
+    CHECK_HEX("hv on: kvm base relocated", 0x40000100u, hype_cpuid_kvm_base(1));
+
+    hype_cpuid_emulate_ex(0x40000100u, 0, 1, &real, &out);
+    CHECK_HEX("relocated sig ebx \"KVMK\"", 0x4b4d564bu, out.ebx);
+    CHECK_HEX("relocated sig ecx \"VMKV\"", 0x564b4d56u, out.ecx);
+    CHECK_HEX("relocated sig edx \"M\\0\\0\\0\"", 0x0000004du, out.edx);
+    CHECK_HEX("relocated max leaf points at its own features leaf", 0x40000101u, out.eax);
+
+    hype_cpuid_emulate_ex(0x40000101u, 0, 1, &real, &out);
+    CHECK_HEX("relocated pvclock bits", (1u << 0) | (1u << 3) | (1u << 24), out.eax);
+}
+
+static void test_hv_privilege_mask_only_claims_backed_msrs(void) {
+    /* Each bit here promises an MSR group that hype_msr_decide_ex() must actually
+     * answer. Reference TSC (bit 9) is deliberately absent: there is no
+     * reference-TSC page, and claiming it would make Windows read a page hype never
+     * fills. */
+    hype_cpuid_result_t real = {0, 0, 0, 0};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate_ex(0x40000003u, 0, 1, &real, &out);
+    CHECK_HEX("privileges: ref counter | hypercall MSRs | vp index",
+              (1u << 1) | (1u << 5) | (1u << 6), out.eax);
+    CHECK_HEX("reference TSC NOT claimed (bit 9)", 0, (out.eax & (1u << 9)) != 0);
+    CHECK_HEX("synic NOT claimed (bit 2)", 0, (out.eax & (1u << 2)) != 0);
+    CHECK_HEX("synthetic timers NOT claimed (bit 3)", 0, (out.eax & (1u << 3)) != 0);
+    CHECK_HEX("privilege mask high empty", 0u, out.ebx);
+    CHECK_HEX("misc features empty", 0u, out.edx);
+}
+
+static void test_hv_recommends_no_enlightenments(void) {
+    /* hype services no hypercalls, so recommending an enlightenment would tell
+     * Windows to replace a working native operation with a call into nothing. */
+    hype_cpuid_result_t real = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate_ex(0x40000004u, 0, 1, &real, &out);
+    CHECK_HEX("no enlightenments recommended", 0u, out.eax | out.ebx | out.ecx | out.edx);
+    hype_cpuid_emulate_ex(0x40000005u, 0, 1, &real, &out);
+    CHECK_HEX("no implementation limits", 0u, out.eax | out.ebx | out.ecx | out.edx);
+    hype_cpuid_emulate_ex(0x40000006u, 0, 1, &real, &out);
+    CHECK_HEX("no hardware features claimed", 0u, out.eax | out.ebx | out.ecx | out.edx);
+}
+
+static void test_hv_leaf_beyond_max_is_not_claimed(void) {
+    /* 0x40000007 is past the advertised maximum, so hype_cpuid_hv_leaf() must decline
+     * it rather than returning stale register contents. */
+    hype_cpuid_result_t out = {0xAAu, 0xBBu, 0xCCu, 0xDDu};
+
+    CHECK_HEX("leaf past max declined", 0, hype_cpuid_hv_leaf(0x40000007u, 0, &out));
+    CHECK_HEX("leaf below base declined", 0, hype_cpuid_hv_leaf(0x3FFFFFFFu, 0, &out));
+    CHECK_HEX("NULL out declined", 0, hype_cpuid_hv_leaf(0x40000000u, 0, (hype_cpuid_result_t *)0));
+    CHECK_HEX("declined leaf left `out` untouched", 0xAAu, out.eax);
+}
+
+static void test_hv_version_leaf_is_populated(void) {
+    /* Windows logs/branches on the version; an all-zero build+version reads as an
+     * unidentifiable hypervisor. */
+    hype_cpuid_result_t real = {0, 0, 0, 0};
+    hype_cpuid_result_t out;
+
+    hype_cpuid_emulate_ex(0x40000002u, 0, 1, &real, &out);
+    CHECK_HEX("build number nonzero", 1u, out.eax);
+    CHECK_HEX("major 6 minor 3", (6u << 16) | 3u, out.ebx);
+}
+
 int main(void) {
     test_leaf0_vendor_is_passed_through();
     test_ext_leaf0_vendor_matches_basic_leaf0();
@@ -367,6 +474,14 @@ int main(void) {
     test_kvm_features_leaf_advertises_only_pvclock();
     test_unhandled_leaf_returns_all_zero();
     test_unhandled_extended_leaf_returns_all_zero();
+
+    test_hv_disabled_leaves_kvm_identity_untouched();
+    test_hv_enabled_reports_microsoft_hv_signature();
+    test_hv_enabled_relocates_kvm_leaves();
+    test_hv_privilege_mask_only_claims_backed_msrs();
+    test_hv_recommends_no_enlightenments();
+    test_hv_leaf_beyond_max_is_not_claimed();
+    test_hv_version_leaf_is_populated();
 
     test_leaf1_masks_monitor_mwait();
     test_leafd_masks_xsaves();

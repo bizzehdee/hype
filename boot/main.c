@@ -507,7 +507,11 @@ typedef struct hype_fw_vm {
      * core's dashboard renderer -- volatile, single-writer/single-reader, a torn
      * 64-bit read at worst shows a momentarily-stale number, never a crash. */
     const char *name;
-    const char *os_hint;    /* "linux" / "windows" / "bsd" */
+    const char *os_hint;    /* "linux" / "windows" / "bsd" / "none" */
+    /* M7-1 (#91): show this guest the Hyper-V CPUID leaves + synthetic MSRs. Derived
+     * from os_hint by fw_1_resolve_os_hint(); per-VM because two guests with different
+     * hints run concurrently. */
+    int hv_leaves;
     unsigned mem_mb;
     const char *media;      /* boot-media short name */
     volatile uint64_t stat_total_exits;
@@ -610,6 +614,32 @@ static void fw_1_resolve_guest_ram(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, uns
     hype_debug_print("fw-1: vm%u guest RAM %u MiB -- %s (requested %u, limits %u..%u) [#290]\n",
                      vm_index, applied_mb, hype_cfg_ram_status_str(st), cfg_mb,
                      HYPE_FW_1_GUEST_RAM_MIN_MB, HYPE_FW_1_GUEST_RAM_MAX_MB);
+}
+/*
+ * M7-1 (#91): settle this VM's os_hint and, from it, whether the guest sees the
+ * Hyper-V hypervisor identity. Writes vm->os_hint (which the dashboard shows) so the
+ * operator can see which hint actually took effect -- the same "say which source won"
+ * lesson #290 came from, where a parsed config value was echoed and then dropped.
+ *
+ * Only `windows` enables the Hyper-V leaves. Everything else, including an absent
+ * config, keeps the KVM identity a Linux/BSD guest needs for kvmclock.
+ */
+static void fw_1_resolve_os_hint(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigned vm_index) {
+    hype_cfg_os_hint_t hint = HYPE_CFG_OS_LINUX;
+
+    if (cfg != 0 && vm_index < cfg->vm_count) {
+        hint = cfg->vms[vm_index].os_hint;
+    }
+    switch (hint) {
+    case HYPE_CFG_OS_WINDOWS: vmp->os_hint = "windows"; break;
+    case HYPE_CFG_OS_BSD: vmp->os_hint = "bsd"; break;
+    case HYPE_CFG_OS_NONE: vmp->os_hint = "none"; break;
+    case HYPE_CFG_OS_LINUX:
+    default: vmp->os_hint = "linux"; break;
+    }
+    vmp->hv_leaves = (hint == HYPE_CFG_OS_WINDOWS) ? 1 : 0;
+    hype_debug_print("fw-1: vm%u os_hint=%s hyper-v-leaves=%s [#91]\n", vm_index, vmp->os_hint,
+                     vmp->hv_leaves ? "on" : "off (KVM identity)");
 }
 #define g_fw_1_e820_blob (vm->e820_blob)
 #define g_fw_1_guest_stack (vm->guest_stack)
@@ -3154,6 +3184,13 @@ static void vmm_get_intr_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
 static int vmm_deliver_pending_if_ready(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
     return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_deliver_pending_if_ready(ctx)
                                      : hype_svm_vcpu_deliver_pending_if_ready(ctx);
+}
+static void vmm_set_hv_enabled(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, int enabled) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_set_hv_enabled(ctx, enabled);
+    } else {
+        hype_svm_vcpu_set_hv_enabled(ctx, enabled);
+    }
 }
 static void vmm_set_pvclock(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map,
                             uint64_t tsc_hz) {
@@ -7179,6 +7216,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
 
     vmm_reset_realmode(kind, ctx, reset_cs_base, stack_top, npt_root_phys);
     vmm_set_pvclock(kind, ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
+    vmm_set_hv_enabled(kind, ctx, vm->hv_leaves);
     vmm_set_rip(kind, ctx, reset_rip);
     vmm_set_exception_intercepts(kind, ctx, (1u << 6) | (1u << 13));
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
@@ -7228,7 +7266,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * current single-Linux-guest reality; multi-OS/config-driven values come
      * with the config->VM plumbing (tracked separately). */
     vm->name = (vm == &g_vms[0]) ? "vm0" : "vm1";
-    vm->os_hint = "linux";
+    /* os_hint is set by fw_1_resolve_os_hint() from hype.cfg -- it used to be
+     * hardcoded here, which is why a configured `os_hint = windows` never reached
+     * either the dashboard or the CPUID leaves. */
     /* #290: mem_mb is set by fw_1_resolve_guest_ram() from vm->ram_bytes. It used
      * to be assigned here FROM the compile-time constant, which is precisely what
      * discarded a configured mem_mb after echoing it. */
@@ -7586,6 +7626,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * with two concurrent guests each needs its OWN map, else one guest's
      * pvclock writes land in the other's RAM (M8-0b STEP 2 dead-halt bug). */
     vmm_set_pvclock(kind, ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
+    vmm_set_hv_enabled(kind, ctx, vm->hv_leaves);
     vmm_set_rip(kind, ctx, reset_rip);
     /* M4-6: let the guest own every exception vector. OVMF and any OS it
      * boots (real Linux takes routine #PF/#GP/#UD/#NM) handle their own
@@ -12028,6 +12069,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * first point that consumes it, so a configured mem_mb now decides the
          * allocation instead of being overwritten after the fact. */
         fw_1_resolve_guest_ram(vm, &g_hype_cfg, 0u);
+        fw_1_resolve_os_hint(vm, &g_hype_cfg, 0u);
         g_fw_1_ram_host_phys =
             hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm->ram_bytes);
         hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
@@ -12194,6 +12236,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 (const void *)(uintptr_t)vm->combined_host_phys, vm1->combined_size);
             /* #290: vm1 gets its own configured size (cfg vm[1]), not vm0's. */
             fw_1_resolve_guest_ram(vm1, &g_hype_cfg, 1u);
+            fw_1_resolve_os_hint(vm1, &g_hype_cfg, 1u);
             vm1->ram_host_phys =
                 hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->ram_bytes);
             hype_guest_ram_zero((void *)(uintptr_t)vm1->ram_host_phys, vm1->ram_bytes);

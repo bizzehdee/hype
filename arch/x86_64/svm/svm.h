@@ -675,6 +675,14 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx);
  * pages) and the host TSC frequency, so the KVM SYSTEM_TIME/WALL_CLOCK MSR
  * writes can fill the guest's pvclock pages. Call once before running the
  * guest. Without it, those MSR writes are accepted but fill nothing. */
+/*
+ * M7-1 (#91): show this vCPU's guest the Hyper-V hypervisor identity (CPUID
+ * 0x40000000-0x40000006 + the synthetic MSRs) instead of the KVM one. Off by default;
+ * driven from the VM's os_hint, and per-vCPU because two guests with different
+ * os_hints run at the same time on different cores.
+ */
+void hype_svm_vcpu_set_hv_enabled(hype_vcpu_ctx_t *ctx, int enabled);
+
 void hype_svm_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, uint64_t tsc_hz);
 
 /* Count of pvclock time-info page fills -- nonzero proves the guest enabled

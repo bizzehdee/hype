@@ -186,6 +186,14 @@ void hype_vmx_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector, int 
 void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
 void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out);
 int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);
+/*
+ * M7-1 (#91): show this vCPU's guest the Hyper-V hypervisor identity (CPUID
+ * 0x40000000-0x40000006 + the synthetic MSRs) instead of the KVM one. Off by default;
+ * driven from the VM's os_hint, and per-vCPU because two guests with different
+ * os_hints run at the same time on different cores.
+ */
+void hype_vmx_vcpu_set_hv_enabled(hype_vcpu_ctx_t *ctx, int enabled);
+
 void hype_vmx_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, uint64_t tsc_hz);
 
 /* VMX-4 (#236): FW-1 device adapters. Unlike the microtest handlers above,

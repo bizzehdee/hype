@@ -102,18 +102,64 @@ typedef struct {
  *                    -- this project does not emulate nested SVM for
  *                    guests, so it must not advertise the extension.
  *   0x40000000    -- the hypervisor CPUID leaf (Xen/KVM/Hyper-V/
- *                    VMware convention): EAX = 0x40000000 (no further
- *                    hypervisor-specific leaves implemented yet);
- *                    EBX/ECX/EDX = a distinct, honest 12-character
- *                    vendor signature ("HypeHypeHype") -- not
- *                    pretending KVM/Xen/Hyper-V compatibility (that's
- *                    M7-1's later, Windows-specific job), just
- *                    signaling "you are virtualized" so guest OSes
- *                    skip bare-metal-only workarounds/assumptions.
+ *                    VMware convention). Reports the KVM signature
+ *                    ("KVMKVMKVM") so a Linux/BSD guest enables
+ *                    kvmclock, with only the pvclock feature bits set
+ *                    at the features leaf -- see the KVM block in
+ *                    cpuid_emulate.c. When the Hyper-V leaves are
+ *                    enabled for a vCPU (M7-1, below) this leaf reports
+ *                    "Microsoft Hv" instead and the KVM pair moves to
+ *                    0x40000100.
  *   anything else -- all-zero (the safe universal fallback for an
  *                    unimplemented/reserved leaf).
  */
 void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_result_t *real,
                          hype_cpuid_result_t *out);
 
+
+/*
+ * M7-1 (#91): Hyper-V-compatible hypervisor CPUID leaves (0x40000000-0x40000006).
+ *
+ * Windows will not enable its enlightenments -- and some builds behave badly -- unless
+ * it recognises a Hyper-V-shaped hypervisor here. Linux and BSD instead want the KVM
+ * signature so they enable kvmclock (which is what PERF-1's fix depends on).
+ *
+ * Both cannot occupy leaf 0x40000000. So this is OPT-IN, off by default:
+ *
+ *   - default (Linux/BSD guests): 0x40000000 reports "KVMKVMKVM" exactly as before, so
+ *     the only guests that currently work are completely unaffected.
+ *   - enabled (os_hint = windows): 0x40000000 reports "Microsoft Hv" and the KVM leaves
+ *     MOVE to 0x40000100, which is the same relocation QEMU performs when both are
+ *     present. A Linux guest under that setting still finds kvmclock; it just looks one
+ *     block higher.
+ *
+ * Enabling it by default would change the behaviour of the guests that do work, to
+ * benefit a Windows guest that cannot boot yet for unrelated reasons (#172). That trade
+ * is not worth making before there is a Windows guest to test against.
+ */
+/*
+ * The enable is a PER-vCPU parameter rather than a module-level flag on purpose. hype
+ * runs two guests concurrently on two cores, so a file-global "Hyper-V on" would be
+ * written by one core's setup and read by the other core's CPUID exit -- the exact
+ * shared-singleton race that #237 and #276 already cost this project. A Windows guest
+ * and a Linux guest must be able to see different hypervisor identities at the same
+ * instant, which only a parameter can express.
+ *
+ * hype_cpuid_emulate() is the hv_enabled=0 case, kept as its own entry point so the
+ * existing callers and tests read unchanged.
+ */
+void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
+                            const hype_cpuid_result_t *real, hype_cpuid_result_t *out);
+
+/* Where the KVM paravirt leaves live -- 0x40000000 normally, 0x40000100 when the
+ * Hyper-V leaves have taken the base. */
+uint32_t hype_cpuid_kvm_base(int hv_enabled);
+
+/*
+ * Synthesize one Hyper-V leaf. Returns 1 if `leaf` is one this fills, 0 otherwise.
+ * Pure: no MSR state, no hardware. `vp_index` is the virtual processor index, which
+ * leaf 0x40000002's version block does not carry but callers pass for future per-vCPU
+ * leaves; ignored today rather than omitted so the signature does not churn.
+ */
+int hype_cpuid_hv_leaf(uint32_t leaf, uint32_t vp_index, hype_cpuid_result_t *out);
 #endif /* HYPE_ARCH_CPUID_EMULATE_H */
