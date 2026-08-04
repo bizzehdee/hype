@@ -2045,6 +2045,27 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     d2h_fis[2] = status_reg;
     d2h_fis[3] = error_reg;
 
+    /* #311: the exact bytes hype leaves for the guest to read after a completion -- the command
+     * header (PRDBC is DW1 at offset 4) and both received FISes. Everything about delivery is
+     * proven working, so what FreeBSD reads to decide a slot finished is the only place left, and
+     * this is a byte-level record of it rather than another hypothesis. First few only. */
+    {
+        static unsigned int cmpl_dump_n = 0;
+        if (cmpl_dump_n < 4000u) { /* large: the interesting completions are the KERNEL's, which are far past any small cap -- OVMF probes the CD first and swamped a 4-entry dump */
+            cmpl_dump_n++;
+            hype_debug_print("fw-1 CMPL#%u hdr=%02x%02x%02x%02x prdbc=%02x%02x%02x%02x "
+                             "pio20=%02x %02x %02x %02x .. e_st=%02x cnt=%02x%02x "
+                             "d2h40=%02x %02x %02x %02x tfd=0x%x xfer=%u\n",
+                             cmpl_dump_n, cmd_hdr_bytes[0], cmd_hdr_bytes[1], cmd_hdr_bytes[2],
+                             cmd_hdr_bytes[3], cmd_hdr_bytes[4], cmd_hdr_bytes[5],
+                             cmd_hdr_bytes[6], cmd_hdr_bytes[7], rx_fis_host[0x20],
+                             rx_fis_host[0x21], rx_fis_host[0x22], rx_fis_host[0x23],
+                             rx_fis_host[0x2F], rx_fis_host[0x31], rx_fis_host[0x30],
+                             rx_fis_host[0x40], rx_fis_host[0x41], rx_fis_host[0x42],
+                             rx_fis_host[0x43], (unsigned int)ahci->p_tfd,
+                             (unsigned int)transferred);
+        }
+    }
     ahci->p_ci &= (uint32_t)~(1u << slot); /* this slot complete */
     /* Completion interrupt-status bit (PxIS.DHRS for D2H completions,
      * PxIS.PSS for PIO-in). A guest that polls waits on this directly;
