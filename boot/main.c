@@ -40,6 +40,7 @@
 #include "../core/rtc.h"
 #include "../core/blk_phys.h"
 #include "../core/blk_image.h"
+#include "../core/blk_qcow2.h"
 #include "../core/ext.h"
 
 /* #229 debug: read the active host CR3 (which page-table root this core runs under). */
@@ -561,6 +562,11 @@ typedef struct hype_fw_vm {
     hype_blk_backend_t vblk_be;
     hype_blk_file_t vblk_file;
     hype_blk_image_t vblk_image; /* M5-8 (#199): raw image FILE backend */
+    /* M5-9 (#200): when the image file turns out to be qcow2, the raw extent backend
+     * becomes the layer BELOW and vblk_be is the format layer's view instead. Two
+     * backends because the guest must see the virtual size, not the file's. */
+    hype_blk_backend_t vblk_raw_be;
+    hype_qcow2_t vblk_qcow2;
     uint64_t vblk_backing_phys; /* host-physical base of this VM's scratch disk */
     /* M10-6a (#227): when this VM's confirmed target is a `physical:` disk, the
      * backend above is instead a writable physical backend over the enumerated
@@ -6803,7 +6809,7 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     if (fs == 0) {
         return 0;
     }
-    if (hype_blk_image_init(&vm->vblk_image, &vm->vblk_be, &file, g_fat_esp_base,
+    if (hype_blk_image_init(&vm->vblk_image, &vm->vblk_raw_be, &file, g_fat_esp_base,
                             hostdisk_read, hostdisk_write, 0) != 0) {
         /* A sparse or short-mapped image: refuse rather than serve a disk whose
          * later sectors would fail mid-install. #90's --check reports why. */
@@ -6811,6 +6817,30 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
                          "cap, sparse, or short) -- run tools/make-disk-image.sh --check\n",
                          path, fs);
         return 0;
+    }
+    /*
+     * M5-9 (#200): decide the format by TRYING to open it as qcow2 rather than by a
+     * config key. The header magic plus the rest of hype_qcow2_init's validation is
+     * exactly how every other tool identifies one, it cannot mistake a raw image for a
+     * qcow2 (no raw image starts with "QFI\xfb" AND passes the header checks), and it
+     * means an operator who swaps a raw image for a qcow2 one does not also have to
+     * remember to edit hype.cfg -- which would fail as a guest that silently reads the
+     * qcow2 HEADER as its boot sector.
+     */
+    if (hype_qcow2_init(&vm->vblk_qcow2, &vm->vblk_be, &vm->vblk_raw_be, 0) == 0) {
+        hype_debug_print("m5-9: %s on %s is QCOW2 v%u -- %llu-byte clusters, %llu virtual "
+                         "sectors from a %llu-byte file [#200]\n",
+                         path, fs, vm->vblk_qcow2.version,
+                         (unsigned long long)vm->vblk_qcow2.cluster_size,
+                         (unsigned long long)vm->vblk_be.total_sectors,
+                         (unsigned long long)file.size_bytes);
+    } else {
+        /* Field-by-field: whole-struct assignment of anything that might hold an array
+         * is the freestanding memcpy trap this project has hit before. */
+        vm->vblk_be.read = vm->vblk_raw_be.read;
+        vm->vblk_be.write = vm->vblk_raw_be.write;
+        vm->vblk_be.ctx = vm->vblk_raw_be.ctx;
+        vm->vblk_be.total_sectors = vm->vblk_raw_be.total_sectors;
     }
     vm->vblk_is_physical = 0;
     hype_virtio_blk_reset(&vm->vblk, vm->vblk_be.total_sectors);
