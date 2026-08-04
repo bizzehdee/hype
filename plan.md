@@ -339,10 +339,28 @@ or a real physical drive). Both targets are exposed to the guest through the
 same block-device frontend (AHCI or virtio-blk, per `os_hint` as in §6/§6a) —
 the installer never knows or cares which backend it's writing to.
 
-- **Install media (ISO)**: read from the host ESP/local filesystem, exposed
-  to the guest as a virtual optical drive (AHCI/ATAPI CD-ROM, or a
-  virtio-scsi CD-ROM for Linux/BSD). Placed first in guest firmware boot
-  order whenever `boot = installer`.
+- **Install media (ISO)**: read from a host block device, exposed to the
+  guest as a virtual optical drive (AHCI/ATAPI CD-ROM, or a virtio-scsi
+  CD-ROM for Linux/BSD). Placed first in guest firmware boot order whenever
+  `boot = installer`.
+  The ISO is **always streamed** from its host device, never preloaded into
+  hypervisor RAM: the RAM/chunked load existed only until streaming worked,
+  and it caps media size at what `AllocatePages` can serve contiguously.
+  The media device is **not** required to be the device hype booted from.
+  The intended deployment is hype installed on a **USB stick**, with the
+  installer ISOs *and* the file-backed guest disk images on a **separate
+  internal drive**; the machine may have **any number** of SATA or NVMe
+  disks, formatted **FAT32, exFAT or ext**. So, per VM, the operator
+  specifies both **which disk** the media lives on (by drive **serial/GUID**
+  from `hype.cfg`, matched the same way a `physical:` target is, with
+  auto-detection as the fallback) and **which ISO** on it
+  (`install_media`) — and reads go through the same host-side block driver
+  set physical targets use (**AHCI + NVMe**). A host **ATAPI** path so a real
+  DVD-ROM can be used as media directly is a further option, not a
+  requirement.
+  Guest-facing, the drive presents as a **DVD-ROM with a data disc in it** —
+  `GET CONFIGURATION`'s current profile is DVD-ROM — so a guest treats it
+  exactly as a physical DVD-ROM presenting a real disc. See §10 decision 25.
 - **Virtual disk target (`target_disk = file:<path>`)**: a raw sparse file
   on host storage. If it doesn't exist yet, the hypervisor (or the `/tools`
   prep script, run ahead of time) creates it at `target_disk_size_gb`. Reads
@@ -956,6 +974,70 @@ isn't lost.
       cluster). A volume with a corrupt entry set, an allocation outside
       the cluster heap, or a chain shorter than the recorded file size is
       now refused rather than half-parsed.
+
+25. **Media/image source device (#319) — decided: an explicitly selected
+    host block device, over AHCI *and* NVMe *and* host ATAPI, matched by
+    serial/GUID with auto-detection as the fallback.** hype's host-side
+    media lookup was written when the ISO always lived on the disk hype
+    booted from: `hostdisk_read()`/`fatvol_read()` are hardwired to a single
+    `(abar, port)` pair found by taking the **first** SATA port whose
+    signature is a non-ATAPI hard disk, and both the ISO scan and the
+    file-backed guest-disk-image resolve read through it. The intended
+    deployment (§6d — hype on a USB stick, ISOs *and* images on a separate
+    internal drive) breaks each of those assumptions at once, so all three
+    are being changed together rather than one at a time:
+    - **NVMe must be a media source, not just a `physical:` target.** The
+      plan already committed to "AHCI + NVMe covers the vast majority of
+      real hardware" for the target-disk axis (§6d), and
+      `hype_nvme_host_read()` exists and works — but it is used only for
+      probing and target matching, never to read media. On a modern machine
+      the separate data drive is likely NVMe, which today means neither the
+      ISOs nor the disk images on it are reachable at all. Rejected
+      alternative: require the media on a SATA disk. That makes the
+      supported hardware a function of an implementation detail rather than
+      a decision, and would be invisible to an operator until nothing was
+      found.
+    - **The device is chosen by serial/GUID from `hype.cfg`**, reusing the
+      matching `physical:` targets already do, with today's auto-detection
+      kept as the fallback so existing single-disk setups keep working
+      untouched. Rejected alternative: positional selection ("disk 1").
+      §6d already rules that out for physical targets because it is fragile
+      against port reordering; the same reasoning applies to a read-only
+      source, where a wrong guess is a confusing failure rather than a
+      dangerous one but is just as hard to diagnose.
+    - **A host ATAPI (DVD-ROM) device is a first-class media source.** The
+      port scan currently *requires* the non-ATAPI signature `0x00000101`,
+      so a real optical drive is skipped by construction — an operator with
+      a bootable disc has to copy it onto a partitioned disk first, which
+      is a worse story than the hardware hype emulates. hype models the
+      guest side of ATAPI already (`devices/atapi.c`), but its host AHCI
+      driver has only ever spoken to a hard disk, so host-side `READ(10)`
+      via the packet protocol is genuinely new code.
+    - **Every media filesystem the operator may reasonably use is
+      supported: FAT32, exFAT and ext.** The ISO resolve tries only the two
+      FAT variants today while the guest-disk-image resolve beside it
+      already tries all three, which is an accident rather than a decision
+      (#320).
+    - **Streaming must handle a fragmented ISO.** The one-extent restriction
+      the ISO path carries is stricter than the 64-extent contract the rest
+      of the block stack uses, and a multi-GB ISO on a volume that is not
+      freshly formatted will fragment; on ext, `core/ext.h` notes large
+      indirect-mapped files are structurally fragmented, so ext support
+      without multi-extent streaming would be nearly useless (#327).
+    - **The RAM/chunked preload is retired, not kept as a fallback** (#326).
+      Keeping it would preserve the very duplication that let the streaming
+      path never learn to honour `install_media`, and it silently caps media
+      size. It may only be deleted once streaming covers configured paths,
+      device selection, NVMe and multi-extent files — otherwise capability
+      is lost rather than consolidated.
+    Implementation is sequenced as an enabling refactor first — replace the
+    two hardwired globals with one selected media device behind the
+    `(ctx, lba, count, dst)` callback `core/iso_stream.h` and
+    `core/nvme_host.h` *already* share — so that each backend afterwards is
+    additive and independently testable. The refactor is behaviour-preserving
+    by construction and is the only step that touches existing paths.
+    No change is needed to how the drive is presented to the guest: hype
+    already reports DVD-ROM as the current MMC profile.
 
 ## 11. Pre-M0 readiness checklist
 

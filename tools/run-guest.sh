@@ -3,9 +3,25 @@
 #
 #   tools/run-guest.sh <iso> <log-name> [seconds]
 #
-# Builds a throwaway FAT ESP image sized to the ISO, drops in the freshly built hype.efi plus
-# hype's vendored guest firmware, and boots it. Used for the #166 FreeBSD work and for the
-# Alpine regression check that any change to the shared interrupt-injection path needs.
+# Drops the freshly built hype.efi plus hype's vendored guest firmware onto a disk image with the
+# ISO, and boots it. Used for the #166 FreeBSD work and for the Alpine regression check that any
+# change to the shared interrupt-injection path needs.
+#
+# TWO DELIVERY MODES, because hype itself supports two and they have different limits. Both end
+# up presenting the guest an ordinary ATAPI CD-ROM (`cd0: <HYPE VIRTUAL CD-ROM>`), streamed with
+# no RAM copy -- the difference is only in how hype OBTAINS the ISO bytes. Selected by
+# ISO_MODE=file|raw, defaulting to raw for ISOs FAT32 cannot hold:
+#
+#   file  (GLADDER-11 / #182)  one FAT32 partition holding \iso\test.iso; hype resolves the
+#                             file's extents and streams from the raw disk LBAs. Requires the
+#                             file to be CONTIGUOUS -- hype falls back if it is fragmented.
+#                             **Cannot carry an ISO >= 4 GiB: that is FAT32's max file size.**
+#
+#   raw   (GLADDER-10)        GPT disk, partition 1 = a small FAT ESP (hype.efi + firmware only),
+#                             partition 2 = the raw ISO bytes, no filesystem in the path. hype's
+#                             FAT-file scan finds no \iso\test.iso, falls through, GPT-locates
+#                             partition 2 and verifies "CD001" at byte 32769. No size limit, and
+#                             it does not copy a multi-GB file into a filesystem per run.
 #
 # Two traps this encodes, both of which cost a wasted run before being understood:
 #
@@ -27,7 +43,55 @@ OUT=disk-images/run-$NAME
 LOG="$OUT.log"
 ESP="$OUT.esp.img"
 
-build_esp() {
+ISO_BYTES=$(stat -c%s "$ISO")
+# 4 GiB - 1 is FAT32's maximum file size. At or above it the `file` mode cannot work at all, so
+# default to `raw` rather than producing a truncated ISO and a mystery boot failure.
+if [ -z "${ISO_MODE:-}" ]; then
+    if [ "$ISO_BYTES" -ge 4294967295 ]; then ISO_MODE=raw; else ISO_MODE=file; fi
+fi
+
+# raw mode: GPT, partition 1 = small FAT ESP (firmware only), partition 2 = the raw ISO.
+build_esp_raw() {
+    local esp_mb=128 iso_mb start_iso
+    iso_mb=$(( ISO_BYTES / 1048576 + 1 ))
+    rm -f "$ESP"
+    fallocate -l "$(( 1 + esp_mb + iso_mb + 1 ))M" "$ESP" 2>/dev/null || \
+        dd if=/dev/zero of="$ESP" bs=1048576 count=$(( 1 + esp_mb + iso_mb + 1 )) status=none conv=fsync
+    # sfdisk + mtools only, so this needs no root -- same constraint tools/262/make-rig.sh works
+    # under. 1MiB alignment: partition 1 at LBA 2048, partition 2 right after it.
+    start_iso=$(( 2048 + esp_mb * 2048 ))
+    sfdisk --label gpt -q "$ESP" >/dev/null <<SFDISK
+2048,$(( esp_mb * 2048 )),U
+$start_iso,$(( iso_mb * 2048 )),L
+SFDISK
+    # The ESP partition, built standalone then written into place: mtools addresses a whole image,
+    # not a partition within one.
+    local espfs="$OUT.espfs.img"
+    rm -f "$espfs"
+    fallocate -l "${esp_mb}M" "$espfs" 2>/dev/null || \
+        dd if=/dev/zero of="$espfs" bs=1048576 count="$esp_mb" status=none
+    mformat -i "$espfs" -F ::
+    mmd -i "$espfs" ::/EFI ::/EFI/BOOT ::/EFI/hype
+    mcopy -i "$espfs" build/hype.efi ::/EFI/BOOT/BOOTX64.EFI
+    mcopy -i "$espfs" fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
+    dd if="$espfs" of="$ESP" bs=1048576 seek=1 conv=notrunc,fsync status=none
+    rm -f "$espfs"
+    # The ISO, raw, at partition 2's first LBA.
+    dd if="$ISO" of="$ESP" bs=1048576 seek=$(( 1 + esp_mb )) conv=notrunc,fsync status=none
+    sync "$ESP"
+
+    # Verify: "CD001" must be readable at ISO offset 32769 from partition 2's start, which is the
+    # exact check hype itself makes. Trusting dd here would turn a short write into a boot mystery.
+    local magic
+    magic=$(dd if="$ESP" bs=1 \
+                skip=$(( (1 + esp_mb) * 1048576 + 32769 )) count=5 status=none 2>/dev/null)
+    [ "$magic" = "CD001" ] || { echo "raw ESP verify FAILED: no CD001 at partition 2 + 32769"; return 1; }
+    mdir -i "$ESP@@1M" ::/EFI/BOOT 2>/dev/null | grep -q BOOTX64 || \
+        { echo "raw ESP verify FAILED: BOOTX64.EFI missing"; return 1; }
+    return 0
+}
+
+build_esp_file() {
     # ISO + firmware + slack, rounded up to whole MB.
     local mb
     mb=$(( $(stat -c%s "$ISO") / 1048576 + 96 ))
@@ -77,7 +141,12 @@ boot_once() {
     wait $qpid 2>/dev/null || true
 }
 
+build_esp() {
+    if [ "$ISO_MODE" = raw ]; then build_esp_raw; else build_esp_file; fi
+}
+
 build_esp || exit 1
+echo "delivery mode: $ISO_MODE ($(( ISO_BYTES / 1048576 )) MB ISO)"
 echo "booting $(basename "$ISO") for ${SECS}s -> $LOG"
 boot_once
 # hype prints its own banner as soon as it is entered. Its absence means the firmware never
