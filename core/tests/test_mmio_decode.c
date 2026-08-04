@@ -388,7 +388,97 @@ static void test_alu_null_rflags_is_safe(void) {
               hype_mmio_alu_apply(HYPE_MMIO_ALU_MOV, 0xFFFFu, 0x1234u, 4u, 0));
 }
 
+/* --- #306: MOV r/m, imm (the store-an-immediate forms) --- */
+
+static void test_decodes_mov_m32_imm32(void) {
+    /* FreeBSD's IO-APIC register select, from the panic hype used to produce:
+     * `mov dword [rbx], 1`. */
+    static const uint8_t insn[] = {0xC7, 0x03, 0x01, 0x00, 0x00, 0x00};
+    hype_mmio_decode_t d;
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(insn, (unsigned)sizeof(insn), &d));
+    CHECK_HEX("it is a write", 1u, (unsigned)d.is_write);
+    CHECK_HEX("dword", 4u, d.size_bytes);
+    CHECK_HEX("carries an immediate", 1u, (unsigned)d.has_imm);
+    CHECK_HEX("immediate value", 1u, d.imm_value);
+    CHECK_HEX("length opcode+modrm+imm32", 6u, d.instr_len);
+    CHECK_HEX("op is MOV", (unsigned)HYPE_MMIO_ALU_MOV, (unsigned)d.op);
+    /* And the resolver hands back the immediate, not a register's contents. */
+    CHECK_HEX("store value is the immediate", 1u, hype_mmio_store_value(&d, 0xDEADBEEFu));
+}
+
+static void test_decodes_mov_m8_imm8(void) {
+    static const uint8_t insn[] = {0xC6, 0x00, 0xAB};
+    hype_mmio_decode_t d;
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(insn, 3u, &d));
+    CHECK_HEX("byte", 1u, d.size_bytes);
+    CHECK_HEX("immediate", 0xABu, d.imm_value);
+    CHECK_HEX("length opcode+modrm+imm8", 3u, d.instr_len);
+}
+
+static void test_imm_length_is_added_for_each_addressing_form(void) {
+    /* instr_len wrong by even one byte resumes the guest MID-INSTRUCTION, which is a far
+     * nastier failure than the panic this replaces -- so every tail shape is pinned. */
+    struct { const char *name; uint8_t b[12]; unsigned len; unsigned expect; } cases[] = {
+        /* [rax], imm32 */
+        {"no disp", {0xC7, 0x00, 0x44, 0x33, 0x22, 0x11}, 6u, 6u},
+        /* [rax+0x10], imm32 : mod=01 disp8 */
+        {"disp8", {0xC7, 0x40, 0x10, 0x44, 0x33, 0x22, 0x11}, 7u, 7u},
+        /* [rax+0x11223344], imm32 : mod=10 disp32 */
+        {"disp32", {0xC7, 0x80, 0x44, 0x33, 0x22, 0x11, 0x99, 0x88, 0x77, 0x66}, 10u, 10u},
+        /* [rax+rcx*1], imm32 : mod=00 rm=100 SIB */
+        {"SIB", {0xC7, 0x04, 0x08, 0x44, 0x33, 0x22, 0x11}, 7u, 7u},
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        hype_mmio_decode_t d;
+        CHECK_HEX(cases[i].name, 0u,
+                  (unsigned)hype_mmio_decode(cases[i].b, cases[i].len, &d));
+        CHECK_HEX("instr_len", cases[i].expect, d.instr_len);
+        CHECK_HEX("has_imm", 1u, (unsigned)d.has_imm);
+    }
+}
+
+static void test_imm_store_rejects_a_non_zero_opcode_extension(void) {
+    /* For 0xC6/0xC7 the ModRM reg field is an opcode EXTENSION and must be /0. Anything
+     * else is a different instruction, so decoding it as a MOV would emulate something the
+     * guest never asked for. */
+    static const uint8_t insn[] = {0xC7, 0x08, 0x01, 0x00, 0x00, 0x00}; /* reg field = 1 */
+    hype_mmio_decode_t d;
+
+    CHECK_HEX("rejected", (unsigned)-1,
+              (unsigned)hype_mmio_decode(insn, (unsigned)sizeof(insn), &d));
+}
+
+static void test_imm_store_rejects_a_truncated_immediate(void) {
+    /* Only 3 of the 4 immediate bytes present: decoding it would read past what the
+     * caller fetched and invent a value to write to a device register. */
+    static const uint8_t insn[] = {0xC7, 0x00, 0x01, 0x00, 0x00};
+    hype_mmio_decode_t d;
+
+    CHECK_HEX("rejected", (unsigned)-1, (unsigned)hype_mmio_decode(insn, 5u, &d));
+}
+
+static void test_store_value_falls_back_to_the_register(void) {
+    /* The register-source path must be untouched -- every Linux guest depends on it. */
+    static const uint8_t insn[] = {0x89, 0x01}; /* mov [rcx], eax */
+    hype_mmio_decode_t d;
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(insn, 2u, &d));
+    CHECK_HEX("no immediate", 0u, (unsigned)d.has_imm);
+    CHECK_HEX("store value comes from the register", 0xBEEFu,
+              hype_mmio_store_value(&d, 0x1234BEEFu) & 0xFFFFu);
+}
+
 int main(void) {
+    test_decodes_mov_m32_imm32();
+    test_decodes_mov_m8_imm8();
+    test_imm_length_is_added_for_each_addressing_form();
+    test_imm_store_rejects_a_non_zero_opcode_extension();
+    test_imm_store_rejects_a_truncated_immediate();
+    test_store_value_falls_back_to_the_register();
     test_decodes_and_r32_m32();
     test_decodes_the_rest_of_the_group();
     test_mov_is_still_a_mov();

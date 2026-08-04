@@ -106,6 +106,9 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
             reg_field = (uint8_t)(reg_field | 0x08u);
         }
         out->instr_len = (uint8_t)(modrm_index + 1 + tail_len);
+        out->op = HYPE_MMIO_ALU_MOV;
+        out->has_imm = 0;
+        out->imm_value = 0;
 
         if (opcode2 == 0xB6u) { /* MOVZX r32/r64, r/m8 */
             out->is_write = 0;
@@ -136,6 +139,8 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
     }
     out->instr_len = (uint8_t)(modrm_index + 1 + tail_len);
     out->op = HYPE_MMIO_ALU_MOV; /* #305: overridden below only by the ALU forms */
+    out->has_imm = 0;            /* #306: set only by the imm store forms */
+    out->imm_value = 0;
 
     switch (opcode) {
         case 0x88u: /* MOV r/m8, r8 (store) */
@@ -195,6 +200,43 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
                       : (opcode == 0x3Bu) ? HYPE_MMIO_ALU_CMP
                                           : HYPE_MMIO_ALU_TEST;
             return 0;
+        /*
+         * #306: MOV r/m, imm -- the stored value is in the instruction. FreeBSD's IO-APIC
+         * register select is `mov dword [rbx], 1`.
+         *
+         * The ModRM reg field is an opcode EXTENSION here and must be /0; any other value
+         * is a different instruction, so it is rejected rather than decoded as a MOV with
+         * a stray register. The immediate follows the whole ModRM+SIB+displacement tail,
+         * and its length has to land in instr_len -- getting that wrong resumes the guest
+         * mid-instruction, which is far worse than the panic this replaces.
+         */
+        case 0xC6u:   /* MOV r/m8, imm8 */
+        case 0xC7u: { /* MOV r/m16, imm16 or r/m32, imm32 */
+            unsigned int imm_index = (unsigned int)(modrm_index + 1 + tail_len);
+            unsigned int imm_len;
+
+            if (reg_field != 0u) {
+                return -1; /* opcode extension must be /0 */
+            }
+            out->size_bytes = (opcode == 0xC6u) ? 1u : (operand16 ? 2u : 4u);
+            imm_len = (opcode == 0xC6u) ? 1u : (operand16 ? 2u : 4u);
+            if (imm_index + imm_len > num_bytes) {
+                return -1; /* the immediate is not in the bytes we were given */
+            }
+            out->is_write = 1;
+            out->reg = 0;
+            out->zero_extend = 0;
+            out->has_imm = 1;
+            out->imm_value = 0;
+            {
+                unsigned int k;
+                for (k = 0; k < imm_len; k++) {
+                    out->imm_value |= ((uint32_t)bytes[imm_index + k]) << (8u * k);
+                }
+            }
+            out->instr_len = (uint8_t)(imm_index + imm_len);
+            return 0;
+        }
         default:
             return -1;
     }
@@ -210,6 +252,13 @@ uint64_t hype_mmio_merge_read_value(uint64_t old_reg_value, uint32_t mem_value, 
 
     mask = (size_bytes == 1u) ? 0xFFULL : (size_bytes == 2u) ? 0xFFFFULL : 0xFFFFFFFFULL;
     return (old_reg_value & ~mask) | ((uint64_t)mem_value & mask);
+}
+
+uint32_t hype_mmio_store_value(const hype_mmio_decode_t *d, uint64_t reg_value) {
+    if (d != (const hype_mmio_decode_t *)0 && d->has_imm) {
+        return hype_mmio_extract_write_value((uint64_t)d->imm_value, d->size_bytes);
+    }
+    return hype_mmio_extract_write_value(reg_value, d ? d->size_bytes : 4u);
 }
 
 uint32_t hype_mmio_extract_write_value(uint64_t reg_value, uint8_t size_bytes) {

@@ -2666,13 +2666,14 @@ int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
         return -1; /* xAPIC registers are 32-bit dword accesses only */
     }
 
-    reg = gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /* #306: an immediate store has no source register -- see the IO-APIC handler. */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
 
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
         if (hype_guest_lapic_write(lapic, offset, decoded.size_bytes, value) != 0) {
             return -1;
         }
@@ -2747,13 +2748,19 @@ int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
         return -1; /* IOREGSEL/IOWIN are 32-bit accesses only */
     }
 
-    reg = gpr_ptr(real, decoded.reg);
-    if (reg == 0) {
+    /*
+     * #306: an immediate store has NO source register -- the ModRM reg field is an opcode
+     * extension -- so the GPR lookup is skipped rather than resolving register 0 and
+     * writing RAX to the device. FreeBSD selects IO-APIC registers exactly this way:
+     * `mov dword [rbx], 1`.
+     */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
         return -1;
     }
 
     if (decoded.is_write) {
-        uint32_t value = hype_mmio_extract_write_value(*reg, decoded.size_bytes);
+        uint32_t value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
         /* M4-6d7 DIAG: RTE-write timeline. Log every redirection-entry write
          * for the ISA GSIs of interest (1=kbd, 3=COM2, 4=COM1) plus the first
          * 24 writes overall, with the resulting full RTE -- proves whether the

@@ -87,6 +87,15 @@ typedef struct {
     uint8_t instr_len;
     /* #305: MOV unless the instruction was one of the memory-source ALU forms. */
     hype_mmio_alu_op_t op;
+    /*
+     * #306: the value being STORED comes from the instruction's immediate, not from a
+     * register (MOV r/m, imm -- opcodes 0xC6/0xC7). FreeBSD selects IO-APIC registers this
+     * way: `mov dword [rbx], 1`. When this is set, `reg` is MEANINGLESS -- the ModRM reg
+     * field is an opcode extension for these forms, and reading it as a source register
+     * would write a GPR's contents to the device instead of the intended constant.
+     */
+    int has_imm;
+    uint32_t imm_value;
 } hype_mmio_decode_t;
 
 /*
@@ -129,5 +138,12 @@ uint64_t hype_mmio_merge_read_value(uint64_t old_reg_value, uint32_t mem_value, 
  * upper, unused bits). Pure bit manipulation.
  */
 uint32_t hype_mmio_extract_write_value(uint64_t reg_value, uint8_t size_bytes);
+
+/*
+ * #306: the value a STORE writes, from whichever place the instruction keeps it -- the
+ * immediate for MOV r/m,imm, otherwise the source register. One helper so a handler cannot
+ * accidentally write a GPR's contents to a device when the instruction meant a constant.
+ */
+uint32_t hype_mmio_store_value(const hype_mmio_decode_t *d, uint64_t reg_value);
 
 #endif /* HYPE_ARCH_MMIO_DECODE_H */
