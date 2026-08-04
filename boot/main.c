@@ -494,7 +494,7 @@ typedef struct hype_fw_vm {
     uint32_t in_send_len;
     uint32_t in_send_pos;
     int in_send_is_key;
-    unsigned int in_send_stalls; /* INPUT-9 (#282): verdict line already emitted */
+    uint64_t in_send_stall_since_ms; /* 0 = not stalling */ /* INPUT-9 (#282): verdict line already emitted */
     /* M8-8 (#171): this VM's own fault watchdog. Per-VM so a faulted guest is forced
      * off ALONE -- condemning a healthy sibling would be worse than the hang. */
     hype_vm_watchdog_t watchdog;
@@ -11214,15 +11214,25 @@ static void fw_1_report_script_verdict(hype_fw_vm_t *vm, unsigned vm_index, uint
  * with a named reason is the point -- the old code's silent truncation is what made a
  * mis-delivered command look like a guest that ignored it.
  */
-#define HYPE_SCRIPT_SEND_MAX_STALLS 2000000u
+/*
+ * Bounded by TIME, not by iteration count. An iteration bound is unpredictable -- the
+ * dispatch loop's rate depends entirely on what the guest is doing -- and the first
+ * version of this held a script silently for minutes on a guest that never read its
+ * keyboard, which is the same "looks like a hang" outcome the truncation bug had.
+ */
+#define HYPE_SCRIPT_SEND_STALL_MS 5000u
 
-static int fw_1_script_drain_send(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uart_t *uart) {
+static int fw_1_script_drain_send(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uart_t *uart,
+                                  uint64_t now_ms) {
     while (vm->in_send_pos < vm->in_send_len) {
         uint8_t b = vm->in_send_buf[vm->in_send_pos];
         int accepted = vm->in_send_is_key ? hype_ps2_kbd_try_enqueue_scancode(&vm->ps2, b)
                                           : hype_guest_uart_rx_enqueue(uart, b);
         if (!accepted) {
-            if (++vm->in_send_stalls >= HYPE_SCRIPT_SEND_MAX_STALLS) {
+            if (vm->in_send_stall_since_ms == 0u) {
+                vm->in_send_stall_since_ms = now_ms;
+            }
+            if (now_ms - vm->in_send_stall_since_ms >= (uint64_t)HYPE_SCRIPT_SEND_STALL_MS) {
                 hype_debug_print("fw-1 SCRIPT vm%u: guest never drained its input -- %u of %u "
                                  "byte(s) of this %s undelivered; abandoning it rather than "
                                  "sending a truncated command [#301]\n",
@@ -11230,12 +11240,13 @@ static int fw_1_script_drain_send(hype_fw_vm_t *vm, unsigned vm_index, hype_gues
                                  (unsigned)vm->in_send_len,
                                  vm->in_send_is_key ? "sendkey" : "send");
                 vm->in_send_pos = vm->in_send_len; /* give up on the remainder */
+                vm->in_send_stall_since_ms = 0;
                 return 1;
             }
             return 0;
         }
         vm->in_send_pos++;
-        vm->in_send_stalls = 0;
+        vm->in_send_stall_since_ms = 0;
         if (vm->in_send_is_key) {
             g_sendkey_codes++;
         }
@@ -11252,7 +11263,8 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
     }
     /* Finish whatever the previous iteration could not fit before touching the script:
      * advancing with bytes still staged would interleave two directives. */
-    if (vm->in_send_pos < vm->in_send_len && !fw_1_script_drain_send(vm, vm_index, uart)) {
+    if (vm->in_send_pos < vm->in_send_len &&
+        !fw_1_script_drain_send(vm, vm_index, uart, now_ms)) {
         return;
     }
     for (;;) {
@@ -11265,8 +11277,8 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
             vm->in_send_len = i;
             vm->in_send_pos = 0;
             vm->in_send_is_key = 0;
-            vm->in_send_stalls = 0;
-            if (!fw_1_script_drain_send(vm, vm_index, uart)) {
+            vm->in_send_stall_since_ms = 0;
+            if (!fw_1_script_drain_send(vm, vm_index, uart, now_ms)) {
                 return; /* device full -- resume on the next dispatch iteration */
             }
             continue; /* a script may send twice in a row */
@@ -11303,8 +11315,8 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
             }
             vm->in_send_pos = 0;
             vm->in_send_is_key = 1;
-            vm->in_send_stalls = 0;
-            if (!fw_1_script_drain_send(vm, vm_index, uart)) {
+            vm->in_send_stall_since_ms = 0;
+            if (!fw_1_script_drain_send(vm, vm_index, uart, now_ms)) {
                 return;
             }
             continue;
