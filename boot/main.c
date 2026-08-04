@@ -7042,11 +7042,46 @@ static int fw_1_vblk_use_physical_ahci(hype_fw_vm_t *vm) {
 #endif
 
 /* Defined with the other host-device plumbing further down (the disk-absolute
- * and volume-relative AHCI adapters + the volume base the FS resolvers use). */
+ * and volume-relative adapters over the selected media device). */
 static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
 static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src);
 static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
-static uint64_t g_fat_esp_base;
+
+/*
+ * #321: THE host block device hype reads guest media and file-backed guest disk images from.
+ *
+ * This replaces a hardwired `(g_hostdisk_abar, g_hostdisk_port)` pair that every media read went
+ * through, which baked in two assumptions the intended deployment breaks (plan.md §6d, §10
+ * decision 25): that there is exactly one host disk, and that it is reachable over AHCI. Routing
+ * the reads through a selected device instead makes NVMe (#324) and a host DVD-ROM (#325)
+ * additive, and gives config-driven device selection (#323) something to select.
+ *
+ * The callback shape is not invented here -- `core/iso_stream.h`, `core/gpt.h`, `core/fat.h` and
+ * `core/ext.h` all already consume `(ctx, lba, count, dst)`, and `core/nvme_host.h` documents the
+ * same contract, so the two sides already agreed and only the middle was hardcoded. `ctx` was
+ * being discarded with `(void)ctx` at every leaf.
+ *
+ * `part_base_lba` is the volume-relative view's base: the first LBA of the partition currently
+ * being probed or used. It is NOT the ESP hype booted from -- it is reassigned as the scan walks
+ * partitions looking for media. It was previously called `g_media.part_base_lba`, a name that cost a
+ * wrong conclusion during the #319 investigation by implying a coupling to the boot device that
+ * does not exist.
+ */
+typedef struct {
+    int (*read)(void *ctx, uint64_t lba, uint32_t count, void *dst);
+    int (*write)(void *ctx, uint64_t lba, uint32_t count, const void *src); /* 0 if read-only */
+    void *ctx;
+    const char *bus;        /* "ahci"/"nvme"/... for logs; 0 until a device is selected */
+    uint64_t part_base_lba; /* volume-relative base, reassigned as partitions are probed */
+} hype_media_dev_t;
+
+static hype_media_dev_t g_media;
+
+/* 1 once a media device has been selected. Replaces the old `g_hostdisk_abar == 0` test, which
+ * asked an AHCI-specific question to mean "is there a host disk at all". */
+static int media_present(void) {
+    return g_media.read != 0;
+}
 
 static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     hype_gpt_partition_t part;
@@ -7055,14 +7090,14 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     const char *fs = 0;
     unsigned pidx;
 
-    if (g_hostdisk_abar == 0) {
-        return 0; /* no host disk enumerated: nothing to resolve against */
+    if (!media_present()) {
+        return 0; /* no media device selected: nothing to resolve against */
     }
     for (pidx = 1u; pidx <= 4u && fs == 0; pidx++) {
         if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
             continue;
         }
-        g_fat_esp_base = part.first_lba;
+        g_media.part_base_lba = part.first_lba;
         if (hype_fat32_resolve(fatvol_read, 0, path, &file) == 0) {
             fs = "FAT32";
         } else if (hype_exfat_resolve(fatvol_read, 0, path, &file) == 0) {
@@ -7074,7 +7109,7 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     if (fs == 0) {
         return 0;
     }
-    if (hype_blk_image_init(&vm->vblk_image, &vm->vblk_raw_be, &file, g_fat_esp_base,
+    if (hype_blk_image_init(&vm->vblk_image, &vm->vblk_raw_be, &file, g_media.part_base_lba,
                             hostdisk_read, hostdisk_write, 0) != 0) {
         /* A sparse or short-mapped image: refuse rather than serve a disk whose
          * later sectors would fail mid-install. #90's --check reports why. */
@@ -11241,32 +11276,65 @@ static void hype_spurious_irq15_isr(const hype_isr_frame_t *frame) {
     }
 }
 
-/* GLADDER-10 streaming: hostdisk_read() adapts hype_ahci_host_read() to the
- * (ctx, lba, count, dst) callback that core/gpt.c and core/iso_stream.c expect.
- * The ABAR/port it reads are declared up with the other host-device globals. */
-static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+/*
+ * #321: the AHCI implementation of the media device. One of several intended backends -- NVMe
+ * (#324) and host ATAPI (#325) are the others -- and the only one until those land, so this
+ * refactor is behaviour-preserving by construction.
+ */
+static int media_ahci_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
     return hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, dst);
+}
+static int media_ahci_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    return hype_ahci_host_write(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, src);
+}
+
+/* Binds the media device to the AHCI port host discovery selected. */
+static void media_select_ahci(void) {
+    g_media.read = media_ahci_read;
+    g_media.write = media_ahci_write;
+    g_media.ctx = 0;
+    g_media.bus = "ahci";
+}
+
+/* GLADDER-10 streaming: hostdisk_read() adapts the selected media device to the
+ * (ctx, lba, count, dst) callback that core/gpt.c and core/iso_stream.c expect.
+ * Disk-absolute: LBA 0 is the start of the device. */
+static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    (void)ctx;
+    if (!media_present()) {
+        return -1;
+    }
+    return g_media.read(g_media.ctx, lba, count, dst);
 }
 
 /* M5-8 (#199): the disk-absolute WRITE counterpart of hostdisk_read, for the
  * raw file-backed guest disk. DESTRUCTIVE by nature -- it only ever runs
  * against sectors inside an image file's own resolved extents (blk_image
  * splits every transfer at extent boundaries), so it cannot touch filesystem
- * metadata or any other file. */
+ * metadata or any other file.
+ *
+ * #321: a media device with no write callback (a DVD-ROM, once #325 lands) refuses here rather
+ * than being assumed writable -- read-only media backing a writable guest disk has to fail
+ * loudly at the first write, not silently discard it. */
 static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     (void)ctx;
-    return hype_ahci_host_write(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, src);
+    if (!media_present() || g_media.write == 0) {
+        return -1;
+    }
+    return g_media.write(g_media.ctx, lba, count, src);
 }
 
 /* GLADDER-11: the host FS reader (core/fat.c) wants a VOLUME-relative reader --
- * sector 0 == the FAT/exFAT ESP's boot sector. Offset every read by the ESP
- * partition's first LBA so the same physical disk backs both this and the
- * disk-absolute hostdisk_read(). */
+ * sector 0 == the volume's own boot sector. Offset every read by the partition's
+ * first LBA so the same device backs both this and the disk-absolute hostdisk_read(). */
 static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
-    return hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, g_fat_esp_base + lba,
-                               (uint16_t)count, dst);
+    if (!media_present()) {
+        return -1;
+    }
+    return g_media.read(g_media.ctx, g_media.part_base_lba + lba, count, dst);
 }
 
 /* GLADDER-9 (#140): field-by-field copy of a chunk list (freestanding hype has
@@ -13825,6 +13893,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             } else {
                 g_hostdisk_abar = hs.bar_phys;
                 g_hostdisk_port = (unsigned)sp;
+                media_select_ahci(); /* #321: route media reads through this device */
                 if (hype_ahci_host_read(hs.bar_phys, (unsigned)sp, 0u, 1u, g_hostdisk_probe) == 0) {
                     hype_debug_print("host-ahci: port %d LBA0 read OK -- mbrsig=%02x%02x\n", sp,
                                      (unsigned)g_hostdisk_probe[510], (unsigned)g_hostdisk_probe[511]);
@@ -13931,7 +14000,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
                             continue;
                         }
-                        g_fat_esp_base = part.first_lba;
+                        g_media.part_base_lba = part.first_lba;
                         if (hype_fat32_resolve(fatvol_read, 0, "\\iso\\test.iso", &file) == 0) {
                             hype_debug_print("host-fat: resolved \\iso\\test.iso on FAT32 partition %u\n",
                                              pidx);
@@ -13944,7 +14013,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     }
                     if (have_file && file.count == 1u) {
                         static uint8_t cd[8];
-                        uint64_t abs_lba = g_fat_esp_base + file.extents[0].start_lba;
+                        uint64_t abs_lba = g_media.part_base_lba + file.extents[0].start_lba;
                         hype_debug_print("host-fat: \\iso\\test.iso vol-LBA %llu -> disk-LBA %llu, "
                                          "%llu bytes, %u extent(s)\n",
                                          (unsigned long long)file.extents[0].start_lba,
