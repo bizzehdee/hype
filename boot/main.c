@@ -9328,6 +9328,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * until libata's 30s timeout resets the port. Clearing on EOI lets the
          * next raise (below) inject the pending completion immediately. */
         if (g_fw_1_lapic.eoi_count != ahci_last_eoi) {
+            /* #311: traced here rather than in the LAPIC model, which stays print-free so it
+             * can be unit-tested on the host. This counter moving is what drops a level line's
+             * Remote-IRR, so "no EOI ever reached hype" and "the EOI reached hype and the line
+             * stayed latched anyway" are the two halves of that bug. */
+            if (ahci_last_eoi < 24u) {
+                hype_debug_print("fw-1 LAPIC-EOI#%llu rte16=0x%llx rte21=0x%llx\n",
+                                 (unsigned long long)g_fw_1_lapic.eoi_count,
+                                 (unsigned long long)g_fw_1_ioapic.rte[HYPE_FW_1_AHCI_GSI],
+                                 (unsigned long long)g_fw_1_ioapic.rte[HYPE_FW_1_ATA_GSI]);
+            }
             ahci_last_eoi = g_fw_1_lapic.eoi_count;
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
             /* M5-7 (#196): same for the virtio-blk line -- on the guest's LAPIC
@@ -9366,16 +9376,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * never programmed (vector 0), and Remote-IRR stuck from a previous
                      * interrupt are three different bugs, and the guest's timeout ladder
                      * looks identical for all three -- so report the entry, once. */
-                    static int undelivered_reported = 0;
-                    if (!undelivered_reported) {
-                        undelivered_reported = 1;
-                        hype_debug_print("fw-1 AHCI-IRQ-UNDELIVERED: gsi=%u rte=0x%llx p_is=0x%x "
-                                         "p_ie=0x%x ghc=0x%x pci_line=%u\n",
-                                         (unsigned int)HYPE_FW_1_AHCI_GSI,
+                    /* Reported on a rising count rather than once: the FIRST undelivered
+                     * completion can be a transient the guest recovers from, and the one that
+                     * matters is the one that never clears. eoi_count vs ahci_last_eoi says
+                     * whether the guest has stopped acknowledging interrupts entirely or hype
+                     * is failing to drop the line despite EOIs. */
+                    static unsigned int undelivered_n = 0;
+                    if (undelivered_n < 8u) {
+                        undelivered_n++;
+                        hype_debug_print("fw-1 AHCI-IRQ-UNDELIVERED#%u: gsi=%u rte=0x%llx "
+                                         "p_is=0x%x p_ie=0x%x ghc=0x%x pci_line=%u eoi=%llu/%llu\n",
+                                         undelivered_n, (unsigned int)HYPE_FW_1_AHCI_GSI,
                                          (unsigned long long)g_fw_1_ioapic.rte[HYPE_FW_1_AHCI_GSI],
                                          (unsigned int)g_fw_1_ahci.p_is,
                                          (unsigned int)g_fw_1_ahci.p_ie,
-                                         (unsigned int)g_fw_1_ahci.ghc, (unsigned int)line);
+                                         (unsigned int)g_fw_1_ahci.ghc, (unsigned int)line,
+                                         (unsigned long long)g_fw_1_lapic.eoi_count,
+                                         (unsigned long long)ahci_last_eoi);
                     }
                 }
             }

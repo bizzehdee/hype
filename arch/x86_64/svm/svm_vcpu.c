@@ -1068,6 +1068,10 @@ void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *o
     }
 }
 
+static unsigned int g_int_trace_n = 0; /* #311: bounds the injection trace above */
+static unsigned int g_int_trace_timer_n = 0;
+static uint8_t g_int_trace_timer_vec = 0xFFu;
+
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int eventinj_busy = (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) != 0;
@@ -1078,6 +1082,37 @@ void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
      * loop iteration (timer, then AHCI/serial/PIT) unconditionally overwrote the
      * first vector's EVENTINJ, silently dropping it -- fatal to a self-re-arming
      * one-shot clockevent, which then never gets its next tick. */
+    /* #311: a bounded trace of every vector hype hands the guest, and by which route. The
+     * open question is whether an AHCI completion's vector reaches the guest's IDT at all --
+     * "injected but never taken" and "taken but the EOI was missed" are different bugs with
+     * different fixes, and from outside they look identical: a command that completed in hype
+     * and timed out in the guest. Bounded so steady interrupt traffic cannot flood the log. */
+    /* The periodic timer vector fires constantly and would consume the whole budget before
+     * the storage probe even starts, so it gets a small quota of its own and everything else
+     * -- which is what this trace exists for -- keeps the rest. */
+    if (vector == g_int_trace_timer_vec) {
+        if (g_int_trace_timer_n < 4u) {
+            g_int_trace_timer_n++;
+        } else {
+            goto trace_done;
+        }
+    } else if (g_int_trace_timer_vec == 0xFFu) {
+        g_int_trace_timer_vec = vector; /* first vector seen is the timer's, by construction */
+    }
+    if (g_int_trace_n < 40u) {
+        g_int_trace_n++;
+        hype_debug_print("fw-1 INJ#%02u vec=0x%02x %s rflags_if=%d shadow=%d einj_busy=%d\n",
+                         (unsigned int)g_int_trace_n, (unsigned int)vector,
+                         (!eventinj_busy && hype_svm_can_accept_interrupt(
+                                                real->vmcb->save.rflags,
+                                                real->vmcb->control.interrupt_shadow))
+                             ? "direct"
+                             : "deferred",
+                         (int)((real->vmcb->save.rflags >> 9) & 1u),
+                         (int)(real->vmcb->control.interrupt_shadow & 1u), eventinj_busy);
+    }
+trace_done:
+
     if (!eventinj_busy &&
         hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
@@ -2058,6 +2093,18 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
         if (g_ahci_trace) {
             hype_debug_print("ahci-trace: ABAR write off=0x%x val=0x%x\n", (unsigned int)offset,
                               (unsigned int)value);
+        }
+        /* #311: does the guest's ISR ever run? A PxIS write is RW1C -- it is how a driver
+         * acknowledges a completion -- so its absence means the handler was never entered,
+         * whatever hype staged for injection. */
+        if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS) {
+            static unsigned int pis_trace_n = 0;
+            if (pis_trace_n < 12u) {
+                pis_trace_n++;
+                hype_debug_print("fw-1 PxIS-ACK#%02u val=0x%x p_is_before=0x%x\n",
+                                 (unsigned int)pis_trace_n, (unsigned int)value,
+                                 (unsigned int)ahci->p_is);
+            }
         }
         if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
             return -1;
