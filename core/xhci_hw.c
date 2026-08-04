@@ -1414,14 +1414,13 @@ static unsigned int hub_port_speed(const uint8_t st[4]) {
     return HYPE_USB_SPEED_FULL;
 }
 
-int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
-                           const hype_xhci_devpath_t *hub_path, unsigned int tier,
-                           unsigned int *out_slot, hype_xhci_devpath_t *out_path,
-                           hype_xhci_msc_eps_t *out_msc) {
+int hype_xhci_hub_walk(hype_xhci_ctrl_t *c, unsigned int hub_slot,
+                       const hype_xhci_devpath_t *hub_path, unsigned int tier,
+                       hype_xhci_hub_visit_fn visit, void *ctx) {
     uint8_t hubdesc[16];
     unsigned int nports, port;
 
-    if (!c->inited || hub_slot == 0u) return -1;
+    if (!c->inited || hub_slot == 0u || visit == (hype_xhci_hub_visit_fn)0) return -1;
     if (tier == 0u || tier > 5u) return -1; /* xHCI route strings are 5 hub tiers deep */
 
     if (hub_get_descriptor(c, hub_slot, hubdesc, sizeof hubdesc) != 0) {
@@ -1511,31 +1510,88 @@ int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
                          (unsigned)(devdesc[8] | (devdesc[9] << 8)),
                          (unsigned)(devdesc[10] | (devdesc[11] << 8)));
 
-        if (hype_xhci_dev_is_hub(devdesc)) {
-            /* A nested hub: configure it, then descend one tier deeper. */
-            if (hype_xhci_get_config_descriptor(c, child_slot, cfg, sizeof cfg, &cfg_len) == 0 &&
-                cfg_len >= 6u &&
-                hype_xhci_set_configuration(c, child_slot, cfg[5]) == 0) {
-                if (hype_xhci_hub_find_msc(c, child_slot, &cp, tier + 1u,
-                                           out_slot, out_path, out_msc) == 0) {
-                    return 0; /* storage found somewhere below this nested hub */
-                }
-            }
-            hype_xhci_disable_slot(c, child_slot); /* nothing storage-like below it */
-            continue;
-        }
+        /* Configuration descriptor where the device will give one -- the visitor needs
+         * it to classify a composite device and to read its endpoint set. A failure is
+         * not fatal: the device is still reported, with cfg_len 0. */
+        cfg_len = 0;
+        (void)hype_xhci_get_config_descriptor(c, child_slot, cfg, sizeof cfg, &cfg_len);
 
-        /* A leaf device: is it a bulk-only SCSI mass-storage device? */
-        if (hype_xhci_get_config_descriptor(c, child_slot, cfg, sizeof cfg, &cfg_len) == 0 &&
-            hype_xhci_msc_find_endpoints(cfg, cfg_len, out_msc) == 0) {
-            *out_slot = child_slot;
-            *out_path = cp;
-            return 0; /* left addressed; caller does SET_CONFIGURATION + Configure Endpoint */
+        {
+            int verdict = visit(ctx, c, child_slot, &cp, devdesc, cfg, cfg_len);
+
+            if (hype_xhci_dev_is_hub(devdesc)) {
+                /* A hub is a device AND a topology parent. It was just handed to the
+                 * visitor like any other; now configure it so its downstream ports can be
+                 * powered, and descend. Its slot stays addressed whatever the visitor
+                 * said -- every device below it is addressed through it. */
+                if (verdict == HYPE_XHCI_VISIT_STOP) {
+                    return 0;
+                }
+                if (cfg_len >= 6u && hype_xhci_set_configuration(c, child_slot, cfg[5]) == 0) {
+                    if (hype_xhci_hub_walk(c, child_slot, &cp, tier + 1u, visit, ctx) == 0) {
+                        return 0; /* a visitor below said STOP */
+                    }
+                }
+                continue;
+            }
+            if (verdict == HYPE_XHCI_VISIT_STOP) {
+                return 0; /* left addressed, as the contract promises */
+            }
+            if (verdict == HYPE_XHCI_VISIT_RELEASE) {
+                hype_xhci_disable_slot(c, child_slot);
+            }
         }
-        hype_xhci_disable_slot(c, child_slot); /* not storage */
     }
     return -1;
 }
+
+/*
+ * USB-8 (#231) pt5b: find the first bulk-only mass-storage device behind a hub.
+ *
+ * #241: now a thin visitor over hype_xhci_hub_walk() rather than its own descent. Two
+ * copies of the hub-port reset/address/descriptor sequence would be two places for the
+ * timing and route-string arithmetic to drift apart, and that arithmetic is what took
+ * several real-hardware runs to get right.
+ */
+typedef struct {
+    unsigned int *out_slot;
+    hype_xhci_devpath_t *out_path;
+    hype_xhci_msc_eps_t *out_msc;
+} hub_msc_seek_t;
+
+static int hub_msc_visit(void *ctx, hype_xhci_ctrl_t *c, unsigned int slot,
+                         const hype_xhci_devpath_t *path, const uint8_t *devdesc,
+                         const uint8_t *cfg, unsigned int cfg_len) {
+    hub_msc_seek_t *seek = (hub_msc_seek_t *)ctx;
+
+    (void)c;
+    if (hype_xhci_dev_is_hub(devdesc)) {
+        return HYPE_XHCI_VISIT_RELEASE; /* the walk keeps hub slots regardless */
+    }
+    if (cfg_len != 0u && hype_xhci_msc_find_endpoints(cfg, cfg_len, seek->out_msc) == 0) {
+        *seek->out_slot = slot;
+        *seek->out_path = *path;
+        return HYPE_XHCI_VISIT_STOP; /* left addressed for SET_CONFIGURATION + Configure EP */
+    }
+    return HYPE_XHCI_VISIT_RELEASE;
+}
+
+int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
+                           const hype_xhci_devpath_t *hub_path, unsigned int tier,
+                           unsigned int *out_slot, hype_xhci_devpath_t *out_path,
+                           hype_xhci_msc_eps_t *out_msc) {
+    hub_msc_seek_t seek;
+
+    if (out_slot == 0 || out_path == 0 || out_msc == 0) {
+        return -1;
+    }
+    seek.out_slot = out_slot;
+    seek.out_path = out_path;
+    seek.out_msc = out_msc;
+    return hype_xhci_hub_walk(c, hub_slot, hub_path, tier, hub_msc_visit, &seek);
+}
+
+
 
 int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot) {
     xhci_hw_t *hw = HW(c);

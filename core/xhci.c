@@ -495,3 +495,31 @@ void hype_xhci_ep_ctx_interval(uint32_t ep[8], unsigned int ep_type, unsigned in
     /* dword0: Interval[23:16]. */
     ep[0] = (ep[0] & ~0x00FF0000u) | ((interval & 0xFFu) << 16);
 }
+
+unsigned int hype_usb_collect_endpoints(const uint8_t *cfg, unsigned int len, hype_usb_ep_t *out,
+                                        unsigned int cap) {
+    unsigned int off = 0;
+    unsigned int n = 0;
+
+    if (cfg == (const uint8_t *)0 || out == (hype_usb_ep_t *)0) {
+        return 0;
+    }
+    while (off + 2u <= len && n < cap) {
+        unsigned int dlen = cfg[off];
+        unsigned int dtype = cfg[off + 1u];
+
+        if (dlen < 2u || off + dlen > len) {
+            break; /* device-supplied buffer: a bad length ends the walk, never spins */
+        }
+        if (dtype == HYPE_USB_DESC_ENDPOINT && dlen >= 7u) {
+            out[n].addr = cfg[off + 2u];
+            out[n].attributes = cfg[off + 3u];
+            out[n].mps = (uint16_t)((unsigned int)cfg[off + 4u] |
+                                    ((unsigned int)cfg[off + 5u] << 8));
+            out[n].interval = cfg[off + 6u];
+            n++;
+        }
+        off += dlen;
+    }
+    return n;
+}

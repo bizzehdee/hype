@@ -467,6 +467,38 @@ int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
                            hype_xhci_msc_eps_t *out_msc);
 
 /*
+ * USB-7 (#241): walk EVERY device behind a hub and hand each one to a visitor.
+ *
+ * hype_xhci_hub_find_msc() above enumerates the same topology but throws away anything
+ * that is not storage, so a keyboard or a camera behind a hub was addressed, read, and
+ * then forgotten -- the inventory could never describe it, and "where a device is plugged
+ * in must be irrelevant" was not true for anything below a hub. This is the same descent
+ * with the decision moved out to the caller.
+ *
+ * The visitor sees each device fully enumerated (addressed, device descriptor read, and
+ * configuration descriptor read where possible) and decides what happens to its slot.
+ * Nested hubs are visited too -- a hub is a device, and passthrough wants it listed --
+ * and are then descended into regardless of what the visitor returned, except on STOP.
+ *
+ * A hub's own slot stays addressed for the rest of the boot even if the visitor releases
+ * it: it is the topology parent every device below it is addressed through, and freeing
+ * it would invalidate its children.
+ */
+#define HYPE_XHCI_VISIT_RELEASE 0 /* keep walking; this device's slot may be freed */
+#define HYPE_XHCI_VISIT_KEEP 1    /* keep walking; leave the slot addressed */
+#define HYPE_XHCI_VISIT_STOP 2    /* stop the walk; leave the slot addressed */
+
+typedef int (*hype_xhci_hub_visit_fn)(void *ctx, hype_xhci_ctrl_t *c, unsigned int slot,
+                                      const hype_xhci_devpath_t *path, const uint8_t *devdesc,
+                                      const uint8_t *cfg, unsigned int cfg_len);
+
+/* Returns 0 if a visitor asked to STOP (so the caller knows it found what it wanted),
+ * -1 if the walk completed or the hub could not be read. */
+int hype_xhci_hub_walk(hype_xhci_ctrl_t *c, unsigned int hub_slot,
+                       const hype_xhci_devpath_t *hub_path, unsigned int tier,
+                       hype_xhci_hub_visit_fn visit, void *ctx);
+
+/*
  * USB-3 (#215) block I/O over Bulk-Only Transport (SCSI). Require the device to
  * be Enable-Slot'd, Address'd, SET_CONFIGURATION'd and its bulk endpoints
  * Configure-Endpoint'd (see above). All bounce through an internal page, so
@@ -569,6 +601,34 @@ typedef enum {
     HYPE_USB_OWNER_GUEST      /* passed through to a guest (reserved; no user yet) */
 } hype_usb_owner_t;
 
+/*
+ * USB-7 (#241): one endpoint of an enumerated device, as passthrough needs it -- a guest
+ * cannot be handed a device without knowing what endpoints to expose. Straight from the
+ * configuration descriptor; no interpretation.
+ */
+#define HYPE_USB_MAX_ENDPOINTS 8u
+
+typedef struct {
+    uint8_t addr;       /* bEndpointAddress, including the 0x80 IN bit */
+    uint8_t attributes; /* bmAttributes: bits 1:0 are the transfer type */
+    uint8_t interval;   /* bInterval, raw (its meaning depends on speed) */
+    uint16_t mps;       /* wMaxPacketSize */
+} hype_usb_ep_t;
+
+/*
+ * Collect a configuration descriptor's endpoints into `out`, returning how many were
+ * written. Stops at `cap` rather than overflowing -- a device with more endpoints than
+ * hype records is reported short, which the caller can see, instead of corrupting the
+ * table next to it.
+ *
+ * Walks the whole configuration (all interfaces), because an entry describes the DEVICE:
+ * a composite peripheral's endpoints all belong to it whichever interface declares them.
+ * Malformed lengths terminate the walk instead of spinning, same rule as every other
+ * descriptor walker here.
+ */
+unsigned int hype_usb_collect_endpoints(const uint8_t *cfg, unsigned int len, hype_usb_ep_t *out,
+                                        unsigned int cap);
+
 typedef struct {
     unsigned int controller;   /* index of the xHCI controller in PCI scan order */
     unsigned int root_port;    /* 1-based root port on that controller */
@@ -581,6 +641,10 @@ typedef struct {
     uint8_t dev_subclass;
     uint8_t dev_protocol;
     uint8_t owner;             /* hype_usb_owner_t */
+    /* #241: the device's endpoint set, for passthrough. ep_count 0 means the
+     * configuration descriptor could not be read, not that the device has none. */
+    uint8_t ep_count;
+    hype_usb_ep_t eps[HYPE_USB_MAX_ENDPOINTS];
 } hype_usb_devinfo_t;
 
 typedef struct {

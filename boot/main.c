@@ -800,6 +800,96 @@ static hype_phys_confirm_t g_phys_confirm;
  * and so a later passthrough feature has a topology to offer a guest. */
 static hype_usb_inventory_t g_usb_inv;
 
+/*
+ * USB-7 (#241): record ONE enumerated USB device in the inventory and return the class
+ * hype should treat it as.
+ *
+ * Shared by the root-port sweep and the hub-descent visitor so a device behind a hub is
+ * described exactly like one on a root port -- "where a device is plugged in must be
+ * irrelevant" is only true if there is one place that builds the entry.
+ */
+static uint8_t fw_1_usb_record(hype_usb_inventory_t *inv, unsigned int controller,
+                               const hype_xhci_devpath_t *path, unsigned int slot,
+                               const uint8_t *devdesc, const uint8_t *cfg,
+                               unsigned int cfg_len) {
+    hype_usb_devinfo_t di;
+
+    di.controller = controller;
+    di.root_port = path->root_port;
+    di.route = path->route;
+    di.slot = slot;
+    di.speed = path->speed;
+    di.vid = (uint16_t)(devdesc[8] | (devdesc[9] << 8));
+    di.pid = (uint16_t)(devdesc[10] | (devdesc[11] << 8));
+    di.dev_class = devdesc[4];
+    di.dev_subclass = devdesc[5];
+    di.dev_protocol = devdesc[6];
+    /*
+     * bDeviceClass is 0 on a COMPOSITE device -- which is most peripherals -- and the
+     * real class lives in its interface descriptor. Recording the device-descriptor value
+     * alone made both a keyboard and a mass-storage stick appear as class=00/00/00, so a
+     * class lookup for HID matched neither.
+     */
+    if (di.dev_class == 0u && cfg_len != 0u) {
+        (void)hype_usb_first_iface_class(cfg, cfg_len, &di.dev_class, &di.dev_subclass,
+                                         &di.dev_protocol);
+    }
+    di.owner = (uint8_t)HYPE_USB_OWNER_NONE;
+    di.ep_count = (uint8_t)hype_usb_collect_endpoints(cfg, cfg_len, di.eps,
+                                                      HYPE_USB_MAX_ENDPOINTS);
+    (void)hype_usb_inventory_add(inv, &di);
+    return di.dev_class;
+}
+
+/* Visitor context for the hub descent: records everything, keeps the first MSC. */
+typedef struct {
+    unsigned int controller;
+    unsigned int *msc_slot;
+    hype_xhci_devpath_t *msc_path;
+    hype_xhci_msc_eps_t *msc_eps;
+    int msc_wanted; /* 0 once a medium has been found elsewhere */
+} fw_1_hub_visit_ctx_t;
+
+static int fw_1_hub_visit(void *ctx, hype_xhci_ctrl_t *c, unsigned int slot,
+                          const hype_xhci_devpath_t *path, const uint8_t *devdesc,
+                          const uint8_t *cfg, unsigned int cfg_len) {
+    fw_1_hub_visit_ctx_t *v = (fw_1_hub_visit_ctx_t *)ctx;
+    uint8_t cls;
+
+    (void)c;
+    cls = fw_1_usb_record(&g_usb_inv, v->controller, path, slot, devdesc, cfg, cfg_len);
+    hype_debug_print("host-usb:   behind-hub device ctrl%u port%u route=0x%05x slot%u "
+                     "%04x:%04x class=%02x -- recorded [#241]\n",
+                     v->controller, path->root_port, path->route, slot,
+                     (unsigned)(devdesc[8] | (devdesc[9] << 8)),
+                     (unsigned)(devdesc[10] | (devdesc[11] << 8)), (unsigned)cls);
+    if (hype_xhci_dev_is_hub(devdesc)) {
+        return HYPE_XHCI_VISIT_RELEASE; /* the walk keeps hub slots as topology parents */
+    }
+    if (v->msc_wanted && cfg_len != 0u &&
+        hype_xhci_msc_find_endpoints(cfg, cfg_len, v->msc_eps) == 0) {
+        *v->msc_slot = slot;
+        *v->msc_path = *path;
+        v->msc_wanted = 0; /* first one wins; a second stick is inventory, not the medium */
+        /*
+         * KEEP, not STOP. Stopping the walk here is what the storage-only descent did, and
+         * it meant the ports AFTER the medium were never looked at -- a mouse sharing the
+         * hub with hype's boot stick never reached the inventory. The whole point of #241
+         * is that the sweep is complete regardless of what hype wants for itself.
+         */
+        return HYPE_XHCI_VISIT_KEEP;
+    }
+    /*
+     * Keep a HID device's slot: claiming a keyboard later needs it still addressed
+     * (#217). Everything else is released, and its inventory entry keeps the slot id it
+     * had -- a passthrough claim will have to re-address it. That is deliberate: the
+     * device-context pool is 8 per controller, so holding every slot would starve
+     * enumeration itself on a machine with a populated hub, which is a worse failure
+     * than an extra Address Device at claim time.
+     */
+    return (cls == HYPE_USB_CLASS_HID) ? HYPE_XHCI_VISIT_KEEP : HYPE_XHCI_VISIT_RELEASE;
+}
+
 /* M10-6a (#227): the enumerated NVMe scratch target for a confirmed `physical:`
  * write. hype boots off the AHCI ESP, so an NVMe controller is a SEPARATE disk
  * -- the safe destructive-write target under test. Captured at the host-nvme
@@ -12933,35 +13023,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                      * bookkeeping first is what makes the inventory complete rather
                      * than a list of things that happened to be useful. */
                     {
-                        hype_usb_devinfo_t di;
-                        di.controller = xhci_count;
-                        di.root_port = rp;
-                        di.route = 0u;
-                        di.slot = slot;
-                        di.speed = speed;
-                        di.vid = (uint16_t)(desc[8] | (desc[9] << 8));
-                        di.pid = (uint16_t)(desc[10] | (desc[11] << 8));
-                        di.dev_class = desc[4];
-                        di.dev_subclass = desc[5];
-                        di.dev_protocol = desc[6];
-                        /*
-                         * #241: bDeviceClass is 0 on a COMPOSITE device -- which is most
-                         * peripherals -- and the real class lives in its interface
-                         * descriptor. Recording the device-descriptor value alone made
-                         * both a keyboard and a mass-storage stick appear as
-                         * class=00/00/00, so a class lookup for HID matched neither.
-                         * Fall back to the first interface when the device declines to
-                         * say.
-                         */
-                        if (di.dev_class == 0u &&
-                            hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
-                                                            &cfglen) == 0) {
-                            (void)hype_usb_first_iface_class(cfgbuf, cfglen, &di.dev_class,
-                                                             &di.dev_subclass, &di.dev_protocol);
-                        }
-                        di.owner = (uint8_t)HYPE_USB_OWNER_NONE;
-                        di_class_for_slot = di.dev_class; /* #217: needed by the skip branch */
-                        (void)hype_usb_inventory_add(&g_usb_inv, &di);
+                        cfglen = 0;
+                        (void)hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
+                                                              &cfglen);
+                        di_class_for_slot = fw_1_usb_record(&g_usb_inv, xhci_count, &path, slot,
+                                                            desc, cfgbuf, cfglen);
                     }
 
                     if (hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
@@ -12976,19 +13042,37 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                          * (so its downstream ports can be powered/reset), then walk. */
                         hype_debug_print("host-xhci: port %u is a USB hub -- descending (#231 pt5b)\n",
                                          rp);
-                        if (hype_xhci_get_config_descriptor(&xc, slot, cfgbuf, sizeof(cfgbuf),
-                                                            &cfglen) == 0 && cfglen >= 6u &&
-                            hype_xhci_set_configuration(&xc, slot, cfgbuf[5]) == 0 &&
-                            hype_xhci_hub_find_msc(&xc, slot, &path, 1u,
-                                                   &msc_slot, &msc_path, &msc) == 0) {
-                            hype_debug_print("host-xhci: MSC found behind hub on port %u -- "
-                                             "slot %u route 0x%05x speed %u\n", rp, msc_slot,
-                                             msc_path.route, msc_path.speed);
-                            have_msc = 1; /* NB: keep the hub slot addressed as topology parent */
+                        /*
+                         * #241: walk the WHOLE hub and record every device, rather than
+                         * hunting storage and discarding the rest. A keyboard or camera
+                         * behind a hub used to be addressed, read, and forgotten, so the
+                         * inventory could never describe it.
+                         */
+                        if (cfglen >= 6u &&
+                            hype_xhci_set_configuration(&xc, slot, cfgbuf[5]) == 0) {
+                            fw_1_hub_visit_ctx_t vctx;
+                            vctx.controller = xhci_count;
+                            vctx.msc_slot = &msc_slot;
+                            vctx.msc_path = &msc_path;
+                            vctx.msc_eps = &msc;
+                            vctx.msc_wanted = !msc_found_any;
+                            /* The walk always runs to completion now, so its return value
+                             * only says whether a visitor cut it short; what matters is
+                             * whether a medium was captured. */
+                            (void)hype_xhci_hub_walk(&xc, slot, &path, 1u, fw_1_hub_visit, &vctx);
+                            if (msc_slot != 0u) {
+                                hype_debug_print("host-xhci: MSC found behind hub on port %u -- "
+                                                 "slot %u route 0x%05x speed %u\n", rp, msc_slot,
+                                                 msc_path.route, msc_path.speed);
+                                have_msc = 1;
+                            }
                         }
+                        /* The hub's own slot stays addressed either way -- it is the
+                         * topology parent of everything the walk just recorded, and the
+                         * hub itself is an inventory entry. */
                         if (!have_msc) {
-                            hype_debug_print("host-xhci: no storage behind hub on port %u\n", rp);
-                            hype_xhci_disable_slot(&xc, slot);
+                            hype_debug_print("host-xhci: no storage behind hub on port %u "
+                                             "(its devices are still in the inventory)\n", rp);
                             continue;
                         }
                     } else {
@@ -13261,6 +13345,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  (unsigned)d->pid, (unsigned)d->dev_class, (unsigned)d->dev_subclass,
                                  (unsigned)d->dev_protocol,
                                  hype_usb_owner_str((hype_usb_owner_t)d->owner));
+                /*
+                 * #241: the endpoint set, on its own line. Passthrough cannot expose a
+                 * device without knowing what endpoints it has, and printing them here is
+                 * what makes the inventory usable from a captured log on a machine with no
+                 * other channel. ep_count 0 means the configuration descriptor could not
+                 * be read, not that the device has no endpoints.
+                 */
+                if (d->ep_count == 0u) {
+                    hype_debug_print("host-usb:        eps: none read\n");
+                } else {
+                    static const char *const tt[4] = {"ctrl", "isoc", "bulk", "int"};
+                    unsigned int e;
+                    for (e = 0; e < d->ep_count; e++) {
+                        const hype_usb_ep_t *ep = &d->eps[e];
+                        hype_debug_print("host-usb:        ep 0x%02x %s-%s mps=%u interval=%u\n",
+                                         (unsigned)ep->addr, tt[ep->attributes & 0x03u],
+                                         (ep->addr & 0x80u) ? "in" : "out", (unsigned)ep->mps,
+                                         (unsigned)ep->interval);
+                    }
+                }
             }
             if (g_usb_inv.overflow != 0u) {
                 hype_debug_print("host-usb: %u device(s) seen but NOT inventoried -- table holds %u "

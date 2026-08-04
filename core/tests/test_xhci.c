@@ -656,7 +656,70 @@ static void test_ep_ctx_interval_field(void) {
     CHECK_HEX("dequeue ptr preserved", 0x1001u, ep[2]);
 }
 
+/* --- USB-7 (#241): endpoint-set collection --- */
+
+static void test_collect_endpoints_walks_all_interfaces(void) {
+    /* A composite device: two interfaces, three endpoints between them. All three belong
+     * to the DEVICE, so a passthrough entry must list all three -- stopping at the first
+     * interface would hand a guest a device missing half its endpoints. */
+    static const uint8_t cfg[] = {
+        9, 0x02, 0, 0, 2, 1, 0, 0x80, 50,          /* configuration */
+        9, 0x04, 0, 0, 2, 0x08, 0x06, 0x50, 0,     /* interface 0: MSC */
+        7, 0x05, 0x81, 0x02, 0x00, 0x02, 0,        /* bulk IN, mps 512 */
+        7, 0x05, 0x02, 0x02, 0x00, 0x02, 0,        /* bulk OUT, mps 512 */
+        9, 0x04, 1, 0, 1, 0x03, 0x01, 0x01, 0,     /* interface 1: HID keyboard */
+        7, 0x05, 0x83, 0x03, 0x08, 0x00, 10,       /* interrupt IN, mps 8, interval 10 */
+    };
+    hype_usb_ep_t eps[HYPE_USB_MAX_ENDPOINTS];
+    unsigned int n = hype_usb_collect_endpoints(cfg, (unsigned)sizeof(cfg), eps,
+                                                HYPE_USB_MAX_ENDPOINTS);
+
+    CHECK_HEX("three endpoints across two interfaces", 3u, n);
+    CHECK_HEX("ep0 addr", 0x81u, eps[0].addr);
+    CHECK_HEX("ep0 is bulk", 0x02u, eps[0].attributes & 0x03u);
+    CHECK_HEX("ep0 mps", 512u, eps[0].mps);
+    CHECK_HEX("ep1 addr", 0x02u, eps[1].addr);
+    CHECK_HEX("ep2 addr", 0x83u, eps[2].addr);
+    CHECK_HEX("ep2 is interrupt", 0x03u, eps[2].attributes & 0x03u);
+    CHECK_HEX("ep2 mps", 8u, eps[2].mps);
+    CHECK_HEX("ep2 interval", 10u, eps[2].interval);
+}
+
+static void test_collect_endpoints_stops_at_capacity(void) {
+    /* Reported short rather than overflowing into whatever follows the array. */
+    static const uint8_t cfg[] = {
+        9, 0x02, 0, 0, 1, 1, 0, 0x80, 50,
+        9, 0x04, 0, 0, 3, 0xFF, 0, 0, 0,
+        7, 0x05, 0x81, 0x02, 0x40, 0x00, 0,
+        7, 0x05, 0x82, 0x02, 0x40, 0x00, 0,
+        7, 0x05, 0x83, 0x02, 0x40, 0x00, 0,
+    };
+    hype_usb_ep_t eps[2];
+
+    CHECK_HEX("capped at the caller's capacity", 2u,
+              hype_usb_collect_endpoints(cfg, (unsigned)sizeof(cfg), eps, 2u));
+    CHECK_HEX("first two are the first two", 0x81u, eps[0].addr);
+    CHECK_HEX("second", 0x82u, eps[1].addr);
+}
+
+static void test_collect_endpoints_rejects_bad_input(void) {
+    hype_usb_ep_t eps[4];
+    /* A zero descriptor length would spin forever if trusted. */
+    static const uint8_t bad[] = {0, 0x02, 0, 0};
+    static const uint8_t overlong[] = {9, 0x02, 0, 0, 1, 1, 0, 0x80, 50, 40, 0x05, 0x81};
+
+    CHECK_HEX("NULL cfg", 0u, hype_usb_collect_endpoints(0, 10u, eps, 4u));
+    CHECK_HEX("NULL out", 0u, hype_usb_collect_endpoints(bad, 4u, 0, 4u));
+    CHECK_HEX("zero-length descriptor ends the walk", 0u,
+              hype_usb_collect_endpoints(bad, (unsigned)sizeof(bad), eps, 4u));
+    CHECK_HEX("descriptor claiming to run past the buffer ends the walk", 0u,
+              hype_usb_collect_endpoints(overlong, (unsigned)sizeof(overlong), eps, 4u));
+}
+
 int main(void) {
+    test_collect_endpoints_walks_all_interfaces();
+    test_collect_endpoints_stops_at_capacity();
+    test_collect_endpoints_rejects_bad_input();
     test_interval_encode();
     test_ep_ctx_interval_field();
     test_first_iface_class();
