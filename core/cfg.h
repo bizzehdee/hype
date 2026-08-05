@@ -173,6 +173,48 @@ typedef struct {
  */
 
 /*
+ * #222 (CONFIG-2, spec §5.1): hypervisor-global settings. Every key is optional, and the whole
+ * section may be absent -- so the defaults here must reproduce today's behaviour exactly.
+ *
+ * §4.3: a malformed [hype] falls back to these defaults rather than failing the parse. That is a
+ * different resilience rule from [vm.*] on purpose: a bad global cannot make a VM wrong, it can only
+ * make hype fall back to what it did before the section existed.
+ */
+typedef enum {
+    HYPE_CFG_VIEW_DASHBOARD = 0,
+    HYPE_CFG_VIEW_VM
+} hype_cfg_view_t;
+
+typedef enum {
+    HYPE_CFG_AUTOSTART_ALL = 0, /* the default: every VM starts, which is what hype does today */
+    HYPE_CFG_AUTOSTART_NONE,
+    HYPE_CFG_AUTOSTART_LIST
+} hype_cfg_autostart_t;
+
+typedef struct {
+    unsigned int config_version; /* §4.2; 1 when absent */
+
+    /* Cores hype may dispatch VMs on. Empty means "all cores"; a per-VM cpu_set is a subset of this
+     * (validated by admission, not here). */
+    int has_host_cpu_budget;
+    unsigned int host_cpu_budget[HYPE_CFG_MAX_CPUS];
+    unsigned int host_cpu_budget_count;
+
+    hype_cfg_net_mode_t default_net_mode; /* a per-VM net_mode overrides it */
+
+    hype_cfg_view_t dashboard_default_view;
+    char dashboard_default_vm[HYPE_CFG_NAME_MAX]; /* only meaningful for VIEW_VM */
+
+    hype_cfg_autostart_t autostart;
+    unsigned int autostart_count;
+    char autostart_vms[HYPE_CFG_MAX_VMS][HYPE_CFG_NAME_MAX]; /* only for AUTOSTART_LIST */
+
+    /* Set when the section was present but something in it was rejected: the defaults above apply,
+     * and the caller should say so rather than let the operator believe a global took effect. */
+    int malformed;
+} hype_cfg_hype_t;
+
+/*
  * #222 (CONFIG-2, spec §5.3): a named storage device, decoupled from any VM.
  *
  * Exists so one VM can attach several devices of mixed type and bus (one SATA + two NVMe, five
@@ -257,6 +299,7 @@ typedef struct {
 typedef enum {
     HYPE_CFG_SECTION_VM = 0,
     HYPE_CFG_SECTION_DISK,
+    HYPE_CFG_SECTION_HYPE,
     HYPE_CFG_SECTION_UNKNOWN
 } hype_cfg_section_kind_t;
 
@@ -275,6 +318,9 @@ typedef struct {
 typedef struct {
     hype_cfg_vm_t vms[HYPE_CFG_MAX_VMS];
     unsigned int vm_count;
+
+    /* #222 (§5.1): hypervisor-global settings; defaults applied when the section is absent. */
+    hype_cfg_hype_t hype;
 
     /* #222 (§5.3): named devices, referenced by VMs via disks =/cdroms =. */
     hype_cfg_disk_t disks[HYPE_CFG_MAX_DISKS];
@@ -335,6 +381,21 @@ typedef struct {
  */
 hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out);
 
+
+
+/*
+ * #222 (spec §5.6): the guest-facing bus a device should present on, resolving HYPE_CFG_BUS_DEFAULT
+ * against the owning VM's os_hint.
+ *
+ * A separate call rather than something the parser bakes in, because a [disk.*] is parsed before it
+ * is known which VM attaches it -- and the same device may be referenced by VMs with different
+ * os_hints, which have different right answers.
+ *
+ * windows -> ahci-sata: there is no inbox virtio-blk driver, so a virtio system disk is INVISIBLE at
+ * Windows install time, while AHCI/SATA is inbox on every supported Windows. linux/bsd/none ->
+ * virtio-blk (inbox and fastest). type=cdrom is always ahci-atapi. An explicit bus always wins.
+ */
+hype_cfg_bus_t hype_cfg_resolve_bus(const hype_cfg_disk_t *disk, hype_cfg_os_hint_t os_hint);
 
 /*
  * #290: resolve the guest RAM size a VM should actually get, in MB.

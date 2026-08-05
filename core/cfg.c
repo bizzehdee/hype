@@ -86,10 +86,19 @@ static hype_cfg_status_t parse_target_disk(char *val, hype_cfg_target_disk_t *td
     return HYPE_CFG_OK;
 }
 
-static int cpu_set_contains(const hype_cfg_vm_t *vm, unsigned int core) {
+
+/*
+ * #222: the cpu-list destination, so `[hype] host_cpu_budget` reuses this exact range/list grammar
+ * (`0-3`, `0,1,2`) rather than growing a second parser that would inevitably diverge on the edges.
+ * Same single-threaded, one-key-at-a-time reasoning as g_list_dst below.
+ */
+static unsigned int *g_cpu_dst;
+static unsigned int *g_cpu_dst_count;
+
+static int cpu_dst_contains(unsigned int core) {
     unsigned int i;
-    for (i = 0; i < vm->cpu_set_count; i++) {
-        if (vm->cpu_set[i] == core) {
+    for (i = 0; i < *g_cpu_dst_count; i++) {
+        if (g_cpu_dst[i] == core) {
             return 1;
         }
     }
@@ -97,13 +106,14 @@ static int cpu_set_contains(const hype_cfg_vm_t *vm, unsigned int core) {
 }
 
 static hype_cfg_status_t cpu_set_add(hype_cfg_vm_t *vm, unsigned int core) {
-    if (cpu_set_contains(vm, core)) {
+    (void)vm;
+    if (cpu_dst_contains(core)) {
         return HYPE_CFG_ERR_BAD_VALUE;
     }
-    if (vm->cpu_set_count >= HYPE_CFG_MAX_CPUS) {
+    if (*g_cpu_dst_count >= HYPE_CFG_MAX_CPUS) {
         return HYPE_CFG_ERR_TOO_MANY_ENTRIES;
     }
-    vm->cpu_set[vm->cpu_set_count++] = core;
+    g_cpu_dst[(*g_cpu_dst_count)++] = core;
     return HYPE_CFG_OK;
 }
 
@@ -168,6 +178,8 @@ static hype_cfg_status_t cpu_set_piece(char *piece, hype_cfg_vm_t *vm) {
 
 static hype_cfg_status_t parse_cpu_set(char *val, hype_cfg_vm_t *vm) {
     vm->cpu_set_count = 0;
+    g_cpu_dst = vm->cpu_set;
+    g_cpu_dst_count = &vm->cpu_set_count;
     return for_each_comma_piece(val, vm, cpu_set_piece);
 }
 
@@ -438,6 +450,108 @@ static hype_cfg_status_t validate_required(const hype_cfg_vm_t *vm, unsigned int
     return HYPE_CFG_OK;
 }
 
+/* #222 (§5.1): per-[hype] duplicate-key tracking. */
+enum {
+    H_CONFIG_VERSION = 1u << 0,
+    H_HOST_CPU_BUDGET = 1u << 1,
+    H_DEFAULT_NET_MODE = 1u << 2,
+    H_DASHBOARD_VIEW = 1u << 3,
+    H_AUTOSTART = 1u << 4
+};
+
+static void hype_globals_defaults(hype_cfg_hype_t *h) {
+    unsigned char *p = (unsigned char *)h;
+    unsigned long long i;
+    for (i = 0; i < sizeof(*h); i++) {
+        p[i] = 0;
+    }
+    /* Zero is the right default for every enum here (NET_NONE, VIEW_DASHBOARD, AUTOSTART_ALL) and
+     * for the empty cpu budget meaning "all cores". config_version is the one exception. */
+    h->config_version = 1u;
+}
+
+/* `autostart = a, b` -- the list form. `all` / `none` are handled by the caller. */
+static hype_cfg_status_t autostart_piece(char *name, hype_cfg_vm_t *vm) {
+    (void)vm;
+    return id_list_piece(name, vm);
+}
+
+static hype_cfg_status_t apply_hype_field(hype_cfg_hype_t *h, unsigned int *seen, const char *key,
+                                         char *val) {
+    if (hype_streq(key, "config_version")) {
+        hype_cfg_status_t st;
+        if (*seen & H_CONFIG_VERSION) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        st = parse_uint_field(val, &h->config_version);
+        if (st != HYPE_CFG_OK) return st;
+        *seen |= H_CONFIG_VERSION;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "host_cpu_budget")) {
+        hype_cfg_status_t st;
+        if (*seen & H_HOST_CPU_BUDGET) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        h->host_cpu_budget_count = 0;
+        g_cpu_dst = h->host_cpu_budget;
+        g_cpu_dst_count = &h->host_cpu_budget_count;
+        /* Reuses cpu_set's own range/list grammar; the VM argument is unused by the destination. */
+        st = for_each_comma_piece(val, (hype_cfg_vm_t *)0, cpu_set_piece);
+        if (st != HYPE_CFG_OK) return st;
+        h->has_host_cpu_budget = 1;
+        *seen |= H_HOST_CPU_BUDGET;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "default_net_mode")) {
+        if (*seen & H_DEFAULT_NET_MODE) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_streq(val, "none")) {
+            h->default_net_mode = HYPE_CFG_NET_NONE;
+        } else if (hype_streq(val, "nat")) {
+            h->default_net_mode = HYPE_CFG_NET_NAT;
+        } else {
+            return HYPE_CFG_ERR_BAD_VALUE;
+        }
+        *seen |= H_DEFAULT_NET_MODE;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "dashboard_default_view")) {
+        if (*seen & H_DASHBOARD_VIEW) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_streq(val, "dashboard")) {
+            h->dashboard_default_view = HYPE_CFG_VIEW_DASHBOARD;
+        } else if (hype_strneq(val, "vm:", 3)) {
+            /* The VM named here need not exist yet -- sections may come later in the file, and
+             * whether it exists at all is a cross-entity question for admission. */
+            if (val[3] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
+            if (hype_strlcpy(h->dashboard_default_vm, val + 3, HYPE_CFG_NAME_MAX) >=
+                HYPE_CFG_NAME_MAX) {
+                return HYPE_CFG_ERR_VALUE_TOO_LONG;
+            }
+            h->dashboard_default_view = HYPE_CFG_VIEW_VM;
+        } else {
+            return HYPE_CFG_ERR_BAD_VALUE;
+        }
+        *seen |= H_DASHBOARD_VIEW;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "autostart")) {
+        if (*seen & H_AUTOSTART) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_streq(val, "all")) {
+            h->autostart = HYPE_CFG_AUTOSTART_ALL;
+        } else if (hype_streq(val, "none")) {
+            h->autostart = HYPE_CFG_AUTOSTART_NONE;
+        } else {
+            hype_cfg_status_t st;
+            h->autostart_count = 0;
+            g_list_dst = h->autostart_vms;
+            g_list_count = &h->autostart_count;
+            g_list_cap = HYPE_CFG_MAX_VMS;
+            st = for_each_comma_piece(val, (hype_cfg_vm_t *)0, autostart_piece);
+            if (st != HYPE_CFG_OK) return st;
+            h->autostart = HYPE_CFG_AUTOSTART_LIST;
+        }
+        *seen |= H_AUTOSTART;
+        return HYPE_CFG_OK;
+    }
+    return HYPE_CFG_ERR_UNKNOWN_KEY;
+}
+
 /* #222 (§5.3): per-[disk.*] duplicate-key tracking, independent of the [vm.*] flags above. */
 enum {
     D_TYPE = 1u << 0,
@@ -663,7 +777,8 @@ static int add_section(hype_cfg_t *out, hype_cfg_section_kind_t kind, const char
 
 static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int *cur,
                                                  unsigned int *seen, const char *raw, int *cur_disk,
-                                                 unsigned int *disk_seen) {
+                                                 unsigned int *disk_seen, int *cur_is_hype,
+                                                 unsigned int *in_hype_seen) {
     unsigned long long len = hype_strlen(line);
     char *body;
     char *name;
@@ -675,6 +790,18 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
     }
     line[len - 1] = '\0';
     body = line + 1;
+    if (hype_streq(body, "hype")) {
+        /* §5.1: the master section has no instance name. A second one is a duplicate, and silently
+         * merging two would make which value wins depend on file order. */
+        if (*in_hype_seen != 0u || out->hype.malformed) {
+            return HYPE_CFG_ERR_DUPLICATE_KEY;
+        }
+        *cur = -1;
+        *cur_disk = -1;
+        *cur_is_hype = 1;
+        (void)add_section(out, HYPE_CFG_SECTION_HYPE, "", raw, -1);
+        return HYPE_CFG_OK;
+    }
     if (hype_strneq(body, "disk.", 5)) {
         /* #222 (§5.3): a named device. Same shape as a VM section: the id must be non-empty and
          * unique, since `disks = a, b` resolves by id and a duplicate would make which device is
@@ -692,6 +819,7 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
             return HYPE_CFG_ERR_TOO_MANY_ENTRIES;
         }
         *cur = -1; /* not a VM: VM keys must not land in a disk section */
+        *cur_is_hype = 0;
         *cur_disk = (int)out->disk_count;
         zero_disk(&out->disks[*cur_disk]);
         if (hype_strlcpy(out->disks[*cur_disk].id, name, HYPE_CFG_NAME_MAX) >= HYPE_CFG_NAME_MAX) {
@@ -711,6 +839,7 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
          */
         *cur = -1;
         *cur_disk = -1;
+        *cur_is_hype = 0;
         (void)add_section(out, HYPE_CFG_SECTION_UNKNOWN, "", raw, -1);
         out->unknown_count++;
         return HYPE_CFG_OK;
@@ -730,6 +859,7 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
 
     *cur = (int)out->vm_count;
     *cur_disk = -1;
+    *cur_is_hype = 0;
     zero_vm(&out->vms[*cur]);
     name_len = hype_strlcpy(out->vms[*cur].name, name, HYPE_CFG_NAME_MAX);
     if (name_len >= HYPE_CFG_NAME_MAX) {
@@ -743,13 +873,14 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
 
 static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
                                             unsigned int *seen, const char *raw, int raw_truncated,
-                                            int cur_disk, unsigned int *disk_seen) {
+                                            int cur_disk, unsigned int *disk_seen, int cur_is_hype,
+                                            unsigned int *in_hype_seen) {
     char *eq;
     char *key;
     char *val;
     hype_cfg_status_t st;
 
-    if (cur < 0 && cur_disk < 0) {
+    if (cur < 0 && cur_disk < 0 && !cur_is_hype) {
         /*
          * #222: no CURRENT typed section. Two different cases, deliberately distinguished: inside a
          * retained unknown section the line is retained (section_count > 0), whereas a key before
@@ -776,8 +907,25 @@ static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
         return HYPE_CFG_ERR_SYNTAX;
     }
 
-    st = (cur_disk >= 0) ? apply_disk_field(&out->disks[cur_disk], disk_seen, key, val)
-                         : apply_field(&out->vms[cur], &seen[cur], key, val);
+    if (cur_is_hype) {
+        st = apply_hype_field(&out->hype, in_hype_seen, key, val);
+        if (st != HYPE_CFG_OK && st != HYPE_CFG_ERR_UNKNOWN_KEY) {
+            /*
+             * §4.3: a malformed [hype] falls back to global DEFAULTS instead of failing the parse.
+             * Deliberately a different rule from [vm.*]: a bad global cannot make a VM wrong, it can
+             * only make hype behave as it did before the section existed. The flag is what stops
+             * that being silent -- a rejected `host_cpu_budget` that just vanished would look like
+             * it had been applied.
+             */
+            hype_globals_defaults(&out->hype);
+            out->hype.malformed = 1;
+            *in_hype_seen = 0;
+            return HYPE_CFG_OK;
+        }
+    } else {
+        st = (cur_disk >= 0) ? apply_disk_field(&out->disks[cur_disk], disk_seen, key, val)
+                             : apply_field(&out->vms[cur], &seen[cur], key, val);
+    }
     if (st == HYPE_CFG_ERR_UNKNOWN_KEY) {
         /* #222: retained, not rejected -- the whole point of the keystone. Note `line` has been
          * mutated (the '=' overwritten), which is why retention works off the untouched `raw`. */
@@ -792,8 +940,10 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     hype_cfg_result_t res;
     unsigned int seen[HYPE_CFG_MAX_VMS];
     unsigned int disk_seen = 0;
+    unsigned int in_hype_seen = 0;
     int cur = -1;
     int cur_disk = -1;
+    int cur_is_hype = 0;
     unsigned int line_no = 0;
     char *p = text;
     unsigned int i;
@@ -801,6 +951,7 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     res.status = HYPE_CFG_OK;
     res.line = 0;
     out->vm_count = 0;
+    hype_globals_defaults(&out->hype);
     out->disk_count = 0;
     out->skipped_disks = 0;
     out->section_count = 0;
@@ -844,10 +995,11 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
         }
 
         if (line[0] == '[') {
-            st = process_section_header(line, out, &cur, seen, raw, &cur_disk, &disk_seen);
+            st = process_section_header(line, out, &cur, seen, raw, &cur_disk, &disk_seen,
+                                        &cur_is_hype, &in_hype_seen);
         } else {
             st = process_key_value(line, out, cur, seen, raw, raw_truncated, cur_disk,
-                                   &disk_seen);
+                                   &disk_seen, cur_is_hype, &in_hype_seen);
         }
 
         if (st != HYPE_CFG_OK) {
@@ -978,4 +1130,22 @@ uint64_t hype_cfg_size_gb_to_bytes(unsigned int gb) {
     /* unsigned int caps at ~4.3e9, so 4.3e9 * 2^30 stays inside 64 bits -- no overflow guard
      * needed, and one would be dead code. */
     return (uint64_t)gb * 1024ull * 1024ull * 1024ull;
+}
+
+hype_cfg_bus_t hype_cfg_resolve_bus(const hype_cfg_disk_t *disk, hype_cfg_os_hint_t os_hint) {
+    if (disk == 0) {
+        return HYPE_CFG_BUS_DEFAULT;
+    }
+    /* An optical drive is ATAPI whatever anything else says: it is the only optical front-end hype
+     * has, and a cdrom on virtio-blk is not a thing a guest would recognise. */
+    if (disk->type == HYPE_CFG_DISK_TYPE_CDROM) {
+        return HYPE_CFG_BUS_AHCI_ATAPI;
+    }
+    if (disk->bus != HYPE_CFG_BUS_DEFAULT) {
+        return disk->bus; /* explicit always wins */
+    }
+    if (os_hint == HYPE_CFG_OS_WINDOWS) {
+        return HYPE_CFG_BUS_AHCI_SATA;
+    }
+    return HYPE_CFG_BUS_VIRTIO_BLK;
 }

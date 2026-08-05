@@ -1141,6 +1141,168 @@ static void test_vm_list_id_too_long(void) {
 }
 
 
+/* ---- #222 (spec §5.1): the [hype] master section ---- */
+
+static void test_hype_section_all_keys(void) {
+    char cfg[2048];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s%s",
+             "[hype]\n"
+             "config_version = 1\n"
+             "host_cpu_budget = 2-5, 8\n"
+             "default_net_mode = nat\n"
+             "dashboard_default_view = vm:a\n"
+             "autostart = a\n\n", VM_A);
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("[hype] parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("not malformed", 0, out.hype.malformed);
+    CHECK_INT("config_version", 1, out.hype.config_version);
+    /* The cpu-list grammar is SHARED with cpu_set: a range plus a single value. */
+    CHECK_INT("host_cpu_budget expanded", 5, out.hype.host_cpu_budget_count);
+    CHECK_INT("budget[0]", 2, out.hype.host_cpu_budget[0]);
+    CHECK_INT("budget[3]", 5, out.hype.host_cpu_budget[3]);
+    CHECK_INT("budget[4]", 8, out.hype.host_cpu_budget[4]);
+    CHECK_INT("default_net_mode nat", (int)HYPE_CFG_NET_NAT, (int)out.hype.default_net_mode);
+    CHECK_INT("view vm", (int)HYPE_CFG_VIEW_VM, (int)out.hype.dashboard_default_view);
+    CHECK_STR("view names the VM", "a", out.hype.dashboard_default_vm);
+    CHECK_INT("autostart list", (int)HYPE_CFG_AUTOSTART_LIST, (int)out.hype.autostart);
+    CHECK_INT("one VM autostarted", 1, out.hype.autostart_count);
+    CHECK_STR("autostart[0]", "a", out.hype.autostart_vms[0]);
+    /* The section is recorded in file order like any other. */
+    CHECK_INT("section 0 is [hype]", (int)HYPE_CFG_SECTION_HYPE, (int)out.sections[0].kind);
+}
+
+static void test_hype_section_absent_gives_todays_behaviour(void) {
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(VM_A, &out);
+
+    CHECK_INT("parses without [hype]", HYPE_CFG_OK, res.status);
+    CHECK_INT("config_version defaults to 1", 1, out.hype.config_version);
+    CHECK_INT("no cpu budget means all cores", 0, out.hype.has_host_cpu_budget);
+    CHECK_INT("net defaults to none", (int)HYPE_CFG_NET_NONE, (int)out.hype.default_net_mode);
+    CHECK_INT("view defaults to dashboard", (int)HYPE_CFG_VIEW_DASHBOARD,
+              (int)out.hype.dashboard_default_view);
+    /* ALL, not NONE: hype starts every VM today, and a default that stopped doing so would be a
+     * silent behaviour change for every existing config. */
+    CHECK_INT("autostart defaults to all", (int)HYPE_CFG_AUTOSTART_ALL, (int)out.hype.autostart);
+    CHECK_INT("not malformed", 0, out.hype.malformed);
+}
+
+static void test_hype_malformed_falls_back_to_defaults(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    /* §4.3: a bad global cannot make a VM wrong, so it must not fail the parse -- but it must not be
+     * silent either, or a rejected setting looks applied. */
+    snprintf(cfg, sizeof(cfg), "%s%s", "[hype]\ndefault_net_mode = carrier-pigeon\n", VM_A);
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("a malformed [hype] does not fail the parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("the VM still loads", 1, out.vm_count);
+    CHECK_INT("and the fallback is FLAGGED", 1, out.hype.malformed);
+    CHECK_INT("globals are back at their defaults", (int)HYPE_CFG_NET_NONE,
+              (int)out.hype.default_net_mode);
+}
+
+static void test_hype_unknown_key_still_retained(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    /* An UNKNOWN key is forward-compatibility (§4.1), not malformation -- so it is retained and does
+     * NOT trigger the defaults fallback. */
+    snprintf(cfg, sizeof(cfg), "%s%s", "[hype]\nfuture_global = 7\ndefault_net_mode = nat\n", VM_A);
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("not treated as malformed", 0, out.hype.malformed);
+    CHECK_INT("the known key still applied", (int)HYPE_CFG_NET_NAT, (int)out.hype.default_net_mode);
+    CHECK_INT("the unknown one retained", 1, out.retained_count);
+    CHECK_STR("verbatim", "future_global = 7", out.retained[0].text);
+}
+
+static void test_hype_section_errors(void) {
+    struct { const char *desc; const char *head; hype_cfg_status_t want; } cases[] = {
+        {"duplicate [hype] section", "[hype]\nautostart = all\n[hype]\nautostart = none\n",
+         HYPE_CFG_ERR_DUPLICATE_KEY},
+        /* A duplicate KEY inside [hype] is malformation like any other, so §4.3 turns it into a
+         * flagged defaults fallback -- NOT fatal, unlike a duplicate key in a [vm.*]. The asymmetry
+         * is the point of §4.3: a bad global can only cost you the global. */
+        {"duplicate key", "[hype]\nautostart = all\nautostart = none\n", HYPE_CFG_OK},
+        {"empty vm: view", "[hype]\ndashboard_default_view = vm:\n", HYPE_CFG_OK},
+        {"repeated autostart id", "[hype]\nautostart = a, a\n", HYPE_CFG_OK}
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char cfg[1024];
+        hype_cfg_t out;
+        hype_cfg_result_t res;
+        snprintf(cfg, sizeof(cfg), "%s%s", cases[i].head, VM_A);
+        res = parse_copy(cfg, &out);
+        CHECK_INT(cases[i].desc, (int)cases[i].want, (int)res.status);
+        /* The two "OK" rows are BAD VALUES that §4.3 converts into a flagged defaults fallback
+         * rather than a parse failure -- so assert the flag, or the OK would mean nothing. */
+        if (cases[i].want == HYPE_CFG_OK) {
+            CHECK_INT("...and it is flagged malformed", 1, out.hype.malformed);
+        }
+    }
+}
+
+static void test_hype_duplicate_after_malformed_is_still_caught(void) {
+    /* The malformed fallback clears the seen mask, so a naive duplicate check would stop noticing a
+     * second [hype] afterwards. */
+    char cfg[1024];
+    hype_cfg_t out;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", "[hype]\nautostart = nonsense-value\n[hype]\nautostart = all\n",
+             VM_A);
+    CHECK_INT("a second [hype] after a malformed one is still a duplicate",
+              HYPE_CFG_ERR_DUPLICATE_KEY, (int)parse_copy(cfg, &out).status);
+}
+
+/* ---- #222 (spec §5.6): bus default resolution ---- */
+
+static void test_resolve_bus(void) {
+    hype_cfg_disk_t d;
+
+    memset(&d, 0, sizeof(d));
+    d.type = HYPE_CFG_DISK_TYPE_DISK;
+    d.bus = HYPE_CFG_BUS_DEFAULT;
+    /* The one that matters: Windows has no inbox virtio-blk, so a virtio system disk is INVISIBLE at
+     * install time. Defaulting a Windows disk to virtio would look like a hype bug, not a config one. */
+    CHECK_INT("windows defaults to ahci-sata", (int)HYPE_CFG_BUS_AHCI_SATA,
+              (int)hype_cfg_resolve_bus(&d, HYPE_CFG_OS_WINDOWS));
+    CHECK_INT("linux defaults to virtio-blk", (int)HYPE_CFG_BUS_VIRTIO_BLK,
+              (int)hype_cfg_resolve_bus(&d, HYPE_CFG_OS_LINUX));
+    CHECK_INT("bsd defaults to virtio-blk", (int)HYPE_CFG_BUS_VIRTIO_BLK,
+              (int)hype_cfg_resolve_bus(&d, HYPE_CFG_OS_BSD));
+    CHECK_INT("none defaults to virtio-blk", (int)HYPE_CFG_BUS_VIRTIO_BLK,
+              (int)hype_cfg_resolve_bus(&d, HYPE_CFG_OS_NONE));
+
+    /* Explicit always wins, even where the default would disagree. */
+    d.bus = HYPE_CFG_BUS_NVME;
+    CHECK_INT("explicit nvme wins over the windows default", (int)HYPE_CFG_BUS_NVME,
+              (int)hype_cfg_resolve_bus(&d, HYPE_CFG_OS_WINDOWS));
+    d.bus = HYPE_CFG_BUS_VIRTIO_BLK;
+    CHECK_INT("explicit virtio-blk wins even for windows", (int)HYPE_CFG_BUS_VIRTIO_BLK,
+              (int)hype_cfg_resolve_bus(&d, HYPE_CFG_OS_WINDOWS));
+
+    /* A cdrom is ATAPI regardless -- it is the only optical front-end hype has. */
+    d.type = HYPE_CFG_DISK_TYPE_CDROM;
+    d.bus = HYPE_CFG_BUS_NVME;
+    CHECK_INT("a cdrom is ahci-atapi whatever bus says", (int)HYPE_CFG_BUS_AHCI_ATAPI,
+              (int)hype_cfg_resolve_bus(&d, HYPE_CFG_OS_LINUX));
+
+    CHECK_INT("a NULL disk resolves to DEFAULT rather than crashing", (int)HYPE_CFG_BUS_DEFAULT,
+              (int)hype_cfg_resolve_bus(0, HYPE_CFG_OS_LINUX));
+}
+
+
 int main(void) {
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
@@ -1188,6 +1350,13 @@ int main(void) {
     test_vm_cdroms_alone_satisfies_the_requirement();
     test_vm_list_errors();
     test_vm_list_id_too_long();
+    test_hype_section_all_keys();
+    test_hype_section_absent_gives_todays_behaviour();
+    test_hype_malformed_falls_back_to_defaults();
+    test_hype_unknown_key_still_retained();
+    test_hype_section_errors();
+    test_hype_duplicate_after_malformed_is_still_caught();
+    test_resolve_bus();
 
     if (failures == 0) {
         printf("all tests passed\n");
