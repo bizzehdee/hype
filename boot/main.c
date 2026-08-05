@@ -7063,9 +7063,9 @@ static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
  *
  * `part_base_lba` is the volume-relative view's base: the first LBA of the partition currently
  * being probed or used. It is NOT the ESP hype booted from -- it is reassigned as the scan walks
- * partitions looking for media. It was previously called `g_media.part_base_lba`, a name that cost a
- * wrong conclusion during the #319 investigation by implying a coupling to the boot device that
- * does not exist.
+ * partitions looking for media. It was previously a file-global called `g_fat_esp_base`, a name
+ * that cost a wrong conclusion during the #319 investigation by implying a coupling to the boot
+ * device that does not exist.
  */
 typedef struct {
     int (*read)(void *ctx, uint64_t lba, uint32_t count, void *dst);
@@ -7086,6 +7086,29 @@ static hype_cfg_t g_hype_cfg;
  * asked an AHCI-specific question to mean "is there a host disk at all". */
 static int media_present(void) {
     return g_media.read != 0;
+}
+
+/*
+ * #322: the media (ISO) path for VM `vi` -- hype.cfg's `install_media` when set, else the built-in
+ * per-VM default (\iso\test.iso for vm0, \iso\vm1.iso for vm1).
+ *
+ * ONE definition, used by BOTH the pre-ExitBootServices loader and the post-EBS streaming resolver.
+ * That is the point: the streaming path opened a hardcoded "\\iso\\test.iso" while only the pre-EBS
+ * loader consulted the config, so "pick any ISO" and "do not copy it into RAM" lived in different
+ * code paths and could not be had together. The pre-EBS loader's own comment records that the
+ * duplication is exactly why its hardcoded literal survived so long; a third caller must not be
+ * able to reintroduce the divergence.
+ *
+ * Returns ASCII; the pre-EBS loader converts to UTF-16 for the UEFI file protocol. Note the three
+ * resolvers do not agree on case (ext is case-SENSITIVE, the FAT pair are not), so a configured
+ * path must match the on-disk spelling for ext -- see #320.
+ */
+static const char *fw_1_media_path(unsigned vi) {
+    const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+    if (cv != 0 && cv->has_install_media && cv->install_media[0] != '\0') {
+        return cv->install_media;
+    }
+    return (vi == 0u) ? "\\iso\\test.iso" : "\\iso\\vm1.iso";
 }
 
 /* #324: the candidate host devices the media/image scan iterates. Defined with the rest of the
@@ -12960,14 +12983,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 g_vms[0].iso_size = 0;
                 hype_debug_print("iso-1: vm0 boot=disk -- no installer media attached\n");
             } else {
-                if (cv != 0 && cv->has_install_media && cv->install_media[0] != '\0') {
-                    if (hype_ascii_to_utf16(cv->install_media, iso_path_w,
+                /* #322: through the shared chooser, so this and the streaming resolver
+                 * cannot disagree about which ISO the operator asked for. */
+                {
+                    const char *want = fw_1_media_path(0u);
+                    if (hype_ascii_to_utf16(want, iso_path_w,
                                             (unsigned long long)HYPE_CFG_PATH_MAX) == 0) {
                         iso_path = (CHAR16 *)iso_path_w;
                     } else {
-                        hype_debug_print("iso-1: install_media '%s' is not a usable path "
-                                         "(too long or non-ASCII) -- falling back to the default\n",
-                                         cv->install_media);
+                        hype_debug_print("iso-1: media path '%s' is not usable (too long or "
+                                         "non-ASCII) -- falling back to the built-in default\n",
+                                         want);
                     }
                 }
                 if (load_iso_into_vm(ImageHandle, SystemTable, iso_path, &g_vms[0]) != 0) {
@@ -14157,6 +14183,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     int have_file = 0;
                     unsigned pidx;
                     unsigned didx; /* #324 */
+                    const char *media_path = fw_1_media_path(0u); /* #322 */
                     /* Scan up to the first 4 GPT partitions for \iso\test.iso,
                      * trying FAT32 then exFAT on each. This covers both the ISO
                      * sitting on the FAT ESP itself and on a separate FAT/exFAT
@@ -14175,15 +14202,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             continue;
                         }
                         g_media.part_base_lba = part.first_lba;
-                        if (hype_fat32_resolve(fatvol_read, 0, "\\iso\\test.iso", &file) == 0) {
-                            hype_debug_print("host-fat: resolved \\iso\\test.iso on FAT32 partition %u "
-                                             "of the %s device\n", pidx, g_media.bus);
+                        if (hype_fat32_resolve(fatvol_read, 0, media_path, &file) == 0) {
+                            hype_debug_print("host-fat: resolved %s on FAT32 partition %u "
+                                             "of the %s device\n", media_path, pidx, g_media.bus);
                             have_file = 1;
-                        } else if (hype_exfat_resolve(fatvol_read, 0, "\\iso\\test.iso", &file) == 0) {
-                            hype_debug_print("host-fat: resolved \\iso\\test.iso on exFAT partition %u "
-                                             "of the %s device\n", pidx, g_media.bus);
+                        } else if (hype_exfat_resolve(fatvol_read, 0, media_path, &file) == 0) {
+                            hype_debug_print("host-fat: resolved %s on exFAT partition %u "
+                                             "of the %s device\n", media_path, pidx, g_media.bus);
                             have_file = 1;
-                        } else if (hype_ext_resolve(fatvol_read, 0, "\\iso\\test.iso", &file) == 0) {
+                        } else if (hype_ext_resolve(fatvol_read, 0, media_path, &file) == 0) {
                             /*
                              * #320: ext too, matching the guest disk-image path
                              * (fw_1_vblk_use_image_file), which has always tried all three. The
@@ -14200,8 +14227,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                              * files are structurally fragmented, so under the old one-extent rule
                              * an ISO here was close to unusable however carefully it was written.
                              */
-                            hype_debug_print("host-fat: resolved \\iso\\test.iso on ext partition %u "
-                                             "of the %s device\n", pidx, g_media.bus);
+                            hype_debug_print("host-fat: resolved %s on ext partition %u "
+                                             "of the %s device\n", media_path, pidx, g_media.bus);
                             have_file = 1;
                         }
                     }
@@ -14223,8 +14250,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         static uint8_t cd[8];
                         uint64_t abs_lba = g_media.part_base_lba + file.extents[0].start_lba;
                         unsigned ei;
-                        hype_debug_print("host-fat: \\iso\\test.iso vol-LBA %llu -> disk-LBA %llu, "
-                                         "%llu bytes, %u extent(s)\n",
+                        hype_debug_print("host-fat: %s vol-LBA %llu -> disk-LBA %llu, "
+                                         "%llu bytes, %u extent(s)\n", media_path,
                                          (unsigned long long)file.extents[0].start_lba,
                                          (unsigned long long)abs_lba,
                                          (unsigned long long)file.size_bytes, file.count);
@@ -14262,8 +14289,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         /* #327: only reachable now for a file needing MORE runs than the resolvers
                          * can even report, i.e. one hype cannot describe rather than one it merely
                          * dislikes. Says the cap so the number is actionable. */
-                        hype_debug_print("host-fat: \\iso\\test.iso needs %u extents, more than the "
-                                         "%u hype can map -- cannot stream it\n",
+                        hype_debug_print("host-fat: %s needs %u extents, more than the "
+                                         "%u hype can map -- cannot stream it\n", media_path,
                                          file.count, (unsigned)HYPE_ISO_STREAM_MAX_EXTENTS);
                     }
                 }
