@@ -1087,7 +1087,31 @@ isn't lost.
       path never learn to honour `install_media`, and it silently caps media
       size. It may only be deleted once streaming covers configured paths,
       device selection, NVMe and multi-extent files — otherwise capability
-      is lost rather than consolidated.
+      is lost rather than consolidated. **Done** (`3b35b64`): the deletion
+      also had to make stream resolution **per-VM** (per-VM media existed
+      only in the RAM loader), move the `boot = disk` check into the
+      resolver, and un-gate resolution from AHCI discovery — it ran only
+      inside the AHCI-port branch, so an NVMe-only host would have been left
+      with no media at all.
+    - **The boot medium itself is a media source** (#326). The simplest
+      deployment is one USB stick holding hype *and* the ISOs, and it was
+      the one drive hype could not take media from: sources were AHCI/NVMe
+      only, and the RAM path had hidden this by reading the ISO through UEFI
+      before `ExitBootServices`, while firmware still owned the USB stack.
+      No new block or filesystem code was needed — post-EBS hype already
+      drives the stick through its own xHCI + USB-MSC backend and already
+      mounts a FAT32 volume on it to write `\HYPEFULL.LOG` (#216/#230), so
+      this only exposes that backend as a media device. It is registered but
+      not made *active*, so a machine with a real internal disk is
+      unchanged. Rejected alternative: declare that ISOs must live on a
+      non-boot drive. That is a restriction imposed by an implementation
+      gap, not by anything about the hardware, and it would have made the
+      cheapest possible setup the unsupported one.
+      Caveat, tracked as #340: hype captures no USB identity yet, so the
+      stick is registered with an empty serial and can be **auto-detected
+      but not named** by `media_disk` — which fails safe (it is also never
+      substituted for another drive's name), but leaves the one-stick
+      deployment unable to be stated explicitly in config.
     Implementation is sequenced as an enabling refactor first — replace the
     two hardwired globals with one selected media device behind the
     `(ctx, lba, count, dst)` callback `core/iso_stream.h` and
