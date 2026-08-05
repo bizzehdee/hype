@@ -2,7 +2,6 @@
 #define HYPE_DEVICES_ATAPI_H
 
 #include <stdint.h>
-#include "../core/chunked_iso.h"
 #include "../core/iso_stream.h"
 
 /*
@@ -91,16 +90,15 @@
 #define HYPE_ATAPI_MAX_SYNTH_RESPONSE 36
 
 typedef struct {
-    const uint8_t *media_data; /* caller-owned backing ISO image (flat); NULL if chunked */
-    /* GLADDER-10(a): alternative CHUNKED backing for multi-GB ISOs that can't
-     * be one contiguous allocation. Exactly one of media_data / media_chunks is
-     * non-NULL. READ(10) reports a start sector (media_lba); the caller scales
-     * it to a byte offset and copies from whichever backing is set (see
-     * svm_vcpu.c AHCI glue). */
-    const hype_chunked_iso_t *media_chunks;
-    /* GLADDER-10: alternative STREAMING backing -- ISO bytes fetched on demand
-     * from a raw disk partition (core/iso_stream.c) instead of held in RAM. At
-     * most one of media_data / media_chunks / media_stream is non-NULL. */
+    const uint8_t *media_data; /* caller-owned backing ISO image (flat); NULL if streamed */
+    /* GLADDER-10: the STREAMING backing -- ISO bytes fetched on demand from a host disk partition
+     * or file (core/iso_stream.c) instead of held in RAM. At most one of media_data /
+     * media_stream is non-NULL. READ(10) reports a start sector (media_lba); the caller scales it
+     * to a byte offset and reads from whichever backing is set (see svm_vcpu.c AHCI glue).
+     *
+     * #326: this is the ONLY backing a guest gets. The RAM-chunk alternative (GLADDER-10a) is
+     * retired -- it capped an ISO at what AllocatePages could serve contiguously. media_data
+     * survives for the pre-EBS ISO-2 microtest, which runs before a stream can exist. */
     hype_iso_stream_t *media_stream;
     uint64_t media_size;       /* GLADDER-10(b): logical bytes (64-bit for >=4GB ISOs); multiple of HYPE_ATAPI_SECTOR_SIZE */
     /* Sense state left behind by the most recently failed command, for
@@ -129,7 +127,7 @@ typedef struct {
      * requests by block count -- [0]=1, [1]=2..8, [2]=9..16, [3]=17..64,
      * [4]=65..256, [5]=>256 (2048-byte blocks, so bucket 4's ceiling is the
      * 512 KiB / 256-block transfer a DMA-capable drive typically reaches).
-     * Purely observational; reset by hype_atapi_reset[_chunked]. */
+     * Purely observational; reset by hype_atapi_reset[_stream]. */
     uint64_t read10_sectors_total;
     uint32_t read10_max_count;
     uint32_t read10_size_hist[6];
@@ -174,11 +172,12 @@ void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint64_t med
 /* GLADDER-10(a): reset with a CHUNKED backing (multi-GB ISO split across
  * non-contiguous buffers). media_size is taken from iso->total_bytes; the flat
  * media_data pointer is cleared. */
-void hype_atapi_reset_chunked(hype_atapi_t *dev, const hype_chunked_iso_t *iso);
 
 /* GLADDER-10: reset with a STREAMING backing -- the ISO is served on demand from
  * a raw disk partition via `stream` (core/iso_stream.c), not held in RAM.
- * media_size is taken from stream->iso_size; the flat/chunked backings are cleared. */
+ * media_size is taken from stream->iso_size; the flat backing is cleared. A NULL stream
+ * means an EMPTY drive (media_size 0), which is what a machine with no disc presents
+ * (#326: since the RAM-chunk backing was retired this is how "no media" is expressed). */
 void hype_atapi_reset_stream(hype_atapi_t *dev, hype_iso_stream_t *stream);
 
 /*

@@ -618,14 +618,13 @@ typedef struct hype_fw_vm {
     hype_ahci_t ata_ahci;
     hype_ata_disk_t ata_disk;
     /* GLADDER-9 (#140): per-VM ISO backing, so two guests can boot DIFFERENT
-     * media (Fedora on vm0, Ubuntu on vm1) rather than one shared global. The
-     * backing is either a RAM-loaded chunk list (iso_chunked, the QEMU/no-host-
-     * disk path) or an on-demand stream off a host disk partition/file
-     * (iso_stream, when iso_stream_ready). iso_host_phys/iso_size are the flat
-     * chunk-0 aliases the direct-read consumers (CD001 check) use. */
-    uint64_t iso_host_phys;
-    uint64_t iso_size;
-    hype_chunked_iso_t iso_chunked;
+     * media (Fedora on vm0, Ubuntu on vm1) rather than one shared global.
+     *
+     * #326: the backing is ALWAYS an on-demand stream off a host disk partition or file. The
+     * RAM-loaded chunk list that used to be the alternative is gone: it capped an ISO at what
+     * AllocatePages could serve CONTIGUOUSLY (Win11's 5.43 GB is refused outright on an 8 GB host,
+     * while streaming serves it), and having two acquisition paths is why only one of them ever
+     * learned to honour install_media (#322). */
     hype_iso_stream_t iso_stream;
     int iso_stream_ready;
     /* M5-7 (#196): per-VM virtio-blk disk + its block backend. vblk is the
@@ -754,13 +753,10 @@ static void fw_1_resolve_os_hint(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsig
 #define g_fw_1_vmrun_max_tsc (vm->vmrun_max_tsc)
 #define g_fw_1_vmrun_over100ms (vm->vmrun_over100ms)
 
-/* GLADDER-9 (#140): the loaded ISO backing is now PER-VM (hype_fw_vm_t.iso_*),
- * so two guests can boot different media. What used to be the g_iso_* globals
- * lives in g_vms[N].{iso_host_phys,iso_size,iso_chunked,iso_stream,
- * iso_stream_ready}: the RAM chunk list (iso_chunked, the QEMU/no-host-disk
- * path), the on-demand host-disk stream (iso_stream, when iso_stream_ready),
- * and the flat chunk-0 aliases (iso_host_phys/iso_size) the direct-read
- * consumers (ISO-2 self-test, load-time CD001 check) use. */
+/* GLADDER-9 (#140): the ISO backing is PER-VM (hype_fw_vm_t.iso_*), so two guests can boot
+ * different media. What used to be the g_iso_* globals lives in
+ * g_vms[N].{iso_stream,iso_stream_ready} -- since #326 the on-demand host-disk stream is the
+ * only backing there is. */
 /* Host usable-RAM total (UEFI memory map), reported by the guest CMOS model. */
 static uint64_t g_usable_ram_bytes;
 
@@ -2761,8 +2757,24 @@ static hype_ahci_t g_iso_2_ahci;
 static hype_atapi_t g_iso_2_atapi;
 
 /*
+ * #326: the ONLY ISO bytes hype still copies into RAM, and a bounded 64 KiB of them.
+ *
+ * ISO-2 (below) proves the emulated AHCI/ATAPI path delivers real ISO content, and it runs BEFORE
+ * the media stream is resolved (run_all_test_guests() is dispatched well ahead of host media
+ * discovery), so it cannot be repointed at the stream; the microtest would have to be deleted to
+ * remove this buffer entirely. The buffer is FILLED pre-ExitBootServices, because that is when UEFI
+ * file services still exist. It reads exactly one sector, the ISO9660 PVD at LBA 16, so it needs 16*2048+2048 =
+ * 34,816 bytes and never more. Bounding it at 64 KiB keeps the microtest's assertion while
+ * removing what #326 is actually about: the multi-GB whole-file copy that capped ISO size at
+ * contiguous AllocatePages.
+ */
+#define HYPE_ISO_2_HEAD_BYTES (64u * 1024u)
+static uint8_t g_iso_2_head[HYPE_ISO_2_HEAD_BYTES];
+static uint64_t g_iso_2_head_len;
+
+/*
  * ISO-2: backs M4-5's own AHCI/ATAPI in-memory model with ISO-1's real
- * loaded \iso\test.iso buffer (g_vms[0].iso_host_phys/iso_size) instead of a
+ * loaded head of \iso\test.iso (g_iso_2_head, #326) instead of a
  * synthetic pattern -- otherwise an exact copy of M4-5's own test
  * guest (same payload template, same fixed-address convention; PCI
  * discovery is PCI-2's own separate concern, not needed here). Reads
@@ -2791,7 +2803,14 @@ static void run_iso_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_guest_ram_zero(g_iso_2_guest_code, sizeof(g_iso_2_guest_code));
     hype_guest_ram_zero(g_iso_2_guest_stack, sizeof(g_iso_2_guest_stack));
 
-    hype_atapi_reset(&g_iso_2_atapi, (uint8_t *)(uintptr_t)g_vms[0].iso_host_phys, g_vms[0].iso_size);
+    /* #326: no media configured (boot=disk, or none found) means there is nothing for this test to
+     * verify. Skip cleanly -- it used to be handed a NULL buffer with size 0 and would have failed
+     * the byte comparison against address 0. */
+    if (g_iso_2_head_len == 0) {
+        hype_debug_print("iso-2: no installer media head loaded -- test skipped\n");
+        return;
+    }
+    hype_atapi_reset(&g_iso_2_atapi, g_iso_2_head, g_iso_2_head_len);
     hype_ahci_reset(&g_iso_2_ahci);
 
     cmd_list_phys = (uint64_t)(uintptr_t)g_iso_2_cmd_list;
@@ -2869,7 +2888,7 @@ static void run_iso_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
                    (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
     }
 
-    iso_bytes = (const uint8_t *)(uintptr_t)g_vms[0].iso_host_phys;
+    iso_bytes = g_iso_2_head;
     for (i = 0; i < HYPE_ATAPI_SECTOR_SIZE; i++) {
         uint64_t file_offset = (uint64_t)HYPE_ISO_2_PVD_LBA * HYPE_ATAPI_SECTOR_SIZE + i;
         if (g_iso_2_dest_buffer[i] != iso_bytes[file_offset]) {
@@ -3857,16 +3876,29 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_fatal("cpumsr: RDMSR(APIC_BASE) mismatch (got 0x%llx, expected 0x%llx)",
                        (unsigned long long)got_apic_base, (unsigned long long)apic_base_expected);
         }
-        /* EFER plausibility differs by backend: an SVM guest runs with SVME
-         * set (it's inside VMRUN); a VMX guest instead has LME|LMA (long mode)
-         * and never SVME. Check the bit that must be set for THIS backend. */
-        if (kind == HYPE_VMM_KIND_VMX) {
-            if ((got_efer & 0x400ULL) == 0) { /* LMA */
-                hype_fatal("cpumsr: RDMSR(EFER) implausible -- LMA bit not set (0x%llx)",
-                           (unsigned long long)got_efer);
-            }
-        } else if ((got_efer & HYPE_SVM_SAVE_EFER_SVME) == 0) {
-            hype_fatal("cpumsr: RDMSR(EFER) implausible -- SVME bit not set (0x%llx)",
+        /*
+         * EFER plausibility: a long-mode guest has LMA set on BOTH backends, so that is the bit to
+         * check, and SVME must be invisible on both.
+         *
+         * This arm used to require SVME *set* under SVM, on the reasoning that the guest is inside
+         * VMRUN. #316 deliberately ended that: hype must force EFER.SVME on in the VMCB (a VMRUN
+         * consistency check) but MASK IT OUT of what the guest reads, because hype does not expose
+         * SVM to guests -- a guest seeing SVME set while its own CPUID reports no SVM is
+         * self-contradictory, and OpenBSD reads EFER back and checks it. So the old assertion
+         * contradicted the fix and this build panicked with "SVME bit not set (0x500)" -- 0x500
+         * being LME|LMA, i.e. a perfectly healthy long-mode guest.
+         *
+         * Inverted deliberately rather than deleted: asserting SVME is ABSENT makes this a guard
+         * for #316, so a regression that leaks SVME back to guests fails here instead of in a BSD
+         * install months later.
+         */
+        if ((got_efer & 0x400ULL) == 0) { /* LMA */
+            hype_fatal("cpumsr: RDMSR(EFER) implausible -- LMA bit not set (0x%llx)",
+                       (unsigned long long)got_efer);
+        }
+        if ((got_efer & HYPE_SVM_SAVE_EFER_SVME) != 0) {
+            hype_fatal("cpumsr: RDMSR(EFER) leaks SVME to the guest (0x%llx) -- #316 requires it be "
+                       "masked on read; hype does not expose SVM to guests",
                        (unsigned long long)got_efer);
         }
     }
@@ -7659,11 +7691,10 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
                      (unsigned long long)g_fw_1_ata_disk.total_sectors,
                      (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
     fw_1_262_id_diff(&g_fw_1_ata_disk);
-    if (vm->iso_stream_ready) {
-        hype_atapi_reset_stream(&g_fw_1_atapi, &vm->iso_stream);
-    } else {
-        hype_atapi_reset_chunked(&g_fw_1_atapi, &vm->iso_chunked);
-    }
+    /* #326: streaming is the only ISO backing there is. A VM with no media resolved gets an EMPTY
+     * drive (media_size 0), which is what a real machine with an empty optical drive presents --
+     * not a missing device. */
+    hype_atapi_reset_stream(&g_fw_1_atapi, vm->iso_stream_ready ? &vm->iso_stream : 0);
     {
         uint64_t above_16mb = (vm->ram_bytes > 16ULL * 1024 * 1024)
                                   ? (vm->ram_bytes - 16ULL * 1024 * 1024)
@@ -7836,36 +7867,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      (unsigned long long)g_fw_1_ata_disk.total_sectors,
                      (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
     fw_1_262_id_diff(&g_fw_1_ata_disk);
-    /* GLADDER-10: prefer the streaming backing (ISO served on demand from its raw
-     * disk partition) when one was found + verified post-EBS; otherwise fall back
-     * to the RAM-chunked copy (GLADDER-10a). */
-    if (vm->iso_stream_ready) {
-        hype_atapi_reset_stream(&g_fw_1_atapi, &vm->iso_stream);
-    } else {
-        hype_atapi_reset_chunked(&g_fw_1_atapi, &vm->iso_chunked); /* GLADDER-10(a): chunked backing */
-    }
-#if HYPE_262_HIDE_EMPTY_CD
-    /*
-     * #262 PROBE, not a fix. With boot=disk there is no optical media, and BOTH
-     * devices then receive exactly one command and are abandoned -- the CD one
-     * INQUIRY, the SATA disk one IDENTIFY. Two unrelated models failing identically
-     * points at EDK2's shared ATA/ATAPI enumeration pass dying on the empty drive
-     * and taking the disk down with it.
-     *
-     * Report NO DEVICE on the CD's port (PxSSTS DET=0, PI=0) so the firmware skips
-     * it entirely, and see whether the SATA disk then gets SET FEATURES and reads.
-     * If it does, causation is established.
-     *
-     * Deliberately NOT a candidate fix: a real machine has empty optical drives and
-     * its firmware copes, so hiding the drive would paper over whatever hype's ATAPI
-     * model is getting wrong. This exists only to prove where to look.
-     */
-    if (vm->iso_size == 0) {
-        g_fw_1_ahci.p_ssts = 0;
-        g_fw_1_ahci.pi = 0;
-        hype_debug_print("fw-1 #262 PROBE: empty CD hidden (PxSSTS=0, PI=0) -- causation test\n");
-    }
-#endif
+    /* GLADDER-10 / #326: the ISO is served on demand from its host disk partition or file. The
+     * RAM-chunked fallback (GLADDER-10a) is retired -- see hype_fw_vm_t.iso_stream. */
+    hype_atapi_reset_stream(&g_fw_1_atapi, vm->iso_stream_ready ? &vm->iso_stream : 0);
     /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging
      * the CD-ROM discovery sequence -- hype_svm_set_ahci_trace(1) -- but
      * left off here: a real boot issues thousands of commands and each
@@ -11506,6 +11510,59 @@ static void media_select_ahci(void) {
     g_media.bus = "ahci";
 }
 
+/*
+ * #326: the USB stick hype booted from, as a media source.
+ *
+ * The simplest deployment is one stick holding hype AND the ISOs, and until now that could not
+ * stream: media sources were AHCI/NVMe only, so the boot medium -- the one drive guaranteed to be
+ * present -- was the one hype could not take media from. The RAM-preload path hid this, because it
+ * read the ISO through UEFI before ExitBootServices, when firmware still owned the USB stack.
+ *
+ * Nothing new is needed underneath: post-EBS hype already drives the stick through its own
+ * xHCI + USB-MSC block backend and already MOUNTS a FAT32 volume on it and writes \HYPEFULL.LOG
+ * (#216/#230, usb_log_setup below). This only exposes that same backend as a media device, with
+ * disk-absolute LBAs -- the partition base is the media layer's own business (g_media.part_base_lba).
+ */
+static const hype_blk_backend_t *g_media_usb_be;
+
+static int media_usb_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    (void)ctx;
+    if (g_media_usb_be == 0) {
+        return -1;
+    }
+    return hype_blk_backend_read(g_media_usb_be, lba, count, dst);
+}
+
+static int media_usb_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    if (g_media_usb_be == 0) {
+        return -1;
+    }
+    return hype_blk_backend_write(g_media_usb_be, lba, count, src);
+}
+
+/*
+ * Registered but NOT made active: a machine with a real internal disk should keep using it, and the
+ * scan iterates every registered device anyway. #323's media_disk names this one explicitly when the
+ * operator wants the stick specifically.
+ */
+static void media_select_usb(const hype_blk_backend_t *be) {
+    g_media_usb_be = be;
+    /*
+     * No serial: hype does not capture a USB identity today (SCSI INQUIRY gives vendor/product,
+     * not a unique serial). Under #323 an unidentified device can never be MATCHED, only
+     * auto-detected -- which fails safe: `media_disk` cannot name the stick yet, and will not
+     * silently select it for some other drive's name either.
+     */
+    media_add_dev(media_usb_read, media_usb_write, "usb", "");
+    if (!media_present()) {
+        g_media.read = media_usb_read;
+        g_media.write = media_usb_write;
+        g_media.ctx = 0;
+        g_media.bus = "usb";
+    }
+}
+
 /* #324: same, for an enumerated NVMe controller. */
 static void media_select_nvme(void) {
     media_add_dev(media_nvme_read, media_nvme_write, "nvme", g_hostnvme_serial);
@@ -11556,34 +11613,242 @@ static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     return g_media.read(g_media.ctx, g_media.part_base_lba + lba, count, dst);
 }
 
-/* GLADDER-9 (#140): field-by-field copy of a chunk list (freestanding hype has
- * no memcpy, so whole-struct assignment of the 48-entry chunk_base can't be
- * used). Used to let a sharing vm1 point at vm0's read-only backing. */
-static void chunked_iso_copy(hype_chunked_iso_t *dst, const hype_chunked_iso_t *src) {
-    unsigned i;
-    for (i = 0; i < HYPE_ISO_MAX_CHUNKS; i++) {
-        dst->chunk_base[i] = src->chunk_base[i];
+/*
+ * #326: resolve VM `vi`'s installer media into a STREAM, the only way an ISO now reaches a guest.
+ *
+ * Extracted from the AHCI-discovery block it used to be inlined in, and parameterised by VM,
+ * because retiring the RAM-preload path (#326) would otherwise have cost GLADDER-9/#140's per-VM
+ * media: that capability lived ONLY in the pre-EBS loader, which could load a different ISO per VM.
+ * Now both VMs resolve their own stream through one function, so `\iso\vm1.iso` still means what it
+ * used to -- and #323's per-VM media_disk applies to vm1 as well, which it did not before.
+ *
+ * Returns 1 if g_vms[vi] ended up with a verified stream, 0 otherwise (no media, or none found).
+ */
+static int fw_1_resolve_media_stream(unsigned vi) {
+    const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+
+    /*
+     * `boot = disk` means no optical media at all -- what you need to boot a guest hype has just
+     * installed. That check used to live in the pre-EBS RAM loader; with that path retired it has to
+     * live here, or a disk-boot VM would still be handed the installer CD it was configured away
+     * from.
+     */
+    if (cv != 0 && cv->boot == HYPE_CFG_BOOT_DISK) {
+        hype_debug_print("host-stream: vm%u boot=disk -- no installer media attached\n", vi);
+        return 0;
     }
-    dst->chunk_bytes = src->chunk_bytes;
-    dst->total_bytes = src->total_bytes;
-    dst->n_chunks = src->n_chunks;
+    /* GLADDER-11: prefer streaming the ISO from a FILE on the FAT32/
+     * exFAT ESP (GPT partition 1) -- the natural "copy hype.efi + an
+     * ISO onto a stick" layout. Locate the ESP, resolve
+     * \iso\test.iso to its on-disk extents via core/fat.c, and (for a
+     * contiguous file) point the ISO stream straight at those disk
+     * sectors. No RAM-resident copy. */
+    int iso_sel; /* #323 */
+    /*
+     * #323: which drive the operator named, decided once for both the FAT-file scan
+     * and the raw-partition fallback below. ABSENT (named but not present) suppresses
+     * both rather than letting either satisfy the request from another drive.
+     *
+     * This is the earliest point where the device list is complete (both scans have
+     * registered), so it is also where the config-wide §6i check runs.
+     */
+    {
+        hype_adm_result_t mr = hype_adm_check_media_disk(&g_hype_cfg, g_media_dev_serial,
+                                                         g_media_dev_count);
+        if (mr.status == HYPE_ADM_ERR_MEDIA_DISK_ABSENT) {
+            const hype_cfg_vm_t *bad = &g_hype_cfg.vms[mr.vm_index_a];
+            hype_serial_print("host-media: vm[%u] '%s': media_disk = '%s' is not present "
+                              "-- refusing to stream media from a different drive\n",
+                              mr.vm_index_a, bad->name, bad->media_disk);
+        }
+        iso_sel = media_selected_dev(vi);
+    }
+    {
+        hype_gpt_partition_t part;
+        hype_fat_file_t file;
+        int have_file = 0;
+        unsigned pidx;
+        unsigned didx; /* #324 */
+        const char *media_path = fw_1_media_path(vi); /* #322 */
+        /* Scan up to the first 4 GPT partitions for \iso\test.iso,
+         * trying FAT32 then exFAT on each. This covers both the ISO
+         * sitting on the FAT ESP itself and on a separate FAT/exFAT
+         * data partition (a UEFI ESP must be FAT, so exFAT media is
+         * always a non-ESP partition).
+         *
+         * #324: and across every registered host device, so an ISO on an NVMe drive is
+         * found too -- the intended deployment puts the ISOs on a separate internal
+         * drive (plan.md §6d) which on a modern machine is likely NVMe. */
+        for (didx = 0u; iso_sel != HYPE_ADM_MEDIA_ABSENT && didx < g_media_dev_count && !have_file; didx++) {
+        /* #323: restrict to the configured drive when one was named. */
+        if (iso_sel >= 0 && didx != (unsigned)iso_sel) {
+            continue;
+        }
+        if (media_use_dev(didx) != 0) {
+            continue;
+        }
+        for (pidx = 1u; pidx <= 4u && !have_file; pidx++) {
+            if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
+                continue;
+            }
+            g_media.part_base_lba = part.first_lba;
+            if (hype_fat32_resolve(fatvol_read, 0, media_path, &file) == 0) {
+                hype_debug_print("host-fat: vm%u resolved %s on FAT32 partition %u "
+                                 "of the %s device\n", vi, media_path, pidx, g_media.bus);
+                have_file = 1;
+            } else if (hype_exfat_resolve(fatvol_read, 0, media_path, &file) == 0) {
+                hype_debug_print("host-fat: vm%u resolved %s on exFAT partition %u "
+                                 "of the %s device\n", vi, media_path, pidx, g_media.bus);
+                have_file = 1;
+            } else if (hype_ext_resolve(fatvol_read, 0, media_path, &file) == 0) {
+                /*
+                 * #320: ext too, matching the guest disk-image path
+                 * (fw_1_vblk_use_image_file), which has always tried all three. The
+                 * ISO being the read-only one of the pair made the omission harmless
+                 * but arbitrary -- and the operator-facing promise is FAT32, exFAT or
+                 * ext (plan.md §6d).
+                 *
+                 * Two ext-specific differences, both from core/ext.h: matching is
+                 * CASE-SENSITIVE where the FAT resolvers are not, so this literal
+                 * means a lowercase `iso/test.iso`; and ext accepts '/' or '\\' as the
+                 * separator, so the shared literal needs no translation.
+                 *
+                 * This only became useful with #327: ext2/3 indirect-mapped large
+                 * files are structurally fragmented, so under the old one-extent rule
+                 * an ISO here was close to unusable however carefully it was written.
+                 */
+                hype_debug_print("host-fat: vm%u resolved %s on ext partition %u "
+                                 "of the %s device\n", vi, media_path, pidx, g_media.bus);
+                have_file = 1;
+            }
+        }
+        } /* #324: end device loop -- the log lines above name the bus via g_media.bus */
+        /*
+         * #327: any number of extents up to the resolvers' cap, not just one.
+         *
+         * The old `file.count == 1u` gate fell back to the RAM-preload path for a
+         * fragmented file -- and that path is being retired (#326), so it would have
+         * become a hard failure. It was also stricter than the rest of the block
+         * stack: hype_fat_file_t carries up to 64 runs and the guest disk-image path
+         * already consumes multi-extent files. A multi-GB ISO on a volume that was not
+         * freshly formatted fragments routinely; on ext, core/ext.h notes large
+         * indirect-mapped files are structurally fragmented, so one extent was close
+         * to unachievable there.
+         */
+        if (have_file && file.count >= 1u &&
+            file.count <= HYPE_ISO_STREAM_MAX_EXTENTS) {
+            static uint8_t cd[8];
+            uint64_t abs_lba = g_media.part_base_lba + file.extents[0].start_lba;
+            unsigned ei;
+            hype_debug_print("host-fat: %s vol-LBA %llu -> disk-LBA %llu, "
+                             "%llu bytes, %u extent(s)\n", media_path,
+                             (unsigned long long)file.extents[0].start_lba,
+                             (unsigned long long)abs_lba,
+                             (unsigned long long)file.size_bytes, file.count);
+            g_vms[vi].iso_stream.read = hostdisk_read;
+            g_vms[vi].iso_stream.ctx = 0;
+            g_vms[vi].iso_stream.part_start_lba = abs_lba;
+            g_vms[vi].iso_stream.iso_size = file.size_bytes;
+            /*
+             * Extents are VOLUME-relative (core/fat.h); the stream wants
+             * DISK-absolute, so add the partition base once here rather than at every
+             * read. A single-extent file leaves extent_count 0 so it keeps taking the
+             * contiguous fast path exactly as before.
+             */
+            g_vms[vi].iso_stream.extent_count = (file.count > 1u) ? file.count : 0u;
+            for (ei = 0; ei < file.count && ei < HYPE_ISO_STREAM_MAX_EXTENTS; ei++) {
+                g_vms[vi].iso_stream.extents[ei].start_lba =
+                    g_media.part_base_lba + file.extents[ei].start_lba;
+                g_vms[vi].iso_stream.extents[ei].sector_count =
+                    file.extents[ei].sector_count;
+            }
+            if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+                cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
+                g_vms[vi].iso_stream_ready = 1;
+                /* #320: the volume may be FAT32, exFAT or ext, so say which rather
+                 * than naming two of the three. */
+                hype_serial_print("host-stream: vm%u CD001 verified streaming from a FILE on "
+                                  "a host volume -- backing guest CD via streaming\n", vi);
+            } else {
+                hype_debug_print("host-stream: CD001 NOT found streaming the ESP file "
+                                 "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
+                                 (unsigned)cd[1], (unsigned)cd[2], (unsigned)cd[3],
+                                 (unsigned)cd[4]);
+            }
+        } else if (have_file) {
+            /* #327: only reachable now for a file needing MORE runs than the resolvers
+             * can even report, i.e. one hype cannot describe rather than one it merely
+             * dislikes. Says the cap so the number is actionable. */
+            hype_debug_print("host-fat: %s needs %u extents, more than the "
+                             "%u hype can map -- cannot stream it\n", media_path,
+                             file.count, (unsigned)HYPE_ISO_STREAM_MAX_EXTENTS);
+        }
+    }
+    /* GLADDER-10: fall back to streaming the ISO from its own raw
+     * partition (partition 2) if the FAT-file path above did not fire
+     * -- GPT-locate partition 2, stream-read its ISO9660 PVD and
+     * verify the "CD001" magic at byte 32769. Proves gpt + ahci_host +
+     * iso_stream compose against a raw-partition backing too. */
+    /* #324: and try the raw-partition fallback on every device too, not just the
+     * one that happened to be active when the FAT scan gave up. */
+    for (unsigned rdev = 0u; iso_sel != HYPE_ADM_MEDIA_ABSENT && rdev < g_media_dev_count &&
+                             !g_vms[vi].iso_stream_ready;
+         rdev++) {
+        if (iso_sel >= 0 && rdev != (unsigned)iso_sel) {
+            continue; /* #323 */
+        }
+        (void)media_use_dev(rdev);
+    if (!g_vms[vi].iso_stream_ready) {
+        hype_gpt_partition_t iso_part;
+        if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
+            hype_serial_print("host-gpt: no partition 2 (raw ISO) on the %s device\n",
+                              g_media.bus);
+        } else {
+            static uint8_t cd[8];
+            hype_debug_print("host-gpt: partition 2 = LBA %llu..%llu (%llu bytes)\n",
+                             (unsigned long long)iso_part.first_lba,
+                             (unsigned long long)iso_part.last_lba,
+                             (unsigned long long)iso_part.size_bytes);
+            g_vms[vi].iso_stream.read = hostdisk_read;
+            g_vms[vi].iso_stream.ctx = 0;
+            g_vms[vi].iso_stream.part_start_lba = iso_part.first_lba;
+            g_vms[vi].iso_stream.iso_size = iso_part.size_bytes;
+            if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+                cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
+                /* Streaming read path verified -- back the guest CD with it. */
+                g_vms[vi].iso_stream_ready = 1;
+                hype_serial_print("host-stream: vm%u CD001 verified via streaming from "
+                                  "partition 2 -- backing guest CD via streaming\n", vi);
+            } else {
+                hype_debug_print("host-stream: CD001 NOT found streaming part2 "
+                                 "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
+                                 (unsigned)cd[1], (unsigned)cd[2], (unsigned)cd[3],
+                                 (unsigned)cd[4]);
+            }
+        }
+    }
+    } /* #324: end raw-partition device loop */
+    return g_vms[vi].iso_stream_ready;
 }
 
-/* GLADDER-9 (#140): load an ISO file from the boot ESP into `vm`'s OWN RAM
- * chunk list (iso_chunked + the flat iso_host_phys/iso_size aliases), so a
- * second guest can be given DIFFERENT media than the first. Same 256MB-chunk
- * scheme as vm0's inline load. Returns 0 on success, -1 if the file is
- * absent / too small / unreadable / too big / not an ISO9660 image -- the
- * caller then falls back to sharing another VM's (read-only) backing. Pre-EBS
- * only: uses UEFI Simple File System + AllocatePages. */
-static int load_iso_into_vm(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable,
-                            CHAR16 *path, hype_fw_vm_t *vm) {
+/*
+ * #326: read the FIRST `buflen` bytes of an ISO off the boot ESP, for the ISO-2 microtest only.
+ *
+ * This is what is left of load_iso_into_vm(), which used to copy the WHOLE ISO into a 256 MB-chunk
+ * RAM list and was how every guest got its media. It is no longer a delivery path: guests are served
+ * by streaming (fw_1_resolve_media_stream), and this exists solely because ISO-2 runs before any
+ * stream has been resolved. Verifies "CD001" so a non-ISO file is refused rather than silently compared.
+ *
+ * Returns 0 and sets *out_len on success; -1 if the file is absent, too small, unreadable, or not an
+ * ISO9660 image. Pre-EBS only: uses UEFI Simple File System.
+ */
+static int load_iso_head(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable, CHAR16 *path,
+                         uint8_t *buf, unsigned buflen, uint64_t *out_len) {
     EFI_FILE_PROTOCOL *root = 0;
     UINT64 iso_size = 0;
-    const uint64_t chunk_bytes = 256ULL * 1024ULL * 1024ULL;
-    uint64_t n_chunks, ci;
-    const uint8_t *iso_bytes;
+    uint64_t want;
 
+    *out_len = 0;
     if (hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root) != EFI_SUCCESS) {
         return -1;
     }
@@ -11593,35 +11858,15 @@ static int load_iso_into_vm(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTabl
     if (iso_size < 32769 + 5) {
         return -1;
     }
-    n_chunks = (iso_size + chunk_bytes - 1ULL) / chunk_bytes;
-    if (n_chunks > HYPE_ISO_MAX_CHUNKS) {
+    want = (iso_size < (uint64_t)buflen) ? iso_size : (uint64_t)buflen;
+    if (hype_file_read_range(root, path, 0, buf, (UINTN)want) != EFI_SUCCESS) {
         return -1;
     }
-    for (ci = 0; ci < n_chunks; ci++) {
-        uint64_t this_len = iso_size - ci * chunk_bytes;
-        UINTN this_pages;
-        uint64_t base;
-        if (this_len > chunk_bytes) {
-            this_len = chunk_bytes;
-        }
-        this_pages = (UINTN)((this_len + 4095ULL) / 4096ULL);
-        base = hype_alloc_pages_any(SystemTable->BootServices, this_pages);
-        if (hype_file_read_range(root, path, ci * chunk_bytes, (void *)(uintptr_t)base,
-                                 (UINTN)this_len) != EFI_SUCCESS) {
-            return -1;
-        }
-        vm->iso_chunked.chunk_base[ci] = base;
-    }
-    vm->iso_chunked.chunk_bytes = chunk_bytes;
-    vm->iso_chunked.total_bytes = iso_size;
-    vm->iso_chunked.n_chunks = (unsigned)n_chunks;
-    vm->iso_host_phys = vm->iso_chunked.chunk_base[0];
-    vm->iso_size = iso_size;
-    iso_bytes = (const uint8_t *)(uintptr_t)vm->iso_host_phys;
-    if (iso_bytes[32769] != 'C' || iso_bytes[32770] != 'D' || iso_bytes[32771] != '0' ||
-        iso_bytes[32772] != '0' || iso_bytes[32773] != '1') {
+    if (buf[32769] != 'C' || buf[32770] != 'D' || buf[32771] != '0' || buf[32772] != '0' ||
+        buf[32773] != '1') {
         return -1; /* not a real ISO9660 image */
     }
+    *out_len = want;
     return 0;
 }
 
@@ -12992,16 +13237,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                           (unsigned long long)g_fw_1_ram_host_phys);
 
         /*
-         * ISO-1 / #261: give vm0 its installer media.
+         * ISO-1 / #261 / #326: read the HEAD of vm0's installer media, for the ISO-2 microtest.
          *
-         * This used to be ~80 lines duplicating load_iso_into_vm() (GLADDER-9,
-         * #140) with a HARDCODED L"\\iso\\test.iso" and hype_fatal() on every
-         * failure. That duplication is why the hardcoded path survived: hype.cfg's
-         * `boot` and `install_media` were parsed and validated by core/cfg.c and
-         * then never consulted here, so a perfectly valid `boot = disk` config --
-         * exactly what you need to boot a guest hype has just installed -- died on
-         * "iso-1: hype_file_get_size(test.iso) failed". Now it routes through the
-         * one loader, honours the config, and refuses rather than panicking.
+         * This is no longer how a guest gets its media. Until #326 this loaded the WHOLE ISO into a
+         * RAM chunk list and that was the backing the guest CD was served from; guests are now served
+         * exclusively by streaming (fw_1_resolve_media_stream). What remains is a bounded 64 KiB
+         * read, done here because UEFI file services still exist, for a microtest that runs before
+         * any stream has been resolved.
+         *
+         * `boot = disk` still means no media -- but note the decision that MATTERS now lives in the
+         * streaming resolver, not here: this read only affects whether a microtest has something to
+         * verify.
          */
         {
             const hype_cfg_vm_t *cv = (g_hype_cfg.vm_count > 0u) ? &g_hype_cfg.vms[0] : 0;
@@ -13009,40 +13255,31 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             CHAR16 *iso_path = (CHAR16 *)L"\\iso\\test.iso";
 
             if (cv != 0 && cv->boot == HYPE_CFG_BOOT_DISK) {
-                /* Boot from the guest's own disk: no optical media at all, so the
-                 * guest firmware has only the disk to boot -- which is what the
-                 * removable EFI/BOOT/BOOTX64.EFI an install writes is for. */
-                g_vms[0].iso_host_phys = 0;
-                g_vms[0].iso_size = 0;
-                hype_debug_print("iso-1: vm0 boot=disk -- no installer media attached\n");
+                g_iso_2_head_len = 0;
+                hype_debug_print("iso-1: vm0 boot=disk -- no installer media\n");
             } else {
-                /* #322: through the shared chooser, so this and the streaming resolver
-                 * cannot disagree about which ISO the operator asked for. */
-                {
-                    const char *want = fw_1_media_path(0u);
-                    if (hype_ascii_to_utf16(want, iso_path_w,
-                                            (unsigned long long)HYPE_CFG_PATH_MAX) == 0) {
-                        iso_path = (CHAR16 *)iso_path_w;
-                    } else {
-                        hype_debug_print("iso-1: media path '%s' is not usable (too long or "
-                                         "non-ASCII) -- falling back to the built-in default\n",
-                                         want);
-                    }
-                }
-                if (load_iso_into_vm(ImageHandle, SystemTable, iso_path, &g_vms[0]) != 0) {
-                    /* A refusal, not a panic: absent or unreadable media is an
-                     * operator/config mistake, and it must be diagnosable from the
-                     * log rather than taking hype down with it. vm0 simply gets no
-                     * optical drive, and its firmware falls through to the disk. */
-                    g_vms[0].iso_host_phys = 0;
-                    g_vms[0].iso_size = 0;
-                    hype_debug_print("iso-1: could not load installer media for vm0 -- "
-                                     "no optical drive attached (absent, unreadable, too big, "
-                                     "or not an ISO9660 image)\n");
+                /* #322: through the shared chooser, so this and the streaming resolver cannot
+                 * disagree about which ISO the operator asked for. */
+                const char *want = fw_1_media_path(0u);
+                if (hype_ascii_to_utf16(want, iso_path_w,
+                                        (unsigned long long)HYPE_CFG_PATH_MAX) == 0) {
+                    iso_path = (CHAR16 *)iso_path_w;
                 } else {
-                    hype_debug_print("iso-1: vm0 installer media loaded -- %llu bytes, "
-                                     "\"CD001\" verified\n",
-                                     (unsigned long long)g_vms[0].iso_size);
+                    hype_debug_print("iso-1: media path '%s' is not usable (too long or "
+                                     "non-ASCII) -- falling back to the built-in default\n", want);
+                }
+                if (load_iso_head(ImageHandle, SystemTable, iso_path, g_iso_2_head,
+                                  HYPE_ISO_2_HEAD_BYTES, &g_iso_2_head_len) != 0) {
+                    /* Not a panic, and NOT a media failure either: the guest's media comes from the
+                     * streaming resolver, which has not run yet. Only ISO-2 loses its input. */
+                    g_iso_2_head_len = 0;
+                    hype_debug_print("iso-1: could not read the head of vm0's media via UEFI "
+                                     "(absent, unreadable, or not an ISO9660 image) -- the ISO-2 "
+                                     "microtest will skip; guest media is unaffected\n");
+                } else {
+                    hype_debug_print("iso-1: read %llu bytes of vm0's media head, \"CD001\" "
+                                     "verified -- ISO-2 input ready (guest media is STREAMED, "
+                                     "not this)\n", (unsigned long long)g_iso_2_head_len);
                 }
             }
         }
@@ -13133,19 +13370,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             vm1->vblk_backing_phys =
                 hype_alloc_pages_any(SystemTable->BootServices, (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL));
             hype_guest_ram_zero((void *)(uintptr_t)vm1->vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
-            /* GLADDER-9: distinct media for vm1 if \iso\vm1.iso exists, else share
-             * vm0's read-only ISO backing. (The streaming case, when vm0 later
-             * ends up served from a host disk, is propagated to a sharing vm1
-             * after the post-EBS stream-setup block below.) */
-            if (load_iso_into_vm(ImageHandle, SystemTable, (CHAR16 *)L"\\iso\\vm1.iso", vm1) == 0) {
-                hype_debug_print("fw-1 VM1: loaded DISTINCT media \\iso\\vm1.iso (%llu bytes)\n",
-                                 (unsigned long long)vm1->iso_size);
-            } else {
-                chunked_iso_copy(&vm1->iso_chunked, &vm->iso_chunked);
-                vm1->iso_host_phys = vm->iso_host_phys;
-                vm1->iso_size = vm->iso_size;
-                hype_debug_print("fw-1 VM1: no \\iso\\vm1.iso -- sharing vm0's ISO backing\n");
-            }
+            /* GLADDER-9 (#140) / #326: vm1's media is resolved POST-EBS by
+             * fw_1_resolve_media_stream(1), which honours \iso\vm1.iso (and vm1's own
+             * install_media / media_disk) exactly as this pre-EBS RAM load used to -- so
+             * per-VM media survives the RAM path's retirement. Nothing to do here. */
             hype_debug_print(
                 "fw-1 VM1: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
                 (unsigned long long)vm1->combined_host_phys, (unsigned long long)vm1->combined_size,
@@ -13882,6 +14110,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                       &g_usb_xc, msc_slot, &g_usb_msc, 512u,
                                                       (uint64_t)last_lba + 1u);
                                     usb_log_setup(&g_usb_ube);
+                                    /* #326: the same backend is also a MEDIA source, so an ISO can
+                                     * live on the stick hype booted from -- the one-stick
+                                     * deployment. Registered after the log sink so a log still
+                                     * lands even if the media scan later finds nothing. */
+                                    media_select_usb(&g_usb_ube);
                                 }
                             }
 #if HYPE_XHCI_MSC_WRITE_SELFTEST
@@ -14204,213 +14437,47 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         hype_serial_print("host-disk: IDENTIFY failed\n");
                     }
                 }
-                /* GLADDER-11: prefer streaming the ISO from a FILE on the FAT32/
-                 * exFAT ESP (GPT partition 1) -- the natural "copy hype.efi + an
-                 * ISO onto a stick" layout. Locate the ESP, resolve
-                 * \iso\test.iso to its on-disk extents via core/fat.c, and (for a
-                 * contiguous file) point the ISO stream straight at those disk
-                 * sectors. No RAM-resident copy. */
-                int iso_sel; /* #323 */
-                /*
-                 * #323: which drive the operator named, decided once for both the FAT-file scan
-                 * and the raw-partition fallback below. ABSENT (named but not present) suppresses
-                 * both rather than letting either satisfy the request from another drive.
-                 *
-                 * This is the earliest point where the device list is complete (both scans have
-                 * registered), so it is also where the config-wide §6i check runs.
-                 */
-                {
-                    hype_adm_result_t mr = hype_adm_check_media_disk(&g_hype_cfg, g_media_dev_serial,
-                                                                     g_media_dev_count);
-                    if (mr.status == HYPE_ADM_ERR_MEDIA_DISK_ABSENT) {
-                        const hype_cfg_vm_t *bad = &g_hype_cfg.vms[mr.vm_index_a];
-                        hype_serial_print("host-media: vm[%u] '%s': media_disk = '%s' is not present "
-                                          "-- refusing to stream media from a different drive\n",
-                                          mr.vm_index_a, bad->name, bad->media_disk);
-                    }
-                    iso_sel = media_selected_dev(0u);
-                }
-                {
-                    hype_gpt_partition_t part;
-                    hype_fat_file_t file;
-                    int have_file = 0;
-                    unsigned pidx;
-                    unsigned didx; /* #324 */
-                    const char *media_path = fw_1_media_path(0u); /* #322 */
-                    /* Scan up to the first 4 GPT partitions for \iso\test.iso,
-                     * trying FAT32 then exFAT on each. This covers both the ISO
-                     * sitting on the FAT ESP itself and on a separate FAT/exFAT
-                     * data partition (a UEFI ESP must be FAT, so exFAT media is
-                     * always a non-ESP partition).
-                     *
-                     * #324: and across every registered host device, so an ISO on an NVMe drive is
-                     * found too -- the intended deployment puts the ISOs on a separate internal
-                     * drive (plan.md §6d) which on a modern machine is likely NVMe. */
-                    for (didx = 0u; iso_sel != HYPE_ADM_MEDIA_ABSENT && didx < g_media_dev_count && !have_file; didx++) {
-                    /* #323: restrict to the configured drive when one was named. */
-                    if (iso_sel >= 0 && didx != (unsigned)iso_sel) {
-                        continue;
-                    }
-                    if (media_use_dev(didx) != 0) {
-                        continue;
-                    }
-                    for (pidx = 1u; pidx <= 4u && !have_file; pidx++) {
-                        if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
-                            continue;
-                        }
-                        g_media.part_base_lba = part.first_lba;
-                        if (hype_fat32_resolve(fatvol_read, 0, media_path, &file) == 0) {
-                            hype_debug_print("host-fat: resolved %s on FAT32 partition %u "
-                                             "of the %s device\n", media_path, pidx, g_media.bus);
-                            have_file = 1;
-                        } else if (hype_exfat_resolve(fatvol_read, 0, media_path, &file) == 0) {
-                            hype_debug_print("host-fat: resolved %s on exFAT partition %u "
-                                             "of the %s device\n", media_path, pidx, g_media.bus);
-                            have_file = 1;
-                        } else if (hype_ext_resolve(fatvol_read, 0, media_path, &file) == 0) {
-                            /*
-                             * #320: ext too, matching the guest disk-image path
-                             * (fw_1_vblk_use_image_file), which has always tried all three. The
-                             * ISO being the read-only one of the pair made the omission harmless
-                             * but arbitrary -- and the operator-facing promise is FAT32, exFAT or
-                             * ext (plan.md §6d).
-                             *
-                             * Two ext-specific differences, both from core/ext.h: matching is
-                             * CASE-SENSITIVE where the FAT resolvers are not, so this literal
-                             * means a lowercase `iso/test.iso`; and ext accepts '/' or '\\' as the
-                             * separator, so the shared literal needs no translation.
-                             *
-                             * This only became useful with #327: ext2/3 indirect-mapped large
-                             * files are structurally fragmented, so under the old one-extent rule
-                             * an ISO here was close to unusable however carefully it was written.
-                             */
-                            hype_debug_print("host-fat: resolved %s on ext partition %u "
-                                             "of the %s device\n", media_path, pidx, g_media.bus);
-                            have_file = 1;
-                        }
-                    }
-                    } /* #324: end device loop -- the log lines above name the bus via g_media.bus */
-                    /*
-                     * #327: any number of extents up to the resolvers' cap, not just one.
-                     *
-                     * The old `file.count == 1u` gate fell back to the RAM-preload path for a
-                     * fragmented file -- and that path is being retired (#326), so it would have
-                     * become a hard failure. It was also stricter than the rest of the block
-                     * stack: hype_fat_file_t carries up to 64 runs and the guest disk-image path
-                     * already consumes multi-extent files. A multi-GB ISO on a volume that was not
-                     * freshly formatted fragments routinely; on ext, core/ext.h notes large
-                     * indirect-mapped files are structurally fragmented, so one extent was close
-                     * to unachievable there.
-                     */
-                    if (have_file && file.count >= 1u &&
-                        file.count <= HYPE_ISO_STREAM_MAX_EXTENTS) {
-                        static uint8_t cd[8];
-                        uint64_t abs_lba = g_media.part_base_lba + file.extents[0].start_lba;
-                        unsigned ei;
-                        hype_debug_print("host-fat: %s vol-LBA %llu -> disk-LBA %llu, "
-                                         "%llu bytes, %u extent(s)\n", media_path,
-                                         (unsigned long long)file.extents[0].start_lba,
-                                         (unsigned long long)abs_lba,
-                                         (unsigned long long)file.size_bytes, file.count);
-                        g_vms[0].iso_stream.read = hostdisk_read;
-                        g_vms[0].iso_stream.ctx = 0;
-                        g_vms[0].iso_stream.part_start_lba = abs_lba;
-                        g_vms[0].iso_stream.iso_size = file.size_bytes;
-                        /*
-                         * Extents are VOLUME-relative (core/fat.h); the stream wants
-                         * DISK-absolute, so add the partition base once here rather than at every
-                         * read. A single-extent file leaves extent_count 0 so it keeps taking the
-                         * contiguous fast path exactly as before.
-                         */
-                        g_vms[0].iso_stream.extent_count = (file.count > 1u) ? file.count : 0u;
-                        for (ei = 0; ei < file.count && ei < HYPE_ISO_STREAM_MAX_EXTENTS; ei++) {
-                            g_vms[0].iso_stream.extents[ei].start_lba =
-                                g_media.part_base_lba + file.extents[ei].start_lba;
-                            g_vms[0].iso_stream.extents[ei].sector_count =
-                                file.extents[ei].sector_count;
-                        }
-                        if (hype_iso_stream_read(&g_vms[0].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
-                            cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
-                            g_vms[0].iso_stream_ready = 1;
-                            /* #320: the volume may be FAT32, exFAT or ext, so say which rather
-                             * than naming two of the three. */
-                            hype_serial_print("host-stream: CD001 verified streaming from a FILE on "
-                                              "a host volume -- backing guest CD via streaming\n");
-                        } else {
-                            hype_debug_print("host-stream: CD001 NOT found streaming the ESP file "
-                                             "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
-                                             (unsigned)cd[1], (unsigned)cd[2], (unsigned)cd[3],
-                                             (unsigned)cd[4]);
-                        }
-                    } else if (have_file) {
-                        /* #327: only reachable now for a file needing MORE runs than the resolvers
-                         * can even report, i.e. one hype cannot describe rather than one it merely
-                         * dislikes. Says the cap so the number is actionable. */
-                        hype_debug_print("host-fat: %s needs %u extents, more than the "
-                                         "%u hype can map -- cannot stream it\n", media_path,
-                                         file.count, (unsigned)HYPE_ISO_STREAM_MAX_EXTENTS);
-                    }
-                }
-                /* GLADDER-10: fall back to streaming the ISO from its own raw
-                 * partition (partition 2) if the FAT-file path above did not fire
-                 * -- GPT-locate partition 2, stream-read its ISO9660 PVD and
-                 * verify the "CD001" magic at byte 32769. Proves gpt + ahci_host +
-                 * iso_stream compose against a raw-partition backing too. */
-                /* #324: and try the raw-partition fallback on every device too, not just the
-                 * one that happened to be active when the FAT scan gave up. */
-                for (unsigned rdev = 0u; iso_sel != HYPE_ADM_MEDIA_ABSENT && rdev < g_media_dev_count &&
-                                         !g_vms[0].iso_stream_ready;
-                     rdev++) {
-                    if (iso_sel >= 0 && rdev != (unsigned)iso_sel) {
-                        continue; /* #323 */
-                    }
-                    (void)media_use_dev(rdev);
-                if (!g_vms[0].iso_stream_ready) {
-                    hype_gpt_partition_t iso_part;
-                    if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
-                        hype_serial_print("host-gpt: no partition 2 (raw ISO) on the %s device\n",
-                                          g_media.bus);
-                    } else {
-                        static uint8_t cd[8];
-                        hype_debug_print("host-gpt: partition 2 = LBA %llu..%llu (%llu bytes)\n",
-                                         (unsigned long long)iso_part.first_lba,
-                                         (unsigned long long)iso_part.last_lba,
-                                         (unsigned long long)iso_part.size_bytes);
-                        g_vms[0].iso_stream.read = hostdisk_read;
-                        g_vms[0].iso_stream.ctx = 0;
-                        g_vms[0].iso_stream.part_start_lba = iso_part.first_lba;
-                        g_vms[0].iso_stream.iso_size = iso_part.size_bytes;
-                        if (hype_iso_stream_read(&g_vms[0].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
-                            cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
-                            /* Streaming read path verified -- back the guest CD with it. */
-                            g_vms[0].iso_stream_ready = 1;
-                            hype_serial_print("host-stream: CD001 verified via streaming from "
-                                              "partition 2 -- backing guest CD via streaming\n");
-                        } else {
-                            hype_debug_print("host-stream: CD001 NOT found streaming part2 "
-                                             "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
-                                             (unsigned)cd[1], (unsigned)cd[2], (unsigned)cd[3],
-                                             (unsigned)cd[4]);
-                        }
-                    }
-                }
-                } /* #324: end raw-partition device loop */
             }
         }
     }
 
+    /*
+     * #326: resolve each VM's media, AFTER every host-discovery pass (NVMe, USB, then AHCI) has
+     * registered its devices.
+     *
+     * This used to sit INSIDE the AHCI-port branch, which meant no AHCI disk => no streaming
+     * attempted at all, however many NVMe or USB devices had been registered. That was survivable
+     * only because the RAM-preload path caught those machines; with #326 it would have left an
+     * NVMe-only or USB-only host with no media at all.
+     */
+    (void)fw_1_resolve_media_stream(0u);
 #if HYPE_RUN_TWO_VMS
-    /* GLADDER-9 (#140): if vm0 ended up STREAMING its ISO from a host disk and
-     * vm1 is sharing vm0's backing (identical chunk-0 base -> no distinct
-     * \iso\vm1.iso was loaded), point vm1 at the same read-only stream. A vm1
-     * with its own RAM-loaded distinct media keeps that (iso_stream_ready 0). */
-    if (g_vms[0].iso_stream_ready &&
-        g_vms[1].iso_chunked.chunk_base[0] == g_vms[0].iso_chunked.chunk_base[0]) {
+    (void)fw_1_resolve_media_stream(1u);
+#endif
+
+#if HYPE_RUN_TWO_VMS
+    /*
+     * GLADDER-9 (#140): vm1 with no media of its own SHARES vm0's, read-only -- the long-standing
+     * behaviour for "no \iso\vm1.iso present". #326 keeps it, now expressed against the stream
+     * rather than a RAM chunk-0 base comparison: vm1 resolved its own stream above, so the only
+     * question left is whether it found one.
+     *
+     * Extents are copied too. Omitting them was survivable while streams were single-run; since #327
+     * a multi-extent ISO would otherwise give vm1 the extent map of a zeroed struct and it would read
+     * the wrong sectors -- silently, since extent_count 0 means "contiguous" rather than "unset".
+     */
+    if (g_vms[0].iso_stream_ready && !g_vms[1].iso_stream_ready) {
+        unsigned ei;
         g_vms[1].iso_stream.read = g_vms[0].iso_stream.read;
         g_vms[1].iso_stream.ctx = g_vms[0].iso_stream.ctx;
         g_vms[1].iso_stream.part_start_lba = g_vms[0].iso_stream.part_start_lba;
         g_vms[1].iso_stream.iso_size = g_vms[0].iso_stream.iso_size;
+        g_vms[1].iso_stream.extent_count = g_vms[0].iso_stream.extent_count;
+        for (ei = 0; ei < HYPE_ISO_STREAM_MAX_EXTENTS; ei++) {
+            g_vms[1].iso_stream.extents[ei] = g_vms[0].iso_stream.extents[ei];
+        }
         g_vms[1].iso_stream_ready = 1;
+        hype_debug_print("fw-1 VM1: no media of its own -- sharing vm0's streamed ISO (read-only)\n");
     }
 #endif
 

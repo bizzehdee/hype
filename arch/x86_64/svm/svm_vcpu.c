@@ -1682,8 +1682,8 @@ static uint64_t guest_dma_xlate(const hype_gpa_map_t *dma_map, uint64_t gpa, uin
  * __builtin_memcpy with a constant size lowers to a single unaligned mov
  * (x86_64 allows unaligned access), so there is no libc/memcpy dependency (this
  * is a freestanding build) and no strict-aliasing UB. ~8x fewer store ops than
- * the old byte loop for the flat-media / IDENTIFY PRDT copies. The chunked-media
- * read path has its own equivalent in core/chunked_iso.c. */
+ * the old byte loop for the flat-media / IDENTIFY PRDT copies. The streamed-media
+ */
 static void ahci_copy_fast(uint8_t *dst, const uint8_t *src, uint32_t n) {
     uint32_t k = 0;
     while (k + 8u <= n) {
@@ -1765,9 +1765,8 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     const uint8_t *src;
     /* Default 0: the ATA paths (IDENTIFY PACKET / SET FEATURES) and the synth
      * ATAPI responses copy from a flat `src`; only a media-data ATAPI read on a
-     * chunked backing sets this to 1 (below). Must be initialised or those paths
-     * would take the chunked copy with a stale media_offset -> spurious failure. */
-    int chunked_media = 0;
+     * streamed backing sets this to 1 (below). Must be initialised or those paths
+     * would take the streamed read with a stale media_offset -> spurious failure. */
     int stream_media = 0; /* GLADDER-10: media served on demand from a raw disk partition */
     uint64_t media_byte_off = 0; /* GLADDER-10(b): 64-bit byte offset = media_lba * sector size */
     uint32_t remaining;
@@ -1883,16 +1882,15 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
 
         /* GLADDER-10(a): media may be backed by a CHUNKED (non-contiguous) ISO
          * rather than a flat buffer. For flat media/synth, `src` is a plain
-         * pointer advanced per PRD; for chunked media, `src` is unused and each
+         * pointer advanced per PRD; for streamed media, `src` is unused and each
          * PRD reads from the chunk list at logical offset media_byte_off+transferred.
          * GLADDER-10(b): the byte offset is derived here from the 32-bit start
          * sector (media_lba) with a 64-bit multiply, so a >=4GB ISO (byte offset
          * past UINT32_MAX) addresses the right bytes -- the result struct only
          * needs to carry a 32-bit sector index (good to 8TB). */
         media_byte_off = (uint64_t)result.media_lba * (uint64_t)HYPE_ATAPI_SECTOR_SIZE;
-        chunked_media = result.uses_media_data && atapi->media_chunks != 0;
         stream_media = result.uses_media_data && atapi->media_stream != 0;
-        src = (result.uses_media_data && !chunked_media && !stream_media)
+        src = (result.uses_media_data && !stream_media)
                   ? (atapi->media_data + media_byte_off)
                   : (result.uses_media_data ? 0 : result.synth_data);
         remaining = result.uses_media_data ? result.media_length : result.synth_length;
@@ -1961,14 +1959,6 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                 hype_atapi_set_media_error(atapi, HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR,
                                            HYPE_ATAPI_ASC_UNRECOVERED_READ_ERROR);
                 media_read_failed = 1;
-                break;
-            }
-        } else if (chunked_media) {
-            if (hype_chunked_iso_read(atapi->media_chunks, media_byte_off + transferred, dst,
-                                      chunk) != 0) {
-                hype_atapi_set_media_error(atapi, HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR,
-                                           HYPE_ATAPI_ASC_UNRECOVERED_READ_ERROR);
-                media_read_failed = 1; /* #287: same reasoning as the streamed path */
                 break;
             }
         } else {

@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "../../devices/atapi.h"
 
 static int failures = 0;
@@ -485,14 +486,16 @@ static void test_read_toc_multisession(void) {
     CHECK_HEX("last session = 1", 1u, out.synth_data[3]);
 }
 
-static void test_reset_chunked_media_size_not_truncated(void) {
+/* #326: the same invariant, now over the STREAM backing -- the chunked one it used to be
+ * asserted against is retired, but a >=4GB ISO is exactly what streaming exists to serve, so the
+ * assertion matters more rather than less. */
+static void test_reset_stream_media_size_not_truncated(void) {
     /* GLADDER-10(b): a >=4GB ISO's size must survive in the 64-bit media_size. */
     hype_atapi_t dev;
-    hype_chunked_iso_t iso;
-    iso.chunk_bytes = 256ull * 1024 * 1024;
-    iso.total_bytes = 5ull * 1024 * 1024 * 1024; /* 5 GB */
-    iso.n_chunks = 20;
-    hype_atapi_reset_chunked(&dev, &iso);
+    hype_iso_stream_t iso;
+    memset(&iso, 0, sizeof(iso));
+    iso.iso_size = 5ull * 1024 * 1024 * 1024; /* 5 GB */
+    hype_atapi_reset_stream(&dev, &iso);
     CHECK_HEX("media_size preserves full 5GB (no uint32 truncation)",
               5ull * 1024 * 1024 * 1024, dev.media_size);
 }
@@ -502,16 +505,15 @@ static void test_read10_offset_no_uint32_overflow(void) {
      * offset must be computed in 64-bit or it wraps and reads the wrong data. */
     hype_atapi_t dev;
     hype_atapi_result_t out;
-    hype_chunked_iso_t iso;
+    hype_iso_stream_t iso;
     uint8_t cdb[HYPE_ATAPI_CDB_MAX];
     uint32_t lba = 3000000u; /* start sector past the 4GB mark: 3e6 * 2048 = 6.144e9 */
     /* The 64-bit byte offset the caller derives (media_lba * sector size). */
     uint64_t byte_off = (uint64_t)lba * HYPE_ATAPI_SECTOR_SIZE;
 
-    iso.chunk_bytes = 256ull * 1024 * 1024;
-    iso.total_bytes = 8ull * 1024 * 1024 * 1024; /* 8 GB -> 4.19M sectors (lba in range) */
-    iso.n_chunks = 32;
-    hype_atapi_reset_chunked(&dev, &iso);
+    memset(&iso, 0, sizeof(iso));
+    iso.iso_size = 8ull * 1024 * 1024 * 1024; /* 8 GB -> 4.19M sectors (lba in range) */
+    hype_atapi_reset_stream(&dev, &iso);
     make_cdb(cdb, HYPE_ATAPI_CMD_READ10);
     cdb[2] = (uint8_t)(lba >> 24);
     cdb[3] = (uint8_t)(lba >> 16);
@@ -588,7 +590,7 @@ int main(void) {
     test_get_event_status_media_present();
     test_read_toc_formatted();
     test_read_toc_multisession();
-    test_reset_chunked_media_size_not_truncated();
+    test_reset_stream_media_size_not_truncated();
     test_read10_offset_no_uint32_overflow();
 
     test_set_media_error();
