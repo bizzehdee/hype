@@ -7746,38 +7746,20 @@ static void fw_1_262_id_diff(hype_ata_disk_t *disk) {
     hype_debug_print("fw-1 #262 IDDIFF: %u differing word(s) outside id/capacity fields\n", diffs);
 }
 
-static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind_t kind) {
-    uint64_t reset_cs_base = 0x100000000ULL - 0x10000ULL; /* 0xFFFF0000 */
-    uint64_t reset_rip = 0xFFF0ULL;
-    uint64_t stack_top = (uint64_t)(uintptr_t)(g_fw_1_guest_stack + sizeof(g_fw_1_guest_stack));
-    uint64_t npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
-
-    if (vm->fw_pristine_host_phys != 0) {
-        hype_guest_ram_copy((void *)(uintptr_t)g_fw_1_combined_host_phys,
-                            (const void *)(uintptr_t)vm->fw_pristine_host_phys, g_fw_1_combined_size);
-    }
-    hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
-    hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
-
-    hype_pic_emu_reset(&g_fw_1_pic);
-    hype_pit_emu_reset(&g_fw_1_pit);
-    hype_guest_lapic_reset(&g_fw_1_lapic);
-    hype_ioapic_reset(&g_fw_1_ioapic);
-    hype_guest_uart_reset(&g_fw_1_uart);
-    hype_guest_uart_reset(&g_fw_1_uart2);
-    hype_vt_screen_init(&vm->term, g_gop_console.cols, g_gop_console.rows);
-    hype_ps2_kbd_reset(&g_fw_1_ps2);
-    hype_ps2_mouse_reset(&g_fw_1_mouse);
-    hype_pci_reset(&g_fw_1_pci);
-    hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
-                         0x00, 0x00);
-    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ICH9_LPC, HYPE_FW_1_PCI_VENDOR_ID_INTEL,
-                         HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC, 0x06, 0x01, 0x00);
-    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u, 0x01, 0x06,
-                         0x01);
-    hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
-    hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
-    hype_ahci_reset(&g_fw_1_ahci);
+/*
+ * #342: the storage bring-up both FW-1 entry points need, in ONE place.
+ *
+ * run_fw_1_test() (initial launch) and fw_1_vm_reinit() (VM restart) carried byte-identical copies of
+ * this -- identical in CODE; the two comment blocks had already drifted apart, one still claiming the
+ * two-devices-over-one-backend hazard #333 removed. Duplicated bring-up has cost three investigations:
+ * #333 gated the SATA attach in one copy and the validation looked like a broken feature; #318 enabled
+ * the AHCI trace in one copy and a whole diagnosis had to be discarded because the trace was not on the
+ * path under test; #310/#317 were the same shape earlier.
+ *
+ * So this is not tidying. It is removing a defect generator: the failure mode is that the code
+ * compiles, the tests pass, the feature appears not to work, and the evidence points at the feature.
+ */
+static void fw_1_attach_storage(hype_fw_vm_t *vm) {
     /* #262 slice 2: the SATA-disk HBA, same class/prog-IF and same 4KB BAR5 as the
      * optical one, so the firmware's existing AHCI driver binds it unchanged.
      *
@@ -7816,17 +7798,8 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
      * IDENTIFY PACKET DEVICE and times out. */
     hype_ahci_set_signature(&g_fw_1_ata_ahci, HYPE_AHCI_SIG_ATA);
     /*
-     * #262 slice 3: the SATA disk carries the SAME backend as virtio-blk -- whatever
-     * this VM's target resolved to (physical disk, raw image file, or the RAM
-     * scratch). Two guest-visible devices over one backend is deliberate and
-     * temporary: it is what lets the guest firmware BOOT the installed system over
-     * AHCI, which it cannot do over virtio-blk (#262), while Linux keeps the faster
-     * virtio path once it is up.
-     *
-     * It is also a hazard worth naming: two devices onto one storage is only safe
-     * while the guest treats them as the same disk, which it does here because they
-     * are. Deciding whether an installed guest should get both, and which one the
-     * installer writes through, is the last item on this ticket.
+     * #262 slice 3 / #333: the storage front-end is chosen per disk, and only the chosen one is
+     * presented. The two-devices-over-one-backend arrangement this used to have was retired by #333.
      *
      * Reset first (so `media` is cleared and the model is in a known state), then
      * attach -- with a backend present the media pointer is never consulted.
@@ -7859,6 +7832,41 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
      * drive (media_size 0), which is what a real machine with an empty optical drive presents --
      * not a missing device. */
     hype_atapi_reset_stream(&g_fw_1_atapi, vm->iso_stream_ready ? &vm->iso_stream : 0);
+}
+
+static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind_t kind) {
+    uint64_t reset_cs_base = 0x100000000ULL - 0x10000ULL; /* 0xFFFF0000 */
+    uint64_t reset_rip = 0xFFF0ULL;
+    uint64_t stack_top = (uint64_t)(uintptr_t)(g_fw_1_guest_stack + sizeof(g_fw_1_guest_stack));
+    uint64_t npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
+
+    if (vm->fw_pristine_host_phys != 0) {
+        hype_guest_ram_copy((void *)(uintptr_t)g_fw_1_combined_host_phys,
+                            (const void *)(uintptr_t)vm->fw_pristine_host_phys, g_fw_1_combined_size);
+    }
+    hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
+    hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
+
+    hype_pic_emu_reset(&g_fw_1_pic);
+    hype_pit_emu_reset(&g_fw_1_pit);
+    hype_guest_lapic_reset(&g_fw_1_lapic);
+    hype_ioapic_reset(&g_fw_1_ioapic);
+    hype_guest_uart_reset(&g_fw_1_uart);
+    hype_guest_uart_reset(&g_fw_1_uart2);
+    hype_vt_screen_init(&vm->term, g_gop_console.cols, g_gop_console.rows);
+    hype_ps2_kbd_reset(&g_fw_1_ps2);
+    hype_ps2_mouse_reset(&g_fw_1_mouse);
+    hype_pci_reset(&g_fw_1_pci);
+    hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
+                         0x00, 0x00);
+    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ICH9_LPC, HYPE_FW_1_PCI_VENDOR_ID_INTEL,
+                         HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC, 0x06, 0x01, 0x00);
+    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u, 0x01, 0x06,
+                         0x01);
+    hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
+    hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
+    hype_ahci_reset(&g_fw_1_ahci);
+    fw_1_attach_storage(vm); /* #342 */
     {
         uint64_t above_16mb = (vm->ram_bytes > 16ULL * 1024 * 1024)
                                   ? (vm->ram_bytes - 16ULL * 1024 * 1024)
@@ -7973,74 +7981,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * (hype_pci_get_interrupt_line), master or slave. */
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
     hype_ahci_reset(&g_fw_1_ahci);
-    /* #262 slice 2: the SATA-disk HBA, same class/prog-IF and same 4KB BAR5 as the
-     * optical one, so the firmware's existing AHCI driver binds it unchanged.
-     * #333: present ONLY when selected -- see the sibling launcher. */
-    if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
-        hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u,
-                            0x01, 0x06, 0x01);
-        hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
-        hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
-    }
-#if HYPE_262_DISK_ON_FIRST_HBA
-    /*
-     * #262 PROBE: separate the last two tangled variables. The firmware fully drives
-     * the ATAPI device on HBA 1 (it boots from it) and will not drive the ATA disk on
-     * HBA 2. Is that because of the DEVICE TYPE or because of WHICH CONTROLLER?
-     *
-     * Put a plain ATA disk on HBA 1 -- the controller the firmware demonstrably
-     * works -- and see what happens:
-     *   configured + read -> "which controller" is the variable; look at how the
-     *                        second HBA is presented/enumerated.
-     *   still one IDENTIFY -> "device type" is the variable; the firmware never
-     *                        drives a plain ATA disk from hype at all, on any
-     *                        controller, and the ATAPI path's success is irrelevant.
-     * Not a candidate fix either way -- a hypervisor that can only offer a disk on
-     * the CD's controller is not a design, it is a coincidence.
-     */
-    hype_ahci_set_signature(&g_fw_1_ahci, HYPE_AHCI_SIG_ATA);
-    hype_debug_print("fw-1 #262 PROBE: HBA1 presents a plain ATA disk (SIG_ATA) -- "
-                     "device-type vs which-controller test\n");
-#endif
-    hype_ahci_reset(&g_fw_1_ata_ahci);
-    /* #262: this HBA carries a real disk, not the optical drive, so it must report
-     * the plain-ATA signature. With the default ATAPI one the guest probes it with
-     * IDENTIFY PACKET DEVICE and times out. */
-    hype_ahci_set_signature(&g_fw_1_ata_ahci, HYPE_AHCI_SIG_ATA);
-    /*
-     * #262 slice 3: the SATA disk carries the SAME backend as virtio-blk -- whatever
-     * this VM's target resolved to (physical disk, raw image file, or the RAM
-     * scratch). Two guest-visible devices over one backend is deliberate and
-     * temporary: it is what lets the guest firmware BOOT the installed system over
-     * AHCI, which it cannot do over virtio-blk (#262), while Linux keeps the faster
-     * virtio path once it is up.
-     *
-     * It is also a hazard worth naming: two devices onto one storage is only safe
-     * while the guest treats them as the same disk, which it does here because they
-     * are. Deciding whether an installed guest should get both, and which one the
-     * installer writes through, is the last item on this ticket.
-     *
-     * Reset first (so `media` is cleared and the model is in a known state), then
-     * attach -- with a backend present the media pointer is never consulted.
-     */
-    hype_ata_disk_reset(&g_fw_1_ata_disk, 0, 0);
-    /* Resolves the backend for whichever front-end was selected -- see the sibling launcher. */
-    fw_1_setup_virtio_blk(vm);
-    if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
-        /* AFTER fw_1_setup_virtio_blk, which fills in the capacity: attaching before it snapshots
-         * total_sectors == 0, and a zero-sector LBA disk makes libata fall back to CHS and fail the
-         * probe with INIT_DEV_PARAMS. */
-        hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
-        hype_debug_print("fw-1: disk front-end = ahci-sata -- %llu sectors (%llu MiB)\n",
-                         (unsigned long long)g_fw_1_ata_disk.total_sectors,
-                         (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
-        fw_1_262_id_diff(&g_fw_1_ata_disk);
-    } else {
-        hype_debug_print("fw-1: disk front-end = virtio-blk -- no SATA disk attached (#333)\n");
-    }
-    /* GLADDER-10 / #326: the ISO is served on demand from its host disk partition or file. The
-     * RAM-chunked fallback (GLADDER-10a) is retired -- see hype_fw_vm_t.iso_stream. */
-    hype_atapi_reset_stream(&g_fw_1_atapi, vm->iso_stream_ready ? &vm->iso_stream : 0);
+    fw_1_attach_storage(vm); /* #342 */
     /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging
      * the CD-ROM discovery sequence -- hype_svm_set_ahci_trace(1) -- but
      * left off here: a real boot issues thousands of commands and each
