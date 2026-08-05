@@ -276,6 +276,12 @@ typedef struct {
     int has_source_disk;
     char source_disk[HYPE_CFG_PATH_MAX];
 
+    /*
+     * #336: `has_format` is not redundant with `format`. The default is RAW, so without this flag
+     * "declared raw" and "said nothing" are the same value -- and under the assertion semantics below
+     * that would make every un-annotated qcow2 image a mismatch and refuse it.
+     */
+    int has_format;
     hype_cfg_format_t format;
 
     int has_size_gb;
@@ -382,6 +388,34 @@ typedef struct {
 hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out);
 
 
+
+
+/*
+ * #336: reconcile a DECLARED `format` against the format the image actually is.
+ *
+ * Decision (plan.md §10 decision 3): sniffing stays authoritative and `format` is an optional
+ * ASSERTION. hype identifies qcow2 by header magic plus hype_qcow2_init's full validation -- which is
+ * how every other tool does it, cannot mistake a raw image for a qcow2, and lets an operator swap a raw
+ * image for a qcow2 one without also remembering to edit hype.cfg. Making the key authoritative would
+ * throw that away to guard against a case that already fails loudly (a corrupt qcow2 header makes
+ * hype_qcow2_init refuse, it does not silently read as raw).
+ *
+ * So the key's job is to catch a VM pointed at the WRONG FILE: you said qcow2, the file is raw, and
+ * that is much more likely a stale path than a format you wanted converted. Same shape as #331's
+ * target_disk_size_gb check.
+ *
+ * Returns MISMATCH only when a format was actually declared and disagrees. Absent key => AGREES.
+ */
+typedef enum {
+    HYPE_CFG_FORMAT_AGREES = 0,
+    HYPE_CFG_FORMAT_MISMATCH_WANTED_QCOW2, /* declared qcow2, the file is raw */
+    HYPE_CFG_FORMAT_MISMATCH_WANTED_RAW    /* declared raw, the file is qcow2 */
+} hype_cfg_format_check_t;
+
+hype_cfg_format_check_t hype_cfg_check_format(const hype_cfg_disk_t *disk, int sniffed_is_qcow2);
+
+/* The refusal message body, so every caller words it the same way. */
+const char *hype_cfg_format_check_str(hype_cfg_format_check_t c);
 
 /*
  * #222 (spec §5.6): the guest-facing bus a device should present on, resolving HYPE_CFG_BUS_DEFAULT

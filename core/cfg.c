@@ -638,6 +638,7 @@ static hype_cfg_status_t apply_disk_field(hype_cfg_disk_t *d, unsigned int *seen
         } else {
             return HYPE_CFG_ERR_BAD_VALUE;
         }
+        d->has_format = 1; /* #336: distinct from format==RAW, which is also the default */
         *seen |= D_FORMAT;
         return HYPE_CFG_OK;
     }
@@ -1148,4 +1149,32 @@ hype_cfg_bus_t hype_cfg_resolve_bus(const hype_cfg_disk_t *disk, hype_cfg_os_hin
         return HYPE_CFG_BUS_AHCI_SATA;
     }
     return HYPE_CFG_BUS_VIRTIO_BLK;
+}
+
+hype_cfg_format_check_t hype_cfg_check_format(const hype_cfg_disk_t *disk, int sniffed_is_qcow2) {
+    if (disk == 0 || !disk->has_format) {
+        return HYPE_CFG_FORMAT_AGREES; /* nothing asserted -- detection decides, as it always has */
+    }
+    if (disk->format == HYPE_CFG_FORMAT_QCOW2 && !sniffed_is_qcow2) {
+        return HYPE_CFG_FORMAT_MISMATCH_WANTED_QCOW2;
+    }
+    if (disk->format == HYPE_CFG_FORMAT_RAW && sniffed_is_qcow2) {
+        return HYPE_CFG_FORMAT_MISMATCH_WANTED_RAW;
+    }
+    return HYPE_CFG_FORMAT_AGREES;
+}
+
+const char *hype_cfg_format_check_str(hype_cfg_format_check_t c) {
+    switch (c) {
+        case HYPE_CFG_FORMAT_AGREES:
+            return "format matches the image";
+        case HYPE_CFG_FORMAT_MISMATCH_WANTED_QCOW2:
+            return "config says format = qcow2 but the image is RAW -- refusing (a stale path is far "
+                   "more likely than a conversion you wanted)";
+        case HYPE_CFG_FORMAT_MISMATCH_WANTED_RAW:
+            return "config says format = raw but the image is QCOW2 -- refusing (writing a qcow2 as "
+                   "raw would corrupt it)";
+        default:
+            return "unknown";
+    }
 }

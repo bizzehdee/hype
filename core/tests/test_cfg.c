@@ -1303,6 +1303,57 @@ static void test_resolve_bus(void) {
 }
 
 
+/* ---- #336: `format` is an ASSERTION over the sniffed format, not a selector ---- */
+
+static void test_format_assertion(void) {
+    hype_cfg_disk_t d;
+
+    memset(&d, 0, sizeof(d));
+
+    /* Nothing declared: detection decides, exactly as before the key existed. This is the case that
+     * keeps "swap a raw image for a qcow2 without editing hype.cfg" working, and note that with
+     * format defaulting to RAW it is ONLY has_format that distinguishes it. */
+    CHECK_INT("absent key agrees with a raw image", (int)HYPE_CFG_FORMAT_AGREES,
+              (int)hype_cfg_check_format(&d, 0));
+    CHECK_INT("absent key agrees with a qcow2 image too", (int)HYPE_CFG_FORMAT_AGREES,
+              (int)hype_cfg_check_format(&d, 1));
+
+    d.has_format = 1;
+    d.format = HYPE_CFG_FORMAT_QCOW2;
+    CHECK_INT("qcow2 declared, qcow2 file: agrees", (int)HYPE_CFG_FORMAT_AGREES,
+              (int)hype_cfg_check_format(&d, 1));
+    CHECK_INT("qcow2 declared, RAW file: mismatch", (int)HYPE_CFG_FORMAT_MISMATCH_WANTED_QCOW2,
+              (int)hype_cfg_check_format(&d, 0));
+
+    d.format = HYPE_CFG_FORMAT_RAW;
+    CHECK_INT("raw declared, raw file: agrees", (int)HYPE_CFG_FORMAT_AGREES,
+              (int)hype_cfg_check_format(&d, 0));
+    /* The dangerous direction: writing a qcow2 through the raw path would corrupt it. */
+    CHECK_INT("raw declared, QCOW2 file: mismatch", (int)HYPE_CFG_FORMAT_MISMATCH_WANTED_RAW,
+              (int)hype_cfg_check_format(&d, 1));
+
+    CHECK_INT("a NULL disk agrees rather than crashing", (int)HYPE_CFG_FORMAT_AGREES,
+              (int)hype_cfg_check_format(0, 1));
+}
+
+static void test_format_has_flag_is_set_only_when_written(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+
+    /* Parsed `format = raw` must be distinguishable from an omitted key, or an un-annotated qcow2
+     * image would be refused as a mismatch. */
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A, "[disk.d]\nbacking = file\npath = a.img\n");
+    CHECK_INT("omitted", HYPE_CFG_OK, (int)parse_copy(cfg, &out).status);
+    CHECK_INT("has_format clear when omitted", 0, out.disks[0].has_format);
+    CHECK_INT("...and the default is still raw", (int)HYPE_CFG_FORMAT_RAW, (int)out.disks[0].format);
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[disk.d]\nbacking = file\npath = a.img\nformat = raw\n");
+    CHECK_INT("explicit raw", HYPE_CFG_OK, (int)parse_copy(cfg, &out).status);
+    CHECK_INT("has_format SET when written explicitly", 1, out.disks[0].has_format);
+}
+
+
 int main(void) {
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
@@ -1357,6 +1408,8 @@ int main(void) {
     test_hype_section_errors();
     test_hype_duplicate_after_malformed_is_still_caught();
     test_resolve_bus();
+    test_format_assertion();
+    test_format_has_flag_is_set_only_when_written();
 
     if (failures == 0) {
         printf("all tests passed\n");

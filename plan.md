@@ -856,6 +856,18 @@ isn't lost.
    remember to edit `hype.cfg`; a raw image cannot be mistaken for a qcow2
    because none begins with `QFI\xfb` *and* passes the header validation.
    Raw remains the default and the recommended format.
+   **Settled by #336:** `docs/hype-cfg-spec.md`'s `format = raw | qcow2` key
+   and this sniffing are not in conflict — the key is an **assertion**, not a
+   selector. Detection stays authoritative, and a declared `format` that
+   disagrees with the image makes hype **refuse** rather than sniff on. That
+   keeps the swap-without-editing property above, and gives the key a real
+   job: catching a VM pointed at the wrong *file*, which is much more likely
+   a stale path than a conversion anyone wanted. Rejected making the key
+   authoritative: its only argument is that a corrupt qcow2 header would
+   silently read as raw, and it would not — `hype_qcow2_init` refuses rather
+   than guessing, so a broken qcow2 already fails loudly. Rejected dropping
+   the key: the raw-declared-but-actually-qcow2 direction is worth catching,
+   since writing a qcow2 through the raw path would corrupt it.
 4. **Testing strategy — decided: QEMU/KVM nested virtualization
    (`-cpu host,+vmx`) for fast day-to-day iteration through M0–M6, plus a
    mandatory real-hardware validation pass at every milestone gate** — not
