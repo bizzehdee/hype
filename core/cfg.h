@@ -38,6 +38,14 @@
 #define HYPE_CFG_MAX_CPUS 256
 #define HYPE_CFG_MAX_PEERS 8
 
+/* #222 (CONFIG-2, spec §4.1): retention limits. A line longer than
+ * HYPE_CFG_LINE_MAX cannot be retained verbatim, so it is treated as an overflow
+ * (see retained_overflow) rather than silently truncated -- a truncated line
+ * written back would corrupt the operator's file. */
+#define HYPE_CFG_MAX_SECTIONS 32
+#define HYPE_CFG_MAX_RETAINED 64
+#define HYPE_CFG_LINE_MAX 192
+
 typedef enum {
     HYPE_CFG_BOOT_INSTALLER,
     HYPE_CFG_BOOT_DISK
@@ -118,9 +126,61 @@ typedef struct {
     char net_peers[HYPE_CFG_MAX_PEERS][HYPE_CFG_NAME_MAX];
 } hype_cfg_vm_t;
 
+/*
+ * #222 (CONFIG-2, spec §4.1): the extensibility keystone.
+ *
+ * An unknown key or an unknown SECTION KIND used to be fatal (HYPE_CFG_ERR_UNKNOWN_KEY), which made
+ * the format un-extendable in both directions: a config written by a newer hype could not be read by
+ * an older one at all, and -- worse -- the CONFIG-3 serializer (#221) would write back a file with
+ * the operator's unrecognised lines silently DELETED. So unknown lines are now non-fatal and
+ * RETAINED verbatim, attached to the section they appeared in.
+ *
+ * `sections` records every section header in FILE ORDER regardless of kind, which is what lets a
+ * serializer re-emit `[vm.*]`, `[disk.*]` and unknown sections interleaved as the operator wrote
+ * them; `vms[]`/`disks[]` alone cannot express that ordering.
+ *
+ * Comments are retained the same way. Pure blank lines are not: they carry no information a
+ * serializer needs, and retention capacity is finite.
+ */
+typedef enum {
+    HYPE_CFG_SECTION_VM = 0,
+    HYPE_CFG_SECTION_UNKNOWN
+} hype_cfg_section_kind_t;
+
+typedef struct {
+    hype_cfg_section_kind_t kind;
+    char name[HYPE_CFG_NAME_MAX]; /* the part after the '.'; "" when there is none */
+    char raw[HYPE_CFG_LINE_MAX];  /* the header line as written, for re-emission */
+    int index;                    /* into vms[] for kind==VM; -1 otherwise */
+} hype_cfg_section_t;
+
+typedef struct {
+    int section;                  /* index into sections[]; -1 = before any section header */
+    char text[HYPE_CFG_LINE_MAX]; /* the line as written, comment included */
+} hype_cfg_retained_t;
+
 typedef struct {
     hype_cfg_vm_t vms[HYPE_CFG_MAX_VMS];
     unsigned int vm_count;
+
+    /* #222: see hype_cfg_section_t above. */
+    hype_cfg_section_t sections[HYPE_CFG_MAX_SECTIONS];
+    unsigned int section_count;
+
+    hype_cfg_retained_t retained[HYPE_CFG_MAX_RETAINED];
+    unsigned int retained_count;
+
+    /*
+     * Set when a line that SHOULD have been retained could not be (too many lines, too long, or too
+     * many sections). Parsing still succeeds -- an operator must not be locked out of booting by a
+     * comment -- but a serializer MUST refuse to write this config back, because doing so would
+     * delete content it never captured. Losing an operator's config silently is worse than refusing
+     * to save.
+     */
+    int retained_overflow;
+
+    /* Count of lines the parser did not understand, for a single summary log line. */
+    unsigned int unknown_count;
 } hype_cfg_t;
 
 typedef enum {

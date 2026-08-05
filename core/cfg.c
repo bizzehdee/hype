@@ -347,8 +347,57 @@ static hype_cfg_status_t validate_required(const hype_cfg_vm_t *vm, unsigned int
     return HYPE_CFG_OK;
 }
 
+/*
+ * #222: retain a line verbatim, attached to the section it appeared in.
+ *
+ * Capacity exhaustion sets retained_overflow rather than failing the parse: a config must not become
+ * unbootable because it carries one comment too many. The flag is what stops the CONFIG-3 serializer
+ * writing back a file whose tail it never captured.
+ */
+static void retain_line(hype_cfg_t *out, const char *raw, int raw_truncated) {
+    unsigned long long len;
+
+    if (raw_truncated) {
+        /* The caller's snapshot already lost bytes, so what is here is a PREFIX of the operator's
+         * line. Writing a prefix back would corrupt the file, so keep none of it -- and flag it. */
+        out->retained_overflow = 1;
+        return;
+    }
+    if (out->retained_count >= HYPE_CFG_MAX_RETAINED) {
+        out->retained_overflow = 1;
+        return;
+    }
+    len = hype_strlcpy(out->retained[out->retained_count].text, raw, HYPE_CFG_LINE_MAX);
+    if (len >= HYPE_CFG_LINE_MAX) {
+        out->retained_overflow = 1;
+        return;
+    }
+    out->retained[out->retained_count].section = (int)out->section_count - 1;
+    out->retained_count++;
+}
+
+/* Records a section header in file order. Returns the new section index, or -1 if full. */
+static int add_section(hype_cfg_t *out, hype_cfg_section_kind_t kind, const char *name,
+                       const char *raw, int index) {
+    hype_cfg_section_t *sec;
+
+    if (out->section_count >= HYPE_CFG_MAX_SECTIONS) {
+        out->retained_overflow = 1;
+        return -1;
+    }
+    sec = &out->sections[out->section_count];
+    sec->kind = kind;
+    sec->index = index;
+    if (hype_strlcpy(sec->name, name, HYPE_CFG_NAME_MAX) >= HYPE_CFG_NAME_MAX ||
+        hype_strlcpy(sec->raw, raw, HYPE_CFG_LINE_MAX) >= HYPE_CFG_LINE_MAX) {
+        out->retained_overflow = 1;
+    }
+    out->section_count++;
+    return (int)out->section_count - 1;
+}
+
 static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int *cur,
-                                                 unsigned int *seen) {
+                                                 unsigned int *seen, const char *raw) {
     unsigned long long len = hype_strlen(line);
     char *body;
     char *name;
@@ -361,7 +410,16 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
     line[len - 1] = '\0';
     body = line + 1;
     if (!hype_strneq(body, "vm.", 3)) {
-        return HYPE_CFG_ERR_SYNTAX;
+        /*
+         * #222 (spec §4.1): an unknown section KIND is retained, not rejected. A `[disk.*]` or
+         * `[nic.*]` section from a newer hype must not stop an older one booting, and the lines
+         * inside it must survive a write-back. Its keys are retained too -- see process_key_value's
+         * cur < 0 path, which is why `cur` is cleared here.
+         */
+        *cur = -1;
+        (void)add_section(out, HYPE_CFG_SECTION_UNKNOWN, "", raw, -1);
+        out->unknown_count++;
+        return HYPE_CFG_OK;
     }
     name = body + 3;
     if (*name == '\0') {
@@ -383,17 +441,32 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
         return HYPE_CFG_ERR_VALUE_TOO_LONG;
     }
     seen[*cur] = 0;
+    (void)add_section(out, HYPE_CFG_SECTION_VM, name, raw, *cur);
     out->vm_count++;
     return HYPE_CFG_OK;
 }
 
 static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
-                                            unsigned int *seen) {
+                                            unsigned int *seen, const char *raw,
+                                            int raw_truncated) {
     char *eq;
     char *key;
     char *val;
+    hype_cfg_status_t st;
 
     if (cur < 0) {
+        /*
+         * #222: no CURRENT typed section. Two different cases, deliberately distinguished: inside a
+         * retained unknown section the line is retained (section_count > 0), whereas a key before
+         * ANY section header is still a hard error -- it belongs to nothing and is far more likely a
+         * typo'd header than a forward-compatible extension.
+         */
+        if (out->section_count > 0u &&
+            out->sections[out->section_count - 1u].kind == HYPE_CFG_SECTION_UNKNOWN) {
+            retain_line(out, raw, raw_truncated);
+            out->unknown_count++;
+            return HYPE_CFG_OK;
+        }
         return HYPE_CFG_ERR_KEY_BEFORE_SECTION;
     }
 
@@ -408,7 +481,15 @@ static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
         return HYPE_CFG_ERR_SYNTAX;
     }
 
-    return apply_field(&out->vms[cur], &seen[cur], key, val);
+    st = apply_field(&out->vms[cur], &seen[cur], key, val);
+    if (st == HYPE_CFG_ERR_UNKNOWN_KEY) {
+        /* #222: retained, not rejected -- the whole point of the keystone. Note `line` has been
+         * mutated (the '=' overwritten), which is why retention works off the untouched `raw`. */
+        retain_line(out, raw, raw_truncated);
+        out->unknown_count++;
+        return HYPE_CFG_OK;
+    }
+    return st;
 }
 
 hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
@@ -422,6 +503,10 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     res.status = HYPE_CFG_OK;
     res.line = 0;
     out->vm_count = 0;
+    out->section_count = 0;
+    out->retained_count = 0;
+    out->retained_overflow = 0;
+    out->unknown_count = 0;
     for (i = 0; i < HYPE_CFG_MAX_VMS; i++) {
         seen[i] = 0;
     }
@@ -429,6 +514,8 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     while (*p) {
         char *line_start = p;
         char *line;
+        char raw[HYPE_CFG_LINE_MAX];
+        int raw_truncated;
         hype_cfg_status_t st;
 
         while (*p && *p != '\n') {
@@ -440,15 +527,26 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
         }
         line_no++;
 
+        /* #222: snapshot the line BEFORE clean_line() strips its comment and trims it in place.
+         * Retention has to re-emit what the operator wrote, comment included, so it cannot work off
+         * the cleaned form. Truncation MUST be detected here rather than inside retain_line(): by
+         * then the bytes are already gone and the prefix looks like a complete short line. */
+        raw_truncated = hype_strlcpy(raw, line_start, HYPE_CFG_LINE_MAX) >= HYPE_CFG_LINE_MAX;
+
         line = clean_line(line_start);
         if (*line == '\0') {
+            /* Comment-only lines are retained (a serializer must preserve them); pure blanks are
+             * not -- they carry nothing a re-emitted file needs, and capacity is finite. */
+            if (raw[0] != '\0') {
+                retain_line(out, raw, raw_truncated);
+            }
             continue;
         }
 
         if (line[0] == '[') {
-            st = process_section_header(line, out, &cur, seen);
+            st = process_section_header(line, out, &cur, seen, raw);
         } else {
-            st = process_key_value(line, out, cur, seen);
+            st = process_key_value(line, out, cur, seen, raw, raw_truncated);
         }
 
         if (st != HYPE_CFG_OK) {

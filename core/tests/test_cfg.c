@@ -155,7 +155,6 @@ struct error_case {
 static const struct error_case ERROR_CASES[] = {
     {"key before any section", "vcpus = 1\n", HYPE_CFG_ERR_KEY_BEFORE_SECTION},
     {"malformed section (no closing bracket)", "[vm.a\nvcpus=1\n", HYPE_CFG_ERR_SYNTAX},
-    {"section not vm.*", "[bogus]\nvcpus=1\n", HYPE_CFG_ERR_SYNTAX},
     {"empty vm name", "[vm.]\nvcpus=1\n", HYPE_CFG_ERR_BAD_VALUE},
     {"duplicate vm name",
      "[vm.a]\nvcpus=1\nmem_mb=1\nboot=disk\ntarget_disk=file:x\nfirmware=uefi\nos_hint=none\n"
@@ -163,7 +162,6 @@ static const struct error_case ERROR_CASES[] = {
      HYPE_CFG_ERR_DUPLICATE_VM_NAME},
     {"key with no '='", "[vm.a]\nvcpus 1\n", HYPE_CFG_ERR_SYNTAX},
     {"empty key", "[vm.a]\n = 1\n", HYPE_CFG_ERR_SYNTAX},
-    {"unknown key", "[vm.a]\nbogus = 1\n", HYPE_CFG_ERR_UNKNOWN_KEY},
     {"duplicate key", "[vm.a]\nvcpus=1\nvcpus=2\n", HYPE_CFG_ERR_DUPLICATE_KEY},
     {"vcpus zero", "[vm.a]\nvcpus=0\n", HYPE_CFG_ERR_BAD_VALUE},
     {"vcpus not a number", "[vm.a]\nvcpus=four\n", HYPE_CFG_ERR_BAD_VALUE},
@@ -552,6 +550,154 @@ static void test_media_disk_too_long(void) {
 }
 
 
+/* ---- #222 (CONFIG-2, spec §4.1): unknown keys and sections are RETAINED, not fatal ---- */
+
+static const char *retained_text(const hype_cfg_t *c, unsigned int i) {
+    return (i < c->retained_count) ? c->retained[i].text : "<none>";
+}
+
+static void test_unknown_key_is_retained_not_fatal(void) {
+    const char *cfg =
+        "[vm.a]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = disk\n"
+        "target_disk = file:a.img\n"
+        "firmware = uefi\n"
+        "os_hint = linux\n"
+        "future_key = whatever   ; a key only a newer hype knows\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+
+    CHECK_INT("an unknown key no longer fails the parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("the VM still loaded", 1, out.vm_count);
+    CHECK_INT("the unknown line was counted", 1, out.unknown_count);
+    CHECK_INT("the unknown line was retained", 1, out.retained_count);
+    /* Retained VERBATIM, comment included -- a serializer must reproduce the operator's line. */
+    CHECK_STR("retained verbatim, comment included",
+              "future_key = whatever   ; a key only a newer hype knows", retained_text(&out, 0));
+    CHECK_INT("retained line is attached to its section", 0, out.retained[0].section);
+    CHECK_INT("no overflow", 0, out.retained_overflow);
+}
+
+static void test_unknown_section_and_its_keys_are_retained(void) {
+    /* Exactly the forward-compatibility case: a [nic.*] section an older hype cannot model. */
+    const char *cfg =
+        "[vm.a]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = disk\n"
+        "target_disk = file:a.img\n"
+        "firmware = uefi\n"
+        "os_hint = linux\n"
+        "\n"
+        "[nic.net0]\n"
+        "mode = nat\n"
+        "mac = 52:54:00:12:34:56\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+
+    CHECK_INT("an unknown section no longer fails the parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("the VM still loaded", 1, out.vm_count);
+    CHECK_INT("two sections recorded in file order", 2, out.section_count);
+    CHECK_INT("section 0 is the VM", (int)HYPE_CFG_SECTION_VM, (int)out.sections[0].kind);
+    CHECK_STR("section 0 names the VM", "a", out.sections[0].name);
+    CHECK_INT("section 0 points at vms[0]", 0, out.sections[0].index);
+    CHECK_INT("section 1 is unknown", (int)HYPE_CFG_SECTION_UNKNOWN, (int)out.sections[1].kind);
+    CHECK_STR("the unknown header is kept verbatim", "[nic.net0]", out.sections[1].raw);
+    /* Both keys inside it survive, attached to that section rather than to the VM. */
+    CHECK_INT("both keys inside it retained", 2, out.retained_count);
+    CHECK_STR("first retained key", "mode = nat", retained_text(&out, 0));
+    CHECK_STR("second retained key", "mac = 52:54:00:12:34:56", retained_text(&out, 1));
+    CHECK_INT("attached to the unknown section", 1, out.retained[0].section);
+    CHECK_INT("attached to the unknown section", 1, out.retained[1].section);
+}
+
+static void test_comments_are_retained_blank_lines_are_not(void) {
+    const char *cfg =
+        "; a header comment before any section\n"
+        "\n"
+        "[vm.a]\n"
+        "vcpus = 1\n"
+        "\n"
+        "; why this VM has so little RAM\n"
+        "mem_mb = 512\n"
+        "boot = disk\n"
+        "target_disk = file:a.img\n"
+        "firmware = uefi\n"
+        "os_hint = linux\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+
+    CHECK_INT("parses OK", HYPE_CFG_OK, res.status);
+    CHECK_INT("both comments retained, neither blank line", 2, out.retained_count);
+    CHECK_STR("comment kept verbatim", "; a header comment before any section",
+              retained_text(&out, 0));
+    /* Before any section header: -1, so a serializer can emit it above everything. */
+    CHECK_INT("pre-section comment belongs to no section", -1, out.retained[0].section);
+    CHECK_STR("in-section comment kept", "; why this VM has so little RAM", retained_text(&out, 1));
+    CHECK_INT("in-section comment attached to the VM", 0, out.retained[1].section);
+    CHECK_INT("comments are not counted as unknown keys", 0, out.unknown_count);
+}
+
+static void test_key_before_any_section_is_still_fatal(void) {
+    /* Deliberately NOT relaxed: a key belonging to nothing is a typo'd header far more often than a
+     * forward-compatible extension, and silently retaining it would hide the typo. */
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy("vcpus = 1\n[vm.a]\n", &out);
+
+    CHECK_INT("a key before any section is still rejected", HYPE_CFG_ERR_KEY_BEFORE_SECTION,
+              res.status);
+}
+
+static void test_retention_overflow_is_flagged_not_silent(void) {
+    /* A serializer must be able to tell that it did NOT capture everything, or a write-back would
+     * delete the operator's lines. Parsing still succeeds: a comment must never stop a boot. */
+    char cfg[8192];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    int n;
+    unsigned int i;
+
+    n = snprintf(cfg, sizeof(cfg),
+                 "[vm.a]\nvcpus=1\nmem_mb=512\nboot=disk\ntarget_disk=file:a.img\n"
+                 "firmware=uefi\nos_hint=linux\n");
+    for (i = 0; i < HYPE_CFG_MAX_RETAINED + 5u; i++) {
+        n += snprintf(cfg + n, sizeof(cfg) - (size_t)n, "; filler comment %u\n", i);
+    }
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("overflowing retention does not fail the parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("the VM still loaded", 1, out.vm_count);
+    CHECK_INT("retention is capped", HYPE_CFG_MAX_RETAINED, (int)out.retained_count);
+    CHECK_INT("and the loss is FLAGGED", 1, out.retained_overflow);
+}
+
+static void test_overlong_line_is_flagged_not_truncated(void) {
+    /* A truncated line written back would corrupt the file, so it is dropped AND flagged rather
+     * than kept in part. */
+    char cfg[HYPE_CFG_LINE_MAX + 512];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    int n;
+    unsigned int i;
+
+    n = snprintf(cfg, sizeof(cfg),
+                 "[vm.a]\nvcpus=1\nmem_mb=512\nboot=disk\ntarget_disk=file:a.img\n"
+                 "firmware=uefi\nos_hint=linux\n;");
+    for (i = 0; i < HYPE_CFG_LINE_MAX + 10u; i++) {
+        cfg[n++] = 'x';
+    }
+    cfg[n++] = '\n';
+    cfg[n] = '\0';
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("an over-long comment does not fail the parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("it is not retained in truncated form", 0, (int)out.retained_count);
+    CHECK_INT("and the loss is FLAGGED", 1, out.retained_overflow);
+}
+
+
 int main(void) {
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
@@ -572,6 +718,12 @@ int main(void) {
     test_error_reports_line_number();
     test_media_disk();
     test_media_disk_too_long();
+    test_unknown_key_is_retained_not_fatal();
+    test_unknown_section_and_its_keys_are_retained();
+    test_comments_are_retained_blank_lines_are_not();
+    test_key_before_any_section_is_still_fatal();
+    test_retention_overflow_is_flagged_not_silent();
+    test_overlong_line_is_flagged_not_truncated();
 
     if (failures == 0) {
         printf("all tests passed\n");

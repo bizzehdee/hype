@@ -12261,6 +12261,22 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 
     hype_debug_print("cfg: loaded \\hype.cfg (%llu bytes) -- %u VM(s)\n",
                      (unsigned long long)sz, g_hype_cfg.vm_count);
+    /*
+     * #222: say when lines were not understood. Unknown keys and sections are now retained rather
+     * than fatal (spec §4.1), which is what makes the format extendable -- but silence about them
+     * would turn a typo into a setting that appears accepted and does nothing, the exact failure
+     * mode #285/#331/#339 were each an instance of.
+     */
+    if (g_hype_cfg.unknown_count != 0u) {
+        hype_debug_print("cfg: %u line(s) not understood -- RETAINED verbatim, not applied. A "
+                         "misspelled key looks exactly like this\n", g_hype_cfg.unknown_count);
+    }
+    if (g_hype_cfg.retained_overflow) {
+        /* Only matters once a serializer exists (#221), but it must be visible before then: it is
+         * the difference between "hype can save this config" and "saving would delete lines". */
+        hype_debug_print("cfg: WARNING -- too many/too long lines to retain; this config must NOT be "
+                         "written back, as unretained lines would be lost\n");
+    }
     {
         unsigned int vi;
         for (vi = 0; vi < g_hype_cfg.vm_count; vi++) {
