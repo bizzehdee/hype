@@ -14183,6 +14183,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             hype_debug_print("host-fat: resolved \\iso\\test.iso on exFAT partition %u "
                                              "of the %s device\n", pidx, g_media.bus);
                             have_file = 1;
+                        } else if (hype_ext_resolve(fatvol_read, 0, "\\iso\\test.iso", &file) == 0) {
+                            /*
+                             * #320: ext too, matching the guest disk-image path
+                             * (fw_1_vblk_use_image_file), which has always tried all three. The
+                             * ISO being the read-only one of the pair made the omission harmless
+                             * but arbitrary -- and the operator-facing promise is FAT32, exFAT or
+                             * ext (plan.md §6d).
+                             *
+                             * Two ext-specific differences, both from core/ext.h: matching is
+                             * CASE-SENSITIVE where the FAT resolvers are not, so this literal
+                             * means a lowercase `iso/test.iso`; and ext accepts '/' or '\\' as the
+                             * separator, so the shared literal needs no translation.
+                             *
+                             * This only became useful with #327: ext2/3 indirect-mapped large
+                             * files are structurally fragmented, so under the old one-extent rule
+                             * an ISO here was close to unusable however carefully it was written.
+                             */
+                            hype_debug_print("host-fat: resolved \\iso\\test.iso on ext partition %u "
+                                             "of the %s device\n", pidx, g_media.bus);
+                            have_file = 1;
                         }
                     }
                     } /* #324: end device loop -- the log lines above name the bus via g_media.bus */
@@ -14228,8 +14248,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         if (hype_iso_stream_read(&g_vms[0].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                             cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
                             g_vms[0].iso_stream_ready = 1;
+                            /* #320: the volume may be FAT32, exFAT or ext, so say which rather
+                             * than naming two of the three. */
                             hype_serial_print("host-stream: CD001 verified streaming from a FILE on "
-                                              "the FAT/exFAT ESP -- backing guest CD via streaming\n");
+                                              "a host volume -- backing guest CD via streaming\n");
                         } else {
                             hype_debug_print("host-stream: CD001 NOT found streaming the ESP file "
                                              "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
