@@ -7020,6 +7020,40 @@ static int fw_1_phys_target_matches(const char *drive_serial) {
     return (g_phys_target_serial[0] != '\0') && term_streq(g_phys_target_serial, drive_serial);
 }
 
+/* Defined with the media plumbing further down; declared here because the physical-target scope
+ * resolution below sits with the guest-disk setup. Both read their own device DISK-ABSOLUTELY. */
+static int media_ahci_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
+static int media_nvme_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
+
+/*
+ * #332: the disk-absolute scope a `physical:` target names -- the whole drive, or one GPT partition.
+ *
+ * Resolves the configured 1-based partition against the drive's own GPT via the injected reader.
+ * Returns 0 with the base and count written out, or -1 when the config named a partition that is not
+ * there -- in which case the caller must REFUSE rather than fall back to the whole disk: silently
+ * widening a partition target to the entire drive is the worst possible response to a typo.
+ */
+
+static int fw_1_phys_scope(int (*rd)(void *, uint64_t, uint32_t, void *), unsigned int partition,
+                           uint64_t disk_sectors, uint64_t *base, uint64_t *count) {
+    hype_gpt_partition_t part;
+
+    if (partition == 0u) {
+        *base = 0u;
+        *count = disk_sectors;
+        return 0;
+    }
+    if (hype_gpt_find_partition(rd, 0, partition, &part) != 0) {
+        return -1;
+    }
+    *base = part.first_lba;
+    *count = (part.last_lba >= part.first_lba) ? (part.last_lba - part.first_lba + 1u) : 0u;
+    if (*count == 0u || *base + *count > disk_sectors) {
+        return -1; /* a table claiming more than the drive has is not something to write through */
+    }
+    return 0;
+}
+
 /* #267: ...but writing to it additionally requires the destructive-write confirm
  * (#125) to have been ACCEPTED for this same drive. Evaluated at attach time, not
  * arm time, because the operator may confirm interactively after arming. */
@@ -7112,7 +7146,21 @@ static hype_media_dev_t g_media;
 /* #285: the parsed hype.cfg, defined with the config loader further down. Forward-declared here
  * because the guest-disk setup above it needs the configured image path, and consulting the
  * config from the file that defaults the value is the whole point of that fix. */
+/* #332: the sector count the guest is told for an NVMe physical target -- the partition's
+ * length when one is scoped, else the whole drive's. Set at bind time, read by the
+ * virtio-blk reset a few lines later. */
+static uint64_t g_hostnvme_scope_sectors;
+
 static hype_cfg_t g_hype_cfg;
+
+/* #332: the partition vm0's `physical:` target names, 0 for the whole disk. */
+static unsigned int fw_1_phys_partition(void) {
+    const hype_cfg_vm_t *cv = (g_hype_cfg.vm_count > 0u) ? &g_hype_cfg.vms[0] : 0;
+    if (cv == 0 || cv->target_disk.kind != HYPE_CFG_DISK_PHYSICAL) {
+        return 0u;
+    }
+    return cv->target_disk.partition;
+}
 
 /* 1 once a media device has been selected. Replaces the old `g_hostdisk_abar == 0` test, which
  * asked an AHCI-specific question to mean "is there a host disk at all". */
@@ -7392,6 +7440,29 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         }
         hype_blk_phys_nvme_init(&vm->vblk_phys, &vm->vblk_phys_nvme, &vm->vblk_be,
                                 g_hostnvme_bar, g_hostnvme_total_sectors);
+        { /* #332: scope to the configured partition, same rules as the AHCI path. */
+            unsigned int pnum = fw_1_phys_partition();
+            uint64_t pbase = 0, pcount = g_hostnvme_total_sectors;
+            if (fw_1_phys_scope(media_nvme_read, pnum, g_hostnvme_total_sectors, &pbase,
+                                &pcount) != 0) {
+                hype_serial_print("virtio-blk[vm %d]: target names partition %u, which is not on "
+                                  "the NVMe drive (sn '%s') -- REFUSING to attach rather than "
+                                  "widening to the whole disk\n", (int)(vm - &g_vms[0]), pnum,
+                                  g_hostnvme_serial);
+                return;
+            }
+            if (pnum != 0u) {
+                vm->vblk_phys.base_lba = pbase;
+                vm->vblk_be.total_sectors = pcount;
+                g_hostnvme_scope_sectors = pcount;
+                hype_debug_print("virtio-blk[vm %d]: scoped to partition %u -- disk LBA %llu, %llu "
+                                 "sectors (%llu MiB)\n", (int)(vm - &g_vms[0]), pnum,
+                                 (unsigned long long)pbase, (unsigned long long)pcount,
+                                 (unsigned long long)(pcount / 2048ull));
+            } else {
+                g_hostnvme_scope_sectors = pcount;
+            }
+        }
 #if HYPE_229_RO_PHYS
         /* #229 real-HW repro: strip the write fn so the guest can READ the real
          * NVMe (reproducing the AP read-completion flake) but never write it. */
@@ -7406,10 +7477,11 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         }
         vm->vblk_is_physical = 1;
         g_phys_backend_claimed_vm = (int)(vm - &g_vms[0]);
-        hype_virtio_blk_reset(&vm->vblk, g_hostnvme_total_sectors);
+        /* The SCOPE's size, not the drive's -- see the AHCI path. */
+        hype_virtio_blk_reset(&vm->vblk, g_hostnvme_scope_sectors);
         hype_debug_print("virtio-blk[vm %d]: PHYSICAL NVMe backend (sn '%s', %llu sectors)%s\n",
                          (int)(vm - &g_vms[0]), g_hostnvme_serial,
-                         (unsigned long long)g_hostnvme_total_sectors,
+                         (unsigned long long)g_hostnvme_scope_sectors,
                          vm->vblk_be.write ? " [writable]"
                                            : " [READ-ONLY -- boot only, no write confirm]");
         hype_debug_print("#229dbg setup: CR3=0x%llx g_pml4=0x%llx g_ap_cr3=0x%llx nvme_bar=0x%llx\n",
@@ -7428,8 +7500,29 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
          * no remap/re-init is needed here. */
         int idx = (int)(vm - &g_vms[0]);
         int writable = fw_1_phys_write_permitted(g_hostdisk_serial);
+        /* #332: scope to the configured partition, or the whole drive when none was named. */
+        unsigned int pnum = fw_1_phys_partition();
+        uint64_t pbase = 0, pcount = g_hostdisk_total_sectors;
+        if (fw_1_phys_scope(media_ahci_read, pnum, g_hostdisk_total_sectors, &pbase, &pcount) != 0) {
+            /* REFUSE, never widen: silently giving the guest the whole drive because partition N was
+             * missing is the worst possible response to a typo in a destructive target. */
+            hype_serial_print("virtio-blk[vm %d]: target names partition %u, which is not on the "
+                              "drive (sn '%s') -- REFUSING to attach rather than widening to the "
+                              "whole disk\n", idx, pnum, g_hostdisk_serial);
+            return;
+        }
         hype_blk_phys_ahci_init(&vm->vblk_phys, &g_hostdisk_ahci, &vm->vblk_be,
                                 g_hostdisk_abar, g_hostdisk_port, g_hostdisk_total_sectors);
+        if (pnum != 0u) {
+            /* Re-point the already-wired backend at the partition: base offsets every transfer and
+             * the clamped capacity is what the dispatcher confines the guest with. */
+            vm->vblk_phys.base_lba = pbase;
+            vm->vblk_be.total_sectors = pcount;
+            hype_debug_print("virtio-blk[vm %d]: scoped to partition %u -- disk LBA %llu, %llu "
+                             "sectors (%llu MiB)\n", idx, pnum, (unsigned long long)pbase,
+                             (unsigned long long)pcount,
+                             (unsigned long long)(pcount / 2048ull));
+        }
         /* #267: identity match earned the ATTACH; only the confirm earns the write
          * path. Nulling `write` is what hype_blk_backend_write checks, so a
          * read-only attach cannot damage the disk however the guest behaves. */
@@ -7438,10 +7531,11 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         }
         vm->vblk_is_physical = 1;
         g_phys_backend_claimed_vm = idx;
-        hype_virtio_blk_reset(&vm->vblk, g_hostdisk_total_sectors);
+        /* The guest is told the SCOPE's size, not the drive's -- otherwise it would address past
+         * the partition and every such access would be refused by the dispatcher. */
+        hype_virtio_blk_reset(&vm->vblk, pcount);
         hype_debug_print("virtio-blk[vm %d]: PHYSICAL AHCI/SATA backend (sn '%s', %llu sectors) "
-                         "%s\n", idx, g_hostdisk_serial,
-                         (unsigned long long)g_hostdisk_total_sectors,
+                         "%s\n", idx, g_hostdisk_serial, (unsigned long long)pcount,
                          writable ? "[writable -- #125 confirm accepted]"
                                   : "[READ-ONLY -- boot only; no write confirm (#267)]");
         /* Real-HW install: guarantee this "attached writable" confirmation reaches
@@ -12314,7 +12408,8 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_serial,
                                        const char *drive_model, uint64_t total_sectors,
                                        const uint8_t *disk_guid, const uint8_t *sector0,
-                                       const uint8_t *sector1) {
+                                       const uint8_t *sector1,
+                                       int (*rd)(void *, uint64_t, uint32_t, void *)) {
     unsigned int vi;
     if (!cfg) return;
     for (vi = 0; vi < cfg->vm_count; vi++) {
@@ -12324,8 +12419,35 @@ static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_
         if (d->kind != HYPE_CFG_DISK_PHYSICAL || d->path_or_id[0] == '\0') {
             continue;
         }
-        r = hype_phys_guard_arm(d->path_or_id, drive_serial, disk_guid, sector0, sector1,
-                                d->allow_overwrite, /*operator_confirmed=*/0);
+        if (d->partition != 0u) {
+            /*
+             * #332: a partition-scoped target asks a DIFFERENT occupancy question. The whole-disk
+             * check would refuse it unconditionally -- the drive always has a partition table, that
+             * being how the partition exists -- while saying nothing about whether the target
+             * partition holds a filesystem. Drive HEALTH still comes from the disk's own LBA0/1;
+             * see hype_phys_guard_arm_partition().
+             */
+            static uint8_t psec0[512] __attribute__((aligned(4096)));
+            static uint8_t psec2[512] __attribute__((aligned(4096)));
+            uint64_t pbase = 0, pcount = 0;
+            int have = 0;
+            if (fw_1_phys_scope(rd, d->partition, total_sectors, &pbase, &pcount) == 0 && rd != 0) {
+                have = (rd(0, pbase, 1u, psec0) == 0) && (rd(0, pbase + 2u, 1u, psec2) == 0);
+            }
+            if (!have) {
+                /* Could not read the partition, so occupancy is UNKNOWN. Refuse: an unreadable
+                 * target is never a safe one to arm a destructive write against. */
+                hype_debug_print("phys-write: vm '%s' target '%s' partition %u could not be read "
+                                 "-- not armed\n", v->name, d->path_or_id, d->partition);
+                continue;
+            }
+            r = hype_phys_guard_arm_partition(d->path_or_id, drive_serial, disk_guid, sector0,
+                                              sector1, psec0, psec2, d->allow_overwrite,
+                                              /*operator_confirmed=*/0);
+        } else {
+            r = hype_phys_guard_arm(d->path_or_id, drive_serial, disk_guid, sector0, sector1,
+                                    d->allow_overwrite, /*operator_confirmed=*/0);
+        }
         if (r == HYPE_PHYS_GUARD_DENY_ID_MISMATCH) {
             hype_debug_print("phys-write: vm '%s' target '%s' != enumerated drive (sn '%s') "
                              "-- not armed\n", v->name, d->path_or_id,
@@ -13732,7 +13854,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     } else {
                         arm_physical_write_confirm(&g_hype_cfg, g_hostnvme_serial, nvme_model,
                                                    g_hostnvme_total_sectors, 0,
-                                                   g_nvme_probe, g_nvme_lba1);
+                                                   g_nvme_probe, g_nvme_lba1, media_nvme_read);
                     }
                 }
             } else {
@@ -14444,9 +14566,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                   "this drive is unreliable; phys-write not armed "
                                                   "(#243)\n");
                             } else {
+                                /* #332: the reader lets the guard inspect a scoped PARTITION's own
+                                 * sectors, not just the disk's first two. */
                                 arm_physical_write_confirm(&g_hype_cfg, di.serial, di.model,
                                                            di.total_sectors, have_guid ? guid : 0,
-                                                           g_hostdisk_probe, g_hostdisk_lba1);
+                                                           g_hostdisk_probe, g_hostdisk_lba1,
+                                                           media_ahci_read);
                             }
                         }
                     } else {

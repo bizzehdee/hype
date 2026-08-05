@@ -93,6 +93,30 @@ hype_phys_guard_result_t hype_phys_guard_check(const hype_phys_guard_ctx_t *c);
 int hype_phys_part_table_nonempty(const uint8_t *sector0, const uint8_t *sector1);
 
 /*
+ * #332: the PARTITION-scoped counterpart -- does this partition already hold a filesystem?
+ *
+ * hype_phys_part_table_nonempty() above is the wrong question for a partition target, and dangerously
+ * so in both directions: the disk ALWAYS has a partition table (that is how the partition exists), so
+ * using it would refuse every partition target; and were it bypassed it would say nothing whatever
+ * about whether the TARGET PARTITION holds data.
+ *
+ * Takes the partition's own first sector and its THIRD sector (partition-relative LBA 0 and 2).
+ * Sector 2 is needed because an ext2/3/4 superblock lives at byte offset 1024 of the volume, i.e.
+ * outside the boot sector. Either pointer may be NULL (that family's check contributes nothing).
+ *
+ * Returns 1 when a filesystem signature is recognised: FAT12/16 ("FAT" at 54), FAT32 ("FAT32" at 82),
+ * exFAT / NTFS (OEM name at 3), ext2/3/4 (0xEF53 at superblock offset 56), or ISO9660 ("CD001").
+ * Returns 0 for a partition with none of them.
+ *
+ * DO NOT pair this with hype_phys_sectors_trustworthy(). That helper reads two all-zero sectors as a
+ * lying drive, which is right for a whole disk (any mainstream tool leaves at least a protective MBR)
+ * and WRONG for a partition, where all-zeros is exactly what a freshly created empty partition looks
+ * like -- every blank partition would be refused. Drive health stays a question about the DISK's
+ * LBA0/1; this is a question about the partition's contents. Pure.
+ */
+int hype_phys_partition_nonempty(const uint8_t *sector0, const uint8_t *sector2);
+
+/*
  * #243: are these sector bytes believable at all?
  *
  * Returns 0 (NOT trustworthy) when LBA0 and LBA1 are BOTH entirely zero. A truly blank
@@ -132,6 +156,32 @@ hype_phys_guard_result_t hype_phys_guard_arm(const char *configured_id, const ch
                                              const uint8_t *disk_guid, const uint8_t *sector0,
                                              const uint8_t *sector1, int allow_overwrite,
                                              int operator_confirmed);
+
+/*
+ * #332: the arm-time decision for a PARTITION-scoped target.
+ *
+ * Two different sector pairs, because the two questions are about different things and answering
+ * either with the wrong bytes is a wipe-the-wrong-thing bug:
+ *
+ *   - "does the target already hold data?" is about the PARTITION -- part_sector0/part_sector2, via
+ *     hype_phys_partition_nonempty(). Asking hype_phys_part_table_nonempty() about the disk would
+ *     refuse every partition target, since the disk always has a table.
+ *   - "is this drive telling the truth?" is about the DISK -- disk_sector0/disk_sector1, via
+ *     hype_phys_sectors_trustworthy(). It must NOT be asked of the partition: two all-zero sectors
+ *     mean a lying drive for a whole disk, but for a partition they are exactly what a freshly
+ *     created empty one looks like, so every blank partition would be refused (#243's WD Blue case
+ *     is about drive health, not partition contents).
+ *
+ * Pure; the caller performs both reads.
+ */
+hype_phys_guard_result_t hype_phys_guard_arm_partition(const char *configured_id,
+                                                      const char *drive_serial,
+                                                      const uint8_t *disk_guid,
+                                                      const uint8_t *disk_sector0,
+                                                      const uint8_t *disk_sector1,
+                                                      const uint8_t *part_sector0,
+                                                      const uint8_t *part_sector2,
+                                                      int allow_overwrite, int operator_confirmed);
 
 /*
  * #267: how a `physical:` target should be ATTACHED, which is a separate question

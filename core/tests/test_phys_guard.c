@@ -339,6 +339,151 @@ static void test_arm_all_zero_is_refused(void) {
               hype_phys_guard_arm("QM00013", "QM00013", GUID, s0, s1, 1, 1));
 }
 
+/* ---- #332: partition-scoped emptiness (a wipe-the-wrong-thing guard, so tested hard) ---- */
+
+static void put(uint8_t *sec, unsigned off, const char *str) {
+    unsigned i;
+    for (i = 0; str[i] != '\0'; i++) {
+        sec[off + i] = (uint8_t)str[i];
+    }
+}
+
+static void test_partition_nonempty_recognises_each_filesystem(void) {
+    uint8_t s0[512], s2[512];
+    unsigned i;
+
+    /* A blank partition: all zeros. This is the case that MUST read as empty -- it is exactly what a
+     * freshly created partition looks like, and refusing it would make the feature useless. */
+    for (i = 0; i < 512u; i++) { s0[i] = 0; s2[i] = 0; }
+    CHECK_HEX("an all-zero partition is EMPTY", 0, hype_phys_partition_nonempty(s0, s2));
+
+    /* exFAT / NTFS: OEM name at offset 3. */
+    for (i = 0; i < 512u; i++) s0[i] = 0;
+    put(s0, 3, "EXFAT   ");
+    CHECK_HEX("exFAT detected", 1, hype_phys_partition_nonempty(s0, s2));
+
+    for (i = 0; i < 512u; i++) s0[i] = 0;
+    put(s0, 3, "NTFS    ");
+    CHECK_HEX("NTFS detected", 1, hype_phys_partition_nonempty(s0, s2));
+
+    /* FAT32 names its type at 82; FAT12/16 at 54. */
+    for (i = 0; i < 512u; i++) s0[i] = 0;
+    put(s0, 82, "FAT32   ");
+    CHECK_HEX("FAT32 detected", 1, hype_phys_partition_nonempty(s0, s2));
+
+    for (i = 0; i < 512u; i++) s0[i] = 0;
+    put(s0, 54, "FAT16   ");
+    CHECK_HEX("FAT16 detected", 1, hype_phys_partition_nonempty(s0, s2));
+
+    for (i = 0; i < 512u; i++) s0[i] = 0;
+    put(s0, 54, "FAT12   ");
+    CHECK_HEX("FAT12 detected", 1, hype_phys_partition_nonempty(s0, s2));
+
+    /* A raw ISO in a partition -- the GLADDER-10 media layout does exactly this, so overwriting one
+     * would destroy an operator's installer media. */
+    for (i = 0; i < 512u; i++) s0[i] = 0;
+    put(s0, 1, "CD001");
+    CHECK_HEX("ISO9660 detected", 1, hype_phys_partition_nonempty(s0, s2));
+
+    /* ext2/3/4: magic 0xEF53 at superblock offset 56, i.e. byte 56 of partition sector 2. */
+    for (i = 0; i < 512u; i++) { s0[i] = 0; s2[i] = 0; }
+    s2[56] = 0x53u; s2[57] = 0xEFu;
+    CHECK_HEX("ext detected via sector 2", 1, hype_phys_partition_nonempty(s0, s2));
+    /* ...and NOT via sector 0, which is why the second sector is a parameter at all. */
+    CHECK_HEX("ext is invisible without sector 2", 0, hype_phys_partition_nonempty(s0, 0));
+}
+
+static void test_partition_nonempty_does_not_key_off_0x55aa(void) {
+    uint8_t s0[512], s2[512];
+    unsigned i;
+
+    for (i = 0; i < 512u; i++) { s0[i] = 0; s2[i] = 0; }
+    /* A boot signature with no filesystem: plenty of non-filesystem content carries 0x55AA, and
+     * treating it as "occupied" would refuse partitions that are genuinely free -- leaving the
+     * operator no way forward but allow_overwrite, which defeats the guard entirely. */
+    s0[510] = 0x55u;
+    s0[511] = 0xAAu;
+    CHECK_HEX("0x55AA alone does not mean occupied", 0, hype_phys_partition_nonempty(s0, s2));
+
+    /* A whole-disk MBR partition table, by contrast, IS occupied -- but that is the other function's
+     * question, and it must NOT be answered by this one. */
+    s0[446 + 4] = 0x83u;
+    CHECK_HEX("an MBR table in the partition's own sector 0 is still not a filesystem here", 0,
+              hype_phys_partition_nonempty(s0, s2));
+    CHECK_HEX("...while the whole-disk check does report it", 1,
+              hype_phys_part_table_nonempty(s0, (const uint8_t *)0));
+}
+
+static void test_partition_nonempty_null_tolerance(void) {
+    uint8_t s0[512];
+    unsigned i;
+    for (i = 0; i < 512u; i++) s0[i] = 0;
+    put(s0, 3, "EXFAT   ");
+
+    CHECK_HEX("NULL sector2 still detects a boot-sector filesystem", 1,
+              hype_phys_partition_nonempty(s0, 0));
+    CHECK_HEX("both NULL contributes nothing", 0, hype_phys_partition_nonempty(0, 0));
+}
+
+
+static void test_arm_partition_asks_each_question_of_the_right_sectors(void) {
+    uint8_t disk0[512], disk1[512], part0[512], part2[512];
+    unsigned i;
+    hype_phys_guard_result_t r;
+
+    /* A realistic drive: GPT-partitioned (so the WHOLE-disk check would say "occupied"), holding one
+     * genuinely EMPTY partition. This combination is the whole reason the partition path exists -- the
+     * old whole-disk guard would refuse it outright. */
+    for (i = 0; i < 512u; i++) { disk0[i] = 0; disk1[i] = 0; part0[i] = 0; part2[i] = 0; }
+    disk0[510] = 0x55u; disk0[511] = 0xAAu;         /* protective MBR */
+    put(disk1, 0, "EFI PART");                      /* GPT header */
+
+    r = hype_phys_guard_arm_partition("SN-1", "SN-1", 0, disk0, disk1, part0, part2,
+                                      /*allow_overwrite=*/0, /*confirmed=*/0);
+    /* Reaches the confirmation gate: identity matched and the PARTITION is blank, even though the
+     * DISK plainly has a partition table. */
+    CHECK_HEX("a blank partition on a partitioned disk is not refused as non-empty",
+              (unsigned long long)HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM, (unsigned long long)r);
+
+    /* Same disk, but now the partition holds a filesystem: refused without allow_overwrite. */
+    put(part0, 3, "EXFAT   ");
+    r = hype_phys_guard_arm_partition("SN-1", "SN-1", 0, disk0, disk1, part0, part2, 0, 0);
+    CHECK_HEX("an occupied partition IS refused", (unsigned long long)HYPE_PHYS_GUARD_DENY_NONEMPTY,
+              (unsigned long long)r);
+
+    /* ...and allow_overwrite gets past it, still needing the operator. */
+    r = hype_phys_guard_arm_partition("SN-1", "SN-1", 0, disk0, disk1, part0, part2, 1, 0);
+    CHECK_HEX("allow_overwrite still requires confirmation",
+              (unsigned long long)HYPE_PHYS_GUARD_DENY_NEEDS_CONFIRM, (unsigned long long)r);
+
+    /* Identity is still checked first. */
+    r = hype_phys_guard_arm_partition("SN-OTHER", "SN-1", 0, disk0, disk1, part0, part2, 1, 1);
+    CHECK_HEX("identity mismatch still wins", (unsigned long long)HYPE_PHYS_GUARD_DENY_ID_MISMATCH,
+              (unsigned long long)r);
+}
+
+static void test_arm_partition_drive_health_comes_from_the_disk(void) {
+    uint8_t disk0[512], disk1[512], part0[512], part2[512];
+    unsigned i;
+    hype_phys_guard_result_t r;
+
+    /* #243: a drive whose LBA0/LBA1 are BOTH all-zero is lying, and that verdict must still apply to
+     * a partition target -- the health question is about the DISK. */
+    for (i = 0; i < 512u; i++) { disk0[i] = 0; disk1[i] = 0; part0[i] = 0; part2[i] = 0; }
+    r = hype_phys_guard_arm_partition("SN-1", "SN-1", 0, disk0, disk1, part0, part2, 1, 1);
+    CHECK_HEX("an untrustworthy DRIVE is refused even for a partition target",
+              (unsigned long long)HYPE_PHYS_GUARD_DENY_UNTRUSTWORTHY_SECTORS, (unsigned long long)r);
+
+    /* With a believable disk and a blank partition, the same call is allowed once confirmed --
+     * proving the refusal above came from the disk bytes, not the partition's zeros. */
+    disk0[510] = 0x55u; disk0[511] = 0xAAu;
+    put(disk1, 0, "EFI PART");
+    r = hype_phys_guard_arm_partition("SN-1", "SN-1", 0, disk0, disk1, part0, part2, 0, 1);
+    CHECK_HEX("a believable disk with a blank partition is ALLOWED once confirmed",
+              (unsigned long long)HYPE_PHYS_GUARD_ALLOW, (unsigned long long)r);
+}
+
+
 int main(void) {
     test_guid_parse();
     test_allow_paths();
@@ -354,6 +499,11 @@ int main(void) {
     test_untrustworthy_denies_and_beats_allow_overwrite();
     test_untrustworthy_attaches_nothing();
     test_arm_all_zero_is_refused();
+    test_partition_nonempty_recognises_each_filesystem();
+    test_partition_nonempty_does_not_key_off_0x55aa();
+    test_partition_nonempty_null_tolerance();
+    test_arm_partition_asks_each_question_of_the_right_sectors();
+    test_arm_partition_drive_health_comes_from_the_disk();
 
     if (failures == 0) {
         printf("all tests passed\n");

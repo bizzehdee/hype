@@ -211,3 +211,71 @@ hype_phys_attach_mode_t hype_phys_attach_mode(hype_phys_guard_result_t guard) {
             return HYPE_PHYS_ATTACH_NONE;
     }
 }
+
+static int bytes_equal(const uint8_t *a, const char *b, unsigned n) {
+    unsigned i;
+    for (i = 0; i < n; i++) {
+        if (a[i] != (uint8_t)b[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int hype_phys_partition_nonempty(const uint8_t *sector0, const uint8_t *sector2) {
+    if (sector0 != 0) {
+        /* exFAT and NTFS both self-identify in the OEM-name field at offset 3. */
+        if (bytes_equal(sector0 + 3, "EXFAT   ", 8u) || bytes_equal(sector0 + 3, "NTFS    ", 8u)) {
+            return 1;
+        }
+        /*
+         * FAT: the type strings, NOT the 0x55AA signature. 0x55AA alone is a terrible test here --
+         * it is present on plenty of non-filesystem content (any bootable sector), so keying on it
+         * would refuse partitions that are in fact free, and the operator would have no way to
+         * proceed except allow_overwrite, which defeats the guard.
+         */
+        if (bytes_equal(sector0 + 82, "FAT32   ", 8u)) {
+            return 1;
+        }
+        if (bytes_equal(sector0 + 54, "FAT12   ", 8u) || bytes_equal(sector0 + 54, "FAT16   ", 8u) ||
+            bytes_equal(sector0 + 54, "FAT     ", 8u)) {
+            return 1;
+        }
+        /* ISO9660, in case a partition holds a raw image (the GLADDER-10 layout does exactly this). */
+        if (bytes_equal(sector0 + 1, "CD001", 5u)) {
+            return 1;
+        }
+    }
+    if (sector2 != 0) {
+        /*
+         * ext2/3/4: the superblock is at byte offset 1024 of the VOLUME, so its magic (0xEF53, little
+         * endian, at superblock offset 56) lands at byte 56 of partition-relative sector 2. This is
+         * why the function needs a second sector at all.
+         */
+        if (sector2[56] == 0x53u && sector2[57] == 0xEFu) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+hype_phys_guard_result_t hype_phys_guard_arm_partition(const char *configured_id,
+                                                      const char *drive_serial,
+                                                      const uint8_t *disk_guid,
+                                                      const uint8_t *disk_sector0,
+                                                      const uint8_t *disk_sector1,
+                                                      const uint8_t *part_sector0,
+                                                      const uint8_t *part_sector2,
+                                                      int allow_overwrite, int operator_confirmed) {
+    hype_phys_guard_ctx_t c;
+    c.configured_id = configured_id;
+    c.drive_serial = drive_serial;
+    c.disk_guid = disk_guid;
+    /* Occupancy: the PARTITION's own contents. */
+    c.partition_table_nonempty = hype_phys_partition_nonempty(part_sector0, part_sector2);
+    /* Drive health: the DISK's first sectors. See the header for why these must not be swapped. */
+    c.sectors_trustworthy = hype_phys_sectors_trustworthy(disk_sector0, disk_sector1);
+    c.allow_overwrite = allow_overwrite;
+    c.operator_confirmed = operator_confirmed;
+    return hype_phys_guard_check(&c);
+}

@@ -32,6 +32,17 @@ typedef struct {
     hype_blk_phys_read_fn read_sectors;
     hype_blk_phys_write_fn write_sectors; /* NULL => read-only backend */
     void *hw;                             /* opaque, passed to the callbacks */
+    /*
+     * #332: disk-absolute LBA of sector 0 of the SCOPE. 0 for a whole-disk target; the partition's
+     * first LBA for a partition-scoped one.
+     *
+     * The confinement property is the reason it lives here rather than being filtered in the adapter:
+     * hype_blk_backend_read/write already bounds-checks the guest's LBA+count against
+     * be->total_sectors. Set total_sectors to the PARTITION's size and add this base, and the guest
+     * is confined to that partition BY THE CHECK THAT ALREADY EXISTS -- no new trust boundary, and no
+     * second place to forget one.
+     */
+    uint64_t base_lba;
 } hype_blk_phys_t;
 
 /*
@@ -39,10 +50,25 @@ typedef struct {
  * per-chunk sector callbacks over `hw`. `write_sectors` NULL makes the backend
  * read-only (be->write stays NULL, so a guest write is rejected by the
  * dispatcher). Pure.
+ *
+ * Whole-disk form: equivalent to hype_blk_phys_init_scoped() with base_lba 0.
  */
 void hype_blk_phys_init(hype_blk_phys_t *p, hype_blk_backend_t *be,
                         hype_blk_phys_read_fn read_sectors, hype_blk_phys_write_fn write_sectors,
                         void *hw, uint64_t total_sectors);
+
+/*
+ * #332: partition-scoped form. `base_lba` is the partition's first disk-absolute LBA and
+ * `sector_count` its length, which becomes the backend's total_sectors -- so the guest sees a disk of
+ * exactly that size and cannot address outside it (see hype_blk_phys_t.base_lba).
+ *
+ * This is what turns "dedicate a whole drive to hype" into "give hype the spare partition you already
+ * have" (plan.md §6d).
+ */
+void hype_blk_phys_init_scoped(hype_blk_phys_t *p, hype_blk_backend_t *be,
+                               hype_blk_phys_read_fn read_sectors,
+                               hype_blk_phys_write_fn write_sectors, void *hw, uint64_t base_lba,
+                               uint64_t sector_count);
 
 /* --- runtime AHCI binding (coverage-exempt shim; real MMIO via ahci_host) --- */
 

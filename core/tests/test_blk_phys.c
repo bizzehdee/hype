@@ -115,6 +115,92 @@ static void test_bounds_gate(void) {
     CHECK_HEX("no hw call on oob", 0, g_ncalls);
 }
 
+/* ---- #332: partition-scoped physical targets ---- */
+
+static void test_scoped_offsets_every_read(void) {
+    hype_blk_phys_t p;
+    hype_blk_backend_t be;
+
+    reset_log();
+    /* Partition at disk LBA 2048, 1000 sectors long. */
+    hype_blk_phys_init_scoped(&p, &be, fake_read, fake_write, 0, 2048ull, 1000ull);
+
+    /* The guest sees a disk of exactly the PARTITION's size -- that is what confines it. */
+    CHECK_HEX("backend capacity is the partition length, not the disk", 1000ull, be.total_sectors);
+
+    CHECK_HEX("read at scope LBA 0 ok", 0, hype_blk_backend_read(&be, 0, 8, g_buf));
+    CHECK_HEX("one hw call", 1, g_ncalls);
+    CHECK_HEX("...issued at the DISK-absolute LBA", 2048ull, g_calls[0].lba);
+
+    reset_log();
+    CHECK_HEX("read at scope LBA 10 ok", 0, hype_blk_backend_read(&be, 10, 8, g_buf));
+    CHECK_HEX("offset applied", 2058ull, g_calls[0].lba);
+}
+
+static void test_scoped_offset_applied_once_not_per_chunk(void) {
+    hype_blk_phys_t p;
+    hype_blk_backend_t be;
+
+    reset_log();
+    hype_blk_phys_init_scoped(&p, &be, fake_read, fake_write, 0, 4096ull,
+                              3ull * HYPE_BLK_PHYS_MAX_CHUNK);
+
+    /* A multi-chunk transfer: the base must be added ONCE, before the loop. Adding it per chunk
+     * would leave chunk 1 at base*2 + MAX_CHUNK -- writing far outside the partition. */
+    CHECK_HEX("multi-chunk read ok", 0,
+              hype_blk_backend_read(&be, 0, 2u * HYPE_BLK_PHYS_MAX_CHUNK, g_buf));
+    CHECK_HEX("two hw calls", 2, g_ncalls);
+    CHECK_HEX("chunk0 at base", 4096ull, g_calls[0].lba);
+    CHECK_HEX("chunk1 at base + MAX_CHUNK (base NOT re-added)",
+              4096ull + HYPE_BLK_PHYS_MAX_CHUNK, g_calls[1].lba);
+}
+
+static void test_scoped_writes_are_offset_too(void) {
+    hype_blk_phys_t p;
+    hype_blk_backend_t be;
+
+    reset_log();
+    hype_blk_phys_init_scoped(&p, &be, fake_read, fake_write, 0, 63ull, 100ull);
+    CHECK_HEX("write ok", 0, hype_blk_backend_write(&be, 5, 4, g_buf));
+    CHECK_HEX("one hw call", 1, g_ncalls);
+    /* A write landing at the wrong LBA is the wipe-the-wrong-thing bug this ticket is about. */
+    CHECK_HEX("write offset applied", 68ull, g_calls[0].lba);
+}
+
+static void test_scoped_guest_cannot_escape_the_partition(void) {
+    hype_blk_phys_t p;
+    hype_blk_backend_t be;
+
+    reset_log();
+    hype_blk_phys_init_scoped(&p, &be, fake_read, fake_write, 0, 2048ull, 100ull);
+
+    /* Refused by the dispatcher's EXISTING bounds check against total_sectors -- no new check was
+     * added, which is the point of clamping capacity rather than filtering in the adapter. */
+    CHECK_HEX("read starting past the partition end is refused", -1,
+              hype_blk_backend_read(&be, 100, 1, g_buf));
+    CHECK_HEX("read straddling the partition end is refused", -1,
+              hype_blk_backend_read(&be, 98, 4, g_buf));
+    CHECK_HEX("write past the end is refused", -1, hype_blk_backend_write(&be, 100, 1, g_buf));
+    CHECK_HEX("no hw call was ever issued", 0, g_ncalls);
+
+    /* The last sector inside the partition still works. */
+    CHECK_HEX("the final in-range sector is allowed", 0, hype_blk_backend_read(&be, 99, 1, g_buf));
+    CHECK_HEX("at the right absolute LBA", 2048ull + 99ull, g_calls[0].lba);
+}
+
+static void test_whole_disk_init_is_unchanged(void) {
+    hype_blk_phys_t p;
+    hype_blk_backend_t be;
+
+    reset_log();
+    hype_blk_phys_init(&p, &be, fake_read, fake_write, 0, 5000ull);
+    CHECK_HEX("base is 0", 0ull, p.base_lba);
+    CHECK_HEX("capacity is the whole disk", 5000ull, be.total_sectors);
+    CHECK_HEX("read ok", 0, hype_blk_backend_read(&be, 42, 1, g_buf));
+    CHECK_HEX("no offset applied", 42ull, g_calls[0].lba);
+}
+
+
 int main(void) {
     test_single_chunk();
     test_exact_chunk_boundary();
@@ -123,6 +209,11 @@ int main(void) {
     test_read_only_backend();
     test_error_propagation();
     test_bounds_gate();
+    test_scoped_offsets_every_read();
+    test_scoped_offset_applied_once_not_per_chunk();
+    test_scoped_writes_are_offset_too();
+    test_scoped_guest_cannot_escape_the_partition();
+    test_whole_disk_init_is_unchanged();
 
     if (failures == 0) {
         printf("all tests passed\n");
