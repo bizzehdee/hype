@@ -126,6 +126,29 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
             })
         }
 
+        /*
+         * #303: the CMOS/RTC node. Linux's rtc_cmos binds either through PNP (PNP0B00) or as a
+         * platform device, and its own log line says which it took -- "registered platform RTC
+         * device (no PNP device found)" is the platform fallback, i.e. it looked for this node and
+         * did not find one. hype DOES model a CMOS RTC at 0x70/0x71 (devices/cmos.c, made legal for
+         * EDK2's PcRtc by #286), so a machine description that omits it is simply wrong.
+         *
+         * Standard resources: the two-port index/data pair at 0x70, and IRQ8 for the periodic and
+         * alarm interrupts. hype does not currently RAISE IRQ8 (register C always reads 0), so a
+         * guest asking for periodic wakeups will not get them -- declaring the line is still correct
+         * for the device that exists, and the alternative (omitting it) makes the node unbindable.
+         */
+        Device (RTC)
+        {
+            Name (_HID, EisaId ("PNP0B00"))  /* MC146818-compatible real-time clock */
+            Name (_STA, 0x0F)
+            Name (_CRS, ResourceTemplate ()
+            {
+                IO (Decode16, 0x0070, 0x0070, 0x00, 0x02)
+                IRQNoFlags () {8}
+            })
+        }
+
         Device (MOU)
         {
             Name (_HID, EisaId ("PNP0F13"))  /* PS/2 mouse (i8042 port B) */
