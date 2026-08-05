@@ -12,10 +12,11 @@
 # no RAM copy -- the difference is only in how hype OBTAINS the ISO bytes. Selected by
 # ISO_MODE=file|raw, defaulting to raw for ISOs FAT32 cannot hold:
 #
-#   file  (GLADDER-11 / #182)  one FAT32 partition holding \iso\test.iso; hype resolves the
-#                             file's extents and streams from the raw disk LBAs. Requires the
-#                             file to be CONTIGUOUS -- hype falls back if it is fragmented.
+#   file  (GLADDER-11 / #182)  GPT disk, partition 1 = FAT32 holding \iso\test.iso; hype resolves
+#                             the file's extents and streams from the raw disk LBAs. Handles up to
+#                             HYPE_FAT_MAX_EXTENTS = 64 extents (#327); beyond that hype refuses.
 #                             **Cannot carry an ISO >= 4 GiB: that is FAT32's max file size.**
+#                             The GPT is not optional -- see build_esp_file().
 #
 #   raw   (GLADDER-10)        GPT disk, partition 1 = a small FAT ESP (hype.efi + firmware only),
 #                             partition 2 = the raw ISO bytes, no filesystem in the path. hype's
@@ -92,7 +93,7 @@ SFDISK
 }
 
 build_esp_file() {
-    # ISO + firmware + slack, rounded up to whole MB.
+    # ISO + firmware + slack, rounded up to whole MB, plus 1MiB for the GPT + alignment gap.
     local mb
     mb=$(( $(stat -c%s "$ISO") / 1048576 + 96 ))
     rm -f "$ESP"
@@ -101,13 +102,29 @@ build_esp_file() {
     # to QEMU in the same breath intermittently came up as `BdsDxe: ... Not Found` / no boot
     # option at all, on an image mtools itself could list correctly. Allocating and then
     # syncing removes the variable rather than leaving a retry to paper over it.
-    fallocate -l "${mb}M" "$ESP" 2>/dev/null || \
-        dd if=/dev/zero of="$ESP" bs=1048576 count="$mb" status=none conv=fsync
-    mformat -i "$ESP" -F ::
-    mmd -i "$ESP" ::/EFI ::/EFI/BOOT ::/EFI/hype ::/iso
-    mcopy -i "$ESP" build/hype.efi ::/EFI/BOOT/BOOTX64.EFI
-    mcopy -i "$ESP" fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
-    mcopy -i "$ESP" "$ISO" ::/iso/test.iso
+    fallocate -l "$(( mb + 1 ))M" "$ESP" 2>/dev/null || \
+        dd if=/dev/zero of="$ESP" bs=1048576 count=$(( mb + 1 )) status=none conv=fsync
+    #
+    # The image MUST be GPT-partitioned, not a bare FAT filesystem. hype's streaming resolver
+    # locates the volume with hype_gpt_find_partition() before handing it to core/fat.c, so a
+    # bare `mformat -i "$ESP" ::` image has no partition for it to find. This mode used to build
+    # exactly that, which meant it silently fell back to the pre-EBS RAM load every run while
+    # this file's own header claimed both modes streamed. It never streamed once. A missing
+    # `host-fat: resolved ...` line is the only symptom, and there is no log line for a FAILED
+    # resolve -- so absence looked like "nothing to see" rather than "wrong mode".
+    #
+    # Size omitted so sfdisk fills the rest of the disk: an explicit mb*2048 overruns the GPT
+    # backup header at the end and sfdisk refuses ("last usable GPT sector is ...").
+    sfdisk --label gpt -q "$ESP" >/dev/null <<SFDISK
+2048,,U
+SFDISK
+    # mtools addresses the partition via @@1M (1MiB == LBA 2048, the alignment above). Without
+    # the offset it reports "init :: non DOS media".
+    mformat -i "$ESP@@1M" -F ::
+    mmd -i "$ESP@@1M" ::/EFI ::/EFI/BOOT ::/EFI/hype ::/iso
+    mcopy -i "$ESP@@1M" build/hype.efi ::/EFI/BOOT/BOOTX64.EFI
+    mcopy -i "$ESP@@1M" fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
+    mcopy -i "$ESP@@1M" "$ISO" ::/iso/test.iso
     sync "$ESP"
 
     # Verify what was produced rather than trusting the tools -- the same discipline
@@ -115,9 +132,9 @@ build_esp_file() {
     # exactly like hype failing to boot.
     local want have
     want=$(stat -c%s "$ISO")
-    have=$(mdir -i "$ESP" ::/iso 2>/dev/null | awk '/test *iso/ {print $3}')
+    have=$(mdir -i "$ESP@@1M" ::/iso 2>/dev/null | awk '/test *iso/ {print $3}')
     [ "$have" = "$want" ] || { echo "ESP verify FAILED: test.iso is $have bytes, wanted $want"; return 1; }
-    mdir -i "$ESP" ::/EFI/BOOT 2>/dev/null | grep -q BOOTX64 || \
+    mdir -i "$ESP@@1M" ::/EFI/BOOT 2>/dev/null | grep -q BOOTX64 || \
         { echo "ESP verify FAILED: BOOTX64.EFI missing"; return 1; }
     return 0
 }
