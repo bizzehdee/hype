@@ -29,6 +29,18 @@ typedef int (*hype_iso_disk_read_fn)(void *ctx, uint64_t lba, uint32_t count, vo
  * not be streamed. On ext it is worse than unlikely: core/ext.h notes large indirect-mapped files
  * are STRUCTURALLY fragmented, so one extent is close to unachievable there.
  */
+/*
+ * #327/#326 CONTRACT: a hype_iso_stream_t MUST be zero-initialised before use.
+ *
+ * `extent_count == 0` means "one contiguous run from part_start_lba" -- it cannot be distinguished
+ * from "never set", so an uninitialised struct does not fail loudly, it reads the WRONG SECTORS or
+ * refuses depending on stack garbage. hype's own streams live in statics (g_vms[]) and are therefore
+ * zeroed by construction; a caller building one on the stack must memset it.
+ *
+ * Learned the hard way: core/tests/test_iso_stream.c declared one on the stack and passed for as long
+ * as that stack slot happened to be zero, then started failing four assertions after unrelated code
+ * shifted the layout. ASan does not catch uninitialised reads.
+ */
 typedef struct {
     uint64_t start_lba;    /* disk-absolute first LBA of this run */
     uint64_t sector_count; /* length of the run, in 512-byte sectors */

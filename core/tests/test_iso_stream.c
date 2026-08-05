@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "../iso_stream.h"
 
 static int failures = 0;
@@ -91,6 +92,7 @@ static uint64_t frag_disk_byte(uint64_t off) {
 static void test_locate_single_run_is_unchanged(void) {
     /* extent_count == 0 is the raw-partition / one-extent case every existing caller sets up. */
     hype_iso_stream_t s;
+    memset(&s, 0, sizeof(s)); /* see iso_stream.h: the struct must be zeroed */
     uint64_t lba = 0, run = 0;
     uint32_t head = 0;
 
@@ -112,6 +114,7 @@ static void test_locate_single_run_is_unchanged(void) {
 
 static void test_locate_walks_the_extent_map(void) {
     hype_iso_stream_t s;
+    memset(&s, 0, sizeof(s)); /* see iso_stream.h: the struct must be zeroed */
     uint64_t lba = 0, run = 0;
     uint32_t head = 0;
     frag_setup(&s);
@@ -153,6 +156,7 @@ static void test_read_across_extent_boundaries(void) {
      * file. Every byte is checked against where it actually lives on disk.
      */
     hype_iso_stream_t s;
+    memset(&s, 0, sizeof(s)); /* see iso_stream.h: the struct must be zeroed */
     uint8_t buf[9 * 512];
     uint64_t i;
     unsigned bad = 0;
@@ -188,6 +192,7 @@ static void test_read_with_many_extents(void) {
      * assumption of ascending or contiguous LBAs fails.
      */
     hype_iso_stream_t s;
+    memset(&s, 0, sizeof(s)); /* see iso_stream.h: the struct must be zeroed */
     static uint8_t buf[HYPE_ISO_STREAM_MAX_EXTENTS * 512u];
     unsigned i;
     unsigned bad = 0;
@@ -221,6 +226,7 @@ static void test_read_with_many_extents(void) {
  */
 static void test_read_large_extents_across_bounce_cap(void) {
     hype_iso_stream_t s;
+    memset(&s, 0, sizeof(s)); /* see iso_stream.h: the struct must be zeroed */
     static uint8_t buf[3u * 256u * 512u]; /* exactly the whole mapped ISO -- sized, not guessed */
     unsigned i;
     unsigned bad = 0;
@@ -279,6 +285,7 @@ static int fail_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
 
 static void test_refusals_and_error_paths(void) {
     hype_iso_stream_t s;
+    memset(&s, 0, sizeof(s)); /* see iso_stream.h: the struct must be zeroed */
     uint8_t buf[64];
 
     /* Unset layout: no read fn, or no size. Both must refuse rather than dereference. */
@@ -311,6 +318,7 @@ static void test_map_shorter_than_iso_size_is_refused_midway(void) {
      * on. This is the mid-read locate() failure path.
      */
     hype_iso_stream_t s;
+    memset(&s, 0, sizeof(s)); /* see iso_stream.h: the struct must be zeroed */
     static uint8_t buf[4096];
     unsigned i;
 
@@ -338,6 +346,7 @@ int main(void) {
     test_read_across_extent_boundaries();
     test_read_with_many_extents();
     hype_iso_stream_t s;
+    memset(&s, 0, sizeof(s)); /* see iso_stream.h: the struct must be zeroed */
     s.read = fake_read;
     s.ctx = 0;
     s.part_start_lba = PART_START;
