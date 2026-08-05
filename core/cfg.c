@@ -15,7 +15,10 @@ enum {
     F_NET_PEERS = 1u << 10,
     F_PARTITION = 1u << 11,
     F_ALLOW_OVERWRITE = 1u << 12,
-    F_MEDIA_DISK = 1u << 13 /* #323 */
+    F_MEDIA_DISK = 1u << 13,
+    F_DISKS = 1u << 14,
+    F_CDROMS = 1u << 15,
+    F_BOOT_ORDER = 1u << 16 /* #323 */
 };
 
 /* Parses a boolean value: true/false, yes/no, on/off, 1/0. */
@@ -196,6 +199,52 @@ static hype_cfg_status_t parse_net_peers(char *val, hype_cfg_vm_t *vm) {
     return for_each_comma_piece(val, vm, net_peer_piece);
 }
 
+/*
+ * #222 (§5.2): the disks/cdroms/boot_order id lists.
+ *
+ * for_each_comma_piece only passes the VM, so which list is being filled is carried in a file-local
+ * pointer. Safe because the parser is single-threaded and strictly one key at a time -- but stated,
+ * because a static here would be a bug the moment that stopped being true.
+ */
+static char (*g_list_dst)[HYPE_CFG_NAME_MAX];
+static unsigned int *g_list_count;
+static unsigned int g_list_cap;
+
+static hype_cfg_status_t id_list_piece(char *name, hype_cfg_vm_t *vm) {
+    unsigned int i;
+
+    (void)vm;
+    if (*name == '\0') {
+        return HYPE_CFG_ERR_BAD_VALUE;
+    }
+    /* A repeated id would attach the same device twice -- for a writable disk that is two guest
+     * devices over one backing store, i.e. guaranteed corruption. Refused here rather than left to
+     * admission, because it needs no cross-entity knowledge to see. */
+    for (i = 0; i < *g_list_count; i++) {
+        if (hype_streq(g_list_dst[i], name)) {
+            return HYPE_CFG_ERR_BAD_VALUE;
+        }
+    }
+    if (*g_list_count >= g_list_cap) {
+        return HYPE_CFG_ERR_TOO_MANY_ENTRIES;
+    }
+    if (hype_strlcpy(g_list_dst[*g_list_count], name, HYPE_CFG_NAME_MAX) >= HYPE_CFG_NAME_MAX) {
+        return HYPE_CFG_ERR_VALUE_TOO_LONG;
+    }
+    (*g_list_count)++;
+    return HYPE_CFG_OK;
+}
+
+static hype_cfg_status_t parse_id_list(char *val, hype_cfg_vm_t *vm,
+                                       char (*dst)[HYPE_CFG_NAME_MAX], unsigned int *count,
+                                       unsigned int cap) {
+    *count = 0;
+    g_list_dst = dst;
+    g_list_count = count;
+    g_list_cap = cap;
+    return for_each_comma_piece(val, vm, id_list_piece);
+}
+
 static hype_cfg_status_t parse_uint_field(char *val, unsigned int *out) {
     unsigned long long v;
     if (hype_parse_uint(val, &v) != 0 || v == 0 || v > 0xFFFFFFFFULL) {
@@ -258,6 +307,31 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         if (vm->media_disk[0] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
         vm->has_media_disk = 1;
         *seen |= F_MEDIA_DISK;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "disks")) {
+        hype_cfg_status_t st;
+        if (*seen & F_DISKS) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        st = parse_id_list(val, vm, vm->disks, &vm->disks_count, HYPE_CFG_MAX_VM_DISKS);
+        if (st != HYPE_CFG_OK) return st;
+        *seen |= F_DISKS;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "cdroms")) {
+        hype_cfg_status_t st;
+        if (*seen & F_CDROMS) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        st = parse_id_list(val, vm, vm->cdroms, &vm->cdroms_count, HYPE_CFG_MAX_VM_DISKS);
+        if (st != HYPE_CFG_OK) return st;
+        *seen |= F_CDROMS;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "boot_order")) {
+        hype_cfg_status_t st;
+        if (*seen & F_BOOT_ORDER) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        st = parse_id_list(val, vm, vm->boot_order, &vm->boot_order_count,
+                           HYPE_CFG_MAX_BOOT_ORDER);
+        if (st != HYPE_CFG_OK) return st;
+        *seen |= F_BOOT_ORDER;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "target_disk")) {
@@ -338,7 +412,24 @@ static hype_cfg_status_t validate_required(const hype_cfg_vm_t *vm, unsigned int
     if (!(seen & F_VCPUS)) return HYPE_CFG_ERR_MISSING_REQUIRED;
     if (!(seen & F_MEM_MB)) return HYPE_CFG_ERR_MISSING_REQUIRED;
     if (!(seen & F_BOOT)) return HYPE_CFG_ERR_MISSING_REQUIRED;
-    if (!(seen & F_TARGET_DISK)) return HYPE_CFG_ERR_MISSING_REQUIRED;
+    /*
+     * #222 (§7): a VM says where its storage comes from EITHER inline (target_disk) OR by reference
+     * (disks/cdroms) -- never both, since two answers to "which disk" cannot be reconciled and
+     * picking one silently would be exactly the #285 failure again.
+     */
+    if ((seen & F_TARGET_DISK) && ((seen & F_DISKS) || (seen & F_CDROMS))) {
+        return HYPE_CFG_ERR_BAD_VALUE;
+    }
+    /*
+     * One of the two forms is required. §5.2 does say a VM with zero disks and zero cdroms is valid,
+     * and this deliberately does NOT permit that yet: nothing can launch such a VM, and accepting it
+     * would turn a misspelled `target_disk` line into a silently disk-less guest -- a config that
+     * looks accepted and produces a machine that cannot boot. Revisit with #329, which is what will
+     * make an attached-device list mean anything at launch.
+     */
+    if (!(seen & F_TARGET_DISK) && !(seen & F_DISKS) && !(seen & F_CDROMS)) {
+        return HYPE_CFG_ERR_MISSING_REQUIRED;
+    }
     if (!(seen & F_FIRMWARE)) return HYPE_CFG_ERR_MISSING_REQUIRED;
     if (!(seen & F_OS_HINT)) return HYPE_CFG_ERR_MISSING_REQUIRED;
     if (vm->boot == HYPE_CFG_BOOT_INSTALLER && !(seen & F_INSTALL_MEDIA)) {

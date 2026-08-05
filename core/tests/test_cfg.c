@@ -1007,6 +1007,140 @@ static void test_too_many_sections_flags_overflow(void) {
 }
 
 
+/* ---- #222 (CONFIG-2, spec §5.2/§5.4/§5.7): disks / cdroms / boot_order lists ---- */
+
+static void test_vm_disk_lists(void) {
+    const char *cfg =
+        "[vm.win11]\n"
+        "vcpus = 4\n"
+        "mem_mb = 8192\n"
+        "boot = installer\n"
+        "install_media = \\iso\\win11.iso\n"
+        "firmware = uefi\n"
+        "os_hint = windows\n"
+        "disks = win-sys, win-data1, win-data2\n"
+        "cdroms = inst, drivers\n"
+        "boot_order = inst, win-sys\n"
+        "\n"
+        "[disk.win-sys]\nbacking = file\npath = sys.img\nbus = ahci-sata\n"
+        "[disk.win-data1]\nbacking = file\npath = d1.img\nbus = nvme\n"
+        "[disk.win-data2]\nbacking = file\npath = d2.img\nbus = nvme\n"
+        "[disk.inst]\ntype = cdrom\npath = \\iso\\win11.iso\n"
+        "[disk.drivers]\ntype = cdrom\npath = \\iso\\virtio.iso\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+
+    CHECK_INT("the spec's mixed-bus example parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("one VM", 1, out.vm_count);
+    CHECK_INT("five disks defined", 5, out.disk_count);
+    CHECK_INT("three disks attached", 3, out.vms[0].disks_count);
+    /* Order is meaningful: it is the order the guest enumerates them. */
+    CHECK_STR("disks[0]", "win-sys", out.vms[0].disks[0]);
+    CHECK_STR("disks[1]", "win-data1", out.vms[0].disks[1]);
+    CHECK_STR("disks[2]", "win-data2", out.vms[0].disks[2]);
+    CHECK_INT("two cdroms attached", 2, out.vms[0].cdroms_count);
+    CHECK_STR("cdroms[0]", "inst", out.vms[0].cdroms[0]);
+    CHECK_STR("cdroms[1]", "drivers", out.vms[0].cdroms[1]);
+    CHECK_INT("boot_order has two entries", 2, out.vms[0].boot_order_count);
+    CHECK_STR("boot_order[0] is the installer CD", "inst", out.vms[0].boot_order[0]);
+    CHECK_STR("boot_order[1] is the system disk", "win-sys", out.vms[0].boot_order[1]);
+    /* No target_disk at all: the reference form replaces it entirely. */
+    CHECK_INT("mixed buses survive per device", (int)HYPE_CFG_BUS_AHCI_SATA, (int)out.disks[0].bus);
+    CHECK_INT("nvme on the data disk", (int)HYPE_CFG_BUS_NVME, (int)out.disks[1].bus);
+}
+
+static void test_vm_lists_are_ordered_not_sets(void) {
+    const char *a =
+        "[vm.a]\nvcpus=1\nmem_mb=512\nboot=disk\nfirmware=uefi\nos_hint=linux\ndisks = x, y\n";
+    const char *b =
+        "[vm.a]\nvcpus=1\nmem_mb=512\nboot=disk\nfirmware=uefi\nos_hint=linux\ndisks = y, x\n";
+    hype_cfg_t oa, ob;
+
+    CHECK_INT("both parse", HYPE_CFG_OK, parse_copy(a, &oa).status);
+    CHECK_INT("both parse", HYPE_CFG_OK, parse_copy(b, &ob).status);
+    /* Different machines: enumeration order differs, so the order must be preserved as written. */
+    CHECK_STR("first config keeps x first", "x", oa.vms[0].disks[0]);
+    CHECK_STR("second config keeps y first", "y", ob.vms[0].disks[0]);
+}
+
+static void test_vm_inline_and_lists_are_mutually_exclusive(void) {
+    /* Two answers to "which disk" cannot be reconciled, and silently picking one would be the #285
+     * failure over again. */
+    const char *cfg =
+        "[vm.a]\nvcpus=1\nmem_mb=512\nboot=disk\nfirmware=uefi\nos_hint=linux\n"
+        "target_disk = file:a.img\ndisks = x\n";
+    hype_cfg_t out;
+
+    CHECK_INT("inline target_disk together with disks= is refused", HYPE_CFG_ERR_BAD_VALUE,
+              parse_copy(cfg, &out).status);
+}
+
+static void test_vm_storage_form_is_required(void) {
+    /* Neither form: refused. §5.2 permits a diskless VM in principle, but accepting it here would
+     * turn a misspelled target_disk into a silently disk-less guest. */
+    const char *cfg = "[vm.a]\nvcpus=1\nmem_mb=512\nboot=disk\nfirmware=uefi\nos_hint=linux\n";
+    hype_cfg_t out;
+
+    CHECK_INT("a VM with no storage form at all is refused", HYPE_CFG_ERR_MISSING_REQUIRED,
+              parse_copy(cfg, &out).status);
+}
+
+static void test_vm_cdroms_alone_satisfies_the_requirement(void) {
+    /* A boot-from-CD VM with no hard disk is legitimate -- a live ISO needs no target. */
+    const char *cfg =
+        "[vm.live]\nvcpus=1\nmem_mb=512\nboot=installer\ninstall_media=\\iso\\a.iso\n"
+        "firmware=uefi\nos_hint=linux\ncdroms = live\n"
+        "[disk.live]\ntype=cdrom\npath=\\iso\\a.iso\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+
+    CHECK_INT("cdroms alone is a valid storage form", HYPE_CFG_OK, res.status);
+    CHECK_INT("one cdrom attached", 1, out.vms[0].cdroms_count);
+    CHECK_INT("no disks attached", 0, out.vms[0].disks_count);
+}
+
+static void test_vm_list_errors(void) {
+    struct { const char *desc; const char *tail; hype_cfg_status_t want; } cases[] = {
+        {"repeated id in disks", "disks = x, x\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"repeated id in cdroms", "cdroms = c, c\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"repeated id in boot_order", "disks = x\nboot_order = x, x\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"empty disks value", "disks =\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"empty piece in the middle", "disks = x, , y\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"trailing comma", "disks = x,\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"duplicate disks key", "disks = x\ndisks = y\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate cdroms key", "cdroms = c\ncdroms = d\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate boot_order key", "disks = x\nboot_order = x\nboot_order = x\n",
+         HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"too many disks", "disks = a,b,c,d,e,f,g,h,i\n", HYPE_CFG_ERR_TOO_MANY_ENTRIES}
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char cfg[1024];
+        hype_cfg_t out;
+        snprintf(cfg, sizeof(cfg),
+                 "[vm.a]\nvcpus=1\nmem_mb=512\nboot=disk\nfirmware=uefi\nos_hint=linux\n%s",
+                 cases[i].tail);
+        CHECK_INT(cases[i].desc, (int)cases[i].want, (int)parse_copy(cfg, &out).status);
+    }
+}
+
+static void test_vm_list_id_too_long(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    int n;
+    unsigned int i;
+
+    n = snprintf(cfg, sizeof(cfg),
+                 "[vm.a]\nvcpus=1\nmem_mb=512\nboot=disk\nfirmware=uefi\nos_hint=linux\ndisks = ");
+    for (i = 0; i < HYPE_CFG_NAME_MAX + 4u; i++) cfg[n++] = 'd';
+    cfg[n++] = '\n';
+    cfg[n] = '\0';
+    CHECK_INT("an over-long id in a list is rejected", HYPE_CFG_ERR_VALUE_TOO_LONG,
+              (int)parse_copy(cfg, &out).status);
+}
+
+
 int main(void) {
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
@@ -1047,6 +1181,13 @@ int main(void) {
     test_disk_allow_overwrite_and_ro_disk();
     test_disk_overlong_id_and_path();
     test_too_many_sections_flags_overflow();
+    test_vm_disk_lists();
+    test_vm_lists_are_ordered_not_sets();
+    test_vm_inline_and_lists_are_mutually_exclusive();
+    test_vm_storage_form_is_required();
+    test_vm_cdroms_alone_satisfies_the_requirement();
+    test_vm_list_errors();
+    test_vm_list_id_too_long();
 
     if (failures == 0) {
         printf("all tests passed\n");

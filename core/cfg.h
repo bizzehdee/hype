@@ -38,6 +38,12 @@
 #define HYPE_CFG_MAX_CPUS 256
 #define HYPE_CFG_MAX_PEERS 8
 
+/* #222 (§5.2): how many devices one VM may attach. Separate from HYPE_CFG_MAX_DISKS (how many may be
+ * DEFINED) -- several VMs can reference the same read-only device, and one VM needing all 16 is not
+ * the case worth sizing for. boot_order may name every disk and cdrom, hence the sum. */
+#define HYPE_CFG_MAX_VM_DISKS 8
+#define HYPE_CFG_MAX_BOOT_ORDER (HYPE_CFG_MAX_VM_DISKS * 2)
+
 /* #222 (CONFIG-2, spec §4.1): retention limits. A line longer than
  * HYPE_CFG_LINE_MAX cannot be retained verbatim, so it is treated as an overflow
  * (see retained_overflow) rather than silently truncated -- a truncated line
@@ -128,6 +134,25 @@ typedef struct {
 
     unsigned int net_peers_count;
     char net_peers[HYPE_CFG_MAX_PEERS][HYPE_CFG_NAME_MAX];
+
+    /*
+     * #222 (§5.2/§5.4/§5.7): ordered references to [disk.<id>] devices. ORDER IS MEANINGFUL -- it is
+     * the order the guest enumerates them, so `disks = sys, data` and `disks = data, sys` are
+     * different machines, which is why these are lists and not sets.
+     *
+     * Ids only; whether each names a device that exists (and of the right `type`) is a CROSS-entity
+     * check and therefore admission's job, not the parser's -- the same split target_disk follows.
+     */
+    unsigned int disks_count;
+    char disks[HYPE_CFG_MAX_VM_DISKS][HYPE_CFG_NAME_MAX];
+
+    unsigned int cdroms_count;
+    char cdroms[HYPE_CFG_MAX_VM_DISKS][HYPE_CFG_NAME_MAX];
+
+    /* Which bootable targets BDS tries, in order. Empty means the documented default: cdroms then
+     * disks. Entries may name either kind. */
+    unsigned int boot_order_count;
+    char boot_order[HYPE_CFG_MAX_BOOT_ORDER][HYPE_CFG_NAME_MAX];
 } hype_cfg_vm_t;
 
 /*
