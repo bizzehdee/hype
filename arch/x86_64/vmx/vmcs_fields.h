@@ -453,6 +453,19 @@
  * valid. The VMX analogue of SVM's EVENTINJ. */
 #define HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD 0x4016u
 /*
+ * #315: IDT-vectoring information (0x4408) and its error code (0x440A) -- the VMX analogue of SVM's
+ * EXITINTINFO, with the SAME bit layout AND the same type encodings (0=external interrupt, 2=NMI,
+ * 3=hardware exception, 4=software interrupt). Set when the VM exit happened WHILE the guest was
+ * delivering an event through its own IDT, which for an external interrupt means the vector is
+ * already consumed and this field is the only surviving copy.
+ *
+ * Because the layout and encodings match, the SVM decision logic (hype_svm_decide_event_replay) is
+ * reused verbatim rather than reimplemented -- the two backends diverging on this is exactly what
+ * #315 asked to prevent, and a second copy of the reasoning is how they would.
+ */
+#define HYPE_VMCS_IDT_VECTORING_INFO_FIELD 0x4408u
+#define HYPE_VMCS_IDT_VECTORING_ERROR_CODE 0x440Au
+/*
  * VMX-4 (#236), all needed by the FW-1 live-guest path.
  *
  * VM-entry exception error code (0x4018) and VM-entry instruction length

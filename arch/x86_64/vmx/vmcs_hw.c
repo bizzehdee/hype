@@ -1,6 +1,9 @@
 #include "vmcs.h"
 #include "../cpu/fpu_state.h"
 #include "vmx.h"
+/* #315: the IDT-delivery replay decision is shared with the SVM backend -- same field layout, same
+ * type encodings, so one tested pure function decides for both rather than two copies drifting. */
+#include "../svm/svm.h"
 
 #include "../../../core/blk_backend.h"
 #include "../../../core/fatal.h"
@@ -1209,6 +1212,41 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     info->reason = vmread(HYPE_VMCS_VM_EXIT_REASON, &ok);
     info->qualification = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
     info->guest_rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+
+    /*
+     * #315: the VMX half of the IDT-delivery recovery. Identical mechanism to SVM's EXITINTINFO, and
+     * VMX had NO handling at all -- not even the diagnostic read the SVM side had.
+     *
+     * The field layout and type encodings match SVM's, so the decision is the SAME pure function,
+     * reused rather than reimplemented: two copies of this reasoning is precisely how the backends
+     * would drift. Only the staging differs -- VMX splits vector/type/error-code across three fields
+     * where SVM packs them into one EVENTINJ qword.
+     */
+    {
+        uint64_t idtv = vmread(HYPE_VMCS_IDT_VECTORING_INFO_FIELD, &ok);
+        uint64_t entry = vmread(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, &ok);
+        hype_svm_evtinfo_t e;
+        hype_svm_evtreplay_t d;
+
+        /* The error code lives in its own field here, so patch it in after the shared decode. */
+        hype_svm_decode_exitintinfo(idtv, (entry & (1ULL << 31)) != 0ULL, &e);
+        if (e.has_error_code) {
+            e.error_code = (uint32_t)vmread(HYPE_VMCS_IDT_VECTORING_ERROR_CODE, &ok);
+        }
+        d = hype_svm_decide_event_replay(&e);
+        if (d == HYPE_SVM_EVTREPLAY_REINJECT) {
+            uint64_t stage = ((uint64_t)e.vector & 0xFFULL) | ((uint64_t)e.type << 8) |
+                             (e.has_error_code ? (1ULL << 11) : 0ULL) | (1ULL << 31);
+            if (e.has_error_code) {
+                vmwrite(HYPE_VMCS_VM_ENTRY_EXCEPTION_ERROR_CODE, (uint64_t)e.error_code);
+            }
+            vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, stage);
+        } else if (d == HYPE_SVM_EVTREPLAY_REFUSE) {
+            hype_debug_print("vmx: IDT-vectoring type=%u vec=0x%x %s (exit reason 0x%llx)\n", e.type,
+                             e.vector, hype_svm_evtreplay_str(d),
+                             (unsigned long long)info->reason);
+        }
+    }
 
     /*
      * #248: consume the interrupt that caused this exit before the caller can

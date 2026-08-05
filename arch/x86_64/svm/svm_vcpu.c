@@ -859,6 +859,17 @@ void hype_svm_set_ps2_trace(int enabled) {
  * FW-1's guest turns it on right before launch. */
 static int g_ahci_trace = 0;
 
+/* #315: how often an IDT-delivery event was re-staged or refused. Counters rather than a
+ * per-event log for the re-stage case: it is on the VMRUN path, and a printf there at any
+ * frequency is its own problem (PERF-2). */
+static unsigned long g_evtreplay_restaged;
+static unsigned long g_evtreplay_refused;
+
+void hype_svm_get_evtreplay_counts(unsigned long *restaged, unsigned long *refused) {
+    if (restaged) *restaged = g_evtreplay_restaged;
+    if (refused) *refused = g_evtreplay_refused;
+}
+
 void hype_svm_set_ahci_trace(int enabled) {
     g_ahci_trace = enabled ? 1 : 0;
 }
@@ -3755,6 +3766,48 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     info->reason = real->vmcb->control.exitcode;
     info->qualification = real->vmcb->control.exitinfo1;
     info->guest_rip = real->vmcb->save.rip;
+
+    /*
+     * #315 (APM Vol 2 §15.7.2/§15.7.3): the intercept may have landed WHILE the guest was delivering
+     * an event through its own IDT, in which case EXITINTINFO holds the only surviving copy. For an
+     * external interrupt the ack cycle already consumed the vector, so dropping it loses a device
+     * interrupt silently.
+     *
+     * Decided by a pure function (hype_svm_decide_event_replay) rather than inline, and deliberately
+     * conservative: only an ack'd INTR/NMI is re-staged. An exception is reproduced by restarting the
+     * faulting instruction, so re-injecting it would deliver it twice; a software interrupt has
+     * next-RIP semantics hype does not model. Anything hype cannot re-stage safely is REPORTED, never
+     * guessed at -- a wrong vector delivered into a guest IDT is far harder to attribute than a log
+     * line saying hype declined.
+     *
+     * EVENTINJ is checked, not assumed: the processor clears it on a successful VMRUN (measured --
+     * it is what got #313 rejected), so a still-valid EVENTINJ here means an injection this exit has
+     * already claimed the one slot available.
+     */
+    {
+        hype_svm_evtinfo_t e;
+        hype_svm_evtreplay_t d;
+        int pending_inject = (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) != 0ULL;
+
+        hype_svm_decode_exitintinfo(real->vmcb->control.exitintinfo, pending_inject, &e);
+        d = hype_svm_decide_event_replay(&e);
+        if (d == HYPE_SVM_EVTREPLAY_REINJECT) {
+            real->vmcb->control.eventinj =
+                ((uint64_t)e.vector & HYPE_SVM_EVENTINJ_VECTOR_MASK) |
+                ((uint64_t)e.type << HYPE_SVM_EVENTINJ_TYPE_SHIFT) | HYPE_SVM_EVENTINJ_V |
+                (e.has_error_code ? (HYPE_SVM_EVENTINJ_EV |
+                                     ((uint64_t)e.error_code << HYPE_SVM_EVENTINJ_ERRORCODE_SHIFT))
+                                  : 0ULL);
+            g_evtreplay_restaged++;
+        } else if (d == HYPE_SVM_EVTREPLAY_REFUSE) {
+            /* Unconditional, not behind a trace flag: this is rare by construction, and a silent
+             * refusal is exactly the lost-interrupt symptom the ticket is about. */
+            hype_debug_print("svm: EXITINTINFO type=%u vec=0x%x %s (exitcode 0x%llx)\n", e.type,
+                             e.vector, hype_svm_evtreplay_str(d),
+                             (unsigned long long)info->reason);
+            g_evtreplay_refused++;
+        }
+    }
 
     return (info->reason == HYPE_SVM_EXITCODE_INVALID) ? -1 : 0;
 }

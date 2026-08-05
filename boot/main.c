@@ -9183,6 +9183,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      (unsigned long long)idg.eventinj,
                                      (int)((idg.rflags >> 9) & 1u),
                                      (unsigned long long)idg.interrupt_shadow);
+                    { /* #315: IDT-delivery recovery totals. A non-zero `refused` is the signal that a
+                       * guest may have lost an event hype declined to re-stage -- the whole point of
+                       * reporting rather than guessing is that this number is visible. */
+                        unsigned long restaged = 0, refused = 0;
+                        hype_svm_get_evtreplay_counts(&restaged, &refused);
+                        if (restaged != 0ul || refused != 0ul) {
+                            hype_debug_print("fw-1 EVTREPLAY: re-staged=%llu refused=%llu (#315)\n",
+                                             (unsigned long long)restaged,
+                                             (unsigned long long)refused);
+                        }
+                    }
                 }
 
                 /* PERF-1 (gaps #3/#4): re-emit the guest's pinned clocksource +

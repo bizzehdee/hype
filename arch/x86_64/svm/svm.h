@@ -1066,6 +1066,65 @@ void hype_svm_set_ps2_trace(int enabled);
  * PACKET command that reaches the ATAPI path) in the AHCI NPF handlers
  * (default off). FW-1's guest turns it on to see what OVMF's storage
  * stack asks the emulated CD-ROM for during boot-device discovery. */
+
+/*
+ * #315 (APM Vol 2 §15.7.2 / §15.7.3): what to do with a recorded EXITINTINFO event.
+ *
+ * EXITINTINFO.V set on a #VMEXIT means the intercept landed WHILE the guest was delivering an
+ * event through its own IDT. For an external interrupt the processor has already run the
+ * interrupt-acknowledge cycle with the PIC/APIC, so the vector is CONSUMED -- nothing will re-raise
+ * it, and the VMCB field is the only surviving copy. Discarding it silently loses a device
+ * interrupt, which is the class of bug that costs days (#311's twelve candidates).
+ *
+ * This is deliberately NOT a blanket re-stage, because a blanket re-stage is wrong in three ways:
+ *
+ *   - An EXCEPTION does not need re-staging. It was produced by an instruction, and restarting that
+ *     instruction produces it again; re-injecting it as well delivers it twice. Only the ack'd
+ *     external event is genuinely unrecoverable, which is precisely why the APM frames the mechanism
+ *     around "no longer possible to recreate the event".
+ *   - A SOFTWARE interrupt (INT n) has next-RIP semantics hype does not model. Re-injecting it would
+ *     re-execute or skip the instruction depending on details not captured here.
+ *   - If the hypervisor is ALREADY injecting something for this exit, re-staging would clobber it,
+ *     since EVENTINJ holds one event.
+ *
+ * So the safe set is INTR and NMI, and everything else is reported rather than guessed at. Refusing
+ * loudly beats a plausible-looking injection: a wrong event delivered into a guest IDT is far harder
+ * to attribute than a log line saying hype declined to act.
+ *
+ * Pure -- no VMCB, no vCPU -- so the decision is unit tested without a VM, the same split
+ * hype_svm_decode_npf_info() uses.
+ */
+typedef struct {
+    int valid;               /* EXITINTINFO.V (bit 31) */
+    unsigned int type;       /* EXITINTINFO type field (0=INTR, 2=NMI, 3=exception, 4=soft INT) */
+    unsigned int vector;
+    int has_error_code;      /* EXITINTINFO.EV (bit 11) */
+    uint32_t error_code;
+    /* The exit hype is currently handling is itself an exception intercept, and hype intends to
+     * reflect it back to the guest. Both facts matter: only then is EVENTINJ already spoken for. */
+    int hypervisor_will_inject;
+} hype_svm_evtinfo_t;
+
+typedef enum {
+    HYPE_SVM_EVTREPLAY_NONE = 0,    /* nothing recorded -- the overwhelmingly common case */
+    HYPE_SVM_EVTREPLAY_REINJECT,    /* an ack'd INTR/NMI: re-stage it, it cannot be recreated */
+    HYPE_SVM_EVTREPLAY_SELF_HEALS,  /* an exception: restarting the instruction reproduces it */
+    HYPE_SVM_EVTREPLAY_REFUSE       /* cannot decide safely -- report, never guess */
+} hype_svm_evtreplay_t;
+
+hype_svm_evtreplay_t hype_svm_decide_event_replay(const hype_svm_evtinfo_t *in);
+
+/* #315: run totals, for the end-of-run diagnostic summary. A non-zero refused count is the
+ * signal that a guest may have lost an event hype declined to re-stage. */
+void hype_svm_get_evtreplay_counts(unsigned long *restaged, unsigned long *refused);
+
+/* Decodes a raw EXITINTINFO qword into the struct above. `will_inject` is the caller's own
+ * knowledge about this exit; nothing in the field itself can tell us that. */
+void hype_svm_decode_exitintinfo(uint64_t exitintinfo, int will_inject, hype_svm_evtinfo_t *out);
+
+/* Human-readable form, for the one log line that accompanies a non-NONE decision. */
+const char *hype_svm_evtreplay_str(hype_svm_evtreplay_t d);
+
 void hype_svm_set_ahci_trace(int enabled);
 
 /* M4-6: when on, an MSR the allow-list doesn't recognize is logged and

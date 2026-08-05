@@ -83,3 +83,50 @@ void hype_svm_vcpu_enable_apic_accel(hype_vmcb_t *vmcb) {
                               (uint64_t)(uintptr_t)g_avic_logical_table,
                               (uint64_t)(uintptr_t)g_avic_physical_table, 0);
 }
+
+void hype_svm_decode_exitintinfo(uint64_t exitintinfo, int will_inject, hype_svm_evtinfo_t *out) {
+    out->valid = (exitintinfo & HYPE_SVM_EVENTINJ_V) != 0ULL;
+    out->type = (unsigned int)((exitintinfo & HYPE_SVM_EVENTINJ_TYPE_MASK) >>
+                               HYPE_SVM_EVENTINJ_TYPE_SHIFT);
+    out->vector = (unsigned int)(exitintinfo & HYPE_SVM_EVENTINJ_VECTOR_MASK);
+    out->has_error_code = (exitintinfo & HYPE_SVM_EVENTINJ_EV) != 0ULL;
+    out->error_code = (uint32_t)(exitintinfo >> HYPE_SVM_EVENTINJ_ERRORCODE_SHIFT);
+    out->hypervisor_will_inject = will_inject ? 1 : 0;
+}
+
+hype_svm_evtreplay_t hype_svm_decide_event_replay(const hype_svm_evtinfo_t *in) {
+    if (in == 0 || !in->valid) {
+        return HYPE_SVM_EVTREPLAY_NONE;
+    }
+    /*
+     * An exception is reproduced by restarting the faulting instruction, so re-staging it would
+     * deliver it twice. Checked BEFORE the will_inject case: it is a property of the recorded event,
+     * not of what hype is doing, and reporting "refused" for something that self-heals would be
+     * noise on a path that is already rare.
+     */
+    if (in->type == (unsigned int)HYPE_SVM_EVENTINJ_TYPE_EXCEPTION) {
+        return HYPE_SVM_EVTREPLAY_SELF_HEALS;
+    }
+    /* EVENTINJ carries one event; re-staging over an injection hype has already decided on would
+     * silently drop whichever lost. */
+    if (in->hypervisor_will_inject) {
+        return HYPE_SVM_EVTREPLAY_REFUSE;
+    }
+    if (in->type == (unsigned int)HYPE_SVM_EVENTINJ_TYPE_INTR ||
+        in->type == (unsigned int)HYPE_SVM_EVENTINJ_TYPE_NMI) {
+        return HYPE_SVM_EVTREPLAY_REINJECT; /* ack'd at the PIC/APIC: unrecoverable if dropped */
+    }
+    /* Software interrupts (type 4) and the reserved encodings: next-RIP semantics hype does not
+     * model, so acting would be a guess. */
+    return HYPE_SVM_EVTREPLAY_REFUSE;
+}
+
+const char *hype_svm_evtreplay_str(hype_svm_evtreplay_t d) {
+    switch (d) {
+        case HYPE_SVM_EVTREPLAY_NONE: return "none";
+        case HYPE_SVM_EVTREPLAY_REINJECT: return "re-staged (interrupt already acknowledged)";
+        case HYPE_SVM_EVTREPLAY_SELF_HEALS: return "left alone (instruction restart reproduces it)";
+        case HYPE_SVM_EVTREPLAY_REFUSE: return "REFUSED -- cannot re-stage safely";
+        default: return "unknown";
+    }
+}

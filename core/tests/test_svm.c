@@ -239,6 +239,87 @@ static void test_guest_efer_write_leaves_out_untouched_on_a_fault(void) {
     CHECK_HEX("out is untouched on a fault", 0xA5A5A5A5A5A5A5A5ULL, out);
 }
 
+/* ---- #315: EXITINTINFO replay decision (APM Vol 2 §15.7.2/§15.7.3) ---- */
+
+static uint64_t mk_eii(unsigned type, unsigned vec, int ev, uint32_t ec, int valid) {
+    uint64_t v = (uint64_t)vec | ((uint64_t)type << HYPE_SVM_EVENTINJ_TYPE_SHIFT);
+    if (ev) v |= HYPE_SVM_EVENTINJ_EV;
+    if (valid) v |= HYPE_SVM_EVENTINJ_V;
+    return v | ((uint64_t)ec << HYPE_SVM_EVENTINJ_ERRORCODE_SHIFT);
+}
+
+static void test_exitintinfo_decode(void) {
+    hype_svm_evtinfo_t e;
+
+    hype_svm_decode_exitintinfo(mk_eii(3u, 14u, 1, 0x7u, 1), 0, &e);
+    CHECK_HEX("valid decoded", 1, e.valid);
+    CHECK_HEX("type decoded", 3, (int)e.type);
+    CHECK_HEX("vector decoded", 14, (int)e.vector);
+    CHECK_HEX("EV decoded", 1, e.has_error_code);
+    CHECK_HEX("error code decoded", 0x7, (int)e.error_code);
+    CHECK_HEX("will_inject is the CALLER's knowledge, not the field's", 0, e.hypervisor_will_inject);
+
+    /* V clear: the field's other bits are meaningless and must not be acted on. */
+    hype_svm_decode_exitintinfo(mk_eii(0u, 0x30u, 0, 0, 0), 1, &e);
+    CHECK_HEX("V clear decoded", 0, e.valid);
+    CHECK_HEX("nothing to do", (int)HYPE_SVM_EVTREPLAY_NONE,
+              (int)hype_svm_decide_event_replay(&e));
+}
+
+static void test_exitintinfo_acked_interrupts_are_restaged(void) {
+    hype_svm_evtinfo_t e;
+
+    /* The case the mechanism exists for: an external interrupt whose ack cycle already consumed the
+     * vector. Nothing will re-raise it, so dropping it loses a device interrupt silently. */
+    hype_svm_decode_exitintinfo(mk_eii(0u, 0x30u, 0, 0, 1), 0, &e);
+    CHECK_HEX("an ack'd INTR is re-staged", (int)HYPE_SVM_EVTREPLAY_REINJECT,
+              (int)hype_svm_decide_event_replay(&e));
+
+    hype_svm_decode_exitintinfo(mk_eii(2u, 2u, 0, 0, 1), 0, &e);
+    CHECK_HEX("an NMI is re-staged", (int)HYPE_SVM_EVTREPLAY_REINJECT,
+              (int)hype_svm_decide_event_replay(&e));
+}
+
+static void test_exitintinfo_exceptions_are_left_alone(void) {
+    hype_svm_evtinfo_t e;
+
+    /* Deliberately NOT re-staged: an exception is produced by an instruction, and restarting that
+     * instruction produces it again. Re-injecting would deliver it TWICE. */
+    hype_svm_decode_exitintinfo(mk_eii(3u, 14u, 1, 0x2u, 1), 0, &e);
+    CHECK_HEX("#PF self-heals via instruction restart", (int)HYPE_SVM_EVTREPLAY_SELF_HEALS,
+              (int)hype_svm_decide_event_replay(&e));
+
+    /* Even when hype is mid-injection, an exception is still self-healing rather than "refused" --
+     * the verdict is a property of the recorded event, not of what hype happens to be doing. */
+    hype_svm_decode_exitintinfo(mk_eii(3u, 13u, 1, 0u, 1), 1, &e);
+    CHECK_HEX("still self-healing while hype injects", (int)HYPE_SVM_EVTREPLAY_SELF_HEALS,
+              (int)hype_svm_decide_event_replay(&e));
+}
+
+static void test_exitintinfo_refuses_rather_than_guessing(void) {
+    hype_svm_evtinfo_t e;
+
+    /* EVENTINJ holds ONE event: re-staging over an injection hype already decided on would silently
+     * drop whichever lost. */
+    hype_svm_decode_exitintinfo(mk_eii(0u, 0x40u, 0, 0, 1), 1, &e);
+    CHECK_HEX("no clobbering an injection hype already chose", (int)HYPE_SVM_EVTREPLAY_REFUSE,
+              (int)hype_svm_decide_event_replay(&e));
+
+    /* INT n has next-RIP semantics hype does not model, so acting would be a guess. */
+    hype_svm_decode_exitintinfo(mk_eii(4u, 0x80u, 0, 0, 1), 0, &e);
+    CHECK_HEX("a software interrupt is refused, not re-staged",
+              (int)HYPE_SVM_EVTREPLAY_REFUSE, (int)hype_svm_decide_event_replay(&e));
+
+    /* Reserved type encodings: same reasoning. */
+    hype_svm_decode_exitintinfo(mk_eii(5u, 1u, 0, 0, 1), 0, &e);
+    CHECK_HEX("a reserved type is refused", (int)HYPE_SVM_EVTREPLAY_REFUSE,
+              (int)hype_svm_decide_event_replay(&e));
+
+    CHECK_HEX("a NULL input is NONE, not a crash", (int)HYPE_SVM_EVTREPLAY_NONE,
+              (int)hype_svm_decide_event_replay(0));
+}
+
+
 int main(void) {
     test_guest_efer_write_forces_svme();
     test_guest_efer_write_rejects_mbz_bits();
@@ -255,6 +336,10 @@ int main(void) {
 
     test_asid_for_slot();
     test_nasid_from_cpuid();
+    test_exitintinfo_decode();
+    test_exitintinfo_acked_interrupts_are_restaged();
+    test_exitintinfo_exceptions_are_left_alone();
+    test_exitintinfo_refuses_rather_than_guessing();
 
     if (failures == 0) {
         printf("all tests passed\n");
