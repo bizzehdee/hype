@@ -42,6 +42,10 @@
  * HYPE_CFG_LINE_MAX cannot be retained verbatim, so it is treated as an overflow
  * (see retained_overflow) rather than silently truncated -- a truncated line
  * written back would corrupt the operator's file. */
+/* #222: named [disk.<id>] devices. 16 matches HYPE_CFG_MAX_VMS -- a one-disk-per-VM floor
+ * with room for the mixed-bus multi-disk case §5.3 exists for. */
+#define HYPE_CFG_MAX_DISKS 16
+
 #define HYPE_CFG_MAX_SECTIONS 32
 #define HYPE_CFG_MAX_RETAINED 64
 #define HYPE_CFG_LINE_MAX 192
@@ -142,8 +146,92 @@ typedef struct {
  * Comments are retained the same way. Pure blank lines are not: they carry no information a
  * serializer needs, and retention capacity is finite.
  */
+
+/*
+ * #222 (CONFIG-2, spec §5.3): a named storage device, decoupled from any VM.
+ *
+ * Exists so one VM can attach several devices of mixed type and bus (one SATA + two NVMe, five
+ * SATA, ...) which the inline `target_disk` sugar cannot express at all -- it describes exactly one
+ * disk with an implied bus.
+ *
+ * Domains are validated here; CROSS-entity checks are not. Whether `disks = a, b` names devices that
+ * exist, whether two VMs claim the same physical drive, and whether the bus is one hype can actually
+ * present are admission's job (§10), the same split target_disk already follows.
+ */
+typedef enum {
+    HYPE_CFG_DISK_TYPE_DISK = 0,
+    HYPE_CFG_DISK_TYPE_CDROM
+} hype_cfg_disk_type_t;
+
+typedef enum {
+    HYPE_CFG_BACKING_FILE = 0,
+    HYPE_CFG_BACKING_PHYSICAL
+} hype_cfg_backing_t;
+
+typedef enum {
+    HYPE_CFG_FORMAT_RAW = 0,
+    HYPE_CFG_FORMAT_QCOW2
+} hype_cfg_format_t;
+
+/*
+ * HYPE_CFG_BUS_DEFAULT is a real state, not a placeholder for virtio-blk: §5.6 derives the default
+ * from the owning VM's os_hint, and a [disk.*] is parsed BEFORE it is known which VM (and therefore
+ * which os_hint) attaches it. Collapsing it to a concrete bus at parse time would silently pin every
+ * Windows disk to virtio-blk, which Windows cannot boot from without a driver.
+ */
+typedef enum {
+    HYPE_CFG_BUS_DEFAULT = 0,
+    HYPE_CFG_BUS_VIRTIO_BLK,
+    HYPE_CFG_BUS_AHCI_SATA,
+    HYPE_CFG_BUS_NVME,
+    HYPE_CFG_BUS_AHCI_ATAPI
+} hype_cfg_bus_t;
+
+typedef struct {
+    char id[HYPE_CFG_NAME_MAX]; /* the <id> in [disk.<id>] */
+
+    hype_cfg_disk_type_t type;
+    hype_cfg_backing_t backing;
+    int has_backing;
+
+    /* backing=file: the image/ISO path on a host filesystem. */
+    int has_path;
+    char path[HYPE_CFG_PATH_MAX];
+
+    /*
+     * WHICH host drive holds `path`, by serial/GUID -- the same axis media_disk (#323) added for
+     * install_media, and for the same reason: the deployment is hype on a USB stick with images and
+     * ISOs on a separate drive (§6d), and a host may have several. Unset means auto-detect.
+     *
+     * Distinct from id_match, which is this device's OWN identity when backing=physical. Here the
+     * device is a file, and this names the drive whose filesystem it lives on.
+     */
+    int has_source_disk;
+    char source_disk[HYPE_CFG_PATH_MAX];
+
+    hype_cfg_format_t format;
+
+    int has_size_gb;
+    unsigned int size_gb;
+
+    /* backing=physical: the identity phys_guard (#122/#124) must match against the ENUMERATED drive
+     * before any write is armed. */
+    int has_id_match;
+    char id_match[HYPE_CFG_PATH_MAX];
+
+    unsigned int partition; /* 1-based GPT partition; 0 = whole disk (the `whole` default) */
+
+    hype_cfg_bus_t bus;
+
+    int read_only;
+    int has_read_only;
+
+    int allow_overwrite;
+} hype_cfg_disk_t;
+
 typedef enum {
     HYPE_CFG_SECTION_VM = 0,
+    HYPE_CFG_SECTION_DISK,
     HYPE_CFG_SECTION_UNKNOWN
 } hype_cfg_section_kind_t;
 
@@ -151,7 +239,7 @@ typedef struct {
     hype_cfg_section_kind_t kind;
     char name[HYPE_CFG_NAME_MAX]; /* the part after the '.'; "" when there is none */
     char raw[HYPE_CFG_LINE_MAX];  /* the header line as written, for re-emission */
-    int index;                    /* into vms[] for kind==VM; -1 otherwise */
+    int index;                    /* into vms[] (kind==VM) or disks[] (kind==DISK); -1 otherwise */
 } hype_cfg_section_t;
 
 typedef struct {
@@ -162,6 +250,18 @@ typedef struct {
 typedef struct {
     hype_cfg_vm_t vms[HYPE_CFG_MAX_VMS];
     unsigned int vm_count;
+
+    /* #222 (§5.3): named devices, referenced by VMs via disks =/cdroms =. */
+    hype_cfg_disk_t disks[HYPE_CFG_MAX_DISKS];
+    unsigned int disk_count;
+
+    /*
+     * §4.3: a malformed [disk.*] is REPORTED AND SKIPPED, not fatal -- one bad device must not stop
+     * the rest of the config loading, because the alternative is a machine that boots nothing over a
+     * typo in a disk nothing may even reference. Counted so the operator is told, since a silently
+     * absent disk is how a VM ends up with no boot device for no visible reason.
+     */
+    unsigned int skipped_disks;
 
     /* #222: see hype_cfg_section_t above. */
     hype_cfg_section_t sections[HYPE_CFG_MAX_SECTIONS];

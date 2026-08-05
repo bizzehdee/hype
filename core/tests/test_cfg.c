@@ -698,6 +698,315 @@ static void test_overlong_line_is_flagged_not_truncated(void) {
 }
 
 
+/* ---- #222 (CONFIG-2, spec §5.3): [disk.<id>] named devices ---- */
+
+static const char *VM_A =
+    "[vm.a]\n"
+    "vcpus = 1\n"
+    "mem_mb = 512\n"
+    "boot = disk\n"
+    "target_disk = file:a.img\n"
+    "firmware = uefi\n"
+    "os_hint = linux\n";
+
+static void test_disk_section_all_keys(void) {
+    char cfg[2048];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[disk.data1]\n"
+             "type = disk\n"
+             "backing = file\n"
+             "path = \\hype\\disks\\data1.qcow2\n"
+             "source_disk = SN-SAMSUNG-980\n"
+             "format = qcow2\n"
+             "size_gb = 512\n"
+             "bus = nvme\n"
+             "read_only = false\n");
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("a [disk.*] section parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("one disk", 1, out.disk_count);
+    CHECK_INT("none skipped", 0, out.skipped_disks);
+    CHECK_INT("nothing retained as unknown", 0, out.unknown_count);
+    CHECK_STR("id", "data1", out.disks[0].id);
+    CHECK_INT("type disk", (int)HYPE_CFG_DISK_TYPE_DISK, (int)out.disks[0].type);
+    CHECK_INT("backing file", (int)HYPE_CFG_BACKING_FILE, (int)out.disks[0].backing);
+    CHECK_STR("path", "\\hype\\disks\\data1.qcow2", out.disks[0].path);
+    CHECK_STR("source_disk", "SN-SAMSUNG-980", out.disks[0].source_disk);
+    CHECK_INT("format qcow2", (int)HYPE_CFG_FORMAT_QCOW2, (int)out.disks[0].format);
+    CHECK_INT("size_gb", 512, out.disks[0].size_gb);
+    CHECK_INT("bus nvme", (int)HYPE_CFG_BUS_NVME, (int)out.disks[0].bus);
+    CHECK_INT("read_only false", 0, out.disks[0].read_only);
+    /* The section table must place it after the VM, in file order. */
+    CHECK_INT("two sections", 2, out.section_count);
+    CHECK_INT("section 1 is the disk", (int)HYPE_CFG_SECTION_DISK, (int)out.sections[1].kind);
+    CHECK_INT("section 1 points at disks[0]", 0, out.sections[1].index);
+}
+
+static void test_disk_defaults(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A, "[disk.sys]\nbacking = file\npath = sys.img\n");
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("type defaults to disk", (int)HYPE_CFG_DISK_TYPE_DISK, (int)out.disks[0].type);
+    CHECK_INT("format defaults to raw", (int)HYPE_CFG_FORMAT_RAW, (int)out.disks[0].format);
+    CHECK_INT("partition defaults to whole (0)", 0, out.disks[0].partition);
+    CHECK_INT("read_only defaults to false", 0, out.disks[0].read_only);
+    /* NOT collapsed to virtio-blk: §5.6 derives it from the owning VM's os_hint, which a
+     * [disk.*] cannot know at parse time. Pinning it here would silently give a Windows VM a bus it
+     * cannot boot from. */
+    CHECK_INT("bus stays DEFAULT for later os_hint resolution", (int)HYPE_CFG_BUS_DEFAULT,
+              (int)out.disks[0].bus);
+}
+
+static void test_disk_cdrom_is_always_read_only(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    /* read_only=false is deliberately IGNORED for a cdrom: a writable ISO is not a thing, and
+     * honouring it would arm a write path against installer media. */
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[disk.inst]\ntype = cdrom\npath = \\iso\\win11.iso\nread_only = false\n");
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("one disk", 1, out.disk_count);
+    CHECK_INT("cdrom", (int)HYPE_CFG_DISK_TYPE_CDROM, (int)out.disks[0].type);
+    CHECK_INT("read_only forced on despite read_only=false", 1, out.disks[0].read_only);
+    CHECK_INT("backing defaults to file for a cdrom", (int)HYPE_CFG_BACKING_FILE,
+              (int)out.disks[0].backing);
+}
+
+static void test_disk_physical_requires_id_match(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    /* Without id_match the phys_guard has nothing to match the enumerated drive against, so the
+     * device is unusable -- and "matches any drive" is the worst possible reading of the omission. */
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A, "[disk.raw]\nbacking = physical\n");
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("the config still loads (§4.3)", HYPE_CFG_OK, res.status);
+    CHECK_INT("the VM survives", 1, out.vm_count);
+    CHECK_INT("the bad disk is dropped", 0, out.disk_count);
+    CHECK_INT("and the drop is COUNTED, not silent", 1, out.skipped_disks);
+}
+
+static void test_disk_physical_rejects_path(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[disk.raw]\nbacking = physical\nid_match = SN-1\npath = nonsense.img\n");
+    res = parse_copy(cfg, &out);
+    CHECK_INT("a path on a physical device is contradictory -- dropped", 0, out.disk_count);
+    CHECK_INT("counted", 1, out.skipped_disks);
+    CHECK_INT("config still loads", HYPE_CFG_OK, res.status);
+}
+
+static void test_disk_partition_whole_and_numeric(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[disk.p]\nbacking = physical\nid_match = SN-1\npartition = 3\n"
+             "[disk.w]\nbacking = physical\nid_match = SN-2\npartition = whole\n");
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("two disks", 2, out.disk_count);
+    CHECK_INT("numeric partition kept 1-based", 3, out.disks[0].partition);
+    CHECK_INT("`whole` means 0, matching target_disk", 0, out.disks[1].partition);
+}
+
+static void test_disk_bad_and_good_compact_correctly(void) {
+    char cfg[1536];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    /* The ordering that breaks a naive compaction: the FIRST disk is dropped, so the good one moves
+     * into slot 0 and the bad section's stale index would alias it. */
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[disk.bad]\nbacking = physical\n"
+             "[disk.good]\nbacking = file\npath = good.img\n");
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("config loads", HYPE_CFG_OK, res.status);
+    CHECK_INT("only the good disk remains", 1, out.disk_count);
+    CHECK_INT("one skipped", 1, out.skipped_disks);
+    CHECK_STR("and it is the RIGHT one (dense, not a corpse)", "good", out.disks[0].id);
+    /* Sections: 0=vm, 1=bad disk (now -1), 2=good disk (now 0). The bad one must NOT point at 0. */
+    CHECK_INT("three sections", 3, out.section_count);
+    CHECK_INT("the dropped disk's section points at nothing", -1, out.sections[1].index);
+    CHECK_INT("the surviving disk's section was retargeted", 0, out.sections[2].index);
+}
+
+static void test_disk_duplicate_id_and_unknown_key(void) {
+    char cfg[1536];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[disk.d]\nbacking = file\npath = a.img\n[disk.d]\nbacking = file\npath = b.img\n");
+    res = parse_copy(cfg, &out);
+    CHECK_INT("a duplicate disk id is fatal -- `disks = d` would be ambiguous",
+              HYPE_CFG_ERR_DUPLICATE_VM_NAME, res.status);
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[disk.d]\nbacking = file\npath = a.img\ntrim_support = yes\n");
+    res = parse_copy(cfg, &out);
+    CHECK_INT("an unknown key inside a disk section is retained, not fatal", HYPE_CFG_OK, res.status);
+    CHECK_INT("the disk still loads", 1, out.disk_count);
+    CHECK_INT("the line is retained", 1, out.retained_count);
+    CHECK_STR("verbatim", "trim_support = yes", out.retained[0].text);
+}
+
+static void test_disk_bad_values_and_duplicates(void) {
+    struct { const char *desc; const char *tail; hype_cfg_status_t want; } cases[] = {
+        {"bad type", "[disk.d]\ntype = tape\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"bad backing", "[disk.d]\nbacking = magic\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"bad format", "[disk.d]\nformat = vmdk\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"bad bus", "[disk.d]\nbus = scsi\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"bad read_only", "[disk.d]\nread_only = maybe\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"zero size_gb", "[disk.d]\nsize_gb = 0\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"zero partition", "[disk.d]\npartition = 0\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"empty path", "[disk.d]\npath =\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"duplicate backing", "[disk.d]\nbacking = file\nbacking = file\n",
+         HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate path", "[disk.d]\npath = a\npath = b\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate bus", "[disk.d]\nbus = nvme\nbus = nvme\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate source_disk", "[disk.d]\nsource_disk = a\nsource_disk = b\n",
+         HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"empty disk id", "[disk.]\nbacking = file\n", HYPE_CFG_ERR_BAD_VALUE}
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char cfg[1536];
+        hype_cfg_t out;
+        hype_cfg_result_t res;
+        snprintf(cfg, sizeof(cfg), "%s%s", VM_A, cases[i].tail);
+        res = parse_copy(cfg, &out);
+        CHECK_INT(cases[i].desc, (int)cases[i].want, (int)res.status);
+    }
+}
+
+static void test_disk_capacity(void) {
+    char cfg[8192];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    int n;
+    unsigned int i;
+
+    n = snprintf(cfg, sizeof(cfg), "%s", VM_A);
+    for (i = 0; i < HYPE_CFG_MAX_DISKS + 1u; i++) {
+        n += snprintf(cfg + n, sizeof(cfg) - (size_t)n,
+                      "[disk.d%u]\nbacking = file\npath = d%u.img\n", i, i);
+    }
+    res = parse_copy(cfg, &out);
+    CHECK_INT("one disk too many is reported, not silently dropped",
+              HYPE_CFG_ERR_TOO_MANY_ENTRIES, res.status);
+}
+
+
+static void test_disk_remaining_domains(void) {
+    struct { const char *desc; const char *tail; hype_cfg_status_t want; } cases[] = {
+        {"duplicate type", "[disk.d]\ntype = disk\ntype = disk\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate format", "[disk.d]\nformat = raw\nformat = raw\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate size_gb", "[disk.d]\nsize_gb = 1\nsize_gb = 2\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate partition", "[disk.d]\npartition = 1\npartition = 2\n",
+         HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate read_only", "[disk.d]\nread_only = yes\nread_only = no\n",
+         HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate allow_overwrite", "[disk.d]\nallow_overwrite = yes\nallow_overwrite = no\n",
+         HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"duplicate id_match", "[disk.d]\nid_match = a\nid_match = b\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+        {"bad allow_overwrite", "[disk.d]\nallow_overwrite = perhaps\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"non-numeric partition", "[disk.d]\npartition = half\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"non-numeric size_gb", "[disk.d]\nsize_gb = big\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"empty source_disk", "[disk.d]\nsource_disk =\n", HYPE_CFG_ERR_BAD_VALUE},
+        {"empty id_match", "[disk.d]\nid_match =\n", HYPE_CFG_ERR_BAD_VALUE}
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char cfg[1536];
+        hype_cfg_t out;
+        hype_cfg_result_t res;
+        snprintf(cfg, sizeof(cfg), "%s%s", VM_A, cases[i].tail);
+        res = parse_copy(cfg, &out);
+        CHECK_INT(cases[i].desc, (int)cases[i].want, (int)res.status);
+    }
+}
+
+static void test_disk_allow_overwrite_and_ro_disk(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[disk.p]\nbacking = physical\nid_match = SN-9\nallow_overwrite = yes\n"
+             "[disk.r]\nbacking = file\npath = r.img\nread_only = yes\n");
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("two disks", 2, out.disk_count);
+    CHECK_INT("allow_overwrite set", 1, out.disks[0].allow_overwrite);
+    CHECK_STR("id_match kept", "SN-9", out.disks[0].id_match);
+    /* A read-only HARD disk is legitimate (a shared reference image), unlike a writable cdrom. */
+    CHECK_INT("read_only honoured on a disk", 1, out.disks[1].read_only);
+}
+
+static void test_disk_overlong_id_and_path(void) {
+    char cfg[2048];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    int n;
+    unsigned int i;
+
+    n = snprintf(cfg, sizeof(cfg), "%s[disk.", VM_A);
+    for (i = 0; i < HYPE_CFG_NAME_MAX + 4u; i++) cfg[n++] = 'i';
+    n += snprintf(cfg + n, sizeof(cfg) - (size_t)n, "]\nbacking = file\npath = a.img\n");
+    cfg[n] = '\0';
+    res = parse_copy(cfg, &out);
+    CHECK_INT("an over-long disk id is rejected", HYPE_CFG_ERR_VALUE_TOO_LONG, res.status);
+
+    n = snprintf(cfg, sizeof(cfg), "%s[disk.d]\nbacking = file\npath = ", VM_A);
+    for (i = 0; i < HYPE_CFG_PATH_MAX + 4u; i++) cfg[n++] = 'p';
+    cfg[n++] = '\n';
+    cfg[n] = '\0';
+    res = parse_copy(cfg, &out);
+    CHECK_INT("an over-long path is rejected", HYPE_CFG_ERR_VALUE_TOO_LONG, res.status);
+}
+
+static void test_too_many_sections_flags_overflow(void) {
+    /* Section capacity is smaller than VM+disk capacity combined, so it can be reached with valid
+     * sections. Losing section ORDER breaks write-back, so it must set the same flag. */
+    char cfg[8192];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    int n = 0;
+    unsigned int i;
+
+    for (i = 0; i < HYPE_CFG_MAX_SECTIONS + 2u; i++) {
+        n += snprintf(cfg + n, sizeof(cfg) - (size_t)n, "[future.s%u]\nk = v\n", i);
+    }
+    res = parse_copy(cfg, &out);
+    CHECK_INT("unknown sections past capacity do not fail the parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("but the loss is flagged", 1, out.retained_overflow);
+}
+
+
 int main(void) {
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
@@ -724,6 +1033,20 @@ int main(void) {
     test_key_before_any_section_is_still_fatal();
     test_retention_overflow_is_flagged_not_silent();
     test_overlong_line_is_flagged_not_truncated();
+    test_disk_section_all_keys();
+    test_disk_defaults();
+    test_disk_cdrom_is_always_read_only();
+    test_disk_physical_requires_id_match();
+    test_disk_physical_rejects_path();
+    test_disk_partition_whole_and_numeric();
+    test_disk_bad_and_good_compact_correctly();
+    test_disk_duplicate_id_and_unknown_key();
+    test_disk_bad_values_and_duplicates();
+    test_disk_capacity();
+    test_disk_remaining_domains();
+    test_disk_allow_overwrite_and_ro_disk();
+    test_disk_overlong_id_and_path();
+    test_too_many_sections_flags_overflow();
 
     if (failures == 0) {
         printf("all tests passed\n");

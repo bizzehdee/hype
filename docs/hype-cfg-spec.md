@@ -156,6 +156,7 @@ is one device; a VM references them by id in `disks =` / `cdroms =`.
 | `type` | `disk` \| `cdrom` | `disk` | hard disk vs optical drive |
 | `backing` | `file` \| `physical` | `file` for cdrom; else required | blk_backend kind (#89) |
 | `path` | path | — | `backing=file`: image/ISO path on the ESP/host FS |
+| `source_disk` | serial-or-GUID string | (auto-detect) | `backing=file`: **which host drive** holds `path` (#222/#323). Same axis and same rules as a VM's `media_disk` (§5.4a) — exact match, unidentified drives never match, positional selection refused. Distinct from `id_match`, which is this device's *own* identity when `backing=physical`. |
 | `format` | `raw` \| `qcow2` | `raw` | disk image format (#199 raw / #200 qcow2); ignored for cdrom (ISO) |
 | `size_gb` | int | — | `type=disk backing=file`: create at this size if absent |
 | `id_match` | serial-or-GUID string | — | `backing=physical`: identity phys_guard requires (#122/#124) |
@@ -198,9 +199,9 @@ The drive named here needs a filesystem hype reads (FAT32, exFAT, or ext2/3/4)
 and may be SATA/AHCI or NVMe. The ISO is **streamed** from it, never copied into
 RAM (#322/#326), so ISO size is not bounded by guest or host memory.
 
-Note for CONFIG-2 (#222): `[disk.<id>]` has `path` but no equivalent "which host
-drive holds `path`" key yet, so `media_disk` is currently the only way to state
-it. When `[disk.*]` lands, it needs the same axis for `backing=file` entries.
+`[disk.<id>]` carries the same axis as `source_disk` (§5.3), added with the
+stanza in #222 — so a `[disk.*]` image or ISO can also name the drive it lives
+on, not just a VM's `install_media`.
 
 ### 5.5 `[nic.<id>]` — a network device + `[switch.<id>]` — a virtual network (NEW)
 
