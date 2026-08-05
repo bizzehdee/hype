@@ -7088,12 +7088,18 @@ static int media_present(void) {
     return g_media.read != 0;
 }
 
+/* #324: the candidate host devices the media/image scan iterates. Defined with the rest of the
+ * host-device plumbing further down; declared here because the guest-disk setup sits above it. */
+extern unsigned g_media_dev_count;
+static int media_use_dev(unsigned i);
+
 static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     hype_gpt_partition_t part;
     hype_fat_file_t file;
     const char *path = HYPE_M5_8_IMAGE_PATH;
     const char *fs = 0;
     unsigned pidx;
+    unsigned didx; /* #324 */
     /*
      * #285: use the path hype.cfg actually named.
      *
@@ -7122,17 +7128,28 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     if (!media_present()) {
         return 0; /* no media device selected: nothing to resolve against */
     }
-    for (pidx = 1u; pidx <= 4u && fs == 0; pidx++) {
-        if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
+    /*
+     * #324: try EVERY registered host device, not just the one AHCI port discovery happened to
+     * find first. The scan cannot know which device holds the image until it looks -- the answer
+     * is "whichever one the file is on" -- so an image on an NVMe drive was previously
+     * unreachable no matter what the operator configured.
+     */
+    for (didx = 0u; didx < g_media_dev_count && fs == 0; didx++) {
+        if (media_use_dev(didx) != 0) {
             continue;
         }
-        g_media.part_base_lba = part.first_lba;
-        if (hype_fat32_resolve(fatvol_read, 0, path, &file) == 0) {
-            fs = "FAT32";
-        } else if (hype_exfat_resolve(fatvol_read, 0, path, &file) == 0) {
-            fs = "exFAT";
-        } else if (hype_ext_resolve(fatvol_read, 0, path, &file) == 0) {
-            fs = "ext2/3/4";
+        for (pidx = 1u; pidx <= 4u && fs == 0; pidx++) {
+            if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
+                continue;
+            }
+            g_media.part_base_lba = part.first_lba;
+            if (hype_fat32_resolve(fatvol_read, 0, path, &file) == 0) {
+                fs = "FAT32";
+            } else if (hype_exfat_resolve(fatvol_read, 0, path, &file) == 0) {
+                fs = "exFAT";
+            } else if (hype_ext_resolve(fatvol_read, 0, path, &file) == 0) {
+                fs = "ext2/3/4";
+            }
         }
     }
     if (fs == 0) {
@@ -11354,12 +11371,94 @@ static int media_ahci_write(void *ctx, uint64_t lba, uint32_t count, const void 
     return hype_ahci_host_write(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, src);
 }
 
+/*
+ * #324: the NVMe implementation of the media device. hype_nvme_host_read/write take the same
+ * (abar, lba, count, buf) shape as their AHCI counterparts by design -- nvme_host.h says
+ * "Signature matches hype_ahci_host_read" -- so this is a second backend behind the #321
+ * abstraction rather than a new abstraction.
+ */
+static int media_nvme_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    (void)ctx;
+    return hype_nvme_host_read(g_hostnvme_bar, lba, (uint16_t)count, dst);
+}
+static int media_nvme_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    return hype_nvme_host_write(g_hostnvme_bar, lba, (uint16_t)count, src);
+}
+
+/*
+ * #324: every host block device the media/image scan may look at.
+ *
+ * Before this there was ONE, implied by two globals, and it was whichever AHCI port the port scan
+ * happened to find first -- so an ISO or guest disk image on any other device, and in particular
+ * on an NVMe drive, was unreachable no matter what the operator did. The intended deployment
+ * (plan.md §6d: hype on a USB stick, ISOs and images on a separate internal drive that may well be
+ * NVMe) needs the scan to try more than one.
+ *
+ * A list rather than a single "preferred" device because the scan cannot know which device holds
+ * the media until it looks: the answer is "whichever one the file is on". #323 adds an explicit
+ * per-VM choice on top, at which point this becomes the fallback rather than the only mechanism.
+ */
+#define HYPE_MEDIA_MAX_DEVS 4u
+static hype_media_dev_t g_media_devs[HYPE_MEDIA_MAX_DEVS];
+unsigned g_media_dev_count;
+
+static void media_add_dev(int (*rd)(void *, uint64_t, uint32_t, void *),
+                          int (*wr)(void *, uint64_t, uint32_t, const void *), const char *bus) {
+    unsigned i;
+    if (g_media_dev_count >= HYPE_MEDIA_MAX_DEVS) {
+        hype_debug_print("media: ignoring a %s device -- already tracking %u (cap)\n", bus,
+                         g_media_dev_count);
+        return;
+    }
+    /* Same bus twice is fine (two AHCI ports); the same read fn twice is a double-register bug. */
+    for (i = 0; i < g_media_dev_count; i++) {
+        if (g_media_devs[i].read == rd) {
+            return;
+        }
+    }
+    g_media_devs[g_media_dev_count].read = rd;
+    g_media_devs[g_media_dev_count].write = wr;
+    g_media_devs[g_media_dev_count].ctx = 0;
+    g_media_devs[g_media_dev_count].bus = bus;
+    g_media_devs[g_media_dev_count].part_base_lba = 0;
+    g_media_dev_count++;
+    hype_debug_print("media: registered host device %u = %s\n", g_media_dev_count - 1u, bus);
+}
+
+/* Points the active media device at candidate `i`, keeping its partition base independent. */
+static int media_use_dev(unsigned i) {
+    if (i >= g_media_dev_count) {
+        return -1;
+    }
+    g_media.read = g_media_devs[i].read;
+    g_media.write = g_media_devs[i].write;
+    g_media.ctx = g_media_devs[i].ctx;
+    g_media.bus = g_media_devs[i].bus;
+    g_media.part_base_lba = 0;
+    return 0;
+}
+
 /* Binds the media device to the AHCI port host discovery selected. */
 static void media_select_ahci(void) {
+    media_add_dev(media_ahci_read, media_ahci_write, "ahci");
+    /* Keep AHCI as the ACTIVE device when it is found, so a machine that works today is
+     * unchanged; the scan loops over all registered devices regardless. */
     g_media.read = media_ahci_read;
     g_media.write = media_ahci_write;
     g_media.ctx = 0;
     g_media.bus = "ahci";
+}
+
+/* #324: same, for an enumerated NVMe controller. */
+static void media_select_nvme(void) {
+    media_add_dev(media_nvme_read, media_nvme_write, "nvme");
+    if (!media_present()) {
+        g_media.read = media_nvme_read;
+        g_media.write = media_nvme_write;
+        g_media.ctx = 0;
+        g_media.bus = "nvme";
+    }
 }
 
 /* GLADDER-10 streaming: hostdisk_read() adapts the selected media device to the
@@ -13305,6 +13404,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 g_hostnvme_present = 1;
                 g_hostnvme_bar = hn.bar_phys;
                 g_hostnvme_total_sectors = hype_nvme_host_total_sectors();
+                media_select_nvme(); /* #324: this controller can hold media/images too */
                 hype_debug_print("host-nvme: serial='%s' model='%s' sectors=%llu (%llu MiB)\n",
                                  g_hostnvme_serial, nvme_model,
                                  (unsigned long long)g_hostnvme_total_sectors,
@@ -14056,26 +14156,36 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     hype_fat_file_t file;
                     int have_file = 0;
                     unsigned pidx;
+                    unsigned didx; /* #324 */
                     /* Scan up to the first 4 GPT partitions for \iso\test.iso,
                      * trying FAT32 then exFAT on each. This covers both the ISO
                      * sitting on the FAT ESP itself and on a separate FAT/exFAT
                      * data partition (a UEFI ESP must be FAT, so exFAT media is
-                     * always a non-ESP partition). */
+                     * always a non-ESP partition).
+                     *
+                     * #324: and across every registered host device, so an ISO on an NVMe drive is
+                     * found too -- the intended deployment puts the ISOs on a separate internal
+                     * drive (plan.md §6d) which on a modern machine is likely NVMe. */
+                    for (didx = 0u; didx < g_media_dev_count && !have_file; didx++) {
+                    if (media_use_dev(didx) != 0) {
+                        continue;
+                    }
                     for (pidx = 1u; pidx <= 4u && !have_file; pidx++) {
                         if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
                             continue;
                         }
                         g_media.part_base_lba = part.first_lba;
                         if (hype_fat32_resolve(fatvol_read, 0, "\\iso\\test.iso", &file) == 0) {
-                            hype_debug_print("host-fat: resolved \\iso\\test.iso on FAT32 partition %u\n",
-                                             pidx);
+                            hype_debug_print("host-fat: resolved \\iso\\test.iso on FAT32 partition %u "
+                                             "of the %s device\n", pidx, g_media.bus);
                             have_file = 1;
                         } else if (hype_exfat_resolve(fatvol_read, 0, "\\iso\\test.iso", &file) == 0) {
-                            hype_debug_print("host-fat: resolved \\iso\\test.iso on exFAT partition %u\n",
-                                             pidx);
+                            hype_debug_print("host-fat: resolved \\iso\\test.iso on exFAT partition %u "
+                                             "of the %s device\n", pidx, g_media.bus);
                             have_file = 1;
                         }
                     }
+                    } /* #324: end device loop -- the log lines above name the bus via g_media.bus */
                     if (have_file && file.count == 1u) {
                         static uint8_t cd[8];
                         uint64_t abs_lba = g_media.part_base_lba + file.extents[0].start_lba;
@@ -14110,10 +14220,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * -- GPT-locate partition 2, stream-read its ISO9660 PVD and
                  * verify the "CD001" magic at byte 32769. Proves gpt + ahci_host +
                  * iso_stream compose against a raw-partition backing too. */
+                /* #324: and try the raw-partition fallback on every device too, not just the
+                 * one that happened to be active when the FAT scan gave up. */
+                for (unsigned rdev = 0u; rdev < g_media_dev_count && !g_vms[0].iso_stream_ready;
+                     rdev++) {
+                    (void)media_use_dev(rdev);
                 if (!g_vms[0].iso_stream_ready) {
                     hype_gpt_partition_t iso_part;
                     if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
-                        hype_serial_print("host-gpt: no partition 2 (raw ISO) on the boot disk\n");
+                        hype_serial_print("host-gpt: no partition 2 (raw ISO) on the %s device\n",
+                                          g_media.bus);
                     } else {
                         static uint8_t cd[8];
                         hype_debug_print("host-gpt: partition 2 = LBA %llu..%llu (%llu bytes)\n",
@@ -14138,6 +14254,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         }
                     }
                 }
+                } /* #324: end raw-partition device loop */
             }
         }
     }
