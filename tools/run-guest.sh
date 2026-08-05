@@ -176,3 +176,20 @@ if ! grep -aq "^hype: build" "$LOG"; then
     grep -aq "^hype: build" "$LOG" || echo "WARNING: still no hype banner -- treat this log as a HARNESS failure"
 fi
 echo "done: $(wc -c < "$LOG") bytes in $LOG"
+
+#
+# #343: score the GUEST's own health, not just "did the installer appear".
+#
+# Every FreeBSD run until now was graded on reaching bsdinstall -- which is true both when the guest
+# is healthy AND when it panics seconds later, because the panic happens after that point. So the
+# project's most-used regression gate was blind to a guest kernel fault, and the next real regression
+# would have been indistinguishable from #343's intermittent one. Grep for the fault signatures too.
+#
+if grep -aqE 'panic:|Fatal trap|Kernel panic|BUG: unable to handle' "$LOG"; then
+    echo "WARNING: the GUEST reported a kernel fault -- this run is NOT a clean pass (see #343):"
+    grep -aoE 'panic: [^|]{0,60}|Fatal trap [0-9]+[^|]{0,40}|Kernel panic[^|]{0,50}' "$LOG" \
+        | sort -u | head -3 | sed 's/^/    /'
+fi
+if ! grep -aq '^hype: build' "$LOG"; then
+    echo "WARNING: no hype banner -- treat this log as a HARNESS failure, not a hype regression"
+fi
