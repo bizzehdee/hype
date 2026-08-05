@@ -7153,6 +7153,46 @@ static uint64_t g_hostnvme_scope_sectors;
 
 static hype_cfg_t g_hype_cfg;
 
+/*
+ * #333: which guest-facing front-end this VM's disk is presented on.
+ *
+ * Until now every VM got virtio-blk AND a SATA disk over the SAME backend, unconditionally. That
+ * existed only because a guest could not boot over virtio-blk (#262) and had no way to ASK for AHCI;
+ * it is also a hazard, since two guest devices over one storage is safe only while the guest happens
+ * to treat them as the same disk.
+ *
+ * Resolution order:
+ *   1. An explicit `bus` on a [disk.*] entry wins (#222 §5.6). The inline `target_disk` sugar has no
+ *      bus key, so it never reaches this.
+ *   2. `boot = disk` forces ahci-sata. This is a deliberate departure from §5.6's os_hint default,
+ *      and the reason is #262: hype's guest firmware cannot boot an installed system over
+ *      virtio-blk. Applying the os_hint default here would hand a Linux VM a disk its own firmware
+ *      cannot boot -- a config that looks right and produces a VM that does not start. An operator
+ *      who genuinely wants virtio for a disk-booting VM can still say so via [disk.*] bus.
+ *   3. Otherwise §5.6's default from os_hint: windows -> ahci-sata (no inbox virtio driver, so a
+ *      virtio system disk is invisible at install), everything else -> virtio-blk.
+ */
+static hype_cfg_bus_t fw_1_target_bus(const hype_fw_vm_t *vm) {
+    unsigned vi = (unsigned)(vm - &g_vms[0]);
+    const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+    hype_cfg_disk_t d;
+    unsigned long long i;
+    unsigned char *dp = (unsigned char *)&d;
+
+    for (i = 0; i < sizeof(d); i++) {
+        dp[i] = 0; /* type=disk, bus=DEFAULT */
+    }
+    if (cv == 0) {
+        /* No config at all (the built-in default path every QEMU rig uses): keep the historical
+         * behaviour of a bootable AHCI disk, since those rigs install and boot. */
+        return HYPE_CFG_BUS_AHCI_SATA;
+    }
+    if (cv->boot == HYPE_CFG_BOOT_DISK) {
+        return HYPE_CFG_BUS_AHCI_SATA;
+    }
+    return hype_cfg_resolve_bus(&d, cv->os_hint);
+}
+
 /* #332: the partition vm0's `physical:` target names, 0 for the whole disk. */
 static unsigned int fw_1_phys_partition(void) {
     const hype_cfg_vm_t *cv = (g_hype_cfg.vm_count > 0u) ? &g_hype_cfg.vms[0] : 0;
@@ -7564,6 +7604,17 @@ vblk_pci:
      * identity for two genuinely different disks; constant across reboots, because vm->name is.
      */
     hype_virtio_blk_set_serial(&vm->vblk, vm->name);
+    /*
+     * #333: present the virtio-blk PCI function ONLY when this VM's disk asked for it. The device
+     * MODEL above is always initialised, because it owns the resolved backend that whichever
+     * front-end was selected then consumes -- but an unasked-for PCI function is guest-visible, and
+     * a guest finding both virtio-blk and a SATA disk over one backend is the hazard this retires.
+     */
+    if (fw_1_target_bus(vm) != HYPE_CFG_BUS_VIRTIO_BLK) {
+        hype_debug_print("fw-1[vm %d]: virtio-blk NOT presented -- this disk asked for another "
+                         "front-end (#333)\n", (int)(vm - &g_vms[0]));
+        return;
+    }
     hype_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
                         HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
                         HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE);
@@ -7728,11 +7779,17 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
     hype_ahci_reset(&g_fw_1_ahci);
     /* #262 slice 2: the SATA-disk HBA, same class/prog-IF and same 4KB BAR5 as the
-     * optical one, so the firmware's existing AHCI driver binds it unchanged. */
-    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u, 0x01,
-                        0x06, 0x01);
-    hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
-    hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
+     * optical one, so the firmware's existing AHCI driver binds it unchanged.
+     *
+     * #333: present ONLY when this VM's disk asked for it. An unasked-for controller is a
+     * guest-visible artefact -- the guest probes it, the firmware binds it, and it shows up as a
+     * second disk over the same storage. */
+    if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
+        hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u,
+                            0x01, 0x06, 0x01);
+        hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
+        hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
+    }
 #if HYPE_262_DISK_ON_FIRST_HBA
     /*
      * #262 PROBE: separate the last two tangled variables. The firmware fully drives
@@ -7775,16 +7832,29 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
      * attach -- with a backend present the media pointer is never consulted.
      */
     hype_ata_disk_reset(&g_fw_1_ata_disk, 0, 0);
-    fw_1_setup_virtio_blk(vm); /* M5-7 (#196): attach this VM's writable virtio-blk disk */
-    /* AFTER fw_1_setup_virtio_blk: that is what chooses this VM's backend (physical
-     * target, raw image file, or RAM scratch) and fills in its capacity. Attaching
-     * before it snapshots total_sectors == 0, and a zero-sector LBA disk makes libata
-     * fall back to CHS and fail the probe with INIT_DEV_PARAMS. */
-    hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
-    hype_debug_print("fw-1: #262 SATA disk attached -- %llu sectors (%llu MiB)\n",
-                     (unsigned long long)g_fw_1_ata_disk.total_sectors,
-                     (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
-    fw_1_262_id_diff(&g_fw_1_ata_disk);
+    /*
+     * Still called unconditionally: this is what RESOLVES the backend (physical target, raw image
+     * file, or RAM scratch) and its capacity. #333 changes which FRONT-END is presented, not how the
+     * storage is chosen -- so the backend is resolved once and whichever front-end was selected
+     * consumes it.
+     */
+    fw_1_setup_virtio_blk(vm);
+    if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
+        /* AFTER fw_1_setup_virtio_blk: that is what fills in the capacity. Attaching before it
+         * snapshots total_sectors == 0, and a zero-sector LBA disk makes libata fall back to CHS and
+         * fail the probe with INIT_DEV_PARAMS. */
+        hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
+        hype_debug_print("fw-1: disk front-end = ahci-sata -- %llu sectors (%llu MiB)\n",
+                         (unsigned long long)g_fw_1_ata_disk.total_sectors,
+                         (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
+        fw_1_262_id_diff(&g_fw_1_ata_disk);
+    } else {
+        /*
+         * #333: the same-backend-on-two-devices workaround is retired. It existed only because a
+         * guest could not ask for AHCI; now it can, so the disk is presented ONCE.
+         */
+        hype_debug_print("fw-1: disk front-end = virtio-blk -- no SATA disk attached (#333)\n");
+    }
     /* #326: streaming is the only ISO backing there is. A VM with no media resolved gets an EMPTY
      * drive (media_size 0), which is what a real machine with an empty optical drive presents --
      * not a missing device. */
@@ -7904,11 +7974,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
     hype_ahci_reset(&g_fw_1_ahci);
     /* #262 slice 2: the SATA-disk HBA, same class/prog-IF and same 4KB BAR5 as the
-     * optical one, so the firmware's existing AHCI driver binds it unchanged. */
-    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u, 0x01,
-                        0x06, 0x01);
-    hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
-    hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
+     * optical one, so the firmware's existing AHCI driver binds it unchanged.
+     * #333: present ONLY when selected -- see the sibling launcher. */
+    if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
+        hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u,
+                            0x01, 0x06, 0x01);
+        hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
+        hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
+    }
 #if HYPE_262_DISK_ON_FIRST_HBA
     /*
      * #262 PROBE: separate the last two tangled variables. The firmware fully drives
@@ -7951,16 +8024,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * attach -- with a backend present the media pointer is never consulted.
      */
     hype_ata_disk_reset(&g_fw_1_ata_disk, 0, 0);
-    fw_1_setup_virtio_blk(vm); /* M5-7 (#196): attach this VM's writable virtio-blk disk */
-    /* AFTER fw_1_setup_virtio_blk: that is what chooses this VM's backend (physical
-     * target, raw image file, or RAM scratch) and fills in its capacity. Attaching
-     * before it snapshots total_sectors == 0, and a zero-sector LBA disk makes libata
-     * fall back to CHS and fail the probe with INIT_DEV_PARAMS. */
-    hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
-    hype_debug_print("fw-1: #262 SATA disk attached -- %llu sectors (%llu MiB)\n",
-                     (unsigned long long)g_fw_1_ata_disk.total_sectors,
-                     (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
-    fw_1_262_id_diff(&g_fw_1_ata_disk);
+    /* Resolves the backend for whichever front-end was selected -- see the sibling launcher. */
+    fw_1_setup_virtio_blk(vm);
+    if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
+        /* AFTER fw_1_setup_virtio_blk, which fills in the capacity: attaching before it snapshots
+         * total_sectors == 0, and a zero-sector LBA disk makes libata fall back to CHS and fail the
+         * probe with INIT_DEV_PARAMS. */
+        hype_ata_disk_set_backend(&g_fw_1_ata_disk, &g_fw_1_vblk_be);
+        hype_debug_print("fw-1: disk front-end = ahci-sata -- %llu sectors (%llu MiB)\n",
+                         (unsigned long long)g_fw_1_ata_disk.total_sectors,
+                         (unsigned long long)(g_fw_1_ata_disk.total_sectors / 2048ull));
+        fw_1_262_id_diff(&g_fw_1_ata_disk);
+    } else {
+        hype_debug_print("fw-1: disk front-end = virtio-blk -- no SATA disk attached (#333)\n");
+    }
     /* GLADDER-10 / #326: the ISO is served on demand from its host disk partition or file. The
      * RAM-chunked fallback (GLADDER-10a) is retired -- see hype_fw_vm_t.iso_stream. */
     hype_atapi_reset_stream(&g_fw_1_atapi, vm->iso_stream_ready ? &vm->iso_stream : 0);
