@@ -90,6 +90,20 @@ typedef struct {
     int has_install_media;
     char install_media[HYPE_CFG_PATH_MAX];
 
+    /*
+     * #323: WHICH host drive the media (and file-backed image) lives on, matched by drive
+     * serial/GUID -- the "where" axis to install_media's "which". Optional: unset means
+     * auto-detect, which is what hype did exclusively before, so every existing config is
+     * unaffected.
+     *
+     * Never a positional index. §6d already rules that out for `physical:` targets because an
+     * index is fragile against cable/port reordering, and the same operator typo picks the wrong
+     * drive here -- a read-only source makes a wrong guess confusing rather than destructive, but
+     * no easier to diagnose.
+     */
+    int has_media_disk;
+    char media_disk[HYPE_CFG_PATH_MAX];
+
     hype_cfg_target_disk_t target_disk;
 
     int has_target_disk_size_gb;

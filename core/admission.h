@@ -24,7 +24,8 @@ typedef enum {
     HYPE_ADM_ERR_CPU_SET_OVERLAP,
     HYPE_ADM_ERR_TARGET_DISK_COLLISION,
     HYPE_ADM_ERR_NET_PEER_UNKNOWN_VM,
-    HYPE_ADM_ERR_NET_PEER_NOT_NAT
+    HYPE_ADM_ERR_NET_PEER_NOT_NAT,
+    HYPE_ADM_ERR_MEDIA_DISK_ABSENT
 } hype_adm_status_t;
 
 typedef struct {
@@ -75,5 +76,34 @@ hype_adm_result_t hype_adm_check_target_disk(const hype_cfg_t *cfg);
 /* Every net_peers entry must name another VM actually defined in this
  * config, and both VMs in the pairing must have net_mode = nat. */
 hype_adm_result_t hype_adm_check_net_peers(const hype_cfg_t *cfg);
+
+/*
+ * #323: resolves a VM's media_disk (which host drive its install_media
+ * lives on) against the drives host discovery actually enumerated.
+ * dev_serials[i] is drive i's serial/GUID, or 0/"" for a drive that
+ * reported none -- an unidentified drive can never match, since matching
+ * it would mean guessing.
+ *
+ * Returns the drive index, or:
+ *   HYPE_ADM_MEDIA_AUTO   -- no media_disk set; the caller picks (today's behaviour)
+ *   HYPE_ADM_MEDIA_ABSENT -- a drive WAS named and is not present
+ *
+ * ABSENT is deliberately distinct from AUTO. A config naming a missing
+ * drive is an operator error, and falling back to another drive is the
+ * worst available response: it would hand the guest media from a drive
+ * nobody asked for. Callers refuse the VM.
+ */
+#define HYPE_ADM_MEDIA_AUTO (-1)
+#define HYPE_ADM_MEDIA_ABSENT (-2)
+
+int hype_adm_select_media_dev(const hype_cfg_t *cfg, unsigned int vm_index,
+                              const char *const *dev_serials, unsigned int dev_count);
+
+/* Startup form of the above: refuses the whole config when any VM names
+ * a media_disk no enumerated drive matches, naming the VM in
+ * vm_index_a. Runs after host discovery, so unlike the other checks here
+ * it needs the enumerated drive list rather than only host totals. */
+hype_adm_result_t hype_adm_check_media_disk(const hype_cfg_t *cfg, const char *const *dev_serials,
+                                            unsigned int dev_count);
 
 #endif /* HYPE_ADMISSION_H */

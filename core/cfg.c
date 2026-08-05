@@ -14,7 +14,8 @@ enum {
     F_NET_MODE = 1u << 9,
     F_NET_PEERS = 1u << 10,
     F_PARTITION = 1u << 11,
-    F_ALLOW_OVERWRITE = 1u << 12
+    F_ALLOW_OVERWRITE = 1u << 12,
+    F_MEDIA_DISK = 1u << 13 /* #323 */
 };
 
 /* Parses a boolean value: true/false, yes/no, on/off, 1/0. */
@@ -245,6 +246,18 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         if (len >= HYPE_CFG_PATH_MAX) return HYPE_CFG_ERR_VALUE_TOO_LONG;
         vm->has_install_media = 1;
         *seen |= F_INSTALL_MEDIA;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "media_disk")) {
+        /* #323: the drive the media lives on, by serial/GUID. Optional -- absent means
+         * auto-detect, preserving the pre-#323 behaviour for every existing config. */
+        unsigned long long len;
+        if (*seen & F_MEDIA_DISK) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        len = hype_strlcpy(vm->media_disk, val, HYPE_CFG_PATH_MAX);
+        if (len >= HYPE_CFG_PATH_MAX) return HYPE_CFG_ERR_VALUE_TOO_LONG;
+        if (vm->media_disk[0] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
+        vm->has_media_disk = 1;
+        *seen |= F_MEDIA_DISK;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "target_disk")) {

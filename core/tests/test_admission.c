@@ -350,6 +350,121 @@ static void test_net_peers_none_is_ok(void) {
     CHECK_INT("no net_peers anywhere is OK", (int)HYPE_ADM_OK, (int)r.status);
 }
 
+/* ---- hype_adm_select_media_dev / hype_adm_check_media_disk (#323) ---- */
+
+static void set_media_disk(hype_cfg_vm_t *vm, const char *serial) {
+    vm->has_media_disk = 1;
+    strncpy(vm->media_disk, serial, sizeof(vm->media_disk) - 1);
+}
+
+static void test_media_disk_unset_is_auto(void) {
+    hype_cfg_t cfg;
+    static const char *const devs[2] = {"SN-A", "SN-B"};
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+
+    CHECK_INT("no media_disk means auto-detect", HYPE_ADM_MEDIA_AUTO,
+              hype_adm_select_media_dev(&cfg, 0, devs, 2));
+    CHECK_INT("no media_disk passes admission", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_media_disk(&cfg, devs, 2).status);
+}
+
+static void test_media_disk_matches_second_device(void) {
+    hype_cfg_t cfg;
+    static const char *const devs[3] = {"SN-A", "SN-B", "SN-C"};
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    set_media_disk(&cfg.vms[0], "SN-B");
+
+    CHECK_INT("named drive resolves to its own index", 1,
+              hype_adm_select_media_dev(&cfg, 0, devs, 3));
+    CHECK_INT("a present named drive passes admission", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_media_disk(&cfg, devs, 3).status);
+}
+
+static void test_media_disk_absent_is_refused_not_substituted(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+    static const char *const devs[2] = {"SN-A", "SN-B"};
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    set_media_disk(&cfg.vms[1], "SN-GONE");
+
+    /* The whole point: two other drives ARE present, and neither may be substituted. */
+    CHECK_INT("absent named drive is ABSENT, never a fallback index", HYPE_ADM_MEDIA_ABSENT,
+              hype_adm_select_media_dev(&cfg, 1, devs, 2));
+    r = hype_adm_check_media_disk(&cfg, devs, 2);
+    CHECK_INT("absent named drive is refused", (int)HYPE_ADM_ERR_MEDIA_DISK_ABSENT, (int)r.status);
+    CHECK_INT("refusal names the offending VM", 1, r.vm_index_a);
+    CHECK_INT("refusal has no second VM", (int)HYPE_ADM_NO_VM, (int)r.vm_index_b);
+}
+
+static void test_media_disk_no_devices_enumerated_is_refused(void) {
+    hype_cfg_t cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    set_media_disk(&cfg.vms[0], "SN-A");
+
+    CHECK_INT("nothing enumerated cannot match", HYPE_ADM_MEDIA_ABSENT,
+              hype_adm_select_media_dev(&cfg, 0, 0, 0));
+}
+
+/* A drive that reported no serial can never match: matching it would mean guessing. */
+static void test_media_disk_unidentified_devices_never_match(void) {
+    hype_cfg_t cfg;
+    static const char *const devs[3] = {0, "", "SN-C"};
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    set_media_disk(&cfg.vms[0], "");
+
+    CHECK_INT("an empty media_disk is treated as unset", HYPE_ADM_MEDIA_AUTO,
+              hype_adm_select_media_dev(&cfg, 0, devs, 3));
+
+    set_media_disk(&cfg.vms[0], "SN-C");
+    CHECK_INT("unidentified drives are skipped, not matched", 2,
+              hype_adm_select_media_dev(&cfg, 0, devs, 3));
+}
+
+static void test_media_disk_is_exact_match(void) {
+    hype_cfg_t cfg;
+    static const char *const devs[2] = {"SN-ABC", "SN-ABCDEF"};
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    set_media_disk(&cfg.vms[0], "SN-ABCDEF");
+
+    /* A prefix must not win: serials commonly share a vendor prefix. */
+    CHECK_INT("match is exact, not a prefix", 1, hype_adm_select_media_dev(&cfg, 0, devs, 2));
+}
+
+static void test_media_disk_out_of_range_vm_is_auto(void) {
+    hype_cfg_t cfg;
+    static const char *const devs[1] = {"SN-A"};
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    set_media_disk(&cfg.vms[0], "SN-A");
+
+    CHECK_INT("a VM index past vm_count is auto", HYPE_ADM_MEDIA_AUTO,
+              hype_adm_select_media_dev(&cfg, 7, devs, 1));
+    CHECK_INT("a null config is auto", HYPE_ADM_MEDIA_AUTO,
+              hype_adm_select_media_dev(0, 0, devs, 1));
+}
+
+
 int main(void) {
     test_memory_within_budget();
     test_memory_overcommit();
@@ -371,6 +486,13 @@ int main(void) {
     test_net_peers_unknown_vm_rejected();
     test_net_peers_requires_nat_on_both_sides();
     test_net_peers_none_is_ok();
+    test_media_disk_unset_is_auto();
+    test_media_disk_matches_second_device();
+    test_media_disk_absent_is_refused_not_substituted();
+    test_media_disk_no_devices_enumerated_is_refused();
+    test_media_disk_unidentified_devices_never_match();
+    test_media_disk_is_exact_match();
+    test_media_disk_out_of_range_vm_is_auto();
 
     if (failures == 0) {
         printf("all tests passed\n");

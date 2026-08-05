@@ -208,6 +208,9 @@ static const struct error_case ERROR_CASES[] = {
     {"duplicate key boot", "[vm.a]\nboot=disk\nboot=disk\n", HYPE_CFG_ERR_DUPLICATE_KEY},
     {"duplicate key install_media", "[vm.a]\ninstall_media=x\ninstall_media=y\n", HYPE_CFG_ERR_DUPLICATE_KEY},
     {"duplicate key target_disk", "[vm.a]\ntarget_disk=file:x\ntarget_disk=file:y\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+    {"duplicate key media_disk", "[vm.a]\nmedia_disk=SN-A\nmedia_disk=SN-B\n",
+     HYPE_CFG_ERR_DUPLICATE_KEY},
+    {"empty media_disk", "[vm.a]\nmedia_disk=\n", HYPE_CFG_ERR_BAD_VALUE},
     {"duplicate key target_disk_size_gb", "[vm.a]\ntarget_disk_size_gb=1\ntarget_disk_size_gb=2\n",
      HYPE_CFG_ERR_DUPLICATE_KEY},
     {"duplicate key firmware", "[vm.a]\nfirmware=uefi\nfirmware=uefi\n", HYPE_CFG_ERR_DUPLICATE_KEY},
@@ -497,6 +500,58 @@ static void test_size_gb_to_bytes(void) {
     CHECK_HEX("4096 GiB does not wrap", 4398046511104ull, hype_cfg_size_gb_to_bytes(4096));
 }
 
+/* #323: which host drive the media lives on -- optional, so its absence must stay the default. */
+static void test_media_disk(void) {
+    const char *with =
+        "[vm.a]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = installer\n"
+        "install_media = \\iso\\alpine.iso\n"
+        "media_disk = SN-SAMSUNG-980-1TB\n"
+        "target_disk = file:\\hype\\disks\\a.img\n"
+        "firmware = uefi\n"
+        "os_hint = linux\n";
+    const char *without =
+        "[vm.a]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = installer\n"
+        "install_media = \\iso\\alpine.iso\n"
+        "target_disk = file:\\hype\\disks\\a.img\n"
+        "firmware = uefi\n"
+        "os_hint = linux\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(with, &out);
+
+    CHECK_INT("media_disk parses OK", HYPE_CFG_OK, res.status);
+    CHECK_INT("media_disk sets has_media_disk", 1, out.vms[0].has_media_disk);
+    CHECK_STR("media_disk value", "SN-SAMSUNG-980-1TB", out.vms[0].media_disk);
+
+    res = parse_copy(without, &out);
+    CHECK_INT("omitting media_disk still parses OK", HYPE_CFG_OK, res.status);
+    CHECK_INT("omitted media_disk leaves has_media_disk clear", 0, out.vms[0].has_media_disk);
+    CHECK_STR("omitted media_disk leaves the value empty", "", out.vms[0].media_disk);
+}
+
+static void test_media_disk_too_long(void) {
+    char cfg[HYPE_CFG_PATH_MAX + 128];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    size_t i, n;
+
+    n = (size_t)snprintf(cfg, sizeof(cfg), "[vm.a]\nvcpus=1\nmem_mb=512\nmedia_disk=");
+    for (i = 0; i < HYPE_CFG_PATH_MAX; i++) {
+        cfg[n + i] = 'S';
+    }
+    cfg[n + i] = '\n';
+    cfg[n + i + 1] = '\0';
+
+    res = parse_copy(cfg, &out);
+    CHECK_INT("an over-long media_disk is rejected", HYPE_CFG_ERR_VALUE_TOO_LONG, res.status);
+}
+
+
 int main(void) {
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
@@ -515,6 +570,8 @@ int main(void) {
     test_comments_and_blank_lines_ignored();
     test_no_vms_is_valid();
     test_error_reports_line_number();
+    test_media_disk();
+    test_media_disk_too_long();
 
     if (failures == 0) {
         printf("all tests passed\n");

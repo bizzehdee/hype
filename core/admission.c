@@ -115,6 +115,40 @@ hype_adm_result_t hype_adm_check_target_disk(const hype_cfg_t *cfg) {
     return adm_ok();
 }
 
+int hype_adm_select_media_dev(const hype_cfg_t *cfg, unsigned int vm_index,
+                              const char *const *dev_serials, unsigned int dev_count) {
+    const hype_cfg_vm_t *vm;
+    unsigned int i;
+
+    if (cfg == 0 || vm_index >= cfg->vm_count) {
+        return HYPE_ADM_MEDIA_AUTO;
+    }
+    vm = &cfg->vms[vm_index];
+    if (!vm->has_media_disk || vm->media_disk[0] == '\0') {
+        return HYPE_ADM_MEDIA_AUTO;
+    }
+    for (i = 0; i < dev_count; i++) {
+        const char *ser = (dev_serials != 0) ? dev_serials[i] : 0;
+
+        if (ser != 0 && ser[0] != '\0' && hype_streq(ser, vm->media_disk)) {
+            return (int)i;
+        }
+    }
+    return HYPE_ADM_MEDIA_ABSENT;
+}
+
+hype_adm_result_t hype_adm_check_media_disk(const hype_cfg_t *cfg, const char *const *dev_serials,
+                                            unsigned int dev_count) {
+    unsigned int i;
+
+    for (i = 0; i < cfg->vm_count; i++) {
+        if (hype_adm_select_media_dev(cfg, i, dev_serials, dev_count) == HYPE_ADM_MEDIA_ABSENT) {
+            return adm_err(HYPE_ADM_ERR_MEDIA_DISK_ABSENT, i, HYPE_ADM_NO_VM);
+        }
+    }
+    return adm_ok();
+}
+
 hype_adm_result_t hype_adm_check_net_peers(const hype_cfg_t *cfg) {
     unsigned int i, p;
 

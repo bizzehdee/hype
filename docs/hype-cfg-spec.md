@@ -136,7 +136,8 @@ as the default display name.
 | `os_hint` | `windows`\|`linux`\|`bsd`\|`none` | `none` | drives `bus` defaults (§5.6) |
 | `disks` | `<disk-id>` list | (empty) | ordered hard disks (`type=disk` `[disk.*]`); **0..N**, mixed bus allowed (§5.7) |
 | `cdroms` | `<disk-id>` list | (empty) | ordered optical drives (`type=cdrom` `[disk.*]`); **0..N** (§5.4) |
-| `install_media` | path | (none) | sugar: an implicit boot `cdrom` (§5.4) |
+| `install_media` | path | (none) | sugar: an implicit boot `cdrom` (§5.4) — *which* ISO |
+| `media_disk` | serial-or-GUID string | (auto-detect) | *which host drive* `install_media` lives on (§5.4a, #323) |
 | `nics` | `<nic-id>` list | (empty) | ordered network devices (`[nic.*]`); **0..N** (§5.5) |
 | `boot_order` | device-id list | `cdroms` then `disks` | order BDS tries bootable targets |
 
@@ -171,6 +172,35 @@ Optical drives are first-class `[disk.<id>] type=cdrom` devices; a VM attaches
 creates one implicit boot cdrom and places it first in `boot_order`
 (maps to the per-VM ISO backing, #140). Use explicit `cdroms =` when a VM needs
 more than one (e.g. an installer ISO + a Windows storage-driver ISO).
+
+### 5.4a `media_disk` — which host drive the ISO lives on (#323)
+
+`install_media` says *which* ISO; `media_disk` says *which drive it is on*. They
+are separate axes because the target deployment (plan.md §6d) is hype on a USB
+stick plus a **separate** drive holding the ISOs, and a host may have several
+such drives.
+
+- Value: the drive's **serial or GUID**, matched **exactly** against the serial
+  host discovery enumerated — the same identity `id_match` uses (§6). A drive
+  that reports no serial can never be selected, because selecting it would mean
+  guessing which drive was meant.
+- **Positional selection (`disk0`, `disk1`, …) is not offered.** Enumeration
+  order depends on controller probe order, so a positional value silently means
+  a different drive after a hardware or firmware change.
+- Omitted (the default, and what every pre-#323 config does): hype searches
+  every enumerated drive and uses the first whose filesystem holds the path.
+- Set but **not present**: hype **refuses that VM**. It does not fall back to
+  another drive — handing a guest media from a drive nobody named is worse than
+  not starting. Enforced at startup by `hype_adm_check_media_disk` (§6i) and
+  again at resolve time.
+
+The drive named here needs a filesystem hype reads (FAT32, exFAT, or ext2/3/4)
+and may be SATA/AHCI or NVMe. The ISO is **streamed** from it, never copied into
+RAM (#322/#326), so ISO size is not bounded by guest or host memory.
+
+Note for CONFIG-2 (#222): `[disk.<id>]` has `path` but no equivalent "which host
+drive holds `path`" key yet, so `media_disk` is currently the only way to state
+it. When `[disk.*]` lands, it needs the same axis for `backing=file` entries.
 
 ### 5.5 `[nic.<id>]` — a network device + `[switch.<id>]` — a virtual network (NEW)
 
@@ -300,7 +330,8 @@ vcpus = 4
 cpu_set = 3-6
 mem_mb = 8192
 boot = installer
-install_media = \iso\win11.iso        ; sugar: the boot CD
+install_media = \iso\win11.iso        ; sugar: the boot CD -- which ISO
+media_disk = SN-SAMSUNG-980-1TB       ; ...and which host drive it is on (§5.4a)
 os_hint = windows
 disks = win-sys, win-data1, win-data2  ; SATA + NVMe + NVMe, enumerated in this order
 nics = win-net0

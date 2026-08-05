@@ -7115,6 +7115,7 @@ static const char *fw_1_media_path(unsigned vi) {
  * host-device plumbing further down; declared here because the guest-disk setup sits above it. */
 extern unsigned g_media_dev_count;
 static int media_use_dev(unsigned i);
+static int media_selected_dev(unsigned vi); /* #323 */
 
 static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     hype_gpt_partition_t part;
@@ -7141,6 +7142,7 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     unsigned vi = (unsigned)(vm - &g_vms[0]);
     const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
     int path_configured = 0;
+    int sel = media_selected_dev(vi); /* #323 */
 
     if (cv != 0 && cv->target_disk.kind == HYPE_CFG_DISK_FILE &&
         cv->target_disk.path_or_id[0] != '\0') {
@@ -7157,7 +7159,21 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
      * is "whichever one the file is on" -- so an image on an NVMe drive was previously
      * unreachable no matter what the operator configured.
      */
+    /*
+     * #323: honour an explicitly named media drive. sel >= 0 restricts the scan to that one device;
+     * -1 means auto-detect (try all); -2 means the config named a drive that is not present, which
+     * is refused rather than silently satisfied from a different disk.
+     */
+    if (sel == HYPE_ADM_MEDIA_ABSENT) {
+        hype_serial_print("m5-8: media_disk = '%s' is not present -- refusing to resolve %s from a "
+                          "different drive\n",
+                          g_hype_cfg.vms[vi].media_disk, path);
+        return 0;
+    }
     for (didx = 0u; didx < g_media_dev_count && fs == 0; didx++) {
+        if (sel >= 0 && didx != (unsigned)sel) {
+            continue;
+        }
         if (media_use_dev(didx) != 0) {
             continue;
         }
@@ -11426,8 +11442,11 @@ static int media_nvme_write(void *ctx, uint64_t lba, uint32_t count, const void 
 static hype_media_dev_t g_media_devs[HYPE_MEDIA_MAX_DEVS];
 unsigned g_media_dev_count;
 
+static const char *g_media_dev_serial[HYPE_MEDIA_MAX_DEVS]; /* #323 */
+
 static void media_add_dev(int (*rd)(void *, uint64_t, uint32_t, void *),
-                          int (*wr)(void *, uint64_t, uint32_t, const void *), const char *bus) {
+                          int (*wr)(void *, uint64_t, uint32_t, const void *), const char *bus,
+                          const char *serial) {
     unsigned i;
     if (g_media_dev_count >= HYPE_MEDIA_MAX_DEVS) {
         hype_debug_print("media: ignoring a %s device -- already tracking %u (cap)\n", bus,
@@ -11445,8 +11464,22 @@ static void media_add_dev(int (*rd)(void *, uint64_t, uint32_t, void *),
     g_media_devs[g_media_dev_count].ctx = 0;
     g_media_devs[g_media_dev_count].bus = bus;
     g_media_devs[g_media_dev_count].part_base_lba = 0;
+    g_media_dev_serial[g_media_dev_count] = serial; /* #323: static storage, stays valid */
     g_media_dev_count++;
-    hype_debug_print("media: registered host device %u = %s\n", g_media_dev_count - 1u, bus);
+    hype_debug_print("media: registered host device %u = %s serial='%s'\n", g_media_dev_count - 1u,
+                     bus, (serial != 0 && serial[0] != '\0') ? serial : "(unknown)");
+}
+
+/*
+ * #323: which host device VM `vi`'s media must come from -- a drive index,
+ * HYPE_ADM_MEDIA_AUTO (no drive named; the caller iterates every candidate, the pre-#323
+ * behaviour), or HYPE_ADM_MEDIA_ABSENT (a drive WAS named and is not present; refuse).
+ *
+ * The match itself lives in core/admission.c: it is pure logic over the parsed config plus the
+ * enumerated serials, so it belongs with the other §6i checks where the unit suite can reach it.
+ */
+static int media_selected_dev(unsigned vi) {
+    return hype_adm_select_media_dev(&g_hype_cfg, vi, g_media_dev_serial, g_media_dev_count);
 }
 
 /* Points the active media device at candidate `i`, keeping its partition base independent. */
@@ -11464,7 +11497,7 @@ static int media_use_dev(unsigned i) {
 
 /* Binds the media device to the AHCI port host discovery selected. */
 static void media_select_ahci(void) {
-    media_add_dev(media_ahci_read, media_ahci_write, "ahci");
+    media_add_dev(media_ahci_read, media_ahci_write, "ahci", g_hostdisk_serial);
     /* Keep AHCI as the ACTIVE device when it is found, so a machine that works today is
      * unchanged; the scan loops over all registered devices regardless. */
     g_media.read = media_ahci_read;
@@ -11475,7 +11508,7 @@ static void media_select_ahci(void) {
 
 /* #324: same, for an enumerated NVMe controller. */
 static void media_select_nvme(void) {
-    media_add_dev(media_nvme_read, media_nvme_write, "nvme");
+    media_add_dev(media_nvme_read, media_nvme_write, "nvme", g_hostnvme_serial);
     if (!media_present()) {
         g_media.read = media_nvme_read;
         g_media.write = media_nvme_write;
@@ -14177,6 +14210,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * \iso\test.iso to its on-disk extents via core/fat.c, and (for a
                  * contiguous file) point the ISO stream straight at those disk
                  * sectors. No RAM-resident copy. */
+                int iso_sel; /* #323 */
+                /*
+                 * #323: which drive the operator named, decided once for both the FAT-file scan
+                 * and the raw-partition fallback below. ABSENT (named but not present) suppresses
+                 * both rather than letting either satisfy the request from another drive.
+                 *
+                 * This is the earliest point where the device list is complete (both scans have
+                 * registered), so it is also where the config-wide §6i check runs.
+                 */
+                {
+                    hype_adm_result_t mr = hype_adm_check_media_disk(&g_hype_cfg, g_media_dev_serial,
+                                                                     g_media_dev_count);
+                    if (mr.status == HYPE_ADM_ERR_MEDIA_DISK_ABSENT) {
+                        const hype_cfg_vm_t *bad = &g_hype_cfg.vms[mr.vm_index_a];
+                        hype_serial_print("host-media: vm[%u] '%s': media_disk = '%s' is not present "
+                                          "-- refusing to stream media from a different drive\n",
+                                          mr.vm_index_a, bad->name, bad->media_disk);
+                    }
+                    iso_sel = media_selected_dev(0u);
+                }
                 {
                     hype_gpt_partition_t part;
                     hype_fat_file_t file;
@@ -14193,7 +14246,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                      * #324: and across every registered host device, so an ISO on an NVMe drive is
                      * found too -- the intended deployment puts the ISOs on a separate internal
                      * drive (plan.md §6d) which on a modern machine is likely NVMe. */
-                    for (didx = 0u; didx < g_media_dev_count && !have_file; didx++) {
+                    for (didx = 0u; iso_sel != HYPE_ADM_MEDIA_ABSENT && didx < g_media_dev_count && !have_file; didx++) {
+                    /* #323: restrict to the configured drive when one was named. */
+                    if (iso_sel >= 0 && didx != (unsigned)iso_sel) {
+                        continue;
+                    }
                     if (media_use_dev(didx) != 0) {
                         continue;
                     }
@@ -14301,8 +14358,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * iso_stream compose against a raw-partition backing too. */
                 /* #324: and try the raw-partition fallback on every device too, not just the
                  * one that happened to be active when the FAT scan gave up. */
-                for (unsigned rdev = 0u; rdev < g_media_dev_count && !g_vms[0].iso_stream_ready;
+                for (unsigned rdev = 0u; iso_sel != HYPE_ADM_MEDIA_ABSENT && rdev < g_media_dev_count &&
+                                         !g_vms[0].iso_stream_ready;
                      rdev++) {
+                    if (iso_sel >= 0 && rdev != (unsigned)iso_sel) {
+                        continue; /* #323 */
+                    }
                     (void)media_use_dev(rdev);
                 if (!g_vms[0].iso_stream_ready) {
                     hype_gpt_partition_t iso_part;
