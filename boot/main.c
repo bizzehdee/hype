@@ -14186,9 +14186,23 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         }
                     }
                     } /* #324: end device loop -- the log lines above name the bus via g_media.bus */
-                    if (have_file && file.count == 1u) {
+                    /*
+                     * #327: any number of extents up to the resolvers' cap, not just one.
+                     *
+                     * The old `file.count == 1u` gate fell back to the RAM-preload path for a
+                     * fragmented file -- and that path is being retired (#326), so it would have
+                     * become a hard failure. It was also stricter than the rest of the block
+                     * stack: hype_fat_file_t carries up to 64 runs and the guest disk-image path
+                     * already consumes multi-extent files. A multi-GB ISO on a volume that was not
+                     * freshly formatted fragments routinely; on ext, core/ext.h notes large
+                     * indirect-mapped files are structurally fragmented, so one extent was close
+                     * to unachievable there.
+                     */
+                    if (have_file && file.count >= 1u &&
+                        file.count <= HYPE_ISO_STREAM_MAX_EXTENTS) {
                         static uint8_t cd[8];
                         uint64_t abs_lba = g_media.part_base_lba + file.extents[0].start_lba;
+                        unsigned ei;
                         hype_debug_print("host-fat: \\iso\\test.iso vol-LBA %llu -> disk-LBA %llu, "
                                          "%llu bytes, %u extent(s)\n",
                                          (unsigned long long)file.extents[0].start_lba,
@@ -14198,6 +14212,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         g_vms[0].iso_stream.ctx = 0;
                         g_vms[0].iso_stream.part_start_lba = abs_lba;
                         g_vms[0].iso_stream.iso_size = file.size_bytes;
+                        /*
+                         * Extents are VOLUME-relative (core/fat.h); the stream wants
+                         * DISK-absolute, so add the partition base once here rather than at every
+                         * read. A single-extent file leaves extent_count 0 so it keeps taking the
+                         * contiguous fast path exactly as before.
+                         */
+                        g_vms[0].iso_stream.extent_count = (file.count > 1u) ? file.count : 0u;
+                        for (ei = 0; ei < file.count && ei < HYPE_ISO_STREAM_MAX_EXTENTS; ei++) {
+                            g_vms[0].iso_stream.extents[ei].start_lba =
+                                g_media.part_base_lba + file.extents[ei].start_lba;
+                            g_vms[0].iso_stream.extents[ei].sector_count =
+                                file.extents[ei].sector_count;
+                        }
                         if (hype_iso_stream_read(&g_vms[0].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                             cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
                             g_vms[0].iso_stream_ready = 1;
@@ -14210,9 +14237,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              (unsigned)cd[4]);
                         }
                     } else if (have_file) {
-                        hype_debug_print("host-fat: \\iso\\test.iso is fragmented (%u extents); "
-                                         "streaming needs a contiguous file -- falling back\n",
-                                         file.count);
+                        /* #327: only reachable now for a file needing MORE runs than the resolvers
+                         * can even report, i.e. one hype cannot describe rather than one it merely
+                         * dislikes. Says the cap so the number is actionable. */
+                        hype_debug_print("host-fat: \\iso\\test.iso needs %u extents, more than the "
+                                         "%u hype can map -- cannot stream it\n",
+                                         file.count, (unsigned)HYPE_ISO_STREAM_MAX_EXTENTS);
                     }
                 }
                 /* GLADDER-10: fall back to streaming the ISO from its own raw
