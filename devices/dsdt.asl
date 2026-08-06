@@ -67,6 +67,13 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                  * (the same M4-6d2 behaviour that made device 2 need its own entry).
                  * Must stay clear of the dev-2 block (16-19) and dev 3 (20). */
                 Package () { 0x0004FFFF, 0x00, 0x00, 0x15 },  /* dev 4 INTA -> GSI 21 (SATA disk) */
+                /* #329: extra disk slots. Slot 0 keeps the per-bus legacy devices above; slots 1
+                 * and 2 are devices 6 and 7 whatever their bus, each with its own GSI -- these are
+                 * the LAST two free pins on the 24-pin IO-APIC, which is what caps a VM at 3 disks
+                 * (HYPE_FW_1_MAX_DISKS in boot/main.c). Present unconditionally: a _PRT entry for
+                 * an absent device is inert, and a conditional table would need a per-config DSDT. */
+                Package () { 0x0006FFFF, 0x00, 0x00, 0x16 },  /* dev 6 INTA -> GSI 22 (disk slot 1) */
+                Package () { 0x0007FFFF, 0x00, 0x00, 0x17 },  /* dev 7 INTA -> GSI 23 (disk slot 2) */
             })
 
             /* Minimal resource template: claim bus 0 so the kernel associates

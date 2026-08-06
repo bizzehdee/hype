@@ -31,7 +31,8 @@ typedef enum {
     HYPE_ADM_ERR_DISK_REF_WRONG_TYPE,  /* a cdrom in disks=, or a disk in cdroms= */
     HYPE_ADM_ERR_DISK_SHARED_WRITABLE, /* two VMs attach the same writable device */
     HYPE_ADM_ERR_DISK_PHYS_OVERLAP,    /* two devices claim overlapping physical storage */
-    HYPE_ADM_ERR_DISK_BUS_UNSUPPORTED  /* a bus hype cannot present yet */
+    HYPE_ADM_ERR_DISK_BUS_UNSUPPORTED, /* a bus hype cannot present yet */
+    HYPE_ADM_ERR_DISK_COUNT_EXCEEDED   /* a VM attaches more disks than hype can present */
 } hype_adm_status_t;
 
 typedef struct {
@@ -148,5 +149,14 @@ hype_adm_result_t hype_adm_check_disk_phys_overlap(const hype_cfg_t *cfg);
  * asking for it must fail loudly at startup instead of producing a diskless VM.
  */
 hype_adm_result_t hype_adm_check_disk_bus(const hype_cfg_t *cfg);
+
+/*
+ * #329: refuse a VM whose disks= list is longer than the front-end can present. max_disks_per_vm
+ * is a parameter, not a constant read from the FW layer: the bound is owned by the caller (it is
+ * an interrupt-budget fact of the FW-1 machine model, HYPE_FW_1_MAX_DISKS), and admission stays a
+ * pure library. The parser's own cap (HYPE_CFG_MAX_VM_DISKS) is larger, so without this a 4-disk
+ * config would parse cleanly and then have its tail silently never attached.
+ */
+hype_adm_result_t hype_adm_check_disk_count(const hype_cfg_t *cfg, unsigned int max_disks_per_vm);
 
 #endif /* HYPE_ADMISSION_H */

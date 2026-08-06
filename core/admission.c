@@ -300,3 +300,14 @@ hype_adm_result_t hype_adm_check_disk_bus(const hype_cfg_t *cfg) {
     }
     return adm_ok();
 }
+
+hype_adm_result_t hype_adm_check_disk_count(const hype_cfg_t *cfg, unsigned int max_disks_per_vm) {
+    unsigned int vi;
+
+    for (vi = 0; vi < cfg->vm_count; vi++) {
+        if (cfg->vms[vi].disks_count > max_disks_per_vm) {
+            return adm_err(HYPE_ADM_ERR_DISK_COUNT_EXCEEDED, vi, HYPE_ADM_NO_VM);
+        }
+    }
+    return adm_ok();
+}

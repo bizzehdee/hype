@@ -12750,11 +12750,18 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         if (dr.status == HYPE_ADM_OK) {
             dr = hype_adm_check_disk_bus(&g_hype_cfg);
         }
+        if (dr.status == HYPE_ADM_OK) {
+            /* #329: the FW-1 machine model can route at most HYPE_FW_1_MAX_DISKS per VM (the
+             * IO-APIC GSI budget); the parser's own cap is larger, so an over-long disks= list
+             * parses cleanly and would otherwise have its tail silently never attached. */
+            dr = hype_adm_check_disk_count(&g_hype_cfg, HYPE_FW_1_MAX_DISKS);
+        }
         if (dr.status != HYPE_ADM_OK) {
             hype_serial_print("cfg: DISK CONFIG REJECTED (code %d, vm %u) -- a referenced [disk.*] is "
                               "missing, of the wrong type, shared writable, overlapping another "
-                              "physical claim, or on a bus hype cannot present\n",
-                              (int)dr.status, dr.vm_index_a);
+                              "physical claim, on a bus hype cannot present, or more disks than the "
+                              "%u hype can attach\n",
+                              (int)dr.status, dr.vm_index_a, (unsigned)HYPE_FW_1_MAX_DISKS);
         }
     }
     if (g_hype_cfg.skipped_vms != 0u) {

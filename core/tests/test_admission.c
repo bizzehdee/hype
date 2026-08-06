@@ -631,6 +631,36 @@ static void test_unpresentable_bus_is_refused(void) {
               (int)hype_adm_check_disk_bus(&cfg).status);
 }
 
+/* #329: the parser's list cap (HYPE_CFG_MAX_VM_DISKS) is larger than what the FW-1 machine model can
+ * route, so a config can parse cleanly and still name more disks than can exist. The boundary itself
+ * is the caller's fact (an interrupt-budget limit) and arrives as a parameter. */
+static void test_disk_count_over_frontend_budget_is_refused(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    add_disk(&cfg, "d0", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 0);
+    add_disk(&cfg, "d1", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 0);
+    add_disk(&cfg, "d2", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 0);
+    add_disk(&cfg, "d3", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 0);
+    attach(&cfg.vms[0], "d0", 0);
+    attach(&cfg.vms[0], "d1", 0);
+    attach(&cfg.vms[0], "d2", 0);
+
+    CHECK_INT("exactly at the budget passes", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_count(&cfg, 3u).status);
+
+    attach(&cfg.vms[0], "d3", 0);
+    r = hype_adm_check_disk_count(&cfg, 3u);
+    CHECK_INT("one past the budget is refused", (int)HYPE_ADM_ERR_DISK_COUNT_EXCEEDED, (int)r.status);
+    CHECK_INT("the refusal names the offending VM", 0, (int)r.vm_index_a);
+
+    CHECK_INT("no config at all passes trivially", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_count(&(hype_cfg_t){0}, 3u).status);
+}
+
 
 int main(void) {
     test_memory_within_budget();
@@ -664,6 +694,7 @@ int main(void) {
     test_writable_disks_cannot_be_shared_but_read_only_can();
     test_physical_overlap_allows_distinct_partitions();
     test_unpresentable_bus_is_refused();
+    test_disk_count_over_frontend_budget_is_refused();
 
     if (failures == 0) {
         printf("all tests passed\n");
