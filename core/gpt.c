@@ -55,7 +55,31 @@ int hype_gpt_find_partition(hype_gpt_read_lba_fn read, void *ctx, unsigned index
         return -1;
     }
     if (rd_le64(sector + GPT_SIG_OFF) != GPT_SIGNATURE) {
-        return -1;
+        /*
+         * #345: no GPT -- fall back to the MBR. Most USB sticks ship MBR-partitioned, and
+         * requiring GPT silently made every file on such a stick unresolvable while hype's own
+         * usb-log writer (which parses the MBR) streamed happily to the same volume -- a stick
+         * deployment that could log but not boot a guest, on both vendors. Indices 1-4 name the
+         * primary entries; a zero type byte is an unused slot and keeps its index, matching how
+         * an absent GPT entry behaves.
+         */
+        if (read(ctx, 0u, 1u, sector) != 0 || index > 4u) {
+            return -1;
+        }
+        if (sector[510] != 0x55u || sector[511] != 0xAAu) {
+            return -1;
+        }
+        {
+            const uint8_t *e = sector + 446u + (index - 1u) * 16u;
+            uint64_t start = (uint64_t)rd_le32(e + 8u);
+            uint64_t count = (uint64_t)rd_le32(e + 12u);
+            if (e[4] == 0u || start == 0u || count == 0u) {
+                return -1; /* unused/invalid entry */
+            }
+            out->first_lba = start;
+            out->last_lba = start + count - 1u;
+            return 0;
+        }
     }
     entry_lba = rd_le64(sector + GPT_PART_ENTRY_LBA_OFF);
     num_entries = rd_le32(sector + GPT_NUM_ENTRIES_OFF);

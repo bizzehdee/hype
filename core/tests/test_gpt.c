@@ -184,11 +184,45 @@ static void test_disk_guid_bad_signature(void) {
               (unsigned long long)hype_gpt_disk_guid(fake_read, 0, guid));
 }
 
+
+/* #345: with no GPT, the finder falls back to the MBR -- most USB sticks ship MBR, and the
+ * GPT-only scan made a stick deployment unable to resolve any file (while usb-log, which
+ * parses the MBR itself, streamed to the same volume). */
+static uint8_t g_mbr_disk[4][512];
+static int mbr_read(void *ctx, uint64_t lba, uint32_t n, void *dst) {
+    (void)ctx;
+    if (lba >= 4u || n != 1u) return -1;
+    for (uint32_t i = 0; i < 512u; i++) ((uint8_t *)dst)[i] = g_mbr_disk[lba][i];
+    return 0;
+}
+static void test_mbr_fallback(void) {
+    hype_gpt_partition_t p;
+    uint8_t *e = g_mbr_disk[0] + 446;
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 512; j++) g_mbr_disk[i][j] = 0;
+    g_mbr_disk[0][510] = 0x55; g_mbr_disk[0][511] = 0xAA;
+    e[4] = 0x0C;                       /* type: FAT32 LBA */
+    e[8] = 32;                          /* start LBA 32 (the SONY stick's real layout) */
+    e[12] = 0x00; e[13] = 0x08;        /* count 0x800 */
+    CHECK_HEX("MBR partition 1 found", 0ull,
+              (unsigned long long)hype_gpt_find_partition(mbr_read, 0, 1, &p));
+    CHECK_HEX("MBR first_lba", 32ull, (unsigned long long)p.first_lba);
+    CHECK_HEX("MBR last_lba", (unsigned long long)(32u + 0x800u - 1u),
+              (unsigned long long)p.last_lba);
+    CHECK_HEX("unused MBR entry refused", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(mbr_read, 0, 2, &p));
+    CHECK_HEX("MBR index 5 refused (primaries only)", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(mbr_read, 0, 5, &p));
+    g_mbr_disk[0][510] = 0; /* no 55AA either: not a partitioned disk at all */
+    CHECK_HEX("no GPT and no MBR refused", (unsigned long long)(-1),
+              (unsigned long long)hype_gpt_find_partition(mbr_read, 0, 1, &p));
+}
+
 int main(void) {
     test_find_first_partition();
     test_find_second_partition();
     test_index_out_of_range();
     test_bad_signature();
+    test_mbr_fallback();
     test_header_read_fail();
     test_entry_size_too_small();
     test_num_entries_zero();
