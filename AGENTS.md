@@ -16,8 +16,8 @@ The **GitHub Project board is the single source of truth for task progress**:
 - the short task title (e.g. `GLADDER-5: Fedora Server, single-VM …`);
 - the full description in the issue body;
 - progress/engineering notes as issue **comments**;
-- the milestone as the native **Milestone** field (`GLADDER`, `M4`, `VALID`,
-  `VIDEO`, …) — *not* a label;
+- the milestone as the native **Milestone** field (`GLADDER`, `INSTALLER`,
+  `VALID`, `VIDEO`, …) — *not* a label;
 - dependencies as native **"is blocked by"** relationships (a task is blocked
   by every task it requires);
 - parent/child breakdowns (e.g. `M4-6` → `M4-6b` → `M4-6b2`) as **sub-issues**.
@@ -58,6 +58,43 @@ live design doc.
   resumed a first-class, reviewable thing rather than a status flip.
 - Reference the task ID (e.g. `M5-3`, `VALID-2`) in commit messages/PRs so the
   dependency graph stays trustworthy.
+
+### Milestones
+
+- **Every milestone name is a single word in ALL CAPS** (`STORAGE`, `CONFIG`,
+  `MULTIVM`, `BSD`). No spaces, no hyphens into phrases, no two milestones with
+  the same name. The milestone **description** carries the long explanation
+  (e.g. `STORAGE = "M10: physical disks and host filesystems"`); the name is
+  only the handle.
+- **A ticket's milestone must match its subject, not where it was found.** Work
+  discovered while chasing a FreeBSD bug is not automatically `BSD`: a config
+  key belongs in `CONFIG`, a media-source defect in `STORAGE`, a disk front-end
+  in `VDISK`. Filing a ticket under the milestone you happened to be working in
+  is how `BSD` accumulated 19 non-BSD tickets before the 2026-08-06 audit.
+- A ticket whose subject spans several milestones, or fits none, may stay
+  unmilestoned — that is better than a wrong assignment. Say why in the ticket.
+- Do not rename or merge milestones ad hoc; a rename touches every ticket in it
+  and every doc that names it, so treat it as its own reviewed task.
+
+### Labels
+
+- **Every issue carries at least one label.** Labels are descriptors; the
+  milestone stays in the Milestone field, never duplicated as a label.
+- One **kind** label per issue, chosen by what the ticket asks for:
+  - `bug` — a defect report: something behaves wrongly today;
+  - `enhancement` — a new capability or an extension of one;
+  - `refactor` — behaviour-preserving restructuring;
+  - `spike` — a time-boxed question to answer, not code to deliver;
+  - `documentation`, `testing` — when the deliverable is docs or test
+    infrastructure itself.
+- Plus any **domain** labels that genuinely apply (several are fine):
+  `storage`, `config`, `usb`, `networking`, `input`, `diagnostics`,
+  `performance`, `guest-compat` (a specific guest OS misbehaves),
+  `amd-svm` / `intel-vmx` (backend-specific), `hardware-validation` (needs a
+  real-hardware run to close).
+- Create a missing label rather than overloading a near-miss, but check
+  `gh label list` first — a synonym of an existing label is clutter, not
+  precision.
 
 ## Before doing anything
 
