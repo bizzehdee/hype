@@ -115,15 +115,38 @@ static uint64_t cluster_lba(const fat32_vol_t *v, uint32_t cl) {
 }
 
 /* Next cluster in the chain, or a value >= FAT32_EOC on end/error. */
-static uint32_t fat32_next(const fat32_vol_t *v, uint32_t cl) {
+/*
+ * #347: one cached FAT sector, owned by the CALLER's stack (never file-global -- two resolves
+ * sharing it silently is the multi-VM singleton hazard). One FAT sector holds 128 entries, and
+ * a chain walk visits them nearly sequentially -- so caching the last sector turns one read per
+ * CLUSTER into roughly one per 128. Measured on real hardware (#346's counters): an 800MB ISO's
+ * resolve was 52k+ single-sector USB reads (~30s, budget-expired); with the cache it is ~500.
+ */
+typedef struct {
+    uint32_t lba;
+    int valid;
     uint8_t sec[HYPE_FAT_SECTOR_SIZE];
+} fat32_cache_t;
+
+static uint32_t fat32_next_cached(const fat32_vol_t *v, uint32_t cl, fat32_cache_t *c) {
     uint32_t byte = cl * 4u;
     uint32_t fat_sec = v->fat_start + byte / HYPE_FAT_SECTOR_SIZE;
     uint32_t within = byte % HYPE_FAT_SECTOR_SIZE;
-    if (v->read(v->ctx, fat_sec, 1u, sec) != 0) {
-        return FAT32_EOC;
+    if (!c->valid || c->lba != fat_sec) {
+        if (v->read(v->ctx, fat_sec, 1u, c->sec) != 0) {
+            c->valid = 0;
+            return FAT32_EOC;
+        }
+        c->lba = fat_sec;
+        c->valid = 1;
     }
-    return rd32(sec + within) & 0x0FFFFFFFu;
+    return rd32(c->sec + within) & 0x0FFFFFFFu;
+}
+
+static uint32_t fat32_next(const fat32_vol_t *v, uint32_t cl) {
+    fat32_cache_t c;
+    c.valid = 0;
+    return fat32_next_cached(v, cl, &c);
 }
 
 /*
@@ -204,6 +227,8 @@ static int fat32_build_extents(const fat32_vol_t *v, uint32_t first_cl, uint32_t
     uint32_t cl = first_cl;
     uint64_t sectors_per_cluster = v->spc;
     unsigned guard = 0;
+    fat32_cache_t fc;
+    fc.valid = 0;
 
     out->count = 0;
     out->size_bytes = size;
@@ -216,7 +241,7 @@ static int fat32_build_extents(const fat32_vol_t *v, uint32_t first_cl, uint32_t
             hype_fat_extent_t *last = &out->extents[out->count - 1u];
             if (last->start_lba + last->sector_count == lba) {
                 last->sector_count += sectors_per_cluster; /* contiguous: extend */
-                cl = fat32_next(v, cl);
+                cl = fat32_next_cached(v, cl, &fc);
                 continue;
             }
         }
@@ -226,7 +251,7 @@ static int fat32_build_extents(const fat32_vol_t *v, uint32_t first_cl, uint32_t
         out->extents[out->count].start_lba = lba;
         out->extents[out->count].sector_count = sectors_per_cluster;
         out->count++;
-        cl = fat32_next(v, cl);
+        cl = fat32_next_cached(v, cl, &fc);
     }
 
     /* Trim the trailing extent to the exact file length (clusters are rounded
