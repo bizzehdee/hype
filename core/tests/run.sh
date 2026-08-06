@@ -49,12 +49,32 @@ binaries=""
 # has to resolve at link time. Assembling it for the host target does that.
 asm_srcs="../../arch/x86_64/vmx/vmx_run.S"
 
-for src in test_*.c; do
-    name="${src%.c}"
+# Parallel build+run, one job per test binary. The compile dominates the suite's wall clock
+# (every binary links the whole instrumented tree), and the jobs are fully independent --
+# separate outputs, separate .profraw files. Failures are NOT lost to the parallelism: each
+# job writes a .rc file, and the collection loop below exits non-zero if any test failed,
+# which is what `set -e` guarded in the serial version.
+njobs=$(nproc 2>/dev/null || echo 4)
+build_and_run() {
+    name="${1%.c}"
     clang -std=c11 -Wall -Wextra -g \
         -fprofile-instr-generate -fcoverage-mapping \
-        -o "$name" "$src" $lib_srcs $asm_srcs
+        -o "$name" "$1" $lib_srcs $asm_srcs || { echo 1 > "$name.rc"; exit 1; }
     LLVM_PROFILE_FILE="$name.profraw" "./$name"
+    echo $? > "$name.rc"
+}
+running=0
+for src in test_*.c; do
+    build_and_run "$src" &
+    running=$((running + 1))
+    [ "$running" -ge "$njobs" ] && { wait -n; running=$((running - 1)); }
+done
+wait
+for src in test_*.c; do
+    name="${src%.c}"
+    rc=$(cat "$name.rc" 2>/dev/null || echo 1)
+    rm -f "$name.rc"
+    [ "$rc" -eq 0 ] || { echo "run.sh: $name FAILED (rc=$rc)"; exit 1; }
     binaries="$binaries $name"
 done
 
