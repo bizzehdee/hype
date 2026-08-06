@@ -753,6 +753,307 @@ static void test_io_zero_size_disk_refuses_everything(void) {
 }
 
 
+/* ---- slice 5: the command processor ---- */
+
+#define ASQ_BASE (GRAM_BASE + 0x8000ull)
+#define ACQ_BASE (GRAM_BASE + 0x9000ull)
+#define IOSQ_BASE (GRAM_BASE + 0xA000ull)
+#define IOCQ_BASE (GRAM_BASE + 0xB000ull)
+
+static void put_sqe(uint64_t base, unsigned slot, uint8_t op, uint16_t cid, uint32_t nsid,
+                    uint64_t prp1, uint32_t cdw10, uint32_t cdw11, uint32_t cdw12) {
+    uint8_t *p = g_gram + (base - GRAM_BASE) + (size_t)slot * HYPE_NVME_SQE_BYTES;
+    memset(p, 0, HYPE_NVME_SQE_BYTES);
+    p[0] = op;
+    p[2] = (uint8_t)(cid & 0xFFu); p[3] = (uint8_t)(cid >> 8);
+    p[4] = (uint8_t)(nsid & 0xFFu);
+    p[24] = (uint8_t)(prp1 & 0xFFu); p[25] = (uint8_t)((prp1 >> 8) & 0xFFu);
+    p[26] = (uint8_t)((prp1 >> 16) & 0xFFu); p[27] = (uint8_t)((prp1 >> 24) & 0xFFu);
+    p[40] = (uint8_t)(cdw10 & 0xFFu); p[41] = (uint8_t)((cdw10 >> 8) & 0xFFu);
+    p[44] = (uint8_t)(cdw11 & 0xFFu);
+    p[48] = (uint8_t)(cdw12 & 0xFFu); p[49] = (uint8_t)((cdw12 >> 8) & 0xFFu);
+}
+
+static uint16_t cqe_status_at(uint64_t base, unsigned slot) {
+    const uint8_t *p = g_gram + (base - GRAM_BASE) + (size_t)slot * HYPE_NVME_CQE_BYTES;
+    return (uint16_t)((p[14] | (p[15] << 8)) >> 1) & 0xFFu;
+}
+static uint8_t cqe_phase_at(uint64_t base, unsigned slot) {
+    const uint8_t *p = g_gram + (base - GRAM_BASE) + (size_t)slot * HYPE_NVME_CQE_BYTES;
+    return (uint8_t)(p[14] & 1u);
+}
+static uint16_t cqe_cid_at(uint64_t base, unsigned slot) {
+    const uint8_t *p = g_gram + (base - GRAM_BASE) + (size_t)slot * HYPE_NVME_CQE_BYTES;
+    return (uint16_t)(p[12] | (p[13] << 8));
+}
+
+static void enable_with_admin_queues(hype_nvme_t *d) {
+    hype_nvme_reset(d);
+    memset(g_gram, 0, sizeof(g_gram));
+    hype_nvme_mmio_write32(d, HYPE_NVME_REG_ASQ, (uint32_t)ASQ_BASE);
+    hype_nvme_mmio_write32(d, HYPE_NVME_REG_ASQ + 4u, (uint32_t)(ASQ_BASE >> 32));
+    hype_nvme_mmio_write32(d, HYPE_NVME_REG_ACQ, (uint32_t)ACQ_BASE);
+    hype_nvme_mmio_write32(d, HYPE_NVME_REG_ACQ + 4u, (uint32_t)(ACQ_BASE >> 32));
+    hype_nvme_mmio_write32(d, HYPE_NVME_REG_CC, HYPE_NVME_CC_EN);
+}
+
+static void fill_ctx(hype_nvme_ctx_t *c, hype_blk_backend_t *be, uint8_t *bounce, uint32_t blen) {
+    memset(c, 0, sizeof(*c));
+    c->be = be;
+    c->total_sectors = DISK_SECTORS;
+    c->page_size = 4096u;
+    c->gread = gram_read;
+    c->gwrite = gram_write;
+    c->gctx = 0;
+    c->bounce = bounce;
+    c->bounce_len = blen;
+    c->serial = "HYPE-NVME-TEST";
+}
+
+static void test_admin_identify_round_trip(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+    uint64_t dest = GRAM_BASE + 0x2000ull;
+
+    io_backend(&be);
+    enable_with_admin_queues(&d);
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+
+    put_sqe(ASQ_BASE, 0, HYPE_NVME_ADMIN_IDENTIFY, 0x55u, 0, dest, HYPE_NVME_CNS_CONTROLLER, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 1u); /* SQ0 tail = 1 */
+
+    CHECK_HEX("one command processed", 1, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("completion says success", HYPE_NVME_SC_SUCCESS, cqe_status_at(ACQ_BASE, 0));
+    /* The CID must be echoed or the driver cannot match the completion to its command. */
+    CHECK_HEX("completion echoes the CID", 0x55u, cqe_cid_at(ACQ_BASE, 0));
+    CHECK_HEX("first completion carries phase 1", 1u, cqe_phase_at(ACQ_BASE, 0));
+    /* The IDENTIFY payload actually landed in guest memory. */
+    CHECK_HEX("identify SN reached the guest buffer", (unsigned)'H',
+              g_gram[(dest - GRAM_BASE) + 4u]);
+    CHECK_HEX("and the controller reports one namespace", 1u,
+              g_gram[(dest - GRAM_BASE) + 516u]);
+}
+
+static void test_io_command_end_to_end_through_the_processor(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+    uint64_t dest = GRAM_BASE + 0x3000ull;
+    unsigned i;
+
+    io_backend(&be);
+    enable_with_admin_queues(&d);
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+    for (i = 0; i < 512u; i++) g_disk[512u + i] = (uint8_t)(i ^ 0x5Au);
+
+    /* The guest must create its I/O queues before using them; without that the processor refuses. */
+    CHECK_HEX("an I/O queue with no base is refused", -1, hype_nvme_process_sq(&d, 1u, &c));
+
+    put_sqe(ASQ_BASE, 0, HYPE_NVME_ADMIN_CREATE_IO_CQ, 1u, 0, IOCQ_BASE, 1u, 0, 0);
+    put_sqe(ASQ_BASE, 1, HYPE_NVME_ADMIN_CREATE_IO_SQ, 2u, 0, IOSQ_BASE, 1u, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 2u);
+    CHECK_HEX("two admin commands processed", 2, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("CQ created", HYPE_NVME_SC_SUCCESS, cqe_status_at(ACQ_BASE, 0));
+    CHECK_HEX("SQ created", HYPE_NVME_SC_SUCCESS, cqe_status_at(ACQ_BASE, 1));
+
+    /* Now a real READ of LBA 1 through the I/O queue. */
+    put_sqe(IOSQ_BASE, 0, HYPE_NVME_IO_READ, 0x99u, 1u, dest, 1u, 0, 0 /* NLB 0 => 1 block */);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE + 8u, 1u); /* SQ1 tail = 1 */
+    CHECK_HEX("the I/O command was processed", 1, hype_nvme_process_sq(&d, 1u, &c));
+    CHECK_HEX("it succeeded", HYPE_NVME_SC_SUCCESS, cqe_status_at(IOCQ_BASE, 0));
+    CHECK_HEX("data reached the guest", (unsigned)(uint8_t)(0u ^ 0x5Au), g_gram[dest - GRAM_BASE]);
+    CHECK_HEX("...to the end of the sector", (unsigned)(uint8_t)(511u ^ 0x5Au),
+              g_gram[(dest - GRAM_BASE) + 511u]);
+}
+
+static void test_failing_command_still_gets_a_completion(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+
+    io_backend(&be);
+    enable_with_admin_queues(&d);
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+
+    /*
+     * The rule that matters most here: a command that FAILS must still be completed. A driver that
+     * receives no completion waits for its timeout and cannot distinguish a failure from a hang, so
+     * silence is strictly worse than an error status.
+     */
+    put_sqe(ASQ_BASE, 0, 0xEEu, 0x77u, 0, GRAM_BASE, 0, 0, 0); /* nonsense opcode */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 1u);
+    CHECK_HEX("the bad command was processed", 1, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("and completed with INVALID_OPCODE", HYPE_NVME_SC_INVALID_OPCODE,
+              cqe_status_at(ACQ_BASE, 0));
+    CHECK_HEX("with its CID echoed", 0x77u, cqe_cid_at(ACQ_BASE, 0));
+    CHECK_HEX("and a valid phase bit", 1u, cqe_phase_at(ACQ_BASE, 0));
+}
+
+static void test_processor_consumes_each_entry_exactly_once(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+    unsigned i;
+
+    io_backend(&be);
+    enable_with_admin_queues(&d);
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+
+    for (i = 0; i < 5u; i++) {
+        put_sqe(ASQ_BASE, i, HYPE_NVME_ADMIN_SET_FEATURES, (uint16_t)(0x100u + i), 0, GRAM_BASE, 0, 0, 0);
+    }
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 5u);
+    CHECK_HEX("all five processed", 5, hype_nvme_process_sq(&d, 0u, &c));
+    /* Draining again must do NOTHING: re-running consumed commands is how a controller repeats a write. */
+    CHECK_HEX("a second drain does nothing", 0, hype_nvme_process_sq(&d, 0u, &c));
+    /* Completions land in order with the right CIDs. */
+    for (i = 0; i < 5u; i++) {
+        CHECK_HEX("completion CID in order", 0x100u + i, cqe_cid_at(ACQ_BASE, i));
+    }
+    CHECK_HEX("sq_head advanced to the tail", 5u, d.sq_head[0]);
+}
+
+static void test_processor_refuses_before_enable(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+
+    io_backend(&be);
+    hype_nvme_reset(&d);
+    memset(g_gram, 0, sizeof(g_gram));
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+
+    /* A doorbell written before CC.EN is not a command to run: the queues are not valid yet, so their
+     * contents are whatever the guest memory happened to contain. */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 1u);
+    CHECK_HEX("no processing before CC.EN", -1, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("a bad qid is refused", -1, hype_nvme_process_sq(&d, HYPE_NVME_MAX_QUEUES, &c));
+    CHECK_HEX("NULL ctx refused", -1, hype_nvme_process_sq(&d, 0u, 0));
+}
+
+
+static int g_gram_fail_at_cqe = 0;
+static uint64_t g_gram_fail_gpa = 0;
+static int gram_write_selective(void *ctx, uint64_t gpa, uint32_t len, const void *src) {
+    if (g_gram_fail_at_cqe && gpa == g_gram_fail_gpa) return -1;
+    return gram_write(ctx, gpa, len, src);
+}
+static int g_gram_read_fail_gpa_set = 0;
+static uint64_t g_gram_read_fail_gpa = 0;
+static int gram_read_selective(void *ctx, uint64_t gpa, uint32_t len, void *dst) {
+    if (g_gram_read_fail_gpa_set && gpa == g_gram_read_fail_gpa) return -1;
+    return gram_read(ctx, gpa, len, dst);
+}
+
+static void test_admin_refusals(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+
+    io_backend(&be);
+    enable_with_admin_queues(&d);
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+
+    /* An unsupported CNS is a FIELD error, not an OPCODE error -- the driver asked a valid question
+     * hype cannot answer, and it distinguishes the two. */
+    put_sqe(ASQ_BASE, 0, HYPE_NVME_ADMIN_IDENTIFY, 1u, 0, GRAM_BASE + 0x2000ull, 0x0Du, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 1u);
+    CHECK_HEX("processed", 1, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("an unknown CNS is a FIELD error", HYPE_NVME_SC_INVALID_FIELD,
+              cqe_status_at(ACQ_BASE, 0));
+
+    /* Only one I/O queue pair is modelled; another id is refused rather than aliased onto it. */
+    put_sqe(ASQ_BASE, 1, HYPE_NVME_ADMIN_CREATE_IO_CQ, 2u, 0, IOCQ_BASE, 7u, 0, 0);
+    put_sqe(ASQ_BASE, 2, HYPE_NVME_ADMIN_CREATE_IO_SQ, 3u, 0, IOSQ_BASE, 7u, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 3u);
+    CHECK_HEX("processed", 2, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("CQ id 7 refused", HYPE_NVME_SC_INVALID_FIELD, cqe_status_at(ACQ_BASE, 1));
+    CHECK_HEX("SQ id 7 refused", HYPE_NVME_SC_INVALID_FIELD, cqe_status_at(ACQ_BASE, 2));
+
+    /* IDENTIFY with a bounce too small to hold the payload. */
+    fill_ctx(&c, &be, bounce, 64u);
+    put_sqe(ASQ_BASE, 3, HYPE_NVME_ADMIN_IDENTIFY, 4u, 0, GRAM_BASE + 0x2000ull,
+            HYPE_NVME_CNS_CONTROLLER, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 4u);
+    CHECK_HEX("processed", 1, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("a too-small bounce is a FIELD error", HYPE_NVME_SC_INVALID_FIELD,
+              cqe_status_at(ACQ_BASE, 3));
+
+    /* IDENTIFY whose destination is unmapped. */
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+    put_sqe(ASQ_BASE, 4, HYPE_NVME_ADMIN_IDENTIFY, 5u, 0, 0xDEAD0000ull, HYPE_NVME_CNS_NAMESPACE, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 5u);
+    CHECK_HEX("processed", 1, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("an unmapped identify destination is a transfer error", HYPE_NVME_SC_DATA_XFER_ERROR,
+              cqe_status_at(ACQ_BASE, 4));
+}
+
+static void test_processor_stops_rather_than_losing_a_command(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+
+    io_backend(&be);
+    enable_with_admin_queues(&d);
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+
+    /*
+     * If the SQE itself cannot be fetched, STOP without advancing. Advancing would drop the command
+     * silently and the guest would wait forever for a completion that can never come.
+     */
+    c.gread = gram_read_selective;
+    g_gram_read_fail_gpa_set = 1;
+    g_gram_read_fail_gpa = ASQ_BASE;
+    put_sqe(ASQ_BASE, 0, HYPE_NVME_ADMIN_SET_FEATURES, 1u, 0, GRAM_BASE, 0, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 1u);
+    CHECK_HEX("nothing processed when the SQE is unreadable", 0, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("and the head did NOT advance past it", 0u, d.sq_head[0]);
+    g_gram_read_fail_gpa_set = 0;
+
+    /* If the completion cannot be posted, report what was done rather than looping. */
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+    c.gwrite = gram_write_selective;
+    g_gram_fail_at_cqe = 1;
+    g_gram_fail_gpa = ACQ_BASE;
+    CHECK_HEX("an unpostable completion stops the drain", 0, hype_nvme_process_sq(&d, 0u, &c));
+    g_gram_fail_at_cqe = 0;
+}
+
+static void test_processor_needs_queue_bases(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+
+    io_backend(&be);
+    hype_nvme_reset(&d);
+    memset(g_gram, 0, sizeof(g_gram));
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+    /* Enabled, but ASQ/ACQ never written: the guest has not said where the queues are. */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_CC, HYPE_NVME_CC_EN);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 1u);
+    CHECK_HEX("no admin queue base means refuse", -1, hype_nvme_process_sq(&d, 0u, &c));
+
+    /* Missing callbacks. */
+    enable_with_admin_queues(&d);
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+    c.gread = 0;
+    CHECK_HEX("no gread refused", -1, hype_nvme_process_sq(&d, 0u, &c));
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+    c.gwrite = 0;
+    CHECK_HEX("no gwrite refused", -1, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("NULL dev refused", -1, hype_nvme_process_sq(0, 0u, &c));
+}
+
+
 int main(void) {
     test_phase_starts_at_one();
     test_phase_toggles_only_on_wrap();
@@ -781,6 +1082,14 @@ int main(void) {
     test_io_spanning_two_prp_pages();
     test_io_backend_and_callback_failures_are_reported();
     test_io_zero_size_disk_refuses_everything();
+    test_admin_identify_round_trip();
+    test_io_command_end_to_end_through_the_processor();
+    test_failing_command_still_gets_a_completion();
+    test_processor_consumes_each_entry_exactly_once();
+    test_processor_refuses_before_enable();
+    test_admin_refusals();
+    test_processor_stops_rather_than_losing_a_command();
+    test_processor_needs_queue_bases();
 
     if (failures == 0) {
         printf("all tests passed\n");

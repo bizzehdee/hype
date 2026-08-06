@@ -72,6 +72,15 @@ typedef struct {
      */
     uint32_t cq_tail[HYPE_NVME_MAX_QUEUES];
     uint8_t cq_phase[HYPE_NVME_MAX_QUEUES];
+    /*
+     * #202 slice 5: how far the CONTROLLER has consumed each submission queue. Distinct from
+     * sq_tail (where the GUEST says it has written to) -- conflating the two is how a controller
+     * either re-executes commands it already ran or skips ones it never did.
+     */
+    uint32_t sq_head[HYPE_NVME_MAX_QUEUES];
+    /* I/O queue bases, as recorded by CREATE_IO_SQ/CQ. Queue 0 uses asq/acq. */
+    uint64_t io_sq_base;
+    uint64_t io_cq_base;
 } hype_nvme_t;
 
 /*
@@ -270,5 +279,34 @@ uint16_t hype_nvme_exec_io(const hype_nvme_cmd_t *cmd, hype_blk_backend_t *be,
                            uint64_t total_sectors, uint32_t page_size,
                            hype_nvme_guest_read_fn gread, hype_nvme_guest_write_fn gwrite,
                            void *gctx, uint8_t *bounce, uint32_t bounce_len);
+
+
+/* ---- slice 5: the command processor (#202) ------------------------------------------------------ */
+
+/* Everything the processor needs that is not controller state. Grouped so the call sites stay readable
+ * and so a new dependency cannot be silently forgotten at one of them. */
+typedef struct {
+    hype_blk_backend_t *be;
+    uint64_t total_sectors;
+    uint32_t page_size;
+    hype_nvme_guest_read_fn gread;
+    hype_nvme_guest_write_fn gwrite;
+    void *gctx;
+    uint8_t *bounce;
+    uint32_t bounce_len;
+    const char *serial; /* reported by IDENTIFY CONTROLLER */
+} hype_nvme_ctx_t;
+
+/*
+ * Drains submission queue `qid`: for every entry the guest has published (sq_head != sq_tail), fetch it,
+ * execute it, and post a completion.
+ *
+ * Returns the number of commands processed, or -1 if the controller is not enabled or the arguments are
+ * unusable. A command that FAILS still gets a completion with a status -- never silence, because a
+ * driver that receives no completion waits for its timeout and cannot tell a failure from a hang.
+ *
+ * Pure apart from the injected callbacks and the backend.
+ */
+int hype_nvme_process_sq(hype_nvme_t *dev, unsigned int qid, const hype_nvme_ctx_t *c);
 
 #endif /* HYPE_DEVICES_NVME_H */

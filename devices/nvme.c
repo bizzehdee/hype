@@ -15,7 +15,10 @@ void hype_nvme_reset(hype_nvme_t *dev) {
         /* See the header: phase MUST start at 1, or the first completion is invisible to a driver
          * polling a zeroed queue. */
         dev->cq_phase[q] = 1u;
+        dev->sq_head[q] = 0;
     }
+    dev->io_sq_base = 0;
+    dev->io_cq_base = 0;
 }
 
 uint32_t hype_nvme_mmio_read32(const hype_nvme_t *dev, uint32_t off) {
@@ -71,7 +74,10 @@ void hype_nvme_mmio_write32(hype_nvme_t *dev, uint32_t off, uint32_t value) {
                     dev->cq_head[q] = 0;
                     dev->cq_tail[q] = 0;
                     dev->cq_phase[q] = 1u; /* a fresh queue is polled against phase 1 again */
+                    dev->sq_head[q] = 0;
                 }
+                dev->io_sq_base = 0;
+                dev->io_cq_base = 0;
             }
             return;
         case HYPE_NVME_REG_AQA:
@@ -474,4 +480,126 @@ uint16_t hype_nvme_exec_io(const hype_nvme_cmd_t *cmd, hype_blk_backend_t *be,
         return HYPE_NVME_SC_DATA_XFER_ERROR;
     }
     return HYPE_NVME_SC_SUCCESS;
+}
+
+/* ---- slice 5: the command processor (#202) ------------------------------------------------------ */
+
+/* Where queue `qid` lives. Queue 0 is the admin pair (ASQ/ACQ); queue 1 is the I/O pair recorded by
+ * CREATE_IO_SQ/CQ. Returning the base rather than indexing an array keeps the admin special case in one
+ * place instead of at every use. */
+static uint64_t sq_base_of(const hype_nvme_t *dev, unsigned int qid) {
+    return (qid == 0u) ? dev->asq : dev->io_sq_base;
+}
+
+static uint64_t cq_base_of(const hype_nvme_t *dev, unsigned int qid) {
+    return (qid == 0u) ? dev->acq : dev->io_cq_base;
+}
+
+/* Executes one ADMIN command, returning its NVMe status. */
+static uint16_t exec_admin(hype_nvme_t *dev, const hype_nvme_cmd_t *cmd, const hype_nvme_ctx_t *c) {
+    switch (cmd->opcode) {
+        case HYPE_NVME_ADMIN_IDENTIFY: {
+            uint32_t cns = cmd->cdw10 & 0xFFu;
+            if (c->gwrite == 0 || c->bounce == 0 || c->bounce_len < HYPE_NVME_IDENTIFY_BYTES) {
+                return HYPE_NVME_SC_INVALID_FIELD;
+            }
+            if (cns == HYPE_NVME_CNS_CONTROLLER) {
+                hype_nvme_identify_controller(c->bounce, c->serial);
+            } else if (cns == HYPE_NVME_CNS_NAMESPACE) {
+                hype_nvme_identify_namespace(c->bounce, c->total_sectors);
+            } else {
+                /* An unsupported CNS is a FIELD error, not an opcode error: the driver asked a valid
+                 * question hype cannot answer, and it distinguishes the two. */
+                return HYPE_NVME_SC_INVALID_FIELD;
+            }
+            if (c->gwrite(c->gctx, cmd->prp1, HYPE_NVME_IDENTIFY_BYTES, c->bounce) != 0) {
+                return HYPE_NVME_SC_DATA_XFER_ERROR;
+            }
+            return HYPE_NVME_SC_SUCCESS;
+        }
+        case HYPE_NVME_ADMIN_CREATE_IO_CQ:
+            /* CDW10 low 16 = queue id. Only the one I/O pair is modelled, so anything else is refused
+             * rather than silently aliased onto it. */
+            if ((cmd->cdw10 & 0xFFFFu) != 1u) {
+                return HYPE_NVME_SC_INVALID_FIELD;
+            }
+            dev->io_cq_base = cmd->prp1;
+            return HYPE_NVME_SC_SUCCESS;
+        case HYPE_NVME_ADMIN_CREATE_IO_SQ:
+            if ((cmd->cdw10 & 0xFFFFu) != 1u) {
+                return HYPE_NVME_SC_INVALID_FIELD;
+            }
+            dev->io_sq_base = cmd->prp1;
+            return HYPE_NVME_SC_SUCCESS;
+        case HYPE_NVME_ADMIN_SET_FEATURES:
+        case HYPE_NVME_ADMIN_GET_FEATURES:
+            /* Accepted so a driver's setup sequence completes. hype has no feature whose value changes
+             * behaviour, so storing them would be state nothing consults. */
+            return HYPE_NVME_SC_SUCCESS;
+        default:
+            return HYPE_NVME_SC_INVALID_OPCODE;
+    }
+}
+
+int hype_nvme_process_sq(hype_nvme_t *dev, unsigned int qid, const hype_nvme_ctx_t *c) {
+    int processed = 0;
+    uint64_t sqb, cqb;
+
+    if (dev == 0 || c == 0 || qid >= HYPE_NVME_MAX_QUEUES || c->gread == 0 || c->gwrite == 0) {
+        return -1;
+    }
+    /* A doorbell written before CC.EN is not a command to run: the queues are not valid yet. */
+    if ((dev->csts & HYPE_NVME_CSTS_RDY) == 0u) {
+        return -1;
+    }
+    sqb = sq_base_of(dev, qid);
+    cqb = cq_base_of(dev, qid);
+    if (sqb == 0u || cqb == 0u) {
+        return -1; /* the guest has not told hype where this queue is */
+    }
+
+    while (dev->sq_head[qid] != dev->sq_tail[qid]) {
+        uint8_t sqe[HYPE_NVME_SQE_BYTES];
+        uint8_t cqe[HYPE_NVME_CQE_BYTES];
+        hype_nvme_cmd_t cmd;
+        uint16_t status;
+        uint8_t phase;
+        uint64_t cqe_gpa;
+
+        if (c->gread(c->gctx, sqb + (uint64_t)dev->sq_head[qid] * HYPE_NVME_SQE_BYTES,
+                     HYPE_NVME_SQE_BYTES, sqe) != 0) {
+            /* Cannot even fetch the command; stop rather than advance past it. Advancing would lose the
+             * command silently, and the guest would wait forever for a completion. */
+            return processed;
+        }
+        hype_nvme_sqe_decode(sqe, &cmd);
+
+        /*
+         * Consume the entry BEFORE executing it. The sq_head reported in the completion must reflect
+         * that this slot is free, and doing it after would let a driver see a completion while still
+         * believing its queue full.
+         */
+        dev->sq_head[qid]++;
+        if (dev->sq_head[qid] >= HYPE_NVME_QUEUE_ENTRIES) {
+            dev->sq_head[qid] = 0;
+        }
+
+        if (qid == 0u) {
+            status = exec_admin(dev, &cmd, c);
+        } else {
+            status = hype_nvme_exec_io(&cmd, c->be, c->total_sectors, c->page_size, c->gread,
+                                       c->gwrite, c->gctx, c->bounce, c->bounce_len);
+        }
+
+        /* Post the completion. The phase comes from the advance, so it is stamped by the one function
+         * that owns the wrap rule. */
+        cqe_gpa = cqb + (uint64_t)dev->cq_tail[qid] * HYPE_NVME_CQE_BYTES;
+        phase = hype_nvme_cq_advance(dev, qid);
+        hype_nvme_cqe_build(cqe, cmd.cid, (uint16_t)dev->sq_head[qid], (uint16_t)qid, phase, status);
+        if (c->gwrite(c->gctx, cqe_gpa, HYPE_NVME_CQE_BYTES, cqe) != 0) {
+            return processed; /* the guest's CQ is unreachable -- nothing useful left to do */
+        }
+        processed++;
+    }
+    return processed;
 }
