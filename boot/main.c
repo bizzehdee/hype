@@ -12507,8 +12507,11 @@ static int fw_1_resolve_media_stream(unsigned vi) {
         if (media_use_dev(didx) != 0) {
             continue;
         }
-        /* #346: 5s budget + read-count instrumentation, per device. */
-        scan_budget_arm(5u);
+        /* #346: time budget + read-count instrumentation, per device. The USB boot medium gets
+         * 30s: the real-HW run measured ~0.57ms/read and the FAT chain walk of an 800MB ISO
+         * needs ~33k reads (~19s) -- a 5s budget skipped the very device carrying the media.
+         * Non-boot devices keep 5s; the real cure (batching the FAT reads) is #347. */
+        scan_budget_arm(hype_streq(g_media.bus, "usb") ? 30u : 5u);
         for (pidx = 1u; pidx <= 4u && !have_file; pidx++) {
             if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
                 continue;
