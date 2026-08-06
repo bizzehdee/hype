@@ -65,6 +65,10 @@ make -C "$REPO_ROOT" EXTRA_CFLAGS="$EXTRA_CFLAGS"
 echo "make-usb-package.sh: writing directory tree to $OUT_DIR..."
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/EFI/BOOT"
+# #348: pre-allocate the log LARGE. hype's post-EBS FAT writer is in-place-only, so the log's
+# capacity is the file's creation-time cluster chain -- a small or absent file silently truncates
+# every run's diagnostics (this cost most of the 2026-08-06 hardware runs). 8MB outlasts any boot.
+dd if=/dev/zero of="$OUT_DIR/HYPEFULL.LOG" bs=1M count=8 status=none
 cp "$REPO_ROOT/build/hype.efi" "$OUT_DIR/EFI/BOOT/BOOTX64.EFI"
 cp "$SCRIPT_DIR/usb-package-README.md" "$OUT_DIR/README.md"
 # FW-1: hype.efi reads its own vendored guest firmware pair from
