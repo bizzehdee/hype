@@ -7565,6 +7565,11 @@ static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
         if (media_use_dev(didx) != 0) {
             continue;
         }
+        /* #346: flush BEFORE probing each device. The periodic log drain only starts at guest
+         * dispatch, so when this scan wedged on a real device the file held nothing past
+         * usb-log setup -- two hardware runs were diagnosable only by photographing the
+         * screen. A flush here bounds the blind window to one device probe. */
+        usb_log_flush();
         for (pidx = 1u; pidx <= 4u && fs == 0; pidx++) {
             if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
                 continue;

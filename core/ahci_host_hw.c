@@ -247,6 +247,15 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
     /* Wait for the device to be ready (not BSY, no DRQ) before issuing. */
     if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
         rc = -1;
+        /* #346: this branch wedged silently too -- the 2026-08-06 run 3 photo shows completed
+         * reads then nothing, with no CI-timeout line, so the stall can be HERE. Same
+         * latch+dump as the CI branch below. */
+        g_dead = 1; g_dead_abar = abar_phys; g_dead_port = port;
+        hype_debug_print("ahci-rd: DEVICE NEVER READY port %u lba=%llu -- tfd=0x%x serr=0x%x; "
+                         "marking device DEAD, boot continues without it (#346)\n",
+                         port, (unsigned long long)lba,
+                         (unsigned)rd32(pb, HYPE_AHCI_PREG_TFD),
+                         (unsigned)rd32(pb, HYPE_AHCI_PREG_SERR));
     } else {
         if (trace) {
             hype_debug_print("ahci-rd[%u] ready, issuing\n", dbg);
