@@ -319,6 +319,157 @@ static void test_identify_namespace_block_size_is_a_power_of_two(void) {
 }
 
 
+/* ---- slice 3: PRP walking ---- */
+
+/* A fake guest memory holding PRP lists. Entry i of the list at LIST_BASE describes page i. */
+#define PRP_PAGE 4096u
+#define LIST_BASE 0x70000ull
+#define LIST2_BASE 0x80000ull
+static uint64_t g_list[512];
+static uint64_t g_list2[512];
+static int g_list_read_fails = 0;
+
+static int fake_guest_read(void *ctx, uint64_t gpa, uint32_t len, void *dst) {
+    (void)ctx;
+    if (g_list_read_fails) {
+        return -1;
+    }
+    if (len != 8u) {
+        return -1;
+    }
+    if (gpa >= LIST_BASE && gpa < LIST_BASE + sizeof(g_list)) {
+        memcpy(dst, (const uint8_t *)g_list + (gpa - LIST_BASE), 8);
+        return 0;
+    }
+    if (gpa >= LIST2_BASE && gpa < LIST2_BASE + sizeof(g_list2)) {
+        memcpy(dst, (const uint8_t *)g_list2 + (gpa - LIST2_BASE), 8);
+        return 0;
+    }
+    return -1;
+}
+
+static void test_prp_single_page_with_offset(void) {
+    hype_nvme_prp_iter_t it;
+    uint64_t gpa; uint32_t len;
+
+    /* PRP1 may be offset into its page; the first segment runs to the END of that page only. */
+    CHECK_HEX("init", 0, hype_nvme_prp_init(&it, 0x1000u + 512u, 0, 1024u, PRP_PAGE));
+    CHECK_HEX("one segment", 1, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+    CHECK_HEX("  at the offset address", 0x1200u, gpa);
+    CHECK_HEX("  covering the whole request", 1024u, len);
+    CHECK_HEX("then done", 0, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+}
+
+static void test_prp_first_segment_stops_at_the_page_end(void) {
+    hype_nvme_prp_iter_t it;
+    uint64_t gpa; uint32_t len;
+
+    /* Offset 3584 in the page leaves 512 bytes; the rest must come from PRP2, NOT by running past the
+     * end of PRP1's page -- which is the mistake that would read the guest's next page. */
+    CHECK_HEX("init", 0, hype_nvme_prp_init(&it, 0x2000u + 3584u, 0x9000u, 1024u, PRP_PAGE));
+    CHECK_HEX("seg0", 1, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+    CHECK_HEX("  stops at the page boundary", 512u, len);
+    CHECK_HEX("seg1", 1, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+    CHECK_HEX("  comes from PRP2", 0x9000u, gpa);
+    CHECK_HEX("  with the remainder", 512u, len);
+    CHECK_HEX("done", 0, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+}
+
+static void test_prp2_is_a_data_page_when_the_transfer_is_small(void) {
+    hype_nvme_prp_iter_t it;
+    uint64_t gpa; uint32_t len;
+
+    /* Exactly two pages: PRP2 IS the second data page, not a list. Misreading it as a list would read
+     * addresses out of the guest's data. */
+    CHECK_HEX("init", 0, hype_nvme_prp_init(&it, 0x3000u, 0x4000u, 2u * PRP_PAGE, PRP_PAGE));
+    CHECK_HEX("seg0", 1, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+    CHECK_HEX("  full page", PRP_PAGE, len);
+    CHECK_HEX("seg1", 1, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+    CHECK_HEX("  is PRP2 itself", 0x4000u, gpa);
+    CHECK_HEX("  full page", PRP_PAGE, len);
+    CHECK_HEX("done", 0, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+}
+
+static void test_prp2_is_a_list_when_the_transfer_is_larger(void) {
+    hype_nvme_prp_iter_t it;
+    uint64_t gpa; uint32_t len;
+    unsigned i;
+
+    for (i = 0; i < 512u; i++) {
+        g_list[i] = 0x100000ull + (uint64_t)i * PRP_PAGE;
+    }
+    /* Three pages: PRP1 + two entries from the LIST. Treating PRP2 as data here would write file
+     * contents over the guest's PRP list. */
+    CHECK_HEX("init", 0, hype_nvme_prp_init(&it, 0x3000u, LIST_BASE, 3u * PRP_PAGE, PRP_PAGE));
+    CHECK_HEX("seg0 is PRP1", 1, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+    CHECK_HEX("  PRP1 address", 0x3000u, gpa);
+    CHECK_HEX("seg1 from the list", 1, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+    CHECK_HEX("  list entry 0", 0x100000ull, gpa);
+    CHECK_HEX("seg2 from the list", 1, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+    CHECK_HEX("  list entry 1", 0x101000ull, gpa);
+    CHECK_HEX("done", 0, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+}
+
+static void test_prp_list_chains_at_the_last_slot(void) {
+    hype_nvme_prp_iter_t it;
+    uint64_t gpa; uint32_t len;
+    unsigned i, segs = 0;
+    unsigned entries_per_page = PRP_PAGE / 8u;   /* 512 */
+    /* One list page describes entries_per_page-1 data pages, then chains. */
+    uint64_t total = (uint64_t)PRP_PAGE * (uint64_t)(entries_per_page + 4u);
+
+    for (i = 0; i < entries_per_page; i++) {
+        g_list[i] = 0x200000ull + (uint64_t)i * PRP_PAGE;
+        g_list2[i] = 0x900000ull + (uint64_t)i * PRP_PAGE;
+    }
+    /* The LAST slot of list 1 chains to list 2 rather than describing data. */
+    g_list[entries_per_page - 1u] = LIST2_BASE;
+
+    CHECK_HEX("init", 0, hype_nvme_prp_init(&it, 0x3000u, LIST_BASE, total, PRP_PAGE));
+    while (hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len) == 1) {
+        segs++;
+        if (segs > entries_per_page + 16u) {
+            break; /* runaway guard */
+        }
+    }
+    /* PRP1 plus every page the two lists describe: the chain must have been followed, otherwise the
+     * walk stops early and the tail of the transfer silently never happens. */
+    CHECK_HEX("the whole transfer was covered", 0u, (unsigned)(it.remaining != 0));
+    CHECK_HEX("segments = 1 (PRP1) + the rest", entries_per_page + 4u, segs);
+}
+
+static void test_prp_refuses_malformed_descriptors(void) {
+    hype_nvme_prp_iter_t it;
+    uint64_t gpa; uint32_t len;
+
+    CHECK_HEX("zero length refused", -1, hype_nvme_prp_init(&it, 0x1000u, 0, 0u, PRP_PAGE));
+    CHECK_HEX("non-power-of-two page refused", -1,
+              hype_nvme_prp_init(&it, 0x1000u, 0, 512u, 3000u));
+    CHECK_HEX("NULL iterator refused", -1, hype_nvme_prp_init(0, 0x1000u, 0, 512u, PRP_PAGE));
+
+    /* A MISALIGNED continuation PRP is refused, not masked: the spec requires alignment, so a
+     * misaligned entry means the list is not what hype thinks it is, and continuing would scatter the
+     * transfer across addresses the guest never nominated. */
+    CHECK_HEX("init", 0, hype_nvme_prp_init(&it, 0x3000u, 0x4001u, 2u * PRP_PAGE, PRP_PAGE));
+    (void)hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len);
+    CHECK_HEX("misaligned PRP2 refused", -1, hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+
+    /* A failed guest read of a list entry must propagate, not silently end the transfer. */
+    g_list[0] = 0x100000ull;
+    CHECK_HEX("init list", 0, hype_nvme_prp_init(&it, 0x3000u, LIST_BASE, 3u * PRP_PAGE, PRP_PAGE));
+    (void)hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len);
+    g_list_read_fails = 1;
+    CHECK_HEX("a failed list read is an error", -1,
+              hype_nvme_prp_next(&it, fake_guest_read, 0, &gpa, &len));
+    g_list_read_fails = 0;
+
+    /* Walking a list with no reader is an error rather than a wild dereference. */
+    CHECK_HEX("init list", 0, hype_nvme_prp_init(&it, 0x3000u, LIST_BASE, 3u * PRP_PAGE, PRP_PAGE));
+    (void)hype_nvme_prp_next(&it, 0, 0, &gpa, &len);
+    CHECK_HEX("no reader refused", -1, hype_nvme_prp_next(&it, 0, 0, &gpa, &len));
+}
+
+
 int main(void) {
     test_phase_starts_at_one();
     test_phase_toggles_only_on_wrap();
@@ -334,6 +485,12 @@ int main(void) {
     test_cqe_status_does_not_collide_with_phase();
     test_identify_controller();
     test_identify_namespace_block_size_is_a_power_of_two();
+    test_prp_single_page_with_offset();
+    test_prp_first_segment_stops_at_the_page_end();
+    test_prp2_is_a_data_page_when_the_transfer_is_small();
+    test_prp2_is_a_list_when_the_transfer_is_larger();
+    test_prp_list_chains_at_the_last_slot();
+    test_prp_refuses_malformed_descriptors();
 
     if (failures == 0) {
         printf("all tests passed\n");

@@ -264,3 +264,122 @@ void hype_nvme_identify_namespace(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], uint64_
     put_le16(buf + 128, 0u);
     buf[130] = 9u;
 }
+
+/* ---- slice 3: PRP walking (#202) -------------------------------------------------------------- */
+
+int hype_nvme_prp_init(hype_nvme_prp_iter_t *it, uint64_t prp1, uint64_t prp2, uint64_t total_len,
+                       uint32_t page_size) {
+    uint64_t first_len;
+
+    if (it == 0 || total_len == 0u || page_size == 0u || (page_size & (page_size - 1u)) != 0u) {
+        return -1;
+    }
+    it->prp1 = prp1;
+    it->prp2 = prp2;
+    it->page_size = page_size;
+    it->remaining = total_len;
+    it->first = 1;
+    it->list_gpa = 0;
+    it->list_left = 0;
+
+    /*
+     * PRP1 covers from its offset to the end of its page. Whether PRP2 is a data page or a LIST follows
+     * from what is left after that -- decided once, here, so no segment has to guess.
+     */
+    first_len = (uint64_t)page_size - (prp1 & ((uint64_t)page_size - 1u));
+    if (first_len > total_len) {
+        first_len = total_len;
+    }
+    it->using_list = ((total_len - first_len) > (uint64_t)page_size) ? 1 : 0;
+    if (it->using_list) {
+        it->list_gpa = prp2;
+        /* Entries per list page, minus one: the LAST slot chains to the next list rather than
+         * describing data. */
+        it->list_left = (page_size / 8u) - 1u;
+    }
+    return 0;
+}
+
+int hype_nvme_prp_next(hype_nvme_prp_iter_t *it, hype_nvme_guest_read_fn read_fn, void *ctx,
+                       uint64_t *out_gpa, uint32_t *out_len) {
+    uint64_t page_mask;
+    uint64_t gpa;
+    uint64_t seg;
+
+    if (it == 0 || out_gpa == 0 || out_len == 0) {
+        return -1;
+    }
+    if (it->remaining == 0u) {
+        return 0;
+    }
+    page_mask = (uint64_t)it->page_size - 1u;
+
+    if (it->first) {
+        it->first = 0;
+        gpa = it->prp1;
+        seg = (uint64_t)it->page_size - (gpa & page_mask); /* only PRP1 may be offset into its page */
+        if (seg > it->remaining) {
+            seg = it->remaining;
+        }
+        it->remaining -= seg;
+        *out_gpa = gpa;
+        *out_len = (uint32_t)seg;
+        return 1;
+    }
+
+    if (!it->using_list) {
+        /* PRP2 IS the second (and final) data page for a transfer this small. */
+        gpa = it->prp2;
+        if ((gpa & page_mask) != 0u) {
+            return -1; /* continuation PRPs must be page-aligned -- refuse, do not mask */
+        }
+        seg = it->remaining;
+        if (seg > (uint64_t)it->page_size) {
+            return -1; /* would mean init mis-decided; fail loudly rather than truncate */
+        }
+        it->remaining = 0;
+        *out_gpa = gpa;
+        *out_len = (uint32_t)seg;
+        return 1;
+    }
+
+    /* Walking a PRP list: read one 8-byte entry at a time from guest memory. */
+    if (read_fn == 0) {
+        return -1;
+    }
+    if (it->list_left == 0u) {
+        /*
+         * The last slot of a list page chains to the next list page. Follow it rather than treating it
+         * as data -- doing the latter would write file contents over the guest's own PRP list.
+         */
+        uint8_t chain[8];
+        if (read_fn(ctx, it->list_gpa, 8u, chain) != 0) {
+            return -1;
+        }
+        it->list_gpa = le64(chain);
+        if ((it->list_gpa & page_mask) != 0u) {
+            return -1;
+        }
+        it->list_left = (it->page_size / 8u) - 1u;
+    }
+    {
+        uint8_t ent[8];
+        if (read_fn(ctx, it->list_gpa, 8u, ent) != 0) {
+            return -1;
+        }
+        gpa = le64(ent);
+        if ((gpa & page_mask) != 0u) {
+            return -1;
+        }
+        it->list_gpa += 8u;
+        it->list_left--;
+        seg = it->remaining;
+        if (seg > (uint64_t)it->page_size) {
+            seg = (uint64_t)it->page_size;
+        }
+        it->remaining -= seg;
+        *out_gpa = gpa;
+        *out_len = (uint32_t)seg;
+        return 1;
+    }
+}

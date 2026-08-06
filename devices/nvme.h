@@ -182,4 +182,61 @@ void hype_nvme_identify_controller(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], const 
  */
 void hype_nvme_identify_namespace(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], uint64_t total_sectors);
 
+
+/* ---- slice 3: PRP walking (#202) -------------------------------------------------------------- */
+
+/*
+ * NVMe describes a transfer's guest buffers with PRPs (Physical Region Pages), and the rules are
+ * asymmetric in a way that is easy to get subtly wrong:
+ *
+ *   - PRP1 may carry a byte OFFSET within its page; every subsequent PRP must be page-aligned.
+ *   - If the transfer fits in PRP1 plus one more page, PRP2 IS that page.
+ *   - Otherwise PRP2 points at a PRP LIST: an array of 8-byte page addresses in guest memory, whose
+ *     LAST entry chains to a further list when one page of entries is not enough.
+ *
+ * Those two meanings of PRP2 are the trap: treating a list pointer as a data page writes the guest's
+ * PRP list full of file contents, and treating a data page as a list reads addresses out of data. Both
+ * corrupt guest memory rather than failing, which is why this is a separate iterator with its own
+ * tests rather than inline arithmetic.
+ *
+ * The iterator is pure: reading list entries from guest memory is an injected callback, so the whole
+ * thing is testable with no VM.
+ */
+
+/* Reads `len` bytes of guest physical memory. Returns 0 on success. The implementation is expected to
+ * BOUNDS-CHECK gpa+len against the VM's mapped range (VALID-3) and refuse otherwise. */
+typedef int (*hype_nvme_guest_read_fn)(void *ctx, uint64_t gpa, uint32_t len, void *dst);
+
+typedef struct {
+    uint64_t prp1;
+    uint64_t prp2;
+    uint32_t page_size;
+    uint64_t remaining;   /* bytes of the transfer not yet yielded */
+    int first;            /* PRP1 has not been consumed yet */
+    int using_list;       /* PRP2 is a list pointer rather than a data page */
+    uint64_t list_gpa;    /* address of the next list ENTRY to read */
+    unsigned int list_left; /* entries remaining in the current list page before it chains */
+} hype_nvme_prp_iter_t;
+
+/*
+ * Prepares an iterator for a `total_len`-byte transfer. Returns 0, or -1 if the request is malformed
+ * (zero length, or a page size that is not a power of two).
+ *
+ * Whether PRP2 is a data page or a list is decided HERE, once, from the length -- not guessed per
+ * segment.
+ */
+int hype_nvme_prp_init(hype_nvme_prp_iter_t *it, uint64_t prp1, uint64_t prp2, uint64_t total_len,
+                       uint32_t page_size);
+
+/*
+ * Yields the next contiguous guest segment. Returns 1 when a segment was produced, 0 when the transfer
+ * is complete, and -1 on a malformed descriptor or a failed list read.
+ *
+ * A misaligned continuation PRP is a REFUSAL, not something to mask off: the spec requires alignment,
+ * so a misaligned entry means the list is not what hype thinks it is, and continuing would scatter the
+ * transfer over addresses the guest never nominated.
+ */
+int hype_nvme_prp_next(hype_nvme_prp_iter_t *it, hype_nvme_guest_read_fn read_fn, void *ctx,
+                       uint64_t *out_gpa, uint32_t *out_len);
+
 #endif /* HYPE_DEVICES_NVME_H */
