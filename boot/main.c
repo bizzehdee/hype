@@ -7168,6 +7168,8 @@ static int fw_1_vblk_use_physical_ahci(hype_fw_vm_t *vm) {
 static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
 static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src);
 static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
+static void scan_budget_arm(unsigned secs);   /* #346 */
+static void scan_budget_disarm(void);
 
 /*
  * #321: THE host block device hype reads guest media and file-backed guest disk images from.
@@ -7570,6 +7572,7 @@ static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
          * usb-log setup -- two hardware runs were diagnosable only by photographing the
          * screen. A flush here bounds the blind window to one device probe. */
         usb_log_flush();
+        scan_budget_arm(5u); /* #346: same 5s per-device budget as the ISO scan */
         for (pidx = 1u; pidx <= 4u && fs == 0; pidx++) {
             if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
                 continue;
@@ -7584,6 +7587,7 @@ static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
             }
         }
     }
+    scan_budget_disarm(); /* #346 */
     if (fs == 0) {
         /*
          * #285: a path the operator explicitly named and hype could not find is an error, not a
@@ -12279,9 +12283,56 @@ static void media_select_nvme(void) {
 /* GLADDER-10 streaming: hostdisk_read() adapts the selected media device to the
  * (ctx, lba, count, dst) callback that core/gpt.c and core/iso_stream.c expect.
  * Disk-absolute: LBA 0 is the start of the device. */
+/*
+ * #346: the media-scan TIME budget, enforced at the READ so a single resolver walk is bounded.
+ *
+ * Every walk in the resolvers is iteration-guarded (2^20 steps), which is instant at QEMU's
+ * microsecond reads and 10-17 MINUTES per exhausted guard at a real AHCI device's ~1ms -- so a
+ * real disk turned boot into tens of minutes of individually-valid reads (four hardware runs,
+ * finally isolated by a byte-faithful replica that CLEARED content as the cause). A budget
+ * check between resolver calls cannot bound that: one call is the long pole. The read callback
+ * is the single point every walk passes through, and every resolver already treats a failed
+ * read as a clean refusal -- so an expired budget here unwinds the whole scan naturally.
+ *
+ * g_scan_reads counts reads per phase (instrumentation: the next hardware log quantifies the
+ * crawl instead of us inferring it from a frozen screen).
+ */
+static uint64_t g_scan_deadline_tsc; /* 0 = no budget armed */
+static uint64_t g_scan_reads;
+static int g_scan_deadline_hit;
+
+static int scan_budget_expired(void) {
+    if (g_scan_deadline_tsc == 0u) {
+        return 0;
+    }
+    g_scan_reads++;
+    if (hype_rdtsc() <= g_scan_deadline_tsc) {
+        return 0;
+    }
+    if (!g_scan_deadline_hit) {
+        g_scan_deadline_hit = 1;
+        hype_serial_print("media-scan: TIME BUDGET EXPIRED after %llu reads -- skipping this "
+                          "device; a slow/huge filesystem must not stall boot (#346)\n",
+                          (unsigned long long)g_scan_reads);
+        usb_log_flush();
+    }
+    return 1;
+}
+
+static void scan_budget_arm(unsigned secs) {
+    uint64_t hz = g_vms[0].host_tsc_hz ? g_vms[0].host_tsc_hz : 2000000000ULL;
+    g_scan_deadline_tsc = hype_rdtsc() + (uint64_t)secs * hz;
+    g_scan_reads = 0;
+    g_scan_deadline_hit = 0;
+}
+
+static void scan_budget_disarm(void) {
+    g_scan_deadline_tsc = 0;
+}
+
 static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
-    if (!media_present()) {
+    if (!media_present() || scan_budget_expired()) {
         return -1;
     }
     return g_media.read(g_media.ctx, lba, count, dst);
@@ -12309,7 +12360,7 @@ static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *s
  * first LBA so the same device backs both this and the disk-absolute hostdisk_read(). */
 static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
-    if (!media_present()) {
+    if (!media_present() || scan_budget_expired()) {
         return -1;
     }
     return g_media.read(g_media.ctx, g_media.part_base_lba + lba, count, dst);
@@ -12456,6 +12507,8 @@ static int fw_1_resolve_media_stream(unsigned vi) {
         if (media_use_dev(didx) != 0) {
             continue;
         }
+        /* #346: 5s budget + read-count instrumentation, per device. */
+        scan_budget_arm(5u);
         for (pidx = 1u; pidx <= 4u && !have_file; pidx++) {
             if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
                 continue;
@@ -12491,6 +12544,13 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                 have_file = 1;
             }
         }
+        /* #346: per-device probe cost, printed + flushed even when nothing resolved -- the next
+         * hardware log quantifies the crawl instead of a frozen screen implying it. */
+        hype_debug_print("media-scan: vm%u dev %u (%s) probed -- %llu reads%s\n", vi, didx,
+                         g_media.bus, (unsigned long long)g_scan_reads,
+                         g_scan_deadline_hit ? " [BUDGET EXPIRED -- device skipped]" : "");
+        scan_budget_disarm();
+        usb_log_flush();
         } /* #324: end device loop -- the log lines above name the bus via g_media.bus */
         /*
          * #327: any number of extents up to the resolvers' cap, not just one.
@@ -12570,6 +12630,9 @@ static int fw_1_resolve_media_stream(unsigned vi) {
             continue; /* #323 */
         }
         (void)media_use_dev(rdev);
+        /* #346: fresh budget for the raw-partition probe -- a stale armed deadline from an
+         * earlier scan phase falsely clipped this probe after 3 reads in QEMU validation. */
+        scan_budget_arm(5u);
     if (!g_vms[vi].iso_stream_ready) {
         hype_gpt_partition_t iso_part;
         if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
@@ -12599,6 +12662,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
             }
         }
     }
+    scan_budget_disarm(); /* #346: never leave a deadline armed past the scan phase */
     } /* #324: end raw-partition device loop */
     return g_vms[vi].iso_stream_ready;
 }
