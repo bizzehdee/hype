@@ -769,9 +769,14 @@ static void put_sqe(uint64_t base, unsigned slot, uint8_t op, uint16_t cid, uint
     p[4] = (uint8_t)(nsid & 0xFFu);
     p[24] = (uint8_t)(prp1 & 0xFFu); p[25] = (uint8_t)((prp1 >> 8) & 0xFFu);
     p[26] = (uint8_t)((prp1 >> 16) & 0xFFu); p[27] = (uint8_t)((prp1 >> 24) & 0xFFu);
+    /* All FOUR bytes of each dword. The first version of this helper wrote only the low two, which
+     * silently dropped QSIZE (CDW10 bits 31:16) and made the slice-6c tests fail against correct code. */
     p[40] = (uint8_t)(cdw10 & 0xFFu); p[41] = (uint8_t)((cdw10 >> 8) & 0xFFu);
-    p[44] = (uint8_t)(cdw11 & 0xFFu);
+    p[42] = (uint8_t)((cdw10 >> 16) & 0xFFu); p[43] = (uint8_t)((cdw10 >> 24) & 0xFFu);
+    p[44] = (uint8_t)(cdw11 & 0xFFu); p[45] = (uint8_t)((cdw11 >> 8) & 0xFFu);
+    p[46] = (uint8_t)((cdw11 >> 16) & 0xFFu); p[47] = (uint8_t)((cdw11 >> 24) & 0xFFu);
     p[48] = (uint8_t)(cdw12 & 0xFFu); p[49] = (uint8_t)((cdw12 >> 8) & 0xFFu);
+    p[50] = (uint8_t)((cdw12 >> 16) & 0xFFu); p[51] = (uint8_t)((cdw12 >> 24) & 0xFFu);
 }
 
 static uint16_t cqe_status_at(uint64_t base, unsigned slot) {
@@ -852,8 +857,15 @@ static void test_io_command_end_to_end_through_the_processor(void) {
     /* The guest must create its I/O queues before using them; without that the processor refuses. */
     CHECK_HEX("an I/O queue with no base is refused", -1, hype_nvme_process_sq(&d, 1u, &c));
 
-    put_sqe(ASQ_BASE, 0, HYPE_NVME_ADMIN_CREATE_IO_CQ, 1u, 0, IOCQ_BASE, 1u, 0, 0);
-    put_sqe(ASQ_BASE, 1, HYPE_NVME_ADMIN_CREATE_IO_SQ, 2u, 0, IOSQ_BASE, 1u, 0, 0);
+    /*
+     * QSIZE (CDW10 31:16, zero-based) must be stated: a CREATE_IO_* with QSIZE 0 asks for a ONE-entry
+     * queue, which is degenerate -- head == tail means empty, so a single-entry queue can never signal
+     * work. This test previously omitted it and only worked because the helper truncated CDW10.
+     */
+    put_sqe(ASQ_BASE, 0, HYPE_NVME_ADMIN_CREATE_IO_CQ, 1u, 0, IOCQ_BASE,
+            ((HYPE_NVME_QUEUE_ENTRIES - 1u) << 16) | 1u, 0, 0);
+    put_sqe(ASQ_BASE, 1, HYPE_NVME_ADMIN_CREATE_IO_SQ, 2u, 0, IOSQ_BASE,
+            ((HYPE_NVME_QUEUE_ENTRIES - 1u) << 16) | 1u, 0, 0);
     hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 2u);
     CHECK_HEX("two admin commands processed", 2, hype_nvme_process_sq(&d, 0u, &c));
     CHECK_HEX("CQ created", HYPE_NVME_SC_SUCCESS, cqe_status_at(ACQ_BASE, 0));
@@ -1054,6 +1066,106 @@ static void test_processor_needs_queue_bases(void) {
 }
 
 
+/* ---- slice 6c: guest-declared queue sizes ---- */
+
+static void test_admin_queue_size_from_aqa_is_honoured(void) {
+    hype_nvme_t d;
+    unsigned i;
+
+    hype_nvme_reset(&d);
+    CHECK_HEX("defaults to the advertised maximum", HYPE_NVME_QUEUE_ENTRIES, d.sq_entries[0]);
+
+    /* AQA: ASQS in 11:0, ACQS in 27:16, both ZERO-BASED. 16 and 8 entries. */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_AQA, (7u << 16) | 15u);
+    CHECK_HEX("admin SQ size decoded (zero-based +1)", 16u, d.sq_entries[0]);
+    CHECK_HEX("admin CQ size decoded", 8u, d.cq_entries[0]);
+
+    /*
+     * THE bug this slice fixes. With an 8-entry completion queue, the producer must wrap at 8. Wrapping
+     * at hype's own 64 would write completion entries into guest memory PAST the end of the queue the
+     * guest allocated -- addresses still inside the VM, so the bounds check never fires. Silent
+     * corruption of the guest's own heap.
+     */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_CC, HYPE_NVME_CC_EN);
+    for (i = 0; i < 8u; i++) {
+        CHECK_HEX("first lap of an 8-entry CQ is phase 1", 1u, hype_nvme_cq_advance(&d, 0u));
+    }
+    CHECK_HEX("wrapped at EIGHT, not 64", 0u, d.cq_tail[0]);
+    CHECK_HEX("and the phase toggled there", 0u, hype_nvme_cq_advance(&d, 0u));
+
+    /* A guest may not ask for more than CAP.MQES advertises. */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_AQA, (4095u << 16) | 4095u);
+    CHECK_HEX("an over-large ASQS is clamped", HYPE_NVME_QUEUE_ENTRIES, d.sq_entries[0]);
+    CHECK_HEX("an over-large ACQS is clamped", HYPE_NVME_QUEUE_ENTRIES, d.cq_entries[0]);
+}
+
+static void test_doorbell_is_bounded_by_the_declared_size(void) {
+    hype_nvme_t d;
+
+    hype_nvme_reset(&d);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_AQA, (15u << 16) | 15u); /* 16 entries each */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_CC, HYPE_NVME_CC_EN);
+
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 15u);
+    CHECK_HEX("the last valid index is accepted", 15u, d.sq_tail[0]);
+    /*
+     * 60 is in range for hype's compile-time maximum and FAR outside a 16-entry queue. Checking the
+     * constant instead of the declared size is what let this through.
+     */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 60u);
+    CHECK_HEX("an index past the DECLARED size is refused", 15u, d.sq_tail[0]);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 16u);
+    CHECK_HEX("one past the end is refused too", 15u, d.sq_tail[0]);
+}
+
+static void test_io_queue_size_from_qsize_is_honoured(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+    unsigned i;
+
+    io_backend(&be);
+    enable_with_admin_queues(&d);
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+
+    /* CREATE_IO_CQ/SQ carry QSIZE in CDW10 bits 31:16, zero-based -- the I/O counterpart of AQA, and
+     * ignored by the same defect. Ask for 4 entries. */
+    put_sqe(ASQ_BASE, 0, HYPE_NVME_ADMIN_CREATE_IO_CQ, 1u, 0, IOCQ_BASE, (3u << 16) | 1u, 0, 0);
+    put_sqe(ASQ_BASE, 1, HYPE_NVME_ADMIN_CREATE_IO_SQ, 2u, 0, IOSQ_BASE, (3u << 16) | 1u, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 2u);
+    CHECK_HEX("both created", 2, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("I/O CQ size honoured", 4u, d.cq_entries[1]);
+    CHECK_HEX("I/O SQ size honoured", 4u, d.sq_entries[1]);
+
+    /* The I/O completion queue must now wrap at 4. */
+    for (i = 0; i < 4u; i++) {
+        (void)hype_nvme_cq_advance(&d, 1u);
+    }
+    CHECK_HEX("I/O CQ wrapped at four", 0u, d.cq_tail[1]);
+
+    /* And its doorbell is bounded by 4, not 64. */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE + 8u, 3u);
+    CHECK_HEX("index 3 accepted", 3u, d.sq_tail[1]);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE + 8u, 10u);
+    CHECK_HEX("index 10 refused on a 4-entry queue", 3u, d.sq_tail[1]);
+}
+
+static void test_reset_restores_default_queue_sizes(void) {
+    hype_nvme_t d;
+
+    hype_nvme_reset(&d);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_AQA, (3u << 16) | 3u);
+    CHECK_HEX("small sizes took effect", 4u, d.sq_entries[0]);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_CC, HYPE_NVME_CC_EN);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_CC, 0u); /* controller reset */
+    /* A reset drops the guest's declarations along with the indices: the next incarnation re-declares,
+     * and carrying a stale small size over would bound a fresh larger queue wrongly. */
+    CHECK_HEX("reset restores the default SQ size", HYPE_NVME_QUEUE_ENTRIES, d.sq_entries[0]);
+    CHECK_HEX("reset restores the default CQ size", HYPE_NVME_QUEUE_ENTRIES, d.cq_entries[0]);
+}
+
+
 int main(void) {
     test_phase_starts_at_one();
     test_phase_toggles_only_on_wrap();
@@ -1090,6 +1202,10 @@ int main(void) {
     test_admin_refusals();
     test_processor_stops_rather_than_losing_a_command();
     test_processor_needs_queue_bases();
+    test_admin_queue_size_from_aqa_is_honoured();
+    test_doorbell_is_bounded_by_the_declared_size();
+    test_io_queue_size_from_qsize_is_honoured();
+    test_reset_restores_default_queue_sizes();
 
     if (failures == 0) {
         printf("all tests passed\n");

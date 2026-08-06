@@ -16,6 +16,11 @@ void hype_nvme_reset(hype_nvme_t *dev) {
          * polling a zeroed queue. */
         dev->cq_phase[q] = 1u;
         dev->sq_head[q] = 0;
+        /* Until the guest declares a size, assume the maximum hype advertises. A guest that never sets
+         * AQA is malformed, but defaulting to the advertised MQES keeps the arithmetic in range rather
+         * than dividing by zero. */
+        dev->sq_entries[q] = HYPE_NVME_QUEUE_ENTRIES;
+        dev->cq_entries[q] = HYPE_NVME_QUEUE_ENTRIES;
     }
     dev->io_sq_base = 0;
     dev->io_cq_base = 0;
@@ -75,6 +80,8 @@ void hype_nvme_mmio_write32(hype_nvme_t *dev, uint32_t off, uint32_t value) {
                     dev->cq_tail[q] = 0;
                     dev->cq_phase[q] = 1u; /* a fresh queue is polled against phase 1 again */
                     dev->sq_head[q] = 0;
+                    dev->sq_entries[q] = HYPE_NVME_QUEUE_ENTRIES;
+                    dev->cq_entries[q] = HYPE_NVME_QUEUE_ENTRIES;
                 }
                 dev->io_sq_base = 0;
                 dev->io_cq_base = 0;
@@ -82,6 +89,20 @@ void hype_nvme_mmio_write32(hype_nvme_t *dev, uint32_t off, uint32_t value) {
             return;
         case HYPE_NVME_REG_AQA:
             dev->aqa = value;
+            /*
+             * #202 slice 6c: AQA is where the guest declares its ADMIN queue sizes -- ASQS in bits 11:0,
+             * ACQS in 27:16, both ZERO-BASED. Storing the register without acting on it (which is what
+             * this did until 6c) leaves hype wrapping at its own maximum and walking off the end of a
+             * smaller queue.
+             */
+            {
+                uint32_t asqs = (value & 0xFFFu) + 1u;
+                uint32_t acqs = ((value >> 16) & 0xFFFu) + 1u;
+                /* Clamp rather than trust: a guest may legally ask for fewer than hype supports, but
+                 * never for more than CAP.MQES advertises. */
+                dev->sq_entries[0] = (asqs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : asqs;
+                dev->cq_entries[0] = (acqs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : acqs;
+            }
             return;
         case HYPE_NVME_REG_ASQ:
             dev->asq = (dev->asq & 0xFFFFFFFF00000000ull) | (uint64_t)value;
@@ -112,7 +133,12 @@ void hype_nvme_mmio_write32(hype_nvme_t *dev, uint32_t off, uint32_t value) {
              * VALID-3: the INDEX the guest writes is bounds-checked here, not where it is used. A tail
              * beyond the queue would otherwise walk off the end of guest-supplied queue memory.
              */
-            if (value >= HYPE_NVME_QUEUE_ENTRIES) {
+            /*
+             * #202 slice 6c: bounded against THIS queue's declared size, not the compile-time maximum.
+             * Checking the constant let a guest with a 16-entry queue set a tail of 60 -- in range for
+             * hype, far outside the memory the guest actually allocated.
+             */
+            if (value >= (is_cq ? dev->cq_entries[qid] : dev->sq_entries[qid])) {
                 return; /* refuse: an out-of-range index is a guest bug, not something to wrap */
             }
             if (is_cq) {
@@ -133,7 +159,8 @@ uint8_t hype_nvme_cq_advance(hype_nvme_t *dev, unsigned int qid) {
     /* The phase stamped on THIS entry is the current one; the toggle happens on wrap, after. */
     phase = dev->cq_phase[qid];
     dev->cq_tail[qid]++;
-    if (dev->cq_tail[qid] >= HYPE_NVME_QUEUE_ENTRIES) {
+    /* Wrap where the GUEST's queue ends (6c), not where hype's maximum does. */
+    if (dev->cq_tail[qid] >= dev->cq_entries[qid]) {
         dev->cq_tail[qid] = 0;
         dev->cq_phase[qid] ^= 1u; /* toggle ONLY on wrap -- see the header for why */
     }
@@ -524,12 +551,22 @@ static uint16_t exec_admin(hype_nvme_t *dev, const hype_nvme_cmd_t *cmd, const h
                 return HYPE_NVME_SC_INVALID_FIELD;
             }
             dev->io_cq_base = cmd->prp1;
+            /* QSIZE is CDW10 bits 31:16, zero-based -- the I/O counterpart of AQA. Ignoring it was the
+             * same defect. */
+            {
+                uint32_t qs = ((cmd->cdw10 >> 16) & 0xFFFFu) + 1u;
+                dev->cq_entries[1] = (qs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : qs;
+            }
             return HYPE_NVME_SC_SUCCESS;
         case HYPE_NVME_ADMIN_CREATE_IO_SQ:
             if ((cmd->cdw10 & 0xFFFFu) != 1u) {
                 return HYPE_NVME_SC_INVALID_FIELD;
             }
             dev->io_sq_base = cmd->prp1;
+            {
+                uint32_t qs = ((cmd->cdw10 >> 16) & 0xFFFFu) + 1u;
+                dev->sq_entries[1] = (qs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : qs;
+            }
             return HYPE_NVME_SC_SUCCESS;
         case HYPE_NVME_ADMIN_SET_FEATURES:
         case HYPE_NVME_ADMIN_GET_FEATURES:
@@ -580,7 +617,7 @@ int hype_nvme_process_sq(hype_nvme_t *dev, unsigned int qid, const hype_nvme_ctx
          * believing its queue full.
          */
         dev->sq_head[qid]++;
-        if (dev->sq_head[qid] >= HYPE_NVME_QUEUE_ENTRIES) {
+        if (dev->sq_head[qid] >= dev->sq_entries[qid]) {
             dev->sq_head[qid] = 0;
         }
 

@@ -81,6 +81,21 @@ typedef struct {
     /* I/O queue bases, as recorded by CREATE_IO_SQ/CQ. Queue 0 uses asq/acq. */
     uint64_t io_sq_base;
     uint64_t io_cq_base;
+    /*
+     * #202 slice 6c: the number of entries the GUEST declared for each queue -- AQA for the admin pair,
+     * QSIZE (CDW10 bits 31:16) for the I/O pair.
+     *
+     * This is not cosmetic. Wrapping at a fixed HYPE_NVME_QUEUE_ENTRIES regardless of what the guest
+     * asked for means that a guest which allocates a SMALLER queue has hype read submission entries
+     * from, and write completion entries into, memory past the end of the queue it allocated. The
+     * bounds-check in the guest-memory callback does not catch it: those addresses are usually still
+     * inside the VM, just belonging to something else. Silent corruption of the guest's own heap.
+     *
+     * Both are ENTRY COUNTS here, not the zero-based encodings the registers use -- converted once at
+     * the point of decode so no consumer has to remember which convention it is holding.
+     */
+    uint32_t sq_entries[HYPE_NVME_MAX_QUEUES];
+    uint32_t cq_entries[HYPE_NVME_MAX_QUEUES];
 } hype_nvme_t;
 
 /*
