@@ -7215,6 +7215,28 @@ static hype_cfg_bus_t fw_1_target_bus(const hype_fw_vm_t *vm) {
          * behaviour of a bootable AHCI disk, since those rigs install and boot. */
         return HYPE_CFG_BUS_AHCI_SATA;
     }
+    /*
+     * #202 slice 6d: an explicit `bus` on the VM's FIRST attached [disk.*] wins.
+     *
+     * #333 documented this ordering and did not implement it: it resolved a ZEROED disk against os_hint
+     * and never looked at the disks list, so `bus = nvme` (or `ahci-sata`) in a [disk.*] entry was
+     * silently ignored while the comment said it took precedence. Found by the first config that
+     * actually asked for a non-default bus.
+     *
+     * First attached disk only: hype presents one storage front-end per VM today, so a second entry
+     * cannot be honoured -- that is #329's remaining half, and admission already refuses the cases this
+     * cannot serve.
+     */
+    if (cv->disks_count > 0u) {
+        unsigned int di;
+        for (di = 0; di < g_hype_cfg.disk_count; di++) {
+            if (term_streq(g_hype_cfg.disks[di].id, cv->disks[0])) {
+                return hype_cfg_resolve_bus(&g_hype_cfg.disks[di], cv->os_hint);
+            }
+        }
+        /* Named a disk that does not exist: admission (#329) reports it; fall through to the default
+         * rather than inventing a front-end for a device that is not there. */
+    }
     if (cv->boot == HYPE_CFG_BOOT_DISK) {
         return HYPE_CFG_BUS_AHCI_SATA;
     }
@@ -7294,6 +7316,12 @@ static int nvme_guest_write(void *ctx, uint64_t gpa, uint32_t len, const void *s
 
 /* Fills the context devices/nvme.c needs. Kept in one place so a new field cannot be forgotten at one
  * of the call sites. */
+/* #202: the real implementation of the weak hook in devices/nvme.c -- see there for why it exists. */
+void hype_nvme_report_enabled(const hype_nvme_t *dev) {
+    (void)dev;
+    hype_serial_print("fw-1: NVMe controller ENABLED by the guest driver (CC.EN set) -- it bound (#202)\n");
+}
+
 static void nvme_fill_ctx(hype_nvme_ctx_t *c, hype_fw_vm_t *vm) {
     unsigned long long i;
     unsigned char *p = (unsigned char *)c;
@@ -7959,8 +7987,14 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
         /*
          * #333: the same-backend-on-two-devices workaround is retired. It existed only because a
          * guest could not ask for AHCI; now it can, so the disk is presented ONCE.
+         *
+         * #202: report the bus that was actually RESOLVED rather than assuming "not AHCI means
+         * virtio-blk". That assumption was true when there were two front-ends and became a false log
+         * line the moment nvme became a third -- a run with bus = nvme printed both "front-end = nvme"
+         * and "front-end = virtio-blk".
          */
-        hype_debug_print("fw-1: disk front-end = virtio-blk -- no SATA disk attached (#333)\n");
+        hype_debug_print("fw-1: disk front-end = %s -- no SATA disk attached (#333)\n",
+                         (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) ? "nvme" : "virtio-blk");
     }
     /* #326: streaming is the only ISO backing there is. A VM with no media resolved gets an EMPTY
      * drive (media_size 0), which is what a real machine with an empty optical drive presents --

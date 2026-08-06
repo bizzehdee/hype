@@ -108,6 +108,10 @@ typedef struct {
  */
 void hype_nvme_reset(hype_nvme_t *dev);
 
+/* #202: called once when a guest driver sets CC.EN -- i.e. when it has actually bound this controller.
+ * Weakly defined in devices/nvme.c so the unit tests need no logging; boot/main.c provides the real one. */
+void hype_nvme_report_enabled(const hype_nvme_t *dev);
+
 /* MMIO reads/writes against BAR0. Offsets outside the modelled set read 0 and ignore writes rather
  * than faulting: a driver probing for optional features must not take the VM down. */
 uint32_t hype_nvme_mmio_read32(const hype_nvme_t *dev, uint32_t off);

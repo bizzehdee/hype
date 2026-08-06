@@ -1,5 +1,13 @@
 #include "nvme.h"
 
+/*
+ * #202: an optional one-shot notification that a guest enabled the controller. Defined weakly so this
+ * module stays pure and unit-testable with no logging dependency -- boot/main.c overrides it.
+ */
+__attribute__((weak)) void hype_nvme_report_enabled(const hype_nvme_t *dev) {
+    (void)dev;
+}
+
 void hype_nvme_reset(hype_nvme_t *dev) {
     unsigned int q;
 
@@ -70,6 +78,15 @@ void hype_nvme_mmio_write32(hype_nvme_t *dev, uint32_t off, uint32_t value) {
              * re-creates queues would otherwise inherit stale tails and read the wrong entries.
              */
             if ((value & HYPE_NVME_CC_EN) != 0u) {
+                /*
+                 * #202: a guest driver setting CC.EN is the moment it has BOUND this controller -- it is
+                 * the only externally visible proof that enumeration succeeded, and per #335 the failure
+                 * mode without it is a silent spin to timeout rather than an error. Reported once so a
+                 * boot log answers "did the driver find it" without tracing every register.
+                 */
+                if ((dev->csts & HYPE_NVME_CSTS_RDY) == 0u) {
+                    hype_nvme_report_enabled(dev);
+                }
                 dev->csts |= HYPE_NVME_CSTS_RDY;
             } else {
                 unsigned int q;
