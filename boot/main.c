@@ -7193,6 +7193,34 @@ static hype_cfg_bus_t fw_1_target_bus(const hype_fw_vm_t *vm) {
     return hype_cfg_resolve_bus(&d, cv->os_hint);
 }
 
+/*
+ * #339: how many VMs this boot should actually run.
+ *
+ * `vm_count` was parsed, validated and ECHOED, and then did not affect anything: HYPE_RUN_TWO_VMS is a
+ * compile-time constant, so a config declaring one VM still built a second, unconfigured one with a
+ * 2048 MB built-in default -- and on an 8 GB box that second VM's AllocatePages could PANIC. hype
+ * printed the right count and then contradicted it, which is the #285/#331 failure mode with a worse
+ * ending.
+ *
+ * The compile-time gate still wins when it is off (-DHYPE_RUN_TWO_VMS=0 is the "prove one core" mode),
+ * and NO config at all still means two -- every existing QEMU rig boots that way and this must not
+ * change what they do. Only an explicit config now reduces the count.
+ *
+ * Deliberately a predicate rather than a count: the second VM is dispatched to a specific pinned AP and
+ * the SVM vCPU-slot pool is sized for two (#237 -- a pool that silently clamped gave two guests one
+ * VMCB). Generalising to N belongs with that pool, not here.
+ */
+static int fw_1_want_two_vms(void) {
+#if HYPE_RUN_TWO_VMS
+    if (g_hype_cfg.vm_count == 0u) {
+        return 1; /* no hype.cfg: built-in default, unchanged */
+    }
+    return (g_hype_cfg.vm_count > 1u) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
 /* #332: the partition vm0's `physical:` target names, 0 for the whole disk. */
 static unsigned int fw_1_phys_partition(void) {
     const hype_cfg_vm_t *cv = (g_hype_cfg.vm_count > 0u) ? &g_hype_cfg.vms[0] : 0;
@@ -8753,6 +8781,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     (unsigned long long)g_vms[1].used_root);
 #if HYPE_RUN_TWO_VMS
                 /*
+                 * #339: only meaningful when a second VM exists.
+                 *
                  * #274: two login prompts prove liveness, not isolation -- a pair of
                  * guests sharing one translation root would print exactly the same
                  * two prompts. Check the separation itself, once, as soon as both
@@ -13070,7 +13100,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      */
     load_input_script(ImageHandle, SystemTable, &g_vms[0], 0u);
 #if HYPE_RUN_TWO_VMS
-    load_input_script(ImageHandle, SystemTable, &g_vms[1], 1u);
+    if (fw_1_want_two_vms()) { /* #339 */
+        load_input_script(ImageHandle, SystemTable, &g_vms[1], 1u);
+    }
 #endif
 
     SystemTable->BootServices->FreePool(map);
@@ -13490,63 +13522,68 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         }
 
 #if HYPE_RUN_TWO_VMS
-        /*
-         * STEP 2b: give g_vms[1] its own firmware + guest RAM so AP2 can run a
-         * SECOND Alpine (STEP 2c dispatches it). Must be done here, pre-EBS,
-         * while UEFI AllocatePages is still available (same as g_vms[0] above).
-         *
-         *  - Firmware: OVMF's *content* is identical between the two VMs, so
-         *    copy g_vms[0]'s freshly-loaded (pristine -- no guest has run yet)
-         *    combined buffer rather than re-reading the files. Each VM needs its
-         *    OWN buffer because OVMF's variable store (VARS) is writable and the
-         *    two guests must not clobber each other's.
-         *  - Guest RAM: a fresh, zeroed HYPE_FW_1_GUEST_RAM_BYTES region (the
-         *    guest-RAM-zeroed-before-first-run invariant, per guest_ram.h).
-         *  - host_tsc_hz: same physical CPU, so reuse the BSP's calibration.
-         *  - ISO (GLADDER-9 #140): vm1 gets its OWN per-VM backing. If a distinct
-         *    \iso\vm1.iso is present it is loaded into vm1's own chunk list
-         *    (mixed-distro: Fedora on vm0, Ubuntu on vm1); otherwise vm1 shares
-         *    vm0's read-only backing (safe for two concurrent readers).
-         *
-         * run_fw_1_test builds each VM's own NPT/devices/VMCB/ACPI from these
-         * fields.
-         */
-        {
-            hype_fw_vm_t *vm1 = &g_vms[1];
-            vm1->code_size = vm->code_size;
-            vm1->vars_size = vm->vars_size;
-            vm1->combined_size = vm->combined_size;
-            vm1->combined_host_phys =
-                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->combined_size);
-            hype_guest_ram_copy((void *)(uintptr_t)vm1->combined_host_phys,
-                                (const void *)(uintptr_t)vm->combined_host_phys, vm1->combined_size);
-            /* #290: vm1 gets its own configured size (cfg vm[1]), not vm0's. */
-            fw_1_resolve_guest_ram(vm1, &g_hype_cfg, 1u);
-            fw_1_resolve_os_hint(vm1, &g_hype_cfg, 1u);
-            vm1->ram_host_phys =
-                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->ram_bytes);
-            hype_guest_ram_zero((void *)(uintptr_t)vm1->ram_host_phys, vm1->ram_bytes);
-            /* M8-4: VM1's own pristine-firmware snapshot (copied from vm0's still-
-             * pristine image before either guest runs). */
-            vm1->fw_pristine_host_phys =
-                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->combined_size);
-            hype_guest_ram_copy((void *)(uintptr_t)vm1->fw_pristine_host_phys,
-                                (const void *)(uintptr_t)vm1->combined_host_phys, vm1->combined_size);
-            vm1->host_tsc_hz = vm->host_tsc_hz;
-            /* M5-7 (#196): vm1's own virtio-blk scratch disk backing (pre-EBS). */
-            vm1->vblk_backing_phys =
-                hype_alloc_pages_any(SystemTable->BootServices, (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL));
-            hype_guest_ram_zero((void *)(uintptr_t)vm1->vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
-            /* GLADDER-9 (#140) / #326: vm1's media is resolved POST-EBS by
-             * fw_1_resolve_media_stream(1), which honours \iso\vm1.iso (and vm1's own
-             * install_media / media_disk) exactly as this pre-EBS RAM load used to -- so
-             * per-VM media survives the RAM path's retirement. Nothing to do here. */
-            hype_debug_print(
-                "fw-1 VM1: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
-                (unsigned long long)vm1->combined_host_phys, (unsigned long long)vm1->combined_size,
-                (unsigned long long)vm1->ram_host_phys,
-                (unsigned long long)(vm1->ram_bytes / (1024ULL * 1024ULL)),
-                (unsigned long long)vm1->host_tsc_hz);
+        /* #339: skip the entire second-VM allocation when the config asked for one VM. This is the
+         * block that PANICKED: vm1 took a 2048 MB built-in default and its AllocatePages could fail
+         * for contiguity on an 8 GB host -- for a VM the operator never asked for. */
+        if (fw_1_want_two_vms()) {
+            /*
+             * STEP 2b: give g_vms[1] its own firmware + guest RAM so AP2 can run a
+             * SECOND Alpine (STEP 2c dispatches it). Must be done here, pre-EBS,
+             * while UEFI AllocatePages is still available (same as g_vms[0] above).
+             *
+             *  - Firmware: OVMF's *content* is identical between the two VMs, so
+             *    copy g_vms[0]'s freshly-loaded (pristine -- no guest has run yet)
+             *    combined buffer rather than re-reading the files. Each VM needs its
+             *    OWN buffer because OVMF's variable store (VARS) is writable and the
+             *    two guests must not clobber each other's.
+             *  - Guest RAM: a fresh, zeroed HYPE_FW_1_GUEST_RAM_BYTES region (the
+             *    guest-RAM-zeroed-before-first-run invariant, per guest_ram.h).
+             *  - host_tsc_hz: same physical CPU, so reuse the BSP's calibration.
+             *  - ISO (GLADDER-9 #140): vm1 gets its OWN per-VM backing. If a distinct
+             *    \iso\vm1.iso is present it is loaded into vm1's own chunk list
+             *    (mixed-distro: Fedora on vm0, Ubuntu on vm1); otherwise vm1 shares
+             *    vm0's read-only backing (safe for two concurrent readers).
+             *
+             * run_fw_1_test builds each VM's own NPT/devices/VMCB/ACPI from these
+             * fields.
+             */
+            {
+                hype_fw_vm_t *vm1 = &g_vms[1];
+                vm1->code_size = vm->code_size;
+                vm1->vars_size = vm->vars_size;
+                vm1->combined_size = vm->combined_size;
+                vm1->combined_host_phys =
+                    hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->combined_size);
+                hype_guest_ram_copy((void *)(uintptr_t)vm1->combined_host_phys,
+                                    (const void *)(uintptr_t)vm->combined_host_phys, vm1->combined_size);
+                /* #290: vm1 gets its own configured size (cfg vm[1]), not vm0's. */
+                fw_1_resolve_guest_ram(vm1, &g_hype_cfg, 1u);
+                fw_1_resolve_os_hint(vm1, &g_hype_cfg, 1u);
+                vm1->ram_host_phys =
+                    hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->ram_bytes);
+                hype_guest_ram_zero((void *)(uintptr_t)vm1->ram_host_phys, vm1->ram_bytes);
+                /* M8-4: VM1's own pristine-firmware snapshot (copied from vm0's still-
+                 * pristine image before either guest runs). */
+                vm1->fw_pristine_host_phys =
+                    hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->combined_size);
+                hype_guest_ram_copy((void *)(uintptr_t)vm1->fw_pristine_host_phys,
+                                    (const void *)(uintptr_t)vm1->combined_host_phys, vm1->combined_size);
+                vm1->host_tsc_hz = vm->host_tsc_hz;
+                /* M5-7 (#196): vm1's own virtio-blk scratch disk backing (pre-EBS). */
+                vm1->vblk_backing_phys =
+                    hype_alloc_pages_any(SystemTable->BootServices, (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL));
+                hype_guest_ram_zero((void *)(uintptr_t)vm1->vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
+                /* GLADDER-9 (#140) / #326: vm1's media is resolved POST-EBS by
+                 * fw_1_resolve_media_stream(1), which honours \iso\vm1.iso (and vm1's own
+                 * install_media / media_disk) exactly as this pre-EBS RAM load used to -- so
+                 * per-VM media survives the RAM path's retirement. Nothing to do here. */
+                hype_debug_print(
+                    "fw-1 VM1: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
+                    (unsigned long long)vm1->combined_host_phys, (unsigned long long)vm1->combined_size,
+                    (unsigned long long)vm1->ram_host_phys,
+                    (unsigned long long)(vm1->ram_bytes / (1024ULL * 1024ULL)),
+                    (unsigned long long)vm1->host_tsc_hz);
+            }
         }
 #endif
 
@@ -14622,7 +14659,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      */
     (void)fw_1_resolve_media_stream(0u);
 #if HYPE_RUN_TWO_VMS
-    (void)fw_1_resolve_media_stream(1u);
+    if (fw_1_want_two_vms()) { /* #339 */
+        (void)fw_1_resolve_media_stream(1u);
+    }
 #endif
 
 #if HYPE_RUN_TWO_VMS
@@ -14636,7 +14675,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * a multi-extent ISO would otherwise give vm1 the extent map of a zeroed struct and it would read
      * the wrong sectors -- silently, since extent_count 0 means "contiguous" rather than "unset".
      */
-    if (g_vms[0].iso_stream_ready && !g_vms[1].iso_stream_ready) {
+    if (fw_1_want_two_vms() && g_vms[0].iso_stream_ready && !g_vms[1].iso_stream_ready) { /* #339 */
         unsigned ei;
         g_vms[1].iso_stream.read = g_vms[0].iso_stream.read;
         g_vms[1].iso_stream.ctx = g_vms[0].iso_stream.ctx;
@@ -14735,13 +14774,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * (fw_1_ap_main with vm index 1 -> g_vms[1], whose RAM+firmware
                  * were allocated pre-EBS below). Otherwise it just parks
                  * (hype_ap_entry) -- the STEP 2a "prove the core comes up" mode. */
-#if HYPE_RUN_TWO_VMS
-                void (*ap2_entry)(void *) = fw_1_ap_main;
-                void *ap2_arg = (void *)(uintptr_t)1u; /* g_vms[1] */
-#else
-                void (*ap2_entry)(void *) = hype_ap_entry;
-                void *ap2_arg = 0;
-#endif
+                /* #339: with a one-VM config AP2 PARKS instead of running g_vms[1] -- the same
+                 * thing -DHYPE_RUN_TWO_VMS=0 does. It must not be dispatched at a VM that was never
+                 * given firmware or RAM, and parking keeps the core accounted for rather than
+                 * leaving a started AP with nothing to do. */
+                void (*ap2_entry)(void *) = fw_1_want_two_vms() ? fw_1_ap_main : hype_ap_entry;
+                void *ap2_arg = fw_1_want_two_vms() ? (void *)(uintptr_t)1u : (void *)0;
                 int ap2_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 2u,
                                            (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                                            (uint64_t)(uintptr_t)(g_ap2_stack + sizeof(g_ap2_stack)),
