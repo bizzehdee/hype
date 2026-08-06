@@ -465,6 +465,169 @@ static void test_media_disk_out_of_range_vm_is_auto(void) {
 }
 
 
+/* ---- #329: multi-disk admission ---- */
+
+static void add_disk(hype_cfg_t *c, const char *id, hype_cfg_disk_type_t type,
+                     hype_cfg_backing_t backing, int read_only) {
+    hype_cfg_disk_t *d = &c->disks[c->disk_count++];
+    memset(d, 0, sizeof(*d));
+    strncpy(d->id, id, sizeof(d->id) - 1);
+    d->type = type;
+    d->backing = backing;
+    d->has_backing = 1;
+    d->read_only = read_only;
+}
+
+static void attach(hype_cfg_vm_t *vm, const char *id, int as_cdrom) {
+    if (as_cdrom) {
+        strncpy(vm->cdroms[vm->cdroms_count++], id, HYPE_CFG_NAME_MAX - 1);
+    } else {
+        strncpy(vm->disks[vm->disks_count++], id, HYPE_CFG_NAME_MAX - 1);
+    }
+}
+
+static void test_disk_refs_must_exist_and_match_type(void) {
+    hype_cfg_t cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    add_disk(&cfg, "sys", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 0);
+    add_disk(&cfg, "inst", HYPE_CFG_DISK_TYPE_CDROM, HYPE_CFG_BACKING_FILE, 1);
+
+    attach(&cfg.vms[0], "sys", 0);
+    attach(&cfg.vms[0], "inst", 1);
+    CHECK_INT("a well-formed reference set passes", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_refs(&cfg).status);
+
+    /* A typo'd id must not silently mean "no disk" -- that is a VM that boots nothing for no visible
+     * reason. */
+    cfg.vms[0].disks_count = 0;
+    attach(&cfg.vms[0], "syz", 0);
+    CHECK_INT("an unknown id is refused", (int)HYPE_ADM_ERR_DISK_REF_UNKNOWN,
+              (int)hype_adm_check_disk_refs(&cfg).status);
+
+    /* The lists mean different front-ends and different read-only semantics, so a cdrom in disks= is
+     * an error rather than something to coerce. */
+    cfg.vms[0].disks_count = 0;
+    attach(&cfg.vms[0], "inst", 0);
+    CHECK_INT("a cdrom in disks= is refused", (int)HYPE_ADM_ERR_DISK_REF_WRONG_TYPE,
+              (int)hype_adm_check_disk_refs(&cfg).status);
+
+    cfg.vms[0].disks_count = 0;
+    cfg.vms[0].cdroms_count = 0;
+    attach(&cfg.vms[0], "sys", 1);
+    CHECK_INT("a disk in cdroms= is refused", (int)HYPE_ADM_ERR_DISK_REF_WRONG_TYPE,
+              (int)hype_adm_check_disk_refs(&cfg).status);
+}
+
+static void test_writable_disks_cannot_be_shared_but_read_only_can(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    add_disk(&cfg, "rw", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 0);
+    add_disk(&cfg, "ro", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 1);
+    add_disk(&cfg, "iso", HYPE_CFG_DISK_TYPE_CDROM, HYPE_CFG_BACKING_FILE, 1);
+
+    /* Two guests writing one backing store corrupts it, and neither can detect the other. */
+    attach(&cfg.vms[0], "rw", 0);
+    attach(&cfg.vms[1], "rw", 0);
+    r = hype_adm_check_disk_sharing(&cfg);
+    CHECK_INT("a shared WRITABLE disk is refused", (int)HYPE_ADM_ERR_DISK_SHARED_WRITABLE,
+              (int)r.status);
+    CHECK_INT("names the first VM", 0, r.vm_index_a);
+    CHECK_INT("names the second", 1, r.vm_index_b);
+
+    /* A shared read-only disk is legitimate -- a common reference image. */
+    cfg.vms[0].disks_count = 0;
+    cfg.vms[1].disks_count = 0;
+    attach(&cfg.vms[0], "ro", 0);
+    attach(&cfg.vms[1], "ro", 0);
+    CHECK_INT("a shared READ-ONLY disk is allowed", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_sharing(&cfg).status);
+
+    /* One installer ISO serving every VM is the normal case, not a mistake. */
+    attach(&cfg.vms[0], "iso", 1);
+    attach(&cfg.vms[1], "iso", 1);
+    CHECK_INT("a shared cdrom is allowed", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_sharing(&cfg).status);
+}
+
+static void test_physical_overlap_allows_distinct_partitions(void) {
+    hype_cfg_t cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 0;
+
+    /* THE case this ticket calls out as easy to get wrong: two DIFFERENT partitions on one drive are
+     * disjoint and must be ALLOWED -- refusing them defeats #332's whole purpose. */
+    add_disk(&cfg, "p2", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_PHYSICAL, 0);
+    cfg.disks[0].has_id_match = 1;
+    strncpy(cfg.disks[0].id_match, "SN-1", sizeof(cfg.disks[0].id_match) - 1);
+    cfg.disks[0].partition = 2u;
+
+    add_disk(&cfg, "p3", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_PHYSICAL, 0);
+    cfg.disks[1].has_id_match = 1;
+    strncpy(cfg.disks[1].id_match, "SN-1", sizeof(cfg.disks[1].id_match) - 1);
+    cfg.disks[1].partition = 3u;
+
+    CHECK_INT("adjacent partitions on one drive are ALLOWED", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_phys_overlap(&cfg).status);
+
+    /* The same partition twice is a genuine conflict. */
+    cfg.disks[1].partition = 2u;
+    CHECK_INT("the same partition twice is refused", (int)HYPE_ADM_ERR_DISK_PHYS_OVERLAP,
+              (int)hype_adm_check_disk_phys_overlap(&cfg).status);
+
+    /* whole-disk CONTAINS every partition, so it conflicts with any of them. */
+    cfg.disks[1].partition = 0u; /* whole */
+    CHECK_INT("whole-disk conflicts with a partition on the same drive",
+              (int)HYPE_ADM_ERR_DISK_PHYS_OVERLAP,
+              (int)hype_adm_check_disk_phys_overlap(&cfg).status);
+
+    /* Different drives cannot overlap however they are scoped. */
+    strncpy(cfg.disks[1].id_match, "SN-2", sizeof(cfg.disks[1].id_match) - 1);
+    CHECK_INT("different drives never conflict", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_phys_overlap(&cfg).status);
+}
+
+static void test_unpresentable_bus_is_refused(void) {
+    hype_cfg_t cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    cfg.vms[0].os_hint = HYPE_CFG_OS_LINUX;
+    add_disk(&cfg, "d", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 0);
+    attach(&cfg.vms[0], "d", 0);
+
+    CHECK_INT("the os_hint default (virtio-blk) is presentable", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_bus(&cfg).status);
+
+    cfg.disks[0].bus = HYPE_CFG_BUS_AHCI_SATA;
+    CHECK_INT("ahci-sata is presentable (#333)", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_bus(&cfg).status);
+
+    /*
+     * nvme parses because the spec defines it, but the guest controller is #202. Refusing LOUDLY beats
+     * attaching nothing: from inside the guest, a missing disk is indistinguishable from a hype bug.
+     */
+    cfg.disks[0].bus = HYPE_CFG_BUS_NVME;
+    CHECK_INT("nvme is refused until #202 lands", (int)HYPE_ADM_ERR_DISK_BUS_UNSUPPORTED,
+              (int)hype_adm_check_disk_bus(&cfg).status);
+
+    /* A windows VM defaulting to ahci-sata must still pass. */
+    cfg.disks[0].bus = HYPE_CFG_BUS_DEFAULT;
+    cfg.vms[0].os_hint = HYPE_CFG_OS_WINDOWS;
+    CHECK_INT("the windows default is presentable", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_bus(&cfg).status);
+}
+
+
 int main(void) {
     test_memory_within_budget();
     test_memory_overcommit();
@@ -493,6 +656,10 @@ int main(void) {
     test_media_disk_unidentified_devices_never_match();
     test_media_disk_is_exact_match();
     test_media_disk_out_of_range_vm_is_auto();
+    test_disk_refs_must_exist_and_match_type();
+    test_writable_disks_cannot_be_shared_but_read_only_can();
+    test_physical_overlap_allows_distinct_partitions();
+    test_unpresentable_bus_is_refused();
 
     if (failures == 0) {
         printf("all tests passed\n");

@@ -25,7 +25,13 @@ typedef enum {
     HYPE_ADM_ERR_TARGET_DISK_COLLISION,
     HYPE_ADM_ERR_NET_PEER_UNKNOWN_VM,
     HYPE_ADM_ERR_NET_PEER_NOT_NAT,
-    HYPE_ADM_ERR_MEDIA_DISK_ABSENT
+    HYPE_ADM_ERR_MEDIA_DISK_ABSENT,
+    /* #329 */
+    HYPE_ADM_ERR_DISK_REF_UNKNOWN,     /* disks=/cdroms= names no [disk.*] that exists */
+    HYPE_ADM_ERR_DISK_REF_WRONG_TYPE,  /* a cdrom in disks=, or a disk in cdroms= */
+    HYPE_ADM_ERR_DISK_SHARED_WRITABLE, /* two VMs attach the same writable device */
+    HYPE_ADM_ERR_DISK_PHYS_OVERLAP,    /* two devices claim overlapping physical storage */
+    HYPE_ADM_ERR_DISK_BUS_UNSUPPORTED  /* a bus hype cannot present yet */
 } hype_adm_status_t;
 
 typedef struct {
@@ -105,5 +111,42 @@ int hype_adm_select_media_dev(const hype_cfg_t *cfg, unsigned int vm_index,
  * it needs the enumerated drive list rather than only host totals. */
 hype_adm_result_t hype_adm_check_media_disk(const hype_cfg_t *cfg, const char *const *dev_serials,
                                             unsigned int dev_count);
+
+
+/*
+ * #329: the cross-entity checks for [disk.*] references. All pure, all cheap, and each of them catches
+ * a misconfiguration that would otherwise surface as a guest with a missing or silently shared disk.
+ *
+ * Deliberately NOT in the parser: whether `disks = a, b` names devices that exist is a question about
+ * the whole config, which is the same split target_disk already follows (§10).
+ */
+
+/* Every id in a VM's disks=/cdroms= must name a defined [disk.*], of the matching `type`. A cdrom in
+ * disks= is a configuration error rather than something to coerce: the two lists mean different
+ * front-ends and different read-only semantics. */
+hype_adm_result_t hype_adm_check_disk_refs(const hype_cfg_t *cfg);
+
+/*
+ * No two VMs may attach the same WRITABLE device. Two guests writing one backing store corrupts it,
+ * and neither guest can detect the other. Read-only devices (and every cdrom) ARE shareable -- that is
+ * the normal case for one installer ISO serving several VMs, so refusing it would be wrong.
+ */
+hype_adm_result_t hype_adm_check_disk_sharing(const hype_cfg_t *cfg);
+
+/*
+ * Two backing=physical devices must not claim overlapping storage on the same drive.
+ *
+ * The arithmetic worth being careful about: identical partition numbers conflict, and `whole` conflicts
+ * with ANY partition on that drive -- but two DIFFERENT partitions do not. Refusing adjacent partitions
+ * would make the whole point of #332 (hand hype the spare partition you already have) unusable.
+ */
+hype_adm_result_t hype_adm_check_disk_phys_overlap(const hype_cfg_t *cfg);
+
+/*
+ * Refuse a bus hype cannot actually present, rather than attaching nothing and leaving the guest to
+ * wonder. `nvme` parses (spec §5.3) but the guest-facing controller is #202; until it lands, a config
+ * asking for it must fail loudly at startup instead of producing a diskless VM.
+ */
+hype_adm_result_t hype_adm_check_disk_bus(const hype_cfg_t *cfg);
 
 #endif /* HYPE_ADMISSION_H */

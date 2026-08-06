@@ -175,3 +175,125 @@ hype_adm_result_t hype_adm_check_net_peers(const hype_cfg_t *cfg) {
     }
     return adm_ok();
 }
+
+/* #329: index of the [disk.*] with this id, or -1. */
+static int disk_by_id(const hype_cfg_t *cfg, const char *id) {
+    unsigned int i;
+    for (i = 0; i < cfg->disk_count; i++) {
+        if (hype_streq(cfg->disks[i].id, id)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+hype_adm_result_t hype_adm_check_disk_refs(const hype_cfg_t *cfg) {
+    unsigned int vi, k;
+
+    for (vi = 0; vi < cfg->vm_count; vi++) {
+        const hype_cfg_vm_t *vm = &cfg->vms[vi];
+
+        for (k = 0; k < vm->disks_count; k++) {
+            int d = disk_by_id(cfg, vm->disks[k]);
+            if (d < 0) {
+                return adm_err(HYPE_ADM_ERR_DISK_REF_UNKNOWN, vi, HYPE_ADM_NO_VM);
+            }
+            if (cfg->disks[d].type != HYPE_CFG_DISK_TYPE_DISK) {
+                return adm_err(HYPE_ADM_ERR_DISK_REF_WRONG_TYPE, vi, HYPE_ADM_NO_VM);
+            }
+        }
+        for (k = 0; k < vm->cdroms_count; k++) {
+            int d = disk_by_id(cfg, vm->cdroms[k]);
+            if (d < 0) {
+                return adm_err(HYPE_ADM_ERR_DISK_REF_UNKNOWN, vi, HYPE_ADM_NO_VM);
+            }
+            if (cfg->disks[d].type != HYPE_CFG_DISK_TYPE_CDROM) {
+                return adm_err(HYPE_ADM_ERR_DISK_REF_WRONG_TYPE, vi, HYPE_ADM_NO_VM);
+            }
+        }
+    }
+    return adm_ok();
+}
+
+hype_adm_result_t hype_adm_check_disk_sharing(const hype_cfg_t *cfg) {
+    unsigned int a, b, ka, kb;
+
+    for (a = 0; a < cfg->vm_count; a++) {
+        for (ka = 0; ka < cfg->vms[a].disks_count; ka++) {
+            int d = disk_by_id(cfg, cfg->vms[a].disks[ka]);
+            if (d < 0 || cfg->disks[d].read_only) {
+                continue; /* unknown ids are check_disk_refs' business; read-only IS shareable */
+            }
+            for (b = a + 1u; b < cfg->vm_count; b++) {
+                for (kb = 0; kb < cfg->vms[b].disks_count; kb++) {
+                    if (hype_streq(cfg->vms[a].disks[ka], cfg->vms[b].disks[kb])) {
+                        return adm_err(HYPE_ADM_ERR_DISK_SHARED_WRITABLE, a, b);
+                    }
+                }
+            }
+        }
+    }
+    /* cdroms are deliberately not checked: they are read-only by construction (the parser forces it),
+     * and one installer ISO serving every VM is the normal case, not a mistake. */
+    return adm_ok();
+}
+
+/* Do two physical claims on the SAME drive overlap? */
+static int phys_ranges_overlap(unsigned int part_a, unsigned int part_b) {
+    /* 0 means the whole disk, which contains every partition -- so it conflicts with anything. */
+    if (part_a == 0u || part_b == 0u) {
+        return 1;
+    }
+    /* Otherwise only the SAME partition conflicts. Two different partitions are disjoint by
+     * definition, and refusing them would defeat #332's whole purpose. */
+    return part_a == part_b;
+}
+
+hype_adm_result_t hype_adm_check_disk_phys_overlap(const hype_cfg_t *cfg) {
+    unsigned int i, j;
+
+    for (i = 0; i < cfg->disk_count; i++) {
+        const hype_cfg_disk_t *da = &cfg->disks[i];
+        if (da->backing != HYPE_CFG_BACKING_PHYSICAL || !da->has_id_match) {
+            continue;
+        }
+        for (j = i + 1u; j < cfg->disk_count; j++) {
+            const hype_cfg_disk_t *db = &cfg->disks[j];
+            if (db->backing != HYPE_CFG_BACKING_PHYSICAL || !db->has_id_match) {
+                continue;
+            }
+            if (!hype_streq(da->id_match, db->id_match)) {
+                continue; /* different drives cannot overlap */
+            }
+            if (phys_ranges_overlap(da->partition, db->partition)) {
+                return adm_err(HYPE_ADM_ERR_DISK_PHYS_OVERLAP, HYPE_ADM_NO_VM, HYPE_ADM_NO_VM);
+            }
+        }
+    }
+    return adm_ok();
+}
+
+hype_adm_result_t hype_adm_check_disk_bus(const hype_cfg_t *cfg) {
+    unsigned int vi, k;
+
+    for (vi = 0; vi < cfg->vm_count; vi++) {
+        for (k = 0; k < cfg->vms[vi].disks_count; k++) {
+            int d = disk_by_id(cfg, cfg->vms[vi].disks[k]);
+            hype_cfg_bus_t bus;
+            if (d < 0) {
+                continue;
+            }
+            bus = hype_cfg_resolve_bus(&cfg->disks[d], cfg->vms[vi].os_hint);
+            /*
+             * virtio-blk and ahci-sata are the two front-ends hype can actually present (#333).
+             * `nvme` parses because the spec defines it, but the controller is #202 -- and a config
+             * asking for it must fail LOUDLY here rather than producing a VM with no disk, which is
+             * indistinguishable from a hype bug from inside the guest.
+             */
+            if (bus != HYPE_CFG_BUS_VIRTIO_BLK && bus != HYPE_CFG_BUS_AHCI_SATA) {
+                return adm_err(HYPE_ADM_ERR_DISK_BUS_UNSUPPORTED, vi, HYPE_ADM_NO_VM);
+            }
+        }
+    }
+    return adm_ok();
+}

@@ -12462,6 +12462,33 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
      * there. Name it and give the line, unconditionally -- this is the case the isolation creates, so
      * it has to be the case that is loudest.
      */
+    /*
+     * #329: the [disk.*] cross-entity checks. Run here, right after the config is parsed and before
+     * anything is allocated or attached, because every one of them describes a config that cannot work
+     * -- and the guest-visible symptom of each (a missing disk, a silently shared one) is
+     * indistinguishable from a hype bug from inside the VM.
+     *
+     * Reported, not fatal: hype still boots with the built-in defaults so the operator has a machine
+     * to fix the config from. A refusal nobody can read is not an improvement.
+     */
+    {
+        hype_adm_result_t dr = hype_adm_check_disk_refs(&g_hype_cfg);
+        if (dr.status == HYPE_ADM_OK) {
+            dr = hype_adm_check_disk_sharing(&g_hype_cfg);
+        }
+        if (dr.status == HYPE_ADM_OK) {
+            dr = hype_adm_check_disk_phys_overlap(&g_hype_cfg);
+        }
+        if (dr.status == HYPE_ADM_OK) {
+            dr = hype_adm_check_disk_bus(&g_hype_cfg);
+        }
+        if (dr.status != HYPE_ADM_OK) {
+            hype_serial_print("cfg: DISK CONFIG REJECTED (code %d, vm %u) -- a referenced [disk.*] is "
+                              "missing, of the wrong type, shared writable, overlapping another "
+                              "physical claim, or on a bus hype cannot present\n",
+                              (int)dr.status, dr.vm_index_a);
+        }
+    }
     if (g_hype_cfg.skipped_vms != 0u) {
         hype_serial_print("cfg: %u VM(s) SKIPPED as malformed -- first was '%s'%s (line %u). The "
                           "rest of the config loaded; those machines will NOT exist\n",
