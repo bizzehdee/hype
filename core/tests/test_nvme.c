@@ -219,6 +219,106 @@ static void test_remaining_register_paths(void) {
 }
 
 
+/* ---- slice 2: admin commands ---- */
+
+static void test_sqe_decode(void) {
+    uint8_t sqe[HYPE_NVME_SQE_BYTES];
+    hype_nvme_cmd_t c;
+    unsigned i;
+
+    for (i = 0; i < sizeof(sqe); i++) sqe[i] = 0;
+    /* CDW0: opcode 0x06 (IDENTIFY) in 7:0, CID 0xBEEF in 31:16. */
+    sqe[0] = 0x06u; sqe[2] = 0xEFu; sqe[3] = 0xBEu;
+    sqe[4] = 0x01u;                                  /* NSID = 1 */
+    sqe[24] = 0x00u; sqe[25] = 0x20u;                /* PRP1 = 0x2000 */
+    sqe[32] = 0x00u; sqe[33] = 0x30u;                /* PRP2 = 0x3000 */
+    sqe[40] = 0x01u;                                 /* CDW10: CNS = 1 */
+
+    hype_nvme_sqe_decode(sqe, &c);
+    CHECK_HEX("opcode", 0x06u, c.opcode);
+    /* The CID must survive exactly: a driver matches completions to commands by it, so a mangled CID
+     * makes a SUCCESSFUL command look like a timeout. */
+    CHECK_HEX("cid", 0xBEEFu, c.cid);
+    CHECK_HEX("nsid", 1u, c.nsid);
+    CHECK_HEX("prp1", 0x2000u, c.prp1);
+    CHECK_HEX("prp2", 0x3000u, c.prp2);
+    CHECK_HEX("cdw10", 1u, c.cdw10);
+}
+
+static void test_cqe_status_does_not_collide_with_phase(void) {
+    uint8_t cqe[HYPE_NVME_CQE_BYTES];
+    uint16_t sf;
+
+    /* Success with phase 1. */
+    hype_nvme_cqe_build(cqe, 0x1234u, 7u, 0u, 1u, HYPE_NVME_SC_SUCCESS);
+    CHECK_HEX("cid echoed", 0x1234u, (uint16_t)(cqe[12] | (cqe[13] << 8)));
+    CHECK_HEX("sq_head reported", 7u, (uint16_t)(cqe[8] | (cqe[9] << 8)));
+    sf = (uint16_t)(cqe[14] | (cqe[15] << 8));
+    CHECK_HEX("phase bit set", 1u, sf & 1u);
+    CHECK_HEX("status code is 0 for success", 0u, (sf >> 1) & 0xFFu);
+
+    /*
+     * The trap: SC lives at bits 8:1, so it is SHIFTED LEFT BY ONE past the phase bit. Forget the
+     * shift and the status overwrites the phase -- and a polling driver then never observes the
+     * completion at all, with no error anywhere.
+     */
+    hype_nvme_cqe_build(cqe, 1u, 0u, 0u, 0u, HYPE_NVME_SC_INVALID_OPCODE);
+    sf = (uint16_t)(cqe[14] | (cqe[15] << 8));
+    CHECK_HEX("phase 0 preserved alongside a status", 0u, sf & 1u);
+    CHECK_HEX("status survives the shift", HYPE_NVME_SC_INVALID_OPCODE, (sf >> 1) & 0xFFu);
+
+    hype_nvme_cqe_build(cqe, 1u, 0u, 0u, 1u, HYPE_NVME_SC_LBA_OUT_OF_RANGE);
+    sf = (uint16_t)(cqe[14] | (cqe[15] << 8));
+    CHECK_HEX("phase 1 alongside a large status", 1u, sf & 1u);
+    CHECK_HEX("0x80 status survives", HYPE_NVME_SC_LBA_OUT_OF_RANGE, (sf >> 1) & 0xFFu);
+}
+
+static void test_identify_controller(void) {
+    static uint8_t buf[HYPE_NVME_IDENTIFY_BYTES];
+    unsigned i;
+
+    hype_nvme_identify_controller(buf, "HYPE-NVME-0001");
+    /* SPACE padded, not NUL: these are fixed-width ASCII fields, and a NUL-padded serial appears as
+     * garbage in a guest's device listing. */
+    CHECK_HEX("SN starts with 'H'", (unsigned)'H', buf[4]);
+    CHECK_HEX("SN is space padded, not NUL", (unsigned)' ', buf[4 + 19]);
+    CHECK_HEX("model is space padded too", (unsigned)' ', buf[24 + 39]);
+    CHECK_HEX("exactly one namespace", 1u,
+              (unsigned)(buf[516] | (buf[517] << 8) | (buf[518] << 16) | (buf[519] << 24)));
+    /* SQES/CQES as powers of two -- must match the queue arithmetic or entry N is at the wrong place. */
+    CHECK_HEX("SQES advertises 2^6 = 64 bytes", 0x66u, buf[512]);
+    CHECK_HEX("CQES advertises 2^4 = 16 bytes", 0x44u, buf[513]);
+    CHECK_HEX("MDTS 0 = unlimited", 0u, buf[77]);
+    /* Nothing should have been left uninitialised beyond the fields set. */
+    for (i = 600; i < 700; i++) {
+        if (buf[i] != 0) { CHECK_HEX("tail of identify is zeroed", 0u, buf[i]); break; }
+    }
+}
+
+static void test_identify_namespace_block_size_is_a_power_of_two(void) {
+    static uint8_t buf[HYPE_NVME_IDENTIFY_BYTES];
+    uint64_t nsze;
+    unsigned k;
+
+    hype_nvme_identify_namespace(buf, 1048576ull); /* 512 MiB of 512-byte blocks */
+    nsze = 0;
+    for (k = 0; k < 8u; k++) {
+        nsze |= (uint64_t)buf[k] << (8u * k);
+    }
+    CHECK_HEX("NSZE is the block count", 1048576ull, nsze);
+    CHECK_HEX("NCAP matches", 1048576ull, (uint64_t)buf[8] | ((uint64_t)buf[9] << 8) |
+                                              ((uint64_t)buf[10] << 16) | ((uint64_t)buf[11] << 24));
+    CHECK_HEX("fully provisioned (NUSE == NSZE)", (unsigned)buf[16], (unsigned)buf[0]);
+    /*
+     * THE field to get right: LBADS is a POWER OF TWO. 9 => 512 bytes. A wrong value makes every guest
+     * LBA land at the wrong byte offset, and the guest reads and writes there without complaint.
+     */
+    CHECK_HEX("LBAF0.LBADS is 9 (2^9 = 512 bytes)", 9u, buf[130]);
+    CHECK_HEX("format 0 selected", 0u, buf[26]);
+    CHECK_HEX("one LBA format described", 0u, buf[25]);
+}
+
+
 int main(void) {
     test_phase_starts_at_one();
     test_phase_toggles_only_on_wrap();
@@ -230,6 +330,10 @@ int main(void) {
     test_queue_bases_are_64bit();
     test_unmodelled_registers_are_inert();
     test_remaining_register_paths();
+    test_sqe_decode();
+    test_cqe_status_does_not_collide_with_phase();
+    test_identify_controller();
+    test_identify_namespace_block_size_is_a_power_of_two();
 
     if (failures == 0) {
         printf("all tests passed\n");

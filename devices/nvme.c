@@ -153,3 +153,114 @@ int hype_nvme_doorbell_decode(uint32_t off, unsigned int *out_qid, int *out_is_c
     }
     return 0;
 }
+
+/* ---- slice 2: admin commands (#202) ---------------------------------------------------------- */
+
+static uint32_t le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t le64(const uint8_t *p) {
+    return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
+}
+
+static void put_le16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void put_le32b(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static void put_le64b(uint8_t *p, uint64_t v) {
+    put_le32b(p, (uint32_t)v);
+    put_le32b(p + 4, (uint32_t)(v >> 32));
+}
+
+static void zero_buf(uint8_t *p, unsigned int n) {
+    unsigned int i;
+    for (i = 0; i < n; i++) {
+        p[i] = 0;
+    }
+}
+
+/* Fixed-width ASCII field, SPACE padded (NVMe 1.4 §5.15.2.1) -- not NUL padded. */
+static void ascii_field(uint8_t *dst, unsigned int width, const char *src) {
+    unsigned int i;
+    for (i = 0; i < width; i++) {
+        dst[i] = (src != 0 && src[i] != '\0' && i < width) ? (uint8_t)src[i] : (uint8_t)' ';
+        if (src != 0 && src[i] == '\0') {
+            src = 0; /* pad the remainder */
+        }
+    }
+}
+
+void hype_nvme_sqe_decode(const uint8_t sqe[HYPE_NVME_SQE_BYTES], hype_nvme_cmd_t *out) {
+    uint32_t cdw0 = le32(sqe + 0);
+
+    out->opcode = (uint8_t)(cdw0 & 0xFFu);
+    out->cid = (uint16_t)(cdw0 >> 16);
+    out->nsid = le32(sqe + 4);
+    out->prp1 = le64(sqe + 24);
+    out->prp2 = le64(sqe + 32);
+    out->cdw10 = le32(sqe + 40);
+    out->cdw11 = le32(sqe + 44);
+    out->cdw12 = le32(sqe + 48);
+}
+
+void hype_nvme_cqe_build(uint8_t cqe[HYPE_NVME_CQE_BYTES], uint16_t cid, uint16_t sq_head,
+                         uint16_t sqid, uint8_t phase, uint16_t status) {
+    zero_buf(cqe, HYPE_NVME_CQE_BYTES);
+    /* DW0/DW1: command-specific result. Zero for everything hype implements. */
+    put_le16(cqe + 8, sq_head);
+    put_le16(cqe + 10, sqid);
+    put_le16(cqe + 12, cid);
+    /*
+     * DW3 high half: status field with the PHASE TAG in bit 0. The status code sits at bits 1..8 of
+     * that half-word (SC in 8:1, SCT in 11:9), so it is shifted left by one -- forgetting that shift
+     * puts the status where the phase belongs and makes every completion look like the wrong phase,
+     * which a polling driver cannot see at all.
+     */
+    put_le16(cqe + 14, (uint16_t)((status << 1) | (phase & 1u)));
+}
+
+void hype_nvme_identify_controller(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], const char *serial) {
+    zero_buf(buf, HYPE_NVME_IDENTIFY_BYTES);
+    put_le16(buf + 0, 0x1AF4u);               /* VID: virtio/Red Hat range, as hype's other models use */
+    put_le16(buf + 2, 0x1AF4u);               /* SSVID */
+    ascii_field(buf + 4, 20u, serial);        /* SN  */
+    ascii_field(buf + 24, 40u, "hype virtual NVMe");  /* MN */
+    ascii_field(buf + 64, 8u, "1.0");         /* FR */
+    /*
+     * MDTS = 0: no maximum data transfer size. hype splits transfers itself, and advertising a limit
+     * it does not need would only invite a driver to fragment more than necessary.
+     */
+    buf[77] = 0u;
+    put_le32b(buf + 516, 1u);                 /* NN: exactly one namespace */
+    /*
+     * SQES/CQES: (max << 4) | min, each as a POWER OF TWO. 0x66 => 2^6 = 64-byte SQ entries; 0x44 =>
+     * 2^4 = 16-byte CQ entries. These must agree with what the doorbell/queue arithmetic assumes, or
+     * the controller and driver disagree about where entry N begins.
+     */
+    buf[512] = 0x66u;
+    buf[513] = 0x44u;
+}
+
+void hype_nvme_identify_namespace(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], uint64_t total_sectors) {
+    zero_buf(buf, HYPE_NVME_IDENTIFY_BYTES);
+    put_le64b(buf + 0, total_sectors);  /* NSZE: size in blocks */
+    put_le64b(buf + 8, total_sectors);  /* NCAP: capacity */
+    put_le64b(buf + 16, total_sectors); /* NUSE: fully provisioned -- hype does not thin-provision */
+    buf[25] = 0u;                       /* NLBAF: one format described (0 == "1 format") */
+    buf[26] = 0u;                       /* FLBAS: format 0 in use */
+    /*
+     * LBAF0 at offset 128: MS in 15:0, LBADS (a POWER OF TWO) at byte 2, RP in 25:24.
+     * LBADS = 9 => 512-byte blocks, matching hype_blk_backend's sector size everywhere else.
+     */
+    put_le16(buf + 128, 0u);
+    buf[130] = 9u;
+}

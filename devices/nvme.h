@@ -107,4 +107,79 @@ uint8_t hype_nvme_cq_advance(hype_nvme_t *dev, unsigned int qid);
  */
 int hype_nvme_doorbell_decode(uint32_t off, unsigned int *out_qid, int *out_is_cq);
 
+
+/* ---- slice 2: admin commands (#202) ---------------------------------------------------------- */
+
+/* Admin opcodes hype answers. Anything else is completed with INVALID_OPCODE rather than ignored: a
+ * driver that gets silence waits forever, whereas a status it understands makes it move on. */
+#define HYPE_NVME_ADMIN_CREATE_IO_SQ 0x01u
+#define HYPE_NVME_ADMIN_CREATE_IO_CQ 0x05u
+#define HYPE_NVME_ADMIN_IDENTIFY 0x06u
+#define HYPE_NVME_ADMIN_SET_FEATURES 0x09u
+#define HYPE_NVME_ADMIN_GET_FEATURES 0x0Au
+
+/* I/O opcodes. */
+#define HYPE_NVME_IO_WRITE 0x01u
+#define HYPE_NVME_IO_READ 0x02u
+
+/* IDENTIFY CNS values. */
+#define HYPE_NVME_CNS_NAMESPACE 0x00u
+#define HYPE_NVME_CNS_CONTROLLER 0x01u
+
+/* Status codes (SCT=0 generic, in the CQE's status field). */
+#define HYPE_NVME_SC_SUCCESS 0x00u
+#define HYPE_NVME_SC_INVALID_OPCODE 0x01u
+#define HYPE_NVME_SC_INVALID_FIELD 0x02u
+#define HYPE_NVME_SC_DATA_XFER_ERROR 0x04u
+#define HYPE_NVME_SC_LBA_OUT_OF_RANGE 0x80u
+
+#define HYPE_NVME_SQE_BYTES 64u
+#define HYPE_NVME_CQE_BYTES 16u
+/* Both queue entry sizes are advertised as 2^6 = 64 / 2^4 = 16 in IDENTIFY; see the builder. */
+#define HYPE_NVME_IDENTIFY_BYTES 4096u
+
+/* A decoded submission-queue entry. Only the fields hype acts on. */
+typedef struct {
+    uint8_t opcode;
+    uint16_t cid;    /* command identifier -- MUST be echoed in the completion, or the driver cannot
+                      * match the completion to its command and will time out on a command that in
+                      * fact succeeded. */
+    uint32_t nsid;
+    uint64_t prp1;
+    uint64_t prp2;
+    uint32_t cdw10;
+    uint32_t cdw11;
+    uint32_t cdw12;
+} hype_nvme_cmd_t;
+
+/* Decodes 64 little-endian bytes of guest-supplied SQE. Pure; the caller fetches the bytes. */
+void hype_nvme_sqe_decode(const uint8_t sqe[HYPE_NVME_SQE_BYTES], hype_nvme_cmd_t *out);
+
+/*
+ * Builds the 16-byte completion entry.
+ *
+ * `phase` comes from hype_nvme_cq_advance(). `sq_head` tells the driver how much of its submission
+ * queue the controller has consumed -- a driver uses it to decide it may reuse those slots, so a wrong
+ * value causes it to either stall (believing the queue full) or overwrite commands in flight.
+ */
+void hype_nvme_cqe_build(uint8_t cqe[HYPE_NVME_CQE_BYTES], uint16_t cid, uint16_t sq_head,
+                         uint16_t sqid, uint8_t phase, uint16_t status);
+
+/*
+ * IDENTIFY CONTROLLER (CNS=1) payload, 4096 bytes.
+ *
+ * `serial` is copied into the SN field SPACE-padded, not NUL-padded -- these are fixed-width ASCII
+ * fields per the spec, and a NUL-padded serial shows up as garbage in a guest's device listing.
+ */
+void hype_nvme_identify_controller(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], const char *serial);
+
+/*
+ * IDENTIFY NAMESPACE (CNS=0) payload, 4096 bytes, for a namespace of `total_sectors` 512-byte blocks.
+ *
+ * The block size is expressed as a POWER OF TWO in LBAF0.LBADS (9 => 512). That indirection is the
+ * thing to get right: a wrong LBADS makes every guest LBA land at the wrong byte offset, and the guest
+ * will happily read and write at those offsets without complaint.
+ */
+void hype_nvme_identify_namespace(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], uint64_t total_sectors);
+
 #endif /* HYPE_DEVICES_NVME_H */
