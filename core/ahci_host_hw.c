@@ -217,6 +217,18 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
     int rc = 0;
     static unsigned dbg = 0; /* GLADDER-10 stall localization: trace the first few reads */
     int trace = (dbg < 8u);
+    /*
+     * #346: a device whose command NEVER completes must not be re-probed. Each timeout burns
+     * SPIN_CMD (20M) uncached MMIO reads -- 6-20 SECONDS on real silicon -- and the media scan
+     * retries per partition per resolver, so one bad device turned boot into minutes of silent
+     * crawl (the 2026-08-06 Crucial BX500 run: several reads completed, then one wedged and the
+     * operator powered off). One loud line with the port state, then every later call fails
+     * fast and the boot continues off the other devices.
+     */
+    static uint64_t g_dead_abar; static unsigned g_dead_port; static int g_dead;
+    if (g_dead && g_dead_abar == abar_phys && g_dead_port == port) {
+        return -1;
+    }
     if (trace) {
         dbg++;
         hype_debug_print("ahci-rd[%u] enter lba=%llu cnt=%u tfd=0x%x ci=0x%x\n", dbg,
@@ -243,6 +255,18 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
         wr32(pb, HYPE_AHCI_PREG_CI, 1u);
         if (wait_clear(pb, HYPE_AHCI_PREG_CI, 1u, SPIN_CMD) != 0) {
             rc = -1;
+            /* #346: the diagnosis the hung run could not give -- what the port looked like
+             * when the completion never came. Printed once; the latch silences repeats. */
+            g_dead = 1; g_dead_abar = abar_phys; g_dead_port = port;
+            hype_debug_print("ahci-rd: COMMAND TIMED OUT port %u lba=%llu -- is=0x%x tfd=0x%x "
+                             "serr=0x%x ci=0x%x sact=0x%x; marking device DEAD, boot continues "
+                             "without it (#346)\n",
+                             port, (unsigned long long)lba,
+                             (unsigned)rd32(pb, HYPE_AHCI_PREG_IS),
+                             (unsigned)rd32(pb, HYPE_AHCI_PREG_TFD),
+                             (unsigned)rd32(pb, HYPE_AHCI_PREG_SERR),
+                             (unsigned)rd32(pb, HYPE_AHCI_PREG_CI),
+                             (unsigned)rd32(pb, HYPE_AHCI_PREG_SACT));
         } else if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
             rc = -1; /* ATA error (TFD status ERR bit) */
         }
