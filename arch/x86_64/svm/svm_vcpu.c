@@ -1955,11 +1955,16 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                                            chunk);
             if (g_stream_dbg < 6u || srr != 0) {
                 g_stream_dbg++;
-                hype_debug_print("stream-rd #%u: off=%llu chunk=%u lba0=%llu isosz=%llu ret=%d\n",
+                /* #346: include the first 8 bytes AS DELIVERED TO GUEST RAM. On real hardware the
+                 * guests retry LBA 0/16 forever with every layer below proven byte-perfect -- this
+                 * shows whether the LAST hop (this very copy) is where the bytes go wrong. */
+                hype_debug_print("stream-rd #%u: off=%llu chunk=%u lba0=%llu isosz=%llu ret=%d "
+                                 "dst=%02x %02x %02x %02x %02x %02x %02x %02x\n",
                                  g_stream_dbg, (unsigned long long)(media_byte_off + transferred),
                                  (unsigned)chunk,
                                  (unsigned long long)atapi->media_stream->part_start_lba,
-                                 (unsigned long long)atapi->media_stream->iso_size, srr);
+                                 (unsigned long long)atapi->media_stream->iso_size, srr,
+                                 dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7]);
             }
             if (srr != 0) {
                 /*
