@@ -8028,6 +8028,14 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      * drive (media_size 0), which is what a real machine with an empty optical drive presents --
      * not a missing device. */
     hype_atapi_reset_stream(&g_fw_1_atapi, vm->iso_stream_ready ? &vm->iso_stream : 0);
+#if defined(HYPE_318_ATAPI_TRACE) && HYPE_318_ATAPI_TRACE
+    /* #318: per-command ATAPI trace, enabled HERE -- the one storage bring-up both entry points
+     * share (#342) -- because the first attempt enabled it in one of the two then-duplicated
+     * launchers and produced 4 traced commands where comparable guests produce 50-1160: the
+     * whole investigation had to be discarded. Compile-gated: a real boot issues thousands of
+     * commands and each line is GOP-rendered, so this must not survive into a normal build. */
+    hype_svm_set_ahci_trace(1);
+#endif
 }
 
 static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind_t kind) {
