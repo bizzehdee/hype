@@ -149,3 +149,94 @@ void hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t 
         out->total_sectors = lba28;
     }
 }
+
+void hype_ahci_host_build_cmd_header_atapi(uint8_t slot[32], uint16_t prdtl,
+                                           uint64_t cmd_table_phys) {
+    uint32_t opts;
+    unsigned i;
+
+    for (i = 0; i < 32u; i++) {
+        slot[i] = 0;
+    }
+    /* Same as the ATA header except bit 5 (A) is SET: without it the HBA never sends the ACMD block
+     * and the drive sees a PACKET command with no packet. W stays clear -- hype never writes to an
+     * optical drive, and there is no code path here that could. */
+    opts = 5u | (1u << 5) | ((uint32_t)prdtl << 16);
+    put_le32(slot + 0, opts);
+    put_le32(slot + 8, (uint32_t)cmd_table_phys);
+    put_le32(slot + 12, (uint32_t)(cmd_table_phys >> 32));
+}
+
+int hype_ahci_host_build_atapi_read10(uint8_t *cmd_table, uint32_t lba2k, uint16_t count2k,
+                                      uint64_t dst_phys) {
+    uint8_t *fis = cmd_table + HYPE_AHCI_HOST_CT_CFIS_OFF;
+    uint8_t *acmd = cmd_table + HYPE_AHCI_HOST_CT_ACMD_OFF;
+    uint8_t *prd = cmd_table + HYPE_AHCI_HOST_CT_PRDT_OFF;
+    uint32_t bytes;
+    unsigned i;
+
+    if (count2k == 0u ||
+        (uint32_t)count2k * HYPE_AHCI_HOST_CD_SECTOR_SIZE > HYPE_AHCI_HOST_PRDT_MAX_BYTES) {
+        return -1;
+    }
+    bytes = (uint32_t)count2k * HYPE_AHCI_HOST_CD_SECTOR_SIZE;
+
+    for (i = 0; i < 20u; i++) {
+        fis[i] = 0;
+    }
+    fis[0] = 0x27u; /* Register FIS - Host to Device */
+    fis[1] = 0x80u; /* C: this FIS carries a command */
+    fis[2] = HYPE_ATA_CMD_PACKET;
+    /*
+     * For PACKET the LBA mid/high bytes are the BYTE COUNT LIMIT, not an address -- the drive may
+     * return less than this but never more. The address itself lives in the CDB below. Getting this
+     * wrong produces a transfer that either truncates or overruns rather than an obvious failure.
+     */
+    fis[5] = (uint8_t)(bytes & 0xFFu);        /* LBA mid  = byte count low  */
+    fis[6] = (uint8_t)((bytes >> 8) & 0xFFu); /* LBA high = byte count high */
+    fis[7] = 0x40u;                           /* device: LBA mode */
+
+    /* The 12-byte ATAPI CDB: READ(10), big-endian LBA and transfer length. */
+    for (i = 0; i < 16u; i++) {
+        acmd[i] = 0;
+    }
+    acmd[0] = 0x28u; /* READ(10) */
+    acmd[2] = (uint8_t)((lba2k >> 24) & 0xFFu);
+    acmd[3] = (uint8_t)((lba2k >> 16) & 0xFFu);
+    acmd[4] = (uint8_t)((lba2k >> 8) & 0xFFu);
+    acmd[5] = (uint8_t)(lba2k & 0xFFu);
+    acmd[7] = (uint8_t)((count2k >> 8) & 0xFFu);
+    acmd[8] = (uint8_t)(count2k & 0xFFu);
+
+    /* One PRDT entry, same shape as the ATA path: DBC is a byte count minus one. */
+    for (i = 0; i < 16u; i++) {
+        prd[i] = 0;
+    }
+    put_le32(prd + 0, (uint32_t)dst_phys);
+    put_le32(prd + 4, (uint32_t)(dst_phys >> 32));
+    put_le32(prd + 12, bytes - 1u);
+    return 0;
+}
+
+int hype_ahci_host_atapi_lba512_to_lba2k(uint64_t lba512, uint32_t count512, uint32_t *out_lba2k,
+                                         uint16_t *out_count2k) {
+    const uint32_t per = HYPE_AHCI_HOST_CD_SECTOR_SIZE / HYPE_AHCI_HOST_SECTOR_SIZE; /* 4 */
+
+    if (out_lba2k == 0 || out_count2k == 0) {
+        return -1;
+    }
+    /*
+     * Refuse rather than round. A misaligned request means the caller's arithmetic is wrong, and
+     * quietly serving the containing 2 KiB sector would return the wrong 512-byte slice -- the exact
+     * off-by-4 this conversion exists to prevent, and invisible in a log.
+     */
+    if (count512 == 0u || (lba512 % per) != 0u || (count512 % per) != 0u) {
+        return -1;
+    }
+    if ((count512 / per) > 0xFFFFu) {
+        return -1;
+    }
+    *out_lba2k = (uint32_t)(lba512 / per);
+    *out_count2k = (uint16_t)(count512 / per);
+    return 0;
+}

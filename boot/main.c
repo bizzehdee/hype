@@ -11716,6 +11716,43 @@ static void media_select_usb(const hype_blk_backend_t *be) {
     }
 }
 
+/*
+ * #325: a real optical drive as a media source.
+ *
+ * The media layer speaks 512-byte LBAs everywhere (core/iso_stream.h's contract), while a CD is
+ * 2048. The conversion lives in hype_ahci_host_atapi_lba512_to_lba2k() and REFUSES a misaligned
+ * request rather than rounding -- serving the containing 2 KiB sector would return the wrong
+ * 512-byte slice, which is invisible in a log. A refusal here surfaces as a failed media read, which
+ * is not.
+ */
+static uint64_t g_hostcd_abar;
+static unsigned g_hostcd_port;
+static int g_hostcd_present;
+
+static int media_atapi_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    uint32_t lba2k;
+    uint16_t count2k;
+
+    (void)ctx;
+    if (!g_hostcd_present) {
+        return -1;
+    }
+    if (hype_ahci_host_atapi_lba512_to_lba2k(lba, count, &lba2k, &count2k) != 0) {
+        return -1;
+    }
+    return hype_ahci_host_atapi_read(g_hostcd_abar, g_hostcd_port, lba2k, count2k, dst);
+}
+
+/* No write counterpart, deliberately: media_add_dev takes NULL and hostdisk_write already refuses a
+ * device with no write callback (#321), so an attempt to use a DVD-ROM as a writable target fails at
+ * the first write rather than being silently discarded. */
+static void media_select_atapi(uint64_t abar, unsigned port) {
+    g_hostcd_abar = abar;
+    g_hostcd_port = port;
+    g_hostcd_present = 1;
+    media_add_dev(media_atapi_read, 0, "atapi", "");
+}
+
 /* #324: same, for an enumerated NVMe controller. */
 static void media_select_nvme(void) {
     media_add_dev(media_nvme_read, media_nvme_write, "nvme", g_hostnvme_serial);
@@ -14539,6 +14576,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  "(MEM=%u BME=%u)\n", (unsigned)hs.bus, (unsigned)hs.dev,
                                  (unsigned)hs.func, (unsigned)cmd, (unsigned)((cmd >> 1) & 1u),
                                  (unsigned)((cmd >> 2) & 1u));
+            }
+            /*
+             * #325: an optical drive on this same controller is a media source too. Looked for
+             * independently of the disk scan and BEFORE it, because a controller with only a CD
+             * attached takes the "no active SATA disk port" branch below and would otherwise be
+             * abandoned entirely -- which is exactly how a real DVD-ROM has been invisible.
+             */
+            {
+                int cp = hype_ahci_host_find_atapi_port(hs.bar_phys);
+                if (cp >= 0 && hype_ahci_host_init(hs.bar_phys, (unsigned)cp) == 0) {
+                    media_select_atapi(hs.bar_phys, (unsigned)cp);
+                    hype_debug_print("host-atapi: optical drive on port %d of %02x:%02x.%x -- "
+                                     "registered as a media source (#325)\n", cp, (unsigned)hs.bus,
+                                     (unsigned)hs.dev, (unsigned)hs.func);
+                }
             }
             sp = hype_ahci_host_find_sata_port(hs.bar_phys);
             if (sp < 0) {

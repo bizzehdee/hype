@@ -51,6 +51,10 @@ static int wait_clear(volatile uint8_t *b, uint32_t off, uint32_t mask, unsigned
     return -1;
 }
 
+/* #325: which PxSIG the scan below matches. Defaults to a plain disk; the ATAPI entry point swaps
+ * it for the duration of one call. Single-threaded, one scan at a time. */
+static uint32_t g_scan_sig = HYPE_AHCI_HOST_SIG_ATA;
+
 int hype_ahci_host_find_sata_port(uint64_t abar_phys) {
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     uint32_t pi = rd32(abar, HYPE_AHCI_REG_PI);
@@ -78,12 +82,62 @@ int hype_ahci_host_find_sata_port(uint64_t abar_phys) {
         if ((ssts & 0xFu) != 3u) {
             continue; /* PHY never came up -> genuinely no device on this port */
         }
-        /* Non-ATAPI SATA disk signature (ATAPI/CD would be 0xEB140101). */
-        if (rd32(pb, HYPE_AHCI_PREG_SIG) == 0x00000101u) {
+        /* #325: was hardcoded to the non-ATAPI signature, which made a real optical drive invisible
+         * by construction. Now whichever signature the current scan is looking for. */
+        if (rd32(pb, HYPE_AHCI_PREG_SIG) == g_scan_sig) {
             return (int)p;
         }
     }
     return -1;
+}
+
+/*
+ * #325: the same scan, for a packet device -- an operator with a bootable disc had to copy it onto a
+ * partitioned disk first, which is a worse story than the hardware hype itself emulates.
+ *
+ * Implemented by re-running the existing scan with a different target signature rather than as a
+ * second copy of the PHY-settle loop: that loop carries a hard-won retry (the AMD laptop's SATA SSD
+ * was found only on some boots), and a duplicate would inevitably drift from it -- see #342.
+ */
+int hype_ahci_host_find_atapi_port(uint64_t abar_phys) {
+    int port;
+
+    g_scan_sig = HYPE_AHCI_HOST_SIG_ATAPI;
+    port = hype_ahci_host_find_sata_port(abar_phys);
+    g_scan_sig = HYPE_AHCI_HOST_SIG_ATA;
+    return port;
+}
+
+/*
+ * #325: read `count2k` 2048-byte sectors from a real optical drive. Same issue sequence as the ATA
+ * path -- the difference is entirely in the command table (PACKET + CDB) and the header's A bit.
+ *
+ * An empty drive is a NORMAL state for optical media, unlike an absent disk, so a failure here is
+ * reported by the return code for the caller to handle, never fatal.
+ */
+int hype_ahci_host_atapi_read(uint64_t abar_phys, unsigned port, uint32_t lba2k, uint16_t count2k,
+                              void *dst) {
+    volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
+    volatile uint8_t *pb = port_base(abar, port);
+    int rc = 0;
+
+    if (hype_ahci_host_build_atapi_read10(g_cmd_table, lba2k, count2k,
+                                          (uint64_t)(uintptr_t)dst) != 0) {
+        return -1;
+    }
+    hype_ahci_host_build_cmd_header_atapi(g_cmd_list, /*prdtl=*/1, (uint64_t)(uintptr_t)g_cmd_table);
+
+    if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
+        return -1;
+    }
+    wr32(pb, HYPE_AHCI_PREG_CI, 1u);
+    if (wait_clear(pb, HYPE_AHCI_PREG_CI, 1u, SPIN_CMD) != 0) {
+        rc = -1;
+    } else if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
+        /* Includes "no medium present" -- the drive is there, the disc is not. Normal, not fatal. */
+        rc = -1;
+    }
+    return rc;
 }
 
 void hype_ahci_host_dump_ports(uint64_t abar_phys) {

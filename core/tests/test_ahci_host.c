@@ -156,6 +156,99 @@ static void test_parse_identify_lba28_fallback(void) {
     CHECK_STR("empty serial trims to nothing", "", info.serial);
 }
 
+/* ---- #325: host-side ATAPI (reading a real optical drive) ---- */
+
+static void test_atapi_header_sets_the_A_bit(void) {
+    uint8_t slot[32];
+    uint32_t dw0;
+
+    hype_ahci_host_build_cmd_header_atapi(slot, 1u, 0x2000u);
+    dw0 = (uint32_t)slot[0] | ((uint32_t)slot[1] << 8) | ((uint32_t)slot[2] << 16) |
+          ((uint32_t)slot[3] << 24);
+    /* Without bit 5 the HBA never sends the ACMD block and the drive sees a PACKET with no packet. */
+    CHECK_HEX("A bit (ATAPI) set", 1u, (dw0 >> 5) & 1u);
+    CHECK_HEX("CFL is 5 dwords", 5u, dw0 & 0x1Fu);
+    CHECK_HEX("W bit clear -- hype never writes to an optical drive", 0u, (dw0 >> 6) & 1u);
+    CHECK_HEX("PRDTL", 1u, dw0 >> 16);
+}
+
+static void test_atapi_read10_cdb_and_byte_count(void) {
+    static uint8_t ct[256];
+    const uint8_t *fis = ct + HYPE_AHCI_HOST_CT_CFIS_OFF;
+    const uint8_t *acmd = ct + HYPE_AHCI_HOST_CT_ACMD_OFF;
+    const uint8_t *prd = ct + HYPE_AHCI_HOST_CT_PRDT_OFF;
+    unsigned i;
+    for (i = 0; i < sizeof(ct); i++) ct[i] = 0xAAu;
+
+    CHECK_HEX("build ok", 0, hype_ahci_host_build_atapi_read10(ct, 0x12345u, 2u, 0x40000u));
+
+    CHECK_HEX("FIS type", 0x27u, fis[0]);
+    CHECK_HEX("C bit", 0x80u, fis[1]);
+    CHECK_HEX("PACKET command", 0xA0u, fis[2]);
+    /*
+     * For PACKET, LBA mid/high are the BYTE COUNT LIMIT -- not an address. 2 sectors = 4096 bytes,
+     * so 0x1000: low byte 0x00 in mid, high byte 0x10 in high. Getting this wrong truncates or
+     * overruns the transfer instead of failing visibly.
+     */
+    CHECK_HEX("byte-count-limit low", 0x00u, fis[5]);
+    CHECK_HEX("byte-count-limit high", 0x10u, fis[6]);
+    CHECK_HEX("LBA mode device", 0x40u, fis[7]);
+
+    /* The CDB is big-endian, unlike everything else in the FIS. */
+    CHECK_HEX("CDB opcode READ(10)", 0x28u, acmd[0]);
+    CHECK_HEX("CDB lba[31:24]", 0x00u, acmd[2]);
+    CHECK_HEX("CDB lba[23:16]", 0x01u, acmd[3]);
+    CHECK_HEX("CDB lba[15:8]", 0x23u, acmd[4]);
+    CHECK_HEX("CDB lba[7:0]", 0x45u, acmd[5]);
+    CHECK_HEX("CDB len high", 0x00u, acmd[7]);
+    CHECK_HEX("CDB len low", 0x02u, acmd[8]);
+
+    /* PRDT: DBC is a byte count MINUS ONE. */
+    CHECK_HEX("PRD addr low", 0x40000u, (uint32_t)prd[0] | ((uint32_t)prd[1] << 8) |
+                                            ((uint32_t)prd[2] << 16) | ((uint32_t)prd[3] << 24));
+    CHECK_HEX("PRD DBC = bytes-1", 4096u - 1u,
+              (uint32_t)prd[12] | ((uint32_t)prd[13] << 8) | ((uint32_t)prd[14] << 16) |
+                  ((uint32_t)prd[15] << 24));
+}
+
+static void test_atapi_read10_refuses_impossible_sizes(void) {
+    static uint8_t ct[256];
+    CHECK_HEX("zero sectors refused", -1, hype_ahci_host_build_atapi_read10(ct, 0, 0, 0x1000u));
+    /* One PRDT entry is 4 MiB; 2048 CD sectors is exactly that, 2049 is over. */
+    CHECK_HEX("exactly one PRDT's worth is allowed", 0,
+              hype_ahci_host_build_atapi_read10(ct, 0, 2048u, 0x1000u));
+    CHECK_HEX("one sector too many refused", -1,
+              hype_ahci_host_build_atapi_read10(ct, 0, 2049u, 0x1000u));
+}
+
+static void test_atapi_lba_conversion_refuses_misalignment(void) {
+    uint32_t lba2k = 0xFFFFFFFFu;
+    uint16_t cnt2k = 0xFFFFu;
+
+    /* A CD LBA is a QUARTER of the 512-byte LBA at the same byte offset. */
+    CHECK_HEX("aligned conversion ok", 0,
+              hype_ahci_host_atapi_lba512_to_lba2k(64u, 8u, &lba2k, &cnt2k));
+    CHECK_HEX("lba/4", 16u, lba2k);
+    CHECK_HEX("count/4", 2u, cnt2k);
+
+    /*
+     * Misaligned is REFUSED, not rounded. Serving the containing 2 KiB sector would return the wrong
+     * 512-byte slice -- the off-by-4 this conversion exists to prevent, and invisible in a log.
+     */
+    CHECK_HEX("misaligned LBA refused", -1,
+              hype_ahci_host_atapi_lba512_to_lba2k(65u, 8u, &lba2k, &cnt2k));
+    CHECK_HEX("misaligned count refused", -1,
+              hype_ahci_host_atapi_lba512_to_lba2k(64u, 6u, &lba2k, &cnt2k));
+    CHECK_HEX("zero count refused", -1,
+              hype_ahci_host_atapi_lba512_to_lba2k(64u, 0u, &lba2k, &cnt2k));
+    CHECK_HEX("NULL outputs refused", -1,
+              hype_ahci_host_atapi_lba512_to_lba2k(64u, 8u, 0, &cnt2k));
+    /* A count that would overflow the 16-bit CDB length field. */
+    CHECK_HEX("over-large count refused", -1,
+              hype_ahci_host_atapi_lba512_to_lba2k(0u, 0x40000u, &lba2k, &cnt2k));
+}
+
+
 int main(void) {
     test_cmd_header_roundtrip();
     test_cmd_header_write_flag();
@@ -165,6 +258,10 @@ int main(void) {
     test_identify_cmd_table();
     test_parse_identify_roundtrip();
     test_parse_identify_lba28_fallback();
+    test_atapi_header_sets_the_A_bit();
+    test_atapi_read10_cdb_and_byte_count();
+    test_atapi_read10_refuses_impossible_sizes();
+    test_atapi_lba_conversion_refuses_misalignment();
 
     if (failures == 0) {
         printf("all tests passed\n");

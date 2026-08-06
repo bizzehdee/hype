@@ -32,6 +32,9 @@
 
 #define HYPE_ATA_CMD_IDENTIFY_DEVICE 0xECu
 #define HYPE_ATA_CMD_READ_DMA_EXT 0x25u
+/* #325: PACKET -- carries an ATAPI CDB rather than an ATA command. Used HOST-side to read a real
+ * optical drive; hype's own guest ATAPI model answers these rather than issuing them. */
+#define HYPE_ATA_CMD_PACKET 0xA0u
 #define HYPE_ATA_CMD_WRITE_DMA_EXT 0x35u
 #define HYPE_ATA_CMD_FLUSH_CACHE_EXT 0xEAu
 #define HYPE_ATA_CMD_READ_DMA 0xC8u

@@ -30,6 +30,24 @@
 #define HYPE_AHCI_HOST_SECTOR_SIZE 512u
 
 /*
+ * #325: host-side ATAPI (a real optical drive).
+ *
+ * The ATAPI command block lives at offset 0x40 of the command table, between the CFIS and the PRDT --
+ * that gap exists precisely for it.
+ *
+ * 2048-byte sectors, and the conversion is the most likely source of a subtle bug in this whole
+ * ticket: every other LBA in hype's media path is in 512-byte units (core/iso_stream.h's contract,
+ * HYPE_VIRTIO_BLK_SECTOR_SIZE), so a CD LBA is a QUARTER of the 512-byte LBA at the same byte offset.
+ * The conversion is therefore done in exactly one place (hype_ahci_host_atapi_lba512_to_lba2k) and
+ * tested, rather than open-coded at each call.
+ */
+#define HYPE_AHCI_HOST_CT_ACMD_OFF 0x40u
+#define HYPE_AHCI_HOST_CD_SECTOR_SIZE 2048u
+/* SATA signatures reported in PxSIG: a plain disk vs a packet device. */
+#define HYPE_AHCI_HOST_SIG_ATA 0x00000101u
+#define HYPE_AHCI_HOST_SIG_ATAPI 0xEB140101u
+
+/*
  * Builds the 32-byte command-list slot header for a single-command transfer:
  * command-FIS length = 5 dwords (a 20-byte H2D Register FIS), the write flag,
  * `prdtl` PRDT entries, and the 64-bit physical base of the command table.
@@ -144,5 +162,41 @@ int hype_ahci_host_identify(uint64_t abar_phys, unsigned port, void *dst512);
  */
 int hype_ahci_host_write(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count,
                          const void *src);
+
+
+/*
+ * #325: build a PACKET (0xA0) command carrying a 12-byte READ(10) CDB for `count2k` 2048-byte sectors
+ * at CD LBA `lba2k`, reading into `dst_phys`.
+ *
+ * Two things differ from the ATA builders and both are easy to miss:
+ *   - the command-list header needs its A (ATAPI) bit set, so the HBA sends the ACMD block at all --
+ *     see hype_ahci_host_build_cmd_header_atapi();
+ *   - the FIS carries the transfer size in the byte-count (LBA mid/high) fields, not a sector count.
+ *
+ * Returns 0, or -1 if the request is empty or exceeds one PRDT entry.
+ */
+int hype_ahci_host_build_atapi_read10(uint8_t *cmd_table, uint32_t lba2k, uint16_t count2k,
+                                      uint64_t dst_phys);
+
+/* As hype_ahci_host_build_cmd_header(), but sets the A bit (ATAPI). Always a read here: hype never
+ * writes to an optical drive. */
+void hype_ahci_host_build_cmd_header_atapi(uint8_t slot[32], uint16_t prdtl, uint64_t cmd_table_phys);
+
+/*
+ * The 512-to-2048 conversion, in ONE place. Returns 0 and writes the CD LBA + sector count, or -1 if
+ * the 512-byte range is not 2048-aligned -- which is a caller bug rather than something to round,
+ * since silently reading the wrong 3 KiB is exactly the off-by-4 this is here to prevent.
+ */
+int hype_ahci_host_atapi_lba512_to_lba2k(uint64_t lba512, uint32_t count512, uint32_t *out_lba2k,
+                                         uint16_t *out_count2k);
+
+/* Scans for a port with an ATAPI device attached (PxSSTS.DET == 3 and the packet signature).
+ * Returns the port number, or -1. Counterpart to the hard-disk scan above, which by requiring the
+ * NON-ATAPI signature skips a real optical drive by construction (#325). */
+int hype_ahci_host_find_atapi_port(uint64_t abar_phys);
+
+/* Issues the above against a real drive. 2048-byte sectors. */
+int hype_ahci_host_atapi_read(uint64_t abar_phys, unsigned port, uint32_t lba2k, uint16_t count2k,
+                              void *dst);
 
 #endif /* HYPE_CORE_AHCI_HOST_H */
