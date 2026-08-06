@@ -17,7 +17,38 @@ void hype_logbuf_reset(void) {
     g_logbuf.checksum = 0;
 }
 
-void hype_logbuf_append(const char *s) {
+/*
+ * #338: the append lock.
+ *
+ * g_logbuf.len was advanced with no synchronisation, so two cores appending at once did not merely
+ * interleave -- they LOST BYTES: both read the same len, both wrote there, one won. That silently
+ * corrupts \HYPEFULL.LOG (#230) and the RT-3 \hype-diag-prev.txt tail, which are the two artefacts
+ * that exist precisely for serial-less real-hardware debugging, where there is no second copy.
+ *
+ * A whole record is appended under one acquisition so it cannot be split by another core. This is a
+ * plain test-and-set spinlock: the critical section is a short memcpy-ish loop and there is nothing
+ * to sleep on in a hypervisor's log path.
+ */
+static volatile int g_logbuf_lock;
+
+static void logbuf_lock(void) {
+    while (__atomic_exchange_n(&g_logbuf_lock, 1, __ATOMIC_ACQUIRE) != 0) {
+        __builtin_ia32_pause();
+    }
+}
+
+static void logbuf_unlock(void) {
+    __atomic_store_n(&g_logbuf_lock, 0, __ATOMIC_RELEASE);
+}
+
+/*
+ * #338: for the panic path. hype_fatal() may run on a core that already holds the lock (it can be
+ * called FROM inside a logging call, or from a fault taken there), and blocking would turn a readable
+ * panic into a silent hang -- the exact failure core/halt.c already carries scar tissue about. So the
+ * panic path takes the lock if it can and writes anyway if it cannot: a torn panic message is still
+ * infinitely more useful than no panic message.
+ */
+void hype_logbuf_append_unlocked(const char *s) {
     if (s == 0) {
         return;
     }
@@ -30,6 +61,20 @@ void hype_logbuf_append(const char *s) {
         g_logbuf.checksum += (unsigned char)*s;
         s++;
     }
+}
+
+int hype_logbuf_try_lock(void) {
+    return __atomic_exchange_n(&g_logbuf_lock, 1, __ATOMIC_ACQUIRE) == 0;
+}
+
+void hype_logbuf_unlock(void) {
+    logbuf_unlock();
+}
+
+void hype_logbuf_append(const char *s) {
+    logbuf_lock();
+    hype_logbuf_append_unlocked(s);
+    logbuf_unlock();
 }
 
 const char *hype_logbuf_data(void) {

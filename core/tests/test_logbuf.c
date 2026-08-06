@@ -163,6 +163,136 @@ static void test_find_honours_stride(void) {
               hype_logbuf_find(buf, sizeof(buf), 8u) == (const hype_logbuf_t *)(buf + 4096 + 64));
 }
 
+/* ---- #338: concurrent appends must not lose or tear records ---- */
+
+#include <pthread.h>
+#include <string.h>
+
+#define CONC_THREADS 4
+#define CONC_RECORDS 25000
+
+/* Each thread appends its own fixed-length record repeatedly. Fixed length matters: it makes a torn
+ * or lost record detectable by simple counting, with no parsing. */
+static const char *const g_conc_rec[CONC_THREADS] = {
+    "AAAAAAAAAAAAAAAA\n", "BBBBBBBBBBBBBBBB\n", "CCCCCCCCCCCCCCCC\n", "DDDDDDDDDDDDDDDD\n"
+};
+
+/* Start barrier: without it a fast thread can finish before the next is scheduled, and the appends
+ * never actually overlap -- which is how the first version of this test passed with the lock REMOVED
+ * and therefore proved nothing. */
+static volatile int g_conc_go;
+
+static void *conc_worker(void *arg) {
+    unsigned t = (unsigned)(unsigned long)arg;
+    int i;
+    while (__atomic_load_n(&g_conc_go, __ATOMIC_ACQUIRE) == 0) {
+    }
+    for (i = 0; i < CONC_RECORDS; i++) {
+        hype_logbuf_append(g_conc_rec[t]);
+    }
+    return 0;
+}
+
+static void test_concurrent_appends_lose_nothing(void) {
+    pthread_t th[CONC_THREADS];
+    unsigned long t;
+    const char *data;
+    unsigned long len, i;
+    int counts[CONC_THREADS];
+    unsigned long expect_bytes = (unsigned long)CONC_THREADS * CONC_RECORDS * 17ul;
+
+    hype_logbuf_reset();
+    g_conc_go = 0;
+    for (t = 0; t < CONC_THREADS; t++) {
+        counts[t] = 0;
+        pthread_create(&th[t], 0, conc_worker, (void *)t);
+    }
+    __atomic_store_n(&g_conc_go, 1, __ATOMIC_RELEASE);
+    for (t = 0; t < CONC_THREADS; t++) {
+        pthread_join(th[t], 0);
+    }
+
+    data = hype_logbuf_data();
+    len = (unsigned long)hype_logbuf_len();
+
+    /*
+     * The assertion that catches the shared-index bug: with an unsynchronised len, two threads write
+     * to the same offset and the total comes out SHORT. Byte count alone proves nothing was lost.
+     */
+    CHECK_INT("no bytes lost to a racing append", (int)expect_bytes, (int)len);
+
+    /* And nothing torn: every 17-byte slot must be one whole record, not a mix. */
+    for (i = 0; i + 17ul <= len; i += 17ul) {
+        unsigned t2;
+        int matched = 0;
+        for (t2 = 0; t2 < CONC_THREADS; t2++) {
+            if (memcmp(data + i, g_conc_rec[t2], 17) == 0) {
+                counts[t2]++;
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched) {
+            CHECK_INT("a record was TORN by a concurrent append", 1, 0);
+            break;
+        }
+    }
+    for (t = 0; t < CONC_THREADS; t++) {
+        CHECK_INT("every record from this writer survived exactly once", CONC_RECORDS, counts[t]);
+    }
+}
+
+
+static void test_panic_path_never_blocks(void) {
+    /* The deadlock this guards: a core faults INSIDE the critical section, so the lock is still held
+     * when hype_fatal() runs. The panic path must write anyway rather than spin forever -- a silent
+     * hang is indistinguishable from the fault itself. */
+    hype_logbuf_reset();
+    CHECK_INT("lock is free to start", 1, hype_logbuf_try_lock());
+    /* Now held, exactly as a faulted core would leave it. */
+    CHECK_INT("a second try_lock reports FAILURE rather than blocking", 0, hype_logbuf_try_lock());
+    hype_logbuf_append_unlocked("PANIC: still written\n");
+    CHECK_INT("the panic text landed despite the lock being held", 21, hype_logbuf_len());
+    hype_logbuf_unlock();
+    CHECK_INT("and the lock is releasable afterwards", 1, hype_logbuf_try_lock());
+    hype_logbuf_unlock();
+}
+
+
+static void test_capacity_truncation_is_flagged(void) {
+    /* The buffer is finite and a hypervisor that logs enough WILL reach the end. Overflow must set
+     * the flag rather than wrap or write past it -- a silently short log is how a debug run looks
+     * complete while missing the part that mattered. */
+    unsigned long i;
+    char chunk[1025];
+
+    hype_logbuf_reset();
+    for (i = 0; i < 1024ul; i++) {
+        chunk[i] = 'x';
+    }
+    chunk[1024] = '\0';
+    CHECK_INT("not truncated to start", 0, hype_logbuf_truncated());
+    for (i = 0; i < (HYPE_LOGBUF_CAPACITY / 1024u) + 2ul; i++) {
+        hype_logbuf_append(chunk);
+    }
+    CHECK_INT("capacity is respected", (int)HYPE_LOGBUF_CAPACITY, (int)hype_logbuf_len());
+    CHECK_INT("and overflow is FLAGGED, not silent", 1, hype_logbuf_truncated());
+    hype_logbuf_reset();
+    CHECK_INT("reset clears the flag", 0, hype_logbuf_truncated());
+}
+
+
+static void test_null_and_empty_appends_are_safe(void) {
+    hype_logbuf_reset();
+    hype_logbuf_append(0);  /* callers do pass NULL: a format that produced nothing */
+    CHECK_INT("a NULL append is a no-op, not a crash", 0, hype_logbuf_len());
+    hype_logbuf_append("");
+    CHECK_INT("an empty append is a no-op", 0, hype_logbuf_len());
+    hype_logbuf_append_unlocked(0);
+    CHECK_INT("...and on the panic path too", 0, hype_logbuf_len());
+}
+
+
 int main(void) {
     test_append_accumulates_in_order();
     test_reset_clears();
@@ -172,6 +302,10 @@ int main(void) {
     test_live_buffer_validates_and_is_findable();
     test_find_at_offset_and_rejections();
     test_find_honours_stride();
+    test_concurrent_appends_lose_nothing();
+    test_panic_path_never_blocks();
+    test_capacity_truncation_is_flagged();
+    test_null_and_empty_appends_are_safe();
 
     if (failures == 0) {
         printf("all tests passed\n");

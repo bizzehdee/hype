@@ -81,9 +81,21 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
     /* Capture the panic in the console log, then flush it to disk (if a
      * hook is registered) before halting -- so a mid-run panic on real
      * hardware still leaves \hype-log.txt ending with the cause. */
-    hype_logbuf_append("PANIC: ");
-    hype_logbuf_append(msg);
-    hype_logbuf_append("\n");
+    /*
+     * #338: NEVER block here. This core may already hold the log lock -- hype_fatal() can be reached
+     * from inside a logging call, or from a fault taken within one -- and blocking would turn a
+     * readable panic into a silent hang, which is the exact failure this file already carries scar
+     * tissue about. Take the lock if it is free, write regardless. A torn panic beats no panic.
+     */
+    {
+        int held = hype_logbuf_try_lock();
+        hype_logbuf_append_unlocked("PANIC: ");
+        hype_logbuf_append_unlocked(msg);
+        hype_logbuf_append_unlocked("\n");
+        if (held) {
+            hype_logbuf_unlock();
+        }
+    }
 
     /*
      * Persist BEFORE painting. Ordering here is load-bearing, and getting it

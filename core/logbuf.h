@@ -100,4 +100,12 @@ int hype_logbuf_validate(const hype_logbuf_t *hdr);
  */
 const hype_logbuf_t *hype_logbuf_find(const void *base, unsigned long size, unsigned long stride);
 
+/*
+ * #338: the panic path's escape hatch. hype_fatal() must never BLOCK on the log lock -- it may already
+ * hold it -- so it try-locks and writes regardless. A torn panic beats a silent hang.
+ */
+int hype_logbuf_try_lock(void);
+void hype_logbuf_unlock(void);
+void hype_logbuf_append_unlocked(const char *s);
+
 #endif /* HYPE_CORE_LOGBUF_H */
