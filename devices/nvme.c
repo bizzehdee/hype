@@ -383,3 +383,95 @@ int hype_nvme_prp_next(hype_nvme_prp_iter_t *it, hype_nvme_guest_read_fn read_fn
         return 1;
     }
 }
+
+/* ---- slice 4: I/O READ/WRITE (#202) ------------------------------------------------------------ */
+
+uint16_t hype_nvme_exec_io(const hype_nvme_cmd_t *cmd, hype_blk_backend_t *be,
+                           uint64_t total_sectors, uint32_t page_size,
+                           hype_nvme_guest_read_fn gread, hype_nvme_guest_write_fn gwrite,
+                           void *gctx, uint8_t *bounce, uint32_t bounce_len) {
+    hype_nvme_prp_iter_t it;
+    uint64_t slba;
+    uint32_t nlb;
+    uint64_t total_bytes;
+    uint64_t sectors_done = 0;
+    int is_write;
+
+    if (cmd == 0 || be == 0 || bounce == 0 || bounce_len < page_size) {
+        return HYPE_NVME_SC_INVALID_FIELD;
+    }
+    if (cmd->opcode == HYPE_NVME_IO_WRITE) {
+        is_write = 1;
+    } else if (cmd->opcode == HYPE_NVME_IO_READ) {
+        is_write = 0;
+    } else {
+        return HYPE_NVME_SC_INVALID_OPCODE;
+    }
+
+    /* SLBA is 64-bit across CDW10/CDW11 -- CDW10 alone is right until the disk exceeds 2 TiB. */
+    slba = (uint64_t)cmd->cdw10 | ((uint64_t)cmd->cdw11 << 32);
+    /* NLB is ZERO-BASED: 0 means one block. */
+    nlb = (cmd->cdw12 & 0xFFFFu) + 1u;
+
+    /* VALID-3: the range is checked against the backend's REAL size before any access. */
+    if (slba > total_sectors || (uint64_t)nlb > total_sectors - slba) {
+        return HYPE_NVME_SC_LBA_OUT_OF_RANGE;
+    }
+    total_bytes = (uint64_t)nlb * HYPE_BLK_SECTOR_SIZE;
+
+    if (hype_nvme_prp_init(&it, cmd->prp1, cmd->prp2, total_bytes, page_size) != 0) {
+        return HYPE_NVME_SC_INVALID_FIELD;
+    }
+
+    for (;;) {
+        uint64_t gpa;
+        uint32_t seg;
+        uint32_t seg_sectors;
+        int rc = hype_nvme_prp_next(&it, gread, gctx, &gpa, &seg);
+
+        if (rc == 0) {
+            break; /* transfer complete */
+        }
+        if (rc < 0) {
+            return HYPE_NVME_SC_DATA_XFER_ERROR;
+        }
+        /*
+         * hype transfers whole sectors. A segment that is not a sector multiple would mean the guest
+         * pointed PRP1 at a non-sector-aligned offset; REFUSE rather than split across a sector
+         * boundary by hand, because a wrong split writes the right bytes to the wrong place and
+         * nothing reports it. Real drivers align their buffers, so this refuses only the malformed
+         * case.
+         */
+        if ((seg % HYPE_BLK_SECTOR_SIZE) != 0u || seg > bounce_len) {
+            return HYPE_NVME_SC_INVALID_FIELD;
+        }
+        seg_sectors = seg / HYPE_BLK_SECTOR_SIZE;
+
+        if (is_write) {
+            if (gread == 0 || gread(gctx, gpa, seg, bounce) != 0) {
+                return HYPE_NVME_SC_DATA_XFER_ERROR;
+            }
+            if (hype_blk_backend_write(be, slba + sectors_done, seg_sectors, bounce) != 0) {
+                return HYPE_NVME_SC_DATA_XFER_ERROR;
+            }
+        } else {
+            if (hype_blk_backend_read(be, slba + sectors_done, seg_sectors, bounce) != 0) {
+                return HYPE_NVME_SC_DATA_XFER_ERROR;
+            }
+            if (gwrite == 0 || gwrite(gctx, gpa, seg, bounce) != 0) {
+                return HYPE_NVME_SC_DATA_XFER_ERROR;
+            }
+        }
+        sectors_done += seg_sectors;
+    }
+
+    /*
+     * The PRP walk and the block count must agree. If they do not, the descriptor described a different
+     * amount of memory than the command asked to transfer -- report it rather than declaring success on
+     * a partial transfer, which a driver would read as good data.
+     */
+    if (sectors_done != (uint64_t)nlb) {
+        return HYPE_NVME_SC_DATA_XFER_ERROR;
+    }
+    return HYPE_NVME_SC_SUCCESS;
+}

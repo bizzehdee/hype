@@ -2,6 +2,7 @@
 #define HYPE_DEVICES_NVME_H
 
 #include <stdint.h>
+#include "../core/blk_backend.h"
 
 /*
  * M5-10 (#202): a GUEST-FACING NVMe controller model -- what a VM's own driver talks to.
@@ -238,5 +239,36 @@ int hype_nvme_prp_init(hype_nvme_prp_iter_t *it, uint64_t prp1, uint64_t prp2, u
  */
 int hype_nvme_prp_next(hype_nvme_prp_iter_t *it, hype_nvme_guest_read_fn read_fn, void *ctx,
                        uint64_t *out_gpa, uint32_t *out_len);
+
+
+/* ---- slice 4: I/O READ/WRITE (#202) ------------------------------------------------------------ */
+
+/* Writes `len` bytes into guest physical memory. Bounds-checking gpa+len against the VM's mapped range
+ * (VALID-3) is the implementation's responsibility -- this is the single point where a guest-supplied
+ * address becomes a host write. */
+typedef int (*hype_nvme_guest_write_fn)(void *ctx, uint64_t gpa, uint32_t len, const void *src);
+
+/*
+ * Executes one NVMe I/O command (READ 0x02 / WRITE 0x01) against `be`, returning an NVMe status code
+ * (HYPE_NVME_SC_*). HYPE_NVME_SC_SUCCESS means the whole transfer completed.
+ *
+ * Two encodings here are the classic ways to get this wrong, and both are silent:
+ *
+ *   - NLB IS ZERO-BASED. CDW12's low 16 bits hold "number of logical blocks MINUS ONE", so a request
+ *     for one block arrives as 0. Reading it literally transfers nothing for every single-block
+ *     command -- and a driver whose read returns no data but reports success sees corrupt content, not
+ *     an error.
+ *   - SLBA IS 64-BIT, split across CDW10 (low) and CDW11 (high). Using only CDW10 works perfectly on
+ *     any disk under 2 TiB and then wraps.
+ *
+ * `bounce` is caller-supplied staging of at least `page_size` bytes: data has to land somewhere host-
+ * side between the backend and guest memory, and this module allocates nothing.
+ *
+ * Pure apart from the injected callbacks and the backend, so every path is unit tested with no VM.
+ */
+uint16_t hype_nvme_exec_io(const hype_nvme_cmd_t *cmd, hype_blk_backend_t *be,
+                           uint64_t total_sectors, uint32_t page_size,
+                           hype_nvme_guest_read_fn gread, hype_nvme_guest_write_fn gwrite,
+                           void *gctx, uint8_t *bounce, uint32_t bounce_len);
 
 #endif /* HYPE_DEVICES_NVME_H */

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../devices/nvme.h"
+#include "../blk_backend.h"
 
 static int failures = 0;
 
@@ -470,6 +471,288 @@ static void test_prp_refuses_malformed_descriptors(void) {
 }
 
 
+/* ---- slice 4: I/O READ/WRITE over a blk_backend ---- */
+
+/* A tiny in-memory backend plus a fake guest RAM, so data actually round-trips. */
+#define DISK_SECTORS 64u
+static uint8_t g_disk[DISK_SECTORS * 512u];
+static uint8_t g_gram[64u * 1024u];
+#define GRAM_BASE 0x400000ull
+
+static int disk_read(void *ctx, uint64_t lba, uint32_t count, void *buf) {
+    (void)ctx;
+    if (lba + count > DISK_SECTORS) return -1;
+    memcpy(buf, g_disk + lba * 512u, (size_t)count * 512u);
+    return 0;
+}
+static int disk_write(void *ctx, uint64_t lba, uint32_t count, const void *buf) {
+    (void)ctx;
+    if (lba + count > DISK_SECTORS) return -1;
+    memcpy(g_disk + lba * 512u, buf, (size_t)count * 512u);
+    return 0;
+}
+static int gram_read(void *ctx, uint64_t gpa, uint32_t len, void *dst) {
+    (void)ctx;
+    /* Serve PRP lists too, so a large transfer can be exercised. */
+    if (gpa >= LIST_BASE && gpa < LIST_BASE + sizeof(g_list)) {
+        return fake_guest_read(ctx, gpa, len, dst);
+    }
+    if (gpa < GRAM_BASE || gpa + len > GRAM_BASE + sizeof(g_gram)) return -1;
+    memcpy(dst, g_gram + (gpa - GRAM_BASE), len);
+    return 0;
+}
+static int gram_write(void *ctx, uint64_t gpa, uint32_t len, const void *src) {
+    (void)ctx;
+    if (gpa < GRAM_BASE || gpa + len > GRAM_BASE + sizeof(g_gram)) return -1;
+    memcpy(g_gram + (gpa - GRAM_BASE), src, len);
+    return 0;
+}
+
+static void io_backend(hype_blk_backend_t *be) {
+    be->read = disk_read;
+    be->write = disk_write;
+    be->ctx = 0;
+    be->total_sectors = DISK_SECTORS;
+}
+
+static void mk_io_cmd(hype_nvme_cmd_t *c, uint8_t op, uint64_t slba, uint32_t blocks, uint64_t prp1,
+                      uint64_t prp2) {
+    memset(c, 0, sizeof(*c));
+    c->opcode = op;
+    c->cid = 1u;
+    c->prp1 = prp1;
+    c->prp2 = prp2;
+    c->cdw10 = (uint32_t)slba;
+    c->cdw11 = (uint32_t)(slba >> 32);
+    c->cdw12 = blocks - 1u; /* NLB is ZERO-BASED -- the caller passes a real count */
+}
+
+static void test_io_read_single_block_nlb_is_zero_based(void) {
+    hype_blk_backend_t be;
+    hype_nvme_cmd_t c;
+    static uint8_t bounce[4096];
+    unsigned i;
+
+    io_backend(&be);
+    for (i = 0; i < 512u; i++) g_disk[i] = (uint8_t)(i & 0xFFu);
+    memset(g_gram, 0, sizeof(g_gram));
+
+    /* ONE block. NLB arrives as 0; read literally, this transfers nothing -- and a driver whose read
+     * "succeeded" but moved no data sees corrupt content rather than an error. */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 1u, GRAM_BASE, 0);
+    CHECK_HEX("single-block read succeeds", HYPE_NVME_SC_SUCCESS,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    CHECK_HEX("first byte landed", 0u, g_gram[0]);
+    CHECK_HEX("last byte of the sector landed", 511u & 0xFFu, g_gram[511]);
+    CHECK_HEX("and NOTHING beyond one sector was written", 0u, g_gram[512]);
+}
+
+static void test_io_read_write_roundtrip_multi_sector(void) {
+    hype_blk_backend_t be;
+    hype_nvme_cmd_t c;
+    static uint8_t bounce[4096];
+    unsigned i;
+
+    io_backend(&be);
+    memset(g_disk, 0, sizeof(g_disk));
+    for (i = 0; i < 2048u; i++) g_gram[i] = (uint8_t)(0xA0u + (i % 7u));
+
+    /* WRITE 4 blocks from guest RAM at LBA 8. */
+    mk_io_cmd(&c, HYPE_NVME_IO_WRITE, 8u, 4u, GRAM_BASE, 0);
+    CHECK_HEX("write succeeds", HYPE_NVME_SC_SUCCESS,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    CHECK_HEX("landed at the right LBA", 0xA0u, g_disk[8u * 512u]);
+    CHECK_HEX("and not at LBA 7", 0u, g_disk[7u * 512u]);
+
+    /* READ it back to a different guest address and compare. */
+    memset(g_gram + 4096u, 0, 2048u);
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 8u, 4u, GRAM_BASE + 4096u, 0);
+    CHECK_HEX("read back succeeds", HYPE_NVME_SC_SUCCESS,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    CHECK_HEX("round-trip is byte-exact", 0, memcmp(g_gram, g_gram + 4096u, 2048u));
+}
+
+static void test_io_uses_the_full_64bit_slba(void) {
+    hype_blk_backend_t be;
+    hype_nvme_cmd_t c;
+    static uint8_t bounce[4096];
+
+    io_backend(&be);
+    /* CDW11 non-zero puts SLBA far past the disk. If only CDW10 were read, this would look like LBA 0
+     * and quietly transfer the WRONG SECTORS -- correct on any disk under 2 TiB, then wrapping. */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 1u, GRAM_BASE, 0);
+    c.cdw11 = 1u; /* SLBA = 2^32 */
+    CHECK_HEX("a 64-bit SLBA past the end is refused", HYPE_NVME_SC_LBA_OUT_OF_RANGE,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+}
+
+static void test_io_bounds_and_error_paths(void) {
+    hype_blk_backend_t be;
+    hype_nvme_cmd_t c;
+    static uint8_t bounce[4096];
+
+    io_backend(&be);
+
+    /* VALID-3: the range is checked against the backend's REAL size. */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, DISK_SECTORS, 1u, GRAM_BASE, 0);
+    CHECK_HEX("starting past the end is refused", HYPE_NVME_SC_LBA_OUT_OF_RANGE,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    /* Straddling the end: the dangerous one, since the first sectors ARE valid. */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, DISK_SECTORS - 2u, 4u, GRAM_BASE, 0);
+    CHECK_HEX("straddling the end is refused", HYPE_NVME_SC_LBA_OUT_OF_RANGE,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    /* The last sector exactly IS allowed -- an off-by-one here would make the final block unreachable. */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, DISK_SECTORS - 1u, 1u, GRAM_BASE, 0);
+    CHECK_HEX("the final sector is readable", HYPE_NVME_SC_SUCCESS,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+
+    /* A guest address outside mapped RAM must fail the command, not be written anyway. */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 1u, 0xDEAD0000ull, 0);
+    CHECK_HEX("an unmapped PRP fails the transfer", HYPE_NVME_SC_DATA_XFER_ERROR,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+
+    /*
+     * A non-sector-multiple segment is REFUSED rather than hand-split: a wrong split writes the right
+     * bytes to the wrong place and nothing reports it.
+     *
+     * Note what it takes to PRODUCE one, because my first attempt at this test did not: with a small
+     * transfer the first segment is clamped by the bytes REMAINING (always a sector multiple), so a
+     * misaligned PRP1 offset alone is harmless. The partial-sector split only appears when the PAGE
+     * BOUNDARY is what limits the segment -- offset 100 with 8192 bytes to move gives 3996.
+     */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 16u, GRAM_BASE + 100u, GRAM_BASE + 8192u);
+    CHECK_HEX("a page-boundary partial-sector split is refused", HYPE_NVME_SC_INVALID_FIELD,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    /* ...while a misaligned offset that does NOT straddle a sector is fine. */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 2u, GRAM_BASE + 100u, 0);
+    CHECK_HEX("a harmless misaligned offset still works", HYPE_NVME_SC_SUCCESS,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+
+    /* Unknown opcode, and the guard rails. */
+    mk_io_cmd(&c, 0x7Fu, 0, 1u, GRAM_BASE, 0);
+    CHECK_HEX("an unknown opcode is reported", HYPE_NVME_SC_INVALID_OPCODE,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 1u, GRAM_BASE, 0);
+    CHECK_HEX("a bounce smaller than a page is refused", HYPE_NVME_SC_INVALID_FIELD,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce, 64u));
+    CHECK_HEX("a NULL backend is refused", HYPE_NVME_SC_INVALID_FIELD,
+              hype_nvme_exec_io(&c, 0, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+}
+
+static void test_io_spanning_two_prp_pages(void) {
+    hype_blk_backend_t be;
+    hype_nvme_cmd_t c;
+    static uint8_t bounce[4096];
+    unsigned i;
+
+    io_backend(&be);
+    for (i = 0; i < 16u * 512u; i++) g_disk[i] = (uint8_t)(i * 3u);
+    memset(g_gram, 0, sizeof(g_gram));
+
+    /* 16 blocks = 8192 bytes = exactly two pages, so PRP2 is the second DATA page. Both halves must
+     * land, and at the right guest addresses. */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 16u, GRAM_BASE, GRAM_BASE + 4096u);
+    CHECK_HEX("two-page read succeeds", HYPE_NVME_SC_SUCCESS,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    CHECK_HEX("first page byte 0", (unsigned)(uint8_t)0u, g_gram[0]);
+    CHECK_HEX("second page starts at disk offset 4096", (unsigned)(uint8_t)(4096u * 3u),
+              g_gram[4096]);
+    CHECK_HEX("last byte of the transfer", (unsigned)(uint8_t)((8192u - 1u) * 3u), g_gram[8191]);
+}
+
+
+static int g_disk_write_fails = 0;
+static int disk_write_maybe_fails(void *ctx, uint64_t lba, uint32_t count, const void *buf) {
+    if (g_disk_write_fails) return -1;
+    return disk_write(ctx, lba, count, buf);
+}
+static int g_disk_read_fails = 0;
+static int disk_read_maybe_fails(void *ctx, uint64_t lba, uint32_t count, void *buf) {
+    if (g_disk_read_fails) return -1;
+    return disk_read(ctx, lba, count, buf);
+}
+
+static void test_io_backend_and_callback_failures_are_reported(void) {
+    hype_blk_backend_t be;
+    hype_nvme_cmd_t c;
+    static uint8_t bounce[4096];
+
+    io_backend(&be);
+    be.write = disk_write_maybe_fails;
+    be.read = disk_read_maybe_fails;
+
+    /*
+     * A backend that fails mid-transfer must FAIL THE COMMAND. Reporting success on a partial write is
+     * the worst option: the guest believes its data is durable when some of it never landed.
+     */
+    g_disk_write_fails = 1;
+    mk_io_cmd(&c, HYPE_NVME_IO_WRITE, 0, 2u, GRAM_BASE, 0);
+    CHECK_HEX("a failing backend write is reported", HYPE_NVME_SC_DATA_XFER_ERROR,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    g_disk_write_fails = 0;
+
+    g_disk_read_fails = 1;
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 2u, GRAM_BASE, 0);
+    CHECK_HEX("a failing backend read is reported", HYPE_NVME_SC_DATA_XFER_ERROR,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    g_disk_read_fails = 0;
+
+    /* A WRITE whose guest source is unreadable must not write stale bounce contents to the disk. */
+    mk_io_cmd(&c, HYPE_NVME_IO_WRITE, 0, 2u, 0xDEAD0000ull, 0);
+    CHECK_HEX("an unmapped write source is reported", HYPE_NVME_SC_DATA_XFER_ERROR,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+
+    /* Missing callbacks: fail the command rather than dereference nothing. */
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 1u, GRAM_BASE, 0);
+    CHECK_HEX("a read with no guest-write callback fails", HYPE_NVME_SC_DATA_XFER_ERROR,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, 0, 0, bounce,
+                                sizeof(bounce)));
+    mk_io_cmd(&c, HYPE_NVME_IO_WRITE, 0, 1u, GRAM_BASE, 0);
+    CHECK_HEX("a write with no guest-read callback fails", HYPE_NVME_SC_DATA_XFER_ERROR,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, 0, gram_write, 0, bounce,
+                                sizeof(bounce)));
+
+    /* A NULL command and a bounce of zero length. */
+    CHECK_HEX("NULL command refused", HYPE_NVME_SC_INVALID_FIELD,
+              hype_nvme_exec_io(0, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 1u, GRAM_BASE, 0);
+    CHECK_HEX("NULL bounce refused", HYPE_NVME_SC_INVALID_FIELD,
+              hype_nvme_exec_io(&c, &be, DISK_SECTORS, 4096u, gram_read, gram_write, 0, 0,
+                                sizeof(bounce)));
+}
+
+static void test_io_zero_size_disk_refuses_everything(void) {
+    hype_blk_backend_t be;
+    hype_nvme_cmd_t c;
+    static uint8_t bounce[4096];
+
+    io_backend(&be);
+    mk_io_cmd(&c, HYPE_NVME_IO_READ, 0, 1u, GRAM_BASE, 0);
+    /* total_sectors 0: every LBA is out of range, including 0. An off-by-one that allowed LBA 0 here
+     * would read a backend that has nothing. */
+    CHECK_HEX("a zero-sector namespace refuses LBA 0", HYPE_NVME_SC_LBA_OUT_OF_RANGE,
+              hype_nvme_exec_io(&c, &be, 0u, 4096u, gram_read, gram_write, 0, bounce,
+                                sizeof(bounce)));
+}
+
+
 int main(void) {
     test_phase_starts_at_one();
     test_phase_toggles_only_on_wrap();
@@ -491,6 +774,13 @@ int main(void) {
     test_prp2_is_a_list_when_the_transfer_is_larger();
     test_prp_list_chains_at_the_last_slot();
     test_prp_refuses_malformed_descriptors();
+    test_io_read_single_block_nlb_is_zero_based();
+    test_io_read_write_roundtrip_multi_sector();
+    test_io_uses_the_full_64bit_slba();
+    test_io_bounds_and_error_paths();
+    test_io_spanning_two_prp_pages();
+    test_io_backend_and_callback_failures_are_reported();
+    test_io_zero_size_disk_refuses_everything();
 
     if (failures == 0) {
         printf("all tests passed\n");
