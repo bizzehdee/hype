@@ -7228,6 +7228,28 @@ static hype_cfg_t g_hype_cfg;
  *   3. Otherwise §5.6's default from os_hint: windows -> ahci-sata (no inbox virtio driver, so a
  *      virtio system disk is invisible at install), everything else -> virtio-blk.
  */
+/*
+ * #329 2b(ii): the [disk.*] entry behind the VM's slot-i disks= reference, or 0 when there is no
+ * config, the list is shorter than i, or the id resolves to nothing (admission reports that; the
+ * caller falls back rather than inventing a device). This lookup existed in three copies --
+ * fw_1_target_bus, and twice in fw_1_vblk_use_image_file -- before it was extracted.
+ */
+static const hype_cfg_disk_t *fw_1_slot_cfg(const hype_fw_vm_t *vm, unsigned int slot) {
+    unsigned vi = (unsigned)(vm - &g_vms[0]);
+    const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+    unsigned int di;
+
+    if (cv == 0 || slot >= cv->disks_count) {
+        return 0;
+    }
+    for (di = 0; di < g_hype_cfg.disk_count; di++) {
+        if (term_streq(g_hype_cfg.disks[di].id, cv->disks[slot])) {
+            return &g_hype_cfg.disks[di];
+        }
+    }
+    return 0;
+}
+
 static hype_cfg_bus_t fw_1_target_bus(const hype_fw_vm_t *vm) {
     unsigned vi = (unsigned)(vm - &g_vms[0]);
     const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
@@ -7256,11 +7278,9 @@ static hype_cfg_bus_t fw_1_target_bus(const hype_fw_vm_t *vm) {
      * cannot serve.
      */
     if (cv->disks_count > 0u) {
-        unsigned int di;
-        for (di = 0; di < g_hype_cfg.disk_count; di++) {
-            if (term_streq(g_hype_cfg.disks[di].id, cv->disks[0])) {
-                return hype_cfg_resolve_bus(&g_hype_cfg.disks[di], cv->os_hint);
-            }
+        const hype_cfg_disk_t *cd = fw_1_slot_cfg(vm, 0);
+        if (cd != 0) {
+            return hype_cfg_resolve_bus(cd, cv->os_hint);
         }
         /* Named a disk that does not exist: admission (#329) reports it; fall through to the default
          * rather than inventing a front-end for a device that is not there. */
@@ -7269,6 +7289,50 @@ static hype_cfg_bus_t fw_1_target_bus(const hype_fw_vm_t *vm) {
         return HYPE_CFG_BUS_AHCI_SATA;
     }
     return hype_cfg_resolve_bus(&d, cv->os_hint);
+}
+
+/*
+ * #329 2b(ii): which bus disk slot `i` resolved to. Slot 0 keeps fw_1_target_bus() -- ALL its
+ * legacy fallbacks (no-config AHCI, boot=disk forcing AHCI, os_hint defaults) apply only to the
+ * one disk that existed before multi-disk. An extra slot exists ONLY because a [disk.*] entry
+ * put it there, so its bus comes from that entry alone.
+ */
+static hype_cfg_bus_t fw_1_slot_bus(const hype_fw_vm_t *vm, unsigned int slot) {
+    unsigned vi = (unsigned)(vm - &g_vms[0]);
+    const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+    const hype_cfg_disk_t *cd;
+
+    if (slot == 0u) {
+        return fw_1_target_bus(vm);
+    }
+    cd = fw_1_slot_cfg(vm, slot);
+    return (cd != 0 && cv != 0) ? hype_cfg_resolve_bus(cd, cv->os_hint) : HYPE_CFG_BUS_DEFAULT;
+}
+
+/*
+ * #329 2b(ii): the PCI device number disk slot `i` presents on. Slot 0 keeps the legacy per-bus
+ * numbers (virtio=3, ahci=4, nvme=5) so an existing config's guest sees an unchanged machine;
+ * slots 1 and 2 are devices 6 and 7 whatever their bus, matching the _PRT entries (dev6->GSI22,
+ * dev7->GSI23) landed in 49daf37.
+ */
+static unsigned int fw_1_slot_pci_dev(unsigned int slot, hype_cfg_bus_t bus) {
+    if (slot != 0u) {
+        return 5u + slot; /* 6, 7 */
+    }
+    switch (bus) {
+    case HYPE_CFG_BUS_NVME: return HYPE_FW_1_PCI_DEV_NVME;
+    case HYPE_CFG_BUS_AHCI_SATA: return HYPE_FW_1_PCI_DEV_ATA;
+    default: return HYPE_FW_1_PCI_DEV_VIRTIO_BLK;
+    }
+}
+
+/* #329 2b(ii): the guest-side GSI a slot's completion IRQ is raised on -- must match the DSDT
+ * _PRT. Slot 0 keeps the legacy per-bus lines; extra slots own GSIs 22/23 whatever their bus. */
+static unsigned int fw_1_slot_gsi(unsigned int slot, hype_cfg_bus_t bus) {
+    if (slot != 0u) {
+        return 21u + slot; /* 22, 23 */
+    }
+    return (bus == HYPE_CFG_BUS_AHCI_SATA) ? HYPE_FW_1_ATA_GSI : HYPE_FW_1_VIRTIO_GSI;
 }
 
 /*
@@ -7350,22 +7414,26 @@ void hype_nvme_report_enabled(const hype_nvme_t *dev) {
     hype_serial_print("fw-1: NVMe controller ENABLED by the guest driver (CC.EN set) -- it bound (#202)\n");
 }
 
-static void nvme_fill_ctx(hype_nvme_ctx_t *c, hype_fw_vm_t *vm) {
+static void nvme_fill_ctx(hype_nvme_ctx_t *c, hype_fw_vm_t *vm, unsigned int slot) {
+    hype_fw_disk_t *d = &vm->disk[slot];
     unsigned long long i;
     unsigned char *p = (unsigned char *)c;
 
     for (i = 0; i < sizeof(*c); i++) {
         p[i] = 0;
     }
-    c->be = &vm->disk[0].be;             /* the same backend every front-end shares (#196) */
-    c->total_sectors = vm->disk[0].be.total_sectors;
+    c->be = &d->be;             /* #329 2b(ii): THIS slot's backend, not always slot 0's */
+    c->total_sectors = d->be.total_sectors;
     c->page_size = 4096u;
     c->gread = nvme_guest_read;
     c->gwrite = nvme_guest_write;
     c->gctx = vm;
-    c->bounce = vm->disk[0].nvme_bounce;
-    c->bounce_len = (uint32_t)sizeof(vm->disk[0].nvme_bounce);
-    c->serial = vm->name;             /* per VM, like virtio-blk's GET_ID serial (#310) */
+    c->bounce = d->nvme_bounce;
+    c->bounce_len = (uint32_t)sizeof(d->nvme_bounce);
+    /* Slot 0 keeps the per-VM name (unchanged for existing configs); an extra slot uses its
+     * [disk.*] id -- two disks on one VM must not share a serial (#310, one level down). */
+    c->serial = (slot == 0u) ? vm->name
+                             : (fw_1_slot_cfg(vm, slot) ? fw_1_slot_cfg(vm, slot)->id : vm->name);
 }
 
 /* #332: the partition vm0's `physical:` target names, 0 for the whole disk. */
@@ -7412,7 +7480,8 @@ extern unsigned g_media_dev_count;
 static int media_use_dev(unsigned i);
 static int media_selected_dev(unsigned vi); /* #323 */
 
-static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
+static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
+    hype_fw_disk_t *d = &vm->disk[slot];
     hype_gpt_partition_t part;
     hype_fat_file_t file;
     const char *path = HYPE_M5_8_IMAGE_PATH;
@@ -7439,7 +7508,7 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
     int path_configured = 0;
     int sel = media_selected_dev(vi); /* #323 */
 
-    if (cv != 0 && cv->target_disk.kind == HYPE_CFG_DISK_FILE &&
+    if (slot == 0u && cv != 0 && cv->target_disk.kind == HYPE_CFG_DISK_FILE &&
         cv->target_disk.path_or_id[0] != '\0') {
         path = cv->target_disk.path_or_id;
         path_configured = 1;
@@ -7451,21 +7520,24 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
      * the sugar survives for one-line configs). First attached disk only, matching
      * fw_1_target_bus(): a second entry cannot be honoured until the per-slot attach lands.
      */
-    if (cv != 0 && cv->disks_count > 0u) {
-        unsigned int di;
-        for (di = 0; di < g_hype_cfg.disk_count; di++) {
-            const hype_cfg_disk_t *cd = &g_hype_cfg.disks[di];
-            if (!term_streq(cd->id, cv->disks[0])) {
-                continue;
-            }
-            if (cd->backing == HYPE_CFG_BACKING_FILE && cd->has_path && cd->path[0] != '\0') {
-                path = cd->path;
-                path_configured = 1;
-            }
-            break;
+    {
+        const hype_cfg_disk_t *cd = fw_1_slot_cfg(vm, slot);
+        if (cd != 0 && cd->backing == HYPE_CFG_BACKING_FILE && cd->has_path &&
+            cd->path[0] != '\0') {
+            path = cd->path;
+            path_configured = 1;
         }
     }
 
+    /*
+     * #329 2b(ii): an EXTRA slot exists only because a [disk.*] entry named a file for it -- the
+     * legacy target_disk sugar and the built-in default path are slot-0 facts. No path here means
+     * nothing to resolve, and the caller does NOT present the slot: a silently-empty extra disk
+     * is the #285 failure mode.
+     */
+    if (slot != 0u && !path_configured) {
+        return 0;
+    }
     if (!media_present()) {
         return 0; /* no media device selected: nothing to resolve against */
     }
@@ -7535,7 +7607,7 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
      * a disk that lies about its capacity). A warning, not a refusal -- the image is usable, it is
      * the operator's expectation that is wrong, and saying which is more useful than declining.
      */
-    if (cv != 0 && cv->has_target_disk_size_gb && cv->target_disk_size_gb != 0u) {
+    if (slot == 0u && cv != 0 && cv->has_target_disk_size_gb && cv->target_disk_size_gb != 0u) {
         uint64_t want = hype_cfg_size_gb_to_bytes(cv->target_disk_size_gb);
         if (file.size_bytes != want) {
             hype_serial_print("m5-8: WARNING %s is %llu bytes but target_disk_size_gb = %u says "
@@ -7545,7 +7617,7 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
                               cv->target_disk_size_gb, (unsigned long long)want);
         }
     }
-    if (hype_blk_image_init(&vm->disk[0].image, &vm->disk[0].raw_be, &file, g_media.part_base_lba,
+    if (hype_blk_image_init(&d->image, &d->raw_be, &file, g_media.part_base_lba,
                             hostdisk_read, hostdisk_write, 0) != 0) {
         /* A sparse or short-mapped image: refuse rather than serve a disk whose
          * later sectors would fail mid-install. #90's --check reports why. */
@@ -7563,22 +7635,22 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
      * remember to edit hype.cfg -- which would fail as a guest that silently reads the
      * qcow2 HEADER as its boot sector.
      */
-    if (hype_qcow2_init(&vm->disk[0].qcow2, &vm->disk[0].be, &vm->disk[0].raw_be, 0) == 0) {
+    if (hype_qcow2_init(&d->qcow2, &d->be, &d->raw_be, 0) == 0) {
         hype_debug_print("m5-9: %s on %s is QCOW2 v%u -- %llu-byte clusters, %llu virtual "
                          "sectors from a %llu-byte file [#200]\n",
-                         path, fs, vm->disk[0].qcow2.version,
-                         (unsigned long long)vm->disk[0].qcow2.cluster_size,
-                         (unsigned long long)vm->disk[0].be.total_sectors,
+                         path, fs, d->qcow2.version,
+                         (unsigned long long)d->qcow2.cluster_size,
+                         (unsigned long long)d->be.total_sectors,
                          (unsigned long long)file.size_bytes);
     } else {
         /* Field-by-field: whole-struct assignment of anything that might hold an array
          * is the freestanding memcpy trap this project has hit before. */
-        vm->disk[0].be.read = vm->disk[0].raw_be.read;
-        vm->disk[0].be.write = vm->disk[0].raw_be.write;
-        vm->disk[0].be.ctx = vm->disk[0].raw_be.ctx;
-        vm->disk[0].be.total_sectors = vm->disk[0].raw_be.total_sectors;
+        d->be.read = d->raw_be.read;
+        d->be.write = d->raw_be.write;
+        d->be.ctx = d->raw_be.ctx;
+        d->be.total_sectors = d->raw_be.total_sectors;
     }
-    vm->disk[0].is_physical = 0;
+    d->is_physical = 0;
     /*
      * #329 slice 2b: honour the [disk.*] entry's read_only. Nulling `write` is what
      * hype_blk_backend_write checks, so however the guest behaves it cannot reach the file --
@@ -7586,23 +7658,18 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
      * for its sharing rules, so before this a "shareable because read-only" disk was in fact
      * writable by every VM sharing it.
      */
-    if (cv != 0 && cv->disks_count > 0u) {
-        unsigned int di;
-        for (di = 0; di < g_hype_cfg.disk_count; di++) {
-            if (term_streq(g_hype_cfg.disks[di].id, cv->disks[0])) {
-                if (g_hype_cfg.disks[di].has_read_only && g_hype_cfg.disks[di].read_only) {
-                    vm->disk[0].be.write = 0;
-                }
-                break;
-            }
+    {
+        const hype_cfg_disk_t *cd = fw_1_slot_cfg(vm, slot);
+        if (cd != 0 && cd->has_read_only && cd->read_only) {
+            d->be.write = 0;
         }
     }
-    hype_virtio_blk_reset(&vm->disk[0].vblk, vm->disk[0].be.total_sectors);
+    hype_virtio_blk_reset(&d->vblk, d->be.total_sectors);
     hype_debug_print("m5-8: FILE-backed guest disk %s on %s -- %llu bytes, %u extent(s), "
                      "%llu sectors [%s]\n",
                      path, fs, (unsigned long long)file.size_bytes, file.count,
-                     (unsigned long long)vm->disk[0].be.total_sectors,
-                     vm->disk[0].be.write ? "writable, persists to the file"
+                     (unsigned long long)d->be.total_sectors,
+                     d->be.write ? "writable, persists to the file"
                                           : "READ-ONLY -- [disk.*] read_only");
     usb_log_flush(); /* prove the attach reached the log before the guest runs */
     return 1;
@@ -7635,8 +7702,9 @@ static void fw_1_vblk_write_selftest(hype_fw_vm_t *vm) {
 }
 #endif
 
+static void fw_1_virtio_pci_present(hype_fw_vm_t *vm, unsigned int dev);
+
 static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
-    uint8_t *config;
 #if HYPE_229_RO_SATA
     /* #229 SATA repro (laptop has no NVMe): attach the REAL SATA disk as this
      * guest's vda, READ-ONLY, no confirm (reads are non-destructive; the write
@@ -7801,7 +7869,7 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
 #if HYPE_M10_6_WRITE_SELFTEST
         fw_1_vblk_write_selftest(vm);
 #endif
-    } else if (fw_1_vblk_use_image_file(vm)) {
+    } else if (fw_1_disk_use_image_file(vm, 0u)) {
         /* M5-8 (#199): a raw image FILE on a host FS -- guest writes persist. */
     } else {
         vm->disk[0].is_physical = 0;
@@ -7831,15 +7899,25 @@ vblk_pci:
                          "front-end (#333)\n", (int)(vm - &g_vms[0]));
         return;
     }
-    hype_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
+    fw_1_virtio_pci_present(vm, HYPE_FW_1_PCI_DEV_VIRTIO_BLK);
+}
+
+/*
+ * #329 2b(ii): present ONE virtio-blk PCI function at `dev`. Extracted from fw_1_setup_virtio_blk
+ * (where it hardcoded device 3) so an extra disk slot can present its own function -- the caps
+ * layout is identical per function, only the device number and its _PRT-routed GSI differ.
+ */
+static void fw_1_virtio_pci_present(hype_fw_vm_t *vm, unsigned int dev) {
+    uint8_t *config;
+    hype_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
                         HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
                         HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE);
-    hype_pci_set_bar_size(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, HYPE_FW_1_VIRTIO_BAR_INDEX,
+    hype_pci_set_bar_size(&vm->pci, dev, HYPE_FW_1_VIRTIO_BAR_INDEX,
                           HYPE_VIRTIO_BLK_BAR_SIZE);
     /* INTA, legacy line 10 (PIC-mode fallback); APIC-mode guests route via the
-     * DSDT _PRT (dev 3 INTA -> GSI 20). */
-    hype_pci_set_interrupt(&vm->pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK, 1, 10);
-    config = vm->pci.devices[HYPE_FW_1_PCI_DEV_VIRTIO_BLK].config;
+     * DSDT _PRT (dev N INTA -> its slot GSI). */
+    hype_pci_set_interrupt(&vm->pci, dev, 1, 10);
+    config = vm->pci.devices[dev].config;
     config[HYPE_M5_1_PCI_STATUS_OFFSET] |= HYPE_M5_1_PCI_STATUS_CAP_LIST;
     config[HYPE_M5_1_PCI_CAP_POINTER_OFFSET] = HYPE_FW_1_VIRTIO_CAP_COMMON_OFF;
     hype_write_virtio_pci_cap(config, HYPE_FW_1_VIRTIO_CAP_COMMON_OFF, HYPE_FW_1_VIRTIO_CAP_NOTIFY_OFF, 16,
@@ -8064,6 +8142,71 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
          */
         hype_debug_print("fw-1: disk front-end = %s -- no SATA disk attached (#333)\n",
                          (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) ? "nvme" : "virtio-blk");
+    }
+    /*
+     * #329 2b(ii): the EXTRA disk slots. Each exists only because the config's disks= list names a
+     * [disk.*] entry for it; each resolves its OWN image file and presents its OWN PCI function at
+     * fw_1_slot_pci_dev (devs 6/7, _PRT-routed to GSIs 22/23). A slot whose image does not resolve
+     * is NOT presented -- a silently-empty extra disk is the #285 failure mode -- and `physical`
+     * backing stays slot-0-only under the single enumerated-scratch claim.
+     */
+    {
+        unsigned int slot;
+        for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS; slot++) {
+            const hype_cfg_disk_t *cd = fw_1_slot_cfg(vm, slot);
+            hype_fw_disk_t *d = &vm->disk[slot];
+            hype_cfg_bus_t bus;
+            unsigned int dev;
+            if (cd == 0) {
+                continue;
+            }
+            if (cd->backing == HYPE_CFG_BACKING_PHYSICAL) {
+                hype_serial_print("fw-1[vm %d]: disk slot %u ([disk.%s]) is physical -- only the "
+                                  "FIRST attached disk may be physical; NOT presented\n",
+                                  (int)(vm - &g_vms[0]), slot, cd->id);
+                continue;
+            }
+            if (!fw_1_disk_use_image_file(vm, slot)) {
+                hype_serial_print("fw-1[vm %d]: disk slot %u ([disk.%s]) did not resolve -- NOT "
+                                  "presented rather than substituting an empty disk (#285)\n",
+                                  (int)(vm - &g_vms[0]), slot, cd->id);
+                continue;
+            }
+            bus = fw_1_slot_bus(vm, slot);
+            dev = fw_1_slot_pci_dev(slot, bus);
+            switch (bus) {
+            case HYPE_CFG_BUS_AHCI_SATA:
+                hype_pci_add_device(&g_fw_1_pci, dev, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u, 0x01,
+                                    0x06, 0x01);
+                hype_pci_set_bar_size(&g_fw_1_pci, dev, 5, 0x1000u);
+                hype_pci_set_interrupt(&g_fw_1_pci, dev, 1, 11);
+                hype_ahci_reset(&d->ata_ahci);
+                hype_ahci_set_signature(&d->ata_ahci, HYPE_AHCI_SIG_ATA);
+                hype_ata_disk_reset(&d->ata_disk, 0, 0);
+                /* AFTER resolution: capacity is set, so no zero-sector CHS fallback. */
+                hype_ata_disk_set_backend(&d->ata_disk, &d->be);
+                break;
+            case HYPE_CFG_BUS_NVME:
+                hype_pci_add_device(&g_fw_1_pci, dev, HYPE_PCI_VENDOR_ID_HYPE, 0x0007u, 0x01,
+                                    0x08, 0x02);
+                hype_pci_set_bar_size(&g_fw_1_pci, dev, 0, HYPE_FW_1_NVME_BAR_SIZE);
+                hype_pci_set_interrupt(&g_fw_1_pci, dev, 1, 11);
+                hype_nvme_reset(&d->nvme);
+                break;
+            default: /* virtio-blk, incl. the os_hint default */
+                fw_1_virtio_pci_present(vm, dev);
+                /* The [disk.*] id, not vm->name: two disks on ONE VM with identical GET_ID
+                 * serials is the #310 problem one level down. */
+                hype_virtio_blk_set_serial(&d->vblk, cd->id);
+                break;
+            }
+            hype_debug_print("fw-1[vm %d]: disk slot %u = [disk.%s] front-end %s at PCI dev %u -- "
+                             "%llu sectors (#329)\n",
+                             (int)(vm - &g_vms[0]), slot, cd->id,
+                             (bus == HYPE_CFG_BUS_AHCI_SATA)   ? "ahci-sata"
+                             : (bus == HYPE_CFG_BUS_NVME) ? "nvme" : "virtio-blk",
+                             dev, (unsigned long long)d->be.total_sectors);
+        }
     }
     /* #326: streaming is the only ISO backing there is. A VM with no media resolved gets an EMPTY
      * drive (media_size 0), which is what a real machine with an empty optical drive presents --
@@ -8609,6 +8752,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     int ata_mapped = 0;
     int vblk_mapped = 0;    /* M5-7 (#196): virtio-blk BAR4 latched + routed */
     uint64_t vblk_bar = 0;
+    /* #329 2b(ii): BAR windows for the EXTRA disk slots (1..2). Slot 0 keeps the dedicated
+     * vblk_/ata_/nvme latches above -- extra slots are uniform: one window each, whatever the
+     * bus (virtio BAR4, ahci BAR5, nvme BAR0). */
+    struct { int mapped; uint64_t bar; } dwin[HYPE_FW_1_MAX_DISKS] = {{0, 0}, {0, 0}, {0, 0}};
     hype_host_input_t hostin; /* TERM-4: host keyboard -> focused guest routing state */
     /* M4-6b1: drive the guest timebase from real elapsed host TSC. */
     uint64_t tb_last_tsc = hype_rdtsc();
@@ -10014,6 +10161,50 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         } else if (ata_mapped) {
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI);
         }
+        /*
+         * #329 2b(ii): completion IRQs for the EXTRA disk slots, same level-triggered shape as
+         * their slot-0 counterparts above: raise while the device holds its pending state
+         * (virtio isr_status / AHCI PxIS), deassert once the guest clears it. Each slot owns its
+         * _PRT-routed GSI (22/23). NVMe slots raise nothing -- that front-end is polled (#335).
+         */
+        {
+            unsigned int slot;
+            for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS; slot++) {
+                hype_fw_disk_t *d = &vm->disk[slot];
+                hype_cfg_bus_t sbus;
+                unsigned int gsi;
+                int pending;
+                if (!dwin[slot].mapped) {
+                    continue;
+                }
+                sbus = fw_1_slot_bus(vm, slot);
+                if (sbus == HYPE_CFG_BUS_NVME) {
+                    continue;
+                }
+                gsi = fw_1_slot_gsi(slot, sbus);
+                pending = (sbus == HYPE_CFG_BUS_AHCI_SATA)
+                              ? hype_ahci_irq_pending(&d->ata_ahci)
+                              : (d->vblk.isr_status != 0u);
+                if (pending) {
+                    uint8_t iov;
+                    uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci,
+                                                               fw_1_slot_pci_dev(slot, sbus));
+                    if (line != 0u && line < 16u) {
+                        int in_service = (line < 8u)
+                            ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
+                            : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
+                        if (!in_service) {
+                            hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
+                        }
+                    }
+                    if (hype_ioapic_raise(&g_fw_1_ioapic, gsi, &iov)) {
+                        vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                    }
+                } else {
+                    hype_ioapic_deassert(&g_fw_1_ioapic, gsi);
+                }
+            }
+        }
         /* M4-6d3: raise the serial TX/RX interrupt (COM1=IRQ4, COM2=IRQ3)
          * when the guest has enabled it (IER.ETBEI/ERBFI). The kernel's
          * printk uses the polled console path (LSR.THRE, always ready), but
@@ -10550,6 +10741,30 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                           (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX, (unsigned long long)bar);
                     }
                 }
+                /* #329 2b(ii): same latch for each EXTRA disk slot's window. */
+                {
+                    unsigned int slot;
+                    for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS; slot++) {
+                        hype_cfg_bus_t sbus = fw_1_slot_bus(vm, slot);
+                        unsigned int sdev = fw_1_slot_pci_dev(slot, sbus);
+                        unsigned int sbar = (sbus == HYPE_CFG_BUS_AHCI_SATA) ? 5u
+                                            : (sbus == HYPE_CFG_BUS_NVME)
+                                                ? 0u
+                                                : (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX;
+                        uint64_t bar;
+                        if (dwin[slot].mapped || fw_1_slot_cfg(vm, slot) == 0 ||
+                            !hype_pci_memory_space_enabled(&g_fw_1_pci, sdev)) {
+                            continue;
+                        }
+                        bar = hype_pci_get_bar_value(&g_fw_1_pci, sdev, sbar);
+                        if (bar != 0) {
+                            dwin[slot].bar = bar;
+                            dwin[slot].mapped = 1;
+                            hype_debug_print("fw-1: disk slot %u BAR enabled at guest-physical "
+                                             "0x%llx (#329)\n", slot, (unsigned long long)bar);
+                        }
+                    }
+                }
                 continue;
             }
             /* FW-1h: AHCI ABAR MMIO. Gate on the faulting guest-physical
@@ -10694,7 +10909,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     if (npf.guest_phys_addr >= nvme_bar &&
                         npf.guest_phys_addr < nvme_bar + HYPE_FW_1_NVME_BAR_SIZE) {
                         hype_nvme_ctx_t nctx;
-                        nvme_fill_ctx(&nctx, vm);
+                        nvme_fill_ctx(&nctx, vm, 0u);
                         if (vmm_handle_nvme_npf(kind, ctx, &vm->disk[0].nvme, &nctx, nvme_bar,
                                                 HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
                             continue;
@@ -10724,6 +10939,59 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                     hype_fatal("fw-1: unhandled virtio-blk MMIO at guest-physical 0x%llx",
                                (unsigned long long)npf.guest_phys_addr);
+                }
+            }
+            /*
+             * #329 2b(ii): route each EXTRA slot's window to ITS OWN device model over ITS OWN
+             * backend -- the same three handlers slot 0 uses, with &vm->disk[slot] state. A fault
+             * inside a latched window that the handler refuses is fatal, exactly as for slot 0:
+             * absorbing it would present a disk that silently ignores I/O.
+             */
+            {
+                unsigned int slot;
+                int routed = 0;
+                for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS && !routed; slot++) {
+                    hype_fw_disk_t *d = &vm->disk[slot];
+                    hype_cfg_bus_t sbus;
+                    uint64_t wsz;
+                    if (!dwin[slot].mapped) {
+                        continue;
+                    }
+                    sbus = fw_1_slot_bus(vm, slot);
+                    wsz = (sbus == HYPE_CFG_BUS_AHCI_SATA) ? (uint64_t)HYPE_AHCI_MMIO_SIZE
+                          : (sbus == HYPE_CFG_BUS_NVME)    ? (uint64_t)HYPE_FW_1_NVME_BAR_SIZE
+                                                           : (uint64_t)HYPE_VIRTIO_BLK_BAR_SIZE;
+                    vmm_get_last_npf(kind, ctx, &npf);
+                    if (npf.guest_phys_addr < dwin[slot].bar ||
+                        npf.guest_phys_addr >= dwin[slot].bar + wsz) {
+                        continue;
+                    }
+                    routed = 1;
+                    if (sbus == HYPE_CFG_BUS_AHCI_SATA) {
+                        if (vmm_handle_ahci_disk_npf_map(kind, ctx, &d->ata_ahci, &d->ata_disk,
+                                                         dwin[slot].bar, &g_fw_1_dma_map,
+                                                         insn) == 0) {
+                            continue;
+                        }
+                    } else if (sbus == HYPE_CFG_BUS_NVME) {
+                        hype_nvme_ctx_t nctx;
+                        nvme_fill_ctx(&nctx, vm, slot);
+                        if (vmm_handle_nvme_npf(kind, ctx, &d->nvme, &nctx, dwin[slot].bar,
+                                                HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
+                            continue;
+                        }
+                    } else {
+                        if (vmm_handle_virtio_blk_npf_map(kind, ctx, &d->vblk, &d->be,
+                                                          &g_fw_1_dma_map, dwin[slot].bar,
+                                                          insn) == 0) {
+                            continue;
+                        }
+                    }
+                    hype_fatal("fw-1: unhandled disk-slot-%u MMIO at guest-physical 0x%llx (#329)",
+                               slot, (unsigned long long)npf.guest_phys_addr);
+                }
+                if (routed) {
+                    continue; /* handler advanced RIP */
                 }
             }
             vmm_get_last_npf(kind, ctx, &npf);
