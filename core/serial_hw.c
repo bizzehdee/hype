@@ -1,4 +1,6 @@
 #include "serial.h"
+#include "logbuf.h"
+#include "format.h"
 
 /*
  * Real 16550 UART register I/O. Exempt from unit testing per
@@ -44,10 +46,27 @@ void hype_serial_putc(char c) {
     outb(g_serial_port, (uint8_t)c);
 }
 
+/*
+ * #346/#338 ROOT CAUSE of every "lost line" on real hardware: this wrote ONLY to the physical
+ * COM port. The serial-less validation laptop has no such port, so every hype_serial_print --
+ * deliberately the LOUD variant, used for stream verdicts, refusals, budget expiries -- was
+ * invisible in \HYPEFULL.LOG while hype_debug_print lines (which tee into the logbuf) landed
+ * fine. QEMU masked it completely: its -serial capture IS the COM port. One evening of
+ * hardware runs was diagnosed around holes this created.
+ *
+ * So: format once, emit to the port, AND tee into the logbuf. hype_debug_print now writes the
+ * port via the _via form directly (it tees the logbuf itself), so nothing double-appends. The
+ * panic path (halt.c) keeps raw putc + append_unlocked, so no lock-order change there.
+ */
 void hype_serial_print(const char *fmt, ...) {
+    char msg[512];
+    int n;
     va_list ap;
 
     va_start(ap, fmt);
-    hype_serial_vprint_via(hype_serial_putc, fmt, ap);
+    n = hype_vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    (void)hype_format_mark_truncated(msg, sizeof(msg), n);
+    hype_serial_print_via(hype_serial_putc, "%s", msg);
+    hype_logbuf_append(msg);
 }

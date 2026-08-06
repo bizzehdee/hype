@@ -77,7 +77,9 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
     va_end(ap);
     (void)hype_format_mark_truncated(msg, sizeof(msg), n);
 
-    hype_serial_print("PANIC: %s\n", msg);
+    /* Raw port write: the logbuf lock may be HELD by the panicking core (#338); the panic
+     * message reaches the logbuf via append_unlocked below, never through the locking tee. */
+    hype_serial_print_via(hype_serial_putc, "PANIC: %s\n", msg);
     /* Capture the panic in the console log, then flush it to disk (if a
      * hook is registered) before halting -- so a mid-run panic on real
      * hardware still leaves \hype-log.txt ending with the cause. */
@@ -192,7 +194,9 @@ void hype_debug_print(const char *fmt, ...) {
     va_end(ap);
     (void)hype_format_mark_truncated(msg, sizeof(msg), n);
 
-    hype_serial_print("%s", msg);
+    /* The RAW port write: hype_serial_print now tees into the logbuf itself (#346), and this
+     * function appends msg below -- going through it here would double every line. */
+    hype_serial_print_via(hype_serial_putc, "%s", msg);
     /* Tee into the in-memory capture so boot/main.c can flush the whole
      * console to a file on the boot volume before ExitBootServices --
      * the serial-less real-hardware debug path (core/logbuf.h). */
