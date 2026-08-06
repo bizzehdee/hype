@@ -12457,6 +12457,18 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
      * would turn a typo into a setting that appears accepted and does nothing, the exact failure
      * mode #285/#331/#339 were each an instance of.
      */
+    /*
+     * #341: a VM that vanishes silently is how an operator ends up with a machine that simply is not
+     * there. Name it and give the line, unconditionally -- this is the case the isolation creates, so
+     * it has to be the case that is loudest.
+     */
+    if (g_hype_cfg.skipped_vms != 0u) {
+        hype_serial_print("cfg: %u VM(s) SKIPPED as malformed -- first was '%s'%s (line %u). The "
+                          "rest of the config loaded; those machines will NOT exist\n",
+                          g_hype_cfg.skipped_vms, g_hype_cfg.skipped_vm_name,
+                          (g_hype_cfg.skipped_vm_line == 0u) ? " (missing a required key)" : "",
+                          g_hype_cfg.skipped_vm_line);
+    }
     if (g_hype_cfg.unknown_count != 0u) {
         hype_debug_print("cfg: %u line(s) not understood -- RETAINED verbatim, not applied. A "
                          "misspelled key looks exactly like this\n", g_hype_cfg.unknown_count);

@@ -942,6 +942,10 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     unsigned int seen[HYPE_CFG_MAX_VMS];
     unsigned int disk_seen = 0;
     unsigned int in_hype_seen = 0;
+    int vm_bad[HYPE_CFG_MAX_VMS];
+    hype_cfg_status_t first_err = HYPE_CFG_OK;
+    int in_vm_key = 0;
+    unsigned int first_err_line = 0;
     int cur = -1;
     int cur_disk = -1;
     int cur_is_hype = 0;
@@ -955,12 +959,16 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     hype_globals_defaults(&out->hype);
     out->disk_count = 0;
     out->skipped_disks = 0;
+    out->skipped_vms = 0;
+    out->skipped_vm_name[0] = '\0';
+    out->skipped_vm_line = 0;
     out->section_count = 0;
     out->retained_count = 0;
     out->retained_overflow = 0;
     out->unknown_count = 0;
     for (i = 0; i < HYPE_CFG_MAX_VMS; i++) {
         seen[i] = 0;
+        vm_bad[i] = 0;
     }
 
     while (*p) {
@@ -995,15 +1003,48 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
             continue;
         }
 
+        in_vm_key = 0;
         if (line[0] == '[') {
             st = process_section_header(line, out, &cur, seen, raw, &cur_disk, &disk_seen,
                                         &cur_is_hype, &in_hype_seen);
         } else {
+            in_vm_key = (cur >= 0);
             st = process_key_value(line, out, cur, seen, raw, raw_truncated, cur_disk,
                                    &disk_seen, cur_is_hype, &in_hype_seen);
         }
 
         if (st != HYPE_CFG_OK) {
+            /*
+             * #341 (§4.3): an error INSIDE a [vm.*] drops that VM and keeps going -- one typo must
+             * not cost every VM in the file. Everything else (a key before any section, a duplicate
+             * VM name, a broken section header) is still fatal: those are not attributable to one VM,
+             * so there is nothing to isolate.
+             *
+             * The FIRST error is remembered rather than discarded, because if every VM ends up
+             * skipped the parse still fails with it -- which is what keeps a single-VM config's
+             * behaviour, and every existing error test, exactly as before.
+             *
+             * `in_vm_key`, not `cur >= 0`: after a bad SECTION HEADER `cur` still points at the
+             * PREVIOUS VM, so keying off it blamed that VM for an error it did not cause -- which is
+             * how the first attempt turned "too many VMs" into a silently dropped 16th VM and a
+             * successful parse.
+             */
+            if (in_vm_key) {
+                if (!vm_bad[cur]) {
+                    vm_bad[cur] = 1;
+                    if (out->skipped_vms == 0u) {
+                        (void)hype_strlcpy(out->skipped_vm_name, out->vms[cur].name,
+                                           HYPE_CFG_NAME_MAX);
+                        out->skipped_vm_line = line_no;
+                    }
+                    out->skipped_vms++;
+                }
+                if (first_err == HYPE_CFG_OK) {
+                    first_err = st;
+                    first_err_line = line_no;
+                }
+                continue;
+            }
             res.status = st;
             res.line = line_no;
             return res;
@@ -1063,12 +1104,68 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     }
 
     for (i = 0; i < out->vm_count; i++) {
-        hype_cfg_status_t st = validate_required(&out->vms[i], seen[i]);
-        if (st != HYPE_CFG_OK) {
-            res.status = st;
-            res.line = 0;
-            return res;
+        hype_cfg_status_t st;
+
+        if (vm_bad[i]) {
+            continue; /* already counted; do not report the same VM twice */
         }
+        st = validate_required(&out->vms[i], seen[i]);
+        if (st != HYPE_CFG_OK) {
+            vm_bad[i] = 1;
+            if (out->skipped_vms == 0u) {
+                (void)hype_strlcpy(out->skipped_vm_name, out->vms[i].name, HYPE_CFG_NAME_MAX);
+                out->skipped_vm_line = 0; /* a missing key has no line of its own */
+            }
+            out->skipped_vms++;
+            if (first_err == HYPE_CFG_OK) {
+                first_err = st;
+                first_err_line = 0;
+            }
+        }
+    }
+
+    /* Compact the survivors, keeping the section table pointing at them. Same explicit-remap shape as
+     * the disk compaction above, and for the same reason: comparing indices against the new count
+     * aliases when index 0 is the dropped one. */
+    {
+        int remap[HYPE_CFG_MAX_VMS];
+        unsigned int w = 0;
+        unsigned int si;
+
+        for (i = 0; i < out->vm_count; i++) {
+            if (vm_bad[i]) {
+                remap[i] = -1;
+                continue;
+            }
+            remap[i] = (int)w;
+            if (w != i) {
+                unsigned char *dst = (unsigned char *)&out->vms[w];
+                const unsigned char *src = (const unsigned char *)&out->vms[i];
+                unsigned long long b;
+                for (b = 0; b < sizeof(out->vms[0]); b++) {
+                    dst[b] = src[b]; /* byte copy: no libc, and hype_cfg_vm_t contains arrays */
+                }
+            }
+            w++;
+        }
+        for (si = 0; si < out->section_count; si++) {
+            if (out->sections[si].kind == HYPE_CFG_SECTION_VM && out->sections[si].index >= 0) {
+                out->sections[si].index = remap[out->sections[si].index];
+            }
+        }
+        out->vm_count = w;
+    }
+
+    /*
+     * If EVERY declared VM was skipped, the config as a whole is unusable -- "hype running with zero
+     * VMs" is never what anyone wanted -- so fail with the first error, exactly as before #341. This
+     * is what makes the change invisible to a single-VM config and to every existing error test:
+     * isolation only shows up when there is something left to isolate.
+     */
+    if (out->vm_count == 0u && first_err != HYPE_CFG_OK) {
+        res.status = first_err;
+        res.line = first_err_line;
+        return res;
     }
 
     return res;

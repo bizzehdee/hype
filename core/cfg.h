@@ -340,6 +340,20 @@ typedef struct {
      */
     unsigned int skipped_disks;
 
+    /*
+     * #341 (§4.3): VMs dropped because something in their section was malformed. The rest of the
+     * config still loads -- one typo must not cost every VM.
+     *
+     * `skipped_vm_name`/`skipped_vm_line` describe the FIRST one, because a VM that vanishes silently
+     * is how an operator ends up with a machine that simply is not there, and a bare count does not
+     * tell them which. hype's culture (#285, #331, #339) is that a value which looks accepted and does
+     * nothing is the failure to avoid; a section that looks accepted and produces no VM is the same
+     * thing one level up.
+     */
+    unsigned int skipped_vms;
+    char skipped_vm_name[HYPE_CFG_NAME_MAX];
+    unsigned int skipped_vm_line;
+
     /* #222: see hype_cfg_section_t above. */
     hype_cfg_section_t sections[HYPE_CFG_MAX_SECTIONS];
     unsigned int section_count;

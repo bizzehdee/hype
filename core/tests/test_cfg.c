@@ -1354,6 +1354,96 @@ static void test_format_has_flag_is_set_only_when_written(void) {
 }
 
 
+/* ---- #341 (§4.3): a malformed [vm.*] is skipped, the rest of the config still loads ---- */
+
+static const char *GOOD_VM =
+    "[vm.good]\nvcpus=1\nmem_mb=512\nboot=disk\ntarget_disk=file:g.img\nfirmware=uefi\n"
+    "os_hint=linux\n";
+
+static void test_one_bad_vm_does_not_cost_the_others(void) {
+    char cfg[2048];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    /* The bad VM is FIRST, which is the ordering a naive compaction gets wrong. */
+    snprintf(cfg, sizeof(cfg), "%s%s",
+             "[vm.bad]\nvcpus=1\nmem_mb=512\nboot=disk\ntarget_disk=file:b.img\nfirmware=uefi\n"
+             "os_hint=linux\nvcpus=9\n", /* duplicate key */
+             GOOD_VM);
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("the config still loads", HYPE_CFG_OK, res.status);
+    CHECK_INT("only the good VM survives", 1, out.vm_count);
+    CHECK_STR("...and it is the RIGHT one (dense, not a corpse)", "good", out.vms[0].name);
+    CHECK_INT("the drop is counted", 1, out.skipped_vms);
+    /* A bare count does not tell an operator WHICH machine is missing. */
+    CHECK_STR("the dropped VM is named", "bad", out.skipped_vm_name);
+    CHECK_INT("...with the offending line", 8, (int)out.skipped_vm_line);
+}
+
+static void test_all_vms_bad_still_fails_like_before(void) {
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    /* This is what keeps every pre-#341 error test valid: with nothing left to isolate, the parse
+     * fails with the first error exactly as it always did. "hype running with zero VMs" is never
+     * what anyone wanted. */
+    res = parse_copy("[vm.a]\nvcpus=1\nvcpus=2\n", &out);
+    CHECK_INT("a single bad VM is still a hard error", HYPE_CFG_ERR_DUPLICATE_KEY, res.status);
+    CHECK_INT("...reported at its line", 3, (int)res.line);
+
+    res = parse_copy("[vm.a]\nvcpus=nonsense\n[vm.b]\nmem_mb=oops\n", &out);
+    CHECK_INT("two bad VMs and nothing else: still fatal", HYPE_CFG_ERR_BAD_VALUE, res.status);
+    CHECK_INT("no VMs survive", 0, out.vm_count);
+    CHECK_INT("both counted", 2, out.skipped_vms);
+}
+
+static void test_missing_required_field_also_isolates(void) {
+    char cfg[2048];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    /* A VM missing a required key is malformed just as much as one with a bad value. */
+    snprintf(cfg, sizeof(cfg), "%s%s", "[vm.nodisk]\nvcpus=1\nmem_mb=512\nboot=disk\n"
+                                       "firmware=uefi\nos_hint=linux\n", GOOD_VM);
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("config loads", HYPE_CFG_OK, res.status);
+    CHECK_INT("the incomplete VM is dropped", 1, out.vm_count);
+    CHECK_STR("the survivor", "good", out.vms[0].name);
+    CHECK_INT("counted", 1, out.skipped_vms);
+    CHECK_STR("named", "nodisk", out.skipped_vm_name);
+}
+
+static void test_section_level_errors_stay_fatal(void) {
+    hype_cfg_t out;
+
+    /* Not attributable to any one VM, so there is nothing to isolate -- and blaming the VM that
+     * happened to be current would drop a VM that was perfectly fine. */
+    CHECK_INT("duplicate VM name is still fatal", HYPE_CFG_ERR_DUPLICATE_VM_NAME,
+              (int)parse_copy("[vm.a]\nvcpus=1\n[vm.a]\nvcpus=1\n", &out).status);
+    CHECK_INT("key before any section is still fatal", HYPE_CFG_ERR_KEY_BEFORE_SECTION,
+              (int)parse_copy("vcpus=1\n", &out).status);
+    CHECK_INT("a broken section header is still fatal", HYPE_CFG_ERR_SYNTAX,
+              (int)parse_copy("[vm.a\nvcpus=1\n", &out).status);
+}
+
+static void test_skipped_vm_section_entry_does_not_alias(void) {
+    char cfg[2048];
+    hype_cfg_t out;
+
+    /* Same aliasing trap the disk compaction had: with vms[0] dropped, the good VM moves into slot 0
+     * and the bad section's stale index would point at it. */
+    snprintf(cfg, sizeof(cfg), "%s%s",
+             "[vm.bad]\nvcpus=1\nmem_mb=512\nboot=disk\ntarget_disk=file:b.img\nfirmware=uefi\n"
+             "os_hint=linux\nvcpus=9\n", GOOD_VM);
+    CHECK_INT("loads", HYPE_CFG_OK, (int)parse_copy(cfg, &out).status);
+    CHECK_INT("two VM sections recorded", 2, (int)out.section_count);
+    CHECK_INT("the dropped VM's section points at nothing", -1, out.sections[0].index);
+    CHECK_INT("the survivor's section was retargeted to slot 0", 0, out.sections[1].index);
+}
+
+
 int main(void) {
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
@@ -1410,6 +1500,11 @@ int main(void) {
     test_resolve_bus();
     test_format_assertion();
     test_format_has_flag_is_set_only_when_written();
+    test_one_bad_vm_does_not_cost_the_others();
+    test_all_vms_bad_still_fails_like_before();
+    test_missing_required_field_also_isolates();
+    test_section_level_errors_stay_fatal();
+    test_skipped_vm_section_entry_does_not_alias();
 
     if (failures == 0) {
         printf("all tests passed\n");
