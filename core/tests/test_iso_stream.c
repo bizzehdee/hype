@@ -337,7 +337,67 @@ static void test_map_shorter_than_iso_size_is_refused_midway(void) {
     CHECK_HEX("read starting past the map refused", -1, hype_iso_stream_read(&s, 2048u, buf, 16u));
 }
 
+/*
+ * #343: does hype_iso_stream_read() ever write PAST `len`?
+ *
+ * Why this matters far beyond the read itself: the ATAPI datapath hands this function a pointer INTO
+ * GUEST RAM (guest_dma_xlate'd from a PRD and bounds-checked for exactly `chunk` bytes). If the read
+ * can write even one byte beyond `len`, hype silently corrupts guest memory -- and the symptom would be
+ * exactly #343: an intermittent guest page fault somewhere unrelated, with garbage pointers, appearing
+ * only on the streaming path (0 panics across ~34 RAM-preload-era runs, ~50% on streaming).
+ *
+ * Canary-guarded destination, swept across sizes that straddle a sector boundary, an EXTENT boundary
+ * and the bounce-buffer cap -- the three places the clamping arithmetic could be wrong.
+ */
+static void test_read_never_writes_past_len(void) {
+    static uint8_t guarded[400000];
+    hype_iso_stream_t s;
+    static const uint64_t offs[] = {0, 1, 511, 512, 2047, 2048, 100000, 1048575, 1048576};
+    static const uint32_t lens[] = {1, 7, 512, 513, 2048, 4096, 65536, 100000};
+    unsigned oi, li, trial = 0;
+
+    memset(&s, 0, sizeof(s));
+    s.read = fake_read;
+    s.ctx = 0;
+    s.part_start_lba = PART_START;
+    s.iso_size = ISO_SIZE;
+    /* A multi-extent map, so the per-extent clamping is exercised, not the contiguous fast path. */
+    s.extent_count = 3u;
+    s.extents[0].start_lba = PART_START;
+    s.extents[0].sector_count = 64u;
+    s.extents[1].start_lba = PART_START + 4096u;
+    s.extents[1].sector_count = 128u;
+    s.extents[2].start_lba = PART_START + 8192u;
+    s.extents[2].sector_count = 8192u;
+
+    for (oi = 0; oi < sizeof(offs) / sizeof(offs[0]); oi++) {
+        for (li = 0; li < sizeof(lens) / sizeof(lens[0]); li++) {
+            uint64_t off = offs[oi];
+            uint32_t len = lens[li];
+            unsigned long i;
+
+            if ((uint64_t)len > sizeof(guarded)) {
+                continue;
+            }
+            memset(guarded, 0xC5, sizeof(guarded));
+            (void)hype_iso_stream_read(&s, off, guarded, len);
+            trial++;
+            for (i = len; i < sizeof(guarded); i++) {
+                if (guarded[i] != 0xC5u) {
+                    printf("FAIL: wrote PAST len: off=%llu len=%u first stray byte at +%lu\n",
+                           (unsigned long long)off, len, i);
+                    failures++;
+                    break;
+                }
+            }
+        }
+    }
+    CHECK_HEX("the sweep ran", 1u, (trial > 20u) ? 1u : 0u);
+}
+
+
 int main(void) {
+    test_read_never_writes_past_len();
     test_refusals_and_error_paths();
     test_map_shorter_than_iso_size_is_refused_midway();
     test_read_large_extents_across_bounce_cap();
