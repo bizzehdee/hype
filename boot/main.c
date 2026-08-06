@@ -7444,6 +7444,27 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
         path = cv->target_disk.path_or_id;
         path_configured = 1;
     }
+    /*
+     * #329 slice 2b: a [disk.*] entry's `path` was parsed and consumed by NOTHING -- the
+     * #285/#331/#333 class again, found while scoping the multi-disk work. The modern form wins
+     * over the inline target_disk sugar (spec §5.3: the stanza is the full-fidelity spelling;
+     * the sugar survives for one-line configs). First attached disk only, matching
+     * fw_1_target_bus(): a second entry cannot be honoured until the per-slot attach lands.
+     */
+    if (cv != 0 && cv->disks_count > 0u) {
+        unsigned int di;
+        for (di = 0; di < g_hype_cfg.disk_count; di++) {
+            const hype_cfg_disk_t *cd = &g_hype_cfg.disks[di];
+            if (!term_streq(cd->id, cv->disks[0])) {
+                continue;
+            }
+            if (cd->backing == HYPE_CFG_BACKING_FILE && cd->has_path && cd->path[0] != '\0') {
+                path = cd->path;
+                path_configured = 1;
+            }
+            break;
+        }
+    }
 
     if (!media_present()) {
         return 0; /* no media device selected: nothing to resolve against */
@@ -7558,11 +7579,31 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
         vm->disk[0].be.total_sectors = vm->disk[0].raw_be.total_sectors;
     }
     vm->disk[0].is_physical = 0;
+    /*
+     * #329 slice 2b: honour the [disk.*] entry's read_only. Nulling `write` is what
+     * hype_blk_backend_write checks, so however the guest behaves it cannot reach the file --
+     * the same mechanism every physical attach uses (#267). Admission already uses read_only
+     * for its sharing rules, so before this a "shareable because read-only" disk was in fact
+     * writable by every VM sharing it.
+     */
+    if (cv != 0 && cv->disks_count > 0u) {
+        unsigned int di;
+        for (di = 0; di < g_hype_cfg.disk_count; di++) {
+            if (term_streq(g_hype_cfg.disks[di].id, cv->disks[0])) {
+                if (g_hype_cfg.disks[di].has_read_only && g_hype_cfg.disks[di].read_only) {
+                    vm->disk[0].be.write = 0;
+                }
+                break;
+            }
+        }
+    }
     hype_virtio_blk_reset(&vm->disk[0].vblk, vm->disk[0].be.total_sectors);
     hype_debug_print("m5-8: FILE-backed guest disk %s on %s -- %llu bytes, %u extent(s), "
-                     "%llu sectors [writable, persists to the file]\n",
+                     "%llu sectors [%s]\n",
                      path, fs, (unsigned long long)file.size_bytes, file.count,
-                     (unsigned long long)vm->disk[0].be.total_sectors);
+                     (unsigned long long)vm->disk[0].be.total_sectors,
+                     vm->disk[0].be.write ? "writable, persists to the file"
+                                          : "READ-ONLY -- [disk.*] read_only");
     usb_log_flush(); /* prove the attach reached the log before the guest runs */
     return 1;
 }
