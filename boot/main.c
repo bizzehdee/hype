@@ -12604,11 +12604,13 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                  * than naming two of the three. */
                 hype_serial_print("host-stream: vm%u CD001 verified streaming from a FILE on "
                                   "a host volume -- backing guest CD via streaming\n", vi);
+                usb_log_flush(); /* #346: the stream verdict must reach the log pre-dispatch */
             } else {
                 hype_debug_print("host-stream: CD001 NOT found streaming the ESP file "
                                  "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
                                  (unsigned)cd[1], (unsigned)cd[2], (unsigned)cd[3],
                                  (unsigned)cd[4]);
+                usb_log_flush(); /* #346: THE failure line two hardware runs never captured */
             }
         } else if (have_file) {
             /* #327: only reachable now for a file needing MORE runs than the resolvers
