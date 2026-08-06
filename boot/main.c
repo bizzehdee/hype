@@ -28,6 +28,7 @@
 #include "../core/usb_hid.h" /* USB-5 (#217): HID boot-keyboard host input */
 #include "../core/scancode.h"  /* INPUT-11 (#284): ASCII -> PS/2 Set-1 for `sendkey` */
 #include "../core/blk_usb.h"
+#include "../devices/nvme.h" /* #202 */
 #include "../core/ahci_host.h"
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
@@ -632,6 +633,14 @@ typedef struct hype_fw_vm {
      * (file-backed over vblk_backing_phys for now). Per-VM so two guests get
      * independent writable disks. */
     hype_virtio_blk_t vblk;
+    /*
+     * #202: this VM's guest-facing NVMe controller, plus the staging buffer its I/O path needs. One
+     * page because that is the largest single PRP segment; devices/nvme.c allocates nothing itself.
+     * Present unconditionally but only ATTACHED (PCI function + MMIO arm) when the VM asks for
+     * bus = nvme -- same shape as #333's front-end selection.
+     */
+    hype_nvme_t nvme;
+    uint8_t nvme_bounce[4096];
     hype_blk_backend_t vblk_be;
     hype_blk_file_t vblk_file;
     hype_blk_image_t vblk_image; /* M5-8 (#199): raw image FILE backend */
@@ -1540,6 +1549,13 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * installed.
  */
 #define HYPE_FW_1_PCI_DEV_ATA 4u
+/*
+ * #202: the guest NVMe controller. Device 5, after the SATA-disk HBA. BAR0 must cover the doorbell
+ * window, which begins at 0x1000 -- 8 KiB leaves room for the one admin plus one I/O pair at a 4-byte
+ * stride without advertising space hype does not model.
+ */
+#define HYPE_FW_1_PCI_DEV_NVME 5u
+#define HYPE_FW_1_NVME_BAR_SIZE 0x2000u
 #define HYPE_FW_1_VIRTIO_BAR_INDEX 4u
 #define HYPE_FW_1_VIRTIO_GSI 20u
 /* #262: the SATA-disk AHCI HBA (PCI dev 4) INTA -> GSI 21. Must match the _PRT entry
@@ -3736,6 +3752,18 @@ static int vmm_handle_pci_ecam_npf_insn(hype_vmm_kind_t kind, hype_vcpu_ctx_t *c
                ? hype_vmx_vcpu_handle_pci_ecam_npf_insn(ctx, pci, ecam_base_phys, insn)
                : hype_svm_vcpu_handle_pci_ecam_npf(ctx, pci, ecam_base_phys, insn);
 }
+/*
+ * #202: NVMe BAR0 MMIO, dispatched to whichever backend is running. Both halves exist (slice 6a) so a
+ * device cannot work on AMD and hang on Intel -- the divergence #315 was filed about.
+ */
+static int vmm_handle_nvme_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
+                               const hype_nvme_ctx_t *nctx, uint64_t mmio_base_phys,
+                               uint32_t bar_size, const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX
+               ? hype_vmx_vcpu_handle_nvme_npf(ctx, dev, nctx, mmio_base_phys, bar_size, insn)
+               : hype_svm_vcpu_handle_nvme_npf(ctx, dev, nctx, mmio_base_phys, bar_size, insn);
+}
+
 static int vmm_handle_virtio_blk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                          hype_virtio_blk_t *dev, const hype_blk_backend_t *be,
                                          const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
@@ -7221,6 +7249,69 @@ static int fw_1_want_two_vms(void) {
 #endif
 }
 
+/*
+ * #202: the VALID-3 boundary for the NVMe front-end.
+ *
+ * devices/nvme.c is pure and deliberately delegates EVERY bounds check to these two callbacks: they are
+ * the single point where a guest-supplied queue base or PRP address becomes a host access, so a check
+ * here covers submission entries, completion entries, PRP list entries and data payloads alike. Putting
+ * it anywhere else would mean four places to forget it.
+ *
+ * hype_gpa_to_host() returns 0 for any range not wholly inside the VM's mapped memory, which is what
+ * makes a guest unable to point the controller at hype or at another VM.
+ */
+static int nvme_guest_read(void *ctx, uint64_t gpa, uint32_t len, void *dst) {
+    hype_fw_vm_t *vm = (hype_fw_vm_t *)ctx;
+    uint64_t host = hype_gpa_to_host(&vm->dma_map, gpa, len);
+    const uint8_t *src;
+    uint32_t i;
+
+    if (host == 0) {
+        return -1; /* outside this VM: refuse rather than translate to something else */
+    }
+    src = (const uint8_t *)(uintptr_t)host;
+    for (i = 0; i < len; i++) {
+        ((uint8_t *)dst)[i] = src[i];
+    }
+    return 0;
+}
+
+static int nvme_guest_write(void *ctx, uint64_t gpa, uint32_t len, const void *src) {
+    hype_fw_vm_t *vm = (hype_fw_vm_t *)ctx;
+    uint64_t host = hype_gpa_to_host(&vm->dma_map, gpa, len);
+    uint8_t *dst;
+    uint32_t i;
+
+    if (host == 0) {
+        return -1;
+    }
+    dst = (uint8_t *)(uintptr_t)host;
+    for (i = 0; i < len; i++) {
+        dst[i] = ((const uint8_t *)src)[i];
+    }
+    return 0;
+}
+
+/* Fills the context devices/nvme.c needs. Kept in one place so a new field cannot be forgotten at one
+ * of the call sites. */
+static void nvme_fill_ctx(hype_nvme_ctx_t *c, hype_fw_vm_t *vm) {
+    unsigned long long i;
+    unsigned char *p = (unsigned char *)c;
+
+    for (i = 0; i < sizeof(*c); i++) {
+        p[i] = 0;
+    }
+    c->be = &vm->vblk_be;             /* the same backend every front-end shares (#196) */
+    c->total_sectors = vm->vblk_be.total_sectors;
+    c->page_size = 4096u;
+    c->gread = nvme_guest_read;
+    c->gwrite = nvme_guest_write;
+    c->gctx = vm;
+    c->bounce = vm->nvme_bounce;
+    c->bounce_len = (uint32_t)sizeof(vm->nvme_bounce);
+    c->serial = vm->name;             /* per VM, like virtio-blk's GET_ID serial (#310) */
+}
+
 /* #332: the partition vm0's `physical:` target names, 0 for the whole disk. */
 static unsigned int fw_1_phys_partition(void) {
     const hype_cfg_vm_t *cv = (g_hype_cfg.vm_count > 0u) ? &g_hype_cfg.vms[0] : 0;
@@ -7794,6 +7885,21 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      * #333: present ONLY when this VM's disk asked for it. An unasked-for controller is a
      * guest-visible artefact -- the guest probes it, the firmware binds it, and it shows up as a
      * second disk over the same storage. */
+    /*
+     * #202: the guest NVMe controller, presented ONLY when this VM asked for bus = nvme. Class 0x01
+     * (mass storage) / subclass 0x08 (NVM) / prog-IF 0x02 (NVM Express) is what makes OVMF's
+     * NvmExpressDxe bind it. INTx line only -- per #335 that driver polls the completion-queue phase
+     * tag and never uses an interrupt, so no MSI/MSI-X is needed and hype models none.
+     */
+    if (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) {
+        hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, HYPE_PCI_VENDOR_ID_HYPE, 0x0007u,
+                            0x01, 0x08, 0x02);
+        hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, 0, HYPE_FW_1_NVME_BAR_SIZE);
+        hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, 1, 11);
+        hype_nvme_reset(&vm->nvme);
+        hype_debug_print("fw-1: disk front-end = nvme -- controller at PCI dev %u (#202)\n",
+                         HYPE_FW_1_PCI_DEV_NVME);
+    }
     if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
         hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u,
                             0x01, 0x06, 0x01);
@@ -10465,6 +10571,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* M5-7 (#196): virtio-blk BAR4 MMIO -> the VALID-3, GPA-translated
              * virtio handler (guest RAM remap handled inside via &g_fw_1_dma_map).
              * Gated on the fault landing in the device's BAR window. */
+            /*
+             * #202: NVMe BAR0. Checked before virtio-blk simply because the two are never both
+             * attached (#333 selects one front-end), so the order only decides which range test runs
+             * first on a fault that belongs to neither.
+             */
+            if (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) {
+                uint64_t nvme_bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, 0);
+                if (nvme_bar != 0) {
+                    vmm_get_last_npf(kind, ctx, &npf);
+                    if (npf.guest_phys_addr >= nvme_bar &&
+                        npf.guest_phys_addr < nvme_bar + HYPE_FW_1_NVME_BAR_SIZE) {
+                        hype_nvme_ctx_t nctx;
+                        nvme_fill_ctx(&nctx, vm);
+                        if (vmm_handle_nvme_npf(kind, ctx, &vm->nvme, &nctx, nvme_bar,
+                                                HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
+                            continue;
+                        }
+                        hype_fatal("fw-1: unhandled NVMe MMIO at guest-physical 0x%llx",
+                                   (unsigned long long)npf.guest_phys_addr);
+                    }
+                }
+            }
             if (vblk_mapped) {
                 vmm_get_last_npf(kind, ctx, &npf);
                 if (npf.guest_phys_addr >= vblk_bar &&

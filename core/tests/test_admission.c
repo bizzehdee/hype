@@ -612,12 +612,16 @@ static void test_unpresentable_bus_is_refused(void) {
     CHECK_INT("ahci-sata is presentable (#333)", (int)HYPE_ADM_OK,
               (int)hype_adm_check_disk_bus(&cfg).status);
 
-    /*
-     * nvme parses because the spec defines it, but the guest controller is #202. Refusing LOUDLY beats
-     * attaching nothing: from inside the guest, a missing disk is indistinguishable from a hype bug.
-     */
+    /* #202 slice 6: nvme is now a real front-end, so it must be ACCEPTED. This assertion flipped when
+     * the controller landed -- it is the gate that stops a config asking for a bus hype cannot present. */
     cfg.disks[0].bus = HYPE_CFG_BUS_NVME;
-    CHECK_INT("nvme is refused until #202 lands", (int)HYPE_ADM_ERR_DISK_BUS_UNSUPPORTED,
+    CHECK_INT("nvme is accepted now the controller exists", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_bus(&cfg).status);
+
+    /* ahci-atapi remains unpresentable as a DISK bus: it is the optical front-end, and a hard disk on
+     * it is a config error rather than something to coerce. */
+    cfg.disks[0].bus = HYPE_CFG_BUS_AHCI_ATAPI;
+    CHECK_INT("ahci-atapi is still refused for a disk", (int)HYPE_ADM_ERR_DISK_BUS_UNSUPPORTED,
               (int)hype_adm_check_disk_bus(&cfg).status);
 
     /* A windows VM defaulting to ahci-sata must still pass. */
