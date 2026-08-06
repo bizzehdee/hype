@@ -525,11 +525,19 @@ static int dir_search(ext_vol_t *v, const uint8_t dino[IN_CORE], const char *nam
     if (map_inode(v, dino, 1, &map) != 0) {
         return -1;
     }
+    uint32_t scanned = 0;
     for (x = 0; x < map.count; x++) {
         uint64_t s;
         for (s = 0; s < map.extents[x].sector_count; s += v->spb) {
             uint64_t block = (map.extents[x].start_lba + s) / v->spb;
             uint32_t off = 0;
+            /* #346: sector_count comes from DISK. A corrupt or absurd directory extent must not
+             * turn one lookup into millions of individually-valid block reads -- on the real-HW
+             * media scan that presents as a boot wedged for hours with every read returning
+             * rc=0. 64K blocks (256MB at 4K) is far beyond any sane directory. */
+            if (++scanned > (1u << 16)) {
+                return -1;
+            }
             while (off + 8u <= v->block_size) {
                 uint8_t hdr[8];
                 uint32_t ino, rec, nl;
