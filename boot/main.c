@@ -11814,6 +11814,73 @@ static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
  *
  * Returns 1 if g_vms[vi] ended up with a verified stream, 0 otherwise (no media, or none found).
  */
+/*
+ * #343: read the WHOLE streamed ISO through hype_iso_stream_read() and print a checksum per 16 MiB
+ * window, so a mismatch against the host's own checksum localises the bad block instead of merely
+ * proving one exists.
+ *
+ * Why: FreeBSD panics in ~50% of streamed runs (#343) at varied SYSINIT sites with garbage pointers,
+ * and ZERO times in ~34 runs on the retired RAM-preload path. The guest loads its kernel AND modules
+ * from this data, so one wrong block yields corrupt code and a fault at an arbitrary later site --
+ * which fits the evidence better than memory corruption, and is exactly what a per-window checksum
+ * settles. The overrun hypothesis was already eliminated by the canary test in test_iso_stream.c.
+ *
+ * Build-flag gated: it reads the entire ISO (seconds of host I/O) and is a diagnostic, not something a
+ * normal boot should pay for.
+ */
+#ifndef HYPE_343_VERIFY_STREAM
+#define HYPE_343_VERIFY_STREAM 0
+#endif
+
+#if HYPE_343_VERIFY_STREAM
+static void fw_1_343_verify_stream(unsigned vi) {
+    static uint8_t buf[65536];
+    hype_iso_stream_t *s = &g_vms[vi].iso_stream;
+    uint64_t off = 0;
+    uint64_t win_start = 0;
+    uint64_t win_sum = 0;
+    uint64_t total_sum = 0;
+    unsigned long long fails = 0;
+    const uint64_t WIN = 16ull * 1024ull * 1024ull;
+
+    hype_serial_print("343-verify: vm%u streaming %llu bytes, 16MiB windows\n", vi,
+                      (unsigned long long)s->iso_size);
+    while (off < s->iso_size) {
+        uint64_t left = s->iso_size - off;
+        uint32_t n = (left > (uint64_t)sizeof(buf)) ? (uint32_t)sizeof(buf) : (uint32_t)left;
+        uint32_t i;
+
+        if (hype_iso_stream_read(s, off, buf, n) != 0) {
+            /* A failed read is itself the answer -- report the offset rather than continuing blind. */
+            hype_serial_print("343-verify: READ FAILED at off=%llu len=%u\n",
+                              (unsigned long long)off, n);
+            fails++;
+            if (fails > 8ull) {
+                break;
+            }
+            off += n;
+            continue;
+        }
+        for (i = 0; i < n; i++) {
+            win_sum += buf[i];
+            total_sum += buf[i];
+        }
+        off += n;
+        if (off - win_start >= WIN || off >= s->iso_size) {
+            hype_serial_print("343-verify: win %llu..%llu sum=%llu\n",
+                              (unsigned long long)win_start, (unsigned long long)off,
+                              (unsigned long long)win_sum);
+            win_start = off;
+            win_sum = 0;
+        }
+    }
+    /* %llu, not %lu: hype's own formatter does not implement %lu, and the first version of this probe
+     * printed the specifier literally. Worth knowing before reaching for it elsewhere. */
+    hype_serial_print("343-verify: DONE total_sum=%llu read_failures=%llu\n",
+                      (unsigned long long)total_sum, (unsigned long long)fails);
+}
+#endif
+
 static int fw_1_resolve_media_stream(unsigned vi) {
     const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
 
@@ -11955,6 +12022,9 @@ static int fw_1_resolve_media_stream(unsigned vi) {
             if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                 cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
                 g_vms[vi].iso_stream_ready = 1;
+#if HYPE_343_VERIFY_STREAM
+                fw_1_343_verify_stream(vi); /* #343 diagnostic */
+#endif
                 /* #320: the volume may be FAT32, exFAT or ext, so say which rather
                  * than naming two of the three. */
                 hype_serial_print("host-stream: vm%u CD001 verified streaming from a FILE on "
