@@ -3669,3 +3669,41 @@ void hype_vmx_vcpu_get_cr_diag(hype_vcpu_ctx_t *ctx, unsigned gpr, hype_vmx_cr_d
 void hype_vmx_vcpu_set_hv_enabled(hype_vcpu_ctx_t *ctx, int enabled) {
     ((struct hype_vcpu_ctx *)ctx)->hv_enabled = enabled ? 1 : 0;
 }
+
+/* ---- #202 slice 6a: NVMe BAR0 MMIO (VMX) ------------------------------------------------------- */
+
+int hype_vmx_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
+                                  const hype_nvme_ctx_t *nctx, uint64_t mmio_base_phys,
+                                  uint32_t bar_size, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+
+    if (dev == 0 || nctx == 0) {
+        return -1;
+    }
+    if (vmx_mmio_begin_insn(real, mmio_base_phys, bar_size, guest_insn_bytes, &m) != 0) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        unsigned int qid;
+        int is_cq;
+        /*
+         * #307: a read-modify-write needs the register's CURRENT value so the instruction combines
+         * with what is there. Only fetched when the form actually needs it, same as the ECAM path.
+         */
+        uint32_t cur = m.decoded.mem_is_dst ? hype_nvme_mmio_read32(dev, m.offset) : 0u;
+        uint32_t value = vmx_mmio_store_val(&m, cur);
+
+        hype_nvme_mmio_write32(dev, m.offset, value);
+        /* A submission-queue doorbell is what makes the controller work; drained synchronously here
+         * for the same reason as the SVM path -- hype has no worker thread. */
+        if (hype_nvme_doorbell_decode(m.offset, &qid, &is_cq) == 0 && !is_cq) {
+            (void)hype_nvme_process_sq(dev, qid, nctx);
+        }
+    } else {
+        uint32_t value = hype_nvme_mmio_read32(dev, m.offset);
+        vmx_mmio_finish_read(&m, value);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}

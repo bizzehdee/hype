@@ -3911,3 +3911,74 @@ uint32_t hype_svm_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx) {
 void hype_svm_vcpu_set_hv_enabled(hype_vcpu_ctx_t *ctx, int enabled) {
     ((struct hype_vcpu_ctx *)ctx)->hv_enabled = enabled ? 1 : 0;
 }
+
+/* ---- #202 slice 6a: NVMe BAR0 MMIO ------------------------------------------------------------- */
+
+int hype_svm_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
+                                  const hype_nvme_ctx_t *nctx, uint64_t mmio_base_phys,
+                                  uint32_t bar_size, const uint8_t *insn) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    if (dev == 0 || nctx == 0) {
+        return -1;
+    }
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    /* bar_size comes from the caller so this can never emulate a wider window than the BAR claims. */
+    if (npf.guest_phys_addr < mmio_base_phys ||
+        npf.guest_phys_addr >= mmio_base_phys + (uint64_t)bar_size) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - mmio_base_phys);
+
+    guest_bytes = (insn != 0) ? insn : (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+    /* #306: an immediate store has no source register -- the ModRM reg field is an opcode extension. */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
+        unsigned int qid;
+        int is_cq;
+
+        hype_nvme_mmio_write32(dev, offset, value);
+        /*
+         * A SUBMISSION queue doorbell is the guest saying "there is work". hype has no worker thread,
+         * so the queue is drained HERE, synchronously, before the guest resumes -- a doorbell whose
+         * commands are never fetched is indistinguishable from a dead controller.
+         *
+         * Completion-queue doorbells only move the consumer index; there is nothing to do for them.
+         */
+        if (hype_nvme_doorbell_decode(offset, &qid, &is_cq) == 0 && !is_cq) {
+            (void)hype_nvme_process_sq(dev, qid, nctx);
+        }
+    } else {
+        uint32_t value = hype_nvme_mmio_read32(dev, offset);
+        /*
+         * MOV only. Unlike the LAPIC (#305), no firmware or OS reads an NVMe register with an ALU form:
+         * these are plain 32-bit register loads. Refusing anything else keeps hype from silently
+         * emulating half an instruction -- if a guest ever does it, the refusal says so rather than
+         * leaving RFLAGS stale.
+         */
+        if (decoded.op != HYPE_MMIO_ALU_MOV) {
+            return -1;
+        }
+        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}

@@ -2,6 +2,7 @@
 #define HYPE_ARCH_VMX_H
 
 #include <stdint.h>
+#include "../../../devices/nvme.h" /* #202 */
 
 #include "../cpu/vmm_ops.h"
 
@@ -127,5 +128,16 @@ int hype_vmx_enable(void);
 int hype_vmx_enable_on(void *vmxon_region);
 
 extern const hype_vmm_ops_t hype_vmx_ops;
+
+
+/*
+ * #202 slice 6a: NVMe BAR0 MMIO, the VMX counterpart of hype_svm_vcpu_handle_nvme_npf().
+ *
+ * Present in BOTH backends from the outset deliberately: a device modelled on one and not the other is
+ * the divergence #315 was filed about, and it would show up as "NVMe works on AMD, hangs on Intel".
+ */
+int hype_vmx_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
+                                  const hype_nvme_ctx_t *nctx, uint64_t mmio_base_phys,
+                                  uint32_t bar_size, const uint8_t *guest_insn_bytes);
 
 #endif /* HYPE_ARCH_VMX_H */

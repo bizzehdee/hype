@@ -8,6 +8,7 @@
 #include "../cpu/cpuid_emulate.h"
 #include "../cpu/msr_emulate.h"
 #include "../../../devices/pic.h"
+#include "../../../devices/nvme.h" /* #202: the guest NVMe model the NPF handler drives */
 #include "../../../devices/pit.h"
 #include "../../../devices/pflash.h"
 #include "../../../devices/fw_cfg.h"
@@ -1213,5 +1214,22 @@ extern const hype_vmm_ops_t hype_svm_ops;
 
 /* The MSR index (guest RCX) at the last MSR intercept, for diagnostics. */
 uint32_t hype_svm_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx);
+
+
+/*
+ * #202 slice 6a: NVMe BAR0 MMIO. Same shape as the virtio-blk handler above -- decode the faulting
+ * instruction, emulate the 32-bit register access, advance RIP.
+ *
+ * `bar_size` is passed rather than assumed so the caller and the PCI BAR cannot disagree: a handler
+ * that accepted a wider range than the BAR actually claims would emulate accesses to addresses the
+ * guest was never told belonged to this device.
+ *
+ * A write to a SUBMISSION QUEUE doorbell is what makes the controller do work, so the handler drains
+ * that queue before returning. That is deliberate: hype has no worker thread, and a doorbell whose
+ * commands are never fetched is indistinguishable to the guest from a dead controller.
+ */
+int hype_svm_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
+                                  const hype_nvme_ctx_t *nctx, uint64_t mmio_base_phys,
+                                  uint32_t bar_size, const uint8_t *insn);
 
 #endif /* HYPE_ARCH_SVM_H */
