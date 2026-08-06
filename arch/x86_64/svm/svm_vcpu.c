@@ -1883,9 +1883,18 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
         hype_atapi_execute_cdb(atapi, cdb, &result);
 
         if (g_ahci_trace) {
+            /* #318: print the DECODED 32-bit LBA and block count for the read commands, not two
+             * raw CDB bytes -- the whole point of this trace is comparing the requested LBAs
+             * against the ISO's real directory extents, which bytes 2 and 5 alone cannot do. */
+            uint32_t t_lba = ((uint32_t)cdb[2] << 24) | ((uint32_t)cdb[3] << 16) |
+                             ((uint32_t)cdb[4] << 8) | (uint32_t)cdb[5];
+            uint32_t t_cnt = (cdb[0] == 0xA8u)
+                                 ? (((uint32_t)cdb[6] << 24) | ((uint32_t)cdb[7] << 16) |
+                                    ((uint32_t)cdb[8] << 8) | (uint32_t)cdb[9])
+                                 : (((uint32_t)cdb[7] << 8) | (uint32_t)cdb[8]);
             hype_debug_print(
-                "ahci-trace: ATAPI CDB=0x%x lba=%u/%u status=%s uses_media=%u len=%u\n",
-                (unsigned int)cdb[0], (unsigned int)cdb[2], (unsigned int)cdb[5],
+                "ahci-trace: ATAPI CDB=0x%x lba=%u count=%u status=%s uses_media=%u len=%u\n",
+                (unsigned int)cdb[0], (unsigned int)t_lba, (unsigned int)t_cnt,
                 result.status == HYPE_ATAPI_STATUS_GOOD ? "GOOD" : "CHECK",
                 (unsigned int)result.uses_media_data,
                 (unsigned int)(result.uses_media_data ? result.media_length : result.synth_length));

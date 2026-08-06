@@ -448,6 +448,56 @@ static uint64_t g_ram_1_size_bytes;
  * the same media) and the host's usable-RAM total.
  */
 #define HYPE_FW_MAX_VMS 2u
+
+/*
+ * #329: how many guest disks one VM can carry. The bound is the interrupt budget, not memory:
+ * each attached disk consumes one device number on bus 0 (hype's PCI model is
+ * bus-0/function-0/Type-0 only) plus one _PRT entry routing its INTA to a dedicated IO-APIC
+ * GSI, and after the existing devices (16-21) the 24-pin IO-APIC has exactly two GSIs left
+ * (22, 23) -- so slot 0's legacy per-bus lines plus two more slots is what can be routed
+ * without sharing a level line between disks. hype.cfg's per-VM list cap
+ * (HYPE_CFG_MAX_VM_DISKS) is checked against this at attach time with a named error.
+ */
+#define HYPE_FW_1_MAX_DISKS 3u
+
+/*
+ * #329: one guest disk -- the front-end device models plus the backend stack that used to be
+ * flat members of hype_fw_vm_t. A slot owns everything one disk needs, so N disks is N slots
+ * rather than N more copies of this list scattered through the VM struct.
+ *
+ * Front-end members (one is attached, by the slot's resolved bus):
+ *   vblk                  M5-7 (#196): virtio-blk device-register model.
+ *   ata_ahci + ata_disk   #262 slice 2: a single-port AHCI HBA carrying a plain SATA disk --
+ *                         one HBA per disk, because hype_ahci_t models exactly one port.
+ *   nvme + nvme_bounce    #202: the guest-facing NVMe controller; the bounce page is the
+ *                         largest single PRP segment (devices/nvme.c allocates nothing).
+ *
+ * Backend stack (be is what the attached front-end drives):
+ *   file                  RAM scratch over backing_phys.
+ *   image + raw_be        M5-8 (#199): raw image FILE on a host filesystem.
+ *   qcow2                 M5-9 (#200): when the image sniffs as qcow2, raw_be becomes the
+ *                         layer below and be is the format layer's view -- the guest must see
+ *                         the virtual size, not the file's.
+ *   phys + phys_nvme      M10-6a (#227): a confirmed `physical:` target over the enumerated
+ *                         host disk. is_physical says which backing is live.
+ */
+typedef struct hype_fw_disk {
+    hype_virtio_blk_t vblk;
+    hype_nvme_t nvme;
+    uint8_t nvme_bounce[4096];
+    hype_ahci_t ata_ahci;
+    hype_ata_disk_t ata_disk;
+    hype_blk_backend_t be;
+    hype_blk_file_t file;
+    hype_blk_image_t image;
+    hype_blk_backend_t raw_be;
+    hype_qcow2_t qcow2;
+    uint64_t backing_phys; /* host-physical base of this slot's RAM scratch */
+    hype_blk_phys_t phys;
+    hype_blk_phys_nvme_t phys_nvme;
+    int is_physical;
+} hype_fw_disk_t;
+
 typedef struct hype_fw_vm {
     /* --- guest memory (OVMF firmware + low RAM) --- */
     uint64_t combined_host_phys; /* OVMF_VARS+CODE, host-physical */
@@ -614,10 +664,6 @@ typedef struct hype_fw_vm {
     hype_acpi_loader_entry_t loader_script[HYPE_ACPI_LOADER_SCRIPT_ENTRIES];
     hype_ahci_t ahci;   /* FW-1h: AHCI/ATAPI CD-ROM (backed by the loaded ISO) */
     hype_atapi_t atapi;
-    /* #262 slice 2: a SECOND AHCI HBA carrying a plain SATA disk, distinct from the
-     * `ahci`/`atapi` optical pair above. Per-VM like the rest of the device set. */
-    hype_ahci_t ata_ahci;
-    hype_ata_disk_t ata_disk;
     /* GLADDER-9 (#140): per-VM ISO backing, so two guests can boot DIFFERENT
      * media (Fedora on vm0, Ubuntu on vm1) rather than one shared global.
      *
@@ -628,34 +674,14 @@ typedef struct hype_fw_vm {
      * learned to honour install_media (#322). */
     hype_iso_stream_t iso_stream;
     int iso_stream_ready;
-    /* M5-7 (#196): per-VM virtio-blk disk + its block backend. vblk is the
-     * device-register model; vblk_be is the hype_blk_backend the datapath drives
-     * (file-backed over vblk_backing_phys for now). Per-VM so two guests get
-     * independent writable disks. */
-    hype_virtio_blk_t vblk;
     /*
-     * #202: this VM's guest-facing NVMe controller, plus the staging buffer its I/O path needs. One
-     * page because that is the largest single PRP segment; devices/nvme.c allocates nothing itself.
-     * Present unconditionally but only ATTACHED (PCI function + MMIO arm) when the VM asks for
-     * bus = nvme -- same shape as #333's front-end selection.
+     * #329: this VM's guest disks, each a self-contained slot. Slot 0 is what used to be the
+     * flat set of vblk/nvme/ata members; grouping them is what lets a VM carry more than one.
+     * Every slot carries all three front-end models even though only the one matching its
+     * resolved bus is ever attached -- a union would save BSS (zero binary cost) at the price
+     * of a slot whose safety depends on never touching the wrong arm.
      */
-    hype_nvme_t nvme;
-    uint8_t nvme_bounce[4096];
-    hype_blk_backend_t vblk_be;
-    hype_blk_file_t vblk_file;
-    hype_blk_image_t vblk_image; /* M5-8 (#199): raw image FILE backend */
-    /* M5-9 (#200): when the image file turns out to be qcow2, the raw extent backend
-     * becomes the layer BELOW and vblk_be is the format layer's view instead. Two
-     * backends because the guest must see the virtual size, not the file's. */
-    hype_blk_backend_t vblk_raw_be;
-    hype_qcow2_t vblk_qcow2;
-    uint64_t vblk_backing_phys; /* host-physical base of this VM's scratch disk */
-    /* M10-6a (#227): when this VM's confirmed target is a `physical:` disk, the
-     * backend above is instead a writable physical backend over the enumerated
-     * host NVMe scratch. Which backing is live is decided in fw_1_setup_virtio_blk. */
-    hype_blk_phys_t vblk_phys;
-    hype_blk_phys_nvme_t vblk_phys_nvme;
-    int vblk_is_physical;
+    hype_fw_disk_t disk[HYPE_FW_1_MAX_DISKS];
     hype_gpa_map_t dma_map; /* VALID-1/3: guest-phys->host layout for DMA bounds */
     /* --- per-run timing + diagnostics (M4-6b1/M4-6d4/PERF-1a) --- */
     uint64_t host_tsc_hz;   /* calibrated CPU freq; drives the guest timebase */
@@ -747,10 +773,12 @@ static void fw_1_resolve_os_hint(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsig
 #define g_fw_1_loader_script (vm->loader_script)
 #define g_fw_1_ahci (vm->ahci)
 #define g_fw_1_atapi (vm->atapi)
-#define g_fw_1_ata_ahci (vm->ata_ahci)
-#define g_fw_1_ata_disk (vm->ata_disk)
-#define g_fw_1_vblk (vm->vblk)
-#define g_fw_1_vblk_be (vm->vblk_be)
+/* #329: the g_fw_1_* disk shims name SLOT 0 -- the one disk every pre-#329 caller meant.
+ * Code that handles slot N takes a hype_fw_disk_t* instead of using these. */
+#define g_fw_1_ata_ahci (vm->disk[0].ata_ahci)
+#define g_fw_1_ata_disk (vm->disk[0].ata_disk)
+#define g_fw_1_vblk (vm->disk[0].vblk)
+#define g_fw_1_vblk_be (vm->disk[0].be)
 #define g_fw_1_dma_map (vm->dma_map)
 #define g_fw_1_host_tsc_hz (vm->host_tsc_hz)
 #define g_fw_1_vmrun_tsc (vm->vmrun_tsc)
@@ -7033,7 +7061,7 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
  * gpa_map, ACPI/fw_cfg/e820 blobs) are not mutated by a run, so they are left
  * intact and not rebuilt; OVMF re-selects the fw_cfg files itself on restart. */
 /* M5-7 (#196): attach this VM's virtio-blk disk -- register model + block
- * backend (RAM-backed blk_file over the pre-EBS-allocated vblk_backing_phys) +
+ * backend (RAM-backed blk_file over the pre-EBS-allocated disk[0].backing_phys) +
  * PCI device 3 with its virtio-pci capability list (config regions at BAR4) and
  * INTA interrupt. Shared by the initial boot (run_fw_1_test) and a VM restart
  * (fw_1_vm_reinit). The vCPU loop latches the BAR OVMF assigns, dispatches BAR
@@ -7329,14 +7357,14 @@ static void nvme_fill_ctx(hype_nvme_ctx_t *c, hype_fw_vm_t *vm) {
     for (i = 0; i < sizeof(*c); i++) {
         p[i] = 0;
     }
-    c->be = &vm->vblk_be;             /* the same backend every front-end shares (#196) */
-    c->total_sectors = vm->vblk_be.total_sectors;
+    c->be = &vm->disk[0].be;             /* the same backend every front-end shares (#196) */
+    c->total_sectors = vm->disk[0].be.total_sectors;
     c->page_size = 4096u;
     c->gread = nvme_guest_read;
     c->gwrite = nvme_guest_write;
     c->gctx = vm;
-    c->bounce = vm->nvme_bounce;
-    c->bounce_len = (uint32_t)sizeof(vm->nvme_bounce);
+    c->bounce = vm->disk[0].nvme_bounce;
+    c->bounce_len = (uint32_t)sizeof(vm->disk[0].nvme_bounce);
     c->serial = vm->name;             /* per VM, like virtio-blk's GET_ID serial (#310) */
 }
 
@@ -7496,7 +7524,7 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
                               cv->target_disk_size_gb, (unsigned long long)want);
         }
     }
-    if (hype_blk_image_init(&vm->vblk_image, &vm->vblk_raw_be, &file, g_media.part_base_lba,
+    if (hype_blk_image_init(&vm->disk[0].image, &vm->disk[0].raw_be, &file, g_media.part_base_lba,
                             hostdisk_read, hostdisk_write, 0) != 0) {
         /* A sparse or short-mapped image: refuse rather than serve a disk whose
          * later sectors would fail mid-install. #90's --check reports why. */
@@ -7514,27 +7542,27 @@ static int fw_1_vblk_use_image_file(hype_fw_vm_t *vm) {
      * remember to edit hype.cfg -- which would fail as a guest that silently reads the
      * qcow2 HEADER as its boot sector.
      */
-    if (hype_qcow2_init(&vm->vblk_qcow2, &vm->vblk_be, &vm->vblk_raw_be, 0) == 0) {
+    if (hype_qcow2_init(&vm->disk[0].qcow2, &vm->disk[0].be, &vm->disk[0].raw_be, 0) == 0) {
         hype_debug_print("m5-9: %s on %s is QCOW2 v%u -- %llu-byte clusters, %llu virtual "
                          "sectors from a %llu-byte file [#200]\n",
-                         path, fs, vm->vblk_qcow2.version,
-                         (unsigned long long)vm->vblk_qcow2.cluster_size,
-                         (unsigned long long)vm->vblk_be.total_sectors,
+                         path, fs, vm->disk[0].qcow2.version,
+                         (unsigned long long)vm->disk[0].qcow2.cluster_size,
+                         (unsigned long long)vm->disk[0].be.total_sectors,
                          (unsigned long long)file.size_bytes);
     } else {
         /* Field-by-field: whole-struct assignment of anything that might hold an array
          * is the freestanding memcpy trap this project has hit before. */
-        vm->vblk_be.read = vm->vblk_raw_be.read;
-        vm->vblk_be.write = vm->vblk_raw_be.write;
-        vm->vblk_be.ctx = vm->vblk_raw_be.ctx;
-        vm->vblk_be.total_sectors = vm->vblk_raw_be.total_sectors;
+        vm->disk[0].be.read = vm->disk[0].raw_be.read;
+        vm->disk[0].be.write = vm->disk[0].raw_be.write;
+        vm->disk[0].be.ctx = vm->disk[0].raw_be.ctx;
+        vm->disk[0].be.total_sectors = vm->disk[0].raw_be.total_sectors;
     }
-    vm->vblk_is_physical = 0;
-    hype_virtio_blk_reset(&vm->vblk, vm->vblk_be.total_sectors);
+    vm->disk[0].is_physical = 0;
+    hype_virtio_blk_reset(&vm->disk[0].vblk, vm->disk[0].be.total_sectors);
     hype_debug_print("m5-8: FILE-backed guest disk %s on %s -- %llu bytes, %u extent(s), "
                      "%llu sectors [writable, persists to the file]\n",
                      path, fs, (unsigned long long)file.size_bytes, file.count,
-                     (unsigned long long)vm->vblk_be.total_sectors);
+                     (unsigned long long)vm->disk[0].be.total_sectors);
     usb_log_flush(); /* prove the attach reached the log before the guest runs */
     return 1;
 }
@@ -7550,12 +7578,12 @@ static void fw_1_vblk_write_selftest(hype_fw_vm_t *vm) {
     unsigned k;
     int ok = 1;
     for (k = 0; k < 512u; k++) wr[k] = (uint8_t)(0x5Au ^ (k & 0xFFu));
-    if (hype_blk_backend_write(&vm->vblk_be, lba, 1u, wr) != 0) {
+    if (hype_blk_backend_write(&vm->disk[0].be, lba, 1u, wr) != 0) {
         hype_serial_print("virtio-blk: M10-6 WRITE-SELFTEST write FAILED\n");
         return;
     }
     for (k = 0; k < 512u; k++) rd[k] = 0;
-    if (hype_blk_backend_read(&vm->vblk_be, lba, 1u, rd) != 0) {
+    if (hype_blk_backend_read(&vm->disk[0].be, lba, 1u, rd) != 0) {
         hype_serial_print("virtio-blk: M10-6 WRITE-SELFTEST readback FAILED\n");
         return;
     }
@@ -7575,12 +7603,12 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
      * the first VM claims it. Exercises guest-on-AP AHCI reads to check whether
      * they flake like the NVMe path (#229). */
     if (g_hostdisk_present && g_phys_backend_claimed_vm < 0) {
-        hype_blk_phys_ahci_init(&vm->vblk_phys, &g_hostdisk_ahci, &vm->vblk_be,
+        hype_blk_phys_ahci_init(&vm->disk[0].phys, &g_hostdisk_ahci, &vm->disk[0].be,
                                 g_hostdisk_abar, g_hostdisk_port, g_hostdisk_total_sectors);
-        vm->vblk_be.write = 0; /* enforce read-only -- laptop's real OS disk */
-        vm->vblk_is_physical = 1;
+        vm->disk[0].be.write = 0; /* enforce read-only -- laptop's real OS disk */
+        vm->disk[0].is_physical = 1;
         g_phys_backend_claimed_vm = (int)(vm - &g_vms[0]);
-        hype_virtio_blk_reset(&vm->vblk, g_hostdisk_total_sectors);
+        hype_virtio_blk_reset(&vm->disk[0].vblk, g_hostdisk_total_sectors);
         hype_debug_print("virtio-blk[vm %d]: READ-ONLY PHYSICAL SATA backend #229 "
                          "(abar 0x%llx port %u, %llu sectors) -- writes rejected\n",
                          (int)(vm - &g_vms[0]), (unsigned long long)g_hostdisk_abar,
@@ -7619,13 +7647,13 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
         if (hype_nvme_host_init(g_hostnvme_bar) != 0) {
             hype_serial_print("virtio-blk: NVMe re-init on servicing core FAILED -- "
                               "falling back to file backend\n");
-            vm->vblk_is_physical = 0;
-            hype_virtio_blk_reset(&vm->vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
-            hype_blk_file_init(&vm->vblk_file, &vm->vblk_be,
-                               (uint8_t *)(uintptr_t)vm->vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
+            vm->disk[0].is_physical = 0;
+            hype_virtio_blk_reset(&vm->disk[0].vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
+            hype_blk_file_init(&vm->disk[0].file, &vm->disk[0].be,
+                               (uint8_t *)(uintptr_t)vm->disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
             goto vblk_pci;
         }
-        hype_blk_phys_nvme_init(&vm->vblk_phys, &vm->vblk_phys_nvme, &vm->vblk_be,
+        hype_blk_phys_nvme_init(&vm->disk[0].phys, &vm->disk[0].phys_nvme, &vm->disk[0].be,
                                 g_hostnvme_bar, g_hostnvme_total_sectors);
         { /* #332: scope to the configured partition, same rules as the AHCI path. */
             unsigned int pnum = fw_1_phys_partition();
@@ -7639,8 +7667,8 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
                 return;
             }
             if (pnum != 0u) {
-                vm->vblk_phys.base_lba = pbase;
-                vm->vblk_be.total_sectors = pcount;
+                vm->disk[0].phys.base_lba = pbase;
+                vm->disk[0].be.total_sectors = pcount;
                 g_hostnvme_scope_sectors = pcount;
                 hype_debug_print("virtio-blk[vm %d]: scoped to partition %u -- disk LBA %llu, %llu "
                                  "sectors (%llu MiB)\n", (int)(vm - &g_vms[0]), pnum,
@@ -7653,23 +7681,23 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
 #if HYPE_229_RO_PHYS
         /* #229 real-HW repro: strip the write fn so the guest can READ the real
          * NVMe (reproducing the AP read-completion flake) but never write it. */
-        vm->vblk_be.write = 0;
+        vm->disk[0].be.write = 0;
         hype_debug_print("#229: PHYSICAL NVMe backend forced READ-ONLY (writes rejected) "
                          "-- safe real-HW read-path repro\n");
 #endif
         /* #267: same split as the AHCI path -- attach on identity match, but install
          * the write path only when the #125 confirm accepted THIS drive. */
         if (!fw_1_phys_write_permitted(g_hostnvme_serial)) {
-            vm->vblk_be.write = 0;
+            vm->disk[0].be.write = 0;
         }
-        vm->vblk_is_physical = 1;
+        vm->disk[0].is_physical = 1;
         g_phys_backend_claimed_vm = (int)(vm - &g_vms[0]);
         /* The SCOPE's size, not the drive's -- see the AHCI path. */
-        hype_virtio_blk_reset(&vm->vblk, g_hostnvme_scope_sectors);
+        hype_virtio_blk_reset(&vm->disk[0].vblk, g_hostnvme_scope_sectors);
         hype_debug_print("virtio-blk[vm %d]: PHYSICAL NVMe backend (sn '%s', %llu sectors)%s\n",
                          (int)(vm - &g_vms[0]), g_hostnvme_serial,
                          (unsigned long long)g_hostnvme_scope_sectors,
-                         vm->vblk_be.write ? " [writable]"
+                         vm->disk[0].be.write ? " [writable]"
                                            : " [READ-ONLY -- boot only, no write confirm]");
         hype_debug_print("#229dbg setup: CR3=0x%llx g_pml4=0x%llx g_ap_cr3=0x%llx nvme_bar=0x%llx\n",
                          (unsigned long long)hype_dbg_read_cr3(), (unsigned long long)(uintptr_t)g_pml4,
@@ -7698,13 +7726,13 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
                               "whole disk\n", idx, pnum, g_hostdisk_serial);
             return;
         }
-        hype_blk_phys_ahci_init(&vm->vblk_phys, &g_hostdisk_ahci, &vm->vblk_be,
+        hype_blk_phys_ahci_init(&vm->disk[0].phys, &g_hostdisk_ahci, &vm->disk[0].be,
                                 g_hostdisk_abar, g_hostdisk_port, g_hostdisk_total_sectors);
         if (pnum != 0u) {
             /* Re-point the already-wired backend at the partition: base offsets every transfer and
              * the clamped capacity is what the dispatcher confines the guest with. */
-            vm->vblk_phys.base_lba = pbase;
-            vm->vblk_be.total_sectors = pcount;
+            vm->disk[0].phys.base_lba = pbase;
+            vm->disk[0].be.total_sectors = pcount;
             hype_debug_print("virtio-blk[vm %d]: scoped to partition %u -- disk LBA %llu, %llu "
                              "sectors (%llu MiB)\n", idx, pnum, (unsigned long long)pbase,
                              (unsigned long long)pcount,
@@ -7714,13 +7742,13 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
          * path. Nulling `write` is what hype_blk_backend_write checks, so a
          * read-only attach cannot damage the disk however the guest behaves. */
         if (!writable) {
-            vm->vblk_be.write = 0;
+            vm->disk[0].be.write = 0;
         }
-        vm->vblk_is_physical = 1;
+        vm->disk[0].is_physical = 1;
         g_phys_backend_claimed_vm = idx;
         /* The guest is told the SCOPE's size, not the drive's -- otherwise it would address past
          * the partition and every such access would be refused by the dispatcher. */
-        hype_virtio_blk_reset(&vm->vblk, pcount);
+        hype_virtio_blk_reset(&vm->disk[0].vblk, pcount);
         hype_debug_print("virtio-blk[vm %d]: PHYSICAL AHCI/SATA backend (sn '%s', %llu sectors) "
                          "%s\n", idx, g_hostdisk_serial, (unsigned long long)pcount,
                          writable ? "[writable -- #125 confirm accepted]"
@@ -7735,9 +7763,9 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
     } else if (fw_1_vblk_use_image_file(vm)) {
         /* M5-8 (#199): a raw image FILE on a host FS -- guest writes persist. */
     } else {
-        vm->vblk_is_physical = 0;
-        hype_virtio_blk_reset(&vm->vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
-        hype_blk_file_init(&vm->vblk_file, &vm->vblk_be, (uint8_t *)(uintptr_t)vm->vblk_backing_phys,
+        vm->disk[0].is_physical = 0;
+        hype_virtio_blk_reset(&vm->disk[0].vblk, HYPE_FW_1_VDISK_BYTES / HYPE_VIRTIO_BLK_SECTOR_SIZE);
+        hype_blk_file_init(&vm->disk[0].file, &vm->disk[0].be, (uint8_t *)(uintptr_t)vm->disk[0].backing_phys,
                            HYPE_FW_1_VDISK_BYTES);
     }
 vblk_pci:
@@ -7750,7 +7778,7 @@ vblk_pci:
      * Per VM, because a serial that is identical across VMs tells each guest the same disk
      * identity for two genuinely different disks; constant across reboots, because vm->name is.
      */
-    hype_virtio_blk_set_serial(&vm->vblk, vm->name);
+    hype_virtio_blk_set_serial(&vm->disk[0].vblk, vm->name);
     /*
      * #333: present the virtio-blk PCI function ONLY when this VM's disk asked for it. The device
      * MODEL above is always initialised, because it owns the resolved backend that whichever
@@ -7924,7 +7952,7 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
                             0x01, 0x08, 0x02);
         hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, 0, HYPE_FW_1_NVME_BAR_SIZE);
         hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, 1, 11);
-        hype_nvme_reset(&vm->nvme);
+        hype_nvme_reset(&vm->disk[0].nvme);
         hype_debug_print("fw-1: disk front-end = nvme -- controller at PCI dev %u (#202)\n",
                          HYPE_FW_1_PCI_DEV_NVME);
     }
@@ -10618,7 +10646,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         npf.guest_phys_addr < nvme_bar + HYPE_FW_1_NVME_BAR_SIZE) {
                         hype_nvme_ctx_t nctx;
                         nvme_fill_ctx(&nctx, vm);
-                        if (vmm_handle_nvme_npf(kind, ctx, &vm->nvme, &nctx, nvme_bar,
+                        if (vmm_handle_nvme_npf(kind, ctx, &vm->disk[0].nvme, &nctx, nvme_bar,
                                                 HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
                             continue;
                         }
@@ -10631,7 +10659,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 vmm_get_last_npf(kind, ctx, &npf);
                 if (npf.guest_phys_addr >= vblk_bar &&
                     npf.guest_phys_addr < vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
-                    if (vm->vblk_is_physical) {
+                    if (vm->disk[0].is_physical) {
                         static int dbg229_once = 0;
                         if (!dbg229_once) {
                             dbg229_once = 1;
@@ -13796,14 +13824,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * disk. Later steps swap the backend to a raw file / physical disk. */
         {
             UINTN vdisk_pages = (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL);
-            g_vms[0].vblk_backing_phys = hype_alloc_pages_any(SystemTable->BootServices, vdisk_pages);
-            hype_guest_ram_zero((void *)(uintptr_t)g_vms[0].vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
+            g_vms[0].disk[0].backing_phys = hype_alloc_pages_any(SystemTable->BootServices, vdisk_pages);
+            hype_guest_ram_zero((void *)(uintptr_t)g_vms[0].disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
             /* #267: this is the RAM fallback being RESERVED, not the backend being
              * chosen -- that happens later in fw_1_setup_virtio_blk. Say so: read as
              * a backend announcement it hides a declined physical attach. */
             hype_debug_print("fw-1: vm0 virtio-blk fallback RAM scratch reserved @0x%llx "
                              "(%llu MiB) -- backend chosen later\n",
-                             (unsigned long long)g_vms[0].vblk_backing_phys,
+                             (unsigned long long)g_vms[0].disk[0].backing_phys,
                              (unsigned long long)(HYPE_FW_1_VDISK_BYTES / (1024ULL * 1024ULL)));
         }
 
@@ -13878,9 +13906,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     (const void *)(uintptr_t)vm1->combined_host_phys, vm1->combined_size);
                 vm1->host_tsc_hz = vm->host_tsc_hz;
                 /* M5-7 (#196): vm1's own virtio-blk scratch disk backing (pre-EBS). */
-                vm1->vblk_backing_phys =
+                vm1->disk[0].backing_phys =
                     hype_alloc_pages_any(SystemTable->BootServices, (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL));
-                hype_guest_ram_zero((void *)(uintptr_t)vm1->vblk_backing_phys, HYPE_FW_1_VDISK_BYTES);
+                hype_guest_ram_zero((void *)(uintptr_t)vm1->disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
                 /* GLADDER-9 (#140) / #326: vm1's media is resolved POST-EBS by
                  * fw_1_resolve_media_stream(1), which honours \iso\vm1.iso (and vm1's own
                  * install_media / media_disk) exactly as this pre-EBS RAM load used to -- so
