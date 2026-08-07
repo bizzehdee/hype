@@ -716,6 +716,9 @@ const uint8_t *hype_svm_vcpu_guest_insn_bytes(hype_vcpu_ctx_t *ctx, uint8_t *out
  * top-level page table, for walking guest virtual -> guest-physical when
  * decode assists are unavailable (e.g. QEMU+KVM nested SVM). */
 uint64_t hype_svm_vcpu_get_cr3(hype_vcpu_ctx_t *ctx);
+/* One guest general-purpose register by x86-64 encoding (0=RAX..15=R15). Indices 0 and 4 are
+ * not held in gprs[] -- RAX lives in the VMCB and RSP is managed by VMRUN -- so they read 0. */
+uint64_t hype_svm_vcpu_get_gpr(hype_vcpu_ctx_t *ctx, unsigned idx);
 
 /*
  * Handles an MSR (CPUMSR-2, RDMSR/WRMSR) VM-exit: decodes direction

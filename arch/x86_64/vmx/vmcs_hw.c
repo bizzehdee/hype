@@ -2744,6 +2744,13 @@ int hype_vmx_smoke_test(void) {
  * VMCS field; the semantics the caller sees are identical.
  * ===================================================================== */
 
+uint64_t hype_vmx_vcpu_get_gpr(hype_vcpu_ctx_t *ctx, unsigned idx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real == 0 || idx >= 16u) {
+        return 0;
+    }
+    return real->gprs[idx];
+}
 uint64_t hype_vmx_vcpu_get_cr3(hype_vcpu_ctx_t *ctx) {
     int ok;
     (void)ctx;

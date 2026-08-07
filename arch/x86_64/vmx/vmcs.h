@@ -173,6 +173,8 @@ int hype_vmx_smoke_test(void);
  * units, exception error codes, activity state, absent Decode Assist).
  */
 uint64_t hype_vmx_vcpu_get_cr3(hype_vcpu_ctx_t *ctx);
+/* One guest general-purpose register by x86-64 encoding (0=RAX..15=R15). */
+uint64_t hype_vmx_vcpu_get_gpr(hype_vcpu_ctx_t *ctx, unsigned idx);
 void hype_vmx_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip);
 const uint8_t *hype_vmx_vcpu_guest_insn_bytes(hype_vcpu_ctx_t *ctx, uint8_t *out_num);
 void hype_vmx_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_vmm_npf_t *out);

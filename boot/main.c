@@ -3415,6 +3415,10 @@ static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
 static uint64_t vmm_get_cr3(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
     return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_cr3(ctx) : hype_svm_vcpu_get_cr3(ctx);
 }
+static uint64_t vmm_get_gpr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, unsigned idx) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_gpr(ctx, idx)
+                                     : hype_svm_vcpu_get_gpr(ctx, idx);
+}
 static void vmm_set_rip(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rip) {
     if (kind == HYPE_VMM_KIND_VMX) {
         hype_vmx_vcpu_set_rip(ctx, rip);
@@ -6591,6 +6595,17 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
  * debug info, so it is found at runtime instead: spc_idleproc is the only word in the structure
  * that equals the idle thread's proc address, and that anchors ci_schedstate exactly.
  */
+/*
+ * The halt inside sched_idle, and the offset of spc_whichqs from the cpu_info the loop holds in
+ * r14. Both read straight out of the kernel's own code, not inferred:
+ *   ffffffff8111c90b  cmpl $0x0,0x42c(%r14)
+ *   ffffffff8111c913  jne  ...            <- leaves the halt loop
+ *   ffffffff8111c915  call *cpu_idle_cycle_fcn
+ *   ffffffff8111c91b  jmp  ...c90b
+ * and cpu_idle_cycle_hlt is `endbr64; sti; hlt; ret`, so the HLT exit reports +5.
+ */
+#define FW_1_BSD_IDLE_HLT_RIP 0xffffffff811f3285ULL
+#define FW_1_BSD_WHICHQS 0x42cULL
 #define FW_1_BSD_CIF 0xffffffff8197a000ULL
 #define FW_1_BSD_CIF_LEN 0x4000u
 #define FW_1_BSD_WIN 1024u
@@ -8982,6 +8997,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 #define HYPE_EXCOST_BUCKETS 9
     static const char *const excost_names[HYPE_EXCOST_BUCKETS] = {
         "hlt", "npf", "ioio", "msr", "cpuid", "vintr", "pause", "intr", "other"};
+    /*
+     * #318 IDLEQ. The guest halts at cpu_idle_cycle_hlt inside sched_idle, whose loop condition
+     * is `cmpl $0x0, 0x42c(%r14)` -- spc_whichqs. Reading that address myself says 0x1000, so the
+     * branch should not be taken, yet the guest halts about a hundred times a second and idle0
+     * never reaches the p_stat store that precedes mi_switch. Both readings cannot be right.
+     * Resolve it by reading the field through the guest's OWN pointer, in r14, at the instant it
+     * halts -- same address the compare uses, same moment.
+     */
+    unsigned long long idleq_hlt = 0, idleq_zero = 0, idleq_nz = 0;
+    uint64_t idleq_last_r14 = 0;
+    uint32_t idleq_last_val = 0;
     unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
                        ex_other = 0;
     unsigned long long ex_io80 = 0, ex_ahci_npf = 0, ex_pause = 0, ex_intr = 0;
@@ -9402,6 +9428,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (vmm_reason_is_hlt(kind, info.reason)) {
             ex_hlt++;
             prev_cost_bucket = 0;
+            if (info.guest_rip == FW_1_BSD_IDLE_HLT_RIP) {
+                uint64_t r14 = vmm_get_gpr(kind, ctx, 14);
+                uint32_t v = 0;
+                idleq_hlt++;
+                idleq_last_r14 = r14;
+                if (r14 >= 0xffff800000000000ULL &&
+                    fw_1_read_guest_va(vm, vmm_get_cr3(kind, ctx), r14 + FW_1_BSD_WHICHQS, &v, 4)) {
+                    idleq_last_val = v;
+                    if (v == 0) {
+                        idleq_zero++;
+                    } else {
+                        idleq_nz++;
+                    }
+                }
+            }
         } else if (vmm_reason_is_npf(kind, info.reason)) {
             ex_npf++;
             prev_cost_bucket = 1;
@@ -9465,6 +9506,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                     }
                 }
+                hype_debug_print("fw-1 IDLEQ: idle_hlt=%llu whichqs_zero=%llu whichqs_nz=%llu "
+                                 "last_r14=0x%llx last_val=0x%x\n", idleq_hlt, idleq_zero,
+                                 idleq_nz, (unsigned long long)idleq_last_r14,
+                                 (unsigned)idleq_last_val);
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
