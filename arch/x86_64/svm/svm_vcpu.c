@@ -1797,6 +1797,7 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     uint8_t status_reg;
     uint8_t error_reg;
     uint32_t pis_bit;
+    int packet_pio_in = 0;
     uint8_t *d2h_fis;
     unsigned i;
 
@@ -1934,6 +1935,14 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
          * Host Register FIS (EDK2's AhciPioTransfer/AhciNonDataTransfer
          * wait on PxIS.DHRS for them). */
         pis_bit = HYPE_AHCI_PIS_DHRS;
+        /* #318: ...but a PACKET command that moves data in PIO mode must ALSO be given a PIO
+         * Setup FIS carrying the byte count, which is how a driver that reads the receive area
+         * (rather than just the PxIS bit, as EDK2 does) learns how much arrived. Without it
+         * OpenBSD's atapiscsi treats every READ(10) as suspect and re-interrogates the device
+         * with TEST UNIT READY + REQUEST SENSE, tripling the command count per sector.
+         * H2D Features bit 0 is the ATAPI DMA bit: set means a DMA transfer, which ends with
+         * the D2H FIS alone and no PIO Setup. */
+        packet_pio_in = (cmd_table_bytes[3] & 0x01u) == 0;
     }
 
     prdt_bytes = cmd_table_bytes + 0x80;
@@ -2066,7 +2075,10 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * ATAPI_IDENTIFY timed out on a completion hype had already finished (cs 00000000,
      * tfd 50, is 00000002).
      */
-    if (pis_bit == HYPE_AHCI_PIS_PSS) {
+    if (packet_pio_in && transferred > 0) {
+        pis_bit |= HYPE_AHCI_PIS_PSS;
+    }
+    if ((pis_bit & HYPE_AHCI_PIS_PSS) != 0) {
         hype_ahci_build_pio_setup_fis(rx_fis_host + 0x20, status_reg, error_reg, transferred);
     }
 
