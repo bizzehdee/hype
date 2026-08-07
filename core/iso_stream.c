@@ -9,21 +9,7 @@
  * VM services its own exits on its own AP core, so two streaming reads in flight overwrote each
  * other's covering sectors. Both guests then read another VM's bytes where their ISO's Primary
  * Volume Descriptor should be, found no filesystem, and OVMF reported the CD-ROM as Not Found. */
-/*
- * #353 DIAGNOSTIC: one sector per fill, not 128.
- *
- * Hardware evidence: the setup check reads 5 bytes at ISO offset 32769 (nsec=1) and gets the
- * correct "CD001"; the guest reads 2048 bytes at offset 32768 (nsec=4) through this same
- * function, on the same LBA, and is handed bytes that match nothing on the disk. Offset 0 is
- * equally wrong -- fc 31 c0 8e on disk, 3d 01 2e 9b delivered. Identical values across two
- * separate boots, so this is deterministic, not the concurrency defect fixed in the previous
- * commit.
- *
- * That isolates the fault to multi-sector reads through the host backend. Clamping to one
- * sector proves it: if the guests boot, the bug is in the backend's multi-block path and this
- * is where the real fix belongs. Restore 128 once that is found -- 1 costs 128x the commands.
- */
-#define BOUNCE_SECTORS 1u
+#define BOUNCE_SECTORS 128u
 #define BOUNCE_BYTES (BOUNCE_SECTORS * HYPE_ISO_STREAM_SECTOR)
 static uint8_t g_bounce[HYPE_ISO_STREAM_MAX_SLOTS][BOUNCE_BYTES] __attribute__((aligned(4096)));
 
