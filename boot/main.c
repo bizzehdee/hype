@@ -12492,18 +12492,61 @@ static uint64_t g_hostcd_abar;
 static unsigned g_hostcd_port;
 static int g_hostcd_present;
 
+/*
+ * #325: the streamer works in 512-byte LBAs and will straddle 2048-byte CD sectors, so a
+ * misaligned request here is NORMAL rather than a caller bug. Two paths:
+ *
+ *  - aligned: hand the strict conversion the request and read straight into the caller's buffer.
+ *    That helper still refuses misalignment, which is right for callers that are aligned by
+ *    construction -- there, a stray offset really is an off-by-4.
+ *  - misaligned: read the containing 2048-byte blocks into a bounce and copy out the exact slice.
+ *    Refusing instead would make a real disc unusable as a media source, which is the whole point
+ *    of this issue.
+ */
+#define MEDIA_ATAPI_BOUNCE_2K 32u /* 64 KiB, matching the ISO streamer's own bounce */
+static uint8_t g_atapi_bounce[MEDIA_ATAPI_BOUNCE_2K * HYPE_AHCI_HOST_CD_SECTOR_SIZE]
+    __attribute__((aligned(4096)));
+
 static int media_atapi_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    const uint32_t cd = HYPE_AHCI_HOST_CD_SECTOR_SIZE;
+    uint8_t *out = (uint8_t *)dst;
     uint32_t lba2k;
     uint16_t count2k;
 
     (void)ctx;
-    if (!g_hostcd_present) {
+    if (!g_hostcd_present || count == 0u) {
         return -1;
     }
-    if (hype_ahci_host_atapi_lba512_to_lba2k(lba, count, &lba2k, &count2k) != 0) {
-        return -1;
+    if (hype_ahci_host_atapi_lba512_to_lba2k(lba, count, &lba2k, &count2k) == 0) {
+        return hype_ahci_host_atapi_read(g_hostcd_abar, g_hostcd_port, lba2k, count2k, out);
     }
-    return hype_ahci_host_atapi_read(g_hostcd_abar, g_hostcd_port, lba2k, count2k, dst);
+    while (count != 0u) {
+        uint64_t byte_off = lba * (uint64_t)HYPE_AHCI_HOST_SECTOR_SIZE;
+        uint32_t head = (uint32_t)(byte_off % cd);
+        uint32_t want = head + count * HYPE_AHCI_HOST_SECTOR_SIZE;
+        uint32_t n2k = (want + cd - 1u) / cd;
+        uint32_t avail, n, i;
+
+        if (n2k > MEDIA_ATAPI_BOUNCE_2K) {
+            n2k = MEDIA_ATAPI_BOUNCE_2K;
+        }
+        if (hype_ahci_host_atapi_read(g_hostcd_abar, g_hostcd_port, (uint32_t)(byte_off / cd),
+                                      (uint16_t)n2k, g_atapi_bounce) != 0) {
+            return -1;
+        }
+        /* head is always a multiple of 512 (a 512-LBA can only land on a 512 boundary), so every
+         * quantity below stays a whole number of 512-byte sectors and the LBA arithmetic is exact. */
+        avail = n2k * cd - head;
+        n = (avail < count * HYPE_AHCI_HOST_SECTOR_SIZE) ? avail
+                                                         : count * HYPE_AHCI_HOST_SECTOR_SIZE;
+        for (i = 0; i < n; i++) {
+            out[i] = g_atapi_bounce[head + i];
+        }
+        out += n;
+        lba += n / HYPE_AHCI_HOST_SECTOR_SIZE;
+        count -= n / HYPE_AHCI_HOST_SECTOR_SIZE;
+    }
+    return 0;
 }
 
 /* No write counterpart, deliberately: media_add_dev takes NULL and hostdisk_write already refuses a
@@ -12887,6 +12930,53 @@ static int fw_1_resolve_media_stream(unsigned vi) {
         /* #346: fresh budget for the raw-partition probe -- a stale armed deadline from an
          * earlier scan phase falsely clipped this probe after 3 reads in QEMU validation. */
         scan_budget_arm(5u);
+    /*
+     * #325: an optical disc carries no partition table -- the disc IS the ISO, from LBA 0. Its
+     * length comes from the ISO9660 primary volume descriptor's volume-space-size (logical block
+     * 16, offset 80, counted in 2048-byte blocks), which is exactly the image that was written.
+     * Taking the drive's full reported capacity instead would run the streamer off the end of the
+     * data on any disc that is not exactly full.
+     */
+    if (!g_vms[vi].iso_stream_ready && hype_streq(g_media.bus, "atapi")) {
+        static uint8_t pvd[HYPE_AHCI_HOST_CD_SECTOR_SIZE];
+        const uint64_t pvd_lba512 = 16ull * HYPE_AHCI_HOST_CD_SECTOR_SIZE / HYPE_AHCI_HOST_SECTOR_SIZE;
+        if (hostdisk_read(0, pvd_lba512, HYPE_AHCI_HOST_CD_SECTOR_SIZE / HYPE_AHCI_HOST_SECTOR_SIZE,
+                          pvd) != 0) {
+            /* An empty tray is a normal state for optical media, so say so and move on rather
+             * than treating it as a failure of the device. */
+            hype_serial_print("host-atapi: no readable disc in the drive -- skipping it as a "
+                              "media source\n");
+        } else if (pvd[1] != 'C' || pvd[2] != 'D' || pvd[3] != '0' || pvd[4] != '0' ||
+                   pvd[5] != '1') {
+            hype_serial_print("host-atapi: disc present but no ISO9660 volume descriptor "
+                              "(got %02x %02x %02x %02x %02x)\n", (unsigned)pvd[1],
+                              (unsigned)pvd[2], (unsigned)pvd[3], (unsigned)pvd[4],
+                              (unsigned)pvd[5]);
+        } else {
+            uint64_t blocks = (uint64_t)pvd[80] | ((uint64_t)pvd[81] << 8) |
+                              ((uint64_t)pvd[82] << 16) | ((uint64_t)pvd[83] << 24);
+            static uint8_t cd[8];
+            g_vms[vi].iso_stream.read = hostdisk_read;
+            g_vms[vi].iso_stream.ctx = 0;
+            g_vms[vi].iso_stream.bounce_slot = vi; /* #352 */
+            g_vms[vi].iso_stream.part_start_lba = 0u;
+            g_vms[vi].iso_stream.extent_count = 0u;
+            g_vms[vi].iso_stream.iso_size = blocks * HYPE_AHCI_HOST_CD_SECTOR_SIZE;
+            if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+                cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
+                g_vms[vi].iso_stream_ready = 1;
+                hype_serial_print("host-stream: vm%u CD001 verified streaming the whole disc "
+                                  "(%llu blocks, %llu bytes) -- backing guest CD from the optical "
+                                  "drive (#325)\n", vi, (unsigned long long)blocks,
+                                  (unsigned long long)g_vms[vi].iso_stream.iso_size);
+            } else {
+                hype_debug_print("host-stream: disc PVD found but streaming it back failed "
+                                 "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
+                                 (unsigned)cd[1], (unsigned)cd[2], (unsigned)cd[3],
+                                 (unsigned)cd[4]);
+            }
+        }
+    }
     if (!g_vms[vi].iso_stream_ready) {
         hype_gpt_partition_t iso_part;
         if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
