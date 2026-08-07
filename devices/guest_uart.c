@@ -11,6 +11,8 @@ void hype_guest_uart_reset(hype_guest_uart_t *u) {
     u->fcr = 0;
     u->tx_head = 0;
     u->tx_tail = 0;
+    u->tx_dropped = 0;
+    u->tx_written = 0;
     u->rx_head = 0;
     u->rx_tail = 0;
     for (i = 0; i < HYPE_GUEST_UART_TX_RING; i++) {
@@ -82,14 +84,20 @@ void hype_guest_uart_write(hype_guest_uart_t *u, uint32_t offset, uint8_t value)
             if (dlab) {
                 u->dll = value;
             } else {
-                /* THR: enqueue for transmit (drop if the ring is full --
-                 * we never fill it in practice since the caller drains
-                 * every exit). */
+                /* THR: enqueue for transmit. A full ring drops the byte, which the caller
+                 * cannot otherwise detect -- #356: the guest wrote 17198 bytes to this
+                 * register and roughly 4200 reached the log, and "the caller drains every
+                 * exit, so this never fills" was an assertion in a comment with nothing
+                 * measuring it. Count the drops so the next run can say whether hype is
+                 * losing guest output or the guest genuinely stopped talking. */
                 uint32_t next = (u->tx_tail + 1u) % HYPE_GUEST_UART_TX_RING;
                 if (next != u->tx_head) {
                     u->tx[u->tx_tail] = value;
                     u->tx_tail = next;
+                } else {
+                    u->tx_dropped++;
                 }
+                u->tx_written++;
             }
             return;
         case HYPE_UART_REG_IER:

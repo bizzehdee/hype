@@ -67,6 +67,11 @@ typedef struct {
     uint8_t tx[HYPE_GUEST_UART_TX_RING];
     uint32_t tx_head;
     uint32_t tx_tail;
+    /* #356: bytes the guest wrote to THR, and how many the ring had no room for. A dropped
+     * transmit byte is invisible to the guest (LSR always reports the transmitter ready), so
+     * without these a lost console line looks exactly like a guest that stopped printing. */
+    unsigned long long tx_written;
+    unsigned long long tx_dropped;
 
     uint8_t rx[HYPE_GUEST_UART_RX_RING];
     uint32_t rx_head;

@@ -9587,6 +9587,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  (unsigned long long)g_fw_1_ioapic.rte[4],
                                  (unsigned long long)g_fw_1_ioapic.rte[1],
                                  (unsigned)g_fw_1_uart.ier);
+                /* #356: the decisive pair. tx_dropped > 0 means hype is losing guest console
+                 * output; tx_dropped == 0 with tx_written far above what reached the log means
+                 * the shortfall is escape-sequence stripping in the line sink and the guest
+                 * really did stop. */
+                hype_debug_print("fw-1 UARTTX: COM1 written=%llu dropped=%llu | COM2 written=%llu "
+                                 "dropped=%llu\n",
+                                 g_fw_1_uart.tx_written, g_fw_1_uart.tx_dropped,
+                                 g_fw_1_uart2.tx_written, g_fw_1_uart2.tx_dropped);
                 hype_debug_print("fw-1 PITROUTE: pic_delivered=%llu apic_delivered=%llu "
                                  "apic_refused=%llu | RTE[2]=0x%llx RTE[0]=0x%llx mIMR=0x%x "
                                  "mIRR=0x%x mISR=0x%x | PIT0 mode=%u reload=%u\n",
