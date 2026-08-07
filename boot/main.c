@@ -8683,13 +8683,30 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * NPF). Dumped to the log every few seconds so diffing consecutive
      * lines shows which exit type dominates a slow stretch. Just integer
      * increments -- no per-exit formatting. */
+#define HYPE_EXCOST_BUCKETS 9
+    static const char *const excost_names[HYPE_EXCOST_BUCKETS] = {
+        "hlt", "npf", "ioio", "msr", "cpuid", "vintr", "pause", "intr", "other"};
     unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
                        ex_other = 0;
     unsigned long long ex_io80 = 0, ex_ahci_npf = 0, ex_pause = 0, ex_intr = 0;
+    /* #351: COSTHIST reports a 692us MEAN body cost per exit and 99.8% of wall time in the loop
+     * body, but a mean over eight exit types cannot say WHICH service path is slow -- that
+     * ambiguity has already cost two real-hardware runs. These attribute the body time (previous
+     * VMRUN exit -> next VM entry) to the reason of the exit being serviced, plus the worst single
+     * occurrence per bucket, so one boot names the offender. */
+    unsigned long long ex_cost[HYPE_EXCOST_BUCKETS];
+    unsigned long long ex_cost_max[HYPE_EXCOST_BUCKETS];
+    int prev_cost_bucket = -1;
+    unsigned excost_i;
     uint64_t last_exhist_tsc = 0;
     uint64_t last_preempt_rip_tsc = 0; /* RT-2b: throttle the preemption-RIP sample log */
     uint64_t last_gop_flush_tsc = 0;   /* RT-2c: throttle deferred GOP framebuffer pushes to ~60 Hz */
     int term_last_view = -2;           /* TERM-1: last on-screen view this core rendered (-2 = none yet) */
+    /* Freestanding: no memset, so the #351 accumulators are cleared explicitly. */
+    for (excost_i = 0; excost_i < HYPE_EXCOST_BUCKETS; excost_i++) {
+        ex_cost[excost_i] = 0;
+        ex_cost_max[excost_i] = 0;
+    }
     /* PERF-1a: idle-wait-vs-active split + IF-state preemption profile. The
      * central question -- how much of the boot is fast-forwardable HLT idle
      * (hype waits real time; QEMU fast-forwards) vs genuine execution, and
@@ -8983,7 +9000,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * fired DURING it (apic_id = vm index + 1: vm0->AP1, vm1->AP2). */
             uint64_t isr_ticks_pre = g_ap_timer_ticks[(unsigned)(vm - g_vms) + 1u];
             if (g_fw_1_prev_post_tsc != 0) {
-                g_fw_1_body_tsc += t_pre - g_fw_1_prev_post_tsc;
+                uint64_t body_delta = t_pre - g_fw_1_prev_post_tsc;
+                g_fw_1_body_tsc += body_delta;
+                /* #351: this stretch serviced the PREVIOUS exit, so it is attributed to that
+                 * exit's reason, not to the one about to be taken. */
+                if (prev_cost_bucket >= 0) {
+                    ex_cost[prev_cost_bucket] += body_delta;
+                    if (body_delta > ex_cost_max[prev_cost_bucket]) {
+                        ex_cost_max[prev_cost_bucket] = body_delta;
+                    }
+                }
             }
             if (ops->vcpu_run(ctx, &info) != 0) {
                 hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
@@ -9068,22 +9094,31 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * are the only place that mapping lives. */
         if (vmm_reason_is_hlt(kind, info.reason)) {
             ex_hlt++;
+            prev_cost_bucket = 0;
         } else if (vmm_reason_is_npf(kind, info.reason)) {
             ex_npf++;
+            prev_cost_bucket = 1;
         } else if (vmm_reason_is_ioio(kind, info.reason)) {
             ex_ioio++;
+            prev_cost_bucket = 2;
         } else if (vmm_reason_is_msr(kind, info.reason)) {
             ex_msr++;
+            prev_cost_bucket = 3;
         } else if (vmm_reason_is_cpuid(kind, info.reason)) {
             ex_cpuid++;
+            prev_cost_bucket = 4;
         } else if (vmm_reason_is_intr_window(kind, info.reason)) {
             ex_vintr++;
+            prev_cost_bucket = 5;
         } else if (vmm_reason_is_pause(kind, info.reason)) {
             ex_pause++;
+            prev_cost_bucket = 6;
         } else if (vmm_reason_is_intr(kind, info.reason)) {
             ex_intr++;
+            prev_cost_bucket = 7;
         } else {
             ex_other++;
+            prev_cost_bucket = 8;
         }
         /* Dump the histogram every ~5s of wall-clock. The periodic flush
          * below writes it to \hype-log.txt, so diffing two EXHIST lines
@@ -9339,6 +9374,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      vmrun_ns, body_ns,
                                      (g_fw_1_vmrun_tsc / g_fw_1_host_tsc_hz) * 1000ULL,
                                      (g_fw_1_body_tsc / g_fw_1_host_tsc_hz) * 1000ULL);
+                    /* #351: the same body time split by the exit reason it serviced. `tot` is
+                     * cumulative ms, `max` the worst single service in us -- a large max with a
+                     * small tot is a rare stall, the reverse is a hot path. */
+                    {
+                        char cline[240];
+                        int coff = hype_snprintf(cline, sizeof(cline), "fw-1 COSTBREAK:");
+                        for (excost_i = 0; excost_i < HYPE_EXCOST_BUCKETS; excost_i++) {
+                            if (ex_cost[excost_i] == 0) continue;
+                            coff += hype_snprintf(
+                                cline + coff, sizeof(cline) - (unsigned)coff, " %s=%llums/max%lluus",
+                                excost_names[excost_i],
+                                (ex_cost[excost_i] * 1000ULL) / g_fw_1_host_tsc_hz,
+                                (ex_cost_max[excost_i] * 1000000ULL) / g_fw_1_host_tsc_hz);
+                        }
+                        hype_debug_print("%s\n", cline);
+                    }
                     /* M4-6d4 MEASUREMENT: cumulative wall-clock the timer IRQ0
                      * spent pending+deliverable but BLOCKED by an in-service
                      * lower-priority IRQ (guest IF=1) -- the time a fair
