@@ -80,7 +80,7 @@ OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS.fd
 TEST_ISO  ?= /usr/share/edk2/ovmf/UefiShell.iso
 ESP       := $(BUILD_DIR)/esp
 
-.PHONY: all clean test run
+.PHONY: all clean test run run-cd
 
 all: $(OUT)
 
@@ -128,6 +128,36 @@ run: $(OUT)
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,file=$(BUILD_DIR)/OVMF_VARS.fd \
 	  -drive format=raw,file=fat:rw:$(ESP) \
+	  -serial stdio -display none -vga none
+
+# #325: the same harness with a real ATAPI device attached, for the optical-drive media source.
+#
+# Three things differ from `run` and all three are load-bearing:
+#  - the ESP is an mtools-built FAT IMAGE, not vvfat. vvfat SIGSEGVs QEMU inside its own AHCI
+#    emulation while OVMF reads it -- not a hype bug, but it ends the run.
+#  - the CD gets a LOWER boot priority than the ESP, or the firmware boots the disc itself and
+#    hype never runs.
+#  - guest RAM comes down via hype.cfg, because OVMF fragments the memory map above 2 GB and
+#    hype needs its guest RAM in one contiguous run.
+run-cd: $(OUT)
+	rm -f $(BUILD_DIR)/esp.img
+	dd if=/dev/zero of=$(BUILD_DIR)/esp.img bs=1M count=128 status=none
+	mkfs.vfat -F 32 -n HYPEESP $(BUILD_DIR)/esp.img >/dev/null
+	mmd -i $(BUILD_DIR)/esp.img ::/EFI ::/EFI/BOOT ::/EFI/hype ::/iso
+	mcopy -i $(BUILD_DIR)/esp.img $(OUT) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $(BUILD_DIR)/esp.img fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
+	mcopy -i $(BUILD_DIR)/esp.img $(TEST_ISO) ::/iso/test.iso
+	mcopy -i $(BUILD_DIR)/esp.img tools/qemu-cd-hype.cfg ::/hype.cfg
+	cp $(OVMF_VARS) $(BUILD_DIR)/OVMF_VARS.fd
+	qemu-system-x86_64 \
+	  -machine q35 -m 3072 -nodefaults \
+	  -accel kvm -accel tcg -cpu host -smp 2 \
+	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	  -drive if=pflash,format=raw,file=$(BUILD_DIR)/OVMF_VARS.fd \
+	  -drive format=raw,file=$(BUILD_DIR)/esp.img,if=none,id=esp \
+	  -device ide-hd,drive=esp,bus=ide.0,bootindex=0 \
+	  -drive id=hostcd,if=none,format=raw,readonly=on,file=$(TEST_ISO) \
+	  -device ide-cd,drive=hostcd,bus=ide.2,bootindex=1 \
 	  -serial stdio -display none -vga none
 
 clean:
