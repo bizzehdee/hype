@@ -80,7 +80,7 @@ OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS.fd
 TEST_ISO  ?= /usr/share/edk2/ovmf/UefiShell.iso
 ESP       := $(BUILD_DIR)/esp
 
-.PHONY: all clean test run run-cd
+.PHONY: all clean test run run-cd run-2disk
 
 all: $(OUT)
 
@@ -158,6 +158,37 @@ run-cd: $(OUT)
 	  -device ide-hd,drive=esp,bus=ide.0,bootindex=0 \
 	  -drive id=hostcd,if=none,format=raw,readonly=on,file=$(TEST_ISO) \
 	  -device ide-cd,drive=hostcd,bus=ide.2,bootindex=1 \
+	  -serial stdio -display none -vga none
+
+# #329: two guest disks on different buses, to check each is presented AND usable.
+#
+# Slot 0 is ahci-sata and slot 1 is nvme, backed by two tagged images (tools/make-2disk-images.sh),
+# so a slot bound to the wrong file or the wrong capacity shows up as the wrong tag rather than as
+# a plausible-looking empty disk.
+run-2disk: $(OUT)
+	tools/make-2disk-images.sh $(BUILD_DIR)
+	rm -f $(BUILD_DIR)/esp_2disk.img $(BUILD_DIR)/fat2d.img
+	dd if=/dev/zero of=$(BUILD_DIR)/esp_2disk.img bs=1M count=196 status=none
+	parted -s $(BUILD_DIR)/esp_2disk.img mklabel gpt
+	parted -s $(BUILD_DIR)/esp_2disk.img mkpart ESP fat32 1MiB 193MiB
+	parted -s $(BUILD_DIR)/esp_2disk.img set 1 esp on
+	dd if=/dev/zero of=$(BUILD_DIR)/fat2d.img bs=1M count=192 status=none
+	mkfs.vfat -F 32 -n HYPEESP $(BUILD_DIR)/fat2d.img >/dev/null
+	mmd -i $(BUILD_DIR)/fat2d.img ::/EFI ::/EFI/BOOT ::/EFI/hype ::/iso ::/hype ::/hype/disks
+	mcopy -i $(BUILD_DIR)/fat2d.img $(OUT) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $(BUILD_DIR)/fat2d.img fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
+	mcopy -i $(BUILD_DIR)/fat2d.img $(TEST_ISO) ::/iso/test.iso
+	mcopy -i $(BUILD_DIR)/fat2d.img $(BUILD_DIR)/diska.img $(BUILD_DIR)/diskb.img ::/hype/disks/
+	mcopy -i $(BUILD_DIR)/fat2d.img tools/qemu-2disk-hype.cfg ::/hype.cfg
+	dd if=$(BUILD_DIR)/fat2d.img of=$(BUILD_DIR)/esp_2disk.img bs=512 seek=2048 conv=notrunc status=none
+	cp $(OVMF_VARS) $(BUILD_DIR)/OVMF_VARS.fd
+	qemu-system-x86_64 \
+	  -machine q35 -m 3072 -nodefaults \
+	  -accel kvm -accel tcg -cpu host -smp 2 \
+	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	  -drive if=pflash,format=raw,file=$(BUILD_DIR)/OVMF_VARS.fd \
+	  -drive format=raw,file=$(BUILD_DIR)/esp_2disk.img,if=none,id=esp \
+	  -device ide-hd,drive=esp,bus=ide.0,bootindex=0 \
 	  -serial stdio -display none -vga none
 
 clean:
