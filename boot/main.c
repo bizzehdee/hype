@@ -3415,10 +3415,6 @@ static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
 static uint64_t vmm_get_cr3(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
     return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_cr3(ctx) : hype_svm_vcpu_get_cr3(ctx);
 }
-static uint64_t vmm_get_gpr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, unsigned idx) {
-    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_gpr(ctx, idx)
-                                     : hype_svm_vcpu_get_gpr(ctx, idx);
-}
 static void vmm_set_rip(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rip) {
     if (kind == HYPE_VMM_KIND_VMX) {
         hype_vmx_vcpu_set_rip(ctx, rip);
@@ -6547,308 +6543,6 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
     return v;
 }
 
-/*
- * #318: OpenBSD guest introspection.
- *
- * The RAMDISK_CD kernel is built without DDB (bsd.rd exports no db_ps), and userland never
- * opened the console, so there is no channel to ask the guest what it is waiting on. Read it
- * out of guest RAM instead: walk `allprocess` and print each process's name, the wait channel
- * its main thread is sleeping on, and the bytes around the thread's state field.
- *
- * bsd.rd carries no debug info, so no offset could be looked up. Every offset below was instead
- * confirmed against a live guest by an earlier build that dumped raw words and searched by
- * shape: ps_list.le_prev read back as &allprocess, ps_threads.tqh_first matched ps_mainproc,
- * and p_wmesg gave "scheduler" for swapper, "pgdaemon" for pagedaemon and "reaper" for reaper,
- * which is what OpenBSD sleeps those threads on. The addresses are specific to OpenBSD 7.9
- * RAMDISK_CD #396 and come from `nm` on the extracted bsd.rd. Read-only: no guest state changes.
- */
-#define FW_1_BSD_ALLPROCESS 0xffffffff819907f8ULL
-#define FW_1_BSD_RODATA_LO 0xffffffff81412000ULL
-#define FW_1_BSD_RODATA_HI 0xffffffff815cbea8ULL
-#define FW_1_BSD_PS_MAINPROC 8u  /* struct process: refcnt(+0) mainproc(+8) ucred(+16) */
-#define FW_1_BSD_PS_LIST 24u     /* LIST_ENTRY(process) ps_list; le_next is its first word */
-#define FW_1_BSD_PS_COMM 0x328u  /* char ps_comm[] */
-#define FW_1_BSD_P_WMESG 0xe0u   /* struct proc: const char *p_wmesg */
-/*
- * Pinning these took three runs of dumping raw bytes and comparing across all sixteen processes,
- * because bsd.rd ships no debug info. What is confirmed:
- *
- *   +0x90 p_wchan   -- swapper's reads &proc0; pagedaemon, zerothread and aiodoned read adjacent
- *                      addresses inside the uvm global; init's reads its own struct process,
- *                      which is what wait4 sleeps on.
- *   +0x98 p_sleep_to -- update's to_list prev and next are equal, i.e. a one-element queue, and
- *                      to_func at +0xb8 is the same kernel address for all sixteen (endtsleep).
- *   +0xe0 p_wmesg   -- gives scheduler/pgdaemon/reaper/pgzero for the threads that sleep on those.
- *
- * p_stat is still not located: every byte from 0x80 to 0x8f reads zero for the child of init, and
- * p_stat is never zero. So dump from offset 0 and stop guessing where it might be -- 160 bytes
- * reaches p_wchan, so the field cannot be outside the window.
- */
-#define FW_1_BSD_P_STAT 0x65u    /* char p_stat: 2=SRUN 3=SSLEEP 7=SONPROC */
-#define FW_1_BSD_P_WCHAN 0x90u
-#define FW_1_BSD_P_RUNQ 0x00u    /* TAILQ_ENTRY(proc) p_runq is the first field */
-#define FW_1_BSD_P_CPU 0xf0u     /* struct cpu_info *p_cpu, past p_wmesg/p_pctcpu/p_slptime */
-#define FW_1_BSD_P_STATE 0x60u
-#define FW_1_BSD_P_STATE_LEN 16u
-/*
- * cpu_info_full_primary. cpu_info sits at an offset inside it that cannot be computed without
- * debug info, so it is found at runtime instead: spc_idleproc is the only word in the structure
- * that equals the idle thread's proc address, and that anchors ci_schedstate exactly.
- */
-/*
- * The halt inside sched_idle, and the offset of spc_whichqs from the cpu_info the loop holds in
- * r14. Both read straight out of the kernel's own code, not inferred:
- *   ffffffff8111c90b  cmpl $0x0,0x42c(%r14)
- *   ffffffff8111c913  jne  ...            <- leaves the halt loop
- *   ffffffff8111c915  call *cpu_idle_cycle_fcn
- *   ffffffff8111c91b  jmp  ...c90b
- * and cpu_idle_cycle_hlt is `endbr64; sti; hlt; ret`, so the HLT exit reports +5.
- */
-#define FW_1_BSD_IDLE_HLT_RIP 0xffffffff811f3285ULL
-#define FW_1_BSD_WHICHQS 0x42cULL
-#define FW_1_BSD_CIF 0xffffffff8197a000ULL
-#define FW_1_BSD_CIF_LEN 0x4000u
-#define FW_1_BSD_WIN 1024u
-
-static uint8_t g_bsd_win[FW_1_BSD_WIN];
-
-static uint64_t fw_1_bsd_word(const uint8_t *buf, unsigned off) {
-    uint64_t v = 0;
-    unsigned k;
-    for (k = 0; k < 8u; k++) {
-        v |= (uint64_t)buf[off + k] << (8u * k);
-    }
-    return v;
-}
-
-/* Copy a guest C string only if it really is one: short, printable and NUL-terminated inside
- * the window. Anything else is a stale or misread pointer and must not reach the log. */
-static int fw_1_bsd_str(hype_fw_vm_t *vm, uint64_t cr3, uint64_t p, char *out, unsigned cap) {
-    unsigned k;
-    if (p < FW_1_BSD_RODATA_LO || p >= FW_1_BSD_RODATA_HI) {
-        return 0;
-    }
-    if (!fw_1_read_guest_va(vm, cr3, p, out, cap - 1u)) {
-        return 0;
-    }
-    for (k = 0; k < cap - 1u; k++) {
-        if (out[k] == 0) {
-            return k != 0u;
-        }
-        if (out[k] < 0x20 || out[k] >= 0x7f) {
-            return 0;
-        }
-    }
-    return 0;
-}
-
-/*
- * #318: the run queues of cpu0.
- *
- * The process walk found four threads in SRUN while the CPU ran idle0 and halted. Either the
- * scheduler does not know the queues are occupied, or it knows and never switches -- those are
- * different faults, and spc_whichqs is the state that tells them apart, because it is exactly
- * what the idle loop tests before it halts.
- *
- * The anchor is found, not assumed: spc_idleproc holds the idle thread's proc address, and the
- * 32 spc_qs heads follow it. An empty TAILQ head has a null tqh_first, so occupancy needs no
- * further offset. The first attempt read tqh_last instead of tqh_first and listed addresses
- * rather than a mask, which overran the line at queue 10 -- and the four runnable threads sit at
- * priority 0x32, so they belong in queue 12. Report a bitmask so no queue can fall off the end.
- */
-#define FW_1_BSD_SPC_QS 16u  /* spc_qs[0] follows spc_idleproc, which follows ci_curproc */
-
-static void fw_1_bsd_sched(hype_fw_vm_t *vm, uint64_t cr3, uint64_t idle_p) {
-    uint64_t base = 0;
-    unsigned chunk;
-    uint32_t occupied = 0;
-    unsigned q;
-
-    if (idle_p == 0) {
-        return;
-    }
-    for (chunk = 0; chunk < FW_1_BSD_CIF_LEN && base == 0; chunk += FW_1_BSD_WIN) {
-        unsigned i;
-        if (!fw_1_read_guest_va(vm, cr3, FW_1_BSD_CIF + chunk, g_bsd_win, FW_1_BSD_WIN)) {
-            break;
-        }
-        for (i = 0; i + 8u <= FW_1_BSD_WIN; i += 8u) {
-            if (fw_1_bsd_word(g_bsd_win, i) == idle_p) {
-                base = FW_1_BSD_CIF + chunk + i;
-                break;
-            }
-        }
-    }
-    if (base == 0) {
-        hype_debug_print("fw-1 BSDSCHED: anchor not found for idle p=0x%llx\n",
-                         (unsigned long long)idle_p);
-        return;
-    }
-
-    {
-        static char sl[300];
-        int so;
-        for (q = 0; q < 32u; q += 8u) {
-            unsigned j;
-            if (!fw_1_read_guest_va(vm, cr3, base + FW_1_BSD_SPC_QS + (uint64_t)q * 16u,
-                                    g_bsd_win, 128u)) {
-                break;
-            }
-            for (j = 0; j < 8u; j++) {
-                if (fw_1_bsd_word(g_bsd_win, j * 16u) != 0) {
-                    occupied |= (uint32_t)1u << (q + j);
-                }
-            }
-        }
-        so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: base=0x%llx occupied=0x%08x",
-                           (unsigned long long)base, (unsigned)occupied);
-        for (q = 0; q < 32u; q++) {
-            int ok = 0;
-            uint64_t first;
-            if ((occupied & ((uint32_t)1u << q)) == 0u) {
-                continue;
-            }
-            first = fw_1_read_guest_u64(vm, cr3, base + FW_1_BSD_SPC_QS + (uint64_t)q * 16u, &ok);
-            so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " q%u=0x%llx", q,
-                                (unsigned long long)first);
-        }
-        hype_debug_print("%s\n", sl);
-    }
-
-    /* spc_whichqs is what the idle loop tests before halting, so it is the value that decides
-     * this: queue 12 is occupied, and if whichqs still reads 0 then the enqueue never became
-     * visible to the halt test. It is not within 128 bytes of the queues -- 0x1000 appears
-     * nowhere in that run -- so dump 256 and cover the rest of schedstate. */
-    {
-        static char sl[420];
-        unsigned half;
-        for (half = 0; half < 2u; half++) {
-            uint64_t at = base + FW_1_BSD_SPC_QS + 512u + (uint64_t)half * 128u;
-            int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: post-qs@0x%llx:",
-                                   (unsigned long long)at);
-            unsigned i;
-            if (!fw_1_read_guest_va(vm, cr3, at, g_bsd_win, 128u)) {
-                break;
-            }
-            for (i = 0; i < 128u; i++) {
-                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, "%s%02x",
-                                    ((i & 7u) == 0u) ? " " : "", g_bsd_win[i]);
-            }
-            hype_debug_print("%s\n", sl);
-        }
-    }
-
-    /* Direct confirmation, independent of where the field turns out to sit: if any 32-bit word in
-     * cpu_info equals the occupancy mask, whichqs agrees with the queues. If none does, it does
-     * not, and the lost update is the fault. */
-    if (occupied != 0) {
-        static char sl[300];
-        int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: mask 0x%08x found at:",
-                               (unsigned)occupied);
-        unsigned found = 0;
-        for (chunk = 0; chunk < FW_1_BSD_CIF_LEN && found < 8u; chunk += FW_1_BSD_WIN) {
-            unsigned i;
-            if (!fw_1_read_guest_va(vm, cr3, FW_1_BSD_CIF + chunk, g_bsd_win, FW_1_BSD_WIN)) {
-                break;
-            }
-            for (i = 0; i + 4u <= FW_1_BSD_WIN && found < 8u; i += 4u) {
-                uint32_t v = (uint32_t)g_bsd_win[i] | ((uint32_t)g_bsd_win[i + 1u] << 8) |
-                             ((uint32_t)g_bsd_win[i + 2u] << 16) |
-                             ((uint32_t)g_bsd_win[i + 3u] << 24);
-                if (v != occupied) {
-                    continue;
-                }
-                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " 0x%llx",
-                                    (unsigned long long)(FW_1_BSD_CIF + chunk + i));
-                found++;
-            }
-        }
-        if (found == 0u) {
-            so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " NOWHERE");
-        }
-        hype_debug_print("%s\n", sl);
-    }
-}
-
-static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
-    const uint64_t kptr = 0xffff800000000000ULL;
-    int ok = 0;
-    uint64_t ps;
-    uint64_t idle_p = 0;
-    unsigned pn;
-
-    ps = fw_1_read_guest_u64(vm, cr3, FW_1_BSD_ALLPROCESS, &ok);
-    hype_debug_print("fw-1 BSDWALK: allprocess=0x%llx first=0x%llx ok=%d\n",
-                     (unsigned long long)FW_1_BSD_ALLPROCESS, (unsigned long long)ps, ok);
-    if (!ok) {
-        return;
-    }
-
-    for (pn = 0; pn < 32u && ps >= kptr; pn++) {
-        uint64_t mainproc, next;
-        char comm[17];
-        char wmesg[13];
-        unsigned i;
-
-        if (!fw_1_read_guest_va(vm, cr3, ps, g_bsd_win, FW_1_BSD_WIN)) {
-            hype_debug_print("fw-1 BSDPROC[%u] ps=0x%llx UNREADABLE\n", pn, (unsigned long long)ps);
-            return;
-        }
-        mainproc = fw_1_bsd_word(g_bsd_win, FW_1_BSD_PS_MAINPROC);
-        next = fw_1_bsd_word(g_bsd_win, FW_1_BSD_PS_LIST);
-        for (i = 0; i < 16u; i++) {
-            uint8_t c = g_bsd_win[FW_1_BSD_PS_COMM + i];
-            comm[i] = (c >= 0x20u && c < 0x7fu) ? (char)c : 0;
-            if (comm[i] == 0) {
-                break;
-            }
-        }
-        comm[16] = 0;
-
-        wmesg[0] = 0;
-        if (mainproc >= kptr && fw_1_read_guest_va(vm, cr3, mainproc, g_bsd_win, FW_1_BSD_WIN)) {
-            char sl[340];
-            int so;
-            if (!fw_1_bsd_str(vm, cr3, fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_WMESG), wmesg,
-                              (unsigned)sizeof(wmesg))) {
-                wmesg[0] = '-';
-                wmesg[1] = 0;
-            }
-            if (comm[0] == 'i' && comm[1] == 'd' && comm[2] == 'l' && comm[3] == 'e') {
-                idle_p = mainproc;
-            }
-            so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDPROC[%u] comm=\"%s\" wmesg=\"%s\" "
-                               "stat=%u wchan=0x%llx ps=0x%llx p=0x%llx st@0x%x:", pn, comm, wmesg,
-                               (unsigned)g_bsd_win[FW_1_BSD_P_STAT],
-                               (unsigned long long)fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_WCHAN),
-                               (unsigned long long)ps, (unsigned long long)mainproc,
-                               FW_1_BSD_P_STATE);
-            so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so,
-                                " cpu=0x%llx runq=[0x%llx 0x%llx]",
-                                (unsigned long long)fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_CPU),
-                                (unsigned long long)fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_RUNQ),
-                                (unsigned long long)fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_RUNQ + 8u));
-            /* p_stat sits in here. It is one byte among p_flag and its neighbours, and which
-             * one cannot be derived without debug info -- but it is the only byte that differs
-             * consistently between a sleeping thread and a running one, so dumping the run and
-             * comparing across the whole process list identifies it. Grouped in eights so the
-             * field boundaries are readable. */
-            for (i = 0; i < FW_1_BSD_P_STATE_LEN; i++) {
-                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, "%s%02x",
-                                    ((i & 7u) == 0u) ? " " : "",
-                                    g_bsd_win[FW_1_BSD_P_STATE + i]);
-            }
-            hype_debug_print("%s\n", sl);
-        } else {
-            hype_debug_print("fw-1 BSDPROC[%u] comm=\"%s\" ps=0x%llx p=0x%llx NO-THREAD\n", pn,
-                             comm, (unsigned long long)ps, (unsigned long long)mainproc);
-        }
-
-        ps = next;
-    }
-    fw_1_bsd_sched(vm, cr3, idle_p);
-}
-
 /* FW-1e: drain the guest UART's transmit ring, strip terminal escape
  * sequences (hype's GOP console can't interpret them), and emit the
  * guest's console output to hype's own console (serial + GOP) one line
@@ -9005,14 +8699,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * Resolve it by reading the field through the guest's OWN pointer, in r14, at the instant it
      * halts -- same address the compare uses, same moment.
      */
-    unsigned long long idleq_hlt = 0, idleq_zero = 0, idleq_nz = 0;
-    /* #318: HLTs retired because an EVENTINJ was already staged -- the case pending_valid misses. */
-    unsigned long long hlt_retired_einj = 0;
     /* #318: last asserted state of each guest UART's interrupt line, so it is raised on the
      * transition rather than continuously while the condition holds. Index 0 = COM1, 1 = COM2. */
     int uart_irq_asserted[2] = {0, 0};
-    uint64_t idleq_last_r14 = 0;
-    uint32_t idleq_last_val = 0;
     unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
                        ex_other = 0;
     unsigned long long ex_io80 = 0, ex_ahci_npf = 0, ex_pause = 0, ex_intr = 0;
@@ -9418,21 +9107,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (vmm_reason_is_hlt(kind, info.reason)) {
             ex_hlt++;
             prev_cost_bucket = 0;
-            if (info.guest_rip == FW_1_BSD_IDLE_HLT_RIP) {
-                uint64_t r14 = vmm_get_gpr(kind, ctx, 14);
-                uint32_t v = 0;
-                idleq_hlt++;
-                idleq_last_r14 = r14;
-                if (r14 >= 0xffff800000000000ULL &&
-                    fw_1_read_guest_va(vm, vmm_get_cr3(kind, ctx), r14 + FW_1_BSD_WHICHQS, &v, 4)) {
-                    idleq_last_val = v;
-                    if (v == 0) {
-                        idleq_zero++;
-                    } else {
-                        idleq_nz++;
-                    }
-                }
-            }
         } else if (vmm_reason_is_npf(kind, info.reason)) {
             ex_npf++;
             prev_cost_bucket = 1;
@@ -9515,10 +9189,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                     hype_debug_print("%s (injected/requested)\n", vl);
                 }
-                hype_debug_print("fw-1 IDLEQ: idle_hlt=%llu whichqs_zero=%llu whichqs_nz=%llu "
-                                 "last_r14=0x%llx last_val=0x%x retired_einj=%llu\n", idleq_hlt,
-                                 idleq_zero, idleq_nz, (unsigned long long)idleq_last_r14,
-                                 (unsigned)idleq_last_val, hlt_retired_einj);
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
@@ -9904,7 +9574,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             kriphist_cnt[kn] = 0;
                         }
                     }
-                    fw_1_bsdwalk(vm, vmm_get_cr3(kind, ctx));
                     /* RT-2c: decode the guest instruction bytes at the #1 hot
                      * RIP -- the definitive waiting-vs-working test. F3 90 =
                      * PAUSE (spin); EC/ED = IN, EE/EF = OUT (device I/O); a
@@ -12182,7 +11851,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  */
                 if (((is.eventinj >> 31) & 1u) != 0u) {
                     vmm_wake_hlt(kind, ctx);
-                    hlt_retired_einj++;
                     continue;
                 }
                 if (if_set && (is.pending_valid || pic_ready)) {
