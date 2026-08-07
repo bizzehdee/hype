@@ -1,4 +1,5 @@
 #include "acpi.h"
+#include "cmos.h"
 #include "dsdt_aml.h" /* M4-6b2: compiled DSDT AML body (PCI host bridge + _PRT) */
 
 static const char HYPE_ACPI_OEM_ID[6] = {'H', 'Y', 'P', 'E', ' ', ' '};
@@ -140,6 +141,16 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
          * safe here since this whole blob is a handful of KB. */
         fadt->dsdt = out->dsdt_offset;
         fadt->x_dsdt = out->dsdt_offset;
+        /*
+         * #318: tell the guest WHERE the RTC century lives. hype's CMOS model writes the
+         * century to register 0x32 (devices/cmos.h), but a zero FADT century field means "no
+         * century register exists", so a guest reads only the two-digit year and has to guess
+         * the century. OpenBSD's inittodr rejects the result -- observed on real hardware as
+         * "WARNING: CHECK AND RESET THE DATE!" right after the kernel mounted root, with 245k
+         * polls of 0x70/0x71 alongside. Same shape as #303: a correct device model that the
+         * guest could not find because a table field was left at zero.
+         */
+        fadt->century = HYPE_CMOS_REG_CENTURY;
         /* M8-6: SleepControl/SleepStatus left zeroed. This guest is UEFI-booted,
          * so its OS powers off via EFI ResetSystem -> OVMF, which on QEMU uses the
          * classic ACPI PM1a_CNT register (I/O 0x604) with SLP_EN, NOT the

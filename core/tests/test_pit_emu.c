@@ -385,6 +385,67 @@ static void test_advance_one_shot_ch0_rearm_refires(void) {
     }
 }
 
+
+/*
+ * #318: the read-back a POLLING guest sees. OpenBSD calibrates its LAPIC timer by reading
+ * channel 0's counter through port 0x40 in a tight loop (168k reads observed on real
+ * hardware) -- it never enables IRQ0 at all. So what matters is not the interrupt but that
+ * successive reads DECREASE across an advance, wrap at the reload, and that a latch command
+ * freezes the value until both bytes have been read. Untested until now: every existing
+ * advance test inspects pit.channels[i].counter directly rather than reading the PORT.
+ */
+static uint8_t rd0(hype_pit_emu_t *p) {
+    uint8_t v = 0;
+    hype_pit_emu_io_read(p, 0x40, &v);
+    return v;
+}
+
+static void test_ch0_counter_readback_tracks_advance(void) {
+    hype_pit_emu_t pit;
+    uint16_t first, second;
+    hype_pit_emu_reset(&pit);
+    hype_pit_emu_io_write(&pit, 0x43, 0x34); /* ch0, lobyte/hibyte, mode 2 */
+    hype_pit_emu_io_write(&pit, 0x40, 0x00); /* reload = 0x8000 (the value OpenBSD used) */
+    hype_pit_emu_io_write(&pit, 0x40, 0x80);
+    CHECK_HEX("reload programmed", 0x8000, pit.channels[0].reload);
+
+    first = rd0(&pit);
+    first |= (uint16_t)((uint16_t)rd0(&pit) << 8);
+    hype_pit_emu_advance(&pit, 1000);
+    second = rd0(&pit);
+    second |= (uint16_t)((uint16_t)rd0(&pit) << 8);
+    CHECK_HEX("a polled counter DECREASES across an advance", 1u, (unsigned)(second < first));
+    CHECK_HEX("and by exactly the advance", (unsigned)(first - 1000u), (unsigned)second);
+
+    /* Across a terminal-count wrap it must land back near the reload, never stick at 0 --
+     * a counter frozen at 0 or jumping upward is what stalls a calibration loop. */
+    hype_pit_emu_advance(&pit, 0x8000u);
+    {
+        uint16_t third = rd0(&pit);
+        third |= (uint16_t)((uint16_t)rd0(&pit) << 8);
+            CHECK_HEX("wrapped counter is in [1, reload]", 1u, (unsigned)(third >= 1u && third <= 0x8000u));
+    }
+}
+
+static void test_ch0_latch_freezes_until_both_bytes_read(void) {
+    hype_pit_emu_t pit;
+    uint8_t lo, hi, lo2;
+    hype_pit_emu_reset(&pit);
+    hype_pit_emu_io_write(&pit, 0x43, 0x34);
+    hype_pit_emu_io_write(&pit, 0x40, 0x00);
+    hype_pit_emu_io_write(&pit, 0x40, 0x80);
+
+    hype_pit_emu_io_write(&pit, 0x43, 0x00); /* latch channel 0 */
+    lo = rd0(&pit);
+    hype_pit_emu_advance(&pit, 500);         /* the counter moves under the latch */
+    hi = rd0(&pit);
+    CHECK_HEX("latched value survives an advance mid-read", 0x8000,
+              (unsigned)(((uint16_t)hi << 8) | lo));
+    lo2 = rd0(&pit);
+    CHECK_HEX("after the latch is consumed, reads are live again", 1u,
+              (unsigned)((unsigned)lo2 != (unsigned)lo));
+}
+
 int main(void) {
     test_reset_defaults();
     test_unrecognized_port_rejected();
@@ -408,6 +469,8 @@ int main(void) {
     test_advance_one_shot_ch2_saturates_and_sets_out();
     test_advance_one_shot_ch0_raises_irq0_once();
     test_advance_one_shot_ch0_rearm_refires();
+    test_ch0_counter_readback_tracks_advance();
+    test_ch0_latch_freezes_until_both_bytes_read();
     test_advance_periodic_wraps();
 
     if (failures == 0) {
