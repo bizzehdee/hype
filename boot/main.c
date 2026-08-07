@@ -9493,6 +9493,25 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                     }
                 }
+                if (kind != HYPE_VMM_KIND_VMX) {
+                    /* #318: which vectors actually reach the guest. SVM-only -- reported as
+                     * unavailable on VMX rather than as zeros, which would read as "no
+                     * interrupts" instead of "not measured". */
+                    static char vl[300];
+                    int vo = hype_snprintf(vl, sizeof(vl), "fw-1 VECHIST:");
+                    unsigned vv, shown = 0;
+                    for (vv = 0; vv < 256u && shown < 10u; vv++) {
+                        uint32_t rq = 0, ij = 0;
+                        hype_svm_vcpu_get_vec_counts((uint8_t)vv, &rq, &ij);
+                        if (rq == 0u && ij == 0u) {
+                            continue;
+                        }
+                        vo += hype_snprintf(vl + vo, sizeof(vl) - (unsigned)vo,
+                                            " 0x%02x=%u/%u", vv, (unsigned)ij, (unsigned)rq);
+                        shown++;
+                    }
+                    hype_debug_print("%s (injected/requested)\n", vl);
+                }
                 hype_debug_print("fw-1 IDLEQ: idle_hlt=%llu whichqs_zero=%llu whichqs_nz=%llu "
                                  "last_r14=0x%llx last_val=0x%x retired_einj=%llu\n", idleq_hlt,
                                  idleq_zero, idleq_nz, (unsigned long long)idleq_last_r14,

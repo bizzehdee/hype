@@ -509,6 +509,11 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx);
  */
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
 
+/* #318: how many times `vector` was requested, and how many times it was actually staged into
+ * EVENTINJ. Counters rather than a bounded trace, because a trace of interrupt traffic is always
+ * dominated by the periodic timer and the vector under investigation never gets a line. */
+void hype_svm_vcpu_get_vec_counts(uint8_t vector, uint32_t *out_req, uint32_t *out_inj);
+
 /* #311: one-command AHCI timeline. Armed by the first kernel-era access to the HBA (OVMF drives
  * the same registers long before, and swamped five earlier attempts at this measurement), then a
  * bounded serial event log shared by the device path and the FW-1 loop's raise. The log is serial,

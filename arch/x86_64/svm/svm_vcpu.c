@@ -1101,8 +1101,27 @@ static unsigned int g_int_trace_n = 0; /* #311: bounds the injection trace above
 static unsigned int g_int_trace_timer_n = 0;
 static uint8_t g_int_trace_timer_vec = 0xFFu;
 
+/*
+ * #318: per-vector interrupt accounting. The bounded INJ# text trace above cannot answer "was
+ * this vector ever delivered": twice now its budget was spent by the periodic timer before the
+ * vector under investigation first fired, and both times the missing lines read as absence of
+ * the event rather than absence of the trace. Counters cannot be crowded out.
+ */
+static uint32_t g_int_req_by_vec[256];
+static uint32_t g_int_inj_by_vec[256];
+
+void hype_svm_vcpu_get_vec_counts(uint8_t vector, uint32_t *out_req, uint32_t *out_inj) {
+    if (out_req != 0) {
+        *out_req = g_int_req_by_vec[vector];
+    }
+    if (out_inj != 0) {
+        *out_inj = g_int_inj_by_vec[vector];
+    }
+}
+
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    g_int_req_by_vec[vector]++;
     int eventinj_busy = (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) != 0;
 
     /* Fast path: the guest can take an interrupt AND nothing is already staged
@@ -1145,6 +1164,7 @@ trace_done:
     if (!eventinj_busy &&
         hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
+        g_int_inj_by_vec[vector]++;
         g_int_eventinj++;
         return;
     }
@@ -1193,6 +1213,7 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
         int v = hype_svm_irr_highest(real->pending_irr);
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
+        g_int_inj_by_vec[(uint8_t)v]++;
         g_int_vintr_window++;
     }
     hype_svm_sync_vintr(real);
@@ -1236,6 +1257,7 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
         int v = hype_svm_irr_highest(real->pending_irr);
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
+        g_int_inj_by_vec[(uint8_t)v]++;
     }
     /* Keep the window armed if more vectors remain; disarm once drained. */
     hype_svm_sync_vintr(real);
