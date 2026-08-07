@@ -6580,8 +6580,17 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
  * p_stat is never zero. So dump from offset 0 and stop guessing where it might be -- 160 bytes
  * reaches p_wchan, so the field cannot be outside the window.
  */
-#define FW_1_BSD_P_STATE 0x00u
-#define FW_1_BSD_P_STATE_LEN 160u
+#define FW_1_BSD_P_STAT 0x65u    /* char p_stat: 2=SRUN 3=SSLEEP 7=SONPROC */
+#define FW_1_BSD_P_WCHAN 0x90u
+#define FW_1_BSD_P_STATE 0x60u
+#define FW_1_BSD_P_STATE_LEN 16u
+/*
+ * cpu_info_full_primary. cpu_info sits at an offset inside it that cannot be computed without
+ * debug info, so it is found at runtime instead: spc_idleproc is the only word in the structure
+ * that equals the idle thread's proc address, and that anchors ci_schedstate exactly.
+ */
+#define FW_1_BSD_CIF 0xffffffff8197a000ULL
+#define FW_1_BSD_CIF_LEN 0x4000u
 #define FW_1_BSD_WIN 1024u
 
 static uint8_t g_bsd_win[FW_1_BSD_WIN];
@@ -6616,10 +6625,85 @@ static int fw_1_bsd_str(hype_fw_vm_t *vm, uint64_t cr3, uint64_t p, char *out, u
     return 0;
 }
 
+/*
+ * #318: the run queues of cpu0.
+ *
+ * The process walk found four threads in SRUN while the CPU ran idle0 and halted. Either the
+ * scheduler does not know the queues are occupied, or it knows and never switches -- those are
+ * different faults, and spc_whichqs is the bit of state that tells them apart, because it is
+ * exactly what the idle loop tests before it halts.
+ */
+static void fw_1_bsd_sched(hype_fw_vm_t *vm, uint64_t cr3, uint64_t idle_p) {
+    uint64_t base = 0;
+    unsigned chunk;
+
+    if (idle_p == 0) {
+        return;
+    }
+    for (chunk = 0; chunk < FW_1_BSD_CIF_LEN && base == 0; chunk += FW_1_BSD_WIN) {
+        unsigned i;
+        if (!fw_1_read_guest_va(vm, cr3, FW_1_BSD_CIF + chunk, g_bsd_win, FW_1_BSD_WIN)) {
+            break;
+        }
+        for (i = 0; i + 8u <= FW_1_BSD_WIN; i += 8u) {
+            if (fw_1_bsd_word(g_bsd_win, i) == idle_p) {
+                base = FW_1_BSD_CIF + chunk + i;
+                break;
+            }
+        }
+    }
+    if (base == 0) {
+        hype_debug_print("fw-1 BSDSCHED: spc_idleproc not found for idle p=0x%llx\n",
+                         (unsigned long long)idle_p);
+        return;
+    }
+
+    /* spc_qs[32] follows spc_idleproc. An empty TAILQ head has a null tqh_first, so the occupied
+     * queues can be listed without knowing any further offset. */
+    {
+        static char sl[300];
+        int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: spc_idleproc@0x%llx qs:",
+                               (unsigned long long)base);
+        unsigned q;
+        for (q = 0; q < 32u; q += 64u / 8u) {
+            unsigned j;
+            if (!fw_1_read_guest_va(vm, cr3, base + 8u + (uint64_t)q * 16u, g_bsd_win, 128u)) {
+                break;
+            }
+            for (j = 0; j < 8u; j++) {
+                uint64_t first = fw_1_bsd_word(g_bsd_win, j * 16u);
+                if (first != 0) {
+                    so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " [%u]=0x%llx",
+                                        q + j, (unsigned long long)first);
+                }
+            }
+        }
+        hype_debug_print("%s\n", sl);
+    }
+
+    /* spc_whichqs lives past the queues, behind spc_deadproc, spc_runtime, spc_schedflags,
+     * spc_schedticks and spc_cp_time. Dump the run rather than guess: it must equal the bitmask
+     * of the occupied queues printed above, which identifies it on sight. */
+    {
+        static char sl[420];
+        int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: post-qs@0x%llx:",
+                               (unsigned long long)(base + 8u + 512u));
+        unsigned i;
+        if (fw_1_read_guest_va(vm, cr3, base + 8u + 512u, g_bsd_win, 128u)) {
+            for (i = 0; i < 128u; i++) {
+                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, "%s%02x",
+                                    ((i & 7u) == 0u) ? " " : "", g_bsd_win[i]);
+            }
+            hype_debug_print("%s\n", sl);
+        }
+    }
+}
+
 static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
     const uint64_t kptr = 0xffff800000000000ULL;
     int ok = 0;
     uint64_t ps;
+    uint64_t idle_p = 0;
     unsigned pn;
 
     ps = fw_1_read_guest_u64(vm, cr3, FW_1_BSD_ALLPROCESS, &ok);
@@ -6652,15 +6736,20 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
 
         wmesg[0] = 0;
         if (mainproc >= kptr && fw_1_read_guest_va(vm, cr3, mainproc, g_bsd_win, FW_1_BSD_WIN)) {
-            char sl[600];
+            char sl[260];
             int so;
             if (!fw_1_bsd_str(vm, cr3, fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_WMESG), wmesg,
                               (unsigned)sizeof(wmesg))) {
                 wmesg[0] = '-';
                 wmesg[1] = 0;
             }
+            if (comm[0] == 'i' && comm[1] == 'd' && comm[2] == 'l' && comm[3] == 'e') {
+                idle_p = mainproc;
+            }
             so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDPROC[%u] comm=\"%s\" wmesg=\"%s\" "
-                               "ps=0x%llx p=0x%llx st@0x%x:", pn, comm, wmesg,
+                               "stat=%u wchan=0x%llx ps=0x%llx p=0x%llx st@0x%x:", pn, comm, wmesg,
+                               (unsigned)g_bsd_win[FW_1_BSD_P_STAT],
+                               (unsigned long long)fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_WCHAN),
                                (unsigned long long)ps, (unsigned long long)mainproc,
                                FW_1_BSD_P_STATE);
             /* p_stat sits in here. It is one byte among p_flag and its neighbours, and which
@@ -6681,6 +6770,7 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
 
         ps = next;
     }
+    fw_1_bsd_sched(vm, cr3, idle_p);
 }
 
 /* FW-1e: drain the guest UART's transmit ring, strip terminal escape
