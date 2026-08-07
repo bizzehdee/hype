@@ -22,22 +22,63 @@ void hype_gop_console_init(hype_gop_console_t *con, void *fb, unsigned int width
     con->dirty_y_min = 0;
     con->dirty_y_max = 0;
     con->dirty = 0;
+    {
+        unsigned int bands = (height + HYPE_GOP_GLYPH_H - 1u) / HYPE_GOP_GLYPH_H;
+        unsigned int b;
+        /* #351: a console taller than the table keeps the row-range behaviour rather than
+         * silently tracking only its top. */
+        con->band_count = (bands <= HYPE_GOP_MAX_BANDS) ? bands : 0u;
+        for (b = 0; b < HYPE_GOP_MAX_BANDS; b++) {
+            con->band_dirty[b] = 0;
+            con->band_x0[b] = 0;
+            con->band_x1[b] = 0;
+        }
+    }
 }
 
-/* RT-1c: extend the accumulated dirty pixel-row range to include [y0, y1]. */
-static void mark_dirty(hype_gop_console_t *con, unsigned int y0, unsigned int y1) {
+/* RT-1c: extend the accumulated dirty pixel-row range to include [y0, y1].
+ * #351: and the per-band x extents, which is what the flush actually copies. */
+static void mark_dirty_rect(hype_gop_console_t *con, unsigned int x0, unsigned int x1,
+                            unsigned int y0, unsigned int y1) {
     if (!con->dirty) {
         con->dirty_y_min = y0;
         con->dirty_y_max = y1;
         con->dirty = 1;
-        return;
+    } else {
+        if (y0 < con->dirty_y_min) {
+            con->dirty_y_min = y0;
+        }
+        if (y1 > con->dirty_y_max) {
+            con->dirty_y_max = y1;
+        }
     }
-    if (y0 < con->dirty_y_min) {
-        con->dirty_y_min = y0;
+    if (con->band_count != 0u) {
+        unsigned int b0 = y0 / HYPE_GOP_GLYPH_H;
+        unsigned int b1 = y1 / HYPE_GOP_GLYPH_H;
+        unsigned int b;
+        if (b1 >= con->band_count) {
+            b1 = con->band_count - 1u;
+        }
+        for (b = b0; b <= b1 && b < con->band_count; b++) {
+            if (!con->band_dirty[b]) {
+                con->band_dirty[b] = 1;
+                con->band_x0[b] = (unsigned short)x0;
+                con->band_x1[b] = (unsigned short)x1;
+                continue;
+            }
+            if (x0 < con->band_x0[b]) {
+                con->band_x0[b] = (unsigned short)x0;
+            }
+            if (x1 > con->band_x1[b]) {
+                con->band_x1[b] = (unsigned short)x1;
+            }
+        }
     }
-    if (y1 > con->dirty_y_max) {
-        con->dirty_y_max = y1;
-    }
+}
+
+/* Full-width variant, for the paths that rewrite whole rows (scroll, clear). */
+static void mark_dirty(hype_gop_console_t *con, unsigned int y0, unsigned int y1) {
+    mark_dirty_rect(con, 0, (con->width > 0) ? con->width - 1u : 0u, y0, y1);
 }
 
 void hype_gop_put_pixel(hype_gop_console_t *con, unsigned int x, unsigned int y, unsigned int color) {
@@ -45,7 +86,7 @@ void hype_gop_put_pixel(hype_gop_console_t *con, unsigned int x, unsigned int y,
         return;
     }
     con->fb[pixel_index(con, x, y)] = color;
-    mark_dirty(con, y, y); /* the single row this pixel touched */
+    mark_dirty_rect(con, x, x, y, y); /* the single pixel this touched */
 }
 
 void hype_gop_draw_glyph(hype_gop_console_t *con, unsigned int col, unsigned int row, unsigned char c) {

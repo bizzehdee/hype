@@ -16,6 +16,9 @@
  * LocateProtocol call) touches UEFI.
  */
 
+/* #351: one entry per 8-pixel band. 272 covers 2176 rows -- past 4K-class panel heights. */
+#define HYPE_GOP_MAX_BANDS 272
+
 typedef struct {
     unsigned int *fb;
     unsigned int width;         /* visible pixels per row */
@@ -37,6 +40,21 @@ typedef struct {
     unsigned int dirty_y_min;
     unsigned int dirty_y_max;
     int dirty;
+    /*
+     * #351: the row range above is a single min..max span, so two changed cells at opposite ends
+     * of the screen mark everything between them dirty. Measured on AMD hardware: 10.8 changed
+     * cells per push still blitted all 2,073,600 pixels, and post-ExitBootServices that is a
+     * scalar copy into uncached VRAM at ~30 MB/s -- 271 ms per push, which consumed 99.8% of all
+     * wall time and left the guest 0.16% of the CPU.
+     *
+     * So dirtiness is also tracked per 8-pixel-row band (one text row) with per-band x bounds.
+     * The flush then moves only the cells that changed. band_count == 0 means the console is
+     * taller than the band table, and flush falls back to the row range.
+     */
+    unsigned short band_x0[HYPE_GOP_MAX_BANDS];
+    unsigned short band_x1[HYPE_GOP_MAX_BANDS];
+    unsigned char band_dirty[HYPE_GOP_MAX_BANDS];
+    unsigned int band_count;
 } hype_gop_console_t;
 
 #define HYPE_GOP_GLYPH_W 8

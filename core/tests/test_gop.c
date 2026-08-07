@@ -79,7 +79,7 @@ static EFI_STATUS EFIAPI mock_blt(EFI_GRAPHICS_OUTPUT_PROTOCOL *this_gop, EFI_GR
 static void test_flush_uses_blt_when_gop_is_available(void) {
     EFI_GRAPHICS_OUTPUT_PROTOCOL fake_gop;
     unsigned int shadow[4 * 3]; /* stride=4, height=3 */
-    hype_gop_console_t con;
+    hype_gop_console_t con = {0};
 
     memset(&fake_gop, 0, sizeof(fake_gop));
     fake_gop.Blt = mock_blt;
@@ -112,7 +112,7 @@ static void test_flush_uses_blt_when_gop_is_available(void) {
 static void test_flush_falls_back_to_memcpy_when_gop_is_null(void) {
     unsigned int shadow[4 * 3];
     unsigned int real_fb[4 * 3];
-    hype_gop_console_t con;
+    hype_gop_console_t con = {0};
     unsigned int x, y;
 
     for (y = 0; y < 3; y++) {
@@ -144,7 +144,7 @@ static void test_flush_falls_back_to_memcpy_when_gop_is_null(void) {
 
 static void test_flush_is_a_safe_no_op_with_no_gop_and_no_real_fb(void) {
     unsigned int shadow[4 * 3];
-    hype_gop_console_t con;
+    hype_gop_console_t con = {0};
 
     con.fb = shadow;
     con.width = 2;
@@ -163,7 +163,7 @@ static void test_flush_is_a_safe_no_op_with_no_gop_and_no_real_fb(void) {
 static void test_flush_skips_when_clean(void) {
     unsigned int shadow[4 * 3];
     unsigned int real_fb[4 * 3];
-    hype_gop_console_t con;
+    hype_gop_console_t con = {0};
     unsigned int i;
 
     for (i = 0; i < 4 * 3; i++) {
@@ -189,7 +189,7 @@ static void test_flush_skips_when_clean(void) {
 static void test_flush_copies_only_dirty_rows(void) {
     unsigned int shadow[4 * 3];
     unsigned int real_fb[4 * 3];
-    hype_gop_console_t con;
+    hype_gop_console_t con = {0};
     unsigned int x, y;
 
     for (y = 0; y < 3; y++) {
@@ -217,6 +217,65 @@ static void test_flush_copies_only_dirty_rows(void) {
     CHECK_INT("dirty cleared after partial flush", 0, con.dirty);
 }
 
+/* #351: the flush must copy only the cells the renderer touched. Before this, two changed cells
+ * at opposite ends of the screen marked every row between them dirty and the whole framebuffer
+ * was blitted -- 271 ms per push on real hardware, which starved the guest of the CPU. */
+static void test_flush_copies_only_dirty_bands(void) {
+    static unsigned int shadow[64 * 40];
+    static unsigned int real_fb[64 * 40];
+    hype_gop_console_t con;
+    unsigned int x, y, copied = 0;
+
+    for (y = 0; y < 40; y++) {
+        for (x = 0; x < 64; x++) {
+            shadow[y * 64 + x] = 0xB0000000u + y * 64 + x;
+            real_fb[y * 64 + x] = 0xFFFFFFFFu;
+        }
+    }
+    hype_gop_console_init(&con, shadow, 64, 40, 64, 0xFFFFFFu, 0u);
+    CHECK_INT("40 rows == 5 bands", 5, (int)con.band_count);
+    con.dirty = 0; /* init's own clear is not what this test measures */
+    {
+        unsigned int b;
+        for (b = 0; b < con.band_count; b++) con.band_dirty[b] = 0;
+    }
+
+    /* One pixel in the top band and one in the bottom band -- the worst case for a row range. */
+    hype_gop_put_pixel(&con, 3, 1, 0x111111u);
+    hype_gop_put_pixel(&con, 60, 36, 0x222222u);
+    CHECK_INT("row range spans nearly the whole console", 1, (int)con.dirty_y_min);
+    CHECK_INT("row range spans nearly the whole console", 36, (int)con.dirty_y_max);
+
+    g_blt_calls = 0;
+    hype_gop_flush(0, &con, real_fb);
+
+    for (y = 0; y < 40; y++) {
+        for (x = 0; x < 64; x++) {
+            if (real_fb[y * 64 + x] != 0xFFFFFFFFu) copied++;
+        }
+    }
+    /* Two 8-row bands, each one pixel wide -- not the 36 full rows the range implies. */
+    CHECK_INT("only the two touched bands are copied", 16, (int)copied);
+    CHECK_INT("top pixel reached the screen", (int)shadow[1 * 64 + 3], (int)real_fb[1 * 64 + 3]);
+    CHECK_INT("bottom pixel reached the screen", (int)shadow[36 * 64 + 60], (int)real_fb[36 * 64 + 60]);
+    CHECK_INT("untouched middle band left alone", (int)0xFFFFFFFFu, (int)real_fb[20 * 64 + 30]);
+    CHECK_INT("dirty cleared", 0, con.dirty);
+
+    /* A second flush with nothing changed must not copy anything more. */
+    for (y = 0; y < 40; y++) {
+        for (x = 0; x < 64; x++) real_fb[y * 64 + x] = 0xFFFFFFFFu;
+    }
+    con.dirty = 1; /* stale flag, clean bands: the bands decide */
+    hype_gop_flush(0, &con, real_fb);
+    copied = 0;
+    for (y = 0; y < 40; y++) {
+        for (x = 0; x < 64; x++) {
+            if (real_fb[y * 64 + x] != 0xFFFFFFFFu) copied++;
+        }
+    }
+    CHECK_INT("cleared bands copy nothing on the next flush", 0, (int)copied);
+}
+
 static void test_locate_failure(void) {
     EFI_BOOT_SERVICES bs;
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = (EFI_GRAPHICS_OUTPUT_PROTOCOL *)0x1;
@@ -240,6 +299,7 @@ int main(void) {
     test_flush_is_a_safe_no_op_with_no_gop_and_no_real_fb();
     test_flush_skips_when_clean();
     test_flush_copies_only_dirty_rows();
+    test_flush_copies_only_dirty_bands();
 
     if (failures == 0) {
         printf("all tests passed\n");
