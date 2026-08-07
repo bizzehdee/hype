@@ -9008,6 +9008,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     unsigned long long idleq_hlt = 0, idleq_zero = 0, idleq_nz = 0;
     /* #318: HLTs retired because an EVENTINJ was already staged -- the case pending_valid misses. */
     unsigned long long hlt_retired_einj = 0;
+    /* #318: last asserted state of each guest UART's interrupt line, so it is raised on the
+     * transition rather than continuously while the condition holds. Index 0 = COM1, 1 = COM2. */
+    int uart_irq_asserted[2] = {0, 0};
     uint64_t idleq_last_r14 = 0;
     uint32_t idleq_last_val = 0;
     unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
@@ -10754,23 +10757,43 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * already in service; raising a masked line (e.g. COM2/IRQ3 when
          * the guest only polls ttyS1) would just leave a stuck, unhandled
          * IRR bit. */
+        /*
+         * #318: raise on the EDGE, not for as long as the condition holds. This used to test
+         * hype_guest_uart_irq_pending() every loop iteration and raise every time it was true,
+         * which is a level, and the guest's line is edge-triggered. With the transmit interrupt
+         * outstanding and unserviced, that delivered vector 0x90 about eight thousand times a
+         * second: 965102 injections in two minutes, measured. The guest never got far enough to
+         * run its handler -- it read IIR three times in the whole run -- so it never cleared the
+         * condition, so the raise never stopped. Latching THRE in the UART model was necessary
+         * but not sufficient; the line has to follow the transition too.
+         *
+         * One raise per 0->1. The guest's handler reads IIR, which clears the latch and drops
+         * the line, and its next THR write re-arms it -- one interrupt per character, as on
+         * real hardware.
+         */
         {
             unsigned u;
             for (u = 0; u < 2u; u++) {
                 hype_guest_uart_t *uart = (u == 0) ? &g_fw_1_uart : &g_fw_1_uart2;
                 uint8_t irqn = (u == 0) ? 4u : 3u; /* COM1=IRQ4, COM2=IRQ3 */
                 uint8_t bit = (uint8_t)(1u << irqn);
-                if (hype_guest_uart_irq_pending(uart) &&
-                    (g_fw_1_pic.master.imr & bit) == 0 &&
-                    (g_fw_1_pic.master.isr & bit) == 0) {
+                int now_pending = hype_guest_uart_irq_pending(uart);
+                if (!now_pending) {
+                    uart_irq_asserted[u] = 0;
+                    continue;
+                }
+                if (uart_irq_asserted[u]) {
+                    continue; /* already raised and not yet serviced */
+                }
+                uart_irq_asserted[u] = 1;
+                if ((g_fw_1_pic.master.imr & bit) == 0 && (g_fw_1_pic.master.isr & bit) == 0) {
                     hype_pic_emu_raise_irq(&g_fw_1_pic.master, irqn);
                 }
                 /* M4-6b3: route the serial line (GSI == IRQ, no override)
                  * through the I/O APIC too, for an ACPI-mode guest. */
                 {
                     uint8_t iov;
-                    if (hype_guest_uart_irq_pending(uart) &&
-                        hype_ioapic_raise(&g_fw_1_ioapic, (uint32_t)irqn, &iov)) {
+                    if (hype_ioapic_raise(&g_fw_1_ioapic, (uint32_t)irqn, &iov)) {
                         vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
                     }
                 }
