@@ -9086,6 +9086,34 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * `localhost login` -- out of the captured window. */
             if (last_exhist_tsc == 0 || now_eh - last_exhist_tsc >= 30ULL * g_fw_1_host_tsc_hz) {
                 last_exhist_tsc = now_eh;
+                /*
+                 * #349: dump this VM's on-screen TERMINAL as text. hype already emulates the
+                 * guest UART and tees it here (the "vmN ttyS0|" lines), so a guest that uses its
+                 * serial console is fully observable -- but a PRISTINE install ISO (OpenBSD,
+                 * FreeBSD, any installer) defaults to its VIDEO console, and that text existed
+                 * only as pixels on the laptop's screen. Photographs were the only capture,
+                 * which is what made a patched boot.conf look like a requirement rather than
+                 * test instrumentation. The VT grid already holds the characters; writing them
+                 * out makes any guest console readable in the log, on a machine with no serial
+                 * port at all. Blank-trimmed, and only rows with content.
+                 */
+                {
+                    unsigned tr, tc;
+                    char line[HYPE_VT_MAX_COLS + 1];
+                    for (tr = 0; tr < vm->term.rows && tr < HYPE_VT_MAX_ROWS; tr++) {
+                        unsigned last = 0;
+                        for (tc = 0; tc < vm->term.cols && tc < HYPE_VT_MAX_COLS; tc++) {
+                            uint8_t ch = vm->term.cells[tr][tc].ch;
+                            line[tc] = (ch >= 0x20u && ch < 0x7Fu) ? (char)ch : ' ';
+                            if (line[tc] != ' ') last = tc + 1u;
+                        }
+                        line[last] = '\0';
+                        if (last != 0u) {
+                            hype_debug_print("fw-1 vm%u screen| %s\n", (unsigned)(vm - g_vms),
+                                             line);
+                        }
+                    }
+                }
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
