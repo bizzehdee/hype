@@ -6700,22 +6700,58 @@ static void fw_1_bsd_sched(hype_fw_vm_t *vm, uint64_t cr3, uint64_t idle_p) {
         hype_debug_print("%s\n", sl);
     }
 
-    /* spc_whichqs lives past the 32 queue heads, behind spc_deadproc, spc_runtime,
-     * spc_schedflags, spc_schedticks and spc_cp_time. Dump the run rather than guess: it must
-     * equal the occupancy mask above, which identifies it on sight. */
+    /* spc_whichqs is what the idle loop tests before halting, so it is the value that decides
+     * this: queue 12 is occupied, and if whichqs still reads 0 then the enqueue never became
+     * visible to the halt test. It is not within 128 bytes of the queues -- 0x1000 appears
+     * nowhere in that run -- so dump 256 and cover the rest of schedstate. */
     {
         static char sl[420];
-        uint64_t at = base + FW_1_BSD_SPC_QS + 512u;
-        int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: post-qs@0x%llx:",
-                               (unsigned long long)at);
-        unsigned i;
-        if (fw_1_read_guest_va(vm, cr3, at, g_bsd_win, 128u)) {
+        unsigned half;
+        for (half = 0; half < 2u; half++) {
+            uint64_t at = base + FW_1_BSD_SPC_QS + 512u + (uint64_t)half * 128u;
+            int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: post-qs@0x%llx:",
+                                   (unsigned long long)at);
+            unsigned i;
+            if (!fw_1_read_guest_va(vm, cr3, at, g_bsd_win, 128u)) {
+                break;
+            }
             for (i = 0; i < 128u; i++) {
                 so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, "%s%02x",
                                     ((i & 7u) == 0u) ? " " : "", g_bsd_win[i]);
             }
             hype_debug_print("%s\n", sl);
         }
+    }
+
+    /* Direct confirmation, independent of where the field turns out to sit: if any 32-bit word in
+     * cpu_info equals the occupancy mask, whichqs agrees with the queues. If none does, it does
+     * not, and the lost update is the fault. */
+    if (occupied != 0) {
+        static char sl[300];
+        int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: mask 0x%08x found at:",
+                               (unsigned)occupied);
+        unsigned found = 0;
+        for (chunk = 0; chunk < FW_1_BSD_CIF_LEN && found < 8u; chunk += FW_1_BSD_WIN) {
+            unsigned i;
+            if (!fw_1_read_guest_va(vm, cr3, FW_1_BSD_CIF + chunk, g_bsd_win, FW_1_BSD_WIN)) {
+                break;
+            }
+            for (i = 0; i + 4u <= FW_1_BSD_WIN && found < 8u; i += 4u) {
+                uint32_t v = (uint32_t)g_bsd_win[i] | ((uint32_t)g_bsd_win[i + 1u] << 8) |
+                             ((uint32_t)g_bsd_win[i + 2u] << 16) |
+                             ((uint32_t)g_bsd_win[i + 3u] << 24);
+                if (v != occupied) {
+                    continue;
+                }
+                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " 0x%llx",
+                                    (unsigned long long)(FW_1_BSD_CIF + chunk + i));
+                found++;
+            }
+        }
+        if (found == 0u) {
+            so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " NOWHERE");
+        }
+        hype_debug_print("%s\n", sl);
     }
 }
 
