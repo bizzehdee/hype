@@ -8748,6 +8748,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     unsigned int uart_line_len2 = 0;
     unsigned long long timer_irqs = 0;   /* M4-6b: guest LAPIC-timer IRQs actually delivered */
     unsigned long long pit_irqs = 0;     /* M4-6b4: PIT IRQ0 (legacy clockevent) IRQs delivered */
+    /*
+     * #318: PIT ticks delivered through the IO-APIC (ISA IRQ0 -> GSI2, the MADT override) and
+     * ticks REFUSED there. pit_irqs above counts only the legacy PIC acknowledge path, so an
+     * APIC-mode guest -- which OpenBSD is -- could be receiving every tick while pit_irq0 reads
+     * 0. That ambiguity made the first reading of this ticket's data wrong; count both channels
+     * separately and never infer delivery from one counter again.
+     */
+    unsigned long long pit_irqs_apic = 0;
+    unsigned long long pit_apic_refused = 0;
     unsigned long long ahci_irqs = 0;    /* M4-6d2: AHCI completion IRQs raised on the guest's line */
     unsigned long long console_chars = 0;
     hype_vt_filter_t dbg_filter;
@@ -9501,6 +9510,27 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * show directly whether (and which) clockevent source stopped
                  * firing, and whether the guest masked IRQ0 (mIMR bit0). Pure
                  * diagnostic -- no guest-visible state changes. */
+                /*
+                 * #318: the PIT ROUTING verdict, printed beside the counters it explains --
+                 * which channel the tick took, how often the IO-APIC refused it, and the state
+                 * of both destinations (RTE[2] is the MADT's IRQ0 override, RTE[0] the identity
+                 * entry, mIMR bit0 the legacy mask). An OpenBSD guest polling the RTE forever
+                 * while pit_irq0 reads 0 is either "no tick at all" or "every tick went to the
+                 * other channel"; these fields tell them apart in one line.
+                 */
+                hype_debug_print("fw-1 PITROUTE: pic_delivered=%llu apic_delivered=%llu "
+                                 "apic_refused=%llu | RTE[2]=0x%llx RTE[0]=0x%llx mIMR=0x%x "
+                                 "mIRR=0x%x mISR=0x%x | PIT0 mode=%u reload=%u\n",
+                                 (unsigned long long)pit_irqs,
+                                 (unsigned long long)pit_irqs_apic,
+                                 (unsigned long long)pit_apic_refused,
+                                 (unsigned long long)g_fw_1_ioapic.rte[2],
+                                 (unsigned long long)g_fw_1_ioapic.rte[0],
+                                 (unsigned int)g_fw_1_pic.master.imr,
+                                 (unsigned int)g_fw_1_pic.master.irr,
+                                 (unsigned int)g_fw_1_pic.master.isr,
+                                 (unsigned int)g_fw_1_pit.channels[0].mode,
+                                 (unsigned int)g_fw_1_pit.channels[0].reload);
                 hype_debug_print("fw-1 TIMERHIST: pit_irq0=%llu lapic_irq=%llu ahci_irq=%llu | "
                                  "PIT0 mode=%u reload=%u counter=%u | LAPIC lvt=0x%x(%s) init=%u cur=%u | "
                                  "svr=0x%x dcr=0x%x ever_armed=0x%x | "
@@ -10040,6 +10070,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         uint8_t iov;
                         if (hype_ioapic_raise(&g_fw_1_ioapic, 2u, &iov)) {
                             vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                            pit_irqs_apic++; /* #318 */
+                        } else {
+                            pit_apic_refused++; /* masked RTE, or Remote-IRR still latched */
                         }
                     }
                 }
