@@ -581,6 +581,11 @@ void hype_svm_irr_clear(uint32_t irr[8], uint8_t vector);
 int hype_svm_irr_any(const uint32_t irr[8]);
 int hype_svm_irr_highest(const uint32_t irr[8]);
 
+/* #356: how many vectors are pending. hype_svm_irr_any() answers only yes/no, and the diagnostic
+ * that printed the highest one read as "there is exactly one" -- which is how I came to file a
+ * bug report claiming interrupts were being overwritten. A count cannot be misread that way. */
+int hype_svm_irr_count(const uint32_t irr[8]);
+
 /*
  * M4-6b2: scale the host TSC down to the ACPI Power-Management timer's
  * architectural 3.579545 MHz rate and mask to 24 bits (this project's FADT

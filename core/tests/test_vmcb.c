@@ -510,6 +510,51 @@ static void test_disarm_vintr_request_clears_bits_preserves_others(void) {
     CHECK_HEX("unrelated bit (AVIC enable) preserved", 1, (disarmed & HYPE_SVM_INT_CTL_AVIC_ENABLE) != 0);
 }
 
+/*
+ * #356: two DIFFERENT vectors pending at once, both surviving, draining highest-first.
+ *
+ * This is the exact property I doubted. A stale comment on
+ * hype_svm_vcpu_request_interrupt() claimed only one interrupt was ever in flight and that a
+ * second request overwrote the first; I believed it over the code during the #318 investigation
+ * and filed a bug against a defect that did not exist. The code has always used a 256-bit IRR.
+ * Pinning the behaviour in a test means the next reader does not have to trust either the comment
+ * or me.
+ */
+static void test_irr_holds_multiple_vectors_and_drains_by_priority(void) {
+    uint32_t irr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    /* The two vectors from the #318 run: the UART on 0x90 and the keyboard on 0x92. */
+    hype_svm_irr_set(irr, 0x90u);
+    hype_svm_irr_set(irr, 0x92u);
+    CHECK_HEX("both vectors pending, neither overwrote the other", 2, hype_svm_irr_count(irr));
+    CHECK_HEX("highest first: 0x92", 0x92, hype_svm_irr_highest(irr));
+
+    /* Draining the top one must leave the other intact -- not clear the slot. */
+    hype_svm_irr_clear(irr, 0x92u);
+    CHECK_HEX("one still pending", 1, hype_svm_irr_count(irr));
+    CHECK_HEX("and it is 0x90", 0x90, hype_svm_irr_highest(irr));
+    hype_svm_irr_clear(irr, 0x90u);
+    CHECK_HEX("drained", 0, hype_svm_irr_count(irr));
+    CHECK_HEX("empty reports -1", (unsigned long long)(long long)-1,
+              (unsigned long long)(long long)hype_svm_irr_highest(irr));
+
+    /* Re-requesting an already-pending vector COALESCES: an IRR bit means one delivery per set
+     * bit, not one per request. That is what the 1.19M "coalesced" count in #318 was, and it is
+     * correct behaviour rather than lost interrupts, which is what I first reported it as. */
+    hype_svm_irr_set(irr, 0x20u);
+    hype_svm_irr_set(irr, 0x20u);
+    hype_svm_irr_set(irr, 0x20u);
+    CHECK_HEX("three requests for one vector is still one pending", 1, hype_svm_irr_count(irr));
+
+    /* Word boundaries: 31/32 and 255 are where an off-by-one in the >>5 / &31 split would show. */
+    hype_svm_irr_clear(irr, 0x20u);
+    hype_svm_irr_set(irr, 31u);
+    hype_svm_irr_set(irr, 32u);
+    hype_svm_irr_set(irr, 255u);
+    CHECK_HEX("three across word boundaries", 3, hype_svm_irr_count(irr));
+    CHECK_HEX("highest is 255", 255, hype_svm_irr_highest(irr));
+}
+
 static void test_irr_set_any_highest_clear(void) {
     uint32_t irr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     CHECK_HEX("empty IRR: any=0", 0, hype_svm_irr_any(irr));
@@ -608,6 +653,7 @@ int main(void) {
     test_arm_vintr_request_sets_bits_preserves_others();
     test_arm_vintr_request_idempotent_over_stale_priority_bits();
     test_disarm_vintr_request_clears_bits_preserves_others();
+    test_irr_holds_multiple_vectors_and_drains_by_priority();
     test_irr_set_any_highest_clear();
     test_irr_boundary_vectors();
     test_acpi_pm_timer_scale();

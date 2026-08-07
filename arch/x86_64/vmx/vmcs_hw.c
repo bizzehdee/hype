@@ -2934,6 +2934,7 @@ void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *o
                      : 0u;
     out->can_accept = hype_svm_can_accept_interrupt(out->rflags, out->interrupt_shadow);
     out->pending_valid = hype_svm_irr_any(real->pending_irr);
+    out->pending_count = hype_svm_irr_count(real->pending_irr); /* #356 */
     {
         int hv = hype_svm_irr_highest(real->pending_irr);
         out->pending_vector = (uint8_t)(hv < 0 ? 0 : hv);

@@ -49,7 +49,8 @@ typedef struct {
     uint64_t vintr;
     int can_accept;
     int pending_valid;
-    uint8_t pending_vector;
+    uint8_t pending_vector;   /* the highest pending vector, if pending_valid */
+    int pending_count;        /* #356: HOW MANY are pending, not just whether any is */
 } hype_vmm_intr_state_t;
 
 /*

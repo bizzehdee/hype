@@ -9717,11 +9717,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     (void)vmm_get_int_diag(kind, &ei, &df, &wn, &ov);
                     vmm_get_intr_state(kind, ctx, &idg);
                     hype_debug_print("fw-1 INTDIAG: eventinj=%llu defer=%llu window=%llu coalesced=%llu "
-                                     "collisions=%llu | pending=%d/vec0x%x staged_eventinj=0x%llx "
+                                     "collisions=%llu | pending=%d(top 0x%x) staged_eventinj=0x%llx "
                                      "IF=%d shadow=0x%llx\n",
                                      ei, df, wn, ov,
                                      vmm_get_eventinj_collisions(kind),
-                                     idg.pending_valid, (unsigned int)idg.pending_vector,
+                                     idg.pending_count, (unsigned int)idg.pending_vector,
                                      (unsigned long long)idg.eventinj,
                                      (int)((idg.rflags >> 9) & 1u),
                                      (unsigned long long)idg.interrupt_shadow);

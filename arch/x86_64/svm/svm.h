@@ -492,16 +492,18 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx);
  * can" per hype_svm_can_accept_interrupt(). If the guest can accept it
  * immediately, writes EVENTINJ directly via
  * hype_svm_encode_eventinj_intr() (delivered on the very next VMRUN).
- * Otherwise arms an interrupt-window request
- * (hype_svm_arm_vintr_request(), HYPE_SVM_INTERCEPT_VINTR) and remembers
- * `vector` so hype_svm_vcpu_handle_vintr_window() can actually inject it
- * once that window opens -- this project only ever has one interrupt
- * genuinely in flight at a time (matching its own current single-IRQ-
- * source scope; a real multi-device PIC's own IRR/priority logic is
- * devices/pic.h's job, not this function's), so a second call before
- * the first is delivered overwrites the pending vector rather than
- * queuing -- acceptable for now, revisit if/when multiple concurrent
- * pending interrupts are ever a real scenario. Exempt from unit testing
+ * Otherwise sets `vector`'s bit in a 256-bit pending IRR and arms an interrupt-window request
+ * (hype_svm_arm_vintr_request(), HYPE_SVM_INTERCEPT_VINTR), so
+ * hype_svm_vcpu_handle_vintr_window() can drain the highest-priority pending vector once that
+ * window opens. Multiple different vectors CAN be pending at once and none is lost; requesting a
+ * vector that is already pending coalesces, which is what an IRR bit means -- one delivery per set
+ * bit, not one per request.
+ *
+ * #356: this comment used to say the opposite -- that only one interrupt was ever in flight and
+ * that a second request "overwrites the pending vector rather than queuing". That described an
+ * older implementation. It was wrong for long enough that I read it during the #318 investigation,
+ * believed it over the code, and filed an issue against a defect that did not exist. Wrong
+ * comments are not harmless; this one cost a bug report and a wrong diagnosis. Exempt from unit testing
  * -- reaches into the exempt VMCB fields this backend's real VMRUN
  * produces; every pure function this composes
  * (hype_svm_can_accept_interrupt()/hype_svm_encode_eventinj_intr()/

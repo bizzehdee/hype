@@ -349,6 +349,18 @@ int hype_svm_irr_any(const uint32_t irr[8]) {
     return 0;
 }
 
+int hype_svm_irr_count(const uint32_t irr[8]) {
+    int i, b, n = 0;
+    for (i = 0; i < 8; i++) {
+        for (b = 0; b < 32; b++) {
+            if ((irr[i] & ((uint32_t)1u << b)) != 0) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
 int hype_svm_irr_highest(const uint32_t irr[8]) {
     int i, b;
     for (i = 7; i >= 0; i--) {
