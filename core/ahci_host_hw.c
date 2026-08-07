@@ -14,10 +14,22 @@
 /* DMA-visible structures the HBA reads/writes. In hype's own .bss, which is
  * identity-mapped, so the pointer == the physical address the HBA needs.
  * Alignment per AHCI 1.3.1 §10.1.2: command list 1 KiB, received FIS 256 B,
- * command table 128 B. */
-static uint8_t g_cmd_list[1024] __attribute__((aligned(1024)));
-static uint8_t g_recv_fis[256] __attribute__((aligned(256)));
-static uint8_t g_cmd_table[256] __attribute__((aligned(128)));
+ * command table 128 B.
+ *
+ * #352: PER PORT, not one set shared by all of them. hype_ahci_host_init() programs a port's
+ * PxCLB/PxFB from these, so a single shared set pointed every initialised port at the same
+ * command list and the same FIS-receive area. With one port in use that is invisible; #325's
+ * optical drive puts a SECOND port in use at the same time as the ESP disk, and then guest-time
+ * disk traffic overwrites the CD's command list between its own commands. That surfaced as every
+ * guest read off the disc failing (`stream-rd ... ret=-1`) while resolution, which ran before the
+ * disk port was busy, had succeeded.
+ *
+ * 32 ports of 1.5 KiB is 48 KiB of .bss, which is the cheap end of the trade against a class of
+ * bug that only appears once two devices are live. */
+#define AHCI_HOST_MAX_PORTS 32u
+static uint8_t g_cmd_list[AHCI_HOST_MAX_PORTS][1024] __attribute__((aligned(1024)));
+static uint8_t g_recv_fis[AHCI_HOST_MAX_PORTS][256] __attribute__((aligned(256)));
+static uint8_t g_cmd_table[AHCI_HOST_MAX_PORTS][256] __attribute__((aligned(128)));
 
 /* PxTFD status-byte bits (bits 7:0 of PxTFD). */
 #define TFD_STS_BSY 0x80u
@@ -117,15 +129,20 @@ int hype_ahci_host_find_atapi_port(uint64_t abar_phys) {
  */
 int hype_ahci_host_atapi_read(uint64_t abar_phys, unsigned port, uint32_t lba2k, uint16_t count2k,
                               void *dst) {
+    /* #352: port indexes the per-port DMA structures, so it must be in range before use. */
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);
     int rc = 0;
 
-    if (hype_ahci_host_build_atapi_read10(g_cmd_table, lba2k, count2k,
+    if (hype_ahci_host_build_atapi_read10(g_cmd_table[port], lba2k, count2k,
                                           (uint64_t)(uintptr_t)dst) != 0) {
         return -1;
     }
-    hype_ahci_host_build_cmd_header_atapi(g_cmd_list, /*prdtl=*/1, (uint64_t)(uintptr_t)g_cmd_table);
+    hype_ahci_host_build_cmd_header_atapi(g_cmd_list[port], /*prdtl=*/1,
+                                          (uint64_t)(uintptr_t)g_cmd_table[port]);
 
     if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
         return -1;
@@ -167,6 +184,10 @@ void hype_ahci_host_dump_ports(uint64_t abar_phys) {
 }
 
 int hype_ahci_host_init(uint64_t abar_phys, unsigned port) {
+    /* #352: port indexes the per-port DMA structures, so it must be in range before use. */
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);
     unsigned i;
@@ -184,16 +205,16 @@ int hype_ahci_host_init(uint64_t abar_phys, unsigned port) {
 
     /* Point the port at hype's own command list + received-FIS area (they stay
      * programmed for the life of the run; reads below only rewrite slot 0). */
-    for (i = 0; i < sizeof(g_cmd_list); i++) {
-        g_cmd_list[i] = 0;
+    for (i = 0; i < sizeof(g_cmd_list[port]); i++) {
+        g_cmd_list[port][i] = 0;
     }
-    for (i = 0; i < sizeof(g_recv_fis); i++) {
-        g_recv_fis[i] = 0;
+    for (i = 0; i < sizeof(g_recv_fis[port]); i++) {
+        g_recv_fis[port][i] = 0;
     }
-    wr32(pb, HYPE_AHCI_PREG_CLB, (uint32_t)(uintptr_t)g_cmd_list);
-    wr32(pb, HYPE_AHCI_PREG_CLBU, (uint32_t)((uint64_t)(uintptr_t)g_cmd_list >> 32));
-    wr32(pb, HYPE_AHCI_PREG_FB, (uint32_t)(uintptr_t)g_recv_fis);
-    wr32(pb, HYPE_AHCI_PREG_FBU, (uint32_t)((uint64_t)(uintptr_t)g_recv_fis >> 32));
+    wr32(pb, HYPE_AHCI_PREG_CLB, (uint32_t)(uintptr_t)g_cmd_list[port]);
+    wr32(pb, HYPE_AHCI_PREG_CLBU, (uint32_t)((uint64_t)(uintptr_t)g_cmd_list[port] >> 32));
+    wr32(pb, HYPE_AHCI_PREG_FB, (uint32_t)(uintptr_t)g_recv_fis[port]);
+    wr32(pb, HYPE_AHCI_PREG_FBU, (uint32_t)((uint64_t)(uintptr_t)g_recv_fis[port] >> 32));
     wr32(pb, HYPE_AHCI_PREG_SERR, 0xFFFFFFFFu); /* clear sticky errors (write-1-to-clear) */
     wr32(pb, HYPE_AHCI_PREG_IS, 0xFFFFFFFFu);
 
@@ -212,6 +233,10 @@ int hype_ahci_host_init(uint64_t abar_phys, unsigned port) {
 }
 
 int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst) {
+    /* #352: port indexes the per-port DMA structures, so it must be in range before use. */
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);
     int rc = 0;
@@ -237,12 +262,12 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
     }
 
     /* Build slot 0's command header + a READ DMA EXT command table. The port was
-     * already pointed at g_cmd_list / g_recv_fis by hype_ahci_host_init(). */
-    if (hype_ahci_host_build_read_dma_ext(g_cmd_table, lba, count, (uint64_t)(uintptr_t)dst) != 0) {
+     * already pointed at this port's g_cmd_list / g_recv_fis by hype_ahci_host_init(). */
+    if (hype_ahci_host_build_read_dma_ext(g_cmd_table[port], lba, count, (uint64_t)(uintptr_t)dst) != 0) {
         return -1;
     }
-    hype_ahci_host_build_cmd_header(g_cmd_list, /*is_write=*/0, /*prdtl=*/1,
-                                    (uint64_t)(uintptr_t)g_cmd_table);
+    hype_ahci_host_build_cmd_header(g_cmd_list[port], /*is_write=*/0, /*prdtl=*/1,
+                                    (uint64_t)(uintptr_t)g_cmd_table[port]);
 
     /* Wait for the device to be ready (not BSY, no DRQ) before issuing. */
     if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
@@ -288,17 +313,21 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
 
 int hype_ahci_host_write(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count,
                          const void *src) {
+    /* #352: port indexes the per-port DMA structures, so it must be in range before use. */
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);
     int rc = 0;
 
     /* Mirror of hype_ahci_host_read() with a WRITE DMA EXT command table and the
      * command-header W bit set. x86 DMA is cache-coherent, so no flush needed. */
-    if (hype_ahci_host_build_write_dma_ext(g_cmd_table, lba, count, (uint64_t)(uintptr_t)src) != 0) {
+    if (hype_ahci_host_build_write_dma_ext(g_cmd_table[port], lba, count, (uint64_t)(uintptr_t)src) != 0) {
         return -1;
     }
-    hype_ahci_host_build_cmd_header(g_cmd_list, /*is_write=*/1, /*prdtl=*/1,
-                                    (uint64_t)(uintptr_t)g_cmd_table);
+    hype_ahci_host_build_cmd_header(g_cmd_list[port], /*is_write=*/1, /*prdtl=*/1,
+                                    (uint64_t)(uintptr_t)g_cmd_table[port]);
 
     if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
         return -1;
@@ -313,15 +342,19 @@ int hype_ahci_host_write(uint64_t abar_phys, unsigned port, uint64_t lba, uint16
 }
 
 int hype_ahci_host_identify(uint64_t abar_phys, unsigned port, void *dst512) {
+    /* #352: port indexes the per-port DMA structures, so it must be in range before use. */
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     volatile uint8_t *pb = port_base(abar, port);
     int rc = 0;
 
     /* Same slot-0 mechanism as hype_ahci_host_read(), but an IDENTIFY command
      * table -- a non-write data-in transfer of exactly 512 bytes into dst512. */
-    hype_ahci_host_build_identify(g_cmd_table, (uint64_t)(uintptr_t)dst512);
-    hype_ahci_host_build_cmd_header(g_cmd_list, /*is_write=*/0, /*prdtl=*/1,
-                                    (uint64_t)(uintptr_t)g_cmd_table);
+    hype_ahci_host_build_identify(g_cmd_table[port], (uint64_t)(uintptr_t)dst512);
+    hype_ahci_host_build_cmd_header(g_cmd_list[port], /*is_write=*/0, /*prdtl=*/1,
+                                    (uint64_t)(uintptr_t)g_cmd_table[port]);
 
     if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
         return -1;
