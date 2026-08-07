@@ -103,6 +103,40 @@ static void test_tx_interrupt_generation(void) {
               hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR));
 }
 
+/*
+ * #318 regression. THRE is a latch, not a level. It used to stay asserted for as long as ETBEI
+ * was set, which is only harmless for a driver that disables ETBEI between bytes. OpenBSD's com
+ * keeps it enabled while its output queue is non-empty, so the line never dropped and the guest
+ * took about six thousand interrupts a second -- it never reached the handler that would have
+ * serviced them, and userland output stopped after one character.
+ */
+static void test_thre_is_a_latch_not_a_level(void) {
+    hype_guest_uart_t u;
+    hype_guest_uart_reset(&u);
+
+    hype_guest_uart_write(&u, HYPE_UART_REG_IER, HYPE_UART_IER_ETBEI);
+    CHECK_HEX("THRE asserted when ETBEI is first enabled", 1, hype_guest_uart_irq_pending(&u));
+
+    /* Reading IIR acknowledges it, exactly as on real hardware. */
+    CHECK_HEX("IIR reports THRE once", HYPE_UART_IIR_THRE,
+              hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR));
+    CHECK_HEX("THRE clears after IIR is read", 0, hype_guest_uart_irq_pending(&u));
+    CHECK_HEX("IIR reports NONE on the second read", HYPE_UART_IIR_NONE,
+              hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR));
+
+    /* Sending a byte empties the holding register again, which re-arms it. */
+    hype_guest_uart_write(&u, HYPE_UART_REG_DATA, 'A');
+    CHECK_HEX("THRE re-arms after a byte is written", 1, hype_guest_uart_irq_pending(&u));
+    CHECK_HEX("IIR reports THRE for the re-armed interrupt", HYPE_UART_IIR_THRE,
+              hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR));
+    CHECK_HEX("and clears again", 0, hype_guest_uart_irq_pending(&u));
+
+    /* ETBEI already set: re-writing the same IER value must not re-arm anything. */
+    hype_guest_uart_write(&u, HYPE_UART_REG_IER, HYPE_UART_IER_ETBEI);
+    CHECK_HEX("re-writing IER with ETBEI already set does not re-arm", 0,
+              hype_guest_uart_irq_pending(&u));
+}
+
 static void test_rx_interrupt_and_priority(void) {
     hype_guest_uart_t u;
     hype_guest_uart_reset(&u);
@@ -145,6 +179,7 @@ int main(void) {
     test_dlab_aliases_divisor();
     test_misc_registers();
     test_tx_interrupt_generation();
+    test_thre_is_a_latch_not_a_level();
     test_rx_interrupt_and_priority();
     test_rx_ring_full_rejects();
 

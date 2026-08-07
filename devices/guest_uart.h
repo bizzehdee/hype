@@ -63,6 +63,11 @@ typedef struct {
     uint8_t dll;
     uint8_t dlm;
     uint8_t fcr;
+    /* #318: the pending transmit-empty interrupt, latched. A real 16550 raises THRE once when the
+     * holding register empties and clears it when the guest reads IIR or writes THR; it does not
+     * hold the line asserted for as long as ETBEI is set. Modelling it as always-asserted gave the
+     * guest about six thousand interrupts a second, which it could not make progress through. */
+    uint8_t thre_int;
 
     uint8_t tx[HYPE_GUEST_UART_TX_RING];
     uint32_t tx_head;

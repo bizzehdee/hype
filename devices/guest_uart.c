@@ -9,6 +9,7 @@ void hype_guest_uart_reset(hype_guest_uart_t *u) {
     u->dll = 1; /* nonzero default divisor (115200) -- value is irrelevant to us */
     u->dlm = 0;
     u->fcr = 0;
+    u->thre_int = 0;
     u->tx_head = 0;
     u->tx_tail = 0;
     u->tx_dropped = 0;
@@ -45,17 +46,24 @@ uint8_t hype_guest_uart_read(hype_guest_uart_t *u, uint32_t offset) {
         case HYPE_UART_REG_IER:
             return dlab ? u->dlm : u->ier;
         case HYPE_UART_REG_IIR_FCR:
-            /* IIR: report the highest-priority enabled, asserted interrupt
-             * so the guest's serial ISR knows why it fired and services it.
-             * RX-data-available (when ERBFI set) outranks THRE (when ETBEI
-             * set); THRE is always assertable since TX is infinite-speed.
-             * bit0=0 means "interrupt pending". The driver clears the
-             * source (drains RX / disables ETBEI when its TX queue empties),
-             * so this stops asserting on its own -- no interrupt storm. */
+            /* IIR: report the highest-priority enabled, asserted interrupt so the guest's
+             * serial ISR knows why it fired and services it. RX-data-available (when ERBFI is
+             * set) outranks THRE. bit0=0 means "interrupt pending".
+             *
+             * #318: THRE is a LATCH, not a level. This used to return THRE for as long as ETBEI
+             * was set, on the theory that "the driver clears the source ... so this stops
+             * asserting on its own". That holds only for a driver that disables ETBEI between
+             * bytes. OpenBSD's com keeps ETBEI enabled while its output queue is non-empty, so
+             * the line stayed asserted permanently and the guest took about six thousand
+             * interrupts a second -- it never got far enough to run the handler that would have
+             * serviced it, and userland output stopped after a single character.
+             *
+             * On real hardware, reading IIR when it reports THRE clears that interrupt. */
             if ((u->ier & HYPE_UART_IER_ERBFI) && rx_available(u)) {
                 return HYPE_UART_IIR_RDA;
             }
-            if (u->ier & HYPE_UART_IER_ETBEI) {
+            if ((u->ier & HYPE_UART_IER_ETBEI) && u->thre_int) {
+                u->thre_int = 0;
                 return HYPE_UART_IIR_THRE;
             }
             return HYPE_UART_IIR_NONE;
@@ -98,12 +106,21 @@ void hype_guest_uart_write(hype_guest_uart_t *u, uint32_t offset, uint8_t value)
                     u->tx_dropped++;
                 }
                 u->tx_written++;
+                /* Transmit is infinite-speed here, so the holding register empties immediately:
+                 * that 0->1 edge on THRE is what re-arms the interrupt for the next byte. Writing
+                 * THR also clears any THRE interrupt already pending, as on real hardware. */
+                u->thre_int = 1;
             }
             return;
         case HYPE_UART_REG_IER:
             if (dlab) {
                 u->dlm = value;
             } else {
+                /* Enabling ETBEI while the transmitter is idle raises THRE straight away, which
+                 * is how a driver gets its first transmit interrupt without priming the port. */
+                if ((value & HYPE_UART_IER_ETBEI) != 0 && (u->ier & HYPE_UART_IER_ETBEI) == 0) {
+                    u->thre_int = 1;
+                }
                 u->ier = value;
             }
             return;
@@ -140,8 +157,8 @@ int hype_guest_uart_irq_pending(const hype_guest_uart_t *u) {
     if ((u->ier & HYPE_UART_IER_ERBFI) && rx_available(u)) {
         return 1;
     }
-    if (u->ier & HYPE_UART_IER_ETBEI) {
-        return 1; /* transmitter always ready */
+    if ((u->ier & HYPE_UART_IER_ETBEI) && u->thre_int) {
+        return 1;
     }
     return 0;
 }
