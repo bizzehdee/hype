@@ -76,8 +76,20 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                 Package () { 0x0007FFFF, 0x00, 0x00, 0x17 },  /* dev 7 INTA -> GSI 23 (disk slot 2) */
             })
 
-            /* Minimal resource template: claim bus 0 so the kernel associates
-             * this bridge (and thus its _PRT) with segment 0 / bus 0. */
+            /* Claim bus 0 so the kernel associates this bridge (and thus its _PRT) with
+             * segment 0 / bus 0, and declare the windows the bridge decodes.
+             *
+             * #354: the memory window used to be missing entirely -- only the bus range was
+             * declared. Linux does not police that, so this went unnoticed; OpenBSD checks every
+             * BAR against the host bridge's declared resources and rejected both AHCI
+             * controllers with "mem address conflict 0x80001000/0x1000", then read the version
+             * register as 0x00000000 and refused to attach ("unsupported AHCI revision").
+             *
+             * The range starts at the 2 GiB line because that is where the guest firmware places
+             * BARs, immediately above the default 2048 MiB of guest RAM, and stops below the
+             * I/O APIC at 0xFEC00000. NOTE: a VM configured with more than 2048 MiB of RAM will
+             * have RAM overlapping the bottom of this window -- see the follow-up issue; the
+             * window has to track the RAM top, which a static AML blob cannot do. */
             Name (_CRS, ResourceTemplate ()
             {
                 WordBusNumber (ResourceProducer, MinFixed, MaxFixed, PosDecode,
@@ -86,6 +98,29 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                     0x00FF,   /* max bus 255 */
                     0x0000,   /* translation */
                     0x0100)   /* length (256 buses) */
+
+                DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed,
+                    NonCacheable, ReadWrite,
+                    0x00000000,   /* granularity */
+                    0x80000000,   /* min  -- 2 GiB, just above guest RAM */
+                    0xFEBFFFFF,   /* max  -- last byte below the I/O APIC */
+                    0x00000000,   /* translation */
+                    0x7EC00000)   /* length */
+
+                /* The legacy I/O space the bridge forwards: com0/com1, the PS/2 controller, the
+                 * PIT and the ACPI PM block all live here and are otherwise undeclared. */
+                WordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange,
+                    0x0000,   /* granularity */
+                    0x0000,   /* min */
+                    0x0CF7,   /* max -- stop below the PCI config ports at 0xCF8 */
+                    0x0000,   /* translation */
+                    0x0CF8)   /* length */
+                WordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange,
+                    0x0000,
+                    0x0D00,   /* resume above the config ports */
+                    0xFFFF,
+                    0x0000,
+                    0xF300)
             })
         }
 
