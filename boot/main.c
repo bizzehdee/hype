@@ -6565,7 +6565,15 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
 #define FW_1_BSD_PS_LIST 24u     /* LIST_ENTRY(process) ps_list; le_next is its first word */
 #define FW_1_BSD_PS_COMM 0x328u  /* char ps_comm[] */
 #define FW_1_BSD_P_WMESG 0xe0u   /* struct proc: const char *p_wmesg */
-#define FW_1_BSD_P_STATE 0xc0u   /* the flag/state bytes ahead of p_wmesg */
+/*
+ * The 32 bytes at +0xc0 turned out to be p_sleep_to, not the state: +0xc0 held a pointer to the
+ * proc itself (timeout_set's to_arg) and +0xd8 read KCLOCK_NONE. p_stat is ahead of that, past
+ * p_wchan and p_cpticks, so the window starts earlier and is wider. It still ends inside
+ * p_sleep_to, which is deliberate -- to_flags there distinguishes a thread whose timed sleep has
+ * already fired from one still waiting, and that is what separated the child of init from the
+ * rest.
+ */
+#define FW_1_BSD_P_STATE 0x80u
 #define FW_1_BSD_WIN 1024u
 
 static uint8_t g_bsd_win[FW_1_BSD_WIN];
@@ -6636,7 +6644,7 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
 
         wmesg[0] = 0;
         if (mainproc >= kptr && fw_1_read_guest_va(vm, cr3, mainproc, g_bsd_win, FW_1_BSD_WIN)) {
-            char sl[200];
+            char sl[440];
             int so;
             if (!fw_1_bsd_str(vm, cr3, fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_WMESG), wmesg,
                               (unsigned)sizeof(wmesg))) {
@@ -6650,9 +6658,11 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
             /* p_stat sits in here. It is one byte among p_flag and its neighbours, and which
              * one cannot be derived without debug info -- but it is the only byte that differs
              * consistently between a sleeping thread and a running one, so dumping the run and
-             * comparing across the whole process list identifies it. */
-            for (i = 0; i < 32u; i++) {
-                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " %02x",
+             * comparing across the whole process list identifies it. Grouped in eights so the
+             * field boundaries are readable. */
+            for (i = 0; i < 64u; i++) {
+                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, "%s%02x",
+                                    ((i & 7u) == 0u) ? " " : "",
                                     g_bsd_win[FW_1_BSD_P_STATE + i]);
             }
             hype_debug_print("%s\n", sl);
