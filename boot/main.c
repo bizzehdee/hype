@@ -9164,21 +9164,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * Remote-IRR (models the LAPIC->IO-APIC EOI broadcast; without it a fresh
      * completion races a stuck Remote-IRR -> 30s ATAPI timeouts). */
     uint64_t ahci_last_eoi = 0;
-    /* M4-6d5 DIAG: once the guest is detected idle at the switch_root/OpenRC
-     * handoff (idle_probe_done), inject Magic SysRq+w ("show blocked tasks")
-     * via the PS/2 keyboard so the guest kernel itself prints the sleeping
-     * tasks' backtraces on ttyS0 -- naming the exact wait site without a
-     * KASLR slide or module symbols. Scancode set 1 (controller translation
-     * on, atkbd's default): LeftAlt 0x38, SysRq 0x54 (Alt+PrintScreen's
-     * dedicated code -> KEY_SYSRQ arms sysrq), W 0x11 (the 'w' command), then
-     * their breaks (make|0x80). Each byte needs its own IRQ1 edge (GSI1): the
-     * i8042 ISR reads one byte per interrupt, so feed the next only once the
-     * guest has read the previous (kbd OBF clear). */
-    static const uint8_t sysrq_seq[] = { 0x38u, 0x54u, 0x11u, 0x91u, 0xD4u, 0xB8u };
-    unsigned sysrq_idx = 0;
-    int sysrq_active = 0;
-    uint64_t sysrq_feed_tsc = 0; /* host TSC when the current byte was fed (stall detect) */
-    int sysrq_stall_logged = 0;
     /* M4-6d6 DIAG: the firmware/GRUB idle is a spin-wait for a 64-bit counter
      * to change. Latch its guest-VA at the idle probe and sample it on each
      * subsequent exit -- frozen => whatever should bump it (a timer/event ISR)
@@ -10252,7 +10237,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_vmm_intr_state_t ip;
                     const uint8_t *ib;
                     idle_probe_done = 1;
-                    sysrq_active = 1; /* M4-6d5: begin the SysRq+w injection below */
                     vmm_get_intr_state(kind, ctx, &ip);
                     ib = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
                     hype_debug_print(
@@ -10783,40 +10767,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * itself the answer to "does the keyboard IRQ path work in APIC
          * mode". request_interrupt queues into the pending IRR; the
          * deliver_pending_if_ready call just below stages it into EVENTINJ. */
-        if (sysrq_active && sysrq_idx < (unsigned)sizeof(sysrq_seq)) {
-            if (!hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
-                uint8_t iov;
-                hype_ps2_kbd_enqueue_scancode(&g_fw_1_ps2, sysrq_seq[sysrq_idx]);
-                sysrq_idx++;
-                sysrq_feed_tsc = hype_rdtsc();
-                if (sysrq_idx == 1u) {
-                    hype_debug_print("fw-1 SYSRQ: guest idle -- injecting Alt+SysRq+w "
-                                     "(show-blocked-tasks) via PS/2, one scancode per IRQ1 (GSI1)\n");
-                }
-                if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &iov)) {
-                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
-                } else if (!sysrq_stall_logged) {
-                    hype_debug_print("fw-1 SYSRQ: IO-APIC RTE[1]=0x%llx did not deliver (masked / "
-                                     "not Fixed) -- keyboard IRQ1 not wired by the guest in APIC mode\n",
-                                     (unsigned long long)g_fw_1_ioapic.rte[1]);
-                    sysrq_stall_logged = 1;
-                }
-                if (sysrq_idx == (unsigned)sizeof(sysrq_seq)) {
-                    hype_debug_print("fw-1 SYSRQ: full Alt+SysRq+w sequence delivered -- "
-                                     "expect blocked-task backtraces on ttyS0 below\n");
-                }
-            } else if (!sysrq_stall_logged && g_fw_1_host_tsc_hz != 0 && sysrq_feed_tsc != 0 &&
-                       hype_rdtsc() - sysrq_feed_tsc >= 2ULL * g_fw_1_host_tsc_hz) {
-                /* the fed byte has sat unread in the output buffer for 2s: the
-                 * guest never took the IRQ1 that would drain it. */
-                hype_debug_print("fw-1 SYSRQ: scancode 0x%x unread for 2s (OBF still set) -- guest "
-                                 "not servicing IRQ1; RTE[1]=0x%llx\n",
-                                 (unsigned int)sysrq_seq[sysrq_idx - 1u],
-                                 (unsigned long long)g_fw_1_ioapic.rte[1]);
-                sysrq_stall_logged = 1;
-            }
-        }
-
         /* M4-6b4/M4-6d2: deliver the highest-priority pending PIC IRQ --
          * the PIT IRQ0 clockevent (master) or the AHCI completion IRQ
          * (master or slave, via the cascade). A fully-legacy guest (our
