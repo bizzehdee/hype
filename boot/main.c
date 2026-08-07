@@ -9006,6 +9006,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * halts -- same address the compare uses, same moment.
      */
     unsigned long long idleq_hlt = 0, idleq_zero = 0, idleq_nz = 0;
+    /* #318: HLTs retired because an EVENTINJ was already staged -- the case pending_valid misses. */
+    unsigned long long hlt_retired_einj = 0;
     uint64_t idleq_last_r14 = 0;
     uint32_t idleq_last_val = 0;
     unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
@@ -9507,9 +9509,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                 }
                 hype_debug_print("fw-1 IDLEQ: idle_hlt=%llu whichqs_zero=%llu whichqs_nz=%llu "
-                                 "last_r14=0x%llx last_val=0x%x\n", idleq_hlt, idleq_zero,
-                                 idleq_nz, (unsigned long long)idleq_last_r14,
-                                 (unsigned)idleq_last_val);
+                                 "last_r14=0x%llx last_val=0x%x retired_einj=%llu\n", idleq_hlt,
+                                 idleq_zero, idleq_nz, (unsigned long long)idleq_last_r14,
+                                 (unsigned)idleq_last_val, hlt_retired_einj);
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
@@ -12167,6 +12169,30 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             (((g_fw_1_pic.master.irr & (uint8_t)~g_fw_1_pic.master.imr) != 0) ||
                              ((g_fw_1_pic.slave.irr & (uint8_t)~g_fw_1_pic.slave.imr) != 0 &&
                               (g_fw_1_pic.master.imr & (uint8_t)(1u << 2)) == 0));
+                /*
+                 * #318: an event already staged for the very next VMRUN is a wake in progress,
+                 * and the HLT must retire before it. On real hardware an interrupt that wakes a
+                 * halted CPU resumes at the instruction AFTER the HLT; if RIP still points at
+                 * the HLT when the event is injected, the CPU takes the interrupt before
+                 * executing it, pushes the HLT's own address as the return address, and IRET
+                 * lands back on the HLT. The guest then halts forever while its timer keeps
+                 * ticking -- which is exactly what OpenBSD did.
+                 *
+                 * pending_valid does NOT cover this. request_interrupt writes EVENTINJ directly
+                 * whenever the guest can accept, and only falls back to the deferred slot that
+                 * pending_valid reports when it cannot. Which of the two happens turns on the
+                 * STI shadow, and that is why this only ever showed up on one guest: Linux calls
+                 * safe_halt() with interrupts already disabled, so its STI is a 0->1 transition
+                 * that raises a shadow, can_accept is false, and the deferred path retires the
+                 * HLT correctly. OpenBSD idles at IPL_NONE with interrupts already enabled, so
+                 * its STI raises no shadow, EVENTINJ is armed directly, and the retire was
+                 * skipped. EVENTINJ ignores IF, so this must not be gated on if_set.
+                 */
+                if (((is.eventinj >> 31) & 1u) != 0u) {
+                    vmm_wake_hlt(kind, ctx);
+                    hlt_retired_einj++;
+                    continue;
+                }
                 if (if_set && (is.pending_valid || pic_ready)) {
                     vmm_wake_hlt(kind, ctx); /* retire HLT + clear STI shadow */
                     if (!vmm_deliver_pending_if_ready(kind, ctx) &&
