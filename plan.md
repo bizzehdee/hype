@@ -1075,6 +1075,19 @@ isn't lost.
       against port reordering; the same reasoning applies to a read-only
       source, where a wrong guess is a confusing failure rather than a
       dangerous one but is just as hard to diagnose.
+    - **Selection order: the configured device, else a disc, else the boot
+      disk.** An explicit `hype.cfg` device wins; failing that a host ATAPI
+      device with a readable disc in it; failing that today's behaviour (the
+      ISO file on a host volume, then raw partition 2). The disc is tried
+      *before* the file deliberately: the first implementation had it after,
+      so an operator who inserted a disc silently got whatever
+      `\iso\test.iso` happened to be sitting on the boot medium instead. An
+      empty tray falls straight through, so nothing that works today
+      regresses, and the log always names which source won -- "it booted
+      something" is not the same as "it booted what you inserted".
+      Rejected alternative: file-first with the disc as a fallback. That
+      makes the meaning of inserting a disc depend on the unrelated contents
+      of another drive.
     - **A host ATAPI (DVD-ROM) device is a first-class media source.** The
       port scan currently *requires* the non-ATAPI signature `0x00000101`,
       so a real optical drive is skipped by construction — an operator with
