@@ -55,6 +55,13 @@ int hype_log_sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write
  * returning 0 if nothing new. Returns -1 if the sink is inactive or a write
  * fails. Safe to call as often as desired.
  */
+/* #338: how many logbuf bytes have reached the file. Lets the drain loop report a growing
+ * gap between "captured" and "written" in the log itself, rather than leaving a stalled sink
+ * to be inferred from a port-access count after the fact. */
+static inline unsigned int hype_log_sink_flushed(const hype_log_sink_t *s) {
+    return s->flushed;
+}
+
 int hype_log_sink_flush(hype_log_sink_t *s);
 
 #endif /* HYPE_CORE_LOG_SINK_H */

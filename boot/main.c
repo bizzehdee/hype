@@ -15650,14 +15650,46 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      */
     {
         uint64_t drain_last_tsc = 0;
+        /*
+         * #338: PAUSE-poll on a TSC deadline, never HLT-and-hope.
+         *
+         * This loop used to `hlt` FIRST and check the interval second, so it drained only as
+         * often as something woke the BSP. Once both guests are dispatched to APs, BSP wakeups
+         * become rare -- and a BSP that is not woken simply stops draining: \HYPEFULL.LOG
+         * freezes mid-run with no error anywhere, while the guest keeps running and keeps
+         * appending to the logbuf. That is exactly what happened across the 2026-08-06 hardware
+         * runs (IOHIST counted 21,581 COM1 writes from the guest against 100 captured lines),
+         * and it misdirected three separate investigations: the log's silence was read as the
+         * GUEST stopping. usb_log_flush() already reports a failing writer, so the missing
+         * failure line was itself the clue -- the flush was never being CALLED.
+         *
+         * PAUSE rather than HLT costs one idle core (which has nothing else to do post-dispatch,
+         * by design) and buys a drain cadence that does not depend on interrupt delivery.
+         */
         for (;;) {
-            __asm__ volatile("hlt");
+            __asm__ volatile("pause");
             if (g_vms[0].host_tsc_hz != 0) {
                 uint64_t now_d = hype_rdtsc();
                 uint64_t iv = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_vms[0].host_tsc_hz;
                 if (drain_last_tsc == 0 || now_d - drain_last_tsc >= iv) {
+                    unsigned int have = hype_logbuf_len();
                     drain_last_tsc = now_d;
                     usb_log_flush(); /* no-op until a USB sink is open */
+                    /*
+                     * #338: say how much of the buffer has actually reached the file. A gap that
+                     * grows means the sink is behind or dead -- visible IN the log instead of
+                     * inferred later from an IOHIST count.
+                     */
+                    {
+                        static unsigned int last_reported;
+                        unsigned int wrote = hype_log_sink_flushed(&g_usb_log);
+                        if (have > wrote && (have - wrote) > 4096u &&
+                            (have - last_reported) > 65536u) {
+                            last_reported = have;
+                            hype_debug_print("usb-log: BEHIND -- logbuf has %u bytes, file has "
+                                             "%u (#338)\n", have, wrote);
+                        }
+                    }
                 }
             }
         }
