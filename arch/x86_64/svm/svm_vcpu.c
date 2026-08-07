@@ -1890,7 +1890,12 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
             remaining = HYPE_ATAPI_IDENTIFY_SIZE;
             status_reg = 0x50u; /* DRDY|DSC */
             error_reg = 0;
-            pis_bit = HYPE_AHCI_PIS_PSS;
+            /* #358: both bits, for the same reason as IDENTIFY DEVICE on the disk port -- this is
+             * also a PIO data-in. It has worked with PSS alone because EDK2's ATAPI probe is
+             * satisfied by the PIO Setup FIS, so this half is a correctness fix rather than a fix
+             * for an observed failure; validated in the same run as the disk change, and the CD
+             * still booting is the check that matters. */
+            pis_bit = HYPE_AHCI_PIS_DHRS | HYPE_AHCI_PIS_PSS;
             if (g_ahci_trace) {
                 hype_debug_print("ahci-trace: IDENTIFY PACKET DEVICE (0xA1) -> 512-byte PIO-in\n");
             }
@@ -2316,7 +2321,7 @@ static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, 
      * disk did not: the guest firmware issued exactly one IDENTIFY, waited at 0x20
      * for a FIS that never arrived, and dropped the device.
      */
-    if (pis_bit == HYPE_AHCI_PIS_PSS) {
+    if ((pis_bit & HYPE_AHCI_PIS_PSS) != 0) {
         hype_ahci_build_pio_setup_fis((uint8_t *)(uintptr_t)(rx_fis_host + 0x20), status_reg,
                                       error_reg, xfer_bytes);
     }
@@ -2437,7 +2442,21 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
         hype_ata_disk_build_identify(disk, identify);
         src = identify;
         remaining = HYPE_ATA_IDENTIFY_SIZE;
-        pis_bit = HYPE_AHCI_PIS_PSS;
+        /*
+         * #358: BOTH bits. A PIO data-in command raises PxIS.PSS when the PIO Setup FIS arrives
+         * and PxIS.DHRS when the closing D2H Register FIS does; real hardware sets both, and the
+         * D2H FIS is already written at receive-area offset 0x40 a few lines below regardless.
+         *
+         * This used to ASSIGN PSS, dropping DHRS. EDK2 waits at 0x20 for the PIO Setup FIS -- which
+         * is why assigning PSS fixed the earlier symptom (#262) -- and then waits for the command to
+         * COMPLETE, which is DHRS. So it got half of what it needed: it started the port, issued one
+         * IDENTIFY, saw PSS, never saw DHRS, timed out, and stopped the port again. The evidence is
+         * the port register pair, disk versus the CD on an identically-presented function:
+         *   HBA[cd-works]:   p_is=0x00000003 (DHRS|PSS)  p_cmd=0x03000000
+         *   HBA[sata-fails]: p_is=0x00000002 (PSS only)  p_cmd=0x00000000  <- port stopped again
+         * Linux and OpenBSD never noticed because they poll PxCI.
+         */
+        pis_bit = HYPE_AHCI_PIS_DHRS | HYPE_AHCI_PIS_PSS;
     } else if (fis.command == HYPE_ATA_CMD_READ_DMA_EXT || fis.command == HYPE_ATA_CMD_READ_DMA ||
                fis.command == HYPE_ATA_CMD_WRITE_DMA_EXT || fis.command == HYPE_ATA_CMD_WRITE_DMA) {
         int lba48 = hype_ata_cmd_is_lba48(fis.command);
