@@ -6934,6 +6934,11 @@ static hype_vt_render_cache_t g_dash_render_cache;
 /* PERF-2 (#234) evidence: how much the diffing renderer actually saves. Before
  * it, every render redrew cols*rows cells and pushed the whole framebuffer;
  * RENDERHIST reports what really happened so the win is measured, not assumed. */
+/* #356: COM1 register accesses split by direction (index = port - 0x3f8). File-scope so the
+ * periodic diagnostic can print them without threading them through the loop. */
+static unsigned long long g_uart_dbg_in[8];
+static unsigned long long g_uart_dbg_out[8];
+
 static uint64_t g_render_calls;
 static uint64_t g_render_pushes;
 static uint64_t g_render_cells_drawn;
@@ -9569,6 +9574,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * while pit_irq0 reads 0 is either "no tick at all" or "every tick went to the
                  * other channel"; these fields tell them apart in one line.
                  */
+                hype_debug_print("fw-1 UARTHIST: COM1 in[thr=%llu ier=%llu iir=%llu lcr=%llu "
+                                 "mcr=%llu lsr=%llu msr=%llu scr=%llu] "
+                                 "out[thr=%llu ier=%llu iir=%llu lcr=%llu mcr=%llu lsr=%llu "
+                                 "msr=%llu scr=%llu] | RTE[4]=0x%llx RTE[1]=0x%llx ier=0x%x\n",
+                                 g_uart_dbg_in[0], g_uart_dbg_in[1], g_uart_dbg_in[2],
+                                 g_uart_dbg_in[3], g_uart_dbg_in[4], g_uart_dbg_in[5],
+                                 g_uart_dbg_in[6], g_uart_dbg_in[7],
+                                 g_uart_dbg_out[0], g_uart_dbg_out[1], g_uart_dbg_out[2],
+                                 g_uart_dbg_out[3], g_uart_dbg_out[4], g_uart_dbg_out[5],
+                                 g_uart_dbg_out[6], g_uart_dbg_out[7],
+                                 (unsigned long long)g_fw_1_ioapic.rte[4],
+                                 (unsigned long long)g_fw_1_ioapic.rte[1],
+                                 (unsigned)g_fw_1_uart.ier);
                 hype_debug_print("fw-1 PITROUTE: pic_delivered=%llu apic_delivered=%llu "
                                  "apic_refused=%llu | RTE[2]=0x%llx RTE[0]=0x%llx mIMR=0x%x "
                                  "mIRR=0x%x mISR=0x%x | PIT0 mode=%u reload=%u\n",
@@ -11292,6 +11310,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* FW-1e: guest COM1 UART (0x3F8-0x3FF). TX bytes are buffered
              * in the model and drained to hype's console at the top of
              * the loop. */
+            /* #356: COM1 accesses split by direction and register. IOHIST reports 21781
+             * accesses to 0x3f8 against only ~4200 characters of captured output, and the guest
+             * goes silent after the kernel's last polled message -- so it matters whether those
+             * are the driver writing bytes that never surface, or reading a receive register
+             * that never has anything in it. One counter cannot say which. */
+            {
+                hype_vmm_ioio_t io_u;
+                vmm_peek_ioio(kind, ctx, &io_u);
+                if (io_u.port >= 0x3f8u && io_u.port <= 0x3ffu) {
+                    if (io_u.is_in) {
+                        g_uart_dbg_in[io_u.port - 0x3f8u]++;
+                    } else {
+                        g_uart_dbg_out[io_u.port - 0x3f8u]++;
+                    }
+                }
+            }
             if (vmm_handle_uart_ioio(kind, ctx, &g_fw_1_uart, HYPE_SERIAL_COM1) == 0) {
                 continue;
             }
