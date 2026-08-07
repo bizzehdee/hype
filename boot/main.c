@@ -6543,6 +6543,139 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
     return v;
 }
 
+/*
+ * #318: OpenBSD guest introspection.
+ *
+ * The RAMDISK_CD kernel is built without DDB (bsd.rd exports no db_ps), and userland never
+ * opened the console, so there is no channel to ask the guest what it is waiting on. Read it
+ * out of guest RAM instead: walk `allprocess` and, for each process, print the longest
+ * printable run in the struct (that is ps_comm) and every short .rodata string reachable
+ * through a pointer field of its main thread (one of those is p_wmesg, the wait-channel name).
+ *
+ * bsd.rd carries no debug info, so no field offset can be looked up. Only the list linkage is
+ * assumed; everything else is found by shape, and the first six words of each struct are
+ * printed so the assumed linkage can be checked against the real layout offline. The address
+ * constants below are specific to OpenBSD 7.9 RAMDISK_CD #396 and come from `nm` on the
+ * extracted bsd.rd. Read-only: this changes no guest state.
+ */
+#define FW_1_BSD_ALLPROCESS 0xffffffff819907f8ULL
+#define FW_1_BSD_RODATA_LO 0xffffffff81412000ULL
+#define FW_1_BSD_RODATA_HI 0xffffffff815cbea8ULL
+#define FW_1_BSD_PS_LIST 16u /* LIST_ENTRY(process) ps_list; le_next is its first word */
+#define FW_1_BSD_WIN 1024u
+
+static uint8_t g_bsd_win[FW_1_BSD_WIN];
+
+static uint64_t fw_1_bsd_word(const uint8_t *buf, unsigned off) {
+    uint64_t v = 0;
+    unsigned k;
+    for (k = 0; k < 8u; k++) {
+        v |= (uint64_t)buf[off + k] << (8u * k);
+    }
+    return v;
+}
+
+static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
+    const uint64_t kptr = 0xffff800000000000ULL;
+    int ok = 0;
+    uint64_t ps;
+    unsigned pn;
+
+    ps = fw_1_read_guest_u64(vm, cr3, FW_1_BSD_ALLPROCESS, &ok);
+    hype_debug_print("fw-1 BSDWALK: allprocess=0x%llx first=0x%llx ok=%d\n",
+                     (unsigned long long)FW_1_BSD_ALLPROCESS, (unsigned long long)ps, ok);
+    if (!ok) {
+        return;
+    }
+
+    for (pn = 0; pn < 12u && ps >= kptr; pn++) {
+        uint64_t mainproc;
+        uint64_t next;
+        unsigned i;
+        char run[24];
+        char best[24];
+        unsigned runlen = 0, bestoff = 0, bestlen = 0;
+
+        if (!fw_1_read_guest_va(vm, cr3, ps, g_bsd_win, FW_1_BSD_WIN)) {
+            hype_debug_print("fw-1 BSDPROC[%u] ps=0x%llx UNREADABLE\n", pn, (unsigned long long)ps);
+            return;
+        }
+        for (i = 0; i < FW_1_BSD_WIN; i++) {
+            uint8_t c = g_bsd_win[i];
+            if (c >= 0x20u && c < 0x7fu) {
+                if (runlen < sizeof(run) - 1u) {
+                    run[runlen] = (char)c;
+                }
+                runlen++;
+            } else {
+                if (runlen > bestlen) {
+                    unsigned j;
+                    bestlen = (runlen < sizeof(run) - 1u) ? runlen : (unsigned)sizeof(run) - 1u;
+                    bestoff = i - runlen;
+                    for (j = 0; j < bestlen; j++) {
+                        best[j] = run[j];
+                    }
+                    best[bestlen] = 0;
+                }
+                runlen = 0;
+            }
+        }
+        if (bestlen == 0u) {
+            best[0] = 0;
+        }
+        mainproc = fw_1_bsd_word(g_bsd_win, 0);
+        next = fw_1_bsd_word(g_bsd_win, FW_1_BSD_PS_LIST);
+        hype_debug_print("fw-1 BSDPROC[%u] ps=0x%llx comm@0x%x=\"%s\" w=[0x%llx 0x%llx 0x%llx "
+                         "0x%llx 0x%llx 0x%llx]\n",
+                         pn, (unsigned long long)ps, bestoff, best,
+                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 0),
+                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 8),
+                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 16),
+                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 24),
+                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 32),
+                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 40));
+
+        if (mainproc >= kptr && fw_1_read_guest_va(vm, cr3, mainproc, g_bsd_win, FW_1_BSD_WIN)) {
+            char sl[220];
+            int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDPROC[%u] p=0x%llx str:", pn,
+                                   (unsigned long long)mainproc);
+            unsigned nfound = 0;
+            for (i = 0; i + 8u <= FW_1_BSD_WIN && nfound < 6u; i += 8u) {
+                uint64_t p = fw_1_bsd_word(g_bsd_win, i);
+                char s[13];
+                unsigned k;
+                if (p < FW_1_BSD_RODATA_LO || p >= FW_1_BSD_RODATA_HI) {
+                    continue;
+                }
+                if (!fw_1_read_guest_va(vm, cr3, p, s, 12)) {
+                    continue;
+                }
+                for (k = 0; k < 12u; k++) {
+                    if (s[k] == 0) {
+                        break;
+                    }
+                    if (s[k] < 0x20 || s[k] >= 0x7f) {
+                        k = 99u;
+                        break;
+                    }
+                }
+                /* A wait-channel name is short, printable and NUL-terminated inside the window;
+                 * k == 0 means an empty string and k > 11 means it ran off the end or hit a
+                 * non-printable byte, so neither is one. */
+                if (k == 0u || k > 11u) {
+                    continue;
+                }
+                s[k] = 0;
+                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " +0x%x=\"%s\"", i, s);
+                nfound++;
+            }
+            hype_debug_print("%s\n", sl);
+        }
+
+        ps = next;
+    }
+}
+
 /* FW-1e: drain the guest UART's transmit ring, strip terminal escape
  * sequences (hype's GOP console can't interpret them), and emit the
  * guest's console output to hype's own console (serial + GOP) one line
@@ -9523,7 +9656,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         top[2] >= 0 ? (unsigned long long)riphist_rip[top[2]] : 0ULL,
                         top[2] >= 0 ? (unsigned long long)riphist_cnt[top[2]] : 0ULL);
                     /* #318: the kernel-only heavy hitters, six of them, so a stall can be
-                     * located in the guest kernel's own symbol table rather than guessed at. */
+                     * located in the guest kernel's own symbol table rather than guessed at.
+                     * The table is cleared after every print, so each line covers only the
+                     * window since the last one. It used to be cumulative, and twice I read a
+                     * frozen cumulative total as live activity and drew the wrong conclusion
+                     * from it -- a counter that cannot go down cannot show a guest going quiet. */
                     {
                         char kl[220];
                         int koff = hype_snprintf(kl, sizeof(kl), "fw-1 KRIPHIST:");
@@ -9550,7 +9687,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                   (unsigned long long)kriphist_cnt[best]);
                         }
                         hype_debug_print("%s\n", kl);
+                        for (kn = 0; kn < FW_1_RIPHIST_N; kn++) {
+                            kriphist_rip[kn] = 0;
+                            kriphist_cnt[kn] = 0;
+                        }
                     }
+                    fw_1_bsdwalk(vm, vmm_get_cr3(kind, ctx));
                     /* RT-2c: decode the guest instruction bytes at the #1 hot
                      * RIP -- the definitive waiting-vs-working test. F3 90 =
                      * PAUSE (spin); EC/ED = IN, EE/EF = OUT (device I/O); a
