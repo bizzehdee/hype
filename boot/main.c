@@ -6566,14 +6566,22 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
 #define FW_1_BSD_PS_COMM 0x328u  /* char ps_comm[] */
 #define FW_1_BSD_P_WMESG 0xe0u   /* struct proc: const char *p_wmesg */
 /*
- * The 32 bytes at +0xc0 turned out to be p_sleep_to, not the state: +0xc0 held a pointer to the
- * proc itself (timeout_set's to_arg) and +0xd8 read KCLOCK_NONE. p_stat is ahead of that, past
- * p_wchan and p_cpticks, so the window starts earlier and is wider. It still ends inside
- * p_sleep_to, which is deliberate -- to_flags there distinguishes a thread whose timed sleep has
- * already fired from one still waiting, and that is what separated the child of init from the
- * rest.
+ * Pinning these took three runs of dumping raw bytes and comparing across all sixteen processes,
+ * because bsd.rd ships no debug info. What is confirmed:
+ *
+ *   +0x90 p_wchan   -- swapper's reads &proc0; pagedaemon, zerothread and aiodoned read adjacent
+ *                      addresses inside the uvm global; init's reads its own struct process,
+ *                      which is what wait4 sleeps on.
+ *   +0x98 p_sleep_to -- update's to_list prev and next are equal, i.e. a one-element queue, and
+ *                      to_func at +0xb8 is the same kernel address for all sixteen (endtsleep).
+ *   +0xe0 p_wmesg   -- gives scheduler/pgdaemon/reaper/pgzero for the threads that sleep on those.
+ *
+ * p_stat is still not located: every byte from 0x80 to 0x8f reads zero for the child of init, and
+ * p_stat is never zero. So dump from offset 0 and stop guessing where it might be -- 160 bytes
+ * reaches p_wchan, so the field cannot be outside the window.
  */
-#define FW_1_BSD_P_STATE 0x80u
+#define FW_1_BSD_P_STATE 0x00u
+#define FW_1_BSD_P_STATE_LEN 160u
 #define FW_1_BSD_WIN 1024u
 
 static uint8_t g_bsd_win[FW_1_BSD_WIN];
@@ -6644,7 +6652,7 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
 
         wmesg[0] = 0;
         if (mainproc >= kptr && fw_1_read_guest_va(vm, cr3, mainproc, g_bsd_win, FW_1_BSD_WIN)) {
-            char sl[440];
+            char sl[600];
             int so;
             if (!fw_1_bsd_str(vm, cr3, fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_WMESG), wmesg,
                               (unsigned)sizeof(wmesg))) {
@@ -6660,7 +6668,7 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
              * consistently between a sleeping thread and a running one, so dumping the run and
              * comparing across the whole process list identifies it. Grouped in eights so the
              * field boundaries are readable. */
-            for (i = 0; i < 64u; i++) {
+            for (i = 0; i < FW_1_BSD_P_STATE_LEN; i++) {
                 so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, "%s%02x",
                                     ((i & 7u) == 0u) ? " " : "",
                                     g_bsd_win[FW_1_BSD_P_STATE + i]);
