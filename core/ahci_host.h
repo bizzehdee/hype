@@ -190,6 +190,17 @@ void hype_ahci_host_build_cmd_header_atapi(uint8_t slot[32], uint16_t prdtl, uin
 int hype_ahci_host_atapi_lba512_to_lba2k(uint64_t lba512, uint32_t count512, uint32_t *out_lba2k,
                                          uint16_t *out_count2k);
 
+/*
+ * #325: the most blocks one PACKET command may ask for.
+ *
+ * The byte count limit a PACKET command carries lives in two bytes of the command FIS, so it tops
+ * out at 65535 -- one byte short of 32 sectors. Asking for 32 makes the limit 0x10000, which
+ * truncates to 0 in those two fields, i.e. "you may return no data". The drive then transfers
+ * nothing and the command fails, which is exactly how a 64 KiB read of an El Torito boot image
+ * failed while every 2 KiB read succeeded. 31 blocks is 63488 bytes and fits.
+ */
+#define HYPE_AHCI_HOST_ATAPI_MAX_BLOCKS 31u
+
 /* Scans for a port with an ATAPI device attached (PxSSTS.DET == 3 and the packet signature).
  * Returns the port number, or -1. Counterpart to the hard-disk scan above, which by requiring the
  * NON-ATAPI signature skips a real optical drive by construction (#325). */

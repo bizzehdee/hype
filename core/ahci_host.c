@@ -175,7 +175,7 @@ int hype_ahci_host_build_atapi_read10(uint8_t *cmd_table, uint32_t lba2k, uint16
     uint32_t bytes;
     unsigned i;
 
-    if (count2k == 0u ||
+    if (count2k == 0u || count2k > HYPE_AHCI_HOST_ATAPI_MAX_BLOCKS ||
         (uint32_t)count2k * HYPE_AHCI_HOST_CD_SECTOR_SIZE > HYPE_AHCI_HOST_PRDT_MAX_BYTES) {
         return -1;
     }

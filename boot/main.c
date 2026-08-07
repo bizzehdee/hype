@@ -12517,7 +12517,8 @@ static int media_atapi_read(void *ctx, uint64_t lba, uint32_t count, void *dst) 
     if (!g_hostcd_present || count == 0u) {
         return -1;
     }
-    if (hype_ahci_host_atapi_lba512_to_lba2k(lba, count, &lba2k, &count2k) == 0) {
+    if (hype_ahci_host_atapi_lba512_to_lba2k(lba, count, &lba2k, &count2k) == 0 &&
+        count2k <= HYPE_AHCI_HOST_ATAPI_MAX_BLOCKS) {
         return hype_ahci_host_atapi_read(g_hostcd_abar, g_hostcd_port, lba2k, count2k, out);
     }
     while (count != 0u) {
@@ -12529,6 +12530,9 @@ static int media_atapi_read(void *ctx, uint64_t lba, uint32_t count, void *dst) 
 
         if (n2k > MEDIA_ATAPI_BOUNCE_2K) {
             n2k = MEDIA_ATAPI_BOUNCE_2K;
+        }
+        if (n2k > HYPE_AHCI_HOST_ATAPI_MAX_BLOCKS) {
+            n2k = HYPE_AHCI_HOST_ATAPI_MAX_BLOCKS; /* the PACKET byte-count limit is 16-bit */
         }
         if (hype_ahci_host_atapi_read(g_hostcd_abar, g_hostcd_port, (uint32_t)(byte_off / cd),
                                       (uint16_t)n2k, g_atapi_bounce) != 0) {
@@ -12637,6 +12641,42 @@ static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
  * #321: a media device with no write callback (a DVD-ROM, once #325 lands) refuses here rather
  * than being assumed writable -- read-only media backing a writable guest disk has to fail
  * loudly at the first write, not silently discard it. */
+/*
+ * #325: read from the device the caller was RESOLVED on, not whichever one happens to be selected
+ * when the read arrives.
+ *
+ * hostdisk_read() dispatches through the ambient g_media, and an ISO stream that stores it keeps
+ * following the selection. With a single host device those are the same thing, which is why this
+ * survived. Attach an optical drive AND an ESP disk and they are not: the guest's CD reads came off
+ * the ESP disk instead, at CD offsets, which is a SUCCESSFUL read of the wrong device returning the
+ * zeros in the pre-partition gap where the ISO's volume descriptor should be. Every read reported
+ * ret=0 and the guest simply found no filesystem.
+ *
+ * ctx carries the device index biased by one, so ctx == 0 keeps meaning "whatever is selected" for
+ * the callers that legitimately want the ambient device (the scan loops, which select it
+ * themselves).
+ */
+static int hostdisk_read_dev(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    unsigned want = (unsigned)(uintptr_t)ctx;
+    hype_media_dev_t saved;
+    int rc;
+
+    if (want == 0u) {
+        return hostdisk_read(0, lba, count, dst);
+    }
+    /* Restore the ambient selection afterwards, so a guest read cannot change which device the
+     * rest of hype is talking to -- the log writer and the guest disk backend both read g_media.
+     * The struct is pointers and one integer, so this assignment needs no memcpy (there is no
+     * libc here, and a struct containing an array would not link). */
+    saved = g_media;
+    if (media_use_dev(want - 1u) != 0) {
+        return -1;
+    }
+    rc = hostdisk_read(0, lba, count, dst);
+    g_media = saved;
+    return rc;
+}
+
 static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     (void)ctx;
     if (!media_present() || g_media.write == 0) {
@@ -12867,8 +12907,8 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                              (unsigned long long)file.extents[0].start_lba,
                              (unsigned long long)abs_lba,
                              (unsigned long long)file.size_bytes, file.count);
-            g_vms[vi].iso_stream.read = hostdisk_read;
-            g_vms[vi].iso_stream.ctx = 0;
+            g_vms[vi].iso_stream.read = hostdisk_read_dev;
+            g_vms[vi].iso_stream.ctx = (void *)(uintptr_t)(didx + 1u); /* #325 */
             /* #352: each VM streams on its own AP core, so each needs its own bounce buffer. */
             g_vms[vi].iso_stream.bounce_slot = vi;
             g_vms[vi].iso_stream.part_start_lba = abs_lba;
@@ -12956,8 +12996,8 @@ static int fw_1_resolve_media_stream(unsigned vi) {
             uint64_t blocks = (uint64_t)pvd[80] | ((uint64_t)pvd[81] << 8) |
                               ((uint64_t)pvd[82] << 16) | ((uint64_t)pvd[83] << 24);
             static uint8_t cd[8];
-            g_vms[vi].iso_stream.read = hostdisk_read;
-            g_vms[vi].iso_stream.ctx = 0;
+            g_vms[vi].iso_stream.read = hostdisk_read_dev;
+            g_vms[vi].iso_stream.ctx = (void *)(uintptr_t)(rdev + 1u); /* #325 */
             g_vms[vi].iso_stream.bounce_slot = vi; /* #352 */
             g_vms[vi].iso_stream.part_start_lba = 0u;
             g_vms[vi].iso_stream.extent_count = 0u;
@@ -12988,8 +13028,8 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                              (unsigned long long)iso_part.first_lba,
                              (unsigned long long)iso_part.last_lba,
                              (unsigned long long)iso_part.size_bytes);
-            g_vms[vi].iso_stream.read = hostdisk_read;
-            g_vms[vi].iso_stream.ctx = 0;
+            g_vms[vi].iso_stream.read = hostdisk_read_dev;
+            g_vms[vi].iso_stream.ctx = (void *)(uintptr_t)(rdev + 1u); /* #325 */
             g_vms[vi].iso_stream.bounce_slot = vi; /* #352 */
             g_vms[vi].iso_stream.part_start_lba = iso_part.first_lba;
             g_vms[vi].iso_stream.iso_size = iso_part.size_bytes;

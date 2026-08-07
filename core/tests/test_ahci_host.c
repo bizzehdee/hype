@@ -213,12 +213,26 @@ static void test_atapi_read10_cdb_and_byte_count(void) {
 
 static void test_atapi_read10_refuses_impossible_sizes(void) {
     static uint8_t ct[256];
+    const uint8_t *fis = ct + HYPE_AHCI_HOST_CT_CFIS_OFF;
     CHECK_HEX("zero sectors refused", -1, hype_ahci_host_build_atapi_read10(ct, 0, 0, 0x1000u));
-    /* One PRDT entry is 4 MiB; 2048 CD sectors is exactly that, 2049 is over. */
-    CHECK_HEX("exactly one PRDT's worth is allowed", 0,
+    /*
+     * #325: the real ceiling is the PACKET byte count limit, not the PRDT.
+     *
+     * That limit is two bytes of the command FIS, so it tops out at 65535 -- one byte short of 32
+     * sectors. Ask for 32 and the limit becomes 0x10000, whose low two bytes are both zero, so the
+     * drive is told it may return NO data and the transfer fails. This test used to assert that
+     * 2048 sectors (one PRDT entry, 4 MiB) was allowed, which had the same truncation to zero and
+     * was simply wrong: a 64 KiB read of an El Torito boot image failed on a real drive while every
+     * 2 KiB read succeeded, and that is what exposed it.
+     */
+    CHECK_HEX("the maximum, 31 sectors, is accepted", 0,
+              hype_ahci_host_build_atapi_read10(ct, 0, HYPE_AHCI_HOST_ATAPI_MAX_BLOCKS, 0x1000u));
+    CHECK_HEX("byte count limit low  = 0x00 (63488 = 0xF800)", 0x00u, fis[5]);
+    CHECK_HEX("byte count limit high = 0xF8 -- crucially NOT zero", 0xF8u, fis[6]);
+    CHECK_HEX("32 sectors refused: the limit would truncate to 0", -1,
+              hype_ahci_host_build_atapi_read10(ct, 0, 32u, 0x1000u));
+    CHECK_HEX("one PRDT's worth refused for the same reason", -1,
               hype_ahci_host_build_atapi_read10(ct, 0, 2048u, 0x1000u));
-    CHECK_HEX("one sector too many refused", -1,
-              hype_ahci_host_build_atapi_read10(ct, 0, 2049u, 0x1000u));
 }
 
 static void test_atapi_lba_conversion_refuses_misalignment(void) {
