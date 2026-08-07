@@ -48,6 +48,9 @@ typedef struct {
 
 #define HYPE_ISO_STREAM_MAX_EXTENTS 64u
 
+/* #352: one bounce buffer per concurrently-readable stream (one per VM). */
+#define HYPE_ISO_STREAM_MAX_SLOTS 2u
+
 typedef struct {
     hype_iso_disk_read_fn read;
     void *ctx;
@@ -60,6 +63,15 @@ typedef struct {
      */
     hype_iso_extent_t extents[HYPE_ISO_STREAM_MAX_EXTENTS];
     unsigned extent_count;
+    /*
+     * #352: which bounce buffer this stream fills. The buffer used to be one file-global,
+     * documented as "single-threaded use (the guest-exit path)" -- true of one guest, false of
+     * two: each VM runs its exit loop on its own AP core, so two concurrent streaming reads
+     * clobbered each other's covering sectors and both guests were handed the other's bytes.
+     * Streams that never set this share slot 0, which is correct as long as only one of them
+     * can be read at a time (the single-VM and unit-test cases).
+     */
+    unsigned bounce_slot;
 } hype_iso_stream_t;
 
 /*

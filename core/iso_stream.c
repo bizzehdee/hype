@@ -3,10 +3,15 @@
 /* Bounce buffer for one disk read: covering sectors land here, then the exact
  * requested slice is copied out. 64 KiB = 128 sectors -- well within one PRDT
  * entry (hype_ahci_host_read's 4 MiB cap), so each fill is a single command.
- * Single-threaded use (the guest-exit path), like the other device state. */
+ *
+ * #352: ONE PER SLOT, not one globally. This was a single buffer whose comment claimed
+ * "single-threaded use (the guest-exit path)" -- which held for one guest and broke for two: each
+ * VM services its own exits on its own AP core, so two streaming reads in flight overwrote each
+ * other's covering sectors. Both guests then read another VM's bytes where their ISO's Primary
+ * Volume Descriptor should be, found no filesystem, and OVMF reported the CD-ROM as Not Found. */
 #define BOUNCE_SECTORS 128u
 #define BOUNCE_BYTES (BOUNCE_SECTORS * HYPE_ISO_STREAM_SECTOR)
-static uint8_t g_bounce[BOUNCE_BYTES] __attribute__((aligned(4096)));
+static uint8_t g_bounce[HYPE_ISO_STREAM_MAX_SLOTS][BOUNCE_BYTES] __attribute__((aligned(4096)));
 
 int hype_iso_stream_locate(const hype_iso_stream_t *s, uint64_t off, uint64_t *out_lba,
                           uint32_t *out_head, uint64_t *out_run) {
@@ -65,6 +70,7 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
         uint32_t nsec;
         uint32_t avail;
         uint32_t n;
+        uint8_t *bounce;
         uint32_t i;
 
         /* #327: which disk LBA holds `cur`, and how far the run continues. */
@@ -87,7 +93,11 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
         if (nsec == 0u) {
             return -1;
         }
-        if (s->read(s->ctx, lba, nsec, g_bounce) != 0) {
+        {
+            unsigned slot = (s->bounce_slot < HYPE_ISO_STREAM_MAX_SLOTS) ? s->bounce_slot : 0u;
+            bounce = g_bounce[slot];
+        }
+        if (s->read(s->ctx, lba, nsec, bounce) != 0) {
             return -1;
         }
         avail = nsec * HYPE_ISO_STREAM_SECTOR - head; /* usable bytes this fill */
@@ -99,7 +109,7 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
             return -1; /* no forward progress -- refuse rather than spin */
         }
         for (i = 0; i < n; i++) {
-            dst[i] = g_bounce[head + i];
+            dst[i] = bounce[head + i];
         }
         dst += n;
         cur += n;

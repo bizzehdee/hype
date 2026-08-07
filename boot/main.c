@@ -12691,6 +12691,8 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                              (unsigned long long)file.size_bytes, file.count);
             g_vms[vi].iso_stream.read = hostdisk_read;
             g_vms[vi].iso_stream.ctx = 0;
+            /* #352: each VM streams on its own AP core, so each needs its own bounce buffer. */
+            g_vms[vi].iso_stream.bounce_slot = vi;
             g_vms[vi].iso_stream.part_start_lba = abs_lba;
             g_vms[vi].iso_stream.iso_size = file.size_bytes;
             /*
@@ -12763,6 +12765,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                              (unsigned long long)iso_part.size_bytes);
             g_vms[vi].iso_stream.read = hostdisk_read;
             g_vms[vi].iso_stream.ctx = 0;
+            g_vms[vi].iso_stream.bounce_slot = vi; /* #352 */
             g_vms[vi].iso_stream.part_start_lba = iso_part.first_lba;
             g_vms[vi].iso_stream.iso_size = iso_part.size_bytes;
             if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
@@ -15540,6 +15543,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         unsigned ei;
         g_vms[1].iso_stream.read = g_vms[0].iso_stream.read;
         g_vms[1].iso_stream.ctx = g_vms[0].iso_stream.ctx;
+        /* #352: the SAME media, but read concurrently on a different core -- so a slot of its
+         * own, deliberately not copied from vm0 along with everything else. */
+        g_vms[1].iso_stream.bounce_slot = 1u;
         g_vms[1].iso_stream.part_start_lba = g_vms[0].iso_stream.part_start_lba;
         g_vms[1].iso_stream.iso_size = g_vms[0].iso_stream.iso_size;
         g_vms[1].iso_stream.extent_count = g_vms[0].iso_stream.extent_count;
