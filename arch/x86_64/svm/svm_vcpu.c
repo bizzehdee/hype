@@ -857,6 +857,17 @@ void hype_svm_set_ps2_trace(int enabled) {
  * we can see exactly what OVMF's AtaAtapiPassThru/ScsiDisk stack asks
  * the emulated CD-ROM for during boot-device discovery. Off by default;
  * FW-1's guest turns it on right before launch. */
+/*
+ * #318: the per-MMIO ABAR trace is separately gated. It is ~20x the volume of the CDB trace
+ * (every register poll, and a polling driver does thousands per command), and each line is
+ * GOP-rendered -- which is what turned a 33-second kernel load into 20+ minutes and made the
+ * instrument unusable for reaching the point we actually need to observe. The CDB trace alone
+ * answers "which command is the guest stuck on"; opt into the register firehose only when the
+ * question is about register semantics.
+ */
+#ifndef HYPE_318_TRACE_MMIO
+#define HYPE_318_TRACE_MMIO 0
+#endif
 static int g_ahci_trace = 0;
 
 /* #315: how often an IDT-delivery event was re-staged or refused. Counters rather than a
@@ -2149,7 +2160,7 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
         } else {
             value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
         }
-        if (g_ahci_trace) {
+        if (HYPE_318_TRACE_MMIO && g_ahci_trace) {
             hype_debug_print("ahci-trace: ABAR write off=0x%x val=0x%x\n", (unsigned int)offset,
                               (unsigned int)value);
         }
@@ -2215,7 +2226,7 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
         if (hype_ahci_mmio_read(ahci, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        if (g_ahci_trace) {
+        if (HYPE_318_TRACE_MMIO && g_ahci_trace) {
             hype_debug_print("ahci-trace: ABAR read  off=0x%x val=0x%x\n", (unsigned int)offset,
                               (unsigned int)value);
         }
