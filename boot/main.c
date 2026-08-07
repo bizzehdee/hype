@@ -12415,6 +12415,32 @@ static int media_use_dev(unsigned i) {
     return 0;
 }
 
+/*
+ * #325: bind a VM's ISO stream to the DEVICE it was resolved on.
+ *
+ * The streams used to store hostdisk_read, which dispatches through the ambient g_media, so a
+ * stream followed whatever device happened to be selected when the guest asked rather than the one
+ * it was resolved on. With one host device those are the same thing, which is why it survived.
+ * Attach an optical drive AND an ESP disk and they are not: the guest's CD reads came off the ESP
+ * disk at CD offsets -- a SUCCESSFUL read of the wrong device, returning the zeros in the
+ * pre-partition gap where the volume descriptor should be, with every read reporting ret=0.
+ *
+ * Bind straight to the device's own read function rather than re-selecting per read. An earlier
+ * attempt did the latter and had to save and restore g_media around every read to avoid changing
+ * what the rest of hype was talking to; that still broke the file-backed path. Touching no global
+ * at all is both simpler and the only version that cannot have this class of bug. Every media
+ * read function ignores ctx, but it is carried anyway so the contract stays honest.
+ */
+static void iso_stream_bind_dev(hype_iso_stream_t *st, unsigned devidx) {
+    if (devidx >= g_media_dev_count) {
+        st->read = 0; /* leaves the stream unusable, which hype_iso_stream_read reports */
+        st->ctx = 0;
+        return;
+    }
+    st->read = g_media_devs[devidx].read;
+    st->ctx = g_media_devs[devidx].ctx;
+}
+
 /* Binds the media device to the AHCI port host discovery selected. */
 static void media_select_ahci(void) {
     media_add_dev(media_ahci_read, media_ahci_write, "ahci", g_hostdisk_serial);
@@ -12641,42 +12667,6 @@ static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
  * #321: a media device with no write callback (a DVD-ROM, once #325 lands) refuses here rather
  * than being assumed writable -- read-only media backing a writable guest disk has to fail
  * loudly at the first write, not silently discard it. */
-/*
- * #325: read from the device the caller was RESOLVED on, not whichever one happens to be selected
- * when the read arrives.
- *
- * hostdisk_read() dispatches through the ambient g_media, and an ISO stream that stores it keeps
- * following the selection. With a single host device those are the same thing, which is why this
- * survived. Attach an optical drive AND an ESP disk and they are not: the guest's CD reads came off
- * the ESP disk instead, at CD offsets, which is a SUCCESSFUL read of the wrong device returning the
- * zeros in the pre-partition gap where the ISO's volume descriptor should be. Every read reported
- * ret=0 and the guest simply found no filesystem.
- *
- * ctx carries the device index biased by one, so ctx == 0 keeps meaning "whatever is selected" for
- * the callers that legitimately want the ambient device (the scan loops, which select it
- * themselves).
- */
-static int hostdisk_read_dev(void *ctx, uint64_t lba, uint32_t count, void *dst) {
-    unsigned want = (unsigned)(uintptr_t)ctx;
-    hype_media_dev_t saved;
-    int rc;
-
-    if (want == 0u) {
-        return hostdisk_read(0, lba, count, dst);
-    }
-    /* Restore the ambient selection afterwards, so a guest read cannot change which device the
-     * rest of hype is talking to -- the log writer and the guest disk backend both read g_media.
-     * The struct is pointers and one integer, so this assignment needs no memcpy (there is no
-     * libc here, and a struct containing an array would not link). */
-    saved = g_media;
-    if (media_use_dev(want - 1u) != 0) {
-        return -1;
-    }
-    rc = hostdisk_read(0, lba, count, dst);
-    g_media = saved;
-    return rc;
-}
-
 static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     (void)ctx;
     if (!media_present() || g_media.write == 0) {
@@ -12819,6 +12809,10 @@ static int fw_1_resolve_media_stream(unsigned vi) {
         int have_file = 0;
         unsigned pidx;
         unsigned didx; /* #324 */
+        /* #325: the device the file was found on. didx is the LOOP variable and the stream setup
+         * below sits OUTSIDE the loop, so by then didx has run past the match -- binding the stream
+         * to it left the stream pointing at no device at all. Record the match where it happens. */
+        unsigned file_dev = 0u;
         const char *media_path = fw_1_media_path(vi); /* #322 */
         /* Scan up to the first 4 GPT partitions for \iso\test.iso,
          * trying FAT32 then exFAT on each. This covers both the ISO
@@ -12851,10 +12845,12 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                 hype_debug_print("host-fat: vm%u resolved %s on FAT32 partition %u "
                                  "of the %s device\n", vi, media_path, pidx, g_media.bus);
                 have_file = 1;
+                file_dev = didx; /* #325 */
             } else if (hype_exfat_resolve(fatvol_read, 0, media_path, &file) == 0) {
                 hype_debug_print("host-fat: vm%u resolved %s on exFAT partition %u "
                                  "of the %s device\n", vi, media_path, pidx, g_media.bus);
                 have_file = 1;
+                file_dev = didx; /* #325 */
             } else if (hype_ext_resolve(fatvol_read, 0, media_path, &file) == 0) {
                 /*
                  * #320: ext too, matching the guest disk-image path
@@ -12875,6 +12871,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                 hype_debug_print("host-fat: vm%u resolved %s on ext partition %u "
                                  "of the %s device\n", vi, media_path, pidx, g_media.bus);
                 have_file = 1;
+                file_dev = didx; /* #325 */
             }
         }
         /* #346: per-device probe cost, printed + flushed even when nothing resolved -- the next
@@ -12907,8 +12904,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                              (unsigned long long)file.extents[0].start_lba,
                              (unsigned long long)abs_lba,
                              (unsigned long long)file.size_bytes, file.count);
-            g_vms[vi].iso_stream.read = hostdisk_read_dev;
-            g_vms[vi].iso_stream.ctx = (void *)(uintptr_t)(didx + 1u); /* #325 */
+            iso_stream_bind_dev(&g_vms[vi].iso_stream, file_dev); /* #325 */
             /* #352: each VM streams on its own AP core, so each needs its own bounce buffer. */
             g_vms[vi].iso_stream.bounce_slot = vi;
             g_vms[vi].iso_stream.part_start_lba = abs_lba;
@@ -12996,8 +12992,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
             uint64_t blocks = (uint64_t)pvd[80] | ((uint64_t)pvd[81] << 8) |
                               ((uint64_t)pvd[82] << 16) | ((uint64_t)pvd[83] << 24);
             static uint8_t cd[8];
-            g_vms[vi].iso_stream.read = hostdisk_read_dev;
-            g_vms[vi].iso_stream.ctx = (void *)(uintptr_t)(rdev + 1u); /* #325 */
+            iso_stream_bind_dev(&g_vms[vi].iso_stream, rdev); /* #325 */
             g_vms[vi].iso_stream.bounce_slot = vi; /* #352 */
             g_vms[vi].iso_stream.part_start_lba = 0u;
             g_vms[vi].iso_stream.extent_count = 0u;
@@ -13028,8 +13023,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                              (unsigned long long)iso_part.first_lba,
                              (unsigned long long)iso_part.last_lba,
                              (unsigned long long)iso_part.size_bytes);
-            g_vms[vi].iso_stream.read = hostdisk_read_dev;
-            g_vms[vi].iso_stream.ctx = (void *)(uintptr_t)(rdev + 1u); /* #325 */
+            iso_stream_bind_dev(&g_vms[vi].iso_stream, rdev); /* #325 */
             g_vms[vi].iso_stream.bounce_slot = vi; /* #352 */
             g_vms[vi].iso_stream.part_start_lba = iso_part.first_lba;
             g_vms[vi].iso_stream.iso_size = iso_part.size_bytes;
