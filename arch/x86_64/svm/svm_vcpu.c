@@ -1953,6 +1953,19 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
             static unsigned g_stream_dbg = 0;
             int srr = hype_iso_stream_read(atapi->media_stream, media_byte_off + transferred, dst,
                                            chunk);
+            /* #346: the loader stops after reading root-dir LBA 51 and never fetches /etc
+             * (LBA 56), so dump the exact bytes delivered for the DIRECTORY sectors -- those
+             * decide what it looks for next. QEMU reads 56; real hardware does not, with every
+             * layer below byte-perfect, so what it PARSED from 51 is the open question. */
+            if (result.media_lba == 51u || result.media_lba == 56u) {
+                hype_debug_print("dirsec lba=%llu off=%llu: %02x %02x %02x %02x %02x %02x %02x %02x "
+                                 "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                 (unsigned long long)result.media_lba,
+                                 (unsigned long long)(media_byte_off + transferred),
+                                 dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7],
+                                 dst[8], dst[9], dst[10], dst[11], dst[12], dst[13], dst[14],
+                                 dst[15]);
+            }
             if (g_stream_dbg < 6u || srr != 0) {
                 g_stream_dbg++;
                 /* #346: include the first 8 bytes AS DELIVERED TO GUEST RAM. On real hardware the
