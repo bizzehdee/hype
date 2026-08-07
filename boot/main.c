@@ -6561,7 +6561,13 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
 #define FW_1_BSD_ALLPROCESS 0xffffffff819907f8ULL
 #define FW_1_BSD_RODATA_LO 0xffffffff81412000ULL
 #define FW_1_BSD_RODATA_HI 0xffffffff815cbea8ULL
-#define FW_1_BSD_PS_LIST 16u /* LIST_ENTRY(process) ps_list; le_next is its first word */
+/*
+ * Confirmed against a live guest by the raw-word dump below, not guessed: ps_list.le_prev read
+ * back as &allprocess, which can only be true at this offset, and ps_threads.tqh_first matched
+ * ps_mainproc. The layout is refcnt(+0) mainproc(+8) ucred(+16) list(+24) threads(+40).
+ */
+#define FW_1_BSD_PS_MAINPROC 8u
+#define FW_1_BSD_PS_LIST 24u /* LIST_ENTRY(process) ps_list; le_next is its first word */
 #define FW_1_BSD_WIN 1024u
 
 static uint8_t g_bsd_win[FW_1_BSD_WIN];
@@ -6588,7 +6594,7 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
         return;
     }
 
-    for (pn = 0; pn < 12u && ps >= kptr; pn++) {
+    for (pn = 0; pn < 32u && ps >= kptr; pn++) {
         uint64_t mainproc;
         uint64_t next;
         unsigned i;
@@ -6623,7 +6629,7 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
         if (bestlen == 0u) {
             best[0] = 0;
         }
-        mainproc = fw_1_bsd_word(g_bsd_win, 0);
+        mainproc = fw_1_bsd_word(g_bsd_win, FW_1_BSD_PS_MAINPROC);
         next = fw_1_bsd_word(g_bsd_win, FW_1_BSD_PS_LIST);
         hype_debug_print("fw-1 BSDPROC[%u] ps=0x%llx comm@0x%x=\"%s\" w=[0x%llx 0x%llx 0x%llx "
                          "0x%llx 0x%llx 0x%llx]\n",
@@ -6637,8 +6643,12 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
 
         if (mainproc >= kptr && fw_1_read_guest_va(vm, cr3, mainproc, g_bsd_win, FW_1_BSD_WIN)) {
             char sl[220];
-            int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDPROC[%u] p=0x%llx str:", pn,
-                                   (unsigned long long)mainproc);
+            int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDPROC[%u] p=0x%llx w=[0x%llx 0x%llx "
+                                   "0x%llx 0x%llx] str:", pn, (unsigned long long)mainproc,
+                                   (unsigned long long)fw_1_bsd_word(g_bsd_win, 0),
+                                   (unsigned long long)fw_1_bsd_word(g_bsd_win, 8),
+                                   (unsigned long long)fw_1_bsd_word(g_bsd_win, 16),
+                                   (unsigned long long)fw_1_bsd_word(g_bsd_win, 24));
             unsigned nfound = 0;
             for (i = 0; i + 8u <= FW_1_BSD_WIN && nfound < 6u; i += 8u) {
                 uint64_t p = fw_1_bsd_word(g_bsd_win, i);
