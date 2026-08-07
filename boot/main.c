@@ -6582,6 +6582,8 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
  */
 #define FW_1_BSD_P_STAT 0x65u    /* char p_stat: 2=SRUN 3=SSLEEP 7=SONPROC */
 #define FW_1_BSD_P_WCHAN 0x90u
+#define FW_1_BSD_P_RUNQ 0x00u    /* TAILQ_ENTRY(proc) p_runq is the first field */
+#define FW_1_BSD_P_CPU 0xf0u     /* struct cpu_info *p_cpu, past p_wmesg/p_pctcpu/p_slptime */
 #define FW_1_BSD_P_STATE 0x60u
 #define FW_1_BSD_P_STATE_LEN 16u
 /*
@@ -6630,12 +6632,22 @@ static int fw_1_bsd_str(hype_fw_vm_t *vm, uint64_t cr3, uint64_t p, char *out, u
  *
  * The process walk found four threads in SRUN while the CPU ran idle0 and halted. Either the
  * scheduler does not know the queues are occupied, or it knows and never switches -- those are
- * different faults, and spc_whichqs is the bit of state that tells them apart, because it is
- * exactly what the idle loop tests before it halts.
+ * different faults, and spc_whichqs is the state that tells them apart, because it is exactly
+ * what the idle loop tests before it halts.
+ *
+ * The anchor is found, not assumed: spc_idleproc holds the idle thread's proc address, and the
+ * 32 spc_qs heads follow it. An empty TAILQ head has a null tqh_first, so occupancy needs no
+ * further offset. The first attempt read tqh_last instead of tqh_first and listed addresses
+ * rather than a mask, which overran the line at queue 10 -- and the four runnable threads sit at
+ * priority 0x32, so they belong in queue 12. Report a bitmask so no queue can fall off the end.
  */
+#define FW_1_BSD_SPC_QS 16u  /* spc_qs[0] follows spc_idleproc, which follows ci_curproc */
+
 static void fw_1_bsd_sched(hype_fw_vm_t *vm, uint64_t cr3, uint64_t idle_p) {
     uint64_t base = 0;
     unsigned chunk;
+    uint32_t occupied = 0;
+    unsigned q;
 
     if (idle_p == 0) {
         return;
@@ -6653,43 +6665,51 @@ static void fw_1_bsd_sched(hype_fw_vm_t *vm, uint64_t cr3, uint64_t idle_p) {
         }
     }
     if (base == 0) {
-        hype_debug_print("fw-1 BSDSCHED: spc_idleproc not found for idle p=0x%llx\n",
+        hype_debug_print("fw-1 BSDSCHED: anchor not found for idle p=0x%llx\n",
                          (unsigned long long)idle_p);
         return;
     }
 
-    /* spc_qs[32] follows spc_idleproc. An empty TAILQ head has a null tqh_first, so the occupied
-     * queues can be listed without knowing any further offset. */
     {
         static char sl[300];
-        int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: spc_idleproc@0x%llx qs:",
-                               (unsigned long long)base);
-        unsigned q;
-        for (q = 0; q < 32u; q += 64u / 8u) {
+        int so;
+        for (q = 0; q < 32u; q += 8u) {
             unsigned j;
-            if (!fw_1_read_guest_va(vm, cr3, base + 8u + (uint64_t)q * 16u, g_bsd_win, 128u)) {
+            if (!fw_1_read_guest_va(vm, cr3, base + FW_1_BSD_SPC_QS + (uint64_t)q * 16u,
+                                    g_bsd_win, 128u)) {
                 break;
             }
             for (j = 0; j < 8u; j++) {
-                uint64_t first = fw_1_bsd_word(g_bsd_win, j * 16u);
-                if (first != 0) {
-                    so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " [%u]=0x%llx",
-                                        q + j, (unsigned long long)first);
+                if (fw_1_bsd_word(g_bsd_win, j * 16u) != 0) {
+                    occupied |= (uint32_t)1u << (q + j);
                 }
             }
+        }
+        so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: base=0x%llx occupied=0x%08x",
+                           (unsigned long long)base, (unsigned)occupied);
+        for (q = 0; q < 32u; q++) {
+            int ok = 0;
+            uint64_t first;
+            if ((occupied & ((uint32_t)1u << q)) == 0u) {
+                continue;
+            }
+            first = fw_1_read_guest_u64(vm, cr3, base + FW_1_BSD_SPC_QS + (uint64_t)q * 16u, &ok);
+            so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " q%u=0x%llx", q,
+                                (unsigned long long)first);
         }
         hype_debug_print("%s\n", sl);
     }
 
-    /* spc_whichqs lives past the queues, behind spc_deadproc, spc_runtime, spc_schedflags,
-     * spc_schedticks and spc_cp_time. Dump the run rather than guess: it must equal the bitmask
-     * of the occupied queues printed above, which identifies it on sight. */
+    /* spc_whichqs lives past the 32 queue heads, behind spc_deadproc, spc_runtime,
+     * spc_schedflags, spc_schedticks and spc_cp_time. Dump the run rather than guess: it must
+     * equal the occupancy mask above, which identifies it on sight. */
     {
         static char sl[420];
+        uint64_t at = base + FW_1_BSD_SPC_QS + 512u;
         int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDSCHED: post-qs@0x%llx:",
-                               (unsigned long long)(base + 8u + 512u));
+                               (unsigned long long)at);
         unsigned i;
-        if (fw_1_read_guest_va(vm, cr3, base + 8u + 512u, g_bsd_win, 128u)) {
+        if (fw_1_read_guest_va(vm, cr3, at, g_bsd_win, 128u)) {
             for (i = 0; i < 128u; i++) {
                 so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, "%s%02x",
                                     ((i & 7u) == 0u) ? " " : "", g_bsd_win[i]);
@@ -6736,7 +6756,7 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
 
         wmesg[0] = 0;
         if (mainproc >= kptr && fw_1_read_guest_va(vm, cr3, mainproc, g_bsd_win, FW_1_BSD_WIN)) {
-            char sl[260];
+            char sl[340];
             int so;
             if (!fw_1_bsd_str(vm, cr3, fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_WMESG), wmesg,
                               (unsigned)sizeof(wmesg))) {
@@ -6752,6 +6772,11 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
                                (unsigned long long)fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_WCHAN),
                                (unsigned long long)ps, (unsigned long long)mainproc,
                                FW_1_BSD_P_STATE);
+            so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so,
+                                " cpu=0x%llx runq=[0x%llx 0x%llx]",
+                                (unsigned long long)fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_CPU),
+                                (unsigned long long)fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_RUNQ),
+                                (unsigned long long)fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_RUNQ + 8u));
             /* p_stat sits in here. It is one byte among p_flag and its neighbours, and which
              * one cannot be derived without debug info -- but it is the only byte that differs
              * consistently between a sleeping thread and a running one, so dumping the run and
