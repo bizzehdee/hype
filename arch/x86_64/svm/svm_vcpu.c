@@ -1986,7 +1986,7 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                                  dst[8], dst[9], dst[10], dst[11], dst[12], dst[13], dst[14],
                                  dst[15]);
             }
-            if (g_stream_dbg < 6u || srr != 0) {
+            if (g_stream_dbg < 24u || srr != 0) {
                 g_stream_dbg++;
                 /* #346: include the first 8 bytes AS DELIVERED TO GUEST RAM. On real hardware the
                  * guests retry LBA 0/16 forever with every layer below proven byte-perfect -- this
