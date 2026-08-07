@@ -8728,12 +8728,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 #define FW_1_RIPHIST_N 24
     uint64_t riphist_rip[FW_1_RIPHIST_N];
     uint64_t riphist_cnt[FW_1_RIPHIST_N];
+    /* #318: a SECOND histogram holding only kernel-mode addresses. The table above is global
+     * over the whole run and its heavy hitters are all sub-2GB addresses from the OVMF and
+     * boot-loader phase, which survive long after those are gone and crowd out the guest kernel
+     * entirely -- reading them as live userland activity was a wrong call already made once.
+     * Guest-kernel RIPs resolve against the guest's own symbol table, which is what turns a
+     * sample into an answer. */
+    uint64_t kriphist_rip[FW_1_RIPHIST_N];
+    uint64_t kriphist_cnt[FW_1_RIPHIST_N];
+    unsigned kseen[6];
     unsigned long long preempt_kernel = 0, preempt_user = 0, preempt_lowmem = 0;
     {
         int rh;
         for (rh = 0; rh < FW_1_RIPHIST_N; rh++) {
             riphist_rip[rh] = 0;
             riphist_cnt[rh] = 0;
+            kriphist_rip[rh] = 0;
+            kriphist_cnt[rh] = 0;
         }
     }
     int booted = 0;
@@ -9511,6 +9522,35 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         top[1] >= 0 ? (unsigned long long)riphist_cnt[top[1]] : 0ULL,
                         top[2] >= 0 ? (unsigned long long)riphist_rip[top[2]] : 0ULL,
                         top[2] >= 0 ? (unsigned long long)riphist_cnt[top[2]] : 0ULL);
+                    /* #318: the kernel-only heavy hitters, six of them, so a stall can be
+                     * located in the guest kernel's own symbol table rather than guessed at. */
+                    {
+                        char kl[220];
+                        int koff = hype_snprintf(kl, sizeof(kl), "fw-1 KRIPHIST:");
+                        unsigned kn;
+                        for (kn = 0; kn < 6u; kn++) {
+                            int best = -1;
+                            unsigned kh;
+                            for (kh = 0; kh < FW_1_RIPHIST_N; kh++) {
+                                if (kriphist_cnt[kh] == 0) continue;
+                                if (best < 0 || kriphist_cnt[kh] > kriphist_cnt[best]) {
+                                    int already = 0;
+                                    unsigned kj;
+                                    for (kj = 0; kj < kn; kj++) {
+                                        if (kseen[kj] == kh) { already = 1; break; }
+                                    }
+                                    if (!already) best = (int)kh;
+                                }
+                            }
+                            if (best < 0) break;
+                            kseen[kn] = (unsigned)best;
+                            koff += hype_snprintf(kl + koff, sizeof(kl) - (unsigned)koff,
+                                                  " 0x%llx=%llu",
+                                                  (unsigned long long)kriphist_rip[best],
+                                                  (unsigned long long)kriphist_cnt[best]);
+                        }
+                        hype_debug_print("%s\n", kl);
+                    }
                     /* RT-2c: decode the guest instruction bytes at the #1 hot
                      * RIP -- the definitive waiting-vs-working test. F3 90 =
                      * PAUSE (spin); EC/ED = IN, EE/EF = OUT (device I/O); a
@@ -10723,6 +10763,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
                 if (rip >= 0xffff800000000000ULL) {
                     preempt_kernel++;
+                    /* #318: same space-saving table, kernel addresses only. */
+                    {
+                        int kfree = -1, kfound = -1, kmin = -1;
+                        unsigned kh;
+                        for (kh = 0; kh < FW_1_RIPHIST_N; kh++) {
+                            if (kriphist_cnt[kh] == 0) {
+                                if (kfree < 0) kfree = (int)kh;
+                                continue;
+                            }
+                            if (kriphist_rip[kh] == rip) { kfound = (int)kh; break; }
+                            if (kmin < 0 || kriphist_cnt[kh] < kriphist_cnt[kmin]) kmin = (int)kh;
+                        }
+                        if (kfound >= 0) {
+                            kriphist_cnt[kfound]++;
+                        } else if (kfree >= 0) {
+                            kriphist_rip[kfree] = rip;
+                            kriphist_cnt[kfree] = 1;
+                        } else if (kmin >= 0) {
+                            kriphist_rip[kmin] = rip;
+                            kriphist_cnt[kmin]++;
+                        }
+                    }
                 } else if (rip >= 0x1000ULL && rip < 0x0000800000000000ULL) {
                     preempt_user++;
                 } else {
