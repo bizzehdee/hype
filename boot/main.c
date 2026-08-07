@@ -6548,26 +6548,24 @@ static uint64_t fw_1_read_guest_u64(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva
  *
  * The RAMDISK_CD kernel is built without DDB (bsd.rd exports no db_ps), and userland never
  * opened the console, so there is no channel to ask the guest what it is waiting on. Read it
- * out of guest RAM instead: walk `allprocess` and, for each process, print the longest
- * printable run in the struct (that is ps_comm) and every short .rodata string reachable
- * through a pointer field of its main thread (one of those is p_wmesg, the wait-channel name).
+ * out of guest RAM instead: walk `allprocess` and print each process's name, the wait channel
+ * its main thread is sleeping on, and the bytes around the thread's state field.
  *
- * bsd.rd carries no debug info, so no field offset can be looked up. Only the list linkage is
- * assumed; everything else is found by shape, and the first six words of each struct are
- * printed so the assumed linkage can be checked against the real layout offline. The address
- * constants below are specific to OpenBSD 7.9 RAMDISK_CD #396 and come from `nm` on the
- * extracted bsd.rd. Read-only: this changes no guest state.
+ * bsd.rd carries no debug info, so no offset could be looked up. Every offset below was instead
+ * confirmed against a live guest by an earlier build that dumped raw words and searched by
+ * shape: ps_list.le_prev read back as &allprocess, ps_threads.tqh_first matched ps_mainproc,
+ * and p_wmesg gave "scheduler" for swapper, "pgdaemon" for pagedaemon and "reaper" for reaper,
+ * which is what OpenBSD sleeps those threads on. The addresses are specific to OpenBSD 7.9
+ * RAMDISK_CD #396 and come from `nm` on the extracted bsd.rd. Read-only: no guest state changes.
  */
 #define FW_1_BSD_ALLPROCESS 0xffffffff819907f8ULL
 #define FW_1_BSD_RODATA_LO 0xffffffff81412000ULL
 #define FW_1_BSD_RODATA_HI 0xffffffff815cbea8ULL
-/*
- * Confirmed against a live guest by the raw-word dump below, not guessed: ps_list.le_prev read
- * back as &allprocess, which can only be true at this offset, and ps_threads.tqh_first matched
- * ps_mainproc. The layout is refcnt(+0) mainproc(+8) ucred(+16) list(+24) threads(+40).
- */
-#define FW_1_BSD_PS_MAINPROC 8u
-#define FW_1_BSD_PS_LIST 24u /* LIST_ENTRY(process) ps_list; le_next is its first word */
+#define FW_1_BSD_PS_MAINPROC 8u  /* struct process: refcnt(+0) mainproc(+8) ucred(+16) */
+#define FW_1_BSD_PS_LIST 24u     /* LIST_ENTRY(process) ps_list; le_next is its first word */
+#define FW_1_BSD_PS_COMM 0x328u  /* char ps_comm[] */
+#define FW_1_BSD_P_WMESG 0xe0u   /* struct proc: const char *p_wmesg */
+#define FW_1_BSD_P_STATE 0xc0u   /* the flag/state bytes ahead of p_wmesg */
 #define FW_1_BSD_WIN 1024u
 
 static uint8_t g_bsd_win[FW_1_BSD_WIN];
@@ -6579,6 +6577,27 @@ static uint64_t fw_1_bsd_word(const uint8_t *buf, unsigned off) {
         v |= (uint64_t)buf[off + k] << (8u * k);
     }
     return v;
+}
+
+/* Copy a guest C string only if it really is one: short, printable and NUL-terminated inside
+ * the window. Anything else is a stale or misread pointer and must not reach the log. */
+static int fw_1_bsd_str(hype_fw_vm_t *vm, uint64_t cr3, uint64_t p, char *out, unsigned cap) {
+    unsigned k;
+    if (p < FW_1_BSD_RODATA_LO || p >= FW_1_BSD_RODATA_HI) {
+        return 0;
+    }
+    if (!fw_1_read_guest_va(vm, cr3, p, out, cap - 1u)) {
+        return 0;
+    }
+    for (k = 0; k < cap - 1u; k++) {
+        if (out[k] == 0) {
+            return k != 0u;
+        }
+        if (out[k] < 0x20 || out[k] >= 0x7f) {
+            return 0;
+        }
+    }
+    return 0;
 }
 
 static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
@@ -6595,91 +6614,51 @@ static void fw_1_bsdwalk(hype_fw_vm_t *vm, uint64_t cr3) {
     }
 
     for (pn = 0; pn < 32u && ps >= kptr; pn++) {
-        uint64_t mainproc;
-        uint64_t next;
+        uint64_t mainproc, next;
+        char comm[17];
+        char wmesg[13];
         unsigned i;
-        char run[24];
-        char best[24];
-        unsigned runlen = 0, bestoff = 0, bestlen = 0;
 
         if (!fw_1_read_guest_va(vm, cr3, ps, g_bsd_win, FW_1_BSD_WIN)) {
             hype_debug_print("fw-1 BSDPROC[%u] ps=0x%llx UNREADABLE\n", pn, (unsigned long long)ps);
             return;
         }
-        for (i = 0; i < FW_1_BSD_WIN; i++) {
-            uint8_t c = g_bsd_win[i];
-            if (c >= 0x20u && c < 0x7fu) {
-                if (runlen < sizeof(run) - 1u) {
-                    run[runlen] = (char)c;
-                }
-                runlen++;
-            } else {
-                if (runlen > bestlen) {
-                    unsigned j;
-                    bestlen = (runlen < sizeof(run) - 1u) ? runlen : (unsigned)sizeof(run) - 1u;
-                    bestoff = i - runlen;
-                    for (j = 0; j < bestlen; j++) {
-                        best[j] = run[j];
-                    }
-                    best[bestlen] = 0;
-                }
-                runlen = 0;
-            }
-        }
-        if (bestlen == 0u) {
-            best[0] = 0;
-        }
         mainproc = fw_1_bsd_word(g_bsd_win, FW_1_BSD_PS_MAINPROC);
         next = fw_1_bsd_word(g_bsd_win, FW_1_BSD_PS_LIST);
-        hype_debug_print("fw-1 BSDPROC[%u] ps=0x%llx comm@0x%x=\"%s\" w=[0x%llx 0x%llx 0x%llx "
-                         "0x%llx 0x%llx 0x%llx]\n",
-                         pn, (unsigned long long)ps, bestoff, best,
-                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 0),
-                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 8),
-                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 16),
-                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 24),
-                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 32),
-                         (unsigned long long)fw_1_bsd_word(g_bsd_win, 40));
+        for (i = 0; i < 16u; i++) {
+            uint8_t c = g_bsd_win[FW_1_BSD_PS_COMM + i];
+            comm[i] = (c >= 0x20u && c < 0x7fu) ? (char)c : 0;
+            if (comm[i] == 0) {
+                break;
+            }
+        }
+        comm[16] = 0;
 
+        wmesg[0] = 0;
         if (mainproc >= kptr && fw_1_read_guest_va(vm, cr3, mainproc, g_bsd_win, FW_1_BSD_WIN)) {
-            char sl[220];
-            int so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDPROC[%u] p=0x%llx w=[0x%llx 0x%llx "
-                                   "0x%llx 0x%llx] str:", pn, (unsigned long long)mainproc,
-                                   (unsigned long long)fw_1_bsd_word(g_bsd_win, 0),
-                                   (unsigned long long)fw_1_bsd_word(g_bsd_win, 8),
-                                   (unsigned long long)fw_1_bsd_word(g_bsd_win, 16),
-                                   (unsigned long long)fw_1_bsd_word(g_bsd_win, 24));
-            unsigned nfound = 0;
-            for (i = 0; i + 8u <= FW_1_BSD_WIN && nfound < 6u; i += 8u) {
-                uint64_t p = fw_1_bsd_word(g_bsd_win, i);
-                char s[13];
-                unsigned k;
-                if (p < FW_1_BSD_RODATA_LO || p >= FW_1_BSD_RODATA_HI) {
-                    continue;
-                }
-                if (!fw_1_read_guest_va(vm, cr3, p, s, 12)) {
-                    continue;
-                }
-                for (k = 0; k < 12u; k++) {
-                    if (s[k] == 0) {
-                        break;
-                    }
-                    if (s[k] < 0x20 || s[k] >= 0x7f) {
-                        k = 99u;
-                        break;
-                    }
-                }
-                /* A wait-channel name is short, printable and NUL-terminated inside the window;
-                 * k == 0 means an empty string and k > 11 means it ran off the end or hit a
-                 * non-printable byte, so neither is one. */
-                if (k == 0u || k > 11u) {
-                    continue;
-                }
-                s[k] = 0;
-                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " +0x%x=\"%s\"", i, s);
-                nfound++;
+            char sl[200];
+            int so;
+            if (!fw_1_bsd_str(vm, cr3, fw_1_bsd_word(g_bsd_win, FW_1_BSD_P_WMESG), wmesg,
+                              (unsigned)sizeof(wmesg))) {
+                wmesg[0] = '-';
+                wmesg[1] = 0;
+            }
+            so = hype_snprintf(sl, sizeof(sl), "fw-1 BSDPROC[%u] comm=\"%s\" wmesg=\"%s\" "
+                               "ps=0x%llx p=0x%llx st@0x%x:", pn, comm, wmesg,
+                               (unsigned long long)ps, (unsigned long long)mainproc,
+                               FW_1_BSD_P_STATE);
+            /* p_stat sits in here. It is one byte among p_flag and its neighbours, and which
+             * one cannot be derived without debug info -- but it is the only byte that differs
+             * consistently between a sleeping thread and a running one, so dumping the run and
+             * comparing across the whole process list identifies it. */
+            for (i = 0; i < 32u; i++) {
+                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so, " %02x",
+                                    g_bsd_win[FW_1_BSD_P_STATE + i]);
             }
             hype_debug_print("%s\n", sl);
+        } else {
+            hype_debug_print("fw-1 BSDPROC[%u] comm=\"%s\" ps=0x%llx p=0x%llx NO-THREAD\n", pn,
+                             comm, (unsigned long long)ps, (unsigned long long)mainproc);
         }
 
         ps = next;
