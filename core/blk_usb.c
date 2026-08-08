@@ -16,16 +16,67 @@
  * (shared state, two cores); same cure as #338's logbuf: a test-and-set spinlock around the
  * whole synchronous command, held across the chunk loop so a logical transfer is atomic.
  */
-static volatile int g_usb_xfer_lock;
+/*
+ * #362: a TICKET lock, not test-and-set.
+ *
+ * The original was a plain exchange-and-spin, which has no fairness. Once #360 let a second AP
+ * start on the Intel box, three cores contended here: two APs streaming their guests' ISOs off the
+ * USB stick, and the BSP flushing the log. Two APs issuing back-to-back reads can hold an unfair
+ * lock effectively continuously, and the third contender may never win it. The BSP owns the
+ * keyboard, the dashboard AND the log, so starving it takes all three away at once while the
+ * guests keep running -- which is exactly what was observed: terminal switching dead, dashboard
+ * timer frozen, log stopped, guest I/O still climbing.
+ *
+ * A ticket lock serves in arrival order, so every waiter is guaranteed to be served after at most
+ * the waiters ahead of it. It costs one extra atomic per acquisition, against a USB transfer that
+ * is orders of magnitude more expensive.
+ */
+static volatile unsigned int g_usb_ticket_next;   /* next ticket handed out */
+static volatile unsigned int g_usb_ticket_owner;  /* ticket currently served */
+
+/*
+ * #362: measurement, kept in tree deliberately.
+ *
+ * The starvation above is a hypothesis until a counter says otherwise -- and on this project a
+ * bounded trace has read as "the event never happened" often enough that counters are the rule.
+ * These make the next run decisive whether or not the ticket lock fixes it: if the BSP's wait
+ * diverges from the APs', that was the cause; if it does not, the freeze is somewhere else.
+ */
+static volatile unsigned long long g_usb_lock_acquires;
+static volatile unsigned long long g_usb_lock_spins;      /* total spin iterations, all cores */
+static volatile unsigned long long g_usb_lock_max_spins;  /* worst single acquisition */
+static volatile unsigned int g_usb_lock_max_spin_apic;    /* which core suffered it */
+
+static unsigned int usb_xfer_this_apic(void) {
+    return (*(volatile uint32_t *)(uintptr_t)0xFEE00020u) >> 24;
+}
 
 static void usb_xfer_lock(void) {
-    while (__atomic_exchange_n(&g_usb_xfer_lock, 1, __ATOMIC_ACQUIRE) != 0) {
+    unsigned int me = __atomic_fetch_add(&g_usb_ticket_next, 1u, __ATOMIC_ACQ_REL);
+    unsigned long long spins = 0;
+    while (__atomic_load_n(&g_usb_ticket_owner, __ATOMIC_ACQUIRE) != me) {
         __builtin_ia32_pause();
+        spins++;
+    }
+    __atomic_fetch_add(&g_usb_lock_acquires, 1ull, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_usb_lock_spins, spins, __ATOMIC_RELAXED);
+    if (spins > __atomic_load_n(&g_usb_lock_max_spins, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&g_usb_lock_max_spins, spins, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_usb_lock_max_spin_apic, usb_xfer_this_apic(), __ATOMIC_RELAXED);
     }
 }
 
 static void usb_xfer_unlock(void) {
-    __atomic_store_n(&g_usb_xfer_lock, 0, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&g_usb_ticket_owner, 1u, __ATOMIC_RELEASE);
+}
+
+void hype_blk_usb_lock_stats(unsigned long long *acquires, unsigned long long *spins,
+                             unsigned long long *max_spins, unsigned int *max_spin_apic) {
+    if (acquires != 0) *acquires = __atomic_load_n(&g_usb_lock_acquires, __ATOMIC_RELAXED);
+    if (spins != 0) *spins = __atomic_load_n(&g_usb_lock_spins, __ATOMIC_RELAXED);
+    if (max_spins != 0) *max_spins = __atomic_load_n(&g_usb_lock_max_spins, __ATOMIC_RELAXED);
+    if (max_spin_apic != 0)
+        *max_spin_apic = __atomic_load_n(&g_usb_lock_max_spin_apic, __ATOMIC_RELAXED);
 }
 
 static int usb_read(void *hw, uint64_t lba, uint32_t count, void *buf) {

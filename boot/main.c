@@ -31,6 +31,7 @@
 #include "../devices/nvme.h" /* #202 */
 #include "../core/ahci_host.h"
 #include "../core/disk_inventory.h"
+#include "../core/cpu_topology.h"
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
 #include "../core/fat.h"
@@ -1284,14 +1285,82 @@ static inline uint64_t hype_rdtsc(void);
  * against the LAPIC being armed+counting (LVT unmasked, IRR bit set), proves
  * "timer fired but SVM did not exit" (guest-IF/V_INTR_MASKING gating) vs
  * "timer never fired" (LAPIC stopped). */
+/*
+ * #360: the host's real APIC IDs, enumerated from EFI_MP_SERVICES_PROTOCOL before
+ * ExitBootServices (see efi_main). Empty if the protocol was unavailable.
+ */
+static hype_cpu_topology_t g_cpu_topo;
+
+/* The APIC ID actually used for each AP slot, recorded at start time so the
+ * LAPIC-timer ISR below can map a core back to its slot. Sparse IDs mean the ID
+ * is no longer usable as an index. */
+static uint8_t g_ap_slot_apic_id[HYPE_FW_MAX_VMS];
+static int g_ap_slot_valid[HYPE_FW_MAX_VMS];
+
+/*
+ * #360: the APIC ID for AP slot `n`, from the enumerated topology.
+ *
+ * Falls back to the old literal (n + 1) when enumeration produced nothing, so a
+ * machine whose firmware lacks EFI_MP_SERVICES_PROTOCOL behaves exactly as it
+ * did before -- this replaces an assumption with a fact where a fact is
+ * available, and does not make a working machine stop working where it is not.
+ *
+ * Truncated to 8 bits because hype_ap_start() sends INIT/SIPI through the xAPIC
+ * ICR, whose destination field is 8 bits. A machine reporting APIC IDs above 255
+ * is running in x2APIC mode and would need the x2APIC ICR MSR instead; that is
+ * out of scope here and is reported rather than silently mis-addressed.
+ */
+static int fw_1_ap_apic_id(unsigned int n) {
+    int64_t id;
+    if (g_cpu_topo.count == 0u) {
+        /* Enumeration produced nothing (no EFI_MP_SERVICES_PROTOCOL). Keep the
+         * pre-#360 literal so a machine that worked before still works: this
+         * replaces an assumption with a fact where a fact is available, and does
+         * not break machines where it is not. */
+        return (int)(n + 1u);
+    }
+    id = hype_cpu_topology_ap(&g_cpu_topo, n);
+    if (id < 0) {
+        /* Enumeration WORKED and says there is no such core. Falling back to a
+         * literal here would re-create the exact bug this fixes -- addressing an
+         * AP that does not exist -- so refuse, and let the caller say so. */
+        return -1;
+    }
+    if (id > 255) {
+        /* hype_ap_start() sends INIT/SIPI through the xAPIC ICR, whose
+         * destination field is 8 bits. An ID above 255 means the machine is in
+         * x2APIC mode and needs the x2APIC ICR MSR instead -- out of scope here,
+         * and reported rather than silently mis-addressed. */
+        hype_debug_print("fw-1 #360: AP slot %u has APIC ID %llu, above the 8-bit xAPIC ICR "
+                         "destination field -- cannot start this core via the xAPIC path\n",
+                         n, (unsigned long long)id);
+        return -1;
+    }
+    return (int)id;
+}
+
+/* Which AP slot this APIC ID belongs to, or -1. Replaces using the ID as an
+ * array index, which only worked while IDs were assumed to be 0,1,2. */
+static int fw_1_ap_slot_of(uint32_t apic_id) {
+    unsigned i;
+    for (i = 0; i < HYPE_FW_MAX_VMS; i++) {
+        if (g_ap_slot_valid[i] && g_ap_slot_apic_id[i] == (uint8_t)apic_id) return (int)i;
+    }
+    return -1;
+}
+
 static volatile uint64_t g_ap_timer_ticks[HYPE_FW_MAX_VMS + 1];
 static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
     (void)frame;
     {
         uint32_t apic_id =
             (*(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + 0x20u)) >> 24;
-        if (apic_id <= HYPE_FW_MAX_VMS) {
-            g_ap_timer_ticks[apic_id]++;
+        /* #360: by SLOT, not by APIC ID -- sparse IDs are not array indices.
+         * Slot 0 is AP1/vm0, slot 1 is AP2/vm1; index +1 keeps the old layout
+         * where element 0 was the (never-counted) BSP. */
+        int slot = fw_1_ap_slot_of(apic_id);
+        if (slot >= 0) {
+            g_ap_timer_ticks[slot + 1]++;
         }
     }
     *(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + HYPE_LAPIC_EOI_OFFSET) = 0;
@@ -9242,6 +9311,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
 #endif
                 }
+                {
+                    /* #362: is the BSP being starved on the USB transfer lock? max_apic names the
+                     * core that waited longest -- BSP (0) diverging from the guest APs is the
+                     * signature of the freeze where the keyboard, dashboard and log all stop while
+                     * the guests keep running. */
+                    unsigned long long la = 0, ls = 0, lm = 0;
+                    unsigned int lapic = 0;
+                    hype_blk_usb_lock_stats(&la, &ls, &lm, &lapic);
+                    if (la != 0) {
+                        hype_debug_print("fw-1 USBLOCK: acquires=%llu spins=%llu avg=%llu "
+                                         "max=%llu on apic=%u [#362]\n", la, ls, ls / la, lm,
+                                         lapic);
+                    }
+                }
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
@@ -9826,7 +9909,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 /* STEP 2a: second AP (apic_id=2) bring-up result, likewise
                  * re-emitted so it survives to login. rc=0 => hype started a
                  * SECOND core -- the foundation for two Alpines on two cores. */
-                hype_debug_print("fw-1 AP2: rc=%d (apic_id=2)\n", g_fw_1_ap2_rc);
+                hype_debug_print("fw-1 AP2: rc=%d (apic_id=%u)\n", g_fw_1_ap2_rc, (unsigned)g_ap_slot_apic_id[1]);
                 /* DEFINITIVE which-core check: the physical LAPIC ID (reg 0x20,
                  * bits 31:24) of the core actually executing this dispatch loop.
                  * BSP = 0, AP = 1. Removes all doubt about whether the guest is
@@ -14433,6 +14516,85 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * above -- must happen before ExitBootServices(). A GOP-less system
      * isn't fatal: serial remains available regardless, so just note it
      * and move on rather than hype_panic(). */
+    /*
+     * #360: enumerate the host's REAL local-APIC IDs, here, because
+     * EFI_MP_SERVICES_PROTOCOL is a Boot Services protocol and disappears at
+     * ExitBootServices -- while the APs are started long afterwards.
+     *
+     * hype used to start APs by literal ID (1 for the first, 2 for the second),
+     * i.e. it assumed IDs run 0,1,2 from the BSP. True on the AMD laptop; false
+     * on a hybrid Intel part, where ID 2 does not answer. The second VM then
+     * never ran despite its RAM, firmware and media all resolving -- it looked
+     * like a configuration fault rather than a missing CPU.
+     *
+     * Enumeration failing is NOT fatal: the fallback below keeps the old
+     * literals, so a machine without the protocol behaves exactly as before.
+     */
+    {
+        static EFI_GUID mp_guid = EFI_MP_SERVICES_PROTOCOL_GUID;
+        EFI_MP_SERVICES_PROTOCOL *mp = 0;
+        hype_cpu_topology_reset(&g_cpu_topo);
+        if (SystemTable->BootServices->LocateProtocol(&mp_guid, 0, (void **)&mp) == EFI_SUCCESS &&
+            mp != 0) {
+            UINTN total = 0, enabled = 0;
+            if (mp->GetNumberOfProcessors(mp, &total, &enabled) == EFI_SUCCESS) {
+                UINTN i;
+                for (i = 0; i < total; i++) {
+                    EFI_PROCESSOR_INFORMATION pi;
+                    if (mp->GetProcessorInfo(mp, i, &pi) != EFI_SUCCESS) continue;
+                    (void)hype_cpu_topology_add_at(
+                        &g_cpu_topo, (uint32_t)pi.ProcessorId,
+                        (pi.StatusFlag & HYPE_MP_PROCESSOR_AS_BSP_BIT) != 0,
+                        (pi.StatusFlag & HYPE_MP_PROCESSOR_ENABLED_BIT) != 0,
+                        (uint32_t)pi.Location.Package, (uint32_t)pi.Location.Core,
+                        (uint32_t)pi.Location.Thread);
+                }
+            }
+        }
+        {
+            /* Print the whole list. On the machine that exposed this, the useful
+             * fact was not "enumeration worked" but WHICH ids exist -- and
+             * whether the old assumption would have held here. */
+            unsigned ci;
+            char ids[320];
+            int off = hype_snprintf(ids, sizeof(ids), "cpu: APIC IDs");
+            for (ci = 0; ci < g_cpu_topo.count && off > 0 && (unsigned)off < sizeof(ids); ci++) {
+                int n = hype_snprintf(ids + off, sizeof(ids) - (unsigned)off, " %u[p%u/c%u/t%u]%s",
+                                      (unsigned)g_cpu_topo.apic_id[ci],
+                                      (unsigned)g_cpu_topo.loc[ci].package,
+                                      (unsigned)g_cpu_topo.loc[ci].core,
+                                      (unsigned)g_cpu_topo.loc[ci].thread,
+                                      (g_cpu_topo.have_bsp && ci == g_cpu_topo.bsp_index) ? "(BSP)"
+                                                                                          : "");
+                if (n <= 0) break;
+                off += n;
+            }
+            {
+                /*
+                 * UEFI has no notion of core TYPE -- a P-core and an E-core are
+                 * both just "an AP" here. On current Intel hybrid parts P-cores
+                 * are SMT and E-cores are not, so the SMT count is a usable
+                 * proxy for the P-core count until CPUID leaf 0x1A is read on
+                 * each core (it reports only the core executing it).
+                 */
+                unsigned ncores = 0, nsmt = 0;
+                hype_cpu_topology_core_summary(&g_cpu_topo, &ncores, &nsmt);
+                hype_debug_print(
+                                   "cpu: %u physical core(s), %u with SMT -- on an Intel hybrid "
+                                   "part that is the P-core count (E-cores are single-threaded); "
+                                   "UEFI cannot tell them apart, CPUID leaf 0x1A can [#360]\n",
+                                   ncores, nsmt);
+            }
+            hype_debug_print(
+                               "%s -- %u usable, %u AP(s), consecutive=%d%s [#360]\n", ids,
+                               g_cpu_topo.count, hype_cpu_topology_ap_count(&g_cpu_topo),
+                               hype_cpu_topology_is_consecutive(&g_cpu_topo),
+                               g_cpu_topo.count == 0u ? " -- ENUMERATION FAILED, falling back to "
+                                                        "the old hardcoded ids 1 and 2"
+                                                      : "");
+        }
+    }
+
     status = hype_gop_locate(SystemTable->BootServices, &gop);
     have_gop = (status == EFI_SUCCESS);
     if (!have_gop) {
@@ -16215,20 +16377,31 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * keyboard right now. */
             fw_1_await_phys_confirm_on_bsp();
             usb_log_latch_bsp_core();
-            int ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 1u,
+            /* #360: the FIRST enumerated AP, not the literal id 1. See fw_1_ap_apic_id(). */
+            int ap1_sel = fw_1_ap_apic_id(0u);
+            uint8_t ap1_id = (uint8_t)((ap1_sel < 0) ? 1 : ap1_sel);
+            if (ap1_sel < 0) {
+                hype_debug_print("fw-1 #360: no application processor available -- this machine "
+                                 "reports %u usable CPU(s); no guest can run on an AP\n",
+                                 g_cpu_topo.count);
+            }
+            g_ap_slot_apic_id[0] = ap1_id;
+            g_ap_slot_valid[0] = 1;
+            int ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, ap1_id,
                                       (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                                       (uint64_t)(uintptr_t)(g_ap_stack + sizeof(g_ap_stack)),
                                       g_fw_1_host_tsc_hz, fw_1_ap_main, 0);
             g_fw_1_ap_rc = ap_rc;
             hype_debug_print(
-                "fw-1 AP-SMOKETEST: apic_id=1 tramp=0x%llx cr3=0x%llx -> rc=%d (long-mode reached=%s), "
+                "fw-1 AP-SMOKETEST: apic_id=%u tramp=0x%llx cr3=0x%llx -> rc=%d (long-mode reached=%s), "
                 "last_phase=%u (0=none 1=real 2=prot 3=long) c_entry_ran=%u ap_vmm_ok=%u\n",
-                (unsigned long long)g_ap_tramp_page, (unsigned long long)cr3, ap_rc,
+                (unsigned)ap1_id, (unsigned long long)g_ap_tramp_page, (unsigned long long)cr3,
+                ap_rc,
                 (ap_rc == 0) ? "yes" : "NO", (unsigned int)g_hype_ap_last_phase,
                 (unsigned int)g_hype_ap_c_alive, (unsigned int)g_fw_1_ap_vmm_ok);
 
             /*
-             * STEP 2a: bring up a SECOND AP (apic_id=2) to prove hype can start
+             * STEP 2a: bring up a SECOND AP (the second ENUMERATED id -- #360) to prove hype can start
              * more than one core -- the foundation for two Alpines on two cores.
              * This one just PARKS (hype_ap_entry: sets alive, cli/hlt); STEP 2c
              * will hand it g_vms[1] once VM1's resources exist. Safe to reuse
@@ -16249,16 +16422,37 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * leaving a started AP with nothing to do. */
                 void (*ap2_entry)(void *) = fw_1_want_two_vms() ? fw_1_ap_main : hype_ap_entry;
                 void *ap2_arg = fw_1_want_two_vms() ? (void *)(uintptr_t)1u : (void *)0;
-                int ap2_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, 2u,
+                int ap2_sel = fw_1_ap_apic_id(1u);
+                uint8_t ap2_id;
+                if (ap2_sel < 0) {
+                    /* #360: enumeration says this machine has no second AP. Do not
+                     * send INIT/SIPI to a made-up ID and then report a mysterious
+                     * timeout -- that is precisely how the Intel failure presented,
+                     * as a VM whose RAM, firmware and media all resolved and which
+                     * then silently never ran. State the reason instead. */
+                    g_fw_1_ap2_rc = -5;
+                    hype_debug_print(
+                        "fw-1 AP2: NOT STARTED -- this machine reports %u usable CPU(s), %u "
+                        "AP(s); there is no second application processor to place vm1 on. "
+                        "vm1 will not run. [#360]\n",
+                        g_cpu_topo.count, hype_cpu_topology_ap_count(&g_cpu_topo));
+                    goto ap2_done;
+                }
+                ap2_id = (uint8_t)ap2_sel;
+                g_ap_slot_apic_id[1] = ap2_id;
+                g_ap_slot_valid[1] = 1;
+                int ap2_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
+                                           ap2_id,
                                            (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                                            (uint64_t)(uintptr_t)(g_ap2_stack + sizeof(g_ap2_stack)),
                                            g_fw_1_host_tsc_hz, ap2_entry, ap2_arg);
                 g_fw_1_ap2_rc = ap2_rc;
                 hype_debug_print(
-                    "fw-1 AP2-SMOKETEST: apic_id=2 -> rc=%d (long-mode reached=%s), "
+                    "fw-1 AP2-SMOKETEST: apic_id=%u -> rc=%d (long-mode reached=%s), "
                     "last_phase=%u (0=none 1=real 2=prot 3=long)\n",
-                    ap2_rc, (ap2_rc == 0) ? "yes" : "NO",
+                    (unsigned)ap2_id, ap2_rc, (ap2_rc == 0) ? "yes" : "NO",
                     (unsigned int)g_hype_ap_last_phase);
+            ap2_done:;
             }
         }
     }

@@ -33,4 +33,11 @@ void hype_blk_usb_init(hype_blk_usb_t *hw, hype_blk_phys_t *p, hype_blk_backend_
                        const hype_xhci_msc_eps_t *msc, unsigned int block_size,
                        uint64_t total_sectors);
 
+/*
+ * #362: USB transfer-lock contention counters. `max_spin_apic` names the core that waited longest,
+ * which is what distinguishes "the BSP is being starved" from "everyone waits a bit".
+ */
+void hype_blk_usb_lock_stats(unsigned long long *acquires, unsigned long long *spins,
+                             unsigned long long *max_spins, unsigned int *max_spin_apic);
+
 #endif /* HYPE_CORE_BLK_USB_H */
