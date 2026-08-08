@@ -74,8 +74,12 @@ grep -aqE "panic:|Fatal trap" "$LOG" && panicked=1
 
 echo "score: reached_installer=$reached guest_panic=$panicked"
 if [ "$panicked" = 1 ]; then
-    echo "---- guest fault detail (#343: resolve this RIP against the FreeBSD kernel symbols) ----"
-    grep -aE -A 12 "Fatal trap" "$LOG" | head -40
+    echo "---- guest fault detail (#343: resolve these against the FreeBSD kernel symbols) ----"
+    # Match "panic:" as well as "Fatal trap", and print CONTEXT BEFORE it too. The first fault
+    # actually caught was `panic: vm_fault_lookup: fault on nofault entry, addr: 0x...` with a KDB
+    # backtrace and NO "Fatal trap" line at all -- so a Fatal-trap-only grep scored the run as
+    # failed and then printed nothing, which is the worst of both.
+    grep -aE -B 4 -A 22 "panic:|Fatal trap" "$LOG" | head -60
     echo "----------------------------------------------------------------------------------------"
 fi
 
