@@ -115,6 +115,28 @@ void hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t 
 int hype_ahci_host_find_sata_port(uint64_t abar_phys);
 
 /*
+ * #258: the same scan, resumable. Returns the first matching port at or after
+ * `start_port`, or -1 when there are no more.
+ *
+ * The single-shot version above returns only the LOWEST matching port, and the
+ * whole host-disk path was built on that one value -- so hype could see exactly
+ * one SATA disk per controller and a `physical:` target on any other port was
+ * unreachable by construction. Callers that need every disk (the inventory in
+ * boot/main.c) iterate with this instead. Same PHY-settle retry as the
+ * single-shot scan, because it IS that scan -- not a second copy that would
+ * drift from it.
+ */
+int hype_ahci_host_find_sata_port_from(uint64_t abar_phys, unsigned int start_port);
+
+/*
+ * #258: does `port` carry a device matching the current scan? One port only, so a caller can walk
+ * 0..31 in a SINGLE pass and inventory what it finds. Re-entering the whole scan per disk made
+ * enumeration quadratic -- each call re-polls the empty tail with the PHY-settle retry -- and that
+ * alone stalled host discovery past a 110-second timeout.
+ */
+int hype_ahci_host_port_matches(uint64_t abar_phys, unsigned int port);
+
+/*
  * Diagnostic: log CAP + PI and, for each implemented port, PxSSTS (DET/SPD/IPM),
  * PxSIG, PxCMD, PxTFD. Read-only. Called when find_sata_port finds nothing so a
  * real-HW log shows WHY (e.g. DET != 3 -> no PHY / disk asleep, or a signature

@@ -30,6 +30,7 @@
 #include "../core/blk_usb.h"
 #include "../devices/nvme.h" /* #202 */
 #include "../core/ahci_host.h"
+#include "../core/disk_inventory.h"
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
 #include "../core/fat.h"
@@ -1074,6 +1075,17 @@ static char g_phys_target_serial[21];
 
 static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
                                     * `physical:` target, exactly as g_hostnvme_serial */
+
+/*
+ * #258: every host disk found, on every port of every controller.
+ *
+ * g_hostdisk_* still names the ONE disk hype reads and may write through, so nothing downstream
+ * changed. This is what that one is chosen FROM -- previously it was whichever disk happened to sit
+ * on the lowest implemented port, and a `physical:` target on any other port could never be
+ * selected. It is also what lets a serial mismatch say WHICH disks are actually present, instead of
+ * leaving "not in this machine" and "here but never scanned" indistinguishable.
+ */
+static hype_disk_inventory_t g_disk_inv;
 static hype_blk_phys_ahci_t g_hostdisk_ahci; /* backend hw ctx (outlives the VM) */
 
 static int term_streq(const char *a, const char *b) {
@@ -7081,6 +7093,7 @@ static int fw_1_phys_target_matches(const char *drive_serial) {
     return (g_phys_target_serial[0] != '\0') && term_streq(g_phys_target_serial, drive_serial);
 }
 
+
 /* Defined with the media plumbing further down; declared here because the physical-target scope
  * resolution below sits with the guest-disk setup. Both read their own device DISK-ABSOLUTELY. */
 static int media_ahci_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
@@ -7215,6 +7228,27 @@ static hype_media_dev_t g_media;
 static uint64_t g_hostnvme_scope_sectors;
 
 static hype_cfg_t g_hype_cfg;
+
+/*
+ * #258: does ANY configured VM name this drive as its `physical:` target?
+ *
+ * Distinct from fw_1_phys_target_matches() above, which asks about the serial the operator has
+ * already CONFIRMED. This one runs during host discovery, long before any confirmation exists, and
+ * answers only "is this the disk the config is asking for" -- which is what port selection needs.
+ * Selection is not permission: every existing gate (identity match, non-empty guard, interactive
+ * confirm) still stands between this and a single byte being written.
+ */
+static int fw_1_cfg_names_physical_serial(const char *drive_serial) {
+    unsigned vi;
+    if (drive_serial == 0 || drive_serial[0] == '\0') return 0;
+    for (vi = 0; vi < g_hype_cfg.vm_count; vi++) {
+        const hype_cfg_target_disk_t *td = &g_hype_cfg.vms[vi].target_disk;
+        if (td->kind == HYPE_CFG_DISK_PHYSICAL && term_streq(td->path_or_id, drive_serial)) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 /*
  * #333: which guest-facing front-end this VM's disk is presented on.
@@ -15100,6 +15134,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* Diagnostic census FIRST: log every PCI function so the real-HW log shows
      * exactly what the machine exposes before the per-class probes run. */
     pci_dump_all();
+    /* #258: start the disk inventory empty before the first discovery pass, rather than relying on
+     * .bss zeroing -- this runs once per boot, and an inventory that silently carried entries over
+     * would be a very confusing thing to debug. */
+    hype_disk_inventory_reset(&g_disk_inv);
     {
         static uint8_t g_nvme_probe[512] __attribute__((aligned(4096)));
         hype_host_storage_t hn;
@@ -15166,6 +15204,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  g_hostnvme_serial, nvme_model,
                                  (unsigned long long)g_hostnvme_total_sectors,
                                  (unsigned long long)(g_hostnvme_total_sectors / 2048ull));
+                /* #258: NVMe drives go in the same inventory as the SATA ones, so a serial
+                 * mismatch can list EVERY disk in the machine rather than only the disks found
+                 * on the bus that happened to be scanned. */
+                (void)hype_disk_inventory_add(&g_disk_inv, HYPE_DISK_BUS_NVME, hn.bar_phys, 0u,
+                                              g_hostnvme_serial, nvme_model,
+                                              g_hostnvme_total_sectors);
                 if (hype_nvme_host_read(hn.bar_phys, 1u, 1u, g_nvme_lba1) != 0) {
                     hype_serial_print("host-nvme: LBA1 read failed -- phys-write not armed\n");
                 } else {
@@ -15821,7 +15865,54 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                      (unsigned)hs.dev, (unsigned)hs.func);
                 }
             }
-            sp = hype_ahci_host_find_sata_port(hs.bar_phys);
+            /*
+             * #258: walk EVERY port of this controller once, inventory each disk, and pick the one
+             * a `physical:` target names -- falling back to the first, which is what the old
+             * single-shot scan always returned.
+             *
+             * Ordering is the whole point. The identity capture and the phys-write arming below run
+             * against `sp`, so choosing here is what makes a target on port 1 reachable; selecting
+             * afterwards would have listed the right disk in the log and still armed against the
+             * wrong one. A single walk, not one scan per disk: re-entering the scan made
+             * enumeration quadratic and stalled discovery outright (see hype_ahci_host_port_matches).
+             */
+            sp = -1;
+            {
+                unsigned pp;
+                for (pp = 0; pp < 32u; pp++) {
+                    static uint8_t inv_id[512] __attribute__((aligned(4096)));
+                    hype_host_disk_info_t idi;
+                    if (!hype_ahci_host_port_matches(hs.bar_phys, pp)) continue;
+                    if (hype_ahci_host_init(hs.bar_phys, pp) != 0 ||
+                        hype_ahci_host_identify(hs.bar_phys, pp, inv_id) != 0) {
+                        hype_debug_print("host-disk: port %u has a disk but would not identify -- "
+                                         "not inventoried [#258]\n", pp);
+                        continue;
+                    }
+                    hype_ahci_host_parse_identify(inv_id, &idi);
+                    if (hype_disk_inventory_add(&g_disk_inv, HYPE_DISK_BUS_AHCI, hs.bar_phys, pp,
+                                                idi.serial, idi.model, idi.total_sectors) != 0) {
+                        hype_debug_print("host-disk: inventory FULL -- %02x:%02x.%x port %u not "
+                                         "recorded [#258]\n", (unsigned)hs.bus, (unsigned)hs.dev,
+                                         (unsigned)hs.func, pp);
+                    } else {
+                        hype_debug_print("host-disk: inventory + %02x:%02x.%x port %u serial='%s' "
+                                         "model='%s' sectors=%llu [#258]\n", (unsigned)hs.bus,
+                                         (unsigned)hs.dev, (unsigned)hs.func, pp, idi.serial,
+                                         idi.model, (unsigned long long)idi.total_sectors);
+                    }
+                    if (sp < 0) sp = (int)pp; /* first disk: the historical choice */
+                    if (fw_1_cfg_names_physical_serial(idi.serial) && sp != (int)pp) {
+                        hype_debug_print("host-disk: port %u is the configured `physical:` target "
+                                         "'%s' -- selecting it over the first-found disk on port "
+                                         "%d [#258]\n", pp, idi.serial, sp);
+                        sp = (int)pp;
+                    }
+                }
+                /* Each init above re-pointed its port at hype's structures; leave the port hype
+                 * will actually use as the last one programmed. */
+                if (sp >= 0) (void)hype_ahci_host_init(hs.bar_phys, (unsigned)sp);
+            }
             if (sp < 0) {
                 hype_debug_print("host-ahci: controller at %02x:%02x.%x (bar 0x%llx) present but "
                                  "no active SATA disk port found\n", (unsigned)hs.bus,
@@ -15925,6 +16016,45 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         hype_serial_print("host-disk: IDENTIFY failed\n");
                     }
                 }
+            }
+        }
+    }
+
+    /*
+     * #258: after every controller has been walked, say plainly when a configured target is not
+     * among the disks that were found -- and list what WAS found.
+     *
+     * Selection itself already happened per controller, above. This exists purely because the
+     * diagnostic gap mattered as much as the bug: a serial mismatch could not distinguish "that
+     * disk is not in this machine" from "that disk is here, on a port hype never scanned", and
+     * those call for completely different operator responses.
+     *
+     * A duplicate serial is reported too. Two drives answering to one name makes "matched by
+     * serial" ambiguous, and choosing one to WRITE to is not a decision hype gets to make.
+     */
+    {
+        unsigned vi;
+        for (vi = 0; vi < g_hype_cfg.vm_count; vi++) {
+            const hype_cfg_target_disk_t *td = &g_hype_cfg.vms[vi].target_disk;
+            unsigned dup, k;
+            if (td->kind != HYPE_CFG_DISK_PHYSICAL || td->path_or_id[0] == '\0') continue;
+            dup = hype_disk_inventory_count_serial(&g_disk_inv, td->path_or_id);
+            if (dup > 1u) {
+                hype_debug_print("host-disk: vm '%s' target '%s' matches %u disks -- ambiguous; "
+                                 "hype will not guess which one to write to [#258]\n",
+                                 g_hype_cfg.vms[vi].name, td->path_or_id, dup);
+                continue;
+            }
+            if (dup == 1u) continue; /* found; selection already handled it */
+            hype_debug_print("host-disk: vm '%s' target '%s' is NOT among the %u disk(s) found%s "
+                             "[#258]:\n", g_hype_cfg.vms[vi].name, td->path_or_id,
+                             g_disk_inv.count,
+                             g_disk_inv.dropped != 0u ? " (and some were DROPPED, see above)" : "");
+            for (k = 0; k < g_disk_inv.count; k++) {
+                const hype_disk_entry_t *le = hype_disk_inventory_get(&g_disk_inv, k);
+                hype_debug_print("host-disk:   [%u] %s port %u serial='%s' model='%s'\n", k,
+                                 le->bus == HYPE_DISK_BUS_NVME ? "nvme" : "ahci", le->port,
+                                 le->serial, le->model);
             }
         }
     }

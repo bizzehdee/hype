@@ -108,40 +108,70 @@ static int wait_clear(volatile uint8_t *b, uint32_t off, uint32_t mask, unsigned
  * it for the duration of one call. Single-threaded, one scan at a time. */
 static uint32_t g_scan_sig = HYPE_AHCI_HOST_SIG_ATA;
 
-int hype_ahci_host_find_sata_port(uint64_t abar_phys) {
+/*
+ * #258: one port's worth of the scan, so a caller can walk 0..31 ONCE.
+ *
+ * Split out rather than letting a caller re-enter the whole scan per disk. Doing that made
+ * enumeration quadratic, and since the PHY-settle retry below spins up to SPIN_READY on every
+ * EMPTY port, a controller with two disks then paid ~30 x 2M spins re-scanning the empty tail.
+ * Measured, not predicted: it stalled host discovery past a 110-second QEMU timeout before the
+ * selection step ran at all.
+ *
+ * Returns 1 if `port` is implemented, its PHY is up, and its signature matches the current scan
+ * target; 0 otherwise.
+ */
+int hype_ahci_host_port_matches(uint64_t abar_phys, unsigned port) {
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
     uint32_t pi = rd32(abar, HYPE_AHCI_REG_PI);
+    volatile uint8_t *pb;
+    uint32_t ssts;
+    unsigned spins = SPIN_READY;
+
+    if (port >= 32u || (pi & (1u << port)) == 0u) {
+        return 0;
+    }
+    pb = port_base(abar, port);
+    /* Wait for the SATA PHY to establish the link (DET (PxSSTS[3:0]) == 3).
+     * On a cold boot the link/disk isn't ready the instant we probe, so an
+     * immediate read intermittently sees the port as empty -- the real-HW
+     * "no active SATA disk port" flake seen on the AMD laptop (the SATA SSD
+     * is present but was found only on some boots). Poll up to the ceiling. */
+    do {
+        ssts = rd32(pb, HYPE_AHCI_PREG_SSTS);
+        if ((ssts & 0xFu) == 3u) {
+            break;
+        }
+    } while (spins-- != 0u);
+    if ((ssts & 0xFu) != 3u) {
+        return 0; /* PHY never came up -> genuinely no device on this port */
+    }
+    /* #325: was hardcoded to the non-ATAPI signature, which made a real optical drive invisible
+     * by construction. Now whichever signature the current scan is looking for. */
+    return (rd32(pb, HYPE_AHCI_PREG_SIG) == g_scan_sig) ? 1 : 0;
+}
+
+int hype_ahci_host_find_sata_port_from(uint64_t abar_phys, unsigned start_port) {
     unsigned p;
 
-    for (p = 0; p < 32u; p++) {
-        volatile uint8_t *pb;
-        uint32_t ssts;
-        unsigned spins = SPIN_READY;
-        if ((pi & (1u << p)) == 0u) {
-            continue;
-        }
-        pb = port_base(abar, p);
-        /* Wait for the SATA PHY to establish the link (DET (PxSSTS[3:0]) == 3).
-         * On a cold boot the link/disk isn't ready the instant we probe, so an
-         * immediate read intermittently sees the port as empty -- the real-HW
-         * "no active SATA disk port" flake seen on the AMD laptop (the SATA SSD
-         * is present but was found only on some boots). Poll up to the ceiling. */
-        do {
-            ssts = rd32(pb, HYPE_AHCI_PREG_SSTS);
-            if ((ssts & 0xFu) == 3u) {
-                break;
-            }
-        } while (spins-- != 0u);
-        if ((ssts & 0xFu) != 3u) {
-            continue; /* PHY never came up -> genuinely no device on this port */
-        }
-        /* #325: was hardcoded to the non-ATAPI signature, which made a real optical drive invisible
-         * by construction. Now whichever signature the current scan is looking for. */
-        if (rd32(pb, HYPE_AHCI_PREG_SIG) == g_scan_sig) {
+    for (p = start_port; p < 32u; p++) {
+        if (hype_ahci_host_port_matches(abar_phys, p)) {
             return (int)p;
         }
     }
     return -1;
+}
+
+/*
+ * #258: the original single-shot scan, now a thin wrapper.
+ *
+ * It returned the FIRST matching port and the whole host-disk path was built on that one value, so
+ * hype could only ever see one SATA disk per controller. On the ordinary desktop layout -- OS disk
+ * on port 0, scratch on port 1 -- a `physical:` target on the scratch was unreachable by
+ * construction. Callers that need every disk iterate with _from() instead; this stays for the
+ * "just give me a disk" callers and for the ATAPI scan.
+ */
+int hype_ahci_host_find_sata_port(uint64_t abar_phys) {
+    return hype_ahci_host_find_sata_port_from(abar_phys, 0u);
 }
 
 /*
