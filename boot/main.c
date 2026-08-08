@@ -14185,12 +14185,29 @@ static void usb_log_flush(void) {
      * project real time more than once. Report the first failure only: it repeats
      * every interval, and the report itself goes through the logbuf, which the
      * RT-3 NV tail still captures even when the USB sink is gone. */
-    /* #338: the split files ride the same cadence and the same BSP-only rule.
-     * Drained BEFORE the combined sink's failure report so a split-sink stall
-     * cannot be mistaken for a healthy run, and after the timestamp update
-     * above so their dirents advance too. Their failures are not reported
-     * individually: they share one block path with the combined sink, so a
-     * failure that reaches them reaches it, and one report is the useful one. */
+    if (hype_log_sink_flush(&g_usb_log) != 0 && !g_usb_log_flush_failed) {
+        g_usb_log_flush_failed = 1;
+        hype_debug_print("usb-log: FLUSH FAILED -- \\HYPEFULL.LOG has stopped growing and is "
+                         "now INCOMPLETE. hype itself is unaffected; this is the USB block path "
+                         "(xHCI/MSC). Read the RT-3 NV tail (\\hype-diag-prev.txt) for the rest "
+                         "of this run.\n");
+    }
+
+    /*
+     * #338: the split files ride the same cadence and the same BSP-only rule,
+     * and are drained AFTER the combined sink -- deliberately.
+     *
+     * They were drained first, and on the first real-hardware run that cost
+     * \HYPEFULL.LOG its last 14,402 bytes: the machine was powered off between
+     * the split flushes and the combined one, so the split files held records
+     * the combined file did not. The combined stream is the primary artefact and
+     * the only one whose ordering between hype and its guests is preserved, so
+     * it must never be the file that loses the tail. The split files may.
+     *
+     * Their failures are not reported individually: they share one block path
+     * with the combined sink, so a failure that reaches them reaches it too, and
+     * one report is the useful one.
+     */
     if (g_hype_log_ready) {
         hype_fat32_fs_set_time(&g_hype_log.fs, &g_usb_log.fs.now);
         if (hype_log_sink_flush(&g_hype_log) != 0) g_hype_log_ready = 0;
@@ -14202,13 +14219,6 @@ static void usb_log_flush(void) {
             hype_fat32_fs_set_time(&g_vm_log[vi].fs, &g_usb_log.fs.now);
             if (hype_log_sink_flush(&g_vm_log[vi]) != 0) g_vm_log_ready[vi] = 0;
         }
-    }
-    if (hype_log_sink_flush(&g_usb_log) != 0 && !g_usb_log_flush_failed) {
-        g_usb_log_flush_failed = 1;
-        hype_debug_print("usb-log: FLUSH FAILED -- \\HYPEFULL.LOG has stopped growing and is "
-                         "now INCOMPLETE. hype itself is unaffected; this is the USB block path "
-                         "(xHCI/MSC). Read the RT-3 NV tail (\\hype-diag-prev.txt) for the rest "
-                         "of this run.\n");
     }
 }
 

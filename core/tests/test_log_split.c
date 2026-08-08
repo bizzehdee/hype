@@ -42,6 +42,26 @@ static void test_hype_own_records_are_not_guest_output(void) {
     CHECK_INT("empty record is hype's", HYPE_LOG_VM_HYPE, vm_of(""));
 }
 
+/*
+ * Regression, found on real hardware: boot/main.c emits guest output from TWO
+ * sources -- "ttyS<M>|" for a serial port and "screen|" for the on-screen
+ * terminal capture. Matching only the first sent every screen record into
+ * \HYPE.LOG, i.e. guest output in hype's own log, and it took a hardware run to
+ * expose it because that is where the on-screen path is exercised.
+ */
+static void test_screen_capture_is_guest_output_too(void) {
+    CHECK_INT("vm0 screen", 0, vm_of("fw-1 vm0 screen| Booting..."));
+    CHECK_INT("vm1 screen", 1, vm_of("fw-1 vm1 screen| lo0: link state changed to UP"));
+    {
+        const char *rec = "fw-1 vm1 screen| lo0: UP";
+        CHECK_INT("screen tag kept, VM tag stripped", 0,
+                  strcmp(rec + body_of(rec), "screen| lo0: UP"));
+    }
+    /* Still strict: an unknown source is not guest output. */
+    CHECK_INT("unknown source rejected", HYPE_LOG_VM_HYPE, vm_of("fw-1 vm0 mystery| x"));
+    CHECK_INT("screen tag not terminated", HYPE_LOG_VM_HYPE, vm_of("fw-1 vm0 screen x"));
+}
+
 static void test_malformed_prefixes_are_not_guest_output(void) {
     CHECK_INT("no port tag", HYPE_LOG_VM_HYPE, vm_of("fw-1 vm0 hello"));
     CHECK_INT("port tag not terminated", HYPE_LOG_VM_HYPE, vm_of("fw-1 vm0 ttyS0 hello"));
@@ -74,6 +94,7 @@ static void test_body_offset_strips_only_the_vm_tag(void) {
 int main(void) {
     test_guest_records_route_to_their_vm();
     test_hype_own_records_are_not_guest_output();
+    test_screen_capture_is_guest_output_too();
     test_malformed_prefixes_are_not_guest_output();
     test_length_bounds_the_match();
     test_body_offset_strips_only_the_vm_tag();

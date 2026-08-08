@@ -32,9 +32,15 @@ static int eat_uint(const char *rec, unsigned int len, unsigned int *pos, unsign
 }
 
 /*
- * Parses "fw-1 vm<N> ttyS<M>| ". On success returns 1, sets *vm to N and *body
- * to the offset just past "fw-1 vm<N> " -- i.e. the start of "ttyS<M>| ", which
+ * Parses "fw-1 vm<N> <source>| ", where <source> is one of the guest-output
+ * sources boot/main.c emits: "ttyS<M>" for a serial port, or "screen" for the
+ * on-screen terminal capture. On success returns 1, sets *vm to N and *body to
+ * the offset just past "fw-1 vm<N> " -- i.e. the start of "<source>| ", which
  * the per-VM file keeps.
+ *
+ * Both sources must be listed here. Matching only "ttyS<M>" sent every "screen"
+ * record into \HYPE.LOG, which is guest output in hype's own log -- found on
+ * real hardware, where the on-screen path is actually exercised.
  */
 static int parse_guest_prefix(const char *rec, unsigned int len, unsigned int *vm,
                               unsigned int *body) {
@@ -48,8 +54,11 @@ static int parse_guest_prefix(const char *rec, unsigned int len, unsigned int *v
     if (!eat_uint(rec, len, &pos, &n)) return 0;
     if (!eat_lit(rec, len, &pos, " ")) return 0;
     after_vm = pos;
-    if (!eat_lit(rec, len, &pos, "ttyS")) return 0;
-    if (!eat_uint(rec, len, &pos, &port)) return 0;
+    if (eat_lit(rec, len, &pos, "ttyS")) {
+        if (!eat_uint(rec, len, &pos, &port)) return 0;
+    } else if (!eat_lit(rec, len, &pos, "screen")) {
+        return 0;
+    }
     if (!eat_lit(rec, len, &pos, "| ")) return 0;
 
     *vm = n;
