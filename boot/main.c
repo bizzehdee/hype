@@ -1112,6 +1112,11 @@ static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
  * total. Decides between caching the decode and restructuring the page tables. */
 static unsigned long long g_mmio_fetch_tsc, g_mmio_fetch_calls;
 
+/* #363: host keyboard -> focused-guest routing state. A file-global because the BSP now owns
+ * polling (fw_1_host_input_poll); it used to be a local in the guest dispatch loop, which is
+ * precisely why a wedged guest took the keyboard with it. */
+static hype_host_input_t g_hostin;
+
 static hype_disk_inventory_t g_disk_inv;
 
 /* One-shot latch for the "capture buffer is full" report -- see usb_log_flush(). */
@@ -7150,6 +7155,44 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
  * from its own loop (fw_1_publish_and_render above), and a wedged guest simply stops updating its
  * row -- which the operator can now SEE, instead of losing the whole display.
  */
+
+/*
+ * #363 part 2: poll the host keyboard on the BSP.
+ *
+ * Moving RENDERING to the BSP was only half the fix. Input stayed in the guest dispatch loop, so
+ * with a wedged vm0 the operator reported the dashboard still counting but
+ * `right ctrl+alt+arrow` locked up -- exactly the half that was left behind.
+ *
+ * Everything here is host-side except the guest-destined bytes, which go into the focused VM's
+ * UART receive ring. That ring is single-producer/single-consumer: the BSP produces, the VM's own
+ * core consumes, and x86 TSO plus the compiler barrier in hype_guest_uart_rx_enqueue() is enough.
+ * No lock, and no device state touched from two cores -- deliberately, given #343.
+ */
+static void fw_1_host_input_poll(void) {
+    uint8_t sc;
+    while (hype_host_kbd_poll_scancode(&sc)) {
+        uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
+        unsigned kn = 0;
+        hype_chord_result_t cr = hype_host_input_feed(&g_hostin, sc, kb, sizeof(kb), &kn);
+        g_hostkbd_scancodes++;
+        if (cr.action != HYPE_CHORD_ACTION_NONE) {
+            g_hostkbd_chords++;
+            hype_term_apply_chord(cr);
+        } else if (g_term_view >= 0) {
+            hype_guest_uart_t *dst = &g_vms[g_term_view].uart;
+            unsigned ki;
+            for (ki = 0; ki < kn; ki++) {
+                hype_guest_uart_rx_enqueue(dst, kb[ki]);
+            }
+        } else {
+            unsigned ki;
+            for (ki = 0; ki < kn; ki++) {
+                term_cmdline_key(kb[ki]);
+            }
+        }
+    }
+}
+
 static void fw_1_render_console(void) {
     static uint64_t last_gop_flush_tsc = 0;
     static int term_last_view = -2; /* neither a VM index nor the dashboard, so the first frame clears */
@@ -9021,7 +9064,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * vblk_/ata_/nvme latches above -- extra slots are uniform: one window each, whatever the
      * bus (virtio BAR4, ahci BAR5, nvme BAR0). */
     struct { int mapped; uint64_t bar; } dwin[HYPE_FW_1_MAX_DISKS] = {{0, 0}, {0, 0}, {0, 0}};
-    hype_host_input_t hostin; /* TERM-4: host keyboard -> focused guest routing state */
     /* M4-6b1: drive the guest timebase from real elapsed host TSC. */
     uint64_t tb_last_tsc = hype_rdtsc();
     uint64_t tb_accum = 0; /* fractional-tick carry (units of host TSC * PIT_HZ) */
@@ -9093,7 +9135,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * serial + \HYPEFULL.LOG; panics still paint the GOP directly. */
     hype_debug_set_gop_enabled(0);
 
-    hype_host_input_reset(&hostin);
     for (;;) {
         uint8_t timer_vector;
 
@@ -9116,7 +9157,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * RX (defaulting to vm0 while the dashboard is up, so typing still lands
          * on a guest). USB HID (TERM-5) will feed this same path unchanged. */
         if (vm == &g_vms[0]) {
-            uint8_t sc;
             /* USB-5 (#217): pull any USB HID keyboard report and inject its scancodes
              * into the same queue this loop already drains, so the chord recognizer and
              * command line below need no knowledge of which keyboard it came from. */
@@ -9136,31 +9176,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_pic_emu_raise_global_irq(&g_fw_1_pic, 12u);
                 }
             }
-            while (hype_host_kbd_poll_scancode(&sc)) {
-                uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
-                unsigned kn = 0;
-                hype_chord_result_t cr = hype_host_input_feed(&hostin, sc, kb, sizeof(kb), &kn);
-                g_hostkbd_scancodes++;
-                if (cr.action != HYPE_CHORD_ACTION_NONE) {
-                    g_hostkbd_chords++;
-                    hype_term_apply_chord(cr);
-                } else if (g_term_view >= 0) {
-                    /* A VM is focused: typed bytes go to its console (COM1). */
-                    hype_guest_uart_t *dst = &g_vms[g_term_view].uart;
-                    unsigned ki;
-                    for (ki = 0; ki < kn; ki++) {
-                        hype_guest_uart_rx_enqueue(dst, kb[ki]);
-                    }
-                } else {
-                    /* M8-3a + TERM-2: dashboard has focus -> keystrokes drive the
-                     * command line and reach NO guest (explicit focus-owner check;
-                     * security-review finding, plan §10 #22). */
-                    unsigned ki;
-                    for (ki = 0; ki < kn; ki++) {
-                        term_cmdline_key(kb[ki]);
-                    }
-                }
-            }
+            /* #363: host input is polled by the BSP now -- see fw_1_host_input_poll().
+             * It used to run here, on the guest's core, so a wedged guest took the keyboard
+             * with it and terminal switching stopped working. */
         }
 
         /* M8-6 shutdown grace timer: on entering SHUTTING, arm a bounded
@@ -9193,10 +9211,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_STARTED);
             }
 #if !HYPE_RUN_GUEST_ON_AP
-            /* #363: with the guest on the BSP there is no idle drain loop to render from, so the
-             * guest loop still drives it. Under HYPE_RUN_GUEST_ON_AP (the default) the BSP owns
-             * this instead, which is the whole point -- a wedged guest must not take the display. */
+            /* #363: with the guest on the BSP there is no idle drain loop, so the guest loop still
+             * drives both. Under HYPE_RUN_GUEST_ON_AP (the default) the BSP owns them instead,
+             * which is the whole point -- a wedged guest must not take the display or keyboard. */
             fw_1_render_console();
+            fw_1_host_input_poll();
 #endif
     #if !HYPE_RUN_GUEST_ON_AP
         fw_1_render_console();
@@ -16743,6 +16762,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * and the machine looked crashed. fw_1_render_console() caps itself at 60 Hz.
              */
             fw_1_render_console();
+            fw_1_host_input_poll(); /* #363: keyboard + terminal switching, off the guest core */
             if (g_vms[0].host_tsc_hz != 0) {
                 uint64_t now_d = hype_rdtsc();
                 uint64_t iv = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_vms[0].host_tsc_hz;

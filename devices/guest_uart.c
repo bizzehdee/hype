@@ -169,6 +169,14 @@ int hype_guest_uart_rx_enqueue(hype_guest_uart_t *u, uint8_t byte) {
         return 0; /* ring full */
     }
     u->rx[u->rx_tail] = byte;
+    /*
+     * #363: the producer is now the BSP (host input polling) while the consumer is the VM's own
+     * core, so this is a genuine cross-core single-producer/single-consumer ring. x86 TSO does not
+     * reorder stores, so the byte is visible before the tail advance that publishes it -- but the
+     * COMPILER may reorder them, which would publish a slot before its contents. Barrier only; no
+     * lock is needed for SPSC.
+     */
+    __atomic_signal_fence(__ATOMIC_RELEASE);
     u->rx_tail = next;
     return 1;
 }
