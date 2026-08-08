@@ -1108,6 +1108,10 @@ static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
  * selected. It is also what lets a serial mismatch say WHICH disks are actually present, instead of
  * leaving "not in this machine" and "here but never scanned" indistinguishable.
  */
+/* #367: cost of fetching the faulting instruction on an emulated-MMIO exit, against the exit
+ * total. Decides between caching the decode and restructuring the page tables. */
+static unsigned long long g_mmio_fetch_tsc, g_mmio_fetch_calls;
+
 static hype_disk_inventory_t g_disk_inv;
 
 /* One-shot latch for the "capture buffer is full" report -- see usb_log_flush(). */
@@ -9453,6 +9457,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * correlated by hand across two lines.
                      */
                     unsigned long long reads = (unsigned long long)g_fw_1_atapi.read10_count;
+                    if (g_mmio_fetch_calls != 0 && g_vms[0].host_tsc_hz != 0) {
+                        hype_debug_print(
+                            "fw-1 MMIOCOST: insn_fetch calls=%llu total=%llums us_each=%llu "
+                            "[#367]\n", g_mmio_fetch_calls,
+                            (g_mmio_fetch_tsc * 1000ull) / g_vms[0].host_tsc_hz,
+                            (g_mmio_fetch_tsc * 1000000ull) / g_vms[0].host_tsc_hz /
+                                g_mmio_fetch_calls);
+                    }
                     hype_debug_print(
                         "fw-1 AHCIIRQ: cd=%llu/%llu ata=%llu/%llu (delivered/pending) | "
                         "ahci_npf=%llu reads=%llu mmio_per_read=%llu [#365]\n",
@@ -11173,7 +11185,33 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * translation of RIP for an identity-paged guest (OVMF) on a
              * CPU without decode assists. */
             uint8_t insn_n = 0;
-            const uint8_t *insn = vmm_guest_insn_bytes(kind, ctx, &insn_n);
+            const uint8_t *insn;
+            /*
+             * #367: split the cost of an emulated-MMIO exit into FETCHING the faulting
+             * instruction and EMULATING it.
+             *
+             * The guest performs ~87 emulated-AHCI register accesses per disc read, 46% of run
+             * time, and the obvious fix -- mapping the polled registers readable so reads stop
+             * exiting -- turns out to need prerequisite work: hype's NPT maps in 2 MB pages with
+             * no read-only helper, so it would need a new 4 KB level and RO support in both NPT
+             * and EPT. That is the memory-management core, which is where this project's worst
+             * bugs have come from (#343, #352).
+             *
+             * Before paying that, find out what the exit actually costs. If most of it is the
+             * instruction fetch -- which on the no-decode-assist path walks the guest page tables
+             * every time -- then caching the decode by RIP is far cheaper and far safer, because
+             * a polling loop hits the same handful of RIPs forever. If most of it is the
+             * emulation, only the mapping change helps.
+             *
+             * Measure before optimising the part: five hypotheses died on this symptom already,
+             * all of them components that were locally correct and globally irrelevant.
+             */
+            {
+                uint64_t t_fetch = hype_rdtsc();
+                insn = vmm_guest_insn_bytes(kind, ctx, &insn_n);
+                g_mmio_fetch_tsc += hype_rdtsc() - t_fetch;
+                g_mmio_fetch_calls++;
+            }
             /* M4-6 real-AMD DIAG: the decode-assist path (insn_n > 0) is
              * used only on real AMD -- QEMU+KVM nested SVM never populates
              * num_bytes_fetched, so it's the ptwalk fallback there and this
