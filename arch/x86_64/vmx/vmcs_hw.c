@@ -3387,7 +3387,44 @@ int hype_vmx_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
         return -1;
     }
     if (io.is_in) {
-        uint32_t value = hype_acpi_pm_timer_scale(vmx_real_rdtsc(), g_vmx_acpi_pm_tsc_hz);
+        uint64_t raw = vmx_real_rdtsc();
+        uint32_t value = hype_acpi_pm_timer_scale(raw, g_vmx_acpi_pm_tsc_hz);
+        /*
+         * #364: the same self-test SVM has had since M4-6b2, which VMX never got.
+         *
+         * hype_acpi_pm_timer_scale() falls back to the RAW TSC when tsc_hz is below the
+         * architectural 3.579545 MHz -- silently ~950x too fast, which is the exact defect M4-6b2
+         * fixed on SVM. Nothing on the VMX path ever checked that the rate is right, and a guest
+         * whose DELAY() spins on this port cannot tell a broken timer from a slow one: on the Intel
+         * box FreeBSD reads this port 452,543 times (93% of all its I/O exits), never touches the
+         * PIT, and never finishes booting.
+         *
+         * Measure it rather than assume it: read the scaler, busy-wait exactly 1 ms of host TSC,
+         * read again. A correct timer advances ~3579 ticks. One shot, at the guest's first read.
+         */
+        static int pm_selftest_done = 0;
+        if (!pm_selftest_done && g_vmx_acpi_pm_tsc_hz != 0) {
+            uint64_t t0 = raw;
+            uint32_t v0 = hype_acpi_pm_timer_scale(t0, g_vmx_acpi_pm_tsc_hz);
+            uint64_t target = t0 + g_vmx_acpi_pm_tsc_hz / 1000ULL;
+            uint64_t t1;
+            uint32_t v1;
+            while ((t1 = vmx_real_rdtsc()) < target) { /* busy-wait ~1ms */ }
+            v1 = hype_acpi_pm_timer_scale(t1, g_vmx_acpi_pm_tsc_hz);
+            pm_selftest_done = 1;
+            hype_debug_print("vmx PMLIVE selftest: tsc_hz=%llu div=%llu | over 1ms (tsc +%llu) PM "
+                             "advanced %u ticks (expect ~3579) v0=0x%x v1=0x%x [#364]\n",
+                             (unsigned long long)g_vmx_acpi_pm_tsc_hz,
+                             (unsigned long long)(g_vmx_acpi_pm_tsc_hz / 3579545ULL),
+                             (unsigned long long)(t1 - t0),
+                             (unsigned)((v1 - v0) & 0x00FFFFFFu), v0, v1);
+        } else if (g_vmx_acpi_pm_tsc_hz == 0 && !pm_selftest_done) {
+            /* Worth its own line: zero means every read of this port has been returning the raw
+             * TSC, i.e. a timer running ~950x fast, and no self-test above would ever run. */
+            pm_selftest_done = 1;
+            hype_debug_print("vmx PMLIVE selftest: tsc_hz is ZERO -- the ACPI PM timer is returning "
+                             "the RAW TSC, ~950x too fast [#364]\n");
+        }
         real->gprs[0] = (real->gprs[0] & ~0xFFFFFFFFULL) | value;
     }
     vmx_advance_rip();
