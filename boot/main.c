@@ -14011,7 +14011,6 @@ typedef struct {
     uint64_t base; /* partition-relative -> disk LBA offset */
 } usblog_ctx_t;
 
-static hype_log_sink_t g_usb_log;
 static int g_usb_log_ready;
 static int g_usb_log_flush_failed; /* emitted once, not every interval */
 static usblog_ctx_t g_usb_log_ctx;
@@ -14210,28 +14209,19 @@ static void split_log_setup(void) {
     unsigned int i;
     int rc;
 
-    rc = hype_log_sink_open_filtered(&g_hype_log, usblog_read, usblog_write, &g_usb_log_ctx,
-                                     "HYPE.LOG", g_host_time_valid ? &g_host_time : 0,
-                                     HYPE_LOG_SINK_HYPE);
-    g_hype_log_ready = (rc == HYPE_LOG_SINK_OK);
-    if (!g_hype_log_ready) {
-        hype_debug_print("usb-log: \\HYPE.LOG not opened (rc=%d) -- \\HYPEFULL.LOG is "
-                         "unaffected [#338]\n", rc);
-    }
-
     for (i = 0; i < HYPE_FW_MAX_VMS; i++) {
         const char *cfg_name = (i < g_hype_cfg.vm_count) ? g_hype_cfg.vms[i].name : 0;
         vm_log_name(i, cfg_name, name, sizeof(name));
-        rc = hype_log_sink_open_filtered(&g_vm_log[i], usblog_read, usblog_write, &g_usb_log_ctx,
-                                         name, g_host_time_valid ? &g_host_time : 0, (int)i);
+        rc = hype_log_sink_open_ordered(&g_vm_log[i], usblog_read, usblog_write, &g_usb_log_ctx,
+                                        name, g_host_time_valid ? &g_host_time : 0, (int)i);
         g_vm_log_ready[i] = (rc == HYPE_LOG_SINK_OK);
         if (!g_vm_log_ready[i]) {
             hype_debug_print("usb-log: \\%s not opened (rc=%d) [#338]\n", name, rc);
         }
     }
     hype_debug_print("usb-log: split diagnostics -- hype's own output to \\HYPE.LOG, each "
-                     "guest's serial to its own file; \\HYPEFULL.LOG keeps the combined "
-                     "stream [#338]\n");
+                     "guest's serial to its own file; the combined stream lives on the serial port and is "
+                     "recoverable from the [offset] prefixes [#338]\n");
 }
 
 static void usb_log_setup(const hype_blk_backend_t *be) {
@@ -14265,12 +14255,31 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
     for (i = 0; i < nb; i++) {
         int rc;
         g_usb_log_ctx.base = bases[i];
-        rc = hype_log_sink_open(&g_usb_log, usblog_read, usblog_write, &g_usb_log_ctx,
-                                "HYPEFULL.LOG", g_host_time_valid ? &g_host_time : 0);
+        /*
+         * #338: \HYPE.LOG is the primary sink now, and doubles as the volume probe.
+         *
+         * \HYPEFULL.LOG is RETIRED. It held a second copy of every byte already going to
+         * \HYPE.LOG and the per-VM files, so every record was written to the stick TWICE --
+         * through the one USB transfer lock the guests also stream their ISOs through. That cost
+         * was visible as guests booting markedly slower once #338 landed (USBLOCK measured
+         * 145,681,332 spin iterations over 34,799 acquisitions).
+         *
+         * What it was FOR -- the ordering between hype and a guest -- is preserved by the
+         * capture-buffer offset each split sink now stamps on every record, so `sort` over the
+         * split files reconstructs it exactly. That is 11 bytes a record instead of all of them.
+         *
+         * The live combined view still exists on the serial port, unchanged.
+         */
+        rc = hype_log_sink_open_ordered(&g_hype_log, usblog_read, usblog_write, &g_usb_log_ctx,
+                                        "HYPE.LOG", g_host_time_valid ? &g_host_time : 0,
+                                        HYPE_LOG_SINK_HYPE);
         if (rc == HYPE_LOG_SINK_OK) {
-            g_usb_log_ready = 1;
-            hype_debug_print("usb-log: streaming full log to \\HYPEFULL.LOG "
-                             "(FAT32 at disk LBA %llu)\n", (unsigned long long)bases[i]);
+            g_hype_log_ready = 1;
+            g_usb_log_ready = 1; /* "a log sink is up", the gate the flush path uses */
+            hype_debug_print("usb-log: \\HYPE.LOG + per-VM logs on FAT32 at disk LBA %llu; "
+                             "\\HYPEFULL.LOG is retired -- merge the split files by their "
+                             "[offset] prefix to recover the combined stream [#338]\n",
+                             (unsigned long long)bases[i]);
             split_log_setup();
             return;
         }
@@ -14280,15 +14289,15 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
          * the block path underneath it. */
         hype_debug_print("usb-log: base LBA %llu -- %s\n", (unsigned long long)bases[i],
                          (rc == HYPE_LOG_SINK_ERR_MOUNT)    ? "not a FAT32 volume"
-                         : (rc == HYPE_LOG_SINK_ERR_CREATE) ? "FAT32 mounted but HYPEFULL.LOG "
+                         : (rc == HYPE_LOG_SINK_ERR_CREATE) ? "FAT32 mounted but HYPE.LOG "
                                                               "could not be created"
                          : (rc == HYPE_LOG_SINK_ERR_WRITE)
-                             ? "FAT32 mounted and HYPEFULL.LOG created, but the FIRST WRITE "
+                             ? "FAT32 mounted and HYPE.LOG created, but the FIRST WRITE "
                                "FAILED -- the USB block path (xHCI/MSC), not the filesystem"
                              : "unknown failure");
     }
     hype_debug_print("usb-log: could not open a log sink on any of %u candidate base LBA(s) "
-                     "(RT-3 NV tail remains the backup -- and note an EMPTY \\HYPEFULL.LOG on "
+                     "(RT-3 NV tail remains the backup -- and note an EMPTY \\HYPE.LOG on "
                      "the stick means the file was created and the write failed)\n", nb);
 }
 
@@ -14360,7 +14369,7 @@ static void usb_log_flush(void) {
         hype_rtc_time_t now;
         hype_rtc_advance(&g_host_time, (hype_rdtsc() - g_host_time_tsc) / g_vms[0].host_tsc_hz,
                          &now);
-        hype_fat32_fs_set_time(&g_usb_log.fs, &now);
+        hype_fat32_fs_set_time(&g_hype_log.fs, &now);
     }
     /* Do NOT discard this. A flush that starts failing mid-run used to be silent,
      * so the log simply stopped growing and a perfectly healthy hype was
@@ -14368,9 +14377,10 @@ static void usb_log_flush(void) {
      * project real time more than once. Report the first failure only: it repeats
      * every interval, and the report itself goes through the logbuf, which the
      * RT-3 NV tail still captures even when the USB sink is gone. */
-    if (hype_log_sink_flush(&g_usb_log) != 0 && !g_usb_log_flush_failed) {
+    if (g_hype_log_ready && hype_log_sink_flush(&g_hype_log) != 0 && !g_usb_log_flush_failed) {
         g_usb_log_flush_failed = 1;
-        hype_debug_print("usb-log: FLUSH FAILED -- \\HYPEFULL.LOG has stopped growing and is "
+        g_hype_log_ready = 0;
+        hype_debug_print("usb-log: FLUSH FAILED -- \\HYPE.LOG has stopped growing and is "
                          "now INCOMPLETE. hype itself is unaffected; this is the USB block path "
                          "(xHCI/MSC). Read the RT-3 NV tail (\\hype-diag-prev.txt) for the rest "
                          "of this run.\n");
@@ -14408,17 +14418,13 @@ static void usb_log_flush(void) {
             "running and this log is INCOMPLETE, not the end of the run. ***\n";
         g_logbuf_full_reported = 1;
         hype_serial_print("%s", msg);
-        (void)hype_fat32_append(&g_usb_log.file, msg, (unsigned int)(sizeof(msg) - 1u));
-    }
-    if (g_hype_log_ready) {
-        hype_fat32_fs_set_time(&g_hype_log.fs, &g_usb_log.fs.now);
-        if (hype_log_sink_flush(&g_hype_log) != 0) g_hype_log_ready = 0;
+        (void)hype_fat32_append(&g_hype_log.file, msg, (unsigned int)(sizeof(msg) - 1u));
     }
     {
         unsigned int vi;
         for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
             if (!g_vm_log_ready[vi]) continue;
-            hype_fat32_fs_set_time(&g_vm_log[vi].fs, &g_usb_log.fs.now);
+            hype_fat32_fs_set_time(&g_vm_log[vi].fs, &g_hype_log.fs.now);
             if (hype_log_sink_flush(&g_vm_log[vi]) != 0) g_vm_log_ready[vi] = 0;
         }
     }
@@ -16399,7 +16405,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         usb_log_flush();
         hype_debug_print("diag: log captured to GOP + RT-3 variable%s; system halted (power-cycle "
                          "to recover the tail as \\hype-diag-prev.txt on the next boot)\n",
-                         g_usb_log_ready ? " + \\HYPEFULL.LOG on USB" : "");
+                         g_usb_log_ready ? " + \\HYPE.LOG and per-VM logs on USB" : "");
         /* One more flush so the final "captured/halted" lines land on the stick too. */
         usb_log_flush();
         hype_debug_flush_gop();
@@ -16540,7 +16546,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 #if HYPE_RUN_GUEST_ON_AP
     (void)vm;
     hype_debug_print("fw-1: guest dispatched to the AP (dedicated core); BSP idle -- "
-                     "draining \\HYPEFULL.LOG from here every %llus (#239)\n",
+                     "draining the split logs from here every %llus (#239)\n",
                      (unsigned long long)HYPE_USBLOG_WRITE_INTERVAL_SECS);
     /*
      * #239: the BSP-side USB log drain.
@@ -16598,7 +16604,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                      */
                     {
                         static unsigned int last_reported;
-                        unsigned int wrote = hype_log_sink_flushed(&g_usb_log);
+                        unsigned int wrote = hype_log_sink_flushed(&g_hype_log);
                         if (have > wrote && (have - wrote) > 4096u &&
                             (have - last_reported) > 65536u) {
                             last_reported = have;

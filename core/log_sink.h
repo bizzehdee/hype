@@ -91,6 +91,18 @@ int hype_log_sink_open_filtered(hype_log_sink_t *s, hype_fat_read_fn read, hype_
 void hype_log_sink_set_ordered(hype_log_sink_t *s, int ordered);
 
 /*
+ * As hype_log_sink_open_filtered(), with ordering on from the FIRST record.
+ *
+ * Prefer this over open_filtered() + set_ordered(): open() streams whatever the capture
+ * buffer already holds, so turning ordering on afterwards leaves that backlog unstamped,
+ * and a merge tool drops unstamped records silently because they do not match the record
+ * pattern. Measured at 65 of 453 records -- all of them boot-time -- before this existed.
+ */
+int hype_log_sink_open_ordered(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
+                               void *ctx, const char *filename, const hype_rtc_time_t *now,
+                               int filter);
+
+/*
  * Appends the logbuf bytes captured since the previous flush (or open). A no-op
  * returning 0 if nothing new. Returns -1 if the sink is inactive or a write
  * fails. Safe to call as often as desired.

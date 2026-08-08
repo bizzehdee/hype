@@ -21,11 +21,18 @@ static unsigned int order_prefix(char *buf, unsigned int off) {
 }
 
 static int sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write, void *ctx,
-                     const char *filename, const hype_rtc_time_t *now, int filter) {
+                     const char *filename, const hype_rtc_time_t *now, int filter, int ordered) {
     s->active = 0;
     s->flushed = 0;
     s->filter = filter;
-    s->ordered = 0;
+    /*
+     * Set BEFORE the open-time flush below, not after. open() writes everything already in the
+     * capture buffer, so switching ordering on afterwards left that backlog unstamped -- 65 of 453
+     * records in a QEMU run, 14%, which a merge tool drops SILENTLY because they simply do not
+     * match the record pattern. That is the whole justification for retiring the combined log
+     * quietly failing for the earliest records, which are the boot ones.
+     */
+    s->ordered = ordered;
     if (hype_fat32_fs_mount(read, write, ctx, &s->fs) != 0) return HYPE_LOG_SINK_ERR_MOUNT;
     /* Before create(), so the new file's directory entry carries a real date
      * rather than the zeroes that made hype's log show as the Unix epoch. */
@@ -41,13 +48,19 @@ static int sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_f
 
 int hype_log_sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
                        void *ctx, const char *filename, const hype_rtc_time_t *now) {
-    return sink_open(s, read, write, ctx, filename, now, HYPE_LOG_SINK_ALL);
+    return sink_open(s, read, write, ctx, filename, now, HYPE_LOG_SINK_ALL, 0);
 }
 
 int hype_log_sink_open_filtered(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
                                 void *ctx, const char *filename, const hype_rtc_time_t *now,
                                 int filter) {
-    return sink_open(s, read, write, ctx, filename, now, filter);
+    return sink_open(s, read, write, ctx, filename, now, filter, 0);
+}
+
+int hype_log_sink_open_ordered(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
+                               void *ctx, const char *filename, const hype_rtc_time_t *now,
+                               int filter) {
+    return sink_open(s, read, write, ctx, filename, now, filter, 1);
 }
 
 /*

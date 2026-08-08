@@ -371,6 +371,55 @@ static void test_ordered_set_on_null_is_safe(void) {
     hype_log_sink_set_ordered(0, 1); /* must not fault */
 }
 
+/*
+ * The backlog must be stamped too. open() streams whatever the capture buffer
+ * already holds, so ordering switched on AFTER open left those records
+ * unstamped -- and a merge tool drops unstamped records silently, because they
+ * simply do not match the pattern. Measured at 65 of 453 in a real run, all of
+ * them boot-time records.
+ */
+static void test_ordering_covers_records_written_at_open(void) {
+    hype_log_sink_t s;
+    char out[4096];
+    build_vol();
+    hype_logbuf_reset();
+    hype_logbuf_append("usb-log: early boot line\n");
+    hype_logbuf_append("usb-log: second early line\n");
+    CHECK_HEX("open ordered", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_ordered(&s, vol_read, vol_write, NULL, "OB.LOG", 0,
+                                         HYPE_LOG_SINK_HYPE));
+    file_text(&s, out, sizeof out);
+    CHECK("first backlog record is stamped", out[0] == '[');
+    CHECK_STR("both backlog records stamped, offsets are their positions",
+              "[00000000] usb-log: early boot line\n"
+              "[00000025] usb-log: second early line\n",
+              out);
+}
+
+/* Every record in the file must carry a key -- a partially-keyed file is the
+ * failure mode, because the gap is invisible. */
+static void test_every_record_is_keyed(void) {
+    hype_log_sink_t s;
+    char out[4096];
+    const char *p;
+    unsigned int lines = 0, keyed = 0;
+    build_vol();
+    log_a_run();
+    CHECK_HEX("open ordered", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_ordered(&s, vol_read, vol_write, NULL, "AK.LOG", 0, 0));
+    hype_logbuf_append("fw-1 vm0 ttyS0| after open\n");
+    CHECK_HEX("flush", 0, hype_log_sink_flush(&s));
+    file_text(&s, out, sizeof out);
+    for (p = out; *p != '\0'; ) {
+        lines++;
+        if (*p == '[') keyed++;
+        while (*p != '\0' && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+    CHECK("at least three records", lines >= 3u);
+    CHECK_HEX("every record keyed", lines, keyed);
+}
+
 int main(void) {
     test_sink_streams_logbuf();
     test_open_rejects_non_fat();
@@ -385,6 +434,8 @@ int main(void) {
     test_ordered_prefix_is_fixed_width();
     test_ordered_off_by_default();
     test_ordered_set_on_null_is_safe();
+    test_ordering_covers_records_written_at_open();
+    test_every_record_is_keyed();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;
