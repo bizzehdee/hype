@@ -31,6 +31,47 @@ static uint8_t g_cmd_list[AHCI_HOST_MAX_PORTS][1024] __attribute__((aligned(1024
 static uint8_t g_recv_fis[AHCI_HOST_MAX_PORTS][256] __attribute__((aligned(256)));
 static uint8_t g_cmd_table[AHCI_HOST_MAX_PORTS][256] __attribute__((aligned(128)));
 
+/*
+ * #343: serialise commands per port.
+ *
+ * #352 made the command list, FIS-receive area and command table PER PORT, which fixed two
+ * DIFFERENT ports clobbering each other. It does nothing for two vCPUs issuing on the SAME port --
+ * and that is the normal case: every VM streams its ISO from the one host device the media
+ * resolved to. Two guests reading concurrently then share one command list, one PxCI slot and one
+ * receive area.
+ *
+ * Measured, not theorised: a verification build that re-read every streamed range and compared it
+ * against what was written into guest memory found 3 mismatches in 4561 reads across two VMs, and
+ * checking the host ISO showed the WRONG side was sometimes the delivered bytes and sometimes the
+ * re-read -- which is a race, not a fixed mis-mapping. Wrong bytes reaching a guest's installation
+ * media is how #343's FreeBSD guest ends up faulting on a page of its own kernel image.
+ *
+ * The USB host path already does exactly this (g_usb_xfer_lock, #346). This is the same fix for
+ * the AHCI one. Host reads are not a throughput path -- they fill a bounce buffer -- so a spin
+ * lock costs nothing worth measuring against silently corrupting a guest.
+ */
+static volatile int g_ahci_port_lock[AHCI_HOST_MAX_PORTS];
+
+static void ahci_port_lock(unsigned port) {
+    while (__atomic_exchange_n(&g_ahci_port_lock[port], 1, __ATOMIC_ACQUIRE) != 0) {
+        __builtin_ia32_pause();
+    }
+}
+
+static void ahci_port_unlock(unsigned port) {
+    __atomic_store_n(&g_ahci_port_lock[port], 0, __ATOMIC_RELEASE);
+}
+
+/* The unlocked bodies; each public entry point below takes the port lock and calls its own. */
+static int ahci_atapi_read_locked(uint64_t abar_phys, unsigned port, uint32_t lba2k,
+                                  uint16_t count2k, void *dst);
+static int ahci_read_locked(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count,
+                            void *dst);
+static int ahci_write_locked(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count,
+                             const void *src);
+static int ahci_identify_locked(uint64_t abar_phys, unsigned port, void *dst512);
+
+
 /* PxTFD status-byte bits (bits 7:0 of PxTFD). */
 #define TFD_STS_BSY 0x80u
 #define TFD_STS_DRQ 0x08u
@@ -129,6 +170,18 @@ int hype_ahci_host_find_atapi_port(uint64_t abar_phys) {
  */
 int hype_ahci_host_atapi_read(uint64_t abar_phys, unsigned port, uint32_t lba2k, uint16_t count2k,
                               void *dst) {
+    int rc;
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
+    ahci_port_lock(port);
+    rc = ahci_atapi_read_locked(abar_phys, port, lba2k, count2k, dst);
+    ahci_port_unlock(port);
+    return rc;
+}
+
+static int ahci_atapi_read_locked(uint64_t abar_phys, unsigned port, uint32_t lba2k, uint16_t count2k,
+                                  void *dst) {
     /* #352: port indexes the per-port DMA structures, so it must be in range before use. */
     if (port >= AHCI_HOST_MAX_PORTS) {
         return -1;
@@ -233,6 +286,17 @@ int hype_ahci_host_init(uint64_t abar_phys, unsigned port) {
 }
 
 int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst) {
+    int rc;
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
+    ahci_port_lock(port);
+    rc = ahci_read_locked(abar_phys, port, lba, count, dst);
+    ahci_port_unlock(port);
+    return rc;
+}
+
+static int ahci_read_locked(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst) {
     /* #352: port indexes the per-port DMA structures, so it must be in range before use. */
     if (port >= AHCI_HOST_MAX_PORTS) {
         return -1;
@@ -313,6 +377,18 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
 
 int hype_ahci_host_write(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count,
                          const void *src) {
+    int rc;
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
+    ahci_port_lock(port);
+    rc = ahci_write_locked(abar_phys, port, lba, count, src);
+    ahci_port_unlock(port);
+    return rc;
+}
+
+static int ahci_write_locked(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count,
+                             const void *src) {
     /* #352: port indexes the per-port DMA structures, so it must be in range before use. */
     if (port >= AHCI_HOST_MAX_PORTS) {
         return -1;
@@ -342,6 +418,17 @@ int hype_ahci_host_write(uint64_t abar_phys, unsigned port, uint64_t lba, uint16
 }
 
 int hype_ahci_host_identify(uint64_t abar_phys, unsigned port, void *dst512) {
+    int rc;
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
+    ahci_port_lock(port);
+    rc = ahci_identify_locked(abar_phys, port, dst512);
+    ahci_port_unlock(port);
+    return rc;
+}
+
+static int ahci_identify_locked(uint64_t abar_phys, unsigned port, void *dst512) {
     /* #352: port indexes the per-port DMA structures, so it must be in range before use. */
     if (port >= AHCI_HOST_MAX_PORTS) {
         return -1;
