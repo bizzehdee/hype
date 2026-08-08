@@ -39,3 +39,33 @@ done
 kill -9 $QPID 2>/dev/null || true
 wait $QPID 2>/dev/null || true
 echo "done: $(wc -c < "$LOG") bytes in $LOG"
+
+# #343: SCORE THE RUN, on both axes, and say so.
+#
+# Every FreeBSD run was graded on `bsdinstall` being reached -- which it is in BOTH outcomes of
+# #343, because the intermittent kernel page fault happens after that point. So the pass/fail
+# signal this rig produced was blind to a guest panic, and #343 surfaced only because #342 needed
+# a fault grep to rule out a regression. While that is open, this rig is hype's most-used
+# regression gate, so a real regression would be indistinguishable from #343's coin flip.
+#
+# Also print the fault detail. The panic lines carry the guest's own RIP, CR2 and fault address,
+# and the whole reason #343 has no root cause yet is that nobody read them before the logs were
+# lost -- resolving that RIP against the FreeBSD kernel's symbols is what cracked #311. Surfacing
+# them automatically means the next run cannot leave them unread.
+reached=0
+panicked=0
+grep -aq "bsdinstall" "$LOG" && reached=1
+grep -aqE "panic:|Fatal trap" "$LOG" && panicked=1
+
+echo "score: reached_bsdinstall=$reached guest_panic=$panicked"
+if [ "$panicked" = 1 ]; then
+    echo "---- guest fault detail (#343: resolve this RIP against the FreeBSD kernel symbols) ----"
+    grep -aE -A 12 "Fatal trap" "$LOG" | head -40
+    echo "----------------------------------------------------------------------------------------"
+fi
+
+# Non-zero on either failure, so this can be used as a gate rather than eyeballed. A guest panic
+# is a FAILURE even though bsdinstall was reached: that combination is exactly #343.
+[ "$reached" = 1 ] || { echo "FAIL: never reached bsdinstall"; exit 1; }
+[ "$panicked" = 0 ] || { echo "FAIL: guest panicked (#343 while it is open, a regression once it is not)"; exit 1; }
+echo "PASS: reached bsdinstall, no guest panic"
