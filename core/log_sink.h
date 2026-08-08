@@ -19,11 +19,22 @@
  * periodically during a run and again at shutdown to capture late output.
  */
 
+/*
+ * #338: which records this sink takes. HYPE_LOG_SINK_ALL reproduces the
+ * original behaviour exactly -- every byte, unfiltered, and NOT split on record
+ * boundaries -- so \HYPEFULL.LOG remains byte-for-byte what it always was.
+ * Any other value routes per record (see core/log_split.h).
+ */
+#define HYPE_LOG_SINK_ALL (-2)  /* combined stream: everything, verbatim */
+#define HYPE_LOG_SINK_HYPE (-1) /* hype's own output only (== HYPE_LOG_VM_HYPE) */
+/* >= 0: that VM index's guest serial only */
+
 typedef struct {
     hype_fat32_fs_t fs;
     hype_fat32_wfile_t file;
     unsigned int flushed; /* logbuf bytes already streamed to the file */
     int active;           /* 1 once the volume mounted and the file was created */
+    int filter;           /* #338: HYPE_LOG_SINK_ALL / _HYPE / a VM index */
 } hype_log_sink_t;
 
 /*
@@ -49,6 +60,16 @@ typedef struct {
  * timestamps are then zeroed, as they were before the RTC existed). */
 int hype_log_sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
                        void *ctx, const char *filename, const hype_rtc_time_t *now);
+
+/*
+ * #338: as hype_log_sink_open(), but takes only the records `filter` selects.
+ * A filtered sink flushes whole records, so it never emits a half-written line
+ * and never re-emits one: a trailing partial record is left in the buffer for
+ * the next flush.
+ */
+int hype_log_sink_open_filtered(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
+                                void *ctx, const char *filename, const hype_rtc_time_t *now,
+                                int filter);
 
 /*
  * Appends the logbuf bytes captured since the previous flush (or open). A no-op

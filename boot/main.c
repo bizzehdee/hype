@@ -13833,6 +13833,27 @@ static int g_usb_log_ready;
 static int g_usb_log_flush_failed; /* emitted once, not every interval */
 static usblog_ctx_t g_usb_log_ctx;
 
+/*
+ * #338: the split companions to the combined \HYPEFULL.LOG -- hype's own output
+ * in \HYPE.LOG, each guest's serial in its own \<name>.LOG.
+ *
+ * Separate hype_log_sink_t instances on the SAME volume and the same block
+ * path. Each carries its own hype_fat32_fs_t, but cluster allocation reads the
+ * FAT back from disk on every call (alloc_cluster -> fat_get), so a cluster
+ * claimed by one instance is seen as taken by the others; only free_count and
+ * next_free are per-instance, and both are advisory FSInfo hints. There is no
+ * concurrency to reason about either: usb_log_flush() already restricts the
+ * whole USB write path to the BSP (#239).
+ *
+ * The names are 8.3 because that is what hype_fat32_create() emits, so the
+ * ticket's "\vm-<name>.log" becomes "<name>.LOG" -- the file sits beside
+ * HYPE.LOG, where a "vm-" prefix would carry no information the name does not.
+ */
+static hype_log_sink_t g_hype_log;
+static int g_hype_log_ready;
+static hype_log_sink_t g_vm_log[HYPE_FW_MAX_VMS];
+static int g_vm_log_ready[HYPE_FW_MAX_VMS];
+
 /* Persistent copies of the USB block path the sink writes through. The probe's
  * own xc/msc are block-locals that die when the probe scope closes; the sink
  * lives for the whole post-EBS run (and the diagnostic halt), so its backend
@@ -13962,6 +13983,74 @@ static int usblog_write(void *ctx, uint64_t lba, uint32_t count, const void *src
  * partition. Try each candidate base LBA; hype_fat32_fs_mount validates the BPB
  * so a wrong guess just fails cleanly. Writes only touch free clusters + our own
  * file, never a partition table, so this is safe on the boot medium. */
+/*
+ * #338: build an 8.3 name for a VM's log file. Anything hype_fat32_create()
+ * cannot represent is dropped rather than silently mangled -- a VM whose
+ * configured name reduces to nothing falls back to "VMn", so a log file always
+ * exists and is always attributable.
+ */
+static void vm_log_name(unsigned int idx, const char *cfg_name, char *out, unsigned int max) {
+    unsigned int n = 0;
+    unsigned int i;
+    if (cfg_name != 0) {
+        for (i = 0; cfg_name[i] != '\0' && n < 8u; i++) {
+            char c = cfg_name[i];
+            if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+            if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+                out[n++] = c;
+            }
+        }
+    }
+    if (n == 0u) {
+        out[n++] = 'V';
+        out[n++] = 'M';
+        out[n++] = (char)('0' + (idx % 10u));
+    }
+    (void)max; /* caller guarantees >= 13 */
+    out[n++] = '.';
+    out[n++] = 'L';
+    out[n++] = 'O';
+    out[n++] = 'G';
+    out[n] = '\0';
+}
+
+/*
+ * #338: open the split companions on the volume the combined sink just mounted.
+ *
+ * Best-effort by design: a failure here must never cost the combined log, which
+ * is the artefact every past real-hardware investigation actually relied on. So
+ * each open is independent, failures are reported by name and stage, and
+ * \HYPEFULL.LOG keeps streaming regardless.
+ */
+static void split_log_setup(void) {
+    char name[16];
+    unsigned int i;
+    int rc;
+
+    rc = hype_log_sink_open_filtered(&g_hype_log, usblog_read, usblog_write, &g_usb_log_ctx,
+                                     "HYPE.LOG", g_host_time_valid ? &g_host_time : 0,
+                                     HYPE_LOG_SINK_HYPE);
+    g_hype_log_ready = (rc == HYPE_LOG_SINK_OK);
+    if (!g_hype_log_ready) {
+        hype_debug_print("usb-log: \\HYPE.LOG not opened (rc=%d) -- \\HYPEFULL.LOG is "
+                         "unaffected [#338]\n", rc);
+    }
+
+    for (i = 0; i < HYPE_FW_MAX_VMS; i++) {
+        const char *cfg_name = (i < g_hype_cfg.vm_count) ? g_hype_cfg.vms[i].name : 0;
+        vm_log_name(i, cfg_name, name, sizeof(name));
+        rc = hype_log_sink_open_filtered(&g_vm_log[i], usblog_read, usblog_write, &g_usb_log_ctx,
+                                         name, g_host_time_valid ? &g_host_time : 0, (int)i);
+        g_vm_log_ready[i] = (rc == HYPE_LOG_SINK_OK);
+        if (!g_vm_log_ready[i]) {
+            hype_debug_print("usb-log: \\%s not opened (rc=%d) [#338]\n", name, rc);
+        }
+    }
+    hype_debug_print("usb-log: split diagnostics -- hype's own output to \\HYPE.LOG, each "
+                     "guest's serial to its own file; \\HYPEFULL.LOG keeps the combined "
+                     "stream [#338]\n");
+}
+
 static void usb_log_setup(const hype_blk_backend_t *be) {
     uint64_t bases[8];
     unsigned int nb = 0, i;
@@ -13999,6 +14088,7 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
             g_usb_log_ready = 1;
             hype_debug_print("usb-log: streaming full log to \\HYPEFULL.LOG "
                              "(FAT32 at disk LBA %llu)\n", (unsigned long long)bases[i]);
+            split_log_setup();
             return;
         }
         /* Name the stage. "no mountable FAT32 volume" was printed even when the
@@ -14095,6 +14185,24 @@ static void usb_log_flush(void) {
      * project real time more than once. Report the first failure only: it repeats
      * every interval, and the report itself goes through the logbuf, which the
      * RT-3 NV tail still captures even when the USB sink is gone. */
+    /* #338: the split files ride the same cadence and the same BSP-only rule.
+     * Drained BEFORE the combined sink's failure report so a split-sink stall
+     * cannot be mistaken for a healthy run, and after the timestamp update
+     * above so their dirents advance too. Their failures are not reported
+     * individually: they share one block path with the combined sink, so a
+     * failure that reaches them reaches it, and one report is the useful one. */
+    if (g_hype_log_ready) {
+        hype_fat32_fs_set_time(&g_hype_log.fs, &g_usb_log.fs.now);
+        if (hype_log_sink_flush(&g_hype_log) != 0) g_hype_log_ready = 0;
+    }
+    {
+        unsigned int vi;
+        for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+            if (!g_vm_log_ready[vi]) continue;
+            hype_fat32_fs_set_time(&g_vm_log[vi].fs, &g_usb_log.fs.now);
+            if (hype_log_sink_flush(&g_vm_log[vi]) != 0) g_vm_log_ready[vi] = 0;
+        }
+    }
     if (hype_log_sink_flush(&g_usb_log) != 0 && !g_usb_log_flush_failed) {
         g_usb_log_flush_failed = 1;
         hype_debug_print("usb-log: FLUSH FAILED -- \\HYPEFULL.LOG has stopped growing and is "
