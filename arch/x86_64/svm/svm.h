@@ -597,6 +597,13 @@ void hype_svm_vcpu_get_atapi_diag(unsigned long long *xfers, unsigned long long 
                                   unsigned long long *req_bytes, unsigned long long *done_bytes,
                                   unsigned long long *owed_bytes);
 
+#if HYPE_343_VERIFY_READS
+/* #343 diagnostic builds only: how many streamed reads were re-read and compared against what was
+ * written into guest memory, and how many DIFFERED. Non-zero mismatched means hype handed the guest
+ * something other than the ISO's bytes. */
+void hype_svm_vcpu_get_read_verify(unsigned long long *checked, unsigned long long *mismatched);
+#endif
+
 /*
  * INPUT-1: the reusable "a device wired to `chip` just raised `irq`"
  * entry point -- combines devices/pic.h's own real-hardware modeling

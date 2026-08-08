@@ -1071,6 +1071,10 @@ static unsigned long long g_atapi_short_xfers = 0;
 static unsigned long long g_atapi_req_bytes = 0;
 static unsigned long long g_atapi_done_bytes = 0;
 static unsigned long long g_atapi_owed_bytes = 0;
+#if HYPE_343_VERIFY_READS
+static unsigned long long g_343_verified = 0;
+static unsigned long long g_343_mismatch = 0;
+#endif
 
 void hype_svm_vcpu_get_atapi_diag(unsigned long long *xfers, unsigned long long *short_xfers,
                                   unsigned long long *req_bytes, unsigned long long *done_bytes,
@@ -1081,6 +1085,13 @@ void hype_svm_vcpu_get_atapi_diag(unsigned long long *xfers, unsigned long long 
     if (done_bytes != 0) { *done_bytes = g_atapi_done_bytes; }
     if (owed_bytes != 0) { *owed_bytes = g_atapi_owed_bytes; }
 }
+
+#if HYPE_343_VERIFY_READS
+void hype_svm_vcpu_get_read_verify(unsigned long long *checked, unsigned long long *mismatched) {
+    if (checked != 0) { *checked = g_343_verified; }
+    if (mismatched != 0) { *mismatched = g_343_mismatch; }
+}
+#endif
 
 void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
                                  unsigned long long *window, unsigned long long *overwrite) {
@@ -2038,6 +2049,47 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
             static unsigned g_stream_dbg = 0;
             int srr = hype_iso_stream_read(atapi->media_stream, media_byte_off + transferred, dst,
                                            chunk);
+#if HYPE_343_VERIFY_READS
+            /*
+             * #343: read the SAME range again and compare it against what was just written into
+             * guest memory.
+             *
+             * The guest faults on a page of its own kernel image that is absent, which is a hole in
+             * a loaded file rather than a truncated one -- so the question is whether hype ever
+             * hands the guest something other than the ISO's bytes. Aggregate counters have
+             * answered what they can (stream failures zero, ATAPI short transfers identical in
+             * clean runs); this compares content, per read, which is the only thing left that can
+             * distinguish "delivered wrong bytes" from "delivered fine and the guest lost the page".
+             *
+             * DIAGNOSTIC ONLY, compile-time gated: it doubles the reads on this path. A mismatch is
+             * reported with the offset and the first diverging byte so the failing range can be
+             * matched against the kernel image's own layout.
+             */
+            if (srr == 0) {
+                static uint8_t v343[4096];
+                static unsigned v343_reported = 0;
+                uint32_t vlen = (chunk <= sizeof(v343)) ? chunk : (uint32_t)sizeof(v343);
+                if (hype_iso_stream_read(atapi->media_stream, media_byte_off + transferred, v343,
+                                         vlen) == 0) {
+                    uint32_t vi;
+                    g_343_verified++;
+                    for (vi = 0; vi < vlen; vi++) {
+                        if (v343[vi] != dst[vi]) {
+                            g_343_mismatch++;
+                            if (v343_reported < 8u) {
+                                v343_reported++;
+                                hype_debug_print("fw-1 #343 MISMATCH: iso_off=%llu +%u delivered=%02x "
+                                                 "reread=%02x (chunk=%u)\n",
+                                                 (unsigned long long)(media_byte_off + transferred),
+                                                 (unsigned)vi, (unsigned)dst[vi], (unsigned)v343[vi],
+                                                 (unsigned)chunk);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+#endif
             /* #346: the loader stops after reading root-dir LBA 51 and never fetches /etc
              * (LBA 56), so dump the exact bytes delivered for the DIRECTORY sectors -- those
              * decide what it looks for next. QEMU reads 56; real hardware does not, with every

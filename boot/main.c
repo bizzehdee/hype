@@ -9197,6 +9197,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * rather than leaving it to be inferred from a capped trace. */
                     hype_debug_print("fw-1 ATAPIXFER: xfers=%llu short=%llu owed=%llu "
                                      "req=%llu done=%llu\n", ax, as, ao, ar, ad);
+#if HYPE_343_VERIFY_READS
+                    {   /* #343: content verification, diagnostic builds only. */
+                        unsigned long long vc = 0, vm2 = 0;
+                        hype_svm_vcpu_get_read_verify(&vc, &vm2);
+                        hype_debug_print("fw-1 #343 VERIFY: checked=%llu mismatched=%llu\n", vc, vm2);
+                    }
+#endif
                 }
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
