@@ -9189,6 +9189,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                     hype_debug_print("%s (injected/requested)\n", vl);
                 }
+                if (kind != HYPE_VMM_KIND_VMX) {
+                    unsigned long long ax = 0, as = 0, ar = 0, ad = 0, ao = 0;
+                    hype_svm_vcpu_get_atapi_diag(&ax, &as, &ar, &ad, &ao);
+                    /* #343: short_xfer NON-ZERO means a guest was handed a partly-filled buffer and
+                     * told the read succeeded. req vs done makes the size of the loss explicit
+                     * rather than leaving it to be inferred from a capped trace. */
+                    hype_debug_print("fw-1 ATAPIXFER: xfers=%llu short=%llu owed=%llu "
+                                     "req=%llu done=%llu\n", ax, as, ao, ar, ad);
+                }
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,

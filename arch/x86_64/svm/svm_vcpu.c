@@ -1057,6 +1057,31 @@ static unsigned long long g_int_defer_overwrite = 0; /* requested a vector alrea
  * the one-shot-clockevent death. Now counted and never lost. */
 static unsigned long long g_int_eventinj_collision = 0;
 
+/*
+ * #343: ATAPI transfer accounting. A SHORT transfer -- the PRDT list exhausted with bytes still
+ * owed -- is reported to the guest as success, so nothing else in the system can notice it. Any
+ * non-zero short count means a guest was handed a partly-filled buffer and told the read completed.
+ *
+ * Counters, not a trace: the ISO stream trace is capped at 24 records and the guest's kernel load
+ * happens long after those, which is exactly why the first pass at this question had no evidence
+ * either way. See #356 for the same lesson at greater cost.
+ */
+static unsigned long long g_atapi_xfers = 0;
+static unsigned long long g_atapi_short_xfers = 0;
+static unsigned long long g_atapi_req_bytes = 0;
+static unsigned long long g_atapi_done_bytes = 0;
+static unsigned long long g_atapi_owed_bytes = 0;
+
+void hype_svm_vcpu_get_atapi_diag(unsigned long long *xfers, unsigned long long *short_xfers,
+                                  unsigned long long *req_bytes, unsigned long long *done_bytes,
+                                  unsigned long long *owed_bytes) {
+    if (xfers != 0) { *xfers = g_atapi_xfers; }
+    if (short_xfers != 0) { *short_xfers = g_atapi_short_xfers; }
+    if (req_bytes != 0) { *req_bytes = g_atapi_req_bytes; }
+    if (done_bytes != 0) { *done_bytes = g_atapi_done_bytes; }
+    if (owed_bytes != 0) { *owed_bytes = g_atapi_owed_bytes; }
+}
+
 void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
                                  unsigned long long *window, unsigned long long *overwrite) {
     *eventinj = g_int_eventinj;
@@ -1983,6 +2008,11 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     prdt_bytes = cmd_table_bytes + 0x80;
     prd_idx = 0;
     transferred = 0;
+    g_atapi_xfers++;
+    {
+        /* #343: what the command ASKED for, before the PRDT list can cut it short. */
+        g_atapi_req_bytes += (uint64_t)remaining;
+    }
     while (remaining > 0 && prd_idx < hdr.prdtl) {
         hype_ahci_prdt_entry_t prd;
         uint32_t chunk;
@@ -2074,6 +2104,24 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
         status_reg = (uint8_t)(0x50u | 0x01u); /* DRDY|DSC|ERR */
         error_reg = (uint8_t)(atapi->sense_key << 4);
     }
+
+    /*
+     * #343: the loop above exits when the PRDT list runs out, NOT only when the request is
+     * satisfied -- so a guest whose PRDT does not cover its own block count gets a SHORT transfer
+     * reported as success, with PRDBC honestly reporting the short count. A driver that checks
+     * PRDBC notices; one that does not believes it read the whole thing and carries on with a
+     * partially-filled buffer. Count it, because that is a silent wrong-data path and the reason
+     * this counter exists is a FreeBSD guest that page-faulted on a page of its own kernel image.
+     *
+     * A counter rather than a trace: the stream trace is capped at 24 records and the kernel load
+     * happens long after those, which is precisely why the first attempt at this had no evidence
+     * either way (see #356 for the same lesson).
+     */
+    if (remaining > 0u) {
+        g_atapi_short_xfers++;
+        g_atapi_owed_bytes += (uint64_t)remaining;
+    }
+    g_atapi_done_bytes += (uint64_t)transferred;
 
     /* PRDBC (Command Header dword 1, byte offset 4): the count of bytes
      * actually transferred. EDK2's PIO-in path (AhciPioTransfer, used by

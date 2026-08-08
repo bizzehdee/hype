@@ -589,6 +589,14 @@ void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long
  * invisible lost-interrupt) -- now safely serialized, never dropped. */
 unsigned long long hype_svm_vcpu_get_eventinj_collisions(void);
 
+/* #343: ATAPI transfer accounting. `short_xfers` counts transfers that ended with bytes still owed
+ * because the guest's PRDT list ran out -- reported to the guest as SUCCESS, so nothing else can
+ * notice. Any non-zero value means a guest was handed a partially-filled buffer and told it was
+ * complete. */
+void hype_svm_vcpu_get_atapi_diag(unsigned long long *xfers, unsigned long long *short_xfers,
+                                  unsigned long long *req_bytes, unsigned long long *done_bytes,
+                                  unsigned long long *owed_bytes);
+
 /*
  * INPUT-1: the reusable "a device wired to `chip` just raised `irq`"
  * entry point -- combines devices/pic.h's own real-hardware modeling
