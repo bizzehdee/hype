@@ -32,6 +32,7 @@
 #include "../core/ahci_host.h"
 #include "../core/disk_inventory.h"
 #include "../core/cpu_topology.h"
+#include "../core/pe_ident.h"
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
 #include "../core/fat.h"
@@ -6578,6 +6579,40 @@ static int fw_1_guest_virt_to_phys(hype_fw_vm_t *vm, uint64_t cr3, uint64_t gva,
  * whose RIP may be virtual: try a guest page-table walk (CR3), then fall
  * back to treating RIP as guest-physical (correct for an identity-paged
  * guest such as OVMF). Used only when decode assists gave nothing. */
+/*
+ * #364: bridge the guest page walk to core/pe_ident, so a hot RIP in firmware or
+ * bootloader space can be named instead of stared at.
+ *
+ * FreeBSD stops before its kernel runs on Intel and spins at 0x7f466526 -- an
+ * address that resolves against nothing, because UEFI relocates every driver and
+ * the shipped OVMF is a RELEASE build that emits no module log (OVMF-DBGPORT
+ * reported writes=0). Walking guest memory back to the enclosing PE image and
+ * reading its own CodeView name is the only way to find out what is running.
+ */
+typedef struct {
+    hype_fw_vm_t *vm;
+    hype_vcpu_ctx_t *ctx;
+} fw_1_pe_ctx_t;
+
+static int fw_1_pe_read(void *vctx, uint64_t va, void *dst, uint64_t len) {
+    fw_1_pe_ctx_t *c = (fw_1_pe_ctx_t *)vctx;
+    uint64_t gpa = 0;
+    const uint8_t *p;
+    uint8_t *o = (uint8_t *)dst;
+    uint64_t i;
+    /* Byte at a time through the existing walk: correct across page boundaries,
+     * and these reads are rare (once per periodic dump), so simplicity wins. */
+    for (i = 0; i < len; i++) {
+        if (fw_1_guest_virt_to_phys(c->vm, vmm_get_cr3(g_fw_1_kind, c->ctx), va + i, &gpa) != 0) {
+            return -1;
+        }
+        p = fw_1_guest_phys_to_host(c->vm, gpa);
+        if (p == 0) return -1;
+        o[i] = *p;
+    }
+    return 0;
+}
+
 static const uint8_t *fw_1_insn_bytes_via_ptwalk(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, uint64_t guest_rip) {
     uint64_t gpa = 0;
     /*
@@ -9724,6 +9759,34 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                              (unsigned long long)riphist_rip[top[0]], ib[0], ib[1],
                                              ib[2], ib[3], ib[4], ib[5], ib[6], ib[7], ib[8], ib[9],
                                              ib[10], ib[11]);
+                        }
+                        {
+                            /* #364: name the module that RIP is in. A base with no
+                             * name is still worth printing -- a RELEASE image
+                             * legitimately has no CodeView record, and the base
+                             * alone bounds the search. Saying nothing, or
+                             * inventing a name, would both be worse. */
+                            fw_1_pe_ctx_t pctx;
+                            uint64_t mbase;
+                            pctx.vm = vm;
+                            pctx.ctx = ctx;
+                            mbase = hype_pe_find_image_base(fw_1_pe_read, &pctx,
+                                                            riphist_rip[top[0]]);
+                            if (mbase != 0) {
+                                char mname[32];
+                                int have = hype_pe_module_name(fw_1_pe_read, &pctx, mbase, mname,
+                                                               sizeof(mname));
+                                hype_debug_print("fw-1 RIPHOT-MODULE 0x%llx -> base 0x%llx (+0x%llx) "
+                                                 "%s [#364]\n",
+                                                 (unsigned long long)riphist_rip[top[0]],
+                                                 (unsigned long long)mbase,
+                                                 (unsigned long long)(riphist_rip[top[0]] - mbase),
+                                                 (have == 0) ? mname : "<no CodeView name>");
+                            } else {
+                                hype_debug_print("fw-1 RIPHOT-MODULE 0x%llx -> no PE image found "
+                                                 "within the scan bound [#364]\n",
+                                                 (unsigned long long)riphist_rip[top[0]]);
+                            }
                         }
                     }
                 }
