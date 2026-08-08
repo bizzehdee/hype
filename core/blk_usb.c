@@ -2,7 +2,9 @@
 
 /* hype_xhci_msc_read/_write bounce through a 4 KiB page, so at most 8 x 512B
  * sectors per xHCI call. blk_backend hands us larger runs; sub-chunk them. */
-#define USB_MAX_SECTORS 8u
+/* #365: 128 x 512B = 64 KiB, matching XPAGE, so a media fill is ONE SCSI command
+ * instead of sixteen. See the XPAGE comment in core/xhci_hw.c. */
+#define USB_MAX_SECTORS 128u
 
 /*
  * #346: ONE xHCI transfer at a time, across cores. The guest's media reads run on an AP (the

@@ -11,7 +11,44 @@
  * Post-ExitBootServices only.
  */
 
+/*
+ * #365: bytes per SCSI command.
+ *
+ * Was 4096. Bulk-Only Transport is CBW -> DATA -> CSW, three SEQUENTIAL dependent transfers, and
+ * USB 2.0 schedules bulk traffic per 125 us microframe -- so one SCSI command costs at least three
+ * microframes (375 us) no matter how small it is. Measured on hardware: 551 us per command, just
+ * above that floor, with only ~62 us of actual wire time. The wait is the bus schedule, not hype's
+ * polling, so polling faster gains nothing.
+ *
+ * The lever is bytes per command. At 4 KiB a 64 KiB media fill needed 16 commands (~8.8 ms); at
+ * 64 KiB it needs one (~0.55 ms). A single xHCI Normal TRB carries up to 64 KiB (the TRB Transfer
+ * Length field is 17 bits), so this stays one TRB per transfer and adds no ring complexity.
+ *
+ * Note this is a bounce BUFFER size, not a cache: nothing is retained between transfers, so it
+ * introduces no state shared between guests -- deliberately, given #343.
+ */
 #define XPAGE 4096u
+
+/*
+ * #365: bytes per SCSI command -- the DATA bounce buffer only, NOT the rings.
+ *
+ * XPAGE stays a page: it sizes the DCBAA, the command/event rings and the scratchpad pages, none
+ * of which want to be bigger (and scratch_pages[MAX_SCRATCH][XPAGE] would balloon).
+ *
+ * The data path is different. Bulk-Only Transport is CBW -> DATA -> CSW, three SEQUENTIAL
+ * dependent transfers, and USB 2.0 schedules bulk traffic per 125 us microframe -- so one SCSI
+ * command costs at least three microframes (375 us) however small it is. Measured on hardware:
+ * 551 us per command, just above that floor, of which only ~62 us is wire time. The wait is the
+ * bus schedule, not hype's polling, so polling faster gains nothing.
+ *
+ * The lever is bytes per command. At 4 KiB a 64 KiB media fill took 16 commands (~8.8 ms); at
+ * 64 KiB it takes one (~0.55 ms). A single xHCI Normal TRB carries up to 64 KiB (TRB Transfer
+ * Length is 17 bits), so this remains one TRB per transfer.
+ *
+ * A bounce BUFFER, not a cache: nothing is retained between transfers, so no state is shared
+ * between guests. That is deliberate given #343.
+ */
+#define XDATA 65536u
 #define RING_TRBS 16u
 #define MAX_SCRATCH 64u
 #define DEVPOOL 8u
@@ -85,7 +122,9 @@ typedef struct {
     /* BOT command/status wrappers + a bulk data bounce buffer. */
     uint8_t cbw[64] __attribute__((aligned(64)));
     uint8_t csw[64] __attribute__((aligned(64)));
-    uint8_t data[XPAGE] __attribute__((aligned(XPAGE)));
+    /* Page-aligned for DMA; larger than a page, but only page alignment is architecturally
+     * required. */
+    uint8_t data[XDATA] __attribute__((aligned(4096)));
     uint32_t bot_tag;
 
     /*
@@ -1055,6 +1094,20 @@ static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
 
 /* Bulk-Only Transport: CBW (out) -> optional data phase -> CSW (in). Data flows
  * through hw->data (bounced). Returns 0 iff the CSW reports command-passed. */
+/* #365: freestanding block copy, 8 bytes at a time when both pointers and the length permit.
+ * No libc here, and the media path now moves 64 KiB per transfer. */
+static void bounce_copy(uint8_t *dst, const uint8_t *src, unsigned int len) {
+    unsigned int i = 0;
+    if ((((uintptr_t)dst | (uintptr_t)src) & 7u) == 0u) {
+        uint64_t *d = (uint64_t *)dst;
+        const uint64_t *s8 = (const uint64_t *)src;
+        unsigned int words = len >> 3;
+        for (; i < words; i++) d[i] = s8[i];
+        i <<= 3;
+    }
+    for (; i < len; i++) dst[i] = src[i];
+}
+
 static int bot_scsi_once(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                     const uint8_t *cdb, unsigned int cdb_len, uint8_t *data, unsigned int data_len,
                     int dir_in) {
@@ -1062,9 +1115,8 @@ static int bot_scsi_once(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci
     unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
     unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
     uint32_t tag = ++hw->bot_tag;
-    unsigned int i;
 
-    if (data_len > XPAGE) return -1;
+    if (data_len > XDATA) return -1;
 
     /* CBW on the bulk OUT endpoint. */
     hype_usb_bot_cbw(hw->cbw, tag, data_len, dir_in, 0, cdb, cdb_len);
@@ -1076,9 +1128,11 @@ static int bot_scsi_once(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci
         if (dir_in) {
             if (bulk_xfer(c, hw->bulk_in_ring, &hw->bin_enq, &hw->bin_cyc, slot, dci_in,
                           phys(hw->data), data_len) != 0) return -1;
-            for (i = 0; i < data_len; i++) data[i] = hw->data[i];
+            /* #365: word-at-a-time when both sides allow it. At 64 KiB a byte loop is 65536
+             * iterations on the hot media path; this cuts it to 8192. */
+            bounce_copy(data, hw->data, data_len);
         } else {
-            for (i = 0; i < data_len; i++) hw->data[i] = data[i];
+            bounce_copy(hw->data, data, data_len);
             if (bulk_xfer(c, hw->bulk_out_ring, &hw->bout_enq, &hw->bout_cyc, slot, dci_out,
                           phys(hw->data), data_len) != 0) return -1;
         }
@@ -1161,7 +1215,7 @@ int hype_xhci_msc_read(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
                        uint32_t lba, unsigned int blocks, unsigned int block_size, void *buf) {
     uint8_t cdb[10];
     unsigned int len = blocks * block_size;
-    if (len == 0u || len > XPAGE) return -1;
+    if (len == 0u || len > XDATA) return -1;
     hype_scsi_cdb_read10(cdb, lba, (uint16_t)blocks);
     return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)buf, len, 1);
 }
@@ -1172,7 +1226,7 @@ int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_
     uint8_t cdb[10];
     unsigned int len = blocks * block_size;
     unsigned int i;
-    if (len == 0u || len > XPAGE) return -1;
+    if (len == 0u || len > XDATA) return -1;
     /* stage the caller's data (bot_scsi bounces from hw->data for OUT). */
     for (i = 0; i < len; i++) ((uint8_t *)hw->data)[i] = ((const uint8_t *)buf)[i];
     hype_scsi_cdb_write10(cdb, lba, (uint16_t)blocks);
