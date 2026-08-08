@@ -1111,6 +1111,8 @@ static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
 /* #367: cost of fetching the faulting instruction on an emulated-MMIO exit, against the exit
  * total. Decides between caching the decode and restructuring the page tables. */
 static unsigned long long g_mmio_fetch_tsc, g_mmio_fetch_calls;
+/* #367: cost of emulating an AHCI register access, separate from the global exit mean. */
+static unsigned long long g_ahci_npf_tsc, g_ahci_npf_calls;
 
 /* #363: host keyboard -> focused-guest routing state. A file-global because the BSP now owns
  * polling (fw_1_host_input_poll); it used to be a local in the guest dispatch loop, which is
@@ -9478,11 +9480,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     unsigned long long reads = (unsigned long long)g_fw_1_atapi.read10_count;
                     if (g_mmio_fetch_calls != 0 && g_vms[0].host_tsc_hz != 0) {
                         hype_debug_print(
-                            "fw-1 MMIOCOST: insn_fetch calls=%llu total=%llums us_each=%llu "
-                            "[#367]\n", g_mmio_fetch_calls,
+                            "fw-1 MMIOCOST: insn_fetch calls=%llu total=%llums us_each=%llu | "
+                            "ahci_emul calls=%llu total=%llums us_each=%llu [#367]\n",
+                            g_mmio_fetch_calls,
                             (g_mmio_fetch_tsc * 1000ull) / g_vms[0].host_tsc_hz,
                             (g_mmio_fetch_tsc * 1000000ull) / g_vms[0].host_tsc_hz /
-                                g_mmio_fetch_calls);
+                                g_mmio_fetch_calls,
+                            g_ahci_npf_calls,
+                            (g_ahci_npf_tsc * 1000ull) / g_vms[0].host_tsc_hz,
+                            (g_ahci_npf_calls != 0)
+                                ? (g_ahci_npf_tsc * 1000000ull) / g_vms[0].host_tsc_hz /
+                                      g_ahci_npf_calls
+                                : 0ull);
                     }
                     hype_debug_print(
                         "fw-1 AHCIIRQ: cd=%llu/%llu ata=%llu/%llu (delivered/pending) | "
@@ -11386,6 +11395,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 #endif
                 if (ahci_npf.guest_phys_addr >= ahci_abar &&
                     ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
+                    /*
+                     * #367: time THIS exit type specifically.
+                     *
+                     * I previously claimed AHCI register polling was 46% of run time. That number
+                     * was invalid: I multiplied the AHCI exit COUNT by the GLOBAL mean exit cost,
+                     * and that mean is dominated by media-read page faults costing milliseconds
+                     * each. A register read and a disc read are both "an NPF" and nothing else
+                     * about them is comparable.
+                     *
+                     * MMIOCOST already showed the instruction fetch is ~15 ns, i.e. free, which
+                     * killed the decode-cache idea. What remains unmeasured is the emulation
+                     * itself -- and that is the number that decides whether restructuring NPT/EPT
+                     * for a read-only shadow page is worth its risk.
+                     */
+                    uint64_t t_ahci = hype_rdtsc();
                     if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
                                                            &g_fw_1_dma_map, insn) == 0) {
                         ex_ahci_npf++; /* exit-histogram sub-bucket */
@@ -11458,6 +11482,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             }
                         }
                         continue;
+                        g_ahci_npf_tsc += hype_rdtsc() - t_ahci;
+                        g_ahci_npf_calls++;
                     }
                     /* Same evidence the generic undecodable-NPF fatal prints, for the
                      * same reason: without the bytes, "unhandled" cannot be told apart
