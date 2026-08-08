@@ -48,10 +48,37 @@
  * which is what every driver handles and what keeps the doorbell index arithmetic trivial.
  */
 #define HYPE_NVME_CAP_DSTRD 0u
+/*
+ * #358: CAP.CSS bit 0 -- "the NVM command set is supported".
+ *
+ * CAP.CSS is bits 44:37 of the 64-bit CAP, so its bit 0 is bit 5 of the HIGH dword. Leaving it
+ * clear says the controller supports no command set at all, and EDK2's NvmExpressDxe refuses the
+ * device outright: "NvmeControllerInit: the controller doesn't support NVMe command set", then
+ * "NvmExpressDriverBindingStart: end with Unsupported". Linux's nvme driver does not check it,
+ * which is why the controller worked under Linux and never under the guest firmware.
+ */
+#define HYPE_NVME_CAP_CSS_NVM (1u << 5)
+/*
+ * #358: CAP.TO -- how long the driver may wait for CSTS.RDY to follow CC.EN, in 500 ms units
+ * (bits 31:24 of the low dword). Zero means "no time at all", which is not a promise hype can
+ * keep even though it completes the transition synchronously: a driver that computes its timeout
+ * from this gets a zero-length one. 0x0F is 7.5 seconds, a realistic controller value.
+ */
+#define HYPE_NVME_CAP_TO 0x0Fu
 #define HYPE_NVME_DOORBELL_STRIDE 4u
 
 /* One admin pair plus one I/O pair is the whole scope (#202). */
-#define HYPE_NVME_MAX_QUEUES 2u
+/*
+ * #358: admin (0) plus TWO I/O pairs, because that is what a real driver asks for.
+ *
+ * EDK2's NvmExpressDxe creates I/O queues in a loop `for (Index = 1; Index < NVME_MAX_QUEUES;
+ * Index++)` with NVME_MAX_QUEUES == 3 -- queue 1 for I/O and queue 2 for asynchronous events
+ * (NVME_ASYNC_CCQ_SIZE). With only one I/O pair modelled, the second CREATE I/O COMPLETION QUEUE
+ * was answered "Invalid Field in Command", NvmeControllerInit failed, and the whole controller was
+ * refused: "NvmExpressDriverBindingStart: end with Device Error". Linux asks for one queue per CPU
+ * and copes with being given fewer, which is why this only ever showed under firmware.
+ */
+#define HYPE_NVME_MAX_QUEUES 3u
 /* CAP.MQES is "max queue entries MINUS ONE", a classic off-by-one to get wrong in both directions. */
 #define HYPE_NVME_QUEUE_ENTRIES 64u
 #define HYPE_NVME_CAP_MQES (HYPE_NVME_QUEUE_ENTRIES - 1u)
@@ -79,8 +106,10 @@ typedef struct {
      */
     uint32_t sq_head[HYPE_NVME_MAX_QUEUES];
     /* I/O queue bases, as recorded by CREATE_IO_SQ/CQ. Queue 0 uses asq/acq. */
-    uint64_t io_sq_base;
-    uint64_t io_cq_base;
+    /* #358: per-queue, indexed by queue id. Index 0 is unused -- the admin queue's bases are asq
+     * and acq -- so that a queue id indexes these directly and cannot be off by one. */
+    uint64_t io_sq_base[HYPE_NVME_MAX_QUEUES];
+    uint64_t io_cq_base[HYPE_NVME_MAX_QUEUES];
     /*
      * #202 slice 6c: the number of entries the GUEST declared for each queue -- AQA for the admin pair,
      * QSIZE (CDW10 bits 31:16) for the I/O pair.

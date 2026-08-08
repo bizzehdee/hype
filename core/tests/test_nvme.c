@@ -120,6 +120,22 @@ static void test_capabilities_advertise_what_hype_actually_does(void) {
     CHECK_HEX("CAP.MQES is entries-1", HYPE_NVME_QUEUE_ENTRIES - 1u, cap_lo & 0xFFFFu);
     CHECK_HEX("CAP.CQR set: hype requires contiguous queues", 1u, (cap_lo >> 16) & 1u);
     CHECK_HEX("CAP.DSTRD 0 => 4-byte doorbell stride", 0u, cap_hi & 0xFu);
+    /*
+     * #358: CAP.CSS bit 0 -- the NVM command set. CSS is bits 44:37 of the 64-bit CAP, so its
+     * bit 0 is bit 5 of the high dword. Leaving it clear claims the controller supports NO
+     * command set, and EDK2 refuses the device on exactly that: "NvmeControllerInit: the
+     * controller doesn't support NVMe command set" then "DriverBindingStart: end with
+     * Unsupported". Linux does not check it, which is why this survived: the controller worked
+     * under Linux and was invisible to the guest firmware.
+     */
+    CHECK_HEX("CAP.CSS advertises the NVM command set", 1u, (cap_hi >> 5) & 1u);
+    /*
+     * CAP.TO, bits 31:24, in 500 ms units: how long a driver may wait for CSTS.RDY to follow
+     * CC.EN. Zero means "no time at all" -- not a promise hype can keep even though it makes the
+     * transition synchronously, because a driver that derives its timeout from this gets a
+     * zero-length one.
+     */
+    CHECK_HEX("CAP.TO is non-zero", 1u, ((cap_lo >> 24) & 0xFFu) != 0u);
     CHECK_HEX("version reads 1.4.0", 0x00010400u, hype_nvme_mmio_read32(&d, HYPE_NVME_REG_VS));
 }
 
@@ -142,8 +158,15 @@ static void test_doorbell_decode_refuses_rather_than_clamps(void) {
      * index it does not own.
      */
     CHECK_HEX("a misaligned doorbell is refused", -1, hype_nvme_doorbell_decode(0x1002u, &qid, &is_cq));
+    /* #358: derived from HYPE_NVME_MAX_QUEUES, not hardcoded. This asserted 0x1010 while only two
+     * queues existed; raising the count to three made 0x1010 the legitimate SQ2 doorbell and the
+     * test failed for the right reason. Deriving it means the next change to the queue count cannot
+     * silently turn this into an assertion about a valid doorbell. */
     CHECK_HEX("a doorbell past the last queue is refused", -1,
-              hype_nvme_doorbell_decode(0x1010u, &qid, &is_cq));
+              hype_nvme_doorbell_decode(0x1000u + HYPE_NVME_MAX_QUEUES * 8u, &qid, &is_cq));
+    CHECK_HEX("the LAST modelled queue's doorbells still decode", 0,
+              hype_nvme_doorbell_decode(0x1000u + (HYPE_NVME_MAX_QUEUES - 1u) * 8u, &qid, &is_cq));
+    CHECK_HEX("  and it is the last queue id", HYPE_NVME_MAX_QUEUES - 1u, qid);
     CHECK_HEX("an offset below the doorbell window is refused", -1,
               hype_nvme_doorbell_decode(0x0FFCu, &qid, &is_cq));
     CHECK_HEX("NULL outputs refused", -1, hype_nvme_doorbell_decode(0x1000u, 0, &is_cq));

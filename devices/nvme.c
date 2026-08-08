@@ -29,9 +29,9 @@ void hype_nvme_reset(hype_nvme_t *dev) {
          * than dividing by zero. */
         dev->sq_entries[q] = HYPE_NVME_QUEUE_ENTRIES;
         dev->cq_entries[q] = HYPE_NVME_QUEUE_ENTRIES;
+        dev->io_sq_base[q] = 0; /* #358: per-queue; index 0 unused (admin uses asq/acq) */
+        dev->io_cq_base[q] = 0;
     }
-    dev->io_sq_base = 0;
-    dev->io_cq_base = 0;
 }
 
 uint32_t hype_nvme_mmio_read32(const hype_nvme_t *dev, uint32_t off) {
@@ -39,12 +39,14 @@ uint32_t hype_nvme_mmio_read32(const hype_nvme_t *dev, uint32_t off) {
         case HYPE_NVME_REG_CAP:
             /*
              * CAP low dword: MQES in 15:0 (entries MINUS ONE), CQR (bit 16) set because hype requires
-             * physically contiguous queues, DSTRD in 35:32 -- i.e. the high dword.
+             * physically contiguous queues, TO in 31:24, DSTRD in 35:32 -- i.e. the high dword.
              */
-            return (uint32_t)HYPE_NVME_CAP_MQES | (1u << 16);
+            return (uint32_t)HYPE_NVME_CAP_MQES | (1u << 16) |
+                   ((uint32_t)HYPE_NVME_CAP_TO << 24);
         case HYPE_NVME_REG_CAP + 4u:
-            /* DSTRD is bits 35:32 of CAP, so bits 3:0 here. Zero => 4-byte stride. */
-            return (uint32_t)HYPE_NVME_CAP_DSTRD;
+            /* High dword: DSTRD in 3:0 (zero => 4-byte stride), CSS in 12:5. CSS bit 0 says the
+             * NVM command set is supported, without which EDK2 rejects the controller (#358). */
+            return (uint32_t)HYPE_NVME_CAP_DSTRD | (uint32_t)HYPE_NVME_CAP_CSS_NVM;
         case HYPE_NVME_REG_VS:
             return 0x00010400u; /* 1.4.0 */
         case HYPE_NVME_REG_CC:
@@ -100,8 +102,13 @@ void hype_nvme_mmio_write32(hype_nvme_t *dev, uint32_t off, uint32_t value) {
                     dev->sq_entries[q] = HYPE_NVME_QUEUE_ENTRIES;
                     dev->cq_entries[q] = HYPE_NVME_QUEUE_ENTRIES;
                 }
-                dev->io_sq_base = 0;
-                dev->io_cq_base = 0;
+                {
+                    unsigned int qi;
+                    for (qi = 0; qi < HYPE_NVME_MAX_QUEUES; qi++) {
+                        dev->io_sq_base[qi] = 0;
+                        dev->io_cq_base[qi] = 0;
+                    }
+                }
             }
             return;
         case HYPE_NVME_REG_AQA:
@@ -532,11 +539,11 @@ uint16_t hype_nvme_exec_io(const hype_nvme_cmd_t *cmd, hype_blk_backend_t *be,
  * CREATE_IO_SQ/CQ. Returning the base rather than indexing an array keeps the admin special case in one
  * place instead of at every use. */
 static uint64_t sq_base_of(const hype_nvme_t *dev, unsigned int qid) {
-    return (qid == 0u) ? dev->asq : dev->io_sq_base;
+    return (qid == 0u) ? dev->asq : dev->io_sq_base[qid];
 }
 
 static uint64_t cq_base_of(const hype_nvme_t *dev, unsigned int qid) {
-    return (qid == 0u) ? dev->acq : dev->io_cq_base;
+    return (qid == 0u) ? dev->acq : dev->io_cq_base[qid];
 }
 
 /* Executes one ADMIN command, returning its NVMe status. */
@@ -564,25 +571,33 @@ static uint16_t exec_admin(hype_nvme_t *dev, const hype_nvme_cmd_t *cmd, const h
         case HYPE_NVME_ADMIN_CREATE_IO_CQ:
             /* CDW10 low 16 = queue id. Only the one I/O pair is modelled, so anything else is refused
              * rather than silently aliased onto it. */
-            if ((cmd->cdw10 & 0xFFFFu) != 1u) {
-                return HYPE_NVME_SC_INVALID_FIELD;
+            {
+                uint32_t qid = cmd->cdw10 & 0xFFFFu;
+                if (qid == 0u || qid >= HYPE_NVME_MAX_QUEUES) {
+                    return HYPE_NVME_SC_INVALID_FIELD;
+                }
+                dev->io_cq_base[qid] = cmd->prp1;
             }
-            dev->io_cq_base = cmd->prp1;
             /* QSIZE is CDW10 bits 31:16, zero-based -- the I/O counterpart of AQA. Ignoring it was the
              * same defect. */
             {
+                uint32_t qid2 = cmd->cdw10 & 0xFFFFu;
                 uint32_t qs = ((cmd->cdw10 >> 16) & 0xFFFFu) + 1u;
-                dev->cq_entries[1] = (qs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : qs;
+                dev->cq_entries[qid2] = (qs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : qs;
             }
             return HYPE_NVME_SC_SUCCESS;
         case HYPE_NVME_ADMIN_CREATE_IO_SQ:
-            if ((cmd->cdw10 & 0xFFFFu) != 1u) {
-                return HYPE_NVME_SC_INVALID_FIELD;
-            }
-            dev->io_sq_base = cmd->prp1;
             {
+                uint32_t qid = cmd->cdw10 & 0xFFFFu;
+                if (qid == 0u || qid >= HYPE_NVME_MAX_QUEUES) {
+                    return HYPE_NVME_SC_INVALID_FIELD;
+                }
+                dev->io_sq_base[qid] = cmd->prp1;
+            }
+            {
+                uint32_t qid2 = cmd->cdw10 & 0xFFFFu;
                 uint32_t qs = ((cmd->cdw10 >> 16) & 0xFFFFu) + 1u;
-                dev->sq_entries[1] = (qs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : qs;
+                dev->sq_entries[qid2] = (qs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : qs;
             }
             return HYPE_NVME_SC_SUCCESS;
         case HYPE_NVME_ADMIN_SET_FEATURES:
