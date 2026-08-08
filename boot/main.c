@@ -1086,6 +1086,9 @@ static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
  * leaving "not in this machine" and "here but never scanned" indistinguishable.
  */
 static hype_disk_inventory_t g_disk_inv;
+
+/* One-shot latch for the "capture buffer is full" report -- see usb_log_flush(). */
+static int g_logbuf_full_reported;
 static hype_blk_phys_ahci_t g_hostdisk_ahci; /* backend hw ctx (outlives the VM) */
 
 static int term_streq(const char *a, const char *b) {
@@ -14242,6 +14245,25 @@ static void usb_log_flush(void) {
      * with the combined sink, so a failure that reaches them reaches it too, and
      * one report is the useful one.
      */
+    /*
+     * The in-RAM capture buffer is a fixed 2 MiB and STOPS accepting appends once full
+     * (hype_logbuf_append_unlocked latches `truncated` and drops the rest). Until now nothing ever
+     * read that flag, so a long run simply stopped logging and every file just... ended -- the same
+     * silent-truncation failure as #348, one layer up, and indistinguishable from a hang.
+     *
+     * Say it, once, and say it IN THE FILES: a message routed through hype_debug_print would go to
+     * the logbuf, which is by definition full, so it would never reach them. Written straight to
+     * the combined sink's file instead, and to the serial port, which are the two channels still
+     * working at that point.
+     */
+    if (hype_logbuf_truncated() && !g_logbuf_full_reported) {
+        static const char msg[] =
+            "\n*** hype: the 2 MiB in-RAM log buffer is FULL. Capture stopped here; hype is still "
+            "running and this log is INCOMPLETE, not the end of the run. ***\n";
+        g_logbuf_full_reported = 1;
+        hype_serial_print("%s", msg);
+        (void)hype_fat32_append(&g_usb_log.file, msg, (unsigned int)(sizeof(msg) - 1u));
+    }
     if (g_hype_log_ready) {
         hype_fat32_fs_set_time(&g_hype_log.fs, &g_usb_log.fs.now);
         if (hype_log_sink_flush(&g_hype_log) != 0) g_hype_log_ready = 0;
@@ -14513,6 +14535,39 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 ? "Intel"
                 : (cpu_diag.vendor == HYPE_CPU_VENDOR_AMD) ? "AMD" : "unknown",
             cpu_diag.has_vmx, cpu_diag.has_svm);
+        /*
+         * #298: what hype actually HANDS a guest for CPUID leaf 0, printed beside what the host
+         * really is.
+         *
+         * The vendor string used to be hardcoded to AuthenticAMD (fixed in 011105e), and the only
+         * way to confirm the fix is a cross-vendor hardware run. The first such run could not
+         * answer it: the guest that would have shown its vendor never started (#360), and the one
+         * that did printed a CPU name derived from an EMPTY brand string (#361), which is a guess
+         * rather than evidence.
+         *
+         * So measure it directly instead of inferring it from what a guest chooses to print. This
+         * calls the real emulator on the real CPUID result, so it reports exactly what a guest
+         * would read -- on any machine, with any guest, in one boot. Reading a hypervisor's
+         * behaviour out of a guest's cosmetic output was the weak part of that plan.
+         */
+        {
+            hype_cpuid_result_t real0, seen0;
+            char vs[13];
+            __asm__ volatile("cpuid"
+                             : "=a"(real0.eax), "=b"(real0.ebx), "=c"(real0.ecx),
+                               "=d"(real0.edx)
+                             : "a"(0u), "c"(0u));
+            hype_cpuid_emulate(0u, 0u, &real0, &seen0);
+            vs[0] = (char)(seen0.ebx & 0xFF); vs[1] = (char)((seen0.ebx >> 8) & 0xFF);
+            vs[2] = (char)((seen0.ebx >> 16) & 0xFF); vs[3] = (char)((seen0.ebx >> 24) & 0xFF);
+            vs[4] = (char)(seen0.edx & 0xFF); vs[5] = (char)((seen0.edx >> 8) & 0xFF);
+            vs[6] = (char)((seen0.edx >> 16) & 0xFF); vs[7] = (char)((seen0.edx >> 24) & 0xFF);
+            vs[8] = (char)(seen0.ecx & 0xFF); vs[9] = (char)((seen0.ecx >> 8) & 0xFF);
+            vs[10] = (char)((seen0.ecx >> 16) & 0xFF); vs[11] = (char)((seen0.ecx >> 24) & 0xFF);
+            vs[12] = '\0';
+            hype_debug_print("cpu: GUEST-CPUID leaf0 vendor='%s' -- this is the string a guest "
+                             "reads; it must match vendor= above [#298]\n", vs);
+        }
         /* M4-6d4: does THIS environment expose SVM PAUSE-filtering? Decides
          * whether the preemption mechanism (#3/#4) is provable here or only on
          * real HW. QEMU/KVM nested SVM may not pass it through. */
