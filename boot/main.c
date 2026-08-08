@@ -7084,7 +7084,7 @@ static uint64_t g_render_pushes;
 static uint64_t g_render_cells_drawn;
 
 static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_tsc,
-                                    int *term_last_view, uint64_t perf_boot_start_tsc,
+                                    uint64_t perf_boot_start_tsc,
                                     uint64_t perf_hlt_wait_tsc, uint64_t total_exits,
                                     uint64_t hlt_exits) {
     if (g_fw_1_host_tsc_hz == 0) {
@@ -7125,9 +7125,47 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
     }
     *last_gop_flush_tsc = now_gf;
 
-    int view = g_term_view;
-    int is_owner = (vm == &g_vms[0]) && (g_gop_console.fb != (void *)0);
-    if (is_owner && view >= 0) {
+}
+
+
+
+/*
+ * #363: draw the console. Called by the BSP, not by a guest's core.
+ *
+ * This used to run inside vm0's dispatch loop, gated on `vm == &g_vms[0]`. That bound every
+ * operator-facing function -- the dashboard, its uptime counter, and terminal switching -- to the
+ * health of ONE guest. When vm0 wedged on the Intel box, rendering stopped with it: the dashboard
+ * froze, `right ctrl+alt+arrow` stopped working, and the machine looked crashed while hype was
+ * fine and vm1 was still running normally. It was reported as "appeared to crash whether or not it
+ * did", which was exactly right, and it misdirected two investigations.
+ *
+ * The BSP is the correct owner: it already owns the keyboard, the USB write path and the log, it
+ * runs no guest, and it was demonstrably still working at 70 s in the run where vm0 stopped at 26.
+ *
+ * Reads per-VM stats out of g_vms[] rather than taking a VM: every guest publishes its own stats
+ * from its own loop (fw_1_publish_and_render above), and a wedged guest simply stops updating its
+ * row -- which the operator can now SEE, instead of losing the whole display.
+ */
+static void fw_1_render_console(void) {
+    static uint64_t last_gop_flush_tsc = 0;
+    static int term_last_view = -2; /* neither a VM index nor the dashboard, so the first frame clears */
+    uint64_t now_gf;
+    int view;
+
+    /* NOT the g_fw_1_host_tsc_hz shim: that is `vm->host_tsc_hz`, and this function
+     * deliberately has no VM. The BSP reads vm0's calibration directly -- it is the same host
+     * TSC for every core. */
+    uint64_t tsc_hz = g_vms[0].host_tsc_hz;
+    if (tsc_hz == 0 || g_gop_console.fb == (void *)0) {
+        return;
+    }
+    now_gf = hype_rdtsc();
+    if (last_gop_flush_tsc != 0 && now_gf - last_gop_flush_tsc < tsc_hz / 60u) {
+        return; /* 60 Hz cap, as before */
+    }
+    last_gop_flush_tsc = now_gf;
+    view = g_term_view;
+    if (view >= 0) {
         /*
          * PERF-2 (#234) part 2: render only the cells that CHANGED. The old
          * unconditional full redraw marked the whole console dirty, so
@@ -7137,10 +7175,10 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
          * against another's leftovers and paint a mixture of the two.
          */
         static hype_vt_render_cache_t term_cache[HYPE_FW_MAX_VMS];
-        if (*term_last_view != view) {
+        if (term_last_view != view) {
             hype_gop_console_clear(&g_gop_console);
             hype_vt_render_cache_invalidate(&term_cache[view]);
-            *term_last_view = view;
+            term_last_view = view;
         }
         {
             unsigned drawn = hype_vt_render_cached(&g_vms[view].term, &g_gop_console, 1,
@@ -7152,7 +7190,7 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
                 hype_debug_flush_gop(); /* only push when something changed */
             }
         }
-    } else if (is_owner /* dashboard view (-1) */) {
+    } else { /* dashboard view (-1) */
         hype_vm_dash_info_t info[HYPE_FW_MAX_VMS];
         unsigned ninfo = HYPE_TERM_NVMS;
         for (unsigned i = 0; i < ninfo; i++) {
@@ -7165,10 +7203,10 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
             info[i].media = g_vms[i].media;
             info[i].focused = 0;
         }
-        if (*term_last_view != -1) {
+        if (term_last_view != -1) {
             hype_gop_console_clear(&g_gop_console);
             hype_vt_render_cache_invalidate(&g_dash_render_cache);
-            *term_last_view = -1;
+            term_last_view = -1;
         }
         {
             /* M10-5: a pending/accepted physical-write confirmation is the most
@@ -7180,7 +7218,8 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
                 result_line = hype_phys_confirm_prompt(&g_phys_confirm, confirm_footer,
                                                        sizeof(confirm_footer));
             }
-            hype_dashboard_render(&g_dashboard_term, info, ninfo, vm->stat_uptime_ms / 1000u,
+            hype_dashboard_render(&g_dashboard_term, info, ninfo,
+                                  g_vms[0].stat_uptime_ms / 1000u,
                                   g_cmdline, result_line);
         }
         /* PERF-2 (#234): same diffing treatment for the dashboard. It only
@@ -7196,7 +7235,6 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
             }
         }
     }
-    /* non-owner cores: skip GOP entirely (owner drives the panel). */
 }
 
 /* M8-4: fresh re-boot of a VM from OFF. Restores the pristine firmware image,
@@ -8879,7 +8917,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     uint64_t last_exhist_tsc = 0;
     uint64_t last_preempt_rip_tsc = 0; /* RT-2b: throttle the preemption-RIP sample log */
     uint64_t last_gop_flush_tsc = 0;   /* RT-2c: throttle deferred GOP framebuffer pushes to ~60 Hz */
-    int term_last_view = -2;           /* TERM-1: last on-screen view this core rendered (-2 = none yet) */
     /* Freestanding: no memset, so the #351 accumulators are cleared explicitly. */
     for (excost_i = 0; excost_i < HYPE_EXCOST_BUCKETS; excost_i++) {
         ex_cost[excost_i] = 0;
@@ -9151,7 +9188,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 ex_hlt = 0;
                 vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_STARTED);
             }
-            fw_1_publish_and_render(vm, &last_gop_flush_tsc, &term_last_view,
+#if !HYPE_RUN_GUEST_ON_AP
+            /* #363: with the guest on the BSP there is no idle drain loop to render from, so the
+             * guest loop still drives it. Under HYPE_RUN_GUEST_ON_AP (the default) the BSP owns
+             * this instead, which is the whole point -- a wedged guest must not take the display. */
+            fw_1_render_console();
+#endif
+    #if !HYPE_RUN_GUEST_ON_AP
+        fw_1_render_console();
+#endif
+        fw_1_publish_and_render(vm, &last_gop_flush_tsc,
                                     perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt);
             {
                 uint64_t t0 = hype_rdtsc();
@@ -10900,7 +10946,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * push has accumulated in the shadow buffer (and RT-1c's dirty range);
          * this is the ONE framebuffer memcpy that pays the uncached-VRAM cost,
          * instead of one per printed line. */
-        fw_1_publish_and_render(vm, &last_gop_flush_tsc, &term_last_view,
+        fw_1_publish_and_render(vm, &last_gop_flush_tsc,
                                 perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt);
 
         /* M4-6d3: flush a buffered partial line that looks like an
@@ -16652,6 +16698,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          */
         for (;;) {
             __asm__ volatile("pause");
+            /*
+             * #363: the BSP draws the console, so the dashboard and terminal switching survive a
+             * wedged guest. This used to run in vm0's dispatch loop; when vm0 stopped on the
+             * Intel box the whole display and keyboard went with it while hype and vm1 were fine,
+             * and the machine looked crashed. fw_1_render_console() caps itself at 60 Hz.
+             */
+            fw_1_render_console();
             if (g_vms[0].host_tsc_hz != 0) {
                 uint64_t now_d = hype_rdtsc();
                 uint64_t iv = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_vms[0].host_tsc_hz;
