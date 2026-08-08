@@ -63,6 +63,10 @@ void hype_logbuf_append_unlocked(const char *s) {
     }
 }
 
+void hype_logbuf_lock(void) {
+    logbuf_lock();
+}
+
 int hype_logbuf_try_lock(void) {
     return __atomic_exchange_n(&g_logbuf_lock, 1, __ATOMIC_ACQUIRE) == 0;
 }

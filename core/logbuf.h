@@ -104,6 +104,21 @@ const hype_logbuf_t *hype_logbuf_find(const void *base, unsigned long size, unsi
  * #338: the panic path's escape hatch. hype_fatal() must never BLOCK on the log lock -- it may already
  * hold it -- so it try-locks and writes regardless. A torn panic beats a silent hang.
  */
+/*
+ * #338: the record lock, exported so an emitter can hold it across BOTH sinks.
+ *
+ * hype_logbuf_append() locks around the logbuf alone, which stopped the byte LOSS (part 1,
+ * 240a1cb) but not the TEARING: the emitters write the same record to the serial port outside the
+ * lock, byte at a time, so two cores still interleave mid-word on the live view --
+ *   "fw-1 vm0 ttyS0| BdsfDwx-e1 :v lm1oa tdtiyngS 0B|o Bodts00Dx02e"
+ * Taking this around the serial write AND the append makes a record atomic on both sinks with one
+ * lock, and no second lock to order against.
+ *
+ * Blocking, deliberately: dropping a record under contention would trade torn output for missing
+ * output, which is worse and much harder to notice. The PANIC path must use hype_logbuf_try_lock()
+ * instead -- see the note there.
+ */
+void hype_logbuf_lock(void);
 int hype_logbuf_try_lock(void);
 void hype_logbuf_unlock(void);
 void hype_logbuf_append_unlocked(const char *s);

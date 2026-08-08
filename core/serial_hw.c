@@ -67,6 +67,10 @@ void hype_serial_print(const char *fmt, ...) {
     n = hype_vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     (void)hype_format_mark_truncated(msg, sizeof(msg), n);
-    hype_serial_print_via(hype_serial_putc, "%s", msg);
-    hype_logbuf_append(msg);
+    /* #338: same as hype_debug_print -- one record, atomic on both sinks, and the already-formatted
+     * string handed straight to the writer so it is not re-truncated through a 256-byte buffer. */
+    hype_logbuf_lock();
+    hype_serial_write_via(hype_serial_putc, msg);
+    hype_logbuf_append_unlocked(msg);
+    hype_logbuf_unlock();
 }

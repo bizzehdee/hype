@@ -70,8 +70,43 @@ static void test_print_via(void) {
     CHECK_STR("print_via formats and expands newline", "x=7\r\n", g_captured);
 }
 
+/*
+ * #338: print_via re-formats through its OWN 256-byte buffer, so a caller that hands it an
+ * already-formatted record longer than 255 chars loses the tail. Both emitters did exactly that --
+ * hype_serial_print_via(putc, "%s", msg) with msg up to 512 -- so every long record was cut ON THE
+ * SERIAL PORT while the logbuf kept all of it. hype_debug_print's own note measures the longest real
+ * record at 272 chars, i.e. past the cut. They now call hype_serial_write_via() with the string
+ * directly, which has no buffer of its own; this pins both halves of that.
+ */
+static void test_write_via_has_no_length_limit_of_its_own(void) {
+    /* 400 chars: comfortably past print_via's 255-char cut, and inside this harness's own
+     * 512-byte capture buffer -- sized at 600 first, which failed on the CAPTURE limit rather than
+     * on the code, and would have read as a defect. */
+    static char big[401];
+    unsigned i;
+
+    for (i = 0; i < sizeof(big) - 1u; i++) {
+        big[i] = (char)('A' + (int)(i % 26u));
+    }
+    big[sizeof(big) - 1u] = '\0';
+
+    reset_capture();
+    hype_serial_write_via(mock_putc, big);
+    CHECK_INT("write_via emits a 400-char record in full", (int)(sizeof(big) - 1u),
+              (int)strlen(g_captured));
+    CHECK_STR("  and the bytes are unchanged", big, g_captured);
+
+    /* And the documented limit of the formatting variant, so the reason the emitters must not use
+     * it for a pre-formatted record is recorded as a fact rather than a comment. */
+    reset_capture();
+    hype_serial_print_via(mock_putc, "%s", big);
+    CHECK_INT("print_via, by contrast, truncates at its own 256-byte buffer", 255,
+              (int)strlen(g_captured));
+}
+
 int main(void) {
     test_divisor_for_baud();
+    test_write_via_has_no_length_limit_of_its_own();
     test_write_via_plain();
     test_write_via_expands_newline();
     test_write_via_empty();

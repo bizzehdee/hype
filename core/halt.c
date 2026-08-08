@@ -194,13 +194,25 @@ void hype_debug_print(const char *fmt, ...) {
     va_end(ap);
     (void)hype_format_mark_truncated(msg, sizeof(msg), n);
 
-    /* The RAW port write: hype_serial_print now tees into the logbuf itself (#346), and this
-     * function appends msg below -- going through it here would double every line. */
-    hype_serial_print_via(hype_serial_putc, "%s", msg);
-    /* Tee into the in-memory capture so boot/main.c can flush the whole
-     * console to a file on the boot volume before ExitBootServices --
-     * the serial-less real-hardware debug path (core/logbuf.h). */
-    hype_logbuf_append(msg);
+    /*
+     * #338: ONE record, atomic on BOTH sinks.
+     *
+     * Part 1 (240a1cb) locked the logbuf and stopped bytes being lost. It did not stop TEARING,
+     * because the serial write happened outside that lock, byte at a time, so two cores still
+     * interleaved mid-word on the live view. Holding the same lock across both writes fixes that
+     * with no second lock to order against and no new buffer -- the constraint recorded above is
+     * that raising three buffers at once produced a 0-byte \HYPEFULL.LOG on real AMD hardware.
+     *
+     * hype_serial_write_via() takes the ALREADY-FORMATTED string. The previous
+     * hype_serial_print_via(..., "%s", msg) re-formatted it through that function's own 256-byte
+     * buffer, so every record over 255 chars was silently cut ON THE SERIAL PORT while the logbuf
+     * got all 512 -- and the note above measures the longest real record at 272. Passing the
+     * string straight through removes both the truncation and a copy.
+     */
+    hype_logbuf_lock();
+    hype_serial_write_via(hype_serial_putc, msg);
+    hype_logbuf_append_unlocked(msg);
+    hype_logbuf_unlock();
 
     gop = hype_fatal_get_gop();
     if (g_gop_enabled && gop != 0) {
