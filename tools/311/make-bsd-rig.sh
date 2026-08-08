@@ -43,6 +43,10 @@ mcopy -i qbsd.fat "$REPO/fw/OVMF_CODE.fd" "$REPO/fw/OVMF_VARS.fd" ::/EFI/hype/
 # #343: without this the run parks forever on bsdinstall's "Console type [vt100]:" prompt and never
 # reaches the window where the fault occurs.
 mcopy -i qbsd.fat "$REPO/tools/input-scripts/bsd343-vm0.txt" ::/input/vm0.txt
+# BOTH guests: the default build runs two, and a guest left parked at the console prompt never
+# enters the window where #343's fault occurs -- so scripting only vm0 tests half the configuration
+# the issue actually describes ("two VMs, pinned APs").
+mcopy -i qbsd.fat "$REPO/tools/input-scripts/bsd343-vm1.txt" ::/input/vm1.txt
 echo "copying the ISO (1.3 GB -- this is the slow part)"
 mcopy -i qbsd.fat "$ISO" ::/iso/test.iso
 dd if=qbsd.fat of=qbsd.img bs=512 seek=2048 conv=notrunc status=none
