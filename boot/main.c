@@ -9359,6 +9359,24 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                          "max=%llu on apic=%u [#362]\n", la, ls, ls / la, lm,
                                          lapic);
                     }
+                    {
+                        /* #365: device time vs hype's own overhead. us_per_chunk is the number
+                         * that decides the fix: if it is close to the wire time for the chunk
+                         * size, the device is the limit and read-ahead is the answer; if it is
+                         * far above, the cost is in hype's xHCI path and read-ahead would only
+                         * hide it. */
+                        unsigned long long xt = 0, xc = 0, xk = 0, xs = 0, xm = 0;
+                        hype_blk_usb_xfer_stats(&xt, &xc, &xk, &xs, &xm);
+                        if (xc != 0 && g_fw_1_host_tsc_hz != 0) {
+                            unsigned long long hz = g_fw_1_host_tsc_hz;
+                            hype_debug_print(
+                                "fw-1 USBXFER: calls=%llu chunks=%llu sectors=%llu total=%llums "
+                                "us_per_call=%llu us_per_chunk=%llu max=%lluus [#365]\n",
+                                xc, xk, xs, (xt * 1000ull) / hz, (xt * 1000000ull) / hz / xc,
+                                (xk != 0) ? (xt * 1000000ull) / hz / xk : 0ull,
+                                (xm * 1000000ull) / hz);
+                        }
+                    }
                 }
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
@@ -11277,7 +11295,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                 }
                                 hype_debug_print("fw-1 DIAG: ATAPI READ(10) count=%u (cmds=%u) "
                                                   "sectors=%llu max=%u hist=%u/%u/%u/%u/%u/%u "
-                                                  "elapsed=%llums thru=%lluKB/s\n",
+                                                  "seq=%u/%u/%u(contig/near/far) "
+                                                  "elapsed=%llums thru=%lluKB/s [#365]\n",
                                                   (unsigned int)g_fw_1_atapi.read10_count,
                                                   (unsigned int)g_fw_1_atapi.command_count,
                                                   (unsigned long long)g_fw_1_atapi.read10_sectors_total,
@@ -11288,6 +11307,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                   (unsigned int)g_fw_1_atapi.read10_size_hist[3],
                                                   (unsigned int)g_fw_1_atapi.read10_size_hist[4],
                                                   (unsigned int)g_fw_1_atapi.read10_size_hist[5],
+                                                  (unsigned int)g_fw_1_atapi.read10_seq_contig,
+                                                  (unsigned int)g_fw_1_atapi.read10_seq_near,
+                                                  (unsigned int)g_fw_1_atapi.read10_seq_far,
                                                   (unsigned long long)r10_ms,
                                                   (unsigned long long)r10_kbps);
                             }

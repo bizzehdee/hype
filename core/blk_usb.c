@@ -79,11 +79,48 @@ void hype_blk_usb_lock_stats(unsigned long long *acquires, unsigned long long *s
         *max_spin_apic = __atomic_load_n(&g_usb_lock_max_spin_apic, __ATOMIC_RELAXED);
 }
 
+/*
+ * #365: where does a USB read's time actually go?
+ *
+ * A 2 KB guest read costs 6.73 ms, of which only ~1% is wire time at USB 2.0 rates. The rest is
+ * fixed per-transaction cost -- but "fixed cost" could be the device's own latency OR hype's
+ * polling inside hype_xhci_msc_read(). Those call for completely different fixes: read-ahead
+ * amortises device latency, while cutting poll overhead speeds up every path including the ones
+ * read-ahead cannot help.
+ *
+ * So time the transfer itself, separately from the lock wait already counted above. Split by
+ * whether the request was one chunk or several, because a multi-chunk read pays the per-chunk cost
+ * repeatedly and that is exactly what a larger USB_MAX_SECTORS would change.
+ */
+static volatile unsigned long long g_usb_xfer_tsc;
+static volatile unsigned long long g_usb_xfer_calls;
+static volatile unsigned long long g_usb_xfer_chunks;
+static volatile unsigned long long g_usb_xfer_sectors;
+static volatile unsigned long long g_usb_xfer_max_tsc;
+
+static inline unsigned long long usb_rdtsc(void) {
+    unsigned int lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((unsigned long long)hi << 32) | lo;
+}
+
+void hype_blk_usb_xfer_stats(unsigned long long *tsc, unsigned long long *calls,
+                             unsigned long long *chunks, unsigned long long *sectors,
+                             unsigned long long *max_tsc) {
+    if (tsc != 0) *tsc = g_usb_xfer_tsc;
+    if (calls != 0) *calls = g_usb_xfer_calls;
+    if (chunks != 0) *chunks = g_usb_xfer_chunks;
+    if (sectors != 0) *sectors = g_usb_xfer_sectors;
+    if (max_tsc != 0) *max_tsc = g_usb_xfer_max_tsc;
+}
+
 static int usb_read(void *hw, uint64_t lba, uint32_t count, void *buf) {
     hype_blk_usb_t *u = (hype_blk_usb_t *)hw;
     uint8_t *p = (uint8_t *)buf;
     uint32_t done = 0;
+    unsigned long long t0;
     usb_xfer_lock();
+    t0 = usb_rdtsc(); /* after the lock, so contention is not counted as device time */
     while (done < count) {
         uint32_t n = (count - done > USB_MAX_SECTORS) ? USB_MAX_SECTORS : (count - done);
         if (hype_xhci_msc_read(u->ctrl, u->slot, &u->msc, (uint32_t)(lba + done), n,
@@ -92,6 +129,14 @@ static int usb_read(void *hw, uint64_t lba, uint32_t count, void *buf) {
             return -1;
         }
         done += n;
+        g_usb_xfer_chunks++;
+    }
+    {
+        unsigned long long dt = usb_rdtsc() - t0;
+        g_usb_xfer_tsc += dt;
+        g_usb_xfer_calls++;
+        g_usb_xfer_sectors += count;
+        if (dt > g_usb_xfer_max_tsc) g_usb_xfer_max_tsc = dt;
     }
     usb_xfer_unlock();
     return 0;

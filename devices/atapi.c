@@ -152,6 +152,24 @@ static void handle_read(hype_atapi_t *dev, uint32_t lba, uint32_t count,
     }
     dev->read10_size_hist[hype_atapi_read10_size_bucket(count)]++;
 
+    /* #365: classify this read against where the previous one ended. The very
+     * first read has no predecessor and is counted as `far` -- it is genuinely
+     * unservable from a prefetch, and inventing a category for it would flatter
+     * the result. */
+    if (dev->read10_count != 0u) {
+        if (lba == dev->read10_next_lba) {
+            dev->read10_seq_contig++;
+        } else if (lba > dev->read10_next_lba &&
+                   (lba - dev->read10_next_lba) < HYPE_ATAPI_READAHEAD_BLOCKS) {
+            dev->read10_seq_near++;
+        } else {
+            dev->read10_seq_far++;
+        }
+    } else {
+        dev->read10_seq_far++;
+    }
+    dev->read10_next_lba = (uint64_t)lba + count;
+
     out->uses_media_data = 1;
     /* GLADDER-10(b): report the start SECTOR, not a byte offset. lba*2048 would
      * overflow 32 bits for a >=4GB ISO (lba ~2.1M+); the caller does the 64-bit
@@ -398,6 +416,10 @@ static void reset_state(hype_atapi_t *dev) {
     for (b = 0; b < HYPE_ATAPI_READ10_HIST_BUCKETS; b++) {
         dev->read10_size_hist[b] = 0;
     }
+    dev->read10_next_lba = 0;
+    dev->read10_seq_contig = 0;
+    dev->read10_seq_near = 0;
+    dev->read10_seq_far = 0;
 }
 
 void hype_atapi_reset(hype_atapi_t *dev, const uint8_t *media_data, uint64_t media_size) {

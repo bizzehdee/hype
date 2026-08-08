@@ -40,4 +40,13 @@ void hype_blk_usb_init(hype_blk_usb_t *hw, hype_blk_phys_t *p, hype_blk_backend_
 void hype_blk_usb_lock_stats(unsigned long long *acquires, unsigned long long *spins,
                              unsigned long long *max_spins, unsigned int *max_spin_apic);
 
+/*
+ * #365: time spent INSIDE USB transfers, excluding the lock wait. Distinguishes device latency
+ * (fix: read-ahead) from hype's own polling (fix: the xHCI path itself) -- different problems with
+ * different answers, and the per-command cost alone cannot tell them apart.
+ */
+void hype_blk_usb_xfer_stats(unsigned long long *tsc, unsigned long long *calls,
+                             unsigned long long *chunks, unsigned long long *sectors,
+                             unsigned long long *max_tsc);
+
 #endif /* HYPE_CORE_BLK_USB_H */

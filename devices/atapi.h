@@ -131,7 +131,32 @@ typedef struct {
     uint64_t read10_sectors_total;
     uint32_t read10_max_count;
     uint32_t read10_size_hist[6];
+
+    /*
+     * #365: is the guest's read pattern SEQUENTIAL?
+     *
+     * Read-ahead only pays if the next request lands inside the window the last
+     * one prefetched. 99% of a 2 KB read's 6.73 ms is fixed per-transaction cost
+     * -- only 1% is wire time -- so fetching 64 KB instead serves 32 requests for
+     * 31% more cost. That arithmetic is worthless if the guest jumps around, and
+     * "an ISO is read sequentially" is an assumption, not a measurement.
+     *
+     * contiguous: this read starts exactly where the previous one ended.
+     * near:       starts ahead of that, within a 64 KiB read-ahead window --
+     *             still served by a prefetch, just with a gap skipped.
+     * far:        anywhere else, including backwards. A prefetch would be wasted.
+     *
+     * Reset alongside the size profile. Purely observational.
+     */
+    uint64_t read10_next_lba;   /* where the previous read ended */
+    uint32_t read10_seq_contig;
+    uint32_t read10_seq_near;
+    uint32_t read10_seq_far;
 } hype_atapi_t;
+
+/* #365: how far ahead of the previous read still counts as "near", in 2048-byte
+ * blocks. 32 blocks is the 64 KiB window the throughput arithmetic assumes. */
+#define HYPE_ATAPI_READAHEAD_BLOCKS 32u
 
 /* Number of READ(10) transfer-size buckets in hype_atapi_t::read10_size_hist. */
 #define HYPE_ATAPI_READ10_HIST_BUCKETS 6
