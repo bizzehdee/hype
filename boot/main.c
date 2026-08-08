@@ -248,6 +248,27 @@ static unsigned long long g_sendkey_codes;
  * the presence check is looping) or it writes without newlines (so hype is holding the
  * output). Those need opposite fixes, and one counter pair settles it.
  */
+/*
+ * #365: does an AHCI completion interrupt actually REACH the guest?
+ *
+ * The exit histogram says the guest performs ~86 emulated-AHCI register accesses per disc read
+ * -- 393,131 nested page faults for 4,545 reads, 46% of a 60 s run. That is the shape of a guest
+ * polling for completion because nothing told it the command finished.
+ *
+ * The existing ATA-IRQ-UNDELIVERED line cannot answer whether that is what is happening: it is
+ * latched by a `static int ... _reported` and prints ONCE. I compared its occurrence count
+ * between two machines (1 and 1) and concluded interrupts were fine, which the message was never
+ * capable of telling me.
+ *
+ * So count instead. `pending` is how often the model had a completion to signal; `delivered` is
+ * how often the IO-APIC accepted it. A declined raise is not necessarily a fault -- the IO-APIC
+ * refuses while the RTE is masked or Remote-IRR is latched, which is normal inside a guest's own
+ * handler -- but delivered/pending collapsing toward zero over a whole run is not normal, and
+ * that is the number that decides whether polling is forced.
+ */
+static unsigned long long g_cd_irq_pending, g_cd_irq_delivered;
+static unsigned long long g_ata_irq_pending, g_ata_irq_delivered;
+
 static unsigned long long g_dbgport_writes;
 static unsigned long long g_dbgport_reads;
 static unsigned long long g_dbgport_lines;
@@ -9378,6 +9399,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                     }
                 }
+                {
+                    /*
+                     * #365: the ratio that decides whether the guest is polling because it must.
+                     * `mmio_per_read` is the observed cost -- emulated-AHCI page faults per guest
+                     * disc read -- printed beside it so the two are read together rather than
+                     * correlated by hand across two lines.
+                     */
+                    unsigned long long reads = (unsigned long long)g_fw_1_atapi.read10_count;
+                    hype_debug_print(
+                        "fw-1 AHCIIRQ: cd=%llu/%llu ata=%llu/%llu (delivered/pending) | "
+                        "ahci_npf=%llu reads=%llu mmio_per_read=%llu [#365]\n",
+                        g_cd_irq_delivered, g_cd_irq_pending, g_ata_irq_delivered,
+                        g_ata_irq_pending, ex_ahci_npf, reads,
+                        (reads != 0ull) ? (ex_ahci_npf / reads) : 0ull);
+                }
                 hype_debug_print("fw-1 EXHIST: total=%llu hlt=%llu npf=%llu(ahci=%llu) ioio=%llu(io80=%llu) "
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
@@ -10492,6 +10528,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
         if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
+            g_cd_irq_pending++;
             if (line != 0u && line < 16u) {
                 int in_service = (line < 8u)
                     ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
@@ -10517,6 +10554,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  */
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
                     vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                    g_cd_irq_delivered++;
                     ahci_irqs++;
                 }
             }
@@ -10560,6 +10598,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          */
         if (ata_mapped && hype_ahci_irq_pending(&g_fw_1_ata_ahci)) {
             uint8_t iov;
+            g_ata_irq_pending++;
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA);
             if (line != 0u && line < 16u) {
                 int in_service = (line < 8u)
@@ -10571,6 +10610,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
             if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI, &iov)) {
                 vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                g_ata_irq_delivered++;
             } else {
                 static int ata_undelivered_reported = 0;
                 if (!ata_undelivered_reported) {
