@@ -5,6 +5,10 @@
 static int failures = 0;
 static unsigned g_reads; /* count disk reads, to check the bounce loop */
 
+#define CHECK(desc, cond) \
+    do { if (!(cond)) { printf("FAIL: %s\n", (desc)); failures++; } } while (0)
+#define CHECK_INT(desc, expected, actual) CHECK_HEX(desc, expected, actual)
+
 #define CHECK_HEX(desc, expected, actual) \
     do { \
         if ((unsigned long long)(expected) != (unsigned long long)(actual)) { \
@@ -396,7 +400,121 @@ static void test_read_never_writes_past_len(void) {
 }
 
 
+/* ---- #365: read-ahead retention ---- */
+
+/*
+ * The property that matters is NOT that the cache is fast -- it is that a cached
+ * read is INDISTINGUISHABLE from an uncached one. A retention bug serves stale
+ * bytes, which at the guest looks exactly like #343's corruption and is just as
+ * hard to attribute afterwards. So every cache test below checks bytes, and the
+ * hit/miss counters are only ever a secondary assertion.
+ */
+static void test_sequential_reads_hit_the_cache_and_return_correct_bytes(void) {
+    hype_iso_stream_t s;
+    uint64_t hits = 0, misses = 0, off;
+    memset(&s, 0, sizeof s);
+    s.read = fake_read;
+    s.ctx = 0;
+    s.part_start_lba = PART_START;
+    s.iso_size = ISO_SIZE;
+
+    g_reads = 0;
+    /* 32 consecutive 2 KB reads -- the OpenBSD pattern that motivated this. */
+    for (off = 0; off < 32ull * 2048ull; off += 2048ull) {
+        check_range("sequential 2KB read", &s, off, 2048u);
+    }
+    hype_iso_stream_cache_stats(&s, &hits, &misses);
+    CHECK("most reads were served from the buffer", hits > misses);
+    CHECK("device reads far fewer than guest reads", g_reads < 32u);
+}
+
+/* A backward seek must NOT be served from a buffer that starts later. */
+static void test_backward_seek_is_a_miss_and_still_correct(void) {
+    hype_iso_stream_t s;
+    memset(&s, 0, sizeof s);
+    s.read = fake_read;
+    s.part_start_lba = PART_START;
+    s.iso_size = ISO_SIZE;
+
+    check_range("forward", &s, 100000u, 2048u);
+    check_range("backward", &s, 0u, 2048u);       /* before the cached range */
+    check_range("far forward", &s, 150000u, 512u); /* past it */
+}
+
+/*
+ * The decisive one: if the medium changes underneath, a stream that was NOT
+ * invalidated may legitimately serve old bytes -- so invalidation must actually
+ * work. Simulated by flipping the backing pattern.
+ */
+static int g_alt_backing = 0;
+static int alt_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    uint8_t *d = (uint8_t *)dst;
+    uint32_t i;
+    (void)ctx;
+    g_reads++;
+    for (i = 0; i < count * 512u; i++) {
+        d[i] = (uint8_t)(pat(lba * 512ull + i) ^ (g_alt_backing ? 0xFFu : 0x00u));
+    }
+    return 0;
+}
+
+static void test_invalidate_forces_a_refetch(void) {
+    hype_iso_stream_t s;
+    static uint8_t a[512], b[512];
+    memset(&s, 0, sizeof s);
+    s.read = alt_read;
+    s.part_start_lba = PART_START;
+    s.iso_size = ISO_SIZE;
+
+    g_alt_backing = 0;
+    CHECK_INT("first read ok", 0, hype_iso_stream_read(&s, 0u, a, sizeof a));
+
+    /* Medium changes. Without invalidation the stream may serve the old copy --
+     * that is the hazard this hook exists for. */
+    g_alt_backing = 1;
+    hype_iso_stream_invalidate(&s);
+    CHECK_INT("read after invalidate ok", 0, hype_iso_stream_read(&s, 0u, b, sizeof b));
+    CHECK("invalidate forced a refetch of the NEW contents", memcmp(a, b, sizeof a) != 0);
+}
+
+/* A failed device read must leave the buffer marked unknown, not merely old:
+ * its contents after a partial/failed transfer are undefined. */
+static void test_failed_read_clears_the_cache(void) {
+    hype_iso_stream_t s;
+    static uint8_t buf[512];
+    uint64_t hits = 0, misses = 0;
+    memset(&s, 0, sizeof s);
+    s.read = fake_read;
+    s.part_start_lba = PART_START;
+    s.iso_size = ISO_SIZE;
+
+    CHECK_INT("prime the cache", 0, hype_iso_stream_read(&s, 0u, buf, sizeof buf));
+    s.read = fail_read;
+    /* A DIFFERENT range: re-reading the primed one would be served from the buffer and
+     * never reach the failing device at all -- which is the cache working, not a failure. */
+    CHECK("read fails", hype_iso_stream_read(&s, 150000u, buf, sizeof buf) != 0);
+    CHECK_INT("cache marked empty", 0u, s.cache_sectors);
+
+    s.read = fake_read;
+    hype_iso_stream_cache_stats(&s, &hits, &misses);
+    CHECK_INT("and the next read is a miss, not a stale hit", 0,
+              hype_iso_stream_read(&s, 0u, buf, sizeof buf));
+}
+
+static void test_cache_stats_null_safety(void) {
+    uint64_t h = 99, m = 99;
+    hype_iso_stream_cache_stats(0, &h, &m);
+    CHECK_INT("null stream reports zero hits", 0, (long long)h);
+    CHECK_INT("null stream reports zero misses", 0, (long long)m);
+    hype_iso_stream_invalidate(0); /* must not fault */
+}
+
 int main(void) {
+    test_sequential_reads_hit_the_cache_and_return_correct_bytes();
+    test_backward_seek_is_a_miss_and_still_correct();
+    test_invalidate_forces_a_refetch();
+    test_failed_read_clears_the_cache();
+    test_cache_stats_null_safety();
     test_read_never_writes_past_len();
     test_refusals_and_error_paths();
     test_map_shorter_than_iso_size_is_refused_midway();

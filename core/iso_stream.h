@@ -63,6 +63,34 @@ typedef struct {
      */
     hype_iso_extent_t extents[HYPE_ISO_STREAM_MAX_EXTENTS];
     unsigned extent_count;
+
+    /*
+     * #365: what the bounce buffer currently holds, so a sequential stream stops re-fetching
+     * bytes it already has.
+     *
+     * Measured on hardware: a guest 2 KB disc read cost 4.75 separate USB calls, because each
+     * fill read up to 64 KiB and then DISCARDED everything past the few bytes asked for -- 6x
+     * more read from the device than the guest requested. 97.5% of guest reads start exactly
+     * where the previous one ended, so nearly all of that refetching is avoidable.
+     *
+     * Why this is safe against the #343 class, where two vCPUs sharing one device handed guests
+     * corrupt bytes:
+     *
+     *  - the bounce buffer is ALREADY per-VM (bounce_slot, one slot per guest, #352), so this
+     *    retains per-VM state and introduces no new sharing between guests;
+     *  - the stream contract is READ-ONLY -- hype_iso_stream_t carries a read callback and no
+     *    write callback, so nothing can write through this path and leave the buffer stale;
+     *  - a write reaching the underlying device by any OTHER route must still invalidate, which
+     *    hype_iso_stream_invalidate() exists for. Media is read-only today; the hook is there so
+     *    that stops being an unwritten assumption.
+     *
+     * cache_sectors == 0 means "nothing held". Zero-initialised by the same contract as
+     * extent_count above.
+     */
+    uint64_t cache_lba;      /* first disk LBA held in the bounce buffer */
+    uint32_t cache_sectors;  /* how many sectors, 0 = empty */
+    uint64_t cache_hits;     /* served without touching the device */
+    uint64_t cache_misses;   /* required a device read */
     /*
      * #352: which bounce buffer this stream fills. The buffer used to be one file-global,
      * documented as "single-threaded use (the guest-exit path)" -- true of one guest, false of
@@ -86,6 +114,16 @@ typedef struct {
  * within that sector; *out_run is how many bytes of the request can be served before the next
  * extent must be consulted. Returns -1 if `off` is past the end of the map.
  */
+/*
+ * #365: drop whatever the bounce buffer holds. Call this if anything writes to the underlying
+ * device, so a subsequent read cannot be served from bytes that are no longer on the medium.
+ * Safe to call on a zeroed or idle stream.
+ */
+void hype_iso_stream_invalidate(hype_iso_stream_t *s);
+
+/* #365: read-ahead effectiveness -- hits are guest reads served without a device transfer. */
+void hype_iso_stream_cache_stats(const hype_iso_stream_t *s, uint64_t *hits, uint64_t *misses);
+
 int hype_iso_stream_locate(const hype_iso_stream_t *s, uint64_t off, uint64_t *out_lba,
                           uint32_t *out_head, uint64_t *out_run);
 
