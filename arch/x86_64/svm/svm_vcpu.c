@@ -2305,7 +2305,8 @@ int hype_svm_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, h
  * already builds for ATAPI. */
 static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, uint8_t status_reg,
                                        uint8_t error_reg, const hype_gpa_map_t *dma_map,
-                                       unsigned slot, uint32_t pis_bit, uint32_t xfer_bytes) {
+                                       unsigned slot, uint32_t pis_bit, uint32_t xfer_bytes,
+                                       uint8_t *cmd_hdr_bytes) {
     /* #262 slice 3: rx_fis_phys is GUEST-physical. Identity holds for M5-2's
      * microtest (dma_map == 0) but not for the FW-1 guest, which remaps its RAM. */
     uint64_t rx_fis_host = guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
@@ -2324,6 +2325,37 @@ static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, 
     if ((pis_bit & HYPE_AHCI_PIS_PSS) != 0) {
         hype_ahci_build_pio_setup_fis((uint8_t *)(uintptr_t)(rx_fis_host + 0x20), status_reg,
                                       error_reg, xfer_bytes);
+    }
+
+    /*
+     * #358: PRDBC (Command Header dword 1, byte offset 4) -- the count of bytes actually
+     * transferred, which the HBA is required to write back.
+     *
+     * This is what made the guest firmware refuse every guest DISK while the CD on an
+     * identically-presented AHCI function worked. EDK2's AhciPioTransfer branches on the command
+     * type, and only the plain-ATA branch checks it:
+     *
+     *   if (Read && (AtapiCommand == 0)) {
+     *     AhciWaitUntilFisReceived (..., SataFisPioSetup);
+     *     PrdCount = ...AhciCmdList[Slot].AhciCmdPrdbc;
+     *     if (PrdCount == DataCount) Status = EFI_SUCCESS; else Status = EFI_DEVICE_ERROR;
+     *   } else {
+     *     AhciWaitUntilFisReceived (..., SataFisD2H);          // ATAPI: PRDBC never read
+     *   }
+     *
+     * So IDENTIFY DEVICE read back 0 against an expected 512 and failed with
+     * "PIO command failed at retry 0" -- one IDENTIFY, then the device dropped. The ATAPI path
+     * has written PRDBC since #287 and takes the branch that ignores it anyway; the disk path
+     * never wrote it and takes the branch that requires it.
+     *
+     * Linux and OpenBSD never noticed, which is why the disk works under both: they poll PxCI
+     * and read the transfer length from the FIS rather than from the command header.
+     */
+    if (cmd_hdr_bytes != 0) {
+        cmd_hdr_bytes[4] = (uint8_t)(xfer_bytes & 0xFFu);
+        cmd_hdr_bytes[5] = (uint8_t)((xfer_bytes >> 8) & 0xFFu);
+        cmd_hdr_bytes[6] = (uint8_t)((xfer_bytes >> 16) & 0xFFu);
+        cmd_hdr_bytes[7] = (uint8_t)((xfer_bytes >> 24) & 0xFFu);
     }
 
     ahci->p_tfd = (uint32_t)status_reg | ((uint32_t)error_reg << 8);
@@ -2357,8 +2389,8 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
     /* #262 slice 3: every address the guest hands us here is GUEST-physical, so it
      * goes through guest_dma_xlate. A NULL map means the trusted identity-mapped
      * microtest, matching the ATAPI path's convention exactly. */
-    const uint8_t *cmd_hdr_bytes =
-        (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, cmd_list_phys, 32u);
+    /* #358: writable -- PRDBC is written back into this header on completion, as a real HBA does. */
+    uint8_t *cmd_hdr_bytes = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, cmd_list_phys, 32u);
     hype_ahci_cmd_header_t hdr;
     const uint8_t *cmd_table_bytes;
     const uint8_t *prdt_bytes;
@@ -2562,7 +2594,7 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
     }
 
     complete_ahci_command_slot(ahci, rx_fis_phys, status_reg, error_reg, dma_map, slot, pis_bit,
-                               (uint32_t)transferred);
+                               (uint32_t)transferred, cmd_hdr_bytes);
     return 0;
 }
 
