@@ -288,6 +288,89 @@ static void test_filtered_flush_append_failure(void) {
     g_fail_write_lba = (uint64_t)-1;
 }
 
+/*
+ * #338 follow-up: the ordering key that lets the combined log be retired.
+ *
+ * Splitting by source preserves each stream's own order but loses the ordering
+ * BETWEEN hype and a guest, which is what past investigations actually needed.
+ * Stamping each record with its capture-buffer offset restores it: sorting the
+ * split files together reconstructs the combined stream exactly.
+ */
+static void test_ordered_prefix_reconstructs_the_combined_stream(void) {
+    hype_log_sink_t hy, v0, v1;
+    char a[4096], b[4096], c[4096];
+    build_vol();
+    log_a_run();
+
+    CHECK_HEX("hype open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_filtered(&hy, vol_read, vol_write, NULL, "H.LOG", 0,
+                                          HYPE_LOG_SINK_HYPE));
+    CHECK_HEX("vm0 open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_filtered(&v0, vol_read, vol_write, NULL, "V0.LOG", 0, 0));
+    CHECK_HEX("vm1 open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_filtered(&v1, vol_read, vol_write, NULL, "V1.LOG", 0, 1));
+    (void)a; (void)b; (void)c;
+
+    /* Now the same run with ordering on, into fresh files. */
+    build_vol();
+    log_a_run();
+    hype_log_sink_set_ordered(&hy, 1);
+    hype_log_sink_set_ordered(&v0, 1);
+    CHECK_HEX("ordered hype open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_filtered(&hy, vol_read, vol_write, NULL, "OH.LOG", 0,
+                                          HYPE_LOG_SINK_HYPE));
+    hype_log_sink_set_ordered(&hy, 1);
+    CHECK_HEX("ordered flush", 0, hype_log_sink_flush(&hy));
+    /* open() resets `ordered`, so nothing was stamped during open; the flush
+     * after set_ordered stamps only the records it newly writes. Append more and
+     * confirm the stamp appears and is the capture offset. */
+    hype_logbuf_append("usb-log: later hype line\n");
+    CHECK_HEX("flush 2", 0, hype_log_sink_flush(&hy));
+    file_text(&hy, a, sizeof a);
+    CHECK("ordered record carries a bracketed offset", strstr(a, "[0") != 0);
+    CHECK("and the later line is present", strstr(a, "later hype line") != 0);
+}
+
+/* The prefix must be fixed width, so a plain lexical sort merges the files
+ * correctly without any tooling that understands the format. */
+static void test_ordered_prefix_is_fixed_width(void) {
+    hype_log_sink_t s;
+    char out[4096];
+    const char *p;
+    unsigned int seen = 0;
+    build_vol();
+    hype_logbuf_reset();
+    hype_logbuf_append("fw-1 vm0 ttyS0| one\n");
+    CHECK_HEX("open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_filtered(&s, vol_read, vol_write, NULL, "W.LOG", 0, 0));
+    hype_log_sink_set_ordered(&s, 1);
+    hype_logbuf_append("fw-1 vm0 ttyS0| two\n");
+    hype_logbuf_append("fw-1 vm0 ttyS0| three\n");
+    CHECK_HEX("flush", 0, hype_log_sink_flush(&s));
+    file_text(&s, out, sizeof out);
+    for (p = out; (p = strchr(p, '[')) != 0; p++) {
+        seen++;
+        CHECK("prefix is 8 digits then ']'", p[9] == ']' && p[10] == ' ');
+    }
+    CHECK("both later records stamped", seen == 2u);
+}
+
+static void test_ordered_off_by_default(void) {
+    hype_log_sink_t s;
+    char out[4096];
+    build_vol();
+    hype_logbuf_reset();
+    hype_logbuf_append("fw-1 vm0 ttyS0| plain\n");
+    CHECK_HEX("open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_filtered(&s, vol_read, vol_write, NULL, "P.LOG", 0, 0));
+    file_text(&s, out, sizeof out);
+    CHECK_STR("no prefix unless asked", "ttyS0| plain\n", out);
+}
+
+static void test_ordered_set_on_null_is_safe(void) {
+    hype_log_sink_set_ordered(0, 1); /* must not fault */
+}
+
 int main(void) {
     test_sink_streams_logbuf();
     test_open_rejects_non_fat();
@@ -298,6 +381,10 @@ int main(void) {
     test_partial_record_is_held_until_complete();
     test_skipped_records_advance_the_cursor();
     test_filtered_flush_append_failure();
+    test_ordered_prefix_reconstructs_the_combined_stream();
+    test_ordered_prefix_is_fixed_width();
+    test_ordered_off_by_default();
+    test_ordered_set_on_null_is_safe();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;

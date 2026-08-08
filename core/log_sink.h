@@ -35,6 +35,7 @@ typedef struct {
     unsigned int flushed; /* logbuf bytes already streamed to the file */
     int active;           /* 1 once the volume mounted and the file was created */
     int filter;           /* #338: HYPE_LOG_SINK_ALL / _HYPE / a VM index */
+    int ordered;          /* prefix each record with its capture-buffer offset */
 } hype_log_sink_t;
 
 /*
@@ -70,6 +71,24 @@ int hype_log_sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write
 int hype_log_sink_open_filtered(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
                                 void *ctx, const char *filename, const hype_rtc_time_t *now,
                                 int filter);
+
+/*
+ * Prefix every record this sink writes with its offset in the capture buffer, as
+ * "[00012345] ".
+ *
+ * This exists so the combined log can be retired without losing what it was actually
+ * for. Splitting by source keeps each stream's own order but destroys the ordering
+ * BETWEEN hype and a guest -- and that interleaving is what several past
+ * investigations turned on. The capture-buffer offset is a total order over every
+ * record ever written, so sorting the split files by it reconstructs the combined
+ * stream exactly.
+ *
+ * Ten bytes per record against duplicating every byte of every record: the offset is
+ * roughly a tenth the cost of the file it replaces.
+ *
+ * Off by default -- callers that keep a combined log do not need it.
+ */
+void hype_log_sink_set_ordered(hype_log_sink_t *s, int ordered);
 
 /*
  * Appends the logbuf bytes captured since the previous flush (or open). A no-op

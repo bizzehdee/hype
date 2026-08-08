@@ -2,11 +2,30 @@
 #include "log_split.h"
 #include "logbuf.h"
 
+void hype_log_sink_set_ordered(hype_log_sink_t *s, int ordered) {
+    if (s != 0) s->ordered = ordered;
+}
+
+/* "[00012345] " -- fixed width so the files sort lexically as well as numerically,
+ * which means a plain `sort` merges them correctly with no tooling. */
+static unsigned int order_prefix(char *buf, unsigned int off) {
+    unsigned int i;
+    buf[0] = '[';
+    for (i = 0; i < 8u; i++) {
+        buf[8u - i] = (char)('0' + (off % 10u));
+        off /= 10u;
+    }
+    buf[9] = ']';
+    buf[10] = ' ';
+    return 11u;
+}
+
 static int sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write, void *ctx,
                      const char *filename, const hype_rtc_time_t *now, int filter) {
     s->active = 0;
     s->flushed = 0;
     s->filter = filter;
+    s->ordered = 0;
     if (hype_fat32_fs_mount(read, write, ctx, &s->fs) != 0) return HYPE_LOG_SINK_ERR_MOUNT;
     /* Before create(), so the new file's directory entry carries a real date
      * rather than the zeroes that made hype's log show as the Unix epoch. */
@@ -56,6 +75,11 @@ static int flush_filtered(hype_log_sink_t *s, const char *data, unsigned int len
             unsigned int off = (s->filter == HYPE_LOG_SINK_HYPE)
                                    ? 0u
                                    : hype_log_record_body_off(data + pos, reclen);
+            if (s->ordered) {
+                char pfx[12];
+                unsigned int plen = order_prefix(pfx, pos);
+                if (hype_fat32_append(&s->file, pfx, plen) != 0) return -1;
+            }
             /* nl + 1 keeps the newline, so the file stays line-oriented. */
             if (hype_fat32_append(&s->file, data + pos + off, (nl + 1u) - (pos + off)) != 0) {
                 return -1;
