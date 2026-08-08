@@ -5,6 +5,12 @@
 # The ESP image (qbsd.img) is an mtools-built FAT image, NOT vvfat -- vvfat SIGSEGVs QEMU
 # inside its own AHCI emulation while OVMF reads it (#288), which reads as a hype bug and
 # is not one. Only BOOTX64.EFI is refreshed per run; the 1.3GB ISO is left in place.
+# Build it with tools/311/make-bsd-rig.sh.
+#
+# #343: the disk is attached as an EXPLICIT ide-hd with bootindex=0. As a bare `-drive` with no
+# device and no bootindex, the firmware produced 73 bytes -- console-init escapes and then 200
+# seconds of silence, which reads as hype hanging on entry and is not. With the device named, the
+# same image boots and reaches the FreeBSD installer.
 set -e
 cd "$(dirname "$0")/../../disk-images"
 LOG="${1:-bsd-run}.log"
@@ -13,7 +19,11 @@ OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/ovmf/OVMF_CODE.fd}"
 OVMF_VARS="${OVMF_VARS:-/usr/share/edk2/ovmf/OVMF_VARS.fd}"
 
 [ -f ../build/hype.efi ] || { echo "build/hype.efi missing -- run make all"; exit 1; }
-mcopy -i qbsd.img -o ../build/hype.efi ::/EFI/BOOT/BOOTX64.EFI
+# #343: qbsd.img is GPT-partitioned (tools/311/make-bsd-rig.sh), so mtools must be pointed at the
+# partition, not the whole device -- `mcopy -i qbsd.img` on a partitioned image fails with
+# "init :: non DOS media". Partitioned rather than bare FAT on purpose: it matches the real USB
+# stick, and hype's own media resolution walks GPT partitions 1..4 to find the ISO.
+mcopy -i qbsd.img@@1M -o ../build/hype.efi ::/EFI/BOOT/BOOTX64.EFI
 # The HOST varstore must be the pair of the HOST OVMF_CODE. Handing QEMU hype's own vendored
 # GUEST varstore (fw/OVMF_VARS.fd, 540672 bytes, for the 4MB build) instead pairs a mismatched
 # size against a 2MB CODE and the boot produces NO serial output at all -- a silent 0-byte log
@@ -28,7 +38,8 @@ qemu-system-x86_64 \
   -accel kvm -cpu host -smp 4 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file=host-vars.fd \
-  -drive format=raw,file=qbsd.img \
+  -drive format=raw,file=qbsd.img,if=none,id=d0 \
+  -device ide-hd,drive=d0,bus=ide.0,bootindex=0 \
   -serial "file:$LOG" -display none -vga none 2>qemu-stderr.txt &
 QPID=$!
 # Bound by wall clock: the guest never exits on its own, and a hung run must still yield a log.
@@ -54,10 +65,14 @@ echo "done: $(wc -c < "$LOG") bytes in $LOG"
 # them automatically means the next run cannot leave them unread.
 reached=0
 panicked=0
-grep -aq "bsdinstall" "$LOG" && reached=1
+# #343: score on what the installer ACTUALLY prints. "bsdinstall" is not in its output on this
+# path -- a run parked forever on the "Console type [vt100]:" prompt scored the same as one that
+# got into the installer, which is the opposite of what this gate is for. "Console type" is
+# bsdinstall's first line; the input script answers it and the run proceeds past it.
+grep -aqE "Console type|bsdinstall" "$LOG" && reached=1
 grep -aqE "panic:|Fatal trap" "$LOG" && panicked=1
 
-echo "score: reached_bsdinstall=$reached guest_panic=$panicked"
+echo "score: reached_installer=$reached guest_panic=$panicked"
 if [ "$panicked" = 1 ]; then
     echo "---- guest fault detail (#343: resolve this RIP against the FreeBSD kernel symbols) ----"
     grep -aE -A 12 "Fatal trap" "$LOG" | head -40
@@ -66,6 +81,6 @@ fi
 
 # Non-zero on either failure, so this can be used as a gate rather than eyeballed. A guest panic
 # is a FAILURE even though bsdinstall was reached: that combination is exactly #343.
-[ "$reached" = 1 ] || { echo "FAIL: never reached bsdinstall"; exit 1; }
+[ "$reached" = 1 ] || { echo "FAIL: never reached the installer"; exit 1; }
 [ "$panicked" = 0 ] || { echo "FAIL: guest panicked (#343 while it is open, a regression once it is not)"; exit 1; }
-echo "PASS: reached bsdinstall, no guest panic"
+echo "PASS: reached the installer, no guest panic"

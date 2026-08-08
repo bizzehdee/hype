@@ -1,0 +1,24 @@
+# #343: drive FreeBSD's bsdinstall past its FIRST interactive prompt.
+#
+# The panic this hunts happens AFTER bsdinstall starts, and bsdinstall's very first act is to ask
+# for a terminal type and block:
+#
+#   Console type [vt100]:
+#
+# So an unattended run parks there forever and never reaches the window where the fault occurs --
+# which is why a rebuilt rig looked like "never reached bsdinstall" rather than like this issue.
+# Accepting the default is enough to get into the installer proper.
+#
+# Generous timeout: the guest boots a streamed 1.3 GB ISO under nested SVM, and #343 is
+# intermittent, so the run must stay alive well past the prompt for the fault to have a chance to
+# appear. A timeout firing early would report a failure that is not one.
+timeout 420000
+
+expect Console type
+send \n
+
+# bsdinstall's menu. Reaching it is the marker the gate should score, because the literal string
+# "bsdinstall" is NOT printed by the installer on this path -- the old grep was matching something
+# else, which is how a run that stops at the console prompt could still be graded as having got here.
+expect Welcome
+pass reached-installer
