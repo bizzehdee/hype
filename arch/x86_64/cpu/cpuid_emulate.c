@@ -334,6 +334,32 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
         return;
     }
 
+    /*
+     * #361: the 48-byte CPU brand string, leaves 0x80000002-4.
+     *
+     * Leaf 0x80000000 above advertises 0x80000008 as the maximum extended leaf, which tells the
+     * guest these three exist. They were not implemented, so they fell through to zero_result()
+     * and the guest read 48 bytes of zeroes -- the advertise-a-feature-that-is-not-there mistake
+     * the Hyper-V leaf code in this same file explicitly warns against.
+     *
+     * Passed straight through from the host, like 0x80000001. There is nothing to sanitise: a
+     * brand string is a name, it exposes no capability the guest can act on, and the leaf-1
+     * feature bits it sits beside are already the host's own. Inventing a name instead would put
+     * hype back in the business of telling guests something untrue, which is how #298 happened.
+     *
+     * This is not cosmetic. OpenBSD printed "cpu0: Opteron or Athlon 64" on Intel silicon --
+     * a fallback guess from the empty string -- which destroyed the evidence for the #298
+     * cross-vendor check, since the guest's own CPU line could no longer distinguish "the vendor
+     * fix works" from "it does not".
+     */
+    if (eax_in >= 0x80000002u && eax_in <= 0x80000004u) {
+        out->eax = real->eax;
+        out->ebx = real->ebx;
+        out->ecx = real->ecx;
+        out->edx = real->edx;
+        return;
+    }
+
     if (eax_in == 0x80000001u) {
         out->eax = real->eax;
         out->edx = real->edx;

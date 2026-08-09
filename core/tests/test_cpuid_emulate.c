@@ -261,11 +261,19 @@ static void test_unhandled_leaf_returns_all_zero(void) {
     CHECK_HEX("edx", 0, out.edx);
 }
 
+/*
+ * #361: this test used to assert that 0x80000004 -- a BRAND-STRING leaf -- returned zeroes, with
+ * the comment "brand string -- not implemented". It was encoding the defect as expected
+ * behaviour: leaf 0x80000000 advertises 0x80000008, so the guest is told that leaf exists.
+ *
+ * Retargeted at a leaf that really is unmodelled and NOT advertised. 0x80000009 is above the
+ * advertised maximum, so returning zeroes there is correct rather than a promise broken.
+ */
 static void test_unhandled_extended_leaf_returns_all_zero(void) {
     hype_cpuid_result_t real = {1, 2, 3, 4};
     hype_cpuid_result_t out;
 
-    hype_cpuid_emulate(0x80000004u, 0, &real, &out); /* brand string -- not implemented */
+    hype_cpuid_emulate(0x80000009u, 0, &real, &out); /* above the advertised max extended leaf */
 
     CHECK_HEX("eax", 0, out.eax);
     CHECK_HEX("ebx", 0, out.ebx);
@@ -457,7 +465,56 @@ static void test_hv_version_leaf_is_populated(void) {
     CHECK_HEX("major 6 minor 3", (6u << 16) | 3u, out.ebx);
 }
 
+
+/*
+ * #361: leaf 0x80000000 advertises 0x80000008 as the max extended leaf, which promises the guest
+ * that the brand-string leaves exist. They returned zeroes, so OpenBSD printed "Opteron or Athlon
+ * 64" on Intel silicon -- a fallback guess from an empty string, which destroyed the evidence for
+ * the #298 cross-vendor check.
+ */
+static void test_brand_string_leaves_are_not_zero(void) {
+    hype_cpuid_result_t real, out;
+    uint32_t leaf;
+    /* "Intel(R) Co" ... arbitrary non-zero host values; the point is they must reach the guest. */
+    for (leaf = 0x80000002u; leaf <= 0x80000004u; leaf++) {
+        real.eax = 0x65746E49u + leaf;
+        real.ebx = 0x2952286Cu;
+        real.ecx = 0x726F4320u;
+        real.edx = 0x00296D65u;
+        out.eax = out.ebx = out.ecx = out.edx = 0xDEADBEEFu;
+        hype_cpuid_emulate(leaf, 0, &real, &out);
+        CHECK_HEX("brand leaf eax passes through", real.eax, out.eax);
+        CHECK_HEX("brand leaf ebx passes through", real.ebx, out.ebx);
+        CHECK_HEX("brand leaf ecx passes through", real.ecx, out.ecx);
+        CHECK_HEX("brand leaf edx passes through", real.edx, out.edx);
+    }
+}
+
+/* The promise and the implementation must not drift apart again: every leaf up to the advertised
+ * maximum should return something, and the three brand leaves specifically must not be zero. */
+static void test_advertised_max_extended_leaf_is_backed_by_the_brand_leaves(void) {
+    hype_cpuid_result_t real, out;
+    real.eax = real.ebx = real.ecx = real.edx = 0u;
+    out.eax = out.ebx = out.ecx = out.edx = 0u;
+    hype_cpuid_emulate(0x80000000u, 0, &real, &out);
+    CHECK_HEX("max extended leaf still advertised as 0x80000008", 0x80000008u, out.eax);
+    CHECK_HEX("the brand leaves are within what leaf 0x80000000 promises", 1u,
+              (0x80000004u <= out.eax) ? 1u : 0u);
+}
+
+/* A host that genuinely reports zeroes must still yield zeroes -- pass-through, not invention. */
+static void test_brand_string_is_not_fabricated(void) {
+    hype_cpuid_result_t real, out;
+    real.eax = real.ebx = real.ecx = real.edx = 0u;
+    out.eax = 0xDEADBEEFu;
+    hype_cpuid_emulate(0x80000003u, 0, &real, &out);
+    CHECK_HEX("a zero host brand leaf stays zero", 0u, out.eax);
+}
+
 int main(void) {
+    test_brand_string_leaves_are_not_zero();
+    test_advertised_max_extended_leaf_is_backed_by_the_brand_leaves();
+    test_brand_string_is_not_fabricated();
     test_leaf0_vendor_is_passed_through();
     test_ext_leaf0_vendor_matches_basic_leaf0();
     test_leaf1_forces_hypervisor_bit_and_clears_mtrr();
