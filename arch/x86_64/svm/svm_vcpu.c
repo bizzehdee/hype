@@ -1837,6 +1837,9 @@ static int complete_ahci_soft_reset(hype_ahci_t *ahci, uint64_t rx_fis_phys,
     return 0;
 }
 
+/* #344: bounded completion trace, see its use below. */
+static unsigned int g_atapi_completion_traced;
+
 int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                               const hype_gpa_map_t *dma_map, unsigned slot) {
     uint64_t cmd_list_phys =
@@ -2219,6 +2222,36 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
 
     d2h_fis = rx_fis_host + 0x40;
     hype_ahci_build_d2h_fis(d2h_fis, 0, status_reg, error_reg);
+
+    /*
+     * #344: what hype actually PUBLISHED for this command, not merely that it completed.
+     *
+     * The wedge profile is 100% CPU with ZERO VM exits and no output -- a guest spinning on
+     * memory it already owns, not on MMIO. Two explanations for that are now eliminated by
+     * reading the code rather than by measurement: the FIS is posted (process_ahci_command_slot
+     * is shared by both backends, so the "VMX never posts it" idea was wrong), and it is posted
+     * BEFORE PxCI is cleared, on the guest's own vCPU inside a VM exit, so there is no window in
+     * which the guest could see stale bytes.
+     *
+     * That leaves CONTENT. EDK2's AhciPioTransfer checks PRDBC against the count it asked for and
+     * fails the command otherwise; a guest that then polls the FIS area waits forever on a
+     * transfer it believes incomplete. So record the three things it reads -- the byte count
+     * written back into the command header, the PIO Setup FIS, and the D2H Register FIS -- for
+     * the first commands of a run, which is where the wedge happens.
+     *
+     * Bounded, because the stream trace being capped at 24 records is exactly why an earlier
+     * attempt at this had no evidence either way (#356, and the #343 counter above).
+     */
+    if (g_atapi_completion_traced < 24u) {
+        g_atapi_completion_traced++;
+        hype_debug_print(
+            "ahci-cpl #%u slot=%u xfer=%u short=%u tfd=0x%04x st=0x%02x err=0x%02x pis=0x%08x | "
+            "pio[0..3]=%02x%02x%02x%02x cnt=%02x%02x | d2h[0..3]=%02x%02x%02x%02x [#344]\n",
+            g_atapi_completion_traced, slot, (unsigned)transferred, (unsigned)remaining,
+            (unsigned)ahci->p_tfd, (unsigned)status_reg, (unsigned)error_reg, (unsigned)pis_bit,
+            rx_fis_host[0x20], rx_fis_host[0x21], rx_fis_host[0x22], rx_fis_host[0x23],
+            rx_fis_host[0x2C], rx_fis_host[0x2D], d2h_fis[0], d2h_fis[1], d2h_fis[2], d2h_fis[3]);
+    }
 
     ahci->p_ci &= (uint32_t)~(1u << slot); /* this slot complete */
     /* Completion interrupt-status bit (PxIS.DHRS for D2H completions,
