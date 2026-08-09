@@ -2,6 +2,7 @@
 #include "../core/console.h"
 #include "../core/fatal.h"
 #include "../core/gop.h"
+#include "../core/mtrr.h"
 #include "../core/gop_text.h"
 #include "../core/vt_screen.h"
 #include "../core/vt_render.h"
@@ -7298,6 +7299,81 @@ static void fw_1_host_input_poll(void) {
     }
 }
 
+
+/*
+ * #368: is the framebuffer blit actually write-combining?
+ *
+ * A real blit measured 180 KB in 11.03 ms on the Intel box -- 16 MB/s, 244 ns per dword, which
+ * is uncached PCIe speed -- against 725 MB/s on the same framebuffer when the machine is quiet.
+ * hype marks the region WC in its own page tables and programs IA32_PAT on every core, and the
+ * boot log confirms both, so the page tables and the stopwatch disagree.
+ *
+ * This times a FIXED-SIZE write with no render logic around it. That is the point: the existing
+ * BLIT counter measures a whole render pass, so a slow number there could be the memory writes
+ * or could be everything else in the pass. A bare dword loop over a known byte count cannot be
+ * anything but the writes.
+ *
+ * Sampled periodically rather than once, because the collapse is not constant -- it appears when
+ * the guests get busy, and a single boot-time sample would have reported the healthy figure and
+ * closed the ticket wrongly.
+ *
+ * Writes black and then invalidates the render caches, so the band repaints on this same pass.
+ */
+static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
+    static uint64_t last_probe_tsc = 0;
+    static int reported_static = 0;
+    /* 64 Ki dwords = 256 KB: long enough to swamp the TSC read, small enough that the repaint
+     * is a brief band rather than the whole screen. */
+    enum { PROBE_DWORDS = 65536u };
+    volatile unsigned int *fb = (volatile unsigned int *)hype_fatal_get_real_fb();
+    uint64_t now = hype_rdtsc();
+    uint64_t t0, t1, ns;
+    unsigned int i;
+
+    if (fb == 0 || tsc_hz == 0) return;
+    /* Never write past the end of the framebuffer. */
+    if ((uint64_t)g_gop_console.stride * (uint64_t)g_gop_console.height < (uint64_t)PROBE_DWORDS) {
+        return;
+    }
+    if (last_probe_tsc != 0 && now - last_probe_tsc < tsc_hz * 5u) return;
+    last_probe_tsc = now;
+
+    if (!reported_static) {
+        hype_mtrr_var_t var[HYPE_MTRR_MAX_VAR];
+        uint64_t pat = hype_mtrr_read_pat();
+        uint64_t def = hype_mtrr_read_def_type();
+        unsigned int n = hype_mtrr_read_var(var, HYPE_MTRR_MAX_VAR);
+        uint64_t fb_pa = (uint64_t)(uintptr_t)fb;
+        uint8_t mt = hype_mtrr_type_for(fb_pa, var, n, def);
+        reported_static = 1;
+        hype_debug_print("fw-1 FBTYPE: fb=0x%llx PAT=0x%llx PA1=%s MTRR=%s def=%s vcnt=%u "
+                          "mtrr_enabled=%u [#368]\n",
+                          (unsigned long long)fb_pa, (unsigned long long)pat,
+                          hype_mtrr_type_name(hype_pat_entry(pat, 1u)), hype_mtrr_type_name(mt),
+                          hype_mtrr_type_name((uint8_t)(def & HYPE_MTRR_DEF_TYPE_MASK)), n,
+                          (def & HYPE_MTRR_DEF_E) ? 1u : 0u);
+    }
+
+    t0 = hype_rdtsc();
+    for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) fb[i] = 0u;
+    t1 = hype_rdtsc();
+
+    /* ns for the whole 256 KB, computed before dividing so a fast probe does not floor to 0. */
+    ns = ((t1 - t0) * 1000000000ull) / tsc_hz;
+    hype_debug_print("fw-1 FBSPEED: %u KB in %lluus = %llu MB/s (%llu ns/dword) [#368]\n",
+                      (unsigned int)(PROBE_DWORDS * 4u / 1024u), (unsigned long long)(ns / 1000ull),
+                      (ns == 0ull) ? 0ull : ((uint64_t)PROBE_DWORDS * 4ull * 1000ull) / ns,
+                      ns / (uint64_t)PROBE_DWORDS);
+
+    {
+        unsigned vi;
+        hype_vt_render_cache_invalidate(&g_dash_render_cache);
+        for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+            hype_vt_render_cache_invalidate(&g_view_render_cache[vi]);
+        }
+    }
+}
+
 static void fw_1_render_console(void) {
     static uint64_t last_gop_flush_tsc = 0;
     static int term_last_view = -2; /* neither a VM index nor the dashboard, so the first frame clears */
@@ -7311,6 +7387,7 @@ static void fw_1_render_console(void) {
     if (tsc_hz == 0 || g_gop_console.fb == (void *)0) {
         return;
     }
+    fw_1_fb_speed_probe(tsc_hz);
     now_gf = hype_rdtsc();
     /*
      * #363: the cap exists to stop a full redraw running on every loop iteration. With a
