@@ -13,7 +13,24 @@ static int failures = 0;
         } \
     } while (0)
 
-#define VOL_SECTORS 400u
+#define EX_FAT_LBA 24u
+#define EX_FAT_LEN 4u
+#define EX_HEAP_LBA 32u
+#define EX_CLUSTERS 360u
+
+/*
+ * #366: sized from HYPE_FAT_MAX_EXTENTS, not a fixed 400.
+ *
+ * The over-fragmented fixtures below must build a chain of MORE non-adjacent clusters than the cap
+ * allows, so both the FAT region and the cluster heap have to scale with the cap. When the cap was
+ * raised from 64 to 256 these fixtures still built a 66-cluster chain, which is now perfectly
+ * mappable -- so the "too fragmented" tests passed vacuously by asserting that a legal file was
+ * rejected. Deriving the geometry keeps them honest the next time the cap moves.
+ */
+#define FRAG_CLUSTERS (HYPE_FAT_MAX_EXTENTS + 2u)          /* two past the cap */
+#define FRAG_FIRST_CL 10u
+#define FRAG_LAST_CL  (FRAG_FIRST_CL + 2u * (FRAG_CLUSTERS - 1u))
+#define VOL_SECTORS (EX_HEAP_LBA + FRAG_LAST_CL + 64u)
 static uint8_t g_vol[VOL_SECTORS * HYPE_FAT_SECTOR_SIZE];
 
 static uint64_t g_fail_lba = (uint64_t)-1; /* inject a read failure at this LBA */
@@ -189,10 +206,6 @@ static void test_fat32_bad_bpb(void) {
  * root dir: File set for contiguous "test.iso" (cluster3, 700B, NoFatChain)
  *           File set for a directory "sub" (cluster4)
  *   sub/  : File set for chained "big.bin" (cluster5->6->8, 1200B). */
-#define EX_FAT_LBA 24u
-#define EX_FAT_LEN 4u
-#define EX_HEAP_LBA 32u
-#define EX_CLUSTERS 360u
 
 /*
  * The exFAT entry-set checksum, spelled out here straight from the spec's
@@ -270,15 +283,11 @@ static void build_exfat(void) {
     exfat_file_set(exfat_cluster(2) + 0,   "test.iso", 0, 1, 3u, 700u); /* contiguous @cl3 */
     exfat_file_set(exfat_cluster(2) + 96,  "sub",      1, 1, 4u, 0u);   /* subdir @cl4 */
     exfat_file_set(exfat_cluster(2) + 192, "empty",    0, 1, 3u, 0u);   /* zero-length */
-    /* over-fragmented chained file: 66 non-adjacent clusters => > MAX_EXTENTS. */
-    exfat_file_set(exfat_cluster(2) + 288, "toofrag", 0, 0, 100u, 66u * 512u);
-    {
-        uint32_t c;
-        for (c = 100u; c < 230u; c += 2u) {
-            put32(exfat_fat_entry(c), c + 2u);
-        }
-        put32(exfat_fat_entry(230u), 0xFFFFFFFFu);
-    }
+    /* #366: this slot must stay OCCUPIED. It used to hold the over-fragmented file, which now has
+     * its own volume (build_exfat_frag). A 0x00 entry type is END OF DIRECTORY in exFAT, so
+     * leaving the slot zeroed truncated the walk here and hid "cdir" at offset 384 -- which is
+     * what build_exfat_contig_dir descends into. */
+    exfat_file_set(exfat_cluster(2) + 288, "filler",   0, 1, 3u, 512u);
 
     /* sub dir (cluster 4, sector 34): chained big.bin @cl5->6->8 (5,6 adjacent so
      * they coalesce; 8 is non-contiguous so it opens a second extent). 1200B => 3 sectors. */
@@ -527,31 +536,68 @@ static void test_fat_chain_read_failures(void) {
     g_fail_lba = (uint64_t)-1;
 }
 
-/* Dedicated FAT32 volume with a 4-sector FAT (holds clusters 0..511) so a
- * 66-cluster non-adjacent chain fits in the FAT region without colliding with
- * the data area. data_start = 32 + 1*4 = 36 (cluster 2 => sector 36). */
+/*
+ * Dedicated FAT32 volume whose FAT is long enough to hold the whole FRAG_CLUSTERS chain, one
+ * sector per cluster. #366: the FAT length and the data start are DERIVED, because the chain
+ * length now follows HYPE_FAT_MAX_EXTENTS -- a fixed 4-sector FAT held only clusters 0..511 and
+ * silently truncated the chain once the cap passed 250.
+ */
+#define FRAG_FAT_SECTORS ((FRAG_LAST_CL + 1u) * 4u / HYPE_FAT_SECTOR_SIZE + 1u)
+#define FRAG_RESERVED 32u
+#define FRAG_DATA_LBA (FRAG_RESERVED + FRAG_FAT_SECTORS)
+
 static void build_fat32_frag(void) {
     uint8_t *bpb = g_vol;
     uint32_t c;
     memset(g_vol, 0, sizeof(g_vol));
-    put16(bpb + 0x0B, 512); bpb[0x0D] = 1; put16(bpb + 0x0E, 32); bpb[0x10] = 1;
-    put16(bpb + 0x16, 0); put32(bpb + 0x24, 4); put32(bpb + 0x2C, 2);
+    put16(bpb + 0x0B, 512); bpb[0x0D] = 1; put16(bpb + 0x0E, (uint16_t)FRAG_RESERVED); bpb[0x10] = 1;
+    put16(bpb + 0x16, 0); put32(bpb + 0x24, FRAG_FAT_SECTORS); put32(bpb + 0x2C, 2);
     put32(fat_entry_ptr(0), 0x0FFFFFF8u); put32(fat_entry_ptr(1), 0x0FFFFFFFu);
     put32(fat_entry_ptr(2), 0x0FFFFFFFu); /* root EOC */
-    put_short_entry(g_vol + 36u * HYPE_FAT_SECTOR_SIZE, "TOOFRAG BIN", 0x20u, 10u, 66u * 512u);
-    for (c = 10u; c < 140u; c += 2u) {
-        put32(fat_entry_ptr(c), c + 2u); /* 10,12,...,140: 66 non-adjacent clusters */
+    put_short_entry(g_vol + FRAG_DATA_LBA * HYPE_FAT_SECTOR_SIZE, "TOOFRAG BIN", 0x20u,
+                    FRAG_FIRST_CL, FRAG_CLUSTERS * 512u);
+    for (c = FRAG_FIRST_CL; c < FRAG_LAST_CL; c += 2u) {
+        put32(fat_entry_ptr(c), c + 2u); /* non-adjacent throughout: every cluster opens an extent */
     }
-    put32(fat_entry_ptr(140u), 0x0FFFFFFFu);
+    put32(fat_entry_ptr(FRAG_LAST_CL), 0x0FFFFFFFu);
+}
+
+/*
+ * #366: a dedicated over-fragmented exFAT volume, mirroring build_fat32_frag.
+ *
+ * The chain has to be longer than HYPE_FAT_MAX_EXTENTS, and at 256 that no longer fits in the
+ * shared build_exfat() volume's 4-sector FAT. Widening THAT volume moved cluster/sector numbers
+ * a dozen unrelated assertions depend on, so the fragmented case gets its own geometry instead --
+ * the same separation build_fat32_frag already uses, and for the same reason.
+ */
+#define EXFRAG_FAT_LBA EX_FAT_LBA                     /* 24 -- the conventional offset */
+#define EXFRAG_FAT_LEN (EX_HEAP_LBA - EXFRAG_FAT_LBA)  /* 8 sectors = 2048 entries */
+
+static uint8_t *exfrag_fat_entry(uint32_t cl) {
+    return g_vol + EXFRAG_FAT_LBA * HYPE_FAT_SECTOR_SIZE + cl * 4u;
+}
+
+static void build_exfat_frag(void) {
+    uint32_t c;
+    memset(g_vol, 0, sizeof(g_vol));
+    exfat_boot(g_vol, EX_HEAP_LBA, FRAG_LAST_CL + 8u, 0u);
+    put32(g_vol + 0x50, EXFRAG_FAT_LBA); /* FatOffset  */
+    put32(g_vol + 0x54, EXFRAG_FAT_LEN); /* FatLength  */
+
+    exfat_file_set(exfat_cluster(2) + 0, "toofrag", 0, 0, FRAG_FIRST_CL, FRAG_CLUSTERS * 512u);
+    for (c = FRAG_FIRST_CL; c < FRAG_LAST_CL; c += 2u) {
+        put32(exfrag_fat_entry(c), c + 2u); /* non-adjacent throughout */
+    }
+    put32(exfrag_fat_entry(FRAG_LAST_CL), 0xFFFFFFFFu);
 }
 
 static void test_over_fragmented(void) {
     hype_fat_file_t f;
     build_fat32_frag();
-    CHECK_HEX("fat32 >64 extents rejected", (unsigned long long)(-1),
+    CHECK_HEX("fat32 past the extent cap rejected", (unsigned long long)(-1),
               (unsigned long long)hype_fat32_resolve(vol_read, 0, "\\toofrag.bin", &f));
-    build_exfat();
-    CHECK_HEX("exfat >64 extents rejected", (unsigned long long)(-1),
+    build_exfat_frag();
+    CHECK_HEX("exfat past the extent cap rejected", (unsigned long long)(-1),
               (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\toofrag", &f));
 }
 
@@ -577,7 +623,7 @@ static void test_too_fragmented_is_distinguishable_from_other_failures(void) {
               (unsigned long long)hype_fat32_resolve(vol_read, 0, "\\nosuch.bin", &f));
     CHECK_HEX("and does not claim fragmentation", 0u, (unsigned)f.too_fragmented);
 
-    build_exfat();
+    build_exfat_frag();
     CHECK_HEX("exfat over-fragmented still returns -1", (unsigned long long)(-1),
               (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\toofrag", &f));
     CHECK_HEX("exfat says WHY too", 1u, (unsigned)f.too_fragmented);
@@ -593,6 +639,32 @@ static void test_too_fragmented_is_cleared_by_a_later_success(void) {
     CHECK_HEX("a later resolve succeeds", 0,
               hype_fat32_resolve(vol_read, 0, "\\iso\\test.iso", &f));
     CHECK_HEX("and the stale reason is gone", 0u, (unsigned)f.too_fragmented);
+}
+
+/*
+ * #366: the reason must survive the NEXT resolver in the chain.
+ *
+ * boot/main.c tries FAT32, then exFAT, then ext against the same struct. Every resolver clears
+ * too_fragmented at entry, so a FAT32 "too fragmented" verdict was wiped by the exFAT attempt that
+ * followed it -- and the diagnostic, by then reading a cleared flag, printed nothing. That is the
+ * silence #366 was filed about, and it SURVIVED the change meant to end it: a deliberately
+ * fragmented 134-extent volume still produced no message. This pins the mechanism at the level the
+ * loader actually uses it.
+ */
+static void test_a_later_resolver_erases_the_fragmentation_reason(void) {
+    hype_fat_file_t f;
+
+    build_fat32_frag();
+    CHECK_HEX("fat32 reports fragmentation", (unsigned long long)(-1),
+              (unsigned long long)hype_fat32_resolve(vol_read, 0, "\\toofrag.bin", &f));
+    CHECK_HEX("...and sets the flag", 1u, (unsigned)f.too_fragmented);
+
+    /* The next resolver in boot/main.c's chain, against the same struct and the same volume. It
+     * cannot read this volume at all, so it fails for an unrelated reason -- and clears the flag. */
+    CHECK_HEX("exfat cannot read a FAT32 volume", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\toofrag.bin", &f));
+    CHECK_HEX("and the reason is GONE -- callers must not read it after the chain", 0u,
+              (unsigned)f.too_fragmented);
 }
 
 static void test_exfat_more_guards(void) {
@@ -841,6 +913,7 @@ int main(void) {
     test_over_fragmented();
     test_too_fragmented_is_distinguishable_from_other_failures();
     test_too_fragmented_is_cleared_by_a_later_success();
+    test_a_later_resolver_erases_the_fragmentation_reason();
     test_exfat_more_guards();
     test_exfat_spc2_partial_cluster();
     test_exfat_scan_past_chain_end();

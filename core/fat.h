@@ -31,7 +31,26 @@ typedef struct {
     uint64_t sector_count; /* length of the run, in 512-byte sectors */
 } hype_fat_extent_t;
 
-#define HYPE_FAT_MAX_EXTENTS 64u
+/*
+ * #366: 64 was too small to be a limit on hype rather than a limit on the operator's stick.
+ *
+ * The builders COALESCE adjacent clusters, so this counts real discontiguities, not clusters --
+ * 64 of them is a mildly fragmented file, not a pathological one. A 3-5 GB Windows ISO copied
+ * onto a volume that was not freshly formatted routinely exceeds it, and core/ext.h notes large
+ * indirect-mapped files on ext are STRUCTURALLY fragmented, so staying under 64 there was close to
+ * unachievable. The observable effect was that whether an ISO streamed depended on how the stick
+ * happened to be laid out, not on the ISO -- the operator's complaint, and the right one.
+ *
+ * 256 is 4x the headroom at 4 KiB per extent array (16 bytes each). The cost is bounded and known:
+ * one array in hype_iso_stream_t per VM, one in hype_blk_image_t per disk, and a 4 KiB frame in
+ * the three functions that resolve into a local. Every one of those runs on the BSP during setup,
+ * before hype_ap_start(), so none of them lands on the 16 KiB AP stacks.
+ *
+ * This is a ceiling, not a target. It is still finite, and the resolvers still report hitting it
+ * through hype_fat_file_t::too_fragmented, so an operator who exceeds even 256 gets the message
+ * naming the cap rather than silence.
+ */
+#define HYPE_FAT_MAX_EXTENTS 256u
 
 typedef struct {
     hype_fat_extent_t extents[HYPE_FAT_MAX_EXTENTS];

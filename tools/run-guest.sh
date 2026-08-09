@@ -14,7 +14,8 @@
 #
 #   file  (GLADDER-11 / #182)  GPT disk, partition 1 = FAT32 holding \iso\test.iso; hype resolves
 #                             the file's extents and streams from the raw disk LBAs. Handles up to
-#                             HYPE_FAT_MAX_EXTENTS = 64 extents (#327); beyond that hype refuses.
+#                             HYPE_FAT_MAX_EXTENTS extents (#327/#366); beyond that hype refuses,
+#                             and says so by name.
 #                             **Cannot carry an ISO >= 4 GiB: that is FAT32's max file size.**
 #                             The GPT is not optional -- see build_esp_file().
 #

@@ -266,6 +266,10 @@ static int emit_run(emit_t *e, uint64_t logical, uint64_t phys, uint64_t count) 
         return 0;
     }
     if (f->count >= HYPE_FAT_MAX_EXTENTS) {
+        /* #366: say WHY, like the FAT resolvers do. ext matters most for this: core/ext.h notes
+         * large indirect-mapped files are STRUCTURALLY fragmented, so it is the filesystem most
+         * likely to hit the cap -- and it was the one that never reported hitting it. */
+        f->too_fragmented = 1;
         return -1;
     }
     f->extents[f->count].start_lba = start_lba;
@@ -519,7 +523,12 @@ static int map_inode(ext_vol_t *v, const uint8_t ino[IN_CORE], int is_dir, hype_
  */
 static int dir_search(ext_vol_t *v, const uint8_t dino[IN_CORE], const char *name,
                       unsigned int nlen, uint32_t *out_ino) {
-    hype_fat_file_t map;
+    /* #366: static for the same reason as boot/main.c's resolve buffers -- at
+     * HYPE_FAT_MAX_EXTENTS = 256 this struct is over 4 KiB, and a frame that large needs a
+     * __chkstk probe the freestanding build has no definition for. dir_search is called in a
+     * LOOP by hype_ext_resolve, never nested, and resolution is setup-time and single-threaded,
+     * so there is no live second copy to collide with. map_inode() below fully rewrites it. */
+    static hype_fat_file_t map;
     unsigned int x;
 
     if (map_inode(v, dino, 1, &map) != 0) {
@@ -576,6 +585,11 @@ static int dir_search(ext_vol_t *v, const uint8_t dino[IN_CORE], const char *nam
 /* ---- path resolution ---- */
 
 int hype_ext_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fat_file_t *out) {
+    /* #366: cleared at ENTRY, before any early return, so a failure that never reaches the extent
+     * walk cannot inherit the previous call's reason. Same rule as hype_fat32_resolve. */
+    if (out != 0) {
+        out->too_fragmented = 0;
+    }
     ext_vol_t v;
     uint8_t ino[IN_CORE];
     unsigned int pos = 0;

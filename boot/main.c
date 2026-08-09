@@ -7880,6 +7880,44 @@ static int fw_1_vblk_use_physical_ahci(hype_fw_vm_t *vm) {
 static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
 static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src);
 static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
+
+/*
+ * #366: try the three host filesystems in order, and KEEP the reason a failure gave.
+ *
+ * Each resolver clears out->too_fragmented at entry, so the next attempt in the chain erases the
+ * previous one's reason. That is why the fragmentation diagnostic still never fired after the
+ * branch was made reachable: hype_fat32_resolve set the flag, hype_exfat_resolve immediately
+ * cleared it, and by the time anything read it the answer was gone. Confirmed on a deliberately
+ * fragmented 134-extent volume, which produced no message at all -- the exact silence #366 was
+ * filed about, surviving the change meant to end it.
+ *
+ * *frag is OR-ed, never assigned, so whichever resolver recognised the volume gets to set it. A
+ * resolver that does not recognise the volume fails long before the extent walk and leaves the
+ * flag clear, so this cannot report fragmentation for a file that is simply absent.
+ *
+ * Returns the filesystem name on success (a literal, for the caller's log line), or 0.
+ */
+static const char *fw_1_resolve_on_any_fs(const char *path, hype_fat_file_t *out, int *frag) {
+    if (hype_fat32_resolve(fatvol_read, 0, path, out) == 0) {
+        return "FAT32";
+    }
+    *frag |= out->too_fragmented;
+    if (hype_exfat_resolve(fatvol_read, 0, path, out) == 0) {
+        return "exFAT";
+    }
+    *frag |= out->too_fragmented;
+    /*
+     * ext matters most here: core/ext.h notes large indirect-mapped files are STRUCTURALLY
+     * fragmented, so it is the filesystem most likely to hit the cap. Matching is CASE-SENSITIVE
+     * where the FAT resolvers are not, and ext accepts either separator, so the shared literal
+     * needs no translation.
+     */
+    if (hype_ext_resolve(fatvol_read, 0, path, out) == 0) {
+        return "ext";
+    }
+    *frag |= out->too_fragmented;
+    return 0;
+}
 static void scan_budget_arm(unsigned secs);   /* #346 */
 static void scan_budget_disarm(void);
 
@@ -8218,9 +8256,16 @@ static int media_selected_dev(unsigned vi); /* #323 */
 static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
     hype_fw_disk_t *d = &vm->disk[slot];
     hype_gpt_partition_t part;
-    hype_fat_file_t file;
+    /* #366: static, not a stack local. HYPE_FAT_MAX_EXTENTS is 256, so this struct is over 4 KiB
+     * and the UEFI ABI makes the compiler emit a __chkstk stack probe for a frame that large --
+     * which does not exist in a freestanding build, so it fails at link. Static is correct here
+     * anyway: every resolver call runs on the BSP during setup, before hype_ap_start(), and they
+     * all share one file-global read context (fatvol_read takes a NULL ctx), so this path was
+     * already single-threaded by construction. */
+    static hype_fat_file_t file;
     const char *path = HYPE_M5_8_IMAGE_PATH;
     const char *fs = 0;
+    int frag_seen = 0; /* #366 */
     unsigned pidx;
     unsigned didx; /* #324 */
     /*
@@ -8311,13 +8356,7 @@ static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
                 continue;
             }
             g_media.part_base_lba = part.first_lba;
-            if (hype_fat32_resolve(fatvol_read, 0, path, &file) == 0) {
-                fs = "FAT32";
-            } else if (hype_exfat_resolve(fatvol_read, 0, path, &file) == 0) {
-                fs = "exFAT";
-            } else if (hype_ext_resolve(fatvol_read, 0, path, &file) == 0) {
-                fs = "ext2/3/4";
-            }
+            fs = fw_1_resolve_on_any_fs(path, &file, &frag_seen);
         }
     }
     scan_budget_disarm(); /* #346 */
@@ -13917,8 +13956,9 @@ static int fw_1_resolve_media_stream(unsigned vi) {
 
     {
         hype_gpt_partition_t part;
-        hype_fat_file_t file;
+        static hype_fat_file_t file; /* #366: see fw_1_disk_use_image_file -- over 4 KiB, BSP-only */
         int have_file = 0;
+        int frag_seen = 0; /* #366: survives the next resolver clearing file.too_fragmented */
         unsigned pidx;
         unsigned didx; /* #324 */
         /* #325: the device the file was found on. didx is the LOOP variable and the stream setup
@@ -13958,37 +13998,15 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                 continue;
             }
             g_media.part_base_lba = part.first_lba;
-            if (hype_fat32_resolve(fatvol_read, 0, media_path, &file) == 0) {
-                hype_debug_print("host-fat: vm%u resolved %s on FAT32 partition %u "
-                                 "of the %s device\n", vi, media_path, pidx, g_media.bus);
-                have_file = 1;
-                file_dev = didx; /* #325 */
-            } else if (hype_exfat_resolve(fatvol_read, 0, media_path, &file) == 0) {
-                hype_debug_print("host-fat: vm%u resolved %s on exFAT partition %u "
-                                 "of the %s device\n", vi, media_path, pidx, g_media.bus);
-                have_file = 1;
-                file_dev = didx; /* #325 */
-            } else if (hype_ext_resolve(fatvol_read, 0, media_path, &file) == 0) {
-                /*
-                 * #320: ext too, matching the guest disk-image path
-                 * (fw_1_vblk_use_image_file), which has always tried all three. The
-                 * ISO being the read-only one of the pair made the omission harmless
-                 * but arbitrary -- and the operator-facing promise is FAT32, exFAT or
-                 * ext (plan.md §6d).
-                 *
-                 * Two ext-specific differences, both from core/ext.h: matching is
-                 * CASE-SENSITIVE where the FAT resolvers are not, so this literal
-                 * means a lowercase `iso/test.iso`; and ext accepts '/' or '\\' as the
-                 * separator, so the shared literal needs no translation.
-                 *
-                 * This only became useful with #327: ext2/3 indirect-mapped large
-                 * files are structurally fragmented, so under the old one-extent rule
-                 * an ISO here was close to unusable however carefully it was written.
-                 */
-                hype_debug_print("host-fat: vm%u resolved %s on ext partition %u "
-                                 "of the %s device\n", vi, media_path, pidx, g_media.bus);
-                have_file = 1;
-                file_dev = didx; /* #325 */
+            {
+                const char *mfs = fw_1_resolve_on_any_fs(media_path, &file, &frag_seen);
+                if (mfs != 0) {
+                    hype_debug_print("host-fat: vm%u resolved %s on %s partition %u "
+                                     "of the %s device\n", vi, media_path, mfs, pidx,
+                                     g_media.bus);
+                    have_file = 1;
+                    file_dev = didx; /* #325 */
+                }
             }
         }
         /* #346: per-device probe cost, printed + flushed even when nothing resolved -- the next
@@ -14005,7 +14023,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
          * The old `file.count == 1u` gate fell back to the RAM-preload path for a
          * fragmented file -- and that path is being retired (#326), so it would have
          * become a hard failure. It was also stricter than the rest of the block
-         * stack: hype_fat_file_t carries up to 64 runs and the guest disk-image path
+         * stack: hype_fat_file_t carries up to HYPE_FAT_MAX_EXTENTS runs and the guest disk-image path
          * already consumes multi-extent files. A multi-GB ISO on a volume that was not
          * freshly formatted fragments routinely; on ext, core/ext.h notes large
          * indirect-mapped files are structurally fragmented, so one extent was close
@@ -14057,7 +14075,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                                  (unsigned)cd[4]);
                 usb_log_flush(); /* #346: THE failure line two hardware runs never captured */
             }
-        } else if (file.too_fragmented) {
+        } else if (frag_seen) {
             /*
              * #366: this diagnostic existed and was UNREACHABLE for the case it describes.
              * It sat behind `else if (have_file)`, and have_file is only set when resolve

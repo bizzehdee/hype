@@ -24,7 +24,7 @@ typedef int (*hype_iso_disk_read_fn)(void *ctx, uint64_t lba, uint32_t count, vo
  * #327: one contiguous run of the ISO's bytes on disk, in DISK-ABSOLUTE LBAs.
  *
  * A raw ISO partition is one run. An ISO stored as a FILE may be many: hype's resolvers hand back
- * up to HYPE_FAT_MAX_EXTENTS (64) of them, and the ISO path used to accept only the single-extent
+ * up to HYPE_FAT_MAX_EXTENTS of them, and the ISO path used to accept only the single-extent
  * case -- so a 3-5 GB Windows ISO copied onto a volume that was not freshly formatted simply could
  * not be streamed. On ext it is worse than unlikely: core/ext.h notes large indirect-mapped files
  * are STRUCTURALLY fragmented, so one extent is close to unachievable there.
@@ -46,7 +46,11 @@ typedef struct {
     uint64_t sector_count; /* length of the run, in 512-byte sectors */
 } hype_iso_extent_t;
 
-#define HYPE_ISO_STREAM_MAX_EXTENTS 64u
+/* #366: must not be smaller than HYPE_FAT_MAX_EXTENTS -- boot/main.c refuses to stream a file
+ * whose extent count exceeds THIS, so a lower value here would silently re-impose the old cap
+ * after the resolvers had already mapped the file. Kept as its own name because the two describe
+ * different things (what a resolver can map vs what a stream can hold), not as an alias. */
+#define HYPE_ISO_STREAM_MAX_EXTENTS 256u
 
 /* #352: one bounce buffer per concurrently-readable stream (one per VM). */
 #define HYPE_ISO_STREAM_MAX_SLOTS 2u
