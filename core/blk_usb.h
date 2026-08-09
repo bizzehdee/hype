@@ -60,4 +60,13 @@ void hype_blk_usb_set_bsp_apic(unsigned int apic_id);
  * than the budget -- the condition that used to hang the console silently. */
 unsigned long long hype_blk_usb_bsp_lock_timeouts(void);
 
+/*
+ * #368: the LIVE queue depth and current holder, as opposed to the cumulative counters above.
+ * `waiters` is how many cores are queued for the USB path right now; `holder_apic` is the core
+ * inside the transfer, or 0xFFFFFFFF if nobody holds it. Sampled while something else is
+ * stalling, these say whether the stall coincides with USB contention or not -- a question the
+ * run totals cannot answer, because they are heavily contended over any whole run.
+ */
+void hype_blk_usb_queue_stats(unsigned int *waiters, unsigned int *holder_apic);
+
 #endif /* HYPE_CORE_BLK_USB_H */

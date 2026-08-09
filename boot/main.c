@@ -7337,7 +7337,8 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     uint64_t t0, t1, t2, t3, t4, t5, t6, t7, ns, ns_ram, ns_scat, ns_cli, smi_now = 0;
     uint64_t rflags = 0, ticks_before = 0, ticks_after = 0;
     uint64_t chunk_max = 0, chunk_min = 0;
-    unsigned int chunks_slow = 0;
+    unsigned int chunks_slow = 0, usb_waiters_max = 0, usb_held_samples = 0;
+    unsigned long long atapi_before = 0, atapi_after = 0, usbcalls_before = 0, usbcalls_after = 0;
     unsigned int i, r, scatter_runs;
     /* 64 dwords = 256 bytes: the order of a few changed character cells, which is what the
      * per-band path actually pushes. */
@@ -7462,6 +7463,10 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      * than assumed -- this runs from the BSP loop where interrupts are on, but assuming that and
      * then unconditionally re-enabling would be a real bug the day it moves.
      */
+    /* Does host I/O make progress WHILE the loop is stalled? If the counters move, the other
+     * cores are running and only this one is stuck; if they are frozen too, the whole machine
+     * is. Those are different faults and nothing so far distinguishes them. */
+    hype_blk_usb_xfer_stats(0, &usbcalls_before, 0, &atapi_before, 0);
     __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
     __asm__ volatile("cli");
     t6 = hype_rdtsc();
@@ -7488,6 +7493,15 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
             unsigned int base = c * (PROBE_DWORDS / PROBE_CHUNKS);
             for (i = 0; i < (PROBE_DWORDS / PROBE_CHUNKS); i++) fb[base + i] = ram[base + i];
             cs = hype_rdtsc();
+            {
+                /* Sampled INSIDE the stall, not after it. The cumulative USB counters show heavy
+                 * contention across any whole run, so they cannot say whether anything was
+                 * contended at the instant this loop stopped making progress. This can. */
+                unsigned int w = 0, h = 0;
+                hype_blk_usb_queue_stats(&w, &h);
+                if (w > usb_waiters_max) usb_waiters_max = w;
+                if (h != 0xFFFFFFFFu) usb_held_samples++;
+            }
             if (cs - prev > chunk_max) chunk_max = cs - prev;
             if (cs - prev < chunk_min) chunk_min = cs - prev;
             /* "slow" = over 1ms, which a healthy chunk beats by three orders of magnitude. */
@@ -7497,6 +7511,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     }
     t7 = hype_rdtsc();
     if (rflags & (1ull << 9)) __asm__ volatile("sti");
+    hype_blk_usb_xfer_stats(0, &usbcalls_after, 0, &atapi_after, 0);
     ns_cli = ((t7 - t6) * 1000000000ull) / tsc_hz;
     /* ONE line. Each hype_debug_print also tees to the GOP screen, and four of them every five
      * seconds is a visible block of diagnostics painted over the dashboard -- reported by the
@@ -7511,6 +7526,11 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
                       (unsigned int)PROBE_CHUNKS,
                       (unsigned long long)(ticks_after - ticks_before),
                       (unsigned long long)(smi_now - last_smi));
+    hype_debug_print("fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=%u usb_held=%u/%u "
+                      "| usb_sectors=+%llu usb_calls=+%llu [#368]\n",
+                      usb_waiters_max, usb_held_samples, (unsigned int)PROBE_CHUNKS,
+                      (unsigned long long)(atapi_after - atapi_before),
+                      (unsigned long long)(usbcalls_after - usbcalls_before));
     last_smi = smi_now;
 
 }

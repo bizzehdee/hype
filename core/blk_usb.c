@@ -35,6 +35,7 @@
  */
 static volatile unsigned int g_usb_ticket_next;   /* next ticket handed out */
 static volatile unsigned int g_usb_ticket_owner;  /* ticket currently served */
+static volatile unsigned int g_usb_lock_holder_apic = 0xFFFFFFFFu; /* core inside the transfer */
 
 /*
  * #362: measurement, kept in tree deliberately.
@@ -101,6 +102,7 @@ static int usb_xfer_lock_bounded(void) {
         __builtin_ia32_pause();
         spins++;
     }
+    __atomic_store_n(&g_usb_lock_holder_apic, usb_xfer_this_apic(), __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_usb_lock_acquires, 1ull, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_usb_lock_spins, spins, __ATOMIC_RELAXED);
     return 0;
@@ -121,6 +123,7 @@ static void usb_xfer_lock(void) {
         __builtin_ia32_pause();
         spins++;
     }
+    __atomic_store_n(&g_usb_lock_holder_apic, usb_xfer_this_apic(), __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_usb_lock_acquires, 1ull, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_usb_lock_spins, spins, __ATOMIC_RELAXED);
     if (spins > __atomic_load_n(&g_usb_lock_max_spins, __ATOMIC_RELAXED)) {
@@ -130,7 +133,25 @@ static void usb_xfer_lock(void) {
 }
 
 static void usb_xfer_unlock(void) {
+    __atomic_store_n(&g_usb_lock_holder_apic, 0xFFFFFFFFu, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_usb_ticket_owner, 1u, __ATOMIC_RELEASE);
+}
+
+/*
+ * #368: the live queue, not the run totals.
+ *
+ * The existing counters are cumulative, so they say the USB path is heavily contended over a
+ * whole run but cannot say whether anything was contended AT the instant something else stalled.
+ * (next - owner) is the number of cores queued right now, and holder is the core inside the
+ * transfer. Sampled during the stall, those distinguish "everyone is waiting on USB" from
+ * "the USB path is idle and the stall is something else entirely" -- which is exactly the
+ * question the run totals cannot answer.
+ */
+void hype_blk_usb_queue_stats(unsigned int *waiters, unsigned int *holder_apic) {
+    unsigned int next = __atomic_load_n(&g_usb_ticket_next, __ATOMIC_RELAXED);
+    unsigned int owner = __atomic_load_n(&g_usb_ticket_owner, __ATOMIC_RELAXED);
+    if (waiters != 0) *waiters = next - owner;
+    if (holder_apic != 0) *holder_apic = __atomic_load_n(&g_usb_lock_holder_apic, __ATOMIC_RELAXED);
 }
 
 void hype_blk_usb_lock_stats(unsigned long long *acquires, unsigned long long *spins,
