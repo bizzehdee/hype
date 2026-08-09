@@ -90,6 +90,16 @@ typedef struct {
     uint64_t cache_lba;      /* first disk LBA held in the bounce buffer */
     uint32_t cache_sectors;  /* how many sectors, 0 = empty */
     uint64_t cache_hits;     /* served without touching the device */
+    /*
+     * #365: where the previous fill ended, so read-ahead can be spent only where it pays.
+     *
+     * A fixed 128-sector read-ahead is a large win on a sequential stream and a large LOSS on a
+     * seeking one: every miss fetches 64 KiB to serve a 2 KiB request, then misses again. Measured
+     * on real hardware with two guests -- vm1 streaming sequentially hit 95%, vm0 seeking hit 13%,
+     * and between them USB moved 55.3 MB to deliver 9.8 MB to the guests. That 5.6x amplification
+     * is the cost of reading ahead for a guest that was never going to use it.
+     */
+    uint64_t next_seq_lba;   /* LBA that would continue the last fill; 0 = no history */
     uint64_t cache_misses;   /* required a device read */
     /*
      * #352: which bounce buffer this stream fills. The buffer used to be one file-global,

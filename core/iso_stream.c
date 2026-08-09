@@ -90,7 +90,21 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
          * more than fetching one sector, and 97.5% of guest reads continue exactly where the
          * previous one ended.
          */
-        nsec = BOUNCE_SECTORS;
+        /*
+         * #365: read ahead only when this read continues the last one.
+         *
+         * Sequential guests get the full bounce buffer, which is where the win is -- a device
+         * read is dominated by a fixed per-request charge (~551 us of USB scheduling against
+         * ~62 us of wire time for 2 KB), so a big fetch costs barely more than a small one.
+         * A seeking guest gets exactly what it asked for, because for it the read-ahead is pure
+         * waste: it never returns to those sectors and the next read misses anyway.
+         */
+        nsec = (s->next_seq_lba != 0u && lba == s->next_seq_lba) ? BOUNCE_SECTORS : need;
+        /* Must never exceed the bounce buffer. `need` can: a single 100000-byte guest read is 196
+         * sectors against a 128-sector buffer, and taking it verbatim would write past the end of
+         * g_bounce. The caller's loop handles a short fill; a buffer overflow it cannot. Caught by
+         * an existing test rather than on hardware. */
+        if (nsec > BOUNCE_SECTORS) nsec = BOUNCE_SECTORS;
 
         /* Never read past this extent's end: the sectors after it belong to another part of the
          * file (or to another file entirely), so reading them would return the wrong bytes.
@@ -138,6 +152,10 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
             s->cache_sectors = nsec;
             s->cache_misses++;
         }
+        /* Where a continuing read would start. Updated on hits as well as misses: a run served
+         * entirely from cache is still sequential, and forgetting that would drop the stream back
+         * to no-read-ahead on the next miss. */
+        s->next_seq_lba = lba + need;
         avail = nsec * HYPE_ISO_STREAM_SECTOR - head; /* usable bytes this fill */
         if ((uint64_t)avail > run) {
             avail = (uint32_t)run; /* clamp to the extent, not just to the sectors fetched */
@@ -157,6 +175,7 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
 }
 
 void hype_iso_stream_invalidate(hype_iso_stream_t *s) {
+    if (s != 0) s->next_seq_lba = 0u;
     if (s != 0) {
         s->cache_sectors = 0u;
     }

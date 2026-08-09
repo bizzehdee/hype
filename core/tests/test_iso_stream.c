@@ -509,6 +509,99 @@ static void test_cache_stats_null_safety(void) {
     hype_iso_stream_invalidate(0); /* must not fault */
 }
 
+
+/*
+ * #365: read-ahead must be spent only where it pays.
+ *
+ * Measured on hardware with two guests: a sequential guest hit 95% while a seeking guest hit 13%,
+ * and USB moved 55.3 MB to deliver 9.8 MB. The unconditional 128-sector fetch was serving the
+ * seeking guest 64 KiB per 2 KiB request and missing again immediately.
+ */
+static uint64_t g_ra_sectors_read;
+static uint64_t g_ra_calls;
+
+static int ra_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    unsigned char *p = (unsigned char *)dst;
+    uint64_t i;
+    (void)ctx;
+    g_ra_calls++;
+    g_ra_sectors_read += count;
+    for (i = 0; i < (uint64_t)count * HYPE_ISO_STREAM_SECTOR; i++) {
+        p[i] = (unsigned char)((lba + i / HYPE_ISO_STREAM_SECTOR) & 0xFFu);
+    }
+    return 0;
+}
+
+static void ra_init(hype_iso_stream_t *s) {
+    unsigned i;
+    for (i = 0; i < sizeof(*s); i++) ((unsigned char *)s)[i] = 0;
+    s->read = ra_read;
+    s->ctx = 0;
+    s->part_start_lba = 0;
+    s->iso_size = (uint64_t)(1u << 20) * HYPE_ISO_STREAM_SECTOR;
+    s->extent_count = 0; /* one contiguous run from part_start_lba */
+    g_ra_sectors_read = 0;
+    g_ra_calls = 0;
+}
+
+static void test_seeking_reads_do_not_fetch_read_ahead(void) {
+    hype_iso_stream_t s;
+    unsigned char buf[HYPE_ISO_STREAM_SECTOR];
+    unsigned i;
+    ra_init(&s);
+    /* Ten reads scattered far apart -- nothing continues anything. */
+    for (i = 0; i < 10u; i++) {
+        CHECK_INT("seeking read succeeds", 0,
+                  hype_iso_stream_read(&s, (uint64_t)i * 4096u * HYPE_ISO_STREAM_SECTOR, buf,
+                                       sizeof(buf)));
+    }
+    CHECK_INT("ten device reads", 10, (int)g_ra_calls);
+    /* One sector each. Before this change it fetched 128 apiece: 1280 sectors for 10 wanted. */
+    CHECK_INT("no read-ahead is fetched for a seeking pattern", 10, (int)g_ra_sectors_read);
+}
+
+static void test_sequential_reads_still_get_full_read_ahead(void) {
+    hype_iso_stream_t s;
+    unsigned char buf[HYPE_ISO_STREAM_SECTOR];
+    unsigned i;
+    ra_init(&s);
+    for (i = 0; i < 64u; i++) {
+        CHECK_INT("sequential read succeeds", 0,
+                  hype_iso_stream_read(&s, (uint64_t)i * HYPE_ISO_STREAM_SECTOR, buf, sizeof(buf)));
+    }
+    /* 64 contiguous sectors must come from far fewer than 64 device reads. */
+    CHECK("a sequential run is served mostly from cache", g_ra_calls <= 2u);
+    CHECK("and its hits dominate", s.cache_hits > s.cache_misses);
+}
+
+/* A seek followed by a sequential run must recover read-ahead, not stay penalised. */
+static void test_read_ahead_recovers_after_a_seek(void) {
+    hype_iso_stream_t s;
+    unsigned char buf[HYPE_ISO_STREAM_SECTOR];
+    unsigned i;
+    uint64_t base = 500u * HYPE_ISO_STREAM_SECTOR;
+    ra_init(&s);
+    CHECK_INT("the seek itself succeeds", 0, hype_iso_stream_read(&s, base, buf, sizeof(buf)));
+    CHECK_INT("the seek fetched one sector only", 1, (int)g_ra_sectors_read);
+    for (i = 1; i < 40u; i++) {
+        CHECK_INT("continuing read succeeds", 0,
+                  hype_iso_stream_read(&s, base + (uint64_t)i * HYPE_ISO_STREAM_SECTOR, buf,
+                                       sizeof(buf)));
+    }
+    CHECK("read-ahead resumed once the pattern became sequential", g_ra_calls <= 3u);
+}
+
+/* Invalidation must clear the sequential history too, or the next read after a media change is
+ * treated as continuing a stream that no longer exists. */
+static void test_invalidate_clears_the_sequential_history(void) {
+    hype_iso_stream_t s;
+    unsigned char buf[HYPE_ISO_STREAM_SECTOR];
+    ra_init(&s);
+    (void)hype_iso_stream_read(&s, 0, buf, sizeof(buf));
+    hype_iso_stream_invalidate(&s);
+    CHECK_INT("history is cleared", 0, (int)s.next_seq_lba);
+}
+
 int main(void) {
     test_sequential_reads_hit_the_cache_and_return_correct_bytes();
     test_backward_seek_is_a_miss_and_still_correct();
@@ -552,6 +645,10 @@ int main(void) {
                   hype_iso_stream_read(&s, ISO_SIZE - 16u, buf, 16));
     }
 
+    test_seeking_reads_do_not_fetch_read_ahead();
+    test_sequential_reads_still_get_full_read_ahead();
+    test_read_ahead_recovers_after_a_seek();
+    test_invalidate_clears_the_sequential_history();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;
