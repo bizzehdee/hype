@@ -1124,6 +1124,24 @@ static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
  */
 static volatile unsigned long long g_bsp_ticks;
 
+/*
+ * #363: WHERE in its loop the BSP is, not just whether it is moving.
+ *
+ * The heartbeat proved the BSP genuinely stalls (ticks frozen across six samples) and then
+ * resumes, and that it is NOT waiting on the USB lock (bsp_usb_timeouts stayed 0 with a budget
+ * that would have expired in well under a second). So it is stuck INSIDE one of the calls in its
+ * loop. Each is a different bug with a different fix, and "the loop stopped" cannot tell them
+ * apart -- which is the same ambiguity that has cost several runs already.
+ *
+ * Set before each step, read by a guest core alongside the tick count.
+ */
+#define BSP_PHASE_IDLE    0u
+#define BSP_PHASE_RENDER  1u
+#define BSP_PHASE_INPUT   2u
+#define BSP_PHASE_KBDDIAG 3u
+#define BSP_PHASE_FLUSH   4u
+static volatile unsigned int g_bsp_phase;
+
 static unsigned long long g_mmio_fetch_tsc, g_mmio_fetch_calls;
 /* #367: cost of emulating an AHCI register access, separate from the global exit mean. */
 static unsigned long long g_ahci_npf_tsc, g_ahci_npf_calls;
@@ -11526,8 +11544,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                    / r10_ms; /* 2 KiB/block */
                                     }
                                 }
-                                hype_debug_print("fw-1 BSPALIVE: ticks=%llu [#363]\n",
-                                                 (unsigned long long)g_bsp_ticks);
+                                hype_debug_print("fw-1 BSPALIVE: ticks=%llu phase=%u "
+                                                 "(0=idle 1=render 2=input 3=kbddiag 4=flush) "
+                                                 "[#363]\n",
+                                                 (unsigned long long)g_bsp_ticks,
+                                                 (unsigned int)g_bsp_phase);
                                 hype_debug_print("fw-1 DIAG: ATAPI READ(10) count=%u (cmds=%u) "
                                                   "sectors=%llu max=%u hist=%u/%u/%u/%u/%u/%u "
                                                   "seq=%u/%u/%u(contig/near/far) "
@@ -16859,8 +16880,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * and the machine looked crashed. fw_1_render_console() caps itself at 60 Hz.
              */
             g_bsp_ticks++; /* #363: liveness, read by a guest core -- see the declaration */
+            g_bsp_phase = BSP_PHASE_RENDER;
             fw_1_render_console();
+            g_bsp_phase = BSP_PHASE_INPUT;
             fw_1_host_input_poll(); /* #363: keyboard + terminal switching, off the guest core */
+            g_bsp_phase = BSP_PHASE_KBDDIAG;
             {
                 /*
                  * #363: report keyboard-interrupt liveness FROM THE BSP, on its own cadence.
@@ -16899,7 +16923,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 if (drain_last_tsc == 0 || now_d - drain_last_tsc >= iv) {
                     unsigned int have = hype_logbuf_len();
                     drain_last_tsc = now_d;
+                    g_bsp_phase = BSP_PHASE_FLUSH;
                     usb_log_flush(); /* no-op until a USB sink is open */
+                    g_bsp_phase = BSP_PHASE_IDLE;
                     /*
                      * #338: say how much of the buffer has actually reached the file. A gap that
                      * grows means the sink is behind or dead -- visible IN the log instead of
