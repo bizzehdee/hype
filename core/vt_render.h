@@ -57,6 +57,12 @@ typedef struct {
     unsigned cur_col;  /* where the cursor was drawn last frame */
     unsigned cur_row;
     int cursor_shown;
+    /*
+     * #363: where a BOUNDED render should resume. Only meaningful with
+     * hype_vt_render_cached_bounded(); the unbounded entry point always sweeps the
+     * whole screen and leaves this at 0.
+     */
+    unsigned resume_row;
     hype_vt_cell_t cells[HYPE_VT_MAX_ROWS][HYPE_VT_MAX_COLS];
 } hype_vt_render_cache_t;
 
@@ -64,5 +70,27 @@ void hype_vt_render_cache_invalidate(hype_vt_render_cache_t *cache);
 
 unsigned hype_vt_render_cached(const hype_vt_screen_t *s, hype_gop_console_t *con, int show_cursor,
                                hype_vt_render_cache_t *cache);
+
+/*
+ * #363: as hype_vt_render_cached(), but drawing at most `max_rows` rows per call and
+ * resuming where the previous call stopped. `*more` is set to 1 if rows remain.
+ *
+ * Why this exists: the renderer moved to the BSP so a wedged guest could not take the
+ * display and keyboard with it. It then became the thing that took them: with a guest
+ * spinning on emulated MMIO, one full pass measured over SIX SECONDS on real hardware
+ * against the 56-140 ms its own PERF-2 note records, and the BSP services keyboard
+ * input between passes -- so the operator lost the keyboard for a minute at a time and
+ * saw exactly one very slow screen update.
+ *
+ * A budget converts that from "no input until the screen is done" into "input every few
+ * milliseconds, screen catches up over several passes". Correctness needs no extra care:
+ * rows not visited keep their PREVIOUS cached contents, so the next pass still sees them
+ * as differing and draws them. A partial pass is never a lost update, only a late one.
+ *
+ * `max_rows` of 0 means unlimited, i.e. identical to hype_vt_render_cached().
+ */
+unsigned hype_vt_render_cached_bounded(const hype_vt_screen_t *s, hype_gop_console_t *con,
+                                       int show_cursor, hype_vt_render_cache_t *cache,
+                                       unsigned max_rows, int *more);
 
 #endif /* HYPE_VT_RENDER_H */

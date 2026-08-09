@@ -49,17 +49,35 @@ void hype_vt_render(const hype_vt_screen_t *s, hype_gop_console_t *con, int show
 void hype_vt_render_cache_invalidate(hype_vt_render_cache_t *cache) {
     if (cache != 0) {
         cache->valid = 0;
+        /*
+         * #363: and drop any partial-sweep progress. Without this a view switch could
+         * resume mid-screen, leaving every row ABOVE the resume point still showing the
+         * previous view -- the exact mixing this cache is per-view to prevent. Caught by
+         * the test asserting a restart lands 2 rows in rather than wherever the last
+         * sweep happened to stop.
+         */
+        cache->resume_row = 0u;
     }
 }
 
 /* Same output as hype_vt_render, but only the cells that changed. */
 unsigned hype_vt_render_cached(const hype_vt_screen_t *s, hype_gop_console_t *con, int show_cursor,
                                hype_vt_render_cache_t *cache) {
+    return hype_vt_render_cached_bounded(s, con, show_cursor, cache, 0u, 0);
+}
+
+unsigned hype_vt_render_cached_bounded(const hype_vt_screen_t *s, hype_gop_console_t *con,
+                                       int show_cursor, hype_vt_render_cache_t *cache,
+                                       unsigned max_rows_this_call, int *more) {
     unsigned max_cols = (s->cols < con->cols) ? s->cols : con->cols;
     unsigned max_rows = (s->rows < con->rows) ? s->rows : con->rows;
     unsigned drawn = 0;
     int full;
 
+    unsigned start_row;
+    unsigned end_row;
+
+    if (more != 0) *more = 0;
     if (cache == 0) {
         hype_vt_render(s, con, show_cursor);
         return max_cols * max_rows;
@@ -68,9 +86,28 @@ unsigned hype_vt_render_cached(const hype_vt_screen_t *s, hype_gop_console_t *co
     if (max_rows > HYPE_VT_MAX_ROWS) max_rows = HYPE_VT_MAX_ROWS;
 
     /* A different geometry invalidates every cached cell position. */
-    full = (!cache->valid || cache->cols != max_cols || cache->rows != max_rows);
+    /*
+     * Mid-sweep means a previous BOUNDED call stopped part-way with the same geometry.
+     * It must be distinguished from an invalid cache, because the first bounded sweep is
+     * BOTH: every cell needs drawing (nothing cached yet) AND progress must be kept
+     * across calls. Conflating them made `full` force start_row back to 0 every call, so
+     * a bounded render redrew the first few rows forever and never finished -- caught by
+     * the test that renders to completion and compares against one unbounded pass.
+     */
+    {
+        int mid_sweep = (cache->resume_row != 0u && cache->resume_row < max_rows &&
+                         cache->cols == max_cols && cache->rows == max_rows);
+        full = (cache->cols != max_cols || cache->rows != max_rows ||
+                (!cache->valid && !mid_sweep));
+        start_row = mid_sweep ? cache->resume_row : 0u;
+    }
+    if (max_rows_this_call == 0u || start_row + max_rows_this_call >= max_rows) {
+        end_row = max_rows;
+    } else {
+        end_row = start_row + max_rows_this_call;
+    }
 
-    for (unsigned r = 0; r < max_rows; r++) {
+    for (unsigned r = start_row; r < end_row; r++) {
         for (unsigned c = 0; c < max_cols; c++) {
             hype_vt_cell_t cell = hype_vt_screen_cell(s, c, r);
             hype_vt_cell_t was = cache->cells[r][c];
@@ -97,11 +134,30 @@ unsigned hype_vt_render_cached(const hype_vt_screen_t *s, hype_gop_console_t *co
             drawn++;
         }
     }
-    cache->valid = 1;
-    cache->cols = max_cols;
-    cache->rows = max_rows;
-    cache->cur_col = s->cur_col;
-    cache->cur_row = s->cur_row;
-    cache->cursor_shown = show_cursor ? 1 : 0;
+    if (end_row >= max_rows) {
+        /* A sweep finished: the cache now describes the whole screen, so the cursor
+         * bookkeeping is safe to update and the next call starts from the top. */
+        cache->valid = 1;
+        cache->cols = max_cols;
+        cache->rows = max_rows;
+        cache->cur_col = s->cur_col;
+        cache->cur_row = s->cur_row;
+        cache->cursor_shown = show_cursor ? 1 : 0;
+        cache->resume_row = 0u;
+    } else {
+        /*
+         * Partial sweep. Deliberately do NOT mark the cache valid or move the cursor
+         * bookkeeping: the rows below end_row still hold older content, and claiming
+         * otherwise is how a partial render turns into a permanently stale region.
+         */
+        /* Record the geometry now, so the next call recognises this as a resume rather
+         * than a fresh (and therefore restarted) sweep. `valid` stays 0: the rows below
+         * end_row still hold older content and the cache does not yet describe the
+         * whole screen. */
+        cache->cols = max_cols;
+        cache->rows = max_rows;
+        cache->resume_row = end_row;
+        if (more != 0) *more = 1;
+    }
     return drawn;
 }

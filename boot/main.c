@@ -7271,8 +7271,14 @@ static void fw_1_render_console(void) {
         return;
     }
     now_gf = hype_rdtsc();
-    if (last_gop_flush_tsc != 0 && now_gf - last_gop_flush_tsc < tsc_hz / 60u) {
-        return; /* 60 Hz cap, as before */
+    /*
+     * #363: the cap exists to stop a full redraw running on every loop iteration. With a
+     * BOUNDED pass that reason is gone, and the cap actively hurts: a screen now takes
+     * several passes, so capping passes at 60 Hz caps a full update at several times that.
+     * Keep a much looser limit purely so an idle BSP is not blitting continuously.
+     */
+    if (last_gop_flush_tsc != 0 && now_gf - last_gop_flush_tsc < tsc_hz / 1000u) {
+        return;
     }
     last_gop_flush_tsc = now_gf;
     view = g_term_view;
@@ -7292,8 +7298,16 @@ static void fw_1_render_console(void) {
             term_last_view = view;
         }
         {
-            unsigned drawn = hype_vt_render_cached(&g_vms[view].term, &g_gop_console, 1,
-                                                  &term_cache[view]);
+            /*
+             * #363: bounded. One unbounded pass measured over SIX SECONDS on hardware with
+             * a guest spinning on emulated MMIO, and the BSP services the keyboard between
+             * passes -- so the operator lost input for a minute and saw a single very slow
+             * screen update. 8 rows keeps a pass in the tens of milliseconds even at the
+             * worst observed rate, and the screen converges over the following passes.
+             */
+            int more = 0;
+            unsigned drawn = hype_vt_render_cached_bounded(&g_vms[view].term, &g_gop_console, 1,
+                                                           &term_cache[view], 8u, &more);
             g_render_cells_drawn += drawn;
             g_render_calls++;
             if (drawn != 0u) {
@@ -7351,8 +7365,9 @@ static void fw_1_render_console(void) {
         /* PERF-2 (#234): same diffing treatment for the dashboard. It only
          * changes when a stat/second ticks, so most frames push nothing. */
         {
-            unsigned drawn = hype_vt_render_cached(&g_dashboard_term, &g_gop_console, 0,
-                                                  &g_dash_render_cache);
+            int more = 0;
+            unsigned drawn = hype_vt_render_cached_bounded(&g_dashboard_term, &g_gop_console, 0,
+                                                           &g_dash_render_cache, 8u, &more);
             g_render_cells_drawn += drawn;
             g_render_calls++;
             if (drawn != 0u) {

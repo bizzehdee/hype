@@ -25,7 +25,150 @@ static int cell_has_fg(const unsigned int *fb, unsigned w, unsigned col, unsigne
     return 0;
 }
 
+/* ---- #363: bounded, resumable rendering ---- */
+
+/*
+ * The renderer moved to the BSP so a wedged guest could not take the display and
+ * keyboard with it -- and then became the thing that took them: one full pass
+ * measured over SIX SECONDS on real hardware with a guest spinning on emulated
+ * MMIO, and the BSP services keyboard input between passes.
+ *
+ * The property that matters is NOT that it draws less per call. It is that a
+ * partial pass never LOSES an update -- a late screen is fine, a permanently
+ * stale region is not.
+ */
+static void test_bounded_render_completes_over_several_passes(void) {
+    unsigned W = 80 * 8, H = 25 * 8;
+    unsigned int *fb_ref = calloc((size_t)W * H, sizeof(unsigned int));
+    unsigned int *fb_bnd = calloc((size_t)W * H, sizeof(unsigned int));
+    hype_gop_console_t cref, cbnd;
+    hype_vt_screen_t *s = malloc(sizeof(*s));
+    hype_vt_render_cache_t *ca_ref = calloc(1, sizeof(*ca_ref));
+    hype_vt_render_cache_t *ca_bnd = calloc(1, sizeof(*ca_bnd));
+    int more = 1;
+    unsigned passes = 0;
+
+    hype_gop_console_init(&cref, fb_ref, W, H, W, 0xAAAAAAu, 0x000000u);
+    hype_gop_console_init(&cbnd, fb_bnd, W, H, W, 0xAAAAAAu, 0x000000u);
+    hype_vt_screen_init(s, 80, 25);
+    hype_vt_screen_write(s, (const uint8_t *)"top line\r\n", 10);
+    for (unsigned i = 0; i < 20u; i++) {
+        hype_vt_screen_write(s, (const uint8_t *)"filler\r\n", 8);
+    }
+    hype_vt_screen_write(s, (const uint8_t *)"bottom", 6);
+
+    /* Reference: one unbounded pass. */
+    (void)hype_vt_render_cached(s, &cref, 0, ca_ref);
+
+    /* Bounded: 4 rows at a time until it reports it is done. */
+    while (more && passes < 100u) {
+        (void)hype_vt_render_cached_bounded(s, &cbnd, 0, ca_bnd, 4u, &more);
+        passes++;
+    }
+    CHECK("bounded render needed several passes", passes > 1u);
+    CHECK("bounded render reported completion", more == 0);
+    CHECK_HEX("bounded output is byte-identical to one unbounded pass", 0,
+              memcmp(fb_ref, fb_bnd, (size_t)W * H * sizeof(unsigned int)));
+
+    free(fb_ref); free(fb_bnd); free(s); free(ca_ref); free(ca_bnd);
+}
+
+/* A content change part-way through a partial sweep must still reach the screen. */
+static void test_partial_sweep_does_not_lose_a_later_update(void) {
+    unsigned W = 80 * 8, H = 25 * 8;
+    unsigned int *fb = calloc((size_t)W * H, sizeof(unsigned int));
+    unsigned int *fb_ref = calloc((size_t)W * H, sizeof(unsigned int));
+    hype_gop_console_t con, cref;
+    hype_vt_screen_t *s = malloc(sizeof(*s));
+    hype_vt_render_cache_t *ca = calloc(1, sizeof(*ca));
+    hype_vt_render_cache_t *ca_ref = calloc(1, sizeof(*ca_ref));
+    int more = 1;
+    unsigned passes = 0;
+
+    hype_gop_console_init(&con, fb, W, H, W, 0xAAAAAAu, 0x000000u);
+    hype_gop_console_init(&cref, fb_ref, W, H, W, 0xAAAAAAu, 0x000000u);
+    hype_vt_screen_init(s, 80, 25);
+    hype_vt_screen_write(s, (const uint8_t *)"first", 5);
+
+    /* One bounded pass only -- the screen is deliberately left incomplete. */
+    (void)hype_vt_render_cached_bounded(s, &con, 0, ca, 2u, &more);
+    CHECK("still more to draw", more == 1);
+
+    /* Now the content changes, including on a row already drawn. */
+    hype_vt_screen_write(s, (const uint8_t *)"\r\nsecond line here\r\n", 20);
+    for (unsigned i = 0; i < 15u; i++) {
+        hype_vt_screen_write(s, (const uint8_t *)"more\r\n", 6);
+    }
+
+    /*
+     * Run to CONVERGENCE, not just to the end of one sweep. The guarantee a bounded
+     * renderer can offer is that no update is lost, not that every update lands within
+     * the current sweep: a row the sweep has already passed is picked up on the next
+     * one. That is exactly the "late, never stale" property, and the BSP renders
+     * continuously so convergence is what it actually does.
+     */
+    for (passes = 0; passes < 200u; passes++) {
+        unsigned drawn = hype_vt_render_cached_bounded(s, &con, 0, ca, 2u, &more);
+        if (drawn == 0u && more == 0) break;
+    }
+
+    /* The same final screen rendered in one go must match exactly -- no cell may
+     * be left holding what it had before the change. */
+    (void)hype_vt_render_cached(s, &cref, 0, ca_ref);
+    CHECK_HEX("no cell left stale after a mid-sweep change", 0,
+              memcmp(fb_ref, fb, (size_t)W * H * sizeof(unsigned int)));
+
+    free(fb); free(fb_ref); free(s); free(ca); free(ca_ref);
+}
+
+/* max_rows == 0 must behave exactly as the unbounded entry point. */
+static void test_zero_budget_is_unbounded(void) {
+    unsigned W = 80 * 8, H = 25 * 8;
+    unsigned int *fb = calloc((size_t)W * H, sizeof(unsigned int));
+    hype_gop_console_t con;
+    hype_vt_screen_t *s = malloc(sizeof(*s));
+    hype_vt_render_cache_t *ca = calloc(1, sizeof(*ca));
+    int more = 1;
+
+    hype_gop_console_init(&con, fb, W, H, W, 0xAAAAAAu, 0x000000u);
+    hype_vt_screen_init(s, 80, 25);
+    hype_vt_screen_write(s, (const uint8_t *)"x", 1);
+
+    (void)hype_vt_render_cached_bounded(s, &con, 0, ca, 0u, &more);
+    CHECK("zero budget completes in one pass", more == 0);
+    CHECK("and leaves nothing to resume", ca->resume_row == 0u);
+
+    free(fb); free(s); free(ca);
+}
+
+/* Invalidation must restart at the top: resuming mid-screen after a view switch
+ * would leave the rows above holding the PREVIOUS view's cells. */
+static void test_invalidate_restarts_from_the_top(void) {
+    unsigned W = 80 * 8, H = 25 * 8;
+    unsigned int *fb = calloc((size_t)W * H, sizeof(unsigned int));
+    hype_gop_console_t con;
+    hype_vt_screen_t *s = malloc(sizeof(*s));
+    hype_vt_render_cache_t *ca = calloc(1, sizeof(*ca));
+    int more = 1;
+
+    hype_gop_console_init(&con, fb, W, H, W, 0xAAAAAAu, 0x000000u);
+    hype_vt_screen_init(s, 80, 25);
+    hype_vt_screen_write(s, (const uint8_t *)"a\r\nb\r\nc\r\nd\r\ne", 13);
+
+    (void)hype_vt_render_cached_bounded(s, &con, 0, ca, 2u, &more);
+    CHECK("mid-screen after a partial pass", ca->resume_row != 0u);
+    hype_vt_render_cache_invalidate(ca);
+    (void)hype_vt_render_cached_bounded(s, &con, 0, ca, 2u, &more);
+    CHECK("invalidate forced a restart, so it is only 2 rows in", ca->resume_row == 2u);
+
+    free(fb); free(s); free(ca);
+}
+
 int main(void) {
+    test_bounded_render_completes_over_several_passes();
+    test_partial_sweep_does_not_lose_a_later_update();
+    test_zero_budget_is_unbounded();
+    test_invalidate_restarts_from_the_top();
     /* --- colour resolution --- */
     unsigned int fg, bg;
     hype_vt_render_colors(HYPE_VT_DEFAULT_ATTR, &fg, &bg);
