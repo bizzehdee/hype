@@ -1186,6 +1186,20 @@ static unsigned long long g_ahci_reg_hist[HYPE_FW_MAX_VMS][HYPE_AHCI_HIST_DWORDS
  * the handful of writes a port bring-up takes, and a bound that hides the answer is worse than
  * none -- so PxCI going to zero (ordinary completion) is excluded rather than counted. */
 static unsigned int g_ahci_wr_logged[HYPE_FW_MAX_VMS];
+/*
+ * #364: one COMPLETE issue -> completion -> timeout -> stop cycle.
+ *
+ * The write trace proved the port really does start (PxCMD reached 0x0300c011: ST, FRE, FR and
+ * CR all set) and then gets stopped and started again -- the standard driver response to a
+ * command that never completes acceptably. It also showed PxIE = 0 across every write and GHC
+ * with IE clear, so the driver is POLLING, not waiting for an interrupt.
+ *
+ * So the open question is no longer "does the port start" but "what does hype present on
+ * completion that a polling ATAPI driver rejects". That needs the state at each command issue and
+ * at each ST transition, which the 48-write budget ended long before reaching.
+ */
+static unsigned int g_ahci_cyc_logged[HYPE_FW_MAX_VMS];
+static uint32_t g_ahci_prev_st[HYPE_FW_MAX_VMS];
 static unsigned long long g_ahci_reg_other[HYPE_FW_MAX_VMS];
 
 /* #363: host keyboard -> focused-guest routing state. A file-global because the BSP now owns
@@ -11973,13 +11987,38 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                            &g_fw_1_dma_map, insn) == 0) {
                         {
                             unsigned vidx2 = (unsigned)(vm - g_vms);
-                            if (vidx2 < HYPE_FW_MAX_VMS && g_ahci_wr_logged[vidx2] < 48u) {
+                            if (vidx2 < HYPE_FW_MAX_VMS) {
                                 uint64_t woff = ahci_npf.guest_phys_addr - ahci_abar;
+                                /* A command issue (PxCI write) or a start/stop transition, with
+                                 * the completion state the driver will poll. Separate budget from
+                                 * the write trace above, which is bounded for a different reason. */
+                                {
+                                    uint32_t st_now = g_fw_1_ahci.p_cmd & 1u;
+                                    int issue = (ahci_npf.is_write && woff == 0x138u);
+                                    int transition = (st_now != g_ahci_prev_st[vidx2]);
+                                    g_ahci_prev_st[vidx2] = st_now;
+                                    if ((issue || transition) && g_ahci_cyc_logged[vidx2] < 64u) {
+                                        g_ahci_cyc_logged[vidx2]++;
+                                        hype_debug_print(
+                                            "fw-1 AHCICYC vm%u #%u %s: PxCMD=0x%08x PxCI=0x%08x "
+                                            "PxIS=0x%08x PxIE=0x%08x PxTFD=0x%08x PxSERR=0x%08x "
+                                            "GHC=0x%08x cmds=%u [#364]\n",
+                                            vidx2, g_ahci_cyc_logged[vidx2],
+                                            issue ? "ISSUE" : (st_now ? "START" : "STOP"),
+                                            (unsigned)g_fw_1_ahci.p_cmd, (unsigned)g_fw_1_ahci.p_ci,
+                                            (unsigned)g_fw_1_ahci.p_is, (unsigned)g_fw_1_ahci.p_ie,
+                                            (unsigned)g_fw_1_ahci.p_tfd,
+                                            (unsigned)g_fw_1_ahci.p_serr,
+                                            (unsigned)g_fw_1_ahci.ghc,
+                                            (unsigned)g_fw_1_atapi.command_count);
+                                    }
+                                }
                                 /* is_write comes from the fault itself (SVM EXITINFO1 / VMX exit
                                  * qualification bit 1), so this is the hardware's own answer
                                  * rather than my inference from which bits changed. PxCI is
                                  * excluded: a driver writes it per command and would flood. */
-                                if (ahci_npf.is_write && woff != 0x138u) {
+                                if (ahci_npf.is_write && woff != 0x138u &&
+                                    g_ahci_wr_logged[vidx2] < 48u) {
                                     g_ahci_wr_logged[vidx2]++;
                                     hype_debug_print(
                                         "fw-1 AHCIWR vm%u #%u: +0x%02x | PxCMD 0x%08x->0x%08x "
