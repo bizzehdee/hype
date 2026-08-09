@@ -1182,6 +1182,10 @@ static unsigned long long g_ahci_cmd_tsc, g_ahci_cmd_calls;
  * neither means anything.
  */
 static unsigned long long g_ahci_reg_hist[HYPE_FW_MAX_VMS][HYPE_AHCI_HIST_DWORDS];
+/* #364: bounded so a driver that writes PxCI every command cannot flood the log. 48 is well past
+ * the handful of writes a port bring-up takes, and a bound that hides the answer is worse than
+ * none -- so PxCI going to zero (ordinary completion) is excluded rather than counted. */
+static unsigned int g_ahci_wr_logged[HYPE_FW_MAX_VMS];
 static unsigned long long g_ahci_reg_other[HYPE_FW_MAX_VMS];
 
 /* #363: host keyboard -> focused-guest routing state. A file-global because the BSP now owns
@@ -11944,8 +11948,49 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             }
                         }
                     }
+                    /*
+                     * #364: what the guest actually WRITES, not just which offsets it touches.
+                     *
+                     * The read histogram says vm0 reads PxCMD 12078 times and never appears to
+                     * write it: PxCMD reads back 0x03000000, and since the write handler replaces
+                     * the whole register and only ORs CR/FR in, those static ATAPI/DLAE bits
+                     * surviving imply no write ever landed. That is an inference from bits that
+                     * did NOT change, which is exactly the kind of reasoning that has been wrong
+                     * repeatedly on this ticket.
+                     *
+                     * A guest AHCI driver that has taken the port must write PxCLB/PxFB, set FRE,
+                     * then set ST. If FreeBSD's ahci(4) never does, no CD device appears, root
+                     * cannot be mounted, and the kernel drops to the mountroot prompt -- which is
+                     * the emergency console actually observed.
+                     *
+                     * Decoding the instruction here is not possible (insn is raw guest bytes and
+                     * the decode lives inside the handler), so snapshot the registers around the
+                     * call and report what CHANGED. A change is a write, and it carries the value.
+                     */
+                    uint32_t pre_cmd = g_fw_1_ahci.p_cmd, pre_ghc = g_fw_1_ahci.ghc;
+                    uint32_t pre_ie = g_fw_1_ahci.p_ie;
                     if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
                                                            &g_fw_1_dma_map, insn) == 0) {
+                        {
+                            unsigned vidx2 = (unsigned)(vm - g_vms);
+                            if (vidx2 < HYPE_FW_MAX_VMS && g_ahci_wr_logged[vidx2] < 48u) {
+                                uint64_t woff = ahci_npf.guest_phys_addr - ahci_abar;
+                                /* is_write comes from the fault itself (SVM EXITINFO1 / VMX exit
+                                 * qualification bit 1), so this is the hardware's own answer
+                                 * rather than my inference from which bits changed. PxCI is
+                                 * excluded: a driver writes it per command and would flood. */
+                                if (ahci_npf.is_write && woff != 0x138u) {
+                                    g_ahci_wr_logged[vidx2]++;
+                                    hype_debug_print(
+                                        "fw-1 AHCIWR vm%u #%u: +0x%02x | PxCMD 0x%08x->0x%08x "
+                                        "GHC 0x%08x->0x%08x PxIE 0x%08x->0x%08x [#364]\n",
+                                        vidx2, g_ahci_wr_logged[vidx2], (unsigned)woff,
+                                        (unsigned)pre_cmd, (unsigned)g_fw_1_ahci.p_cmd,
+                                        (unsigned)pre_ghc, (unsigned)g_fw_1_ahci.ghc,
+                                        (unsigned)pre_ie, (unsigned)g_fw_1_ahci.p_ie);
+                                }
+                            }
+                        }
                         ex_ahci_npf++; /* exit-histogram sub-bucket */
                         /* M4-6 real-AMD DIAG (compact, screen-only-friendly):
                          * report CD progress at milestones instead of tracing
