@@ -7319,6 +7319,9 @@ static void fw_1_host_input_poll(void) {
  *
  * Writes black and then invalidates the render caches, so the band repaints on this same pass.
  */
+static unsigned long long g_fbprobe_entries, g_fbprobe_ran, g_fbprobe_skip_null,
+    g_fbprobe_skip_rate;
+
 static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     static uint64_t last_probe_tsc = 0;
     static int reported_static = 0;
@@ -7330,16 +7333,35 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     static uint64_t last_smi = 0;
     static int smi_readable = -1; /* -1 = not yet decided */
     uint64_t now = hype_rdtsc();
-    uint64_t t0, t1, t2, t3, ns, ns_ram, smi_now = 0;
-    unsigned int i;
+    uint64_t t0, t1, t2, t3, t4, t5, ns, ns_ram, ns_scat, smi_now = 0;
+    unsigned int i, r, scatter_runs, scatter_dwords;
+    /* 64 dwords = 256 bytes: the order of a few changed character cells, which is what the
+     * per-band path actually pushes. */
+    enum { SCATTER_RUN = 64u };
 
-    if (fb == 0 || ram == 0 || tsc_hz == 0) return;
+    /*
+     * Last run this probe printed 4 samples and then stopped, while the log ran on for another
+     * 30 seconds with the BSP still reporting phase=1 (render). Nothing recorded WHY -- the same
+     * defect that had me close #362 on a counter that could not observe the failure it was
+     * supposed to detect. Count every entry and every early return, so a probe that goes quiet
+     * says so instead of being mistaken for a probe that found nothing.
+     */
+    g_fbprobe_entries++;
+    if (fb == 0 || ram == 0 || tsc_hz == 0) {
+        g_fbprobe_skip_null++;
+        return;
+    }
     /* Never write past the end of the framebuffer. */
     if ((uint64_t)g_gop_console.stride * (uint64_t)g_gop_console.height < (uint64_t)PROBE_DWORDS) {
         return;
     }
-    if (last_probe_tsc != 0 && now - last_probe_tsc < tsc_hz * 5u) return;
+    if (g_gop_console.stride < (unsigned int)SCATTER_RUN || g_gop_console.height == 0u) return;
+    if (last_probe_tsc != 0 && now - last_probe_tsc < tsc_hz * 5u) {
+        g_fbprobe_skip_rate++;
+        return;
+    }
     last_probe_tsc = now;
+    g_fbprobe_ran++;
 
     /*
      * MSR_SMI_COUNT (0x34) is Intel-only and reading it elsewhere is a #GP -- which after
@@ -7386,10 +7408,35 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) ram[i] = 0u;
     t3 = hype_rdtsc();
 
+    /*
+     * The same byte count again, but written the way hype_gop_flush ACTUALLY writes it: a narrow
+     * horizontal run per row, then a jump of one stride to the next row.
+     *
+     * This is the hypothesis under test. Write-combining only pays off when stores fill a WC
+     * buffer contiguously; a 256-byte run followed by a jump leaves buffers part-full and forces
+     * a partial flush, and each of those is its own small PCIe transaction. The contiguous loop
+     * above measures the memory, not the access pattern, which is why it reports 4279 MB/s at the
+     * same moment the real blit reports 20 MB/s -- 210x apart, same memory, same instant.
+     *
+     * If this loop collapses while the contiguous one stays fast, the cost is the pattern and the
+     * fix is in the blit, not in any page attribute. Note the irony if so: #351 narrowed the copy
+     * to move fewer bytes, and narrowing is exactly what breaks write-combining.
+     */
+    scatter_runs = (unsigned int)PROBE_DWORDS / SCATTER_RUN;
+    if (scatter_runs > g_gop_console.height) scatter_runs = g_gop_console.height;
+    scatter_dwords = scatter_runs * SCATTER_RUN;
+    t4 = hype_rdtsc();
+    for (r = 0; r < scatter_runs; r++) {
+        unsigned int base = r * g_gop_console.stride;
+        for (i = 0; i < SCATTER_RUN; i++) fb[base + i] = 0u;
+    }
+    t5 = hype_rdtsc();
+
     /* ns for the whole 256 KB, computed before dividing so a fast probe does not floor to 0.
      * Reported per 1000 dwords for the same reason: 62us/65536 floored to "0 ns/dword". */
     ns = ((t1 - t0) * 1000000000ull) / tsc_hz;
     ns_ram = ((t3 - t2) * 1000000000ull) / tsc_hz;
+    ns_scat = ((t5 - t4) * 1000000000ull) / tsc_hz;
     hype_debug_print("fw-1 FBSPEED: fb %u KB in %lluus = %llu MB/s (%llu ns/1k dwords) | "
                       "ram same size in %lluus = %llu MB/s | smi=%llu (+%llu) [#368]\n",
                       (unsigned int)(PROBE_DWORDS * 4u / 1024u), (unsigned long long)(ns / 1000ull),
@@ -7398,6 +7445,12 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
                       (unsigned long long)(ns_ram / 1000ull),
                       (ns_ram == 0ull) ? 0ull : ((uint64_t)PROBE_DWORDS * 4ull * 1000ull) / ns_ram,
                       (unsigned long long)smi_now, (unsigned long long)(smi_now - last_smi));
+    hype_debug_print("fw-1 FBSCATTER: fb %u KB as %u runs of %u dwords (stride %u) in %lluus "
+                      "= %llu MB/s [#368]\n",
+                      scatter_dwords * 4u / 1024u, scatter_runs, (unsigned int)SCATTER_RUN,
+                      g_gop_console.stride, (unsigned long long)(ns_scat / 1000ull),
+                      (ns_scat == 0ull) ? 0ull
+                                        : ((uint64_t)scatter_dwords * 4ull * 1000ull) / ns_scat);
     last_smi = smi_now;
 
     {
@@ -17196,6 +17249,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     (bb * hz) / bt / 1000000ull,
                                     (bt * 1000000ull) / hz / bc);
                             }
+                            hype_debug_print("fw-1 FBPROBE: entries=%llu ran=%llu skip_null=%llu "
+                                             "skip_rate=%llu [#368]\n",
+                                             g_fbprobe_entries, g_fbprobe_ran, g_fbprobe_skip_null,
+                                             g_fbprobe_skip_rate);
                         }
                         hype_debug_print("fw-1 KBDIRQ: isr_entries=%llu (+%llu since last) eois=%llu "
                                          "last_apic=%u | polled=%llu chords=%llu | "
