@@ -49,4 +49,15 @@ void hype_blk_usb_xfer_stats(unsigned long long *tsc, unsigned long long *calls,
                              unsigned long long *chunks, unsigned long long *sectors,
                              unsigned long long *max_tsc);
 
+/*
+ * #363: tell blk_usb which core is the BSP, so its USB waits can be BOUNDED while guest media
+ * reads stay blocking. A blocked BSP costs the operator the dashboard, the keyboard and the log
+ * all at once; a skipped log flush or HID poll costs almost nothing.
+ */
+void hype_blk_usb_set_bsp_apic(unsigned int apic_id);
+
+/* How many times the BSP gave up waiting. Non-zero means a guest core held the controller longer
+ * than the budget -- the condition that used to hang the console silently. */
+unsigned long long hype_blk_usb_bsp_lock_timeouts(void);
+
 #endif /* HYPE_CORE_BLK_USB_H */

@@ -53,6 +53,67 @@ static unsigned int usb_xfer_this_apic(void) {
     return (*(volatile uint32_t *)(uintptr_t)0xFEE00020u) >> 24;
 }
 
+/*
+ * #363: the BSP must never block here forever.
+ *
+ * The operator's console -- dashboard, keyboard, terminal switching -- and hype's own logging all
+ * run on the BSP, and all three stopped dead mid-run while the guests carried on. The BSP had
+ * completed one last log flush and then gone silent: it was queued behind this lock, held by a
+ * guest core that was no longer making progress.
+ *
+ * USBLOCK could not show this, and I closed #362 on the strength of it. Every counter below is
+ * updated AFTER the spin loop exits, so a core that never acquires the lock is invisible to them
+ * -- the statistics describe only the waiters that eventually succeeded. A permanent block is
+ * exactly the case the instrument cannot report.
+ *
+ * So: guest media reads still wait indefinitely, because returning short data to a guest is not an
+ * option. The BSP gets a bounded wait and fails instead. Everything the BSP does over USB is
+ * optional relative to correctness -- a skipped log flush costs a few seconds of log, a skipped
+ * HID poll costs 8 ms of key latency -- whereas a blocked BSP costs the operator the entire
+ * machine, which is what happened.
+ */
+static void usb_xfer_lock(void);
+
+#define USB_BSP_LOCK_BUDGET 20000000u
+
+static volatile unsigned int g_usb_bsp_apic = 0xFFFFFFFFu;
+static volatile unsigned long long g_usb_bsp_lock_timeouts;
+
+void hype_blk_usb_set_bsp_apic(unsigned int apic_id) { g_usb_bsp_apic = apic_id; }
+
+unsigned long long hype_blk_usb_bsp_lock_timeouts(void) { return g_usb_bsp_lock_timeouts; }
+
+static int usb_xfer_lock_bounded(void) {
+    unsigned int me = __atomic_fetch_add(&g_usb_ticket_next, 1u, __ATOMIC_ACQ_REL);
+    unsigned long long spins = 0;
+    unsigned int budget = USB_BSP_LOCK_BUDGET;
+    while (__atomic_load_n(&g_usb_ticket_owner, __ATOMIC_ACQUIRE) != me) {
+        if (budget-- == 0u) {
+            /*
+             * Give the ticket back by advancing the owner past it. Safe only because the holder
+             * is the one that advances it on release and we are the next in line -- any waiter
+             * behind us simply moves up. Without this the queue would be permanently gapped.
+             */
+            __atomic_fetch_add(&g_usb_ticket_owner, 1u, __ATOMIC_RELEASE);
+            g_usb_bsp_lock_timeouts++;
+            return -1;
+        }
+        __builtin_ia32_pause();
+        spins++;
+    }
+    __atomic_fetch_add(&g_usb_lock_acquires, 1ull, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_usb_lock_spins, spins, __ATOMIC_RELAXED);
+    return 0;
+}
+
+static int usb_xfer_lock_or_fail(void) {
+    if (usb_xfer_this_apic() == g_usb_bsp_apic) {
+        return usb_xfer_lock_bounded();
+    }
+    usb_xfer_lock();
+    return 0;
+}
+
 static void usb_xfer_lock(void) {
     unsigned int me = __atomic_fetch_add(&g_usb_ticket_next, 1u, __ATOMIC_ACQ_REL);
     unsigned long long spins = 0;
@@ -121,7 +182,7 @@ static int usb_read(void *hw, uint64_t lba, uint32_t count, void *buf) {
     uint8_t *p = (uint8_t *)buf;
     uint32_t done = 0;
     unsigned long long t0;
-    usb_xfer_lock();
+    if (usb_xfer_lock_or_fail() != 0) return -1;
     t0 = usb_rdtsc(); /* after the lock, so contention is not counted as device time */
     while (done < count) {
         uint32_t n = (count - done > USB_MAX_SECTORS) ? USB_MAX_SECTORS : (count - done);

@@ -14567,6 +14567,9 @@ static uint32_t usb_log_exec_apic_id(void) {
 static void usb_log_latch_bsp_core(void) {
     g_usb_log_bsp_apic_id = usb_log_exec_apic_id();
     g_usb_log_bsp_apic_id_valid = 1;
+    /* #363: and tell blk_usb, so the BSP's USB waits are bounded and a stuck guest core cannot
+     * take the console down with it. */
+    hype_blk_usb_set_bsp_apic(g_usb_log_bsp_apic_id);
 }
 
 /* 1 when this core owns USB I/O. Pre-MP (marker not yet latched) only the BSP
@@ -16863,10 +16866,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         kbd_last = now_k;
                         hype_host_kbd_isr_stats(&e, &eo, &ap);
                         hype_debug_print("fw-1 KBDIRQ: isr_entries=%llu (+%llu since last) eois=%llu "
-                                         "last_apic=%u | polled=%llu chords=%llu [#363]\n",
+                                         "last_apic=%u | polled=%llu chords=%llu | "
+                                         "bsp_usb_timeouts=%llu [#363]\n",
                                          e, e - kbd_prev_entries, eo, ap,
                                          (unsigned long long)g_hostkbd_scancodes,
-                                         (unsigned long long)g_hostkbd_chords);
+                                         (unsigned long long)g_hostkbd_chords,
+                                         hype_blk_usb_bsp_lock_timeouts());
                         kbd_prev_entries = e;
                     }
                 }
