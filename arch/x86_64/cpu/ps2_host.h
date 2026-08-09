@@ -109,4 +109,13 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode);
  */
 void hype_host_kbd_inject_scancode(uint8_t scancode);
 
+/*
+ * #363: host keyboard ISR liveness. `entries` advancing proves the interrupt is still being
+ * serviced; `last_apic` says by which core. Read this from a core that is NOT running a guest --
+ * a counter printed from a wedged context reads as absence of the event, which has misled this
+ * project three times.
+ */
+void hype_host_kbd_isr_stats(unsigned long long *entries, unsigned long long *eois,
+                             unsigned int *last_apic);
+
 #endif /* HYPE_ARCH_PS2_HOST_H */

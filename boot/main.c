@@ -16789,6 +16789,36 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              */
             fw_1_render_console();
             fw_1_host_input_poll(); /* #363: keyboard + terminal switching, off the guest core */
+            {
+                /*
+                 * #363: report keyboard-interrupt liveness FROM THE BSP, on its own cadence.
+                 *
+                 * Deliberately not in the guest's periodic dump. Three separate diagnostics today
+                 * were emitted from a context that stops when a guest wedges -- RENDERHIST, the
+                 * rate-limited ATA-IRQ-UNDELIVERED line, and MMIOCOST -- and each read as "the
+                 * event stopped happening" when it had only stopped being PRINTED. The whole point
+                 * of this counter is to observe a wedge, so it must be emitted by a core that
+                 * survives one.
+                 */
+                static uint64_t kbd_last = 0;
+                static unsigned long long kbd_prev_entries = 0;
+                uint64_t hz = g_vms[0].host_tsc_hz;
+                if (hz != 0) {
+                    uint64_t now_k = hype_rdtsc();
+                    if (kbd_last == 0 || now_k - kbd_last >= 5ull * hz) {
+                        unsigned long long e = 0, eo = 0;
+                        unsigned int ap = 0;
+                        kbd_last = now_k;
+                        hype_host_kbd_isr_stats(&e, &eo, &ap);
+                        hype_debug_print("fw-1 KBDIRQ: isr_entries=%llu (+%llu since last) eois=%llu "
+                                         "last_apic=%u | polled=%llu chords=%llu [#363]\n",
+                                         e, e - kbd_prev_entries, eo, ap,
+                                         (unsigned long long)g_hostkbd_scancodes,
+                                         (unsigned long long)g_hostkbd_chords);
+                        kbd_prev_entries = e;
+                    }
+                }
+            }
             if (g_vms[0].host_tsc_hz != 0) {
                 uint64_t now_d = hype_rdtsc();
                 uint64_t iv = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_vms[0].host_tsc_hz;
