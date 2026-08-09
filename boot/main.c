@@ -17354,7 +17354,31 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     (bb * hz) / bt / 1000000ull,
                                     (bt * 1000000ull) / hz / bc);
                             }
-                            hype_debug_print("fw-1 FBPROBE: entries=%llu ran=%llu skip_null=%llu "
+                            {
+                            /*
+                             * #365: the ISO read-ahead cache has counters and has never once been
+                             * logged, so its effectiveness has never been measured -- only assumed.
+                             * With 98% of guest reads sequential (seq=6885 contig of 6977) a
+                             * 32-block read-ahead should turn most of them into hits needing no USB
+                             * transfer at all. Instead there are 2.3 USB calls per ATAPI read, which
+                             * is the opposite. Either the cache is not retaining, or it is being
+                             * invalidated, and a hit/miss ratio says which in one run.
+                             */
+                            unsigned vi;
+                            for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+                                uint64_t hits = 0, misses = 0;
+                                if (!g_vms[vi].iso_stream_ready) continue;
+                                hype_iso_stream_cache_stats(&g_vms[vi].iso_stream, &hits, &misses);
+                                hype_debug_print("fw-1 ISOCACHE vm%u: hits=%llu misses=%llu "
+                                                 "hit_pct=%llu [#365]\n",
+                                                 vi, (unsigned long long)hits,
+                                                 (unsigned long long)misses,
+                                                 (hits + misses == 0ull)
+                                                     ? 0ull
+                                                     : (hits * 100ull) / (hits + misses));
+                            }
+                        }
+                        hype_debug_print("fw-1 FBPROBE: entries=%llu ran=%llu skip_null=%llu "
                                              "skip_rate=%llu [#368]\n",
                                              g_fbprobe_entries, g_fbprobe_ran, g_fbprobe_skip_null,
                                              g_fbprobe_skip_rate);
