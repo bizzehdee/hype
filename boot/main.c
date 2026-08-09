@@ -13412,7 +13412,23 @@ static void media_select_ahci(void) {
  */
 static const hype_blk_backend_t *g_media_usb_be;
 
+/*
+ * #365: who is actually reading the USB device?
+ *
+ * The stick moved 55.6 MB of READS (usb_write does not touch these counters) to deliver 12.9 MB
+ * to the guests, across 18379 read calls -- while the two ISO streams missed only 850 times
+ * between them. So roughly 17500 reads come from somewhere else entirely, and the ISO read-ahead
+ * I just spent a build tuning was never the dominant consumer.
+ *
+ * The candidates are FAT metadata for the log writes (an append re-reads FAT and directory
+ * sectors), and the writable file-backed guest disk. Tagging the callbacks says which, instead of
+ * me tuning another layer on a guess -- which is exactly what the last build was.
+ */
+static unsigned long long g_usbrd_media, g_usbrd_fatvol, g_usbrd_media_sec, g_usbrd_fatvol_sec;
+
 static int media_usb_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    g_usbrd_media++;
+    g_usbrd_media_sec += count;
     (void)ctx;
     if (g_media_usb_be == 0) {
         return -1;
@@ -13624,6 +13640,8 @@ static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *s
  * sector 0 == the volume's own boot sector. Offset every read by the partition's
  * first LBA so the same device backs both this and the disk-absolute hostdisk_read(). */
 static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    g_usbrd_fatvol++;
+    g_usbrd_fatvol_sec += count;
     (void)ctx;
     if (!media_present() || scan_budget_expired()) {
         return -1;
@@ -17417,6 +17435,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              "(intercepted, no host cache flush) [#368]\n",
                                              wb, (unsigned long long)wbrip);
                         }
+                        hype_debug_print("fw-1 USBRD: media=%llu calls/%llu sec | "
+                                         "fatvol=%llu calls/%llu sec [#365]\n",
+                                         g_usbrd_media, g_usbrd_media_sec, g_usbrd_fatvol,
+                                         g_usbrd_fatvol_sec);
                         hype_debug_print("fw-1 FBPROBE: entries=%llu ran=%llu skip_null=%llu "
                                              "skip_rate=%llu [#368]\n",
                                              g_fbprobe_entries, g_fbprobe_ran, g_fbprobe_skip_null,
