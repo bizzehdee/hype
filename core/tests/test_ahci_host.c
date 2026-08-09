@@ -263,7 +263,57 @@ static void test_atapi_lba_conversion_refuses_misalignment(void) {
 }
 
 
+/*
+ * #369: the PHY-settle stop/continue rule.
+ *
+ * The bug this encodes: an empty port and a port whose disk is still negotiating were treated
+ * identically, so a controller with five empty sockets paid five full 2,000,000-spin budgets and
+ * stalled ~60 s before any guest started. The rule has to shorten the empty case WITHOUT
+ * shortening the case the wait exists for.
+ */
+static void test_settle_stops_when_all_ports_established(void) {
+    CHECK_HEX("nothing pending -> stop immediately", 0,
+              hype_ahci_host_settle_continue(0u, 0u, 0u));
+    CHECK_HEX("nothing pending -> stop even at spin 0 with a device present", 0,
+              hype_ahci_host_settle_continue(0u, 0u, 5u));
+}
+
+static void test_settle_waits_for_a_negotiating_port(void) {
+    /* The real-hardware cold-boot case: DET==1, disk present, link not up yet. It must keep the
+     * FULL ceiling -- shortening this is how the AMD laptop's SATA SSD goes missing on some
+     * boots, which is the flake the wait was added for. */
+    CHECK_HEX("negotiating -> keep waiting at spin 0", 1,
+              hype_ahci_host_settle_continue(1u, 1u, 0u));
+    CHECK_HEX("negotiating -> keep waiting past the empty budget", 1,
+              hype_ahci_host_settle_continue(1u, 1u, HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS));
+    CHECK_HEX("negotiating -> keep waiting far past the empty budget", 1,
+              hype_ahci_host_settle_continue(6u, 1u, HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS * 10u));
+}
+
+static void test_settle_gives_up_on_ports_with_nothing_on_them(void) {
+    /* Five empty sockets beside one established disk -- the QEMU ich9-ahci shape that cost 60 s. */
+    CHECK_HEX("empty ports still get a real wait", 1,
+              hype_ahci_host_settle_continue(5u, 0u, 0u));
+    CHECK_HEX("empty ports still waiting just under the budget", 1,
+              hype_ahci_host_settle_continue(5u, 0u, HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS - 1u));
+    CHECK_HEX("empty ports give up at the budget", 0,
+              hype_ahci_host_settle_continue(5u, 0u, HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS));
+    CHECK_HEX("empty ports stay given up past the budget", 0,
+              hype_ahci_host_settle_continue(5u, 0u, HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS + 1u));
+}
+
+static void test_settle_one_negotiating_port_holds_the_whole_controller(void) {
+    /* A mixed controller must be governed by the port that CAN still come up, not by the majority
+     * that cannot -- otherwise a single slow disk beside empty sockets is written off early. */
+    CHECK_HEX("one negotiating among many empty -> keep waiting", 1,
+              hype_ahci_host_settle_continue(6u, 1u, HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS * 4u));
+}
+
 int main(void) {
+    test_settle_stops_when_all_ports_established();
+    test_settle_waits_for_a_negotiating_port();
+    test_settle_gives_up_on_ports_with_nothing_on_them();
+    test_settle_one_negotiating_port_holds_the_whole_controller();
     test_cmd_header_roundtrip();
     test_cmd_header_write_flag();
     test_read_dma_ext_roundtrip();

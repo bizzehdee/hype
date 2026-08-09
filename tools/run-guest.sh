@@ -142,9 +142,19 @@ SFDISK
 boot_once() {
     cp -f "$OVMF_VARS" "$OUT.vars.fd"   # fresh, so a previous run's BootOrder cannot decide
     rm -f "$LOG"
+    # SMP and EXTRA_QEMU_ARGS are overridable so one harness can also build host topologies hype
+    # must cope with but this machine does not have natively. #360's bug -- APs started by
+    # hardcoded APIC ID 1 and 2 -- only shows on a host whose APIC IDs are NOT densely packed
+    # from zero, which is every Intel hybrid part and no AMD one. QEMU can synthesize that:
+    #   SMP='1,sockets=2,cores=4,threads=1,maxcpus=8' \
+    #   EXTRA_QEMU_ARGS='-device host-x86_64-cpu,apic-id=1,socket-id=0,core-id=1,thread-id=0
+    #                    -device host-x86_64-cpu,apic-id=5,socket-id=1,core-id=1,thread-id=0' \
+    #   tools/run-guest.sh ...
+    # gives APIC IDs 0, 1, 5 -- a host where ID 2 does not answer, reproducing the Intel failure
+    # on an AMD box. Word-split deliberately, so EXTRA_QEMU_ARGS carries several arguments.
     qemu-system-x86_64 \
       -machine q35 -m 8192 -nodefaults \
-      -accel kvm -cpu host -smp 4 \
+      -accel kvm -cpu host -smp "${SMP:-4}" ${EXTRA_QEMU_ARGS:-} \
       -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
       -drive if=pflash,format=raw,file="$OUT.vars.fd" \
       -drive format=raw,file="$ESP" \

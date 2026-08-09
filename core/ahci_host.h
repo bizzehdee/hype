@@ -137,6 +137,40 @@ int hype_ahci_host_find_sata_port_from(uint64_t abar_phys, unsigned int start_po
 int hype_ahci_host_port_matches(uint64_t abar_phys, unsigned int port);
 
 /*
+ * #369: how long to keep waiting for a port whose PxSSTS.DET says nothing is there.
+ *
+ * The PHY-settle wait exists for a disk that is present but has not finished negotiating at cold
+ * boot (the AMD laptop's SATA SSD, found only on some boots). AHCI 1.3.1 PxSSTS.DET separates that
+ * state (1 = device present, no communication) from a genuinely empty port (0 = nothing detected,
+ * PHY offline) -- and the wait used to treat them identically, so every empty port burned the
+ * whole budget. A 6-port controller with one disk paid five full budgets and stalled ~60 s before
+ * any guest started.
+ *
+ * This is the shorter budget for the "nothing is negotiating" case: still a real wait, so a port
+ * that reports 0 for a moment before its PHY announces itself is not written off, but small enough
+ * that an empty backplane costs milliseconds instead of seconds. A port that reads DET 1 or 2 gets
+ * the full ceiling, unchanged.
+ */
+#define HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS 20000u
+
+/*
+ * #369: the PHY-settle stop/continue decision, as pure logic so it is testable without an HBA.
+ *
+ * Called once per settle iteration for a WHOLE controller, with a census of its implemented ports:
+ *   `pending`     -- ports not yet reporting DET==3 (established).
+ *   `negotiating` -- the subset of those reporting DET==1 or 2, i.e. something is actually there
+ *                    and still coming up. DET==0 (nothing) and DET==4 (PHY disabled) are excluded:
+ *                    neither can progress to 3 on its own.
+ *   `elapsed`     -- iterations already spent on this controller.
+ *
+ * Returns 1 to keep waiting, 0 to stop. Stops immediately when nothing is pending, waits without
+ * limit (up to the caller's own ceiling) while anything is negotiating, and otherwise gives up
+ * after HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS.
+ */
+int hype_ahci_host_settle_continue(unsigned int pending, unsigned int negotiating,
+                                   unsigned int elapsed);
+
+/*
  * Diagnostic: log CAP + PI and, for each implemented port, PxSSTS (DET/SPD/IPM),
  * PxSIG, PxCMD, PxTFD. Read-only. Called when find_sata_port finds nothing so a
  * real-HW log shows WHY (e.g. DET != 3 -> no PHY / disk asleep, or a signature

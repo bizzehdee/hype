@@ -120,29 +120,76 @@ static uint32_t g_scan_sig = HYPE_AHCI_HOST_SIG_ATA;
  * Returns 1 if `port` is implemented, its PHY is up, and its signature matches the current scan
  * target; 0 otherwise.
  */
+/*
+ * #369: the PHY-settle wait, paid ONCE per controller instead of once per port.
+ *
+ * Every PHY on an HBA negotiates in parallel, so waiting for them one at a time buys nothing and
+ * costs a full budget per port that never comes up. #258 made the inventory walk all 32 ports, and
+ * since the wait used to live inside the per-port check, a 6-port controller with a disk on port 0
+ * paid five whole SPIN_READY budgets -- 10,000,000 uncached MMIO reads, ~60 s under QEMU where each
+ * one is a VM exit -- before any guest started. Long enough that the 120 s regression run timed out
+ * and read as a hype hang.
+ *
+ * Settling here, across all implemented ports at once, means the wait is bounded by the slowest
+ * PHY rather than by the number of empty sockets. hype_ahci_host_settle_continue() decides when to
+ * stop; see its contract for how DET==0 (nothing there) is separated from DET==1/2 (coming up).
+ *
+ * Remembered for one controller, because every caller walks a single HBA's ports to completion
+ * before moving on. A different abar re-settles, which is slower than a larger cache would be but
+ * never wrong. hype does not hot-plug, so a settled controller stays settled.
+ */
+static uint64_t g_settled_abar;
+static int g_settled_valid;
+
+static void settle_controller(volatile uint8_t *abar, uint64_t abar_phys) {
+    uint32_t pi;
+    unsigned elapsed;
+
+    if (g_settled_valid && g_settled_abar == abar_phys) {
+        return;
+    }
+    pi = rd32(abar, HYPE_AHCI_REG_PI);
+    for (elapsed = 0u; elapsed < SPIN_READY; elapsed++) {
+        unsigned pending = 0u;
+        unsigned negotiating = 0u;
+        unsigned p;
+        for (p = 0u; p < 32u; p++) {
+            uint32_t det;
+            if ((pi & (1u << p)) == 0u) {
+                continue;
+            }
+            det = rd32(port_base(abar, p), HYPE_AHCI_PREG_SSTS) & 0xFu;
+            if (det == 3u) {
+                continue;
+            }
+            pending++;
+            if (det == 1u || det == 2u) {
+                negotiating++;
+            }
+        }
+        if (!hype_ahci_host_settle_continue(pending, negotiating, elapsed)) {
+            break;
+        }
+    }
+    g_settled_abar = abar_phys;
+    g_settled_valid = 1;
+}
+
 int hype_ahci_host_port_matches(uint64_t abar_phys, unsigned port) {
     volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
-    uint32_t pi = rd32(abar, HYPE_AHCI_REG_PI);
+    uint32_t pi;
     volatile uint8_t *pb;
-    uint32_t ssts;
-    unsigned spins = SPIN_READY;
 
-    if (port >= 32u || (pi & (1u << port)) == 0u) {
+    if (port >= 32u) {
+        return 0;
+    }
+    settle_controller(abar, abar_phys);
+    pi = rd32(abar, HYPE_AHCI_REG_PI);
+    if ((pi & (1u << port)) == 0u) {
         return 0;
     }
     pb = port_base(abar, port);
-    /* Wait for the SATA PHY to establish the link (DET (PxSSTS[3:0]) == 3).
-     * On a cold boot the link/disk isn't ready the instant we probe, so an
-     * immediate read intermittently sees the port as empty -- the real-HW
-     * "no active SATA disk port" flake seen on the AMD laptop (the SATA SSD
-     * is present but was found only on some boots). Poll up to the ceiling. */
-    do {
-        ssts = rd32(pb, HYPE_AHCI_PREG_SSTS);
-        if ((ssts & 0xFu) == 3u) {
-            break;
-        }
-    } while (spins-- != 0u);
-    if ((ssts & 0xFu) != 3u) {
+    if ((rd32(pb, HYPE_AHCI_PREG_SSTS) & 0xFu) != 3u) {
         return 0; /* PHY never came up -> genuinely no device on this port */
     }
     /* #325: was hardcoded to the non-ATAPI signature, which made a real optical drive invisible

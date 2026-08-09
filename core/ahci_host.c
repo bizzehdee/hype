@@ -8,6 +8,16 @@ static void put_le32(uint8_t *p, uint32_t v) {
     p[3] = (uint8_t)(v >> 24);
 }
 
+int hype_ahci_host_settle_continue(unsigned pending, unsigned negotiating, unsigned elapsed) {
+    if (pending == 0u) {
+        return 0; /* every implemented port is established -- nothing left to wait for */
+    }
+    if (negotiating != 0u) {
+        return 1; /* a real device is still coming up; it gets the caller's full ceiling */
+    }
+    return (elapsed < HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS) ? 1 : 0;
+}
+
 void hype_ahci_host_build_cmd_header(uint8_t slot[32], int is_write, uint16_t prdtl,
                                      uint64_t cmd_table_phys) {
     uint32_t opts;
