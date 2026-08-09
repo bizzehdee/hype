@@ -209,7 +209,15 @@ static int usb_write(void *hw, uint64_t lba, uint32_t count, const void *buf) {
     hype_blk_usb_t *u = (hype_blk_usb_t *)hw;
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t done = 0;
-    usb_xfer_lock();
+    /*
+     * #363: bounded for the BSP here TOO, and this is the path that mattered.
+     *
+     * The previous attempt bounded only usb_read(), which was the wrong half: guests READ their
+     * discs, while the BSP's dominant use of the controller is WRITING the log. So the BSP still
+     * blocked indefinitely, bsp_usb_timeouts stayed 0, and the console still died -- the fix
+     * measured as ineffective because it was applied to the path the BSP barely uses.
+     */
+    if (usb_xfer_lock_or_fail() != 0) return -1;
     while (done < count) {
         uint32_t n = (count - done > USB_MAX_SECTORS) ? USB_MAX_SECTORS : (count - done);
         if (hype_xhci_msc_write(u->ctrl, u->slot, &u->msc, (uint32_t)(lba + done), n,
