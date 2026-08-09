@@ -7113,6 +7113,10 @@ static void fw_1_dump_prev_diag(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
 /* PERF-2 (#234): the dashboard's diffing-render cache (file-scope so both the
  * view-switch invalidation and the render below reach it). */
 static hype_vt_render_cache_t g_dash_render_cache;
+/* #363: file-scope so a foreign framebuffer write can invalidate every view's cache, not just
+ * the one currently displayed -- a stale cache for a background view would show that view's old
+ * pixels mixed with boot output the moment it is switched to. */
+static hype_vt_render_cache_t g_view_render_cache[HYPE_FW_MAX_VMS];
 
 /* PERF-2 (#234) evidence: how much the diffing renderer actually saves. Before
  * it, every render redrew cols*rows cells and pushed the whole framebuffer;
@@ -7282,6 +7286,30 @@ static void fw_1_render_console(void) {
     }
     last_gop_flush_tsc = now_gf;
     view = g_term_view;
+
+    /*
+     * #363: if anything else painted the framebuffer since the last pass, every cache is stale.
+     *
+     * The renderer only repaints cells that differ from its cache, which is correct only while it
+     * is the sole writer. hype_debug_print's GOP tee and hype_fatal() both write directly, and
+     * those pixels sit in cells the cache believes are already correct -- so boot messages stayed
+     * drawn over the dashboard until unrelated cells happened to change, and bounded rendering
+     * made it worse by widening the window. Invalidate and repaint rather than leave the screen
+     * showing something no view actually contains.
+     */
+    {
+        static unsigned long long last_foreign = 0;
+        unsigned long long foreign = hype_debug_gop_write_count();
+        if (foreign != last_foreign) {
+            unsigned vi;
+            last_foreign = foreign;
+            hype_vt_render_cache_invalidate(&g_dash_render_cache);
+            for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+                hype_vt_render_cache_invalidate(&g_view_render_cache[vi]);
+            }
+            term_last_view = -2; /* force the clear-and-redraw path for whichever view is up */
+        }
+    }
     if (view >= 0) {
         /*
          * PERF-2 (#234) part 2: render only the cells that CHANGED. The old
@@ -7291,10 +7319,10 @@ static void fw_1_render_console(void) {
          * One cache PER VIEW: a shared cache would diff one VM's terminal
          * against another's leftovers and paint a mixture of the two.
          */
-        static hype_vt_render_cache_t term_cache[HYPE_FW_MAX_VMS];
+
         if (term_last_view != view) {
             hype_gop_console_clear(&g_gop_console);
-            hype_vt_render_cache_invalidate(&term_cache[view]);
+            hype_vt_render_cache_invalidate(&g_view_render_cache[view]);
             term_last_view = view;
         }
         {
@@ -7307,7 +7335,7 @@ static void fw_1_render_console(void) {
              */
             int more = 0;
             unsigned drawn = hype_vt_render_cached_bounded(&g_vms[view].term, &g_gop_console, 1,
-                                                           &term_cache[view], 8u, &more);
+                                                           &g_view_render_cache[view], 8u, &more);
             g_render_cells_drawn += drawn;
             g_render_calls++;
             if (drawn != 0u) {

@@ -155,6 +155,24 @@ static int g_gop_deferred = 0;
  * paints the GOP directly, so panics are never suppressed. */
 static int g_gop_enabled = 1;
 
+/*
+ * #363: how many times something OTHER than the terminal renderer has painted the GOP shadow.
+ *
+ * hype_vt_render_cached() is a DIFFING renderer: it repaints only cells that differ from its
+ * cache, which is correct exactly as long as nothing else writes to the framebuffer. The debug
+ * tee below does, and so does hype_fatal(). Those pixels land in cells the cache believes are
+ * already correct, so they stay on screen until that cell changes for an unrelated reason --
+ * which is the long-standing "boot messages drawn over the dashboard, clearing after a few
+ * refreshes" the operator has been reporting for the whole of this work, and the display
+ * corruption that appeared once bounded rendering widened the window.
+ *
+ * A counter rather than a flag: the renderer compares it against the value it last saw, so it
+ * cannot miss a write that happens while it is mid-sweep.
+ */
+static volatile unsigned long long g_gop_foreign_writes;
+
+unsigned long long hype_debug_gop_write_count(void) { return g_gop_foreign_writes; }
+
 void hype_debug_set_gop_deferred(int deferred) {
     g_gop_deferred = deferred;
 }
@@ -216,6 +234,7 @@ void hype_debug_print(const char *fmt, ...) {
 
     gop = hype_fatal_get_gop();
     if (g_gop_enabled && gop != 0) {
+        g_gop_foreign_writes++; /* #363: tell the diffing renderer its cache is stale */
         hype_gop_print(gop, "%s", msg);
         if (!g_gop_deferred) {
             hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());

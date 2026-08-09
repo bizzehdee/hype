@@ -20,4 +20,11 @@ __attribute__((noreturn)) void hype_halt_forever(void);
  * tick count) rather than never return at all. */
 void hype_wait_for_interrupt(void);
 
+/*
+ * #363: how many times the debug tee (or any non-renderer path) has painted the GOP shadow.
+ * A diffing renderer must invalidate its cache when this changes, or those pixels persist in
+ * cells it believes are already correct.
+ */
+unsigned long long hype_debug_gop_write_count(void);
+
 #endif /* HYPE_HALT_H */
