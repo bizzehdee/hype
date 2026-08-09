@@ -1173,8 +1173,15 @@ static unsigned long long g_ahci_cmd_tsc, g_ahci_cmd_calls;
  * is 0x100-0x17F, so 0x180 bytes covers everything hype models; indexed by dword.
  */
 #define HYPE_AHCI_HIST_DWORDS (0x180u / 4u)
-static unsigned long long g_ahci_reg_hist[HYPE_AHCI_HIST_DWORDS];
-static unsigned long long g_ahci_reg_other;
+/*
+ * PER VM. The first version made this a single global while the register VALUES printed beside it
+ * come from the printing VM's own model (g_fw_1_ahci is vm->...), so counts from one guest could be
+ * read against another guest's registers -- the mixed-population error that has already cost this
+ * investigation three wrong answers, in a new form. Counts and values must describe the same VM or
+ * neither means anything.
+ */
+static unsigned long long g_ahci_reg_hist[HYPE_FW_MAX_VMS][HYPE_AHCI_HIST_DWORDS];
+static unsigned long long g_ahci_reg_other[HYPE_FW_MAX_VMS];
 
 /* #363: host keyboard -> focused-guest routing state. A file-global because the BSP now owns
  * polling (fw_1_host_input_poll); it used to be a local in the guest dispatch loop, which is
@@ -9673,6 +9680,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          */
                         unsigned hi, top[4] = {0, 0, 0, 0};
                         unsigned n;
+                        unsigned vidx = (unsigned)(vm - g_vms);
+                        const unsigned long long *hist =
+                            g_ahci_reg_hist[(vidx < HYPE_FW_MAX_VMS) ? vidx : 0u];
                         for (n = 0; n < 4u; n++) {
                             unsigned long long best = 0;
                             unsigned besti = 0xFFFFu;
@@ -9681,21 +9691,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                 for (k = 0; k < n; k++) {
                                     if (top[k] == hi) already = 1;
                                 }
-                                if (!already && g_ahci_reg_hist[hi] > best) {
-                                    best = g_ahci_reg_hist[hi];
+                                if (!already && hist[hi] > best) {
+                                    best = hist[hi];
                                     besti = hi;
                                 }
                             }
                             top[n] = (besti == 0xFFFFu) ? 0u : besti;
                         }
                         hype_debug_print(
-                            "fw-1 AHCIREG: top +0x%02x=%llu +0x%02x=%llu +0x%02x=%llu "
+                            "fw-1 AHCIREG vm%u: top +0x%02x=%llu +0x%02x=%llu +0x%02x=%llu "
                             "+0x%02x=%llu other=%llu | GHC=0x%08x IS=0x%08x PxIS=0x%08x "
                             "PxIE=0x%08x PxCMD=0x%08x PxTFD=0x%08x PxCI=0x%08x PxSSTS=0x%08x "
                             "[#364]\n",
-                            top[0] * 4u, g_ahci_reg_hist[top[0]], top[1] * 4u,
-                            g_ahci_reg_hist[top[1]], top[2] * 4u, g_ahci_reg_hist[top[2]],
-                            top[3] * 4u, g_ahci_reg_hist[top[3]], g_ahci_reg_other,
+                            vidx, top[0] * 4u, hist[top[0]], top[1] * 4u, hist[top[1]],
+                            top[2] * 4u, hist[top[2]], top[3] * 4u, hist[top[3]],
+                            g_ahci_reg_other[(vidx < HYPE_FW_MAX_VMS) ? vidx : 0u],
                             (unsigned)g_fw_1_ahci.ghc, (unsigned)g_fw_1_ahci.is,
                             (unsigned)g_fw_1_ahci.p_is, (unsigned)g_fw_1_ahci.p_ie,
                             (unsigned)g_fw_1_ahci.p_cmd, (unsigned)g_fw_1_ahci.p_tfd,
@@ -11624,10 +11634,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          * histogram reflects what the guest asked for even if the handler
                          * declines it. */
                         uint64_t off = ahci_npf.guest_phys_addr - ahci_abar;
-                        if (off < 0x180u) {
-                            g_ahci_reg_hist[off / 4u]++;
-                        } else {
-                            g_ahci_reg_other++;
+                        unsigned vidx = (unsigned)(vm - g_vms);
+                        if (vidx < HYPE_FW_MAX_VMS) {
+                            if (off < 0x180u) {
+                                g_ahci_reg_hist[vidx][off / 4u]++;
+                            } else {
+                                g_ahci_reg_other[vidx]++;
+                            }
                         }
                     }
                     if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
