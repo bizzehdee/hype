@@ -7333,7 +7333,8 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     static uint64_t last_smi = 0;
     static int smi_readable = -1; /* -1 = not yet decided */
     uint64_t now = hype_rdtsc();
-    uint64_t t0, t1, t2, t3, t4, t5, ns, ns_ram, ns_scat, smi_now = 0;
+    uint64_t t0, t1, t2, t3, t4, t5, t6, t7, ns, ns_ram, ns_scat, ns_cli, smi_now = 0;
+    uint64_t rflags = 0, ticks_before = 0, ticks_after = 0;
     unsigned int i, r, scatter_runs, scatter_dwords;
     /* 64 dwords = 256 bytes: the order of a few changed character cells, which is what the
      * per-band path actually pushes. */
@@ -7390,9 +7391,11 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
                           (def & HYPE_MTRR_DEF_E) ? 1u : 0u);
     }
 
+    ticks_before = hype_timer_get_ticks();
     t0 = hype_rdtsc();
     for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) fb[i] = 0u;
     t1 = hype_rdtsc();
+    ticks_after = hype_timer_get_ticks();
 
     /*
      * The SAME loop over ordinary RAM. This is the discriminator the last run needed and did not
@@ -7437,6 +7440,32 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     ns = ((t1 - t0) * 1000000000ull) / tsc_hz;
     ns_ram = ((t3 - t2) * 1000000000ull) / tsc_hz;
     ns_scat = ((t5 - t4) * 1000000000ull) / tsc_hz;
+
+    /*
+     * The same framebuffer loop again, with interrupts masked.
+     *
+     * This is the experiment the data now demands. ORDINARY WB RAM measured 2 MB/s in the same
+     * sample as the framebuffer -- 109705us for 256 KB of cached stores, which no memory
+     * attribute, access pattern or PCIe path can explain, because WB stores land in cache. So
+     * the loop is not slow; the BSP is not running it. Something else is consuming the window.
+     *
+     * SMIs are already ruled out by the counter beside it (smi +0 across the slow sample), which
+     * leaves interrupt work on this core. Masking for the duration answers it directly: fast with
+     * interrupts off means the time is going to handlers, still slow means it is not this core's
+     * interrupts at all and the next suspect is contention from the APs.
+     *
+     * A ~100 ms masked window is safe here: a single USB transfer on this path already measured
+     * max=164704us, so the machine demonstrably tolerates longer. IF is saved and restored rather
+     * than assumed -- this runs from the BSP loop where interrupts are on, but assuming that and
+     * then unconditionally re-enabling would be a real bug the day it moves.
+     */
+    __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
+    __asm__ volatile("cli");
+    t6 = hype_rdtsc();
+    for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) fb[i] = 0u;
+    t7 = hype_rdtsc();
+    if (rflags & (1ull << 9)) __asm__ volatile("sti");
+    ns_cli = ((t7 - t6) * 1000000000ull) / tsc_hz;
     hype_debug_print("fw-1 FBSPEED: fb %u KB in %lluus = %llu MB/s (%llu ns/1k dwords) | "
                       "ram same size in %lluus = %llu MB/s | smi=%llu (+%llu) [#368]\n",
                       (unsigned int)(PROBE_DWORDS * 4u / 1024u), (unsigned long long)(ns / 1000ull),
@@ -7451,6 +7480,11 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
                       g_gop_console.stride, (unsigned long long)(ns_scat / 1000ull),
                       (ns_scat == 0ull) ? 0ull
                                         : ((uint64_t)scatter_dwords * 4ull * 1000ull) / ns_scat);
+    hype_debug_print("fw-1 FBIRQ: fb loop again with interrupts MASKED: %lluus = %llu MB/s | "
+                      "timer ticks during the unmasked loop: %llu [#368]\n",
+                      (unsigned long long)(ns_cli / 1000ull),
+                      (ns_cli == 0ull) ? 0ull : ((uint64_t)PROBE_DWORDS * 4ull * 1000ull) / ns_cli,
+                      (unsigned long long)(ticks_after - ticks_before));
     last_smi = smi_now;
 
     {
