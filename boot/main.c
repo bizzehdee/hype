@@ -7172,6 +7172,14 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
  */
 static void fw_1_host_input_poll(void) {
     uint8_t sc;
+    /*
+     * #363: pull USB HID keyboard reports here, on the BSP.
+     *
+     * This is the input path that actually works on the operator's hardware -- a full run
+     * measured isr_entries=0 for the PS/2 ISR, so nothing arrives that way. It also belongs on
+     * the BSP under #239: only the BSP may drive the USB host controller.
+     */
+    (void)usb_hid_drain();
     while (hype_host_kbd_poll_scancode(&sc)) {
         uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
         unsigned kn = 0;
@@ -7267,8 +7275,23 @@ static void fw_1_render_console(void) {
                 result_line = hype_phys_confirm_prompt(&g_phys_confirm, confirm_footer,
                                                        sizeof(confirm_footer));
             }
+            /*
+             * #363: HOST uptime, computed here on the BSP -- not vm0's.
+             *
+             * It used to show g_vms[0].stat_uptime_ms, which a guest publishes from its own loop.
+             * When vm0 wedged, that number froze, and with the diffing renderer correctly drawing
+             * nothing (no content changed) the whole dashboard looked dead. The operator reported
+             * exactly that: "dashboard froze". hype was fine and still logging.
+             *
+             * A clock the BSP owns keeps ticking through any guest failure, so a frozen screen now
+             * means hype itself has stopped -- which is the distinction the operator actually needs
+             * and could not make.
+             */
             hype_dashboard_render(&g_dashboard_term, info, ninfo,
-                                  g_vms[0].stat_uptime_ms / 1000u,
+                                  (g_host_time_tsc != 0 && g_vms[0].host_tsc_hz != 0)
+                                      ? (unsigned)((hype_rdtsc() - g_host_time_tsc) /
+                                                   g_vms[0].host_tsc_hz)
+                                      : 0u,
                                   g_cmdline, result_line);
         }
         /* PERF-2 (#234): same diffing treatment for the dashboard. It only
@@ -9159,10 +9182,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * RX (defaulting to vm0 while the dashboard is up, so typing still lands
          * on a guest). USB HID (TERM-5) will feed this same path unchanged. */
         if (vm == &g_vms[0]) {
-            /* USB-5 (#217): pull any USB HID keyboard report and inject its scancodes
-             * into the same queue this loop already drains, so the chord recognizer and
-             * command line below need no knowledge of which keyboard it came from. */
-            (void)usb_hid_drain();
+            /*
+             * #363: usb_hid_drain() MOVED TO THE BSP -- see fw_1_host_input_poll().
+             *
+             * On the operator's laptop the keyboard is USB, not PS/2: a full run measured
+             * isr_entries=0, so the PS/2 ISR never fires there and every keystroke arrives
+             * through this drain. Running it on vm0's core meant a wedged vm0 stopped the ONLY
+             * working input path -- which is why moving the PS/2 poll to the BSP changed nothing.
+             *
+             * It also violated #239's rule that only the BSP may drive the USB host controller,
+             * the same rule whose breach page-faulted hype from an AP before.
+             */
             /*
              * USB-6 (#219): and any pointer movement, straight into THIS VM's PS/2 mouse
              * plus its IRQ12. A pointer has no host-side meaning -- unlike a keystroke,
