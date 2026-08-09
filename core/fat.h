@@ -37,6 +37,20 @@ typedef struct {
     hype_fat_extent_t extents[HYPE_FAT_MAX_EXTENTS];
     unsigned count;      /* number of extents used */
     uint64_t size_bytes; /* exact file length in bytes */
+    /*
+     * #366: set when resolution stopped because the file needs MORE than HYPE_FAT_MAX_EXTENTS
+     * runs, as opposed to any other failure.
+     *
+     * Every failure used to collapse into -1, so "this ISO is too fragmented for hype to map" was
+     * indistinguishable from "no such file" and "this is not a FAT32 volume". boot/main.c even
+     * had a diagnostic written for the fragmentation case -- and it was unreachable, because it
+     * sat behind `else if (have_file)` and have_file only gets set when resolve SUCCEEDS.
+     *
+     * The operator's complaint is the point: whether an ISO streams should not depend on how
+     * their stick happens to be laid out. It does today, and until this flag existed it did so
+     * without saying why.
+     */
+    int too_fragmented;
 } hype_fat_file_t;
 
 /*
@@ -52,6 +66,10 @@ typedef int (*hype_fat_read_fn)(void *ctx, uint64_t lba, uint32_t count, void *d
  * names. Returns 0 on success; -1 if the volume is not a supported FAT32
  * volume, the path does not resolve to a regular file, the file needs more than
  * HYPE_FAT_MAX_EXTENTS runs, or a sector read fails. Read-only.
+ *
+ * #366: on the too-many-extents failure specifically, out->too_fragmented is set to 1 and
+ * out->count holds HYPE_FAT_MAX_EXTENTS. The return value is still -1, so existing callers are
+ * unaffected -- but one that wants to tell the operator WHY now can.
  */
 int hype_fat32_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fat_file_t *out);
 

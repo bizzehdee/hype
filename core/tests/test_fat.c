@@ -555,6 +555,46 @@ static void test_over_fragmented(void) {
               (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\toofrag", &f));
 }
 
+/*
+ * #366: "too fragmented to map" must be distinguishable from every other resolve failure.
+ *
+ * They all returned -1, so the caller could not tell it from "no such file" or "not a FAT32
+ * volume" -- and boot/main.c's diagnostic for the fragmentation case sat behind a branch that
+ * only runs when resolve SUCCEEDS, making it unreachable for the one failure it described. The
+ * operator saw nothing at all.
+ */
+static void test_too_fragmented_is_distinguishable_from_other_failures(void) {
+    hype_fat_file_t f;
+
+    build_fat32_frag();
+    CHECK_HEX("fat32 over-fragmented still returns -1", (unsigned long long)(-1),
+              (unsigned long long)hype_fat32_resolve(vol_read, 0, "\\toofrag.bin", &f));
+    CHECK_HEX("and says WHY", 1u, (unsigned)f.too_fragmented);
+
+    /* The distinction that matters: a different failure must NOT claim fragmentation, or the
+     * operator is told to defragment a stick that simply does not have the file on it. */
+    CHECK_HEX("a missing file still returns -1", (unsigned long long)(-1),
+              (unsigned long long)hype_fat32_resolve(vol_read, 0, "\\nosuch.bin", &f));
+    CHECK_HEX("and does not claim fragmentation", 0u, (unsigned)f.too_fragmented);
+
+    build_exfat();
+    CHECK_HEX("exfat over-fragmented still returns -1", (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\toofrag", &f));
+    CHECK_HEX("exfat says WHY too", 1u, (unsigned)f.too_fragmented);
+}
+
+/* The flag must not survive into a later resolve: the loader reuses one struct across media. */
+static void test_too_fragmented_is_cleared_by_a_later_success(void) {
+    hype_fat_file_t f;
+    build_fat32_frag();
+    (void)hype_fat32_resolve(vol_read, 0, "\\toofrag.bin", &f);
+    CHECK_HEX("flag set by the failure", 1u, (unsigned)f.too_fragmented);
+    build_fat32();
+    CHECK_HEX("a later resolve succeeds", 0,
+              hype_fat32_resolve(vol_read, 0, "\\iso\\test.iso", &f));
+    CHECK_HEX("and the stale reason is gone", 0u, (unsigned)f.too_fragmented);
+}
+
 static void test_exfat_more_guards(void) {
     hype_fat_file_t f;
     /* empty component (path is only separators). */
@@ -799,6 +839,8 @@ int main(void) {
     test_exfat_multicluster_dir();
     test_fat_chain_read_failures();
     test_over_fragmented();
+    test_too_fragmented_is_distinguishable_from_other_failures();
+    test_too_fragmented_is_cleared_by_a_later_success();
     test_exfat_more_guards();
     test_exfat_spc2_partial_cluster();
     test_exfat_scan_past_chain_end();

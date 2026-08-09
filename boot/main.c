@@ -14057,13 +14057,27 @@ static int fw_1_resolve_media_stream(unsigned vi) {
                                  (unsigned)cd[4]);
                 usb_log_flush(); /* #346: THE failure line two hardware runs never captured */
             }
+        } else if (file.too_fragmented) {
+            /*
+             * #366: this diagnostic existed and was UNREACHABLE for the case it describes.
+             * It sat behind `else if (have_file)`, and have_file is only set when resolve
+             * SUCCEEDS -- while the too-many-extents path returns non-zero. So the one failure
+             * with a written explanation was the one that printed nothing at all, and the
+             * operator saw a media path that simply did not appear.
+             *
+             * Now keyed off the flag the resolver sets, which is reachable precisely when the cap
+             * was hit. Names the file, the cap, and what to do about it: the fix is on the
+             * operator's side (defragment or re-copy onto a fresh volume), so saying so is worth
+             * more than the number alone.
+             */
+            hype_debug_print("host-fat: %s needs more than the %u extents hype can map -- "
+                             "cannot stream it. The file is too fragmented on this volume; "
+                             "re-copy it onto a freshly-formatted one. [#366]\n",
+                             media_path, (unsigned)HYPE_FAT_MAX_EXTENTS);
+            usb_log_flush(); /* #346: a media failure must reach the log before dispatch */
         } else if (have_file) {
-            /* #327: only reachable now for a file needing MORE runs than the resolvers
-             * can even report, i.e. one hype cannot describe rather than one it merely
-             * dislikes. Says the cap so the number is actionable. */
-            hype_debug_print("host-fat: %s needs %u extents, more than the "
-                             "%u hype can map -- cannot stream it\n", media_path,
-                             file.count, (unsigned)HYPE_ISO_STREAM_MAX_EXTENTS);
+            hype_debug_print("host-fat: %s resolved but could not be streamed [#366]\n",
+                             media_path);
         }
     }
     /* GLADDER-10: fall back to streaming the ISO from its own raw

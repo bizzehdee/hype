@@ -246,7 +246,10 @@ static int fat32_build_extents(const fat32_vol_t *v, uint32_t first_cl, uint32_t
             }
         }
         if (out->count >= HYPE_FAT_MAX_EXTENTS) {
-            return -1; /* too fragmented for our fixed extent table */
+            /* #366: distinguishable from every other -1. The caller cannot otherwise tell "too
+             * fragmented to map" from "no such file", and those need different advice. */
+            out->too_fragmented = 1;
+            return -1;
         }
         out->extents[out->count].start_lba = lba;
         out->extents[out->count].sector_count = sectors_per_cluster;
@@ -282,6 +285,11 @@ static int fat32_build_extents(const fat32_vol_t *v, uint32_t first_cl, uint32_t
 }
 
 int hype_fat32_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fat_file_t *out) {
+    /* #366: cleared HERE, not at the extent-walk, because a path that fails earlier (no such
+     * file, bad volume) returns before ever reaching it -- and would then inherit the previous
+     * call's reason. That would tell the operator to defragment a stick that simply does not have
+     * the file on it. Caught by a test, not on hardware. */
+    if (out != 0) out->too_fragmented = 0;
     uint8_t bpb[HYPE_FAT_SECTOR_SIZE];
     fat32_vol_t v;
     uint32_t dir_cl;
@@ -516,7 +524,10 @@ static int exfat_build_extents(const exfat_vol_t *v, const hype_exfat_set_t *set
             }
         }
         if (out->count >= HYPE_FAT_MAX_EXTENTS) {
-            return -1; /* too fragmented for our fixed extent table */
+            /* #366: distinguishable from every other -1. The caller cannot otherwise tell "too
+             * fragmented to map" from "no such file", and those need different advice. */
+            out->too_fragmented = 1;
+            return -1;
         }
         out->extents[out->count].start_lba = lba;
         out->extents[out->count].sector_count = this_sectors;
@@ -590,6 +601,7 @@ static int exfat_find_in_dir(const exfat_vol_t *v, uint32_t dir_cl, int dir_cont
 }
 
 int hype_exfat_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fat_file_t *out) {
+    if (out != 0) out->too_fragmented = 0; /* #366: see hype_fat32_resolve */
     uint8_t boot[HYPE_FAT_SECTOR_SIZE];
     exfat_vol_t v;
     hype_exfat_set_t set;
