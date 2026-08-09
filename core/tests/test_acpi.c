@@ -74,7 +74,91 @@ static hype_acpi_config_t make_config(uint8_t cpu_count) {
     cfg.pci_start_bus = 0;
     cfg.pci_end_bus = 255;
     cfg.sci_interrupt = 9;
+    cfg.pci_window_base = 0x80000000u; /* #355: the historical 2 GiB line, unless a test moves it */
     return cfg;
+}
+
+/*
+ * #355: the PCI0 _CRS 32-bit window must follow THIS VM's RAM top.
+ *
+ * devices/dsdt.asl hardcodes 0x80000000 because that is where the default 2048 MiB of guest RAM
+ * ends. mem_mb goes to 3072, and a VM given more than 2048 MiB then has RAM extending past the
+ * declared bridge window's base -- the window overlaps the VM's own RAM. A strict guest may object
+ * to that, which is the failure #354 was.
+ */
+static uint32_t read_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static const uint8_t *dsdt_body_of(const uint8_t *buf, const hype_acpi_layout_t *layout) {
+    return buf + layout->dsdt_offset + sizeof(hype_acpi_sdt_header_t);
+}
+
+static void test_pci_window_tracks_guest_ram_top(void) {
+    static uint8_t buf[4096];
+    hype_acpi_layout_t layout;
+    hype_acpi_config_t cfg = make_config(1);
+    const uint8_t *body;
+
+    /* A VM with 3072 MiB: RAM ends at 0xC0000000, so the window must start there, not at 2 GiB. */
+    cfg.pci_window_base = 0xC0000000u;
+    CHECK_HEX("3072 MiB VM builds", 0, hype_acpi_build_tables_blob(buf, sizeof(buf), &cfg, &layout));
+    body = dsdt_body_of(buf, &layout);
+    CHECK_HEX("window base follows RAM top", 0xC0000000u,
+              read_le32(body + HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF));
+    CHECK_HEX("window length runs to the I/O APIC", 0xFEBFFFFFu - 0xC0000000u + 1u,
+              read_le32(body + HYPE_DSDT_AML_PCI_WINDOW_LEN_OFF));
+}
+
+static void test_pci_window_default_ram_is_unchanged(void) {
+    static uint8_t buf[4096];
+    hype_acpi_layout_t layout;
+    hype_acpi_config_t cfg = make_config(1);
+    const uint8_t *body;
+
+    /* The 2048 MiB default must still produce exactly what the static blob always did, or this
+     * change alters every VM that was already correct. */
+    cfg.pci_window_base = 0x80000000u;
+    CHECK_HEX("2048 MiB VM builds", 0, hype_acpi_build_tables_blob(buf, sizeof(buf), &cfg, &layout));
+    body = dsdt_body_of(buf, &layout);
+    CHECK_HEX("base unchanged at the 2 GiB line", 0x80000000u,
+              read_le32(body + HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF));
+    CHECK_HEX("length unchanged", 0x7EC00000u,
+              read_le32(body + HYPE_DSDT_AML_PCI_WINDOW_LEN_OFF));
+}
+
+/* The offsets are generated from the compiled AML. If devices/dsdt.asl moves the descriptor and
+ * the header is not regenerated, the patch would silently corrupt unrelated AML -- so pin that the
+ * bytes just before _MIN really are a DWordMemory descriptor tag and its granularity. */
+static void test_pci_window_offset_points_at_a_dword_memory_descriptor(void) {
+    CHECK_HEX("tag is DWordMemory (0x87)", 0x87u,
+              (unsigned)hype_dsdt_aml_body[HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF - 10u]);
+    CHECK_HEX("granularity dword is 0", 0u,
+              read_le32(hype_dsdt_aml_body + HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF - 4u));
+    CHECK_HEX("_MAX sits between _MIN and _LEN", 0xFEBFFFFFu,
+              read_le32(hype_dsdt_aml_body + HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF + 4u));
+}
+
+static void test_rejects_an_impossible_pci_window(void) {
+    static uint8_t buf[4096];
+    hype_acpi_layout_t layout;
+    hype_acpi_config_t cfg;
+
+    cfg = make_config(1);
+    cfg.pci_window_base = 0u;
+    CHECK_HEX("a zero window base is refused", (unsigned long long)-1,
+              hype_acpi_build_tables_blob(buf, sizeof(buf), &cfg, &layout));
+
+    cfg = make_config(1);
+    cfg.pci_window_base = 0x80000001u;
+    CHECK_HEX("an unaligned window base is refused", (unsigned long long)-1,
+              hype_acpi_build_tables_blob(buf, sizeof(buf), &cfg, &layout));
+
+    /* At or above the I/O APIC there is no window left to declare. */
+    cfg = make_config(1);
+    cfg.pci_window_base = 0xFFF00000u;
+    CHECK_HEX("a window base past the I/O APIC is refused", (unsigned long long)-1,
+              hype_acpi_build_tables_blob(buf, sizeof(buf), &cfg, &layout));
 }
 
 static void test_rejects_zero_cpus(void) {
@@ -217,6 +301,10 @@ int main(void) {
     test_checksum_makes_sum_zero();
     test_checksum_all_zero_is_zero();
     test_build_rsdp();
+    test_pci_window_tracks_guest_ram_top();
+    test_pci_window_default_ram_is_unchanged();
+    test_pci_window_offset_points_at_a_dword_memory_descriptor();
+    test_rejects_an_impossible_pci_window();
     test_rejects_zero_cpus();
     test_rejects_too_many_cpus();
     test_rejects_buffer_too_small();

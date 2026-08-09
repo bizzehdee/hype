@@ -16,6 +16,34 @@ AML="$TMP/dsdt.aml"
 TOTAL=$(stat -c%s "$AML")
 BODY=$((TOTAL - 36)) # strip the 36-byte SDT header
 
+#
+# #355: find the PCI0 _CRS 32-bit memory window so hype can patch it at runtime.
+#
+# The window's base is the guest's RAM top, and mem_mb is configurable (128..3072), so a static
+# base is wrong for any VM given more than the 2048 MiB default -- the declared bridge window then
+# overlaps that VM's own RAM. A static AML blob cannot track it, so the address is patched into the
+# copy hype builds. Locating it by hand-counted offset would rot the moment the ASL above it
+# changes, so the offset is DERIVED here, at generation time, and the C side asserts against it.
+#
+# ACPI 6.x §6.4.3.5.1: a DWord Address Space descriptor is tag 0x87, a 16-bit length, then 3 flag
+# bytes (resource type, general flags, type-specific flags), then FIVE little-endian dwords --
+# granularity, min, max, translation, length. So _MIN is 10 bytes into the descriptor and _LEN is
+# 22, i.e. 12 past _MIN. Matched on the min/max pair, which is unique in this table.
+#
+WIN_OFF=$(python3 - "$AML" <<'PYFIND'
+import sys, struct
+aml = open(sys.argv[1], 'rb').read()[36:]     # body only, matching the array emitted below
+pat = struct.pack('<II', 0x80000000, 0xFEBFFFFF)   # min, max as written in devices/dsdt.asl
+hits = [i for i in range(len(aml) - len(pat) + 1) if aml[i:i+len(pat)] == pat]
+if len(hits) != 1:
+    sys.exit("gen-dsdt-aml.sh: expected exactly one PCI0 _CRS window, found %d" % len(hits))
+off = hits[0]
+if aml[off-10] != 0x87:
+    sys.exit("gen-dsdt-aml.sh: bytes at the match are not a DWordMemory descriptor")
+print(off)
+PYFIND
+)
+
 {
     echo "#ifndef HYPE_DEVICES_DSDT_AML_H"
     echo "#define HYPE_DEVICES_DSDT_AML_H"
@@ -35,6 +63,20 @@ BODY=$((TOTAL - 36)) # strip the 36-byte SDT header
     echo "};"
     echo ""
     echo "#define HYPE_DSDT_AML_BODY_LEN ((uint32_t)sizeof(hype_dsdt_aml_body))"
+    echo ""
+    echo "/*"
+    echo " * #355: byte offset, within the body above, of the PCI0 _CRS 32-bit memory window's"
+    echo " * _MIN field. _LEN follows 12 bytes later (min, max, translation, length are"
+    echo " * consecutive little-endian dwords -- ACPI 6.x SS6.4.3.5.1). Derived at generation"
+    echo " * time by locating the descriptor, so editing devices/dsdt.asl cannot silently move it"
+    echo " * out from under the runtime patch."
+    echo " */"
+    echo "#define HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF ${WIN_OFF}u"
+    echo "#define HYPE_DSDT_AML_PCI_WINDOW_LEN_OFF $((WIN_OFF + 12))u"
+    echo ""
+    echo "/* The window's last byte: one below the I/O APIC at 0xFEC00000. Fixed -- only the BASE"
+    echo " * tracks guest RAM. */"
+    echo "#define HYPE_DSDT_AML_PCI_WINDOW_MAX 0xFEBFFFFFu"
     echo ""
     echo "#endif /* HYPE_DEVICES_DSDT_AML_H */"
 } > "$HDR"

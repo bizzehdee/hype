@@ -73,6 +73,15 @@ void hype_acpi_build_rsdp(hype_acpi_rsdp_t *rsdp, uint64_t xsdt_offset_in_tables
     }
 }
 
+/* #355: little-endian dword into the DSDT body copy. AML stores address-space descriptor fields
+ * little-endian regardless of host order, so this is explicit rather than a cast. */
+static void put_le32_at(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
 int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi_config_t *cfg,
                                  hype_acpi_layout_t *out) {
     uint32_t xsdt_entry_count = 3; /* FADT, MADT, MCFG */
@@ -89,6 +98,12 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
     uint32_t i;
 
     if (cfg->cpu_count == 0 || cfg->cpu_count > HYPE_ACPI_MAX_CPUS) {
+        return -1;
+    }
+    /* #355: a window that starts inside guest RAM, is unaligned, or has nothing left below the
+     * I/O APIC describes memory that is not the bridge's. Refuse rather than emit it. */
+    if (cfg->pci_window_base == 0u || (cfg->pci_window_base & 0xFFFFFu) != 0u ||
+        cfg->pci_window_base >= (uint64_t)HYPE_DSDT_AML_PCI_WINDOW_MAX) {
         return -1;
     }
     if (total > buf_size) {
@@ -124,6 +139,25 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
         fill_header((hype_acpi_sdt_header_t *)dsdt, "DSDT", out->dsdt_length, 2, "HYPEDSDT");
         for (j = 0; j < HYPE_DSDT_AML_BODY_LEN; j++) {
             dsdt[sizeof(hype_acpi_sdt_header_t) + j] = hype_dsdt_aml_body[j];
+        }
+        /*
+         * #355: point the PCI0 _CRS 32-bit window at THIS VM's RAM top.
+         *
+         * The blob says 0x80000000 because that is where the default 2048 MiB of guest RAM ends.
+         * With mem_mb configurable to 3072 the declared bridge window would otherwise overlap the
+         * VM's own RAM. Only the base moves; the top stays one byte below the I/O APIC, so the
+         * length follows from the two.
+         *
+         * Patched in the COPY, never in hype_dsdt_aml_body, which is const and shared by every VM.
+         * The offsets come from devices/dsdt_aml.h, derived by tools/gen-dsdt-aml.sh from the
+         * compiled AML, so editing devices/dsdt.asl cannot move the field out from under this.
+         */
+        {
+            uint8_t *body = dsdt + sizeof(hype_acpi_sdt_header_t);
+            uint32_t base = (uint32_t)cfg->pci_window_base;
+            uint32_t len = HYPE_DSDT_AML_PCI_WINDOW_MAX - base + 1u;
+            put_le32_at(body + HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF, base);
+            put_le32_at(body + HYPE_DSDT_AML_PCI_WINDOW_LEN_OFF, len);
         }
     }
 

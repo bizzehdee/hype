@@ -54,4 +54,18 @@ static const uint8_t hype_dsdt_aml_body[] = {
 
 #define HYPE_DSDT_AML_BODY_LEN ((uint32_t)sizeof(hype_dsdt_aml_body))
 
+/*
+ * #355: byte offset, within the body above, of the PCI0 _CRS 32-bit memory window's
+ * _MIN field. _LEN follows 12 bytes later (min, max, translation, length are
+ * consecutive little-endian dwords -- ACPI 6.x SS6.4.3.5.1). Derived at generation
+ * time by locating the descriptor, so editing devices/dsdt.asl cannot silently move it
+ * out from under the runtime patch.
+ */
+#define HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF 210u
+#define HYPE_DSDT_AML_PCI_WINDOW_LEN_OFF 222u
+
+/* The window's last byte: one below the I/O APIC at 0xFEC00000. Fixed -- only the BASE
+ * tracks guest RAM. */
+#define HYPE_DSDT_AML_PCI_WINDOW_MAX 0xFEBFFFFFu
+
 #endif /* HYPE_DEVICES_DSDT_AML_H */

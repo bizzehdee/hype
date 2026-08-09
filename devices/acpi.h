@@ -263,6 +263,24 @@ typedef struct {
     uint8_t pci_start_bus;
     uint8_t pci_end_bus;
     uint32_t sci_interrupt;
+    /*
+     * #355: base of the PCI0 _CRS 32-bit memory window -- the guest's RAM top, which is where the
+     * guest firmware places BARs.
+     *
+     * devices/dsdt.asl hardcodes 0x80000000, the 2 GiB line, because that is where the DEFAULT
+     * 2048 MiB of guest RAM ends. mem_mb is configurable from 128 to 3072 (#290), so a VM given
+     * more than 2048 MiB has RAM extending past that line and the declared bridge window then
+     * overlaps its own RAM. A strict guest may object to that, which is exactly the failure #354
+     * was.
+     *
+     * A static AML blob cannot track a per-VM value, so hype patches this into its own copy of the
+     * DSDT body. The window's TOP does not move: it ends one byte below the I/O APIC.
+     *
+     * Must be non-zero, 1 MiB-aligned, and leave a non-empty window below
+     * HYPE_DSDT_AML_PCI_WINDOW_MAX -- hype_acpi_build_tables_blob() returns -1 otherwise rather
+     * than emitting a table that describes the wrong memory.
+     */
+    uint64_t pci_window_base;
 } hype_acpi_config_t;
 
 /* Byte offsets/lengths of each table within the blob

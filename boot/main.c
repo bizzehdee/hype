@@ -2686,6 +2686,10 @@ static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind
     cfg.pci_start_bus = 0;
     cfg.pci_end_bus = 255;
     cfg.sci_interrupt = 9;
+    /* #355: this microtest's guest is a fixed tiny image with no configurable RAM, so the
+     * historical 2 GiB line is still the right window base for it. Named rather than left to a
+     * default, so it is a stated choice and not an omission. */
+    cfg.pci_window_base = 0x80000000u;
 
     if (hype_acpi_build_tables_blob(g_m4_4_tables_blob, sizeof(g_m4_4_tables_blob), &cfg, &layout) != 0) {
         hype_fatal("m4-4: hype_acpi_build_tables_blob failed");
@@ -9204,6 +9208,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         cfg.pci_start_bus = 0;
         cfg.pci_end_bus = 255;
         cfg.sci_interrupt = 9;
+        /* #355: this VM's RAM top, not the 2 GiB the DSDT blob hardcodes. Guest RAM is one region
+         * [0, ram_bytes) (see the etc/e820 build below), and the guest firmware places BARs just
+         * above it, so the bridge window must start there or it overlaps the VM's own RAM. */
+        cfg.pci_window_base = vm->ram_bytes;
 
         if (hype_acpi_build_tables_blob(g_fw_1_tables_blob, sizeof(g_fw_1_tables_blob), &cfg, &layout) !=
             0) {
