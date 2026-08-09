@@ -14600,8 +14600,10 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
                           g_hype_cfg.skipped_vm_line);
     }
     if (g_hype_cfg.unknown_count != 0u) {
-        hype_debug_print("cfg: %u line(s) not understood -- RETAINED verbatim, not applied. A "
-                         "misspelled key looks exactly like this\n", g_hype_cfg.unknown_count);
+        hype_debug_print("cfg: %u line(s) not understood -- RETAINED verbatim, not applied. "
+                         "First is line %u: \"%s\" [#357]\n",
+                         g_hype_cfg.unknown_count, g_hype_cfg.unknown_first_line,
+                         g_hype_cfg.unknown_first);
     }
     if (g_hype_cfg.retained_overflow) {
         /* Only matters once a serializer exists (#221), but it must be visible before then: it is

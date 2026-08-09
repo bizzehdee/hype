@@ -30,6 +30,10 @@ static int failures = 0;
         } \
     } while (0)
 
+/* #357: a VM section is ignored entirely unless every required key is present. */
+#define REQ "mem_mb = 512\nvcpus = 1\nfirmware = uefi\nboot = disk\nos_hint = linux\n" \
+            "target_disk = file:\\hype\\disks\\a.img\n"
+
 static hype_cfg_result_t parse_copy(const char *text, hype_cfg_t *out) {
     static char buf[8192];
     strncpy(buf, text, sizeof(buf) - 1);
@@ -1444,7 +1448,91 @@ static void test_skipped_vm_section_entry_does_not_alias(void) {
 }
 
 
+
+/*
+ * #357: `label` appeared in the spec's own worked examples and was not parsed, so a config copied
+ * out of the documentation reported "line(s) not understood" and the setting did nothing.
+ */
+static void test_label_from_the_spec_example_is_accepted(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n"
+                                     "[vm.win11]\nlabel = Windows 11 Workstation\n" REQ,
+                                     &c);
+    CHECK_INT("the spec's own example parses", HYPE_CFG_OK, r.status);
+    CHECK_INT("and produces no unknown lines", 0, (int)c.unknown_count);
+    CHECK_INT("one vm", 1, (int)c.vm_count);
+    CHECK_STR("label is stored verbatim, spaces included", "Windows 11 Workstation", c.vms[0].label);
+    CHECK_STR("the section id is untouched", "win11", c.vms[0].name);
+}
+
+static void test_label_absent_leaves_an_empty_string(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n[vm.a]\n" REQ, &c);
+    CHECK_INT("parses", HYPE_CFG_OK, r.status);
+    /* Empty, not absent-and-undefined: callers fall back to the section id for display. */
+    CHECK_STR("label is empty when unset", "", c.vms[0].label);
+}
+
+static void test_label_rejects_empty_and_duplicate(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n[vm.a]\n" REQ "label =\n", &c);
+    /* `label =` with nothing after it is a mistake, not a way to clear it. */
+    CHECK_INT("an empty label is a bad value", HYPE_CFG_ERR_BAD_VALUE, r.status);
+    r = parse_copy("[hype]\nconfig_version = 1\n[vm.a]\n" REQ "label = One\nlabel = Two\n", &c);
+    CHECK_INT("a repeated label is a duplicate key", HYPE_CFG_ERR_DUPLICATE_KEY, r.status);
+}
+
+static void test_over_long_label_is_refused_not_truncated(void) {
+    hype_cfg_t c;
+    char text[512];
+    unsigned i;
+    strcpy(text, "[hype]\nconfig_version = 1\n[vm.a]\n" REQ "label = ");
+    for (i = 0; i < HYPE_CFG_LABEL_MAX + 8u; i++) strcat(text, "x");
+    strcat(text, "\n");
+    /* Silently truncating a display name would show the operator something they did not write. */
+    CHECK_INT("an over-long label is refused", HYPE_CFG_ERR_VALUE_TOO_LONG,
+              parse_copy(text, &c).status);
+}
+
+/*
+ * #357 part 2: the old warning told the operator "a misspelled key looks exactly like this" and
+ * then did not say which line, which is unusable in a long config.
+ */
+static void test_first_unknown_line_is_named_with_its_number(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n"
+                                     "[vm.a]\n" REQ "vcpuss = 2\nnonsense = 1\n",
+                                     &c);
+    CHECK_INT("unknown keys are retained, not fatal", HYPE_CFG_OK, r.status);
+    CHECK_INT("both are counted", 2, (int)c.unknown_count);
+    CHECK_INT("the FIRST one is reported", 10, (int)c.unknown_first_line);
+    CHECK_STR("and named verbatim", "vcpuss = 2", c.unknown_first);
+}
+
+static void test_no_unknown_lines_leaves_the_report_empty(void) {
+    hype_cfg_t c;
+    (void)parse_copy("[hype]\nconfig_version = 1\n[vm.a]\n" REQ, &c);
+    CHECK_INT("no unknown lines", 0, (int)c.unknown_count);
+    CHECK_INT("so no line number", 0, (int)c.unknown_first_line);
+    CHECK_STR("and no text", "", c.unknown_first);
+}
+
+/* The comment retained with an unknown line must not be lost from the report. */
+static void test_unknown_line_is_reported_with_its_comment(void) {
+    hype_cfg_t c;
+    (void)parse_copy("[hype]\nconfig_version = 1\n[vm.a]\n" REQ "bogus = 1 ; why\n", &c);
+    CHECK_INT("counted", 1, (int)c.unknown_count);
+    CHECK_STR("reported as the operator wrote it", "bogus = 1 ; why", c.unknown_first);
+}
+
 int main(void) {
+    test_label_from_the_spec_example_is_accepted();
+    test_label_absent_leaves_an_empty_string();
+    test_label_rejects_empty_and_duplicate();
+    test_over_long_label_is_refused_not_truncated();
+    test_first_unknown_line_is_named_with_its_number();
+    test_no_unknown_lines_leaves_the_report_empty();
+    test_unknown_line_is_reported_with_its_comment();
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
     test_full_example_from_plan();

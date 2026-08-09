@@ -18,7 +18,8 @@ enum {
     F_MEDIA_DISK = 1u << 13,
     F_DISKS = 1u << 14,
     F_CDROMS = 1u << 15,
-    F_BOOT_ORDER = 1u << 16 /* #323 */
+    F_BOOT_ORDER = 1u << 16, /* #323 */
+    F_LABEL = 1u << 17       /* #357 */
 };
 
 /* Parses a boolean value: true/false, yes/no, on/off, 1/0. */
@@ -369,6 +370,21 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         else if (hype_streq(val, "legacy")) vm->firmware = HYPE_CFG_FW_LEGACY;
         else return HYPE_CFG_ERR_BAD_VALUE;
         *seen |= F_FIRMWARE;
+        return HYPE_CFG_OK;
+    }
+    /*
+     * #357: `label` was documented in the spec's own worked examples and not implemented, so a
+     * config copied out of the documentation produced "line(s) not understood" and the setting
+     * silently did nothing. Accepts any prose; empty is rejected like every other string value,
+     * because `label =` with nothing after it is a mistake rather than a way to clear it.
+     */
+    if (hype_streq(key, "label")) {
+        if (*seen & F_LABEL) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_strlcpy(vm->label, val, HYPE_CFG_LABEL_MAX) >= HYPE_CFG_LABEL_MAX) {
+            return HYPE_CFG_ERR_VALUE_TOO_LONG;
+        }
+        if (vm->label[0] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
+        *seen |= F_LABEL;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "os_hint")) {
@@ -950,6 +966,7 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     int cur_disk = -1;
     int cur_is_hype = 0;
     unsigned int line_no = 0;
+    unsigned int unknown_before = 0;
     char *p = text;
     unsigned int i;
 
@@ -966,6 +983,10 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     out->retained_count = 0;
     out->retained_overflow = 0;
     out->unknown_count = 0;
+    /* #357: reset with the count, or a later parse reports a line from an earlier one. Caught by
+     * a test that parses twice into the same struct -- which is exactly how the loader uses it. */
+    out->unknown_first_line = 0u;
+    out->unknown_first[0] = '\0';
     for (i = 0; i < HYPE_CFG_MAX_VMS; i++) {
         seen[i] = 0;
         vm_bad[i] = 0;
@@ -1003,6 +1024,18 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
             continue;
         }
 
+        /*
+         * #357: remember the FIRST line the parser did not understand, with its number.
+         *
+         * The old warning said "N line(s) not understood -- a misspelled key looks exactly like
+         * this" and then did not say which line. It is the counter-example to its own advice: with
+         * a 40-line config and a real typo the operator has nothing to go on. Captured here rather
+         * than at the three unknown_count++ sites because `raw` and `line_no` are both in scope
+         * only in this loop, and the first one is the one worth reporting -- a cascade usually
+         * starts with a single mistake.
+         */
+        unknown_before = out->unknown_count;
+
         in_vm_key = 0;
         if (line[0] == '[') {
             st = process_section_header(line, out, &cur, seen, raw, &cur_disk, &disk_seen,
@@ -1011,6 +1044,10 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
             in_vm_key = (cur >= 0);
             st = process_key_value(line, out, cur, seen, raw, raw_truncated, cur_disk,
                                    &disk_seen, cur_is_hype, &in_hype_seen);
+        }
+        if (out->unknown_count > unknown_before && out->unknown_first_line == 0u) {
+            out->unknown_first_line = line_no;
+            (void)hype_strlcpy(out->unknown_first, raw, HYPE_CFG_LINE_MAX);
         }
 
         if (st != HYPE_CFG_OK) {

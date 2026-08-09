@@ -33,6 +33,9 @@
  */
 
 #define HYPE_CFG_MAX_VMS 16
+/* Longer than NAME_MAX because a label is prose ("Windows 11 Workstation"), not an identifier. */
+#define HYPE_CFG_LABEL_MAX 64
+
 #define HYPE_CFG_NAME_MAX 32
 #define HYPE_CFG_PATH_MAX 256
 #define HYPE_CFG_MAX_CPUS 256
@@ -94,6 +97,19 @@ typedef struct {
 
 typedef struct {
     char name[HYPE_CFG_NAME_MAX];
+
+    /*
+     * #357: the human-readable display name from `label = ...` (spec section 5).
+     *
+     * The spec used `label` in its own worked examples while core/cfg.c did not parse it, so a
+     * config copied straight out of the documentation produced "1 line(s) not understood" and the
+     * setting silently did nothing. That is the #285/#331/#339 class the codebase keeps calling
+     * out: a documented setting that appears accepted and has no effect.
+     *
+     * Empty when unset. Callers wanting something to show should fall back to `name` (the section
+     * id), which is what the dashboard and log lines used before this existed.
+     */
+    char label[HYPE_CFG_LABEL_MAX];
 
     unsigned int vcpus;
 
@@ -372,6 +388,19 @@ typedef struct {
 
     /* Count of lines the parser did not understand, for a single summary log line. */
     unsigned int unknown_count;
+
+    /*
+     * #357: the FIRST line that was not understood, and its 1-based number. 0 / "" when there
+     * were none.
+     *
+     * The summary used to report only a count, while telling the operator that "a misspelled key
+     * looks exactly like this" -- advice it then made impossible to act on. With a typo in a long
+     * config there was nothing to search for. Naming one line is enough: a cascade of unknown
+     * lines almost always starts from a single mistake, and the count still says how many
+     * followed.
+     */
+    unsigned int unknown_first_line;
+    char unknown_first[HYPE_CFG_LINE_MAX];
 } hype_cfg_t;
 
 typedef enum {
