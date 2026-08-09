@@ -11621,9 +11621,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                   (unsigned long long)r10_kbps);
                             }
                         }
-                        continue;
+                        /* #367: account BEFORE the continue. The first version of this put the
+                         * two lines after it, where they are unreachable -- ahci_emul reported
+                         * calls=0 for a whole run while ahci_npf reported 670,578, which is what
+                         * exposed it. A counter that cannot increment reads exactly like an event
+                         * that never happens. */
                         g_ahci_npf_tsc += hype_rdtsc() - t_ahci;
                         g_ahci_npf_calls++;
+                        continue;
                     }
                     /* Same evidence the generic undecodable-NPF fatal prints, for the
                      * same reason: without the bytes, "unhandled" cannot be told apart
