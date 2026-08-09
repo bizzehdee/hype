@@ -654,6 +654,7 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     uint32_t proc2_ctls = hype_vmx_adjust_controls(
         HYPE_VMX_PROCBASED2_ENABLE_EPT | HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST |
             HYPE_VMX_PROCBASED2_ENABLE_INVPCID | HYPE_VMX_PROCBASED2_ENABLE_RDTSCP |
+            HYPE_VMX_PROCBASED2_WBINVD_EXITING |
             (want_vpid ? HYPE_VMX_PROCBASED2_ENABLE_VPID : 0u),
         proc2_cap);
     /* Read back what adjust_controls() actually granted rather than what was
@@ -3751,4 +3752,27 @@ int hype_vmx_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
     }
     vmx_mmio_end(&m);
     return 0;
+}
+
+/*
+ * #368: a guest executed WBINVD (or WBNOINVD) and we intercepted it.
+ *
+ * Deliberately does NOT execute a host WBINVD. Guest RAM is host-backed and coherent, and every
+ * device the guest sees is mediated by hype, so there is nothing for a real cache flush to make
+ * correct here -- it would only destroy hype's caches and every other VM's, which is the exact
+ * harm intercepting it prevents. Retire the instruction and record where it came from.
+ */
+static unsigned long long g_vmx_wbinvd_exits;
+static uint64_t g_vmx_wbinvd_last_rip;
+
+void hype_vmx_vcpu_handle_wbinvd(void) {
+    int ok = 1;
+    g_vmx_wbinvd_last_rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    g_vmx_wbinvd_exits++;
+    vmx_advance_rip();
+}
+
+void hype_vmx_wbinvd_stats(unsigned long long *count, uint64_t *last_rip) {
+    if (count != 0) *count = g_vmx_wbinvd_exits;
+    if (last_rip != 0) *last_rip = g_vmx_wbinvd_last_rip;
 }

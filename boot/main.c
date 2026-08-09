@@ -1576,7 +1576,7 @@ static void fw_1_ap_main(void *arg) {
          * guest runs in this build, so nothing else drives the log flush. */
         usb_log_flush();
         for (k = 0; k < 8u; k++) {
-            uint64_t t0 = hype_rdtsc();
+            uint64_t t0 = fb_tsc_begin();
             int rc = hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, (uint64_t)k, 1u,
                                          ap_probe_buf);
             uint64_t dt = hype_rdtsc() - t0;
@@ -4048,6 +4048,11 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             hype_fatal("cpumsr: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
         }
 
+        if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_WBINVD) {
+            /* #368: retire it without flushing any real cache. See the handler's comment. */
+            hype_vmx_vcpu_handle_wbinvd();
+            continue;
+        }
         if (vmm_reason_is_cpuid(kind, info.reason)) {
             vmm_handle_cpuid(kind, ctx);
             continue;
@@ -7341,6 +7346,27 @@ static unsigned int g_fbprobe_scratch[65536];
 static unsigned long long g_fbprobe_entries, g_fbprobe_ran, g_fbprobe_skip_null,
     g_fbprobe_skip_rate;
 
+/*
+ * #368: serialised TSC reads, per the expert review of this investigation.
+ *
+ * A plain RDTSC can be reordered around the stores it is meant to bracket, so a measured interval
+ * can include or exclude work it should not. LFENCE before, and RDTSCP (itself ordered against
+ * earlier loads) followed by LFENCE after, pins both ends. The invariant TSC is the right clock
+ * for elapsed wall time here; it deliberately does NOT track core frequency, which is why
+ * APERF/MPERF is measured separately rather than inferred from it.
+ */
+static inline uint64_t fb_tsc_begin(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline uint64_t fb_tsc_end(void) {
+    uint32_t lo, hi, aux;
+    __asm__ volatile("rdtscp; lfence" : "=a"(lo), "=d"(hi), "=c"(aux) :: "memory");
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     static uint64_t last_probe_tsc = 0;
     static int reported_static = 0;
@@ -7417,9 +7443,9 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     }
 
     ticks_before = hype_timer_get_ticks();
-    t0 = hype_rdtsc();
+    t0 = fb_tsc_begin();
     for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) fb[i] = ram[i];
-    t1 = hype_rdtsc();
+    t1 = fb_tsc_end();
     ticks_after = hype_timer_get_ticks();
 
     /*
@@ -7432,9 +7458,9 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      * g_gop_console.fb is the shadow buffer in normal WB RAM. Writing it is safe: the render
      * caches are invalidated below, so both buffers repaint on this pass.
      */
-    t2 = hype_rdtsc();
+    t2 = fb_tsc_begin();
     for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) g_fbprobe_scratch[i] = ram[i];
-    t3 = hype_rdtsc();
+    t3 = fb_tsc_end();
 
     /*
      * The same byte count again, but written the way hype_gop_flush ACTUALLY writes it: a narrow
@@ -7452,12 +7478,12 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      */
     scatter_runs = (unsigned int)PROBE_DWORDS / SCATTER_RUN;
     if (scatter_runs > g_gop_console.height) scatter_runs = g_gop_console.height;
-    t4 = hype_rdtsc();
+    t4 = fb_tsc_begin();
     for (r = 0; r < scatter_runs; r++) {
         unsigned int base = r * g_gop_console.stride;
         for (i = 0; i < SCATTER_RUN; i++) fb[base + i] = ram[base + i];
     }
-    t5 = hype_rdtsc();
+    t5 = fb_tsc_end();
 
     /* ns for the whole 256 KB, computed before dividing so a fast probe does not floor to 0.
      * Reported per 1000 dwords for the same reason: 62us/65536 floored to "0 ns/dword". */
@@ -7490,7 +7516,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     hype_perf_read_amperf(&aperf0, &mperf0);
     __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
     __asm__ volatile("cli");
-    t6 = hype_rdtsc();
+    t6 = fb_tsc_begin();
     {
         /*
          * Timed in CHUNKS, because "1.55us per store" and "the core stopped dead for 90ms" are
@@ -7513,7 +7539,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
             uint64_t cs;
             unsigned int base = c * (PROBE_DWORDS / PROBE_CHUNKS);
             for (i = 0; i < (PROBE_DWORDS / PROBE_CHUNKS); i++) fb[base + i] = ram[base + i];
-            cs = hype_rdtsc();
+            cs = fb_tsc_end();
             {
                 /* Sampled INSIDE the stall, not after it. The cumulative USB counters show heavy
                  * contention across any whole run, so they cannot say whether anything was
@@ -7530,7 +7556,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
             prev = cs;
         }
     }
-    t7 = hype_rdtsc();
+    t7 = fb_tsc_end();
     if (rflags & (1ull << 9)) __asm__ volatile("sti");
     hype_perf_read_amperf(&aperf1, &mperf1);
     hype_blk_usb_xfer_stats(0, &usbcalls_after, 0, &atapi_after, 0);
@@ -9667,7 +9693,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         fw_1_publish_and_render(vm, &last_gop_flush_tsc,
                                     perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt);
             {
-                uint64_t t0 = hype_rdtsc();
+                uint64_t t0 = fb_tsc_begin();
                 while (g_fw_1_host_tsc_hz != 0 && hype_rdtsc() - t0 < g_fw_1_host_tsc_hz / 1000u) {
                     /* ~1ms */
                 }
@@ -11667,6 +11693,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      (unsigned long long)info.guest_rip);
                 }
             }
+            continue;
+        }
+        if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_WBINVD) {
+            /* #368: retire it without flushing any real cache. See the handler's comment. */
+            hype_vmx_vcpu_handle_wbinvd();
             continue;
         }
         if (vmm_reason_is_cpuid(kind, info.reason)) {
@@ -15815,7 +15846,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * to its real signature: EFI_STATUS (EFIAPI *)(UINTN us). */
             EFI_STATUS(EFIAPI * stall_fn)(UINTN) =
                 (EFI_STATUS(EFIAPI *)(UINTN))SystemTable->BootServices->Stall;
-            uint64_t t0 = hype_rdtsc();
+            uint64_t t0 = fb_tsc_begin();
             stall_fn(20000);
             g_fw_1_host_tsc_hz = (hype_rdtsc() - t0) * 50ULL; /* *(1e6/20000) */
             /* #265: from here on the write stats can stamp their first write. */
@@ -17377,6 +17408,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                      ? 0ull
                                                      : (hits * 100ull) / (hits + misses));
                             }
+                        }
+                        if (g_fw_1_kind == HYPE_VMM_KIND_VMX) {
+                            unsigned long long wb = 0;
+                            uint64_t wbrip = 0;
+                            hype_vmx_wbinvd_stats(&wb, &wbrip);
+                            hype_debug_print("fw-1 WBINVD: guest exits=%llu last_rip=0x%llx "
+                                             "(intercepted, no host cache flush) [#368]\n",
+                                             wb, (unsigned long long)wbrip);
                         }
                         hype_debug_print("fw-1 FBPROBE: entries=%llu ran=%llu skip_null=%llu "
                                              "skip_rate=%llu [#368]\n",

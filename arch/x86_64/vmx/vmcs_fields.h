@@ -132,6 +132,22 @@
  * also why #274's isolation does not actually depend on this ticket.
  */
 #define HYPE_VMX_PROCBASED2_ENABLE_VPID (1u << 5)
+
+/*
+ * "WBINVD exiting" (secondary control, bit 6) -- SDM Vol. 3C, Table 27-7: WBINVD and WBNOINVD
+ * cause a VM exit only when this control is set.
+ *
+ * Without it a guest's WBINVD executes on real hardware and flushes the caches of the whole
+ * machine -- hype's own, and every other VM's. That breaks the isolation rule outright: a guest
+ * must not be able to degrade another. hype made it worse by advertising WBINVD as coherent in
+ * the FADT (devices/acpi.c), which is an invitation for guests to use it.
+ *
+ * Suspected in #368, where a guest on the BSP's SMT sibling cost the other thread ~400x on
+ * cached stores -- far more than ordinary SMT contention should. Repeated cache maintenance from
+ * a sibling explains that magnitude where cache pressure alone does not. NOT established as a
+ * machine-wide effect on unrelated cores; the evidence supports a shared-core mechanism only.
+ */
+#define HYPE_VMX_PROCBASED2_WBINVD_EXITING (1u << 6)
 /* APIC-register virtualization / virtual-interrupt delivery (M2-4):
  * both operate on the virtual-APIC page directly, not through EPT, so
  * (unlike "virtualize APIC accesses", intentionally not used here)
@@ -389,6 +405,11 @@
 #define HYPE_VMX_EXIT_REASON_INTERRUPT_WINDOW 7u
 #define HYPE_VMX_EXIT_REASON_CPUID 10u
 #define HYPE_VMX_EXIT_REASON_HLT 12u
+#define HYPE_VMX_EXIT_REASON_WBINVD 54u
+
+/* Retires an intercepted guest WBINVD without flushing any real cache, and counts it. */
+void hype_vmx_vcpu_handle_wbinvd(void);
+void hype_vmx_wbinvd_stats(unsigned long long *count, uint64_t *last_rip);
 #define HYPE_VMX_EXIT_REASON_RDMSR 31u
 #define HYPE_VMX_EXIT_REASON_WRMSR 32u
 #define HYPE_VMX_EXIT_REASON_IO_INSTRUCTION 30u
