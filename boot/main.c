@@ -7319,6 +7319,7 @@ static void fw_1_host_input_poll(void) {
  *
  * Writes black and then invalidates the render caches, so the band repaints on this same pass.
  */
+static unsigned int g_fbprobe_scratch[65536];
 static unsigned long long g_fbprobe_entries, g_fbprobe_ran, g_fbprobe_skip_null,
     g_fbprobe_skip_rate;
 
@@ -7335,10 +7336,13 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     uint64_t now = hype_rdtsc();
     uint64_t t0, t1, t2, t3, t4, t5, t6, t7, ns, ns_ram, ns_scat, ns_cli, smi_now = 0;
     uint64_t rflags = 0, ticks_before = 0, ticks_after = 0;
-    unsigned int i, r, scatter_runs, scatter_dwords;
+    uint64_t chunk_max = 0, chunk_min = 0;
+    unsigned int chunks_slow = 0;
+    unsigned int i, r, scatter_runs;
     /* 64 dwords = 256 bytes: the order of a few changed character cells, which is what the
      * per-band path actually pushes. */
     enum { SCATTER_RUN = 64u };
+    enum { PROBE_CHUNKS = 64u }; /* 4 KB per chunk */
 
     /*
      * Last run this probe printed 4 samples and then stopped, while the log ran on for another
@@ -7393,7 +7397,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
 
     ticks_before = hype_timer_get_ticks();
     t0 = hype_rdtsc();
-    for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) fb[i] = 0u;
+    for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) fb[i] = ram[i];
     t1 = hype_rdtsc();
     ticks_after = hype_timer_get_ticks();
 
@@ -7408,7 +7412,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      * caches are invalidated below, so both buffers repaint on this pass.
      */
     t2 = hype_rdtsc();
-    for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) ram[i] = 0u;
+    for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) g_fbprobe_scratch[i] = ram[i];
     t3 = hype_rdtsc();
 
     /*
@@ -7427,11 +7431,10 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      */
     scatter_runs = (unsigned int)PROBE_DWORDS / SCATTER_RUN;
     if (scatter_runs > g_gop_console.height) scatter_runs = g_gop_console.height;
-    scatter_dwords = scatter_runs * SCATTER_RUN;
     t4 = hype_rdtsc();
     for (r = 0; r < scatter_runs; r++) {
         unsigned int base = r * g_gop_console.stride;
-        for (i = 0; i < SCATTER_RUN; i++) fb[base + i] = 0u;
+        for (i = 0; i < SCATTER_RUN; i++) fb[base + i] = ram[base + i];
     }
     t5 = hype_rdtsc();
 
@@ -7462,38 +7465,54 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
     __asm__ volatile("cli");
     t6 = hype_rdtsc();
-    for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) fb[i] = 0u;
+    {
+        /*
+         * Timed in CHUNKS, because "1.55us per store" and "the core stopped dead for 90ms" are
+         * the same average and completely different faults.
+         *
+         * Uniformly slow chunks mean every access really is slow: bus or coherency contention
+         * from the guest cores, which is hype's problem to fix. One huge chunk among fast ones
+         * means the core was stopped -- and with interrupts masked, no SMIs counted and no timer
+         * ticks to blame, that points at the platform (power/thermal/firmware), which is not
+         * something hype can fix and would end this investigation with a different answer.
+         *
+         * Nothing measured so far can tell those apart, and I would otherwise have to guess.
+         */
+        unsigned int c;
+        uint64_t prev = t6;
+        chunk_max = 0;
+        chunk_min = ~0ull;
+        chunks_slow = 0;
+        for (c = 0; c < PROBE_CHUNKS; c++) {
+            uint64_t cs;
+            unsigned int base = c * (PROBE_DWORDS / PROBE_CHUNKS);
+            for (i = 0; i < (PROBE_DWORDS / PROBE_CHUNKS); i++) fb[base + i] = ram[base + i];
+            cs = hype_rdtsc();
+            if (cs - prev > chunk_max) chunk_max = cs - prev;
+            if (cs - prev < chunk_min) chunk_min = cs - prev;
+            /* "slow" = over 1ms, which a healthy chunk beats by three orders of magnitude. */
+            if (((cs - prev) * 1000ull) / tsc_hz > 1000ull) chunks_slow++;
+            prev = cs;
+        }
+    }
     t7 = hype_rdtsc();
     if (rflags & (1ull << 9)) __asm__ volatile("sti");
     ns_cli = ((t7 - t6) * 1000000000ull) / tsc_hz;
-    hype_debug_print("fw-1 FBSPEED: fb %u KB in %lluus = %llu MB/s (%llu ns/1k dwords) | "
-                      "ram same size in %lluus = %llu MB/s | smi=%llu (+%llu) [#368]\n",
-                      (unsigned int)(PROBE_DWORDS * 4u / 1024u), (unsigned long long)(ns / 1000ull),
-                      (ns == 0ull) ? 0ull : ((uint64_t)PROBE_DWORDS * 4ull * 1000ull) / ns,
-                      (ns * 1000ull) / (uint64_t)PROBE_DWORDS,
-                      (unsigned long long)(ns_ram / 1000ull),
-                      (ns_ram == 0ull) ? 0ull : ((uint64_t)PROBE_DWORDS * 4ull * 1000ull) / ns_ram,
-                      (unsigned long long)smi_now, (unsigned long long)(smi_now - last_smi));
-    hype_debug_print("fw-1 FBSCATTER: fb %u KB as %u runs of %u dwords (stride %u) in %lluus "
-                      "= %llu MB/s [#368]\n",
-                      scatter_dwords * 4u / 1024u, scatter_runs, (unsigned int)SCATTER_RUN,
-                      g_gop_console.stride, (unsigned long long)(ns_scat / 1000ull),
-                      (ns_scat == 0ull) ? 0ull
-                                        : ((uint64_t)scatter_dwords * 4ull * 1000ull) / ns_scat);
-    hype_debug_print("fw-1 FBIRQ: fb loop again with interrupts MASKED: %lluus = %llu MB/s | "
-                      "timer ticks during the unmasked loop: %llu [#368]\n",
+    /* ONE line. Each hype_debug_print also tees to the GOP screen, and four of them every five
+     * seconds is a visible block of diagnostics painted over the dashboard -- reported by the
+     * operator, and self-inflicted by this probe. */
+    hype_debug_print("fw-1 FBSPEED: fb=%lluus ram=%lluus scat=%lluus cli=%lluus | "
+                      "chunk min=%lluus max=%lluus slow=%u/%u | ticks=%llu smi=+%llu [#368]\n",
+                      (unsigned long long)(ns / 1000ull), (unsigned long long)(ns_ram / 1000ull),
+                      (unsigned long long)(ns_scat / 1000ull),
                       (unsigned long long)(ns_cli / 1000ull),
-                      (ns_cli == 0ull) ? 0ull : ((uint64_t)PROBE_DWORDS * 4ull * 1000ull) / ns_cli,
-                      (unsigned long long)(ticks_after - ticks_before));
+                      (unsigned long long)((chunk_min * 1000000ull) / tsc_hz),
+                      (unsigned long long)((chunk_max * 1000000ull) / tsc_hz), chunks_slow,
+                      (unsigned int)PROBE_CHUNKS,
+                      (unsigned long long)(ticks_after - ticks_before),
+                      (unsigned long long)(smi_now - last_smi));
     last_smi = smi_now;
 
-    {
-        unsigned vi;
-        hype_vt_render_cache_invalidate(&g_dash_render_cache);
-        for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
-            hype_vt_render_cache_invalidate(&g_view_render_cache[vi]);
-        }
-    }
 }
 
 static void fw_1_render_console(void) {
