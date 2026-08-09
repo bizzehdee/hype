@@ -7326,17 +7326,31 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      * is a brief band rather than the whole screen. */
     enum { PROBE_DWORDS = 65536u };
     volatile unsigned int *fb = (volatile unsigned int *)hype_fatal_get_real_fb();
+    volatile unsigned int *ram = (volatile unsigned int *)g_gop_console.fb;
+    static uint64_t last_smi = 0;
+    static int smi_readable = -1; /* -1 = not yet decided */
     uint64_t now = hype_rdtsc();
-    uint64_t t0, t1, ns;
+    uint64_t t0, t1, t2, t3, ns, ns_ram, smi_now = 0;
     unsigned int i;
 
-    if (fb == 0 || tsc_hz == 0) return;
+    if (fb == 0 || ram == 0 || tsc_hz == 0) return;
     /* Never write past the end of the framebuffer. */
     if ((uint64_t)g_gop_console.stride * (uint64_t)g_gop_console.height < (uint64_t)PROBE_DWORDS) {
         return;
     }
     if (last_probe_tsc != 0 && now - last_probe_tsc < tsc_hz * 5u) return;
     last_probe_tsc = now;
+
+    /*
+     * MSR_SMI_COUNT (0x34) is Intel-only and reading it elsewhere is a #GP -- which after
+     * ExitBootServices is a triple fault, not a diagnostic. Gate on the vendor, do not probe.
+     * An SMI storm is one of the few things that can steal 100ms from a straight store loop
+     * without any architectural state changing, so it is worth ruling in or out directly.
+     */
+    if (smi_readable < 0) {
+        smi_readable = (hype_cpu_detect_vmm_kind_diag().vendor == HYPE_CPU_VENDOR_INTEL) ? 1 : 0;
+    }
+    if (smi_readable) smi_now = hype_smi_count_unchecked();
 
     if (!reported_static) {
         hype_mtrr_var_t var[HYPE_MTRR_MAX_VAR];
@@ -7358,12 +7372,33 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) fb[i] = 0u;
     t1 = hype_rdtsc();
 
-    /* ns for the whole 256 KB, computed before dividing so a fast probe does not floor to 0. */
+    /*
+     * The SAME loop over ordinary RAM. This is the discriminator the last run needed and did not
+     * have: the framebuffer write went from 57us to 106336us with PA1 still WC and the MTRRs
+     * untouched, so the memory TYPE cannot be the cause -- nothing about it changed. Either the
+     * BSP itself is being starved (and RAM will be slow too), or it is specific to the path out
+     * to the framebuffer (and RAM will stay fast). One number separates those.
+     *
+     * g_gop_console.fb is the shadow buffer in normal WB RAM. Writing it is safe: the render
+     * caches are invalidated below, so both buffers repaint on this pass.
+     */
+    t2 = hype_rdtsc();
+    for (i = 0; i < (unsigned int)PROBE_DWORDS; i++) ram[i] = 0u;
+    t3 = hype_rdtsc();
+
+    /* ns for the whole 256 KB, computed before dividing so a fast probe does not floor to 0.
+     * Reported per 1000 dwords for the same reason: 62us/65536 floored to "0 ns/dword". */
     ns = ((t1 - t0) * 1000000000ull) / tsc_hz;
-    hype_debug_print("fw-1 FBSPEED: %u KB in %lluus = %llu MB/s (%llu ns/dword) [#368]\n",
+    ns_ram = ((t3 - t2) * 1000000000ull) / tsc_hz;
+    hype_debug_print("fw-1 FBSPEED: fb %u KB in %lluus = %llu MB/s (%llu ns/1k dwords) | "
+                      "ram same size in %lluus = %llu MB/s | smi=%llu (+%llu) [#368]\n",
                       (unsigned int)(PROBE_DWORDS * 4u / 1024u), (unsigned long long)(ns / 1000ull),
                       (ns == 0ull) ? 0ull : ((uint64_t)PROBE_DWORDS * 4ull * 1000ull) / ns,
-                      ns / (uint64_t)PROBE_DWORDS);
+                      (ns * 1000ull) / (uint64_t)PROBE_DWORDS,
+                      (unsigned long long)(ns_ram / 1000ull),
+                      (ns_ram == 0ull) ? 0ull : ((uint64_t)PROBE_DWORDS * 4ull * 1000ull) / ns_ram,
+                      (unsigned long long)smi_now, (unsigned long long)(smi_now - last_smi));
+    last_smi = smi_now;
 
     {
         unsigned vi;

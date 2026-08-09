@@ -38,3 +38,10 @@ unsigned int hype_mtrr_read_var(hype_mtrr_var_t *out, unsigned int max) {
     }
     return vcnt;
 }
+
+/*
+ * MSR_SMI_COUNT. Intel-only: reading it on another vendor is a #GP, which after
+ * ExitBootServices is a triple fault rather than a diagnostic, so the CALLER must check the
+ * vendor first -- this function cannot, and deliberately does not try.
+ */
+uint64_t hype_smi_count_unchecked(void) { return rdmsr(0x34u); }

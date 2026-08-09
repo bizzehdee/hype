@@ -79,4 +79,14 @@ uint64_t hype_mtrr_read_pat(void);
 uint64_t hype_mtrr_read_def_type(void);
 unsigned int hype_mtrr_read_var(hype_mtrr_var_t *out, unsigned int max);
 
+/*
+ * MSR_SMI_COUNT: how many System Management Interrupts this core has taken. An SMI storm is one
+ * of the few things that can steal 100 ms from a straight store loop while every architectural
+ * state stays identical, so it is worth ruling in or out directly rather than by elimination.
+ *
+ * INTEL ONLY. Reading this MSR on another vendor is a #GP, and after ExitBootServices that is a
+ * triple fault, not a diagnostic. The caller must check the vendor -- hence "unchecked".
+ */
+uint64_t hype_smi_count_unchecked(void);
+
 #endif /* HYPE_CORE_MTRR_H */
