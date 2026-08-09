@@ -1143,8 +1143,22 @@ static volatile unsigned long long g_bsp_ticks;
 static volatile unsigned int g_bsp_phase;
 
 static unsigned long long g_mmio_fetch_tsc, g_mmio_fetch_calls;
-/* #367: cost of emulating an AHCI register access, separate from the global exit mean. */
-static unsigned long long g_ahci_npf_tsc, g_ahci_npf_calls;
+/*
+ * #367: cost of emulating an AHCI register access -- SPLIT by whether the access actually issued
+ * a command.
+ *
+ * A single mean over all of them is worthless here, and I have now been caught by that three
+ * times on this symptom. Most accesses are status-register polls that touch nothing; roughly one
+ * in 87 is the PxCI write that starts a real disc read costing MILLISECONDS of USB. Averaging the
+ * two produced "27 us per access", which then implied 18 s of a 90 s run -- when the arithmetic
+ * says ~132 commands at 2 ms each already account for 82% of the measured window, leaving the
+ * ~11,400 polls at a few microseconds between them.
+ *
+ * `poll` = the access completed without issuing a command. `cmd` = it issued one, so its cost is
+ * disc I/O, which is unavoidable work and not what this ticket proposed to remove.
+ */
+static unsigned long long g_ahci_poll_tsc, g_ahci_poll_calls;
+static unsigned long long g_ahci_cmd_tsc, g_ahci_cmd_calls;
 
 /* #363: host keyboard -> focused-guest routing state. A file-global because the BSP now owns
  * polling (fw_1_host_input_poll); it used to be a local in the guest dispatch loop, which is
@@ -9615,17 +9629,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     unsigned long long reads = (unsigned long long)g_fw_1_atapi.read10_count;
                     if (g_mmio_fetch_calls != 0 && g_vms[0].host_tsc_hz != 0) {
                         hype_debug_print(
-                            "fw-1 MMIOCOST: insn_fetch calls=%llu total=%llums us_each=%llu | "
-                            "ahci_emul calls=%llu total=%llums us_each=%llu [#367]\n",
-                            g_mmio_fetch_calls,
-                            (g_mmio_fetch_tsc * 1000ull) / g_vms[0].host_tsc_hz,
-                            (g_mmio_fetch_tsc * 1000000ull) / g_vms[0].host_tsc_hz /
+                            "fw-1 MMIOCOST: insn_fetch=%lluns | ahci POLL calls=%llu "
+                            "total=%llums us_each=%llu | ahci CMD calls=%llu total=%llums "
+                            "us_each=%llu [#367]\n",
+                            (g_mmio_fetch_tsc * 1000000000ull) / g_vms[0].host_tsc_hz /
                                 g_mmio_fetch_calls,
-                            g_ahci_npf_calls,
-                            (g_ahci_npf_tsc * 1000ull) / g_vms[0].host_tsc_hz,
-                            (g_ahci_npf_calls != 0)
-                                ? (g_ahci_npf_tsc * 1000000ull) / g_vms[0].host_tsc_hz /
-                                      g_ahci_npf_calls
+                            g_ahci_poll_calls,
+                            (g_ahci_poll_tsc * 1000ull) / g_vms[0].host_tsc_hz,
+                            (g_ahci_poll_calls != 0)
+                                ? (g_ahci_poll_tsc * 1000000ull) / g_vms[0].host_tsc_hz /
+                                      g_ahci_poll_calls
+                                : 0ull,
+                            g_ahci_cmd_calls,
+                            (g_ahci_cmd_tsc * 1000ull) / g_vms[0].host_tsc_hz,
+                            (g_ahci_cmd_calls != 0)
+                                ? (g_ahci_cmd_tsc * 1000000ull) / g_vms[0].host_tsc_hz /
+                                      g_ahci_cmd_calls
                                 : 0ull);
                     }
                     hype_debug_print(
@@ -11545,6 +11564,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * for a read-only shadow page is worth its risk.
                      */
                     uint64_t t_ahci = hype_rdtsc();
+                    uint32_t cmds_before = g_fw_1_atapi.command_count;
                     if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
                                                            &g_fw_1_dma_map, insn) == 0) {
                         ex_ahci_npf++; /* exit-histogram sub-bucket */
@@ -11626,8 +11646,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          * calls=0 for a whole run while ahci_npf reported 670,578, which is what
                          * exposed it. A counter that cannot increment reads exactly like an event
                          * that never happens. */
-                        g_ahci_npf_tsc += hype_rdtsc() - t_ahci;
-                        g_ahci_npf_calls++;
+                        {
+                            /* Attribute by whether a command was issued: the ATAPI model's own
+                             * command counter moving is the discriminator, and it is exact rather
+                             * than inferred from which register was touched. */
+                            uint64_t dt = hype_rdtsc() - t_ahci;
+                            if (g_fw_1_atapi.command_count != cmds_before) {
+                                g_ahci_cmd_tsc += dt;
+                                g_ahci_cmd_calls++;
+                            } else {
+                                g_ahci_poll_tsc += dt;
+                                g_ahci_poll_calls++;
+                            }
+                        }
                         continue;
                     }
                     /* Same evidence the generic undecodable-NPF fatal prints, for the
