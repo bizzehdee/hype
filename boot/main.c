@@ -7173,13 +7173,35 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
 static void fw_1_host_input_poll(void) {
     uint8_t sc;
     /*
-     * #363: pull USB HID keyboard reports here, on the BSP.
+     * #363: pull USB HID keyboard reports here, on the BSP -- RATE-LIMITED.
      *
-     * This is the input path that actually works on the operator's hardware -- a full run
-     * measured isr_entries=0 for the PS/2 ISR, so nothing arrives that way. It also belongs on
-     * the BSP under #239: only the BSP may drive the USB host controller.
+     * This is the input path that actually works on the operator's hardware (a full run measured
+     * isr_entries=0 for the PS/2 ISR). It belongs on the BSP because a wedged guest must not take
+     * the keyboard with it -- NOT because of #239, whose BSP-only rule covers the log path alone
+     * (usb_log_this_core_owns_usb() is called from usb_log_flush and nowhere else). Guest media
+     * reads have always driven the host xHCI from their own AP cores, which is exactly why
+     * g_usb_xfer_lock exists. An earlier commit message of mine claimed otherwise and was wrong.
+     *
+     * The rate limit is not a nicety. The BSP loop is a tight `pause` spin, so calling this every
+     * iteration issued a USB transfer every iteration -- and a USB bulk transfer costs ~551 us of
+     * bus scheduling (#365), on the SAME controller the guests stream their ISOs from. That
+     * starved the log flush (four status lines in an entire run instead of one every five
+     * seconds) and contended with guest media reads. Measured, not guessed: the symptom appeared
+     * the moment this call moved here.
+     *
+     * 125 Hz is far above human key repeat and costs ~7% of one core's USB budget.
      */
-    (void)usb_hid_drain();
+    {
+        static uint64_t hid_last = 0;
+        uint64_t hz = g_vms[0].host_tsc_hz;
+        if (hz != 0) {
+            uint64_t now_h = hype_rdtsc();
+            if (hid_last == 0 || now_h - hid_last >= hz / 125u) {
+                hid_last = now_h;
+                (void)usb_hid_drain();
+            }
+        }
+    }
     while (hype_host_kbd_poll_scancode(&sc)) {
         uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
         unsigned kn = 0;
