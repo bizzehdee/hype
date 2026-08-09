@@ -7319,6 +7319,7 @@ static void fw_1_host_input_poll(void) {
  *
  * Writes black and then invalidates the render caches, so the band repaints on this same pass.
  */
+static uint64_t g_fbprobe_first_tsc;
 static unsigned int g_fbprobe_scratch[65536];
 static unsigned long long g_fbprobe_entries, g_fbprobe_ran, g_fbprobe_skip_null,
     g_fbprobe_skip_rate;
@@ -7362,7 +7363,8 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
         return;
     }
     if (g_gop_console.stride < (unsigned int)SCATTER_RUN || g_gop_console.height == 0u) return;
-    if (last_probe_tsc != 0 && now - last_probe_tsc < tsc_hz * 5u) {
+    if (g_fbprobe_first_tsc == 0) g_fbprobe_first_tsc = now;
+    if (last_probe_tsc != 0 && now - last_probe_tsc < tsc_hz) {
         g_fbprobe_skip_rate++;
         return;
     }
@@ -7516,8 +7518,9 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     /* ONE line. Each hype_debug_print also tees to the GOP screen, and four of them every five
      * seconds is a visible block of diagnostics painted over the dashboard -- reported by the
      * operator, and self-inflicted by this probe. */
-    hype_debug_print("fw-1 FBSPEED: fb=%lluus ram=%lluus scat=%lluus cli=%lluus | "
+    hype_debug_print("fw-1 FBSPEED: t=%llums fb=%lluus ram=%lluus scat=%lluus cli=%lluus | "
                       "chunk min=%lluus max=%lluus slow=%u/%u | ticks=%llu smi=+%llu [#368]\n",
+                      (unsigned long long)(((now - g_fbprobe_first_tsc) * 1000ull) / tsc_hz),
                       (unsigned long long)(ns / 1000ull), (unsigned long long)(ns_ram / 1000ull),
                       (unsigned long long)(ns_scat / 1000ull),
                       (unsigned long long)(ns_cli / 1000ull),
