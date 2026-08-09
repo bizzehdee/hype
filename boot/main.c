@@ -1160,6 +1160,22 @@ static unsigned long long g_mmio_fetch_tsc, g_mmio_fetch_calls;
 static unsigned long long g_ahci_poll_tsc, g_ahci_poll_calls;
 static unsigned long long g_ahci_cmd_tsc, g_ahci_cmd_calls;
 
+/*
+ * #364: WHICH register is the firmware polling, and what is hype returning?
+ *
+ * FreeBSD never enters its kernel on Intel. The hot RIPs resolve to OVMF's CpuIo2Dxe and Metronome
+ * -- a Stall() loop polling a register through the CPU I/O protocol -- so the firmware is waiting
+ * for a state it never sees. hype never raises an AHCI interrupt (measured: cd=0/0 ata=0/0,
+ * because the guest never sets GHC.IE), so polling is the only way it can learn anything, and
+ * whether the state it wants is reachable is a question about hype's register model.
+ *
+ * A histogram over the ABAR window names the register. The global block is 0x00-0xFF and port 0
+ * is 0x100-0x17F, so 0x180 bytes covers everything hype models; indexed by dword.
+ */
+#define HYPE_AHCI_HIST_DWORDS (0x180u / 4u)
+static unsigned long long g_ahci_reg_hist[HYPE_AHCI_HIST_DWORDS];
+static unsigned long long g_ahci_reg_other;
+
 /* #363: host keyboard -> focused-guest routing state. A file-global because the BSP now owns
  * polling (fw_1_host_input_poll); it used to be a local in the guest dispatch loop, which is
  * precisely why a wedged guest took the keyboard with it. */
@@ -9647,6 +9663,44 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                       g_ahci_cmd_calls
                                 : 0ull);
                     }
+                    {
+                        /*
+                         * #364: the top registers the guest is touching, with the value hype
+                         * currently returns for each. The value is the point: if the firmware is
+                         * spinning on PxTFD waiting for BSY to clear, or on PxCI waiting for a
+                         * slot to retire, the value shows whether the state it wants is even
+                         * reachable.
+                         */
+                        unsigned hi, top[4] = {0, 0, 0, 0};
+                        unsigned n;
+                        for (n = 0; n < 4u; n++) {
+                            unsigned long long best = 0;
+                            unsigned besti = 0xFFFFu;
+                            for (hi = 0; hi < HYPE_AHCI_HIST_DWORDS; hi++) {
+                                unsigned already = 0, k;
+                                for (k = 0; k < n; k++) {
+                                    if (top[k] == hi) already = 1;
+                                }
+                                if (!already && g_ahci_reg_hist[hi] > best) {
+                                    best = g_ahci_reg_hist[hi];
+                                    besti = hi;
+                                }
+                            }
+                            top[n] = (besti == 0xFFFFu) ? 0u : besti;
+                        }
+                        hype_debug_print(
+                            "fw-1 AHCIREG: top +0x%02x=%llu +0x%02x=%llu +0x%02x=%llu "
+                            "+0x%02x=%llu other=%llu | GHC=0x%08x IS=0x%08x PxIS=0x%08x "
+                            "PxIE=0x%08x PxCMD=0x%08x PxTFD=0x%08x PxCI=0x%08x PxSSTS=0x%08x "
+                            "[#364]\n",
+                            top[0] * 4u, g_ahci_reg_hist[top[0]], top[1] * 4u,
+                            g_ahci_reg_hist[top[1]], top[2] * 4u, g_ahci_reg_hist[top[2]],
+                            top[3] * 4u, g_ahci_reg_hist[top[3]], g_ahci_reg_other,
+                            (unsigned)g_fw_1_ahci.ghc, (unsigned)g_fw_1_ahci.is,
+                            (unsigned)g_fw_1_ahci.p_is, (unsigned)g_fw_1_ahci.p_ie,
+                            (unsigned)g_fw_1_ahci.p_cmd, (unsigned)g_fw_1_ahci.p_tfd,
+                            (unsigned)g_fw_1_ahci.p_ci, (unsigned)g_fw_1_ahci.p_ssts);
+                    }
                     hype_debug_print(
                         "fw-1 AHCIIRQ: cd=%llu/%llu ata=%llu/%llu (delivered/pending) | "
                         "ahci_npf=%llu reads=%llu mmio_per_read=%llu [#365]\n",
@@ -11565,6 +11619,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      */
                     uint64_t t_ahci = hype_rdtsc();
                     uint32_t cmds_before = g_fw_1_atapi.command_count;
+                    {
+                        /* #364: record the register offset before the handler runs, so the
+                         * histogram reflects what the guest asked for even if the handler
+                         * declines it. */
+                        uint64_t off = ahci_npf.guest_phys_addr - ahci_abar;
+                        if (off < 0x180u) {
+                            g_ahci_reg_hist[off / 4u]++;
+                        } else {
+                            g_ahci_reg_other++;
+                        }
+                    }
                     if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
                                                            &g_fw_1_dma_map, insn) == 0) {
                         ex_ahci_npf++; /* exit-histogram sub-bucket */
