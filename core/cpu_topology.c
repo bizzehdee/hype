@@ -93,3 +93,40 @@ void hype_cpu_topology_core_summary(const hype_cpu_topology_t *t, unsigned int *
     if (cores != 0) *cores = ncores;
     if (smt_cores != 0) *smt_cores = nsmt;
 }
+
+int hype_cpu_topology_select_isolated(const hype_cpu_topology_t *t, unsigned int want,
+                                      uint32_t *out_apic, unsigned int out_max) {
+    unsigned int taken_pkg[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned int taken_core[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned int taken = 0, chosen = 0;
+    unsigned int i;
+
+    if (t == 0 || out_apic == 0 || want == 0u || out_max == 0u) return 0;
+    if (want > out_max) want = out_max;
+
+    /* The BSP's own physical core is claimed before anything else, so no vCPU can land on its
+     * SMT sibling. That is the case this exists to prevent. */
+    if (t->have_bsp && t->bsp_index < t->count) {
+        taken_pkg[taken] = t->loc[t->bsp_index].package;
+        taken_core[taken] = t->loc[t->bsp_index].core;
+        taken++;
+    }
+
+    for (i = 0; i < t->count && chosen < want; i++) {
+        unsigned int j;
+        int clash = 0;
+        if (t->have_bsp && i == t->bsp_index) continue;
+        for (j = 0; j < taken; j++) {
+            if (taken_pkg[j] == t->loc[i].package && taken_core[j] == t->loc[i].core) {
+                clash = 1;
+                break;
+            }
+        }
+        if (clash) continue;
+        taken_pkg[taken] = t->loc[i].package;
+        taken_core[taken] = t->loc[i].core;
+        taken++;
+        out_apic[chosen++] = t->apic_id[i];
+    }
+    return (int)chosen;
+}

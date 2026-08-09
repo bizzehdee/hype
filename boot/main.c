@@ -1414,7 +1414,9 @@ static int g_ap_slot_valid[HYPE_FW_MAX_VMS];
  * out of scope here and is reported rather than silently mis-addressed.
  */
 static int fw_1_ap_apic_id(unsigned int n) {
-    int64_t id;
+    uint32_t sel[HYPE_FW_MAX_VMS];
+    int nsel;
+
     if (g_cpu_topo.count == 0u) {
         /* Enumeration produced nothing (no EFI_MP_SERVICES_PROTOCOL). Keep the
          * pre-#360 literal so a machine that worked before still works: this
@@ -1422,24 +1424,39 @@ static int fw_1_ap_apic_id(unsigned int n) {
          * not break machines where it is not. */
         return (int)(n + 1u);
     }
-    id = hype_cpu_topology_ap(&g_cpu_topo, n);
-    if (id < 0) {
-        /* Enumeration WORKED and says there is no such core. Falling back to a
-         * literal here would re-create the exact bug this fixes -- addressing an
-         * AP that does not exist -- so refuse, and let the caller say so. */
+
+    /*
+     * Isolated placement, NOT enumeration order.
+     *
+     * hype's rule is that the BSP shares no part of its core with any AP, and no VM shares with
+     * another. Enumeration order does not honour that: on the Intel i5-13420H the first enumerated
+     * AP is APIC 1, which is p0/c0/t1 -- the SMT SIBLING of the BSP at p0/c0/t0. That put a guest
+     * vCPU on the same physical core as the thread that renders the console and polls input,
+     * sharing L1, L2 and the execution pipeline.
+     *
+     * It survived because the AMD laptop enumerates one thread per core, so order happened to be
+     * correct there -- the same reason the hardcoded ap_start(1)/ap_start(2) survived until #360.
+     * Selection has to come from the topology, never from the order firmware reports.
+     */
+    nsel = hype_cpu_topology_select_isolated(&g_cpu_topo, HYPE_FW_MAX_VMS, sel, HYPE_FW_MAX_VMS);
+    if (n >= (unsigned int)nsel) {
+        /* Either enumeration says there is no such core, or there are not enough distinct
+         * physical cores to place this vCPU without doubling up. Refuse and let the caller say
+         * so: falling back to a literal would re-create #360, and doubling up would re-create
+         * the isolation break this function exists to prevent. */
         return -1;
     }
-    if (id > 255) {
+    if (sel[n] > 255u) {
         /* hype_ap_start() sends INIT/SIPI through the xAPIC ICR, whose
          * destination field is 8 bits. An ID above 255 means the machine is in
          * x2APIC mode and needs the x2APIC ICR MSR instead -- out of scope here,
          * and reported rather than silently mis-addressed. */
         hype_debug_print("fw-1 #360: AP slot %u has APIC ID %llu, above the 8-bit xAPIC ICR "
                          "destination field -- cannot start this core via the xAPIC path\n",
-                         n, (unsigned long long)id);
+                         n, (unsigned long long)sel[n]);
         return -1;
     }
-    return (int)id;
+    return (int)sel[n];
 }
 
 /* Which AP slot this APIC ID belongs to, or -1. Replaces using the ID as an
@@ -17147,7 +17164,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * keyboard right now. */
             fw_1_await_phys_confirm_on_bsp();
             usb_log_latch_bsp_core();
-            /* #360: the FIRST enumerated AP, not the literal id 1. See fw_1_ap_apic_id(). */
+            /* #368: an ISOLATED core, not the first enumerated AP. See fw_1_ap_apic_id(). */
             int ap1_sel = fw_1_ap_apic_id(0u);
             uint8_t ap1_id = (uint8_t)((ap1_sel < 0) ? 1 : ap1_sel);
             if (ap1_sel < 0) {

@@ -223,6 +223,96 @@ static void test_core_summary_null_safety(void) {
     CHECK_INT("null add_at", -1, hype_cpu_topology_add_at(0, 1u, 0, 1, 0u, 0u, 0u));
 }
 
+
+/* The real Intel i5-13420H layout, from MP Services on the actual box:
+ * 0[p0/c0/t0](BSP) 1[p0/c0/t1] 8[p0/c4/t0] 9[p0/c4/t1] 16[p0/c8/t0] ... plus single-thread
+ * E-cores at 40,42,44,46. Enumeration order picks APIC 1 first -- the BSP's own SMT sibling. */
+static void add_intel_hybrid(hype_cpu_topology_t *t) {
+    hype_cpu_topology_reset(t);
+    (void)hype_cpu_topology_add_at(t, 0u, 1, 1, 0u, 0u, 0u);
+    (void)hype_cpu_topology_add_at(t, 1u, 0, 1, 0u, 0u, 1u);
+    (void)hype_cpu_topology_add_at(t, 8u, 0, 1, 0u, 4u, 0u);
+    (void)hype_cpu_topology_add_at(t, 9u, 0, 1, 0u, 4u, 1u);
+    (void)hype_cpu_topology_add_at(t, 16u, 0, 1, 0u, 8u, 0u);
+    (void)hype_cpu_topology_add_at(t, 17u, 0, 1, 0u, 8u, 1u);
+    (void)hype_cpu_topology_add_at(t, 40u, 0, 1, 0u, 20u, 0u);
+    (void)hype_cpu_topology_add_at(t, 42u, 0, 1, 0u, 21u, 0u);
+}
+
+static void test_selection_never_lands_on_the_bsp_sibling(void) {
+    hype_cpu_topology_t t;
+    uint32_t sel[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+    add_intel_hybrid(&t);
+    CHECK_INT("two vCPUs placed", 2, hype_cpu_topology_select_isolated(&t, 2u, sel, 2u));
+    CHECK("vm0 is NOT the BSP's SMT sibling (APIC 1)", sel[0] != 1u);
+    CHECK("vm1 is NOT the BSP's SMT sibling (APIC 1)", sel[1] != 1u);
+    CHECK("vm0 is not the BSP itself", sel[0] != 0u);
+    /* First two whole cores after the BSP's. */
+    CHECK_INT("vm0 gets the first free physical core", 8u, sel[0]);
+    CHECK_INT("vm1 gets the next free physical core", 16u, sel[1]);
+}
+
+static void test_selected_cores_are_distinct_from_each_other(void) {
+    hype_cpu_topology_t t;
+    uint32_t sel[4];
+    int n, i, j;
+    add_intel_hybrid(&t);
+    n = hype_cpu_topology_select_isolated(&t, 4u, sel, 4u);
+    CHECK_INT("four distinct cores available besides the BSP's", 4, n);
+    for (i = 0; i < n; i++) {
+        for (j = i + 1; j < n; j++) {
+            CHECK("no two vCPUs share an APIC ID", sel[i] != sel[j]);
+        }
+    }
+    /* 9 and 17 are the siblings of 8 and 16; picking either would put two VMs on one core. */
+    for (i = 0; i < n; i++) {
+        CHECK("sibling of a taken core is never selected", sel[i] != 9u && sel[i] != 17u);
+    }
+}
+
+/* A machine with only one physical core beyond the BSP's must return 1, not overcommit to 2. */
+static void test_selection_reports_short_rather_than_overcommitting(void) {
+    hype_cpu_topology_t t;
+    uint32_t sel[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+    hype_cpu_topology_reset(&t);
+    (void)hype_cpu_topology_add_at(&t, 0u, 1, 1, 0u, 0u, 0u);
+    (void)hype_cpu_topology_add_at(&t, 1u, 0, 1, 0u, 0u, 1u);
+    (void)hype_cpu_topology_add_at(&t, 2u, 0, 1, 0u, 1u, 0u);
+    (void)hype_cpu_topology_add_at(&t, 3u, 0, 1, 0u, 1u, 1u);
+    CHECK_INT("only one isolated core is available", 1,
+              hype_cpu_topology_select_isolated(&t, 2u, sel, 2u));
+    CHECK_INT("and it is the non-BSP core", 2u, sel[0]);
+    CHECK("the second slot is left untouched", sel[1] == 0xFFFFFFFFu);
+}
+
+/* The AMD laptop: consecutive IDs, no SMT recorded. Enumeration order was already correct there,
+ * which is exactly why this defect survived -- it must stay correct. */
+static void test_non_smt_layout_is_unchanged(void) {
+    hype_cpu_topology_t t;
+    uint32_t sel[2];
+    hype_cpu_topology_reset(&t);
+    (void)hype_cpu_topology_add_at(&t, 0u, 1, 1, 0u, 0u, 0u);
+    (void)hype_cpu_topology_add_at(&t, 1u, 0, 1, 0u, 1u, 0u);
+    (void)hype_cpu_topology_add_at(&t, 2u, 0, 1, 0u, 2u, 0u);
+    CHECK_INT("two placed", 2, hype_cpu_topology_select_isolated(&t, 2u, sel, 2u));
+    CHECK_INT("vm0 on APIC 1 as before", 1u, sel[0]);
+    CHECK_INT("vm1 on APIC 2 as before", 2u, sel[1]);
+}
+
+static void test_selection_degenerate_inputs(void) {
+    hype_cpu_topology_t t;
+    uint32_t sel[2];
+    add_intel_hybrid(&t);
+    CHECK_INT("null topology selects nothing", 0,
+              hype_cpu_topology_select_isolated(0, 2u, sel, 2u));
+    CHECK_INT("null output selects nothing", 0,
+              hype_cpu_topology_select_isolated(&t, 2u, 0, 2u));
+    CHECK_INT("zero wanted selects nothing", 0,
+              hype_cpu_topology_select_isolated(&t, 0u, sel, 2u));
+    CHECK_INT("want is clamped to the output buffer", 1,
+              hype_cpu_topology_select_isolated(&t, 2u, sel, 1u));
+}
+
 int main(void) {
     test_consecutive_layout_matches_the_old_assumption();
     test_sparse_layout_gives_real_ids_not_indices();
@@ -238,6 +328,11 @@ int main(void) {
     test_core_summary_without_smt();
     test_core_summary_distinguishes_packages();
     test_core_summary_null_safety();
+    test_selection_never_lands_on_the_bsp_sibling();
+    test_selected_cores_are_distinct_from_each_other();
+    test_selection_reports_short_rather_than_overcommitting();
+    test_non_smt_layout_is_unchanged();
+    test_selection_degenerate_inputs();
     if (failures != 0) {
         printf("test_cpu_topology: %d failure(s)\n", failures);
         return 1;

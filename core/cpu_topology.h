@@ -112,4 +112,23 @@ int64_t hype_cpu_topology_bsp(const hype_cpu_topology_t *t);
  */
 int hype_cpu_topology_is_consecutive(const hype_cpu_topology_t *t);
 
+/*
+ * Picks up to `want` APs for guest vCPUs such that no two share a physical core, and none shares
+ * a physical core with the BSP. Writes their APIC IDs to out_apic and returns how many were
+ * selected -- fewer than `want` if the machine does not have enough distinct cores, which the
+ * caller must handle rather than overcommit.
+ *
+ * This exists because placement was previously "the first enabled APs in enumeration order", and
+ * on a hybrid Raptor Lake part that yielded APIC 1 for the first guest -- which is p0/c0/t1, the
+ * SMT SIBLING of the BSP at p0/c0/t0. A guest vCPU was sharing L1, L2 and the execution pipeline
+ * with the thread that renders the console and polls the keyboard.
+ *
+ * That violates hype's isolation rule outright: the BSP shares no part of its core with any AP,
+ * and no VM shares with another. Enumeration order happened to satisfy it on the AMD laptop,
+ * which is why it survived -- the same reason the hardcoded ap_start(1)/ap_start(2) in #360 did.
+ * Selection must come from the topology, not from the order the firmware happens to report.
+ */
+int hype_cpu_topology_select_isolated(const hype_cpu_topology_t *t, unsigned int want,
+                                      uint32_t *out_apic, unsigned int out_max);
+
 #endif /* HYPE_CORE_CPU_TOPOLOGY_H */
