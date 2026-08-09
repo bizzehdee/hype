@@ -15385,6 +15385,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_debug_print("rtc: host clock unreadable -- file timestamps left unset\n");
     }
 
+    /*
+     * #296: this one stays on ConOut deliberately -- it is the only line hype writes that proves
+     * ConOut ITSELF works. Everything else goes through hype_debug_print(), whose sinks are the
+     * serial port and the logbuf; if those fail, a log that is empty for that reason looks exactly
+     * like a hype that never started. Seeing this word on the screen and nothing in the log
+     * separates the two. Kept short and unconditional for that reason, and kept HERE, immediately
+     * before hype_serial_init() below, so it also marks the last moment before serial exists.
+     */
     hype_console_print(SystemTable, "hype\n");
 
     /* Safe to bring up now: it's raw port I/O, independent of Boot
@@ -15408,7 +15416,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_fatal("failed to get memory map: 0x%llx", (unsigned long long)status);
     }
 
-    hype_memmap_dump(SystemTable, map, map_size, desc_size);
+    hype_memmap_dump(hype_debug_print, map, map_size, desc_size);
     /* RAM-1: computed here, before the map is freed, so the admission
      * check ahead of the guest-RAM allocation below is against this
      * machine's own real usable RAM, not a guess. */
@@ -15534,6 +15542,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     status = hype_gop_locate(SystemTable->BootServices, &gop);
     have_gop = (status == EFI_SUCCESS);
     if (!have_gop) {
+        /*
+         * #296: on BOTH channels, and each has a reason.
+         *
+         * hype_debug_print() because this is boot-critical diagnosis and must survive to the log:
+         * with no GOP there is no framebuffer, so no terminal rendering, no dashboard, and
+         * hype_fatal() has nothing to paint a panic onto. An operator reading a captured log needs
+         * to see the cause rather than infer it from what is missing.
+         *
+         * ConOut as well because this is the one failure where the debug tee cannot reach the
+         * screen -- that tee paints the GOP, which is exactly what was not found. On a serial-less
+         * machine ConOut is then the only channel the operator can see live.
+         */
+        hype_debug_print("no GOP found: 0x%llx\n", (unsigned long long)status);
         hype_console_print(SystemTable, "no GOP found: 0x%llx\n", (unsigned long long)status);
     }
 

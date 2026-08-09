@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 #include "../memmap.h"
 
 static int failures = 0;
@@ -208,53 +209,42 @@ static void test_get_second_call_error(void) {
     CHECK_INT("get() frees pool when second call fails", 1, g_free_calls);
 }
 
-/* ---- hype_memmap_dump: mocked ConOut ---- */
+/* ---- hype_memmap_dump: captured from the injected emit sink ---- */
 
-static CHAR16 g_captured[1024];
-static int g_output_calls;
+/*
+ * #296: the dump used to go to ConOut, and this harness mocked ConOut->OutputString to read it
+ * back. ConOut reaches the firmware console and no durable sink -- not the logbuf, so not
+ * \hype-log.txt, \HYPEFULL.LOG or the RT-3 tail -- which on a serial-less machine made the dump
+ * recoverable never. The test could not have caught that, because it asserted on the one channel
+ * that was wrong.
+ *
+ * The sink is now a parameter. boot/main.c passes hype_debug_print, which does real port I/O and
+ * would fault in a host test; this stub records what was emitted instead.
+ */
+static char g_emitted[4096];
+static int g_emit_calls;
 
-static EFI_STATUS EFIAPI mock_output_string(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *this, CHAR16 *str) {
-    unsigned long long i = 0;
-    unsigned long long start;
-    (void)this;
-
-    /* Append across multiple OutputString calls, like a real console log. */
-    start = 0;
-    while (g_captured[start] != 0 && start < 1023) {
-        start++;
+static void capture_emit(const char *fmt, ...) {
+    va_list ap;
+    unsigned long long used = 0;
+    while (used < sizeof(g_emitted) - 1u && g_emitted[used] != 0) {
+        used++;
     }
-    while (str[i] != 0 && start + i < 1023) {
-        g_captured[start + i] = str[i];
-        i++;
-    }
-    g_captured[start + i] = 0;
-    g_output_calls++;
-    return EFI_SUCCESS;
+    va_start(ap, fmt);
+    vsnprintf(g_emitted + used, sizeof(g_emitted) - used, fmt, ap);
+    va_end(ap);
+    g_emit_calls++;
 }
 
-static int wide_contains(const CHAR16 *haystack, const char *needle) {
-    unsigned long long i, j;
-    for (i = 0; haystack[i]; i++) {
-        for (j = 0; needle[j] && haystack[i + j] == (CHAR16)needle[j]; j++) {
-        }
-        if (needle[j] == 0) {
-            return 1;
-        }
-    }
-    return 0;
+static void capture_reset(void) {
+    memset(g_emitted, 0, sizeof(g_emitted));
+    g_emit_calls = 0;
 }
 
 static void test_dump(void) {
-    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL con_out;
-    EFI_SYSTEM_TABLE st;
     EFI_MEMORY_DESCRIPTOR map[2];
 
-    memset(&con_out, 0, sizeof(con_out));
-    memset(&st, 0, sizeof(st));
-    memset(g_captured, 0, sizeof(g_captured));
-    con_out.OutputString = mock_output_string;
-    st.ConOut = &con_out;
-    g_output_calls = 0;
+    capture_reset();
 
     map[0].Type = EfiConventionalMemory;
     map[0].PhysicalStart = 0x100000;
@@ -263,45 +253,48 @@ static void test_dump(void) {
     map[1].PhysicalStart = 0x200000;
     map[1].NumberOfPages = 1;
 
-    hype_memmap_dump(&st, map, sizeof(map), sizeof(EFI_MEMORY_DESCRIPTOR));
+    hype_memmap_dump(capture_emit, map, sizeof(map), sizeof(EFI_MEMORY_DESCRIPTOR));
 
-    CHECK_INT("dump() prints header plus one line per entry", 3, g_output_calls);
-    if (!wide_contains(g_captured, "2 entries")) {
+    CHECK_INT("dump() emits header plus one line per entry", 3, g_emit_calls);
+    if (strstr(g_emitted, "2 entries") == 0) {
         printf("FAIL: dump() header missing entry count\n");
         failures++;
     }
-    if (!wide_contains(g_captured, "Conventional")) {
+    if (strstr(g_emitted, "Conventional") == 0) {
         printf("FAIL: dump() missing Conventional entry\n");
         failures++;
     }
-    if (!wide_contains(g_captured, "ACPIReclaim")) {
+    if (strstr(g_emitted, "ACPIReclaim") == 0) {
         printf("FAIL: dump() missing ACPIReclaim entry\n");
         failures++;
     }
-    if (!wide_contains(g_captured, "0x100000")) {
+    if (strstr(g_emitted, "0x100000") == 0) {
         printf("FAIL: dump() missing first entry's physical address\n");
         failures++;
     }
 }
 
 static void test_dump_empty(void) {
-    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL con_out;
-    EFI_SYSTEM_TABLE st;
+    capture_reset();
+    hype_memmap_dump(capture_emit, 0, 0, sizeof(EFI_MEMORY_DESCRIPTOR));
 
-    memset(&con_out, 0, sizeof(con_out));
-    memset(&st, 0, sizeof(st));
-    memset(g_captured, 0, sizeof(g_captured));
-    con_out.OutputString = mock_output_string;
-    st.ConOut = &con_out;
-    g_output_calls = 0;
-
-    hype_memmap_dump(&st, 0, 0, sizeof(EFI_MEMORY_DESCRIPTOR));
-
-    CHECK_INT("dump() with zero entries prints only the header", 1, g_output_calls);
-    if (!wide_contains(g_captured, "0 entries")) {
+    CHECK_INT("dump() with zero entries emits only the header", 1, g_emit_calls);
+    if (strstr(g_emitted, "0 entries") == 0) {
         printf("FAIL: dump() empty header missing zero count\n");
         failures++;
     }
+}
+
+/* #296: a caller with no sink must be a no-op, not a null call through a function pointer. */
+static void test_dump_without_a_sink_is_silent(void) {
+    EFI_MEMORY_DESCRIPTOR map[1];
+    map[0].Type = EfiConventionalMemory;
+    map[0].PhysicalStart = 0x100000;
+    map[0].NumberOfPages = 1;
+
+    capture_reset();
+    hype_memmap_dump(0, map, sizeof(map), sizeof(EFI_MEMORY_DESCRIPTOR));
+    CHECK_INT("dump() with no emit sink writes nothing", 0, g_emit_calls);
 }
 
 /* ---- hype_exit_boot_services: mocked EFI_BOOT_SERVICES ---- */
@@ -506,6 +499,7 @@ int main(void) {
     test_get_second_call_error();
     test_dump();
     test_dump_empty();
+    test_dump_without_a_sink_is_silent();
     test_exit_boot_services_success_first_try();
     test_exit_boot_services_retries_on_stale_map_key();
     test_exit_boot_services_propagates_memmap_error();

@@ -22,11 +22,30 @@ EFI_STATUS hype_memmap_get(EFI_BOOT_SERVICES *bs,
 
 /*
  * Prints one line per descriptor (index, type, physical start, page
- * count) via ConOut. desc_size is the stride between entries (NOT
- * necessarily sizeof(EFI_MEMORY_DESCRIPTOR) -- the spec allows firmware
- * to report a larger, versioned descriptor).
+ * count). desc_size is the stride between entries (NOT necessarily
+ * sizeof(EFI_MEMORY_DESCRIPTOR) -- the spec allows firmware to report a
+ * larger, versioned descriptor).
+ *
+ * #296: emitted via hype_debug_print(), NOT ConOut. ConOut reaches the firmware console and
+ * nothing else -- not the logbuf, so not \hype-log.txt, not \HYPEFULL.LOG, and not the RT-3 tail
+ * recovered as \hype-diag-prev.txt. On a machine whose ConOut is the screen that makes this dump
+ * readable for as long as it stays on screen and recoverable never, which is precisely the
+ * configuration both validation machines are in (serial-less, cold-boot-only). It hid because
+ * OVMF under QEMU routes ConOut to the serial port, so these lines appear in every QEMU log and
+ * are missing only where the log is the sole telemetry.
+ *
+ * The sink is a PARAMETER, not a call to hype_debug_print() inside -- the same reason
+ * hype_input_runner takes its clock rather than calling hype_rdtsc(). hype_debug_print() writes to
+ * the serial port with real `inb`/`outb`, which faults immediately in a host unit test, so calling
+ * it directly here would have made this function untestable and dropped a covered module off the
+ * gate. boot/main.c passes hype_debug_print; the tests pass a capturing stub. The signature is
+ * hype_debug_print's, so no adapter is needed.
+ *
+ * No system_table parameter any more: the durable sinks need no Boot Services.
  */
-void hype_memmap_dump(EFI_SYSTEM_TABLE *system_table,
+typedef void (*hype_memmap_emit_fn)(const char *fmt, ...);
+
+void hype_memmap_dump(hype_memmap_emit_fn emit,
                        const EFI_MEMORY_DESCRIPTOR *map,
                        UINTN map_size,
                        UINTN desc_size);

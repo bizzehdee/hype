@@ -1,5 +1,5 @@
 #include "memmap.h"
-#include "console.h"
+
 
 const char *hype_memmap_type_name(UINT32 type) {
     switch (type) {
@@ -61,7 +61,7 @@ EFI_STATUS hype_memmap_get(EFI_BOOT_SERVICES *bs,
     return EFI_SUCCESS;
 }
 
-void hype_memmap_dump(EFI_SYSTEM_TABLE *system_table,
+void hype_memmap_dump(hype_memmap_emit_fn emit,
                        const EFI_MEMORY_DESCRIPTOR *map,
                        UINTN map_size,
                        UINTN desc_size) {
@@ -69,14 +69,17 @@ void hype_memmap_dump(EFI_SYSTEM_TABLE *system_table,
     UINTN i;
     const UINT8 *base = (const UINT8 *)map;
 
-    hype_console_print(system_table, "memory map: %llu entries\n", (unsigned long long)count);
+    if (emit == 0) {
+        return;
+    }
+    emit("memory map: %llu entries\n", (unsigned long long)count);
     for (i = 0; i < count; i++) {
         const EFI_MEMORY_DESCRIPTOR *d = (const EFI_MEMORY_DESCRIPTOR *)(base + i * desc_size);
-        hype_console_print(system_table, "  [%llu] %s phys=0x%llx pages=%llu\n",
-                            (unsigned long long)i,
-                            hype_memmap_type_name(d->Type),
-                            (unsigned long long)d->PhysicalStart,
-                            (unsigned long long)d->NumberOfPages);
+        emit("  [%llu] %s phys=0x%llx pages=%llu\n",
+                         (unsigned long long)i,
+                         hype_memmap_type_name(d->Type),
+                         (unsigned long long)d->PhysicalStart,
+                         (unsigned long long)d->NumberOfPages);
     }
 }
 
