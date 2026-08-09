@@ -7307,7 +7307,15 @@ static void fw_1_render_console(void) {
             for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
                 hype_vt_render_cache_invalidate(&g_view_render_cache[vi]);
             }
-            term_last_view = -2; /* force the clear-and-redraw path for whichever view is up */
+            /*
+             * Invalidate ONLY -- do not force the clear-and-redraw path.
+             *
+             * An invalidated cache already repaints every cell, so the clear adds nothing except
+             * a blank screen while the bounded renderer refills it 8 rows at a time. The operator
+             * saw exactly that: "most of the screen was solid white". Clearing is right when the
+             * CONTENT changes underneath (a view switch), because the old view's cells must not
+             * survive; it is wrong here, where the same content is simply being repainted.
+             */
         }
     }
     if (view >= 0) {
