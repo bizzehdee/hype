@@ -16993,6 +16993,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         unsigned int ap = 0;
                         kbd_last = now_k;
                         hype_host_kbd_isr_stats(&e, &eo, &ap);
+                        {
+                            /* #368: blit rate, from the BSP. The number that matters is MB/s: if it
+                             * is already poor while the guests are quiet, the framebuffer mapping is
+                             * wrong and no amount of contention work will help. */
+                            unsigned long long bt = 0, bb = 0, bc = 0;
+                            hype_gop_blit_stats(&bt, &bb, &bc);
+                            if (bc != 0 && bt != 0) {
+                                hype_debug_print(
+                                    "fw-1 BLIT: calls=%llu bytes=%llu total=%llums MB_per_s=%llu "
+                                    "us_each=%llu [#368]\n", bc, bb, (bt * 1000ull) / hz,
+                                    (bb * hz) / bt / 1000000ull,
+                                    (bt * 1000000ull) / hz / bc);
+                            }
+                        }
                         hype_debug_print("fw-1 KBDIRQ: isr_entries=%llu (+%llu since last) eois=%llu "
                                          "last_apic=%u | polled=%llu chords=%llu | "
                                          "bsp_usb_timeouts=%llu [#363]\n",

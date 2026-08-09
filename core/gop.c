@@ -23,8 +23,39 @@ static void bands_clear(hype_gop_console_t *con) {
     }
 }
 
+/*
+ * #368: how fast is the blit, really?
+ *
+ * Console rendering slows ~1000x while a guest spins on emulated MMIO, and the guest's CPU cost is
+ * now measured at 0.18% of run time (#367, closed), so CPU contention cannot explain it. That
+ * leaves the write path itself: this is a plain pixel copy to a high PCIe BAR, and hype ASSERTS in
+ * paging.h that PAT WC beats an MTRR of UC there. Asserting is not measuring, and the difference
+ * between WC and UC on a PCIe framebuffer is roughly the factor being observed.
+ *
+ * Bytes and time, separated from the cell drawing that precedes it. Reported by the BSP, so it
+ * also shows whether the rate changes when a guest starts misbehaving -- which distinguishes "the
+ * mapping is wrong all along" from "the guest starves it", and those need completely different
+ * fixes.
+ */
+static volatile unsigned long long g_blit_tsc, g_blit_bytes, g_blit_calls;
+
+static inline unsigned long long gop_rdtsc(void) {
+    unsigned int lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((unsigned long long)hi << 32) | lo;
+}
+
+void hype_gop_blit_stats(unsigned long long *tsc, unsigned long long *bytes,
+                         unsigned long long *calls) {
+    if (tsc != 0) *tsc = g_blit_tsc;
+    if (bytes != 0) *bytes = g_blit_bytes;
+    if (calls != 0) *calls = g_blit_calls;
+}
+
 void hype_gop_flush(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop_console_t *con, void *real_fb) {
     unsigned int y0, y1, rows;
+    unsigned long long blit_t0;
+    unsigned long long band_bytes = 0; /* #368: bytes actually pushed on the per-band path */
 
     /* RT-1c: only copy what changed since the last flush. Skipping a
      * clean console avoids a whole-framebuffer copy on every
@@ -46,6 +77,7 @@ void hype_gop_flush(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop_console_t *con, 
         return;
     }
     rows = y1 - y0 + 1u;
+    blit_t0 = gop_rdtsc();
 
     /* EFI_GRAPHICS_OUTPUT_BLT_PIXEL's own byte order (Blue, Green, Red,
      * Reserved) is fixed by the UEFI spec regardless of the real
@@ -61,6 +93,9 @@ void hype_gop_flush(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop_console_t *con, 
                  con->width, rows, (UINTN)con->stride * sizeof(EFI_GRAPHICS_OUTPUT_BLT_PIXEL));
         /* Pre-ExitBootServices only: Blt() is firmware-accelerated and one call for the union
          * rectangle beats hundreds of per-band calls, so the row range stays right here. */
+        g_blit_tsc += gop_rdtsc() - blit_t0;
+        g_blit_bytes += (unsigned long long)con->width * rows * 4ull;
+        g_blit_calls++;
         bands_clear(con);
         con->dirty = 0;
         return;
@@ -93,6 +128,9 @@ void hype_gop_flush(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop_console_t *con, 
                 }
                 bx0 = con->band_x0[b];
                 bx1 = con->band_x1[b];
+                if (bx1 >= bx0) {
+                    band_bytes += (unsigned long long)(bx1 - bx0 + 1u) * (by1 - by0 + 1u) * 4ull;
+                }
                 if (bx1 >= con->width) {
                     bx1 = (con->width > 0) ? con->width - 1u : 0u;
                 }
@@ -106,6 +144,9 @@ void hype_gop_flush(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop_console_t *con, 
                     }
                 }
             }
+            g_blit_tsc += gop_rdtsc() - blit_t0;
+            g_blit_bytes += band_bytes;
+            g_blit_calls++;
             con->dirty = 0;
             return;
         }
@@ -116,6 +157,9 @@ void hype_gop_flush(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop_console_t *con, 
                 dst[row + x] = con->fb[row + x];
             }
         }
+        g_blit_tsc += gop_rdtsc() - blit_t0;
+        g_blit_bytes += (unsigned long long)con->width * rows * 4ull;
+        g_blit_calls++;
     }
     bands_clear(con);
     con->dirty = 0;

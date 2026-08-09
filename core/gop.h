@@ -46,4 +46,13 @@ EFI_STATUS hype_gop_locate(EFI_BOOT_SERVICES *bs, EFI_GRAPHICS_OUTPUT_PROTOCOL *
  * `con` is non-const. */
 void hype_gop_flush(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop_console_t *con, void *real_fb);
 
+/*
+ * #368: blit cost -- cycles, bytes and calls, separated from the cell drawing that precedes it.
+ * A rate that is already slow on an IDLE machine means the framebuffer mapping is wrong (an MTRR
+ * of UC can defeat a PAT of WC); a rate that collapses only when a guest misbehaves means
+ * contention. Those need different fixes and cannot be told apart by eye.
+ */
+void hype_gop_blit_stats(unsigned long long *tsc, unsigned long long *bytes,
+                         unsigned long long *calls);
+
 #endif /* HYPE_GOP_H */
