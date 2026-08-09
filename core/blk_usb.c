@@ -33,6 +33,26 @@
  * the waiters ahead of it. It costs one extra atomic per acquisition, against a USB transfer that
  * is orders of magnitude more expensive.
  */
+static inline unsigned long long usb_rdtsc(void) {
+    unsigned int lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((unsigned long long)hi << 32) | lo;
+}
+
+/*
+ * #365: how long acquiring the lock TAKES, not how many times we spun.
+ *
+ * The device-time counter starts after the lock is held -- deliberately, so contention is not
+ * misreported as device speed. The consequence is that lock wait has never appeared in any
+ * number, and the run now points straight at it: a guest disc read takes 9.75 ms end to end
+ * (ATAPI elapsed 51193ms / 5249 reads) while only 1.8 ms of that is device time (USBXFER
+ * 9492ms / 5249). Eight milliseconds per read is unaccounted for, and the excluded wait is the
+ * obvious candidate. Spin COUNTS cannot settle it -- a spin is not a unit of time, and the spin
+ * total fell 6x between two runs whose throughput barely moved.
+ */
+static volatile unsigned long long g_usb_lock_wait_tsc;
+static volatile unsigned long long g_usb_lock_wait_max;
+
 static volatile unsigned int g_usb_ticket_next;   /* next ticket handed out */
 static volatile unsigned int g_usb_ticket_owner;  /* ticket currently served */
 static volatile unsigned int g_usb_lock_holder_apic = 0xFFFFFFFFu; /* core inside the transfer */
@@ -119,9 +139,17 @@ static int usb_xfer_lock_or_fail(void) {
 static void usb_xfer_lock(void) {
     unsigned int me = __atomic_fetch_add(&g_usb_ticket_next, 1u, __ATOMIC_ACQ_REL);
     unsigned long long spins = 0;
+    unsigned long long wait_t0 = usb_rdtsc();
     while (__atomic_load_n(&g_usb_ticket_owner, __ATOMIC_ACQUIRE) != me) {
         __builtin_ia32_pause();
         spins++;
+    }
+    {
+        unsigned long long w = usb_rdtsc() - wait_t0;
+        __atomic_fetch_add(&g_usb_lock_wait_tsc, w, __ATOMIC_RELAXED);
+        if (w > __atomic_load_n(&g_usb_lock_wait_max, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&g_usb_lock_wait_max, w, __ATOMIC_RELAXED);
+        }
     }
     __atomic_store_n(&g_usb_lock_holder_apic, usb_xfer_this_apic(), __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_usb_lock_acquires, 1ull, __ATOMIC_RELAXED);
@@ -147,6 +175,11 @@ static void usb_xfer_unlock(void) {
  * "the USB path is idle and the stall is something else entirely" -- which is exactly the
  * question the run totals cannot answer.
  */
+void hype_blk_usb_lock_wait(unsigned long long *total_tsc, unsigned long long *max_tsc) {
+    if (total_tsc != 0) *total_tsc = __atomic_load_n(&g_usb_lock_wait_tsc, __ATOMIC_RELAXED);
+    if (max_tsc != 0) *max_tsc = __atomic_load_n(&g_usb_lock_wait_max, __ATOMIC_RELAXED);
+}
+
 void hype_blk_usb_queue_stats(unsigned int *waiters, unsigned int *holder_apic) {
     unsigned int next = __atomic_load_n(&g_usb_ticket_next, __ATOMIC_RELAXED);
     unsigned int owner = __atomic_load_n(&g_usb_ticket_owner, __ATOMIC_RELAXED);
@@ -180,13 +213,9 @@ static volatile unsigned long long g_usb_xfer_tsc;
 static volatile unsigned long long g_usb_xfer_calls;
 static volatile unsigned long long g_usb_xfer_chunks;
 static volatile unsigned long long g_usb_xfer_sectors;
+
 static volatile unsigned long long g_usb_xfer_max_tsc;
 
-static inline unsigned long long usb_rdtsc(void) {
-    unsigned int lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((unsigned long long)hi << 32) | lo;
-}
 
 void hype_blk_usb_xfer_stats(unsigned long long *tsc, unsigned long long *calls,
                              unsigned long long *chunks, unsigned long long *sectors,

@@ -69,4 +69,14 @@ unsigned long long hype_blk_usb_bsp_lock_timeouts(void);
  */
 void hype_blk_usb_queue_stats(unsigned int *waiters, unsigned int *holder_apic);
 
+/*
+ * #365: total and worst time spent WAITING for the transfer lock, in TSC ticks.
+ *
+ * Device time is measured only once the lock is held, so lock wait has never been visible in any
+ * counter. A guest disc read costs 9.75 ms end to end while only 1.8 ms is device time; this is
+ * where the missing 8 ms is expected to be. Spin counts cannot answer it -- a spin is not a unit
+ * of time, and the spin total fell 6x between two runs whose throughput barely moved.
+ */
+void hype_blk_usb_lock_wait(unsigned long long *total_tsc, unsigned long long *max_tsc);
+
 #endif /* HYPE_CORE_BLK_USB_H */

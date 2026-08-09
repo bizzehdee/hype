@@ -17435,6 +17435,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              "(intercepted, no host cache flush) [#368]\n",
                                              wb, (unsigned long long)wbrip);
                         }
+                        {
+                            unsigned long long lw = 0, lwm = 0;
+                            hype_blk_usb_lock_wait(&lw, &lwm);
+                            hype_debug_print("fw-1 USBWAIT: lock wait total=%llums max=%lluus "
+                                             "(device time is measured AFTER the lock) [#365]\n",
+                                             (lw * 1000ull) / hz, (lwm * 1000000ull) / hz);
+                        }
                         hype_debug_print("fw-1 USBRD: media=%llu calls/%llu sec | "
                                          "fatvol=%llu calls/%llu sec [#365]\n",
                                          g_usbrd_media, g_usbrd_media_sec, g_usbrd_fatvol,
