@@ -89,4 +89,13 @@ unsigned int hype_mtrr_read_var(hype_mtrr_var_t *out, unsigned int max);
  */
 uint64_t hype_smi_count_unchecked(void);
 
+/* #368: delivered-vs-nominal frequency (see mtrr_hw.c). Both vendors. */
+void hype_perf_read_amperf(uint64_t *aperf, uint64_t *mperf);
+
+/* IA32_THERM_STATUS. INTEL ONLY -- same #GP hazard as the SMI counter. */
+uint64_t hype_therm_status_unchecked(void);
+
+/* CR0, for the cache-disable (bit 30) and not-write-through (bit 29) bits. */
+uint64_t hype_read_cr0(void);
+
 #endif /* HYPE_CORE_MTRR_H */

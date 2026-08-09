@@ -45,3 +45,27 @@ unsigned int hype_mtrr_read_var(hype_mtrr_var_t *out, unsigned int max) {
  * vendor first -- this function cannot, and deliberately does not try.
  */
 uint64_t hype_smi_count_unchecked(void) { return rdmsr(0x34u); }
+
+/*
+ * #368: IA32_APERF / IA32_MPERF -- the architectural way to ask "what speed is this core
+ * ACTUALLY running at". MPERF counts at the nominal frequency; APERF counts at the delivered
+ * one. Their ratio across a window is the delivered fraction, and it is the one measurement that
+ * separates "each memory access is genuinely slow" from "the core is being clocked down", which
+ * chunk timing alone cannot do. Present on both Intel and AMD.
+ */
+void hype_perf_read_amperf(uint64_t *aperf, uint64_t *mperf) {
+    if (aperf != 0) *aperf = rdmsr(0xE8u);
+    if (mperf != 0) *mperf = rdmsr(0xE7u);
+}
+
+/* IA32_THERM_STATUS. Intel-only; caller must check the vendor, as for the SMI counter.
+ * Bit 0 = thermal status now, bit 1 = log (sticky), bit 10 = power limit status. */
+uint64_t hype_therm_status_unchecked(void) { return rdmsr(0x19Cu); }
+
+/* CR0, to see whether cache-disable (bit 30) or not-write-through (bit 29) has been set on this
+ * core -- the one thing that would make every access uniformly slow without any MSR changing. */
+uint64_t hype_read_cr0(void) {
+    uint64_t v;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(v));
+    return v;
+}

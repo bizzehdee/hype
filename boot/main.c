@@ -7340,6 +7340,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     uint64_t chunk_max = 0, chunk_min = 0;
     unsigned int chunks_slow = 0, usb_waiters_max = 0, usb_held_samples = 0;
     unsigned long long atapi_before = 0, atapi_after = 0, usbcalls_before = 0, usbcalls_after = 0;
+    uint64_t aperf0 = 0, aperf1 = 0, mperf0 = 0, mperf1 = 0;
     unsigned int i, r, scatter_runs;
     /* 64 dwords = 256 bytes: the order of a few changed character cells, which is what the
      * per-band path actually pushes. */
@@ -7469,6 +7470,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      * cores are running and only this one is stuck; if they are frozen too, the whole machine
      * is. Those are different faults and nothing so far distinguishes them. */
     hype_blk_usb_xfer_stats(0, &usbcalls_before, 0, &atapi_before, 0);
+    hype_perf_read_amperf(&aperf0, &mperf0);
     __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
     __asm__ volatile("cli");
     t6 = hype_rdtsc();
@@ -7513,6 +7515,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     }
     t7 = hype_rdtsc();
     if (rflags & (1ull << 9)) __asm__ volatile("sti");
+    hype_perf_read_amperf(&aperf1, &mperf1);
     hype_blk_usb_xfer_stats(0, &usbcalls_after, 0, &atapi_after, 0);
     ns_cli = ((t7 - t6) * 1000000000ull) / tsc_hz;
     /* ONE line. Each hype_debug_print also tees to the GOP screen, and four of them every five
@@ -7529,6 +7532,15 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
                       (unsigned int)PROBE_CHUNKS,
                       (unsigned long long)(ticks_after - ticks_before),
                       (unsigned long long)(smi_now - last_smi));
+    hype_debug_print("fw-1 FBCLOCK: delivered/nominal = %llu/1000 (aperf=%llu mperf=%llu) | "
+                      "cr0=0x%llx therm=0x%llx [#368]\n",
+                      (mperf1 - mperf0) == 0ull
+                          ? 0ull
+                          : ((aperf1 - aperf0) * 1000ull) / (mperf1 - mperf0),
+                      (unsigned long long)(aperf1 - aperf0),
+                      (unsigned long long)(mperf1 - mperf0),
+                      (unsigned long long)hype_read_cr0(),
+                      (unsigned long long)(smi_readable ? hype_therm_status_unchecked() : 0ull));
     hype_debug_print("fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=%u usb_held=%u/%u "
                       "| usb_sectors=+%llu usb_calls=+%llu [#368]\n",
                       usb_waiters_max, usb_held_samples, (unsigned int)PROBE_CHUNKS,
