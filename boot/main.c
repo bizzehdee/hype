@@ -1110,6 +1110,20 @@ static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
  */
 /* #367: cost of fetching the faulting instruction on an emulated-MMIO exit, against the exit
  * total. Decides between caching the decode and restructuring the page tables. */
+/*
+ * #363: BSP liveness, observable from somewhere else.
+ *
+ * Every diagnostic the BSP prints about itself shares the BSP's fate: if it stops, or if its
+ * print path blocks, the line simply stops appearing and the two cases look identical. Three
+ * fixes have now been aimed at the wrong thing partly because of that ambiguity.
+ *
+ * This counter is incremented in the BSP's loop and printed by a GUEST core, which the logs show
+ * keeps running. Frozen counter => the BSP itself is stuck. Advancing counter while KBDIRQ has
+ * stopped => the BSP is alive and its PRINT path is what blocks, which is a completely different
+ * bug in a completely different lock.
+ */
+static volatile unsigned long long g_bsp_ticks;
+
 static unsigned long long g_mmio_fetch_tsc, g_mmio_fetch_calls;
 /* #367: cost of emulating an AHCI register access, separate from the global exit mean. */
 static unsigned long long g_ahci_npf_tsc, g_ahci_npf_calls;
@@ -11512,6 +11526,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                    / r10_ms; /* 2 KiB/block */
                                     }
                                 }
+                                hype_debug_print("fw-1 BSPALIVE: ticks=%llu [#363]\n",
+                                                 (unsigned long long)g_bsp_ticks);
                                 hype_debug_print("fw-1 DIAG: ATAPI READ(10) count=%u (cmds=%u) "
                                                   "sectors=%llu max=%u hist=%u/%u/%u/%u/%u/%u "
                                                   "seq=%u/%u/%u(contig/near/far) "
@@ -16842,6 +16858,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * Intel box the whole display and keyboard went with it while hype and vm1 were fine,
              * and the machine looked crashed. fw_1_render_console() caps itself at 60 Hz.
              */
+            g_bsp_ticks++; /* #363: liveness, read by a guest core -- see the declaration */
             fw_1_render_console();
             fw_1_host_input_poll(); /* #363: keyboard + terminal switching, off the guest core */
             {
