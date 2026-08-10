@@ -192,6 +192,31 @@ int hype_vmx_smoke_test(void);
 #define HYPE_209_NVME_PROBE 0
 #endif
 
+/*
+ * #209 write half. OFF by default, and it refuses to write unless the drive it found IS the drive
+ * the build was made for.
+ *
+ * HYPE_209_EXPECT_SERIAL is the whole safety argument. The existing HYPE_NVME_WRITE_SELFTEST writes
+ * to whatever NVMe discovery happens to land on, which is fine on a machine with one drive and
+ * catastrophic on one with two -- and the AMD laptop holds the operator's own OS disk. Naming the
+ * expected serial at BUILD time means a stick made for the scratch drive physically cannot write to
+ * anything else: enumeration order can change, a serial cannot, which is the same reasoning #124
+ * applies to `physical:` targets and #332 applies to partition scopes.
+ *
+ * RESTORING, not merely bounded. It reads the original sector, writes a pattern, verifies the
+ * readback, then writes the ORIGINAL bytes back and verifies those too. The net effect on the drive
+ * is nothing, so a run that is interrupted between the two writes is the only window in which
+ * anything is altered -- and LBA 2048 is well past any GPT, so even that window touches no
+ * structure. A test that proves writes work by leaving damage behind is a worse test, not a braver
+ * one.
+ */
+#ifndef HYPE_209_NVME_WRITE
+#define HYPE_209_NVME_WRITE 0
+#endif
+#ifndef HYPE_209_EXPECT_SERIAL
+#define HYPE_209_EXPECT_SERIAL ""
+#endif
+
 /* #229 SATA counterpart: attach the REAL SATA disk (host AHCI) as vm0's guest
  * vda, READ-ONLY, bypassing the destructive-write confirm entirely (reads are
  * non-destructive, so no serial-match/confirm is needed -- and this MUST stay
@@ -16799,6 +16824,59 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  g_hostnvme_serial, nvme_model,
                                  (unsigned long long)g_hostnvme_total_sectors,
                                  (unsigned long long)(g_hostnvme_total_sectors / 2048ull));
+#if HYPE_209_NVME_WRITE
+                /* #209 write half -- gated on identity, and restores what it wrote. */
+                {
+                    static uint8_t orig[512] __attribute__((aligned(4096)));
+                    static uint8_t patt[512] __attribute__((aligned(4096)));
+                    static uint8_t back[512] __attribute__((aligned(4096)));
+                    uint64_t wlba = 2048ull; /* past any MBR/GPT */
+                    unsigned k;
+                    int wrote = 0, verified = 0, restored = 0;
+
+                    if (!hype_streq(g_hostnvme_serial, HYPE_209_EXPECT_SERIAL)) {
+                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- found serial '%s' but this "
+                                         "build is armed only for '%s'. No write attempted.\n",
+                                         g_hostnvme_serial, HYPE_209_EXPECT_SERIAL);
+                    } else if (g_hostnvme_total_sectors <= wlba) {
+                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- drive too small\n");
+                    } else if (hype_nvme_host_read(hn.bar_phys, wlba, 1u, orig) != 0) {
+                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- cannot read LBA %llu "
+                                         "first, so it could not be restored\n",
+                                         (unsigned long long)wlba);
+                    } else {
+                        for (k = 0; k < 512u; k++) {
+                            patt[k] = (uint8_t)(0x5Au ^ (k & 0xFFu));
+                        }
+                        if (hype_nvme_host_write(hn.bar_phys, wlba, 1u, patt) == 0) {
+                            wrote = 1;
+                            if (hype_nvme_host_read(hn.bar_phys, wlba, 1u, back) == 0) {
+                                verified = 1;
+                                for (k = 0; k < 512u; k++) {
+                                    if (back[k] != patt[k]) { verified = 0; break; }
+                                }
+                            }
+                            /* Restore unconditionally: if the verify failed we want the original
+                             * bytes back even more, not less. */
+                            if (hype_nvme_host_write(hn.bar_phys, wlba, 1u, orig) == 0 &&
+                                hype_nvme_host_read(hn.bar_phys, wlba, 1u, back) == 0) {
+                                restored = 1;
+                                for (k = 0; k < 512u; k++) {
+                                    if (back[k] != orig[k]) { restored = 0; break; }
+                                }
+                            }
+                        }
+                        hype_debug_print("fw-1 #209 NVMEWRITE: serial matched, lba=%llu wrote=%d "
+                                         "verified=%d restored=%d [#209]\n",
+                                         (unsigned long long)wlba, wrote, verified, restored);
+                        hype_debug_print("fw-1 #209 NVMEWRITE: VERDICT %s\n",
+                                         (wrote && verified && restored)
+                                             ? "PASS -- host NVMe write + readback correct, sector "
+                                               "restored to its original contents"
+                                             : "FAIL -- see the flags above");
+                    }
+                }
+#endif
 #if HYPE_209_NVME_PROBE
                 /* #209: read-only sweep -- see the knob's comment. Nothing here writes. */
                 {
