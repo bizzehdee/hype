@@ -490,6 +490,11 @@ static uint64_t g_ram_1_size_bytes;
  */
 #define HYPE_FW_MAX_VMS 2u
 
+/* #302: console bytes that reach the script matcher, split by whether it was armed -- see
+ * fw_1_script_feed for what each combination rules out. */
+static unsigned long long g_script_seen[HYPE_FW_MAX_VMS];
+static unsigned long long g_script_fed[HYPE_FW_MAX_VMS];
+
 /*
  * #329: how many guest disks one VM can carry. The bound is the interrupt budget, not memory:
  * each attached disk consumes one device number on bus 0 (hype's PCI model is
@@ -10360,6 +10365,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         fw_1_262_hba_dump("sata-fails", &g_fw_1_ata_ahci);
                     }
                 }
+                /* #302: does console output actually reach the script matcher? Printed on the
+                 * periodic cadence so it can be correlated against WHEN a pattern appeared in the
+                 * log, which a one-shot total at failure time cannot do. */
+                hype_debug_print("fw-1 SCRIPTFEED vm%u: seen=%llu fed=%llu armed=%d [#302]\n",
+                                 (unsigned)(vm - g_vms),
+                                 g_script_seen[(unsigned)(vm - g_vms)],
+                                 g_script_fed[(unsigned)(vm - g_vms)], vm->in_script_armed);
                 hype_debug_print(
                     "fw-1 VMSTAT vm%u: state=%d uptime=%llus cpu=%u%% roots=[0x%llx,0x%llx]\n",
                     (unsigned)(vm - g_vms), (int)vm->lifecycle,
@@ -14801,10 +14813,34 @@ static void fw_1_watchdog_observe(hype_fw_vm_t *vm, unsigned vm_index, uint64_t 
     vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_FORCE_OFF);
 }
 
+/*
+ * #302: how many console bytes REACH the script matcher, split by whether it was armed.
+ *
+ * The expect for GRUB's menu times out even though GRUB's text is logged by this very function
+ * (seven lines below), in window, and the matcher demonstrably matches that string when driven
+ * directly on the host. Three explanations survive and the existing instrumentation cannot tell
+ * them apart -- which is the #370 mistake, so measure instead of guessing again:
+ *
+ *   seen advances, fed flat        -> the script was not armed when those bytes passed
+ *   both advance through the GRUB
+ *     window, expect still fails   -> the bytes arrive and the RUNNER is not consuming them
+ *   neither advances               -> GRUB's output reaches the log by a path that never gets here
+ */
 /* Feed one guest console byte to this VM's runner and keep the failure-context tail. */
 static void fw_1_script_feed(hype_fw_vm_t *vm, uint8_t byte) {
+    unsigned vi = (unsigned)(vm - g_vms);
+    if (vi < HYPE_FW_MAX_VMS) g_script_seen[vi]++;
     if (!vm->in_script_armed) {
         return;
+    }
+    if (vi < HYPE_FW_MAX_VMS) {
+        /* #302: the periodic sample is ~30s apart, which is far too coarse to say whether feeding
+         * had STARTED when a given pattern went past -- the whole question. One line at the first
+         * fed byte places it exactly, against the log's own ordering. */
+        if (g_script_fed[vi] == 0ull) {
+            hype_debug_print("fw-1 SCRIPTFEED vm%u: FIRST byte reaches the matcher now [#302]\n", vi);
+        }
+        g_script_fed[vi]++;
     }
     vm->in_tail[vm->in_tail_head] = byte;
     vm->in_tail_head = (vm->in_tail_head + 1u) % sizeof(vm->in_tail);
