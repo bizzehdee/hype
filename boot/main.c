@@ -11774,6 +11774,38 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * Gating this on "the guest produced output" would hang exactly the scripts
          * whose job is to notice that it did not.
          */
+        /*
+         * #302: offer the script matcher the RECONSTRUCTED SCREEN as well as the wire.
+         *
+         * A full-screen consumer -- GRUB's menu, OVMF's boot manager -- never puts its text on the
+         * wire contiguously: it positions the cursor and paints, so `GNU GRUB` arrives as
+         * `ESC[005;238H` and spaces and the streaming matcher can never see it. vm->term is the
+         * grid hype already maintains from those same bytes, so the text the operator would read
+         * is here for free.
+         *
+         * Throttled to ~10 Hz. A snapshot is a whole-screen copy and the expects it serves are
+         * human-scale ("is the menu up"), so doing it per exit would burn the loop for nothing.
+         */
+        if (vm->in_script_armed) {
+            static uint64_t scan_last[HYPE_FW_MAX_VMS];
+            unsigned svi = (unsigned)(vm - g_vms);
+            uint64_t hz = g_fw_1_host_tsc_hz;
+            uint64_t now_s = hype_rdtsc();
+            if (hz != 0 && (scan_last[svi] == 0 || now_s - scan_last[svi] >= hz / 10u)) {
+                static uint8_t snap[HYPE_VT_MAX_ROWS * (HYPE_VT_MAX_COLS + 1u)];
+                unsigned row, col, n = 0;
+                scan_last[svi] = now_s;
+                for (row = 0; row < vm->term.rows; row++) {
+                    for (col = 0; col < vm->term.cols; col++) {
+                        snap[n++] = hype_vt_screen_cell(&vm->term, col, row).ch;
+                    }
+                    /* Row boundaries matter: without them the last column of one row and the first
+                     * of the next would splice into words neither row contains. */
+                    snap[n++] = '\n';
+                }
+                hype_input_runner_scan(&vm->in_runner, snap, n);
+            }
+        }
         fw_1_script_step(vm, (unsigned)(vm - g_vms), &g_fw_1_uart,
                          fw_1_script_now_ms(vm, hype_rdtsc()));
         /*
