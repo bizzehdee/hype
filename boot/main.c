@@ -213,6 +213,8 @@ int hype_vmx_smoke_test(void);
 #ifndef HYPE_209_NVME_WRITE
 #define HYPE_209_NVME_WRITE 0
 #endif
+/* Set by the #209 read sweep. The write half refuses without it -- see its own comment. */
+static int g_209_reads_passed;
 #ifndef HYPE_209_EXPECT_SERIAL
 #define HYPE_209_EXPECT_SERIAL ""
 #endif
@@ -16824,59 +16826,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  g_hostnvme_serial, nvme_model,
                                  (unsigned long long)g_hostnvme_total_sectors,
                                  (unsigned long long)(g_hostnvme_total_sectors / 2048ull));
-#if HYPE_209_NVME_WRITE
-                /* #209 write half -- gated on identity, and restores what it wrote. */
-                {
-                    static uint8_t orig[512] __attribute__((aligned(4096)));
-                    static uint8_t patt[512] __attribute__((aligned(4096)));
-                    static uint8_t back[512] __attribute__((aligned(4096)));
-                    uint64_t wlba = 2048ull; /* past any MBR/GPT */
-                    unsigned k;
-                    int wrote = 0, verified = 0, restored = 0;
-
-                    if (!hype_streq(g_hostnvme_serial, HYPE_209_EXPECT_SERIAL)) {
-                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- found serial '%s' but this "
-                                         "build is armed only for '%s'. No write attempted.\n",
-                                         g_hostnvme_serial, HYPE_209_EXPECT_SERIAL);
-                    } else if (g_hostnvme_total_sectors <= wlba) {
-                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- drive too small\n");
-                    } else if (hype_nvme_host_read(hn.bar_phys, wlba, 1u, orig) != 0) {
-                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- cannot read LBA %llu "
-                                         "first, so it could not be restored\n",
-                                         (unsigned long long)wlba);
-                    } else {
-                        for (k = 0; k < 512u; k++) {
-                            patt[k] = (uint8_t)(0x5Au ^ (k & 0xFFu));
-                        }
-                        if (hype_nvme_host_write(hn.bar_phys, wlba, 1u, patt) == 0) {
-                            wrote = 1;
-                            if (hype_nvme_host_read(hn.bar_phys, wlba, 1u, back) == 0) {
-                                verified = 1;
-                                for (k = 0; k < 512u; k++) {
-                                    if (back[k] != patt[k]) { verified = 0; break; }
-                                }
-                            }
-                            /* Restore unconditionally: if the verify failed we want the original
-                             * bytes back even more, not less. */
-                            if (hype_nvme_host_write(hn.bar_phys, wlba, 1u, orig) == 0 &&
-                                hype_nvme_host_read(hn.bar_phys, wlba, 1u, back) == 0) {
-                                restored = 1;
-                                for (k = 0; k < 512u; k++) {
-                                    if (back[k] != orig[k]) { restored = 0; break; }
-                                }
-                            }
-                        }
-                        hype_debug_print("fw-1 #209 NVMEWRITE: serial matched, lba=%llu wrote=%d "
-                                         "verified=%d restored=%d [#209]\n",
-                                         (unsigned long long)wlba, wrote, verified, restored);
-                        hype_debug_print("fw-1 #209 NVMEWRITE: VERDICT %s\n",
-                                         (wrote && verified && restored)
-                                             ? "PASS -- host NVMe write + readback correct, sector "
-                                               "restored to its original contents"
-                                             : "FAIL -- see the flags above");
-                    }
-                }
-#endif
 #if HYPE_209_NVME_PROBE
                 /* #209: read-only sweep -- see the knob's comment. Nothing here writes. */
                 {
@@ -16933,10 +16882,70 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                      "bytes=%llu elapsed=%llums [#209]\n",
                                      ok, bad, mism, (unsigned long long)bytes,
                                      (unsigned long long)dt_ms);
+                    g_209_reads_passed = (bad == 0u && mism == 0u && ok >= 4u) ? 1 : 0;
                     hype_debug_print("fw-1 #209 NVMEPROBE: VERDICT %s\n",
                                      (bad == 0u && mism == 0u && ok >= 4u)
                                          ? "PASS -- host NVMe reads are correct and repeatable"
                                          : "FAIL -- see the counters above");
+                }
+#endif
+#if HYPE_209_NVME_WRITE
+                /* #209 write half -- gated on identity, and restores what it wrote. */
+                {
+                    static uint8_t orig[512] __attribute__((aligned(4096)));
+                    static uint8_t patt[512] __attribute__((aligned(4096)));
+                    static uint8_t back[512] __attribute__((aligned(4096)));
+                    uint64_t wlba = 2048ull; /* past any MBR/GPT */
+                    unsigned k;
+                    int wrote = 0, verified = 0, restored = 0;
+
+                    /* Reads gate writes: a drive whose reads are wrong must never be written to, and
+                     * the sweep above is what establishes that. This is the sequencing the run plan
+                     * claims, and until now the write block merely sat before it in the file. */
+                    if (!g_209_reads_passed) {
+                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- the read sweep did not pass, "
+                                         "so this drive is not fit to be written\n");
+                    } else if (!hype_streq(g_hostnvme_serial, HYPE_209_EXPECT_SERIAL)) {
+                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- found serial '%s' but this "
+                                         "build is armed only for '%s'. No write attempted.\n",
+                                         g_hostnvme_serial, HYPE_209_EXPECT_SERIAL);
+                    } else if (g_hostnvme_total_sectors <= wlba) {
+                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- drive too small\n");
+                    } else if (hype_nvme_host_read(hn.bar_phys, wlba, 1u, orig) != 0) {
+                        hype_debug_print("fw-1 #209 NVMEWRITE: REFUSED -- cannot read LBA %llu "
+                                         "first, so it could not be restored\n",
+                                         (unsigned long long)wlba);
+                    } else {
+                        for (k = 0; k < 512u; k++) {
+                            patt[k] = (uint8_t)(0x5Au ^ (k & 0xFFu));
+                        }
+                        if (hype_nvme_host_write(hn.bar_phys, wlba, 1u, patt) == 0) {
+                            wrote = 1;
+                            if (hype_nvme_host_read(hn.bar_phys, wlba, 1u, back) == 0) {
+                                verified = 1;
+                                for (k = 0; k < 512u; k++) {
+                                    if (back[k] != patt[k]) { verified = 0; break; }
+                                }
+                            }
+                            /* Restore unconditionally: if the verify failed we want the original
+                             * bytes back even more, not less. */
+                            if (hype_nvme_host_write(hn.bar_phys, wlba, 1u, orig) == 0 &&
+                                hype_nvme_host_read(hn.bar_phys, wlba, 1u, back) == 0) {
+                                restored = 1;
+                                for (k = 0; k < 512u; k++) {
+                                    if (back[k] != orig[k]) { restored = 0; break; }
+                                }
+                            }
+                        }
+                        hype_debug_print("fw-1 #209 NVMEWRITE: serial matched, lba=%llu wrote=%d "
+                                         "verified=%d restored=%d [#209]\n",
+                                         (unsigned long long)wlba, wrote, verified, restored);
+                        hype_debug_print("fw-1 #209 NVMEWRITE: VERDICT %s\n",
+                                         (wrote && verified && restored)
+                                             ? "PASS -- host NVMe write + readback correct, sector "
+                                               "restored to its original contents"
+                                             : "FAIL -- see the flags above");
+                    }
                 }
 #endif
                 /* #258: NVMe drives go in the same inventory as the SATA ones, so a serial
