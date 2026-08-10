@@ -95,6 +95,30 @@ void hype_input_runner_init(hype_input_runner_t *r, const hype_input_script_t *s
 void hype_input_runner_feed(hype_input_runner_t *r, uint8_t byte);
 
 /*
+ * #302: match against the RECONSTRUCTED SCREEN as well as the byte stream.
+ *
+ * The byte-stream matcher above cannot see text drawn by a full-screen program. Measured on GRUB's
+ * boot menu: the wire carries cursor positioning and paint spaces (`ESC[005;238H`), so the literal
+ * `GNU GRUB` never exists as consecutive bytes, even though the log shows it -- that line is
+ * hype_vt_filter's reconstruction. Every consumer that reads a KEYBOARD rather than a serial port
+ * is such a program (OVMF's boot menu, GRUB, graphical installers), which is precisely the set
+ * `sendkey` exists for, so without this they cannot be scripted at all.
+ *
+ * Pass a snapshot of the terminal grid as text, rows concatenated. Call it on a cadence; each call
+ * is an independent look at what is CURRENTLY ON SCREEN.
+ *
+ * That is a deliberately different meaning from the streaming matcher: `expect` against the screen
+ * is satisfied by text that is visible NOW, including text that was already there when the expect
+ * became current. For a TUI that is the useful question ("is the menu up"), but it is not the same
+ * as "this appeared in the output", so the two are separate entry points rather than one merged
+ * matcher.
+ *
+ * The raw rolling window is saved and restored across the scan, so a pattern arriving one byte at a
+ * time on the wire cannot be broken by a screen scan landing in the middle of it.
+ */
+void hype_input_runner_scan(hype_input_runner_t *r, const uint8_t *text, uint32_t len);
+
+/*
  * Decide what to do at `now_ms`. Returns the action and fills *out.
  *
  * A SEND is returned exactly once per `send` directive -- calling poll again

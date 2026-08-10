@@ -409,6 +409,87 @@ static void test_reason_strings(void) {
               hype_input_reason_str((hype_input_reason_t)999) == 0);
 }
 
+
+/*
+ * #302: matching against the reconstructed SCREEN.
+ *
+ * A full-screen program never puts its text on the wire contiguously -- GRUB's menu arrives as
+ * cursor positioning and paint spaces -- so the streaming matcher cannot see it, and every
+ * keyboard-reading consumer `sendkey` exists for is such a program.
+ */
+static void test_scan_matches_text_the_wire_never_carried(void) {
+    hype_input_runner_t r;
+    load("timeout 5000\nexpect GNU GRUB\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    pump(&r, 0);
+
+    /* What GRUB actually sends: positioning between the characters. The pattern is NOT present as
+     * consecutive bytes, so the streaming matcher must NOT match it. */
+    feed_str(&r, "\x1b[5;10HG\x1b[5;11HN\x1b[5;12HU\x1b[5;13H \x1b[5;14HG\x1b[5;15HR"
+                 "\x1b[5;16HU\x1b[5;17HB");
+    pump(&r, 1);
+    CHECK_INT("wire bytes alone do not satisfy the expect", (int)HYPE_INPUT_VERDICT_PENDING,
+              (int)hype_input_runner_verdict(&r));
+
+    /* The reconstructed screen, which is what the operator sees and what vt_screen builds. */
+    hype_input_runner_scan(&r, (const uint8_t *)"    GNU GRUB  version 2.12    ", 30u);
+    pump(&r, 2);
+    CHECK_INT("the screen snapshot satisfies it", (int)HYPE_INPUT_VERDICT_PASS,
+              (int)hype_input_runner_verdict(&r));
+}
+
+/* The two matchers share one rolling window, so a scan landing mid-pattern must not destroy a
+ * wire match in flight. This is the regression that would silently break every existing script. */
+static void test_scan_does_not_disturb_a_wire_match_in_progress(void) {
+    hype_input_runner_t r;
+    load("timeout 5000\nexpect localhost login:\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    pump(&r, 0);
+
+    feed_str(&r, "localhost log");                       /* half the pattern on the wire */
+    hype_input_runner_scan(&r, (const uint8_t *)"an unrelated screen full of text", 32u);
+    feed_str(&r, "in:");                                 /* the rest */
+    pump(&r, 1);
+    CHECK_INT("the split wire match still completes", (int)HYPE_INPUT_VERDICT_PASS,
+              (int)hype_input_runner_verdict(&r));
+}
+
+/* ...and the converse: the wire must not lend its tail to the screen. */
+static void test_scan_does_not_splice_onto_wire_bytes(void) {
+    hype_input_runner_t r;
+    load("timeout 5000\nexpect ABCD\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    pump(&r, 0);
+
+    feed_str(&r, "AB");                                  /* wire ends mid-pattern */
+    hype_input_runner_scan(&r, (const uint8_t *)"CD is on screen", 15u);
+    pump(&r, 1);
+    /* "AB" + "CD" appeared in NEITHER place as a whole. Matching would be inventing an event. */
+    CHECK_INT("no match spliced across wire and screen", (int)HYPE_INPUT_VERDICT_PENDING,
+              (int)hype_input_runner_verdict(&r));
+}
+
+static void test_scan_edge_inputs(void) {
+    hype_input_runner_t r;
+    load("timeout 5000\nexpect X\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    pump(&r, 0);
+    hype_input_runner_scan(&r, 0, 5u);                              /* null */
+    hype_input_runner_scan(&r, (const uint8_t *)"X", 0u);           /* zero length */
+    CHECK_INT("neither advances the run", (int)HYPE_INPUT_VERDICT_PENDING,
+              (int)hype_input_runner_verdict(&r));
+    hype_input_runner_scan(&r, (const uint8_t *)"X", 1u);
+    pump(&r, 1);
+    CHECK_INT("a real snapshot does", (int)HYPE_INPUT_VERDICT_PASS,
+              (int)hype_input_runner_verdict(&r));
+
+    /* Scanning after the verdict must be inert. The caller is on a timer and will keep handing
+     * over snapshots after the run ends; a late screen must not rewrite the result. */
+    hype_input_runner_scan(&r, (const uint8_t *)"anything at all", 15u);
+    CHECK_INT("a scan after the run is a no-op", (int)HYPE_INPUT_VERDICT_PASS,
+              (int)hype_input_runner_verdict(&r));
+}
+
 int main(void) {
     test_happy_path();
     test_match_split_across_feeds();
@@ -429,6 +510,10 @@ int main(void) {
     test_feed_before_any_poll();
     test_reason_strings();
 
+    test_scan_matches_text_the_wire_never_carried();
+    test_scan_does_not_disturb_a_wire_match_in_progress();
+    test_scan_does_not_splice_onto_wire_bytes();
+    test_scan_edge_inputs();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;

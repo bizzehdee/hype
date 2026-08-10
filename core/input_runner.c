@@ -140,6 +140,37 @@ void hype_input_runner_feed(hype_input_runner_t *r, uint8_t byte) {
     }
 }
 
+/* #302: see the header. Reuses feed() so fail-if, expect consumption and pc advance behave
+ * identically -- the only difference is which bytes are presented and that the wire's own
+ * rolling window is preserved around the call. */
+void hype_input_runner_scan(hype_input_runner_t *r, const uint8_t *text, uint32_t len) {
+    uint8_t saved[HYPE_INPUT_SCRIPT_MAX_ARG];
+    uint32_t saved_len;
+    uint32_t i;
+
+    if (r == 0 || text == 0 || len == 0u || r->done) {
+        return;
+    }
+    /* `saved` is the same size as r->win and win_len can never exceed it, so the copy needs no
+     * bound of its own -- a guard that cannot fail is dead code pretending to be caution. */
+    saved_len = r->win_len;
+    for (i = 0; i < saved_len; i++) {
+        saved[i] = r->win[i];
+    }
+    /* Start clean: a partial match left by the wire must not combine with the screen's first
+     * characters into a match that never appeared anywhere. */
+    r->win_len = 0;
+
+    for (i = 0; i < len; i++) {
+        hype_input_runner_feed(r, text[i]);
+    }
+
+    for (i = 0; i < saved_len; i++) {
+        r->win[i] = saved[i];
+    }
+    r->win_len = saved_len;
+}
+
 hype_input_action_kind_t hype_input_runner_poll(hype_input_runner_t *r, uint64_t now_ms,
                                                 hype_input_action_t *out) {
     out->kind = HYPE_INPUT_ACTION_WAIT;
