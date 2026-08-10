@@ -266,4 +266,49 @@ int hype_ahci_host_find_atapi_port(uint64_t abar_phys);
 int hype_ahci_host_atapi_read(uint64_t abar_phys, unsigned port, uint32_t lba2k, uint16_t count2k,
                               void *dst);
 
+/*
+ * #295: gathering adjacent writes into ONE multi-PRDT command.
+ *
+ * The physical write path issues one AHCI command at a time and spins for completion, so
+ * throughput is 1/latency no matter how big each transfer is. Measured on the QEMU rig with a
+ * 48 MiB dd: 12,288 writes, every one exactly 4 KiB (max=8 sectors, nothing larger got through
+ * despite bs=1M), against a virtqueue holding a mean of 27.7 chains per kick and 32+ on 84% of
+ * kicks. The guest will not merge these itself; there is a great deal to merge, and hype is the
+ * only place left to do it.
+ *
+ * AHCI already carries scatter-gather: one command, one PRDT entry per segment, each pointing at a
+ * different host address -- so adjacent requests merge with NO bounce buffer and no copying.
+ *
+ * This is the DECISION half, kept pure and separate from command construction on purpose. It is
+ * the part that gets a gather wrong, and a gather bug on the write path puts the right bytes at the
+ * wrong LBA, which is worse than being slow.
+ */
+typedef struct {
+    uint64_t lba;      /* 512-byte LBA this request starts at */
+    uint32_t sectors;  /* length in 512-byte sectors */
+    uint64_t buf_phys; /* host-physical address of this request's data */
+    int is_write;      /* direction; a merge never crosses it */
+} hype_ahci_host_gather_req_t;
+
+/*
+ * How many of the first `n` requests may be issued as ONE command, starting at reqs[0].
+ *
+ * Returns at least 1 whenever reqs[0] is individually valid, and 0 when it is not (zero-length, or
+ * a single request too large for one PRDT entry) -- so a caller can always distinguish "merge these
+ * k" from "this request cannot be issued at all".
+ *
+ * A request joins only when ALL of these hold, and each one is a way a look-ahead loop gets it
+ * wrong:
+ *   - same direction as the run (mixing a read into a write run would transfer the wrong way),
+ *   - its LBA exactly continues the previous one (a gap would write the right bytes to the wrong
+ *     place -- the failure this ticket calls out by name),
+ *   - the run stays within `max_segs` PRDT entries and `max_sectors` total,
+ *   - its own length fits one PRDT entry (HYPE_AHCI_HOST_PRDT_MAX_BYTES).
+ *
+ * Deliberately does NOT merge across a non-contiguous LBA even when the buffers happen to be
+ * adjacent in host memory: the LBA is what the disk acts on.
+ */
+unsigned int hype_ahci_host_gather_span(const hype_ahci_host_gather_req_t *reqs, unsigned int n,
+                                        unsigned int max_segs, uint32_t max_sectors);
+
 #endif /* HYPE_CORE_AHCI_HOST_H */

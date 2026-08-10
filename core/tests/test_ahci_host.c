@@ -309,6 +309,92 @@ static void test_settle_one_negotiating_port_holds_the_whole_controller(void) {
               hype_ahci_host_settle_continue(6u, 1u, HYPE_AHCI_HOST_SETTLE_EMPTY_SPINS * 4u));
 }
 
+
+/*
+ * #295: the gather decision. Every case here is a way a look-ahead loop gets it wrong, and on the
+ * write path getting it wrong puts the right bytes at the wrong LBA.
+ */
+static void test_gather_merges_a_contiguous_run(void) {
+    hype_ahci_host_gather_req_t r[4];
+    unsigned int i;
+    for (i = 0; i < 4u; i++) {
+        r[i].lba = 100ull + i * 8ull;
+        r[i].sectors = 8u;
+        r[i].buf_phys = 0x10000ull + i * 0x1000ull;
+        r[i].is_write = 1;
+    }
+    CHECK_HEX("four contiguous 4 KiB writes merge into one command", 4,
+              (int)hype_ahci_host_gather_span(r, 4u, 32u, 2048u));
+}
+
+static void test_gather_stops_at_a_gap(void) {
+    hype_ahci_host_gather_req_t r[3];
+    r[0].lba = 100; r[0].sectors = 8; r[0].buf_phys = 0x1000; r[0].is_write = 1;
+    r[1].lba = 108; r[1].sectors = 8; r[1].buf_phys = 0x2000; r[1].is_write = 1;
+    /* One sector short of contiguous. Merging this would write r[2]'s bytes at LBA 116 when the
+     * guest asked for 117 -- silent corruption, not a slow path. */
+    r[2].lba = 117; r[2].sectors = 8; r[2].buf_phys = 0x3000; r[2].is_write = 1;
+    CHECK_HEX("a gap ends the run", 2, (int)hype_ahci_host_gather_span(r, 3u, 32u, 2048u));
+}
+
+static void test_gather_never_crosses_direction(void) {
+    hype_ahci_host_gather_req_t r[3];
+    r[0].lba = 0;  r[0].sectors = 8; r[0].buf_phys = 0x1000; r[0].is_write = 1;
+    r[1].lba = 8;  r[1].sectors = 8; r[1].buf_phys = 0x2000; r[1].is_write = 1;
+    /* Contiguous, but a READ. One command has one direction bit; merging this would transfer it
+     * the wrong way. */
+    r[2].lba = 16; r[2].sectors = 8; r[2].buf_phys = 0x3000; r[2].is_write = 0;
+    CHECK_HEX("a direction change ends the run", 2,
+              (int)hype_ahci_host_gather_span(r, 3u, 32u, 2048u));
+}
+
+static void test_gather_respects_the_segment_cap(void) {
+    hype_ahci_host_gather_req_t r[8];
+    unsigned int i;
+    for (i = 0; i < 8u; i++) {
+        r[i].lba = i * 8ull; r[i].sectors = 8u; r[i].buf_phys = 0x1000ull * (i + 1u); r[i].is_write = 1;
+    }
+    CHECK_HEX("stops at max_segs even when everything else fits", 3,
+              (int)hype_ahci_host_gather_span(r, 8u, 3u, 4096u));
+}
+
+static void test_gather_respects_the_sector_cap(void) {
+    hype_ahci_host_gather_req_t r[8];
+    unsigned int i;
+    for (i = 0; i < 8u; i++) {
+        r[i].lba = i * 8ull; r[i].sectors = 8u; r[i].buf_phys = 0x1000ull * (i + 1u); r[i].is_write = 1;
+    }
+    /* 20 sectors allows two whole 8-sector requests; the third would reach 24 and is refused
+     * WHOLE rather than split, because a partially-merged request has no completion of its own. */
+    CHECK_HEX("stops before exceeding max_sectors", 2,
+              (int)hype_ahci_host_gather_span(r, 8u, 32u, 20u));
+}
+
+static void test_gather_refuses_an_unissuable_first_request(void) {
+    hype_ahci_host_gather_req_t r[2];
+    r[0].lba = 0; r[0].sectors = 0; r[0].buf_phys = 0x1000; r[0].is_write = 1;
+    r[1].lba = 0; r[1].sectors = 8; r[1].buf_phys = 0x2000; r[1].is_write = 1;
+    /* 0, not 1: the caller must be able to tell "cannot issue this at all" from "merge one", or it
+     * builds a command that silently transfers nothing and reports success. */
+    CHECK_HEX("a zero-length first request yields 0", 0,
+              (int)hype_ahci_host_gather_span(r, 2u, 32u, 2048u));
+
+    r[0].sectors = (uint32_t)(HYPE_AHCI_HOST_PRDT_MAX_BYTES / 512u) + 1u;
+    CHECK_HEX("a first request too large for one PRDT entry yields 0", 0,
+              (int)hype_ahci_host_gather_span(r, 2u, 32u, 0xFFFFFFFFu));
+}
+
+static void test_gather_edge_inputs(void) {
+    hype_ahci_host_gather_req_t r;
+    r.lba = 0; r.sectors = 8; r.buf_phys = 0x1000; r.is_write = 1;
+    CHECK_HEX("null array", 0, (int)hype_ahci_host_gather_span(0, 4u, 32u, 2048u));
+    CHECK_HEX("zero count", 0, (int)hype_ahci_host_gather_span(&r, 0u, 32u, 2048u));
+    CHECK_HEX("zero segment cap", 0, (int)hype_ahci_host_gather_span(&r, 1u, 0u, 2048u));
+    CHECK_HEX("zero sector cap", 0, (int)hype_ahci_host_gather_span(&r, 1u, 32u, 0u));
+    CHECK_HEX("a single valid request merges as one", 1,
+              (int)hype_ahci_host_gather_span(&r, 1u, 32u, 2048u));
+}
+
 int main(void) {
     test_settle_stops_when_all_ports_established();
     test_settle_waits_for_a_negotiating_port();
@@ -327,6 +413,13 @@ int main(void) {
     test_atapi_read10_refuses_impossible_sizes();
     test_atapi_lba_conversion_refuses_misalignment();
 
+    test_gather_merges_a_contiguous_run();
+    test_gather_stops_at_a_gap();
+    test_gather_never_crosses_direction();
+    test_gather_respects_the_segment_cap();
+    test_gather_respects_the_sector_cap();
+    test_gather_refuses_an_unissuable_first_request();
+    test_gather_edge_inputs();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;

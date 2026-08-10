@@ -250,3 +250,40 @@ int hype_ahci_host_atapi_lba512_to_lba2k(uint64_t lba512, uint32_t count512, uin
     *out_count2k = (uint16_t)(count512 / per);
     return 0;
 }
+
+/* #295: see the header for why this is separate from command construction. */
+unsigned int hype_ahci_host_gather_span(const hype_ahci_host_gather_req_t *reqs, unsigned int n,
+                                        unsigned int max_segs, uint32_t max_sectors) {
+    unsigned int i;
+    uint64_t next_lba;
+    uint32_t total;
+    int dir;
+
+    if (reqs == 0 || n == 0u || max_segs == 0u || max_sectors == 0u) {
+        return 0u;
+    }
+    /* A request that cannot be issued alone cannot be issued at all: say 0 rather than 1, so the
+     * caller fails it explicitly instead of building a command that silently truncates it. */
+    if (reqs[0].sectors == 0u ||
+        (uint64_t)reqs[0].sectors * 512ull > (uint64_t)HYPE_AHCI_HOST_PRDT_MAX_BYTES ||
+        reqs[0].sectors > max_sectors) {
+        return 0u;
+    }
+
+    dir = (reqs[0].is_write != 0);
+    total = reqs[0].sectors;
+    next_lba = reqs[0].lba + (uint64_t)reqs[0].sectors;
+
+    for (i = 1u; i < n && i < max_segs; i++) {
+        if ((reqs[i].is_write != 0) != dir) break;
+        if (reqs[i].lba != next_lba) break;
+        if (reqs[i].sectors == 0u) break;
+        if ((uint64_t)reqs[i].sectors * 512ull > (uint64_t)HYPE_AHCI_HOST_PRDT_MAX_BYTES) break;
+        /* Checked in 64-bit before the add, so a run near the limit cannot wrap into looking
+         * small -- the arithmetic mistake that would produce a short write with no error. */
+        if ((uint64_t)total + (uint64_t)reqs[i].sectors > (uint64_t)max_sectors) break;
+        total += reqs[i].sectors;
+        next_lba += (uint64_t)reqs[i].sectors;
+    }
+    return i;
+}

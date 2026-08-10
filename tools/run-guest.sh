@@ -130,6 +130,21 @@ SFDISK
     # Without one hype uses its built-in defaults, so the entire config path -- and everything it
     # decides, from guest RAM to display names -- goes untested here unless a run asks for it.
     [ -n "${HYPE_CFG:-}" ] && mcopy -i "$ESP@@1M" "$HYPE_CFG" ::/hype.cfg
+    # HYPE_INPUT=<path> drops a section 6k input script at \input\vm0.txt, so a run can drive the
+    # guest -- log in, run a workload -- instead of only watching it boot. #295 needs one: its own
+    # first instruction is to re-measure the write-size histogram, and nothing writes to a disk
+    # unless something in the guest is told to.
+    if [ -n "${HYPE_INPUT:-}" ]; then
+        mmd -i "$ESP@@1M" ::/input 2>/dev/null || true
+        mcopy -i "$ESP@@1M" "$HYPE_INPUT" ::/input/vm0.txt
+    fi
+    # HYPE_DISK=<path> drops a raw disk image at \hype\disks\<basename>, which a hype.cfg
+    # `[disk.*] backing = file` entry can then point at.
+    if [ -n "${HYPE_DISK:-}" ]; then
+        mmd -i "$ESP@@1M" ::/hype 2>/dev/null || true
+        mmd -i "$ESP@@1M" ::/hype/disks 2>/dev/null || true
+        mcopy -i "$ESP@@1M" "$HYPE_DISK" "::/hype/disks/$(basename "$HYPE_DISK")"
+    fi
     sync "$ESP"
 
     # Verify what was produced rather than trusting the tools -- the same discipline

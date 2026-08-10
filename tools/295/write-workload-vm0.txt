@@ -1,0 +1,27 @@
+# #295: drive a real WRITE workload, so the request-size histogram and queue depth reflect what a
+# guest actually does rather than what hype's own write self-test does.
+#
+# This ticket's first instruction is to re-measure before building anything: the last reading was
+# 4 KiB requests (max=8 sectors, everything in the 8-31 bucket) with the guest not merging them
+# itself, and that was taken when hype's virtqueue was only 8 entries deep. A shallow queue also
+# suppresses the guest block layer's own merging, so the small requests and the shallow depth may
+# have had one cause. If Linux now issues larger requests on its own, the value of coalescing in
+# hype shrinks accordingly.
+#
+# dd with a large bs is deliberate: it gives the guest's block layer every chance to merge. If it
+# still arrives as 4 KiB requests after that, the guest genuinely is not merging and hype is the
+# only place left to do it. Writing to the raw device, not a filesystem, keeps the measurement
+# about the block path rather than about ext4's own batching.
+timeout 300000
+expect localhost login:
+send root\n
+expect ~#
+# Name the device first -- a missing /dev/vda would otherwise show up as a mysterious absence of
+# writes, which reads exactly like "the workload never ran".
+send ls -l /dev/vd* /dev/sd* 2>/dev/null; echo DEVLIST-DONE\n
+expect DEVLIST-DONE
+send dd if=/dev/zero of=/dev/vda bs=1M count=48 conv=fsync; echo DD-DONE\n
+expect DD-DONE
+send sync; echo SYNC-DONE\n
+expect SYNC-DONE
+pass write-workload
