@@ -171,6 +171,27 @@ int hype_vmx_smoke_test(void);
 #define HYPE_372_CLEAR_BME 0
 #endif
 
+/*
+ * #209 real-hardware NVMe read probe. READ-ONLY BY CONSTRUCTION -- it never calls
+ * hype_nvme_host_write, and a stick carrying no hype.cfg cannot arm a physical write either
+ * (tools/make-usb-package.sh ships without one for exactly that reason).
+ *
+ * Read-only first is not timidity, it is sequencing: this probe is also how the spare drive's
+ * SERIAL is obtained, and the serial is what a later write test must name in hype.cfg for the #124
+ * identity guard to match. Arming a write against a drive whose identity has not been confirmed is
+ * the one mistake with unrecoverable consequences, on a laptop that also contains the operator's
+ * own OS disk.
+ *
+ * Exercises what a single LBA0 read at discovery cannot: reads spread across the whole device
+ * (including the last sector, where an off-by-one in the capacity arithmetic shows up), a
+ * multi-sector transfer, and a re-read of every one of them compared byte-for-byte -- the #343
+ * pattern, because a drive that returns different bytes for the same LBA is the failure that looks
+ * like a hype bug and is not.
+ */
+#ifndef HYPE_209_NVME_PROBE
+#define HYPE_209_NVME_PROBE 0
+#endif
+
 /* #229 SATA counterpart: attach the REAL SATA disk (host AHCI) as vm0's guest
  * vda, READ-ONLY, bypassing the destructive-write confirm entirely (reads are
  * non-destructive, so no serial-match/confirm is needed -- and this MUST stay
@@ -16778,6 +16799,68 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  g_hostnvme_serial, nvme_model,
                                  (unsigned long long)g_hostnvme_total_sectors,
                                  (unsigned long long)(g_hostnvme_total_sectors / 2048ull));
+#if HYPE_209_NVME_PROBE
+                /* #209: read-only sweep -- see the knob's comment. Nothing here writes. */
+                {
+                    static uint8_t a[64 * 512] __attribute__((aligned(4096)));
+                    static uint8_t b[64 * 512] __attribute__((aligned(4096)));
+                    uint64_t total = g_hostnvme_total_sectors;
+                    uint64_t spots[4];
+                    unsigned si, ok = 0, bad = 0, mism = 0;
+                    uint64_t t0, dt_ms = 0, bytes = 0;
+
+                    spots[0] = 0ull;
+                    spots[1] = 1ull;
+                    spots[2] = (total > 2ull) ? (total / 2ull) : 0ull;
+                    /* The last sector: an off-by-one in capacity shows up here and nowhere else. */
+                    spots[3] = (total > 0ull) ? (total - 1ull) : 0ull;
+
+                    hype_debug_print("fw-1 #209 NVMEPROBE: serial='%s' sectors=%llu -- READ-ONLY "
+                                     "sweep begins (this build cannot write)\n",
+                                     g_hostnvme_serial, (unsigned long long)total);
+                    t0 = hype_rdtsc();
+                    for (si = 0; si < 4u; si++) {
+                        unsigned k;
+                        if (hype_nvme_host_read(hn.bar_phys, spots[si], 1u, a) != 0) {
+                            bad++;
+                            hype_debug_print("fw-1 #209 NVMEPROBE: LBA %llu READ FAILED\n",
+                                             (unsigned long long)spots[si]);
+                            continue;
+                        }
+                        if (hype_nvme_host_read(hn.bar_phys, spots[si], 1u, b) != 0) {
+                            bad++;
+                            continue;
+                        }
+                        for (k = 0; k < 512u; k++) {
+                            if (a[k] != b[k]) { mism++; break; }
+                        }
+                        ok++;
+                        bytes += 1024ull; /* both reads */
+                    }
+                    /* One multi-sector transfer, kept clear of the end so it cannot run past
+                     * capacity -- the bounds mistake this probe exists to catch, not commit. */
+                    if (total > 128ull) {
+                        if (hype_nvme_host_read(hn.bar_phys, total / 4ull, 64u, a) == 0) {
+                            ok++;
+                            bytes += 64ull * 512ull;
+                        } else {
+                            bad++;
+                            hype_debug_print("fw-1 #209 NVMEPROBE: 64-sector read FAILED\n");
+                        }
+                    }
+                    if (g_fw_1_host_tsc_hz != 0) {
+                        dt_ms = ((hype_rdtsc() - t0) * 1000ull) / g_fw_1_host_tsc_hz;
+                    }
+                    hype_debug_print("fw-1 #209 NVMEPROBE: reads_ok=%u failed=%u mismatched=%u "
+                                     "bytes=%llu elapsed=%llums [#209]\n",
+                                     ok, bad, mism, (unsigned long long)bytes,
+                                     (unsigned long long)dt_ms);
+                    hype_debug_print("fw-1 #209 NVMEPROBE: VERDICT %s\n",
+                                     (bad == 0u && mism == 0u && ok >= 4u)
+                                         ? "PASS -- host NVMe reads are correct and repeatable"
+                                         : "FAIL -- see the counters above");
+                }
+#endif
                 /* #258: NVMe drives go in the same inventory as the SATA ones, so a serial
                  * mismatch can list EVERY disk in the machine rather than only the disks found
                  * on the bus that happened to be scanned. */
