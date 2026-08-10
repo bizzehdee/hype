@@ -214,16 +214,38 @@ build_esp() {
 build_esp || exit 1
 echo "delivery mode: $ISO_MODE ($(( ISO_BYTES / 1048576 )) MB ISO)"
 echo "booting $(basename "$ISO") for ${SECS}s -> $LOG"
-boot_once
-# hype prints its own banner as soon as it is entered. Its absence means the firmware never
-# handed off, which is a harness failure and NOT a hype result -- say so instead of letting a
-# near-empty log be read as "hype produced nothing".
-if ! grep -aq "^hype: build" "$LOG"; then
-    echo "WARNING: firmware never launched hype (no banner) -- rebuilding the ESP and retrying once"
-    build_esp || exit 1
+#
+# #371: a boot with no hype banner is INVALID, not failed. Retry it, and never return it as a result.
+#
+# The firmware fails to reach hype in 5-15% of boots on this rig: OVMF selects the boot device,
+# issues the first READ DMA for LBA 0, and QEMU never completes it. Measured cause -- a 2,560-byte
+# hello-world reproduces it, two independent OVMF builds fail at identical rates, the host disk is
+# completely idle at the time, and it never happens on virtio. Nothing to do with hype, which is
+# never entered: the log holds only OVMF's mode-setting escape sequences, 113 bytes.
+#
+# That log reads exactly like a guest wedge -- "hype silent, zero exits, no output" -- and has
+# already produced two wrong diagnoses (#344 scored these as wedges; #365 read four of them as a
+# regression in a binary that had booted minutes earlier). At this rate a 10-run batch expects 1-2,
+# so filtering them is not a rare-event nicety.
+#
+# The ESP is deliberately NOT rebuilt between attempts, unlike the previous version of this retry.
+# #371 proved the image is fine -- six of eight boots loaded BOOTX64.EFI from the very same file --
+# so rebuilding only spends ~30s recopying a 266 MB ISO and muddies what is being retried.
+#
+BOOT_ATTEMPTS="${BOOT_ATTEMPTS:-3}"
+attempt=1
+while :; do
     boot_once
-    grep -aq "^hype: build" "$LOG" || echo "WARNING: still no hype banner -- treat this log as a HARNESS failure"
-fi
+    grep -aq "^hype: build" "$LOG" && break
+    if [ "$attempt" -ge "$BOOT_ATTEMPTS" ]; then
+        echo "HARNESS FAILURE: firmware never launched hype in $BOOT_ATTEMPTS attempts (no banner)."
+        echo "  This is #371 (QEMU/OVMF loses the first AHCI DMA completion), NOT a hype result."
+        echo "  Do not score this run. Log: $LOG ($(wc -c < "$LOG") bytes)"
+        exit 2
+    fi
+    echo "WARNING: no hype banner (#371, ~5-15% of boots) -- retrying, attempt $((attempt + 1)) of $BOOT_ATTEMPTS"
+    attempt=$((attempt + 1))
+done
 echo "done: $(wc -c < "$LOG") bytes in $LOG"
 
 #
@@ -239,6 +261,5 @@ if grep -aqE 'panic:|Fatal trap|Kernel panic|BUG: unable to handle' "$LOG"; then
     grep -aoE 'panic: [^|]{0,60}|Fatal trap [0-9]+[^|]{0,40}|Kernel panic[^|]{0,50}' "$LOG" \
         | sort -u | head -3 | sed 's/^/    /'
 fi
-if ! grep -aq '^hype: build' "$LOG"; then
-    echo "WARNING: no hype banner -- treat this log as a HARNESS failure, not a hype regression"
-fi
+# (The bannerless case is handled above and exits 2 before reaching here, so there is deliberately
+# no second check: a warning that can never print is worse than none, because it reads as coverage.)
