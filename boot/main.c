@@ -1224,6 +1224,36 @@ static unsigned long long g_mmio_fetch_tsc, g_mmio_fetch_calls;
  */
 static unsigned long long g_ahci_poll_tsc, g_ahci_poll_calls;
 static unsigned long long g_ahci_cmd_tsc, g_ahci_cmd_calls;
+/*
+ * #365: of a command's service time, HOW MUCH WAS THE MEDIUM?
+ *
+ * The per-command mean above answers "what does a command cost" and cannot answer the question the
+ * ticket is actually stuck on: whether that cost is hype's or the stick's. Those have opposite
+ * conclusions -- if a command costs 1.3 ms and USB was busy for 1.3 ms of it, hype adds nothing and
+ * the guest is pacing itself, so there is no hype-side optimisation to find; if it costs 5 ms with
+ * 1.3 ms of USB, the other 3.7 ms is emulation overhead and belongs to hype.
+ *
+ * Sampled from blk_usb's own transfer accumulator across exactly the same window as g_ahci_cmd_tsc,
+ * so the two are the same measurement split in two, not two measurements to correlate by hand.
+ *
+ * The MAX matters as much as the mean: #367's own comment records being caught three times by a
+ * mean over a bimodal population, and COSTBREAK already saw a single nested page fault peak at
+ * 172 ms. A mean of 2 ms hides that completely.
+ */
+static unsigned long long g_ahci_cmd_usb_tsc, g_ahci_cmd_max_tsc, g_ahci_cmd_usb_max_tsc;
+
+/*
+ * #365: time hype spent obtaining media bytes from the HOST device, whichever backend that is.
+ *
+ * Deliberately not blk_usb's own transfer counter, which only exists on the USB path: the QEMU rig
+ * serves media from host AHCI, so a USB-only figure would report "medium share = 0%" there and
+ * invite the conclusion that all the cost is emulation. Same trap as every other counter in this
+ * arc that could not observe the case it was pointed at.
+ *
+ * Accumulated in the media_*_read wrappers, so it covers AHCI, NVMe and USB identically, and
+ * includes the USB lock wait -- which is honest for this question: the guest is blocked for it.
+ */
+static unsigned long long g_media_io_tsc, g_media_io_calls;
 
 /*
  * #364: WHICH register is the firmware polling, and what is hype returning?
@@ -10182,6 +10212,38 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                       g_ahci_cmd_calls
                                 : 0ull);
                     }
+                    /*
+                     * #365: the split that decides where the remaining cost lives.
+                     *
+                     * `medium` is time inside USB transfers, `hype` is everything else in the same
+                     * window -- decode, the ATAPI model, the ISO extent walk, the copy. If medium
+                     * dominates, there is nothing hype-side left to win and the guest is pacing
+                     * itself; if hype does, the overhead is ours and worth attacking. The ticket
+                     * has been unable to choose between those two readings, and it is one
+                     * subtraction.
+                     *
+                     * Means AND maxima, because #367's own note records being caught three times by
+                     * a mean over a bimodal population.
+                     */
+                    if (g_ahci_cmd_calls != 0 && g_vms[0].host_tsc_hz != 0) {
+                        unsigned long long hz = g_vms[0].host_tsc_hz;
+                        unsigned long long hype_tsc = (g_ahci_cmd_tsc > g_ahci_cmd_usb_tsc)
+                                                          ? (g_ahci_cmd_tsc - g_ahci_cmd_usb_tsc)
+                                                          : 0ull;
+                        hype_debug_print(
+                            "fw-1 ATAPISVC: cmds=%llu | per-cmd total=%lluus medium=%lluus "
+                            "hype=%lluus | medium share=%llu%% | max total=%lluus medium=%lluus "
+                            "[#365]\n",
+                            g_ahci_cmd_calls,
+                            (g_ahci_cmd_tsc * 1000000ull) / hz / g_ahci_cmd_calls,
+                            (g_ahci_cmd_usb_tsc * 1000000ull) / hz / g_ahci_cmd_calls,
+                            (hype_tsc * 1000000ull) / hz / g_ahci_cmd_calls,
+                            (g_ahci_cmd_tsc != 0)
+                                ? (g_ahci_cmd_usb_tsc * 100ull) / g_ahci_cmd_tsc
+                                : 0ull,
+                            (g_ahci_cmd_max_tsc * 1000000ull) / hz,
+                            (g_ahci_cmd_usb_max_tsc * 1000000ull) / hz);
+                    }
                     {
                         /*
                          * #364: the top registers the guest is touching, with the value hype
@@ -12146,6 +12208,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      */
                     uint64_t t_ahci = hype_rdtsc();
                     uint32_t cmds_before = g_fw_1_atapi.command_count;
+                    /* #365: the USB transfer accumulator at the same instant, so the medium's share
+                     * of this command's service time comes out of one window, not two. */
+                    unsigned long long usb_tsc_before = g_media_io_tsc;
                     {
                         /* #364: record the register offset before the handler runs, so the
                          * histogram reflects what the guest asked for even if the handler
@@ -12315,7 +12380,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                              * than inferred from which register was touched. */
                             uint64_t dt = hype_rdtsc() - t_ahci;
                             if (g_fw_1_atapi.command_count != cmds_before) {
+                                /* #365: split this command into medium time and hype time. */
+                                unsigned long long usb_tsc_after = g_media_io_tsc;
+                                unsigned long long usb_dt = (usb_tsc_after > usb_tsc_before)
+                                             ? (usb_tsc_after - usb_tsc_before)
+                                             : 0ull;
                                 g_ahci_cmd_tsc += dt;
+                                g_ahci_cmd_usb_tsc += usb_dt;
+                                if (dt > g_ahci_cmd_max_tsc) g_ahci_cmd_max_tsc = dt;
+                                if (usb_dt > g_ahci_cmd_usb_max_tsc) g_ahci_cmd_usb_max_tsc = usb_dt;
                                 g_ahci_cmd_calls++;
                             } else {
                                 g_ahci_poll_tsc += dt;
@@ -13551,8 +13624,13 @@ static void hype_spurious_irq15_isr(const hype_isr_frame_t *frame) {
  * refactor is behaviour-preserving by construction.
  */
 static int media_ahci_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    uint64_t t0 = hype_rdtsc(); /* #365: host-device time, backend-agnostic */
+    int rc;
     (void)ctx;
-    return hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, dst);
+    rc = hype_ahci_host_read(g_hostdisk_abar, g_hostdisk_port, lba, (uint16_t)count, dst);
+    g_media_io_tsc += hype_rdtsc() - t0;
+    g_media_io_calls++;
+    return rc;
 }
 static int media_ahci_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     (void)ctx;
@@ -13566,8 +13644,13 @@ static int media_ahci_write(void *ctx, uint64_t lba, uint32_t count, const void 
  * abstraction rather than a new abstraction.
  */
 static int media_nvme_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    uint64_t t0 = hype_rdtsc(); /* #365 */
+    int rc;
     (void)ctx;
-    return hype_nvme_host_read(g_hostnvme_bar, lba, (uint16_t)count, dst);
+    rc = hype_nvme_host_read(g_hostnvme_bar, lba, (uint16_t)count, dst);
+    g_media_io_tsc += hype_rdtsc() - t0;
+    g_media_io_calls++;
+    return rc;
 }
 static int media_nvme_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     (void)ctx;
@@ -13711,13 +13794,19 @@ static const hype_blk_backend_t *g_media_usb_be;
 static unsigned long long g_usbrd_media, g_usbrd_fatvol, g_usbrd_media_sec, g_usbrd_fatvol_sec;
 
 static int media_usb_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    uint64_t t0;
+    int rc;
     g_usbrd_media++;
     g_usbrd_media_sec += count;
     (void)ctx;
     if (g_media_usb_be == 0) {
         return -1;
     }
-    return hype_blk_backend_read(g_media_usb_be, lba, count, dst);
+    t0 = hype_rdtsc(); /* #365: includes the USB lock wait -- the guest is blocked for it too */
+    rc = hype_blk_backend_read(g_media_usb_be, lba, count, dst);
+    g_media_io_tsc += hype_rdtsc() - t0;
+    g_media_io_calls++;
+    return rc;
 }
 
 static int media_usb_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
