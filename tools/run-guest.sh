@@ -126,6 +126,10 @@ SFDISK
     mcopy -i "$ESP@@1M" build/hype.efi ::/EFI/BOOT/BOOTX64.EFI
     mcopy -i "$ESP@@1M" fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
     mcopy -i "$ESP@@1M" "$ISO" ::/iso/test.iso
+    # HYPE_CFG=<path> drops a config at \hype.cfg, which is where hype looks (boot/main.c:14699).
+    # Without one hype uses its built-in defaults, so the entire config path -- and everything it
+    # decides, from guest RAM to display names -- goes untested here unless a run asks for it.
+    [ -n "${HYPE_CFG:-}" ] && mcopy -i "$ESP@@1M" "$HYPE_CFG" ::/hype.cfg
     sync "$ESP"
 
     # Verify what was produced rather than trusting the tools -- the same discipline

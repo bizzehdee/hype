@@ -661,7 +661,18 @@ typedef struct hype_fw_vm {
      * by THIS VM's own loop each render window and read by the console-owner
      * core's dashboard renderer -- volatile, single-writer/single-reader, a torn
      * 64-bit read at worst shows a momentarily-stale number, never a crash. */
+    /*
+     * IDENTITY, not a display string -- deliberately still "vm0"/"vm1".
+     *
+     * #357: this is what term_resolve_vm() matches typed dashboard commands against, and what
+     * hype_virtio_blk_set_serial() hands the guest as its disk serial ("constant across reboots,
+     * because vm->name is"). Routing `label` through here would have made editing a display name
+     * change the guest's disk identity and stop `start vm0` resolving -- so the human-readable name
+     * lives beside it, in `label`, and only the dashboard reads that.
+     */
     const char *name;
+    /* #357: `label = ...` from hype.cfg, or 0 when unset. Display only. */
+    const char *label;
     const char *os_hint;    /* "linux" / "windows" / "bsd" / "none" */
     /* #304: host TSC when this VM's CMOS clock was seeded, so a guest read can be
      * answered as base + elapsed. 0 = never seeded, so the clock stays frozen (and
@@ -7795,7 +7806,9 @@ static void fw_1_render_console(void) {
         hype_vm_dash_info_t info[HYPE_FW_MAX_VMS];
         unsigned ninfo = HYPE_TERM_NVMS;
         for (unsigned i = 0; i < ninfo; i++) {
-            info[i].name = g_vms[i].name;
+            /* #357: show the operator's `label` when they set one; the section-id/vm0 identity is
+             * what they TYPE, and stays available for commands either way. */
+            info[i].name = (g_vms[i].label != 0) ? g_vms[i].label : g_vms[i].name;
             info[i].os_hint = g_vms[i].os_hint;
             info[i].state = hype_vm_lifecycle_name(g_vms[i].lifecycle);
             info[i].cpu_pct = (g_vms[i].lifecycle == HYPE_VM_RUNNING) ? g_vms[i].stat_cpu_pct : 0u;
@@ -8112,6 +8125,27 @@ static const hype_cfg_disk_t *fw_1_slot_cfg(const hype_fw_vm_t *vm, unsigned int
         if (term_streq(g_hype_cfg.disks[di].id, cv->disks[slot])) {
             return &g_hype_cfg.disks[di];
         }
+    }
+    return 0;
+}
+
+/*
+ * #357: this VM's human-readable display name from `label`, or 0 when the config sets none.
+ *
+ * `label` was parsed and stored and then read by nothing, so a config copied out of the spec's own
+ * worked examples still had no visible effect -- the same "documented setting that does nothing"
+ * defect the ticket was filed about, moved one step later. This is the config->runtime wiring the
+ * comment at the assignment site asked for, and it follows fw_1_resolve_os_hint's shape rather than
+ * assigning at init, because os_hint and mem_mb were both silently discarded by doing that.
+ *
+ * Returns 0 rather than falling back to a name, because the fallback belongs to the DISPLAY site:
+ * vm->name remains the identifier that dashboard commands and the guest's disk serial depend on.
+ */
+static const char *fw_1_resolve_vm_label(const hype_fw_vm_t *vm) {
+    unsigned vi = (unsigned)(vm - &g_vms[0]);
+    const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+    if (cv != 0 && cv->label[0] != '\0') {
+        return cv->label;
     }
     return 0;
 }
@@ -9203,6 +9237,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * current single-Linux-guest reality; multi-OS/config-driven values come
      * with the config->VM plumbing (tracked separately). */
     vm->name = (vm == &g_vms[0]) ? "vm0" : "vm1";
+    /* #357: the display name from `label`, kept OFF vm->name -- see the field comments. This is the
+     * "no cfg->runtime wiring exists yet" note above, closed for the display name only. */
+    vm->label = fw_1_resolve_vm_label(vm);
     /* os_hint is set by fw_1_resolve_os_hint() from hype.cfg -- it used to be
      * hardcoded here, which is why a configured `os_hint = windows` never reached
      * either the dashboard or the CPUID leaves. */
@@ -14772,8 +14809,42 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         for (vi = 0; vi < g_hype_cfg.vm_count; vi++) {
             const hype_cfg_vm_t *v = &g_hype_cfg.vms[vi];
             const hype_cfg_target_disk_t *d = &v->target_disk;
-            hype_debug_print("cfg:   vm[%u] '%s' vcpus=%u mem=%uMB target=%s:%s",
-                             vi, v->name, v->vcpus, v->mem_mb,
+            /* #357: the label is what the operator wrote it for. Show the section id alongside it
+             * rather than instead of it -- every other cfg line, and admission's errors, identify a
+             * VM by section id, so dropping it would make those unmatchable. */
+            if (v->label[0] != '\0') {
+                hype_debug_print("cfg:   vm[%u] '%s' (%s) vcpus=%u mem=%uMB",
+                                 vi, hype_cfg_vm_display_name(v), v->name, v->vcpus, v->mem_mb);
+            } else {
+                hype_debug_print("cfg:   vm[%u] '%s' vcpus=%u mem=%uMB",
+                                 vi, hype_cfg_vm_display_name(v), v->vcpus, v->mem_mb);
+            }
+            /* #357: only claim a target when there is one. `target=file:` with an empty path read
+             * as a configured-but-empty target on every `disks =` VM. */
+            if (!hype_cfg_vm_has_target_disk(v)) {
+                unsigned int di;
+                /* Both lists, because §7 lets a VM reference disks, cdroms, or both -- and a
+                 * cdrom-only VM is legal, so reporting only `disks=` would say "no storage" about
+                 * a machine that has some. */
+                if (v->disks_count != 0u) {
+                    hype_debug_print(" disks=");
+                    for (di = 0; di < v->disks_count; di++) {
+                        hype_debug_print("%s%s", (di == 0u) ? "" : ",", v->disks[di]);
+                    }
+                }
+                if (v->cdroms_count != 0u) {
+                    hype_debug_print(" cdroms=");
+                    for (di = 0; di < v->cdroms_count; di++) {
+                        hype_debug_print("%s%s", (di == 0u) ? "" : ",", v->cdroms[di]);
+                    }
+                }
+                if (v->disks_count == 0u && v->cdroms_count == 0u) {
+                    hype_debug_print(" target=(none)");
+                }
+                hype_debug_print("\n");
+                continue;
+            }
+            hype_debug_print(" target=%s:%s",
                              d->kind == HYPE_CFG_DISK_PHYSICAL ? "physical" : "file",
                              d->path_or_id);
             if (d->kind == HYPE_CFG_DISK_PHYSICAL) {

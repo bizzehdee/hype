@@ -524,4 +524,28 @@ const char *hype_cfg_ram_status_str(hype_cfg_ram_status_t st);
  */
 uint64_t hype_cfg_size_gb_to_bytes(unsigned int gb);
 
+/*
+ * #357: what to CALL this VM on screen and in the log.
+ *
+ * Parsing `label` was only half the fix. Nothing read it, so a config copied out of the spec still
+ * had no visible effect -- which is the exact defect the ticket was filed about, just moved one
+ * step later. Every display site must go through here rather than reaching for one field or the
+ * other, so "labelled VMs are named by their label" is one decision with one test, not a
+ * convention each caller re-implements.
+ *
+ * Returns the label when set, otherwise the section id. Never NULL, and never an empty string for
+ * a parsed VM: the parser rejects both an empty section id and an empty `label =`.
+ */
+const char *hype_cfg_vm_display_name(const hype_cfg_vm_t *vm);
+
+/*
+ * #357: does this VM configure a `target_disk` at all?
+ *
+ * The VM summary printed `target=file:` unconditionally, so a VM whose storage comes from
+ * `disks = a, b` read as a configured-but-EMPTY target -- worse than saying nothing, because an
+ * empty path looks like a truncated or failed value. The storage-by-reference case has to be
+ * distinguishable from the no-storage case, and neither is a file target.
+ */
+int hype_cfg_vm_has_target_disk(const hype_cfg_vm_t *vm);
+
 #endif /* HYPE_CFG_H */

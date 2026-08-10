@@ -44,9 +44,24 @@ static char *find_char(char *s, char c) {
     return s;
 }
 
-/* Truncates at the first ';' (comment to end of line), then trims. */
+/*
+ * Truncates at the first comment character (to end of line), then trims.
+ *
+ * #357: spec section 3 says "`;` or `#` begins a comment to end of line", and only ';' was
+ * implemented. That is the same documented-but-absent defect as `label`, with a far worse failure:
+ * a '#' comment is parsed as content, and a '#' comment ABOVE the first section is therefore a key
+ * before any section -- a hard parse error that makes hype discard the WHOLE config and fall back
+ * to built-in defaults. '#' is the more common comment character of the two, and the first line of
+ * a file is the most likely place to write one.
+ *
+ * Whichever comes first wins, so a ';' inside a '#' comment and vice versa behave as documented.
+ * The verbatim retention snapshot for lossless write-back (#220/#221) is taken BEFORE this runs,
+ * so stripped comments are still preserved.
+ */
 static char *clean_line(char *line) {
-    *find_char(line, ';') = '\0';
+    char *semi = find_char(line, ';');
+    char *hash = find_char(line, '#');
+    *((hash < semi) ? hash : semi) = '\0';
     return hype_str_trim(line);
 }
 
@@ -1311,4 +1326,17 @@ const char *hype_cfg_format_check_str(hype_cfg_format_check_t c) {
         default:
             return "unknown";
     }
+}
+
+/* #357: see the header. One decision, so every display site agrees. */
+const char *hype_cfg_vm_display_name(const hype_cfg_vm_t *vm) {
+    if (vm == 0) return "";
+    return (vm->label[0] != '\0') ? vm->label : vm->name;
+}
+
+int hype_cfg_vm_has_target_disk(const hype_cfg_vm_t *vm) {
+    if (vm == 0) return 0;
+    /* A physical target is named by id/serial, a file target by path -- both land in path_or_id,
+     * so its emptiness is the whole test. */
+    return (vm->target_disk.path_or_id[0] != '\0') ? 1 : 0;
 }

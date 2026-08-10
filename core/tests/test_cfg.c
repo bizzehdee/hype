@@ -1482,6 +1482,112 @@ static void test_label_rejects_empty_and_duplicate(void) {
     CHECK_INT("a repeated label is a duplicate key", HYPE_CFG_ERR_DUPLICATE_KEY, r.status);
 }
 
+/*
+ * #357: parsing `label` was only half the fix -- nothing READ it, so a config copied out of the
+ * spec still had no visible effect. These cover the resolution every display site now shares.
+ */
+/*
+ * #357: spec section 3 documents BOTH ';' and '#' as comment characters; only ';' was implemented.
+ * A '#' comment above the first section parsed as a key before any section -- a hard error that
+ * discarded the entire config, silently falling back to built-in defaults. Found by writing a
+ * validation config with an explanatory '#' header, exactly as an operator would.
+ */
+static void test_hash_begins_a_comment(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("# what this config is for\n"
+                                     "[hype]\nconfig_version = 1\n"
+                                     "[vm.a]\n" REQ "# trailing note\n",
+                                     &c);
+    CHECK_INT("a leading '#' comment does not discard the config", HYPE_CFG_OK, r.status);
+    CHECK_INT("one vm still parses", 1, (int)c.vm_count);
+    CHECK_INT("and the comments are not counted as unknown lines", 0, (int)c.unknown_count);
+}
+
+static void test_hash_comment_after_a_value_is_stripped(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n"
+                                     "[vm.a]\n" REQ "label = Prod Box # not part of the name\n",
+                                     &c);
+    CHECK_INT("parses", HYPE_CFG_OK, r.status);
+    /* The trailing comment must not become part of the displayed name. */
+    CHECK_STR("value stops at the '#'", "Prod Box", c.vms[0].label);
+}
+
+static void test_whichever_comment_char_comes_first_wins(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n"
+                                     "[vm.a]\n" REQ "label = A ; b # c\n",
+                                     &c);
+    CHECK_INT("parses", HYPE_CFG_OK, r.status);
+    CHECK_STR("';' first, so the '#' is inside the comment", "A", c.vms[0].label);
+    r = parse_copy("[hype]\nconfig_version = 1\n[vm.a]\n" REQ "label = A # b ; c\n", &c);
+    CHECK_INT("parses", HYPE_CFG_OK, r.status);
+    CHECK_STR("'#' first, so the ';' is inside the comment", "A", c.vms[0].label);
+}
+
+static void test_display_name_prefers_the_label(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n"
+                                     "[vm.win11]\nlabel = Windows 11 Workstation\n" REQ,
+                                     &c);
+    CHECK_INT("parses", HYPE_CFG_OK, r.status);
+    CHECK_STR("a labelled VM is displayed by its label", "Windows 11 Workstation",
+              hype_cfg_vm_display_name(&c.vms[0]));
+}
+
+static void test_display_name_falls_back_to_the_section_id(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n[vm.twodisk]\n" REQ, &c);
+    CHECK_INT("parses", HYPE_CFG_OK, r.status);
+    CHECK_STR("an unlabelled VM keeps the historical section-id name", "twodisk",
+              hype_cfg_vm_display_name(&c.vms[0]));
+    /* A display path must never be handed NULL and print nothing identifiable. */
+    CHECK_STR("a NULL vm yields an empty string, not a crash", "", hype_cfg_vm_display_name(0));
+}
+
+/*
+ * #357: the VM summary printed `target=file:` for every VM, so storage-by-reference read as a
+ * configured-but-EMPTY file target -- an empty path looks like a truncated value, which is worse
+ * than saying nothing.
+ */
+static void test_disks_by_reference_is_not_a_target_disk(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n"
+                                     "[disk.a]\ntype = disk\npath = \\a.img\n"
+                                     "[disk.b]\ntype = disk\npath = \\b.img\n"
+                                     "[vm.twodisk]\nvcpus = 1\nmem_mb = 1024\n"
+                                     "boot = disk\nfirmware = uefi\nos_hint = linux\n"
+                                     "net_mode = none\ndisks = a, b\n",
+                                     &c);
+    CHECK_INT("parses", HYPE_CFG_OK, r.status);
+    CHECK_INT("two disks referenced", 2, (int)c.vms[0].disks_count);
+    CHECK_INT("and NO target_disk is configured", 0, hype_cfg_vm_has_target_disk(&c.vms[0]));
+}
+
+/* A cdrom-only VM is legal (§7), and it is storage by reference too -- so "has no target disk"
+ * must not be read as "has no storage". */
+static void test_a_cdrom_only_vm_has_no_target_disk_but_has_storage(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n"
+                                     "[disk.live]\ntype = cdrom\npath = \\iso\\test.iso\n"
+                                     "[vm.livecd]\nvcpus = 1\nmem_mb = 1024\n"
+                                     "boot = disk\nfirmware = uefi\nos_hint = linux\n"
+                                     "cdroms = live\n",
+                                     &c);
+    CHECK_INT("parses", HYPE_CFG_OK, r.status);
+    CHECK_INT("no target_disk", 0, hype_cfg_vm_has_target_disk(&c.vms[0]));
+    CHECK_INT("no disks", 0, (int)c.vms[0].disks_count);
+    CHECK_INT("but one cdrom", 1, (int)c.vms[0].cdroms_count);
+}
+
+static void test_a_configured_target_disk_is_reported_as_one(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r = parse_copy("[hype]\nconfig_version = 1\n[vm.a]\n" REQ, &c);
+    CHECK_INT("parses", HYPE_CFG_OK, r.status);
+    CHECK_INT("the REQ fixture's target_disk is seen", 1, hype_cfg_vm_has_target_disk(&c.vms[0]));
+    CHECK_INT("a NULL vm has no target disk", 0, hype_cfg_vm_has_target_disk(0));
+}
+
 static void test_over_long_label_is_refused_not_truncated(void) {
     hype_cfg_t c;
     char text[512];
@@ -1529,6 +1635,14 @@ int main(void) {
     test_label_from_the_spec_example_is_accepted();
     test_label_absent_leaves_an_empty_string();
     test_label_rejects_empty_and_duplicate();
+    test_hash_begins_a_comment();
+    test_hash_comment_after_a_value_is_stripped();
+    test_whichever_comment_char_comes_first_wins();
+    test_display_name_prefers_the_label();
+    test_display_name_falls_back_to_the_section_id();
+    test_disks_by_reference_is_not_a_target_disk();
+    test_a_cdrom_only_vm_has_no_target_disk_but_has_storage();
+    test_a_configured_target_disk_is_reported_as_one();
     test_over_long_label_is_refused_not_truncated();
     test_first_unknown_line_is_named_with_its_number();
     test_no_unknown_lines_leaves_the_report_empty();
