@@ -154,17 +154,24 @@ boot_once() {
     # gives APIC IDs 0, 1, 5 -- a host where ID 2 does not answer, reproducing the Intel failure
     # on an AMD box. Word-split deliberately, so EXTRA_QEMU_ARGS carries several arguments.
     #
-    # VGA defaults to none, which is how this harness has always run -- and that means OVMF hands
-    # hype NO GOP, so hype's entire render path returns immediately and has never executed under
-    # QEMU. #370 is a BSP console-loop stall that only happens when a framebuffer exists, and it
-    # was invisible here for exactly that reason. VGA=std gives hype a real framebuffer.
+    # VGA defaults to std, i.e. hype gets a real GOP framebuffer.
+    #
+    # It used to default to none, which is how this harness ran for its whole life -- and with no
+    # GOP, fw_1_render_console() returns on its first line, so hype's ENTIRE display path never
+    # executed under QEMU. #370 lived in that blind spot: a diagnostic MSR read that #GP-panicked
+    # the BSP, reachable only when a framebuffer exists, so every regression run here was immune to
+    # it while every real machine was not. A default that silently skips a subsystem is not a
+    # neutral choice.
+    #
+    # VGA=none is still available for the A/B that isolates the display path from everything else
+    # (that comparison is what identified #370), but it must be asked for, not assumed.
     qemu-system-x86_64 \
       -machine q35 -m 8192 -nodefaults \
       -accel kvm -cpu host -smp "${SMP:-4}" ${EXTRA_QEMU_ARGS:-} \
       -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
       -drive if=pflash,format=raw,file="$OUT.vars.fd" \
       -drive format=raw,file="$ESP" \
-      -serial "file:$LOG" -display none -vga "${VGA:-none}" 2>"$OUT.stderr" &
+      -serial "file:$LOG" -display none -vga "${VGA:-std}" 2>"$OUT.stderr" &
     local qpid=$!
     # Bounded by wall clock: these guests never exit on their own, and a hung run must still
     # leave a log behind to read.
