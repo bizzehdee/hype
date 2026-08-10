@@ -1,0 +1,30 @@
+# #302: prove `sendkey` end-to-end against a guest that actually READS the keyboard.
+#
+# #284 implemented the transport and #301 the pacing; what was missing is a consumer. The Alpine
+# ISO boots with console=ttyS0 and nothing binds the i8042, so a keystroke sent to it can never be
+# observed -- 6 of 26 scancodes queued and still_pending stuck at 1, which is the paced delivery
+# working correctly against a guest that will never drain it.
+#
+# GRUB is that consumer. It renders its menu on the guest serial (so the reaction is visible in the
+# log) and takes its input through the UEFI Simple Text Input protocol, which OVMF backs with the
+# PS/2 controller hype models.
+#
+# ONLY `sendkey` is used below, never `send`. GRUB would accept serial input too, so mixing the two
+# would leave it unprovable which path the keystroke took -- the whole question this ticket asks.
+timeout 300000
+
+# The menu is up for about a second before it auto-boots. Any keypress cancels the countdown, so
+# the first sendkey both proves delivery and buys the time for the rest.
+expect GNU GRUB
+sendkey c
+
+# GRUB's command line. This string is the acceptance evidence: it cannot appear unless a PS/2
+# keystroke was decoded, delivered, and consumed by something that was actually listening.
+expect grub>
+
+# A mixed-case string, because the ticket's acceptance is the FULL expansion -- shifted characters
+# cost two scancodes each (make/break of Shift around the key), and the 8-byte PS/2 output FIFO
+# cannot hold more than a couple at once, so this also exercises the #301 pacing.
+sendkey Hello World
+expect Hello World
+pass sendkey-consumer
