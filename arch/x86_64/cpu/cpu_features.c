@@ -56,3 +56,11 @@ int hype_cpu_has_pause_filter(uint32_t leaf8000000a_edx) {
 int hype_cpu_has_pause_threshold(uint32_t leaf8000000a_edx) {
     return (int)((leaf8000000a_edx >> 12) & 1u);
 }
+
+/* #370: see the header. Vendor-specific bit, and "unknown vendor" must mean no. */
+int hype_cpu_has_eff_freq(hype_cpu_vendor_t vendor, uint32_t leaf6_ecx,
+                          uint32_t leaf80000007_edx) {
+    if (vendor == HYPE_CPU_VENDOR_INTEL) return (int)(leaf6_ecx & 1u);
+    if (vendor == HYPE_CPU_VENDOR_AMD) return (int)((leaf80000007_edx >> 10) & 1u);
+    return 0;
+}

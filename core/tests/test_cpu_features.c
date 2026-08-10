@@ -61,12 +61,37 @@ static void test_has_pause_filter(void) {
     CHECK_INT("PFTHRESHOLD ignores other bits", 0, hype_cpu_has_pause_threshold(~(1u << 12)));
 }
 
+/*
+ * #370: reading IA32_APERF/MPERF without this check raised #GP under KVM and panicked the BSP
+ * inside a diagnostic. Each vendor advertises the pair in its own leaf, so the wrong vendor's bit
+ * must NOT authorise the read -- that is the case that faulted.
+ */
+static void test_has_eff_freq(void) {
+    CHECK_INT("Intel CPUID.6:ECX bit 0 set", 1,
+              hype_cpu_has_eff_freq(HYPE_CPU_VENDOR_INTEL, 1u, 0u));
+    CHECK_INT("Intel CPUID.6:ECX bit 0 clear", 0,
+              hype_cpu_has_eff_freq(HYPE_CPU_VENDOR_INTEL, ~1u, ~0u));
+    CHECK_INT("AMD CPUID.8000_0007:EDX bit 10 set", 1,
+              hype_cpu_has_eff_freq(HYPE_CPU_VENDOR_AMD, 0u, 1u << 10));
+    CHECK_INT("AMD CPUID.8000_0007:EDX bit 10 clear", 0,
+              hype_cpu_has_eff_freq(HYPE_CPU_VENDOR_AMD, ~0u, ~(1u << 10)));
+    CHECK_INT("AMD does not read Intel's bit", 0,
+              hype_cpu_has_eff_freq(HYPE_CPU_VENDOR_AMD, 1u, 0u));
+    CHECK_INT("Intel does not read AMD's bit", 0,
+              hype_cpu_has_eff_freq(HYPE_CPU_VENDOR_INTEL, 0u, 1u << 10));
+    /* The default must be "do not read": on an unrecognised vendor the cost of guessing wrong is
+     * a #GP with no handler, not a missing log line. */
+    CHECK_INT("unknown vendor refuses even with both bits set", 0,
+              hype_cpu_has_eff_freq(HYPE_CPU_VENDOR_UNKNOWN, ~0u, ~0u));
+}
+
 int main(void) {
     test_vendor_from_string();
     test_has_vmx();
     test_has_svm();
     test_kind_select();
     test_has_pause_filter();
+    test_has_eff_freq();
 
     if (failures == 0) {
         printf("all tests passed\n");

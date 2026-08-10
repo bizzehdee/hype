@@ -39,3 +39,20 @@ uint32_t hype_cpu_svm_feature_edx(void) {
     cpuid(0x8000000Au, &a, &b, &c, &d);
     return d;
 }
+
+/* #370: leaf reads that check the leaf EXISTS first -- see the header. */
+uint32_t hype_cpu_leaf6_ecx(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    cpuid(0, &a, &b, &c, &d);
+    if (a < 6u) return 0u;
+    cpuid(6u, &a, &b, &c, &d);
+    return c;
+}
+
+uint32_t hype_cpu_leaf80000007_edx(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    cpuid(0x80000000u, &a, &b, &c, &d);
+    if (a < 0x80000007u) return 0u;
+    cpuid(0x80000007u, &a, &b, &c, &d);
+    return d;
+}

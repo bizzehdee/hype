@@ -1141,7 +1141,40 @@ static volatile unsigned long long g_bsp_ticks;
 #define BSP_PHASE_INPUT   2u
 #define BSP_PHASE_KBDDIAG 3u
 #define BSP_PHASE_FLUSH   4u
+/*
+ * #370: the four phases above were not enough resolution.
+ *
+ * With a framebuffer present the BSP entered fw_1_render_console() once and never came back:
+ * ticks=1 phase=1 held across all 30 samples of a 420-second run, while both guests reached a
+ * login prompt. "somewhere in render" covers a speed probe, a ~100 ms interrupts-masked loop, a
+ * cache-invalidate sweep, a bounded per-band repaint and a GOP flush -- five different bugs with
+ * five different fixes, and phase=1 cannot tell them apart.
+ *
+ * These sub-phases are all INSIDE fw_1_render_console. They are set through bsp_phase() so the
+ * sequence counter advances with them: a BSP cycling through render without ever returning looks
+ * identical to a stuck one if only the phase VALUE is read.
+ */
+#define BSP_PHASE_FBPROBE  5u /* fw_1_fb_speed_probe, before the masked loop */
+#define BSP_PHASE_FBCLI    6u /* inside that probe's interrupts-masked chunk loop */
+#define BSP_PHASE_FBREPORT 7u /* the probe's own hype_debug_print lines */
+#define BSP_PHASE_INVAL    8u /* render-cache invalidate sweep */
+#define BSP_PHASE_BAND     9u /* hype_vt_render_cached_bounded */
+#define BSP_PHASE_GOPFLUSH 10u /* hype_debug_flush_gop, i.e. the blit to VRAM */
+#define BSP_PHASE_DASH     11u /* hype_dashboard_render, before any drawing */
 static volatile unsigned int g_bsp_phase;
+/*
+ * #370: how many phase TRANSITIONS the BSP has made, not how many passes it has completed.
+ *
+ * g_bsp_ticks only advances at the top of a pass, so it cannot distinguish "stopped dead inside
+ * render" from "making progress inside render but never finishing a pass" -- and those have
+ * opposite fixes. This advances on every step the BSP takes anywhere in its loop.
+ */
+static volatile unsigned long long g_bsp_phase_seq;
+
+static inline void bsp_phase(unsigned int p) {
+    g_bsp_phase = p;
+    g_bsp_phase_seq++;
+}
 
 static unsigned long long g_mmio_fetch_tsc, g_mmio_fetch_calls;
 /*
@@ -7399,6 +7432,19 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     volatile unsigned int *ram = (volatile unsigned int *)g_gop_console.fb;
     static uint64_t last_smi = 0;
     static int smi_readable = -1; /* -1 = not yet decided */
+    /*
+     * #370: IA32_APERF/IA32_MPERF are a CAPABILITY, not a given, and #368 read them as a given.
+     *
+     * On this QEMU rig the rdmsr raised #GP, which post-EBS is a panic -- so the BSP died inside
+     * this probe on its FIRST pass, having printed FBTYPE and nothing after it. Both the earlier
+     * "printed 4 samples and then stopped" note above and the whole of #370 ("the BSP stalls
+     * whenever a framebuffer exists") are this: the probe only runs when a GOP is present, so the
+     * fault hid behind that gate and looked like a stall in the render path.
+     *
+     * Decided once, exactly like smi_readable beside it. Same lesson as MSR_SMI_COUNT, learned
+     * twice now: a diagnostic must not be able to kill the thing it is diagnosing.
+     */
+    static int amperf_readable = -1; /* -1 = not yet decided */
     uint64_t now = hype_rdtsc();
     uint64_t t0, t1, t2, t3, t4, t5, t6, t7, ns, ns_ram, ns_scat, ns_cli, smi_now = 0;
     uint64_t rflags = 0, ticks_before = 0, ticks_after = 0;
@@ -7445,6 +7491,11 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      */
     if (smi_readable < 0) {
         smi_readable = (hype_cpu_detect_vmm_kind_diag().vendor == HYPE_CPU_VENDOR_INTEL) ? 1 : 0;
+    }
+    if (amperf_readable < 0) {
+        amperf_readable = hype_cpu_has_eff_freq(hype_cpu_detect_vmm_kind_diag().vendor,
+                                                hype_cpu_leaf6_ecx(),
+                                                hype_cpu_leaf80000007_edx());
     }
     if (smi_readable) smi_now = hype_smi_count_unchecked();
 
@@ -7535,7 +7586,8 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      * cores are running and only this one is stuck; if they are frozen too, the whole machine
      * is. Those are different faults and nothing so far distinguishes them. */
     hype_blk_usb_xfer_stats(0, &usbcalls_before, 0, &atapi_before, 0);
-    hype_perf_read_amperf(&aperf0, &mperf0);
+    if (amperf_readable) hype_perf_read_amperf(&aperf0, &mperf0);
+    bsp_phase(BSP_PHASE_FBCLI); /* #370: published BEFORE cli, so a stall with interrupts masked is named */
     __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
     __asm__ volatile("cli");
     t6 = fb_tsc_begin();
@@ -7580,9 +7632,12 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
     }
     t7 = fb_tsc_end();
     if (rflags & (1ull << 9)) __asm__ volatile("sti");
-    hype_perf_read_amperf(&aperf1, &mperf1);
+    if (amperf_readable) hype_perf_read_amperf(&aperf1, &mperf1);
     hype_blk_usb_xfer_stats(0, &usbcalls_after, 0, &atapi_after, 0);
     ns_cli = ((t7 - t6) * 1000000000ull) / tsc_hz;
+    /* #370: each of these lines tees to the GOP screen, so the reporting path itself writes the
+     * framebuffer -- exactly the thing under suspicion. Name it separately from the measuring. */
+    bsp_phase(BSP_PHASE_FBREPORT);
     /* ONE line. Each hype_debug_print also tees to the GOP screen, and four of them every five
      * seconds is a visible block of diagnostics painted over the dashboard -- reported by the
      * operator, and self-inflicted by this probe. */
@@ -7597,13 +7652,17 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
                       (unsigned int)PROBE_CHUNKS,
                       (unsigned long long)(ticks_after - ticks_before),
                       (unsigned long long)(smi_now - last_smi));
-    hype_debug_print("fw-1 FBCLOCK: delivered/nominal = %llu/1000 (aperf=%llu mperf=%llu) | "
-                      "cr0=0x%llx therm=0x%llx [#368]\n",
+    /* #370: "delivered/nominal = 0/1000" is what a HALTED core looks like, and it is also what an
+     * unreadable APERF/MPERF pair would look like -- so say which. A diagnostic that cannot
+     * distinguish "no data" from "the worst possible reading" is the #362 mistake again. */
+    hype_debug_print("fw-1 FBCLOCK: delivered/nominal = %llu/1000 (aperf=%llu mperf=%llu%s) | "
+                      "cr0=0x%llx therm=0x%llx [#368 #370]\n",
                       (mperf1 - mperf0) == 0ull
                           ? 0ull
                           : ((aperf1 - aperf0) * 1000ull) / (mperf1 - mperf0),
                       (unsigned long long)(aperf1 - aperf0),
                       (unsigned long long)(mperf1 - mperf0),
+                      amperf_readable ? "" : " NOT READABLE on this cpu",
                       (unsigned long long)hype_read_cr0(),
                       (unsigned long long)(smi_readable ? hype_therm_status_unchecked() : 0ull));
     hype_debug_print("fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=%u usb_held=%u/%u "
@@ -7628,7 +7687,9 @@ static void fw_1_render_console(void) {
     if (tsc_hz == 0 || g_gop_console.fb == (void *)0) {
         return;
     }
+    bsp_phase(BSP_PHASE_FBPROBE);
     fw_1_fb_speed_probe(tsc_hz);
+    bsp_phase(BSP_PHASE_RENDER);
     now_gf = hype_rdtsc();
     /*
      * #363: the cap exists to stop a full redraw running on every loop iteration. With a
@@ -7657,6 +7718,7 @@ static void fw_1_render_console(void) {
         unsigned long long foreign = hype_debug_gop_write_count();
         if (foreign != last_foreign) {
             unsigned vi;
+            bsp_phase(BSP_PHASE_INVAL);
             last_foreign = foreign;
             hype_vt_render_cache_invalidate(&g_dash_render_cache);
             for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
@@ -7697,12 +7759,15 @@ static void fw_1_render_console(void) {
              * worst observed rate, and the screen converges over the following passes.
              */
             int more = 0;
-            unsigned drawn = hype_vt_render_cached_bounded(&g_vms[view].term, &g_gop_console, 1,
-                                                           &g_view_render_cache[view], 8u, &more);
+            unsigned drawn;
+            bsp_phase(BSP_PHASE_BAND);
+            drawn = hype_vt_render_cached_bounded(&g_vms[view].term, &g_gop_console, 1,
+                                                 &g_view_render_cache[view], 8u, &more);
             g_render_cells_drawn += drawn;
             g_render_calls++;
             if (drawn != 0u) {
                 g_render_pushes++;
+                bsp_phase(BSP_PHASE_GOPFLUSH);
                 hype_debug_flush_gop(); /* only push when something changed */
             }
         }
@@ -7746,6 +7811,7 @@ static void fw_1_render_console(void) {
              * means hype itself has stopped -- which is the distinction the operator actually needs
              * and could not make.
              */
+            bsp_phase(BSP_PHASE_DASH);
             hype_dashboard_render(&g_dashboard_term, info, ninfo,
                                   (g_host_time_tsc != 0 && g_vms[0].host_tsc_hz != 0)
                                       ? (unsigned)((hype_rdtsc() - g_host_time_tsc) /
@@ -7757,12 +7823,15 @@ static void fw_1_render_console(void) {
          * changes when a stat/second ticks, so most frames push nothing. */
         {
             int more = 0;
-            unsigned drawn = hype_vt_render_cached_bounded(&g_dashboard_term, &g_gop_console, 0,
-                                                           &g_dash_render_cache, 8u, &more);
+            unsigned drawn;
+            bsp_phase(BSP_PHASE_BAND);
+            drawn = hype_vt_render_cached_bounded(&g_dashboard_term, &g_gop_console, 0,
+                                                 &g_dash_render_cache, 8u, &more);
             g_render_cells_drawn += drawn;
             g_render_calls++;
             if (drawn != 0u) {
                 g_render_pushes++;
+                bsp_phase(BSP_PHASE_GOPFLUSH);
                 hype_debug_flush_gop();
             }
         }
@@ -12125,11 +12194,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                    / r10_ms; /* 2 KiB/block */
                                     }
                                 }
-                                hype_debug_print("fw-1 BSPALIVE: ticks=%llu phase=%u "
-                                                 "(0=idle 1=render 2=input 3=kbddiag 4=flush) "
-                                                 "[#363]\n",
+                                hype_debug_print("fw-1 BSPALIVE: ticks=%llu phase=%u seq=%llu "
+                                                 "(0=idle 1=render 2=input 3=kbddiag 4=flush "
+                                                 "5=fbprobe 6=fbcli 7=fbreport 8=inval 9=band "
+                                                 "10=gopflush 11=dash) [#363 #370]\n",
                                                  (unsigned long long)g_bsp_ticks,
-                                                 (unsigned int)g_bsp_phase);
+                                                 (unsigned int)g_bsp_phase,
+                                                 (unsigned long long)g_bsp_phase_seq);
                                 hype_debug_print("fw-1 DIAG: ATAPI READ(10) count=%u (cmds=%u) "
                                                   "sectors=%llu max=%u hist=%u/%u/%u/%u/%u/%u "
                                                   "seq=%u/%u/%u(contig/near/far) "
@@ -17511,11 +17582,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * and the machine looked crashed. fw_1_render_console() caps itself at 60 Hz.
              */
             g_bsp_ticks++; /* #363: liveness, read by a guest core -- see the declaration */
-            g_bsp_phase = BSP_PHASE_RENDER;
+            bsp_phase(BSP_PHASE_RENDER);
             fw_1_render_console();
-            g_bsp_phase = BSP_PHASE_INPUT;
+            bsp_phase(BSP_PHASE_INPUT);
             fw_1_host_input_poll(); /* #363: keyboard + terminal switching, off the guest core */
-            g_bsp_phase = BSP_PHASE_KBDDIAG;
+            bsp_phase(BSP_PHASE_KBDDIAG);
             {
                 /*
                  * #363: report keyboard-interrupt liveness FROM THE BSP, on its own cadence.
@@ -17615,9 +17686,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 if (drain_last_tsc == 0 || now_d - drain_last_tsc >= iv) {
                     unsigned int have = hype_logbuf_len();
                     drain_last_tsc = now_d;
-                    g_bsp_phase = BSP_PHASE_FLUSH;
+                    bsp_phase(BSP_PHASE_FLUSH);
                     usb_log_flush(); /* no-op until a USB sink is open */
-                    g_bsp_phase = BSP_PHASE_IDLE;
+                    bsp_phase(BSP_PHASE_IDLE);
                     /*
                      * #338: say how much of the buffer has actually reached the file. A gap that
                      * grows means the sink is behind or dead -- visible IN the log instead of

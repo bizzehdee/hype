@@ -77,4 +77,30 @@ int hype_cpu_has_pause_threshold(uint32_t leaf8000000a_edx);
 /* Real CPUID Fn8000_000A_EDX read (SVM feature bitmap). Exempt hw shim. */
 uint32_t hype_cpu_svm_feature_edx(void);
 
+/*
+ * #370: is IA32_APERF/IA32_MPERF (MSR 0xE8/0xE7) readable on this core?
+ *
+ * These are NOT unconditionally present, and #368 read them as if they were. Under a hypervisor
+ * that does not implement them -- KVM, i.e. the entire QEMU dev rig -- rdmsr raises #GP, and
+ * post-ExitBootServices that is a panic, not a diagnostic. It killed the BSP inside the #368
+ * framebuffer probe on every run that had a GOP, which is what #370 was actually about.
+ *
+ * Each vendor advertises the pair through its own bit, so both are needed:
+ *   Intel  CPUID.06H:ECX bit 0        -- effective-frequency interface
+ *   AMD    CPUID.8000_0007H:EDX bit 10 -- EffFreqRO
+ * An unknown vendor gets 0: the wrong answer here is a triple fault, so the default must be "do
+ * not read". Pure bit checks; the leaf reads are the exempt hw shims below.
+ */
+int hype_cpu_has_eff_freq(hype_cpu_vendor_t vendor, uint32_t leaf6_ecx, uint32_t leaf80000007_edx);
+
+/*
+ * Real CPUID.06H:ECX / CPUID.8000_0007H:EDX reads. Exempt hw shims.
+ *
+ * Each returns 0 when the CPU does not implement that leaf at all -- reading past the reported
+ * maximum leaf returns another leaf's contents, and mistaking those for a feature bitmap is how a
+ * capability check ends up authorising the very #GP it exists to prevent.
+ */
+uint32_t hype_cpu_leaf6_ecx(void);
+uint32_t hype_cpu_leaf80000007_edx(void);
+
 #endif /* HYPE_ARCH_CPU_FEATURES_H */
