@@ -165,20 +165,42 @@ boot_once() {
     #
     # VGA=none is still available for the A/B that isolates the display path from everything else
     # (that comparison is what identified #370), but it must be asked for, not assumed.
+    # SENDKEYS presses real keys at chosen times, e.g.
+    #   SENDKEYS='60:ctrl_r-alt_r-right,75:ctrl_r-alt_r-d' tools/run-guest.sh ...
+    # Injected at the i8042, which is the device hype's own host-input path owns, so this exercises
+    # the operator controls (leader chords, terminal switching, dashboard typing) end to end. #363
+    # needs it: no amount of log reading can show that the keyboard still works -- something has to
+    # press a key. QMP is only wired up when keys are actually requested.
+    local qmp_args=()
+    if [ -n "${SENDKEYS:-}" ]; then
+        rm -f "$OUT.qmp"
+        qmp_args=(-qmp "unix:$OUT.qmp,server=on,wait=off")
+    fi
     qemu-system-x86_64 \
       -machine q35 -m 8192 -nodefaults \
       -accel kvm -cpu host -smp "${SMP:-4}" ${EXTRA_QEMU_ARGS:-} \
       -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
       -drive if=pflash,format=raw,file="$OUT.vars.fd" \
       -drive format=raw,file="$ESP" \
+      "${qmp_args[@]}" \
       -serial "file:$LOG" -display none -vga "${VGA:-std}" 2>"$OUT.stderr" &
     local qpid=$!
+    local keypid=
+    if [ -n "${SENDKEYS:-}" ]; then
+        python3 tools/qmp-sendkeys.py "$OUT.qmp" "$SENDKEYS" >"$OUT.keys" 2>&1 &
+        keypid=$!
+    fi
     # Bounded by wall clock: these guests never exit on their own, and a hung run must still
     # leave a log behind to read.
     local i
     for i in $(seq "$SECS"); do kill -0 $qpid 2>/dev/null || break; sleep 1; done
     kill -9 $qpid 2>/dev/null || true
     wait $qpid 2>/dev/null || true
+    if [ -n "$keypid" ]; then
+        kill -9 "$keypid" 2>/dev/null || true
+        wait "$keypid" 2>/dev/null || true
+        [ -s "$OUT.keys" ] && cat "$OUT.keys"
+    fi
 }
 
 build_esp() {

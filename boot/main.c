@@ -155,6 +155,14 @@ int hype_vmx_smoke_test(void);
 #define HYPE_229_RO_PHYS 0
 #endif
 
+/* #363 fault injection: seconds after vm0 first dispatches at which vm0's core stops dead and
+ * never returns, so "the operator keeps the dashboard and keyboard when a guest wedges" can be
+ * TESTED rather than waited for. 0 = off, which is the shipping default. See the injection site
+ * in run_fw_1_test for why a PAUSE spin is a harsher test than the failure it stands in for. */
+#ifndef HYPE_363_WEDGE_VM0
+#define HYPE_363_WEDGE_VM0 0
+#endif
+
 /* #229 SATA counterpart: attach the REAL SATA disk (host AHCI) as vm0's guest
  * vda, READ-ONLY, bypassing the destructive-write confirm entirely (reads are
  * non-destructive, so no serial-match/confirm is needed -- and this MUST stay
@@ -889,6 +897,18 @@ static void hype_term_apply_chord(hype_chord_result_t cr) {
             break;
         default:
             break;
+    }
+    /*
+     * #363: say on the durable channel which view the operator switched to.
+     *
+     * The effect of a chord was previously visible only ON THE SCREEN -- so when the screen was
+     * the thing that had failed, there was no way to tell "the keyboard is dead" from "the
+     * keyboard works and the display does not". Those have different fixes, and this ticket spent
+     * several runs unable to separate them.
+     */
+    if (cr.action != HYPE_CHORD_ACTION_NONE) {
+        hype_debug_print("fw-1 VIEWSWITCH: action=%u -> view=%d (-1 = dashboard) [#363]\n",
+                         (unsigned)cr.action, g_term_view);
     }
 }
 
@@ -9738,6 +9758,31 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (perf_boot_start_tsc == 0) {
             perf_boot_start_tsc = hype_rdtsc(); /* PERF-1a wall-clock base */
         }
+
+#if HYPE_363_WEDGE_VM0
+        /*
+         * #363 fault injection: stop vm0's core dead, N seconds in, and never return.
+         *
+         * The claim under test -- "a wedged vm0 no longer takes the dashboard and keyboard with
+         * it" -- cannot be validated by a healthy run, and the wedge that exposed it was an
+         * intermittent guest fault on hardware nobody can summon on demand. So manufacture it,
+         * the same way #360 manufactured a sparse-APIC host to reproduce an Intel-only bug on AMD.
+         *
+         * A PAUSE spin is deliberately HARSHER than the observed failure: the real vm0 was still
+         * taking exits, whereas this core stops servicing anything at all and never publishes
+         * another stat. If the operator keeps control through this, the weaker real case follows.
+         */
+        if (vm == &g_vms[0] && g_fw_1_host_tsc_hz != 0 &&
+            (hype_rdtsc() - perf_boot_start_tsc) / g_fw_1_host_tsc_hz >=
+                (uint64_t)HYPE_363_WEDGE_VM0) {
+            hype_debug_print("fw-1 #363 WEDGE: vm0 core stopping DELIBERATELY at %us -- fault "
+                             "injection, not a bug. Everything after this must survive it.\n",
+                             (unsigned)HYPE_363_WEDGE_VM0);
+            for (;;) {
+                __asm__ volatile("pause");
+            }
+        }
+#endif
 
         /* TERM-4 (step 1): deliver real operator keystrokes to the focused guest.
          * Drain hype's owned host keyboard (INPUT-3), split leader chords (INPUT-4)
