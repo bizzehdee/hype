@@ -47,6 +47,17 @@ void hype_virtio_blk_reset(hype_virtio_blk_t *dev, uint64_t capacity_sectors) {
      * consistently across its disk frontends. boot/main.c overrides it per VM.
      */
     hype_virtio_blk_set_serial(dev, "HYPE0000000000000001");
+    /* #372: permissive default, overridden by the live path -- see the field comment. Set here and
+     * not in reset_negotiation_state() for the same reason as the serial: a driver writing
+     * device_status = 0 resets the DEVICE, it does not re-enable bus mastering on its behalf. */
+    dev->bus_master = 1;
+}
+
+void hype_virtio_blk_set_bus_master(hype_virtio_blk_t *dev, int enabled) {
+    if (dev == 0) {
+        return;
+    }
+    dev->bus_master = (enabled != 0) ? 1 : 0;
 }
 
 int hype_virtio_blk_common_cfg_read(const hype_virtio_blk_t *dev, uint32_t offset, uint8_t size_bytes,

@@ -32,6 +32,15 @@ void hype_nvme_reset(hype_nvme_t *dev) {
         dev->io_sq_base[q] = 0; /* #358: per-queue; index 0 unused (admin uses asq/acq) */
         dev->io_cq_base[q] = 0;
     }
+    /* #372: permissive default, overridden by the live path -- see the field comment. */
+    dev->bus_master = 1;
+}
+
+void hype_nvme_set_bus_master(hype_nvme_t *dev, int enabled) {
+    if (dev == 0) {
+        return;
+    }
+    dev->bus_master = (enabled != 0) ? 1 : 0;
 }
 
 uint32_t hype_nvme_mmio_read32(const hype_nvme_t *dev, uint32_t off) {
@@ -620,6 +629,16 @@ int hype_nvme_process_sq(hype_nvme_t *dev, unsigned int qid, const hype_nvme_ctx
     /* A doorbell written before CC.EN is not a command to run: the queues are not valid yet. */
     if ((dev->csts & HYPE_NVME_CSTS_RDY) == 0u) {
         return -1;
+    }
+    /*
+     * #372: a controller that cannot master the bus cannot fetch an SQE, walk a PRP or post a CQE.
+     *
+     * Returns 0, not -1: -1 here means "malformed", and this is not malformed -- it is a guest
+     * asking for something the hardware silently declines. Nothing is consumed and no completion is
+     * posted, so the driver waits forever, which is the behaviour being modelled.
+     */
+    if (dev->bus_master == 0) {
+        return 0;
     }
     sqb = sq_base_of(dev, qid);
     cqb = cq_base_of(dev, qid);

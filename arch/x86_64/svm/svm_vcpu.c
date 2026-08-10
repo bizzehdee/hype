@@ -3549,6 +3549,24 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
     if (qsz == 0u) {
         return -1;
     }
+    /*
+     * #372: a device that cannot master the bus cannot reach the virtqueue either.
+     *
+     * Same gate as the AHCI paths, same return convention: 0, because the guest asked for
+     * something the hardware would silently not do. Nothing is consumed from the avail ring and
+     * nothing is placed in the used ring, so the driver waits forever -- which is the point.
+     */
+    if (dev->bus_master == 0) {
+        static int reported;
+        if (!reported) {
+            reported = 1;
+            hype_debug_print("virtio-blk: queue notify IGNORED -- the guest has not set PCI Bus "
+                             "Master Enable (Command bit 2), so the device cannot reach the "
+                             "virtqueue. No request will ever complete, exactly as on real "
+                             "hardware. [#372]\n");
+        }
+        return 0;
+    }
     /* avail ring: flags(2) + idx(2) + ring(2*qsz) + used_event(2). */
     avail_base = (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, dev->queue_driver,
                                                              4u + 2u * (uint64_t)qsz + 2u);
@@ -4271,6 +4289,19 @@ int hype_svm_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
          * Completion-queue doorbells only move the consumer index; there is nothing to do for them.
          */
         if (hype_nvme_doorbell_decode(offset, &qid, &is_cq) == 0 && !is_cq) {
+            /* #372: the refusal itself lives in hype_nvme_process_sq (it owns the state), but the
+             * REPORT has to be here: devices/nvme.c is host-unit-tested, and calling
+             * hype_debug_print from inside it faults the test binary -- the #296 lesson. */
+            if (dev->bus_master == 0) {
+                static int reported;
+                if (!reported) {
+                    reported = 1;
+                    hype_debug_print("nvme: doorbell IGNORED -- the guest has not set PCI Bus "
+                                     "Master Enable (Command bit 2), so the controller cannot "
+                                     "fetch an SQE, walk a PRP or post a completion. This command "
+                                     "will never complete, exactly as on real hardware. [#372]\n");
+                }
+            }
             (void)hype_nvme_process_sq(dev, qid, nctx);
         }
     } else {

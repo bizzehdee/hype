@@ -12112,6 +12112,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                    &g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI));
                 hype_ahci_set_bus_master(&g_fw_1_ata_ahci, hype_pci_bus_master_enabled(
                                                                &g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA));
+                hype_virtio_blk_set_bus_master(
+                    &g_fw_1_vblk,
+                    hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK));
+                hype_nvme_set_bus_master(
+                    &vm->disk[0].nvme,
+                    hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME));
                 if (!ahci_mapped && hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI)) {
                     uint64_t bar5 = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5);
                     if (bar5 != 0) {

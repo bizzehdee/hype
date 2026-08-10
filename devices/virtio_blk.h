@@ -182,6 +182,16 @@ typedef struct {
      * like the disk had been swapped mid-boot.
      */
     uint8_t serial[HYPE_VIRTIO_BLK_ID_BYTES];
+
+    /*
+     * #372: the guest's PCI Bus Master Enable, mirrored in so this model stays PCI-free.
+     *
+     * A virtio-blk device reaches the virtqueue, the descriptors and every data buffer by
+     * mastering the bus, exactly as the AHCI controller does -- so with the bit clear a queue
+     * notify must produce nothing. Defaults to enabled for the same reason as the AHCI model:
+     * the microtests drive this with no PCI at all. See devices/ahci.h for the full argument.
+     */
+    int bus_master;
 } hype_virtio_blk_t;
 
 /*
@@ -229,6 +239,10 @@ void hype_virtio_blk_reset(hype_virtio_blk_t *dev, uint64_t capacity_sectors);
  * about per-VM distinctness gets a valid, stable serial for free.
  */
 void hype_virtio_blk_set_serial(hype_virtio_blk_t *dev, const char *name);
+
+/* #372: mirror the guest's PCI Bus Master Enable in. With it clear, a queue notify walks nothing:
+ * the descriptors are unreachable to a device that cannot master the bus. */
+void hype_virtio_blk_set_bus_master(hype_virtio_blk_t *dev, int enabled);
 
 /*
  * Reads/writes the common configuration register at `offset` (byte

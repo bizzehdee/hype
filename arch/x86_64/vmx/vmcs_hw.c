@@ -3744,6 +3744,18 @@ int hype_vmx_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
         /* A submission-queue doorbell is what makes the controller work; drained synchronously here
          * for the same reason as the SVM path -- hype has no worker thread. */
         if (hype_nvme_doorbell_decode(m.offset, &qid, &is_cq) == 0 && !is_cq) {
+            /* #372: refusal lives in hype_nvme_process_sq; the report has to be here, because
+             * devices/nvme.c is host-unit-tested and hype_debug_print faults that binary (#296). */
+            if (dev->bus_master == 0) {
+                static int reported;
+                if (!reported) {
+                    reported = 1;
+                    hype_debug_print("nvme: doorbell IGNORED -- the guest has not set PCI Bus "
+                                     "Master Enable (Command bit 2), so the controller cannot "
+                                     "fetch an SQE, walk a PRP or post a completion. This command "
+                                     "will never complete, exactly as on real hardware. [#372]\n");
+                }
+            }
             (void)hype_nvme_process_sq(dev, qid, nctx);
         }
     } else {

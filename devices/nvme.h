@@ -125,6 +125,16 @@ typedef struct {
      */
     uint32_t sq_entries[HYPE_NVME_MAX_QUEUES];
     uint32_t cq_entries[HYPE_NVME_MAX_QUEUES];
+
+    /*
+     * #372: the guest's PCI Bus Master Enable, mirrored in so this model stays PCI-free.
+     *
+     * An NVMe controller fetches submission-queue entries, walks PRPs and moves data by mastering
+     * the bus. With the bit clear a doorbell write must produce nothing -- no completion is ever
+     * posted, and the driver's wait never ends. Defaults to enabled for the same reason as the
+     * other models: the microtests drive this with no PCI at all. See devices/ahci.h.
+     */
+    int bus_master;
 } hype_nvme_t;
 
 /*
@@ -136,6 +146,9 @@ typedef struct {
  * and the driver would poll forever.
  */
 void hype_nvme_reset(hype_nvme_t *dev);
+
+/* #372: mirror the guest's PCI Bus Master Enable in. With it clear, a doorbell walks no queue. */
+void hype_nvme_set_bus_master(hype_nvme_t *dev, int enabled);
 
 /* #202: called once when a guest driver sets CC.EN -- i.e. when it has actually bound this controller.
  * Weakly defined in devices/nvme.c so the unit tests need no logging; boot/main.c provides the real one. */
