@@ -96,6 +96,68 @@ int hype_ahci_host_build_write_dma_ext(uint8_t *cmd_table, uint64_t lba, uint16_
     return build_rw_dma_ext(cmd_table, lba, count, src_phys, HYPE_ATA_CMD_WRITE_DMA_EXT);
 }
 
+/* #295: see the header. Builds the same command as above with one PRDT entry per segment. */
+int hype_ahci_host_build_write_dma_ext_sg(uint8_t *cmd_table, uint64_t lba, uint16_t count,
+                                          const hype_ahci_host_sg_t *segs, unsigned int nsegs,
+                                          unsigned int max_prdt) {
+    uint8_t *prd;
+    uint64_t summed = 0;
+    unsigned int i;
+
+    if (cmd_table == 0 || segs == 0 || nsegs == 0u || max_prdt == 0u || nsegs > max_prdt) {
+        return -1;
+    }
+    /*
+     * Validate EVERY segment before writing any of them. A half-built command table whose header
+     * already says PRDTL=nsegs would be issued by the caller and move whatever the stale remainder
+     * of the table happens to contain -- on the write path, to a real disk.
+     */
+    for (i = 0; i < nsegs; i++) {
+        if (segs[i].bytes == 0u || (segs[i].bytes % HYPE_AHCI_HOST_SECTOR_SIZE) != 0u) {
+            return -1;
+        }
+        if (segs[i].bytes > HYPE_AHCI_HOST_PRDT_MAX_BYTES) {
+            return -1;
+        }
+        summed += (uint64_t)segs[i].bytes;
+    }
+    /* The FIS count is what the drive acts on; the PRDT is what it moves. If they disagree the
+     * drive either starves waiting for data or leaves some unwritten, and both look like success
+     * from the command's own status. */
+    if (summed != (uint64_t)count * (uint64_t)HYPE_AHCI_HOST_SECTOR_SIZE) {
+        return -1;
+    }
+
+    /*
+     * Build the FIS through the single-entry path so the two cannot drift apart -- but then rewrite
+     * EVERY PRDT entry, including the first.
+     *
+     * build_rw_dma_ext sizes PRDT[0] to the WHOLE transfer (count * 512), which is right when there
+     * is one buffer and catastrophically wrong when there are several: the drive would take the
+     * entire merged payload from segment 0's buffer, reading far past its end. Rewriting from i=0
+     * rather than patching afterwards keeps that impossible to overlook.
+     *
+     * Note this also inherits build_rw_dma_ext's 4 MiB ceiling on the TOTAL, which for a merged
+     * command is stricter than AHCI requires (the limit is per PRDT entry). It refuses rather than
+     * truncates, and 4 MiB is 512x the largest merge this path can currently produce, so it is a
+     * bound worth keeping until something needs otherwise.
+     */
+    if (build_rw_dma_ext(cmd_table, lba, count, segs[0].phys, HYPE_ATA_CMD_WRITE_DMA_EXT) != 0) {
+        return -1;
+    }
+    for (i = 0u; i < nsegs; i++) {
+        unsigned int b;
+        prd = cmd_table + HYPE_AHCI_HOST_CT_PRDT_OFF + i * HYPE_AHCI_HOST_PRDT_ENTRY_SIZE;
+        for (b = 0; b < HYPE_AHCI_HOST_PRDT_ENTRY_SIZE; b++) {
+            prd[b] = 0;
+        }
+        put_le32(prd + 0, (uint32_t)segs[i].phys);
+        put_le32(prd + 4, (uint32_t)(segs[i].phys >> 32));
+        put_le32(prd + 12, (segs[i].bytes - 1u) & 0x3FFFFFu);
+    }
+    return 0;
+}
+
 void hype_ahci_host_build_identify(uint8_t *cmd_table, uint64_t dst_phys) {
     uint8_t *fis = cmd_table + HYPE_AHCI_HOST_CT_CFIS_OFF;
     uint8_t *prd = cmd_table + HYPE_AHCI_HOST_CT_PRDT_OFF;

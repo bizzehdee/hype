@@ -395,6 +395,100 @@ static void test_gather_edge_inputs(void) {
               (int)hype_ahci_host_gather_span(&r, 1u, 32u, 2048u));
 }
 
+
+/*
+ * #295: the multi-PRDT builder. The first test here is the one that matters most: it would have
+ * caught the bug I wrote first time, where PRDT[0] inherited the WHOLE transfer size from the
+ * single-entry path and the drive would have taken every merged byte from segment 0's buffer.
+ */
+static void test_sg_write_sizes_every_prdt_entry_individually(void) {
+    uint8_t ct[0x80 + 4 * 16];
+    hype_ahci_host_sg_t segs[3];
+    hype_ahci_prdt_entry_t e;
+    unsigned i;
+
+    for (i = 0; i < sizeof(ct); i++) ct[i] = 0xAAu;
+    segs[0].phys = 0x11110000ull; segs[0].bytes = 4096u;   /* 8 sectors */
+    segs[1].phys = 0x22220000ull; segs[1].bytes = 4096u;
+    segs[2].phys = 0x33330000ull; segs[2].bytes = 8192u;   /* 16 sectors */
+
+    CHECK_HEX("builds", 0, hype_ahci_host_build_write_dma_ext_sg(ct, 4096ull, 32u, segs, 3u, 8u));
+
+    hype_ahci_decode_prdt_entry(ct + 0x80, &e);
+    CHECK_HEX("PRDT0 base", 0x11110000ull, e.data_phys);
+    CHECK_HEX("PRDT0 carries ITS OWN length, not the total", 4096u, e.byte_count);
+    hype_ahci_decode_prdt_entry(ct + 0x80 + 16, &e);
+    CHECK_HEX("PRDT1 base", 0x22220000ull, e.data_phys);
+    CHECK_HEX("PRDT1 length", 4096u, e.byte_count);
+    hype_ahci_decode_prdt_entry(ct + 0x80 + 32, &e);
+    CHECK_HEX("PRDT2 base", 0x33330000ull, e.data_phys);
+    CHECK_HEX("PRDT2 length", 8192u, e.byte_count);
+}
+
+static void test_sg_write_fis_carries_the_total(void) {
+    uint8_t ct[0x80 + 2 * 16];
+    hype_ahci_host_sg_t segs[2];
+    hype_ahci_h2d_fis_t fis;
+
+    segs[0].phys = 0x1000ull; segs[0].bytes = 4096u;
+    segs[1].phys = 0x2000ull; segs[1].bytes = 4096u;
+    CHECK_HEX("builds", 0, hype_ahci_host_build_write_dma_ext_sg(ct, 0x123456ull, 16u, segs, 2u, 8u));
+
+    hype_ahci_decode_h2d_fis(ct, &fis);
+    CHECK_HEX("WRITE DMA EXT", 0x35u, fis.command);
+    CHECK_HEX("LBA", 0x123456ull, fis.lba);
+    CHECK_HEX("count is the SUM of the segments", 16u, fis.count);
+}
+
+static void test_sg_write_refuses_a_count_that_disagrees_with_the_segments(void) {
+    uint8_t ct[0x80 + 2 * 16];
+    hype_ahci_host_sg_t segs[2];
+
+    segs[0].phys = 0x1000ull; segs[0].bytes = 4096u;
+    segs[1].phys = 0x2000ull; segs[1].bytes = 4096u;
+    /* 16 sectors of PRDT against a FIS asking for 17. The drive acts on the FIS and moves the
+     * PRDT: it would starve or leave data unwritten, and the command status would say neither. */
+    CHECK_HEX("count too large is refused", -1,
+              hype_ahci_host_build_write_dma_ext_sg(ct, 0, 17u, segs, 2u, 8u));
+    CHECK_HEX("count too small is refused", -1,
+              hype_ahci_host_build_write_dma_ext_sg(ct, 0, 15u, segs, 2u, 8u));
+}
+
+static void test_sg_write_rejects_bad_segments_before_writing_anything(void) {
+    uint8_t ct[0x80 + 4 * 16];
+    hype_ahci_host_sg_t segs[3];
+    unsigned i;
+
+    for (i = 0; i < sizeof(ct); i++) ct[i] = 0x5Au;
+    segs[0].phys = 0x1000ull; segs[0].bytes = 4096u;
+    segs[1].phys = 0x2000ull; segs[1].bytes = 0u; /* empty */
+    segs[2].phys = 0x3000ull; segs[2].bytes = 4096u;
+    CHECK_HEX("an empty segment is refused", -1,
+              hype_ahci_host_build_write_dma_ext_sg(ct, 0, 16u, segs, 3u, 8u));
+    /* Nothing may have been written: a half-built table whose header already says PRDTL=n would be
+     * issued anyway and would move whatever the stale remainder contains. */
+    CHECK_HEX("the command table is untouched", 0x5Au, ct[0]);
+    CHECK_HEX("...including the PRDT area", 0x5Au, ct[0x80]);
+
+    segs[1].bytes = 4095u; /* not a whole sector */
+    CHECK_HEX("a partial-sector segment is refused", -1,
+              hype_ahci_host_build_write_dma_ext_sg(ct, 0, 16u, segs, 3u, 8u));
+}
+
+static void test_sg_write_edge_inputs(void) {
+    uint8_t ct[0x80 + 16];
+    hype_ahci_host_sg_t seg;
+    seg.phys = 0x1000ull; seg.bytes = 4096u;
+
+    CHECK_HEX("null table", -1, hype_ahci_host_build_write_dma_ext_sg(0, 0, 8u, &seg, 1u, 8u));
+    CHECK_HEX("null segments", -1, hype_ahci_host_build_write_dma_ext_sg(ct, 0, 8u, 0, 1u, 8u));
+    CHECK_HEX("zero segments", -1, hype_ahci_host_build_write_dma_ext_sg(ct, 0, 8u, &seg, 0u, 8u));
+    CHECK_HEX("more segments than the PRDT allows", -1,
+              hype_ahci_host_build_write_dma_ext_sg(ct, 0, 8u, &seg, 2u, 1u));
+    CHECK_HEX("one segment is the ordinary single-entry command", 0,
+              hype_ahci_host_build_write_dma_ext_sg(ct, 0, 8u, &seg, 1u, 8u));
+}
+
 int main(void) {
     test_settle_stops_when_all_ports_established();
     test_settle_waits_for_a_negotiating_port();
@@ -420,6 +514,11 @@ int main(void) {
     test_gather_respects_the_sector_cap();
     test_gather_refuses_an_unissuable_first_request();
     test_gather_edge_inputs();
+    test_sg_write_sizes_every_prdt_entry_individually();
+    test_sg_write_fis_carries_the_total();
+    test_sg_write_refuses_a_count_that_disagrees_with_the_segments();
+    test_sg_write_rejects_bad_segments_before_writing_anything();
+    test_sg_write_edge_inputs();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;

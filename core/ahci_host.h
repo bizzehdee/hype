@@ -311,4 +311,30 @@ typedef struct {
 unsigned int hype_ahci_host_gather_span(const hype_ahci_host_gather_req_t *reqs, unsigned int n,
                                         unsigned int max_segs, uint32_t max_sectors);
 
+/*
+ * #295: WRITE DMA EXT with one PRDT entry PER SEGMENT -- the construction half.
+ *
+ * Same command as hype_ahci_host_build_write_dma_ext, but the data comes from `nsegs` separate host
+ * buffers instead of one. That is what lets adjacent guest requests merge with no bounce buffer:
+ * each request keeps its own buffer and contributes its own PRDT entry.
+ *
+ * The caller must set PRDTL to `nsegs` in the command header (hype_ahci_host_build_cmd_header) --
+ * a header still saying 1 would transfer only the first segment and report success, which is a
+ * short write with no error.
+ *
+ * `count` is the TOTAL sectors and must equal the sum of the segment lengths; the mismatch is
+ * refused rather than trusted, because the FIS count is what the drive acts on and the PRDT is what
+ * it moves. Returns 0, or -1 if nsegs is 0 or above `max_prdt`, if any segment is empty, not a
+ * whole number of sectors, or larger than one PRDT entry allows, or if the lengths do not sum to
+ * `count`.
+ */
+typedef struct {
+    uint64_t phys;  /* host-physical base of this segment */
+    uint32_t bytes; /* its length; must be a whole number of 512-byte sectors */
+} hype_ahci_host_sg_t;
+
+int hype_ahci_host_build_write_dma_ext_sg(uint8_t *cmd_table, uint64_t lba, uint16_t count,
+                                          const hype_ahci_host_sg_t *segs, unsigned int nsegs,
+                                          unsigned int max_prdt);
+
 #endif /* HYPE_CORE_AHCI_HOST_H */
