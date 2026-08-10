@@ -1,0 +1,20 @@
+# #297: does the guest actually get a serial from VIRTIO_BLK_T_GET_ID?
+#
+# The ticket was filed on "unsupported request type" rejections at probe time and inferred -- but
+# did not confirm -- that the type was GET_ID (8). #310 then implemented GET_ID for FreeBSD's vtblk.
+# Nobody checked whether that closed this ticket, so it is still open.
+#
+# /sys/block/vda/serial is populated by Linux's virtio_blk driver ONLY from a successful GET_ID, so
+# reading it is a direct end-to-end test: the string appearing means the request type is handled,
+# the serial reached the guest, and the used-ring length was right. An empty or missing file means
+# it is not.
+timeout 300000
+expect localhost login:
+send root\n
+expect ~#
+send cat /sys/block/vda/serial; echo; echo SERIAL-DONE\n
+expect SERIAL-DONE
+# Rejections are logged by hype itself (#268), so a clean run should show none at all.
+send dmesg | grep -iE 'vda|virtio_blk' | head -5; echo DMESG-DONE\n
+expect DMESG-DONE
+pass serial-check
