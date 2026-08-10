@@ -41,7 +41,12 @@ static void test_request_prompt_pending(void) {
     CHECK_HAS("prompt names serial", buf, "S4EWNF0");
     CHECK_HAS("prompt warns destroy", buf, "DESTROYED");
     CHECK_HAS("prompt shows GiB size", buf, "465.7 GiB");
-    CHECK_HAS("prompt gives confirm cmd", buf, "confirm S4EWNF0");
+    /* #125 revision: the prompt asks for a short word, not the serial. The serial is still shown
+     * -- its safety value is in being READ and checked, which a footer full of diagnostics made
+     * hard when it also had to be transcribed. */
+    CHECK_HAS("prompt gives the short confirm cmd", buf, "confirm agree");
+    CHECK_HAS("prompt still shows the serial to check", buf, "S4EWNF0");
+    CHECK_HAS("prompt still shows the model to check", buf, "Samsung SSD 990");
 }
 
 static void test_submit_mismatch_then_match(void) {
@@ -197,6 +202,41 @@ static void test_prompt_truncation_and_nulls(void) {
     }
 }
 
+
+/*
+ * #125 revision: which tokens are accepted. Re-typing a 17-character serial from a diagnostic-
+ * covered footer was friction without safety -- the guard that actually refuses a wrong drive is
+ * #124's identity match, which is untouched.
+ */
+static void test_short_tokens_are_accepted(void) {
+    const char *toks[] = {"agree", "yes", "confirm", "S4EWNF0"};
+    unsigned i;
+    for (i = 0; i < 4u; i++) {
+        hype_phys_confirm_t c;
+        hype_phys_confirm_reset(&c);
+        hype_phys_confirm_request(&c, "winvm", "Samsung SSD 990", "S4EWNF0", 500000000000ull);
+        CHECK_INT("accepted", (int)HYPE_PHYS_CONFIRM_SUBMIT_ACCEPTED,
+                  (int)hype_phys_confirm_submit(&c, toks[i]));
+        CHECK_INT("state is accepted", 1, hype_phys_confirm_is_accepted(&c));
+    }
+}
+
+static void test_empty_or_wrong_token_is_still_refused(void) {
+    hype_phys_confirm_t c;
+    hype_phys_confirm_reset(&c);
+    hype_phys_confirm_request(&c, "winvm", "Samsung SSD 990", "S4EWNF0", 500000000000ull);
+    /* A bare Enter is not a decision. */
+    CHECK_INT("empty refused", (int)HYPE_PHYS_CONFIRM_SUBMIT_MISMATCH,
+              (int)hype_phys_confirm_submit(&c, ""));
+    CHECK_INT("whitespace refused", (int)HYPE_PHYS_CONFIRM_SUBMIT_MISMATCH,
+              (int)hype_phys_confirm_submit(&c, "   "));
+    CHECK_INT("some other word refused", (int)HYPE_PHYS_CONFIRM_SUBMIT_MISMATCH,
+              (int)hype_phys_confirm_submit(&c, "ok"));
+    CHECK_INT("a DIFFERENT drive's serial refused", (int)HYPE_PHYS_CONFIRM_SUBMIT_MISMATCH,
+              (int)hype_phys_confirm_submit(&c, "2132E5BF4EAE"));
+    CHECK_INT("still not accepted", 0, hype_phys_confirm_is_accepted(&c));
+}
+
 int main(void) {
     test_request_prompt_pending();
     test_submit_mismatch_then_match();
@@ -208,6 +248,8 @@ int main(void) {
     test_size_formatting();
     test_prompt_truncation_and_nulls();
 
+    test_short_tokens_are_accepted();
+    test_empty_or_wrong_token_is_still_refused();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;

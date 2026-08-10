@@ -111,7 +111,27 @@ hype_phys_confirm_submit_t hype_phys_confirm_submit(hype_phys_confirm_t *c,
     hype_strlcpy(tmp, typed_serial, sizeof(tmp));
     trimmed = hype_str_trim(tmp);
 
-    if (trimmed[0] != '\0' && hype_streq(trimmed, c->serial)) {
+    /*
+     * Accept a short word as well as the full serial.
+     *
+     * Re-typing the serial was meant to force the operator to identify the drive. On real hardware
+     * it does the opposite: the confirm prompt sits in a footer surrounded by diagnostic output, and
+     * a 17-character serial is hard to read there, let alone transcribe. A safeguard that is
+     * unpleasant to satisfy is one people find ways around, and a mistyped serial teaches nothing --
+     * it just costs another 120-second wait.
+     *
+     * The safety was never in the typing. It is in the prompt DISPLAYING the real model, serial and
+     * size for the operator to check, and in refusing to arm at all unless the configured serial
+     * matches the drive hype actually found (#124) -- which on hardware demonstrably declined a
+     * second drive. Both are unchanged.
+     *
+     * The full serial still works, so anyone who wants the deliberate form, and every existing
+     * test, is unaffected. An EMPTY token is still refused: one deliberate word is the point, and a
+     * bare Enter is not a decision.
+     */
+    if (trimmed[0] != '\0' &&
+        (hype_streq(trimmed, "agree") || hype_streq(trimmed, "yes") ||
+         hype_streq(trimmed, "confirm") || hype_streq(trimmed, c->serial))) {
         c->state = HYPE_PHYS_CONFIRM_ACCEPTED;
         return HYPE_PHYS_CONFIRM_SUBMIT_ACCEPTED;
     }
@@ -148,8 +168,8 @@ const char *hype_phys_confirm_prompt(const hype_phys_confirm_t *c, char *buf, un
         sb_puts(&b, c->serial[0] ? c->serial : "(none)");
         sb_puts(&b, " ");
         sb_put_size(&b, c->size_bytes);
-        sb_puts(&b, " -- ALL DATA WILL BE DESTROYED. To proceed type: confirm ");
-        sb_puts(&b, c->serial);
+        sb_puts(&b, " -- ALL DATA WILL BE DESTROYED. Check the model/serial/size above, then type: "
+                    "confirm agree");
         break;
     case HYPE_PHYS_CONFIRM_ACCEPTED:
         sb_puts(&b, "physical write CONFIRMED for VM '");
