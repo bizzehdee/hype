@@ -194,6 +194,47 @@ static void test_memory_space_enable_bit(void) {
     CHECK_HEX("memory space enabled after setting bit 1", 1, hype_pci_memory_space_enabled(&pci, 0));
 }
 
+/*
+ * #372: Bus Master Enable, the bit that decides whether a controller may reach guest memory at all.
+ * Emulated devices used to transfer regardless, so a guest driver that forgot it worked here and
+ * hung on real hardware -- hype gave a passing result for code that is wrong.
+ */
+static void test_bus_master_enabled(void) {
+    hype_pci_t pci;
+    hype_pci_ecam_addr_t command_reg = {0, 0, 0, 0x04};
+
+    hype_pci_reset(&pci);
+    hype_pci_add_device(&pci, 0, HYPE_PCI_VENDOR_ID_HYPE, 0x0000u, 0x06, 0x00, 0x00);
+
+    CHECK_HEX("bus master disabled by default", 0, hype_pci_bus_master_enabled(&pci, 0));
+
+    /* Memory-space enable must NOT imply bus master: they are separate bits and a driver commonly
+     * sets the first and forgets the second, which is the exact bug this models. */
+    hype_pci_config_write(&pci, &command_reg, 2, 0x0002u);
+    CHECK_HEX("memory space alone does not enable bus master", 0,
+              hype_pci_bus_master_enabled(&pci, 0));
+    CHECK_HEX("...and memory space itself is on", 1, hype_pci_memory_space_enabled(&pci, 0));
+
+    hype_pci_config_write(&pci, &command_reg, 2, 0x0006u);
+    CHECK_HEX("bus master enabled after setting bit 2", 1, hype_pci_bus_master_enabled(&pci, 0));
+
+    /* A driver unbinding or resetting the device clears it again; hype must follow, which is why
+     * the live path re-reads this rather than latching it once. */
+    hype_pci_config_write(&pci, &command_reg, 2, 0x0002u);
+    CHECK_HEX("bus master clears again when the guest clears the bit", 0,
+              hype_pci_bus_master_enabled(&pci, 0));
+}
+
+static void test_bus_master_out_of_range_and_absent(void) {
+    hype_pci_t pci;
+
+    hype_pci_reset(&pci);
+    /* Refusing is the safe answer for a device that is not there: the alternative reads a
+     * neighbouring slot's config and authorises a transfer on its behalf. */
+    CHECK_HEX("out-of-range device", 0, hype_pci_bus_master_enabled(&pci, HYPE_PCI_MAX_DEVICES));
+    CHECK_HEX("absent device", 0, hype_pci_bus_master_enabled(&pci, 3));
+}
+
 static void test_add_device_out_of_range_rejected(void) {
     hype_pci_t pci;
     int rc;
@@ -381,6 +422,8 @@ int main(void) {
     test_unimplemented_bar_always_reads_zero();
     test_write_to_absent_device_is_dropped();
     test_memory_space_enable_bit();
+    test_bus_master_enabled();
+    test_bus_master_out_of_range_and_absent();
     test_add_device_out_of_range_rejected();
     test_set_bar_size_out_of_range_is_a_no_op();
     test_get_bar_value_out_of_range_and_absent();

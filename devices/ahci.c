@@ -17,6 +17,16 @@ void hype_ahci_reset(hype_ahci_t *ahci) {
     ahci->p_sig = HYPE_AHCI_SIG_ATAPI;
     ahci->p_ssts = 0x00000123u; /* IPM=1 (active), SPD=1 (Gen1), DET=3 (present, phy comm established) */
     ahci->p_tfd = 0x00000050u;  /* STATUS = DRDY|DSC, no ERR/BSY/DRQ */
+    /* #372: permissive by default -- see the field's comment in the header for why, and note that
+     * the live path overrides it immediately with the guest's real PCI state. */
+    ahci->bus_master = 1;
+}
+
+void hype_ahci_set_bus_master(hype_ahci_t *ahci, int enabled) {
+    if (ahci == 0) {
+        return;
+    }
+    ahci->bus_master = (enabled != 0) ? 1 : 0;
 }
 
 int hype_ahci_mmio_read(const hype_ahci_t *ahci, uint32_t offset, uint8_t size_bytes, uint32_t *out_value) {

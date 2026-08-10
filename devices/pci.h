@@ -169,6 +169,21 @@ uint32_t hype_pci_get_bar_value(const hype_pci_t *pci, uint8_t device_number, un
 int hype_pci_memory_space_enabled(const hype_pci_t *pci, uint8_t device_number);
 
 /*
+ * #372: True if the device's Command register has Bus Master Enable (bit 2) set.
+ *
+ * On real hardware this gates the device's ability to initiate bus transactions AT ALL. With it
+ * clear, a command written to the controller is accepted and simply never completes, and a driver
+ * polling for completion spins forever -- which is the single most common cause of "my AHCI
+ * command never finishes" and the first thing an experienced driver author checks.
+ *
+ * hype's emulated devices used to transfer regardless, so a guest driver with that bug worked here
+ * and hung on real hardware. This is a FIDELITY predicate, not a safety one: hype's "DMA" is a copy
+ * within guest RAM it already owns, so there is nothing to contain -- the point is to refuse work
+ * the hardware would refuse, rather than give a passing result for code that is wrong.
+ */
+int hype_pci_bus_master_enabled(const hype_pci_t *pci, uint8_t device_number);
+
+/*
  * Decodes an ECAM byte offset (relative to the whole MCFG-described
  * region's own base) into bus/device/function/register. Pure bit
  * extraction, no CPU/guest-memory access of its own.

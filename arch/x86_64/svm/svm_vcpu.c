@@ -1840,6 +1840,36 @@ static int complete_ahci_soft_reset(hype_ahci_t *ahci, uint64_t rx_fis_phys,
 /* #344: bounded completion trace, see its use below. */
 static unsigned int g_atapi_completion_traced;
 
+/*
+ * #372: refuse a command when the guest has not enabled PCI Bus Master.
+ *
+ * Every structure this function touches -- the command list, the command table, each PRD's data
+ * pointer, the receive FIS -- is reached by the controller MASTERING THE BUS. With BME clear the
+ * hardware cannot issue any of those cycles, so the command sits in PxCI and never retires, and a
+ * driver polling for completion spins forever. That is the failure a guest driver which forgot to
+ * set the bit must be allowed to see here.
+ *
+ * Leaving PxCI set is the whole behaviour: returning "done" or clearing the slot would hide it.
+ * Said once on the diagnostic channel, because an operator debugging their own guest driver
+ * deserves the reason rather than hype's silence -- which would only move the confusion one layer
+ * down, and is the same mistake as a counter that cannot observe its own subject.
+ */
+static int ahci_bus_master_refused(const hype_ahci_t *ahci, const char *what) {
+    static int reported;
+    if (ahci->bus_master != 0) {
+        return 0;
+    }
+    if (!reported) {
+        reported = 1;
+        hype_debug_print("ahci: %s IGNORED -- the guest has not set PCI Bus Master Enable "
+                         "(Command bit 2), so the controller cannot reach the command list or any "
+                         "PRD. PxCI stays set and this command will never complete, exactly as on "
+                         "real hardware. [#372]\n",
+                         what);
+    }
+    return 1;
+}
+
 int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
                               const hype_gpa_map_t *dma_map, unsigned slot) {
     uint64_t cmd_list_phys =
@@ -1869,6 +1899,13 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     int packet_pio_in = 0;
     uint8_t *d2h_fis;
     unsigned i;
+
+    /* #372: before any of it -- can this controller master the bus at all? Returning 0 (not -1)
+     * because nothing is WRONG: the guest asked for something the hardware would silently not do,
+     * and the caller must not treat that as a decode failure and panic. PxCI stays set. */
+    if (ahci_bus_master_refused(ahci, "PxCI write")) {
+        return 0;
+    }
 
     /* VALID-3: every guest-physical address the AHCI command structures
      * carry is guest-controlled, so each is translated through the VM's
@@ -2551,6 +2588,13 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
      */
     uint32_t pis_bit = HYPE_AHCI_PIS_DHRS;
     int is_write_direction = 0;
+
+    /* #372: the disk path masters the bus for exactly the same structures as the ATAPI one, so it
+     * gets the same gate. 0, not -1: the caller panics on -1, and a guest that has not enabled bus
+     * mastering is doing something the hardware ignores, not something undecodable. */
+    if (ahci_bus_master_refused(ahci, "PxCI write (disk)")) {
+        return 0;
+    }
 
     hype_ahci_decode_cmd_header(cmd_hdr_bytes, &hdr);
     if (hdr.is_atapi) {

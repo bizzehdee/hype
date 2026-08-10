@@ -163,6 +163,14 @@ int hype_vmx_smoke_test(void);
 #define HYPE_363_WEDGE_VM0 0
 #endif
 
+/* #372 fault injection: pretend the guest never set PCI Bus Master Enable on the CD-ROM HBA, so the
+ * refusal path can be exercised on demand. A real guest always sets it -- OVMF and Linux both do --
+ * which means the normal boot proves only that the gate does not FIRE. Proving it fires, and that
+ * hype says why, needs the bit forced off. 0 = off, the shipping default. */
+#ifndef HYPE_372_CLEAR_BME
+#define HYPE_372_CLEAR_BME 0
+#endif
+
 /* #229 SATA counterpart: attach the REAL SATA disk (host AHCI) as vm0's guest
  * vda, READ-ONLY, bypassing the destructive-write confirm entirely (reads are
  * non-destructive, so no serial-match/confirm is needed -- and this MUST stay
@@ -12088,6 +12096,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * faults as an NPF -- unlike PCI-2's full identity map,
                  * which had to mark it not-present explicitly. Only
                  * latched once; this guest never reprograms BAR5. */
+                /*
+                 * #372: mirror the guest's Bus Master Enable into both HBAs, beside the
+                 * memory-space latch that already reads the same register.
+                 *
+                 * Re-read every pass rather than latched once, because unlike a BAR the guest can
+                 * legitimately clear this bit again -- a driver unbinding, or resetting the device,
+                 * does exactly that, and a latch would leave hype mastering the bus for a
+                 * controller the guest has switched off. Cheap: it is a byte out of a struct.
+                 */
+                hype_ahci_set_bus_master(&g_fw_1_ahci,
+                                         HYPE_372_CLEAR_BME
+                                             ? 0
+                                             : hype_pci_bus_master_enabled(
+                                                   &g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI));
+                hype_ahci_set_bus_master(&g_fw_1_ata_ahci, hype_pci_bus_master_enabled(
+                                                               &g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA));
                 if (!ahci_mapped && hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI)) {
                     uint64_t bar5 = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5);
                     if (bar5 != 0) {

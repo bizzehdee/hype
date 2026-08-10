@@ -160,6 +160,23 @@ typedef struct {
      * has to remember it saw the first. Cleared by hype_ahci_reset().
      */
     int srst_asserted;
+
+    /*
+     * #372: does the guest's PCI Command register have Bus Master Enable set?
+     *
+     * Mirrored in from PCI config rather than read from it, so this model stays free of any PCI
+     * dependency (devices/ahci.c references PCI nowhere, deliberately). The live path pushes the
+     * real value with hype_ahci_set_bus_master() at setup and on every config write.
+     *
+     * DEFAULTS TO ENABLED in hype_ahci_reset(), and that default is a compromise worth naming:
+     * twenty-four call sites drive this model directly with no PCI at all (sixteen unit tests and
+     * eight boot microtests), and a refusing default would break every one of them for no gain --
+     * none of them is a guest, so none can demonstrate the behaviour this models. The default is
+     * therefore permissive and the LIVE path is explicit. That is the weaker half of this fix: a
+     * future device path that forgets to push its state gets the old permissive behaviour rather
+     * than a loud failure.
+     */
+    int bus_master;
 } hype_ahci_t;
 
 /*
@@ -172,6 +189,16 @@ typedef struct {
  * after its own init sequence" conventions elsewhere in this project.
  */
 void hype_ahci_reset(hype_ahci_t *ahci);
+
+/*
+ * #372: mirror the guest's PCI Bus Master Enable state into the controller.
+ *
+ * Call it whenever the guest writes the PCI Command register, and once at setup so the initial
+ * state is the real one rather than the permissive default. With it clear, a command written to
+ * PxCI is accepted and never completes -- exactly what the hardware does, and what a guest driver
+ * that forgot to enable bus mastering must be allowed to discover here rather than in the field.
+ */
+void hype_ahci_set_bus_master(hype_ahci_t *ahci, int enabled);
 
 /* Override the port signature after reset, so one HBA can present a plain SATA disk
  * while another presents the optical drive (#262). */

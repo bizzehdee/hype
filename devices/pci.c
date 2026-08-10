@@ -101,6 +101,21 @@ int hype_pci_memory_space_enabled(const hype_pci_t *pci, uint8_t device_number) 
     return (command & 0x0002u) != 0;
 }
 
+int hype_pci_bus_master_enabled(const hype_pci_t *pci, uint8_t device_number) {
+    const hype_pci_device_t *dev;
+    uint16_t command;
+
+    if (device_number >= HYPE_PCI_MAX_DEVICES) {
+        return 0;
+    }
+    dev = &pci->devices[device_number];
+    if (!dev->in_use) {
+        return 0;
+    }
+    command = (uint16_t)dev->config[0x04] | ((uint16_t)dev->config[0x05] << 8);
+    return (command & 0x0004u) != 0;
+}
+
 void hype_pci_decode_ecam_offset(uint64_t offset, hype_pci_ecam_addr_t *out) {
     out->bus = (unsigned int)((offset >> HYPE_PCI_ECAM_BUS_SHIFT) & HYPE_PCI_ECAM_BUS_MASK);
     out->device = (unsigned int)((offset >> HYPE_PCI_ECAM_DEVICE_SHIFT) & HYPE_PCI_ECAM_DEVICE_MASK);
