@@ -52,6 +52,13 @@
 int hype_ext_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_file_map_t *out);
 
 /*
+ * #293: does this volume carry a supported, cleanly-unmounted ext2/3/4
+ * filesystem? The same superblock gate hype_ext_resolve applies, without
+ * resolving anything. Returns 0 (claimed) or -1. Read-only.
+ */
+int hype_ext_probe(hype_blk_read_fn read, void *ctx);
+
+/*
  * #204 (STORAGE: ext2/3/4 host filesystem WRITE) -- IN-PLACE writes to an
  * existing, fully-allocated backing file, the ext counterpart of
  * hype_exfat_write_at(): persist guest disk writes back into a raw image

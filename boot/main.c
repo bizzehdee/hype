@@ -16035,7 +16035,7 @@ static void usb_log_flush_limit(unsigned int max_source_bytes) {
         hype_rtc_time_t now;
         hype_rtc_advance(&g_host_time, (hype_rdtsc() - g_host_time_tsc) / g_vms[0].host_tsc_hz,
                          &now);
-        hype_fat32_fs_set_time(&g_hype_log.fs, &now);
+        hype_fs_set_time(&g_hype_log.fs, &now);
     }
     /* Do NOT discard this. A flush that starts failing mid-run used to be silent,
      * so the log simply stopped growing and a perfectly healthy hype was
@@ -16085,14 +16085,14 @@ static void usb_log_flush_limit(unsigned int max_source_bytes) {
             "running and this log is INCOMPLETE, not the end of the run. ***\n";
         g_logbuf_full_reported = 1;
         hype_serial_print("%s", msg);
-        (void)hype_fat32_append(&g_hype_log.file, msg, (unsigned int)(sizeof(msg) - 1u));
+        (void)hype_fs_append(&g_hype_log.file, msg, (unsigned int)(sizeof(msg) - 1u));
     }
     {
         unsigned int vi;
         for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
             if (!g_vm_log_ready[vi]) continue;
             if (hype_log_sink_flush_budget(&g_vm_log[vi], max_source_bytes) != 0) {
-                if (g_vm_log[vi].file.last_error == HYPE_FAT32_WFILE_ERR_IDENTITY) {
+                if (hype_fs_file_identity_error(&g_vm_log[vi].file)) {
                     hype_debug_print(
                         "usb-log: VM%u LOG STOPPED -- FAT chain identity changed; "
                         "the writer rejected the metadata update to prevent a cross-link [#377]\n",

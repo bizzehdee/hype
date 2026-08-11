@@ -2,7 +2,7 @@
 #define HYPE_CORE_LOG_SINK_H
 
 #include <stdint.h>
-#include "fat_write_fs.h"
+#include "fs_ops.h"
 #include "rtc.h"
 
 /*
@@ -30,8 +30,8 @@
 /* >= 0: that VM index's guest serial only */
 
 typedef struct {
-    hype_fat32_fs_t fs;
-    hype_fat32_wfile_t file;
+    hype_fs_t fs;
+    hype_fs_file_t file;
     unsigned int flushed; /* logbuf bytes already streamed to the file */
     int active;           /* 1 once the volume mounted and the file was created */
     int filter;           /* #338: HYPE_LOG_SINK_ALL / _HYPE / a VM index */
@@ -47,12 +47,13 @@ typedef struct {
  * is worse, because it sends the next person to the wrong layer.
  */
 #define HYPE_LOG_SINK_OK 0
-#define HYPE_LOG_SINK_ERR_MOUNT (-1)  /* not a FAT32 volume at this base LBA */
+#define HYPE_LOG_SINK_ERR_MOUNT (-1)  /* no writable (create+append) volume at this base LBA */
 #define HYPE_LOG_SINK_ERR_CREATE (-2) /* mounted, but the file could not be created */
 #define HYPE_LOG_SINK_ERR_WRITE (-3)  /* created, but the first append failed (block I/O) */
 
 /*
- * Mounts the FAT32 volume, creates (truncating) `filename` (8.3) in its root,
+ * Mounts the volume (any registered driver with create+append), creates
+ * (truncating) `filename` (8.3) in its root,
  * and streams whatever the logbuf already holds. Returns HYPE_LOG_SINK_OK, or one
  * of the ERR codes above -- which stage failed is the useful part. The sink is
  * left inactive on any failure.
@@ -112,7 +113,7 @@ int hype_log_sink_open_ordered_durable(hype_log_sink_t *s, hype_blk_read_fn read
  * All files that mutate one volume must use the same `fs`, so allocation state
  * and the write-through FAT cache remain coherent without a medium round trip.
  */
-int hype_log_sink_open_shared_ordered(hype_log_sink_t *s, hype_fat32_fs_t *fs,
+int hype_log_sink_open_shared_ordered(hype_log_sink_t *s, hype_fs_t *fs,
                                       const char *filename, const hype_rtc_time_t *now,
                                       int filter);
 

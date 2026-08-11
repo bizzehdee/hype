@@ -25,9 +25,13 @@ static int failures = 0;
 #define FATSZ 2u
 #define DATA_START (RESERVED + NUM_FATS * FATSZ)
 static uint8_t g_vol[VOL_SECTORS * SECSZ];
+static unsigned int g_read_calls;
+static unsigned int g_write_calls;
+static unsigned int g_sync_calls;
 
 static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
+    g_read_calls++;
     if (lba + count > VOL_SECTORS) return -1;
     memcpy(dst, g_vol + lba * SECSZ, (size_t)count * SECSZ);
     return 0;
@@ -35,9 +39,15 @@ static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
 static uint64_t g_fail_write_lba = (uint64_t)-1;
 static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     (void)ctx;
+    g_write_calls++;
     if (lba + count > VOL_SECTORS) return -1;
     if (lba == g_fail_write_lba) return -1;
     memcpy(g_vol + lba * SECSZ, src, (size_t)count * SECSZ);
+    return 0;
+}
+static int vol_sync(void *ctx) {
+    (void)ctx;
+    g_sync_calls++;
     return 0;
 }
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
@@ -54,6 +64,9 @@ static void build_vol(void) {
     uint8_t *bpb = g_vol, *fsi;
     unsigned int copy;
     memset(g_vol, 0, sizeof(g_vol));
+    g_read_calls = 0u;
+    g_write_calls = 0u;
+    g_sync_calls = 0u;
     put16(bpb + 0x0B, 512); bpb[0x0D] = 1; put16(bpb + 0x0E, RESERVED); bpb[0x10] = NUM_FATS;
     put16(bpb + 0x16, 0);   put32(bpb + 0x24, FATSZ);
     put32(bpb + 0x2C, 2);   put16(bpb + 0x30, 1);
@@ -107,7 +120,7 @@ static void test_sink_streams_logbuf(void) {
     CHECK_HEX("dirent name", 0, memcmp(g_vol + clba(2) * SECSZ, "HYPEFULLLOG", 11));
 
     d = hype_logbuf_data();
-    got = gather(sink.file.first_cluster, back, sizeof back);
+    got = gather(sink.file.u.fat32.first_cluster, back, sizeof back);
     CHECK("gathered >= len", got >= len);
     for (i = 0; i < len; i++) {
         if (back[i] != (uint8_t)d[i]) { CHECK_HEX("byte matches logbuf", (uint8_t)d[i], back[i]); break; }
@@ -119,7 +132,7 @@ static void test_sink_streams_logbuf(void) {
     len = hype_logbuf_len();
     CHECK_HEX("file grew to new logbuf len", len, (unsigned)sink.file.size);
     d = hype_logbuf_data();
-    got = gather(sink.file.first_cluster, back, sizeof back);
+    got = gather(sink.file.u.fat32.first_cluster, back, sizeof back);
     for (i = 0; i < len; i++) {
         if (back[i] != (uint8_t)d[i]) { CHECK_HEX("byte matches after append", (uint8_t)d[i], back[i]); break; }
     }
@@ -127,6 +140,36 @@ static void test_sink_streams_logbuf(void) {
     /* A flush with no new output is a no-op success. */
     CHECK_HEX("noop flush ok", 0, hype_log_sink_flush(&sink));
     CHECK_HEX("size unchanged", len, (unsigned)sink.file.size);
+}
+
+static void test_split_sink_reuses_primary_fat_mount(void) {
+    hype_log_sink_t primary, vm0;
+
+    build_vol();
+    hype_logbuf_reset();
+    hype_logbuf_append("usb-log: primary record\n");
+    hype_logbuf_append("fw-1 vm0 ttyS0| guest record\n");
+    CHECK_HEX("primary shared-volume open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_ordered_durable(
+                  &primary, vol_read, vol_write, vol_sync, NULL, "HYPE.LOG", 0,
+                  HYPE_LOG_SINK_HYPE));
+    CHECK_HEX("secondary shared-volume open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_shared_ordered(&vm0, &primary.fs, "VM0.LOG", 0, 0));
+    CHECK("both files use the same mounted FAT state", vm0.file.u.fat32.fs == &primary.fs.u.fat32);
+    CHECK("shared files have distinct roots", vm0.file.u.fat32.first_cluster != primary.file.u.fat32.first_cluster);
+    CHECK_HEX("null shared mount rejected", HYPE_LOG_SINK_ERR_MOUNT,
+              hype_log_sink_open_shared_ordered(&vm0, NULL, "BAD.LOG", 0, 0));
+}
+
+static void test_durable_ordered_sink_installs_sync(void) {
+    hype_log_sink_t sink;
+    build_vol();
+    hype_logbuf_reset();
+    CHECK_HEX("durable ordered open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_ordered_durable(
+                  &sink, vol_read, vol_write, vol_sync, NULL, "DUR.LOG", 0,
+                  HYPE_LOG_SINK_HYPE));
+    CHECK_HEX("durable create used two barriers", 2u, g_sync_calls);
 }
 
 static void test_open_rejects_non_fat(void) {
@@ -160,7 +203,7 @@ static void test_flush_append_failure(void) {
     CHECK_HEX("open ok", 0, hype_log_sink_open(&sink, vol_read, vol_write, NULL, "F.LOG", 0));
     /* New output arrives, but the data-cluster write now fails. */
     hype_logbuf_append("second line that must be flushed\n");
-    g_fail_write_lba = clba(sink.file.tail_cluster);
+    g_fail_write_lba = clba(sink.file.u.fat32.tail_cluster);
     CHECK("flush surfaces the write error", hype_log_sink_flush(&sink) != 0);
     g_fail_write_lba = (uint64_t)-1;
 }
@@ -169,13 +212,124 @@ static void test_flush_append_failure(void) {
 
 /* A sink's file contents as a NUL-terminated string, truncated to its size. */
 static void file_text(const hype_log_sink_t *s, char *out, unsigned int max) {
-    static uint8_t raw[8192];
-    unsigned int got = gather(s->file.first_cluster, raw, sizeof raw);
+    static uint8_t raw[16384];
+    unsigned int got = gather(s->file.u.fat32.first_cluster, raw, sizeof raw);
     unsigned int n = (unsigned int)s->file.size;
     if (n > got) n = got;
     if (n > max - 1u) n = max - 1u;
     memcpy(out, raw, n);
     out[n] = '\0';
+}
+
+static void test_budgeted_combined_flush_makes_bounded_progress(void) {
+    hype_log_sink_t s;
+    char out[4096];
+    build_vol();
+    hype_logbuf_reset();
+    CHECK_HEX("empty combined open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open(&s, vol_read, vol_write, NULL, "BUD.LOG", 0));
+    hype_logbuf_append("abcdefghijklmnopqrstuvwxyz\n");
+    CHECK_HEX("zero budget is a no-op", 0, hype_log_sink_flush_budget(&s, 0u));
+    CHECK_HEX("zero budget cursor", 0u, hype_log_sink_flushed(&s));
+    CHECK_HEX("eight-byte slice", 0, hype_log_sink_flush_budget(&s, 8u));
+    CHECK_HEX("slice advances by budget", 8u, hype_log_sink_flushed(&s));
+    CHECK_HEX("second eight-byte slice", 0, hype_log_sink_flush_budget(&s, 8u));
+    CHECK_HEX("second slice cursor", 16u, hype_log_sink_flushed(&s));
+    CHECK_HEX("finish combined backlog", 0, hype_log_sink_flush(&s));
+    file_text(&s, out, sizeof out);
+    CHECK_STR("budgeted combined output exact", "abcdefghijklmnopqrstuvwxyz\n", out);
+}
+
+static void test_filtered_flush_batches_records_and_respects_budget(void) {
+    hype_log_sink_t s;
+    char line[64];
+    char out[4096];
+    unsigned int writes_before;
+    unsigned int first_record_len;
+    unsigned int i;
+
+    build_vol();
+    hype_logbuf_reset();
+    CHECK_HEX("empty filtered open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_ordered(&s, vol_read, vol_write, NULL, "BAT.LOG", 0, 0));
+    for (i = 0; i < 20u; i++) {
+        snprintf(line, sizeof line, "fw-1 vm0 ttyS0| record %02u\n", i);
+        hype_logbuf_append(line);
+    }
+    first_record_len = (unsigned int)strlen("fw-1 vm0 ttyS0| record 00\n");
+    writes_before = g_write_calls;
+    CHECK_HEX("one-record filtered slice", 0,
+              hype_log_sink_flush_budget(&s, first_record_len));
+    CHECK_HEX("filtered cursor stops at source budget", first_record_len,
+              hype_log_sink_flushed(&s));
+    CHECK_HEX("finish filtered backlog", 0, hype_log_sink_flush(&s));
+    /* Two batched calls should need far fewer metadata commits than the old
+     * two appends per record. Keep the assertion loose across FAT geometry. */
+    CHECK("twenty ordered records use fewer than twenty block writes",
+          g_write_calls - writes_before < 20u);
+    file_text(&s, out, sizeof out);
+    CHECK("first ordered record present", strstr(out, "[00000000] ttyS0| record 00\n") != 0);
+    CHECK("last ordered record present", strstr(out, "ttyS0| record 19\n") != 0);
+}
+
+static void make_vm0_record(char *buf, unsigned int payload, char fill) {
+    static const char prefix[] = "fw-1 vm0 ttyS0| ";
+    unsigned int i = 0u;
+    while (prefix[i] != '\0') {
+        buf[i] = prefix[i];
+        i++;
+    }
+    while (payload-- != 0u) buf[i++] = fill;
+    buf[i++] = '\n';
+    buf[i] = '\0';
+}
+
+static void test_filtered_batch_rollover_and_oversized_record(void) {
+    hype_log_sink_t s;
+    static char huge[5200];
+    static char medium_a[2800];
+    static char medium_b[2800];
+    char out[16384];
+
+    build_vol();
+    hype_logbuf_reset();
+    CHECK_HEX("oversized ordered open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_ordered(&s, vol_read, vol_write, NULL, "BIG.LOG", 0, 0));
+    hype_logbuf_append("fw-1 vm0 ttyS0| small first\n");
+    make_vm0_record(huge, 5000u, 'H');
+    make_vm0_record(medium_a, 2500u, 'A');
+    make_vm0_record(medium_b, 2500u, 'B');
+    hype_logbuf_append(huge);
+    hype_logbuf_append(medium_a);
+    hype_logbuf_append(medium_b);
+    CHECK_HEX("mixed oversized flush", 0, hype_log_sink_flush(&s));
+    CHECK_HEX("mixed cursor reaches end", hype_logbuf_len(), hype_log_sink_flushed(&s));
+    file_text(&s, out, sizeof out);
+    CHECK("small record survives rollover", strstr(out, "ttyS0| small first\n") != 0);
+    CHECK("oversized record survives direct path", strstr(out, "HHHHHHHHHHHHHHHH") != 0);
+    CHECK("post-oversized rollover records survive", strstr(out, "BBBBBBBBBBBBBBBB") != 0);
+
+    /* The same direct path without ordering covers the no-prefix form. */
+    build_vol();
+    hype_logbuf_reset();
+    CHECK_HEX("oversized plain open", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_filtered(&s, vol_read, vol_write, NULL, "PLAIN.LOG", 0, 0));
+    hype_logbuf_append(huge);
+    CHECK_HEX("oversized plain flush", 0, hype_log_sink_flush(&s));
+    file_text(&s, out, sizeof out);
+    CHECK("plain oversized record has no order prefix", out[0] == 't');
+}
+
+static void test_open_reports_initial_flush_failure(void) {
+    hype_log_sink_t s;
+    build_vol();
+    hype_logbuf_reset();
+    hype_logbuf_append("data present before open\n");
+    g_fail_write_lba = clba(3u); /* first allocated file data cluster */
+    CHECK_HEX("open distinguishes initial write failure", HYPE_LOG_SINK_ERR_WRITE,
+              hype_log_sink_open(&s, vol_read, vol_write, NULL, "OW.LOG", 0));
+    CHECK_HEX("sink inactive after initial write failure", 0u, (unsigned)s.active);
+    g_fail_write_lba = (uint64_t)-1;
 }
 
 /* A representative interleaving: two guests plus hype's own reports, including
@@ -283,7 +437,7 @@ static void test_filtered_flush_append_failure(void) {
     CHECK_HEX("open ok", HYPE_LOG_SINK_OK,
               hype_log_sink_open_filtered(&s, vol_read, vol_write, NULL, "VF.LOG", 0, 0));
     hype_logbuf_append("fw-1 vm0 ttyS0| second line that must be flushed\n");
-    g_fail_write_lba = clba(s.file.tail_cluster);
+    g_fail_write_lba = clba(s.file.u.fat32.tail_cluster);
     CHECK("filtered flush surfaces the write error", hype_log_sink_flush(&s) != 0);
     g_fail_write_lba = (uint64_t)-1;
 }
@@ -421,6 +575,12 @@ static void test_every_record_is_keyed(void) {
 }
 
 int main(void) {
+    test_split_sink_reuses_primary_fat_mount();
+    test_durable_ordered_sink_installs_sync();
+    test_budgeted_combined_flush_makes_bounded_progress();
+    test_filtered_flush_batches_records_and_respects_budget();
+    test_filtered_batch_rollover_and_oversized_record();
+    test_open_reports_initial_flush_failure();
     test_sink_streams_logbuf();
     test_open_rejects_non_fat();
     test_open_create_failure();

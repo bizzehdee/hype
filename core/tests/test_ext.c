@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../ext.h"
+#include "../fs_ops.h"
 
 static int failures = 0;
 #define CHECK(desc, cond) \
@@ -880,7 +881,67 @@ static void test_fault_sweep(void) {
     CHECK("fault sweep completed without crashing", 1);
 }
 
+/* ---- #293: the ext driver behind the common interface ---- */
+static void test_fs_ops_ext(void) {
+    static hype_fs_t fs;
+    static hype_fs_file_t f;
+    static hype_file_rmap_t rm;
+    uint8_t buf[256];
+    unsigned i;
+
+    build_vol();
+    CHECK_HEX("probe claims ext", 0, hype_ext_probe(vol_read, 0));
+
+    /* read-only mount: lookup produces a generic rmap handle */
+    CHECK_HEX("ro auto-mount", 0, hype_fs_mount_auto(&fs, vol_read, 0, 0));
+    CHECK("driver is ext", fs.ops != 0 && fs.ops->name[0] == 'e' && fs.ops->name[1] == 'x' &&
+                               fs.ops->name[2] == 't');
+    CHECK("ro caps: read only", hype_fs_caps(&fs) == HYPE_FS_CAP_READ);
+    CHECK_HEX("ro lookup img.bin", 0, hype_fs_lookup(&fs, "/img.bin", &f));
+    CHECK_HEX("ro size", 20000, f.size);
+    CHECK_HEX("ro read_at", 0, hype_fs_read_at(&f, 100, buf, 200));
+    for (i = 0; i < 200u; i++) {
+        if (buf[i] != pat(100u + i)) break;
+    }
+    CHECK("ro read data", i == 200u);
+    CHECK("ro write refused", hype_fs_write_at(&f, 0, buf, 1) != 0);
+
+    CHECK_HEX("map_ranges", 0, hype_fs_map_ranges(&fs, "/img.bin", &rm));
+    CHECK_HEX("two DATA ranges", 2, rm.count);
+
+    /* writable mount: lookup produces the native in-place handle */
+    CHECK_HEX("rw auto-mount", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK("rw caps: in-place write", (hype_fs_caps(&fs) & HYPE_FS_CAP_WRITE_INPLACE) != 0);
+    CHECK("rw caps: no append (ext allocation is #384)",
+          (hype_fs_caps(&fs) & HYPE_FS_CAP_APPEND) == 0);
+    CHECK_HEX("rw lookup", 0, hype_fs_lookup(&fs, "/img.bin", &f));
+    CHECK_HEX("rw read_at (native arm)", 0, hype_fs_read_at(&f, 0, buf, 16));
+    buf[0] = 0xEE;
+    CHECK_HEX("rw write_at in place", 0, hype_fs_write_at(&f, 3, buf, 1));
+    CHECK_HEX("write visible", 0xEE, blk(40u)[3]);
+    CHECK("rw write past size refused", hype_fs_write_at(&f, 19999, buf, 2) != 0);
+    CHECK("append refused (NULL slot)", hype_fs_append(&f, buf, 1) != 0);
+    CHECK("create refused (NULL slot)", hype_fs_create(&fs, "/x", &f) != 0);
+    CHECK("mkdir refused (NULL slot)", hype_fs_mkdir(&fs, "/d") != 0);
+    CHECK("sync is a clean no-op", hype_fs_sync(&fs) == 0);
+    CHECK("identity error never fires on ext", hype_fs_file_identity_error(&f) == 0);
+
+    CHECK("rw lookup missing fails", hype_fs_lookup(&fs, "/nope", &f) != 0);
+    CHECK("map_ranges missing fails", hype_fs_map_ranges(&fs, "/nope", &rm) != 0);
+    {
+        static hype_fs_t rofs;
+        CHECK_HEX("ro mount again", 0, hype_fs_mount_auto(&rofs, vol_read, 0, 0));
+        CHECK("ro lookup missing fails", hype_fs_lookup(&rofs, "/nope", &f) != 0);
+    }
+    memset(&f, 0, sizeof(f));
+    f.fs = &fs;
+    f.tag = 0;
+    CHECK("read_at bogus tag", hype_fs_read_at(&f, 0, buf, 1) != 0);
+    CHECK("write_at bogus tag", hype_fs_write_at(&f, 0, buf, 1) != 0);
+}
+
 int main(void) {
+    test_fs_ops_ext();
     test_resolve_extents();
     test_resolve_indirect();
     test_refusals();

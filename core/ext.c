@@ -640,3 +640,14 @@ int hype_ext_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_fi
         }
     }
 }
+
+/*
+ * #293: recognition without resolution, for the common-interface probe. The
+ * same superblock validation vol_open applies per resolve -- magic, supported
+ * feature set, clean (non-RECOVER) journal -- against a throwaway volume
+ * descriptor. Read-only.
+ */
+int hype_ext_probe(hype_blk_read_fn read, void *ctx) {
+    ext_vol_t v;
+    return vol_open(read, ctx, &v);
+}

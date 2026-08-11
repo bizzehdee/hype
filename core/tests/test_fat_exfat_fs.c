@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include "../fs_ops.h"
 #include "../fat_exfat_fs.h"
 #include "../fat_exfat.h"
 
@@ -1726,7 +1727,75 @@ static void test_exfat_set_time(void) {
     CHECK_HEX("exfat entry no clock -> epoch", 0x00210000u, ts);
 }
 
+/* ---- #293: the exFAT driver behind the common interface ---- */
+static void test_fs_ops_exfat(void) {
+    static hype_fs_t fs;
+    static hype_fs_file_t f, created;
+    static hype_file_rmap_t rm;
+    uint8_t buf[600];
+    unsigned i;
+
+    build_vol_with_files();
+    CHECK_HEX("auto-mount claims exfat", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK("driver is exfat", fs.ops != 0 && fs.ops->name[0] == 'e' && fs.ops->name[1] == 'x');
+    CHECK("caps: in-place write", (hype_fs_caps(&fs) & HYPE_FS_CAP_WRITE_INPLACE) != 0);
+    CHECK("caps: append", (hype_fs_caps(&fs) & HYPE_FS_CAP_APPEND) != 0);
+    CHECK("caps: namespace", (hype_fs_caps(&fs) & HYPE_FS_CAP_NAMESPACE) != 0);
+    CHECK("caps: no grow yet (#383)", (hype_fs_caps(&fs) & HYPE_FS_CAP_WRITE_GROW) == 0);
+
+    CHECK_HEX("lookup image.img", 0, hype_fs_lookup(&fs, "image.img", &f));
+    CHECK_HEX("size", 1400, f.size);
+    CHECK_HEX("read_at", 0, hype_fs_read_at(&f, 100, buf, 300));
+    for (i = 0; i < 300u; i++) {
+        if (buf[i] != pat(100u + i)) break;
+    }
+    CHECK("read data", i == 300u);
+    buf[0] = 0x5A;
+    CHECK_HEX("write_at in place", 0, hype_fs_write_at(&f, 7, buf, 1));
+    CHECK_HEX("write landed", 0x5A, cluster(10u)[7]);
+    CHECK("write past size refused", hype_fs_write_at(&f, 1399, buf, 2) != 0);
+
+    CHECK_HEX("map_ranges", 0, hype_fs_map_ranges(&fs, "image.img", &rm));
+    CHECK_HEX("one DATA range", 1, rm.count);
+    CHECK("range kind DATA", rm.ranges[0].kind == HYPE_RANGE_DATA);
+
+    CHECK_HEX("create via interface", 0, hype_fs_create(&fs, "NEW.BIN", &created));
+    CHECK_HEX("append via interface", 0, hype_fs_append(&created, "hello", 5));
+    CHECK_HEX("appended size", 5, created.size);
+    CHECK_HEX("mkdir via interface", 0, hype_fs_mkdir(&fs, "d1"));
+    CHECK_HEX("rename via interface", 0, hype_fs_rename(&fs, "NEW.BIN", "d1/n.bin"));
+    CHECK_HEX("unlink via interface", 0, hype_fs_unlink(&fs, "d1/n.bin"));
+    CHECK_HEX("rmdir via interface", 0, hype_fs_rmdir(&fs, "d1"));
+    CHECK_HEX("sync via interface", 0, hype_fs_sync(&fs));
+    hype_fs_set_time(&fs, 0); /* exercised; exFAT accepts a NULL reset */
+
+    /* read-only mount: same volume, mutation refused at the wrapper */
+    CHECK_HEX("ro mount", 0, hype_fs_mount_auto(&fs, vol_read, 0, 0));
+    CHECK("ro caps masked", hype_fs_caps(&fs) == HYPE_FS_CAP_READ);
+    CHECK("ro create refused", hype_fs_create(&fs, "X.BIN", &created) != 0);
+    CHECK("ro unlink refused", hype_fs_unlink(&fs, "image.img") != 0);
+    CHECK("ro lookup still ok", hype_fs_lookup(&fs, "image.img", &f) == 0);
+    CHECK("ro write_at refused", hype_fs_write_at(&f, 0, buf, 1) != 0);
+    CHECK("ro append refused", hype_fs_append(&f, buf, 1) != 0);
+    CHECK("ro mkdir refused", hype_fs_mkdir(&fs, "z") != 0);
+    CHECK("ro rmdir refused", hype_fs_rmdir(&fs, "z") != 0);
+    CHECK("ro rename refused", hype_fs_rename(&fs, "a", "b") != 0);
+
+    CHECK("lookup missing fails", hype_fs_lookup(&fs, "missing.bin", &f) != 0);
+    CHECK("map_ranges missing fails", hype_fs_map_ranges(&fs, "missing.bin", &rm) != 0);
+
+    /* a handle with a foreign tag is refused by every exfat adapter */
+    CHECK_HEX("rw mount again", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    memset(&f, 0, sizeof(f));
+    f.fs = &fs;
+    f.tag = 0; /* TAG_NONE: no live arm */
+    CHECK("read_at bogus tag", hype_fs_read_at(&f, 0, buf, 1) != 0);
+    CHECK("write_at bogus tag", hype_fs_write_at(&f, 0, buf, 1) != 0);
+    CHECK("append bogus tag", hype_fs_append(&f, buf, 1) != 0);
+}
+
 int main(void) {
+    test_fs_ops_exfat();
     test_exfat_set_time();
     test_multi_sector_bitmap();
     test_bad_allocations();

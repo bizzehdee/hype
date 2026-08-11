@@ -20,7 +20,7 @@ static unsigned int order_prefix(char *buf, unsigned int off) {
     return 11u;
 }
 
-static int sink_start(hype_log_sink_t *s, hype_fat32_fs_t *fs, const char *filename,
+static int sink_start(hype_log_sink_t *s, hype_fs_t *fs, const char *filename,
                       const hype_rtc_time_t *now, int filter, int ordered) {
     s->active = 0;
     s->flushed = 0;
@@ -35,8 +35,8 @@ static int sink_start(hype_log_sink_t *s, hype_fat32_fs_t *fs, const char *filen
     s->ordered = ordered;
     /* Before create(), so the new file's directory entry carries a real date
      * rather than the zeroes that made hype's log show as the Unix epoch. */
-    hype_fat32_fs_set_time(fs, now);
-    if (hype_fat32_create(fs, filename, &s->file) != 0) return HYPE_LOG_SINK_ERR_CREATE;
+    hype_fs_set_time(fs, now);
+    if (hype_fs_create(fs, filename, &s->file) != 0) return HYPE_LOG_SINK_ERR_CREATE;
     s->active = 1;
     if (hype_log_sink_flush(s) != 0) {
         s->active = 0;
@@ -49,8 +49,14 @@ static int sink_open(hype_log_sink_t *s, hype_blk_read_fn read, hype_blk_write_f
                      const char *filename, const hype_rtc_time_t *now, int filter, int ordered,
                      hype_blk_sync_fn sync) {
     s->active = 0;
-    if (hype_fat32_fs_mount(read, write, ctx, &s->fs) != 0) return HYPE_LOG_SINK_ERR_MOUNT;
-    hype_fat32_fs_set_sync(&s->fs, sync);
+    /* #293: probe the registry instead of assuming FAT32. The gate is what the
+     * sink needs -- create + append on THIS mount -- not a driver name. */
+    if (hype_fs_mount_auto(&s->fs, read, write, ctx) != 0) return HYPE_LOG_SINK_ERR_MOUNT;
+    if ((hype_fs_caps(&s->fs) & (HYPE_FS_CAP_APPEND | HYPE_FS_CAP_NAMESPACE)) !=
+        (HYPE_FS_CAP_APPEND | HYPE_FS_CAP_NAMESPACE)) {
+        return HYPE_LOG_SINK_ERR_MOUNT;
+    }
+    hype_fs_set_barrier(&s->fs, sync);
     return sink_start(s, &s->fs, filename, now, filter, ordered);
 }
 
@@ -78,10 +84,10 @@ int hype_log_sink_open_ordered_durable(hype_log_sink_t *s, hype_blk_read_fn read
     return sink_open(s, read, write, ctx, filename, now, filter, 1, sync);
 }
 
-int hype_log_sink_open_shared_ordered(hype_log_sink_t *s, hype_fat32_fs_t *fs,
+int hype_log_sink_open_shared_ordered(hype_log_sink_t *s, hype_fs_t *fs,
                                       const char *filename, const hype_rtc_time_t *now,
                                       int filter) {
-    if (fs == (hype_fat32_fs_t *)0) return HYPE_LOG_SINK_ERR_MOUNT;
+    if (fs == (hype_fs_t *)0) return HYPE_LOG_SINK_ERR_MOUNT;
     return sink_start(s, fs, filename, now, filter, 1);
 }
 
@@ -142,8 +148,8 @@ static int flush_filtered(hype_log_sink_t *s, const char *data, unsigned int len
                  * Flush the accumulated batch first, then commit this record
                  * directly. This path is bounded to one complete record. */
                 if (batch_len != 0u) break;
-                if (plen != 0u && hype_fat32_append(&s->file, pfx, plen) != 0) return -1;
-                if (hype_fat32_append(&s->file, data + pos + off, body_len) != 0) return -1;
+                if (plen != 0u && hype_fs_append(&s->file, pfx, plen) != 0) return -1;
+                if (hype_fs_append(&s->file, data + pos + off, body_len) != 0) return -1;
             } else {
                 if (batch_len + plen + body_len > HYPE_LOG_SINK_BATCH_BYTES) break;
                 if (plen != 0u) {
@@ -161,7 +167,7 @@ static int flush_filtered(hype_log_sink_t *s, const char *data, unsigned int len
         if (pos - start >= max_source_bytes) break;
     }
     if (batch_len != 0u) {
-        if (hype_fat32_append(&s->file, g_filtered_batch, batch_len) != 0) return -1;
+        if (hype_fs_append(&s->file, g_filtered_batch, batch_len) != 0) return -1;
     }
     s->flushed = commit_pos;
     return 0;
@@ -179,7 +185,7 @@ int hype_log_sink_flush_budget(hype_log_sink_t *s, unsigned int max_source_bytes
     {
         unsigned int pending = len - s->flushed;
         unsigned int n = (pending > max_source_bytes) ? max_source_bytes : pending;
-        if (hype_fat32_append(&s->file, hype_logbuf_data() + s->flushed, n) != 0) {
+        if (hype_fs_append(&s->file, hype_logbuf_data() + s->flushed, n) != 0) {
             return -1;
         }
         s->flushed += n;
