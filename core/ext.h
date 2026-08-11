@@ -3,8 +3,7 @@
 
 #include <stdint.h>
 
-#include "fat.h"          /* hype_fat_read_fn, hype_fat_file_t: the shared extent contract */
-#include "fat_write_fs.h" /* hype_fat_write_fn (shared with the FAT32/exFAT writers) */
+#include "blk_io.h" /* the shared block I/O + file-map contract (#292) */
 
 /*
  * #203 (STORAGE: ext2/3/4 host filesystem READ) -- the ext counterpart of the
@@ -39,7 +38,7 @@
  *     say "this range reads as zeros", and a disk image with silent zero
  *     holes is exactly the kind of quiet corruption hype refuses; the image
  *     prep tooling writes images fully;
- *   - files needing more than HYPE_FAT_MAX_EXTENTS runs (same cap as FAT).
+ *   - files needing more than HYPE_FILE_MAX_EXTENTS runs (same cap as FAT).
  *     NOTE this makes very large ext2/3 INDIRECT-mapped files structurally
  *     unresolvable: the classic allocator interleaves an indirection block
  *     into the data every 256 blocks (at 1 KiB), so a 64 MiB+ file needs
@@ -50,7 +49,7 @@
  * Unlike the FAT resolvers, matching is CASE-SENSITIVE -- ext filesystems
  * are. Path separators may be '/' or '\\'.
  */
-int hype_ext_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fat_file_t *out);
+int hype_ext_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_file_map_t *out);
 
 /*
  * #204 (STORAGE: ext2/3/4 host filesystem WRITE) -- IN-PLACE writes to an
@@ -59,7 +58,7 @@ int hype_ext_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fa
  * file that lives on an ext-formatted host volume. Implemented in
  * core/ext_write.c on top of the resolver above: the file's extents never
  * move, so writes are plain sector I/O through the injected write callback
- * (the same hype_fat_write_fn the FAT32/exFAT writers use, carried by
+ * (the same hype_blk_write_fn the FAT32/exFAT writers use, carried by
  * blk_phys over AHCI/NVMe/USB).
  *
  * THE JOURNAL CONSTRAINT (the ticket's hard part, resolved by scoping):
@@ -74,9 +73,9 @@ int hype_ext_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fa
  * (true by construction post-ExitBootServices).
  */
 typedef struct {
-    hype_fat_file_t map; /* the file's resolved extents (they never move) */
-    hype_fat_read_fn read;
-    hype_fat_write_fn write;
+    hype_file_map_t map; /* the file's resolved extents (they never move) */
+    hype_blk_read_fn read;
+    hype_blk_write_fn write;
     void *ctx;
 } hype_ext_wfile_t;
 
@@ -85,7 +84,7 @@ typedef struct {
  * resolver failure, a NULL write callback, or a volume that is not cleanly
  * unmounted (mounted-dirty or marked with errors).
  */
-int hype_ext_open_rw(hype_fat_read_fn read, hype_fat_write_fn write, void *ctx,
+int hype_ext_open_rw(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
                      const char *path, hype_ext_wfile_t *out);
 
 /*

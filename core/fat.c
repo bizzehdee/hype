@@ -1,16 +1,8 @@
 #include "fat.h"
+#include "lebytes.h"
 #include "fat_exfat.h" /* shared exFAT layout constants + entry-set validation */
 
 /* ---- little-endian field readers over a 512-byte sector buffer ---- */
-static uint16_t rd16(const uint8_t *p) {
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-static uint32_t rd32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static uint64_t rd64(const uint8_t *p) {
-    return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
-}
 
 /* ASCII lowercase for case-insensitive name matching. */
 static char lc(char c) {
@@ -83,7 +75,7 @@ static void lfn_piece(const uint8_t *ent, unsigned seq, char *lfn, unsigned lfn_
     unsigned base = (seq - 1u) * 13u;
     unsigned i;
     for (i = 0; i < 13u; i++) {
-        uint16_t u = rd16(ent + off[i]);
+        uint16_t u = hype_rd16(ent + off[i]);
         unsigned idx = base + i;
         if (idx >= lfn_cap - 1u) {
             break;
@@ -95,7 +87,7 @@ static void lfn_piece(const uint8_t *ent, unsigned seq, char *lfn, unsigned lfn_
 /* ================================ FAT32 ================================ */
 
 typedef struct {
-    hype_fat_read_fn read;
+    hype_blk_read_fn read;
     void *ctx;
     uint32_t spc;         /* sectors per cluster */
     uint32_t reserved;    /* reserved sector count */
@@ -125,13 +117,13 @@ static uint64_t cluster_lba(const fat32_vol_t *v, uint32_t cl) {
 typedef struct {
     uint32_t lba;
     int valid;
-    uint8_t sec[HYPE_FAT_SECTOR_SIZE];
+    uint8_t sec[HYPE_BLK_SECTOR_SIZE];
 } fat32_cache_t;
 
 static uint32_t fat32_next_cached(const fat32_vol_t *v, uint32_t cl, fat32_cache_t *c) {
     uint32_t byte = cl * 4u;
-    uint32_t fat_sec = v->fat_start + byte / HYPE_FAT_SECTOR_SIZE;
-    uint32_t within = byte % HYPE_FAT_SECTOR_SIZE;
+    uint32_t fat_sec = v->fat_start + byte / HYPE_BLK_SECTOR_SIZE;
+    uint32_t within = byte % HYPE_BLK_SECTOR_SIZE;
     if (!c->valid || c->lba != fat_sec) {
         if (v->read(v->ctx, fat_sec, 1u, c->sec) != 0) {
             c->valid = 0;
@@ -140,7 +132,7 @@ static uint32_t fat32_next_cached(const fat32_vol_t *v, uint32_t cl, fat32_cache
         c->lba = fat_sec;
         c->valid = 1;
     }
-    return rd32(c->sec + within) & 0x0FFFFFFFu;
+    return hype_rd32(c->sec + within) & 0x0FFFFFFFu;
 }
 
 static uint32_t fat32_next(const fat32_vol_t *v, uint32_t cl) {
@@ -165,12 +157,12 @@ static int fat32_find_in_dir(const fat32_vol_t *v, uint32_t dir_cl, const char *
     while (dir_cl < FAT32_EOC && guard++ < (1u << 20)) {
         uint32_t s;
         for (s = 0; s < v->spc; s++) {
-            uint8_t sec[HYPE_FAT_SECTOR_SIZE];
+            uint8_t sec[HYPE_BLK_SECTOR_SIZE];
             unsigned e;
             if (v->read(v->ctx, cluster_lba(v, dir_cl) + s, 1u, sec) != 0) {
                 return -1;
             }
-            for (e = 0; e < HYPE_FAT_SECTOR_SIZE; e += 32u) {
+            for (e = 0; e < HYPE_BLK_SECTOR_SIZE; e += 32u) {
                 const uint8_t *ent = sec + e;
                 uint8_t a = ent[0x0B];
                 if (ent[0] == 0x00u) {
@@ -205,9 +197,9 @@ static int fat32_find_in_dir(const fat32_vol_t *v, uint32_t dir_cl, const char *
                         matched = 1;
                     }
                     if (matched) {
-                        *first_cl = ((uint32_t)rd16(ent + 0x14) << 16) | rd16(ent + 0x1A);
+                        *first_cl = ((uint32_t)hype_rd16(ent + 0x14) << 16) | hype_rd16(ent + 0x1A);
                         *attr = a;
-                        *size = rd32(ent + 0x1C);
+                        *size = hype_rd32(ent + 0x1C);
                         return 1;
                     }
                 }
@@ -223,7 +215,7 @@ static int fat32_find_in_dir(const fat32_vol_t *v, uint32_t dir_cl, const char *
 /* Follow the file's cluster chain, coalescing on-disk-consecutive clusters into
  * runs, into out->extents. Trims the last extent to the exact file size. */
 static int fat32_build_extents(const fat32_vol_t *v, uint32_t first_cl, uint32_t size,
-                               hype_fat_file_t *out) {
+                               hype_file_map_t *out) {
     uint32_t cl = first_cl;
     uint64_t sectors_per_cluster = v->spc;
     unsigned guard = 0;
@@ -238,14 +230,14 @@ static int fat32_build_extents(const fat32_vol_t *v, uint32_t first_cl, uint32_t
     while (cl >= 2u && cl < FAT32_EOC && guard++ < (1u << 20)) {
         uint64_t lba = cluster_lba(v, cl);
         if (out->count > 0u) {
-            hype_fat_extent_t *last = &out->extents[out->count - 1u];
+            hype_file_extent_t *last = &out->extents[out->count - 1u];
             if (last->start_lba + last->sector_count == lba) {
                 last->sector_count += sectors_per_cluster; /* contiguous: extend */
                 cl = fat32_next_cached(v, cl, &fc);
                 continue;
             }
         }
-        if (out->count >= HYPE_FAT_MAX_EXTENTS) {
+        if (out->count >= HYPE_FILE_MAX_EXTENTS) {
             /* #366: distinguishable from every other -1. The caller cannot otherwise tell "too
              * fragmented to map" from "no such file", and those need different advice. */
             out->too_fragmented = 1;
@@ -260,7 +252,7 @@ static int fat32_build_extents(const fat32_vol_t *v, uint32_t first_cl, uint32_t
     /* Trim the trailing extent to the exact file length (clusters are rounded
      * up; the ISO stream must not read past size_bytes). */
     {
-        uint64_t total_sectors = ((uint64_t)size + HYPE_FAT_SECTOR_SIZE - 1u) / HYPE_FAT_SECTOR_SIZE;
+        uint64_t total_sectors = ((uint64_t)size + HYPE_BLK_SECTOR_SIZE - 1u) / HYPE_BLK_SECTOR_SIZE;
         uint64_t acc = 0;
         unsigned i;
         for (i = 0; i < out->count; i++) {
@@ -284,13 +276,13 @@ static int fat32_build_extents(const fat32_vol_t *v, uint32_t first_cl, uint32_t
     return 0;
 }
 
-int hype_fat32_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fat_file_t *out) {
+int hype_fat32_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_file_map_t *out) {
     /* #366: cleared HERE, not at the extent-walk, because a path that fails earlier (no such
      * file, bad volume) returns before ever reaching it -- and would then inherit the previous
      * call's reason. That would tell the operator to defragment a stick that simply does not have
      * the file on it. Caught by a test, not on hardware. */
     if (out != 0) out->too_fragmented = 0;
-    uint8_t bpb[HYPE_FAT_SECTOR_SIZE];
+    uint8_t bpb[HYPE_BLK_SECTOR_SIZE];
     fat32_vol_t v;
     uint32_t dir_cl;
     unsigned pos = 0;
@@ -301,20 +293,20 @@ int hype_fat32_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_
     if (read(ctx, 0u, 1u, bpb) != 0) {
         return -1;
     }
-    if (rd16(bpb + 0x0B) != HYPE_FAT_SECTOR_SIZE) {
+    if (hype_rd16(bpb + 0x0B) != HYPE_BLK_SECTOR_SIZE) {
         return -1; /* only 512-byte logical sectors supported */
     }
     /* FAT32 has a zero 16-bit FATSz (0x16) and a nonzero 32-bit FATSz (0x24). */
-    if (rd16(bpb + 0x16) != 0u || rd32(bpb + 0x24) == 0u) {
+    if (hype_rd16(bpb + 0x16) != 0u || hype_rd32(bpb + 0x24) == 0u) {
         return -1;
     }
     v.read = read;
     v.ctx = ctx;
     v.spc = bpb[0x0D];
-    v.reserved = rd16(bpb + 0x0E);
+    v.reserved = hype_rd16(bpb + 0x0E);
     v.fat_start = v.reserved;
-    v.fat_size = rd32(bpb + 0x24);
-    v.root_cluster = rd32(bpb + 0x2C);
+    v.fat_size = hype_rd32(bpb + 0x24);
+    v.root_cluster = hype_rd32(bpb + 0x2C);
     if (v.spc == 0u || v.reserved == 0u || v.root_cluster < 2u) {
         return -1;
     }
@@ -374,7 +366,7 @@ int hype_fat32_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_
  * the read-only path-walk and extent construction on top.
  */
 typedef struct {
-    hype_fat_read_fn read;
+    hype_blk_read_fn read;
     void *ctx;
     uint32_t fat_lba;         /* first sector of the ACTIVE FAT */
     uint32_t fat_length;      /* sectors per FAT */
@@ -394,17 +386,17 @@ static uint64_t exfat_cluster_lba(const exfat_vol_t *v, uint32_t cl) {
 
 /* Next cluster in a chain, or >= HYPE_EXFAT_EOC on end-of-chain / error. */
 static uint32_t exfat_next(const exfat_vol_t *v, uint32_t cl) {
-    uint8_t sec[HYPE_FAT_SECTOR_SIZE];
+    uint8_t sec[HYPE_BLK_SECTOR_SIZE];
     uint32_t byte = cl * 4u;
-    uint32_t fat_sec = v->fat_lba + byte / HYPE_FAT_SECTOR_SIZE;
-    uint32_t within = byte % HYPE_FAT_SECTOR_SIZE;
+    uint32_t fat_sec = v->fat_lba + byte / HYPE_BLK_SECTOR_SIZE;
+    uint32_t within = byte % HYPE_BLK_SECTOR_SIZE;
     if (!exfat_cluster_ok(v, cl)) {
         return HYPE_EXFAT_EOC;
     }
     if (v->read(v->ctx, fat_sec, 1u, sec) != 0) {
         return HYPE_EXFAT_EOC;
     }
-    return rd32(sec + within);
+    return hype_rd32(sec + within);
 }
 
 /*
@@ -420,7 +412,7 @@ static int exfat_read_entry(const exfat_vol_t *v, uint32_t dir_cl, int dir_conti
                             uint8_t ent[32]) {
     uint32_t cluster_index, sec_in_cluster;
     unsigned off_in_sector;
-    uint8_t sec[HYPE_FAT_SECTOR_SIZE];
+    uint8_t sec[HYPE_BLK_SECTOR_SIZE];
     uint32_t cl = dir_cl;
     unsigned i;
 
@@ -469,7 +461,7 @@ static int exfat_walk_entry(void *ctx, uint32_t ei, uint8_t ent[32]) {
  * heap. Returns 1 if the set is safe to act on.
  */
 static int exfat_set_in_range(const exfat_vol_t *v, const hype_exfat_set_t *set) {
-    uint64_t bytes_per_cluster = (uint64_t)v->sec_per_cluster * HYPE_FAT_SECTOR_SIZE;
+    uint64_t bytes_per_cluster = (uint64_t)v->sec_per_cluster * HYPE_BLK_SECTOR_SIZE;
     uint64_t need;
 
     if (set->first_cluster == 0u) {
@@ -491,9 +483,9 @@ static int exfat_set_in_range(const exfat_vol_t *v, const hype_exfat_set_t *set)
 
 /* Builds the extent list for a validated, in-range stream. */
 static int exfat_build_extents(const exfat_vol_t *v, const hype_exfat_set_t *set,
-                               hype_fat_file_t *out) {
+                               hype_file_map_t *out) {
     uint64_t total_sectors =
-        (set->data_length + HYPE_FAT_SECTOR_SIZE - 1u) / HYPE_FAT_SECTOR_SIZE;
+        (set->data_length + HYPE_BLK_SECTOR_SIZE - 1u) / HYPE_BLK_SECTOR_SIZE;
     uint64_t acc = 0;
     uint32_t cl = set->first_cluster;
     unsigned guard = 0;
@@ -515,7 +507,7 @@ static int exfat_build_extents(const exfat_vol_t *v, const hype_exfat_set_t *set
         uint64_t remain = total_sectors - acc;
         uint64_t this_sectors = (remain < v->sec_per_cluster) ? remain : v->sec_per_cluster;
         if (out->count > 0u) {
-            hype_fat_extent_t *last = &out->extents[out->count - 1u];
+            hype_file_extent_t *last = &out->extents[out->count - 1u];
             if (last->start_lba + last->sector_count == lba) {
                 last->sector_count += this_sectors; /* on-disk consecutive: extend */
                 acc += this_sectors;
@@ -523,7 +515,7 @@ static int exfat_build_extents(const exfat_vol_t *v, const hype_exfat_set_t *set
                 continue;
             }
         }
-        if (out->count >= HYPE_FAT_MAX_EXTENTS) {
+        if (out->count >= HYPE_FILE_MAX_EXTENTS) {
             /* #366: distinguishable from every other -1. The caller cannot otherwise tell "too
              * fragmented to map" from "no such file", and those need different advice. */
             out->too_fragmented = 1;
@@ -600,9 +592,9 @@ static int exfat_find_in_dir(const exfat_vol_t *v, uint32_t dir_cl, int dir_cont
     return -1;
 }
 
-int hype_exfat_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fat_file_t *out) {
+int hype_exfat_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_file_map_t *out) {
     if (out != 0) out->too_fragmented = 0; /* #366: see hype_fat32_resolve */
-    uint8_t boot[HYPE_FAT_SECTOR_SIZE];
+    uint8_t boot[HYPE_BLK_SECTOR_SIZE];
     exfat_vol_t v;
     hype_exfat_set_t set;
     uint32_t dir_cl;
@@ -633,15 +625,15 @@ int hype_exfat_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_
     if (num_fats != 1u && num_fats != 2u) {
         return -1;
     }
-    volume_flags = rd16(boot + 0x6A);
-    fat_offset = rd32(boot + 0x50);
+    volume_flags = hype_rd16(boot + 0x6A);
+    fat_offset = hype_rd32(boot + 0x50);
 
     v.read = read;
     v.ctx = ctx;
-    v.fat_length = rd32(boot + 0x54);
-    v.cluster_heap = rd32(boot + 0x58);
-    v.cluster_count = rd32(boot + 0x5C);
-    v.root_cluster = rd32(boot + 0x60);
+    v.fat_length = hype_rd32(boot + 0x54);
+    v.cluster_heap = hype_rd32(boot + 0x58);
+    v.cluster_count = hype_rd32(boot + 0x5C);
+    v.root_cluster = hype_rd32(boot + 0x60);
     v.sec_per_cluster = 1u << boot[0x6D];
     /* With two FATs, VolumeFlags bit 0 (ActiveFat) says which copy is live;
      * reading the stale one would follow chains that no longer exist. */
@@ -661,11 +653,11 @@ int hype_exfat_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_
     }
     /* The FAT must be able to address every cluster (entries 0 and 1 are
      * reserved), or a chain walk would read another structure's bytes. */
-    if ((uint64_t)v.fat_length * (HYPE_FAT_SECTOR_SIZE / 4u) < (uint64_t)v.cluster_count + 2u) {
+    if ((uint64_t)v.fat_length * (HYPE_BLK_SECTOR_SIZE / 4u) < (uint64_t)v.cluster_count + 2u) {
         return -1;
     }
     if ((uint64_t)v.cluster_heap + (uint64_t)v.cluster_count * v.sec_per_cluster >
-        rd64(boot + 0x48)) {
+        hype_rd64(boot + 0x48)) {
         return -1; /* the heap would run past the end of the volume */
     }
     if (!exfat_cluster_ok(&v, v.root_cluster)) {

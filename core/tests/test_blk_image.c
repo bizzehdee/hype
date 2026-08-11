@@ -67,7 +67,7 @@ static void fill_disk(void) {
 /* A two-extent, deliberately out-of-order image: file sectors 0..15 live at
  * disk 200..215, file sectors 16..31 at disk 100..115. Non-contiguous AND
  * backwards, so any accidental "just add lba" arithmetic fails loudly. */
-static void map_two_extents(hype_fat_file_t *m) {
+static void map_two_extents(hype_file_map_t *m) {
     m->count = 2;
     m->extents[0].start_lba = 200;
     m->extents[0].sector_count = 16;
@@ -79,7 +79,7 @@ static void map_two_extents(hype_fat_file_t *m) {
 static void test_locate(void) {
     hype_blk_image_t img;
     hype_blk_backend_t be;
-    hype_fat_file_t m;
+    hype_file_map_t m;
     uint64_t lba, run;
 
     map_two_extents(&m);
@@ -109,7 +109,7 @@ static void test_locate(void) {
 static void test_read_write_roundtrip(void) {
     hype_blk_image_t img;
     hype_blk_backend_t be;
-    hype_fat_file_t m;
+    hype_file_map_t m;
     static uint8_t buf[32 * SECSZ];
     static uint8_t back[32 * SECSZ];
     unsigned i;
@@ -165,7 +165,7 @@ static void test_read_write_roundtrip(void) {
 static void test_bounds(void) {
     hype_blk_image_t img;
     hype_blk_backend_t be;
-    hype_fat_file_t m;
+    hype_file_map_t m;
     static uint8_t buf[4 * SECSZ];
 
     fill_disk();
@@ -185,7 +185,7 @@ static void test_bounds(void) {
 static void test_read_only(void) {
     hype_blk_image_t img;
     hype_blk_backend_t be;
-    hype_fat_file_t m;
+    hype_file_map_t m;
     static uint8_t buf[SECSZ];
 
     map_two_extents(&m);
@@ -198,7 +198,7 @@ static void test_read_only(void) {
 static void test_init_refusals(void) {
     hype_blk_image_t img;
     hype_blk_backend_t be;
-    hype_fat_file_t m;
+    hype_file_map_t m;
 
     /* No read callback. */
     map_two_extents(&m);
@@ -228,7 +228,7 @@ static void test_init_refusals(void) {
 
     /* More extents than the contract holds. */
     map_two_extents(&m);
-    m.count = HYPE_FAT_MAX_EXTENTS + 1u;
+    m.count = HYPE_FILE_MAX_EXTENTS + 1u;
     CHECK_HEX("too many extents refused", -1,
               hype_blk_image_init(&img, &be, &m, 0u, disk_read, disk_write, 0));
 
@@ -245,7 +245,7 @@ static void test_init_refusals(void) {
 static void test_contiguous_single_command(void) {
     hype_blk_image_t img;
     hype_blk_backend_t be;
-    hype_fat_file_t m;
+    hype_file_map_t m;
     static uint8_t buf[64 * SECSZ];
 
     fill_disk();
@@ -266,7 +266,7 @@ static void test_contiguous_single_command(void) {
 static void test_io_errors(void) {
     hype_blk_image_t img;
     hype_blk_backend_t be;
-    hype_fat_file_t m;
+    hype_file_map_t m;
     static uint8_t buf[32 * SECSZ];
     long k;
 

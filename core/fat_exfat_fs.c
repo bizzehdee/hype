@@ -1,6 +1,7 @@
 #include "fat_exfat_fs.h"
+#include "lebytes.h"
 
-#define SECSZ HYPE_FAT_SECTOR_SIZE
+#define SECSZ HYPE_BLK_SECTOR_SIZE
 #define ENTSZ HYPE_EXFAT_ENTRY_SIZE
 #define FAT_ENTRIES_PER_SECTOR (SECSZ / 4u)
 #define BITMAP_BITS_PER_SECTOR (SECSZ * 8u)
@@ -18,29 +19,6 @@
 /* The largest entry set hype builds: File + Stream + 17 File Name entries. */
 #define MAX_SET_ENTRIES (HYPE_EXFAT_MAX_SECONDARY + 1u)
 
-static uint16_t rd16(const uint8_t *p) {
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-static uint32_t rd32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static uint64_t rd64(const uint8_t *p) {
-    return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
-}
-static void wr16(uint8_t *p, uint16_t v) {
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-}
-static void wr32(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16);
-    p[3] = (uint8_t)(v >> 24);
-}
-static void wr64(uint8_t *p, uint64_t v) {
-    wr32(p, (uint32_t)v);
-    wr32(p + 4, (uint32_t)(v >> 32));
-}
 static void bcopy(uint8_t *dst, const uint8_t *src, unsigned int n) {
     unsigned int i;
     for (i = 0; i < n; i++) {
@@ -83,7 +61,7 @@ static int fat_get(hype_exfat_fs_t *fs, uint32_t cl, uint32_t *out) {
     if (fs->read(fs->ctx, slba, 1u, sec) != 0) {
         return -1;
     }
-    *out = rd32(sec + (cl % FAT_ENTRIES_PER_SECTOR) * 4u);
+    *out = hype_rd32(sec + (cl % FAT_ENTRIES_PER_SECTOR) * 4u);
     return 0;
 }
 
@@ -96,7 +74,7 @@ static int fat_set(hype_exfat_fs_t *fs, uint32_t cl, uint32_t val) {
     if (fs->read(fs->ctx, slba, 1u, sec) != 0) {
         return -1;
     }
-    wr32(sec + (cl % FAT_ENTRIES_PER_SECTOR) * 4u, val);
+    hype_wr32(sec + (cl % FAT_ENTRIES_PER_SECTOR) * 4u, val);
     return fs->write(fs->ctx, slba, 1u, sec);
 }
 
@@ -146,13 +124,13 @@ static int boot_sector_flags(hype_exfat_fs_t *fs, uint64_t lba, int dirty, int r
     if (fs->read(fs->ctx, lba, 1u, sec) != 0 || !boot_signature_ok(sec)) {
         return -1;
     }
-    flags = rd16(sec + 0x6A);
+    flags = hype_rd16(sec + 0x6A);
     if (dirty) {
         flags = (uint16_t)(flags | HYPE_EXFAT_VOLUME_DIRTY);
     } else {
         flags = (uint16_t)(flags & (uint16_t)~(uint16_t)HYPE_EXFAT_VOLUME_DIRTY);
     }
-    wr16(sec + 0x6A, flags);
+    hype_wr16(sec + 0x6A, flags);
     if (refresh_percent && fs->used_clusters != HYPE_EXFAT_USED_UNKNOWN) {
         /* used_clusters is counted out of the bitmap, so it cannot exceed
          * cluster_count and the quotient cannot exceed 100. */
@@ -434,9 +412,9 @@ static int set_flush(hype_exfat_wfile_t *f) {
     }
     ent[1] = (uint8_t)(HYPE_EXFAT_FLAG_ALLOC_POSSIBLE |
                        (f->contiguous ? HYPE_EXFAT_FLAG_NO_FAT_CHAIN : 0u));
-    wr64(ent + 8, f->size); /* ValidDataLength: hype only ever writes full data */
-    wr32(ent + 20, f->first_cluster);
-    wr64(ent + 24, f->size);
+    hype_wr64(ent + 8, f->size); /* ValidDataLength: hype only ever writes full data */
+    hype_wr32(ent + 20, f->first_cluster);
+    hype_wr64(ent + 24, f->size);
     if (entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, ent) != 0) {
         return -1;
     }
@@ -532,7 +510,7 @@ static void count_used(hype_exfat_fs_t *fs) {
     fs->used_clusters = used;
 }
 
-int hype_exfat_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ctx,
+int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
                         hype_exfat_fs_t *out) {
     uint8_t boot[SECSZ];
     uint8_t num_fats;
@@ -565,16 +543,16 @@ int hype_exfat_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ct
     if (num_fats != 1u && num_fats != 2u) {
         return -1;
     }
-    volume_flags = rd16(boot + 0x6A);
+    volume_flags = hype_rd16(boot + 0x6A);
 
     out->read = read;
     out->write = write;
     out->ctx = ctx;
-    out->volume_length = rd64(boot + 0x48);
-    out->fat_length = rd32(boot + 0x54);
-    out->heap_lba = rd32(boot + 0x58);
-    out->cluster_count = rd32(boot + 0x5C);
-    out->root_cluster = rd32(boot + 0x60);
+    out->volume_length = hype_rd64(boot + 0x48);
+    out->fat_length = hype_rd32(boot + 0x54);
+    out->heap_lba = hype_rd32(boot + 0x58);
+    out->cluster_count = hype_rd32(boot + 0x5C);
+    out->root_cluster = hype_rd32(boot + 0x60);
     out->spc = 1u << boot[0x6D];
     out->next_free = 2u;
     out->used_clusters = HYPE_EXFAT_USED_UNKNOWN;
@@ -583,15 +561,15 @@ int hype_exfat_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ct
 
     /* With two FATs, VolumeFlags bit 0 selects the live one; reading the stale
      * copy would follow chains that no longer exist. */
-    out->fat_lba = rd32(boot + 0x50);
+    out->fat_lba = hype_rd32(boot + 0x50);
     if (num_fats == 2u && (volume_flags & 0x0001u) != 0u) {
         out->fat_lba += out->fat_length;
     }
 
-    if (out->fat_length == 0u || rd32(boot + 0x50) < BOOT_REGION_SECTORS) {
+    if (out->fat_length == 0u || hype_rd32(boot + 0x50) < BOOT_REGION_SECTORS) {
         return -1;
     }
-    if (out->heap_lba < rd32(boot + 0x50) + (uint32_t)num_fats * out->fat_length) {
+    if (out->heap_lba < hype_rd32(boot + 0x50) + (uint32_t)num_fats * out->fat_length) {
         return -1; /* the heap would overlap the FAT region */
     }
     if (out->cluster_count == 0u || out->cluster_count > 0xFFFFFFF4u) {
@@ -634,15 +612,15 @@ int hype_exfat_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ct
             if (which != active) {
                 continue;
             }
-            bitmap_cluster = rd32(ent + 20);
-            bitmap_bytes = rd64(ent + 24);
+            bitmap_cluster = hype_rd32(ent + 20);
+            bitmap_bytes = hype_rd64(ent + 24);
             have_bitmap = 1;
             continue;
         }
         if (ent[0] == HYPE_EXFAT_ENT_UPCASE && !have_upcase) {
-            out->upcase_cluster = rd32(ent + 20);
-            out->upcase_bytes = rd64(ent + 24);
-            upcase_checksum = rd32(ent + 4);
+            out->upcase_cluster = hype_rd32(ent + 20);
+            out->upcase_bytes = hype_rd64(ent + 24);
+            upcase_checksum = hype_rd32(ent + 4);
             have_upcase = 1;
             continue;
         }

@@ -28,6 +28,7 @@
 #include "../core/xhci.h"
 #include "../core/usb_hid.h" /* USB-5 (#217): HID boot-keyboard host input */
 #include "../core/scancode.h"  /* INPUT-11 (#284): ASCII -> PS/2 Set-1 for `sendkey` */
+#include "../core/scancode_queue.h" /* #375: BSP -> focused guest keyboard */
 #include "../core/blk_usb.h"
 #include "../devices/nvme.h" /* #202 */
 #include "../core/ahci_host.h"
@@ -43,6 +44,7 @@
 #include "../core/blk_backend.h"
 #include "../core/fw1_debug.h"
 #include "../core/rtc.h"
+#include "../core/render_budget.h"
 #include "../core/blk_phys.h"
 #include "../core/blk_image.h"
 #include "../core/blk_qcow2.h"
@@ -55,7 +57,7 @@ static inline uint64_t hype_dbg_read_cr3(void) {
     return v;
 }
 #include "../core/logbuf.h"
-#include "../core/nvlog.h"
+#include "../core/log_drain.h"
 #include "../core/clockfacts.h"
 #include "../core/io_histogram.h"
 #include "../core/format.h"
@@ -72,6 +74,7 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #include "../arch/x86_64/cpu/ps2_host.h"
 #include "../arch/x86_64/cpu/leader_chord.h"
 #include "../arch/x86_64/cpu/host_input.h"
+#include "../arch/x86_64/cpu/hyperv.h"
 #include "../arch/x86_64/cpu/vmexit.h"
 #include "../arch/x86_64/cpu/vmm_select.h"
 #include "../arch/x86_64/svm/npt.h"
@@ -257,14 +260,10 @@ static int g_209_reads_passed;
 #endif
 
 /* Real-HW diagnostic build: after the read-only host-controller probes (PCI /
- * xHCI+USB / NVMe / AHCI enumeration), flush the log to the GOP screen + the
- * RT-3 NV variable and HALT -- before any guest runs. Gives a serial-less,
- * cold-boot laptop a photographable frozen screen AND a cold-boot-surviving log
- * tail of exactly the probe output (which the full guest boot would otherwise
- * evict). Purely read-only; no FS writes. OFF by default. */
+ * xHCI+USB / NVMe / AHCI enumeration), flush the log to the GOP screen and USB
+ * log, then HALT before any guest runs. Purely read-only; OFF by default. */
 /* #230: USB debug-log sink helpers (defined just above efi_main); forward-
- * declared here because the post-EBS run loop (well above the definition) flushes
- * the sink on the RT-3 cadence. */
+ * declared here because the post-EBS run loop appears above the definition. */
 static void usb_log_flush(void);
 /* USB-5 (#217): defined with the other USB globals, used by the FW-1 dispatch loop and
  * the #233 confirm gate, both of which appear earlier in this file. */
@@ -762,8 +761,14 @@ typedef struct hype_fw_vm {
      * I/O that first loaded it is gone, so it cannot be re-read from disk. */
     uint64_t fw_pristine_host_phys;
     hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
+    hype_scancode_queue_t host_ps2_queue; /* #375: BSP producer, this VM's core consumer */
+    unsigned long long host_ps2_irqs;
     hype_ps2_mouse_t mouse;   /* required by the shared PS/2 IOIO handler */
     hype_fw_cfg_t fw_cfg;
+    /* #350: OVMF writes this VM's ramfb surface description through fw_cfg. */
+    uint8_t ramfb_config[HYPE_RAMFB_CONFIG_SIZE];
+    int ramfb_reported;
+    uint64_t ramfb_last_blit_tsc;
     hype_acpi_rsdp_t rsdp;
     uint8_t tables_blob[4096] __attribute__((aligned(64)));
     hype_acpi_loader_entry_t loader_script[HYPE_ACPI_LOADER_SCRIPT_ENTRIES];
@@ -888,6 +893,41 @@ static void fw_1_resolve_os_hint(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsig
 #define g_fw_1_host_tsc_hz (vm->host_tsc_hz)
 #define g_fw_1_vmrun_tsc (vm->vmrun_tsc)
 #define g_fw_1_body_tsc (vm->body_tsc)
+
+/*
+ * #365: split the between-VMRUN time into coarse phases. The existing COSTBREAK
+ * counter attributes the whole body to the preceding exit reason. That proved
+ * that the body dominates the hardware run, but not which common work inside
+ * the body is expensive. These counters stay file-scope because this function's
+ * freestanding stack frame is already close to clang's __chkstk threshold.
+ */
+enum {
+    HYPE_FW_PHASE_DIAG = 0,
+    HYPE_FW_PHASE_PERSIST,
+    HYPE_FW_PHASE_HOUSEKEEP,
+    HYPE_FW_PHASE_DISPATCH,
+    HYPE_FW_PHASE_COUNT
+};
+static uint64_t g_fw_phase_mark_tsc[HYPE_FW_MAX_VMS];
+static uint64_t g_fw_phase_accounted_tsc[HYPE_FW_MAX_VMS];
+static uint64_t g_fw_phase_total_tsc[HYPE_FW_MAX_VMS][HYPE_FW_PHASE_COUNT];
+static inline uint64_t hype_rdtsc(void);
+
+static void fw_1_phase_checkpoint(hype_fw_vm_t *vm, unsigned phase) {
+    unsigned vi = (unsigned)(vm - g_vms);
+    uint64_t now;
+    uint64_t delta;
+
+    if (vi >= HYPE_FW_MAX_VMS || phase >= HYPE_FW_PHASE_DISPATCH ||
+        g_fw_phase_mark_tsc[vi] == 0) {
+        return;
+    }
+    now = hype_rdtsc();
+    delta = now - g_fw_phase_mark_tsc[vi];
+    g_fw_phase_total_tsc[vi][phase] += delta;
+    g_fw_phase_accounted_tsc[vi] += delta;
+    g_fw_phase_mark_tsc[vi] = now;
+}
 #define g_fw_1_prev_post_tsc (vm->prev_post_tsc)
 #define g_fw_1_irq0_recoverable_tsc (vm->irq0_recoverable_tsc)
 #define g_fw_1_irq0_pending_tsc (vm->irq0_pending_tsc)
@@ -943,6 +983,17 @@ static uint64_t g_usable_ram_bytes;
  * across cores, but only the console-owner core (the one running g_vms[0])
  * ever reads it to drive input+display, so no cross-core GOP contention. */
 static volatile int g_term_view = -1;
+/* #379: only VMs whose runtime display/input state has been initialized may
+ * own focus. AP startup can fail after configuration and media preparation;
+ * the configured VM count is therefore not a readiness signal. */
+static volatile uint32_t g_vm_runtime_ready_mask;
+/* #373: measured, per-view redraw budgets. Each switch starts at the
+ * conservative floor and expands only when productive passes are fast. */
+static hype_render_budget_t g_dash_render_budget;
+static hype_render_budget_t g_view_render_budget[HYPE_FW_MAX_VMS];
+static uint64_t g_view_switch_started_tsc;
+static unsigned g_view_switch_passes;
+static int g_view_switch_pending_view = -2;
 /* Number of VMs the operator can cycle through (mirrors HYPE_RUN_TWO_VMS). */
 #define HYPE_TERM_NVMS (HYPE_RUN_TWO_VMS ? 2 : 1)
 /* M8-6: seconds a guest gets to reach ACPI S5 after a shutdown request before
@@ -952,24 +1003,30 @@ static volatile int g_term_view = -1;
 /* Apply a completed leader-chord action to the terminal focus. Cycling order
  * is dashboard(-1) -> vm0 -> vm1 -> ... -> dashboard, wrapping both ways. */
 static void hype_term_apply_chord(hype_chord_result_t cr) {
+    int old_view = g_term_view;
+    unsigned int ready = __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE);
+    hype_term_focus_action_t action = HYPE_TERM_FOCUS_NONE;
+    unsigned int jump = 0u;
+
     switch (cr.action) {
         case HYPE_CHORD_ACTION_CYCLE_NEXT:
-            g_term_view = (g_term_view + 1 > HYPE_TERM_NVMS - 1) ? -1 : g_term_view + 1;
+            action = HYPE_TERM_FOCUS_NEXT;
             break;
         case HYPE_CHORD_ACTION_CYCLE_PREV:
-            g_term_view = (g_term_view <= -1) ? HYPE_TERM_NVMS - 1 : g_term_view - 1;
+            action = HYPE_TERM_FOCUS_PREV;
             break;
         case HYPE_CHORD_ACTION_JUMP_TO_VM:
             /* chord vm_index is 1-based (leader+1 => VM #1 => g_vms[0]). */
-            if (cr.vm_index >= 1 && (int)cr.vm_index <= HYPE_TERM_NVMS)
-                g_term_view = (int)cr.vm_index - 1;
+            action = HYPE_TERM_FOCUS_JUMP;
+            jump = cr.vm_index >= 1u ? cr.vm_index - 1u : HYPE_TERM_NVMS;
             break;
         case HYPE_CHORD_ACTION_TOGGLE_DASHBOARD:
-            g_term_view = (g_term_view >= 0) ? -1 : 0;
+            action = HYPE_TERM_FOCUS_TOGGLE_DASHBOARD;
             break;
         default:
             break;
     }
+    g_term_view = hype_term_focus_apply(g_term_view, action, jump, ready, HYPE_TERM_NVMS);
     /*
      * #363: say on the durable channel which view the operator switched to.
      *
@@ -979,6 +1036,16 @@ static void hype_term_apply_chord(hype_chord_result_t cr) {
      * several runs unable to separate them.
      */
     if (cr.action != HYPE_CHORD_ACTION_NONE) {
+        if (g_term_view != old_view) {
+            if (g_term_view >= 0) {
+                hype_render_budget_reset(&g_view_render_budget[g_term_view]);
+            } else {
+                hype_render_budget_reset(&g_dash_render_budget);
+            }
+            g_view_switch_started_tsc = hype_rdtsc();
+            g_view_switch_passes = 0u;
+            g_view_switch_pending_view = g_term_view;
+        }
         hype_debug_print("fw-1 VIEWSWITCH: action=%u -> view=%d (-1 = dashboard) [#363]\n",
                          (unsigned)cr.action, g_term_view);
     }
@@ -1458,8 +1525,15 @@ static void term_run_cmdline(void) {
                 hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focus: unknown vm '%s'", nm);
                 break;
             }
-            g_term_view = idx;
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focused %s", nm);
+            if (hype_term_focus_validate(
+                    idx, __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE),
+                    HYPE_TERM_NVMS) < 0) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "focus: %s is unavailable (vCPU not dispatched)", nm);
+            } else {
+                g_term_view = idx;
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focused %s", nm);
+            }
             break;
         case HYPE_CMD_CONFIRM: {
             /* M10-5: the operator authorises the pending physical write by
@@ -1523,8 +1597,8 @@ static hype_vmm_kind_t g_fw_1_kind;
  * business, reached through ops->enable_on (see vmm_ops.h). */
 static uint8_t g_ap_vmm_page[HYPE_FW_MAX_VMS][4096] __attribute__((aligned(4096)));
 static volatile uint32_t g_fw_1_ap_vmm_ok;
-/* AP-bring-up result, latched so the diag tick can re-emit it (the one-shot
- * AP-SMOKETEST line prints too early to survive in the 16KB nvlog tail).
+/* AP-bring-up result, latched so the diag tick can re-emit it after the one-shot
+ * AP-SMOKETEST line has scrolled out of the live display.
  * -2 = smoketest not reached; -3 = skipped (no <1MB trampoline page);
  * -4 = skipped (host CR3 >= 4GB); >=-1 = hype_ap_start's return. */
 static int g_fw_1_ap_rc = -2;
@@ -1546,10 +1620,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 
 static inline uint64_t hype_rdtsc(void);
 
-/* M8-0b-ii inc 5: the AP's periodic-timer vector + ISR. The AP doesn't receive
+/* M8-0b-ii inc 5/#364: the AP preemption-timer vector + ISR. The AP doesn't receive
  * the BSP's PIT IRQ0, so its guest was never force-preempted -> it spun in
  * wait loops without exiting, so hype couldn't inject its due timer (soft
- * lockups on HW). This LAPIC timer forces a periodic VMEXIT(INTR) on the AP,
+ * lockups on HW). This LAPIC timer forces a bounded VMEXIT(INTR) on the AP,
  * so the dispatch loop advances the timebase + injects the guest tick -- the
  * same role the PIT tick plays on the BSP, but per-core. The ISR only EOIs;
  * the real work happens in the dispatch loop on the INTR exit. */
@@ -1566,6 +1640,88 @@ static inline uint64_t hype_rdtsc(void);
  * ExitBootServices (see efi_main). Empty if the protocol was unavailable.
  */
 static hype_cpu_topology_t g_cpu_topo;
+
+static void fw_1_host_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax,
+                            uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(leaf), "c"(subleaf));
+    if (eax != 0) *eax = a;
+    if (ebx != 0) *ebx = b;
+    if (ecx != 0) *ecx = c;
+    if (edx != 0) *edx = d;
+}
+
+/* #378: repair firmware's all-zero EFI_CPU_PHYSICAL_LOCATION table from
+ * architectural CPUID topology. This is a thin hardware-reading shim; the
+ * width validation and APIC-ID decoding live in cpu_topology.c and are unit
+ * tested. Return 1 when repaired, 0 when no repair was needed, -1 when the
+ * firmware table is bad and CPUID did not supply a safe replacement. */
+static int fw_1_repair_degenerate_cpu_topology(void) {
+    uint32_t max_basic = 0u;
+    uint32_t max_ext = 0u;
+    unsigned int thread_bits = 0u;
+    unsigned int core_bits = 0u;
+    int have_layout = 0;
+
+    if (!hype_cpu_topology_locations_degenerate(&g_cpu_topo)) return 0;
+
+    fw_1_host_cpuid(0u, 0u, &max_basic, 0, 0, 0);
+    if (max_basic >= 0x0bu) {
+        uint32_t sub;
+        unsigned int smt_shift = 0u;
+        unsigned int package_shift = 0u;
+        int have_smt = 0;
+        int have_core = 0;
+        for (sub = 0u; sub < 16u; sub++) {
+            uint32_t a, b, c;
+            unsigned int level_type;
+            fw_1_host_cpuid(0x0bu, sub, &a, &b, &c, 0);
+            if ((b & 0xffffu) == 0u) break;
+            level_type = (c >> 8) & 0xffu;
+            if (level_type == 1u) {
+                smt_shift = a & 0x1fu;
+                have_smt = 1;
+            } else if (level_type == 2u) {
+                package_shift = a & 0x1fu;
+                have_core = 1;
+            }
+        }
+        if (have_smt && have_core &&
+            hype_cpu_topology_layout_from_shifts(smt_shift, package_shift,
+                                                  &thread_bits, &core_bits) == 0) {
+            have_layout = 1;
+        }
+    }
+
+    if (!have_layout && hype_cpu_detect_vmm_kind_diag().vendor == HYPE_CPU_VENDOR_AMD) {
+        uint32_t ext1_ecx = 0u;
+        fw_1_host_cpuid(0x80000000u, 0u, &max_ext, 0, 0, 0);
+        if (max_ext >= 0x8000001eu) {
+            uint32_t ext8_ecx = 0u;
+            uint32_t ext1e_ebx = 0u;
+            fw_1_host_cpuid(0x80000001u, 0u, 0, 0, &ext1_ecx, 0);
+            fw_1_host_cpuid(0x80000008u, 0u, 0, 0, &ext8_ecx, 0);
+            fw_1_host_cpuid(0x8000001eu, 0u, 0, &ext1e_ebx, 0, 0);
+            if ((ext1_ecx & (1u << 22)) != 0u &&
+                hype_cpu_topology_layout_from_amd((ext8_ecx >> 12) & 0x0fu,
+                                                   ((ext1e_ebx >> 8) & 0xffu) + 1u,
+                                                   &thread_bits, &core_bits) == 0) {
+                have_layout = 1;
+            }
+        }
+    }
+
+    if (!have_layout ||
+        hype_cpu_topology_apply_apic_layout(&g_cpu_topo, thread_bits, core_bits) != 0 ||
+        hype_cpu_topology_locations_degenerate(&g_cpu_topo)) {
+        return -1;
+    }
+    hype_debug_print("cpu: firmware physical locations were degenerate; CPUID repaired layout "
+                     "with thread_bits=%u core_bits=%u [#378]\n",
+                     thread_bits, core_bits);
+    return 1;
+}
 
 /* The APIC ID actually used for each AP slot, recorded at start time so the
  * LAPIC-timer ISR below can map a core back to its slot. Sparse IDs mean the ID
@@ -1607,8 +1763,10 @@ static int fw_1_ap_apic_id(unsigned int n) {
      * vCPU on the same physical core as the thread that renders the console and polls input,
      * sharing L1, L2 and the execution pipeline.
      *
-     * It survived because the AMD laptop enumerates one thread per core, so order happened to be
-     * correct there -- the same reason the hardcoded ap_start(1)/ap_start(2) survived until #360.
+     * It survived because the earlier AMD runs used consecutive APIC IDs, so literal placement
+     * happened to start CPUs there -- the same reason hardcoded ap_start(1)/ap_start(2) survived
+     * until #360. #378 later proved that this AMD firmware reports every EFI physical location as
+     * zero; CPUID repair above is now required before this selector can classify its SMT siblings.
      * Selection has to come from the topology, never from the order firmware reports.
      */
     nsel = hype_cpu_topology_select_isolated(&g_cpu_topo, HYPE_FW_MAX_VMS, sel, HYPE_FW_MAX_VMS);
@@ -1643,6 +1801,11 @@ static int fw_1_ap_slot_of(uint32_t apic_id) {
 }
 
 static volatile uint64_t g_ap_timer_ticks[HYPE_FW_MAX_VMS + 1];
+/* #364: calibrated 1 ms one-shot reload for each AP/VM slot. The dispatch
+ * loop restarts this immediately before VM entry. A periodic timer can become
+ * permanently pending when one host dispatch takes longer than its period;
+ * VMX then exits before the guest executes even one instruction. */
+static uint32_t g_ap_timer_reload[HYPE_FW_MAX_VMS];
 static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
     (void)frame;
     {
@@ -1766,10 +1929,12 @@ static void fw_1_ap_main(void *arg) {
     }
 #endif
 #if HYPE_RUN_GUEST_ON_AP
-    /* inc 5: give this core a periodic timer so the guest gets forced exits
+    /* inc 5/#364: give this core a one-shot timer so the guest gets forced exits
      * (timer delivery), else it soft-locks in wait loops (HW). Software-enable
      * the LAPIC (INIT reset it), calibrate its timer against the TSC, then arm
-     * it periodic at ~1ms. */
+     * at most ~1 ms after entry. The dispatch loop rearms it immediately before
+     * every entry, so a tick consumed during host work cannot remain pending and
+     * starve the next guest instruction. */
     {
         volatile uint8_t *lb = (volatile uint8_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE;
         volatile uint32_t *svr = (volatile uint32_t *)(lb + HYPE_LAPIC_SVR_OFFSET);
@@ -1796,14 +1961,15 @@ static void fw_1_ap_main(void *arg) {
             count = 1;
         }
         hype_isr_register(HYPE_AP_LAPIC_TIMER_VECTOR, hype_ap_lapic_timer_isr);
-        *lvt = hype_lapic_lvt_timer_periodic((uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR);
-        *icnt = (uint32_t)count;
+        g_ap_timer_reload[vm_idx] = (uint32_t)count;
+        *lvt = hype_lapic_lvt_timer_oneshot((uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR);
+        *icnt = 0; /* armed at the VM-entry site, after host dispatch work */
         hype_sti(); /* enable host interrupts on the AP so the timer fires */
     }
     /* Run the FW-1 guest on THIS (dedicated) core. run_fw_1_test builds the
      * NPT/VMCB/devices and enters the dispatch loop; never returns for a live
-     * boot. INTERCEPT_INTR + the AP's own LAPIC timer above give the periodic
-     * forced exits; the clocksource is kvmclock. */
+     * boot. INTERCEPT_INTR + the AP's one-shot timer above give bounded forced
+     * exits; the clocksource is kvmclock. */
     run_fw_1_test(&g_vms[vm_idx], g_fw_1_ops, g_fw_1_kind);
 #endif
     for (;;) {
@@ -1811,8 +1977,7 @@ static void fw_1_ap_main(void *arg) {
     }
 }
 /* PERF-1 (gaps #3/#4): the guest kernel's own clocksource + delay-calibration
- * dmesg lines, pinned so they survive to the login-time RT-3 nvlog snapshot
- * (they print too early to otherwise be in the 16 KB tail). Diagnostic aid for
+ * dmesg lines, pinned so periodic diagnostics can re-emit them later. Diagnostic aid for
  * the single FW-1 guest -- file-global like the ISO buffer above. */
 static hype_clockfacts_t g_fw_1_clockfacts;
 /* PERF-1: per-port I/O-exit histogram, one array per VM (indexed by vm - g_vms)
@@ -3507,14 +3672,17 @@ static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t ki
  * and the hypervisor-signature leaf (0x40000000), then RDMSR for
  * APIC_BASE and EFER (both read-only exercises here -- WRMSR against
  * EFER mid-test would risk destabilizing the guest's own long-mode
- * state, not worth the risk for a baseline test), storing every
+ * state, not worth the risk for a baseline test). M7-1b (#300) then
+ * establishes a Hyper-V hypercall page, calls an unknown code through
+ * the installed vendor opcode, and stores the returned status. Every
  * result into a host-inspectable guest buffer via RDI-relative stores
  * (ordinary guest-RAM writes, no MMIO/NPF involved -- unlike M4-3/
  * M4-5's device tests).
  */
 static uint8_t g_cpumsr_1_guest_code[160] __attribute__((aligned(4096)));
 static uint8_t g_cpumsr_1_guest_stack[4096] __attribute__((aligned(4096)));
-static uint8_t g_cpumsr_1_result_buf[64] __attribute__((aligned(16)));
+static uint8_t g_cpumsr_1_result_buf[72] __attribute__((aligned(16)));
+static uint8_t g_cpumsr_1_hypercall_page[4096] __attribute__((aligned(4096)));
 
 /*
  *   mov rdi, <patched: result_buf guest-physical address>
@@ -3545,6 +3713,13 @@ static uint8_t g_cpumsr_1_result_buf[64] __attribute__((aligned(16)));
  *   rdmsr                                0F 32
  *   mov [rdi+56], eax                    89 47 38
  *   mov [rdi+60], edx                    89 57 3C
+ *   mov ecx, HV_GUEST_OS_ID              B9 00 00 00 40
+ *   mov eax, 1; xor edx, edx; wrmsr
+ *   mov ecx, HV_HYPERCALL                 B9 01 00 00 40
+ *   mov rax, <patched: page GPA>; split into EDX:EAX; set Enable; wrmsr
+ *   mov ecx, 0xBEEF                       B9 EF BE 00 00
+ *   mov rax, <patched: page GPA>; call rax
+ *   mov [rdi+64], rax                     48 89 47 40
  *   hlt                                  F4
  *   jmp $-3                              EB FD
  */
@@ -3576,10 +3751,26 @@ static const uint8_t g_cpumsr_1_payload_template[] = {
     0x0F, 0x32,
     0x89, 0x47, 0x38,
     0x89, 0x57, 0x3C,
+    0xB9, 0x00, 0x00, 0x00, 0x40,
+    0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x31, 0xD2,
+    0x0F, 0x30,
+    0xB9, 0x01, 0x00, 0x00, 0x40,
+    0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x89, 0xC2,
+    0x48, 0xC1, 0xEA, 0x20,
+    0x83, 0xC8, 0x01,
+    0x0F, 0x30,
+    0xB9, 0xEF, 0xBE, 0x00, 0x00,
+    0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xD0,
+    0x48, 0x89, 0x47, 0x40,
     0xF4,
     0xEB, 0xFD
 };
 #define HYPE_CPUMSR_1_PAYLOAD_RDI_IMM_OFFSET 2
+#define HYPE_CPUMSR_1_PAYLOAD_PAGE_MSR_IMM_OFFSET 114
+#define HYPE_CPUMSR_1_PAYLOAD_PAGE_CALL_IMM_OFFSET 141
 
 /*
  * VMX-2 vendor dispatch. SVM and VMX expose parallel create_long_mode + CPUID/
@@ -3608,6 +3799,10 @@ static int vmm_reason_is_msr(hype_vmm_kind_t kind, uint64_t reason) {
                ? (reason == HYPE_VMX_EXIT_REASON_RDMSR || reason == HYPE_VMX_EXIT_REASON_WRMSR)
                : (reason == HYPE_SVM_EXITCODE_MSR);
 }
+static int vmm_reason_is_hypercall(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_VMCALL)
+                                     : (reason == HYPE_SVM_EXITCODE_VMMCALL);
+}
 static int vmm_reason_is_hlt(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_HLT)
                                      : (reason == HYPE_SVM_EXITCODE_HLT);
@@ -3624,6 +3819,10 @@ static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t r
         return hype_vmx_vcpu_handle_msr(ctx, reason == HYPE_VMX_EXIT_REASON_WRMSR);
     }
     return hype_svm_vcpu_handle_msr(ctx);
+}
+static int vmm_handle_hypercall(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_hypercall(ctx)
+                                     : hype_svm_vcpu_handle_hypercall(ctx);
 }
 static int vmm_handle_fw_cfg_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
                                   const hype_gpa_map_t *dma_map) {
@@ -4184,7 +4383,8 @@ static int vmm_handle_virtio_blk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *
 
 static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     unsigned long long i;
-    uint64_t entry_rip, guest_cr3, rsp, result_buf_phys;
+    uint64_t entry_rip, guest_cr3, rsp, result_buf_phys, hypercall_page_phys;
+    hype_gpa_map_t hypercall_map;
     hype_vcpu_ctx_t *ctx;
     hype_vmexit_info_t info;
     hype_cpuid_result_t real, expected;
@@ -4195,13 +4395,19 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     hype_guest_ram_zero(g_cpumsr_1_guest_code, sizeof(g_cpumsr_1_guest_code));
     hype_guest_ram_zero(g_cpumsr_1_guest_stack, sizeof(g_cpumsr_1_guest_stack));
     hype_guest_ram_zero(g_cpumsr_1_result_buf, sizeof(g_cpumsr_1_result_buf));
+    hype_guest_ram_zero(g_cpumsr_1_hypercall_page, sizeof(g_cpumsr_1_hypercall_page));
 
     result_buf_phys = (uint64_t)(uintptr_t)g_cpumsr_1_result_buf;
+    hypercall_page_phys = (uint64_t)(uintptr_t)g_cpumsr_1_hypercall_page;
 
     for (i = 0; i < sizeof(g_cpumsr_1_payload_template); i++) {
         g_cpumsr_1_guest_code[i] = g_cpumsr_1_payload_template[i];
     }
     hype_write_le64(g_cpumsr_1_guest_code + HYPE_CPUMSR_1_PAYLOAD_RDI_IMM_OFFSET, result_buf_phys);
+    hype_write_le64(g_cpumsr_1_guest_code + HYPE_CPUMSR_1_PAYLOAD_PAGE_MSR_IMM_OFFSET,
+                    hypercall_page_phys);
+    hype_write_le64(g_cpumsr_1_guest_code + HYPE_CPUMSR_1_PAYLOAD_PAGE_CALL_IMM_OFFSET,
+                    hypercall_page_phys);
 
     entry_rip = (uint64_t)(uintptr_t)g_cpumsr_1_guest_code;
     rsp = (uint64_t)(uintptr_t)(g_cpumsr_1_guest_stack + sizeof(g_cpumsr_1_guest_stack));
@@ -4219,6 +4425,13 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     if (ctx == 0) {
         hype_fatal("cpumsr: vcpu_create_long_mode failed");
     }
+    hype_gpa_map_reset(&hypercall_map);
+    if (hype_gpa_map_add(&hypercall_map, hypercall_page_phys, hypercall_page_phys,
+                         sizeof(g_cpumsr_1_hypercall_page)) != 0) {
+        hype_fatal("cpumsr: could not map Hyper-V hypercall page");
+    }
+    vmm_set_pvclock(kind, ctx, &hypercall_map, g_vms[0].host_tsc_hz);
+    vmm_set_hv_enabled(kind, ctx, 1);
 
     for (;;) {
         if (ops->vcpu_run(ctx, &info) != 0) {
@@ -4238,6 +4451,13 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             if (vmm_handle_msr(kind, ctx, info.reason) != 0) {
                 hype_fatal("cpumsr: unhandled guest MSR access (qual=0x%llx guest_rip=0x%llx)",
                            (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
+            }
+            continue;
+        }
+        if (vmm_reason_is_hypercall(kind, info.reason)) {
+            if (vmm_handle_hypercall(kind, ctx) != 0) {
+                hype_fatal("cpumsr: active Hyper-V hypercall was rejected at guest_rip=0x%llx",
+                           (unsigned long long)info.guest_rip);
             }
             continue;
         }
@@ -4264,7 +4484,7 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         __asm__ volatile("cpuid"
                           : "=a"(real.eax), "=b"(real.ebx), "=c"(real.ecx), "=d"(real.edx)
                           : "a"(eax_in), "c"(0));
-        hype_cpuid_emulate(eax_in, 0, &real, &expected);
+        hype_cpuid_emulate_ex(eax_in, 0, 1, &real, &expected);
 
         got_eax = (uint32_t)slot[0] | ((uint32_t)slot[1] << 8) | ((uint32_t)slot[2] << 16) |
                   ((uint32_t)slot[3] << 24);
@@ -4345,9 +4565,36 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
     }
 
+    {
+        uint8_t vendor_opcode = (kind == HYPE_VMM_KIND_VMX) ? 0xC1u : 0xD9u;
+        uint8_t result_or = 0;
+        unsigned j;
+        for (j = 65u; j < sizeof(g_cpumsr_1_result_buf); j++) {
+            result_or |= g_cpumsr_1_result_buf[j];
+        }
+        if (g_cpumsr_1_result_buf[64] != HYPE_HV_STATUS_INVALID_HYPERCALL_CODE ||
+            result_or != 0u) {
+            hype_fatal("cpumsr: Hyper-V unknown call returned malformed status "
+                       "(low=0x%x high-or=0x%x)",
+                       (unsigned)g_cpumsr_1_result_buf[64], (unsigned)result_or);
+        }
+        if (g_cpumsr_1_hypercall_page[0] != 0x0Fu ||
+            g_cpumsr_1_hypercall_page[1] != 0x01u ||
+            g_cpumsr_1_hypercall_page[2] != vendor_opcode ||
+            g_cpumsr_1_hypercall_page[3] != 0xC3u) {
+            hype_fatal("cpumsr: Hyper-V page has wrong %s stub (%02x %02x %02x %02x)",
+                       kind == HYPE_VMM_KIND_VMX ? "VMCALL" : "VMMCALL",
+                       (unsigned)g_cpumsr_1_hypercall_page[0],
+                       (unsigned)g_cpumsr_1_hypercall_page[1],
+                       (unsigned)g_cpumsr_1_hypercall_page[2],
+                       (unsigned)g_cpumsr_1_hypercall_page[3]);
+        }
+    }
+
     hype_debug_print(
         "cpumsr: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- CPUID leaves "
-        "0/1/0x40000000 and RDMSR(APIC_BASE/EFER) all verified via the real VM-exit path\n",
+        "0/1/0x40000000, RDMSR(APIC_BASE/EFER), and unknown Hyper-V hypercall status "
+        "all verified via the real VM-exit path [#300]\n",
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
 }
 
@@ -7000,7 +7247,7 @@ static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_fil
         /* TERM-1: feed the RAW byte stream to the on-screen terminal grid, which
          * does its own VT/ANSI interpretation (cursor addressing, erase, colour).
          * The vt_filter path below is the separate escape-*stripping* used for the
-         * line-buffered serial/nvlog. Both consume the same bytes; the terminal
+         * line-buffered serial/USB log. Both consume the same bytes; the terminal
          * must see them raw, so this precedes the filter. */
         if (term) {
             hype_vt_screen_feed(term, b);
@@ -7022,8 +7269,8 @@ static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_fil
         if (c == '\n') {
             line[*line_len] = '\0';
             hype_debug_print("fw-1 vm%u ttyS%u| %s\n", vm_idx, port, line);
-            /* PERF-1: pin the guest's clocksource/lpj lines so they reach the
-             * cold-boot-surviving nvlog even though they scroll off early. */
+            /* PERF-1: pin the guest's clocksource/lpj lines so later diagnostic
+             * blocks repeat them after the original lines scroll away. */
             hype_clockfacts_observe(&g_fw_1_clockfacts, line);
             *line_len = 0;
             continue;
@@ -7135,9 +7382,9 @@ static void fw_1_debug_feed(hype_vt_filter_t *filter, char *line, unsigned int *
  * This is best-effort observability, not a guarantee: the region's bytes
  * must survive the reboot. A WARM reboot (CPU reset without cutting power)
  * can preserve them; a COLD power cycle wipes RAM, so on power-off-only
- * machines this recovers nothing -- there the RT-3 EFI-variable channel
- * (SPI-flash-backed, survives cold boot) and the live GOP screen (RT-1c) are
- * the fallbacks. The `found == live` guard skips THIS boot's own buffer
+ * machines this recovers nothing. The live GOP screen remains the immediate
+ * fallback, while BSP-owned USB logs provide persistent capture. The
+ * `found == live` guard skips THIS boot's own buffer
  * (hype_logbuf_reset() has already stamped it by the time this runs).
  *
  * RT-1d: the scan steps by HYPE_LOGBUF_SCAN_ALIGN (page-aligned buffer +
@@ -7202,7 +7449,7 @@ static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
 
     if (found == 0) {
         hype_debug_print("RT-1b: no prior boot log found in RAM (expected after a cold power "
-                         "cycle -- see RT-3 for cold-boot-surviving capture)\n");
+                         "cycle; persistent live-run capture is on USB)\n");
     } else {
         hype_debug_print("RT-1b: found %u bytes of prior log but could not write it (no "
                          "writable boot volume)\n",
@@ -7210,125 +7457,21 @@ static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
     }
 }
 
-/* RT-3: the previous run's diagnostic tail, captured to an NV EFI variable
- * (core/nvlog.h). Unlike RT-1b's RAM scan this SURVIVES A COLD POWER CYCLE
- * (SPI flash), so it's the capture path for a power-off-only, serial-less
- * machine. g_hype_rt is the Runtime Services table cached in efi_main; the
- * write side runs in the post-EBS FW-1 loop (throttled), this read side runs
- * pre-EBS here where Boot-Services file I/O can dump it to a file. */
-static EFI_RUNTIME_SERVICES *g_hype_rt = 0;
-
 /*
- * RT-3c: persist the log tail when hype_fatal() is about to halt.
- *
- * core/fatal.h has declared this hook since RT-1, but nothing ever registered
- * it -- so a post-EBS panic left NOTHING behind. The USB sink is opened late in
- * the boot (and on a machine whose xHCI bring-up is itself what faulted, it
- * never opens at all), and the periodic NV write lives in the FW-1 loop, which
- * a panic before that point never reaches. The frozen GOP screen was the only
- * record, which is exactly why the Intel bare-metal xHCI page fault (#240) had
- * to be captured by photographing the display.
- *
- * SetVariable is a Runtime Service: valid post-EBS under hype's own identity
- * map, and independent of USB/xHCI/FAT -- i.e. the one channel that still works
- * when the storage path is the thing that died. RT-3b recovers it into
- * \hype-diag-prev.txt on the next boot, so a panic becomes readable text rather
- * than a photograph.
- *
- * Deliberately NOT flushing the USB sink here as well: hype_fatal() can be
- * reached from any core, and driving the xHCI/FAT write path from an AP faults
- * (see #239), so a panic handler is the last place to attempt it. Best-effort
- * and NULL-guarded; hype_fatal() paints the GOP *before* calling this, so the
- * on-screen evidence is never at risk even if the firmware's SetVariable is
- * slow or refuses.
- */
-static void hype_panic_persist_tail(void) {
-    static volatile int in_hook = 0;
-    EFI_STATUS st;
-
-    /*
-     * Re-entrancy guard. A panic handler must survive its own failure: if
-     * anything below faults -- a firmware SetVariable that does not tolerate
-     * being called post-EBS, or a second core panicking concurrently -- the
-     * fault lands back in hype_fatal(), which calls this hook again, and the
-     * result is an endless PANIC storm that scrolls the original cause off the
-     * only screen we have. Run once, ever; a second entrant returns
-     * immediately and lets hype_fatal() get on with halting.
-     */
-    if (in_hook) {
-        return;
-    }
-    in_hook = 1;
-
-    if (g_hype_rt == 0) {
-        hype_debug_print("RT-3c: no Runtime Services -- panic tail NOT saved (screen is the only "
-                          "record)\n");
-        return;
-    }
-    st = hype_nvlog_write(g_hype_rt, hype_logbuf_data(), hype_logbuf_len());
-    /* Say which it was, on the screen that is about to freeze: whether there is
-     * a recoverable log waiting on the next boot is the first thing you want to
-     * know when standing in front of a panicked, serial-less machine. */
-    if (st == EFI_SUCCESS) {
-        hype_debug_print("RT-3c: panic tail saved to NV (build " HYPE_BUILD_ID ", %u bytes) -- "
-                          "reboot and read \\hype-diag-prev.txt\n",
-                          (unsigned int)hype_logbuf_len());
-    } else {
-        hype_debug_print("RT-3c: panic tail NOT saved -- SetVariable failed (0x%llx); this firmware "
-                          "refuses post-EBS NV writes, so photograph the screen\n",
-                          (unsigned long long)st);
-    }
-}
-/* Throttle the post-EBS variable writes; multiplied by the calibrated host
- * TSC Hz at use. ~60s between flash writes bounds wear on a long-idle guest. */
-#define HYPE_NVLOG_WRITE_INTERVAL_SECS 60ull
-
-/*
- * #239: the USB log stream must NOT share the NV cadence. 60 s exists to bound
- * SPI-flash wear on the firmware's NV store; a USB stick has no such limit, and
- * a log that lags a minute behind is nearly useless exactly when the machine
- * freezes. Worse, it made short runs look like total failures: the 23:26
+ * #239: the USB log stream uses a short cadence. A log that lags a minute
+ * behind is nearly useless exactly when the machine freezes. Short runs also
+ * looked like total failures: the 23:26
  * PERF-2 boot ran 420 s and produced NO \HYPEFULL.LOG, and a 23:42 control run
  * on an older build produced a log truncated at the pre-EBS backlog -- both
  * purely because the first USB flush had not come round yet. 3 s keeps a
  * frozen machine's log within a few lines of the freeze.
  */
 #define HYPE_USBLOG_WRITE_INTERVAL_SECS 3ull
-
-/* RT-3b: recover the previous run's diagnostic tail from the EFI variable and
- * write it to \hype-diag-prev.txt, then clear the variable so a stale tail
- * can't be mistaken for a fresh one. Best-effort; runs pre-EBS. */
-static void fw_1_dump_prev_diag(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
-                                EFI_RUNTIME_SERVICES *rt) {
-    static char diag[HYPE_NVLOG_CAPACITY];
-    EFI_FILE_PROTOCOL *root = 0;
-    unsigned int len = 0;
-
-    if (rt == 0) {
-        return;
-    }
-    if (hype_nvlog_read(rt, diag, (unsigned int)sizeof(diag), &len) != EFI_SUCCESS || len == 0) {
-        /* No prior tail. Common + benign on the first ever boot; but if the
-         * previous run definitely reached the guest loop and this still shows,
-         * the firmware isn't persisting the post-EBS SetVariable (see the
-         * RT-3a "SetVariable FAILED/OK" line the previous run would have
-         * printed). Reported so a blank drive isn't ambiguous. */
-        hype_debug_print("RT-3: no prior diagnostic variable to recover (first boot, or this "
-                         "firmware doesn't persist a post-EBS SetVariable)\n");
-        return;
-    }
-    if (hype_file_locate_root(image_handle, bs, &root) == EFI_SUCCESS && root != 0) {
-        hype_file_delete(root, (CHAR16 *)L"\\hype-diag-prev.txt");
-        if (hype_file_write_new(root, (CHAR16 *)L"\\hype-diag-prev.txt", diag, (UINTN)len) ==
-            EFI_SUCCESS) {
-            hype_debug_print("RT-3: recovered %u bytes of the previous run's post-EBS diagnostic "
-                             "tail (EFI var) -> \\hype-diag-prev.txt\n",
-                             len);
-        }
-    }
-    /* Clear it so next boot doesn't re-dump this same (now-stale) tail. */
-    hype_nvlog_clear(rt);
-}
+/* #374/#377: a three-second snapshot is drained in bounded slices. The long
+ * cadence prevents short records from causing continuous FAT directory-sector
+ * rewrites. The short cadence applies only while draining that fixed snapshot. */
+#define HYPE_USBLOG_SLICE_INTERVAL_MS 10ull
+#define HYPE_USBLOG_SLICE_BYTES 4096u
 
 /* RT-2a: the M4-6d4 firmware-IDT exception catcher (fw_1_install/remove_
  * exception_catcher) is retired. It existed only because the guest loop ran
@@ -7477,17 +7620,36 @@ static void fw_1_host_input_poll(void) {
     }
     while (hype_host_kbd_poll_scancode(&sc)) {
         uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
+        uint8_t ps2_bytes[2];
         unsigned kn = 0;
-        hype_chord_result_t cr = hype_host_input_feed(&g_hostin, sc, kb, sizeof(kb), &kn);
+        unsigned pn = 0;
+        hype_chord_result_t cr = hype_host_input_feed_routed(
+            &g_hostin, sc, kb, sizeof(kb), &kn, ps2_bytes, sizeof(ps2_bytes), &pn);
         g_hostkbd_scancodes++;
         if (cr.action != HYPE_CHORD_ACTION_NONE) {
             g_hostkbd_chords++;
             hype_term_apply_chord(cr);
         } else if (g_term_view >= 0) {
-            hype_guest_uart_t *dst = &g_vms[g_term_view].uart;
+            hype_fw_vm_t *dst = &g_vms[g_term_view];
             unsigned ki;
-            for (ki = 0; ki < kn; ki++) {
-                hype_guest_uart_rx_enqueue(dst, kb[ki]);
+            /*
+             * #375: input follows the console the operator can see. A validated
+             * RAMFB view is a graphical/firmware console and consumes Set-1 via
+             * the guest i8042. A terminal view is reconstructed from COM1 and
+             * therefore retains TERM-4's decoded UART path.
+             *
+             * Queue the raw bytes rather than touching dst->ps2 here. The BSP
+             * and guest run on different cores; the SPSC queue preserves device
+             * ownership and the guest core raises IRQ1 after accepting a byte.
+             */
+            if (dst->ramfb_reported == 1 && dst->lifecycle == HYPE_VM_RUNNING) {
+                for (ki = 0; ki < pn; ki++) {
+                    (void)hype_scancode_queue_enqueue(&dst->host_ps2_queue, ps2_bytes[ki]);
+                }
+            } else {
+                for (ki = 0; ki < kn; ki++) {
+                    (void)hype_guest_uart_rx_enqueue(&dst->uart, kb[ki]);
+                }
             }
         } else {
             unsigned ki;
@@ -7796,6 +7958,72 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
 
 }
 
+static int fw_1_ramfb_surface(hype_fw_vm_t *vm, hype_ramfb_config_t *cfg,
+                              const uint8_t **out_pixels) {
+    uint64_t frame_size;
+    uint64_t host;
+    unsigned i;
+    int nonzero = 0;
+
+    hype_ramfb_decode_config(vm->ramfb_config, cfg);
+    if (hype_ramfb_frame_size(cfg, &frame_size) != 0) {
+        for (i = 0; i < sizeof(vm->ramfb_config); i++) {
+            if (vm->ramfb_config[i] != 0u) {
+                nonzero = 1;
+                break;
+            }
+        }
+        if (nonzero && vm->ramfb_reported >= 0) {
+            hype_debug_print("fw-1[vm %u] RAMFB: rejected config addr=0x%llx format=0x%x "
+                             "%ux%u stride=%u flags=0x%x [#350]\n",
+                             (unsigned)(vm - g_vms), (unsigned long long)cfg->address,
+                             cfg->fourcc, cfg->width, cfg->height, cfg->stride, cfg->flags);
+            vm->ramfb_reported = -1;
+        }
+        return 0;
+    }
+
+    /* The address and every size field are guest-controlled. Translate the
+     * complete surface through this VM's own GPA map before dereferencing it. */
+    host = hype_gpa_to_host(&vm->dma_map, cfg->address, frame_size);
+    if (host == 0u) {
+        if (vm->ramfb_reported >= 0) {
+            hype_debug_print("fw-1[vm %u] RAMFB: rejected unmapped range gpa=0x%llx bytes=%llu "
+                             "[#350]\n",
+                             (unsigned)(vm - g_vms), (unsigned long long)cfg->address,
+                             (unsigned long long)frame_size);
+            vm->ramfb_reported = -1;
+        }
+        return 0;
+    }
+    if (vm->ramfb_reported != 1) {
+        hype_debug_print("fw-1[vm %u] RAMFB: OVMF GOP surface gpa=0x%llx %ux%u stride=%u "
+                         "bytes=%llu [#350]\n",
+                         (unsigned)(vm - g_vms), (unsigned long long)cfg->address, cfg->width,
+                         cfg->height, cfg->stride, (unsigned long long)frame_size);
+        vm->ramfb_reported = 1;
+    }
+    *out_pixels = (const uint8_t *)(uintptr_t)host;
+    return 1;
+}
+
+static void fw_1_view_switch_pass(int view, int complete, uint64_t tsc_hz) {
+    if (g_view_switch_pending_view != view || g_view_switch_started_tsc == 0u) {
+        return;
+    }
+    g_view_switch_passes++;
+    if (complete) {
+        uint64_t elapsed = hype_rdtsc() - g_view_switch_started_tsc;
+        uint64_t elapsed_ms = (tsc_hz >= 1000u) ? elapsed / (tsc_hz / 1000u) : 0u;
+        hype_debug_print("fw-1 VIEWSWITCH: view=%d complete in %llums over %u render passes; "
+                         "debug_gop_writes=%llu [#373 #380]\n",
+                         view, (unsigned long long)elapsed_ms, g_view_switch_passes,
+                         hype_debug_gop_write_count());
+        g_view_switch_pending_view = -2;
+        g_view_switch_started_tsc = 0u;
+    }
+}
+
 static void fw_1_render_console(void) {
     static uint64_t last_gop_flush_tsc = 0;
     static int term_last_view = -2; /* neither a VM index nor the dashboard, so the first frame clears */
@@ -7824,6 +8052,40 @@ static void fw_1_render_console(void) {
     }
     last_gop_flush_tsc = now_gf;
     view = g_term_view;
+    {
+        unsigned int ready = __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE);
+        if (view >= 0 && hype_term_focus_validate(view, ready, HYPE_TERM_NVMS) < 0) {
+            hype_debug_print("fw-1 VIEWSWITCH: refusing unavailable vm%d; returning to dashboard "
+                             "[#379]\n", view);
+            g_term_view = -1;
+            view = -1;
+            g_view_switch_pending_view = -1;
+            g_view_switch_started_tsc = hype_rdtsc();
+            g_view_switch_passes = 0u;
+        }
+    }
+
+    /*
+     * #373: a view change invalidates the WHOLE physical surface, not only the
+     * destination's text cells.
+     *
+     * Cache invalidation makes every destination cell eligible for repaint, but
+     * text views repaint in bounded bands. The previous RAMFB frame therefore
+     * remained visible below the dashboard until the sweep reached those rows.
+     * Clear the shadow to a deterministic black once per actual view change.
+     * The first destination band (or complete RAMFB copy) is drawn below before
+     * the same GOP flush, so no separate blank-frame flush is introduced.
+     */
+    if (term_last_view != view) {
+        g_gop_console.bg = 0x000000u;
+        hype_gop_console_clear(&g_gop_console);
+        if (view >= 0) {
+            hype_vt_render_cache_invalidate(&g_view_render_cache[view]);
+        } else {
+            hype_vt_render_cache_invalidate(&g_dash_render_cache);
+        }
+        term_last_view = view;
+    }
 
     /*
      * #363: if anything else painted the framebuffer since the last pass, every cache is stale.
@@ -7843,8 +8105,10 @@ static void fw_1_render_console(void) {
             bsp_phase(BSP_PHASE_INVAL);
             last_foreign = foreign;
             hype_vt_render_cache_invalidate(&g_dash_render_cache);
+            hype_render_budget_reset(&g_dash_render_budget);
             for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
                 hype_vt_render_cache_invalidate(&g_view_render_cache[vi]);
+                hype_render_budget_reset(&g_view_render_budget[vi]);
             }
             /*
              * Invalidate ONLY -- do not force the clear-and-redraw path.
@@ -7858,6 +8122,9 @@ static void fw_1_render_console(void) {
         }
     }
     if (view >= 0) {
+        hype_ramfb_config_t ramfb;
+        const uint8_t *ramfb_pixels = 0;
+        int has_ramfb = fw_1_ramfb_surface(&g_vms[view], &ramfb, &ramfb_pixels);
         /*
          * PERF-2 (#234) part 2: render only the cells that CHANGED. The old
          * unconditional full redraw marked the whole console dirty, so
@@ -7867,24 +8134,58 @@ static void fw_1_render_console(void) {
          * against another's leftovers and paint a mixture of the two.
          */
 
-        if (term_last_view != view) {
-            hype_gop_console_clear(&g_gop_console);
-            hype_vt_render_cache_invalidate(&g_view_render_cache[view]);
-            term_last_view = view;
-        }
-        {
+        if (has_ramfb) {
+            uint32_t copy_width = (ramfb.width < g_gop_console.width)
+                                      ? ramfb.width
+                                      : g_gop_console.width;
+            uint32_t copy_height = (ramfb.height < g_gop_console.height)
+                                       ? ramfb.height
+                                       : g_gop_console.height;
+            int switching = (g_view_switch_pending_view == view && g_view_switch_passes == 0u);
+
+            /* A framebuffer has no dirty protocol. Sample it at 30 Hz. A view
+             * switch bypasses the rate limit so the first frame is immediate. */
+            if (switching || g_vms[view].ramfb_last_blit_tsc == 0u ||
+                now_gf - g_vms[view].ramfb_last_blit_tsc >= tsc_hz / 30u) {
+                hype_fb_blit_copy(ramfb_pixels, ramfb.width, ramfb.height, ramfb.stride,
+                                  HYPE_FB_PIXEL_FORMAT_XRGB8888,
+                                  (uint8_t *)g_gop_console.fb, g_gop_console.width,
+                                  g_gop_console.height, g_gop_console.stride * 4u,
+                                  HYPE_FB_PIXEL_FORMAT_XRGB8888);
+                if (copy_width != 0u && copy_height != 0u) {
+                    hype_gop_mark_dirty_rect(&g_gop_console, 0u, copy_width - 1u, 0u,
+                                             copy_height - 1u);
+                }
+                g_vms[view].ramfb_last_blit_tsc = now_gf;
+                g_render_calls++;
+                g_render_pushes++;
+                bsp_phase(BSP_PHASE_GOPFLUSH);
+                hype_debug_flush_gop();
+                fw_1_view_switch_pass(view, 1, tsc_hz);
+            }
+        } else {
             /*
-             * #363: bounded. One unbounded pass measured over SIX SECONDS on hardware with
-             * a guest spinning on emulated MMIO, and the BSP services the keyboard between
-             * passes -- so the operator lost input for a minute and saw a single very slow
-             * screen update. 8 rows keeps a pass in the tens of milliseconds even at the
-             * worst observed rate, and the screen converges over the following passes.
+             * #373: start at #363's safe eight-row floor, then adapt from the
+             * measured duration of productive passes. A healthy switch expands
+             * quickly. A loaded machine stays at the protective floor.
              */
             int more = 0;
             unsigned drawn;
+            unsigned rows = hype_render_budget_rows(&g_view_render_budget[view],
+                                                     g_gop_console.rows);
+            uint64_t render_t0;
+            uint64_t render_t1;
+            uint64_t render_us;
             bsp_phase(BSP_PHASE_BAND);
+            render_t0 = fb_tsc_begin();
             drawn = hype_vt_render_cached_bounded(&g_vms[view].term, &g_gop_console, 1,
-                                                 &g_view_render_cache[view], 8u, &more);
+                                                 &g_view_render_cache[view], rows, &more);
+            render_t1 = fb_tsc_end();
+            render_us = (tsc_hz >= 1000000u)
+                            ? (render_t1 - render_t0) / (tsc_hz / 1000000u)
+                            : 0u;
+            hype_render_budget_record(&g_view_render_budget[view], g_gop_console.rows,
+                                      drawn, render_us);
             g_render_cells_drawn += drawn;
             g_render_calls++;
             if (drawn != 0u) {
@@ -7892,26 +8193,32 @@ static void fw_1_render_console(void) {
                 bsp_phase(BSP_PHASE_GOPFLUSH);
                 hype_debug_flush_gop(); /* only push when something changed */
             }
+            fw_1_view_switch_pass(view, !more, tsc_hz);
         }
     } else { /* dashboard view (-1) */
         hype_vm_dash_info_t info[HYPE_FW_MAX_VMS];
         unsigned ninfo = HYPE_TERM_NVMS;
         for (unsigned i = 0; i < ninfo; i++) {
+            unsigned int ready_mask =
+                __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE);
+            int ready = i < 32u && (ready_mask & (1u << i)) != 0u;
             /* #357: show the operator's `label` when they set one; the section-id/vm0 identity is
              * what they TYPE, and stays available for commands either way. */
-            info[i].name = (g_vms[i].label != 0) ? g_vms[i].label : g_vms[i].name;
+            info[i].name = (g_vms[i].label != 0)
+                               ? g_vms[i].label
+                               : (g_vms[i].name != 0 ? g_vms[i].name
+                                                    : (i == 0u ? "vm0" : "vm1"));
             info[i].os_hint = g_vms[i].os_hint;
-            info[i].state = hype_vm_lifecycle_name(g_vms[i].lifecycle);
-            info[i].cpu_pct = (g_vms[i].lifecycle == HYPE_VM_RUNNING) ? g_vms[i].stat_cpu_pct : 0u;
+            info[i].state = ready ? hype_vm_lifecycle_name(g_vms[i].lifecycle) : "no-vcpu";
+            info[i].cpu_pct = (ready && g_vms[i].lifecycle == HYPE_VM_RUNNING)
+                                  ? g_vms[i].stat_cpu_pct
+                                  : 0u;
             info[i].mem_mb = g_vms[i].mem_mb;
             info[i].uptime_s = g_vms[i].stat_uptime_ms / 1000u;
-            info[i].media = g_vms[i].media;
+            info[i].media = g_vms[i].media != 0
+                                ? g_vms[i].media
+                                : (i == 0u ? "test.iso" : "vm1.iso");
             info[i].focused = 0;
-        }
-        if (term_last_view != -1) {
-            hype_gop_console_clear(&g_gop_console);
-            hype_vt_render_cache_invalidate(&g_dash_render_cache);
-            term_last_view = -1;
         }
         {
             /* M10-5: a pending/accepted physical-write confirmation is the most
@@ -7948,9 +8255,21 @@ static void fw_1_render_console(void) {
         {
             int more = 0;
             unsigned drawn;
+            unsigned rows = hype_render_budget_rows(&g_dash_render_budget,
+                                                     g_gop_console.rows);
+            uint64_t render_t0;
+            uint64_t render_t1;
+            uint64_t render_us;
             bsp_phase(BSP_PHASE_BAND);
+            render_t0 = fb_tsc_begin();
             drawn = hype_vt_render_cached_bounded(&g_dashboard_term, &g_gop_console, 0,
-                                                 &g_dash_render_cache, 8u, &more);
+                                                 &g_dash_render_cache, rows, &more);
+            render_t1 = fb_tsc_end();
+            render_us = (tsc_hz >= 1000000u)
+                            ? (render_t1 - render_t0) / (tsc_hz / 1000000u)
+                            : 0u;
+            hype_render_budget_record(&g_dash_render_budget, g_gop_console.rows, drawn,
+                                      render_us);
             g_render_cells_drawn += drawn;
             g_render_calls++;
             if (drawn != 0u) {
@@ -7958,6 +8277,7 @@ static void fw_1_render_console(void) {
                 bsp_phase(BSP_PHASE_GOPFLUSH);
                 hype_debug_flush_gop();
             }
+            fw_1_view_switch_pass(-1, !more, tsc_hz);
         }
     }
 }
@@ -8094,7 +8414,7 @@ static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
  *
  * Returns the filesystem name on success (a literal, for the caller's log line), or 0.
  */
-static const char *fw_1_resolve_on_any_fs(const char *path, hype_fat_file_t *out, int *frag) {
+static const char *fw_1_resolve_on_any_fs(const char *path, hype_file_map_t *out, int *frag) {
     if (hype_fat32_resolve(fatvol_read, 0, path, out) == 0) {
         return "FAT32";
     }
@@ -8474,13 +8794,13 @@ static int media_selected_dev(unsigned vi); /* #323 */
 static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
     hype_fw_disk_t *d = &vm->disk[slot];
     hype_gpt_partition_t part;
-    /* #366: static, not a stack local. HYPE_FAT_MAX_EXTENTS is 256, so this struct is over 4 KiB
+    /* #366: static, not a stack local. HYPE_FILE_MAX_EXTENTS is 256, so this struct is over 4 KiB
      * and the UEFI ABI makes the compiler emit a __chkstk stack probe for a frame that large --
      * which does not exist in a freestanding build, so it fails at link. Static is correct here
      * anyway: every resolver call runs on the BSP during setup, before hype_ap_start(), and they
      * all share one file-global read context (fatvol_read takes a NULL ctx), so this path was
      * already single-threaded by construction. */
-    static hype_fat_file_t file;
+    static hype_file_map_t file;
     const char *path = HYPE_M5_8_IMAGE_PATH;
     const char *fs = 0;
     int frag_seen = 0; /* #366 */
@@ -9242,7 +9562,12 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     hype_guest_uart_reset(&g_fw_1_uart2);
     hype_vt_screen_init(&vm->term, g_gop_console.cols, g_gop_console.rows);
     hype_ps2_kbd_reset(&g_fw_1_ps2);
+    hype_scancode_queue_reset(&vm->host_ps2_queue);
+    __atomic_store_n(&vm->host_ps2_irqs, 0ull, __ATOMIC_RELAXED);
     hype_ps2_mouse_reset(&g_fw_1_mouse);
+    hype_guest_ram_zero(vm->ramfb_config, sizeof(vm->ramfb_config));
+    vm->ramfb_reported = 0;
+    vm->ramfb_last_blit_tsc = 0;
     hype_pci_reset(&g_fw_1_pci);
     hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
                          0x00, 0x00);
@@ -9289,6 +9614,69 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     vm->pm1a_cnt = 0;
     hype_debug_print("fw-1: vm%u restarted (M8-4): pristine firmware restored, RAM zeroed, vcpu reset\n",
                      (unsigned)(vm - g_vms));
+}
+
+/* Build the real VM's fw_cfg directory outside run_fw_1_test(). The ACPI
+ * config and layout are large enough to push that already-large dispatch
+ * function over the freestanding target's stack-probe threshold. */
+static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
+    hype_acpi_layout_t layout;
+    hype_acpi_config_t cfg;
+    hype_e820_region_t ram_region;
+    uint32_t loader_entries;
+    int e820_len;
+    unsigned int z;
+
+    for (z = 0; z < HYPE_ACPI_MAX_CPUS; z++) cfg.apic_ids[z] = (uint8_t)z;
+    cfg.cpu_count = 1;
+    cfg.local_apic_address = 0xFEE00000u;
+    cfg.io_apic_id = (uint8_t)HYPE_IOAPIC_DEFAULT_ID;
+    cfg.io_apic_address = 0xFEC00000u;
+    cfg.io_apic_gsi_base = 0;
+    cfg.mcfg_base_address = HYPE_FW_1_ECAM_GPA;
+    cfg.pci_segment = 0;
+    cfg.pci_start_bus = 0;
+    cfg.pci_end_bus = 255;
+    cfg.sci_interrupt = 9;
+    cfg.pci_window_base = vm->ram_bytes;
+
+    if (hype_acpi_build_tables_blob(g_fw_1_tables_blob, sizeof(g_fw_1_tables_blob), &cfg,
+                                    &layout) != 0) {
+        hype_fatal("fw-1: hype_acpi_build_tables_blob failed");
+    }
+    hype_acpi_build_rsdp(&g_fw_1_rsdp, layout.xsdt_offset);
+    loader_entries = hype_acpi_loader_build_script(g_fw_1_loader_script, &layout);
+
+    hype_fw_cfg_reset(&g_fw_1_fw_cfg);
+    if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_RSDP,
+                             (const uint8_t *)&g_fw_1_rsdp, sizeof(g_fw_1_rsdp)) < 0 ||
+        hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_TABLES,
+                             g_fw_1_tables_blob, layout.total_length) < 0 ||
+        hype_fw_cfg_add_file(&g_fw_1_fw_cfg, "etc/table-loader",
+                             (const uint8_t *)g_fw_1_loader_script,
+                             loader_entries * (uint32_t)sizeof(hype_acpi_loader_entry_t)) < 0) {
+        hype_fatal("fw-1: fw_cfg registry full while registering ACPI");
+    }
+
+    ram_region.base = 0;
+    ram_region.length = vm->ram_bytes;
+    ram_region.type = HYPE_E820_TYPE_RAM;
+    e820_len = hype_e820_build(g_fw_1_e820_blob, (uint32_t)sizeof(g_fw_1_e820_blob),
+                               &ram_region, 1);
+    if (e820_len < 0 ||
+        hype_fw_cfg_add_file(&g_fw_1_fw_cfg, "etc/e820", g_fw_1_e820_blob,
+                             (uint32_t)e820_len) < 0) {
+        hype_fatal("fw-1: failed to register e820");
+    }
+
+    /* #350: QemuRamfbDxe returns EFI_NOT_FOUND without this exact file. */
+    hype_guest_ram_zero(vm->ramfb_config, sizeof(vm->ramfb_config));
+    vm->ramfb_reported = 0;
+    vm->ramfb_last_blit_tsc = 0;
+    if (hype_fw_cfg_add_writable_file(&g_fw_1_fw_cfg, "etc/ramfb", vm->ramfb_config,
+                                      sizeof(vm->ramfb_config)) < 0) {
+        hype_fatal("fw-1: fw_cfg registry full while registering etc/ramfb");
+    }
 }
 
 static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
@@ -9341,12 +9729,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     vm->lifecycle = HYPE_VM_RUNNING; /* M8-4..7 */
     vm->shutdown_deadline_tsc = 0;
     vm->pm1a_cnt = 0;
-    /* One dashboard grid, sized to the panel, owned by the console-owner core. */
-    if (vm == &g_vms[0] && !g_dashboard_ready) {
-        hype_vt_screen_init(&g_dashboard_term, g_gop_console.cols, g_gop_console.rows);
-        g_dashboard_ready = 1;
-    }
     hype_ps2_kbd_reset(&g_fw_1_ps2);
+    hype_scancode_queue_reset(&vm->host_ps2_queue);
+    __atomic_store_n(&vm->host_ps2_irqs, 0ull, __ATOMIC_RELAXED);
     hype_ps2_mouse_reset(&g_fw_1_mouse);
     hype_pci_reset(&g_fw_1_pci);
     hype_pci_add_device(&g_fw_1_pci, 0, HYPE_FW_1_PCI_VENDOR_ID_INTEL, HYPE_FW_1_PCI_DEVICE_ID_Q35_MCH, 0x06,
@@ -9399,81 +9784,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * interactive prompt busy-polls 0x64 thousands of times and each
      * trace line is GOP-rendered. */
 
-    /* Real OVMF's own platform init needs real ACPI content via
-     * fw_cfg, the same "etc/acpi/rsdp"/"etc/acpi/tables"/
-     * "etc/table-loader" mechanism M4-4 already built and proved works
-     * against real SVM -- confirmed necessary here too: with no fw_cfg
-     * device registered at all, every fw_cfg port access (0x510/0x511)
-     * was absorbed as all-1s (visible in the unhandled-port log),
-     * giving real OVMF no valid ACPI/RSDP content to find. */
-    {
-        hype_acpi_layout_t layout;
-        hype_acpi_config_t cfg;
-        uint32_t loader_entries;
-        unsigned int z;
-
-        for (z = 0; z < HYPE_ACPI_MAX_CPUS; z++) {
-            cfg.apic_ids[z] = (uint8_t)z;
-        }
-        cfg.cpu_count = 1;
-        cfg.local_apic_address = 0xFEE00000u;
-        cfg.io_apic_id = (uint8_t)HYPE_IOAPIC_DEFAULT_ID; /* #312: one definition, shared with the model */
-        cfg.io_apic_address = 0xFEC00000u;
-        cfg.io_apic_gsi_base = 0;
-        cfg.mcfg_base_address = HYPE_FW_1_ECAM_GPA;
-        cfg.pci_segment = 0;
-        cfg.pci_start_bus = 0;
-        cfg.pci_end_bus = 255;
-        cfg.sci_interrupt = 9;
-        /* #355: this VM's RAM top, not the 2 GiB the DSDT blob hardcodes. Guest RAM is one region
-         * [0, ram_bytes) (see the etc/e820 build below), and the guest firmware places BARs just
-         * above it, so the bridge window must start there or it overlaps the VM's own RAM. */
-        cfg.pci_window_base = vm->ram_bytes;
-
-        if (hype_acpi_build_tables_blob(g_fw_1_tables_blob, sizeof(g_fw_1_tables_blob), &cfg, &layout) !=
-            0) {
-            hype_fatal("fw-1: hype_acpi_build_tables_blob failed");
-        }
-        hype_acpi_build_rsdp(&g_fw_1_rsdp, layout.xsdt_offset);
-        loader_entries = hype_acpi_loader_build_script(g_fw_1_loader_script, &layout);
-
-        hype_fw_cfg_reset(&g_fw_1_fw_cfg);
-        if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_RSDP, (const uint8_t *)&g_fw_1_rsdp,
-                                  sizeof(g_fw_1_rsdp)) < 0) {
-            hype_fatal("fw-1: fw_cfg registry full while registering rsdp");
-        }
-        if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_TABLES, g_fw_1_tables_blob,
-                                  layout.total_length) < 0) {
-            hype_fatal("fw-1: fw_cfg registry full while registering tables");
-        }
-        if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, "etc/table-loader", (const uint8_t *)g_fw_1_loader_script,
-                                  loader_entries * (uint32_t)sizeof(hype_acpi_loader_entry_t)) < 0) {
-            hype_fatal("fw-1: fw_cfg registry full while registering table-loader");
-        }
-
-        /* FW-1a: etc/e820 -- the memory map OVMF reads FIRST (before the
-         * CMOS fallback below) to size low RAM
-         * (PlatformInitLib/MemDetect.c: PlatformScanE820). Declares
-         * exactly the RAM this project actually backs with a real host
-         * buffer: a single usable region [0, HYPE_FW_1_GUEST_RAM_BYTES),
-         * well below the Q35 32-bit MMIO hole. This is what makes OVMF
-         * place its DXE stack inside backed RAM instead of just below
-         * 4GB in the host's MMIO hole (the jump-to-(-1) root cause). */
-        {
-            hype_e820_region_t ram_region;
-            int e820_len;
-            ram_region.base = 0;
-            ram_region.length = vm->ram_bytes;
-            ram_region.type = HYPE_E820_TYPE_RAM;
-            e820_len = hype_e820_build(g_fw_1_e820_blob, (uint32_t)sizeof(g_fw_1_e820_blob), &ram_region, 1);
-            if (e820_len < 0) {
-                hype_fatal("fw-1: hype_e820_build failed");
-            }
-            if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, "etc/e820", g_fw_1_e820_blob, (uint32_t)e820_len) < 0) {
-                hype_fatal("fw-1: fw_cfg registry full while registering e820");
-            }
-        }
-    }
+    /* Real OVMF needs ACPI, E820 and #350's ramfb file through fw_cfg. */
+    fw_1_setup_fw_cfg(vm);
 
     /* CMOS 0x34/0x35: OVMF's memory-size fallback if it doesn't honor
      * etc/e820 above. Report the SAME guest RAM size (in 64KB units above
@@ -9693,7 +10005,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      */
     /* #318: last asserted state of each guest UART's interrupt line, so it is raised on the
      * transition rather than continuously while the condition holds. Index 0 = COM1, 1 = COM2. */
-    int uart_irq_asserted[2] = {0, 0};
+    uint8_t uart_irq_asserted[2] = {0, 0};
     unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
                        ex_other = 0;
     unsigned long long ex_io80 = 0, ex_ahci_npf = 0, ex_pause = 0, ex_intr = 0;
@@ -9738,7 +10050,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * sample into an answer. */
     uint64_t kriphist_rip[FW_1_RIPHIST_N];
     uint64_t kriphist_cnt[FW_1_RIPHIST_N];
-    unsigned kseen[6];
+    /* Bucket indices and boolean IRQ state need one byte each. Keeping these
+     * narrow also keeps this large freestanding dispatch frame below the
+     * target ABI's unavailable __chkstk probe threshold. */
+    uint8_t kseen[6];
     unsigned long long preempt_kernel = 0, preempt_user = 0, preempt_lowmem = 0;
     {
         int rh;
@@ -9868,17 +10183,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * RIP, error code, and CS. That is strictly more than the old catcher
      * gave, so no per-loop IDT patching is needed. */
 
-    /* RT-2c: defer per-print GOP framebuffer pushes; the loop flushes the
-     * accumulated shadow buffer to VRAM at ~60 Hz below. On real (uncached)
-     * VRAM a full-frame scroll memcpy per console line dominated the loop
-     * body -- batching turns N lines/flush-window into one push. */
-    hype_debug_set_gop_deferred(1);
-    /* Rendering isolation (#235): from here the terminal/dashboard renderer owns the
-     * GOP framebuffer, so stop hype_debug_print (relayed VM serial + diagnostics,
-     * from every core) teeing onto the shared shadow -- otherwise one VM's output
-     * bleeds onto the focused view/dashboard for a frame. Prints still go to
-     * serial + \HYPEFULL.LOG; panics still paint the GOP directly. */
-    hype_debug_set_gop_enabled(0);
+    /* #379: publish readiness only after this VM's terminal, identity, device
+     * state and vCPU context all exist. The BSP uses this acquire/release flag
+     * before rendering or routing input to the VM. */
+    {
+        unsigned int ready_index = (unsigned int)(vm - g_vms);
+        if (ready_index < HYPE_FW_MAX_VMS) {
+            __atomic_fetch_or(&g_vm_runtime_ready_mask, 1u << ready_index, __ATOMIC_RELEASE);
+        }
+    }
 
     for (;;) {
         uint8_t timer_vector;
@@ -10021,7 +10334,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint64_t isr_ticks_pre = g_ap_timer_ticks[(unsigned)(vm - g_vms) + 1u];
             if (g_fw_1_prev_post_tsc != 0) {
                 uint64_t body_delta = t_pre - g_fw_1_prev_post_tsc;
+                unsigned vi = (unsigned)(vm - g_vms);
                 g_fw_1_body_tsc += body_delta;
+                /* Everything not consumed by the three explicit checkpoints is
+                 * the reason-specific handler plus the next loop's short head. */
+                if (vi < HYPE_FW_MAX_VMS &&
+                    body_delta >= g_fw_phase_accounted_tsc[vi]) {
+                    g_fw_phase_total_tsc[vi][HYPE_FW_PHASE_DISPATCH] +=
+                        body_delta - g_fw_phase_accounted_tsc[vi];
+                }
                 /* #351: this stretch serviced the PREVIOUS exit, so it is attributed to that
                  * exit's reason, not to the one about to be taken. */
                 if (prev_cost_bucket >= 0) {
@@ -10031,6 +10352,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                 }
             }
+#if HYPE_RUN_GUEST_ON_AP
+            /* #364: restart the AP's one-shot preemption interval from this
+             * entry, not from the preceding exit. On VMX, a periodic 1 kHz
+             * tick remained pending when dispatch took 1.186 ms. Every resume
+             * then exited for that tick before FreeBSD could execute its next
+             * WBINVD. A fresh one-shot gives the guest a real execution window
+             * while preserving the 1 ms bound on uninterrupted execution. */
+            hype_lapic_arm_timer_oneshot(
+                (volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
+                (uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR,
+                g_ap_timer_reload[(unsigned)(vm - g_vms)]);
+#endif
             if (ops->vcpu_run(ctx, &info) != 0) {
                 hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
             }
@@ -10039,6 +10372,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 uint64_t this_vmrun = t_post - t_pre;
                 g_fw_1_vmrun_tsc += this_vmrun;
                 g_fw_1_prev_post_tsc = t_post;
+                {
+                    unsigned vi = (unsigned)(vm - g_vms);
+                    if (vi < HYPE_FW_MAX_VMS) {
+                        g_fw_phase_mark_tsc[vi] = t_post;
+                        g_fw_phase_accounted_tsc[vi] = 0;
+                    }
+                }
                 /* M4-6d4: the DECISIVE probe for the host-preemption-timer
                  * question. A single VMRUN's duration = how long the guest ran
                  * before it voluntarily exited. If the MAX is multi-second, the
@@ -10145,8 +10485,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * gives per-second exit rates by kind for the slow stretch. */
         if (g_fw_1_host_tsc_hz != 0) {
             uint64_t now_eh = hype_rdtsc();
-            /* RT-2c: every 30s (was 5s) so the diagnostic blocks don't flood
-             * the 4KB RT-3 tail and shove the guest console -- incl.
+            /* RT-2c: every 30s (was 5s) so the diagnostic blocks do not flood
+             * the persistent USB log and shove the guest console -- incl.
              * `localhost login` -- out of the captured window. */
             if (last_exhist_tsc == 0 || now_eh - last_exhist_tsc >= 30ULL * g_fw_1_host_tsc_hz) {
                 last_exhist_tsc = now_eh;
@@ -10592,6 +10932,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                         hype_debug_print("%s\n", cline);
                     }
+                    {
+                        unsigned vi = (unsigned)(vm - g_vms);
+                        if (vi < HYPE_FW_MAX_VMS) {
+                            hype_debug_print(
+                                "fw-1 LOOPPHASE: diag=%llums persist=%llums house=%llums "
+                                "dispatch=%llums [#365]\n",
+                                (g_fw_phase_total_tsc[vi][HYPE_FW_PHASE_DIAG] * 1000ULL) /
+                                    g_fw_1_host_tsc_hz,
+                                (g_fw_phase_total_tsc[vi][HYPE_FW_PHASE_PERSIST] * 1000ULL) /
+                                    g_fw_1_host_tsc_hz,
+                                (g_fw_phase_total_tsc[vi][HYPE_FW_PHASE_HOUSEKEEP] * 1000ULL) /
+                                    g_fw_1_host_tsc_hz,
+                                (g_fw_phase_total_tsc[vi][HYPE_FW_PHASE_DISPATCH] * 1000ULL) /
+                                    g_fw_1_host_tsc_hz);
+                        }
+                    }
                     /* M4-6d4 MEASUREMENT: cumulative wall-clock the timer IRQ0
                      * spent pending+deliverable but BLOCKED by an in-service
                      * lower-priority IRQ (guest IF=1) -- the time a fair
@@ -10733,7 +11089,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                 }
                             }
                             if (best < 0) break;
-                            kseen[kn] = (unsigned)best;
+                            kseen[kn] = (uint8_t)best;
                             koff += hype_snprintf(kl + koff, sizeof(kl) - (unsigned)koff,
                                                   " 0x%llx=%llu",
                                                   (unsigned long long)kriphist_rip[best],
@@ -10938,9 +11294,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
 
                 /* PERF-1 (gaps #3/#4): re-emit the guest's pinned clocksource +
-                 * delay-calibration lines on every diag tick, so they're always
-                 * in the last 16 KB the RT-3 nvlog snapshots -- otherwise these
-                 * early-boot lines scroll out long before login. Directly shows
+                 * delay-calibration lines on every diag tick, so they remain near
+                 * the current USB-log tail. Directly shows
                  * which clocksource Linux settled on (did it keep the TSC?) and
                  * its loops_per_jiffy, instead of us inferring it. */
                 if (g_fw_1_clockfacts.len > 0) {
@@ -10959,9 +11314,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  (unsigned long long)g_render_pushes,
                                  (unsigned long long)g_render_cells_drawn,
                                  (unsigned int)(g_gop_console.cols * g_gop_console.rows));
-                /* M8-0b: re-emit the AP bring-up result every tick so it survives
-                 * in the nvlog tail to login (the one-shot AP-SMOKETEST prints too
-                 * early). rc=0 + vmm_ok=1 => the second core came up on real HW. */
+                /* M8-0b: re-emit the AP bring-up result every tick so it remains
+                 * visible near login. rc=0 + vmm_ok=1 => the second core came up on real HW. */
                 hype_debug_print(
                     "fw-1 AP: rc=%d tramp=0x%llx host_cr3=0x%llx ap_cr3=0x%llx phase=%u "
                     "c_alive=%u vmm_ok=%u\n",
@@ -10992,6 +11346,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
         }
 
+        fw_1_phase_checkpoint(vm, HYPE_FW_PHASE_DIAG);
+
         /* RT-2a: the periodic in-loop \hype-log.txt flush is retired. This
          * loop now runs post-ExitBootServices, where Boot-Services file I/O
          * no longer exists. The RT-1 channel replaces it: every
@@ -10999,57 +11355,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * logbuf (recovered to \hype-log-prev.txt on the next boot, RT-1b)
          * and renders live to the GOP framebuffer (RT-1c). */
 
-        /* RT-3a: persist the logbuf TAIL to an NV EFI variable via Runtime
-         * Services -- the one channel that both works post-EBS and survives a
-         * COLD power cycle (SPI flash), so a power-off-only, serial-less
-         * machine can still recover the post-EBS diagnostics on the next boot
-         * (RT-3b). Throttled by time + content-change to bound flash wear; a
-         * latched failure stops retrying so a fussy firmware can't wedge the
-         * loop. */
+        /* USB log cadence. AP calls are rejected by the BSP ownership guard. */
         {
-            static uint64_t nvlog_last_tsc = 0;
-            static uint32_t nvlog_last_sum = 0;
-            static int nvlog_written = 0;
-            static int nvlog_disabled = 0;
-            static int nvlog_reported = 0; /* RT-3: report the FIRST write result once */
-            if (!nvlog_disabled && g_hype_rt != 0 && g_fw_1_host_tsc_hz != 0) {
-                uint64_t now = hype_rdtsc();
-                uint32_t sum = hype_nvlog_checksum(hype_logbuf_data(), hype_logbuf_len());
-                uint64_t interval = HYPE_NVLOG_WRITE_INTERVAL_SECS * g_fw_1_host_tsc_hz;
-                if (hype_nvlog_should_write(now, nvlog_last_tsc, interval, nvlog_written, sum,
-                                            nvlog_last_sum)) {
-                    EFI_STATUS st = hype_nvlog_write(g_hype_rt, hype_logbuf_data(),
-                                                     hype_logbuf_len());
-                    if (st == EFI_SUCCESS) {
-                        nvlog_last_tsc = now;
-                        nvlog_last_sum = sum;
-                        nvlog_written = 1;
-                        if (!nvlog_reported) {
-                            nvlog_reported = 1;
-                            hype_debug_print("RT-3: post-EBS SetVariable OK -- cold-boot diagnostic "
-                                             "capture is LIVE on this firmware\n");
-                        }
-                    } else {
-                        nvlog_disabled = 1; /* firmware rejected an RT SetVariable -- stop trying */
-                        if (!nvlog_reported) {
-                            nvlog_reported = 1;
-                            /* This firmware won't take a NON_VOLATILE SetVariable post-EBS
-                             * (commonly: runtime NV writes need SMM, which we don't drive).
-                             * RT-3 cold-boot capture is unavailable here -- rely on the frozen
-                             * GOP screen for panics/hangs. */
-                            hype_debug_print("RT-3: post-EBS SetVariable FAILED (0x%llx) -- cold-boot "
-                                             "diagnostic capture UNAVAILABLE on this firmware\n",
-                                             (unsigned long long)st);
-                        }
-                    }
-                }
-            }
-            /*
-             * #239: stream to \HYPEFULL.LOG on its OWN, much shorter cadence,
-             * and OUTSIDE the nvlog_disabled gate -- a firmware that refuses a
-             * post-EBS NV SetVariable used to silently stop the USB stream with
-             * it, which is how a healthy run could leave an empty log.
-             */
+            /* #239: retain the legacy guest-loop cadence for BSP-guest builds.
+             * AP calls are no-ops; the normal AP build drains from the BSP loop. */
             if (g_fw_1_host_tsc_hz != 0) {
                 static uint64_t usblog_last_tsc = 0;
                 uint64_t now_u = hype_rdtsc();
@@ -11060,6 +11369,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
         }
+
+        fw_1_phase_checkpoint(vm, HYPE_FW_PHASE_PERSIST);
 
         /* M4-6b1: advance the guest PIT + LAPIC timer by the number of
          * 1.193182 MHz ticks that really elapsed since the last exit
@@ -11857,7 +12168,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         fw_1_script_step(vm, (unsigned)(vm - g_vms), &g_fw_1_uart,
                          fw_1_script_now_ms(vm, hype_rdtsc()));
         /*
-         * #284: a scripted `sendkey` queued scancodes -- now tell the guest. Guest
+         * #375: move at most one physical-keyboard byte from the BSP's
+         * SPSC queue into this vCPU-owned device model. Waiting for OBF to
+         * clear produces one IRQ1 edge per byte and prevents make/break or E0
+         * sequences from being collapsed into one notification.
+         */
+        if (!hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
+            uint8_t host_scancode;
+            if (hype_scancode_queue_dequeue(&vm->host_ps2_queue, &host_scancode)) {
+                if (hype_ps2_kbd_try_enqueue_scancode(&g_fw_1_ps2, host_scancode)) {
+                    vm->in_sendkey_needs_irq = 1;
+                    __atomic_add_fetch(&vm->host_ps2_irqs, 1ull, __ATOMIC_RELAXED);
+                }
+            }
+        }
+        /*
+         * #284/#375: scripted or physical input queued a scancode -- now tell the guest. Guest
          * firmware reads its keyboard from the IRQ1 handler, so the bytes are invisible
          * without this: measured as OVMF sitting on "Press any key to enter the Boot
          * Manager Menu" with 7 scancodes queued and never read. IO-APIC first with a PIC
@@ -11907,6 +12233,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
         }
+
+        fw_1_phase_checkpoint(vm, HYPE_FW_PHASE_HOUSEKEEP);
 
         /* FW-1g: "reacted" = the guest emitted new CONSOLE output after
          * we fed it a key -- evidence the keystroke registered and drove
@@ -12083,11 +12411,25 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             continue;
         }
         if (vmm_reason_is_msr(kind, info.reason)) {
-            if (vmm_handle_msr(kind, ctx, info.reason) != 0) {
+            int msr_rc = vmm_handle_msr(kind, ctx, info.reason);
+            if (msr_rc > 0) {
+                /* Invalid synthetic-MSR input is a guest fault, not a host fault. */
+                vmm_reinject_exception(kind, ctx, 13u, 1, 0u);
+                continue;
+            }
+            if (msr_rc != 0) {
                 hype_fatal("fw-1: unhandled guest MSR access msr=0x%x %s (guest_rip=0x%llx)",
                            (unsigned int)vmm_get_msr_index(kind, ctx),
                            (info.qualification & 1ull) ? "write" : "read",
                            (unsigned long long)info.guest_rip);
+            }
+            continue;
+        }
+        if (vmm_reason_is_hypercall(kind, info.reason)) {
+            if (vmm_handle_hypercall(kind, ctx) != 0) {
+                hype_debug_print("fw-1: inactive Hyper-V hypercall instruction at guest_rip=0x%llx\n",
+                                 (unsigned long long)info.guest_rip);
+                vmm_reinject_exception(kind, ctx, 6u, 0, 0u);
             }
             continue;
         }
@@ -14328,7 +14670,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
 
     {
         hype_gpt_partition_t part;
-        static hype_fat_file_t file; /* #366: see fw_1_disk_use_image_file -- over 4 KiB, BSP-only */
+        static hype_file_map_t file; /* #366: see fw_1_disk_use_image_file -- over 4 KiB, BSP-only */
         int have_file = 0;
         int frag_seen = 0; /* #366: survives the next resolver clearing file.too_fragmented */
         unsigned pidx;
@@ -14395,7 +14737,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
          * The old `file.count == 1u` gate fell back to the RAM-preload path for a
          * fragmented file -- and that path is being retired (#326), so it would have
          * become a hard failure. It was also stricter than the rest of the block
-         * stack: hype_fat_file_t carries up to HYPE_FAT_MAX_EXTENTS runs and the guest disk-image path
+         * stack: hype_file_map_t carries up to HYPE_FILE_MAX_EXTENTS runs and the guest disk-image path
          * already consumes multi-extent files. A multi-GB ISO on a volume that was not
          * freshly formatted fragments routinely; on ext, core/ext.h notes large
          * indirect-mapped files are structurally fragmented, so one extent was close
@@ -14463,7 +14805,7 @@ static int fw_1_resolve_media_stream(unsigned vi) {
             hype_debug_print("host-fat: %s needs more than the %u extents hype can map -- "
                              "cannot stream it. The file is too fragmented on this volume; "
                              "re-copy it onto a freshly-formatted one. [#366]\n",
-                             media_path, (unsigned)HYPE_FAT_MAX_EXTENTS);
+                             media_path, (unsigned)HYPE_FILE_MAX_EXTENTS);
             usb_log_flush(); /* #346: a media failure must reach the log before dispatch */
         } else if (have_file) {
             hype_debug_print("host-fat: %s resolved but could not be streamed [#366]\n",
@@ -15314,7 +15656,7 @@ static void fw_1_await_phys_confirm_on_bsp(void) {
 /*
  * #230: stream the full in-RAM log to \HYPEFULL.LOG on the USB stick's FAT32
  * volume, so a real-HW debug run leaves the WHOLE log on the medium it booted
- * from (the RT-3 NV tail stays as a backup for the last few KB). The sink is
+ * from. The sink is
  * volume-relative; usblog_ctx_t adds the FAT partition's base LBA so the same
  * blk_usb backend serves both the raw probe reads and the filesystem writes.
  */
@@ -15326,18 +15668,23 @@ typedef struct {
 static int g_usb_log_ready;
 static int g_usb_log_flush_failed; /* emitted once, not every interval */
 static usblog_ctx_t g_usb_log_ctx;
+/* #374: live BSP-slice evidence. Source bytes count capture-buffer progress
+ * across the combined and split sinks; time includes FAT and USB work. */
+static volatile unsigned long long g_usb_log_slice_calls;
+static volatile unsigned long long g_usb_log_slice_tsc;
+static volatile unsigned long long g_usb_log_slice_max_tsc;
+static volatile unsigned long long g_usb_log_slice_source_bytes;
 
 /*
  * #338: the split companions to the combined \HYPEFULL.LOG -- hype's own output
  * in \HYPE.LOG, each guest's serial in its own \<name>.LOG.
  *
- * Separate hype_log_sink_t instances on the SAME volume and the same block
- * path. Each carries its own hype_fat32_fs_t, but cluster allocation reads the
- * FAT back from disk on every call (alloc_cluster -> fat_get), so a cluster
- * claimed by one instance is seen as taken by the others; only free_count and
- * next_free are per-instance, and both are advisory FSInfo hints. There is no
- * concurrency to reason about either: usb_log_flush() already restricts the
- * whole USB write path to the BSP (#239).
+ * Separate files on one mounted FAT state. The AMD #377 captures disproved the
+ * previous assumption that independent mounts would always observe each
+ * other's FAT writes through the USB medium. One stale read made HYPE claim
+ * VM0's root cluster. All split files now share g_hype_log.fs, including its
+ * allocation cursor and write-through FAT-sector cache. usb_log_flush() still
+ * restricts the whole path to the BSP (#239).
  *
  * The names are 8.3 because that is what hype_fat32_create() emits, so the
  * ticket's "\vm-<name>.log" becomes "<name>.LOG" -- the file sits beside
@@ -15471,6 +15818,11 @@ static int usblog_write(void *ctx, uint64_t lba, uint32_t count, const void *src
     return hype_blk_backend_write(c->be, c->base + lba, count, src);
 }
 
+static int usblog_sync(void *ctx) {
+    (void)ctx;
+    return hype_blk_usb_sync(&g_usb_ubk);
+}
+
 /* Try to mount a FAT32 volume on the stick and open the log file on it. The FAT
  * can live at LBA 0 (superfloppy), inside an MBR partition (LBA 0 is a Master
  * Boot Record -- the common "format a stick as FAT32" layout), or a GPT
@@ -15524,8 +15876,8 @@ static void split_log_setup(void) {
     for (i = 0; i < HYPE_FW_MAX_VMS; i++) {
         const char *cfg_name = (i < g_hype_cfg.vm_count) ? g_hype_cfg.vms[i].name : 0;
         vm_log_name(i, cfg_name, name, sizeof(name));
-        rc = hype_log_sink_open_ordered(&g_vm_log[i], usblog_read, usblog_write, &g_usb_log_ctx,
-                                        name, g_host_time_valid ? &g_host_time : 0, (int)i);
+        rc = hype_log_sink_open_shared_ordered(
+            &g_vm_log[i], &g_hype_log.fs, name, g_host_time_valid ? &g_host_time : 0, (int)i);
         g_vm_log_ready[i] = (rc == HYPE_LOG_SINK_OK);
         if (!g_vm_log_ready[i]) {
             hype_debug_print("usb-log: \\%s not opened (rc=%d) [#338]\n", name, rc);
@@ -15582,9 +15934,9 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
          *
          * The live combined view still exists on the serial port, unchanged.
          */
-        rc = hype_log_sink_open_ordered(&g_hype_log, usblog_read, usblog_write, &g_usb_log_ctx,
-                                        "HYPE.LOG", g_host_time_valid ? &g_host_time : 0,
-                                        HYPE_LOG_SINK_HYPE);
+        rc = hype_log_sink_open_ordered_durable(
+            &g_hype_log, usblog_read, usblog_write, usblog_sync, &g_usb_log_ctx, "HYPE.LOG",
+            g_host_time_valid ? &g_host_time : 0, HYPE_LOG_SINK_HYPE);
         if (rc == HYPE_LOG_SINK_OK) {
             g_hype_log_ready = 1;
             g_usb_log_ready = 1; /* "a log sink is up", the gate the flush path uses */
@@ -15608,9 +15960,8 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
                                "FAILED -- the USB block path (xHCI/MSC), not the filesystem"
                              : "unknown failure");
     }
-    hype_debug_print("usb-log: could not open a log sink on any of %u candidate base LBA(s) "
-                     "(RT-3 NV tail remains the backup -- and note an EMPTY \\HYPE.LOG on "
-                     "the stick means the file was created and the write failed)\n", nb);
+    hype_debug_print("usb-log: could not open a log sink on any of %u candidate base LBA(s); "
+                     "an EMPTY \\HYPE.LOG means the file was created and the write failed\n", nb);
 }
 
 /*
@@ -15650,7 +16001,7 @@ static int usb_log_this_core_owns_usb(void) {
     return usb_log_exec_apic_id() == g_usb_log_bsp_apic_id;
 }
 
-static void usb_log_flush(void) {
+static void usb_log_flush_limit(unsigned int max_source_bytes) {
     if (!g_usb_log_ready) return;
     /*
      * #239: ONLY the BSP may drive the USB write path. Driving xHCI/FAT from an
@@ -15690,15 +16041,16 @@ static void usb_log_flush(void) {
      * so the log simply stopped growing and a perfectly healthy hype was
      * indistinguishable from one that had died -- that misread has cost this
      * project real time more than once. Report the first failure only: it repeats
-     * every interval, and the report itself goes through the logbuf, which the
-     * RT-3 NV tail still captures even when the USB sink is gone. */
-    if (g_hype_log_ready && hype_log_sink_flush(&g_hype_log) != 0 && !g_usb_log_flush_failed) {
+     * every interval. The report remains visible on serial and the live display
+     * even though the failed USB sink cannot persist it. */
+    if (g_hype_log_ready &&
+        hype_log_sink_flush_budget(&g_hype_log, max_source_bytes) != 0 &&
+        !g_usb_log_flush_failed) {
         g_usb_log_flush_failed = 1;
         g_hype_log_ready = 0;
         hype_debug_print("usb-log: FLUSH FAILED -- \\HYPE.LOG has stopped growing and is "
                          "now INCOMPLETE. hype itself is unaffected; this is the USB block path "
-                         "(xHCI/MSC). Read the RT-3 NV tail (\\hype-diag-prev.txt) for the rest "
-                         "of this run.\n");
+                         "(xHCI/MSC). Photograph the live display if more evidence is needed.\n");
     }
 
     /*
@@ -15739,10 +16091,88 @@ static void usb_log_flush(void) {
         unsigned int vi;
         for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
             if (!g_vm_log_ready[vi]) continue;
-            hype_fat32_fs_set_time(&g_vm_log[vi].fs, &g_hype_log.fs.now);
-            if (hype_log_sink_flush(&g_vm_log[vi]) != 0) g_vm_log_ready[vi] = 0;
+            if (hype_log_sink_flush_budget(&g_vm_log[vi], max_source_bytes) != 0) {
+                if (g_vm_log[vi].file.last_error == HYPE_FAT32_WFILE_ERR_IDENTITY) {
+                    hype_debug_print(
+                        "usb-log: VM%u LOG STOPPED -- FAT chain identity changed; "
+                        "the writer rejected the metadata update to prevent a cross-link [#377]\n",
+                        vi);
+                }
+                g_vm_log_ready[vi] = 0;
+            }
         }
     }
+}
+
+/* Full drains remain available at one-shot checkpoints where the dashboard is
+ * not live yet, or where preserving the final diagnostic tail is the priority. */
+static void usb_log_flush(void) {
+    unsigned int before;
+    do {
+        before = hype_log_sink_flushed(&g_hype_log);
+        usb_log_flush_limit(~0u);
+    } while (g_hype_log_ready && hype_log_sink_flushed(&g_hype_log) != before &&
+             hype_log_sink_flushed(&g_hype_log) < hype_logbuf_len());
+    /* The combined sink is primary. Once it is caught up, finish each split
+     * sink without changing the existing combined-first ordering rule. */
+    {
+        unsigned int vi;
+        for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+            while (g_vm_log_ready[vi] &&
+                   hype_log_sink_flushed(&g_vm_log[vi]) < hype_logbuf_len()) {
+                unsigned int prior = hype_log_sink_flushed(&g_vm_log[vi]);
+                if (hype_log_sink_flush_budget(&g_vm_log[vi], ~0u) != 0) {
+                    g_vm_log_ready[vi] = 0;
+                    break;
+                }
+                if (hype_log_sink_flushed(&g_vm_log[vi]) == prior) break;
+            }
+        }
+    }
+}
+
+static void usb_log_flush_slice(void) {
+    unsigned int before = 0u;
+    unsigned int after = 0u;
+    unsigned int vi;
+    uint64_t t0;
+    uint64_t dt;
+
+    if (!g_usb_log_ready) return;
+    before += hype_log_sink_flushed(&g_hype_log);
+    for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+        before += hype_log_sink_flushed(&g_vm_log[vi]);
+    }
+    t0 = hype_rdtsc();
+    usb_log_flush_limit(HYPE_USBLOG_SLICE_BYTES);
+    dt = hype_rdtsc() - t0;
+    after += hype_log_sink_flushed(&g_hype_log);
+    for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+        after += hype_log_sink_flushed(&g_vm_log[vi]);
+    }
+    g_usb_log_slice_calls++;
+    g_usb_log_slice_tsc += dt;
+    if (dt > g_usb_log_slice_max_tsc) g_usb_log_slice_max_tsc = dt;
+    if (after >= before) g_usb_log_slice_source_bytes += after - before;
+}
+
+static unsigned int usb_log_flushed_total(void) {
+    unsigned int total = 0u;
+    unsigned int vi;
+    if (g_hype_log_ready) total += hype_log_sink_flushed(&g_hype_log);
+    for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+        if (g_vm_log_ready[vi]) total += hype_log_sink_flushed(&g_vm_log[vi]);
+    }
+    return total;
+}
+
+static int usb_log_reached_target(unsigned int target) {
+    unsigned int vi;
+    if (g_hype_log_ready && hype_log_sink_flushed(&g_hype_log) < target) return 0;
+    for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+        if (g_vm_log_ready[vi] && hype_log_sink_flushed(&g_vm_log[vi]) < target) return 0;
+    }
+    return 1;
 }
 
 /* Diagnostic: log EVERY PCI function present (bus:dev.func, vendor/device,
@@ -15799,16 +16229,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * later boot's scanner, RT-1b) from the very first byte. The buffer is
      * in BSS (zero at load), so this must run explicitly. */
     hype_logbuf_reset();
-
-    /* RT-3: cache Runtime Services now -- they stay valid after
-     * ExitBootServices (under our identity map), which is what lets the FW-1
-     * loop write the diagnostic tail to an NV EFI variable post-EBS. */
-    g_hype_rt = SystemTable->RuntimeServices;
-    /* RT-3c: from here on, a panic persists its own tail -- see
-     * hype_panic_persist_tail(). Registered as early as possible (right after
-     * the Runtime Services pointer exists) so it covers the whole rest of the
-     * boot, including the host device probing where #240 dies. */
-    hype_fatal_set_flush_hook(hype_panic_persist_tail);
 
     /* First thing in every log: which build this is. Captures from a
      * serial-less machine otherwise all start with identical boilerplate. */
@@ -15879,11 +16299,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * survived in RAM. */
     fw_1_dump_prev_log(ImageHandle, SystemTable->BootServices, map, map_size, desc_size);
 
-    /* RT-3b: recover the previous run's post-EBS diagnostic tail from its NV
-     * EFI variable (survives a cold power cycle, unlike RT-1b's RAM scan) and
-     * dump it to \hype-diag-prev.txt while Boot Services file I/O is up. */
-    fw_1_dump_prev_diag(ImageHandle, SystemTable->BootServices, g_hype_rt);
-
     /* CONFIG-4 (#225): load + parse \hype.cfg off the ESP now, while Boot
      * Services file I/O is still up (pre-EBS), into g_hype_cfg. Advisory:
      * absent/malformed -> empty config + built-in fallback, never a boot stop.
@@ -15932,7 +16347,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             if (mp->GetNumberOfProcessors(mp, &total, &enabled) == EFI_SUCCESS) {
                 UINTN i;
                 for (i = 0; i < total; i++) {
-                    EFI_PROCESSOR_INFORMATION pi;
+                    EFI_PROCESSOR_INFORMATION pi = {0};
                     if (mp->GetProcessorInfo(mp, i, &pi) != EFI_SUCCESS) continue;
                     (void)hype_cpu_topology_add_at(
                         &g_cpu_topo, (uint32_t)pi.ProcessorId,
@@ -15942,6 +16357,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         (uint32_t)pi.Location.Thread);
                 }
             }
+        }
+        if (hype_cpu_topology_locations_degenerate(&g_cpu_topo) &&
+            fw_1_repair_degenerate_cpu_topology() < 0) {
+            hype_debug_print("cpu: firmware physical locations are degenerate and CPUID could not "
+                             "replace them -- refusing unproven core isolation [#378]\n");
         }
         {
             /* Print the whole list. On the machine that exposed this, the useful
@@ -17356,8 +17776,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 /* #230: attach the USB debug-log sink. Use file-global copies
                                  * of the controller + MSC endpoints + backend so the sink
                                  * outlives this probe scope (it streams for the whole run and
-                                 * at the diagnostic halt). Stream whatever's been logged so far;
-                                 * flushed again on the RT-3 cadence and at the probe halt. */
+                                 * at the diagnostic halt). Stream whatever has been logged so far;
+                                 * the BSP continues bounded live draining after EBS. */
                                 /* #299: the sweep now continues past this controller, so a
                                  * second USB disk must not re-point the log sink at itself
                                  * mid-run. First one wins. */
@@ -17545,7 +17965,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      *
      * On a machine with no serial port, no USB log sink (that is the very thing
      * being diagnosed) and only cold-boot resets -- so RT-1b's in-RAM recovery
-     * is gone and RT-3c's NV tail has proven unreliable there -- the screen is
+     * is gone -- the screen is
      * the only channel left, and everything after this point (AP smoke tests,
      * guest launch, any resulting fault storm) scrolls the answer away before
      * it can be photographed. Halting here makes ONE photo of the final screen
@@ -17553,14 +17973,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * build changes.
      */
     if (HYPE_USB_PROBE) {
-        /* Deliberately reuse RT-3c's capture: this is not a panic, but the same
-         * NV tail is exactly what we want persisted, so the result survives to
-         * the next boot as \hype-diag-prev.txt and the photo becomes a backup
-         * rather than the only copy. */
-        hype_panic_persist_tail();
         hype_debug_print("usb-probe: STOP -- diagnostic build (-DHYPE_USB_PROBE=1). The usb-probe "
-                          "ctrl[] line(s) above are the payload; photograph them, and the same text "
-                          "is saved to NV -- reboot once and read \\hype-diag-prev.txt.\n");
+                          "ctrl[] line(s) above are the payload; photograph the screen.\n");
         hype_debug_flush_gop();
         hype_halt_forever();
     }
@@ -17850,19 +18264,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
 #if HYPE_DIAG_PROBE_ONLY
     /* Real-HW diagnostic: the read-only host/USB/NVMe/AHCI probes above have all
-     * run + logged. Capture the log (frozen GOP screen + RT-3 NV tail) and halt
+     * run + logged. Capture the log (frozen GOP screen + USB log) and halt
      * before any guest -- so the whole captured log IS the probe output. */
     {
         hype_debug_print("diag: PROBE-ONLY build -- host enumeration complete, capturing + halting\n");
         hype_debug_flush_gop();
-        if (g_hype_rt) {
-            (void)hype_nvlog_write(g_hype_rt, hype_logbuf_data(), hype_logbuf_len());
-        }
-        /* #230: flush the full log to \HYPEFULL.LOG on the USB stick (if one was
-         * found + mounted); this is the complete run, not just the RT-3 tail. */
+        /* #230: flush the full log to USB if a writable stick was mounted. */
         usb_log_flush();
-        hype_debug_print("diag: log captured to GOP + RT-3 variable%s; system halted (power-cycle "
-                         "to recover the tail as \\hype-diag-prev.txt on the next boot)\n",
+        hype_debug_print("diag: log captured to GOP%s; system halted\n",
                          g_usb_log_ready ? " + \\HYPE.LOG and per-VM logs on USB" : "");
         /* One more flush so the final "captured/halted" lines land on the stick too. */
         usb_log_flush();
@@ -17872,6 +18281,27 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         }
     }
 #endif
+
+    /*
+     * #380: transfer GOP ownership on the BSP before any guest AP starts.
+     * Relayed guest serial and diagnostics continue to serial and the USB log,
+     * but they must never modify the renderer's shared shadow. The old code
+     * performed this store independently from each AP after guest setup. That
+     * raced the BSP renderer and also left AP initialization output able to
+     * overwrite a dashboard that the BSP had already drawn.
+     */
+    hype_debug_set_gop_deferred(1);
+    hype_debug_set_gop_enabled(0);
+    hype_debug_print("gop: BSP transferred exclusive framebuffer ownership to the view renderer "
+                     "[#380]\n");
+
+    /* #379: the dashboard belongs to the BSP and must exist even when every
+     * AP dispatch fails. Initializing it inside vm0's AP routine made the
+     * failure screen itself depend on a successful guest start. */
+    if (!g_dashboard_ready) {
+        hype_vt_screen_init(&g_dashboard_term, g_gop_console.cols, g_gop_console.rows);
+        g_dashboard_ready = 1;
+    }
 
 #if HYPE_AP_SMOKETEST
     /*
@@ -17906,18 +18336,23 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             usb_log_latch_bsp_core();
             /* #368: an ISOLATED core, not the first enumerated AP. See fw_1_ap_apic_id(). */
             int ap1_sel = fw_1_ap_apic_id(0u);
-            uint8_t ap1_id = (uint8_t)((ap1_sel < 0) ? 1 : ap1_sel);
+            uint8_t ap1_id = 0u;
+            int ap_rc;
             if (ap1_sel < 0) {
                 hype_debug_print("fw-1 #360: no application processor available -- this machine "
-                                 "reports %u usable CPU(s); no guest can run on an AP\n",
+                                 "reports %u usable CPU(s), but no AP has proven physical-core "
+                                 "isolation; no guest will run [#378]\n",
                                  g_cpu_topo.count);
-            }
-            g_ap_slot_apic_id[0] = ap1_id;
-            g_ap_slot_valid[0] = 1;
-            int ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, ap1_id,
-                                      (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
+                ap_rc = -5;
+            } else {
+                ap1_id = (uint8_t)ap1_sel;
+                g_ap_slot_apic_id[0] = ap1_id;
+                g_ap_slot_valid[0] = 1;
+                ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
+                                      ap1_id, (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                                       (uint64_t)(uintptr_t)(g_ap_stack + sizeof(g_ap_stack)),
                                       g_fw_1_host_tsc_hz, fw_1_ap_main, 0);
+            }
             g_fw_1_ap_rc = ap_rc;
             hype_debug_print(
                 "fw-1 AP-SMOKETEST: apic_id=%u tramp=0x%llx cr3=0x%llx -> rc=%d (long-mode reached=%s), "
@@ -18003,9 +18438,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      */
 #if HYPE_RUN_GUEST_ON_AP
     (void)vm;
-    hype_debug_print("fw-1: guest dispatched to the AP (dedicated core); BSP idle -- "
-                     "draining the split logs from here every %llus (#239)\n",
-                     (unsigned long long)HYPE_USBLOG_WRITE_INTERVAL_SECS);
+    hype_debug_print("fw-1: guest dispatched to the AP (dedicated core); BSP owns console + "
+                     "%llus bursts drained in %llums/%u-byte USB log slices (#239 #374 #377)\n",
+                     (unsigned long long)HYPE_USBLOG_WRITE_INTERVAL_SECS,
+                     (unsigned long long)HYPE_USBLOG_SLICE_INTERVAL_MS,
+                     (unsigned int)HYPE_USBLOG_SLICE_BYTES);
     /*
      * #239: the BSP-side USB log drain.
      *
@@ -18027,9 +18464,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * bytes appended before it sampled the length. That is a diagnostic-quality
      * race and strictly better than the previous arrangement, where an AP both
      * appended and flushed.
-     */
+    */
     {
-        uint64_t drain_last_tsc = 0;
+        hype_log_drain_t log_drain;
+        hype_log_drain_init(&log_drain, hype_rdtsc(), g_vms[0].host_tsc_hz,
+                            (unsigned int)HYPE_USBLOG_WRITE_INTERVAL_SECS,
+                            (unsigned int)HYPE_USBLOG_SLICE_INTERVAL_MS);
         /*
          * #338: PAUSE-poll on a TSC deadline, never HLT-and-hope.
          *
@@ -18133,6 +18573,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              "(device time is measured AFTER the lock) [#365]\n",
                                              (lw * 1000ull) / hz, (lwm * 1000000ull) / hz);
                         }
+                        hype_debug_print(
+                            "fw-1 USBFLUSH: slices=%llu source_bytes=%llu total=%llums "
+                            "max=%lluus [#374]\n",
+                            g_usb_log_slice_calls, g_usb_log_slice_source_bytes,
+                            (g_usb_log_slice_tsc * 1000ull) / hz,
+                            (g_usb_log_slice_max_tsc * 1000000ull) / hz);
                         hype_debug_print("fw-1 USBRD: media=%llu calls/%llu sec | "
                                          "fatvol=%llu calls/%llu sec [#365]\n",
                                          g_usbrd_media, g_usbrd_media_sec, g_usbrd_fatvol,
@@ -18149,19 +18595,42 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                          (unsigned long long)g_hostkbd_scancodes,
                                          (unsigned long long)g_hostkbd_chords,
                                          hype_blk_usb_bsp_lock_timeouts());
+                        {
+                            unsigned vi;
+                            for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+                                unsigned long long routed = 0, handed = 0, route_drop = 0;
+                                unsigned long long dev_queued = 0, guest_read = 0, dev_drop = 0;
+                                hype_scancode_queue_stats(&g_vms[vi].host_ps2_queue,
+                                                          &routed, &handed, &route_drop);
+                                hype_ps2_kbd_scancode_stats(&g_vms[vi].ps2,
+                                                            &dev_queued, &guest_read, &dev_drop);
+                                hype_debug_print(
+                                    "fw-1 GUESTKBD vm%u: routed=%llu handed=%llu "
+                                    "route_drop=%llu pending=%u | device=%llu read=%llu "
+                                    "device_drop=%llu irq1=%llu [#375]\n",
+                                    vi, routed, handed, route_drop,
+                                    hype_scancode_queue_pending(&g_vms[vi].host_ps2_queue),
+                                    dev_queued, guest_read, dev_drop,
+                                    __atomic_load_n(&g_vms[vi].host_ps2_irqs,
+                                                    __ATOMIC_RELAXED));
+                            }
+                        }
                         kbd_prev_entries = e;
                     }
                 }
             }
             if (g_vms[0].host_tsc_hz != 0) {
                 uint64_t now_d = hype_rdtsc();
-                uint64_t iv = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_vms[0].host_tsc_hz;
-                if (drain_last_tsc == 0 || now_d - drain_last_tsc >= iv) {
-                    unsigned int have = hype_logbuf_len();
-                    drain_last_tsc = now_d;
+                unsigned int have = hype_logbuf_len();
+                if (hype_log_drain_due(&log_drain, now_d, have)) {
+                    unsigned int before = usb_log_flushed_total();
+                    unsigned int after;
                     bsp_phase(BSP_PHASE_FLUSH);
-                    usb_log_flush(); /* no-op until a USB sink is open */
+                    usb_log_flush_slice();
                     bsp_phase(BSP_PHASE_IDLE);
+                    after = usb_log_flushed_total();
+                    hype_log_drain_record(&log_drain, hype_rdtsc(), after > before,
+                                          usb_log_reached_target(log_drain.target));
                     /*
                      * #338: say how much of the buffer has actually reached the file. A gap that
                      * grows means the sink is behind or dead -- visible IN the log instead of

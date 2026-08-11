@@ -302,7 +302,7 @@ static void build_vol(void) {
 }
 
 /* Gathers a resolved file's bytes through its extents, test-side. */
-static unsigned int gather(const hype_fat_file_t *f, uint8_t *out, unsigned int max) {
+static unsigned int gather(const hype_file_map_t *f, uint8_t *out, unsigned int max) {
     unsigned int n = 0, x;
     for (x = 0; x < f->count; x++) {
         uint64_t s;
@@ -315,7 +315,7 @@ static unsigned int gather(const hype_fat_file_t *f, uint8_t *out, unsigned int 
     return n;
 }
 
-static void check_content(const char *what, const hype_fat_file_t *f, unsigned int seed) {
+static void check_content(const char *what, const hype_file_map_t *f, unsigned int seed) {
     static uint8_t buf[120000];
     unsigned int n = gather(f, buf, sizeof buf);
     unsigned int i;
@@ -333,7 +333,7 @@ static void check_content(const char *what, const hype_fat_file_t *f, unsigned i
 /* ---- tests ---- */
 
 static void test_resolve_extents(void) {
-    hype_fat_file_t f;
+    hype_file_map_t f;
     build_vol();
     CHECK_HEX("resolve img.bin", 0, hype_ext_resolve(vol_read, 0, "/img.bin", &f));
     CHECK_HEX("size", 20000u, (unsigned)f.size_bytes);
@@ -368,7 +368,7 @@ static void test_resolve_extents(void) {
 }
 
 static void test_resolve_indirect(void) {
-    hype_fat_file_t f;
+    hype_file_map_t f;
     build_vol();
     CHECK_HEX("resolve ind.bin", 0, hype_ext_resolve(vol_read, 0, "/ind.bin", &f));
     CHECK_HEX("ind size", 114000u, (unsigned)f.size_bytes);
@@ -381,7 +381,7 @@ static void test_resolve_indirect(void) {
 }
 
 static void test_refusals(void) {
-    hype_fat_file_t f;
+    hype_file_map_t f;
     build_vol();
     CHECK_HEX("a symlink is refused", -1, hype_ext_resolve(vol_read, 0, "/sym", &f));
     CHECK_HEX("a directory is refused", -1, hype_ext_resolve(vol_read, 0, "/sub", &f));
@@ -405,7 +405,7 @@ static void test_refusals(void) {
 }
 
 static void test_mount_refusals(void) {
-    hype_fat_file_t f;
+    hype_file_map_t f;
 
     build_vol();
     put16(g_vol + 1024 + 0x38, 0x1234u);
@@ -450,7 +450,7 @@ static void test_mount_refusals(void) {
 }
 
 static void test_corrupt_structures(void) {
-    hype_fat_file_t f;
+    hype_file_map_t f;
 
     /* A crafted extent pointing past the volume. */
     build_vol();
@@ -546,7 +546,7 @@ static void test_corrupt_structures(void) {
 
 /* The 64BIT shape: 64-byte group descriptors, split block counts. */
 static void test_64bit_feature(void) {
-    hype_fat_file_t f;
+    hype_file_map_t f;
     build_vol();
     put32(g_vol + 1024 + 0x60, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT);
     put16(g_vol + 1024 + 0xFE, 64u); /* desc_size */
@@ -578,7 +578,7 @@ static int big_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
 }
 
 static void test_triple_indirect(void) {
-    hype_fat_file_t f;
+    hype_file_map_t f;
     uint8_t *in;
     uint32_t i;
     /* 12 direct + 256 single + 65536 double + 4 triple = 65808 blocks. All
@@ -667,7 +667,7 @@ static void test_triple_indirect(void) {
 /* Remaining defensive legs: superblock field bounds, crafted descriptor and
  * pointer-block corruption, extent-node children at impossible blocks. */
 static void test_more_bounds(void) {
-    hype_fat_file_t f;
+    hype_file_map_t f;
 
     build_vol();
     put32(g_vol + 1024 + 0x04, 1u); /* blocks_count 1 */
@@ -805,7 +805,7 @@ static void test_write_at(void) {
     CHECK_HEX("null read buffer", -1, hype_ext_read_at(&f, 0u, 0, 1u));
     /* The resolver still sees a healthy file afterwards (no metadata moved). */
     {
-        hype_fat_file_t m;
+        hype_file_map_t m;
         CHECK_HEX("re-resolve after writes", 0, hype_ext_resolve(vol_read, 0, "/img.bin", &m));
         CHECK_HEX("same size", 20000u, (unsigned)m.size_bytes);
         CHECK_HEX("same extents", 2u, m.count);
@@ -868,7 +868,7 @@ static void test_write_io_errors(void) {
 static void test_fault_sweep(void) {
     long k;
     for (k = 0; k < 1600; k += (k < 400 ? 1 : 5)) {
-        hype_fat_file_t f;
+        hype_file_map_t f;
         build_vol();
         g_read_countdown = k;
         (void)hype_ext_resolve(vol_read, 0, "/img.bin", &f);

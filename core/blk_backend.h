@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "blk_io.h" /* HYPE_BLK_SECTOR_SIZE + the shared I/O callback types (#292) */
+
 /*
  * M5-3 (§6d): the block-backend abstraction. A guest's virtio-blk/AHCI disk
  * frontend serves either a host-file-backed virtual disk (`file:` target) or a
@@ -20,8 +22,6 @@
  * a host buffer, and tests exercise both the bounds gate and the data path
  * without any real disk.
  */
-
-#define HYPE_BLK_SECTOR_SIZE 512u
 
 /*
  * A block backend: read/write `count` 512-byte sectors at `lba`. The impls are

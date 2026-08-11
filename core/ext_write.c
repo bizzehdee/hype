@@ -6,7 +6,7 @@
  * extents #203's resolver produced -- no ext metadata is ever written.
  */
 
-#define SECSZ HYPE_FAT_SECTOR_SIZE
+#define SECSZ HYPE_BLK_SECTOR_SIZE
 
 /* Superblock fields checked beyond what the resolver already validates. */
 #define SB_STATE 0x3Au
@@ -20,7 +20,7 @@ static void bcopy(uint8_t *dst, const uint8_t *src, unsigned int n) {
     }
 }
 
-int hype_ext_open_rw(hype_fat_read_fn read, hype_fat_write_fn write, void *ctx,
+int hype_ext_open_rw(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
                      const char *path, hype_ext_wfile_t *out) {
     uint8_t sb[1024];
     uint16_t state;

@@ -526,8 +526,8 @@ static int ra_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
     g_ra_calls++;
     g_ra_sectors_read += count;
-    for (i = 0; i < (uint64_t)count * HYPE_ISO_STREAM_SECTOR; i++) {
-        p[i] = (unsigned char)((lba + i / HYPE_ISO_STREAM_SECTOR) & 0xFFu);
+    for (i = 0; i < (uint64_t)count * HYPE_BLK_SECTOR_SIZE; i++) {
+        p[i] = (unsigned char)((lba + i / HYPE_BLK_SECTOR_SIZE) & 0xFFu);
     }
     return 0;
 }
@@ -538,7 +538,7 @@ static void ra_init(hype_iso_stream_t *s) {
     s->read = ra_read;
     s->ctx = 0;
     s->part_start_lba = 0;
-    s->iso_size = (uint64_t)(1u << 20) * HYPE_ISO_STREAM_SECTOR;
+    s->iso_size = (uint64_t)(1u << 20) * HYPE_BLK_SECTOR_SIZE;
     s->extent_count = 0; /* one contiguous run from part_start_lba */
     g_ra_sectors_read = 0;
     g_ra_calls = 0;
@@ -546,13 +546,13 @@ static void ra_init(hype_iso_stream_t *s) {
 
 static void test_seeking_reads_do_not_fetch_read_ahead(void) {
     hype_iso_stream_t s;
-    unsigned char buf[HYPE_ISO_STREAM_SECTOR];
+    unsigned char buf[HYPE_BLK_SECTOR_SIZE];
     unsigned i;
     ra_init(&s);
     /* Ten reads scattered far apart -- nothing continues anything. */
     for (i = 0; i < 10u; i++) {
         CHECK_INT("seeking read succeeds", 0,
-                  hype_iso_stream_read(&s, (uint64_t)i * 4096u * HYPE_ISO_STREAM_SECTOR, buf,
+                  hype_iso_stream_read(&s, (uint64_t)i * 4096u * HYPE_BLK_SECTOR_SIZE, buf,
                                        sizeof(buf)));
     }
     CHECK_INT("ten device reads", 10, (int)g_ra_calls);
@@ -562,12 +562,12 @@ static void test_seeking_reads_do_not_fetch_read_ahead(void) {
 
 static void test_sequential_reads_still_get_full_read_ahead(void) {
     hype_iso_stream_t s;
-    unsigned char buf[HYPE_ISO_STREAM_SECTOR];
+    unsigned char buf[HYPE_BLK_SECTOR_SIZE];
     unsigned i;
     ra_init(&s);
     for (i = 0; i < 64u; i++) {
         CHECK_INT("sequential read succeeds", 0,
-                  hype_iso_stream_read(&s, (uint64_t)i * HYPE_ISO_STREAM_SECTOR, buf, sizeof(buf)));
+                  hype_iso_stream_read(&s, (uint64_t)i * HYPE_BLK_SECTOR_SIZE, buf, sizeof(buf)));
     }
     /* 64 contiguous sectors must come from far fewer than 64 device reads. */
     CHECK("a sequential run is served mostly from cache", g_ra_calls <= 2u);
@@ -577,15 +577,15 @@ static void test_sequential_reads_still_get_full_read_ahead(void) {
 /* A seek followed by a sequential run must recover read-ahead, not stay penalised. */
 static void test_read_ahead_recovers_after_a_seek(void) {
     hype_iso_stream_t s;
-    unsigned char buf[HYPE_ISO_STREAM_SECTOR];
+    unsigned char buf[HYPE_BLK_SECTOR_SIZE];
     unsigned i;
-    uint64_t base = 500u * HYPE_ISO_STREAM_SECTOR;
+    uint64_t base = 500u * HYPE_BLK_SECTOR_SIZE;
     ra_init(&s);
     CHECK_INT("the seek itself succeeds", 0, hype_iso_stream_read(&s, base, buf, sizeof(buf)));
     CHECK_INT("the seek fetched one sector only", 1, (int)g_ra_sectors_read);
     for (i = 1; i < 40u; i++) {
         CHECK_INT("continuing read succeeds", 0,
-                  hype_iso_stream_read(&s, base + (uint64_t)i * HYPE_ISO_STREAM_SECTOR, buf,
+                  hype_iso_stream_read(&s, base + (uint64_t)i * HYPE_BLK_SECTOR_SIZE, buf,
                                        sizeof(buf)));
     }
     CHECK("read-ahead resumed once the pattern became sequential", g_ra_calls <= 3u);
@@ -595,7 +595,7 @@ static void test_read_ahead_recovers_after_a_seek(void) {
  * treated as continuing a stream that no longer exists. */
 static void test_invalidate_clears_the_sequential_history(void) {
     hype_iso_stream_t s;
-    unsigned char buf[HYPE_ISO_STREAM_SECTOR];
+    unsigned char buf[HYPE_BLK_SECTOR_SIZE];
     ra_init(&s);
     (void)hype_iso_stream_read(&s, 0, buf, sizeof(buf));
     hype_iso_stream_invalidate(&s);

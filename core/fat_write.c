@@ -1,22 +1,16 @@
 #include "fat_write.h"
+#include "lebytes.h"
 
-static uint32_t rd32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
-static void wr32(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
 static char up(char c) { return (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c; }
 
 uint32_t hype_fat32_entry_get(const uint8_t *fat_sector, unsigned int idx_in_sector) {
-    return rd32(fat_sector + idx_in_sector * 4u) & 0x0FFFFFFFu;
+    return hype_rd32(fat_sector + idx_in_sector * 4u) & 0x0FFFFFFFu;
 }
 
 void hype_fat32_entry_set(uint8_t *fat_sector, unsigned int idx_in_sector, uint32_t value) {
     uint8_t *p = fat_sector + idx_in_sector * 4u;
-    uint32_t cur = rd32(p);
-    wr32(p, (cur & 0xF0000000u) | (value & 0x0FFFFFFFu)); /* preserve reserved top nibble */
+    uint32_t cur = hype_rd32(p);
+    hype_wr32(p, (cur & 0xF0000000u) | (value & 0x0FFFFFFFu)); /* preserve reserved top nibble */
 }
 
 void hype_fat32_fat_location(uint32_t cluster, uint64_t fat_start_lba, uint64_t *out_sector_lba,
@@ -71,14 +65,14 @@ void hype_fat_dirent_build(uint8_t ent[32], const uint8_t name11[11], uint8_t at
      * invalid time, so this reproduces the old all-zero behaviour rather than
      * writing a confidently wrong date when the clock is unreadable. */
     ent[13] = hype_fat_encode_time_tenths(now);      /* CrtTimeTenth */
-    wr16(ent + 14, hype_fat_encode_time(now));       /* CrtTime */
-    wr16(ent + 16, hype_fat_encode_date(now));       /* CrtDate */
-    wr16(ent + 18, hype_fat_encode_date(now));       /* LstAccDate (date only) */
-    wr16(ent + 22, hype_fat_encode_time(now));       /* WrtTime */
-    wr16(ent + 24, hype_fat_encode_date(now));       /* WrtDate */
-    wr16(ent + 20, (uint16_t)(first_cluster >> 16)); /* first cluster high */
-    wr16(ent + 26, (uint16_t)(first_cluster & 0xFFFFu)); /* first cluster low */
-    wr32(ent + 28, size);
+    hype_wr16(ent + 14, hype_fat_encode_time(now));       /* CrtTime */
+    hype_wr16(ent + 16, hype_fat_encode_date(now));       /* CrtDate */
+    hype_wr16(ent + 18, hype_fat_encode_date(now));       /* LstAccDate (date only) */
+    hype_wr16(ent + 22, hype_fat_encode_time(now));       /* WrtTime */
+    hype_wr16(ent + 24, hype_fat_encode_date(now));       /* WrtDate */
+    hype_wr16(ent + 20, (uint16_t)(first_cluster >> 16)); /* first cluster high */
+    hype_wr16(ent + 26, (uint16_t)(first_cluster & 0xFFFFu)); /* first cluster low */
+    hype_wr32(ent + 28, size);
 }
 
 uint32_t hype_fat_dirent_cluster(const uint8_t ent[32]) {
@@ -88,19 +82,19 @@ uint32_t hype_fat_dirent_cluster(const uint8_t ent[32]) {
 }
 
 uint32_t hype_fat_dirent_size(const uint8_t ent[32]) {
-    return rd32(ent + 28);
+    return hype_rd32(ent + 28);
 }
 
 int hype_fat32_fsinfo_set(uint8_t *fsinfo_sector, uint32_t free_count, uint32_t next_free) {
-    if (rd32(fsinfo_sector + 0) != 0x41615252u) return -1; /* FSInfo lead signature */
-    wr32(fsinfo_sector + 0x1E8, free_count);
-    wr32(fsinfo_sector + 0x1EC, next_free);
+    if (hype_rd32(fsinfo_sector + 0) != 0x41615252u) return -1; /* FSInfo lead signature */
+    hype_wr32(fsinfo_sector + 0x1E8, free_count);
+    hype_wr32(fsinfo_sector + 0x1EC, next_free);
     return 0;
 }
 
 void hype_fat_dirent_set_cluster(uint8_t ent[32], uint32_t first_cluster) {
-    wr16(ent + 20, (uint16_t)(first_cluster >> 16));
-    wr16(ent + 26, (uint16_t)(first_cluster & 0xFFFFu));
+    hype_wr16(ent + 20, (uint16_t)(first_cluster >> 16));
+    hype_wr16(ent + 26, (uint16_t)(first_cluster & 0xFFFFu));
 }
 
 /* ---- Long File Names (#247) ---- */
@@ -228,7 +222,7 @@ void hype_fat_lfn_entry_build(uint8_t ent[32], const char *name, unsigned int na
         } else {
             u = 0xFFFFu; /* fill */
         }
-        wr16(ent + lfn_off[k], u);
+        hype_wr16(ent + lfn_off[k], u);
     }
 }
 

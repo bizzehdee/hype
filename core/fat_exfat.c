@@ -1,19 +1,6 @@
 #include "fat_exfat.h"
+#include "lebytes.h"
 
-static void wr16(uint8_t *p, uint16_t v) {
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-}
-static void wr32(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16);
-    p[3] = (uint8_t)(v >> 24);
-}
-static void wr64(uint8_t *p, uint64_t v) {
-    wr32(p, (uint32_t)v);
-    wr32(p + 4, (uint32_t)(v >> 32));
-}
 
 /* ---- checksums and hashes ---- */
 
@@ -225,16 +212,16 @@ void hype_exfat_file_entry(uint8_t ent[32], uint16_t attributes, uint8_t seconda
     ent[1] = secondary_count;
     /* ent[2..3] (SetChecksum) stays zero so a checksum taken over the built set
      * matches -- hype_exfat_set_checksum_update skips those bytes anyway. */
-    wr16(ent + 4, attributes);
+    hype_wr16(ent + 4, attributes);
     {
         /* hype_exfat_encode_timestamp() returns the 1980-01-01 epoch for an
          * absent/invalid time, so this keeps the previous behaviour when there
          * is no clock. */
         uint32_t ts = hype_exfat_encode_timestamp(now);
         uint8_t ms10 = hype_exfat_encode_10ms(now);
-        wr32(ent + 8, ts);  /* CreateTimestamp */
-        wr32(ent + 12, ts); /* LastModifiedTimestamp */
-        wr32(ent + 16, ts); /* LastAccessedTimestamp */
+        hype_wr32(ent + 8, ts);  /* CreateTimestamp */
+        hype_wr32(ent + 12, ts); /* LastModifiedTimestamp */
+        hype_wr32(ent + 16, ts); /* LastAccessedTimestamp */
         ent[20] = ms10; /* Create10msIncrement: the odd second (#253) */
         ent[21] = ms10; /* LastModified10msIncrement */
         /*
@@ -257,10 +244,10 @@ void hype_exfat_stream_entry(uint8_t ent[32], unsigned int name_length, uint16_t
     ent[1] = (uint8_t)(HYPE_EXFAT_FLAG_ALLOC_POSSIBLE |
                        (no_fat_chain ? HYPE_EXFAT_FLAG_NO_FAT_CHAIN : 0u));
     ent[3] = (uint8_t)name_length;
-    wr16(ent + 4, name_hash);
-    wr64(ent + 8, valid_data_length);
-    wr32(ent + 20, first_cluster);
-    wr64(ent + 24, data_length);
+    hype_wr16(ent + 4, name_hash);
+    hype_wr64(ent + 8, valid_data_length);
+    hype_wr32(ent + 20, first_cluster);
+    hype_wr64(ent + 24, data_length);
 }
 
 void hype_exfat_name_entry(uint8_t ent[32], const uint16_t *chars, unsigned int count) {
@@ -268,12 +255,12 @@ void hype_exfat_name_entry(uint8_t ent[32], const uint16_t *chars, unsigned int 
     ent_zero(ent);
     ent[0] = HYPE_EXFAT_ENT_NAME;
     for (i = 0; i < count && i < HYPE_EXFAT_NAME_CHARS_PER_ENTRY; i++) {
-        wr16(ent + 2u + i * 2u, chars[i]);
+        hype_wr16(ent + 2u + i * 2u, chars[i]);
     }
 }
 
 void hype_exfat_file_entry_set_checksum(uint8_t ent[32], uint16_t checksum) {
-    wr16(ent + 2, checksum);
+    hype_wr16(ent + 2, checksum);
 }
 
 int hype_exfat_name_to_utf16(const char *name, uint16_t *out, unsigned int cap) {
@@ -304,15 +291,6 @@ int hype_exfat_name_to_utf16(const char *name, uint16_t *out, unsigned int cap) 
 
 /* ---- directory entry sets ---- */
 
-static uint16_t rd16(const uint8_t *p) {
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-static uint32_t rd32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static uint64_t rd64(const uint8_t *p) {
-    return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
-}
 
 int hype_exfat_set_read(hype_exfat_entry_read_fn read_entry, void *ctx, uint32_t ei,
                         hype_exfat_set_t *set) {
@@ -330,14 +308,14 @@ int hype_exfat_set_read(hype_exfat_entry_read_fn read_entry, void *ctx, uint32_t
         return -1;
     }
     set->secondary = ent[1];
-    set->attributes = rd16(ent + 4);
+    set->attributes = hype_rd16(ent + 4);
     set->first_cluster = 0u;
     set->data_length = 0u;
     set->valid_length = 0u;
     set->contiguous = 0u;
     set->name_length = 0u;
     set->name_hash = 0u;
-    stored = rd16(ent + 2);
+    stored = hype_rd16(ent + 2);
     if (set->secondary < 1u || set->secondary > HYPE_EXFAT_MAX_SECONDARY) {
         return -1; /* every File set carries at least a Stream Extension entry */
     }
@@ -355,10 +333,10 @@ int hype_exfat_set_read(hype_exfat_entry_read_fn read_entry, void *ctx, uint32_t
             }
             set->contiguous = (uint8_t)((ent[1] & HYPE_EXFAT_FLAG_NO_FAT_CHAIN) ? 1u : 0u);
             set->name_length = ent[3];
-            set->name_hash = rd16(ent + 4);
-            set->valid_length = rd64(ent + 8);
-            set->first_cluster = rd32(ent + 20);
-            set->data_length = rd64(ent + 24);
+            set->name_hash = hype_rd16(ent + 4);
+            set->valid_length = hype_rd64(ent + 8);
+            set->first_cluster = hype_rd32(ent + 20);
+            set->data_length = hype_rd64(ent + 24);
             have_stream = 1;
             continue;
         }
@@ -369,7 +347,7 @@ int hype_exfat_set_read(hype_exfat_entry_read_fn read_entry, void *ctx, uint32_t
         {
             unsigned int c;
             for (c = 0; c < HYPE_EXFAT_NAME_CHARS_PER_ENTRY && nlen < HYPE_EXFAT_MAX_NAME; c++) {
-                set->name[nlen++] = rd16(ent + 2u + c * 2u);
+                set->name[nlen++] = hype_rd16(ent + 2u + c * 2u);
             }
         }
     }

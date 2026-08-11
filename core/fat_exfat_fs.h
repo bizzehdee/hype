@@ -2,9 +2,10 @@
 #define HYPE_CORE_FAT_EXFAT_FS_H
 
 #include <stdint.h>
-#include "fat.h"          /* hype_fat_read_fn, HYPE_FAT_SECTOR_SIZE */
+#include "blk_io.h"       /* the shared block I/O callbacks + sector size (#292) */
+#include "fat.h"          /* hype_exfat_resolve (same volume family) */
 #include "fat_exfat.h"    /* hype_exfat_upcase_t and the pure primitives */
-#include "fat_write_fs.h" /* hype_fat_write_fn (shared with the FAT32 writer) */
+#include "fat_write_fs.h" /* hype_blk_write_fn (shared with the FAT32 writer) */
 
 /*
  * #198 (STORAGE: writable FAT32/exFAT) -- block-backed exFAT read/write
@@ -63,8 +64,8 @@
 #define HYPE_EXFAT_MAX_BITMAP_SCAN 4096u
 
 typedef struct {
-    hype_fat_read_fn read;
-    hype_fat_write_fn write;
+    hype_blk_read_fn read;
+    hype_blk_write_fn write;
     void *ctx;
     uint64_t volume_length; /* total sectors, from the boot sector */
     uint32_t fat_lba;       /* first sector of the ACTIVE FAT */
@@ -113,7 +114,7 @@ typedef struct {
  * exFAT volume, its critical structures are missing or inconsistent, or a read
  * fails.
  */
-int hype_exfat_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ctx,
+int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
                         hype_exfat_fs_t *out);
 
 /*

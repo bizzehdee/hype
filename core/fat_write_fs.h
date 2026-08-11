@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #include "rtc.h"
-#include "fat.h" /* hype_fat_read_fn, HYPE_FAT_SECTOR_SIZE */
+#include "blk_io.h" /* the shared block I/O callbacks + sector size (#292) */
 
 /*
  * #198 pt2 (STORAGE: writable FAT32) -- block-backed write orchestration on top
@@ -27,13 +27,13 @@
  * medium wraps read/write so the callback adds the partition's first LBA.
  */
 
-/* Writes `count` 512-byte sectors from `src` at volume-relative `lba`. Returns
- * 0 on success, non-zero on error. Mirror of hype_fat_read_fn. */
-typedef int (*hype_fat_write_fn)(void *ctx, uint64_t lba, uint32_t count, const void *src);
+#define HYPE_FAT32_WFILE_ERR_NONE 0
+#define HYPE_FAT32_WFILE_ERR_IDENTITY 1
 
 typedef struct {
-    hype_fat_read_fn read;
-    hype_fat_write_fn write;
+    hype_blk_read_fn read;
+    hype_blk_write_fn write;
+    hype_blk_sync_fn sync; /* optional persistence barrier */
     void *ctx;
     uint32_t reserved;      /* reserved sector count (== FAT copy 0 start LBA) */
     uint32_t num_fats;      /* number of FAT copies to keep in sync */
@@ -45,6 +45,16 @@ typedef struct {
     uint32_t fsinfo_sector; /* FSInfo sector LBA (0 == none) */
     uint32_t free_count;    /* running free-cluster count (unknown == 0xFFFFFFFF) */
     uint32_t next_free;     /* next-free-cluster search hint */
+    int fsinfo_dirty;       /* this instance changed allocation hints */
+    /*
+     * Authoritative write-through view of the most recently used FAT sector.
+     * Every file writer on one mounted volume must share this fs object. This
+     * prevents a medium with stale read-after-write data from making a cluster
+     * allocated earlier in this mount appear free again.
+     */
+    uint32_t fat_cache_off;
+    int fat_cache_valid;
+    uint8_t fat_cache[HYPE_BLK_SECTOR_SIZE];
     /*
      * Wall-clock snapshot stamped into directory entries. Zeroed (i.e. invalid)
      * by mount, which reproduces the old all-zero-timestamp behaviour; call
@@ -59,26 +69,38 @@ typedef struct {
     hype_fat32_fs_t *fs;
     uint8_t name11[11];       /* 8.3 name, for dirent rewrites on flush */
     uint32_t first_cluster;   /* first cluster of the file's data chain */
+    /*
+     * Detect an unexpected change to the immutable chain root before a
+     * directory update can publish another file's cluster. This is a guard,
+     * not another source of truth; the existing on-disk directory entry is
+     * checked independently once the root has been published.
+     */
+    uint32_t first_cluster_guard;
     uint32_t tail_cluster;    /* last cluster of the chain (append cursor) */
     uint64_t size;            /* current file size in bytes */
     uint64_t dirent_lba;      /* volume-relative LBA of the sector holding the dirent */
     unsigned int dirent_off;  /* byte offset of the 32-byte dirent within that sector */
+    int last_error;           /* HYPE_FAT32_WFILE_ERR_* diagnostic for the last append */
 } hype_fat32_wfile_t;
 
 /*
  * Parses the BPB (+ FSInfo) via `read` and fills *out. Returns 0 on success; -1
  * if the volume is not a 512-byte-sector FAT32 volume.
  */
-int hype_fat32_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ctx,
+int hype_fat32_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
                         hype_fat32_fs_t *out);
+
+/* Install an optional persistence barrier. The FAT writer invokes it around a
+ * directory-size commit only when an append extended the cluster chain. */
+void hype_fat32_fs_set_sync(hype_fat32_fs_t *fs, hype_blk_sync_fn sync);
 
 /*
  * Creates the file named by `path` ('\\' or '/' separated; every directory on
  * the way must already exist), truncating it to empty if it already exists
  * (its old cluster chain is freed and its directory entry -- LFN run included
  * -- is kept in place). A name that is not a strict 8.3 short name gets an LFN
- * run over a generated "~N" short name. Allocates one initial data cluster and
- * writes the directory entry. Fills *out ready for append. Returns 0 on
+ * run over a generated "~N" short name. An empty file has first cluster zero;
+ * the first append allocates its data chain. Fills *out ready for append. Returns 0 on
  * success, -1 on any I/O error, an invalid name, a missing parent, or a full
  * volume/directory.
  */

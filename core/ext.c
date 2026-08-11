@@ -1,4 +1,5 @@
 #include "ext.h"
+#include "lebytes.h"
 
 /*
  * #203: read-only ext2/3/4 path-to-extents resolver. Layout facts are from the
@@ -18,7 +19,7 @@
  * an explicit bounded stack for the same reason.
  */
 
-#define SECSZ HYPE_FAT_SECTOR_SIZE
+#define SECSZ HYPE_BLK_SECTOR_SIZE
 
 /* Superblock byte offsets (little-endian). */
 #define SB_INODES_COUNT 0x00u
@@ -78,15 +79,9 @@
 
 #define EXT_MAX_NAME 255u
 
-static uint16_t rd16(const uint8_t *p) {
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-static uint32_t rd32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
 typedef struct {
-    hype_fat_read_fn read;
+    hype_blk_read_fn read;
     void *ctx;
     uint32_t block_size;
     uint32_t spb; /* 512-byte sectors per block */
@@ -126,7 +121,7 @@ static int block_bytes(ext_vol_t *v, uint64_t block, uint32_t off, uint32_t len,
     return 0;
 }
 
-static int vol_open(hype_fat_read_fn read, void *ctx, ext_vol_t *v) {
+static int vol_open(hype_blk_read_fn read, void *ctx, ext_vol_t *v) {
     uint8_t sb[1024];
     uint32_t log_bs, incompat, rev;
 
@@ -134,17 +129,17 @@ static int vol_open(hype_fat_read_fn read, void *ctx, ext_vol_t *v) {
     if (read(ctx, 2u, 2u, sb) != 0) {
         return -1;
     }
-    if (rd16(sb + SB_MAGIC) != EXT_MAGIC) {
+    if (hype_rd16(sb + SB_MAGIC) != EXT_MAGIC) {
         return -1;
     }
-    incompat = rd32(sb + SB_FEATURE_INCOMPAT);
+    incompat = hype_rd32(sb + SB_FEATURE_INCOMPAT);
     if (incompat & INCOMPAT_RECOVER) {
         return -1; /* an unreplayed journal: nothing on disk can be trusted yet */
     }
     if (incompat & ~INCOMPAT_SUPPORTED) {
         return -1; /* a shape this reader does not understand: refuse, don't guess */
     }
-    log_bs = rd32(sb + SB_LOG_BLOCK_SIZE);
+    log_bs = hype_rd32(sb + SB_LOG_BLOCK_SIZE);
     if (log_bs > 2u) {
         return -1; /* > 4096-byte blocks */
     }
@@ -152,16 +147,16 @@ static int vol_open(hype_fat_read_fn read, void *ctx, ext_vol_t *v) {
     v->ctx = ctx;
     v->block_size = 1024u << log_bs;
     v->spb = v->block_size / SECSZ;
-    v->blocks_count = rd32(sb + SB_BLOCKS_COUNT_LO);
+    v->blocks_count = hype_rd32(sb + SB_BLOCKS_COUNT_LO);
     if (incompat & INCOMPAT_64BIT) {
-        v->blocks_count |= (uint64_t)rd32(sb + SB_BLOCKS_COUNT_HI) << 32;
+        v->blocks_count |= (uint64_t)hype_rd32(sb + SB_BLOCKS_COUNT_HI) << 32;
     }
-    v->inodes_count = rd32(sb + SB_INODES_COUNT);
-    v->inodes_per_group = rd32(sb + SB_INODES_PER_GROUP);
-    v->first_data_block = rd32(sb + SB_FIRST_DATA_BLOCK);
-    rev = rd32(sb + SB_REV_LEVEL);
-    v->inode_size = (rev == 0u) ? 128u : (uint32_t)rd16(sb + SB_INODE_SIZE);
-    v->desc_size = (incompat & INCOMPAT_64BIT) ? (uint32_t)rd16(sb + SB_DESC_SIZE) : 32u;
+    v->inodes_count = hype_rd32(sb + SB_INODES_COUNT);
+    v->inodes_per_group = hype_rd32(sb + SB_INODES_PER_GROUP);
+    v->first_data_block = hype_rd32(sb + SB_FIRST_DATA_BLOCK);
+    rev = hype_rd32(sb + SB_REV_LEVEL);
+    v->inode_size = (rev == 0u) ? 128u : (uint32_t)hype_rd16(sb + SB_INODE_SIZE);
+    v->desc_size = (incompat & INCOMPAT_64BIT) ? (uint32_t)hype_rd16(sb + SB_DESC_SIZE) : 32u;
 
     if (v->blocks_count < 2u || v->inodes_count == 0u || v->inodes_per_group == 0u) {
         return -1;
@@ -202,9 +197,9 @@ static int inode_read(ext_vol_t *v, uint32_t ino, uint8_t out[IN_CORE]) {
     }
     {
         const uint8_t *gd = sec + (gdt_byte % SECSZ);
-        table_block = rd32(gd + GD_INODE_TABLE_LO);
+        table_block = hype_rd32(gd + GD_INODE_TABLE_LO);
         if (v->desc_size >= 64u) {
-            table_block |= (uint64_t)rd32(gd + GD_INODE_TABLE_HI) << 32;
+            table_block |= (uint64_t)hype_rd32(gd + GD_INODE_TABLE_HI) << 32;
         }
     }
     if (table_block == 0u || table_block >= v->blocks_count) {
@@ -228,7 +223,7 @@ static int inode_read(ext_vol_t *v, uint32_t ino, uint8_t out[IN_CORE]) {
 /* ---- extent emission (shared by both mapping schemes) ---- */
 
 typedef struct {
-    hype_fat_file_t *out;
+    hype_file_map_t *out;
     ext_vol_t *v;
     uint64_t next_logical; /* the next file block expected: gaps are holes */
     uint64_t total_blocks; /* ceil(size / block_size) */
@@ -241,7 +236,7 @@ typedef struct {
  * block against the volume, and coalesces adjacent runs.
  */
 static int emit_run(emit_t *e, uint64_t logical, uint64_t phys, uint64_t count) {
-    hype_fat_file_t *f = e->out;
+    hype_file_map_t *f = e->out;
     uint64_t start_lba, sectors;
 
     if (count == 0u || logical != e->next_logical) {
@@ -265,7 +260,7 @@ static int emit_run(emit_t *e, uint64_t logical, uint64_t phys, uint64_t count) 
         f->extents[f->count - 1u].sector_count += sectors;
         return 0;
     }
-    if (f->count >= HYPE_FAT_MAX_EXTENTS) {
+    if (f->count >= HYPE_FILE_MAX_EXTENTS) {
         /* #366: say WHY, like the FAT resolvers do. ext matters most for this: core/ext.h notes
          * large indirect-mapped files are STRUCTURALLY fragmented, so it is the filesystem most
          * likely to hit the cap -- and it was the one that never reported hitting it. */
@@ -295,15 +290,15 @@ static int node_header(ext_vol_t *v, uint64_t block, uint32_t want_depth, ext_fr
     if (block_bytes(v, block, 0u, EH_SIZE, hdr) != 0) {
         return -1;
     }
-    if (rd16(hdr + 0) != EH_MAGIC) {
+    if (hype_rd16(hdr + 0) != EH_MAGIC) {
         return -1;
     }
-    entries = rd16(hdr + EH_ENTRIES);
-    max = rd16(hdr + EH_MAX);
+    entries = hype_rd16(hdr + EH_ENTRIES);
+    max = hype_rd16(hdr + EH_MAX);
     if (entries > max || EH_SIZE + (uint32_t)max * EE_SIZE > v->block_size) {
         return -1;
     }
-    if ((uint32_t)rd16(hdr + EH_DEPTH) != want_depth) {
+    if ((uint32_t)hype_rd16(hdr + EH_DEPTH) != want_depth) {
         return -1; /* every child must sit exactly one level below its parent */
     }
     f->block = block;
@@ -315,9 +310,9 @@ static int node_header(ext_vol_t *v, uint64_t block, uint32_t want_depth, ext_fr
 
 /* Emits one leaf extent entry. */
 static int leaf_entry(emit_t *e, const uint8_t ee[EE_SIZE]) {
-    uint32_t lblk = rd32(ee + 0);
-    uint32_t len = rd16(ee + 4);
-    uint64_t phys = (uint64_t)rd32(ee + 8) | ((uint64_t)rd16(ee + 6) << 32);
+    uint32_t lblk = hype_rd32(ee + 0);
+    uint32_t len = hype_rd16(ee + 4);
+    uint64_t phys = (uint64_t)hype_rd32(ee + 8) | ((uint64_t)hype_rd16(ee + 6) << 32);
     if (len == 0u || len > EE_LEN_UNWRITTEN) {
         /* len > 32768 marks an UNWRITTEN extent (real length len - 32768): it
          * reads as zeros, which the extent contract cannot express. A written
@@ -339,12 +334,12 @@ static int walk_extents(ext_vol_t *v, const uint8_t *root, uint32_t root_bytes, 
     uint16_t entries, max;
     uint32_t depth;
 
-    if (rd16(root + 0) != EH_MAGIC) {
+    if (hype_rd16(root + 0) != EH_MAGIC) {
         return -1;
     }
-    entries = rd16(root + EH_ENTRIES);
-    max = rd16(root + EH_MAX);
-    depth = rd16(root + EH_DEPTH);
+    entries = hype_rd16(root + EH_ENTRIES);
+    max = hype_rd16(root + EH_MAX);
+    depth = hype_rd16(root + EH_DEPTH);
     if (entries > max || EH_SIZE + (uint32_t)max * EE_SIZE > root_bytes || depth > EXT_MAX_DEPTH) {
         return -1;
     }
@@ -375,7 +370,7 @@ static int walk_extents(ext_vol_t *v, const uint8_t *root, uint32_t root_bytes, 
                 return -1;
             }
         } else {
-            uint64_t child = (uint64_t)rd32(ent + 4) | ((uint64_t)rd16(ent + 8) << 32);
+            uint64_t child = (uint64_t)hype_rd32(ent + 4) | ((uint64_t)hype_rd16(ent + 8) << 32);
             if (sp > EXT_MAX_DEPTH) {
                 return -1;
             }
@@ -416,7 +411,7 @@ static int pread32(ext_vol_t *v, pcache_t *c, uint64_t block, uint32_t index, ui
         }
         c->sector = sector;
     }
-    *out = rd32(c->data + (index * 4u) % SECSZ);
+    *out = hype_rd32(c->data + (index * 4u) % SECSZ);
     return 0;
 }
 
@@ -430,16 +425,16 @@ static int walk_indirect(ext_vol_t *v, const uint8_t *iblk, ind_scratch_t *s, em
     for (lb = 0; lb < e->total_blocks; lb++) {
         uint32_t ptr = 0;
         if (lb < 12u) {
-            ptr = rd32(iblk + lb * 4u);
+            ptr = hype_rd32(iblk + lb * 4u);
         } else {
             uint64_t r = lb - 12u;
             if (r < ppb) { /* single indirect */
-                if (pread32(v, &s->l1, rd32(iblk + 12u * 4u), (uint32_t)r, &ptr) != 0) {
+                if (pread32(v, &s->l1, hype_rd32(iblk + 12u * 4u), (uint32_t)r, &ptr) != 0) {
                     return -1;
                 }
             } else if ((r -= ppb) < (uint64_t)ppb * ppb) { /* double */
                 uint32_t mid;
-                if (pread32(v, &s->l2, rd32(iblk + 13u * 4u), (uint32_t)(r / ppb), &mid) != 0) {
+                if (pread32(v, &s->l2, hype_rd32(iblk + 13u * 4u), (uint32_t)(r / ppb), &mid) != 0) {
                     return -1;
                 }
                 if (pread32(v, &s->l1, mid, (uint32_t)(r % ppb), &ptr) != 0) {
@@ -447,7 +442,7 @@ static int walk_indirect(ext_vol_t *v, const uint8_t *iblk, ind_scratch_t *s, em
                 }
             } else if ((r -= (uint64_t)ppb * ppb) < (uint64_t)ppb * ppb * ppb) { /* triple */
                 uint32_t hi, mid;
-                if (pread32(v, &s->l3, rd32(iblk + 14u * 4u),
+                if (pread32(v, &s->l3, hype_rd32(iblk + 14u * 4u),
                             (uint32_t)(r / ((uint64_t)ppb * ppb)), &hi) != 0) {
                     return -1;
                 }
@@ -474,17 +469,17 @@ static int walk_indirect(ext_vol_t *v, const uint8_t *iblk, ind_scratch_t *s, em
 /* ---- file mapping ---- */
 
 static uint64_t inode_file_size(const uint8_t ino[IN_CORE], int is_dir) {
-    uint64_t size = rd32(ino + IN_SIZE_LO);
+    uint64_t size = hype_rd32(ino + IN_SIZE_LO);
     if (!is_dir) {
         /* i_size_high doubles as i_dir_acl on directories: files only. */
-        size |= (uint64_t)rd32(ino + IN_SIZE_HIGH) << 32;
+        size |= (uint64_t)hype_rd32(ino + IN_SIZE_HIGH) << 32;
     }
     return size;
 }
 
 /* Resolves an inode's data to extents in *out. Sets out->size_bytes. */
-static int map_inode(ext_vol_t *v, const uint8_t ino[IN_CORE], int is_dir, hype_fat_file_t *out) {
-    uint32_t flags = rd32(ino + IN_FLAGS);
+static int map_inode(ext_vol_t *v, const uint8_t ino[IN_CORE], int is_dir, hype_file_map_t *out) {
+    uint32_t flags = hype_rd32(ino + IN_FLAGS);
     emit_t e;
 
     out->count = 0;
@@ -524,11 +519,11 @@ static int map_inode(ext_vol_t *v, const uint8_t ino[IN_CORE], int is_dir, hype_
 static int dir_search(ext_vol_t *v, const uint8_t dino[IN_CORE], const char *name,
                       unsigned int nlen, uint32_t *out_ino) {
     /* #366: static for the same reason as boot/main.c's resolve buffers -- at
-     * HYPE_FAT_MAX_EXTENTS = 256 this struct is over 4 KiB, and a frame that large needs a
+     * HYPE_FILE_MAX_EXTENTS = 256 this struct is over 4 KiB, and a frame that large needs a
      * __chkstk probe the freestanding build has no definition for. dir_search is called in a
      * LOOP by hype_ext_resolve, never nested, and resolution is setup-time and single-threaded,
      * so there is no live second copy to collide with. map_inode() below fully rewrites it. */
-    static hype_fat_file_t map;
+    static hype_file_map_t map;
     unsigned int x;
 
     if (map_inode(v, dino, 1, &map) != 0) {
@@ -553,8 +548,8 @@ static int dir_search(ext_vol_t *v, const uint8_t dino[IN_CORE], const char *nam
                 if (block_bytes(v, block, off, 8u, hdr) != 0) {
                     return -1;
                 }
-                ino = rd32(hdr + 0);
-                rec = rd16(hdr + 4);
+                ino = hype_rd32(hdr + 0);
+                rec = hype_rd16(hdr + 4);
                 nl = hdr[6];
                 if (rec < 8u || (rec & 3u) != 0u || off + rec > v->block_size) {
                     return -1; /* corrupt record: stop rather than misparse */
@@ -584,7 +579,7 @@ static int dir_search(ext_vol_t *v, const uint8_t dino[IN_CORE], const char *nam
 
 /* ---- path resolution ---- */
 
-int hype_ext_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fat_file_t *out) {
+int hype_ext_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_file_map_t *out) {
     /* #366: cleared at ENTRY, before any early return, so a failure that never reaches the extent
      * walk cannot inherit the previous call's reason. Same rule as hype_fat32_resolve. */
     if (out != 0) {
@@ -600,7 +595,7 @@ int hype_ext_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fa
     if (inode_read(&v, 2u, ino) != 0) { /* the root directory is always inode 2 */
         return -1;
     }
-    if ((rd16(ino + IN_MODE) & MODE_FMT) != MODE_DIR) {
+    if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_DIR) {
         return -1;
     }
     for (;;) {
@@ -635,12 +630,12 @@ int hype_ext_resolve(hype_fat_read_fn read, void *ctx, const char *path, hype_fa
             return -1;
         }
         if (last) {
-            if ((rd16(ino + IN_MODE) & MODE_FMT) != MODE_REG) {
+            if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_REG) {
                 return -1; /* directories and symlinks are not stream targets */
             }
             return map_inode(&v, ino, 0, out);
         }
-        if ((rd16(ino + IN_MODE) & MODE_FMT) != MODE_DIR) {
+        if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_DIR) {
             return -1; /* a non-final component must be a directory */
         }
     }

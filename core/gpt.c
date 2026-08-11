@@ -1,4 +1,5 @@
 #include "gpt.h"
+#include "lebytes.h"
 
 /* GPT header field offsets (UEFI spec §5.3.2), within the LBA-1 sector. */
 #define GPT_SIG_OFF 0x00u          /* 8 bytes: "EFI PART" */
@@ -20,13 +21,7 @@
 #define GPT_MAX_ENTRIES 4096u
 #define GPT_MIN_ENTRY_SIZE 128u
 
-static uint32_t rd_le32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
-static uint64_t rd_le64(const uint8_t *p) {
-    return (uint64_t)rd_le32(p) | ((uint64_t)rd_le32(p + 4) << 32);
-}
 
 static int entry_is_used(const uint8_t *ent) {
     unsigned i;
@@ -54,7 +49,7 @@ int hype_gpt_find_partition(hype_gpt_read_lba_fn read, void *ctx, unsigned index
     if (read(ctx, HYPE_GPT_HEADER_LBA, 1u, sector) != 0) {
         return -1;
     }
-    if (rd_le64(sector + GPT_SIG_OFF) != GPT_SIGNATURE) {
+    if (hype_rd64(sector + GPT_SIG_OFF) != GPT_SIGNATURE) {
         /*
          * #345: no GPT -- fall back to the MBR. Most USB sticks ship MBR-partitioned, and
          * requiring GPT silently made every file on such a stick unresolvable while hype's own
@@ -71,8 +66,8 @@ int hype_gpt_find_partition(hype_gpt_read_lba_fn read, void *ctx, unsigned index
         }
         {
             const uint8_t *e = sector + 446u + (index - 1u) * 16u;
-            uint64_t start = (uint64_t)rd_le32(e + 8u);
-            uint64_t count = (uint64_t)rd_le32(e + 12u);
+            uint64_t start = (uint64_t)hype_rd32(e + 8u);
+            uint64_t count = (uint64_t)hype_rd32(e + 12u);
             if (e[4] == 0u || start == 0u || count == 0u) {
                 return -1; /* unused/invalid entry */
             }
@@ -81,9 +76,9 @@ int hype_gpt_find_partition(hype_gpt_read_lba_fn read, void *ctx, unsigned index
             return 0;
         }
     }
-    entry_lba = rd_le64(sector + GPT_PART_ENTRY_LBA_OFF);
-    num_entries = rd_le32(sector + GPT_NUM_ENTRIES_OFF);
-    entry_size = rd_le32(sector + GPT_ENTRY_SIZE_OFF);
+    entry_lba = hype_rd64(sector + GPT_PART_ENTRY_LBA_OFF);
+    num_entries = hype_rd32(sector + GPT_NUM_ENTRIES_OFF);
+    entry_size = hype_rd32(sector + GPT_ENTRY_SIZE_OFF);
     if (entry_size < GPT_MIN_ENTRY_SIZE || num_entries == 0u || num_entries > GPT_MAX_ENTRIES) {
         return -1;
     }
@@ -106,8 +101,8 @@ int hype_gpt_find_partition(hype_gpt_read_lba_fn read, void *ctx, unsigned index
             }
             used_seen++;
             if (used_seen == index) {
-                out->first_lba = rd_le64(ent + GPT_ENT_FIRST_LBA_OFF);
-                out->last_lba = rd_le64(ent + GPT_ENT_LAST_LBA_OFF);
+                out->first_lba = hype_rd64(ent + GPT_ENT_FIRST_LBA_OFF);
+                out->last_lba = hype_rd64(ent + GPT_ENT_LAST_LBA_OFF);
                 if (out->last_lba < out->first_lba) {
                     return -1;
                 }
@@ -126,7 +121,7 @@ int hype_gpt_disk_guid(hype_gpt_read_lba_fn read, void *ctx, uint8_t out_guid[16
     if (read(ctx, HYPE_GPT_HEADER_LBA, 1u, sector) != 0) {
         return -1;
     }
-    if (rd_le64(sector + GPT_SIG_OFF) != GPT_SIGNATURE) {
+    if (hype_rd64(sector + GPT_SIG_OFF) != GPT_SIGNATURE) {
         return -1;
     }
     for (i = 0; i < 16u; i++) {

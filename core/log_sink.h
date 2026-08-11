@@ -8,11 +8,11 @@
 /*
  * #230 (USB debug-log sink): stream hype's in-RAM capture buffer (core/logbuf.c)
  * to a file on a FAT32 volume, so a real-hardware debug run leaves a complete
- * \hype-fulllog.txt on the USB stick it booted from -- the RT-3 NV-variable tail
+ * \HYPE.LOG on the USB stick it booted from -- the live framebuffer
  * stays as a backup, but this carries the WHOLE log, not just the last few KB.
  *
  * The volume is reached through an injected read+write sector-callback pair
- * (hype_fat_read_fn / hype_fat_write_fn) so the block path (USB MSC via blk_usb,
+ * (hype_blk_read_fn / hype_blk_write_fn) so the block path (USB MSC via blk_usb,
  * plus a partition-base offset) is the caller's concern and this module stays
  * pure and unit-testable. Open once, then flush repeatedly: each flush appends
  * only the logbuf bytes written since the previous flush, so it can be called
@@ -59,7 +59,7 @@ typedef struct {
  */
 /* `now` stamps the created file's directory entry; pass 0 for none (the
  * timestamps are then zeroed, as they were before the RTC existed). */
-int hype_log_sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
+int hype_log_sink_open(hype_log_sink_t *s, hype_blk_read_fn read, hype_blk_write_fn write,
                        void *ctx, const char *filename, const hype_rtc_time_t *now);
 
 /*
@@ -68,7 +68,7 @@ int hype_log_sink_open(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write
  * and never re-emits one: a trailing partial record is left in the buffer for
  * the next flush.
  */
-int hype_log_sink_open_filtered(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
+int hype_log_sink_open_filtered(hype_log_sink_t *s, hype_blk_read_fn read, hype_blk_write_fn write,
                                 void *ctx, const char *filename, const hype_rtc_time_t *now,
                                 int filter);
 
@@ -98,9 +98,23 @@ void hype_log_sink_set_ordered(hype_log_sink_t *s, int ordered);
  * and a merge tool drops unstamped records silently because they do not match the record
  * pattern. Measured at 65 of 453 records -- all of them boot-time -- before this existed.
  */
-int hype_log_sink_open_ordered(hype_log_sink_t *s, hype_fat_read_fn read, hype_fat_write_fn write,
+int hype_log_sink_open_ordered(hype_log_sink_t *s, hype_blk_read_fn read, hype_blk_write_fn write,
                                void *ctx, const char *filename, const hype_rtc_time_t *now,
                                int filter);
+
+/* Ordered sink with a persistence barrier for crash-consistent FAT growth. */
+int hype_log_sink_open_ordered_durable(hype_log_sink_t *s, hype_blk_read_fn read,
+                                       hype_blk_write_fn write, hype_blk_sync_fn sync, void *ctx,
+                                       const char *filename, const hype_rtc_time_t *now, int filter);
+
+/*
+ * Open another ordered log file on an already mounted writable FAT volume.
+ * All files that mutate one volume must use the same `fs`, so allocation state
+ * and the write-through FAT cache remain coherent without a medium round trip.
+ */
+int hype_log_sink_open_shared_ordered(hype_log_sink_t *s, hype_fat32_fs_t *fs,
+                                      const char *filename, const hype_rtc_time_t *now,
+                                      int filter);
 
 /*
  * Appends the logbuf bytes captured since the previous flush (or open). A no-op
@@ -115,5 +129,17 @@ static inline unsigned int hype_log_sink_flushed(const hype_log_sink_t *s) {
 }
 
 int hype_log_sink_flush(hype_log_sink_t *s);
+
+/*
+ * #374: drain at most `max_source_bytes` from the capture buffer.
+ *
+ * The live USB sink shares the BSP with dashboard rendering and input. A full
+ * boot burst can contain thousands of records, so an unbounded synchronous
+ * flush can keep the BSP inside FAT and USB I/O for several seconds. This
+ * variant always makes progress by at least one complete record when the next
+ * filtered record is larger than the budget. Filtered output is batched into
+ * one FAT append per call. A zero budget is a no-op.
+ */
+int hype_log_sink_flush_budget(hype_log_sink_t *s, unsigned int max_source_bytes);
 
 #endif /* HYPE_CORE_LOG_SINK_H */

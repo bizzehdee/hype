@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #include "blk_backend.h"
-#include "fat.h" /* hype_fat_file_t: the shared extent contract */
+#include "blk_io.h" /* hype_file_map_t: the shared extent contract (#292) */
 
 /*
  * M5-8 (#199): a RAW disk-image FILE on a host filesystem as a guest block
@@ -12,7 +12,7 @@
  *
  * The trick is that this needs no filesystem writer at all. Every host-FS
  * resolver in the tree -- FAT32 and exFAT (#181, core/fat.c) and ext2/3/4
- * (#203, core/ext.c) -- produces the SAME hype_fat_file_t extent list, so a
+ * (#203, core/ext.c) -- produces the SAME hype_file_map_t extent list, so a
  * pre-allocated image file is just a scatter list of disk sectors. Mapping a
  * guest LBA through that list gives a host LBA, and the transfer is then plain
  * block I/O through the injected host read/write pair (AHCI / NVMe / USB via
@@ -37,15 +37,15 @@
  * images.
  */
 
-/* Host block I/O, in DISK-ABSOLUTE LBAs (the same shape blk_phys uses). */
-typedef int (*hype_blk_image_read_fn)(void *hw, uint64_t lba, uint32_t count, void *buf);
-typedef int (*hype_blk_image_write_fn)(void *hw, uint64_t lba, uint32_t count, const void *buf);
+/* The injected host block I/O pair operates in DISK-ABSOLUTE LBAs (the same
+ * shape blk_phys hands out); the shared callback types are LBA-space-neutral
+ * (see core/blk_io.h), so the space is documented here, where it is decided. */
 
 typedef struct {
-    hype_fat_file_t map;    /* the image file's extents, VOLUME-relative */
+    hype_file_map_t map;    /* the image file's extents, VOLUME-relative */
     uint64_t partition_lba; /* added to every extent LBA to get disk-absolute */
-    hype_blk_image_read_fn read_sectors;
-    hype_blk_image_write_fn write_sectors; /* NULL => read-only backend */
+    hype_blk_read_fn read_sectors;
+    hype_blk_write_fn write_sectors; /* NULL => read-only backend */
     void *hw;
 } hype_blk_image_t;
 
@@ -59,9 +59,9 @@ typedef struct {
  * refused rather than silently serving a short disk.
  */
 int hype_blk_image_init(hype_blk_image_t *img, hype_blk_backend_t *be,
-                        const hype_fat_file_t *map, uint64_t partition_lba,
-                        hype_blk_image_read_fn read_sectors,
-                        hype_blk_image_write_fn write_sectors, void *hw);
+                        const hype_file_map_t *map, uint64_t partition_lba,
+                        hype_blk_read_fn read_sectors,
+                        hype_blk_write_fn write_sectors, void *hw);
 
 /*
  * Maps file-relative sector `fsec` to its disk-absolute LBA and reports how

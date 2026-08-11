@@ -1,10 +1,11 @@
 #include "fat_write_fs.h"
 #include "fat_write.h"
 
-#define SECSZ HYPE_FAT_SECTOR_SIZE
+#define SECSZ HYPE_BLK_SECTOR_SIZE
 #define FAT32_EOC_MIN 0x0FFFFFF8u /* entry >= this in a chain means end-of-chain */
 #define DIRENT_SIZE 32u
 #define UNKNOWN 0xFFFFFFFFu
+#define FIRST_CLUSTER_GUARD_SEED 0xA5C37E19u
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
 static uint32_t rd32(const uint8_t *p) {
@@ -19,30 +20,90 @@ static void bzero(uint8_t *dst, unsigned int n) {
     for (i = 0; i < n; i++) dst[i] = 0u;
 }
 
+/* The first cluster is immutable after the first allocation. The guard binds
+ * it to this file's directory slot and short name, so a stray assignment of a
+ * neighbouring writer's first_cluster fails closed instead of cross-linking
+ * the two files. This is deliberately independent of the FAT chain itself:
+ * the AMD #377 capture contained both valid chains, but VM1's directory entry
+ * published VM0's root. */
+static uint32_t first_cluster_guard(const hype_fat32_wfile_t *f, uint32_t first) {
+    uint32_t v = FIRST_CLUSTER_GUARD_SEED ^ first ^ (uint32_t)f->dirent_lba ^
+                 (uint32_t)(f->dirent_lba >> 32) ^ f->dirent_off;
+    unsigned int i;
+    for (i = 0; i < 11u; i++) v = (v << 5) ^ (v >> 27) ^ f->name11[i];
+    return v;
+}
+
+static void first_cluster_set(hype_fat32_wfile_t *f, uint32_t first) {
+    f->first_cluster = first;
+    f->first_cluster_guard = first_cluster_guard(f, first);
+}
+
+static int first_cluster_valid(const hype_fat32_wfile_t *f) {
+    return f->first_cluster_guard == first_cluster_guard(f, f->first_cluster);
+}
+
 static uint64_t cluster_lba(const hype_fat32_fs_t *fs, uint32_t cl) {
     return (uint64_t)fs->data_start + (uint64_t)(cl - 2u) * fs->spc;
 }
 
-/* Read a single FAT entry (from FAT copy 0). */
-static int fat_get(hype_fat32_fs_t *fs, uint32_t cl, uint32_t *out) {
-    uint8_t sec[SECSZ];
-    uint64_t slba = (uint64_t)fs->reserved + cl / HYPE_FAT32_ENTRIES_PER_SECTOR;
-    if (fs->read(fs->ctx, slba, 1u, sec) != 0) return -1;
-    *out = hype_fat32_entry_get(sec, cl % HYPE_FAT32_ENTRIES_PER_SECTOR);
+/* Refresh advisory allocation state before this writer changes it. Several
+ * log sinks mount one volume independently, so a value cached at mount may be
+ * stale even though all operations are serialized on the BSP. Do not refresh
+ * while this instance has uncommitted changes from the same public operation. */
+static void fsinfo_refresh(hype_fat32_fs_t *fs) {
+    uint8_t fsi[SECSZ];
+    uint32_t next;
+    if (fs->fsinfo_dirty || fs->fsinfo_sector == 0u) return;
+    if (fs->read(fs->ctx, fs->fsinfo_sector, 1u, fsi) != 0 ||
+        rd32(fsi + 0) != 0x41615252u) {
+        fs->free_count = UNKNOWN;
+        return;
+    }
+    fs->free_count = rd32(fsi + 0x1E8);
+    next = rd32(fsi + 0x1EC);
+    fs->next_free = (next >= 2u && next <= fs->max_cluster) ? next : 2u;
+}
+
+static int fat_cache_load(hype_fat32_fs_t *fs, uint32_t off) {
+    uint64_t slba;
+    if (fs->fat_cache_valid && fs->fat_cache_off == off) return 0;
+    slba = (uint64_t)fs->reserved + off;
+    if (fs->read(fs->ctx, slba, 1u, fs->fat_cache) != 0) {
+        fs->fat_cache_valid = 0;
+        return -1;
+    }
+    fs->fat_cache_off = off;
+    fs->fat_cache_valid = 1;
     return 0;
 }
 
-/* Write a FAT entry into every FAT copy (read-modify-write, reserved nibble kept). */
+/* Read a single FAT entry from this mount's authoritative FAT-sector view. */
+static int fat_get(hype_fat32_fs_t *fs, uint32_t cl, uint32_t *out) {
+    uint32_t off = cl / HYPE_FAT32_ENTRIES_PER_SECTOR;
+    if (fat_cache_load(fs, off) != 0) return -1;
+    *out = hype_fat32_entry_get(fs->fat_cache, cl % HYPE_FAT32_ENTRIES_PER_SECTOR);
+    return 0;
+}
+
+/*
+ * Write a FAT entry into every FAT copy from one authoritative sector image.
+ * Reading each copy independently before modifying it allowed a stale medium
+ * read to resurrect an older allocation map. The cache is updated first and
+ * the same complete sector is then written to every copy.
+ */
 static int fat_set(hype_fat32_fs_t *fs, uint32_t cl, uint32_t val) {
-    uint8_t sec[SECSZ];
     unsigned int idx = cl % HYPE_FAT32_ENTRIES_PER_SECTOR;
     uint32_t off = cl / HYPE_FAT32_ENTRIES_PER_SECTOR;
     unsigned int copy;
+    if (fat_cache_load(fs, off) != 0) return -1;
+    hype_fat32_entry_set(fs->fat_cache, idx, val);
     for (copy = 0; copy < fs->num_fats; copy++) {
         uint64_t slba = (uint64_t)fs->reserved + (uint64_t)copy * fs->fat_size + off;
-        if (fs->read(fs->ctx, slba, 1u, sec) != 0) return -1;
-        hype_fat32_entry_set(sec, idx, val);
-        if (fs->write(fs->ctx, slba, 1u, sec) != 0) return -1;
+        if (fs->write(fs->ctx, slba, 1u, fs->fat_cache) != 0) {
+            fs->fat_cache_valid = 0;
+            return -1;
+        }
     }
     return 0;
 }
@@ -62,11 +123,14 @@ static int cluster_zero(hype_fat32_fs_t *fs, uint32_t cl) {
 /* Allocate one free cluster, mark it end-of-chain, and update the free hints.
  * Returns 0 and the cluster in *out, or -1 if the volume is full. */
 static int alloc_cluster(hype_fat32_fs_t *fs, uint32_t *out) {
-    uint32_t start = (fs->next_free >= 2u && fs->next_free <= fs->max_cluster) ? fs->next_free : 2u;
+    uint32_t start;
     uint32_t scanned = 0;
     uint32_t total = fs->max_cluster - 2u + 1u;
-    uint32_t cl = start;
+    uint32_t cl;
 
+    fsinfo_refresh(fs);
+    start = (fs->next_free >= 2u && fs->next_free <= fs->max_cluster) ? fs->next_free : 2u;
+    cl = start;
     while (scanned < total) {
         uint32_t v;
         if (fat_get(fs, cl, &v) != 0) return -1;
@@ -74,6 +138,7 @@ static int alloc_cluster(hype_fat32_fs_t *fs, uint32_t *out) {
             if (fat_set(fs, cl, FAT32_EOC_MIN | 0x7u) != 0) return -1; /* 0x0FFFFFFF EOC */
             fs->next_free = (cl + 1u > fs->max_cluster) ? 2u : (cl + 1u);
             if (fs->free_count != UNKNOWN && fs->free_count != 0u) fs->free_count--;
+            fs->fsinfo_dirty = 1;
             *out = cl;
             return 0;
         }
@@ -87,12 +152,14 @@ static int alloc_cluster(hype_fat32_fs_t *fs, uint32_t *out) {
 static int free_chain(hype_fat32_fs_t *fs, uint32_t first) {
     uint32_t cl = first;
     unsigned int guard = 0;
+    fsinfo_refresh(fs);
     while (cl >= 2u && cl <= fs->max_cluster && guard <= fs->max_cluster) {
         uint32_t next;
         if (fat_get(fs, cl, &next) != 0) return -1;
         if (fat_set(fs, cl, 0u) != 0) return -1;
         if (fs->free_count != UNKNOWN) fs->free_count++;
         if (fs->next_free == 0u || cl < fs->next_free) fs->next_free = cl;
+        fs->fsinfo_dirty = 1;
         if (next >= FAT32_EOC_MIN) break;
         cl = next;
         guard++;
@@ -100,7 +167,7 @@ static int free_chain(hype_fat32_fs_t *fs, uint32_t first) {
     return 0;
 }
 
-int hype_fat32_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ctx,
+int hype_fat32_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
                         hype_fat32_fs_t *out) {
     uint8_t bpb[SECSZ];
     uint32_t total_sectors, data_sectors, data_clusters, fat_capacity;
@@ -115,6 +182,7 @@ int hype_fat32_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ct
 
     out->read = read;
     out->write = write;
+    out->sync = (hype_blk_sync_fn)0;
     out->ctx = ctx;
     out->spc = bpb[0x0D];
     out->reserved = rd16(bpb + 0x0E);
@@ -122,6 +190,9 @@ int hype_fat32_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ct
     out->fat_size = rd32(bpb + 0x24);
     out->root_cluster = rd32(bpb + 0x2C);
     out->fsinfo_sector = rd16(bpb + 0x30);
+    out->fsinfo_dirty = 0;
+    out->fat_cache_off = 0u;
+    out->fat_cache_valid = 0;
     if (out->spc == 0u || out->reserved == 0u || out->num_fats == 0u || out->root_cluster < 2u) {
         return -1;
     }
@@ -154,31 +225,15 @@ int hype_fat32_fs_mount(hype_fat_read_fn read, hype_fat_write_fn write, void *ct
 /* Flush the free-cluster counters to FSInfo (best-effort: a volume without a
  * usable FSInfo simply keeps none). */
 static void fsinfo_flush(hype_fat32_fs_t *fs) {
-    if (fs->fsinfo_sector != 0u) {
+    if (fs->fsinfo_sector != 0u && fs->fsinfo_dirty) {
         uint8_t fsi[SECSZ];
         if (fs->read(fs->ctx, fs->fsinfo_sector, 1u, fsi) == 0 &&
             hype_fat32_fsinfo_set(fsi, fs->free_count, fs->next_free) == 0) {
-            (void)fs->write(fs->ctx, fs->fsinfo_sector, 1u, fsi);
+            if (fs->write(fs->ctx, fs->fsinfo_sector, 1u, fsi) == 0) {
+                fs->fsinfo_dirty = 0;
+            }
         }
     }
-}
-
-/* Write the file's current first-cluster + size into its directory entry, and
- * flush the free-cluster counters to FSInfo. */
-static int flush_metadata(hype_fat32_wfile_t *f) {
-    hype_fat32_fs_t *fs = f->fs;
-    uint8_t sec[SECSZ];
-    uint8_t ent[DIRENT_SIZE];
-    uint32_t sz = (f->size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)f->size;
-
-    if (fs->read(fs->ctx, f->dirent_lba, 1u, sec) != 0) return -1;
-    hype_fat_dirent_build(ent, f->name11, HYPE_FAT_ATTR_ARCHIVE, f->first_cluster, sz,
-                          &f->fs->now);
-    bcopy(sec + f->dirent_off, ent, DIRENT_SIZE);
-    if (fs->write(fs->ctx, f->dirent_lba, 1u, sec) != 0) return -1;
-
-    fsinfo_flush(fs);
-    return 0;
 }
 
 /* Names match if their 11-byte 8.3 fields are byte-identical. */
@@ -186,6 +241,54 @@ static int name_eq(const uint8_t *a, const uint8_t *b) {
     unsigned int i;
     for (i = 0; i < 11u; i++) if (a[i] != b[i]) return 0;
     return 1;
+}
+
+/* Write the file's current first-cluster + size into its directory entry, and
+ * flush the free-cluster counters to FSInfo. */
+static int flush_metadata(hype_fat32_wfile_t *f, int durable, int truncate_root) {
+    hype_fat32_fs_t *fs = f->fs;
+    uint8_t sec[SECSZ];
+    uint8_t ent[DIRENT_SIZE];
+    uint32_t sz = (f->size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)f->size;
+    uint32_t disk_first;
+
+    if (!first_cluster_valid(f) || f->dirent_off > SECSZ - DIRENT_SIZE) {
+        f->last_error = HYPE_FAT32_WFILE_ERR_IDENTITY;
+        return -1;
+    }
+
+    /* #377: a WRITE(10) completion does not guarantee that the stick made the
+     * preceding FAT link durable. When a cluster chain grew, establish that
+     * ordering before publishing a size that reaches the new cluster. */
+    if (durable && fs->sync != (hype_blk_sync_fn)0 && fs->sync(fs->ctx) != 0) return -1;
+    if (fs->read(fs->ctx, f->dirent_lba, 1u, sec) != 0) return -1;
+    if (!name_eq(sec + f->dirent_off, f->name11)) {
+        f->last_error = HYPE_FAT32_WFILE_ERR_IDENTITY;
+        return -1;
+    }
+    disk_first = hype_fat_dirent_cluster(sec + f->dirent_off);
+    /* A file's chain root never changes during append. Preserve and verify the
+     * already-published value instead of blindly replacing it from mutable RAM.
+     * Zero is allowed only before the first non-empty metadata commit. */
+    if (!truncate_root && disk_first != 0u && disk_first != f->first_cluster) {
+        f->last_error = HYPE_FAT32_WFILE_ERR_IDENTITY;
+        return -1;
+    }
+    if (!truncate_root && hype_fat_dirent_size(sec + f->dirent_off) != 0u && disk_first == 0u) {
+        f->last_error = HYPE_FAT32_WFILE_ERR_IDENTITY;
+        return -1;
+    }
+    hype_fat_dirent_build(ent, f->name11, HYPE_FAT_ATTR_ARCHIVE,
+                          (!truncate_root && disk_first != 0u) ? disk_first : f->first_cluster, sz,
+                          &f->fs->now);
+    bcopy(sec + f->dirent_off, ent, DIRENT_SIZE);
+    if (fs->write(fs->ctx, f->dirent_lba, 1u, sec) != 0) return -1;
+
+    fsinfo_flush(fs);
+    /* Persist the directory entry too. Losing it leaves a safely shorter file;
+     * completing it makes the whole cluster-extension transaction durable. */
+    if (durable && fs->sync != (hype_blk_sync_fn)0 && fs->sync(fs->ctx) != 0) return -1;
+    return 0;
 }
 
 /* ---- directory-entry addressing (#247) ----
@@ -587,7 +690,7 @@ int hype_fat32_create(hype_fat32_fs_t *fs, const char *path, hype_fat32_wfile_t 
     char leafbuf[HYPE_FAT_MAX_LFN + 1u];
     hype_fat32_dloc_t loc;
     unsigned int leaf;
-    uint32_t parent, first_cl = 0, ei = 0;
+    uint32_t parent, ei = 0;
     int rc;
 
     if (path_split(path, &leaf) != 0 || leaf_name(path, leaf, leafbuf, sizeof leafbuf) != 0) {
@@ -605,25 +708,27 @@ int hype_fat32_create(hype_fat32_fs_t *fs, const char *path, hype_fat32_wfile_t 
         if (loc.ent[11] & HYPE_FAT_ATTR_DIRECTORY) return -1; /* never clobber a directory */
         old = hype_fat_dirent_cluster(loc.ent);
         if (old >= 2u && free_chain(fs, old) != 0) return -1;
-        if (alloc_cluster(fs, &first_cl) != 0) return -1;
         out->fs = fs;
         bcopy(out->name11, loc.ent, 11u);
-        out->first_cluster = first_cl;
-        out->tail_cluster = first_cl;
+        out->first_cluster = 0u;
+        out->tail_cluster = 0u;
         out->size = 0u;
+        out->last_error = HYPE_FAT32_WFILE_ERR_NONE;
         if (dirent_pos(fs, parent, loc.ent_index, &out->dirent_lba, &out->dirent_off) != 0) {
             return -1;
         }
-        return flush_metadata(out);
+        first_cluster_set(out, 0u);
+        return flush_metadata(out, 1, 1);
     }
-    /* Fresh file: allocate its first data cluster, then place the entry. */
-    if (alloc_cluster(fs, &first_cl) != 0) return -1;
+    /* Fresh empty files are chainless. Allocating here leaves a zero-length
+     * file with an excess cluster, which fsck must later truncate. The first
+     * append allocates the first data cluster and publishes it with the size. */
     {
         uint8_t ent[DIRENT_SIZE];
         uint8_t dummy11[11];
         unsigned int i;
         for (i = 0; i < 11u; i++) dummy11[i] = ' '; /* insert_entry overwrites it */
-        hype_fat_dirent_build(ent, dummy11, HYPE_FAT_ATTR_ARCHIVE, first_cl, 0u, &fs->now);
+        hype_fat_dirent_build(ent, dummy11, HYPE_FAT_ATTR_ARCHIVE, 0u, 0u, &fs->now);
         if (insert_entry(fs, parent, leafbuf, ent, &ei) != 0) return -1;
     }
     {
@@ -633,12 +738,14 @@ int hype_fat32_create(hype_fat32_fs_t *fs, const char *path, hype_fat32_wfile_t 
         if (dirent_read(fs, parent, ei, placed) != 0) return -1;
         out->fs = fs;
         bcopy(out->name11, placed, 11u);
-        out->first_cluster = first_cl;
-        out->tail_cluster = first_cl;
+        out->first_cluster = 0u;
+        out->tail_cluster = 0u;
         out->size = 0u;
+        out->last_error = HYPE_FAT32_WFILE_ERR_NONE;
         if (dirent_pos(fs, parent, ei, &out->dirent_lba, &out->dirent_off) != 0) return -1;
+        first_cluster_set(out, 0u);
     }
-    return flush_metadata(out);
+    return flush_metadata(out, 1, 0);
 }
 
 int hype_fat32_unlink(hype_fat32_fs_t *fs, const char *path) {
@@ -811,18 +918,34 @@ int hype_fat32_append(hype_fat32_wfile_t *f, const void *data, unsigned int len)
     hype_fat32_fs_t *fs = f->fs;
     const uint8_t *src = (const uint8_t *)data;
     uint64_t cluster_bytes = (uint64_t)fs->spc * SECSZ;
+    int extended = 0;
+
+    f->last_error = HYPE_FAT32_WFILE_ERR_NONE;
+    if (!first_cluster_valid(f)) {
+        f->last_error = HYPE_FAT32_WFILE_ERR_IDENTITY;
+        return -1;
+    }
 
     while (len > 0u) {
         uint64_t oic = f->size % cluster_bytes;
         unsigned int sic, bis, n;
         uint64_t lba;
 
-        if (oic == 0u && f->size > 0u) {
+        if (f->size == 0u && f->first_cluster < 2u) {
+            uint32_t ncl;
+            if (alloc_cluster(fs, &ncl) != 0) return -1;
+            first_cluster_set(f, ncl);
+            f->tail_cluster = ncl;
+            extended = 1;
+        } else if (!cluster_ok(fs, f->tail_cluster)) {
+            return -1;
+        } else if (oic == 0u && f->size > 0u) {
             /* Filled the current cluster exactly -- extend the chain. */
             uint32_t ncl;
             if (alloc_cluster(fs, &ncl) != 0) return -1;
             if (fat_set(fs, f->tail_cluster, ncl) != 0) return -1;
             f->tail_cluster = ncl;
+            extended = 1;
         }
         sic = (unsigned int)(oic / SECSZ);
         bis = (unsigned int)(oic % SECSZ);
@@ -836,13 +959,30 @@ int hype_fat32_append(hype_fat32_wfile_t *f, const void *data, unsigned int len)
             bcopy(sec + bis, src, n);
             if (fs->write(fs->ctx, lba, 1u, sec) != 0) return -1;
         } else {
-            if (fs->write(fs->ctx, lba, 1u, src) != 0) return -1;
+            /*
+             * #374: the block callbacks accept a sector count, and the USB
+             * backend can transfer up to 64 KiB per command. Sending every
+             * full sector separately forced one USB command per 512 bytes.
+             * Coalesce the contiguous full sectors left in this cluster. A
+             * cluster boundary still returns to the top of the loop so the
+             * next FAT link is allocated and committed before data reaches it.
+             */
+            unsigned int sectors = len / SECSZ;
+            unsigned int in_cluster = fs->spc - sic;
+            if (sectors > in_cluster) sectors = in_cluster;
+            if (sectors == 0u) sectors = 1u;
+            n = sectors * SECSZ;
+            if (fs->write(fs->ctx, lba, sectors, src) != 0) return -1;
         }
         src += n;
         len -= n;
         f->size += n;
     }
-    return flush_metadata(f);
+    return flush_metadata(f, extended, 0);
+}
+
+void hype_fat32_fs_set_sync(hype_fat32_fs_t *fs, hype_blk_sync_fn sync) {
+    if (fs != (hype_fat32_fs_t *)0) fs->sync = sync;
 }
 
 void hype_fat32_fs_set_time(hype_fat32_fs_t *fs, const hype_rtc_time_t *now) {

@@ -10,7 +10,7 @@
  * other's covering sectors. Both guests then read another VM's bytes where their ISO's Primary
  * Volume Descriptor should be, found no filesystem, and OVMF reported the CD-ROM as Not Found. */
 #define BOUNCE_SECTORS 128u
-#define BOUNCE_BYTES (BOUNCE_SECTORS * HYPE_ISO_STREAM_SECTOR)
+#define BOUNCE_BYTES (BOUNCE_SECTORS * HYPE_BLK_SECTOR_SIZE)
 static uint8_t g_bounce[HYPE_ISO_STREAM_MAX_SLOTS][BOUNCE_BYTES] __attribute__((aligned(4096)));
 
 int hype_iso_stream_locate(const hype_iso_stream_t *s, uint64_t off, uint64_t *out_lba,
@@ -25,19 +25,19 @@ int hype_iso_stream_locate(const hype_iso_stream_t *s, uint64_t off, uint64_t *o
      * that path is provably unchanged.
      */
     if (s->extent_count == 0u) {
-        *out_lba = s->part_start_lba + off / HYPE_ISO_STREAM_SECTOR;
-        *out_head = (uint32_t)(off % HYPE_ISO_STREAM_SECTOR);
+        *out_lba = s->part_start_lba + off / HYPE_BLK_SECTOR_SIZE;
+        *out_head = (uint32_t)(off % HYPE_BLK_SECTOR_SIZE);
         /* One run, so everything left in the ISO is contiguous from here. */
         *out_run = (off < s->iso_size) ? (s->iso_size - off) : 0u;
         return (off < s->iso_size) ? 0 : -1;
     }
 
     for (i = 0; i < s->extent_count && i < HYPE_ISO_STREAM_MAX_EXTENTS; i++) {
-        uint64_t bytes = s->extents[i].sector_count * (uint64_t)HYPE_ISO_STREAM_SECTOR;
+        uint64_t bytes = s->extents[i].sector_count * (uint64_t)HYPE_BLK_SECTOR_SIZE;
         if (off < seen + bytes) {
             uint64_t within = off - seen; /* byte offset into this extent */
-            *out_lba = s->extents[i].start_lba + within / HYPE_ISO_STREAM_SECTOR;
-            *out_head = (uint32_t)(within % HYPE_ISO_STREAM_SECTOR);
+            *out_lba = s->extents[i].start_lba + within / HYPE_BLK_SECTOR_SIZE;
+            *out_head = (uint32_t)(within % HYPE_BLK_SECTOR_SIZE);
             /* Stop at the extent boundary: the next byte lives at an unrelated LBA, so a caller
              * must come back for it rather than reading straight on. */
             *out_run = bytes - within;
@@ -79,7 +79,7 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
             return -1;
         }
         want = head + remaining; /* bytes from `lba` we still need */
-        need = (want + HYPE_ISO_STREAM_SECTOR - 1u) / HYPE_ISO_STREAM_SECTOR;
+        need = (want + HYPE_BLK_SECTOR_SIZE - 1u) / HYPE_BLK_SECTOR_SIZE;
         /*
          * #365: fetch a whole bounce buffer, not just what was asked for.
          *
@@ -110,7 +110,7 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
          * file (or to another file entirely), so reading them would return the wrong bytes.
          * Applies to the read-ahead as much as to the requested part. */
         {
-            uint64_t run_sec = (head + run + HYPE_ISO_STREAM_SECTOR - 1u) / HYPE_ISO_STREAM_SECTOR;
+            uint64_t run_sec = (head + run + HYPE_BLK_SECTOR_SIZE - 1u) / HYPE_BLK_SECTOR_SIZE;
             if ((uint64_t)nsec > run_sec) {
                 nsec = (uint32_t)run_sec;
             }
@@ -140,7 +140,7 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
         if (s->cache_sectors != 0u && lba >= s->cache_lba &&
             (lba + need) <= (s->cache_lba + s->cache_sectors)) {
             uint64_t skip = lba - s->cache_lba;
-            bounce += skip * HYPE_ISO_STREAM_SECTOR;
+            bounce += skip * HYPE_BLK_SECTOR_SIZE;
             nsec = (uint32_t)(s->cache_sectors - skip); /* usable sectors from `lba` */
             s->cache_hits++;
         } else {
@@ -156,7 +156,7 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
          * entirely from cache is still sequential, and forgetting that would drop the stream back
          * to no-read-ahead on the next miss. */
         s->next_seq_lba = lba + need;
-        avail = nsec * HYPE_ISO_STREAM_SECTOR - head; /* usable bytes this fill */
+        avail = nsec * HYPE_BLK_SECTOR_SIZE - head; /* usable bytes this fill */
         if ((uint64_t)avail > run) {
             avail = (uint32_t)run; /* clamp to the extent, not just to the sectors fetched */
         }

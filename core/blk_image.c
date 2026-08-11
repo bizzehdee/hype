@@ -26,7 +26,7 @@ int hype_blk_image_locate(const hype_blk_image_t *img, uint64_t fsec, uint64_t *
 }
 
 /* Total sectors the extent list actually covers. */
-static uint64_t mapped_sectors(const hype_fat_file_t *map) {
+static uint64_t mapped_sectors(const hype_file_map_t *map) {
     uint64_t total = 0;
     unsigned int x;
     for (x = 0; x < map->count; x++) {
@@ -80,16 +80,16 @@ static int image_write(void *ctx, uint64_t lba, uint32_t count, const void *buf)
     return image_rw((hype_blk_image_t *)ctx, lba, count, 0, (const uint8_t *)buf);
 }
 
-int hype_blk_image_init(hype_blk_image_t *img, hype_blk_backend_t *be, const hype_fat_file_t *map,
-                        uint64_t partition_lba, hype_blk_image_read_fn read_sectors,
-                        hype_blk_image_write_fn write_sectors, void *hw) {
+int hype_blk_image_init(hype_blk_image_t *img, hype_blk_backend_t *be, const hype_file_map_t *map,
+                        uint64_t partition_lba, hype_blk_read_fn read_sectors,
+                        hype_blk_write_fn write_sectors, void *hw) {
     uint64_t capacity;
     unsigned int x;
 
     if (img == 0 || be == 0 || map == 0 || read_sectors == 0) {
         return -1;
     }
-    if (map->count > HYPE_FAT_MAX_EXTENTS) {
+    if (map->count > HYPE_FILE_MAX_EXTENTS) {
         return -1;
     }
     capacity = map->size_bytes / SECSZ; /* a trailing partial sector is unreachable */
