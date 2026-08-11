@@ -12,7 +12,7 @@ TARGET  := x86_64-unknown-uefi
 # struct layout links against freshly-built ones that disagree on field offsets --
 # which silently corrupted the ATAPI result struct across atapi.o/svm_vcpu.o and
 # looked like a mysterious "struct size sensitivity" (GLADDER-STRUCT / #180).
-# Build stamp, printed at boot and included in the RT-3c panic-tail line so any
+# Build stamp, printed at boot so any
 # captured log or screen photo says which build produced it. Real-hardware
 # debugging on a machine with no serial port means comparing captures that all
 # begin with identical boilerplate -- without a stamp there is no way to tell a
@@ -29,10 +29,10 @@ BUILD_DIR := build
 CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/serial.c core/serial_hw.c core/font8x8.c core/gop.c core/gop_text.c \
              core/fatal.c core/strutil.c core/guest_ram.c core/mp.c core/linux_boot.c \
-             core/admission.c core/file_io.c core/guest_mem.c core/logbuf.c core/nvlog.c \
-             core/clockfacts.c core/io_histogram.c \
+             core/admission.c core/file_io.c core/guest_mem.c core/logbuf.c \
+             core/clockfacts.c core/io_histogram.c core/log_drain.c core/render_budget.c core/scancode_queue.c core/ticket_lock.c \
              core/host_pci.c core/host_pci_hw.c core/ahci_host.c core/ahci_host_hw.c \
-             core/gpt.c core/iso_stream.c core/fat.c core/ext.c core/ext_write.c core/blk_image.c core/blk_qcow2.c core/nvme_host.c core/nvme_host_hw.c core/blk_backend.c core/blk_phys.c core/blk_phys_hw.c core/phys_guard.c \
+             core/gpt.c core/iso_stream.c core/fat.c core/file_range.c core/ext.c core/ext_write.c core/blk_image.c core/blk_qcow2.c core/nvme_host.c core/nvme_host_hw.c core/blk_backend.c core/blk_phys.c core/blk_phys_hw.c core/phys_guard.c \
              core/kbd_decode.c core/vt_screen.c core/vt_render.c core/dashboard.c core/vm_lifecycle.c core/vm_isolation.c core/input_script.c core/input_runner.c core/vm_watchdog.c core/cmdparse.c \
              core/cfg.c core/phys_confirm.c core/scancode.c core/xhci.c core/xhci_hw.c core/usb_msc.c core/usb_hid.c core/blk_usb.c \
              core/fat_write.c core/fat_write_fs.c core/fat_exfat.c core/fat_exfat_fs.c \
@@ -49,6 +49,7 @@ ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/id
              arch/x86_64/cpu/fpu_state.c arch/x86_64/cpu/fpu_state_hw.c \
              arch/x86_64/cpu/vmm_select.c arch/x86_64/cpu/vmexit.c arch/x86_64/cpu/mmio_decode.c \
              arch/x86_64/cpu/cpuid_emulate.c arch/x86_64/cpu/msr_emulate.c \
+             arch/x86_64/cpu/hyperv.c \
              arch/x86_64/cpu/ap_boot.c \
              arch/x86_64/svm/svm_bits.c arch/x86_64/svm/svm_enable_hw.c arch/x86_64/svm/svm_ops.c \
              arch/x86_64/svm/vmcb.c arch/x86_64/svm/svm_vcpu.c arch/x86_64/svm/npt.c \
