@@ -7352,41 +7352,76 @@ static __attribute__((noinline)) void fw_1_436_deep_dump(hype_fw_vm_t *vm, hype_
      * (the cycle). Names whether the list is truly circular and where it closes.
      */
     {
-        uint64_t rdx = hype_svm_vcpu_get_gpr(ctx, 2);
-        uint64_t r8 = hype_svm_vcpu_get_gpr(ctx, 8);
-        uint64_t seen[40];
-        unsigned hop, nseen = 0;
-        hype_debug_print("fw-1 #436 LISTWALK from rdx=0x%llx, sentinel r8=0x%llx:\n",
-                         (unsigned long long)rdx, (unsigned long long)r8);
-        for (hop = 0; hop < 40u; hop++) {
-            const uint8_t *nh;
-            uint64_t next = 0, ownerfield = 0;
-            unsigned b, s;
-            int repeat = 0;
-            if (rdx == r8) { hype_debug_print("  hop %u: reached sentinel -- list is finite\n", hop); break; }
-            for (s = 0; s < nseen; s++) { if (seen[s] == rdx) { repeat = 1; break; } }
-            if (repeat) {
-                hype_debug_print("  hop %u: node 0x%llx REPEATS (first seen at hop %u) -- CYCLE\n",
-                                 hop, (unsigned long long)rdx, s);
-                break;
-            }
-            if (nseen < 40u) seen[nseen++] = rdx;
-            nh = fw_1_guest_phys_to_host(vm, rdx + 0x18u);
-            if (nh) { for (b = 0; b < 8u; b++) next |= (uint64_t)nh[b] << (b * 8); }
-            {
-                const uint8_t *oh = fw_1_guest_phys_to_host(vm, rdx - 8u);
-                uint64_t owner = 0;
-                if (oh) { for (b = 0; b < 8u; b++) owner |= (uint64_t)oh[b] << (b * 8); }
-                {
-                    const uint8_t *fh = fw_1_guest_phys_to_host(vm, owner + 0x28u);
-                    if (fh) { for (b = 0; b < 8u; b++) ownerfield |= (uint64_t)fh[b] << (b * 8); }
+        /*
+         * #436 wedge #2: trace the +0x18 (EDK2 IHANDLE Protocols.Flink) chain from EACH candidate
+         * walk register -- rcx/rdx/rsi/rdi -- 24 hops with cycle detection. Whichever register is
+         * the loop's actual list shows its structure; the rest bail on the first non-canonical
+         * node. Reports where each chain cycles or leaves the guest-RAM range (0..4 GiB here).
+         */
+        unsigned reg_idx[4]; uint64_t reg_val[4]; const char *reg_nm[4];
+        reg_idx[0] = 1; reg_nm[0] = "rcx"; reg_idx[1] = 2; reg_nm[1] = "rdx";
+        reg_idx[2] = 6; reg_nm[2] = "rsi"; reg_idx[3] = 7; reg_nm[3] = "rdi";
+        unsigned r;
+        for (r = 0; r < 4u; r++) reg_val[r] = hype_svm_vcpu_get_gpr(ctx, reg_idx[r]);
+        for (r = 0; r < 4u; r++) {
+            uint64_t cur = reg_val[r];
+            uint64_t seen[24];
+            unsigned hop, nseen = 0;
+            hype_debug_print("fw-1 #436 CHAIN %s=0x%llx (+0x18 walk):\n", reg_nm[r],
+                             (unsigned long long)cur);
+            for (hop = 0; hop < 24u; hop++) {
+                const uint8_t *nh; uint64_t next = 0; unsigned b, s; int repeat = 0;
+                if (cur < 0x1000ULL || cur >= (4ULL << 30)) {
+                    hype_debug_print("  hop %u: 0x%llx out of guest RAM -- not a list node\n",
+                                     hop, (unsigned long long)cur);
+                    break;
                 }
+                for (s = 0; s < nseen; s++) { if (seen[s] == cur) { repeat = 1; break; } }
+                if (repeat) {
+                    hype_debug_print("  hop %u: 0x%llx REPEATS (hop %u) -- CYCLE of length %u\n",
+                                     hop, (unsigned long long)cur, s, hop - s);
+                    break;
+                }
+                if (nseen < 24u) seen[nseen++] = cur;
+                nh = fw_1_guest_phys_to_host(vm, cur + 0x18u);
+                if (nh) { for (b = 0; b < 8u; b++) next |= (uint64_t)nh[b] << (b * 8); }
+                hype_debug_print("  hop %u: node=0x%llx next=0x%llx\n", hop,
+                                 (unsigned long long)cur, (unsigned long long)next);
+                cur = next;
             }
-            hype_debug_print("  hop %u: node=0x%llx next=0x%llx [owner+0x28]=0x%llx\n",
-                             hop, (unsigned long long)rdx, (unsigned long long)next,
-                             (unsigned long long)ownerfield);
-            rdx = next;
         }
+        usb_log_flush();
+    }
+    /*
+     * #436 wedge #3: when the spin is in DxeCore (base 0xbfd2e000), count the guest's EFI handle
+     * database. gHandleList (DxeCore .data VA 0x173f8, ImageBase 0) is a circular LIST_ENTRY whose
+     * Flink (offset 0) chains every handle. Walk it up to 20000 nodes: a bounded count that returns
+     * to the head is a healthy DB; an unbounded/huge count is the CoreConnectController EFI_NOT_READY
+     * loop creating handles without end. Only meaningful when `base` is DxeCore's -- guarded by a
+     * sanity check that the list head's Flink points back into guest RAM.
+     */
+    if (base != 0) {
+        uint64_t ghead = base + 0x173f8u;   /* gHandleList */
+        uint64_t flink = 0, cur;
+        const uint8_t *hp = fw_1_guest_phys_to_host(vm, ghead);
+        unsigned b, count = 0;
+        int looped = 0;
+        if (hp) { for (b = 0; b < 8u; b++) flink |= (uint64_t)hp[b] << (b * 8); }
+        cur = flink;
+        while (cur != 0 && cur != ghead && count < 20000u) {
+            const uint8_t *np = fw_1_guest_phys_to_host(vm, cur);
+            uint64_t nxt = 0;
+            if (cur < 0x1000ULL || cur >= (4ULL << 30)) { looped = 2; break; }
+            if (np) { for (b = 0; b < 8u; b++) nxt |= (uint64_t)np[b] << (b * 8); }
+            count++;
+            cur = nxt;
+        }
+        looped = (count >= 20000u) ? 1 : looped;
+        hype_debug_print("fw-1 #436 HANDLEDB: gHandleList@0x%llx flink=0x%llx count=%u %s [#436]\n",
+                         (unsigned long long)ghead, (unsigned long long)flink, count,
+                         looped == 1 ? "(HIT 20000 CAP -- unbounded/cyclic!)"
+                                     : (looped == 2 ? "(ran off into garbage)"
+                                                    : "(closed cleanly)"));
         usb_log_flush();
     }
 }
