@@ -16290,6 +16290,16 @@ static void pci_dump_all(void) {
  * g_ap_vmm_page, the SVM host-save area, which needs 4 KiB alignment and so uses
  * AllocatePages like g_vms. Sized to g_vm_count; pool memory is zeroed (not BSS).
  */
+/* #412: BootServices captured for the vCPU-pool allocator callback (the arch
+ * backends allocate their own VMCB/VMCS/ctx pools through this, sized to the
+ * VM count). Set once in efi_main before the pools are allocated. */
+static EFI_BOOT_SERVICES *g_pool_bs;
+static uint64_t fw_alloc_zeroed_pages(unsigned pages) {
+    uint64_t p = hype_alloc_pages_any(g_pool_bs, (UINTN)pages);
+    if (p != 0) hype_guest_ram_zero((void *)(uintptr_t)p, (uint64_t)pages * 4096ull);
+    return p;
+}
+
 static void *fw_aux_alloc(EFI_BOOT_SERVICES *bs, UINTN bytes) {
     void *ptr = 0;
     if (bs->AllocatePool(EfiLoaderData, bytes, &ptr) != EFI_SUCCESS || ptr == 0) {
@@ -16452,6 +16462,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                          g_vm_count, (unsigned long long)sizeof(hype_fw_vm_t), (void *)g_vms);
     }
     fw_alloc_vm_aux_arena(SystemTable->BootServices);
+    /* #412: size the per-vCPU pools (VMCB/VMCS/ctx/MSR/virtual-APIC) to the VM
+     * count too, before any vCPU is created -- so N VMs get N distinct
+     * hardware contexts (#237). The self-test battery that also uses these pools
+     * is gated off for a normal boot, so this is the first user. */
+    g_pool_bs = SystemTable->BootServices;
+    hype_svm_vcpu_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
+    hype_vmx_vcpu_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
     vm = &g_vms[0];
     /*
      * INPUT-8 (#281): load each VM's expect script here, PRE-EBS, because this is the

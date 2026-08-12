@@ -59,12 +59,18 @@
  * guests are created -- without that the battery drains the pool and the real VMs
  * both clamp to the same slot, which is #237 exactly.
  */
-#define HYPE_VMX_MAX_VCPUS 4u
-static uint8_t g_vmcs_pool[HYPE_VMX_MAX_VCPUS][4096] __attribute__((aligned(4096)));
+/* #412 step 2: VMX per-vCPU pools are runtime-allocated and sized to the VM
+ * count (hype_vmx_vcpu_pool_alloc), not fixed arrays -- so N VMs get N distinct
+ * VMCS/virtual-APIC/MSR-area/ctx sets (#237/#276/#277: sharing any of these
+ * across two vCPUs corrupts one guest). VMCS + virtual-APIC pages are
+ * page-allocated (4 KiB architectural); the MSR areas (16-byte aligned) and ctx
+ * pool sit in page-aligned blocks so their element alignment holds. */
+static uint8_t (*g_vmcs_pool)[4096];
+static unsigned g_vmx_pool_n;
 /* #277: one virtual-APIC page PER vCPU slot. A single shared page went into every
  * VMCS as VIRTUAL_APIC_PAGE_ADDR, so two guests would share one TPR the moment the
  * capability negotiation granted USE_TPR_SHADOW. Same shape as #276's MSR areas. */
-static uint8_t g_virtual_apic_page[HYPE_VMX_MAX_VCPUS][4096] __attribute__((aligned(4096)));
+static uint8_t (*g_virtual_apic_page)[4096];
 
 /* #248: did the CPU actually grant acknowledge-interrupt-on-exit? Set from the
  * ADJUSTED exit controls in hype_vmx_vcpu_create(), never from what was
@@ -197,10 +203,8 @@ static const uint32_t g_vmx_msr_list[] = {
  * syscalls. Indexed exactly like g_vmcs_pool/g_vmx_ctx_pool (#271) -- pooling
  * the VMCS is not enough on its own if what the VMCS POINTS AT stays shared.
  */
-static hype_vmx_msr_entry_t g_vmx_msr_guest[HYPE_VMX_MAX_VCPUS][HYPE_VMX_MSR_AREA_COUNT]
-    __attribute__((aligned(16)));
-static hype_vmx_msr_entry_t g_vmx_msr_host[HYPE_VMX_MAX_VCPUS][HYPE_VMX_MSR_AREA_COUNT]
-    __attribute__((aligned(16)));
+static hype_vmx_msr_entry_t (*g_vmx_msr_guest)[HYPE_VMX_MSR_AREA_COUNT];
+static hype_vmx_msr_entry_t (*g_vmx_msr_host)[HYPE_VMX_MSR_AREA_COUNT];
 
 /* Index into g_vmx_msr_guest for `msr`, or -1. Used by the RDMSR/WRMSR handler so
  * the guest reads back what it wrote even between transitions. */
@@ -311,8 +315,22 @@ struct hype_vcpu_ctx {
  * of ctx + VMCS regions AND per-VM EPT roots + VPID, since the EPT here is one
  * global identity map.
  */
-static struct hype_vcpu_ctx g_vmx_ctx_pool[HYPE_VMX_MAX_VCPUS];
+static struct hype_vcpu_ctx *g_vmx_ctx_pool;
 static unsigned g_vmx_vcpu_count = 0;
+
+void hype_vmx_vcpu_pool_alloc(unsigned count, uint64_t (*alloc_zeroed_pages)(unsigned pages)) {
+    unsigned msr_pages, ctx_pages;
+    if (count == 0u) count = 1u;
+    msr_pages = (unsigned)((count * sizeof(hype_vmx_msr_entry_t) * HYPE_VMX_MSR_AREA_COUNT + 4095u) / 4096u);
+    ctx_pages = (unsigned)((count * sizeof(struct hype_vcpu_ctx) + 4095u) / 4096u);
+    g_vmcs_pool = (uint8_t (*)[4096])(uintptr_t)alloc_zeroed_pages(count);
+    g_virtual_apic_page = (uint8_t (*)[4096])(uintptr_t)alloc_zeroed_pages(count);
+    g_vmx_msr_guest = (hype_vmx_msr_entry_t (*)[HYPE_VMX_MSR_AREA_COUNT])(uintptr_t)alloc_zeroed_pages(msr_pages ? msr_pages : 1u);
+    g_vmx_msr_host = (hype_vmx_msr_entry_t (*)[HYPE_VMX_MSR_AREA_COUNT])(uintptr_t)alloc_zeroed_pages(msr_pages ? msr_pages : 1u);
+    g_vmx_ctx_pool = (struct hype_vcpu_ctx *)(uintptr_t)alloc_zeroed_pages(ctx_pages ? ctx_pages : 1u);
+    g_vmx_pool_n = count;
+    g_vmx_vcpu_count = 0u;
+}
 
 /*
  * #271/#237: allocate a slot, and be LOUD when there are none left. #237's SVM pool
@@ -322,13 +340,13 @@ static unsigned g_vmx_vcpu_count = 0;
  */
 static unsigned vmx_alloc_slot(void) {
     unsigned slot = __atomic_fetch_add(&g_vmx_vcpu_count, 1u, __ATOMIC_SEQ_CST);
-    if (slot < HYPE_VMX_MAX_VCPUS) {
+    if (slot < g_vmx_pool_n) {
         return slot;
     }
     hype_debug_print("vmx: vCPU slot pool EXHAUSTED (%u slots) -- slot %u aliased to %u. Safe ONLY "
                      "if these guests never run concurrently (see #237/#245)\n",
-                     HYPE_VMX_MAX_VCPUS, slot, HYPE_VMX_MAX_VCPUS - 1u);
-    return HYPE_VMX_MAX_VCPUS - 1u;
+                     g_vmx_pool_n, slot, g_vmx_pool_n - 1u);
+    return g_vmx_pool_n - 1u;
 }
 
 /*
@@ -348,7 +366,7 @@ void hype_vmx_vcpu_pool_reset(void) {
  * (never expected) falls back to slot 0 rather than indexing out of bounds.
  */
 static unsigned vmx_ctx_slot(const struct hype_vcpu_ctx *ctx) {
-    if (ctx >= &g_vmx_ctx_pool[0] && ctx < &g_vmx_ctx_pool[HYPE_VMX_MAX_VCPUS]) {
+    if (ctx >= &g_vmx_ctx_pool[0] && ctx < &g_vmx_ctx_pool[g_vmx_pool_n]) {
         return (unsigned)(ctx - &g_vmx_ctx_pool[0]);
     }
     return 0;
@@ -590,7 +608,7 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     /* #276: ONE index drives every per-guest resource -- VMCS region, MSR areas,
      * VPID. Deriving them separately is how the MSR areas stayed shared while the
      * VMCS pool looked done. */
-    uint16_t vpid = hype_vmx_vpid_for_slot(slot, HYPE_VMX_MAX_VCPUS);
+    uint16_t vpid = hype_vmx_vpid_for_slot(slot, g_vmx_pool_n);
     /* #271: the region is passed in, not taken from a "current slot" global -- two
      * APs can be building their own vCPUs at the same time, and a shared global
      * would be the very race this pool exists to remove. VMPTRLD makes it current

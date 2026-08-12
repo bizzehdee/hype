@@ -102,11 +102,28 @@ struct hype_vcpu_ctx {
  * 4KB, so aligning the array to 4KB keeps every element page-aligned (the
  * _Static_assert guards that). iopm/msrpm below stay shared -- they are
  * read-only permission maps and every guest wants the same policy. */
-#define HYPE_SVM_MAX_VCPUS 2u
-static hype_vmcb_t g_vmcb_pool[HYPE_SVM_MAX_VCPUS] __attribute__((aligned(4096)));
-static struct hype_vcpu_ctx g_ctx_pool[HYPE_SVM_MAX_VCPUS];
+/*
+ * #412 step 2: the VMCB and vCPU-ctx pools are runtime-allocated and sized to
+ * the VM count (hype_svm_vcpu_pool_alloc, called from boot before any vCPU is
+ * created), not a fixed HYPE_SVM_MAX_VCPUS array -- so N VMs get N distinct
+ * VMCB/ctx pairs (#237: two vCPUs must never share one VMCB). The VMCB pool is
+ * page-allocated because a VMCB is architecturally 4 KiB; sizeof==4096 keeps
+ * every element page-aligned off the page-aligned base.
+ */
+static hype_vmcb_t *g_vmcb_pool;
+static struct hype_vcpu_ctx *g_ctx_pool;
+static unsigned g_svm_pool_n;
 static unsigned g_vcpu_count;
 _Static_assert(sizeof(hype_vmcb_t) == 4096, "VMCB must be 4KB for per-element page alignment");
+
+void hype_svm_vcpu_pool_alloc(unsigned count, uint64_t (*alloc_zeroed_pages)(unsigned pages)) {
+    unsigned ctx_pages = (unsigned)((count * sizeof(struct hype_vcpu_ctx) + 4095u) / 4096u);
+    if (count == 0u) count = 1u;
+    g_vmcb_pool = (hype_vmcb_t *)(uintptr_t)alloc_zeroed_pages(count);   /* 1 page per VMCB */
+    g_ctx_pool = (struct hype_vcpu_ctx *)(uintptr_t)alloc_zeroed_pages(ctx_pages ? ctx_pages : 1u);
+    g_svm_pool_n = count;
+    g_vcpu_count = 0u;
+}
 
 /* Allocates the next vCPU slot. The two concurrent guests take slots 0 and 1;
  * the gated-off self-test guests run sequentially and safely reuse the last
@@ -134,7 +151,7 @@ _Static_assert(sizeof(hype_vmcb_t) == 4096, "VMCB must be 4KB for per-element pa
  * VMCB and has no slot in hand) still assigns that vCPU's own ASID. Mirrors
  * vmx_ctx_slot() from #276. */
 static unsigned svm_ctx_slot(const struct hype_vcpu_ctx *ctx) {
-    if (ctx >= &g_ctx_pool[0] && ctx < &g_ctx_pool[HYPE_SVM_MAX_VCPUS]) {
+    if (ctx >= &g_ctx_pool[0] && ctx < &g_ctx_pool[g_svm_pool_n]) {
         return (unsigned)(ctx - &g_ctx_pool[0]);
     }
     return 0;
@@ -165,7 +182,7 @@ static void svm_assign_asid(hype_vmcb_t *vmcb, unsigned slot) {
 
 static unsigned svm_alloc_vcpu_slot(void) {
     unsigned slot = __atomic_fetch_add(&g_vcpu_count, 1u, __ATOMIC_SEQ_CST);
-    if (slot < HYPE_SVM_MAX_VCPUS) {
+    if (slot < g_svm_pool_n) {
         return slot;
     }
     /*
@@ -178,8 +195,8 @@ static unsigned svm_alloc_vcpu_slot(void) {
      */
     hype_debug_print("svm: vCPU slot pool EXHAUSTED (%u slots) -- slot %u aliased to %u. Safe ONLY "
                      "if these guests never run concurrently (see #237)\n",
-                     HYPE_SVM_MAX_VCPUS, slot, HYPE_SVM_MAX_VCPUS - 1u);
-    return HYPE_SVM_MAX_VCPUS - 1u;
+                     g_svm_pool_n, slot, g_svm_pool_n - 1u);
+    return g_svm_pool_n - 1u;
 }
 
 /*

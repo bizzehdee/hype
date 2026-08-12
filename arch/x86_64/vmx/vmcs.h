@@ -150,6 +150,10 @@ void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx);
 
 /* #271: release every vCPU slot. Mirrors hype_svm_vcpu_pool_reset() -- call between
  * the sequential battery and the concurrent guests, never while a vCPU is live. */
+/* #412: allocate the VMX per-vCPU pools (VMCS/virtual-APIC/MSR-area/ctx) sized to
+ * `count`, before any vCPU is created. `alloc_zeroed_pages(pages)` returns the
+ * host address of `pages` page-aligned, zeroed 4 KiB pages. */
+void hype_vmx_vcpu_pool_alloc(unsigned count, uint64_t (*alloc_zeroed_pages)(unsigned pages));
 void hype_vmx_vcpu_pool_reset(void);
 
 /* #248: the VMX half of the interrupt-delivery counters. Same field meanings as

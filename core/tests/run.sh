@@ -47,7 +47,9 @@ binaries=""
 # instructions + win64 ABI, never CALLED by a test (only vcpu_run() in
 # vmcs_hw.c calls it, and that itself is exempt/unrun on the host); it just
 # has to resolve at link time. Assembling it for the host target does that.
-asm_srcs="../../arch/x86_64/vmx/vmx_run.S"
+# svm_run.S is the same story for hype_svm_vmrun, referenced by svm_vcpu.c
+# (#412: the SVM VMRUN trampoline, replacing the old inline-asm macro).
+asm_srcs="../../arch/x86_64/vmx/vmx_run.S ../../arch/x86_64/svm/svm_run.S"
 
 # Parallel build+run, one job per test binary. The compile dominates the suite's wall clock
 # (every binary links the whole instrumented tree), and the jobs are fully independent --
