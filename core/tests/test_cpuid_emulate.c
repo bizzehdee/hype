@@ -81,9 +81,15 @@ static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
     hype_cpuid_emulate(1, 0, &real, &out);
 
     CHECK_HEX("eax passthrough", real.eax, out.eax);
-    /* ebx[31:24] (initial APIC ID) forced to 0; lower 24 bits pass through. */
+    /* ebx[31:24] (initial APIC ID) forced to 0; [23:16] (logical-processor count)
+     * forced to 1 (#436: single modeled vCPU); [15:0] (brand idx + CLFLUSH size) pass
+     * through. real.ebx=0x12345678 -> 0x00015678. */
     CHECK_HEX("ebx initial-APIC-ID forced 0", 0, (out.ebx >> 24) & 0xFFu);
-    CHECK_HEX("ebx low 24 bits passthrough", real.ebx & 0x00FFFFFFu, out.ebx);
+    CHECK_HEX("ebx logical-processor count forced 1", 1u, (out.ebx >> 16) & 0xFFu);
+    CHECK_HEX("ebx low 16 bits (brand+clflush) passthrough", real.ebx & 0x0000FFFFu,
+              out.ebx & 0x0000FFFFu);
+    /* #436: HTT (edx bit 28) forced clear so the guest sees a single logical processor. */
+    CHECK_HEX("HTT bit forced clear", 0, (out.edx & (1u << 28)) != 0);
     CHECK_HEX("hypervisor-present bit forced set", 1, (out.ecx & (1u << 31)) != 0);
     CHECK_HEX("TSC_DEADLINE bit forced clear", 0, (out.ecx & (1u << 24)) != 0);
     CHECK_HEX("X2APIC bit forced clear", 0, (out.ecx & (1u << 21)) != 0);
@@ -100,7 +106,8 @@ static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
     CHECK_HEX("ecx otherwise passthrough",
               (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21) & ~(1u << 3), out.ecx);
     CHECK_HEX("MTRR bit forced clear", 0, (out.edx & (1u << 12)) != 0);
-    CHECK_HEX("edx otherwise passthrough", real.edx & ~(1u << 12), out.edx);
+    /* #436: HTT (bit 28) is now cleared alongside MTRR (bit 12). */
+    CHECK_HEX("edx otherwise passthrough", real.edx & ~(1u << 12) & ~(1u << 28), out.edx);
 }
 
 static void test_leaf1_mtrr_already_clear_is_idempotent(void) {
@@ -109,7 +116,8 @@ static void test_leaf1_mtrr_already_clear_is_idempotent(void) {
 
     hype_cpuid_emulate(1, 0, &real, &out);
 
-    CHECK_HEX("edx unchanged when MTRR bit already clear", real.edx, out.edx);
+    /* #436: HTT (bit 28) is cleared even when MTRR was already clear. */
+    CHECK_HEX("edx has HTT cleared when MTRR already clear", real.edx & ~(1u << 28), out.edx);
 }
 
 static void test_leaf_ext1_clears_svm_bit(void) {
@@ -135,14 +143,17 @@ static void test_leaf_ext1_svm_already_clear_is_idempotent(void) {
 }
 
 static void test_leaf_ext8_address_sizes_passthrough(void) {
-    hype_cpuid_result_t real = {0x00003028u, 0x00000000u, 0x00000000u, 0x00000000u};
+    /* real.ecx carries the host core count: NC[7:0]=0x0F (16 cores), ApicIdCoreIdSize[15:12]=4. */
+    hype_cpuid_result_t real = {0x00003028u, 0x00000000u, 0x0000400Fu, 0x00000000u};
     hype_cpuid_result_t out;
 
     hype_cpuid_emulate(0x80000008u, 0, &real, &out);
 
     CHECK_HEX("eax passthrough (phys/linear address widths)", real.eax, out.eax);
     CHECK_HEX("ebx passthrough", real.ebx, out.ebx);
-    CHECK_HEX("ecx passthrough", real.ecx, out.ecx);
+    /* #436: ecx (core count NC + ApicIdCoreIdSize) forced to 0 = single core, so the guest
+     * does not try to start phantom APs. */
+    CHECK_HEX("ecx (core count) forced to single core", 0u, out.ecx);
     CHECK_HEX("edx passthrough", real.edx, out.edx);
 }
 

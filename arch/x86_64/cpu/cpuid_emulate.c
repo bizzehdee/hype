@@ -2,6 +2,16 @@
 
 #define HYPE_CPUID_HYPERVISOR_PRESENT_BIT (1u << 31)
 #define HYPE_CPUID_LEAF1_EDX_MTRR_BIT (1u << 12)
+/*
+ * #436: leaf 1 EDX bit 28 = HTT (Hyper-Threading / multiple logical processors present). Passed
+ * through, it carries the HOST's multi-core answer, and leaf 1 EBX[23:16] then reports the host's
+ * logical-processor count -- so the guest believes there are N CPUs while hype runs exactly ONE
+ * 1:1-pinned vCPU. Linux/BSD dodge this (they take their CPU count from the MADT, which declares 1),
+ * but Windows winload calls the UEFI EFI_MP_SERVICES protocol -- OVMF's MpInitLib -- which INIT-SIPIs
+ * the phantom APs and spins forever waiting for them to check in (the #436 winload wedge). Clearing
+ * HTT and forcing the counts to 1 makes CPUID agree with the modeled single vCPU.
+ */
+#define HYPE_CPUID_LEAF1_EDX_HTT_BIT (1u << 28)
 #define HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT (1u << 24)
 #define HYPE_CPUID_LEAF1_ECX_X2APIC_BIT (1u << 21)
 #define HYPE_CPUID_LEAF1_ECX_MONITOR_BIT (1u << 3)
@@ -194,8 +204,14 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
          * disagreement ("[Firmware Bug]: APIC ID mismatch. CPUID: 0x0001 APIC:
          * 0x0000"). Force it to 0 so CPUID agrees with the modeled LAPIC. (Each
          * hype VM has exactly one 1:1-pinned vCPU whose LAPIC ID is 0.) */
-        out->ebx = real->ebx & 0x00FFFFFFu;
-        out->edx = real->edx & ~HYPE_CPUID_LEAF1_EDX_MTRR_BIT;
+        /* EBX: keep brand index [7:0] + CLFLUSH size [15:8] from the host; force the
+         * addressable-logical-processor count [23:16] to 1 and the initial APIC ID [31:24]
+         * to 0 (the single modeled vCPU). #436: without the [23:16]=1 clamp the guest reads
+         * the host's HT count and tries to start that many APs. */
+        out->ebx = (real->ebx & 0x0000FFFFu) | (1u << 16);
+        /* EDX: clear MTRR (unmodeled) and HTT (#436: single logical processor -- see the
+         * HYPE_CPUID_LEAF1_EDX_HTT_BIT comment). */
+        out->edx = real->edx & ~HYPE_CPUID_LEAF1_EDX_MTRR_BIT & ~HYPE_CPUID_LEAF1_EDX_HTT_BIT;
         /* Hypervisor-present set; MTRR already cleared above. Also clear
          * TSC_DEADLINE (ECX bit 24): with it set, a guest OS arms its
          * LAPIC timer via the IA32_TSC_DEADLINE MSR (0x6e0) -- a mode
@@ -400,7 +416,11 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
          * sensitive here. */
         out->eax = real->eax;
         out->ebx = real->ebx;
-        out->ecx = real->ecx;
+        /* ECX[7:0] = NC (number of physical cores - 1); [15:12] = ApicIdCoreIdSize.
+         * #436: passed through, this reports the host's core count (e.g. 15 for a 16-core
+         * host), another source that makes the guest start phantom APs. Force it to 0 =
+         * a single core, consistent with leaf 1's cleared HTT and the one modeled vCPU. */
+        out->ecx = 0u;
         out->edx = real->edx;
         return;
     }
