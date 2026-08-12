@@ -12,6 +12,7 @@
 #define TAG_NONE 0u
 #define TAG_RMAP 1u   /* u.rmap: generic read-only handle (#381) */
 #define TAG_NATIVE 2u /* the driver's own writable handle arm */
+#define TAG_EXT2 3u   /* u.ext2: the #384 allocating ext2 writer */
 
 /* ---------------- ISO9660 (read-only, whole-image) ---------------- */
 
@@ -390,8 +391,16 @@ static int ext_map_ranges(hype_fs_t *fs, const char *path, hype_file_rmap_t *out
 static int ext_lookup(hype_fs_t *fs, const char *path, hype_fs_file_t *out) {
     out->fs = fs;
     if (fs->write != 0) {
-        /* Writable mount: an in-place read/write handle. hype_ext_open_rw
-         * additionally requires the volume cleanly unmounted. */
+        /* #384: on an ext2 volume the allocating writer opens first, so a
+         * sparse backing file gets hole-filling writes. Any journal, extent
+         * mapping or unsupported feature makes it refuse; the legacy
+         * in-place-only handle (clean ext3/4, fully-allocated files) is the
+         * fallback. Both require a cleanly-unmounted volume. */
+        out->tag = TAG_EXT2;
+        if (hype_ext2_open_rw(fs->read, fs->write, fs->ctx, path, &out->u.ext2) == 0) {
+            out->size = out->u.ext2.size_bytes;
+            return 0;
+        }
         out->tag = TAG_NATIVE;
         if (hype_ext_open_rw(fs->read, fs->write, fs->ctx, path, &out->u.ext) != 0) {
             return -1;
@@ -411,6 +420,9 @@ static int ext_read_at(hype_fs_file_t *f, uint64_t offset, void *dst, unsigned i
     if (f->tag == TAG_RMAP) {
         return rmap_read_at(f, offset, dst, len);
     }
+    if (f->tag == TAG_EXT2) {
+        return hype_ext2_read_at(&f->u.ext2, offset, dst, len);
+    }
     if (f->tag == TAG_NATIVE) {
         return hype_ext_read_at(&f->u.ext, offset, dst, len);
     }
@@ -418,6 +430,10 @@ static int ext_read_at(hype_fs_file_t *f, uint64_t offset, void *dst, unsigned i
 }
 
 static int ext_write_at(hype_fs_file_t *f, uint64_t offset, const void *src, unsigned int len) {
+    if (f->tag == TAG_EXT2) {
+        /* allocates when the span crosses a hole (#384) */
+        return hype_ext2_write_at(&f->u.ext2, offset, src, len);
+    }
     if (f->tag != TAG_NATIVE) {
         return -1;
     }
@@ -426,7 +442,7 @@ static int ext_write_at(hype_fs_file_t *f, uint64_t offset, const void *src, uns
 
 static const hype_fs_ops_t ext_ops = {
     "ext",
-    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE,
+    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_SPARSE,
     ext_probe,
     ext_mount,
     ext_lookup,

@@ -1,5 +1,6 @@
 #include "ext.h"
 #include "lebytes.h"
+#include "file_range.h"
 
 /*
  * #203: read-only ext2/3/4 path-to-extents resolver. Layout facts are from the
@@ -223,7 +224,8 @@ static int inode_read(ext_vol_t *v, uint32_t ino, uint8_t out[IN_CORE]) {
 /* ---- extent emission (shared by both mapping schemes) ---- */
 
 typedef struct {
-    hype_file_map_t *out;
+    hype_file_map_t *out;   /* legacy physical-only target (refuses holes) */
+    hype_file_rmap_t *rout; /* #384 sparse target: gaps become HOLE ranges */
     ext_vol_t *v;
     uint64_t next_logical; /* the next file block expected: gaps are holes */
     uint64_t total_blocks; /* ceil(size / block_size) */
@@ -239,8 +241,23 @@ static int emit_run(emit_t *e, uint64_t logical, uint64_t phys, uint64_t count) 
     hype_file_map_t *f = e->out;
     uint64_t start_lba, sectors;
 
-    if (count == 0u || logical != e->next_logical) {
-        return -1; /* a hole or an out-of-order extent */
+    if (count == 0u || logical < e->next_logical) {
+        return -1; /* zero-length or out-of-order */
+    }
+    if (logical != e->next_logical) {
+        /* a logical gap: an explicit HOLE under the #384 contract, corruption
+         * under the legacy physical-only one */
+        if (e->rout == 0) {
+            return -1;
+        }
+        if (logical > e->total_blocks) {
+            return -1;
+        }
+        if (hype_file_rmap_append(e->rout, HYPE_RANGE_HOLE, 0,
+                                  (logical - e->next_logical) * e->v->spb) != 0) {
+            return -1;
+        }
+        e->next_logical = logical;
     }
     if (logical >= e->total_blocks) {
         return -1;
@@ -255,6 +272,12 @@ static int emit_run(emit_t *e, uint64_t logical, uint64_t phys, uint64_t count) 
 
     start_lba = phys * e->v->spb;
     sectors = count * e->v->spb;
+    if (e->rout != 0) {
+        if (hype_file_rmap_append(e->rout, HYPE_RANGE_DATA, start_lba, sectors) != 0) {
+            return -1; /* over the range cap: too_fragmented is already set */
+        }
+        return 0;
+    }
     if (f->count > 0u && f->extents[f->count - 1u].start_lba +
                                  f->extents[f->count - 1u].sector_count == start_lba) {
         f->extents[f->count - 1u].sector_count += sectors;
@@ -313,11 +336,43 @@ static int leaf_entry(emit_t *e, const uint8_t ee[EE_SIZE]) {
     uint32_t lblk = hype_rd32(ee + 0);
     uint32_t len = hype_rd16(ee + 4);
     uint64_t phys = (uint64_t)hype_rd32(ee + 8) | ((uint64_t)hype_rd16(ee + 6) << 32);
-    if (len == 0u || len > EE_LEN_UNWRITTEN) {
-        /* len > 32768 marks an UNWRITTEN extent (real length len - 32768): it
-         * reads as zeros, which the extent contract cannot express. A written
-         * extent is 1..32768 exactly. */
+    if (len == 0u) {
         return -1;
+    }
+    if (len > EE_LEN_UNWRITTEN) {
+        /* len > 32768 marks an UNWRITTEN extent (real length len - 32768): it
+         * reads as zeros. Under the #384 contract that is an UNWRITTEN range;
+         * under the legacy physical-only contract it stays a refusal. */
+        uint64_t real_len = len - EE_LEN_UNWRITTEN;
+        if (e->rout == 0) {
+            return -1;
+        }
+        if (real_len == 0u || lblk < e->next_logical) {
+            return -1;
+        }
+        if ((uint64_t)lblk != e->next_logical) {
+            if ((uint64_t)lblk > e->total_blocks ||
+                hype_file_rmap_append(e->rout, HYPE_RANGE_HOLE, 0,
+                                      ((uint64_t)lblk - e->next_logical) * e->v->spb) != 0) {
+                return -1;
+            }
+            e->next_logical = lblk;
+        }
+        if (lblk >= e->total_blocks) {
+            return -1;
+        }
+        if (real_len > e->total_blocks - lblk) {
+            real_len = e->total_blocks - lblk;
+        }
+        if (phys == 0u || phys >= e->v->blocks_count || real_len > e->v->blocks_count - phys) {
+            return -1;
+        }
+        if (hype_file_rmap_append(e->rout, HYPE_RANGE_UNWRITTEN, phys * e->v->spb,
+                                  real_len * e->v->spb) != 0) {
+            return -1;
+        }
+        e->next_logical = lblk + real_len;
+        return 0;
     }
     return emit_run(e, lblk, phys, len);
 }
@@ -429,27 +484,39 @@ static int walk_indirect(ext_vol_t *v, const uint8_t *iblk, ind_scratch_t *s, em
         } else {
             uint64_t r = lb - 12u;
             if (r < ppb) { /* single indirect */
-                if (pread32(v, &s->l1, hype_rd32(iblk + 12u * 4u), (uint32_t)r, &ptr) != 0) {
+                uint32_t root = hype_rd32(iblk + 12u * 4u);
+                if (root == 0u && e->rout != 0) {
+                    ptr = 0u; /* the whole level is a hole */
+                } else if (pread32(v, &s->l1, root, (uint32_t)r, &ptr) != 0) {
                     return -1;
                 }
             } else if ((r -= ppb) < (uint64_t)ppb * ppb) { /* double */
                 uint32_t mid;
-                if (pread32(v, &s->l2, hype_rd32(iblk + 13u * 4u), (uint32_t)(r / ppb), &mid) != 0) {
+                uint32_t root = hype_rd32(iblk + 13u * 4u);
+                if (root == 0u && e->rout != 0) {
+                    ptr = 0u;
+                } else if (pread32(v, &s->l2, root, (uint32_t)(r / ppb), &mid) != 0) {
                     return -1;
-                }
-                if (pread32(v, &s->l1, mid, (uint32_t)(r % ppb), &ptr) != 0) {
+                } else if (mid == 0u && e->rout != 0) {
+                    ptr = 0u;
+                } else if (pread32(v, &s->l1, mid, (uint32_t)(r % ppb), &ptr) != 0) {
                     return -1;
                 }
             } else if ((r -= (uint64_t)ppb * ppb) < (uint64_t)ppb * ppb * ppb) { /* triple */
                 uint32_t hi, mid;
-                if (pread32(v, &s->l3, hype_rd32(iblk + 14u * 4u),
-                            (uint32_t)(r / ((uint64_t)ppb * ppb)), &hi) != 0) {
+                uint32_t root = hype_rd32(iblk + 14u * 4u);
+                if (root == 0u && e->rout != 0) {
+                    ptr = 0u;
+                } else if (pread32(v, &s->l3, root,
+                                   (uint32_t)(r / ((uint64_t)ppb * ppb)), &hi) != 0) {
                     return -1;
-                }
-                if (pread32(v, &s->l2, hi, (uint32_t)((r / ppb) % ppb), &mid) != 0) {
+                } else if (hi == 0u && e->rout != 0) {
+                    ptr = 0u;
+                } else if (pread32(v, &s->l2, hi, (uint32_t)((r / ppb) % ppb), &mid) != 0) {
                     return -1;
-                }
-                if (pread32(v, &s->l1, mid, (uint32_t)(r % ppb), &ptr) != 0) {
+                } else if (mid == 0u && e->rout != 0) {
+                    ptr = 0u;
+                } else if (pread32(v, &s->l1, mid, (uint32_t)(r % ppb), &ptr) != 0) {
                     return -1;
                 }
             } else {
@@ -457,7 +524,13 @@ static int walk_indirect(ext_vol_t *v, const uint8_t *iblk, ind_scratch_t *s, em
             }
         }
         if (ptr == 0u) {
-            return -1; /* a hole */
+            if (e->rout == 0) {
+                return -1; /* a hole: the legacy contract cannot say "zeros" */
+            }
+            /* skip it -- emit_run() emits the accumulated gap as one HOLE
+             * when the next mapped block appears, and the post-walk pad
+             * covers a file that ENDS in holes */
+            continue;
         }
         if (emit_run(e, lb, ptr, 1u) != 0) {
             return -1;
@@ -491,6 +564,7 @@ static int map_inode(ext_vol_t *v, const uint8_t ino[IN_CORE], int is_dir, hype_
         return 0;
     }
     e.out = out;
+    e.rout = 0; /* legacy physical-only contract: holes refuse */
     e.v = v;
     e.next_logical = 0;
     e.total_blocks = (out->size_bytes + v->block_size - 1u) / v->block_size;
@@ -506,6 +580,65 @@ static int map_inode(ext_vol_t *v, const uint8_t ino[IN_CORE], int is_dir, hype_
     }
     /* Every file block must have been mapped: a short map is a hole at EOF. */
     return (e.next_logical == e.total_blocks) ? 0 : -1;
+}
+
+/*
+ * #384: as map_inode, but into the sparse-aware #381 contract: classic-map
+ * and extent holes become HOLE ranges, unwritten extents become UNWRITTEN,
+ * and a file that simply ENDS in a hole gets a trailing HOLE pad. The final
+ * partial block's slack sectors are trimmed so the map covers exactly
+ * ceil(size / 512) sectors.
+ */
+static int map_inode_rmap(ext_vol_t *v, const uint8_t ino[IN_CORE], hype_file_rmap_t *out) {
+    uint32_t flags = hype_rd32(ino + IN_FLAGS);
+    emit_t e;
+
+    hype_file_rmap_init(out, inode_file_size(ino, 0));
+    if (flags & FL_INLINE) {
+        return -1; /* data inside the inode: not addressable on media */
+    }
+    if (out->size_bytes == 0u) {
+        return 0;
+    }
+    e.out = 0;
+    e.rout = out;
+    e.v = v;
+    e.next_logical = 0;
+    e.total_blocks = (out->size_bytes + v->block_size - 1u) / v->block_size;
+    if (flags & FL_EXTENTS) {
+        if (walk_extents(v, ino + IN_BLOCK, 60u, &e) != 0) {
+            return -1;
+        }
+    } else {
+        ind_scratch_t scratch;
+        if (walk_indirect(v, ino + IN_BLOCK, &scratch, &e) != 0) {
+            return -1;
+        }
+    }
+    /* a file ending in a hole: pad the tail */
+    if (e.next_logical < e.total_blocks) {
+        if (hype_file_rmap_append(out, HYPE_RANGE_HOLE, 0,
+                                  (e.total_blocks - e.next_logical) * v->spb) != 0) {
+            return -1;
+        }
+    }
+    /* trim block-tail slack down to exactly ceil(size/512) sectors */
+    {
+        uint64_t need = (out->size_bytes + SECSZ - 1u) / SECSZ;
+        uint64_t covered = 0;
+        unsigned r;
+        for (r = 0; r < out->count; r++) {
+            if (covered >= need) {
+                out->count = r;
+                break;
+            }
+            if (covered + out->ranges[r].sector_count > need) {
+                out->ranges[r].sector_count = need - covered;
+            }
+            covered += out->ranges[r].sector_count;
+        }
+    }
+    return hype_file_rmap_validate(out, v->blocks_count * v->spb);
 }
 
 /* ---- directories ---- */
@@ -579,20 +712,13 @@ static int dir_search(ext_vol_t *v, const uint8_t dino[IN_CORE], const char *nam
 
 /* ---- path resolution ---- */
 
-int hype_ext_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_file_map_t *out) {
-    /* #366: cleared at ENTRY, before any early return, so a failure that never reaches the extent
-     * walk cannot inherit the previous call's reason. Same rule as hype_fat32_resolve. */
-    if (out != 0) {
-        out->too_fragmented = 0;
-    }
-    ext_vol_t v;
-    uint8_t ino[IN_CORE];
+/* Walks `path` to its final REGULAR-file inode. Fills ino[] and, when
+ * out_ino is non-NULL, the inode number. Shared by every resolver flavour. */
+static int resolve_inode(ext_vol_t *v, const char *path, uint8_t ino[IN_CORE],
+                         uint32_t *out_ino) {
     unsigned int pos = 0;
 
-    if (vol_open(read, ctx, &v) != 0) {
-        return -1;
-    }
-    if (inode_read(&v, 2u, ino) != 0) { /* the root directory is always inode 2 */
+    if (inode_read(v, 2u, ino) != 0) { /* the root directory is always inode 2 */
         return -1;
     }
     if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_DIR) {
@@ -623,22 +749,90 @@ int hype_ext_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_fi
             }
             last = (path[peek] == '\0') ? 1 : 0;
         }
-        if (dir_search(&v, ino, comp, n, &next) != 1) {
+        if (dir_search(v, ino, comp, n, &next) != 1) {
             return -1;
         }
-        if (inode_read(&v, next, ino) != 0) {
+        if (inode_read(v, next, ino) != 0) {
             return -1;
         }
         if (last) {
             if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_REG) {
                 return -1; /* directories and symlinks are not stream targets */
             }
-            return map_inode(&v, ino, 0, out);
+            if (out_ino != 0) {
+                *out_ino = next;
+            }
+            return 0;
         }
         if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_DIR) {
             return -1; /* a non-final component must be a directory */
         }
     }
+}
+
+int hype_ext_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_file_map_t *out) {
+    /* #366: cleared at ENTRY, before any early return, so a failure that never reaches the extent
+     * walk cannot inherit the previous call's reason. Same rule as hype_fat32_resolve. */
+    if (out != 0) {
+        out->too_fragmented = 0;
+    }
+    ext_vol_t v;
+    uint8_t ino[IN_CORE];
+
+    if (vol_open(read, ctx, &v) != 0) {
+        return -1;
+    }
+    if (resolve_inode(&v, path, ino, 0) != 0) {
+        return -1;
+    }
+    return map_inode(&v, ino, 0, out);
+}
+
+int hype_ext_resolve_rmap(hype_blk_read_fn read, void *ctx, const char *path,
+                          hype_file_rmap_t *out) {
+    ext_vol_t v;
+    uint8_t ino[IN_CORE];
+
+    if (out != 0) {
+        out->too_fragmented = 0;
+    }
+    if (vol_open(read, ctx, &v) != 0) {
+        return -1;
+    }
+    if (resolve_inode(&v, path, ino, 0) != 0) {
+        return -1;
+    }
+    return map_inode_rmap(&v, ino, out);
+}
+
+/* #384: the inode NUMBER behind a path, for the ext2 writer's metadata
+ * updates. Same walk, same refusals. */
+int hype_ext_resolve_ino(hype_blk_read_fn read, void *ctx, const char *path, uint32_t *out_ino) {
+    ext_vol_t v;
+    uint8_t ino[IN_CORE];
+    if (vol_open(read, ctx, &v) != 0) {
+        return -1;
+    }
+    return resolve_inode(&v, path, ino, out_ino);
+}
+
+/* #384: re-derive an inode's sparse map straight from its (just-committed)
+ * on-disk state, so the allocating writer can refresh its handle without a
+ * path re-walk. */
+int hype_ext_map_ino_rmap(hype_blk_read_fn read, void *ctx, uint32_t ino_no,
+                          hype_file_rmap_t *out) {
+    ext_vol_t v;
+    uint8_t ino[IN_CORE];
+    if (vol_open(read, ctx, &v) != 0) {
+        return -1;
+    }
+    if (inode_read(&v, ino_no, ino) != 0) {
+        return -1;
+    }
+    if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_REG) {
+        return -1;
+    }
+    return map_inode_rmap(&v, ino, out);
 }
 
 /*

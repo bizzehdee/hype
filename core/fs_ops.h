@@ -30,8 +30,9 @@
  *   FAT32    read + create/append + namespace + random write_at (#382):
  *            in-place inside the size, allocate-and-zero-fill growth past it.
  *   exFAT    read + full mutation + IN-PLACE write_at (never grows/moves).
- *   ext      read + IN-PLACE write_at on a cleanly-unmounted volume; no
- *            namespace mutation (#384/#385 add allocation).
+ *   ext      sparse-aware read (#384: holes/unwritten read as zeros);
+ *            write_at in place, plus HOLE-FILLING allocation on ext2
+ *            volumes (journaled allocation is #385); no namespace mutation.
  *   NTFS     read (sparse runs read as zeroes) + IN-PLACE write_at into
  *            DATA ranges only; a write into a HOLE or UNWRITTEN range is
  *            refused (#337, plan.md §10 decision 30). No mutation beyond
@@ -55,7 +56,7 @@
 #define HYPE_FS_CAP_APPEND 0x04u        /* append, growing the allocation */
 #define HYPE_FS_CAP_NAMESPACE 0x08u     /* create/unlink/mkdir/rmdir/rename */
 #define HYPE_FS_CAP_WRITE_GROW 0x10u    /* write_at past EOF allocates (FAT32 via #382) */
-#define HYPE_FS_CAP_SPARSE 0x20u        /* may emit HOLE/UNWRITTEN ranges (NTFS via #337) */
+#define HYPE_FS_CAP_SPARSE 0x20u        /* may emit HOLE/UNWRITTEN ranges (NTFS #337, ext #384) */
 
 typedef struct hype_fs hype_fs_t;
 typedef struct hype_fs_file hype_fs_file_t;
@@ -132,6 +133,7 @@ struct hype_fs_file {
         hype_fat32_wfile_t fat32; /* FAT32 create/append handle */
         hype_exfat_wfile_t exfat;
         hype_ext_wfile_t ext;     /* ext in-place read/write handle */
+        hype_ext2_wfile_t ext2;   /* #384 allocating ext2 writer handle */
         hype_file_rmap_t rmap;    /* generic read-only handle (#381 contract) */
     } u;
 };

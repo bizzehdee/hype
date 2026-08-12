@@ -3,7 +3,8 @@
 
 #include <stdint.h>
 
-#include "blk_io.h" /* the shared block I/O + file-map contract (#292) */
+#include "blk_io.h"     /* the shared block I/O + file-map contract (#292) */
+#include "file_range.h" /* the sparse-aware logical range contract (#381) */
 
 /*
  * #203 (STORAGE: ext2/3/4 host filesystem READ) -- the ext counterpart of the
@@ -105,5 +106,81 @@ int hype_ext_write_at(hype_ext_wfile_t *f, uint64_t offset, const void *data, un
 
 /* Reads `len` bytes at byte `offset`. Bounds-checked exactly as above. */
 int hype_ext_read_at(hype_ext_wfile_t *f, uint64_t offset, void *out, unsigned int len);
+
+/*
+ * #384: as hype_ext_resolve, but into the sparse-aware #381 contract.
+ * Classic-map holes (at every indirection level, including whole missing
+ * indirect trees and a file that ends in a hole) become HOLE ranges; ext4
+ * unwritten extents become UNWRITTEN ranges. Both read as zeros through
+ * hype_file_rmap_read_at. The refusal list otherwise matches the legacy
+ * resolver (unsupported features, INCOMPAT_RECOVER, inline data, ...).
+ */
+int hype_ext_resolve_rmap(hype_blk_read_fn read, void *ctx, const char *path,
+                          hype_file_rmap_t *out);
+
+/* #384 support helpers for the ext2 writer: the inode number behind a path,
+ * and an inode's sparse map re-derived from its current on-disk state. */
+int hype_ext_resolve_ino(hype_blk_read_fn read, void *ctx, const char *path, uint32_t *out_ino);
+int hype_ext_map_ino_rmap(hype_blk_read_fn read, void *ctx, uint32_t ino_no,
+                          hype_file_rmap_t *out);
+
+/*
+ * #384: the ext2 allocating writer (core/ext2_alloc.c) -- persist guest
+ * writes into a sparse backing file on an EXT2 volume, allocating blocks
+ * when a write reaches a hole. plan.md §10 decision 29's ext2 arm: ordered
+ * direct metadata updates while the volume is marked dirty; ext3/4
+ * allocation needs jbd2 and is #385.
+ *
+ * Gates at open: ext2 ONLY (any journal -> refuse; that is #385's work),
+ * cleanly unmounted (s_state VALID and not ERROR), no RO_COMPAT feature
+ * beyond SPARSE_SUPER/LARGE_FILE (a checksummed volume must not be written
+ * by code that does not maintain its checksums), classic block map (an
+ * extent-mapped file is refused), 32-bit block numbers.
+ *
+ * Ordering per write (decision 29): superblock marked dirty -> block claimed
+ * in the bitmap + group/superblock free counts -> content (zeros + data)
+ * written to the block -> the POINTER exposing it published last (a fresh
+ * pointer block is zeroed on media before its parent references it) -> inode
+ * (roots, i_blocks, optional times) -> superblock restored clean. A failure
+ * mid-way rolls the claims and hooks back; a failure DURING rollback leaves
+ * the volume marked dirty, honestly.
+ */
+typedef struct {
+    hype_blk_read_fn read;
+    hype_blk_write_fn write;
+    void *ctx;
+    uint32_t block_size;
+    uint32_t spb;
+    uint64_t blocks_count;
+    uint32_t blocks_per_group;
+    uint32_t first_data_block;
+    uint32_t groups;
+    uint32_t ino;
+    uint64_t inode_byte;  /* media byte offset of the inode structure */
+    uint64_t size_bytes;
+    uint32_t mtime;       /* stamped into i_mtime/i_ctime on commit; 0 = leave */
+    hype_file_rmap_t map; /* the file's CURRENT ranges (refreshed after allocation) */
+} hype_ext2_wfile_t;
+
+int hype_ext2_open_rw(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
+                      const char *path, hype_ext2_wfile_t *out);
+
+/* Unix-epoch timestamp for subsequent commits' i_mtime/i_ctime. */
+void hype_ext2_set_time(hype_ext2_wfile_t *f, uint32_t unix_seconds);
+
+/* Reads `len` bytes at `offset`: holes read as zeros. Bounds-checked. */
+int hype_ext2_read_at(hype_ext2_wfile_t *f, uint64_t offset, void *out, unsigned int len);
+
+/*
+ * Writes `len` bytes at `offset`, allocating blocks (and any missing
+ * indirection blocks) where the span crosses holes. The range must lie
+ * wholly inside the file -- this writer changes a file's SHAPE, never its
+ * size. Newly allocated blocks are zero-filled around the written bytes
+ * before the pointer publishing them lands. Returns 0, -1 on error, a full
+ * volume (rolled back; file unchanged), or a span needing more than the
+ * per-call allocation bound.
+ */
+int hype_ext2_write_at(hype_ext2_wfile_t *f, uint64_t offset, const void *data,
+                       unsigned int len);
 
 #endif /* HYPE_CORE_EXT_H */
