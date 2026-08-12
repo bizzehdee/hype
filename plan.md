@@ -1260,46 +1260,65 @@ isn't lost.
     writer-specific exceptions: every caller would then need filesystem
     knowledge, defeating #293 and recreating inconsistent bounds behavior.
 
-30. **Host NTFS support (#337) — decided: read + in-place write only, as the
-    fifth `hype_fs_ops_t` driver.** NTFS runlists map directly onto the
-    decision-29 logical range contract: an allocated run is `DATA`, a sparse
-    run (no LCN) is `HOLE` and reads as zeroes. No new abstraction is needed,
-    which is what makes the scope proportionate.
-    - **In-place only.** Writes land only inside already-allocated `DATA`
-      ranges of an existing, non-resident, uncompressed, unencrypted `$DATA`
-      stream. A write aimed at a `HOLE` is refused through the #293 writer
-      capability flags, never a silent short write. Growing a file, hole
-      allocation, creating files/directories, `$Bitmap` updates, `$MFTMirr`
-      consistency and `$LogFile`/USN journaling are all out of scope — hype
-      needs none of them, and each would turn a resolver into a filesystem
-      writer with jbd2-class ordering obligations.
+30. **Host NTFS support (#337) — decided: FULL read/write, the fifth
+    `hype_fs_ops_t` driver.**
+
+    > **Revised (supersedes the original read + in-place-write-only scope).**
+    > The first cut (#337, landed) shipped read + in-place write only, on the
+    > reasoning that growth/allocation would turn the resolver into a full
+    > journaling writer (`$Bitmap` + runlist + `$MFT` rewrites, jbd2-class
+    > ordering) that hype did not then need. That scope is now lifted: NTFS is
+    > a first-class read/write filesystem, on par with the ext2/3/4 writer
+    > series. A read-only NTFS driver does not let hype own a Windows data
+    > disk, which is the point of supporting it. The engineering cost noted
+    > below is real and is why this is an epic of ordered slices, not the
+    > reason to avoid it. The original in-place driver is the correctness
+    > baseline the writer extends, not a competing design.
+
+    NTFS runlists map onto the decision-29 logical range contract: an
+    allocated run is `DATA`, a sparse run (no LCN) is `HOLE` reading as zeroes.
+    The read model and the in-place writer are unchanged and stay the base.
+
+    - **Full writer scope (the new work):** append/grow a `$DATA` stream;
+      allocate into a `HOLE` (sparse fill) and advance initialized size;
+      create / unlink files, mkdir / rmdir, rename; `$Bitmap` cluster
+      allocation and release; `$MFT`/`$MFTMirr` record allocation and mirror
+      consistency; and `$LogFile`/USN journal maintenance so the volume stays
+      recoverable by Windows' own chkdsk. Each mutation is ordered so a crash
+      leaves either the old state or a chkdsk-repairable one — never readable
+      stale bytes — the same discipline the ext3/4 jbd2 writer proved
+      (decision 29's fault-sweep-per-crash-point method applies verbatim).
+    - **Dirty volumes are supported, not refused.** A dirty NTFS volume has
+      pending `$LogFile` transactions from an unclean Windows unmount
+      (fast-startup, hibernation, or a crash). The writer must process
+      `$LogFile` — replay/rollback to a consistent state — before mounting
+      writable, and maintain it on every mutation, exactly as a real NTFS
+      driver does. (Read-only mounting of a dirty volume without touching
+      `$LogFile` remains available as the conservative path.)
     - **Fixups are mandatory and verified.** Every MFT record and INDX block
       has its update sequence array checked and un-applied before any field is
-      trusted; a fixup mismatch is a hard refusal (torn write), not a warning.
-      Getting this wrong reads plausible garbage, so it carries dedicated
-      tests.
-    - **Refusals.** Dirty volume (Windows fast startup and hibernation leave
-      this set routinely — the common case, same discipline as ext's
-      `INCOMPAT_RECOVER` refusal); compressed (LZNT1) or encrypted `$DATA`;
-      resident `$DATA` is read-only (its bytes live inside the MFT record,
-      which hype does not rewrite); a name whose case folding falls outside
-      the cached `$UpCase` prefix (the decision-24 exFAT rule: fold names
-      exactly as other implementations do, or not at all — first 256 code
-      points cached after validating the table; 256 code points, matching the exFAT cache).
-    - **BitLocker is explicitly and permanently out of scope.** A BitLocker
-      volume is a container, not NTFS; the only supported behaviour is
-      detecting one and refusing it. This matters concretely: the Intel test
-      box's only internal NVMe is a BitLocker Windows install, so the
-      `physical:` destructive-write guard (§6d) interaction is: an NTFS write
-      path can only ever be enabled on a volume that (a) mounted writable
-      through this driver's own gates and (b) sits behind the same
-      serial/GUID + interactive confirmation chain as every physical target.
+      trusted, and re-applied on write; a fixup mismatch is a hard refusal
+      (torn write). Getting this wrong reads plausible garbage, so it carries
+      dedicated tests.
+    - **Still refused:** compressed (LZNT1) or encrypted (EFS) `$DATA` —
+      writing these needs the compression/encryption codecs, a separate body
+      of work not in this scope; resident `$DATA` grows by conversion to
+      non-resident (an explicit writer step) rather than rewriting bytes in
+      place inside the MFT record.
+    - **BitLocker stays out — it is not NTFS.** A BitLocker volume is an
+      encrypted container; the only supported behaviour is detecting and
+      refusing it (the Intel box's internal NVMe is one). Every NTFS write
+      still sits behind the §6d `physical:` chain: a volume mounts writable
+      only through this driver's own gates AND the serial/GUID + interactive
+      confirmation every physical target requires.
 
     Rejected ZFS alongside this: 128 KB compressed records with multiple DVAs
     cannot be expressed as a flat logical range map, so it would need a second
-    read model. Rejected write support for compressed/sparse allocation: it
-    requires `$Bitmap` + runlist + possibly `$MFT` rewrites, i.e. the full
-    writer hype deliberately does not have.
+    read model — out of scope. Validation mirrors the ext writer: mkfs.ntfs /
+    Windows-created volumes populated through the real `ntfs-3g`/Windows
+    driver, every writer path fault-swept per crash point, and `chkdsk`
+    (or `ntfsfix`/`ntfsck`) clean plus a Windows/ntfs-3g remount reading back
+    byte-exactly after every operation.
 
 31. **Multiple USB mass-storage devices — decided: additional USB disks are
     claimable as media-only devices, behind per-device transfer rings.**
