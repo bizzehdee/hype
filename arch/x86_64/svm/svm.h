@@ -762,6 +762,9 @@ uint64_t hype_svm_vcpu_get_gpr(hype_vcpu_ctx_t *ctx, unsigned idx);
  */
 int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx);
 
+/* M7-1b (#300): service an intercepted Hyper-V VMMCALL and retire it. */
+int hype_svm_vcpu_handle_hypercall(hype_vcpu_ctx_t *ctx);
+
 /* PVCLOCK (kvmclock): register the guest-memory map (for reaching the pvclock
  * pages) and the host TSC frequency, so the KVM SYSTEM_TIME/WALL_CLOCK MSR
  * writes can fill the guest's pvclock pages. Call once before running the

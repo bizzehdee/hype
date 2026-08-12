@@ -235,9 +235,9 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  * on those ticks. SKINIT is a secure-init primitive; VMLOAD/VMSAVE load and store a block of
  * segment and MSR state from an address in RAX.
  *
- * Bit numbers from APM Table B-1 (VMCB control area, offset 010h). VMMCALL is bit 1 and is
- * deliberately NOT here: it is the hypercall instruction, and servicing it is #300's design
- * work -- intercepting it without a handler would only change which way a Windows guest fails.
+ * Bit numbers from APM Table B-1 (VMCB control area, offset 010h). VMMCALL is
+ * separate below because it is a serviced guest interface, not an instruction
+ * that hype hides from the guest.
  */
 #define HYPE_SVM_INTERCEPT_VMLOAD (1u << 2)
 #define HYPE_SVM_INTERCEPT_VMSAVE (1u << 3)
@@ -254,6 +254,9 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 #define HYPE_SVM_INTERCEPT_SVM_INSNS                                                              \
     (HYPE_SVM_INTERCEPT_VMRUN | HYPE_SVM_INTERCEPT_VMLOAD | HYPE_SVM_INTERCEPT_VMSAVE |           \
      HYPE_SVM_INTERCEPT_STGI | HYPE_SVM_INTERCEPT_CLGI | HYPE_SVM_INTERCEPT_SKINIT)
+
+/* M7-1b (#300): route the Hyper-V page's VMMCALL through the dispatcher. */
+#define HYPE_SVM_INTERCEPT_VMMCALL (1u << 1)
 
 /* intercept_misc1 bit 26: INVLPGA, the remaining SVM instruction, which lives in the other
  * intercept word (APM Table B-1, offset 00Ch). Same reasoning as the five above. */
@@ -386,6 +389,7 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  */
 #define HYPE_SVM_EXITCODE_INVLPGA 0x7AULL
 #define HYPE_SVM_EXITCODE_VMRUN_INSN 0x80ULL
+#define HYPE_SVM_EXITCODE_VMMCALL 0x81ULL
 #define HYPE_SVM_EXITCODE_VMLOAD 0x82ULL
 #define HYPE_SVM_EXITCODE_VMSAVE 0x83ULL
 #define HYPE_SVM_EXITCODE_STGI 0x84ULL

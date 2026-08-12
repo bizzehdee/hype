@@ -1,5 +1,6 @@
 #include "svm.h"
 #include "../cpu/fpu_state.h"
+#include "../cpu/hyperv.h"
 
 #include "../../../core/guest_mem.h"
 
@@ -1603,21 +1604,36 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     switch (action) {
     /*
      * M7-1 (#91): Hyper-V synthetic MSRs. Only reachable when the Hyper-V CPUID
-     * leaves are enabled -- hype_msr_decide() gates them on that, so a Linux guest
+     * leaves are enabled -- hype_msr_decide_ex() gates them on that, so a Linux guest
      * still gets the fail-closed absorb here.
      */
     case HYPE_MSR_ACTION_READWRITE_HV_GUEST_OS_ID:
-    case HYPE_MSR_ACTION_READWRITE_HV_HYPERCALL: {
-        uint64_t *slot = (action == HYPE_MSR_ACTION_READWRITE_HV_GUEST_OS_ID)
-                             ? &real->hv_guest_os_id
-                             : &real->hv_hypercall;
         if (is_write) {
-            *slot = (((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax);
+            real->hv_guest_os_id = (((uint64_t)(uint32_t)real->gprs[2] << 32) |
+                                    (uint64_t)(uint32_t)real->vmcb->save.rax);
+            if (real->hv_guest_os_id == 0u) {
+                real->hv_hypercall = hype_hv_hypercall_disable(real->hv_hypercall);
+            }
         } else {
-            svm_msr_return(real, *slot);
+            svm_msr_return(real, real->hv_guest_os_id);
         }
         break;
-    }
+    case HYPE_MSR_ACTION_READWRITE_HV_HYPERCALL:
+        if (is_write) {
+            uint64_t requested = (((uint64_t)(uint32_t)real->gprs[2] << 32) |
+                                  (uint64_t)(uint32_t)real->vmcb->save.rax);
+            uint64_t effective;
+            if (hype_hv_hypercall_page_write(real->hv_hypercall, requested,
+                                             real->hv_guest_os_id, real->pvclock_map,
+                                             HYPE_HV_HYPERCALL_VENDOR_SVM, &effective) != 0) {
+                /* The caller injects #GP(0) at this WRMSR. */
+                return 1;
+            }
+            real->hv_hypercall = effective;
+        } else {
+            svm_msr_return(real, real->hv_hypercall);
+        }
+        break;
     case HYPE_MSR_ACTION_READ_HV_VP_INDEX:
         /*
          * Always 0. hype gives each guest exactly one vCPU, so this guest IS
@@ -1738,6 +1754,22 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     }
 
     real->vmcb->save.rip += 2; /* RDMSR/WRMSR are always exactly 2 bytes (0F 32 / 0F 30) */
+    return 0;
+}
+
+int hype_svm_vcpu_handle_hypercall(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+
+    if (real == 0 || !real->hv_enabled ||
+        (real->hv_hypercall & HYPE_HV_HYPERCALL_ENABLE) == 0u) {
+        return -1;
+    }
+    real->vmcb->save.rax = hype_hv_hypercall_dispatch(real->gprs[1]);
+    if (real->vmcb->control.nrip > real->vmcb->save.rip) {
+        real->vmcb->save.rip = real->vmcb->control.nrip;
+    } else {
+        real->vmcb->save.rip += 3u; /* VMMCALL: 0F 01 D9 */
+    }
     return 0;
 }
 

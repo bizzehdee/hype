@@ -86,12 +86,9 @@ typedef enum {
      */
     HYPE_MSR_ACTION_READWRITE_HV_GUEST_OS_ID,
     /*
-     * Read/write the hypercall-page control MSR. The value is stored and returned,
-     * and the enable bit is honoured only to the extent of reading back what was
-     * written -- hype services no hypercalls (see #300). This is not a dead-feature
-     * advertisement: CPUID leaf 0x40000004 recommends ZERO enlightenments, so a
-     * conforming guest establishes the page and then has no reason to call through
-     * it.
+     * Read/write the hypercall-page control MSR. An enabled write installs the
+     * vendor-specific call stub into the guest page. CPUID leaf 0x40000004 remains
+     * zero because hype does not implement any recommended enlightenment calls.
      */
     HYPE_MSR_ACTION_READWRITE_HV_HYPERCALL,
     /* Read-only: the virtual processor index, which is hype's vCPU index. */

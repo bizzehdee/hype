@@ -88,6 +88,8 @@ static void test_build_realmode_guest(void) {
      */
     CHECK_HEX("every SVM instruction is intercepted", HYPE_SVM_INTERCEPT_SVM_INSNS,
               vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_SVM_INSNS);
+    CHECK_HEX("VMMCALL is intercepted", HYPE_SVM_INTERCEPT_VMMCALL,
+              vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_VMMCALL);
     CHECK_HEX("INVLPGA is intercepted", HYPE_SVM_INTERCEPT_INVLPGA,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_INVLPGA);
     CHECK_HEX("ASID is nonzero", 1, vmcb.control.guest_asid_tlb_ctl);
@@ -199,6 +201,8 @@ static void test_build_long_mode_guest(void) {
      */
     CHECK_HEX("every SVM instruction is intercepted", HYPE_SVM_INTERCEPT_SVM_INSNS,
               vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_SVM_INSNS);
+    CHECK_HEX("VMMCALL is intercepted", HYPE_SVM_INTERCEPT_VMMCALL,
+              vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_VMMCALL);
     CHECK_HEX("INVLPGA is intercepted", HYPE_SVM_INTERCEPT_INVLPGA,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_INVLPGA);
     CHECK_HEX("nested paging starts disabled (caller opts in)", 0, vmcb.control.np_enable);

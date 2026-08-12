@@ -126,9 +126,8 @@ int hype_cpuid_hv_leaf(uint32_t leaf, uint32_t vp_index, hype_cpuid_result_t *ou
         case 0x40000004u:
             /*
              * Recommended enlightenments. ALL ZERO deliberately: each bit tells Windows
-             * to REPLACE a native operation with a hypercall, and hype implements no
-             * hypercalls yet. Recommending one hype does not service would turn a
-             * working native path into a call into nothing.
+             * to replace a native operation with a specific hypercall. Hype services
+             * the call ABI but implements none of those enlightenment operations.
              */
             out->eax = 0u; out->ebx = 0u; out->ecx = 0u; out->edx = 0u;
             return 1;

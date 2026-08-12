@@ -95,6 +95,8 @@ uint32_t hype_vmx_vcpu_tlb_tag(hype_vcpu_ctx_t *ctx);
  * (31); returns 0 if handled, -1 to reject. */
 void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
 int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write);
+/* M7-1b (#300): service an intercepted Hyper-V VMCALL and retire it. */
+int hype_vmx_vcpu_handle_hypercall(hype_vcpu_ctx_t *ctx);
 /* set_rsi seeds guest RSI before entry (Linux zero-page ptr, m3-5). handle_ioio
  * emulates a port-I/O exit (reason 30) against the PIC/PIT models. */
 void hype_vmx_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi);

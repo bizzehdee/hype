@@ -405,6 +405,7 @@
 #define HYPE_VMX_EXIT_REASON_INTERRUPT_WINDOW 7u
 #define HYPE_VMX_EXIT_REASON_CPUID 10u
 #define HYPE_VMX_EXIT_REASON_HLT 12u
+#define HYPE_VMX_EXIT_REASON_VMCALL 18u
 #define HYPE_VMX_EXIT_REASON_WBINVD 54u
 
 /* Retires an intercepted guest WBINVD without flushing any real cache, and counts it. */
