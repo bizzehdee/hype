@@ -800,7 +800,7 @@ typedef struct hype_fw_vm {
  * alignment from the linker, but AllocatePool does not, and a misaligned NPT
  * root makes the guest fault on every access. AllocatePages gives a page-aligned
  * base, and sizeof(hype_fw_vm_t) is a whole number of pages, so every element is
- * aligned. Sized to HYPE_FW_MAX_VMS for now; the dynamic count is the next step. */
+ * aligned. Sized to g_vm_count for now; the dynamic count is the next step. */
 static hype_fw_vm_t *g_vms;
 static unsigned g_vm_count = HYPE_FW_MAX_VMS;
 #define FW_1_LINE_BUF_FS 256u /* #394: file-scope twin of FW_1_LINE_BUF */
@@ -922,7 +922,7 @@ static void fw_1_phase_checkpoint(hype_fw_vm_t *vm, unsigned phase) {
     uint64_t now;
     uint64_t delta;
 
-    if (vi >= HYPE_FW_MAX_VMS || phase >= HYPE_FW_PHASE_DISPATCH ||
+    if (vi >= g_vm_count || phase >= HYPE_FW_PHASE_DISPATCH ||
         g_fw_phase_mark_tsc[vi] == 0) {
         return;
     }
@@ -1022,7 +1022,7 @@ static void hype_term_apply_chord(hype_chord_result_t cr) {
         case HYPE_CHORD_ACTION_JUMP_TO_VM:
             /* chord vm_index is 1-based (leader+1 => VM #1 => g_vms[0]). */
             action = HYPE_TERM_FOCUS_JUMP;
-            jump = cr.vm_index >= 1u ? cr.vm_index - 1u : HYPE_TERM_NVMS;
+            jump = cr.vm_index >= 1u ? cr.vm_index - 1u : g_vm_count;
             break;
         case HYPE_CHORD_ACTION_TOGGLE_DASHBOARD:
             action = HYPE_TERM_FOCUS_TOGGLE_DASHBOARD;
@@ -1030,7 +1030,7 @@ static void hype_term_apply_chord(hype_chord_result_t cr) {
         default:
             break;
     }
-    g_term_view = hype_term_focus_apply(g_term_view, action, jump, ready, HYPE_TERM_NVMS);
+    g_term_view = hype_term_focus_apply(g_term_view, action, jump, ready, g_vm_count);
     /*
      * #363: say on the durable channel which view the operator switched to.
      *
@@ -1451,12 +1451,12 @@ static int term_streq(const char *a, const char *b) {
  * or -1 if it names no known VM. */
 static int term_resolve_vm(const char *arg) {
     if (!arg || !arg[0]) return -1;
-    for (int i = 0; i < HYPE_TERM_NVMS; i++) {
+    for (int i = 0; i < g_vm_count; i++) {
         if (g_vms[i].name && term_streq(arg, g_vms[i].name)) return i;
     }
     if (arg[1] == '\0' && arg[0] >= '1' && arg[0] <= '9') {
         int k = arg[0] - '1';
-        if (k < HYPE_TERM_NVMS) return k;
+        if (k < g_vm_count) return k;
     }
     return -1;
 }
@@ -1480,7 +1480,7 @@ static void term_run_cmdline(void) {
             break;
         case HYPE_CMD_LIST:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%u VM(s) -- see table above",
-                          (unsigned)HYPE_TERM_NVMS);
+                          (unsigned)g_vm_count);
             break;
         case HYPE_CMD_STATUS:
             if (idx < 0) {
@@ -1531,7 +1531,7 @@ static void term_run_cmdline(void) {
             }
             if (hype_term_focus_validate(
                     idx, __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE),
-                    HYPE_TERM_NVMS) < 0) {
+                    g_vm_count) < 0) {
                 hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
                               "focus: %s is unavailable (vCPU not dispatched)", nm);
             } else {
@@ -1773,7 +1773,7 @@ static int fw_1_ap_apic_id(unsigned int n) {
      * zero; CPUID repair above is now required before this selector can classify its SMT siblings.
      * Selection has to come from the topology, never from the order firmware reports.
      */
-    nsel = hype_cpu_topology_select_isolated(&g_cpu_topo, HYPE_FW_MAX_VMS, sel, HYPE_FW_MAX_VMS);
+    nsel = hype_cpu_topology_select_isolated(&g_cpu_topo, g_vm_count, sel, g_vm_count);
     if (n >= (unsigned int)nsel) {
         /* Either enumeration says there is no such core, or there are not enough distinct
          * physical cores to place this vCPU without doubling up. Refuse and let the caller say
@@ -1798,7 +1798,7 @@ static int fw_1_ap_apic_id(unsigned int n) {
  * array index, which only worked while IDs were assumed to be 0,1,2. */
 static int fw_1_ap_slot_of(uint32_t apic_id) {
     unsigned i;
-    for (i = 0; i < HYPE_FW_MAX_VMS; i++) {
+    for (i = 0; i < g_vm_count; i++) {
         if (g_ap_slot_valid[i] && g_ap_slot_apic_id[i] == (uint8_t)apic_id) return (int)i;
     }
     return -1;
@@ -1835,7 +1835,7 @@ static void fw_1_ap_main(void *arg) {
      * g_vms[1] on AP2). Selects this core's guest, its own SVM host-save area,
      * and (below) its host_tsc_hz for the LAPIC-timer calibration. */
     unsigned vm_idx = (unsigned)(uintptr_t)arg;
-    if (vm_idx >= HYPE_FW_MAX_VMS) {
+    if (vm_idx >= g_vm_count) {
         vm_idx = 0u;
     }
     /*
@@ -8058,7 +8058,7 @@ static void fw_1_render_console(void) {
     view = g_term_view;
     {
         unsigned int ready = __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE);
-        if (view >= 0 && hype_term_focus_validate(view, ready, HYPE_TERM_NVMS) < 0) {
+        if (view >= 0 && hype_term_focus_validate(view, ready, g_vm_count) < 0) {
             hype_debug_print("fw-1 VIEWSWITCH: refusing unavailable vm%d; returning to dashboard "
                              "[#379]\n", view);
             g_term_view = -1;
@@ -8110,7 +8110,7 @@ static void fw_1_render_console(void) {
             last_foreign = foreign;
             hype_vt_render_cache_invalidate(&g_dash_render_cache);
             hype_render_budget_reset(&g_dash_render_budget);
-            for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+            for (vi = 0; vi < g_vm_count; vi++) {
                 hype_vt_render_cache_invalidate(&g_view_render_cache[vi]);
                 hype_render_budget_reset(&g_view_render_budget[vi]);
             }
@@ -8201,7 +8201,7 @@ static void fw_1_render_console(void) {
         }
     } else { /* dashboard view (-1) */
         hype_vm_dash_info_t *info = g_dash_info;
-        unsigned ninfo = HYPE_TERM_NVMS;
+        unsigned ninfo = g_vm_count;
         for (unsigned i = 0; i < ninfo; i++) {
             unsigned int ready_mask =
                 __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE);
@@ -10222,7 +10222,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * before rendering or routing input to the VM. */
     {
         unsigned int ready_index = (unsigned int)(vm - g_vms);
-        if (ready_index < HYPE_FW_MAX_VMS) {
+        if (ready_index < g_vm_count) {
             __atomic_fetch_or(&g_vm_runtime_ready_mask, 1u << ready_index, __ATOMIC_RELEASE);
         }
     }
@@ -10372,7 +10372,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 g_fw_1_body_tsc += body_delta;
                 /* Everything not consumed by the three explicit checkpoints is
                  * the reason-specific handler plus the next loop's short head. */
-                if (vi < HYPE_FW_MAX_VMS &&
+                if (vi < g_vm_count &&
                     body_delta >= g_fw_phase_accounted_tsc[vi]) {
                     g_fw_phase_total_tsc[vi][HYPE_FW_PHASE_DISPATCH] +=
                         body_delta - g_fw_phase_accounted_tsc[vi];
@@ -10408,7 +10408,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 g_fw_1_prev_post_tsc = t_post;
                 {
                     unsigned vi = (unsigned)(vm - g_vms);
-                    if (vi < HYPE_FW_MAX_VMS) {
+                    if (vi < g_vm_count) {
                         g_fw_phase_mark_tsc[vi] = t_post;
                         g_fw_phase_accounted_tsc[vi] = 0;
                     }
@@ -10692,7 +10692,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         unsigned n;
                         unsigned vidx = (unsigned)(vm - g_vms);
                         const unsigned long long *hist =
-                            g_ahci_reg_hist[(vidx < HYPE_FW_MAX_VMS) ? vidx : 0u];
+                            g_ahci_reg_hist[(vidx < g_vm_count) ? vidx : 0u];
                         for (n = 0; n < 4u; n++) {
                             unsigned long long best = 0;
                             unsigned besti = 0xFFFFu;
@@ -10715,7 +10715,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             "[#364]\n",
                             vidx, top[0] * 4u, hist[top[0]], top[1] * 4u, hist[top[1]],
                             top[2] * 4u, hist[top[2]], top[3] * 4u, hist[top[3]],
-                            g_ahci_reg_other[(vidx < HYPE_FW_MAX_VMS) ? vidx : 0u],
+                            g_ahci_reg_other[(vidx < g_vm_count) ? vidx : 0u],
                             (unsigned)g_fw_1_ahci.ghc, (unsigned)g_fw_1_ahci.is,
                             (unsigned)g_fw_1_ahci.p_is, (unsigned)g_fw_1_ahci.p_ie,
                             (unsigned)g_fw_1_ahci.p_cmd, (unsigned)g_fw_1_ahci.p_tfd,
@@ -10969,7 +10969,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                     {
                         unsigned vi = (unsigned)(vm - g_vms);
-                        if (vi < HYPE_FW_MAX_VMS) {
+                        if (vi < g_vm_count) {
                             hype_debug_print(
                                 "fw-1 LOOPPHASE: diag=%llums persist=%llums house=%llums "
                                 "dispatch=%llums [#365]\n",
@@ -12717,7 +12717,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          * declines it. */
                         uint64_t off = ahci_npf.guest_phys_addr - ahci_abar;
                         unsigned vidx = (unsigned)(vm - g_vms);
-                        if (vidx < HYPE_FW_MAX_VMS) {
+                        if (vidx < g_vm_count) {
                             if (off < 0x180u) {
                                 g_ahci_reg_hist[vidx][off / 4u]++;
                             } else {
@@ -12750,7 +12750,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                            &g_fw_1_dma_map, insn) == 0) {
                         {
                             unsigned vidx2 = (unsigned)(vm - g_vms);
-                            if (vidx2 < HYPE_FW_MAX_VMS) {
+                            if (vidx2 < g_vm_count) {
                                 uint64_t woff = ahci_npf.guest_phys_addr - ahci_abar;
                                 /* A command issue (PxCI write) or a start/stop transition, with
                                  * the completion state the driver will poll. Separate budget from
@@ -15329,11 +15329,11 @@ static void fw_1_watchdog_observe(hype_fw_vm_t *vm, unsigned vm_index, uint64_t 
 /* Feed one guest console byte to this VM's runner and keep the failure-context tail. */
 static void fw_1_script_feed(hype_fw_vm_t *vm, uint8_t byte) {
     unsigned vi = (unsigned)(vm - g_vms);
-    if (vi < HYPE_FW_MAX_VMS) g_script_seen[vi]++;
+    if (vi < g_vm_count) g_script_seen[vi]++;
     if (!vm->in_script_armed) {
         return;
     }
-    if (vi < HYPE_FW_MAX_VMS) {
+    if (vi < g_vm_count) {
         /* #302: the periodic sample is ~30s apart, which is far too coarse to say whether feeding
          * had STARTED when a given pattern went past -- the whole question. One line at the first
          * fed byte places it exactly, against the log's own ordering. */
@@ -15951,7 +15951,7 @@ static void split_log_setup(void) {
     unsigned int i;
     int rc;
 
-    for (i = 0; i < HYPE_FW_MAX_VMS; i++) {
+    for (i = 0; i < g_vm_count; i++) {
         const char *cfg_name = (i < g_hype_cfg.vm_count) ? g_hype_cfg.vms[i].name : 0;
         vm_log_name(i, cfg_name, name, sizeof(name));
         rc = hype_log_sink_open_shared_ordered(
@@ -16167,7 +16167,7 @@ static void usb_log_flush_limit(unsigned int max_source_bytes) {
     }
     {
         unsigned int vi;
-        for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+        for (vi = 0; vi < g_vm_count; vi++) {
             if (!g_vm_log_ready[vi]) continue;
             if (hype_log_sink_flush_budget(&g_vm_log[vi], max_source_bytes) != 0) {
                 if (hype_fs_file_identity_error(&g_vm_log[vi].file)) {
@@ -16195,7 +16195,7 @@ static void usb_log_flush(void) {
      * sink without changing the existing combined-first ordering rule. */
     {
         unsigned int vi;
-        for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+        for (vi = 0; vi < g_vm_count; vi++) {
             while (g_vm_log_ready[vi] &&
                    hype_log_sink_flushed(&g_vm_log[vi]) < hype_logbuf_len()) {
                 unsigned int prior = hype_log_sink_flushed(&g_vm_log[vi]);
@@ -16218,14 +16218,14 @@ static void usb_log_flush_slice(void) {
 
     if (!g_usb_log_ready) return;
     before += hype_log_sink_flushed(&g_hype_log);
-    for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+    for (vi = 0; vi < g_vm_count; vi++) {
         before += hype_log_sink_flushed(&g_vm_log[vi]);
     }
     t0 = hype_rdtsc();
     usb_log_flush_limit(HYPE_USBLOG_SLICE_BYTES);
     dt = hype_rdtsc() - t0;
     after += hype_log_sink_flushed(&g_hype_log);
-    for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+    for (vi = 0; vi < g_vm_count; vi++) {
         after += hype_log_sink_flushed(&g_vm_log[vi]);
     }
     g_usb_log_slice_calls++;
@@ -16238,7 +16238,7 @@ static unsigned int usb_log_flushed_total(void) {
     unsigned int total = 0u;
     unsigned int vi;
     if (g_hype_log_ready) total += hype_log_sink_flushed(&g_hype_log);
-    for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+    for (vi = 0; vi < g_vm_count; vi++) {
         if (g_vm_log_ready[vi]) total += hype_log_sink_flushed(&g_vm_log[vi]);
     }
     return total;
@@ -16247,7 +16247,7 @@ static unsigned int usb_log_flushed_total(void) {
 static int usb_log_reached_target(unsigned int target) {
     unsigned int vi;
     if (g_hype_log_ready && hype_log_sink_flushed(&g_hype_log) < target) return 0;
-    for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+    for (vi = 0; vi < g_vm_count; vi++) {
         if (g_vm_log_ready[vi] && hype_log_sink_flushed(&g_vm_log[vi]) < target) return 0;
     }
     return 1;
@@ -16361,23 +16361,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* First thing in every log: which build this is. Captures from a
      * serial-less machine otherwise all start with identical boilerplate. */
     hype_debug_print("hype: build " HYPE_BUILD_ID "\n");
-
-    /* #394 step 1: allocate the per-VM struct array, page-aligned (see g_vms
-     * declaration). Must precede the first g_vms[] use. */
-    {
-        UINTN vm_bytes = (UINTN)g_vm_count * sizeof(hype_fw_vm_t);
-        UINTN vm_pages = (vm_bytes + 4095u) / 4096u;
-        g_vms = (hype_fw_vm_t *)(uintptr_t)hype_alloc_pages_any(SystemTable->BootServices, vm_pages);
-        if (g_vms == 0) {
-            hype_fatal("fw-1: g_vms allocation (%u VM(s), %llu pages) failed",
-                       g_vm_count, (unsigned long long)vm_pages);
-        }
-        hype_guest_ram_zero(g_vms, (uint64_t)vm_pages * 4096ull);
-        hype_debug_print("fw-1: g_vms arena %u VM(s) x %llu B, page-aligned @%p [#394]\n",
-                         g_vm_count, (unsigned long long)sizeof(hype_fw_vm_t), (void *)g_vms);
-    }
-    fw_alloc_vm_aux_arena(SystemTable->BootServices);
-    vm = &g_vms[0];
     /*
      * Host wall clock, read once here and reused wherever a timestamp is needed
      * (currently the FAT32 log file's directory entry). Read at boot rather than
@@ -16449,6 +16432,27 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * absent/malformed -> empty config + built-in fallback, never a boot stop.
      * #125/#126 consume the parsed physical target + partition qualifiers. */
     load_hype_cfg(ImageHandle, SystemTable);
+
+    /* #411: the VM count is now a runtime value from the parsed config, and the
+     * #394 arena is sized to it. Still bounded to what the (not-yet-generalised)
+     * launch handles -- one or two VMs; #393b-d raises the ceiling to the
+     * cfg count under core/RAM admission. Every per-VM loop below uses
+     * g_vm_count, so raising it there needs no further loop edits. */
+    g_vm_count = fw_1_want_two_vms() ? 2u : 1u;
+    {
+        UINTN vm_bytes = (UINTN)g_vm_count * sizeof(hype_fw_vm_t);
+        UINTN vm_pages = (vm_bytes + 4095u) / 4096u;
+        g_vms = (hype_fw_vm_t *)(uintptr_t)hype_alloc_pages_any(SystemTable->BootServices, vm_pages);
+        if (g_vms == 0) {
+            hype_fatal("fw-1: g_vms allocation (%u VM(s), %llu pages) failed",
+                       g_vm_count, (unsigned long long)vm_pages);
+        }
+        hype_guest_ram_zero(g_vms, (uint64_t)vm_pages * 4096ull);
+        hype_debug_print("fw-1: g_vms arena %u VM(s) x %llu B, page-aligned @%p [#394]\n",
+                         g_vm_count, (unsigned long long)sizeof(hype_fw_vm_t), (void *)g_vms);
+    }
+    fw_alloc_vm_aux_arena(SystemTable->BootServices);
+    vm = &g_vms[0];
     /*
      * INPUT-8 (#281): load each VM's expect script here, PRE-EBS, because this is the
      * last point where the UEFI Simple File System is usable. Both VMs are loaded
@@ -18693,7 +18697,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                              * invalidated, and a hit/miss ratio says which in one run.
                              */
                             unsigned vi;
-                            for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+                            for (vi = 0; vi < g_vm_count; vi++) {
                                 uint64_t hits = 0, misses = 0;
                                 if (!g_vms[vi].iso_stream_ready) continue;
                                 hype_iso_stream_cache_stats(&g_vms[vi].iso_stream, &hits, &misses);
@@ -18745,7 +18749,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                          hype_blk_usb_bsp_lock_timeouts());
                         {
                             unsigned vi;
-                            for (vi = 0; vi < HYPE_FW_MAX_VMS; vi++) {
+                            for (vi = 0; vi < g_vm_count; vi++) {
                                 unsigned long long routed = 0, handed = 0, route_drop = 0;
                                 unsigned long long dev_queued = 0, guest_read = 0, dev_drop = 0;
                                 hype_scancode_queue_stats(&g_vms[vi].host_ps2_queue,
