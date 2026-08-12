@@ -246,6 +246,7 @@ static inline uint32_t hype_xhci_portsc_write_preserve(uint32_t current, uint32_
 #define HYPE_USB_PROTO_BOT       0x50u
 /* USB descriptor types. */
 #define HYPE_USB_DESC_CONFIG     0x02u
+#define HYPE_USB_DESC_STRING     0x03u
 #define HYPE_USB_DESC_INTERFACE  0x04u
 #define HYPE_USB_DESC_ENDPOINT   0x05u
 /* USB hub class (device descriptor bDeviceClass == 0x09). */
@@ -582,6 +583,40 @@ void hype_xhci_parked_drop_slot(hype_xhci_parked_t *p, uint32_t slot);
 
 /* Fixed-length BOT stages must transfer every requested byte. */
 int hype_xhci_xfer_exact_ok(uint32_t cc, uint32_t residue);
+
+/* --- #340: USB mass-storage identity --- */
+
+/* iSerialNumber: the string-descriptor index of the device's serial, byte 16
+ * of the 18-byte device descriptor. 0 means the device offers none. */
+static inline unsigned int hype_usb_dev_iserial_index(const uint8_t *devdesc18) {
+    return devdesc18[16];
+}
+
+/* First LANGID from string descriptor 0 (the language-list descriptor).
+ * Returns 0 and writes *out, or -1 on a malformed descriptor. */
+int hype_usb_string_desc_langid0(const uint8_t *desc, unsigned int desc_len, uint16_t *out);
+
+/*
+ * Extract a USB string descriptor's text as ASCII, trimmed of space padding
+ * and NUL-terminated into `out`. Returns its length, or -1 when the
+ * descriptor is malformed, empty, does not fit `out_cap`, or contains any
+ * code unit outside printable ASCII -- a serial the operator cannot type into
+ * hype.cfg is not a usable identity, and an unidentified device must stay
+ * unmatchable (#323).
+ */
+int hype_usb_string_desc_ascii(const uint8_t *desc, unsigned int desc_len, char *out,
+                               unsigned int out_cap);
+
+/* GET_DESCRIPTOR(STRING, index) on EP0. `langid` is 0 for the language-list
+ * descriptor (index 0). Returns 0 and the raw descriptor bytes in `buf`. */
+int hype_xhci_get_string_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int index,
+                                    uint16_t langid, uint8_t *buf, unsigned int maxlen);
+
+/* INQUIRY with EVPD for `page` over the bulk-only transport. `len` bytes of
+ * the response land in `buf`; the device pads short pages with zeros. */
+int hype_xhci_msc_inquiry_vpd(hype_xhci_ctrl_t *c, unsigned int slot,
+                              const hype_xhci_msc_eps_t *msc, uint8_t page, uint8_t *buf,
+                              unsigned int len);
 
 
 /* --- USB-7 (#241): device inventory across all controllers/ports --- */

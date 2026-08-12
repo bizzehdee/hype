@@ -753,7 +753,86 @@ static void test_collect_endpoints_rejects_bad_input(void) {
               hype_usb_collect_endpoints(overlong, (unsigned)sizeof(overlong), eps, 4u));
 }
 
+static void test_string_desc_langid0(void) {
+    /* String descriptor 0: bLength 4, type STRING, LANGID 0x0409 (en-US). */
+    static const uint8_t d0[] = {4, 0x03, 0x09, 0x04};
+    static const uint8_t wrong_type[] = {4, 0x02, 0x09, 0x04};
+    static const uint8_t too_short_blen[] = {2, 0x03, 0x09, 0x04};
+    uint16_t lang = 0;
+
+    CHECK_HEX("langid0 parses", 0, hype_usb_string_desc_langid0(d0, sizeof d0, &lang));
+    CHECK_HEX("langid0 value", 0x0409u, lang);
+    CHECK_HEX("langid0 wrong type refused", -1,
+              hype_usb_string_desc_langid0(wrong_type, sizeof wrong_type, &lang));
+    CHECK_HEX("langid0 empty list refused", -1,
+              hype_usb_string_desc_langid0(too_short_blen, sizeof too_short_blen, &lang));
+    CHECK_HEX("langid0 short buffer refused", -1, hype_usb_string_desc_langid0(d0, 3u, &lang));
+    CHECK_HEX("langid0 null desc refused", -1, hype_usb_string_desc_langid0(0, 4u, &lang));
+    CHECK_HEX("langid0 null out refused", -1, hype_usb_string_desc_langid0(d0, sizeof d0, 0));
+}
+
+static void test_string_desc_ascii(void) {
+    /* "AB12" as UTF-16LE, with a leading pad space to prove trimming. */
+    static const uint8_t sn[] = {12, 0x03, ' ', 0, 'A', 0, 'B', 0, '1', 0, '2', 0};
+    char out[8];
+
+    CHECK_HEX("iSerialNumber length", 4, hype_usb_string_desc_ascii(sn, sizeof sn, out, sizeof out));
+    CHECK_HEX("iSerialNumber b0", 'A', out[0]);
+    CHECK_HEX("iSerialNumber b3", '2', out[3]);
+    CHECK_HEX("iSerialNumber NUL", 0, out[4]);
+
+    /* the descriptor is bounded by bLength, not the buffer: the 0xEE tail
+     * beyond bLength is never read as text */
+    {
+        static const uint8_t padded[16] = {8, 0x03, 'X', 0, 'Y', 0, 'Z', 0,
+                                           0xEE, 0xEE, 0xEE, 0xEE};
+        CHECK_HEX("bLength bounds the text", 3,
+                  hype_usb_string_desc_ascii(padded, sizeof padded, out, sizeof out));
+        CHECK_HEX("bounded text b2", 'Z', out[2]);
+        CHECK_HEX("bounded text NUL", 0, out[3]);
+    }
+
+    /* refusals: no identity is ever repaired into one (#323) */
+    {
+        static const uint8_t nonascii[] = {6, 0x03, 0x42, 0x30, 'A', 0};   /* U+3042 */
+        static const uint8_t ctrl_ch[] = {6, 0x03, 0x07, 0, 'A', 0};       /* BEL */
+        static const uint8_t empty[] = {2, 0x03};
+        static const uint8_t all_space[] = {6, 0x03, ' ', 0, ' ', 0};
+        static const uint8_t odd_blen[] = {5, 0x03, 'A', 0, 'B'};
+        static const uint8_t overlong_blen[] = {10, 0x03, 'A', 0};
+        static const uint8_t not_string[] = {6, 0x04, 'A', 0, 'B', 0};
+        CHECK_HEX("non-ASCII code unit refused", -1,
+                  hype_usb_string_desc_ascii(nonascii, sizeof nonascii, out, sizeof out));
+        CHECK_HEX("control char refused", -1,
+                  hype_usb_string_desc_ascii(ctrl_ch, sizeof ctrl_ch, out, sizeof out));
+        CHECK_HEX("empty string refused", -1,
+                  hype_usb_string_desc_ascii(empty, sizeof empty, out, sizeof out));
+        CHECK_HEX("all-space string refused", -1,
+                  hype_usb_string_desc_ascii(all_space, sizeof all_space, out, sizeof out));
+        CHECK_HEX("odd bLength refused", -1,
+                  hype_usb_string_desc_ascii(odd_blen, sizeof odd_blen, out, sizeof out));
+        CHECK_HEX("bLength past buffer refused", -1,
+                  hype_usb_string_desc_ascii(overlong_blen, sizeof overlong_blen, out, sizeof out));
+        CHECK_HEX("wrong descriptor type refused", -1,
+                  hype_usb_string_desc_ascii(not_string, sizeof not_string, out, sizeof out));
+        CHECK_HEX("null desc refused", -1, hype_usb_string_desc_ascii(0, 8u, out, sizeof out));
+        CHECK_HEX("null out refused", -1, hype_usb_string_desc_ascii(sn, sizeof sn, 0, 8u));
+        CHECK_HEX("overflowing serial refused", -1,
+                  hype_usb_string_desc_ascii(sn, sizeof sn, out, 4u));
+        CHECK_HEX("exact fit accepted", 4, hype_usb_string_desc_ascii(sn, sizeof sn, out, 5u));
+    }
+
+    /* device-descriptor iSerialNumber index accessor */
+    {
+        uint8_t dd[18] = {0};
+        dd[16] = 3u;
+        CHECK_HEX("iSerialNumber index", 3u, hype_usb_dev_iserial_index(dd));
+    }
+}
+
 int main(void) {
+    test_string_desc_langid0();
+    test_string_desc_ascii();
     test_collect_endpoints_walks_all_interfaces();
     test_collect_endpoints_stops_at_capacity();
     test_collect_endpoints_rejects_bad_input();

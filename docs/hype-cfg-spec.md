@@ -196,8 +196,15 @@ such drives.
   again at resolve time.
 
 The drive named here needs a filesystem hype reads (FAT32, exFAT, or ext2/3/4)
-and may be SATA/AHCI or NVMe. The ISO is **streamed** from it, never copied into
-RAM (#322/#326), so ISO size is not bounded by guest or host memory.
+and may be SATA/AHCI, NVMe, or the USB medium hype claims at boot (#326). USB
+identity (#340) is the SCSI INQUIRY VPD page 0x80 Unit Serial Number — the same
+identity axis as the ATA and NVMe serials — falling back to the USB device
+descriptor's iSerialNumber string when page 0x80 is unsupported; the boot log's
+`MSC identity` line names which source was used. A stick that reports neither
+remains auto-detectable but can never be named — the identity is never
+synthesised from port or enumeration position. The ISO is **streamed** from the
+drive, never copied into RAM (#322/#326), so ISO size is not bounded by guest or
+host memory.
 
 `[disk.<id>]` carries the same axis as `source_disk` (§5.3), added with the
 stanza in #222 — so a `[disk.*]` image or ISO can also name the drive it lives

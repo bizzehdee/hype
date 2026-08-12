@@ -30,6 +30,7 @@
 #include "../core/scancode.h"  /* INPUT-11 (#284): ASCII -> PS/2 Set-1 for `sendkey` */
 #include "../core/scancode_queue.h" /* #375: BSP -> focused guest keyboard */
 #include "../core/blk_usb.h"
+#include "../core/usb_msc.h"
 #include "../devices/nvme.h" /* #202 */
 #include "../core/ahci_host.h"
 #include "../core/disk_inventory.h"
@@ -14282,6 +14283,42 @@ static int media_usb_write(void *ctx, uint64_t lba, uint32_t count, const void *
 }
 
 /*
+ * #340: the claimed USB medium's identity, on the same axis as g_hostdisk_serial (ATA) and
+ * g_hostnvme_serial (NVMe): INQUIRY VPD page 0x80's Unit Serial Number, preferred for
+ * consistency with the other two buses, with the USB device descriptor's iSerialNumber
+ * string as the fallback (cheap sticks often stub page 0x80). The SOURCE is logged so a
+ * mismatch between what hype prints and what `lsusb` prints is explainable. A stick that
+ * reports neither stays UNMATCHABLE by #323's rule -- never synthesised from port position.
+ */
+static char g_hostusb_serial[64];
+
+static void usb_capture_identity(hype_xhci_ctrl_t *xc, unsigned int slot,
+                                 const hype_xhci_msc_eps_t *msc) {
+    static uint8_t vpd[255];
+    static uint8_t sd[255];
+    uint8_t dd[18];
+    const char *source = "none";
+
+    g_hostusb_serial[0] = '\0';
+    if (hype_xhci_msc_inquiry_vpd(xc, slot, msc, 0x80u, vpd, sizeof vpd) == 0 &&
+        hype_scsi_vpd80_serial(vpd, sizeof vpd, g_hostusb_serial, sizeof g_hostusb_serial) > 0) {
+        source = "inquiry-vpd80";
+    } else if (hype_xhci_get_device_descriptor(xc, slot, dd) == 0) {
+        unsigned int idx = hype_usb_dev_iserial_index(dd);
+        uint16_t lang = 0;
+        if (idx != 0u && hype_xhci_get_string_descriptor(xc, slot, 0u, 0u, sd, sizeof sd) == 0 &&
+            hype_usb_string_desc_langid0(sd, sizeof sd, &lang) == 0 &&
+            hype_xhci_get_string_descriptor(xc, slot, idx, lang, sd, sizeof sd) == 0 &&
+            hype_usb_string_desc_ascii(sd, sizeof sd, g_hostusb_serial,
+                                       sizeof g_hostusb_serial) > 0) {
+            source = "usb-string";
+        }
+    }
+    hype_debug_print("host-xhci: MSC identity serial='%s' source=%s [#340]\n",
+                     g_hostusb_serial[0] != '\0' ? g_hostusb_serial : "(none)", source);
+}
+
+/*
  * Registered but NOT made active: a machine with a real internal disk should keep using it, and the
  * scan iterates every registered device anyway. #323's media_disk names this one explicitly when the
  * operator wants the stick specifically.
@@ -14289,12 +14326,12 @@ static int media_usb_write(void *ctx, uint64_t lba, uint32_t count, const void *
 static void media_select_usb(const hype_blk_backend_t *be) {
     g_media_usb_be = be;
     /*
-     * No serial: hype does not capture a USB identity today (SCSI INQUIRY gives vendor/product,
-     * not a unique serial). Under #323 an unidentified device can never be MATCHED, only
-     * auto-detected -- which fails safe: `media_disk` cannot name the stick yet, and will not
-     * silently select it for some other drive's name either.
+     * #340: registered under the serial usb_capture_identity() captured. When the stick
+     * reported no usable identity the serial is empty and #323's rule applies unchanged:
+     * auto-detected but never matched -- `media_disk` cannot name it, and it is never
+     * silently selected under another drive's name either.
      */
-    media_add_dev(media_usb_read, media_usb_write, "usb", "");
+    media_add_dev(media_usb_read, media_usb_write, "usb", g_hostusb_serial);
     if (!media_present()) {
         g_media.read = media_usb_read;
         g_media.write = media_usb_write;
@@ -17742,6 +17779,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     {
                         uint32_t last_lba = 0, bsz = 0;
                         hype_debug_print("host-xhci: bulk endpoints configured -- MSC datapath ready\n");
+                        /* #340: capture the medium's identity while its bulk path and EP0 are
+                         * both live, so media_add_dev below registers it under a real serial. */
+                        usb_capture_identity(&xc, msc_slot, &msc);
                         if (hype_xhci_msc_read_capacity(&xc, msc_slot, &msc, &last_lba, &bsz) != 0) {
                             hype_debug_print("host-xhci: slot %u SCSI READ CAPACITY FAILED\n", msc_slot);
                         } else {

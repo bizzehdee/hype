@@ -634,6 +634,16 @@ int hype_xhci_get_config_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint
     return 0;
 }
 
+int hype_xhci_get_string_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int index,
+                                    uint16_t langid, uint8_t *buf, unsigned int maxlen) {
+    /* GET_DESCRIPTOR(STRING, index): wValue = type|index, wIndex = LANGID.
+     * bLength (byte 0) bounds the useful bytes; a short reply is normal. */
+    if (maxlen < 2u || maxlen > 255u) return -1;
+    return control_transfer(c, slot, 0x80, 6,
+                            (uint16_t)(((unsigned int)HYPE_USB_DESC_STRING << 8) | index), langid,
+                            buf, maxlen, 1);
+}
+
 int hype_xhci_set_configuration(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int config_value) {
     /* SET_CONFIGURATION: bmRequestType=0x00 (OUT/standard/device), bRequest=9,
      * wValue=config, no data stage. */
@@ -1262,6 +1272,34 @@ int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_
     hype_scsi_cdb_write10(cdb, lba, (uint16_t)blocks);
     /* pass hw->data as the data pointer so bot_scsi's OUT copy is a self-copy. */
     return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)hw->data, len, 0);
+}
+
+int hype_xhci_msc_inquiry_vpd(hype_xhci_ctrl_t *c, unsigned int slot,
+                              const hype_xhci_msc_eps_t *msc, uint8_t page, uint8_t *buf,
+                              unsigned int len) {
+    uint8_t cdb[6];
+    uint8_t hdr[4];
+    unsigned int avail;
+    unsigned int i;
+
+    if (buf == 0 || len < 4u || len > 255u) return -1;
+
+    /*
+     * Two exact-length reads, never one padded read: #377's exact-transfer
+     * rule (residue must be zero) is what keeps log sectors uncorrupted, and
+     * a VPD response shorter than the allocation length would trip it. The
+     * 4-byte header is always available and carries the page length, so the
+     * second read can request exactly what the device holds.
+     */
+    hype_scsi_cdb_inquiry_vpd(cdb, page, 4u);
+    if (bot_scsi(c, slot, msc, cdb, 6u, hdr, 4u, 1) != 0) return -1;
+    if (hdr[1] != page) return -1;
+    avail = 4u + (unsigned int)hdr[3];
+    if (avail > len) return -1;
+
+    for (i = 0; i < len; i++) buf[i] = 0;
+    hype_scsi_cdb_inquiry_vpd(cdb, page, (uint8_t)avail);
+    return bot_scsi(c, slot, msc, cdb, 6u, buf, avail, 1);
 }
 
 int hype_xhci_msc_sync_cache(hype_xhci_ctrl_t *c, unsigned int slot,

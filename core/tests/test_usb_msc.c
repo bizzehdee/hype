@@ -91,6 +91,73 @@ static void test_cdbs(void) {
     }
 }
 
+static void test_inquiry_vpd_cdb(void) {
+    uint8_t c[6];
+    unsigned int n;
+    for (n = 0; n < sizeof c; n++) c[n] = 0xA5u;
+    hype_scsi_cdb_inquiry_vpd(c, 0x80u, 4u);
+    CHECK_HEX("vpd inquiry opcode", 0x12u, c[0]);
+    CHECK_HEX("vpd inquiry EVPD set", 0x01u, c[1]);
+    CHECK_HEX("vpd inquiry page code", 0x80u, c[2]);
+    CHECK_HEX("vpd inquiry reserved", 0u, c[3]);
+    CHECK_HEX("vpd inquiry alloc len", 4u, c[4]);
+    CHECK_HEX("vpd inquiry control", 0u, c[5]);
+}
+
+static void test_vpd80_serial_parse(void) {
+    /* page 0x80, length 10: two leading pad spaces + "HYPE-1234" would be 11;
+     * use " HYPE-1234" (leading space pad, SPC-3 right-aligned form). */
+    uint8_t ok[14] = {0x00, 0x80, 0x00, 0x0A,
+                      ' ', 'H', 'Y', 'P', 'E', '-', '1', '2', '3', '4'};
+    char out[16];
+
+    CHECK_HEX("padded serial length", 9, hype_scsi_vpd80_serial(ok, sizeof ok, out, sizeof out));
+    CHECK_HEX("padded serial b0", 'H', out[0]);
+    CHECK_HEX("padded serial b8", '4', out[8]);
+    CHECK_HEX("padded serial NUL", 0, out[9]);
+
+    /* trailing space + NUL padding also trims */
+    {
+        uint8_t tr[8] = {0x00, 0x80, 0x00, 0x04, 'A', 'B', ' ', 0x00};
+        CHECK_HEX("trailing pad trimmed", 2, hype_scsi_vpd80_serial(tr, sizeof tr, out, sizeof out));
+        CHECK_HEX("trailing pad b1", 'B', out[1]);
+    }
+
+    /* every refusal path: each malformed case must yield NO identity (#323) */
+    {
+        uint8_t wrongpage[6] = {0x00, 0x83, 0x00, 0x02, 'A', 'B'};
+        uint8_t zerolen[4] = {0x00, 0x80, 0x00, 0x00};
+        uint8_t overlen[6] = {0x00, 0x80, 0x00, 0x08, 'A', 'B'};
+        uint8_t allpad[8] = {0x00, 0x80, 0x00, 0x04, ' ', ' ', ' ', ' '};
+        uint8_t binary[6] = {0x00, 0x80, 0x00, 0x02, 0x07, 'B'};
+        CHECK_HEX("wrong page refused", -1,
+                  hype_scsi_vpd80_serial(wrongpage, sizeof wrongpage, out, sizeof out));
+        CHECK_HEX("zero page length refused", -1,
+                  hype_scsi_vpd80_serial(zerolen, sizeof zerolen, out, sizeof out));
+        CHECK_HEX("truncated page refused", -1,
+                  hype_scsi_vpd80_serial(overlen, sizeof overlen, out, sizeof out));
+        CHECK_HEX("all-padding serial refused", -1,
+                  hype_scsi_vpd80_serial(allpad, sizeof allpad, out, sizeof out));
+        CHECK_HEX("non-printable byte refused", -1,
+                  hype_scsi_vpd80_serial(binary, sizeof binary, out, sizeof out));
+        CHECK_HEX("short response refused", -1, hype_scsi_vpd80_serial(zerolen, 3u, out, sizeof out));
+        CHECK_HEX("null response refused", -1, hype_scsi_vpd80_serial(0, 6u, out, sizeof out));
+        CHECK_HEX("null output refused", -1,
+                  hype_scsi_vpd80_serial(binary, sizeof binary, 0, sizeof out));
+        CHECK_HEX("tiny output refused", -1, hype_scsi_vpd80_serial(binary, sizeof binary, out, 1u));
+    }
+
+    /* a serial that does not fit is a different serial, not a prefix */
+    {
+        uint8_t longer[9] = {0x00, 0x80, 0x00, 0x05, 'A', 'B', 'C', 'D', 'E'};
+        char tiny[4];
+        CHECK_HEX("overflowing serial refused", -1,
+                  hype_scsi_vpd80_serial(longer, sizeof longer, tiny, sizeof tiny));
+        CHECK_HEX("exact-fit serial accepted", 5,
+                  hype_scsi_vpd80_serial(longer, sizeof longer, out, 6u));
+    }
+}
+
 static void test_read_capacity_parse(void) {
     /* last LBA 0x0003FFFF, block size 512 (0x200), both big-endian */
     uint8_t rc[8] = {0x00, 0x03, 0xFF, 0xFF, 0x00, 0x00, 0x02, 0x00};
@@ -104,6 +171,8 @@ int main(void) {
     test_cbw();
     test_csw();
     test_cdbs();
+    test_inquiry_vpd_cdb();
+    test_vpd80_serial_parse();
     test_read_capacity_parse();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);

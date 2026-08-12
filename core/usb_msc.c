@@ -76,3 +76,47 @@ void hype_scsi_parse_read_capacity10(const uint8_t rc[8], uint32_t *last_lba,
     if (last_lba) *last_lba = rd_be32(rc + 0);
     if (block_size) *block_size = rd_be32(rc + 4);
 }
+
+void hype_scsi_cdb_inquiry_vpd(uint8_t cdb[6], uint8_t page, uint8_t alloc_len) {
+    unsigned int i;
+    for (i = 0; i < 6u; i++) cdb[i] = 0;
+    cdb[0] = 0x12u;     /* INQUIRY */
+    cdb[1] = 0x01u;     /* EVPD: return the vital product data page, not standard data */
+    cdb[2] = page;
+    cdb[4] = alloc_len;
+}
+
+int hype_scsi_vpd80_serial(const uint8_t *resp, unsigned int resp_len, char *out,
+                           unsigned int out_cap) {
+    unsigned int page_len;
+    unsigned int start;
+    unsigned int end;
+    unsigned int i;
+    unsigned int n;
+
+    if (resp == 0 || out == 0 || out_cap < 2u || resp_len < 4u) return -1;
+    if (resp[1] != 0x80u) return -1; /* not the Unit Serial Number page */
+    page_len = resp[3];
+    if (page_len == 0u || 4u + page_len > resp_len) return -1;
+
+    /*
+     * SPC-3 7.6.10: the product serial number field holds ASCII graphic codes
+     * (20h..7Eh), right-aligned with left space padding. A byte outside that
+     * range means the field is not a usable identity; producing a mangled
+     * serial that matches nothing the operator can read fails #323's rule
+     * worse than producing none.
+     */
+    start = 4u;
+    end = 4u + page_len;
+    while (start < end && resp[start] == 0x20u) start++;
+    while (end > start && (resp[end - 1u] == 0x20u || resp[end - 1u] == 0x00u)) end--;
+    if (start == end) return -1; /* all padding: no identity */
+    for (i = start; i < end; i++) {
+        if (resp[i] < 0x20u || resp[i] > 0x7Eu) return -1;
+    }
+    n = end - start;
+    if (n > out_cap - 1u) return -1; /* a truncated serial is a different serial */
+    for (i = 0; i < n; i++) out[i] = (char)resp[start + i];
+    out[n] = '\0';
+    return (int)n;
+}

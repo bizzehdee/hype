@@ -349,6 +349,54 @@ int hype_xhci_xfer_exact_ok(uint32_t cc, uint32_t residue) {
     return (cc == HYPE_XHCI_CC_SUCCESS || cc == HYPE_XHCI_CC_SHORT_PACKET) && residue == 0u;
 }
 
+/* --- #340: USB string-descriptor identity --- */
+
+int hype_usb_string_desc_langid0(const uint8_t *desc, unsigned int desc_len, uint16_t *out) {
+    if (desc == 0 || out == 0 || desc_len < 4u) return -1;
+    if (desc[1] != HYPE_USB_DESC_STRING || desc[0] < 4u) return -1;
+    *out = (uint16_t)((unsigned int)desc[2] | ((unsigned int)desc[3] << 8));
+    return 0;
+}
+
+int hype_usb_string_desc_ascii(const uint8_t *desc, unsigned int desc_len, char *out,
+                               unsigned int out_cap) {
+    unsigned int blen;
+    unsigned int chars;
+    unsigned int start;
+    unsigned int end;
+    unsigned int i;
+    unsigned int n;
+
+    if (desc == 0 || out == 0 || out_cap < 2u || desc_len < 2u) return -1;
+    if (desc[1] != HYPE_USB_DESC_STRING) return -1;
+    blen = desc[0];
+    if (blen < 2u || blen > desc_len || (blen & 1u) != 0u) return -1;
+    chars = (blen - 2u) / 2u;
+    if (chars == 0u) return -1; /* an empty string is not an identity */
+
+    /*
+     * UTF-16LE code units. Only printable ASCII (0020h..007Eh) is accepted:
+     * this serial is matched byte-exactly against what an operator types into
+     * hype.cfg, and a code point that cannot round-trip through that config
+     * line is not a usable identity. Refuse rather than transliterate (#323).
+     */
+    start = 0;
+    end = chars;
+    while (start < end && desc[2u + 2u * start] == 0x20u && desc[3u + 2u * start] == 0u) start++;
+    while (end > start && desc[2u + 2u * (end - 1u)] == 0x20u && desc[3u + 2u * (end - 1u)] == 0u)
+        end--;
+    if (start == end) return -1; /* all spaces: no identity */
+    for (i = start; i < end; i++) {
+        if (desc[3u + 2u * i] != 0u) return -1;
+        if (desc[2u + 2u * i] < 0x20u || desc[2u + 2u * i] > 0x7Eu) return -1;
+    }
+    n = end - start;
+    if (n > out_cap - 1u) return -1;
+    for (i = 0; i < n; i++) out[i] = (char)desc[2u + 2u * (start + i)];
+    out[n] = '\0';
+    return (int)n;
+}
+
 /* --- USB-7 (#241): device inventory --- */
 
 void hype_usb_inventory_reset(hype_usb_inventory_t *inv) {

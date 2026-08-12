@@ -40,4 +40,20 @@ void hype_scsi_cdb_inquiry(uint8_t cdb[6], uint8_t alloc_len);
 void hype_scsi_parse_read_capacity10(const uint8_t rc[8], uint32_t *last_lba,
                                      uint32_t *block_size);
 
+/* #340: INQUIRY with EVPD set, for a vital-product-data page (0x80 = Unit
+ * Serial Number, the same identity axis as the ATA and NVMe serials). */
+void hype_scsi_cdb_inquiry_vpd(uint8_t cdb[6], uint8_t page, uint8_t alloc_len);
+
+/*
+ * #340: extract the serial from an INQUIRY VPD page 0x80 response.
+ *
+ * Returns the serial's length after writing it NUL-terminated to `out`, or -1
+ * when the response is not page 0x80, is truncated, is all padding, contains a
+ * non-printable byte, or does not fit `out_cap`. A device with no usable
+ * identity must stay UNMATCHABLE (#323), so every malformed case refuses
+ * rather than repairs.
+ */
+int hype_scsi_vpd80_serial(const uint8_t *resp, unsigned int resp_len, char *out,
+                           unsigned int out_cap);
+
 #endif /* HYPE_CORE_USB_MSC_H */
