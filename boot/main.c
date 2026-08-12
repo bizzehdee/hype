@@ -7345,6 +7345,50 @@ static __attribute__((noinline)) void fw_1_436_deep_dump(hype_fw_vm_t *vm, hype_
                              (unsigned long long)w2, (unsigned long long)w3);
         }
     }
+    /*
+     * #436 wedge #2: the loop walks rdx = [rdx+0x18] until rdx == r8 (sentinel). Trace that
+     * chain from the live rdx, up to 40 hops: report each node + the field at [node-8]+0x28
+     * (the value the loop compares to rcx), and stop on the sentinel OR when a node repeats
+     * (the cycle). Names whether the list is truly circular and where it closes.
+     */
+    {
+        uint64_t rdx = hype_svm_vcpu_get_gpr(ctx, 2);
+        uint64_t r8 = hype_svm_vcpu_get_gpr(ctx, 8);
+        uint64_t seen[40];
+        unsigned hop, nseen = 0;
+        hype_debug_print("fw-1 #436 LISTWALK from rdx=0x%llx, sentinel r8=0x%llx:\n",
+                         (unsigned long long)rdx, (unsigned long long)r8);
+        for (hop = 0; hop < 40u; hop++) {
+            const uint8_t *nh;
+            uint64_t next = 0, ownerfield = 0;
+            unsigned b, s;
+            int repeat = 0;
+            if (rdx == r8) { hype_debug_print("  hop %u: reached sentinel -- list is finite\n", hop); break; }
+            for (s = 0; s < nseen; s++) { if (seen[s] == rdx) { repeat = 1; break; } }
+            if (repeat) {
+                hype_debug_print("  hop %u: node 0x%llx REPEATS (first seen at hop %u) -- CYCLE\n",
+                                 hop, (unsigned long long)rdx, s);
+                break;
+            }
+            if (nseen < 40u) seen[nseen++] = rdx;
+            nh = fw_1_guest_phys_to_host(vm, rdx + 0x18u);
+            if (nh) { for (b = 0; b < 8u; b++) next |= (uint64_t)nh[b] << (b * 8); }
+            {
+                const uint8_t *oh = fw_1_guest_phys_to_host(vm, rdx - 8u);
+                uint64_t owner = 0;
+                if (oh) { for (b = 0; b < 8u; b++) owner |= (uint64_t)oh[b] << (b * 8); }
+                {
+                    const uint8_t *fh = fw_1_guest_phys_to_host(vm, owner + 0x28u);
+                    if (fh) { for (b = 0; b < 8u; b++) ownerfield |= (uint64_t)fh[b] << (b * 8); }
+                }
+            }
+            hype_debug_print("  hop %u: node=0x%llx next=0x%llx [owner+0x28]=0x%llx\n",
+                             hop, (unsigned long long)rdx, (unsigned long long)next,
+                             (unsigned long long)ownerfield);
+            rdx = next;
+        }
+        usb_log_flush();
+    }
 }
 
 static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_filter_t *filter, char *line,
