@@ -1518,30 +1518,88 @@ should be implemented without first promoting it to a real board milestone
 and, if it changes a v1 decision, updating §10 explicitly (per AGENTS.md's
 own "keeping plan.md and the board in sync" rule).
 
-- **Real vCPU scheduler, replacing 1:1 exclusive pCPU pinning** (noted
-  2026-07-14). v1's hard invariant (§3, §10, AGENTS.md) is one vCPU
-  permanently and exclusively owning one pCPU — simple, and it's *why*
-  §6g's fault-isolation guarantee holds "by construction" (a hung guest
-  occupies only its own core, never one shared with another guest's
-  vCPU). A v2 direction is to replace this with hype's own scheduler:
+- **Real vCPU scheduler, alongside (not replacing) 1:1 exclusive pCPU
+  pinning** (noted 2026-07-14; expanded 2026-08-12). v1's hard invariant
+  (§3, §10, AGENTS.md) is one vCPU permanently and exclusively owning one
+  pCPU — simple, and it's *why* §6g's fault-isolation guarantee holds "by
+  construction" (a hung guest occupies only its own core, never one shared
+  with another guest's vCPU). A v2 direction is hype's own scheduler:
   multiple vCPUs (from the same or different guests) time-sliced across a
-  smaller pCPU pool, with optional config-driven affinity (e.g. pin
-  specific vCPUs/VMs to specific pCPUs when an operator wants that, but
-  don't require it). This is a materially bigger architectural change
-  than it sounds, because §6g's fault-isolation story would need a new
-  mechanism once "hung vCPU occupies only its own pCPU" is no longer true
-  by construction — likely some form of scheduling quantum/priority
-  guarantee enforced by the scheduler itself, replacing what pinning gave
-  for free. Any v2 work here must explicitly re-derive how fault
-  isolation holds under real scheduling before it can replace the
-  pinning invariant, not just drop the invariant and assume isolation
-  still holds. The scheduler must also be **NUMA-node aware**: on
-  multi-socket/multi-node hosts, place a VM's vCPUs and its guest RAM on
-  the same NUMA node wherever possible (and keep them together across
-  any rebalancing), rather than scheduling purely on core availability —
-  cross-node memory access is a real, measurable performance cliff this
-  project shouldn't reintroduce once it's no longer avoided for free by
-  static 1:1 pinning to a fixed core.
+  smaller pCPU pool, exposing a configured vCPU count that need not equal
+  the physical core count.
+
+  **A hybrid of dedicated + shared, not a wholesale replacement.**
+  Partition the physical cores into two tiers, operator-chosen per VM
+  (the existing `cpu_set` admission seam, §6i, extends to carry a mode):
+    - **Dedicated tier** — today's 1:1 pinned path, unchanged. No
+      scheduler overhead, full isolation preserved by construction. For
+      latency-sensitive or security-critical guests.
+    - **Shared tier** — a pool of cores the scheduler multiplexes several
+      vCPUs onto. The "never share a core" invariant is a property of the
+      **dedicated tier**, and does NOT govern shared-tier VMs — sharing a
+      core (time-slicing, and SMT co-residency within a trust group) is
+      exactly what a shared VM opts into.
+  A "dedicated" VM is then just a scheduler run-queue of length one pinned
+  to a core, so both tiers can sit on one vCPU-run primitive.
+
+  **What carries over (most of the CPU work):** the VMRUN/exit engine and
+  every emulation path are per-vCPU and independent of the pinning model.
+  A vCPU's switchable context already exists — its VMCB/VMCS + FPU (§260) +
+  TSC_AUX (§275) + GPR ctx, saved/restored on every exit today. The
+  one-shot LAPIC preemption timer (§364) is already a time-slice
+  primitive. The no-VM-cap work (§10 decision 33; #393/#394/#395) already
+  decouples the number of runtime vCPU contexts from the core count — a
+  scheduler needs exactly that (more vCPU contexts than pCPUs). **What is
+  new:** the scheduler proper (run queue, time accounting, pick-next
+  policy, mandatory preemption), context-switch orchestration across
+  vCPUs, and holding a descheduled vCPU's timer/device interrupts (the
+  pending-IRR machinery already queues them) until it runs again.
+
+  **Isolation under core sharing — spatial holds, temporal is the axis
+  that weakens.** Memory isolation comes from nested paging, not pinning:
+  the scheduler swaps the NPT/EPT root + ASID/VPID on switch, so a
+  descheduled vCPU's memory is unaddressable by the running one (§6j
+  bounds checks unchanged). Register/MSR isolation is standard
+  context-switch hygiene (the same save/restore run on every exit). Fault
+  isolation still holds *provided preemption is mandatory* — a spinning
+  guest cannot monopolise a shared core because the scheduler forcibly
+  preempts it (this is the "new mechanism" replacing what pinning gave for
+  free; it MUST be re-derived and proven, not assumed). The genuinely
+  weaker axis is **microarchitectural/timing side channels**: VMs taking
+  turns on one core share caches/TLB/branch predictors, and SMT siblings
+  share L1D/ports concurrently (the L1TF/MDS class). Pinning eliminates
+  this by construction; sharing reintroduces it.
+
+  **Default-deny core sharing, explicit trust groups** (mirrors the
+  §6e/net_peers default-deny philosophy). The µarch precautions apply
+  **between trust groups, never within one**:
+    1. **Dedicated** — shares with no one (today's path).
+    2. **Shared, same group** — freely shares cores and SMT siblings with
+       group-mates; no cross-VM flush, maximum density. (Two vCPUs of one
+       VM already share a core in the SMP case with no issue; mutually-
+       trusting VMs are the same situation.)
+    3. **Shared, cross group** — the scheduler keeps distrusting groups off
+       the same physical core simultaneously (schedule whole cores as a
+       unit / SMT-off for the pool) and flushes µarch state (L1D + IBPB)
+       when it switches a core between groups; optionally Intel CAT / AMD
+       cache partitioning.
+  A deployment whose shared tier is a single trust domain has no
+  cross-group boundaries and runs completely unrestricted. VMs that must
+  never share a core with anyone use the dedicated tier.
+
+  The scheduler must also be **NUMA-node aware**: on multi-socket/
+  multi-node hosts, place a VM's vCPUs and its guest RAM on the same NUMA
+  node wherever possible (and keep them together across any rebalancing),
+  rather than scheduling purely on core availability — cross-node memory
+  access is a real, measurable performance cliff this project shouldn't
+  reintroduce once it's no longer avoided for free by static pinning.
+
+  **v1-friendly seams (so v2 is additive, not a rewrite):** the `cpu_set`
+  mode field (dedicated vs shared) and an isolation-group field are small
+  config surfaces that can be reserved/validated early; the scheduler
+  itself is v2. Promoting any of this into v1 requires re-deriving §6g
+  fault isolation under scheduling and recording it as a new §10 decision,
+  per the note at the top of this section.
 
 - **Memory ballooning, for dynamic per-VM RAM allocation with a
   configurable floor and ceiling** (noted 2026-07-14). v1's admission
