@@ -8,6 +8,7 @@
 #include "fat_write_fs.h"  /* hype_fat32_fs_t / hype_fat32_wfile_t */
 #include "fat_exfat_fs.h"  /* hype_exfat_fs_t / hype_exfat_wfile_t */
 #include "ext.h"           /* hype_ext_wfile_t */
+#include "ntfs.h"          /* hype_ntfs_t (#337) */
 #include "rtc.h"
 
 /*
@@ -31,6 +32,10 @@
  *   exFAT    read + full mutation + IN-PLACE write_at (never grows/moves).
  *   ext      read + IN-PLACE write_at on a cleanly-unmounted volume; no
  *            namespace mutation (#384/#385 add allocation).
+ *   NTFS     read (sparse runs read as zeroes) + IN-PLACE write_at into
+ *            DATA ranges only; a write into a HOLE or UNWRITTEN range is
+ *            refused (#337, plan.md §10 decision 30). No mutation beyond
+ *            that, permanently.
  *
  * File mapping and reads speak the #381 logical range contract
  * (hype_file_rmap_t): DATA / HOLE / UNWRITTEN, zeros synthesized by the
@@ -50,7 +55,7 @@
 #define HYPE_FS_CAP_APPEND 0x04u        /* append, growing the allocation */
 #define HYPE_FS_CAP_NAMESPACE 0x08u     /* create/unlink/mkdir/rmdir/rename */
 #define HYPE_FS_CAP_WRITE_GROW 0x10u    /* write_at past EOF allocates (FAT32 via #382) */
-#define HYPE_FS_CAP_SPARSE 0x20u        /* may emit HOLE/UNWRITTEN ranges (#337/#384: nobody yet) */
+#define HYPE_FS_CAP_SPARSE 0x20u        /* may emit HOLE/UNWRITTEN ranges (NTFS via #337) */
 
 typedef struct hype_fs hype_fs_t;
 typedef struct hype_fs_file hype_fs_file_t;
@@ -108,6 +113,7 @@ struct hype_fs {
     union {
         hype_fat32_fs_t fat32;
         hype_exfat_fs_t exfat;
+        hype_ntfs_t ntfs;
         struct {
             uint64_t size_bytes; /* whole image, from the PVD */
         } iso;

@@ -444,12 +444,71 @@ static const hype_fs_ops_t ext_ops = {
     0, /* set_barrier */
 };
 
+/* ---------------- NTFS (#337: read + in-place write, sparse-aware) -------- */
+
+static int ntfs_probe(hype_blk_read_fn read, void *ctx) {
+    return hype_ntfs_probe(read, ctx);
+}
+
+static int ntfs_mount(hype_fs_t *fs, hype_blk_read_fn read, hype_blk_write_fn write, void *ctx) {
+    fs->read = read;
+    fs->write = write;
+    fs->ctx = ctx;
+    return hype_ntfs_mount(read, ctx, &fs->u.ntfs);
+}
+
+static int ntfs_map_ranges(hype_fs_t *fs, const char *path, hype_file_rmap_t *out) {
+    return hype_ntfs_resolve(&fs->u.ntfs, path, out);
+}
+
+static int ntfs_lookup(hype_fs_t *fs, const char *path, hype_fs_file_t *out) {
+    out->fs = fs;
+    out->tag = TAG_RMAP;
+    if (ntfs_map_ranges(fs, path, &out->u.rmap) != 0) {
+        return -1;
+    }
+    out->size = out->u.rmap.size_bytes;
+    return 0;
+}
+
+/* In-place only, DATA ranges only: hype_file_rmap_write_at refuses a span
+ * touching a HOLE (needs allocation) or UNWRITTEN (needs an initialized-size
+ * advance) BEFORE writing anything -- decision 30's no-silent-short-write. */
+static int ntfs_write_at(hype_fs_file_t *f, uint64_t offset, const void *src, unsigned int len) {
+    if (f->tag != TAG_RMAP) {
+        return -1;
+    }
+    return hype_file_rmap_write_at(&f->u.rmap, f->fs->read, f->fs->write, f->fs->ctx, offset,
+                                   src, len);
+}
+
+static const hype_fs_ops_t ntfs_ops = {
+    "ntfs",
+    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_SPARSE,
+    ntfs_probe,
+    ntfs_mount,
+    ntfs_lookup,
+    ntfs_map_ranges,
+    rmap_read_at,
+    ntfs_write_at,
+    0, /* append: growth is out of scope, permanently (decision 30) */
+    0, /* create */
+    0, /* unlink */
+    0, /* mkdir */
+    0, /* rmdir */
+    0, /* rename */
+    0, /* sync */
+    0, /* set_time */
+    0, /* set_barrier */
+};
+
 /* ---------------- registry + wrappers ---------------- */
 
 static const hype_fs_ops_t *const g_registry[] = {
     &iso_ops,
     &exfat_ops,
     &fat32_ops,
+    &ntfs_ops,
     &ext_ops,
 };
 

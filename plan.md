@@ -207,9 +207,12 @@ explicit design:
   26. `docs/hype-cfg-spec.md` is the authority for the config surface itself
   and already specifies these keys.
 - **Network**: virtio-net, optional; not required for offline installs.
-- **Video**: two phases, same underlying mechanism. Pre-OS-driver, the
-  guest's own firmware renders through the GOP protocol we expose, into a
-  linear framebuffer in that guest's RAM. Post-boot, we present a plain
+- **Video**: two phases. Pre-OS-driver, the hypervisor registers QEMU's
+  `etc/ramfb` fw_cfg file for each VM. The vendored OVMF `QemuRamfbDxe`
+  driver installs GOP and allocates a linear framebuffer in that VM's own
+  RAM. The hypervisor validates the complete guest-written surface range
+  against that VM's GPA map before copying focused pixels to the host display.
+  Post-boot, we present a plain
   VGA/Bochs-VBE-class virtual display adapter (the interface QEMU's
   `stdvga`/`bochs-display` and VirtualBox use) so Windows' inbox Microsoft
   Basic Display Adapter driver "just works" with zero driver install, and
@@ -382,18 +385,16 @@ surface for all of this.
   `GET CONFIGURATION`'s current profile is DVD-ROM — so a guest treats it
   exactly as a physical DVD-ROM presenting a real disc. See §10 decision 25.
 - **Virtual disk target (`target_disk = file:<path>`)**: a raw (or qcow2,
-  §10 decision 3) file on host storage, **created ahead of time by
-  `tools/make-disk-image.sh`** — *not* by the hypervisor. hype creates
-  nothing: post-`ExitBootServices()` it has no filesystem allocator, and by
-  design it only ever writes **in place** into an already-allocated file, so
-  the image must be **fully allocated** before hype sees it (a sparse hole is
-  a sector the filesystem has not assigned, and this layer cannot assign
-  one). `target_disk_size_gb` is therefore a **declaration of intent that
-  hype validates**, not a creation instruction: hype compares it against the
-  resolved image's real size and reports a mismatch, which catches a VM
-  pointed at a stale or truncated image. Reads and writes from the guest are
-  file I/O against the host filesystem driver already needed to load ISOs and
-  guest firmware/varstore.
+  §10 decision 3) file on host storage, created ahead of time by
+  `tools/make-disk-image.sh` — *not* by the hypervisor. `target_disk_size_gb`
+  is a **declaration of intent that hype validates**, not a creation
+  instruction: hype compares it against the resolved image's real size and
+  reports a mismatch, which catches a VM pointed at a stale or truncated
+  image. The host filesystem controls whether the backing file can remain
+  sparse (§10 decision 29). ext supports true holes. FAT32 and exFAT do not;
+  their writers allocate and zero-fill any logical gap before publishing the
+  new file size. Reads and writes from the guest use the host filesystem
+  driver already needed to load ISOs and guest firmware/varstore.
 - **Physical disk target (`target_disk = physical:<serial-or-guid>`)**: the
   guest's writes go straight to a real drive. This needs the hypervisor to
   own a minimal **host-side block driver** (AHCI + NVMe covers the vast
@@ -1181,6 +1182,123 @@ isn't lost.
     front-end is made *selectable* before the NVMe one is *written*, since
     it already exists and only lacks a switch; partition-scoped physical
     targets are independent of both and can land in parallel.
+
+27. **Guest boot framebuffer (#350) — decided: QEMU ramfb supplies firmware
+    GOP; Bochs VBE remains the separate post-boot adapter.** The vendored OVMF
+    already contains `QemuRamfbDxe`. Each VM therefore receives its own
+    writable `etc/ramfb` fw_cfg file. OVMF allocates the framebuffer inside
+    that VM's RAM, publishes GOP, and writes the big-endian surface description
+    back through fw_cfg. hype validates the full address, stride and height
+    against that VM's GPA map before reading pixels. This makes the GOP handoff
+    available to kernels such as OpenBSD's `efifb` without adding another PCI
+    device. Rejected using Bochs VBE for firmware GOP: that duplicates an OVMF
+    driver path already present and couples boot firmware to the later OS video
+    model. Rejected host-allocated or shared framebuffer memory: either choice
+    weakens the per-VM memory boundary. Bochs VBE remains the PCI-discoverable
+    adapter for a guest OS driver after boot; ramfb remains the firmware and EFI
+    framebuffer path.
+
+28. **Post-boot diagnostic persistence — decided: USB log files are the only
+    persistent live-run channel; the RT-3 EFI-variable tail is retired.** RT-3
+    wrote the last 16 KiB of the in-memory log through UEFI Runtime Services and
+    recovered it on the next boot. The implementation calculated a checksum over
+    the entire growing log on every VM exit before testing its 60-second write
+    deadline. A 2026-08-11 AMD run measured 174.8 of 177 seconds in that path.
+    Rate-limiting the checksum would remove that immediate cost, but would retain
+    a second persistence mechanism, firmware flash writes, a post-EBS Runtime
+    Services dependency, and shared writer state beside the BSP-owned USB log.
+    The operator chose to retire RT-3. `HYPE.LOG` and the per-VM USB logs remain
+    the supported persistent record and are drained in bounded slices by the BSP.
+    A panic still paints its message directly to the framebuffer and halts. A
+    cold power loss before the next USB slice may therefore lose the newest
+    in-memory tail; this is accepted in exchange for one persistence path with
+    measured bounded latency. Rejected alternative: keep RT-3 but move its
+    checksum and `SetVariable` call to the BSP at 60-second intervals. That fixes
+    the measured scan loop but preserves the redundant firmware-dependent path.
+
+29. **Sparse host files — decided: one sparse-aware logical range contract,
+    with format-specific allocation semantics.** The old shared extent list
+    represented only physically allocated sectors. It therefore rejected ext
+    holes and unwritten extents, and it could not state whether a writer may
+    allocate a missing range. The filesystem refactor (#292/#293) will use a
+    neutral logical range map whose entries distinguish allocated data, holes,
+    and unwritten allocation. Callers read holes and unwritten allocation as
+    zeroes. A writer advertises its allocation and growth capabilities rather
+    than returning a short or false-successful write.
+    - **FAT32 has no sparse-file representation.** A valid non-empty file is a
+      FAT cluster chain sized to cover `DIR_FileSize`. A random write beyond
+      EOF allocates every intervening cluster and zero-fills the logical gap
+      before publishing the larger directory size. A chain shorter than the
+      existing size remains corruption and is refused; it must never be
+      reinterpreted as a hole.
+    - **exFAT uses `ValidDataLength` but does not provide arbitrary holes.**
+      `DataLength` still requires allocation through the logical end of the
+      stream. Reads from `ValidDataLength` to `DataLength` return zeroes. A
+      write beyond `ValidDataLength` allocates through the new `DataLength`,
+      zeroes any gap needed to make the valid prefix contiguous, then advances
+      `ValidDataLength`. A missing allocation inside `DataLength` is corruption,
+      not sparseness.
+    - **ext2/3/4 supports true holes and unwritten extents.** Reads synthesize
+      zeroes without allocating. Writes into holes allocate filesystem blocks,
+      update the inode mapping and allocation counters, and preserve all
+      enabled metadata checksums. ext2 allocation may use ordered direct
+      metadata updates while the volume is marked dirty. ext3/4 allocation
+      requires a valid jbd2 metadata transaction and commit before the new
+      mapping is exposed. Existing in-place writes to allocated blocks remain
+      available without allocation.
+    - **Crash ordering is part of the writer contract.** New blocks are zeroed
+      or filled before metadata exposes them. Allocation bitmap, mapping,
+      inode length, free counts, checksums, and filesystem dirty/clean state
+      are committed in a format-valid order with block-device barriers. A
+      failure leaves either the old mapping or recoverable allocated metadata;
+      it must never expose stale contents or map one block to two files.
+
+    Rejected treating a short FAT chain as sparse: FAT has no logical block
+    indices in a chain, so there is no safe way to infer where a missing range
+    belongs. Rejected keeping the old physical-only extent contract and adding
+    writer-specific exceptions: every caller would then need filesystem
+    knowledge, defeating #293 and recreating inconsistent bounds behavior.
+
+30. **Host NTFS support (#337) — decided: read + in-place write only, as the
+    fifth `hype_fs_ops_t` driver.** NTFS runlists map directly onto the
+    decision-29 logical range contract: an allocated run is `DATA`, a sparse
+    run (no LCN) is `HOLE` and reads as zeroes. No new abstraction is needed,
+    which is what makes the scope proportionate.
+    - **In-place only.** Writes land only inside already-allocated `DATA`
+      ranges of an existing, non-resident, uncompressed, unencrypted `$DATA`
+      stream. A write aimed at a `HOLE` is refused through the #293 writer
+      capability flags, never a silent short write. Growing a file, hole
+      allocation, creating files/directories, `$Bitmap` updates, `$MFTMirr`
+      consistency and `$LogFile`/USN journaling are all out of scope — hype
+      needs none of them, and each would turn a resolver into a filesystem
+      writer with jbd2-class ordering obligations.
+    - **Fixups are mandatory and verified.** Every MFT record and INDX block
+      has its update sequence array checked and un-applied before any field is
+      trusted; a fixup mismatch is a hard refusal (torn write), not a warning.
+      Getting this wrong reads plausible garbage, so it carries dedicated
+      tests.
+    - **Refusals.** Dirty volume (Windows fast startup and hibernation leave
+      this set routinely — the common case, same discipline as ext's
+      `INCOMPAT_RECOVER` refusal); compressed (LZNT1) or encrypted `$DATA`;
+      resident `$DATA` is read-only (its bytes live inside the MFT record,
+      which hype does not rewrite); a name whose case folding falls outside
+      the cached `$UpCase` prefix (the decision-24 exFAT rule: fold names
+      exactly as other implementations do, or not at all — first 256 code
+      points cached after validating the table; 256 code points, matching the exFAT cache).
+    - **BitLocker is explicitly and permanently out of scope.** A BitLocker
+      volume is a container, not NTFS; the only supported behaviour is
+      detecting one and refusing it. This matters concretely: the Intel test
+      box's only internal NVMe is a BitLocker Windows install, so the
+      `physical:` destructive-write guard (§6d) interaction is: an NTFS write
+      path can only ever be enabled on a volume that (a) mounted writable
+      through this driver's own gates and (b) sits behind the same
+      serial/GUID + interactive confirmation chain as every physical target.
+
+    Rejected ZFS alongside this: 128 KB compressed records with multiple DVAs
+    cannot be expressed as a flat logical range map, so it would need a second
+    read model. Rejected write support for compressed/sparse allocation: it
+    requires `$Bitmap` + runlist + possibly `$MFT` rewrites, i.e. the full
+    writer hype deliberately does not have.
 
 ## 11. Pre-M0 readiness checklist
 

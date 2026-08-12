@@ -30,6 +30,19 @@ static int disk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     return 0;
 }
 
+static long g_wfail_after = -1;
+static int disk_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    if (g_wfail_after >= 0 && g_wfail_after-- == 0) return -1;
+    if (lba + count > DISK_SECTORS) return -1;
+    memcpy(g_disk + lba * SECSZ, src, (size_t)count * SECSZ);
+    return 0;
+}
+static int fail_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx; (void)lba; (void)count; (void)src;
+    return -1;
+}
+
 static int forbidden_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx; (void)lba; (void)count; (void)dst;
     g_reads++;
@@ -321,6 +334,75 @@ static void test_read_at(void) {
           hype_file_rmap_read_at(&m, disk_read, 0, 39 * SECSZ, buf, 8) == -1);
 }
 
+static void test_write_at(void) {
+    hype_file_rmap_t m;
+    uint8_t buf[3 * SECSZ];
+    unsigned i;
+
+    fill_disk();
+    /* DATA(2 @10) | HOLE(1) | DATA(1 @20) | UNWRITTEN(1 @30); 4.5 sec file */
+    hype_file_rmap_init(&m, 4 * SECSZ + SECSZ / 2);
+    hype_file_rmap_append(&m, HYPE_RANGE_DATA, 10, 2);
+    hype_file_rmap_append(&m, HYPE_RANGE_HOLE, 0, 1);
+    hype_file_rmap_append(&m, HYPE_RANGE_DATA, 20, 1);
+    hype_file_rmap_append(&m, HYPE_RANGE_UNWRITTEN, 30, 1);
+
+    for (i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(i ^ 0x5A);
+
+    /* bulk aligned write inside DATA */
+    CHECK_HEX("bulk write", 0, hype_file_rmap_write_at(&m, disk_read, disk_write, 0, 0, buf, SECSZ));
+    CHECK("bulk landed", memcmp(g_disk + 10 * SECSZ, buf, SECSZ) == 0);
+    /* ragged write inside DATA (RMW) */
+    CHECK_HEX("ragged write", 0, hype_file_rmap_write_at(&m, disk_read, disk_write, 0, SECSZ + 100, buf, 50));
+    CHECK("ragged landed", memcmp(g_disk + 11 * SECSZ + 100, buf, 50) == 0);
+    /* write spanning two DATA sectors, ragged both ends */
+    CHECK_HEX("straddle write", 0,
+              hype_file_rmap_write_at(&m, disk_read, disk_write, 0, SECSZ - 20, buf, 40));
+    CHECK("straddle landed", memcmp(g_disk + 10 * SECSZ + SECSZ - 20, buf, 20) == 0 &&
+                                 memcmp(g_disk + 11 * SECSZ, buf + 20, 20) == 0);
+
+    /* refusals: hole, unwritten, span crossing into hole -- nothing written */
+    {
+        uint8_t before[SECSZ];
+        memcpy(before, g_disk + 11 * SECSZ, SECSZ);
+        CHECK("write into hole refused",
+              hype_file_rmap_write_at(&m, disk_read, disk_write, 0, 2 * SECSZ + 8, buf, 8) != 0);
+        CHECK("write into unwritten refused",
+              hype_file_rmap_write_at(&m, disk_read, disk_write, 0, 4 * SECSZ, buf, 8) != 0);
+        CHECK("span into hole refused",
+              hype_file_rmap_write_at(&m, disk_read, disk_write, 0, 2 * SECSZ - 8, buf, 16) != 0);
+        CHECK("refused span wrote nothing",
+              memcmp(before, g_disk + 11 * SECSZ, SECSZ) == 0);
+    }
+
+    /* bounds + args */
+    CHECK("past EOF refused",
+          hype_file_rmap_write_at(&m, disk_read, disk_write, 0, 4 * SECSZ + 200, buf, 200) != 0);
+    CHECK("overflow refused",
+          hype_file_rmap_write_at(&m, disk_read, disk_write, 0, ~0ull - 4, buf, 16) != 0);
+    CHECK("len 0 no-op", hype_file_rmap_write_at(&m, disk_read, disk_write, 0, 0, buf, 0) == 0);
+    CHECK("NULL read refused", hype_file_rmap_write_at(&m, 0, disk_write, 0, 0, buf, 8) != 0);
+    CHECK("NULL write refused", hype_file_rmap_write_at(&m, disk_read, 0, 0, 0, buf, 8) != 0);
+
+    /* injected I/O failures: bulk write, RMW read, RMW write */
+    g_fail_after = 0;
+    CHECK("bulk write failure surfaces",
+          hype_file_rmap_write_at(&m, disk_read, fail_write, 0, 0, buf, SECSZ) != 0);
+    g_fail_after = 0;
+    CHECK("RMW read failure surfaces",
+          hype_file_rmap_write_at(&m, disk_read, disk_write, 0, 10, buf, 8) != 0);
+    g_fail_after = -1;
+    g_wfail_after = 0;
+    CHECK("RMW write failure surfaces",
+          hype_file_rmap_write_at(&m, disk_read, disk_write, 0, 10, buf, 8) != 0);
+    g_wfail_after = -1;
+
+    /* malformed map surfaces */
+    m.size_bytes = 40 * SECSZ;
+    CHECK("malformed map write refused",
+          hype_file_rmap_write_at(&m, disk_read, disk_write, 0, 39 * SECSZ, buf, 8) != 0);
+}
+
 int main(void) {
     test_append_and_coalesce();
     test_append_cap();
@@ -328,6 +410,7 @@ int main(void) {
     test_from_extents();
     test_locate();
     test_read_at();
+    test_write_at();
 
     if (failures == 0) {
         printf("test_file_range: all tests passed\n");

@@ -85,7 +85,7 @@ static void test_registry(void) {
     unsigned n = 0;
     const hype_fs_ops_t *const *reg = hype_fs_registry(&n);
     unsigned i;
-    CHECK_HEX("four drivers registered", 4, n);
+    CHECK_HEX("five drivers registered", 5, n);
     for (i = 0; i < n; i++) {
         CHECK("every driver probes", reg[i]->probe != 0);
         CHECK("every driver mounts", reg[i]->mount != 0);

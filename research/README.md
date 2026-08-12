@@ -36,6 +36,15 @@ not treat them as project-licensed material.
 |------|----------|----------|--------|
 | `24593_3.44_APM_Vol2.pdf` | AMD64 Architecture Programmer's Manual, Vol. 2 — System Programming (SVM/VMCB) | pub. 24593, Rev. 3.44 | https://docs.amd.com/v/u/en-US/24593_3.44_APM_Vol2 |
 | `325462-092-sdm-vol-1-2abcd-3abcd-4.pdf` | Intel® 64 and IA-32 Architectures Software Developer's Manuals — combined volume set (Vol. 1, 2ABCD, 3ABCD, 4) | order 325462, rev. 092 | https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html |
+| `t10-03-388r2-spc3-sbc2-nonvolatile-caches.pdf` | T10 SPC-3/SBC-2 Nonvolatile Caches proposal | 03-388r2, 10 March 2004 | https://www.t10.org/ftp/t10/document.03/03-388r2.pdf |
+| `microsoft-fat32-specification-v1.03.pdf` | Microsoft EFI FAT32 File System Specification | Version 1.03, 6 December 2000 | https://www.win.tue.nl/~aeb/linux/fs/fat/fatgen103.pdf (archived mirror of the Microsoft specification) |
+| `microsoft-exfat-specification-2026-08-11.html` | Microsoft exFAT File System Specification | Microsoft Learn snapshot, 11 August 2026 | https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification |
+| `linux-ext4-blockmap-2026-08-11.html` | Linux kernel ext4 block maps and extent trees | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/blockmap.html |
+| `linux-ext4-bitmaps-2026-08-11.html` | Linux kernel ext4 block and inode bitmaps | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/bitmaps.html |
+| `linux-ext4-group-descriptors-2026-08-11.html` | Linux kernel ext4 block group descriptors | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/group_descr.html |
+| `linux-ext4-inodes-2026-08-11.html` | Linux kernel ext4 inode structure | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/inodes.html |
+| `linux-ext4-journal-2026-08-11.html` | Linux kernel ext4 jbd2 journal format | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html |
+| `microsoft-hyper-v-tlfs-hypercall-interface-94373af.md` | Microsoft Hyper-V TLFS Hypercall Interface | commit `94373af`, 15 December 2025 | https://github.com/MicrosoftDocs/Virtualization-Documentation/blob/94373af503f83b800ac002911f5d137a53392656/virtualization/hyper-v-on-windows/tlfs/hypercall-interface.md |
 
 ## Archived wiki exports
 
@@ -48,12 +57,45 @@ not treat them as project-licensed material.
 - **AMD APM Vol 2 (`24593_3.44_APM_Vol2.pdf`).** SVM/VMCB work — §15 (SVM:
   VMRUN, #VMEXIT, EVENTINJ/VINTR §15.20/§15.21, intercepted-#PF semantics
   §15.12.15, decode assists, MSRPM/IOPM layout §15.11) and Appendix B
-  (VMCB layout / state-save-area field offsets). Cited throughout the M2
-  (SVM), FW-1, CPUMSR, and M4-6b task notes.
+  (VMCB layout / state-save-area field offsets). §7.6.5 identifies
+  Fn8000_0008 and Fn8000_001E as processor-topology sources; Fn8000_001E
+  returns the extended APIC ID in EAX and the compute-unit description in
+  EBX. Cited throughout the M2 (SVM), FW-1, CPUMSR, M4-6b, and #378 task
+  notes.
 - **Intel SDM (`325462-092-sdm-vol-1-2abcd-3abcd-4.pdf`).** The Intel-host
   counterpart reference (VMX/VT-x, IA-32 system programming) for the
   mandatory Intel real-hardware validation pass (AGENTS.md testing gate);
   cite the specific volume/§ against the task when used.
+- **T10 nonvolatile-cache proposal (`t10-03-388r2-spc3-sbc2-nonvolatile-caches.pdf`).** #377
+  uses §5.20 and table 3. SYNCHRONIZE CACHE(10) has opcode 35h. A zero LBA and
+  zero block count select all remaining logical blocks. SYNC_NV=0 requires
+  synchronization to the medium, and IMMED=0 withholds status until completion.
+- **FAT32 specification (`microsoft-fat32-specification-v1.03.pdf`).** Sparse-writer
+  planning uses the FAT entry rules and directory-entry definition. A zero-length
+  file has first cluster zero (page 21). `DIR_FileSize` is the file size in bytes
+  (page 24), while allocation is expressed only by the singly linked FAT cluster
+  chain. FAT32 has no field that can identify a logical hole inside that chain.
+- **exFAT specification (`microsoft-exfat-specification-2026-08-11.html`).** Sparse-writer
+  planning uses §§4.1, 6.3.5-6.3.6, and 7.6.5-7.6.7. `DataLength` describes the
+  allocated stream. `ValidDataLength` describes the contiguous prefix written by
+  the application. Implementations must return zeroes beyond `ValidDataLength`.
+  The allocation remains a contiguous run or FAT chain; the format has no logical
+  index for an arbitrary unallocated hole.
+- **Linux ext4 documentation (`linux-ext4-*-2026-08-11.html`).** Sparse-writer
+  planning uses `blockmap` for logical extent indices and unwritten extents,
+  `bitmaps` and `group-descriptors` for block allocation and free counts,
+  `inodes` for mappings, sizes and inode checksums, and `journal` for jbd2
+  metadata transactions. Allocation changes metadata and therefore cannot use
+  #204's journal-bypass reasoning, which applies only to in-place data writes.
+- **Hyper-V TLFS (`microsoft-hyper-v-tlfs-hypercall-interface-94373af.md`).** #300
+  uses "Hypercall Inputs", "Hypercall Outputs", "Hypercall Status Codes", and
+  "Establishing the Hypercall Interface (x86/x64)". The call code is input bits
+  15:0 in RCX for x64. The 64-bit result is returned in RAX, with the status in
+  bits 15:0. `HV_STATUS_INVALID_HYPERCALL_CODE` identifies an unknown call.
+  `HV_X64_MSR_HYPERCALL` bit 0 enables a page whose GPFN is bits 63:12. A
+  nonzero Guest OS ID is required before enablement. The page must be fully
+  within the guest GPA space. A call enters at the page start and the page must
+  provide near-return behavior.
 
 ## Online reference links (external, not archived)
 
@@ -80,3 +122,23 @@ Note on licenses: the KVM (GPLv2) and Bochs (LGPLv2) sources are for
 *understanding*, not copy-paste — hype is GPLv3 and its device/decode logic is
 written fresh from the primary specs. ZeldaOS (check its repo license) is a
 useful "how another small VMM structured this" comparison, same rule.
+
+## NTFS (#337)
+
+No external specification document was archived for the NTFS resolver: it was
+written from the ntfs-3g layout headers' publicly documented structures (boot
+sector, FILE record + update sequence arrays, attribute headers, mapping
+pairs/runlists, $ATTRIBUTE_LIST, $INDEX_ROOT/$INDEX_ALLOCATION/$BITMAP,
+$UpCase, $VOLUME_INFORMATION) and then **empirically validated field-by-field
+against genuine volumes**: mkntfs-created images populated through the kernel
+ntfs-3g driver, cross-checked with `ntfsinfo` dumps, byte-exact reads
+(including sparse runs and a fragmented multi-extent file), and a clean
+`ntfsfix -n` after hype's in-place writes. Two behaviours worth recording
+because they are easy to get wrong and were caught by that validation, not by
+documentation:
+
+- **Each attribute extent's mapping pairs are self-contained**: the first
+  delta of every extent is relative to LCN 0, not to the previous extent's
+  last LCN (ntfs-3g decompresses each extent from zero and merges by VCN).
+- **$VOLUME_INFORMATION's flags** live at value offset 10 (8 reserved bytes,
+  then major/minor version bytes), not offset 8.

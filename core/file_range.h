@@ -135,4 +135,17 @@ int hype_file_rmap_locate(const hype_file_rmap_t *m, uint64_t off, hype_range_ki
 int hype_file_rmap_read_at(const hype_file_rmap_t *m, hype_blk_read_fn read, void *ctx,
                            uint64_t offset, void *dst, unsigned int len);
 
+/*
+ * #337: IN-PLACE write through a range map: DATA ranges only. The range must
+ * lie wholly inside the file, and every byte of it must fall in DATA --
+ * writing into a HOLE needs allocation and into UNWRITTEN a valid-length
+ * advance, both filesystem-writer work this layer must not fake. Refused
+ * (-1) without touching the medium: the whole span is validated BEFORE the
+ * first sector is written, so a refused write is a no-op, not a torn one.
+ * Ragged sector edges read-modify-write through `read`. len==0 is a no-op.
+ */
+int hype_file_rmap_write_at(const hype_file_rmap_t *m, hype_blk_read_fn read,
+                            hype_blk_write_fn write, void *ctx, uint64_t offset,
+                            const void *src, unsigned int len);
+
 #endif /* HYPE_CORE_FILE_RANGE_H */

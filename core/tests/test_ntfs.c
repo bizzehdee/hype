@@ -1,0 +1,1493 @@
+#include <stdio.h>
+#include <string.h>
+#include "../ntfs.h"
+#include "../fs_ops.h"
+
+static int failures = 0;
+#define CHECK(desc, cond) \
+    do { if (!(cond)) { printf("FAIL: %s\n", (desc)); failures++; } } while (0)
+#define CHECK_HEX(desc, expected, actual) \
+    do { \
+        if ((unsigned long long)(expected) != (unsigned long long)(actual)) { \
+            printf("FAIL: %s: expected 0x%llx, got 0x%llx\n", (desc), \
+                   (unsigned long long)(expected), (unsigned long long)(actual)); \
+            failures++; \
+        } \
+    } while (0)
+
+#define SECSZ 512u
+#define VOL_SECTORS 4096u
+#define SPC 1u
+#define REC_SIZE 1024u
+#define MFT_LCN 100u   /* $MFT: 64 records = 128 clusters, 100..227 */
+#define MFT_RECORDS 64u
+#define INDX_LCN 240u  /* bigdir's one INDX block: clusters 240..247 */
+#define UPCASE_LCN 250u /* $UpCase data: 256 clusters, 250..505 */
+#define DATA_LCN 600u  /* file data region */
+
+static uint8_t g_vol[VOL_SECTORS * SECSZ];
+static long g_read_countdown = -1;
+
+static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    (void)ctx;
+    if (g_read_countdown >= 0 && g_read_countdown-- == 0) return -1;
+    if (lba + count > VOL_SECTORS) return -1;
+    memcpy(dst, g_vol + lba * SECSZ, (size_t)count * SECSZ);
+    return 0;
+}
+static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    if (lba + count > VOL_SECTORS) return -1;
+    memcpy(g_vol + lba * SECSZ, src, (size_t)count * SECSZ);
+    return 0;
+}
+
+static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static void put64(uint8_t *p, uint64_t v) { put32(p, (uint32_t)v); put32(p + 4, (uint32_t)(v >> 32)); }
+
+/* ---- record + attribute builders ---- */
+
+static uint8_t *rec_ptr(unsigned n) { return g_vol + (MFT_LCN + n * (REC_SIZE / SECSZ)) * SECSZ; }
+
+static void rec_init(unsigned n, int is_dir) {
+    uint8_t *r = rec_ptr(n);
+    memset(r, 0, REC_SIZE);
+    r[0] = 'F'; r[1] = 'I'; r[2] = 'L'; r[3] = 'E';
+    put16(r + 4, 0x30);              /* USA offset */
+    put16(r + 6, 3);                 /* USA count: usn + 2 sectors */
+    put16(r + 0x14, 0x38);           /* attributes offset */
+    put16(r + 0x16, (uint16_t)(0x0001u | (is_dir ? 0x0002u : 0u)));
+    put32(r + 0x1C, REC_SIZE);       /* allocated */
+    put32(r + 0x38, 0xFFFFFFFFu);    /* end marker (no attrs yet) */
+    put32(r + 0x18, 0x40);           /* bytes used */
+}
+
+/* Append an attribute record; returns the offset of its header. */
+static uint32_t attr_add(unsigned n, uint32_t type, int non_res, uint16_t flags,
+                         const uint8_t *body, uint32_t body_len) {
+    uint8_t *r = rec_ptr(n);
+    uint32_t off = 0x38;
+    uint32_t total;
+    while (off + 4u <= REC_SIZE) {
+        uint32_t t = (uint32_t)r[off] | ((uint32_t)r[off + 1] << 8) |
+                     ((uint32_t)r[off + 2] << 16) | ((uint32_t)r[off + 3] << 24);
+        if (t == 0xFFFFFFFFu) break;
+        off += (uint32_t)r[off + 4] | ((uint32_t)r[off + 5] << 8);
+    }
+    total = ((non_res ? 0x40u : 0x18u) + body_len + 7u) & ~7u;
+    put32(r + off, type);
+    put32(r + off + 4, total);
+    r[off + 8] = (uint8_t)non_res;
+    put16(r + off + 0x0C, flags);
+    if (non_res) {
+        put16(r + off + 0x20, 0x40); /* runlist offset */
+        memcpy(r + off + 0x40, body, body_len);
+    } else {
+        put32(r + off + 0x10, body_len);
+        put16(r + off + 0x14, 0x18);
+        memcpy(r + off + 0x18, body, body_len);
+    }
+    put32(r + off + total, 0xFFFFFFFFu); /* new end marker */
+    put32(r + 0x18, off + total + 8u);
+    return off;
+}
+
+static void nonres_sizes(unsigned n, uint32_t attr_off, uint64_t start_vcn, uint64_t alloc,
+                         uint64_t real, uint64_t init) {
+    uint8_t *r = rec_ptr(n);
+    put64(r + attr_off + 0x10, start_vcn);
+    put64(r + attr_off + 0x28, alloc);
+    put64(r + attr_off + 0x30, real);
+    put64(r + attr_off + 0x38, init);
+}
+
+static void rec_fixup(unsigned n) {
+    uint8_t *r = rec_ptr(n);
+    uint16_t usn = 0x0001;
+    unsigned s;
+    put16(r + 0x30, usn);
+    for (s = 0; s < REC_SIZE / SECSZ; s++) {
+        uint8_t *tail = r + (s + 1u) * SECSZ - 2u;
+        put16(r + 0x30 + (s + 1u) * 2u, (uint16_t)(tail[0] | (tail[1] << 8)));
+        put16(tail, usn);
+    }
+}
+
+/* ---- index entry builders ---- */
+
+static uint32_t ientry(uint8_t *dst, uint64_t mft_ref, const char *name, int is_dir) {
+    uint32_t nlen = (uint32_t)strlen(name);
+    uint32_t klen = 0x42u + nlen * 2u;
+    uint32_t elen = (0x10u + klen + 7u) & ~7u;
+    uint32_t i;
+    memset(dst, 0, elen);
+    put64(dst, mft_ref);
+    put16(dst + 8, (uint16_t)elen);
+    put16(dst + 10, (uint16_t)klen);
+    put16(dst + 12, 0); /* flags */
+    put64(dst + 0x10, 5u); /* parent: root (unchecked by the reader) */
+    put32(dst + 0x10 + 0x38, is_dir ? 0x10000000u : 0u);
+    dst[0x10 + 0x40] = (uint8_t)nlen;
+    dst[0x10 + 0x41] = 1; /* WIN32 namespace */
+    for (i = 0; i < nlen; i++) put16(dst + 0x10 + 0x42 + i * 2u, (uint16_t)(uint8_t)name[i]);
+    return elen;
+}
+
+static uint32_t ientry_last(uint8_t *dst) {
+    memset(dst, 0, 0x18);
+    put16(dst + 8, 0x18);
+    put16(dst + 12, 0x02); /* last */
+    return 0x18;
+}
+
+/* $INDEX_ROOT value: type/collation/block-size header + index header + entries. */
+static uint32_t build_index_root(uint8_t *v, uint32_t (*fill)(uint8_t *)) {
+    uint32_t ents;
+    put32(v + 0, 0x30);      /* indexed attribute: $FILE_NAME */
+    put32(v + 4, 1);         /* collation */
+    put32(v + 8, 4096);      /* index block size */
+    v[12] = 8;               /* clusters per block */
+    ents = fill(v + 0x20);
+    put32(v + 0x10 + 0, 0x10);        /* entries offset (from index header) */
+    put32(v + 0x10 + 4, 0x10 + ents); /* total size */
+    put32(v + 0x10 + 8, 0x10 + ents); /* allocated */
+    v[0x10 + 12] = 0;                 /* no children unless the test says so */
+    return 0x20u + ents;
+}
+
+/* ---- volume assembly ---- */
+
+static uint8_t pat(unsigned i) { return (uint8_t)(i * 17u + 11u); }
+static uint32_t hype_probe_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint32_t root_entries(uint8_t *e) {
+    uint32_t o = 0;
+    o += ientry(e + o, 40, "img.bin", 0);
+    o += ientry(e + o, 41, "vdl.bin", 0);
+    o += ientry(e + o, 42, "comp.bin", 0);
+    o += ientry(e + o, 43, "enc.bin", 0);
+    o += ientry(e + o, 44, "res.bin", 0);
+    o += ientry(e + o, 45, "subdir", 1);
+    o += ientry(e + o, 47, "bigdir", 1);
+    o += ientry(e + o, 48, "lst.bin", 0);
+    o += ientry_last(e + o);
+    return o;
+}
+static uint32_t sub_entries(uint8_t *e) {
+    uint32_t o = 0;
+    o += ientry(e + o, 46, "nested.bin", 0);
+    o += ientry(e + o, 40, "fkdir", 1); /* claims dir, record 40 is a file */
+    o += ientry(e + o, 46, "dosonly", 0);
+    e[o - 8 + 0] = 0; /* leave len/key intact; patch the namespace below */
+    o += ientry_last(e + o);
+    return o;
+}
+static uint32_t empty_entries(uint8_t *e) { return ientry_last(e); }
+
+static void build_vol(int dirty) {
+    uint8_t v[900];
+    uint8_t rl[64];
+    uint32_t off, n;
+    unsigned i;
+
+    memset(g_vol, 0, sizeof(g_vol));
+
+    /* boot sector */
+    g_vol[3] = 'N'; g_vol[4] = 'T'; g_vol[5] = 'F'; g_vol[6] = 'S';
+    g_vol[7] = ' '; g_vol[8] = ' '; g_vol[9] = ' '; g_vol[10] = ' ';
+    put16(g_vol + 0x0B, 512);
+    g_vol[0x0D] = SPC;
+    put64(g_vol + 0x28, VOL_SECTORS);
+    put64(g_vol + 0x30, MFT_LCN);
+    g_vol[0x40] = 0xF6; /* -10: 1024-byte records */
+    put16(g_vol + 0x1FE, 0xAA55);
+
+    /* record 0: $MFT, $DATA = 128 clusters at MFT_LCN */
+    rec_init(0, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 128; put16(rl + n, MFT_LCN); n += 2; rl[n++] = 0;
+    off = attr_add(0, 0x80, 1, 0, rl, n);
+    nonres_sizes(0, off, 0, 128u * SECSZ, (uint64_t)MFT_RECORDS * REC_SIZE, (uint64_t)MFT_RECORDS * REC_SIZE);
+    rec_fixup(0);
+
+    /* record 3: $Volume with $VOLUME_INFORMATION */
+    rec_init(3, 0);
+    memset(v, 0, 12);
+    v[8] = 3; v[9] = 1; /* version */
+    put16(v + 10, dirty ? 0x0001 : 0x0000);
+    attr_add(3, 0x70, 0, 0, v, 12);
+    rec_fixup(3);
+
+    /* record 5: root directory */
+    rec_init(5, 1);
+    n = build_index_root(v, root_entries);
+    attr_add(5, 0x90, 0, 0, v, n);
+    rec_fixup(5);
+
+    /* record 10: $UpCase -- 256 clusters at UPCASE_LCN, 128 KiB */
+    rec_init(10, 0);
+    n = 0;
+    rl[n++] = 0x22; put16(rl + n, 256); n += 2; put16(rl + n, UPCASE_LCN); n += 2; rl[n++] = 0;
+    off = attr_add(10, 0x80, 1, 0, rl, n);
+    nonres_sizes(10, off, 0, 256u * SECSZ, 131072, 131072);
+    rec_fixup(10);
+    for (i = 0; i < 65536u; i++) {
+        uint16_t up = (uint16_t)i;
+        if (i >= 'a' && i <= 'z') up = (uint16_t)(i - 'a' + 'A');
+        put16(g_vol + UPCASE_LCN * SECSZ + i * 2u, up);
+    }
+
+    /* record 40: img.bin -- DATA(4 cl) HOLE(3 cl) DATA(2 cl), 4300 bytes */
+    rec_init(40, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 4; put16(rl + n, DATA_LCN); n += 2;         /* 4 @600 */
+    rl[n++] = 0x01; rl[n++] = 3;                                          /* sparse 3 */
+    rl[n++] = 0x21; rl[n++] = 2; put16(rl + n, 20); n += 2;               /* 2 @620 (rel +20) */
+    rl[n++] = 0;
+    off = attr_add(40, 0x80, 1, 0, rl, n);
+    nonres_sizes(40, off, 0, 9u * SECSZ, 4300, 4300);
+    rec_fixup(40);
+    for (i = 0; i < 4u * SECSZ; i++) g_vol[DATA_LCN * SECSZ + i] = pat(i);
+    for (i = 0; i < 2u * SECSZ; i++) g_vol[(DATA_LCN + 20u) * SECSZ + i] = pat(i + 5000u);
+
+    /* record 41: vdl.bin -- 6 clusters, real 3000, initialized 1000 */
+    rec_init(41, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 6; put16(rl + n, DATA_LCN + 40u); n += 2; rl[n++] = 0;
+    off = attr_add(41, 0x80, 1, 0, rl, n);
+    nonres_sizes(41, off, 0, 6u * SECSZ, 3000, 1000);
+    rec_fixup(41);
+    for (i = 0; i < 6u * SECSZ; i++) g_vol[(DATA_LCN + 40u) * SECSZ + i] = 0xEE; /* stale */
+    for (i = 0; i < 1000u; i++) g_vol[(DATA_LCN + 40u) * SECSZ + i] = pat(i + 7000u);
+
+    /* record 42: comp.bin -- compressed $DATA: refused */
+    rec_init(42, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 1; put16(rl + n, DATA_LCN + 50u); n += 2; rl[n++] = 0;
+    off = attr_add(42, 0x80, 1, 0x0001, rl, n);
+    nonres_sizes(42, off, 0, SECSZ, 100, 100);
+    rec_fixup(42);
+
+    /* record 43: enc.bin -- encrypted: refused */
+    rec_init(43, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 1; put16(rl + n, DATA_LCN + 51u); n += 2; rl[n++] = 0;
+    off = attr_add(43, 0x80, 1, 0x4000, rl, n);
+    nonres_sizes(43, off, 0, SECSZ, 100, 100);
+    rec_fixup(43);
+
+    /* record 44: res.bin -- resident $DATA: refused */
+    rec_init(44, 0);
+    for (i = 0; i < 32u; i++) v[i] = pat(i);
+    attr_add(44, 0x80, 0, 0, v, 32);
+    rec_fixup(44);
+
+    /* record 45: subdir (small: INDEX_ROOT only), 46: nested.bin */
+    rec_init(45, 1);
+    n = build_index_root(v, sub_entries);
+    /* flip 'dosonly' (third entry) to the DOS-only namespace so a lookup
+     * must skip it */
+    {
+        uint8_t *e = v + 0x20;
+        uint32_t k;
+        for (k = 0; k < 2u; k++) e += (uint32_t)e[8] | ((uint32_t)e[9] << 8);
+        e[0x10 + 0x41] = 2; /* NS_DOS */
+    }
+    attr_add(45, 0x90, 0, 0, v, n);
+    rec_fixup(45);
+
+    rec_init(46, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 2; put16(rl + n, DATA_LCN + 60u); n += 2; rl[n++] = 0;
+    off = attr_add(46, 0x80, 1, 0, rl, n);
+    nonres_sizes(46, off, 0, 2u * SECSZ, 900, 900);
+    rec_fixup(46);
+    for (i = 0; i < 900u; i++) g_vol[(DATA_LCN + 60u) * SECSZ + i] = pat(i + 100u);
+
+    /* record 47: bigdir -- INDEX_ROOT (empty) + INDEX_ALLOCATION + BITMAP */
+    rec_init(47, 1);
+    n = build_index_root(v, empty_entries);
+    v[0x10 + 12] = 1; /* has children */
+    attr_add(47, 0x90, 0, 0, v, n);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 8; put16(rl + n, INDX_LCN); n += 2; rl[n++] = 0;
+    off = attr_add(47, 0xA0, 1, 0, rl, n);
+    nonres_sizes(47, off, 0, 4096, 4096, 4096);
+    v[0] = 0x01; /* bitmap: block 0 in use */
+    attr_add(47, 0xB0, 0, 0, v, 8);
+    rec_fixup(47);
+    /* the INDX block itself, holding deep.bin (record 49) */
+    {
+        uint8_t *x = g_vol + INDX_LCN * SECSZ;
+        uint32_t ents, s;
+        uint16_t usn = 0x0002;
+        memset(x, 0, 4096);
+        x[0] = 'I'; x[1] = 'N'; x[2] = 'D'; x[3] = 'X';
+        put16(x + 4, 0x28);  /* USA offset */
+        put16(x + 6, 9);     /* usn + 8 sectors */
+        /* node header at 0x18 */
+        ents = ientry(x + 0x58, 49, "deep.bin", 0);
+        ents += ientry_last(x + 0x58 + ents);
+        put32(x + 0x18 + 0, 0x40);        /* entries offset from node header */
+        put32(x + 0x18 + 4, 0x40 + ents); /* size */
+        put32(x + 0x18 + 8, 4096 - 0x18); /* allocated */
+        put16(x + 0x28, usn);
+        for (s = 0; s < 8u; s++) {
+            uint8_t *tail = x + (s + 1u) * SECSZ - 2u;
+            put16(x + 0x28 + (s + 1u) * 2u, (uint16_t)(tail[0] | (tail[1] << 8)));
+            put16(tail, usn);
+        }
+    }
+    rec_init(49, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 1; put16(rl + n, DATA_LCN + 70u); n += 2; rl[n++] = 0;
+    off = attr_add(49, 0x80, 1, 0, rl, n);
+    nonres_sizes(49, off, 0, SECSZ, 333, 333);
+    rec_fixup(49);
+    for (i = 0; i < 333u; i++) g_vol[(DATA_LCN + 70u) * SECSZ + i] = pat(i + 200u);
+
+    /* record 48: lst.bin -- $DATA split over two extension records (50, 51)
+     * via a resident $ATTRIBUTE_LIST. 3 clusters + 2 clusters, 2500 bytes. */
+    rec_init(48, 0);
+    memset(v, 0, 0x40u);
+    /* entry 0: $DATA, VCN 0, in record 50 */
+    put32(v + 0, 0x80); put16(v + 4, 0x20); put64(v + 8, 0); put64(v + 0x10, 50);
+    /* entry 1: $DATA, VCN 3, in record 51 */
+    put32(v + 0x20, 0x80); put16(v + 0x24, 0x20); put64(v + 0x28, 3); put64(v + 0x30, 51);
+    attr_add(48, 0x20, 0, 0, v, 0x40);
+    rec_fixup(48);
+    rec_init(50, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 3; put16(rl + n, DATA_LCN + 80u); n += 2; rl[n++] = 0;
+    off = attr_add(50, 0x80, 1, 0, rl, n);
+    nonres_sizes(50, off, 0, 5u * SECSZ, 2500, 2500);
+    rec_fixup(50);
+    rec_init(51, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 2; put16(rl + n, DATA_LCN + 90u); n += 2; rl[n++] = 0;
+    off = attr_add(51, 0x80, 1, 0, rl, n);
+    nonres_sizes(51, off, 3, 5u * SECSZ, 2500, 2500);
+    rec_fixup(51);
+    for (i = 0; i < 3u * SECSZ; i++) g_vol[(DATA_LCN + 80u) * SECSZ + i] = pat(i + 300u);
+    for (i = 0; i < 2u * SECSZ; i++) g_vol[(DATA_LCN + 90u) * SECSZ + i] = pat(i + 300u + 3u * SECSZ);
+}
+
+/* ---- tests ---- */
+
+static void test_probe(void) {
+    hype_ntfs_t fs;
+    build_vol(0);
+    CHECK_HEX("probe claims NTFS", 0, hype_ntfs_probe(vol_read, 0));
+    g_vol[3] = '-'; g_vol[4] = 'F'; g_vol[5] = 'V'; g_vol[6] = 'E';
+    g_vol[7] = '-'; g_vol[8] = 'F'; g_vol[9] = 'S'; g_vol[10] = '-';
+    CHECK("BitLocker refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    put16(g_vol + 0x0B, 4096);
+    CHECK("4Kn sectors refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    g_vol[0x1FE] = 0;
+    CHECK("missing AA55 refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    g_vol[0x0D] = 3; /* not a power of two */
+    CHECK("bad spc refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    CHECK_HEX("mount ok", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("spc", SPC, fs.spc);
+    CHECK_HEX("record size", REC_SIZE, fs.mft_record_size);
+}
+
+static void test_mount_refusals(void) {
+    hype_ntfs_t fs;
+    build_vol(1); /* dirty */
+    CHECK("dirty volume refused", hype_ntfs_mount(vol_read, 0, &fs) != 0);
+    build_vol(0);
+    /* corrupt the upcase table's ASCII folding */
+    put16(g_vol + UPCASE_LCN * SECSZ + 'a' * 2u, 'a');
+    CHECK("broken $UpCase refused", hype_ntfs_mount(vol_read, 0, &fs) != 0);
+    build_vol(0);
+    /* torn MFT record 0: break a fixup tail */
+    g_vol[(MFT_LCN + 1u) * SECSZ - 2u] ^= 0xFF;
+    CHECK("torn $MFT record refused", hype_ntfs_mount(vol_read, 0, &fs) != 0);
+}
+
+static void test_resolve_sparse(void) {
+    hype_ntfs_t fs;
+    static hype_file_rmap_t m;
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+
+    CHECK_HEX("resolve img.bin", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("size", 4300, m.size_bytes);
+    CHECK_HEX("three ranges", 3, m.count);
+    CHECK("r0 DATA", m.ranges[0].kind == HYPE_RANGE_DATA && m.ranges[0].start_lba == DATA_LCN &&
+                         m.ranges[0].sector_count == 4);
+    CHECK("r1 HOLE", m.ranges[1].kind == HYPE_RANGE_HOLE && m.ranges[1].sector_count == 3);
+    CHECK("r2 DATA", m.ranges[2].kind == HYPE_RANGE_DATA &&
+                         m.ranges[2].start_lba == DATA_LCN + 20u);
+
+    /* reads: data, then zeros through the hole, then data again */
+    {
+        uint8_t buf[SECSZ];
+        unsigned i;
+        CHECK_HEX("read data", 0, hype_file_rmap_read_at(&m, vol_read, 0, 100, buf, 64));
+        for (i = 0; i < 64u; i++) { if (buf[i] != pat(100u + i)) break; }
+        CHECK("data bytes", i == 64u);
+        CHECK_HEX("read hole", 0, hype_file_rmap_read_at(&m, vol_read, 0, 4u * SECSZ + 10u, buf, 64));
+        for (i = 0; i < 64u; i++) { if (buf[i] != 0) break; }
+        CHECK("hole zeros", i == 64u);
+        CHECK_HEX("read tail data", 0, hype_file_rmap_read_at(&m, vol_read, 0, 7u * SECSZ, buf, 64));
+        for (i = 0; i < 64u; i++) { if (buf[i] != pat(5000u + i)) break; }
+        CHECK("tail bytes", i == 64u);
+    }
+
+    /* case-insensitive + separators */
+    CHECK_HEX("resolve IMG.BIN", 0, hype_ntfs_resolve(&fs, "\\IMG.BIN", &m));
+    CHECK_HEX("resolve subdir file", 0, hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m));
+    CHECK_HEX("nested size", 900, m.size_bytes);
+    CHECK_HEX("resolve INDX-block file", 0, hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m));
+    CHECK_HEX("deep size", 333, m.size_bytes);
+    CHECK_HEX("resolve attribute-list file", 0, hype_ntfs_resolve(&fs, "/lst.bin", &m));
+    CHECK_HEX("lst size", 2500, m.size_bytes);
+    CHECK_HEX("lst one coalesced or two ranges", 2, m.count);
+    {
+        uint8_t buf[64];
+        unsigned i;
+        CHECK_HEX("lst read across piece seam", 0,
+                  hype_file_rmap_read_at(&m, vol_read, 0, 3u * SECSZ - 32u, buf, 64));
+        for (i = 0; i < 64u; i++) { if (buf[i] != pat(300u + 3u * SECSZ - 32u + i)) break; }
+        CHECK("lst seam bytes", i == 64u);
+    }
+}
+
+static void test_resolve_unwritten(void) {
+    hype_ntfs_t fs;
+    static hype_file_rmap_t m;
+    uint8_t buf[SECSZ];
+    unsigned i;
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("resolve vdl.bin", 0, hype_ntfs_resolve(&fs, "/vdl.bin", &m));
+    CHECK_HEX("vdl size", 3000, m.size_bytes);
+    CHECK_HEX("split into DATA + UNWRITTEN", 2, m.count);
+    CHECK("initialized prefix DATA", m.ranges[0].kind == HYPE_RANGE_DATA &&
+                                         m.ranges[0].sector_count == 2); /* ceil(1000/512) */
+    CHECK("tail UNWRITTEN", m.ranges[1].kind == HYPE_RANGE_UNWRITTEN);
+    /* the initialized bytes read back; the uninitialized tail reads zero,
+     * never the 0xEE stale fill */
+    CHECK_HEX("read init", 0, hype_file_rmap_read_at(&m, vol_read, 0, 0, buf, 512));
+    for (i = 0; i < 512u; i++) { if (buf[i] != pat(i + 7000u)) break; }
+    CHECK("init bytes", i == 512u);
+    CHECK_HEX("read past init", 0, hype_file_rmap_read_at(&m, vol_read, 0, 2000, buf, 200));
+    for (i = 0; i < 200u; i++) { if (buf[i] != 0) break; }
+    CHECK("uninitialized tail is zeros, not stale 0xEE", i == 200u);
+}
+
+static void test_refusals(void) {
+    hype_ntfs_t fs;
+    static hype_file_rmap_t m;
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("compressed refused", hype_ntfs_resolve(&fs, "/comp.bin", &m) != 0);
+    CHECK("encrypted refused", hype_ntfs_resolve(&fs, "/enc.bin", &m) != 0);
+    CHECK("resident refused", hype_ntfs_resolve(&fs, "/res.bin", &m) != 0);
+    CHECK("missing refused", hype_ntfs_resolve(&fs, "/nope.bin", &m) != 0);
+    CHECK("directory refused", hype_ntfs_resolve(&fs, "/subdir", &m) != 0);
+    CHECK("root refused", hype_ntfs_resolve(&fs, "/", &m) != 0);
+    CHECK("path under a file refused", hype_ntfs_resolve(&fs, "/img.bin/x", &m) != 0);
+    CHECK("NULL path refused", hype_ntfs_resolve(&fs, 0, &m) != 0);
+    /* a name needing a fold outside the cached prefix */
+    CHECK("non-ASCII name refused, not guessed",
+          hype_ntfs_resolve(&fs, "/caf\xC3\xA9.bin", &m) != 0);
+
+    /* torn INDX block */
+    build_vol(0);
+    CHECK_HEX("mount2", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    g_vol[(INDX_LCN + 1u) * SECSZ - 2u] ^= 0xFF;
+    CHECK("torn INDX refused", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+
+    /* runlist pointing past the volume */
+    build_vol(0);
+    CHECK_HEX("mount3", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        /* rewrite img.bin's first run to LCN 100000 (past the media) */
+        uint8_t *r = rec_ptr(40);
+        /* undo fixups on our copy is not needed: patch the runlist bytes and refix */
+        uint8_t rl2[16];
+        uint32_t n2 = 0;
+        rl2[n2++] = 0x31; rl2[n2++] = 4; rl2[n2++] = 0xA0; rl2[n2++] = 0x86; rl2[n2++] = 0x01;
+        rl2[n2++] = 0;
+        memcpy(r + 0x38 + 0x40, rl2, n2); /* first attr's runlist */
+        rec_fixup(40);
+    }
+    CHECK("out-of-media runlist refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* I/O failure sweep across mount + resolve: fail every nth read */
+    {
+        long n;
+        for (n = 0; n < 30; n++) {
+            hype_ntfs_t f2;
+            build_vol(0);
+            g_read_countdown = n;
+            if (hype_ntfs_mount(vol_read, 0, &f2) == 0) {
+                (void)hype_ntfs_resolve(&f2, "/img.bin", &m);
+            }
+            g_read_countdown = -1;
+        }
+        build_vol(0);
+        CHECK_HEX("mount after sweep", 0, hype_ntfs_mount(vol_read, 0, &fs));
+        CHECK_HEX("resolve after sweep", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    }
+}
+
+static void test_fs_ops_ntfs(void) {
+    static hype_fs_t fs;
+    static hype_fs_file_t f;
+    uint8_t buf[600];
+    unsigned i;
+
+    build_vol(0);
+    CHECK_HEX("auto-mount claims ntfs", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK("driver name", strcmp(fs.ops->name, "ntfs") == 0);
+    CHECK("caps: read + in-place + sparse, nothing else",
+          hype_fs_caps(&fs) ==
+              (HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_SPARSE));
+
+    CHECK_HEX("lookup", 0, hype_fs_lookup(&fs, "/img.bin", &f));
+    CHECK_HEX("size", 4300, f.size);
+    CHECK_HEX("read across data|hole seam", 0, hype_fs_read_at(&f, 4u * SECSZ - 32u, buf, 64));
+    for (i = 0; i < 32u; i++) { if (buf[i] != pat(4u * SECSZ - 32u + i)) break; }
+    CHECK("seam data half", i == 32u);
+    for (i = 32u; i < 64u; i++) { if (buf[i] != 0) break; }
+    CHECK("seam hole half", i == 64u);
+
+    /* in-place write into DATA: lands and reads back */
+    CHECK_HEX("write into DATA", 0, hype_fs_write_at(&f, 100, "hello", 5));
+    CHECK_HEX("read back", 0, hype_fs_read_at(&f, 100, buf, 5));
+    CHECK("write landed", memcmp(buf, "hello", 5) == 0);
+    /* a write touching the HOLE is refused BEFORE anything lands */
+    {
+        uint8_t before[SECSZ];
+        memcpy(before, g_vol + DATA_LCN * SECSZ + 3u * SECSZ, SECSZ);
+        CHECK("write spanning into hole refused",
+              hype_fs_write_at(&f, 4u * SECSZ - 16u, buf, 64) != 0);
+        CHECK("nothing written by refused span",
+              memcmp(before, g_vol + DATA_LCN * SECSZ + 3u * SECSZ, SECSZ) == 0);
+    }
+    CHECK("write into hole refused", hype_fs_write_at(&f, 5u * SECSZ, buf, 8) != 0);
+    /* writes into UNWRITTEN are refused too (VDL advance is #383-class work) */
+    CHECK_HEX("lookup vdl", 0, hype_fs_lookup(&fs, "/vdl.bin", &f));
+    CHECK("write into unwritten refused", hype_fs_write_at(&f, 2000, buf, 8) != 0);
+    CHECK("write into initialized prefix ok", hype_fs_write_at(&f, 10, buf, 8) == 0);
+
+    /* growth/namespace are absent, not stubbed */
+    CHECK("append refused", hype_fs_append(&f, buf, 1) != 0);
+    CHECK("create refused", hype_fs_create(&fs, "/x", &f) != 0);
+    CHECK("write past EOF refused", hype_fs_write_at(&f, f.size - 2, buf, 8) != 0);
+
+    /* read-only mount masks the write capability */
+    CHECK_HEX("ro mount", 0, hype_fs_mount_auto(&fs, vol_read, 0, 0));
+    CHECK("ro caps", hype_fs_caps(&fs) == (HYPE_FS_CAP_READ | HYPE_FS_CAP_SPARSE));
+    CHECK_HEX("ro lookup", 0, hype_fs_lookup(&fs, "/img.bin", &f));
+    CHECK("ro write refused", hype_fs_write_at(&f, 0, buf, 4) != 0);
+}
+
+
+/* ---- second wave: boot variants, malformed structures, list edge cases ---- */
+
+static void test_boot_variants(void) {
+    hype_ntfs_t fs;
+
+    /* positive clusters-per-record encoding */
+    build_vol(0);
+    g_vol[0x40] = 2; /* 2 clusters * 1 spc * 512 = 1024 bytes */
+    CHECK_HEX("positive cpr mounts", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("positive cpr size", 1024, fs.mft_record_size);
+
+    build_vol(0);
+    g_vol[0x40] = 16; /* 8192 bytes: over the cap */
+    CHECK("oversized positive cpr refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    g_vol[0x40] = 0xF8; /* -8: 256 bytes, under a sector */
+    CHECK("undersized record refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    g_vol[0x40] = 0xF3; /* -13: 8192, over the cap */
+    CHECK("oversized record refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    put64(g_vol + 0x28, 0); /* no sectors */
+    CHECK("zero sectors refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    put64(g_vol + 0x30, 0); /* no MFT */
+    CHECK("zero mft_lcn refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    put64(g_vol + 0x30, VOL_SECTORS); /* MFT past the end */
+    CHECK("mft past media refused", hype_ntfs_probe(vol_read, 0) != 0);
+    build_vol(0);
+    g_read_countdown = 0;
+    CHECK("unreadable boot refused", hype_ntfs_probe(vol_read, 0) != 0);
+    g_read_countdown = -1;
+    build_vol(0);
+    g_vol[0x0D] = 0;
+    CHECK("spc 0 refused", hype_ntfs_probe(vol_read, 0) != 0);
+}
+
+/* Rewrite one attribute's runlist in record `n` and refix. `attr_off` is the
+ * offset returned by attr_add (0x38 for the first attribute). */
+static void patch_runlist(unsigned n, uint32_t attr_off, const uint8_t *rl, uint32_t rl_len) {
+    uint8_t *r = rec_ptr(n);
+    memcpy(r + attr_off + 0x40, rl, rl_len);
+    rec_fixup(n);
+}
+
+static void test_malformed_structures(void) {
+    hype_ntfs_t fs;
+    static hype_file_rmap_t m;
+    uint8_t rl[16];
+    uint32_t n;
+
+    /* malformed runlists on img.bin's $DATA (first attribute at 0x38) */
+    struct { const char *what; uint8_t bytes[8]; uint32_t len; } cases[] = {
+        {"len_sz 0", {0x20, 9, 0, 0}, 4},
+        {"len_sz 9", {0x29, 9, 9, 9, 9, 9, 9, 9}, 8},
+        {"truncated", {0x24, 9}, 2},
+        {"zero run", {0x21, 0, 44, 0}, 4},
+    };
+    unsigned c;
+    for (c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        build_vol(0);
+        CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+        patch_runlist(40, 0x38, cases[c].bytes, cases[c].len);
+        CHECK(cases[c].what, hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+    }
+
+    /* negative LCN */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    n = 0;
+    rl[n++] = 0x11; rl[n++] = 9; rl[n++] = 0x80; /* 1-byte delta: -128 from 0 */
+    rl[n++] = 0;
+    patch_runlist(40, 0x38, rl, n);
+    CHECK("negative LCN refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* record with a broken attribute chain (unaligned length) */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(40);
+        put32(r + 0x38 + 4, 0x43); /* not 8-aligned */
+        rec_fixup(40);
+    }
+    CHECK("unaligned attribute refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* an entry pointing at a record that is not FILE */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(40);
+        r[0] = 'B';
+        rec_fixup(40); /* fixups fine, magic wrong */
+    }
+    CHECK("bad record magic refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* record marked not-in-use */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(40);
+        put16(r + 0x16, 0x0000);
+        rec_fixup(40);
+    }
+    CHECK("free record refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* fixup structure out of range */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(40);
+        put16(r + 6, 1); /* usa_count too small */
+    }
+    CHECK("bad usa_count refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(40);
+        put16(r + 4, REC_SIZE - 2); /* usa runs off the record */
+    }
+    CHECK("bad usa_off refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* $Volume without VOLUME_INFORMATION */
+    build_vol(0);
+    rec_init(3, 0); /* re-init: no attributes at all */
+    rec_fixup(3);
+    CHECK("missing $VOLUME_INFORMATION refused", hype_ntfs_mount(vol_read, 0, &fs) != 0);
+
+    /* $UpCase too short */
+    build_vol(0);
+    {
+        uint8_t *r = rec_ptr(10);
+        put64(r + 0x38 + 0x30, 100); /* real size under the cache */
+        rec_fixup(10);
+    }
+    CHECK("short $UpCase refused", hype_ntfs_mount(vol_read, 0, &fs) != 0);
+
+    /* directory without a bitmap behind an INDEX_ALLOCATION */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        /* rebuild bigdir with INDEX_ROOT + INDEX_ALLOCATION but NO bitmap */
+        uint8_t v2[900];
+        uint8_t rl2[8];
+        uint32_t n2 = build_index_root(v2, empty_entries);
+        uint32_t o2;
+        v2[0x10 + 12] = 1;
+        rec_init(47, 1);
+        attr_add(47, 0x90, 0, 0, v2, n2);
+        n2 = 0;
+        rl2[n2++] = 0x21; rl2[n2++] = 8; put16(rl2 + n2, INDX_LCN); n2 += 2; rl2[n2++] = 0;
+        o2 = attr_add(47, 0xA0, 1, 0, rl2, n2);
+        nonres_sizes(47, o2, 0, 4096, 4096, 4096);
+        rec_fixup(47);
+    }
+    CHECK("allocation without bitmap refused",
+          hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+
+    /* map_trim: a runlist covering MORE clusters than the size needs is
+     * trimmed, not refused (NTFS allocates whole clusters) */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t rl3[8];
+        uint32_t n3 = 0;
+        rl3[n3++] = 0x21; rl3[n3++] = 12; put16(rl3 + n3, DATA_LCN); n3 += 2; rl3[n3++] = 0;
+        patch_runlist(40, 0x38, rl3, n3); /* 12 clusters for a 4300-byte file */
+    }
+    CHECK_HEX("slack clusters trimmed", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("trimmed coverage", (4300u + 511u) / 512u, m.ranges[0].sector_count);
+}
+
+static void test_list_and_names(void) {
+    hype_ntfs_t fs;
+    static hype_file_rmap_t m;
+
+    /* non-resident attribute list: move lst.bin's list value into a cluster */
+    build_vol(0);
+    {
+        uint8_t v2[0x40];
+        uint8_t rl2[8];
+        uint32_t n2, o2;
+        /* the same two entries the resident list carried */
+        memset(v2, 0, sizeof v2);
+        put32(v2 + 0, 0x80); put16(v2 + 4, 0x20); put64(v2 + 8, 0); put64(v2 + 0x10, 50);
+        put32(v2 + 0x20, 0x80); put16(v2 + 0x24, 0x20); put64(v2 + 0x28, 3); put64(v2 + 0x30, 51);
+        memcpy(g_vol + (DATA_LCN + 95u) * SECSZ, v2, sizeof v2);
+        rec_init(48, 0);
+        n2 = 0;
+        rl2[n2++] = 0x21; rl2[n2++] = 1; put16(rl2 + n2, DATA_LCN + 95u); n2 += 2; rl2[n2++] = 0;
+        o2 = attr_add(48, 0x20, 1, 0, rl2, n2);
+        nonres_sizes(48, o2, 0, SECSZ, sizeof v2, sizeof v2);
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("non-resident list resolves", 0, hype_ntfs_resolve(&fs, "/lst.bin", &m));
+    CHECK_HEX("nr-list size", 2500, m.size_bytes);
+
+    /* an oversized non-resident list is refused */
+    {
+        uint8_t *r = rec_ptr(48);
+        put64(r + 0x38 + 0x30, 100000); /* real_size over the cap */
+        rec_fixup(48);
+    }
+    CHECK("oversized list refused", hype_ntfs_resolve(&fs, "/lst.bin", &m) != 0);
+
+    /* a broken list entry (elen 0) */
+    build_vol(0);
+    {
+        uint8_t *r = rec_ptr(48);
+        put16(r + 0x38 + 0x18 + 4, 0); /* first entry's length = 0 */
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("broken list entry refused", hype_ntfs_resolve(&fs, "/lst.bin", &m) != 0);
+
+    /* an on-disk name using a code point past the cache: skipped, not matched */
+    build_vol(0);
+    {
+        /* rename img.bin's root entry to use U+0142 as its first char */
+        uint8_t *root = rec_ptr(5);
+        /* entry area starts at value+0x20; value starts at 0x38+0x18 */
+        uint8_t *e = root + 0x38 + 0x18 + 0x20;
+        put16(e + 0x10 + 0x42, 0x0142);
+        rec_fixup(5);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("exotic on-disk name never matches an ASCII query",
+          hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+    CHECK_HEX("later entries still found", 0, hype_ntfs_resolve(&fs, "/vdl.bin", &m));
+
+    /* very long component name refused */
+    {
+        char big[300];
+        unsigned i;
+        big[0] = '/';
+        for (i = 1; i < 290u; i++) big[i] = 'a';
+        big[290] = 0;
+        CHECK("overlong component refused", hype_ntfs_resolve(&fs, big, &m) != 0);
+    }
+    /* empty path / double slash */
+    CHECK("empty refused", hype_ntfs_resolve(&fs, "", &m) != 0);
+    CHECK_HEX("doubled separators fine", 0, hype_ntfs_resolve(&fs, "//vdl.bin", &m));
+
+    /* unmounted fs refused */
+    {
+        hype_ntfs_t cold;
+        cold.upcase_loaded = 0;
+        CHECK("unmounted resolve refused", hype_ntfs_resolve(&cold, "/x", &m) != 0);
+    }
+}
+
+
+static void test_more_edges(void) {
+    hype_ntfs_t fs;
+    static hype_file_rmap_t m;
+
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    /* DOS-only names are skipped, dir-flagged file records refuse descent */
+    CHECK("DOS-namespace entry not matched", hype_ntfs_resolve(&fs, "/subdir/dosonly", &m) != 0);
+    CHECK("descent into a file record refused",
+          hype_ntfs_resolve(&fs, "/subdir/fkdir/x.bin", &m) != 0);
+    CHECK_HEX("siblings still fine", 0, hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m));
+
+    /* a named $DATA stream before the unnamed one is skipped */
+    build_vol(0);
+    {
+        /* rebuild record 46 with a named stream first */
+        uint8_t rl[8];
+        uint32_t n = 0, off;
+        rec_init(46, 0);
+        rl[n++] = 0x21; rl[n++] = 1; put16(rl + n, DATA_LCN + 75u); n += 2; rl[n++] = 0;
+        off = attr_add(46, 0x80, 1, 0, rl, n);
+        rec_ptr(46)[off + 9] = 4; /* name_len 4: a named stream */
+        nonres_sizes(46, off, 0, SECSZ, 50, 50);
+        n = 0;
+        rl[n++] = 0x21; rl[n++] = 2; put16(rl + n, DATA_LCN + 60u); n += 2; rl[n++] = 0;
+        off = attr_add(46, 0x80, 1, 0, rl, n);
+        nonres_sizes(46, off, 0, 2u * SECSZ, 900, 900);
+        rec_fixup(46);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("named stream skipped", 0, hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m));
+    CHECK_HEX("unnamed stream size", 900, m.size_bytes);
+
+    /* an over-fragmented runlist reports too_fragmented and refuses */
+    build_vol(0);
+    {
+        static uint8_t rl[720];
+        uint32_t n = 0;
+        unsigned k;
+        uint8_t *r = rec_ptr(40);
+        for (k = 0; k < 130u; k++) {
+            rl[n++] = 0x11; rl[n++] = 1; rl[n++] = (k == 0) ? (uint8_t)0x7F : (uint8_t)2;
+            rl[n++] = 0x01; rl[n++] = 1; /* hole */
+        }
+        rl[n++] = 0;
+        /* rebuild record 40 with an attribute large enough for this runlist */
+        rec_init(40, 0);
+        {
+            uint32_t off = attr_add(40, 0x80, 1, 0, rl, n);
+            nonres_sizes(40, off, 0, 260u * SECSZ, 260u * SECSZ, 260u * SECSZ);
+        }
+        rec_fixup(40);
+        (void)r;
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("over-fragmented refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* attribute chain guards */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(40);
+        put16(r + 0x14, REC_SIZE); /* attrs offset off the end */
+        rec_fixup(40);
+    }
+    CHECK("attrs offset out of range refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* $VOLUME_INFORMATION too short */
+    build_vol(0);
+    {
+        uint8_t *r = rec_ptr(3);
+        put32(r + 0x38 + 0x10, 4); /* value length 4 < 12 */
+        rec_fixup(3);
+    }
+    CHECK("short volume info refused", hype_ntfs_mount(vol_read, 0, &fs) != 0);
+
+    /* index-root shape guards */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(47); /* bigdir */
+        put32(r + 0x38 + 0x18 + 8, 0x300); /* block size: not a power of two */
+        rec_fixup(47);
+    }
+    CHECK("bad block size refused", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(47);
+        put32(r + 0x38 + 0x18 + 0, 0x80); /* indexed type: not $FILE_NAME */
+        rec_fixup(47);
+    }
+    CHECK("non-filename index refused", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(47);
+        put32(r + 0x38 + 0x10, 0x10); /* index-root value shorter than its header */
+        rec_fixup(47);
+    }
+    CHECK("truncated index root refused", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+
+    /* entries area overrunning the value */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(5);
+        put32(r + 0x38 + 0x18 + 0x10 + 4, 0x7000); /* ents size >> value size */
+        rec_fixup(5);
+    }
+    CHECK("oversized entries area refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* a torn entry (length under the minimum) */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(5);
+        put16(r + 0x38 + 0x18 + 0x20 + 8, 8); /* first entry elen 8 < 0x10 */
+        rec_fixup(5);
+    }
+    CHECK("undersized entry refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+}
+
+
+static void test_attr_and_list_guards(void) {
+    hype_ntfs_t fs;
+    static hype_file_rmap_t m;
+
+    /* boot: the OTHER signature byte */
+    build_vol(0);
+    g_vol[0x1FF] = 0;
+    CHECK("bad 0xAA byte refused", hype_ntfs_probe(vol_read, 0) != 0);
+
+    /* attribute shape guards on img.bin's $DATA header */
+    struct { const char *what; uint32_t off; uint32_t val; int is16; } shapes[] = {
+        {"attr length 16", 0x38 + 4, 16, 0},
+        {"attr length past record", 0x38 + 4, 0x7F8, 0},
+        {"non-resident header short", 0x38 + 4, 0x30, 0},
+        {"runlist offset past length", 0x38 + 0x20, 0x600, 1},
+    };
+    unsigned c;
+    for (c = 0; c < sizeof shapes / sizeof shapes[0]; c++) {
+        build_vol(0);
+        CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+        {
+            uint8_t *r = rec_ptr(40);
+            if (shapes[c].is16) put16(r + shapes[c].off, (uint16_t)shapes[c].val);
+            else put32(r + shapes[c].off, shapes[c].val);
+            rec_fixup(40);
+        }
+        CHECK(shapes[c].what, hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+    }
+
+    /* resident value overrunning its attribute (res.bin) */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(44);
+        put32(r + 0x38 + 0x10, 0x400); /* val_len far past the attribute */
+        rec_fixup(44);
+    }
+    CHECK("resident value overrun refused", hype_ntfs_resolve(&fs, "/res.bin", &m) != 0);
+
+    /* attribute chain running off the record end without a terminator */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(40);
+        put16(r + 0x14, REC_SIZE - 8u); /* attrs start 8 bytes from the end */
+        rec_fixup(40);
+    }
+    CHECK("chain past record end refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* record magic: second byte corrupt */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(40);
+        r[1] = 'X';
+        rec_fixup(40);
+    }
+    CHECK("magic byte 1 refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* $ATTRIBUTE_LIST variants on lst.bin (record 48) */
+    /* a foreign entry type before the $DATA entries */
+    build_vol(0);
+    {
+        uint8_t v2[0x60];
+        memset(v2, 0, sizeof v2);
+        put32(v2 + 0, 0x30); put16(v2 + 4, 0x20); put64(v2 + 0x10, 48); /* $FILE_NAME piece */
+        put32(v2 + 0x20, 0x80); put16(v2 + 0x24, 0x20); put64(v2 + 0x28, 0); put64(v2 + 0x30, 50);
+        put32(v2 + 0x40, 0x80); put16(v2 + 0x44, 0x20); put64(v2 + 0x48, 3); put64(v2 + 0x50, 51);
+        rec_init(48, 0);
+        attr_add(48, 0x20, 0, 0, v2, sizeof v2);
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("foreign list entries skipped", 0, hype_ntfs_resolve(&fs, "/lst.bin", &m));
+
+    /* two consecutive entries for the SAME extension record: visited once */
+    build_vol(0);
+    {
+        uint8_t v2[0x60];
+        memset(v2, 0, sizeof v2);
+        put32(v2 + 0, 0x80); put16(v2 + 4, 0x20); put64(v2 + 8, 0); put64(v2 + 0x10, 50);
+        put32(v2 + 0x20, 0x80); put16(v2 + 0x24, 0x20); put64(v2 + 0x28, 1); put64(v2 + 0x30, 50);
+        put32(v2 + 0x40, 0x80); put16(v2 + 0x44, 0x20); put64(v2 + 0x48, 3); put64(v2 + 0x50, 51);
+        rec_init(48, 0);
+        attr_add(48, 0x20, 0, 0, v2, sizeof v2);
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("duplicate-record entries visited once", 0, hype_ntfs_resolve(&fs, "/lst.bin", &m));
+
+    /* list entry pointing at a record with no $DATA at all */
+    build_vol(0);
+    {
+        uint8_t v2[0x20];
+        memset(v2, 0, sizeof v2);
+        put32(v2 + 0, 0x80); put16(v2 + 4, 0x20); put64(v2 + 8, 0); put64(v2 + 0x10, 45);
+        rec_init(48, 0);
+        attr_add(48, 0x20, 0, 0, v2, sizeof v2);
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("listed record without the attribute refused",
+          hype_ntfs_resolve(&fs, "/lst.bin", &m) != 0);
+
+    /* list entry pointing past the MFT */
+    build_vol(0);
+    {
+        uint8_t v2[0x20];
+        memset(v2, 0, sizeof v2);
+        put32(v2 + 0, 0x80); put16(v2 + 4, 0x20); put64(v2 + 8, 0); put64(v2 + 0x10, 9999);
+        rec_init(48, 0);
+        attr_add(48, 0x20, 0, 0, v2, sizeof v2);
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("list entry past the MFT refused", hype_ntfs_resolve(&fs, "/lst.bin", &m) != 0);
+
+    /* non-resident list with real_size 0 */
+    build_vol(0);
+    {
+        uint8_t rl2[8];
+        uint32_t n2 = 0, o2;
+        rec_init(48, 0);
+        rl2[n2++] = 0x21; rl2[n2++] = 1; put16(rl2 + n2, DATA_LCN + 95u); n2 += 2; rl2[n2++] = 0;
+        o2 = attr_add(48, 0x20, 1, 0, rl2, n2);
+        nonres_sizes(48, o2, 0, SECSZ, 0, 0);
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("empty non-resident list refused", hype_ntfs_resolve(&fs, "/lst.bin", &m) != 0);
+
+    /* non-resident list with a garbage runlist */
+    build_vol(0);
+    {
+        uint8_t rl2[4];
+        uint32_t o2;
+        rec_init(48, 0);
+        rl2[0] = 0x20; rl2[1] = 1; rl2[2] = 0; rl2[3] = 0; /* len_sz 0: bad */
+        o2 = attr_add(48, 0x20, 1, 0, rl2, 4);
+        nonres_sizes(48, o2, 0, SECSZ, 0x40, 0x40);
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("garbage list runlist refused", hype_ntfs_resolve(&fs, "/lst.bin", &m) != 0);
+
+    /* index root marked non-resident */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(45);
+        r[0x38 + 8] = 1;
+        rec_fixup(45);
+    }
+    CHECK("non-resident index root refused",
+          hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m) != 0);
+
+    /* bitmap too large for the reader's buffer */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(47);
+        /* find $BITMAP (third attribute) and inflate val_len: attrs are DATA
+         * order 0x90, 0xA0, 0xB0 */
+        uint32_t off = 0x38;
+        while (hype_probe_u32(r + off) != 0xB0u) off += (uint32_t)r[off + 4] | ((uint32_t)r[off + 5] << 8);
+        put32(r + off + 0x10, 600);
+        rec_fixup(47);
+    }
+    CHECK("oversized dir bitmap refused", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+
+    /* a bitmap with too few bits: blocks past it are skipped (not found) */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t *r = rec_ptr(47);
+        uint32_t off = 0x38;
+        while (hype_probe_u32(r + off) != 0xB0u) off += (uint32_t)r[off + 4] | ((uint32_t)r[off + 5] << 8);
+        put32(r + off + 0x10, 0); /* zero-length bitmap */
+        rec_fixup(47);
+    }
+    CHECK("no-bit bitmap finds nothing", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+
+    /* INDX magic second byte */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    g_vol[INDX_LCN * SECSZ + 1] = 'Q';
+    CHECK("INDX magic byte 1 refused", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+
+    /* an entry whose FILE_NAME overruns its key: skipped */
+    build_vol(0);
+    {
+        uint8_t *r = rec_ptr(5);
+        uint8_t *e = r + 0x38 + 0x18 + 0x20; /* first root entry: img.bin */
+        e[0x10 + 0x40] = 200; /* name length far past the key */
+        rec_fixup(5);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("overrunning name skipped", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+    CHECK_HEX("later entries fine", 0, hype_ntfs_resolve(&fs, "/vdl.bin", &m));
+
+    /* entries area with no last-entry flag: scan runs off the end cleanly */
+    build_vol(0);
+    {
+        uint8_t *r = rec_ptr(45);
+        uint8_t *e = r + 0x38 + 0x18 + 0x20;
+        uint32_t elen;
+        unsigned k;
+        for (k = 0; k < 3u; k++) { /* walk to the last entry */
+            elen = (uint32_t)e[8] | ((uint32_t)e[9] << 8);
+            e += elen;
+        }
+        put16(e + 12, 0); /* clear its LAST flag */
+        rec_fixup(45);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("no-terminator entry area is a clean miss",
+          hype_ntfs_resolve(&fs, "/subdir/zzz.bin", &m) != 0);
+}
+
+
+static void test_final_edges(void) {
+    hype_ntfs_t fs;
+    static hype_file_rmap_t m;
+    uint8_t rl[16];
+    uint32_t n, off;
+
+    /* sparse + VDL interplay: HOLE passthrough, whole-run UNWRITTEN, and the
+     * boundary falling mid-run with a real tail */
+    build_vol(0);
+    {
+        rec_init(40, 0); /* re-purpose img.bin: DATA(2) HOLE(2) DATA(4), init 300 */
+        n = 0;
+        rl[n++] = 0x21; rl[n++] = 2; put16(rl + n, DATA_LCN); n += 2;
+        rl[n++] = 0x01; rl[n++] = 2;
+        rl[n++] = 0x21; rl[n++] = 4; put16(rl + n, 30); n += 2; /* rel +30 */
+        rl[n++] = 0;
+        off = attr_add(40, 0x80, 1, 0, rl, n);
+        nonres_sizes(40, off, 0, 8u * SECSZ, 8u * SECSZ - 100u, 300);
+        rec_fixup(40);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("sparse+vdl resolves", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK("split: DATA head", m.ranges[0].kind == HYPE_RANGE_DATA &&
+                                  m.ranges[0].sector_count == 1);
+    CHECK("split: UNWRITTEN tail of first run", m.ranges[1].kind == HYPE_RANGE_UNWRITTEN);
+    CHECK("HOLE passthrough", m.ranges[2].kind == HYPE_RANGE_HOLE);
+    CHECK("post-hole run UNWRITTEN", m.ranges[3].kind == HYPE_RANGE_UNWRITTEN);
+
+    /* boundary exactly at a run edge: no split, later runs whole-UNWRITTEN */
+    build_vol(0);
+    {
+        rec_init(40, 0);
+        n = 0;
+        rl[n++] = 0x21; rl[n++] = 2; put16(rl + n, DATA_LCN); n += 2;
+        rl[n++] = 0x21; rl[n++] = 4; put16(rl + n, 30); n += 2;
+        rl[n++] = 0;
+        off = attr_add(40, 0x80, 1, 0, rl, n);
+        nonres_sizes(40, off, 0, 6u * SECSZ, 6u * SECSZ - 1u, 2u * SECSZ);
+        rec_fixup(40);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("edge-vdl resolves", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("edge-vdl two ranges", 2, m.count);
+    CHECK("edge-vdl kinds", m.ranges[0].kind == HYPE_RANGE_DATA &&
+                                m.ranges[1].kind == HYPE_RANGE_UNWRITTEN);
+
+    /* trim dropping a whole trailing run */
+    build_vol(0);
+    {
+        rec_init(40, 0);
+        n = 0;
+        rl[n++] = 0x21; rl[n++] = 9; put16(rl + n, DATA_LCN); n += 2;
+        rl[n++] = 0x21; rl[n++] = 3; put16(rl + n, 40); n += 2;
+        rl[n++] = 0;
+        off = attr_add(40, 0x80, 1, 0, rl, n);
+        nonres_sizes(40, off, 0, 12u * SECSZ, 4300, 4300);
+        rec_fixup(40);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("trailing-run trim resolves", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("trailing run dropped", 1, m.count);
+
+    /* a runlist that fills its space exactly, no terminator byte */
+    build_vol(0);
+    {
+        rec_init(40, 0);
+        n = 0;
+        rl[n++] = 0x21; rl[n++] = 9; put16(rl + n, DATA_LCN); n += 2; /* 4 bytes, no 0 */
+        off = attr_add(40, 0x80, 1, 0, rl, n);
+        nonres_sizes(40, off, 0, 9u * SECSZ, 4300, 4300);
+        /* shrink the attribute so the runlist区 ends exactly at the runs */
+        put32(rec_ptr(40) + off + 4, 0x48);
+        put32(rec_ptr(40) + off + 0x48, 0xFFFFFFFFu);
+        rec_fixup(40);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("terminatorless runlist ok", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+
+    /* runlist decode leftovers: off_sz 9; truncated offset bytes */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    { uint8_t bad[3] = {0x91, 1, 0}; patch_runlist(40, 0x38, bad, 3); }
+    CHECK("off_sz 9 refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        rec_init(40, 0);
+        n = 0;
+        rl[n++] = 0x21; rl[n++] = 1; put16(rl + n, DATA_LCN); n += 2;
+        rl[n++] = 0x14; rl[n++] = 1; rl[n++] = 1; rl[n++] = 1; /* header wants 4+1 bytes; 3 left */
+        off = attr_add(40, 0x80, 1, 0, rl, n);
+        put32(rec_ptr(40) + off + 4, 0x48); /* runlist space: exactly these 8 bytes */
+        put32(rec_ptr(40) + off + 0x48, 0xFFFFFFFFu);
+        nonres_sizes(40, off, 0, SECSZ, 100, 100);
+        rec_fixup(40);
+    }
+    CHECK("truncated run fields refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* fixups: usa_count 0; record magic bytes 2 and 3 */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    put16(rec_ptr(40) + 6, 0);
+    CHECK("usa_count 0 refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    rec_ptr(40)[2] = 'Q';
+    rec_fixup(40);
+    CHECK("magic byte 2 refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* attribute list: a base-record piece plus a duplicate base entry */
+    build_vol(0);
+    {
+        uint8_t v2[0x60];
+        uint8_t rl2[8];
+        uint32_t n2;
+        memset(v2, 0, sizeof v2);
+        put32(v2 + 0, 0x80); put16(v2 + 4, 0x20); put64(v2 + 8, 0); put64(v2 + 0x10, 48);
+        put32(v2 + 0x20, 0x80); put16(v2 + 0x24, 0x20); put64(v2 + 0x28, 1); put64(v2 + 0x30, 48);
+        put32(v2 + 0x40, 0x80); put16(v2 + 0x44, 0x20); put64(v2 + 0x48, 3); put64(v2 + 0x50, 51);
+        rec_init(48, 0);
+        attr_add(48, 0x20, 0, 0, v2, sizeof v2);
+        n2 = 0;
+        rl2[n2++] = 0x21; rl2[n2++] = 3; put16(rl2 + n2, DATA_LCN + 80u); n2 += 2; rl2[n2++] = 0;
+        off = attr_add(48, 0x80, 1, 0, rl2, n2);
+        nonres_sizes(48, off, 0, 5u * SECSZ, 2500, 2500);
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("base-record piece + duplicate entry ok", 0,
+              hype_ntfs_resolve(&fs, "/lst.bin", &m));
+    CHECK_HEX("combined size", 2500, m.size_bytes);
+
+    /* an extension record with a broken attribute chain */
+    build_vol(0);
+    {
+        uint8_t *r = rec_ptr(51);
+        put32(r + 0x38 + 4, 0x43); /* unaligned */
+        rec_fixup(51);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("broken extension record refused", hype_ntfs_resolve(&fs, "/lst.bin", &m) != 0);
+
+    /* a list entry overrunning the list */
+    build_vol(0);
+    {
+        uint8_t v2[0x40];
+        memset(v2, 0, sizeof v2);
+        put32(v2 + 0, 0x80); put16(v2 + 4, 0x20); put64(v2 + 8, 0); put64(v2 + 0x10, 50);
+        put32(v2 + 0x20, 0x80); put16(v2 + 0x24, 0x30); /* runs past the 0x40 value */
+        put64(v2 + 0x28, 3); put64(v2 + 0x30, 51);
+        rec_init(48, 0);
+        attr_add(48, 0x20, 0, 0, v2, sizeof v2);
+        rec_fixup(48);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("overrunning list entry refused", hype_ntfs_resolve(&fs, "/lst.bin", &m) != 0);
+
+    /* index guards: no INDEX_ROOT at all; block size under a sector; huge klen;
+     * ents_off past ents_size; non-resident bitmap; second INDX block skipped */
+    build_vol(0);
+    rec_init(45, 1); /* subdir: dir with no attributes */
+    rec_fixup(45);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("dir without index refused", hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m) != 0);
+
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    put32(rec_ptr(47) + 0x38 + 0x18 + 8, 256); /* block size < sector */
+    rec_fixup(47);
+    CHECK("undersized index block refused", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+
+    build_vol(0);
+    {
+        uint8_t *e = rec_ptr(5) + 0x38 + 0x18 + 0x20;
+        put16(e + 10, 0x600); /* klen overruns the entries area */
+        rec_fixup(5);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("huge klen skipped", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    build_vol(0);
+    {
+        uint8_t *r = rec_ptr(5);
+        put32(r + 0x38 + 0x18 + 0x10 + 0, 0x9000); /* ents_off > ents_size */
+        rec_fixup(5);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("ents_off past size refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    build_vol(0);
+    {
+        uint8_t *r = rec_ptr(47);
+        uint32_t o2 = 0x38;
+        while (hype_probe_u32(r + o2) != 0xB0u) o2 += (uint32_t)r[o2 + 4] | ((uint32_t)r[o2 + 5] << 8);
+        r[o2 + 8] = 1; /* bitmap marked non-resident */
+        rec_fixup(47);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("non-resident bitmap refused", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+
+    /* an INDX area of two blocks where only block 0 is in use */
+    build_vol(0);
+    {
+        uint8_t *r = rec_ptr(47);
+        uint32_t o2 = 0x38;
+        while (hype_probe_u32(r + o2) != 0xA0u) o2 += (uint32_t)r[o2 + 4] | ((uint32_t)r[o2 + 5] << 8);
+        put64(r + o2 + 0x30, 8192); /* real: two blocks (the second unbuilt) */
+        put64(r + o2 + 0x28, 8192);
+        put64(r + o2 + 0x38, 8192);
+        /* widen the runlist to 16 clusters */
+        rec_ptr(47)[o2 + 0x40 + 1] = 16;
+        rec_fixup(47);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("free second block skipped, file still found", 0,
+              hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m));
+
+    /* INDX magic byte 2; read-fault sweep over the whole lookup path */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    g_vol[INDX_LCN * SECSZ + 2] = 'Q';
+    CHECK("INDX magic byte 2 refused", hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m) != 0);
+    {
+        long k;
+        for (k = 0; k < 40; k++) {
+            build_vol(0);
+            if (hype_ntfs_mount(vol_read, 0, &fs) != 0) continue;
+            g_read_countdown = k;
+            (void)hype_ntfs_resolve(&fs, "/bigdir/deep.bin", &m);
+            g_read_countdown = -1;
+        }
+    }
+
+    /* mount guards: $MFT stream too small; non-resident $VOLUME_INFORMATION;
+     * an up-case table breaking the below-'a' identity */
+    build_vol(0);
+    put64(rec_ptr(0) + 0x38 + 0x30, 4096); /* $MFT real: only 4 records */
+    rec_fixup(0);
+    CHECK("undersized $MFT refused", hype_ntfs_mount(vol_read, 0, &fs) != 0);
+
+    build_vol(0);
+    rec_ptr(3)[0x38 + 8] = 1; /* volume info marked non-resident */
+    rec_fixup(3);
+    CHECK("non-resident volume info refused", hype_ntfs_mount(vol_read, 0, &fs) != 0);
+
+    build_vol(0);
+    put16(g_vol + UPCASE_LCN * SECSZ + 5u * 2u, 99); /* identity broken below 'a' */
+    CHECK("non-identity $UpCase prefix refused", hype_ntfs_mount(vol_read, 0, &fs) != 0);
+
+    /* hole-first over-fragmentation: the HOLE append is the one that hits the cap */
+    build_vol(0);
+    {
+        static uint8_t big_rl[720];
+        uint32_t n3 = 0;
+        unsigned k;
+        for (k = 0; k < 130u; k++) {
+            big_rl[n3++] = 0x01; big_rl[n3++] = 1; /* hole first */
+            big_rl[n3++] = 0x11; big_rl[n3++] = 1; big_rl[n3++] = (k == 0) ? (uint8_t)0x7F : (uint8_t)2;
+        }
+        big_rl[n3++] = 0;
+        rec_init(40, 0);
+        off = attr_add(40, 0x80, 1, 0, big_rl, n3);
+        nonres_sizes(40, off, 0, 260u * SECSZ, 260u * SECSZ, 260u * SECSZ);
+        rec_fixup(40);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("hole-first over-fragmentation refused", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+
+    /* mixed separators and a trailing backslash */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("mixed separators", 0, hype_ntfs_resolve(&fs, "\\subdir/nested.bin", &m));
+    CHECK("trailing separator on a file path",
+          hype_ntfs_resolve(&fs, "/subdir/nested.bin\\", &m) == 0);
+}
+
+int main(void) {
+    test_probe();
+    test_mount_refusals();
+    test_resolve_sparse();
+    test_resolve_unwritten();
+    test_refusals();
+    test_fs_ops_ntfs();
+    test_boot_variants();
+    test_malformed_structures();
+    test_list_and_names();
+    test_more_edges();
+    test_attr_and_list_guards();
+    test_final_edges();
+
+    if (failures == 0) {
+        printf("test_ntfs: all tests passed\n");
+        return 0;
+    }
+    printf("test_ntfs: %d failure(s)\n", failures);
+    return 1;
+}

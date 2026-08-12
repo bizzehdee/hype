@@ -205,3 +205,73 @@ int hype_file_rmap_read_at(const hype_file_rmap_t *m, hype_blk_read_fn read, voi
     }
     return 0;
 }
+
+int hype_file_rmap_write_at(const hype_file_rmap_t *m, hype_blk_read_fn read,
+                            hype_blk_write_fn write, void *ctx, uint64_t offset,
+                            const void *src, unsigned int len) {
+    const uint8_t *in = (const uint8_t *)src;
+    uint8_t sec[HYPE_BLK_SECTOR_SIZE];
+    uint64_t probe, remaining;
+
+    if (len == 0) {
+        return 0;
+    }
+    if (offset + len < offset || offset + len > m->size_bytes || read == 0 || write == 0) {
+        return -1;
+    }
+
+    /* Validate the WHOLE span is DATA before writing anything. */
+    probe = offset;
+    remaining = len;
+    while (remaining > 0) {
+        hype_range_kind_t kind;
+        uint64_t lba, run;
+        uint32_t head;
+        if (hype_file_rmap_locate(m, probe, &kind, &lba, &head, &run) != 0) {
+            return -1;
+        }
+        if (kind != HYPE_RANGE_DATA) {
+            return -1; /* a HOLE needs allocation; UNWRITTEN needs a VDL advance */
+        }
+        if (run >= remaining) {
+            break;
+        }
+        probe += run;
+        remaining -= run;
+    }
+
+    while (len > 0) {
+        hype_range_kind_t kind;
+        uint64_t lba, run;
+        uint32_t head;
+        unsigned int n;
+
+        if (hype_file_rmap_locate(m, offset, &kind, &lba, &head, &run) != 0 ||
+            kind != HYPE_RANGE_DATA) {
+            return -1;
+        }
+        n = (run < (uint64_t)len) ? (unsigned int)run : len;
+        if (head == 0 && n >= HYPE_BLK_SECTOR_SIZE) {
+            uint32_t whole = (uint32_t)(n / HYPE_BLK_SECTOR_SIZE);
+            if (write(ctx, lba, whole, in) != 0) {
+                return -1;
+            }
+            n = whole * HYPE_BLK_SECTOR_SIZE;
+        } else {
+            if (read(ctx, lba, 1, sec) != 0) {
+                return -1;
+            }
+            if ((uint64_t)head + n > SECSZ) {
+                n = (unsigned int)(SECSZ - head);
+            }
+            bcopy8(sec + head, in, n);
+            if (write(ctx, lba, 1, sec) != 0) {
+                return -1;
+            }
+        }
+        in += n;
+        offset += n;
+        len -= n;
+    }
+    return 0;
+}
