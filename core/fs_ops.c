@@ -155,11 +155,39 @@ static int fat32_map_ranges(hype_fs_t *fs, const char *path, hype_file_rmap_t *o
 
 static int fat32_lookup(hype_fs_t *fs, const char *path, hype_fs_file_t *out) {
     out->fs = fs;
+    if (fs->write != 0) {
+        /* #382: a writable mount opens the native random-I/O handle, chain
+         * validated against DIR_FileSize. */
+        out->tag = TAG_NATIVE;
+        if (hype_fat32_open(&fs->u.fat32, path, &out->u.fat32) != 0) {
+            return -1;
+        }
+        out->size = out->u.fat32.size;
+        return 0;
+    }
     out->tag = TAG_RMAP;
     if (fat32_map_ranges(fs, path, &out->u.rmap) != 0) {
         return -1;
     }
     out->size = out->u.rmap.size_bytes;
+    return 0;
+}
+
+static int fat32_read_at(hype_fs_file_t *f, uint64_t offset, void *dst, unsigned int len) {
+    if (f->tag == TAG_NATIVE) {
+        return hype_fat32_read_at(&f->u.fat32, offset, dst, len);
+    }
+    return rmap_read_at(f, offset, dst, len);
+}
+
+static int fat32_write_at(hype_fs_file_t *f, uint64_t offset, const void *src, unsigned int len) {
+    if (f->tag != TAG_NATIVE) {
+        return -1;
+    }
+    if (hype_fat32_write_at(&f->u.fat32, offset, src, len) != 0) {
+        return -1;
+    }
+    if (f->u.fat32.size > f->size) f->size = f->u.fat32.size;
     return 0;
 }
 
@@ -202,13 +230,14 @@ static void fat32_set_barrier(hype_fs_t *fs, hype_blk_sync_fn sync) {
 
 static const hype_fs_ops_t fat32_ops = {
     "fat32",
-    HYPE_FS_CAP_READ | HYPE_FS_CAP_APPEND | HYPE_FS_CAP_NAMESPACE,
+    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_WRITE_GROW | HYPE_FS_CAP_APPEND |
+        HYPE_FS_CAP_NAMESPACE,
     fat32_probe,
     fat32_mount,
     fat32_lookup,
     fat32_map_ranges,
-    rmap_read_at,
-    0, /* write_at: FAT32 random writes are #382, not stubbed as success */
+    fat32_read_at,
+    fat32_write_at, /* #382: in-place + growth with gap zero-fill */
     fat32_append,
     fat32_create,
     fat32_unlink,

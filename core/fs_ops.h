@@ -26,8 +26,8 @@
  *
  * Capabilities as of #293:
  *   ISO9660  read-only, streaming; lookup resolves only the whole image.
- *   FAT32    read + create/append/unlink/mkdir/rmdir/rename; NO random
- *            write_at yet (that is #382; today's writer is append-shaped).
+ *   FAT32    read + create/append + namespace + random write_at (#382):
+ *            in-place inside the size, allocate-and-zero-fill growth past it.
  *   exFAT    read + full mutation + IN-PLACE write_at (never grows/moves).
  *   ext      read + IN-PLACE write_at on a cleanly-unmounted volume; no
  *            namespace mutation (#384/#385 add allocation).
@@ -49,7 +49,7 @@
 #define HYPE_FS_CAP_WRITE_INPLACE 0x02u /* write_at inside the current size */
 #define HYPE_FS_CAP_APPEND 0x04u        /* append, growing the allocation */
 #define HYPE_FS_CAP_NAMESPACE 0x08u     /* create/unlink/mkdir/rmdir/rename */
-#define HYPE_FS_CAP_WRITE_GROW 0x10u    /* write_at past EOF allocates (#382/#383/#384: nobody yet) */
+#define HYPE_FS_CAP_WRITE_GROW 0x10u    /* write_at past EOF allocates (FAT32 via #382) */
 #define HYPE_FS_CAP_SPARSE 0x20u        /* may emit HOLE/UNWRITTEN ranges (#337/#384: nobody yet) */
 
 typedef struct hype_fs hype_fs_t;

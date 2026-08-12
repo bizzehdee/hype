@@ -28,21 +28,52 @@ static uint64_t g_fail_read_lba = (uint64_t)-1;
 static uint32_t g_total_sectors = VOL_SECTORS; /* BPB total (may be shrunk per test) */
 static long g_read_countdown = -1;  /* if >=0, fail the read that hits 0 */
 static long g_write_countdown = -1; /* if >=0, fail the write that hits 0 */
+static int g_write_hardfail;        /* once the countdown fires, keep failing */
+static unsigned int g_read_calls;
+static unsigned int g_write_calls;
+static unsigned int g_max_write_count;
+static unsigned int g_sync_calls;
+static long g_sync_countdown = -1;
+static int g_stale_fat0_reads;
+static uint8_t g_stale_fat0[SECSZ];
+static hype_fat32_wfile_t *g_corrupt_guard_on_data_write;
 
 static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
+    g_read_calls++;
     if (lba + count > VOL_SECTORS) return -1;
     if (lba == g_fail_read_lba) return -1;
     if (g_read_countdown >= 0) { if (g_read_countdown-- == 0) return -1; }
+    if (g_stale_fat0_reads && lba == RESERVED && count == 1u) {
+        memcpy(dst, g_stale_fat0, SECSZ);
+        return 0;
+    }
     memcpy(dst, g_vol + lba * SECSZ, (size_t)count * SECSZ);
     return 0;
 }
 static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     (void)ctx;
+    g_write_calls++;
+    if (count > g_max_write_count) g_max_write_count = count;
     if (lba + count > VOL_SECTORS) return -1;
     if (lba == g_fail_write_lba) return -1;
-    if (g_write_countdown >= 0) { if (g_write_countdown-- == 0) return -1; }
+    if (g_write_countdown >= 0) {
+        if (g_write_countdown-- == 0) {
+            if (g_write_hardfail) g_write_countdown = 0; /* stay failing */
+            return -1;
+        }
+    }
     memcpy(g_vol + lba * SECSZ, src, (size_t)count * SECSZ);
+    if (g_corrupt_guard_on_data_write != 0 && lba >= DATA_START) {
+        g_corrupt_guard_on_data_write->first_cluster_guard ^= 1u;
+        g_corrupt_guard_on_data_write = 0;
+    }
+    return 0;
+}
+static int vol_sync(void *ctx) {
+    (void)ctx;
+    g_sync_calls++;
+    if (g_sync_countdown >= 0 && g_sync_countdown-- == 0) return -1;
     return 0;
 }
 
@@ -58,11 +89,20 @@ static uint32_t fat0(uint32_t cl) {
     return get32(g_vol + RESERVED * SECSZ + cl * 4u) & 0x0FFFFFFFu;
 }
 static uint64_t clba(uint32_t cl) { return DATA_START + (cl - 2u); } /* spc == 1 */
+static uint8_t pat(unsigned int i);
 
 static void build_vol(void) {
     uint8_t *bpb = g_vol;
     uint8_t *fsi;
     memset(g_vol, 0, sizeof(g_vol));
+    g_read_calls = 0u;
+    g_write_calls = 0u;
+    g_max_write_count = 0u;
+    g_sync_calls = 0u;
+    g_sync_countdown = -1;
+    g_stale_fat0_reads = 0;
+    g_write_hardfail = 0;
+    g_corrupt_guard_on_data_write = 0;
 
     put16(bpb + 0x0B, 512);   bpb[0x0D] = 1;          /* bytes/sector, spc */
     put16(bpb + 0x0E, RESERVED); bpb[0x10] = NUM_FATS; /* reserved, numFATs */
@@ -89,7 +129,69 @@ static void build_vol(void) {
     }
 }
 
+/* #374: full sectors within one cluster must reach the block backend as one
+ * multi-sector transfer. The USB backend supports this directly; splitting
+ * here made filesystem throughput pay one command latency per 512 bytes. */
+static void test_append_coalesces_contiguous_sectors(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    uint8_t data[1536];
+    unsigned int i;
+
+    build_vol();
+    g_vol[0x0D] = 4u; /* four sectors per cluster */
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+    CHECK_HEX("mount coalescing volume", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("create coalescing file", 0,
+              hype_fat32_create(&fs, "COAL.BIN", &f));
+    g_max_write_count = 0u;
+    CHECK_HEX("append three contiguous sectors", 0,
+              hype_fat32_append(&f, data, sizeof data));
+    CHECK_HEX("one backend transfer covers all data sectors", 3u, g_max_write_count);
+}
+
 static uint8_t pat(unsigned int i) { return (uint8_t)(i * 7u + 3u); }
+
+static void test_cluster_growth_uses_durability_barriers(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    uint8_t data[600];
+
+    build_vol();
+    memset(data, 0x5A, sizeof data);
+    CHECK_HEX("mount durable volume", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    hype_fat32_fs_set_sync(&fs, vol_sync);
+    CHECK_HEX("durable create", 0, hype_fat32_create(&fs, "DUR.LOG", &f));
+    CHECK_HEX("create brackets metadata with two barriers", 2u, g_sync_calls);
+
+    CHECK_HEX("first append allocates the initial cluster", 0,
+              hype_fat32_append(&f, data, 400u));
+    CHECK_HEX("initial cluster publication is bracketed", 4u, g_sync_calls);
+
+    CHECK_HEX("append across cluster boundary", 0,
+              hype_fat32_append(&f, data + 400u, 200u));
+    CHECK_HEX("cluster extension brackets size commit", 6u, g_sync_calls);
+    CHECK_HEX("extended file size committed", 600u,
+              hype_fat_dirent_size(g_vol + clba(2) * SECSZ));
+
+    /* A failed pre-metadata barrier must leave the on-disk size inside the
+     * already durable chain. The newly allocated cluster may be reclaimed,
+     * but fsck must never need to truncate a size beyond the chain. */
+    build_vol();
+    CHECK_HEX("remount barrier-failure volume", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    hype_fat32_fs_set_sync(&fs, vol_sync);
+    CHECK_HEX("create before barrier failure", 0, hype_fat32_create(&fs, "FAIL.LOG", &f));
+    CHECK_HEX("seed 400 bytes", 0, hype_fat32_append(&f, data, 400u));
+    g_sync_countdown = 0;
+    CHECK("extension surfaces failed persistence barrier",
+          hype_fat32_append(&f, data + 400u, 200u) != 0);
+    CHECK_HEX("failed barrier did not publish larger size", 400u,
+              hype_fat_dirent_size(g_vol + clba(2) * SECSZ));
+    hype_fat32_fs_set_sync(0, vol_sync); /* NULL is safe */
+}
 
 /* Walk the file's chain and gather its data into buf (up to max bytes). */
 static unsigned int gather(uint32_t first, uint8_t *buf, unsigned int max) {
@@ -119,7 +221,10 @@ static void test_create_append(void) {
     CHECK_HEX("max cluster (fat-capacity bound)", 127u, fs.max_cluster);
 
     CHECK_HEX("create ok", 0, hype_fat32_create(&fs, "HYPELOG.TXT", &f));
-    CHECK_HEX("first cluster == next_free hint 3", 3u, f.first_cluster);
+    CHECK_HEX("empty file has no cluster", 0u, f.first_cluster);
+    CHECK_HEX("empty dirent has no cluster", 0u,
+              hype_fat_dirent_cluster(g_vol + clba(2) * SECSZ));
+    CHECK_HEX("empty create allocates no data cluster", 0u, fat0(3u));
     CHECK_HEX("initial size 0", 0u, (unsigned)f.size);
     CHECK_HEX("dirent at root sector", clba(2), f.dirent_lba);
     CHECK_HEX("dirent off 0", 0u, f.dirent_off);
@@ -166,6 +271,7 @@ static void test_truncate_and_second_file(void) {
     /* Re-creating the same name truncates: old chain (3,4,5) is freed. */
     CHECK_HEX("recreate ok", 0, hype_fat32_create(&fs, "HYPELOG.TXT", &f));
     CHECK_HEX("recreate size 0", 0u, (unsigned)f.size);
+    CHECK_HEX("recreated empty file is chainless", 0u, f.first_cluster);
     CHECK_HEX("recreate reuses dirent slot", clba(2), f.dirent_lba);
     CHECK_HEX("recreate dirent off 0", 0u, f.dirent_off);
     CHECK_HEX("dirent size reset to 0", 0u,
@@ -174,7 +280,7 @@ static void test_truncate_and_second_file(void) {
     /* A distinct second file lands in the next free dirent slot. */
     CHECK_HEX("create second ok", 0, hype_fat32_create(&fs, "B.LOG", &g));
     CHECK("second dirent distinct from first", g.dirent_off != f.dirent_off);
-    CHECK("second first-cluster distinct", g.first_cluster != f.first_cluster);
+    CHECK_HEX("second empty file is also chainless", 0u, g.first_cluster);
     {
         CHECK_HEX("append to second ok", 0, hype_fat32_append(&g, "hello", 5u));
         CHECK_HEX("second size 5", 5u, (unsigned)g.size);
@@ -200,7 +306,7 @@ static void test_write_error_propagates(void) {
     build_vol();
     CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
     CHECK_HEX("create ok", 0, hype_fat32_create(&fs, "X.TXT", &f));
-    g_fail_write_lba = clba(f.first_cluster); /* fail the data-cluster write */
+    g_fail_write_lba = clba(3u); /* first append lazily allocates cluster 3 */
     CHECK("append surfaces write error", hype_fat32_append(&f, "data", 4u) != 0);
     g_fail_write_lba = (uint64_t)-1;
 }
@@ -295,6 +401,182 @@ static void test_fsinfo_variants(void) {
     build_vol(); put32(g_vol + 1u * SECSZ + 0x1EC, 999999u);
     CHECK_HEX("mount (huge next_free) ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
     CHECK_HEX("next_free clamped to 2", 2u, fs.next_free);
+
+}
+
+static void test_independent_writers_preserve_fsinfo_count(void) {
+    hype_fat32_fs_t fs1, fs2;
+    hype_fat32_wfile_t f1, f2;
+
+    build_vol();
+    CHECK_HEX("mount shared writer one", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs1));
+    CHECK_HEX("mount shared writer two", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs2));
+    CHECK_HEX("create shared file one", 0, hype_fat32_create(&fs1, "ONE.LOG", &f1));
+    CHECK_HEX("create shared file two", 0, hype_fat32_create(&fs2, "TWO.LOG", &f2));
+
+    CHECK_HEX("writer one allocates", 0, hype_fat32_append(&f1, "a", 1u));
+    CHECK_HEX("first allocation decrements exact count", 123u,
+              get32(g_vol + 1u * SECSZ + 0x1E8));
+    CHECK_HEX("writer two refreshes before allocating", 0,
+              hype_fat32_append(&f2, "b", 1u));
+    CHECK_HEX("second allocation preserves both decrements", 122u,
+              get32(g_vol + 1u * SECSZ + 0x1E8));
+
+    /* fs1 still caches 123. An append that does not change allocation must not
+     * write that stale count back over fs2's newer value. */
+    CHECK_HEX("writer one appends within its cluster", 0,
+              hype_fat32_append(&f1, "c", 1u));
+    CHECK_HEX("non-allocating append does not overwrite FSInfo", 122u,
+              get32(g_vol + 1u * SECSZ + 0x1E8));
+}
+
+/*
+ * #377: all files on one mounted volume share one authoritative FAT-sector
+ * image. The AMD stick returned an older successful FAT read after VM0 had
+ * claimed the next cluster. Without the cache, HYPE then linked to VM0's root.
+ * Keep returning the mount-time FAT image and prove two files still receive
+ * distinct chains as the first file grows past one cluster.
+ */
+static void test_shared_mount_survives_stale_fat_reads(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t h, v;
+    uint8_t full[SECSZ];
+
+    build_vol();
+    memset(full, 'H', sizeof full);
+    memcpy(g_stale_fat0, g_vol + RESERVED * SECSZ, SECSZ);
+    g_stale_fat0_reads = 1;
+    CHECK_HEX("stale-read mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("stale-read create HYPE", 0, hype_fat32_create(&fs, "HYPE.LOG", &h));
+    CHECK_HEX("stale-read create VM0", 0, hype_fat32_create(&fs, "VM0.LOG", &v));
+    CHECK_HEX("HYPE claims and fills first cluster", 0,
+              hype_fat32_append(&h, full, sizeof full));
+    CHECK_HEX("VM0 claims its own root", 0, hype_fat32_append(&v, "V", 1u));
+    CHECK("initial roots differ", h.first_cluster != v.first_cluster);
+    CHECK_HEX("HYPE extends despite stale medium reads", 0,
+              hype_fat32_append(&h, "x", 1u));
+    CHECK("HYPE extension does not link to VM0 root", fat0(h.first_cluster) != v.first_cluster);
+    CHECK_HEX("VM0 root remains end-of-chain", 0x0FFFFFFFu, fat0(v.first_cluster));
+    g_stale_fat0_reads = 0;
+}
+
+static void test_fat_cache_failure_paths(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    uint8_t full[SECSZ];
+
+    build_vol();
+    memset(full, 0x5A, sizeof full);
+    CHECK_HEX("cache-failure mount", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("cache-failure create", 0, hype_fat32_create(&fs, "FAIL.LOG", &f));
+    fs.fat_cache_valid = 0;
+    g_fail_read_lba = RESERVED;
+    CHECK("allocation surfaces FAT cache read failure",
+          hype_fat32_append(&f, "x", 1u) != 0);
+    g_fail_read_lba = (uint64_t)-1;
+
+    build_vol();
+    CHECK_HEX("free-failure mount", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("free-failure create", 0, hype_fat32_create(&fs, "FREE.LOG", &f));
+    CHECK_HEX("free-failure seed", 0, hype_fat32_append(&f, "x", 1u));
+    fs.fat_cache_valid = 0;
+    g_fail_read_lba = RESERVED;
+    CHECK("truncate surfaces FAT cache read failure",
+          hype_fat32_create(&fs, "FREE.LOG", &f) != 0);
+    g_fail_read_lba = (uint64_t)-1;
+
+    /* A valid cache for another FAT-sector offset must be replaced. */
+    build_vol();
+    CHECK_HEX("cache-offset mount", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("cache-offset create", 0, hype_fat32_create(&fs, "OFFSET.LOG", &f));
+    fs.fat_cache_valid = 1;
+    fs.fat_cache_off = 1u;
+    CHECK_HEX("different cached FAT sector is reloaded", 0,
+              hype_fat32_append(&f, full, sizeof full));
+
+    f.tail_cluster = fs.max_cluster + 1u;
+    CHECK("invalid in-memory tail fails closed", hype_fat32_append(&f, "x", 1u) != 0);
+
+    build_vol();
+    CHECK_HEX("zero-hint mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("zero-hint create", 0, hype_fat32_create(&fs, "ZERO.LOG", &f));
+    CHECK_HEX("zero-hint seed", 0, hype_fat32_append(&f, "x", 1u));
+    fs.next_free = 0u;
+    fs.fsinfo_dirty = 1; /* preserve the injected in-memory state through free_chain */
+    CHECK_HEX("truncate repairs zero next-free hint", 0,
+              hype_fat32_create(&fs, "ZERO.LOG", &f));
+    CHECK("freed cluster becomes the next allocation hint", fs.next_free >= 2u);
+
+    build_vol();
+    CHECK_HEX("mid-append guard mount", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("mid-append guard create", 0,
+              hype_fat32_create(&fs, "GUARD.LOG", &f));
+    g_corrupt_guard_on_data_write = &f;
+    CHECK("metadata commit rejects a guard changed during data I/O",
+          hype_fat32_append(&f, "x", 1u) != 0);
+}
+
+/* #377: the AMD capture contained two valid independent FAT chains, but
+ * VM1's directory entry named VM0's first cluster. The remaining VM1 fields
+ * were intact. Reproduce that exact single-field mutation and prove the
+ * writer fails closed before it can publish a cross-link. */
+static void test_chain_root_identity_is_immutable(void) {
+    hype_fat32_fs_t fs0, fs1;
+    hype_fat32_wfile_t f0, f1;
+    uint8_t *ent1;
+    uint32_t first0, first1;
+    uint32_t saved_guard;
+
+    build_vol();
+    CHECK_HEX("identity mount 0", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs0));
+    CHECK_HEX("identity mount 1", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs1));
+    CHECK_HEX("identity create 0", 0, hype_fat32_create(&fs0, "VM0.LOG", &f0));
+    CHECK_HEX("identity create 1", 0, hype_fat32_create(&fs1, "VM1.LOG", &f1));
+    CHECK_HEX("identity append 0", 0, hype_fat32_append(&f0, "zero", 4u));
+    CHECK_HEX("identity append 1", 0, hype_fat32_append(&f1, "one", 3u));
+    first0 = f0.first_cluster;
+    first1 = f1.first_cluster;
+    ent1 = g_vol + f1.dirent_lba * SECSZ + f1.dirent_off;
+    CHECK("writers received independent roots", first0 != first1);
+
+    saved_guard = f1.first_cluster_guard;
+    f1.first_cluster = first0; /* the exact observed VM1 <- VM0 mutation */
+    CHECK("guard rejects RAM root substitution",
+          hype_fat32_append(&f1, "must not write", 14u) != 0);
+    CHECK_HEX("RAM substitution is classified as identity", HYPE_FAT32_WFILE_ERR_IDENTITY,
+              f1.last_error);
+    CHECK_HEX("VM1 dirent keeps its own root", first1, hype_fat_dirent_cluster(ent1));
+    CHECK_HEX("VM1 size remains unchanged", 3u, hype_fat_dirent_size(ent1));
+
+    /* Restore RAM, then independently corrupt the existing directory entry.
+     * A zero-length append performs metadata validation without touching data. */
+    f1.first_cluster = first1;
+    f1.first_cluster_guard = saved_guard;
+    hype_fat_dirent_set_cluster(ent1, first0);
+    CHECK("disk root mismatch is not overwritten",
+          hype_fat32_append(&f1, "", 0u) != 0);
+    CHECK_HEX("disk substitution is classified as identity", HYPE_FAT32_WFILE_ERR_IDENTITY,
+              f1.last_error);
+    CHECK_HEX("mismatched disk root remains observable", first0,
+              hype_fat_dirent_cluster(ent1));
+
+    hype_fat_dirent_set_cluster(ent1, 0u);
+    CHECK("non-empty chainless dirent is rejected",
+          hype_fat32_append(&f1, "", 0u) != 0);
+    hype_fat_dirent_set_cluster(ent1, first1);
+    ent1[0] = 'X';
+    CHECK("directory name mismatch is rejected",
+          hype_fat32_append(&f1, "", 0u) != 0);
+    ent1[0] = 'V';
+    f1.dirent_off = SECSZ;
+    CHECK("out-of-sector directory offset is rejected",
+          hype_fat32_append(&f1, "", 0u) != 0);
 }
 
 static void test_lfn_skip(void) {
@@ -320,9 +602,10 @@ static void test_fat_write_failure(void) {
     hype_fat32_wfile_t f;
     build_vol();
     CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
-    /* Fail the FAT copy-0 write so alloc_cluster (via create) surfaces the error. */
+    /* Fail the FAT copy-0 write so the first append's lazy allocation surfaces it. */
     g_fail_write_lba = RESERVED; /* FAT copy 0, sector 0 */
-    CHECK("create surfaces FAT write error", hype_fat32_create(&fs, "E.TXT", &f) != 0);
+    CHECK_HEX("chainless create succeeds", 0, hype_fat32_create(&fs, "E.TXT", &f));
+    CHECK("append surfaces FAT write error", hype_fat32_append(&f, "x", 1u) != 0);
     g_fail_write_lba = (uint64_t)-1;
 }
 
@@ -578,6 +861,7 @@ static void test_corrupt_and_boundary(void) {
     {
         uint32_t d1 = hype_fat_dirent_cluster(root_ent(0));
         put32(g_vol + RESERVED * SECSZ + d1 * 4u, d1); /* self-loop */
+        fs.fat_cache_valid = 0; /* test changed the mounted medium out of band */
         CHECK("rmdir of a looping directory refused", hype_fat32_rmdir(&fs, "\\D1") != 0);
     }
 
@@ -658,11 +942,12 @@ static void test_corrupt_and_boundary(void) {
         CHECK_HEX("move still completes", 0, hype_fat32_rename(&fs, "\\A", "\\B\\A"));
     }
 
-    /* FSInfo that goes bad AFTER mount: flushes are skipped, ops still work. */
+    /* FSInfo that goes bad AFTER mount: allocation falls back to unknown. */
     build_vol();
     CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
     put32(g_vol + 1u * SECSZ, 0xBADBAD00u);
     CHECK_HEX("create with a corrupt FSInfo", 0, hype_fat32_create(&fs, "OK.TXT", &f));
+    CHECK_HEX("append with a corrupt FSInfo", 0, hype_fat32_append(&f, "x", 1u));
     CHECK_HEX("unlink with a corrupt FSInfo", 0, hype_fat32_unlink(&fs, "\\OK.TXT"));
 
     /* The dirent size field saturates at 4 GiB - 1. */
@@ -704,6 +989,15 @@ static void test_corrupt_and_boundary(void) {
     put32(g_vol + 1u * SECSZ + 0x1EC, 1u);
     CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
     CHECK_HEX("low next_free clamped", 2u, fs.next_free);
+    CHECK_HEX("allocate after low on-disk hint", 0, hype_fat32_create(&fs, "LOW.TXT", &f));
+    CHECK_HEX("append after low on-disk hint", 0, hype_fat32_append(&f, "x", 1u));
+
+    build_vol();
+    put32(g_vol + 1u * SECSZ + 0x1EC, 999999u);
+    CHECK_HEX("mount high-hint volume", 0,
+              hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("create after high on-disk hint", 0, hype_fat32_create(&fs, "HIGH.TXT", &f));
+    CHECK_HEX("append after high on-disk hint", 0, hype_fat32_append(&f, "x", 1u));
 }
 
 
@@ -854,8 +1148,514 @@ static void test_dirent_timestamp_from_clock(void) {
     hype_fat32_fs_set_time(0, &now); /* must not crash */
 }
 
+
+/* ---- #382: open-existing + random-position I/O ---- */
+
+static void set_fat_both(uint32_t cl, uint32_t val) {
+    unsigned int copy;
+    for (copy = 0; copy < NUM_FATS; copy++) {
+        put32(g_vol + (RESERVED + copy * FATSZ) * SECSZ + cl * 4u, val);
+    }
+}
+
+/* Allocated (non-zero) data-cluster entries in FAT copy 0. */
+static unsigned int fat_allocated(void) {
+    unsigned int n = 0, cl;
+    for (cl = 2u; cl < 128u; cl++) {
+        if (fat0(cl) != 0u) n++;
+    }
+    return n;
+}
+
+/* Volume-dirty per FAT[1] ClnShutBitMask: bit CLEAR == dirty. */
+static int vol_dirty(void) { return (fat0(1u) & 0x08000000u) ? 0 : 1; }
+
+static void mk_file(hype_fat32_fs_t *fs, const char *name, unsigned int len,
+                    hype_fat32_wfile_t *w) {
+    static uint8_t data[8192];
+    unsigned int i;
+    for (i = 0; i < len; i++) data[i] = pat(i);
+    CHECK_HEX("mk create", 0, hype_fat32_create(fs, name, w));
+    if (len) CHECK_HEX("mk append", 0, hype_fat32_append(w, data, len));
+}
+
+static void test_open_existing(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t w, o;
+    uint8_t buf[1600];
+    unsigned int i;
+
+    build_vol();
+    CHECK_HEX("mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "F.BIN", 1200u, &w);
+
+    CHECK_HEX("open existing", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    CHECK_HEX("open size", 1200, o.size);
+    CHECK_HEX("open first == create first", w.first_cluster, o.first_cluster);
+    CHECK_HEX("open tail == create tail", w.tail_cluster, o.tail_cluster);
+
+    CHECK_HEX("read whole", 0, hype_fat32_read_at(&o, 0, buf, 1200));
+    for (i = 0; i < 1200u; i++) { if (buf[i] != pat(i)) break; }
+    CHECK("read whole data", i == 1200u);
+    CHECK_HEX("read straddle", 0, hype_fat32_read_at(&o, 500, buf, 200));
+    for (i = 0; i < 200u; i++) { if (buf[i] != pat(500u + i)) break; }
+    CHECK("read straddle data", i == 200u);
+    CHECK("read past EOF refused", hype_fat32_read_at(&o, 1199, buf, 2) != 0);
+    CHECK("read overflow refused", hype_fat32_read_at(&o, ~0ull - 1u, buf, 4) != 0);
+    CHECK_HEX("read zero-len ok", 0, hype_fat32_read_at(&o, 0, buf, 0));
+
+    /* in-place write: pure data, dirent + FAT untouched */
+    {
+        uint8_t dirent_before[SECSZ], fat_before[SECSZ];
+        memcpy(dirent_before, g_vol + clba(2u) * SECSZ, SECSZ);
+        memcpy(fat_before, g_vol + RESERVED * SECSZ, SECSZ);
+        CHECK_HEX("write in place", 0, hype_fat32_write_at(&o, 510, "QR", 2));
+        CHECK("dirent sector untouched",
+              memcmp(dirent_before, g_vol + clba(2u) * SECSZ, SECSZ) == 0);
+        CHECK("FAT untouched", memcmp(fat_before, g_vol + RESERVED * SECSZ, SECSZ) == 0);
+        CHECK_HEX("in-place data read back", 0, hype_fat32_read_at(&o, 510, buf, 2));
+        CHECK("in-place data", buf[0] == 'Q' && buf[1] == 'R');
+    }
+
+    /* refusals */
+    CHECK("open missing refused", hype_fat32_open(&fs, "NOPE.BIN", &o) != 0);
+    CHECK_HEX("mkdir for open test", 0, hype_fat32_mkdir(&fs, "D"));
+    CHECK("open a directory refused", hype_fat32_open(&fs, "D", &o) != 0);
+
+    /* chain shorter than size */
+    set_fat_both(w.first_cluster, 0x0FFFFFFFu); /* EOC after one cluster; size 1200 needs 3 */
+    fs.fat_cache_valid = 0;
+    CHECK("short chain refused", hype_fat32_open(&fs, "F.BIN", &o) != 0);
+
+    /* loop */
+    set_fat_both(w.first_cluster, w.first_cluster); /* self-loop */
+    fs.fat_cache_valid = 0;
+    CHECK("looping chain refused", hype_fat32_open(&fs, "F.BIN", &o) != 0);
+
+    /* free cluster mid-chain */
+    set_fat_both(w.first_cluster, 0u);
+    fs.fat_cache_valid = 0;
+    CHECK("free mid-chain refused", hype_fat32_open(&fs, "F.BIN", &o) != 0);
+
+    /* out-of-range cluster mid-chain */
+    set_fat_both(w.first_cluster, 0x0FFFFFF0u); /* above max_cluster, below EOC */
+    fs.fat_cache_valid = 0;
+    CHECK("out-of-range link refused", hype_fat32_open(&fs, "F.BIN", &o) != 0);
+
+    /* chain longer than the size justifies */
+    build_vol();
+    CHECK_HEX("remount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "G.BIN", 500u, &w); /* one cluster */
+    set_fat_both(w.first_cluster, w.first_cluster + 1u);
+    set_fat_both(w.first_cluster + 1u, 0x0FFFFFFFu);
+    fs.fat_cache_valid = 0;
+    CHECK("slack cluster refused", hype_fat32_open(&fs, "G.BIN", &o) != 0);
+
+    /* size 0 with a chain */
+    build_vol();
+    CHECK_HEX("remount2", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "H.BIN", 0u, &w);
+    {
+        uint8_t *root = g_vol + clba(2u) * SECSZ; /* H.BIN is entry 0, 8.3, no LFN */
+        put16(root + 26, 3u); /* DIR_FstClusLO = 3 */
+    }
+    CHECK("zero size with chain refused", hype_fat32_open(&fs, "H.BIN", &o) != 0);
+}
+
+static void test_write_at_growth(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t w, o;
+    uint8_t buf[2100];
+    uint32_t free_before;
+    unsigned int i;
+
+    build_vol();
+    CHECK_HEX("mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "F.BIN", 700u, &w); /* clusters 3,4; slack 324 bytes in cluster 4 */
+    /* plant stale garbage in the slack the size does not cover */
+    for (i = 700u; i < 1024u; i++) g_vol[clba(4u) * SECSZ + (i - 512u)] = 0xAB;
+
+    CHECK_HEX("open", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    free_before = fs.free_count;
+
+    /* growth within the existing slack: no new cluster */
+    CHECK_HEX("grow within slack", 0, hype_fat32_write_at(&o, 900, "Q", 1));
+    CHECK_HEX("size grew", 901, o.size);
+    CHECK_HEX("no new cluster", 0x0FFFFFFFu, fat0(4u));
+    CHECK_HEX("read gap", 0, hype_fat32_read_at(&o, 700, buf, 200));
+    for (i = 0; i < 200u; i++) { if (buf[i] != 0u) break; }
+    CHECK("slack gap zeroed", i == 200u);
+    CHECK_HEX("free count unchanged", free_before, fs.free_count);
+
+    /* growth allocating clusters, with a gap spanning old slack + new */
+    CHECK_HEX("grow with gap", 0, hype_fat32_write_at(&o, 2000, "XY", 2));
+    CHECK_HEX("size", 2002, o.size);
+    CHECK("chain extended", fat0(4u) != 0x0FFFFFFFu);
+    CHECK_HEX("free count dropped by 2", free_before - 2u, fs.free_count);
+    CHECK("volume clean after success", vol_dirty() == 0);
+    /* whole-file verification: pattern, then zeros, then the payload */
+    CHECK_HEX("read all", 0, hype_fat32_read_at(&o, 0, buf, 2002));
+    for (i = 0; i < 700u; i++) { if (buf[i] != pat(i)) break; }
+    CHECK("data prefix intact", i == 700u);
+    if (buf[900] != 'Q') { printf("FAIL: mid write lost\n"); failures++; }
+    for (i = 700u; i < 2000u; i++) {
+        if (i == 900u) continue;
+        if (buf[i] != 0u) break;
+    }
+    CHECK("gap zeroed end to end", i == 2000u);
+    CHECK("payload landed", buf[2000] == 'X' && buf[2001] == 'Y');
+    /* dirent size published */
+    CHECK_HEX("reopen sees new size", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    CHECK_HEX("reopen size", 2002, o.size);
+
+    /* growth from a fresh empty file: first cluster is published */
+    mk_file(&fs, "E.BIN", 0u, &w);
+    CHECK_HEX("open empty", 0, hype_fat32_open(&fs, "E.BIN", &o));
+    CHECK_HEX("grow empty", 0, hype_fat32_write_at(&o, 600, "ZZ", 2));
+    CHECK_HEX("empty grew", 602, o.size);
+    CHECK_HEX("reopen empty-grown", 0, hype_fat32_open(&fs, "E.BIN", &o));
+    CHECK_HEX("reopen size 602", 602, o.size);
+    CHECK("first cluster published", o.first_cluster >= 2u);
+    CHECK_HEX("read gap head", 0, hype_fat32_read_at(&o, 0, buf, 600));
+    for (i = 0; i < 600u; i++) { if (buf[i] != 0u) break; }
+    CHECK("empty-file gap zeroed", i == 600u);
+
+    /* a fragmented chain still opens and grows: interleave two files */
+    build_vol();
+    CHECK_HEX("mount3", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    {
+        hype_fat32_wfile_t a, b;
+        uint8_t d[512];
+        for (i = 0; i < 512u; i++) d[i] = pat(i);
+        CHECK_HEX("create A", 0, hype_fat32_create(&fs, "A.BIN", &a));
+        CHECK_HEX("create B", 0, hype_fat32_create(&fs, "B.BIN", &b));
+        /* alternate appends so A's clusters interleave with B's */
+        for (i = 0; i < 3u; i++) {
+            CHECK_HEX("append A", 0, hype_fat32_append(&a, d, 512));
+            CHECK_HEX("append B", 0, hype_fat32_append(&b, d, 512));
+        }
+        CHECK_HEX("open fragmented", 0, hype_fat32_open(&fs, "A.BIN", &o));
+        CHECK_HEX("fragmented size", 1536, o.size);
+        CHECK_HEX("fragmented read", 0, hype_fat32_read_at(&o, 1000, buf, 500));
+        for (i = 0; i < 500u; i++) { if (buf[i] != pat((1000u + i) % 512u)) break; }
+        CHECK("fragmented data", i == 500u);
+        CHECK_HEX("fragmented growth", 0, hype_fat32_write_at(&o, 1800, "k", 1));
+        CHECK_HEX("fragmented new size", 1801, o.size);
+        /* B is untouched */
+        CHECK_HEX("open B", 0, hype_fat32_open(&fs, "B.BIN", &o));
+        CHECK_HEX("B size", 1536, o.size);
+    }
+}
+
+static void test_write_at_rollback(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t o, w;
+    uint8_t buf[64];
+    unsigned int before_alloc;
+    uint64_t huge_end;
+
+    build_vol();
+    CHECK_HEX("mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "F.BIN", 700u, &w);
+    CHECK_HEX("open", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    before_alloc = fat_allocated();
+
+    /* disk full: the volume has ~124 free clusters; ask for far more */
+    huge_end = (uint64_t)180u * 512u * 2u; /* way past capacity */
+    CHECK("oversized growth fails", hype_fat32_write_at(&o, huge_end, "x", 1) != 0);
+    CHECK_HEX("size unchanged", 700, o.size);
+    CHECK_HEX("allocation restored", before_alloc, fat_allocated());
+    CHECK_HEX("tail EOC restored", 0x0FFFFFFFu, fat0(o.tail_cluster));
+    CHECK("volume clean after clean rollback", vol_dirty() == 0);
+    CHECK_HEX("file still writable", 0, hype_fat32_write_at(&o, 800, "y", 1));
+    CHECK_HEX("recovered growth size", 801, o.size);
+
+    /* absurd size: beyond FAT32 chain limits */
+    CHECK("beyond-format growth refused",
+          hype_fat32_write_at(&o, 0xFFFFFFFF0ull, "x", 1) != 0);
+
+    /* identity guard: dirent tampered between open and growth */
+    build_vol();
+    CHECK_HEX("mount2", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "F.BIN", 700u, &w);
+    CHECK_HEX("open2", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    before_alloc = fat_allocated();
+    g_vol[clba(2u) * SECSZ + 0] = 'X'; /* rename the 8.3 entry on disk */
+    CHECK("growth after tamper refused", hype_fat32_write_at(&o, 1500, "x", 1) != 0);
+    CHECK_HEX("identity error reported", HYPE_FAT32_WFILE_ERR_IDENTITY, o.last_error);
+    CHECK_HEX("allocation rolled back", before_alloc, fat_allocated());
+    CHECK_HEX("size unchanged after tamper", 700, o.size);
+
+    /* zero-length write is a no-op */
+    CHECK_HEX("len 0 no-op", 0, hype_fat32_write_at(&o, 5000, buf, 0));
+    CHECK_HEX("still old size", 700, o.size);
+    /* overflow refused */
+    CHECK("offset overflow refused", hype_fat32_write_at(&o, ~0ull, buf, 2) != 0);
+}
+
+/* Fail every Nth write in turn across a fixed growth operation; after every
+ * failure the volume must reopen consistently at either the old or the new
+ * state, with no cross-linked or lost allocation beyond what rollback frees. */
+static void test_write_at_fault_sweep(void) {
+    long n;
+    int reached_success = 0;
+
+    for (n = 0; n < 80 && !reached_success; n++) {
+        hype_fat32_fs_t fs;
+        hype_fat32_wfile_t o, w;
+        int rc;
+
+        build_vol();
+        CHECK_HEX("sweep mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+        mk_file(&fs, "F.BIN", 700u, &w);
+        CHECK_HEX("sweep open", 0, hype_fat32_open(&fs, "F.BIN", &o));
+
+        g_write_countdown = n;
+        rc = hype_fat32_write_at(&o, 2000, "XY", 2);
+        g_write_countdown = -1;
+
+        if (rc == 0) {
+            reached_success = 1;
+            CHECK_HEX("sweep success size", 2002, o.size);
+        }
+        /* whatever happened, a fresh mount + open must find a valid file */
+        {
+            hype_fat32_fs_t fs2;
+            hype_fat32_wfile_t o2;
+            CHECK_HEX("sweep remount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs2));
+            if (hype_fat32_open(&fs2, "F.BIN", &o2) != 0) {
+                printf("FAIL: sweep reopen validates at n=%ld rc=%d\n", n, rc);
+                failures++;
+            }
+            CHECK("sweep size sane", o2.size == 700u || o2.size == 2002u);
+        }
+    }
+    CHECK("sweep reached success", reached_success);
+
+    /* same sweep on the read side */
+    for (n = 0; n < 20; n++) {
+        hype_fat32_fs_t fs;
+        hype_fat32_wfile_t o, w;
+        build_vol();
+        CHECK_HEX("rsweep mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+        mk_file(&fs, "F.BIN", 700u, &w);
+        CHECK_HEX("rsweep open", 0, hype_fat32_open(&fs, "F.BIN", &o));
+        g_read_countdown = n;
+        (void)hype_fat32_write_at(&o, 2000, "XY", 2); /* may fail; must not corrupt */
+        g_read_countdown = -1;
+        {
+            hype_fat32_fs_t fs2;
+            hype_fat32_wfile_t o2;
+            CHECK_HEX("rsweep remount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs2));
+            CHECK_HEX("rsweep reopen validates", 0, hype_fat32_open(&fs2, "F.BIN", &o2));
+        }
+    }
+}
+
+
+static void test_382_edge_branches(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t o, w;
+    static uint8_t big[2048];
+    uint8_t buf[1200];
+    unsigned int i;
+
+    for (i = 0; i < sizeof big; i++) big[i] = pat(i + 9u);
+
+    /* bulk data write + bulk read through span_io */
+    build_vol();
+    CHECK_HEX("mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "F.BIN", 700u, &w);
+    CHECK_HEX("open", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    CHECK_HEX("bulk growth write", 0, hype_fat32_write_at(&o, 1024, big, 2048));
+    CHECK_HEX("bulk size", 3072, o.size);
+    CHECK_HEX("bulk read", 0, hype_fat32_read_at(&o, 1024, buf, 1024));
+    for (i = 0; i < 1024u; i++) { if (buf[i] != pat(i + 9u)) break; }
+    CHECK("bulk data", i == 1024u);
+
+    /* read failures: bulk and mid-walk */
+    g_fail_read_lba = clba(o.first_cluster);
+    CHECK("bulk read failure surfaces", hype_fat32_read_at(&o, 0, buf, 512) != 0);
+    CHECK("ragged read failure surfaces", hype_fat32_read_at(&o, 10, buf, 8) != 0);
+    g_fail_read_lba = (uint64_t)-1;
+    g_read_countdown = 0; /* first FAT read of a cold walk */
+    o.seek_cluster = 0u;  /* force the walk to consult the FAT */
+    (void)hype_fat32_read_at(&o, 2000, buf, 8);
+    g_read_countdown = -1;
+
+    /* a corrupted handle fails the walk cleanly */
+    o.seek_cluster = 0u;
+    o.first_cluster = 1u; /* reserved: never a data cluster */
+    CHECK("corrupt handle read refused", hype_fat32_read_at(&o, 0, buf, 8) != 0);
+
+    /* already-dirty volume: the dirty transition is a no-op branch */
+    build_vol();
+    CHECK_HEX("mount2", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "F.BIN", 700u, &w);
+    set_fat_both(1u, 0x07FFFFFFu); /* ClnShut CLEAR == already dirty */
+    fs.fat_cache_valid = 0;
+    CHECK_HEX("open dirty vol", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    CHECK_HEX("growth on dirty volume", 0, hype_fat32_write_at(&o, 1500, "x", 1));
+    CHECK("volume clean after", vol_dirty() == 0);
+
+    /* growth from empty failing on the SECOND allocation: old_tail == 0 arm */
+    build_vol();
+    CHECK_HEX("mount3", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "E.BIN", 0u, &w);
+    {
+        /* burn all but one data cluster (3..126 used; one left) */
+        uint32_t cl;
+        for (cl = 3u; cl < 127u; cl++) set_fat_both(cl, 0x0FFFFFFFu); /* leaves ONE free: 127 */
+        fs.fat_cache_valid = 0;
+        fs.free_count = 0xFFFFFFFFu;
+        fs.fsinfo_sector = 0u; /* no FSInfo refresh to overwrite the hand edit */
+    }
+    CHECK_HEX("open empty", 0, hype_fat32_open(&fs, "E.BIN", &o));
+    CHECK("empty growth needing 2 clusters fails", hype_fat32_write_at(&o, 600, "zz", 2) != 0);
+    CHECK_HEX("file still empty", 0, o.size);
+    CHECK_HEX("no chain root", 0, o.first_cluster);
+
+    /* open() path refusals */
+    build_vol();
+    CHECK_HEX("mount4", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK("open empty path refused", hype_fat32_open(&fs, "", &o) != 0);
+    CHECK("open root refused", hype_fat32_open(&fs, "/", &o) != 0);
+    /* open-time fault sweep: no crash point may corrupt or wedge */
+    mk_file(&fs, "F.BIN", 700u, &w);
+    {
+        long n;
+        for (n = 0; n < 12; n++) {
+            g_read_countdown = n;
+            (void)hype_fat32_open(&fs, "F.BIN", &o);
+            g_read_countdown = -1;
+        }
+    }
+    CHECK_HEX("open after sweep", 0, hype_fat32_open(&fs, "F.BIN", &o));
+
+    /* size > 0 with a NULL chain root in the dirent */
+    {
+        uint8_t *root = g_vol + clba(2u) * SECSZ;
+        uint8_t save26 = root[26], save27 = root[27], save20 = root[20], save21 = root[21];
+        root[26] = root[27] = root[20] = root[21] = 0; /* DIR_FstClus = 0, size stays 700 */
+        CHECK("size without chain refused", hype_fat32_open(&fs, "F.BIN", &o) != 0);
+        root[26] = save26; root[27] = save27; root[20] = save20; root[21] = save21;
+        CHECK_HEX("restored open", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    }
+
+    /* overlap growth: starts inside the file, ends past it -- no gap to zero */
+    CHECK_HEX("overlap growth", 0, hype_fat32_write_at(&o, 600, big, 200));
+    CHECK_HEX("overlap size", 800, o.size);
+    CHECK_HEX("overlap read", 0, hype_fat32_read_at(&o, 600, buf, 200));
+    for (i = 0; i < 200u; i++) { if (buf[i] != pat(i + 9u)) break; }
+    CHECK("overlap data", i == 200u);
+
+    /* bulk in-place data write failing */
+    g_fail_write_lba = clba(o.first_cluster);
+    CHECK("bulk in-place failure surfaces", hype_fat32_write_at(&o, 0, big, 512) != 0);
+    g_fail_write_lba = (uint64_t)-1;
+
+    /* the in-RAM identity guard itself */
+    o.first_cluster_guard ^= 1u;
+    CHECK("corrupt guard refused", hype_fat32_write_at(&o, 5000, "x", 1) != 0);
+    CHECK_HEX("guard error code", HYPE_FAT32_WFILE_ERR_IDENTITY, o.last_error);
+
+    /* missing parent directory */
+    CHECK("open under missing dir refused", hype_fat32_open(&fs, "NODIR/X.BIN", &o) != 0);
+
+    /* double fault: the failure that triggers rollback ALSO breaks the
+     * rollback writes -- write_at must fail and leave the dirty flag SET */
+    build_vol();
+    CHECK_HEX("mount6", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    mk_file(&fs, "F.BIN", 700u, &w);
+    CHECK_HEX("open6", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    g_write_hardfail = 1;
+    g_write_countdown = 6; /* first failure lands mid-chain-link */
+    CHECK("double fault fails", hype_fat32_write_at(&o, 2000, "xy", 2) != 0);
+    g_write_hardfail = 0;
+    g_write_countdown = -1;
+    CHECK("volume honestly left dirty", vol_dirty() == 1);
+
+    /* dirty-flag write failing up front: nothing else is touched */
+    {
+        unsigned int alloc_before = fat_allocated();
+        g_fail_write_lba = RESERVED; /* FAT copy 0: volume_set_dirty cannot land */
+        CHECK("growth with unwritable FAT refused",
+              hype_fat32_write_at(&o, 1500, "x", 1) != 0);
+        g_fail_write_lba = (uint64_t)-1;
+        CHECK_HEX("nothing allocated", alloc_before, fat_allocated());
+        CHECK_HEX("size untouched", 700, o.size);
+    }
+
+    /* gap zero-fill hitting a bad sector: growth rolls back */
+    {
+        unsigned int alloc_before;
+        build_vol();
+        CHECK_HEX("mount5", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+        mk_file(&fs, "F.BIN", 700u, &w);
+        CHECK_HEX("open5", 0, hype_fat32_open(&fs, "F.BIN", &o));
+        alloc_before = fat_allocated();
+        g_fail_write_lba = clba(4u); /* the slack sector the gap zero must rewrite */
+        CHECK("gap-zero failure rolls back", hype_fat32_write_at(&o, 2000, "xy", 2) != 0);
+        g_fail_write_lba = (uint64_t)-1;
+        CHECK_HEX("rollback allocation", alloc_before, fat_allocated());
+        CHECK_HEX("rollback size", 700, o.size);
+        CHECK_HEX("rollback tail EOC", 0x0FFFFFFFu, fat0(o.tail_cluster));
+    }
+}
+
+/* spc == 2: the aligned-full-sector zero-fill path inside the old allocation
+ * is only reachable when a cluster spans more than one sector. */
+static void test_382_spc2(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t w, o;
+    uint8_t buf[1200];
+    unsigned int i;
+
+    build_vol();
+    g_vol[0x0D] = 2; /* sectors per cluster */
+    CHECK_HEX("mount spc2", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("spc", 2, fs.spc);
+    mk_file(&fs, "F.BIN", 512u, &w); /* one 1024-byte cluster, size sector-aligned */
+    CHECK_HEX("open spc2", 0, hype_fat32_open(&fs, "F.BIN", &o));
+    /* grow: the gap [512,1024) is a whole aligned sector in the OLD cluster */
+    CHECK_HEX("grow spc2", 0, hype_fat32_write_at(&o, 3000, "W", 1));
+    CHECK_HEX("size spc2", 3001, o.size);
+    CHECK_HEX("read back gap", 0, hype_fat32_read_at(&o, 512, buf, 512));
+    for (i = 0; i < 512u; i++) { if (buf[i] != 0u) break; }
+    CHECK("aligned gap zeroed", i == 512u);
+    CHECK_HEX("read data spc2", 0, hype_fat32_read_at(&o, 0, buf, 512));
+    for (i = 0; i < 512u; i++) { if (buf[i] != pat(i)) break; }
+    CHECK("prefix intact spc2", i == 512u);
+    CHECK_HEX("payload spc2", 0, hype_fat32_read_at(&o, 3000, buf, 1));
+    CHECK("payload byte", buf[0] == 'W');
+
+    /* the aligned bulk-zero write failing mid-gap: rollback, file unchanged */
+    {
+        hype_fat32_wfile_t o2;
+        build_vol();
+        g_vol[0x0D] = 2;
+        CHECK_HEX("mount spc2b", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+        mk_file(&fs, "G.BIN", 512u, &w);
+        CHECK_HEX("open spc2b", 0, hype_fat32_open(&fs, "G.BIN", &o2));
+        g_fail_write_lba = DATA_START + (w.first_cluster - 2u) * 2u + 1u; /* the slack sector */
+        CHECK("bulk gap-zero failure rolls back",
+              hype_fat32_write_at(&o2, 3000, "W", 1) != 0);
+        g_fail_write_lba = (uint64_t)-1;
+        CHECK_HEX("spc2 rollback size", 512, o2.size);
+        CHECK_HEX("spc2 tail EOC", 0x0FFFFFFFu, fat0(o2.tail_cluster));
+    }
+}
+
 int main(void) {
+    test_open_existing();
+    test_write_at_growth();
+    test_write_at_rollback();
+    test_write_at_fault_sweep();
+    test_382_edge_branches();
+    test_382_spc2();
     test_dirent_timestamp_from_clock();
+    test_cluster_growth_uses_durability_barriers();
+    test_append_coalesces_contiguous_sectors();
     test_create_append();
     test_truncate_and_second_file();
     test_reject_bad_volume();
@@ -865,6 +1665,10 @@ int main(void) {
     test_volume_full();
     test_mount_rejections();
     test_fsinfo_variants();
+    test_independent_writers_preserve_fsinfo_count();
+    test_shared_mount_survives_stale_fat_reads();
+    test_fat_cache_failure_paths();
+    test_chain_root_identity_is_immutable();
     test_lfn_skip();
     test_fat_write_failure();
     test_unlink_fat();

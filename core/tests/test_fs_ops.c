@@ -100,7 +100,9 @@ static void test_registry(void) {
               ((reg[i]->append != 0)) == ((reg[i]->caps & HYPE_FS_CAP_APPEND) != 0));
         CHECK("namespace slots match caps",
               ((reg[i]->create != 0)) == ((reg[i]->caps & HYPE_FS_CAP_NAMESPACE) != 0));
-        CHECK("nobody claims WRITE_GROW yet", (reg[i]->caps & HYPE_FS_CAP_WRITE_GROW) == 0);
+        CHECK("WRITE_GROW is fat32-only so far (#382)",
+              ((reg[i]->caps & HYPE_FS_CAP_WRITE_GROW) == 0) ||
+                  (reg[i]->name[0] == 'f' && reg[i]->name[1] == 'a'));
     }
     (void)hype_fs_registry(0); /* count pointer is optional */
 }
@@ -190,31 +192,31 @@ static void test_fat32_through_interface(void) {
     build_fat32();
     CHECK_HEX("auto-mount claims fat32", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
     CHECK("driver name", strcmp(fs.ops->name, "fat32") == 0);
-    CHECK("caps: append but NO random write yet (#382)",
-          (hype_fs_caps(&fs) & (HYPE_FS_CAP_APPEND | HYPE_FS_CAP_WRITE_INPLACE)) ==
-              HYPE_FS_CAP_APPEND);
+    CHECK("caps: append + random write with growth (#382)",
+          (hype_fs_caps(&fs) & (HYPE_FS_CAP_APPEND | HYPE_FS_CAP_WRITE_INPLACE |
+                                HYPE_FS_CAP_WRITE_GROW)) ==
+              (HYPE_FS_CAP_APPEND | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_WRITE_GROW));
 
     CHECK_HEX("create", 0, hype_fs_create(&fs, "LOG.TXT", &created));
     CHECK_HEX("append", 0, hype_fs_append(&created, "0123456789", 10));
     CHECK_HEX("size after append", 10, created.size);
-    CHECK("write_at refused on FAT32 (NULL slot)", hype_fs_write_at(&created, 0, buf, 4) != 0);
+    CHECK_HEX("write_at in place via interface", 0, hype_fs_write_at(&created, 0, "ABCD", 4));
     CHECK("no identity error", hype_fs_file_identity_error(&created) == 0);
 
     CHECK_HEX("lookup finds it", 0, hype_fs_lookup(&fs, "LOG.TXT", &ro));
     CHECK_HEX("lookup size", 10, ro.size);
     CHECK_HEX("read back", 0, hype_fs_read_at(&ro, 2, buf, 6));
-    CHECK("read data", memcmp(buf, "234567", 6) == 0);
-    CHECK("append on a lookup handle refused (read handle)",
-          hype_fs_append(&ro, buf, 1) != 0);
-    CHECK("identity error needs the native arm", hype_fs_file_identity_error(&ro) == 0);
+    CHECK("read data", memcmp(buf, "CD4567", 6) == 0);
+    CHECK_HEX("growth via interface", 0, hype_fs_write_at(&ro, 2000, "Z", 1));
+    CHECK_HEX("size grew", 2001, ro.size);
+    CHECK_HEX("gap reads zero", 0, hype_fs_read_at(&ro, 500, buf, 1));
+    CHECK_HEX("gap byte", 0, buf[0]);
 
     CHECK_HEX("map_ranges", 0, hype_fs_map_ranges(&fs, "LOG.TXT", &rm));
     CHECK_HEX("one range", 1, rm.count);
 
     CHECK_HEX("mkdir", 0, hype_fs_mkdir(&fs, "D"));
     CHECK_HEX("rename", 0, hype_fs_rename(&fs, "LOG.TXT", "D/L.TXT"));
-    CHECK_HEX("unlink", 0, hype_fs_unlink(&fs, "D/L.TXT"));
-    CHECK_HEX("rmdir", 0, hype_fs_rmdir(&fs, "D"));
     CHECK("sync no-op success (barrier is injected instead)", hype_fs_sync(&fs) == 0);
     hype_fs_set_barrier(&fs, 0); /* fat32 has the slot; installing NULL is legal */
 
@@ -230,6 +232,23 @@ static void test_fat32_through_interface(void) {
     CHECK("ro rmdir refused", hype_fs_rmdir(&fs, "E") != 0);
     CHECK("ro rename refused", hype_fs_rename(&fs, "A", "B") != 0);
     CHECK("ro unlink refused", hype_fs_unlink(&fs, "A") != 0);
+    /* ro lookup is the generic rmap arm; reads work, native ops do not */
+    CHECK_HEX("ro lookup", 0, hype_fs_lookup(&fs, "D/L.TXT", &ro));
+    CHECK_HEX("ro read", 0, hype_fs_read_at(&ro, 0, buf, 4));
+    CHECK("ro read data", memcmp(buf, "ABCD", 4) == 0);
+
+    /* a foreign-tag handle is refused by the fat32 adapters */
+    CHECK_HEX("rw mount back", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    memset(&ro, 0, sizeof(ro));
+    ro.fs = &fs;
+    ro.tag = 0;
+    CHECK("write_at bogus tag", hype_fs_write_at(&ro, 0, buf, 1) != 0);
+    /* in-place write does not shrink the tracked size */
+    CHECK_HEX("re-lookup", 0, hype_fs_lookup(&fs, "D/L.TXT", &ro));
+    CHECK_HEX("small in-place write", 0, hype_fs_write_at(&ro, 0, "a", 1));
+    CHECK("size unchanged by in-place write", ro.size == 2001u);
+    CHECK_HEX("unlink", 0, hype_fs_unlink(&fs, "D/L.TXT"));
+    CHECK_HEX("rmdir", 0, hype_fs_rmdir(&fs, "D"));
 }
 
 static void test_claimed_but_unmountable(void) {

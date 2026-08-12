@@ -713,6 +713,8 @@ int hype_fat32_create(hype_fat32_fs_t *fs, const char *path, hype_fat32_wfile_t 
         out->first_cluster = 0u;
         out->tail_cluster = 0u;
         out->size = 0u;
+        out->seek_index = 0u;
+        out->seek_cluster = 0u;
         out->last_error = HYPE_FAT32_WFILE_ERR_NONE;
         if (dirent_pos(fs, parent, loc.ent_index, &out->dirent_lba, &out->dirent_off) != 0) {
             return -1;
@@ -741,6 +743,8 @@ int hype_fat32_create(hype_fat32_fs_t *fs, const char *path, hype_fat32_wfile_t 
         out->first_cluster = 0u;
         out->tail_cluster = 0u;
         out->size = 0u;
+        out->seek_index = 0u;
+        out->seek_cluster = 0u;
         out->last_error = HYPE_FAT32_WFILE_ERR_NONE;
         if (dirent_pos(fs, parent, ei, &out->dirent_lba, &out->dirent_off) != 0) return -1;
         first_cluster_set(out, 0u);
@@ -979,6 +983,313 @@ int hype_fat32_append(hype_fat32_wfile_t *f, const void *data, unsigned int len)
         f->size += n;
     }
     return flush_metadata(f, extended, 0);
+}
+
+
+/* ---- #382: open-existing + random-position read/write with allocation ---- */
+
+/* FAT[1] ClnShutBitMask: bit CLEAR while the volume has in-flight changes.
+ * Within the 28 valid FAT32 entry bits, so fat_set() carries it intact. */
+#define FAT32_CLNSHUT 0x08000000u
+
+static uint64_t cluster_bytes_of(const hype_fat32_fs_t *fs) {
+    return (uint64_t)fs->spc * SECSZ;
+}
+
+static int volume_set_dirty(hype_fat32_fs_t *fs, int dirty) {
+    uint32_t v, nv;
+    if (fat_get(fs, 1u, &v) != 0) return -1;
+    nv = dirty ? (v & ~FAT32_CLNSHUT) : (v | FAT32_CLNSHUT);
+    if (nv == v) return 0;
+    return fat_set(fs, 1u, nv);
+}
+
+/*
+ * Walks and validates the complete chain against the recorded size (the
+ * DIR_FileSize rule: every cluster through the size belongs to the chain,
+ * and none beyond it -- FAT32 cannot represent an internal hole, so a short
+ * chain is corruption and a long one is what fsck reports as an allocation/
+ * size mismatch). Bounded by `need`, so a loop or a cross-link back into
+ * this chain fails as "longer than the size justifies" without a visited
+ * set. Refuses free (0), reserved (1) and out-of-range clusters.
+ */
+static int chain_measure(hype_fat32_fs_t *fs, uint32_t first, uint64_t size,
+                         uint32_t *out_count, uint32_t *out_tail) {
+    uint64_t need = (size + cluster_bytes_of(fs) - 1u) / cluster_bytes_of(fs);
+    uint32_t cl = first, count = 0, tail = 0;
+
+    if (first == 0u) {
+        if (size != 0u) return -1; /* a non-empty file must have a chain */
+        *out_count = 0u;
+        *out_tail = 0u;
+        return 0;
+    }
+    if (!cluster_ok(fs, cl)) return -1;
+    for (;;) {
+        uint32_t next;
+        count++;
+        if ((uint64_t)count > need) return -1; /* loop, cross-link, or slack clusters */
+        tail = cl;
+        if (fat_get(fs, cl, &next) != 0) return -1;
+        if (next >= FAT32_EOC_MIN) break;
+        if (!cluster_ok(fs, next)) return -1; /* free, reserved or out of range */
+        cl = next;
+    }
+    if ((uint64_t)count < need) return -1; /* shorter than the recorded size */
+    *out_count = count;
+    *out_tail = tail;
+    return 0;
+}
+
+/* Cluster at chain index `index`, through the handle's seek cache so a
+ * sequential scan is O(n) overall instead of per call. */
+static int chain_cluster_at(hype_fat32_wfile_t *f, uint32_t index, uint32_t *out) {
+    hype_fat32_fs_t *fs = f->fs;
+    uint32_t cl, i;
+    if (!cluster_ok(fs, f->first_cluster)) return -1;
+    if (f->seek_cluster >= 2u && f->seek_index <= index && cluster_ok(fs, f->seek_cluster)) {
+        cl = f->seek_cluster;
+        i = f->seek_index;
+    } else {
+        cl = f->first_cluster;
+        i = 0u;
+    }
+    for (; i < index; i++) {
+        uint32_t next;
+        if (fat_get(fs, cl, &next) != 0) return -1;
+        if (next >= FAT32_EOC_MIN || !cluster_ok(fs, next)) return -1;
+        cl = next;
+    }
+    f->seek_index = index;
+    f->seek_cluster = cl;
+    *out = cl;
+    return 0;
+}
+
+/*
+ * One transfer loop for all three byte-range operations over the chain:
+ * read (rbuf), write (wbuf), or zero-fill (both NULL). Whole aligned sectors
+ * move in bulk runs bounded by the cluster; ragged edges bounce through one
+ * sector (read-modify-write when writing). Pure data path -- no metadata.
+ */
+static int span_io(hype_fat32_wfile_t *f, uint64_t off, uint8_t *rbuf, const uint8_t *wbuf,
+                   uint64_t len, uint64_t limit) {
+    hype_fat32_fs_t *fs = f->fs;
+    uint64_t cb = cluster_bytes_of(fs);
+    static const uint8_t zsec[SECSZ]; /* all-zero source for gap fill */
+
+    if (off + len < off || off + len > limit) return -1;
+    while (len > 0u) {
+        uint32_t cl;
+        uint64_t oic = off % cb; /* offset in cluster */
+        unsigned int sic = (unsigned int)(oic / SECSZ);
+        unsigned int bis = (unsigned int)(oic % SECSZ);
+        uint64_t lba;
+        unsigned int n;
+
+        if (chain_cluster_at(f, (uint32_t)(off / cb), &cl) != 0) return -1;
+        lba = cluster_lba(fs, cl) + sic;
+
+        if (bis == 0u && len >= SECSZ) {
+            /* bulk full sectors, bounded by this cluster */
+            unsigned int sectors = (unsigned int)(len / SECSZ);
+            unsigned int in_cluster = fs->spc - sic;
+            if (sectors > in_cluster) sectors = in_cluster;
+            n = sectors * SECSZ;
+            if (rbuf != 0) {
+                if (fs->read(fs->ctx, lba, sectors, rbuf) != 0) return -1;
+            } else if (wbuf != 0) {
+                if (fs->write(fs->ctx, lba, sectors, wbuf) != 0) return -1;
+            } else {
+                unsigned int si;
+                for (si = 0; si < sectors; si++) {
+                    if (fs->write(fs->ctx, lba + si, 1u, zsec) != 0) return -1;
+                }
+            }
+        } else {
+            /* ragged head/tail: one bounced sector */
+            uint8_t sec[SECSZ];
+            n = SECSZ - bis;
+            if ((uint64_t)n > len) n = (unsigned int)len;
+            if (rbuf != 0) {
+                if (fs->read(fs->ctx, lba, 1u, sec) != 0) return -1;
+                bcopy(rbuf, sec + bis, n);
+            } else {
+                if (fs->read(fs->ctx, lba, 1u, sec) != 0) return -1;
+                if (wbuf != 0) {
+                    bcopy(sec + bis, wbuf, n);
+                } else {
+                    bzero(sec + bis, n);
+                }
+                if (fs->write(fs->ctx, lba, 1u, sec) != 0) return -1;
+            }
+        }
+        off += n;
+        len -= n;
+        if (rbuf != 0) rbuf += n;
+        if (wbuf != 0) wbuf += n;
+    }
+    return 0;
+}
+
+int hype_fat32_open(hype_fat32_fs_t *fs, const char *path, hype_fat32_wfile_t *out) {
+    char leafbuf[HYPE_FAT_MAX_LFN + 1u];
+    hype_fat32_dloc_t loc;
+    unsigned int leaf;
+    uint32_t parent, first, count, tail;
+    uint64_t size;
+    int rc;
+
+    if (path_split(path, &leaf) != 0 || leaf_name(path, leaf, leafbuf, sizeof leafbuf) != 0) {
+        return -1;
+    }
+    if (resolve_parent(fs, path, leaf, 0u, &parent) != 0) return -1;
+    rc = dir_find(fs, parent, leafbuf, &loc);
+    if (rc != 1) return -1; /* open never creates */
+    if (loc.ent[11] & HYPE_FAT_ATTR_DIRECTORY) return -1;
+
+    first = hype_fat_dirent_cluster(loc.ent);
+    size = hype_fat_dirent_size(loc.ent);
+    if (chain_measure(fs, first, size, &count, &tail) != 0) return -1;
+
+    out->fs = fs;
+    bcopy(out->name11, loc.ent, 11u);
+    out->size = size;
+    out->tail_cluster = tail;
+    out->seek_index = 0u;
+    out->seek_cluster = (first >= 2u) ? first : 0u;
+    out->last_error = HYPE_FAT32_WFILE_ERR_NONE;
+    if (dirent_pos(fs, parent, loc.ent_index, &out->dirent_lba, &out->dirent_off) != 0) return -1;
+    first_cluster_set(out, first);
+    return 0;
+}
+
+int hype_fat32_read_at(hype_fat32_wfile_t *f, uint64_t offset, void *out, unsigned int len) {
+    if (len == 0u) return 0;
+    return span_io(f, offset, (uint8_t *)out, 0, len, f->size);
+}
+
+/* Undo a partial growth: free the clusters allocated this call, restore the
+ * old chain terminator (or the empty file), and put the handle back. Returns
+ * 0 when the volume was fully restored, -1 when the undo itself failed --
+ * the volume dirty flag is then left SET, honestly. */
+static int growth_rollback(hype_fat32_wfile_t *f, uint32_t first_new, uint32_t old_tail,
+                           uint64_t old_size) {
+    hype_fat32_fs_t *fs = f->fs;
+    int ok = 0;
+    if (first_new >= 2u) {
+        ok |= free_chain(fs, first_new);
+        if (old_tail >= 2u) {
+            ok |= fat_set(fs, old_tail, FAT32_EOC_MIN | 0x7u);
+        } else {
+            first_cluster_set(f, 0u); /* the file was empty: it stays empty */
+        }
+    }
+    f->size = old_size;
+    f->tail_cluster = old_tail;
+    f->seek_index = 0u;
+    f->seek_cluster = (f->first_cluster >= 2u) ? f->first_cluster : 0u;
+    fsinfo_flush(fs);
+    if (ok == 0) ok |= volume_set_dirty(fs, 0);
+    return ok ? -1 : 0;
+}
+
+int hype_fat32_write_at(hype_fat32_wfile_t *f, uint64_t offset, const void *data,
+                        unsigned int len) {
+    hype_fat32_fs_t *fs = f->fs;
+    uint64_t cb = cluster_bytes_of(fs);
+    uint64_t end, old_size, old_cap;
+    uint32_t old_count, old_tail, need, i;
+    uint32_t first_new = 0u, prev;
+
+    f->last_error = HYPE_FAT32_WFILE_ERR_NONE;
+    if (len == 0u) return 0;
+    if (offset + len < offset) return -1;
+    if (!first_cluster_valid(f)) {
+        f->last_error = HYPE_FAT32_WFILE_ERR_IDENTITY;
+        return -1;
+    }
+    end = offset + len;
+
+    if (end <= f->size) {
+        /* In place: pure data writes, no metadata touched (the #204/#199
+         * discipline that makes this safe on a volume the host OS knows). */
+        return span_io(f, offset, 0, (const uint8_t *)data, len, f->size);
+    }
+
+    /* Growth. Re-measure the chain now rather than trusting open-time state:
+     * appends may have extended it since, and the measure re-applies every
+     * corruption refusal before this call commits to changing the volume. */
+    old_size = f->size;
+    if (chain_measure(fs, f->first_cluster, old_size, &old_count, &old_tail) != 0) return -1;
+    old_cap = (uint64_t)old_count * cb;
+    need = (uint32_t)((end + cb - 1u) / cb);
+    if ((end + cb - 1u) / cb > 0x0FFFFFF5u) return -1; /* beyond what FAT32 can chain */
+
+    if (volume_set_dirty(fs, 1) != 0) return -1;
+
+    /* 1. Extend the chain, zeroing any fresh cluster that will hold gap
+     *    bytes (cluster start before `offset`) BEFORE it becomes reachable.
+     *    Clusters fully covered by the incoming data skip the zero pass. */
+    prev = old_tail;
+    for (i = old_count; i < need; i++) {
+        uint32_t ncl;
+        uint64_t cl_start = (uint64_t)i * cb;
+        if (alloc_cluster(fs, &ncl) != 0) {
+            (void)growth_rollback(f, first_new, old_tail, old_size);
+            return -1; /* volume full (or FAT I/O failed) -- file unchanged */
+        }
+        if (cl_start < offset && cluster_zero(fs, ncl) != 0) {
+            (void)fat_set(fs, ncl, 0u); /* orphan the never-linked cluster */
+            (void)growth_rollback(f, first_new, old_tail, old_size);
+            return -1;
+        }
+        if (prev >= 2u) {
+            if (fat_set(fs, prev, ncl) != 0) {
+                /* The link may be half-written (cache/copy 0 carry it, a later
+                 * copy failed). Free the never-published cluster AND restore
+                 * prev's terminator explicitly: when this was the FIRST link,
+                 * first_new is still 0, so growth_rollback alone would leave
+                 * the old tail pointing at a freed cluster. */
+                (void)fat_set(fs, ncl, 0u);
+                (void)fat_set(fs, prev, FAT32_EOC_MIN | 0x7u);
+                (void)growth_rollback(f, first_new, old_tail, old_size);
+                return -1;
+            }
+        } else {
+            first_cluster_set(f, ncl); /* the file was empty */
+        }
+        if (first_new == 0u) first_new = ncl;
+        prev = ncl;
+    }
+    f->tail_cluster = prev;
+
+    /* 2. Zero the logical gap inside the OLD allocation: the bytes past the
+     *    recorded size in already-allocated clusters were never written and
+     *    hold stale media contents. */
+    if (offset > old_size && old_count > 0u) {
+        uint64_t zto = (offset < old_cap) ? offset : old_cap;
+        if (zto > old_size && span_io(f, old_size, 0, 0, zto - old_size, end) != 0) {
+            (void)growth_rollback(f, first_new, old_tail, old_size);
+            return -1;
+        }
+    }
+
+    /* 3. The data itself. */
+    if (span_io(f, offset, 0, (const uint8_t *)data, len, end) != 0) {
+        (void)growth_rollback(f, first_new, old_tail, old_size);
+        return -1;
+    }
+
+    /* 4. Publish: barrier, directory size, FSInfo, barrier (flush_metadata),
+     *    then retire the dirty flag. A crash before this point leaves the old
+     *    size over a longer chain -- a safely shorter file. */
+    f->size = end;
+    if (flush_metadata(f, 1, 0) != 0) {
+        (void)growth_rollback(f, first_new, old_tail, old_size);
+        return -1;
+    }
+    return volume_set_dirty(fs, 0);
 }
 
 void hype_fat32_fs_set_sync(hype_fat32_fs_t *fs, hype_blk_sync_fn sync) {

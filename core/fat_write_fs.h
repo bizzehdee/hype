@@ -69,6 +69,11 @@ typedef struct {
     hype_fat32_fs_t *fs;
     uint8_t name11[11];       /* 8.3 name, for dirent rewrites on flush */
     uint32_t first_cluster;   /* first cluster of the file's data chain */
+    /* #382 seek cache: `seek_cluster` is the cluster at chain index
+     * `seek_index`, so sequential read_at/write_at does not re-walk the chain
+     * from the start on every call. seek_cluster == 0 means empty. */
+    uint32_t seek_index;
+    uint32_t seek_cluster;
     /*
      * Detect an unexpected change to the immutable chain root before a
      * directory update can publish another file's cluster. This is a guard,
@@ -146,6 +151,40 @@ int hype_fat32_rename(hype_fat32_fs_t *fs, const char *from, const char *to);
  * to FSInfo. Returns 0 on success, -1 on I/O error or when the volume is full.
  */
 int hype_fat32_append(hype_fat32_wfile_t *f, const void *data, unsigned int len);
+
+/*
+ * #382: opens the EXISTING file named by `path` for random-position I/O,
+ * validating its complete cluster chain against DIR_FileSize before handing
+ * out a handle. Refused (-1): a missing path, a directory, an out-of-range or
+ * free cluster in the chain, a loop, a chain shorter than the recorded size,
+ * or a chain longer than the size justifies (FAT32 has no representation for
+ * an internal hole -- every cluster through DIR_FileSize must belong, so a
+ * short chain is corruption, never sparseness, and slack whole clusters are
+ * what fsck reports as allocation-size mismatch). All writers that mutate one
+ * mounted volume must share the same `fs`, exactly as with create().
+ */
+int hype_fat32_open(hype_fat32_fs_t *fs, const char *path, hype_fat32_wfile_t *out);
+
+/* Reads `len` bytes at byte `offset`. The range must lie wholly inside the
+ * file (offset+len <= size, overflow-guarded) -- refused, not clamped. */
+int hype_fat32_read_at(hype_fat32_wfile_t *f, uint64_t offset, void *out, unsigned int len);
+
+/*
+ * #382: writes `len` bytes at byte `offset`, allocating on demand.
+ *
+ * Inside the current size this is a pure in-place data write (no metadata).
+ * Past it, the file GROWS: every intervening cluster is allocated (FAT32
+ * cannot represent a hole), the logical gap [old_size, offset) -- including
+ * stale slack in the last already-allocated cluster -- is zeroed, and fresh
+ * clusters are zeroed before they are linked into the chain, all BEFORE the
+ * larger size is published to the directory entry. Commit order: volume
+ * dirty flag, FAT copies (link-by-link), zeroed+written data, barrier,
+ * directory size, FSInfo, barrier, dirty flag cleared. On allocation or I/O
+ * failure mid-growth the new clusters are freed and the chain terminator
+ * restored, so the file is unchanged. Returns 0, -1 on error or full volume.
+ */
+int hype_fat32_write_at(hype_fat32_wfile_t *f, uint64_t offset, const void *data,
+                        unsigned int len);
 
 /*
  * Sets the timestamp stamped into subsequently written directory entries. Pass
