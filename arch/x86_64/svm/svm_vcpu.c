@@ -65,6 +65,17 @@ struct hype_vcpu_ctx {
     int tsc_aux_valid; /* the guest has written it; skip the swap entirely until then */
     uint64_t pvclock_system_msr;
     uint64_t pvclock_wall_msr;
+    /*
+     * #436: a round-tripping MTRR model. The old stub ignored MTRR writes and returned 0 on
+     * reads, but reported MTRRcap with variable MTRRs -- so OVMF's MtrrLib (invoked by Windows
+     * winload's SetMemoryAttributes; Linux/BSD never call it) wrote the variable MTRRs, read
+     * them back as 0, saw its writes had not taken, and looped in CpuSetMemoryAttributes ->
+     * MtrrLibSetMemoryAttributesWorker forever. Storing writes and returning them makes the
+     * verify converge. These MTRRs are cosmetic to hype's own NPT memory typing (WB via PAT);
+     * they exist so the guest reads back what it wrote. Zeroed at reset. */
+    uint64_t mtrr_deftype;   /* IA32_MTRR_DEF_TYPE (0x2FF) */
+    uint64_t mtrr_var[16];   /* 8 PHYSBASE/PHYSMASK pairs (0x200..0x20F) */
+    uint64_t mtrr_fix[11];   /* 0x250, 0x258, 0x259, 0x268..0x26F */
     /* Deferred-interrupt slot, per-vCPU. M8-0b STEP 2: two guests run
      * concurrently, so a single shared pending-IRQ slot let one guest's
      * deferred vector be overwritten by, or injected into, the OTHER guest ->
@@ -309,6 +320,12 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     ctx->tsc_aux_valid = 0;
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
+    {   /* #436: MTRR model starts empty (defType 0 = disabled + type UC; the guest programs it). */
+        unsigned mi;
+        ctx->mtrr_deftype = 0;
+        for (mi = 0; mi < 16u; mi++) ctx->mtrr_var[mi] = 0;
+        for (mi = 0; mi < 11u; mi++) ctx->mtrr_fix[mi] = 0;
+    }
     ctx->hv_guest_os_id = 0;
     ctx->hv_hypercall = 0;
     ctx->hv_enabled = 0;
@@ -1569,19 +1586,51 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
 
     /* PERF-1 memory-type probe: count guest MTRR MSR traffic (does not change
      * handling -- these still fall through to the stub path below). */
-    if (msr_is_mtrr(msr_number)) {
+    if (msr_is_mtrr(msr_number) || msr_number == 0xFEu) {
+        /*
+         * #436: round-trip the MTRR MSRs (store writes, return them on reads) so OVMF MtrrLib's
+         * write-then-verify converges instead of looping. MTRRcap (0xFE) is read-only and returns
+         * a fixed, self-consistent capability: 8 variable MTRRs + fixed-MTRR + WC supported.
+         */
+        uint64_t rval = 0;
+        int fixi = -1;
+        if (msr_number == 0x250u) fixi = 0;
+        else if (msr_number == 0x258u) fixi = 1;
+        else if (msr_number == 0x259u) fixi = 2;
+        else if (msr_number >= 0x268u && msr_number <= 0x26Fu) fixi = 3 + (int)(msr_number - 0x268u);
         if (is_write) {
             uint64_t wval =
                 ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
             g_mtrr_writes++;
-            if (msr_number == 0x2FFu) {
+            if (msr_number == 0xFEu) {
+                /* MTRRcap is read-only; a write is #GP on real hardware. Ignore it. */
+            } else if (msr_number == 0x2FFu) {
+                real->mtrr_deftype = wval;
                 g_mtrr_last_deftype_wr = wval;
             } else if (msr_number >= 0x200u && msr_number <= 0x20Fu) {
+                real->mtrr_var[msr_number - 0x200u] = wval;
                 g_mtrr_last_var_wr = wval;
+            } else if (fixi >= 0) {
+                real->mtrr_fix[fixi] = wval;
             }
-        } else {
-            g_mtrr_reads++;
+            real->vmcb->save.rip += 2;
+            return 0;
         }
+        g_mtrr_reads++;
+        if (msr_number == 0xFEu) {
+            /* VCNT=8 [7:0], FIX=1 [8], WC=1 [10]. Matches the 8 mtrr_var[] pairs above. */
+            rval = 0x0508u;
+        } else if (msr_number == 0x2FFu) {
+            rval = real->mtrr_deftype;
+        } else if (msr_number >= 0x200u && msr_number <= 0x20Fu) {
+            rval = real->mtrr_var[msr_number - 0x200u];
+        } else if (fixi >= 0) {
+            rval = real->mtrr_fix[fixi];
+        }
+        real->vmcb->save.rax = (uint64_t)(uint32_t)rval;
+        real->gprs[2] = (uint64_t)(uint32_t)(rval >> 32);
+        real->vmcb->save.rip += 2;
+        return 0;
     }
 
     /* PVCLOCK (kvmclock): the guest arms the paravirt clock by writing the
