@@ -793,7 +793,16 @@ typedef struct hype_fw_vm {
     unsigned long long vmrun_over100ms;
 } hype_fw_vm_t;
 
-static hype_fw_vm_t g_vms[HYPE_FW_MAX_VMS];
+/*
+ * #394 step 1: g_vms is a pointer into a PAGE-ALIGNED pool block, not a static
+ * array. The per-VM struct carries the guest's nested page tables (npt_pml4/
+ * ept_pml4, __attribute__((aligned(4096)))); a static array inherits that 4 KiB
+ * alignment from the linker, but AllocatePool does not, and a misaligned NPT
+ * root makes the guest fault on every access. AllocatePages gives a page-aligned
+ * base, and sizeof(hype_fw_vm_t) is a whole number of pages, so every element is
+ * aligned. Sized to HYPE_FW_MAX_VMS for now; the dynamic count is the next step. */
+static hype_fw_vm_t *g_vms;
+static unsigned g_vm_count = HYPE_FW_MAX_VMS;
 
 /* M8-0 shims: the FW-1 path still names g_fw_1_*; each expands to `vm->X`,
  * where `vm` is the hype_fw_vm_t* threaded through run_fw_1_test()/efi_main
@@ -16285,7 +16294,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * to `vm->X`, so this one declaration threads the instance through both
      * efi_main's setup and run_fw_1_test(). A second Alpine (g_vms[1], on its
      * own core -- M8-0b) will get its own vm here. */
-    hype_fw_vm_t *vm = &g_vms[0];
+    hype_fw_vm_t *vm; /* #394: bound after g_vms is allocated */
     /* RT-2a: the guest now runs AFTER ExitBootServices (below), so its
      * ops/kind must outlive the pre-EBS setup block that computes them. */
     hype_test_guest_args_t args;
@@ -16299,6 +16308,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* First thing in every log: which build this is. Captures from a
      * serial-less machine otherwise all start with identical boilerplate. */
     hype_debug_print("hype: build " HYPE_BUILD_ID "\n");
+
+    /* #394 step 1: allocate the per-VM struct array, page-aligned (see g_vms
+     * declaration). Must precede the first g_vms[] use. */
+    {
+        UINTN vm_bytes = (UINTN)g_vm_count * sizeof(hype_fw_vm_t);
+        UINTN vm_pages = (vm_bytes + 4095u) / 4096u;
+        g_vms = (hype_fw_vm_t *)(uintptr_t)hype_alloc_pages_any(SystemTable->BootServices, vm_pages);
+        if (g_vms == 0) {
+            hype_fatal("fw-1: g_vms allocation (%u VM(s), %llu pages) failed",
+                       g_vm_count, (unsigned long long)vm_pages);
+        }
+        hype_guest_ram_zero(g_vms, (uint64_t)vm_pages * 4096ull);
+        hype_debug_print("fw-1: g_vms arena %u VM(s) x %llu B, page-aligned @%p [#394]\n",
+                         g_vm_count, (unsigned long long)sizeof(hype_fw_vm_t), (void *)g_vms);
+    }
+    vm = &g_vms[0];
     /*
      * Host wall clock, read once here and reused wherever a timestamp is needed
      * (currently the FAT32 log file's directory entry). Read at boot rather than
