@@ -226,7 +226,7 @@ typedef struct {
 
 /* EFI variable attributes (UEFI spec). NON_VOLATILE persists in the
  * firmware's NV store (SPI flash) across a cold power cycle; RUNTIME_ACCESS
- * lets SetVariable be called after ExitBootServices (RT-3's whole point);
+ * lets SetVariable be called after ExitBootServices;
  * BOOTSERVICE_ACCESS lets a later boot read it back before EBS. */
 #define EFI_VARIABLE_NON_VOLATILE 0x00000001u
 #define EFI_VARIABLE_BOOTSERVICE_ACCESS 0x00000002u
@@ -239,7 +239,7 @@ typedef EFI_STATUS(EFIAPI *EFI_SET_VARIABLE)(CHAR16 *VariableName, EFI_GUID *Ven
 
 /*
  * EFI_RUNTIME_SERVICES: the services that stay valid after
- * ExitBootServices (RT-3 uses GetVariable/SetVariable). Full spec layout so
+ * ExitBootServices. Full spec layout so
  * the two variable functions land at the correct offsets; the rest are
  * void* placeholders -- same rule as EFI_BOOT_SERVICES above.
  */

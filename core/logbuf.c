@@ -22,7 +22,7 @@ void hype_logbuf_reset(void) {
  *
  * g_logbuf.len was advanced with no synchronisation, so two cores appending at once did not merely
  * interleave -- they LOST BYTES: both read the same len, both wrote there, one won. That silently
- * corrupts \HYPEFULL.LOG (#230) and the RT-3 \hype-diag-prev.txt tail, which are the two artefacts
+ * corrupts \HYPE.LOG and the per-VM USB logs, which are the persistent artefacts
  * that exist precisely for serial-less real-hardware debugging, where there is no second copy.
  *
  * A whole record is appended under one acquisition so it cannot be split by another core. This is a

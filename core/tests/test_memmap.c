@@ -214,7 +214,7 @@ static void test_get_second_call_error(void) {
 /*
  * #296: the dump used to go to ConOut, and this harness mocked ConOut->OutputString to read it
  * back. ConOut reaches the firmware console and no durable sink -- not the logbuf, so not
- * \hype-log.txt, \HYPEFULL.LOG or the RT-3 tail -- which on a serial-less machine made the dump
+ * \hype-log.txt or the persistent USB logs -- which on a serial-less machine made the dump
  * recoverable never. The test could not have caught that, because it asserted on the one channel
  * that was wrong.
  *

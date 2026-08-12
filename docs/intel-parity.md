@@ -185,7 +185,7 @@ VMX-3, plus the **Intel halves** of #13 (M0-5), #43 (M3-6), #173 (M8-10).
 > (`/dev/sda`) is the live Ubuntu root in an NVMe enclosure — excluded from
 > native-HW testing too. The **only** authorised physical-write target anywhere
 > is the AMD laptop's AHCI/SATA `2132E5BF4EAE`. Ship **no `hype.cfg`** on the
-> validation stick; capture results via RT-3 (`\hype-diag-prev.txt`) + the frozen
+> validation stick; capture results via `\HYPE.LOG` and the per-VM logs + the frozen
 > GOP screen, since the box is cold-boot-only/serial-less for real runs.
 
 ## E. Hygiene that has already cost time twice

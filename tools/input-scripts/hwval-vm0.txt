@@ -3,7 +3,7 @@
 # The AMD laptop and the Intel box are both serial-less and cold-boot-only, so
 # "did it work?" cannot be answered by watching a console. This turns the live
 # guest into a self-checking test whose verdict lands in \HYPEFULL.LOG on the
-# stick and in the RT-3 NV tail, both readable after the fact.
+# stick's persistent USB logs, readable after the fact.
 #
 # Generous timeout: a cold machine booting Alpine off a streamed ISO takes far
 # longer than QEMU, and a timeout firing early would report a failure that isn't

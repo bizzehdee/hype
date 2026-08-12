@@ -27,8 +27,8 @@ EFI_STATUS hype_memmap_get(EFI_BOOT_SERVICES *bs,
  * larger, versioned descriptor).
  *
  * #296: emitted via hype_debug_print(), NOT ConOut. ConOut reaches the firmware console and
- * nothing else -- not the logbuf, so not \hype-log.txt, not \HYPEFULL.LOG, and not the RT-3 tail
- * recovered as \hype-diag-prev.txt. On a machine whose ConOut is the screen that makes this dump
+ * nothing else -- not the logbuf and therefore not the persistent USB logs. On a machine whose
+ * ConOut is the screen that makes this dump
  * readable for as long as it stays on screen and recoverable never, which is precisely the
  * configuration both validation machines are in (serial-less, cold-boot-only). It hid because
  * OVMF under QEMU routes ConOut to the serial port, so these lines appear in every QEMU log and

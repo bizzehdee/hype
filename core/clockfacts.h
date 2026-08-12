@@ -4,12 +4,12 @@
 /*
  * PERF-1 (gaps #3/#4): pin the guest kernel's own clocksource-selection and
  * delay-calibration dmesg lines into a small fixed buffer, so hype can re-emit
- * them into the RT-3 cold-boot-surviving nvlog on every diagnostics tick.
+ * them into the persistent USB log on every diagnostics tick.
  *
  * Why this exists: those lines ("Calibrating delay loop ... lpj=NNNN",
  * "clocksource: Switched to clocksource tsc", "Marking TSC unstable") print
  * VERY early in a Linux boot. On the serial-less HW test box they scroll off
- * the GOP screen, and they also fall out of the 16 KB nvlog tail long before
+ * the GOP screen, and they also fall far behind the current log tail before
  * the ~5-minute boot reaches login. Capturing them once, here, keeps them
  * available for the login-time snapshot -- directly answering "did Linux keep
  * the TSC as its clocksource?" (gap #3) and "is loops_per_jiffy sane?" (#4)
