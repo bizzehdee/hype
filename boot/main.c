@@ -1582,7 +1582,12 @@ static void term_cmdline_key(uint8_t ch) {
 }
 
 static uint64_t g_ap_tramp_page;
-static uint8_t g_ap_stack[16384] __attribute__((aligned(4096)));
+#define HYPE_AP_STACK_BYTES 16384u
+/* #413: one AP stack per VM (was g_ap_stack + g_ap2_stack). Pool-allocated,
+ * page-aligned, sized to g_vm_count. Used by the AP during early bring-up on
+ * g_ap_cr3's flat [0,64GB) map before it switches to g_pml4, so like the former
+ * statics it must sit under 64 GiB -- satisfied on any host with <=64 GiB RAM. */
+static uint8_t (*g_ap_stacks)[HYPE_AP_STACK_BYTES];
 /* Stashed for fw_1_ap_main to run the guest on the AP (set in efi_main). */
 static const hype_vmm_ops_t *g_fw_1_ops;
 /* Host wall clock, sampled once at startup. See the read in efi_main(). */
@@ -1615,7 +1620,6 @@ static uint64_t g_ap_cr3;      /* the AP's own <4GB identity-map page-table root
  * g_vms[1] on it once VM1's resources exist. Reuses g_ap_tramp_page (AP1 is
  * long past the trampoline by then) and g_ap_cr3 (the <4GB identity map is
  * per-machine, safe to share across APs). */
-static uint8_t g_ap2_stack[16384] __attribute__((aligned(4096)));
 static int g_fw_1_ap2_rc = -2;
 
 /* Defined much later; used by fw_1_ap_main (which precedes their definitions). */
@@ -16469,6 +16473,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     g_pool_bs = SystemTable->BootServices;
     hype_svm_vcpu_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
     hype_vmx_vcpu_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
+    /* #413: one AP stack per VM (HYPE_AP_STACK_BYTES each = 4 pages). */
+    g_ap_stacks = (uint8_t (*)[HYPE_AP_STACK_BYTES])(uintptr_t)
+        fw_alloc_zeroed_pages(g_vm_count * (HYPE_AP_STACK_BYTES / 4096u));
     vm = &g_vms[0];
     /*
      * INPUT-8 (#281): load each VM's expect script here, PRE-EBS, because this is the
@@ -17033,65 +17040,44 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         /* #339: skip the entire second-VM allocation when the config asked for one VM. This is the
          * block that PANICKED: vm1 took a 2048 MB built-in default and its AllocatePages could fail
          * for contiguity on an 8 GB host -- for a VM the operator never asked for. */
-        if (fw_1_want_two_vms()) {
-            /*
-             * STEP 2b: give g_vms[1] its own firmware + guest RAM so AP2 can run a
-             * SECOND Alpine (STEP 2c dispatches it). Must be done here, pre-EBS,
-             * while UEFI AllocatePages is still available (same as g_vms[0] above).
-             *
-             *  - Firmware: OVMF's *content* is identical between the two VMs, so
-             *    copy g_vms[0]'s freshly-loaded (pristine -- no guest has run yet)
-             *    combined buffer rather than re-reading the files. Each VM needs its
-             *    OWN buffer because OVMF's variable store (VARS) is writable and the
-             *    two guests must not clobber each other's.
-             *  - Guest RAM: a fresh, zeroed HYPE_FW_1_GUEST_RAM_BYTES region (the
-             *    guest-RAM-zeroed-before-first-run invariant, per guest_ram.h).
-             *  - host_tsc_hz: same physical CPU, so reuse the BSP's calibration.
-             *  - ISO (GLADDER-9 #140): vm1 gets its OWN per-VM backing. If a distinct
-             *    \iso\vm1.iso is present it is loaded into vm1's own chunk list
-             *    (mixed-distro: Fedora on vm0, Ubuntu on vm1); otherwise vm1 shares
-             *    vm0's read-only backing (safe for two concurrent readers).
-             *
-             * run_fw_1_test builds each VM's own NPT/devices/VMCB/ACPI from these
-             * fields.
-             */
-            {
-                hype_fw_vm_t *vm1 = &g_vms[1];
-                vm1->code_size = vm->code_size;
-                vm1->vars_size = vm->vars_size;
-                vm1->combined_size = vm->combined_size;
-                vm1->combined_host_phys =
-                    hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->combined_size);
-                hype_guest_ram_copy((void *)(uintptr_t)vm1->combined_host_phys,
-                                    (const void *)(uintptr_t)vm->combined_host_phys, vm1->combined_size);
-                /* #290: vm1 gets its own configured size (cfg vm[1]), not vm0's. */
-                fw_1_resolve_guest_ram(vm1, &g_hype_cfg, 1u);
-                fw_1_resolve_os_hint(vm1, &g_hype_cfg, 1u);
-                vm1->ram_host_phys =
-                    hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->ram_bytes);
-                hype_guest_ram_zero((void *)(uintptr_t)vm1->ram_host_phys, vm1->ram_bytes);
-                /* M8-4: VM1's own pristine-firmware snapshot (copied from vm0's still-
-                 * pristine image before either guest runs). */
-                vm1->fw_pristine_host_phys =
-                    hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm1->combined_size);
-                hype_guest_ram_copy((void *)(uintptr_t)vm1->fw_pristine_host_phys,
-                                    (const void *)(uintptr_t)vm1->combined_host_phys, vm1->combined_size);
-                vm1->host_tsc_hz = vm->host_tsc_hz;
-                /* M5-7 (#196): vm1's own virtio-blk scratch disk backing (pre-EBS). */
-                vm1->disk[0].backing_phys =
-                    hype_alloc_pages_any(SystemTable->BootServices, (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL));
-                hype_guest_ram_zero((void *)(uintptr_t)vm1->disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
-                /* GLADDER-9 (#140) / #326: vm1's media is resolved POST-EBS by
-                 * fw_1_resolve_media_stream(1), which honours \iso\vm1.iso (and vm1's own
-                 * install_media / media_disk) exactly as this pre-EBS RAM load used to -- so
-                 * per-VM media survives the RAM path's retirement. Nothing to do here. */
-                hype_debug_print(
-                    "fw-1 VM1: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
-                    (unsigned long long)vm1->combined_host_phys, (unsigned long long)vm1->combined_size,
-                    (unsigned long long)vm1->ram_host_phys,
-                    (unsigned long long)(vm1->ram_bytes / (1024ULL * 1024ULL)),
-                    (unsigned long long)vm1->host_tsc_hz);
-            }
+        /* #413: give every configured secondary VM (vi=1..g_vm_count-1) its own
+         * firmware + guest RAM + pristine snapshot + virtio-blk backing, pre-EBS
+         * while UEFI AllocatePages is up. At g_vm_count==1 the loop does nothing;
+         * at 2 it is exactly the former hardcoded vm1 block. Firmware CONTENT is
+         * identical across VMs, so each secondary copies vm0's pristine combined
+         * buffer (it needs its OWN buffer -- OVMF's VARS store is writable and the
+         * guests must not clobber each other). Each gets its own configured
+         * mem_mb (#290) and os_hint. Media is resolved POST-EBS per VM by
+         * fw_1_resolve_media_stream(vi) (\iso\vmN.iso etc.). run_fw_1_test builds
+         * each VM's own NPT/devices/VMCB/ACPI from these fields. */
+        for (unsigned vi = 1u; vi < g_vm_count; vi++) {
+            hype_fw_vm_t *vmn = &g_vms[vi];
+            vmn->code_size = vm->code_size;
+            vmn->vars_size = vm->vars_size;
+            vmn->combined_size = vm->combined_size;
+            vmn->combined_host_phys =
+                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vmn->combined_size);
+            hype_guest_ram_copy((void *)(uintptr_t)vmn->combined_host_phys,
+                                (const void *)(uintptr_t)vm->combined_host_phys, vmn->combined_size);
+            fw_1_resolve_guest_ram(vmn, &g_hype_cfg, vi);
+            fw_1_resolve_os_hint(vmn, &g_hype_cfg, vi);
+            vmn->ram_host_phys =
+                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vmn->ram_bytes);
+            hype_guest_ram_zero((void *)(uintptr_t)vmn->ram_host_phys, vmn->ram_bytes);
+            vmn->fw_pristine_host_phys =
+                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vmn->combined_size);
+            hype_guest_ram_copy((void *)(uintptr_t)vmn->fw_pristine_host_phys,
+                                (const void *)(uintptr_t)vmn->combined_host_phys, vmn->combined_size);
+            vmn->host_tsc_hz = vm->host_tsc_hz;
+            vmn->disk[0].backing_phys =
+                hype_alloc_pages_any(SystemTable->BootServices, (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL));
+            hype_guest_ram_zero((void *)(uintptr_t)vmn->disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
+            hype_debug_print(
+                "fw-1 VM%u: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
+                vi, (unsigned long long)vmn->combined_host_phys, (unsigned long long)vmn->combined_size,
+                (unsigned long long)vmn->ram_host_phys,
+                (unsigned long long)(vmn->ram_bytes / (1024ULL * 1024ULL)),
+                (unsigned long long)vmn->host_tsc_hz);
         }
 #endif
 
@@ -18519,7 +18505,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 g_ap_slot_valid[0] = 1;
                 ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
                                       ap1_id, (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
-                                      (uint64_t)(uintptr_t)(g_ap_stack + sizeof(g_ap_stack)),
+                                      (uint64_t)(uintptr_t)(g_ap_stacks[0] + HYPE_AP_STACK_BYTES),
                                       g_fw_1_host_tsc_hz, fw_1_ap_main, 0);
             }
             g_fw_1_ap_rc = ap_rc;
@@ -18575,7 +18561,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 int ap2_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
                                            ap2_id,
                                            (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
-                                           (uint64_t)(uintptr_t)(g_ap2_stack + sizeof(g_ap2_stack)),
+                                           (uint64_t)(uintptr_t)(g_ap_stacks[1] + HYPE_AP_STACK_BYTES),
                                            g_fw_1_host_tsc_hz, ap2_entry, ap2_arg);
                 g_fw_1_ap2_rc = ap2_rc;
                 hype_debug_print(
