@@ -1436,6 +1436,41 @@ isn't lost.
       Storage transports are already unified at the block layer that matters;
       a NIC is a packet device, not a block device. They share the PCI/DMA/IRQ
       scaffolding (the facility above), not a device-level interface.
+    - Every type vtable and the shared facility are designed with a clean
+      **registration seam** (a driver registry each driver self-registers into,
+      plus a PCI-ID / probe match table per driver), because decision 35 wants
+      to eventually load drivers as on-demand modules — and that is mechanical
+      only if a driver already reaches the rest of hype solely through its
+      vtable and the facility ABI, never through private cross-references.
+
+35. **Loadable driver modules — decided: the eventual direction is on-demand
+    module loading (load only the drivers the detected hardware needs, not
+    every driver baked into `hype.efi`); deferred to v2+, with a design
+    constraint on the interfaces now.** Today every host driver is compiled
+    into the single `hype.efi` PE image. The goal is that, e.g., the NVMe
+    driver is not loaded on a machine with no NVMe controller, and only the one
+    host NIC family present is loaded.
+    - **Why deferred:** post-`ExitBootServices` module loading is effectively a
+      mini dynamic linker — a relocatable module format (PE/COFF or ELF), a
+      loader that maps + relocates + resolves each module's imports against a
+      table of symbols `hype.efi` exports, and detection→load wiring driven by
+      the PCI enumeration. That is a substantial subsystem, and none of v1's
+      milestones need it; a machine boots fine with unused drivers resident.
+      So v1 stays a single image.
+    - **What v1 does now to make it cheap later:** decision 34's registration
+      seam. Each driver self-registers its type vtable (and a PCI-ID/probe
+      match table) into a registry at init; hype selects drivers by matching
+      enumerated hardware against those tables rather than by hardcoded calls.
+      A driver that only ever reaches the rest of hype through its vtable + the
+      shared facility ABI can later be split into a module with no logic
+      change — the registry entry simply gets populated by the loader instead
+      of a static initialiser. Keeping that boundary clean is the actionable v1
+      cost; the loader itself is v2.
+    - **Rejected for v1:** building the module loader now (no milestone needs
+      it, and it is a large subsystem competing with guest-facing features);
+      and its opposite, ignoring modularity entirely and letting drivers
+      cross-reference each other freely (which would make the eventual split a
+      rewrite instead of a mechanical extraction).
 
 ## 11. Pre-M0 readiness checklist
 
