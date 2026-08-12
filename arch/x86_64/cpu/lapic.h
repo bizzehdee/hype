@@ -45,6 +45,15 @@ void hype_lapic_mask_timer(volatile uint32_t *lapic_base);
  * low 8 bits, periodic mode bit set, unmasked. Pure -- unit tested. */
 uint32_t hype_lapic_lvt_timer_periodic(uint8_t vector);
 
+/* LVT Timer register value for an unmasked one-shot timer. */
+uint32_t hype_lapic_lvt_timer_oneshot(uint8_t vector);
+
+/* Restart a one-shot timer from `initial_count`. The caller configures the
+ * divide register separately. Writing the LVT first prevents a stale periodic
+ * mode from turning a delayed host tick into a permanent interrupt stream. */
+void hype_lapic_arm_timer_oneshot(volatile uint32_t *lapic_base, uint8_t vector,
+                                  uint32_t initial_count);
+
 /*
  * M8-0b: Interrupt Command Register (ICR) IPI send, for bringing a second
  * application processor (AP) up post-ExitBootServices via the standard

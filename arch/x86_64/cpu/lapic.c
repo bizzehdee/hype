@@ -12,6 +12,23 @@ uint32_t hype_lapic_lvt_timer_periodic(uint8_t vector) {
     return (uint32_t)vector | HYPE_LAPIC_LVT_TIMER_PERIODIC;
 }
 
+uint32_t hype_lapic_lvt_timer_oneshot(uint8_t vector) {
+    /* One-shot is mode 00 in bits 18:17. Bit 16 remains clear. */
+    return (uint32_t)vector;
+}
+
+void hype_lapic_arm_timer_oneshot(volatile uint32_t *lapic_base, uint8_t vector,
+                                  uint32_t initial_count) {
+    volatile uint8_t *base_bytes = (volatile uint8_t *)lapic_base;
+    volatile uint32_t *lvt_timer =
+        (volatile uint32_t *)(base_bytes + HYPE_LAPIC_LVT_TIMER_OFFSET);
+    volatile uint32_t *initial =
+        (volatile uint32_t *)(base_bytes + HYPE_LAPIC_TIMER_INITIAL_OFFSET);
+
+    *lvt_timer = hype_lapic_lvt_timer_oneshot(vector);
+    *initial = initial_count;
+}
+
 /* ICR_LOW delivery-mode field (bits 10:8) + level=assert (bit 14). These are
  * the canonical Intel/AMD MP-init values: INIT-assert = 0x00004500,
  * SIPI = 0x00004600 | vector. */

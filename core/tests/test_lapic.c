@@ -19,6 +19,10 @@ static uint32_t *lvt_timer(void) {
     return (uint32_t *)((unsigned char *)g_fake_lapic + HYPE_LAPIC_LVT_TIMER_OFFSET);
 }
 
+static uint32_t *timer_initial(void) {
+    return (uint32_t *)((unsigned char *)g_fake_lapic + HYPE_LAPIC_TIMER_INITIAL_OFFSET);
+}
+
 static void test_mask_timer_sets_only_the_mask_bit(void) {
     *lvt_timer() = 0x000000EC; /* vector 0xEC, some mode bits, unmasked */
 
@@ -97,11 +101,31 @@ static void test_lvt_timer_periodic_encoding(void) {
     CHECK_HEX("vector preserved", 0x40u, hype_lapic_lvt_timer_periodic(0x40) & 0xFFu);
 }
 
+static void test_lvt_timer_oneshot_encoding(void) {
+    CHECK_HEX("one-shot LVT vector 0x50", 0x50u, hype_lapic_lvt_timer_oneshot(0x50));
+    CHECK_HEX("one-shot mode bits clear", 0u,
+              hype_lapic_lvt_timer_oneshot(0x50) & HYPE_LAPIC_LVT_TIMER_PERIODIC);
+    CHECK_HEX("one-shot not masked", 0u,
+              hype_lapic_lvt_timer_oneshot(0x50) & HYPE_LAPIC_LVT_MASKED);
+}
+
+static void test_arm_timer_oneshot_replaces_periodic_mode_and_reloads(void) {
+    *lvt_timer() = HYPE_LAPIC_LVT_TIMER_PERIODIC | 0xECu;
+    *timer_initial() = 1u;
+
+    hype_lapic_arm_timer_oneshot(g_fake_lapic, 0x50u, 0x12345678u);
+
+    CHECK_HEX("arm selects one-shot vector", 0x50u, *lvt_timer());
+    CHECK_HEX("arm writes initial count", 0x12345678u, *timer_initial());
+}
+
 int main(void) {
     test_mask_timer_sets_only_the_mask_bit();
     test_mask_timer_idempotent();
     test_mask_timer_does_not_touch_neighboring_registers();
     test_lvt_timer_periodic_encoding();
+    test_lvt_timer_oneshot_encoding();
+    test_arm_timer_oneshot_replaces_periodic_mode_and_reloads();
     test_icr_high_places_apic_id_in_top_byte();
     test_icr_low_init_is_canonical_value();
     test_icr_low_sipi_encodes_vector_and_startup_mode();
