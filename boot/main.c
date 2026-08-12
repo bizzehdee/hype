@@ -16465,6 +16465,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     g_pool_bs = SystemTable->BootServices;
     hype_svm_vcpu_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
     hype_vmx_vcpu_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
+    /* #428: one ISO-stream bounce buffer per VM. The old fixed 2-slot array
+     * silently aliased vm2+ onto vm0's buffer, which served one VM's CD
+     * sectors to another under concurrent streaming (the 4-VM #392 run's
+     * Fedora/Ubuntu boot corruption). */
+    hype_iso_stream_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
     /* #413: one AP stack per VM (HYPE_AP_STACK_BYTES each = 4 pages). */
     g_ap_stacks = (uint8_t (*)[HYPE_AP_STACK_BYTES])(uintptr_t)
         fw_alloc_zeroed_pages(g_vm_count * (HYPE_AP_STACK_BYTES / 4096u));

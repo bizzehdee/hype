@@ -8,10 +8,29 @@
  * "single-threaded use (the guest-exit path)" -- which held for one guest and broke for two: each
  * VM services its own exits on its own AP core, so two streaming reads in flight overwrote each
  * other's covering sectors. Both guests then read another VM's bytes where their ISO's Primary
- * Volume Descriptor should be, found no filesystem, and OVMF reported the CD-ROM as Not Found. */
+ * Volume Descriptor should be, found no filesystem, and OVMF reported the CD-ROM as Not Found.
+ *
+ * #428: and one slot PER VM means the pool must be sized to the VM COUNT, which is a runtime
+ * value since #393 removed the VM cap. The fixed 2-slot array survived the no-cap arc unnoticed
+ * because the read path clamped an out-of-range slot to slot 0 instead of failing -- so the first
+ * 4-VM boot re-created exactly the #352 corruption for vm2/vm3 (aliased onto vm0's buffer),
+ * worse: each stream's cache_lba/cache_sectors still described the shared buffer as its own, so
+ * stale-hit reads served another VM's sectors with no device I/O to even trace. The pool is now
+ * allocated at boot to the VM count; the built-in single fallback slot keeps zero-setup callers
+ * (one stream at a time: unit tests, single-VM tools) working with no pool. */
 #define BOUNCE_SECTORS 128u
 #define BOUNCE_BYTES (BOUNCE_SECTORS * HYPE_BLK_SECTOR_SIZE)
-static uint8_t g_bounce[HYPE_ISO_STREAM_MAX_SLOTS][BOUNCE_BYTES] __attribute__((aligned(4096)));
+static uint8_t g_bounce0[BOUNCE_BYTES] __attribute__((aligned(4096)));
+static uint8_t *g_bounce_pool;
+static unsigned g_bounce_slots;
+
+void hype_iso_stream_pool_alloc(unsigned slots, uint64_t (*alloc_zeroed_pages)(unsigned pages)) {
+    unsigned pages;
+    if (slots == 0u) slots = 1u;
+    pages = slots * (unsigned)(BOUNCE_BYTES / 4096u);
+    g_bounce_pool = (uint8_t *)(uintptr_t)alloc_zeroed_pages(pages);
+    g_bounce_slots = (g_bounce_pool != 0) ? slots : 0u;
+}
 
 int hype_iso_stream_locate(const hype_iso_stream_t *s, uint64_t off, uint64_t *out_lba,
                           uint32_t *out_head, uint64_t *out_run) {
@@ -121,9 +140,21 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
         if (nsec == 0u || need == 0u) {
             return -1;
         }
-        {
-            unsigned slot = (s->bounce_slot < HYPE_ISO_STREAM_MAX_SLOTS) ? s->bounce_slot : 0u;
-            bounce = g_bounce[slot];
+        /*
+         * #428: resolve the stream's OWN buffer, or refuse. The old clamp-to-slot-0 here is the
+         * bug this ticket exists for: refusing turns a mis-sized pool into a visible MEDIUM
+         * ERROR at the guest, where aliasing turned it into another VM's bytes reported as a
+         * successful read.
+         */
+        if (g_bounce_slots != 0u) {
+            if (s->bounce_slot >= g_bounce_slots) {
+                return -1;
+            }
+            bounce = g_bounce_pool + (uint64_t)s->bounce_slot * BOUNCE_BYTES;
+        } else if (s->bounce_slot == 0u) {
+            bounce = g_bounce0;
+        } else {
+            return -1;
         }
         /*
          * #365: are the sectors we NEED already held from a previous fill?

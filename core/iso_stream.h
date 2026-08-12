@@ -48,8 +48,20 @@ typedef struct {
  * different things (what a resolver can map vs what a stream can hold), not as an alias. */
 #define HYPE_ISO_STREAM_MAX_EXTENTS 256u
 
-/* #352: one bounce buffer per concurrently-readable stream (one per VM). */
-#define HYPE_ISO_STREAM_MAX_SLOTS 2u
+/*
+ * #428: the bounce pool is sized at RUNTIME to the VM count, replacing a fixed 2-slot array.
+ * The old array clamped an out-of-range bounce_slot to slot 0 -- at 4 VMs that silently gave
+ * vm0/vm2/vm3 ONE shared buffer while each stream's private cache_lba/cache_sectors still
+ * claimed the buffer held ITS sectors, so cache hits served another VM's bytes (Fedora's PVD
+ * "Not Found", Ubuntu's corrupt GRUB module). Same bug class as #237's clamped VMCB pool.
+ *
+ * Call once at boot, before any stream is read, with the VM count and a page allocator
+ * (page-aligned + zeroed, like the vCPU pools). Without a pool only slot 0 works, backed by a
+ * built-in single buffer -- the single-stream and unit-test cases. A slot outside the pool now
+ * FAILS the read instead of aliasing: wrong-bytes silently is the one outcome this path must
+ * never have.
+ */
+void hype_iso_stream_pool_alloc(unsigned slots, uint64_t (*alloc_zeroed_pages)(unsigned pages));
 
 typedef struct {
     hype_blk_read_fn read;
@@ -107,7 +119,8 @@ typedef struct {
      * two: each VM runs its exit loop on its own AP core, so two concurrent streaming reads
      * clobbered each other's covering sectors and both guests were handed the other's bytes.
      * Streams that never set this share slot 0, which is correct as long as only one of them
-     * can be read at a time (the single-VM and unit-test cases).
+     * can be read at a time (the single-VM and unit-test cases). #428: a slot with no backing
+     * buffer fails the read -- it must never fall back to a buffer another stream owns.
      */
     unsigned bounce_slot;
 } hype_iso_stream_t;

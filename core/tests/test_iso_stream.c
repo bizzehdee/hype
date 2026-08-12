@@ -602,6 +602,91 @@ static void test_invalidate_clears_the_sequential_history(void) {
     CHECK_INT("history is cleared", 0, (int)s.next_seq_lba);
 }
 
+/* ---- #428: the bounce pool must be per-slot for real, at any VM count ---- */
+
+/*
+ * The regression: HYPE_ISO_STREAM_MAX_SLOTS was 2 and the read path clamped any higher
+ * bounce_slot to slot 0. At 4 VMs that gave vm0/vm2/vm3 ONE shared buffer while each stream's
+ * cache_lba/cache_sectors still described the shared buffer as its own -- so a cache hit served
+ * another VM's sectors, reported as a successful read. These tests pin both halves of the fix:
+ * an unbacked slot refuses, and pooled slots hold their bytes across another slot's fill.
+ */
+static uint8_t g_pool_arena[6u * 128u * 512u] __attribute__((aligned(4096)));
+static unsigned g_pool_pages_given;
+static uint64_t test_alloc_zeroed_pages(unsigned pages) {
+    if ((uint64_t)pages * 4096ull > sizeof(g_pool_arena)) {
+        return 0;
+    }
+    g_pool_pages_given = pages;
+    memset(g_pool_arena, 0, (size_t)pages * 4096u);
+    return (uint64_t)(uintptr_t)g_pool_arena;
+}
+
+static void test_unpooled_nonzero_slot_is_refused_not_aliased(void) {
+    /* No pool allocated: only the built-in slot 0 exists. A stream claiming slot 2 -- the
+     * pre-fix silent-clamp case -- must FAIL its read, not borrow slot 0's buffer. */
+    hype_iso_stream_t s;
+    static uint8_t buf[512];
+    memset(&s, 0, sizeof(s));
+    s.read = fake_read;
+    s.part_start_lba = PART_START;
+    s.iso_size = ISO_SIZE;
+    s.bounce_slot = 2u;
+    CHECK_HEX("slot without a backing buffer is refused", -1,
+              hype_iso_stream_read(&s, 0u, buf, sizeof buf));
+    s.bounce_slot = 0u;
+    CHECK_HEX("slot 0 still works with no pool", 0, hype_iso_stream_read(&s, 0u, buf, sizeof buf));
+}
+
+static void test_pooled_slots_do_not_alias(void) {
+    /* Two streams on DIFFERENT disk regions, slots 0 and 3 of a 4-slot pool. Prime stream A's
+     * cache, fill stream B (which aliased onto A's buffer before the fix), then take a cache HIT
+     * on A. The hit is served from A's buffer with no device read -- if the buffers alias, the
+     * hit returns B's sectors and the byte check below is exactly the 4-VM corruption. */
+    hype_iso_stream_t a, b;
+    static uint8_t buf[2048];
+    uint32_t i;
+    unsigned bad = 0;
+
+    hype_iso_stream_pool_alloc(4u, test_alloc_zeroed_pages);
+    CHECK_HEX("pool sized to 4 slots x 128 sectors", 4u * 128u * 512u / 4096u,
+              g_pool_pages_given);
+
+    memset(&a, 0, sizeof(a));
+    a.read = fake_read; a.part_start_lba = PART_START; a.iso_size = ISO_SIZE; a.bounce_slot = 0u;
+    memset(&b, 0, sizeof(b));
+    b.read = fake_read; b.part_start_lba = PART_START + 100000u; b.iso_size = ISO_SIZE;
+    b.bounce_slot = 3u;
+
+    /* Prime A: 2 KB at 0 caches its covering sectors. */
+    CHECK_HEX("prime stream A", 0, hype_iso_stream_read(&a, 0u, buf, sizeof buf));
+    /* Fill B over the same LOGICAL range -- lands in slot 3, not on top of A. */
+    CHECK_HEX("fill stream B", 0, hype_iso_stream_read(&b, 0u, buf, sizeof buf));
+    for (i = 0; i < sizeof buf; i++) {
+        if (buf[i] != pat((PART_START + 100000u) * 512ull + i)) bad++;
+    }
+    CHECK_HEX("B's own bytes are correct", 0, bad);
+
+    /* The decisive read: within A's cached range, served as a HIT from A's buffer. */
+    {
+        uint64_t hits0 = 0, misses0 = 0, hits1 = 0, misses1 = 0;
+        hype_iso_stream_cache_stats(&a, &hits0, &misses0);
+        CHECK_HEX("re-read stream A", 0, hype_iso_stream_read(&a, 512u, buf, 512u));
+        hype_iso_stream_cache_stats(&a, &hits1, &misses1);
+        CHECK("A's re-read was a cache hit (the aliasing-sensitive path)",
+              hits1 == hits0 + 1u && misses1 == misses0);
+    }
+    bad = 0;
+    for (i = 0; i < 512u; i++) {
+        if (buf[i] != expect_byte(512u + i)) bad++;
+    }
+    CHECK_HEX("A's cache hit returns A's bytes, not B's", 0, bad);
+
+    /* And a slot past the pool still refuses. */
+    b.bounce_slot = 4u;
+    CHECK_HEX("slot beyond the pool is refused", -1, hype_iso_stream_read(&b, 0u, buf, 512u));
+}
+
 int main(void) {
     test_sequential_reads_hit_the_cache_and_return_correct_bytes();
     test_backward_seek_is_a_miss_and_still_correct();
@@ -649,6 +734,9 @@ int main(void) {
     test_sequential_reads_still_get_full_read_ahead();
     test_read_ahead_recovers_after_a_seek();
     test_invalidate_clears_the_sequential_history();
+    /* #428: LAST -- pool_alloc switches the file-global buffer source for the process. */
+    test_unpooled_nonzero_slot_is_refused_not_aliased();
+    test_pooled_slots_do_not_alias();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;
