@@ -8779,7 +8779,33 @@ extern unsigned g_media_dev_count;
 static int media_use_dev(unsigned i);
 static int media_selected_dev(unsigned vi); /* #323 */
 
-static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
+/*
+ * #390: one media scan at a time, machine-wide.
+ *
+ * Every resolve scan mutates the SHARED g_media (the active device and
+ * part_base_lba) while it walks devices and partitions -- and each VM's setup
+ * runs on its own dedicated core. Two concurrent scans therefore yank each
+ * other's partition base mid-walk: measured as a FAT chain walk reading
+ * disk-absolute sectors (base 2048 -> 0 between two fatvol reads, observed on
+ * APIC 1), whose zeros parse as a free cluster and truncate the chain -- the
+ * transiently "NOT FOUND" 1 GiB image whose bytes were fine all along.
+ *
+ * A plain spinlock, not the bounded USB ticket queue: scans are setup-phase,
+ * seconds long, and at most one per VM contends. Streams and blk_image
+ * snapshot their device binding INSIDE the window, so runtime guest I/O never
+ * depends on what g_media points at afterwards.
+ */
+static volatile int g_media_scan_lock;
+static void media_scan_lock(void) {
+    while (__atomic_exchange_n(&g_media_scan_lock, 1, __ATOMIC_ACQUIRE) != 0) {
+        __builtin_ia32_pause();
+    }
+}
+static void media_scan_unlock(void) {
+    __atomic_store_n(&g_media_scan_lock, 0, __ATOMIC_RELEASE);
+}
+
+static int fw_1_disk_use_image_file_unlocked(hype_fw_vm_t *vm, unsigned int slot) {
     hype_fw_disk_t *d = &vm->disk[slot];
     hype_gpt_partition_t part;
     /* #366: static, not a stack local. HYPE_FILE_MAX_EXTENTS is 256, so this struct is over 4 KiB
@@ -8980,6 +9006,13 @@ static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
                                           : "READ-ONLY -- [disk.*] read_only");
     usb_log_flush(); /* prove the attach reached the log before the guest runs */
     return 1;
+}
+static int fw_1_disk_use_image_file(hype_fw_vm_t *vm, unsigned int slot) {
+    int rc;
+    media_scan_lock();
+    rc = fw_1_disk_use_image_file_unlocked(vm, slot);
+    media_scan_unlock();
+    return rc;
 }
 
 #if HYPE_M10_6_WRITE_SELFTEST
@@ -14590,7 +14623,7 @@ static void fw_1_343_verify_stream(unsigned vi) {
 }
 #endif
 
-static int fw_1_resolve_media_stream(unsigned vi) {
+static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
     const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
 
     /*
@@ -14887,6 +14920,13 @@ static int fw_1_resolve_media_stream(unsigned vi) {
     scan_budget_disarm(); /* #346: never leave a deadline armed past the scan phase */
     } /* #324: end raw-partition device loop */
     return g_vms[vi].iso_stream_ready;
+}
+static int fw_1_resolve_media_stream(unsigned vi) {
+    int rc;
+    media_scan_lock();
+    rc = fw_1_resolve_media_stream_unlocked(vi);
+    media_scan_unlock();
+    return rc;
 }
 
 /*
