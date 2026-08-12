@@ -259,65 +259,16 @@ static inline void vmload(uint64_t vmcb_phys) {
  * space the compiler's own register allocator has no visibility into.
  */
 /*
- * The GPR save/restore uses "+m" operands bound to a SPECIFIC pool slot's
- * gprs[] -- i.e. a static (absolute) address. That is deliberate and load-
- * bearing: the guest clobbers every GPR, so all of them are in the clobber
- * list, leaving the compiler no free register to hold a `ctx` pointer for
- * base+displacement addressing. A static operand needs no base register.
- * Rather than hand-juggle a ctx pointer across VMRUN on the stack (fragile),
- * this macro instantiates the register-free body once per pool slot and
- * vmrun_full() dispatches to the right one. Extend the dispatch if
- * HYPE_SVM_MAX_VCPUS grows.
+ * #412: guest entry moved to an external asm trampoline (arch/x86_64/svm/svm_run.S),
+ * modelled on vmx_run.S. It stashes the ctx pointer on the stack across the guest,
+ * so -- unlike the former static-operand HYPE_VMRUN_BODY macro -- the ctx pool may
+ * be runtime-allocated and any size. The guest RAX/RSP/RFLAGS live in the VMCB, so
+ * the trampoline saves/restores only RCX RDX RBX RBP RSI RDI R8-R15.
  */
-#define HYPE_VMRUN_BODY(CTX, RAXVAR)                                                               \
-    __asm__ volatile("mov %[rcx], %%rcx\n\t"                                                      \
-                     "mov %[rdx], %%rdx\n\t"                                                      \
-                     "mov %[rbx], %%rbx\n\t"                                                      \
-                     "mov %[rbp], %%rbp\n\t"                                                      \
-                     "mov %[rsi], %%rsi\n\t"                                                      \
-                     "mov %[rdi], %%rdi\n\t"                                                      \
-                     "mov %[r8], %%r8\n\t"                                                        \
-                     "mov %[r9], %%r9\n\t"                                                        \
-                     "mov %[r10], %%r10\n\t"                                                      \
-                     "mov %[r11], %%r11\n\t"                                                      \
-                     "mov %[r12], %%r12\n\t"                                                      \
-                     "mov %[r13], %%r13\n\t"                                                      \
-                     "mov %[r14], %%r14\n\t"                                                      \
-                     "mov %[r15], %%r15\n\t"                                                      \
-                     "vmrun %%rax\n\t"                                                            \
-                     "mov %%rcx, %[rcx]\n\t"                                                      \
-                     "mov %%rdx, %[rdx]\n\t"                                                      \
-                     "mov %%rbx, %[rbx]\n\t"                                                      \
-                     "mov %%rbp, %[rbp]\n\t"                                                      \
-                     "mov %%rsi, %[rsi]\n\t"                                                      \
-                     "mov %%rdi, %[rdi]\n\t"                                                      \
-                     "mov %%r8, %[r8]\n\t"                                                        \
-                     "mov %%r9, %[r9]\n\t"                                                        \
-                     "mov %%r10, %[r10]\n\t"                                                      \
-                     "mov %%r11, %[r11]\n\t"                                                      \
-                     "mov %%r12, %[r12]\n\t"                                                      \
-                     "mov %%r13, %[r13]\n\t"                                                      \
-                     "mov %%r14, %[r14]\n\t"                                                      \
-                     "mov %%r15, %[r15]\n\t"                                                      \
-                     : "+a"(RAXVAR), [rcx] "+m"((CTX).gprs[1]), [rdx] "+m"((CTX).gprs[2]),        \
-                       [rbx] "+m"((CTX).gprs[3]), [rbp] "+m"((CTX).gprs[5]),                      \
-                       [rsi] "+m"((CTX).gprs[6]), [rdi] "+m"((CTX).gprs[7]),                      \
-                       [r8] "+m"((CTX).gprs[8]), [r9] "+m"((CTX).gprs[9]),                        \
-                       [r10] "+m"((CTX).gprs[10]), [r11] "+m"((CTX).gprs[11]),                    \
-                       [r12] "+m"((CTX).gprs[12]), [r13] "+m"((CTX).gprs[13]),                    \
-                       [r14] "+m"((CTX).gprs[14]), [r15] "+m"((CTX).gprs[15])                     \
-                     :                                                                            \
-                     : "memory", "cc", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9",      \
-                       "r10", "r11", "r12", "r13", "r14", "r15")
+void hype_svm_vmrun(struct hype_vcpu_ctx *ctx, uint64_t vmcb_phys);
 
 static inline void vmrun_full(struct hype_vcpu_ctx *ctx, uint64_t vmcb_phys) {
-    uint64_t clobbered_rax = vmcb_phys;
-    /* Dispatch to the register-free body for this ctx's static pool slot. */
-    if (ctx == &g_ctx_pool[0]) {
-        HYPE_VMRUN_BODY(g_ctx_pool[0], clobbered_rax);
-    } else {
-        HYPE_VMRUN_BODY(g_ctx_pool[1], clobbered_rax);
-    }
+    hype_svm_vmrun(ctx, vmcb_phys);
 }
 
 static inline void vmsave(uint64_t vmcb_phys) {
