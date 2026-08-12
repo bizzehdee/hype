@@ -668,19 +668,6 @@ typedef struct hype_fw_vm {
     uint32_t in_send_pos;
     int in_send_is_key;
     uint64_t in_send_stall_since_ms; /* 0 = not stalling */
-    /*
-     * #284: scancodes were just queued for this VM's keyboard and the guest still owes an
-     * IRQ1 for them.
-     *
-     * Queueing a scancode and setting OBF is NOT enough. Guest firmware reads its
-     * keyboard from the IRQ1 handler, so without the interrupt the bytes sit in the
-     * output buffer forever -- measured exactly that way: OVMF parked on "Press any key
-     * to enter the Boot Manager Menu" with 7 scancodes queued and never read, which
-     * looked like a broken transport but was a missing interrupt. Every other guest-facing
-     * IRQ here is raised by the dispatch loop, which owns the vcpu context, so the flag is
-     * set here and consumed there.
-     */
-    int in_sendkey_needs_irq; /* INPUT-9 (#282): verdict line already emitted */
     /* M8-8 (#171): this VM's own fault watchdog. Per-VM so a faulted guest is forced
      * off ALONE -- condemning a healthy sibling would be worse than the hang. */
     hype_vm_watchdog_t watchdog;
@@ -12178,21 +12165,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint8_t host_scancode;
             if (hype_scancode_queue_dequeue(&vm->host_ps2_queue, &host_scancode)) {
                 if (hype_ps2_kbd_try_enqueue_scancode(&g_fw_1_ps2, host_scancode)) {
-                    vm->in_sendkey_needs_irq = 1;
                     __atomic_add_fetch(&vm->host_ps2_irqs, 1ull, __ATOMIC_RELAXED);
                 }
             }
         }
         /*
-         * #284/#375: scripted or physical input queued a scancode -- now tell the guest. Guest
-         * firmware reads its keyboard from the IRQ1 handler, so the bytes are invisible
-         * without this: measured as OVMF sitting on "Press any key to enter the Boot
-         * Manager Menu" with 7 scancodes queued and never read. IO-APIC first with a PIC
-         * fallback, the same shape the SYSRQ injector and every other guest IRQ here use.
+         * #284/#375/#389: a byte became readable on the guest's keyboard -- now tell the
+         * guest. Guest firmware reads its keyboard from the IRQ1 handler, so the bytes are
+         * invisible without this: measured as OVMF sitting on "Press any key to enter the
+         * Boot Manager Menu" with 7 scancodes queued and never read. The edge comes from
+         * the DEVICE MODEL (one per byte that becomes the readable head), so command
+         * responses raise it too: Linux's atkbd probe waits for its ACK interrupt-driven,
+         * and an ACK that never interrupts stalls the probe with the unread byte gating
+         * the #375 host-input drain shut (#389). IO-APIC first with a PIC fallback, the
+         * same shape the SYSRQ injector and every other guest IRQ here use.
          */
-        if (vm->in_sendkey_needs_irq) {
+        if (hype_ps2_kbd_take_irq(&g_fw_1_ps2)) {
             uint8_t kiov;
-            vm->in_sendkey_needs_irq = 0;
             if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &kiov)) {
                 vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, kiov);
             } else {
@@ -15171,7 +15160,6 @@ static int fw_1_script_drain_send(hype_fw_vm_t *vm, unsigned vm_index, hype_gues
         vm->in_send_stall_since_ms = 0;
         if (vm->in_send_is_key) {
             g_sendkey_codes++;
-            vm->in_sendkey_needs_irq = 1;
         }
     }
     return 1;

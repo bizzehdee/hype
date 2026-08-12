@@ -100,6 +100,8 @@ typedef struct {
     unsigned long long scancodes_queued;
     unsigned long long scancodes_read;
     unsigned long long scancodes_dropped;
+    /* #389: pending IRQ1 edges -- one per byte that became readable. */
+    unsigned int irq_edges;
 } hype_ps2_kbd_t;
 
 /* Resets to power-on state: no pending byte, keyboard port enabled,
@@ -166,5 +168,16 @@ void hype_ps2_kbd_scancode_stats(const hype_ps2_kbd_t *kbd,
                                  unsigned long long *queued,
                                  unsigned long long *read,
                                  unsigned long long *dropped);
+
+/*
+ * #389: consume one pending IRQ1 edge. The device records an edge whenever a
+ * byte becomes the readable head of the output FIFO -- a push into an empty
+ * FIFO, and a read that leaves more bytes queued. This covers command
+ * responses (ACKs), which the previous injected-scancode-only interrupt path
+ * missed: Linux's atkbd probe waits for its 0xFA interrupt-driven, and a
+ * never-signalled ACK stalls the probe and blocks the #375 host-input drain
+ * behind the unread byte. The caller injects one guest IRQ1 per taken edge.
+ */
+int hype_ps2_kbd_take_irq(hype_ps2_kbd_t *kbd);
 
 #endif /* HYPE_DEVICES_PS2_KEYBOARD_H */

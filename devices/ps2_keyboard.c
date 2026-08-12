@@ -9,6 +9,7 @@ void hype_ps2_kbd_reset(hype_ps2_kbd_t *kbd) {
     kbd->keyboard_port_enabled = 1;
     kbd->aux_port_enabled = 1;
     kbd->next_data_write_is_for_aux = 0;
+    kbd->irq_edges = 0;
     __atomic_store_n(&kbd->scancodes_queued, 0ull, __ATOMIC_RELAXED);
     __atomic_store_n(&kbd->scancodes_read, 0ull, __ATOMIC_RELAXED);
     __atomic_store_n(&kbd->scancodes_dropped, 0ull, __ATOMIC_RELAXED);
@@ -32,6 +33,9 @@ static void push_output(hype_ps2_kbd_t *kbd, uint8_t value, int is_scancode) {
     kbd->out_fifo[slot] = value;
     kbd->out_is_scancode[slot] = (uint8_t)(is_scancode != 0);
     kbd->out_count++;
+    if (kbd->out_count == 1u && kbd->irq_edges < HYPE_PS2_KBD_FIFO_SIZE) {
+        kbd->irq_edges++; /* #389: this byte just became the readable head */
+    }
     if (is_scancode) {
         __atomic_add_fetch(&kbd->scancodes_queued, 1ull, __ATOMIC_RELAXED);
     }
@@ -80,6 +84,9 @@ int hype_ps2_kbd_io_read(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t *out_value)
             *out_value = kbd->out_fifo[kbd->out_head];
             kbd->out_head = (kbd->out_head + 1) % HYPE_PS2_KBD_FIFO_SIZE;
             kbd->out_count--;
+            if (kbd->out_count > 0 && kbd->irq_edges < HYPE_PS2_KBD_FIFO_SIZE) {
+                kbd->irq_edges++; /* #389: the next byte is now the readable head */
+            }
         } else {
             *out_value = 0;
         }
@@ -191,4 +198,12 @@ void hype_ps2_kbd_scancode_stats(const hype_ps2_kbd_t *kbd,
     if (dropped != 0) {
         *dropped = __atomic_load_n(&kbd->scancodes_dropped, __ATOMIC_RELAXED);
     }
+}
+
+int hype_ps2_kbd_take_irq(hype_ps2_kbd_t *kbd) {
+    if (kbd->irq_edges == 0u) {
+        return 0;
+    }
+    kbd->irq_edges--;
+    return 1;
 }

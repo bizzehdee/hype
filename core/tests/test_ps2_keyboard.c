@@ -302,7 +302,89 @@ static void test_scancode_stats_distinguish_guest_reads(void) {
     CHECK_HEX("full refusals counted", 3, dropped);
 }
 
+static void test_irq_edge_per_readable_byte(void) {
+    hype_ps2_kbd_t kbd;
+    uint8_t got;
+
+    hype_ps2_kbd_reset(&kbd);
+    CHECK_HEX("no edge after reset", 0, hype_ps2_kbd_take_irq(&kbd));
+
+    /* One edge when a byte becomes the readable head, consumed exactly once. */
+    hype_ps2_kbd_enqueue_scancode(&kbd, 0x1Eu);
+    CHECK_HEX("edge for the first byte", 1, hype_ps2_kbd_take_irq(&kbd));
+    CHECK_HEX("edge consumed", 0, hype_ps2_kbd_take_irq(&kbd));
+
+    /* A burst: no extra edge while the first byte still blocks the head... */
+    hype_ps2_kbd_try_enqueue_scancode(&kbd, 0x9Eu);
+    hype_ps2_kbd_try_enqueue_scancode(&kbd, 0x2Au);
+    CHECK_HEX("no edge for queued-behind bytes", 0, hype_ps2_kbd_take_irq(&kbd));
+    /* ...but each read that exposes the next byte raises the next edge, so a
+     * multi-byte burst gets one interrupt per byte -- the #284 OVMF case. */
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got);
+    CHECK_HEX("edge after read exposes second byte", 1, hype_ps2_kbd_take_irq(&kbd));
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got);
+    CHECK_HEX("edge after read exposes third byte", 1, hype_ps2_kbd_take_irq(&kbd));
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got);
+    CHECK_HEX("no edge after the FIFO drains", 0, hype_ps2_kbd_take_irq(&kbd));
+}
+
+static void test_irq_edge_for_command_responses(void) {
+    hype_ps2_kbd_t kbd;
+    uint8_t got;
+
+    /* #389: Linux's atkbd probe waits for its ACK interrupt-driven. A response
+     * byte must raise the same edge a scancode does. */
+    hype_ps2_kbd_reset(&kbd);
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_DATA, 0xF4u); /* enable scanning */
+    CHECK_HEX("ACK raises an IRQ edge", 1, hype_ps2_kbd_take_irq(&kbd));
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got);
+    CHECK_HEX("ACK byte", 0xFAu, got);
+    CHECK_HEX("no edge left after the ACK is read", 0, hype_ps2_kbd_take_irq(&kbd));
+
+    /* Reset command: ACK then BAT -- two bytes, two edges, sequenced by reads. */
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_DATA, 0xFFu);
+    CHECK_HEX("reset ACK edge", 1, hype_ps2_kbd_take_irq(&kbd));
+    CHECK_HEX("BAT edge waits for the ACK read", 0, hype_ps2_kbd_take_irq(&kbd));
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got);
+    CHECK_HEX("BAT edge after ACK read", 1, hype_ps2_kbd_take_irq(&kbd));
+
+    /* Reset clears any pending edges. */
+    hype_ps2_kbd_reset(&kbd);
+    CHECK_HEX("reset clears pending edges", 0, hype_ps2_kbd_take_irq(&kbd));
+}
+
+static void test_irq_edges_saturate_instead_of_wrapping(void) {
+    hype_ps2_kbd_t kbd;
+    uint8_t got;
+    unsigned int i;
+    unsigned int taken = 0;
+
+    /* A guest that never services IRQ1 must not accumulate unbounded edges:
+     * push/read cycles without a take saturate at the FIFO size. */
+    hype_ps2_kbd_reset(&kbd);
+    for (i = 0; i < HYPE_PS2_KBD_FIFO_SIZE * 3u; i++) {
+        hype_ps2_kbd_enqueue_scancode(&kbd, 0x1Eu);         /* push-on-empty edge */
+        hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got); /* drain, no expose edge */
+    }
+    while (hype_ps2_kbd_take_irq(&kbd)) taken++;
+    CHECK_HEX("edges saturate at the FIFO size", HYPE_PS2_KBD_FIFO_SIZE, taken);
+
+    /* Same cap on the read-exposes-next-byte side: fill the FIFO, then read it
+     * down twice over with edges never taken. */
+    hype_ps2_kbd_reset(&kbd);
+    for (i = 0; i < HYPE_PS2_KBD_FIFO_SIZE * 2u; i++) {
+        while (hype_ps2_kbd_try_enqueue_scancode(&kbd, 0x1Eu)) { }
+        hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got);
+    }
+    taken = 0;
+    while (hype_ps2_kbd_take_irq(&kbd)) taken++;
+    CHECK_HEX("read-exposed edges saturate too", HYPE_PS2_KBD_FIFO_SIZE, taken);
+}
+
 int main(void) {
+    test_irq_edge_per_readable_byte();
+    test_irq_edge_for_command_responses();
+    test_irq_edges_saturate_instead_of_wrapping();
     test_try_enqueue_appends_a_whole_sequence();
     test_try_enqueue_refuses_when_full_instead_of_dropping();
     test_clobbering_enqueue_is_unchanged();
