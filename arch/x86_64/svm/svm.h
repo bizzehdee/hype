@@ -514,7 +514,10 @@ void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
 /* #318: how many times `vector` was requested, and how many times it was actually staged into
  * EVENTINJ. Counters rather than a bounded trace, because a trace of interrupt traffic is always
  * dominated by the periodic timer and the vector under investigation never gets a line. */
-void hype_svm_vcpu_get_vec_counts(uint8_t vector, uint32_t *out_req, uint32_t *out_inj);
+/* #359: per-vCPU -- the global version summed both guests, making its one lead
+ * (a requested-vs-injected gap on a single vector) unattributable. */
+void hype_svm_vcpu_get_vec_counts(hype_vcpu_ctx_t *ctx, uint8_t vector, uint32_t *out_req,
+                                  uint32_t *out_inj);
 
 /* #311: one-command AHCI timeline. Armed by the first kernel-era access to the HBA (OVMF drives
  * the same registers long before, and swamped five earlier attempts at this measurement), then a

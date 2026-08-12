@@ -10544,11 +10544,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * unavailable on VMX rather than as zeros, which would read as "no
                      * interrupts" instead of "not measured". */
                     static char vl[300];
-                    int vo = hype_snprintf(vl, sizeof(vl), "fw-1 VECHIST:");
+                    int vo = hype_snprintf(vl, sizeof(vl), "fw-1 VECHIST vm%u:",
+                                           (unsigned)(vm - g_vms));
                     unsigned vv, shown = 0;
                     for (vv = 0; vv < 256u && shown < 10u; vv++) {
                         uint32_t rq = 0, ij = 0;
-                        hype_svm_vcpu_get_vec_counts((uint8_t)vv, &rq, &ij);
+                        hype_svm_vcpu_get_vec_counts(ctx, (uint8_t)vv, &rq, &ij);
                         if (rq == 0u && ij == 0u) {
                             continue;
                         }

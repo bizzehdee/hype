@@ -89,6 +89,11 @@ struct hype_vcpu_ctx {
      * file-global: VM0 may be Windows while VM1 is Linux, and the two cores take
      * CPUID exits concurrently. */
     int hv_enabled;
+    /* #359: per-vector interrupt accounting, per-vCPU. The file-global version
+     * summed both guests, so the one diagnostic lead #359 has (a requested-vs-
+     * injected gap on one vector) could not be attributed to a VM. */
+    uint32_t int_req_by_vec[256];
+    uint32_t int_inj_by_vec[256];
 };
 
 /* M8-0b-ii: per-vCPU state pool. Was a single g_vmcb/g_ctx (M2's one-vCPU
@@ -343,6 +348,10 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
         int i;
         for (i = 0; i < 8; i++) {
             ctx->pending_irr[i] = 0;
+        }
+        for (i = 0; i < 256; i++) {
+            ctx->int_req_by_vec[i] = 0;   /* #359: a recycled slot must not inherit */
+            ctx->int_inj_by_vec[i] = 0;   /* the previous guest's interrupt history */
         }
     }
 }
@@ -1145,21 +1154,20 @@ static uint8_t g_int_trace_timer_vec = 0xFFu;
  * vector under investigation first fired, and both times the missing lines read as absence of
  * the event rather than absence of the trace. Counters cannot be crowded out.
  */
-static uint32_t g_int_req_by_vec[256];
-static uint32_t g_int_inj_by_vec[256];
-
-void hype_svm_vcpu_get_vec_counts(uint8_t vector, uint32_t *out_req, uint32_t *out_inj) {
+void hype_svm_vcpu_get_vec_counts(hype_vcpu_ctx_t *ctx, uint8_t vector, uint32_t *out_req,
+                                  uint32_t *out_inj) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     if (out_req != 0) {
-        *out_req = g_int_req_by_vec[vector];
+        *out_req = (real != 0) ? real->int_req_by_vec[vector] : 0u;
     }
     if (out_inj != 0) {
-        *out_inj = g_int_inj_by_vec[vector];
+        *out_inj = (real != 0) ? real->int_inj_by_vec[vector] : 0u;
     }
 }
 
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
-    g_int_req_by_vec[vector]++;
+    real->int_req_by_vec[vector]++;
     int eventinj_busy = (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) != 0;
 
     /* Fast path: the guest can take an interrupt AND nothing is already staged
@@ -1202,7 +1210,7 @@ trace_done:
     if (!eventinj_busy &&
         hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
-        g_int_inj_by_vec[vector]++;
+        real->int_inj_by_vec[vector]++;
         g_int_eventinj++;
         return;
     }
@@ -1251,7 +1259,7 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
         int v = hype_svm_irr_highest(real->pending_irr);
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
-        g_int_inj_by_vec[(uint8_t)v]++;
+        real->int_inj_by_vec[(uint8_t)v]++;
         g_int_vintr_window++;
     }
     hype_svm_sync_vintr(real);
@@ -1295,7 +1303,7 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
         int v = hype_svm_irr_highest(real->pending_irr);
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
-        g_int_inj_by_vec[(uint8_t)v]++;
+        real->int_inj_by_vec[(uint8_t)v]++;
     }
     /* Keep the window armed if more vectors remain; disarm once drained. */
     hype_svm_sync_vintr(real);
