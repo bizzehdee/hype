@@ -378,8 +378,9 @@ surface for all of this.
   from `hype.cfg`, matched the same way a `physical:` target is, with
   auto-detection as the fallback) and **which ISO** on it
   (`install_media`) — and reads go through the same host-side block driver
-  set physical targets use (**AHCI + NVMe**). A host **ATAPI** path so a real
-  DVD-ROM can be used as media directly is a further option, not a
+  set physical targets use (**AHCI + NVMe + USB**, §10 decisions 25/31; USB
+  disks are named by the identity #340 captures). A host **ATAPI** path so a
+  real DVD-ROM can be used as media directly is a further option, not a
   requirement.
   Guest-facing, the drive presents as a **DVD-ROM with a data disc in it** —
   `GET CONFIGURATION`'s current profile is DVD-ROM — so a guest treats it
@@ -1299,6 +1300,53 @@ isn't lost.
     read model. Rejected write support for compressed/sparse allocation: it
     requires `$Bitmap` + runlist + possibly `$MFT` rewrites, i.e. the full
     writer hype deliberately does not have.
+
+31. **Multiple USB mass-storage devices — decided: additional USB disks are
+    claimable as media-only devices, behind per-device transfer rings.**
+    Today hype claims exactly ONE USB MSC — its boot/log medium, first
+    encountered wins (#241) — and the xHCI layer owns one bulk-ring pair per
+    controller, so a second stick cannot be brought up at all: with #340's
+    identity capture in place, naming a second stick in `media_disk` refuses
+    cleanly but can never succeed. Decided:
+    - **Per-claimed-device bulk transfer rings** (ring pair + BOT state per
+      claimed slot, not per controller), so N MSC devices on one controller
+      can be live. The controller-wide transfer lock stays: one transfer at
+      a time per controller is the concurrency contract the #343/#377 work
+      proved; per-device rings remove the *bring-up* limit, not the
+      serialisation.
+    - **The log-sink claim is unchanged**: the first MSC remains hype's
+      boot/log medium (#241's actual concern was re-pointing the log sink
+      mid-boot, and that stays forbidden). Each further MSC is claimed as a
+      **media-only** device — registered via `media_add_dev` under its
+      captured identity (#340), never touching the log sink, up to the
+      existing `HYPE_MEDIA_MAX_DEVS` cap.
+    - **Unidentified extra sticks stay unmatchable** (#323): they register
+      with an empty serial, auto-detectable only.
+    - Rejected: claiming extra sticks only when a configured serial matches
+      (the sweep cannot know whether a later device matches, and an unnamed
+      second stick would be invisible to auto-detection for no reason);
+      re-pointing the log sink at a config-named stick (re-opens the exact
+      mid-boot failure #241 closed).
+
+32. **USB disks as `physical:` targets — decided: same chain, third bus.**
+    #340 gives a USB disk the enumerated identity the destructive-write
+    chain needs; the `blk_backend` plan already names `physical`
+    (AHCI/NVMe/USB) as one backing (§6d). A USB `physical:` target goes
+    through **exactly** the decision-8 chain — serial match at VM start,
+    interactive dashboard confirmation before the first write, non-empty-
+    partition-table guard — with `blk_usb` (which already reads, writes and
+    SYNCHRONIZE-CACHEs) as the backend behind `phys_guard`. Two hard rules:
+    - **hype's own boot/log medium is never a physical target**, whatever
+      its serial: the inventory's `HYPE_USB_OWNER_HYPE` claim marks it and
+      the admission check refuses it by identity, not by position. This
+      makes decision 31 a prerequisite in practice: the only USB disk hype
+      can drive today IS the boot medium.
+    - **No identity, no target**: a stick reporting neither a VPD-0x80 nor
+      an iSerialNumber serial cannot be named, matching the media rule —
+      never positional.
+    Rejected: a separate confirmation flow for USB ("it's removable, so
+    softer rules") — a stick holds real data exactly like an internal disk,
+    and two different destructive-write ceremonies is how one of them rots.
 
 ## 11. Pre-M0 readiness checklist
 
