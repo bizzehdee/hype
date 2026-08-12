@@ -990,7 +990,10 @@ static volatile int g_term_view = -1;
 /* #379: only VMs whose runtime display/input state has been initialized may
  * own focus. AP startup can fail after configuration and media preparation;
  * the configured VM count is therefore not a readiness signal. */
-static volatile uint32_t g_vm_runtime_ready_mask;
+/* #396: per-VM readiness, a byte array (g_vm_ready[i] != 0) not a 32-bit mask
+ * -- the mask capped the VM count at 32. Pool-allocated to g_vm_count; the AP
+ * sets its own VM's byte on becoming ready, the BSP reads them for focus. */
+static volatile uint8_t *g_vm_ready;
 /* #373: measured, per-view redraw budgets. Each switch starts at the
  * conservative floor and expands only when productive passes are fast. */
 static hype_render_budget_t g_dash_render_budget;
@@ -1008,7 +1011,7 @@ static int g_view_switch_pending_view = -2;
  * is dashboard(-1) -> vm0 -> vm1 -> ... -> dashboard, wrapping both ways. */
 static void hype_term_apply_chord(hype_chord_result_t cr) {
     int old_view = g_term_view;
-    unsigned int ready = __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE);
+    const unsigned char *ready = (const unsigned char *)g_vm_ready;
     hype_term_focus_action_t action = HYPE_TERM_FOCUS_NONE;
     unsigned int jump = 0u;
 
@@ -1529,9 +1532,8 @@ static void term_run_cmdline(void) {
                 hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focus: unknown vm '%s'", nm);
                 break;
             }
-            if (hype_term_focus_validate(
-                    idx, __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE),
-                    g_vm_count) < 0) {
+            if (hype_term_focus_validate(idx, (const unsigned char *)g_vm_ready,
+                                         g_vm_count) < 0) {
                 hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
                               "focus: %s is unavailable (vCPU not dispatched)", nm);
             } else {
@@ -8061,7 +8063,7 @@ static void fw_1_render_console(void) {
     last_gop_flush_tsc = now_gf;
     view = g_term_view;
     {
-        unsigned int ready = __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE);
+        const unsigned char *ready = (const unsigned char *)g_vm_ready;
         if (view >= 0 && hype_term_focus_validate(view, ready, g_vm_count) < 0) {
             hype_debug_print("fw-1 VIEWSWITCH: refusing unavailable vm%d; returning to dashboard "
                              "[#379]\n", view);
@@ -8207,9 +8209,7 @@ static void fw_1_render_console(void) {
         hype_vm_dash_info_t *info = g_dash_info;
         unsigned ninfo = g_vm_count;
         for (unsigned i = 0; i < ninfo; i++) {
-            unsigned int ready_mask =
-                __atomic_load_n(&g_vm_runtime_ready_mask, __ATOMIC_ACQUIRE);
-            int ready = i < 32u && (ready_mask & (1u << i)) != 0u;
+            int ready = __atomic_load_n(&g_vm_ready[i], __ATOMIC_ACQUIRE) != 0;
             /* #357: show the operator's `label` when they set one; the section-id/vm0 identity is
              * what they TYPE, and stays available for commands either way. */
             info[i].name = (g_vms[i].label != 0)
@@ -8768,11 +8768,17 @@ static int media_present(void) {
  * path must match the on-disk spelling for ext -- see #320.
  */
 static const char *fw_1_media_path(unsigned vi) {
+    static char path[32]; /* BSP setup is sequential; the caller uses the path immediately. */
     const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
     if (cv != 0 && cv->has_install_media && cv->install_media[0] != '\0') {
         return cv->install_media;
     }
-    return (vi == 0u) ? "\\iso\\test.iso" : "\\iso\\vm1.iso";
+    /* #396: vm0 keeps the historical \iso\test.iso; every later VM defaults to
+     * \iso\vmN.iso (vm1 -> vm1.iso, vm2 -> vm2.iso, ...), generalising the old
+     * two-VM test.iso/vm1.iso pair. */
+    if (vi == 0u) return "\\iso\\test.iso";
+    hype_snprintf(path, sizeof(path), "\\iso\\vm%u.iso", vi);
+    return path;
 }
 
 /* #324: the candidate host devices the media/image scan iterates. Defined with the rest of the
@@ -10209,7 +10215,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     {
         unsigned int ready_index = (unsigned int)(vm - g_vms);
         if (ready_index < g_vm_count) {
-            __atomic_fetch_or(&g_vm_runtime_ready_mask, 1u << ready_index, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_vm_ready[ready_index], 1u, __ATOMIC_RELEASE);
         }
     }
 
@@ -16324,6 +16330,7 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
     g_dash_info = fw_aux_alloc(bs, (UINTN)n * sizeof *g_dash_info);
     g_vm_log = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log);
     g_vm_log_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log_ready);
+    g_vm_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_ready);
     /* g_ap_vmm_page: 4 KiB-aligned per element -> pages, like g_vms. */
     g_ap_vmm_page = (uint8_t (*)[4096])(uintptr_t)hype_alloc_pages_any(bs, (UINTN)n);
     hype_guest_ram_zero(g_ap_vmm_page, (uint64_t)n * 4096ull);
@@ -16561,6 +16568,59 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                         "the old hardcoded ids 1 and 2"
                                                       : "");
         }
+    }
+
+    /*
+     * #396: topology-bounded admission. The config count sized the arena; now
+     * bound the number that will actually LAUNCH by the two physical limits --
+     * one isolated core per VM (1:1 pinning, the BSP is reserved) and the guest
+     * RAM budget -- and REPORT every VM that will not run, by name, with the
+     * real numbers (never a silent drop, #341). The RAM setup loop and the AP
+     * launch below both use the bounded g_vm_count, so no un-launchable VM's
+     * guest RAM is allocated. Enumeration failure (count==0) keeps the whole
+     * configured count and the fw_1_ap_apic_id literal fallback.
+     */
+    {
+        unsigned int launchable = g_vm_count;
+        if (g_cpu_topo.count != 0u) {
+            int nsel = hype_cpu_topology_select_isolated(&g_cpu_topo, g_vm_count, g_ap_sel,
+                                                         g_vm_count);
+            unsigned int by_cores = (nsel < 0) ? 0u : (unsigned int)nsel;
+            if (by_cores < launchable) {
+                hype_debug_print("adm: %u VM(s) configured but only %u isolated core(s) available "
+                                 "(%u usable CPU(s), BSP reserved) -- capping to %u [#396]\n",
+                                 g_vm_count, by_cores, g_cpu_topo.count, by_cores);
+                launchable = by_cores;
+            }
+        }
+        {
+            /* RAM: cumulative configured guest RAM must fit the usable budget. */
+            uint64_t budget = usable_ram_bytes;
+            uint64_t used = 0;
+            unsigned int fit = 0u;
+            unsigned int i;
+            for (i = 0u; i < launchable; i++) {
+                uint64_t mb = (i < g_hype_cfg.vm_count && g_hype_cfg.vms[i].mem_mb != 0u)
+                                  ? (uint64_t)g_hype_cfg.vms[i].mem_mb
+                                  : HYPE_FW_1_GUEST_RAM_MB;
+                uint64_t bytes = mb * 1024ull * 1024ull;
+                if (used + bytes > budget) break;
+                used += bytes;
+                fit = i + 1u;
+            }
+            if (fit < launchable) {
+                hype_debug_print("adm: guest RAM budget %llu MiB exceeded at vm%u -- %u VM(s) fit, "
+                                 "capping to %u [#396]\n",
+                                 (unsigned long long)(budget / (1024ull * 1024ull)), fit, fit, fit);
+                launchable = fit;
+            }
+        }
+        for (unsigned int vi = launchable; vi < g_vm_count; vi++) {
+            const char *nm = (vi < g_hype_cfg.vm_count) ? g_hype_cfg.vms[vi].name : "(default)";
+            hype_debug_print("adm: vm%u '%s' WILL NOT RUN -- exceeds the physical core/RAM budget "
+                             "[#396]\n", vi, nm);
+        }
+        g_vm_count = launchable ? launchable : 1u; /* always keep at least vm0 */
     }
 
     status = hype_gop_locate(SystemTable->BootServices, &gop);
