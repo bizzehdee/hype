@@ -274,10 +274,39 @@ static void test_clobbering_enqueue_is_unchanged(void) {
     CHECK_HEX("OBF clear -- no second byte", 0, got & HYPE_PS2_STATUS_OUTPUT_FULL);
 }
 
+static void test_scancode_stats_distinguish_guest_reads(void) {
+    hype_ps2_kbd_t kbd;
+    unsigned long long queued = 99, read = 99, dropped = 99;
+    uint8_t got;
+
+    hype_ps2_kbd_reset(&kbd);
+    hype_ps2_kbd_scancode_stats(&kbd, &queued, &read, &dropped);
+    CHECK_HEX("stats reset queued", 0, queued);
+    CHECK_HEX("stats reset read", 0, read);
+    CHECK_HEX("stats reset dropped", 0, dropped);
+
+    hype_ps2_kbd_enqueue_scancode(&kbd, 0x1Eu);
+    hype_ps2_kbd_enqueue_scancode(&kbd, 0x9Eu);
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got);
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_DATA, 0xF4u);
+    hype_ps2_kbd_io_read(&kbd, HYPE_PS2_PORT_DATA, &got);
+    hype_ps2_kbd_scancode_stats(&kbd, &queued, &read, &dropped);
+    CHECK_HEX("two scancodes queued", 2, queued);
+    CHECK_HEX("one scancode read", 1, read);
+    CHECK_HEX("overwritten scancode dropped", 1, dropped);
+
+    /* A full append reports the refusal as a scancode drop. */
+    while (hype_ps2_kbd_try_enqueue_scancode(&kbd, 0x20u)) { }
+    CHECK_HEX("full append refused", 0, hype_ps2_kbd_try_enqueue_scancode(&kbd, 0x21u));
+    hype_ps2_kbd_scancode_stats(&kbd, 0, 0, &dropped);
+    CHECK_HEX("full refusals counted", 3, dropped);
+}
+
 int main(void) {
     test_try_enqueue_appends_a_whole_sequence();
     test_try_enqueue_refuses_when_full_instead_of_dropping();
     test_clobbering_enqueue_is_unchanged();
+    test_scancode_stats_distinguish_guest_reads();
     test_reset_state();
     test_unrecognized_port_rejected();
     test_enqueue_scancode_sets_obf_and_reads_back();

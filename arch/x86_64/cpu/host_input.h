@@ -28,6 +28,7 @@
 typedef struct {
     hype_kbd_decode_t dec;
     hype_chord_state_t chord;
+    int ps2_extended_pending; /* hold E0 until its byte is classified as guest input or leader */
 } hype_host_input_t;
 
 void hype_host_input_reset(hype_host_input_t *hi);
@@ -42,5 +43,16 @@ void hype_host_input_reset(hype_host_input_t *hi);
  */
 hype_chord_result_t hype_host_input_feed(hype_host_input_t *hi, uint8_t scancode, uint8_t *out,
                                          unsigned out_cap, unsigned *n_out);
+
+/*
+ * #375: the same split, with the original Set-1 bytes for a focused
+ * framebuffer guest. Reserved Right-Ctrl/Right-Alt leader bytes and action
+ * keys are omitted. Ordinary modifiers, make/break bytes, and complete E0
+ * sequences are preserved. `ps2_out` needs room for two bytes.
+ */
+hype_chord_result_t hype_host_input_feed_routed(hype_host_input_t *hi, uint8_t scancode,
+                                                uint8_t *out, unsigned out_cap,
+                                                unsigned *n_out, uint8_t *ps2_out,
+                                                unsigned ps2_cap, unsigned *n_ps2_out);
 
 #endif /* HYPE_CPU_HOST_INPUT_H */

@@ -1,6 +1,7 @@
 #include "ps2_keyboard.h"
 
 void hype_ps2_kbd_reset(hype_ps2_kbd_t *kbd) {
+    unsigned int i;
     kbd->out_head = 0;
     kbd->out_count = 0;
     kbd->config_byte = 0;
@@ -8,16 +9,32 @@ void hype_ps2_kbd_reset(hype_ps2_kbd_t *kbd) {
     kbd->keyboard_port_enabled = 1;
     kbd->aux_port_enabled = 1;
     kbd->next_data_write_is_for_aux = 0;
+    __atomic_store_n(&kbd->scancodes_queued, 0ull, __ATOMIC_RELAXED);
+    __atomic_store_n(&kbd->scancodes_read, 0ull, __ATOMIC_RELAXED);
+    __atomic_store_n(&kbd->scancodes_dropped, 0ull, __ATOMIC_RELAXED);
+    for (i = 0; i < HYPE_PS2_KBD_FIFO_SIZE; i++) {
+        kbd->out_fifo[i] = 0;
+        kbd->out_is_scancode[i] = 0;
+    }
 }
 
 /* Append one byte to the output FIFO (dropped if full -- never happens
  * in practice). */
-static void push_output(hype_ps2_kbd_t *kbd, uint8_t value) {
+static void push_output(hype_ps2_kbd_t *kbd, uint8_t value, int is_scancode) {
+    unsigned int slot;
     if (kbd->out_count >= HYPE_PS2_KBD_FIFO_SIZE) {
+        if (is_scancode) {
+            __atomic_add_fetch(&kbd->scancodes_dropped, 1ull, __ATOMIC_RELAXED);
+        }
         return;
     }
-    kbd->out_fifo[(kbd->out_head + kbd->out_count) % HYPE_PS2_KBD_FIFO_SIZE] = value;
+    slot = (kbd->out_head + kbd->out_count) % HYPE_PS2_KBD_FIFO_SIZE;
+    kbd->out_fifo[slot] = value;
+    kbd->out_is_scancode[slot] = (uint8_t)(is_scancode != 0);
     kbd->out_count++;
+    if (is_scancode) {
+        __atomic_add_fetch(&kbd->scancodes_queued, 1ull, __ATOMIC_RELAXED);
+    }
 }
 
 void hype_ps2_kbd_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode) {
@@ -27,21 +44,29 @@ void hype_ps2_kbd_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode) {
      * that must not lose a byte -- anything sending a multi-byte sequence, where losing
      * one produces a different keystroke -- use try_enqueue below instead.
      */
+    unsigned int i;
+    for (i = 0; i < kbd->out_count; i++) {
+        unsigned int slot = (kbd->out_head + i) % HYPE_PS2_KBD_FIFO_SIZE;
+        if (kbd->out_is_scancode[slot]) {
+            __atomic_add_fetch(&kbd->scancodes_dropped, 1ull, __ATOMIC_RELAXED);
+        }
+    }
     kbd->out_head = 0;
     kbd->out_count = 0;
-    push_output(kbd, scancode);
+    push_output(kbd, scancode, 1);
 }
 
 int hype_ps2_kbd_try_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode) {
     if (kbd->out_count >= HYPE_PS2_KBD_FIFO_SIZE) {
+        __atomic_add_fetch(&kbd->scancodes_dropped, 1ull, __ATOMIC_RELAXED);
         return 0;
     }
-    push_output(kbd, scancode);
+    push_output(kbd, scancode, 1);
     return 1;
 }
 
 static void stage_response(hype_ps2_kbd_t *kbd, uint8_t value) {
-    push_output(kbd, value);
+    push_output(kbd, value, 0);
 }
 
 int hype_ps2_kbd_io_read(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t *out_value) {
@@ -49,6 +74,9 @@ int hype_ps2_kbd_io_read(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t *out_value)
         /* Pop the next queued byte; reading the data port clears OBF once
          * the FIFO drains (real firmware's poll loop depends on this). */
         if (kbd->out_count > 0) {
+            if (kbd->out_is_scancode[kbd->out_head]) {
+                __atomic_add_fetch(&kbd->scancodes_read, 1ull, __ATOMIC_RELAXED);
+            }
             *out_value = kbd->out_fifo[kbd->out_head];
             kbd->out_head = (kbd->out_head + 1) % HYPE_PS2_KBD_FIFO_SIZE;
             kbd->out_count--;
@@ -148,4 +176,19 @@ int hype_ps2_kbd_take_aux_data_write(hype_ps2_kbd_t *kbd) {
     int was_set = kbd->next_data_write_is_for_aux;
     kbd->next_data_write_is_for_aux = 0;
     return was_set;
+}
+
+void hype_ps2_kbd_scancode_stats(const hype_ps2_kbd_t *kbd,
+                                 unsigned long long *queued,
+                                 unsigned long long *read,
+                                 unsigned long long *dropped) {
+    if (queued != 0) {
+        *queued = __atomic_load_n(&kbd->scancodes_queued, __ATOMIC_RELAXED);
+    }
+    if (read != 0) {
+        *read = __atomic_load_n(&kbd->scancodes_read, __ATOMIC_RELAXED);
+    }
+    if (dropped != 0) {
+        *dropped = __atomic_load_n(&kbd->scancodes_dropped, __ATOMIC_RELAXED);
+    }
 }

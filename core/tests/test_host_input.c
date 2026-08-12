@@ -84,6 +84,63 @@ int main(void) {
     CHECK_HEX("post-leader 'a' -> 1 byte", 1u, n);
     CHECK_HEX("post-leader 'a' -> 'a' (no desync)", 'a', b);
 
+    /* #375: framebuffer routing retains raw Set-1 input, including ordinary
+     * modifiers and complete extended sequences, but never exposes the
+     * hypervisor-reserved right-side leader chord. */
+    {
+        uint8_t text[HYPE_KBD_DECODE_MAX_OUT];
+        uint8_t raw[2];
+        unsigned nt = 0, nr = 0;
+        hype_chord_result_t r;
+
+        hype_host_input_reset(&hi);
+        r = hype_host_input_feed_routed(&hi, 0x2Au, text, sizeof(text), &nt,
+                                        raw, sizeof(raw), &nr); /* Left Shift make */
+        CHECK_HEX("left shift raw count", 1u, nr);
+        CHECK_HEX("left shift raw byte", 0x2Au, raw[0]);
+        r = hype_host_input_feed_routed(&hi, 0x1Eu, text, sizeof(text), &nt,
+                                        raw, sizeof(raw), &nr); /* A make */
+        CHECK_HEX("A raw count", 1u, nr);
+        CHECK_HEX("A raw byte", 0x1Eu, raw[0]);
+        CHECK_HEX("A still decodes for serial", 'A', text[0]);
+        (void)r;
+
+        hype_host_input_feed_routed(&hi, 0xE0u, text, sizeof(text), &nt,
+                                    raw, sizeof(raw), &nr);
+        CHECK_HEX("E0 held until classified", 0u, nr);
+        hype_host_input_feed_routed(&hi, 0x48u, text, sizeof(text), &nt,
+                                    raw, sizeof(raw), &nr);
+        CHECK_HEX("extended raw count", 2u, nr);
+        CHECK_HEX("extended prefix", 0xE0u, raw[0]);
+        CHECK_HEX("extended key", 0x48u, raw[1]);
+
+        hype_host_input_reset(&hi);
+        hype_host_input_feed_routed(&hi, 0xE0u, text, sizeof(text), &nt,
+                                    raw, sizeof(raw), &nr);
+        hype_host_input_feed_routed(&hi, HYPE_SCANCODE_RIGHT_CTRL_MAKE,
+                                    text, sizeof(text), &nt, raw, sizeof(raw), &nr);
+        CHECK_HEX("right ctrl reserved", 0u, nr);
+        hype_host_input_feed_routed(&hi, 0xE0u, text, sizeof(text), &nt,
+                                    raw, sizeof(raw), &nr);
+        hype_host_input_feed_routed(&hi, HYPE_SCANCODE_RIGHT_ALT_MAKE,
+                                    text, sizeof(text), &nt, raw, sizeof(raw), &nr);
+        CHECK_HEX("right alt reserved", 0u, nr);
+        r = hype_host_input_feed_routed(&hi, HYPE_SCANCODE_D_MAKE,
+                                        text, sizeof(text), &nt, raw, sizeof(raw), &nr);
+        CHECK_HEX("leader action retained", HYPE_CHORD_ACTION_TOGGLE_DASHBOARD, r.action);
+        CHECK_HEX("leader action not guest raw", 0u, nr);
+
+        hype_host_input_reset(&hi);
+        hype_host_input_feed_routed(&hi, 0xE0u, text, sizeof(text), &nt,
+                                    raw, sizeof(raw), &nr);
+        hype_host_input_feed_routed(&hi, 0x48u, text, sizeof(text), &nt,
+                                    raw, 1u, &nr);
+        CHECK_HEX("short raw buffer emits nothing", 0u, nr);
+        hype_host_input_feed_routed(&hi, 0x1Eu, text, sizeof(text), &nt,
+                                    0, 0u, &nr);
+        CHECK_HEX("null raw buffer emits nothing", 0u, nr);
+    }
+
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;

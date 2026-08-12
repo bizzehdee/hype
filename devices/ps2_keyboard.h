@@ -89,6 +89,7 @@ typedef struct {
      * responses and injected scancodes). OBF (status bit 0) reflects
      * out_count > 0. */
     uint8_t out_fifo[HYPE_PS2_KBD_FIFO_SIZE];
+    uint8_t out_is_scancode[HYPE_PS2_KBD_FIFO_SIZE];
     unsigned int out_head;  /* index of the next byte to read */
     unsigned int out_count; /* bytes currently queued */
     uint8_t config_byte;    /* controller configuration byte (0x20/0x60) */
@@ -96,6 +97,9 @@ typedef struct {
     int keyboard_port_enabled;
     int aux_port_enabled;         /* INPUT-2: mouse port enable/disable (0xA8/0xA7) */
     int next_data_write_is_for_aux; /* INPUT-2: one-shot flag set by 0xD4, consumed by the next 0x60 write */
+    unsigned long long scancodes_queued;
+    unsigned long long scancodes_read;
+    unsigned long long scancodes_dropped;
 } hype_ps2_kbd_t;
 
 /* Resets to power-on state: no pending byte, keyboard port enabled,
@@ -156,5 +160,11 @@ int hype_ps2_kbd_has_pending_byte(const hype_ps2_kbd_t *kbd);
  * hype_ps2_kbd_io_write() for a 0x60 write.
  */
 int hype_ps2_kbd_take_aux_data_write(hype_ps2_kbd_t *kbd);
+
+/* #375: end-to-end evidence for host input reaching and being read by a guest. */
+void hype_ps2_kbd_scancode_stats(const hype_ps2_kbd_t *kbd,
+                                 unsigned long long *queued,
+                                 unsigned long long *read,
+                                 unsigned long long *dropped);
 
 #endif /* HYPE_DEVICES_PS2_KEYBOARD_H */
