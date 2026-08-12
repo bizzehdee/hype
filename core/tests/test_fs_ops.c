@@ -100,9 +100,10 @@ static void test_registry(void) {
               ((reg[i]->append != 0)) == ((reg[i]->caps & HYPE_FS_CAP_APPEND) != 0));
         CHECK("namespace slots match caps",
               ((reg[i]->create != 0)) == ((reg[i]->caps & HYPE_FS_CAP_NAMESPACE) != 0));
-        CHECK("WRITE_GROW is fat32-only so far (#382)",
+        CHECK("WRITE_GROW is fat32/exfat so far (#382/#383)",
               ((reg[i]->caps & HYPE_FS_CAP_WRITE_GROW) == 0) ||
-                  (reg[i]->name[0] == 'f' && reg[i]->name[1] == 'a'));
+                  (reg[i]->name[0] == 'f' && reg[i]->name[1] == 'a') ||
+                  (reg[i]->name[0] == 'e' && reg[i]->name[1] == 'x'));
     }
     (void)hype_fs_registry(0); /* count pointer is optional */
 }

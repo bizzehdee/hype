@@ -98,6 +98,7 @@ typedef struct {
     uint32_t first_cluster; /* first cluster of the data chain (0 == no allocation) */
     uint32_t tail_cluster;  /* last cluster of the chain, 0 == not resolved yet */
     uint64_t size;          /* DataLength in bytes */
+    uint64_t valid;         /* ValidDataLength: bytes actually initialized (#383) */
     uint8_t contiguous;     /* 1 == the data stream is NoFatChain */
     uint8_t is_dir;         /* 1 == the entry names a directory */
     /* Seek cache: `seek_cluster` is the cluster at chain index `seek_index`, so
@@ -172,15 +173,28 @@ int hype_exfat_rmdir(hype_exfat_fs_t *fs, const char *path);
 int hype_exfat_rename(hype_exfat_fs_t *fs, const char *from, const char *to);
 
 /*
- * Overwrites `len` bytes at byte `offset` of the file. The range must lie wholly
- * within the file's current size -- this is the pre-allocated-backing-file path
- * and never grows or moves an allocation. Returns 0 on success, -1 on I/O error
- * or an out-of-range range.
+ * #383: writes `len` bytes at byte `offset`, growing as needed.
+ *
+ * Wholly inside ValidDataLength: a pure in-place data write (no metadata).
+ * Past ValidDataLength but inside DataLength: the gap [valid, offset) is
+ * zeroed on the medium FIRST, the data written, and only then is the larger
+ * ValidDataLength published to the entry set -- a crash mid-way leaves the
+ * old valid prefix, never stale media bytes readable. Past DataLength: the
+ * allocation grows (materializing a FAT chain when a NoFatChain file cannot
+ * extend in place), the gap is zeroed, the data written, and DataLength +
+ * ValidDataLength advance together in one entry-set update. A failure rolls
+ * newly allocated clusters back. Returns 0 or -1 (bounds are refused, not
+ * clamped; the volume must be mounted writable).
  */
 int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data,
                         unsigned int len);
 
-/* Reads `len` bytes from byte `offset` of the file. Bounds-checked as above. */
+/*
+ * Reads `len` bytes from byte `offset`. Bytes past ValidDataLength (but
+ * inside DataLength) read as ZEROS -- the allocation exists but was never
+ * initialized, and the media contents there are stale (#383). Bounds-checked
+ * against DataLength.
+ */
 int hype_exfat_read_at(hype_exfat_wfile_t *f, uint64_t offset, void *out, unsigned int len);
 
 /*

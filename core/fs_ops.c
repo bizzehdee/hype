@@ -308,7 +308,11 @@ static int exfat_write_at(hype_fs_file_t *f, uint64_t offset, const void *src, u
     if (f->tag != TAG_NATIVE) {
         return -1;
     }
-    return hype_exfat_write_at(&f->u.exfat, offset, src, len);
+    if (hype_exfat_write_at(&f->u.exfat, offset, src, len) != 0) {
+        return -1;
+    }
+    if (f->u.exfat.size > f->size) f->size = f->u.exfat.size; /* #383 growth */
+    return 0;
 }
 
 static int exfat_append(hype_fs_file_t *f, const void *src, unsigned int len) {
@@ -350,7 +354,8 @@ static void exfat_set_time(hype_fs_t *fs, const hype_rtc_time_t *now) {
 
 static const hype_fs_ops_t exfat_ops = {
     "exfat",
-    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_APPEND | HYPE_FS_CAP_NAMESPACE,
+    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_WRITE_GROW | HYPE_FS_CAP_APPEND |
+        HYPE_FS_CAP_NAMESPACE, /* #383: random writes grow with VDL semantics */
     exfat_probe,
     exfat_mount,
     exfat_lookup,

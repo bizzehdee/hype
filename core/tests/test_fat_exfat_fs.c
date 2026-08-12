@@ -808,14 +808,14 @@ static void test_write_at(void) {
 
     /* Out of range in every direction: refused, never clamped. This is the
      * offset+length validation AGENTS.md requires on anything a guest can steer. */
-    CHECK_HEX("write past the end", -1, hype_exfat_write_at(&f, 1400u, buf, 1u));
-    CHECK_HEX("write straddling the end", -1, hype_exfat_write_at(&f, 1399u, buf, 2u));
+    /* #383: reads past DataLength stay refused; writes past it now GROW
+     * (asserted in the dedicated VDL tests, on a fresh volume) */
     CHECK_HEX("read past the end", -1, hype_exfat_read_at(&f, 1400u, back, 1u));
     CHECK_HEX("read straddling the end", -1, hype_exfat_read_at(&f, 1396u, back, 8u));
     CHECK_HEX("absurd offset", -1, hype_exfat_write_at(&f, 0xFFFFFFFFFFFFFFFFull, buf, 1u));
     CHECK_HEX("null buffer refused", -1, hype_exfat_write_at(&f, 0u, 0, 1u));
     CHECK_HEX("null read buffer refused", -1, hype_exfat_read_at(&f, 0u, 0, 1u));
-    /* Writing does not resize or re-point the file. */
+    /* In-place writing does not resize or re-point the file. */
     verify_set("after in-place writes", 3u, "image.img", 10u, 1400u, 1);
 
     /* A chained file's offsets follow the FAT, and the seek cache must not
@@ -1741,7 +1741,7 @@ static void test_fs_ops_exfat(void) {
     CHECK("caps: in-place write", (hype_fs_caps(&fs) & HYPE_FS_CAP_WRITE_INPLACE) != 0);
     CHECK("caps: append", (hype_fs_caps(&fs) & HYPE_FS_CAP_APPEND) != 0);
     CHECK("caps: namespace", (hype_fs_caps(&fs) & HYPE_FS_CAP_NAMESPACE) != 0);
-    CHECK("caps: no grow yet (#383)", (hype_fs_caps(&fs) & HYPE_FS_CAP_WRITE_GROW) == 0);
+    CHECK("caps: grow (#383)", (hype_fs_caps(&fs) & HYPE_FS_CAP_WRITE_GROW) != 0);
 
     CHECK_HEX("lookup image.img", 0, hype_fs_lookup(&fs, "image.img", &f));
     CHECK_HEX("size", 1400, f.size);
@@ -1753,7 +1753,8 @@ static void test_fs_ops_exfat(void) {
     buf[0] = 0x5A;
     CHECK_HEX("write_at in place", 0, hype_fs_write_at(&f, 7, buf, 1));
     CHECK_HEX("write landed", 0x5A, cluster(10u)[7]);
-    CHECK("write past size refused", hype_fs_write_at(&f, 1399, buf, 2) != 0);
+    CHECK_HEX("write past size grows (#383)", 0, hype_fs_write_at(&f, 1399, buf, 2));
+    CHECK_HEX("size grew", 1401, f.size);
 
     CHECK_HEX("map_ranges", 0, hype_fs_map_ranges(&fs, "image.img", &rm));
     CHECK_HEX("one DATA range", 1, rm.count);
@@ -1794,8 +1795,186 @@ static void test_fs_ops_exfat(void) {
     CHECK("append bogus tag", hype_fs_append(&f, buf, 1) != 0);
 }
 
+
+/* ---- #383: ValidDataLength + random-write growth ---- */
+
+/* Patch a root entry set's ValidDataLength (entry_set at root cluster offset
+ * `off`, stream entry at +32) and refresh the set checksum. */
+static void patch_vdl(uint32_t root_off, uint64_t vdl) {
+    uint8_t *set = cluster(ROOT_CL) + root_off;
+    uint16_t sum = 0;
+    unsigned k, n = 1u + (unsigned)set[1];
+    put64(set + 32 + 8, vdl);
+    for (k = 0; k < n; k++) {
+        sum = hype_exfat_set_checksum_update(sum, k * 32u, set + k * 32u, 32u);
+    }
+    hype_exfat_file_entry_set_checksum(set, sum);
+}
+
+static void test_383_vdl(void) {
+    hype_exfat_wfile_t f;
+    uint8_t buf[4096];
+    unsigned i;
+
+    /* a file whose ValidDataLength is SHORT of its DataLength, with stale
+     * bytes planted in the uninitialized region */
+    build_vol_with_files();
+    for (i = 1000u; i < 1400u; i++) cluster(10u + i / SECSZ)[i % SECSZ] = 0xEE;
+    patch_vdl(96u, 1000u);
+    CHECK_HEX("mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup", 0, hype_exfat_lookup(&g_fs, "image.img", 0, &f));
+    CHECK_HEX("DataLength", 1400, f.size);
+    CHECK_HEX("ValidDataLength", 1000, f.valid);
+
+    /* reads: initialized prefix from media, uninitialized tail as zeros */
+    CHECK_HEX("read straddling VDL", 0, hype_exfat_read_at(&f, 990u, buf, 30u));
+    for (i = 0; i < 10u; i++) { if (buf[i] != pat(990u + i)) break; }
+    CHECK("prefix bytes", i == 10u);
+    for (i = 10u; i < 30u; i++) { if (buf[i] != 0) break; }
+    CHECK("stale bytes NEVER leak", i == 30u);
+    CHECK_HEX("read wholly past VDL", 0, hype_exfat_read_at(&f, 1200u, buf, 100u));
+    for (i = 0; i < 100u; i++) { if (buf[i] != 0) break; }
+    CHECK("zeros past VDL", i == 100u);
+
+    /* a write inside [VDL, DataLength): the gap is zeroed ON MEDIA and the
+     * valid prefix advances; DataLength stays */
+    CHECK_HEX("write past VDL", 0, hype_exfat_write_at(&f, 1200u, "VD", 2u));
+    CHECK_HEX("VDL advanced", 1202, f.valid);
+    CHECK_HEX("DataLength unchanged", 1400, f.size);
+    /* media: the gap [1000,1200) must be REAL zeros now, not stale 0xEE */
+    for (i = 1000u; i < 1200u; i++) {
+        if (cluster(10u + i / SECSZ)[i % SECSZ] != 0) break;
+    }
+    CHECK("gap zeroed on the medium", i == 1200u);
+    CHECK("payload on the medium", cluster(12u)[1200u % SECSZ] == 'V');
+    /* a fresh lookup sees the published VDL */
+    CHECK_HEX("re-lookup", 0, hype_exfat_lookup(&g_fs, "image.img", 0, &f));
+    CHECK_HEX("published VDL", 1202, f.valid);
+
+    /* growth past DataLength: the NoFatChain file materializes a chain */
+    CHECK_HEX("growth write", 0, hype_exfat_write_at(&f, 2000u, "GR", 2u));
+    CHECK_HEX("grown size", 2002, f.size);
+    CHECK_HEX("grown VDL", 2002, f.valid);
+    verify_set("after growth", 3u, "image.img", 10u, 2002u, 0); /* chained now */
+    CHECK_HEX("read grown", 0, hype_exfat_read_at(&f, 1202u, buf, 800u));
+    for (i = 0; i < 798u; i++) { if (buf[i] != 0) break; }
+    CHECK("grown gap zeros", i == 798u);
+    CHECK("grown payload", buf[798u] == 'G' && buf[799u] == 'R');
+    /* the FAT chain covers the new cluster and terminates */
+    CHECK("chain linked", fat_get(12u) != 0xFFFFFFFFu);
+
+    /* a fresh empty file: growth from nothing */
+    {
+        hype_exfat_wfile_t g;
+        CHECK_HEX("create", 0, hype_exfat_create(&g_fs, "grow.bin", &g));
+        CHECK_HEX("empty growth", 0, hype_exfat_write_at(&g, 3000u, "E", 1u));
+        CHECK_HEX("empty grown size", 3001, g.size);
+        CHECK_HEX("empty grown VDL", 3001, g.valid);
+        CHECK("first cluster published", g.first_cluster >= 2u);
+        CHECK_HEX("empty gap read", 0, hype_exfat_read_at(&g, 0u, buf, 512u));
+        for (i = 0; i < 512u; i++) { if (buf[i] != 0) break; }
+        CHECK("empty gap zeros", i == 512u);
+    }
+
+    /* in-place writes inside VDL never touch metadata */
+    {
+        uint8_t before[SECSZ];
+        memcpy(before, cluster(ROOT_CL), SECSZ);
+        CHECK_HEX("in-place write", 0, hype_exfat_write_at(&f, 10u, "ip", 2u));
+        CHECK("entry set untouched", memcmp(before, cluster(ROOT_CL), SECSZ) == 0);
+    }
+
+    /* an entry claiming VDL > DataLength is refused at lookup (parser gate) */
+    build_vol_with_files();
+    patch_vdl(96u, 2000u);
+    CHECK_HEX("mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK("VDL past DataLength refused", hype_exfat_lookup(&g_fs, "image.img", 0, &f) != 0);
+}
+
+static void test_383_rollback_and_faults(void) {
+    hype_exfat_wfile_t f;
+    uint8_t buf[64];
+    unsigned used_before;
+    long n;
+
+    /* disk full: burn every free cluster, then ask for growth */
+    build_vol_with_files();
+    CHECK_HEX("mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    {
+        unsigned c;
+        for (c = 2u; c < 2u + CLUSTERS; c++) {
+            if (!bit_used((uint32_t)c)) bit_mark((uint32_t)c, 1);
+        }
+        g_fs.used_clusters = CLUSTERS;
+    }
+    CHECK_HEX("lookup", 0, hype_exfat_lookup(&g_fs, "image.img", 0, &f));
+    used_before = used_count();
+    CHECK("growth on a full volume fails", hype_exfat_write_at(&f, 5000u, "x", 1u) != 0);
+    CHECK_HEX("allocation restored", used_before, used_count());
+    CHECK_HEX("size unchanged", 1400, f.size);
+    CHECK_HEX("VDL unchanged", 1400, f.valid);
+    CHECK("in-place still works", hype_exfat_write_at(&f, 5u, "y", 1u) == 0);
+
+    /* fault sweep across a growth write: every crash point must leave a
+     * volume that remounts with the file either old-shaped or new-shaped */
+    for (n = 0; n < 40; n++) {
+        hype_exfat_wfile_t f2;
+        build_vol_with_files();
+        CHECK_HEX("sweep mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+        CHECK_HEX("sweep lookup", 0, hype_exfat_lookup(&g_fs, "image.img", 0, &f2));
+        g_write_countdown = n;
+        (void)hype_exfat_write_at(&f2, 2000u, "GR", 2u);
+        g_write_countdown = -1;
+        {
+            hype_exfat_fs_t fs2;
+            hype_exfat_wfile_t f3;
+            CHECK_HEX("sweep remount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &fs2));
+            if (hype_exfat_lookup(&fs2, "image.img", 0, &f3) == 0) {
+                CHECK("sweep size sane", f3.size == 1400u || f3.size == 2002u);
+                CHECK("sweep VDL sane", f3.valid <= f3.size);
+            }
+            /* else: the crash landed inside the entry-set rewrite, so the
+             * set checksum no longer matches -- lookup REFUSES the torn set
+             * (fsck.exfat is the repair path), which is the correct refusal,
+             * not a corruption hype must tolerate */
+        }
+        /* read-fault variant */
+        build_vol_with_files();
+        CHECK_HEX("rsweep mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+        CHECK_HEX("rsweep lookup", 0, hype_exfat_lookup(&g_fs, "image.img", 0, &f2));
+        g_read_countdown = n;
+        (void)hype_exfat_write_at(&f2, 2000u, "GR", 2u);
+        g_read_countdown = -1;
+    }
+
+    /* bounds + arg guards on the new path */
+    build_vol_with_files();
+    CHECK_HEX("mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup", 0, hype_exfat_lookup(&g_fs, "image.img", 0, &f));
+    CHECK("overflow refused", hype_exfat_write_at(&f, ~0ull - 1u, buf, 8u) != 0);
+    CHECK_HEX("len 0 no-op", 0, hype_exfat_write_at(&f, 5000u, buf, 0u));
+    CHECK_HEX("size still", 1400, f.size);
+    {
+        hype_exfat_wfile_t d;
+        CHECK_HEX("lookup dir", 0, hype_exfat_lookup(&g_fs, "subdir", 1, &d));
+        CHECK("directory growth refused", hype_exfat_write_at(&d, 5000u, buf, 8u) != 0);
+    }
+    /* read-only mount: growth refused */
+    {
+        hype_exfat_fs_t ro;
+        hype_exfat_wfile_t rf;
+        CHECK_HEX("ro mount", 0, hype_exfat_fs_mount(vol_read, 0, 0, &ro));
+        CHECK_HEX("ro lookup", 0, hype_exfat_lookup(&ro, "image.img", 0, &rf));
+        CHECK("ro growth refused", hype_exfat_write_at(&rf, 2000u, "x", 1u) != 0);
+        /* ro reads past VDL still zero-synthesize */
+        CHECK_HEX("ro read", 0, hype_exfat_read_at(&rf, 100u, buf, 8u));
+    }
+}
+
 int main(void) {
     test_fs_ops_exfat();
+    test_383_vdl();
+    test_383_rollback_and_faults();
     test_exfat_set_time();
     test_multi_sector_bitmap();
     test_bad_allocations();

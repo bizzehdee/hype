@@ -412,7 +412,10 @@ static int set_flush(hype_exfat_wfile_t *f) {
     }
     ent[1] = (uint8_t)(HYPE_EXFAT_FLAG_ALLOC_POSSIBLE |
                        (f->contiguous ? HYPE_EXFAT_FLAG_NO_FAT_CHAIN : 0u));
-    hype_wr64(ent + 8, f->size); /* ValidDataLength: hype only ever writes full data */
+    if (f->valid > f->size) {
+        return -1; /* never publish a valid prefix past the data length */
+    }
+    hype_wr64(ent + 8, f->valid); /* ValidDataLength (#383) */
     hype_wr32(ent + 20, f->first_cluster);
     hype_wr64(ent + 24, f->size);
     if (entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, ent) != 0) {
@@ -735,6 +738,7 @@ static void wfile_from_set(hype_exfat_wfile_t *f, hype_exfat_fs_t *fs, uint32_t 
     f->first_cluster = set->first_cluster;
     f->tail_cluster = 0u; /* resolved lazily: walking a long chain is not free */
     f->size = set->data_length;
+    f->valid = set->valid_length;
     f->contiguous = set->contiguous;
     f->is_dir = (uint8_t)((set->attributes & HYPE_EXFAT_ATTR_DIRECTORY) ? 1 : 0);
     f->seek_index = 0u;
@@ -1245,6 +1249,7 @@ int hype_exfat_create(hype_exfat_fs_t *fs, const char *path, hype_exfat_wfile_t 
     out->first_cluster = 0u;
     out->tail_cluster = 0u;
     out->size = 0u;
+    out->valid = 0u;
     out->contiguous = 0u;
     out->is_dir = 0u;
     out->seek_index = 0u;
@@ -1604,19 +1609,173 @@ static int file_rw_at(hype_exfat_wfile_t *f, uint64_t offset, uint8_t *rbuf, con
     return 0;
 }
 
+static int chain_materialise(hype_exfat_wfile_t *f);
+static int resolve_tail(hype_exfat_wfile_t *f);
+static int zero_span(hype_exfat_wfile_t *f, uint64_t offset, uint64_t len);
+
 int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data,
                         unsigned int len) {
-    if (data == 0) {
+    hype_exfat_fs_t *fs = f->fs;
+    uint64_t end = offset + len;
+    uint64_t old_size, old_valid;
+    uint32_t old_tail = 0u, first_new = 0u;
+    uint8_t old_contig;
+
+    if (data == 0 || f->is_dir) {
         return -1;
     }
-    return file_rw_at(f, offset, 0, (const uint8_t *)data, len);
+    if (len == 0u) {
+        return 0;
+    }
+    if (end < offset) {
+        return -1;
+    }
+    if (end <= f->valid) {
+        /* wholly inside the initialized prefix: pure in-place data */
+        return file_rw_at(f, offset, 0, (const uint8_t *)data, len);
+    }
+    if (fs->write == 0) {
+        return -1;
+    }
+    if (mark_dirty(fs) != 0) {
+        return -1;
+    }
+    old_size = f->size;
+    old_valid = f->valid;
+    old_contig = f->contiguous;
+
+    /* 1. Grow the allocation through the new end (exFAT cannot represent a
+     *    missing cluster inside DataLength). */
+    if (end > f->size) {
+        uint64_t cb = cluster_bytes(fs);
+        uint64_t need = clusters_for(fs, end);
+        uint64_t have = (f->first_cluster == 0u) ? 0u : clusters_for(fs, f->size);
+
+        if (have > 0u) {
+            if (chain_materialise(f) != 0) {
+                return -1;
+            }
+            if (resolve_tail(f) != 0) {
+                return -1;
+            }
+            old_tail = f->tail_cluster;
+        }
+        while (have < need) {
+            uint32_t cl;
+            if (alloc_cluster(fs, &cl) != 0) {
+                goto rollback;
+            }
+            if (f->first_cluster == 0u) {
+                f->first_cluster = cl;
+                f->contiguous = 0u;
+                f->seek_index = 0u;
+                f->seek_cluster = cl;
+            } else if (fat_set(fs, f->tail_cluster, cl) != 0) {
+                (void)free_cluster(fs, cl);
+                goto rollback;
+            }
+            if (first_new == 0u) {
+                first_new = cl;
+            }
+            f->tail_cluster = cl;
+            have++;
+        }
+        f->size = end;
+        (void)cb;
+    }
+
+    /* 2. Zero the never-written gap on the medium BEFORE anything makes it
+     *    reachable: [old_valid, offset) inside the (possibly new) allocation. */
+    if (offset > old_valid) {
+        if (zero_span(f, old_valid, offset - old_valid) != 0) {
+            goto rollback;
+        }
+    }
+
+    /* 3. The data itself. */
+    if (file_rw_at(f, offset, 0, (const uint8_t *)data, len) != 0) {
+        goto rollback;
+    }
+
+    /* 4. Publish: DataLength + ValidDataLength + first cluster + checksum in
+     *    one entry-set update, after the bytes are on the medium. */
+    f->valid = end;
+    if (set_flush(f) != 0) {
+        goto rollback;
+    }
+    return 0;
+
+rollback:
+    /* free everything allocated this call and restore the old shape */
+    if (first_new != 0u) {
+        uint32_t cl = first_new;
+        uint32_t guard = 0;
+        while (cluster_valid(fs, cl) && guard++ <= fs->cluster_count) {
+            uint32_t next;
+            if (fat_get(fs, cl, &next) != 0) {
+                break;
+            }
+            (void)free_cluster(fs, cl);
+            if (next >= EOC_MARK || next == 0u) {
+                break;
+            }
+            cl = next;
+        }
+        if (old_tail != 0u) {
+            (void)fat_set(fs, old_tail, EOC_MARK);
+        }
+    }
+    if (f->first_cluster != 0u && old_size == 0u && first_new == f->first_cluster) {
+        f->first_cluster = 0u;
+        f->tail_cluster = 0u;
+    } else {
+        f->tail_cluster = old_tail;
+    }
+    f->size = old_size;
+    f->valid = old_valid;
+    f->contiguous = (old_contig && first_new == 0u) ? old_contig : f->contiguous;
+    f->seek_index = 0u;
+    f->seek_cluster = f->first_cluster;
+    return -1;
 }
 
 int hype_exfat_read_at(hype_exfat_wfile_t *f, uint64_t offset, void *out, unsigned int len) {
+    uint8_t *dst = (uint8_t *)out;
+    unsigned int from_media = len;
     if (out == 0) {
         return -1;
     }
-    return file_rw_at(f, offset, (uint8_t *)out, 0, len);
+    if (offset > f->size || (uint64_t)len > f->size - offset) {
+        return -1;
+    }
+    /* #383: the allocation past ValidDataLength was never written -- reading
+     * the medium there would hand out stale bytes. Synthesize zeros. */
+    if (offset >= f->valid) {
+        from_media = 0;
+    } else if (offset + len > f->valid) {
+        from_media = (unsigned int)(f->valid - offset);
+    }
+    if (from_media > 0u && file_rw_at(f, offset, dst, 0, from_media) != 0) {
+        return -1;
+    }
+    bzero(dst + from_media, len - from_media);
+    return 0;
+}
+
+/* Zero `len` bytes of the ALLOCATION at byte `offset`, bounded by f->size
+ * (which the caller has already advanced when growing). Chunked through a
+ * static zero buffer -- BSP-serialized, like every writer here. */
+static int zero_span(hype_exfat_wfile_t *f, uint64_t offset, uint64_t len) {
+    static const uint8_t zeros[2048];
+    while (len > 0u) {
+        unsigned int n = (len > sizeof zeros) ? (unsigned int)sizeof zeros : (unsigned int)len;
+        if (file_rw_at(f, offset, 0, zeros, n) != 0) {
+            return -1;
+        }
+        offset += n;
+        len -= n;
+    }
+    return 0;
 }
 
 /* ---- append ---- */
@@ -1753,6 +1912,7 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
         len -= n;
         f->size += n;
     }
+    f->valid = f->size; /* an append writes every byte through the new end */
     return set_flush(f);
 }
 
