@@ -320,11 +320,20 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     ctx->tsc_aux_valid = 0;
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
-    {   /* #436: MTRR model starts empty (defType 0 = disabled + type UC; the guest programs it). */
+    {
+        /*
+         * #436: default MTRR state = "all memory Write-Back, MTRRs enabled". hype forces WB for
+         * all guest RAM via the NPT/PAT, so the guest's MTRR view must AGREE: MTRRdefType with
+         * E (bit 11) + FE (bit 10) set and default type WB (6) -> 0xC06. Starting from 0 instead
+         * (MTRRs disabled, default type UC) told a guest that reads MTRRs -- FreeBSD does, Linux/
+         * BSD via the MADT do not -- that ALL memory is uncached, and FreeBSD panicked/reset.
+         * Fixed MTRRs default to WB (0x06 per byte) for the same reason. Variable MTRRs stay 0
+         * (disabled, mask.V=0): with the default already WB, none are needed.
+         */
         unsigned mi;
-        ctx->mtrr_deftype = 0;
+        ctx->mtrr_deftype = 0x0C06u;
         for (mi = 0; mi < 16u; mi++) ctx->mtrr_var[mi] = 0;
-        for (mi = 0; mi < 11u; mi++) ctx->mtrr_fix[mi] = 0;
+        for (mi = 0; mi < 11u; mi++) ctx->mtrr_fix[mi] = 0x0606060606060606ull; /* all WB */
     }
     ctx->hv_guest_os_id = 0;
     ctx->hv_hypercall = 0;
