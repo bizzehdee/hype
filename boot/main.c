@@ -8655,32 +8655,14 @@ static unsigned int fw_1_slot_gsi(unsigned int slot, hype_cfg_bus_t bus) {
 }
 
 /*
- * #339: how many VMs this boot should actually run.
- *
- * `vm_count` was parsed, validated and ECHOED, and then did not affect anything: HYPE_RUN_TWO_VMS is a
- * compile-time constant, so a config declaring one VM still built a second, unconfigured one with a
- * 2048 MB built-in default -- and on an 8 GB box that second VM's AllocatePages could PANIC. hype
- * printed the right count and then contradicted it, which is the #285/#331 failure mode with a worse
- * ending.
- *
- * The compile-time gate still wins when it is off (-DHYPE_RUN_TWO_VMS=0 is the "prove one core" mode),
- * and NO config at all still means two -- every existing QEMU rig boots that way and this must not
- * change what they do. Only an explicit config now reduces the count.
- *
- * Deliberately a predicate rather than a count: the second VM is dispatched to a specific pinned AP and
- * the SVM vCPU-slot pool is sized for two (#237 -- a pool that silently clamped gave two guests one
- * VMCB). Generalising to N belongs with that pool, not here.
+ * #414: the VM count is now g_vm_count, set once from the parsed config
+ * (g_hype_cfg.vm_count, or the built-in two-VM default when no hype.cfg), and
+ * every per-VM path -- resource setup, media resolve, input scripts, AP launch,
+ * pools, arena -- loops over it. The former fw_1_want_two_vms() predicate and
+ * the HYPE_RUN_TWO_VMS compile gate it wrapped are gone: nothing hardcodes the
+ * count. (#339's original concern -- a config declaring one VM must not build a
+ * second unconfigured one -- holds because the setup loop runs vi=1..count-1.)
  */
-static int fw_1_want_two_vms(void) {
-#if HYPE_RUN_TWO_VMS
-    if (g_hype_cfg.vm_count == 0u) {
-        return 1; /* no hype.cfg: built-in default, unchanged */
-    }
-    return (g_hype_cfg.vm_count > 1u) ? 1 : 0;
-#else
-    return 0;
-#endif
-}
 
 /*
  * #202: the VALID-3 boundary for the NVMe front-end.
@@ -16452,7 +16434,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * launch handles -- one or two VMs; #393b-d raises the ceiling to the
      * cfg count under core/RAM admission. Every per-VM loop below uses
      * g_vm_count, so raising it there needs no further loop edits. */
-    g_vm_count = fw_1_want_two_vms() ? 2u : 1u;
+    /* #414: the number of VMs to launch is the parsed config's VM count
+     * (the parser caps it at HYPE_CFG_MAX_VMS; the core/RAM admission bound is
+     * #396). No hype.cfg keeps the built-in two-VM default. */
+    g_vm_count = g_hype_cfg.vm_count ? g_hype_cfg.vm_count : 2u;
     {
         UINTN vm_bytes = (UINTN)g_vm_count * sizeof(hype_fw_vm_t);
         UINTN vm_pages = (vm_bytes + 4095u) / 4096u;
@@ -16484,11 +16469,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * and costs one log line.
      */
     load_input_script(ImageHandle, SystemTable, &g_vms[0], 0u);
-#if HYPE_RUN_TWO_VMS
-    if (fw_1_want_two_vms()) { /* #339 */
-        load_input_script(ImageHandle, SystemTable, &g_vms[1], 1u);
+    for (unsigned vi = 1u; vi < g_vm_count; vi++) { /* #414 */
+        load_input_script(ImageHandle, SystemTable, &g_vms[vi], vi);
     }
-#endif
 
     SystemTable->BootServices->FreePool(map);
 
@@ -18382,11 +18365,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * NVMe-only or USB-only host with no media at all.
      */
     (void)fw_1_resolve_media_stream(0u);
-#if HYPE_RUN_TWO_VMS
-    if (fw_1_want_two_vms()) { /* #339 */
-        (void)fw_1_resolve_media_stream(1u);
+    for (unsigned vi = 1u; vi < g_vm_count; vi++) { /* #414 */
+        (void)fw_1_resolve_media_stream(vi);
     }
-#endif
 
 #if HYPE_RUN_TWO_VMS
     /*
@@ -18399,21 +18380,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * a multi-extent ISO would otherwise give vm1 the extent map of a zeroed struct and it would read
      * the wrong sectors -- silently, since extent_count 0 means "contiguous" rather than "unset".
      */
-    if (fw_1_want_two_vms() && g_vms[0].iso_stream_ready && !g_vms[1].iso_stream_ready) { /* #339 */
+    for (unsigned vi = 1u; vi < g_vm_count; vi++) { /* #414 */
+        if (!g_vms[0].iso_stream_ready || g_vms[vi].iso_stream_ready) continue;
         unsigned ei;
-        g_vms[1].iso_stream.read = g_vms[0].iso_stream.read;
-        g_vms[1].iso_stream.ctx = g_vms[0].iso_stream.ctx;
-        /* #352: the SAME media, but read concurrently on a different core -- so a slot of its
-         * own, deliberately not copied from vm0 along with everything else. */
-        g_vms[1].iso_stream.bounce_slot = 1u;
-        g_vms[1].iso_stream.part_start_lba = g_vms[0].iso_stream.part_start_lba;
-        g_vms[1].iso_stream.iso_size = g_vms[0].iso_stream.iso_size;
-        g_vms[1].iso_stream.extent_count = g_vms[0].iso_stream.extent_count;
+        g_vms[vi].iso_stream.read = g_vms[0].iso_stream.read;
+        g_vms[vi].iso_stream.ctx = g_vms[0].iso_stream.ctx;
+        /* #352: the SAME media, read concurrently on a different core -- so each gets its own
+         * bounce slot, deliberately not copied from vm0 along with everything else. */
+        g_vms[vi].iso_stream.bounce_slot = vi;
+        g_vms[vi].iso_stream.part_start_lba = g_vms[0].iso_stream.part_start_lba;
+        g_vms[vi].iso_stream.iso_size = g_vms[0].iso_stream.iso_size;
+        g_vms[vi].iso_stream.extent_count = g_vms[0].iso_stream.extent_count;
         for (ei = 0; ei < HYPE_ISO_STREAM_MAX_EXTENTS; ei++) {
-            g_vms[1].iso_stream.extents[ei] = g_vms[0].iso_stream.extents[ei];
+            g_vms[vi].iso_stream.extents[ei] = g_vms[0].iso_stream.extents[ei];
         }
-        g_vms[1].iso_stream_ready = 1;
-        hype_debug_print("fw-1 VM1: no media of its own -- sharing vm0's streamed ISO (read-only)\n");
+        g_vms[vi].iso_stream_ready = 1;
+        hype_debug_print("fw-1 VM%u: no media of its own -- sharing vm0's streamed ISO (read-only)\n", vi);
     }
 #endif
 
@@ -18489,87 +18471,60 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * keyboard right now. */
             fw_1_await_phys_confirm_on_bsp();
             usb_log_latch_bsp_core();
-            /* #368: an ISOLATED core, not the first enumerated AP. See fw_1_ap_apic_id(). */
-            int ap1_sel = fw_1_ap_apic_id(0u);
-            uint8_t ap1_id = 0u;
-            int ap_rc;
-            if (ap1_sel < 0) {
-                hype_debug_print("fw-1 #360: no application processor available -- this machine "
-                                 "reports %u usable CPU(s), but no AP has proven physical-core "
-                                 "isolation; no guest will run [#378]\n",
-                                 g_cpu_topo.count);
-                ap_rc = -5;
-            } else {
-                ap1_id = (uint8_t)ap1_sel;
-                g_ap_slot_apic_id[0] = ap1_id;
-                g_ap_slot_valid[0] = 1;
-                ap_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
-                                      ap1_id, (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
-                                      (uint64_t)(uintptr_t)(g_ap_stacks[0] + HYPE_AP_STACK_BYTES),
-                                      g_fw_1_host_tsc_hz, fw_1_ap_main, 0);
-            }
-            g_fw_1_ap_rc = ap_rc;
-            hype_debug_print(
-                "fw-1 AP-SMOKETEST: apic_id=%u tramp=0x%llx cr3=0x%llx -> rc=%d (long-mode reached=%s), "
-                "last_phase=%u (0=none 1=real 2=prot 3=long) c_entry_ran=%u ap_vmm_ok=%u\n",
-                (unsigned)ap1_id, (unsigned long long)g_ap_tramp_page, (unsigned long long)cr3,
-                ap_rc,
-                (ap_rc == 0) ? "yes" : "NO", (unsigned int)g_hype_ap_last_phase,
-                (unsigned int)g_hype_ap_c_alive, (unsigned int)g_fw_1_ap_vmm_ok);
-
             /*
-             * STEP 2a: bring up a SECOND AP (the second ENUMERATED id -- #360) to prove hype can start
-             * more than one core -- the foundation for two Alpines on two cores.
-             * This one just PARKS (hype_ap_entry: sets alive, cli/hlt); STEP 2c
-             * will hand it g_vms[1] once VM1's resources exist. Safe to reuse
-             * g_ap_tramp_page: AP1 signalled alive and is now executing
-             * fw_1_ap_main from high memory, no longer touching the low
-             * trampoline; hype_ap_start re-copies the blob and re-zeroes its own
-             * per-bring-up `alive` flag, so rc/last_phase below reflect AP2, not
-             * a stale AP1 value. Only attempted when AP1 itself came up (rc=0),
-             * so a single-core box or a failed AP1 doesn't chase a phantom AP2. */
-            if (ap_rc == 0) {
-                /* STEP 2c: when HYPE_RUN_TWO_VMS, AP2 runs the SECOND Alpine
-                 * (fw_1_ap_main with vm index 1 -> g_vms[1], whose RAM+firmware
-                 * were allocated pre-EBS below). Otherwise it just parks
-                 * (hype_ap_entry) -- the STEP 2a "prove the core comes up" mode. */
-                /* #339: with a one-VM config AP2 PARKS instead of running g_vms[1] -- the same
-                 * thing -DHYPE_RUN_TWO_VMS=0 does. It must not be dispatched at a VM that was never
-                 * given firmware or RAM, and parking keeps the core accounted for rather than
-                 * leaving a started AP with nothing to do. */
-                void (*ap2_entry)(void *) = fw_1_want_two_vms() ? fw_1_ap_main : hype_ap_entry;
-                void *ap2_arg = fw_1_want_two_vms() ? (void *)(uintptr_t)1u : (void *)0;
-                int ap2_sel = fw_1_ap_apic_id(1u);
-                uint8_t ap2_id;
-                if (ap2_sel < 0) {
-                    /* #360: enumeration says this machine has no second AP. Do not
-                     * send INIT/SIPI to a made-up ID and then report a mysterious
-                     * timeout -- that is precisely how the Intel failure presented,
-                     * as a VM whose RAM, firmware and media all resolved and which
-                     * then silently never ran. State the reason instead. */
-                    g_fw_1_ap2_rc = -5;
+             * #414: start one AP per configured VM (vi = 0..g_vm_count-1), each
+             * running fw_1_ap_main(vi) -> run_fw_1_test(&g_vms[vi]) on its own
+             * ISOLATED core (fw_1_ap_apic_id selects by topology, never
+             * enumeration order -- #368/#378) with its own AP stack (#413). The
+             * BSP owns console/logging and runs no guest. Was a hardcoded AP1 +
+             * AP2 pair; now the count comes only from the config.
+             *
+             * Sequential by necessity: every hype_ap_start re-copies the shared
+             * <1 MB trampoline blob and re-zeroes its alive flag, and returns
+             * only once THIS AP has signalled alive and moved off the trampoline
+             * into fw_1_ap_main in high memory -- so the next iteration can reuse
+             * the blob safely. A core that cannot be isolated (sel < 0: the pool
+             * of isolated cores is exhausted, so no later VM has one either) or
+             * that fails to come up stops further starts rather than reusing a
+             * trampoline an unresponsive AP may still touch; the VMs that DID
+             * come up keep running (fault isolation). g_fw_1_ap_rc / _ap2_rc are
+             * kept for vi 0/1 as the existing single-VM diagnostics.
+             */
+            for (unsigned vi = 0u; vi < g_vm_count; vi++) {
+                int sel = fw_1_ap_apic_id(vi);
+                if (sel < 0) {
                     hype_debug_print(
-                        "fw-1 AP2: NOT STARTED -- this machine reports %u usable CPU(s), %u "
-                        "AP(s); there is no second application processor to place vm1 on. "
-                        "vm1 will not run. [#360]\n",
-                        g_cpu_topo.count, hype_cpu_topology_ap_count(&g_cpu_topo));
-                    goto ap2_done;
+                        "fw-1 AP[vm%u]: NO isolated core (machine reports %u CPU(s), %u AP(s)) -- "
+                        "vm%u and any later VM will not run [#360/#414]\n",
+                        vi, g_cpu_topo.count, hype_cpu_topology_ap_count(&g_cpu_topo), vi);
+                    if (vi == 0u) g_fw_1_ap_rc = -5;
+                    else if (vi == 1u) g_fw_1_ap2_rc = -5;
+                    break;
                 }
-                ap2_id = (uint8_t)ap2_sel;
-                g_ap_slot_apic_id[1] = ap2_id;
-                g_ap_slot_valid[1] = 1;
-                int ap2_rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
-                                           ap2_id,
-                                           (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
-                                           (uint64_t)(uintptr_t)(g_ap_stacks[1] + HYPE_AP_STACK_BYTES),
-                                           g_fw_1_host_tsc_hz, ap2_entry, ap2_arg);
-                g_fw_1_ap2_rc = ap2_rc;
-                hype_debug_print(
-                    "fw-1 AP2-SMOKETEST: apic_id=%u -> rc=%d (long-mode reached=%s), "
-                    "last_phase=%u (0=none 1=real 2=prot 3=long)\n",
-                    (unsigned)ap2_id, ap2_rc, (ap2_rc == 0) ? "yes" : "NO",
-                    (unsigned int)g_hype_ap_last_phase);
-            ap2_done:;
+                {
+                    uint8_t id = (uint8_t)sel;
+                    int rc;
+                    g_ap_slot_apic_id[vi] = id;
+                    g_ap_slot_valid[vi] = 1;
+                    rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
+                                       id, (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
+                                       (uint64_t)(uintptr_t)(g_ap_stacks[vi] + HYPE_AP_STACK_BYTES),
+                                       g_fw_1_host_tsc_hz, fw_1_ap_main, (void *)(uintptr_t)vi);
+                    if (vi == 0u) g_fw_1_ap_rc = rc;
+                    else if (vi == 1u) g_fw_1_ap2_rc = rc;
+                    hype_debug_print(
+                        "fw-1 AP[vm%u]-SMOKETEST: apic_id=%u cr3=0x%llx -> rc=%d (long-mode=%s), "
+                        "last_phase=%u c_entry_ran=%u ap_vmm_ok=%u [#414]\n",
+                        vi, (unsigned)id, (unsigned long long)cr3, rc, (rc == 0) ? "yes" : "NO",
+                        (unsigned int)g_hype_ap_last_phase, (unsigned int)g_hype_ap_c_alive,
+                        (unsigned int)g_fw_1_ap_vmm_ok);
+                    if (rc != 0) {
+                        hype_debug_print(
+                            "fw-1 AP[vm%u]: START FAILED (rc=%d) -- not reusing the trampoline for "
+                            "later VMs; VMs already up keep running [#414]\n", vi, rc);
+                        break;
+                    }
+                }
             }
         }
     }
