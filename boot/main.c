@@ -540,8 +540,8 @@ static uint64_t g_ram_1_size_bytes;
 
 /* #302: console bytes that reach the script matcher, split by whether it was armed -- see
  * fw_1_script_feed for what each combination rules out. */
-static unsigned long long g_script_seen[HYPE_FW_MAX_VMS];
-static unsigned long long g_script_fed[HYPE_FW_MAX_VMS];
+static unsigned long long *g_script_seen;
+static unsigned long long *g_script_fed;
 
 /*
  * #329: how many guest disks one VM can carry. The bound is the interrupt budget, not memory:
@@ -803,6 +803,13 @@ typedef struct hype_fw_vm {
  * aligned. Sized to HYPE_FW_MAX_VMS for now; the dynamic count is the next step. */
 static hype_fw_vm_t *g_vms;
 static unsigned g_vm_count = HYPE_FW_MAX_VMS;
+#define FW_1_LINE_BUF_FS 256u /* #394: file-scope twin of FW_1_LINE_BUF */
+static char (*g_uart_line)[FW_1_LINE_BUF_FS];   /* #394: per-VM, were func-static */
+static char (*g_uart_line2)[FW_1_LINE_BUF_FS];
+static char (*g_dbg_line)[FW_1_LINE_BUF_FS];
+static uint64_t *g_scan_last;                   /* #394: per-VM, was func-static */
+static uint32_t *g_ap_sel;                      /* #394: isolated-core pick scratch */
+static hype_vm_dash_info_t *g_dash_info;        /* #394: dashboard rows, per-VM */
 
 /* M8-0 shims: the FW-1 path still names g_fw_1_*; each expands to `vm->X`,
  * where `vm` is the hype_fw_vm_t* threaded through run_fw_1_test()/efi_main
@@ -905,9 +912,9 @@ enum {
     HYPE_FW_PHASE_DISPATCH,
     HYPE_FW_PHASE_COUNT
 };
-static uint64_t g_fw_phase_mark_tsc[HYPE_FW_MAX_VMS];
-static uint64_t g_fw_phase_accounted_tsc[HYPE_FW_MAX_VMS];
-static uint64_t g_fw_phase_total_tsc[HYPE_FW_MAX_VMS][HYPE_FW_PHASE_COUNT];
+static uint64_t *g_fw_phase_mark_tsc;
+static uint64_t *g_fw_phase_accounted_tsc;
+static uint64_t (*g_fw_phase_total_tsc)[HYPE_FW_PHASE_COUNT];
 static inline uint64_t hype_rdtsc(void);
 
 static void fw_1_phase_checkpoint(hype_fw_vm_t *vm, unsigned phase) {
@@ -987,7 +994,7 @@ static volatile uint32_t g_vm_runtime_ready_mask;
 /* #373: measured, per-view redraw budgets. Each switch starts at the
  * conservative floor and expands only when productive passes are fast. */
 static hype_render_budget_t g_dash_render_budget;
-static hype_render_budget_t g_view_render_budget[HYPE_FW_MAX_VMS];
+static hype_render_budget_t *g_view_render_budget;
 static uint64_t g_view_switch_started_tsc;
 static unsigned g_view_switch_passes;
 static int g_view_switch_pending_view = -2;
@@ -1400,11 +1407,11 @@ static unsigned long long g_media_io_tsc, g_media_io_calls;
  * investigation three wrong answers, in a new form. Counts and values must describe the same VM or
  * neither means anything.
  */
-static unsigned long long g_ahci_reg_hist[HYPE_FW_MAX_VMS][HYPE_AHCI_HIST_DWORDS];
+static unsigned long long (*g_ahci_reg_hist)[HYPE_AHCI_HIST_DWORDS];
 /* #364: bounded so a driver that writes PxCI every command cannot flood the log. 48 is well past
  * the handful of writes a port bring-up takes, and a bound that hides the answer is worse than
  * none -- so PxCI going to zero (ordinary completion) is excluded rather than counted. */
-static unsigned int g_ahci_wr_logged[HYPE_FW_MAX_VMS];
+static unsigned int *g_ahci_wr_logged;
 /*
  * #364: one COMPLETE issue -> completion -> timeout -> stop cycle.
  *
@@ -1417,9 +1424,9 @@ static unsigned int g_ahci_wr_logged[HYPE_FW_MAX_VMS];
  * completion that a polling ATAPI driver rejects". That needs the state at each command issue and
  * at each ST transition, which the 48-write budget ended long before reaching.
  */
-static unsigned int g_ahci_cyc_logged[HYPE_FW_MAX_VMS];
-static uint32_t g_ahci_prev_st[HYPE_FW_MAX_VMS];
-static unsigned long long g_ahci_reg_other[HYPE_FW_MAX_VMS];
+static unsigned int *g_ahci_cyc_logged;
+static uint32_t *g_ahci_prev_st;
+static unsigned long long *g_ahci_reg_other;
 
 /* #363: host keyboard -> focused-guest routing state. A file-global because the BSP now owns
  * polling (fw_1_host_input_poll); it used to be a local in the guest dispatch loop, which is
@@ -1592,7 +1599,7 @@ static hype_vmm_kind_t g_fw_1_kind;
  * and stays in use for as long as that core is in SVM/VMX operation -- so two
  * APs MUST NOT share one, and which of the two it *is* is the backend's
  * business, reached through ops->enable_on (see vmm_ops.h). */
-static uint8_t g_ap_vmm_page[HYPE_FW_MAX_VMS][4096] __attribute__((aligned(4096)));
+static uint8_t (*g_ap_vmm_page)[4096];
 static volatile uint32_t g_fw_1_ap_vmm_ok;
 /* AP-bring-up result, latched so the diag tick can re-emit it after the one-shot
  * AP-SMOKETEST line has scrolled out of the live display.
@@ -1723,8 +1730,8 @@ static int fw_1_repair_degenerate_cpu_topology(void) {
 /* The APIC ID actually used for each AP slot, recorded at start time so the
  * LAPIC-timer ISR below can map a core back to its slot. Sparse IDs mean the ID
  * is no longer usable as an index. */
-static uint8_t g_ap_slot_apic_id[HYPE_FW_MAX_VMS];
-static int g_ap_slot_valid[HYPE_FW_MAX_VMS];
+static uint8_t *g_ap_slot_apic_id;
+static int *g_ap_slot_valid;
 
 /*
  * #360: the APIC ID for AP slot `n`, from the enumerated topology.
@@ -1740,7 +1747,7 @@ static int g_ap_slot_valid[HYPE_FW_MAX_VMS];
  * out of scope here and is reported rather than silently mis-addressed.
  */
 static int fw_1_ap_apic_id(unsigned int n) {
-    uint32_t sel[HYPE_FW_MAX_VMS];
+    uint32_t *sel = g_ap_sel;
     int nsel;
 
     if (g_cpu_topo.count == 0u) {
@@ -1797,12 +1804,12 @@ static int fw_1_ap_slot_of(uint32_t apic_id) {
     return -1;
 }
 
-static volatile uint64_t g_ap_timer_ticks[HYPE_FW_MAX_VMS + 1];
+static volatile uint64_t *g_ap_timer_ticks; /* g_vm_count + 1: BSP slot */
 /* #364: calibrated 1 ms one-shot reload for each AP/VM slot. The dispatch
  * loop restarts this immediately before VM entry. A periodic timer can become
  * permanently pending when one host dispatch takes longer than its period;
  * VMX then exits before the guest executes even one instruction. */
-static uint32_t g_ap_timer_reload[HYPE_FW_MAX_VMS];
+static uint32_t *g_ap_timer_reload;
 static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
     (void)frame;
     {
@@ -1984,7 +1991,7 @@ static hype_clockfacts_t g_fw_1_clockfacts;
  * and the fix (virtio-blk boot) has landed. */
 #define HYPE_IO_HISTOGRAM 1
 #if HYPE_IO_HISTOGRAM
-static uint32_t g_fw_1_io_hist[HYPE_FW_MAX_VMS][HYPE_IO_HIST_PORTS];
+static uint32_t (*g_fw_1_io_hist)[HYPE_IO_HIST_PORTS];
 #endif
 
 /* PERF-1 step 1 (long-VMRUN evidence): when a single VMRUN runs longer than
@@ -2011,7 +2018,7 @@ typedef struct {
     uint32_t guest_if;   /* guest RFLAGS.IF at exit (0 => interrupts masked) */
     uint32_t int_shadow; /* guest interrupt-shadow at exit */
 } hype_longvmrun_t;
-static hype_longvmrun_t g_fw_1_longvmrun[HYPE_FW_MAX_VMS][HYPE_LONGVMRUN_TOP];
+static hype_longvmrun_t (*g_fw_1_longvmrun)[HYPE_LONGVMRUN_TOP];
 
 /* Insert a long VMRUN into the per-VM top-N, replacing the smallest slot if the
  * new duration is larger (zero-initialised slots have ms=0, so they fill first).
@@ -7493,7 +7500,7 @@ static hype_vt_render_cache_t g_dash_render_cache;
 /* #363: file-scope so a foreign framebuffer write can invalidate every view's cache, not just
  * the one currently displayed -- a stale cache for a background view would show that view's old
  * pixels mixed with boot output the moment it is switched to. */
-static hype_vt_render_cache_t g_view_render_cache[HYPE_FW_MAX_VMS];
+static hype_vt_render_cache_t *g_view_render_cache;
 
 /* PERF-2 (#234) evidence: how much the diffing renderer actually saves. Before
  * it, every render redrew cols*rows cells and pushed the whole framebuffer;
@@ -8193,7 +8200,7 @@ static void fw_1_render_console(void) {
             fw_1_view_switch_pass(view, !more, tsc_hz);
         }
     } else { /* dashboard view (-1) */
-        hype_vm_dash_info_t info[HYPE_FW_MAX_VMS];
+        hype_vm_dash_info_t *info = g_dash_info;
         unsigned ninfo = HYPE_TERM_NVMS;
         for (unsigned i = 0; i < ninfo; i++) {
             unsigned int ready_mask =
@@ -10117,9 +10124,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * not less state.
      */
 #define FW_1_LINE_BUF 256u
-    static char g_uart_line[HYPE_FW_MAX_VMS][FW_1_LINE_BUF];
-    static char g_uart_line2[HYPE_FW_MAX_VMS][FW_1_LINE_BUF];
-    static char g_dbg_line[HYPE_FW_MAX_VMS][FW_1_LINE_BUF];
     char *const uart_line = g_uart_line[vm - g_vms];
     char *const uart_line2 = g_uart_line2[vm - g_vms];
     char *const dbg_line = g_dbg_line[vm - g_vms];
@@ -12177,14 +12181,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * human-scale ("is the menu up"), so doing it per exit would burn the loop for nothing.
          */
         if (vm->in_script_armed) {
-            static uint64_t scan_last[HYPE_FW_MAX_VMS];
             unsigned svi = (unsigned)(vm - g_vms);
             uint64_t hz = g_fw_1_host_tsc_hz;
             uint64_t now_s = hype_rdtsc();
-            if (hz != 0 && (scan_last[svi] == 0 || now_s - scan_last[svi] >= hz / 10u)) {
+            if (hz != 0 && (g_scan_last[svi] == 0 || now_s - g_scan_last[svi] >= hz / 10u)) {
                 static uint8_t snap[HYPE_VT_MAX_ROWS * (HYPE_VT_MAX_COLS + 1u)];
                 unsigned row, col, n = 0;
-                scan_last[svi] = now_s;
+                g_scan_last[svi] = now_s;
                 for (row = 0; row < vm->term.rows; row++) {
                     for (col = 0; col < vm->term.cols; col++) {
                         snap[n++] = hype_vt_screen_cell(&vm->term, col, row).ch;
@@ -15767,8 +15770,8 @@ static volatile unsigned long long g_usb_log_slice_source_bytes;
  */
 static hype_log_sink_t g_hype_log;
 static int g_hype_log_ready;
-static hype_log_sink_t g_vm_log[HYPE_FW_MAX_VMS];
-static int g_vm_log_ready[HYPE_FW_MAX_VMS];
+static hype_log_sink_t *g_vm_log;
+static int *g_vm_log_ready;
 
 /* Persistent copies of the USB block path the sink writes through. The probe's
  * own xc/msc are block-locals that die when the probe scope closes; the sink
@@ -16281,6 +16284,56 @@ static void pci_dump_all(void) {
     hype_debug_print("pci-dump: %u PCI functions total\n", count);
 }
 
+/*
+ * #394 step 2: the remaining per-VM auxiliary arrays. None embed a page-table
+ * or other >8-byte-aligned member (verified), so AllocatePool is safe -- except
+ * g_ap_vmm_page, the SVM host-save area, which needs 4 KiB alignment and so uses
+ * AllocatePages like g_vms. Sized to g_vm_count; pool memory is zeroed (not BSS).
+ */
+static void *fw_aux_alloc(EFI_BOOT_SERVICES *bs, UINTN bytes) {
+    void *ptr = 0;
+    if (bs->AllocatePool(EfiLoaderData, bytes, &ptr) != EFI_SUCCESS || ptr == 0) {
+        hype_fatal("fw-1: per-VM aux arena AllocatePool(%llu) failed for %u VM(s)",
+                   (unsigned long long)bytes, g_vm_count);
+    }
+    hype_guest_ram_zero(ptr, (uint64_t)bytes);
+    return ptr;
+}
+
+static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
+    unsigned n = g_vm_count;
+    g_script_seen = fw_aux_alloc(bs, (UINTN)n * sizeof *g_script_seen);
+    g_script_fed = fw_aux_alloc(bs, (UINTN)n * sizeof *g_script_fed);
+    g_fw_phase_mark_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_fw_phase_mark_tsc);
+    g_fw_phase_accounted_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_fw_phase_accounted_tsc);
+    g_fw_phase_total_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_fw_phase_total_tsc);
+    g_view_render_budget = fw_aux_alloc(bs, (UINTN)n * sizeof *g_view_render_budget);
+    g_view_render_cache = fw_aux_alloc(bs, (UINTN)n * sizeof *g_view_render_cache);
+    g_ahci_reg_hist = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ahci_reg_hist);
+    g_ahci_wr_logged = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ahci_wr_logged);
+    g_ahci_cyc_logged = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ahci_cyc_logged);
+    g_ahci_prev_st = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ahci_prev_st);
+    g_ahci_reg_other = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ahci_reg_other);
+    g_ap_slot_apic_id = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_slot_apic_id);
+    g_ap_slot_valid = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_slot_valid);
+    g_ap_timer_reload = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_timer_reload);
+    g_ap_timer_ticks = fw_aux_alloc(bs, (UINTN)(n + 1u) * sizeof *g_ap_timer_ticks);
+    g_fw_1_io_hist = fw_aux_alloc(bs, (UINTN)n * sizeof *g_fw_1_io_hist);
+    g_fw_1_longvmrun = fw_aux_alloc(bs, (UINTN)n * sizeof *g_fw_1_longvmrun);
+    g_uart_line = fw_aux_alloc(bs, (UINTN)n * sizeof *g_uart_line);
+    g_uart_line2 = fw_aux_alloc(bs, (UINTN)n * sizeof *g_uart_line2);
+    g_dbg_line = fw_aux_alloc(bs, (UINTN)n * sizeof *g_dbg_line);
+    g_scan_last = fw_aux_alloc(bs, (UINTN)n * sizeof *g_scan_last);
+    g_ap_sel = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_sel);
+    g_dash_info = fw_aux_alloc(bs, (UINTN)n * sizeof *g_dash_info);
+    g_vm_log = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log);
+    g_vm_log_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log_ready);
+    /* g_ap_vmm_page: 4 KiB-aligned per element -> pages, like g_vms. */
+    g_ap_vmm_page = (uint8_t (*)[4096])(uintptr_t)hype_alloc_pages_any(bs, (UINTN)n);
+    hype_guest_ram_zero(g_ap_vmm_page, (uint64_t)n * 4096ull);
+    hype_debug_print("fw-1: per-VM aux arena for %u VM(s) allocated [#394]\n", n);
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
@@ -16323,6 +16376,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_debug_print("fw-1: g_vms arena %u VM(s) x %llu B, page-aligned @%p [#394]\n",
                          g_vm_count, (unsigned long long)sizeof(hype_fw_vm_t), (void *)g_vms);
     }
+    fw_alloc_vm_aux_arena(SystemTable->BootServices);
     vm = &g_vms[0];
     /*
      * Host wall clock, read once here and reused wherever a timestamp is needed
