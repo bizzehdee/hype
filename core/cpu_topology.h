@@ -131,4 +131,32 @@ int hype_cpu_topology_is_consecutive(const hype_cpu_topology_t *t);
 int hype_cpu_topology_select_isolated(const hype_cpu_topology_t *t, unsigned int want,
                                       uint32_t *out_apic, unsigned int out_max);
 
+/* Returns 1 when a multi-processor table assigns the same physical location
+ * to every logical processor. Several real firmware implementations return
+ * this all-zero placeholder; it is not usable evidence that every CPU shares
+ * one core. */
+int hype_cpu_topology_locations_degenerate(const hype_cpu_topology_t *t);
+
+/* Convert topology shifts into Package|Core|Thread widths. `package_shift`
+ * is the number of low APIC-ID bits below the package level; `thread_shift`
+ * is the number below the core level (CPUID leaf 0Bh/1Fh terminology). */
+int hype_cpu_topology_layout_from_shifts(unsigned int thread_shift,
+                                         unsigned int package_shift,
+                                         unsigned int *thread_bits,
+                                         unsigned int *core_bits);
+
+/* AMD legacy topology-extension form. `apic_core_id_bits` is
+ * Fn8000_0008_ECX[15:12]. `threads_per_core` is
+ * Fn8000_001E_EBX[15:8]+1. */
+int hype_cpu_topology_layout_from_amd(unsigned int apic_core_id_bits,
+                                      unsigned int threads_per_core,
+                                      unsigned int *thread_bits,
+                                      unsigned int *core_bits);
+
+/* Replace every recorded physical location by decoding its firmware-supplied
+ * APIC ID with the proven Package|Core|Thread bit widths. */
+int hype_cpu_topology_apply_apic_layout(hype_cpu_topology_t *t,
+                                        unsigned int thread_bits,
+                                        unsigned int core_bits);
+
 #endif /* HYPE_CORE_CPU_TOPOLOGY_H */

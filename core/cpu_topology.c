@@ -130,3 +130,87 @@ int hype_cpu_topology_select_isolated(const hype_cpu_topology_t *t, unsigned int
     }
     return (int)chosen;
 }
+
+int hype_cpu_topology_locations_degenerate(const hype_cpu_topology_t *t) {
+    unsigned int i;
+    if (t == 0 || t->count < 2u) return 0;
+    for (i = 1u; i < t->count; i++) {
+        if (t->loc[i].package != t->loc[0].package ||
+            t->loc[i].core != t->loc[0].core ||
+            t->loc[i].thread != t->loc[0].thread) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int hype_cpu_topology_layout_from_shifts(unsigned int thread_shift,
+                                         unsigned int package_shift,
+                                         unsigned int *thread_bits,
+                                         unsigned int *core_bits) {
+    if (thread_bits == 0 || core_bits == 0 || thread_shift > package_shift ||
+        package_shift > 31u) {
+        return -1;
+    }
+    *thread_bits = thread_shift;
+    *core_bits = package_shift - thread_shift;
+    return 0;
+}
+
+static unsigned int bits_for_count(unsigned int count) {
+    unsigned int bits = 0u;
+    unsigned int value = count - 1u; /* callers reject zero */
+    while (value != 0u) {
+        bits++;
+        value >>= 1;
+    }
+    return bits;
+}
+
+int hype_cpu_topology_layout_from_amd(unsigned int apic_core_id_bits,
+                                      unsigned int threads_per_core,
+                                      unsigned int *thread_bits,
+                                      unsigned int *core_bits) {
+    unsigned int logical_per_package;
+    unsigned int cores_per_package;
+    unsigned int tbits;
+    unsigned int cbits;
+
+    if (thread_bits == 0 || core_bits == 0 || apic_core_id_bits == 0u ||
+        apic_core_id_bits > 31u || threads_per_core == 0u) {
+        return -1;
+    }
+    logical_per_package = 1u << apic_core_id_bits;
+    if (threads_per_core > logical_per_package ||
+        logical_per_package % threads_per_core != 0u) {
+        return -1;
+    }
+    cores_per_package = logical_per_package / threads_per_core;
+    tbits = bits_for_count(threads_per_core);
+    cbits = bits_for_count(cores_per_package);
+    *thread_bits = tbits;
+    *core_bits = cbits;
+    return 0;
+}
+
+int hype_cpu_topology_apply_apic_layout(hype_cpu_topology_t *t,
+                                        unsigned int thread_bits,
+                                        unsigned int core_bits) {
+    uint32_t thread_mask;
+    uint32_t core_mask;
+    unsigned int total_bits;
+    unsigned int i;
+
+    if (t == 0 || thread_bits > 31u || core_bits > 31u) return -1;
+    total_bits = thread_bits + core_bits;
+    if (total_bits > 31u) return -1;
+    thread_mask = thread_bits == 0u ? 0u : ((1u << thread_bits) - 1u);
+    core_mask = core_bits == 0u ? 0u : ((1u << core_bits) - 1u);
+    for (i = 0u; i < t->count; i++) {
+        uint32_t id = t->apic_id[i];
+        t->loc[i].thread = id & thread_mask;
+        t->loc[i].core = (id >> thread_bits) & core_mask;
+        t->loc[i].package = id >> total_bits;
+    }
+    return 0;
+}

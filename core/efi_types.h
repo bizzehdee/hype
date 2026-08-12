@@ -354,6 +354,7 @@ typedef struct _EFI_GRAPHICS_OUTPUT_PROTOCOL {
 
 #define HYPE_MP_PROCESSOR_AS_BSP_BIT 0x00000001u
 #define HYPE_MP_PROCESSOR_ENABLED_BIT 0x00000002u
+#define HYPE_MP_CPU_V2_EXTENDED_TOPOLOGY (1u << 24)
 
 typedef struct {
     UINT32 Package;
@@ -361,10 +362,30 @@ typedef struct {
     UINT32 Thread;
 } EFI_CPU_PHYSICAL_LOCATION;
 
+/* PI MP Services v2 extends EFI_PROCESSOR_INFORMATION with this six-level
+ * location. Keep the complete ABI-sized output structure even when callers do
+ * not request the extension: current firmware implementations receive the
+ * full type and may clear/copy its complete size. The old 24-byte local
+ * definition ended at Location and therefore exposed adjacent stack storage
+ * to a firmware write. */
+typedef struct {
+    UINT32 Package;
+    UINT32 Module;
+    UINT32 Tile;
+    UINT32 Die;
+    UINT32 Core;
+    UINT32 Thread;
+} EFI_CPU_PHYSICAL_LOCATION2;
+
+typedef union {
+    EFI_CPU_PHYSICAL_LOCATION2 Location2;
+} EXTENDED_PROCESSOR_INFORMATION;
+
 typedef struct {
     UINT64 ProcessorId;
     UINT32 StatusFlag;
     EFI_CPU_PHYSICAL_LOCATION Location;
+    EXTENDED_PROCESSOR_INFORMATION ExtendedInformation;
 } EFI_PROCESSOR_INFORMATION;
 
 typedef struct EFI_MP_SERVICES_PROTOCOL EFI_MP_SERVICES_PROTOCOL;

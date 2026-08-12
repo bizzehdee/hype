@@ -285,8 +285,8 @@ static void test_selection_reports_short_rather_than_overcommitting(void) {
     CHECK("the second slot is left untouched", sel[1] == 0xFFFFFFFFu);
 }
 
-/* The AMD laptop: consecutive IDs, no SMT recorded. Enumeration order was already correct there,
- * which is exactly why this defect survived -- it must stay correct. */
+/* A valid consecutive, non-SMT topology. This covers machines where enumeration order already
+ * names distinct physical cores; the real AMD laptop now uses the repaired SMT case below. */
 static void test_non_smt_layout_is_unchanged(void) {
     hype_cpu_topology_t t;
     uint32_t sel[2];
@@ -313,6 +313,108 @@ static void test_selection_degenerate_inputs(void) {
               hype_cpu_topology_select_isolated(&t, 2u, sel, 1u));
 }
 
+static void test_all_zero_firmware_locations_are_detected(void) {
+    hype_cpu_topology_t t;
+    hype_cpu_topology_reset(&t);
+    (void)hype_cpu_topology_add_at(&t, 0u, 1, 1, 0u, 0u, 0u);
+    (void)hype_cpu_topology_add_at(&t, 1u, 0, 1, 0u, 0u, 0u);
+    (void)hype_cpu_topology_add_at(&t, 2u, 0, 1, 0u, 0u, 0u);
+    CHECK_INT("all-zero multi-CPU locations are degenerate", 1,
+              hype_cpu_topology_locations_degenerate(&t));
+    t.loc[2].core = 1u;
+    CHECK_INT("one distinct location makes the table usable", 0,
+              hype_cpu_topology_locations_degenerate(&t));
+    CHECK_INT("null table is not reported degenerate", 0,
+              hype_cpu_topology_locations_degenerate(0));
+    hype_cpu_topology_reset(&t);
+    (void)hype_cpu_topology_add_at(&t, 0u, 1, 1, 0u, 0u, 0u);
+    CHECK_INT("one CPU is not evidence of bad topology", 0,
+              hype_cpu_topology_locations_degenerate(&t));
+}
+
+static void test_amd_apic_layout_repairs_ryzen_smt_topology(void) {
+    hype_cpu_topology_t t;
+    uint32_t sel[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+    unsigned int thread_bits = 99u, core_bits = 99u;
+    unsigned int i;
+
+    hype_cpu_topology_reset(&t);
+    for (i = 0u; i < 8u; i++) {
+        (void)hype_cpu_topology_add_at(&t, i, i == 0u, 1, 0u, 0u, 0u);
+    }
+    /* Ryzen 5 2500U: eight logical processors, four cores, two threads/core. */
+    CHECK_INT("AMD CPUID layout accepted", 0,
+              hype_cpu_topology_layout_from_amd(3u, 2u, &thread_bits, &core_bits));
+    CHECK_INT("one SMT bit", 1u, thread_bits);
+    CHECK_INT("two core bits", 2u, core_bits);
+    CHECK_INT("APIC locations repaired", 0,
+              hype_cpu_topology_apply_apic_layout(&t, thread_bits, core_bits));
+    CHECK_INT("repaired table is no longer degenerate", 0,
+              hype_cpu_topology_locations_degenerate(&t));
+    CHECK_INT("two isolated guest cores selected", 2,
+              hype_cpu_topology_select_isolated(&t, 2u, sel, 2u));
+    CHECK_INT("vm0 skips BSP sibling and uses core 1", 2u, sel[0]);
+    CHECK_INT("vm1 uses core 2", 4u, sel[1]);
+}
+
+static void test_topology_layout_validation(void) {
+    hype_cpu_topology_t t;
+    unsigned int tb = 0u, cb = 0u;
+    CHECK_INT("leaf-B shifts decode", 0,
+              hype_cpu_topology_layout_from_shifts(1u, 4u, &tb, &cb));
+    CHECK_INT("leaf-B thread bits", 1u, tb);
+    CHECK_INT("leaf-B core bits", 3u, cb);
+    CHECK_INT("reversed shifts refused", -1,
+              hype_cpu_topology_layout_from_shifts(4u, 3u, &tb, &cb));
+    CHECK_INT("oversize shift refused", -1,
+              hype_cpu_topology_layout_from_shifts(1u, 32u, &tb, &cb));
+    CHECK_INT("null shift output refused", -1,
+              hype_cpu_topology_layout_from_shifts(1u, 2u, 0, &cb));
+    CHECK_INT("null core shift output refused", -1,
+              hype_cpu_topology_layout_from_shifts(1u, 2u, &tb, 0));
+    CHECK_INT("zero AMD width refused", -1,
+              hype_cpu_topology_layout_from_amd(0u, 2u, &tb, &cb));
+    CHECK_INT("oversize AMD width refused", -1,
+              hype_cpu_topology_layout_from_amd(32u, 2u, &tb, &cb));
+    CHECK_INT("zero AMD threads refused", -1,
+              hype_cpu_topology_layout_from_amd(3u, 0u, &tb, &cb));
+    CHECK_INT("too many AMD threads refused", -1,
+              hype_cpu_topology_layout_from_amd(2u, 8u, &tb, &cb));
+    CHECK_INT("non-dividing AMD threads refused", -1,
+              hype_cpu_topology_layout_from_amd(3u, 3u, &tb, &cb));
+    CHECK_INT("null AMD thread output refused", -1,
+              hype_cpu_topology_layout_from_amd(3u, 2u, 0, &cb));
+    CHECK_INT("null AMD output refused", -1,
+              hype_cpu_topology_layout_from_amd(3u, 2u, &tb, 0));
+    hype_cpu_topology_reset(&t);
+    CHECK_INT("null topology apply refused", -1,
+              hype_cpu_topology_apply_apic_layout(0, 1u, 2u));
+    CHECK_INT("oversize layout refused", -1,
+              hype_cpu_topology_apply_apic_layout(&t, 31u, 1u));
+    CHECK_INT("oversize thread width refused", -1,
+              hype_cpu_topology_apply_apic_layout(&t, 32u, 0u));
+    CHECK_INT("oversize core width refused", -1,
+              hype_cpu_topology_apply_apic_layout(&t, 0u, 32u));
+    CHECK_INT("zero-width layout accepted", 0,
+              hype_cpu_topology_apply_apic_layout(&t, 0u, 0u));
+
+    /* Cover selection without a BSP marker and the explicit zero output size. */
+    (void)hype_cpu_topology_add_at(&t, 7u, 0, 1, 0u, 1u, 0u);
+    {
+        uint32_t sel[1];
+        CHECK_INT("zero output capacity selects nothing", 0,
+                  hype_cpu_topology_select_isolated(&t, 1u, sel, 0u));
+        CHECK_INT("missing BSP still selects an isolated AP", 1,
+                  hype_cpu_topology_select_isolated(&t, 1u, sel, 1u));
+        CHECK_INT("selected AP is recorded ID", 7u, sel[0]);
+    }
+
+    /* A second BSP marker must not replace the first. */
+    (void)hype_cpu_topology_add_at(&t, 8u, 1, 1, 0u, 2u, 0u);
+    (void)hype_cpu_topology_add_at(&t, 9u, 1, 1, 0u, 3u, 0u);
+    CHECK_INT("first BSP marker remains authoritative", 8, hype_cpu_topology_bsp(&t));
+}
+
 int main(void) {
     test_consecutive_layout_matches_the_old_assumption();
     test_sparse_layout_gives_real_ids_not_indices();
@@ -333,6 +435,9 @@ int main(void) {
     test_selection_reports_short_rather_than_overcommitting();
     test_non_smt_layout_is_unchanged();
     test_selection_degenerate_inputs();
+    test_all_zero_firmware_locations_are_detected();
+    test_amd_apic_layout_repairs_ryzen_smt_topology();
+    test_topology_layout_validation();
     if (failures != 0) {
         printf("test_cpu_topology: %d failure(s)\n", failures);
         return 1;
