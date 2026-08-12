@@ -7247,6 +7247,106 @@ static uint64_t fw_1_script_now_ms(const hype_fw_vm_t *vm, uint64_t tsc) {
     return (khz == 0ull) ? 0ull : (tsc / khz);
 }
 
+/*
+ * #436: one-shot deep forensic dump of the Windows winload spin. Kept in its OWN function so its
+ * stack buffers do not add to the giant run-loop frame (which is already at the __chkstk limit).
+ * (a) finds the containing PE module base by scanning back for "MZ" -> base + RIP offset, to match
+ * winload.efi/bootmgr.efi disassembly offline; (b) 32 code bytes before RIP; (c) the two nodes the
+ * loop walks (rdi, rcx). The guest is identity-paged in this region, so a physical read reaches it.
+ */
+static __attribute__((noinline)) void fw_1_436_deep_dump(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx,
+                                                         uint64_t prip);
+
+/* #436: the rate-limited PREEMPT-RIP line -- spin RIP, the pointer registers, and the 16
+ * instruction bytes at RIP. In a helper (noinline, or the compiler folds it back into the
+ * already-__chkstk-limit run-loop frame) so its buffer + wide variadic print stay out. */
+static __attribute__((noinline)) void fw_1_436_preempt_dump(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx,
+                                                            uint64_t prip) {
+    uint64_t pcr3 = vmm_get_cr3(HYPE_VMM_KIND_SVM, ctx);
+    uint8_t pib[16];
+    unsigned pk;
+    static int deep_dumped;
+    for (pk = 0; pk < 16u; pk++) { pib[pk] = 0; }
+    if (pcr3 == 0 || !fw_1_read_guest_va(vm, pcr3, prip, pib, 16)) {
+        const uint8_t *pph = fw_1_guest_phys_to_host(vm, prip);
+        if (pph != 0) { for (pk = 0; pk < 16u; pk++) { pib[pk] = pph[pk]; } }
+    }
+    hype_debug_print(
+        "fw-1 PREEMPT-RIP: host tick preempted guest at rip=0x%llx cr3=0x%llx | "
+        "rcx=0x%llx rdx=0x%llx rbx=0x%llx rsi=0x%llx rdi=0x%llx rbp=0x%llx "
+        "r8=0x%llx r9=0x%llx | insn=%02x %02x %02x %02x %02x %02x %02x %02x "
+        "%02x %02x %02x %02x %02x %02x %02x %02x [#436]\n",
+        (unsigned long long)prip, (unsigned long long)pcr3,
+        (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 1),
+        (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 2),
+        (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 3),
+        (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 6),
+        (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 7),
+        (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 5),
+        (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 8),
+        (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 9),
+        pib[0], pib[1], pib[2], pib[3], pib[4], pib[5], pib[6], pib[7],
+        pib[8], pib[9], pib[10], pib[11], pib[12], pib[13], pib[14], pib[15]);
+    if (!deep_dumped) {
+        deep_dumped = 1;
+        fw_1_436_deep_dump(vm, ctx, prip);
+    }
+}
+
+static __attribute__((noinline)) void fw_1_436_deep_dump(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx,
+                                                         uint64_t prip) {
+    uint64_t base = 0;
+    uint64_t scan = prip & ~0xFFFULL;
+    unsigned pages;
+    uint8_t cb[32];
+    unsigned i;
+    for (pages = 0; pages < 4096u; pages++) {
+        const uint8_t *hp = fw_1_guest_phys_to_host(vm, scan);
+        if (hp != 0 && hp[0] == 'M' && hp[1] == 'Z') { base = scan; break; }
+        if (scan < 0x1000ULL) break;
+        scan -= 0x1000ULL;
+    }
+    hype_debug_print("fw-1 #436 MODULE: rip=0x%llx base=0x%llx off=0x%llx (scanned %u pages back)\n",
+                     (unsigned long long)prip, (unsigned long long)base,
+                     (unsigned long long)(base ? prip - base : 0), pages);
+    for (i = 0; i < 32u; i++) cb[i] = 0;
+    {
+        const uint8_t *chp = fw_1_guest_phys_to_host(vm, prip - 32u);
+        if (chp) for (i = 0; i < 32u; i++) cb[i] = chp[i];
+    }
+    hype_debug_print("fw-1 #436 PRECODE @0x%llx: %02x %02x %02x %02x %02x %02x %02x %02x "
+                     "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+                     "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                     (unsigned long long)(prip - 32u),
+                     cb[0],cb[1],cb[2],cb[3],cb[4],cb[5],cb[6],cb[7],
+                     cb[8],cb[9],cb[10],cb[11],cb[12],cb[13],cb[14],cb[15],
+                     cb[16],cb[17],cb[18],cb[19],cb[20],cb[21],cb[22],cb[23],
+                     cb[24],cb[25],cb[26],cb[27],cb[28],cb[29],cb[30],cb[31]);
+    {
+        uint64_t node[2];
+        unsigned ni;
+        node[0] = hype_svm_vcpu_get_gpr(ctx, 7); /* rdi */
+        node[1] = hype_svm_vcpu_get_gpr(ctx, 1); /* rcx */
+        for (ni = 0; ni < 2u; ni++) {
+            const uint8_t *nh = fw_1_guest_phys_to_host(vm, node[ni]);
+            uint64_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+            if (nh) {
+                unsigned b;
+                for (b = 0; b < 8u; b++) {
+                    w0 |= (uint64_t)nh[b] << (b * 8);
+                    w1 |= (uint64_t)nh[8 + b] << (b * 8);
+                    w2 |= (uint64_t)nh[16 + b] << (b * 8);
+                    w3 |= (uint64_t)nh[24 + b] << (b * 8);
+                }
+            }
+            hype_debug_print("fw-1 #436 NODE%u @0x%llx: %016llx %016llx %016llx %016llx\n",
+                             ni, (unsigned long long)node[ni],
+                             (unsigned long long)w0, (unsigned long long)w1,
+                             (unsigned long long)w2, (unsigned long long)w3);
+        }
+    }
+}
+
 static unsigned int fw_1_drain_uart_console(hype_guest_uart_t *uart, hype_vt_filter_t *filter, char *line,
                                              unsigned int *line_len, unsigned int line_cap,
                                              unsigned vm_idx, unsigned port, hype_vt_screen_t *term) {
@@ -12423,8 +12523,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (last_preempt_rip_tsc == 0 ||
                     now_pr - last_preempt_rip_tsc >= 10ULL * g_fw_1_host_tsc_hz) {
                     last_preempt_rip_tsc = now_pr;
-                    hype_debug_print("fw-1 PREEMPT-RIP: host tick preempted guest at rip=0x%llx\n",
-                                     (unsigned long long)info.guest_rip);
+                    /* #436: whole dump lives in a helper so its buffers + the wide variadic
+                     * prints do not add to run_fw_1_test's (already __chkstk-limit) frame. */
+                    if (kind != HYPE_VMM_KIND_VMX) {
+                        fw_1_436_preempt_dump(vm, ctx, info.guest_rip);
+                    }
                 }
             }
             continue;
@@ -13662,6 +13765,49 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                     }
                     continue;
+                }
+            }
+            /*
+             * #436: a HLT with interrupts MASKED (IF=0), past boot, that we do not wake, is a
+             * DEAD halt -- the guest chose to stop and will take no interrupt. For a Windows
+             * guest that is KeBugCheck's terminal `cli; hlt`, which emits nothing (pre-video,
+             * pre-KD). Dump the forensics ONCE: RIP + the Microsoft x64 arg registers (RCX holds
+             * KeBugCheckEx's bugcheck CODE, RDX/R8/R9 the first parameters) + the instruction
+             * bytes at RIP. This is the only channel that can name the stop when the guest is
+             * silent -- resolve the RIP against winload/ntoskrnl offline.
+             */
+            if (kind != HYPE_VMM_KIND_VMX) {
+                static int deadhalt_dumped = 0;
+                hype_vmm_intr_state_t dh;
+                vmm_get_intr_state(kind, ctx, &dh);
+                if (!deadhalt_dumped && productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
+                    ((dh.rflags >> 9) & 1u) == 0u) {
+                    uint64_t rip = info.guest_rip;
+                    uint64_t cr3 = vmm_get_cr3(kind, ctx);
+                    static uint8_t ib[16]; /* static: keep run_fw_1_test frame under __chkstk */
+                    unsigned k;
+                    deadhalt_dumped = 1;
+                    for (k = 0; k < 16u; k++) { ib[k] = 0; }
+                    if (cr3 == 0 || !fw_1_read_guest_va(vm, cr3, rip, ib, 16)) {
+                        const uint8_t *phys = fw_1_guest_phys_to_host(vm, rip);
+                        if (phys != 0) { for (k = 0; k < 16u; k++) { ib[k] = phys[k]; } }
+                    }
+                    hype_debug_print("fw-1 #436 DEADHALT: rip=0x%llx cr3=0x%llx IF=0 | "
+                                     "rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx | "
+                                     "rbx=0x%llx rsi=0x%llx rdi=0x%llx rbp=0x%llx | "
+                                     "insn=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                     (unsigned long long)rip, (unsigned long long)cr3,
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 1),
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 2),
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 8),
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 9),
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 3),
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 6),
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 7),
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 5),
+                                     ib[0], ib[1], ib[2], ib[3], ib[4], ib[5], ib[6], ib[7],
+                                     ib[8], ib[9], ib[10], ib[11], ib[12], ib[13], ib[14], ib[15]);
+                    usb_log_flush();
                 }
             }
             /* M4-6d2b: stop once the guest has been quiescent (no
