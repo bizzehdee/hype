@@ -115,4 +115,20 @@ void hype_vm_cpu_sample(hype_vm_cpu_t *c, unsigned long long busy_total,
 
 unsigned hype_vm_cpu_pct(const hype_vm_cpu_t *c);
 
+/* Pure terminal-focus policy. `available_mask` contains VMs whose runtime
+ * display and input state is initialized. Dashboard is -1. Cycling skips
+ * unavailable VMs; a direct jump to one leaves focus unchanged. */
+typedef enum {
+    HYPE_TERM_FOCUS_NONE = 0,
+    HYPE_TERM_FOCUS_NEXT,
+    HYPE_TERM_FOCUS_PREV,
+    HYPE_TERM_FOCUS_JUMP,
+    HYPE_TERM_FOCUS_TOGGLE_DASHBOARD
+} hype_term_focus_action_t;
+
+int hype_term_focus_validate(int view, unsigned int available_mask, unsigned int nvm);
+int hype_term_focus_apply(int current, hype_term_focus_action_t action,
+                          unsigned int jump_index, unsigned int available_mask,
+                          unsigned int nvm);
+
 #endif /* HYPE_DASHBOARD_H */

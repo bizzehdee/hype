@@ -97,6 +97,53 @@ unsigned hype_vm_cpu_pct(const hype_vm_cpu_t *c) {
     return (c == (const hype_vm_cpu_t *)0) ? 0u : c->pct;
 }
 
+static int term_vm_available(unsigned int index, unsigned int mask, unsigned int nvm) {
+    return index < nvm && index < 32u && (mask & (1u << index)) != 0u;
+}
+
+int hype_term_focus_validate(int view, unsigned int available_mask, unsigned int nvm) {
+    if (view < 0) return -1;
+    return term_vm_available((unsigned int)view, available_mask, nvm) ? view : -1;
+}
+
+int hype_term_focus_apply(int current, hype_term_focus_action_t action,
+                          unsigned int jump_index, unsigned int available_mask,
+                          unsigned int nvm) {
+    unsigned int i;
+    current = hype_term_focus_validate(current, available_mask, nvm);
+    switch (action) {
+        case HYPE_TERM_FOCUS_NEXT:
+            for (i = (unsigned int)(current + 1); i < nvm; i++) {
+                if (term_vm_available(i, available_mask, nvm)) return (int)i;
+            }
+            return -1;
+        case HYPE_TERM_FOCUS_PREV:
+            if (current < 0) {
+                i = nvm;
+            } else {
+                i = (unsigned int)current;
+            }
+            while (i > 0u) {
+                i--;
+                if (term_vm_available(i, available_mask, nvm)) return (int)i;
+            }
+            return -1;
+        case HYPE_TERM_FOCUS_JUMP:
+            return term_vm_available(jump_index, available_mask, nvm)
+                       ? (int)jump_index
+                       : current;
+        case HYPE_TERM_FOCUS_TOGGLE_DASHBOARD:
+            if (current >= 0) return -1;
+            for (i = 0u; i < nvm; i++) {
+                if (term_vm_available(i, available_mask, nvm)) return (int)i;
+            }
+            return -1;
+        case HYPE_TERM_FOCUS_NONE:
+        default:
+            return current;
+    }
+}
+
 void hype_dashboard_fmt_uptime(char *buf, unsigned long long secs) {
     unsigned long long h = secs / 3600ull;
     unsigned m = (unsigned)((secs / 60ull) % 60ull);

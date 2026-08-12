@@ -182,6 +182,51 @@ static void test_cpu_null_safe(void) {
     }
 }
 
+static void test_focus_skips_undispatched_vms(void) {
+    unsigned mask = 1u << 0; /* vm0 ready; vm1 never dispatched */
+    CHECK("next from dashboard reaches vm0",
+          hype_term_focus_apply(-1, HYPE_TERM_FOCUS_NEXT, 0u, mask, 2u) == 0);
+    CHECK("next from vm0 returns to dashboard, skipping vm1",
+          hype_term_focus_apply(0, HYPE_TERM_FOCUS_NEXT, 0u, mask, 2u) == -1);
+    CHECK("previous from dashboard reaches vm0, skipping vm1",
+          hype_term_focus_apply(-1, HYPE_TERM_FOCUS_PREV, 0u, mask, 2u) == 0);
+    CHECK("direct jump to unavailable vm1 is refused",
+          hype_term_focus_apply(0, HYPE_TERM_FOCUS_JUMP, 1u, mask, 2u) == 0);
+    CHECK("invalid current view is forced to dashboard",
+          hype_term_focus_validate(1, mask, 2u) == -1);
+}
+
+static void test_focus_handles_no_available_vms(void) {
+    CHECK("toggle with no VM stays on dashboard",
+          hype_term_focus_apply(-1, HYPE_TERM_FOCUS_TOGGLE_DASHBOARD, 0u, 0u, 2u) == -1);
+    CHECK("jump with no VM stays on dashboard",
+          hype_term_focus_apply(-1, HYPE_TERM_FOCUS_JUMP, 0u, 0u, 2u) == -1);
+    CHECK("negative view validates as dashboard",
+          hype_term_focus_validate(-5, 0u, 2u) == -1);
+}
+
+static void test_focus_preserves_normal_two_vm_cycle(void) {
+    unsigned mask = 3u;
+    CHECK("dashboard next vm0",
+          hype_term_focus_apply(-1, HYPE_TERM_FOCUS_NEXT, 0u, mask, 2u) == 0);
+    CHECK("vm0 next vm1",
+          hype_term_focus_apply(0, HYPE_TERM_FOCUS_NEXT, 0u, mask, 2u) == 1);
+    CHECK("vm1 next dashboard",
+          hype_term_focus_apply(1, HYPE_TERM_FOCUS_NEXT, 0u, mask, 2u) == -1);
+    CHECK("dashboard previous vm1",
+          hype_term_focus_apply(-1, HYPE_TERM_FOCUS_PREV, 0u, mask, 2u) == 1);
+    CHECK("vm1 previous vm0",
+          hype_term_focus_apply(1, HYPE_TERM_FOCUS_PREV, 0u, mask, 2u) == 0);
+    CHECK("vm0 previous dashboard",
+          hype_term_focus_apply(0, HYPE_TERM_FOCUS_PREV, 0u, mask, 2u) == -1);
+    CHECK("toggle dashboard enters first VM",
+          hype_term_focus_apply(-1, HYPE_TERM_FOCUS_TOGGLE_DASHBOARD, 0u, mask, 2u) == 0);
+    CHECK("toggle VM returns dashboard",
+          hype_term_focus_apply(1, HYPE_TERM_FOCUS_TOGGLE_DASHBOARD, 0u, mask, 2u) == -1);
+    CHECK("none keeps current",
+          hype_term_focus_apply(1, HYPE_TERM_FOCUS_NONE, 0u, mask, 2u) == 1);
+}
+
 int main(void) {
     /* --- uptime formatting --- */
     char up[16];
@@ -255,6 +300,9 @@ int main(void) {
     test_cpu_clamps_and_handles_degenerate_windows();
     test_cpu_rebases_on_counter_going_backwards();
     test_cpu_null_safe();
+    test_focus_skips_undispatched_vms();
+    test_focus_handles_no_available_vms();
+    test_focus_preserves_normal_two_vm_cycle();
 
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
