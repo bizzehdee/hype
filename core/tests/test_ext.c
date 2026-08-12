@@ -3,6 +3,8 @@
 #include <string.h>
 #include "../ext.h"
 #include "../fs_ops.h"
+#include "../ext_jalloc.h"
+#include "../jbd2.h"
 
 static int failures = 0;
 #define CHECK(desc, cond) \
@@ -61,6 +63,7 @@ static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(
 static void put32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
+static uint16_t get16(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
 static uint32_t get32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -1712,6 +1715,1027 @@ static void test_384_coverage_tail(void) {
     }
 }
 
+
+/* ---- #385: the journaled (jbd2) allocating writer ---- */
+
+#define JBLK 800u   /* journal: 12 blocks at 800..811 (inside the used region) */
+#define JLEN 12u
+
+static void put32be(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+static uint32_t get32be(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static void graft_journal(void) {
+    uint8_t *sb = g_vol + 1024;
+    uint8_t *in;
+    uint8_t *jsb = blk(JBLK);
+    unsigned i;
+    put32(sb + 0x5C, get32(sb + 0x5C) | 0x0004u); /* COMPAT_HAS_JOURNAL */
+    put32(sb + 0xE0, 8u);                          /* s_journal_inum */
+    in = mk_inode(8u, 0x8180u, JLEN * BS, 0u);
+    for (i = 0; i < JLEN; i++) put32(in + 0x28 + i * 4u, JBLK + i);
+    put32(in + 0x1C, JLEN * (BS / 512u));
+    memset(jsb, 0, BS);
+    put32be(jsb + 0, 0xC03B3998u);
+    put32be(jsb + 4, 4u);       /* V2 superblock */
+    put32be(jsb + 12, BS);      /* blocksize */
+    put32be(jsb + 16, JLEN);    /* maxlen */
+    put32be(jsb + 20, 1u);      /* first */
+    put32be(jsb + 24, 1u);      /* sequence */
+    put32be(jsb + 28, 0u);      /* start: empty */
+}
+
+static void build_vol_ext3(void) {
+    build_vol_ext2();
+    graft_journal();
+}
+
+/* the ext2 builder + journal + an extent-mapped sparse file (inode 17) */
+static void build_vol_ext4j(void) {
+    uint8_t *sb = g_vol + 1024;
+    uint8_t *in;
+    uint32_t off, last;
+    unsigned i;
+    build_vol_ext2();
+    graft_journal();
+    put32(sb + 0x60, get32(sb + 0x60) | 0x0040u); /* INCOMPAT_EXTENTS */
+    /* esp.bin: HOLE(2) | DATA(2 @70) | UNWRITTEN(4 @75) | HOLE(rest); 400 blocks */
+    in = mk_inode(17u, 0x81A4u, 400u * BS, 0x80000u);
+    {
+        uint8_t *eh = in + 0x28;
+        put16(eh + 0, 0xF30Au); put16(eh + 2, 2u); put16(eh + 4, 4u); put16(eh + 6, 0u);
+        put32(eh + 12 + 0, 2u); put16(eh + 12 + 4, 2u); put16(eh + 12 + 6, 0u); put32(eh + 12 + 8, 70u);
+        put32(eh + 24 + 0, 4u); put16(eh + 24 + 4, (uint16_t)(32768u + 4u)); put16(eh + 24 + 6, 0u);
+        put32(eh + 24 + 8, 75u);
+    }
+    for (i = 0; i < 2u * BS; i++) blk(70u)[i] = pat(i + 3u);
+    for (i = 0; i < 4u * BS; i++) blk(75u)[i] = 0xEE; /* stale: must never leak */
+    off = 0;
+    off = dirent(blk(ROOT_BLK), off, 2u, ".", 2u);
+    off = dirent(blk(ROOT_BLK), off, 2u, "..", 2u);
+    off = dirent(blk(ROOT_BLK), off, 13u, "swiss.bin", 1u);
+    last = off;
+    off = dirent(blk(ROOT_BLK), off, 17u, "esp.bin", 1u);
+    dirent_close(blk(ROOT_BLK), last + 16u, BS);
+}
+
+static void test_extj_gates(void) {
+    static hype_extj_wfile_t w;
+    static hype_ext2_wfile_t e2;
+    uint8_t *sb = g_vol + 1024;
+
+    /* complementary writers: extj requires the journal, ext2 refuses it */
+    build_vol_ext2();
+    CHECK("extj refuses an unjournaled volume",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    CHECK("ext2 writer refuses a journaled volume",
+          hype_ext2_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &e2) != 0);
+    CHECK_HEX("extj opens it", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+
+    /* non-empty journal: a crashed writer's transactions await replay */
+    build_vol_ext3();
+    put32be(blk(JBLK) + 28, 1u); /* s_start != 0 */
+    CHECK("non-empty journal refused",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    /* journal feature gates */
+    build_vol_ext3();
+    put32be(blk(JBLK) + 40, 0x10u); /* INCOMPAT_CSUM_V3 */
+    CHECK("checksummed journal refused",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32be(blk(JBLK) + 4, 3u); /* V1 superblock */
+    CHECK("V1 journal refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32be(blk(JBLK) + 32, 5u); /* s_errno */
+    CHECK("journal with recorded error refused",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    /* external journal */
+    build_vol_ext3();
+    put32(sb + 0xE0, 0u);
+    CHECK("external journal refused",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    /* filesystem feature gates */
+    build_vol_ext3();
+    put32(sb + 0x60, get32(sb + 0x60) | 0x0080u); /* 64BIT */
+    CHECK("64-bit volume refused",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32(sb + 0x64, 0x0200u); /* BIGALLOC */
+    CHECK("bigalloc refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32(sb + 0x64, 0x0400u); /* METADATA_CSUM */
+    CHECK("checksummed metadata refused",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put16(sb + 0x3A, 0x0000u); /* dirty */
+    CHECK("dirty volume refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+}
+
+static void test_extj_classic(void) {
+    static hype_extj_wfile_t w;
+    uint8_t buf[2 * BS];
+    uint32_t used_before;
+    unsigned i;
+
+    build_vol_ext3();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    hype_extj_set_time(&w, 1765500000u);
+    used_before = bitmap_used_count();
+
+    /* in-place fast path: no journal traffic */
+    {
+        uint32_t seq_before = get32be(blk(JBLK) + 24);
+        CHECK_HEX("in-place write", 0, hype_extj_write_at(&w, 10, "JJ", 2));
+        CHECK_HEX("no allocation", used_before, bitmap_used_count());
+        CHECK_HEX("no transaction", seq_before, get32be(blk(JBLK) + 24));
+    }
+
+    /* a hole write journals, applies, and checkpoints */
+    for (i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(i ^ 0x77);
+    {
+        uint32_t seq_before = get32be(blk(JBLK) + 24);
+        CHECK_HEX("hole write", 0, hype_extj_write_at(&w, BS + 50u, buf, 300));
+        CHECK("sequence advanced", get32be(blk(JBLK) + 24) == seq_before + 1u);
+        CHECK_HEX("journal empty again", 0, get32be(blk(JBLK) + 28));
+        CHECK("descriptor landed in the journal",
+              get32be(blk(JBLK + 1u)) == 0xC03B3998u && get32be(blk(JBLK + 1u) + 4) == 1u);
+    }
+    CHECK_HEX("one block allocated", used_before + 1u, bitmap_used_count());
+    CHECK("pointer published", get32(inode(13u) + 0x28 + 4u) != 0u);
+    CHECK_HEX("mtime stamped", 1765500000u, get32(inode(13u) + 0x10));
+    CHECK_HEX("readback", 0, hype_extj_read_at(&w, BS + 50u, buf + BS, 300));
+    CHECK("data", memcmp(buf + BS, buf, 300) == 0);
+    CHECK_HEX("zero head", 0, hype_extj_read_at(&w, BS, buf + BS, 50));
+    for (i = 0; i < 50u; i++) { if (buf[BS + i] != 0) break; }
+    CHECK("block head zeroed", i == 50u);
+
+    /* indirect materialization through the journal */
+    used_before = bitmap_used_count();
+    CHECK_HEX("indirect hole write", 0, hype_extj_write_at(&w, 20u * BS, "JIND", 4));
+    CHECK_HEX("data + pointer block", used_before + 2u, bitmap_used_count());
+    CHECK_HEX("indirect readback", 0, hype_extj_read_at(&w, 20u * BS, buf, 4));
+    CHECK("indirect data", memcmp(buf, "JIND", 4) == 0);
+
+    /* bounds */
+    CHECK("past EOF refused", hype_extj_write_at(&w, w.size_bytes - 1u, "ab", 2) != 0);
+    CHECK("overflow refused", hype_extj_write_at(&w, ~0ull - 1u, "a", 1) != 0);
+    CHECK_HEX("len 0", 0, hype_extj_write_at(&w, 0, buf, 0));
+}
+
+static void test_extj_extents(void) {
+    static hype_extj_wfile_t w;
+    uint8_t buf[2 * BS];
+    unsigned i;
+
+    build_vol_ext4j();
+    CHECK_HEX("open extent file", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+
+    /* the unwritten region reads as zeros, never 0xEE */
+    CHECK_HEX("read unwritten", 0, hype_extj_read_at(&w, 4u * BS, buf, 64));
+    for (i = 0; i < 64u; i++) { if (buf[i] != 0) break; }
+    CHECK("unwritten zeros", i == 64u);
+
+    /* a write into the LEADING hole inserts an extent at the tree's front
+     * (the parent first-key update arm) */
+    CHECK_HEX("hole insert (front)", 0, hype_extj_write_at(&w, 0u * BS + 7u, "EXT", 3));
+    CHECK_HEX("hole readback", 0, hype_extj_read_at(&w, 0u * BS + 7u, buf, 3));
+    CHECK("hole data", memcmp(buf, "EXT", 3) == 0);
+    /* the pre-existing DATA blocks still read back */
+    CHECK_HEX("data intact", 0, hype_extj_read_at(&w, 2u * BS, buf, 8));
+    for (i = 0; i < 8u; i++) { if (buf[i] != pat(i + 3u)) break; }
+    CHECK("data bytes", i == 8u);
+
+    /* a write into the UNWRITTEN region converts the block: the covered
+     * bytes stick, the rest of the block becomes REAL zeros */
+    CHECK_HEX("unwritten conversion", 0, hype_extj_write_at(&w, 5u * BS + 100u, "CVT", 3));
+    CHECK_HEX("converted readback", 0, hype_extj_read_at(&w, 5u * BS, buf, BS));
+    for (i = 0; i < 100u; i++) { if (buf[i] != 0) break; }
+    CHECK("converted head zeroed", i == 100u);
+    CHECK("converted data", memcmp(buf + 100, "CVT", 3) == 0);
+    for (i = 103u; i < BS; i++) { if (buf[i] != 0) break; }
+    CHECK("converted tail zeroed", i == BS);
+    /* neighbours in the unwritten region still read zero */
+    CHECK_HEX("neighbour", 0, hype_extj_read_at(&w, 6u * BS, buf, 64));
+    for (i = 0; i < 64u; i++) { if (buf[i] != 0) break; }
+    CHECK("neighbour still zeros", i == 64u);
+
+    /* conversion at the region edges (before == 0, after == 0) */
+    CHECK_HEX("convert first block", 0, hype_extj_write_at(&w, 4u * BS, "A", 1));
+    CHECK_HEX("convert last block", 0, hype_extj_write_at(&w, 7u * BS + BS - 1u, "Z", 1));
+    /* an insert directly after the unwritten region: the merge check must
+     * SKIP an unwritten predecessor, never extend it */
+    CHECK_HEX("insert after unwritten", 0, hype_extj_write_at(&w, 8u * BS, "N", 1));
+
+    /* root growth then LEAF SPLIT: 120 strided single-block inserts */
+    for (i = 0; i < 120u; i++) {
+        uint64_t at = (uint64_t)(9u + 3u * i) * BS; /* stride 3: never merges */
+        CHECK_HEX("strided insert", 0, hype_extj_write_at(&w, at, "S", 1));
+    }
+    for (i = 0; i < 120u; i++) {
+        uint64_t at = (uint64_t)(9u + 3u * i) * BS;
+        uint8_t c;
+        CHECK_HEX("strided verify", 0, hype_extj_read_at(&w, at, &c, 1));
+        CHECK("strided byte", c == 'S');
+    }
+    /* an insert BETWEEN existing extents lands mid-leaf */
+    CHECK_HEX("mid insert", 0, hype_extj_write_at(&w, (uint64_t)(9u + 3u * 50u + 1u) * BS, "M", 1));
+    /* everything fsck would check locally: counters consistent */
+    {
+        uint32_t used = bitmap_used_count();
+        uint16_t gdfree = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+        CHECK("counters consistent", used + gdfree == VOL_BLOCKS - 1u);
+    }
+}
+
+static void test_extj_crash_windows(void) {
+    long n;
+    int saw_refusal = 0, saw_success = 0;
+
+    for (n = 0; n < 60; n++) {
+        static hype_extj_wfile_t w;
+        int wrote;
+        build_vol_ext3();
+        g_writes_seen = 0;
+        g_whardfail = 0;
+        g_wfail_at = (uint32_t)n;
+        wrote = (hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) == 0) &&
+                (hype_extj_write_at(&w, 20u * BS + 5u, "XYZ", 3) == 0);
+        g_wfail_at = ~0u;
+        (void)wrote;
+        {
+            static hype_extj_wfile_t w2;
+            int reopen = hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w2);
+            if (reopen != 0) {
+                /* only acceptable reason: the journal holds an exposed
+                 * transaction awaiting replay */
+                CHECK("refusal is the non-empty journal", get32be(blk(JBLK) + 28) != 0u);
+                saw_refusal = 1;
+            } else {
+                uint32_t used = bitmap_used_count();
+                uint16_t gdfree = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+                CHECK("crash sweep: counters consistent", used + gdfree == VOL_BLOCKS - 1u);
+                saw_success = 1;
+            }
+        }
+    }
+    CHECK("sweep covered the pre-commit window", saw_success);
+    CHECK("sweep covered the exposed-transaction window", saw_refusal);
+
+    /* the journal itself: a too-big transaction is refused */
+    {
+        static hype_jbd2_t j;
+        static hype_file_rmap_t jm;
+        static hype_jbd2_block_t imgs[HYPE_JBD2_MAX_BLOCKS + 1u];
+        static uint8_t img[1024];
+        unsigned i2;
+        build_vol_ext3();
+        CHECK_HEX("map journal inode", 0, hype_ext_map_ino_rmap(vol_read, 0, 8u, &jm));
+        CHECK_HEX("jbd2 open", 0, hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm));
+        for (i2 = 0; i2 <= HYPE_JBD2_MAX_BLOCKS; i2++) {
+            imgs[i2].blocknr = 40u + i2;
+            imgs[i2].data = img;
+        }
+        CHECK("over-budget transaction refused",
+              hype_jbd2_commit(&j, imgs, HYPE_JBD2_MAX_BLOCKS + 1u) != 0);
+        CHECK("zero-block transaction refused", hype_jbd2_commit(&j, imgs, 0u) != 0);
+        /* an image that LOOKS like a journal block gets escaped */
+        put32be(img, 0xC03B3998u);
+        CHECK_HEX("escaped commit", 0, hype_jbd2_commit(&j, imgs, 1u));
+        CHECK("escaped image stored without its magic",
+              get32be(blk(JBLK + 2u)) == 0u);
+        CHECK_HEX("checkpoint", 0, hype_jbd2_checkpoint(&j));
+        CHECK_HEX("journal empty", 0, get32be(blk(JBLK) + 28));
+    }
+}
+
+
+static void test_extj_deep_and_faults(void) {
+    static hype_extj_wfile_t w;
+    uint8_t buf[64];
+    long n;
+    unsigned i;
+
+    /* a journaled HUGE classic sparse file: every indirection level */
+    build_vol_ext3();
+    {
+        uint8_t *in = mk_inode(14u, 0x81A4u, 0u, 0u);
+        uint32_t off, last;
+        put32(in + 0x04, (uint32_t)((uint64_t)66000u * BS));
+        put32(in + 0x6C, (uint32_t)(((uint64_t)66000u * BS) >> 32));
+        off = 0;
+        off = dirent(blk(ROOT_BLK), off, 2u, ".", 2u);
+        off = dirent(blk(ROOT_BLK), off, 2u, "..", 2u);
+        off = dirent(blk(ROOT_BLK), off, 13u, "swiss.bin", 1u);
+        last = off;
+        off = dirent(blk(ROOT_BLK), off, 14u, "huge.bin", 1u);
+        dirent_close(blk(ROOT_BLK), last + 16u, BS);
+    }
+    CHECK_HEX("open huge (journaled)", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w));
+    CHECK_HEX("direct", 0, hype_extj_write_at(&w, 3u * BS, "D", 1));
+    CHECK_HEX("single", 0, hype_extj_write_at(&w, 100u * BS, "S", 1));
+    CHECK_HEX("double", 0, hype_extj_write_at(&w, 1000u * BS, "W", 1));
+    CHECK_HEX("triple", 0, hype_extj_write_at(&w, (uint64_t)(12u + 256u + 65536u + 3u) * BS, "T", 1));
+    /* siblings in already-built trees: the reuse (non-fresh) arms */
+    CHECK_HEX("single sibling", 0, hype_extj_write_at(&w, 101u * BS, "s", 1));
+    CHECK_HEX("double sibling", 0, hype_extj_write_at(&w, 1001u * BS, "w", 1));
+    CHECK_HEX("verify T", 0, hype_extj_read_at(&w, (uint64_t)(12u + 256u + 65536u + 3u) * BS, buf, 1));
+    CHECK("T byte", buf[0] == 'T');
+    {
+        uint32_t used = bitmap_used_count();
+        uint16_t gdfree = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+        CHECK("deep counters consistent", used + gdfree == VOL_BLOCKS - 1u);
+    }
+
+    /* a span whose METADATA footprint exceeds the journal credit bound is
+     * refused with no metadata change at all: a pre-built double-indirect
+     * tree with one hole per MID block makes a single span touch 24 distinct
+     * pointer blocks -- more slots than the transaction owns */
+    {
+        static uint8_t big[6400u * BS];
+        uint32_t used_before;
+        uint8_t *in = inode(14u);
+        unsigned mi, q;
+        put32(in + 0x28 + 13u * 4u, 61u); /* L2 root */
+        memset(blk(61u), 0, BS);
+        for (mi = 0; mi < 24u; mi++) {
+            uint32_t midblk = 62u + mi;
+            put32(blk(61u) + mi * 4u, midblk);
+            memset(blk(midblk), 0, BS);
+            for (q = 0; q < 256u; q++) {
+                /* contiguous per-mid mapping (coalesces to one range per
+                 * mid), except ONE hole per mid */
+                put32(blk(midblk) + q * 4u, (q == 7u) ? 0u : (1000u + q));
+            }
+        }
+        CHECK_HEX("reopen huge with prebuilt tree", 0,
+                  hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w));
+        used_before = bitmap_used_count();
+        CHECK("over-credit span refused",
+              hype_extj_write_at(&w, (uint64_t)(12u + 256u) * BS, big, 6144u * BS) != 0);
+        CHECK_HEX("no metadata leaked by refusal", used_before, bitmap_used_count());
+        CHECK_HEX("journal still empty", 0, get32be(blk(JBLK) + 28));
+    }
+
+    /* stale-map arms: a lying HOLE over a mapped block rediscovers the
+     * pointer; nothing is dirtied, so no transaction is committed */
+    {
+        uint32_t seq_before, used_before;
+        unsigned r;
+        CHECK_HEX("reopen huge", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w));
+        seq_before = get32be(blk(JBLK) + 24);
+        used_before = bitmap_used_count();
+        for (r = 0; r < w.map.count; r++) {
+            uint64_t logical = 0;
+            unsigned q;
+            for (q = 0; q < r; q++) logical += w.map.ranges[q].sector_count;
+            if (w.map.ranges[r].kind == HYPE_RANGE_DATA && logical == 3u * (BS / 512u)) {
+                w.map.ranges[r].kind = HYPE_RANGE_HOLE; /* lie about block 3 */
+            }
+        }
+        CHECK_HEX("stale write rediscovers", 0, hype_extj_write_at(&w, 3u * BS, "d", 1));
+        CHECK_HEX("no alloc", used_before, bitmap_used_count());
+        CHECK_HEX("no transaction", seq_before, get32be(blk(JBLK) + 24));
+    }
+
+    /* fault sweeps across the triple-indirect journaled write */
+    for (n = 0; n < 70; n++) {
+        static hype_extj_wfile_t w2;
+        build_vol_ext3();
+        {
+            uint8_t *in = mk_inode(14u, 0x81A4u, 0u, 0u);
+            uint32_t off, last;
+            put32(in + 0x04, (uint32_t)((uint64_t)66000u * BS));
+            put32(in + 0x6C, (uint32_t)(((uint64_t)66000u * BS) >> 32));
+            off = 0;
+            off = dirent(blk(ROOT_BLK), off, 2u, ".", 2u);
+            off = dirent(blk(ROOT_BLK), off, 2u, "..", 2u);
+            off = dirent(blk(ROOT_BLK), off, 13u, "swiss.bin", 1u);
+            last = off;
+            off = dirent(blk(ROOT_BLK), off, 14u, "huge.bin", 1u);
+            dirent_close(blk(ROOT_BLK), last + 16u, BS);
+        }
+        g_writes_seen = 0;
+        g_wfail_at = (uint32_t)n;
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w2) == 0) {
+            (void)hype_extj_write_at(&w2, (uint64_t)(12u + 256u + 65536u + 3u) * BS, "T", 1);
+        }
+        g_wfail_at = ~0u;
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w2) != 0) {
+            CHECK("triple sweep: refusal is the exposed journal",
+                  get32be(blk(JBLK) + 28) != 0u);
+        } else {
+            uint32_t used = bitmap_used_count();
+            uint16_t gdfree = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+            CHECK("triple sweep: counters consistent", used + gdfree == VOL_BLOCKS - 1u);
+        }
+        g_read_countdown = (n < 35) ? n : -1;
+        (void)hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w2);
+        g_read_countdown = -1;
+    }
+}
+
+static void test_jbd2_api(void) {
+    static hype_jbd2_t j;
+    static hype_file_rmap_t jm;
+    uint8_t *jsb;
+
+    build_vol_ext3();
+    jsb = blk(JBLK);
+    CHECK_HEX("map journal", 0, hype_ext_map_ino_rmap(vol_read, 0, 8u, &jm));
+
+    CHECK("NULL read refused", hype_jbd2_open(&j, 0, vol_write2, 0, BS, &jm) != 0);
+    CHECK("bad blocksize refused", hype_jbd2_open(&j, vol_read, vol_write2, 0, 512u, &jm) != 0);
+    put32be(jsb + 0, 0x11111111u);
+    CHECK("bad magic refused", hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm) != 0);
+    build_vol_ext3();
+    put32be(jsb + 12, 4096u);
+    CHECK("blocksize mismatch refused", hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm) != 0);
+    build_vol_ext3();
+    put32be(jsb + 16, 4u); /* maxlen < 8 */
+    CHECK("tiny journal refused", hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm) != 0);
+    build_vol_ext3();
+    put32be(jsb + 16, 4096u); /* maxlen beyond the inode's size */
+    CHECK("overlong journal refused", hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm) != 0);
+    build_vol_ext3();
+    put32be(jsb + 44, 1u); /* ro-compat feature */
+    CHECK("ro-compat journal feature refused",
+          hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm) != 0);
+    build_vol_ext3();
+    put32be(jsb + 24, 0u); /* sequence 0: normalized to 1 */
+    CHECK_HEX("sequence 0 accepted", 0, hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm));
+    CHECK_HEX("sequence normalized", 1, j.sequence);
+    build_vol_ext3();
+    g_read_countdown = 0;
+    CHECK("unreadable journal refused", hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm) != 0);
+    g_read_countdown = -1;
+
+    /* a sparse journal map is corruption */
+    {
+        static hype_file_rmap_t sparse;
+        hype_file_rmap_init(&sparse, 4u * BS);
+        hype_file_rmap_append(&sparse, HYPE_RANGE_DATA, JBLK * (BS / 512u), 2u * (BS / 512u));
+        hype_file_rmap_append(&sparse, HYPE_RANGE_HOLE, 0, 2u * (BS / 512u));
+        CHECK("sparse journal refused",
+              hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &sparse) != 0);
+    }
+
+    /* commit refusals: wrap, 64-bit block numbers */
+    build_vol_ext3();
+    CHECK_HEX("open", 0, hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm));
+    {
+        static uint8_t img[1024];
+        static hype_jbd2_block_t one;
+        static hype_jbd2_block_t many[10];
+        unsigned k;
+        one.blocknr = 0x100000000ull;
+        one.data = img;
+        CHECK("64-bit block refused", hype_jbd2_commit(&j, &one, 1u) != 0);
+        for (k = 0; k < 10u; k++) { many[k].blocknr = 40u + k; many[k].data = img; }
+        CHECK("wrapping transaction refused", hype_jbd2_commit(&j, many, 10u) != 0);
+        /* write-fault sweep across a real commit */
+        for (k = 0; k < 20u; k++) {
+            build_vol_ext3();
+            if (hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm) != 0) continue;
+            g_writes_seen = 0;
+            g_wfail_at = k;
+            (void)hype_jbd2_commit(&j, many, 3u);
+            g_wfail_at = ~0u;
+        }
+    }
+}
+
+
+static void test_extj_extent_guards(void) {
+    static hype_extj_wfile_t w;
+    uint8_t buf[64];
+    unsigned i;
+
+    /* conversion needing room in a nearly-full leaf */
+    build_vol_ext4j();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    for (i = 0; i < 100u; i++) { /* fill: root grows, leaf fills */
+        CHECK_HEX("fill insert", 0, hype_extj_write_at(&w, (uint64_t)(20u + 3u * i) * BS, "F", 1));
+    }
+    /* now convert a middle unwritten block: needs a 3-way split, may split the leaf */
+    CHECK_HEX("convert under pressure", 0, hype_extj_write_at(&w, 5u * BS + 9u, "P", 1));
+    CHECK_HEX("converted read", 0, hype_extj_read_at(&w, 5u * BS + 9u, buf, 1));
+    CHECK("converted byte", buf[0] == 'P');
+    CHECK_HEX("unwritten sibling still zero", 0, hype_extj_read_at(&w, 6u * BS + 9u, buf, 1));
+    CHECK("sibling zero", buf[0] == 0);
+
+    /* structural guards: corrupt tree shapes refuse cleanly */
+    build_vol_ext4j();
+    {
+        uint8_t *eh = inode(17u) + 0x28;
+        put16(eh + 0, 0x1111u); /* root magic */
+    }
+    CHECK("bad root magic refused at open (resolver)",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w) != 0);
+    build_vol_ext4j();
+    CHECK_HEX("open2", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    {
+        /* corrupt the root AFTER open: the write path's own epath_find must
+         * catch it (the resolver's map is already cached) */
+        uint8_t *eh = inode(17u) + 0x28;
+        put16(eh + 0, 0x2222u);
+    }
+    CHECK("bad root magic refused at write", hype_extj_write_at(&w, 9u * BS, "x", 1) != 0);
+    build_vol_ext4j();
+    CHECK_HEX("open3", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    {
+        uint8_t *eh = inode(17u) + 0x28;
+        put16(eh + 6, 6u); /* depth beyond the cap */
+    }
+    CHECK("over-deep tree refused", hype_extj_write_at(&w, 9u * BS, "x", 1) != 0);
+
+    /* fault sweeps across the extent insert + conversion paths */
+    {
+        long n;
+        for (n = 0; n < 130; n += 2) {
+            static hype_extj_wfile_t w2;
+            build_vol_ext4j();
+            g_writes_seen = 0;
+            g_wfail_at = (uint32_t)n;
+            if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w2) == 0) {
+                (void)hype_extj_write_at(&w2, 9u * BS, "I", 1);
+                (void)hype_extj_write_at(&w2, 5u * BS, "C", 1);
+                (void)hype_extj_write_at(&w2, 6u * BS + 5u, "c", 1);
+            }
+            g_wfail_at = ~0u;
+            if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w2) != 0) {
+                CHECK("extent sweep: refusal is the exposed journal",
+                      get32be(blk(JBLK) + 28) != 0u);
+            } else {
+                uint32_t used = bitmap_used_count();
+                uint16_t gdfree = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+                CHECK("extent sweep: counters consistent",
+                      used + gdfree == VOL_BLOCKS - 1u);
+            }
+            g_read_countdown = (n < 30) ? n : -1;
+            if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w2) == 0) {
+                (void)hype_extj_write_at(&w2, 12u * BS, "R", 1);
+            }
+            g_read_countdown = -1;
+        }
+    }
+
+    /* a corrupt L1 pointer entry on a journaled classic file refuses */
+    build_vol_ext3();
+    {
+        uint8_t *in = inode(13u);
+        put32(in + 0x28 + 12u * 4u, 70u);
+        memset(blk(70u), 0, BS);
+        put32(blk(70u) + 8u, 4000000u); /* logical 14 -> garbage */
+        /* make the resolver's map treat it as... the resolver refuses; so
+         * corrupt AFTER open instead */
+    }
+    (void)0;
+    build_vol_ext3();
+    CHECK_HEX("open swiss", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    {
+        uint8_t *in = inode(13u);
+        put32(in + 0x28 + 12u * 4u, 70u); /* L1 root appears mid-flight */
+        memset(blk(70u), 0, BS);
+        put32(blk(70u) + (20u - 12u) * 4u, 4000000u); /* logical 20 -> garbage */
+    }
+    CHECK("garbage leaf pointer refused", hype_extj_write_at(&w, 20u * BS, "x", 1) != 0);
+}
+
+
+static void test_extj_wave3(void) {
+    static hype_extj_wfile_t w;
+    uint8_t buf[16];
+    long n;
+    unsigned i;
+
+    /* 2-group journaled volume: cross-group allocation under the journal */
+    build_vol_ext3();
+    {
+        uint8_t *sb = g_vol + 1024;
+        unsigned k;
+        put32(sb + 0x20, 2048u);
+        put32(blk(2) + 32u + 0x00u, 4u);
+        put32(blk(2) + 32u + 0x08u, INODE_TABLE);
+        memset(blk(4), 0, BS);
+        for (k = 0; k < 2048u; k++) blk(BITMAP_BLK)[k / 8u] |= (uint8_t)(1u << (k % 8u));
+        put16(blk(2) + 0x0C, 0);
+        for (k = 0; k < 64u; k++) blk(4u)[k / 8u] |= (uint8_t)(1u << (k % 8u));
+        put16(blk(2) + 32u + 0x0Cu, (uint16_t)(2047u - 64u));
+        put32(sb + 0x0C, 2047u - 64u);
+    }
+    CHECK_HEX("open 2-group", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    CHECK_HEX("cross-group journaled alloc", 0, hype_extj_write_at(&w, BS, "G", 1));
+    CHECK("block from group 1", get32(inode(13u) + 0x28 + 4u) >= 2049u);
+
+    /* corrupt grown-tree shapes refuse at write time */
+    build_vol_ext4j();
+    CHECK_HEX("open esp", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    for (i = 0; i < 8u; i++) {
+        CHECK_HEX("grow fill", 0, hype_extj_write_at(&w, (uint64_t)(20u + 3u * i) * BS, "F", 1));
+    }
+    /* the root is now an index: find its child block and corrupt it */
+    {
+        uint8_t *eh = inode(17u) + 0x28;
+        uint32_t child = get32(eh + 12 + 4);
+        CHECK("tree grew", get16(eh + 6) != 0);
+        put16(blk(child) + 0, 0x3333u); /* child magic */
+        CHECK("bad child magic refused", hype_extj_write_at(&w, 200u * BS, "x", 1) != 0);
+        put16(blk(child) + 0, 0xF30Au);
+        put16(blk(child) + 6, 3u); /* child depth mismatch */
+        CHECK("child depth mismatch refused", hype_extj_write_at(&w, 200u * BS, "x", 1) != 0);
+        put16(blk(child) + 6, 0u);
+        put16(blk(child) + 2, 0u); /* interior... leaf with 0 entries is legal;
+                                    * make the ROOT claim 0 entries instead */
+        put16(blk(child) + 2, 8u);
+        put16(eh + 2, 0u); /* interior root with no children */
+        CHECK("empty interior refused", hype_extj_write_at(&w, 200u * BS, "x", 1) != 0);
+        put16(eh + 2, 1u);
+        put32(eh + 12 + 4, 4000000u); /* child pointer outside the volume */
+        CHECK("child outside volume refused", hype_extj_write_at(&w, 200u * BS, "x", 1) != 0);
+        put32(eh + 12 + 4, child);
+    }
+
+    /* fault sweep across ALL FOUR classic depths in one run: the later
+     * depths only see faults at high write indices */
+    for (n = 0; n < 420; n += 3) {
+        static hype_extj_wfile_t w2;
+        build_vol_ext3();
+        {
+            uint8_t *in = mk_inode(14u, 0x81A4u, 0u, 0u);
+            uint32_t off, last;
+            put32(in + 0x04, (uint32_t)((uint64_t)66000u * BS));
+            put32(in + 0x6C, (uint32_t)(((uint64_t)66000u * BS) >> 32));
+            off = 0;
+            off = dirent(blk(ROOT_BLK), off, 2u, ".", 2u);
+            off = dirent(blk(ROOT_BLK), off, 2u, "..", 2u);
+            off = dirent(blk(ROOT_BLK), off, 13u, "swiss.bin", 1u);
+            last = off;
+            off = dirent(blk(ROOT_BLK), off, 14u, "huge.bin", 1u);
+            dirent_close(blk(ROOT_BLK), last + 16u, BS);
+        }
+        g_writes_seen = 0;
+        g_wfail_at = (uint32_t)n;
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w2) == 0) {
+            (void)hype_extj_write_at(&w2, 3u * BS, "D", 1);
+            (void)hype_extj_write_at(&w2, 100u * BS, "S", 1);
+            (void)hype_extj_write_at(&w2, 1000u * BS, "W", 1);
+            (void)hype_extj_write_at(&w2, (uint64_t)(12u + 256u + 65536u + 3u) * BS, "T", 1);
+        }
+        g_wfail_at = ~0u;
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w2) != 0) {
+            CHECK("all-depth sweep: refusal is the exposed journal",
+                  get32be(blk(JBLK) + 28) != 0u);
+        } else {
+            uint32_t used = bitmap_used_count();
+            uint16_t gdfree = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+            CHECK("all-depth sweep: counters consistent", used + gdfree == VOL_BLOCKS - 1u);
+        }
+        /* read-fault variant over the same depths */
+        g_read_countdown = n;
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w2) == 0) {
+            (void)hype_extj_write_at(&w2, 1000u * BS, "W", 1);
+            (void)hype_extj_write_at(&w2, (uint64_t)(12u + 256u + 65536u + 5u) * BS, "t", 1);
+        }
+        g_read_countdown = -1;
+    }
+
+    /* faults around a leaf split: fill a tree clean, then fault one insert */
+    for (n = 0; n < 40; n += 3) {
+        static hype_extj_wfile_t w2;
+        build_vol_ext4j();
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w2) != 0) continue;
+        for (i = 0; i < 90u; i++) {
+            if (hype_extj_write_at(&w2, (uint64_t)(20u + 3u * i) * BS, "F", 1) != 0) break;
+        }
+        g_writes_seen = 0;
+        g_wfail_at = (uint32_t)n;
+        (void)hype_extj_write_at(&w2, (uint64_t)(20u + 3u * 95u) * BS, "X", 1);
+        g_wfail_at = ~0u;
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w2) != 0) {
+            CHECK("split sweep: refusal is the exposed journal",
+                  get32be(blk(JBLK) + 28) != 0u);
+        }
+    }
+
+    /* exactly-k-free-blocks sweeps: each claim SITE sees the volume run
+     * dry (write faults cannot reach claims -- they are cache-only) */
+    for (n = 0; n <= 8; n++) {
+        static hype_extj_wfile_t w2;
+        unsigned k;
+        build_vol_ext3();
+        {
+            uint8_t *in = mk_inode(14u, 0x81A4u, 0u, 0u);
+            uint32_t off, last;
+            put32(in + 0x04, (uint32_t)((uint64_t)66000u * BS));
+            put32(in + 0x6C, (uint32_t)(((uint64_t)66000u * BS) >> 32));
+            off = 0;
+            off = dirent(blk(ROOT_BLK), off, 2u, ".", 2u);
+            off = dirent(blk(ROOT_BLK), off, 2u, "..", 2u);
+            off = dirent(blk(ROOT_BLK), off, 13u, "swiss.bin", 1u);
+            last = off;
+            off = dirent(blk(ROOT_BLK), off, 14u, "huge.bin", 1u);
+            dirent_close(blk(ROOT_BLK), last + 16u, BS);
+        }
+        /* burn free blocks down to exactly n */
+        {
+            uint32_t left = (uint32_t)n;
+            uint32_t bit;
+            uint32_t freec = 0;
+            for (bit = 0; bit + 1u < VOL_BLOCKS; bit++) {
+                if (!(blk(BITMAP_BLK)[bit / 8u] & (1u << (bit % 8u)))) {
+                    if (left > 0u) { left--; freec++; continue; }
+                    blk(BITMAP_BLK)[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+                }
+            }
+            put16(blk(2) + 0x0C, (uint16_t)freec);
+            put32(g_vol + 1024 + 0x0C, freec);
+        }
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w2) == 0) {
+            int rc = hype_extj_write_at(&w2, (uint64_t)(12u + 256u + 65536u + 3u) * BS, "T", 1);
+            if (n >= 4) {
+                CHECK("k-free: enough blocks succeeds", rc == 0);
+            } else {
+                CHECK("k-free: dry volume refused", rc != 0);
+            }
+            /* refusals are cache-only: nothing may have leaked */
+            {
+                uint32_t used = bitmap_used_count();
+                uint16_t gdfree = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+                CHECK("k-free: counters consistent", used + gdfree == VOL_BLOCKS - 1u);
+            }
+        }
+        /* same on the extent volume: insert (1 block) and grow (2 blocks) */
+        for (k = 0; k < 1u; k++) {
+            static hype_extj_wfile_t w3;
+            build_vol_ext4j();
+            {
+                uint32_t left = (uint32_t)n;
+                uint32_t bit;
+                uint32_t freec = 0;
+                for (bit = 0; bit + 1u < VOL_BLOCKS; bit++) {
+                    if (!(blk(BITMAP_BLK)[bit / 8u] & (1u << (bit % 8u)))) {
+                        if (left > 0u) { left--; freec++; continue; }
+                        blk(BITMAP_BLK)[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+                    }
+                }
+                put16(blk(2) + 0x0C, (uint16_t)freec);
+                put32(g_vol + 1024 + 0x0C, freec);
+            }
+            if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w3) == 0) {
+                unsigned q;
+                for (q = 0; q < 8u; q++) {
+                    (void)hype_extj_write_at(&w3, (uint64_t)(20u + 3u * q) * BS, "F", 1);
+                }
+                (void)hype_extj_write_at(&w3, 5u * BS, "C", 1);
+            }
+        }
+    }
+
+    /* fine-grained read-fault sweep over one double-indirect write */
+    for (n = 0; n < 80; n++) {
+        static hype_extj_wfile_t w2;
+        build_vol_ext3();
+        {
+            uint8_t *in = mk_inode(14u, 0x81A4u, 0u, 0u);
+            uint32_t off, last;
+            put32(in + 0x04, (uint32_t)((uint64_t)66000u * BS));
+            put32(in + 0x6C, (uint32_t)(((uint64_t)66000u * BS) >> 32));
+            off = 0;
+            off = dirent(blk(ROOT_BLK), off, 2u, ".", 2u);
+            off = dirent(blk(ROOT_BLK), off, 2u, "..", 2u);
+            off = dirent(blk(ROOT_BLK), off, 13u, "swiss.bin", 1u);
+            last = off;
+            off = dirent(blk(ROOT_BLK), off, 14u, "huge.bin", 1u);
+            dirent_close(blk(ROOT_BLK), last + 16u, BS);
+        }
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/huge.bin", &w2) == 0) {
+            g_read_countdown = n;
+            (void)hype_extj_write_at(&w2, 1000u * BS, "W", 1);
+            g_read_countdown = -1;
+        }
+    }
+
+    /* a group whose descriptor claims free blocks its bitmap does not
+     * have: the scan moves on to the next group (the bitmap is the
+     * authority), and the allocation still lands */
+    build_vol_ext3();
+    {
+        uint8_t *sb2 = g_vol + 1024;
+        unsigned k;
+        put32(sb2 + 0x20, 2048u);
+        put32(blk(2) + 32u + 0x00u, 4u);
+        put32(blk(2) + 32u + 0x08u, INODE_TABLE);
+        memset(blk(4), 0, BS);
+        for (k = 0; k < 2048u; k++) blk(BITMAP_BLK)[k / 8u] |= (uint8_t)(1u << (k % 8u));
+        put16(blk(2) + 0x0C, 5u); /* the LIE: bitmap is full */
+        for (k = 0; k < 64u; k++) blk(4u)[k / 8u] |= (uint8_t)(1u << (k % 8u));
+        put16(blk(2) + 32u + 0x0Cu, (uint16_t)(2047u - 64u));
+        put32(sb2 + 0x0C, 2047u - 64u);
+    }
+    {
+        static hype_extj_wfile_t w4;
+        CHECK_HEX("open lie-volume", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w4));
+        CHECK_HEX("scan skips the lying group", 0, hype_extj_write_at(&w4, BS, "L", 1));
+        CHECK("landed in group 1", get32(inode(13u) + 0x28 + 4u) >= 2049u);
+    }
+
+    /* checkpoint I/O failure poisons the handle */
+    {
+        static hype_jbd2_t j;
+        static hype_file_rmap_t jm;
+        static uint8_t img[1024];
+        static hype_jbd2_block_t one;
+        build_vol_ext3();
+        CHECK_HEX("map j", 0, hype_ext_map_ino_rmap(vol_read, 0, 8u, &jm));
+        CHECK_HEX("open j", 0, hype_jbd2_open(&j, vol_read, vol_write2, 0, BS, &jm));
+        one.blocknr = 40u;
+        one.data = img;
+        CHECK_HEX("commit", 0, hype_jbd2_commit(&j, &one, 1u));
+        g_read_countdown = 0;
+        CHECK("checkpoint read failure surfaces", hype_jbd2_checkpoint(&j) != 0);
+        g_read_countdown = -1;
+    }
+}
+
+
+static void test_extj_gate_tail(void) {
+    static hype_extj_wfile_t w;
+    uint8_t *sb = g_vol + 1024;
+    unsigned i;
+
+    build_vol_ext3();
+    CHECK("NULL write refused", hype_extj_open_rw(vol_read, 0, 0, "/swiss.bin", &w) != 0);
+    CHECK("NULL read refused", hype_extj_open_rw(0, vol_write2, 0, "/swiss.bin", &w) != 0);
+    put16(sb + 0x38, 0x1111u);
+    CHECK("bad magic refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32(sb + 0x60, get32(sb + 0x60) | 0x0004u); /* RECOVER */
+    CHECK("RECOVER refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32(sb + 0x60, get32(sb + 0x60) | 0x0008u); /* JOURNAL_DEV */
+    CHECK("journal-dev refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put16(sb + 0x3A, 0x0003u); /* valid + error */
+    CHECK("error state refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32(sb + 0x18, 3u);
+    CHECK("8K blocks refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32(sb + 0x20, 0);
+    CHECK("bpg 0 refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put16(sb + 0x58, 64u); /* inode size under 128 */
+    CHECK("tiny inodes refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32(blk(2) + 0x08, 4000000u); /* inode table outside the volume */
+    CHECK("inode table oob refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32(sb + 0x4C, 0); /* rev 0: 128-byte inodes (layout mismatch on this
+                          * volume, but the branch must parse cleanly) */
+    (void)hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w);
+
+    /* a grown tree whose root index entry points at block 0 */
+    build_vol_ext4j();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    for (i = 0; i < 8u; i++) {
+        CHECK_HEX("fill", 0, hype_extj_write_at(&w, (uint64_t)(20u + 3u * i) * BS, "F", 1));
+    }
+    put32(inode(17u) + 0x28 + 12 + 4, 0u); /* child pointer NULL */
+    CHECK("NULL child refused", hype_extj_write_at(&w, 200u * BS, "x", 1) != 0);
+
+    /* a hand-built FULL root index over full leaves: a leaf split has
+     * nowhere to put its new index entry -> bounded refusal */
+    build_vol_ext4j();
+    {
+        uint8_t *in = mk_inode(17u, 0x81A4u, (uint64_t)3000000u * BS, 0x80000u);
+        uint8_t *eh = in + 0x28;
+        unsigned e;
+        put16(eh + 0, 0xF30Au); put16(eh + 2, 4u); put16(eh + 4, 4u); put16(eh + 6, 1u);
+        for (e = 0; e < 4u; e++) {
+            uint8_t *ie = eh + 12 + e * 12u;
+            uint32_t leafblk = 500u + e;
+            uint8_t *lf = blk(leafblk);
+            unsigned q;
+            uint16_t lmax = (uint16_t)((BS - 12u) / 12u);
+            uint16_t nent = (e == 0u) ? lmax : 1u; /* only leaf 0 is FULL */
+            put32(ie + 0, e * 100000u);
+            put32(ie + 4, leafblk);
+            put16(ie + 8, 0u);
+            memset(lf, 0, BS);
+            put16(lf + 0, 0xF30Au);
+            put16(lf + 2, nent);
+            put16(lf + 4, lmax);
+            put16(lf + 6, 0u);
+            for (q = 0; q < nent; q++) {
+                uint8_t *le = lf + 12u + q * 12u;
+                put32(le + 0, e * 100000u + q * 2u); /* gaps between extents */
+                put16(le + 4, 1u);
+                put16(le + 6, 0u);
+                put32(le + 8, 70u); /* all point at a harmless block */
+            }
+            /* mark the leaf blocks used so the allocator ignores them */
+            {
+                uint32_t bit = leafblk - 1u;
+                blk(BITMAP_BLK)[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+            }
+        }
+    }
+    CHECK_HEX("open full-tree", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    CHECK("cascading split refused (bounded transaction)",
+          hype_extj_write_at(&w, 5u * BS + 1u, "x", 1) != 0);
+}
+
+
+static void test_extj_last_mile(void) {
+    static hype_extj_wfile_t w;
+    uint8_t buf[2048];
+    unsigned i;
+
+    /* corrupt group metadata discovered mid-write */
+    build_vol_ext3();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    put32(blk(2) + 0x00, 4000000u); /* bitmap pointer far outside the volume */
+    CHECK("oob bitmap refused mid-write", hype_extj_write_at(&w, BS, "x", 1) != 0);
+    build_vol_ext3();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    put32(blk(2) + 0x00, 0u); /* NULL bitmap pointer */
+    CHECK("NULL bitmap refused mid-write", hype_extj_write_at(&w, BS, "x", 1) != 0);
+
+    /* the inode-table block becoming unreadable mid-write */
+    build_vol_ext3();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    g_fail_read_lba = (w.inode_byte / 512u) & ~1ull; /* the inode block's first sector */
+    CHECK("unreadable inode block refused", hype_extj_write_at(&w, BS, "x", 1) != 0);
+    g_fail_read_lba = (uint64_t)-1;
+
+    /* open gates: NULL inode table pointer; zero inodes-per-group */
+    build_vol_ext3();
+    put32(blk(2) + 0x08, 0u);
+    CHECK("NULL inode table refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    build_vol_ext3();
+    put32(g_vol + 1024 + 0x28, 0u);
+    CHECK("zero inodes/group refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+
+    /* a classic file whose map LIES about an unwritten range is refused --
+     * classic block maps have no unwritten state to convert */
+    build_vol_ext3();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    w.map.ranges[0].kind = HYPE_RANGE_UNWRITTEN;
+    CHECK("unwritten on a classic map refused", hype_extj_write_at(&w, 5u, "x", 1) != 0);
+
+    /* a data-portion write failing inside a mixed DATA->HOLE span */
+    build_vol_ext3();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    g_writes_seen = 0;
+    g_wfail_at = 0; /* the very first media write: the DATA part of the span */
+    CHECK("data-part failure surfaces",
+          hype_extj_write_at(&w, BS - 8u, buf, 64) != 0);
+    g_wfail_at = ~0u;
+
+    /* a FRONT insert into a GROWN tree: the parent first-key update path */
+    build_vol_ext4j();
+    CHECK_HEX("open esp", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    for (i = 0; i < 8u; i++) {
+        CHECK_HEX("grow", 0, hype_extj_write_at(&w, (uint64_t)(20u + 3u * i) * BS, "F", 1));
+    }
+    CHECK_HEX("front insert into grown tree", 0, hype_extj_write_at(&w, 0u, "0", 1));
+    CHECK_HEX("front readback", 0, hype_extj_read_at(&w, 0u, buf, 1));
+    CHECK("front byte", buf[0] == '0');
+    /* keys above the front insert are intact */
+    CHECK_HEX("later readback", 0, hype_extj_read_at(&w, (uint64_t)(20u) * BS, buf, 1));
+    CHECK("later byte", buf[0] == 'F');
+
+    /* an lb-adjacent insert whose new block is NOT phys-adjacent: the merge
+     * check must fall through to a fresh entry */
+    build_vol_ext4j();
+    CHECK_HEX("open esp2", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    CHECK_HEX("insert lb 9", 0, hype_extj_write_at(&w, 9u * BS, "A", 1));
+    {
+        /* burn the next free block ON MEDIA so the following claim skips it */
+        uint32_t bit;
+        for (bit = 0; bit + 1u < VOL_BLOCKS; bit++) {
+            if (!(blk(BITMAP_BLK)[bit / 8u] & (1u << (bit % 8u)))) {
+                blk(BITMAP_BLK)[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+                {
+                    uint16_t g = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+                    put16(blk(2) + 0x0C, (uint16_t)(g - 1u));
+                }
+                put32(g_vol + 1024 + 0x0C, get32(g_vol + 1024 + 0x0C) - 1u);
+                break;
+            }
+        }
+    }
+    CHECK_HEX("insert lb 10 (non-adjacent phys)", 0, hype_extj_write_at(&w, 10u * BS, "B", 1));
+    CHECK_HEX("A ok", 0, hype_extj_read_at(&w, 9u * BS, buf, 1));
+    CHECK("A byte", buf[0] == 'A');
+    CHECK_HEX("B ok", 0, hype_extj_read_at(&w, 10u * BS, buf, 1));
+    CHECK("B byte", buf[0] == 'B');
+}
+
 int main(void) {
     test_fs_ops_ext();
     test_resolve_rmap_sparse();
@@ -1720,6 +2744,16 @@ int main(void) {
     test_ext2_alloc_deep();
     test_384_final_edges();
     test_384_coverage_tail();
+    test_extj_gates();
+    test_extj_classic();
+    test_extj_extents();
+    test_extj_crash_windows();
+    test_extj_deep_and_faults();
+    test_jbd2_api();
+    test_extj_extent_guards();
+    test_extj_wave3();
+    test_extj_gate_tail();
+    test_extj_last_mile();
     test_resolve_extents();
     test_resolve_indirect();
     test_refusals();

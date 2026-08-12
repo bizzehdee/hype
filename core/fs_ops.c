@@ -1,6 +1,7 @@
 #include "fs_ops.h"
 
 #include "fat.h" /* hype_fat32_resolve / hype_exfat_resolve */
+#include "ext_jalloc.h"
 #include "lebytes.h"
 
 /*
@@ -13,6 +14,7 @@
 #define TAG_RMAP 1u   /* u.rmap: generic read-only handle (#381) */
 #define TAG_NATIVE 2u /* the driver's own writable handle arm */
 #define TAG_EXT2 3u   /* u.ext2: the #384 allocating ext2 writer */
+#define TAG_EXTJ 4u   /* u.extj: the #385 journaled ext3/4 writer */
 
 /* ---------------- ISO9660 (read-only, whole-image) ---------------- */
 
@@ -391,11 +393,16 @@ static int ext_map_ranges(hype_fs_t *fs, const char *path, hype_file_rmap_t *out
 static int ext_lookup(hype_fs_t *fs, const char *path, hype_fs_file_t *out) {
     out->fs = fs;
     if (fs->write != 0) {
-        /* #384: on an ext2 volume the allocating writer opens first, so a
-         * sparse backing file gets hole-filling writes. Any journal, extent
-         * mapping or unsupported feature makes it refuse; the legacy
-         * in-place-only handle (clean ext3/4, fully-allocated files) is the
-         * fallback. Both require a cleanly-unmounted volume. */
+        /* #384/#385: the allocating writers open first, so a sparse backing
+         * file gets hole-filling writes -- the journaled one on ext3/4, the
+         * direct one on ext2. Whatever both refuse (unsupported features,
+         * checksummed metadata, a non-empty journal) falls back to the
+         * legacy in-place-only handle. All require a clean volume. */
+        out->tag = TAG_EXTJ;
+        if (hype_extj_open_rw(fs->read, fs->write, fs->ctx, path, &out->u.extj) == 0) {
+            out->size = out->u.extj.size_bytes;
+            return 0;
+        }
         out->tag = TAG_EXT2;
         if (hype_ext2_open_rw(fs->read, fs->write, fs->ctx, path, &out->u.ext2) == 0) {
             out->size = out->u.ext2.size_bytes;
@@ -423,6 +430,9 @@ static int ext_read_at(hype_fs_file_t *f, uint64_t offset, void *dst, unsigned i
     if (f->tag == TAG_EXT2) {
         return hype_ext2_read_at(&f->u.ext2, offset, dst, len);
     }
+    if (f->tag == TAG_EXTJ) {
+        return hype_extj_read_at(&f->u.extj, offset, dst, len);
+    }
     if (f->tag == TAG_NATIVE) {
         return hype_ext_read_at(&f->u.ext, offset, dst, len);
     }
@@ -433,6 +443,10 @@ static int ext_write_at(hype_fs_file_t *f, uint64_t offset, const void *src, uns
     if (f->tag == TAG_EXT2) {
         /* allocates when the span crosses a hole (#384) */
         return hype_ext2_write_at(&f->u.ext2, offset, src, len);
+    }
+    if (f->tag == TAG_EXTJ) {
+        /* journaled allocation + unwritten conversion (#385) */
+        return hype_extj_write_at(&f->u.extj, offset, src, len);
     }
     if (f->tag != TAG_NATIVE) {
         return -1;

@@ -8,6 +8,7 @@
 #include "fat_write_fs.h"  /* hype_fat32_fs_t / hype_fat32_wfile_t */
 #include "fat_exfat_fs.h"  /* hype_exfat_fs_t / hype_exfat_wfile_t */
 #include "ext.h"           /* hype_ext_wfile_t */
+#include "ext_jalloc.h"    /* hype_extj_wfile_t (#385) */
 #include "ntfs.h"          /* hype_ntfs_t (#337) */
 #include "rtc.h"
 
@@ -31,8 +32,9 @@
  *            in-place inside the size, allocate-and-zero-fill growth past it.
  *   exFAT    read + full mutation + IN-PLACE write_at (never grows/moves).
  *   ext      sparse-aware read (#384: holes/unwritten read as zeros);
- *            write_at in place, plus HOLE-FILLING allocation on ext2
- *            volumes (journaled allocation is #385); no namespace mutation.
+ *            write_at in place, plus HOLE-FILLING allocation -- journaled
+ *            (jbd2) on ext3/4, direct on ext2 -- and unwritten-extent
+ *            conversion on ext4 (#385); no namespace mutation.
  *   NTFS     read (sparse runs read as zeroes) + IN-PLACE write_at into
  *            DATA ranges only; a write into a HOLE or UNWRITTEN range is
  *            refused (#337, plan.md §10 decision 30). No mutation beyond
@@ -134,6 +136,7 @@ struct hype_fs_file {
         hype_exfat_wfile_t exfat;
         hype_ext_wfile_t ext;     /* ext in-place read/write handle */
         hype_ext2_wfile_t ext2;   /* #384 allocating ext2 writer handle */
+        hype_extj_wfile_t extj;   /* #385 journaled ext3/4 writer handle */
         hype_file_rmap_t rmap;    /* generic read-only handle (#381 contract) */
     } u;
 };
