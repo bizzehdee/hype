@@ -81,4 +81,11 @@ void hype_debug_flush_gop(void);
  * Re-enable (1) is unused today (boot starts enabled). Panics paint GOP directly. */
 void hype_debug_set_gop_enabled(int enabled);
 
+/* Testable, atomic state behind the debug GOP tee. The BSP disables the tee
+ * before starting guest APs. Every core then observes one renderer owner.
+ * `note_gop_write` is called immediately before the tee changes the shadow. */
+int hype_debug_gop_is_enabled(void);
+void hype_debug_note_gop_write(void);
+unsigned long long hype_debug_gop_write_count(void);
+
 #endif /* HYPE_FATAL_H */

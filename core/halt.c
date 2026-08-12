@@ -146,15 +146,6 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...) {
  */
 static int g_gop_deferred = 0;
 
-/* Rendering isolation: once the guest dispatch loop's terminal/dashboard renderer
- * owns the GOP framebuffer, hype_debug_print() (used from EVERY core to relay each
- * VM's serial console + hype diagnostics to the log) must NOT also paint the shared
- * GOP shadow -- otherwise one VM's output bleeds onto the focused view/dashboard for
- * a frame (and races the shadow across cores). When disabled, prints still go to the
- * serial port + logbuf (\HYPEFULL.LOG); only the GOP tee is suppressed. hype_fatal()
- * paints the GOP directly, so panics are never suppressed. */
-static int g_gop_enabled = 1;
-
 /*
  * #363: how many times something OTHER than the terminal renderer has painted the GOP shadow.
  *
@@ -168,17 +159,13 @@ static int g_gop_enabled = 1;
  *
  * A counter rather than a flag: the renderer compares it against the value it last saw, so it
  * cannot miss a write that happens while it is mid-sweep.
+ * #380 moves the counter and ownership flag to fatal.c. That testable state
+ * uses atomics because debug writers and the renderer execute on different
+ * cores. halt.c remains only the hardware-facing print and flush shim.
  */
-static volatile unsigned long long g_gop_foreign_writes;
-
-unsigned long long hype_debug_gop_write_count(void) { return g_gop_foreign_writes; }
 
 void hype_debug_set_gop_deferred(int deferred) {
     g_gop_deferred = deferred;
-}
-
-void hype_debug_set_gop_enabled(int enabled) {
-    g_gop_enabled = enabled;
 }
 
 void hype_debug_flush_gop(void) {
@@ -233,8 +220,8 @@ void hype_debug_print(const char *fmt, ...) {
     hype_logbuf_unlock();
 
     gop = hype_fatal_get_gop();
-    if (g_gop_enabled && gop != 0) {
-        g_gop_foreign_writes++; /* #363: tell the diffing renderer its cache is stale */
+    if (hype_debug_gop_is_enabled() && gop != 0) {
+        hype_debug_note_gop_write(); /* #363: tell the diffing renderer its cache is stale */
         hype_gop_print(gop, "%s", msg);
         if (!g_gop_deferred) {
             hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());

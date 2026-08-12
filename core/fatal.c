@@ -8,6 +8,15 @@ static hype_gop_console_t *g_gop_console = 0;
 static EFI_GRAPHICS_OUTPUT_PROTOCOL *g_gop_protocol = 0;
 static void *g_gop_real_fb = 0;
 
+/*
+ * #380: the debug tee and the dashboard renderer run on different cores.
+ * Plain loads and stores made the old enable flag a C data race. Keep the
+ * renderer ownership state here, outside halt.c's hardware-only exemption,
+ * so its synchronization and write accounting remain unit-testable.
+ */
+static unsigned int g_debug_gop_enabled = 1u;
+static unsigned long long g_debug_gop_writes;
+
 void hype_fatal_set_gop(hype_gop_console_t *con) {
     g_gop_console = con;
 }
@@ -27,6 +36,22 @@ EFI_GRAPHICS_OUTPUT_PROTOCOL *hype_fatal_get_gop_protocol(void) {
 
 void *hype_fatal_get_real_fb(void) {
     return g_gop_real_fb;
+}
+
+void hype_debug_set_gop_enabled(int enabled) {
+    __atomic_store_n(&g_debug_gop_enabled, enabled ? 1u : 0u, __ATOMIC_RELEASE);
+}
+
+int hype_debug_gop_is_enabled(void) {
+    return __atomic_load_n(&g_debug_gop_enabled, __ATOMIC_ACQUIRE) != 0u;
+}
+
+void hype_debug_note_gop_write(void) {
+    (void)__atomic_fetch_add(&g_debug_gop_writes, 1ull, __ATOMIC_RELAXED);
+}
+
+unsigned long long hype_debug_gop_write_count(void) {
+    return __atomic_load_n(&g_debug_gop_writes, __ATOMIC_RELAXED);
 }
 
 /* Optional hook run by hype_fatal() just before it halts, so a panic

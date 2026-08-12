@@ -80,6 +80,26 @@ int main(void) {
         }
     }
 
+    {
+        unsigned long long before = hype_debug_gop_write_count();
+
+        hype_debug_set_gop_enabled(0);
+        if (hype_debug_gop_is_enabled()) {
+            printf("FAIL: debug GOP tee remained enabled after renderer ownership transfer\n");
+            failures++;
+        }
+        hype_debug_note_gop_write();
+        if (hype_debug_gop_write_count() != before + 1ull) {
+            printf("FAIL: debug GOP write counter did not advance atomically\n");
+            failures++;
+        }
+        hype_debug_set_gop_enabled(1);
+        if (!hype_debug_gop_is_enabled()) {
+            printf("FAIL: debug GOP tee did not re-enable for the pre-render boot phase\n");
+            failures++;
+        }
+    }
+
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;
