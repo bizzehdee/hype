@@ -1348,6 +1348,34 @@ isn't lost.
     softer rules") — a stick holds real data exactly like an internal disk,
     and two different destructive-write ceremonies is how one of them rots.
 
+33. **VM count — decided: no compile-time cap; per-VM state is sized from
+    the machine at boot.** §6 already promises "any number of VMs ...
+    bounded by host resources", but the implementation grew a
+    `HYPE_FW_MAX_VMS 2u` constant plus arrays, pools and 32-bit VM masks
+    sized around it, and the config layer caps at 16 parsed VMs. Those are
+    implementation stages, not design, and they are silently wrong on real
+    targets: current AMD EPYC parts ship up to 192 cores and quad-socket
+    boards exist, so a machine with 700+ usable cores is a legitimate host.
+    The only real bounds are physical: 1:1 pinning gives at most
+    (usable cores - 1) VMs (the BSP keeps console/log duty), and total
+    guest RAM must fit. Decided:
+    - **Per-VM state is allocated once at startup from the UEFI pool,
+      before ExitBootServices, sized by the parsed config and validated
+      against the detected CPU topology** — not a static array behind a
+      constant. Admission (§6i) enforces VMs <= usable cores - 1 and the
+      RAM budget, refusing at startup with the real numbers in the message.
+    - **No 32-bit VM bitmasks.** Any per-VM mask (dashboard focus
+      availability, isolation state) must scale with the VM count —
+      a fixed `unsigned int` mask is the same silent clamp in disguise.
+    - **Naming/UX surfaces must not assume single digits**: per-VM log
+      files, the `\iso\vmN.iso` drop convention, dashboard rows (the
+      dashboard needs paging/scrolling well before 700 rows, but it must
+      never *misreport* the count).
+    - Rejected: raising the constant (2 -> 4 -> 16 is whack-a-mole, and
+      #237's silent 2-slot VMCB pool clamp is exactly the failure class
+      this breeds); runtime VM hotplug (out of scope — the set of VMs is
+      fixed at boot from `hype.cfg`, only their power state changes, §6f).
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
