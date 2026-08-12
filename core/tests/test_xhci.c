@@ -336,25 +336,60 @@ static void test_recovery_trbs(void) {
 static void test_parked_events(void) {
     hype_xhci_parked_t p;
     uint32_t cc = 0;
+    uint32_t residue = 0;
 
     hype_xhci_parked_reset(&p);
     /* #266: nothing parked yet. */
-    CHECK_HEX("empty table takes nothing", 0, hype_xhci_parked_take(&p, 1, 4, 0x1000, &cc));
+    CHECK_HEX("empty table takes nothing", 0,
+              hype_xhci_parked_take(&p, 1, 4, 0x1000, &cc, &residue));
 
     /* The observed case: a completion for ep=3 arrives while ep=4 is awaited. It must be
      * REMEMBERED, not discarded -- discarding is what stranded the BOT state machine. */
-    hype_xhci_parked_put(&p, 1, 3, 0x140425000ull, 1);
+    hype_xhci_parked_put(&p, 1, 3, 0x140425000ull, 1, 7);
     CHECK_HEX("wrong endpoint does not claim it", 0,
-              hype_xhci_parked_take(&p, 1, 4, 0x140425000ull, &cc));
-    CHECK_HEX("wrong trb does not claim it", 0, hype_xhci_parked_take(&p, 1, 3, 0x999, &cc));
+              hype_xhci_parked_take(&p, 1, 4, 0x140425000ull, &cc, &residue));
+    CHECK_HEX("wrong trb does not claim it", 0,
+              hype_xhci_parked_take(&p, 1, 3, 0x999, &cc, &residue));
     CHECK_HEX("wrong slot does not claim it", 0,
-              hype_xhci_parked_take(&p, 2, 3, 0x140425000ull, &cc));
+              hype_xhci_parked_take(&p, 2, 3, 0x140425000ull, &cc, &residue));
     /* Only the exact (slot,dci,trb) may claim it -- that is what keeps data out of the
      * wrong buffer, which is #254's original corruption. */
-    CHECK_HEX("exact match claims it", 1, hype_xhci_parked_take(&p, 1, 3, 0x140425000ull, &cc));
+    CHECK_HEX("exact match claims it", 1,
+              hype_xhci_parked_take(&p, 1, 3, 0x140425000ull, &cc, &residue));
     CHECK_HEX("completion code carried through", 1, cc);
+    CHECK_HEX("transfer residue carried through", 7, residue);
     /* Consumed: one event must never satisfy two waits. */
-    CHECK_HEX("not claimable twice", 0, hype_xhci_parked_take(&p, 1, 3, 0x140425000ull, &cc));
+    CHECK_HEX("not claimable twice", 0,
+              hype_xhci_parked_take(&p, 1, 3, 0x140425000ull, &cc, &residue));
+}
+
+static void test_parked_drop_exact(void) {
+    hype_xhci_parked_t p;
+    uint32_t cc = 0;
+    uint32_t residue = 0;
+    hype_xhci_parked_reset(&p);
+    hype_xhci_parked_put(&p, 1, 3, 0x5000, 1, 0);
+    hype_xhci_parked_put(&p, 1, 4, 0x5000, 1, 0);
+    CHECK_HEX("stale exact completion dropped", 1,
+              hype_xhci_parked_drop_exact(&p, 1, 3, 0x5000));
+    CHECK_HEX("dropped completion cannot satisfy reused TRB", 0,
+              hype_xhci_parked_take(&p, 1, 3, 0x5000, &cc, &residue));
+    CHECK_HEX("other endpoint remains parked", 1,
+              hype_xhci_parked_take(&p, 1, 4, 0x5000, &cc, &residue));
+    CHECK_HEX("missing exact completion reports nothing", 0,
+              hype_xhci_parked_drop_exact(&p, 1, 3, 0x5000));
+}
+
+static void test_exact_transfer_result(void) {
+    CHECK_HEX("successful complete transfer", 1,
+              hype_xhci_xfer_exact_ok(HYPE_XHCI_CC_SUCCESS, 0));
+    CHECK_HEX("success with residue rejected", 0,
+              hype_xhci_xfer_exact_ok(HYPE_XHCI_CC_SUCCESS, 1));
+    CHECK_HEX("short completion with no residue is complete", 1,
+              hype_xhci_xfer_exact_ok(HYPE_XHCI_CC_SHORT_PACKET, 0));
+    CHECK_HEX("short incomplete transfer rejected", 0,
+              hype_xhci_xfer_exact_ok(HYPE_XHCI_CC_SHORT_PACKET, 64));
+    CHECK_HEX("failed transfer rejected", 0, hype_xhci_xfer_exact_ok(4, 0));
 }
 
 static void test_parked_no_duplicates(void) {
@@ -364,10 +399,11 @@ static void test_parked_no_duplicates(void) {
     hype_xhci_parked_reset(&p);
     /* A controller that re-reports the same completion must not fill the table. */
     for (i = 0; i < HYPE_XHCI_PARKED_MAX * 3u; i++) {
-        hype_xhci_parked_put(&p, 1, 3, 0x2000, 1);
+        hype_xhci_parked_put(&p, 1, 3, 0x2000, 1, 0);
     }
-    CHECK_HEX("re-reported event stored once", 1, hype_xhci_parked_take(&p, 1, 3, 0x2000, &cc));
-    CHECK_HEX("and only once", 0, hype_xhci_parked_take(&p, 1, 3, 0x2000, &cc));
+    CHECK_HEX("re-reported event stored once", 1,
+              hype_xhci_parked_take(&p, 1, 3, 0x2000, &cc, 0));
+    CHECK_HEX("and only once", 0, hype_xhci_parked_take(&p, 1, 3, 0x2000, &cc, 0));
 }
 
 static void test_parked_overflow_keeps_newest(void) {
@@ -376,20 +412,21 @@ static void test_parked_overflow_keeps_newest(void) {
     unsigned i;
     hype_xhci_parked_reset(&p);
     for (i = 0; i < HYPE_XHCI_PARKED_MAX + 2u; i++) {
-        hype_xhci_parked_put(&p, 1, 3, 0x3000ull + i, i);
+        hype_xhci_parked_put(&p, 1, 3, 0x3000ull + i, i, 0);
     }
     /* The newest must still be there: silently refusing to record it would recreate the
      * discard bug this whole table exists to fix. */
     CHECK_HEX("newest survives overflow", 1,
-              hype_xhci_parked_take(&p, 1, 3, 0x3000ull + HYPE_XHCI_PARKED_MAX + 1u, &cc));
+              hype_xhci_parked_take(&p, 1, 3, 0x3000ull + HYPE_XHCI_PARKED_MAX + 1u,
+                                    &cc, 0));
 }
 
 static void test_parked_drop_slot(void) {
     hype_xhci_parked_t p;
     uint32_t cc = 0;
     hype_xhci_parked_reset(&p);
-    hype_xhci_parked_put(&p, 1, 3, 0x4000, 1);
-    hype_xhci_parked_put(&p, 2, 3, 0x4000, 1);
+    hype_xhci_parked_put(&p, 1, 3, 0x4000, 1, 0);
+    hype_xhci_parked_put(&p, 2, 3, 0x4000, 1, 0);
     /*
      * After a reset the rings restart at index 0, so a parked event for the torn-down
      * state carries a TRB address the RETRY is about to reuse -- and would be claimed by
@@ -397,8 +434,8 @@ static void test_parked_drop_slot(void) {
      * reintroducing #254's mis-attribution.
      */
     hype_xhci_parked_drop_slot(&p, 1);
-    CHECK_HEX("slot 1 dropped", 0, hype_xhci_parked_take(&p, 1, 3, 0x4000, &cc));
-    CHECK_HEX("other slot untouched", 1, hype_xhci_parked_take(&p, 2, 3, 0x4000, &cc));
+    CHECK_HEX("slot 1 dropped", 0, hype_xhci_parked_take(&p, 1, 3, 0x4000, &cc, 0));
+    CHECK_HEX("other slot untouched", 1, hype_xhci_parked_take(&p, 2, 3, 0x4000, &cc, 0));
 }
 
 
@@ -741,6 +778,8 @@ int main(void) {
     test_event_decode();
 
     test_parked_events();
+    test_parked_drop_exact();
+    test_exact_transfer_result();
     test_parked_no_duplicates();
     test_parked_overflow_keeps_newest();
     test_parked_drop_slot();

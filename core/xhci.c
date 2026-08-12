@@ -265,12 +265,13 @@ void hype_xhci_parked_reset(hype_xhci_parked_t *p) {
         p->e[i].dci = 0;
         p->e[i].trb = 0;
         p->e[i].cc = 0;
+        p->e[i].residue = 0;
     }
     p->next = 0;
 }
 
 void hype_xhci_parked_put(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, uint64_t trb,
-                          uint32_t cc) {
+                          uint32_t cc, uint32_t residue) {
     unsigned i;
 
     /* Replace an existing entry for the same transfer rather than adding a duplicate:
@@ -278,6 +279,7 @@ void hype_xhci_parked_put(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, ui
     for (i = 0; i < HYPE_XHCI_PARKED_MAX; i++) {
         if (p->e[i].used && p->e[i].slot == slot && p->e[i].dci == dci && p->e[i].trb == trb) {
             p->e[i].cc = cc;
+            p->e[i].residue = residue;
             return;
         }
     }
@@ -288,6 +290,7 @@ void hype_xhci_parked_put(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, ui
             p->e[i].dci = dci;
             p->e[i].trb = trb;
             p->e[i].cc = cc;
+            p->e[i].residue = residue;
             return;
         }
     }
@@ -300,17 +303,33 @@ void hype_xhci_parked_put(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, ui
     p->e[i].dci = dci;
     p->e[i].trb = trb;
     p->e[i].cc = cc;
+    p->e[i].residue = residue;
 }
 
 int hype_xhci_parked_take(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, uint64_t trb,
-                          uint32_t *out_cc) {
+                          uint32_t *out_cc, uint32_t *out_residue) {
     unsigned i;
     for (i = 0; i < HYPE_XHCI_PARKED_MAX; i++) {
         if (p->e[i].used && p->e[i].slot == slot && p->e[i].dci == dci && p->e[i].trb == trb) {
             if (out_cc != 0) {
                 *out_cc = p->e[i].cc;
             }
+            if (out_residue != 0) {
+                *out_residue = p->e[i].residue;
+            }
             p->e[i].used = 0; /* consumed: one event must not satisfy two waits */
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int hype_xhci_parked_drop_exact(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci,
+                                uint64_t trb) {
+    unsigned i;
+    for (i = 0; i < HYPE_XHCI_PARKED_MAX; i++) {
+        if (p->e[i].used && p->e[i].slot == slot && p->e[i].dci == dci && p->e[i].trb == trb) {
+            p->e[i].used = 0;
             return 1;
         }
     }
@@ -324,6 +343,10 @@ void hype_xhci_parked_drop_slot(hype_xhci_parked_t *p, uint32_t slot) {
             p->e[i].used = 0;
         }
     }
+}
+
+int hype_xhci_xfer_exact_ok(uint32_t cc, uint32_t residue) {
+    return (cc == HYPE_XHCI_CC_SUCCESS || cc == HYPE_XHCI_CC_SHORT_PACKET) && residue == 0u;
 }
 
 /* --- USB-7 (#241): device inventory --- */

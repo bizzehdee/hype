@@ -1,4 +1,5 @@
 #include "blk_usb.h"
+#include "ticket_lock.h"
 
 /* hype_xhci_msc_read/_write bounce through a 4 KiB page, so at most 8 x 512B
  * sectors per xHCI call. blk_backend hands us larger runs; sub-chunk them. */
@@ -105,27 +106,34 @@ void hype_blk_usb_set_bsp_apic(unsigned int apic_id) { g_usb_bsp_apic = apic_id;
 unsigned long long hype_blk_usb_bsp_lock_timeouts(void) { return g_usb_bsp_lock_timeouts; }
 
 static int usb_xfer_lock_bounded(void) {
-    unsigned int me = __atomic_fetch_add(&g_usb_ticket_next, 1u, __ATOMIC_ACQ_REL);
     unsigned long long spins = 0;
     unsigned int budget = USB_BSP_LOCK_BUDGET;
-    while (__atomic_load_n(&g_usb_ticket_owner, __ATOMIC_ACQUIRE) != me) {
-        if (budget-- == 0u) {
-            /*
-             * Give the ticket back by advancing the owner past it. Safe only because the holder
-             * is the one that advances it on release and we are the next in line -- any waiter
-             * behind us simply moves up. Without this the queue would be permanently gapped.
-             */
-            __atomic_fetch_add(&g_usb_ticket_owner, 1u, __ATOMIC_RELEASE);
-            g_usb_bsp_lock_timeouts++;
-            return -1;
+
+    /*
+     * #377: never enqueue a ticket that this bounded caller may abandon.
+     *
+     * The previous timeout advanced owner to cancel the BSP's ticket. When a
+     * guest ticket preceded the BSP, that advance admitted the guest while the
+     * current holder was still using the shared xHCI ring. Later releases then
+     * advanced the damaged queue again. Under log-write pressure, concurrent
+     * transfers can corrupt any sector, including an earlier HYPE.LOG FAT link.
+     *
+     * Claim only while next == owner. A failed claim does not mutate either
+     * counter, so timing out cannot disturb the holder or queued guest reads.
+     */
+    while (budget-- != 0u) {
+        if (hype_ticket_lock_try_claim(&g_usb_ticket_next, &g_usb_ticket_owner)) {
+            __atomic_store_n(&g_usb_lock_holder_apic, usb_xfer_this_apic(),
+                             __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_usb_lock_acquires, 1ull, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_usb_lock_spins, spins, __ATOMIC_RELAXED);
+            return 0;
         }
         __builtin_ia32_pause();
         spins++;
     }
-    __atomic_store_n(&g_usb_lock_holder_apic, usb_xfer_this_apic(), __ATOMIC_RELAXED);
-    __atomic_fetch_add(&g_usb_lock_acquires, 1ull, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&g_usb_lock_spins, spins, __ATOMIC_RELAXED);
-    return 0;
+    g_usb_bsp_lock_timeouts++;
+    return -1;
 }
 
 static int usb_xfer_lock_or_fail(void) {
@@ -279,6 +287,15 @@ static int usb_write(void *hw, uint64_t lba, uint32_t count, const void *buf) {
     }
     usb_xfer_unlock();
     return 0;
+}
+
+int hype_blk_usb_sync(hype_blk_usb_t *u) {
+    int rc;
+    if (u == (hype_blk_usb_t *)0) return -1;
+    if (usb_xfer_lock_or_fail() != 0) return -1;
+    rc = hype_xhci_msc_sync_cache(u->ctrl, u->slot, &u->msc);
+    usb_xfer_unlock();
+    return rc;
 }
 
 void hype_blk_usb_init(hype_blk_usb_t *hw, hype_blk_phys_t *p, hype_blk_backend_t *be,

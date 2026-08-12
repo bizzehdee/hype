@@ -46,6 +46,9 @@ static void test_csw(void) {
     csw[12] = 0;                                                /* passed */
     CHECK_HEX("csw ok", 1, hype_usb_bot_csw_ok(csw, 0x87654321u));
     CHECK_HEX("csw wrong tag", 0, hype_usb_bot_csw_ok(csw, 0x11111111u));
+    csw[8] = 1; /* one byte not transferred */
+    CHECK_HEX("csw nonzero residue", 0, hype_usb_bot_csw_ok(csw, 0x87654321u));
+    csw[8] = 0;
     csw[12] = 1; /* failed */
     CHECK_HEX("csw failed status", 0, hype_usb_bot_csw_ok(csw, 0x87654321u));
     csw[12] = 0; csw[0] = 0x00; /* bad signature */
@@ -69,6 +72,16 @@ static void test_cdbs(void) {
     hype_scsi_cdb_write10(c, 0x10, 1);
     CHECK_HEX("write10 opcode", 0x2Au, c[0]);
     CHECK_HEX("write10 lba lo", 0x10u, c[5]);
+
+    {
+        unsigned int n;
+        for (n = 0; n < sizeof c; n++) c[n] = 0xA5u;
+        hype_scsi_cdb_synchronize_cache10(c);
+        CHECK_HEX("sync-cache10 opcode", 0x35u, c[0]);
+        for (n = 1; n < sizeof c; n++) {
+            CHECK_HEX("sync-cache10 whole-device fields zero", 0u, c[n]);
+        }
+    }
 
     {
         uint8_t iq[6];

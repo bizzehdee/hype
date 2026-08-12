@@ -33,6 +33,10 @@ void hype_blk_usb_init(hype_blk_usb_t *hw, hype_blk_phys_t *p, hype_blk_backend_
                        const hype_xhci_msc_eps_t *msc, unsigned int block_size,
                        uint64_t total_sectors);
 
+/* Complete all preceding writes on the USB mass-storage medium. Serialised by
+ * the same controller lock as READ(10)/WRITE(10). */
+int hype_blk_usb_sync(hype_blk_usb_t *hw);
+
 /*
  * #362: USB transfer-lock contention counters. `max_spin_apic` names the core that waited longest,
  * which is what distinguishes "the BSP is being starved" from "everyone waits a bit".
@@ -56,8 +60,8 @@ void hype_blk_usb_xfer_stats(unsigned long long *tsc, unsigned long long *calls,
  */
 void hype_blk_usb_set_bsp_apic(unsigned int apic_id);
 
-/* How many times the BSP gave up waiting. Non-zero means a guest core held the controller longer
- * than the budget -- the condition that used to hang the console silently. */
+/* How many times the BSP gave up waiting. The BSP does not enter the ticket
+ * queue until the lock is idle, so giving up cannot leave or skip a ticket. */
 unsigned long long hype_blk_usb_bsp_lock_timeouts(void);
 
 /*

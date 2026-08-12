@@ -30,6 +30,7 @@ void hype_usb_bot_cbw(uint8_t cbw[31], uint32_t tag, uint32_t data_len, int dir_
 int hype_usb_bot_csw_ok(const uint8_t csw[13], uint32_t expect_tag) {
     return rd_le32(csw + 0) == HYPE_USB_CSW_SIGNATURE &&
            rd_le32(csw + 4) == expect_tag &&
+           rd_le32(csw + 8) == 0u && /* dCSWDataResidue: exact BOT stages only */
            csw[12] == 0u; /* bCSWStatus: 0 = command passed */
 }
 
@@ -55,6 +56,12 @@ void hype_scsi_cdb_write10(uint8_t cdb[10], uint32_t lba, uint16_t blocks) {
     put_be32(cdb + 2, lba);
     cdb[7] = (uint8_t)(blocks >> 8);
     cdb[8] = (uint8_t)blocks;
+}
+
+void hype_scsi_cdb_synchronize_cache10(uint8_t cdb[10]) {
+    unsigned int i;
+    for (i = 0; i < 10u; i++) cdb[i] = 0;
+    cdb[0] = 0x35u; /* SYNCHRONIZE CACHE(10) */
 }
 
 void hype_scsi_cdb_inquiry(uint8_t cdb[6], uint8_t alloc_len) {

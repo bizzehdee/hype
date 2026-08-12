@@ -31,6 +31,8 @@ int hype_usb_bot_csw_ok(const uint8_t csw[13], uint32_t expect_tag);
 void hype_scsi_cdb_read_capacity10(uint8_t cdb[10]);
 void hype_scsi_cdb_read10(uint8_t cdb[10], uint32_t lba, uint16_t blocks);
 void hype_scsi_cdb_write10(uint8_t cdb[10], uint32_t lba, uint16_t blocks);
+/* SYNCHRONIZE CACHE(10), whole logical unit: all range fields zero. */
+void hype_scsi_cdb_synchronize_cache10(uint8_t cdb[10]);
 void hype_scsi_cdb_inquiry(uint8_t cdb[6], uint8_t alloc_len);
 
 /* Parses an 8-byte READ CAPACITY(10) response (big-endian): the LAST LBA and

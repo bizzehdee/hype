@@ -511,6 +511,9 @@ int hype_xhci_msc_read(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
                        uint32_t lba, unsigned int blocks, unsigned int block_size, void *buf);
 int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                         uint32_t lba, unsigned int blocks, unsigned int block_size, const void *buf);
+/* Ask the mass-storage device to make preceding writes durable. */
+int hype_xhci_msc_sync_cache(hype_xhci_ctrl_t *c, unsigned int slot,
+                             const hype_xhci_msc_eps_t *msc);
 
 /*
  * #266 defect 1: a parking table for transfer completions that arrive for an endpoint
@@ -542,6 +545,7 @@ typedef struct {
     uint32_t dci;
     uint64_t trb;
     uint32_t cc;
+    uint32_t residue;
     int used;
 } hype_xhci_parked_evt_t;
 
@@ -554,15 +558,19 @@ void hype_xhci_parked_reset(hype_xhci_parked_t *p);
 
 /* Remember a completion that is not the one currently awaited. */
 void hype_xhci_parked_put(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, uint64_t trb,
-                          uint32_t cc);
+                          uint32_t cc, uint32_t residue);
 
 /*
  * Claim a previously parked completion for exactly this (slot, dci, trb). Returns 1 and
- * writes *out_cc when found, and REMOVES it so a single event cannot satisfy two waits.
- * Returns 0 otherwise.
+ * writes the completion code and transfer residue when their output pointers are non-null.
+ * The claim REMOVES the event so one event cannot satisfy two waits. Returns 0 otherwise.
  */
 int hype_xhci_parked_take(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, uint64_t trb,
-                          uint32_t *out_cc);
+                          uint32_t *out_cc, uint32_t *out_residue);
+
+/* Drop a completion before reusing its transfer-ring TRB address. */
+int hype_xhci_parked_drop_exact(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci,
+                                uint64_t trb);
 
 /*
  * Drop every parked event for a slot. Called after a reset/recovery: the transfer rings
@@ -571,6 +579,9 @@ int hype_xhci_parked_take(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, ui
  * transfer. That is precisely the mis-attribution strictness exists to prevent.
  */
 void hype_xhci_parked_drop_slot(hype_xhci_parked_t *p, uint32_t slot);
+
+/* Fixed-length BOT stages must transfer every requested byte. */
+int hype_xhci_xfer_exact_ok(uint32_t cc, uint32_t residue);
 
 
 /* --- USB-7 (#241): device inventory across all controllers/ports --- */

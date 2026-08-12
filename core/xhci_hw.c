@@ -772,11 +772,13 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
     }
     my_trb = hw->iin_pending_trb;
 
-    /* #266: a completion for this transfer may already be parked from a previous
-     * pass -- claim it before spinning, same reasoning as the bulk path. */
+    /* #266: a completion for this armed transfer may already be parked from a previous
+     * poll -- claim it before spinning. */
     {
         uint32_t parked_cc = 0;
-        if (hype_xhci_parked_take(&hw->parked, slot, dci, my_trb, &parked_cc)) {
+        uint32_t parked_residue = 0;
+        if (hype_xhci_parked_take(&hw->parked, slot, dci, my_trb, &parked_cc,
+                                  &parked_residue)) {
             hw->iin_armed = 0; /* consumed -- next poll re-arms */
             if (parked_cc != HYPE_XHCI_CC_SUCCESS && parked_cc != HYPE_XHCI_CC_SHORT_PACKET) {
                 return -1;
@@ -793,7 +795,8 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
          * #266 bug, and the MSC datapath may be waiting for exactly this. */
         (void)hype_xhci_parked_put(&hw->parked, hype_xhci_event_slot_id(evt),
                                    hype_xhci_event_ep_id(evt),
-                                   hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt));
+                                   hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt),
+                                   hype_xhci_event_xfer_residue(evt));
         return 0;
     }
     hw->iin_armed = 0; /* our completion arrived -- re-arm on the next poll */
@@ -812,22 +815,42 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
     uint32_t t[4], evt[4];
     unsigned int guard = 64u;
     uint64_t my_trb = phys(ring) + (uint64_t)(*enq) * HYPE_XHCI_TRB_BYTES;
+    static unsigned int stale_reported = 0;
+    static unsigned int short_reported = 0;
+
+    /*
+     * Transfer rings reuse a physical TRB address every 15 submissions. A parked
+     * completion has no generation field, so an entry left from the previous use of
+     * this address must not be allowed to complete the new transfer.
+     */
+    if (hype_xhci_parked_drop_exact(&hw->parked, slot, dci, my_trb)) {
+        if (stale_reported++ < 16u) {
+            hype_debug_print("host-xhci: #377 dropped stale parked completion before "
+                             "TRB reuse (slot=%u ep=%u trb=0x%llx)\n",
+                             slot, dci, (unsigned long long)my_trb);
+        }
+    }
 
     hype_xhci_trb_normal(t, buf_phys, len, (int)(*cyc));
     ring_enqueue(ring, enq, cyc, t);
     wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
     /*
-     * #266: a completion for THIS transfer may already have been parked while another
-     * endpoint was being waited on. Claim it before spinning -- otherwise we would burn
-     * the whole budget waiting for an event that has already been delivered, which is
-     * the same stall by a different route.
+     * #266: after the stale-entry purge above, only a completion parked after this
+     * submission can match. Claim it before spinning. Otherwise the transfer would burn
+     * the whole budget waiting for an event that another poll already consumed.
      */
     {
         uint32_t parked_cc = 0;
-        if (hype_xhci_parked_take(&hw->parked, slot, dci, my_trb, &parked_cc)) {
-            return (parked_cc == HYPE_XHCI_CC_SUCCESS || parked_cc == HYPE_XHCI_CC_SHORT_PACKET)
-                       ? 0
-                       : -1;
+        uint32_t parked_residue = 0;
+        if (hype_xhci_parked_take(&hw->parked, slot, dci, my_trb, &parked_cc,
+                                  &parked_residue)) {
+            if (!hype_xhci_xfer_exact_ok(parked_cc, parked_residue) && short_reported++ < 16u) {
+                hype_debug_print("host-xhci: #377 rejected incomplete parked transfer "
+                                 "(slot=%u ep=%u trb=0x%llx cc=%u residue=%u len=%u)\n",
+                                 slot, dci, (unsigned long long)my_trb, parked_cc,
+                                 parked_residue, len);
+            }
+            return hype_xhci_xfer_exact_ok(parked_cc, parked_residue) ? 0 : -1;
         }
     }
     while (guard-- != 0u) {
@@ -881,7 +904,13 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
             if (hype_xhci_event_slot_id(evt) == slot && hype_xhci_event_ep_id(evt) == dci &&
                 hype_xhci_event_trb_ptr(evt) == my_trb) {
                 unsigned int cc = hype_xhci_event_cc(evt);
-                return (cc == HYPE_XHCI_CC_SUCCESS || cc == HYPE_XHCI_CC_SHORT_PACKET) ? 0 : -1;
+                unsigned int residue = hype_xhci_event_xfer_residue(evt);
+                if (!hype_xhci_xfer_exact_ok(cc, residue) && short_reported++ < 16u) {
+                    hype_debug_print("host-xhci: #377 rejected incomplete transfer "
+                                     "(slot=%u ep=%u trb=0x%llx cc=%u residue=%u len=%u)\n",
+                                     slot, dci, (unsigned long long)my_trb, cc, residue, len);
+                }
+                return hype_xhci_xfer_exact_ok(cc, residue) ? 0 : -1;
             }
             {
                 static int s1 = 0;
@@ -900,7 +929,8 @@ static int bulk_xfer(hype_xhci_ctrl_t *c, uint8_t *ring, unsigned int *enq, unsi
                  */
                 hype_xhci_parked_put(&hw->parked, hype_xhci_event_slot_id(evt),
                                      hype_xhci_event_ep_id(evt), hype_xhci_event_trb_ptr(evt),
-                                     hype_xhci_event_cc(evt));
+                                     hype_xhci_event_cc(evt),
+                                     hype_xhci_event_xfer_residue(evt));
                 if (s1++ < 8) {
                     hype_debug_print("host-xhci: #266 parking out-of-order transfer event "
                                      "(slot=%u ep=%u trb=0x%llx cc=%u, wanted slot=%u ep=%u "
@@ -1232,6 +1262,13 @@ int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_
     hype_scsi_cdb_write10(cdb, lba, (uint16_t)blocks);
     /* pass hw->data as the data pointer so bot_scsi's OUT copy is a self-copy. */
     return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)hw->data, len, 0);
+}
+
+int hype_xhci_msc_sync_cache(hype_xhci_ctrl_t *c, unsigned int slot,
+                             const hype_xhci_msc_eps_t *msc) {
+    uint8_t cdb[10];
+    hype_scsi_cdb_synchronize_cache10(cdb);
+    return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)0, 0u, 0);
 }
 
 int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
