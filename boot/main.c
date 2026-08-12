@@ -18788,6 +18788,48 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     dev_queued, guest_read, dev_drop,
                                     __atomic_load_n(&g_vms[vi].host_ps2_irqs,
                                                     __ATOMIC_RELAXED));
+                                /* #92: the two 8042 states a Windows-boot wedge turns on. A pending
+                                 * MOUSE byte forces AUX_DATA into every status read, and OVMF's
+                                 * keyboard driver refuses to read 0x60 while that bit is up -- so
+                                 * mouse=1 here with kbd_fifo>0 is a hard input deadlock, invisible
+                                 * in the per-channel counters. last_cdb/lba name the final media
+                                 * command when streaming stops. */
+                                hype_debug_print(
+                                    "fw-1 PS2STATE vm%u: kbd_fifo=%u kbd_port=%d mouse_pending=%d | "
+                                    "atapi last_cdb=0x%02x cmds=%u [#92]\n",
+                                    vi, g_vms[vi].ps2.out_count,
+                                    g_vms[vi].ps2.keyboard_port_enabled,
+                                    hype_ps2_mouse_has_pending_byte(&g_vms[vi].mouse),
+                                    (unsigned)g_vms[vi].atapi.last_cdb,
+                                    (unsigned)g_vms[vi].atapi.command_count);
+                                /* #92 diag: name the CPUID leaves / MSRs a spinning guest hammers.
+                                 * SVM-only (this rig); the getter reads file-global MRUs. */
+                                if (vi == 0u) {
+                                    uint32_t ck[8], mk[8];
+                                    uint64_t cc[8], mc[8], crip = 0, mrip = 0;
+                                    static char sl[300];
+                                    int so;
+                                    unsigned si;
+                                    hype_svm_vcpu_get_spin_diag(ck, cc, mk, mc, 8u, &crip, &mrip);
+                                    so = hype_snprintf(sl, sizeof(sl), "fw-1 SPIN cpuid(rip=0x%llx):",
+                                                       (unsigned long long)crip);
+                                    for (si = 0; si < 8u; si++) {
+                                        if (cc[si] == 0u) continue;
+                                        so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so,
+                                                            " 0x%x=%llu", ck[si],
+                                                            (unsigned long long)cc[si]);
+                                    }
+                                    hype_debug_print("%s [#92]\n", sl);
+                                    so = hype_snprintf(sl, sizeof(sl), "fw-1 SPIN msr(rip=0x%llx):",
+                                                       (unsigned long long)mrip);
+                                    for (si = 0; si < 8u; si++) {
+                                        if (mc[si] == 0u) continue;
+                                        so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so,
+                                                            " 0x%x=%llu", mk[si],
+                                                            (unsigned long long)mc[si]);
+                                    }
+                                    hype_debug_print("%s [#92]\n", sl);
+                                }
                             }
                         }
                         kbd_prev_entries = e;

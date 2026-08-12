@@ -520,6 +520,11 @@ void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
  * dominated by the periodic timer and the vector under investigation never gets a line. */
 /* #359: per-vCPU -- the global version summed both guests, making its one lead
  * (a requested-vs-injected gap on a single vector) unattributable. */
+/* #92 diag: 8-entry MRU histograms of CPUID leaves + MSR indices the guest hits, with the
+ * last RIP for each kind -- names a spin loop the EXHIST totals can only count. */
+void hype_svm_vcpu_get_spin_diag(uint32_t *cpuid_keys, uint64_t *cpuid_cnts, uint32_t *msr_keys,
+                                 uint64_t *msr_cnts, unsigned n, uint64_t *cpuid_rip,
+                                 uint64_t *msr_rip);
 void hype_svm_vcpu_get_vec_counts(hype_vcpu_ctx_t *ctx, uint8_t vector, uint32_t *out_req,
                                   uint32_t *out_inj);
 

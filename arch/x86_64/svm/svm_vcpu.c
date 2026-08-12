@@ -666,12 +666,65 @@ static inline void real_cpuid(uint32_t eax, uint32_t ecx, hype_cpuid_result_t *o
                       : "a"(eax), "c"(ecx));
 }
 
+/*
+ * #92 diag: WHICH CPUID leaves / MSR indices a spinning guest is hammering, plus the RIP
+ * doing it. An 8-entry key->count MRU per kind, dumped by the 30s diagnostic -- the EXHIST
+ * totals say "cpuid 400/s" but not which leaf, and a Windows-boot wedge is indistinguishable
+ * from a calibration loop without the number. Counters, not a trace (#356's lesson).
+ */
+#define HYPE_SPIN_MRU 8u
+static uint32_t g_spin_cpuid_key[HYPE_SPIN_MRU];
+static uint64_t g_spin_cpuid_cnt[HYPE_SPIN_MRU];
+static uint32_t g_spin_msr_key[HYPE_SPIN_MRU];
+static uint64_t g_spin_msr_cnt[HYPE_SPIN_MRU];
+static uint64_t g_spin_cpuid_rip;
+static uint64_t g_spin_msr_rip;
+
+static void spin_mru_bump(uint32_t *keys, uint64_t *cnts, uint32_t key) {
+    unsigned i, min_i = 0;
+    for (i = 0; i < HYPE_SPIN_MRU; i++) {
+        if (cnts[i] != 0u && keys[i] == key) {
+            cnts[i]++;
+            return;
+        }
+    }
+    for (i = 0; i < HYPE_SPIN_MRU; i++) {
+        if (cnts[i] == 0u) {
+            keys[i] = key;
+            cnts[i] = 1u;
+            return;
+        }
+    }
+    for (i = 1; i < HYPE_SPIN_MRU; i++) {
+        if (cnts[i] < cnts[min_i]) min_i = i;
+    }
+    keys[min_i] = key;
+    cnts[min_i] = 1u;
+}
+
+void hype_svm_vcpu_get_spin_diag(uint32_t *cpuid_keys, uint64_t *cpuid_cnts, uint32_t *msr_keys,
+                                 uint64_t *msr_cnts, unsigned n, uint64_t *cpuid_rip,
+                                 uint64_t *msr_rip) {
+    unsigned i;
+    for (i = 0; i < n && i < HYPE_SPIN_MRU; i++) {
+        cpuid_keys[i] = g_spin_cpuid_key[i];
+        cpuid_cnts[i] = g_spin_cpuid_cnt[i];
+        msr_keys[i] = g_spin_msr_key[i];
+        msr_cnts[i] = g_spin_msr_cnt[i];
+    }
+    if (cpuid_rip != 0) *cpuid_rip = g_spin_cpuid_rip;
+    if (msr_rip != 0) *msr_rip = g_spin_msr_rip;
+}
+
 void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint32_t eax_in = (uint32_t)real->vmcb->save.rax;
     uint32_t ecx_in = (uint32_t)real->gprs[1]; /* RCX */
     hype_cpuid_result_t host_real;
     hype_cpuid_result_t out;
+
+    spin_mru_bump(g_spin_cpuid_key, g_spin_cpuid_cnt, eax_in); /* #92 diag */
+    g_spin_cpuid_rip = real->vmcb->save.rip;
 
     real_cpuid(eax_in, ecx_in, &host_real);
     hype_cpuid_emulate_ex(eax_in, ecx_in, real->hv_enabled, &host_real, &out);
@@ -1454,6 +1507,9 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     int is_write = (real->vmcb->control.exitinfo1 & 0x1ULL) != 0;
     uint32_t msr_number = (uint32_t)real->gprs[1]; /* RCX */
     hype_msr_action_t action;
+
+    spin_mru_bump(g_spin_msr_key, g_spin_msr_cnt, msr_number); /* #92 diag */
+    g_spin_msr_rip = real->vmcb->save.rip;
 
     /*
      * #275: IA32_TSC_AUX. Guest writes used to fall through to the absorb path, so a
