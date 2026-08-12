@@ -1395,6 +1395,48 @@ isn't lost.
       this breeds); runtime VM hotplug (out of scope — the set of VMs is
       fixed at boot from `hype.cfg`, only their power state changes, §6f).
 
+34. **Driver interfaces — decided: a common vtable PER DRIVER TYPE where two
+    or more real implementations share shape, plus one shared host-PCI-device
+    facility (bind + DMA rings + IRQ/poll) grown from the NIC work; storage
+    HBAs migrate onto it opportunistically. No single universal driver
+    interface.** As the host-driver count grows (5 filesystems, 3 storage
+    transports, 5+ NIC families incoming), the question is how much to unify.
+    Decided by what already works:
+    - **Per-type interfaces earn their place with concrete implementations,
+      not in anticipation.** Two are already proven: `hype_fs_ops_t`
+      (`core/fs_ops.h`) behind which FAT32/exFAT/ext/ISO9660/NTFS all sit, and
+      `hype_blk_backend_t` (`core/blk_backend.h`) behind which file/image/
+      qcow2/physical(AHCI/NVMe/USB) all sit — with the single guest-address
+      bounds check (§6j) centralised in the block dispatcher so no backend can
+      forget it. NIC drivers get the same treatment: one NIC vtable that the
+      r8169/igc/e1000e-igb/bnxt/atlantic drivers implement (the NET epic's NIC
+      device model). This is decision #17's "no premature abstraction" applied
+      as a rule: abstract a type when it has ≥2-3 real implementations that
+      genuinely share shape.
+    - **The real shared layer is one level below the type vtables: the
+      host-PCI-device scaffolding both storage HBAs and NICs need** — PCI bind
+      (`core/host_pci.c` already does config space, BARs, bus-master, MSI/
+      MSI-X), DMA descriptor rings + buffer pools, and an interrupt-or-poll
+      model. AHCI, NVMe and xHCI each re-implement this today; the incoming
+      NICs would re-implement it again. Build it ONCE, as the NET epic's
+      DMA-ring and IRQ/poll slices, framed as a general host-PCI-device
+      facility rather than NIC-only.
+    - **Storage HBAs migrate opportunistically, never big-bang.** The working
+      AHCI/NVMe/xHCI drivers are already unified where callers care (block I/O,
+      via `hype_blk_backend_t`); they adopt the shared PCI/DMA/IRQ facility one
+      at a time, only after it is proven on NICs and only where it comes out
+      cleaner. A refactor of working storage drivers purely for symmetry is not
+      a win (decision #17 / the §6j "one place to forget the check" reasoning).
+    - **Rejected: a single universal driver interface** spanning fs + block +
+      net + transport. Filesystems, block backends and packet NICs do not
+      share a callable shape; forcing one vtable over them would be lossy
+      abstraction with a translation layer at every leaf — the opposite of what
+      `hype_fs_ops_t` and `hype_blk_backend_t` achieve by being type-specific.
+    - **Rejected: a second "transport" vtable over AHCI/NVMe/xHCI + NIC.**
+      Storage transports are already unified at the block layer that matters;
+      a NIC is a packet device, not a block device. They share the PCI/DMA/IRQ
+      scaffolding (the facility above), not a device-level interface.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
