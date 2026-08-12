@@ -85,6 +85,11 @@ uint64_t hype_vmx_cr_with_fixed_bits(uint64_t cr, uint64_t fixed0, uint64_t fixe
  */
 uint32_t hype_vmx_adjust_controls(uint32_t desired, uint64_t capability_msr);
 
+/* Default address size for a string instruction from the guest CS access-rights
+ * field. CS.L selects 64 bits. Otherwise CS.D selects 32 bits, with 16 bits as
+ * the real-mode/16-bit fallback. Pure decision logic used by the VM-exit shim. */
+uint8_t hype_vmx_default_address_size(uint64_t cs_access_rights);
+
 /*
  * #273. VPID for a vCPU pool slot: slot + 1, because VPID 0000H is reserved for
  * VMX root operation and VM entry fails outright if ENABLE_VPID is set with a

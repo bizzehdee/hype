@@ -42,7 +42,9 @@ Smoke-tested standalone in QEMU (reaches BdsDxe's boot manager
 correctly reporting no bootable device with nothing attached) and
 booting `hype.efi` itself all the way through its own existing test
 suite (M2-7's real-mode test guest, M3-5's Linux boot-protocol shim
-test guest, timer bring-up) exactly as `edk2-ovmf` already does. Not
-yet used as *guest*-facing firmware for an actual VM -- that starts at
-M4-3 (emulated flash/varstore) and M4-6 (a real guest OS installer
-boot).
+test guest, timer bring-up) exactly as `edk2-ovmf` already does. hype
+now exposes OVMF's included `QemuRamfbDxe` through a per-VM
+`etc/ramfb` fw_cfg file. OVMF can install GOP and pass its guest-RAM
+framebuffer to the guest kernel. A nested-KVM OpenBSD run confirmed that
+OVMF published a valid 1024x768 surface. Intel and AMD hardware validation
+must still confirm the complete #350 kernel handoff.

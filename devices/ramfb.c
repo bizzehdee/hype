@@ -21,3 +21,24 @@ void hype_ramfb_decode_config(const uint8_t buf[HYPE_RAMFB_CONFIG_SIZE], hype_ra
     out->height = read_be32(buf + 20);
     out->stride = read_be32(buf + 24);
 }
+
+int hype_ramfb_frame_size(const hype_ramfb_config_t *cfg, uint64_t *out_size) {
+    uint64_t visible_row_bytes;
+    uint64_t size;
+
+    if (cfg == 0 || out_size == 0 || cfg->address == 0u || cfg->width == 0u ||
+        cfg->height == 0u || cfg->stride == 0u || cfg->fourcc != HYPE_RAMFB_FORMAT_XRGB8888 ||
+        cfg->flags != 0u) {
+        return -1;
+    }
+    visible_row_bytes = (uint64_t)cfg->width * 4u;
+    if (visible_row_bytes > cfg->stride) {
+        return -1;
+    }
+    size = (uint64_t)cfg->stride * (uint64_t)cfg->height;
+    if (size == 0u) {
+        return -1;
+    }
+    *out_size = size;
+    return 0;
+}

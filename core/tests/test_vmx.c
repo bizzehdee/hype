@@ -92,6 +92,14 @@ static void test_adjust_controls(void) {
     CHECK_HEX("optional bit clear when not desired", 0u, hype_vmx_adjust_controls(0x0u, cap) & 4u);
 }
 
+static void test_default_address_size(void) {
+    CHECK_INT("16-bit CS", 2, hype_vmx_default_address_size(0));
+    CHECK_INT("32-bit CS.D", 4, hype_vmx_default_address_size(1ULL << 14));
+    CHECK_INT("64-bit CS.L", 8, hype_vmx_default_address_size(1ULL << 13));
+    CHECK_INT("CS.L wins over invalid L+D combination", 8,
+              hype_vmx_default_address_size((1ULL << 13) | (1ULL << 14)));
+}
+
 static void test_vpid_for_slot(void) {
     /* VPID 0000H is reserved for VMX root operation, and VM entry fails if
      * ENABLE_VPID is set with a zero VPID -- so slot 0 must NOT map to 0. */
@@ -135,6 +143,7 @@ int main(void) {
     test_cr4_with_vmxe();
     test_cr_with_fixed_bits();
     test_adjust_controls();
+    test_default_address_size();
     test_vpid_for_slot();
     test_vpid_usable();
 

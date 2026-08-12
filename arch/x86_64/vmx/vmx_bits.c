@@ -45,3 +45,13 @@ uint32_t hype_vmx_adjust_controls(uint32_t desired, uint64_t capability_msr) {
 
     return (desired | allowed0) & allowed1;
 }
+
+uint8_t hype_vmx_default_address_size(uint64_t cs_access_rights) {
+    if ((cs_access_rights & (1ULL << 13)) != 0u) { /* CS.L */
+        return 8u;
+    }
+    if ((cs_access_rights & (1ULL << 14)) != 0u) { /* CS.D */
+        return 4u;
+    }
+    return 2u;
+}

@@ -57,4 +57,12 @@ typedef struct {
  */
 void hype_ramfb_decode_config(const uint8_t buf[HYPE_RAMFB_CONFIG_SIZE], hype_ramfb_config_t *out);
 
+/*
+ * Validates the guest-written surface description and returns the mapped byte
+ * length required for all scanlines. Only OVMF's XRGB8888 format and zero flags
+ * are accepted. The stride must contain every visible pixel. Returns 0 on
+ * success and -1 on an absent, unsupported, or overflowing configuration.
+ */
+int hype_ramfb_frame_size(const hype_ramfb_config_t *cfg, uint64_t *out_size);
+
 #endif /* HYPE_DEVICES_RAMFB_H */

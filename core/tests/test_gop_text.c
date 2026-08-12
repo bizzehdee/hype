@@ -292,6 +292,29 @@ static void test_clear_marks_full_frame_dirty(void) {
     CHECK_INT("clear dirties through the last row", FB_H - 1, con.dirty_y_max);
 }
 
+static void test_bulk_dirty_rect_is_clipped(void) {
+    hype_gop_console_t con;
+    reset_fb(&con);
+    hype_gop_mark_dirty_rect(&con, 9u, 100u, 9u, 100u);
+    CHECK_INT("bulk rect marks dirty", 1, con.dirty);
+    CHECK_INT("bulk rect y starts exactly", 9u, con.dirty_y_min);
+    CHECK_INT("bulk rect y clips", FB_H - 1u, con.dirty_y_max);
+    CHECK_INT("second band x starts exactly", 9u, con.band_x0[1]);
+    CHECK_INT("second band x clips", FB_W - 1u, con.band_x1[1]);
+
+    con.dirty = 0;
+    hype_gop_mark_dirty_rect(&con, FB_W, FB_W, 0u, 0u);
+    CHECK_INT("out-of-range x is ignored", 0, con.dirty);
+    hype_gop_mark_dirty_rect(&con, 0u, 0u, FB_H, FB_H);
+    CHECK_INT("out-of-range y is ignored", 0, con.dirty);
+    hype_gop_mark_dirty_rect(&con, 4u, 3u, 0u, 0u);
+    CHECK_INT("inverted x is ignored", 0, con.dirty);
+
+    con.width = 0u;
+    hype_gop_mark_dirty_rect(&con, 0u, 0u, 0u, 0u);
+    CHECK_INT("zero-width console is ignored", 0, con.dirty);
+}
+
 int main(void) {
     test_init();
     test_put_pixel();
@@ -310,6 +333,7 @@ int main(void) {
     test_draw_glyph_marks_its_rows_dirty();
     test_scroll_marks_full_frame_dirty();
     test_clear_marks_full_frame_dirty();
+    test_bulk_dirty_rect_is_clipped();
 
     if (failures == 0) {
         printf("all tests passed\n");

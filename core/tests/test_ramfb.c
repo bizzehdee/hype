@@ -3,6 +3,8 @@
 
 static int failures = 0;
 
+#define CHECK_INT(desc, expected, actual) CHECK_HEX((desc), (expected), (actual))
+
 #define CHECK_HEX(desc, expected, actual) \
     do { \
         if ((unsigned long long)(expected) != (unsigned long long)(actual)) { \
@@ -57,9 +59,41 @@ static void test_decode_all_ones(void) {
     CHECK_HEX("stride", 0xFFFFFFFFu, cfg.stride);
 }
 
+static void test_frame_size_validation(void) {
+    hype_ramfb_config_t cfg = {0x1000u, HYPE_RAMFB_FORMAT_XRGB8888, 0u, 800u, 600u, 3200u};
+    uint64_t size = 0;
+
+    CHECK_INT("valid frame", 0, hype_ramfb_frame_size(&cfg, &size));
+    CHECK_HEX("valid frame size", 1920000u, size);
+    cfg.stride = 3199u;
+    CHECK_INT("short stride rejected", -1, hype_ramfb_frame_size(&cfg, &size));
+    cfg.stride = 3200u;
+    cfg.fourcc = 0u;
+    CHECK_INT("unsupported format rejected", -1, hype_ramfb_frame_size(&cfg, &size));
+    cfg.fourcc = HYPE_RAMFB_FORMAT_XRGB8888;
+    cfg.flags = 1u;
+    CHECK_INT("flags rejected", -1, hype_ramfb_frame_size(&cfg, &size));
+    cfg.flags = 0u;
+    cfg.address = 0u;
+    CHECK_INT("absent address rejected", -1, hype_ramfb_frame_size(&cfg, &size));
+    cfg.address = 0x1000u;
+    cfg.width = 0u;
+    CHECK_INT("zero width rejected", -1, hype_ramfb_frame_size(&cfg, &size));
+    cfg.width = 800u;
+    cfg.height = 0u;
+    CHECK_INT("zero height rejected", -1, hype_ramfb_frame_size(&cfg, &size));
+    cfg.height = 600u;
+    cfg.stride = 0u;
+    CHECK_INT("zero stride rejected", -1, hype_ramfb_frame_size(&cfg, &size));
+    cfg.stride = 3200u;
+    CHECK_INT("null config rejected", -1, hype_ramfb_frame_size(0, &size));
+    CHECK_INT("null size output rejected", -1, hype_ramfb_frame_size(&cfg, 0));
+}
+
 int main(void) {
     test_decode_known_config();
     test_decode_all_ones();
+    test_frame_size_validation();
 
     if (failures == 0) {
         printf("all tests passed\n");

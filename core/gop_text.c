@@ -38,8 +38,14 @@ void hype_gop_console_init(hype_gop_console_t *con, void *fb, unsigned int width
 
 /* RT-1c: extend the accumulated dirty pixel-row range to include [y0, y1].
  * #351: and the per-band x extents, which is what the flush actually copies. */
-static void mark_dirty_rect(hype_gop_console_t *con, unsigned int x0, unsigned int x1,
-                            unsigned int y0, unsigned int y1) {
+void hype_gop_mark_dirty_rect(hype_gop_console_t *con, unsigned int x0, unsigned int x1,
+                              unsigned int y0, unsigned int y1) {
+    if (con->width == 0u || con->height == 0u || x0 >= con->width || y0 >= con->height) {
+        return;
+    }
+    if (x1 >= con->width) x1 = con->width - 1u;
+    if (y1 >= con->height) y1 = con->height - 1u;
+    if (x0 > x1 || y0 > y1) return;
     if (!con->dirty) {
         con->dirty_y_min = y0;
         con->dirty_y_max = y1;
@@ -78,7 +84,7 @@ static void mark_dirty_rect(hype_gop_console_t *con, unsigned int x0, unsigned i
 
 /* Full-width variant, for the paths that rewrite whole rows (scroll, clear). */
 static void mark_dirty(hype_gop_console_t *con, unsigned int y0, unsigned int y1) {
-    mark_dirty_rect(con, 0, (con->width > 0) ? con->width - 1u : 0u, y0, y1);
+    hype_gop_mark_dirty_rect(con, 0, (con->width > 0) ? con->width - 1u : 0u, y0, y1);
 }
 
 void hype_gop_put_pixel(hype_gop_console_t *con, unsigned int x, unsigned int y, unsigned int color) {
@@ -86,7 +92,7 @@ void hype_gop_put_pixel(hype_gop_console_t *con, unsigned int x, unsigned int y,
         return;
     }
     con->fb[pixel_index(con, x, y)] = color;
-    mark_dirty_rect(con, x, x, y, y); /* the single pixel this touched */
+    hype_gop_mark_dirty_rect(con, x, x, y, y); /* the single pixel this touched */
 }
 
 void hype_gop_draw_glyph(hype_gop_console_t *con, unsigned int col, unsigned int row, unsigned char c) {

@@ -68,6 +68,12 @@ void hype_gop_console_init(hype_gop_console_t *con, void *fb, unsigned int width
  * as clamped/rejected-not-crashed elsewhere in this codebase). */
 void hype_gop_put_pixel(hype_gop_console_t *con, unsigned int x, unsigned int y, unsigned int color);
 
+/* Marks an already-written pixel rectangle for the next GOP flush. The
+ * rectangle is clipped to the console. This is used by bulk renderers that
+ * write the shadow framebuffer directly instead of calling put_pixel(). */
+void hype_gop_mark_dirty_rect(hype_gop_console_t *con, unsigned int x0, unsigned int x1,
+                              unsigned int y0, unsigned int y1);
+
 /* Draws one 8x8 glyph at the given *cell* (not pixel) coordinates.
  * Characters >= 128 (outside hype_font8x8_basic's range) draw as blank. */
 void hype_gop_draw_glyph(hype_gop_console_t *con, unsigned int col, unsigned int row, unsigned char c);

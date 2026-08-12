@@ -78,6 +78,7 @@ static int g_vmx_ack_intr_on_exit = 0;
  * needs it too -- either of CR0.PG and EFER.LME changing can flip long mode. */
 static void vmx_sync_long_mode(void);
 static void vmx_make_fs_gs_usable(void);
+static void vmx_decode_ioio(hype_vmm_ioio_t *out);
 /* #251: defined beside hype_vmx_vcpu_set_pvclock(), which owns the scale globals
  * they read; the MSR handler above needs them. */
 static void vmx_pvclock_arm_system_time(struct hype_vcpu_ctx *real, uint64_t msr_value);
@@ -2116,12 +2117,18 @@ static uint64_t vmx_dma_xlate(const hype_gpa_map_t *map, uint64_t gpa, uint64_t 
  * byte; 0x514 latches the DMA address high dword; 0x518 latches the low dword,
  * reads the 16-byte DMA access struct from guest RAM, executes the transfer
  * against guest RAM, and writes the big-endian result back into the struct's
- * control field. Reuses the vendor-neutral hype_fw_cfg_dma_* helpers. String
- * INS/OUTS to fw_cfg is rejected (not needed by these tests).
+ * control field. Reuses the vendor-neutral hype_fw_cfg_dma_* helpers.
+ *
+ * #350: OVMF does not start with DMA. QemuFwCfgInitialize() probes the classic
+ * data port with `rep insb` before it trusts the DMA feature bit. Rejecting
+ * string I/O here made that probe read as an unhandled port on VMX, so every
+ * fw_cfg consumer -- including QemuRamfbDxe -- concluded that fw_cfg was
+ * absent. The SVM backend already handles this exact transfer shape.
  */
 int hype_vmx_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
                                      const hype_gpa_map_t *dma_map) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_vmm_ioio_t io;
     int ok;
     uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
     uint16_t port = (uint16_t)((qual >> 16) & 0xFFFFu);
@@ -2130,7 +2137,45 @@ int hype_vmx_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
     uint64_t rax = real->gprs[0];
 
     if (is_string) {
-        return -1;
+        hype_svm_string_io_plan_t plan;
+        uint64_t es_base;
+        uint64_t rflags;
+        uint64_t host;
+        uint64_t u;
+
+        /* fw_cfg has no classic-port write path. Fail closed for every string
+         * form except INS from its byte-stream data port. */
+        if (port != 0x511u || !is_in) {
+            return -1;
+        }
+        vmx_decode_ioio(&io);
+        es_base = vmread(HYPE_VMCS_GUEST_ES_BASE, &ok);
+        rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
+        if (hype_svm_build_string_io_plan(&io, real->gprs[7] /* RDI */,
+                                          real->gprs[1] /* RCX */, es_base, rflags,
+                                          &plan) != 0) {
+            return -1;
+        }
+        if (plan.byte_count != 0u) {
+            host = vmx_dma_xlate(dma_map, plan.low_gpa, plan.byte_count);
+            if (host == 0u) {
+                return -1;
+            }
+            for (u = 0; u < plan.count; u++) {
+                uint64_t address = plan.descending
+                                       ? plan.start_gpa - u * (uint64_t)plan.unit_bytes
+                                       : plan.start_gpa + u * (uint64_t)plan.unit_bytes;
+                uint64_t offset = address - plan.low_gpa;
+                uint8_t b;
+                for (b = 0; b < plan.unit_bytes; b++) {
+                    ((uint8_t *)(uintptr_t)host)[offset + b] = hype_fw_cfg_read_byte(fw);
+                }
+            }
+        }
+        real->gprs[7] = plan.new_index_reg;
+        real->gprs[1] = plan.new_count_reg;
+        vmx_advance_rip();
+        return 0;
     }
 
     if (port == 0x510u) {
@@ -2822,8 +2867,9 @@ void hype_vmx_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_vmm_npf_t *out) {
  *
  * Note VMX reports the *operand* size here but not the address size, which SVM
  * does carry (ADDR16/32/64 in EXITINFO1). For string I/O the address size is
- * needed to index (E/R)SI/(E/R)DI, so derive it from the guest's current mode
- * rather than guessing: 64-bit if EFER.LMA, else 32 if CS.D, else 16.
+ * needed to index (E/R)SI/(E/R)DI, so derive the default from CS: 64-bit when
+ * CS.L is set, otherwise 32-bit when CS.D is set, otherwise 16-bit. EFER.LMA
+ * alone is insufficient because it remains set in compatibility mode.
  */
 static void vmx_decode_ioio(hype_vmm_ioio_t *out) {
     int ok;
@@ -2835,15 +2881,8 @@ static void vmx_decode_ioio(hype_vmm_ioio_t *out) {
     out->is_rep = (int)((qual >> 5) & 1u);
     out->size_bytes = (uint8_t)(sz == 0u ? 1u : (sz == 1u ? 2u : 4u));
     {
-        uint64_t efer = vmread(HYPE_VMCS_GUEST_IA32_EFER, &ok);
         uint64_t cs_ar = vmread(HYPE_VMCS_GUEST_CS_AR_BYTES, &ok);
-        if ((efer & (1ULL << 10)) != 0) { /* EFER.LMA: 64-bit mode */
-            out->addr_size_bytes = 8u;
-        } else if ((cs_ar & (1ULL << 14)) != 0) { /* CS.D */
-            out->addr_size_bytes = 4u;
-        } else {
-            out->addr_size_bytes = 2u;
-        }
+        out->addr_size_bytes = hype_vmx_default_address_size(cs_ar);
     }
 }
 
