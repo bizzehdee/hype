@@ -93,6 +93,8 @@ static void zero_result(hype_cpuid_result_t *out) {
 #define HV_PRIV_REF_COUNTER (1u << 1) /* HV_X64_MSR_TIME_REF_COUNT readable */
 #define HV_PRIV_HYPERCALL_MSRS (1u << 5) /* GUEST_OS_ID + HYPERCALL MSRs */
 #define HV_PRIV_VP_INDEX (1u << 6) /* HV_X64_MSR_VP_INDEX readable */
+#define HV_PRIV_ACCESS_FREQUENCY_MSRS (1u << 11) /* TSC/APIC frequency MSRs readable (#436) */
+#define HV_PRIV_ACCESS_REFERENCE_TSC (1u << 9)    /* HV_X64_MSR_REFERENCE_TSC page (#436) */
 
 uint32_t hype_cpuid_kvm_base(int hv_enabled) {
     /* When Hyper-V holds 0x40000000, KVM moves up a block -- the same relocation QEMU
@@ -128,7 +130,8 @@ int hype_cpuid_hv_leaf(uint32_t leaf, uint32_t vp_index, hype_cpuid_result_t *ou
             out->edx = 0u;                 /* service branch/number */
             return 1;
         case 0x40000003u:
-            out->eax = HV_PRIV_REF_COUNTER | HV_PRIV_HYPERCALL_MSRS | HV_PRIV_VP_INDEX;
+            out->eax = HV_PRIV_REF_COUNTER | HV_PRIV_HYPERCALL_MSRS | HV_PRIV_VP_INDEX |
+                       HV_PRIV_ACCESS_FREQUENCY_MSRS | HV_PRIV_ACCESS_REFERENCE_TSC;
             out->ebx = 0u;                 /* privilege mask high -- nothing granted */
             out->ecx = 0u;
             out->edx = 0u;                 /* no misc features */

@@ -41,6 +41,15 @@ hype_msr_action_t hype_msr_decide_ex(uint32_t msr_number, int is_write, int hv_e
         if (msr_number == HYPE_MSR_NUMBER_HV_VP_INDEX) {
             return is_write ? HYPE_MSR_ACTION_REJECT : HYPE_MSR_ACTION_READ_HV_VP_INDEX;
         }
+        if (msr_number == HYPE_MSR_NUMBER_HV_REFERENCE_TSC) {
+            return HYPE_MSR_ACTION_READWRITE_HV_REFERENCE_TSC;
+        }
+        if (msr_number == HYPE_MSR_NUMBER_HV_TSC_FREQUENCY) {
+            return is_write ? HYPE_MSR_ACTION_REJECT : HYPE_MSR_ACTION_READ_HV_TSC_FREQUENCY;
+        }
+        if (msr_number == HYPE_MSR_NUMBER_HV_APIC_FREQUENCY) {
+            return is_write ? HYPE_MSR_ACTION_REJECT : HYPE_MSR_ACTION_READ_HV_APIC_FREQUENCY;
+        }
         if (msr_number == HYPE_MSR_NUMBER_HV_TIME_REF_COUNT) {
             return is_write ? HYPE_MSR_ACTION_REJECT
                             : HYPE_MSR_ACTION_READ_HV_TIME_REF_COUNT;

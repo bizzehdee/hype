@@ -59,3 +59,47 @@ uint64_t hype_hv_hypercall_dispatch(uint64_t input_value) {
     (void)call_code;
     return HYPE_HV_STATUS_INVALID_HYPERCALL_CODE;
 }
+
+int hype_hv_reference_tsc_write(uint64_t requested_value, const hype_gpa_map_t *map,
+                                uint64_t tsc_hz, uint64_t *out_value) {
+    if ((requested_value & HYPE_HV_REF_TSC_ENABLE) == 0u || tsc_hz == 0u) {
+        *out_value = requested_value & ~HYPE_HV_REF_TSC_ENABLE;
+        return 0;
+    }
+    {
+        uint64_t gpa = requested_value & HYPE_HV_REF_TSC_GPA_MASK;
+        uint8_t *host = (uint8_t *)(uintptr_t)hype_gpa_to_host(map, gpa, 4096u);
+        uint64_t q1, r1, scale;
+        unsigned i;
+        if (host == 0) {
+            return -1;
+        }
+        /*
+         * TscScale = floor(2^64 * 10^7 / tsc_hz), without 128-bit division
+         * (freestanding: no __udivti3). 2^64 = q1*hz + r1 with r1 in [1, hz]:
+         * derive from UINT64_MAX = 2^64 - 1.
+         */
+        q1 = 0xFFFFFFFFFFFFFFFFull / tsc_hz;
+        r1 = (0xFFFFFFFFFFFFFFFFull % tsc_hz) + 1u;
+        if (r1 == tsc_hz) {
+            q1 += 1u;
+            r1 = 0u;
+        }
+        scale = q1 * 10000000ull + (r1 * 10000000ull) / tsc_hz;
+        /* Zero the page, then scale/offset, then a valid sequence LAST so a
+         * concurrent reader never pairs a live sequence with stale fields.
+         * (Sequence 0 means "invalid, fall back to the reference-count MSR";
+         * any other value is valid under the current TLFS.) */
+        for (i = 0; i < 4096u; i++) {
+            host[i] = 0;
+        }
+        /* TscScale at offset 8, TscOffset at offset 16 (both little-endian). */
+        for (i = 0; i < 8u; i++) {
+            host[8u + i] = (uint8_t)(scale >> (8u * i));
+        }
+        /* TscOffset = 0: the guest TSC is the raw host TSC (tsc_offset=0). */
+        host[0] = 1u; /* TscSequence = 1 */
+        *out_value = requested_value;
+    }
+    return 0;
+}

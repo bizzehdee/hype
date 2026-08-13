@@ -96,6 +96,7 @@ struct hype_vcpu_ctx {
      * no hypercalls through the page (#300). */
     uint64_t hv_guest_os_id;
     uint64_t hv_hypercall;
+    uint64_t hv_ref_tsc; /* #436: HV_X64_MSR_REFERENCE_TSC readback value */
     /* M7-1 (#91): does THIS guest see the Hyper-V hypervisor identity? Per-vCPU, not
      * file-global: VM0 may be Windows while VM1 is Linux, and the two cores take
      * CPUID exits concurrently. */
@@ -337,6 +338,7 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     }
     ctx->hv_guest_os_id = 0;
     ctx->hv_hypercall = 0;
+    ctx->hv_ref_tsc = 0;
     ctx->hv_enabled = 0;
     {
         int i;
@@ -646,6 +648,21 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
             rc = hype_pic_emu_io_write(pic, io.port, pv);
         }
     } else if (io.port >= 0x40u && io.port <= 0x43u) {
+        /* #436 CALTRACE: cdboot's TSC calibration reads a hype timing source and
+         * concludes a wildly wrong frequency (its Stall() deadlines then never
+         * arrive). Trace the first PIT accesses from LOW (Windows) RIPs to see
+         * the exact calibration pattern and the values hype served. */
+        if (real->vmcb->save.rip < 0x80000000ull) {
+            static unsigned cal_n = 0;
+            if (cal_n < 48u) {
+                cal_n++;
+                hype_debug_print("fw-1 #436 CALTRACE pit p=0x%x %s rax=0x%02x rip=0x%llx tsc=0x%llx\n",
+                                 (unsigned)io.port, io.is_in ? "IN" : "OUT",
+                                 (unsigned)(real->vmcb->save.rax & 0xFFu),
+                                 (unsigned long long)real->vmcb->save.rip,
+                                 (unsigned long long)real_rdtsc());
+            }
+        }
         if (io.is_in) {
             uint8_t value = 0;
             rc = hype_pit_emu_io_read(pit, io.port, &value);
@@ -665,6 +682,18 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
                 (real->vmcb->save.rax & ~0xFFULL) | hype_pit_emu_port61_read(pit);
         } else {
             hype_pit_emu_port61_write(pit, (uint8_t)(real->vmcb->save.rax & 0xFFu));
+        }
+        /* #436 CALTRACE: same trace for port 0x61 (ch2 gate/OUT + refresh toggle). */
+        if (real->vmcb->save.rip < 0x80000000ull) {
+            static unsigned cal61_n = 0;
+            if (cal61_n < 48u) {
+                cal61_n++;
+                hype_debug_print("fw-1 #436 CALTRACE p61 %s rax=0x%02x rip=0x%llx tsc=0x%llx\n",
+                                 io.is_in ? "IN" : "OUT",
+                                 (unsigned)(real->vmcb->save.rax & 0xFFu),
+                                 (unsigned long long)real->vmcb->save.rip,
+                                 (unsigned long long)real_rdtsc());
+            }
         }
         rc = 0;
     } else {
@@ -1733,6 +1762,31 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
          * this becomes the vCPU-within-VM index.
          */
         svm_msr_return(real, 0ULL);
+        break;
+    case HYPE_MSR_ACTION_READWRITE_HV_REFERENCE_TSC:
+        if (is_write) {
+            uint64_t requested = (((uint64_t)(uint32_t)real->gprs[2] << 32) |
+                                  (uint64_t)(uint32_t)real->vmcb->save.rax);
+            uint64_t effective;
+            if (hype_hv_reference_tsc_write(requested, real->pvclock_map, g_acpi_pm_tsc_hz,
+                                            &effective) != 0) {
+                return 1; /* enabled page outside the map: caller injects #GP(0) */
+            }
+            real->hv_ref_tsc = effective;
+        } else {
+            svm_msr_return(real, real->hv_ref_tsc);
+        }
+        break;
+    case HYPE_MSR_ACTION_READ_HV_TSC_FREQUENCY:
+        /* #436: the guest's TSC runs at the raw host rate (no intercept, tsc_offset=0),
+         * so report the calibrated host TSC frequency. Windows bootlib uses this
+         * instead of self-calibrating, whose result under hype was wildly wrong. */
+        svm_msr_return(real, g_acpi_pm_tsc_hz);
+        break;
+    case HYPE_MSR_ACTION_READ_HV_APIC_FREQUENCY:
+        /* Report the APIC bus frequency OVMF's LocalApicTimerDxe assumes for this
+         * platform (PcdFSBClock 1 GHz) -- consistent with the firmware's own view. */
+        svm_msr_return(real, 1000000000ull);
         break;
     case HYPE_MSR_ACTION_READ_HV_TIME_REF_COUNT: {
         /*

@@ -45,6 +45,9 @@
 #define HYPE_MSR_NUMBER_HV_HYPERCALL 0x40000001u
 #define HYPE_MSR_NUMBER_HV_VP_INDEX 0x40000002u
 #define HYPE_MSR_NUMBER_HV_TIME_REF_COUNT 0x40000020u
+#define HYPE_MSR_NUMBER_HV_REFERENCE_TSC 0x40000021u
+#define HYPE_MSR_NUMBER_HV_TSC_FREQUENCY 0x40000022u
+#define HYPE_MSR_NUMBER_HV_APIC_FREQUENCY 0x40000023u
 
 typedef enum {
     /* Unknown MSR, or a write to a read-only one -- the caller's job
@@ -98,7 +101,18 @@ typedef enum {
      * from the guest timebase with hype_msr_hv_ref_count_from_tsc(). Read-only
      * because it is a counter, not a settable clock -- a write is a guest bug.
      */
-    HYPE_MSR_ACTION_READ_HV_TIME_REF_COUNT
+    HYPE_MSR_ACTION_READ_HV_TIME_REF_COUNT,
+    /*
+     * #436: read-only frequency MSRs (TLFS AccessFrequencyMsrs). Windows'
+     * bootlib reads HV_X64_MSR_TSC_FREQUENCY instead of calibrating the TSC
+     * itself when the privilege bit is set -- its own calibration against
+     * hype's timing sources produced a wildly wrong frequency, making every
+     * bootlib Stall() near-infinite (cdboot's "press any key" hang, wedge #4).
+     */
+    HYPE_MSR_ACTION_READ_HV_TSC_FREQUENCY,
+    HYPE_MSR_ACTION_READ_HV_APIC_FREQUENCY,
+    /* #436: the reference TSC page -- Windows' primary clock under Hyper-V. */
+    HYPE_MSR_ACTION_READWRITE_HV_REFERENCE_TSC
 } hype_msr_action_t;
 
 /*
