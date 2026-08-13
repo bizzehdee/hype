@@ -163,6 +163,16 @@ _Static_assert(sizeof(hype_acpi_fadt_t) == 276, "FADT must be 276 bytes (ACPI 6.
  * declared, that is an orderly S5 power-off, which hype detects in the IOIO path
  * (boot/main.c) and turns into an S5 lifecycle event. */
 #define HYPE_ACPI_PM1A_CNT_PORT 0x604u
+/* #436: the rest of the classic PM register file hype implements. The event
+ * block is a status/enable pair (no event sources are wired yet, so status
+ * reads 0), and the timer is the 24-bit ACPI PM timer already serviced in the
+ * IOIO path. Describing them in the FADT is what lets a guest find hardware
+ * hype genuinely has -- the same correctness rule as the century field. */
+#define HYPE_ACPI_PM1A_EVT_PORT 0x600u
+#define HYPE_ACPI_PM1A_EVT_LENGTH 4u
+#define HYPE_ACPI_PM1A_CNT_LENGTH 2u
+#define HYPE_ACPI_PM_TMR_PORT 0x608u
+#define HYPE_ACPI_PM_TMR_LENGTH 4u
 #define HYPE_ACPI_PM1_SLP_EN (1u << 13) /* PM1_CNT bit 13: commit the sleep */
 
 /* MADT ("APIC") header -- common SDT header plus the two MADT-specific
@@ -299,6 +309,13 @@ typedef struct {
     uint32_t mcfg_length;
     uint32_t dsdt_offset;
     uint32_t dsdt_length;
+    /* #436: the FACS. Required by ACPI whenever the platform is NOT
+     * hardware-reduced -- which hype's is not: it implements the classic
+     * PM1a event/control blocks and the PM timer below. Unlike every other
+     * table here the FACS has no standard SDT header and therefore no
+     * checksum byte, so the loader emits only pointers to it. */
+    uint32_t facs_offset;
+    uint32_t facs_length;
     uint32_t total_length;
 } hype_acpi_layout_t;
 

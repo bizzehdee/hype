@@ -233,6 +233,9 @@ void hype_svm_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
 int hype_svm_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint16_t *value,
                                       int *slp_en);
 
+/* #436: PM1a event block (status/enable) -- see the definition's comment. */
+int hype_svm_vcpu_handle_pm1_evt_ioio(hype_vcpu_ctx_t *ctx, uint16_t base, uint16_t *enable);
+
 /*
  * M3-5: creates this backend's (same single, static instance as
  * hype_svm_vcpu_create() -- calling one after the other simply

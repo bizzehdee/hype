@@ -94,7 +94,11 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
     uint32_t mcfg_length =
         (uint32_t)sizeof(hype_acpi_mcfg_header_t) + (uint32_t)sizeof(hype_acpi_mcfg_allocation_t);
     uint32_t dsdt_length = (uint32_t)sizeof(hype_acpi_sdt_header_t) + HYPE_DSDT_AML_BODY_LEN;
-    uint32_t total = xsdt_length + fadt_length + madt_length + mcfg_length + dsdt_length;
+    /* #436: FACS -- 64 bytes, and the spec requires 64-byte alignment, so the
+     * worst-case padding is budgeted here and applied when placing it. */
+    uint32_t facs_length = 64u;
+    uint32_t total = xsdt_length + fadt_length + madt_length + mcfg_length + dsdt_length +
+                     facs_length + 63u;
     uint32_t i;
 
     if (cfg->cpu_count == 0 || cfg->cpu_count > HYPE_ACPI_MAX_CPUS) {
@@ -124,7 +128,22 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
     out->mcfg_length = mcfg_length;
     out->dsdt_offset = out->mcfg_offset + mcfg_length;
     out->dsdt_length = dsdt_length;
-    out->total_length = out->dsdt_offset + dsdt_length;
+    out->facs_offset = (out->dsdt_offset + dsdt_length + 63u) & ~63u;
+    out->facs_length = facs_length;
+    out->total_length = out->facs_offset + facs_length;
+
+    /* FACS: signature + length are the only fields a firmware-provided,
+     * never-slept platform must populate. HardwareSignature stays 0 (no
+     * S4 state to compare against), both waking vectors stay 0, and the
+     * global lock is unused -- hype has no SMI to arbitrate with. */
+    {
+        uint8_t *f = buf + out->facs_offset;
+        f[0] = 'F'; f[1] = 'A'; f[2] = 'C'; f[3] = 'S';
+        f[4] = (uint8_t)(facs_length & 0xFFu);
+        f[5] = (uint8_t)((facs_length >> 8) & 0xFFu);
+        f[6] = 0; f[7] = 0;
+        f[32] = 2; /* Version 2 -- matches the FADT revision emitted below */
+    }
 
     /* DSDT: SDT header + the compiled AML body from devices/dsdt.asl
      * (devices/dsdt_aml.h). M4-6b2: the body declares the PCI host bridge
@@ -166,8 +185,28 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
         hype_acpi_fadt_t *fadt = (hype_acpi_fadt_t *)(buf + out->fadt_offset);
         fill_header(&fadt->header, "FACP", out->fadt_length, 6, "HYPEFADT");
         fadt->sci_interrupt = (uint16_t)cfg->sci_interrupt;
-        fadt->flags = HYPE_ACPI_FADT_WBINVD | HYPE_ACPI_FADT_PWR_BUTTON | HYPE_ACPI_FADT_SLP_BUTTON |
-                      HYPE_ACPI_FADT_HW_REDUCED_ACPI;
+        /*
+         * #436: hype is NOT a hardware-reduced platform, and claiming to be
+         * one hid hardware it genuinely implements. HW_REDUCED_ACPI means
+         * "the classic PM register file does not exist" -- yet hype services
+         * PM1a_CNT (0x604) and the 24-bit PM timer (0x608) in its IOIO path,
+         * and the PM1a event block below. An OS that believed the flag never
+         * looked for any of it, and one that validates the platform strictly
+         * cannot reconcile a reduced-hardware FADT that also declares a SCI
+         * and a century register. Describe what is really there instead.
+         */
+        fadt->flags = HYPE_ACPI_FADT_WBINVD | HYPE_ACPI_FADT_PWR_BUTTON | HYPE_ACPI_FADT_SLP_BUTTON;
+        fadt->pm1a_event_block = HYPE_ACPI_PM1A_EVT_PORT;
+        fadt->pm1_event_length = (uint8_t)HYPE_ACPI_PM1A_EVT_LENGTH;
+        fadt->pm1a_control_block = HYPE_ACPI_PM1A_CNT_PORT;
+        fadt->pm1_control_length = (uint8_t)HYPE_ACPI_PM1A_CNT_LENGTH;
+        fadt->pm_timer_block = HYPE_ACPI_PM_TMR_PORT;
+        fadt->pm_timer_length = (uint8_t)HYPE_ACPI_PM_TMR_LENGTH;
+        /* FirmwareCtrl/X_FirmwareCtrl: offsets within this same blob, patched
+         * to absolute addresses by the loader's ADD_POINTER commands -- the
+         * identical convention Dsdt/X_Dsdt below already use. */
+        fadt->facs = out->facs_offset;
+        fadt->x_facs = out->facs_offset;
         /* Dsdt/X_Dsdt: pre-filled with DSDT's offset *within this same
          * blob* (both point at "etc/acpi/tables", the same src_file the
          * loader script's ADD_POINTER command adds its allocated base

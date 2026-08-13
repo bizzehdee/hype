@@ -90,6 +90,16 @@ uint32_t hype_acpi_loader_build_script(hype_acpi_loader_entry_t *entries, const 
                                         HYPE_ACPI_LOADER_FILE_TABLES,
                                         layout->fadt_offset + (uint32_t)offsetof(hype_acpi_fadt_t, x_dsdt), 8);
 
+    /* #436: FADT.FirmwareCtrl (legacy 32-bit) and FADT.X_FirmwareCtrl
+     * (64-bit) -> the FACS, within the same blob. The FACS itself carries no
+     * SDT header, so it takes pointers but no checksum command below. */
+    hype_acpi_loader_build_add_pointer(&entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,
+                                        HYPE_ACPI_LOADER_FILE_TABLES,
+                                        layout->fadt_offset + (uint32_t)offsetof(hype_acpi_fadt_t, facs), 4);
+    hype_acpi_loader_build_add_pointer(&entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,
+                                        HYPE_ACPI_LOADER_FILE_TABLES,
+                                        layout->fadt_offset + (uint32_t)offsetof(hype_acpi_fadt_t, x_facs), 8);
+
     /* One checksum per table in "etc/acpi/tables" -- the Checksum byte
      * is always at offset 9 within any table's own ACPI SDT header
      * (offsetof(hype_acpi_sdt_header_t, checksum)). */

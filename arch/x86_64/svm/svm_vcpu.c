@@ -484,6 +484,33 @@ int hype_svm_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint1
     return 0;
 }
 
+/*
+ * #436: PM1a EVENT block (status @base, enable @base+2). A non-hardware-reduced
+ * ACPI platform has one, and hype's FADT now says so. No event sources are wired
+ * to it, so status reads "nothing pending" and write-1-to-clear is a no-op; the
+ * enable register round-trips what the guest wrote so a read-back matches.
+ * Returns 0 when the access was this block's, -1 otherwise.
+ */
+int hype_svm_vcpu_handle_pm1_evt_ioio(hype_vcpu_ctx_t *ctx, uint16_t base, uint16_t *enable) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+    int is_enable;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+    if (io.port < base || io.port >= (uint16_t)(base + 4u)) {
+        return -1;
+    }
+    is_enable = (io.port >= (uint16_t)(base + 2u));
+    if (io.is_in) {
+        uint16_t v = is_enable ? *enable : 0u;
+        real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFFFULL) | (uint64_t)v;
+    } else if (is_enable) {
+        *enable = (uint16_t)(real->vmcb->save.rax & 0xFFFFu);
+    }
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return 0;
+}
+
 void hype_svm_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
                                   uint64_t npt_root) {
     unsigned i;
@@ -662,6 +689,9 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
          * the exact calibration pattern and the values hype served. */
         if (real->vmcb->save.rip < 0x80000000ull) {
             static unsigned cal_n = 0;
+#ifdef HYPE_QUIET
+            cal_n = 48u;
+#endif
             if (cal_n < 48u) {
                 cal_n++;
                 hype_debug_print("fw-1 #436 CALTRACE pit p=0x%x %s rax=0x%02x rip=0x%llx tsc=0x%llx\n",
@@ -694,6 +724,9 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
         /* #436 CALTRACE: same trace for port 0x61 (ch2 gate/OUT + refresh toggle). */
         if (real->vmcb->save.rip < 0x80000000ull) {
             static unsigned cal61_n = 0;
+#ifdef HYPE_QUIET
+            cal61_n = 48u;
+#endif
             if (cal61_n < 48u) {
                 cal61_n++;
                 hype_debug_print("fw-1 #436 CALTRACE p61 %s rax=0x%02x rip=0x%llx tsc=0x%llx\n",
@@ -1056,6 +1089,9 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
         static unsigned ps2_trace_n = 0;
         /* status-read spam excluded: the 10ms poll fills any cap instantly. */
         int interesting = !(io.is_in && io.port == 0x64u);
+#ifdef HYPE_QUIET
+        interesting = 0;
+#endif
         if (g_ps2_trace || (interesting && ps2_trace_n < 200u)) {
             if (interesting) ps2_trace_n++;
             hype_debug_print("fw-1 ps2| %s 0x%x %s=0x%x rip=0x%llx\n", io.is_in ? "IN " : "OUT",
@@ -2542,6 +2578,27 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
         return -1;
     }
     offset = (uint32_t)(npf.guest_phys_addr - ahci_base_phys);
+
+    {   /* #436: name the register a stalled guest polls. Latched MRU by offset,
+         * printed every 200k accesses -- silent unless something spins. */
+        static uint32_t off_key[8]; static uint64_t off_cnt[8]; static uint64_t tot;
+        unsigned oi, slot = 8u;
+        tot++;
+        for (oi = 0; oi < 8u; oi++) {
+            if (off_cnt[oi] != 0 && off_key[oi] == offset) { slot = oi; break; }
+            if (off_cnt[oi] == 0 && slot == 8u) { slot = oi; off_key[oi] = offset; }
+        }
+        if (slot < 8u) { off_cnt[slot]++; }
+        if ((tot % 200000ull) == 0ull) {
+            hype_debug_print("fw-1 #436 AHCIPOLL tot=%llu: "
+                             "[0]0x%x=%llu [1]0x%x=%llu [2]0x%x=%llu [3]0x%x=%llu\n",
+                             (unsigned long long)tot,
+                             (unsigned)off_key[0], (unsigned long long)off_cnt[0],
+                             (unsigned)off_key[1], (unsigned long long)off_cnt[1],
+                             (unsigned)off_key[2], (unsigned long long)off_cnt[2],
+                             (unsigned)off_key[3], (unsigned long long)off_cnt[3]);
+        }
+    }
 
     /* Faulting-instruction bytes for MMIO decode. A caller that already
      * resolved them (FW-1: decode assists, else a guest page-table walk

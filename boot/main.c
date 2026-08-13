@@ -743,7 +743,8 @@ typedef struct hype_fw_vm {
      * to by the dashboard command layer (TERM-2). volatile: cross-core writes. */
     volatile hype_vm_lifecycle_t lifecycle;
     uint64_t shutdown_deadline_tsc; /* M8-6: force-off if S5 not reached by here */
-    uint16_t pm1a_cnt;              /* M8-6: modeled ACPI PM1a control register (I/O 0x604) */
+    uint16_t pm1a_cnt;
+    uint16_t pm1a_evt_en; /* #436: PM1a event-enable register, round-tripped */              /* M8-6: modeled ACPI PM1a control register (I/O 0x604) */
     /* M8-4: a retained pristine copy of the loaded firmware image (OVMF), so a
      * VM Start can restore fresh firmware -- post-ExitBootServices the ESP file
      * I/O that first loaded it is gone, so it cannot be re-read from disk. */
@@ -7277,6 +7278,57 @@ static uint64_t fw_1_script_now_ms(const hype_fw_vm_t *vm, uint64_t tsc) {
  * winload.efi/bootmgr.efi disassembly offline; (b) 32 code bytes before RIP; (c) the two nodes the
  * loop walks (rdi, rcx). The guest is identity-paged in this region, so a physical read reaches it.
  */
+/* #436: identify the KERNEL-space module a parked RIP belongs to. Walks back
+ * page by page through the guest's own page tables for the PE 'MZ' header, then
+ * reports the base, the offset, and the CodeView PDB path embedded in the image
+ * -- which names the module (bootmgr/winload/ntoskrnl) outright. */
+static void fw_1_436_kmod_probe(hype_fw_vm_t *vm, uint64_t cr3, uint64_t rip) {
+    uint64_t scan = rip & ~0xFFFULL;
+    uint64_t base = 0;
+    unsigned pages;
+    uint8_t hdr[2];
+
+    for (pages = 0; pages < 8192u; pages++) {
+        if (fw_1_read_guest_va(vm, cr3, scan, hdr, 2) && hdr[0] == 'M' && hdr[1] == 'Z') {
+            base = scan;
+            break;
+        }
+        if (scan < 0x1000ULL) { break; }
+        scan -= 0x1000ULL;
+    }
+    if (base == 0) {
+        hype_debug_print("fw-1 #436 KMOD: no MZ within 32MB below rip=0x%llx (cr3=0x%llx)\n",
+                         (unsigned long long)rip, (unsigned long long)cr3);
+        return;
+    }
+    hype_debug_print("fw-1 #436 KMOD: rip=0x%llx base=0x%llx off=0x%llx\n",
+                     (unsigned long long)rip, (unsigned long long)base,
+                     (unsigned long long)(rip - base));
+    /* Scan the image for the CodeView '.pdb' path -- cheap, and it names the
+     * module without parsing the debug directory. */
+    {
+        uint64_t off;
+        uint8_t win[64];
+        for (off = 0; off < 0x400000ULL; off += 48ULL) {
+            unsigned i;
+            if (!fw_1_read_guest_va(vm, cr3, base + off, win, 64)) { continue; }
+            for (i = 0; i + 4u < 64u; i++) {
+                if (win[i] == 'R' && win[i+1] == 'S' && win[i+2] == 'D' && win[i+3] == 'S') {
+                    uint8_t name[64];
+                    unsigned k;
+                    if (fw_1_read_guest_va(vm, cr3, base + off + i + 24u, name, 64)) {
+                        for (k = 0; k < 63u; k++) { if (name[k] == 0) { break; } }
+                        name[k] = 0;
+                        hype_debug_print("fw-1 #436 KMOD PDB: %s\n", (const char *)name);
+                    }
+                    return;
+                }
+            }
+        }
+        hype_debug_print("fw-1 #436 KMOD: no RSDS/PDB record found in 4MB\n");
+    }
+}
+
 static __attribute__((noinline)) void fw_1_436_deep_dump(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx,
                                                          uint64_t prip);
 
@@ -7312,6 +7364,9 @@ static __attribute__((noinline)) void fw_1_436_preempt_dump(hype_fw_vm_t *vm, hy
         pib[8], pib[9], pib[10], pib[11], pib[12], pib[13], pib[14], pib[15]);
     if (!deep_dumped) {
         deep_dumped = 1;
+        if (prip >= 0xFFFF800000000000ULL) {
+            fw_1_436_kmod_probe(vm, pcr3, prip);
+        }
         fw_1_436_deep_dump(vm, ctx, prip);
     }
 }
@@ -13543,6 +13598,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * by the unknown-IOIO handler below) and post an S5 lifecycle event so
              * a guest that ran `poweroff` transitions cleanly to OFF instead of
              * being force-killed by the shutdown grace timer. */
+            if (kind == HYPE_VMM_KIND_SVM &&
+                hype_svm_vcpu_handle_pm1_evt_ioio(ctx, (uint16_t)HYPE_ACPI_PM1A_EVT_PORT,
+                                                  &vm->pm1a_evt_en) == 0) {
+                continue;
+            }
             {
                 int slp_en = 0;
                 int pr = vmm_handle_pm1_cnt_ioio(kind, ctx, (uint16_t)HYPE_ACPI_PM1A_CNT_PORT,
