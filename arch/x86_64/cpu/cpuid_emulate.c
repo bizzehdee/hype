@@ -312,6 +312,39 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
         return;
     }
 
+    if (eax_in == 0xBu) {
+        /*
+         * #436: extended topology enumeration. Leaf 0 advertises a max basic
+         * leaf of 0xD, so this leaf is claimed -- but it was unmodelled and fell
+         * through to the all-zero default, the exact advertise-a-feature-that-
+         * is-not-there mistake the Hyper-V leaf code here already warns about.
+         * A guest enumerating topology then reads "0 logical processors at level
+         * 0", which no consistent interpretation covers.
+         *
+         * hype models exactly one logical processor per guest (leaf 1 clears HTT,
+         * leaf 0x80000008 forces NC=0, the MADT and fw_cfg NB_CPUS both say 1),
+         * so report that same machine here: one thread in the SMT level, one
+         * logical processor in the core level, x2APIC ID 0. ECX[15:8] carries the
+         * level type (1=SMT, 2=Core; 0=invalid terminates enumeration) and
+         * ECX[7:0] echoes the input level, per the SDM's own algorithm.
+         */
+        out->edx = 0u; /* this logical processor's x2APIC ID -- forced to 0 like the LAPIC */
+        if (ecx_in == 0u) {
+            out->eax = 0u;               /* shift to the next level: 1 thread/core */
+            out->ebx = 1u;               /* logical processors at this level */
+            out->ecx = 0u | (1u << 8);   /* level 0, type SMT */
+        } else if (ecx_in == 1u) {
+            out->eax = 0u;               /* one core, so no further shift */
+            out->ebx = 1u;
+            out->ecx = 1u | (2u << 8);   /* level 1, type Core */
+        } else {
+            out->eax = 0u;
+            out->ebx = 0u;               /* 0 processors + type 0 = end of enumeration */
+            out->ecx = ecx_in & 0xFFu;
+        }
+        return;
+    }
+
     if (eax_in == HYPE_CPUID_LEAF_XSAVE) {
         /* XSAVE state enumeration (leaf 0xD, per sub-leaf): host passthrough so the
          * guest can size its XSAVE area and enable XCR0 -- the other half of making
