@@ -1816,8 +1816,16 @@ static volatile uint64_t *g_ap_timer_ticks; /* g_vm_count + 1: BSP slot */
  * permanently pending when one host dispatch takes longer than its period;
  * VMX then exits before the guest executes even one instruction. */
 static uint32_t *g_ap_timer_reload;
+/* #436: AP run-loop section breadcrumb. The AP sets these; the BSP prints them.
+ * Pinpoints WHERE the loop stops when the AP freezes (deterministic ~127k iters). */
+volatile uint8_t g_436_loop_section[HYPE_FW_MAX_VMS];
+volatile uint64_t g_436_loop_iter[HYPE_FW_MAX_VMS];
+volatile uint64_t g_436_last_reason[HYPE_FW_MAX_VMS];
+volatile uint64_t g_436_last_rip[HYPE_FW_MAX_VMS];
+
+volatile uint64_t g_436_ap_host_rip[HYPE_FW_MAX_VMS + 1u];
+
 static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
-    (void)frame;
     {
         uint32_t apic_id =
             (*(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + 0x20u)) >> 24;
@@ -1827,6 +1835,15 @@ static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
         int slot = fw_1_ap_slot_of(apic_id);
         if (slot >= 0) {
             g_ap_timer_ticks[slot + 1]++;
+            /* #436 diagnosis: the interrupted HOST rip -- names the exact hype
+             * instruction the AP is stuck on when the run loop freezes. */
+            g_436_ap_host_rip[slot] = frame->rip;
+            /* #436 diagnosis: re-arm from the ISR so the tick keeps firing even
+             * when the run loop (the normal re-arm site) is frozen. */
+            hype_lapic_arm_timer_oneshot(
+                (volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
+                (uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR,
+                g_ap_timer_reload ? g_ap_timer_reload[slot] : 0u);
         }
     }
     *(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + HYPE_LAPIC_EOI_OFFSET) = 0;
@@ -2175,7 +2192,11 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * reached a stable idle (a login/shell prompt) or genuinely hung -- stop
  * and report either way. Comfortably longer than any single in-boot wait,
  * bounded so a run doesn't burn minutes idling at the end. */
-#define HYPE_FW_1_IDLE_GIVEUP_SECONDS 10ULL
+/* #436: was 10s -- that fired at OVMF's Boot-Manager-menu idle and ended the
+ * run while the operator's keys were still queued, making every interactive
+ * (Windows) boot die at its first quiet prompt. Interactive sessions idle at
+ * prompts for minutes by design; pending host input also resets the clock. */
+#define HYPE_FW_1_IDLE_GIVEUP_SECONDS 300ULL
 /* FW-1f: evidence-based reaction detection for an injected keystroke.
  * "Reacted" = OVMF leaves its idle wait and does at least this many
  * PRODUCTIVE (non-HLT) exits after the key -- entering the Boot Manager
@@ -10585,6 +10606,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * then exited for that tick before FreeBSD could execute its next
              * WBINVD. A fresh one-shot gives the guest a real execution window
              * while preserving the 1 ms bound on uninterrupted execution. */
+            { unsigned _vi=(unsigned)(vm-g_vms); g_436_loop_iter[_vi]++; g_436_loop_section[_vi]=2; }
 #ifndef HYPE_436_NO_PREEMPT
             /* #436 experiment gate: the host preempt tick fires mid-guest-execution
              * (an INTR exit with no guest-visible effect) exactly during CPU-bound
@@ -11626,7 +11648,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* M4-6d2b: any non-HLT exit is the guest doing real work
              * (MMIO, port I/O, NPF, CPUID/MSR ...) -- mark progress so the
              * idle detector only fires after a true quiescent stretch. */
-            if (!vmm_reason_is_hlt(kind, info.reason)) {
+            if (!vmm_reason_is_hlt(kind, info.reason) ||
+                hype_scancode_queue_pending(&vm->host_ps2_queue) != 0u) {
+                /* #436: queued operator input counts as progress -- the guest
+                 * is at an interactive prompt hype still has keys to deliver to. */
                 last_progress_tsc = now_tsc;
             }
             /* M4-6b2 DIAG: non-timer progress -- device port I/O (IOIO) or a
@@ -12372,6 +12397,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * to an injected keystroke. RT-2c: skip on host-tick (INTR) exits --
          * the guest wrote nothing, so draining an empty UART FIFO twice per
          * host tick (~55% of all exits) is pure waste. */
+        g_436_loop_section[(unsigned)(vm-g_vms)]=5;
         if (!vmm_reason_is_intr(kind, info.reason)) {
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line,
                                                      &uart_line_len, FW_1_LINE_BUF,
@@ -12422,6 +12448,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_input_runner_scan(&vm->in_runner, snap, n);
             }
         }
+        g_436_loop_section[(unsigned)(vm-g_vms)]=6;
         fw_1_script_step(vm, (unsigned)(vm - g_vms), &g_fw_1_uart,
                          fw_1_script_now_ms(vm, hype_rdtsc()));
         /*
@@ -12433,12 +12460,39 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         {   /* #436: prove the drain gate runs and what blocks it */
             static uint64_t dr_last; static uint64_t dr_n;
             dr_n++;
+#ifndef HYPE_QUIET
             if (g_fw_1_host_tsc_hz && hype_rdtsc() - dr_last > 5u * g_fw_1_host_tsc_hz) {
                 dr_last = hype_rdtsc();
                 hype_debug_print("fw-1 DRAIN: iters=%llu kbd_pending=%d q_pending=%u [#436]\n",
                                  (unsigned long long)dr_n,
                                  hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2),
                                  hype_scancode_queue_pending(&vm->host_ps2_queue));
+            }
+#endif
+        }
+        g_436_loop_section[(unsigned)(vm-g_vms)]=7;
+        {
+            /* #436: a response byte the guest never reads (e.g. the tail of an
+             * init exchange OVMF abandoned) gated this drain shut for a whole
+             * run -- 63 keys queued, zero delivered. If the SAME byte has
+             * blocked the gate for >1s while operator keys wait, evict it:
+             * real keyboards overwrite their output buffer too. */
+            static uint64_t stale_since_tsc; static int stale_active;
+            if (hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2) &&
+                hype_scancode_queue_pending(&vm->host_ps2_queue) != 0u) {
+                uint64_t now_st = hype_rdtsc();
+                if (!stale_active) { stale_active = 1; stale_since_tsc = now_st; }
+                else if (g_fw_1_host_tsc_hz != 0 &&
+                         now_st - stale_since_tsc > g_fw_1_host_tsc_hz) {
+                    uint8_t discard;
+                    (void)hype_ps2_kbd_io_read(&g_fw_1_ps2, HYPE_PS2_PORT_DATA, &discard);
+                    hype_debug_print("fw-1 KBD-EVICT vm%u: dropped stale unread byte 0x%02x "
+                                     "to unblock key delivery [#436]\n",
+                                     (unsigned)(vm - g_vms), (unsigned)discard);
+                    stale_active = 0;
+                }
+            } else {
+                stale_active = 0;
             }
         }
         if (!hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
@@ -12460,6 +12514,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * the #375 host-input drain shut (#389). IO-APIC first with a PIC fallback, the
          * same shape the SYSRQ injector and every other guest IRQ here use.
          */
+        g_436_loop_section[(unsigned)(vm-g_vms)]=72;
         if (hype_ps2_kbd_take_irq(&g_fw_1_ps2)) {
             uint8_t kiov;
             if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &kiov)) {
@@ -12474,8 +12529,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * push has accumulated in the shadow buffer (and RT-1c's dirty range);
          * this is the ONE framebuffer memcpy that pays the uncached-VRAM cost,
          * instead of one per printed line. */
+        g_436_loop_section[(unsigned)(vm-g_vms)]=73;
         fw_1_publish_and_render(vm, &last_gop_flush_tsc,
                                 perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt);
+        g_436_loop_section[(unsigned)(vm-g_vms)]=74;
 
         /* M4-6d3: flush a buffered partial line that looks like an
          * interactive prompt (ends in ": ", "# ", "$ ", "> ") when the
@@ -12537,6 +12594,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             vmm_reinject_exception(kind, ctx, 6u, 0, 0u); /* #UD pushes no error code */
             continue;
         }
+        g_436_loop_section[(unsigned)(vm-g_vms)]=75;
         if (vmm_reason_is_xsetbv(kind, info.reason)) {
             /* #251: guest enabling XSAVE state. Same fall-through discipline as
              * the CR-access exit -- if the form is not modelled, do NOT continue,
@@ -12548,12 +12606,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                              "-- not resuming blind\n",
                              (unsigned long long)info.guest_rip);
         }
+        { unsigned _vi=(unsigned)(vm-g_vms); g_436_loop_section[_vi]=76;
+          g_436_last_reason[_vi]=info.reason; g_436_last_rip[_vi]=info.guest_rip; }
         if (vmm_reason_is_cr_access(kind, info.reason)) {
             /* #248: guest wrote a CR whose bits the host owns (CR4.VMXE /
              * CR0.NE). Re-apply the required bit and let the guest read back its
              * own value. If the access is one this does not model, fall through
              * WITHOUT continuing -- RIP was not advanced, so silently resuming
              * would re-execute the same instruction forever. */
+            g_436_loop_section[(unsigned)(vm-g_vms)]=761;
             if (vmm_handle_cr_access(kind, ctx)) {
                 continue;
             }
@@ -12573,6 +12634,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             continue;
         }
         if (vmm_reason_is_intr(kind, info.reason)) {
+            g_436_loop_section[(unsigned)(vm-g_vms)]=768;
             /* RT-2b: hype's periodic host timer tick preempted the guest. The
              * pending tick was already taken by hype_timer_isr at the loop's
              * STGI, and the loop-top timebase advance already staged any due
@@ -12679,11 +12741,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             hype_vmx_vcpu_handle_wbinvd();
             continue;
         }
+            g_436_loop_section[(unsigned)(vm-g_vms)]=769;
         if (vmm_reason_is_cpuid(kind, info.reason)) {
             vmm_handle_cpuid(kind, ctx);
             continue;
         }
         if (vmm_reason_is_msr(kind, info.reason)) {
+            g_436_loop_section[(unsigned)(vm-g_vms)]=764;
             int msr_rc = vmm_handle_msr(kind, ctx, info.reason);
             if (msr_rc > 0) {
                 /* Invalid synthetic-MSR input is a guest fault, not a host fault. */
@@ -12699,6 +12763,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             continue;
         }
         if (vmm_reason_is_hypercall(kind, info.reason)) {
+            g_436_loop_section[(unsigned)(vm-g_vms)]=781;
             if (vmm_handle_hypercall(kind, ctx) != 0) {
                 hype_debug_print("fw-1: inactive Hyper-V hypercall instruction at guest_rip=0x%llx\n",
                                  (unsigned long long)info.guest_rip);
@@ -12710,6 +12775,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (vmm_reason_is_intr_window(kind, info.reason)) {
             /* The VINTR window opened -- the guest can now take the
              * pending timer IRQ (INT-2). */
+            g_436_loop_section[(unsigned)(vm-g_vms)]=782;
             vmm_handle_intr_window(kind, ctx);
             continue;
         }
@@ -12777,6 +12843,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
             /* FW-1b: the guest Local APIC at 0xFEE00000 is the expected
              * NPF here (the region is not-present by design). */
+            g_436_loop_section[(unsigned)(vm-g_vms)]=767;
             if (vmm_handle_lapic_npf(kind, ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE, insn) == 0) {
                 continue;
             }
@@ -12790,6 +12857,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* FW-1c: PCI config space via MMCONFIG ECAM at 0xE0000000
              * (OVMF's Q35 PcdPciExpressBaseAddress). Reuses PCI-1's ECAM
              * config model over FW-1's own host bridge + LPC devices. */
+            g_436_loop_section[(unsigned)(vm-g_vms)]=771;
             if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &g_fw_1_pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
                 /* FW-1h: an ECAM config write may have just programmed
                  * BAR5 and set Memory Space Enable on the AHCI function.
@@ -12906,6 +12974,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 vmm_get_last_npf(kind, ctx, &ata_npf);
                 if (ata_npf.guest_phys_addr >= ata_abar &&
                     ata_npf.guest_phys_addr < ata_abar + HYPE_AHCI_MMIO_SIZE) {
+                    g_436_loop_section[(unsigned)(vm-g_vms)]=772;
                     if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ata_ahci,
                                                      &g_fw_1_ata_disk, ata_abar, &g_fw_1_dma_map,
                                                      insn) == 0) {
@@ -12921,6 +12990,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * disk model instead of the ATAPI one. */
                 if (ahci_npf.guest_phys_addr >= ahci_abar &&
                     ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
+                    g_436_loop_section[(unsigned)(vm-g_vms)]=773;
                     if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_ata_disk,
                                                      ahci_abar, &g_fw_1_dma_map, insn) == 0) {
                         continue;
@@ -12983,6 +13053,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      */
                     uint32_t pre_cmd = g_fw_1_ahci.p_cmd, pre_ghc = g_fw_1_ahci.ghc;
                     uint32_t pre_ie = g_fw_1_ahci.p_ie;
+                    g_436_loop_section[(unsigned)(vm-g_vms)]=774;
                     if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
                                                            &g_fw_1_dma_map, insn) == 0) {
                         {
@@ -13224,6 +13295,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                     routed = 1;
                     if (sbus == HYPE_CFG_BUS_AHCI_SATA) {
+                        g_436_loop_section[(unsigned)(vm-g_vms)]=775;
                         if (vmm_handle_ahci_disk_npf_map(kind, ctx, &d->ata_ahci, &d->ata_disk,
                                                          dwin[slot].bar, &g_fw_1_dma_map,
                                                          insn) == 0) {
@@ -13416,6 +13488,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * command writes, which reset the run to 0. */
             {
                 int kbd_wait = 0;
+                g_436_loop_section[(unsigned)(vm-g_vms)]=77;
                 if (vmm_handle_ps2_ioio(kind, ctx, &g_fw_1_ps2, &g_fw_1_mouse, &kbd_wait) == 0) {
                     /* #284: the empty-poll run used to trigger a guessed Enter
                      * injection. A script's `expect` + `sendkey` waits for the actual
@@ -14025,6 +14098,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * previously, wrongly, ran the LAPIC value through PIT_HZ, so
                      * a 50us one-shot deadline became a capped 10ms wait). */
                     uint64_t wait_tsc = 0;
+                    g_436_loop_section[(unsigned)(vm-g_vms)]=78;
                     perf_hlt_if1++; /* PERF-1a */
                     int pit_armed = (g_fw_1_pit.channels[0].counter != 0u);
                     int lapic_armed = (g_fw_1_lapic.init_count != 0u &&
@@ -19063,6 +19137,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             for (vi = 0; vi < g_vm_count; vi++) {
                                 unsigned long long routed = 0, handed = 0, route_drop = 0;
                                 unsigned long long dev_queued = 0, guest_read = 0, dev_drop = 0;
+                                {
+                                    extern volatile uint64_t g_436_ap_host_rip[];
+                                    hype_debug_print("fw-1 APLOOP vm%u: section=%u iter=%llu reason=0x%llx grip=0x%llx HOSTRIP=0x%llx [#436]\n",
+                                                 vi, (unsigned)g_436_loop_section[vi],
+                                                 (unsigned long long)g_436_loop_iter[vi],
+                                                 (unsigned long long)g_436_last_reason[vi],
+                                                 (unsigned long long)g_436_last_rip[vi],
+                                                 (unsigned long long)g_436_ap_host_rip[vi]);
+                                }
                                 hype_scancode_queue_stats(&g_vms[vi].host_ps2_queue,
                                                           &routed, &handed, &route_drop);
                                 hype_ps2_kbd_scancode_stats(&g_vms[vi].ps2,
