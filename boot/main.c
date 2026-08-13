@@ -7309,6 +7309,22 @@ static __attribute__((noinline)) void fw_1_436_deep_dump(hype_fw_vm_t *vm, hype_
     hype_debug_print("fw-1 #436 MODULE: rip=0x%llx base=0x%llx off=0x%llx (scanned %u pages back)\n",
                      (unsigned long long)prip, (unsigned long long)base,
                      (unsigned long long)(base ? prip - base : 0), pages);
+    /*
+     * #436 wedge #4: winload's TSC stall loop (rdtsc; cmp TSC,r9; jl) at ~0x10046b3d should end
+     * once the guest RDTSC reaches r9. Compare hype's OWN TSC to the guest's target r9 (r9) and
+     * start r8. If hype_rdtsc() is FAR past r9 while the guest still spins, the guest's RDTSC is
+     * not tracking (a TSC-desync / offset problem); if hype_rdtsc() < r9, the target is
+     * unreachable (the guest computed it against a wrong frequency).
+     */
+    {
+        uint64_t htsc = hype_rdtsc();
+        uint64_t r8 = hype_svm_vcpu_get_gpr(ctx, 8);
+        uint64_t r9 = hype_svm_vcpu_get_gpr(ctx, 9);
+        hype_debug_print("fw-1 #436 TSCCHK: hype_tsc=0x%llx guest_r8(start)=0x%llx guest_r9(target)="
+                         "0x%llx | hype_tsc %s target [#436]\n",
+                         (unsigned long long)htsc, (unsigned long long)r8, (unsigned long long)r9,
+                         (htsc >= r9) ? ">= (should have exited)" : "< (target unreached)");
+    }
     for (i = 0; i < 32u; i++) cb[i] = 0;
     {
         const uint8_t *chp = fw_1_guest_phys_to_host(vm, prip - 32u);
@@ -19054,6 +19070,28 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                             (unsigned long long)mc[si]);
                                     }
                                     hype_debug_print("%s [#92]\n", sl);
+                                    /* #436: dump the instruction bytes at each spin RIP so the
+                                     * loop can be disassembled. Guest low-memory RIPs (winload/
+                                     * early ntoskrnl) are identity-mapped, so treat RIP as a GPA. */
+                                    {
+                                        uint64_t rips[2]; unsigned ri;
+                                        rips[0] = mrip; rips[1] = crip;
+                                        for (ri = 0; ri < 2u; ri++) {
+                                            uint64_t r = rips[ri];
+                                            const uint8_t *ins;
+                                            if (r == 0u) continue;
+                                            ins = fw_1_guest_phys_to_host(&g_vms[0], r);
+                                            if (ins == 0) continue;
+                                            so = hype_snprintf(sl, sizeof(sl),
+                                                               "fw-1 SPINCODE @0x%llx(phys):",
+                                                               (unsigned long long)r);
+                                            for (si = 0; si < 32u; si++) {
+                                                so += hype_snprintf(sl + so, sizeof(sl) - (unsigned)so,
+                                                                    " %02x", ins[si]);
+                                            }
+                                            hype_debug_print("%s [#92]\n", sl);
+                                        }
+                                    }
                                 }
                             }
                         }
