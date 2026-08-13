@@ -209,6 +209,12 @@ void hype_guest_lapic_advance(hype_guest_lapic_t *lapic, uint64_t ticks);
  */
 int hype_guest_lapic_take_timer_irq(hype_guest_lapic_t *lapic, uint8_t *vector_out);
 
+/* #436: recover a wedged timer in-service latch. One lost guest EOI (an MMIO
+ * write form the decoder missed) permanently gated ALL further timer IRQs off
+ * -- OVMF's periodic events (incl. its keyboard poll) died with it. Returns 1
+ * if it cleared a stuck latch. */
+int hype_guest_lapic_recover_in_service(hype_guest_lapic_t *lapic);
+
 /*
  * GLADDER-6c: if any self-IPI vector is pending (an ICR write with fixed
  * delivery whose destination included this CPU), returns 1, writes the

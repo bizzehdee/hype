@@ -11962,6 +11962,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     lapic_tick_accum += (uint64_t)ticks * HYPE_GUEST_LAPIC_HZ;
                     lapic_ticks = lapic_tick_accum / HYPE_PIT_HZ;
                     lapic_tick_accum -= lapic_ticks * HYPE_PIT_HZ;
+                    { /* #436: measure what actually feeds the guest LAPIC */
+                        static uint64_t lt_sum, lt_last;
+                        lt_sum += lapic_ticks;
+                        uint64_t now_lt = hype_rdtsc();
+                        if (g_fw_1_host_tsc_hz && now_lt - lt_last > 5u * g_fw_1_host_tsc_hz) {
+                            lt_last = now_lt;
+                            hype_debug_print("fw-1 LAPICFEED: sum=%llu (+%llu/5s) [#436]\n",
+                                             (unsigned long long)lt_sum, (unsigned long long)lt_sum);
+                        }
+                    }
                     hype_guest_lapic_advance(&g_fw_1_lapic, lapic_ticks);
                 }
                 /* advance the PIT at its own 1.19 MHz rate. */

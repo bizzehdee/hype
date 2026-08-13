@@ -350,6 +350,14 @@ void hype_guest_lapic_advance(hype_guest_lapic_t *lapic, uint64_t ticks) {
     }
 }
 
+int hype_guest_lapic_recover_in_service(hype_guest_lapic_t *lapic) {
+    if (lapic->timer_in_service) {
+        lapic->timer_in_service = 0;
+        return 1;
+    }
+    return 0;
+}
+
 int hype_guest_lapic_take_timer_irq(hype_guest_lapic_t *lapic, uint8_t *vector_out) {
     if (!lapic->timer_irq_pending || lapic->timer_in_service) {
         return 0;
