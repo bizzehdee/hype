@@ -211,6 +211,34 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
          * identical convention Dsdt/X_Dsdt below already use. */
         fadt->facs = out->facs_offset;
         fadt->x_facs = out->facs_offset;
+        /*
+         * #436: the extended (GAS) forms of the PM blocks. From FADT revision
+         * 3 on these are the authoritative description -- the legacy 32-bit
+         * fields above are the compatibility copy -- so leaving them zeroed
+         * while claiming revision 6 told a strict consumer that the PM1a
+         * event/control blocks and the PM timer do not exist, even though the
+         * legacy fields named their ports. Same defect as every other one in
+         * this series: the hardware described in one place and denied in the
+         * authoritative one. Address space 1 is system I/O; the widths match
+         * PM1_EVT_LEN/PM1_CNT_LEN/PM_TMR_LEN in bits.
+         */
+        fadt->x_pm1a_event_block.space_id = 1;
+        fadt->x_pm1a_event_block.bit_width = (uint8_t)(HYPE_ACPI_PM1A_EVT_LENGTH * 8u);
+        fadt->x_pm1a_event_block.bit_offset = 0;
+        fadt->x_pm1a_event_block.access_width = 0;
+        fadt->x_pm1a_event_block.address = HYPE_ACPI_PM1A_EVT_PORT;
+
+        fadt->x_pm1a_control_block.space_id = 1;
+        fadt->x_pm1a_control_block.bit_width = (uint8_t)(HYPE_ACPI_PM1A_CNT_LENGTH * 8u);
+        fadt->x_pm1a_control_block.bit_offset = 0;
+        fadt->x_pm1a_control_block.access_width = 0;
+        fadt->x_pm1a_control_block.address = HYPE_ACPI_PM1A_CNT_PORT;
+
+        fadt->x_pm_timer_block.space_id = 1;
+        fadt->x_pm_timer_block.bit_width = (uint8_t)(HYPE_ACPI_PM_TMR_LENGTH * 8u);
+        fadt->x_pm_timer_block.bit_offset = 0;
+        fadt->x_pm_timer_block.access_width = 0;
+        fadt->x_pm_timer_block.address = HYPE_ACPI_PM_TMR_PORT;
         /* Dsdt/X_Dsdt: pre-filled with DSDT's offset *within this same
          * blob* (both point at "etc/acpi/tables", the same src_file the
          * loader script's ADD_POINTER command adds its allocated base

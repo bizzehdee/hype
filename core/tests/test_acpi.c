@@ -259,6 +259,23 @@ static void test_build_tables_blob_layout(void) {
     CHECK_HEX("fadt declares PM1a_CNT_BLK", HYPE_ACPI_PM1A_CNT_PORT, fadt->pm1a_control_block);
     CHECK_HEX("fadt declares PM_TMR_BLK", HYPE_ACPI_PM_TMR_PORT, fadt->pm_timer_block);
     CHECK_HEX("fadt points at the FACS", layout.facs_offset, fadt->facs);
+    /* #436: from FADT revision 3 on, the extended GAS forms are the
+     * authoritative description of the PM registers -- the 32-bit fields above
+     * are only the compatibility copy. Leaving these zeroed while claiming a
+     * modern revision denies the very hardware the legacy fields declare. */
+    CHECK_HEX("x_pm1a_evt is system I/O", 1, fadt->x_pm1a_event_block.space_id);
+    CHECK_HEX("x_pm1a_evt address matches the legacy field", HYPE_ACPI_PM1A_EVT_PORT,
+              fadt->x_pm1a_event_block.address);
+    CHECK_HEX("x_pm1a_evt width in bits", HYPE_ACPI_PM1A_EVT_LENGTH * 8u,
+              fadt->x_pm1a_event_block.bit_width);
+    CHECK_HEX("x_pm1a_cnt address matches the legacy field", HYPE_ACPI_PM1A_CNT_PORT,
+              fadt->x_pm1a_control_block.address);
+    CHECK_HEX("x_pm1a_cnt width in bits", HYPE_ACPI_PM1A_CNT_LENGTH * 8u,
+              fadt->x_pm1a_control_block.bit_width);
+    CHECK_HEX("x_pm_tmr address matches the legacy field", HYPE_ACPI_PM_TMR_PORT,
+              fadt->x_pm_timer_block.address);
+    CHECK_HEX("x_pm_tmr width in bits", HYPE_ACPI_PM_TMR_LENGTH * 8u,
+              fadt->x_pm_timer_block.bit_width);
     /* IAPC_BOOT_ARCH must name the legacy hardware hype models (8042, PIC,
      * PIT, RTC, UARTs) rather than leaving a guest to assume none exists. */
     CHECK_HEX("fadt declares the 8042", 1,
