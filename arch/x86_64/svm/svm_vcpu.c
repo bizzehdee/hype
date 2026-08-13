@@ -937,6 +937,10 @@ int hype_svm_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd)
  * so we can see whether OVMF's WaitForKey poll reads the status (OBF)
  * and consumes the scancode -- without the init traffic drowning it. */
 static int g_ps2_trace = 0;
+/* #436 kbd-poll breadcrumbs (see the PS/2 ioio handler). */
+volatile uint64_t g_436_last_p64_tsc; volatile uint64_t g_436_last_p64_rip;
+volatile uint8_t g_436_last_p64_val;
+volatile uint64_t g_436_last_p60_tsc; volatile uint8_t g_436_last_p60_val;
 
 void hype_svm_set_ps2_trace(int enabled) {
     g_ps2_trace = enabled ? 1 : 0;
@@ -1041,10 +1045,33 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
         return -1;
     }
 
-    if (g_ps2_trace) {
-        hype_debug_print("fw-1 ps2| %s 0x%x %s=0x%x rip=0x%llx\n", io.is_in ? "IN " : "OUT",
-                          (unsigned int)io.port, io.is_in ? "->" : "<-", (unsigned int)traced_value,
-                          (unsigned long long)real->vmcb->save.rip);
+    {
+        /* #436: always trace the first N accesses -- covers the whole init
+         * dialogue (which is where OVMF's driver gives up) without the
+         * interactive-poll flood the unconditional trace produced. */
+        static unsigned ps2_trace_n = 0;
+        /* status-read spam excluded: the 10ms poll fills any cap instantly. */
+        int interesting = !(io.is_in && io.port == 0x64u);
+        if (g_ps2_trace || (interesting && ps2_trace_n < 200u)) {
+            if (interesting) ps2_trace_n++;
+            hype_debug_print("fw-1 ps2| %s 0x%x %s=0x%x rip=0x%llx\n", io.is_in ? "IN " : "OUT",
+                              (unsigned int)io.port, io.is_in ? "->" : "<-", (unsigned int)traced_value,
+                              (unsigned long long)real->vmcb->save.rip);
+        }
+    }
+    /* #436: cheap always-on breadcrumbs -- WHEN did the guest last poll the
+     * kbd status/data ports, and what did hype answer? Distinguishes "guest
+     * stopped polling" (OVMF-side, timer/event death) from "guest polls but
+     * hype reports no data" (hype status-port bug) once GUESTKBD freezes. */
+    if (io.is_in) {
+        if (io.port == 0x64u) {
+            g_436_last_p64_tsc = real_rdtsc();
+            g_436_last_p64_rip = real->vmcb->save.rip;
+            g_436_last_p64_val = (uint8_t)traced_value;
+        } else if (io.port == 0x60u) {
+            g_436_last_p60_tsc = real_rdtsc();
+            g_436_last_p60_val = (uint8_t)traced_value;
+        }
     }
 
     /* EXITINFO2 gives the resume RIP directly, same "next-RIP-for-free"
@@ -4242,8 +4269,21 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
         host_tsc_aux = svm_rdmsr(HYPE_SVM_MSR_TSC_AUX);
         svm_wrmsr(HYPE_SVM_MSR_TSC_AUX, real->tsc_aux);
     }
-    hype_fpu_restore(&real->fpu);
+    /*
+     * #436: CLGI must come FIRST. hype_fpu_restore() puts the GUEST's x87/SSE
+     * state in the registers; a host interrupt (the 1ms AP preempt tick)
+     * landing between the restore and CLGI runs the ISR dispatch chain, whose
+     * compiled C uses XMM (xorps/movups struct zeroing -- measured in
+     * isr_decode.o) with NO FPU save in the ISR stubs. That silently zeroed
+     * guest vector registers, and a guest resuming a GUID-compare or struct
+     * move mid-loop with zeroed XMM walks off otherwise-valid structures --
+     * the timing-dependent DxeCore list-walk hangs that blocked every Windows
+     * boot. With GIF clear the tick stays pending until the post-#VMEXIT
+     * STGI, which is after hype_fpu_save() -- the guest state is never live
+     * across any host ISR.
+     */
     clgi();
+    hype_fpu_restore(&real->fpu);
     vmload(vmcb_phys);
     vmrun_full(real, vmcb_phys);
     /*

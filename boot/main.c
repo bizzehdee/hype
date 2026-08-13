@@ -10585,10 +10585,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * then exited for that tick before FreeBSD could execute its next
              * WBINVD. A fresh one-shot gives the guest a real execution window
              * while preserving the 1 ms bound on uninterrupted execution. */
+#ifndef HYPE_436_NO_PREEMPT
+            /* #436 experiment gate: the host preempt tick fires mid-guest-execution
+             * (an INTR exit with no guest-visible effect) exactly during CPU-bound
+             * list walks; if resuming from it ever corrupts guest state, every
+             * DxeCore walk becomes a random infinite loop. Build with
+             * -DHYPE_436_NO_PREEMPT to run the guest preempt-free and test that. */
             hype_lapic_arm_timer_oneshot(
                 (volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
                 (uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR,
                 g_ap_timer_reload[(unsigned)(vm - g_vms)]);
+#endif
 #endif
             if (ops->vcpu_run(ctx, &info) != 0) {
                 hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
@@ -12423,6 +12430,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * clear produces one IRQ1 edge per byte and prevents make/break or E0
          * sequences from being collapsed into one notification.
          */
+        {   /* #436: prove the drain gate runs and what blocks it */
+            static uint64_t dr_last; static uint64_t dr_n;
+            dr_n++;
+            if (g_fw_1_host_tsc_hz && hype_rdtsc() - dr_last > 5u * g_fw_1_host_tsc_hz) {
+                dr_last = hype_rdtsc();
+                hype_debug_print("fw-1 DRAIN: iters=%llu kbd_pending=%d q_pending=%u [#436]\n",
+                                 (unsigned long long)dr_n,
+                                 hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2),
+                                 hype_scancode_queue_pending(&vm->host_ps2_queue));
+            }
+        }
         if (!hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
             uint8_t host_scancode;
             if (hype_scancode_queue_dequeue(&vm->host_ps2_queue, &host_scancode)) {
@@ -19072,6 +19090,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     hype_ps2_mouse_has_pending_byte(&g_vms[vi].mouse),
                                     (unsigned)g_vms[vi].atapi.last_cdb,
                                     (unsigned)g_vms[vi].atapi.command_count);
+                                {   /* #436: last kbd-port polls (see svm_vcpu.c breadcrumbs) */
+                                    extern volatile uint64_t g_436_last_p64_tsc, g_436_last_p64_rip;
+                                    extern volatile uint8_t g_436_last_p64_val;
+                                    extern volatile uint64_t g_436_last_p60_tsc;
+                                    extern volatile uint8_t g_436_last_p60_val;
+                                    uint64_t now436 = hype_rdtsc();
+                                    hype_debug_print(
+                                        "fw-1 KBDPOLL: p64 %llums ago val=0x%02x rip=0x%llx | "
+                                        "p60 %llums ago val=0x%02x [#436]\n",
+                                        g_436_last_p64_tsc ? ((now436 - g_436_last_p64_tsc) * 1000ull) / hz : 0ull,
+                                        (unsigned)g_436_last_p64_val,
+                                        (unsigned long long)g_436_last_p64_rip,
+                                        g_436_last_p60_tsc ? ((now436 - g_436_last_p60_tsc) * 1000ull) / hz : 0ull,
+                                        (unsigned)g_436_last_p60_val);
+                                }
                                 /* #92 diag: name the CPUID leaves / MSRs a spinning guest hammers.
                                  * SVM-only (this rig); the getter reads file-global MRUs. */
                                 if (vi == 0u) {
