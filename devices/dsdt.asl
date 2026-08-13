@@ -39,6 +39,27 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
 
     Scope (\_SB)
     {
+        /*
+         * #436: the processor object. Every real x86 platform declares its
+         * CPUs in the ACPI namespace -- the MADT lists their local APICs, and
+         * the namespace gives each one an object an OS can attach to. hype
+         * declared none, so a guest walking the namespace found a machine with
+         * no processors at all while the MADT said otherwise: the same
+         * describe-a-different-machine defect as the MCFG bus range and the
+         * hardware-reduced flag.
+         *
+         * _UID 0 matches the ACPI processor UID hype writes into the MADT's
+         * first Local APIC entry. hype gives each guest exactly one vCPU
+         * today, so exactly one object is declared here; when a guest can have
+         * several, these must be generated to match cpu_count (as the MADT
+         * entries already are) rather than fixed in this static AML.
+         */
+        Device (CP00)
+        {
+            Name (_HID, "ACPI0007")  /* Processor Device */
+            Name (_UID, 0x00)
+        }
+
         Device (PCI0)
         {
             Name (_HID, EisaId ("PNP0A08"))  /* PCI Express root bridge */
