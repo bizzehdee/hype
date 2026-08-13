@@ -11962,14 +11962,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     lapic_tick_accum += (uint64_t)ticks * HYPE_GUEST_LAPIC_HZ;
                     lapic_ticks = lapic_tick_accum / HYPE_PIT_HZ;
                     lapic_tick_accum -= lapic_ticks * HYPE_PIT_HZ;
-                    { /* #436: measure what actually feeds the guest LAPIC */
-                        static uint64_t lt_sum, lt_last;
+                    { /* #436: feed rate + full latch state, one line per 5s */
+                        static uint64_t lt_sum, lt_last, lt_prev;
                         lt_sum += lapic_ticks;
                         uint64_t now_lt = hype_rdtsc();
                         if (g_fw_1_host_tsc_hz && now_lt - lt_last > 5u * g_fw_1_host_tsc_hz) {
                             lt_last = now_lt;
-                            hype_debug_print("fw-1 LAPICFEED: sum=%llu (+%llu/5s) [#436]\n",
-                                             (unsigned long long)lt_sum, (unsigned long long)lt_sum);
+                            hype_debug_print("fw-1 LAPSTATE: feed+%llu/5s pend=%d insvc=%d cur=%u init=%u "
+                                             "lvt=0x%x eoi=%llu [#436]\n",
+                                             (unsigned long long)(lt_sum - lt_prev),
+                                             g_fw_1_lapic.timer_irq_pending,
+                                             g_fw_1_lapic.timer_in_service,
+                                             (unsigned)g_fw_1_lapic.current_count,
+                                             (unsigned)g_fw_1_lapic.init_count,
+                                             (unsigned)g_fw_1_lapic.lvt_timer,
+                                             (unsigned long long)g_fw_1_lapic.eoi_count);
+                            lt_prev = lt_sum;
                         }
                     }
                     hype_guest_lapic_advance(&g_fw_1_lapic, lapic_ticks);
@@ -11996,33 +12004,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
         }
-        /*
-         * #436: pace the timer tick after a long no-exit stretch. The deferred
-         * tick used to be injected on the FIRST exit after the gap -- and during
-         * an OS loader's image-load phase those exits cluster at DxeCore
-         * boot-services calls, so the interrupt systematically landed inside
-         * DxeCore's protocol/memory-map list manipulation. The re-entrant event
-         * dispatch OVMF then performs (NestedInterruptTplLib forces RestoreTPL
-         * from inside the handler) corrupted whichever list was mid-edit -> the
-         * cyclic-list boot hangs Windows hit. Real timers are not synchronized
-         * to the guest's exit pattern; after a gap, hold the tick for a few
-         * exits so it lands at an uncorrelated point instead.
-         */
-        {
-            static uint64_t tick_prev_tsc;
-            static unsigned tick_hold;
-            uint64_t now_tick_tsc = hype_rdtsc();
-            if (tick_prev_tsc != 0 && g_fw_1_host_tsc_hz != 0 &&
-                now_tick_tsc - tick_prev_tsc > g_fw_1_host_tsc_hz / 1000u) {
-                tick_hold = 4u; /* >1ms without an exit: skip the next 4 injection points */
-            }
-            tick_prev_tsc = now_tick_tsc;
-            if (tick_hold != 0) {
-                tick_hold--;
-            } else if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
-                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, timer_vector);
-                timer_irqs++;
-            }
+        if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
+            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, timer_vector);
+            timer_irqs++;
         }
         /* GLADDER-6c: deliver guest self-IPIs (ICR fixed-delivery writes aimed
          * at the local CPU). Linux >= 6.16 starts every SRCU grace period from
