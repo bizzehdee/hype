@@ -315,6 +315,13 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 #define HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT 16
 #define HYPE_SVM_VINTR_V_INTR_PRIO_MASK (0xFULL << HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT)
 #define HYPE_SVM_VINTR_V_IGN_TPR (1ULL << 20)
+/* #436: V_INTR_MASKING (int_ctl bit 24, APM 15.21.1). When set, PHYSICAL
+ * interrupt masking during guest execution follows the HOST's EFLAGS.IF
+ * (saved by VMRUN); the guest's own IF gates only VIRTUAL interrupts. Without
+ * it, a guest spinning with IF=0 masked hype's 1ms preempt tick entirely --
+ * no #VMEXIT, no input delivery, no diagnostics, no watchdog (measured:
+ * preempt_if1=5889, preempt_if0=0 across every historic run). */
+#define HYPE_SVM_VINTR_V_INTR_MASKING (1ULL << 24)
 /* Every bit hype_svm_arm_vintr_request()/_disarm_vintr_request() ever
  * touch, as a single mask -- matches Linux KVM's own
  * V_IRQ_INJECTION_BITS_MASK naming/grouping. */

@@ -587,6 +587,10 @@ void hype_svm_vcpu_enable_pause_filter(hype_vcpu_ctx_t *ctx, uint16_t count, uin
 void hype_svm_vcpu_enable_intr_intercept(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_INTR;
+    /* #436: without V_INTR_MASKING the guest's IF masks the physical tick, so
+     * an IF=0 guest spin is unpreemptible and starves the whole run loop.
+     * With it, the tick exits regardless of guest IF (host IF=1 at VMRUN). */
+    real->vmcb->control.vintr |= HYPE_SVM_VINTR_V_INTR_MASKING;
     real->vmcb->control.vmcb_clean_bits = 0; /* control area changed */
 }
 
