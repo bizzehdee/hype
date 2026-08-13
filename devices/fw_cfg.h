@@ -40,6 +40,7 @@
 
 #define HYPE_FW_CFG_KEY_SIGNATURE 0x00u
 #define HYPE_FW_CFG_KEY_ID 0x01u
+#define HYPE_FW_CFG_KEY_NB_CPUS 0x05u /* FW_CFG_NB_CPUS: boot CPU count, uint16 LE */
 #define HYPE_FW_CFG_KEY_FILE_DIR 0x19u
 #define HYPE_FW_CFG_KEY_FILE_FIRST 0x20u
 
@@ -88,6 +89,11 @@ typedef struct {
     uint16_t selected_key;
     uint32_t offset;
     uint32_t dma_addr_high; /* staged between the 0x514 and 0x518 port writes */
+    /* FW_CFG_NB_CPUS (key 0x05), uint16 little-endian. OVMF's
+     * PlatformMaxCpuCountInitialization reads this; a zero (the value an
+     * unregistered selector returns) makes OVMF assume MaxCpuCount=64 and
+     * INIT-SIPI/wait for phantom APs, hanging CpuDxe's MP init. */
+    uint8_t nb_cpus_le[2];
 } hype_fw_cfg_t;
 
 typedef struct {
@@ -100,6 +106,9 @@ typedef struct {
 /* Resets to no files registered, item 0 selected, offset 0. Call on
  * every (re)start, same convention as every other device model here. */
 void hype_fw_cfg_reset(hype_fw_cfg_t *fw);
+
+/* Set FW_CFG_NB_CPUS (key 0x05), the boot CPU count OVMF reads to size MP init. */
+void hype_fw_cfg_set_nb_cpus(hype_fw_cfg_t *fw, uint16_t count);
 
 /*
  * Registers a read-only file (`data`/`size` caller-owned, must outlive

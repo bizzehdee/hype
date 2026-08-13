@@ -48,10 +48,23 @@ void hype_fw_cfg_reset(hype_fw_cfg_t *fw) {
     fw->selected_key = 0;
     fw->offset = 0;
     fw->dma_addr_high = 0;
+    /* Default to 1 boot CPU; a caller with a configured vcpu count overrides
+     * via hype_fw_cfg_set_nb_cpus(). Never 0 -- a zero here is what made OVMF
+     * fall back to MaxCpuCount=64 and wait for phantom APs. */
+    fw->nb_cpus_le[0] = 1u;
+    fw->nb_cpus_le[1] = 0u;
     for (i = 0; i < sizeof(fw->dir_blob); i++) {
         fw->dir_blob[i] = 0;
     }
     rebuild_dir(fw);
+}
+
+void hype_fw_cfg_set_nb_cpus(hype_fw_cfg_t *fw, uint16_t count) {
+    if (count == 0u) {
+        count = 1u;
+    }
+    fw->nb_cpus_le[0] = (uint8_t)(count & 0xFFu);
+    fw->nb_cpus_le[1] = (uint8_t)((count >> 8) & 0xFFu);
 }
 
 int hype_fw_cfg_add_file(hype_fw_cfg_t *fw, const char *name, const uint8_t *data, uint32_t size) {
@@ -105,6 +118,11 @@ static int lookup_item(const hype_fw_cfg_t *fw, uint16_t key, const uint8_t **ou
     if (key == HYPE_FW_CFG_KEY_ID) {
         *out_data = id;
         *out_size = 4;
+        return 0;
+    }
+    if (key == HYPE_FW_CFG_KEY_NB_CPUS) {
+        *out_data = fw->nb_cpus_le;
+        *out_size = 2;
         return 0;
     }
     if (key == HYPE_FW_CFG_KEY_FILE_DIR) {

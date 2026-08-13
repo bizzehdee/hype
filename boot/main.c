@@ -9872,6 +9872,11 @@ static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
     loader_entries = hype_acpi_loader_build_script(g_fw_1_loader_script, &layout);
 
     hype_fw_cfg_reset(&g_fw_1_fw_cfg);
+    /* #436: the FW-1 guest is single-vCPU (CPUID + ACPI MADT both report 1).
+     * Report the same via FW_CFG_NB_CPUS so OVMF's PlatformMaxCpuCountInitialization
+     * gets BootCpuCount=1 instead of falling back to MaxCpuCount=64 and hanging
+     * CpuDxe MP init on INIT-SIPI/wait for 63 phantom APs. */
+    hype_fw_cfg_set_nb_cpus(&g_fw_1_fw_cfg, 1u);
     if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_RSDP,
                              (const uint8_t *)&g_fw_1_rsdp, sizeof(g_fw_1_rsdp)) < 0 ||
         hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_TABLES,
