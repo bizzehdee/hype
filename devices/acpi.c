@@ -224,6 +224,11 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
          * guest could not find because a table field was left at zero.
          */
         fadt->century = HYPE_CMOS_REG_CENTURY;
+        /* #436: declare the legacy hardware hype actually models -- see the
+         * IAPC_BOOT_ARCH comment in acpi.h. Zero here told every guest that
+         * hype had no 8042 and no legacy devices while it emulates both. */
+        fadt->boot_flags = (uint16_t)(HYPE_ACPI_FADT_BOOT_ARCH_LEGACY_DEVICES |
+                                      HYPE_ACPI_FADT_BOOT_ARCH_8042);
         /* M8-6: SleepControl/SleepStatus left zeroed. This guest is UEFI-booted,
          * so its OS powers off via EFI ResetSystem -> OVMF, which on QEMU uses the
          * classic ACPI PM1a_CNT register (I/O 0x604) with SLP_EN, NOT the

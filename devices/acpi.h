@@ -157,6 +157,17 @@ _Static_assert(sizeof(hype_acpi_fadt_t) == 276, "FADT must be 276 bytes (ACPI 6.
 #define HYPE_ACPI_FADT_SLP_BUTTON (1u << 5)    /* no fixed-hardware sleep button */
 #define HYPE_ACPI_FADT_HW_REDUCED_ACPI (1u << 20)
 
+/*
+ * #436: IAPC_BOOT_ARCH (the FADT's `boot_flags`) -- what x86 legacy hardware
+ * the platform has. Left at zero it asserts the opposite of hype's own device
+ * set: no legacy devices at all and no 8042 keyboard controller, when hype
+ * models a PIC, PIT, CMOS RTC, UARTs and an 8042 with a keyboard behind it.
+ * The two "NOT_PRESENT" bits stay clear because a VGA-class display (ramfb)
+ * and a CMOS RTC both exist.
+ */
+#define HYPE_ACPI_FADT_BOOT_ARCH_LEGACY_DEVICES (1u << 0)
+#define HYPE_ACPI_FADT_BOOT_ARCH_8042 (1u << 1)
+
 /* M8-6: the QEMU/OVMF ACPI PM1a control register (classic ACPI, I/O 0x604) that
  * a UEFI guest's OS ends up writing (via EFI ResetSystem -> OVMF) to power off.
  * A write with PM1_CNT.SLP_EN (bit 13) set commits the sleep; with only \_S5
