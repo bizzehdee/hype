@@ -165,6 +165,28 @@ int hype_ps2_kbd_io_write(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t value) {
              * byte -- the bulk of FW-1's PS/2 init spin. */
             stage_response(kbd, HYPE_PS2_KBD_ACK);
             stage_response(kbd, HYPE_PS2_KBD_BAT_OK);
+        } else if (kbd->awaiting_scancode_set_param) {
+            /* #436: 0xF0 parameter. 0 = query -> ACK + current set (2);
+             * 1/2/3 = select -> ACK alone. */
+            kbd->awaiting_scancode_set_param = 0;
+            stage_response(kbd, HYPE_PS2_KBD_ACK);
+            if (value == 0u) {
+                stage_response(kbd, 0x02u);
+            }
+        } else if (value == 0xF2u) {
+            /* #436: READ ID. A bare ACK left OVMF's Ps2KeyboardDxe waiting for
+             * the two ID bytes until its timeout -- it then declared the
+             * keyboard absent and never installed its ConIn poll, so no host
+             * key could ever reach a firmware prompt. Real MF2 keyboard ID. */
+            stage_response(kbd, HYPE_PS2_KBD_ACK);
+            stage_response(kbd, 0xABu);
+            stage_response(kbd, 0x83u);
+        } else if (value == 0xF0u) {
+            kbd->awaiting_scancode_set_param = 1;
+            stage_response(kbd, HYPE_PS2_KBD_ACK);
+        } else if (value == 0xEEu) {
+            /* Echo: answers 0xEE, not ACK. */
+            stage_response(kbd, 0xEEu);
         } else {
             /* Any other command byte sent to the keyboard device itself
              * (not the controller) -- generically ACKed, which is all

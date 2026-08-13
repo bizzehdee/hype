@@ -90,6 +90,7 @@ typedef struct {
      * out_count > 0. */
     uint8_t out_fifo[HYPE_PS2_KBD_FIFO_SIZE];
     int guest_wrote; /* #436: guest driver has touched the device */
+    int awaiting_scancode_set_param; /* #436: 0xF0 consumes one parameter byte */
     uint8_t out_is_scancode[HYPE_PS2_KBD_FIFO_SIZE];
     unsigned int out_head;  /* index of the next byte to read */
     unsigned int out_count; /* bytes currently queued */
