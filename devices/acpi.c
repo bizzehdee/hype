@@ -1,4 +1,5 @@
 #include "acpi.h"
+#include "hpet.h"
 #include "cmos.h"
 #include "dsdt_aml.h" /* M4-6b2: compiled DSDT AML body (PCI host bridge + _PRT) */
 
@@ -84,7 +85,7 @@ static void put_le32_at(uint8_t *p, uint32_t v) {
 
 int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi_config_t *cfg,
                                  hype_acpi_layout_t *out) {
-    uint32_t xsdt_entry_count = 3; /* FADT, MADT, MCFG */
+    uint32_t xsdt_entry_count = 4; /* FADT, MADT, MCFG, HPET */
     uint32_t xsdt_length = (uint32_t)sizeof(hype_acpi_sdt_header_t) + xsdt_entry_count * 8u;
     uint32_t fadt_length = (uint32_t)sizeof(hype_acpi_fadt_t);
     uint32_t madt_length = (uint32_t)sizeof(hype_acpi_madt_header_t) +
@@ -97,8 +98,9 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
     /* #436: FACS -- 64 bytes, and the spec requires 64-byte alignment, so the
      * worst-case padding is budgeted here and applied when placing it. */
     uint32_t facs_length = 64u;
+    uint32_t hpet_length = (uint32_t)sizeof(hype_acpi_hpet_t);
     uint32_t total = xsdt_length + fadt_length + madt_length + mcfg_length + dsdt_length +
-                     facs_length + 63u;
+                     hpet_length + facs_length + 63u;
     uint32_t i;
 
     if (cfg->cpu_count == 0 || cfg->cpu_count > HYPE_ACPI_MAX_CPUS) {
@@ -128,7 +130,9 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
     out->mcfg_length = mcfg_length;
     out->dsdt_offset = out->mcfg_offset + mcfg_length;
     out->dsdt_length = dsdt_length;
-    out->facs_offset = (out->dsdt_offset + dsdt_length + 63u) & ~63u;
+    out->hpet_offset = out->dsdt_offset + dsdt_length;
+    out->hpet_length = hpet_length;
+    out->facs_offset = (out->hpet_offset + hpet_length + 63u) & ~63u;
     out->facs_length = facs_length;
     out->total_length = out->facs_offset + facs_length;
 
@@ -296,7 +300,29 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
         alloc->reserved = 0;
     }
 
-    /* XSDT -- built last so FADT/MADT/MCFG's offsets are already known;
+    /* HPET */
+    {
+        hype_acpi_hpet_t *hpet = (hype_acpi_hpet_t *)(buf + out->hpet_offset);
+        uint64_t cap = hype_hpet_capabilities();
+
+        fill_header(&hpet->header, "HPET", out->hpet_length, 1, "HYPEHPET");
+        /* The block id is the capabilities register's low half: vendor, the
+         * comparator count, the 64-bit counter bit and the revision, all read
+         * straight from the model so the table cannot drift from the device. */
+        hpet->event_timer_block_id = (uint32_t)cap;
+        hpet->base_address.space_id = 0;      /* system memory */
+        hpet->base_address.bit_width = 64;
+        hpet->base_address.bit_offset = 0;
+        hpet->base_address.access_width = 4;  /* qword */
+        hpet->base_address.address = HYPE_HPET_MMIO_BASE;
+        hpet->hpet_number = 0;
+        /* The smallest period a guest may program without the comparator
+         * having already passed by the time it is armed. */
+        hpet->minimum_tick = 128;
+        hpet->page_protection = 0; /* no guarantee offered */
+    }
+
+    /* XSDT -- built last so FADT/MADT/MCFG/HPET's offsets are already known;
      * each entry pre-filled with that table's offset within this same
      * blob, same not-a-final-address convention as FADT's Dsdt/X_Dsdt
      * above. Written via write_le64() rather than a uint64_t* cast --
@@ -309,6 +335,7 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
         write_le64(entries + 0, out->fadt_offset);
         write_le64(entries + 8, out->madt_offset);
         write_le64(entries + 16, out->mcfg_offset);
+        write_le64(entries + 24, out->hpet_offset); /* #436 */
     }
 
     return 0;

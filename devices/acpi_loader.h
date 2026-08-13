@@ -68,7 +68,7 @@ _Static_assert(sizeof(hype_acpi_loader_entry_t) == 128, "loader entry must be 12
  * 64-bit) + 5 ADD_CHECKSUM (one per table in "etc/acpi/tables") + 2
  * ADD_CHECKSUM (RSDP's own two checksums) = 15, fixed for this
  * project's fixed table set. */
-#define HYPE_ACPI_LOADER_SCRIPT_ENTRIES 17 /* #436: +2 for the FACS pointers */
+#define HYPE_ACPI_LOADER_SCRIPT_ENTRIES 19 /* #436: +2 for the FACS pointers, +2 for the HPET */
 
 /*
  * Copies `name` (a NUL-terminated ASCII fw_cfg file name, must fit

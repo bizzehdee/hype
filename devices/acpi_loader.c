@@ -70,7 +70,7 @@ uint32_t hype_acpi_loader_build_script(hype_acpi_loader_entry_t *entries, const 
                                         HYPE_ACPI_LOADER_FILE_TABLES,
                                         (uint32_t)offsetof(hype_acpi_rsdp_t, xsdt_address), 8);
 
-    /* XSDT's 3 entries -> FADT/MADT/MCFG, all within the same blob. */
+    /* XSDT's 4 entries -> FADT/MADT/MCFG/HPET, all within the same blob. */
     hype_acpi_loader_build_add_pointer(
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES, HYPE_ACPI_LOADER_FILE_TABLES,
         layout->xsdt_offset + (uint32_t)sizeof(hype_acpi_sdt_header_t) + 0u * 8u, 8);
@@ -80,6 +80,9 @@ uint32_t hype_acpi_loader_build_script(hype_acpi_loader_entry_t *entries, const 
     hype_acpi_loader_build_add_pointer(
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES, HYPE_ACPI_LOADER_FILE_TABLES,
         layout->xsdt_offset + (uint32_t)sizeof(hype_acpi_sdt_header_t) + 2u * 8u, 8);
+    hype_acpi_loader_build_add_pointer(
+        &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES, HYPE_ACPI_LOADER_FILE_TABLES,
+        layout->xsdt_offset + (uint32_t)sizeof(hype_acpi_sdt_header_t) + 3u * 8u, 8);
 
     /* FADT.Dsdt (legacy 32-bit) and FADT.X_Dsdt (64-bit) -> DSDT,
      * within the same blob. */
@@ -123,6 +126,10 @@ uint32_t hype_acpi_loader_build_script(hype_acpi_loader_entry_t *entries, const 
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,
         layout->dsdt_offset + (uint32_t)offsetof(hype_acpi_sdt_header_t, checksum), layout->dsdt_offset,
         layout->dsdt_length);
+    hype_acpi_loader_build_add_checksum(
+        &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,
+        layout->hpet_offset + (uint32_t)offsetof(hype_acpi_sdt_header_t, checksum), layout->hpet_offset,
+        layout->hpet_length);
 
     /* RSDP's own two checksums: the ACPI 1.0 region [0,20) and the
      * whole 36-byte extended structure. */

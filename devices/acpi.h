@@ -309,6 +309,21 @@ typedef struct {
  * for the caller and, more importantly, exactly the information
  * devices/acpi_loader.h's builder needs to emit ADD_POINTER/
  * ADD_CHECKSUM commands against the right byte ranges. */
+/*
+ * #436: HPET Description Table (IA-PC HPET specification, section 3.2.4). The
+ * event-timer block id repeats the low half of the block's own capabilities
+ * register, so a guest can sanity-check the table against the hardware before
+ * touching it.
+ */
+typedef struct {
+    hype_acpi_sdt_header_t header;
+    uint32_t event_timer_block_id;
+    hype_acpi_gas_t base_address;
+    uint8_t hpet_number;
+    uint16_t minimum_tick;
+    uint8_t page_protection;
+} __attribute__((packed)) hype_acpi_hpet_t;
+
 typedef struct {
     uint32_t xsdt_offset;
     uint32_t xsdt_length;
@@ -327,6 +342,9 @@ typedef struct {
      * checksum byte, so the loader emits only pointers to it. */
     uint32_t facs_offset;
     uint32_t facs_length;
+    /* #436: the HPET description table. */
+    uint32_t hpet_offset;
+    uint32_t hpet_length;
     uint32_t total_length;
 } hype_acpi_layout_t;
 

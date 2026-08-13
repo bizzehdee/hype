@@ -60,6 +60,22 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
             Name (_UID, 0x00)
         }
 
+        /*
+         * #436: the HPET, at the fixed 0xFED00000 the HPET table names. A
+         * guest that walks the namespace rather than reading the table finds
+         * the same block at the same address, which is the point: the two
+         * descriptions of one piece of hardware must agree.
+         */
+        Device (HPET)
+        {
+            Name (_HID, EisaId ("PNP0103"))
+            Name (_UID, 0x00)
+            Name (_CRS, ResourceTemplate ()
+            {
+                Memory32Fixed (ReadOnly, 0xFED00000, 0x00000400)
+            })
+        }
+
         Device (PCI0)
         {
             Name (_HID, EisaId ("PNP0A08"))  /* PCI Express root bridge */
