@@ -8,6 +8,10 @@
 
 #include "../../../devices/pvclock.h"
 
+/* Defined below (exempt real-hardware helper); forward-declared because the
+ * #436 CALTRACE sites in the IOIO handler run earlier in the file. */
+static inline uint64_t real_rdtsc(void);
+
 /*
  * Concrete per-vCPU context for the SVM backend (M2-7). Opaque outside
  * this file per vmm_ops.h's hype_vcpu_ctx_t contract -- the dispatch
