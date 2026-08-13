@@ -89,6 +89,7 @@ typedef struct {
      * responses and injected scancodes). OBF (status bit 0) reflects
      * out_count > 0. */
     uint8_t out_fifo[HYPE_PS2_KBD_FIFO_SIZE];
+    int guest_wrote; /* #436: guest driver has touched the device */
     uint8_t out_is_scancode[HYPE_PS2_KBD_FIFO_SIZE];
     unsigned int out_head;  /* index of the next byte to read */
     unsigned int out_count; /* bytes currently queued */
@@ -152,6 +153,11 @@ int hype_ps2_kbd_io_write(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t value);
  * keyboard-only status computation.
  */
 int hype_ps2_kbd_has_pending_byte(const hype_ps2_kbd_t *kbd);
+
+/* #436: nonzero once the guest has written the device (its keyboard driver is
+ * alive). Host keys handed before this sat unread in the FIFO forever, gating
+ * all later delivery shut. */
+int hype_ps2_kbd_guest_initialized(const hype_ps2_kbd_t *kbd);
 
 /*
  * INPUT-2: returns 1 if the next 0x60 WRITE should be routed to the

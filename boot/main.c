@@ -12471,31 +12471,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 #endif
         }
         g_436_loop_section[(unsigned)(vm-g_vms)]=7;
-        {
-            /* #436: a response byte the guest never reads (e.g. the tail of an
-             * init exchange OVMF abandoned) gated this drain shut for a whole
-             * run -- 63 keys queued, zero delivered. If the SAME byte has
-             * blocked the gate for >1s while operator keys wait, evict it:
-             * real keyboards overwrite their output buffer too. */
-            static uint64_t stale_since_tsc; static int stale_active;
-            if (hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2) &&
-                hype_scancode_queue_pending(&vm->host_ps2_queue) != 0u) {
-                uint64_t now_st = hype_rdtsc();
-                if (!stale_active) { stale_active = 1; stale_since_tsc = now_st; }
-                else if (g_fw_1_host_tsc_hz != 0 &&
-                         now_st - stale_since_tsc > g_fw_1_host_tsc_hz) {
-                    uint8_t discard;
-                    (void)hype_ps2_kbd_io_read(&g_fw_1_ps2, HYPE_PS2_PORT_DATA, &discard);
-                    hype_debug_print("fw-1 KBD-EVICT vm%u: dropped stale unread byte 0x%02x "
-                                     "to unblock key delivery [#436]\n",
-                                     (unsigned)(vm - g_vms), (unsigned)discard);
-                    stale_active = 0;
-                }
-            } else {
-                stale_active = 0;
-            }
-        }
-        if (!hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
+        if (hype_ps2_kbd_guest_initialized(&g_fw_1_ps2) &&
+            !hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
+            /* #436: hold host keys until the guest's keyboard driver is alive.
+             * A key handed pre-init sat unread in the FIFO for the whole run
+             * and gated every later key shut (63 queued, 0 delivered). */
             uint8_t host_scancode;
             if (hype_scancode_queue_dequeue(&vm->host_ps2_queue, &host_scancode)) {
                 if (hype_ps2_kbd_try_enqueue_scancode(&g_fw_1_ps2, host_scancode)) {

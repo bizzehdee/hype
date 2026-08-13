@@ -107,7 +107,12 @@ int hype_ps2_kbd_io_read(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t *out_value)
     return -1;
 }
 
+int hype_ps2_kbd_guest_initialized(const hype_ps2_kbd_t *kbd) {
+    return kbd->guest_wrote != 0;
+}
+
 int hype_ps2_kbd_io_write(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t value) {
+    kbd->guest_wrote = 1;
     if (port == HYPE_PS2_PORT_STATUS_COMMAND) {
         switch (value) {
         case HYPE_PS2_CMD_READ_CONFIG_BYTE:
