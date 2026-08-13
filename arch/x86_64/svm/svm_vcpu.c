@@ -3446,6 +3446,71 @@ int hype_svm_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_ins
     return 0;
 }
 
+/*
+ * #436: the HPET's MMIO block. Same shape as the LAPIC handler below, with one
+ * difference that matters: HPET registers are 64 bits and a guest may access
+ * either a whole register or one 32-bit half, so both widths are honoured
+ * rather than rejected. Returns 0 when the access was the HPET's, -1 otherwise.
+ */
+int hype_svm_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
+                                   uint64_t hpet_base_phys, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < hpet_base_phys ||
+        npf.guest_phys_addr >= hpet_base_phys + HYPE_HPET_MMIO_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - hpet_base_phys);
+
+    if (guest_insn_bytes == 0 ||
+        hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+    if (decoded.size_bytes != 4u && decoded.size_bytes != 8u) {
+        return -1;
+    }
+
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint64_t value;
+        if (decoded.mem_is_dst) {
+            uint64_t cur = hype_hpet_read(hpet, offset, decoded.size_bytes);
+            value = hype_mmio_rmw_value(&decoded, reg ? *reg : 0u, (uint32_t)cur,
+                                        &real->vmcb->save.rflags);
+        } else {
+            value = decoded.has_imm ? decoded.imm_value : *reg;
+        }
+        hype_hpet_write(hpet, offset, decoded.size_bytes, value);
+    } else {
+        uint64_t value = hype_hpet_read(hpet, offset, decoded.size_bytes);
+        if (reg == 0) {
+            return -1;
+        }
+        if (decoded.size_bytes == 8u) {
+            *reg = value;
+        } else {
+            *reg = hype_mmio_merge_read_value(*reg, (uint32_t)value, decoded.size_bytes,
+                                              decoded.zero_extend);
+        }
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                     uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;

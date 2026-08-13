@@ -701,6 +701,7 @@ typedef struct hype_fw_vm {
     hype_pci_t pci;
     hype_cmos_t cmos;
     hype_guest_lapic_t lapic; /* FW-1b: guest Local APIC (0xFEE00000) */
+    hype_hpet_t hpet;         /* #436: guest HPET (0xFED00000) */
     hype_ioapic_t ioapic;     /* M4-6b3: guest I/O APIC (0xFEC00000) */
     hype_guest_uart_t uart;   /* FW-1e: COM1 0x3F8 */
     hype_guest_uart_t uart2;  /* FW-1e: COM2 0x2F8 -- OVMF probes/uses both */
@@ -877,6 +878,7 @@ static void fw_1_resolve_os_hint(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsig
 #define g_fw_1_pci (vm->pci)
 #define g_fw_1_cmos (vm->cmos)
 #define g_fw_1_lapic (vm->lapic)
+#define g_fw_1_hpet (vm->hpet)
 #define g_fw_1_ioapic (vm->ioapic)
 #define g_fw_1_uart (vm->uart)
 #define g_fw_1_uart2 (vm->uart2)
@@ -7793,6 +7795,48 @@ static uint64_t g_render_calls;
 static uint64_t g_render_pushes;
 static uint64_t g_render_cells_drawn;
 
+/*
+ * #436: advance the guest HPET and deliver any comparator that expired. Its own
+ * function, not inline in the dispatch loop: that loop's frame is already near
+ * the stack-probe threshold and a few more locals there would cost a __chkstk
+ * this freestanding image has no reason to carry.
+ */
+static __attribute__((noinline)) void fw_1_hpet_step(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx,
+                                                     hype_vmm_kind_t kind, uint64_t delta) {
+    uint64_t hpet_ticks;
+    uint32_t fired;
+    unsigned ti;
+
+    if (g_fw_1_host_tsc_hz == 0u) {
+        return;
+    }
+    hpet_ticks = delta * HYPE_HPET_TICKS_PER_SECOND / g_fw_1_host_tsc_hz;
+    fired = hype_hpet_advance(&g_fw_1_hpet, hpet_ticks);
+    if (fired == 0u) {
+        return;
+    }
+    for (ti = 0; ti < HYPE_HPET_NUM_TIMERS; ti++) {
+        uint8_t hiov;
+        unsigned gsi;
+        if ((fired & (1u << ti)) == 0u) {
+            continue;
+        }
+        /* Legacy replacement routing puts timer 0 where the PIT's output would
+         * be, which is how the chipset wires it; otherwise the timer's own
+         * routing field names the GSI. */
+        if (ti == 0u && (g_fw_1_hpet.config & HYPE_HPET_CONFIG_LEGACY_ROUTE) != 0u) {
+            gsi = 2u;
+        } else {
+            gsi = (unsigned)((g_fw_1_hpet.timers[ti].config >> 9) & 0x1Fu);
+        }
+        if (hype_ioapic_raise(&g_fw_1_ioapic, gsi, &hiov)) {
+            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, hiov);
+        } else if (gsi == 2u) {
+            hype_pic_emu_raise_irq(&g_fw_1_pic.master, 0);
+        }
+    }
+}
+
 static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_tsc,
                                     uint64_t perf_boot_start_tsc,
                                     uint64_t perf_hlt_wait_tsc, uint64_t total_exits,
@@ -9865,6 +9909,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     hype_vt_screen_init(&vm->term, g_gop_console.cols, g_gop_console.rows);
     hype_ps2_kbd_reset(&g_fw_1_ps2);
     hype_scancode_queue_reset(&vm->host_ps2_queue);
+    hype_hpet_reset(&vm->hpet);
     __atomic_store_n(&vm->host_ps2_irqs, 0ull, __ATOMIC_RELAXED);
     hype_ps2_mouse_reset(&g_fw_1_mouse);
     hype_guest_ram_zero(vm->ramfb_config, sizeof(vm->ramfb_config));
@@ -10044,6 +10089,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     vm->pm1a_cnt = 0;
     hype_ps2_kbd_reset(&g_fw_1_ps2);
     hype_scancode_queue_reset(&vm->host_ps2_queue);
+    hype_hpet_reset(&vm->hpet);
     __atomic_store_n(&vm->host_ps2_irqs, 0ull, __ATOMIC_RELAXED);
     hype_ps2_mouse_reset(&g_fw_1_mouse);
     hype_pci_reset(&g_fw_1_pci);
@@ -12049,6 +12095,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                     hype_guest_lapic_advance(&g_fw_1_lapic, lapic_ticks);
                 }
+                fw_1_hpet_step(vm, ctx, kind, delta);
                 /* advance the PIT at its own 1.19 MHz rate. */
                 /* Channel-0 terminal-count crossings during this advance
                  * are PIT IRQ0 timer edges (M4-6b4). */
@@ -12885,6 +12932,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* FW-1b: the guest Local APIC at 0xFEE00000 is the expected
              * NPF here (the region is not-present by design). */
             g_436_loop_section[(unsigned)(vm-g_vms)]=767;
+            if (kind == HYPE_VMM_KIND_SVM &&
+                hype_svm_vcpu_handle_hpet_npf(ctx, &g_fw_1_hpet, HYPE_HPET_MMIO_BASE, insn) == 0) {
+                continue;
+            }
             if (vmm_handle_lapic_npf(kind, ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE, insn) == 0) {
                 continue;
             }

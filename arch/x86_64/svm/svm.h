@@ -10,6 +10,7 @@
 #include "../../../devices/pic.h"
 #include "../../../devices/nvme.h" /* #202: the guest NVMe model the NPF handler drives */
 #include "../../../devices/pit.h"
+#include "../../../devices/hpet.h" /* #436: the HPET block the NPF handler drives */
 #include "../../../devices/pflash.h"
 #include "../../../devices/fw_cfg.h"
 #include "../../../devices/ahci.h"
@@ -1058,6 +1059,10 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
  * the guest RIP to its real host backing address first (FW-1's guest
  * paging is identity, so guest-linear RIP == guest-physical there).
  */
+/* #436: HPET MMIO block -- see the definition's comment. */
+int hype_svm_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
+                                   uint64_t hpet_base_phys, const uint8_t *guest_insn_bytes);
+
 int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                     uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes);
 
