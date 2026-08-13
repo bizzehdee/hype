@@ -220,7 +220,9 @@ static void test_build_tables_blob_layout(void) {
     CHECK_HEX("madt follows fadt", layout.fadt_offset + layout.fadt_length, layout.madt_offset);
     CHECK_HEX("mcfg follows madt", layout.madt_offset + layout.madt_length, layout.mcfg_offset);
     CHECK_HEX("dsdt follows mcfg", layout.mcfg_offset + layout.mcfg_length, layout.dsdt_offset);
-    CHECK_HEX("total_length covers everything", layout.dsdt_offset + layout.dsdt_length,
+    /* #436: the FACS is placed after the DSDT at 64-byte alignment, so the
+     * blob now ends at the FACS rather than at the DSDT. */
+    CHECK_HEX("total_length covers everything", layout.facs_offset + layout.facs_length,
               layout.total_length);
 
     /* XSDT */
@@ -247,8 +249,20 @@ static void test_build_tables_blob_layout(void) {
     CHECK_MEM("fadt signature", "FACP", fadt->header.signature, 4);
     CHECK_HEX("fadt checksum left 0", 0, fadt->header.checksum);
     CHECK_HEX("fadt sci_interrupt", 9, fadt->sci_interrupt);
-    CHECK_HEX("fadt has HW_REDUCED_ACPI set", 1,
+    /* #436: hype is NOT hardware-reduced -- it implements the classic PM
+     * register file, so the flag must stay clear and the blocks must be
+     * described. A reduced-hardware FADT that also declares a SCI, a century
+     * register and PM blocks describes no real machine. */
+    CHECK_HEX("fadt does NOT claim HW_REDUCED_ACPI", 0,
               (fadt->flags & HYPE_ACPI_FADT_HW_REDUCED_ACPI) != 0);
+    CHECK_HEX("fadt declares PM1a_EVT_BLK", HYPE_ACPI_PM1A_EVT_PORT, fadt->pm1a_event_block);
+    CHECK_HEX("fadt declares PM1a_CNT_BLK", HYPE_ACPI_PM1A_CNT_PORT, fadt->pm1a_control_block);
+    CHECK_HEX("fadt declares PM_TMR_BLK", HYPE_ACPI_PM_TMR_PORT, fadt->pm_timer_block);
+    CHECK_HEX("fadt points at the FACS", layout.facs_offset, fadt->facs);
+    /* IAPC_BOOT_ARCH must name the legacy hardware hype models (8042, PIC,
+     * PIT, RTC, UARTs) rather than leaving a guest to assume none exists. */
+    CHECK_HEX("fadt declares the 8042", 1,
+              (fadt->boot_flags & HYPE_ACPI_FADT_BOOT_ARCH_8042) != 0);
     CHECK_HEX("fadt.dsdt holds dsdt's blob-relative offset", layout.dsdt_offset, fadt->dsdt);
     CHECK_HEX("fadt.x_dsdt holds dsdt's blob-relative offset", layout.dsdt_offset, fadt->x_dsdt);
 

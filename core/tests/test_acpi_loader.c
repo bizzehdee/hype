@@ -120,8 +120,11 @@ static void test_build_script_entry_count_and_shape(void) {
         }
     }
     CHECK_HEX("2 ALLOCATE entries (rsdp + tables)", 2, allocate_count);
-    CHECK_HEX("6 ADD_POINTER entries (rsdp->xsdt, xsdt->{fadt,madt,mcfg}, fadt->{dsdt,x_dsdt})", 6,
-              pointer_count);
+    /* #436: fadt->{facs,x_facs} joined the set when hype started emitting a
+     * FACS -- a non-hardware-reduced platform has one, and the FADT must point
+     * at it. The FACS has no SDT header, so it takes pointers but no checksum. */
+    CHECK_HEX("8 ADD_POINTER entries (rsdp->xsdt, xsdt->{fadt,madt,mcfg}, "
+              "fadt->{dsdt,x_dsdt,facs,x_facs})", 8, pointer_count);
     CHECK_HEX("7 ADD_CHECKSUM entries (5 tables + rsdp's own 2)", 7, checksum_count);
 
     /* Spot-check a couple of the pointer entries land on the offsets

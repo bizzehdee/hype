@@ -119,10 +119,14 @@ static void test_hv_counters_are_read_only(void) {
               hype_msr_decide_ex(HYPE_MSR_NUMBER_HV_TIME_REF_COUNT, 1, 1));
 }
 
-static void test_hv_reference_tsc_msr_not_claimed(void) {
-    /* CPUID leaf 0x40000003 deliberately does not claim AccessPartitionReferenceTsc,
-     * so its MSR must stay unclaimed here too -- the two must not drift. */
-    CHECK_HEX("REFERENCE_TSC still unknown", HYPE_MSR_ACTION_REJECT,
+static void test_hv_reference_tsc_msr_matches_cpuid(void) {
+    /* The pairing this guards is what matters, not the direction: CPUID leaf
+     * 0x40000003 and the MSR decoder must agree. Since #436 hype implements the
+     * reference-TSC page, so the leaf claims AccessPartitionReferenceTsc and the
+     * MSR is answered here -- claiming one without the other is the drift this
+     * test exists to catch. Synic stays unclaimed on both sides. */
+    CHECK_HEX("REFERENCE_TSC answered (matches the claimed CPUID bit)",
+              HYPE_MSR_ACTION_READWRITE_HV_REFERENCE_TSC,
               hype_msr_decide_ex(0x40000021u, 0, 1));
     CHECK_HEX("SCONTROL (synic) still unknown", HYPE_MSR_ACTION_REJECT,
               hype_msr_decide_ex(0x40000080u, 1, 1));
@@ -169,7 +173,7 @@ int main(void) {
     test_hv_msrs_rejected_when_hv_disabled();
     test_hv_os_id_and_hypercall_are_readwrite();
     test_hv_counters_are_read_only();
-    test_hv_reference_tsc_msr_not_claimed();
+    test_hv_reference_tsc_msr_matches_cpuid();
     test_hv_enable_does_not_disturb_existing_msrs();
     test_hv_ref_count_conversion();
 

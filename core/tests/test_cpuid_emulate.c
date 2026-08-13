@@ -424,16 +424,22 @@ static void test_hv_enabled_relocates_kvm_leaves(void) {
 
 static void test_hv_privilege_mask_only_claims_backed_msrs(void) {
     /* Each bit here promises an MSR group that hype_msr_decide_ex() must actually
-     * answer. Reference TSC (bit 9) is deliberately absent: there is no
-     * reference-TSC page, and claiming it would make Windows read a page hype never
-     * fills. */
+     * answer. Reference TSC (bit 9) and the frequency MSRs (bit 11) ARE claimed
+     * since #436: hype fills a real reference-TSC page (devices/../cpu/hyperv.c)
+     * and answers the TSC/APIC frequency MSRs, so the promise is backed. The
+     * groups still absent -- synic, synthetic timers -- stay absent, because
+     * claiming an MSR group nothing answers is the failure this test exists to
+     * catch. */
     hype_cpuid_result_t real = {0, 0, 0, 0};
     hype_cpuid_result_t out;
 
     hype_cpuid_emulate_ex(0x40000003u, 0, 1, &real, &out);
-    CHECK_HEX("privileges: ref counter | hypercall MSRs | vp index",
-              (1u << 1) | (1u << 5) | (1u << 6), out.eax);
-    CHECK_HEX("reference TSC NOT claimed (bit 9)", 0, (out.eax & (1u << 9)) != 0);
+    CHECK_HEX("privileges: ref counter | hypercall MSRs | vp index | ref TSC | freq MSRs",
+              (1u << 1) | (1u << 5) | (1u << 6) | (1u << 9) | (1u << 11), out.eax);
+    CHECK_HEX("reference TSC claimed (bit 9) -- hype fills the page", 1,
+              (out.eax & (1u << 9)) != 0);
+    CHECK_HEX("frequency MSRs claimed (bit 11) -- hype answers them", 1,
+              (out.eax & (1u << 11)) != 0);
     CHECK_HEX("synic NOT claimed (bit 2)", 0, (out.eax & (1u << 2)) != 0);
     CHECK_HEX("synthetic timers NOT claimed (bit 3)", 0, (out.eax & (1u << 3)) != 0);
     CHECK_HEX("privilege mask high empty", 0u, out.ebx);
