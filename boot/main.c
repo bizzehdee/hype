@@ -1824,6 +1824,8 @@ volatile uint64_t g_436_last_reason[HYPE_FW_MAX_VMS];
 volatile uint64_t g_436_last_rip[HYPE_FW_MAX_VMS];
 
 volatile uint64_t g_436_ap_host_rip[HYPE_FW_MAX_VMS + 1u];
+volatile uint32_t g_436_lvt_last_old, g_436_lvt_last_new;
+volatile uint64_t g_436_lvt_change_count;
 
 static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
     {
@@ -9881,7 +9883,13 @@ static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
     cfg.mcfg_base_address = HYPE_FW_1_ECAM_GPA;
     cfg.pci_segment = 0;
     cfg.pci_start_bus = 0;
-    cfg.pci_end_bus = 255;
+    /* #436: hype implements bus 0 only, and the ECAM NPF handler traps just
+     * bus 0's window (HYPE_PCI_ECAM_BUS0_SIZE). Advertising 255 made Windows'
+     * cdboot enumerate buses 1-255 via ECAM MMIO; those reads fell to the
+     * unhandled-MMIO catch-all (which silences the region), so cdboot stormed
+     * the same RIP until the watchdog forced the guest off. Advertise the one
+     * bus that exists so the guest never generates the phantom-bus scan. */
+    cfg.pci_end_bus = 0;
     cfg.sci_interrupt = 9;
     cfg.pci_window_base = vm->ram_bytes;
 
@@ -11977,6 +11985,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                              (unsigned)g_fw_1_lapic.init_count,
                                              (unsigned)g_fw_1_lapic.lvt_timer,
                                              (unsigned long long)g_fw_1_lapic.eoi_count);
+                            hype_debug_print("fw-1 LVTMASK: changes=%llu last 0x%x->0x%x [#436]\n",
+                                             (unsigned long long)g_436_lvt_change_count,
+                                             (unsigned)g_436_lvt_last_old,
+                                             (unsigned)g_436_lvt_last_new);
                             lt_prev = lt_sum;
                         }
                     }
