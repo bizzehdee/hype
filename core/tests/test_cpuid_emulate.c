@@ -105,12 +105,19 @@ static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
      * an un-intercepted MWAIT never exits, so the guest must not be offered it). */
     CHECK_HEX("ecx otherwise passthrough",
               (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21) & ~(1u << 3), out.ecx);
-    CHECK_HEX("MTRR bit forced clear", 0, (out.edx & (1u << 12)) != 0);
-    /* #436: HTT (bit 28) is now cleared alongside MTRR (bit 12). */
-    CHECK_HEX("edx otherwise passthrough", real.edx & ~(1u << 12) & ~(1u << 28), out.edx);
+    /* #436: MTRR is REPORTED, because hype models the MTRR MSRs (MTRRcap,
+     * MTRRdefType, the variable pairs and the fixed ranges). Clearing it while
+     * implementing it made a strict guest see a processor missing a required
+     * feature -- Windows answers that with bugcheck 0x5D UNSUPPORTED_PROCESSOR,
+     * read out of its own bugcheck record. */
+    CHECK_HEX("MTRR bit reported (the MSRs are modelled)", 1, (out.edx & (1u << 12)) != 0);
+    /* Only HTT (bit 28) is cleared now: one logical processor. */
+    CHECK_HEX("edx otherwise passthrough", real.edx & ~(1u << 28), out.edx);
 }
 
-static void test_leaf1_mtrr_already_clear_is_idempotent(void) {
+static void test_leaf1_mtrr_absent_on_the_host_stays_absent(void) {
+    /* If a host somehow lacked MTRR, hype must not invent it -- the bit is
+     * passed through, not forced on. */
     hype_cpuid_result_t real = {0, 0, 0, 0xFFFFEFFFu}; /* MTRR bit already 0 */
     hype_cpuid_result_t out;
 
@@ -535,7 +542,7 @@ int main(void) {
     test_leaf0_vendor_is_passed_through();
     test_ext_leaf0_vendor_matches_basic_leaf0();
     test_leaf1_forces_hypervisor_bit_and_clears_mtrr();
-    test_leaf1_mtrr_already_clear_is_idempotent();
+    test_leaf1_mtrr_absent_on_the_host_stays_absent();
     test_leaf_ext1_clears_svm_bit();
     test_leaf_ext1_svm_already_clear_is_idempotent();
     test_leaf_ext8_address_sizes_passthrough();

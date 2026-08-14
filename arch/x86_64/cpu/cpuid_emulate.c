@@ -212,10 +212,22 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
          * to 0 (the single modeled vCPU). #436: without the [23:16]=1 clamp the guest reads
          * the host's HT count and tries to start that many APs. */
         out->ebx = (real->ebx & 0x0000FFFFu) | (1u << 16);
-        /* EDX: clear MTRR (unmodeled) and HTT (#436: single logical processor -- see the
-         * HYPE_CPUID_LEAF1_EDX_HTT_BIT comment). */
-        out->edx = real->edx & ~HYPE_CPUID_LEAF1_EDX_MTRR_BIT & ~HYPE_CPUID_LEAF1_EDX_HTT_BIT;
-        /* Hypervisor-present set; MTRR already cleared above. Also clear
+        /*
+         * EDX: clear HTT (#436: single logical processor -- see the
+         * HYPE_CPUID_LEAF1_EDX_HTT_BIT comment).
+         *
+         * #436: MTRR is NO LONGER cleared. It was, on the grounds that MTRRs
+         * were "unmodeled" -- but they have been modelled since the MTRR MSR
+         * round-trip and WB-default work: hype answers MTRRcap, MTRRdefType,
+         * the eight variable base/mask pairs and the fixed ranges. Denying the
+         * feature while implementing it is the same describe-a-different-
+         * machine defect as the MCFG bus range and the hardware-reduced FADT
+         * flag, and it is the one a strict OS refuses outright: MTRR is a
+         * required processor feature, so a guest that checks the bit sees an
+         * unsupported CPU and stops rather than boots.
+         */
+        out->edx = real->edx & ~HYPE_CPUID_LEAF1_EDX_HTT_BIT;
+        /* Hypervisor-present set. Also clear
          * TSC_DEADLINE (ECX bit 24): with it set, a guest OS arms its
          * LAPIC timer via the IA32_TSC_DEADLINE MSR (0x6e0) -- a mode
          * this project does not model, so no timer interrupt would ever
