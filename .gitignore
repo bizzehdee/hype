@@ -61,3 +61,6 @@ fw/OVMF_VARS.debug.fd
 # -m allocation needs. A 2 GB ESP image there competes with the VM it is meant to
 # boot, and filling it takes the whole shell down with it.
 disk-images/
+
+# #436: rig images -- large, rebuildable by tools/436/make-win-rig.sh
+rig/
