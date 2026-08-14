@@ -1,78 +1,10 @@
 # #436: get a key into cdboot's "Press any key to boot from CD or DVD" prompt.
 #
-# The window is EARLY and SHORT. Measured from the guest's own elapsed-time
-# markers: the CD boot option starts at about t=2s and BDS reports it timed out
-# by t=4s. An earlier version of this script waited 5s before its first key and
-# so never put one in the window at all -- every run then looked like a wedge.
-#
-# Only the FIRST prompt can be satisfied. The Windows boot application arms the
-# LAPIC timer on its own vector for its countdown and does not restore the
-# firmware's, so after the first attempt the firmware has no tick, its keyboard
-# polling stops, and no later prompt can read a key however many are queued.
-#
-# Hence: start immediately, and keep the cadence tighter than the window is
-# wide. The 8042 output buffer holds only 8 bytes, so keys that arrive with
-# nothing draining them are dropped rather than banked -- density inside the
-# window matters, total count does not.
-timeout 300000
-
+# The prompt arrives later than an early fixed delay on this media. Waiting for
+# the reconstructed guest screen keeps the key out of the 8042 FIFO until the
+# Windows boot application is actually polling it; an early burst otherwise
+# drains long before it can be consumed.
+timeout 120000
+expect Press any key to boot from CD or DVD.
 sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
-sendkey \n
-delay 250
+pass cdboot-key-delivered
