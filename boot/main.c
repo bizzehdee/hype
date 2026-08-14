@@ -7842,6 +7842,27 @@ static __attribute__((noinline)) void fw_1_hpet_step(hype_fw_vm_t *vm, hype_vcpu
                          g_fw_1_host_tsc_hz;
     }
     fired = hype_hpet_sync(&g_fw_1_hpet, hpet_ticks);
+    /*
+     * #436: a LEVEL-triggered comparator asserts its line for as long as its
+     * interrupt-status bit is set, and deasserts when the guest clears it.
+     * hype only ever pulsed an edge and never deasserted, which leaves an
+     * IO-APIC entry's Remote-IRR latched for a level entry -- after which that
+     * line never delivers again. Deassert any level comparator whose status the
+     * guest has since cleared, every step, not only when one fires.
+     */
+    {
+        unsigned li;
+        for (li = 0; li < HYPE_HPET_NUM_TIMERS; li++) {
+            int lg = hype_hpet_timer_gsi(&g_fw_1_hpet, li);
+            if (lg < 0 ||
+                (g_fw_1_hpet.timers[li].config & HYPE_HPET_TIMER_INT_TYPE_LEVEL) == 0u) {
+                continue;
+            }
+            if ((g_fw_1_hpet.int_status & (1ull << li)) == 0u) {
+                hype_ioapic_deassert(&g_fw_1_ioapic, (uint32_t)lg);
+            }
+        }
+    }
     if (fired == 0u) {
         return;
     }
