@@ -206,6 +206,20 @@ static void test_focus_handles_no_available_vms(void) {
           hype_term_focus_validate(-5, none, 2u) == -1);
 }
 
+static void test_focus_resolves_configured_vm_name_before_ready(void) {
+    const char *names[2] = {"win10", "bsd"};
+    const unsigned char avail[2] = {0u, 1u};
+
+    CHECK("configured vm name resolves", hype_term_focus_find_name("win10", names, 2u) == 0);
+    CHECK("second configured vm name resolves", hype_term_focus_find_name("bsd", names, 2u) == 1);
+    CHECK("unknown configured vm name is rejected",
+          hype_term_focus_find_name("missing", names, 2u) == -1);
+    CHECK("empty configured vm name is rejected", hype_term_focus_find_name("", names, 2u) == -1);
+    CHECK("name lookup does not mistake an unready VM for unknown",
+          hype_term_focus_find_name("win10", names, 2u) == 0 &&
+          hype_term_focus_validate(0, avail, 2u) == -1);
+}
+
 static void test_focus_preserves_normal_two_vm_cycle(void) {
     const unsigned char avail[2] = {1u, 1u};
     CHECK("dashboard next vm0",
@@ -303,6 +317,7 @@ int main(void) {
     test_cpu_null_safe();
     test_focus_skips_undispatched_vms();
     test_focus_handles_no_available_vms();
+    test_focus_resolves_configured_vm_name_before_ready();
     test_focus_preserves_normal_two_vm_cycle();
 
     if (failures == 0) { printf("all tests passed\n"); return 0; }

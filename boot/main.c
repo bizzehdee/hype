@@ -991,6 +991,13 @@ static uint64_t g_usable_ram_bytes;
  * across cores, but only the console-owner core (the one running g_vms[0])
  * ever reads it to drive input+display, so no cross-core GOP contention. */
 static volatile int g_term_view = -1;
+/* #437: `dashboard_default_view = vm:<name>` is resolved from the parsed
+ * config before APs start, but selected only once that VM has published its
+ * display/input runtime state as ready.  A failed AP therefore leaves the
+ * operator on the safe dashboard rather than a dead view. */
+static int g_term_default_view_pending;
+static int g_term_default_view_target = -1;
+static const char *g_term_cfg_vm_names[HYPE_CFG_MAX_VMS];
 /* #379: only VMs whose runtime display/input state has been initialized may
  * own focus. AP startup can fail after configuration and media preparation;
  * the configured VM count is therefore not a readiness signal. */
@@ -8443,6 +8450,18 @@ static void fw_1_render_console(void) {
         return;
     }
     last_gop_flush_tsc = now_gf;
+    if (g_term_default_view_pending &&
+        hype_term_focus_validate(g_term_default_view_target,
+                                 (const unsigned char *)g_vm_ready, g_vm_count) >= 0) {
+        g_term_view = g_term_default_view_target;
+        g_term_default_view_pending = 0;
+        hype_render_budget_reset(&g_view_render_budget[g_term_view]);
+        g_view_switch_pending_view = g_term_view;
+        g_view_switch_started_tsc = hype_rdtsc();
+        g_view_switch_passes = 0u;
+        hype_debug_print("cfg: dashboard_default_view selected vm%d after runtime became ready [#437]\n",
+                         g_term_view);
+    }
     view = g_term_view;
     {
         const unsigned char *ready = (const unsigned char *)g_vm_ready;
@@ -10164,7 +10183,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * (mem is a compile constant, ISO a single global), so these mirror the
      * current single-Linux-guest reality; multi-OS/config-driven values come
      * with the config->VM plumbing (tracked separately). */
-    vm->name = (vm == &g_vms[0]) ? "vm0" : "vm1";
+    {
+        unsigned int vm_index = (unsigned int)(vm - g_vms);
+        vm->name = (vm_index < g_hype_cfg.vm_count && g_hype_cfg.vms[vm_index].name[0] != '\0')
+                       ? g_hype_cfg.vms[vm_index].name
+                       : ((vm_index == 0u) ? "vm0" : "vm1");
+    }
     /* #357: the display name from `label`, kept OFF vm->name -- see the field comments. This is the
      * "no cfg->runtime wiring exists yet" note above, closed for the display name only. */
     vm->label = fw_1_resolve_vm_label(vm);
@@ -17292,6 +17316,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * (the parser caps it at HYPE_CFG_MAX_VMS; the core/RAM admission bound is
      * #396). No hype.cfg keeps the built-in two-VM default. */
     g_vm_count = g_hype_cfg.vm_count ? g_hype_cfg.vm_count : 2u;
+    if (g_hype_cfg.hype.dashboard_default_view == HYPE_CFG_VIEW_VM) {
+        unsigned int vi;
+        for (vi = 0u; vi < g_hype_cfg.vm_count; vi++) {
+            g_term_cfg_vm_names[vi] = g_hype_cfg.vms[vi].name;
+        }
+        g_term_default_view_target = hype_term_focus_find_name(
+            g_hype_cfg.hype.dashboard_default_vm, g_term_cfg_vm_names, g_hype_cfg.vm_count);
+        if (g_term_default_view_target < 0) {
+            hype_debug_print("cfg: dashboard_default_view names unknown vm '%s' -- using dashboard [#437]\n",
+                             g_hype_cfg.hype.dashboard_default_vm);
+        } else {
+            g_term_default_view_pending = 1;
+            hype_debug_print("cfg: dashboard_default_view waiting for vm%d ('%s') runtime [#437]\n",
+                             g_term_default_view_target, g_hype_cfg.hype.dashboard_default_vm);
+        }
+    }
     {
         UINTN vm_bytes = (UINTN)g_vm_count * sizeof(hype_fw_vm_t);
         UINTN vm_pages = (vm_bytes + 4095u) / 4096u;

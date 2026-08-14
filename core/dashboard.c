@@ -108,6 +108,20 @@ int hype_term_focus_validate(int view, const unsigned char *available, unsigned 
     return term_vm_available((unsigned int)view, available, nvm) ? view : -1;
 }
 
+int hype_term_focus_find_name(const char *name, const char *const *names, unsigned int nvm) {
+    unsigned int i;
+
+    if (name == 0 || name[0] == '\0' || names == 0) return -1;
+    for (i = 0u; i < nvm; i++) {
+        const char *candidate = names[i];
+        unsigned int j = 0u;
+        if (candidate == 0) continue;
+        while (name[j] != '\0' && name[j] == candidate[j]) j++;
+        if (name[j] == '\0' && candidate[j] == '\0') return (int)i;
+    }
+    return -1;
+}
+
 int hype_term_focus_apply(int current, hype_term_focus_action_t action,
                           unsigned int jump_index, const unsigned char *available,
                           unsigned int nvm) {

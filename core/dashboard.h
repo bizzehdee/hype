@@ -131,4 +131,9 @@ int hype_term_focus_apply(int current, hype_term_focus_action_t action,
                           unsigned int jump_index, const unsigned char *available,
                           unsigned int nvm);
 
+/* Resolve a configured VM name to its index without making availability part of
+ * the answer.  Startup uses this before vCPUs are dispatched, then waits for
+ * hype_term_focus_validate() to say the requested view is safe to render. */
+int hype_term_focus_find_name(const char *name, const char *const *names, unsigned int nvm);
+
 #endif /* HYPE_DASHBOARD_H */

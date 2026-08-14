@@ -22,11 +22,15 @@ SHOT=${SHOT:-$RIG/screen.ppm}
 
 [ -f "$RIG/media.img" ] || { echo "rig/media.img missing -- run tools/436/make-win-rig.sh"; exit 1; }
 
-# Refresh only hype.efi in the ESP: re-copying the 5.8 GB media per run would
-# dominate the cycle, and the media does not change between builds.
+# Refresh the small mutable ESP files.  Re-copying the 5.8 GB media per run
+# would dominate the cycle, but a changed rig config or input script must not
+# silently leave a run using stale validation settings.
 if [ -f "$REPO/build/hype.efi" ]; then
     mcopy -i "$RIG/media.img@@1M" -o "$REPO/build/hype.efi" ::/EFI/BOOT/BOOTX64.EFI
 fi
+mcopy -i "$RIG/media.img@@1M" -o "$HERE/hype.cfg" ::/hype.cfg
+[ ! -f "$HERE/input-vm0.txt" ] || \
+    mcopy -i "$RIG/media.img@@1M" -o "$HERE/input-vm0.txt" ::/input/vm0.txt
 cp -f "$REPO/fw/OVMF_VARS.fd" "$RIG/host-vars.fd"
 
 # Match the process NAME truncated to the 15 characters the kernel keeps in
