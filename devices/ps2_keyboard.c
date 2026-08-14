@@ -261,6 +261,10 @@ int hype_ps2_kbd_take_irq(hype_ps2_kbd_t *kbd) {
     return 1;
 }
 
+int hype_ps2_kbd_has_pending_irq(const hype_ps2_kbd_t *kbd) {
+    return kbd->irq_edges != 0u;
+}
+
 unsigned hype_ps2_kbd_trace_event(const hype_ps2_kbd_t *kbd, unsigned i, uint16_t *out) {
     if (i >= kbd->trace_count || out == 0) {
         return 0;

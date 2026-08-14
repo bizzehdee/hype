@@ -1052,10 +1052,14 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
     if (io.port == HYPE_PS2_PORT_DATA) {
         if (io.is_in) {
             uint8_t value;
-            if (hype_ps2_mouse_has_pending_byte(mouse)) {
-                value = hype_ps2_mouse_read_byte(mouse);
-            } else {
+            /* The model keeps upstream keyboard and auxiliary FIFOs
+             * separately, but the i8042 exposes one output buffer. Prefer a
+             * waiting keyboard byte so an old auxiliary reply cannot make the
+             * guest observe AUX_DATA forever and starve interactive input. */
+            if (hype_ps2_kbd_has_pending_byte(kbd)) {
                 hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_DATA, &value);
+            } else {
+                value = hype_ps2_mouse_read_byte(mouse);
             }
             real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
             traced_value = value;
@@ -1072,7 +1076,8 @@ int hype_svm_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
         if (io.is_in) {
             uint8_t status;
             hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_STATUS_COMMAND, &status);
-            if (hype_ps2_mouse_has_pending_byte(mouse)) {
+            if (!hype_ps2_kbd_has_pending_byte(kbd) &&
+                hype_ps2_mouse_has_pending_byte(mouse)) {
                 status |= HYPE_PS2_STATUS_OUTPUT_FULL | HYPE_PS2_STATUS_AUX_DATA;
             }
             /* A status read with the output buffer empty is the guest

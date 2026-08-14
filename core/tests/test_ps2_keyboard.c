@@ -180,6 +180,9 @@ static void test_has_pending_byte(void) {
 
     hype_ps2_kbd_enqueue_scancode(&kbd, 0x1Eu);
     CHECK_HEX("pending after enqueue", 1, hype_ps2_kbd_has_pending_byte(&kbd));
+    CHECK_HEX("IRQ pending after enqueue", 1, hype_ps2_kbd_has_pending_irq(&kbd));
+    CHECK_HEX("IRQ consumed", 1, hype_ps2_kbd_take_irq(&kbd));
+    CHECK_HEX("no stale IRQ after consume", 0, hype_ps2_kbd_has_pending_irq(&kbd));
 }
 
 /* FW-1f: keyboard reset (0xFF via 0x60) must return ACK (0xFA) THEN

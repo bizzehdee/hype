@@ -2067,10 +2067,12 @@ int hype_vmx_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
     if (port == HYPE_PS2_PORT_DATA) {
         if (is_in) {
             uint8_t value;
-            if (hype_ps2_mouse_has_pending_byte(mouse)) {
-                value = hype_ps2_mouse_read_byte(mouse);
-            } else {
+            /* See the SVM handler: one controller output buffer cannot let a
+             * stale auxiliary reply permanently hide a waiting keyboard byte. */
+            if (hype_ps2_kbd_has_pending_byte(kbd)) {
                 hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_DATA, &value);
+            } else {
+                value = hype_ps2_mouse_read_byte(mouse);
             }
             real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
         } else {
@@ -2085,7 +2087,8 @@ int hype_vmx_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
         if (is_in) {
             uint8_t status = 0;
             hype_ps2_kbd_io_read(kbd, HYPE_PS2_PORT_STATUS_COMMAND, &status);
-            if (hype_ps2_mouse_has_pending_byte(mouse)) {
+            if (!hype_ps2_kbd_has_pending_byte(kbd) &&
+                hype_ps2_mouse_has_pending_byte(mouse)) {
                 status |= HYPE_PS2_STATUS_OUTPUT_FULL | HYPE_PS2_STATUS_AUX_DATA;
             }
             if (out_kbd_wait != 0 && (status & HYPE_PS2_STATUS_OUTPUT_FULL) == 0) {

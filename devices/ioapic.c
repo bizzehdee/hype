@@ -88,8 +88,9 @@ int hype_ioapic_raise(hype_ioapic_t *io, uint32_t gsi, uint8_t *out_vector) {
         return 0; /* masked -- no delivery */
     }
     delmode = (uint32_t)((entry & HYPE_IOAPIC_RTE_DELMODE_MASK) >> HYPE_IOAPIC_RTE_DELMODE_SHIFT);
-    if (delmode != HYPE_IOAPIC_DELMODE_FIXED) {
-        return 0; /* only Fixed-mode plain-vector delivery is modeled */
+    if (delmode != HYPE_IOAPIC_DELMODE_FIXED &&
+        delmode != HYPE_IOAPIC_DELMODE_LOWEST_PRIORITY) {
+        return 0; /* NMI/SMI/INIT/ExtINT are not plain external vectors */
     }
 
     if ((entry & HYPE_IOAPIC_RTE_TRIGGER_LEVEL) != 0) {

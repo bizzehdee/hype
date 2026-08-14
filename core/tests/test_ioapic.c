@@ -127,9 +127,15 @@ static void test_masked_and_nonfixed_and_oob(void) {
     hype_ioapic_reset(&io);
     /* masked (reset default) */
     CHECK_HEX("masked entry does not raise", 0, hype_ioapic_raise(&io, 4u, &vec));
+    /* Windows routes legacy PS/2 GSIs as Lowest Priority. With one guest
+     * vCPU, that selects the same destination as Fixed and must deliver. */
+    reg_write(&io, HYPE_IOAPIC_INDEX_REDIR_BASE + 4u * 2u,
+              0x60u | (HYPE_IOAPIC_DELMODE_LOWEST_PRIORITY << HYPE_IOAPIC_RTE_DELMODE_SHIFT));
+    CHECK_HEX("lowest-priority delivery injects on one vCPU", 1, hype_ioapic_raise(&io, 4u, &vec));
+    CHECK_HEX("lowest-priority preserves vector", 0x60u, vec);
     /* unmasked but NMI delivery mode (100b) -> not a plain vector */
     reg_write(&io, HYPE_IOAPIC_INDEX_REDIR_BASE + 4u * 2u, 0x60u | (0x4u << HYPE_IOAPIC_RTE_DELMODE_SHIFT));
-    CHECK_HEX("non-Fixed delivery mode does not inject a vector", 0, hype_ioapic_raise(&io, 4u, &vec));
+    CHECK_HEX("NMI delivery mode does not inject a vector", 0, hype_ioapic_raise(&io, 4u, &vec));
     /* out-of-range GSI */
     CHECK_HEX("out-of-range gsi does not raise", 0, hype_ioapic_raise(&io, HYPE_IOAPIC_NUM_RTES, &vec));
 }

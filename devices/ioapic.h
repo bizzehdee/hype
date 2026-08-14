@@ -76,10 +76,11 @@
 #define HYPE_IOAPIC_RTE_TRIGGER_LEVEL (1u << 15)
 #define HYPE_IOAPIC_RTE_MASK (1u << 16)
 
-/* Delivery mode 000 = Fixed (the only mode this router injects a plain vector
- * for; NMI/SMI/INIT/ExtINT are not modeled -- an ACPI PC guest routes ordinary
- * device lines as Fixed). */
+/* Lowest Priority differs from Fixed only in destination selection. Hype's
+ * per-VM IO-APIC has one eligible vCPU, so both modes inject the same vector;
+ * NMI/SMI/INIT/ExtINT remain intentionally unsupported. */
 #define HYPE_IOAPIC_DELMODE_FIXED 0u
+#define HYPE_IOAPIC_DELMODE_LOWEST_PRIORITY 1u
 
 typedef struct {
     uint32_t ioregsel;                     /* last value written to IOREGSEL */
@@ -110,11 +111,11 @@ int hype_ioapic_mmio_write(hype_ioapic_t *io, uint32_t offset, uint32_t value);
 
 /*
  * A device just asserted GSI line `gsi`. If the entry is programmed for
- * delivery (unmasked, Fixed delivery mode) this returns 1 and sets
+ * delivery (unmasked Fixed or Lowest-Priority delivery mode) this returns 1 and sets
  * *out_vector to the vector to inject into the guest LAPIC; for a
  * level-triggered entry it also latches Remote-IRR so a still-asserted line
  * won't re-inject until the guest EOIs. Returns 0 (no injection) when the
- * entry is masked, not Fixed, out of range, or a level entry whose Remote-IRR
+ * entry is masked, an unsupported mode, out of range, or a level entry whose Remote-IRR
  * is already set. Pure.
  */
 int hype_ioapic_raise(hype_ioapic_t *io, uint32_t gsi, uint8_t *out_vector);

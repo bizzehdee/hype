@@ -669,6 +669,11 @@ typedef struct hype_fw_vm {
     uint32_t in_send_pos;
     int in_send_is_key;
     uint64_t in_send_stall_since_ms; /* 0 = not stalling */
+    /* A successful enqueue only proves that Hype accepted a scancode.  Hold a
+     * sendkey directive until the guest has actually read every one, so a
+     * scripted PASS cannot conceal a stuck IRQ1/OBF transport. */
+    unsigned long long in_send_read_goal;
+    uint64_t in_send_read_stall_since_ms; /* 0 = not waiting for reads */
     /* M8-8 (#171): this VM's own fault watchdog. Per-VM so a faulted guest is forced
      * off ALONE -- condemning a healthy sibling would be worse than the hang. */
     hype_vm_watchdog_t watchdog;
@@ -12961,12 +12966,46 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * same shape the SYSRQ injector and every other guest IRQ here use.
          */
         g_436_loop_section[(unsigned)(vm-g_vms)]=72;
-        if (hype_ps2_kbd_take_irq(&g_fw_1_ps2)) {
+        {
+            /* The controller's output buffer can already hold a firmware
+             * reply when Windows takes ownership. A new scancode appended to
+             * that buffer must still cause IRQ1: a real i8042 keeps the
+             * output condition asserted, whereas a one-shot FIFO edge loses
+             * the input forever behind the pre-existing byte. */
+            static uint64_t kbd_rte1_last;
+            static unsigned long long kbd_queued_last;
+            static int kbd_rte1_seen;
+            static int kbd_obf_irq_delivered;
+            unsigned long long kbd_queued = 0;
+            unsigned long long ignored_read = 0, ignored_dropped = 0;
+            int kbd_route_changed = kbd_rte1_seen &&
+                kbd_rte1_last != g_fw_1_ioapic.rte[1];
             uint8_t kiov;
-            if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &kiov)) {
-                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, kiov);
-            } else {
-                hype_pic_emu_raise_global_irq(&g_fw_1_pic, 1u);
+
+            hype_ps2_kbd_scancode_stats(&g_fw_1_ps2, &kbd_queued, &ignored_read,
+                                         &ignored_dropped);
+            if (kbd_route_changed || kbd_queued != kbd_queued_last ||
+                !hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
+                kbd_obf_irq_delivered = 0;
+            }
+            kbd_rte1_last = g_fw_1_ioapic.rte[1];
+            kbd_rte1_seen = 1;
+            kbd_queued_last = kbd_queued;
+            if (hype_ps2_kbd_has_pending_irq(&g_fw_1_ps2) ||
+                (!kbd_obf_irq_delivered && hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2))) {
+                if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &kiov)) {
+                    if (hype_ps2_kbd_has_pending_irq(&g_fw_1_ps2)) {
+                        (void)hype_ps2_kbd_take_irq(&g_fw_1_ps2);
+                    }
+                    kbd_obf_irq_delivered = 1;
+                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, kiov);
+                } else if ((g_fw_1_pic.master.imr & (uint8_t)(1u << 1)) == 0) {
+                    if (hype_ps2_kbd_has_pending_irq(&g_fw_1_ps2)) {
+                        (void)hype_ps2_kbd_take_irq(&g_fw_1_ps2);
+                    }
+                    kbd_obf_irq_delivered = 1;
+                    hype_pic_emu_raise_global_irq(&g_fw_1_pic, 1u);
+                }
             }
         }
         /* PS/2 auxiliary output uses IRQ12, including mouse-command replies.
@@ -16127,6 +16166,37 @@ static int fw_1_script_drain_send(hype_fw_vm_t *vm, unsigned vm_index, hype_gues
     return 1;
 }
 
+static int fw_1_script_wait_for_key_reads(hype_fw_vm_t *vm, unsigned vm_index,
+                                          uint64_t now_ms) {
+    unsigned long long ignored_queued = 0, read = 0, ignored_dropped = 0;
+
+    if (!vm->in_send_is_key || vm->in_send_pos < vm->in_send_len) {
+        return 1;
+    }
+    hype_ps2_kbd_scancode_stats(&vm->ps2, &ignored_queued, &read, &ignored_dropped);
+    if (read >= vm->in_send_read_goal) {
+        vm->in_send_len = 0;
+        vm->in_send_pos = 0;
+        vm->in_send_read_stall_since_ms = 0;
+        return 1;
+    }
+    if (vm->in_send_read_stall_since_ms == 0u) {
+        vm->in_send_read_stall_since_ms = now_ms;
+    }
+    if (now_ms - vm->in_send_read_stall_since_ms >= (uint64_t)HYPE_SCRIPT_SEND_STALL_MS) {
+        hype_debug_print("fw-1 SCRIPT vm%u: guest did not read %llu delivered sendkey "
+                         "scancode(s); failing the script rather than reporting a false PASS "
+                         "[#93]\n", vm_index,
+                         vm->in_send_read_goal - read);
+        vm->in_send_len = 0;
+        vm->in_send_pos = 0;
+        vm->in_send_read_stall_since_ms = 0;
+        hype_input_runner_transport_stalled(&vm->in_runner);
+        return 1;
+    }
+    return 0;
+}
+
 static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uart_t *uart,
                              uint64_t now_ms) {
     hype_input_action_t act;
@@ -16140,6 +16210,9 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
         !fw_1_script_drain_send(vm, vm_index, uart, now_ms)) {
         return;
     }
+    if (!fw_1_script_wait_for_key_reads(vm, vm_index, now_ms)) {
+        return;
+    }
     for (;;) {
         hype_input_action_kind_t k = hype_input_runner_poll(&vm->in_runner, now_ms, &act);
         if (k == HYPE_INPUT_ACTION_SEND) {
@@ -16151,6 +16224,7 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
             vm->in_send_pos = 0;
             vm->in_send_is_key = 0;
             vm->in_send_stall_since_ms = 0;
+            vm->in_send_read_stall_since_ms = 0;
             if (!fw_1_script_drain_send(vm, vm_index, uart, now_ms)) {
                 return; /* device full -- resume on the next dispatch iteration */
             }
@@ -16168,6 +16242,7 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
              * asked for should say so rather than type a different string.
              */
             uint32_t i;
+            unsigned long long ignored_queued = 0, read = 0, ignored_dropped = 0;
             vm->in_send_len = 0;
             for (i = 0; i < act.len; i++) {
                 uint8_t codes[HYPE_SCANCODE_MAX_PER_CHAR];
@@ -16189,7 +16264,14 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
             vm->in_send_pos = 0;
             vm->in_send_is_key = 1;
             vm->in_send_stall_since_ms = 0;
+            vm->in_send_read_stall_since_ms = 0;
+            hype_ps2_kbd_scancode_stats(&vm->ps2, &ignored_queued, &read,
+                                         &ignored_dropped);
+            vm->in_send_read_goal = read + vm->in_send_len;
             if (!fw_1_script_drain_send(vm, vm_index, uart, now_ms)) {
+                return;
+            }
+            if (!fw_1_script_wait_for_key_reads(vm, vm_index, now_ms)) {
                 return;
             }
             continue;

@@ -206,6 +206,10 @@ void hype_ps2_kbd_scancode_stats(const hype_ps2_kbd_t *kbd,
  */
 int hype_ps2_kbd_take_irq(hype_ps2_kbd_t *kbd);
 
+/* Non-consuming counterpart used by controller glue that must retain an
+ * unread output-buffer event until an interrupt route can accept it. */
+int hype_ps2_kbd_has_pending_irq(const hype_ps2_kbd_t *kbd);
+
 /* #436: read back the port-event ring, oldest first. */
 unsigned hype_ps2_kbd_trace_event(const hype_ps2_kbd_t *kbd, unsigned i, uint16_t *out);
 unsigned hype_ps2_kbd_trace_count(const hype_ps2_kbd_t *kbd);
