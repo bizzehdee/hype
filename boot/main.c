@@ -19633,6 +19633,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     dev_queued, guest_read, dev_drop,
                                     __atomic_load_n(&g_vms[vi].host_ps2_irqs,
                                                     __ATOMIC_RELAXED));
+                                {
+                                    const uint16_t *ev = 0;
+                                    unsigned n = hype_ps2_kbd_trace(&g_vms[vi].ps2, &ev);
+                                    unsigned ei;
+                                    hype_debug_print("fw-1 KBDTRACE vm%u: %u event(s):", vi, n);
+                                    for (ei = 0; ei < n; ei++) {
+                                        static const char *k[4] = {"?", "cmd", "wr", "rd"};
+                                        hype_debug_print(" %s%02x", k[(ev[ei] >> 12) & 3u],
+                                                         (unsigned)(ev[ei] & 0xFFu));
+                                    }
+                                    hype_debug_print(" [#436]\n");
+                                }
                                 /* #92: the two 8042 states a Windows-boot wedge turns on. A pending
                                  * MOUSE byte forces AUX_DATA into every status read, and OVMF's
                                  * keyboard driver refuses to read 0x60 while that bit is up -- so

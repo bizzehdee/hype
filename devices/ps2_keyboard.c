@@ -4,6 +4,7 @@ void hype_ps2_kbd_reset(hype_ps2_kbd_t *kbd) {
     unsigned int i;
     kbd->out_head = 0;
     kbd->out_count = 0;
+    kbd->trace_count = 0;
     kbd->config_byte = 0;
     kbd->awaiting_config_byte_write = 0;
     kbd->keyboard_port_enabled = 1;
@@ -69,6 +70,13 @@ int hype_ps2_kbd_try_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode) {
     return 1;
 }
 
+static void trace_event(hype_ps2_kbd_t *kbd, unsigned kind, uint8_t value) {
+    if (kbd->trace_count < HYPE_PS2_KBD_TRACE_MAX) {
+        kbd->trace[kbd->trace_count] = (uint16_t)((kind << 12) | value);
+        kbd->trace_count++;
+    }
+}
+
 static void stage_response(hype_ps2_kbd_t *kbd, uint8_t value) {
     push_output(kbd, value, 0);
 }
@@ -82,6 +90,7 @@ int hype_ps2_kbd_io_read(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t *out_value)
                 __atomic_add_fetch(&kbd->scancodes_read, 1ull, __ATOMIC_RELAXED);
             }
             *out_value = kbd->out_fifo[kbd->out_head];
+            trace_event(kbd, HYPE_PS2_KBD_TRACE_DATA_READ, *out_value);
             kbd->out_head = (kbd->out_head + 1) % HYPE_PS2_KBD_FIFO_SIZE;
             kbd->out_count--;
             if (kbd->out_count > 0 && kbd->irq_edges < HYPE_PS2_KBD_FIFO_SIZE) {
@@ -113,6 +122,9 @@ int hype_ps2_kbd_guest_initialized(const hype_ps2_kbd_t *kbd) {
 
 int hype_ps2_kbd_io_write(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t value) {
     kbd->guest_wrote = 1;
+    trace_event(kbd, (port == HYPE_PS2_PORT_STATUS_COMMAND) ? HYPE_PS2_KBD_TRACE_CMD_WRITE
+                                                            : HYPE_PS2_KBD_TRACE_DATA_WRITE,
+                value);
     if (port == HYPE_PS2_PORT_STATUS_COMMAND) {
         switch (value) {
         case HYPE_PS2_CMD_READ_CONFIG_BYTE:
@@ -233,4 +245,11 @@ int hype_ps2_kbd_take_irq(hype_ps2_kbd_t *kbd) {
     }
     kbd->irq_edges--;
     return 1;
+}
+
+unsigned hype_ps2_kbd_trace(const hype_ps2_kbd_t *kbd, const uint16_t **out_events) {
+    if (out_events != 0) {
+        *out_events = kbd->trace;
+    }
+    return kbd->trace_count;
 }

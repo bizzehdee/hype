@@ -84,6 +84,13 @@
  * pending at once here (ACK+BAT); a small ring is plenty. */
 #define HYPE_PS2_KBD_FIFO_SIZE 8u
 
+/* #436: bounded port-event trace. Encoded as (kind << 12) | value, where kind
+ * is 1=cmd write (0x64), 2=data write (0x60), 3=data read (0x60). */
+#define HYPE_PS2_KBD_TRACE_MAX 48u
+#define HYPE_PS2_KBD_TRACE_CMD_WRITE 1u
+#define HYPE_PS2_KBD_TRACE_DATA_WRITE 2u
+#define HYPE_PS2_KBD_TRACE_DATA_READ 3u
+
 typedef struct {
     /* Output-buffer FIFO: bytes waiting to be read at port 0x60 (command
      * responses and injected scancodes). OBF (status bit 0) reflects
@@ -104,6 +111,15 @@ typedef struct {
     unsigned long long scancodes_dropped;
     /* #389: pending IRQ1 edges -- one per byte that became readable. */
     unsigned int irq_edges;
+    /*
+     * #436: the first N port events, so the initialisation handshake can be
+     * read back exactly as it happened. The guest stops talking to the 8042
+     * after four data reads and never returns, and no counter says which
+     * command it was answering when it gave up -- only the sequence does.
+     * Bounded and never wraps: the interesting part is the beginning.
+     */
+    uint16_t trace[HYPE_PS2_KBD_TRACE_MAX];
+    unsigned int trace_count;
 } hype_ps2_kbd_t;
 
 /* Resets to power-on state: no pending byte, keyboard port enabled,
@@ -186,5 +202,8 @@ void hype_ps2_kbd_scancode_stats(const hype_ps2_kbd_t *kbd,
  * behind the unread byte. The caller injects one guest IRQ1 per taken edge.
  */
 int hype_ps2_kbd_take_irq(hype_ps2_kbd_t *kbd);
+
+/* #436: read back the bounded port-event trace. Returns the number of events. */
+unsigned hype_ps2_kbd_trace(const hype_ps2_kbd_t *kbd, const uint16_t **out_events);
 
 #endif /* HYPE_DEVICES_PS2_KEYBOARD_H */
