@@ -1,0 +1,80 @@
+# #436: get past cdboot's "Press any key to boot from CD or DVD" prompt.
+#
+# Without this the boot never reaches Windows at all: the prompt times out
+# (`BdsDxe: failed to start Boot0002: Time out`) and the guest sits in firmware
+# spinning on HLT with RDMSR/CPUID -- which reads exactly like a hype wedge and
+# is not one. That misreading cost several cycles before it was identified.
+#
+# Keys are injected on a fixed cadence rather than after an `expect`, because
+# the prompt is painted to the graphical console by cdboot, not written to the
+# serial line, so there is no text to wait for. The window is only a few
+# seconds wide, so Enter every 2s across a 65s span is certain to land inside
+# it wherever it falls, and the extra keypresses are harmless: the firmware
+# menu and cdboot both discard input outside their own prompt windows.
+#
+# 62 directives, against a parser limit of 64 (HYPE_INPUT_SCRIPT_MAX_DIRECTIVES).
+timeout 300000
+
+# Nothing reads a key before the firmware has initialised its console.
+delay 5000
+
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
+sendkey \n
+delay 2000
