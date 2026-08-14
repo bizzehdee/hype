@@ -24,6 +24,8 @@ void hype_hpet_reset(hype_hpet_t *hpet) {
     hpet->config = 0;
     hpet->int_status = 0;
     hpet->counter = 0;
+    hpet->offset = 0;
+    hpet->last_absolute = 0;
     for (i = 0; i < HYPE_HPET_NUM_TIMERS; i++) {
         /* Each comparator reports what it can do even before a guest writes
          * it: periodic capable, 64-bit wide. Nothing is enabled at reset. */
@@ -33,16 +35,24 @@ void hype_hpet_reset(hype_hpet_t *hpet) {
     }
 }
 
-uint32_t hype_hpet_advance(hype_hpet_t *hpet, uint64_t ticks) {
+uint32_t hype_hpet_sync(hype_hpet_t *hpet, uint64_t absolute_ticks) {
     uint64_t before;
+    uint64_t now;
     uint32_t fired = 0;
     unsigned i;
 
-    if ((hpet->config & HYPE_HPET_CONFIG_ENABLE) == 0u || ticks == 0u) {
+    /* Track absolute time even while the counter is disabled, so enabling it
+     * does not make the clock appear to jump backwards or leap forwards. */
+    hpet->last_absolute = absolute_ticks;
+    if ((hpet->config & HYPE_HPET_CONFIG_ENABLE) == 0u) {
+        return 0;
+    }
+    now = absolute_ticks + (uint64_t)hpet->offset;
+    if (now == hpet->counter) {
         return 0;
     }
     before = hpet->counter;
-    hpet->counter += ticks;
+    hpet->counter = now;
 
     for (i = 0; i < HYPE_HPET_NUM_TIMERS; i++) {
         hype_hpet_timer_t *t = &hpet->timers[i];
@@ -151,7 +161,10 @@ void hype_hpet_write(hype_hpet_t *hpet, uint32_t offset, unsigned size, uint64_t
         return;
     }
     if (base == HYPE_HPET_REG_MAIN_COUNTER) {
+        /* A write rebases the reported counter; the underlying clock keeps
+         * running from wherever real time has reached. */
         hpet->counter = merge(hpet->counter, value, offset, size);
+        hpet->offset = (int64_t)(hpet->counter - hpet->last_absolute);
         return;
     }
     if (base >= HYPE_HPET_REG_TIMER_BASE) {

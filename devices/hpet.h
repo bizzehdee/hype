@@ -61,6 +61,20 @@ typedef struct {
     uint64_t config;      /* general configuration */
     uint64_t int_status;  /* general interrupt status (write-1-to-clear) */
     uint64_t counter;     /* main counter, in 100 ns ticks */
+    /*
+     * #436: the counter is derived from ABSOLUTE elapsed time, never
+     * accumulated from per-exit deltas. Accumulating truncates: at a 3.4 GHz
+     * host one 100 ns tick is ~340 TSC cycles, so a guest polling the counter
+     * in a tight loop advances it by less than a tick per exit and the whole
+     * quotient rounds to zero -- the counter looks STOPPED to exactly the
+     * calibration loops that read it hardest. The ACPI PM timer in this
+     * project scales the raw TSC on every read for the same reason.
+     *
+     * `offset` carries whatever a guest wrote to the counter, so a write
+     * rebases the reported value without disturbing the underlying clock.
+     */
+    int64_t offset;
+    uint64_t last_absolute; /* the most recent absolute tick count seen */
     hype_hpet_timer_t timers[HYPE_HPET_NUM_TIMERS];
 } hype_hpet_t;
 
@@ -70,13 +84,14 @@ void hype_hpet_reset(hype_hpet_t *hpet);
 uint64_t hype_hpet_capabilities(void);
 
 /*
- * Advance the main counter by `ticks` 100 ns units and latch any comparator
- * matches into the interrupt status. Returns a bitmask of timers that fired on
- * this call (bit N = timer N), so the caller can raise the guest interrupt the
- * same way it does for the PIT and the LAPIC timer. Counting only happens when
- * ENABLE_CNF is set, exactly as the hardware behaves.
+ * Bring the main counter up to `absolute_ticks` (100 ns units since the guest
+ * started) and latch any comparator crossed on the way into the interrupt
+ * status. Returns a bitmask of timers that fired (bit N = timer N), so the
+ * caller can raise the guest interrupt the same way it does for the PIT and
+ * the LAPIC timer. Counting only happens when ENABLE_CNF is set, exactly as
+ * the hardware behaves.
  */
-uint32_t hype_hpet_advance(hype_hpet_t *hpet, uint64_t ticks);
+uint32_t hype_hpet_sync(hype_hpet_t *hpet, uint64_t absolute_ticks);
 
 /* 64-bit register read/write. `size` is 4 or 8; 4-byte accesses address either
  * half of a 64-bit register, which is how 32-bit guests drive an HPET. */

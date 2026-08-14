@@ -23,12 +23,43 @@ static void test_counter_only_runs_when_enabled(void) {
     hype_hpet_reset(&h);
 
     /* Disabled at reset: time passes and the counter does not move. */
-    assert(hype_hpet_advance(&h, 1000) == 0);
+    assert(hype_hpet_sync(&h, 1000) == 0);
     assert(hype_hpet_read(&h, HYPE_HPET_REG_MAIN_COUNTER, 8) == 0);
 
     hype_hpet_write(&h, HYPE_HPET_REG_CONFIG, 8, HYPE_HPET_CONFIG_ENABLE);
-    (void)hype_hpet_advance(&h, 1000);
-    assert(hype_hpet_read(&h, HYPE_HPET_REG_MAIN_COUNTER, 8) == 1000);
+    (void)hype_hpet_sync(&h, 2000);
+    assert(hype_hpet_read(&h, HYPE_HPET_REG_MAIN_COUNTER, 8) == 2000);
+}
+
+static void test_frequent_sync_does_not_lose_time(void) {
+    /* #436: the counter must track ABSOLUTE time. A model that accumulated
+     * per-call deltas and divided each one would round every short interval to
+     * zero and appear stopped to a tight calibration loop -- which is exactly
+     * how Windows' HAL reads it. Syncing one tick at a time must still reach
+     * the same place as one large sync. */
+    hype_hpet_t h;
+    unsigned i;
+    hype_hpet_reset(&h);
+    hype_hpet_write(&h, HYPE_HPET_REG_CONFIG, 8, HYPE_HPET_CONFIG_ENABLE);
+    for (i = 1; i <= 10000u; i++) {
+        (void)hype_hpet_sync(&h, i);
+    }
+    assert(hype_hpet_read(&h, HYPE_HPET_REG_MAIN_COUNTER, 8) == 10000);
+    /* And a repeated sync at the same instant must not advance it. */
+    (void)hype_hpet_sync(&h, 10000);
+    assert(hype_hpet_read(&h, HYPE_HPET_REG_MAIN_COUNTER, 8) == 10000);
+}
+
+static void test_counter_write_rebases_without_stopping_the_clock(void) {
+    hype_hpet_t h;
+    hype_hpet_reset(&h);
+    hype_hpet_write(&h, HYPE_HPET_REG_CONFIG, 8, HYPE_HPET_CONFIG_ENABLE);
+    (void)hype_hpet_sync(&h, 5000);
+    hype_hpet_write(&h, HYPE_HPET_REG_MAIN_COUNTER, 8, 0);
+    assert(hype_hpet_read(&h, HYPE_HPET_REG_MAIN_COUNTER, 8) == 0);
+    /* 100 more ticks of real time => 100 on the rebased counter. */
+    (void)hype_hpet_sync(&h, 5100);
+    assert(hype_hpet_read(&h, HYPE_HPET_REG_MAIN_COUNTER, 8) == 100);
 }
 
 static void test_oneshot_comparator_fires_once(void) {
@@ -41,14 +72,14 @@ static void test_oneshot_comparator_fires_once(void) {
     hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE + 8u, 8, 500);
 
     /* Not yet reached. */
-    assert(hype_hpet_advance(&h, 499) == 0);
+    assert(hype_hpet_sync(&h, 499) == 0);
     /* A single step that spans the comparator still delivers -- hype samples
      * time at VM exits, so an expiry inside the step must not be lost. */
-    fired = hype_hpet_advance(&h, 100);
+    fired = hype_hpet_sync(&h, 599);
     assert(fired == 0x1u);
     assert(hype_hpet_read(&h, HYPE_HPET_REG_INT_STATUS, 8) == 0x1u);
     /* One-shot: it does not fire again. */
-    assert(hype_hpet_advance(&h, 10000) == 0);
+    assert(hype_hpet_sync(&h, 10000) == 0);
 }
 
 static void test_interrupt_status_is_write_one_to_clear(void) {
@@ -57,7 +88,7 @@ static void test_interrupt_status_is_write_one_to_clear(void) {
     hype_hpet_write(&h, HYPE_HPET_REG_CONFIG, 8, HYPE_HPET_CONFIG_ENABLE);
     hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE, 8, HYPE_HPET_TIMER_INT_ENABLE);
     hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE + 8u, 8, 10);
-    (void)hype_hpet_advance(&h, 20);
+    (void)hype_hpet_sync(&h, 20);
     assert(hype_hpet_read(&h, HYPE_HPET_REG_INT_STATUS, 8) == 0x1u);
 
     hype_hpet_write(&h, HYPE_HPET_REG_INT_STATUS, 8, 0x1u);
@@ -73,15 +104,15 @@ static void test_periodic_comparator_rearms(void) {
                         HYPE_HPET_TIMER_VAL_SET);
     hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE + 8u, 8, 100);
 
-    assert(hype_hpet_advance(&h, 100) == 0x1u);
+    assert(hype_hpet_sync(&h, 100) == 0x1u);
     hype_hpet_write(&h, HYPE_HPET_REG_INT_STATUS, 8, 0x1u);
-    assert(hype_hpet_advance(&h, 100) == 0x1u);
+    assert(hype_hpet_sync(&h, 200) == 0x1u);
     hype_hpet_write(&h, HYPE_HPET_REG_INT_STATUS, 8, 0x1u);
     /* A long step that covers several periods still leaves the comparator
      * ahead of the counter, so the timer keeps working afterwards. */
-    assert(hype_hpet_advance(&h, 1000) == 0x1u);
+    assert(hype_hpet_sync(&h, 1200) == 0x1u);
     hype_hpet_write(&h, HYPE_HPET_REG_INT_STATUS, 8, 0x1u);
-    assert(hype_hpet_advance(&h, 100) == 0x1u);
+    assert(hype_hpet_sync(&h, 1300) == 0x1u);
 }
 
 static void test_disabled_timer_does_not_interrupt(void) {
@@ -91,7 +122,7 @@ static void test_disabled_timer_does_not_interrupt(void) {
     /* Interrupt bit clear: the comparator still matches, but no interrupt is
      * signalled and no status bit is latched. */
     hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE + 8u, 8, 50);
-    assert(hype_hpet_advance(&h, 100) == 0);
+    assert(hype_hpet_sync(&h, 100) == 0);
     assert(hype_hpet_read(&h, HYPE_HPET_REG_INT_STATUS, 8) == 0);
 }
 
@@ -99,7 +130,7 @@ static void test_32bit_halves_address_the_right_word(void) {
     hype_hpet_t h;
     hype_hpet_reset(&h);
     hype_hpet_write(&h, HYPE_HPET_REG_CONFIG, 8, HYPE_HPET_CONFIG_ENABLE);
-    (void)hype_hpet_advance(&h, 0x100000007ull);
+    (void)hype_hpet_sync(&h, 0x100000007ull);
 
     /* A 32-bit guest reads the counter in two halves; each must yield its own
      * word rather than the low word twice. */
@@ -135,6 +166,8 @@ static void test_unimplemented_offsets_read_zero(void) {
 int main(void) {
     test_capabilities_describe_what_is_modelled();
     test_counter_only_runs_when_enabled();
+    test_frequent_sync_does_not_lose_time();
+    test_counter_write_rebases_without_stopping_the_clock();
     test_oneshot_comparator_fires_once();
     test_interrupt_status_is_write_one_to_clear();
     test_periodic_comparator_rearms();

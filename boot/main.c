@@ -7808,11 +7808,20 @@ static __attribute__((noinline)) void fw_1_hpet_step(hype_fw_vm_t *vm, hype_vcpu
     uint32_t fired;
     unsigned ti;
 
+    (void)delta;
     if (g_fw_1_host_tsc_hz == 0u) {
         return;
     }
-    hpet_ticks = delta * HYPE_HPET_TICKS_PER_SECOND / g_fw_1_host_tsc_hz;
-    fired = hype_hpet_advance(&g_fw_1_hpet, hpet_ticks);
+    /*
+     * #436: absolute elapsed time, scaled once -- never a running sum of
+     * per-exit deltas. Each delta is only a few hundred TSC cycles when a
+     * guest polls the counter hard, and 100 ns is ~340 cycles here, so
+     * dividing each delta separately truncates every one of them to zero and
+     * the counter never moves. The ACPI PM timer scales the raw TSC the same
+     * way for the same reason.
+     */
+    hpet_ticks = hype_rdtsc() / (g_fw_1_host_tsc_hz / HYPE_HPET_TICKS_PER_SECOND);
+    fired = hype_hpet_sync(&g_fw_1_hpet, hpet_ticks);
     if (fired == 0u) {
         return;
     }
@@ -11530,6 +11539,38 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                  (unsigned long long)mbase,
                                                  (unsigned long long)(riphist_rip[top[0]] - mbase),
                                                  (have == 0) ? mname : "<no CodeView name>");
+                                {
+                                    /*
+                                     * #436: ntoskrnl's bugcheck record. The halt the Windows
+                                     * kernel parks in is a bare `jmp .` stub reached indirectly,
+                                     * so it carries no arguments and the stack has already been
+                                     * switched -- the only place the reason survives is the
+                                     * global KeBugCheck2 stores it in (RVA 0xf21620, found by
+                                     * disassembling KeBugCheckEx forward). Read it once, through
+                                     * the guest's own page tables.
+                                     */
+                                    static int bugchk_done = 0;
+                                    if (!bugchk_done && riphist_rip[top[0]] >= 0xFFFF800000000000ULL) {
+                                        hype_svm_debug_state_t bs;
+                                        unsigned bq;
+                                        bugchk_done = 1;
+                                        hype_svm_vcpu_get_debug_state(ctx, &bs);
+                                        for (bq = 0; bq < 8u; bq += 4u) {
+                                            uint64_t v[4];
+                                            unsigned k;
+                                            for (k = 0; k < 4u; k++) {
+                                                v[k] = 0;
+                                                (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                    mbase + 0xf21610ull + 8ull * (bq + k), &v[k], 8);
+                                            }
+                                            hype_debug_print(
+                                                "fw-1 #436 BUGCHK +0x%02x: %016llx %016llx %016llx %016llx\n",
+                                                (unsigned)(bq * 8u),
+                                                (unsigned long long)v[0], (unsigned long long)v[1],
+                                                (unsigned long long)v[2], (unsigned long long)v[3]);
+                                        }
+                                    }
+                                }
                             } else {
                                 hype_debug_print("fw-1 RIPHOT-MODULE 0x%llx -> no PE image found "
                                                  "within the scan bound [#364]\n",
