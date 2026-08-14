@@ -44,6 +44,8 @@ fi
 
 rm -f "$LOG" "$SHOT" "$RIG/qmp.sock"
 echo "running for up to ${SECS}s -> $LOG"
+# #93: give the outer hardware a real USB HID pointer. Hype enumerates this
+# xHCI controller and forwards its reports through the inner PS/2 mouse path.
 timeout "$SECS" qemu-system-x86_64 \
     -enable-kvm -cpu host -machine q35,accel=kvm -smp 4 -m 8192 \
     -drive if=pflash,format=raw,readonly=on,file="$REPO/fw/OVMF_CODE.fd" \
@@ -51,6 +53,8 @@ timeout "$SECS" qemu-system-x86_64 \
     -drive file="$RIG/media.img",format=raw,if=none,id=media \
     -device ahci,id=ahci \
     -device ide-hd,drive=media,bus=ahci.0,serial=HYPE436 \
+    -device qemu-xhci,id=hostxhci \
+    -device usb-mouse,bus=hostxhci.0 \
     -vga std -display none \
     -serial "file:$LOG" \
     -qmp unix:"$RIG/qmp.sock",server,nowait \
