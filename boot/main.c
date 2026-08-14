@@ -7823,7 +7823,24 @@ static __attribute__((noinline)) void fw_1_hpet_step(hype_fw_vm_t *vm, hype_vcpu
      * the counter never moves. The ACPI PM timer scales the raw TSC the same
      * way for the same reason.
      */
-    hpet_ticks = hype_rdtsc() / (g_fw_1_host_tsc_hz / HYPE_HPET_TICKS_PER_SECOND);
+    {
+        /*
+         * #436: exact TSC -> 100 ns conversion. Dividing the TSC frequency by
+         * the tick rate first truncates it (3,400,566,865 / 10,000,000 = 340),
+         * which runs the HPET 0.0167% fast -- ten milliseconds of drift per
+         * minute against the TSC and the ACPI PM timer, both of which are
+         * derived from the same clock and therefore stay exact. An OS that
+         * cross-checks its clock sources sees the HPET disagree with them and
+         * cannot trust any of them. Split the division instead: the quotient
+         * contributes whole seconds' worth of ticks and the remainder the rest,
+         * with no intermediate overflow (remainder < tsc_hz, so the product
+         * stays well inside 64 bits).
+         */
+        uint64_t raw = hype_rdtsc();
+        hpet_ticks = (raw / g_fw_1_host_tsc_hz) * HYPE_HPET_TICKS_PER_SECOND +
+                     ((raw % g_fw_1_host_tsc_hz) * HYPE_HPET_TICKS_PER_SECOND) /
+                         g_fw_1_host_tsc_hz;
+    }
     fired = hype_hpet_sync(&g_fw_1_hpet, hpet_ticks);
     if (fired == 0u) {
         return;
