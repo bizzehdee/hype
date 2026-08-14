@@ -29,8 +29,6 @@ if [ -f "$REPO/build/hype.efi" ]; then
 fi
 cp -f "$REPO/fw/OVMF_VARS.fd" "$RIG/host-vars.fd"
 
-killall -9 qemu-system-x86_64 2>/dev/null || true
-sleep 1
 # Match the process NAME truncated to the 15 characters the kernel keeps in
 # comm. `pgrep -x qemu-system-x86_64` matches nothing at all (the name is too
 # long), and `pgrep -f` matches any shell whose command line merely mentions
@@ -40,7 +38,7 @@ if pgrep -x qemu-system-x86 >/dev/null; then
     echo "a QEMU is still running -- refusing to start a second"; exit 1
 fi
 
-rm -f "$LOG" "$SHOT"
+rm -f "$LOG" "$SHOT" "$RIG/qmp.sock"
 echo "running for up to ${SECS}s -> $LOG"
 timeout "$SECS" qemu-system-x86_64 \
     -enable-kvm -cpu host -machine q35,accel=kvm -smp 4 -m 8192 \
@@ -54,6 +52,5 @@ timeout "$SECS" qemu-system-x86_64 \
     -qmp unix:"$RIG/qmp.sock",server,nowait \
     -no-reboot >"$RIG/qemu-stderr.txt" 2>&1 || true
 
-killall -9 qemu-system-x86_64 2>/dev/null || true
 echo "--- log tail ---"
 LC_ALL=C tail -c 2000 "$LOG" 2>/dev/null || echo "(no log)"

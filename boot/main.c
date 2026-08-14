@@ -7284,20 +7284,33 @@ static uint64_t fw_1_script_now_ms(const hype_fw_vm_t *vm, uint64_t tsc) {
  * winload.efi/bootmgr.efi disassembly offline; (b) 32 code bytes before RIP; (c) the two nodes the
  * loop walks (rdi, rcx). The guest is identity-paged in this region, so a physical read reaches it.
  */
-/* #436: identify the KERNEL-space module a parked RIP belongs to. Walks back
- * page by page through the guest's own page tables for the PE 'MZ' header, then
- * reports the base, the offset, and the CodeView PDB path embedded in the image
- * -- which names the module (bootmgr/winload/ntoskrnl) outright. */
+/* #436: identify a KERNEL-space PE image containing a parked RIP.  An MZ word
+ * alone is not sufficient: executable code can contain that byte pair, and an
+ * unbounded RSDS scan then risks attributing the RIP to an unrelated PDB. */
 static void fw_1_436_kmod_probe(hype_fw_vm_t *vm, uint64_t cr3, uint64_t rip) {
     uint64_t scan = rip & ~0xFFFULL;
     uint64_t base = 0;
     unsigned pages;
-    uint8_t hdr[2];
+    uint8_t hdr[0x100];
 
     for (pages = 0; pages < 8192u; pages++) {
-        if (fw_1_read_guest_va(vm, cr3, scan, hdr, 2) && hdr[0] == 'M' && hdr[1] == 'Z') {
-            base = scan;
-            break;
+        if (fw_1_read_guest_va(vm, cr3, scan, hdr, sizeof(hdr)) &&
+            hdr[0] == 'M' && hdr[1] == 'Z') {
+            uint32_t peoff = (uint32_t)hdr[0x3c] | ((uint32_t)hdr[0x3d] << 8) |
+                             ((uint32_t)hdr[0x3e] << 16) | ((uint32_t)hdr[0x3f] << 24);
+            uint32_t image_size;
+            if (peoff <= sizeof(hdr) - 0x54u && hdr[peoff] == 'P' && hdr[peoff + 1u] == 'E' &&
+                hdr[peoff + 2u] == 0 && hdr[peoff + 3u] == 0 &&
+                hdr[peoff + 24u] == 0x0bu && hdr[peoff + 25u] == 0x02u) {
+                image_size = (uint32_t)hdr[peoff + 0x50u] |
+                             ((uint32_t)hdr[peoff + 0x51u] << 8) |
+                             ((uint32_t)hdr[peoff + 0x52u] << 16) |
+                             ((uint32_t)hdr[peoff + 0x53u] << 24);
+                if (image_size != 0 && rip - scan < image_size) {
+                    base = scan;
+                    break;
+                }
+            }
         }
         if (scan < 0x1000ULL) { break; }
         scan -= 0x1000ULL;
@@ -7310,29 +7323,27 @@ static void fw_1_436_kmod_probe(hype_fw_vm_t *vm, uint64_t cr3, uint64_t rip) {
     hype_debug_print("fw-1 #436 KMOD: rip=0x%llx base=0x%llx off=0x%llx\n",
                      (unsigned long long)rip, (unsigned long long)base,
                      (unsigned long long)(rip - base));
-    /* Scan the image for the CodeView '.pdb' path -- cheap, and it names the
-     * module without parsing the debug directory. */
-    {
-        uint64_t off;
-        uint8_t win[64];
-        for (off = 0; off < 0x400000ULL; off += 48ULL) {
-            unsigned i;
-            if (!fw_1_read_guest_va(vm, cr3, base + off, win, 64)) { continue; }
-            for (i = 0; i + 4u < 64u; i++) {
-                if (win[i] == 'R' && win[i+1] == 'S' && win[i+2] == 'D' && win[i+3] == 'S') {
-                    uint8_t name[64];
-                    unsigned k;
-                    if (fw_1_read_guest_va(vm, cr3, base + off + i + 24u, name, 64)) {
-                        for (k = 0; k < 63u; k++) { if (name[k] == 0) { break; } }
-                        name[k] = 0;
-                        hype_debug_print("fw-1 #436 KMOD PDB: %s\n", (const char *)name);
-                    }
-                    return;
-                }
-            }
-        }
-        hype_debug_print("fw-1 #436 KMOD: no RSDS/PDB record found in 4MB\n");
-    }
+}
+
+/* #436: capture a bounded kernel stack window with the first useful
+ * high-canonical RIP.  Offline PDB lookup of return addresses identifies the
+ * owner of a spin lock without relying on a potentially discarded PE header. */
+static void fw_1_436_stack_probe(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, uint64_t cr3) {
+    hype_svm_debug_state_t ds;
+    uint64_t stack[12];
+    unsigned i;
+    hype_svm_vcpu_get_debug_state(ctx, &ds);
+    for (i = 0; i < 12u; i++) { stack[i] = 0; }
+    (void)fw_1_read_guest_va(vm, cr3, ds.rsp, stack, sizeof(stack));
+    hype_debug_print("fw-1 #436 STACK: rsp=0x%llx +00=%llx +08=%llx +10=%llx +18=%llx "
+                     "+20=%llx +28=%llx +30=%llx +38=%llx +40=%llx +48=%llx +50=%llx +58=%llx\n",
+                     (unsigned long long)ds.rsp,
+                     (unsigned long long)stack[0], (unsigned long long)stack[1],
+                     (unsigned long long)stack[2], (unsigned long long)stack[3],
+                     (unsigned long long)stack[4], (unsigned long long)stack[5],
+                     (unsigned long long)stack[6], (unsigned long long)stack[7],
+                     (unsigned long long)stack[8], (unsigned long long)stack[9],
+                     (unsigned long long)stack[10], (unsigned long long)stack[11]);
 }
 
 static __attribute__((noinline)) void fw_1_436_deep_dump(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx,
@@ -7368,11 +7379,13 @@ static __attribute__((noinline)) void fw_1_436_preempt_dump(hype_fw_vm_t *vm, hy
         (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 9),
         pib[0], pib[1], pib[2], pib[3], pib[4], pib[5], pib[6], pib[7],
         pib[8], pib[9], pib[10], pib[11], pib[12], pib[13], pib[14], pib[15]);
-    if (!deep_dumped) {
+    /* The reset-vector sample arrives before any PE image or kernel page table
+     * exists.  Do not consume the one-shot forensic capture there: the useful
+     * sample is the first high-canonical RIP after Windows takes control. */
+    if (!deep_dumped && prip >= 0xFFFF800000000000ULL) {
         deep_dumped = 1;
-        if (prip >= 0xFFFF800000000000ULL) {
-            fw_1_436_kmod_probe(vm, pcr3, prip);
-        }
+        fw_1_436_kmod_probe(vm, pcr3, prip);
+        fw_1_436_stack_probe(vm, ctx, pcr3);
         fw_1_436_deep_dump(vm, ctx, prip);
     }
 }
