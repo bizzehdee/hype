@@ -836,6 +836,15 @@ void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     real->vmcb->save.rip += 2; /* CPUID is always exactly 2 bytes (0F A2) */
 }
 
+void hype_svm_vcpu_handle_rdtsc(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    uint64_t tsc = real_rdtsc() + real->vmcb->control.tsc_offset;
+
+    real->vmcb->save.rax = (uint64_t)(uint32_t)tsc;
+    real->gprs[2] = (uint64_t)(uint32_t)(tsc >> 32);
+    real->vmcb->save.rip += 2; /* RDTSC is exactly 0F 31. */
+}
+
 /* Runs the real `rdtsc` instruction. Exempt from unit testing, same
  * reasoning as real_cpuid() above. */
 static inline uint64_t real_rdtsc(void) {

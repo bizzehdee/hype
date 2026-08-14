@@ -346,6 +346,10 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
  */
 void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
 
+/* #438: retire an intercepted RDTSC with the hypervisor's advancing timebase
+ * plus the VMCB offset, avoiding a nested L2 counter that is observed frozen. */
+void hype_svm_vcpu_handle_rdtsc(hype_vcpu_ctx_t *ctx);
+
 /*
  * FW-1 real-hardware/real-firmware debugging: decodes and returns the
  * most recent NPF's direction/faulting-guest-physical-address

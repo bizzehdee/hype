@@ -182,6 +182,10 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  * svm_vcpu.c) -- not part of any guest's baseline intercept set the
  * way HLT/SHUTDOWN/CPUID/MSR_PROT are. */
 #define HYPE_SVM_INTERCEPT_VINTR (1u << 4)
+/* RDTSC is normally allowed to run directly, but nested KVM can expose a
+ * stopped L2 counter.  Intercept it so hype can return the advancing L1 TSC
+ * plus the guest's configured offset (#438). */
+#define HYPE_SVM_INTERCEPT_RDTSC (1u << 14)
 /*
  * CPUMSR-1: intercept every guest CPUID (bit 18 of intercept_misc1's
  * "Intercept Vector 3" layout -- cross-referenced against the AMD SDM
@@ -384,6 +388,7 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 #define HYPE_SVM_EXITCODE_SHUTDOWN 0x7FULL
 #define HYPE_SVM_EXITCODE_IOIO 0x7BULL
 #define HYPE_SVM_EXITCODE_CPUID 0x72ULL
+#define HYPE_SVM_EXITCODE_RDTSC 0x6EULL
 #define HYPE_SVM_EXITCODE_MSR 0x7CULL
 #define HYPE_SVM_EXITCODE_NPF 0x400ULL
 /*

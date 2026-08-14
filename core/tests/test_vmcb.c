@@ -77,6 +77,8 @@ static void test_build_realmode_guest(void) {
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_HLT);
     CHECK_HEX("shutdown is intercepted", HYPE_SVM_INTERCEPT_SHUTDOWN,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_SHUTDOWN);
+    CHECK_HEX("RDTSC is intercepted", HYPE_SVM_INTERCEPT_RDTSC,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_RDTSC);
     CHECK_HEX("VMRUN is intercepted", HYPE_SVM_INTERCEPT_VMRUN,
               vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_VMRUN);
     /*
@@ -188,6 +190,8 @@ static void test_build_long_mode_guest(void) {
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_HLT);
     CHECK_HEX("shutdown is intercepted", HYPE_SVM_INTERCEPT_SHUTDOWN,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_SHUTDOWN);
+    CHECK_HEX("RDTSC is intercepted", HYPE_SVM_INTERCEPT_RDTSC,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_RDTSC);
     CHECK_HEX("IOIO is intercepted (unlike the real-mode guest)", HYPE_SVM_INTERCEPT_IOIO_PROT,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_IOIO_PROT);
     CHECK_HEX("VMRUN is intercepted", HYPE_SVM_INTERCEPT_VMRUN,

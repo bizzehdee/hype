@@ -4494,6 +4494,10 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             vmm_handle_cpuid(kind, ctx);
             continue;
         }
+        if (kind == HYPE_VMM_KIND_SVM && info.reason == HYPE_SVM_EXITCODE_RDTSC) {
+            hype_svm_vcpu_handle_rdtsc(ctx);
+            continue;
+        }
         if (vmm_reason_is_msr(kind, info.reason)) {
             if (vmm_handle_msr(kind, ctx, info.reason) != 0) {
                 hype_fatal("cpumsr: unhandled guest MSR access (qual=0x%llx guest_rip=0x%llx)",
@@ -13192,6 +13196,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             g_436_loop_section[(unsigned)(vm-g_vms)]=769;
         if (vmm_reason_is_cpuid(kind, info.reason)) {
             vmm_handle_cpuid(kind, ctx);
+            continue;
+        }
+        /* #438: cdboot polls RDTSC while waiting for its firmware deadline.
+         * Nested SVM's inherited TSC value can be static, so retire the
+         * intercepted instruction with Hype's advancing host-derived value. */
+        if (kind == HYPE_VMM_KIND_SVM && info.reason == HYPE_SVM_EXITCODE_RDTSC) {
+            hype_svm_vcpu_handle_rdtsc(ctx);
             continue;
         }
         if (vmm_reason_is_msr(kind, info.reason)) {
