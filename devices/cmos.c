@@ -161,3 +161,47 @@ void hype_cmos_data_write(hype_cmos_t *cmos, uint8_t value) {
             return;
     }
 }
+
+uint32_t hype_cmos_periodic_hz(const hype_cmos_t *cmos) {
+    /* Register A bits 3:0. The hardware's own table: 0 = disabled, 1 and 2 are
+     * aliases for 256 Hz, and 3..15 run 8192 Hz down to 2 Hz by halving. */
+    uint8_t rate = (uint8_t)(cmos->registers[HYPE_CMOS_REG_STATUS_A] & 0x0Fu);
+    if (rate == 0u) {
+        return 0u;
+    }
+    if (rate == 1u || rate == 2u) {
+        return 256u;
+    }
+    return 32768u >> (rate - 1u);
+}
+
+int hype_cmos_advance(hype_cmos_t *cmos, uint64_t elapsed_ns) {
+    uint32_t hz = hype_cmos_periodic_hz(cmos);
+    uint64_t period_ns;
+
+    if (hz == 0u || (cmos->registers[HYPE_CMOS_REG_STATUS_B] & HYPE_CMOS_STATUS_B_PIE) == 0u) {
+        /* No rate selected, or the guest has not enabled the interrupt: time
+         * still passes, but nothing is owed. Keep the accumulator from growing
+         * without bound so enabling it later starts from now. */
+        cmos->periodic_ns = 0;
+        return 0;
+    }
+    period_ns = 1000000000ull / (uint64_t)hz;
+    if (period_ns == 0u) {
+        return 0;
+    }
+    cmos->periodic_ns += elapsed_ns;
+    if (cmos->periodic_ns < period_ns) {
+        return 0;
+    }
+    /* One assertion per elapsed period, however many periods a single step
+     * covered: the flag is a level, not a count, and the guest clears it by
+     * reading register C. */
+    cmos->periodic_ns %= period_ns;
+    if ((cmos->registers[HYPE_CMOS_REG_STATUS_C] & HYPE_CMOS_STATUS_C_IRQF) != 0u) {
+        return 0; /* already asserted and not yet acknowledged */
+    }
+    cmos->registers[HYPE_CMOS_REG_STATUS_C] |=
+        (uint8_t)(HYPE_CMOS_STATUS_C_PF | HYPE_CMOS_STATUS_C_IRQF);
+    return 1;
+}

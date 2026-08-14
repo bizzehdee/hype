@@ -12164,6 +12164,24 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_guest_lapic_advance(&g_fw_1_lapic, lapic_ticks);
                 }
                 fw_1_hpet_step(vm, ctx, kind, delta);
+                /*
+                 * #436: the RTC's periodic interrupt. hype modelled register B's
+                 * enable and register C's flags but never raised IRQ8, so a
+                 * guest that armed the periodic interrupt waited on a line that
+                 * could not assert. Feed it the same elapsed real time every
+                 * other clock here uses.
+                 */
+                if (g_fw_1_host_tsc_hz != 0u) {
+                    uint64_t rtc_ns = delta * 1000000000ull / g_fw_1_host_tsc_hz;
+                    if (hype_cmos_advance(&vm->cmos, rtc_ns)) {
+                        uint8_t rtciov;
+                        if (hype_ioapic_raise(&g_fw_1_ioapic, 8u, &rtciov)) {
+                            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, rtciov);
+                        } else {
+                            hype_pic_emu_raise_global_irq(&g_fw_1_pic, 8u);
+                        }
+                    }
+                }
                 /* advance the PIT at its own 1.19 MHz rate. */
                 /* Channel-0 terminal-count crossings during this advance
                  * are PIT IRQ0 timer edges (M4-6b4). */

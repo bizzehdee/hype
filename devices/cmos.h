@@ -49,6 +49,16 @@
 #define HYPE_CMOS_REG_STATUS_A 0x0Au
 #define HYPE_CMOS_REG_STATUS_B 0x0Bu
 #define HYPE_CMOS_REG_STATUS_C 0x0Cu
+
+/*
+ * #436: register B's interrupt-enable bits and register C's flags. hype stored
+ * both registers faithfully but never RAISED anything, so a guest that enabled
+ * the periodic interrupt and waited for IRQ8 waited forever -- the registers
+ * described an interrupting RTC that could not interrupt.
+ */
+#define HYPE_CMOS_STATUS_B_PIE (1u << 6) /* periodic interrupt enable */
+#define HYPE_CMOS_STATUS_C_PF (1u << 6)  /* periodic interrupt flag */
+#define HYPE_CMOS_STATUS_C_IRQF (1u << 7) /* an enabled interrupt is asserted */
 #define HYPE_CMOS_REG_STATUS_D 0x0Du
 #define HYPE_CMOS_REG_CENTURY 0x32u
 
@@ -97,6 +107,8 @@ typedef struct {
     uint16_t base_year;
     uint8_t base_month, base_day, base_hour, base_minute, base_second;
     int base_valid;
+    /* #436: nanoseconds accumulated toward the next periodic interrupt. */
+    uint64_t periodic_ns;
 } hype_cmos_t;
 
 /*
@@ -166,5 +178,22 @@ uint8_t hype_cmos_data_read(const hype_cmos_t *cmos);
  * it had been told was invalid.
  */
 void hype_cmos_data_write(hype_cmos_t *cmos, uint8_t value);
+
+/*
+ * #436: the periodic-interrupt rate register A's rate selector encodes, in Hz.
+ * Rate 0 means "no periodic interrupt"; 1 and 2 are the 256 Hz aliases the
+ * hardware defines, and 3..15 halve from 8192 Hz down. Returns 0 when no rate
+ * is selected.
+ */
+uint32_t hype_cmos_periodic_hz(const hype_cmos_t *cmos);
+
+/*
+ * Advance the RTC by `elapsed_ns` and report whether the periodic interrupt is
+ * now asserted. When it fires, register C's PF and IRQF are latched exactly as
+ * the hardware latches them -- and, as on hardware, reading register C clears
+ * them and drops the line. Returns 1 the moment the line is newly asserted so
+ * the caller can raise IRQ8, 0 otherwise.
+ */
+int hype_cmos_advance(hype_cmos_t *cmos, uint64_t elapsed_ns);
 
 #endif /* HYPE_DEVICES_CMOS_H */
