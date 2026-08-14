@@ -174,6 +174,41 @@ static void test_route_capability_is_reported_and_read_only(void) {
     assert((HYPE_HPET_TIMER_ROUTE_CAP_MASK >> 32) == 0);
 }
 
+static void test_unrouted_timer_delivers_nowhere(void) {
+    /* #436: the bug this guards. A guest that enables a comparator's interrupt
+     * without programming a route leaves the routing field zero; delivering
+     * that as GSI 0 fires on the PIT's own line. Measured against Windows as a
+     * fatal unexpected interrupt during kernel initialisation. */
+    hype_hpet_t h;
+    hype_hpet_reset(&h);
+
+    /* No interrupt requested at all: nowhere. */
+    assert(hype_hpet_timer_gsi(&h, 0) == -1);
+
+    /* Interrupt enabled but never routed: still nowhere, NOT GSI 0. */
+    hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE, 8, HYPE_HPET_TIMER_INT_ENABLE);
+    assert(hype_hpet_timer_gsi(&h, 0) == -1);
+
+    /* Routed to a line the comparator advertises: delivered there. */
+    hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE, 8,
+                    HYPE_HPET_TIMER_INT_ENABLE | (20ull << 9));
+    assert(hype_hpet_timer_gsi(&h, 0) == 20);
+
+    /* Routed to a line it does NOT advertise: refused rather than guessed. */
+    hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE, 8,
+                    HYPE_HPET_TIMER_INT_ENABLE | (5ull << 9));
+    assert(hype_hpet_timer_gsi(&h, 0) == -1);
+
+    /* Legacy replacement routing applies to comparator 0 only. */
+    hype_hpet_write(&h, HYPE_HPET_REG_CONFIG, 8,
+                    HYPE_HPET_CONFIG_ENABLE | HYPE_HPET_CONFIG_LEGACY_ROUTE);
+    hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE, 8, HYPE_HPET_TIMER_INT_ENABLE);
+    assert(hype_hpet_timer_gsi(&h, 0) == 2);
+    hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE + HYPE_HPET_REG_TIMER_STRIDE, 8,
+                    HYPE_HPET_TIMER_INT_ENABLE);
+    assert(hype_hpet_timer_gsi(&h, 1) == -1);
+}
+
 static void test_unimplemented_offsets_read_zero(void) {
     hype_hpet_t h;
     hype_hpet_reset(&h);
@@ -195,6 +230,7 @@ int main(void) {
     test_32bit_halves_address_the_right_word();
     test_capability_bits_survive_a_guest_write();
     test_route_capability_is_reported_and_read_only();
+    test_unrouted_timer_delivers_nowhere();
     test_unimplemented_offsets_read_zero();
     printf("test_hpet: all tests passed\n");
     return 0;

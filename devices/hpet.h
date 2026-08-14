@@ -109,6 +109,19 @@ uint64_t hype_hpet_capabilities(void);
  */
 uint32_t hype_hpet_sync(hype_hpet_t *hpet, uint64_t absolute_ticks);
 
+/*
+ * #436: which interrupt line comparator `idx` is routed to, or -1 when it is
+ * routed nowhere hype can deliver.
+ *
+ * This is not a formality. A guest that enables a comparator's interrupt
+ * without programming a route leaves the routing field at zero, and treating
+ * that as "GSI 0" delivers a spurious timer interrupt on the PIT's own line --
+ * measured against Windows as a fatal unexpected interrupt during kernel
+ * initialisation. A line the timer was never routed to is not a line to
+ * deliver on.
+ */
+int hype_hpet_timer_gsi(const hype_hpet_t *hpet, unsigned idx);
+
 /* 64-bit register read/write. `size` is 4 or 8; 4-byte accesses address either
  * half of a 64-bit register, which is how 32-bit guests drive an HPET. */
 uint64_t hype_hpet_read(const hype_hpet_t *hpet, uint32_t offset, unsigned size);

@@ -1828,6 +1828,9 @@ volatile uint64_t g_436_last_reason[HYPE_FW_MAX_VMS];
 volatile uint64_t g_436_last_rip[HYPE_FW_MAX_VMS];
 
 volatile uint64_t g_436_ap_host_rip[HYPE_FW_MAX_VMS + 1u];
+volatile uint64_t g_436_hpet_accesses;
+volatile uint64_t g_436_kmod_base;
+volatile uint64_t g_436_last_cr3;
 volatile uint32_t g_436_lvt_last_old, g_436_lvt_last_new;
 volatile uint64_t g_436_lvt_change_count;
 
@@ -7831,13 +7834,14 @@ static __attribute__((noinline)) void fw_1_hpet_step(hype_fw_vm_t *vm, hype_vcpu
         if ((fired & (1u << ti)) == 0u) {
             continue;
         }
-        /* Legacy replacement routing puts timer 0 where the PIT's output would
-         * be, which is how the chipset wires it; otherwise the timer's own
-         * routing field names the GSI. */
-        if (ti == 0u && (g_fw_1_hpet.config & HYPE_HPET_CONFIG_LEGACY_ROUTE) != 0u) {
-            gsi = 2u;
-        } else {
-            gsi = (unsigned)((g_fw_1_hpet.timers[ti].config >> 9) & 0x1Fu);
+        {   /* #436: deliver only to a line this comparator is really routed to.
+             * Treating an unprogrammed routing field as GSI 0 fired spurious
+             * interrupts on the PIT's line and killed Windows' kernel init. */
+            int routed = hype_hpet_timer_gsi(&g_fw_1_hpet, ti);
+            if (routed < 0) {
+                continue;
+            }
+            gsi = (unsigned)routed;
         }
         if (hype_ioapic_raise(&g_fw_1_ioapic, gsi, &hiov)) {
             vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, hiov);
@@ -10752,6 +10756,45 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * WBINVD. A fresh one-shot gives the guest a real execution window
              * while preserving the 1 ms bound on uninterrupted execution. */
             { unsigned _vi=(unsigned)(vm-g_vms); g_436_loop_iter[_vi]++; g_436_loop_section[_vi]=2; }
+            {   /* #436: watch the HAL's SELECTED clock descriptor over time. The
+                 * halt-time snapshot may not be the descriptor that actually
+                 * failed, and that is the one untested explanation for the
+                 * arm-routine contradiction. Placed at the loop top because the
+                 * dispatch below `continue`s for most exits. */
+                static uint64_t selw_last;
+                uint64_t selw_now = hype_rdtsc();
+                if (g_436_kmod_base == 0 && info.guest_rip >= 0xFFFF800000000000ULL) {
+                    fw_1_pe_ctx_t sctx;
+                    sctx.vm = vm;
+                    sctx.ctx = ctx;
+                    g_436_kmod_base = hype_pe_find_image_base(fw_1_pe_read, &sctx, info.guest_rip);
+                    if (g_436_kmod_base != 0 && kind == HYPE_VMM_KIND_SVM) {
+                        /* #436: break on KeBugCheckEx so the bugcheck reports itself --
+                         * caller, parameters and register state, measured rather than
+                         * matched by parameter shape (which has been wrong every time). */
+                        vmm_set_exception_intercepts(kind, ctx, (1u << 1) | (1u << 6) | (1u << 13));
+                        /* #436: break on the faulting instruction itself (the probe's
+                         * dereference), not on KeBugCheckEx -- the registers there name
+                         * WHERE the bogus pointer was loaded from. */
+                        hype_svm_vcpu_arm_exec_breakpoint(ctx, g_436_kmod_base + 0x25d50bull);
+                        hype_debug_print("fw-1 #436 BP armed on the probe @0x%llx\n",
+                                         (unsigned long long)(g_436_kmod_base + 0x25d50bull));
+                    }
+                }
+                if (g_436_kmod_base != 0 && g_fw_1_host_tsc_hz != 0 &&
+                    selw_now - selw_last > 5u * g_fw_1_host_tsc_hz) {
+                    uint64_t sel = 0, arm = 0, cr3w = vmm_get_cr3(kind, ctx);
+                    selw_last = selw_now;
+                    if (cr3w != 0 &&
+                        fw_1_read_guest_va(vm, cr3w, g_436_kmod_base + 0xfc2230ull, &sel, 8) &&
+                        sel != 0) {
+                        (void)fw_1_read_guest_va(vm, cr3w, sel + 0x80ull, &arm, 8);
+                        hype_debug_print("fw-1 #436 SELWATCH desc=%016llx armRVA=0x%llx\n",
+                                         (unsigned long long)sel,
+                                         (unsigned long long)(arm ? arm - g_436_kmod_base : 0));
+                    }
+                }
+            }
 #ifndef HYPE_436_NO_PREEMPT
             /* #436 experiment gate: the host preempt tick fires mid-guest-execution
              * (an INTR exit with no guest-visible effect) exactly during CPU-bound
@@ -11533,6 +11576,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                 char mname[32];
                                 int have = hype_pe_module_name(fw_1_pe_read, &pctx, mbase, mname,
                                                                sizeof(mname));
+                                g_436_kmod_base = mbase;
                                 hype_debug_print("fw-1 RIPHOT-MODULE 0x%llx -> base 0x%llx (+0x%llx) "
                                                  "%s [#364]\n",
                                                  (unsigned long long)riphist_rip[top[0]],
@@ -11549,19 +11593,175 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      * disassembling KeBugCheckEx forward). Read it once, through
                                      * the guest's own page tables.
                                      */
+                                    static int frame_done = 0;
                                     static int bugchk_done = 0;
                                     if (!bugchk_done && riphist_rip[top[0]] >= 0xFFFF800000000000ULL) {
                                         hype_svm_debug_state_t bs;
                                         unsigned bq;
                                         bugchk_done = 1;
                                         hype_svm_vcpu_get_debug_state(ctx, &bs);
+                                        if (!frame_done && bs.rsp != 0) {
+                                            /* #436: which dispatch was actually taken? Scan the
+                                             * guest stack for the return addresses that follow
+                                             * each one. Static analysis has now been wrong nine
+                                             * times; this reads what the CPU really did. */
+                                            uint64_t want1 = mbase + 0x2adb1aull; /* mode-3 site */
+                                            uint64_t want2 = mbase + 0x2adbfbull; /* mode-1/2 site */
+                                            unsigned si;
+                                            frame_done = 1;
+                                            for (si = 0; si < 512u; si++) {
+                                                uint64_t v = 0;
+                                                if (!fw_1_read_guest_va(vm, bs.cr3,
+                                                                        bs.rsp + 8ull * si, &v, 8)) {
+                                                    continue;
+                                                }
+                                                if (v == want1 || v == want2) {
+                                                    hype_debug_print("fw-1 #436 FRAME: found return "
+                                                                     "to %s dispatch at rsp+0x%x\n",
+                                                                     (v == want1) ? "mode-3"
+                                                                                  : "mode-1/2",
+                                                                     (unsigned)(si * 8u));
+                                                }
+                                            }
+                                            hype_debug_print("fw-1 #436 FRAME: scan done "
+                                                             "(rsp=0x%llx)\n",
+                                                             (unsigned long long)bs.rsp);
+                                        }
+                                        {
+                                            /* #436: how many timer sources the
+                                             * HAL actually registered. Zero means
+                                             * nothing registered at all, which is
+                                             * a different problem from "no timer
+                                             * of the class it wants". */
+                                            uint32_t regcount = 0;
+                                            uint64_t lh0 = 0, lh1 = 0;
+                                            (void)fw_1_read_guest_va(vm, bs.cr3, mbase + 0xfc227cull,
+                                                                     &regcount, 4);
+                                            (void)fw_1_read_guest_va(vm, bs.cr3, mbase + 0xfc2260ull,
+                                                                     &lh0, 8);
+                                            (void)fw_1_read_guest_va(vm, bs.cr3, mbase + 0xfc2268ull,
+                                                                     &lh1, 8);
+                                            {   /* #436: the SELECTED clock timer, read from the
+                                                 * global the failing function uses (0xfc2230),
+                                                 * plus its arm routine at +0x80 and its class --
+                                                 * this is the descriptor the bugcheck names, and
+                                                 * assuming it equals any particular list entry
+                                                 * has been wrong before. */
+                                                uint64_t sel = 0, arm = 0;
+                                                uint32_t scls = 0;
+                                                (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                         mbase + 0xfc2230ull,
+                                                                         &sel, 8);
+                                                if (sel != 0) {
+                                                    (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                             sel + 0x80ull, &arm, 8);
+                                                    (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                             sel + 0xE4ull, &scls, 4);
+                                                }
+                                                hype_debug_print("fw-1 #436 SELECTED: desc=%016llx "
+                                                                 "class=%u arm=%016llx (arm RVA "
+                                                                 "0x%llx)\n",
+                                                                 (unsigned long long)sel,
+                                                                 (unsigned)scls,
+                                                                 (unsigned long long)arm,
+                                                                 (unsigned long long)(arm ? arm - mbase : 0));
+                                            }
+                                            hype_debug_print("fw-1 #436 HPETACC: guest touched the "
+                                                             "HPET block %llu times\n",
+                                                             (unsigned long long)g_436_hpet_accesses);
+                                            hype_debug_print("fw-1 #436 HALTIMERS: registered=%u "
+                                                             "list=%016llx/%016llx\n",
+                                                             (unsigned)regcount,
+                                                             (unsigned long long)lh0,
+                                                             (unsigned long long)lh1);
+                                            {   /* #436: the bugcheck names one descriptor in
+                                                 * p2. Dump the offsets the HAL's own code reads
+                                                 * -- +0xC0 (a routine pointer it requires
+                                                 * non-NULL), +0xE0 (flags whose bits 8/9/11 gate
+                                                 * registration and bit 13 the HPET path), and
+                                                 * +0x88/+0x8c -- so the mismatch is visible. */
+                                                uint64_t dsc = lh1;
+                                                uint32_t o;
+                                                for (o = 0x80u; o <= 0xE0u; o += 0x20u) {
+                                                    uint64_t q[4];
+                                                    unsigned k;
+                                                    for (k = 0; k < 4u; k++) {
+                                                        q[k] = 0;
+                                                        (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                                 dsc + o + 8ull * k,
+                                                                                 &q[k], 8);
+                                                    }
+                                                    hype_debug_print("fw-1 #436 HALDESC +0x%02x:"
+                                                                     " %016llx %016llx %016llx"
+                                                                     " %016llx\n", (unsigned)o,
+                                                                     (unsigned long long)q[0],
+                                                                     (unsigned long long)q[1],
+                                                                     (unsigned long long)q[2],
+                                                                     (unsigned long long)q[3]);
+                                                }
+                                            }
+                                            {   /* Walk the list and show each entry's
+                                                 * identifying fields, so the classes hype's
+                                                 * platform produced are visible directly. */
+                                                uint64_t node = lh0;
+                                                unsigned n;
+                                                for (n = 0; n < 10u && node != 0; n++) {
+                                                    uint64_t q[6];
+                                                    unsigned k;
+                                                    for (k = 0; k < 6u; k++) {
+                                                        q[k] = 0;
+                                                        (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                                 node + 8ull * k,
+                                                                                 &q[k], 8);
+                                                    }
+                                                    {   /* #436: +0xE4 is the CLASS the HAL
+                                                         * matches on (exact equality) and +0xC0
+                                                         * the frequency -- print both so the
+                                                         * classes hype's platform really
+                                                         * produced are ground truth, not a
+                                                         * static guess. */
+                                                        uint32_t cls = 0;
+                                                        uint64_t freq = 0;
+                                                        (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                                 node + 0xE4ull,
+                                                                                 &cls, 4);
+                                                        (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                                 node + 0xC0ull,
+                                                                                 &freq, 8);
+                                                        uint32_t filt = 0, caps = 0;
+                                                        (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                                 node + 0xB8ull,
+                                                                                 &filt, 4);
+                                                        (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                                 node + 0xE0ull,
+                                                                                 &caps, 4);
+                                                        uint64_t p68 = 0;
+                                                        (void)fw_1_read_guest_va(vm, bs.cr3,
+                                                                                 node + 0x80ull,
+                                                                                 &p68, 8);
+                                                        hype_debug_print("fw-1 #436 HALTIMER[%u] "
+                                                                         "@%llx class=%u freq=%llu "
+                                                                         "filt=%08x caps=%08x "
+                                                                         "p68=%016llx\n",
+                                                                         n, (unsigned long long)node,
+                                                                         (unsigned)cls,
+                                                                         (unsigned long long)freq,
+                                                                         (unsigned)filt,
+                                                                         (unsigned)caps,
+                                                                         (unsigned long long)p68);
+                                                    }
+                                                    if (q[0] == lh0 || q[0] == node) { break; }
+                                                    node = q[0];
+                                                }
+                                            }
+                                        }
                                         for (bq = 0; bq < 8u; bq += 4u) {
                                             uint64_t v[4];
                                             unsigned k;
                                             for (k = 0; k < 4u; k++) {
                                                 v[k] = 0;
                                                 (void)fw_1_read_guest_va(vm, bs.cr3,
-                                                    mbase + 0xf21610ull + 8ull * (bq + k), &v[k], 8);
+                                                    mbase + 0xf215f0ull + 8ull * (bq + k), &v[k], 8);
                                             }
                                             hype_debug_print(
                                                 "fw-1 #436 BUGCHK +0x%02x: %016llx %016llx %016llx %016llx\n",
@@ -12781,7 +12981,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                              (unsigned long long)info.guest_rip);
         }
         { unsigned _vi=(unsigned)(vm-g_vms); g_436_loop_section[_vi]=76;
-          g_436_last_reason[_vi]=info.reason; g_436_last_rip[_vi]=info.guest_rip; }
+          g_436_last_reason[_vi]=info.reason; g_436_last_rip[_vi]=info.guest_rip;
+          g_436_last_cr3 = vmm_get_cr3(kind, ctx); }
         if (vmm_reason_is_cr_access(kind, info.reason)) {
             /* #248: guest wrote a CR whose bits the host owns (CR4.VMXE /
              * CR0.NE). Re-apply the required bit and let the guest read back its
@@ -13807,6 +14008,58 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * delivers the fault through its own IDT exactly as if unintercepted --
          * benign kernel ud2/BUG or MSR-probe #GP just get logged+reinjected and
          * the boot continues. Capped so a chatty guest can't flood the console. */
+        if (kind == HYPE_VMM_KIND_SVM && info.reason == 0x37ull) {
+            /* #436: the guest wrote DR7 -- keep the KeBugCheckEx breakpoint armed. */
+            if (hype_svm_vcpu_handle_dr_write(ctx) == 0) {
+                continue;
+            }
+        }
+        if (vmm_reason_is_exception(kind, ctx, info.reason, 1)) {
+            /* #436: the KeBugCheckEx breakpoint. Report the call exactly as the
+             * guest made it, then disarm so the bugcheck proceeds untouched. */
+            static int bp_hit = 0;
+            /* #436: this probe runs constantly and succeeds; report only the
+             * execution that is about to fault -- the one whose clamped address
+             * equals the value the bugcheck reported. */
+            /* RBX holds the loaded value that the clamp is applied to; RAX is not
+             * in the GPR array (VMCB save.rax holds it), so test RBX instead --
+             * rax >= the clamp exactly when rbx does. */
+            {   /* #436: entry to the faulting function -- log its arguments so the
+                 * structure it is processing can be identified. Keep only the most
+                 * recent few, since the last one before the fault is the one that
+                 * matters. */
+                /* #436: print EVERY hit. The run ends at the bugcheck, so the last
+                 * line in the log is the execution that faulted -- no condition
+                 * needed, and no risk of the condition being wrong (which it has
+                 * been twice). */
+                static unsigned ent_n = 0;
+                ent_n++;
+                {
+                hype_svm_debug_state_t ds;
+                uint64_t ret = 0, p5 = 0;
+                bp_hit = 1;
+                hype_svm_vcpu_get_debug_state(ctx, &ds);
+                (void)fw_1_read_guest_va(vm, ds.cr3, ds.rsp, &ret, 8);
+                (void)fw_1_read_guest_va(vm, ds.cr3, ds.rsp + 0x28ull, &p5, 8);
+                    hype_svm_debug_state_t es;
+                    uint64_t eret = 0;
+                    hype_svm_vcpu_get_debug_state(ctx, &es);
+                    (void)fw_1_read_guest_va(vm, es.cr3, es.rsp, &eret, 8);
+                    uint64_t r8v = hype_svm_vcpu_get_gpr(ctx, 8);
+                    uint64_t srcv = 0;
+                    (void)fw_1_read_guest_va(vm, es.cr3, r8v, &srcv, 8);
+                    hype_debug_print("fw-1 #436 HIT[%u]: rbx=0x%llx r8=0x%llx *(r8)=0x%llx "
+                                     "rsi=0x%llx rdi=0x%llx\n",
+                                     ent_n,
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 3),
+                                     (unsigned long long)r8v,
+                                     (unsigned long long)srcv,
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 6),
+                                     (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 7));
+                }
+            }
+            continue;
+        }
         if (vmm_reason_is_exception(kind, ctx, info.reason, 6) ||
             vmm_reason_is_exception(kind, ctx, info.reason, 13)) {
             unsigned vec = (unsigned)vmm_exception_vector(kind, ctx, info.reason);
@@ -19322,7 +19575,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 unsigned long long dev_queued = 0, guest_read = 0, dev_drop = 0;
                                 {
                                     extern volatile uint64_t g_436_ap_host_rip[];
-                                    hype_debug_print("fw-1 APLOOP vm%u: section=%u iter=%llu reason=0x%llx grip=0x%llx HOSTRIP=0x%llx [#436]\n",
+                                hype_debug_print("fw-1 APLOOP vm%u: section=%u iter=%llu reason=0x%llx grip=0x%llx HOSTRIP=0x%llx [#436]\n",
                                                  vi, (unsigned)g_436_loop_section[vi],
                                                  (unsigned long long)g_436_loop_iter[vi],
                                                  (unsigned long long)g_436_last_reason[vi],

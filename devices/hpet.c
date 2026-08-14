@@ -86,6 +86,32 @@ uint32_t hype_hpet_sync(hype_hpet_t *hpet, uint64_t absolute_ticks) {
     return fired;
 }
 
+int hype_hpet_timer_gsi(const hype_hpet_t *hpet, unsigned idx) {
+    uint64_t conf;
+    unsigned gsi;
+
+    if (idx >= HYPE_HPET_NUM_TIMERS) {
+        return -1;
+    }
+    conf = hpet->timers[idx].config;
+    if ((conf & HYPE_HPET_TIMER_INT_ENABLE) == 0u) {
+        return -1; /* the guest did not ask for an interrupt at all */
+    }
+    /* Legacy replacement routing applies only to comparator 0, and puts it
+     * where the PIT's output would be. */
+    if (idx == 0u && (hpet->config & HYPE_HPET_CONFIG_LEGACY_ROUTE) != 0u) {
+        return 2;
+    }
+    gsi = (unsigned)((conf >> 9) & 0x1Fu);
+    /* Only a line this comparator advertises it can reach. A zero routing
+     * field means "unrouted", and delivering it as GSI 0 would fire on the
+     * PIT's line -- which is the bug this check exists to prevent. */
+    if (((HYPE_HPET_TIMER_ROUTE_CAP_MASK >> gsi) & 1u) == 0u) {
+        return -1;
+    }
+    return (int)gsi;
+}
+
 static uint64_t timer_index_for(uint32_t offset, uint32_t *out_reg) {
     uint32_t rel = offset - HYPE_HPET_REG_TIMER_BASE;
     *out_reg = rel % HYPE_HPET_REG_TIMER_STRIDE;
