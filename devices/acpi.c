@@ -85,7 +85,30 @@ static void put_le32_at(uint8_t *p, uint32_t v) {
 
 int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi_config_t *cfg,
                                  hype_acpi_layout_t *out) {
+    /*
+     * #436: the HPET is NOT advertised by default.
+     *
+     * The device model, its ACPI table and its DSDT node are all implemented
+     * and unit-tested, but a guest that uses the timer still fails: with the
+     * HPET in the XSDT, Windows bugchecks during kernel initialisation in every
+     * run; with it omitted and the device otherwise untouched, the bugchecks
+     * disappear and the boot proceeds measurably further. Three real defects in
+     * the model were found and fixed along the way (unrouted comparators
+     * delivering to the PIT's line, a counter that ran 0.0167% fast against the
+     * other clocks, and a level-triggered line that was pulsed and never
+     * deasserted) and at least one more remains.
+     *
+     * Advertising a timer whose behaviour is not yet right is the same defect
+     * this ticket has been fixing everywhere else -- describing hardware that
+     * does not work the way the description promises. So it stays out of the
+     * table until the model is proven; build with -DHYPE_HPET_ADVERTISE to
+     * enable it for that work.
+     */
+#ifdef HYPE_HPET_ADVERTISE
     uint32_t xsdt_entry_count = 4; /* FADT, MADT, MCFG, HPET */
+#else
+    uint32_t xsdt_entry_count = 3; /* FADT, MADT, MCFG */
+#endif
     uint32_t xsdt_length = (uint32_t)sizeof(hype_acpi_sdt_header_t) + xsdt_entry_count * 8u;
     uint32_t fadt_length = (uint32_t)sizeof(hype_acpi_fadt_t);
     uint32_t madt_length = (uint32_t)sizeof(hype_acpi_madt_header_t) +
@@ -375,7 +398,9 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
         write_le64(entries + 0, out->fadt_offset);
         write_le64(entries + 8, out->madt_offset);
         write_le64(entries + 16, out->mcfg_offset);
+#ifdef HYPE_HPET_ADVERTISE
         write_le64(entries + 24, out->hpet_offset); /* #436 */
+#endif
     }
 
     return 0;

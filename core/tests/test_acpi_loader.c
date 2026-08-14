@@ -123,10 +123,17 @@ static void test_build_script_entry_count_and_shape(void) {
     /* #436: fadt->{facs,x_facs} joined the set when hype started emitting a
      * FACS -- a non-hardware-reduced platform has one, and the FADT must point
      * at it. The FACS has no SDT header, so it takes pointers but no checksum. */
-    CHECK_HEX("9 ADD_POINTER entries (rsdp->xsdt, xsdt->{fadt,madt,mcfg,hpet}, "
-              "fadt->{dsdt,x_dsdt,facs,x_facs})", 9, pointer_count);
-    /* #436: the HPET table joined the set, so six tables carry a checksum. */
-    CHECK_HEX("8 ADD_CHECKSUM entries (6 tables + rsdp's own 2)", 8, checksum_count);
+    /* #436: the HPET is not advertised by default (see devices/acpi.c), so its
+     * XSDT pointer and checksum are absent unless the build enables it. */
+#ifdef HYPE_HPET_ADVERTISE
+    CHECK_HEX("9 ADD_POINTER entries", 9, pointer_count);
+    CHECK_HEX("8 ADD_CHECKSUM entries", 8, checksum_count);
+#else
+    CHECK_HEX("8 ADD_POINTER entries (rsdp->xsdt, xsdt->{fadt,madt,mcfg}, "
+              "fadt->{dsdt,x_dsdt,facs,x_facs})", 8, pointer_count);
+    CHECK_HEX("7 ADD_CHECKSUM entries (5 tables + rsdp's own 2)", 7, checksum_count);
+#endif
+
 
     /* Spot-check a couple of the pointer entries land on the offsets
      * this specific layout implies. */
@@ -136,11 +143,16 @@ static void test_build_script_entry_count_and_shape(void) {
     CHECK_HEX("xsdt->fadt pointer offset", layout.xsdt_offset + 36, entries[3].pointer.offset);
     CHECK_HEX("xsdt->madt pointer offset", layout.xsdt_offset + 36 + 8, entries[4].pointer.offset);
     CHECK_HEX("xsdt->mcfg pointer offset", layout.xsdt_offset + 36 + 16, entries[5].pointer.offset);
+#ifdef HYPE_HPET_ADVERTISE
     CHECK_HEX("xsdt->hpet pointer offset", layout.xsdt_offset + 36 + 24, entries[6].pointer.offset);
     CHECK_HEX("fadt->dsdt (legacy 32-bit) pointer offset", layout.fadt_offset + 40, entries[7].pointer.offset);
-    CHECK_HEX("fadt->dsdt (legacy) pointer size", 4, entries[7].pointer.size);
     CHECK_HEX("fadt->x_dsdt pointer offset", layout.fadt_offset + 140, entries[8].pointer.offset);
-    CHECK_HEX("fadt->x_dsdt pointer size", 8, entries[8].pointer.size);
+#else
+    CHECK_HEX("fadt->dsdt (legacy 32-bit) pointer offset", layout.fadt_offset + 40, entries[6].pointer.offset);
+    CHECK_HEX("fadt->dsdt (legacy) pointer size", 4, entries[6].pointer.size);
+    CHECK_HEX("fadt->x_dsdt pointer offset", layout.fadt_offset + 140, entries[7].pointer.offset);
+    CHECK_HEX("fadt->x_dsdt pointer size", 8, entries[7].pointer.size);
+#endif
 }
 
 int main(void) {

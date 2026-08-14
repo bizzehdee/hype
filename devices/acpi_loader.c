@@ -80,9 +80,13 @@ uint32_t hype_acpi_loader_build_script(hype_acpi_loader_entry_t *entries, const 
     hype_acpi_loader_build_add_pointer(
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES, HYPE_ACPI_LOADER_FILE_TABLES,
         layout->xsdt_offset + (uint32_t)sizeof(hype_acpi_sdt_header_t) + 2u * 8u, 8);
+#ifdef HYPE_HPET_ADVERTISE
+    /* #436: only when the HPET is advertised -- patching a fourth XSDT slot
+     * that does not exist would write into the table that follows it. */
     hype_acpi_loader_build_add_pointer(
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES, HYPE_ACPI_LOADER_FILE_TABLES,
         layout->xsdt_offset + (uint32_t)sizeof(hype_acpi_sdt_header_t) + 3u * 8u, 8);
+#endif
 
     /* FADT.Dsdt (legacy 32-bit) and FADT.X_Dsdt (64-bit) -> DSDT,
      * within the same blob. */
@@ -126,10 +130,12 @@ uint32_t hype_acpi_loader_build_script(hype_acpi_loader_entry_t *entries, const 
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,
         layout->dsdt_offset + (uint32_t)offsetof(hype_acpi_sdt_header_t, checksum), layout->dsdt_offset,
         layout->dsdt_length);
+#ifdef HYPE_HPET_ADVERTISE
     hype_acpi_loader_build_add_checksum(
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,
         layout->hpet_offset + (uint32_t)offsetof(hype_acpi_sdt_header_t, checksum), layout->hpet_offset,
         layout->hpet_length);
+#endif
 
     /* RSDP's own two checksums: the ACPI 1.0 region [0,20) and the
      * whole 36-byte extended structure. */
