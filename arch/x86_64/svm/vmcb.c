@@ -324,8 +324,13 @@ int hype_svm_can_accept_interrupt(uint64_t rflags, uint64_t interrupt_shadow) {
     return (rflags & HYPE_RFLAGS_IF) != 0;
 }
 
-uint64_t hype_svm_arm_vintr_request(uint64_t vintr) {
-    return (vintr & ~HYPE_SVM_VINTR_INJECTION_BITS_MASK) | HYPE_SVM_VINTR_V_IRQ | HYPE_SVM_VINTR_V_IGN_TPR;
+int hype_svm_vintr_priority_allows(uint64_t vintr, uint8_t vector) {
+    return (vintr & HYPE_SVM_VINTR_V_TPR_MASK) < ((uint64_t)vector >> 4);
+}
+
+uint64_t hype_svm_arm_vintr_request(uint64_t vintr, uint8_t vector) {
+    uint64_t priority = ((uint64_t)vector >> 4) << HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT;
+    return (vintr & ~HYPE_SVM_VINTR_INJECTION_BITS_MASK) | HYPE_SVM_VINTR_V_IRQ | priority;
 }
 
 uint64_t hype_svm_disarm_vintr_request(uint64_t vintr) {

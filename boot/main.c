@@ -10017,7 +10017,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     vmm_set_pvclock(kind, ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
     vmm_set_hv_enabled(kind, ctx, vm->hv_leaves);
     vmm_set_rip(kind, ctx, reset_rip);
-    vmm_set_exception_intercepts(kind, ctx, (1u << 6) | (1u << 13));
+    vmm_set_exception_intercepts(kind, ctx, (1u << 6));
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
         vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
     }
@@ -10391,15 +10391,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * guest. An unrecoverable triple fault still returns to us as
      * HYPE_SVM_EXITCODE_SHUTDOWN.
      *
-     * GLADDER-6c DIAG: additionally OBSERVE #UD(6) and #GP(13) -- the two
-     * vectors a hype-specific mis-emulation would surface as (a bad/illegal
-     * instruction -> #UD; a bad segment/MSR/canonical access -> #GP). They are
-     * intercepted only to LOG (rip/cs/err/insn bytes) and then reinjected via
-     * hype_svm_vcpu_reinject_exception(), so the guest still delivers the fault
-     * through its own IDT exactly as before -- catches the invisible Ubuntu
-     * udevadm crash at its source without altering guest behavior. #PF(14) is
-     * deliberately NOT intercepted (routine, would flood + slow the boot). */
-    vmm_set_exception_intercepts(kind, ctx, (1u << 6) | (1u << 13));
+     * GLADDER-6c DIAG: observe #UD(6), which identifies an illegal instruction
+     * while remaining rare enough to re-inject safely.  Do not intercept #GP:
+     * Windows' syscall and exception paths legitimately use it during early
+     * user-mode bring-up, and an observation/reinjection loop here can turn a
+     * recoverable guest fault into an endless VM-exit storm.  #PF(14) is also
+     * deliberately not intercepted (routine, would flood + slow the boot). */
+    vmm_set_exception_intercepts(kind, ctx, (1u << 6));
 
     /* M4-6d4 #5: bound the guest's uninterrupted execution via SVM PAUSE-
      * filtering. Real HW showed a single 40s VMRUN with zero exits (PREEMPT
@@ -10823,7 +10821,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         /* #436: break on KeBugCheckEx so the bugcheck reports itself --
                          * caller, parameters and register state, measured rather than
                          * matched by parameter shape (which has been wrong every time). */
-                        vmm_set_exception_intercepts(kind, ctx, (1u << 1) | (1u << 6) | (1u << 13));
+                        vmm_set_exception_intercepts(kind, ctx, (1u << 1) | (1u << 6));
                         /* #436: break on the faulting instruction itself (the probe's
                          * dereference), not on KeBugCheckEx -- the registers there name
                          * WHERE the bogus pointer was loaded from. */

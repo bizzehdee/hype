@@ -497,8 +497,8 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx);
 /*
  * INT-1/INT-2: the high-level API a device model calls to deliver an
  * interrupt `vector` to this guest -- "now, or as soon as it genuinely
- * can" per hype_svm_can_accept_interrupt(). If the guest can accept it
- * immediately, writes EVENTINJ directly via
+ * can" per hype_svm_can_accept_interrupt() and the guest's virtual
+ * interrupt priority. If the guest can accept it immediately, writes EVENTINJ directly via
  * hype_svm_encode_eventinj_intr() (delivered on the very next VMRUN).
  * Otherwise sets `vector`'s bit in a 256-bit pending IRR and arms an interrupt-window request
  * (hype_svm_arm_vintr_request(), HYPE_SVM_INTERCEPT_VINTR), so
@@ -628,7 +628,7 @@ void hype_svm_vcpu_get_read_verify(unsigned long long *checked, unsigned long lo
  * pending/unmasked IRQ from IRR to ISR and computing its real vector
  * from the chip's own ICW2-programmed offset) with
  * hype_svm_vcpu_request_interrupt() (INT-1/INT-2) to actually deliver
- * that vector to the guest, now or once it genuinely can accept it.
+ * that vector to the guest, now or once IF/shadow and virtual priority permit it.
  * If nothing pending is currently unmasked (acknowledge finds
  * nothing), this is a no-op beyond raising IRR -- exactly matching
  * real hardware, where a masked IRQ simply waits until unmasked.

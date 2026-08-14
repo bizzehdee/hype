@@ -487,11 +487,13 @@ static void test_can_accept_interrupt_if_clear_and_in_shadow(void) {
               hype_svm_can_accept_interrupt(0, HYPE_SVM_INTERRUPT_SHADOW_ACTIVE));
 }
 
-static void test_arm_vintr_request_sets_bits_preserves_others(void) {
-    uint64_t armed = hype_svm_arm_vintr_request(HYPE_SVM_INT_CTL_AVIC_ENABLE);
+static void test_arm_vintr_request_sets_priority_preserves_others(void) {
+    uint64_t armed = hype_svm_arm_vintr_request(HYPE_SVM_INT_CTL_AVIC_ENABLE, 0xD1u);
 
     CHECK_HEX("V_IRQ set", 1, (armed & HYPE_SVM_VINTR_V_IRQ) != 0);
-    CHECK_HEX("V_IGN_TPR set", 1, (armed & HYPE_SVM_VINTR_V_IGN_TPR) != 0);
+    CHECK_HEX("V_IGN_TPR clear", 0, (armed & HYPE_SVM_VINTR_V_IGN_TPR) != 0);
+    CHECK_HEX("vector priority armed", 0xDu << HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT,
+              armed & HYPE_SVM_VINTR_V_INTR_PRIO_MASK);
     CHECK_HEX("unrelated bit (AVIC enable) preserved", 1, (armed & HYPE_SVM_INT_CTL_AVIC_ENABLE) != 0);
 }
 
@@ -500,18 +502,29 @@ static void test_arm_vintr_request_idempotent_over_stale_priority_bits(void) {
      * fresh arm -- the mask clears the whole injection-bits group
      * before re-setting it. */
     uint64_t stale = 0x5ULL << HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT;
-    uint64_t armed = hype_svm_arm_vintr_request(stale);
-    CHECK_HEX("stale priority bits cleared", 0, armed & HYPE_SVM_VINTR_V_INTR_PRIO_MASK);
+    uint64_t armed = hype_svm_arm_vintr_request(stale, 0x20u);
+    CHECK_HEX("stale priority replaced", 0x2u << HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT,
+              armed & HYPE_SVM_VINTR_V_INTR_PRIO_MASK);
 }
 
 static void test_disarm_vintr_request_clears_bits_preserves_others(void) {
-    uint64_t armed = hype_svm_arm_vintr_request(HYPE_SVM_INT_CTL_AVIC_ENABLE);
+    uint64_t armed = hype_svm_arm_vintr_request(HYPE_SVM_INT_CTL_AVIC_ENABLE, 0xD1u);
     uint64_t disarmed = hype_svm_disarm_vintr_request(armed);
 
     CHECK_HEX("V_IRQ clear", 0, disarmed & HYPE_SVM_VINTR_V_IRQ);
     CHECK_HEX("V_IGN_TPR clear", 0, disarmed & HYPE_SVM_VINTR_V_IGN_TPR);
     CHECK_HEX("V_INTR_PRIO clear", 0, disarmed & HYPE_SVM_VINTR_V_INTR_PRIO_MASK);
     CHECK_HEX("unrelated bit (AVIC enable) preserved", 1, (disarmed & HYPE_SVM_INT_CTL_AVIC_ENABLE) != 0);
+}
+
+static void test_vintr_priority_honours_virtual_tpr(void) {
+    uint64_t vintr = 0xDu; /* Windows' CR8/IRQL 13 while handling vector 0xD1. */
+
+    CHECK_HEX("same priority is blocked", 0, hype_svm_vintr_priority_allows(vintr, 0xD1u));
+    CHECK_HEX("lower priority is blocked", 0, hype_svm_vintr_priority_allows(vintr, 0xC0u));
+    CHECK_HEX("higher priority is allowed", 1, hype_svm_vintr_priority_allows(vintr, 0xE0u));
+    CHECK_HEX("priority is allowed after CR8 lowers", 1,
+              hype_svm_vintr_priority_allows(0x2u, 0xD1u));
 }
 
 /*
@@ -654,9 +667,10 @@ int main(void) {
     test_can_accept_interrupt_if_clear();
     test_can_accept_interrupt_in_shadow();
     test_can_accept_interrupt_if_clear_and_in_shadow();
-    test_arm_vintr_request_sets_bits_preserves_others();
+    test_arm_vintr_request_sets_priority_preserves_others();
     test_arm_vintr_request_idempotent_over_stale_priority_bits();
     test_disarm_vintr_request_clears_bits_preserves_others();
+    test_vintr_priority_honours_virtual_tpr();
     test_irr_holds_multiple_vectors_and_drains_by_priority();
     test_irr_set_any_highest_clear();
     test_irr_boundary_vectors();

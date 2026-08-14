@@ -299,19 +299,17 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  * "Virtual Interrupt Control (VMCB offset 60h)", p.512, cross-checked
  * against Appendix B's own combined description of offset 60h-67h.
  * V_IRQ (bit 8) requests hardware treat a virtual interrupt as pending;
- * V_INTR_PRIO (bits 19:16) is its priority, compared against V_TPR
- * (bits 3:0, this project always leaves at 0) unless V_IGN_TPR (bit 20)
- * is set to skip that check entirely -- this project always sets
- * V_IGN_TPR alongside V_IRQ (matching real hypervisors' own "just poke
- * me when the guest can take *any* interrupt" convention, since the
- * actual vector delivered is via EVENTINJ, not V_INTR_VECTOR -- this
- * project never uses AVIC, so V_INTR_VECTOR's hardware-delivery path
- * is irrelevant here). Hardware clears V_IRQ once the interrupt window
- * genuinely opens and fires EXITCODE_VINTR; nothing here is itself the
- * interrupt delivery -- that's still EVENTINJ, written only once that
- * VMEXIT confirms the guest can actually accept it right now.
+ * V_INTR_PRIO (bits 19:16) is compared against V_TPR (bits 3:0), which
+ * tracks the guest's CR8/IRQL.  Keeping this comparison enabled is essential:
+ * delivering a same-priority clock interrupt while its previous handler holds
+ * a spin lock can re-enter a non-reentrant Windows DPC path.  Hardware clears
+ * V_IRQ once the eligible interrupt window genuinely opens and fires
+ * EXITCODE_VINTR; nothing here is itself the interrupt delivery -- that is
+ * still EVENTINJ, written only once that VMEXIT confirms both IF/shadow and
+ * virtual priority permit it.
  */
 #define HYPE_SVM_VINTR_V_IRQ (1ULL << 8)
+#define HYPE_SVM_VINTR_V_TPR_MASK 0xFULL
 #define HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT 16
 #define HYPE_SVM_VINTR_V_INTR_PRIO_MASK (0xFULL << HYPE_SVM_VINTR_V_INTR_PRIO_SHIFT)
 #define HYPE_SVM_VINTR_V_IGN_TPR (1ULL << 20)
@@ -322,7 +320,7 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  * no #VMEXIT, no input delivery, no diagnostics, no watchdog (measured:
  * preempt_if1=5889, preempt_if0=0 across every historic run). */
 #define HYPE_SVM_VINTR_V_INTR_MASKING (1ULL << 24)
-/* Every bit hype_svm_arm_vintr_request()/_disarm_vintr_request() ever
+/* Every injection-control bit hype_svm_arm_vintr_request()/_disarm_vintr_request() ever
  * touch, as a single mask -- matches Linux KVM's own
  * V_IRQ_INJECTION_BITS_MASK naming/grouping. */
 #define HYPE_SVM_VINTR_INJECTION_BITS_MASK \
@@ -547,24 +545,26 @@ uint64_t hype_svm_encode_eventinj_intr(uint8_t vector);
  * HYPE_SVM_INTERRUPT_SHADOW_ACTIVE's own comment for what that means).
  * This project has no VGIF/nested-guest concept, so those are the only
  * two gates that apply here (real hardware's full gating list also
- * includes GIF and, for AVIC, a priority check against V_TPR -- neither
- * relevant to this project's own non-AVIC, non-nested scope). Pure
- * logic, no CPU state touched.
+ * includes GIF and the virtual interrupt priority check, which is kept in
+ * hype_svm_vintr_priority_allows() because EVENTINJ itself bypasses V_TPR.
+ * Pure logic, no CPU state touched.
  */
 int hype_svm_can_accept_interrupt(uint64_t rflags, uint64_t interrupt_shadow);
 
 /*
- * INT-2: returns `vintr` with V_IRQ/V_INTR_PRIO/V_IGN_TPR set to
- * request an interrupt-window VMEXIT (EXITCODE_VINTR) the moment the
- * guest becomes able to accept an interrupt -- V_IGN_TPR is always set
- * alongside V_IRQ (this project never uses V_TPR-based priority
- * masking; the actual vector delivered comes from EVENTINJ once that
- * VMEXIT fires, not from V_INTR_VECTOR/AVIC's own hardware-delivery
- * path). Every other bit of `vintr` (e.g. HYPE_SVM_INT_CTL_AVIC_ENABLE,
- * unused by this project but preserved for correctness regardless) is
- * left untouched. Pure bit packing, no CPU state touched.
+ * True iff `vector` outranks the guest's current V_TPR.  SVM's hardware
+ * applies the same predicate before producing EXITCODE_VINTR; the direct
+ * EVENTINJ path checks it explicitly because EVENTINJ bypasses V_TPR.
  */
-uint64_t hype_svm_arm_vintr_request(uint64_t vintr);
+int hype_svm_vintr_priority_allows(uint64_t vintr, uint8_t vector);
+
+/*
+ * INT-2: returns `vintr` with V_IRQ and `vector`'s priority armed to request
+ * EXITCODE_VINTR only when the guest can accept an interrupt of that priority.
+ * Every unrelated bit (including V_TPR and AVIC enable) is preserved. Pure
+ * bit packing, no CPU state touched.
+ */
+uint64_t hype_svm_arm_vintr_request(uint64_t vintr, uint8_t vector);
 
 /*
  * INT-2: returns `vintr` with the same bits _arm_vintr_request() sets

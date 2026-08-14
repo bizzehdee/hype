@@ -1267,7 +1267,9 @@ unsigned long long hype_svm_vcpu_get_eventinj_collisions(void) {
  * take an interrupt" request exactly as long as there is something to deliver. */
 static void hype_svm_sync_vintr(struct hype_vcpu_ctx *real) {
     if (hype_svm_irr_any(real->pending_irr)) {
-        real->vmcb->control.vintr = hype_svm_arm_vintr_request(real->vmcb->control.vintr);
+        int v = hype_svm_irr_highest(real->pending_irr);
+        real->vmcb->control.vintr = hype_svm_arm_vintr_request(real->vmcb->control.vintr,
+                                                                 (uint8_t)v);
         real->vmcb->control.intercept_misc1 |= HYPE_SVM_INTERCEPT_VINTR;
     } else {
         real->vmcb->control.vintr = hype_svm_disarm_vintr_request(real->vmcb->control.vintr);
@@ -1346,7 +1348,8 @@ void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
                          (unsigned int)g_int_trace_n, (unsigned int)vector,
                          (!eventinj_busy && hype_svm_can_accept_interrupt(
                                                 real->vmcb->save.rflags,
-                                                real->vmcb->control.interrupt_shadow))
+                                                real->vmcb->control.interrupt_shadow) &&
+                          hype_svm_vintr_priority_allows(real->vmcb->control.vintr, vector))
                              ? "direct"
                              : "deferred",
                          (int)((real->vmcb->save.rflags >> 9) & 1u),
@@ -1355,7 +1358,8 @@ void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
 trace_done:
 
     if (!eventinj_busy &&
-        hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow)) {
+        hype_svm_can_accept_interrupt(real->vmcb->save.rflags, real->vmcb->control.interrupt_shadow) &&
+        hype_svm_vintr_priority_allows(real->vmcb->control.vintr, vector)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
         real->int_inj_by_vec[vector]++;
         g_int_eventinj++;
@@ -1448,6 +1452,9 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
     }
     {
         int v = hype_svm_irr_highest(real->pending_irr);
+        if (!hype_svm_vintr_priority_allows(real->vmcb->control.vintr, (uint8_t)v)) {
+            return 0;
+        }
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         real->int_inj_by_vec[(uint8_t)v]++;
