@@ -1,80 +1,78 @@
-# #436: get past cdboot's "Press any key to boot from CD or DVD" prompt.
+# #436: get a key into cdboot's "Press any key to boot from CD or DVD" prompt.
 #
-# Without this the boot never reaches Windows at all: the prompt times out
-# (`BdsDxe: failed to start Boot0002: Time out`) and the guest sits in firmware
-# spinning on HLT with RDMSR/CPUID -- which reads exactly like a hype wedge and
-# is not one. That misreading cost several cycles before it was identified.
+# The window is EARLY and SHORT. Measured from the guest's own elapsed-time
+# markers: the CD boot option starts at about t=2s and BDS reports it timed out
+# by t=4s. An earlier version of this script waited 5s before its first key and
+# so never put one in the window at all -- every run then looked like a wedge.
 #
-# Keys are injected on a fixed cadence rather than after an `expect`, because
-# the prompt is painted to the graphical console by cdboot, not written to the
-# serial line, so there is no text to wait for. The window is only a few
-# seconds wide, so Enter every 2s across a 65s span is certain to land inside
-# it wherever it falls, and the extra keypresses are harmless: the firmware
-# menu and cdboot both discard input outside their own prompt windows.
+# Only the FIRST prompt can be satisfied. The Windows boot application arms the
+# LAPIC timer on its own vector for its countdown and does not restore the
+# firmware's, so after the first attempt the firmware has no tick, its keyboard
+# polling stops, and no later prompt can read a key however many are queued.
 #
-# 62 directives, against a parser limit of 64 (HYPE_INPUT_SCRIPT_MAX_DIRECTIVES).
+# Hence: start immediately, and keep the cadence tighter than the window is
+# wide. The 8042 output buffer holds only 8 bytes, so keys that arrive with
+# nothing draining them are dropped rather than banked -- density inside the
+# window matters, total count does not.
 timeout 300000
 
-# Nothing reads a key before the firmware has initialised its console.
-delay 5000
-
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250
 sendkey \n
-delay 2000
+delay 250

@@ -7,6 +7,7 @@
 
 static void chip_reset(hype_pic_emu_chip_t *chip) {
     chip->imr = 0xFFu; /* fully masked at power-on, matching real hardware */
+    chip->imr_write_count = 0;
     chip->irq_offset = 0;
     chip->init_state = 0;
     chip->expect_icw4 = 0;
@@ -74,6 +75,10 @@ static void chip_write_data(hype_pic_emu_chip_t *chip, uint8_t value) {
             return;
         default: /* OCW1: mask register. */
             chip->imr = value;
+            if (chip->imr_write_count < 8u) {
+                chip->imr_writes[chip->imr_write_count] = value;
+            }
+            chip->imr_write_count++; /* counts past the kept window on purpose */
             return;
     }
 }

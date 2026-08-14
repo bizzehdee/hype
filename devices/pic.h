@@ -25,6 +25,15 @@
 
 typedef struct {
     uint8_t imr;             /* Interrupt Mask Register (OCW1) */
+    /*
+     * #436: every IMR value this chip has ever been given, newest last, so an
+     * unmask that never arrives is distinguishable from one hype failed to
+     * record. The KVM reference run shows the same firmware ending up with
+     * IRQ1 unmasked and delivered 16 times; on hype the mask reads 0xff for
+     * the whole run and the request sits latched in the IRR forever.
+     */
+    uint8_t imr_writes[8];
+    unsigned int imr_write_count;
     uint8_t irq_offset;      /* vector base programmed via ICW2 */
     uint8_t init_state;      /* 0 = normal operation; 1/2/3 = expecting ICW2/ICW3/ICW4 next */
     uint8_t expect_icw4;     /* ICW1 bit 0 (IC4) */

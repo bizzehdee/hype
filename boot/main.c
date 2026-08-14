@@ -19634,6 +19634,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     __atomic_load_n(&g_vms[vi].host_ps2_irqs,
                                                     __ATOMIC_RELAXED));
                                 {
+                                    const hype_pic_emu_t *pc = &g_vms[vi].pic;
+                                    unsigned mi;
+                                    hype_debug_print("fw-1 PICMASK vm%u: master imr=0x%02x after %u "
+                                                     "write(s):", vi, (unsigned)pc->master.imr,
+                                                     pc->master.imr_write_count);
+                                    for (mi = 0; mi < pc->master.imr_write_count && mi < 8u; mi++) {
+                                        hype_debug_print(" %02x", (unsigned)pc->master.imr_writes[mi]);
+                                    }
+                                    hype_debug_print(" [#436]\n");
+                                }
+                                {
                                     unsigned n = hype_ps2_kbd_trace_count(&g_vms[vi].ps2);
                                     unsigned ei;
                                     hype_debug_print("fw-1 KBDTRACE vm%u: last %u of %llu:", vi, n,
