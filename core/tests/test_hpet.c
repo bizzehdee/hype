@@ -154,6 +154,26 @@ static void test_capability_bits_survive_a_guest_write(void) {
     assert((conf & HYPE_HPET_TIMER_INT_ENABLE) != 0);
 }
 
+static void test_route_capability_is_reported_and_read_only(void) {
+    /* #436: a comparator that advertises no routable interrupt line is a timer
+     * software cannot use -- Windows' HAL skips registering the whole block,
+     * then bugchecks when it later needs a timer. The capability must be
+     * present and must survive a guest write to the same register. */
+    hype_hpet_t h;
+    uint64_t conf;
+    hype_hpet_reset(&h);
+    conf = hype_hpet_read(&h, HYPE_HPET_REG_TIMER_BASE, 8);
+    assert((conf >> HYPE_HPET_TIMER_ROUTE_CAP_SHIFT) == HYPE_HPET_TIMER_ROUTE_CAP_MASK);
+
+    hype_hpet_write(&h, HYPE_HPET_REG_TIMER_BASE, 8, HYPE_HPET_TIMER_INT_ENABLE);
+    conf = hype_hpet_read(&h, HYPE_HPET_REG_TIMER_BASE, 8);
+    assert((conf >> HYPE_HPET_TIMER_ROUTE_CAP_SHIFT) == HYPE_HPET_TIMER_ROUTE_CAP_MASK);
+
+    /* Every GSI the capability advertises must be one hype can actually raise:
+     * the routing field is 5 bits, so the mask may not name a line above 31. */
+    assert((HYPE_HPET_TIMER_ROUTE_CAP_MASK >> 32) == 0);
+}
+
 static void test_unimplemented_offsets_read_zero(void) {
     hype_hpet_t h;
     hype_hpet_reset(&h);
@@ -174,6 +194,7 @@ int main(void) {
     test_disabled_timer_does_not_interrupt();
     test_32bit_halves_address_the_right_word();
     test_capability_bits_survive_a_guest_write();
+    test_route_capability_is_reported_and_read_only();
     test_unimplemented_offsets_read_zero();
     printf("test_hpet: all tests passed\n");
     return 0;

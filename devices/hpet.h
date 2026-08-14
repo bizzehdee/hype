@@ -51,6 +51,22 @@
 #define HYPE_HPET_TIMER_VAL_SET (1ull << 6)
 #define HYPE_HPET_TIMER_32BIT_MODE (1ull << 8)
 
+/*
+ * #436: Tn_INT_ROUTE_CAP, bits 63:32 of each comparator's configuration -- the
+ * bitmap of I/O APIC inputs that comparator can be wired to. Left at zero it
+ * says "this timer can be routed nowhere", so software that needs an
+ * interrupting timer concludes the block is useless and does not register it
+ * at all. Windows' HAL does exactly that, and then finds no timer to use.
+ *
+ * hype delivers a comparator's interrupt by raising whatever GSI the timer's
+ * routing field names, so the honest capability is the set of I/O APIC inputs
+ * hype will really drive. GSIs 20-23 are the range real HPETs commonly offer
+ * and the range hype's I/O APIC has free -- 0-15 are the legacy ISA lines and
+ * 16-19 carry this platform's PCI interrupts.
+ */
+#define HYPE_HPET_TIMER_ROUTE_CAP_SHIFT 32
+#define HYPE_HPET_TIMER_ROUTE_CAP_MASK 0x00F00000ull /* GSIs 20-23 */
+
 typedef struct {
     uint64_t config;     /* per-timer Tn_CONF */
     uint64_t comparator; /* per-timer Tn_CMP */

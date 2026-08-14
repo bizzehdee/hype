@@ -29,7 +29,9 @@ void hype_hpet_reset(hype_hpet_t *hpet) {
     for (i = 0; i < HYPE_HPET_NUM_TIMERS; i++) {
         /* Each comparator reports what it can do even before a guest writes
          * it: periodic capable, 64-bit wide. Nothing is enabled at reset. */
-        hpet->timers[i].config = HYPE_HPET_TIMER_PERIODIC_CAP | HYPE_HPET_TIMER_SIZE_CAP;
+        hpet->timers[i].config = HYPE_HPET_TIMER_PERIODIC_CAP | HYPE_HPET_TIMER_SIZE_CAP |
+                                 (HYPE_HPET_TIMER_ROUTE_CAP_MASK
+                                  << HYPE_HPET_TIMER_ROUTE_CAP_SHIFT);
         hpet->timers[i].comparator = 0xFFFFFFFFFFFFFFFFull;
         hpet->timers[i].period = 0;
     }
@@ -179,8 +181,11 @@ void hype_hpet_write(hype_hpet_t *hpet, uint32_t offset, unsigned size, uint64_t
             /* The capability bits are read-only; everything a guest may set is
              * kept. VAL_SET is a one-shot request, not stored state. */
             t->config = (w & ~(HYPE_HPET_TIMER_PERIODIC_CAP | HYPE_HPET_TIMER_SIZE_CAP |
-                               HYPE_HPET_TIMER_VAL_SET)) |
-                        HYPE_HPET_TIMER_PERIODIC_CAP | HYPE_HPET_TIMER_SIZE_CAP;
+                               HYPE_HPET_TIMER_VAL_SET |
+                               (HYPE_HPET_TIMER_ROUTE_CAP_MASK
+                                << HYPE_HPET_TIMER_ROUTE_CAP_SHIFT))) |
+                        HYPE_HPET_TIMER_PERIODIC_CAP | HYPE_HPET_TIMER_SIZE_CAP |
+                        (HYPE_HPET_TIMER_ROUTE_CAP_MASK << HYPE_HPET_TIMER_ROUTE_CAP_SHIFT);
             if ((w & HYPE_HPET_TIMER_VAL_SET) != 0u) {
                 t->period = 0; /* the next comparator write supplies the period */
                 t->config |= HYPE_HPET_TIMER_VAL_SET;
