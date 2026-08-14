@@ -120,6 +120,9 @@ typedef struct {
      */
     uint16_t trace[HYPE_PS2_KBD_TRACE_MAX];
     unsigned int trace_count;
+    unsigned int trace_head;
+    unsigned long long trace_total; /* events ever recorded, so a quiet ring is
+                                     * distinguishable from a stalled guest */
 } hype_ps2_kbd_t;
 
 /* Resets to power-on state: no pending byte, keyboard port enabled,
@@ -203,7 +206,9 @@ void hype_ps2_kbd_scancode_stats(const hype_ps2_kbd_t *kbd,
  */
 int hype_ps2_kbd_take_irq(hype_ps2_kbd_t *kbd);
 
-/* #436: read back the bounded port-event trace. Returns the number of events. */
-unsigned hype_ps2_kbd_trace(const hype_ps2_kbd_t *kbd, const uint16_t **out_events);
+/* #436: read back the port-event ring, oldest first. */
+unsigned hype_ps2_kbd_trace_event(const hype_ps2_kbd_t *kbd, unsigned i, uint16_t *out);
+unsigned hype_ps2_kbd_trace_count(const hype_ps2_kbd_t *kbd);
+unsigned long long hype_ps2_kbd_trace_total(const hype_ps2_kbd_t *kbd);
 
 #endif /* HYPE_DEVICES_PS2_KEYBOARD_H */

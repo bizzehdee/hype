@@ -5,6 +5,8 @@ void hype_ps2_kbd_reset(hype_ps2_kbd_t *kbd) {
     kbd->out_head = 0;
     kbd->out_count = 0;
     kbd->trace_count = 0;
+    kbd->trace_head = 0;
+    kbd->trace_total = 0;
     kbd->config_byte = 0;
     kbd->awaiting_config_byte_write = 0;
     kbd->keyboard_port_enabled = 1;
@@ -70,11 +72,23 @@ int hype_ps2_kbd_try_enqueue_scancode(hype_ps2_kbd_t *kbd, uint8_t scancode) {
     return 1;
 }
 
+/*
+ * #436: a RING, not a bounded prefix. The first version stopped recording once
+ * it was full, which filled during keyboard initialisation and so could never
+ * show what the guest does later -- exactly the window that matters, since the
+ * question is whether it keeps polling while a prompt is waiting for a key.
+ * Keeping the most recent events answers that; the initialisation sequence is
+ * already understood.
+ */
 static void trace_event(hype_ps2_kbd_t *kbd, unsigned kind, uint8_t value) {
+    unsigned slot = (kbd->trace_head + kbd->trace_count) % HYPE_PS2_KBD_TRACE_MAX;
+    kbd->trace[slot] = (uint16_t)((kind << 12) | value);
     if (kbd->trace_count < HYPE_PS2_KBD_TRACE_MAX) {
-        kbd->trace[kbd->trace_count] = (uint16_t)((kind << 12) | value);
         kbd->trace_count++;
+    } else {
+        kbd->trace_head = (kbd->trace_head + 1u) % HYPE_PS2_KBD_TRACE_MAX;
     }
+    kbd->trace_total++;
 }
 
 static void stage_response(hype_ps2_kbd_t *kbd, uint8_t value) {
@@ -247,9 +261,16 @@ int hype_ps2_kbd_take_irq(hype_ps2_kbd_t *kbd) {
     return 1;
 }
 
-unsigned hype_ps2_kbd_trace(const hype_ps2_kbd_t *kbd, const uint16_t **out_events) {
-    if (out_events != 0) {
-        *out_events = kbd->trace;
+unsigned hype_ps2_kbd_trace_event(const hype_ps2_kbd_t *kbd, unsigned i, uint16_t *out) {
+    if (i >= kbd->trace_count || out == 0) {
+        return 0;
     }
-    return kbd->trace_count;
+    *out = kbd->trace[(kbd->trace_head + i) % HYPE_PS2_KBD_TRACE_MAX];
+    return 1;
+}
+
+unsigned hype_ps2_kbd_trace_count(const hype_ps2_kbd_t *kbd) { return kbd->trace_count; }
+
+unsigned long long hype_ps2_kbd_trace_total(const hype_ps2_kbd_t *kbd) {
+    return kbd->trace_total;
 }

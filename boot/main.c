@@ -19634,14 +19634,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     __atomic_load_n(&g_vms[vi].host_ps2_irqs,
                                                     __ATOMIC_RELAXED));
                                 {
-                                    const uint16_t *ev = 0;
-                                    unsigned n = hype_ps2_kbd_trace(&g_vms[vi].ps2, &ev);
+                                    unsigned n = hype_ps2_kbd_trace_count(&g_vms[vi].ps2);
                                     unsigned ei;
-                                    hype_debug_print("fw-1 KBDTRACE vm%u: %u event(s):", vi, n);
+                                    hype_debug_print("fw-1 KBDTRACE vm%u: last %u of %llu:", vi, n,
+                                                     hype_ps2_kbd_trace_total(&g_vms[vi].ps2));
                                     for (ei = 0; ei < n; ei++) {
                                         static const char *k[4] = {"?", "cmd", "wr", "rd"};
-                                        hype_debug_print(" %s%02x", k[(ev[ei] >> 12) & 3u],
-                                                         (unsigned)(ev[ei] & 0xFFu));
+                                        uint16_t e = 0;
+                                        if (hype_ps2_kbd_trace_event(&g_vms[vi].ps2, ei, &e)) {
+                                            hype_debug_print(" %s%02x", k[(e >> 12) & 3u],
+                                                             (unsigned)(e & 0xFFu));
+                                        }
                                     }
                                     hype_debug_print(" [#436]\n");
                                 }
