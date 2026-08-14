@@ -89,6 +89,7 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #include "../devices/pflash.h"
 #include "../devices/acpi.h"
 #include "../devices/acpi_loader.h"
+#include "../devices/smbios.h"
 #include "../devices/fw_cfg.h"
 #include "../devices/ahci.h"
 #include "../devices/atapi.h"
@@ -10014,6 +10015,32 @@ static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
                              (const uint8_t *)g_fw_1_loader_script,
                              loader_entries * (uint32_t)sizeof(hype_acpi_loader_entry_t)) < 0) {
         hype_fatal("fw-1: fw_cfg registry full while registering ACPI");
+    }
+
+    /*
+     * #436: SMBIOS. hype published none at all -- the UEFI shell's smbiosview
+     * answered "Cannot get SMBIOS Table" under hype while reporting a full set
+     * under QEMU. Firmware installs these as a UEFI configuration table and an
+     * OS reads them during early initialisation, so a machine without them is
+     * describing itself as something no physical system is. The structures
+     * report exactly what this guest was given: its vCPU count and its RAM.
+     */
+    {
+        static uint8_t smbios_anchor[64];
+        static uint8_t smbios_tables[1024];
+        hype_smbios_config_t sm_cfg;
+        hype_smbios_layout_t sm_lay;
+
+        sm_cfg.cpu_count = 1u;
+        sm_cfg.ram_bytes = vm->ram_bytes;
+        if (hype_smbios_build(&sm_cfg, smbios_anchor, (uint32_t)sizeof(smbios_anchor),
+                              smbios_tables, (uint32_t)sizeof(smbios_tables), &sm_lay) != 0 ||
+            hype_fw_cfg_add_file(&g_fw_1_fw_cfg, "etc/smbios/smbios-anchor", smbios_anchor,
+                                 sm_lay.anchor_length) < 0 ||
+            hype_fw_cfg_add_file(&g_fw_1_fw_cfg, "etc/smbios/smbios-tables", smbios_tables,
+                                 sm_lay.tables_length) < 0) {
+            hype_fatal("fw-1: failed to register SMBIOS");
+        }
     }
 
     ram_region.base = 0;
