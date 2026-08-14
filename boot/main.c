@@ -12980,26 +12980,32 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * keyboard driver correctly remains behind AUX_DATA forever. */
             static uint64_t mouse_rte12_last;
             static int mouse_rte12_seen;
-            int mouse_route_just_unmasked = mouse_rte12_seen &&
-                (mouse_rte12_last & HYPE_IOAPIC_RTE_MASK) != 0 &&
-                (g_fw_1_ioapic.rte[12] & HYPE_IOAPIC_RTE_MASK) == 0;
+            static int mouse_obf_irq_delivered;
+            int mouse_route_changed = mouse_rte12_seen &&
+                mouse_rte12_last != g_fw_1_ioapic.rte[12];
             uint8_t miov;
 
+            if (mouse_route_changed || !hype_ps2_mouse_has_pending_byte(&g_fw_1_mouse)) {
+                mouse_obf_irq_delivered = 0;
+            }
             mouse_rte12_last = g_fw_1_ioapic.rte[12];
             mouse_rte12_seen = 1;
-            if (hype_ps2_mouse_has_pending_irq(&g_fw_1_mouse)) {
+            if (hype_ps2_mouse_has_pending_irq(&g_fw_1_mouse) ||
+                (!mouse_obf_irq_delivered && hype_ps2_mouse_has_pending_byte(&g_fw_1_mouse))) {
                 if (hype_ioapic_raise(&g_fw_1_ioapic, 12u, &miov)) {
-                    (void)hype_ps2_mouse_take_irq(&g_fw_1_mouse);
+                    if (hype_ps2_mouse_has_pending_irq(&g_fw_1_mouse)) {
+                        (void)hype_ps2_mouse_take_irq(&g_fw_1_mouse);
+                    }
+                    mouse_obf_irq_delivered = 1;
                     vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, miov);
                 } else if ((g_fw_1_pic.master.imr & (uint8_t)(1u << 2)) == 0 &&
                            (g_fw_1_pic.slave.imr & (uint8_t)(1u << 4)) == 0) {
-                    (void)hype_ps2_mouse_take_irq(&g_fw_1_mouse);
+                    if (hype_ps2_mouse_has_pending_irq(&g_fw_1_mouse)) {
+                        (void)hype_ps2_mouse_take_irq(&g_fw_1_mouse);
+                    }
+                    mouse_obf_irq_delivered = 1;
                     hype_pic_emu_raise_global_irq(&g_fw_1_pic, 12u);
                 }
-            } else if (mouse_route_just_unmasked &&
-                       hype_ps2_mouse_has_pending_byte(&g_fw_1_mouse) &&
-                       hype_ioapic_raise(&g_fw_1_ioapic, 12u, &miov)) {
-                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, miov);
             }
         }
 
