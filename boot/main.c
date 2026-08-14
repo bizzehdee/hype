@@ -10846,6 +10846,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     sctx.ctx = ctx;
                     g_436_kmod_base = hype_pe_find_image_base(fw_1_pe_read, &sctx, info.guest_rip);
                     if (g_436_kmod_base != 0 && kind == HYPE_VMM_KIND_SVM) {
+#ifdef HYPE_ENABLE_436_DIAGNOSTICS
                         /* #436: break on KeBugCheckEx so the bugcheck reports itself --
                          * caller, parameters and register state, measured rather than
                          * matched by parameter shape (which has been wrong every time). */
@@ -10856,6 +10857,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         hype_svm_vcpu_arm_exec_breakpoint(ctx, g_436_kmod_base + 0x25d50bull);
                         hype_debug_print("fw-1 #436 BP armed on the probe @0x%llx\n",
                                          (unsigned long long)(g_436_kmod_base + 0x25d50bull));
+#endif
                     }
                 }
                 if (g_436_kmod_base != 0 && g_fw_1_host_tsc_hz != 0 &&

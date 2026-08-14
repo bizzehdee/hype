@@ -163,9 +163,12 @@ void hype_cmos_set_extended_memory_above_16mb(hype_cmos_t *cmos, uint16_t size_6
  * NMI-disable, is masked off -- not modeled). Pure struct mutation. */
 void hype_cmos_index_write(hype_cmos_t *cmos, uint8_t value);
 
-/* Port 0x71 read: the currently-selected register's byte. Pure struct
- * read. */
-uint8_t hype_cmos_data_read(const hype_cmos_t *cmos);
+/*
+ * Port 0x71 read: returns the currently-selected register's byte. Reading
+ * status register C acknowledges its latched interrupt flags, as an MC146818
+ * does, so this accessor may update the register file.
+ */
+uint8_t hype_cmos_data_read(hype_cmos_t *cmos);
 
 /*
  * Port 0x71 write: stores into the currently-selected register, EXCEPT for the read-only

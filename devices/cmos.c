@@ -119,8 +119,16 @@ void hype_cmos_index_write(hype_cmos_t *cmos, uint8_t value) {
     cmos->index = value & (uint8_t)HYPE_CMOS_INDEX_MASK;
 }
 
-uint8_t hype_cmos_data_read(const hype_cmos_t *cmos) {
-    return cmos->registers[cmos->index];
+uint8_t hype_cmos_data_read(hype_cmos_t *cmos) {
+    uint8_t value = cmos->registers[cmos->index];
+
+    /* Register C is an acknowledge-on-read interrupt-status latch. Leaving
+     * its flags set makes a guest that polls for the acknowledge condition
+     * spin forever and prevents the next periodic IRQ from being raised. */
+    if (cmos->index == HYPE_CMOS_REG_STATUS_C) {
+        cmos->registers[cmos->index] = 0;
+    }
+    return value;
 }
 
 void hype_cmos_data_write(hype_cmos_t *cmos, uint8_t value) {

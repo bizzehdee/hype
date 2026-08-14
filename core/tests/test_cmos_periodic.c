@@ -45,11 +45,11 @@ static void test_flag_is_a_level_cleared_by_reading_register_c(void) {
     v = hype_cmos_data_read(&c);
     assert((v & HYPE_CMOS_STATUS_C_PF) != 0);
     assert((v & HYPE_CMOS_STATUS_C_IRQF) != 0);
+    assert(c.registers[HYPE_CMOS_REG_STATUS_C] == 0);
 
-    /* While the flag is still asserted, more time must not re-assert it: the
-     * guest has not acknowledged yet, and a second raise would be a spurious
-     * interrupt. */
-    assert(hype_cmos_advance(&c, 1000000ull) == 0);
+    /* The read acknowledged the level, so a later elapsed period may assert a
+     * fresh IRQ. */
+    assert(hype_cmos_advance(&c, 1000000ull) == 1);
 }
 
 static void test_disabling_the_rate_stops_the_clock_cleanly(void) {
