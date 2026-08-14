@@ -225,19 +225,31 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
         fadt->x_pm1a_event_block.space_id = 1;
         fadt->x_pm1a_event_block.bit_width = (uint8_t)(HYPE_ACPI_PM1A_EVT_LENGTH * 8u);
         fadt->x_pm1a_event_block.bit_offset = 0;
-        fadt->x_pm1a_event_block.access_width = 0;
+        /*
+         * #436: the access size these registers are actually read and written
+         * in. It is NOT decoration: an OS derives its access width from this
+         * field alone once the FADT revision is 5 or newer, because from that
+         * revision the extended description supersedes the legacy fields
+         * entirely. Left at 0 ("undefined") a consumer must assume byte
+         * access, and one that requires at least word access to a 16-bit
+         * register rejects the description outright -- measured as Windows'
+         * bugcheck 0x5C with minkernel\hals\lib\acpi\pmregs.c line 194.
+         * The PM1a event block is a pair of 16-bit registers (status then
+         * enable), so word access (3 == dword is wrong here, 2 == word).
+         */
+        fadt->x_pm1a_event_block.access_width = 2; /* word */
         fadt->x_pm1a_event_block.address = HYPE_ACPI_PM1A_EVT_PORT;
 
         fadt->x_pm1a_control_block.space_id = 1;
         fadt->x_pm1a_control_block.bit_width = (uint8_t)(HYPE_ACPI_PM1A_CNT_LENGTH * 8u);
         fadt->x_pm1a_control_block.bit_offset = 0;
-        fadt->x_pm1a_control_block.access_width = 0;
+        fadt->x_pm1a_control_block.access_width = 2; /* word: a 16-bit register */
         fadt->x_pm1a_control_block.address = HYPE_ACPI_PM1A_CNT_PORT;
 
         fadt->x_pm_timer_block.space_id = 1;
         fadt->x_pm_timer_block.bit_width = (uint8_t)(HYPE_ACPI_PM_TMR_LENGTH * 8u);
         fadt->x_pm_timer_block.bit_offset = 0;
-        fadt->x_pm_timer_block.access_width = 0;
+        fadt->x_pm_timer_block.access_width = 3; /* dword: the timer is 32-bit */
         fadt->x_pm_timer_block.address = HYPE_ACPI_PM_TMR_PORT;
         /* Dsdt/X_Dsdt: pre-filled with DSDT's offset *within this same
          * blob* (both point at "etc/acpi/tables", the same src_file the

@@ -276,6 +276,13 @@ static void test_build_tables_blob_layout(void) {
               fadt->x_pm_timer_block.address);
     CHECK_HEX("x_pm_tmr width in bits", HYPE_ACPI_PM_TMR_LENGTH * 8u,
               fadt->x_pm_timer_block.bit_width);
+    /* #436: the access size is load-bearing from FADT revision 5 on -- an OS
+     * takes it from here alone, and 0 ("undefined") means byte access, which
+     * is too narrow for these registers and gets the whole description
+     * rejected. Word for the 16-bit PM1a blocks, dword for the 32-bit timer. */
+    CHECK_HEX("x_pm1a_evt access width is word", 2, fadt->x_pm1a_event_block.access_width);
+    CHECK_HEX("x_pm1a_cnt access width is word", 2, fadt->x_pm1a_control_block.access_width);
+    CHECK_HEX("x_pm_tmr access width is dword", 3, fadt->x_pm_timer_block.access_width);
     /* IAPC_BOOT_ARCH must name the legacy hardware hype models (8042, PIC,
      * PIT, RTC, UARTs) rather than leaving a guest to assume none exists. */
     CHECK_HEX("fadt declares the 8042", 1,
