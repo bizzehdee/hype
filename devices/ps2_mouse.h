@@ -46,6 +46,10 @@ typedef struct {
     uint8_t queue[HYPE_PS2_MOUSE_QUEUE_SIZE];
     unsigned int head;
     unsigned int count;
+    /* One IRQ12 edge per byte made visible at the shared controller output.
+     * The controller starts an edge when an empty output buffer receives a
+     * byte, and another when a guest read exposes the next queued byte. */
+    unsigned int irq_edges;
     int reporting_enabled;
 } hype_ps2_mouse_t;
 
@@ -62,6 +66,14 @@ int hype_ps2_mouse_has_pending_byte(const hype_ps2_mouse_t *mouse);
  * as every other "don't call me with nothing ready" convention this
  * project already follows elsewhere). */
 uint8_t hype_ps2_mouse_read_byte(hype_ps2_mouse_t *mouse);
+
+/* Returns and consumes one pending IRQ12 edge. The VMM-facing glue owns the
+ * actual interrupt injection because this pure device model has no vCPU. */
+int hype_ps2_mouse_take_irq(hype_ps2_mouse_t *mouse);
+
+/* Non-consuming query for VMM glue: a masked interrupt controller must not
+ * make an unread auxiliary output byte disappear. */
+int hype_ps2_mouse_has_pending_irq(const hype_ps2_mouse_t *mouse);
 
 /*
  * A command byte routed here by the controller (the 0x60 write that

@@ -8,6 +8,7 @@ void hype_ps2_mouse_reset(hype_ps2_mouse_t *mouse) {
     }
     mouse->head = 0;
     mouse->count = 0;
+    mouse->irq_edges = 0;
     mouse->reporting_enabled = 0;
 }
 
@@ -20,6 +21,9 @@ static void enqueue_byte(hype_ps2_mouse_t *mouse, uint8_t value) {
     tail = (mouse->head + mouse->count) % HYPE_PS2_MOUSE_QUEUE_SIZE;
     mouse->queue[tail] = value;
     mouse->count++;
+    if (mouse->count == 1u && mouse->irq_edges < HYPE_PS2_MOUSE_QUEUE_SIZE) {
+        mouse->irq_edges++;
+    }
 }
 
 int hype_ps2_mouse_has_pending_byte(const hype_ps2_mouse_t *mouse) {
@@ -35,7 +39,22 @@ uint8_t hype_ps2_mouse_read_byte(hype_ps2_mouse_t *mouse) {
     value = mouse->queue[mouse->head];
     mouse->head = (mouse->head + 1) % HYPE_PS2_MOUSE_QUEUE_SIZE;
     mouse->count--;
+    if (mouse->count > 0 && mouse->irq_edges < HYPE_PS2_MOUSE_QUEUE_SIZE) {
+        mouse->irq_edges++;
+    }
     return value;
+}
+
+int hype_ps2_mouse_take_irq(hype_ps2_mouse_t *mouse) {
+    if (mouse->irq_edges == 0u) {
+        return 0;
+    }
+    mouse->irq_edges--;
+    return 1;
+}
+
+int hype_ps2_mouse_has_pending_irq(const hype_ps2_mouse_t *mouse) {
+    return mouse->irq_edges != 0u;
 }
 
 void hype_ps2_mouse_write_command(hype_ps2_mouse_t *mouse, uint8_t command) {

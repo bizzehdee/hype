@@ -16,7 +16,29 @@ static void test_reset_state(void) {
     hype_ps2_mouse_t mouse;
     hype_ps2_mouse_reset(&mouse);
     CHECK_HEX("no pending byte after reset", 0, hype_ps2_mouse_has_pending_byte(&mouse));
+    CHECK_HEX("no IRQ12 edge after reset", 0, hype_ps2_mouse_take_irq(&mouse));
     CHECK_HEX("reporting disabled after reset", 0, mouse.reporting_enabled);
+}
+
+static void test_each_visible_mouse_byte_raises_irq12(void) {
+    hype_ps2_mouse_t mouse;
+    hype_ps2_mouse_reset(&mouse);
+
+    /* RESET replies with three bytes. The first one makes OBF visible, and
+     * each guest read exposes the next byte and raises its own IRQ12 edge. */
+    hype_ps2_mouse_write_command(&mouse, HYPE_PS2_MOUSE_CMD_RESET);
+    CHECK_HEX("pending IRQ12 after first reset reply", 1, hype_ps2_mouse_has_pending_irq(&mouse));
+    CHECK_HEX("IRQ12 for first reset reply", 1, hype_ps2_mouse_take_irq(&mouse));
+    CHECK_HEX("only one edge before a read", 0, hype_ps2_mouse_take_irq(&mouse));
+    CHECK_HEX("first reset reply", HYPE_PS2_MOUSE_ACK, hype_ps2_mouse_read_byte(&mouse));
+    CHECK_HEX("IRQ12 for second reset reply", 1, hype_ps2_mouse_take_irq(&mouse));
+    CHECK_HEX("second reset reply", HYPE_PS2_MOUSE_SELF_TEST_PASSED,
+              hype_ps2_mouse_read_byte(&mouse));
+    CHECK_HEX("IRQ12 for third reset reply", 1, hype_ps2_mouse_take_irq(&mouse));
+    CHECK_HEX("third reset reply", HYPE_PS2_MOUSE_DEVICE_ID_STANDARD,
+              hype_ps2_mouse_read_byte(&mouse));
+    CHECK_HEX("no stale IRQ12 after draining", 0, hype_ps2_mouse_take_irq(&mouse));
+    CHECK_HEX("no pending IRQ12 after draining", 0, hype_ps2_mouse_has_pending_irq(&mouse));
 }
 
 static void test_reset_command_queues_ack_selftest_and_id(void) {
@@ -162,6 +184,7 @@ static void test_queue_fifo_ordering_across_multiple_commands(void) {
 int main(void) {
     test_reset_state();
     test_reset_command_queues_ack_selftest_and_id();
+    test_each_visible_mouse_byte_raises_irq12();
     test_reset_command_disables_reporting();
     test_enable_reporting();
     test_disable_reporting();

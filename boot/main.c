@@ -10731,14 +10731,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * the host-input layer. The IO-APIC path first with a PIC fallback, the same
              * shape every other guest IRQ here uses.
              */
-            if (usb_mouse_drain(&g_fw_1_mouse)) {
-                uint8_t miov;
-                if (hype_ioapic_raise(&g_fw_1_ioapic, 12u, &miov)) {
-                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, miov);
-                } else {
-                    hype_pic_emu_raise_global_irq(&g_fw_1_pic, 12u);
-                }
-            }
+            (void)usb_mouse_drain(&g_fw_1_mouse);
             /* #363: host input is polled by the BSP now -- see fw_1_host_input_poll().
              * It used to run here, on the guest's core, so a wedged guest took the keyboard
              * with it and terminal switching stopped working. */
@@ -12974,6 +12967,39 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, kiov);
             } else {
                 hype_pic_emu_raise_global_irq(&g_fw_1_pic, 1u);
+            }
+        }
+        /* PS/2 auxiliary output uses IRQ12, including mouse-command replies.
+         * Without this, a reply can leave AUX_DATA set forever: Windows then
+         * correctly refuses to read it as a keyboard byte, which gates every
+         * later keyboard scancode behind the shared 8042 output buffer. */
+        {
+            /* An i8042 keeps OBF asserted when a device reply predates a
+             * masked IO-APIC route. Reassert that existing AUX byte once when
+             * the guest enables GSI12; otherwise the old edge is lost and the
+             * keyboard driver correctly remains behind AUX_DATA forever. */
+            static uint64_t mouse_rte12_last;
+            static int mouse_rte12_seen;
+            int mouse_route_just_unmasked = mouse_rte12_seen &&
+                (mouse_rte12_last & HYPE_IOAPIC_RTE_MASK) != 0 &&
+                (g_fw_1_ioapic.rte[12] & HYPE_IOAPIC_RTE_MASK) == 0;
+            uint8_t miov;
+
+            mouse_rte12_last = g_fw_1_ioapic.rte[12];
+            mouse_rte12_seen = 1;
+            if (hype_ps2_mouse_has_pending_irq(&g_fw_1_mouse)) {
+                if (hype_ioapic_raise(&g_fw_1_ioapic, 12u, &miov)) {
+                    (void)hype_ps2_mouse_take_irq(&g_fw_1_mouse);
+                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, miov);
+                } else if ((g_fw_1_pic.master.imr & (uint8_t)(1u << 2)) == 0 &&
+                           (g_fw_1_pic.slave.imr & (uint8_t)(1u << 4)) == 0) {
+                    (void)hype_ps2_mouse_take_irq(&g_fw_1_mouse);
+                    hype_pic_emu_raise_global_irq(&g_fw_1_pic, 12u);
+                }
+            } else if (mouse_route_just_unmasked &&
+                       hype_ps2_mouse_has_pending_byte(&g_fw_1_mouse) &&
+                       hype_ioapic_raise(&g_fw_1_ioapic, 12u, &miov)) {
+                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, miov);
             }
         }
 
@@ -16074,13 +16100,14 @@ static int fw_1_script_drain_send(hype_fw_vm_t *vm, unsigned vm_index, hype_gues
             }
             if (now_ms - vm->in_send_stall_since_ms >= (uint64_t)HYPE_SCRIPT_SEND_STALL_MS) {
                 hype_debug_print("fw-1 SCRIPT vm%u: guest never drained its input -- %u of %u "
-                                 "byte(s) of this %s undelivered; abandoning it rather than "
+                                 "byte(s) of this %s undelivered; failing the script rather than "
                                  "sending a truncated command [#301]\n",
                                  vm_index, (unsigned)(vm->in_send_len - vm->in_send_pos),
                                  (unsigned)vm->in_send_len,
                                  vm->in_send_is_key ? "sendkey" : "send");
                 vm->in_send_pos = vm->in_send_len; /* give up on the remainder */
                 vm->in_send_stall_since_ms = 0;
+                hype_input_runner_transport_stalled(&vm->in_runner);
                 return 1;
             }
             return 0;

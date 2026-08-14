@@ -42,7 +42,8 @@ typedef enum {
     HYPE_INPUT_REASON_FAIL_DIRECTIVE,  /* `fail <label>` reached */
     HYPE_INPUT_REASON_EXPECT_TIMEOUT,  /* an `expect` was not seen in time */
     HYPE_INPUT_REASON_FAIL_IF_MATCHED, /* an armed `fail-if` pattern appeared */
-    HYPE_INPUT_REASON_RAN_OFF_END      /* script ended without pass/fail */
+    HYPE_INPUT_REASON_RAN_OFF_END,     /* script ended without pass/fail */
+    HYPE_INPUT_REASON_TRANSPORT_STALL  /* the requested input could not reach the guest */
 } hype_input_reason_t;
 
 typedef struct {
@@ -117,6 +118,11 @@ void hype_input_runner_feed(hype_input_runner_t *r, uint8_t byte);
  * time on the wire cannot be broken by a screen scan landing in the middle of it.
  */
 void hype_input_runner_scan(hype_input_runner_t *r, const uint8_t *text, uint32_t len);
+
+/* The caller could not deliver a previously-issued send/sendkey directive.
+ * This is terminal: continuing to a later `pass` would turn lost input into a
+ * false validation success. */
+void hype_input_runner_transport_stalled(hype_input_runner_t *r);
 
 /*
  * Decide what to do at `now_ms`. Returns the action and fills *out.

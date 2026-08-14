@@ -171,6 +171,15 @@ void hype_input_runner_scan(hype_input_runner_t *r, const uint8_t *text, uint32_
     r->win_len = saved_len;
 }
 
+void hype_input_runner_transport_stalled(hype_input_runner_t *r) {
+    static const uint8_t detail[] = "guest input was not drained";
+    if (r == 0 || r->done) {
+        return;
+    }
+    finish(r, HYPE_INPUT_VERDICT_FAIL, HYPE_INPUT_REASON_TRANSPORT_STALL,
+           detail, (uint32_t)(sizeof(detail) - 1u), 0);
+}
+
 hype_input_action_kind_t hype_input_runner_poll(hype_input_runner_t *r, uint64_t now_ms,
                                                 hype_input_action_t *out) {
     out->kind = HYPE_INPUT_ACTION_WAIT;
@@ -293,6 +302,7 @@ const char *hype_input_reason_str(hype_input_reason_t reason) {
         case HYPE_INPUT_REASON_EXPECT_TIMEOUT: return "expect timed out";
         case HYPE_INPUT_REASON_FAIL_IF_MATCHED: return "fail-if pattern appeared";
         case HYPE_INPUT_REASON_RAN_OFF_END: return "script ended without pass/fail";
+        case HYPE_INPUT_REASON_TRANSPORT_STALL: return "input transport stalled";
         default: return "unknown";
     }
 }

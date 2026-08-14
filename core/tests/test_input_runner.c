@@ -216,6 +216,22 @@ static void test_delay(void) {
               hype_input_runner_poll(&r, 2000, &a));
 }
 
+static void test_transport_stall_is_terminal_failure(void) {
+    hype_input_runner_t r;
+    hype_input_action_t a;
+
+    load("send hello\npass misleading-success\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    CHECK_INT("send is issued", HYPE_INPUT_ACTION_SEND, hype_input_runner_poll(&r, 0, &a));
+    hype_input_runner_transport_stalled(&r);
+    CHECK_INT("stalled transport finishes", HYPE_INPUT_ACTION_DONE,
+              hype_input_runner_poll(&r, 1, &a));
+    CHECK_INT("stalled transport fails", HYPE_INPUT_VERDICT_FAIL,
+              hype_input_runner_verdict(&r));
+    CHECK_INT("stall reason", HYPE_INPUT_REASON_TRANSPORT_STALL,
+              hype_input_runner_reason(&r));
+}
+
 static void test_send_delivered_once(void) {
     hype_input_runner_t r;
     hype_input_action_t a;
@@ -499,6 +515,7 @@ int main(void) {
     test_fail_if_during_unrelated_expect();
     test_fail_if_does_not_fire_on_absence();
     test_delay();
+    test_transport_stall_is_terminal_failure();
     test_send_delivered_once();
     test_ran_off_end_is_fail();
     test_empty_script_still_yields_a_verdict();
