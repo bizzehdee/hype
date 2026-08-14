@@ -737,6 +737,17 @@ void hype_svm_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip);
  * triple fault still returns to us as HYPE_SVM_EXITCODE_SHUTDOWN. */
 void hype_svm_vcpu_set_exception_intercepts(hype_vcpu_ctx_t *ctx, uint32_t mask);
 
+/*
+ * #436: arm DR0 as a 1-byte execution breakpoint at `gva` in the guest, or
+ * disarm it when `gva` is 0. hype owns the guest's debug registers through the
+ * VMCB, so this needs no cooperation from the guest -- which is the point: it
+ * observes code that never gets the chance to report on itself.
+ */
+void hype_svm_vcpu_arm_exec_breakpoint(hype_vcpu_ctx_t *ctx, uint64_t gva);
+
+/* #436: DR7-write exit (0x37) -- re-apply the breakpoint and step over. */
+int hype_svm_vcpu_handle_dr_write(hype_vcpu_ctx_t *ctx);
+
 /* Returns the AMD SVM "decode assists" guest instruction bytes captured
  * by hardware on the current NPF/#PF intercept (VMCB control area
  * 0xD0/0xD1), writing the fetched byte count to *out_num. When the count

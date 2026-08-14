@@ -1514,6 +1514,50 @@ void hype_svm_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip) {
     real->vmcb->save.rip = rip;
 }
 
+/*
+ * #436: re-apply the breakpoint after the guest writes DR7. A booting kernel
+ * initialises DR7 to the architectural 0x400 as a matter of course, which
+ * silently disables any breakpoint set behind its back -- measured: the
+ * breakpoint armed correctly and never fired. Intercepting the write lets the
+ * observation survive the guest's own initialisation. The guest's intended
+ * value is deliberately NOT honoured; this is a diagnostic path, and nothing in
+ * the boot being observed uses the debug registers for its own purposes.
+ */
+int hype_svm_vcpu_handle_dr_write(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+
+    if (real->vmcb->control.nrip == 0) {
+        return -1; /* no decode assist: cannot skip the instruction safely */
+    }
+    real->vmcb->save.dr7 = 0x403u;
+    real->vmcb->save.rip = real->vmcb->control.nrip;
+    real->vmcb->control.vmcb_clean_bits = 0;
+    return 0;
+}
+
+void hype_svm_vcpu_arm_exec_breakpoint(hype_vcpu_ctx_t *ctx, uint64_t gva) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+
+    if (gva == 0) {
+        real->vmcb->save.dr7 = 0x400u; /* the architectural reset value */
+        real->vmcb->control.intercept_dr = 0;
+        real->vmcb->control.vmcb_clean_bits = 0;
+        return;
+    }
+    /* Intercept writes to DR7 (bit 16+7) so the guest cannot disarm this. */
+    real->vmcb->control.intercept_dr |= (1u << (16 + 7));
+    /*
+     * DR0 holds the linear address. DR7: L0|G0 enable it, and its type/length
+     * field (bits 19:16) stays zero, which is "execute, one byte" -- the only
+     * combination architecturally valid for an instruction breakpoint. Bit 10
+     * is reserved-one. The guest's own DR0 is not preserved: nothing in a
+     * Windows boot uses it, and this is a diagnostic build.
+     */
+    __asm__ volatile("mov %0, %%dr0" : : "r"(gva));
+    real->vmcb->save.dr7 = 0x403u;
+    real->vmcb->control.vmcb_clean_bits = 0;
+}
+
 void hype_svm_vcpu_set_exception_intercepts(hype_vcpu_ctx_t *ctx, uint32_t mask) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->vmcb->control.intercept_exceptions = mask;
@@ -3476,12 +3520,12 @@ int hype_svm_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
         return -1;
     }
     if (decoded.size_bytes != 4u && decoded.size_bytes != 8u) {
-        return -1;
+        goto undecoded;
     }
 
     reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
     if (reg == 0 && !decoded.has_imm) {
-        return -1;
+        goto undecoded;
     }
 
     if (decoded.is_write) {
@@ -3509,6 +3553,25 @@ int hype_svm_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
 
     real->vmcb->save.rip += decoded.instr_len;
     return 0;
+
+undecoded:
+    /*
+     * #436: an HPET access this decoder cannot handle must be visible, not
+     * silently handed to the unhandled-MMIO catch-all -- that absorbs the
+     * access and answers all-ones, which a guest reads as a live register
+     * full of set bits rather than as the register it asked for. Report the
+     * form once so the gap is nameable.
+     */
+    {
+        static unsigned undec_n = 0;
+        if (undec_n < 8u) {
+            undec_n++;
+            hype_debug_print("fw-1 #436 HPET-UNDECODED off=0x%x w=%d size=%u imm=%d rip=0x%llx\n",
+                             (unsigned)offset, npf.is_write, (unsigned)decoded.size_bytes,
+                             decoded.has_imm, (unsigned long long)real->vmcb->save.rip);
+        }
+    }
+    return -1;
 }
 
 int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
