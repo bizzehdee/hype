@@ -7,11 +7,18 @@
  * TERM-8 (#445): a minimal PNG encoder, from scratch -- hype is freestanding
  * with no libc/zlib/libpng, so there is nothing to wrap.
  *
- * A valid PNG does not require real DEFLATE compression: RFC 1951 section
- * 3.2.4's "stored" (uncompressed) block type is spec-legal and any PNG
- * viewer/decoder reads it correctly, just larger than a compressed file
- * would be. That is the deliberate tradeoff here -- simplicity over file
- * size, since these are one-off operator screenshots, not a video stream.
+ * It started out emitting RFC 1951 section 3.2.4 "stored" (uncompressed)
+ * blocks -- spec-legal, read correctly by any viewer, and the simplest thing
+ * that works. #463 retired that: a 1920x1080 capture came to 6.2 MB, which
+ * took 10-15 seconds to write to a real USB stick (freezing the machine, since
+ * the write runs on the BSP through the one USB transfer lock the guests
+ * stream their media through) and then failed outright, leaving a 0-byte file.
+ *
+ * It now emits ONE fixed-Huffman block (BTYPE=01) with run-length matches at
+ * distance 1. That is a deliberately small amount of machinery -- no hash
+ * chains, no dynamic Huffman tables, no match search -- chosen because the
+ * thing being compressed is a text console: long runs of identical background
+ * pixels, which RLE alone handles about as well as a full LZ77 would.
  *
  * Output is always 8-bit truecolor-without-alpha (PNG color type 2, 3 bytes
  * per pixel, row-major, no filtering beyond the mandatory per-row "None"
@@ -34,9 +41,14 @@ uint32_t hype_png_write(const uint8_t *rgb, uint32_t width, uint32_t height,
                         uint32_t stride_bytes, uint8_t *out, uint32_t out_cap);
 
 /*
- * The exact byte count hype_png_write() will need for a `width`x`height`
- * image, so a caller can size its output buffer correctly up front rather
- * than guessing. 0 for invalid dimensions (0 width or height).
+ * An UPPER BOUND on the bytes hype_png_write() needs for a `width`x`height`
+ * image, so a caller can size its output buffer safely up front. 0 for
+ * invalid dimensions (0 width or height).
+ *
+ * #463: this was an exact count while the encoder emitted stored blocks. With
+ * compression the real size is data-dependent and typically orders of
+ * magnitude smaller; the bound is the worst case (every byte a 9-bit literal),
+ * which a real capture never reaches but a buffer must still allow for.
  */
 uint32_t hype_png_encoded_size(uint32_t width, uint32_t height);
 

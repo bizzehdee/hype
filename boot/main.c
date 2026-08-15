@@ -17738,22 +17738,40 @@ static void term_take_screenshot(void) {
         hype_snprintf(filename, sizeof(filename), "%s-unknown-time.png", vm_name);
     }
 
-    if (g_hype_log_ready) {
-        /* #447: best-effort, same limitation as TERM-7's resolution save -- only the USB
-         * debug-log sink's already-mounted volume, not a device-agnostic boot-ESP lookup. */
+    /*
+     * #463: report WHICH step failed. This used to collapse every outcome into "NOT saved (no
+     * writable volume mounted)", which on real hardware was simply false: the volume was
+     * mounted, the directory and file were created, and only the write failed -- leaving a
+     * 0-byte PNG on the stick and a message blaming the wrong thing.
+     */
+    if (!g_hype_log_ready) {
+        hype_debug_print("screenshot: %s (%ux%u, %u bytes) -- NOT saved, no writable volume "
+                         "mounted [#447]\n", filename, width, height, (unsigned)png_len);
+        return;
+    }
+    {
         char full_path[80];
         hype_fs_file_t f;
         (void)hype_fs_mkdir(&g_hype_log.fs, "screenshots"); /* ignore -- already-exists is fine */
         hype_snprintf(full_path, sizeof(full_path), "screenshots\\%s", filename);
-        if (hype_fs_create(&g_hype_log.fs, full_path, &f) == 0 &&
-            hype_fs_write_at(&f, 0, g_screenshot_png, png_len) == 0) {
-            saved = 1;
+        if (hype_fs_create(&g_hype_log.fs, full_path, &f) != 0) {
+            hype_debug_print("screenshot: %s (%ux%u, %u bytes) -- NOT saved, could not create the "
+                             "file [#463]\n", filename, width, height, (unsigned)png_len);
+            return;
         }
+        if (hype_fs_write_at(&f, 0, g_screenshot_png, png_len) != 0) {
+            /* Remove the empty entry create() just made: a 0-byte PNG on the stick reads as a
+             * captured screenshot that happens not to open, which is a worse lie than nothing. */
+            (void)hype_fs_unlink(&g_hype_log.fs, full_path);
+            hype_debug_print("screenshot: %s (%ux%u, %u bytes) -- NOT saved, the write failed "
+                             "[#463]\n", filename, width, height, (unsigned)png_len);
+            return;
+        }
+        saved = 1;
     }
 
     hype_debug_print("screenshot: %s (%ux%u, %u bytes)%s\n", filename, width, height,
-                     (unsigned)png_len,
-                     saved ? " saved" : " -- NOT saved (no writable volume mounted) [#447]");
+                     (unsigned)png_len, saved ? " saved" : "");
 }
 
 /* Persistent copies of the USB block path the sink writes through. The probe's
