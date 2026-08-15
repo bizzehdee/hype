@@ -343,6 +343,9 @@ static int g_cd_msi_asserted, g_ata_msi_asserted;
 static unsigned long long g_440_ata_npf_accesses;
 static uint32_t g_440_cfg_ring[16];
 static unsigned long long g_440_cfg_total;
+/* #94: RTC periodic interrupts actually injected -- compared against the
+ * guest-programmed rate in the RTCRATE diagnostic. */
+static unsigned long long g_94_rtc_irqs;
 
 static unsigned long long g_dbgport_writes;
 static unsigned long long g_dbgport_reads;
@@ -12471,6 +12474,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, rtciov);
                         } else {
                             hype_pic_emu_raise_global_irq(&g_fw_1_pic, 8u);
+                        }
+                        g_94_rtc_irqs++;
+                    }
+                    {   /* #94: the RTC is the full OS's clock source here (LAPIC
+                         * timer left masked), and the guest's InterruptTime runs
+                         * ~3.7x its wall clock. Print the PROGRAMMED rate next to
+                         * the DELIVERED rate so a mismatch names itself. */
+                        static uint64_t rtc_last_tsc;
+                        static unsigned long long rtc_last_irqs;
+                        uint64_t now_rtc = hype_rdtsc();
+                        if (now_rtc - rtc_last_tsc > 5u * g_fw_1_host_tsc_hz) {
+                            if (rtc_last_tsc != 0u) {
+                                hype_debug_print(
+                                    "fw-1 #94 RTCRATE: delivered=%llu/5s programmed=%uHz "
+                                    "regA=0x%02x regB=0x%02x\n",
+                                    (unsigned long long)(g_94_rtc_irqs - rtc_last_irqs),
+                                    (unsigned)hype_cmos_periodic_hz(&vm->cmos),
+                                    (unsigned)vm->cmos.registers[HYPE_CMOS_REG_STATUS_A],
+                                    (unsigned)vm->cmos.registers[HYPE_CMOS_REG_STATUS_B]);
+                            }
+                            rtc_last_tsc = now_rtc;
+                            rtc_last_irqs = g_94_rtc_irqs;
                         }
                     }
                 }

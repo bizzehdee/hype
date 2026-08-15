@@ -109,6 +109,13 @@ typedef struct {
     int base_valid;
     /* #436: nanoseconds accumulated toward the next periodic interrupt. */
     uint64_t periodic_ns;
+    /* #94: periods that ELAPSED but could not be delivered yet (the guest had
+     * not acknowledged the previous one, or several elapsed in one coarse
+     * step). Windows accumulates InterruptTime by adding the period per RTC
+     * interrupt it receives, so every dropped period makes guest relative
+     * time fall behind wall time -- delivering the backlog as the guest acks
+     * (QEMU's RTC does the same "reinjection") keeps the two clocks equal. */
+    uint32_t periodic_owed;
 } hype_cmos_t;
 
 /*

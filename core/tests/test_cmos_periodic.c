@@ -66,11 +66,49 @@ static void test_disabling_the_rate_stops_the_clock_cleanly(void) {
     assert(hype_cmos_advance(&c, 100ull) == 0);
 }
 
+
+static void test_backlog_periods_are_owed_not_dropped(void) {
+    hype_cmos_t c;
+    uint8_t v;
+    unsigned delivered = 0, i;
+    memset(&c, 0, sizeof c);
+    sel(&c, HYPE_CMOS_REG_STATUS_A, 0x26);       /* 1024 Hz */
+    sel(&c, HYPE_CMOS_REG_STATUS_B, HYPE_CMOS_STATUS_B_PIE);
+    /* #94: 10 periods elapse in ONE coarse step (a busy vCPU loop). Windows
+     * adds the period to InterruptTime per interrupt RECEIVED, so all 10 must
+     * arrive -- the old code delivered one and dropped nine, and the guest's
+     * relative clock fell measurably behind its wall clock. */
+    assert(hype_cmos_advance(&c, 10u * 976563ull) == 1);
+    delivered = 1;
+    for (i = 0; i < 16u; i++) {
+        hype_cmos_index_write(&c, HYPE_CMOS_REG_STATUS_C);
+        v = hype_cmos_data_read(&c); /* ack */
+        (void)v;
+        if (hype_cmos_advance(&c, 0ull) == 1) {
+            delivered++;
+        }
+    }
+    assert(delivered == 10);
+}
+
+static void test_backlog_is_capped_at_one_second(void) {
+    hype_cmos_t c;
+    memset(&c, 0, sizeof c);
+    sel(&c, HYPE_CMOS_REG_STATUS_A, 0x26);       /* 1024 Hz */
+    sel(&c, HYPE_CMOS_REG_STATUS_B, HYPE_CMOS_STATUS_B_PIE);
+    /* An hour-long stall must not owe an hour of interrupts: the burst is
+     * bounded to one second's worth, like QEMU's reinjection cap. */
+    assert(hype_cmos_advance(&c, 3600ull * 1000000000ull) == 1);
+    assert(c.periodic_owed <= 1024u);
+}
+
 int main(void) {
     test_rate_table_matches_the_hardware();
     test_no_interrupt_until_the_guest_enables_it();
     test_flag_is_a_level_cleared_by_reading_register_c();
     test_disabling_the_rate_stops_the_clock_cleanly();
+    test_backlog_periods_are_owed_not_dropped();
+    test_backlog_is_capped_at_one_second();
     printf("test_cmos_periodic: all tests passed\n");
     return 0;
 }

@@ -13,6 +13,8 @@ void hype_cmos_reset(hype_cmos_t *cmos) {
     cmos->registers[HYPE_CMOS_REG_STATUS_A] = HYPE_CMOS_STATUS_A_RESET;
     cmos->registers[HYPE_CMOS_REG_STATUS_B] = HYPE_CMOS_STATUS_B_RESET;
     cmos->registers[HYPE_CMOS_REG_STATUS_D] = HYPE_CMOS_STATUS_D_RESET;
+    cmos->periodic_ns = 0;
+    cmos->periodic_owed = 0;
     cmos->base_valid = 0;
     cmos->base_year = 0;
     cmos->base_month = 0;
@@ -189,9 +191,10 @@ int hype_cmos_advance(hype_cmos_t *cmos, uint64_t elapsed_ns) {
 
     if (hz == 0u || (cmos->registers[HYPE_CMOS_REG_STATUS_B] & HYPE_CMOS_STATUS_B_PIE) == 0u) {
         /* No rate selected, or the guest has not enabled the interrupt: time
-         * still passes, but nothing is owed. Keep the accumulator from growing
+         * still passes, but nothing is owed. Keep the accumulators from growing
          * without bound so enabling it later starts from now. */
         cmos->periodic_ns = 0;
+        cmos->periodic_owed = 0;
         return 0;
     }
     period_ns = 1000000000ull / (uint64_t)hz;
@@ -199,16 +202,35 @@ int hype_cmos_advance(hype_cmos_t *cmos, uint64_t elapsed_ns) {
         return 0;
     }
     cmos->periodic_ns += elapsed_ns;
-    if (cmos->periodic_ns < period_ns) {
+    if (cmos->periodic_ns >= period_ns) {
+        /* #94: every elapsed period is OWED an interrupt, not just the most
+         * recent one. Windows uses this line as its clock and adds the period
+         * to InterruptTime per interrupt received; the old drop-the-backlog
+         * behaviour (periodic_ns %= period) made guest relative time run
+         * measurably slow (RTCRATE: ~1730 delivered/s against a programmed
+         * 2048 Hz), stretching every timeout until service starts and OOBE
+         * fell over. Cap the backlog at one second's worth so a paused/wedged
+         * guest gets a bounded catch-up burst, exactly like QEMU's RTC
+         * reinjection. */
+        uint64_t elapsed_periods = cmos->periodic_ns / period_ns;
+        uint32_t cap = (hz > 0u) ? hz : 1u;
+        cmos->periodic_ns -= elapsed_periods * period_ns;
+        if (elapsed_periods > (uint64_t)cap) {
+            elapsed_periods = cap;
+        }
+        if (cmos->periodic_owed > cap - (uint32_t)elapsed_periods) {
+            cmos->periodic_owed = cap;
+        } else {
+            cmos->periodic_owed += (uint32_t)elapsed_periods;
+        }
+    }
+    if (cmos->periodic_owed == 0u) {
         return 0;
     }
-    /* One assertion per elapsed period, however many periods a single step
-     * covered: the flag is a level, not a count, and the guest clears it by
-     * reading register C. */
-    cmos->periodic_ns %= period_ns;
     if ((cmos->registers[HYPE_CMOS_REG_STATUS_C] & HYPE_CMOS_STATUS_C_IRQF) != 0u) {
-        return 0; /* already asserted and not yet acknowledged */
+        return 0; /* still asserted; the backlog drains as the guest acks */
     }
+    cmos->periodic_owed--;
     cmos->registers[HYPE_CMOS_REG_STATUS_C] |=
         (uint8_t)(HYPE_CMOS_STATUS_C_PF | HYPE_CMOS_STATUS_C_IRQF);
     return 1;
