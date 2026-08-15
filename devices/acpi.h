@@ -155,7 +155,14 @@ _Static_assert(sizeof(hype_acpi_fadt_t) == 276, "FADT must be 276 bytes (ACPI 6.
 #define HYPE_ACPI_FADT_WBINVD (1u << 0)        /* WBINVD correctly flushes all caches -- true on real x86 */
 #define HYPE_ACPI_FADT_PWR_BUTTON (1u << 4)    /* no fixed-hardware power button (none emulated yet) */
 #define HYPE_ACPI_FADT_SLP_BUTTON (1u << 5)    /* no fixed-hardware sleep button */
+#define HYPE_ACPI_FADT_RESET_REG_SUP (1u << 10) /* the reset register below is real */
 #define HYPE_ACPI_FADT_HW_REDUCED_ACPI (1u << 20)
+
+/* #94: the ACPI reset register -- the classic 0xCF9 reset-control port. A
+ * write of HYPE_ACPI_RESET_VALUE requests a platform reset; the vCPU loop
+ * turns it into a VM restart. */
+#define HYPE_ACPI_RESET_PORT 0xCF9u
+#define HYPE_ACPI_RESET_VALUE 0x06u
 
 /*
  * #436: IAPC_BOOT_ARCH (the FADT's `boot_flags`) -- what x86 legacy hardware

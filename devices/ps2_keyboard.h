@@ -59,6 +59,7 @@
 #define HYPE_PS2_CMD_ENABLE_AUX_PORT 0xA8u
 #define HYPE_PS2_CMD_TEST_AUX_PORT 0xA9u
 #define HYPE_PS2_CMD_WRITE_TO_AUX 0xD4u
+#define HYPE_PS2_CMD_PULSE_RESET 0xFEu /* #94: pulse output line 0 low = system reset */
 
 #define HYPE_PS2_AUX_TEST_PASSED 0x00u
 
@@ -97,6 +98,10 @@ typedef struct {
      * out_count > 0. */
     uint8_t out_fifo[HYPE_PS2_KBD_FIFO_SIZE];
     int guest_wrote; /* #436: guest driver has touched the device */
+    int reset_pulse; /* #94: controller command 0xFE seen -- the classic
+                      * keyboard-controller system-reset pulse. Latched for the
+                      * VMM to consume (it owns the VM lifecycle); the device
+                      * model itself has nothing to reset. */
     int awaiting_scancode_set_param; /* #436: 0xF0 consumes one parameter byte */
     uint8_t out_is_scancode[HYPE_PS2_KBD_FIFO_SIZE];
     unsigned int out_head;  /* index of the next byte to read */

@@ -41,6 +41,9 @@ typedef enum {
     HYPE_VM_EV_S5,       /* guest reached ACPI soft-off */
     HYPE_VM_EV_TIMEOUT,  /* shutdown grace period elapsed */
     HYPE_VM_EV_STARTED,  /* re-initialisation finished */
+    HYPE_VM_EV_RESET,    /* #94: guest-requested platform reset (ACPI reset
+                          * register / 8042 0xFE pulse) -- straight back
+                          * through STARTING for a fresh boot */
 } hype_vm_event_t;
 
 /* Compute the next state for `state` on `ev`. Events that don't apply to the

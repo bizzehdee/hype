@@ -485,6 +485,29 @@ int hype_svm_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint1
 }
 
 /*
+ * #94: the 0xCF9 reset-control port (the FADT's reset register). A write with
+ * bit 2 (RST_CPU) set is a platform-reset request; reads return 0. Returns 0
+ * for a handled write (with *reset_requested set), 1 for a handled read, -1
+ * when the exit is not this port's.
+ */
+int hype_svm_vcpu_handle_reset_ctl_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, int *reset_requested) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+    if (io.port != port) {
+        return -1;
+    }
+    if (io.is_in) {
+        real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL);
+        real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+        return 1;
+    }
+    *reset_requested = ((real->vmcb->save.rax & 0x04u) != 0) ? 1 : 0;
+    real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+    return 0;
+}
+
+/*
  * #436: PM1a EVENT block (status @base, enable @base+2). A non-hardware-reduced
  * ACPI platform has one, and hype's FADT now says so. No event sources are wired
  * to it, so status reads "nothing pending" and write-1-to-clear is a no-op; the

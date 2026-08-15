@@ -3380,6 +3380,25 @@ int hype_vmx_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint1
     return 0;
 }
 
+/* #94: 0xCF9 reset control -- same three-way contract as the SVM original. */
+int hype_vmx_vcpu_handle_reset_ctl_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, int *reset_requested) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_vmm_ioio_t io;
+
+    vmx_decode_ioio(&io);
+    if (io.port != port) {
+        return -1;
+    }
+    if (io.is_in) {
+        real->gprs[0] = (real->gprs[0] & ~0xFFULL);
+        vmx_advance_rip();
+        return 1;
+    }
+    *reset_requested = ((real->gprs[0] & 0x04u) != 0) ? 1 : 0;
+    vmx_advance_rip();
+    return 0;
+}
+
 /* Legacy PCI config access via CF8/CFC. */
 int hype_vmx_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;

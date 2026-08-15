@@ -11,6 +11,7 @@ hype_vm_lifecycle_t hype_vm_lifecycle_next(hype_vm_lifecycle_t state, hype_vm_ev
             if (ev == HYPE_VM_EV_STOP)     return HYPE_VM_PAUSED;
             if (ev == HYPE_VM_EV_SHUTDOWN) return HYPE_VM_SHUTTING;
             if (ev == HYPE_VM_EV_S5)       return HYPE_VM_OFF; /* guest self-poweroff */
+            if (ev == HYPE_VM_EV_RESET)    return HYPE_VM_STARTING; /* guest-requested reboot */
             return state;
         case HYPE_VM_PAUSED:
             if (ev == HYPE_VM_EV_RESUME)   return HYPE_VM_RUNNING;
@@ -19,6 +20,7 @@ hype_vm_lifecycle_t hype_vm_lifecycle_next(hype_vm_lifecycle_t state, hype_vm_ev
         case HYPE_VM_SHUTTING:
             if (ev == HYPE_VM_EV_S5)       return HYPE_VM_OFF;
             if (ev == HYPE_VM_EV_TIMEOUT)  return HYPE_VM_OFF; /* escalate to off */
+            if (ev == HYPE_VM_EV_RESET)    return HYPE_VM_STARTING;
             return state;
         case HYPE_VM_OFF:
             if (ev == HYPE_VM_EV_START)    return HYPE_VM_STARTING;

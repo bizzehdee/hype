@@ -10747,6 +10747,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * with it and terminal switching stopped working. */
         }
 
+        /* #94: the 8042 reset pulse (controller command 0xFE). Windows' HAL
+         * reboot path writes it; the device model latches it because only
+         * this loop owns the lifecycle. */
+        if (vm->ps2.reset_pulse) {
+            vm->ps2.reset_pulse = 0;
+            vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_RESET);
+            hype_debug_print("fw-1: vm%u guest reset via 8042 pulse (0xFE) -> restart\n",
+                             (unsigned)(vm - g_vms));
+        }
+
         /* M8-6 shutdown grace timer: on entering SHUTTING, arm a bounded
          * deadline; the guest keeps running (so it can reach ACPI S5). If it
          * hasn't powered off by the deadline, escalate to OFF. (Guest-driven S5
@@ -14184,6 +14194,27 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
             if (vmm_handle_acpi_pm_timer_ioio(kind, ctx) == 0) {
                 continue;
+            }
+            {
+                /* #94: the ACPI reset register (FADT: I/O 0xCF9, value 6).
+                 * Windows' HAL writes it to REBOOT; before this the write fell
+                 * into the absorb-unknown-port path and a mid-install restart
+                 * idled forever. Bit 2 (RST_CPU) is the reset request, as on
+                 * real PIIX/ICH chipsets. */
+                int reset_req = 0;
+                int rr = (kind == HYPE_VMM_KIND_VMX)
+                             ? hype_vmx_vcpu_handle_reset_ctl_ioio(ctx, (uint16_t)HYPE_ACPI_RESET_PORT,
+                                                                   &reset_req)
+                             : hype_svm_vcpu_handle_reset_ctl_ioio(ctx, (uint16_t)HYPE_ACPI_RESET_PORT,
+                                                                   &reset_req);
+                if (rr == 0 && reset_req) {
+                    vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_RESET);
+                    hype_debug_print("fw-1: vm%u guest reset via ACPI reset register (0xCF9) "
+                                     "-> restart\n", (unsigned)(vm - g_vms));
+                }
+                if (rr != -1) {
+                    continue; /* handled; on reset the STARTING branch reinitialises */
+                }
             }
 
             {

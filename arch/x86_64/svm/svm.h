@@ -234,6 +234,10 @@ void hype_svm_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
 int hype_svm_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint16_t *value,
                                       int *slp_en);
 
+/* #94: 0xCF9 reset control. 0 = handled write (*reset_requested set),
+ * 1 = handled read, -1 = not this port. */
+int hype_svm_vcpu_handle_reset_ctl_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, int *reset_requested);
+
 /* #436: PM1a event block (status/enable) -- see the definition's comment. */
 int hype_svm_vcpu_handle_pm1_evt_ioio(hype_vcpu_ctx_t *ctx, uint16_t base, uint16_t *enable);
 

@@ -12,6 +12,7 @@ void hype_ps2_kbd_reset(hype_ps2_kbd_t *kbd) {
     kbd->keyboard_port_enabled = 1;
     kbd->aux_port_enabled = 1;
     kbd->next_data_write_is_for_aux = 0;
+    kbd->reset_pulse = 0;
     kbd->irq_edges = 0;
     __atomic_store_n(&kbd->scancodes_queued, 0ull, __ATOMIC_RELAXED);
     __atomic_store_n(&kbd->scancodes_read, 0ull, __ATOMIC_RELAXED);
@@ -170,6 +171,12 @@ int hype_ps2_kbd_io_write(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t value) {
             break;
         case HYPE_PS2_CMD_WRITE_TO_AUX:
             kbd->next_data_write_is_for_aux = 1;
+            break;
+        case HYPE_PS2_CMD_PULSE_RESET:
+            /* #94: the 8042 system-reset pulse -- Windows' HAL reboot path
+             * when the ACPI reset register is absent (and some OSes try it
+             * first regardless). Latch it; the VMM restarts the VM. */
+            kbd->reset_pulse = 1;
             break;
         default:
             /* Unrecognized controller command -- silently ignored,

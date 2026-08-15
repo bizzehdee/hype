@@ -222,7 +222,18 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
          * cannot reconcile a reduced-hardware FADT that also declares a SCI
          * and a century register. Describe what is really there instead.
          */
-        fadt->flags = HYPE_ACPI_FADT_WBINVD | HYPE_ACPI_FADT_PWR_BUTTON | HYPE_ACPI_FADT_SLP_BUTTON;
+        fadt->flags = HYPE_ACPI_FADT_WBINVD | HYPE_ACPI_FADT_PWR_BUTTON | HYPE_ACPI_FADT_SLP_BUTTON |
+                      HYPE_ACPI_FADT_RESET_REG_SUP;
+        /* #94: the ACPI reset register. Without it Windows' HAL falls back to
+         * the 8042 0xFE pulse, and a platform that answers neither (hype until
+         * now) leaves a rebooting guest idling forever -- Setup's mid-install
+         * restarts hung exactly there. The classic PIIX/ICH 0xCF9 port with
+         * value 6 (system reset); hype's vCPU loop watches for the write. */
+        fadt->reset_register.space_id = HYPE_ACPI_GAS_SPACE_SYSTEM_IO;
+        fadt->reset_register.bit_width = 8;
+        fadt->reset_register.access_width = 1;
+        fadt->reset_register.address = HYPE_ACPI_RESET_PORT;
+        fadt->reset_value = HYPE_ACPI_RESET_VALUE;
         fadt->pm1a_event_block = HYPE_ACPI_PM1A_EVT_PORT;
         fadt->pm1_event_length = (uint8_t)HYPE_ACPI_PM1A_EVT_LENGTH;
         fadt->pm1a_control_block = HYPE_ACPI_PM1A_CNT_PORT;

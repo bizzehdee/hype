@@ -37,6 +37,12 @@ int main(void) {
     EQ("off+resume no-op", HYPE_VM_OFF, hype_vm_lifecycle_next(HYPE_VM_OFF, HYPE_VM_EV_RESUME));
     EQ("off+S5 no-op", HYPE_VM_OFF, hype_vm_lifecycle_next(HYPE_VM_OFF, HYPE_VM_EV_S5));
 
+    /* --- guest-requested reset (#94): ACPI reset register / 8042 0xFE --- */
+    EQ("running+reset -> starting", HYPE_VM_STARTING, hype_vm_lifecycle_next(HYPE_VM_RUNNING, HYPE_VM_EV_RESET));
+    EQ("shutting+reset -> starting", HYPE_VM_STARTING, hype_vm_lifecycle_next(HYPE_VM_SHUTTING, HYPE_VM_EV_RESET));
+    EQ("off+reset no-op", HYPE_VM_OFF, hype_vm_lifecycle_next(HYPE_VM_OFF, HYPE_VM_EV_RESET));
+    EQ("paused+reset no-op", HYPE_VM_PAUSED, hype_vm_lifecycle_next(HYPE_VM_PAUSED, HYPE_VM_EV_RESET));
+
     /* --- runs() predicate --- */
     CHECK("running runs", hype_vm_lifecycle_runs(HYPE_VM_RUNNING));
     CHECK("shutting runs (must reach S5)", hype_vm_lifecycle_runs(HYPE_VM_SHUTTING));

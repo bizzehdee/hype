@@ -384,7 +384,21 @@ static void test_irq_edges_saturate_instead_of_wrapping(void) {
     CHECK_HEX("read-exposed edges saturate too", HYPE_PS2_KBD_FIFO_SIZE, taken);
 }
 
+static void test_reset_pulse_latches(void) {
+    hype_ps2_kbd_t kbd;
+
+    hype_ps2_kbd_reset(&kbd);
+    CHECK_HEX("no reset pulse after reset", 0, kbd.reset_pulse);
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, HYPE_PS2_CMD_PULSE_RESET);
+    CHECK_HEX("0xFE latches the reset pulse", 1, kbd.reset_pulse);
+    /* The latch is the VMM's to consume; a second pulse keeps it set. */
+    kbd.reset_pulse = 0;
+    hype_ps2_kbd_io_write(&kbd, HYPE_PS2_PORT_STATUS_COMMAND, HYPE_PS2_CMD_PULSE_RESET);
+    CHECK_HEX("a later 0xFE latches again", 1, kbd.reset_pulse);
+}
+
 int main(void) {
+    test_reset_pulse_latches();
     test_irq_edge_per_readable_byte();
     test_irq_edge_for_command_responses();
     test_irq_edges_saturate_instead_of_wrapping();
