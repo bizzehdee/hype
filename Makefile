@@ -28,6 +28,7 @@ LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 BUILD_DIR := build
 CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/serial.c core/serial_hw.c core/font8x8.c core/gop.c core/gop_text.c core/gop_mode.c core/gop_mode_hw.c \
+             core/png_write.c \
              core/fatal.c core/strutil.c core/guest_ram.c core/mp.c core/linux_boot.c \
              core/admission.c core/file_io.c core/guest_mem.c core/logbuf.c \
              core/clockfacts.c core/io_histogram.c core/log_drain.c core/render_budget.c core/scancode_queue.c core/ticket_lock.c \

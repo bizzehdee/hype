@@ -46,6 +46,7 @@
 #include "../core/blk_backend.h"
 #include "../core/fw1_debug.h"
 #include "../core/rtc.h"
+#include "../core/png_write.h"
 #include "../core/render_budget.h"
 #include "../core/blk_phys.h"
 #include "../core/blk_image.h"
@@ -1047,6 +1048,11 @@ static int g_view_switch_pending_view = -2;
  * hype escalates to a forced power-off. */
 #define HYPE_FW_1_SHUTDOWN_GRACE_S 10ull
 
+/* TERM-8 (#445): defined further down (needs g_gop_console, g_hype_cfg, g_host_time -- same
+ * reason term_resolution_cmd/term_config_cmd are forward-declared). Dumps the current on-screen
+ * framebuffer to a PNG on whichever writable volume is mounted. */
+static void term_take_screenshot(void);
+
 /* Apply a completed leader-chord action to the terminal focus. Cycling order
  * is dashboard(-1) -> vm0 -> vm1 -> ... -> dashboard, wrapping both ways. */
 static void hype_term_apply_chord(hype_chord_result_t cr) {
@@ -1070,6 +1076,9 @@ static void hype_term_apply_chord(hype_chord_result_t cr) {
         case HYPE_CHORD_ACTION_TOGGLE_DASHBOARD:
             action = HYPE_TERM_FOCUS_TOGGLE_DASHBOARD;
             break;
+        case HYPE_CHORD_ACTION_SCREENSHOT:
+            term_take_screenshot();
+            return; /* not a focus change -- nothing below applies */
         default:
             break;
     }
@@ -17183,6 +17192,105 @@ static void term_config_cmd(int idx, const char *nm) {
     hype_debug_print("cfg[%s]: --- end ---\n", nm);
 
     hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: full config printed to the log", nm);
+}
+
+/*
+ * TERM-8 (#445): PNG screenshot hotkey. Captures g_gop_console.fb -- the shadow framebuffer
+ * already holding whatever is currently on screen (dashboard or a focused VM's RAMFB, already
+ * blitted there by fw_1_render_console()), so this needs no VM-specific lookup of its own; it
+ * screenshots exactly what the operator is looking at.
+ *
+ * Capped at 1920x1080: real screenshots, not a video stream, and this project's own display
+ * targets are well within that. A larger console is cropped (logged, not silently wrong) rather
+ * than failing outright or growing these static buffers without bound.
+ */
+#define HYPE_SCREENSHOT_MAX_WIDTH 1920u
+#define HYPE_SCREENSHOT_MAX_HEIGHT 1080u
+#define HYPE_SCREENSHOT_RGB_BYTES (HYPE_SCREENSHOT_MAX_WIDTH * HYPE_SCREENSHOT_MAX_HEIGHT * 3u)
+/* Generous, not exact: raw PNG data is one filter byte per row plus the pixel bytes, wrapped in
+ * stored-DEFLATE blocks (5 bytes of header per <=65535-byte block) plus a small fixed chunk
+ * overhead -- HYPE_SCREENSHOT_MAX_HEIGHT*8u covers the row/block overhead many times over. */
+#define HYPE_SCREENSHOT_PNG_BYTES (HYPE_SCREENSHOT_RGB_BYTES + HYPE_SCREENSHOT_MAX_HEIGHT * 8u + 256u)
+
+static uint8_t g_screenshot_rgb[HYPE_SCREENSHOT_RGB_BYTES];
+static uint8_t g_screenshot_png[HYPE_SCREENSHOT_PNG_BYTES];
+
+static void term_take_screenshot(void) {
+    unsigned int width, height, x, y;
+    const char *vm_name;
+    hype_rtc_time_t now;
+    uint32_t png_len;
+    char filename[48];
+    int saved = 0;
+
+    if (g_gop_console.fb == 0 || g_gop_console.width == 0u || g_gop_console.height == 0u) {
+        hype_debug_print("screenshot: no framebuffer to capture\n");
+        return;
+    }
+
+    width = g_gop_console.width;
+    height = g_gop_console.height;
+    if (width > HYPE_SCREENSHOT_MAX_WIDTH || height > HYPE_SCREENSHOT_MAX_HEIGHT) {
+        hype_debug_print("screenshot: display %ux%u exceeds the %ux%u capture limit -- cropping\n",
+                         g_gop_console.width, g_gop_console.height, HYPE_SCREENSHOT_MAX_WIDTH,
+                         HYPE_SCREENSHOT_MAX_HEIGHT);
+        if (width > HYPE_SCREENSHOT_MAX_WIDTH) width = HYPE_SCREENSHOT_MAX_WIDTH;
+        if (height > HYPE_SCREENSHOT_MAX_HEIGHT) height = HYPE_SCREENSHOT_MAX_HEIGHT;
+    }
+
+    /* g_gop_console.fb is XRGB8888 (memory byte order B,G,R,X -- see devices/fb_blit.h's own
+     * format comment); PNG truecolor wants R,G,B in that byte order per pixel. */
+    for (y = 0; y < height; y++) {
+        const unsigned int *src_row = g_gop_console.fb + (uint64_t)y * g_gop_console.stride;
+        uint8_t *dst_row = g_screenshot_rgb + (uint64_t)y * width * 3u;
+        for (x = 0; x < width; x++) {
+            unsigned int px = src_row[x];
+            dst_row[x * 3u + 0u] = (uint8_t)((px >> 16) & 0xFFu); /* R */
+            dst_row[x * 3u + 1u] = (uint8_t)((px >> 8) & 0xFFu);  /* G */
+            dst_row[x * 3u + 2u] = (uint8_t)(px & 0xFFu);         /* B */
+        }
+    }
+
+    png_len = hype_png_write(g_screenshot_rgb, width, height, width * 3u, g_screenshot_png,
+                             sizeof(g_screenshot_png));
+    if (png_len == 0u) {
+        hype_debug_print("screenshot: PNG encode failed for a %ux%u capture\n", width, height);
+        return;
+    }
+
+    vm_name =
+        (g_term_view >= 0 && g_term_view < (int)g_vm_count) ? g_vms[g_term_view].name : "dashboard";
+
+    if (g_host_time_valid) {
+        /* Same physical host clock regardless of VM index -- g_vms[0].host_tsc_hz rather than
+         * the vm-scoped g_fw_1_host_tsc_hz macro, which needs a local `vm` this function has no
+         * reason to have (this captures the SCREEN, not one VM's own state). */
+        uint64_t hz = g_vms[0].host_tsc_hz;
+        uint64_t elapsed_s = (hz != 0) ? (hype_rdtsc() - g_host_time_tsc) / hz : 0ull;
+        hype_rtc_advance(&g_host_time, elapsed_s, &now);
+        hype_snprintf(filename, sizeof(filename), "%s-%04u%02u%02u-%02u%02u%02u.png", vm_name,
+                     (unsigned)now.year, (unsigned)now.month, (unsigned)now.day,
+                     (unsigned)now.hour, (unsigned)now.minute, (unsigned)now.second);
+    } else {
+        hype_snprintf(filename, sizeof(filename), "%s-unknown-time.png", vm_name);
+    }
+
+    if (g_hype_log_ready) {
+        /* #447: best-effort, same limitation as TERM-7's resolution save -- only the USB
+         * debug-log sink's already-mounted volume, not a device-agnostic boot-ESP lookup. */
+        char full_path[80];
+        hype_fs_file_t f;
+        (void)hype_fs_mkdir(&g_hype_log.fs, "screenshots"); /* ignore -- already-exists is fine */
+        hype_snprintf(full_path, sizeof(full_path), "screenshots\\%s", filename);
+        if (hype_fs_create(&g_hype_log.fs, full_path, &f) == 0 &&
+            hype_fs_write_at(&f, 0, g_screenshot_png, png_len) == 0) {
+            saved = 1;
+        }
+    }
+
+    hype_debug_print("screenshot: %s (%ux%u, %u bytes)%s\n", filename, width, height,
+                     (unsigned)png_len,
+                     saved ? " saved" : " -- NOT saved (no writable volume mounted) [#447]");
 }
 
 /* Persistent copies of the USB block path the sink writes through. The probe's

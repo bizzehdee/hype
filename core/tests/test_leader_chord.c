@@ -234,6 +234,69 @@ static void test_unrelated_extended_key_is_ignored_and_held_state_survives(void)
               HYPE_CHORD_ACTION_TOGGLE_DASHBOARD, result.action);
 }
 
+/* TERM-8 (#445): Print Screen's 4-byte make sequence `E0 2A E0 37`. */
+
+static void feed_printscreen_make(hype_chord_state_t *state) {
+    feed_extended(state, HYPE_SCANCODE_PRINTSCREEN_MAKE_1);
+    feed_extended(state, HYPE_SCANCODE_PRINTSCREEN_MAKE_2);
+}
+
+static void test_screenshot_chord(void) {
+    hype_chord_state_t state;
+    hype_chord_result_t result;
+
+    hype_chord_state_reset(&state);
+    hold_both_modifiers(&state);
+    feed_extended(&state, HYPE_SCANCODE_PRINTSCREEN_MAKE_1);
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_EXTENDED_PREFIX);
+    CHECK_HEX("E0 before the second half produces no action yet", HYPE_CHORD_ACTION_NONE,
+              result.action);
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_PRINTSCREEN_MAKE_2);
+    CHECK_HEX("Right-Ctrl+Right-Alt+PrtScn takes a screenshot", HYPE_CHORD_ACTION_SCREENSHOT,
+              result.action);
+}
+
+static void test_screenshot_without_both_modifiers_is_ignored(void) {
+    hype_chord_state_t state;
+    hype_chord_result_t result;
+
+    hype_chord_state_reset(&state);
+    feed_extended(&state, HYPE_SCANCODE_RIGHT_CTRL_MAKE); /* only one modifier */
+    feed_printscreen_make(&state);
+    result = hype_chord_feed_scancode(&state, 0);
+    CHECK_HEX("PrtScn with only right-ctrl held produces no action", HYPE_CHORD_ACTION_NONE,
+              result.action);
+}
+
+static void test_printscreen_second_half_alone_is_not_mistaken_for_the_chord(void) {
+    hype_chord_state_t state;
+    hype_chord_result_t result;
+
+    /* `E0 37` (keypad '*' extended) without the preceding `E0 2A` first -- must not fire,
+     * even with both modifiers held, since it is genuinely a different key. */
+    hype_chord_state_reset(&state);
+    hold_both_modifiers(&state);
+    feed_extended(&state, HYPE_SCANCODE_PRINTSCREEN_MAKE_2);
+    result = hype_chord_feed_scancode(&state, 0);
+    CHECK_HEX("E0 37 alone is not Print Screen", HYPE_CHORD_ACTION_NONE, result.action);
+}
+
+static void test_printscreen_sequence_interrupted_does_not_fire_later(void) {
+    hype_chord_state_t state;
+    hype_chord_result_t result;
+
+    hype_chord_state_reset(&state);
+    hold_both_modifiers(&state);
+    feed_extended(&state, HYPE_SCANCODE_PRINTSCREEN_MAKE_1); /* E0 2A: step armed */
+    /* Something else entirely arrives instead of the completing E0 37 -- the OSDev-
+     * documented sequence is atomic on real hardware, so this proves it aborts cleanly. */
+    hype_chord_feed_scancode(&state, HYPE_SCANCODE_D_MAKE); /* also fires TOGGLE_DASHBOARD */
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_EXTENDED_PREFIX);
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_PRINTSCREEN_MAKE_2);
+    CHECK_HEX("a stray E0 37 after an interruption does not fire a stale screenshot",
+              HYPE_CHORD_ACTION_NONE, result.action);
+}
+
 static void test_unrelated_plain_key_is_ignored_and_held_state_survives(void) {
     hype_chord_state_t state;
     hype_chord_result_t result;
@@ -263,6 +326,10 @@ int main(void) {
     test_break_code_of_action_key_produces_no_action();
     test_unrelated_extended_key_is_ignored_and_held_state_survives();
     test_unrelated_plain_key_is_ignored_and_held_state_survives();
+    test_screenshot_chord();
+    test_screenshot_without_both_modifiers_is_ignored();
+    test_printscreen_second_half_alone_is_not_mistaken_for_the_chord();
+    test_printscreen_sequence_interrupted_does_not_fire_later();
 
     if (failures == 0) {
         printf("all tests passed\n");

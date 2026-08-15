@@ -37,13 +37,25 @@
 #define HYPE_SCANCODE_1_MAKE            0x02u   /* no prefix; 1..9 == 0x02..0x0A */
 #define HYPE_SCANCODE_9_MAKE            0x0Au
 
+/*
+ * TERM-8 (#445): Print Screen is not a simple `0xE0 <byte>` key like every other action key
+ * here. Its make code is the FOUR-byte sequence `E0 2A E0 37` (break `E0 B7 E0 AA`) -- confirmed
+ * against the same reference tables as the constants above (vetra.com / OSDev's PS/2 Scan Code
+ * Set 1 tables), not assumed. The two E0-prefixed halves are `0x2A` then `0x37`; tracked via
+ * `printscreen_step` below since the existing single-byte `pending_extended` lookahead cannot
+ * span a second E0-prefixed byte.
+ */
+#define HYPE_SCANCODE_PRINTSCREEN_MAKE_1 0x2Au  /* E0 2A, first half of Print Screen's make */
+#define HYPE_SCANCODE_PRINTSCREEN_MAKE_2 0x37u  /* E0 37, second half */
+
 typedef enum {
     HYPE_CHORD_ACTION_NONE = 0,
     HYPE_CHORD_ACTION_TOGGLE_DASHBOARD,   /* Right-Ctrl+Right-Alt+D */
     HYPE_CHORD_ACTION_JUMP_TO_VM,         /* Right-Ctrl+Right-Alt+1..9; see vm_index */
     HYPE_CHORD_ACTION_CYCLE_PREV,         /* Right-Ctrl+Right-Alt+Left */
     HYPE_CHORD_ACTION_CYCLE_NEXT,         /* Right-Ctrl+Right-Alt+Right */
-    HYPE_CHORD_ACTION_RETURN_TO_DASHBOARD /* Right-Ctrl+Right-Alt+Esc */
+    HYPE_CHORD_ACTION_RETURN_TO_DASHBOARD, /* Right-Ctrl+Right-Alt+Esc */
+    HYPE_CHORD_ACTION_SCREENSHOT           /* Right-Ctrl+Right-Alt+Print Screen (TERM-8, #445) */
 } hype_chord_action_t;
 
 typedef struct {
@@ -55,6 +67,12 @@ typedef struct {
     int right_ctrl_held;
     int right_alt_held;
     int pending_extended; /* saw a bare 0xE0 prefix byte, next byte completes it */
+    /* TERM-8 (#445): progress through Print Screen's 4-byte make sequence `E0 2A E0 37`.
+     * 0 = nothing seen yet; 1 = just saw the `E0 2A` half, waiting for `E0 37`. Any other
+     * extended byte in between resets this to 0 -- a genuine Print Screen press is never
+     * interrupted by another key, since the make sequence is emitted atomically by real
+     * hardware. */
+    int printscreen_step;
 } hype_chord_state_t;
 
 void hype_chord_state_reset(hype_chord_state_t *state);

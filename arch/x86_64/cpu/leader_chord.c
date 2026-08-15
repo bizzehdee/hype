@@ -4,6 +4,7 @@ void hype_chord_state_reset(hype_chord_state_t *state) {
     state->right_ctrl_held = 0;
     state->right_alt_held = 0;
     state->pending_extended = 0;
+    state->printscreen_step = 0;
 }
 
 hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t byte) {
@@ -47,13 +48,41 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
                 return result;
             }
             return none;
+        case HYPE_SCANCODE_PRINTSCREEN_MAKE_1:
+            /* First half of `E0 2A E0 37` -- arm the second-half check below,
+             * regardless of any prior partial match (a fresh press always restarts it). */
+            state->printscreen_step = 1;
+            return none;
+        case HYPE_SCANCODE_PRINTSCREEN_MAKE_2:
+            if (state->printscreen_step == 1) {
+                state->printscreen_step = 0;
+                if (state->right_ctrl_held && state->right_alt_held) {
+                    result.action = HYPE_CHORD_ACTION_SCREENSHOT;
+                    result.vm_index = 0;
+                    return result;
+                }
+                return none;
+            }
+            /* `E0 37` without the preceding `E0 2A` this same press -- not Print Screen at
+             * all (0x37 alone, un-prefixed, is the keypad '*'; this is its extended cousin
+             * only in the specific two-byte sequence). Fall through as unrelated. */
+            state->printscreen_step = 0;
+            return none;
         default:
-            /* Every other extended-prefixed key (Left-Ctrl/Left-Alt have
-             * no 0xE0 prefix at all, so they never land here) is not
-             * part of the chord -- ignored, held-state untouched. */
+            /* Every other extended-prefixed key is not part of the chord -- ignored, held-
+             * state untouched. Also aborts a partial Print Screen match: the real sequence
+             * is emitted atomically by hardware, so anything else arriving mid-sequence
+             * means it was never Print Screen. */
+            state->printscreen_step = 0;
             return none;
         }
     }
+
+    /* A plain (non-extended) byte can only arrive here between the `E0 2A` and `E0 37`
+     * halves if something other than Print Screen is actually happening -- real hardware
+     * emits that sequence atomically. Abort any partial match rather than let a stray
+     * later `E0 37` fire on stale state. */
+    state->printscreen_step = 0;
 
     if (byte == HYPE_SCANCODE_D_MAKE) {
         if (state->right_ctrl_held && state->right_alt_held) {
