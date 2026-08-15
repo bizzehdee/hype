@@ -1631,6 +1631,256 @@ static void test_unknown_line_is_reported_with_its_comment(void) {
     CHECK_STR("reported as the operator wrote it", "bogus = 1 ; why", c.unknown_first);
 }
 
+/* ==================== CONFIG-3 (#221): serializer ==================== */
+
+static void test_serialize_round_trip_full_example(void) {
+    const char *cfg =
+        "[vm.win11]\n"
+        "vcpus = 4\n"
+        "cpu_set = 4-7\n"
+        "mem_mb = 8192\n"
+        "boot = installer\n"
+        "install_media = \\EFI\\hype\\win11.iso\n"
+        "target_disk = file:\\hype\\disks\\win11.img\n"
+        "target_disk_size_gb = 128\n"
+        "firmware = uefi\n"
+        "os_hint = windows\n"
+        "net_mode = nat\n"
+        "\n"
+        "[vm.debian]\n"
+        "vcpus = 2\n"
+        "mem_mb = 4096\n"
+        "boot = installer\n"
+        "install_media = \\EFI\\hype\\debian-netinst.iso\n"
+        "target_disk = physical:SN-WDC-1234567890\n"
+        "firmware = uefi\n"
+        "os_hint = linux\n"
+        "net_mode = nat\n"
+        "net_peers = freebsd\n"
+        "\n"
+        "[vm.freebsd]\n"
+        "vcpus = 2\n"
+        "mem_mb = 4096\n"
+        "boot = installer\n"
+        "install_media = \\EFI\\hype\\FreeBSD.iso\n"
+        "target_disk = file:\\hype\\disks\\freebsd.img\n"
+        "target_disk_size_gb = 64\n"
+        "firmware = uefi\n"
+        "os_hint = bsd\n"
+        "net_mode = nat\n";
+    hype_cfg_t before, after;
+    hype_cfg_serialize_result_t sr;
+    hype_cfg_result_t pr;
+    char buf[8192];
+
+    pr = parse_copy(cfg, &before);
+    CHECK_INT("original parses OK", HYPE_CFG_OK, pr.status);
+
+    sr = hype_cfg_serialize(&before, buf, sizeof(buf));
+    CHECK_INT("did not refuse", 0, sr.refused_overflow);
+    CHECK_INT("did not truncate", 0, sr.truncated);
+
+    pr = hype_cfg_parse(buf, &after);
+    CHECK_INT("serialized text re-parses OK", HYPE_CFG_OK, pr.status);
+    CHECK_INT("same VM count", (int)before.vm_count, (int)after.vm_count);
+
+    CHECK_STR("vm0 name survives", "win11", after.vms[0].name);
+    CHECK_INT("vm0 vcpus survives", 4, after.vms[0].vcpus);
+    CHECK_INT("vm0 cpu_set_count survives", 4, after.vms[0].cpu_set_count);
+    CHECK_INT("vm0 cpu_set[0] survives", 4, after.vms[0].cpu_set[0]);
+    CHECK_INT("vm0 cpu_set[3] survives", 7, after.vms[0].cpu_set[3]);
+    CHECK_INT("vm0 mem_mb survives", 8192, after.vms[0].mem_mb);
+    CHECK_STR("vm0 install_media survives", "\\EFI\\hype\\win11.iso", after.vms[0].install_media);
+    CHECK_INT("vm0 target_disk kind survives", (int)HYPE_CFG_DISK_FILE,
+              (int)after.vms[0].target_disk.kind);
+    CHECK_STR("vm0 target_disk path survives", "\\hype\\disks\\win11.img",
+              after.vms[0].target_disk.path_or_id);
+    CHECK_INT("vm0 target_disk_size_gb survives", 128, after.vms[0].target_disk_size_gb);
+    CHECK_INT("vm0 os_hint survives", (int)HYPE_CFG_OS_WINDOWS, (int)after.vms[0].os_hint);
+    CHECK_INT("vm0 net_mode survives", (int)HYPE_CFG_NET_NAT, (int)after.vms[0].net_mode);
+
+    CHECK_STR("vm1 name survives", "debian", after.vms[1].name);
+    CHECK_INT("vm1 target_disk kind physical survives", (int)HYPE_CFG_DISK_PHYSICAL,
+              (int)after.vms[1].target_disk.kind);
+    CHECK_STR("vm1 target_disk id survives", "SN-WDC-1234567890",
+              after.vms[1].target_disk.path_or_id);
+    CHECK_INT("vm1 net_peers_count survives", 1, after.vms[1].net_peers_count);
+    CHECK_STR("vm1 net_peers[0] survives", "freebsd", after.vms[1].net_peers[0]);
+    CHECK_INT("vm1 has_cpu_set stays false", 0, after.vms[1].has_cpu_set);
+
+    CHECK_STR("vm2 name survives", "freebsd", after.vms[2].name);
+    CHECK_INT("vm2 os_hint survives", (int)HYPE_CFG_OS_BSD, (int)after.vms[2].os_hint);
+}
+
+/* An edit lands as a struct-value change before serializing -- the whole reason CONFIG-3 exists is
+ * the GUI/TUI editing the in-memory model and saving it, not just re-emitting an unchanged parse. */
+static void test_serialize_reflects_an_in_memory_edit(void) {
+    hype_cfg_t before, after;
+    hype_cfg_serialize_result_t sr;
+    char buf[4096];
+
+    (void)parse_copy("[vm.a]\n" REQ, &before);
+    before.vms[0].mem_mb = 2048;
+    before.vms[0].vcpus = 4;
+
+    sr = hype_cfg_serialize(&before, buf, sizeof(buf));
+    CHECK_INT("did not refuse", 0, sr.refused_overflow);
+    (void)hype_cfg_parse(buf, &after);
+    CHECK_INT("edited mem_mb round-trips", 2048, after.vms[0].mem_mb);
+    CHECK_INT("edited vcpus round-trips", 4, after.vms[0].vcpus);
+}
+
+static void test_serialize_preserves_comments_section_order_and_unknown_content(void) {
+    const char *cfg =
+        "; a leading comment before any section\n"
+        "[hype]\n"
+        "config_version = 1\n"
+        "future_hype_key = surprise ; an unknown [hype] key, retained\n"
+        "[nic.eth0] ; an entirely unknown section kind\n"
+        "mode = bridge\n"
+        "[vm.a] ; trailing comment on a section header\n"
+        "; a comment inside the VM section\n"
+        REQ
+        "future_vm_key = 1 ; an unknown VM key\n";
+    hype_cfg_t before, after;
+    hype_cfg_serialize_result_t sr;
+    hype_cfg_result_t pr;
+    char buf[4096];
+
+    pr = parse_copy(cfg, &before);
+    CHECK_INT("parses OK (unknown content is retained, not fatal)", HYPE_CFG_OK, pr.status);
+    /* The unknown SECTION header itself counts too, alongside its one key and the two unknown
+     * keys inside known sections: [nic.eth0] + mode=bridge + future_hype_key + future_vm_key. */
+    CHECK_INT("four unknown lines counted", 4, (int)before.unknown_count);
+
+    sr = hype_cfg_serialize(&before, buf, sizeof(buf));
+    CHECK_INT("did not refuse", 0, sr.refused_overflow);
+    CHECK_INT("did not truncate", 0, sr.truncated);
+
+    CHECK_INT("leading comment survives", 1, strstr(buf, "; a leading comment before any section") != 0);
+    CHECK_INT("unknown [hype] key survives verbatim",
+              1, strstr(buf, "future_hype_key = surprise ; an unknown [hype] key, retained") != 0);
+    CHECK_INT("unknown section header survives",
+              1, strstr(buf, "[nic.eth0] ; an entirely unknown section kind") != 0);
+    CHECK_INT("unknown section's key survives", 1, strstr(buf, "mode = bridge") != 0);
+    CHECK_INT("VM section header comment survives",
+              1, strstr(buf, "[vm.a] ; trailing comment on a section header") != 0);
+    CHECK_INT("comment inside the VM section survives",
+              1, strstr(buf, "; a comment inside the VM section") != 0);
+    CHECK_INT("unknown VM key survives verbatim",
+              1, strstr(buf, "future_vm_key = 1 ; an unknown VM key") != 0);
+
+    /* Section order itself: [hype] before [nic.eth0] before [vm.a]. */
+    {
+        const char *p_hype = strstr(buf, "[hype]");
+        const char *p_nic = strstr(buf, "[nic.eth0]");
+        const char *p_vm = strstr(buf, "[vm.a]");
+        CHECK_INT("all three sections found", 1, p_hype != 0 && p_nic != 0 && p_vm != 0);
+        CHECK_INT("hype before nic", 1, p_hype < p_nic);
+        CHECK_INT("nic before vm", 1, p_nic < p_vm);
+    }
+
+    pr = hype_cfg_parse(buf, &after);
+    CHECK_INT("re-parses OK", HYPE_CFG_OK, pr.status);
+    CHECK_INT("same unknown-line count after round trip", 4, (int)after.unknown_count);
+}
+
+static void test_serialize_refuses_on_retained_overflow(void) {
+    hype_cfg_t c;
+    hype_cfg_serialize_result_t sr;
+    char buf[64];
+
+    (void)parse_copy("[vm.a]\n" REQ, &c);
+    c.retained_overflow = 1; /* simulate the original parse having lost content */
+    buf[0] = 'X'; /* poison, so "untouched" is distinguishable from "happens to be empty" */
+
+    sr = hype_cfg_serialize(&c, buf, sizeof(buf));
+    CHECK_INT("refuses rather than writing an incomplete file", 1, sr.refused_overflow);
+    CHECK_INT("out buffer left untouched", 'X', buf[0]);
+}
+
+static void test_serialize_truncation_is_reported_not_silent(void) {
+    hype_cfg_t c;
+    hype_cfg_serialize_result_t sr;
+    char tiny[8];
+
+    (void)parse_copy("[vm.a]\n" REQ, &c);
+    sr = hype_cfg_serialize(&c, tiny, sizeof(tiny));
+    CHECK_INT("a too-small buffer is reported truncated", 1, sr.truncated);
+}
+
+static void test_serialize_disk_section_round_trips_optional_fields(void) {
+    const char *cfg =
+        "[disk.sys]\n"
+        "type = disk\n"
+        "backing = file\n"
+        "path = \\hype\\disks\\a.img\n"
+        "format = qcow2\n"
+        "size_gb = 40\n"
+        "bus = virtio-blk\n"
+        "read_only = false\n"
+        "[disk.phys]\n"
+        "type = disk\n"
+        "backing = physical\n"
+        "id_match = SN-1234\n"
+        "allow_overwrite = true\n"
+        "partition = 2\n";
+    hype_cfg_t before, after;
+    hype_cfg_serialize_result_t sr;
+    char buf[4096];
+
+    (void)parse_copy(cfg, &before);
+    CHECK_INT("two disks parsed", 2, (int)before.disk_count);
+
+    sr = hype_cfg_serialize(&before, buf, sizeof(buf));
+    CHECK_INT("did not refuse", 0, sr.refused_overflow);
+    (void)hype_cfg_parse(buf, &after);
+
+    CHECK_INT("disk0 format survives", (int)HYPE_CFG_FORMAT_QCOW2, (int)after.disks[0].format);
+    CHECK_INT("disk0 size_gb survives", 40, after.disks[0].size_gb);
+    CHECK_INT("disk0 bus survives", (int)HYPE_CFG_BUS_VIRTIO_BLK, (int)after.disks[0].bus);
+    CHECK_STR("disk0 path survives", "\\hype\\disks\\a.img", after.disks[0].path);
+
+    CHECK_INT("disk1 backing physical survives", (int)HYPE_CFG_BACKING_PHYSICAL,
+              (int)after.disks[1].backing);
+    CHECK_STR("disk1 id_match survives", "SN-1234", after.disks[1].id_match);
+    CHECK_INT("disk1 allow_overwrite survives", 1, after.disks[1].allow_overwrite);
+    CHECK_INT("disk1 partition survives", 2, after.disks[1].partition);
+    /* disk1 never set `bus` -- HYPE_CFG_BUS_DEFAULT has no textual form, so the key must be
+     * omitted rather than emitted as something that would fail to reparse. */
+    CHECK_INT("disk1 bus stays default", (int)HYPE_CFG_BUS_DEFAULT, (int)after.disks[1].bus);
+}
+
+static void test_serialize_hype_section_lists(void) {
+    const char *cfg = "[hype]\n"
+                      "host_cpu_budget = 1-3\n"
+                      "default_net_mode = nat\n"
+                      "dashboard_default_view = vm:alpine\n"
+                      "autostart = alpine,beta\n"
+                      "[vm.alpine]\n" REQ "[vm.beta]\n" REQ;
+    hype_cfg_t before, after;
+    hype_cfg_serialize_result_t sr;
+    char buf[4096];
+
+    (void)parse_copy(cfg, &before);
+    sr = hype_cfg_serialize(&before, buf, sizeof(buf));
+    CHECK_INT("did not refuse", 0, sr.refused_overflow);
+    (void)hype_cfg_parse(buf, &after);
+
+    CHECK_INT("host_cpu_budget count survives (expanded)", 3, after.hype.host_cpu_budget_count);
+    CHECK_INT("host_cpu_budget[0] survives", 1, after.hype.host_cpu_budget[0]);
+    CHECK_INT("host_cpu_budget[2] survives", 3, after.hype.host_cpu_budget[2]);
+    CHECK_INT("default_net_mode survives", (int)HYPE_CFG_NET_NAT, (int)after.hype.default_net_mode);
+    CHECK_INT("dashboard_default_view survives", (int)HYPE_CFG_VIEW_VM,
+              (int)after.hype.dashboard_default_view);
+    CHECK_STR("dashboard_default_vm survives", "alpine", after.hype.dashboard_default_vm);
+    CHECK_INT("autostart survives as a list", (int)HYPE_CFG_AUTOSTART_LIST,
+              (int)after.hype.autostart);
+    CHECK_INT("autostart_count survives", 2, after.hype.autostart_count);
+    CHECK_STR("autostart_vms[0] survives", "alpine", after.hype.autostart_vms[0]);
+    CHECK_STR("autostart_vms[1] survives", "beta", after.hype.autostart_vms[1]);
+}
+
 int main(void) {
     test_label_from_the_spec_example_is_accepted();
     test_label_absent_leaves_an_empty_string();
@@ -1647,6 +1897,13 @@ int main(void) {
     test_first_unknown_line_is_named_with_its_number();
     test_no_unknown_lines_leaves_the_report_empty();
     test_unknown_line_is_reported_with_its_comment();
+    test_serialize_round_trip_full_example();
+    test_serialize_reflects_an_in_memory_edit();
+    test_serialize_preserves_comments_section_order_and_unknown_content();
+    test_serialize_refuses_on_retained_overflow();
+    test_serialize_truncation_is_reported_not_silent();
+    test_serialize_disk_section_round_trips_optional_fields();
+    test_serialize_hype_section_lists();
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
     test_full_example_from_plan();

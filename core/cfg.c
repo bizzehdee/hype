@@ -1,4 +1,5 @@
 #include "cfg.h"
+#include "format.h"
 #include "strutil.h"
 
 enum {
@@ -1339,4 +1340,306 @@ int hype_cfg_vm_has_target_disk(const hype_cfg_vm_t *vm) {
     /* A physical target is named by id/serial, a file target by path -- both land in path_or_id,
      * so its emptiness is the whole test. */
     return (vm->target_disk.path_or_id[0] != '\0') ? 1 : 0;
+}
+
+/* ==================== CONFIG-3 (#221): serializer ==================== */
+
+typedef struct {
+    char *buf;
+    unsigned int cap;
+    unsigned int len;
+    int truncated;
+} hype_cfg_w_t;
+
+static void w_init(hype_cfg_w_t *w, char *buf, unsigned int cap) {
+    w->buf = buf;
+    w->cap = cap;
+    w->len = 0;
+    w->truncated = 0;
+    if (cap > 0u) {
+        buf[0] = '\0';
+    }
+}
+
+static void w_raw(hype_cfg_w_t *w, const char *s, unsigned long long n) {
+    unsigned long long i;
+    if (w->truncated) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        if (w->len + 1u >= w->cap) {
+            w->truncated = 1;
+            return;
+        }
+        w->buf[w->len++] = s[i];
+    }
+    w->buf[w->len] = '\0';
+}
+
+static void w_str(hype_cfg_w_t *w, const char *s) {
+    w_raw(w, s, hype_strlen(s));
+}
+
+static void w_line(hype_cfg_w_t *w, const char *s) {
+    w_str(w, s);
+    w_str(w, "\n");
+}
+
+static void w_kv(hype_cfg_w_t *w, const char *key, const char *val) {
+    w_str(w, key);
+    w_str(w, " = ");
+    w_line(w, val);
+}
+
+static void w_kv_uint(hype_cfg_w_t *w, const char *key, unsigned int val) {
+    char tmp[24];
+    hype_snprintf(tmp, sizeof(tmp), "%u", val);
+    w_kv(w, key, tmp);
+}
+
+/* Comma-joins up to `count` NAME_MAX entries. A count of 0 emits nothing (an
+ * empty list has no textual form the parser accepts back -- see id_list_piece
+ * / cpu_set_piece, both of which reject an empty piece). */
+static void w_kv_list(hype_cfg_w_t *w, const char *key, const char (*items)[HYPE_CFG_NAME_MAX],
+                      unsigned int count) {
+    unsigned int i;
+    if (count == 0u) {
+        return;
+    }
+    w_str(w, key);
+    w_str(w, " = ");
+    for (i = 0; i < count; i++) {
+        if (i > 0u) {
+            w_str(w, ",");
+        }
+        w_str(w, items[i]);
+    }
+    w_str(w, "\n");
+}
+
+/*
+ * host_cpu_budget / cpu_set: written back as an expanded comma list ("1,2,3"),
+ * never the operator's original range notation ("1-3") -- the struct only
+ * ever stored the expanded set, so the range is not recoverable. Reparsing
+ * the expanded form yields the identical set, which is what round-trip
+ * correctness requires here (see hype_cfg_serialize's own header comment).
+ */
+static void w_kv_cpu_list(hype_cfg_w_t *w, const char *key, const unsigned int *cores,
+                          unsigned int count) {
+    unsigned int i;
+    char tmp[12];
+    if (count == 0u) {
+        return;
+    }
+    w_str(w, key);
+    w_str(w, " = ");
+    for (i = 0; i < count; i++) {
+        if (i > 0u) {
+            w_str(w, ",");
+        }
+        hype_snprintf(tmp, sizeof(tmp), "%u", cores[i]);
+        w_str(w, tmp);
+    }
+    w_str(w, "\n");
+}
+
+/* Emits every retained line still attached to `section` (-1 = before any section header), starting
+ * from *ri, advancing *ri past them. Relies on retained[] being in file order (the parser only ever
+ * appends), so a single forward pass over the whole array, resumed section by section, visits every
+ * entry exactly once. */
+static void serialize_retained_upto(hype_cfg_w_t *w, const hype_cfg_t *cfg, int section,
+                                    unsigned int *ri) {
+    while (*ri < cfg->retained_count && cfg->retained[*ri].section == section) {
+        w_line(w, cfg->retained[*ri].text);
+        (*ri)++;
+    }
+}
+
+static void serialize_hype(hype_cfg_w_t *w, const hype_cfg_hype_t *h) {
+    w_kv_uint(w, "config_version", h->config_version);
+    if (h->has_host_cpu_budget) {
+        w_kv_cpu_list(w, "host_cpu_budget", h->host_cpu_budget, h->host_cpu_budget_count);
+    }
+    w_kv(w, "default_net_mode", h->default_net_mode == HYPE_CFG_NET_NAT ? "nat" : "none");
+    if (h->dashboard_default_view == HYPE_CFG_VIEW_VM) {
+        char tmp[HYPE_CFG_NAME_MAX + 4];
+        hype_snprintf(tmp, sizeof(tmp), "vm:%s", h->dashboard_default_vm);
+        w_kv(w, "dashboard_default_view", tmp);
+    } else {
+        w_kv(w, "dashboard_default_view", "dashboard");
+    }
+    if (h->autostart == HYPE_CFG_AUTOSTART_NONE) {
+        w_kv(w, "autostart", "none");
+    } else if (h->autostart == HYPE_CFG_AUTOSTART_LIST) {
+        w_kv_list(w, "autostart", h->autostart_vms, h->autostart_count);
+    } else {
+        w_kv(w, "autostart", "all");
+    }
+}
+
+static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {
+    w_kv_uint(w, "vcpus", vm->vcpus);
+    if (vm->has_cpu_set) {
+        w_kv_cpu_list(w, "cpu_set", vm->cpu_set, vm->cpu_set_count);
+    }
+    w_kv_uint(w, "mem_mb", vm->mem_mb);
+    w_kv(w, "boot", vm->boot == HYPE_CFG_BOOT_DISK ? "disk" : "installer");
+    if (vm->has_install_media) {
+        w_kv(w, "install_media", vm->install_media);
+    }
+    if (vm->has_media_disk) {
+        w_kv(w, "media_disk", vm->media_disk);
+    }
+    /* target_disk and disks/cdroms are mutually exclusive (validate_required, §7) -- exactly one
+     * of these two branches ever has anything to emit for a VM that passed validation. */
+    if (hype_cfg_vm_has_target_disk(vm)) {
+        char tmp[HYPE_CFG_PATH_MAX + 10];
+        hype_snprintf(tmp, sizeof(tmp), "%s:%s",
+                     vm->target_disk.kind == HYPE_CFG_DISK_PHYSICAL ? "physical" : "file",
+                     vm->target_disk.path_or_id);
+        w_kv(w, "target_disk", tmp);
+        if (vm->target_disk.partition == 0u) {
+            w_kv(w, "partition", "whole");
+        } else {
+            w_kv_uint(w, "partition", vm->target_disk.partition);
+        }
+        if (vm->target_disk.allow_overwrite) {
+            w_kv(w, "allow_overwrite", "true");
+        }
+        if (vm->has_target_disk_size_gb) {
+            w_kv_uint(w, "target_disk_size_gb", vm->target_disk_size_gb);
+        }
+    } else {
+        if (vm->disks_count > 0u) {
+            w_kv_list(w, "disks", vm->disks, vm->disks_count);
+        }
+        if (vm->cdroms_count > 0u) {
+            w_kv_list(w, "cdroms", vm->cdroms, vm->cdroms_count);
+        }
+    }
+    if (vm->boot_order_count > 0u) {
+        w_kv_list(w, "boot_order", vm->boot_order, vm->boot_order_count);
+    }
+    w_kv(w, "firmware", vm->firmware == HYPE_CFG_FW_LEGACY ? "legacy" : "uefi");
+    if (vm->label[0] != '\0') {
+        w_kv(w, "label", vm->label);
+    }
+    {
+        const char *oh = "none";
+        if (vm->os_hint == HYPE_CFG_OS_WINDOWS) {
+            oh = "windows";
+        } else if (vm->os_hint == HYPE_CFG_OS_LINUX) {
+            oh = "linux";
+        } else if (vm->os_hint == HYPE_CFG_OS_BSD) {
+            oh = "bsd";
+        }
+        w_kv(w, "os_hint", oh);
+    }
+    w_kv(w, "net_mode", vm->net_mode == HYPE_CFG_NET_NAT ? "nat" : "none");
+    if (vm->net_peers_count > 0u) {
+        w_kv_list(w, "net_peers", vm->net_peers, vm->net_peers_count);
+    }
+}
+
+/* NULL for HYPE_CFG_BUS_DEFAULT: that sentinel has no textual form the parser accepts (§5.6 derives
+ * it from the owning VM's os_hint at resolve time, not at parse time -- see the enum's own header
+ * comment), so a device left at the default must have its `bus` key OMITTED entirely rather than
+ * writing a value that would fail to reparse. */
+static const char *disk_bus_str(hype_cfg_bus_t bus) {
+    switch (bus) {
+        case HYPE_CFG_BUS_VIRTIO_BLK: return "virtio-blk";
+        case HYPE_CFG_BUS_AHCI_SATA: return "ahci-sata";
+        case HYPE_CFG_BUS_NVME: return "nvme";
+        case HYPE_CFG_BUS_AHCI_ATAPI: return "ahci-atapi";
+        default: return 0;
+    }
+}
+
+static void serialize_disk(hype_cfg_w_t *w, const hype_cfg_disk_t *d) {
+    w_kv(w, "type", d->type == HYPE_CFG_DISK_TYPE_CDROM ? "cdrom" : "disk");
+    w_kv(w, "backing", d->backing == HYPE_CFG_BACKING_PHYSICAL ? "physical" : "file");
+    if (d->has_path) {
+        w_kv(w, "path", d->path);
+    }
+    if (d->has_source_disk) {
+        w_kv(w, "source_disk", d->source_disk);
+    }
+    if (d->has_id_match) {
+        w_kv(w, "id_match", d->id_match);
+    }
+    if (d->has_format) {
+        w_kv(w, "format", d->format == HYPE_CFG_FORMAT_QCOW2 ? "qcow2" : "raw");
+    }
+    if (d->has_size_gb) {
+        w_kv_uint(w, "size_gb", d->size_gb);
+    }
+    if (d->partition == 0u) {
+        w_kv(w, "partition", "whole");
+    } else {
+        w_kv_uint(w, "partition", d->partition);
+    }
+    {
+        const char *bs = disk_bus_str(d->bus);
+        if (bs != 0) {
+            w_kv(w, "bus", bs);
+        }
+    }
+    if (d->has_read_only) {
+        w_kv(w, "read_only", d->read_only ? "true" : "false");
+    }
+    /* Meaningful only for a physical target (plan.md §10 decision #8's destructive-write guard);
+     * a file backing that somehow had it set (not reachable through the parser today) still round-
+     * trips correctly by omission, since `allow_overwrite`'s only consumer is the physical path. */
+    if (d->backing == HYPE_CFG_BACKING_PHYSICAL && d->allow_overwrite) {
+        w_kv(w, "allow_overwrite", "true");
+    }
+}
+
+hype_cfg_serialize_result_t hype_cfg_serialize(const hype_cfg_t *cfg, char *out,
+                                               unsigned int out_cap) {
+    hype_cfg_serialize_result_t res;
+    hype_cfg_w_t w;
+    unsigned int ri = 0;
+    unsigned int si;
+
+    res.len = 0;
+    res.truncated = 0;
+    res.refused_overflow = 0;
+
+    if (cfg->retained_overflow) {
+        /* §8: some of the ORIGINAL file's content never made it into `cfg` at all -- writing back
+         * would silently delete it. Refuse rather than produce a file that looks complete. */
+        res.refused_overflow = 1;
+        return res;
+    }
+
+    w_init(&w, out, out_cap);
+
+    serialize_retained_upto(&w, cfg, -1, &ri);
+
+    for (si = 0; si < cfg->section_count; si++) {
+        const hype_cfg_section_t *sec = &cfg->sections[si];
+        w_line(&w, sec->raw);
+        switch (sec->kind) {
+            case HYPE_CFG_SECTION_HYPE:
+                serialize_hype(&w, &cfg->hype);
+                break;
+            case HYPE_CFG_SECTION_VM:
+                serialize_vm(&w, &cfg->vms[sec->index]);
+                break;
+            case HYPE_CFG_SECTION_DISK:
+                serialize_disk(&w, &cfg->disks[sec->index]);
+                break;
+            case HYPE_CFG_SECTION_UNKNOWN:
+            default:
+                /* An unknown section's entire content lives in retained[] -- there is nothing
+                 * else to emit; the loop below still re-emits its retained lines. */
+                break;
+        }
+        serialize_retained_upto(&w, cfg, (int)si, &ri);
+    }
+
+    res.len = w.len;
+    res.truncated = w.truncated;
+    return res;
 }

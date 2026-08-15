@@ -430,7 +430,48 @@ typedef struct {
  */
 hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out);
 
+/*
+ * CONFIG-3 (#221): serialize `cfg` back into `hype.cfg` text, for the GUI/TUI
+ * dashboard to persist a runtime edit (mem, vcpus, net, boot=installer->disk,
+ * attach/detach a disk, ...) across a host reboot.
+ *
+ * Lossless round-trip is scoped exactly as docs/hype-cfg-spec.md §8 promises:
+ * section order, comments, and unknown keys/sections the parser RETAINED are
+ * reproduced verbatim (so an older hype editing a newer one's config, or vice
+ * versa, cannot silently drop content it does not understand). Every KNOWN
+ * field is re-emitted from its CURRENT struct value in a fixed, canonical
+ * form -- not the operator's original spelling/whitespace/notation (e.g. a
+ * `host_cpu_budget = 1-6` range is written back as the expanded list
+ * `1,2,3,4,5,6`) and not necessarily the original line order relative to that
+ * section's own comments, since the parser does not track where among the
+ * known keys each comment/unknown line originally sat, only their order
+ * relative to EACH OTHER within that section. Re-parsing the output always
+ * recovers the same VALUES; it does not guarantee byte-identical text.
+ *
+ * Refuses to serialize (returns .refused_overflow = 1, `out` left untouched)
+ * when `cfg->retained_overflow` is set: that flag means some retained content
+ * from the ORIGINAL parse never made it into `cfg` at all (too many
+ * lines/sections, or a truncated line), so writing back would silently
+ * delete content the parser could not even capture, which is worse than
+ * refusing to save. The caller decides what "refuse to save" means at its
+ * own layer (dashboard error, keep the in-memory edit unpersisted, ...).
+ *
+ * `out_cap` bounds the output buffer; `.truncated` is set (and `out`'s
+ * content is NOT a valid, complete config -- do not write it to disk) if the
+ * serialized text would not fit. Sizing guidance: HYPE_CFG_MAX_SECTIONS
+ * sections, HYPE_CFG_MAX_RETAINED retained lines at up to HYPE_CFG_LINE_MAX
+ * bytes each, plus every known field of up to HYPE_CFG_MAX_VMS VMs and
+ * HYPE_CFG_MAX_DISKS disks -- a 64 KiB buffer comfortably covers the
+ * structure's own maximums.
+ */
+typedef struct {
+    unsigned int len;     /* bytes written into `out`, excluding the NUL terminator */
+    int truncated;        /* 1 if out_cap was too small; `out`'s content must not be used */
+    int refused_overflow; /* 1 if cfg->retained_overflow was set; `out` is untouched */
+} hype_cfg_serialize_result_t;
 
+hype_cfg_serialize_result_t hype_cfg_serialize(const hype_cfg_t *cfg, char *out,
+                                               unsigned int out_cap);
 
 
 /*
