@@ -781,6 +781,10 @@ typedef struct hype_fw_vm {
      * VM Start can restore fresh firmware -- post-ExitBootServices the ESP file
      * I/O that first loaded it is gone, so it cannot be re-read from disk. */
     uint64_t fw_pristine_host_phys;
+    /* #441: last TSC this VM's varstore content was saved to disk (0 = never). Rate-limits the
+     * periodic save in fw_1_publish_and_render() to roughly once every few seconds, since it is
+     * called on every VM exit and a real disk write on every exit would be pathological. */
+    uint64_t vars_last_save_tsc;
     hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
     hype_scancode_queue_t host_ps2_queue; /* #375: BSP producer, this VM's core consumer */
     unsigned long long host_ps2_irqs;
@@ -7980,6 +7984,12 @@ static __attribute__((noinline)) void fw_1_hpet_step(hype_fw_vm_t *vm, hype_vcpu
  * window needs it even earlier, in fw_1_publish_and_render() immediately below. */
 static hype_cfg_t g_hype_cfg;
 
+/* #441: defined further down (needs g_hype_log, declared later) -- forward-declared here so the
+ * periodic checkpoint in fw_1_publish_and_render() and the restore points in fw_1_vm_reinit() /
+ * the initial FW-1 setup can all call it. */
+static void fw_1_save_vars(hype_fw_vm_t *vm);
+static void fw_1_load_saved_vars(hype_fw_vm_t *vm);
+
 static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_tsc,
                                     uint64_t perf_boot_start_tsc,
                                     uint64_t perf_hlt_wait_tsc, uint64_t total_exits,
@@ -8019,6 +8029,19 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
                            (uint64_t)g_hype_cfg.hype.cpu_avg_window_secs * g_fw_1_host_tsc_hz);
         vm->stat_cpu_pct = hype_vm_cpu_pct(&vm->cpu_acc);
         (void)idle_pct;
+
+        /*
+         * #441: periodic varstore checkpoint. hype has no notification before a host power
+         * loss/reboot, so "save once at a clean shutdown" cannot be the only mechanism -- this
+         * is called on every VM exit, far too often for a real disk write, so it is rate-
+         * limited to roughly once every 5 seconds per VM.
+         */
+        if (g_fw_1_host_tsc_hz != 0 &&
+            (vm->vars_last_save_tsc == 0 ||
+             now_gf - vm->vars_last_save_tsc >= g_fw_1_host_tsc_hz * 5u)) {
+            fw_1_save_vars(vm);
+            vm->vars_last_save_tsc = now_gf;
+        }
     }
 
     if (*last_gop_flush_tsc != 0 && now_gf - *last_gop_flush_tsc < g_fw_1_host_tsc_hz / 60u) {
@@ -10047,10 +10070,36 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     uint64_t stack_top = (uint64_t)(uintptr_t)(g_fw_1_guest_stack + sizeof(g_fw_1_guest_stack));
     uint64_t npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
 
+    /*
+     * M8-1: per-VM dashboard identity, moved to the TOP of this function (#441) -- the varstore
+     * save/restore immediately below needs vm->name for its per-VM filename, and this is the
+     * first point in fw_1_vm_reinit() it is available (this is also where it is first assigned
+     * at all: the initial FW-1 setup does not go through this function, only a genuine (re)start
+     * does). No cfg->runtime wiring exists yet for mem/ISO, so those still mirror the current
+     * single-Linux-guest reality; multi-OS/config-driven values come with the config->VM
+     * plumbing (tracked separately).
+     */
+    {
+        unsigned int vm_index = (unsigned int)(vm - g_vms);
+        vm->name = (vm_index < g_hype_cfg.vm_count && g_hype_cfg.vms[vm_index].name[0] != '\0')
+                       ? g_hype_cfg.vms[vm_index].name
+                       : ((vm_index == 0u) ? "vm0" : "vm1");
+    }
+
+    /*
+     * #441: capture whatever this VM's varstore held from its LAST run before the pristine
+     * restore below discards it -- this is the one point a Stop-then-Start is guaranteed to
+     * pass through, so it catches the common case immediately rather than waiting for the next
+     * periodic checkpoint.
+     */
+    fw_1_save_vars(vm);
     if (vm->fw_pristine_host_phys != 0) {
         hype_guest_ram_copy((void *)(uintptr_t)g_fw_1_combined_host_phys,
                             (const void *)(uintptr_t)vm->fw_pristine_host_phys, g_fw_1_combined_size);
     }
+    /* #441: then overlay any PREVIOUSLY saved varstore on top of the fresh pristine copy, so
+     * this VM resumes with its own persisted NVRAM state rather than the pristine one. */
+    fw_1_load_saved_vars(vm);
     hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
     hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
 
@@ -10250,16 +10299,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * cell per glyph). If there's no GOP (serial-only host), it clamps to 1x1
      * and is simply never rendered. */
     hype_vt_screen_init(&vm->term, g_gop_console.cols, g_gop_console.rows);
-    /* M8-1: per-VM dashboard identity. No cfg->runtime wiring exists yet
-     * (mem is a compile constant, ISO a single global), so these mirror the
-     * current single-Linux-guest reality; multi-OS/config-driven values come
-     * with the config->VM plumbing (tracked separately). */
+    /*
+     * M8-1: per-VM dashboard identity -- was missing from this copy of the setup sequence
+     * entirely (found while wiring #441: fw_1_vm_reinit() has this assignment, run_fw_1_test(),
+     * the genuinely-first-launch path, did not, leaving vm->name unset -- an empty string, since
+     * g_vms is zero-allocated -- until the first real restart ever ran fw_1_vm_reinit). #441's
+     * per-VM varstore filename needs a real name on the very first launch too, which is what
+     * surfaced this.
+     */
     {
         unsigned int vm_index = (unsigned int)(vm - g_vms);
         vm->name = (vm_index < g_hype_cfg.vm_count && g_hype_cfg.vms[vm_index].name[0] != '\0')
                        ? g_hype_cfg.vms[vm_index].name
                        : ((vm_index == 0u) ? "vm0" : "vm1");
     }
+    /*
+     * #441: restore this VM's previously-saved varstore, if any -- the host-reboot case (a
+     * genuinely fresh launch, not a Start-from-OFF restart, so fw_1_vm_reinit()'s own restore
+     * point never runs for it). Best-effort like every other use of g_hype_log: if the log
+     * sink isn't mounted yet at this point in boot, this is a silent no-op and the VM starts
+     * from the pristine varstore -- no worse than before #441 existed.
+     */
+    fw_1_load_saved_vars(vm);
     /* #357: the display name from `label`, kept OFF vm->name -- see the field comments. This is the
      * "no cfg->runtime wiring exists yet" note above, closed for the display name only. */
     vm->label = fw_1_resolve_vm_label(vm);
@@ -16965,6 +17026,70 @@ static hype_log_sink_t g_hype_log;
 static int g_hype_log_ready;
 static hype_log_sink_t *g_vm_log;
 static int *g_vm_log_ready;
+
+/*
+ * #441: persist a VM's varstore (the OVMF_VARS.fd content living inside its combined firmware
+ * buffer) across restarts -- VM-level and, via the periodic checkpoint, host-level too.
+ *
+ * The combined buffer is [pad][VARS][CODE], `combined_size` bytes total, where CODE is
+ * `code_size` bytes and VARS is `vars_size` bytes; `code_size`/`vars_size` are exactly what was
+ * read from \EFI\hype\OVMF_CODE.fd/OVMF_VARS.fd, so the VARS region sits at offset
+ * `combined_size - (code_size + vars_size)`, `vars_size` bytes long (see the initial FW-1 setup,
+ * which loads VARS then CODE back-to-back at the END of the mapped/padded buffer).
+ *
+ * Best-effort, same limitation as TERM-7/TERM-8's own saves (#447): only when g_hype_log's
+ * volume happens to be mounted. A generous static buffer bounds the load side (OVMF_VARS.fd is
+ * ~528 KiB in this project's own fw/ tree; 2 MiB covers every OVMF variant with headroom).
+ */
+#define HYPE_FW_1_VARS_LOAD_BUF_MAX (2u * 1024u * 1024u)
+
+static int fw_1_vars_region(const hype_fw_vm_t *vm, uint64_t *out_offset, uint64_t *out_len) {
+    if (vm->combined_size == 0u || vm->vars_size == 0u ||
+        vm->code_size + vm->vars_size > vm->combined_size) {
+        return -1;
+    }
+    *out_offset = vm->combined_size - (vm->code_size + vm->vars_size);
+    *out_len = vm->vars_size;
+    return 0;
+}
+
+static void fw_1_save_vars(hype_fw_vm_t *vm) {
+    uint64_t offset, len;
+    char path[48];
+    hype_fs_file_t f;
+
+    if (!g_hype_log_ready || vm->combined_host_phys == 0 ||
+        fw_1_vars_region(vm, &offset, &len) != 0) {
+        return;
+    }
+    hype_snprintf(path, sizeof(path), "vars-%s.bin", vm->name);
+    if (hype_fs_create(&g_hype_log.fs, path, &f) == 0) {
+        (void)hype_fs_write_at(&f, 0, (const void *)(uintptr_t)(vm->combined_host_phys + offset),
+                               (unsigned int)len);
+    }
+}
+
+static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
+    static uint8_t g_vars_load_buf[HYPE_FW_1_VARS_LOAD_BUF_MAX];
+    uint64_t offset, len;
+    char path[48];
+    hype_fs_file_t f;
+
+    if (!g_hype_log_ready || vm->combined_host_phys == 0 ||
+        fw_1_vars_region(vm, &offset, &len) != 0 || len > sizeof(g_vars_load_buf)) {
+        return;
+    }
+    hype_snprintf(path, sizeof(path), "vars-%s.bin", vm->name);
+    /* hype_fs_lookup() confirms both existence and size before any read -- a file that exists
+     * but is the wrong size (a stale save from a differently-sized OVMF_VARS.fd, say) is treated
+     * as absent rather than partially applied. */
+    if (hype_fs_lookup(&g_hype_log.fs, path, &f) == 0 && f.size == len) {
+        if (hype_fs_read_at(&f, 0, g_vars_load_buf, (unsigned int)len) == 0) {
+            hype_guest_ram_copy((void *)(uintptr_t)(vm->combined_host_phys + offset),
+                                g_vars_load_buf, len);
+        }
+    }
+}
 
 /*
  * TERM-7 (#443): `resolution` -- list available GOP modes, show the current setting, or apply
