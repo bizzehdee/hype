@@ -785,6 +785,27 @@ typedef struct hype_fw_vm {
      * periodic save in fw_1_publish_and_render() to roughly once every few seconds, since it is
      * called on every VM exit and a real disk write on every exit would be pathological. */
     uint64_t vars_last_save_tsc;
+    /*
+     * #454: varstore I/O request this VM's core has posted to the BSP.
+     *
+     * Only the BSP may touch the shared FAT/xHCI state (#239), and under
+     * HYPE_RUN_GUEST_ON_AP -- the default -- every varstore call site runs on
+     * this VM's own AP core, so the #441 guard made save/load permanent no-ops.
+     * The AP posts here instead and fw_1_vars_service() runs it on the BSP,
+     * next to the log flush that already owns that path.
+     *
+     * `req` is the pending kind (HYPE_FW_VARS_REQ_*); `req_seq` counts requests
+     * posted and `req_done_seq` counts requests completed, so a caller that has
+     * to wait for its own request compares the two rather than racing a flag
+     * that the next request could re-arm.
+     */
+    volatile uint32_t vars_req;
+    volatile uint32_t vars_req_seq;
+    volatile uint32_t vars_req_done_seq;
+    /* #441/#454: one-shot report latches, so the periodic checkpoint says whether it works
+     * exactly once per VM instead of every few seconds. */
+    int vars_save_failed;
+    int vars_save_reported;
     hype_ps2_kbd_t ps2;       /* FW-1f: guest PS/2 keyboard -- OVMF's ConIn */
     hype_scancode_queue_t host_ps2_queue; /* #375: BSP producer, this VM's core consumer */
     unsigned long long host_ps2_irqs;
@@ -8050,9 +8071,30 @@ static hype_cfg_t g_hype_cfg;
 
 /* #441: defined further down (needs g_hype_log, declared later) -- forward-declared here so the
  * periodic checkpoint in fw_1_publish_and_render() and the restore points in fw_1_vm_reinit() /
- * the initial FW-1 setup can all call it. */
+ * the initial FW-1 setup can all call it.
+ *
+ * #454: these two do the actual file I/O and must run on the BSP. Callers use
+ * fw_1_vars_request() below instead, which runs them inline when the caller IS the BSP and
+ * otherwise posts the work to it. */
 static void fw_1_save_vars(hype_fw_vm_t *vm);
 static void fw_1_load_saved_vars(hype_fw_vm_t *vm);
+
+/* #454: varstore request kinds, in vm->vars_req. */
+#define HYPE_FW_VARS_REQ_NONE 0u
+#define HYPE_FW_VARS_REQ_SAVE 1u
+#define HYPE_FW_VARS_REQ_LOAD 2u
+
+/*
+ * #454: how long a caller that needs its request finished before continuing will wait for the
+ * BSP to service it, in milliseconds. The BSP's flush cadence is well under this; the bound
+ * exists so a BSP that is wedged (or a guest core that reaches a restore point before the BSP's
+ * loop is even running) degrades to "varstore not persisted this time" instead of hanging the
+ * VM forever, which is exactly the failure #441's own guard was added to avoid.
+ */
+#define HYPE_FW_VARS_WAIT_MS 2000u
+
+static void fw_1_vars_request(hype_fw_vm_t *vm, uint32_t kind, int wait);
+static void fw_1_vars_service(void);
 
 static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_tsc,
                                     uint64_t perf_boot_start_tsc,
@@ -8103,7 +8145,7 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
         if (g_fw_1_host_tsc_hz != 0 &&
             (vm->vars_last_save_tsc == 0 ||
              now_gf - vm->vars_last_save_tsc >= g_fw_1_host_tsc_hz * 5u)) {
-            fw_1_save_vars(vm);
+            fw_1_vars_request(vm, HYPE_FW_VARS_REQ_SAVE, 0); /* #454: fire-and-forget */
             vm->vars_last_save_tsc = now_gf;
         }
     }
@@ -10156,14 +10198,14 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
      * pass through, so it catches the common case immediately rather than waiting for the next
      * periodic checkpoint.
      */
-    fw_1_save_vars(vm);
+    fw_1_vars_request(vm, HYPE_FW_VARS_REQ_SAVE, 1); /* #454: must finish before the overwrite */
     if (vm->fw_pristine_host_phys != 0) {
         hype_guest_ram_copy((void *)(uintptr_t)g_fw_1_combined_host_phys,
                             (const void *)(uintptr_t)vm->fw_pristine_host_phys, g_fw_1_combined_size);
     }
     /* #441: then overlay any PREVIOUSLY saved varstore on top of the fresh pristine copy, so
      * this VM resumes with its own persisted NVRAM state rather than the pristine one. */
-    fw_1_load_saved_vars(vm);
+    fw_1_vars_request(vm, HYPE_FW_VARS_REQ_LOAD, 1); /* #454: must finish before the VM resumes */
     hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
     hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
 
@@ -10384,7 +10426,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * sink isn't mounted yet at this point in boot, this is a silent no-op and the VM starts
      * from the pristine varstore -- no worse than before #441 existed.
      */
-    fw_1_load_saved_vars(vm);
+    fw_1_vars_request(vm, HYPE_FW_VARS_REQ_LOAD, 1); /* #454: must finish before the VM launches */
     /* #357: the display name from `label`, kept OFF vm->name -- see the field comments. This is the
      * "no cfg->runtime wiring exists yet" note above, closed for the display name only. */
     vm->label = fw_1_resolve_vm_label(vm);
@@ -17157,15 +17199,41 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
     uint64_t offset, len;
     char path[48];
     hype_fs_file_t f;
+    int have = 0;
+    int rc;
 
     if (!usb_log_this_core_owns_usb() || !g_hype_log_ready || vm->combined_host_phys == 0 ||
         fw_1_vars_region(vm, &offset, &len) != 0) {
         return;
     }
     hype_snprintf(path, sizeof(path), "vars-%s.bin", vm->name);
-    if (hype_fs_create(&g_hype_log.fs, path, &f) == 0) {
-        (void)hype_fs_write_at(&f, 0, (const void *)(uintptr_t)(vm->combined_host_phys + offset),
-                               (unsigned int)len);
+    /* #454: reuse an existing correctly-sized file so the steady-state checkpoint is a pure
+     * in-place data write -- the #204/#199 discipline. Only the first save of a run (or one after
+     * the varstore size changed) allocates, and only then does it touch FAT metadata. */
+    if (hype_fs_lookup(&g_hype_log.fs, path, &f) == 0 && f.size == len) {
+        have = 1;
+    } else if (hype_fs_create(&g_hype_log.fs, path, &f) == 0) {
+        have = 1;
+    }
+    if (!have) {
+        return;
+    }
+    rc = hype_fs_write_at(&f, 0, (const void *)(uintptr_t)(vm->combined_host_phys + offset),
+                          (unsigned int)len);
+    /*
+     * #454: report the first failure per VM. A silent failure here is indistinguishable from
+     * working persistence right up until a guest's boot entries turn out to be gone -- the same
+     * misread usb_log_flush_limit() already refuses to allow. Reported once because the periodic
+     * checkpoint repeats every few seconds.
+     */
+    if (rc != 0 && !vm->vars_save_failed) {
+        vm->vars_save_failed = 1;
+        hype_debug_print("fw-1 VARS: %s write failed (%llu bytes) -- NVRAM will not persist for "
+                         "this VM [#441]\n", path, (unsigned long long)len);
+    } else if (rc == 0 && !vm->vars_save_reported) {
+        vm->vars_save_reported = 1;
+        hype_debug_print("fw-1 VARS: %s saved (%llu bytes) [#441]\n", path,
+                         (unsigned long long)len);
     }
 }
 
@@ -17187,7 +17255,96 @@ static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
         if (hype_fs_read_at(&f, 0, g_vars_load_buf, (unsigned int)len) == 0) {
             hype_guest_ram_copy((void *)(uintptr_t)(vm->combined_host_phys + offset),
                                 g_vars_load_buf, len);
+            hype_debug_print("fw-1 VARS: %s restored (%llu bytes) [#441]\n", path,
+                             (unsigned long long)len);
         }
+    }
+}
+
+/*
+ * #454: run any varstore request a guest core has posted. Called from the BSP's own loop, right
+ * next to usb_log_flush_slice() -- the same core, the same cadence, and the same ownership of the
+ * shared FAT/xHCI state that #239 established.
+ *
+ * The seq/done_seq pair is published in that order (work, then done_seq) so a waiter that sees
+ * its own sequence completed is guaranteed the file I/O behind it has already happened.
+ */
+static void fw_1_vars_service(void) {
+    unsigned int i;
+
+    if (!usb_log_this_core_owns_usb()) {
+        return;
+    }
+    for (i = 0; i < HYPE_FW_MAX_VMS; i++) {
+        hype_fw_vm_t *vm = &g_vms[i];
+        uint32_t kind = vm->vars_req;
+        uint32_t seq;
+
+        if (kind == HYPE_FW_VARS_REQ_NONE) {
+            continue;
+        }
+        seq = vm->vars_req_seq;
+        vm->vars_req = HYPE_FW_VARS_REQ_NONE;
+        if (kind == HYPE_FW_VARS_REQ_SAVE) {
+            fw_1_save_vars(vm);
+        } else {
+            fw_1_load_saved_vars(vm);
+        }
+        vm->vars_req_done_seq = seq;
+    }
+}
+
+/*
+ * #454: ask for a varstore save or load.
+ *
+ * On the BSP this just does the work inline -- no queue, no wait, and the pre-MP boot path (where
+ * the BSP is the only core running and its service loop does not exist yet) keeps working.
+ *
+ * On a guest AP the work is posted for fw_1_vars_service(). `wait` says whether the caller can
+ * continue before it completes: the periodic checkpoint cannot (it would stall the guest every
+ * five seconds), but the restore points in fw_1_vm_reinit() and the initial launch must, because
+ * the save has to land before the pristine firmware overwrites it and the load has to land before
+ * the guest reads its own NVRAM. The wait is bounded -- see HYPE_FW_VARS_WAIT_MS.
+ */
+static void fw_1_vars_request(hype_fw_vm_t *vm, uint32_t kind, int wait) {
+    uint32_t seq;
+    uint64_t deadline;
+    uint64_t hz;
+
+    if (usb_log_this_core_owns_usb()) {
+        if (kind == HYPE_FW_VARS_REQ_SAVE) {
+            fw_1_save_vars(vm);
+        } else {
+            fw_1_load_saved_vars(vm);
+        }
+        return;
+    }
+
+    seq = vm->vars_req_seq + 1u;
+    vm->vars_req_seq = seq;
+    vm->vars_req = kind;
+    if (!wait) {
+        return;
+    }
+
+    /* No calibrated TSC yet means no way to bound the wait, and the BSP's loop is not running
+     * that early either -- so do not wait at all rather than spin unbounded. */
+    hz = vm->host_tsc_hz;
+    if (hz == 0) {
+        return;
+    }
+    deadline = hype_rdtsc() + (hz / 1000u) * HYPE_FW_VARS_WAIT_MS;
+    while ((int32_t)(vm->vars_req_done_seq - seq) < 0) {
+        if (hype_rdtsc() >= deadline) {
+            /* Abandon the request rather than leaving it queued: by the time the BSP got to it
+             * the guest would already have moved past the point where applying it is correct. */
+            vm->vars_req = HYPE_FW_VARS_REQ_NONE;
+            hype_debug_print("fw-1 VARS: %s for %s timed out waiting for the BSP -- varstore not "
+                             "persisted this cycle [#454]\n",
+                             (kind == HYPE_FW_VARS_REQ_SAVE) ? "save" : "load", vm->name);
+            return;
+        }
+        __asm__ __volatile__("pause" ::: "memory");
     }
 }
 
@@ -20826,6 +20983,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     }
                 }
             }
+            /*
+             * #454: service any varstore save/load a guest core has posted. Deliberately OUTSIDE
+             * the log-drain gate below: that only fires when there is log data to write, and a
+             * quiet run would otherwise leave a waiting VM spinning until its own timeout.
+             */
+            bsp_phase(BSP_PHASE_FLUSH);
+            fw_1_vars_service();
+            bsp_phase(BSP_PHASE_IDLE);
             if (g_vms[0].host_tsc_hz != 0) {
                 uint64_t now_d = hype_rdtsc();
                 unsigned int have = hype_logbuf_len();
