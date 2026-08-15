@@ -334,6 +334,15 @@ static unsigned long long g_sendkey_codes;
  */
 static unsigned long long g_cd_irq_pending, g_cd_irq_delivered;
 static unsigned long long g_ata_irq_pending, g_ata_irq_delivered;
+/* MSI is edge-triggered while AHCI PxIS is level-like.  These latches turn a
+ * continuous pending status into one message until the guest acknowledges it. */
+static int g_cd_msi_asserted, g_ata_msi_asserted;
+/* #440: how often the guest touches the ICH9 SATA target's ABAR at all --
+ * distinguishes "Windows never drives the controller" from "Windows drives it
+ * and the exchange goes wrong". */
+static unsigned long long g_440_ata_npf_accesses;
+static uint32_t g_440_cfg_ring[16];
+static unsigned long long g_440_cfg_total;
 
 static unsigned long long g_dbgport_writes;
 static unsigned long long g_dbgport_reads;
@@ -2094,12 +2103,6 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * (was: PIT-tick-count x MULT); hype_guest_lapic_advance divides by the guest's
  * Divide Configuration Register. */
 #define HYPE_GUEST_LAPIC_HZ 1000000000ULL
-/* Bus 0 slot for the AHCI function -- free (MCH is dev 0, ICH9 LPC is
- * dev 31). OVMF's PciBusDxe enumerates it, sizes BAR5, assigns it a
- * guest-physical address in the 32-bit PCI MMIO aperture, and enables
- * Memory Space -- exactly the PCI-2 discovery path. */
-#define HYPE_FW_1_PCI_DEV_AHCI 2u
-
 /* Intel Q35 MCH (the real Q35 chipset's host bridge) vendor/device ID
  * -- transcribed from this project's own vendored edk2 submodule,
  * edk2/OvmfPkg/Include/IndustryStandard/Q35MchIch9.h
@@ -2129,6 +2132,8 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * loop (AcpiTimerLib's own GetPerformanceCounter()). */
 #define HYPE_FW_1_PCI_DEV_ICH9_LPC 31u
 #define HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC 0x2918u
+/* Bus 0 slot for the optical AHCI function. */
+#define HYPE_FW_1_PCI_DEV_AHCI 2u
 
 /* FW-1c: guest-physical base of the PCI MMCONFIG (ECAM) window. Must
  * match the base FW-1's ACPI MCFG table advertises (cfg.mcfg_base_
@@ -2142,15 +2147,15 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * region, so a guest access faults into hype_svm_vcpu_handle_ioapic_npf. */
 #define HYPE_FW_1_IOAPIC_GPA 0xFEC00000ULL
 /* M4-6b2/M4-6b3: the I/O APIC GSI the AHCI function's INTA is routed to. MUST
- * match the DSDT _PRT (devices/dsdt.asl: dev 2 INTA -> GSI 0x10). In APIC mode
+ * match the DSDT _PRT (devices/dsdt.asl: dev 31 INTA -> GSI 0x10). In APIC mode
  * the guest programs IO-APIC RTE[16] for AHCI and ignores the legacy PCI
  * Interrupt Line, so hype raises the AHCI line here rather than on line 11. */
 #define HYPE_FW_1_AHCI_GSI 16u
 
-/* M5-7 (#196): the live guest's virtio-blk disk. Device 3 on the PCI bus (dev 2
- * is the AHCI CD-ROM), a modern virtio-pci device with its config-region window
+/* M5-7 (#196): the live guest's virtio-blk disk. Device 3 on the PCI bus, a
+ * modern virtio-pci device with its config-region window
  * at BAR4. INTA is routed to GSI 20 (0x14) -- MUST match the DSDT _PRT entry for
- * dev 3 (devices/dsdt.asl); clear of the dev-2 pin block (GSI 16-19). The
+ * dev 3 (devices/dsdt.asl); clear of the ICH9 AHCI pin block (GSI 16-19). The
  * per-VM scratch backing is a small RAM-backed blk_file for now (later steps
  * swap the backend to a raw file / physical disk without touching the frontend). */
 #define HYPE_FW_1_PCI_DEV_VIRTIO_BLK 3u
@@ -2166,7 +2171,8 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * installed disk as SATA is the shorter route to a guest that can boot what hype
  * installed.
  */
-#define HYPE_FW_1_PCI_DEV_ATA 4u
+#define HYPE_FW_1_PCI_DEV_ATA HYPE_FW_1_PCI_DEV_ICH9_LPC
+#define HYPE_FW_1_PCI_FUNC_ATA 2u
 /*
  * #202: the guest NVMe controller. Device 5, after the SATA-disk HBA. BAR0 must cover the doorbell
  * window, which begins at 0x1000 -- 8 KiB leaves room for the one admin plus one I/O pair at a 4-byte
@@ -2176,8 +2182,9 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
 #define HYPE_FW_1_NVME_BAR_SIZE 0x2000u
 #define HYPE_FW_1_VIRTIO_BAR_INDEX 4u
 #define HYPE_FW_1_VIRTIO_GSI 20u
-/* #262: the SATA-disk AHCI HBA (PCI dev 4) INTA -> GSI 21. Must match the _PRT entry
- * in devices/dsdt.asl; clear of the dev-2 block (16-19) and virtio-blk (20). */
+/* #262/#440: the SATA-disk (ICH9 dev31 fn2) INTA -> GSI 21. Must match the
+ * dev-31 _PRT entry in devices/dsdt.asl; clear of the dev-2 block (16-19)
+ * and virtio-blk (20). */
 #define HYPE_FW_1_ATA_GSI 21u
 #define HYPE_FW_1_VDISK_BYTES (64ULL * 1024ULL * 1024ULL) /* 64 MiB scratch virtual disk */
 /* virtio-pci capability-list offsets within the device's config space (reusing
@@ -9834,10 +9841,9 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
                          HYPE_FW_1_PCI_DEV_NVME);
     }
     if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
-        hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u,
-                            0x01, 0x06, 0x01);
-        hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5, 0x1000u);
-        hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 1, 11);
+        hype_pci_add_ich9_ahci_function(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA);
+        hype_pci_set_function_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                        HYPE_FW_1_PCI_FUNC_ATA, 1, 11);
     }
 #if HYPE_262_DISK_ON_FIRST_HBA
     /*
@@ -9938,6 +9944,7 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
                                     0x06, 0x01);
                 hype_pci_set_bar_size(&g_fw_1_pci, dev, 5, 0x1000u);
                 hype_pci_set_interrupt(&g_fw_1_pci, dev, 1, 11);
+                hype_pci_set_msi_capability(&g_fw_1_pci, dev);
                 hype_ahci_reset(&d->ata_ahci);
                 hype_ahci_set_signature(&d->ata_ahci, HYPE_AHCI_SIG_ATA);
                 hype_ata_disk_reset(&d->ata_disk, 0, 0);
@@ -10013,10 +10020,11 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
                          0x00, 0x00);
     hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ICH9_LPC, HYPE_FW_1_PCI_VENDOR_ID_INTEL,
                          HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC, 0x06, 0x01, 0x00);
-    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u, 0x01, 0x06,
-                         0x01);
+    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u,
+                        0x01, 0x06, 0x01);
     hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
+    hype_pci_set_msi_capability(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
     hype_ahci_reset(&g_fw_1_ahci);
     fw_1_attach_storage(vm); /* #342 */
     {
@@ -10221,12 +10229,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          0x00, 0x00);
     hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ICH9_LPC, HYPE_FW_1_PCI_VENDOR_ID_INTEL,
                          HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC, 0x06, 0x01, 0x00);
-    /* FW-1h: AHCI SATA controller (class 0x01 / subclass 0x06 / prog-IF
-     * 0x01 -- "AHCI 1.0"), with a 4KB BAR5 (ABAR) for OVMF to size and
-     * place, exactly as run_pci_2_test registers it. Backed by ISO-1's
-     * real loaded ISO so OVMF's BDS finds a bootable CD. */
-    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u, 0x01, 0x06,
-                         0x01);
+    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u,
+                        0x01, 0x06, 0x01);
     hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
     /* M4-6d2: advertise a legacy PCI interrupt on the AHCI function
      * (Interrupt Pin INTA=1) so the guest treats it as interrupt-capable
@@ -10238,6 +10242,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * delivers the completion IRQ on whatever line 0x3C actually holds
      * (hype_pci_get_interrupt_line), master or slave. */
     hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
+    hype_pci_set_msi_capability(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
     hype_ahci_reset(&g_fw_1_ahci);
     fw_1_attach_storage(vm); /* #342 */
     /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging
@@ -12540,7 +12545,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
             g_cd_irq_pending++;
-            if (line != 0u && line < 16u) {
+            if (hype_pci_msi_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI)) {
+                /* MSI is edge-triggered.  The AHCI status bit remains level-like
+                 * until the guest acknowledges it, so send exactly one message
+                 * per assertion instead of re-injecting on every VMM iteration. */
+                if (!g_cd_msi_asserted) {
+                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic,
+                                          hype_pci_msi_vector(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI));
+                    g_cd_msi_asserted = 1;
+                    g_cd_irq_delivered++;
+                    ahci_irqs++;
+                }
+            } else if (line != 0u && line < 16u) {
+                g_cd_msi_asserted = 0;
                 int in_service = (line < 8u)
                     ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
                     : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
@@ -12554,7 +12571,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * IO-APIC RTE[16] for it (NOT the legacy PCI line). Route through
              * the IO-APIC on that GSI. Level-triggered: Remote-IRR gates
              * re-injection until the line deasserts (below). */
-            {
+            if (!hype_pci_msi_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI)) {
                 uint8_t iov;
                 /*
                  * A declined raise is NORMAL, not a fault: hype_ioapic_raise() refuses while
@@ -12570,6 +12587,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
         } else if (ahci_mapped) {
+            /* A new completion after the guest clears PxIS is a new MSI edge. */
+            g_cd_msi_asserted = 0;
             /* AHCI IRQ line deasserted (guest serviced it -> PxIS cleared):
              * drop the IO-APIC Remote-IRR so the next completion re-injects.
              * Models a level line going low; the guest's LAPIC EOI need not be
@@ -12610,8 +12629,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (ata_mapped && hype_ahci_irq_pending(&g_fw_1_ata_ahci)) {
             uint8_t iov;
             g_ata_irq_pending++;
-            uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA);
-            if (line != 0u && line < 16u) {
+            uint8_t line = hype_pci_get_function_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                                                  HYPE_FW_1_PCI_FUNC_ATA);
+            if (hype_pci_function_msi_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                               HYPE_FW_1_PCI_FUNC_ATA)) {
+                if (!g_ata_msi_asserted) {
+                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic,
+                                          hype_pci_function_msi_vector(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                                                       HYPE_FW_1_PCI_FUNC_ATA));
+                    g_ata_msi_asserted = 1;
+                    g_ata_irq_delivered++;
+                }
+            } else if (line != 0u && line < 16u) {
+                g_ata_msi_asserted = 0;
                 int in_service = (line < 8u)
                     ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
                     : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
@@ -12619,23 +12649,27 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
                 }
             }
-            if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI, &iov)) {
-                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
-                g_ata_irq_delivered++;
-            } else {
-                static int ata_undelivered_reported = 0;
-                if (!ata_undelivered_reported) {
-                    ata_undelivered_reported = 1;
-                    hype_debug_print("fw-1 ATA-IRQ-UNDELIVERED: gsi=%u rte=0x%llx p_is=0x%x "
-                                     "p_ie=0x%x ghc=0x%x pci_line=%u\n",
-                                     (unsigned int)HYPE_FW_1_ATA_GSI,
-                                     (unsigned long long)g_fw_1_ioapic.rte[HYPE_FW_1_ATA_GSI],
-                                     (unsigned int)g_fw_1_ata_ahci.p_is,
-                                     (unsigned int)g_fw_1_ata_ahci.p_ie,
-                                     (unsigned int)g_fw_1_ata_ahci.ghc, (unsigned int)line);
+            if (!hype_pci_function_msi_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                                HYPE_FW_1_PCI_FUNC_ATA)) {
+                if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI, &iov)) {
+                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                    g_ata_irq_delivered++;
+                } else {
+                    static int ata_undelivered_reported = 0;
+                    if (!ata_undelivered_reported) {
+                        ata_undelivered_reported = 1;
+                        hype_debug_print("fw-1 ATA-IRQ-UNDELIVERED: gsi=%u rte=0x%llx p_is=0x%x "
+                                         "p_ie=0x%x ghc=0x%x pci_line=%u\n",
+                                         (unsigned int)HYPE_FW_1_ATA_GSI,
+                                         (unsigned long long)g_fw_1_ioapic.rte[HYPE_FW_1_ATA_GSI],
+                                         (unsigned int)g_fw_1_ata_ahci.p_is,
+                                         (unsigned int)g_fw_1_ata_ahci.p_ie,
+                                         (unsigned int)g_fw_1_ata_ahci.ghc, (unsigned int)line);
+                    }
                 }
             }
         } else if (ata_mapped) {
+            g_ata_msi_asserted = 0;
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI);
         }
         /*
@@ -13394,6 +13428,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * (OVMF's Q35 PcdPciExpressBaseAddress). Reuses PCI-1's ECAM
              * config model over FW-1's own host bridge + LPC devices. */
             g_436_loop_section[(unsigned)(vm-g_vms)]=771;
+            {   /* #440: who reads config space, and when. A ring of the last 16
+                 * decoded B/D/F+register accesses separates "Windows never
+                 * enumerates PCI" from "enumerates and declines the device". */
+                hype_vmm_npf_t cfg_npf;
+                vmm_get_last_npf(kind, ctx, &cfg_npf);
+                if (cfg_npf.guest_phys_addr >= HYPE_FW_1_ECAM_GPA &&
+                    cfg_npf.guest_phys_addr < HYPE_FW_1_ECAM_GPA + (1ull << 28)) {
+                    hype_pci_ecam_addr_t a;
+                    hype_pci_decode_ecam_offset(cfg_npf.guest_phys_addr - HYPE_FW_1_ECAM_GPA, &a);
+                    g_440_cfg_ring[g_440_cfg_total % 16u] =
+                        ((uint32_t)a.device << 24) | ((uint32_t)a.function << 16) |
+                        ((uint32_t)a.register_offset << 4) | (cfg_npf.is_write ? 1u : 0u);
+                    g_440_cfg_total++;
+                }
+            }
             if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &g_fw_1_pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
                 /* FW-1h: an ECAM config write may have just programmed
                  * BAR5 and set Memory Space Enable on the AHCI function.
@@ -13419,17 +13468,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_ahci_set_bus_master(&g_fw_1_ahci,
                                          HYPE_372_CLEAR_BME
                                              ? 0
-                                             : hype_pci_bus_master_enabled(
-                                                   &g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI));
-                hype_ahci_set_bus_master(&g_fw_1_ata_ahci, hype_pci_bus_master_enabled(
-                                                               &g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA));
+                                             : hype_pci_bus_master_enabled(&g_fw_1_pci,
+                                                                           HYPE_FW_1_PCI_DEV_AHCI));
+                hype_ahci_set_bus_master(&g_fw_1_ata_ahci, hype_pci_function_bus_master_enabled(
+                                                               &g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                                               HYPE_FW_1_PCI_FUNC_ATA));
                 hype_virtio_blk_set_bus_master(
                     &g_fw_1_vblk,
                     hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK));
                 hype_nvme_set_bus_master(
                     &vm->disk[0].nvme,
                     hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME));
-                if (!ahci_mapped && hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI)) {
+                if (!ahci_mapped && hype_pci_memory_space_enabled(&g_fw_1_pci,
+                                                                    HYPE_FW_1_PCI_DEV_AHCI)) {
                     uint64_t bar5 = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5);
                     if (bar5 != 0) {
                         ahci_abar = bar5;
@@ -13440,8 +13491,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                 }
                 /* #262 slice 2: same latch for the SATA-disk HBA's BAR5. */
-                if (!ata_mapped && hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA)) {
-                    uint64_t abar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA, 5);
+                if (!ata_mapped && hype_pci_function_memory_space_enabled(&g_fw_1_pci,
+                                                                            HYPE_FW_1_PCI_DEV_ATA,
+                                                                            HYPE_FW_1_PCI_FUNC_ATA)) {
+                    uint64_t abar = hype_pci_get_function_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                                                       HYPE_FW_1_PCI_FUNC_ATA, 5);
                     if (abar != 0) {
                         ata_abar = abar;
                         ata_mapped = 1;
@@ -13511,6 +13565,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (ata_npf.guest_phys_addr >= ata_abar &&
                     ata_npf.guest_phys_addr < ata_abar + HYPE_AHCI_MMIO_SIZE) {
                     g_436_loop_section[(unsigned)(vm-g_vms)]=772;
+                    g_440_ata_npf_accesses++;
                     if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ata_ahci,
                                                      &g_fw_1_ata_disk, ata_abar, &g_fw_1_dma_map,
                                                      insn) == 0) {
@@ -13986,6 +14041,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 #endif
             if (vmm_handle_ioio(kind, ctx, &g_fw_1_pic, &g_fw_1_pit) == 0) {
                 continue;
+            }
+            {   /* #440: the legacy 0xCFC window feeds the same access ring as ECAM. */
+                hype_vmm_ioio_t cfg_io;
+                vmm_peek_ioio(kind, ctx, &cfg_io);
+                if (cfg_io.port >= 0xCFCu && cfg_io.port <= 0xCFFu) {
+                    hype_pci_ecam_addr_t a;
+                    hype_pci_decode_cf8_address(g_fw_1_pci.cf8_selected, &a);
+                    g_440_cfg_ring[g_440_cfg_total % 16u] =
+                        ((uint32_t)a.device << 24) | ((uint32_t)a.function << 16) |
+                        ((uint32_t)(a.register_offset + (cfg_io.port - 0xCFCu)) << 4) |
+                        (cfg_io.is_in ? 0u : 1u) | 2u;
+                    g_440_cfg_total++;
+                }
             }
             if (vmm_handle_pci_cf8_ioio(kind, ctx, &g_fw_1_pci) == 0) {
                 continue;
@@ -19852,6 +19920,83 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     hype_ps2_mouse_has_pending_byte(&g_vms[vi].mouse),
                                     (unsigned)g_vms[vi].atapi.last_cdb,
                                     (unsigned)g_vms[vi].atapi.command_count);
+                                if (vi == 0u) {
+                                    const uint8_t *pcfg =
+                                        g_fw_1_pci.devices[HYPE_FW_1_PCI_DEV_AHCI].config;
+                                    const uint8_t *tpcfg = hype_pci_function_config(
+                                        &g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                        HYPE_FW_1_PCI_FUNC_ATA);
+                                    hype_debug_print(
+                                        "fw-1 #92 PCI-AHCI: cmd=0x%02x%02x status=0x%02x%02x "
+                                        "bar5=%02x%02x%02x%02x cap=0x%02x msi_ctl=0x%02x%02x "
+                                        "msi_data=0x%02x%02x\n",
+                                        (unsigned)pcfg[0x05], (unsigned)pcfg[0x04],
+                                        (unsigned)pcfg[0x07], (unsigned)pcfg[0x06],
+                                        (unsigned)pcfg[0x27], (unsigned)pcfg[0x26],
+                                        (unsigned)pcfg[0x25], (unsigned)pcfg[0x24],
+                                        (unsigned)pcfg[HYPE_PCI_CAP_PTR_OFFSET],
+                                        (unsigned)pcfg[HYPE_PCI_MSI_CONTROL_OFFSET + 1u],
+                                        (unsigned)pcfg[HYPE_PCI_MSI_CONTROL_OFFSET],
+                                        (unsigned)pcfg[HYPE_PCI_MSI_DATA_OFFSET + 1u],
+                                        (unsigned)pcfg[HYPE_PCI_MSI_DATA_OFFSET]);
+                                    if (tpcfg) {
+                                        hype_debug_print(
+                                            "fw-1 #440 PCI-ICH9: cmd=0x%02x%02x bar5=%02x%02x%02x%02x "
+                                            "cap=0x%02x msi_ctl=0x%02x%02x msi_data=0x%02x%02x\n",
+                                            (unsigned)tpcfg[0x05], (unsigned)tpcfg[0x04],
+                                            (unsigned)tpcfg[0x27], (unsigned)tpcfg[0x26],
+                                            (unsigned)tpcfg[0x25], (unsigned)tpcfg[0x24],
+                                            (unsigned)tpcfg[HYPE_PCI_CAP_PTR_OFFSET],
+                                            (unsigned)tpcfg[0x83], (unsigned)tpcfg[0x82],
+                                            (unsigned)tpcfg[0x8d], (unsigned)tpcfg[0x8c]);
+                                    }
+                                    {
+                                        const hype_ahci_t *ta = &g_vms[0].disk[0].ata_ahci;
+                                        hype_debug_print(
+                                            "fw-1 #440 ICH9-PORT: npf=%llu ghc=0x%x p_cmd=0x%x "
+                                            "p_is=0x%x p_ie=0x%x p_ci=0x%x p_tfd=0x%x p_ssts=0x%x "
+                                            "p_serr=0x%x p_sig=0x%x p_clb=0x%x\n",
+                                            g_440_ata_npf_accesses, (unsigned)ta->ghc,
+                                            (unsigned)ta->p_cmd, (unsigned)ta->p_is,
+                                            (unsigned)ta->p_ie, (unsigned)ta->p_ci,
+                                            (unsigned)ta->p_tfd, (unsigned)ta->p_ssts,
+                                            (unsigned)ta->p_serr, (unsigned)ta->p_sig,
+                                            (unsigned)ta->p_clb);
+                                        {
+                                            extern volatile uint32_t g_440_ata_wr_ring[64];
+                                            extern volatile uint32_t g_440_ata_wr_total;
+                                            unsigned wn = (g_440_ata_wr_total < 64u)
+                                                              ? g_440_ata_wr_total : 64u;
+                                            unsigned ws = g_440_ata_wr_total % 64u;
+                                            unsigned wi;
+                                            hype_debug_print("fw-1 #440 ATAWR: total=%u last(off=val):",
+                                                             g_440_ata_wr_total);
+                                            for (wi = 0; wi < wn; wi++) {
+                                                uint32_t e = g_440_ata_wr_ring[(ws + wi) % 64u];
+                                                hype_debug_print(" %x=%x", (unsigned)(e >> 20),
+                                                                 (unsigned)(e & 0xFFFFFu));
+                                            }
+                                            hype_debug_print(" [#440]\n");
+                                        }
+                                        hype_debug_print(
+                                            "fw-1 #440 CFGRING: total=%llu last(dd.f reg rw):",
+                                            g_440_cfg_total);
+                                        {
+                                            unsigned ri, n = (g_440_cfg_total < 16ull)
+                                                                 ? (unsigned)g_440_cfg_total : 16u;
+                                            unsigned start = (unsigned)(g_440_cfg_total % 16u);
+                                            for (ri = 0; ri < n; ri++) {
+                                                uint32_t e = g_440_cfg_ring[(start + ri) % 16u];
+                                                hype_debug_print(" %02u.%u:%02x%c",
+                                                                 (unsigned)(e >> 24),
+                                                                 (unsigned)((e >> 16) & 0xFFu),
+                                                                 (unsigned)((e >> 4) & 0xFFFu),
+                                                                 (e & 1u) ? 'w' : 'r');
+                                            }
+                                        }
+                                        hype_debug_print(" [#440]\n");
+                                    }
+                                }
                                 {   /* #436: last kbd-port polls (see svm_vcpu.c breadcrumbs) */
                                     extern volatile uint64_t g_436_last_p64_tsc, g_436_last_p64_rip;
                                     extern volatile uint8_t g_436_last_p64_val;

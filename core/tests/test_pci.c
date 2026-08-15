@@ -59,6 +59,92 @@ static void test_non_bus_zero_or_non_function_zero_reads_absent(void) {
     CHECK_HEX("function 1 reads absent", 0xFFFFFFFFu, value);
 }
 
+static void test_multifunction_device(void) {
+    hype_pci_t pci;
+    hype_pci_ecam_addr_t function0_header = {0, 31, 0, 0x0E};
+    hype_pci_ecam_addr_t function1 = {0, 31, 1, 0x00};
+    hype_pci_ecam_addr_t function2_id = {0, 31, 2, 0x00};
+    hype_pci_ecam_addr_t function2_class = {0, 31, 2, 0x08};
+    hype_pci_ecam_addr_t function2_bar5 = {0, 31, 2, 0x24};
+    hype_pci_ecam_addr_t function2_command = {0, 31, 2, 0x04};
+    uint32_t value;
+
+    hype_pci_reset(&pci);
+    CHECK_HEX("function requires function 0", -1,
+              hype_pci_add_function(&pci, 31, 2, 0x8086u, 0x2922u, 0x01, 0x06, 0x01));
+    hype_pci_add_device(&pci, 31, 0x8086u, 0x2918u, 0x06, 0x01, 0x00);
+    CHECK_HEX("register ICH9 AHCI function", 0,
+              hype_pci_add_function(&pci, 31, 2, 0x8086u, 0x2922u, 0x01, 0x06, 0x01));
+
+    hype_pci_config_read(&pci, &function0_header, 1, &value);
+    CHECK_HEX("function 0 advertises multifunction", 0x80u, value & 0x80u);
+    hype_pci_config_read(&pci, &function1, 4, &value);
+    CHECK_HEX("unregistered function remains absent", 0xFFFFFFFFu, value);
+    hype_pci_config_read(&pci, &function2_id, 4, &value);
+    CHECK_HEX("function 2 vendor/device", 0x29228086u, value);
+    hype_pci_config_read(&pci, &function2_class, 4, &value);
+    CHECK_HEX("function 2 AHCI class", 0x01060100u, value);
+    CHECK_HEX("function 2 MSI starts absent", 0, hype_pci_function_msi_enabled(&pci, 31, 2));
+
+    hype_pci_set_function_bar_size(&pci, 31, 2, 5, 0x1000u);
+    hype_pci_config_write(&pci, &function2_bar5, 4, 0xE0100123u);
+    CHECK_HEX("function 2 BAR5 programmed", 0xE0100000u,
+              hype_pci_get_function_bar_value(&pci, 31, 2, 5));
+    hype_pci_config_write(&pci, &function2_command, 2, 0x0006u);
+    CHECK_HEX("function 2 memory enabled", 1,
+              hype_pci_function_memory_space_enabled(&pci, 31, 2));
+    CHECK_HEX("function 2 bus master enabled", 1,
+              hype_pci_function_bus_master_enabled(&pci, 31, 2));
+    hype_pci_set_function_interrupt(&pci, 31, 2, 1, 16);
+    CHECK_HEX("function 2 interrupt line", 16,
+              hype_pci_get_function_interrupt_line(&pci, 31, 2));
+
+    hype_pci_set_function_msi_capability(&pci, 31, 2);
+    CHECK_HEX("function 2 MSI starts disabled", 0, hype_pci_function_msi_enabled(&pci, 31, 2));
+    hype_pci_config_write(&pci, &(hype_pci_ecam_addr_t){0, 31, 2, HYPE_PCI_MSI_CAP_OFFSET}, 2, 0u);
+    hype_pci_config_read(&pci, &(hype_pci_ecam_addr_t){0, 31, 2, HYPE_PCI_MSI_CAP_OFFSET}, 1, &value);
+    CHECK_HEX("function 2 MSI capability ID is hardware-owned", HYPE_PCI_CAP_ID_MSI, value);
+    hype_pci_config_write(&pci, &(hype_pci_ecam_addr_t){0, 31, 2, HYPE_PCI_MSI_DATA_OFFSET}, 2, 0x0062u);
+    hype_pci_config_write(&pci, &(hype_pci_ecam_addr_t){0, 31, 2, HYPE_PCI_MSI_CONTROL_OFFSET}, 2,
+                          HYPE_PCI_MSI_CONTROL_ENABLE);
+    CHECK_HEX("function 2 MSI enabled", 1, hype_pci_function_msi_enabled(&pci, 31, 2));
+    CHECK_HEX("function 2 MSI vector", 0x62u, hype_pci_function_msi_vector(&pci, 31, 2));
+    CHECK_HEX("function 2 raw config is exposed", 0x22u,
+              hype_pci_function_config(&pci, 31, 2)[0x02]);
+
+    /* Both a nonexistent but in-range function and an invalid function must
+     * be inert. This covers the exact no-device cases PCI enumeration hits. */
+    hype_pci_set_function_bar_size(&pci, 31, 3, 5, 0x1000u);
+    hype_pci_set_function_bar_size(&pci, 31, HYPE_PCI_MAX_FUNCTIONS, 5, 0x1000u);
+    hype_pci_set_function_interrupt(&pci, 31, 3, 1, 16);
+    hype_pci_set_function_interrupt(&pci, 31, HYPE_PCI_MAX_FUNCTIONS, 1, 16);
+    hype_pci_set_function_msi_capability(&pci, 31, 3);
+    hype_pci_set_function_msi_capability(&pci, 31, HYPE_PCI_MAX_FUNCTIONS);
+    CHECK_HEX("absent function MSI disabled", 0, hype_pci_function_msi_enabled(&pci, 31, 3));
+    CHECK_HEX("invalid function MSI disabled", 0,
+              hype_pci_function_msi_enabled(&pci, 31, HYPE_PCI_MAX_FUNCTIONS));
+    CHECK_HEX("absent function MSI vector", 0, hype_pci_function_msi_vector(&pci, 31, 3));
+    CHECK_HEX("invalid function MSI vector", 0,
+              hype_pci_function_msi_vector(&pci, 31, HYPE_PCI_MAX_FUNCTIONS));
+    CHECK_HEX("absent function interrupt line", 0, hype_pci_get_function_interrupt_line(&pci, 31, 3));
+    CHECK_HEX("invalid function interrupt line", 0,
+              hype_pci_get_function_interrupt_line(&pci, 31, HYPE_PCI_MAX_FUNCTIONS));
+
+    CHECK_HEX("function zero cannot be re-added", -1,
+              hype_pci_add_function(&pci, 31, 0, 0, 0, 0, 0, 0));
+    CHECK_HEX("function eight is out of range", -1,
+              hype_pci_add_function(&pci, 31, HYPE_PCI_MAX_FUNCTIONS, 0, 0, 0, 0, 0));
+    CHECK_HEX("out-of-range device rejects function", -1,
+              hype_pci_add_function(&pci, HYPE_PCI_MAX_DEVICES, 2, 0, 0, 0, 0, 0));
+    CHECK_HEX("invalid function has no config", 0,
+              hype_pci_function_config(&pci, 31, HYPE_PCI_MAX_FUNCTIONS) != 0);
+    CHECK_HEX("absent function has no config", 0, hype_pci_function_config(&pci, 31, 3) != 0);
+    CHECK_HEX("absent function memory is disabled", 0,
+              hype_pci_function_memory_space_enabled(&pci, 31, 3));
+    CHECK_HEX("absent function bus master is disabled", 0,
+              hype_pci_function_bus_master_enabled(&pci, 31, 3));
+}
+
 static void test_add_device_populates_header(void) {
     hype_pci_t pci;
     hype_pci_ecam_addr_t addr;
@@ -133,6 +219,43 @@ static void test_set_interrupt_ignores_out_of_range_device(void) {
     hype_pci_set_interrupt(&pci, 0xFFu, 1u, 5u);
 }
 
+static void test_msi_capability_and_guest_programming(void) {
+    hype_pci_t pci;
+    hype_pci_ecam_addr_t status = {0, 1, 0, 0x06};
+    hype_pci_ecam_addr_t cap_ptr = {0, 1, 0, HYPE_PCI_CAP_PTR_OFFSET};
+    hype_pci_ecam_addr_t cap_header = {0, 1, 0, HYPE_PCI_MSI_CAP_OFFSET};
+    hype_pci_ecam_addr_t control = {0, 1, 0, HYPE_PCI_MSI_CONTROL_OFFSET};
+    hype_pci_ecam_addr_t data = {0, 1, 0, HYPE_PCI_MSI_DATA_OFFSET};
+    uint32_t value;
+
+    hype_pci_reset(&pci);
+    hype_pci_add_device(&pci, 1, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u, 0x01, 0x06, 0x01);
+    hype_pci_set_msi_capability(&pci, 1);
+
+    hype_pci_config_read(&pci, &status, 2, &value);
+    CHECK_HEX("Status advertises capability list", HYPE_PCI_STATUS_CAPABILITIES_LIST,
+              value & HYPE_PCI_STATUS_CAPABILITIES_LIST);
+    hype_pci_config_read(&pci, &cap_ptr, 1, &value);
+    CHECK_HEX("Capabilities Pointer names MSI", HYPE_PCI_MSI_CAP_OFFSET, value);
+    hype_pci_config_read(&pci, &cap_header, 2, &value);
+    CHECK_HEX("MSI capability ID and end-of-list", HYPE_PCI_CAP_ID_MSI, value);
+    CHECK_HEX("MSI is disabled until guest enables it", 0, hype_pci_msi_enabled(&pci, 1));
+
+    hype_pci_config_write(&pci, &data, 2, 0x0062u);
+    hype_pci_config_write(&pci, &control, 2, HYPE_PCI_MSI_CONTROL_ENABLE);
+    CHECK_HEX("guest can enable MSI", 1, hype_pci_msi_enabled(&pci, 1));
+    CHECK_HEX("MSI vector comes from message data", 0x62u, hype_pci_msi_vector(&pci, 1));
+
+    /* Device-owned discovery fields survive a broad guest config write. */
+    hype_pci_config_write(&pci, &status, 2, 0u);
+    hype_pci_config_write(&pci, &cap_ptr, 1, 0u);
+    hype_pci_config_read(&pci, &status, 2, &value);
+    CHECK_HEX("Status capability bit stays hardware-owned", HYPE_PCI_STATUS_CAPABILITIES_LIST,
+              value & HYPE_PCI_STATUS_CAPABILITIES_LIST);
+    hype_pci_config_read(&pci, &cap_ptr, 1, &value);
+    CHECK_HEX("Capabilities Pointer stays hardware-owned", HYPE_PCI_MSI_CAP_OFFSET, value);
+}
+
 static void test_bar_sizing_protocol(void) {
     hype_pci_t pci;
     hype_pci_ecam_addr_t bar0 = {0, 1, 0, 0x10};
@@ -153,6 +276,73 @@ static void test_bar_sizing_protocol(void) {
     hype_pci_config_write(&pci, &bar0, 4, 0xE0100123u);
     hype_pci_config_read(&pci, &bar0, 4, &value);
     CHECK_HEX("BAR programmed address (aligned)", 0xE0100000u, value);
+}
+
+static void test_io_bar_sizing_protocol(void) {
+    hype_pci_t pci;
+    hype_pci_ecam_addr_t bar0 = {0, 31, 2, 0x10};
+    uint32_t value;
+
+    hype_pci_reset(&pci);
+    hype_pci_add_device(&pci, 31, 0x8086u, 0x2918u, 0x06, 0x01, 0x00);
+    hype_pci_add_function(&pci, 31, 2, 0x8086u, 0x2922u, 0x01, 0x06, 0x01);
+    hype_pci_set_function_io_bar_size(&pci, 31, 2, 0, 8u);
+
+    hype_pci_config_write(&pci, &bar0, 4, 0xFFFFFFFFu);
+    hype_pci_config_read(&pci, &bar0, 4, &value);
+    CHECK_HEX("I/O BAR size mask keeps type bit", 0xFFFFFFF9u, value);
+
+    hype_pci_config_write(&pci, &bar0, 4, 0x0000D007u);
+    hype_pci_config_read(&pci, &bar0, 4, &value);
+    CHECK_HEX("I/O BAR aligns and retains type bit", 0x0000D001u, value);
+    CHECK_HEX("I/O function BAR value", 0x0000D001u,
+              hype_pci_get_function_bar_value(&pci, 31, 2, 0));
+}
+
+static void test_ich9_ahci_pci_profile(void) {
+    hype_pci_t pci;
+    hype_pci_ecam_addr_t cfg = {0, 31, 2, 0};
+    uint32_t value;
+
+    hype_pci_reset(&pci);
+    hype_pci_add_device(&pci, 31, 0x8086u, 0x2918u, 0x06, 0x01, 0x00);
+    CHECK_HEX("ICH9 AHCI requires LPC function zero", 0,
+              hype_pci_add_ich9_ahci_function(&pci, 31));
+    hype_pci_config_read(&pci, &cfg, 4, &value);
+    CHECK_HEX("ICH9 AHCI vendor/device", 0x29228086u, value);
+    cfg.register_offset = 0x08;
+    hype_pci_config_read(&pci, &cfg, 4, &value);
+    CHECK_HEX("ICH9 AHCI revision/class", 0x01060102u, value);
+    cfg.register_offset = 0x0C;
+    hype_pci_config_read(&pci, &cfg, 2, &value);
+    CHECK_HEX("ICH9 cache line and latency", 0x0008u, value);
+    cfg.register_offset = 0x34;
+    hype_pci_config_read(&pci, &cfg, 1, &value);
+    CHECK_HEX("ICH9 capability pointer", 0x80u, value);
+    cfg.register_offset = 0x80;
+    hype_pci_config_read(&pci, &cfg, 4, &value);
+    CHECK_HEX("ICH9 MSI header", 0x0080A805u, value);
+    cfg.register_offset = 0xA8;
+    hype_pci_config_read(&pci, &cfg, 4, &value);
+    CHECK_HEX("ICH9 SATA header", 0x00100012u, value);
+    cfg.register_offset = 0xAC;
+    hype_pci_config_read(&pci, &cfg, 4, &value);
+    CHECK_HEX("ICH9 SATA index-data descriptor", 0x00000048u, value);
+    cfg.register_offset = 0x90;
+    hype_pci_config_read(&pci, &cfg, 1, &value);
+    CHECK_HEX("ICH9 begins in AHCI mode", 0x40u, value);
+    cfg.register_offset = 0x24;
+    hype_pci_config_write(&pci, &cfg, 4, 0xFFFFFFFFu);
+    hype_pci_config_read(&pci, &cfg, 4, &value);
+    CHECK_HEX("ICH9 BAR5 is 2KiB memory", 0xFFFFF800u, value);
+    cfg.register_offset = 0x20;
+    hype_pci_config_write(&pci, &cfg, 4, 0xFFFFFFFFu);
+    hype_pci_config_read(&pci, &cfg, 4, &value);
+    CHECK_HEX("ICH9 BAR4 is 32-byte I/O", 0xFFFFFFE1u, value);
+    hype_pci_config_write(&pci, &(hype_pci_ecam_addr_t){0, 31, 2, 0x8Cu}, 2, 0x0063u);
+    hype_pci_config_write(&pci, &(hype_pci_ecam_addr_t){0, 31, 2, 0x82u}, 2, 0x0081u);
+    CHECK_HEX("ICH9 64-bit MSI enables", 1, hype_pci_function_msi_enabled(&pci, 31, 2));
+    CHECK_HEX("ICH9 64-bit MSI vector", 0x63u, hype_pci_function_msi_vector(&pci, 31, 2));
 }
 
 static void test_unimplemented_bar_always_reads_zero(void) {
@@ -414,11 +604,15 @@ int main(void) {
     test_decode_ecam_offset();
     test_absent_device_reads_all_ones();
     test_non_bus_zero_or_non_function_zero_reads_absent();
+    test_multifunction_device();
     test_add_device_populates_header();
     test_ahci_class_code();
     test_set_interrupt_pin_and_line();
     test_set_interrupt_ignores_out_of_range_device();
+    test_msi_capability_and_guest_programming();
     test_bar_sizing_protocol();
+    test_io_bar_sizing_protocol();
+    test_ich9_ahci_pci_profile();
     test_unimplemented_bar_always_reads_zero();
     test_write_to_absent_device_is_dropped();
     test_memory_space_enable_bit();

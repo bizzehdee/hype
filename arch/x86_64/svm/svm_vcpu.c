@@ -3116,6 +3116,11 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
  * mirror hype_svm_ahci_atapi_npf_common's contract, so the two controllers are
  * handled the same way rather than each having its own rules.
  */
+/* #440: every register WRITE the guest makes to a disk-model HBA, as
+ * (offset, value) pairs -- names the last thing a silent storahci did. */
+volatile uint32_t g_440_ata_wr_ring[64];
+volatile uint32_t g_440_ata_wr_total;
+
 static int hype_svm_ahci_disk_npf_common(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
                                          hype_ata_disk_t *disk, uint64_t ahci_base_phys,
                                          const hype_gpa_map_t *dma_map,
@@ -3176,6 +3181,8 @@ static int hype_svm_ahci_disk_npf_common(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci
         if (hype_ahci_mmio_write(ahci, offset, decoded.size_bytes, value) != 0) {
             return -1;
         }
+        g_440_ata_wr_ring[g_440_ata_wr_total % 64u] = (offset << 20) | (value & 0xFFFFFu);
+        g_440_ata_wr_total++;
         if (offset == HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CI && ahci->p_ci != 0) {
             /* #262 slice 3: same lesson the ATAPI path already learned in M4-6d2 --
              * libata issues by tag, so a command is NOT always in slot 0. Only its

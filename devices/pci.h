@@ -25,9 +25,9 @@
  * project's own scope: bus 0 only (no PCI-to-PCI bridges modeled, so
  * no further bus is ever reachable -- every device presents a Type 0,
  * not Type 1, header, meaning compliant firmware has no reason to look
- * for one), single-function devices only (header_type's own
- * multi-function bit, 0x80, is never set, so compliant firmware never
- * bothers probing functions 1-7 of any device here).
+ * for one). A device can expose up to eight Type 0 functions. Function 0
+ * owns the PCI multifunction bit, and functions 1--7 are absent unless
+ * explicitly registered.
  *
  * ECAM address decoding (PCI Express spec): a config-space MMIO
  * access's offset within the whole MCFG-described region encodes which
@@ -76,7 +76,22 @@
 #define HYPE_PCI_VENDOR_ID_HYPE 0xFFFEu
 
 #define HYPE_PCI_MAX_DEVICES 32
+#define HYPE_PCI_MAX_FUNCTIONS 8
 #define HYPE_PCI_CONFIG_SIZE 256
+
+/* PCI MSI is a conventional capability, linked from config 0x34.  Keep it
+ * out of the Type 0 header and at a fixed, naturally aligned location so the
+ * simple 256-byte configuration model remains sufficient.  This model
+ * implements one 32-bit message only: that is enough for an AHCI HBA's single
+ * completion source, and avoids advertising MSI-X or multiple vectors that
+ * the interrupt delivery side does not implement. */
+#define HYPE_PCI_STATUS_CAPABILITIES_LIST 0x0010u
+#define HYPE_PCI_CAP_PTR_OFFSET 0x34u
+#define HYPE_PCI_MSI_CAP_OFFSET 0x50u
+#define HYPE_PCI_CAP_ID_MSI 0x05u
+#define HYPE_PCI_MSI_CONTROL_ENABLE 0x0001u
+#define HYPE_PCI_MSI_CONTROL_OFFSET (HYPE_PCI_MSI_CAP_OFFSET + 0x02u)
+#define HYPE_PCI_MSI_DATA_OFFSET (HYPE_PCI_MSI_CAP_OFFSET + 0x08u)
 
 typedef struct {
     uint8_t config[HYPE_PCI_CONFIG_SIZE];
@@ -85,11 +100,17 @@ typedef struct {
      * this project's own scope has no need for I/O-space or 64-bit
      * BARs yet. Must be a power of two when nonzero. */
     uint32_t bar_size[6];
+    /* BAR type bit (config bit 0): I/O-space when set, memory-space when
+     * clear.  Both forms use the same power-of-two sizing protocol. */
+    uint8_t bar_is_io[6];
     int in_use;
 } hype_pci_device_t;
 
 typedef struct {
-    hype_pci_device_t devices[HYPE_PCI_MAX_DEVICES]; /* bus 0, function 0 only, indexed by device number */
+    /* Function 0 stays in this array so existing single-function callers do
+     * not need a different data path. functions[d][f - 1] stores f=1..7. */
+    hype_pci_device_t devices[HYPE_PCI_MAX_DEVICES];
+    hype_pci_device_t functions[HYPE_PCI_MAX_DEVICES][HYPE_PCI_MAX_FUNCTIONS - 1];
     /* Last value written to the legacy 0xCF8 config-address port (FW-1)
      * -- genuinely part of the host bridge's own state, the same way
      * devices/fw_cfg.h's hype_fw_cfg_t keeps its own selected_key/offset
@@ -111,14 +132,20 @@ void hype_pci_reset(hype_pci_t *pci);
 
 /*
  * Registers a single-function device at bus 0, the given device
- * number (0-31). Fills the Type 0 header's Vendor/Device ID, Class
- * Code (base/sub/interface), and Revision ID (always 0) fields;
- * header_type is always 0x00 (single-function) -- this project has no
- * need for multi-function devices. Returns 0 on success, -1 if
- * `device_number` is out of range. Pure struct-filling.
+ * number (0-31), function 0. Fills the Type 0 header's Vendor/Device ID,
+ * Class Code (base/sub/interface), and Revision ID (always 0) fields.
+ * Returns 0 on success, -1 if `device_number` is out of range. Pure
+ * struct-filling.
  */
 int hype_pci_add_device(hype_pci_t *pci, uint8_t device_number, uint16_t vendor_id, uint16_t device_id,
                          uint8_t class_base, uint8_t class_sub, uint8_t class_interface);
+
+/* Registers a non-zero Type 0 function below an already registered function
+ * 0. This sets function 0's multifunction bit. Returns -1 for an invalid
+ * device/function or if function 0 is absent. */
+int hype_pci_add_function(hype_pci_t *pci, uint8_t device_number, uint8_t function_number,
+                          uint16_t vendor_id, uint16_t device_id, uint8_t class_base,
+                          uint8_t class_sub, uint8_t class_interface);
 
 /*
  * Declares BAR `bar_index` (0-5) of the device at `device_number` as a
@@ -127,6 +154,22 @@ int hype_pci_add_device(hype_pci_t *pci, uint8_t device_number, uint16_t vendor_
  * Pure struct mutation.
  */
 void hype_pci_set_bar_size(hype_pci_t *pci, uint8_t device_number, unsigned int bar_index, uint32_t size);
+void hype_pci_set_function_bar_size(hype_pci_t *pci, uint8_t device_number, uint8_t function_number,
+                                    unsigned int bar_index, uint32_t size);
+
+/* Declares a 32-bit I/O-space BAR.  This is configuration-space fidelity;
+ * callers that expose a live PIO block still route it separately. */
+void hype_pci_set_io_bar_size(hype_pci_t *pci, uint8_t device_number, unsigned int bar_index,
+                              uint32_t size);
+void hype_pci_set_function_io_bar_size(hype_pci_t *pci, uint8_t device_number,
+                                       uint8_t function_number, unsigned int bar_index,
+                                       uint32_t size);
+
+/* Registers the ICH9 AHCI SATA function at `device_number`. Function 0 must
+ * already be the ICH9 LPC bridge; the helper adds function 2 and its complete
+ * PCI-visible BAR/capability identity. MMIO/PIO service remains the caller's
+ * device-model responsibility. */
+int hype_pci_add_ich9_ahci_function(hype_pci_t *pci, uint8_t device_number);
 
 /*
  * Sets a device's Interrupt Pin (config 0x3D) and Interrupt Line
@@ -140,6 +183,25 @@ void hype_pci_set_bar_size(hype_pci_t *pci, uint8_t device_number, unsigned int 
  * for that device. Pure struct mutation.
  */
 void hype_pci_set_interrupt(hype_pci_t *pci, uint8_t device_number, uint8_t int_pin, uint8_t int_line);
+void hype_pci_set_function_interrupt(hype_pci_t *pci, uint8_t device_number, uint8_t function_number,
+                                     uint8_t int_pin, uint8_t int_line);
+
+/* Adds one 32-bit-message MSI capability to a registered device.  The guest
+ * owns the MSI enable bit and message address/data registers through normal
+ * config writes; the fixed capability headers and Status/Capabilities Pointer
+ * remain hardware-owned. */
+void hype_pci_set_msi_capability(hype_pci_t *pci, uint8_t device_number);
+void hype_pci_set_function_msi_capability(hype_pci_t *pci, uint8_t device_number, uint8_t function_number);
+
+/* Returns whether the guest has enabled this device's MSI capability and, if
+ * so, the x86 interrupt vector in its message data.  Delivery intentionally
+ * remains the VMM's responsibility: the guest-programmed APIC message address
+ * chooses an in-guest LAPIC destination, while Hype has one active guest vCPU
+ * context in which to inject the vector. */
+int hype_pci_msi_enabled(const hype_pci_t *pci, uint8_t device_number);
+uint8_t hype_pci_msi_vector(const hype_pci_t *pci, uint8_t device_number);
+int hype_pci_function_msi_enabled(const hype_pci_t *pci, uint8_t device_number, uint8_t function_number);
+uint8_t hype_pci_function_msi_vector(const hype_pci_t *pci, uint8_t device_number, uint8_t function_number);
 
 /* Reads back a device's current Interrupt Line (config 0x3C) -- whatever
  * value firmware/the guest last programmed there (a guest reads it to
@@ -147,6 +209,8 @@ void hype_pci_set_interrupt(hype_pci_t *pci, uint8_t device_number, uint8_t int_
  * by the vCPU loop to deliver a device's completion IRQ on the exact
  * line the guest is listening on. Pure struct read. */
 uint8_t hype_pci_get_interrupt_line(const hype_pci_t *pci, uint8_t device_number);
+uint8_t hype_pci_get_function_interrupt_line(const hype_pci_t *pci, uint8_t device_number,
+                                             uint8_t function_number);
 
 /*
  * Reads back a device's current BAR value (whatever a prior
@@ -158,6 +222,8 @@ uint8_t hype_pci_get_interrupt_line(const hype_pci_t *pci, uint8_t device_number
  * Enable (Command register bit 1, offset 0x04) is set.
  */
 uint32_t hype_pci_get_bar_value(const hype_pci_t *pci, uint8_t device_number, unsigned int bar_index);
+uint32_t hype_pci_get_function_bar_value(const hype_pci_t *pci, uint8_t device_number,
+                                         uint8_t function_number, unsigned int bar_index);
 
 /*
  * True if the device's Command register (offset 0x04) has Memory
@@ -167,6 +233,8 @@ uint32_t hype_pci_get_bar_value(const hype_pci_t *pci, uint8_t device_number, un
  * NPT-trapped at all.
  */
 int hype_pci_memory_space_enabled(const hype_pci_t *pci, uint8_t device_number);
+int hype_pci_function_memory_space_enabled(const hype_pci_t *pci, uint8_t device_number,
+                                           uint8_t function_number);
 
 /*
  * #372: True if the device's Command register has Bus Master Enable (bit 2) set.
@@ -182,6 +250,13 @@ int hype_pci_memory_space_enabled(const hype_pci_t *pci, uint8_t device_number);
  * the hardware would refuse, rather than give a passing result for code that is wrong.
  */
 int hype_pci_bus_master_enabled(const hype_pci_t *pci, uint8_t device_number);
+int hype_pci_function_bus_master_enabled(const hype_pci_t *pci, uint8_t device_number,
+                                         uint8_t function_number);
+
+/* Returns a registered function's raw 256-byte config space, or NULL when
+ * absent. Intended for diagnostics that report the guest-visible state. */
+const uint8_t *hype_pci_function_config(const hype_pci_t *pci, uint8_t device_number,
+                                        uint8_t function_number);
 
 /*
  * Decodes an ECAM byte offset (relative to the whole MCFG-described
@@ -194,10 +269,10 @@ void hype_pci_decode_ecam_offset(uint64_t offset, hype_pci_ecam_addr_t *out);
  * Config-space read: always succeeds (see this header's own top
  * comment for why config-space accesses never fault). `size_bytes` is
  * 1, 2, or 4, matching hype_mmio_decode()'s own supported access
- * widths. An access against bus != 0, function != 0, an out-of-range
- * device, or a device number with no registered device all read back
- * as all-1s (masked to size_bytes) -- the standard "no device here"
- * PCI convention. A BAR register (offset 0x10-0x24, 4-byte-aligned
+ * widths. An access against bus != 0, an out-of-range device/function,
+ * or an unregistered function reads back as all-1s (masked to
+ * size_bytes) -- the standard "no device here" PCI convention. A BAR
+ * register (offset 0x10-0x24, 4-byte-aligned
  * access only -- the only form real firmware/OS ever uses to probe/
  * program a BAR) reads back whatever hype_pci_config_write() last
  * stored there; any other register reads directly from the device's

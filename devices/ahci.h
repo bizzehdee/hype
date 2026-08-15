@@ -43,10 +43,12 @@
 #define HYPE_AHCI_REG_CAP2 0x24u
 #define HYPE_AHCI_REG_BOHC 0x28u
 
-/* Port register block base and per-port stride (single port here, so
- * this project only ever uses port 0's block at HYPE_AHCI_PORT_BASE). */
+/* Port register block base and per-port stride. ICH9 exposes six ports; port
+ * zero is the active medium in Hype's compact model while the remaining empty
+ * ports retain their architectural, readable register aperture. */
 #define HYPE_AHCI_PORT_BASE 0x100u
 #define HYPE_AHCI_PORT_STRIDE 0x80u
+#define HYPE_AHCI_PORT_COUNT 6u
 
 /* Port register byte offsets, relative to HYPE_AHCI_PORT_BASE. */
 #define HYPE_AHCI_PREG_CLB 0x00u
@@ -65,7 +67,7 @@
 #define HYPE_AHCI_PREG_CI 0x38u
 #define HYPE_AHCI_PREG_SNTF 0x3Cu
 
-#define HYPE_AHCI_MMIO_SIZE (HYPE_AHCI_PORT_BASE + HYPE_AHCI_PORT_STRIDE)
+#define HYPE_AHCI_MMIO_SIZE (HYPE_AHCI_PORT_BASE + HYPE_AHCI_PORT_COUNT * HYPE_AHCI_PORT_STRIDE)
 
 /* GHC (Global HBA Control) bits this project models. */
 #define HYPE_AHCI_GHC_HR (1u << 0)   /* HBA Reset (write-1; self-clears when the reset completes) */

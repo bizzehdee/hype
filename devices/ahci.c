@@ -9,9 +9,10 @@ void hype_ahci_reset(hype_ahci_t *ahci) {
     }
 
     ahci->cap = (1u << 31) /* S64A: supports 64-bit addressing */
-                | (1u << 18); /* SAM: AHCI-only, no legacy IDE emulation */
-                              /* NP (bits 4:0) = 0 -> 1 port; NCS (bits 12:8) = 0 -> 1 command slot */
-    ahci->pi = 0x1u;          /* port 0 implemented */
+                | (1u << 18) /* SAM: AHCI-only, no legacy IDE emulation */
+                | (31u << 8) /* NCS = 31 -> 32 command slots */
+                | (HYPE_AHCI_PORT_COUNT - 1u); /* NP: six ICH9 ports */
+    ahci->pi = (1u << HYPE_AHCI_PORT_COUNT) - 1u;
     ahci->vs = 0x00010301u;   /* AHCI 1.3.1 */
 
     ahci->p_sig = HYPE_AHCI_SIG_ATAPI;

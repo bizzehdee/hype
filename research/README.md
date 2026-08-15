@@ -97,6 +97,17 @@ not treat them as project-licensed material.
   within the guest GPA space. A call enters at the page start and the page must
   provide near-return behavior.
 
+### #440 ICH9 AHCI primary-source provenance
+
+- **QEMU ICH9 AHCI model (upstream source, consulted 14 August 2026).** #440 uses
+  `https://gitlab.com/qemu-project/qemu/-/raw/master/hw/ide/ich.c` (LGPL-2.1-or-later;
+  consulted, not copied). `pci_ich9_ahci_realize()` defines the compatible Q35
+  contract: `8086:2922`, revision `02`, cache line `08`, AHCI mode at config
+  `0x90` bit 6, I/O BAR0--4 sizes 8/4/8/4/32, a 2 KiB memory BAR5, six ports,
+  and a capability chain with 64-bit MSI at `0x80` followed by SATA at `0xA8`.
+  The vendored EDK2 `OvmfPkg/Library/QemuBootOrderLib/QemuBootOrderLib.c:809-845`
+  independently confirms the Q35 `Pci(0x1F,0x2)` placement.
+
 ## Online reference links (external, not archived)
 
 Code/spec links gathered for reference. Not downloaded into this tree (code

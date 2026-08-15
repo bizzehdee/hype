@@ -18,6 +18,7 @@ static void test_reset_state(void) {
 
     CHECK_HEX("CAP.S64A set", 1, (ahci.cap & (1u << 31)) != 0);
     CHECK_HEX("CAP.SAM set", 1, (ahci.cap & (1u << 18)) != 0);
+    CHECK_HEX("CAP.NCS advertises 32 command slots", 31, (ahci.cap >> 8) & 0x1Fu);
     CHECK_HEX("PI has port 0 implemented", 1, ahci.pi & 0x1u);
     CHECK_HEX("VS is 1.3.1", 0x00010301u, ahci.vs);
     CHECK_HEX("PxSIG is ATAPI", HYPE_AHCI_SIG_ATAPI, ahci.p_sig);
