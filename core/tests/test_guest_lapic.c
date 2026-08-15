@@ -685,7 +685,7 @@ static void test_all_lvt_entries_roundtrip(void) {
     (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_PMC, 4, 0xF0u);
     CHECK_HEX("pmc LVT roundtrips", 0xF0u,
               (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_PMC, 4, &v), v));
-    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_CMCI, 4, 0x100F2u),
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_CMCI, 4, 0x100F2u);
     CHECK_HEX("cmci LVT roundtrips", 0x100F2u,
               (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_CMCI, 4, &v), v));
 
