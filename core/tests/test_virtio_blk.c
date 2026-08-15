@@ -707,6 +707,140 @@ static void test_chain_bad_requests_complete_with_ioerr(void) {
     }
 }
 
+/*
+ * VALID-2: process_virtio_blk_queue() is shared, vendor-neutral code, and every
+ * guest-supplied address in it (the ring bases, each descriptor, every data
+ * segment, the status byte) is already routed through guest_dma_xlate() ->
+ * hype_gpa_to_host() -- the tests above all drive it with dma_map == 0
+ * ("trusted identity-mapped guest"), which never exercises that bounds check at
+ * all. These two prove the check is real for a genuinely non-identity guest
+ * (FW-1's own case): a legitimate request through a real hype_gpa_map_t still
+ * completes, and a data segment pointing outside that VM's own mapped window is
+ * refused rather than translated to whatever host address the raw guest value
+ * happens to collide with.
+ */
+#define TQM_QSZ 8u
+#define TQM_SECTORS 16u
+#define TQM_GUEST_BASE 0x9000000000ull /* arbitrary GPA base for this VM's one region */
+
+typedef struct {
+    uint8_t desc[TQM_QSZ * 16u];
+    uint8_t avail[4u + 2u * TQM_QSZ + 2u];
+    uint8_t used[4u + 8u * TQM_QSZ + 2u];
+    uint8_t hdr[16];
+    uint8_t status;
+    uint8_t gbuf[512u]; /* the one in-bounds data segment target */
+    hype_virtio_blk_t dev;
+    hype_blk_file_t file;
+    hype_blk_backend_t be;
+    uint8_t img[TQM_SECTORS * 512u];
+    hype_gpa_map_t map;
+} tqm_t;
+
+static uint64_t tqm_gpa(const tqm_t *q, const void *host_ptr) {
+    return TQM_GUEST_BASE + (uint64_t)((const uint8_t *)host_ptr - (const uint8_t *)q);
+}
+
+/* Same rig as tq_init(), but addresses stored on the wire are GUEST-PHYSICAL
+ * (TQM_GUEST_BASE-relative) offsets into `q`, and `q->map` maps exactly that one
+ * region to `q`'s real host address -- reproducing FW-1's non-identity case. */
+static void tqm_init(tqm_t *q, uint32_t req_type, uint64_t sector) {
+    unsigned s;
+
+    memset(q, 0, sizeof(*q));
+    hype_virtio_blk_set_reject_sink(tq_reject_sink);
+    tq_reject_count = 0;
+    tq_reject_last[0] = 0;
+    for (s = 0; s < TQM_SECTORS; s++) {
+        memset(q->img + s * 512u, (int)(0x10u + s), 512u);
+    }
+    q->status = 0xEE;
+
+    tq_put32(q->hdr, req_type);
+    tq_put64(q->hdr + 8, sector);
+
+    hype_gpa_map_reset(&q->map);
+    if (hype_gpa_map_add(&q->map, TQM_GUEST_BASE, (uint64_t)(uintptr_t)q, sizeof(*q)) != 0) {
+        printf("FAIL: tqm_init: could not map the test VM's one region\n");
+        failures++;
+    }
+
+    hype_virtio_blk_reset(&q->dev, TQM_SECTORS);
+    q->dev.queue_size = (uint16_t)TQM_QSZ;
+    q->dev.queue_desc = tqm_gpa(q, q->desc);
+    q->dev.queue_driver = tqm_gpa(q, q->avail);
+    q->dev.queue_device = tqm_gpa(q, q->used);
+
+    hype_blk_file_init(&q->file, &q->be, q->img, sizeof(q->img));
+}
+
+static void tqm_submit(tqm_t *q, uint16_t head) {
+    uint16_t idx = tq_get16(q->avail + 2);
+    tq_put16(q->avail + 4 + 2u * (idx % TQM_QSZ), head);
+    tq_put16(q->avail + 2, (uint16_t)(idx + 1u));
+}
+
+/* header -> one data segment -> status, all addresses GPA offsets into `q`
+ * except `data_addr`, which a caller may point outside `q` entirely to probe
+ * the bounds check. */
+static void tqm_desc(tqm_t *q, unsigned i, uint64_t addr, uint32_t len, uint16_t flags,
+                     uint16_t next) {
+    uint8_t *d = q->desc + i * 16u;
+    tq_put64(d, addr);
+    tq_put32(d + 8, len);
+    tq_put16(d + 12, flags);
+    tq_put16(d + 14, next);
+}
+
+static void tqm_chain_1seg(tqm_t *q, uint64_t data_addr, uint32_t data_len, uint16_t data_flags) {
+    tqm_desc(q, 0, tqm_gpa(q, q->hdr), 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    tqm_desc(q, 1, data_addr, data_len, (uint16_t)(HYPE_VIRTQ_DESC_F_NEXT | data_flags), 2);
+    tqm_desc(q, 2, tqm_gpa(q, &q->status), 1u, 0, 0);
+}
+
+static int tqm_run(tqm_t *q) {
+    return process_virtio_blk_queue(&q->dev, &q->be, &q->map);
+}
+
+static void test_chain_via_real_gpa_map_translates_and_succeeds(void) {
+    tqm_t q;
+
+    tqm_init(&q, HYPE_VIRTIO_BLK_T_OUT, 3);
+    memset(q.gbuf, 0xA5, sizeof(q.gbuf));
+    tqm_chain_1seg(&q, tqm_gpa(&q, q.gbuf), 512u, 0);
+    tqm_submit(&q, 0);
+
+    CHECK_HEX("a real (non-identity) gpa_map still lets a legitimate write through", 0,
+              tqm_run(&q));
+    CHECK_HEX("status OK through the real map", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("sector 3 actually written via the translated address", 0xA5u, q.img[3u * 512u]);
+}
+
+static void test_chain_data_segment_outside_mapped_region_is_rejected(void) {
+    tqm_t q;
+    uint8_t victim[512];
+
+    memset(victim, 0x77, sizeof(victim));
+    tqm_init(&q, HYPE_VIRTIO_BLK_T_OUT, 3);
+    /*
+     * The malicious segment names `victim`'s real host address as if it were a
+     * guest-physical one -- exactly what a guest driver would send if it had
+     * learned (or guessed) hype's own address space. `victim` is NOT part of
+     * `q`'s one mapped region, so this must be refused rather than translated.
+     */
+    tqm_chain_1seg(&q, (uint64_t)(uintptr_t)victim, 512u, 0);
+    tqm_submit(&q, 0);
+
+    CHECK_HEX("an out-of-region data segment does not abort the notify", 0, tqm_run(&q));
+    CHECK_HEX("out-of-region data segment reported IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+    CHECK_HEX("out-of-region data segment named in the log", 1,
+              tq_reject_says("bounds check"));
+    CHECK_HEX("sector 3 was never written (translation failed before any transfer)", 0x13u,
+              q.img[3u * 512u]);
+    CHECK_HEX("victim buffer untouched -- the guest never reached it", 0x77,
+              victim[0]);
+}
+
 /* #310 --------------------------------------------------------------------------------- */
 
 static void test_get_id_returns_the_serial_nul_padded(void) {
@@ -1080,6 +1214,8 @@ int main(void) {
     test_chain_cycle_is_rejected();
     test_chain_malformed_shapes_change_nothing();
     test_chain_bad_requests_complete_with_ioerr();
+    test_chain_via_real_gpa_map_translates_and_succeeds();
+    test_chain_data_segment_outside_mapped_region_is_rejected();
     test_get_id_returns_the_serial_nul_padded();
     test_get_id_is_stable_across_calls();
     test_get_id_default_serial_is_a_valid_20_byte_field();
