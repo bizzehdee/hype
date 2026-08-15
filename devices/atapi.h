@@ -53,7 +53,11 @@
  * dracut stage never mounts the CD and the boot times out. (Ubuntu's casper
  * scans block devices directly and so never needed them -- which is why GLADDER-6
  * worked before these existed and GLADDER-5 did not.) */
+#define HYPE_ATAPI_CMD_MODE_SENSE6 0x1Au
+#define HYPE_ATAPI_CMD_PREVENT_ALLOW_REMOVAL 0x1Eu
 #define HYPE_ATAPI_CMD_READ_TOC 0x43u
+#define HYPE_ATAPI_CMD_READ_DISC_INFORMATION 0x51u
+#define HYPE_ATAPI_CMD_MODE_SENSE10 0x5Au
 #define HYPE_ATAPI_CMD_GET_CONFIGURATION 0x46u
 #define HYPE_ATAPI_CMD_GET_EVENT_STATUS 0x4Au
 
@@ -75,6 +79,7 @@
 #define HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR 0x03u
 #define HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT 0x3Au
 #define HYPE_ATAPI_ASC_INVALID_COMMAND_OPCODE 0x20u
+#define HYPE_ATAPI_ASC_INVALID_FIELD_IN_CDB 0x24u
 #define HYPE_ATAPI_ASC_LBA_OUT_OF_RANGE 0x21u
 /* #287: unrecovered read error in the data area -- what a real drive reports when it
  * cannot read a sector it acknowledged. Used when hype's own BACKING STORE read fails
@@ -116,6 +121,14 @@ typedef struct {
      * console) instead of tracing every command. Reset by
      * hype_atapi_reset. */
     uint32_t command_count;
+    /* #92: per-opcode counts, and how many of each ended in CHECK CONDITION.
+     * Names the exact command an OS's filesystem probe tripped over -- a
+     * declined mount (Windows udfs.sys falling back to CDFS) is otherwise
+     * invisible: the failing CDB never appears in last_cdb because the next
+     * poll overwrites it. */
+    uint8_t op_hist_op[16];
+    uint32_t op_hist_count[16];
+    uint32_t op_hist_fail[16];
     uint32_t read10_count;
     uint32_t read12_count; /* READ(12) opcode 0xA8, issued by a DMA-capable libata */
     uint8_t last_cdb;

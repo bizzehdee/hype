@@ -294,6 +294,85 @@ static void handle_get_event_status(hype_atapi_t *dev, hype_atapi_result_t *out)
     dev->asc = 0;
 }
 
+/* READ DISC INFORMATION (0x51): one complete session, one complete data
+ * track, non-erasable -- a pressed DVD-ROM. #92: Windows' udfs.sys asks for
+ * this while deciding whether the disc is a mountable UDF volume; the
+ * CHECK CONDITION it used to get made it decline the volume, and CDFS then
+ * mounted the ISO9660 bridge stub (README.TXT alone) instead of the real
+ * 5.8 GB UDF filesystem -- Setup reported "a media driver ... is missing". */
+static void handle_read_disc_information(hype_atapi_t *dev, hype_atapi_result_t *out) {
+    zero_synth(out);
+    out->uses_media_data = 0;
+    if (!media_present(dev)) {
+        set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
+        return;
+    }
+    put_be16(out->synth_data + 0, 32u); /* disc information length */
+    out->synth_data[2] = 0x0Eu;         /* non-erasable, last session complete, disc complete */
+    out->synth_data[3] = 1u;            /* first track on disc */
+    out->synth_data[4] = 1u;            /* number of sessions (LSB) */
+    out->synth_data[5] = 1u;            /* first track in last session (LSB) */
+    out->synth_data[6] = 1u;            /* last track in last session (LSB) */
+    out->synth_data[7] = 0x20u;         /* unrestricted-use disc */
+    out->synth_data[8] = 0x00u;         /* disc type: CD-DA or CD-ROM disc */
+    out->synth_length = 34;
+    out->status = HYPE_ATAPI_STATUS_GOOD;
+    dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
+    dev->asc = 0;
+}
+
+/* MODE SENSE(6)/(10) (0x1A/0x5A): the read-error-recovery page (0x01) and the
+ * MM capabilities page (0x2A), which cdrom.sys reads while sizing up the
+ * drive. The 6-byte form differs only in its 4-byte parameter header. Pages
+ * this model does not have keep returning CHECK CONDITION, which callers
+ * treat as "page not supported" rather than "drive broken". */
+static void handle_mode_sense(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_MAX],
+                              hype_atapi_result_t *out) {
+    unsigned hdr = (cdb[0] == HYPE_ATAPI_CMD_MODE_SENSE10) ? 8u : 4u;
+    uint8_t page = (uint8_t)(cdb[2] & 0x3Fu);
+    unsigned page_len;
+
+    zero_synth(out);
+    out->uses_media_data = 0;
+    if (!media_present(dev)) {
+        set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_NOT_READY, HYPE_ATAPI_ASC_MEDIUM_NOT_PRESENT);
+        return;
+    }
+    if (page == 0x01u) {
+        /* Read/write error recovery: all-defaults (no retries modeled). */
+        out->synth_data[hdr + 0] = 0x01u;
+        out->synth_data[hdr + 1] = 10u;
+        page_len = 12u;
+    } else if (page == 0x2Au) {
+        /* MM capabilities and mechanical status. */
+        out->synth_data[hdr + 0] = 0x2Au;
+        out->synth_data[hdr + 1] = 18u;
+        out->synth_data[hdr + 2] = 0x09u; /* reads CD-R and DVD-ROM */
+        out->synth_data[hdr + 3] = 0x00u; /* writes nothing */
+        out->synth_data[hdr + 6] = 0x28u; /* tray loader, eject supported */
+        put_be16(out->synth_data + hdr + 8, 1385u * 8u);  /* max read speed (8x DVD, kB/s) */
+        put_be16(out->synth_data + hdr + 10, 0x0100u);    /* volume levels */
+        put_be16(out->synth_data + hdr + 12, 2048u);      /* buffer size (KiB) */
+        put_be16(out->synth_data + hdr + 14, 1385u * 8u); /* current read speed */
+        page_len = 20u;
+    } else {
+        set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_ILLEGAL_REQUEST,
+                             HYPE_ATAPI_ASC_INVALID_FIELD_IN_CDB);
+        return;
+    }
+    if (hdr == 8u) {
+        put_be16(out->synth_data + 0, (uint16_t)(hdr + page_len - 2u)); /* mode data length */
+        out->synth_data[2] = 0x00u; /* medium type: default */
+    } else {
+        out->synth_data[0] = (uint8_t)(hdr + page_len - 1u);
+        out->synth_data[1] = 0x00u;
+    }
+    out->synth_length = (uint16_t)(hdr + page_len);
+    out->status = HYPE_ATAPI_STATUS_GOOD;
+    dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
+    dev->asc = 0;
+}
+
 /* READ TOC/PMA/ATIP (0x43): a single data track starting at LBA 0 with the
  * lead-out at the media end. Answers the Formatted-TOC (format 0) and
  * multisession (format 1) queries the Linux sr driver issues at probe time;
@@ -436,10 +515,14 @@ void hype_atapi_reset_stream(hype_atapi_t *dev, hype_iso_stream_t *stream) {
     reset_state(dev);
 }
 
+static void atapi_dispatch_cdb(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_MAX],
+                               hype_atapi_result_t *out);
+
 void hype_atapi_execute_cdb(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_MAX],
                             hype_atapi_result_t *out) {
     /* Diagnostic bookkeeping (see hype_atapi_t): every CDB counts, so a
      * caller can report CD progress without tracing each command. */
+    unsigned hist_slot = 16u;
     dev->command_count++;
     dev->last_cdb = cdb[0];
     if (cdb[0] == HYPE_ATAPI_CMD_READ10) {
@@ -447,6 +530,30 @@ void hype_atapi_execute_cdb(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_
     } else if (cdb[0] == HYPE_ATAPI_CMD_READ12) {
         dev->read12_count++;
     }
+    {
+        unsigned hi;
+        for (hi = 0; hi < 16u; hi++) {
+            if (dev->op_hist_count[hi] != 0 && dev->op_hist_op[hi] == cdb[0]) {
+                hist_slot = hi;
+                break;
+            }
+            if (dev->op_hist_count[hi] == 0 && hist_slot == 16u) {
+                hist_slot = hi;
+            }
+        }
+        if (hist_slot < 16u) {
+            dev->op_hist_op[hist_slot] = cdb[0];
+            dev->op_hist_count[hist_slot]++;
+        }
+    }
+    atapi_dispatch_cdb(dev, cdb, out);
+    if (hist_slot < 16u && out->status != HYPE_ATAPI_STATUS_GOOD) {
+        dev->op_hist_fail[hist_slot]++;
+    }
+}
+
+static void atapi_dispatch_cdb(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_MAX],
+                               hype_atapi_result_t *out) {
     switch (cdb[0]) {
         case HYPE_ATAPI_CMD_TEST_UNIT_READY:
             handle_test_unit_ready(dev, out);
@@ -468,6 +575,21 @@ void hype_atapi_execute_cdb(hype_atapi_t *dev, const uint8_t cdb[HYPE_ATAPI_CDB_
             return;
         case HYPE_ATAPI_CMD_READ_TOC:
             handle_read_toc(dev, cdb, out);
+            return;
+        case HYPE_ATAPI_CMD_READ_DISC_INFORMATION:
+            handle_read_disc_information(dev, out);
+            return;
+        case HYPE_ATAPI_CMD_PREVENT_ALLOW_REMOVAL:
+            /* No tray to lock: accept and do nothing, like every virtual drive. */
+            zero_synth(out);
+            out->uses_media_data = 0;
+            out->status = HYPE_ATAPI_STATUS_GOOD;
+            dev->sense_key = HYPE_ATAPI_SENSE_KEY_NO_SENSE;
+            dev->asc = 0;
+            return;
+        case HYPE_ATAPI_CMD_MODE_SENSE6:
+        case HYPE_ATAPI_CMD_MODE_SENSE10:
+            handle_mode_sense(dev, cdb, out);
             return;
         case HYPE_ATAPI_CMD_GET_CONFIGURATION:
             handle_get_configuration(dev, out);

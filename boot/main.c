@@ -15933,6 +15933,28 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
             g_vms[vi].iso_stream.iso_size = iso_part.size_bytes;
             if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                 cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
+                /* #92: report the DISC's size, not the partition's. The partition is
+                 * MiB-rounded, so READ CAPACITY otherwise claims up to ~500 phantom
+                 * sectors of zero padding past the ISO. Windows' udfs.sys probes the
+                 * UDF anchor at the reported last LBA, reads zeros there, rejects the
+                 * volume, and mounts the ISO9660 bridge stub instead -- on Windows
+                 * install media that stub holds ONE file (README.TXT), so Setup found
+                 * no install.wim and asked for a "media driver". The PVD's Volume
+                 * Space Size (byte 80 of sector 16, little-endian half of the
+                 * both-endian field) is the disc's true block count. */
+                uint8_t vss[4];
+                if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32768u + 80u, vss, 4u) == 0) {
+                    uint64_t disc_bytes = ((uint64_t)vss[0] | ((uint64_t)vss[1] << 8) |
+                                           ((uint64_t)vss[2] << 16) | ((uint64_t)vss[3] << 24)) *
+                                          2048ull;
+                    if (disc_bytes != 0 && disc_bytes <= g_vms[vi].iso_stream.iso_size) {
+                        hype_debug_print("host-stream: vm%u disc size %llu bytes from the PVD "
+                                         "(partition carries %llu) [#92]\n", vi,
+                                         (unsigned long long)disc_bytes,
+                                         (unsigned long long)g_vms[vi].iso_stream.iso_size);
+                        g_vms[vi].iso_stream.iso_size = disc_bytes;
+                    }
+                }
                 /* Streaming read path verified -- back the guest CD with it. */
                 g_vms[vi].iso_stream_ready = 1;
                 hype_serial_print("host-stream: vm%u CD001 verified via streaming from "
@@ -19920,6 +19942,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     hype_ps2_mouse_has_pending_byte(&g_vms[vi].mouse),
                                     (unsigned)g_vms[vi].atapi.last_cdb,
                                     (unsigned)g_vms[vi].atapi.command_count);
+                                {   /* #92: which CDBs the guest issued, and which failed. */
+                                    unsigned hi;
+                                    hype_debug_print("fw-1 ATAPIOPS vm%u:", vi);
+                                    for (hi = 0; hi < 16u; hi++) {
+                                        if (g_vms[vi].atapi.op_hist_count[hi] == 0) continue;
+                                        hype_debug_print(" %02x=%u/f%u",
+                                            (unsigned)g_vms[vi].atapi.op_hist_op[hi],
+                                            (unsigned)g_vms[vi].atapi.op_hist_count[hi],
+                                            (unsigned)g_vms[vi].atapi.op_hist_fail[hi]);
+                                    }
+                                    hype_debug_print(" [#92]\n");
+                                }
                                 if (vi == 0u) {
                                     const uint8_t *pcfg =
                                         g_fw_1_pci.devices[HYPE_FW_1_PCI_DEV_AHCI].config;

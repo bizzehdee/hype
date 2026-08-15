@@ -486,6 +486,71 @@ static void test_read_toc_multisession(void) {
     CHECK_HEX("last session = 1", 1u, out.synth_data[3]);
 }
 
+static void test_read_disc_information(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ_DISC_INFORMATION);
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("response length 34", 34, out.synth_length);
+    CHECK_HEX("disc information length 32", 32u,
+              ((unsigned)out.synth_data[0] << 8) | out.synth_data[1]);
+    CHECK_HEX("disc complete, last session complete", 0x0Eu, out.synth_data[2]);
+    CHECK_HEX("one session", 1u, out.synth_data[4]);
+}
+
+static void test_mode_sense10_capabilities_page(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    make_cdb(cdb, HYPE_ATAPI_CMD_MODE_SENSE10);
+    cdb[2] = 0x2A;
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("response length 28 (8-byte header + 20-byte page)", 28, out.synth_length);
+    CHECK_HEX("mode data length covers header + page", 26u,
+              ((unsigned)out.synth_data[0] << 8) | out.synth_data[1]);
+    CHECK_HEX("page code 0x2A", 0x2Au, out.synth_data[8]);
+    CHECK_HEX("reads DVD-ROM", 0x08u, out.synth_data[10] & 0x08u);
+}
+
+static void test_mode_sense6_error_recovery_page(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    make_cdb(cdb, HYPE_ATAPI_CMD_MODE_SENSE6);
+    cdb[2] = 0x01;
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("response length 16 (4-byte header + 12-byte page)", 16, out.synth_length);
+    CHECK_HEX("mode data length excludes its own byte", 15u, out.synth_data[0]);
+    CHECK_HEX("page code 0x01", 0x01u, out.synth_data[4]);
+}
+
+static void test_mode_sense_unknown_page_rejected(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    make_cdb(cdb, HYPE_ATAPI_CMD_MODE_SENSE10);
+    cdb[2] = 0x1C;
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("status CHECK CONDITION", HYPE_ATAPI_STATUS_CHECK_CONDITION, out.status);
+    CHECK_HEX("sense key ILLEGAL REQUEST", HYPE_ATAPI_SENSE_KEY_ILLEGAL_REQUEST, dev.sense_key);
+}
+
 /* #326: the same invariant, now over the STREAM backing -- the chunked one it used to be
  * asserted against is retired, but a >=4GB ISO is exactly what streaming exists to serve, so the
  * assertion matters more rather than less. */
@@ -590,6 +655,10 @@ int main(void) {
     test_get_event_status_media_present();
     test_read_toc_formatted();
     test_read_toc_multisession();
+    test_read_disc_information();
+    test_mode_sense10_capabilities_page();
+    test_mode_sense6_error_recovery_page();
+    test_mode_sense_unknown_page_rejected();
     test_reset_stream_media_size_not_truncated();
     test_read10_offset_no_uint32_overflow();
 
