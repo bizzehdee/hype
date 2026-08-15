@@ -95,23 +95,48 @@ unsigned long long hype_vm_uptime_ms(const hype_vm_uptime_t *u);
  * uptime accumulator, the formatter was already tested while the DERIVATION had no
  * tests, which is how a permanently-constant metric survived.
  */
+/*
+ * #429: this used to compare only the two most recent samples, which flickered wildly
+ * (0% <-> 96%) once the caller started sampling on every VM-exit rather than once per
+ * render tick -- a window of "since the last call" shrinks to whatever tiny slice of
+ * work happened between two exits, not anything a human would call a rate.
+ *
+ * Fixed by decimating commits into a small ring spanning the requested `window` (in the
+ * caller's own unit -- TSC ticks for FW-1's real caller), independent of how often
+ * hype_vm_cpu_sample() itself is called: a commit lands at most once per `window /
+ * HYPE_VM_CPU_RING_MAX`, so the ring always covers roughly `window` regardless of call
+ * cadence. The percentage is busy/wall between the OLDEST populated ring entry and the
+ * latest raw sample, which is what makes it "decay over N seconds" rather than snap.
+ */
+#define HYPE_VM_CPU_RING_MAX 32u
+
 typedef struct {
-    unsigned long long last_busy; /* cumulative busy at the previous sample */
-    unsigned long long last_wall; /* cumulative wall-clock at the previous sample */
-    unsigned pct;                 /* most recent window's percentage, 0..100 */
+    unsigned long long last_busy; /* most recent raw cumulative sample */
+    unsigned long long last_wall;
+    unsigned long long ring_busy[HYPE_VM_CPU_RING_MAX];
+    unsigned long long ring_wall[HYPE_VM_CPU_RING_MAX];
+    unsigned long long last_commit_wall; /* wall value of the most recently committed entry */
+    unsigned int ring_count;             /* populated ring entries, <= HYPE_VM_CPU_RING_MAX */
+    unsigned int ring_next;              /* index the next commit writes (mod RING_MAX) */
+    unsigned pct;                        /* most recent window's percentage, 0..100 */
     int started;
 } hype_vm_cpu_t;
 
 void hype_vm_cpu_reset(hype_vm_cpu_t *c);
 
 /*
- * Fold one sample. `busy_total` and `wall_total` are cumulative and must be in the
- * same unit. A window with no elapsed wall time, or either counter going backwards,
- * leaves the previous reading in place rather than producing a spike. The result is
- * clamped to 100 so measurement jitter cannot report an impossible figure.
+ * Fold one sample. `busy_total` and `wall_total` are cumulative and must be in the same
+ * unit as `window` (the averaging window's span in that same unit -- e.g. TSC ticks for
+ * N seconds at the host's TSC frequency). A window with no elapsed wall time since the
+ * oldest populated ring entry, or either counter going backwards, leaves the previous
+ * percentage in place rather than producing a spike. The result is clamped to 100 so
+ * measurement jitter cannot report an impossible figure. `window == 0` is treated as 1
+ * (the smallest meaningful window), matching TERM-7/#429's own "no less than 1 second"
+ * floor at the config layer -- this function does not know what a second is, so the
+ * floor has to be enforced again here for any caller that skips the config parser.
  */
 void hype_vm_cpu_sample(hype_vm_cpu_t *c, unsigned long long busy_total,
-                        unsigned long long wall_total);
+                        unsigned long long wall_total, unsigned long long window);
 
 unsigned hype_vm_cpu_pct(const hype_vm_cpu_t *c);
 

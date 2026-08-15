@@ -489,7 +489,8 @@ enum {
     H_DEFAULT_NET_MODE = 1u << 2,
     H_DASHBOARD_VIEW = 1u << 3,
     H_AUTOSTART = 1u << 4,
-    H_RESOLUTION = 1u << 5
+    H_RESOLUTION = 1u << 5,
+    H_CPU_AVG_WINDOW = 1u << 6
 };
 
 static void hype_globals_defaults(hype_cfg_hype_t *h) {
@@ -499,8 +500,10 @@ static void hype_globals_defaults(hype_cfg_hype_t *h) {
         p[i] = 0;
     }
     /* Zero is the right default for every enum here (NET_NONE, VIEW_DASHBOARD, AUTOSTART_ALL) and
-     * for the empty cpu budget meaning "all cores". config_version is the one exception. */
+     * for the empty cpu budget meaning "all cores". config_version and cpu_avg_window_secs are
+     * the exceptions -- both have a real, non-zero default. */
     h->config_version = 1u;
+    h->cpu_avg_window_secs = 1u;
 }
 
 /* `autostart = a, b` -- the list form. `all` / `none` are handled by the caller. */
@@ -601,6 +604,29 @@ static hype_cfg_status_t apply_hype_field(hype_cfg_hype_t *h, unsigned int *seen
         h->resolution_height = (unsigned int)hgt;
         h->has_resolution = 1;
         *seen |= H_RESOLUTION;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "cpu_avg_window_secs")) {
+        /*
+         * #429: unlike a syntax error (non-numeric, which still falls through to §4.3's whole-
+         * section malformed reset below), a successfully-parsed 0 is CLAMPED to 1 rather than
+         * rejected -- it is out of range, not unparseable, and the ticket's own requirement is
+         * "no less than 1 second", a floor, not a hard refusal.
+         */
+        /*
+         * NOT parse_uint_field(): that helper rejects 0 outright (BAD_VALUE) for the many
+         * fields where 0 is always meaningless (vcpus, mem_mb, ...), which would make the
+         * clamp below unreachable -- 0 has to actually parse here so it can be clamped
+         * instead of falling into the whole-section malformed reset a genuine BAD_VALUE
+         * triggers.
+         */
+        unsigned long long v;
+        if (*seen & H_CPU_AVG_WINDOW) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_parse_uint(val, &v) != 0 || v > 0xFFFFFFFFULL) {
+            return HYPE_CFG_ERR_BAD_VALUE;
+        }
+        h->cpu_avg_window_secs = (v == 0u) ? 1u : (unsigned int)v;
+        *seen |= H_CPU_AVG_WINDOW;
         return HYPE_CFG_OK;
     }
     return HYPE_CFG_ERR_UNKNOWN_KEY;
@@ -1504,6 +1530,9 @@ static void serialize_hype(hype_cfg_w_t *w, const hype_cfg_hype_t *h) {
         hype_snprintf(tmp, sizeof(tmp), "%ux%u", h->resolution_width, h->resolution_height);
         w_kv(w, "resolution", tmp);
     }
+    /* #429: always has a real, meaningful value (default 1) -- same "always emit" treatment as
+     * config_version, no has_* flag needed. */
+    w_kv_uint(w, "cpu_avg_window_secs", h->cpu_avg_window_secs);
 }
 
 static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {

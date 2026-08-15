@@ -237,6 +237,17 @@ typedef struct {
     unsigned int resolution_width;
     unsigned int resolution_height;
 
+    /*
+     * #429: how many seconds the dashboard's CPU%% column averages over. Always holds a valid
+     * value -- hype_globals_defaults() sets it to 1 (§4.3's usual "the default when absent"), and
+     * an explicitly-configured 0 is CLAMPED up to 1 rather than triggering the whole-[hype]-
+     * section malformed fallback a syntax error would: a 0-second window is out of range, not
+     * unparseable, and clamping just this one field is more precise than resetting every global.
+     * No `has_*` flag needed, unlike resolution -- every value (including the default) is
+     * meaningful and directly usable, there is no "unset" state to distinguish.
+     */
+    unsigned int cpu_avg_window_secs;
+
     /* Set when the section was present but something in it was rejected: the defaults above apply,
      * and the caller should say so rather than let the operator believe a global took effect. */
     int malformed;

@@ -52,28 +52,48 @@ unsigned long long hype_vm_uptime_ms(const hype_vm_uptime_t *u) {
 }
 
 void hype_vm_cpu_reset(hype_vm_cpu_t *c) {
+    unsigned int i;
     if (c == (hype_vm_cpu_t *)0) {
         return;
     }
     c->last_busy = 0;
     c->last_wall = 0;
+    c->last_commit_wall = 0;
+    for (i = 0; i < HYPE_VM_CPU_RING_MAX; i++) {
+        c->ring_busy[i] = 0;
+        c->ring_wall[i] = 0;
+    }
+    c->ring_count = 0;
+    c->ring_next = 0;
     c->pct = 0;
     c->started = 0;
 }
 
 void hype_vm_cpu_sample(hype_vm_cpu_t *c, unsigned long long busy_total,
-                        unsigned long long wall_total) {
-    unsigned long long dbusy, dwall;
+                        unsigned long long wall_total, unsigned long long window) {
+    unsigned long long decim;
+    unsigned int oldest_idx;
+    unsigned long long oldest_busy, oldest_wall;
+
     if (c == (hype_vm_cpu_t *)0) {
         return;
     }
     if (!c->started) {
-        /* First sample only establishes the baseline: with no previous reading there
-         * is no window to average over, and treating the totals as a window would
-         * report the lifetime mean -- exactly the behaviour this replaces. */
+        /*
+         * First sample only establishes the baseline: with no previous reading there is
+         * no window to average over, and treating the totals as a window would report
+         * the lifetime mean -- exactly the behaviour this replaces. It also seeds ring
+         * slot 0, so the very NEXT call already has one checkpoint to measure against
+         * instead of needing a third call before any percentage is available at all.
+         */
         c->started = 1;
         c->last_busy = busy_total;
         c->last_wall = wall_total;
+        c->last_commit_wall = wall_total;
+        c->ring_busy[0] = busy_total;
+        c->ring_wall[0] = wall_total;
+        c->ring_count = 1;
+        c->ring_next = 1;
         return;
     }
     if (busy_total < c->last_busy || wall_total < c->last_wall) {
@@ -83,14 +103,43 @@ void hype_vm_cpu_sample(hype_vm_cpu_t *c, unsigned long long busy_total,
         c->last_wall = wall_total;
         return;
     }
-    dbusy = busy_total - c->last_busy;
-    dwall = wall_total - c->last_wall;
     c->last_busy = busy_total;
     c->last_wall = wall_total;
-    if (dwall == 0u) {
-        return; /* no window elapsed; keep the previous percentage */
+
+    /* The oldest populated slot: index 0 while the ring hasn't wrapped yet, otherwise
+     * the slot about to be overwritten next. Computed BEFORE this sample's own commit
+     * decision below, so a fresh commit never measures against itself. */
+    oldest_idx = (c->ring_count < HYPE_VM_CPU_RING_MAX) ? 0u : (c->ring_next % HYPE_VM_CPU_RING_MAX);
+    oldest_busy = c->ring_busy[oldest_idx];
+    oldest_wall = c->ring_wall[oldest_idx];
+    if (wall_total > oldest_wall) {
+        unsigned long long dbusy = busy_total - oldest_busy;
+        unsigned long long dwall = wall_total - oldest_wall;
+        c->pct = (unsigned)((dbusy >= dwall) ? 100u : ((dbusy * 100u) / dwall));
     }
-    c->pct = (unsigned)((dbusy >= dwall) ? 100u : ((dbusy * 100u) / dwall));
+    /* else: no elapsed time against the oldest checkpoint (this IS that checkpoint's
+     * own instant) -- keep the previous percentage rather than dividing by zero. */
+
+    if (window == 0u) {
+        window = 1u;
+    }
+    decim = window / HYPE_VM_CPU_RING_MAX;
+    if (decim == 0u) {
+        decim = 1u;
+    }
+    /* Commit a new checkpoint for FUTURE calls at most once per `decim` -- decoupling the
+     * ring's resolution from however often this function itself is called, which can be
+     * far finer than the window (FW-1's real caller samples on every VM exit). */
+    if (wall_total - c->last_commit_wall >= decim) {
+        unsigned int idx = c->ring_next % HYPE_VM_CPU_RING_MAX;
+        c->ring_busy[idx] = busy_total;
+        c->ring_wall[idx] = wall_total;
+        c->ring_next++;
+        if (c->ring_count < HYPE_VM_CPU_RING_MAX) {
+            c->ring_count++;
+        }
+        c->last_commit_wall = wall_total;
+    }
 }
 
 unsigned hype_vm_cpu_pct(const hype_vm_cpu_t *c) {

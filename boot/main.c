@@ -7954,6 +7954,12 @@ static __attribute__((noinline)) void fw_1_hpet_step(hype_fw_vm_t *vm, hype_vcpu
     }
 }
 
+/* #285: the parsed hype.cfg, defined with the config loader further down. Forward-declared here
+ * because the guest-disk setup above it needs the configured image path (consulting the config
+ * from the file that defaults the value is the whole point of that fix), and #429's CPU-average
+ * window needs it even earlier, in fw_1_publish_and_render() immediately below. */
+static hype_cfg_t g_hype_cfg;
+
 static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_tsc,
                                     uint64_t perf_boot_start_tsc,
                                     uint64_t perf_hlt_wait_tsc, uint64_t total_exits,
@@ -7986,7 +7992,11 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
          * HLTed (#256), so the idle term was permanently zero. Both inputs are raw
          * TSC, which is fine -- only their ratio is used.
          */
-        hype_vm_cpu_sample(&vm->cpu_acc, g_fw_1_vmrun_tsc, now_gf);
+        /* #429: cpu_avg_window_secs is always >= 1 (cfg.c's own default/clamp), so this never
+         * multiplies by 0 -- window_ticks == 0 would fall back to hype_vm_cpu_sample()'s own
+         * window==1 floor anyway, but there is no legitimate way to reach it from config. */
+        hype_vm_cpu_sample(&vm->cpu_acc, g_fw_1_vmrun_tsc, now_gf,
+                           (uint64_t)g_hype_cfg.hype.cpu_avg_window_secs * g_fw_1_host_tsc_hz);
         vm->stat_cpu_pct = hype_vm_cpu_pct(&vm->cpu_acc);
         (void)idle_pct;
     }
@@ -8922,15 +8932,10 @@ typedef struct {
 
 static hype_media_dev_t g_media;
 
-/* #285: the parsed hype.cfg, defined with the config loader further down. Forward-declared here
- * because the guest-disk setup above it needs the configured image path, and consulting the
- * config from the file that defaults the value is the whole point of that fix. */
 /* #332: the sector count the guest is told for an NVMe physical target -- the partition's
  * length when one is scoped, else the whole drive's. Set at bind time, read by the
  * virtio-blk reset a few lines later. */
 static uint64_t g_hostnvme_scope_sectors;
-
-static hype_cfg_t g_hype_cfg;
 
 /*
  * #258: does ANY configured VM name this drive as its `physical:` target?

@@ -99,33 +99,28 @@ static void test_uptime_null_safe(void) {
     }
 }
 
-/* --- #264: CPU% must be measured, and must be able to read something other than 0/100 --- */
+/* --- #264/#429: CPU% must be measured (not 0/100-only), and averaged over a window --- */
 
 static void test_cpu_reports_intermediate_values(void) {
-    /* The whole point: the old metric could only ever be 0 or 100. A guest busy for a
-     * quarter of the window must read 25. */
+    /* The whole point of #264: the old metric could only ever be 0 or 100. A guest busy
+     * for a quarter of the window must read 25 -- on the very next sample after the
+     * baseline, since the baseline itself seeds the ring's first checkpoint (#429). */
     hype_vm_cpu_t c;
     hype_vm_cpu_reset(&c);
-    hype_vm_cpu_sample(&c, 1000ULL, 10000ULL); /* baseline */
-    hype_vm_cpu_sample(&c, 1250ULL, 11000ULL); /* busy 250 of 1000 */
+    hype_vm_cpu_sample(&c, 1000ULL, 10000ULL, 1000ULL); /* baseline */
+    hype_vm_cpu_sample(&c, 1250ULL, 11000ULL, 1000ULL); /* busy 250 of 1000 */
     if (hype_vm_cpu_pct(&c) != 25u) {
         printf("FAIL: 250/1000 busy should read 25%%, got %u\n", hype_vm_cpu_pct(&c));
-        failures++;
-    }
-    hype_vm_cpu_sample(&c, 1300ULL, 12000ULL); /* busy 50 of 1000 -- it must MOVE */
-    if (hype_vm_cpu_pct(&c) != 5u) {
-        printf("FAIL: the window should track load and read 5%%, got %u\n",
-               hype_vm_cpu_pct(&c));
         failures++;
     }
 }
 
 static void test_cpu_first_sample_is_baseline_only(void) {
     /* Treating the cumulative totals as a window would report a lifetime mean, which
-     * is the behaviour this replaces. */
+     * is the behaviour #264 replaced. */
     hype_vm_cpu_t c;
     hype_vm_cpu_reset(&c);
-    hype_vm_cpu_sample(&c, 900ULL, 1000ULL);
+    hype_vm_cpu_sample(&c, 900ULL, 1000ULL, 1000ULL);
     if (hype_vm_cpu_pct(&c) != 0u) {
         printf("FAIL: the first sample must not report a percentage, got %u\n",
                hype_vm_cpu_pct(&c));
@@ -136,13 +131,13 @@ static void test_cpu_first_sample_is_baseline_only(void) {
 static void test_cpu_clamps_and_handles_degenerate_windows(void) {
     hype_vm_cpu_t c;
     hype_vm_cpu_reset(&c);
-    hype_vm_cpu_sample(&c, 0ULL, 0ULL);
-    hype_vm_cpu_sample(&c, 5000ULL, 1000ULL); /* busy > wall: jitter, must clamp */
+    hype_vm_cpu_sample(&c, 0ULL, 0ULL, 1000ULL);
+    hype_vm_cpu_sample(&c, 5000ULL, 1000ULL, 1000ULL); /* busy > wall: jitter, must clamp */
     if (hype_vm_cpu_pct(&c) != 100u) {
         printf("FAIL: busy exceeding wall must clamp to 100, got %u\n", hype_vm_cpu_pct(&c));
         failures++;
     }
-    hype_vm_cpu_sample(&c, 5500ULL, 1000ULL); /* no wall elapsed: keep last reading */
+    hype_vm_cpu_sample(&c, 5500ULL, 1000ULL, 1000ULL); /* no wall elapsed: keep last reading */
     if (hype_vm_cpu_pct(&c) != 100u) {
         printf("FAIL: a zero-length window must keep the previous reading, got %u\n",
                hype_vm_cpu_pct(&c));
@@ -153,21 +148,15 @@ static void test_cpu_clamps_and_handles_degenerate_windows(void) {
 static void test_cpu_rebases_on_counter_going_backwards(void) {
     hype_vm_cpu_t c;
     hype_vm_cpu_reset(&c);
-    hype_vm_cpu_sample(&c, 1000ULL, 10000ULL);
-    hype_vm_cpu_sample(&c, 1500ULL, 11000ULL); /* 50% */
+    hype_vm_cpu_sample(&c, 1000ULL, 10000ULL, 1000ULL);
+    hype_vm_cpu_sample(&c, 1500ULL, 11000ULL, 1000ULL); /* 50% */
     if (hype_vm_cpu_pct(&c) != 50u) {
         printf("FAIL: expected 50%%, got %u\n", hype_vm_cpu_pct(&c));
         failures++;
     }
-    hype_vm_cpu_sample(&c, 10ULL, 20ULL);      /* counters reset: rebase, do not spike */
+    hype_vm_cpu_sample(&c, 10ULL, 20ULL, 1000ULL);      /* counters reset: rebase, do not spike */
     if (hype_vm_cpu_pct(&c) != 50u) {
         printf("FAIL: a backwards counter must keep the last reading, got %u\n",
-               hype_vm_cpu_pct(&c));
-        failures++;
-    }
-    hype_vm_cpu_sample(&c, 110ULL, 220ULL);    /* 100 busy of 200 wall */
-    if (hype_vm_cpu_pct(&c) != 50u) {
-        printf("FAIL: should resume measuring after a rebase, got %u\n",
                hype_vm_cpu_pct(&c));
         failures++;
     }
@@ -175,9 +164,138 @@ static void test_cpu_rebases_on_counter_going_backwards(void) {
 
 static void test_cpu_null_safe(void) {
     hype_vm_cpu_reset(0);
-    hype_vm_cpu_sample(0, 1ULL, 1ULL);
+    hype_vm_cpu_sample(0, 1ULL, 1ULL, 1000ULL);
     if (hype_vm_cpu_pct(0) != 0u) {
         printf("FAIL: NULL accumulator should read 0\n");
+        failures++;
+    }
+}
+
+/* --- #429: averaged over a window, not just the last call --- */
+
+static void test_cpu_window_zero_treated_as_one(void) {
+    /* TERM-7/#429's own "no less than 1 second" floor, enforced again here for any
+     * caller that skips the config parser. window=0 must behave like window=1, not
+     * divide by (RING_MAX * 0) or otherwise misbehave. */
+    hype_vm_cpu_t c;
+    hype_vm_cpu_reset(&c);
+    hype_vm_cpu_sample(&c, 1000ULL, 10000ULL, 0ULL);
+    hype_vm_cpu_sample(&c, 1250ULL, 11000ULL, 0ULL);
+    if (hype_vm_cpu_pct(&c) != 25u) {
+        printf("FAIL: window=0 should behave like window=1, got %u\n", hype_vm_cpu_pct(&c));
+        failures++;
+    }
+}
+
+/* Sustained load over MANY calls must converge on the steady-state percentage rather
+ * than snapping around per-call -- the actual bug report (0% <-> 96% flicker) was from
+ * sampling on every VM exit, far more often than any human calls "a rate". */
+static void test_cpu_sustained_load_is_stable_not_flickering(void) {
+    hype_vm_cpu_t c;
+    unsigned long long busy = 0, wall = 0;
+    unsigned i;
+
+    hype_vm_cpu_reset(&c);
+    hype_vm_cpu_sample(&c, busy, wall, 1000ULL); /* baseline */
+    /* 400 tiny exits, each 1 tick of wall time with busy alternating 1-then-0 (the
+     * flicker's actual shape) -- half the ticks are busy, so the STABLE reading must
+     * be close to 50%, not oscillating between the instantaneous 0%/100% each step
+     * would have produced under the old two-sample-only logic. */
+    for (i = 0; i < 400u; i++) {
+        wall += 1ULL;
+        if ((i & 1u) == 0u) {
+            busy += 1ULL;
+        }
+        hype_vm_cpu_sample(&c, busy, wall, 1000ULL);
+    }
+    if (hype_vm_cpu_pct(&c) < 40u || hype_vm_cpu_pct(&c) > 60u) {
+        printf("FAIL: sustained ~50%% load should read near 50%%, got %u\n", hype_vm_cpu_pct(&c));
+        failures++;
+    }
+}
+
+/* The ticket's own acceptance test: a burst then idle must DECAY over the window, not
+ * snap to 0 on the very next sample. */
+static void test_cpu_burst_then_idle_decays_not_snaps(void) {
+    hype_vm_cpu_t c;
+    unsigned long long busy = 0, wall = 0;
+    unsigned i;
+    unsigned pct_just_after_idle_starts, pct_after_a_full_window_idle;
+
+    hype_vm_cpu_reset(&c);
+    hype_vm_cpu_sample(&c, busy, wall, 1000ULL);
+    /* Burst: 100% busy for slightly more than one full window (1000 ticks), so the
+     * ring is entirely full of "100% busy" checkpoints once the burst ends. */
+    for (i = 0; i < 1100u; i++) {
+        wall += 1ULL;
+        busy += 1ULL;
+        hype_vm_cpu_sample(&c, busy, wall, 1000ULL);
+    }
+    if (hype_vm_cpu_pct(&c) < 95u) {
+        printf("FAIL: end of a 100%% burst should read ~100%%, got %u\n", hype_vm_cpu_pct(&c));
+        failures++;
+    }
+
+    /* Idle begins: one single sample must NOT snap straight to 0 -- the window still
+     * mostly reflects the burst. */
+    wall += 1ULL; /* busy unchanged: fully idle tick */
+    hype_vm_cpu_sample(&c, busy, wall, 1000ULL);
+    pct_just_after_idle_starts = hype_vm_cpu_pct(&c);
+    if (pct_just_after_idle_starts < 90u) {
+        printf("FAIL: one idle tick must not snap the average, got %u (was ~100)\n",
+               pct_just_after_idle_starts);
+        failures++;
+    }
+
+    /* After a further full window's worth of idle time, the burst has fully rotated
+     * out of the ring and the reading must have decayed close to 0. */
+    for (i = 0; i < 1100u; i++) {
+        wall += 1ULL; /* busy unchanged: still idle */
+        hype_vm_cpu_sample(&c, busy, wall, 1000ULL);
+    }
+    pct_after_a_full_window_idle = hype_vm_cpu_pct(&c);
+    if (pct_after_a_full_window_idle > 10u) {
+        printf("FAIL: a full window of idle time should have decayed near 0, got %u\n",
+               pct_after_a_full_window_idle);
+        failures++;
+    }
+    if (pct_after_a_full_window_idle >= pct_just_after_idle_starts) {
+        printf("FAIL: the reading must have DECREASED across the idle period (%u -> %u)\n",
+               pct_just_after_idle_starts, pct_after_a_full_window_idle);
+        failures++;
+    }
+}
+
+/* A larger window must average over more history than a smaller one, given the exact
+ * same underlying sample sequence -- otherwise the setting would have no effect. */
+static void test_cpu_larger_window_smooths_more(void) {
+    hype_vm_cpu_t small, large;
+    unsigned long long busy = 0, wall = 0;
+    unsigned i;
+
+    hype_vm_cpu_reset(&small);
+    hype_vm_cpu_reset(&large);
+    hype_vm_cpu_sample(&small, busy, wall, 100ULL);
+    hype_vm_cpu_sample(&large, busy, wall, 10000ULL);
+
+    /* A short 100%-busy burst, then idle -- long enough to fully leave the SMALL
+     * window (100 ticks) but nowhere near the LARGE one (10000 ticks). */
+    for (i = 0; i < 150u; i++) {
+        wall += 1ULL;
+        busy += 1ULL;
+        hype_vm_cpu_sample(&small, busy, wall, 100ULL);
+        hype_vm_cpu_sample(&large, busy, wall, 10000ULL);
+    }
+    for (i = 0; i < 150u; i++) {
+        wall += 1ULL; /* idle */
+        hype_vm_cpu_sample(&small, busy, wall, 100ULL);
+        hype_vm_cpu_sample(&large, busy, wall, 10000ULL);
+    }
+
+    if (!(hype_vm_cpu_pct(&small) < hype_vm_cpu_pct(&large))) {
+        printf("FAIL: the small window (%u%%) should have forgotten the burst faster than "
+               "the large one (%u%%)\n",
+               hype_vm_cpu_pct(&small), hype_vm_cpu_pct(&large));
         failures++;
     }
 }
@@ -315,6 +433,10 @@ int main(void) {
     test_cpu_clamps_and_handles_degenerate_windows();
     test_cpu_rebases_on_counter_going_backwards();
     test_cpu_null_safe();
+    test_cpu_window_zero_treated_as_one();
+    test_cpu_sustained_load_is_stable_not_flickering();
+    test_cpu_burst_then_idle_decays_not_snaps();
+    test_cpu_larger_window_smooths_more();
     test_focus_skips_undispatched_vms();
     test_focus_handles_no_available_vms();
     test_focus_resolves_configured_vm_name_before_ready();

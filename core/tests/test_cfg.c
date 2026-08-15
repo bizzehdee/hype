@@ -1228,6 +1228,68 @@ static void test_hype_resolution_bad_values(void) {
                                 "resolution = 1920x1080\nresolution = 640x480\n");
 }
 
+/* #429 --------------------------------------------------------------------------------- */
+
+static void test_hype_cpu_avg_window_default_is_one(void) {
+    hype_cfg_t c;
+    (void)parse_copy("[vm.a]\n" REQ, &c);
+    CHECK_INT("defaults to 1 second when [hype] is absent entirely", 1,
+              (int)c.hype.cpu_avg_window_secs);
+}
+
+static void test_hype_cpu_avg_window_configured_value_is_kept(void) {
+    char cfg[1024];
+    hype_cfg_t c;
+    hype_cfg_result_t r;
+
+    snprintf(cfg, sizeof(cfg), "[hype]\ncpu_avg_window_secs = 5\n[vm.a]\n" REQ);
+    r = parse_copy(cfg, &c);
+    CHECK_INT("parses OK", HYPE_CFG_OK, r.status);
+    CHECK_INT("not malformed", 0, c.hype.malformed);
+    CHECK_INT("configured value is kept", 5, (int)c.hype.cpu_avg_window_secs);
+}
+
+/* A 0 is a successfully-parsed NUMBER that is merely out of range -- clamped to the floor,
+ * not treated as a syntax error that resets the whole [hype] section. */
+static void test_hype_cpu_avg_window_zero_is_clamped_not_rejected(void) {
+    char cfg[1024];
+    hype_cfg_t c;
+    hype_cfg_result_t r;
+
+    snprintf(cfg, sizeof(cfg), "[hype]\ncpu_avg_window_secs = 0\ndefault_net_mode = nat\n[vm.a]\n" REQ);
+    r = parse_copy(cfg, &c);
+    CHECK_INT("parses OK", HYPE_CFG_OK, r.status);
+    CHECK_INT("NOT flagged malformed -- 0 is clamped, not a parse error", 0, c.hype.malformed);
+    CHECK_INT("clamped up to the 1-second floor", 1, (int)c.hype.cpu_avg_window_secs);
+    CHECK_INT("the REST of [hype] still applied normally", (int)HYPE_CFG_NET_NAT,
+              (int)c.hype.default_net_mode);
+}
+
+/* A non-numeric value, by contrast, IS a syntax error -- §4.3's usual whole-section fallback. */
+static void test_hype_cpu_avg_window_non_numeric_falls_back(void) {
+    char cfg[1024];
+    hype_cfg_t c;
+    hype_cfg_result_t r;
+
+    snprintf(cfg, sizeof(cfg), "[hype]\ncpu_avg_window_secs = five\n[vm.a]\n" REQ);
+    r = parse_copy(cfg, &c);
+    CHECK_INT("parses OK (malformed [hype], not a fatal error)", HYPE_CFG_OK, r.status);
+    CHECK_INT("flagged malformed", 1, c.hype.malformed);
+    CHECK_INT("reset to the default", 1, (int)c.hype.cpu_avg_window_secs);
+}
+
+static void test_hype_cpu_avg_window_duplicate_is_rejected(void) {
+    char cfg[1024];
+    hype_cfg_t c;
+    hype_cfg_result_t r;
+
+    snprintf(cfg, sizeof(cfg),
+             "[hype]\ncpu_avg_window_secs = 3\ncpu_avg_window_secs = 7\n[vm.a]\n" REQ);
+    r = parse_copy(cfg, &c);
+    CHECK_INT("parses OK (malformed [hype], not fatal)", HYPE_CFG_OK, r.status);
+    CHECK_INT("flagged malformed", 1, c.hype.malformed);
+}
+
 static void test_hype_malformed_falls_back_to_defaults(void) {
     char cfg[1024];
     hype_cfg_t out;
@@ -1891,6 +1953,7 @@ static void test_serialize_hype_section_lists(void) {
                       "dashboard_default_view = vm:alpine\n"
                       "autostart = alpine,beta\n"
                       "resolution = 2560x1440\n"
+                      "cpu_avg_window_secs = 5\n"
                       "[vm.alpine]\n" REQ "[vm.beta]\n" REQ;
     hype_cfg_t before, after;
     hype_cfg_serialize_result_t sr;
@@ -1913,6 +1976,7 @@ static void test_serialize_hype_section_lists(void) {
     CHECK_INT("autostart_count survives", 2, after.hype.autostart_count);
     CHECK_STR("autostart_vms[0] survives", "alpine", after.hype.autostart_vms[0]);
     CHECK_STR("autostart_vms[1] survives", "beta", after.hype.autostart_vms[1]);
+    CHECK_INT("cpu_avg_window_secs survives", 5, (int)after.hype.cpu_avg_window_secs);
     CHECK_INT("resolution has_resolution survives", 1, after.hype.has_resolution);
     CHECK_INT("resolution width survives", 2560, after.hype.resolution_width);
     CHECK_INT("resolution height survives", 1440, after.hype.resolution_height);
@@ -2012,6 +2076,11 @@ int main(void) {
     test_hype_unknown_key_still_retained();
     test_hype_section_errors();
     test_hype_resolution_bad_values();
+    test_hype_cpu_avg_window_default_is_one();
+    test_hype_cpu_avg_window_configured_value_is_kept();
+    test_hype_cpu_avg_window_zero_is_clamped_not_rejected();
+    test_hype_cpu_avg_window_non_numeric_falls_back();
+    test_hype_cpu_avg_window_duplicate_is_rejected();
     test_hype_duplicate_after_malformed_is_still_caught();
     test_resolve_bus();
     test_format_assertion();
