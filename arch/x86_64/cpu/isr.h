@@ -25,10 +25,20 @@ typedef struct {
  * vectors; vectors 32-255 are user-defined/IRQ. */
 const char *hype_isr_vector_name(uint64_t vector);
 
-/* Formats the fatal-fault message hype_isr_dispatch() panics with when
- * no handler is registered for a vector. Pure/testable -- see
- * isr_decode.c for why dispatch itself only partly is. */
-void hype_isr_format_message(char *buf, unsigned long long bufsz, const hype_isr_frame_t *frame);
+/*
+ * Formats the fatal-fault message hype_isr_dispatch() panics with when no handler is registered
+ * for a vector. Pure/testable -- see isr_decode.c for why dispatch itself only partly is, which
+ * is also why `apic_id` is a parameter rather than an MMIO read in here.
+ *
+ * #461: the message used to omit both the core and the stack. A stray GP fault with
+ * `rip=0x9f01f cs=0x8` was unattributable -- there was no way to tell which core died, and
+ * therefore no way to tell whether a VM had just lost its vCPU. It also has to say that the
+ * halt is CORE-LOCAL: hype_fatal() masks interrupts and halts the calling core only, so the
+ * other cores carry on and the log keeps flowing, which reads as "hype survived a panic" when
+ * what actually happened is that one core is gone and nothing noticed.
+ */
+void hype_isr_format_message(char *buf, unsigned long long bufsz, const hype_isr_frame_t *frame,
+                             unsigned int apic_id);
 
 typedef void (*hype_isr_handler_fn)(const hype_isr_frame_t *frame);
 

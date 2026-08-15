@@ -37,11 +37,15 @@ const char *hype_isr_vector_name(uint64_t vector) {
     }
 }
 
-void hype_isr_format_message(char *buf, unsigned long long bufsz, const hype_isr_frame_t *frame) {
+void hype_isr_format_message(char *buf, unsigned long long bufsz, const hype_isr_frame_t *frame,
+                             unsigned int apic_id) {
     hype_snprintf(buf, bufsz,
-                  "unhandled interrupt: vector=%llu (%s) error_code=0x%llx rip=0x%llx cs=0x%llx rflags=0x%llx",
-                  frame->vector, hype_isr_vector_name(frame->vector), frame->error_code,
-                  frame->rip, frame->cs, frame->rflags);
+                  "unhandled interrupt on apic=%u: vector=%llu (%s) error_code=0x%llx "
+                  "rip=0x%llx cs=0x%llx rflags=0x%llx rsp=0x%llx ss=0x%llx rbp=0x%llx "
+                  "-- apic=%u HALTS, other cores keep running [#461]",
+                  apic_id, frame->vector, hype_isr_vector_name(frame->vector), frame->error_code,
+                  frame->rip, frame->cs, frame->rflags, frame->rsp, frame->ss, frame->rbp,
+                  apic_id);
 }
 
 /* Only vectors 32-255 are ever populated -- see hype_isr_register(). */
@@ -87,9 +91,18 @@ int hype_isr_dispatch_vector(uint8_t vector) {
     return 1;
 }
 
+/*
+ * #461: read only on the panic path, never on the handler-found path the unit tests exercise --
+ * which is why this is a local read rather than a parameter threaded through every ISR entry.
+ */
+static unsigned int isr_this_apic(void) {
+    return (unsigned int)((*(volatile uint32_t *)(uintptr_t)0xFEE00020u) >> 24);
+}
+
 void hype_isr_dispatch(const hype_isr_frame_t *frame) {
-    char msg[192];
+    char msg[320]; /* #461: the message now carries the core, the stack and the halt note. */
     hype_isr_handler_fn handler;
+    unsigned int apic;
 
     handler = (frame->vector < 256) ? g_handlers[frame->vector] : 0;
     if (handler != 0) {
@@ -97,6 +110,10 @@ void hype_isr_dispatch(const hype_isr_frame_t *frame) {
         return;
     }
 
-    hype_isr_format_message(msg, sizeof(msg), frame);
+    apic = isr_this_apic();
+    /* Recorded BEFORE panicking, so the surviving cores can report the loss even if the panic
+     * path itself dies painting the framebuffer. */
+    hype_fatal_note_core_panic(apic);
+    hype_isr_format_message(msg, sizeof(msg), frame, apic);
     hype_fatal("%s", msg);
 }

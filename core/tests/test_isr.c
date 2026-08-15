@@ -67,7 +67,7 @@ static void test_format_message(void) {
     frame.cs = 0x08;
     frame.rflags = 0x246;
 
-    hype_isr_format_message(buf, sizeof(buf), &frame);
+    hype_isr_format_message(buf, sizeof(buf), &frame, 3u);
 
     if (strstr(buf, "vector=13") == 0) {
         printf("FAIL: format_message missing vector number: %s\n", buf);
@@ -99,7 +99,7 @@ static void test_format_message_truncates_safely(void) {
     /* Must not crash/overflow with a tiny buffer -- confirms bufsz is
      * actually passed through to hype_snprintf rather than, say, a
      * hardcoded internal size. */
-    hype_isr_format_message(buf, sizeof(buf), &frame);
+    hype_isr_format_message(buf, sizeof(buf), &frame, 3u);
     for (i = 0; i < sizeof(buf); i++) {
         if (buf[i] == '\0') {
             found_nul = 1;

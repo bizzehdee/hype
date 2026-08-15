@@ -52,14 +52,22 @@ void hype_dash_text_reset(hype_dash_text_t *t);
  * `dropped` counts it, so the renderer can say so instead of quietly showing a partial answer. */
 void hype_dash_text_add(hype_dash_text_t *t, const char *s);
 
-/* Render the dashboard into grid `s` (cleared first). host_uptime_s is shown
- * in the header. `cmdline` (the TERM-2 command being typed) and `result` (the
- * last command's output) render as a footer when non-NULL. Result lines that do
- * not fit the grid are reported by count rather than dropped silently. */
+/*
+ * Render the dashboard into grid `s` (cleared first). host_uptime_s is shown in the header.
+ * `cmdline` (the TERM-2 command being typed) and `result` (the last command's output) render as
+ * a footer when non-NULL. Result lines that do not fit the grid are reported by count rather
+ * than dropped silently.
+ *
+ * #461: `alert`, when non-NULL, renders directly under the header, before anything else. It
+ * exists for the one thing the dashboard could not previously say -- that a core has died. A
+ * core that takes an unhandled fault halts alone, so the remaining cores keep rendering a
+ * perfectly healthy-looking table for a VM whose vCPU is gone.
+ */
 void hype_dashboard_render(hype_vt_screen_t *s,
                            const hype_vm_dash_info_t *vms, unsigned n,
                            uint64_t host_uptime_s,
-                           const char *cmdline, const hype_dash_text_t *result);
+                           const char *cmdline, const hype_dash_text_t *result,
+                           const char *alert);
 
 /* Format `secs` as HH:MM:SS into buf (>= 9 bytes). Exposed for tests. */
 void hype_dashboard_fmt_uptime(char *buf, unsigned long long secs);

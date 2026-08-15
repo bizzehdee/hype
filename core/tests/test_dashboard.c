@@ -31,6 +31,32 @@ static int grid_has(const hype_vt_screen_t *s, const char *needle) {
     return 0;
 }
 
+/* --- #461: a dead core must be visible on the surface the operator actually reads --- */
+
+static void test_core_panic_alert_is_shown(void) {
+    /*
+     * hype_fatal() halts the CALLING core only, so the survivors kept drawing a healthy table
+     * for a VM whose vCPU had gone. The alert is the only thing that distinguishes the two.
+     */
+    hype_vt_screen_t *s = malloc(sizeof(*s));
+    hype_vm_dash_info_t vms[1] = { { "vm0", "linux", "running", 0, 512, 0, NULL, 0 } };
+
+    hype_vt_screen_init(s, 100, 30);
+    hype_dashboard_render(s, vms, 1, 0, "", NULL, "** 1 CORE PANIC(S) -- apic=2 halted **");
+    CHECK("panic alert rendered", grid_has(s, "CORE PANIC"));
+    CHECK("panic alert names the core", grid_has(s, "apic=2"));
+    CHECK("table still renders under the alert", grid_has(s, "vm0"));
+
+    hype_vt_screen_init(s, 100, 30);
+    hype_dashboard_render(s, vms, 1, 0, "", NULL, NULL);
+    CHECK("no alert when no core has died", !grid_has(s, "CORE PANIC"));
+
+    hype_vt_screen_init(s, 100, 30);
+    hype_dashboard_render(s, vms, 1, 0, "", NULL, "");
+    CHECK("empty alert renders nothing", !grid_has(s, "CORE PANIC"));
+    free(s);
+}
+
 /* --- #459: the always-visible hint must list every verb the parser accepts --- */
 
 static void test_hint_line_lists_every_verb(void) {
@@ -44,7 +70,7 @@ static void test_hint_line_lists_every_verb(void) {
     unsigned i, n = hype_cmd_usage_count();
 
     hype_vt_screen_init(s, 100, 40);
-    hype_dashboard_render(s, NULL, 0, 0, "", NULL);
+    hype_dashboard_render(s, NULL, 0, 0, "", NULL, NULL);
     CHECK("usage table is not empty", n > 0);
     for (i = 0; i < n; i++) {
         if (!grid_has(s, hype_cmd_usage(i))) {
@@ -71,7 +97,7 @@ static void test_result_panel_renders_every_line(void) {
         snprintf(l, sizeof(l), "field%u = value%u", i, i);
         hype_dash_text_add(t, l);
     }
-    hype_dashboard_render(s, NULL, 0, 0, "config vm0", t);
+    hype_dashboard_render(s, NULL, 0, 0, "config vm0", t, NULL);
     CHECK("first result line rendered", grid_has(s, "field0 = value0"));
     CHECK("last result line rendered", grid_has(s, "field11 = value11"));
     CHECK("no overflow notice when everything fits", !grid_has(s, "not shown"));
@@ -93,7 +119,7 @@ static void test_result_overflow_is_reported_not_silent(void) {
         snprintf(l, sizeof(l), "line%u", i);
         hype_dash_text_add(t, l);
     }
-    hype_dashboard_render(s, NULL, 0, 0, "", t);
+    hype_dashboard_render(s, NULL, 0, 0, "", t, NULL);
     CHECK("clipped result says so", grid_has(s, "not shown"));
     free(t);
     free(s);
@@ -472,7 +498,7 @@ int main(void) {
     hype_dash_text_t *res = malloc(sizeof(*res));
     hype_dash_text_reset(res);
     hype_dash_text_add(res, "vm0: paused");
-    hype_dashboard_render(s, vms, 2, 45296, "sto", res);
+    hype_dashboard_render(s, vms, 2, 45296, "sto", res, NULL);
 
     CHECK("header line names product", row_has(s, 0, "hype - VM dashboard"));
     CHECK("header shows host uptime", row_has(s, 0, "12:34:56"));
@@ -499,7 +525,7 @@ int main(void) {
     hype_vm_dash_info_t big[1] = {
         { "a-really-long-vm-name-exceeding-the-column", "linux", "running", 100, 65536, 99999, "some-long-media-name.iso", 0 },
     };
-    hype_dashboard_render(s, big, 1, 0, NULL, NULL);
+    hype_dashboard_render(s, big, 1, 0, NULL, NULL, NULL);
     CHECK("long name truncated (col header intact on row2)", row_has(s, 2, "NAME"));
     CHECK("long-name row rendered something", row_has(s, 3, "a-really-long"));
 
@@ -507,18 +533,19 @@ int main(void) {
     hype_vt_screen_init(s, 80, 25);
     {
         hype_vm_dash_info_t nullish[1] = { { NULL, NULL, NULL, 0, 512, 0, NULL, 0 } };
-        hype_dashboard_render(s, nullish, 1, 0, NULL, NULL);
+        hype_dashboard_render(s, nullish, 1, 0, NULL, NULL, NULL);
         CHECK("null name -> '?'", row_has(s, 3, "?"));
         CHECK("null media -> '-'", row_has(s, 3, "-"));
     }
 
     /* --- zero VMs: header still renders, no crash --- */
     hype_vt_screen_init(s, 80, 25);
-    hype_dashboard_render(s, NULL, 0, 10, "", NULL);
+    hype_dashboard_render(s, NULL, 0, 10, "", NULL, NULL);
     CHECK("empty dashboard header", row_has(s, 0, "hype - VM dashboard"));
 
     free(res);
     free(s);
+    test_core_panic_alert_is_shown();
     test_hint_line_lists_every_verb();
     test_result_panel_renders_every_line();
     test_result_overflow_is_reported_not_silent();

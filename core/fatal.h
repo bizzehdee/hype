@@ -88,4 +88,16 @@ int hype_debug_gop_is_enabled(void);
 void hype_debug_note_gop_write(void);
 unsigned long long hype_debug_gop_write_count(void);
 
+/*
+ * #461: a core that takes an unhandled fault halts ALONE -- hype_fatal() masks interrupts and
+ * halts the calling core, and every other core carries on. The log therefore keeps flowing past
+ * a PANIC line, which reads as "hype survived" when a VM has in fact just lost its vCPU and the
+ * dashboard is still drawing it as `running`.
+ *
+ * The dying core records itself here before panicking; the survivors read it and say so.
+ */
+void hype_fatal_note_core_panic(unsigned int apic_id);
+unsigned int hype_fatal_core_panic_count(void);
+unsigned int hype_fatal_core_panic_apic(void); /* the most recent panicking core */
+
 #endif /* HYPE_FATAL_H */

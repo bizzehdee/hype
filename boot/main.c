@@ -8858,6 +8858,7 @@ static void fw_1_render_console(void) {
              * important thing on screen, so it takes over the footer result
              * line (drive model/serial/size + the exact command to type). */
             const hype_dash_text_t *result_text = &g_cmd_text;
+            const char *alert = 0;
             static char confirm_footer[192];
             static hype_dash_text_t confirm_text;
             if (g_phys_confirm.state != HYPE_PHYS_CONFIRM_IDLE) {
@@ -8879,13 +8880,29 @@ static void fw_1_render_console(void) {
              * means hype itself has stopped -- which is the distinction the operator actually needs
              * and could not make.
              */
+            /*
+             * #461: a core that took an unhandled fault halted ALONE -- every other core, this
+             * renderer included, carried on drawing a healthy table for a VM whose vCPU is gone.
+             * Say so, on the one surface the operator of a serial-less machine can read.
+             */
+            {
+                static char alert_line[96];
+                unsigned int panics = hype_fatal_core_panic_count();
+                if (panics > 0u) {
+                    hype_snprintf(alert_line, sizeof(alert_line),
+                                  "** %u CORE PANIC(S) -- apic=%u halted; see the log for the "
+                                  "fault [#461] **",
+                                  panics, hype_fatal_core_panic_apic());
+                    alert = alert_line;
+                }
+            }
             bsp_phase(BSP_PHASE_DASH);
             hype_dashboard_render(&g_dashboard_term, info, ninfo,
                                   (g_host_time_tsc != 0 && g_vms[0].host_tsc_hz != 0)
                                       ? (unsigned)((hype_rdtsc() - g_host_time_tsc) /
                                                    g_vms[0].host_tsc_hz)
                                       : 0u,
-                                  g_cmdline, result_text);
+                                  g_cmdline, result_text, alert);
         }
         /* PERF-2 (#234): same diffing treatment for the dashboard. It only
          * changes when a stat/second ticks, so most frames push nothing. */
@@ -20583,6 +20600,30 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             "later VMs; VMs already up keep running [#414]\n", vi, rc);
                         break;
                     }
+                }
+            }
+            /*
+             * #461: retire the trampoline page by filling it with INT3.
+             *
+             * An intermittent host fault was reported as `vector=13 (General Protection Fault)
+             * rip=0x9f01f cs=0x8` -- inside this page. That rip is unreadable as it stands: the
+             * page still holds the 16-bit startup blob, so a 64-bit core that branches in decodes
+             * leftover real-mode bytes into whatever fault they happen to make, and `cs=0x8` is
+             * ambiguous besides (it is both hype's host code selector AND the trampoline's own
+             * 32-bit one). Neither the vector nor the selector identifies the mistake.
+             *
+             * Filled with 0xCC, any stray branch here instead reports vector 3 (Breakpoint) with
+             * an rip in this page -- which can only mean one thing, and says so on the first
+             * occurrence rather than after a hunt.
+             *
+             * Safe to clobber: hype_ap_start() re-copies the whole blob and re-zeroes its alive
+             * flag on every call, so a later VM restart that starts an AP again is unaffected.
+             */
+            if (g_ap_tramp_page != 0) {
+                volatile uint8_t *tp = (volatile uint8_t *)(uintptr_t)g_ap_tramp_page;
+                unsigned int bi;
+                for (bi = 0; bi < 4096u; bi++) {
+                    tp[bi] = 0xCCu;
                 }
             }
         }

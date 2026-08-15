@@ -17,6 +17,24 @@ static void *g_gop_real_fb = 0;
 static unsigned int g_debug_gop_enabled = 1u;
 static unsigned long long g_debug_gop_writes;
 
+/* #461: see fatal.h. Written by a dying core, read by the living ones -- atomics, not plain
+ * loads and stores, for the same reason the debug-tee flag above uses them. */
+static unsigned int g_core_panic_count;
+static unsigned int g_core_panic_apic;
+
+void hype_fatal_note_core_panic(unsigned int apic_id) {
+    __atomic_store_n(&g_core_panic_apic, apic_id, __ATOMIC_RELEASE);
+    (void)__atomic_add_fetch(&g_core_panic_count, 1u, __ATOMIC_ACQ_REL);
+}
+
+unsigned int hype_fatal_core_panic_count(void) {
+    return __atomic_load_n(&g_core_panic_count, __ATOMIC_ACQUIRE);
+}
+
+unsigned int hype_fatal_core_panic_apic(void) {
+    return __atomic_load_n(&g_core_panic_apic, __ATOMIC_ACQUIRE);
+}
+
 void hype_fatal_set_gop(hype_gop_console_t *con) {
     g_gop_console = con;
 }
