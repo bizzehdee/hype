@@ -19942,6 +19942,41 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                     hype_ps2_mouse_has_pending_byte(&g_vms[vi].mouse),
                                     (unsigned)g_vms[vi].atapi.last_cdb,
                                     (unsigned)g_vms[vi].atapi.command_count);
+                                if (vi == 0u) {
+                                    /* #94: find KiBugCheckData after a 0x109 BSOD. PatchGuard's
+                                     * CRITICAL_STRUCTURE_CORRUPTION args have a fixed shape --
+                                     * arg1 starts 0xa3a0..., arg2 0xb3b7..., arg4 is a small
+                                     * region-type code -- so the 5-qword block is findable in
+                                     * guest RAM without symbols. One rotating 256 MiB window per
+                                     * diag tick keeps the scan off the input-latency path. */
+                                    static uint64_t scan_off = 0;
+                                    static unsigned found_n = 0;
+                                    if (found_n < 4u && g_vms[0].ram_bytes != 0) {
+                                        const uint8_t *base = (const uint8_t *)(uintptr_t)
+                                            g_vms[0].ram_host_phys;
+                                        uint64_t end = scan_off + (256ull << 20);
+                                        uint64_t off;
+                                        if (end > g_vms[0].ram_bytes) end = g_vms[0].ram_bytes;
+                                        for (off = scan_off; off + 40u <= end; off += 8u) {
+                                            const uint64_t *q = (const uint64_t *)(base + off);
+                                            if (q[0] == 0x109ull && (q[1] >> 56) == 0xa3ull &&
+                                                (q[2] >> 56) == 0xb3ull && q[4] <= 0x40ull) {
+                                                found_n++;
+                                                hype_debug_print(
+                                                    "fw-1 #94 BUGCHECK@0x%llx: code=0x109 "
+                                                    "arg1=0x%llx arg2=0x%llx arg3=0x%llx "
+                                                    "arg4=0x%llx (region type)\n",
+                                                    (unsigned long long)off,
+                                                    (unsigned long long)q[1],
+                                                    (unsigned long long)q[2],
+                                                    (unsigned long long)q[3],
+                                                    (unsigned long long)q[4]);
+                                                if (found_n >= 4u) break;
+                                            }
+                                        }
+                                        scan_off = (end >= g_vms[0].ram_bytes) ? 0 : end;
+                                    }
+                                }
                                 {   /* #92: which CDBs the guest issued, and which failed. */
                                     unsigned hi;
                                     hype_debug_print("fw-1 ATAPIOPS vm%u:", vi);

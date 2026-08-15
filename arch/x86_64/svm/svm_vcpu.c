@@ -2884,6 +2884,125 @@ static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, 
  * command FIS at all, or the command byte isn't one this project
  * models) so the caller can fall through to whichever other handler
  * actually owns it. */
+/*
+ * #94: move a backend-disk transfer through a guest PRDT whose entry
+ * boundaries need not fall on sector boundaries. Windows' storahci builds
+ * PRDs from whatever physical fragments the MDL has -- 1536-byte and
+ * 512+1024-byte splits are routine -- and real AHCI hardware does not care.
+ * The old per-PRD path refused any entry that split a sector (ABRT), which
+ * failed every NTFS/FAT format and Setup's CreateSystemVolume with
+ * "wrote 0 bytes" (measured: ATA-SHORT cmd=0xc8/0xca did=0 with prdtl=2..33).
+ *
+ * Full-sector spans inside one PRD go straight between guest RAM and the
+ * backend; only a sector that straddles a PRD boundary is staged through a
+ * 512-byte buffer. Returns 0 with *out_done = bytes moved (short if the PRDT
+ * ran out -- the caller reports that via PRDBC), or -1 on a refused DMA
+ * translation, or -2 on a backend I/O error.
+ */
+static int ahci_backend_rw_prdt(hype_ata_disk_t *disk, const hype_gpa_map_t *dma_map,
+                                const uint8_t *prdt_bytes, uint16_t prdtl, uint64_t lba_base,
+                                uint32_t total_bytes, int is_write, uint32_t *out_done) {
+    unsigned idx = 0;
+    uint32_t prd_off = 0;
+    uint32_t done = 0;
+    hype_ahci_prdt_entry_t prd;
+    int prd_valid = 0;
+
+    while (done < total_bytes) {
+        uint32_t prd_rem;
+        if (!prd_valid) {
+            if (idx >= prdtl) {
+                break; /* PRDT exhausted: genuine short transfer */
+            }
+            hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)idx * 16u, &prd);
+            prd_valid = 1;
+        }
+        prd_rem = prd.byte_count - prd_off;
+        if (prd_rem == 0) {
+            idx++;
+            prd_off = 0;
+            prd_valid = 0;
+            continue;
+        }
+        if ((done % HYPE_ATA_SECTOR_SIZE) == 0u && prd_rem >= HYPE_ATA_SECTOR_SIZE) {
+            /* Aligned full sectors within this PRD: one backend call. */
+            uint32_t span = prd_rem;
+            uint8_t *ptr;
+            if (span > total_bytes - done) {
+                span = total_bytes - done;
+            }
+            span -= span % HYPE_ATA_SECTOR_SIZE;
+            ptr = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys + prd_off, span);
+            if (ptr == 0) {
+                return -1;
+            }
+            if (is_write ? hype_blk_backend_write(disk->be, lba_base + done / HYPE_ATA_SECTOR_SIZE,
+                                                  span / HYPE_ATA_SECTOR_SIZE, ptr)
+                         : hype_blk_backend_read(disk->be, lba_base + done / HYPE_ATA_SECTOR_SIZE,
+                                                 span / HYPE_ATA_SECTOR_SIZE, ptr)) {
+                return -2;
+            }
+            done += span;
+            prd_off += span;
+            continue;
+        }
+        {
+            /* A sector that straddles PRD boundaries (or an unaligned PRD
+             * tail): stage it. Reads fetch the sector first and scatter;
+             * writes gather and store once the sector is complete. */
+            uint8_t stage[HYPE_ATA_SECTOR_SIZE];
+            uint32_t sec_off = 0;
+            uint64_t lba = lba_base + done / HYPE_ATA_SECTOR_SIZE;
+            if (!is_write && hype_blk_backend_read(disk->be, lba, 1u, stage)) {
+                return -2;
+            }
+            while (sec_off < HYPE_ATA_SECTOR_SIZE) {
+                uint32_t chunk;
+                uint8_t *ptr;
+                uint32_t i;
+                if (!prd_valid) {
+                    if (idx >= prdtl) {
+                        *out_done = done + sec_off; /* short inside a sector */
+                        return 0;
+                    }
+                    hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)idx * 16u, &prd);
+                    prd_valid = 1;
+                }
+                prd_rem = prd.byte_count - prd_off;
+                if (prd_rem == 0) {
+                    idx++;
+                    prd_off = 0;
+                    prd_valid = 0;
+                    continue;
+                }
+                chunk = (prd_rem < HYPE_ATA_SECTOR_SIZE - sec_off) ? prd_rem
+                                                                   : HYPE_ATA_SECTOR_SIZE - sec_off;
+                ptr = (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys + prd_off, chunk);
+                if (ptr == 0) {
+                    return -1;
+                }
+                if (is_write) {
+                    for (i = 0; i < chunk; i++) {
+                        stage[sec_off + i] = ptr[i];
+                    }
+                } else {
+                    for (i = 0; i < chunk; i++) {
+                        ptr[i] = stage[sec_off + i];
+                    }
+                }
+                sec_off += chunk;
+                prd_off += chunk;
+            }
+            if (is_write && hype_blk_backend_write(disk->be, lba, 1u, stage)) {
+                return -2;
+            }
+            done += HYPE_ATA_SECTOR_SIZE;
+        }
+    }
+    *out_done = done;
+    return 0;
+}
+
 int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
                                   const hype_gpa_map_t *dma_map, unsigned slot) {
     uint64_t cmd_list_phys =
@@ -3009,6 +3128,23 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
                               fis.command == HYPE_ATA_CMD_WRITE_DMA)
                                  ? 1
                                  : 0;
+        if (is_write_direction) {
+            /* #94: the first writes the guest ever issues, and their fate --
+             * "format wrote 0 bytes" names the symptom but not which layer
+             * refused. Bounded like the ATACMD trace above. */
+            static unsigned wtrace_n = 0;
+            if (wtrace_n < 8u) {
+                wtrace_n++;
+                hype_debug_print("fw-1 #94 ATAWRITE#%u: cmd=0x%02x lba=0x%llx count=%u prdtl=%u "
+                                 "in_bounds=%d be_total=%llu\n",
+                                 wtrace_n, (unsigned)fis.command, (unsigned long long)lba_base,
+                                 (unsigned)sector_count, (unsigned)hdr.prdtl,
+                                 disk->be != 0
+                                     ? (lba_base + sector_count <= disk->be->total_sectors)
+                                     : hype_ata_disk_range_in_bounds(disk, lba_base, sector_count),
+                                 (unsigned long long)(disk->be != 0 ? disk->be->total_sectors : 0));
+            }
+        }
         if (disk->be != 0 ? (lba_base + sector_count <= disk->be->total_sectors)
                           : hype_ata_disk_range_in_bounds(disk, lba_base, sector_count)) {
             uint8_t *media_at = (disk->be != 0) ? 0 : disk->media + lba_base * HYPE_ATA_SECTOR_SIZE;
@@ -3042,12 +3178,50 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
          * disk I/O. (Returning -1 stays correct for the ATAPI-header case above:
          * that genuinely belongs to another handler, which will clear the slot.)
          */
+        {   /* #94: name the opcode being retired with ABRT -- an OS that needed
+             * it sees only a failed I/O. Bounded. */
+            static unsigned abrt_n = 0;
+            if (abrt_n < 8u) {
+                abrt_n++;
+                hype_debug_print("fw-1 #94 ATA-ABRT#%u: unmodelled cmd=0x%02x count=%u prdtl=%u\n",
+                                 abrt_n, (unsigned)fis.command, (unsigned)fis.count,
+                                 (unsigned)hdr.prdtl);
+            }
+        }
         status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
         error_reg = 0x04u; /* ABRT */
     }
 
     prdt_bytes = cmd_table_bytes + 0x80;
     prd_idx = 0;
+    /* #94: backend R/W goes through the PRD-cursor engine above, which
+     * tolerates sector-splitting PRD boundaries. The per-PRD loop below still
+     * serves the synthesised transfers (IDENTIFY) and the RAM-media path. */
+    if (disk->be != 0 && remaining > 0 && error_reg == 0 &&
+        (is_write_direction || fis.command == HYPE_ATA_CMD_READ_DMA ||
+         fis.command == HYPE_ATA_CMD_READ_DMA_EXT)) {
+        uint32_t done = 0;
+        uint32_t requested = remaining;
+        int erc = ahci_backend_rw_prdt(disk, dma_map, prdt_bytes, hdr.prdtl, lba_base, requested,
+                                       is_write_direction, &done);
+        if (erc == -1) {
+            return -1; /* refused DMA translation: same contract as the loop below */
+        }
+        if (erc == -2) {
+            static unsigned befail_n = 0;
+            if (befail_n < 8u) {
+                befail_n++;
+                hype_debug_print("fw-1 #94 ATA-BE-FAIL#%u: cmd=0x%02x lba=0x%llx done=%u\n",
+                                 befail_n, (unsigned)fis.command, (unsigned long long)lba_base,
+                                 (unsigned)done);
+            }
+            status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
+            error_reg = 0x10u;
+        }
+        transferred = done;
+        remaining = requested - done;
+        prd_idx = hdr.prdtl; /* the loop below must not re-run this transfer */
+    }
     while (remaining > 0 && prd_idx < hdr.prdtl) {
         hype_ahci_prdt_entry_t prd;
         uint32_t chunk;
@@ -3074,6 +3248,14 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
                         disk->be, lba_base + lba_off, nsec,
                         (const void *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk)) !=
                     0) {
+                    static unsigned wfail_n = 0;
+                    if (wfail_n < 8u) {
+                        wfail_n++;
+                        hype_debug_print("fw-1 #94 ATAWRITE-FAIL#%u: backend write lba=%llu "
+                                         "nsec=%u chunk=%u\n",
+                                         wfail_n, (unsigned long long)(lba_base + lba_off),
+                                         (unsigned)nsec, (unsigned)chunk);
+                    }
                     status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
                     error_reg = 0x10u;
                     break;
@@ -3103,6 +3285,19 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
         prd_idx++;
     }
 
+    if (remaining > 0) {
+        /* #94: the PRDT ran out before the command's byte count was satisfied --
+         * a silent short transfer. Windows' format writes died exactly here. */
+        static unsigned short_n = 0;
+        if (short_n < 12u) {
+            short_n++;
+            hype_debug_print("fw-1 #94 ATA-SHORT#%u: cmd=0x%02x lba=0x%llx wanted=%u did=%u "
+                             "prdtl=%u write=%d\n",
+                             short_n, (unsigned)fis.command, (unsigned long long)lba_base,
+                             (unsigned)(remaining + (uint32_t)transferred), (unsigned)transferred,
+                             (unsigned)hdr.prdtl, is_write_direction);
+        }
+    }
     complete_ahci_command_slot(ahci, rx_fis_phys, status_reg, error_reg, dma_map, slot, pis_bit,
                                (uint32_t)transferred, cmd_hdr_bytes);
     return 0;
