@@ -225,6 +225,18 @@ typedef struct {
     unsigned int autostart_count;
     char autostart_vms[HYPE_CFG_MAX_VMS][HYPE_CFG_NAME_MAX]; /* only for AUTOSTART_LIST */
 
+    /*
+     * TERM-7 (#443): the host GOP mode, `<width>x<height>` (e.g. `1920x1080`). Absent (the
+     * default) means "whatever mode the firmware already left GOP in" -- hype has never called
+     * SetMode itself, so "no setting found" must reproduce that exact pre-existing behavior
+     * rather than falling back to a hardcoded resolution. `has_resolution` is what distinguishes
+     * "operator asked for 0x0" (impossible, the parser rejects a zero dimension) from "operator
+     * said nothing at all" -- width/height alone cannot, since 0 is also mem_mb's own zero-init.
+     */
+    int has_resolution;
+    unsigned int resolution_width;
+    unsigned int resolution_height;
+
     /* Set when the section was present but something in it was rejected: the defaults above apply,
      * and the caller should say so rather than let the operator believe a global took effect. */
     int malformed;

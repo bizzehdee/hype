@@ -328,9 +328,20 @@ typedef EFI_STATUS(EFIAPI *EFI_GRAPHICS_OUTPUT_PROTOCOL_BLT)(
     EFI_GRAPHICS_OUTPUT_BLT_OPERATION BltOperation, UINTN SourceX, UINTN SourceY, UINTN DestinationX,
     UINTN DestinationY, UINTN Width, UINTN Height, UINTN Delta);
 
+/* TERM-7 (#443): typed at last -- every caller before this ticket left these as opaque `void *`
+ * because nothing called them. Signatures transcribed directly from EDK2's own
+ * MdePkg/Include/Protocol/GraphicsOutput.h, not reconstructed from memory, same discipline as
+ * every other protocol struct here. */
+typedef EFI_STATUS(EFIAPI *EFI_GRAPHICS_OUTPUT_PROTOCOL_QUERY_MODE)(
+    struct _EFI_GRAPHICS_OUTPUT_PROTOCOL *This, UINT32 ModeNumber, UINTN *SizeOfInfo,
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION **Info);
+
+typedef EFI_STATUS(EFIAPI *EFI_GRAPHICS_OUTPUT_PROTOCOL_SET_MODE)(
+    struct _EFI_GRAPHICS_OUTPUT_PROTOCOL *This, UINT32 ModeNumber);
+
 typedef struct _EFI_GRAPHICS_OUTPUT_PROTOCOL {
-    void *QueryMode;
-    void *SetMode;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_QUERY_MODE QueryMode;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_SET_MODE SetMode;
     EFI_GRAPHICS_OUTPUT_PROTOCOL_BLT Blt;
     EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL;

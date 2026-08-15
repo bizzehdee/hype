@@ -1158,7 +1158,8 @@ static void test_hype_section_all_keys(void) {
              "host_cpu_budget = 2-5, 8\n"
              "default_net_mode = nat\n"
              "dashboard_default_view = vm:a\n"
-             "autostart = a\n\n", VM_A);
+             "autostart = a\n"
+             "resolution = 1920x1080\n\n", VM_A);
     res = parse_copy(cfg, &out);
 
     CHECK_INT("[hype] parses", HYPE_CFG_OK, res.status);
@@ -1175,6 +1176,9 @@ static void test_hype_section_all_keys(void) {
     CHECK_INT("autostart list", (int)HYPE_CFG_AUTOSTART_LIST, (int)out.hype.autostart);
     CHECK_INT("one VM autostarted", 1, out.hype.autostart_count);
     CHECK_STR("autostart[0]", "a", out.hype.autostart_vms[0]);
+    CHECK_INT("resolution is set", 1, out.hype.has_resolution);
+    CHECK_INT("resolution width", 1920, out.hype.resolution_width);
+    CHECK_INT("resolution height", 1080, out.hype.resolution_height);
     /* The section is recorded in file order like any other. */
     CHECK_INT("section 0 is [hype]", (int)HYPE_CFG_SECTION_HYPE, (int)out.sections[0].kind);
 }
@@ -1193,6 +1197,35 @@ static void test_hype_section_absent_gives_todays_behaviour(void) {
      * silent behaviour change for every existing config. */
     CHECK_INT("autostart defaults to all", (int)HYPE_CFG_AUTOSTART_ALL, (int)out.hype.autostart);
     CHECK_INT("not malformed", 0, out.hype.malformed);
+    /* TERM-7 (#443): unset must mean "keep whatever GOP mode the firmware already left it in",
+     * not a hardcoded fallback resolution -- has_resolution is the caller's signal to do nothing. */
+    CHECK_INT("resolution unset by default", 0, out.hype.has_resolution);
+}
+
+/*
+ * §4.3: a bad `resolution` is malformation like any other [hype] key -- it does not fail the
+ * parse, it falls back to defaults (has_resolution cleared) and sets `malformed`. See
+ * test_hype_malformed_falls_back_to_defaults for the general rule this follows.
+ */
+static void check_resolution_falls_back(const char *desc, const char *resolution_lines) {
+    char cfg[2048];
+    hype_cfg_t c;
+    hype_cfg_result_t r;
+
+    snprintf(cfg, sizeof(cfg), "[hype]\n%s%s", resolution_lines, VM_A);
+    r = parse_copy(cfg, &c);
+    CHECK_INT(desc, HYPE_CFG_OK, r.status);
+    CHECK_INT("flagged malformed", 1, c.hype.malformed);
+    CHECK_INT("has_resolution cleared", 0, c.hype.has_resolution);
+}
+
+static void test_hype_resolution_bad_values(void) {
+    check_resolution_falls_back("missing 'x' separator falls back", "resolution = 1920\n");
+    check_resolution_falls_back("non-numeric width falls back", "resolution = abcx1080\n");
+    check_resolution_falls_back("zero width falls back", "resolution = 0x1080\n");
+    check_resolution_falls_back("zero height falls back", "resolution = 1920x0\n");
+    check_resolution_falls_back("duplicate resolution falls back",
+                                "resolution = 1920x1080\nresolution = 640x480\n");
 }
 
 static void test_hype_malformed_falls_back_to_defaults(void) {
@@ -1857,6 +1890,7 @@ static void test_serialize_hype_section_lists(void) {
                       "default_net_mode = nat\n"
                       "dashboard_default_view = vm:alpine\n"
                       "autostart = alpine,beta\n"
+                      "resolution = 2560x1440\n"
                       "[vm.alpine]\n" REQ "[vm.beta]\n" REQ;
     hype_cfg_t before, after;
     hype_cfg_serialize_result_t sr;
@@ -1879,6 +1913,27 @@ static void test_serialize_hype_section_lists(void) {
     CHECK_INT("autostart_count survives", 2, after.hype.autostart_count);
     CHECK_STR("autostart_vms[0] survives", "alpine", after.hype.autostart_vms[0]);
     CHECK_STR("autostart_vms[1] survives", "beta", after.hype.autostart_vms[1]);
+    CHECK_INT("resolution has_resolution survives", 1, after.hype.has_resolution);
+    CHECK_INT("resolution width survives", 2560, after.hype.resolution_width);
+    CHECK_INT("resolution height survives", 1440, after.hype.resolution_height);
+}
+
+/* A config that never set `resolution` at all must not gain one from serializing -- the key
+ * itself must be omitted, not written as some zero/default value. */
+static void test_serialize_omits_resolution_when_unset(void) {
+    hype_cfg_t before, after;
+    hype_cfg_serialize_result_t sr;
+    char buf[4096];
+
+    (void)parse_copy("[hype]\nconfig_version = 1\n[vm.a]\n" REQ, &before);
+    CHECK_INT("resolution starts unset", 0, before.hype.has_resolution);
+
+    sr = hype_cfg_serialize(&before, buf, sizeof(buf));
+    CHECK_INT("did not refuse", 0, sr.refused_overflow);
+    CHECK_INT("no resolution key was written", 0, strstr(buf, "resolution") != 0);
+
+    (void)hype_cfg_parse(buf, &after);
+    CHECK_INT("still unset after round trip", 0, after.hype.has_resolution);
 }
 
 int main(void) {
@@ -1904,6 +1959,7 @@ int main(void) {
     test_serialize_truncation_is_reported_not_silent();
     test_serialize_disk_section_round_trips_optional_fields();
     test_serialize_hype_section_lists();
+    test_serialize_omits_resolution_when_unset();
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
     test_full_example_from_plan();
@@ -1955,6 +2011,7 @@ int main(void) {
     test_hype_malformed_falls_back_to_defaults();
     test_hype_unknown_key_still_retained();
     test_hype_section_errors();
+    test_hype_resolution_bad_values();
     test_hype_duplicate_after_malformed_is_still_caught();
     test_resolve_bus();
     test_format_assertion();
