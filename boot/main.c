@@ -17067,6 +17067,15 @@ static int *g_vm_log_ready;
  */
 #define HYPE_FW_1_VARS_LOAD_BUF_MAX (2u * 1024u * 1024u)
 
+/* #239 (see usb_log_flush_limit()'s own comment further down, forward-declared here): ONLY the
+ * BSP may touch g_hype_log.fs -- driving xHCI/FAT from an AP faulted hype itself before
+ * ("PANIC: unhandled interrupt: vector=14 (Page Fault)... took both VMs down with it"). This
+ * module's own vars save/load calls hype_fs_create/write_at/lookup/read_at on that exact shared
+ * state, and unlike usb_log_flush_limit() they are reached from EACH VM's own core
+ * (fw_1_publish_and_render() runs per-VM under HYPE_RUN_GUEST_ON_AP, the default) -- so they need
+ * the identical guard, not a new one. */
+static int usb_log_this_core_owns_usb(void);
+
 static int fw_1_vars_region(const hype_fw_vm_t *vm, uint64_t *out_offset, uint64_t *out_len) {
     if (vm->combined_size == 0u || vm->vars_size == 0u ||
         vm->code_size + vm->vars_size > vm->combined_size) {
@@ -17082,7 +17091,7 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
     char path[48];
     hype_fs_file_t f;
 
-    if (!g_hype_log_ready || vm->combined_host_phys == 0 ||
+    if (!usb_log_this_core_owns_usb() || !g_hype_log_ready || vm->combined_host_phys == 0 ||
         fw_1_vars_region(vm, &offset, &len) != 0) {
         return;
     }
@@ -17099,7 +17108,7 @@ static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
     char path[48];
     hype_fs_file_t f;
 
-    if (!g_hype_log_ready || vm->combined_host_phys == 0 ||
+    if (!usb_log_this_core_owns_usb() || !g_hype_log_ready || vm->combined_host_phys == 0 ||
         fw_1_vars_region(vm, &offset, &len) != 0 || len > sizeof(g_vars_load_buf)) {
         return;
     }
