@@ -553,6 +553,21 @@ void hype_svm_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector,
                                       int has_error_code, uint32_t error_code);
 
 /*
+ * #455: drop a vector from the pending IRR without delivering it. request_interrupt()
+ * translates an acknowledged IRQ line into a CPU vector and queues it the instant the
+ * guest can't yet accept it (IF=0) -- eagerly, at acknowledge time, decoupled from
+ * there on from whatever later masks that IRQ line. A vector queued this way is
+ * NEVER re-checked against the PIC's current IMR before delivery, so a line masked
+ * AFTER acknowledge (routine during early boot: BIOS/loader traffic acknowledged
+ * while unmasked, then the guest masks everything before its own interrupt
+ * subsystem is ready) still delivers, late, into a kernel that never asked for it.
+ * Real hardware cannot do this -- a masked line simply never reaches the CPU, no
+ * matter how long ago it was raised. Call this once a line's mask state is known to
+ * have changed, for every vector that line could still have queued.
+ */
+void hype_svm_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector);
+
+/*
  * INT-2: handles an EXITCODE_VINTR VM-exit -- disarms the window
  * request (hype_svm_disarm_vintr_request(),
  * ~HYPE_SVM_INTERCEPT_VINTR) and, if a vector is still pending from an

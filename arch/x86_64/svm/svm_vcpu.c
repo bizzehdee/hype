@@ -703,6 +703,34 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
                     }
                 }
             }
+            /*
+             * #455: ICW1 (command port, bit4 set) begins a full 8259 reinitialisation --
+             * both the loader and, later, the kernel each do this as they take ownership
+             * of the interrupt controller. hype's own request_interrupt() translates an
+             * acknowledged IRQ line into a CPU vector and queues it in pending_irr the
+             * instant the guest can't yet accept it (IF=0) -- eagerly, at acknowledge
+             * time, not at delivery time. A PIC reinit resets the CHIP's own IRR/IMR
+             * (hype_pic_emu_reset(), via chip_write_command() below) but never reached
+             * pending_irr, so a vector translated under the OLD irq_offset (raised by,
+             * say, the loader's own PS/2 handshake traffic while its IF was 0) survived
+             * untouched across the reinit and got delivered late, into whatever the
+             * vector now happens to mean under the NEW configuration -- observed as a
+             * spurious IRQ1 (vector 0x21, queued during the loader's own 8042 self-test)
+             * landing at the KERNEL's first `sti`, before it had registered a real
+             * handler for anything, which FreeBSD (correctly, by its own lights) treated
+             * as fatal. Capture the pre-reinit vector range on ICW1 and drop anything
+             * still queued there -- exactly the discard a real reinit's IRR/IMR reset
+             * already models one layer up, just extended to the vector this project
+             * translates the IRQ into.
+             */
+            if ((io.port == 0x20u || io.port == 0xA0u) && (pv & 0x10u) != 0u) {
+                uint8_t old_offset = (io.port == 0x20u) ? pic->master.irq_offset
+                                                        : pic->slave.irq_offset;
+                unsigned i;
+                for (i = 0; i < 8u; i++) {
+                    hype_svm_irr_clear(real->pending_irr, (uint8_t)(old_offset + i));
+                }
+            }
             rc = hype_pic_emu_io_write(pic, io.port, pv);
         }
     } else if (io.port >= 0x40u && io.port <= 0x43u) {
@@ -1433,6 +1461,11 @@ void hype_svm_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector,
         einj |= HYPE_SVM_EVENTINJ_EV | ((uint64_t)error_code << 32);
     }
     real->vmcb->control.eventinj = einj;
+}
+
+void hype_svm_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_irr_clear(real->pending_irr, vector);
 }
 
 void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {

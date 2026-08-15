@@ -1766,6 +1766,20 @@ int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
                 real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
             }
         } else {
+            /* #455: mirror hype_svm_vcpu_handle_ioio's ICW1 cancellation -- see that
+             * function's comment for the full reasoning. A PIC reinit (ICW1, bit4 of
+             * a command-port write) discards the chip's own IRR/IMR but, without
+             * this, left any ALREADY-TRANSLATED vector sitting in pending_irr (staged
+             * eagerly at acknowledge time under the OLD irq_offset) to survive
+             * untouched and deliver late under a since-changed configuration. */
+            if ((port == 0x20u || port == 0xA0u) && (rax & 0x10u) != 0u) {
+                uint8_t old_offset = (port == 0x20u) ? pic->master.irq_offset
+                                                     : pic->slave.irq_offset;
+                unsigned i;
+                for (i = 0; i < 8u; i++) {
+                    hype_svm_irr_clear(real->pending_irr, (uint8_t)(old_offset + i));
+                }
+            }
             rc = hype_pic_emu_io_write(pic, port, rax);
         }
     } else if (port >= 0x40u && port <= 0x43u) {
@@ -2988,6 +3002,11 @@ void hype_vmx_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector, int 
     }
     vmwrite(HYPE_VMCS_VM_ENTRY_INSTRUCTION_LEN, vmread(HYPE_VMCS_VM_EXIT_INSTRUCTION_LEN, &ok));
     vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, info);
+}
+
+void hype_vmx_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_irr_clear(real->pending_irr, vector);
 }
 
 /*

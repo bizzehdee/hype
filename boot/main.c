@@ -4178,6 +4178,39 @@ static void vmm_wake_hlt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
         hype_svm_vcpu_wake_hlt(ctx);
     }
 }
+static void vmm_cancel_pending_vector(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_cancel_pending_vector(ctx, vector);
+    } else {
+        hype_svm_vcpu_cancel_pending_vector(ctx, vector);
+    }
+}
+/*
+ * #455: a vector queued in pending_irr (via request_interrupt(), while the guest
+ * couldn't yet accept it) is never re-checked against the PIC's CURRENT mask state
+ * before delivery -- only against whatever the mask was at acknowledge time. Real
+ * hardware cannot deliver a masked line no matter how long ago it was raised; hype's
+ * eager acknowledge-time vector translation can. Drop any still-pending PIC-sourced
+ * vector whose line is masked right now, before attempting delivery -- observed
+ * necessary when the guest (BIOS/loader era, unmasked) acknowledges a PS/2
+ * controller-handshake byte as IRQ1, then masks everything (0xff) before its own
+ * interrupt subsystem is ready, yet the stale vector still delivered at the kernel's
+ * first `sti`, landing on an unclaimed vector and panicking FreeBSD ("Fatal trap
+ * 30", though the delivered vector was IRQ1/33 -- the trap number is whatever the
+ * kernel's shared "unclaimed interrupt" stub happens to report, not the real one).
+ */
+static void vmm_prune_masked_pic_pending(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                         const hype_pic_emu_t *pic) {
+    unsigned line;
+    for (line = 0; line < 8u; line++) {
+        if ((pic->master.imr & (uint8_t)(1u << line)) != 0u) {
+            vmm_cancel_pending_vector(kind, ctx, (uint8_t)(pic->master.irq_offset + line));
+        }
+        if ((pic->slave.imr & (uint8_t)(1u << line)) != 0u) {
+            vmm_cancel_pending_vector(kind, ctx, (uint8_t)(pic->slave.irq_offset + line));
+        }
+    }
+}
 static void vmm_get_intr_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                hype_vmm_intr_state_t *out) {
     if (kind == HYPE_VMM_KIND_VMX) {
@@ -12971,6 +13004,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * that gap stranded the timer tick and froze jiffies). If it
          * injected, skip acknowledging a new one this iteration so the
          * freshly-staged EVENTINJ isn't clobbered. */
+        vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic);
         if (!vmm_deliver_pending_if_ready(kind, ctx) &&
             g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
             uint8_t pic_vector;
@@ -13518,6 +13552,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* The VINTR window opened -- the guest can now take the
              * pending timer IRQ (INT-2). */
             g_436_loop_section[(unsigned)(vm-g_vms)]=782;
+            vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic); /* #455 */
             vmm_handle_intr_window(kind, ctx);
             continue;
         }
@@ -14825,6 +14860,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
                 if (if_set && (is.pending_valid || pic_ready)) {
                     vmm_wake_hlt(kind, ctx); /* retire HLT + clear STI shadow */
+                    vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic); /* #455 */
                     if (!vmm_deliver_pending_if_ready(kind, ctx) &&
                         g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
                         uint8_t v;
