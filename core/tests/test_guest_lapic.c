@@ -655,7 +655,48 @@ static void test_tpr_roundtrips_and_ppr_is_derived(void) {
     CHECK_HEX("PPR ignores writes", 0x3Au, hype_guest_lapic_ppr(&l));
 }
 
+
+static void test_all_lvt_entries_roundtrip(void) {
+    /*
+     * #94: PatchGuard shadows the WHOLE LVT table. A register whose write is
+     * dropped and whose read returns 0 later differs from the shadow and
+     * bugchecks 0x109 arg4=0x17 ("Local APIC modification") -- the crash that
+     * kept killing Windows mid-install. Faithful storage is the requirement.
+     */
+    hype_guest_lapic_t l;
+    uint32_t v = 0;
+
+    hype_guest_lapic_reset(&l);
+    CHECK_HEX("thermal masked at reset", HYPE_GUEST_LAPIC_LVT_MASKED,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_THERMAL, 4, &v), v));
+    CHECK_HEX("pmc masked at reset", HYPE_GUEST_LAPIC_LVT_MASKED,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_PMC, 4, &v), v));
+    CHECK_HEX("error masked at reset", HYPE_GUEST_LAPIC_LVT_MASKED,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_ERROR, 4, &v), v));
+    CHECK_HEX("cmci masked at reset", HYPE_GUEST_LAPIC_LVT_MASKED,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_CMCI, 4, &v), v));
+
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_ERROR, 4, 0xFEu);
+    CHECK_HEX("error LVT roundtrips", 0xFEu,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_ERROR, 4, &v), v));
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_THERMAL, 4, 0x100FDu);
+    CHECK_HEX("thermal LVT roundtrips", 0x100FDu,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_THERMAL, 4, &v), v));
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_PMC, 4, 0xF0u);
+    CHECK_HEX("pmc LVT roundtrips", 0xF0u,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_PMC, 4, &v), v));
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_LVT_CMCI, 4, 0x100F2u),
+    CHECK_HEX("cmci LVT roundtrips", 0x100F2u,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_LVT_CMCI, 4, &v), v));
+
+    /* ESR: a write latches the (empty) internal status; reads stay 0. */
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ESR, 4, 0xDEADu);
+    CHECK_HEX("ESR reads 0", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ESR, 4, &v), v));
+}
+
 int main(void) {
+    test_all_lvt_entries_roundtrip();
     test_isr_reads_zero_until_a_vector_is_accepted();
     test_isr_bit_lands_in_the_right_dword_across_the_whole_range();
     test_eoi_retires_the_highest_in_service_vector();

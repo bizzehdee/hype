@@ -6,6 +6,11 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->lvt_timer = HYPE_GUEST_LAPIC_LVT_MASKED;
     lapic->lvt_lint0 = HYPE_GUEST_LAPIC_LVT_MASKED;
     lapic->lvt_lint1 = HYPE_GUEST_LAPIC_LVT_MASKED;
+    lapic->lvt_thermal = HYPE_GUEST_LAPIC_LVT_MASKED;
+    lapic->lvt_pmc = HYPE_GUEST_LAPIC_LVT_MASKED;
+    lapic->lvt_error = HYPE_GUEST_LAPIC_LVT_MASKED;
+    lapic->lvt_cmci = HYPE_GUEST_LAPIC_LVT_MASKED;
+    lapic->esr = 0;
     lapic->dfr = 0xFFFFFFFFu;
     lapic->ldr = 0;
     lapic->icr_low = 0;
@@ -134,6 +139,22 @@ int hype_guest_lapic_read(hype_guest_lapic_t *lapic, uint32_t offset, unsigned i
         case HYPE_GUEST_LAPIC_REG_LVT_LINT1:
             *out = lapic->lvt_lint1;
             return 0;
+        case HYPE_GUEST_LAPIC_REG_LVT_THERMAL:
+            *out = lapic->lvt_thermal;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_LVT_PMC:
+            *out = lapic->lvt_pmc;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_LVT_ERROR:
+            *out = lapic->lvt_error;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_LVT_CMCI:
+            *out = lapic->lvt_cmci;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_ESR:
+            /* No error sources are modelled; the latched value is always 0. */
+            *out = lapic->esr;
+            return 0;
         case HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT:
             *out = lapic->init_count;
             return 0;
@@ -219,6 +240,23 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
             return 0;
         case HYPE_GUEST_LAPIC_REG_LVT_LINT1:
             lapic->lvt_lint1 = value;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_LVT_THERMAL:
+            lapic->lvt_thermal = value;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_LVT_PMC:
+            lapic->lvt_pmc = value;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_LVT_ERROR:
+            lapic->lvt_error = value;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_LVT_CMCI:
+            lapic->lvt_cmci = value;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_ESR:
+            /* A write latches the (empty) internal error status into the
+             * visible register; both are always 0 here. */
+            lapic->esr = 0;
             return 0;
         case HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT:
             /* Writing the initial count (re)arms the timer, per the SDM. */

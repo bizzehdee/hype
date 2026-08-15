@@ -62,7 +62,12 @@
 #define HYPE_GUEST_LAPIC_REG_SVR 0x0F0u
 #define HYPE_GUEST_LAPIC_REG_ICR_LOW 0x300u
 #define HYPE_GUEST_LAPIC_REG_ICR_HIGH 0x310u
+#define HYPE_GUEST_LAPIC_REG_ESR 0x280u
+#define HYPE_GUEST_LAPIC_REG_LVT_CMCI 0x2F0u
 #define HYPE_GUEST_LAPIC_REG_LVT_TIMER 0x320u
+#define HYPE_GUEST_LAPIC_REG_LVT_THERMAL 0x330u
+#define HYPE_GUEST_LAPIC_REG_LVT_PMC 0x340u
+#define HYPE_GUEST_LAPIC_REG_LVT_ERROR 0x370u
 #define HYPE_GUEST_LAPIC_REG_LVT_LINT0 0x350u
 #define HYPE_GUEST_LAPIC_REG_LVT_LINT1 0x360u
 #define HYPE_GUEST_LAPIC_REG_TIMER_INIT_COUNT 0x380u
@@ -128,6 +133,17 @@ typedef struct {
     uint32_t lvt_timer;
     uint32_t lvt_lint0;
     uint32_t lvt_lint1;
+    /* #94: the remaining LVT entries and the ESR. Windows programs LVT ERROR
+     * (and the PMC entry) at boot, and PatchGuard SHADOWS the whole LVT table:
+     * a register whose write is dropped and whose read returns 0 shows up as
+     * CRITICAL_STRUCTURE_CORRUPTION arg4=0x17 ("Local APIC modification") --
+     * the 0x109 that kept killing Windows mid-install. Nothing is wired to
+     * these sources; faithful storage is the entire requirement. */
+    uint32_t lvt_thermal;
+    uint32_t lvt_pmc;
+    uint32_t lvt_error;
+    uint32_t lvt_cmci;
+    uint32_t esr;
     uint32_t dfr;
     uint32_t ldr;
     uint32_t icr_low;  /* last ICR_LOW written (delivery status reads as idle) */
