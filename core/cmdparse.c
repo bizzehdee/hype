@@ -60,3 +60,30 @@ hype_cmd_t hype_cmd_parse(const char *line) {
     }
     return c;
 }
+
+/*
+ * #459: one table, both readers. Order matches the verb_of() chain above so a new verb is added
+ * in two adjacent places in one file, not in three files two of which are easy to miss.
+ */
+static const char *const g_cmd_usage[] = {
+    "help",
+    "list",
+    "status <vm>",
+    "start <vm>",
+    "stop <vm>",
+    "resume <vm>",
+    "shutdown <vm>",
+    "off <vm>",
+    "focus <vm>",
+    "confirm <serial>",
+    "resolution [list|<W>x<H>]",
+    "config <vm>",
+};
+
+unsigned hype_cmd_usage_count(void) {
+    return (unsigned)(sizeof(g_cmd_usage) / sizeof(g_cmd_usage[0]));
+}
+
+const char *hype_cmd_usage(unsigned index) {
+    return (index < hype_cmd_usage_count()) ? g_cmd_usage[index] : "";
+}

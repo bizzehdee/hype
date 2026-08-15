@@ -24,15 +24,42 @@ typedef struct {
     int focused;          /* nonzero => this row is the currently-focused VM */
 } hype_vm_dash_info_t;
 
+/*
+ * #460: the last command's output, as LINES rather than one string.
+ *
+ * It used to be a single `char[96]` in boot/main.c. Two features outgrew it: `help` is 116
+ * characters and was cut mid-token (taking `config <vm>` off the screen entirely, #459), and
+ * TERM-6's `config <vm>` is a whole VM's configuration -- which is why that shipped writing to
+ * the debug log with `-- see log` on screen. On a cold-boot-only, serial-less machine "see log"
+ * means power down and move the USB stick, so the answer was effectively unreadable.
+ *
+ * Sized to hold the largest thing a command produces (a VM's full effective config) on a grid
+ * that is 100+ rows tall in every mode this project renders at. Overflow is reported, never
+ * silent -- see hype_dash_text_add.
+ */
+#define HYPE_DASH_TEXT_LINES 48u
+#define HYPE_DASH_TEXT_COLS 128u
+
+typedef struct {
+    char line[HYPE_DASH_TEXT_LINES][HYPE_DASH_TEXT_COLS];
+    unsigned count;   /* lines held */
+    unsigned dropped; /* lines refused because the buffer was full */
+} hype_dash_text_t;
+
+void hype_dash_text_reset(hype_dash_text_t *t);
+
+/* Append one line, truncated at HYPE_DASH_TEXT_COLS-1. Past capacity the line is refused and
+ * `dropped` counts it, so the renderer can say so instead of quietly showing a partial answer. */
+void hype_dash_text_add(hype_dash_text_t *t, const char *s);
+
 /* Render the dashboard into grid `s` (cleared first). host_uptime_s is shown
  * in the header. `cmdline` (the TERM-2 command being typed) and `result` (the
- * last command's result message) render as a footer when non-NULL. Rows beyond
- * the grid height scroll off (the grid's own behaviour); size the grid to the
- * panel. */
+ * last command's output) render as a footer when non-NULL. Result lines that do
+ * not fit the grid are reported by count rather than dropped silently. */
 void hype_dashboard_render(hype_vt_screen_t *s,
                            const hype_vm_dash_info_t *vms, unsigned n,
                            uint64_t host_uptime_s,
-                           const char *cmdline, const char *result);
+                           const char *cmdline, const hype_dash_text_t *result);
 
 /* Format `secs` as HH:MM:SS into buf (>= 9 bytes). Exposed for tests. */
 void hype_dashboard_fmt_uptime(char *buf, unsigned long long secs);

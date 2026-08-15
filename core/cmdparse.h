@@ -29,11 +29,24 @@ typedef enum {
     HYPE_CMD_RESOLUTION,
     /* TERM-6 (#444): arg = a VM name/index (the same addressing every other per-VM verb uses).
      * Prints that VM's full effective hype.cfg -- every field, tagged (default) or (set) --
-     * to the log (hype_debug_print); g_cmd_result gets a short pointer to it, since a whole
-     * VM's config does not fit the single-line result buffer. */
+     * into the dashboard's multi-line result panel (#460). */
     HYPE_CMD_CONFIG,
     HYPE_CMD_UNKNOWN,
 } hype_cmd_verb_t;
+
+/*
+ * #459: the canonical usage list, and the ONLY place a verb's on-screen spelling lives.
+ *
+ * There used to be two hand-maintained copies -- the always-visible hint line in
+ * core/dashboard.c and the `help` result string in boot/main.c -- and neither was updated when
+ * `resolution` (#443) and `config` (#444) were added. The dashboard therefore advertised the
+ * pre-TERM-6/7 command set permanently, which is why both features read as missing. Deriving
+ * both from this table is what stops the third divergence.
+ */
+unsigned hype_cmd_usage_count(void);
+
+/* Usage text for entry `index` (e.g. "status <vm>"), or "" when out of range. */
+const char *hype_cmd_usage(unsigned index);
 
 #define HYPE_CMD_ARG_MAX 48u
 

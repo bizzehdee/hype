@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../cmdparse.h"
 #include "../dashboard.h"
 
 static int failures = 0;
@@ -20,6 +21,98 @@ static int row_has(const hype_vt_screen_t *s, unsigned r, const char *needle) {
     char buf[HYPE_VT_MAX_COLS + 1];
     row_text(s, r, buf);
     return strstr(buf, needle) != NULL;
+}
+
+static int grid_has(const hype_vt_screen_t *s, const char *needle) {
+    unsigned r;
+    for (r = 0; r < s->rows; r++) {
+        if (row_has(s, r, needle)) return 1;
+    }
+    return 0;
+}
+
+/* --- #459: the always-visible hint must list every verb the parser accepts --- */
+
+static void test_hint_line_lists_every_verb(void) {
+    /*
+     * The bug: the hint was a hand-written string in dashboard.c and `help` was a second
+     * hand-written string in main.c. Neither was updated when `resolution` and `config` were
+     * added, so both features were invisible from the dashboard. Asserting against
+     * hype_cmd_usage() is what makes a third divergence fail here instead of on hardware.
+     */
+    hype_vt_screen_t *s = malloc(sizeof(*s));
+    unsigned i, n = hype_cmd_usage_count();
+
+    hype_vt_screen_init(s, 100, 40);
+    hype_dashboard_render(s, NULL, 0, 0, "", NULL);
+    CHECK("usage table is not empty", n > 0);
+    for (i = 0; i < n; i++) {
+        if (!grid_has(s, hype_cmd_usage(i))) {
+            printf("FAIL: hint line omits verb '%s'\n", hype_cmd_usage(i));
+            failures++;
+        }
+    }
+    CHECK("hint mentions resolution", grid_has(s, "resolution"));
+    CHECK("hint mentions config", grid_has(s, "config"));
+    free(s);
+}
+
+/* --- #460: the result panel is multi-line, and never truncates silently --- */
+
+static void test_result_panel_renders_every_line(void) {
+    hype_vt_screen_t *s = malloc(sizeof(*s));
+    hype_dash_text_t *t = malloc(sizeof(*t));
+    unsigned i;
+
+    hype_vt_screen_init(s, 100, 60);
+    hype_dash_text_reset(t);
+    for (i = 0; i < 12u; i++) {
+        char l[32];
+        snprintf(l, sizeof(l), "field%u = value%u", i, i);
+        hype_dash_text_add(t, l);
+    }
+    hype_dashboard_render(s, NULL, 0, 0, "config vm0", t);
+    CHECK("first result line rendered", grid_has(s, "field0 = value0"));
+    CHECK("last result line rendered", grid_has(s, "field11 = value11"));
+    CHECK("no overflow notice when everything fits", !grid_has(s, "not shown"));
+    free(t);
+    free(s);
+}
+
+static void test_result_overflow_is_reported_not_silent(void) {
+    /* A short grid cannot show 40 lines. The one thing it must never do is show 6 of them and
+     * look complete -- that is the failure mode the 96-byte buffer had. */
+    hype_vt_screen_t *s = malloc(sizeof(*s));
+    hype_dash_text_t *t = malloc(sizeof(*t));
+    unsigned i;
+
+    hype_vt_screen_init(s, 100, 12);
+    hype_dash_text_reset(t);
+    for (i = 0; i < 40u; i++) {
+        char l[32];
+        snprintf(l, sizeof(l), "line%u", i);
+        hype_dash_text_add(t, l);
+    }
+    hype_dashboard_render(s, NULL, 0, 0, "", t);
+    CHECK("clipped result says so", grid_has(s, "not shown"));
+    free(t);
+    free(s);
+}
+
+static void test_dash_text_add_caps_and_counts_dropped(void) {
+    hype_dash_text_t *t = malloc(sizeof(*t));
+    unsigned i;
+
+    hype_dash_text_reset(t);
+    CHECK("reset empties", t->count == 0 && t->dropped == 0);
+    for (i = 0; i < HYPE_DASH_TEXT_LINES + 7u; i++) hype_dash_text_add(t, "x");
+    CHECK("capped at capacity", t->count == HYPE_DASH_TEXT_LINES);
+    CHECK("overflow counted, not silent", t->dropped == 7u);
+
+    hype_dash_text_reset(t);
+    hype_dash_text_add(t, NULL);
+    CHECK("NULL line is safe and empty", t->count == 1 && t->line[0][0] == '\0');
+    free(t);
 }
 
 /* --- #263: uptime must accumulate RUNNING time, not wall-clock --- */
@@ -376,7 +469,10 @@ int main(void) {
         { "alpine", "linux", "running", 3, 6144, 754, "test.iso", 1 },
         { "fedora", "linux", "off",     0, 6144, 0,   0,          0 },
     };
-    hype_dashboard_render(s, vms, 2, 45296, "sto", "vm0: paused");
+    hype_dash_text_t *res = malloc(sizeof(*res));
+    hype_dash_text_reset(res);
+    hype_dash_text_add(res, "vm0: paused");
+    hype_dashboard_render(s, vms, 2, 45296, "sto", res);
 
     CHECK("header line names product", row_has(s, 0, "hype - VM dashboard"));
     CHECK("header shows host uptime", row_has(s, 0, "12:34:56"));
@@ -418,10 +514,15 @@ int main(void) {
 
     /* --- zero VMs: header still renders, no crash --- */
     hype_vt_screen_init(s, 80, 25);
-    hype_dashboard_render(s, NULL, 0, 10, "", "");
+    hype_dashboard_render(s, NULL, 0, 10, "", NULL);
     CHECK("empty dashboard header", row_has(s, 0, "hype - VM dashboard"));
 
+    free(res);
     free(s);
+    test_hint_line_lists_every_verb();
+    test_result_panel_renders_every_line();
+    test_result_overflow_is_reported_not_silent();
+    test_dash_text_add_caps_and_counts_dropped();
     test_uptime_freezes_while_stopped();
     test_uptime_resumes_after_stop();
     test_uptime_first_sample_banks_nothing();

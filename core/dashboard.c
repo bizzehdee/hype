@@ -1,6 +1,28 @@
 #include "dashboard.h"
+#include "cmdparse.h"
 #include "format.h"
 #include "strutil.h"
+
+void hype_dash_text_reset(hype_dash_text_t *t) {
+    if (t == (hype_dash_text_t *)0) {
+        return;
+    }
+    t->count = 0;
+    t->dropped = 0;
+    t->line[0][0] = '\0';
+}
+
+void hype_dash_text_add(hype_dash_text_t *t, const char *s) {
+    if (t == (hype_dash_text_t *)0) {
+        return;
+    }
+    if (t->count >= HYPE_DASH_TEXT_LINES) {
+        t->dropped++;
+        return;
+    }
+    (void)hype_strlcpy(t->line[t->count], s ? s : "", HYPE_DASH_TEXT_COLS);
+    t->count++;
+}
 
 /* Append `s` to line[*len..], left-justified and space-padded to `width`, then
  * one separator space; `s` is truncated at `width`. Callers pass non-null `s`
@@ -233,9 +255,12 @@ static void emit_line(hype_vt_screen_t *s, const char *line) {
 void hype_dashboard_render(hype_vt_screen_t *s,
                            const hype_vm_dash_info_t *vms, unsigned n,
                            uint64_t host_uptime_s,
-                           const char *cmdline, const char *result) {
+                           const char *cmdline, const hype_dash_text_t *result) {
     char line[160];
     char up[16];
+    /* #460: rows consumed so far, so the result panel knows how much of the grid is left.
+     * Counted rather than derived, because the hint block below wraps to an unknown height. */
+    unsigned rows_used = 0;
 
     /* Home + clear the grid (reuse the VT interpreter's own ED/CUP). */
     hype_vt_screen_write(s, (const uint8_t *)"\x1b[H\x1b[2J", 7);
@@ -282,12 +307,62 @@ void hype_dashboard_render(hype_vt_screen_t *s,
         emit_line(s, line);
     }
 
-    /* TERM-2 footer: the command prompt (with a '_' caret) + last result. */
+    /* TERM-2 footer: the command hint, the prompt (with a '_' caret), then the last result. */
     emit_line(s, "");
-    emit_line(s, "type: help | list | status|start|stop|resume|shutdown|off|focus <vm>");
+    /* title, blank, column header, n VM rows, this blank. */
+    rows_used += n + 4u;
+
+    /*
+     * #459: the hint is built from hype_cmd_usage(), not hand-written here. The hand-written
+     * version silently fell two verbs behind and made TERM-6/TERM-7 look unimplemented.
+     * Wrapped to the grid width so a longer command set grows a line instead of vanishing off
+     * the right edge -- the same failure in a different direction.
+     */
+    {
+        unsigned i, count = hype_cmd_usage_count();
+        unsigned len = 0;
+        unsigned width = (s->cols > 8u && s->cols < sizeof(line)) ? s->cols - 1u
+                                                                  : (unsigned)sizeof(line) - 1u;
+        hype_strlcpy(line, "type: ", sizeof(line));
+        len = (unsigned)hype_strlen(line);
+        for (i = 0; i < count; i++) {
+            const char *u = hype_cmd_usage(i);
+            unsigned ul = (unsigned)hype_strlen(u);
+            if (len + ul + 3u > width) {
+                line[len] = '\0';
+                emit_line(s, line);
+                rows_used++;
+                len = 6u; /* re-indent under "type: " */
+                for (unsigned k = 0; k < len; k++) line[k] = ' ';
+            } else if (i > 0) {
+                line[len++] = ' ';
+                line[len++] = '|';
+                line[len++] = ' ';
+            }
+            for (unsigned k = 0; k < ul; k++) line[len++] = u[k];
+        }
+        line[len] = '\0';
+        emit_line(s, line);
+        rows_used++;
+    }
+
     hype_snprintf(line, sizeof(line), "hype> %s_", cmdline ? cmdline : "");
     emit_line(s, line);
-    if (result && result[0]) {
-        emit_line(s, result);
+    rows_used++;
+
+    if (result != (const hype_dash_text_t *)0 && result->count > 0u) {
+        /* One row is reserved for the overflow notice, so a clipped result can always say so. */
+        unsigned room = (s->rows > rows_used + 1u) ? s->rows - rows_used - 1u : 0u;
+        unsigned shown = (result->count < room) ? result->count : room;
+        unsigned i;
+        for (i = 0; i < shown; i++) {
+            emit_line(s, result->line[i]);
+        }
+        if (shown < result->count || result->dropped > 0u) {
+            hype_snprintf(line, sizeof(line),
+                          "-- %u more line(s) not shown (grid has %u rows) --",
+                          (result->count - shown) + result->dropped, s->rows);
+            emit_line(s, line);
+        }
     }
 }

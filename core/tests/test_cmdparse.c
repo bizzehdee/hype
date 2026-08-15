@@ -69,6 +69,27 @@ int main(void) {
     /* NULL line */
     CHECK("NULL line -> NONE", P(NULL).verb == HYPE_CMD_NONE);
 
+    /*
+     * #459: the usage table is the single source the dashboard hint and `help` both render from.
+     * Two hand-written copies had already fallen two verbs behind, so guard both directions:
+     * every usage entry must name a verb the parser knows, and there must be exactly one entry
+     * per verb. Adding HYPE_CMD_* without a usage line now fails here.
+     */
+    {
+        unsigned i, n = hype_cmd_usage_count();
+        CHECK("one usage entry per verb",
+              n == (unsigned)(HYPE_CMD_CONFIG - HYPE_CMD_HELP + 1));
+        for (i = 0; i < n; i++) {
+            hype_cmd_t c = P(hype_cmd_usage(i));
+            if (c.verb == HYPE_CMD_UNKNOWN || c.verb == HYPE_CMD_NONE) {
+                printf("FAIL: usage entry '%s' does not parse to a verb\n", hype_cmd_usage(i));
+                failures++;
+            }
+        }
+        CHECK("out-of-range usage index is empty, not a crash",
+              hype_cmd_usage(n)[0] == '\0');
+    }
+
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;

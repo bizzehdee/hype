@@ -1138,7 +1138,20 @@ static void hype_term_apply_chord(hype_chord_result_t cr) {
 #define HYPE_CMDLINE_MAX 96u
 static char g_cmdline[HYPE_CMDLINE_MAX];
 static unsigned g_cmdline_len;
-static char g_cmd_result[96];
+/*
+ * #459/#460: the last command's output, as lines. Was `char[96]`, which cut `help` mid-token and
+ * forced TERM-6's `config <vm>` to answer into the debug log instead of onto the screen.
+ */
+static hype_dash_text_t g_cmd_text;
+
+static void term_resultf(const char *fmt, ...) {
+    char buf[HYPE_DASH_TEXT_COLS];
+    va_list ap;
+    va_start(ap, fmt);
+    (void)hype_vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    hype_dash_text_add(&g_cmd_text, buf);
+}
 
 /* TERM-7 (#443): the live GOP protocol, stashed once hype_gop_locate() succeeds so the
  * `resolution` command (dispatched from term_run_cmdline, a different function) can reach it.
@@ -1548,37 +1561,44 @@ static void term_post(int idx, hype_vm_event_t ev) {
 }
 
 /* TERM-7 (#443): defined further down, once g_hype_cfg/g_hype_log/g_term_gop are all declared --
- * forward-declared here so term_run_cmdline's switch can call it. Writes its result into
- * g_cmd_result, matching every other verb's own convention. */
+ * forward-declared here so term_run_cmdline's switch can call it. Appends its result with
+ * term_resultf(), matching every other verb's own convention. */
 static void term_resolution_cmd(hype_cmd_t *c);
 
 /* TERM-6 (#444): same reason/placement as term_resolution_cmd above -- needs g_hype_cfg. `idx` is
  * the VM index term_run_cmdline already resolved from the command's arg. */
 static void term_config_cmd(int idx, const char *nm);
 
-/* Execute the current command line, setting g_cmd_result, then clear it. */
+/* Execute the current command line, replacing the previous result, then clear the line. */
 static void term_run_cmdline(void) {
     hype_cmd_t c = hype_cmd_parse(g_cmdline);
     int idx = term_resolve_vm(c.arg);
     const char *nm = (idx >= 0) ? g_vms[idx].name : (c.has_arg ? c.arg : "?");
 
+    /* Each command's output replaces the last -- the panel is a result, not a scrollback. */
+    hype_dash_text_reset(&g_cmd_text);
+
     switch (c.verb) {
         case HYPE_CMD_NONE:
             break;
-        case HYPE_CMD_HELP:
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
-                          "cmds: list status start stop resume shutdown off focus <vm> | confirm "
-                          "<sn> | resolution [list|<W>x<H>] | config <vm>");
+        case HYPE_CMD_HELP: {
+            /* #459: from hype_cmd_usage(), so this cannot fall behind the parser again. */
+            unsigned ui, ucount = hype_cmd_usage_count();
+            term_resultf("commands (<vm> = name or 1-based index):");
+            for (ui = 0; ui < ucount; ui++) {
+                term_resultf("  %s", hype_cmd_usage(ui));
+            }
             break;
+        }
         case HYPE_CMD_LIST:
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%u VM(s) -- see table above",
+            term_resultf( "%u VM(s) -- see table above",
                           (unsigned)g_vm_count);
             break;
         case HYPE_CMD_STATUS:
             if (idx < 0) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "status: unknown vm '%s'", nm);
+                term_resultf( "status: unknown vm '%s'", nm);
             } else {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: %s, cpu %u%%, up %llus",
+                term_resultf( "%s: %s, cpu %u%%, up %llus",
                               nm, hype_vm_lifecycle_name(g_vms[idx].lifecycle),
                               g_vms[idx].stat_cpu_pct,
                               (unsigned long long)(g_vms[idx].stat_uptime_ms / 1000u));
@@ -1588,46 +1608,46 @@ static void term_run_cmdline(void) {
         case HYPE_CMD_RESUME:
         case HYPE_CMD_POWEROFF:
             if (idx < 0) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "unknown vm '%s'", nm);
+                term_resultf( "unknown vm '%s'", nm);
                 break;
             }
             term_post(idx, (c.verb == HYPE_CMD_STOP) ? HYPE_VM_EV_STOP
                           : (c.verb == HYPE_CMD_RESUME) ? HYPE_VM_EV_RESUME
                           : HYPE_VM_EV_FORCE_OFF);
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: %s", nm,
+            term_resultf( "%s: %s", nm,
                           hype_vm_lifecycle_name(g_vms[idx].lifecycle));
             break;
         case HYPE_CMD_SHUTDOWN:
             if (idx < 0) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "shutdown: unknown vm '%s'", nm);
+                term_resultf( "shutdown: unknown vm '%s'", nm);
                 break;
             }
             g_vms[idx].shutdown_deadline_tsc = 0; /* the VM's own loop arms the grace timer */
             term_post(idx, HYPE_VM_EV_SHUTDOWN);
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: %s (grace, then off)", nm,
+            term_resultf( "%s: %s (grace, then off)", nm,
                           hype_vm_lifecycle_name(g_vms[idx].lifecycle));
             break;
         case HYPE_CMD_START:
             if (idx < 0) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "start: unknown vm '%s'", nm);
+                term_resultf( "start: unknown vm '%s'", nm);
                 break;
             }
             term_post(idx, HYPE_VM_EV_START); /* OFF -> STARTING; the VM's loop re-boots it */
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: %s", nm,
+            term_resultf( "%s: %s", nm,
                           hype_vm_lifecycle_name(g_vms[idx].lifecycle));
             break;
         case HYPE_CMD_FOCUS:
             if (idx < 0) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focus: unknown vm '%s'", nm);
+                term_resultf( "focus: unknown vm '%s'", nm);
                 break;
             }
             if (hype_term_focus_validate(idx, (const unsigned char *)g_vm_ready,
                                          g_vm_count) < 0) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                term_resultf(
                               "focus: %s is unavailable (vCPU not dispatched)", nm);
             } else {
                 g_term_view = idx;
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "focused %s", nm);
+                term_resultf( "focused %s", nm);
             }
             break;
         case HYPE_CMD_CONFIRM: {
@@ -1638,15 +1658,15 @@ static void term_run_cmdline(void) {
             hype_phys_confirm_submit_t sr =
                 hype_phys_confirm_submit(&g_phys_confirm, c.has_arg ? c.arg : "");
             if (sr == HYPE_PHYS_CONFIRM_SUBMIT_NONE_PENDING) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                term_resultf(
                               "confirm: no physical write pending");
             } else if (sr == HYPE_PHYS_CONFIRM_SUBMIT_ACCEPTED) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                term_resultf(
                               "physical write CONFIRMED for '%s'", g_phys_confirm.vm_name);
                 hype_debug_print("phys-write: operator CONFIRMED via dashboard -- vm '%s' sn '%s'\n",
                                  g_phys_confirm.vm_name, g_phys_confirm.serial);
             } else {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                term_resultf(
                               "confirm: serial mismatch -- type: confirm <drive-serial>");
             }
             break;
@@ -1656,14 +1676,14 @@ static void term_run_cmdline(void) {
             break;
         case HYPE_CMD_CONFIG:
             if (idx < 0) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "config: unknown vm '%s'", nm);
+                term_resultf( "config: unknown vm '%s'", nm);
             } else {
                 term_config_cmd(idx, nm);
             }
             break;
         case HYPE_CMD_UNKNOWN:
         default:
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "unknown command (try 'help')");
+            term_resultf( "unknown command (try 'help')");
             break;
     }
     g_cmdline[0] = '\0';
@@ -8837,11 +8857,15 @@ static void fw_1_render_console(void) {
             /* M10-5: a pending/accepted physical-write confirmation is the most
              * important thing on screen, so it takes over the footer result
              * line (drive model/serial/size + the exact command to type). */
-            const char *result_line = g_cmd_result;
+            const hype_dash_text_t *result_text = &g_cmd_text;
             static char confirm_footer[192];
+            static hype_dash_text_t confirm_text;
             if (g_phys_confirm.state != HYPE_PHYS_CONFIRM_IDLE) {
-                result_line = hype_phys_confirm_prompt(&g_phys_confirm, confirm_footer,
-                                                       sizeof(confirm_footer));
+                hype_dash_text_reset(&confirm_text);
+                hype_dash_text_add(&confirm_text,
+                                   hype_phys_confirm_prompt(&g_phys_confirm, confirm_footer,
+                                                            sizeof(confirm_footer)));
+                result_text = &confirm_text;
             }
             /*
              * #363: HOST uptime, computed here on the BSP -- not vm0's.
@@ -8861,7 +8885,7 @@ static void fw_1_render_console(void) {
                                       ? (unsigned)((hype_rdtsc() - g_host_time_tsc) /
                                                    g_vms[0].host_tsc_hz)
                                       : 0u,
-                                  g_cmdline, result_line);
+                                  g_cmdline, result_text);
         }
         /* PERF-2 (#234): same diffing treatment for the dashboard. It only
          * changes when a stat/second ticks, so most frames push nothing. */
@@ -17363,17 +17387,17 @@ static void fw_1_vars_request(hype_fw_vm_t *vm, uint32_t kind, int wait) {
 static void term_resolution_cmd(hype_cmd_t *c) {
     if (!c->has_arg) {
         if (g_hype_cfg.hype.has_resolution) {
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "resolution: %ux%u (configured)",
+            term_resultf( "resolution: %ux%u (configured)",
                           g_hype_cfg.hype.resolution_width, g_hype_cfg.hype.resolution_height);
         } else {
-            hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+            term_resultf(
                           "resolution: unset (using the firmware's current mode)");
         }
         return;
     }
 
     if (g_term_gop == 0) {
-        hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "resolution: no GOP on this host");
+        term_resultf( "resolution: no GOP on this host");
         return;
     }
 
@@ -17383,18 +17407,16 @@ static void term_resolution_cmd(hype_cmd_t *c) {
 
         if (hype_streq(c->arg, "list")) {
             unsigned int i;
-            unsigned int off = 0;
             if (mode_count == 0u) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "resolutions: none reported");
+                term_resultf("resolutions: none reported");
                 return;
             }
+            /* #460: one mode per line. This used to pack them comma-separated into the 96-byte
+             * result and stop at whatever fit, so the tail of the list was simply invisible --
+             * on a host with many modes, the one the operator wanted usually was. */
+            term_resultf("%u mode(s) reported by GOP:", mode_count);
             for (i = 0; i < mode_count; i++) {
-                int n = hype_snprintf(g_cmd_result + off, sizeof(g_cmd_result) - off, "%s%ux%u",
-                                      (i > 0u) ? "," : "", modes[i].width, modes[i].height);
-                if (n < 0 || (unsigned int)n >= sizeof(g_cmd_result) - off) {
-                    break; /* the single-line result buffer is full -- the rest is truncated */
-                }
-                off += (unsigned int)n;
+                term_resultf("  %ux%u", modes[i].width, modes[i].height);
             }
             return;
         }
@@ -17413,21 +17435,21 @@ static void term_resolution_cmd(hype_cmd_t *c) {
             }
             if (x == 0 || x == c->arg || hype_parse_uint(c->arg, &w) != 0 ||
                 hype_parse_uint(x + 1, &hgt) != 0 || w == 0u || hgt == 0u) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                term_resultf(
                               "resolution: expected <W>x<H>, e.g. 1920x1080");
                 return;
             }
 
             match = hype_gop_mode_find(modes, mode_count, (uint32_t)w, (uint32_t)hgt);
             if (match < 0) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                term_resultf(
                               "resolution: %llux%llu not offered by this GOP (try 'resolution "
                               "list')",
                               w, hgt);
                 return;
             }
             if (hype_gop_mode_set(g_term_gop, modes[(unsigned int)match].mode_number) != 0) {
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                term_resultf(
                               "resolution: %llux%llu was offered but SetMode refused it", w, hgt);
                 return;
             }
@@ -17449,7 +17471,7 @@ static void term_resolution_cmd(hype_cmd_t *c) {
                         saved = 1;
                     }
                 }
-                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "resolution applied: %llux%llu%s",
+                term_resultf( "resolution applied: %llux%llu%s",
                               w, hgt,
                               saved ? " (saved)" : " (NOT saved -- no writable volume mounted)");
             }
@@ -17457,11 +17479,34 @@ static void term_resolution_cmd(hype_cmd_t *c) {
     }
 }
 
-/* One "<key> = <value> (default|set)" log line. `set` is whether this field's F_* bit is present
- * in the VM's seen_fields -- the whole point of #444. */
+/*
+ * One "<key> = <value> (default|set)" field. `set` is whether this field's F_* bit is present in
+ * the VM's seen_fields -- the whole point of #444.
+ *
+ * #460: goes to the on-screen result panel AND the log. The panel is what the ticket actually
+ * asked for (the target machine is cold-boot-only and serial-less, so "see log" meant powering
+ * down and moving the USB stick); the log copy stays because it is what post-mortem analysis of
+ * a captured run reads, and it costs nothing.
+ */
+#define TERM_CFG_KEY_COL 28u
+
 static void term_cfg_line(const char *vm_name, const char *key, const char *value, int set) {
-    hype_debug_print("cfg[%s]: %s = %s (%s)\n", vm_name, key, value,
-                     set ? "set" : "default");
+    char row[HYPE_DASH_TEXT_COLS];
+    unsigned int n = 0, k;
+
+    hype_debug_print("cfg[%s]: %s = %s (%s)\n", vm_name, key, value, set ? "set" : "default");
+
+    /* hype_snprintf has no left-justify flag, so the key column is padded by hand. */
+    row[n++] = ' ';
+    row[n++] = ' ';
+    for (k = 0; key[k] != '\0' && n < TERM_CFG_KEY_COL; k++) {
+        row[n++] = key[k];
+    }
+    while (n < TERM_CFG_KEY_COL) {
+        row[n++] = ' ';
+    }
+    row[n] = '\0';
+    term_resultf("%s%s (%s)", row, value, set ? "set" : "default");
 }
 
 static void term_cfg_line_uint(const char *vm_name, const char *key, unsigned int value, int set) {
@@ -17491,10 +17536,10 @@ static void term_cfg_line_list(const char *vm_name, const char *key,
 }
 
 /*
- * TERM-6 (#444): every field of `cfg->vms[idx]`, one log line each, tagged (default) or (set)
- * from seen_fields. g_cmd_result only points at the log -- a whole VM's config does not fit the
- * single-line command-result buffer (see #444's own ticket, which flags this as a known follow-on
- * design question: a proper multi-line TERM panel, not this diagnostic-log workaround).
+ * TERM-6 (#444): every field of `cfg->vms[idx]`, one line each, tagged (default) or (set) from
+ * seen_fields, rendered into the dashboard's multi-line result panel (#460) and mirrored to the
+ * log. The panel is the deliverable: this used to answer "see log" on screen, which on a
+ * cold-boot-only serial-less machine is not an answer the operator can read.
  */
 static void term_config_cmd(int idx, const char *nm) {
     const hype_cfg_vm_t *vm;
@@ -17504,8 +17549,7 @@ static void term_config_cmd(int idx, const char *nm) {
         /* A built-in default VM (no hype.cfg / no [vm.*] section for it at all) has nothing
          * parsed to show -- everything about it is a compiled-in default, not a config field. */
         hype_debug_print("cfg[%s]: no [vm.*] section for this VM -- built-in defaults only\n", nm);
-        hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
-                      "%s: no config section (built-in defaults) -- see log", nm);
+        term_resultf("config %s: no [vm.*] section -- every value is a built-in default", nm);
         return;
     }
 
@@ -17513,6 +17557,7 @@ static void term_config_cmd(int idx, const char *nm) {
     sf = vm->seen_fields;
 
     hype_debug_print("cfg[%s]: --- begin (name from section header: [vm.%s]) ---\n", nm, vm->name);
+    term_resultf("config %s -- from [vm.%s]", nm, vm->name);
     term_cfg_line_uint(nm, "vcpus", vm->vcpus, (sf & HYPE_CFG_F_VCPUS) != 0);
     /* cpu_set is a uint array, not NAME_MAX strings, so it can't reuse term_cfg_line_list. */
     if (vm->has_cpu_set) {
@@ -17572,8 +17617,6 @@ static void term_config_cmd(int idx, const char *nm) {
     term_cfg_line_list(nm, "net_peers", vm->net_peers, vm->net_peers_count,
                       (sf & HYPE_CFG_F_NET_PEERS) != 0);
     hype_debug_print("cfg[%s]: --- end ---\n", nm);
-
-    hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: full config printed to the log", nm);
 }
 
 /*
