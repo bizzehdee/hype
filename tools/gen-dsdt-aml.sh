@@ -8,7 +8,9 @@ set -eu
 cd "$(dirname "$0")/.."
 ASL=devices/dsdt.asl
 HDR=devices/dsdt_aml.h
-TMP="$(mktemp -d)"
+# Keep generated AML work on the checked ext4 project volume; do not inherit a
+# host TMPDIR that could resolve to tmpfs.
+TMP="$(mktemp -d "$PWD/.dsdt-tmp.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 iasl -p "$TMP/dsdt" "$ASL" >/dev/null
@@ -33,7 +35,7 @@ BODY=$((TOTAL - 36)) # strip the 36-byte SDT header
 WIN_OFF=$(python3 - "$AML" <<'PYFIND'
 import sys, struct
 aml = open(sys.argv[1], 'rb').read()[36:]     # body only, matching the array emitted below
-pat = struct.pack('<II', 0x80000000, 0xFEBFFFFF)   # min, max as written in devices/dsdt.asl
+pat = struct.pack('<II', 0x80000000, 0xDFFFFFFF)   # min, max as written in devices/dsdt.asl
 hits = [i for i in range(len(aml) - len(pat) + 1) if aml[i:i+len(pat)] == pat]
 if len(hits) != 1:
     sys.exit("gen-dsdt-aml.sh: expected exactly one PCI0 _CRS window, found %d" % len(hits))
@@ -58,7 +60,7 @@ PYFIND
     # emit the body bytes (offset 36..end) as 0xNN, 12 per line
     tail -c "$BODY" "$AML" | od -An -v -tu1 | tr -s ' ' '\n' | grep -E '^[0-9]+$' | \
         awk 'BEGIN{c=0}{printf "0x%02x, ", $1; if(++c%12==0) printf "\n    "}' | \
-        sed 's/^/    /' | sed 's/    $//'
+        sed 's/[[:space:]]*$//' | sed 's/^/    /' | sed 's/    $//'
     echo ""
     echo "};"
     echo ""
@@ -74,9 +76,11 @@ PYFIND
     echo "#define HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF ${WIN_OFF}u"
     echo "#define HYPE_DSDT_AML_PCI_WINDOW_LEN_OFF $((WIN_OFF + 12))u"
     echo ""
-    echo "/* The window's last byte: one below the I/O APIC at 0xFEC00000. Fixed -- only the BASE"
-    echo " * tracks guest RAM. */"
-    echo "#define HYPE_DSDT_AML_PCI_WINDOW_MAX 0xFEBFFFFFu"
+    echo "/* The patched window's last byte: one below the ECAM at 0xE0000000 (#440 -- the"
+    echo " * window must not cover the MCFG region or Windows fails the root bus with a"
+    echo " * resource conflict). A second, fixed window above the ECAM covers up to the"
+    echo " * I/O APIC. Only the BASE of this low window tracks guest RAM. */"
+    echo "#define HYPE_DSDT_AML_PCI_WINDOW_MAX 0xDFFFFFFFu"
     echo ""
     echo "#endif /* HYPE_DEVICES_DSDT_AML_H */"
 } > "$HDR"

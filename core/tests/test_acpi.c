@@ -106,7 +106,7 @@ static void test_pci_window_tracks_guest_ram_top(void) {
     body = dsdt_body_of(buf, &layout);
     CHECK_HEX("window base follows RAM top", 0xC0000000u,
               read_le32(body + HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF));
-    CHECK_HEX("window length runs to the I/O APIC", 0xFEBFFFFFu - 0xC0000000u + 1u,
+    CHECK_HEX("window length runs to the ECAM base", 0xDFFFFFFFu - 0xC0000000u + 1u,
               read_le32(body + HYPE_DSDT_AML_PCI_WINDOW_LEN_OFF));
 }
 
@@ -123,7 +123,7 @@ static void test_pci_window_default_ram_is_unchanged(void) {
     body = dsdt_body_of(buf, &layout);
     CHECK_HEX("base unchanged at the 2 GiB line", 0x80000000u,
               read_le32(body + HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF));
-    CHECK_HEX("length unchanged", 0x7EC00000u,
+    CHECK_HEX("length unchanged", 0x60000000u,
               read_le32(body + HYPE_DSDT_AML_PCI_WINDOW_LEN_OFF));
 }
 
@@ -135,7 +135,7 @@ static void test_pci_window_offset_points_at_a_dword_memory_descriptor(void) {
               (unsigned)hype_dsdt_aml_body[HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF - 10u]);
     CHECK_HEX("granularity dword is 0", 0u,
               read_le32(hype_dsdt_aml_body + HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF - 4u));
-    CHECK_HEX("_MAX sits between _MIN and _LEN", 0xFEBFFFFFu,
+    CHECK_HEX("_MAX sits between _MIN and _LEN", 0xDFFFFFFFu,
               read_le32(hype_dsdt_aml_body + HYPE_DSDT_AML_PCI_WINDOW_MIN_OFF + 4u));
 }
 

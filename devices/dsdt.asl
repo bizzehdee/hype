@@ -97,13 +97,13 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                 Package () { 0x0002FFFF, 0x02, 0x00, 0x12 },  /* dev 2 INTC -> GSI 18 */
                 Package () { 0x0002FFFF, 0x03, 0x00, 0x13 },  /* dev 2 INTD -> GSI 19 */
                 Package () { 0x0003FFFF, 0x00, 0x00, 0x14 },  /* dev 3 INTA -> GSI 20 (virtio-blk) */
-                /* #262: the SATA-disk AHCI HBA is device 4, INTA -> GSI 21. Without an
-                 * entry here the guest reports "can't derive routing for PCI INT A" /
-                 * "PCI INT A: no GSI" and libata's probe fails with -22: ahci needs an
-                 * interrupt, and its forced-polling fallback WARNs and stalls instead
-                 * (the same M4-6d2 behaviour that made device 2 need its own entry).
-                 * Must stay clear of the dev-2 block (16-19) and dev 3 (20). */
-                Package () { 0x0004FFFF, 0x00, 0x00, 0x15 },  /* dev 4 INTA -> GSI 21 (SATA disk) */
+                /* #440: the ICH9 SATA function is 00:1f.2. _PRT keys on
+                 * device/pin, so function 2 routes via dev31 INTA. GSI 21 keeps
+                 * it OFF the CD controller's line (dev 2 INTA -> GSI 16): hype's
+                 * per-device deassert would otherwise drop a still-pending
+                 * interrupt from the other HBA sharing the pin. Must match
+                 * HYPE_FW_1_ATA_GSI in boot/main.c. */
+                Package () { 0x001FFFFF, 0x00, 0x00, 0x15 },  /* dev 31 INTA -> GSI 21 (ICH9 SATA) */
                 /* #329: extra disk slots. Slot 0 keeps the per-bus legacy devices above; slots 1
                  * and 2 are devices 6 and 7 whatever their bus, each with its own GSI -- these are
                  * the LAST two free pins on the 24-pin IO-APIC, which is what caps a VM at 3 disks
@@ -136,13 +136,28 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                     0x0000,   /* translation */
                     0x0100)   /* length (256 buses) */
 
+                /* #440: the window must EXCLUDE the ECAM region at 0xE0000000
+                 * (HYPE_FW_1_ECAM_GPA, 256 MiB). Windows reserves the MCFG
+                 * range and its arbiter fails the whole root bus with problem
+                 * code 12 / STATUS_CONFLICTING_ADDRESSES when a bridge window
+                 * overlaps it -- measured: ACPI\PNP0A08 "Problem 12", no
+                 * Enum\PCI key, no storage driver ever started. QEMU's Q35
+                 * DSDT splits its window around the MCFG for the same reason. */
                 DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed,
                     NonCacheable, ReadWrite,
                     0x00000000,   /* granularity */
                     0x80000000,   /* min  -- 2 GiB, just above guest RAM */
+                    0xDFFFFFFF,   /* max  -- last byte below the ECAM */
+                    0x00000000,   /* translation */
+                    0x60000000)   /* length */
+
+                DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed,
+                    NonCacheable, ReadWrite,
+                    0x00000000,   /* granularity */
+                    0xF0000000,   /* min  -- resume above the ECAM */
                     0xFEBFFFFF,   /* max  -- last byte below the I/O APIC */
                     0x00000000,   /* translation */
-                    0x7EC00000)   /* length */
+                    0x0EC00000)   /* length */
 
                 /* The legacy I/O space the bridge forwards: com0/com1, the PS/2 controller, the
                  * PIT and the ACPI PM block all live here and are otherwise undeclared. */
@@ -159,83 +174,98 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                     0x0000,
                     0xF300)
             })
+
+            /* #440: the ICH9 LPC bridge at 00:1f.0, carrying the legacy ISA
+             * devices AS ITS CHILDREN. They used to be siblings of PCI0 at
+             * \_SB, which Linux tolerates -- but Windows' resource arbiter
+             * then treats their I/O ports as root-level allocations that
+             * CONFLICT with PCI0's own I/O windows, and fails the whole root
+             * bus with problem code 12 (measured: ACPI\PNP0A08 status
+             * 0xC0000018, no Enum\PCI key, no storage stack). Under the LPC
+             * bridge the arbiter charges them to the bridge's windows, which
+             * is where every real Q35 machine puts them. */
+            Device (ISA)
+            {
+                Name (_ADR, 0x001F0000)
+
+                /* M4-6d7: legacy ISA devices. In ACPI/APIC mode Linux wires an ISA
+                 * IRQ into the I/O APIC only when a namespace device claims it via
+                 * _CRS (acpi_pnp -> acpi_register_gsi); with none declared, the 8250
+                 * driver still probes ttyS0 at 0x3f8 but irq4 is never routed to any
+                 * interrupt controller, so every userspace serial write stalls on a
+                 * TX-empty IRQ that cannot arrive (and i8042 refuses to probe at all:
+                 * "PNP: No PS/2 controller found"). These mirror what QEMU's Q35 DSDT
+                 * declares, matching hype's existing COM1/COM2 + PS/2 models. */
+                Device (COM1)
+                {
+                    Name (_HID, EisaId ("PNP0501"))  /* 16550-compatible UART */
+                    Name (_UID, 0x01)
+                    Name (_STA, 0x0F)
+                    Name (_CRS, ResourceTemplate ()
+                    {
+                        IO (Decode16, 0x03F8, 0x03F8, 0x00, 0x08)
+                        IRQNoFlags () {4}
+                    })
+                }
+
+                Device (COM2)
+                {
+                    Name (_HID, EisaId ("PNP0501"))
+                    Name (_UID, 0x02)
+                    Name (_STA, 0x0F)
+                    Name (_CRS, ResourceTemplate ()
+                    {
+                        IO (Decode16, 0x02F8, 0x02F8, 0x00, 0x08)
+                        IRQNoFlags () {3}
+                    })
+                }
+
+                Device (KBD)
+                {
+                    Name (_HID, EisaId ("PNP0303"))  /* PS/2 keyboard (i8042 port A) */
+                    Name (_STA, 0x0F)
+                    Name (_CRS, ResourceTemplate ()
+                    {
+                        IO (Decode16, 0x0060, 0x0060, 0x00, 0x01)
+                        IO (Decode16, 0x0064, 0x0064, 0x00, 0x01)
+                        IRQNoFlags () {1}
+                    })
+                }
+
+                /*
+                 * #303: the CMOS/RTC node. Linux's rtc_cmos binds either through PNP (PNP0B00) or as a
+                 * platform device, and its own log line says which it took -- "registered platform RTC
+                 * device (no PNP device found)" is the platform fallback, i.e. it looked for this node and
+                 * did not find one. hype DOES model a CMOS RTC at 0x70/0x71 (devices/cmos.c, made legal for
+                 * EDK2's PcRtc by #286), so a machine description that omits it is simply wrong.
+                 *
+                 * Standard resources: the two-port index/data pair at 0x70, and IRQ8 for the periodic and
+                 * alarm interrupts. hype does not currently RAISE IRQ8 (register C always reads 0), so a
+                 * guest asking for periodic wakeups will not get them -- declaring the line is still correct
+                 * for the device that exists, and the alternative (omitting it) makes the node unbindable.
+                 */
+                Device (RTC)
+                {
+                    Name (_HID, EisaId ("PNP0B00"))  /* MC146818-compatible real-time clock */
+                    Name (_STA, 0x0F)
+                    Name (_CRS, ResourceTemplate ()
+                    {
+                        IO (Decode16, 0x0070, 0x0070, 0x00, 0x02)
+                        IRQNoFlags () {8}
+                    })
+                }
+
+                Device (MOU)
+                {
+                    Name (_HID, EisaId ("PNP0F13"))  /* PS/2 mouse (i8042 port B) */
+                    Name (_STA, 0x0F)
+                    Name (_CRS, ResourceTemplate ()
+                    {
+                        IRQNoFlags () {12}
+                    })
+                }
+            }
         }
 
-        /* M4-6d7: legacy ISA devices. In ACPI/APIC mode Linux wires an ISA
-         * IRQ into the I/O APIC only when a namespace device claims it via
-         * _CRS (acpi_pnp -> acpi_register_gsi); with none declared, the 8250
-         * driver still probes ttyS0 at 0x3f8 but irq4 is never routed to any
-         * interrupt controller, so every userspace serial write stalls on a
-         * TX-empty IRQ that cannot arrive (and i8042 refuses to probe at all:
-         * "PNP: No PS/2 controller found"). These mirror what QEMU's Q35 DSDT
-         * declares, matching hype's existing COM1/COM2 + PS/2 models. */
-        Device (COM1)
-        {
-            Name (_HID, EisaId ("PNP0501"))  /* 16550-compatible UART */
-            Name (_UID, 0x01)
-            Name (_STA, 0x0F)
-            Name (_CRS, ResourceTemplate ()
-            {
-                IO (Decode16, 0x03F8, 0x03F8, 0x00, 0x08)
-                IRQNoFlags () {4}
-            })
-        }
-
-        Device (COM2)
-        {
-            Name (_HID, EisaId ("PNP0501"))
-            Name (_UID, 0x02)
-            Name (_STA, 0x0F)
-            Name (_CRS, ResourceTemplate ()
-            {
-                IO (Decode16, 0x02F8, 0x02F8, 0x00, 0x08)
-                IRQNoFlags () {3}
-            })
-        }
-
-        Device (KBD)
-        {
-            Name (_HID, EisaId ("PNP0303"))  /* PS/2 keyboard (i8042 port A) */
-            Name (_STA, 0x0F)
-            Name (_CRS, ResourceTemplate ()
-            {
-                IO (Decode16, 0x0060, 0x0060, 0x00, 0x01)
-                IO (Decode16, 0x0064, 0x0064, 0x00, 0x01)
-                IRQNoFlags () {1}
-            })
-        }
-
-        /*
-         * #303: the CMOS/RTC node. Linux's rtc_cmos binds either through PNP (PNP0B00) or as a
-         * platform device, and its own log line says which it took -- "registered platform RTC
-         * device (no PNP device found)" is the platform fallback, i.e. it looked for this node and
-         * did not find one. hype DOES model a CMOS RTC at 0x70/0x71 (devices/cmos.c, made legal for
-         * EDK2's PcRtc by #286), so a machine description that omits it is simply wrong.
-         *
-         * Standard resources: the two-port index/data pair at 0x70, and IRQ8 for the periodic and
-         * alarm interrupts. hype does not currently RAISE IRQ8 (register C always reads 0), so a
-         * guest asking for periodic wakeups will not get them -- declaring the line is still correct
-         * for the device that exists, and the alternative (omitting it) makes the node unbindable.
-         */
-        Device (RTC)
-        {
-            Name (_HID, EisaId ("PNP0B00"))  /* MC146818-compatible real-time clock */
-            Name (_STA, 0x0F)
-            Name (_CRS, ResourceTemplate ()
-            {
-                IO (Decode16, 0x0070, 0x0070, 0x00, 0x02)
-                IRQNoFlags () {8}
-            })
-        }
-
-        Device (MOU)
-        {
-            Name (_HID, EisaId ("PNP0F13"))  /* PS/2 mouse (i8042 port B) */
-            Name (_STA, 0x0F)
-            Name (_CRS, ResourceTemplate ()
-            {
-                IRQNoFlags () {12}
-            })
-        }
     }
 }
