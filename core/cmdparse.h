@@ -27,6 +27,11 @@ typedef enum {
      * every resolution the GOP offers), "<W>x<H>" (apply and persist one), or absent (show the
      * current setting). */
     HYPE_CMD_RESOLUTION,
+    /* TERM-6 (#444): arg = a VM name/index (the same addressing every other per-VM verb uses).
+     * Prints that VM's full effective hype.cfg -- every field, tagged (default) or (set) --
+     * to the log (hype_debug_print); g_cmd_result gets a short pointer to it, since a whole
+     * VM's config does not fit the single-line result buffer. */
+    HYPE_CMD_CONFIG,
     HYPE_CMD_UNKNOWN,
 } hype_cmd_verb_t;
 

@@ -110,6 +110,75 @@ static void test_full_example_from_plan(void) {
     CHECK_INT("vm2 os_hint bsd", (int)HYPE_CFG_OS_BSD, (int)out.vms[2].os_hint);
 }
 
+/* #444 (TERM-6): every key the operator actually wrote must be recorded in seen_fields, and
+ * nothing they didn't. */
+static void test_seen_fields_records_exactly_what_was_written(void) {
+    hype_cfg_t out;
+    (void)parse_copy(
+        "[vm.win11]\n"
+        "vcpus = 4\n"
+        "cpu_set = 4-7\n"
+        "mem_mb = 8192\n"
+        "boot = installer\n"
+        "install_media = \\EFI\\hype\\win11.iso\n"
+        "target_disk = file:\\hype\\disks\\win11.img\n"
+        "target_disk_size_gb = 128\n"
+        "firmware = uefi\n"
+        "os_hint = windows\n"
+        "net_mode = nat\n",
+        &out);
+
+    CHECK_INT("vcpus was written", 1, (out.vms[0].seen_fields & HYPE_CFG_F_VCPUS) != 0);
+    CHECK_INT("cpu_set was written", 1, (out.vms[0].seen_fields & HYPE_CFG_F_CPU_SET) != 0);
+    CHECK_INT("mem_mb was written", 1, (out.vms[0].seen_fields & HYPE_CFG_F_MEM_MB) != 0);
+    CHECK_INT("boot was written", 1, (out.vms[0].seen_fields & HYPE_CFG_F_BOOT) != 0);
+    CHECK_INT("install_media was written", 1,
+              (out.vms[0].seen_fields & HYPE_CFG_F_INSTALL_MEDIA) != 0);
+    CHECK_INT("target_disk was written", 1, (out.vms[0].seen_fields & HYPE_CFG_F_TARGET_DISK) != 0);
+    CHECK_INT("target_disk_size_gb was written", 1,
+              (out.vms[0].seen_fields & HYPE_CFG_F_TARGET_DISK_SIZE_GB) != 0);
+    CHECK_INT("firmware was written", 1, (out.vms[0].seen_fields & HYPE_CFG_F_FIRMWARE) != 0);
+    CHECK_INT("os_hint was written", 1, (out.vms[0].seen_fields & HYPE_CFG_F_OS_HINT) != 0);
+    CHECK_INT("net_mode was written", 1, (out.vms[0].seen_fields & HYPE_CFG_F_NET_MODE) != 0);
+
+    /* Never written by this config -- must read as unset, not accidentally aliased onto
+     * some other bit. */
+    CHECK_INT("label was NOT written", 0, (out.vms[0].seen_fields & HYPE_CFG_F_LABEL) != 0);
+    CHECK_INT("net_peers was NOT written", 0, (out.vms[0].seen_fields & HYPE_CFG_F_NET_PEERS) != 0);
+    CHECK_INT("media_disk was NOT written", 0, (out.vms[0].seen_fields & HYPE_CFG_F_MEDIA_DISK) != 0);
+    CHECK_INT("disks was NOT written (target_disk form used instead)", 0,
+              (out.vms[0].seen_fields & HYPE_CFG_F_DISKS) != 0);
+}
+
+/* A VM using the disks=/cdroms= reference form instead of target_disk must show THAT choice in
+ * seen_fields, not leave the reader guessing which storage form was used. */
+static void test_seen_fields_distinguishes_storage_form(void) {
+    hype_cfg_t out;
+    (void)parse_copy(
+        "[vm.a]\n"
+        "vcpus = 1\nmem_mb = 512\nboot = disk\nfirmware = uefi\nos_hint = linux\n"
+        "disks = sys\n",
+        &out);
+    CHECK_INT("disks was written", 1, (out.vms[0].seen_fields & HYPE_CFG_F_DISKS) != 0);
+    CHECK_INT("target_disk was NOT written", 0,
+              (out.vms[0].seen_fields & HYPE_CFG_F_TARGET_DISK) != 0);
+}
+
+/* seen_fields must survive VM compaction (a bad VM dropped, survivors reindexed) -- it lives
+ * inside the struct that gets memmove'd, not a separate array keyed by the old index. */
+static void test_seen_fields_survives_compaction(void) {
+    hype_cfg_t out;
+    hype_cfg_result_t r = parse_copy(
+        "[vm.bad]\n"
+        "vcpus = 1\n" /* missing mem_mb/boot/firmware/os_hint/storage: fails validate_required */
+        "[vm.good]\n" REQ "label = kept\n",
+        &out);
+    CHECK_INT("parses (one bad VM isolates, does not fail the file)", HYPE_CFG_OK, r.status);
+    CHECK_INT("only the good VM survives", 1, (int)out.vm_count);
+    CHECK_STR("it is the right one", "good", out.vms[0].name);
+    CHECK_INT("its seen_fields moved with it", 1, (out.vms[0].seen_fields & HYPE_CFG_F_LABEL) != 0);
+}
+
 static void test_cpu_set_comma_list(void) {
     const char *cfg =
         "[vm.a]\n"
@@ -2027,6 +2096,9 @@ int main(void) {
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
     test_full_example_from_plan();
+    test_seen_fields_records_exactly_what_was_written();
+    test_seen_fields_distinguishes_storage_form();
+    test_seen_fields_survives_compaction();
     test_cpu_set_comma_list();
     test_boot_disk_no_install_media_required();
     test_error_cases();

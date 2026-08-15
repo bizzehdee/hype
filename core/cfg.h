@@ -169,7 +169,45 @@ typedef struct {
      * disks. Entries may name either kind. */
     unsigned int boot_order_count;
     char boot_order[HYPE_CFG_MAX_BOOT_ORDER][HYPE_CFG_NAME_MAX];
+
+    /*
+     * #444 (TERM-6): which of the bits below the operator actually WROTE, vs. what the parser
+     * defaulted -- so a caller (the dashboard's `config <vm>` query) can tell "vcpus = 1 because
+     * you configured it" from "vcpus = 1 because you didn't say". Every field in `hype_cfg_vm_t`
+     * already resolves to a valid value once a VM survives validate_required() (see §5.2's
+     * required-field table), which is why this had no consumer before now; it existed only as a
+     * local parse-time duplicate-key check (`apply_field`'s own `seen` parameter) until TERM-6
+     * needed it to outlive the parse.
+     */
+    unsigned int seen_fields;
 } hype_cfg_vm_t;
+
+/*
+ * #222/#444: the bits `hype_cfg_vm_t.seen_fields` accumulates, one per `[vm.*]` key -- also used
+ * internally by the parser (`apply_field`'s duplicate-key check) and by `validate_required()`.
+ * Public so a caller outside cfg.c (TERM-6's config query) can test which fields were explicitly
+ * written versus defaulted.
+ */
+enum {
+    HYPE_CFG_F_VCPUS = 1u << 0,
+    HYPE_CFG_F_CPU_SET = 1u << 1,
+    HYPE_CFG_F_MEM_MB = 1u << 2,
+    HYPE_CFG_F_BOOT = 1u << 3,
+    HYPE_CFG_F_INSTALL_MEDIA = 1u << 4,
+    HYPE_CFG_F_TARGET_DISK = 1u << 5,
+    HYPE_CFG_F_TARGET_DISK_SIZE_GB = 1u << 6,
+    HYPE_CFG_F_FIRMWARE = 1u << 7,
+    HYPE_CFG_F_OS_HINT = 1u << 8,
+    HYPE_CFG_F_NET_MODE = 1u << 9,
+    HYPE_CFG_F_NET_PEERS = 1u << 10,
+    HYPE_CFG_F_PARTITION = 1u << 11,
+    HYPE_CFG_F_ALLOW_OVERWRITE = 1u << 12,
+    HYPE_CFG_F_MEDIA_DISK = 1u << 13,
+    HYPE_CFG_F_DISKS = 1u << 14,
+    HYPE_CFG_F_CDROMS = 1u << 15,
+    HYPE_CFG_F_BOOT_ORDER = 1u << 16, /* #323 */
+    HYPE_CFG_F_LABEL = 1u << 17       /* #357 */
+};
 
 /*
  * #222 (CONFIG-2, spec §4.1): the extensibility keystone.

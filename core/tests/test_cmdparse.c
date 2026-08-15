@@ -33,6 +33,9 @@ int main(void) {
     CHECK("resolution carries its value arg", strcmp(P("resolution 1920x1080").arg, "1920x1080") == 0);
     CHECK("res alias -> RESOLUTION", P("res list").verb == HYPE_CMD_RESOLUTION);
     CHECK("resolution with no arg", !P("resolution").has_arg);
+    CHECK("config", P("config vm0").verb == HYPE_CMD_CONFIG);
+    CHECK("cfg alias -> CONFIG", P("cfg vm0").verb == HYPE_CMD_CONFIG);
+    CHECK("config carries its vm arg", strcmp(P("config vm0").arg, "vm0") == 0);
 
     /* case-insensitive */
     CHECK("STOP uppercase", P("STOP vm0")    .verb == HYPE_CMD_STOP);

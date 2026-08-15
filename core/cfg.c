@@ -2,27 +2,6 @@
 #include "format.h"
 #include "strutil.h"
 
-enum {
-    F_VCPUS = 1u << 0,
-    F_CPU_SET = 1u << 1,
-    F_MEM_MB = 1u << 2,
-    F_BOOT = 1u << 3,
-    F_INSTALL_MEDIA = 1u << 4,
-    F_TARGET_DISK = 1u << 5,
-    F_TARGET_DISK_SIZE_GB = 1u << 6,
-    F_FIRMWARE = 1u << 7,
-    F_OS_HINT = 1u << 8,
-    F_NET_MODE = 1u << 9,
-    F_NET_PEERS = 1u << 10,
-    F_PARTITION = 1u << 11,
-    F_ALLOW_OVERWRITE = 1u << 12,
-    F_MEDIA_DISK = 1u << 13,
-    F_DISKS = 1u << 14,
-    F_CDROMS = 1u << 15,
-    F_BOOT_ORDER = 1u << 16, /* #323 */
-    F_LABEL = 1u << 17       /* #357 */
-};
-
 /* Parses a boolean value: true/false, yes/no, on/off, 1/0. */
 static hype_cfg_status_t parse_bool_field(const char *val, int *out) {
     if (hype_streq(val, "true") || hype_streq(val, "yes") || hype_streq(val, "on") ||
@@ -286,106 +265,106 @@ static hype_cfg_status_t parse_uint_field(char *val, unsigned int *out) {
 static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char *key, char *val) {
     if (hype_streq(key, "vcpus")) {
         hype_cfg_status_t st;
-        if (*seen & F_VCPUS) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_VCPUS) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_uint_field(val, &vm->vcpus);
         if (st != HYPE_CFG_OK) return st;
-        *seen |= F_VCPUS;
+        *seen |= HYPE_CFG_F_VCPUS;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "cpu_set")) {
         hype_cfg_status_t st;
-        if (*seen & F_CPU_SET) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_CPU_SET) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_cpu_set(val, vm);
         if (st != HYPE_CFG_OK) return st;
         vm->has_cpu_set = 1;
-        *seen |= F_CPU_SET;
+        *seen |= HYPE_CFG_F_CPU_SET;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "mem_mb")) {
         hype_cfg_status_t st;
-        if (*seen & F_MEM_MB) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_MEM_MB) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_uint_field(val, &vm->mem_mb);
         if (st != HYPE_CFG_OK) return st;
-        *seen |= F_MEM_MB;
+        *seen |= HYPE_CFG_F_MEM_MB;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "boot")) {
-        if (*seen & F_BOOT) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_BOOT) return HYPE_CFG_ERR_DUPLICATE_KEY;
         if (hype_streq(val, "installer")) vm->boot = HYPE_CFG_BOOT_INSTALLER;
         else if (hype_streq(val, "disk")) vm->boot = HYPE_CFG_BOOT_DISK;
         else return HYPE_CFG_ERR_BAD_VALUE;
-        *seen |= F_BOOT;
+        *seen |= HYPE_CFG_F_BOOT;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "install_media")) {
         unsigned long long len;
-        if (*seen & F_INSTALL_MEDIA) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_INSTALL_MEDIA) return HYPE_CFG_ERR_DUPLICATE_KEY;
         len = hype_strlcpy(vm->install_media, val, HYPE_CFG_PATH_MAX);
         if (len >= HYPE_CFG_PATH_MAX) return HYPE_CFG_ERR_VALUE_TOO_LONG;
         vm->has_install_media = 1;
-        *seen |= F_INSTALL_MEDIA;
+        *seen |= HYPE_CFG_F_INSTALL_MEDIA;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "media_disk")) {
         /* #323: the drive the media lives on, by serial/GUID. Optional -- absent means
          * auto-detect, preserving the pre-#323 behaviour for every existing config. */
         unsigned long long len;
-        if (*seen & F_MEDIA_DISK) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_MEDIA_DISK) return HYPE_CFG_ERR_DUPLICATE_KEY;
         len = hype_strlcpy(vm->media_disk, val, HYPE_CFG_PATH_MAX);
         if (len >= HYPE_CFG_PATH_MAX) return HYPE_CFG_ERR_VALUE_TOO_LONG;
         if (vm->media_disk[0] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
         vm->has_media_disk = 1;
-        *seen |= F_MEDIA_DISK;
+        *seen |= HYPE_CFG_F_MEDIA_DISK;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "disks")) {
         hype_cfg_status_t st;
-        if (*seen & F_DISKS) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_DISKS) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_id_list(val, vm, vm->disks, &vm->disks_count, HYPE_CFG_MAX_VM_DISKS);
         if (st != HYPE_CFG_OK) return st;
-        *seen |= F_DISKS;
+        *seen |= HYPE_CFG_F_DISKS;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "cdroms")) {
         hype_cfg_status_t st;
-        if (*seen & F_CDROMS) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_CDROMS) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_id_list(val, vm, vm->cdroms, &vm->cdroms_count, HYPE_CFG_MAX_VM_DISKS);
         if (st != HYPE_CFG_OK) return st;
-        *seen |= F_CDROMS;
+        *seen |= HYPE_CFG_F_CDROMS;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "boot_order")) {
         hype_cfg_status_t st;
-        if (*seen & F_BOOT_ORDER) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_BOOT_ORDER) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_id_list(val, vm, vm->boot_order, &vm->boot_order_count,
                            HYPE_CFG_MAX_BOOT_ORDER);
         if (st != HYPE_CFG_OK) return st;
-        *seen |= F_BOOT_ORDER;
+        *seen |= HYPE_CFG_F_BOOT_ORDER;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "target_disk")) {
         hype_cfg_status_t st;
-        if (*seen & F_TARGET_DISK) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_TARGET_DISK) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_target_disk(val, &vm->target_disk);
         if (st != HYPE_CFG_OK) return st;
-        *seen |= F_TARGET_DISK;
+        *seen |= HYPE_CFG_F_TARGET_DISK;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "target_disk_size_gb")) {
         hype_cfg_status_t st;
-        if (*seen & F_TARGET_DISK_SIZE_GB) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_TARGET_DISK_SIZE_GB) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_uint_field(val, &vm->target_disk_size_gb);
         if (st != HYPE_CFG_OK) return st;
         vm->has_target_disk_size_gb = 1;
-        *seen |= F_TARGET_DISK_SIZE_GB;
+        *seen |= HYPE_CFG_F_TARGET_DISK_SIZE_GB;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "firmware")) {
-        if (*seen & F_FIRMWARE) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_FIRMWARE) return HYPE_CFG_ERR_DUPLICATE_KEY;
         if (hype_streq(val, "uefi")) vm->firmware = HYPE_CFG_FW_UEFI;
         else if (hype_streq(val, "legacy")) vm->firmware = HYPE_CFG_FW_LEGACY;
         else return HYPE_CFG_ERR_BAD_VALUE;
-        *seen |= F_FIRMWARE;
+        *seen |= HYPE_CFG_F_FIRMWARE;
         return HYPE_CFG_OK;
     }
     /*
@@ -395,42 +374,42 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
      * because `label =` with nothing after it is a mistake rather than a way to clear it.
      */
     if (hype_streq(key, "label")) {
-        if (*seen & F_LABEL) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_LABEL) return HYPE_CFG_ERR_DUPLICATE_KEY;
         if (hype_strlcpy(vm->label, val, HYPE_CFG_LABEL_MAX) >= HYPE_CFG_LABEL_MAX) {
             return HYPE_CFG_ERR_VALUE_TOO_LONG;
         }
         if (vm->label[0] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
-        *seen |= F_LABEL;
+        *seen |= HYPE_CFG_F_LABEL;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "os_hint")) {
-        if (*seen & F_OS_HINT) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_OS_HINT) return HYPE_CFG_ERR_DUPLICATE_KEY;
         if (hype_streq(val, "windows")) vm->os_hint = HYPE_CFG_OS_WINDOWS;
         else if (hype_streq(val, "linux")) vm->os_hint = HYPE_CFG_OS_LINUX;
         else if (hype_streq(val, "bsd")) vm->os_hint = HYPE_CFG_OS_BSD;
         else if (hype_streq(val, "none")) vm->os_hint = HYPE_CFG_OS_NONE;
         else return HYPE_CFG_ERR_BAD_VALUE;
-        *seen |= F_OS_HINT;
+        *seen |= HYPE_CFG_F_OS_HINT;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "net_mode")) {
-        if (*seen & F_NET_MODE) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_NET_MODE) return HYPE_CFG_ERR_DUPLICATE_KEY;
         if (hype_streq(val, "none")) vm->net_mode = HYPE_CFG_NET_NONE;
         else if (hype_streq(val, "nat")) vm->net_mode = HYPE_CFG_NET_NAT;
         else return HYPE_CFG_ERR_BAD_VALUE;
-        *seen |= F_NET_MODE;
+        *seen |= HYPE_CFG_F_NET_MODE;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "net_peers")) {
         hype_cfg_status_t st;
-        if (*seen & F_NET_PEERS) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_NET_PEERS) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_net_peers(val, vm);
         if (st != HYPE_CFG_OK) return st;
-        *seen |= F_NET_PEERS;
+        *seen |= HYPE_CFG_F_NET_PEERS;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "partition")) {
-        if (*seen & F_PARTITION) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_PARTITION) return HYPE_CFG_ERR_DUPLICATE_KEY;
         if (hype_streq(val, "whole")) {
             vm->target_disk.partition = 0; /* whole disk */
         } else {
@@ -438,30 +417,30 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
             if (st != HYPE_CFG_OK) return st;
             if (vm->target_disk.partition == 0) return HYPE_CFG_ERR_BAD_VALUE; /* 1-based */
         }
-        *seen |= F_PARTITION;
+        *seen |= HYPE_CFG_F_PARTITION;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "allow_overwrite")) {
         hype_cfg_status_t st;
-        if (*seen & F_ALLOW_OVERWRITE) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*seen & HYPE_CFG_F_ALLOW_OVERWRITE) return HYPE_CFG_ERR_DUPLICATE_KEY;
         st = parse_bool_field(val, &vm->target_disk.allow_overwrite);
         if (st != HYPE_CFG_OK) return st;
-        *seen |= F_ALLOW_OVERWRITE;
+        *seen |= HYPE_CFG_F_ALLOW_OVERWRITE;
         return HYPE_CFG_OK;
     }
     return HYPE_CFG_ERR_UNKNOWN_KEY;
 }
 
 static hype_cfg_status_t validate_required(const hype_cfg_vm_t *vm, unsigned int seen) {
-    if (!(seen & F_VCPUS)) return HYPE_CFG_ERR_MISSING_REQUIRED;
-    if (!(seen & F_MEM_MB)) return HYPE_CFG_ERR_MISSING_REQUIRED;
-    if (!(seen & F_BOOT)) return HYPE_CFG_ERR_MISSING_REQUIRED;
+    if (!(seen & HYPE_CFG_F_VCPUS)) return HYPE_CFG_ERR_MISSING_REQUIRED;
+    if (!(seen & HYPE_CFG_F_MEM_MB)) return HYPE_CFG_ERR_MISSING_REQUIRED;
+    if (!(seen & HYPE_CFG_F_BOOT)) return HYPE_CFG_ERR_MISSING_REQUIRED;
     /*
      * #222 (§7): a VM says where its storage comes from EITHER inline (target_disk) OR by reference
      * (disks/cdroms) -- never both, since two answers to "which disk" cannot be reconciled and
      * picking one silently would be exactly the #285 failure again.
      */
-    if ((seen & F_TARGET_DISK) && ((seen & F_DISKS) || (seen & F_CDROMS))) {
+    if ((seen & HYPE_CFG_F_TARGET_DISK) && ((seen & HYPE_CFG_F_DISKS) || (seen & HYPE_CFG_F_CDROMS))) {
         return HYPE_CFG_ERR_BAD_VALUE;
     }
     /*
@@ -471,12 +450,12 @@ static hype_cfg_status_t validate_required(const hype_cfg_vm_t *vm, unsigned int
      * looks accepted and produces a machine that cannot boot. Revisit with #329, which is what will
      * make an attached-device list mean anything at launch.
      */
-    if (!(seen & F_TARGET_DISK) && !(seen & F_DISKS) && !(seen & F_CDROMS)) {
+    if (!(seen & HYPE_CFG_F_TARGET_DISK) && !(seen & HYPE_CFG_F_DISKS) && !(seen & HYPE_CFG_F_CDROMS)) {
         return HYPE_CFG_ERR_MISSING_REQUIRED;
     }
-    if (!(seen & F_FIRMWARE)) return HYPE_CFG_ERR_MISSING_REQUIRED;
-    if (!(seen & F_OS_HINT)) return HYPE_CFG_ERR_MISSING_REQUIRED;
-    if (vm->boot == HYPE_CFG_BOOT_INSTALLER && !(seen & F_INSTALL_MEDIA)) {
+    if (!(seen & HYPE_CFG_F_FIRMWARE)) return HYPE_CFG_ERR_MISSING_REQUIRED;
+    if (!(seen & HYPE_CFG_F_OS_HINT)) return HYPE_CFG_ERR_MISSING_REQUIRED;
+    if (vm->boot == HYPE_CFG_BOOT_INSTALLER && !(seen & HYPE_CFG_F_INSTALL_MEDIA)) {
         return HYPE_CFG_ERR_MISSING_REQUIRED;
     }
     return HYPE_CFG_OK;
@@ -857,7 +836,7 @@ static int add_section(hype_cfg_t *out, hype_cfg_section_kind_t kind, const char
 }
 
 static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int *cur,
-                                                 unsigned int *seen, const char *raw, int *cur_disk,
+                                                 const char *raw, int *cur_disk,
                                                  unsigned int *disk_seen, int *cur_is_hype,
                                                  unsigned int *in_hype_seen) {
     unsigned long long len = hype_strlen(line);
@@ -946,14 +925,16 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
     if (name_len >= HYPE_CFG_NAME_MAX) {
         return HYPE_CFG_ERR_VALUE_TOO_LONG;
     }
-    seen[*cur] = 0;
+    /* #444 (TERM-6): seen_fields lives in the struct itself now, so operators can query
+     * default-vs-explicit later at runtime -- already cleared by zero_vm() above, nothing
+     * further to reset here. */
     (void)add_section(out, HYPE_CFG_SECTION_VM, name, raw, *cur);
     out->vm_count++;
     return HYPE_CFG_OK;
 }
 
 static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
-                                            unsigned int *seen, const char *raw, int raw_truncated,
+                                            const char *raw, int raw_truncated,
                                             int cur_disk, unsigned int *disk_seen, int cur_is_hype,
                                             unsigned int *in_hype_seen) {
     char *eq;
@@ -1005,7 +986,7 @@ static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
         }
     } else {
         st = (cur_disk >= 0) ? apply_disk_field(&out->disks[cur_disk], disk_seen, key, val)
-                             : apply_field(&out->vms[cur], &seen[cur], key, val);
+                             : apply_field(&out->vms[cur], &out->vms[cur].seen_fields, key, val);
     }
     if (st == HYPE_CFG_ERR_UNKNOWN_KEY) {
         /* #222: retained, not rejected -- the whole point of the keystone. Note `line` has been
@@ -1019,7 +1000,6 @@ static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
 
 hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     hype_cfg_result_t res;
-    unsigned int seen[HYPE_CFG_MAX_VMS];
     unsigned int disk_seen = 0;
     unsigned int in_hype_seen = 0;
     int vm_bad[HYPE_CFG_MAX_VMS];
@@ -1052,7 +1032,6 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     out->unknown_first_line = 0u;
     out->unknown_first[0] = '\0';
     for (i = 0; i < HYPE_CFG_MAX_VMS; i++) {
-        seen[i] = 0;
         vm_bad[i] = 0;
     }
 
@@ -1102,11 +1081,11 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
 
         in_vm_key = 0;
         if (line[0] == '[') {
-            st = process_section_header(line, out, &cur, seen, raw, &cur_disk, &disk_seen,
+            st = process_section_header(line, out, &cur, raw, &cur_disk, &disk_seen,
                                         &cur_is_hype, &in_hype_seen);
         } else {
             in_vm_key = (cur >= 0);
-            st = process_key_value(line, out, cur, seen, raw, raw_truncated, cur_disk,
+            st = process_key_value(line, out, cur, raw, raw_truncated, cur_disk,
                                    &disk_seen, cur_is_hype, &in_hype_seen);
         }
         if (out->unknown_count > unknown_before && out->unknown_first_line == 0u) {
@@ -1210,7 +1189,7 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
         if (vm_bad[i]) {
             continue; /* already counted; do not report the same VM twice */
         }
-        st = validate_required(&out->vms[i], seen[i]);
+        st = validate_required(&out->vms[i], out->vms[i].seen_fields);
         if (st != HYPE_CFG_OK) {
             vm_bad[i] = 1;
             if (out->skipped_vms == 0u) {

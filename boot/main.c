@@ -1518,6 +1518,10 @@ static void term_post(int idx, hype_vm_event_t ev) {
  * g_cmd_result, matching every other verb's own convention. */
 static void term_resolution_cmd(hype_cmd_t *c);
 
+/* TERM-6 (#444): same reason/placement as term_resolution_cmd above -- needs g_hype_cfg. `idx` is
+ * the VM index term_run_cmdline already resolved from the command's arg. */
+static void term_config_cmd(int idx, const char *nm);
+
 /* Execute the current command line, setting g_cmd_result, then clear it. */
 static void term_run_cmdline(void) {
     hype_cmd_t c = hype_cmd_parse(g_cmdline);
@@ -1530,7 +1534,7 @@ static void term_run_cmdline(void) {
         case HYPE_CMD_HELP:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
                           "cmds: list status start stop resume shutdown off focus <vm> | confirm "
-                          "<sn> | resolution [list|<W>x<H>]");
+                          "<sn> | resolution [list|<W>x<H>] | config <vm>");
             break;
         case HYPE_CMD_LIST:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%u VM(s) -- see table above",
@@ -1615,6 +1619,13 @@ static void term_run_cmdline(void) {
         }
         case HYPE_CMD_RESOLUTION:
             term_resolution_cmd(&c);
+            break;
+        case HYPE_CMD_CONFIG:
+            if (idx < 0) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "config: unknown vm '%s'", nm);
+            } else {
+                term_config_cmd(idx, nm);
+            }
             break;
         case HYPE_CMD_UNKNOWN:
         default:
@@ -17053,6 +17064,125 @@ static void term_resolution_cmd(hype_cmd_t *c) {
             }
         }
     }
+}
+
+/* One "<key> = <value> (default|set)" log line. `set` is whether this field's F_* bit is present
+ * in the VM's seen_fields -- the whole point of #444. */
+static void term_cfg_line(const char *vm_name, const char *key, const char *value, int set) {
+    hype_debug_print("cfg[%s]: %s = %s (%s)\n", vm_name, key, value,
+                     set ? "set" : "default");
+}
+
+static void term_cfg_line_uint(const char *vm_name, const char *key, unsigned int value, int set) {
+    char tmp[24];
+    hype_snprintf(tmp, sizeof(tmp), "%u", value);
+    term_cfg_line(vm_name, key, tmp, set);
+}
+
+/* Comma-joins up to `count` NAME_MAX entries into `out` (bounded); prints nothing (an empty list
+ * has no useful line) when count == 0 -- matching cfg.c's own w_kv_list omission rule. */
+static void term_cfg_line_list(const char *vm_name, const char *key,
+                               const char (*items)[HYPE_CFG_NAME_MAX], unsigned int count,
+                               int set) {
+    char buf[192];
+    unsigned int off = 0, i;
+    if (count == 0u) {
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        int n = hype_snprintf(buf + off, sizeof(buf) - off, "%s%s", (i > 0u) ? "," : "", items[i]);
+        if (n < 0 || (unsigned int)n >= sizeof(buf) - off) {
+            break;
+        }
+        off += (unsigned int)n;
+    }
+    term_cfg_line(vm_name, key, buf, set);
+}
+
+/*
+ * TERM-6 (#444): every field of `cfg->vms[idx]`, one log line each, tagged (default) or (set)
+ * from seen_fields. g_cmd_result only points at the log -- a whole VM's config does not fit the
+ * single-line command-result buffer (see #444's own ticket, which flags this as a known follow-on
+ * design question: a proper multi-line TERM panel, not this diagnostic-log workaround).
+ */
+static void term_config_cmd(int idx, const char *nm) {
+    const hype_cfg_vm_t *vm;
+    unsigned int sf;
+
+    if (idx >= (int)g_hype_cfg.vm_count) {
+        /* A built-in default VM (no hype.cfg / no [vm.*] section for it at all) has nothing
+         * parsed to show -- everything about it is a compiled-in default, not a config field. */
+        hype_debug_print("cfg[%s]: no [vm.*] section for this VM -- built-in defaults only\n", nm);
+        hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                      "%s: no config section (built-in defaults) -- see log", nm);
+        return;
+    }
+
+    vm = &g_hype_cfg.vms[idx];
+    sf = vm->seen_fields;
+
+    hype_debug_print("cfg[%s]: --- begin (name from section header: [vm.%s]) ---\n", nm, vm->name);
+    term_cfg_line_uint(nm, "vcpus", vm->vcpus, (sf & HYPE_CFG_F_VCPUS) != 0);
+    /* cpu_set is a uint array, not NAME_MAX strings, so it can't reuse term_cfg_line_list. */
+    if (vm->has_cpu_set) {
+        char buf[192];
+        unsigned int off = 0, i;
+        for (i = 0; i < vm->cpu_set_count; i++) {
+            char tmp[12];
+            int n;
+            hype_snprintf(tmp, sizeof(tmp), "%u", vm->cpu_set[i]);
+            n = hype_snprintf(buf + off, sizeof(buf) - off, "%s%s", (i > 0u) ? "," : "", tmp);
+            if (n < 0 || (unsigned int)n >= sizeof(buf) - off) break;
+            off += (unsigned int)n;
+        }
+        term_cfg_line(nm, "cpu_set", buf, 1);
+    } else {
+        term_cfg_line(nm, "cpu_set", "(unpinned)", 0);
+    }
+    term_cfg_line_uint(nm, "mem_mb", vm->mem_mb, (sf & HYPE_CFG_F_MEM_MB) != 0);
+    term_cfg_line(nm, "boot", vm->boot == HYPE_CFG_BOOT_DISK ? "disk" : "installer",
+                 (sf & HYPE_CFG_F_BOOT) != 0);
+    term_cfg_line(nm, "install_media", vm->has_install_media ? vm->install_media : "(none)",
+                 (sf & HYPE_CFG_F_INSTALL_MEDIA) != 0);
+    term_cfg_line(nm, "media_disk", vm->has_media_disk ? vm->media_disk : "(auto-detect)",
+                 (sf & HYPE_CFG_F_MEDIA_DISK) != 0);
+    if (hype_cfg_vm_has_target_disk(vm)) {
+        char tmp[HYPE_CFG_PATH_MAX + 10];
+        hype_snprintf(tmp, sizeof(tmp), "%s:%s",
+                     vm->target_disk.kind == HYPE_CFG_DISK_PHYSICAL ? "physical" : "file",
+                     vm->target_disk.path_or_id);
+        term_cfg_line(nm, "target_disk", tmp, (sf & HYPE_CFG_F_TARGET_DISK) != 0);
+        term_cfg_line_uint(nm, "target_disk.partition", vm->target_disk.partition,
+                          (sf & HYPE_CFG_F_PARTITION) != 0);
+        term_cfg_line(nm, "target_disk.allow_overwrite", vm->target_disk.allow_overwrite ? "true" : "false",
+                     (sf & HYPE_CFG_F_ALLOW_OVERWRITE) != 0);
+        term_cfg_line_uint(nm, "target_disk_size_gb", vm->target_disk_size_gb,
+                          (sf & HYPE_CFG_F_TARGET_DISK_SIZE_GB) != 0);
+    } else {
+        term_cfg_line_list(nm, "disks", vm->disks, vm->disks_count, (sf & HYPE_CFG_F_DISKS) != 0);
+        term_cfg_line_list(nm, "cdroms", vm->cdroms, vm->cdroms_count,
+                          (sf & HYPE_CFG_F_CDROMS) != 0);
+    }
+    term_cfg_line_list(nm, "boot_order", vm->boot_order, vm->boot_order_count,
+                      (sf & HYPE_CFG_F_BOOT_ORDER) != 0);
+    term_cfg_line(nm, "firmware", vm->firmware == HYPE_CFG_FW_LEGACY ? "legacy" : "uefi",
+                 (sf & HYPE_CFG_F_FIRMWARE) != 0);
+    term_cfg_line(nm, "label", vm->label[0] != '\0' ? vm->label : "(none -- displays as the section id)",
+                 (sf & HYPE_CFG_F_LABEL) != 0);
+    {
+        const char *oh = "none";
+        if (vm->os_hint == HYPE_CFG_OS_WINDOWS) oh = "windows";
+        else if (vm->os_hint == HYPE_CFG_OS_LINUX) oh = "linux";
+        else if (vm->os_hint == HYPE_CFG_OS_BSD) oh = "bsd";
+        term_cfg_line(nm, "os_hint", oh, (sf & HYPE_CFG_F_OS_HINT) != 0);
+    }
+    term_cfg_line(nm, "net_mode", vm->net_mode == HYPE_CFG_NET_NAT ? "nat" : "none",
+                 (sf & HYPE_CFG_F_NET_MODE) != 0);
+    term_cfg_line_list(nm, "net_peers", vm->net_peers, vm->net_peers_count,
+                      (sf & HYPE_CFG_F_NET_PEERS) != 0);
+    hype_debug_print("cfg[%s]: --- end ---\n", nm);
+
+    hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%s: full config printed to the log", nm);
 }
 
 /* Persistent copies of the USB block path the sink writes through. The probe's
