@@ -297,6 +297,81 @@ static void test_printscreen_sequence_interrupted_does_not_fire_later(void) {
               HYPE_CHORD_ACTION_NONE, result.action);
 }
 
+/*
+ * #458: the encoding this chord ACTUALLY receives.
+ *
+ * The tests above all feed `E0 2A E0 37`, which is Print Screen pressed with no modifiers. With
+ * Alt held -- and the leader always holds it -- the keyboard suppresses the `E0 2A` fake shift
+ * and reports SysRq: a bare, non-extended 0x54. So the suite passed while the hotkey could not
+ * fire at all. These cover the real sequence, captured from a raw scancode trace.
+ */
+
+static void test_screenshot_chord_via_sysrq(void) {
+    hype_chord_state_t state;
+    hype_chord_result_t result;
+
+    hype_chord_state_reset(&state);
+    hold_both_modifiers(&state);
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_SYSRQ_MAKE);
+    CHECK_HEX("Right-Ctrl+Right-Alt+PrtScn (reported as SysRq 0x54) takes a screenshot",
+              HYPE_CHORD_ACTION_SCREENSHOT, result.action);
+}
+
+static void test_screenshot_via_sysrq_replays_the_captured_trace(void) {
+    /*
+     * Byte for byte what the host input poll recorded, including the keyboard's own
+     * release-and-repress of Right-Alt around the key. Exactly one action must come out.
+     */
+    static const uint8_t trace[] = {
+        0xE0, 0x1D,       /* RCtrl make */
+        0xE0, 0x38,       /* RAlt make */
+        0xE0, 0xB8,       /* RAlt break */
+        0xE0, 0x38,       /* RAlt make */
+        0x54,             /* Print Screen -> SysRq make */
+        0xD4,             /* SysRq break */
+        0xE0, 0xB8,       /* RAlt break */
+        0xE0, 0x9D,       /* RCtrl break */
+    };
+    hype_chord_state_t state;
+    unsigned i, shots = 0;
+
+    hype_chord_state_reset(&state);
+    for (i = 0; i < sizeof(trace) / sizeof(trace[0]); i++) {
+        if (hype_chord_feed_scancode(&state, trace[i]).action == HYPE_CHORD_ACTION_SCREENSHOT) {
+            shots++;
+        }
+    }
+    CHECK_HEX("the captured chord trace fires exactly one screenshot", 1u, shots);
+}
+
+static void test_sysrq_without_both_modifiers_is_ignored(void) {
+    hype_chord_state_t state;
+    hype_chord_result_t result;
+
+    hype_chord_state_reset(&state);
+    feed_extended(&state, HYPE_SCANCODE_RIGHT_CTRL_MAKE); /* only one modifier */
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_SYSRQ_MAKE);
+    CHECK_HEX("SysRq with only right-ctrl held produces no action", HYPE_CHORD_ACTION_NONE,
+              result.action);
+
+    /* And with no leader at all -- a bare SysRq must never be swallowed as a chord. */
+    hype_chord_state_reset(&state);
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_SYSRQ_MAKE);
+    CHECK_HEX("bare SysRq is not a chord", HYPE_CHORD_ACTION_NONE, result.action);
+}
+
+static void test_sysrq_break_produces_no_action(void) {
+    hype_chord_state_t state;
+    hype_chord_result_t result;
+
+    /* The release must not fire a second screenshot, and must not be read as anything else. */
+    hype_chord_state_reset(&state);
+    hold_both_modifiers(&state);
+    (void)hype_chord_feed_scancode(&state, HYPE_SCANCODE_SYSRQ_MAKE);
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_SYSRQ_BREAK);
+    CHECK_HEX("SysRq break is not an action", HYPE_CHORD_ACTION_NONE, result.action);
+}
+
 static void test_unrelated_plain_key_is_ignored_and_held_state_survives(void) {
     hype_chord_state_t state;
     hype_chord_result_t result;
@@ -327,6 +402,10 @@ int main(void) {
     test_unrelated_extended_key_is_ignored_and_held_state_survives();
     test_unrelated_plain_key_is_ignored_and_held_state_survives();
     test_screenshot_chord();
+    test_screenshot_chord_via_sysrq();
+    test_screenshot_via_sysrq_replays_the_captured_trace();
+    test_sysrq_without_both_modifiers_is_ignored();
+    test_sysrq_break_produces_no_action();
     test_screenshot_without_both_modifiers_is_ignored();
     test_printscreen_second_half_alone_is_not_mistaken_for_the_chord();
     test_printscreen_sequence_interrupted_does_not_fire_later();

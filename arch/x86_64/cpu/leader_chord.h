@@ -39,14 +39,35 @@
 
 /*
  * TERM-8 (#445): Print Screen is not a simple `0xE0 <byte>` key like every other action key
- * here. Its make code is the FOUR-byte sequence `E0 2A E0 37` (break `E0 B7 E0 AA`) -- confirmed
- * against the same reference tables as the constants above (vetra.com / OSDev's PS/2 Scan Code
- * Set 1 tables), not assumed. The two E0-prefixed halves are `0x2A` then `0x37`; tracked via
- * `printscreen_step` below since the existing single-byte `pending_extended` lookahead cannot
- * span a second E0-prefixed byte.
+ * here. UNMODIFIED, its make code is the FOUR-byte sequence `E0 2A E0 37` (break `E0 B7 E0 AA`).
+ * The two E0-prefixed halves are `0x2A` then `0x37`; tracked via `printscreen_step` below since
+ * the existing single-byte `pending_extended` lookahead cannot span a second E0-prefixed byte.
+ *
+ * #458: that sequence is NOT what this chord ever sees, and matching only it made the screenshot
+ * hotkey impossible to trigger. The leading `E0 2A` is a "fake shift" the keyboard inserts only
+ * when no Shift/Ctrl/Alt is held. With Alt held -- which it always is here, the leader being
+ * Right-Ctrl+Right-Alt -- the key reports as SysRq instead: a single NON-extended `0x54`
+ * (break `0xD4`). The two encodings are mutually exclusive by construction, so the decoder has
+ * to accept the modified one.
+ *
+ * Measured, not assumed, with a raw scancode trace at hype's own host input poll. Leader held,
+ * then Print Screen:
+ *
+ *     e0 1d  e0 38        RCtrl make, RAlt make
+ *     e0 b8  e0 38        RAlt break, RAlt make  (the keyboard's own modifier dance)
+ *     54     d4           <-- Print Screen: SysRq, non-extended
+ *
+ * and the same key with no modifiers, same keyboard, same run:
+ *
+ *     e0 2a  e0 37  e0 b7  e0 aa
+ *
+ * Both paths are kept: `0x54` is what this chord actually produces, and the four-byte form
+ * still fires for any keyboard or emulator that emits it regardless of modifiers.
  */
-#define HYPE_SCANCODE_PRINTSCREEN_MAKE_1 0x2Au  /* E0 2A, first half of Print Screen's make */
+#define HYPE_SCANCODE_PRINTSCREEN_MAKE_1 0x2Au  /* E0 2A, first half of the unmodified make */
 #define HYPE_SCANCODE_PRINTSCREEN_MAKE_2 0x37u  /* E0 37, second half */
+#define HYPE_SCANCODE_SYSRQ_MAKE 0x54u          /* Print Screen with Ctrl/Alt held (#458) */
+#define HYPE_SCANCODE_SYSRQ_BREAK 0xD4u
 
 typedef enum {
     HYPE_CHORD_ACTION_NONE = 0,

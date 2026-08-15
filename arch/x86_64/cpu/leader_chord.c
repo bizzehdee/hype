@@ -93,6 +93,25 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
         return none;
     }
 
+    /*
+     * #458: Print Screen with the leader held reports as SysRq -- a single non-extended 0x54.
+     * This, not the four-byte `E0 2A E0 37` form above, is the encoding this chord actually
+     * receives; see leader_chord.h for the trace. The break (0xD4) is swallowed rather than
+     * left to fall through to the digit range below, which it does not overlap today but sits
+     * close enough to that letting it drift there would be an unpleasant surprise.
+     */
+    if (byte == HYPE_SCANCODE_SYSRQ_MAKE) {
+        if (state->right_ctrl_held && state->right_alt_held) {
+            result.action = HYPE_CHORD_ACTION_SCREENSHOT;
+            result.vm_index = 0;
+            return result;
+        }
+        return none;
+    }
+    if (byte == HYPE_SCANCODE_SYSRQ_BREAK) {
+        return none;
+    }
+
     if (byte == HYPE_SCANCODE_ESC_MAKE) {
         if (state->right_ctrl_held && state->right_alt_held) {
             result.action = HYPE_CHORD_ACTION_RETURN_TO_DASHBOARD;
