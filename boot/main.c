@@ -1159,6 +1159,21 @@ static void term_resultf(const char *fmt, ...) {
 static EFI_GRAPHICS_OUTPUT_PROTOCOL *g_term_gop;
 
 /*
+ * #462: the GOP mode list, enumerated ONCE while Boot Services still exist.
+ *
+ * `resolution` used to call gop->QueryMode() at command time, which is post-ExitBootServices --
+ * and QueryMode is a Boot-Services-era protocol call that allocates the buffer it returns
+ * (UEFI spec: "the caller is responsible for freeing"). Post-EBS there is no pool allocator and
+ * the driver's own code/data may already have been reused as guest RAM, so the call panicked on
+ * real hardware the first time an operator ran `resolution list` -- which only became reachable
+ * once #459 stopped `help` truncating before it.
+ *
+ * Enumerated unconditionally at boot instead, so the command is a pure lookup over a snapshot.
+ */
+static hype_gop_mode_t g_gop_modes[HYPE_GOP_MODE_MAX];
+static unsigned int g_gop_mode_count;
+
+/*
  * M10-5 (#125): the one pending physical-write confirmation. A `physical:`
  * target that has PASSED the #124 guard (identity match + non-empty/override)
  * still may not be written until the operator, shown the real drive's
@@ -17397,9 +17412,11 @@ static void fw_1_vars_request(hype_fw_vm_t *vm, uint32_t kind, int wait) {
  * Persistence is BEST-EFFORT via whichever writable FAT volume g_hype_log already has mounted
  * (the USB debug-log sink, #338) -- there is no device-agnostic "find and mount hype's own boot
  * volume regardless of backend (AHCI/NVMe/USB)" utility in this codebase yet post-
- * ExitBootServices (see the follow-up ticket this ships with). A resolution change always takes
- * effect for the REST OF THIS RUN via SetMode either way; whether it survives a reboot depends on
- * a writable volume being mounted when the command runs.
+ * ExitBootServices (see the follow-up ticket this ships with).
+ *
+ * #462: this command makes NO firmware call. It reads the mode list snapshotted before
+ * ExitBootServices and persists the choice for the next boot; it does not SetMode. Both
+ * QueryMode and SetMode are Boot-Services-era protocol calls and panicked here on real hardware.
  */
 static void term_resolution_cmd(hype_cmd_t *c) {
     if (!c->has_arg) {
@@ -17419,8 +17436,9 @@ static void term_resolution_cmd(hype_cmd_t *c) {
     }
 
     {
-        static hype_gop_mode_t modes[HYPE_GOP_MODE_MAX];
-        unsigned int mode_count = hype_gop_mode_enumerate(g_term_gop, modes, HYPE_GOP_MODE_MAX);
+        /* #462: the pre-ExitBootServices snapshot, never a live QueryMode -- see g_gop_modes. */
+        const hype_gop_mode_t *modes = g_gop_modes;
+        unsigned int mode_count = g_gop_mode_count;
 
         if (hype_streq(c->arg, "list")) {
             unsigned int i;
@@ -17465,12 +17483,15 @@ static void term_resolution_cmd(hype_cmd_t *c) {
                               w, hgt);
                 return;
             }
-            if (hype_gop_mode_set(g_term_gop, modes[(unsigned int)match].mode_number) != 0) {
-                term_resultf(
-                              "resolution: %llux%llu was offered but SetMode refused it", w, hgt);
-                return;
-            }
-
+            /*
+             * #462: NO SetMode here. It is the same Boot-Services-era protocol call QueryMode
+             * is, and it does more damage: it reprograms the display and can hand back a
+             * different framebuffer base -- while hype is painting the old one from its own
+             * post-EBS page tables. The setting is persisted and applied at the next boot, in
+             * the pre-EBS window where SetMode is legal (see the TERM-7 block in efi_main).
+             * #443 listed live mode switching as out of scope "unless it falls out trivially";
+             * it does not.
+             */
             g_hype_cfg.hype.has_resolution = 1;
             g_hype_cfg.hype.resolution_width = (unsigned int)w;
             g_hype_cfg.hype.resolution_height = (unsigned int)hgt;
@@ -17488,9 +17509,9 @@ static void term_resolution_cmd(hype_cmd_t *c) {
                         saved = 1;
                     }
                 }
-                term_resultf( "resolution applied: %llux%llu%s",
+                term_resultf( "resolution %llux%llu%s -- takes effect on the next boot",
                               w, hgt,
-                              saved ? " (saved)" : " (NOT saved -- no writable volume mounted)");
+                              saved ? " saved" : " NOT saved (no writable volume mounted)");
             }
         }
     }
@@ -18642,16 +18663,24 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * own, and "no setting found" has to reproduce that exact prior behavior, not fall back to a
      * hardcoded resolution of its own choosing.
      */
+    /*
+     * #462: snapshot the mode list here, where QueryMode is legal, whether or not a resolution
+     * is configured -- the `resolution` command needs it post-EBS and cannot ask firmware then.
+     */
+    if (have_gop) {
+        g_gop_mode_count = hype_gop_mode_enumerate(gop, g_gop_modes, HYPE_GOP_MODE_MAX);
+        hype_debug_print("TERM-7: GOP reports %u mode(s), snapshotted pre-ExitBootServices "
+                         "[#443 #462]\n", g_gop_mode_count);
+    }
     if (have_gop && g_hype_cfg.hype.has_resolution) {
-        hype_gop_mode_t modes[HYPE_GOP_MODE_MAX];
-        unsigned int mode_count = hype_gop_mode_enumerate(gop, modes, HYPE_GOP_MODE_MAX);
-        int match = hype_gop_mode_find(modes, mode_count, g_hype_cfg.hype.resolution_width,
+        int match = hype_gop_mode_find(g_gop_modes, g_gop_mode_count,
+                                       g_hype_cfg.hype.resolution_width,
                                        g_hype_cfg.hype.resolution_height);
         if (match < 0) {
             hype_debug_print("TERM-7: configured resolution %ux%u is not offered by this "
                              "firmware's GOP -- keeping its current mode\n",
                              g_hype_cfg.hype.resolution_width, g_hype_cfg.hype.resolution_height);
-        } else if (hype_gop_mode_set(gop, modes[match].mode_number) != 0) {
+        } else if (hype_gop_mode_set(gop, g_gop_modes[match].mode_number) != 0) {
             hype_debug_print("TERM-7: configured resolution %ux%u was offered but SetMode "
                              "refused it -- keeping the firmware's current mode\n",
                              g_hype_cfg.hype.resolution_width, g_hype_cfg.hype.resolution_height);
