@@ -750,7 +750,18 @@ typedef struct hype_fw_vm {
      * hints run concurrently. */
     int hv_leaves;
     unsigned mem_mb;
-    const char *media;      /* boot-media short name */
+    const char *media;      /* boot-media short name; points at media_buf below */
+    /*
+     * #391: fw_1_media_path()'s generated default ("\iso\vmN.iso" for a VM with no
+     * configured install_media) is returned in a function-static scratch buffer
+     * shared across every call, valid only until the NEXT call. Setup runs every
+     * VM in sequence, so holding that pointer directly in vm->media let each
+     * later VM's setup overwrite the string every earlier VM's row was still
+     * displaying -- the dashboard's MEDIA column showed vm0's path for every VM.
+     * Copying into this VM's own buffer at setup time (see fw_1_vm_setup) makes
+     * each row's media name independent of setup order.
+     */
+    char media_buf[32];
     volatile uint64_t stat_total_exits;
     volatile uint64_t stat_hlt_exits;
     volatile uint64_t stat_uptime_ms; /* #263: accumulated RUNNING time, not wall-clock */
@@ -10218,7 +10229,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     /* #290: mem_mb is set by fw_1_resolve_guest_ram() from vm->ram_bytes. It used
      * to be assigned here FROM the compile-time constant, which is precisely what
      * discarded a configured mem_mb after echoing it. */
-    vm->media = "test.iso";
+    /* #391: copy out immediately -- fw_1_media_path()'s generated-default case
+     * returns a shared scratch buffer that the NEXT VM's setup call overwrites
+     * (see media_buf's own comment above). */
+    (void)hype_strlcpy(vm->media_buf, fw_1_media_path((unsigned int)(vm - g_vms)),
+                       sizeof(vm->media_buf));
+    vm->media = vm->media_buf;
     vm->lifecycle = HYPE_VM_RUNNING; /* M8-4..7 */
     vm->shutdown_deadline_tsc = 0;
     vm->pm1a_cnt = 0;
