@@ -309,6 +309,12 @@ distinct from any guest's own console:
   adding a network stack or serial protocol to the trusted hypervisor core.
   Revisit serial/remote access as a stretch goal only if a real headless-host
   use case shows up.
+  **Scope of this bullet, clarified (decision #36):** it means the *dashboard*
+  is not remotely administrable — no listening service in the hypervisor for
+  anything outside it to connect to. It is not a ban on hype owning a NIC:
+  §6e's host NIC drivers and NAT forwarding plane are separately required
+  (decision #9) and do not conflict with this. The rule that follows from
+  both is a listener, not a driver: hype never accepts an inbound connection.
 
 ## 6c. Interactive / GUI installs (non-headless OSes)
 
@@ -450,13 +456,41 @@ surface for all of this.
 Required, not optional, per decision: many Linux net-installers need network
 to fetch the base system, and any online-account/update flow does too.
 
-- **Host NIC driver**: a minimal host-side driver for one common real NIC
-  chipset family (Intel e1000/e1000e-class is the pragmatic first target —
-  broad hardware support, simple register interface, well-documented) so
-  the hypervisor can drive the physical network adapter directly after
-  `ExitBootServices()`, the same way §6d's AHCI/NVMe driver does for
-  storage. Lives in its own module behind a backend abstraction, same
-  isolation principle as `blk_backend`.
+- **Host NIC drivers**: minimal host-side drivers so the hypervisor can drive
+  the physical network adapter directly after `ExitBootServices()`, the same
+  way §6d's AHCI/NVMe driver does for storage. Intel e1000/e1000e-class is the
+  first target — broad hardware support, simple register interface,
+  well-documented. The supported families for v1 are **Intel e1000e/igb,
+  Realtek r8169, Intel igc, Broadcom bnxt/tg3, and Marvell/Aquantia
+  atlantic** (decision #36); each is a separate driver behind the single NIC
+  vtable of decision #34, sitting on the shared host-PCI bind + DMA-ring +
+  IRQ/poll facility that decision grows from this work — same isolation
+  principle as `blk_backend`, and no second PCI enumerator alongside
+  `core/host_pci.c`.
+- **Forwarding plane, never an endpoint** (decision #36): host NAT genuinely
+  requires protocol code — Ethernet framing, ARP for the uplink, IPv4 header
+  parsing, UDP/TCP address/port rewriting with checksum fixup, and a
+  connection-tracking table — and all of that is in scope. What is **not** in
+  scope is hype acting as a network *peer*: no sockets API, no TCP state
+  machine hype drives as an endpoint, no reassembly (over-large fragments are
+  dropped, not reassembled), and **no listening socket of any kind** in the
+  hypervisor core. hype may rewrite a packet passing between a guest and the
+  wire; hype is never the address a packet is sent to. The single exception is
+  the uplink **DHCP client**, which NAPT needs to obtain hype's own uplink
+  address: outbound-initiated only, one transaction at a time, replies matched
+  against hype's own outstanding transaction ID, with a static-address setting
+  in `hype.cfg` for operators who prefer to disable it.
+- **Guests may listen; hype may not.** The rule above constrains the
+  hypervisor, not the guests. A guest running a server on its own virtual NIC
+  is expected and supported — it runs its own TCP/IP stack, and hype only
+  moves frames. Guest-to-guest reachability works today through `net_peers`
+  (decision #21) or an opt-in virtual switch (NET-6). Reaching a guest's
+  listening port from **outside** the host additionally needs an inbound
+  destination-NAT rule (port forwarding), which is deliberately **not** part
+  of the baseline NAT (NET-4 is outbound plus established-return only) and is
+  tracked separately as NET-8. Port forwarding is still forwarding: hype
+  rewrites the packet and the *guest* is the endpoint, so it is consistent
+  with the rule above — the thing that is banned is a socket hype itself owns.
 - **Guest-facing device**: virtio-net as the default frontend (Linux/BSD
   inbox support); Windows needs virtio-win's network driver injected if
   virtio-net is used for it, or an emulated e1000-compatible NIC (Windows
@@ -1472,6 +1506,121 @@ isn't lost.
       cross-reference each other freely (which would make the eventual split a
       rewrite instead of a mechanical extraction).
 
+36. **Host networking scope, and whether a host TCP/IP stack belongs in the
+    trusted core (#397 HNET-0) — decided: hype's host network code is a
+    FORWARDING PLANE, never a network endpoint. Multiple real NIC families
+    and the packet-translation logic NAT needs are ratified and in scope; a
+    general host TCP/IP stack with sockets — and above all a LISTENING TCP
+    socket (#406 HNET-9) — is rejected for v1.** This settles the conflict
+    #397 filed against decision #9 and §6b, and supersedes decision #9's
+    single-NIC-family wording without disturbing its substance.
+    - **First, the §6b "conflict" is a misreading, and the record should say
+      so once so it is not re-litigated.** §6b's "explicitly local-only for
+      v1 — no serial or network exposure" is a statement about the *status
+      dashboard*: the dashboard is not remotely administrable. It is not a
+      ban on hype touching a NIC — decision #9 and §6e already put a host NIC
+      driver and NAT in the trusted core, and both were ratified after §6b was
+      written. So HNET-1..HNET-4 and the per-chip drivers never contradicted
+      §6b at all. What §6b *does* forbid, in the clearest terms the document
+      uses anywhere, is exactly the one thing HNET-9 proposes: a network
+      service listening inside the hypervisor for connections from outside it.
+      The conflict is real, but it is narrow, and it is one ticket wide.
+    - **Multi-vendor NIC drivers: ratified, and already implied.** Decision
+      #34 names "r8169/igc/e1000e-igb/bnxt/atlantic" as the NET epic's NIC
+      set and builds the shared host-PCI/DMA/IRQ facility out of that work.
+      Decision #9's "e1000/e1000e-class chosen as the *first* supported real
+      NIC family" was always a starting point, not a cap. §6e's supported list
+      is now explicit: Intel e1000e/igb (#80), Realtek r8169, Intel igc,
+      Broadcom bnxt/tg3, Marvell/Aquantia atlantic — all behind the single NIC
+      vtable of decision #34, all optional at runtime, none of them protocol
+      code. A driver moves frames between a ring and a buffer; its blast
+      radius is DMA correctness, which every host storage driver already
+      carries. Adding a fifth NIC does not change hype's threat model. It is
+      the coverage that makes §6e's "required, not optional" true on real
+      hardware rather than only on emulated e1000e.
+    - **The protocol layers are ratified only in their forwarding-plane form.**
+      NAT is not free of protocol code, and pretending otherwise would just
+      hide it: to masquerade several guests behind one physical port hype must
+      parse Ethernet, answer and issue ARP for its own uplink address, parse
+      IPv4 headers, rewrite addresses/ports and fix checksums for UDP and TCP,
+      and keep a connection-tracking table. That is HNET-5..HNET-7's real
+      content and it is in scope, because decision #9 already bought it. The
+      distinction that matters, and the one this decision draws as a hard line,
+      is **translate versus terminate**. hype may inspect and rewrite a packet
+      that is passing between a guest and the wire. hype may not be the peer
+      that a packet is addressed to. Concretely, in scope: header parse and
+      rewrite, checksum fixup, conntrack, ARP for the uplink, fragment handling
+      by dropping rather than reassembling. Out of scope: a sockets API, TCP
+      reassembly or retransmission as an endpoint, any TCP state machine hype
+      itself drives as a peer, and any bind/listen of any kind. A conntrack
+      entry follows a TCP flow's state to know when to expire it; that is
+      observation, not participation, and the difference is that hype never
+      owns a receive queue that an attacker can drive.
+    - **The one sanctioned endpoint is the DHCP client (#405 HNET-8), and it
+      stays bounded.** NAPT needs the uplink to have an address, and on most
+      real networks that address comes from DHCP, so refusing all endpoint
+      behaviour would make decision #9 undeliverable. It is admitted as a
+      narrow exception with its limits written down: outbound-initiated only,
+      one transaction at a time, replies accepted only while a request of
+      hype's own is outstanding and only if they match its transaction ID, no
+      general UDP socket layer underneath it, and a static-address
+      configuration path in `hype.cfg` so an operator who does not want even
+      this can turn it off entirely.
+    - **Rejected: HNET-9, TCP with listening sockets (#406).** No consumer for
+      it exists. §6b rules out the remote dashboard, §1 lists a management UI
+      as a non-goal, and no filed ticket asks for a management API — #397 asks
+      the question ("state the consumer") and the epic itself does not answer
+      it. Building it anyway would put pre-authentication, attacker-reachable
+      parsing code inside a ring-0 payload that owns the IOMMU, every guest's
+      NPT/EPT, and the physical disks. The hard invariant this project keeps
+      is host↔guest isolation, and a listener is strictly worse than the guest
+      surface hype already accepts: a guest is a party hype deliberately
+      admitted, sandboxed and bounds-checks (§6j), whereas a LAN peer is
+      unadmitted, unbounded and needs no guest at all to reach the code. A
+      hypervisor is also the worst possible place to host a service, because
+      it has no process to lose — there is no privilege left to drop and no
+      component to restart. If a real remote-management use case ever appears,
+      the answer is decision #9's own shape applied one level up: run the
+      service in a guest that already has its own OS, its own hardened stack
+      and its own blast radius, and give it whatever host-side hook it needs
+      through a narrow, explicitly-modelled interface. That is a v2
+      conversation and it starts with the consumer, not the socket.
+    - **This constrains hype, not the guests.** A guest running a listening
+      service on its own virtual NIC is expected and supported — the guest
+      owns that TCP stack, inside its own sandbox, and hype only moves frames.
+      Guest-to-guest reachability already works via decision #21's `net_peers`
+      or NET-6's opt-in switch. Reaching a guest listener from outside the host
+      needs an inbound DNAT/port-forward rule, which the baseline NAT does not
+      include (NET-4 is outbound plus established-return only); that is tracked
+      as NET-8 and is squarely *translate*, not *terminate* — hype rewrites the
+      packet and the guest is the endpoint. Rejecting #406 therefore takes
+      nothing away from guests; it removes a socket hype itself would own.
+    - **Remote management of hype itself is a v2 goal, recorded in §13.** This
+      decision rejects a listener in the v1 core; it does not reject the
+      ambition. §13 states the two constraints the v2 design must satisfy
+      (name the consumer first; host the service in a guest behind a narrow,
+      validated control channel rather than in the trusted core). Promotion
+      requires a new §10 decision, not a reopening of #406.
+    - **Rejected: the alternative of cutting all protocol code and only
+      bridging raw frames to a guest that runs its own stack.** It is the
+      purest answer to the security question and it was considered seriously,
+      but it silently repeals decision #9: with N guests behind one physical
+      port and no NAPT, an L2 bridge needs the network to accept N MAC
+      addresses on one link, which many switches and nearly all Wi-Fi links
+      refuse, and it puts every guest directly on the operator's LAN — which
+      contradicts decision #21's default-deny isolation posture as well. The
+      forwarding-plane line above keeps the security benefit where it actually
+      pays (no listener, no endpoint, no sockets) without breaking the feature.
+    - **Board consequence:** the HNET tickets do not survive unchanged. The
+      driver and facility slices proceed as filed; the protocol slices are
+      re-scoped to translation-only and lose their "pending ratification"
+      footers; #406 (HNET-9) is Rejected. Nothing was blocked by #406, so
+      removing it strands no other work — which is itself evidence the
+      listener had no consumer. #404 (HNET-7) loses its port-demux and
+      datagram-API deliverables, since a bound local port is an endpoint.
+      See §6e for the resulting supported-NIC list and the
+      translate-versus-terminate rule in its normative form.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
@@ -1665,3 +1814,25 @@ own "keeping plan.md and the board in sync" rule).
   story for thin-provisioned space) -- deserves its own design pass
   before promotion to a board milestone, likely building on M5's
   `blk_backend` vtable rather than replacing it.
+
+- **Remote management of hype itself** (noted 2026-08-15, confirmed as a v2
+  goal alongside §10 decision #36). §6b keeps the v1 dashboard local-only and
+  decision #36 rejects any listening socket in the hypervisor core (#406), so
+  v1 has no remote administration of any kind. The intent to have it in v2 is
+  recorded here so the v2 design starts from a position rather than by
+  reopening the rejected ticket. Two constraints that decision #36's reasoning
+  already fixes, and which any v2 design must answer rather than sidestep:
+  (1) **the consumer comes first** — what is being managed remotely, by whom,
+  and authenticated how, before any transport is chosen; and (2) **the
+  hypervisor core is the worst available place to host the service**, because
+  it is ring-0 with the IOMMU, every guest's NPT/EPT and the physical disks,
+  and it has no process to lose (no privilege left to drop, nothing to
+  restart). The direction that follows is decision #9's own shape applied one
+  level up: run the management service **in a guest** — which already has its
+  own OS, hardened network stack and contained blast radius — and give it a
+  narrow, explicitly-modelled host-side hook (a small, versioned, strictly
+  validated control channel, in the spirit of §6j's device-emulation trust
+  boundary) rather than putting a parser and a listener in the trusted core.
+  A management VM privileged enough to control other VMs is itself a new
+  trust tier and needs its own §10 decision when promoted; it must not
+  silently become a hole in the §6g/§10 guest-isolation invariant.
