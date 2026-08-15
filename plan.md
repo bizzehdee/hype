@@ -45,21 +45,50 @@ scope.
 ```
  Firmware (UEFI) -> hype.efi (our loader/hypervisor image)
                        |
-                       |-- Phase 0: UEFI application context
-                       |     - Parse config (hype.cfg on ESP)
-                       |     - Enumerate CPU features (VMX/EPT or SVM/NPT)
-                       |     - Reserve memory (runtime services buffer) for
-                       |       hypervisor + per-VM guest RAM
-                       |     - Zero every page of each VM's reserved guest
-                       |       RAM before that VM's first instruction runs
-                       |       (§6f) — applies on every (re)start, not just
-                       |       the initial hypervisor boot
-                       |     - Load VM images / ISO installers from ESP or
-                       |       attached storage into guest-reserved memory
+                       |-- Phase 0: UEFI application context — deliberately
+                       |   minimal: ONLY what Boot Services alone can do
+                       |   (§10 decision 37)
+                       |     - Locate GOP; record the framebuffer base, size
+                       |       and mode (a firmware protocol; there is no
+                       |       post-ExitBootServices equivalent)
+                       |     - GetMemoryMap; enumerate CPU features
+                       |       (VMX/EPT or SVM/NPT)
+                       |     - Calibrate the host TSC against Boot Services'
+                       |       Stall() — hype's own xHCI driver needs a real
+                       |       timebase before it can enumerate (§10
+                       |       decision 37)
+                       |     - Enumerate UEFI Block I/O handles to capture
+                       |       each drive's serial/GUID identity (§6d) — free
+                       |       here, gone afterwards
+                       |     - Reserve host-physical memory with
+                       |       AllocatePages: ONE large guest-RAM pool sized
+                       |       from the memory map (NOT from hype.cfg), plus
+                       |       the few address-constrained pages firmware
+                       |       alone can place (<1MB AP trampoline, <4GB AP
+                       |       page-table root). This is the one deliberate
+                       |       exception to "move it post-EBS" — see §10
+                       |       decision 37
+                       |     - Call ExitBootServices
                        |
-                       |-- Phase 1: ExitBootServices() + take ownership
-                       |     - Call ExitBootServices, become the only kernel
-                       |     - Set up our own paging, IDT/GDT, APIC, timers
+                       |-- Phase 1: take ownership + hype's own I/O
+                       |     - Become the only kernel: own paging, IDT/GDT,
+                       |       APIC, timers
+                       |     - Bring up hype's OWN host storage stack: PCI
+                       |       enumeration, AHCI + NVMe + xHCI/USB-MSC, and
+                       |       the FAT32/exFAT/ext/NTFS/ISO9660 readers
+                       |     - Locate and mount hype's own boot volume,
+                       |       whichever bus it is on (USB, SATA or NVMe —
+                       |       one shared locator, §10 decision 38)
+                       |     - Read hype.cfg through that stack and parse it;
+                       |       run §6i admission control
+                       |     - Read the guest firmware images and the §6h
+                       |       run-state record through that stack
+                       |     - Carve each VM's guest RAM out of the Phase 0
+                       |       pool at the parsed sizes, and zero every page
+                       |       before that VM's first instruction runs (§6f)
+                       |       — on every (re)start, not just the first
+                       |     - Resolve each VM's install media and stream it
+                       |       from its host device (§6d) — never preloaded
                        |
                        |-- Phase 2: VMM core (thin hypervisor proper)
                        |     - Enable VMX/SVM on all cores (VMXON / mode set)
@@ -83,10 +112,20 @@ scope.
                                to 1..N vCPUs, own EPT/NPT address space
 ```
 
-Everything before `ExitBootServices()` is a normal UEFI app using Boot
-Services (file I/O via Simple File System protocol, memory via
-AllocatePages). Everything after is our own tiny kernel: no dependency on
-firmware runtime except UEFI Runtime Services we explicitly keep mapped
+The boundary between Phase 0 and Phase 1 is drawn as early as the hardware
+allows, not as late as convenience allows (§10 decision 37). Phase 0 uses a
+Boot Services facility only where no post-`ExitBootServices` equivalent
+exists: locating GOP, reading the memory map, capturing Block I/O drive
+identity, and `AllocatePages`. **hype does not read its own files through
+firmware.** `hype.cfg`, the guest firmware images, the run-state record and
+all install media are read in Phase 1 by hype's own host storage stack —
+the same AHCI/NVMe/USB drivers and FAT32/exFAT/ext/NTFS/ISO9660 readers
+that already serve guest-facing disk I/O. Which bus hype booted from does
+not matter; all three are equally valid boot media, exactly as `media_disk`
+already treats them for media reads (§6d, §10 decision 25).
+
+Everything after `ExitBootServices()` is our own tiny kernel: no dependency
+on firmware runtime except UEFI Runtime Services we explicitly keep mapped
 (time, variable services optionally, reset).
 
 ## 3. Why "thin"
@@ -99,10 +138,15 @@ firmware runtime except UEFI Runtime Services we explicitly keep mapped
   (no two VMs' pinned sets overlap) remains a hard invariant, checked at
   startup (§6i), since it's what the fault-isolation guarantee (§6g)
   depends on.
-- No filesystem in the hypervisor beyond what's needed to read guest images
-  off the ESP/local disk (FAT32 via UEFI Simple File System pre-ExitBootServices,
-  or a minimal read-only FAT/ext driver post-ExitBootServices if we need to
-  load additional images after boot services are gone).
+- No filesystem in the hypervisor beyond what's needed to read hype's own
+  files and the guest images off a host volume — but that reader is the
+  **primary** path, not a contingency. hype's own FAT32/exFAT/ext/NTFS/
+  ISO9660 drivers, running post-`ExitBootServices` over hype's own AHCI/
+  NVMe/USB block drivers, are how hype reads `hype.cfg`, the guest firmware
+  images, the run-state record and every installer ISO (§2, §10 decision
+  37). UEFI's Simple File System protocol is not used for any of them. The
+  scope limit still holds: read plus the narrow in-place/append writes §6h
+  and §10 decisions 24/30 already define, not a general filesystem.
 - Guest firmware is the minimal amount needed to satisfy each OS installer's
   expectations (see §6).
 
@@ -570,7 +614,9 @@ it starts back up again:
 - **State persisted across the host power event**: a small state record
   (which VMs were running vs. stopped at the moment shutdown began) is
   written to persistent storage (the ESP, alongside `hype.cfg`) as part of
-  the shutdown sequence.
+  the shutdown sequence. Both the write and the next boot's read go through
+  hype's own storage stack via the shared boot-volume locator (§10 decisions
+  37/38), not through firmware.
 - **On next hypervisor startup**: read that state record and automatically
   re-**Start** every VM that was previously running (a fresh boot from its
   disk/target per §6f's Start semantics), leaving previously-stopped VMs
@@ -1471,6 +1517,142 @@ isn't lost.
       and its opposite, ignoring modularity entirely and letting drivers
       cross-reference each other freely (which would make the eventual split a
       rewrite instead of a mechanical extraction).
+
+37. **Boot Services boundary (#449/#450/#451/#452/#453) — decided: hype reads
+    its own files through
+    hype's OWN storage stack, post-`ExitBootServices`; Boot Services are used
+    only where no post-EBS equivalent exists. The single deliberate exception
+    is memory reservation, which becomes ONE large pre-EBS pool sized from the
+    memory map, carved post-EBS once the config is parsed.** Phase 0 grew into
+    a second, firmware-shaped implementation of things hype already does
+    better itself. Today `load_hype_cfg()` (`boot/main.c`) opens `\hype.cfg`
+    through UEFI's Simple File System protocol; the guest firmware images are
+    read the same way by the FW-1 block, which then keeps a per-VM *pristine
+    copy in RAM* solely because "the ESP is unreachable post-EBS"; and a 64 KiB
+    ISO-head read still goes through UEFI for a microtest. Meanwhile hype
+    already drives AHCI, NVMe and xHCI/USB-MSC itself post-EBS, already mounts
+    FAT32/exFAT/ext/NTFS/ISO9660 on them, and already streams multi-GB
+    installer ISOs off any of the three — including off its own boot stick
+    (decision 25 / #326). The firmware path is the weaker one, and it is the
+    only reason the pre-EBS phase is large. The full list of remaining
+    Simple-File-System callers is `load_hype_cfg()`, the FW-1 firmware load,
+    `load_iso_head()`, `load_input_script()` and `fw_1_dump_prev_log()`; all
+    five move.
+    - **Config, guest firmware, run-state record and media all move to Phase 1
+      (post-EBS), read through hype's own stack.** None of these is
+      chicken-and-egg: each is storage I/O, and hype's storage stack needs
+      nothing from Boot Services — it binds the controllers over raw PCI
+      config space and MMIO, which is only *safer* after firmware has been
+      shut out of the same controllers. Media already made this move and
+      proved it (decision 25). Moving the firmware images with them also
+      deletes the per-VM pristine RAM snapshot: a VM restart can re-read the
+      images from disk instead of hoarding a copy of them per VM.
+    - **Memory reservation cannot move, and is not asked to.**
+      `AllocatePages` has no post-`ExitBootServices` equivalent — after EBS
+      there is no allocator to ask, only the memory map hype captured before
+      it. So the reservation stays in Phase 0. What changes is that it stops
+      depending on the config: instead of "parse `hype.cfg` pre-EBS, then
+      `AllocatePages` each VM's `mem_mb`" (`fw_1_resolve_guest_ram` →
+      `hype_alloc_pages_any_2mb_aligned`, once per VM), Phase 0 reserves **one
+      2MB-aligned pool** sized from `GetMemoryMap`'s usable RAM minus hype's
+      own margin, and Phase 1 carves each VM's guest RAM out of that pool at
+      the parsed size. That breaks the last real tie between the config and
+      Boot Services. §6i's admission check moves with it and becomes a check
+      against a known pool size rather than an estimate of free RAM.
+      The handful of *address-constrained* pages stay as individual pre-EBS
+      allocations, because only firmware can place them: the <1MB AP
+      trampoline page and the <4GB AP page-table root
+      (`hype_alloc_page_below_1mb`, `hype_alloc_pages_below_4gb`).
+    - **One further Boot Services dependency stays, and it is not storage:**
+      the host TSC is calibrated against `BootServices->Stall(20000)`, and
+      hype's own xHCI driver consumes that frequency
+      (`hype_xhci_set_tsc_hz`) before it can enumerate — a too-early Address
+      Device is NAKed by High-Speed devices on real hardware. Since USB is
+      one of the buses hype must read its own config from, the calibration
+      must precede the storage bring-up, and Stall is the only timebase
+      available that early. It stays in Phase 0. Replacing it with a
+      Boot-Services-free calibration (PIT or HPET) is possible but is a
+      separate change, not a prerequisite for this one.
+    - **What is left in Phase 0** is then: locate GOP, `GetMemoryMap`,
+      enumerate CPU features, calibrate the TSC via Stall, capture Block I/O
+      drive serial/GUID identity (§6d — free before EBS, impossible after),
+      the reservations above, and `ExitBootServices`. Loading `hype.efi`
+      itself remains firmware's job by definition.
+    - **Ordering hazard this fixes.** Today config parsing and every
+      allocation are Boot-Services-only while media resolution is
+      post-EBS-only, so hype commits guest RAM, firmware buffers and vdisk
+      backing at a point where it cannot yet see which disks or ISOs exist.
+      Carving from a pool after the storage stack is up removes that split:
+      hype sizes what it commits from what it has actually found.
+    - **This does not create a generic pluggable-backend abstraction.** No new
+      framework, no new vtable, no new indirection layer. `hype_fs_ops_t` and
+      `hype_blk_backend_t` (decision 34) already exist, already have their
+      implementations, and already treat USB/SATA/NVMe as interchangeable
+      candidates for media reads (#323). This decision points hype's own
+      config/firmware/state reads at that same existing stack — one more
+      caller, not a new mechanism. Decision 17's "no premature abstraction"
+      is respected precisely because nothing is being abstracted.
+    - **Isolation is unaffected.** All of this is host-side I/O performed by
+      the host on its own behalf, before or between guest execution. It hands
+      no guest a new path to host storage, adds no guest-supplied address to
+      any host dereference, and therefore does not touch the §6j trust
+      boundary or the host↔guest invariant in `AGENTS.md`. The guest-facing
+      surface is unchanged: guests still see only emulated block front-ends
+      backed by `hype_blk_backend_t`, with the §6j bounds check in the same
+      dispatcher. Two second-order effects do need care and are called out in
+      the tickets: a config-parse failure now happens after the point of no
+      return, so it must degrade to built-in defaults with a loud diagnostic
+      rather than panic; and guest RAM carved from a shared pool must still be
+      zeroed per VM per (re)start, and no two VMs' carved ranges may overlap —
+      the same admission-control property, now enforced by the carve.
+    - **Rejected: keep reading `hype.cfg` via Simple File System because it
+      works.** It works only when hype boots from a volume firmware can mount,
+      and it forces every downstream decision (guest RAM size, media choice,
+      firmware load) to be made before hype owns the machine. That ordering is
+      what produced the RAM-preload cap decision 25 had to retire, and the
+      per-VM pristine firmware copies above.
+    - **Rejected: reserve guest RAM lazily post-EBS from the memory map,
+      without a pre-EBS pool.** Technically possible — hype has the memory
+      map — but it means hype second-guessing which "free" regions firmware
+      and its own loaded image actually left free, with no allocator to
+      arbitrate. A single `AllocatePages` pool is firmware's own answer to
+      that question, obtained for free while it can still be asked.
+
+38. **Locating hype's own boot volume (#447) — decided: ONE shared locator,
+    used by
+    both the read path and the write path, over every registered host block
+    device.** hype needs to find the volume it booted from twice: to read
+    `hype.cfg` and its firmware images (decision 37), and to write back
+    `hype.cfg`, the §6h run-state record and the debug log (#447). Today only
+    the write side has any implementation — `usb_log_setup()`'s
+    superfloppy/MBR/GPT partition-base scan, wired to one already-identified
+    USB backend. That scan is not USB-specific in substance: it already takes
+    a generic `hype_blk_backend_t *`, its `(base + lba)` read/write shims are
+    bus-neutral, and it already ends in `hype_fs_mount_auto()`. The only
+    genuinely USB-bound part is its `sync` shim, hardcoded to
+    `hype_blk_usb_sync(&g_usb_ubk)`, plus the single call site that passes the
+    USB backend. Generalising it is a small, contained change, not a rewrite.
+    - **Extract it once**, taking a `(read_fn, ctx)` pair, and run it over
+      every registered host device the way media resolution already iterates
+      candidates (#323) — so USB, SATA and NVMe boot volumes are found by the
+      same code. Writing the same scan a second time for the read path is the
+      failure mode this avoids; the owner's requirement is that the bus hype
+      booted from is not a distinction hype's own code makes.
+    - **The volume must be confirmed, not guessed.** A writable FAT volume is
+      not evidence it is *hype's* volume. Confirmation is that `\hype.cfg` (or
+      `\EFI\hype\`) is present on it, checked before the volume is trusted as
+      either a config source or a save target — writing a fresh `hype.cfg` to
+      the wrong disk is worse than not saving at all.
+    - **The device registry must not silently drop hype's own boot volume.**
+      `HYPE_MEDIA_MAX_DEVS` is 4 and registration order is fixed (NVMe, USB,
+      ATAPI, AHCI), so a machine with three NVMe drives plus a stick already
+      drops the AHCI disk with one log line. Once hype's own config lives
+      behind the same registry, being dropped stops being a media
+      inconvenience and becomes an unbootable configuration. The cap must be
+      raised, or hype's boot volume registered ahead of the cap.
+    - **Rejected: two locators, one per direction.** They would drift, and the
+      read path would be the one without real-hardware exposure until a
+      config change failed to load on somebody's NVMe machine.
 
 ## 11. Pre-M0 readiness checklist
 
