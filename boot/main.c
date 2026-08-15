@@ -11192,6 +11192,30 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         shown++;
                     }
                     hype_debug_print("%s (injected/requested)\n", vl);
+                    /*
+                     * #359: VECHIST reports vectors, but a vector alone does not say which
+                     * device it belongs to -- the guest's own IOAPIC redirection table is what
+                     * maps a vector back to a GSI, and #359's investigation stopped exactly
+                     * there ("I have not identified which device 0x31 is, and I am not going to
+                     * guess -- the guest's own IDT/IOAPIC routing is the thing to read").
+                     * Printed alongside VECHIST so the next occurrence has both without needing
+                     * a second run: for every unmasked redirection entry, GSI -> vector.
+                     */
+                    {
+                        static char rl[300];
+                        int ro = hype_snprintf(rl, sizeof(rl), "fw-1 IOAPICRT vm%u:",
+                                               (unsigned)(vm - g_vms));
+                        unsigned gsi;
+                        for (gsi = 0; gsi < HYPE_IOAPIC_NUM_RTES; gsi++) {
+                            uint64_t rte = g_fw_1_ioapic.rte[gsi];
+                            if ((rte & (1ull << 16)) != 0ull) {
+                                continue; /* masked: guest has no delivery expectation here */
+                            }
+                            ro += hype_snprintf(rl + ro, sizeof(rl) - (unsigned)ro,
+                                                " gsi%u->0x%02x", gsi, (unsigned)(rte & 0xFFu));
+                        }
+                        hype_debug_print("%s (unmasked only)\n", rl);
+                    }
                 }
                 if (kind != HYPE_VMM_KIND_VMX) {
                     unsigned long long ax = 0, as = 0, ar = 0, ad = 0, ao = 0;
