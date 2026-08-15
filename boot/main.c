@@ -2,6 +2,7 @@
 #include "../core/console.h"
 #include "../core/fatal.h"
 #include "../core/gop.h"
+#include "../core/gop_mode.h"
 #include "../core/mtrr.h"
 #include "../core/gop_text.h"
 #include "../core/vt_screen.h"
@@ -1105,6 +1106,11 @@ static char g_cmdline[HYPE_CMDLINE_MAX];
 static unsigned g_cmdline_len;
 static char g_cmd_result[96];
 
+/* TERM-7 (#443): the live GOP protocol, stashed once hype_gop_locate() succeeds so the
+ * `resolution` command (dispatched from term_run_cmdline, a different function) can reach it.
+ * 0 whenever there is no GOP at all (a serial-only host) -- every user is expected to check it. */
+static EFI_GRAPHICS_OUTPUT_PROTOCOL *g_term_gop;
+
 /*
  * M10-5 (#125): the one pending physical-write confirmation. A `physical:`
  * target that has PASSED the #124 guard (identity match + non-empty/override)
@@ -1507,6 +1513,11 @@ static void term_post(int idx, hype_vm_event_t ev) {
     g_vms[idx].lifecycle = hype_vm_lifecycle_next(g_vms[idx].lifecycle, ev);
 }
 
+/* TERM-7 (#443): defined further down, once g_hype_cfg/g_hype_log/g_term_gop are all declared --
+ * forward-declared here so term_run_cmdline's switch can call it. Writes its result into
+ * g_cmd_result, matching every other verb's own convention. */
+static void term_resolution_cmd(hype_cmd_t *c);
+
 /* Execute the current command line, setting g_cmd_result, then clear it. */
 static void term_run_cmdline(void) {
     hype_cmd_t c = hype_cmd_parse(g_cmdline);
@@ -1518,7 +1529,8 @@ static void term_run_cmdline(void) {
             break;
         case HYPE_CMD_HELP:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
-                          "cmds: list status start stop resume shutdown off focus <vm> | confirm <sn>");
+                          "cmds: list status start stop resume shutdown off focus <vm> | confirm "
+                          "<sn> | resolution [list|<W>x<H>]");
             break;
         case HYPE_CMD_LIST:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "%u VM(s) -- see table above",
@@ -1601,6 +1613,9 @@ static void term_run_cmdline(void) {
             }
             break;
         }
+        case HYPE_CMD_RESOLUTION:
+            term_resolution_cmd(&c);
+            break;
         case HYPE_CMD_UNKNOWN:
         default:
             hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "unknown command (try 'help')");
@@ -16926,6 +16941,115 @@ static int g_hype_log_ready;
 static hype_log_sink_t *g_vm_log;
 static int *g_vm_log_ready;
 
+/*
+ * TERM-7 (#443): `resolution` -- list available GOP modes, show the current setting, or apply
+ * and persist one. Forward-declared with term_run_cmdline's switch, defined here because it needs
+ * g_hype_cfg/g_hype_log/g_term_gop, all declared above this point.
+ *
+ * Persistence is BEST-EFFORT via whichever writable FAT volume g_hype_log already has mounted
+ * (the USB debug-log sink, #338) -- there is no device-agnostic "find and mount hype's own boot
+ * volume regardless of backend (AHCI/NVMe/USB)" utility in this codebase yet post-
+ * ExitBootServices (see the follow-up ticket this ships with). A resolution change always takes
+ * effect for the REST OF THIS RUN via SetMode either way; whether it survives a reboot depends on
+ * a writable volume being mounted when the command runs.
+ */
+static void term_resolution_cmd(hype_cmd_t *c) {
+    if (!c->has_arg) {
+        if (g_hype_cfg.hype.has_resolution) {
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "resolution: %ux%u (configured)",
+                          g_hype_cfg.hype.resolution_width, g_hype_cfg.hype.resolution_height);
+        } else {
+            hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                          "resolution: unset (using the firmware's current mode)");
+        }
+        return;
+    }
+
+    if (g_term_gop == 0) {
+        hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "resolution: no GOP on this host");
+        return;
+    }
+
+    {
+        static hype_gop_mode_t modes[HYPE_GOP_MODE_MAX];
+        unsigned int mode_count = hype_gop_mode_enumerate(g_term_gop, modes, HYPE_GOP_MODE_MAX);
+
+        if (hype_streq(c->arg, "list")) {
+            unsigned int i;
+            unsigned int off = 0;
+            if (mode_count == 0u) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "resolutions: none reported");
+                return;
+            }
+            for (i = 0; i < mode_count; i++) {
+                int n = hype_snprintf(g_cmd_result + off, sizeof(g_cmd_result) - off, "%s%ux%u",
+                                      (i > 0u) ? "," : "", modes[i].width, modes[i].height);
+                if (n < 0 || (unsigned int)n >= sizeof(g_cmd_result) - off) {
+                    break; /* the single-line result buffer is full -- the rest is truncated */
+                }
+                off += (unsigned int)n;
+            }
+            return;
+        }
+
+        {
+            char *x = 0;
+            unsigned int k;
+            unsigned long long w = 0, hgt = 0;
+            int match;
+
+            for (k = 0; c->arg[k] != '\0'; k++) {
+                if (c->arg[k] == 'x' || c->arg[k] == 'X') {
+                    x = &c->arg[k];
+                    break;
+                }
+            }
+            if (x == 0 || x == c->arg || hype_parse_uint(c->arg, &w) != 0 ||
+                hype_parse_uint(x + 1, &hgt) != 0 || w == 0u || hgt == 0u) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "resolution: expected <W>x<H>, e.g. 1920x1080");
+                return;
+            }
+
+            match = hype_gop_mode_find(modes, mode_count, (uint32_t)w, (uint32_t)hgt);
+            if (match < 0) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "resolution: %llux%llu not offered by this GOP (try 'resolution "
+                              "list')",
+                              w, hgt);
+                return;
+            }
+            if (hype_gop_mode_set(g_term_gop, modes[(unsigned int)match].mode_number) != 0) {
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result),
+                              "resolution: %llux%llu was offered but SetMode refused it", w, hgt);
+                return;
+            }
+
+            g_hype_cfg.hype.has_resolution = 1;
+            g_hype_cfg.hype.resolution_width = (unsigned int)w;
+            g_hype_cfg.hype.resolution_height = (unsigned int)hgt;
+
+            {
+                int saved = 0;
+                if (g_hype_log_ready) {
+                    static char cfgtext[8192];
+                    hype_cfg_serialize_result_t sr =
+                        hype_cfg_serialize(&g_hype_cfg, cfgtext, sizeof(cfgtext));
+                    hype_fs_file_t f;
+                    if (!sr.refused_overflow && !sr.truncated &&
+                        hype_fs_create(&g_hype_log.fs, "hype.cfg", &f) == 0 &&
+                        hype_fs_write_at(&f, 0, cfgtext, sr.len) == 0) {
+                        saved = 1;
+                    }
+                }
+                hype_snprintf(g_cmd_result, sizeof(g_cmd_result), "resolution applied: %llux%llu%s",
+                              w, hgt,
+                              saved ? " (saved)" : " (NOT saved -- no writable volume mounted)");
+            }
+        }
+    }
+}
+
 /* Persistent copies of the USB block path the sink writes through. The probe's
  * own xc/msc are block-locals that die when the probe scope closes; the sink
  * lives for the whole post-EBS run (and the diagnostic halt), so its backend
@@ -17807,6 +17931,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     status = hype_gop_locate(SystemTable->BootServices, &gop);
     have_gop = (status == EFI_SUCCESS);
+    g_term_gop = have_gop ? gop : 0; /* TERM-7 (#443): so the `resolution` command can reach it */
     if (!have_gop) {
         /*
          * #296: on BOTH channels, and each has a reason.
@@ -17822,6 +17947,30 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          */
         hype_debug_print("no GOP found: 0x%llx\n", (unsigned long long)status);
         hype_console_print(SystemTable, "no GOP found: 0x%llx\n", (unsigned long long)status);
+    }
+
+    /*
+     * TERM-7 (#443): apply a configured resolution BEFORE the console-init block below reads
+     * gop->Mode->Info -- so the terminal/dashboard is sized to the chosen mode from its very
+     * first frame, not the firmware's original one. No configured resolution (has_resolution ==
+     * 0, the default) means this block does nothing at all: hype has never called SetMode on its
+     * own, and "no setting found" has to reproduce that exact prior behavior, not fall back to a
+     * hardcoded resolution of its own choosing.
+     */
+    if (have_gop && g_hype_cfg.hype.has_resolution) {
+        hype_gop_mode_t modes[HYPE_GOP_MODE_MAX];
+        unsigned int mode_count = hype_gop_mode_enumerate(gop, modes, HYPE_GOP_MODE_MAX);
+        int match = hype_gop_mode_find(modes, mode_count, g_hype_cfg.hype.resolution_width,
+                                       g_hype_cfg.hype.resolution_height);
+        if (match < 0) {
+            hype_debug_print("TERM-7: configured resolution %ux%u is not offered by this "
+                             "firmware's GOP -- keeping its current mode\n",
+                             g_hype_cfg.hype.resolution_width, g_hype_cfg.hype.resolution_height);
+        } else if (hype_gop_mode_set(gop, modes[match].mode_number) != 0) {
+            hype_debug_print("TERM-7: configured resolution %ux%u was offered but SetMode "
+                             "refused it -- keeping the firmware's current mode\n",
+                             g_hype_cfg.hype.resolution_width, g_hype_cfg.hype.resolution_height);
+        }
     }
 
     /*

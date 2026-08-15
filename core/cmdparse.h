@@ -23,6 +23,10 @@ typedef enum {
     HYPE_CMD_POWEROFF,   /* force power off (M8-7) */
     HYPE_CMD_FOCUS,      /* switch console focus */
     HYPE_CMD_CONFIRM,    /* M10-5: confirm a pending physical-disk write (arg = drive serial) */
+    /* TERM-7 (#443): the first entry in TERM's general host-settings mechanism. arg = "list" (show
+     * every resolution the GOP offers), "<W>x<H>" (apply and persist one), or absent (show the
+     * current setting). */
+    HYPE_CMD_RESOLUTION,
     HYPE_CMD_UNKNOWN,
 } hype_cmd_verb_t;
 
