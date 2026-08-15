@@ -110,6 +110,18 @@ struct hype_vcpu_ctx {
      * injected gap on one vector) could not be attributed to a VM. */
     uint32_t int_req_by_vec[256];
     uint32_t int_inj_by_vec[256];
+    /*
+     * #456: the vectors staged into EVENTINJ since the caller last drained this,
+     * as a 256-bit set. The guest's emulated LAPIC ISR must be marked at the
+     * moment a vector is COMMITTED to the guest, not when it is requested --
+     * requests can be deferred for a long time, cancelled (#455), or coalesced,
+     * and a vector re-injected out of pending_irr after the guest EOI'd an
+     * earlier delivery gets no fresh request at all. Marking at request time
+     * left FreeBSD's `bsr ISR1` stub reading a stale low bit and calling
+     * lapic_handle_intr() with a PIC-range vector, which indexes
+     * la_ioint_irqs[vector - 48] with a huge unsigned value and page-faults.
+     */
+    uint32_t inj_notify[8];
 };
 
 /* M8-0b-ii: per-vCPU state pool. Was a single g_vmcb/g_ctx (M2's one-vCPU
@@ -348,6 +360,7 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
         int i;
         for (i = 0; i < 8; i++) {
             ctx->pending_irr[i] = 0;
+            ctx->inj_notify[i] = 0; /* #456 */
         }
         for (i = 0; i < 256; i++) {
             ctx->int_req_by_vec[i] = 0;   /* #359: a recycled slot must not inherit */
@@ -1379,6 +1392,33 @@ void hype_svm_vcpu_get_vec_counts(hype_vcpu_ctx_t *ctx, uint8_t vector, uint32_t
     }
 }
 
+/* #456: record that `vector` has just been staged into EVENTINJ, so the caller can mark the
+ * guest's emulated LAPIC ISR for exactly the vectors hype committed. */
+static void svm_note_injected(struct hype_vcpu_ctx *real, uint8_t vector) {
+    real->inj_notify[vector >> 5] |= (uint32_t)1u << (vector & 31u);
+}
+
+int hype_svm_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    unsigned word;
+
+    for (word = 0; word < 8u; word++) {
+        uint32_t bits = real->inj_notify[word];
+        unsigned bit;
+        if (bits == 0u) {
+            continue;
+        }
+        for (bit = 0; bit < 32u; bit++) {
+            if ((bits & ((uint32_t)1u << bit)) != 0u) {
+                real->inj_notify[word] &= ~((uint32_t)1u << bit);
+                *out_vector = (uint8_t)(word * 32u + bit);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 void hype_svm_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->int_req_by_vec[vector]++;
@@ -1427,6 +1467,7 @@ trace_done:
         hype_svm_vintr_priority_allows(real->vmcb->control.vintr, vector)) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
         real->int_inj_by_vec[vector]++;
+        svm_note_injected(real, vector); /* #456 */
         g_int_eventinj++;
         return;
     }
@@ -1481,6 +1522,7 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         real->int_inj_by_vec[(uint8_t)v]++;
+        svm_note_injected(real, (uint8_t)v); /* #456 */
         g_int_vintr_window++;
     }
     hype_svm_sync_vintr(real);
@@ -1528,6 +1570,7 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         real->int_inj_by_vec[(uint8_t)v]++;
+        svm_note_injected(real, (uint8_t)v); /* #456 */
     }
     /* Keep the window armed if more vectors remain; disarm once drained. */
     hype_svm_sync_vintr(real);

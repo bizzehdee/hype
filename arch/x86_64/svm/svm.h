@@ -568,6 +568,17 @@ void hype_svm_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector,
 void hype_svm_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector);
 
 /*
+ * #456: pop one vector that hype has staged into EVENTINJ since the last call, or return 0
+ * once none remain. The caller uses this to mark the guest's emulated LAPIC ISR at the moment
+ * of commitment. Marking at REQUEST time is wrong in both directions: a request that is
+ * deferred (or cancelled) leaves an ISR bit for a vector the guest never took, and a vector
+ * drained out of pending_irr after the guest EOI'd an earlier delivery is committed with no
+ * request of its own, so its ISR bit is missing. FreeBSD derives the vector it dispatches from
+ * `bsr` over the ISR dword, so either error hands it the wrong vector.
+ */
+int hype_svm_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector);
+
+/*
  * INT-2: handles an EXITCODE_VINTR VM-exit -- disarms the window
  * request (hype_svm_disarm_vintr_request(),
  * ~HYPE_SVM_INTERCEPT_VINTR) and, if a vector is still pending from an

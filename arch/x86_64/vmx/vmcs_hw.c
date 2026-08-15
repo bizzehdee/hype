@@ -277,6 +277,10 @@ struct hype_vcpu_ctx {
      * interrupt would be lost. Now a 256-bit IRR, matching the SVM ctx.
      */
     uint32_t pending_irr[8];
+    /* #456: vectors staged into VM_ENTRY_INTR_INFO since the caller last drained this.
+     * Mirrors the SVM ctx's field of the same name -- see svm.h on why the guest's
+     * emulated LAPIC ISR must be marked at injection time, not at request time. */
+    uint32_t inj_notify[8];
     /* M4-6b1: the guest's pvclock shared page, if it enabled one. */
     const hype_gpa_map_t *pvclock_map;
     /* #251: last value the guest wrote to each pvclock MSR, so a RDMSR reads back
@@ -377,6 +381,7 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
     unsigned i;
     for (i = 0; i < 8u; i++) {
         ctx->pending_irr[i] = 0;
+        ctx->inj_notify[i] = 0; /* #456 */
     }
     ctx->pvclock_map = 0;
     /* A slot reused by a later guest must not inherit a prior guest's armed
@@ -2690,6 +2695,32 @@ unsigned long long hype_vmx_vcpu_get_eventinj_collisions(void) {
     return g_vmx_int_collision;
 }
 
+/* #456: see svm_note_injected -- the VMX mirror. */
+static void vmx_note_injected(struct hype_vcpu_ctx *real, uint8_t vector) {
+    real->inj_notify[vector >> 5] |= (uint32_t)1u << (vector & 31u);
+}
+
+int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    unsigned word;
+
+    for (word = 0; word < 8u; word++) {
+        uint32_t bits = real->inj_notify[word];
+        unsigned bit;
+        if (bits == 0u) {
+            continue;
+        }
+        for (bit = 0; bit < 32u; bit++) {
+            if ((bits & ((uint32_t)1u << bit)) != 0u) {
+                real->inj_notify[word] &= ~((uint32_t)1u << bit);
+                *out_vector = (uint8_t)(word * 32u + bit);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int staged = vmx_entry_event_staged();
@@ -2709,6 +2740,7 @@ void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
         if (v >= 0) {
             hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
             vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
+            vmx_note_injected(real, (uint8_t)v); /* #456 */
             g_vmx_int_eventinj++;
         }
     } else {
@@ -2751,6 +2783,7 @@ int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
     }
     hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
     vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
+    vmx_note_injected(real, (uint8_t)v); /* #456 */
     g_vmx_int_window++; /* drained from the queue once the guest could accept it */
     vmx_set_intr_window(hype_svm_irr_any(real->pending_irr) ? 1 : 0);
     return 1;
@@ -2769,6 +2802,7 @@ void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx) {
     if (v >= 0 && !vmx_entry_event_staged()) {
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
         vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
+        vmx_note_injected(real, (uint8_t)v); /* #456 */
     }
     /* VMX-4: stay armed if more vectors are queued -- disarming unconditionally
      * here would strand every vector after the first. */

@@ -194,6 +194,9 @@ void hype_vmx_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector, int 
 /* #455: VMX-side mirror of hype_svm_vcpu_cancel_pending_vector -- see that
  * declaration for the full reasoning. */
 void hype_vmx_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector);
+
+/* #456: the VMX mirror of hype_svm_vcpu_take_injected_vector. */
+int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector);
 void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
 void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out);
 int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);

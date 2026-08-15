@@ -2752,7 +2752,8 @@ static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, 
 static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                   hype_guest_lapic_t *lapic, uint8_t vector);
 static int vmm_reason_is_intr_window(hype_vmm_kind_t kind, uint64_t reason);
-static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx);
+static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                   hype_guest_lapic_t *lapic);
 
 /*
  * M3-5: builds the synthetic bzImage (real setup_header validated
@@ -4058,6 +4059,33 @@ static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, 
     hype_svm_vcpu_set_cs_ss_selectors(ctx, cs, ss);
 }
 /*
+ * #456: mark the guest's emulated LAPIC ISR for every vector the backend has just committed to
+ * EVENTINJ / VM_ENTRY_INTR_INFO. Call after ANY entry point that can inject.
+ *
+ * This used to be done in vmm_request_interrupt below, at request time, which is wrong in both
+ * directions: a request that is deferred into pending_irr (or later cancelled -- #455) left an
+ * ISR bit for a vector the guest never took, and a vector drained back out of pending_irr after
+ * the guest had EOI'd an earlier delivery of it was committed with no fresh request, so its ISR
+ * bit was missing. FreeBSD's apic_isr stub takes `bsr` over the ISR dword to decide WHICH vector
+ * it is servicing, so either error hands it a wrong vector: a stale PIC-range bit made it call
+ * lapic_handle_intr(0x21), which indexes la_ioint_irqs[0x21 - 48] with the 32-bit wrap of a
+ * negative index and page-faults 16 GB up the direct map.
+ */
+static void vmm_sync_lapic_isr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                               hype_guest_lapic_t *lapic) {
+    uint8_t vector;
+    int (*take)(hype_vcpu_ctx_t *, uint8_t *) =
+        (kind == HYPE_VMM_KIND_VMX) ? hype_vmx_vcpu_take_injected_vector
+                                    : hype_svm_vcpu_take_injected_vector;
+
+    while (take(ctx, &vector)) {
+        if (lapic != 0) {
+            hype_guest_lapic_accept_vector(lapic, vector);
+        }
+    }
+}
+
+/*
  * #311: `lapic` may be 0 for the M2/VMX microtests, which run a bare guest with no LAPIC model
  * at all. Every live-guest caller must pass one -- a guest that reads the ISR to find out what
  * it is servicing (FreeBSD does; see devices/guest_lapic.h) sees nothing otherwise, and
@@ -4065,25 +4093,25 @@ static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, 
  */
 static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                   hype_guest_lapic_t *lapic, uint8_t vector) {
-    if (lapic != 0) {
-        hype_guest_lapic_accept_vector(lapic, vector);
-    }
     if (kind == HYPE_VMM_KIND_VMX) {
         hype_vmx_vcpu_request_interrupt(ctx, vector);
     } else {
         hype_svm_vcpu_request_interrupt(ctx, vector);
     }
+    vmm_sync_lapic_isr(kind, ctx, lapic);
 }
 static int vmm_reason_is_intr_window(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_INTERRUPT_WINDOW)
                                      : (reason == HYPE_SVM_EXITCODE_VINTR);
 }
-static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                   hype_guest_lapic_t *lapic) {
     if (kind == HYPE_VMM_KIND_VMX) {
         hype_vmx_vcpu_handle_intr_window(ctx);
     } else {
         hype_svm_vcpu_handle_vintr_window(ctx);
     }
+    vmm_sync_lapic_isr(kind, ctx, lapic); /* #456 */
 }
 
 /*
@@ -4219,9 +4247,12 @@ static void vmm_get_intr_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
         hype_svm_vcpu_get_intr_state(ctx, out);
     }
 }
-static int vmm_deliver_pending_if_ready(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
-    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_deliver_pending_if_ready(ctx)
-                                     : hype_svm_vcpu_deliver_pending_if_ready(ctx);
+static int vmm_deliver_pending_if_ready(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                        hype_guest_lapic_t *lapic) {
+    int injected = kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_deliver_pending_if_ready(ctx)
+                                             : hype_svm_vcpu_deliver_pending_if_ready(ctx);
+    vmm_sync_lapic_isr(kind, ctx, lapic); /* #456 */
+    return injected;
 }
 static void vmm_set_hv_enabled(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, int enabled) {
     if (kind == HYPE_VMM_KIND_VMX) {
@@ -4900,7 +4931,7 @@ static void run_int_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         }
 
         if (vmm_reason_is_intr_window(kind, info.reason)) {
-            vmm_handle_intr_window(kind, ctx);
+            vmm_handle_intr_window(kind, ctx, 0);
             continue;
         }
 
@@ -5117,7 +5148,7 @@ static void run_input_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
 
             if (vmm_reason_is_intr_window(kind, info.reason)) {
-                vmm_handle_intr_window(kind, ctx);
+                vmm_handle_intr_window(kind, ctx, 0);
                 continue;
             }
 
@@ -5404,7 +5435,7 @@ static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
 
             if (vmm_reason_is_intr_window(kind, info.reason)) {
-                vmm_handle_intr_window(kind, ctx);
+                vmm_handle_intr_window(kind, ctx, 0);
                 continue;
             }
 
@@ -13005,7 +13036,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * injected, skip acknowledging a new one this iteration so the
          * freshly-staged EVENTINJ isn't clobbered. */
         vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic);
-        if (!vmm_deliver_pending_if_ready(kind, ctx) &&
+        if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic) &&
             g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
             uint8_t pic_vector;
             if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
@@ -13553,7 +13584,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * pending timer IRQ (INT-2). */
             g_436_loop_section[(unsigned)(vm-g_vms)]=782;
             vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic); /* #455 */
-            vmm_handle_intr_window(kind, ctx);
+            vmm_handle_intr_window(kind, ctx, &g_fw_1_lapic);
             continue;
         }
 
@@ -14861,7 +14892,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (if_set && (is.pending_valid || pic_ready)) {
                     vmm_wake_hlt(kind, ctx); /* retire HLT + clear STI shadow */
                     vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic); /* #455 */
-                    if (!vmm_deliver_pending_if_ready(kind, ctx) &&
+                    if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic) &&
                         g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
                         uint8_t v;
                         if (hype_pic_emu_acknowledge(&g_fw_1_pic, &v)) {
