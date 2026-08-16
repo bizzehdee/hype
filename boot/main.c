@@ -11224,6 +11224,19 @@ static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t
      * Same conversion the BSP uses: TSC delta -> PIT-rate ticks -> HYPE_GUEST_LAPIC_HZ, each
      * with a fractional accumulator so the base rate is exact regardless of loop granularity.
      */
+    /*
+     * #484: whether this AP currently holds the shared-device lock.
+     *
+     * SMP-7 had the AP take that lock on EVERY exit, matching the BSP's "hold it whenever
+     * outside the guest" rule. Measured, that cost the AP 97.3% of its wall time blocked, with
+     * single waits up to 3.6 s -- because the BSP holds the same lock across multi-millisecond
+     * host ATAPI reads. Seconds of frozen guest CPU is what Linux reported as an RCU stall.
+     *
+     * The lock exists to serialise SHARED device models. RDTSC, HLT, CPUID, MSR and exception
+     * exits touch none of them -- and they dominate this loop -- so the lock is now taken only
+     * for the exits that can actually reach a shared device: nested page faults and port I/O.
+     */
+    int ap_locked = 0;
     uint64_t ap_tsc_last = hype_rdtsc();
     uint64_t ap_tb_accum = 0;
     uint64_t ap_lt_accum = 0;
@@ -11288,6 +11301,7 @@ wait_for_sipi:
     vmm_set_exception_intercepts(kind, ctx, (1u << 6));
     hype_debug_print("fw-1 vm%u vCPU %u: SIPI received, entering guest [#190]\n", vm_idx, vi);
     fw_1_dev_lock(vm); /* SMP-7: enter the loop in the "outside the guest" state */
+    ap_locked = 1;
 
     for (;;) {
         /*
@@ -11300,20 +11314,29 @@ wait_for_sipi:
             hype_debug_print("fw-1 vm%u vCPU %u: INIT -- parking [#190]\n", vm_idx, vi);
             /* Drop the shared-device lock BEFORE parking. Waiting for a SIPI while holding it
              * would block the BSP that is trying to send one -- a deadlock, not a slowdown. */
-            fw_1_dev_unlock(vm);
+            if (ap_locked) {
+                fw_1_dev_unlock(vm);
+                ap_locked = 0;
+            }
             goto wait_for_sipi;
         }
-        fw_1_dev_unlock(vm); /* SMP-7: never hold the shared-device lock inside the guest */
+        if (ap_locked) { /* SMP-7: never hold the shared-device lock inside the guest */
+            fw_1_dev_unlock(vm);
+            ap_locked = 0;
+        }
         if (ops->vcpu_run(ctx, &info) != 0) {
             fw_1_dev_lock(vm);
+            ap_locked = 1;
             hype_debug_print("fw-1 vm%u vCPU %u: vcpu_run failed -- stopping this vCPU "
                              "[#190]\n", vm_idx, vi);
             break;
         }
-        {
+        /* #484: only the exits that can reach a shared device model take the lock. */
+        if (vmm_reason_is_npf(kind, info.reason) || vmm_reason_is_ioio(kind, info.reason)) {
             uint64_t lk0 = hype_rdtsc();
             uint64_t lkd;
             fw_1_dev_lock(vm);
+            ap_locked = 1;
             lkd = hype_rdtsc() - lk0;
             g_ap_devlock_wait[vm_idx][vi] += lkd;
             if (lkd > g_ap_devlock_max[vm_idx][vi]) {
@@ -12028,7 +12051,10 @@ wait_for_sipi:
         }
         (void)vmm_deliver_pending_if_ready(kind, ctx, lapic);
     }
-    fw_1_dev_unlock(vm);
+    if (ap_locked) { /* #484: only unlock if this AP actually holds it */
+        fw_1_dev_unlock(vm);
+        ap_locked = 0;
+    }
     vm->vcpu_parked[vi] = 1u;
     g_ap_vcpu_live[vm_idx][vi] = 0u;
 }
