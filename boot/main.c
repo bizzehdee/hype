@@ -11095,6 +11095,7 @@ static uint64_t g_ap_vcpu_last_reason[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint64_t g_ap_vcpu_last_rip[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static unsigned long long g_ap_vcpu_unhandled[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static unsigned g_ap_vcpu_excp_dumped[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static int g_ap_mpdata_sample;
 
 static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t *ops,
                              hype_vmm_kind_t kind) {
@@ -11178,19 +11179,28 @@ wait_for_sipi:
          * the first exit because OVMF reclaims this page later and a dump at the fault reads
          * zeros.
          */
-        if (g_ap_vcpu_exits[vm_idx][vi] == 1ull || g_ap_vcpu_exits[vm_idx][vi] == 2000ull) {
+        {
+            unsigned long long e = g_ap_vcpu_exits[vm_idx][vi];
+            g_ap_mpdata_sample = (e == 1ull || e == 5ull || e == 20ull || e == 60ull ||
+                                  e == 150ull || e == 400ull || e == 1000ull || e == 2500ull);
+        }
+        if (g_ap_mpdata_sample) {
             const uint8_t *xi = fw_1_guest_phys_to_host(vm, 0x9f000ull);
             if (xi != 0) {
-                uint64_t naps = 0, aidx = 0;
+                uint64_t naps = 0, aidx = 0, iflag = 0;
                 unsigned b;
                 for (b = 0; b < 8u; b++) {
                     naps |= (uint64_t)xi[0x58u + b] << (8u * b);
                     aidx |= (uint64_t)xi[0x60u + b] << (8u * b);
+                    iflag |= (uint64_t)xi[0xACu + b] << (8u * b);
                 }
-                hype_debug_print("fw-1 APVCPU vm%u/%u MPDATA: NumApsExecuting=%llu ApIndex=%llu "
-                                 "(exit %llu, reason 0x%llx) [#190]\n", vm_idx, vi,
-                                 (unsigned long long)naps, (unsigned long long)aidx,
-                                 g_ap_vcpu_exits[vm_idx][vi],
+                /* InitFlag (0xAC) says WHICH round the AP is in: 1 = ApInitConfig, which is
+                 * the only round that touches these counters, 2 = ApExecute, which skips
+                 * straight to GetApicId. Without it a zero counter is unreadable. */
+                hype_debug_print("fw-1 APVCPU vm%u/%u MPDATA: InitFlag=%llu NumApsExecuting=%llu "
+                                 "ApIndex=%llu (exit %llu, reason 0x%llx) [#190]\n", vm_idx, vi,
+                                 (unsigned long long)iflag, (unsigned long long)naps,
+                                 (unsigned long long)aidx, g_ap_vcpu_exits[vm_idx][vi],
                                  (unsigned long long)info.reason);
             }
         }
