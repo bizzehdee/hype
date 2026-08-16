@@ -188,6 +188,17 @@ live design doc.
   both a dedicated `cpu_set` and the shared pool, and distrusting
   `isolation_group`s may never occupy one physical core simultaneously
   (default is one group per VM, so configuring nothing is the strict case).
+- **A hardware thread is the unit of execution; a physical core is the unit
+  of allocation** (plan.md §10 decision 40). A granted core is granted
+  whole, so every SMT sibling thread of it may run a vCPU: a dedicated VM
+  given one 2-thread core gets two vCPUs, and a two-core shared pool
+  dispatches on all four threads. Never idle a sibling thread to satisfy an
+  isolation rule and never disable SMT for the pool — the rule forbids two
+  *distrusting* owners on one core at the same time, which core-granular
+  allocation already delivers. If (package, core, thread) cannot be proven
+  for this host, fall back to treating every logical processor as its own
+  single-threaded core; wasting threads is safe, pairing distrusting owners
+  by accident is not.
 - **Guest RAM is zeroed before first execution**, on every (re)start,
   including after Force power off — never reused as-is.
 - **No guest gets direct hardware access.** Physical disk/NIC access is

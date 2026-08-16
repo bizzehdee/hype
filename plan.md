@@ -142,6 +142,14 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
       startup (§6i).
     - **Shared** — a pool of cores that several vCPUs are time-sliced onto,
       so a host can run more vCPUs than it has cores. A VM opts in per-VM.
+  On both tiers the unit of **execution** is a hardware thread and the unit
+  of **allocation** is a physical core (§10 decision 40). A core is granted
+  whole: every SMT sibling thread of a granted core may run a vCPU. A
+  dedicated VM given one 2-thread core therefore gets two vCPUs, and a
+  two-core shared pool dispatches on all four of its threads. A sibling
+  thread is never left idle to satisfy an isolation rule; what the isolation
+  rule forbids is two *distrusting* owners occupying one physical core at the
+  same time (§6g).
   Fault isolation (§6g) is preserved on both tiers, but by different
   mechanisms: by construction on the dedicated tier, and by **mandatory
   preemption** on the shared one. That difference is the whole substance of
@@ -181,9 +189,12 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
   tiny parser — no libc) enumerates guest definitions:
   ```
   [vm.win11]
-  vcpus = 4
-  cpu_set = 4-7             ; explicit host core subset to pin to (optional;
-                            ; auto-assigned from whatever's free if omitted)
+  vcpus = 4                 ; hardware threads, not physical cores
+                            ; (§10 decision 40)
+  cpu_set = 4-7             ; explicit host PHYSICAL core subset to pin to
+                            ; (optional; auto-assigned from whatever's free if
+                            ; omitted). A core is granted whole, so on an SMT
+                            ; host two listed cores supply four vCPUs
   cpu_mode = dedicated      ; dedicated | shared (§3, §10 decision 39).
                             ; default dedicated = today's exclusive 1:1 pinning
   isolation_group = payroll ; VMs naming the same group may share cores and SMT
@@ -664,6 +675,16 @@ hypervisor itself:
   one VM already share a core in the SMP case and mutually-trusting VMs are
   the same situation. A VM that must never share a core with anyone uses the
   dedicated tier. See §10 decision 39.
+- **SMT siblings are not the hazard; distrusting co-residency is.** The rule
+  above forbids two distrusting owners on one physical core *at the same
+  time*. It does not forbid using sibling threads. Within one owner — one
+  dedicated VM, or one trust group in the pool — every thread of a granted
+  core is dispatchable, with no restriction and no flush. The enforcement is
+  therefore **core-granular allocation**, not disabling SMT: a core is
+  handed to one owner whole, and is drained and flushed (L1D + IBPB) before
+  it is handed to another. Disabling SMT for the pool would idle half the
+  machine even when every pool VM is in one trust group, which no isolation
+  requirement asks for. See §10 decision 40.
 - **What still needs building**: a per-vCPU **watchdog** in the VM-exit
   dispatch loop that detects a guest that's actually gone wrong (not just
   busy) — repeated unhandled/unrecognized VM-exit reasons, a triple fault,
@@ -714,15 +735,24 @@ actual host resources and refuse to start any VM that would overcommit them
   need to be reduced or disabled, rather than starting some VMs and running
   out of memory later during arbitrary guest operation.
 - Same principle for CPU, but the rule is now **per tier** (§3):
-  every **dedicated**-tier vCPU needs a core of its own, so the sum of
-  dedicated `vcpus` may not exceed the cores available to them. **Shared**-
-  tier vCPUs are deliberately over-committed onto a pool, so a core count is
-  not the limit there; what is checked instead is that the shared pool is
-  non-empty whenever any shared VM is configured, and that over-commit stays
-  within a configured maximum ratio.
-- **Explicit `cpu_set` validation**: for any VM specifying `cpu_set`, confirm
-  every listed core actually exists on this host and — for the dedicated
-  tier — that the count matches `vcpus`. Overlap rules follow the tier:
+  every **dedicated**-tier vCPU needs a hardware thread of its own, so the
+  sum of dedicated `vcpus` may not exceed the *threads* of the cores
+  available to them — not the core count, since a granted core supplies all
+  of its threads (§10 decision 40). **Shared**-tier vCPUs are deliberately
+  over-committed onto a pool, so a thread count is not the limit there; what
+  is checked instead is that the shared pool is non-empty whenever any
+  shared VM is configured, and that over-commit stays within a configured
+  maximum ratio.
+- **Explicit `cpu_set` validation**: `cpu_set` names **physical cores**, and
+  each listed core is granted whole. For any VM specifying `cpu_set`,
+  confirm every listed core actually exists on this host and — for the
+  dedicated tier — that `vcpus` does not exceed the total hardware threads
+  of the listed cores. (Before SMT was accounted for, the check was
+  `cpu_set` entry count == `vcpus`; that is the same rule only on a
+  non-SMT host.) A `vcpus` lower than the available thread count is legal
+  and leaves the surplus threads of those cores idle, because the core is
+  still owned exclusively; admission reports it rather than silently
+  accepting a half-used core. Overlap rules follow the tier:
     - Two **dedicated** VMs' `cpu_set` ranges must not overlap. Refused
       outright (not just warned about), exactly as before: exclusive pinning
       is what §6g's by-construction argument relies on.
@@ -1065,9 +1095,10 @@ isn't lost.
     non-goal (§1).
 14. **Startup admission control — decided: required, not best-effort**
     (§6i). Total configured `mem_mb` and `vcpus` across all VMs in
-    `hype.cfg` are checked against actual physical RAM and core count at
-    hypervisor startup; any VM that would overcommit either is refused with
-    a clear diagnostic rather than allowed to start and fail later.
+    `hype.cfg` are checked against actual physical RAM and hardware-thread
+    count at hypervisor startup (thread, not core — decision 40); any VM
+    that would overcommit either is refused with a clear diagnostic rather
+    than allowed to start and fail later.
 15. **Guest RAM zeroing on boot — decided: required, on every (re)start.**
     Every page of a VM's reserved guest RAM is zeroed immediately before
     that VM's first instruction executes (§2, §6f) — including restarts
@@ -1933,6 +1964,63 @@ isn't lost.
     doing it later would mean re-opening §6g a second time.
 
     Delivered by #466–#478.
+
+40. **SMT siblings — decided: allocate whole physical cores, execute on every
+    thread (2026-08-16).** Recorded because decision 39 left the unit of
+    execution undefined, #473 offered "SMT off for the pool" as an option,
+    and today's code silently discards every sibling thread.
+
+    **The rule, in three parts.**
+    - The unit of **execution** is a hardware thread. Every thread hype has
+      been given may run a vCPU.
+    - The unit of **allocation and exclusion** is a physical core. A core,
+      with all of its threads, is owned by exactly one owner at a time: one
+      dedicated VM, or one `isolation_group` in the shared pool.
+    - Within one owner there is no restriction and no flush. Across owners,
+      no two may occupy threads of one physical core at the same time; a
+      core is drained of the outgoing owner and flushed (L1D + IBPB, SMP-18)
+      before the incoming owner enters.
+
+    **What this settles.** A dedicated VM given one 2-thread core gets two
+    vCPUs, not one. A two-core shared pool dispatches on four threads, not
+    two. A single VM is trivially one trust group, so its own vCPUs may
+    always occupy sibling threads — that is the ordinary guest-SMP case and
+    needs no special permission.
+
+    **Rejected: running the shared pool with SMT disabled** (the alternative
+    #473 offered). It idles half the machine unconditionally, including in
+    the common deployment where every pool VM is in one trust group and no
+    isolation rule is engaged. Core-granular allocation gives the identical
+    security property — no distrusting co-residency on a core — and costs
+    threads only in the configuration that actually needs it.
+
+    **Rejected: thread-granular allocation across trust groups** (letting
+    distrusting groups take sibling threads of one core). That is exactly
+    the L1TF/MDS exposure §6g calls the genuinely weakened axis, and no
+    flush can mitigate it, because the two owners execute *concurrently*
+    rather than in turns. If an operator ever wants it, it must arrive as an
+    explicit opt-in key with the risk stated, not as a default.
+
+    **The cost, stated plainly.** The pool's allocation quantum is a whole
+    core. G mutually-distrusting groups therefore need G cores concurrently
+    resident, whatever each group's vCPU count. In the worst case — many
+    single-vCPU distrusting groups — the pool behaves exactly as if SMT were
+    off, and `C × (T − 1)` threads sit idle. That is the honest price of the
+    isolation the operator asked for, and the operator's lever is
+    `isolation_group`: naming one group for mutually-trusting VMs restores
+    full thread density. The idle-thread count must be reported (SMP-21),
+    never hidden, so a config paying this price is visible.
+
+    **Fallback when siblings cannot be identified.** Sibling detection needs
+    a trustworthy (package, core, thread) map. #378 already found firmware
+    reporting every `EFI_CPU_PHYSICAL_LOCATION` as zero, repaired from CPUID
+    leaf 0x0B/0x1F (Intel) and 0x8000001E (AMD), and refuses unproven
+    isolation when neither source works. The same gate applies here: if
+    siblings cannot be proven, hype treats every logical processor as a
+    single-threaded core. That is the conservative direction — it wastes
+    threads, it never pairs distrusting owners by accident.
+
+    Delivered by #479 plus scope amendments on #186, #190, #472, #473, #477.
 
 ## 11. Pre-M0 readiness checklist
 
