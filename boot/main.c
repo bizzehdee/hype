@@ -5019,10 +5019,52 @@ static void fw_1_deliver_device_vector(hype_fw_vm_t *vm, hype_vmm_kind_t kind, u
     (void)kind;
 }
 
+/*
+ * #484: how long the shared-device lock is HELD, and where it was released.
+ *
+ * The AP's wait side is already measured; it showed a 0.37 s worst case with the BSP's section
+ * marker reading 2, which is the top of its loop rather than any device branch. That narrows the
+ * culprit to the BSP's periodic housekeeping but does not name it. Timing the hold and recording
+ * the section at RELEASE does: whatever section is stamped when the longest hold ends is the code
+ * that ran while the other vCPU's guest was frozen.
+ */
+static uint64_t g_devlock_held_tsc[HYPE_FW_MAX_VMS];
+static uint64_t g_devlock_hold_max[HYPE_FW_MAX_VMS];
+static unsigned g_devlock_hold_max_sec[HYPE_FW_MAX_VMS];
+static uint64_t g_devlock_hold_total[HYPE_FW_MAX_VMS];
+/* #484: the BSP's loop body split in two, both measured under the device lock. "Housekeeping"
+ * is everything from re-acquiring the lock after VMRUN up to the exit-dispatch chain; the rest
+ * is dispatch. held_tot/span already says the lock is held ~97% of wall time, so which half of
+ * the body that is decides what to fix. */
+static uint64_t g_bsp_house_tsc[HYPE_FW_MAX_VMS];
+static uint64_t g_bsp_house_max[HYPE_FW_MAX_VMS];
+static uint64_t g_bsp_lock_tsc[HYPE_FW_MAX_VMS];
+
 static void fw_1_dev_lock(hype_fw_vm_t *vm) {
     hype_ticket_lock_acquire(&vm->dev_lock_next, &vm->dev_lock_owner);
+    g_devlock_held_tsc[(unsigned)(vm - g_vms)] = hype_rdtsc();
 }
 static void fw_1_dev_unlock(hype_fw_vm_t *vm) {
+    unsigned vi_ = (unsigned)(vm - g_vms);
+    uint64_t t0 = g_devlock_held_tsc[vi_];
+    /*
+     * #484: consume the timestamp, so a hold is counted exactly once.
+     *
+     * The first cut left it set, and hype calls fw_1_dev_unlock() on paths that did not
+     * acquire -- so a stale t0 was re-measured on each of them and the total came out at 1.24e12
+     * TSC against a 2.9e11 wall-clock span, i.e. the lock was "held" 3.5x longer than the run
+     * lasted. An impossible number is at least self-announcing; a merely inflated one would have
+     * been believed. The AP-side lockwait and the housekeeping window were unaffected.
+     */
+    if (t0 != 0ull) {
+        uint64_t held = hype_rdtsc() - t0;
+        g_devlock_held_tsc[vi_] = 0ull;
+        g_devlock_hold_total[vi_] += held;
+        if (held > g_devlock_hold_max[vi_]) {
+            g_devlock_hold_max[vi_] = held;
+            g_devlock_hold_max_sec[vi_] = g_436_loop_section[vi_];
+        }
+    }
     hype_ticket_lock_release(&vm->dev_lock_owner);
 }
 
@@ -5052,6 +5094,11 @@ static uint64_t g_ap_lapic_tsc_span[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
  * the run, the lock is the stall. */
 static uint64_t g_ap_devlock_wait[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint64_t g_ap_devlock_max[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+/* #484: the BSP's loop-section marker sampled at the START of the AP's longest wait for the
+ * shared-device lock. The AP still loses 38.9% of its life to that lock with single waits of
+ * 0.29 s, and "which code holds it that long" is not guessable -- #436 already stamps the BSP's
+ * position into g_436_loop_section, so record the value that was live while the AP was stuck. */
+static unsigned g_ap_devlock_max_section[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 
 /*
@@ -11331,16 +11378,37 @@ wait_for_sipi:
                              "[#190]\n", vm_idx, vi);
             break;
         }
-        /* #484: only the exits that can reach a shared device model take the lock. */
-        if (vmm_reason_is_npf(kind, info.reason) || vmm_reason_is_ioio(kind, info.reason)) {
+        /*
+         * #484: only the exits that can reach a SHARED device model take the lock.
+         *
+         * Refined once measured: taking it for every NPF was still far too broad. This vCPU's
+         * own LAPIC is per-vCPU state -- nothing else touches it -- and a guest hits it on
+         * essentially every interrupt (EOI, TPR, ICR), so those faults dominated the AP's
+         * acquisitions while needing no serialisation whatsoever. The fault address is read
+         * straight from the VMCB, which needs no lock either.
+         */
+        {
+            int ap_needs_lock = 0;
+            if (vmm_reason_is_ioio(kind, info.reason)) {
+                ap_needs_lock = 1;
+            } else if (vmm_reason_is_npf(kind, info.reason)) {
+                hype_vmm_npf_t probe_npf;
+                vmm_get_last_npf(kind, ctx, &probe_npf);
+                ap_needs_lock = !(probe_npf.guest_phys_addr >= HYPE_LAPIC_DEFAULT_BASE &&
+                                  probe_npf.guest_phys_addr < HYPE_LAPIC_DEFAULT_BASE + 0x1000u);
+            }
+            if (ap_needs_lock) {
             uint64_t lk0 = hype_rdtsc();
             uint64_t lkd;
+            unsigned holder_section = g_436_loop_section[vm_idx];
             fw_1_dev_lock(vm);
             ap_locked = 1;
             lkd = hype_rdtsc() - lk0;
             g_ap_devlock_wait[vm_idx][vi] += lkd;
             if (lkd > g_ap_devlock_max[vm_idx][vi]) {
                 g_ap_devlock_max[vm_idx][vi] = lkd;
+                g_ap_devlock_max_section[vm_idx][vi] = holder_section;
+            }
             }
         }
         g_ap_vcpu_exits[vm_idx][vi]++;
@@ -12889,6 +12957,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
             }
             fw_1_dev_lock(vm);
+            g_bsp_lock_tsc[(unsigned)(vm - g_vms)] = hype_rdtsc(); /* #484 */
             {
                 uint64_t t_post = hype_rdtsc();
                 uint64_t this_vmrun = t_post - t_pre;
@@ -13346,7 +13415,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         hype_debug_print(
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
                             "last=0x%llx@0x%llx timer_irqs=%llu init=%u cur=%u lvt=0x%x "
-                            "ahci=%llu ecam=%llu lt=%llu span=%llu lockwait=%llu lockmax=%llu "
+                            "ahci=%llu ecam=%llu lt=%llu span=%llu lockwait=%llu lockmax=%llu lockmaxsec=%u | held_max=%llu held_tot=%llu house_tot=%llu house_max=%llu "
                             "[#190]\n", _vmi, _av,
                             (unsigned)g_ap_vcpu_live[_vmi][_av],
                             g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
@@ -13361,7 +13430,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             (unsigned long long)g_ap_lapic_ticks[_vmi][_av],
                             (unsigned long long)g_ap_lapic_tsc_span[_vmi][_av],
                             (unsigned long long)g_ap_devlock_wait[_vmi][_av],
-                            (unsigned long long)g_ap_devlock_max[_vmi][_av]);
+                            (unsigned long long)g_ap_devlock_max[_vmi][_av],
+                            g_ap_devlock_max_section[_vmi][_av],
+                            (unsigned long long)g_devlock_hold_max[_vmi],
+                            (unsigned long long)g_devlock_hold_total[_vmi],
+                            (unsigned long long)g_bsp_house_tsc[_vmi],
+                            (unsigned long long)g_bsp_house_max[_vmi]);
                     /*
                      * SMP-6: dump the AP's dispatch record ONCE on the normal path, not only
                      * at a fault. The DEBUG guest firmware names its modules but does not
@@ -14181,7 +14255,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
         }
 
+        g_436_loop_section[(unsigned)(vm - g_vms)] = 23; /* #484 */
         fw_1_phase_checkpoint(vm, HYPE_FW_PHASE_DIAG);
+        g_436_loop_section[(unsigned)(vm - g_vms)] = 2;
 
         /* RT-2a: the periodic in-loop \hype-log.txt flush is retired. This
          * loop now runs post-ExitBootServices, where Boot-Services file I/O
@@ -14199,13 +14275,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 uint64_t now_u = hype_rdtsc();
                 uint64_t usb_interval = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_fw_1_host_tsc_hz;
                 if (usblog_last_tsc == 0 || now_u - usblog_last_tsc >= usb_interval) {
+                    unsigned sec_prev = g_436_loop_section[(unsigned)(vm - g_vms)];
                     usblog_last_tsc = now_u;
+                    /* #484: distinct marker so a long lock hold can be attributed to the USB
+                     * log flush rather than to "somewhere in the BSP's housekeeping". */
+                    g_436_loop_section[(unsigned)(vm - g_vms)] = 21;
                     usb_log_flush(); /* no-op when no USB sink is open */
+                    g_436_loop_section[(unsigned)(vm - g_vms)] = sec_prev;
                 }
             }
         }
 
+        /* #484: the varstore persist writes hundreds of KB to a host volume. Marked so a long
+         * hold shows up as this rather than as the loop-top default. */
+        g_436_loop_section[(unsigned)(vm - g_vms)] = 22;
         fw_1_phase_checkpoint(vm, HYPE_FW_PHASE_PERSIST);
+        g_436_loop_section[(unsigned)(vm - g_vms)] = 2;
 
         /* M4-6b1: advance the guest PIT + LAPIC timer by the number of
          * 1.193182 MHz ticks that really elapsed since the last exit
@@ -15057,6 +15142,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * to an injected keystroke. RT-2c: skip on host-tick (INTR) exits --
          * the guest wrote nothing, so draining an empty UART FIFO twice per
          * host tick (~55% of all exits) is pure waste. */
+        {   /* #484: close the housekeeping window -- the dispatch chain starts here. */
+            unsigned vh_ = (unsigned)(vm - g_vms);
+            if (g_bsp_lock_tsc[vh_] != 0ull) {
+                uint64_t h_ = hype_rdtsc() - g_bsp_lock_tsc[vh_];
+                g_bsp_house_tsc[vh_] += h_;
+                if (h_ > g_bsp_house_max[vh_]) {
+                    g_bsp_house_max[vh_] = h_;
+                }
+                g_bsp_lock_tsc[vh_] = 0ull;
+            }
+        }
         g_436_loop_section[(unsigned)(vm-g_vms)]=5;
         if (!vmm_reason_is_intr(kind, info.reason)) {
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line,
