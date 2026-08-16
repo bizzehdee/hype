@@ -5,6 +5,7 @@
 #include "../core/gop_mode.h"
 #include "../core/mtrr.h"
 #include "../core/gop_text.h"
+#include "../core/ticket_lock.h"
 #include "../core/vt_screen.h"
 #include "../core/vt_render.h"
 #include "../core/dashboard.h"
@@ -811,6 +812,22 @@ typedef struct hype_fw_vm {
      * The BSP waits for this before touching a vCPU another core may be running.
      */
     volatile uint8_t vcpu_parked[HYPE_MAX_VCPUS_PER_VM];
+    /*
+     * SMP-7 (#191): serialises this VM's SHARED emulated state -- the UART, PIC, PIT, CMOS,
+     * IO-APIC, PCI, the disk models -- between its vCPUs, which now run on different cores.
+     *
+     * Held by a core whenever it is OUTSIDE the guest, and released across vcpu_run. That
+     * shape is deliberate: the BSP's exit handling is thousands of lines with `continue` from
+     * dozens of places, and acquiring at the top of each handler would be a lock-leak waiting
+     * to happen. Bracketing the guest entry instead is balanced by construction -- every path
+     * out of the handling returns to vcpu_run.
+     *
+     * #343 is why this exists at all: two cores driving one host-I/O path handed guests corrupt
+     * bytes, and that was with per-port structures. Two vCPUs sharing ONE device model is the
+     * same failure with fewer moving parts.
+     */
+    volatile unsigned dev_lock_next;
+    volatile unsigned dev_lock_owner;
     /*
      * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what
      * its guest is told. 1 until SMT-aware core allocation lands (#479, #190) -- and honestly
@@ -4931,6 +4948,14 @@ static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint6
     } else {
         hype_svm_vcpu_reset_realmode(ctx, guest_rip, guest_rsp, table_root);
     }
+}
+
+/* SMP-7 (#191): this VM's shared-device lock. See hype_fw_vm_t.dev_lock_next. */
+static void fw_1_dev_lock(hype_fw_vm_t *vm) {
+    hype_ticket_lock_acquire(&vm->dev_lock_next, &vm->dev_lock_owner);
+}
+static void fw_1_dev_unlock(hype_fw_vm_t *vm) {
+    hype_ticket_lock_release(&vm->dev_lock_owner);
 }
 
 /* SMP-6: set by an AP vCPU loop while it owns its vCPU; read by the BSP's INIT/SIPI path. */
@@ -11089,6 +11114,7 @@ wait_for_sipi:
     }
     vm->vcpu_parked[vi] = 0u;
     hype_debug_print("fw-1 vm%u vCPU %u: SIPI received, entering guest [#190]\n", vm_idx, vi);
+    fw_1_dev_lock(vm); /* SMP-7: enter the loop in the "outside the guest" state */
 
     for (;;) {
         /*
@@ -11099,13 +11125,19 @@ wait_for_sipi:
          */
         if (*(volatile uint8_t *)&vm->vcpu_state[vi] != HYPE_VCPU_STATE_RUNNABLE) {
             hype_debug_print("fw-1 vm%u vCPU %u: INIT -- parking [#190]\n", vm_idx, vi);
+            /* Drop the shared-device lock BEFORE parking. Waiting for a SIPI while holding it
+             * would block the BSP that is trying to send one -- a deadlock, not a slowdown. */
+            fw_1_dev_unlock(vm);
             goto wait_for_sipi;
         }
+        fw_1_dev_unlock(vm); /* SMP-7: never hold the shared-device lock inside the guest */
         if (ops->vcpu_run(ctx, &info) != 0) {
+            fw_1_dev_lock(vm);
             hype_debug_print("fw-1 vm%u vCPU %u: vcpu_run failed -- stopping this vCPU "
                              "[#190]\n", vm_idx, vi);
             break;
         }
+        fw_1_dev_lock(vm);
         g_ap_vcpu_exits[vm_idx][vi]++;
         g_ap_vcpu_last_reason[vm_idx][vi] = info.reason;
         g_ap_vcpu_last_rip[vm_idx][vi] = info.guest_rip;
@@ -11126,6 +11158,41 @@ wait_for_sipi:
                                      "shared device state -- refused, see SMP-7 [#190]\n",
                                      vm_idx, vi, (unsigned long long)info.qualification,
                                      (unsigned long long)info.guest_rip);
+                }
+                g_ap_vcpu_unhandled[vm_idx][vi]++;
+            }
+        } else if (vmm_reason_is_ioio(kind, info.reason)) {
+            /*
+             * SMP-7 (#191): shared-device port I/O, safe now because this core holds the VM's
+             * device lock whenever it is outside the guest.
+             *
+             * Measured need: OVMF's AP writes COM1's line-control register (0x3FB) during its
+             * startup, so without the UART an AP cannot get past its own serial init. The set
+             * here is what an AP actually touches -- the two UARTs, the PIC/PIT, and the
+             * fw_cfg/debug ports it may share -- rather than a copy of the BSP's entire IOIO
+             * chain, which also drives media streaming and the disk models that belong to the
+             * BSP alone.
+             */
+            if (vmm_handle_uart_ioio(kind, ctx, &vm->uart, HYPE_SERIAL_COM1) == 0) {
+                /* handled */
+            } else if (vmm_handle_uart_ioio(kind, ctx, &vm->uart2, HYPE_SERIAL_COM2) == 0) {
+                /* handled */
+            } else if (vmm_handle_ioio(kind, ctx, &vm->pic, &vm->pit) == 0) {
+                /* handled */
+            } else {
+                /*
+                 * Absorb an unmodelled port -- vmm_handle_unknown_ioio retires the instruction
+                 * with a benign all-ones read, the same treatment the BSP gives it. Spinning
+                 * on it forever is strictly worse, and the count says it happened. Port 0x80
+                 * alone (Linux's io_delay) would otherwise flood the log, so the report is
+                 * bounded rather than per-access.
+                 */
+                hype_vmm_ioio_t io_ap;
+                vmm_handle_unknown_ioio(kind, ctx, &io_ap);
+                if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
+                    hype_debug_print("fw-1 vm%u vCPU %u: unmodelled port 0x%x %s -- absorbed "
+                                     "[#191]\n", vm_idx, vi, (unsigned)io_ap.port,
+                                     io_ap.is_in ? "in" : "out");
                 }
                 g_ap_vcpu_unhandled[vm_idx][vi]++;
             }
@@ -11156,7 +11223,7 @@ wait_for_sipi:
                           vec == 14u || vec == 17u || vec == 21u);
             /* SMP-6: dump the AP's own state on its first few faults. "Reinjected and it
              * faulted again" is not diagnosable without knowing what mode it is in. */
-            if (g_ap_vcpu_excp_dumped[vm_idx][vi] < 3u) {
+            if (g_ap_vcpu_excp_dumped[vm_idx][vi] < 12u) {
                 hype_svm_debug_state_t d;
                 g_ap_vcpu_excp_dumped[vm_idx][vi]++;
                 if (vmm_get_debug_state(kind, ctx, &d)) {
@@ -11171,6 +11238,45 @@ wait_for_sipi:
                     /* Paging is off (CR0.PG clear) and CS.base is 0, so the linear address IS
                      * the guest-physical one -- read the bytes directly and say what faulted
                      * rather than guessing at it. */
+                    if ((d.cr0 & 0x80000000ull) != 0ull) {
+                        /* Paging on: the RIP is a guest VIRTUAL address, so walk the guest's
+                         * own page tables rather than treating it as physical. */
+                        uint8_t ib[16];
+                        int got = (fw_1_read_guest_va(vm, d.cr3, d.cs_base + d.rip, ib,
+                                                      sizeof(ib)) == 0);
+                        if (!got && kind == HYPE_VMM_KIND_SVM) {
+                            /* The VMCB's decode assist: the bytes hardware itself fetched.
+                             * Authoritative when present, and it needs no page walk -- QEMU's
+                             * nested SVM may leave it empty, hence the physical fallback below. */
+                            uint8_t nb = 0;
+                            const uint8_t *hw = hype_svm_vcpu_guest_insn_bytes(ctx, &nb);
+                            if (hw != 0 && nb >= 4u) {
+                                unsigned q;
+                                for (q = 0; q < sizeof(ib) && q < nb; q++) ib[q] = hw[q];
+                                got = 3;
+                            }
+                        }
+                        if (!got) {
+                            /* Last resort: OVMF identity-maps much of its low memory. Marked
+                             * "phys" in the output because it can be the WRONG mapping -- it
+                             * returned page-table bytes for an address that was really
+                             * elsewhere, which is worth seeing rather than trusting. */
+                            const uint8_t *ph = fw_1_guest_phys_to_host(vm, d.cs_base + d.rip);
+                            if (ph != 0) {
+                                unsigned q;
+                                for (q = 0; q < sizeof(ib); q++) ib[q] = ph[q];
+                                got = 2;
+                            }
+                        }
+                        if (got) {
+                            hype_debug_print("fw-1 APVCPU vm%u/%u INSN(%s) @0x%llx: %02x %02x "
+                                             "%02x %02x %02x %02x %02x %02x %02x %02x [#190]\n",
+                                             vm_idx, vi, (got == 3) ? "vmcb" : ((got == 2) ? "phys" : "va"),
+                                             (unsigned long long)(d.cs_base + d.rip), ib[0],
+                                             ib[1], ib[2], ib[3], ib[4], ib[5], ib[6], ib[7],
+                                             ib[8], ib[9]);
+                        }
+                    }
                     if ((d.cr0 & 0x80000000ull) == 0ull) {
                         const uint8_t *pre = fw_1_guest_phys_to_host(vm, d.cs_base + d.rip - 16u);
                         if (pre != 0) {
@@ -11203,10 +11309,16 @@ wait_for_sipi:
                                    has_ec ? vmm_exception_error_code(kind, ctx, &info) : 0u);
         } else {
             if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
-                hype_debug_print("fw-1 vm%u vCPU %u: unhandled exit reason 0x%llx at rip "
-                                 "0x%llx [#190]\n", vm_idx, vi,
+                /* SVM EXITINFO1 for an IOIO exit carries the port in [31:16] and the
+                 * direction in bit 0 -- named here so an unhandled I/O says WHICH port, which
+                 * is the difference between "needs a lock" and "needs a device model". */
+                hype_debug_print("fw-1 vm%u vCPU %u: unhandled exit reason 0x%llx at rip 0x%llx "
+                                 "(qual=0x%llx port=0x%x %s) [#190]\n", vm_idx, vi,
                                  (unsigned long long)info.reason,
-                                 (unsigned long long)info.guest_rip);
+                                 (unsigned long long)info.guest_rip,
+                                 (unsigned long long)info.qualification,
+                                 (unsigned)((info.qualification >> 16) & 0xFFFFu),
+                                 (info.qualification & 1u) ? "in" : "out");
             }
             g_ap_vcpu_unhandled[vm_idx][vi]++;
         }
@@ -11227,6 +11339,7 @@ wait_for_sipi:
         }
         (void)vmm_deliver_pending_if_ready(kind, ctx, lapic);
     }
+    fw_1_dev_unlock(vm);
     vm->vcpu_parked[vi] = 1u;
     g_ap_vcpu_live[vm_idx][vi] = 0u;
 }
@@ -11825,6 +11938,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
     }
 
+    /* SMP-7 (#191): enter the loop in the "outside the guest" state -- the loop releases this
+     * across every guest entry and re-takes it on the way out. */
+    fw_1_dev_lock(vm);
+
     for (;;) {
         uint8_t timer_vector;
 
@@ -12048,9 +12165,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 g_ap_timer_reload[(unsigned)(vm - g_vms)]);
 #endif
 #endif
+            /* SMP-7 (#191): the shared-device lock is held everywhere OUTSIDE the guest and
+             * released across the entry, so every `continue` in the handling below is balanced
+             * by construction. See hype_fw_vm_t.dev_lock_next. */
+            fw_1_dev_unlock(vm);
             if (ops->vcpu_run(ctx, &info) != 0) {
+                fw_1_dev_lock(vm);
                 hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
             }
+            fw_1_dev_lock(vm);
             {
                 uint64_t t_post = hype_rdtsc();
                 uint64_t this_vmrun = t_post - t_pre;
