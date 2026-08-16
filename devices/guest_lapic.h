@@ -94,6 +94,35 @@
 #define HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF (0x1u << 18)
 #define HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL (0x2u << 18)
 #define HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_EXCL (0x3u << 18)
+/* SMP-4 (#188): the delivery modes AP bring-up uses. INIT resets a target vCPU into
+ * wait-for-SIPI; STARTUP hands it a real-mode entry at (vector << 12), i.e. CS = vector << 8,
+ * IP = 0. Both are ICR_LOW[10:8]. */
+#define HYPE_GUEST_LAPIC_ICR_DELMODE_SHIFT 8u
+#define HYPE_GUEST_LAPIC_ICR_DELMODE_FIXED 0u
+#define HYPE_GUEST_LAPIC_ICR_DELMODE_NMI 4u
+#define HYPE_GUEST_LAPIC_ICR_DELMODE_INIT 5u
+#define HYPE_GUEST_LAPIC_ICR_DELMODE_STARTUP 6u
+/* ICR_LOW[14] -- level. INIT de-assert is the (level=0, trigger=level) form older firmware
+ * still emits after an INIT assert; it must not be mistaken for a second reset. */
+#define HYPE_GUEST_LAPIC_ICR_LEVEL_ASSERT (1u << 14)
+
+/*
+ * SMP-4/SMP-5 (#188/#189): one IPI this LAPIC has SENT that something other than itself has to
+ * act on -- INIT and STARTUP always, and a fixed IPI whose destination includes another vCPU.
+ *
+ * The LAPIC model is per-vCPU and deliberately knows nothing about its siblings: how many
+ * exist, and which host core each runs on, is the VM layer's business. So it decodes the ICR
+ * write and records what was asked for; the caller routes it. Keeping the decode here is what
+ * makes it unit-testable without a VM.
+ */
+typedef struct {
+    uint32_t delivery_mode; /* HYPE_GUEST_LAPIC_ICR_DELMODE_* */
+    uint32_t vector;        /* ICR_LOW[7:0]; the SIPI start page for STARTUP */
+    uint32_t dest_apic_id;  /* physical destination, or the logical mask when `logical` */
+    uint32_t shorthand;     /* HYPE_GUEST_LAPIC_ICR_SHORTHAND_* */
+    uint32_t logical;       /* nonzero when ICR_LOW[11] selected logical destination mode */
+    uint32_t level_assert;  /* ICR_LOW[14]; 0 on an INIT DE-assert */
+} hype_guest_lapic_ipi_t;
 
 /*
  * How many hype_guest_lapic_tick() calls (one per guest VM-exit in the
@@ -156,6 +185,11 @@ typedef struct {
     uint32_t ldr;
     uint32_t icr_low;  /* last ICR_LOW written (delivery status reads as idle) */
     uint32_t icr_high; /* destination field, bits 31:24 */
+    /* SMP-4 (#188): the outbound-IPI slot -- see hype_guest_lapic_take_ipi. */
+    hype_guest_lapic_ipi_t ipi_out;
+    int ipi_out_valid;
+    uint64_t ipi_out_dropped; /* overwritten before the caller drained: a bug signal, not noise */
+    uint64_t ipi_out_count;
     uint32_t self_ipi_pending[8]; /* 256-bit set of self-IPI vectors awaiting injection */
     uint64_t self_ipi_count;      /* GLADDER-6c diag: total self-IPIs accepted */
     uint32_t divide_config;
@@ -190,7 +224,18 @@ typedef struct {
 uint32_t hype_guest_lapic_divisor(uint32_t divide_config);
 
 /* Clears to a just-powered-on state (timer masked, no IRQ pending). */
+
 void hype_guest_lapic_reset(hype_guest_lapic_t *lapic);
+
+/*
+ * Pop the pending outbound IPI, if any. Returns 1 and fills `out`, or 0.
+ *
+ * One slot, not a queue: every ICR_LOW write is an MMIO write that takes a VM exit, and the
+ * dispatch loop drains here on the same exit, so a second cannot be written before the first
+ * is taken. `ipi_out_dropped` counts any that were, so the assumption is measured rather than
+ * trusted -- a nonzero count means the drain site is wrong, and says so.
+ */
+int hype_guest_lapic_take_ipi(hype_guest_lapic_t *lapic, hype_guest_lapic_ipi_t *out);
 
 /* SMP-3 (#187): set this LAPIC's APIC ID. Called once per vCPU after reset; the ID must match
  * what the MADT and CPUID report for the same vCPU or the guest logs an APIC ID mismatch. */

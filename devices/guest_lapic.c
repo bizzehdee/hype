@@ -31,6 +31,44 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->timer_in_service = 0;
     lapic->eoi_count = 0;
     lapic->apic_id = 0; /* SMP-3: the BSP's ID; APs are set explicitly after reset */
+    /* SMP-4: no IPI in flight across a reset. */
+    lapic->ipi_out_valid = 0;
+    lapic->ipi_out_dropped = 0;
+    lapic->ipi_out_count = 0;
+}
+
+int hype_guest_lapic_take_ipi(hype_guest_lapic_t *lapic, hype_guest_lapic_ipi_t *out) {
+    if (lapic == 0 || !lapic->ipi_out_valid) {
+        return 0;
+    }
+    if (out != 0) {
+        /* Field by field: whole-struct assignment emits a memcpy, which does not link on the
+         * freestanding UEFI target. */
+        out->delivery_mode = lapic->ipi_out.delivery_mode;
+        out->vector = lapic->ipi_out.vector;
+        out->dest_apic_id = lapic->ipi_out.dest_apic_id;
+        out->shorthand = lapic->ipi_out.shorthand;
+        out->logical = lapic->ipi_out.logical;
+        out->level_assert = lapic->ipi_out.level_assert;
+    }
+    lapic->ipi_out_valid = 0;
+    return 1;
+}
+
+/* SMP-4 (#188): latch an IPI for the VM layer to route. See hype_guest_lapic_take_ipi. */
+static void lapic_post_ipi(hype_guest_lapic_t *lapic, uint32_t icr_low, uint32_t dest) {
+    if (lapic->ipi_out_valid) {
+        lapic->ipi_out_dropped++;
+    }
+    lapic->ipi_out.delivery_mode =
+        (icr_low & HYPE_GUEST_LAPIC_ICR_DELMODE_MASK) >> HYPE_GUEST_LAPIC_ICR_DELMODE_SHIFT;
+    lapic->ipi_out.vector = icr_low & HYPE_GUEST_LAPIC_ICR_VECTOR_MASK;
+    lapic->ipi_out.dest_apic_id = dest;
+    lapic->ipi_out.shorthand = icr_low & HYPE_GUEST_LAPIC_ICR_SHORTHAND_MASK;
+    lapic->ipi_out.logical = (icr_low & HYPE_GUEST_LAPIC_ICR_DESTMODE_LOGICAL) != 0u;
+    lapic->ipi_out.level_assert = (icr_low & HYPE_GUEST_LAPIC_ICR_LEVEL_ASSERT) != 0u;
+    lapic->ipi_out_valid = 1;
+    lapic->ipi_out_count++;
 }
 
 void hype_guest_lapic_set_apic_id(hype_guest_lapic_t *lapic, uint32_t apic_id) {
@@ -197,39 +235,66 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
             lapic->icr_high = value;
             return 0;
         case HYPE_GUEST_LAPIC_REG_ICR_LOW: {
-            /* Writing ICR_LOW latches and sends. Only FIXED delivery aimed at
-             * this (the only) CPU is deliverable; everything else -- INIT/SIPI/
-             * NMI, or a fixed IPI addressed to a nonexistent CPU -- is dropped.
-             * Vectors 0-15 are illegal for fixed delivery, so they are dropped
-             * too rather than pended into the IRR. */
+            /*
+             * Writing ICR_LOW latches and sends.
+             *
+             * Two destinations, decided independently: SELF, which is pended straight into
+             * this LAPIC's own self-IPI set (the #103 path -- kernels >= 6.16 need the LAPIC
+             * self-IPI for SRCU's irq_work), and OTHERS, which is latched for the VM layer
+             * because this model knows nothing about its siblings.
+             *
+             * SMP-4 (#188): "others" used to be unconditionally dropped -- correct while a VM
+             * had one vCPU, and the reason AP bring-up could not even be expressed. INIT and
+             * STARTUP are always outbound (a CPU never INITs itself), and a fixed IPI can be
+             * aimed at either or both.
+             */
+            uint32_t delmode =
+                (value & HYPE_GUEST_LAPIC_ICR_DELMODE_MASK) >> HYPE_GUEST_LAPIC_ICR_DELMODE_SHIFT;
+            uint32_t shorthand = value & HYPE_GUEST_LAPIC_ICR_SHORTHAND_MASK;
+            uint32_t dest = lapic->icr_high >> 24;
+            uint32_t self_id = lapic->apic_id & 0xFFu;
             int to_self = 0;
+            int to_others = 0;
+
             lapic->icr_low = value;
-            if ((value & HYPE_GUEST_LAPIC_ICR_DELMODE_MASK) == 0) {
-                switch (value & HYPE_GUEST_LAPIC_ICR_SHORTHAND_MASK) {
-                    case HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF:
-                    case HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL:
-                        to_self = 1;
-                        break;
-                    case HYPE_GUEST_LAPIC_ICR_SHORTHAND_NONE: {
-                        uint32_t dest = lapic->icr_high >> 24;
-                        if ((value & HYPE_GUEST_LAPIC_ICR_DESTMODE_LOGICAL) != 0) {
-                            to_self = (dest & (lapic->ldr >> 24)) != 0;
-                        } else {
-                            /* Physical: our APIC ID is 0; 0xFF broadcasts. */
-                            to_self = (dest == 0u) || (dest == 0xFFu);
-                        }
-                        break;
+
+            switch (shorthand) {
+                case HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF:
+                    to_self = 1;
+                    break;
+                case HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL:
+                    to_self = 1;
+                    to_others = 1;
+                    break;
+                case HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_EXCL:
+                    to_others = 1;
+                    break;
+                default: /* no shorthand: the destination field decides */
+                    if ((value & HYPE_GUEST_LAPIC_ICR_DESTMODE_LOGICAL) != 0) {
+                        to_self = (dest & (lapic->ldr >> 24)) != 0;
+                        /* A logical mask may name others too; the VM layer resolves it
+                         * against every vCPU's LDR, which is knowledge this model lacks. */
+                        to_others = 1;
+                    } else {
+                        to_self = (dest == self_id) || (dest == 0xFFu);
+                        to_others = (dest != self_id) || (dest == 0xFFu);
                     }
-                    default: /* all-excluding-self: no other CPUs exist */
-                        break;
-                }
+                    break;
             }
-            if (to_self) {
+
+            /* Only FIXED delivery is self-deliverable here, and vectors 0-15 are illegal for
+             * it -- dropped rather than pended into the IRR. INIT/SIPI/NMI to self are not
+             * modelled: nothing in this project's guests does it. */
+            if (to_self && delmode == HYPE_GUEST_LAPIC_ICR_DELMODE_FIXED) {
                 uint32_t vector = value & HYPE_GUEST_LAPIC_ICR_VECTOR_MASK;
                 if (vector >= 16u) {
                     lapic->self_ipi_pending[vector >> 5] |= 1u << (vector & 31u);
                     lapic->self_ipi_count++;
                 }
+            }
+            if (to_others || delmode == HYPE_GUEST_LAPIC_ICR_DELMODE_INIT ||
+                delmode == HYPE_GUEST_LAPIC_ICR_DELMODE_STARTUP) {
+                lapic_post_ipi(lapic, value, dest);
             }
             return 0;
         }

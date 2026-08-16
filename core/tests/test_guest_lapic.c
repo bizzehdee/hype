@@ -754,7 +754,117 @@ static void test_two_lapics_are_independent(void) {
     CHECK_HEX("and they report different IDs", 1u << 24, v);
 }
 
+/* ---- SMP-4 (#188): ICR decode for AP bring-up ---- */
+
+static void icr_write(hype_guest_lapic_t *l, uint32_t dest, uint32_t icr_low) {
+    hype_guest_lapic_write(l, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4u, dest << 24);
+    hype_guest_lapic_write(l, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4u, icr_low);
+}
+
+static void test_init_and_sipi_are_latched_for_the_vm_layer(void) {
+    /* The bring-up sequence a BSP actually writes: INIT assert, INIT de-assert, then two
+     * SIPIs. Every one must reach the VM layer -- they used to be dropped outright. */
+    hype_guest_lapic_t l;
+    hype_guest_lapic_ipi_t ipi;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_id(&l, 0u);
+
+    icr_write(&l, 1u, (HYPE_GUEST_LAPIC_ICR_DELMODE_INIT << 8) |
+                          HYPE_GUEST_LAPIC_ICR_LEVEL_ASSERT);
+    CHECK_HEX("INIT assert is latched", 1u, (unsigned)hype_guest_lapic_take_ipi(&l, &ipi));
+    CHECK_HEX("  mode INIT", HYPE_GUEST_LAPIC_ICR_DELMODE_INIT, ipi.delivery_mode);
+    CHECK_HEX("  dest 1", 1u, ipi.dest_apic_id);
+    CHECK_HEX("  level asserted", 1u, ipi.level_assert);
+
+    icr_write(&l, 1u, (HYPE_GUEST_LAPIC_ICR_DELMODE_INIT << 8));
+    CHECK_HEX("INIT de-assert is latched too", 1u, (unsigned)hype_guest_lapic_take_ipi(&l, &ipi));
+    CHECK_HEX("  and is distinguishable by level=0", 0u, ipi.level_assert);
+
+    icr_write(&l, 1u, (HYPE_GUEST_LAPIC_ICR_DELMODE_STARTUP << 8) | 0x9Au);
+    CHECK_HEX("SIPI is latched", 1u, (unsigned)hype_guest_lapic_take_ipi(&l, &ipi));
+    CHECK_HEX("  mode STARTUP", HYPE_GUEST_LAPIC_ICR_DELMODE_STARTUP, ipi.delivery_mode);
+    CHECK_HEX("  vector carries the start page", 0x9Au, ipi.vector);
+
+    CHECK_HEX("nothing left once drained", 0u, (unsigned)hype_guest_lapic_take_ipi(&l, &ipi));
+    CHECK_HEX("and nothing was dropped", 0u, (unsigned)l.ipi_out_dropped);
+}
+
+static void test_self_ipi_still_works_and_is_not_double_routed(void) {
+    /* #103: a fixed self-IPI must still land in the self set (kernels >= 6.16 need it for
+     * SRCU). It must NOT also be latched as outbound, or the vector arrives twice. */
+    hype_guest_lapic_t l;
+    hype_guest_lapic_ipi_t ipi;
+    uint8_t v = 0;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_id(&l, 0u);
+    icr_write(&l, 0u, HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF | 0xF6u);
+    CHECK_HEX("self-IPI pended locally", 1u, (unsigned)hype_guest_lapic_take_self_ipi(&l, &v));
+    CHECK_HEX("  correct vector", 0xF6u, v);
+    CHECK_HEX("self-IPI is not also latched outbound", 0u,
+              (unsigned)hype_guest_lapic_take_ipi(&l, &ipi));
+}
+
+static void test_fixed_ipi_to_another_cpu_goes_outbound_only(void) {
+    hype_guest_lapic_t l;
+    hype_guest_lapic_ipi_t ipi;
+    uint8_t v = 0;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_id(&l, 0u);
+    icr_write(&l, 2u, 0x40u); /* fixed, physical, to APIC 2 */
+    CHECK_HEX("outbound to another cpu", 1u, (unsigned)hype_guest_lapic_take_ipi(&l, &ipi));
+    CHECK_HEX("  dest 2", 2u, ipi.dest_apic_id);
+    CHECK_HEX("  not self-pended", 0u, (unsigned)hype_guest_lapic_take_self_ipi(&l, &v));
+}
+
+static void test_broadcast_reaches_self_and_others(void) {
+    hype_guest_lapic_t l;
+    hype_guest_lapic_ipi_t ipi;
+    uint8_t v = 0;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_id(&l, 0u);
+    icr_write(&l, 0xFFu, 0x41u); /* fixed, physical broadcast */
+    CHECK_HEX("broadcast self-pends", 1u, (unsigned)hype_guest_lapic_take_self_ipi(&l, &v));
+    CHECK_HEX("broadcast also goes outbound", 1u, (unsigned)hype_guest_lapic_take_ipi(&l, &ipi));
+}
+
+static void test_all_excluding_self_never_self_pends(void) {
+    hype_guest_lapic_t l;
+    hype_guest_lapic_ipi_t ipi;
+    uint8_t v = 0;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_id(&l, 1u);
+    icr_write(&l, 0u, HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_EXCL | 0x42u);
+    CHECK_HEX("all-excluding-self does not self-pend", 0u,
+              (unsigned)hype_guest_lapic_take_self_ipi(&l, &v));
+    CHECK_HEX("but does go outbound", 1u, (unsigned)hype_guest_lapic_take_ipi(&l, &ipi));
+    CHECK_HEX("  shorthand preserved", (unsigned)HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_EXCL,
+              ipi.shorthand);
+}
+
+static void test_an_undrained_slot_is_counted_not_hidden(void) {
+    /* One slot is only safe because the caller drains on the same exit. If that ever stops
+     * being true the count says so, rather than an IPI vanishing. */
+    hype_guest_lapic_t l;
+
+    hype_guest_lapic_reset(&l);
+    icr_write(&l, 1u, (HYPE_GUEST_LAPIC_ICR_DELMODE_INIT << 8) |
+                          HYPE_GUEST_LAPIC_ICR_LEVEL_ASSERT);
+    icr_write(&l, 1u, (HYPE_GUEST_LAPIC_ICR_DELMODE_STARTUP << 8) | 0x8u);
+    CHECK_HEX("the overwritten IPI is counted", 1u, (unsigned)l.ipi_out_dropped);
+}
+
 int main(void) {
+    test_init_and_sipi_are_latched_for_the_vm_layer();
+    test_self_ipi_still_works_and_is_not_double_routed();
+    test_fixed_ipi_to_another_cpu_goes_outbound_only();
+    test_broadcast_reaches_self_and_others();
+    test_all_excluding_self_never_self_pends();
+    test_an_undrained_slot_is_counted_not_hidden();
     test_apic_id_defaults_to_zero_and_reads_in_the_right_bits();
     test_apic_id_is_read_only_to_the_guest();
     test_two_lapics_are_independent();

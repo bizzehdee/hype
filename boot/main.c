@@ -571,6 +571,10 @@ static unsigned long long *g_script_fed;
  */
 #define HYPE_MAX_VCPUS_PER_VM 8u
 
+/* SMP-4 (#188): a vCPU's architectural run state -- see hype_fw_vm_t.vcpu_state. */
+#define HYPE_VCPU_STATE_WAIT_SIPI 0u /* the AP reset state: only INIT/STARTUP are accepted */
+#define HYPE_VCPU_STATE_RUNNABLE 1u  /* started, or the BSP, which never waits */
+
 /*
  * #329: how many guest disks one VM can carry. The bound is the interrupt budget, not memory:
  * each attached disk consumes one device number on bus 0 (hype's PCI model is
@@ -791,6 +795,13 @@ typedef struct hype_fw_vm {
      */
     unsigned vcpu_count;
     /*
+     * SMP-4 (#188): each vCPU's architectural run state. An x86 AP leaves reset in
+     * wait-for-SIPI and ignores everything except INIT and STARTUP until its BSP sends one;
+     * the BSP is runnable from power-on. Kept per-vCPU here rather than in the backend ctx
+     * because it is guest-architectural state, not VMCB/VMCS state.
+     */
+    uint8_t vcpu_state[HYPE_MAX_VCPUS_PER_VM];
+    /*
      * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what
      * its guest is told. 1 until SMT-aware core allocation lands (#479, #190) -- and honestly
      * so, since today a granted core supplies exactly one dispatchable thread.
@@ -962,6 +973,8 @@ static void fw_1_reset_all_lapics(hype_fw_vm_t *vmp) {
     for (i = 0; i < n; i++) {
         hype_guest_lapic_reset(&vmp->lapic[i]);
         hype_guest_lapic_set_apic_id(&vmp->lapic[i], i);
+        /* SMP-4: the BSP runs from power-on; every AP waits for its BSP's SIPI. */
+        vmp->vcpu_state[i] = (i == 0u) ? HYPE_VCPU_STATE_RUNNABLE : HYPE_VCPU_STATE_WAIT_SIPI;
     }
     vmp->cur_vcpu = 0u; /* the BSP is what resumes after a reset */
 }
@@ -975,14 +988,22 @@ static void fw_1_reset_all_lapics(hype_fw_vm_t *vmp) {
  * the flash window, i.e. still in SEC/PEI, at 95% CPU with no console output at all. The same
  * VM with the same two vCPU contexts boots to a login prompt when it is told 1. Firmware's MP
  * init sends INIT-SIPI-SIPI and waits for each AP to check in; hype creates AP contexts but
- * cannot yet start them (SMP-4), so the AP never answers.
+ * cannot yet DISPATCH them on a host core (SMP-6), so the AP never answers. SMP-4 landed the
+ * INIT/SIPI decode -- a SIPI does now transition the target vCPU to runnable and set its
+ * real-mode entry -- but a runnable vCPU that nothing executes still leaves firmware
+ * waiting.
  *
  * Advertising hardware that cannot be started is the same defect class as #436's phantom PCI
  * buses and the MCFG bus range: describe a machine hype does not implement and the guest
  * hangs looking for the missing part. So the advertised count follows what hype can actually
- * run, and SMP-4 is what raises HYPE_SMP_STARTABLE_VCPUS.
+ * run, and SMP-6 is what raises HYPE_SMP_STARTABLE_VCPUS.
  */
+/* #ifndef-guarded so -DHYPE_SMP_STARTABLE_VCPUS=N on the build line wins, the same knob shape
+ * HYPE_FW_1_GUEST_RAM_MB and HYPE_SELFTEST_LIMIT use. That is how SMP-4's INIT/SIPI path was
+ * exercised before SMP-6 could dispatch the AP it starts. */
+#ifndef HYPE_SMP_STARTABLE_VCPUS
 #define HYPE_SMP_STARTABLE_VCPUS 1u
+#endif
 
 static unsigned fw_1_guest_visible_vcpus(const hype_fw_vm_t *vmp) {
     unsigned n = vmp->vcpu_count ? vmp->vcpu_count : 1u;
@@ -4697,6 +4718,20 @@ static uint32_t vmm_exception_error_code(hype_vmm_kind_t kind, hype_vcpu_ctx_t *
                                      : (uint32_t)info->qualification;
 }
 
+/*
+ * SMP-4 (#188): route one IPI a guest vCPU sent, taken from its LAPIC's outbound slot.
+ *
+ * This is AP bring-up: a guest BSP writes INIT then STARTUP to its own ICR, addressed at
+ * another vCPU's APIC ID, and expects that vCPU to begin executing at (vector << 12) in real
+ * mode. Before SMP-3 gave each vCPU its own LAPIC and SMP-4 its own run state, neither the
+ * target nor the transition could be expressed, so every such write was dropped.
+ *
+ * Returns the number of vCPUs the IPI acted on, for the diagnostics.
+ */
+static unsigned fw_1_route_ipi(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
+                               const hype_guest_lapic_ipi_t *ipi, uint64_t npt_root,
+                               uint64_t stack_top);
+
 static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t guest_rip,
                                uint64_t guest_rsp, uint64_t table_root) {
     if (kind == HYPE_VMM_KIND_VMX) {
@@ -4705,6 +4740,120 @@ static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint6
         hype_svm_vcpu_reset_realmode(ctx, guest_rip, guest_rsp, table_root);
     }
 }
+
+/*
+ * SMP-4 (#188): the router declared above. Defined here, after vmm_reset_realmode and
+ * vmm_set_topology, which it calls.
+ */
+static unsigned fw_1_route_ipi(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
+                               const hype_guest_lapic_ipi_t *ipi, uint64_t npt_root,
+                               uint64_t stack_top) {
+    unsigned target;
+    unsigned acted = 0;
+    unsigned n = vm->vcpu_count ? vm->vcpu_count : 1u;
+
+    if (n > HYPE_MAX_VCPUS_PER_VM) {
+        n = HYPE_MAX_VCPUS_PER_VM;
+    }
+
+    for (target = 0; target < n; target++) {
+        int selected;
+
+        if (target == vm->cur_vcpu) {
+            /* Self is handled by the LAPIC's own self-IPI path, except for the shorthands
+             * that explicitly exclude the sender. */
+            if (ipi->shorthand != HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL) {
+                continue;
+            }
+        }
+        switch (ipi->shorthand) {
+            case HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL:
+            case HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_EXCL:
+                selected = 1;
+                break;
+            case HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF:
+                selected = 0; /* never reaches another vCPU */
+                break;
+            default:
+                if (ipi->logical) {
+                    /* Logical destination: match against that vCPU's own LDR, which only the
+                     * VM layer can see -- this is why the LAPIC model latches rather than
+                     * resolves. */
+                    selected = (ipi->dest_apic_id & (vm->lapic[target].ldr >> 24)) != 0u;
+                } else {
+                    selected = (ipi->dest_apic_id == 0xFFu) ||
+                               (ipi->dest_apic_id == (vm->lapic[target].apic_id & 0xFFu));
+                }
+                break;
+        }
+        if (!selected) {
+            continue;
+        }
+
+        switch (ipi->delivery_mode) {
+            case HYPE_GUEST_LAPIC_ICR_DELMODE_INIT:
+                /*
+                 * INIT puts the target back into wait-for-SIPI. The DE-assert form (level 0)
+                 * is the second half of the classic assert/de-assert pair older firmware
+                 * still emits; it must NOT be treated as a second reset, or a BSP that sends
+                 * both would undo the SIPI it is about to send.
+                 */
+                if (!ipi->level_assert) {
+                    acted++;
+                    break;
+                }
+                if (target != 0u) {
+                    vm->vcpu_state[target] = HYPE_VCPU_STATE_WAIT_SIPI;
+                    hype_guest_lapic_reset(&vm->lapic[target]);
+                    hype_guest_lapic_set_apic_id(&vm->lapic[target], target);
+                    acted++;
+                }
+                break;
+
+            case HYPE_GUEST_LAPIC_ICR_DELMODE_STARTUP:
+                /*
+                 * STARTUP hands the target a real-mode entry at vector << 12 -- CS.base =
+                 * vector << 12 with IP 0, which is exactly what the real-mode VMCB/VMCS
+                 * builder produces from an entry-physical address.
+                 *
+                 * A SIPI to an already-running vCPU is IGNORED, per the SDM. That is not a
+                 * nicety: firmware and Linux both send TWO SIPIs as insurance against the
+                 * first being lost, and acting on the second would reset a CPU that had
+                 * already started.
+                 */
+                if (target != 0u && vm->vcpu_state[target] == HYPE_VCPU_STATE_WAIT_SIPI) {
+                    if (vm->vcpu[target] != 0) {
+                        vmm_reset_realmode(kind, vm->vcpu[target],
+                                           (uint64_t)ipi->vector << 12, stack_top, npt_root);
+                        vmm_set_topology(kind, vm->vcpu[target], target,
+                                         fw_1_guest_visible_vcpus(vm),
+                                         vm->threads_per_core ? vm->threads_per_core : 1u);
+                    }
+                    vm->vcpu_state[target] = HYPE_VCPU_STATE_RUNNABLE;
+                    acted++;
+                    hype_debug_print("fw-1 vm%u: SIPI -> vCPU %u started at 0x%llx (real mode) "
+                                     "[#188]\n", (unsigned)(vm - g_vms), target,
+                                     (unsigned long long)((uint64_t)ipi->vector << 12));
+                }
+                break;
+
+            case HYPE_GUEST_LAPIC_ICR_DELMODE_FIXED:
+                /* SMP-5 (#189) delivers these to the target vCPU's pending set. Counted here
+                 * so the diagnostics show they are arriving before that lands. */
+                if (ipi->vector >= 16u) {
+                    hype_guest_lapic_accept_vector(&vm->lapic[target], (uint8_t)ipi->vector);
+                    acted++;
+                }
+                break;
+
+            default:
+                /* NMI and the rest: not modelled. Counted, never silently absorbed. */
+                break;
+        }
+    }
+    return acted;
+}
+
 /* ECAM / virtio-blk with caller-resolved instruction bytes -- the live-guest
  * flavour. Distinct from the microtest shims above, which pass a guest RIP for
  * the backend to dereference; FW-1's guest RAM is not identity-mapped, so the
@@ -10872,7 +11021,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     }
     if (vm->vcpu_count > 1u) {
         hype_debug_print("fw-1 vm%u: %u vCPU context(s) on one NPT/EPT root 0x%llx, %u "
-                         "thread(s)/core -- guest is told %u until AP bring-up (SMP-4); AP(s) "
+                         "thread(s)/core -- guest is told %u until AP dispatch (SMP-6); AP(s) "
                          "parked in wait-for-SIPI [#185 #186]\n",
                          (unsigned)(vm - g_vms), vm->vcpu_count,
                          (unsigned long long)npt_root_phys,
@@ -13039,6 +13188,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint8_t sipi_vector;
             while (hype_guest_lapic_take_self_ipi(&g_fw_1_lapic, &sipi_vector)) {
                 vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, sipi_vector);
+            }
+            /*
+             * SMP-4 (#188): and the IPIs this vCPU sent to OTHERS. Drained here, next to the
+             * self-IPI drain and on the same exit that produced them -- the LAPIC's outbound
+             * slot holds one, which is why the drain must not be deferred.
+             */
+            {
+                hype_guest_lapic_ipi_t ipi;
+                while (hype_guest_lapic_take_ipi(&g_fw_1_lapic, &ipi)) {
+                    (void)fw_1_route_ipi(vm, kind, &ipi, vm->used_root, stack_top);
+                }
             }
         }
         /* M4-6d2: raise the AHCI completion IRQ on the line the guest
