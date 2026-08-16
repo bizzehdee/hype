@@ -1173,10 +1173,35 @@ int hype_fat32_read_at(hype_fat32_wfile_t *f, uint64_t offset, void *out, unsign
  * old chain terminator (or the empty file), and put the handle back. Returns
  * 0 when the volume was fully restored, -1 when the undo itself failed --
  * the volume dirty flag is then left SET, honestly. */
+/* #464: count rollbacks that could not complete. Read by the diagnostics so a volume left
+ * needing repair is visible in the log rather than only in the next mount's failure. */
+static unsigned long long g_fat_rollback_failures;
+void hype_fat_write_note_rollback_failure(void) { g_fat_rollback_failures++; }
+unsigned long long hype_fat_write_rollback_failures(void) { return g_fat_rollback_failures; }
+
 static int growth_rollback(hype_fat32_wfile_t *f, uint32_t first_new, uint32_t old_tail,
                            uint64_t old_size) {
     hype_fat32_fs_t *fs = f->fs;
     int ok = 0;
+    /*
+     * #464: SHRINK THE DIRECTORY ENTRY BEFORE SHRINKING THE CHAIN.
+     *
+     * This used to free the new clusters first and restore f->size only in memory, never
+     * rewriting the entry. On the last call site that is reached AFTER flush_metadata() has
+     * already published the larger size to disk and then failed partway -- so the sequence was:
+     * entry says `end`, chain is cut back to `old_size`, entry never corrected. That leaves a
+     * directory entry whose size exceeds its cluster chain, which is exactly what Linux reports
+     * as "fat_bmap_cluster: request beyond EOF" before applying errors=remount-ro.
+     *
+     * Restoring the size on disk first means the entry never describes more data than the chain
+     * holds at any intermediate point, including across a power cut. The opposite ordering -- a
+     * chain longer than the entry -- is harmless: it is a few leaked clusters that fsck
+     * reclaims, and the file simply reads short.
+     */
+    f->size = old_size;
+    if (first_cluster_valid(f)) {
+        ok |= flush_metadata(f, 1, 0);
+    }
     if (first_new >= 2u) {
         ok |= free_chain(fs, first_new);
         if (old_tail >= 2u) {
@@ -1191,6 +1216,17 @@ static int growth_rollback(hype_fat32_wfile_t *f, uint32_t first_new, uint32_t o
     f->seek_cluster = (f->first_cluster >= 2u) ? f->first_cluster : 0u;
     fsinfo_flush(fs);
     if (ok == 0) ok |= volume_set_dirty(fs, 0);
+    if (ok != 0) {
+        /*
+         * #464: say so. Every call site discards this return with (void), which is defensible
+         * -- the write has already failed and there is nothing better to return -- but a
+         * rollback that ITSELF failed leaves the volume dirty and possibly inconsistent, and
+         * that is exactly the state the operator needs to know about: it is the difference
+         * between "this write did not happen" and "run fsck before trusting this volume".
+         * Silence here is how a stick that needs repairing looks identical to one that does not.
+         */
+        hype_fat_write_note_rollback_failure();
+    }
     return ok ? -1 : 0;
 }
 

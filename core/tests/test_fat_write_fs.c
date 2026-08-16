@@ -132,6 +132,58 @@ static void build_vol(void) {
 /* #374: full sectors within one cluster must reach the block backend as one
  * multi-sector transfer. The USB backend supports this directly; splitting
  * here made filesystem throughput pay one command latency per 512 bytes. */
+/*
+ * #464: the invariant that keeps a volume mountable -- a directory entry must never claim more
+ * bytes than its cluster chain holds, at ANY point, including after a failed growth.
+ *
+ * The operator's validation stick went read-only after every hardware run with Linux reporting
+ * "fat_bmap_cluster: request beyond EOF", which is precisely this invariant broken. The cause
+ * was growth_rollback() freeing the newly allocated clusters while leaving the on-disk entry at
+ * the larger size, so the entry outlived the chain that backed it.
+ */
+static void test_failed_growth_leaves_entry_within_chain(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    uint8_t data[1500];
+    unsigned int i;
+    uint32_t dsz, clus, walked;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    hype_fat32_fs_set_sync(&fs, vol_sync);
+    CHECK_HEX("create ok", 0, hype_fat32_create(&fs, "GROWFAIL.BIN", &f));
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+    CHECK_HEX("seed 600", 0, hype_fat32_append(&f, data, 600u));
+
+    /*
+     * Fail the DURABILITY BARRIER, not a data write. That is the path that corrupts:
+     * flush_metadata() writes the directory entry with the NEW size, then calls sync -- so a
+     * sync failure returns -1 with the larger size already on the medium, and the rollback then
+     * frees the clusters that size depended on. A failing data write aborts earlier, before the
+     * entry is ever published, and cannot reproduce this.
+     *
+     * The operator's stick has a real barrier (SCSI SYNCHRONIZE CACHE over USB), so this is the
+     * live configuration, not a synthetic one.
+     */
+    g_sync_countdown = 0;
+    CHECK("growing append reports failure", hype_fat32_append(&f, data, 900u) != 0);
+    g_sync_countdown = -1;
+
+    /* Read the invariant off the volume image, not from the in-memory file. */
+    {
+        const uint8_t *ent = g_vol + clba(2) * SECSZ + 0;
+        dsz = hype_fat_dirent_size(ent);
+        clus = hype_fat_dirent_cluster(ent);
+    }
+    walked = 0u;
+    while (clus >= 2u && clus < 0x0FFFFFF8u && walked < 128u) {
+        walked++;
+        clus = fat0(clus);
+    }
+    CHECK("chain terminates", walked < 128u);
+    CHECK_HEX("entry size fits the chain it claims", 1u, (unsigned)(dsz <= walked * SECSZ));
+}
+
 static void test_append_coalesces_contiguous_sectors(void) {
     hype_fat32_fs_t fs;
     hype_fat32_wfile_t f;
@@ -1679,6 +1731,7 @@ int main(void) {
     test_corrupt_and_boundary();
     test_more_edges();
     test_fault_sweep();
+    test_failed_growth_leaves_entry_within_chain(); /* #464 */
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;

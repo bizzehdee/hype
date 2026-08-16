@@ -99,6 +99,11 @@ int hype_fat32_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
  * directory-size commit only when an append extended the cluster chain. */
 void hype_fat32_fs_set_sync(hype_fat32_fs_t *fs, hype_blk_sync_fn sync);
 
+/* #464: how many growth rollbacks failed to complete. Non-zero means a volume was left dirty
+ * and should be fsck'd before its contents are trusted. */
+unsigned long long hype_fat_write_rollback_failures(void);
+void hype_fat_write_note_rollback_failure(void);
+
 /*
  * Creates the file named by `path` ('\\' or '/' separated; every directory on
  * the way must already exist), truncating it to empty if it already exists
