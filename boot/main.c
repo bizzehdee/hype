@@ -11339,7 +11339,19 @@ wait_for_sipi:
                         /*
                          * The caller loads its object pointer from [IDT base - 8] and that read
                          * returned 0, which is the whole fault: a null object yields a garbage
-                         * function table and the indirect call lands in page-table bytes. Dump
+                         * function table and the indirect call lands in page-table bytes.
+                         *
+                         * [IDT base - 8] is where PeiServicesTablePointerLibIdt keeps the PEI
+                         * Services table pointer. edk2 never populates it for the shared AP
+                         * IDT: MpLib.c ZeroMem()s the whole MP buffer and then copies only
+                         * `Idtr.Limit + 1` bytes starting AT the BSP's IDT base, so the 8
+                         * bytes before it are excluded -- unlike the pointer library's own
+                         * migration path, which deliberately copies from `Base - sizeof(UINTN)`
+                         * for `Limit + 1 + sizeof(UINTN)`. So an AP running on the shared AP
+                         * IDT can never call a PEI service, on any machine. Reaching this code
+                         * at all means the AP is executing something it must not.
+                         *
+                         * Dump
                          * the region PHYSICALLY (OVMF identity-maps it, and the physical read
                          * needs no page walk) to separate "genuinely zero" from "hype could not
                          * follow the AP's CR3" -- the two have completely different causes.
