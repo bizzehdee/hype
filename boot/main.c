@@ -5032,6 +5032,12 @@ static uint8_t g_ap_apdata_dumped[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
  * lapic_et_start), but whether the timer then FIRES is a separate question, and a guest whose
  * per-CPU event timer never fires cannot run its scheduler on that CPU. */
 static uint64_t g_ap_timer_injected[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+/* #482: how much shared-device work an AP actually serves. The ATAPI read stream freezes at
+ * 282 reads under 2 vCPUs against 3899 under 1, and #229 already established that host-backed
+ * guest I/O issued from an AP core is its own failure mode -- so whether the AP is serving the
+ * AHCI window at all, and how often, decides which of those this is. */
+static uint64_t g_ap_ahci_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_ap_ecam_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 
 /*
@@ -11378,6 +11384,7 @@ wait_for_sipi:
              */
             if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &vm->pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
                 ap_mmio_done = 1;
+                g_ap_ecam_serves[vm_idx][vi]++;
             } else if (kind == HYPE_VMM_KIND_SVM &&
                        hype_svm_vcpu_handle_hpet_npf(ctx, &vm->hpet, HYPE_HPET_MMIO_BASE,
                                                      insn) == 0) {
@@ -11412,6 +11419,7 @@ wait_for_sipi:
                                                 (uint64_t)vm->shared_ahci_abar,
                                                 &g_fw_1_dma_map, insn) == 0) {
                         ap_mmio_done = 1;
+                        g_ap_ahci_serves[vm_idx][vi]++;
                     }
                 }
             }
@@ -13250,6 +13258,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         hype_debug_print(
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
                             "last=0x%llx@0x%llx timer_irqs=%llu init=%u cur=%u lvt=0x%x "
+                            "ahci=%llu ecam=%llu "
                             "[#190]\n", _vmi, _av,
                             (unsigned)g_ap_vcpu_live[_vmi][_av],
                             g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
@@ -13258,7 +13267,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             (unsigned long long)g_ap_timer_injected[_vmi][_av],
                             (unsigned)vm->lapic[_av].init_count,
                             (unsigned)vm->lapic[_av].current_count,
-                            (unsigned)vm->lapic[_av].lvt_timer);
+                            (unsigned)vm->lapic[_av].lvt_timer,
+                            (unsigned long long)g_ap_ahci_serves[_vmi][_av],
+                            (unsigned long long)g_ap_ecam_serves[_vmi][_av]);
                     /*
                      * SMP-6: dump the AP's dispatch record ONCE on the normal path, not only
                      * at a fault. The DEBUG guest firmware names its modules but does not
