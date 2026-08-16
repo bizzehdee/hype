@@ -11291,6 +11291,35 @@ wait_for_sipi:
                                                      " %llx", (unsigned long long)v);
                             }
                             hype_debug_print("%s [#190]\n", line);
+                            /*
+                             * SMP-6: the CALLER. [rsp+8] is the return address of whatever
+                             * branched to a RIP inside data; disassembling the bytes just
+                             * before it names the instruction that did it, which no amount of
+                             * looking at the faulting address can.
+                             */
+                            {
+                                uint64_t ret = 0;
+                                unsigned b;
+                                for (b = 0; b < 8u; b++) {
+                                    ret |= (uint64_t)sp[8u + b] << (8u * b);
+                                }
+                                if (ret > 32u) {
+                                    const uint8_t *cb = fw_1_guest_phys_to_host(vm, ret - 24u);
+                                    if (cb != 0) {
+                                        char cl[190];
+                                        int co = hype_snprintf(cl, sizeof(cl),
+                                                               "fw-1 APVCPU vm%u/%u CALLER "
+                                                               "@0x%llx-24:", vm_idx, vi,
+                                                               (unsigned long long)ret);
+                                        for (b = 0; b < 32u; b++) {
+                                            co += hype_snprintf(cl + co,
+                                                                sizeof(cl) - (unsigned)co,
+                                                                " %02x", cb[b]);
+                                        }
+                                        hype_debug_print("%s [#190]\n", cl);
+                                    }
+                                }
+                            }
                         }
                     }
                     if ((d.cr0 & 0x80000000ull) != 0ull) {
