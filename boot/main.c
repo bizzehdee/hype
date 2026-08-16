@@ -5039,6 +5039,22 @@ static uint64_t g_devlock_hold_total[HYPE_FW_MAX_VMS];
 static uint64_t g_bsp_house_tsc[HYPE_FW_MAX_VMS];
 static uint64_t g_bsp_house_max[HYPE_FW_MAX_VMS];
 static uint64_t g_bsp_lock_tsc[HYPE_FW_MAX_VMS];
+/*
+ * #509: where the BSP's per-exit host time actually goes.
+ *
+ * Measured: ~302 us per exit, of which ~293 us is host code -- the guest executes about 3% of
+ * wall time. The housekeeping window accounts for only ~6%, so the rest is the dispatch chain,
+ * but "the dispatch chain" is 3000 lines. Timing it PER EXIT REASON says which handler is
+ * expensive rather than which is frequent, and those are not the same question: `intr` is 32%
+ * of exits and does almost nothing, while an AHCI fault is rare and reaches host I/O.
+ *
+ * Buckets: 0 npf, 1 ioio, 2 msr, 3 cpuid, 4 hlt, 5 intr, 6 intr-window, 7 everything else.
+ */
+#define HYPE_509_BUCKETS 8u
+static uint64_t g_bsp_disp_tsc[HYPE_FW_MAX_VMS][HYPE_509_BUCKETS];
+static uint64_t g_bsp_disp_cnt[HYPE_FW_MAX_VMS][HYPE_509_BUCKETS];
+static uint64_t g_bsp_disp_start[HYPE_FW_MAX_VMS];
+static unsigned g_bsp_disp_bucket[HYPE_FW_MAX_VMS];
 
 static void fw_1_dev_lock(hype_fw_vm_t *vm) {
     hype_ticket_lock_acquire(&vm->dev_lock_next, &vm->dev_lock_owner);
@@ -12951,6 +12967,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* SMP-7 (#191): the shared-device lock is held everywhere OUTSIDE the guest and
              * released across the entry, so every `continue` in the handling below is balanced
              * by construction. See hype_fw_vm_t.dev_lock_next. */
+            {   /* #509: close the dispatch window -- everything from the chain start to the
+                 * guest entry, which is exactly the host time this exit cost. */
+                unsigned vd_ = (unsigned)(vm - g_vms);
+                if (g_bsp_disp_start[vd_] != 0ull) {
+                    unsigned b_ = g_bsp_disp_bucket[vd_];
+                    if (b_ < HYPE_509_BUCKETS) {
+                        g_bsp_disp_tsc[vd_][b_] += hype_rdtsc() - g_bsp_disp_start[vd_];
+                        g_bsp_disp_cnt[vd_][b_]++;
+                    }
+                    g_bsp_disp_start[vd_] = 0ull;
+                }
+            }
             fw_1_dev_unlock(vm);
             if (ops->vcpu_run(ctx, &info) != 0) {
                 fw_1_dev_lock(vm);
@@ -13397,6 +13425,29 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * BSP was measured spinning in smp_targeted_tlb_shootdown_native waiting
                      * for an AP that is idle in cpu_idle_acpi.
                      */
+                    {   /* #509: per-exit-reason dispatch cost -- which handler is EXPENSIVE,
+                         * as opposed to which is frequent. Those are different questions: intr
+                         * is ~32% of exits and does almost nothing. */
+                        static const char *bn[HYPE_509_BUCKETS] = {
+                            "npf", "ioio", "msr", "cpuid", "hlt", "intr", "iwin", "other"};
+                        char dl[240];
+                        unsigned b2;
+                        int do_ = hype_snprintf(dl, sizeof(dl),
+                                                "fw-1 DISPCOST vm%u us/exit(count):", _vmi);
+                        for (b2 = 0; b2 < HYPE_509_BUCKETS; b2++) {
+                            uint64_t c = g_bsp_disp_cnt[_vmi][b2];
+                            uint64_t us = 0;
+                            if (c != 0u && g_fw_1_host_tsc_hz >= 1000000ull) {
+                                us = (g_bsp_disp_tsc[_vmi][b2] / c) /
+                                     (g_fw_1_host_tsc_hz / 1000000ull);
+                            }
+                            do_ += hype_snprintf(dl + do_, sizeof(dl) - (unsigned)do_,
+                                                 " %s=%llu(%llu)", bn[b2],
+                                                 (unsigned long long)us,
+                                                 (unsigned long long)c);
+                        }
+                        hype_debug_print("%s [#509]\n", dl);
+                    }
                     for (_av = 0u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
                         if (kind == HYPE_VMM_KIND_VMX) {
                         hype_debug_print("fw-1 VMCSRELOAD: count=%llu last_cur=0x%llx "
@@ -15152,6 +15203,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
                 g_bsp_lock_tsc[vh_] = 0ull;
             }
+        }
+        {   /* #509: open the dispatch window and classify this exit. */
+            unsigned vd_ = (unsigned)(vm - g_vms);
+            unsigned b_ = 7u;
+            if (vmm_reason_is_npf(kind, info.reason)) b_ = 0u;
+            else if (vmm_reason_is_ioio(kind, info.reason)) b_ = 1u;
+            else if (vmm_reason_is_msr(kind, info.reason)) b_ = 2u;
+            else if (vmm_reason_is_cpuid(kind, info.reason)) b_ = 3u;
+            else if (vmm_reason_is_hlt(kind, info.reason)) b_ = 4u;
+            else if (vmm_reason_is_intr(kind, info.reason)) b_ = 5u;
+            else if (vmm_reason_is_intr_window(kind, info.reason)) b_ = 6u;
+            g_bsp_disp_bucket[vd_] = b_;
+            g_bsp_disp_start[vd_] = hype_rdtsc();
         }
         g_436_loop_section[(unsigned)(vm-g_vms)]=5;
         if (!vmm_reason_is_intr(kind, info.reason)) {
@@ -17073,9 +17137,29 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                         start = hype_rdtsc();
                         if (wait_tsc > cap) { wait_tsc = cap; }
+                        /*
+                         * #509: do NOT hold the shared-device lock across this spin.
+                         *
+                         * M4-6d4 busy-waits up to 10 ms here so an idle guest does not burn
+                         * world-switches re-halting. That is right for one vCPU and ruinous for
+                         * two: SMP-7 holds the device lock everywhere outside the guest, so
+                         * every idle period froze the OTHER vCPU for as long as this spin --
+                         * measured at 5665 us average over 12445 HLT exits, 68% of all
+                         * dispatch time and the single largest contributor to the RCU stalls
+                         * Linux reported on CPU 1.
+                         *
+                         * Safe to release: the spin reads the host TSC and touches no device
+                         * state at all. The PIT and LAPIC values that set wait_tsc were already
+                         * sampled above, and re-sampling them after the wait is not required --
+                         * a timer that came due during it is delivered on the next pass either
+                         * way. Released and retaken so every `continue` below still leaves the
+                         * lock held, which is the invariant the rest of this loop relies on.
+                         */
+                        fw_1_dev_unlock(vm);
                         while (hype_rdtsc() - start < wait_tsc) {
                             __asm__ volatile("pause");
                         }
+                        fw_1_dev_lock(vm);
                         /* PERF-1a: this is the fast-forwardable idle time (QEMU
                          * collapses it; hype honours it) -- accumulate but keep
                          * it out of the per-exit COSTHIST accounting. */
