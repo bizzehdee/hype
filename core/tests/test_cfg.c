@@ -500,6 +500,46 @@ static void test_error_reports_line_number(void) {
  * the status, because the status is what makes "applied" distinguishable from
  * "ignored" in a log.
  */
+/*
+ * SMP-1 (#185): vcpus resolution. Same contract as mem_mb above -- the STATUS is the part
+ * worth testing, because it is what lets a log distinguish "you asked for 4" from "you asked
+ * for 64 and got 8".
+ */
+static void test_resolve_vcpus(void) {
+    unsigned n;
+
+    /* Unconfigured -> one vCPU, which is hype's behaviour from before SMP existed. */
+    CHECK_INT("no cfg -> DEFAULTED", HYPE_CFG_RAM_DEFAULTED,
+              (int)hype_cfg_resolve_vcpus(0u, 8u, &n));
+    CHECK_INT("no cfg -> 1 vCPU", 1, (int)n);
+
+    /* In range -> used exactly. */
+    CHECK_INT("in range -> APPLIED", HYPE_CFG_RAM_APPLIED,
+              (int)hype_cfg_resolve_vcpus(4u, 8u, &n));
+    CHECK_INT("in range -> 4 applied", 4, (int)n);
+
+    /* Boundaries inclusive: 1 and exactly max are APPLIED, not clamped. */
+    CHECK_INT("one vCPU -> APPLIED", HYPE_CFG_RAM_APPLIED,
+              (int)hype_cfg_resolve_vcpus(1u, 8u, &n));
+    CHECK_INT("one vCPU value", 1, (int)n);
+    CHECK_INT("exactly max -> APPLIED", HYPE_CFG_RAM_APPLIED,
+              (int)hype_cfg_resolve_vcpus(8u, 8u, &n));
+    CHECK_INT("exactly max value", 8, (int)n);
+
+    /* Over the cap clamps and SAYS so. A silent clamp here would size the vCPU pools for
+     * fewer contexts than the MADT later advertises -- #237's shared-VMCB failure, arrived at
+     * by a different route. */
+    CHECK_INT("over cap -> CLAMPED_HIGH", HYPE_CFG_RAM_CLAMPED_HIGH,
+              (int)hype_cfg_resolve_vcpus(64u, 8u, &n));
+    CHECK_INT("over cap -> clamped to max", 8, (int)n);
+
+    /* A caller passing a zero cap still gets a runnable VM rather than zero vCPUs. */
+    CHECK_INT("zero cap -> still one vCPU", 1, (int)(hype_cfg_resolve_vcpus(4u, 0u, &n), n));
+
+    /* NULL out is safe -- the status alone is a legitimate use. */
+    (void)hype_cfg_resolve_vcpus(2u, 8u, (unsigned *)0);
+}
+
 static void test_resolve_mem_mb(void) {
     unsigned mb;
 
@@ -2162,6 +2202,7 @@ int main(void) {
     test_missing_required_field_also_isolates();
     test_section_level_errors_stay_fatal();
     test_skipped_vm_section_entry_does_not_alias();
+    test_resolve_vcpus();
 
     if (failures == 0) {
         printf("all tests passed\n");

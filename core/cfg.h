@@ -615,6 +615,18 @@ hype_cfg_ram_status_t hype_cfg_resolve_mem_mb(unsigned int cfg_mem_mb, unsigned 
 const char *hype_cfg_ram_status_str(hype_cfg_ram_status_t st);
 
 /*
+ * SMP-1 (#185): resolve a VM's vCPU count the same way mem_mb is resolved -- one pure
+ * function, so the "which source won, and was it clamped" question has one answer and one
+ * test, rather than being decided inline at the call site.
+ *
+ * Reuses hype_cfg_ram_status_t deliberately: the four outcomes (defaulted, applied, clamped
+ * low, clamped high) are identical in shape, and inventing a parallel enum would mean a
+ * second status_str() to keep in step. `min` is 1 -- a VM with no vCPU is not a VM.
+ */
+hype_cfg_ram_status_t hype_cfg_resolve_vcpus(unsigned int cfg_vcpus, unsigned int max_vcpus,
+                                             unsigned int *out_vcpus);
+
+/*
  * #331: the byte count a `target_disk_size_gb` value declares.
  *
  * GiB, not decimal GB -- the same unit tools/make-disk-image.sh allocates in, so a config and the

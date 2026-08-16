@@ -1251,6 +1251,37 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     return res;
 }
 
+/*
+ * SMP-1 (#185). See cfg.h. Clamps into [1, max_vcpus] and reports which of the four things
+ * happened, so the caller can say so rather than silently applying a different number than the
+ * operator configured -- the #428 lesson.
+ */
+hype_cfg_ram_status_t hype_cfg_resolve_vcpus(unsigned int cfg_vcpus, unsigned int max_vcpus,
+                                             unsigned int *out_vcpus) {
+    unsigned int applied;
+    hype_cfg_ram_status_t st;
+
+    if (max_vcpus == 0u) {
+        max_vcpus = 1u; /* a caller that passes 0 still gets a runnable VM, not zero vCPUs */
+    }
+
+    if (cfg_vcpus == 0u) {
+        applied = 1u; /* unconfigured: one vCPU, hype's behaviour before SMP existed */
+        st = HYPE_CFG_RAM_DEFAULTED;
+    } else if (cfg_vcpus > max_vcpus) {
+        applied = max_vcpus;
+        st = HYPE_CFG_RAM_CLAMPED_HIGH;
+    } else {
+        applied = cfg_vcpus;
+        st = HYPE_CFG_RAM_APPLIED;
+    }
+
+    if (out_vcpus != (unsigned int *)0) {
+        *out_vcpus = applied;
+    }
+    return st;
+}
+
 hype_cfg_ram_status_t hype_cfg_resolve_mem_mb(unsigned int cfg_mem_mb, unsigned int default_mb,
                                               unsigned int min_mb, unsigned int max_mb,
                                               unsigned int *out_mb) {

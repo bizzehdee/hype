@@ -559,6 +559,19 @@ static unsigned long long *g_script_seen;
 static unsigned long long *g_script_fed;
 
 /*
+ * SMP-1 (#185): how many vCPUs one VM can have.
+ *
+ * The bound is the guest-visible APIC ID space hype models plus the per-VM state each vCPU
+ * carries (a VMCB/VMCS + ctx pair from the backend pool, and its own guest LAPIC once SMP-3
+ * lands), not anything architectural. 8 is generous for the guests this project targets and
+ * keeps HYPE_ACPI_MAX_CPUS (the MADT builder's own bound) comfortably ahead of it.
+ *
+ * A configured `vcpus` above this is clamped with a diagnostic naming both numbers -- never
+ * silently, which is the #428 lesson (a per-VM index clamped in silence, three times).
+ */
+#define HYPE_MAX_VCPUS_PER_VM 8u
+
+/*
  * #329: how many guest disks one VM can carry. The bound is the interrupt budget, not memory:
  * each attached disk consumes one device number on bus 0 (hype's PCI model is
  * bus-0/function-0/Type-0 only) plus one _PRT entry routing its INTA to a dedicated IO-APIC
@@ -752,6 +765,17 @@ typedef struct hype_fw_vm {
      * hints run concurrently. */
     int hv_leaves;
     unsigned mem_mb;
+    /*
+     * SMP-1 (#185): this VM's vCPUs. All of them share ONE nested-paging root, one guest RAM
+     * region and one emulated-device set -- that sharing is exactly what distinguishes SMP
+     * from M8-0b's multi-VM case, where each VM has its own everything.
+     *
+     * `vcpu_count` is resolved from cfg.vcpus by fw_1_resolve_vcpus(). Index 0 is the BSP and
+     * is the only one dispatched today; the APs are created, parked and left for SMP-6 to
+     * dispatch, so this task can land and be verified without a scheduler.
+     */
+    unsigned vcpu_count;
+    hype_vcpu_ctx_t *vcpu[HYPE_MAX_VCPUS_PER_VM];
     const char *media;      /* boot-media short name; points at media_buf below */
     /*
      * #391: fw_1_media_path()'s generated default ("\iso\vmN.iso" for a VM with no
@@ -901,6 +925,27 @@ static void fw_1_resolve_guest_ram(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, uns
                      vm_index, applied_mb, hype_cfg_ram_status_str(st), cfg_mb,
                      HYPE_FW_1_GUEST_RAM_MIN_MB, HYPE_FW_1_GUEST_RAM_MAX_MB);
 }
+/*
+ * SMP-1 (#185): settle this VM's vCPU count. Same shape as fw_1_resolve_guest_ram above, and
+ * for the same reason -- one place decides, and it says out loud which source won and whether
+ * the value was clamped. `cfg.vcpus` has been parsed and admission-validated since ADM-2/3 but
+ * never reached the runtime, which hardcoded one vCPU per VM.
+ */
+static void fw_1_resolve_vcpus(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigned vm_index) {
+    unsigned cfg_vcpus = 0u;
+    unsigned applied = 1u;
+    hype_cfg_ram_status_t st;
+
+    if (cfg != 0 && vm_index < cfg->vm_count) {
+        cfg_vcpus = cfg->vms[vm_index].vcpus;
+    }
+    st = hype_cfg_resolve_vcpus(cfg_vcpus, HYPE_MAX_VCPUS_PER_VM, &applied);
+    vmp->vcpu_count = applied;
+    hype_debug_print("fw-1: vm%u vcpus %u -- %s (requested %u, max %u) [#185]\n", vm_index,
+                     applied, hype_cfg_ram_status_str(st), cfg_vcpus,
+                     (unsigned)HYPE_MAX_VCPUS_PER_VM);
+}
+
 /*
  * M7-1 (#91): settle this VM's os_hint and, from it, whether the guest sees the
  * Hyper-V hypervisor identity. Writes vm->os_hint (which the dashboard shows) so the
@@ -10678,6 +10723,47 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     if (ctx == 0) {
         hype_fatal("fw-1: vcpu_create failed");
     }
+    /*
+     * SMP-1 (#185): vCPU 0 is this VM's BSP, and is the one this loop dispatches. Its APs get
+     * their own hardware contexts from the same pool, all handed the SAME nested-paging root --
+     * that shared root is what makes them vCPUs of one VM rather than separate VMs (contrast
+     * M8-0b, where each VM has its own root, RAM and devices).
+     *
+     * They are created and parked here, not started. An x86 AP comes out of reset in
+     * wait-for-SIPI and does nothing until its BSP sends INIT-SIPI-SIPI (SMP-4), so "created
+     * but not running" is the architecturally correct state for them to sit in, not a stub.
+     * Dispatching them is SMP-6.
+     */
+    vm->vcpu[0] = ctx;
+    if (vm->vcpu_count == 0u) {
+        vm->vcpu_count = 1u; /* a VM created outside the resolver path (self-tests) */
+    }
+    {
+        unsigned vi;
+        for (vi = 1u; vi < vm->vcpu_count; vi++) {
+            hype_vcpu_ctx_t *ap = ops->vcpu_create(reset_cs_base, stack_top, npt_root_phys);
+            if (ap == 0) {
+                /*
+                 * Do not fatal: the VM is viable with fewer vCPUs, and taking the whole host
+                 * down because the pool came up short would be a worse outcome than a guest
+                 * that boots with two CPUs instead of four. Say so, and correct the count so
+                 * every later consumer (the MADT in SMP-2, the dashboard, admission) agrees
+                 * with what actually exists.
+                 */
+                hype_debug_print("fw-1 vm%u: vcpu_create failed for AP %u -- running with %u "
+                                 "vCPU(s) [#185]\n", (unsigned)(vm - g_vms), vi, vi);
+                vm->vcpu_count = vi;
+                break;
+            }
+            vm->vcpu[vi] = ap;
+        }
+    }
+    if (vm->vcpu_count > 1u) {
+        hype_debug_print("fw-1 vm%u: %u vCPU(s) created on one NPT/EPT root 0x%llx -- AP(s) "
+                         "parked in wait-for-SIPI until SMP-6 [#185]\n",
+                         (unsigned)(vm - g_vms), vm->vcpu_count,
+                         (unsigned long long)npt_root_phys);
+    }
     vm->used_root = npt_root_phys; /* #274 */
     /* #244/#273: latch the tag the hardware will actually use for this guest. */
     vm->used_tlb_tag = (ops->vcpu_tlb_tag != 0) ? ops->vcpu_tlb_tag(ctx) : 0u;
@@ -18480,8 +18566,29 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * hardware contexts (#237). The self-test battery that also uses these pools
      * is gated off for a normal boot, so this is the first user. */
     g_pool_bs = SystemTable->BootServices;
-    hype_svm_vcpu_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
-    hype_vmx_vcpu_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
+    /*
+     * SMP-1 (#185): the pools are sized to the total number of vCPUs across all VMs, not to
+     * the VM count. Each vCPU needs its OWN VMCB/VMCS + ctx pair -- #237 was two vCPUs sharing
+     * one VMCB, and it took both guests down with no panic on real hardware, so an
+     * under-sized pool here is not a slow path, it is that bug again.
+     *
+     * Every VM's vcpu_count is resolved HERE, not at the per-VM setup sites further down: this
+     * is the first thing that needs the total, and it runs before them. Resolving it lazily
+     * there and summing here would read zeros off the freshly-zeroed g_vms arena and size the
+     * pools for one vCPU each -- which is exactly the old behaviour, arrived at silently.
+     * load_hype_cfg() has already run (just above), so g_hype_cfg is populated.
+     */
+    {
+        unsigned vi, total_vcpus = 0u;
+        for (vi = 0; vi < g_vm_count; vi++) {
+            fw_1_resolve_vcpus(&g_vms[vi], &g_hype_cfg, vi);
+            total_vcpus += g_vms[vi].vcpu_count;
+        }
+        hype_debug_print("fw-1: vCPU pools sized for %u vCPU(s) across %u VM(s) [#185]\n",
+                         total_vcpus, g_vm_count);
+        hype_svm_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
+        hype_vmx_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
+    }
     /* #428: one ISO-stream bounce buffer per VM. The old fixed 2-slot array
      * silently aliased vm2+ onto vm0's buffer, which served one VM's CD
      * sectors to another under concurrent streaming (the 4-VM #392 run's
