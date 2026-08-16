@@ -11169,6 +11169,31 @@ wait_for_sipi:
         }
         fw_1_dev_lock(vm);
         g_ap_vcpu_exits[vm_idx][vi]++;
+        /*
+         * SMP-6: on this vCPU's FIRST exit, read back the two fields the AP has just updated
+         * with LOCK-prefixed RMWs -- NumApsExecuting (0x58) and ApIndex (0x60) in OVMF's
+         * MP_CPU_EXCHANGE_INFO, whose layout is pinned by GdtrProfile at 0x68 (the AP's own
+         * `mov si,0x68` confirms it). The AP indexes its stack and per-CPU data off ApIndex,
+         * so a wrong value there explains reading an uninitialised function pointer. Taken at
+         * the first exit because OVMF reclaims this page later and a dump at the fault reads
+         * zeros.
+         */
+        if (g_ap_vcpu_exits[vm_idx][vi] == 1ull || g_ap_vcpu_exits[vm_idx][vi] == 2000ull) {
+            const uint8_t *xi = fw_1_guest_phys_to_host(vm, 0x9f000ull);
+            if (xi != 0) {
+                uint64_t naps = 0, aidx = 0;
+                unsigned b;
+                for (b = 0; b < 8u; b++) {
+                    naps |= (uint64_t)xi[0x58u + b] << (8u * b);
+                    aidx |= (uint64_t)xi[0x60u + b] << (8u * b);
+                }
+                hype_debug_print("fw-1 APVCPU vm%u/%u MPDATA: NumApsExecuting=%llu ApIndex=%llu "
+                                 "(exit %llu, reason 0x%llx) [#190]\n", vm_idx, vi,
+                                 (unsigned long long)naps, (unsigned long long)aidx,
+                                 g_ap_vcpu_exits[vm_idx][vi],
+                                 (unsigned long long)info.reason);
+            }
+        }
         g_ap_vcpu_last_reason[vm_idx][vi] = info.reason;
         g_ap_vcpu_last_rip[vm_idx][vi] = info.guest_rip;
 
