@@ -345,14 +345,25 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
         /*
          * #436: default MTRR state = "all memory Write-Back, MTRRs enabled". hype forces WB for
          * all guest RAM via the NPT/PAT, so the guest's MTRR view must AGREE: MTRRdefType with
-         * E (bit 11) + FE (bit 10) set and default type WB (6) -> 0xC06. Starting from 0 instead
+         * E (bit 11) set and default type WB (6) -> 0x806. Starting from 0 instead
          * (MTRRs disabled, default type UC) told a guest that reads MTRRs -- FreeBSD does, Linux/
          * BSD via the MADT do not -- that ALL memory is uncached, and FreeBSD panicked/reset.
          * Fixed MTRRs default to WB (0x06 per byte) for the same reason. Variable MTRRs stay 0
          * (disabled, mask.V=0): with the default already WB, none are needed.
          */
         unsigned mi;
-        ctx->mtrr_deftype = 0x0C06u;
+        /*
+         * #481: E=1, type=WB, and FE (bit 10) CLEAR. FE used to be set, which a DEBUG OVMF
+         * rejects outright -- "ASSERT MemDetect.c: (MtrrSettings.MtrrDefType & 0x400) == 0" --
+         * halting the guest firmware in PEI before MP init ever runs. RELEASE builds compile
+         * the assert out, so it stayed invisible until a DEBUG firmware was booted.
+         *
+         * Clearing FE does not change the effective memory type: with the fixed ranges not
+         * consulted, the low 1MB falls through to the WB default, which is what the all-WB
+         * mtrr_fix[] below already produced. The WB default itself is load-bearing and stays
+         * -- see the comment above on FreeBSD panicking when all memory read as uncached.
+         */
+        ctx->mtrr_deftype = 0x0806u;
         for (mi = 0; mi < 16u; mi++) ctx->mtrr_var[mi] = 0;
         for (mi = 0; mi < 11u; mi++) ctx->mtrr_fix[mi] = 0x0606060606060606ull; /* all WB */
     }
