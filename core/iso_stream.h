@@ -48,6 +48,10 @@ typedef struct {
  * different things (what a resolver can map vs what a stream can hold), not as an alias. */
 #define HYPE_ISO_STREAM_MAX_EXTENTS 256u
 
+/* #484: how many independent read-ahead windows each stream keeps. Each costs BOUNCE_SECTORS
+ * (64 KiB) of the per-VM bounce allocation, so this trades memory for host reads. */
+#define HYPE_ISO_STREAM_WINDOWS 4u
+
 /*
  * #428: the bounce pool is sized at RUNTIME to the VM count, replacing a fixed 2-slot array.
  * The old array clamped an out-of-range bounce_slot to slot 0 -- at 4 VMs that silently gave
@@ -99,8 +103,20 @@ typedef struct {
      * cache_sectors == 0 means "nothing held". Zero-initialised by the same contract as
      * extent_count above.
      */
-    uint64_t cache_lba;      /* first disk LBA held in the bounce buffer */
-    uint32_t cache_sectors;  /* how many sectors, 0 = empty */
+    /*
+     * #484: N windows, not one.
+     *
+     * A single window means any interleaving between two read streams evicts the other's
+     * sectors, and the containment test then misses on both. Measured on a 2-vCPU Alpine boot:
+     * hits=34 misses=410, a 7% hit rate, so essentially every guest CD read became a host read
+     * -- and a host read is what holds the shared-device lock for milliseconds while the other
+     * vCPU's guest is frozen. Several windows let interleaved readers keep their own.
+     *
+     * Kept deliberately small: this multiplies the per-VM bounce allocation.
+     */
+    uint64_t cache_lba[HYPE_ISO_STREAM_WINDOWS];     /* first disk LBA held in each window */
+    uint32_t cache_sectors[HYPE_ISO_STREAM_WINDOWS]; /* sectors held, 0 = empty */
+    unsigned cache_victim;                           /* round-robin refill target */
     uint64_t cache_hits;     /* served without touching the device */
     /*
      * #365: where the previous fill ended, so read-ahead can be spent only where it pays.

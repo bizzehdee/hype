@@ -493,7 +493,23 @@ static void test_failed_read_clears_the_cache(void) {
     /* A DIFFERENT range: re-reading the primed one would be served from the buffer and
      * never reach the failing device at all -- which is the cache working, not a failure. */
     CHECK("read fails", hype_iso_stream_read(&s, 150000u, buf, sizeof buf) != 0);
-    CHECK_INT("cache marked empty", 0u, s.cache_sectors);
+    /*
+     * #484: with an N-way cache the point is not that every window is empty -- an earlier
+     * window legitimately still holds good sectors for its own range. What must hold is that
+     * NO window claims the range whose device read just failed, so the retry cannot be served
+     * from a buffer that was never filled.
+     */
+    {
+        unsigned w_, claims_ = 0u;
+        uint64_t failed_lba = 150000u / 512u;
+        for (w_ = 0; w_ < HYPE_ISO_STREAM_WINDOWS; w_++) {
+            if (s.cache_sectors[w_] != 0u && failed_lba >= s.cache_lba[w_] &&
+                failed_lba < s.cache_lba[w_] + s.cache_sectors[w_]) {
+                claims_++;
+            }
+        }
+        CHECK_INT("no window claims the failed range", 0u, claims_);
+    }
 
     s.read = fake_read;
     hype_iso_stream_cache_stats(&s, &hits, &misses);
@@ -611,7 +627,10 @@ static void test_invalidate_clears_the_sequential_history(void) {
  * another VM's sectors, reported as a successful read. These tests pin both halves of the fix:
  * an unbacked slot refuses, and pooled slots hold their bytes across another slot's fill.
  */
-static uint8_t g_pool_arena[6u * 128u * 512u] __attribute__((aligned(4096)));
+/* #484: a slot is now HYPE_ISO_STREAM_WINDOWS windows, so the arena has to scale with it or
+ * the allocator refuses and every pooled test fails for the wrong reason. */
+static uint8_t g_pool_arena[6u * HYPE_ISO_STREAM_WINDOWS * 128u * 512u]
+    __attribute__((aligned(4096)));
 static unsigned g_pool_pages_given;
 static uint64_t test_alloc_zeroed_pages(unsigned pages) {
     if ((uint64_t)pages * 4096ull > sizeof(g_pool_arena)) {
@@ -649,8 +668,9 @@ static void test_pooled_slots_do_not_alias(void) {
     unsigned bad = 0;
 
     hype_iso_stream_pool_alloc(4u, test_alloc_zeroed_pages);
-    CHECK_HEX("pool sized to 4 slots x 128 sectors", 4u * 128u * 512u / 4096u,
-              g_pool_pages_given);
+    /* #484: a slot is HYPE_ISO_STREAM_WINDOWS windows of 128 sectors, not one. */
+    CHECK_HEX("pool sized to 4 slots x N windows x 128 sectors",
+              4u * HYPE_ISO_STREAM_WINDOWS * 128u * 512u / 4096u, g_pool_pages_given);
 
     memset(&a, 0, sizeof(a));
     a.read = fake_read; a.part_start_lba = PART_START; a.iso_size = ISO_SIZE; a.bounce_slot = 0u;

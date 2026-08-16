@@ -20,14 +20,16 @@
  * (one stream at a time: unit tests, single-VM tools) working with no pool. */
 #define BOUNCE_SECTORS 128u
 #define BOUNCE_BYTES (BOUNCE_SECTORS * HYPE_BLK_SECTOR_SIZE)
-static uint8_t g_bounce0[BOUNCE_BYTES] __attribute__((aligned(4096)));
+/* #484: a slot now holds HYPE_ISO_STREAM_WINDOWS windows, each BOUNCE_BYTES. */
+#define SLOT_BYTES (BOUNCE_BYTES * HYPE_ISO_STREAM_WINDOWS)
+static uint8_t g_bounce0[SLOT_BYTES] __attribute__((aligned(4096)));
 static uint8_t *g_bounce_pool;
 static unsigned g_bounce_slots;
 
 void hype_iso_stream_pool_alloc(unsigned slots, uint64_t (*alloc_zeroed_pages)(unsigned pages)) {
     unsigned pages;
     if (slots == 0u) slots = 1u;
-    pages = slots * (unsigned)(BOUNCE_BYTES / 4096u);
+    pages = slots * (unsigned)(SLOT_BYTES / 4096u);
     g_bounce_pool = (uint8_t *)(uintptr_t)alloc_zeroed_pages(pages);
     g_bounce_slots = (g_bounce_pool != 0) ? slots : 0u;
 }
@@ -150,7 +152,7 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
             if (s->bounce_slot >= g_bounce_slots) {
                 return -1;
             }
-            bounce = g_bounce_pool + (uint64_t)s->bounce_slot * BOUNCE_BYTES;
+            bounce = g_bounce_pool + (uint64_t)s->bounce_slot * SLOT_BYTES;
         } else if (s->bounce_slot == 0u) {
             bounce = g_bounce0;
         } else {
@@ -168,20 +170,37 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
          * refill, and getting that subtly wrong serves stale bytes -- indistinguishable at the
          * guest from #343's corruption. A miss is cheap; a wrong hit is not.
          */
-        if (s->cache_sectors != 0u && lba >= s->cache_lba &&
-            (lba + need) <= (s->cache_lba + s->cache_sectors)) {
-            uint64_t skip = lba - s->cache_lba;
-            bounce += skip * HYPE_BLK_SECTOR_SIZE;
-            nsec = (uint32_t)(s->cache_sectors - skip); /* usable sectors from `lba` */
-            s->cache_hits++;
-        } else {
-            if (s->read(s->ctx, lba, nsec, bounce) != 0) {
-                s->cache_sectors = 0u; /* contents are now unknown, not merely old */
-                return -1;
+        {
+            unsigned w;
+            int hit = 0;
+            for (w = 0; w < HYPE_ISO_STREAM_WINDOWS; w++) {
+                if (s->cache_sectors[w] != 0u && lba >= s->cache_lba[w] &&
+                    (lba + need) <= (s->cache_lba[w] + s->cache_sectors[w])) {
+                    uint64_t skip = lba - s->cache_lba[w];
+                    bounce += (uint64_t)w * BOUNCE_BYTES + skip * HYPE_BLK_SECTOR_SIZE;
+                    nsec = (uint32_t)(s->cache_sectors[w] - skip); /* usable sectors from lba */
+                    s->cache_hits++;
+                    hit = 1;
+                    break;
+                }
             }
-            s->cache_lba = lba;
-            s->cache_sectors = nsec;
-            s->cache_misses++;
+            if (!hit) {
+                unsigned v = s->cache_victim;
+                uint8_t *win;
+                if (v >= HYPE_ISO_STREAM_WINDOWS) {
+                    v = 0u;
+                }
+                win = bounce + (uint64_t)v * BOUNCE_BYTES;
+                if (s->read(s->ctx, lba, nsec, win) != 0) {
+                    s->cache_sectors[v] = 0u; /* contents are now unknown, not merely old */
+                    return -1;
+                }
+                s->cache_lba[v] = lba;
+                s->cache_sectors[v] = nsec;
+                s->cache_victim = (v + 1u) % HYPE_ISO_STREAM_WINDOWS;
+                s->cache_misses++;
+                bounce = win;
+            }
         }
         /* Where a continuing read would start. Updated on hits as well as misses: a run served
          * entirely from cache is still sequential, and forgetting that would drop the stream back
@@ -206,10 +225,18 @@ int hype_iso_stream_read(hype_iso_stream_t *s, uint64_t off, uint8_t *dst, uint3
 }
 
 void hype_iso_stream_invalidate(hype_iso_stream_t *s) {
-    if (s != 0) s->next_seq_lba = 0u;
-    if (s != 0) {
-        s->cache_sectors = 0u;
+    unsigned w;
+    if (s == 0) {
+        return;
     }
+    s->next_seq_lba = 0u;
+    /* #484: every window, not just one -- a partial invalidate would leave stale sectors
+     * reachable through another window, which is the wrong-bytes outcome this path must never
+     * have. */
+    for (w = 0; w < HYPE_ISO_STREAM_WINDOWS; w++) {
+        s->cache_sectors[w] = 0u;
+    }
+    s->cache_victim = 0u;
 }
 
 void hype_iso_stream_cache_stats(const hype_iso_stream_t *s, uint64_t *hits, uint64_t *misses) {
