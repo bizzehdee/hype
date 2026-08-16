@@ -281,6 +281,9 @@ struct hype_vcpu_ctx {
      * Mirrors the SVM ctx's field of the same name -- see svm.h on why the guest's
      * emulated LAPIC ISR must be marked at injection time, not at request time. */
     uint32_t inj_notify[8];
+    /* SMP-2 (#186): the topology THIS vCPU's guest sees. Mirrors the SVM ctx's field of the
+     * same name -- per-vCPU, never file-global (#237/#276). */
+    hype_cpuid_topology_t cpuid_topo;
     /* M4-6b1: the guest's pvclock shared page, if it enabled one. */
     const hype_gpa_map_t *pvclock_map;
     /* #251: last value the guest wrote to each pvclock MSR, so a RDMSR reads back
@@ -383,6 +386,10 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
         ctx->pending_irr[i] = 0;
         ctx->inj_notify[i] = 0; /* #456 */
     }
+    /* SMP-2: a recycled slot must not inherit the previous guest's topology. */
+    ctx->cpuid_topo.apic_id = 0u;
+    ctx->cpuid_topo.vcpu_count = 1u;
+    ctx->cpuid_topo.threads_per_core = 1u;
     ctx->pvclock_map = 0;
     /* A slot reused by a later guest must not inherit a prior guest's armed
      * pvclock pages -- same reasoning as the SVM path's reset. */
@@ -1440,7 +1447,8 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     } else {
         vmx_real_cpuid(eax_in, ecx_in, &host_real);
     }
-    hype_cpuid_emulate_ex(eax_in, ecx_in, real->hv_enabled, &host_real, &out);
+    hype_cpuid_emulate_topo(eax_in, ecx_in, real->hv_enabled, &real->cpuid_topo, &host_real,
+                            &out); /* SMP-2 */
 
     real->gprs[0] = out.eax; /* RAX */
     real->gprs[3] = out.ebx; /* RBX */
@@ -3947,4 +3955,12 @@ void hype_vmx_vcpu_handle_wbinvd(void) {
 void hype_vmx_wbinvd_stats(unsigned long long *count, uint64_t *last_rip) {
     if (count != 0) *count = g_vmx_wbinvd_exits;
     if (last_rip != 0) *last_rip = g_vmx_wbinvd_last_rip;
+}
+
+void hype_vmx_vcpu_set_topology(hype_vcpu_ctx_t *ctx, uint32_t apic_id, uint32_t vcpu_count,
+                                uint32_t threads_per_core) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->cpuid_topo.apic_id = apic_id;
+    real->cpuid_topo.vcpu_count = vcpu_count ? vcpu_count : 1u;
+    real->cpuid_topo.threads_per_core = threads_per_core ? threads_per_core : 1u;
 }

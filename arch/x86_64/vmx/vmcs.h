@@ -195,6 +195,10 @@ void hype_vmx_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector, int 
  * declaration for the full reasoning. */
 void hype_vmx_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector);
 
+/* SMP-2 (#186): the VMX mirror of hype_svm_vcpu_set_topology. */
+void hype_vmx_vcpu_set_topology(hype_vcpu_ctx_t *ctx, uint32_t apic_id, uint32_t vcpu_count,
+                                uint32_t threads_per_core);
+
 /* #456: the VMX mirror of hype_svm_vcpu_take_injected_vector. */
 int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector);
 void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);

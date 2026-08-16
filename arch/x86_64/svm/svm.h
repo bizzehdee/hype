@@ -567,6 +567,11 @@ void hype_svm_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector,
  */
 void hype_svm_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector);
 
+/* SMP-2 (#186): set the CPU topology this vCPU's guest sees. Called once per vCPU after
+ * creation; see hype_cpuid_topology_t on why it is per-vCPU rather than global. */
+void hype_svm_vcpu_set_topology(hype_vcpu_ctx_t *ctx, uint32_t apic_id, uint32_t vcpu_count,
+                                uint32_t threads_per_core);
+
 /*
  * #456: pop one vector that hype has staged into EVENTINJ since the last call, or return 0
  * once none remain. The caller uses this to mark the guest's emulated LAPIC ISR at the moment

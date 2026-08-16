@@ -775,6 +775,12 @@ typedef struct hype_fw_vm {
      * dispatch, so this task can land and be verified without a scheduler.
      */
     unsigned vcpu_count;
+    /*
+     * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what
+     * its guest is told. 1 until SMT-aware core allocation lands (#479, #190) -- and honestly
+     * so, since today a granted core supplies exactly one dispatchable thread.
+     */
+    unsigned threads_per_core;
     hype_vcpu_ctx_t *vcpu[HYPE_MAX_VCPUS_PER_VM];
     const char *media;      /* boot-media short name; points at media_buf below */
     /*
@@ -926,6 +932,29 @@ static void fw_1_resolve_guest_ram(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, uns
                      HYPE_FW_1_GUEST_RAM_MIN_MB, HYPE_FW_1_GUEST_RAM_MAX_MB);
 }
 /*
+ * SMP-2 (#186): how many vCPUs this VM ADVERTISES to its guest, as opposed to how many
+ * contexts exist (vm->vcpu_count).
+ *
+ * These differ, and must, until AP bring-up works. Measured: with the MADT, fw_cfg NB_CPUS
+ * and CPUID all reporting 2, OVMF never reaches BdsDxe -- vm0 spins at RIP 0xfffd48f3, inside
+ * the flash window, i.e. still in SEC/PEI, at 95% CPU with no console output at all. The same
+ * VM with the same two vCPU contexts boots to a login prompt when it is told 1. Firmware's MP
+ * init sends INIT-SIPI-SIPI and waits for each AP to check in; hype creates AP contexts but
+ * cannot yet start them (SMP-4), so the AP never answers.
+ *
+ * Advertising hardware that cannot be started is the same defect class as #436's phantom PCI
+ * buses and the MCFG bus range: describe a machine hype does not implement and the guest
+ * hangs looking for the missing part. So the advertised count follows what hype can actually
+ * run, and SMP-4 is what raises HYPE_SMP_STARTABLE_VCPUS.
+ */
+#define HYPE_SMP_STARTABLE_VCPUS 1u
+
+static unsigned fw_1_guest_visible_vcpus(const hype_fw_vm_t *vmp) {
+    unsigned n = vmp->vcpu_count ? vmp->vcpu_count : 1u;
+    return (n < HYPE_SMP_STARTABLE_VCPUS) ? n : HYPE_SMP_STARTABLE_VCPUS;
+}
+
+/*
  * SMP-1 (#185): settle this VM's vCPU count. Same shape as fw_1_resolve_guest_ram above, and
  * for the same reason -- one place decides, and it says out loud which source won and whether
  * the value was clamped. `cfg.vcpus` has been parsed and admission-validated since ADM-2/3 but
@@ -941,6 +970,9 @@ static void fw_1_resolve_vcpus(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigne
     }
     st = hype_cfg_resolve_vcpus(cfg_vcpus, HYPE_MAX_VCPUS_PER_VM, &applied);
     vmp->vcpu_count = applied;
+    /* SMP-2: set explicitly rather than relying on the zeroed arena, so the value the guest is
+     * told has one visible origin. SMT-aware allocation (#479/#190) is what raises it. */
+    vmp->threads_per_core = 1u;
     hype_debug_print("fw-1: vm%u vcpus %u -- %s (requested %u, max %u) [#185]\n", vm_index,
                      applied, hype_cfg_ram_status_str(st), cfg_vcpus,
                      (unsigned)HYPE_MAX_VCPUS_PER_VM);
@@ -4172,6 +4204,16 @@ static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, 
  * lapic_handle_intr(0x21), which indexes la_ioint_irqs[0x21 - 48] with the 32-bit wrap of a
  * negative index and page-faults 16 GB up the direct map.
  */
+/* SMP-2 (#186): vendor shim for the per-vCPU guest-visible topology. */
+static void vmm_set_topology(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint32_t apic_id,
+                             uint32_t vcpu_count, uint32_t threads_per_core) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_set_topology(ctx, apic_id, vcpu_count, threads_per_core);
+    } else {
+        hype_svm_vcpu_set_topology(ctx, apic_id, vcpu_count, threads_per_core);
+    }
+}
+
 static void vmm_sync_lapic_isr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                hype_guest_lapic_t *lapic) {
     uint8_t vector;
@@ -10385,8 +10427,18 @@ static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
     int e820_len;
     unsigned int z;
 
+    /*
+     * SMP-2 (#186): the MADT lists one enabled Local APIC per vCPU, with DISTINCT IDs. The IDs
+     * are hype's own dense 0..N-1, deliberately not the host's -- the guest's APIC ID space is
+     * hype's to define, and #360 is the standing evidence that host APIC IDs are not dense.
+     * They must agree with what CPUID leaf 1 EBX[31:24] and leaf 0x0B EDX report for the same
+     * vCPU, or the guest logs an APIC ID mismatch and distrusts one of the two.
+     */
     for (z = 0; z < HYPE_ACPI_MAX_CPUS; z++) cfg.apic_ids[z] = (uint8_t)z;
-    cfg.cpu_count = 1;
+    {
+        unsigned adv = fw_1_guest_visible_vcpus(vm);
+        cfg.cpu_count = (uint8_t)((adv <= HYPE_ACPI_MAX_CPUS) ? adv : HYPE_ACPI_MAX_CPUS);
+    }
     cfg.local_apic_address = 0xFEE00000u;
     cfg.io_apic_id = (uint8_t)HYPE_IOAPIC_DEFAULT_ID;
     cfg.io_apic_address = 0xFEC00000u;
@@ -10416,7 +10468,10 @@ static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
      * Report the same via FW_CFG_NB_CPUS so OVMF's PlatformMaxCpuCountInitialization
      * gets BootCpuCount=1 instead of falling back to MaxCpuCount=64 and hanging
      * CpuDxe MP init on INIT-SIPI/wait for 63 phantom APs. */
-    hype_fw_cfg_set_nb_cpus(&g_fw_1_fw_cfg, 1u);
+    /* SMP-2 (#186): OVMF sizes its own CPU structures from NB_CPUS, so it has to agree with
+     * the MADT and CPUID. A mismatch here is what #436 chased: a zero made OVMF hang, and a
+     * value larger than the modelled vCPUs makes firmware wait on APs that never check in. */
+    hype_fw_cfg_set_nb_cpus(&g_fw_1_fw_cfg, (uint16_t)fw_1_guest_visible_vcpus(vm));
     if (hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_RSDP,
                              (const uint8_t *)&g_fw_1_rsdp, sizeof(g_fw_1_rsdp)) < 0 ||
         hype_fw_cfg_add_file(&g_fw_1_fw_cfg, HYPE_ACPI_LOADER_FILE_TABLES,
@@ -10758,11 +10813,35 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             vm->vcpu[vi] = ap;
         }
     }
+    /*
+     * SMP-2 (#186): tell each vCPU which APIC ID and VM-wide topology its CPUID should report.
+     * APIC IDs are hype's own dense 0..N-1 and must match the MADT built in fw_1_setup_fw_cfg
+     * exactly -- a disagreement makes Linux log "[Firmware Bug]: APIC ID mismatch" and pick
+     * one of the two to believe.
+     *
+     * threads_per_core is 1 until SMT-aware core allocation lands (#479/#190). That is an
+     * honest report of what hype gives a VM today, not a placeholder: with one thread per
+     * granted core, "N vCPUs" really is N single-threaded cores. §10 decision 40 is what
+     * makes it more than 1, and it is set from one place when it does.
+     */
+    {
+        unsigned vi;
+        for (vi = 0; vi < vm->vcpu_count; vi++) {
+            if (vm->vcpu[vi] == 0) {
+                continue;
+            }
+            vmm_set_topology(kind, vm->vcpu[vi], vi, fw_1_guest_visible_vcpus(vm),
+                             vm->threads_per_core ? vm->threads_per_core : 1u);
+        }
+    }
     if (vm->vcpu_count > 1u) {
-        hype_debug_print("fw-1 vm%u: %u vCPU(s) created on one NPT/EPT root 0x%llx -- AP(s) "
-                         "parked in wait-for-SIPI until SMP-6 [#185]\n",
+        hype_debug_print("fw-1 vm%u: %u vCPU context(s) on one NPT/EPT root 0x%llx, %u "
+                         "thread(s)/core -- guest is told %u until AP bring-up (SMP-4); AP(s) "
+                         "parked in wait-for-SIPI [#185 #186]\n",
                          (unsigned)(vm - g_vms), vm->vcpu_count,
-                         (unsigned long long)npt_root_phys);
+                         (unsigned long long)npt_root_phys,
+                         vm->threads_per_core ? vm->threads_per_core : 1u,
+                         fw_1_guest_visible_vcpus(vm));
     }
     vm->used_root = npt_root_phys; /* #274 */
     /* #244/#273: latch the tag the hardware will actually use for this guest. */

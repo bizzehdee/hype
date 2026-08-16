@@ -151,6 +151,43 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
 void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
                             const hype_cpuid_result_t *real, hype_cpuid_result_t *out);
 
+/*
+ * SMP-2 (#186): the CPU topology THIS vCPU's guest should see.
+ *
+ * Per-vCPU for the same reason hv_enabled is (see above): two guests with different vCPU
+ * counts take CPUID exits on two cores at the same instant, and `apic_id` differs per vCPU
+ * even within one guest. A file-global would be the #237/#276 shared-singleton race again.
+ *
+ * The topology reported is hype's OWN choice, never a mirror of the host's. A guest is told
+ * one socket containing `vcpu_count / threads_per_core` cores of `threads_per_core` threads --
+ * whatever hype actually gave it. #436 is the standing evidence for why leaking host values
+ * here is harmful: passing the host's HT count and core count through made guests try to start
+ * phantom APs that do not exist.
+ */
+typedef struct {
+    uint32_t apic_id;          /* this vCPU's local APIC ID; 0 for the BSP */
+    uint32_t vcpu_count;       /* logical processors in THIS VM; >= 1 */
+    uint32_t threads_per_core; /* SMT threads per core hype gave this VM; >= 1 (§10 decision 40) */
+} hype_cpuid_topology_t;
+
+/*
+ * Smallest s such that (1u << s) >= n -- the SDM's "number of bits to shift the x2APIC ID
+ * right to reach the next topology level" for leaf 0x0B/0x1F. Exposed because it is the one
+ * piece of arithmetic in the topology leaves that is easy to get subtly wrong (n=1 must give
+ * 0, and non-powers-of-two must round UP, or a guest's APIC-ID decode silently overlaps
+ * levels). n == 0 is treated as 1.
+ */
+uint32_t hype_cpuid_topo_shift(uint32_t n);
+
+/*
+ * As hype_cpuid_emulate_ex(), plus the guest-visible topology. `topo` may be 0, which means
+ * one vCPU with APIC ID 0 -- exactly what the two entry points above report, so they are thin
+ * wrappers over this and every existing caller and test reads unchanged.
+ */
+void hype_cpuid_emulate_topo(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
+                             const hype_cpuid_topology_t *topo,
+                             const hype_cpuid_result_t *real, hype_cpuid_result_t *out);
+
 /* Where the KVM paravirt leaves live -- 0x40000000 normally, 0x40000100 when the
  * Hyper-V leaves have taken the base. */
 uint32_t hype_cpuid_kvm_base(int hv_enabled);

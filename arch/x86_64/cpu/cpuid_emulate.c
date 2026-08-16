@@ -164,9 +164,46 @@ void hype_cpuid_emulate(uint32_t eax_in, uint32_t ecx_in, const hype_cpuid_resul
     hype_cpuid_emulate_ex(eax_in, ecx_in, 0, real, out);
 }
 
+uint32_t hype_cpuid_topo_shift(uint32_t n) {
+    uint32_t s = 0;
+    if (n <= 1u) {
+        return 0u; /* one item at this level needs no ID bits */
+    }
+    n -= 1u; /* ceil(log2(n)) == bits needed to index 0..n-1 */
+    while (n != 0u) {
+        s++;
+        n >>= 1;
+    }
+    return s;
+}
+
 void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
                             const hype_cpuid_result_t *real, hype_cpuid_result_t *out) {
-    (void)ecx_in; /* no leaf handled here uses a sub-leaf */
+    hype_cpuid_emulate_topo(eax_in, ecx_in, hv_enabled, (const hype_cpuid_topology_t *)0, real,
+                            out);
+}
+
+void hype_cpuid_emulate_topo(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
+                             const hype_cpuid_topology_t *topo,
+                             const hype_cpuid_result_t *real, hype_cpuid_result_t *out) {
+    /* SMP-2 (#186): a null topo means the pre-SMP machine -- one vCPU, APIC ID 0 -- so every
+     * caller that has not been taught about topology keeps reporting exactly what it did. */
+    hype_cpuid_topology_t topo_default;
+    if (topo == (const hype_cpuid_topology_t *)0) {
+        topo_default.apic_id = 0u;
+        topo_default.vcpu_count = 1u;
+        topo_default.threads_per_core = 1u;
+        topo = &topo_default;
+    }
+    {
+        /* Defend the arithmetic below against a caller that never set these. */
+        if (topo->vcpu_count == 0u || topo->threads_per_core == 0u) {
+            topo_default.apic_id = topo->apic_id;
+            topo_default.vcpu_count = topo->vcpu_count ? topo->vcpu_count : 1u;
+            topo_default.threads_per_core = topo->threads_per_core ? topo->threads_per_core : 1u;
+            topo = &topo_default;
+        }
+    }
 
     if (eax_in == 0) {
         out->eax = HYPE_CPUID_MAX_BASIC_LEAF; /* max basic leaf supported (reaches 0xD XSAVE) */
@@ -207,11 +244,15 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
          * disagreement ("[Firmware Bug]: APIC ID mismatch. CPUID: 0x0001 APIC:
          * 0x0000"). Force it to 0 so CPUID agrees with the modeled LAPIC. (Each
          * hype VM has exactly one 1:1-pinned vCPU whose LAPIC ID is 0.) */
-        /* EBX: keep brand index [7:0] + CLFLUSH size [15:8] from the host; force the
-         * addressable-logical-processor count [23:16] to 1 and the initial APIC ID [31:24]
-         * to 0 (the single modeled vCPU). #436: without the [23:16]=1 clamp the guest reads
-         * the host's HT count and tries to start that many APs. */
-        out->ebx = (real->ebx & 0x0000FFFFu) | (1u << 16);
+        /* EBX: keep brand index [7:0] + CLFLUSH size [15:8] from the host; report THIS VM's
+         * addressable-logical-processor count [23:16] and THIS vCPU's initial APIC ID [31:24].
+         * #436: neither may be passed through -- the host's HT count made guests start
+         * phantom APs, and the host's APIC ID disagreed with hype's guest LAPIC ("[Firmware
+         * Bug]: APIC ID mismatch"). SMP-2 (#186): both now come from the modelled topology
+         * rather than being forced to 1 and 0, which was correct only while a VM had one
+         * vCPU. */
+        out->ebx = (real->ebx & 0x0000FFFFu) |
+                   ((topo->vcpu_count & 0xFFu) << 16) | ((topo->apic_id & 0xFFu) << 24);
         /*
          * EDX: clear HTT (#436: single logical processor -- see the
          * HYPE_CPUID_LEAF1_EDX_HTT_BIT comment).
@@ -226,7 +267,11 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
          * required processor feature, so a guest that checks the bit sees an
          * unsupported CPU and stops rather than boots.
          */
-        out->edx = real->edx & ~HYPE_CPUID_LEAF1_EDX_HTT_BIT;
+        /* HTT means "more than one logical processor in this package", so it follows the
+         * modelled vCPU count. Clearing it with several vCPUs present would contradict
+         * EBX[23:16] above and leaf 0x0B below. */
+        out->edx = (topo->vcpu_count > 1u) ? (real->edx | HYPE_CPUID_LEAF1_EDX_HTT_BIT)
+                                           : (real->edx & ~HYPE_CPUID_LEAF1_EDX_HTT_BIT);
         /* Hypervisor-present set. Also clear
          * TSC_DEADLINE (ECX bit 24): with it set, a guest OS arms its
          * LAPIC timer via the IA32_TSC_DEADLINE MSR (0x6e0) -- a mode
@@ -340,14 +385,18 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
          * level type (1=SMT, 2=Core; 0=invalid terminates enumeration) and
          * ECX[7:0] echoes the input level, per the SDM's own algorithm.
          */
-        out->edx = 0u; /* this logical processor's x2APIC ID -- forced to 0 like the LAPIC */
+        /* SMP-2 (#186): report the modelled topology, not a hardcoded uniprocessor. EAX[4:0]
+         * is the number of bits to shift an x2APIC ID right to reach the NEXT level, so the
+         * SMT level shifts past the thread bits and the Core level past the whole package.
+         * EBX is the count of logical processors AT OR BELOW that level. */
+        out->edx = topo->apic_id; /* this logical processor's x2APIC ID */
         if (ecx_in == 0u) {
-            out->eax = 0u;               /* shift to the next level: 1 thread/core */
-            out->ebx = 1u;               /* logical processors at this level */
+            out->eax = hype_cpuid_topo_shift(topo->threads_per_core);
+            out->ebx = topo->threads_per_core;
             out->ecx = 0u | (1u << 8);   /* level 0, type SMT */
         } else if (ecx_in == 1u) {
-            out->eax = 0u;               /* one core, so no further shift */
-            out->ebx = 1u;
+            out->eax = hype_cpuid_topo_shift(topo->vcpu_count);
+            out->ebx = topo->vcpu_count;
             out->ecx = 1u | (2u << 8);   /* level 1, type Core */
         } else {
             out->eax = 0u;
@@ -464,11 +513,14 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
          * sensitive here. */
         out->eax = real->eax;
         out->ebx = real->ebx;
-        /* ECX[7:0] = NC (number of physical cores - 1); [15:12] = ApicIdCoreIdSize.
-         * #436: passed through, this reports the host's core count (e.g. 15 for a 16-core
-         * host), another source that makes the guest start phantom APs. Force it to 0 =
-         * a single core, consistent with leaf 1's cleared HTT and the one modeled vCPU. */
-        out->ecx = 0u;
+        /* ECX[7:0] = NC (number of logical processors in the package - 1); [15:12] =
+         * ApicIdCoreIdSize (bits of the APIC ID used for the core index; 0 means "use NC").
+         * #436: never passed through -- the host's count (e.g. 15 for a 16-core host) is
+         * another source that makes a guest start phantom APs. SMP-2 (#186): report THIS
+         * VM's count, so AMD's enumeration agrees with leaf 1's EBX[23:16] and leaf 0x0B
+         * rather than contradicting them. */
+        out->ecx = ((topo->vcpu_count - 1u) & 0xFFu) |
+                   ((hype_cpuid_topo_shift(topo->vcpu_count) & 0xFu) << 12);
         out->edx = real->edx;
         return;
     }

@@ -535,7 +535,153 @@ static void test_brand_string_is_not_fabricated(void) {
     CHECK_HEX("a zero host brand leaf stays zero", 0u, out.eax);
 }
 
+/* ---- SMP-2 (#186): guest-visible SMP topology ---- */
+
+static void test_topo_shift_rounds_up(void) {
+    /* EAX[4:0] of leaf 0x0B is "bits to shift the x2APIC ID right to reach the next level".
+     * One item needs no bits; non-powers-of-two must round UP, or a guest decoding an APIC ID
+     * reads bits belonging to the level above. */
+    CHECK_HEX("shift(0) treated as 1 -> 0", 0u, hype_cpuid_topo_shift(0u));
+    CHECK_HEX("shift(1) -> 0", 0u, hype_cpuid_topo_shift(1u));
+    CHECK_HEX("shift(2) -> 1", 1u, hype_cpuid_topo_shift(2u));
+    CHECK_HEX("shift(3) rounds up -> 2", 2u, hype_cpuid_topo_shift(3u));
+    CHECK_HEX("shift(4) -> 2", 2u, hype_cpuid_topo_shift(4u));
+    CHECK_HEX("shift(5) rounds up -> 3", 3u, hype_cpuid_topo_shift(5u));
+    CHECK_HEX("shift(8) -> 3", 3u, hype_cpuid_topo_shift(8u));
+}
+
+static void test_null_topology_reproduces_the_uniprocessor_report(void) {
+    /* The whole point of the null default: every pre-SMP caller and test must read unchanged. */
+    hype_cpuid_result_t real = {0x00A00F11u, 0x12345678u, 0x7FFAFBFFu, 0xFFFAFBFFu};
+    hype_cpuid_result_t a, b;
+
+    hype_cpuid_emulate(1, 0, &real, &a);
+    hype_cpuid_emulate_topo(1, 0, 0, (const hype_cpuid_topology_t *)0, &real, &b);
+    CHECK_HEX("null topo == legacy entry point (ebx)", a.ebx, b.ebx);
+    CHECK_HEX("null topo == legacy entry point (edx)", a.edx, b.edx);
+    CHECK_HEX("uniprocessor: 1 logical processor in ebx[23:16]", 1u, (a.ebx >> 16) & 0xFFu);
+    CHECK_HEX("uniprocessor: APIC ID 0 in ebx[31:24]", 0u, (a.ebx >> 24) & 0xFFu);
+    CHECK_HEX("uniprocessor: HTT clear", 0u, a.edx & (1u << 28));
+}
+
+static void test_leaf1_reports_this_vcpus_apic_id_and_the_vm_count(void) {
+    hype_cpuid_result_t real = {0x00A00F11u, 0x99887766u, 0x7FFAFBFFu, 0xFFFAFBFFu};
+    hype_cpuid_result_t out;
+    hype_cpuid_topology_t topo;
+    topo.vcpu_count = 4u;
+    topo.threads_per_core = 1u;
+
+    topo.apic_id = 0u;
+    hype_cpuid_emulate_topo(1, 0, 0, &topo, &real, &out);
+    CHECK_HEX("BSP: apic id 0", 0u, (out.ebx >> 24) & 0xFFu);
+    CHECK_HEX("4 logical processors", 4u, (out.ebx >> 16) & 0xFFu);
+    CHECK_HEX("HTT set once there is more than one", 1u << 28, out.edx & (1u << 28));
+    /* Host brand index + CLFLUSH size still pass through -- they are not topology. */
+    CHECK_HEX("ebx low half preserved", 0x7766u, out.ebx & 0xFFFFu);
+
+    topo.apic_id = 3u;
+    hype_cpuid_emulate_topo(1, 0, 0, &topo, &real, &out);
+    CHECK_HEX("AP: apic id 3", 3u, (out.ebx >> 24) & 0xFFu);
+    CHECK_HEX("count is per-VM, not per-vCPU", 4u, (out.ebx >> 16) & 0xFFu);
+
+    /* x2APIC must STAY masked whatever the topology -- hype is MMIO-LAPIC-only. */
+    CHECK_HEX("x2APIC still cleared with 4 vCPUs", 0u, out.ecx & (1u << 21));
+}
+
+static void test_leaf_b_reports_smt_and_core_levels(void) {
+    hype_cpuid_result_t real = {0, 0, 0, 0};
+    hype_cpuid_result_t out;
+    hype_cpuid_topology_t topo;
+
+    /* 4 vCPUs as 2 cores x 2 threads -- the shape §10 decision 40 says an SMT host gives. */
+    topo.apic_id = 2u;
+    topo.vcpu_count = 4u;
+    topo.threads_per_core = 2u;
+
+    hype_cpuid_emulate_topo(0xBu, 0u, 0, &topo, &real, &out);
+    CHECK_HEX("SMT level: type 1", 1u, (out.ecx >> 8) & 0xFFu);
+    CHECK_HEX("SMT level: echoes input level", 0u, out.ecx & 0xFFu);
+    CHECK_HEX("SMT level: 2 threads", 2u, out.ebx);
+    CHECK_HEX("SMT level: shift 1 past the thread bit", 1u, out.eax);
+    CHECK_HEX("SMT level: x2APIC id is this vCPU's", 2u, out.edx);
+
+    hype_cpuid_emulate_topo(0xBu, 1u, 0, &topo, &real, &out);
+    CHECK_HEX("core level: type 2", 2u, (out.ecx >> 8) & 0xFFu);
+    CHECK_HEX("core level: 4 logical processors", 4u, out.ebx);
+    CHECK_HEX("core level: shift 2 past the whole package", 2u, out.eax);
+
+    hype_cpuid_emulate_topo(0xBu, 2u, 0, &topo, &real, &out);
+    CHECK_HEX("level 2 terminates enumeration (ebx 0)", 0u, out.ebx);
+    CHECK_HEX("level 2 terminates enumeration (type 0)", 0u, (out.ecx >> 8) & 0xFFu);
+}
+
+static void test_leaf_b_single_vcpu_is_still_a_consistent_machine(void) {
+    /* #436's original complaint: an all-zero leaf 0x0B has no consistent reading. One vCPU
+     * must still enumerate as one thread in one core, not as zero of anything. */
+    hype_cpuid_result_t real = {0, 0, 0, 0};
+    hype_cpuid_result_t out;
+    hype_cpuid_topology_t topo = {0u, 1u, 1u};
+
+    hype_cpuid_emulate_topo(0xBu, 0u, 0, &topo, &real, &out);
+    CHECK_HEX("1 thread at the SMT level", 1u, out.ebx);
+    CHECK_HEX("no shift needed", 0u, out.eax);
+    hype_cpuid_emulate_topo(0xBu, 1u, 0, &topo, &real, &out);
+    CHECK_HEX("1 logical processor at the core level", 1u, out.ebx);
+}
+
+static void test_amd_leaf_8_reports_the_vm_not_the_host(void) {
+    /* ECX[7:0] = logical processors - 1. #436: passing the host's through made guests start
+     * phantom APs; reporting fewer than the MADT lists is the same defect mirrored. */
+    hype_cpuid_result_t real = {0x00003030u, 0, 0x0000700Fu, 0};
+    hype_cpuid_result_t out;
+    hype_cpuid_topology_t topo = {0u, 4u, 1u};
+
+    hype_cpuid_emulate_topo(0x80000008u, 0, 0, &topo, &real, &out);
+    CHECK_HEX("NC = vcpus - 1", 3u, out.ecx & 0xFFu);
+    CHECK_HEX("ApicIdCoreIdSize covers 4 ids", 2u, (out.ecx >> 12) & 0xFu);
+
+    topo.vcpu_count = 1u;
+    hype_cpuid_emulate_topo(0x80000008u, 0, 0, &topo, &real, &out);
+    CHECK_HEX("single vCPU: NC 0", 0u, out.ecx & 0xFFu);
+    CHECK_HEX("single vCPU: no core id bits", 0u, (out.ecx >> 12) & 0xFu);
+}
+
+static void test_topology_leaves_agree_with_each_other(void) {
+    /* The failure this guards is a guest seeing two different CPU counts from two leaves and
+     * distrusting one -- which is what the MADT/CPUID mismatch warning is. */
+    hype_cpuid_result_t real = {0x00A00F11u, 0x12345678u, 0x7FFAFBFFu, 0xFFFAFBFFu};
+    hype_cpuid_result_t l1, lb, l8;
+    hype_cpuid_topology_t topo = {1u, 8u, 2u};
+
+    hype_cpuid_emulate_topo(1u, 0, 0, &topo, &real, &l1);
+    hype_cpuid_emulate_topo(0xBu, 1u, 0, &topo, &real, &lb);
+    hype_cpuid_emulate_topo(0x80000008u, 0, 0, &topo, &real, &l8);
+    CHECK_HEX("leaf 1 count == leaf 0xB core-level count", (l1.ebx >> 16) & 0xFFu, lb.ebx);
+    CHECK_HEX("leaf 1 count == leaf 0x80000008 NC + 1", (l1.ebx >> 16) & 0xFFu,
+              (l8.ecx & 0xFFu) + 1u);
+}
+
+static void test_degenerate_topology_values_do_not_produce_nonsense(void) {
+    /* A caller that forgets to set the struct must not make the guest read "0 processors". */
+    hype_cpuid_result_t real = {0, 0, 0, 0};
+    hype_cpuid_result_t out;
+    hype_cpuid_topology_t topo = {0u, 0u, 0u};
+
+    hype_cpuid_emulate_topo(0xBu, 0u, 0, &topo, &real, &out);
+    CHECK_HEX("zero threads_per_core floors at 1", 1u, out.ebx);
+    hype_cpuid_emulate_topo(1u, 0, 0, &topo, &real, &out);
+    CHECK_HEX("zero vcpu_count floors at 1", 1u, (out.ebx >> 16) & 0xFFu);
+}
+
 int main(void) {
+    test_topo_shift_rounds_up();
+    test_null_topology_reproduces_the_uniprocessor_report();
+    test_leaf1_reports_this_vcpus_apic_id_and_the_vm_count();
+    test_leaf_b_reports_smt_and_core_levels();
+    test_leaf_b_single_vcpu_is_still_a_consistent_machine();
+    test_amd_leaf_8_reports_the_vm_not_the_host();
+    test_topology_leaves_agree_with_each_other();
+    test_degenerate_topology_values_do_not_produce_nonsense();
     test_brand_string_leaves_are_not_zero();
     test_advertised_max_extended_leaf_is_backed_by_the_brand_leaves();
     test_brand_string_is_not_fabricated();

@@ -122,6 +122,10 @@ struct hype_vcpu_ctx {
      * la_ioint_irqs[vector - 48] with a huge unsigned value and page-faults.
      */
     uint32_t inj_notify[8];
+    /* SMP-2 (#186): the topology THIS vCPU's guest sees. Per-vCPU, not file-global -- apic_id
+     * differs between vCPUs of one VM, and two VMs with different vcpu_counts take CPUID exits
+     * concurrently on two cores (the #237/#276 shared-singleton class). */
+    hype_cpuid_topology_t cpuid_topo;
 };
 
 /* M8-0b-ii: per-vCPU state pool. Was a single g_vmcb/g_ctx (M2's one-vCPU
@@ -356,6 +360,10 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     ctx->hv_hypercall = 0;
     ctx->hv_ref_tsc = 0;
     ctx->hv_enabled = 0;
+    /* SMP-2: a recycled slot must not inherit the previous guest's topology either. */
+    ctx->cpuid_topo.apic_id = 0u;
+    ctx->cpuid_topo.vcpu_count = 1u;
+    ctx->cpuid_topo.threads_per_core = 1u;
     {
         int i;
         for (i = 0; i < 8; i++) {
@@ -887,7 +895,8 @@ void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     g_spin_cpuid_rip = real->vmcb->save.rip;
 
     real_cpuid(eax_in, ecx_in, &host_real);
-    hype_cpuid_emulate_ex(eax_in, ecx_in, real->hv_enabled, &host_real, &out);
+    hype_cpuid_emulate_topo(eax_in, ecx_in, real->hv_enabled, &real->cpuid_topo, &host_real,
+                            &out); /* SMP-2 */
 
     /* CPUID zero-extends all four registers to their full 64-bit width
      * in 64-bit mode -- assigning a uint32_t into a uint64_t field
@@ -5051,4 +5060,12 @@ int hype_svm_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
 
     real->vmcb->save.rip += decoded.instr_len;
     return 0;
+}
+
+void hype_svm_vcpu_set_topology(hype_vcpu_ctx_t *ctx, uint32_t apic_id, uint32_t vcpu_count,
+                                uint32_t threads_per_core) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->cpuid_topo.apic_id = apic_id;
+    real->cpuid_topo.vcpu_count = vcpu_count ? vcpu_count : 1u;
+    real->cpuid_topo.threads_per_core = threads_per_core ? threads_per_core : 1u;
 }
