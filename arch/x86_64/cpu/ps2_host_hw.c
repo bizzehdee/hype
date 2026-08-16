@@ -52,6 +52,10 @@ static inline uint8_t inb(uint16_t port) {
 /* #218: bytes taken by the polling fallback, so a hardware run can tell "the poll found
  * nothing" from "the poll never ran" -- the distinction that cost this bug a whole session. */
 static uint64_t g_kbd_polled_bytes;
+/* Set once the status port reads 0xFF: no i8042 is answering, so stop probing it entirely
+ * rather than paying an I/O port read per BSP loop iteration forever. */
+static uint8_t g_kbd_no_controller;
+static uint8_t g_kbd_drain_busy;
 
 void hype_host_kbd_init(void) {
     hype_host_kbd_buffer_reset(&g_host_kbd_buffer);
@@ -89,13 +93,30 @@ void hype_host_kbd_isr(const hype_isr_frame_t *frame) {
  */
 static void host_kbd_drain_polled(void) {
     unsigned guard;
-    for (guard = 0; guard < 16u; guard++) {
+    for (guard = 0; guard < 8u; guard++) {
         uint8_t st = inb(HYPE_PS2_HOST_PORT_STATUS);
         uint8_t data;
+        /*
+         * 0xFF is the floating bus -- no i8042 is answering at all. Bit 0 of 0xFF is SET, so a
+         * naive OBF test reads "data is waiting" forever and returns 0xFF as a scancode every
+         * time. That is not hypothetical: the first cut of this shipped without the check and
+         * flooded the input path on real hardware, which doubled and tripled every keystroke,
+         * starved the BSP's render loop so neither guest drew to the screen, and truncated
+         * hype's own log mid-line because the flush never ran again.
+         */
+        if (st == 0xFFu) {
+            g_kbd_no_controller = 1u;
+            return;
+        }
         if ((st & HYPE_PS2_HOST_STATUS_OBF) == 0u) {
-            return; /* nothing waiting */
+            return; /* nothing waiting -- the normal exit */
         }
         data = inb(HYPE_PS2_HOST_PORT_DATA);
+        if (data == 0xFFu && (st & HYPE_PS2_HOST_STATUS_AUX) == 0u) {
+            /* A keyboard never sends 0xFF as a make/break code; it is the floating bus again,
+             * or a controller error byte. Consume it and stop rather than feed it upstream. */
+            return;
+        }
         if ((st & HYPE_PS2_HOST_STATUS_AUX) != 0u) {
             continue; /* mouse byte: consumed so it cannot block the keyboard, then dropped */
         }
@@ -108,7 +129,22 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
     if (hype_host_kbd_buffer_pop(&g_host_kbd_buffer, out_scancode)) {
         return 1;
     }
+    /*
+     * Drain at most once per caller-driven pass, and never from a controller that has already
+     * been found absent. The caller is `while (hype_host_kbd_poll_scancode(&sc))` on the BSP's
+     * tight render/input spin, so an unconditional drain here is called thousands of times a
+     * second and re-probes the port every time -- which is how the floating-bus case became an
+     * endless loop rather than a single bad read.
+     */
+    if (g_kbd_no_controller) {
+        return 0;
+    }
+    if (g_kbd_drain_busy) {
+        return 0; /* re-entered from within the caller's own drain loop */
+    }
+    g_kbd_drain_busy = 1u;
     host_kbd_drain_polled();
+    g_kbd_drain_busy = 0u;
     return hype_host_kbd_buffer_pop(&g_host_kbd_buffer, out_scancode);
 }
 
