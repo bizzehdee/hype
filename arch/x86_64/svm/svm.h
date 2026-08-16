@@ -549,6 +549,10 @@ void hype_svm_vcpu_get_vec_counts(hype_vcpu_ctx_t *ctx, uint8_t vector, uint32_t
  * guest takes it through its own IDT on the next VMRUN (used when hype
  * intercepts a vector only to observe/log it). has_error_code + error_code for
  * faults that push one (#GP/#PF/#DF); pass 0 for #UD and other no-error faults. */
+/* #484: inject an NMI into this vCPU. Call on the vCPU's own core -- see the note at the
+ * definition on why a cross-core VMCB write can be lost. */
+void hype_svm_vcpu_inject_nmi(hype_vcpu_ctx_t *ctx);
+
 void hype_svm_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector,
                                       int has_error_code, uint32_t error_code);
 

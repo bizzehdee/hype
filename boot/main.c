@@ -834,6 +834,14 @@ typedef struct hype_fw_vm {
      * unmapped address and had to refuse it -- handing the guest garbage. FreeBSD touches AHCI
      * from whichever CPU it is on (measured: ahci_ctlr_reset+0x28 on the AP).
      */
+    /*
+     * #484: an NMI IPI pended for a vCPU, injected by that vCPU's OWN core.
+     *
+     * Set by the IPI router from whichever core sent it; consumed in the target's dispatch
+     * loop. Same discipline as the FIXED path: nothing writes another core's VMCB, because
+     * hardware rewrites the control area on exit and the write would be lost (#190).
+     */
+    volatile uint8_t nmi_pending[HYPE_MAX_VCPUS_PER_VM];
     volatile uint64_t shared_ahci_abar;
     volatile uint64_t shared_ata_abar;
     volatile unsigned shared_ahci_mapped;
@@ -4692,6 +4700,16 @@ static void vmm_set_hv_enabled(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, int e
         hype_svm_vcpu_set_hv_enabled(ctx, enabled);
     }
 }
+/* #484: inject an NMI into this vCPU, on its own core. VMX has no equivalent wired up, and the
+ * shim says so with a return code rather than silently doing nothing on Intel. */
+static int vmm_inject_nmi(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind == HYPE_VMM_KIND_SVM) {
+        hype_svm_vcpu_inject_nmi(ctx);
+        return 0;
+    }
+    return -1;
+}
+
 static void vmm_set_pvclock(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map,
                             uint64_t tsc_hz) {
     if (kind == HYPE_VMM_KIND_VMX) {
@@ -5289,6 +5307,24 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
                 hype_debug_print("fw-1 vm%u: SIPI -> vCPU %u started at 0x%llx (real mode) "
                                  "[#188]\n", (unsigned)(vm - g_vms), target,
                                  (unsigned long long)((uint64_t)ipi->vector << 12));
+            }
+            break;
+
+        case HYPE_GUEST_LAPIC_ICR_DELMODE_NMI:
+            /*
+             * #484: NMI IPI. This delivery mode was defined in guest_lapic.h and never handled
+             * here, so it fell through and was DROPPED. Linux sends an NMI IPI to make a CPU
+             * that is not responding print a backtrace -- every RCU stall report ends with
+             * "Sending NMI from CPU 0 to CPUs 1:" -- and uses NMIs for its watchdog, so
+             * dropping them cost the guest both its diagnosis and its recovery path.
+             *
+             * Pended, not injected here, for the same reason the FIXED case pends: the target's
+             * VMCB belongs to whichever core is running it.
+             */
+            for (target = 0; target < n; target++) {
+                if (!selected[target] || vm->vcpu[target] == 0) continue;
+                vm->nmi_pending[target] = 1u;
+                acted++;
             }
             break;
 
@@ -12130,6 +12166,11 @@ wait_for_sipi:
          * that left an AP which HLTs waiting on its LAPIC timer unable to ever wake: hype
          * resumed the HLT without delivering anything, 3.4M times.
          */
+        /* #484: an NMI pended for this vCPU by another core, delivered here on its own. */
+        if (vm->nmi_pending[vi]) {
+            vm->nmi_pending[vi] = 0u;
+            (void)vmm_inject_nmi(kind, ctx);
+        }
         {
             uint8_t ap_timer_vector;
             if (hype_guest_lapic_take_timer_irq(lapic, &ap_timer_vector)) {
@@ -13003,6 +13044,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
             }
             fw_1_dev_lock(vm);
+            /* #484: an NMI pended for the BSP by another vCPU, delivered on its own core. */
+            if (vm->nmi_pending[0]) {
+                vm->nmi_pending[0] = 0u;
+                (void)vmm_inject_nmi(kind, ctx);
+            }
             g_bsp_lock_tsc[(unsigned)(vm - g_vms)] = hype_rdtsc(); /* #484 */
             {
                 uint64_t t_post = hype_rdtsc();

@@ -1526,6 +1526,25 @@ void hype_svm_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector,
     real->vmcb->control.eventinj = einj;
 }
 
+/*
+ * #484: inject an NMI (EVENTINJ type 2, vector 2).
+ *
+ * The guest's ICR supports a delivery mode hype never implemented. Linux uses an NMI IPI to
+ * make a CPU that is not responding print a backtrace -- which is exactly what an RCU stall
+ * report does -- and also for its NMI watchdog. hype's IPI router had cases for INIT, STARTUP,
+ * FIXED and lowest-priority, and silently dropped NMI, so "Sending NMI from CPU 0 to CPUs 1:"
+ * was followed by nothing at all and the guest could neither diagnose nor recover.
+ *
+ * Must be called on the target vCPU's OWN core: this writes its VMCB, and hardware rewrites
+ * the control area on exit, so a cross-core write can be lost (the #190 IPI bug).
+ */
+void hype_svm_vcpu_inject_nmi(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->vmcb->control.eventinj = HYPE_SVM_EVENTINJ_V |
+                                   (HYPE_SVM_EVENTINJ_TYPE_NMI << HYPE_SVM_EVENTINJ_TYPE_SHIFT) |
+                                   2ULL;
+}
+
 void hype_svm_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_irr_clear(real->pending_irr, vector);
