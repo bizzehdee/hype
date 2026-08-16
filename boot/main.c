@@ -829,6 +829,16 @@ typedef struct hype_fw_vm {
     volatile unsigned dev_lock_next;
     volatile unsigned dev_lock_owner;
     /*
+     * #482 / SMP-6: the AHCI ABAR windows, once firmware programs BAR5. These were locals in
+     * the BSP dispatch loop, which meant an AP could not tell an AHCI MMIO fault from any other
+     * unmapped address and had to refuse it -- handing the guest garbage. FreeBSD touches AHCI
+     * from whichever CPU it is on (measured: ahci_ctlr_reset+0x28 on the AP).
+     */
+    volatile uint64_t shared_ahci_abar;
+    volatile uint64_t shared_ata_abar;
+    volatile unsigned shared_ahci_mapped;
+    volatile unsigned shared_ata_mapped;
+    /*
      * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what
      * its guest is told. 1 until SMT-aware core allocation lands (#479, #190) -- and honestly
      * so, since today a granted core supplies exactly one dispatchable thread.
@@ -11308,7 +11318,49 @@ wait_for_sipi:
              * fw_1_dev_lock() is exactly the serialisation SMP-7 added for this: the lock is
              * already held while outside the guest, so the shared hype_pci_t is not raced.
              */
+            int ap_mmio_done = 0;
+            /*
+             * #482: the shared device models, served from the AP under fw_1_dev_lock() -- the
+             * same handlers the BSP dispatch calls. The AP loop previously handled only its own
+             * LAPIC and refused everything else, so once the guest got past AP launch it took
+             * tens of thousands of unhandled NPFs (pci_docfgregread, then ahci_ctlr_reset) and
+             * read garbage from device registers on whichever CPU it happened to be on.
+             *
+             * The ABAR windows come from vm->shared_* rather than the BSP's loop locals, which
+             * is why those had to be published on the VM.
+             */
             if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &vm->pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
+                ap_mmio_done = 1;
+            } else if (kind == HYPE_VMM_KIND_SVM &&
+                       hype_svm_vcpu_handle_hpet_npf(ctx, &vm->hpet, HYPE_HPET_MMIO_BASE,
+                                                     insn) == 0) {
+                ap_mmio_done = 1;
+            } else if (vmm_handle_ioapic_npf(kind, ctx, &vm->ioapic, HYPE_FW_1_IOAPIC_GPA,
+                                             insn) == 0) {
+                ap_mmio_done = 1;
+            } else if (vm->shared_ahci_mapped || vm->shared_ata_mapped) {
+                hype_vmm_npf_t ap_npf;
+                vmm_get_last_npf(kind, ctx, &ap_npf);
+                if (vm->shared_ata_mapped &&
+                    ap_npf.guest_phys_addr >= vm->shared_ata_abar &&
+                    ap_npf.guest_phys_addr < vm->shared_ata_abar + HYPE_AHCI_MMIO_SIZE) {
+                    if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ata_ahci,
+                                                     &g_fw_1_ata_disk,
+                                                     (uint64_t)vm->shared_ata_abar,
+                                                     &g_fw_1_dma_map, insn) == 0) {
+                        ap_mmio_done = 1;
+                    }
+                } else if (vm->shared_ahci_mapped &&
+                           ap_npf.guest_phys_addr >= vm->shared_ahci_abar &&
+                           ap_npf.guest_phys_addr < vm->shared_ahci_abar + HYPE_AHCI_MMIO_SIZE) {
+                    if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_ata_disk,
+                                                     (uint64_t)vm->shared_ahci_abar,
+                                                     &g_fw_1_dma_map, insn) == 0) {
+                        ap_mmio_done = 1;
+                    }
+                }
+            }
+            if (ap_mmio_done) {
                 /* handled */
             } else if (vmm_handle_lapic_npf(kind, ctx, lapic, HYPE_LAPIC_DEFAULT_BASE, insn) != 0) {
                 if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
@@ -11336,6 +11388,21 @@ wait_for_sipi:
             } else if (vmm_handle_uart_ioio(kind, ctx, &vm->uart2, HYPE_SERIAL_COM2) == 0) {
                 /* handled */
             } else if (vmm_handle_ioio(kind, ctx, &vm->pic, &vm->pit) == 0) {
+                /* handled */
+            /*
+             * #482: the rest of the shared port-I/O models, under the same device lock. The AP
+             * previously fell through to "absorb the port" for all of these, which silently
+             * hands the guest a wrong read. Measured after the MMIO half landed: 30858
+             * unhandled AP exits at atkbdc_isa_probe -- the PS/2 controller probed from the AP.
+             * All of these structures are already per-VM.
+             */
+            } else if (vmm_handle_ps2_ioio(kind, ctx, &vm->ps2, &vm->mouse, 0) == 0) {
+                /* handled */
+            } else if (vmm_handle_cmos_ioio(kind, ctx, &vm->cmos) == 0) {
+                /* handled */
+            } else if (vmm_handle_fw_cfg_ioio(kind, ctx, &vm->fw_cfg, &g_fw_1_dma_map) == 0) {
+                /* handled */
+            } else if (vmm_handle_acpi_pm_timer_ioio(kind, ctx) == 0) {
                 /* handled */
             } else {
                 /*
@@ -15403,6 +15470,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     if (bar5 != 0) {
                         ahci_abar = bar5;
                         ahci_mapped = 1;
+                        vm->shared_ahci_abar = bar5;   /* #482: visible to AP loops */
+                        vm->shared_ahci_mapped = 1u;
                         hype_debug_print("fw-1: AHCI BAR5 (ABAR) enabled at guest-physical 0x%llx -- "
                                           "routing its MMIO to the CD-ROM model now\n",
                                           (unsigned long long)bar5);
@@ -15417,6 +15486,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     if (abar != 0) {
                         ata_abar = abar;
                         ata_mapped = 1;
+                        vm->shared_ata_abar = abar;    /* #482: visible to AP loops */
+                        vm->shared_ata_mapped = 1u;
                         hype_debug_print("fw-1: #262 SATA-disk AHCI BAR5 (ABAR) enabled at "
                                           "guest-physical 0x%llx -- the guest firmware has "
                                           "enumerated the second HBA\n", (unsigned long long)abar);
