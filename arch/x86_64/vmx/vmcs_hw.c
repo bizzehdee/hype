@@ -592,6 +592,41 @@ static inline uint64_t vmptrst_current(void) {
 }
 
 /*
+ * #483: make ctx's VMCS current on THIS core before touching any VMCS field.
+ *
+ * Every accessor in this file reads and writes the CURRENT VMCS -- the current pointer is per
+ * logical processor, set by whoever VMPTRLDed last. With one vCPU that was always the right
+ * one, which is why none of this existed. With two, building vCPU 1 left ITS VMCS current on
+ * the core doing the building, so every later configuration write aimed at vCPU 0 --
+ * external-interrupt exiting included -- landed in vCPU 1's VMCS. vCPU 0 then ran tick-blind:
+ * the first host interrupt pierced the guest and it never exited again. Measured by the #483
+ * BSPPROBE watchdog as `exits=1 IN-GUEST for 195s` the moment a second VMCS merely EXISTED.
+ *
+ * VMCLEAR-before-VMPTRLD is the reload protocol proven on the run path: it writes the target's
+ * cached state back to memory and returns it to the clear state, so `launched` must drop to 0
+ * (the next entry is a VMLAUNCH, not a VMRESUME). A no-op when the VMCS is already current --
+ * which is every hot-path call -- at the cost of one VMPTRST.
+ */
+static void vmx_ensure_current(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    uint64_t want, cur;
+    if (real == 0 || real->vmcs_region == 0) {
+        return;
+    }
+    want = (uint64_t)(uintptr_t)real->vmcs_region;
+    cur = vmptrst_current();
+    if (cur == want) {
+        return;
+    }
+    g_vmx_vmcs_reload_count++;
+    g_vmx_vmcs_reload_last_cur = cur;
+    g_vmx_vmcs_reload_last_want = want;
+    if (vmclear(real->vmcs_region) == 0 && vmptrld(real->vmcs_region) == 0) {
+        real->launched = 0;
+    }
+}
+
+/*
  * INVVPID, single-context (#273): drop every linear and combined mapping tagged
  * with `vpid`. Issued when a pool slot is handed to a new guest -- the slot's
  * VPID is stable, so without this a fresh guest could inherit its predecessor's
@@ -1279,24 +1314,14 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
      * being loaded here, and `launched` is reset because VMCLEAR puts the VMCS back into the
      * clear state where the next entry must be VMLAUNCH, not VMRESUME.
      */
-    if (real->vmcs_region != 0) {
-        uint64_t want = (uint64_t)(uintptr_t)real->vmcs_region;
-        uint64_t cur_vmcs = vmptrst_current();
-        if (cur_vmcs != want) {
-            /* #483 diagnostic: this must fire ONCE per vCPU per core. If it fires on every
-             * entry the comparison is wrong, and the VMCLEAR below would be discarding live
-             * guest state every time -- so it is counted rather than assumed. */
-            g_vmx_vmcs_reload_count++;
-            g_vmx_vmcs_reload_last_cur = cur_vmcs;
-            g_vmx_vmcs_reload_last_want = want;
-            if (vmclear(real->vmcs_region) != 0 || vmptrld(real->vmcs_region) != 0) {
-                info->reason = (1ULL << 63);
-                info->qualification = 0;
-                info->guest_rip = 0;
-                return -1;
-            }
-            real->launched = 0;
-        }
+    vmx_ensure_current(ctx);
+    if (real->vmcs_region != 0 &&
+        vmptrst_current() != (uint64_t)(uintptr_t)real->vmcs_region) {
+        /* The reload failed -- entering would run some OTHER vCPU's state. */
+        info->reason = (1ULL << 63);
+        info->qualification = 0;
+        info->guest_rip = 0;
+        return -1;
     }
     /* #251: run the guest under its own XCR0, and put hype's back afterwards. */
     if (real->guest_xcr0_valid && vmx_ensure_osxsave()) {
@@ -1448,6 +1473,7 @@ static unsigned g_vmx_cpuid_ring_n = 0;
  * unhandled for the caller to report rather than quietly skipped.
  */
 int hype_vmx_vcpu_handle_xsetbv(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint64_t requested, supported;
     hype_cpuid_result_t xs;
@@ -1496,6 +1522,7 @@ void hype_vmx_vcpu_dump_cpuid_ring(void) {
 }
 
 void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint32_t eax_in = (uint32_t)real->gprs[0];
     uint32_t ecx_in = (uint32_t)real->gprs[1];
@@ -1583,6 +1610,7 @@ static void vmx_msr_return(struct hype_vcpu_ctx *real, uint64_t value) {
 }
 
 int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint32_t msr_number = (uint32_t)real->gprs[1];
     hype_msr_action_t action = hype_msr_decide_ex(msr_number, is_write, real->hv_enabled);
@@ -1822,6 +1850,7 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
 }
 
 int hype_vmx_vcpu_handle_hypercall(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
 
     if (real == 0 || !real->hv_enabled ||
@@ -1851,6 +1880,7 @@ void hype_vmx_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi) {
  * Returns 0 if handled, -1 for an unmodelled port.
  */
 int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok, rc;
     uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
@@ -1941,6 +1971,7 @@ static void vmx_mmio_finish_read_at(const hype_mmio_decode_t *d, uint64_t *reg, 
  */
 int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
                                     uint64_t pf_base_phys) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_mmio_decode_t decoded;
     uint64_t *reg;
@@ -2007,6 +2038,7 @@ int hype_vmx_vcpu_handle_pflash_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
  */
 int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
                                       uint64_t ecam_base_phys) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_mmio_decode_t decoded;
     hype_pci_ecam_addr_t addr;
@@ -2066,6 +2098,7 @@ int hype_vmx_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
  */
 int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
                                   uint64_t ahci_base_phys) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_mmio_decode_t decoded;
     uint64_t *reg;
@@ -2137,6 +2170,7 @@ int hype_vmx_vcpu_handle_ahci_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_
  * to the keyboard model; value in RAX (gprs[0] low byte).
  */
 int hype_vmx_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok, rc;
     uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
@@ -2168,6 +2202,7 @@ int hype_vmx_vcpu_handle_ps2_kbd_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd)
  */
 int hype_vmx_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hype_ps2_mouse_t *mouse,
                                   int *out_kbd_wait) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok;
     uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
@@ -2227,6 +2262,7 @@ int hype_vmx_vcpu_handle_ps2_ioio(hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd, hyp
  * injection (via the interrupt-window path in hype_vmx_vcpu_request_interrupt).
  */
 void hype_vmx_vcpu_deliver_pic_irq(hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip, uint8_t irq) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     uint8_t vector;
     hype_pic_emu_raise_irq(chip, irq);
     if (hype_pic_emu_acknowledge_highest_priority(chip, &vector)) {
@@ -2262,6 +2298,7 @@ static uint64_t vmx_dma_xlate(const hype_gpa_map_t *map, uint64_t gpa, uint64_t 
  */
 int hype_vmx_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
                                      const hype_gpa_map_t *dma_map) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_vmm_ioio_t io;
     int ok;
@@ -2489,6 +2526,7 @@ static void vmx_mmio_finish_read(struct vmx_mmio_access *m, uint32_t value) {
  * process_ahci_ata_command_slot() (SATA command + guest-RAM DMA). */
 int hype_vmx_vcpu_handle_ahci_disk_npf(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
                                        hype_ata_disk_t *disk, uint64_t ahci_base_phys) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
     if (vmx_mmio_begin(real, ahci_base_phys, HYPE_AHCI_MMIO_SIZE, &m) != 0) {
@@ -2542,6 +2580,7 @@ int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ah
                                            hype_ata_disk_t *disk, uint64_t ahci_base_phys,
                                            const hype_gpa_map_t *dma_map,
                                            const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
 
@@ -2586,6 +2625,7 @@ int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ah
  * hype_svm_vcpu_handle_bochs_vbe_npf. DISPI registers are 16-bit only. */
 int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                        uint64_t mmio_base_phys) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
     if (vmx_mmio_begin(real, mmio_base_phys, HYPE_BOCHS_VBE_MMIO_SIZE, &m) != 0) {
@@ -2710,11 +2750,13 @@ static int vmx_virtio_blk_npf_common(struct hype_vcpu_ctx *real, hype_virtio_blk
  * Real interrupt delivery reloads CS from the guest GDT and vectors through the
  * guest IDT, so both must point at real tables (VMWRITE base+limit). */
 void hype_vmx_vcpu_set_gdt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     (void)ctx;
     vmwrite(HYPE_VMCS_GUEST_GDTR_BASE, base);
     vmwrite(HYPE_VMCS_GUEST_GDTR_LIMIT, limit);
 }
 void hype_vmx_vcpu_set_idt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     (void)ctx;
     vmwrite(HYPE_VMCS_GUEST_IDTR_BASE, base);
     vmwrite(HYPE_VMCS_GUEST_IDTR_LIMIT, limit);
@@ -2796,6 +2838,7 @@ static void vmx_note_injected(struct hype_vcpu_ctx *real, uint8_t vector) {
 }
 
 int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     unsigned word;
 
@@ -2817,6 +2860,7 @@ int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector
 }
 
 void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int staged = vmx_entry_event_staged();
     int ready = vmx_can_accept_interrupt();
@@ -2860,6 +2904,7 @@ void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
  * Returns 1 if it injected.
  */
 int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int v;
 
@@ -2892,6 +2937,7 @@ int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
  * CPU delivers it through the guest IDT on VMRESUME.
  */
 void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int v = hype_svm_irr_highest(real->pending_irr);
     if (v >= 0 && !vmx_entry_event_staged()) {
@@ -2990,12 +3036,14 @@ uint64_t hype_vmx_vcpu_get_gpr(hype_vcpu_ctx_t *ctx, unsigned idx) {
     return real->gprs[idx];
 }
 uint64_t hype_vmx_vcpu_get_cr3(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     int ok;
     (void)ctx;
     return vmread(HYPE_VMCS_GUEST_CR3, &ok);
 }
 
 void hype_vmx_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     (void)ctx;
     vmwrite(HYPE_VMCS_GUEST_RIP, rip);
 }
@@ -3009,6 +3057,7 @@ void hype_vmx_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip) {
  * advertises it), so the ptwalk path is the one both backends actually use.
  */
 const uint8_t *hype_vmx_vcpu_guest_insn_bytes(hype_vcpu_ctx_t *ctx, uint8_t *out_num) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     (void)ctx;
     if (out_num != 0) {
         *out_num = 0;
@@ -3018,6 +3067,7 @@ const uint8_t *hype_vmx_vcpu_guest_insn_bytes(hype_vcpu_ctx_t *ctx, uint8_t *out
 
 /* The EPT violation that caused this exit, in the vendor-neutral shape. */
 void hype_vmx_vcpu_get_last_npf(hype_vcpu_ctx_t *ctx, hype_vmm_npf_t *out) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     int ok;
     (void)ctx;
     out->guest_phys_addr = vmread(HYPE_VMCS_GUEST_PHYSICAL_ADDRESS, &ok);
@@ -3051,6 +3101,7 @@ static void vmx_decode_ioio(hype_vmm_ioio_t *out) {
 }
 
 void hype_vmx_vcpu_peek_ioio(hype_vcpu_ctx_t *ctx, hype_vmm_ioio_t *out) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     (void)ctx;
     vmx_decode_ioio(out);
 }
@@ -3058,6 +3109,7 @@ void hype_vmx_vcpu_peek_ioio(hype_vcpu_ctx_t *ctx, hype_vmm_ioio_t *out) {
 /* Unhandled port I/O: report it and step over the instruction so the guest
  * makes progress (GLADDER-1's absorb-rather-than-die posture). */
 void hype_vmx_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_vmm_ioio_t *out) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     (void)ctx;
     vmx_decode_ioio(out);
     if (out->is_in) {
@@ -3072,6 +3124,7 @@ void hype_vmx_vcpu_handle_unknown_ioio(hype_vcpu_ctx_t *ctx, hype_vmm_ioio_t *ou
 }
 
 void hype_vmx_vcpu_set_exception_intercepts(hype_vcpu_ctx_t *ctx, uint32_t mask) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     (void)ctx;
     vmwrite(HYPE_VMCS_EXCEPTION_BITMAP, mask);
 }
@@ -3082,6 +3135,7 @@ void hype_vmx_vcpu_set_exception_intercepts(hype_vcpu_ctx_t *ctx, uint32_t mask)
  * carry bits the VMCS build set, and clobbering them would fail VM-entry.
  */
 void hype_vmx_vcpu_enable_intr_intercept(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     int ok;
     uint64_t pin = vmread(HYPE_VMCS_PIN_BASED_VM_EXEC_CONTROL, &ok);
     (void)ctx;
@@ -3100,6 +3154,7 @@ void hype_vmx_vcpu_enable_intr_intercept(hype_vcpu_ctx_t *ctx) {
  * the honest translation rather than inventing a tick count.
  */
 void hype_vmx_vcpu_enable_pause_filter(hype_vcpu_ctx_t *ctx, uint16_t count, uint16_t threshold) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     int ok;
     uint64_t proc, proc2;
     (void)ctx;
@@ -3122,6 +3177,7 @@ void hype_vmx_vcpu_enable_pause_filter(hype_vcpu_ctx_t *ctx, uint16_t count, uin
  */
 void hype_vmx_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector, int has_error_code,
                                       uint32_t error_code) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     int ok;
     uint32_t info = 0x80000000u | (3u << 8) | (uint32_t)vector;
     (void)ctx;
@@ -3134,6 +3190,7 @@ void hype_vmx_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector, int 
 }
 
 void hype_vmx_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_irr_clear(real->pending_irr, vector);
 }
@@ -3147,6 +3204,7 @@ void hype_vmx_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector) {
  * has to go back to active or VM-entry re-halts immediately.
  */
 void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     int ok;
     uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
     uint64_t block = vmread(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE, &ok);
@@ -3158,6 +3216,7 @@ void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
 }
 
 void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok;
     out->rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
@@ -3217,6 +3276,7 @@ static void vmx_pvclock_arm_wall_clock(struct hype_vcpu_ctx *real, uint64_t msr_
 }
 
 void hype_vmx_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, uint64_t tsc_hz) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->pvclock_map = map;
     hype_pvclock_calc_scale(tsc_hz, &g_vmx_pvclock_mul, &g_vmx_pvclock_shift);
@@ -3280,6 +3340,7 @@ static int vmx_mmio_begin_insn(struct hype_vcpu_ctx *real, uint64_t base, uint64
  * access fails closed rather than being half-emulated. */
 int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                    uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
 
@@ -3317,6 +3378,7 @@ int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
 /* Guest I/O APIC MMIO. IOREGSEL/IOWIN are 32-bit only. */
 int hype_vmx_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
                                     uint64_t ioapic_base_phys, const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
 
@@ -3359,6 +3421,7 @@ int hype_vmx_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
 int hype_vmx_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
                                       uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map,
                                       const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
 
@@ -3406,6 +3469,7 @@ int hype_vmx_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, h
  * address range to check -- the caller has already tried every modelled region.
  */
 int hype_vmx_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_mmio_decode_t decoded;
     int ok;
@@ -3453,6 +3517,7 @@ int hype_vmx_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_ins
 /* Guest 16550 UART. Byte-wide registers at base_port + offset. */
 int hype_vmx_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart,
                                    uint16_t base_port) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_vmm_ioio_t io;
     uint32_t offset;
@@ -3474,6 +3539,7 @@ int hype_vmx_vcpu_handle_uart_ioio(hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart
 
 /* CMOS/RTC index (0x70) + data (0x71). */
 int hype_vmx_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_vmm_ioio_t io;
 
@@ -3507,6 +3573,7 @@ int hype_vmx_vcpu_handle_cmos_ioio(hype_vcpu_ctx_t *ctx, hype_cmos_t *cmos) {
  */
 int hype_vmx_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint16_t *value,
                                       int *slp_en) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_vmm_ioio_t io;
 
@@ -3530,6 +3597,7 @@ int hype_vmx_vcpu_handle_pm1_cnt_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, uint1
 
 /* #94: 0xCF9 reset control -- same three-way contract as the SVM original. */
 int hype_vmx_vcpu_handle_reset_ctl_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, int *reset_requested) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_vmm_ioio_t io;
 
@@ -3549,6 +3617,7 @@ int hype_vmx_vcpu_handle_reset_ctl_ioio(hype_vcpu_ctx_t *ctx, uint16_t port, int
 
 /* Legacy PCI config access via CF8/CFC. */
 int hype_vmx_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_vmm_ioio_t io;
 
@@ -3587,6 +3656,7 @@ int hype_vmx_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
 int hype_vmx_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_port,
                                          const hype_gpa_map_t *dma_map, uint8_t *out_bytes,
                                          unsigned int out_cap, unsigned int *out_n) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_vmm_ioio_t io;
 
@@ -3635,6 +3705,7 @@ int hype_vmx_vcpu_handle_debug_port_ioio(hype_vcpu_ctx_t *ctx, uint16_t base_por
  * hardware, matching the other "nothing to do" IOIO writes here.
  */
 int hype_vmx_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_vmm_ioio_t io;
 
@@ -3695,6 +3766,7 @@ int hype_vmx_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
  * field. Returns -1 if no valid interruption is recorded.
  */
 int hype_vmx_vcpu_exit_exception_vector(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     int ok;
     uint64_t info = vmread(HYPE_VMCS_VM_EXIT_INTR_INFO, &ok);
     (void)ctx;
@@ -3705,6 +3777,7 @@ int hype_vmx_vcpu_exit_exception_vector(hype_vcpu_ctx_t *ctx) {
 }
 
 uint32_t hype_vmx_vcpu_exit_exception_error_code(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     int ok;
     uint64_t info = vmread(HYPE_VMCS_VM_EXIT_INTR_INFO, &ok);
     (void)ctx;
@@ -3720,6 +3793,7 @@ uint32_t hype_vmx_vcpu_exit_exception_error_code(hype_vcpu_ctx_t *ctx) {
  */
 int hype_vmx_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
                                         const hype_blk_backend_t *be, uint64_t mmio_base_phys) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok;
     uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
@@ -3733,6 +3807,7 @@ int hype_vmx_vcpu_handle_virtio_blk_npf_map(hype_vcpu_ctx_t *ctx, hype_virtio_bl
                                             const hype_blk_backend_t *be,
                                             const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
                                             const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     return vmx_virtio_blk_npf_common((struct hype_vcpu_ctx *)ctx, dev, be, dma_map, mmio_base_phys,
                                      guest_insn_bytes);
 }
@@ -3745,6 +3820,7 @@ int hype_vmx_vcpu_handle_virtio_blk_npf_map(hype_vcpu_ctx_t *ctx, hype_virtio_bl
 int hype_vmx_vcpu_handle_pci_ecam_npf_insn(hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
                                            uint64_t ecam_base_phys,
                                            const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
     hype_pci_ecam_addr_t addr;
@@ -3787,6 +3863,7 @@ int hype_vmx_vcpu_handle_pci_ecam_npf_insn(hype_vcpu_ctx_t *ctx, hype_pci_t *pci
  */
 void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
                                   uint64_t ept_root) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     (void)ctx; /* single static ctx today -- see #245 */
     (void)hype_vmx_vcpu_create(guest_rip, guest_rsp, ept_root);
 }
@@ -3863,6 +3940,7 @@ static void vmx_sync_long_mode(void) {
 }
 
 int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok;
     uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
@@ -3905,6 +3983,7 @@ int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx) {
 }
 
 void hype_vmx_vcpu_dump_ept_violation(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     int ok;
     (void)ctx;
     /* Read the reason back from the VMCS rather than trusting a value threaded
@@ -3968,6 +4047,7 @@ void hype_vmx_vcpu_get_cr_diag(hype_vcpu_ctx_t *ctx, unsigned gpr, hype_vmx_cr_d
 }
 
 void hype_vmx_vcpu_set_hv_enabled(hype_vcpu_ctx_t *ctx, int enabled) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     ((struct hype_vcpu_ctx *)ctx)->hv_enabled = enabled ? 1 : 0;
 }
 
@@ -3976,6 +4056,7 @@ void hype_vmx_vcpu_set_hv_enabled(hype_vcpu_ctx_t *ctx, int enabled) {
 int hype_vmx_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
                                   const hype_nvme_ctx_t *nctx, uint64_t mmio_base_phys,
                                   uint32_t bar_size, const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
 
@@ -4046,6 +4127,7 @@ void hype_vmx_wbinvd_stats(unsigned long long *count, uint64_t *last_rip) {
 
 void hype_vmx_vcpu_set_topology(hype_vcpu_ctx_t *ctx, uint32_t apic_id, uint32_t vcpu_count,
                                 uint32_t threads_per_core) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->cpuid_topo.apic_id = apic_id;
     real->cpuid_topo.vcpu_count = vcpu_count ? vcpu_count : 1u;
