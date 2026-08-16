@@ -672,6 +672,23 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     if (vmclear(vmcs_region) != 0) {
         return -1;
     }
+    /*
+     * #483: VMCLEAR whatever VMCS is currently loaded on this core before making this one
+     * current.
+     *
+     * Intel requires a VMCS to be VMCLEARed before it stops being current, or its cached
+     * state is not guaranteed to be written back to memory. This function VMPTRLDs each VMCS
+     * as it builds it, and the BSP builds every vCPU's -- so building vCPU 1 displaced vCPU 0's
+     * VMCS with no VMCLEAR, potentially leaving vCPU 0 incoherent before it had ever run. That
+     * is an ISA violation independent of any symptom, so it is fixed here rather than worked
+     * around at entry.
+     */
+    {
+        uint64_t cur = vmptrst_current();
+        if (cur != 0ull && cur != ~0ull && cur != (uint64_t)(uintptr_t)vmcs_region) {
+            (void)vmclear((const void *)(uintptr_t)&cur);
+        }
+    }
     /* #483: the builder's core owns it from here; hype_vmx_vcpu_run() re-loads it if the
      * running core is a different one. */
     if (vmptrld(vmcs_region) != 0) {
