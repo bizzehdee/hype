@@ -372,6 +372,25 @@ distinct from any guest's own console:
   keyboard-routing code, not "forward to whichever VM last had focus by
   default" — the latter would let dashboard-navigation keystrokes leak into
   a backgrounded guest's virtual PS/2 input stream.
+- **Operator terminal** (added 2026-08-17, TERM-9/#485): alongside the
+  rendered per-VM consoles, the dashboard layer owns a host-level command
+  line for operations that a list-and-hotkey UI expresses poorly. Its
+  command set is the authoritative operator surface for changing the
+  machine's configuration at runtime:
+  - `create` — interactive VM-creation wizard (§6f Create; TERM-10).
+  - `mkdisk` — create a preallocated qcow2 backing image on a chosen host
+    disk's existing filesystem (§6d; TERM-11).
+  - `attach` / `detach` — bind or unbind a device (USB, physical disk,
+    SATA) to a VM (§10 decision 41; TERM-12/TERM-13).
+  - `set` — edit a VM's configuration, applying immediately what can be
+    applied and queueing what needs a reboot, saying which is which
+    (TERM-14).
+  - `delete` — remove a VM with a two-step confirmation (§6f Delete;
+    TERM-15).
+  Every mutation these commands make is written back to `hype.cfg`
+  (the unknown-key-retaining write-back contract of
+  `docs/hype-cfg-spec.md`, #220/#221, is what makes that lossless), so
+  the runtime set and the configured set never drift.
 - Explicitly **local-only for v1** — no serial or network exposure. This
   keeps the feature inside the existing console-ownership model instead of
   adding a network stack or serial protocol to the trusted hypervisor core.
@@ -460,8 +479,13 @@ surface for all of this.
   `GET CONFIGURATION`'s current profile is DVD-ROM — so a guest treats it
   exactly as a physical DVD-ROM presenting a real disc. See §10 decision 25.
 - **Virtual disk target (`target_disk = file:<path>`)**: a raw (or qcow2,
-  §10 decision 3) file on host storage, created ahead of time by
-  `tools/make-disk-image.sh` — *not* by the hypervisor. `target_disk_size_gb`
+  §10 decision 3) file on host storage. Created ahead of time by
+  `tools/make-disk-image.sh`, **or by hype itself** via the terminal's
+  `mkdisk` command (added 2026-08-17, TERM-9/#485; TERM-11): a
+  **preallocated** qcow2 image — every cluster allocated and its metadata
+  written at create time, no thin provisioning (§13) — on a filesystem
+  that already exists on a chosen host disk. hype creates *files on
+  existing volumes*; it does not partition disks or make filesystems. `target_disk_size_gb`
   is a **declaration of intent that hype validates**, not a creation
   instruction: hype compares it against the resolved image's real size and
   reports a mismatch, which catches a VM pointed at a stale or truncated
@@ -634,6 +658,22 @@ which one currently has focus:
 - All four are available per-VM from the dashboard, independent of console
   focus — e.g. force-power-off a hung background VM without switching to
   its console first.
+
+Two further verbs change the VM *set* rather than a VM's power state
+(added 2026-08-17, TERM-9/#485 — this reverses part of §10 decision 33,
+recorded there):
+
+- **Create** — define a new VM at runtime from the terminal (§6b) and
+  start it with no host reboot. Gated by the same admission check as a
+  boot-time definition (§6i, #453): a VM that would have been refused at
+  startup is refused at create time, with the real numbers in the
+  message. The new definition is written back to `hype.cfg`, so a later
+  host reboot produces the same VM set.
+- **Delete** — remove a defined VM. If it is running, Delete
+  force-powers-off first (same path as above, same guarantees), then
+  removes the definition from `hype.cfg`. Backing disk images are
+  **never touched** — deleting a VM deletes configuration, not data;
+  reclaiming the image is a separate, explicit operator act.
 
 ## 6g. Fault isolation between guests
 
@@ -1561,8 +1601,23 @@ isn't lost.
       never *misreport* the count).
     - Rejected: raising the constant (2 -> 4 -> 16 is whack-a-mole, and
       #237's silent 2-slot VMCB pool clamp is exactly the failure class
-      this breeds); runtime VM hotplug (out of scope — the set of VMs is
-      fixed at boot from `hype.cfg`, only their power state changes, §6f).
+      this breeds).
+    - ~~Rejected: runtime VM hotplug (out of scope — the set of VMs is
+      fixed at boot from `hype.cfg`, only their power state changes,
+      §6f).~~ **REVERSED 2026-08-17 (TERM-9, #485)** for operator-driven
+      changes: an operator may define a new VM at runtime from the
+      terminal and start it with no host reboot, and may delete one
+      (§6f Create/Delete). The reasons this rejection gave do not vanish
+      — they become requirements on the implementation: a free per-VM
+      state slot must exist (#393's pool, not a compile-time constant),
+      the new VM's guest RAM comes from the pre-reserved pool (#449),
+      and the same admission check that gates startup gates creation
+      (#453, §6i) — a create that would not have been admitted at boot
+      is refused at runtime with the same real numbers in the message.
+      What stays true: nothing *external* changes the VM set — no API,
+      no guest, no file appearing on a disk. Only the local operator at
+      the terminal (§6b), and every change is written back to `hype.cfg`
+      so the set survives a host reboot exactly as configured.
 
 34. **Driver interfaces — decided: a common vtable PER DRIVER TYPE where two
     or more real implementations share shape, plus one shared host-PCI-device
@@ -1965,6 +2020,32 @@ isn't lost.
 
     Delivered by #466–#478.
 
+    **Parameters settled 2026-08-16 (grilling session):**
+    - **Over-commit ratio** is a global `[hype]` setting, `shared_overcommit_ratio`
+      (default `4.0`), not per-VM or per-`isolation_group` — there is one shared
+      pool per host today (§3). Admission (§6i) refuses startup if any
+      `cpu_mode = shared` VM is configured while the ratio is `< 1.0`.
+    - **Time-slice length** is a global `[hype]` setting, `shared_timeslice_us`
+      (default `4000`, i.e. 4ms — conventional desktop-scheduler scale, short
+      enough to bound worst-case latency for other shared-tier VMs, long enough
+      to keep context-switch overhead low relative to it), fixed by default with
+      an operator override. No per-VM override: a shorter slice for one
+      latency-sensitive shared VM is a plausible future knob, but nothing today
+      asks for it, and a per-VM slice multiplies SMP-20's timing proof surface
+      (every distinct slice length becomes a separate case to verify).
+    - **NUMA placement** prefers node-local and falls back cross-node with a
+      loud diagnostic, rather than refusing admission outright — matching §6i's
+      existing pattern of failing fast only for actual overcommit, not for a
+      suboptimal-but-workable placement. A hard single-node-only rule would make
+      small or oddly-shaped hosts un-startable over a performance concern, not a
+      safety one.
+    - **SMP-20's acceptance criteria** (what "proven" means, operationally) are
+      explicitly left to the ticket, not recorded here — plan.md tracks
+      decisions and architecture, §9 already points at SMP-20 as the pointer,
+      and pulling test-acceptance detail into the plan duplicates the board and
+      rots faster than the ticket does.
+      See `docs/hype-cfg-spec.md` §5.1 for both new keys' full definitions.
+
 40. **SMT siblings — decided: allocate whole physical cores, execute on every
     thread (2026-08-16).** Recorded because decision 39 left the unit of
     execution undefined, #473 offered "SMT off for the pool" as an option,
@@ -2022,6 +2103,48 @@ isn't lost.
 
     Delivered by #479 plus scope amendments on #186, #190, #472, #473, #477.
 
+41. **Device hotplug — decided: attaching and detaching guest-visible
+    hardware while a VM runs is in v1 scope, on the buses that can
+    express it; every other bus queues the change to the VM's next boot
+    (2026-08-17, TERM-9/#485).** Recorded because decision 33 rejected *VM*
+    hotplug and nothing anywhere said what happens to a `attach`/`detach`
+    (§6b terminal, TERM-12/TERM-13) issued against a running VM.
+
+    **The rule.** An attach or detach against a running VM applies
+    **immediately** on a bus whose guest-visible contract includes runtime
+    arrival/removal, and is otherwise **queued** to the VM's next boot —
+    reported to the operator as queued, never refused and never silently
+    dropped. A queued change is written to `hype.cfg` like any other `set`
+    edit, so it survives a host reboot and applies on the VM's next start
+    wherever that happens.
+
+    **Which buses hot-attach in v1.**
+    - **USB (xHCI)**: yes — hotplug is the bus's native model. hype flips
+      the emulated root-hub port's connect status and raises the port
+      status-change event; every guest OS already handles this path.
+    - **AHCI/SATA**: yes — SATA defines surprise hotplug (PxSSTS.DET
+      transitions + PxIS port-change interrupt), and AHCI-aware OSes
+      handle it. hype models the port going device-present/absent.
+    - **virtio-blk and NVMe (PCI-attached)**: no — arrival/removal of the
+      *function itself* is PCIe hotplug, which hype's guest chipset model
+      does not implement (no slot capability, no ACPI hotplug methods),
+      so these queue to next boot. This is the fallback rule doing its
+      job, not a missing feature: implementing PCIe hotplug machinery for
+      v1 was considered and rejected below.
+
+    **Rejected: emulating PCIe/ACPI hotplug so every bus hot-attaches.**
+    It adds a chipset-model surface (slot registers, ACPI methods, guest
+    OS quirks per family) whose only v1 customer is attaching a disk
+    without rebooting — which the queue-to-next-boot fallback already
+    covers honestly, and which USB/SATA cover immediately for the media
+    cases that actually motivated TERM-12. Revisit only if a real
+    operator need for runtime virtio/NVMe arrival shows up.
+
+    **Rejected: refusing hot-attach entirely** (everything queues). USB
+    passthrough's whole point (#241) is plugging a device into a running
+    guest; a version of `attach` that always waits for a reboot fails the
+    primary use case while being only marginally simpler.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
@@ -2074,6 +2197,14 @@ own "keeping plan.md and the board in sync" rule).
   the re-derived §6g argument, §3 for the two tiers, and #466–#478 on the SMP
   milestone for the delivery plan. Kept as a stub rather than deleted so the
   promotion is visible to anyone who remembers this section containing it.
+- **Thin-provisioned virtual disks** (made explicit 2026-08-17, TERM-9/#485
+  — previously only implied). qcow2's copy-on-write growth model stays out
+  of v1: `mkdisk` (TERM-11, §6d) **preallocates every cluster** at create
+  time, and the file-backed write path assumes the backing bytes exist.
+  Recorded here precisely so TERM-11 landing a qcow2 *creator* is not read
+  as promoting thin provisioning — allocation-on-first-write, host
+  free-space accounting under overcommit, and the fragmentation/fsck story
+  are the v2 work, not a flag on the v1 creator.
 - **Memory ballooning, for dynamic per-VM RAM allocation with a
   configurable floor and ceiling** (noted 2026-07-14). v1's admission
   control (§6i) sizes each VM's RAM as a fixed amount decided at start

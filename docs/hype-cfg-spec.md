@@ -118,6 +118,8 @@ kinds are ignored (§4.1).
 | `default_net_mode` | `none` \| `nat` | `none` | per-VM `net_mode` overrides |
 | `dashboard_default_view` | `dashboard` \| `vm:<name>` | `dashboard` | which view the GOP shows at boot (TERM) |
 | `autostart` | `all` \| `none` \| list | `all` | which VMs to Start at boot (plan.md §6h/§9) |
+| `shared_overcommit_ratio` | float, `>= 1.0` | `4.0` | max vCPU:thread over-commit ratio for the shared scheduling tier's pool (plan.md §10 decision 39). Admission (§6i) refuses startup if any `cpu_mode = shared` VM is configured while this is `< 1.0` — that would forbid the pool from over-committing at all, which is the tier's whole point |
+| `shared_timeslice_us` | int, microseconds | `4000` | LAPIC one-shot preemption-timer slice length for the shared tier (plan.md §10 decision 39, SMP-20). Global only — no per-VM override; a shorter slice for one latency-sensitive shared VM is a plausible future knob, but nothing today asks for it, and it would multiply SMP-20's timing proof surface |
 
 ### 5.2 `[vm.<name>]` — per VM
 
