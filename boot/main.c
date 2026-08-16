@@ -5038,6 +5038,12 @@ static uint64_t g_ap_timer_injected[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
  * AHCI window at all, and how often, decides which of those this is. */
 static uint64_t g_ap_ahci_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint64_t g_ap_ecam_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+/* #484: total LAPIC base-frequency ticks this AP has been advanced, and the TSC span it was
+ * advanced over. The RCU stall says CPU 1 gets ~5 timer IRQs/s where its init_count implies
+ * ~1600, so the question is whether the ADVANCE is short or the IRQ delivery is. These two
+ * numbers answer it: ticks/elapsed should equal HYPE_GUEST_LAPIC_HZ. */
+static uint64_t g_ap_lapic_ticks[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_ap_lapic_tsc_span[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 
 /*
@@ -11346,6 +11352,7 @@ wait_for_sipi:
             if (ap_delta > ap_cap) {
                 ap_delta = ap_cap;
             }
+            g_ap_lapic_tsc_span[vm_idx][vi] += ap_delta;
             ap_tb_accum += ap_delta * HYPE_PIT_HZ;
             ap_ticks = ap_tb_accum / g_fw_1_host_tsc_hz;
             ap_tb_accum -= ap_ticks * g_fw_1_host_tsc_hz;
@@ -11356,6 +11363,7 @@ wait_for_sipi:
                 ap_lt_accum -= ap_lt * HYPE_PIT_HZ;
                 if (ap_lt != 0u) {
                     hype_guest_lapic_advance(lapic, ap_lt);
+                    g_ap_lapic_ticks[vm_idx][vi] += ap_lt;
                 }
             }
         }
@@ -13295,7 +13303,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         hype_debug_print(
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
                             "last=0x%llx@0x%llx timer_irqs=%llu init=%u cur=%u lvt=0x%x "
-                            "ahci=%llu ecam=%llu "
+                            "ahci=%llu ecam=%llu lt=%llu span=%llu "
                             "[#190]\n", _vmi, _av,
                             (unsigned)g_ap_vcpu_live[_vmi][_av],
                             g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
@@ -13306,7 +13314,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             (unsigned)vm->lapic[_av].current_count,
                             (unsigned)vm->lapic[_av].lvt_timer,
                             (unsigned long long)g_ap_ahci_serves[_vmi][_av],
-                            (unsigned long long)g_ap_ecam_serves[_vmi][_av]);
+                            (unsigned long long)g_ap_ecam_serves[_vmi][_av],
+                            (unsigned long long)g_ap_lapic_ticks[_vmi][_av],
+                            (unsigned long long)g_ap_lapic_tsc_span[_vmi][_av]);
                     /*
                      * SMP-6: dump the AP's dispatch record ONCE on the normal path, not only
                      * at a fault. The DEBUG guest firmware names its modules but does not
