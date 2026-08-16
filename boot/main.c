@@ -1051,8 +1051,16 @@ static void fw_1_reset_all_lapics(hype_fw_vm_t *vmp) {
 #endif
 
 static unsigned fw_1_guest_visible_vcpus(const hype_fw_vm_t *vmp) {
+    /*
+     * SMP-8 (#192): no longer clamped to HYPE_SMP_STARTABLE_VCPUS. That clamp made a default
+     * build silently ignore `vcpus = 2` from hype.cfg -- the count resolved, echoed, and was
+     * then cut back to 1 here, so the second host core never started and the guest was told 1.
+     * The same silent-clamp class as #428. The knob keeps exactly one job: raising the NO-CONFIG
+     * default in fw_1_resolve_vcpus for rigs that ship no hype.cfg. vcpu_count itself is already
+     * admission-validated config, so it is the authority.
+     */
     unsigned n = vmp->vcpu_count ? vmp->vcpu_count : 1u;
-    return (n < HYPE_SMP_STARTABLE_VCPUS) ? n : HYPE_SMP_STARTABLE_VCPUS;
+    return (n < HYPE_MAX_VCPUS_PER_VM) ? n : HYPE_MAX_VCPUS_PER_VM;
 }
 
 /*
