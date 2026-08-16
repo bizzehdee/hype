@@ -5096,6 +5096,15 @@ static uint64_t g_bsp_disp_tsc[HYPE_FW_MAX_VMS][HYPE_509_BUCKETS];
 static uint64_t g_bsp_disp_cnt[HYPE_FW_MAX_VMS][HYPE_509_BUCKETS];
 static uint64_t g_bsp_disp_start[HYPE_FW_MAX_VMS];
 static unsigned g_bsp_disp_bucket[HYPE_FW_MAX_VMS];
+/* #483: BSP progress, sampled CROSS-CORE by the AP's wait-for-SIPI watchdog. The 2-vCPU VMX
+ * wedge takes ONE exit in 180 s, so the BSP cannot report its own state -- every diagnostic
+ * print in this file runs on the per-exit path. The parked AP reports it instead: whether the
+ * BSP is inside the guest or in host code, since when, and what its last exit was. */
+static volatile uint64_t g_bsp_probe_entry_tsc[HYPE_FW_MAX_VMS];
+static volatile uint64_t g_bsp_probe_exit_tsc[HYPE_FW_MAX_VMS];
+static volatile uint64_t g_bsp_probe_exits[HYPE_FW_MAX_VMS];
+static volatile uint64_t g_bsp_probe_reason[HYPE_FW_MAX_VMS];
+static volatile uint64_t g_bsp_probe_rip[HYPE_FW_MAX_VMS];
 
 static void fw_1_dev_lock(hype_fw_vm_t *vm) {
     hype_ticket_lock_acquire(&vm->dev_lock_next, &vm->dev_lock_owner);
@@ -11440,6 +11449,26 @@ wait_for_sipi:
             hype_debug_print("fw-1 vm%u vCPU %u: waiting (ctx=%s, state=%u) [#190]\n", vm_idx,
                              vi, ctx ? "ready" : "not created",
                              (unsigned)vm->vcpu_state[vi]);
+            {   /* #483: report the BSP's progress from THIS core -- during the 2-vCPU VMX
+                 * wedge the BSP takes no exits, so this is the only core that can say
+                 * whether it is stuck inside the guest or in host code. */
+                uint64_t bp_now = hype_rdtsc();
+                uint64_t bp_in = g_bsp_probe_entry_tsc[vm_idx];
+                uint64_t bp_out = g_bsp_probe_exit_tsc[vm_idx];
+                int bp_guest = (bp_in != 0ull && bp_in >= bp_out);
+                uint64_t bp_ref = bp_guest ? bp_in : bp_out;
+                unsigned long long bp_ms =
+                    (g_fw_1_host_tsc_hz != 0ull && bp_ref != 0ull)
+                        ? (bp_now - bp_ref) * 1000ull / g_fw_1_host_tsc_hz
+                        : 0ull;
+                hype_debug_print("fw-1 vm%u BSPPROBE: exits=%llu last=0x%llx@0x%llx %s for "
+                                 "%llums section=%u [#483]\n",
+                                 vm_idx, (unsigned long long)g_bsp_probe_exits[vm_idx],
+                                 (unsigned long long)g_bsp_probe_reason[vm_idx],
+                                 (unsigned long long)g_bsp_probe_rip[vm_idx],
+                                 bp_guest ? "IN-GUEST" : "IN-HOST", bp_ms,
+                                 g_436_loop_section[vm_idx]);
+            }
         }
     }
     vm->vcpu_parked[vi] = 0u;
@@ -13104,9 +13133,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
             fw_1_dev_unlock(vm);
+            g_bsp_probe_entry_tsc[(unsigned)(vm - g_vms)] = hype_rdtsc(); /* #483 */
             if (ops->vcpu_run(ctx, &info) != 0) {
                 fw_1_dev_lock(vm);
                 hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
+            }
+            {   /* #483: publish this exit for the AP watchdog BEFORE anything that can block. */
+                unsigned vp_ = (unsigned)(vm - g_vms);
+                g_bsp_probe_exit_tsc[vp_] = hype_rdtsc();
+                g_bsp_probe_exits[vp_]++;
+                g_bsp_probe_reason[vp_] = info.reason;
+                g_bsp_probe_rip[vp_] = info.guest_rip;
             }
             fw_1_dev_lock(vm);
             /* #484: an NMI pended for the BSP by another vCPU, delivered on its own core. */
@@ -23292,6 +23329,28 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                         (unsigned long long)g_436_last_p64_rip,
                                         g_436_last_p60_tsc ? ((now436 - g_436_last_p60_tsc) * 1000ull) / hz : 0ull,
                                         (unsigned)g_436_last_p60_val);
+                                }
+                                {   /* #483: each VM dispatch core's progress, reported from THIS
+                                     * core -- when a dispatch loop wedges (VMX: one exit in
+                                     * 180 s) it cannot print its own diagnostics, and the AP-side
+                                     * watchdog only exists once a vCPU-AP core is live. */
+                                    unsigned pv;
+                                    uint64_t pnow = hype_rdtsc();
+                                    for (pv = 0u; pv < g_vm_count && pv < HYPE_FW_MAX_VMS; pv++) {
+                                        uint64_t p_in = g_bsp_probe_entry_tsc[pv];
+                                        uint64_t p_out = g_bsp_probe_exit_tsc[pv];
+                                        int p_guest = (p_in != 0ull && p_in >= p_out);
+                                        uint64_t p_ref = p_guest ? p_in : p_out;
+                                        hype_debug_print(
+                                            "fw-1 BSPPROBE vm%u: exits=%llu last=0x%llx@0x%llx %s "
+                                            "for %llums section=%u [#483]\n", pv,
+                                            (unsigned long long)g_bsp_probe_exits[pv],
+                                            (unsigned long long)g_bsp_probe_reason[pv],
+                                            (unsigned long long)g_bsp_probe_rip[pv],
+                                            p_guest ? "IN-GUEST" : "IN-HOST",
+                                            (p_ref != 0ull) ? (pnow - p_ref) * 1000ull / hz : 0ull,
+                                            g_436_loop_section[pv]);
+                                    }
                                 }
                                 /* #92 diag: name the CPUID leaves / MSRs a spinning guest hammers.
                                  * SVM-only (this rig); the getter reads file-global MRUs. */
