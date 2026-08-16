@@ -127,6 +127,14 @@ typedef struct {
      * hypervisor with one broken AHCI device. Linux never noticed because it uses one IDT
      * entry per vector, so the vector is implicit in the entry point.
      */
+    /*
+     * SMP-3 (#187): THIS LAPIC's APIC ID, reported by the ID register (0x020) in its
+     * architectural bits [31:24]. It used to be hardcoded to 0 on read, which was true only
+     * while a VM had one vCPU: with several, every vCPU would read 0 and a guest OS would be
+     * unable to tell them apart -- and it would disagree with the MADT and with CPUID leaf 1
+     * EBX[31:24], both of which report per-vCPU IDs since SMP-2.
+     */
+    uint32_t apic_id;
     uint32_t isr[8];
     uint32_t tpr; /* Task Priority Register (0x080); PPR (0x0A0) is derived from it and isr */
     uint32_t svr;
@@ -183,6 +191,10 @@ uint32_t hype_guest_lapic_divisor(uint32_t divide_config);
 
 /* Clears to a just-powered-on state (timer masked, no IRQ pending). */
 void hype_guest_lapic_reset(hype_guest_lapic_t *lapic);
+
+/* SMP-3 (#187): set this LAPIC's APIC ID. Called once per vCPU after reset; the ID must match
+ * what the MADT and CPUID report for the same vCPU or the guest logs an APIC ID mismatch. */
+void hype_guest_lapic_set_apic_id(hype_guest_lapic_t *lapic, uint32_t apic_id);
 
 /*
  * MMIO read/write within the 4KB window (offset is relative to

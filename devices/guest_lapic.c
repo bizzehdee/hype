@@ -30,6 +30,11 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->timer_irq_pending = 0;
     lapic->timer_in_service = 0;
     lapic->eoi_count = 0;
+    lapic->apic_id = 0; /* SMP-3: the BSP's ID; APs are set explicitly after reset */
+}
+
+void hype_guest_lapic_set_apic_id(hype_guest_lapic_t *lapic, uint32_t apic_id) {
+    lapic->apic_id = apic_id;
 }
 
 void hype_guest_lapic_accept_vector(hype_guest_lapic_t *lapic, uint8_t vector) {
@@ -102,7 +107,9 @@ int hype_guest_lapic_read(hype_guest_lapic_t *lapic, uint32_t offset, unsigned i
 
     switch (offset) {
         case HYPE_GUEST_LAPIC_REG_ID:
-            *out = 0; /* single vCPU -> APIC ID 0 */
+            /* SMP-3 (#187): the architectural xAPIC ID register carries the ID in [31:24].
+             * Was hardcoded 0, which every vCPU of a multi-vCPU guest would have read. */
+            *out = (lapic->apic_id & 0xFFu) << 24;
             return 0;
         case HYPE_GUEST_LAPIC_REG_TPR:
             *out = lapic->tpr;

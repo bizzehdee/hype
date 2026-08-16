@@ -733,7 +733,22 @@ typedef struct hype_fw_vm {
     hype_pit_emu_t pit;
     hype_pci_t pci;
     hype_cmos_t cmos;
-    hype_guest_lapic_t lapic; /* FW-1b: guest Local APIC (0xFEE00000) */
+    /*
+     * FW-1b: guest Local APIC (0xFEE00000).
+     *
+     * SMP-3 (#187): one per vCPU, not one per VM. A LAPIC is per-CPU hardware -- its ID, ICR,
+     * LVT table, timer, ISR and EOI state all belong to the processor that owns it, and a
+     * guest OS programming vCPU 1's timer must not disturb vCPU 0's. Sharing one was correct
+     * only while a VM had a single vCPU, and it is a prerequisite for AP bring-up (SMP-4,
+     * which is INIT-SIPI-SIPI *through* the BSP's ICR at a target APIC ID) and for inter-vCPU
+     * IPIs (SMP-5).
+     *
+     * Indexed by vCPU. `cur_vcpu` selects the executing one; it is 0 until SMP-6 dispatches
+     * more than the BSP, and every access goes through g_fw_1_lapic so that becomes a
+     * one-line change rather than a sweep.
+     */
+    hype_guest_lapic_t lapic[HYPE_MAX_VCPUS_PER_VM];
+    unsigned cur_vcpu;
     hype_hpet_t hpet;         /* #436: guest HPET (0xFED00000) */
     hype_ioapic_t ioapic;     /* M4-6b3: guest I/O APIC (0xFEC00000) */
     hype_guest_uart_t uart;   /* FW-1e: COM1 0x3F8 */
@@ -932,6 +947,26 @@ static void fw_1_resolve_guest_ram(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, uns
                      HYPE_FW_1_GUEST_RAM_MIN_MB, HYPE_FW_1_GUEST_RAM_MAX_MB);
 }
 /*
+ * SMP-3 (#187): reset EVERY vCPU's LAPIC and give each its own APIC ID.
+ *
+ * All of them, not just the executing one: a VM restart must not leave an AP's LAPIC holding
+ * the previous run's LVT table, timer state or in-service vectors. The IDs are hype's dense
+ * 0..N-1 and must agree with the MADT and CPUID leaf 1 (SMP-2) for the same vCPU.
+ */
+static void fw_1_reset_all_lapics(hype_fw_vm_t *vmp) {
+    unsigned i;
+    unsigned n = vmp->vcpu_count ? vmp->vcpu_count : 1u;
+    if (n > HYPE_MAX_VCPUS_PER_VM) {
+        n = HYPE_MAX_VCPUS_PER_VM;
+    }
+    for (i = 0; i < n; i++) {
+        hype_guest_lapic_reset(&vmp->lapic[i]);
+        hype_guest_lapic_set_apic_id(&vmp->lapic[i], i);
+    }
+    vmp->cur_vcpu = 0u; /* the BSP is what resumes after a reset */
+}
+
+/*
  * SMP-2 (#186): how many vCPUs this VM ADVERTISES to its guest, as opposed to how many
  * contexts exist (vm->vcpu_count).
  *
@@ -1010,7 +1045,8 @@ static void fw_1_resolve_os_hint(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsig
 #define g_fw_1_pit (vm->pit)
 #define g_fw_1_pci (vm->pci)
 #define g_fw_1_cmos (vm->cmos)
-#define g_fw_1_lapic (vm->lapic)
+/* SMP-3 (#187): the executing vCPU's LAPIC. cur_vcpu is 0 until SMP-6 runs the APs. */
+#define g_fw_1_lapic (vm->lapic[vm->cur_vcpu])
 #define g_fw_1_hpet (vm->hpet)
 #define g_fw_1_ioapic (vm->ioapic)
 #define g_fw_1_uart (vm->uart)
@@ -10354,7 +10390,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
 
     hype_pic_emu_reset(&g_fw_1_pic);
     hype_pit_emu_reset(&g_fw_1_pit);
-    hype_guest_lapic_reset(&g_fw_1_lapic);
+    fw_1_reset_all_lapics(vm); /* SMP-3: every vCPU's, with its own APIC ID */
     hype_ioapic_reset(&g_fw_1_ioapic);
     hype_guest_uart_reset(&g_fw_1_uart);
     hype_guest_uart_reset(&g_fw_1_uart2);
@@ -10553,7 +10589,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
     hype_pic_emu_reset(&g_fw_1_pic);
     hype_pit_emu_reset(&g_fw_1_pit);
-    hype_guest_lapic_reset(&g_fw_1_lapic);
+    fw_1_reset_all_lapics(vm); /* SMP-3: every vCPU's, with its own APIC ID */
     hype_ioapic_reset(&g_fw_1_ioapic); /* M4-6b3: guest I/O APIC at 0xFEC00000 */
     hype_guest_uart_reset(&g_fw_1_uart);
     hype_guest_uart_reset(&g_fw_1_uart2);

@@ -695,7 +695,69 @@ static void test_all_lvt_entries_roundtrip(void) {
               (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ESR, 4, &v), v));
 }
 
+/* ---- SMP-3 (#187): each vCPU's LAPIC carries its own APIC ID ---- */
+
+static void test_apic_id_defaults_to_zero_and_reads_in_the_right_bits(void) {
+    hype_guest_lapic_t l;
+    uint32_t v = 0xDEADBEEFu;
+
+    hype_guest_lapic_reset(&l);
+    CHECK_HEX("reset gives the BSP id 0", 0u,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ID, 4u, &v), v));
+
+    /* The xAPIC ID register carries the ID in [31:24], not in the low byte -- a guest reading
+     * it and shifting would otherwise see 0 for every vCPU. */
+    hype_guest_lapic_set_apic_id(&l, 3u);
+    hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ID, 4u, &v);
+    CHECK_HEX("id 3 appears in bits [31:24]", 3u << 24, v);
+    CHECK_HEX("nothing leaks into the low bits", 0u, v & 0x00FFFFFFu);
+}
+
+static void test_apic_id_is_read_only_to_the_guest(void) {
+    hype_guest_lapic_t l;
+    uint32_t v = 0;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_id(&l, 2u);
+    hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_ID, 4u, 7u << 24);
+    hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ID, 4u, &v);
+    CHECK_HEX("a guest write to the ID register is ignored", 2u << 24, v);
+}
+
+static void test_two_lapics_are_independent(void) {
+    /*
+     * The point of SMP-3: one LAPIC per vCPU. Programming one vCPU's timer, TPR or in-service
+     * state must not be visible on another's -- sharing a single struct is exactly the
+     * singleton bug this replaces.
+     */
+    hype_guest_lapic_t a, b;
+    uint32_t v = 0;
+
+    hype_guest_lapic_reset(&a);
+    hype_guest_lapic_reset(&b);
+    hype_guest_lapic_set_apic_id(&a, 0u);
+    hype_guest_lapic_set_apic_id(&b, 1u);
+
+    hype_guest_lapic_write(&a, HYPE_GUEST_LAPIC_REG_TPR, 4u, 0x40u);
+    hype_guest_lapic_write(&a, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4u, 0x20030u);
+    hype_guest_lapic_accept_vector(&a, 0x41u);
+
+    hype_guest_lapic_read(&b, HYPE_GUEST_LAPIC_REG_TPR, 4u, &v);
+    CHECK_HEX("vCPU 1's TPR untouched by vCPU 0", 0u, v);
+    hype_guest_lapic_read(&b, HYPE_GUEST_LAPIC_REG_LVT_TIMER, 4u, &v);
+    CHECK_HEX("vCPU 1's LVT timer untouched", HYPE_GUEST_LAPIC_LVT_MASKED, v);
+    CHECK_HEX("vCPU 1 has nothing in service", (unsigned long long)(long long)-1,
+              (unsigned long long)(long long)hype_guest_lapic_isr_highest(&b));
+    CHECK_HEX("vCPU 0 does", 0x41u, (unsigned)hype_guest_lapic_isr_highest(&a));
+
+    hype_guest_lapic_read(&b, HYPE_GUEST_LAPIC_REG_ID, 4u, &v);
+    CHECK_HEX("and they report different IDs", 1u << 24, v);
+}
+
 int main(void) {
+    test_apic_id_defaults_to_zero_and_reads_in_the_right_bits();
+    test_apic_id_is_read_only_to_the_guest();
+    test_two_lapics_are_independent();
     test_all_lvt_entries_roundtrip();
     test_isr_reads_zero_until_a_vector_is_accepted();
     test_isr_bit_lands_in_the_right_dword_across_the_whole_range();
