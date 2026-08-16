@@ -11362,6 +11362,24 @@ wait_for_sipi:
      * loop, like the BSP's, relies on seeing it.
      */
     vmm_set_exception_intercepts(kind, ctx, (1u << 6));
+    /*
+     * #484: give this AP a pvclock map, or its kvmclock never works.
+     *
+     * vmm_set_pvclock() had three call sites -- a selftest, fw_1_vm_reinit() and the BSP's own
+     * setup -- and none of them was the AP path, so an AP's pvclock_map stayed 0. Linux writes
+     * MSR_KVM_SYSTEM_TIME per CPU during bring-up, and hype's handler returns EARLY on a null
+     * map: the write is accepted and the page is never filled. CPU 1 then read an unfilled
+     * time-info page and computed time from a zero base.
+     *
+     * That is what the guest reported, and it is a clock going backwards rather than a CPU
+     * freezing: "[18446744066.620685] Loading boot drivers: ok." is ~2^64 ns, i.e. a small
+     * NEGATIVE nanosecond count wrapped -- about -7 s -- and the RCU stalls that followed are
+     * self-detected, which is what a time jump looks like, not what a stuck CPU looks like.
+     *
+     * Set here, after the SIPI wait, for the same reason the exception mask is: every SIPI
+     * rebuilds this vCPU's VMCB.
+     */
+    vmm_set_pvclock(kind, ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
     hype_debug_print("fw-1 vm%u vCPU %u: SIPI received, entering guest [#190]\n", vm_idx, vi);
     fw_1_dev_lock(vm); /* SMP-7: enter the loop in the "outside the guest" state */
     ap_locked = 1;
