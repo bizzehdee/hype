@@ -257,6 +257,21 @@ struct hype_vcpu_ctx {
     hype_fpu_area_t fpu;
     int launched; /* 0 until the first successful VMLAUNCH; VMRESUME thereafter. */
     /*
+     * #483: this vCPU's VMCS region, and the core it is currently loaded on.
+     *
+     * On Intel the CURRENT-VMCS pointer is per logical processor, unlike SVM where VMRUN takes
+     * the VMCB address as an operand. build_guest_common() VMPTRLDs on whichever core BUILT the
+     * VMCS -- always the BSP -- so an AP reaching hype_vmx_vcpu_run() had no current VMCS and
+     * its VM entry could not proceed. Measured on the Intel box: SIPI delivered, VMXON fine on
+     * the AP (ap_vmm_ok=1), and then "APVCPU vm0/1: live=1 exits=0" forever, silently.
+     *
+     * Only the region is recorded. Whether it is current is asked of the HARDWARE with VMPTRST
+     * rather than tracked in software: the tracking version needs a per-core identity and stays
+     * correct only if every path that moves a VMCS updates it, whereas VMPTRST is exact by
+     * construction and costs one instruction on a path that is about to do a VM entry anyway.
+     */
+    uint8_t *vmcs_region;
+    /*
      * #273: the VPID actually programmed into this vCPU's VMCS, or 0 when the
      * CPU's EPT_VPID_CAP did not support enabling VPID (in which case the guest
      * genuinely runs on VPID 0 and every VM-entry flushes it). Recorded rather
@@ -562,6 +577,21 @@ static inline int vmptrld(const void *vmcs_phys_addr_ptr) {
 }
 
 /*
+ * #483: the VMCS currently loaded on THIS logical processor, or ~0 when none is.
+ * VMX keeps the current-VMCS pointer per processor, so this is the only honest way to ask
+ * whether a vCPU's VMCS is ready to be launched on the core about to launch it.
+ */
+uint64_t g_vmx_vmcs_reload_count;
+uint64_t g_vmx_vmcs_reload_last_cur;
+uint64_t g_vmx_vmcs_reload_last_want;
+
+static inline uint64_t vmptrst_current(void) {
+    uint64_t out = 0;
+    __asm__ volatile("vmptrst %0" : "=m"(out) : : "cc", "memory");
+    return out;
+}
+
+/*
  * INVVPID, single-context (#273): drop every linear and combined mapping tagged
  * with `vpid`. Issued when a pool slot is handed to a new guest -- the slot's
  * VPID is stable, so without this a fresh guest could inherit its predecessor's
@@ -642,6 +672,8 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     if (vmclear(vmcs_region) != 0) {
         return -1;
     }
+    /* #483: the builder's core owns it from here; hype_vmx_vcpu_run() re-loads it if the
+     * running core is a different one. */
     if (vmptrld(vmcs_region) != 0) {
         return -1;
     }
@@ -1103,6 +1135,7 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
     if (hype_vmx_vmcs_build_guest(guest_rip, 0, guest_rsp, eptp, g_vmcs_pool[slot], slot) != 0) {
         return 0;
     }
+    ctx->vmcs_region = g_vmcs_pool[slot];   /* #483 */
 
     for (i = 0; i < 16; i++) {
         ctx->gprs[i] = 0;
@@ -1219,6 +1252,35 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     uint64_t failed;
     int ok;
 
+    /*
+     * #483: make this vCPU's VMCS current on THIS core before entering.
+     *
+     * The VMCS was VMPTRLDed by whichever core built it -- always the BSP -- and the current
+     * pointer is per logical processor. An AP therefore arrived here with no current VMCS and
+     * its entry could never succeed, silently: "APVCPU vm0/1: live=1 exits=0". A VMCS must not
+     * be current on two processors at once, so it is VMCLEARed off whatever it was on before
+     * being loaded here, and `launched` is reset because VMCLEAR puts the VMCS back into the
+     * clear state where the next entry must be VMLAUNCH, not VMRESUME.
+     */
+    if (real->vmcs_region != 0) {
+        uint64_t want = (uint64_t)(uintptr_t)real->vmcs_region;
+        uint64_t cur_vmcs = vmptrst_current();
+        if (cur_vmcs != want) {
+            /* #483 diagnostic: this must fire ONCE per vCPU per core. If it fires on every
+             * entry the comparison is wrong, and the VMCLEAR below would be discarding live
+             * guest state every time -- so it is counted rather than assumed. */
+            g_vmx_vmcs_reload_count++;
+            g_vmx_vmcs_reload_last_cur = cur_vmcs;
+            g_vmx_vmcs_reload_last_want = want;
+            if (vmclear(real->vmcs_region) != 0 || vmptrld(real->vmcs_region) != 0) {
+                info->reason = (1ULL << 63);
+                info->qualification = 0;
+                info->guest_rip = 0;
+                return -1;
+            }
+            real->launched = 0;
+        }
+    }
     /* #251: run the guest under its own XCR0, and put hype's back afterwards. */
     if (real->guest_xcr0_valid && vmx_ensure_osxsave()) {
         xsetbv0(real->guest_xcr0);

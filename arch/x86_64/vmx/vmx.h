@@ -132,6 +132,13 @@ int hype_vmx_enable(void);
  * printing here would race the BSP's console). */
 int hype_vmx_enable_on(void *vmxon_region);
 
+/* #483 diagnostic: how often hype_vmx_vcpu_run() found this vCPU's VMCS not current on the
+ * running core and had to reload it. Expected to be small (once per vCPU per core); a count
+ * that tracks the exit count means the comparison is wrong. */
+extern uint64_t g_vmx_vmcs_reload_count;
+extern uint64_t g_vmx_vmcs_reload_last_cur;
+extern uint64_t g_vmx_vmcs_reload_last_want;
+
 extern const hype_vmm_ops_t hype_vmx_ops;
 
 

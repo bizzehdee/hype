@@ -13233,7 +13233,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * for an AP that is idle in cpu_idle_acpi.
                      */
                     for (_av = 0u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
-                        hype_debug_print("fw-1 IPIOUT vm%u/%u: sent=%llu dropped=%llu "
+                        if (kind == HYPE_VMM_KIND_VMX) {
+                        hype_debug_print("fw-1 VMCSRELOAD: count=%llu last_cur=0x%llx "
+                                         "last_want=0x%llx [#483]\n",
+                                         (unsigned long long)g_vmx_vmcs_reload_count,
+                                         (unsigned long long)g_vmx_vmcs_reload_last_cur,
+                                         (unsigned long long)g_vmx_vmcs_reload_last_want);
+                    }
+                    hype_debug_print("fw-1 IPIOUT vm%u/%u: sent=%llu dropped=%llu "
                                          "pending=%u [#190]\n", _vmi, _av,
                                          (unsigned long long)vm->lapic[_av].ipi_out_count,
                                          (unsigned long long)vm->lapic[_av].ipi_out_dropped,
