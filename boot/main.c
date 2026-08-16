@@ -4751,105 +4751,160 @@ static unsigned fw_1_route_ipi(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
     unsigned target;
     unsigned acted = 0;
     unsigned n = vm->vcpu_count ? vm->vcpu_count : 1u;
+    uint8_t selected[HYPE_MAX_VCPUS_PER_VM];
 
     if (n > HYPE_MAX_VCPUS_PER_VM) {
         n = HYPE_MAX_VCPUS_PER_VM;
     }
 
+    /*
+     * Resolve the destination first, then dispatch by delivery mode -- lowest-priority has to
+     * choose ONE of the selected set, which a single fused loop cannot express.
+     *
+     * Self is never selected here. The LAPIC has already pended a self-directed FIXED IPI into
+     * its own set (the #103 path), so routing it again would deliver the vector twice -- and
+     * INIT/STARTUP to self is meaningless.
+     */
     for (target = 0; target < n; target++) {
-        int selected;
-
+        int sel;
         if (target == vm->cur_vcpu) {
-            /* Self is handled by the LAPIC's own self-IPI path, except for the shorthands
-             * that explicitly exclude the sender. */
-            if (ipi->shorthand != HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL) {
-                continue;
-            }
+            selected[target] = 0;
+            continue;
         }
         switch (ipi->shorthand) {
             case HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_INCL:
             case HYPE_GUEST_LAPIC_ICR_SHORTHAND_ALL_EXCL:
-                selected = 1;
+                sel = 1;
                 break;
             case HYPE_GUEST_LAPIC_ICR_SHORTHAND_SELF:
-                selected = 0; /* never reaches another vCPU */
+                sel = 0;
                 break;
             default:
                 if (ipi->logical) {
-                    /* Logical destination: match against that vCPU's own LDR, which only the
-                     * VM layer can see -- this is why the LAPIC model latches rather than
+                    /* Logical destination resolves against each vCPU's own LDR -- knowledge
+                     * only the VM layer has, which is why the LAPIC latches rather than
                      * resolves. */
-                    selected = (ipi->dest_apic_id & (vm->lapic[target].ldr >> 24)) != 0u;
+                    sel = (ipi->dest_apic_id & (vm->lapic[target].ldr >> 24)) != 0u;
                 } else {
-                    selected = (ipi->dest_apic_id == 0xFFu) ||
-                               (ipi->dest_apic_id == (vm->lapic[target].apic_id & 0xFFu));
+                    sel = (ipi->dest_apic_id == 0xFFu) ||
+                          (ipi->dest_apic_id == (vm->lapic[target].apic_id & 0xFFu));
                 }
                 break;
         }
-        if (!selected) {
-            continue;
+        selected[target] = (uint8_t)(sel ? 1 : 0);
+    }
+
+    switch (ipi->delivery_mode) {
+        case HYPE_GUEST_LAPIC_ICR_DELMODE_INIT:
+            /*
+             * INIT (assert) returns a target AP to wait-for-SIPI. The DE-assert form
+             * (level 0) is the second half of the assert/de-assert pair older firmware still
+             * emits; treating it as a second reset would undo the SIPI about to follow.
+             */
+            if (!ipi->level_assert) {
+                return 1;
+            }
+            for (target = 1; target < n; target++) { /* never the BSP */
+                if (!selected[target]) continue;
+                vm->vcpu_state[target] = HYPE_VCPU_STATE_WAIT_SIPI;
+                hype_guest_lapic_reset(&vm->lapic[target]);
+                hype_guest_lapic_set_apic_id(&vm->lapic[target], target);
+                acted++;
+            }
+            break;
+
+        case HYPE_GUEST_LAPIC_ICR_DELMODE_STARTUP:
+            /*
+             * STARTUP gives the target a real-mode entry at vector << 12 -- CS.base = entry,
+             * IP = 0, which is what the real-mode VMCB/VMCS builder produces.
+             *
+             * A SIPI to an ALREADY-RUNNING vCPU is ignored, per the SDM. Firmware and Linux
+             * both send TWO as insurance against the first being lost, and acting on the
+             * second would reset a CPU that had already started.
+             */
+            for (target = 1; target < n; target++) {
+                if (!selected[target]) continue;
+                if (vm->vcpu_state[target] != HYPE_VCPU_STATE_WAIT_SIPI) continue;
+                if (vm->vcpu[target] != 0) {
+                    vmm_reset_realmode(kind, vm->vcpu[target], (uint64_t)ipi->vector << 12,
+                                       stack_top, npt_root);
+                    vmm_set_topology(kind, vm->vcpu[target], target,
+                                     fw_1_guest_visible_vcpus(vm),
+                                     vm->threads_per_core ? vm->threads_per_core : 1u);
+                }
+                vm->vcpu_state[target] = HYPE_VCPU_STATE_RUNNABLE;
+                acted++;
+                hype_debug_print("fw-1 vm%u: SIPI -> vCPU %u started at 0x%llx (real mode) "
+                                 "[#188]\n", (unsigned)(vm - g_vms), target,
+                                 (unsigned long long)((uint64_t)ipi->vector << 12));
+            }
+            break;
+
+        case HYPE_GUEST_LAPIC_ICR_DELMODE_FIXED:
+            /*
+             * SMP-5 (#189): the ordinary cross-vCPU IPI -- reschedule and TLB shootdown are
+             * both this. Queued through vmm_request_interrupt against the TARGET's own ctx and
+             * LAPIC, so the vector lands in that vCPU's pending set and its ISR is marked when
+             * the vector is actually injected (#456), not when it is requested.
+             *
+             * Vectors 0-15 are illegal for fixed delivery and are dropped rather than queued.
+             */
+            if (ipi->vector < 16u) {
+                break;
+            }
+            for (target = 0; target < n; target++) {
+                if (!selected[target] || vm->vcpu[target] == 0) continue;
+                vmm_request_interrupt(kind, vm->vcpu[target], &vm->lapic[target],
+                                      (uint8_t)ipi->vector);
+                acted++;
+            }
+            break;
+
+        case HYPE_GUEST_LAPIC_ICR_DELMODE_LOWPRI: {
+            /*
+             * SMP-5: lowest-priority picks exactly ONE of the selected set -- the least busy,
+             * by processor priority, ties broken by the lowest APIC ID so the choice is
+             * deterministic and testable rather than dependent on iteration luck.
+             */
+            unsigned best = HYPE_MAX_VCPUS_PER_VM;
+            uint32_t best_ppr = 0xFFFFFFFFu;
+            if (ipi->vector < 16u) {
+                break;
+            }
+            for (target = 0; target < n; target++) {
+                uint32_t ppr;
+                if (!selected[target] || vm->vcpu[target] == 0) continue;
+                ppr = hype_guest_lapic_ppr(&vm->lapic[target]);
+                if (best == HYPE_MAX_VCPUS_PER_VM || ppr < best_ppr) {
+                    best = target;
+                    best_ppr = ppr;
+                }
+            }
+            if (best != HYPE_MAX_VCPUS_PER_VM) {
+                vmm_request_interrupt(kind, vm->vcpu[best], &vm->lapic[best],
+                                      (uint8_t)ipi->vector);
+                acted++;
+            }
+            break;
         }
 
-        switch (ipi->delivery_mode) {
-            case HYPE_GUEST_LAPIC_ICR_DELMODE_INIT:
-                /*
-                 * INIT puts the target back into wait-for-SIPI. The DE-assert form (level 0)
-                 * is the second half of the classic assert/de-assert pair older firmware
-                 * still emits; it must NOT be treated as a second reset, or a BSP that sends
-                 * both would undo the SIPI it is about to send.
-                 */
-                if (!ipi->level_assert) {
-                    acted++;
-                    break;
+        default:
+            /*
+             * NMI (4) and the remaining modes are NOT modelled. Said out loud rather than
+             * absorbed: Linux uses NMI IPIs for its watchdog and for crash dumps, and a
+             * silently-dropped NMI looks like a hung CPU rather than a missing feature.
+             * Neither is needed for reschedule or TLB shootdown, which is SMP-5's bar.
+             */
+            {
+                static unsigned long long unmodelled;
+                if (unmodelled < 4u) {
+                    unmodelled++;
+                    hype_debug_print("fw-1 vm%u: IPI delivery mode %u not modelled -- dropped "
+                                     "(vector 0x%02x) [#189]\n", (unsigned)(vm - g_vms),
+                                     ipi->delivery_mode, ipi->vector);
                 }
-                if (target != 0u) {
-                    vm->vcpu_state[target] = HYPE_VCPU_STATE_WAIT_SIPI;
-                    hype_guest_lapic_reset(&vm->lapic[target]);
-                    hype_guest_lapic_set_apic_id(&vm->lapic[target], target);
-                    acted++;
-                }
-                break;
-
-            case HYPE_GUEST_LAPIC_ICR_DELMODE_STARTUP:
-                /*
-                 * STARTUP hands the target a real-mode entry at vector << 12 -- CS.base =
-                 * vector << 12 with IP 0, which is exactly what the real-mode VMCB/VMCS
-                 * builder produces from an entry-physical address.
-                 *
-                 * A SIPI to an already-running vCPU is IGNORED, per the SDM. That is not a
-                 * nicety: firmware and Linux both send TWO SIPIs as insurance against the
-                 * first being lost, and acting on the second would reset a CPU that had
-                 * already started.
-                 */
-                if (target != 0u && vm->vcpu_state[target] == HYPE_VCPU_STATE_WAIT_SIPI) {
-                    if (vm->vcpu[target] != 0) {
-                        vmm_reset_realmode(kind, vm->vcpu[target],
-                                           (uint64_t)ipi->vector << 12, stack_top, npt_root);
-                        vmm_set_topology(kind, vm->vcpu[target], target,
-                                         fw_1_guest_visible_vcpus(vm),
-                                         vm->threads_per_core ? vm->threads_per_core : 1u);
-                    }
-                    vm->vcpu_state[target] = HYPE_VCPU_STATE_RUNNABLE;
-                    acted++;
-                    hype_debug_print("fw-1 vm%u: SIPI -> vCPU %u started at 0x%llx (real mode) "
-                                     "[#188]\n", (unsigned)(vm - g_vms), target,
-                                     (unsigned long long)((uint64_t)ipi->vector << 12));
-                }
-                break;
-
-            case HYPE_GUEST_LAPIC_ICR_DELMODE_FIXED:
-                /* SMP-5 (#189) delivers these to the target vCPU's pending set. Counted here
-                 * so the diagnostics show they are arriving before that lands. */
-                if (ipi->vector >= 16u) {
-                    hype_guest_lapic_accept_vector(&vm->lapic[target], (uint8_t)ipi->vector);
-                    acted++;
-                }
-                break;
-
-            default:
-                /* NMI and the rest: not modelled. Counted, never silently absorbed. */
-                break;
-        }
+            }
+            break;
     }
     return acted;
 }
