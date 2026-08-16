@@ -1051,7 +1051,19 @@ static void fw_1_resolve_vcpus(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigne
     if (cfg != 0 && vm_index < cfg->vm_count) {
         cfg_vcpus = cfg->vms[vm_index].vcpus;
     }
+    /*
+     * SMP-6: with no config value, fall back to HYPE_SMP_STARTABLE_VCPUS rather than a
+     * hardcoded 1. The knob's stated purpose is to exercise the AP path from the build line,
+     * but it only ever clamped the guest-VISIBLE count downward -- so -DHYPE_SMP_STARTABLE_VCPUS=2
+     * on a rig that ships no hype.cfg (which is every QEMU rig) still resolved to one vCPU and
+     * started no AP. Default builds keep the value at 1u, so this changes nothing for them.
+     */
     st = hype_cfg_resolve_vcpus(cfg_vcpus, HYPE_MAX_VCPUS_PER_VM, &applied);
+    if (cfg_vcpus == 0u && HYPE_SMP_STARTABLE_VCPUS > applied) {
+        applied = (HYPE_SMP_STARTABLE_VCPUS < HYPE_MAX_VCPUS_PER_VM)
+                      ? HYPE_SMP_STARTABLE_VCPUS
+                      : HYPE_MAX_VCPUS_PER_VM;
+    }
     vmp->vcpu_count = applied;
     /* SMP-2: set explicitly rather than relying on the zeroed arena, so the value the guest is
      * told has one visible origin. SMT-aware allocation (#479/#190) is what raises it. */
@@ -11300,6 +11312,89 @@ wait_for_sipi:
                                      (unsigned long long)d.rip, (unsigned long long)d.rflags,
                                      (unsigned long long)d.cr0, (unsigned long long)d.cr3,
                                      (unsigned long long)d.cr4, (unsigned long long)d.rsp);
+                    /*
+                     * SMP-6: the AP's live IDTR, and the two addresses that could hold the
+                     * CpuMpData pointer it reaches through. MpLib.c says the AP finds
+                     * CpuMpData at IDTR.BASE + IDTR.LIMIT + 1; the disassembled caller
+                     * instead loads from [base - 8]. Printing both settles which the code
+                     * actually uses and whether either holds a plausible pointer -- the
+                     * indirect call that #UD'd went through one of them.
+                     */
+                    {
+                        uint64_t after = d.idtr_base + (uint64_t)d.idtr_limit + 1ull;
+                        uint64_t pa = 0, pb = 0;
+                        int ga = 0, gb = 0;
+                        if (d.idtr_base >= 8ull) {
+                            ga = (fw_1_read_guest_va(vm, d.cr3, d.idtr_base - 8ull,
+                                                     (uint8_t *)&pb, 8u) == 0);
+                        }
+                        gb = (fw_1_read_guest_va(vm, d.cr3, after, (uint8_t *)&pa, 8u) == 0);
+                        hype_debug_print("fw-1 APVCPU vm%u/%u IDTR base=0x%llx limit=0x%x "
+                                         "[base-8]=%s0x%llx [base+limit+1=0x%llx]=%s0x%llx "
+                                         "[#190]\n", vm_idx, vi,
+                                         (unsigned long long)d.idtr_base,
+                                         (unsigned)d.idtr_limit, ga ? "" : "unreadable:",
+                                         (unsigned long long)pb, (unsigned long long)after,
+                                         gb ? "" : "unreadable:", (unsigned long long)pa);
+                        /*
+                         * The caller loads its object pointer from [IDT base - 8] and that read
+                         * returned 0, which is the whole fault: a null object yields a garbage
+                         * function table and the indirect call lands in page-table bytes. Dump
+                         * the region PHYSICALLY (OVMF identity-maps it, and the physical read
+                         * needs no page walk) to separate "genuinely zero" from "hype could not
+                         * follow the AP's CR3" -- the two have completely different causes.
+                         */
+                        if (d.idtr_base >= 64ull) {
+                            const uint8_t *ib = fw_1_guest_phys_to_host(vm, d.idtr_base - 64ull);
+                            if (ib != 0) {
+                                char bl[190];
+                                unsigned q;
+                                int bo = hype_snprintf(bl, sizeof(bl),
+                                                       "fw-1 APVCPU vm%u/%u IDTPRE @0x%llx-64:",
+                                                       vm_idx, vi,
+                                                       (unsigned long long)d.idtr_base);
+                                for (q = 0; q < 8u; q++) {
+                                    uint64_t v = 0;
+                                    unsigned b;
+                                    for (b = 0; b < 8u; b++) {
+                                        v |= (uint64_t)ib[q * 8u + b] << (8u * b);
+                                    }
+                                    bo += hype_snprintf(bl + bo, sizeof(bl) - (unsigned)bo,
+                                                        " %llx", (unsigned long long)v);
+                                }
+                                hype_debug_print("%s [#190]\n", bl);
+                            }
+                        }
+                        /*
+                         * The BSP's IDTR for comparison. edk2 keeps the PEI Services table
+                         * pointer at IDT base - 8; if the BSP's IDT has one and the AP's does
+                         * not, the AP is running against the wrong IDT rather than against a
+                         * corrupted one -- a different bug with a different owner.
+                         */
+                        if (vi != 0u && vm->vcpu[0] != 0) {
+                            hype_svm_debug_state_t b;
+                            if (vmm_get_debug_state(kind, vm->vcpu[0], &b)) {
+                                uint64_t bp = 0;
+                                const uint8_t *bh = (b.idtr_base >= 8ull)
+                                                        ? fw_1_guest_phys_to_host(vm,
+                                                                                  b.idtr_base - 8ull)
+                                                        : 0;
+                                if (bh != 0) {
+                                    unsigned b2;
+                                    for (b2 = 0; b2 < 8u; b2++) {
+                                        bp |= (uint64_t)bh[b2] << (8u * b2);
+                                    }
+                                }
+                                hype_debug_print("fw-1 APVCPU vm%u/%u BSPIDT base=0x%llx "
+                                                 "limit=0x%x [base-8]=0x%llx same_idt=%s "
+                                                 "[#190]\n", vm_idx, vi,
+                                                 (unsigned long long)b.idtr_base,
+                                                 (unsigned)b.idtr_limit,
+                                                 (unsigned long long)bp,
+                                                 (b.idtr_base == d.idtr_base) ? "yes" : "no");
+                            }
+                        }
+                    }
                     /* Paging is off (CR0.PG clear) and CS.base is 0, so the linear address IS
                      * the guest-physical one -- read the bytes directly and say what faulted
                      * rather than guessing at it. */

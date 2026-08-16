@@ -730,6 +730,13 @@ typedef struct {
      * guest PAT + page-table PAT index otherwise pick the type. */
     uint64_t cr4;
     uint64_t g_pat;
+    /* SMP-6: the AP locates OVMF's CpuMpData through its own IDTR --
+     * MpLib.c: "All APs share one separate IDT. So AP can get the address
+     * of CpuMpData by using IDTR.BASE + IDTR.LIMIT + 1". A wrong IDTR
+     * therefore yields a garbage structure pointer and an indirect call
+     * into nothing, which is what the #UD at 0x80201A looks like. */
+    uint64_t idtr_base;
+    uint32_t idtr_limit;
 } hype_svm_debug_state_t;
 
 void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out);

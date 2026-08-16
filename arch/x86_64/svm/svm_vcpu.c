@@ -1613,6 +1613,8 @@ void hype_svm_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t 
     out->nrip = real->vmcb->control.nrip;
     out->cr4 = real->vmcb->save.cr4;
     out->g_pat = real->vmcb->save.g_pat;
+    out->idtr_base = real->vmcb->save.idtr.base;
+    out->idtr_limit = real->vmcb->save.idtr.limit;
 }
 
 /* PERF-1 memory-type probe: guest MTRR MSR access counters (aggregate across
