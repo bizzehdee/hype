@@ -802,6 +802,16 @@ typedef struct hype_fw_vm {
      */
     uint8_t vcpu_state[HYPE_MAX_VCPUS_PER_VM];
     /*
+     * SMP-6 (#190): the AP's own acknowledgement that it is NOT inside VMRUN for this vCPU.
+     *
+     * INIT/SIPI arrive on the BSP's core and rebuild the target's VMCB. Doing that while the
+     * target core is executing that very VMCB is undefined, and it was observed: OVMF runs
+     * INIT-SIPI-SIPI twice (PEI, then DXE), and the second round zeroed a running AP's GPRs
+     * mid-flight -- the guest then executed `mov ss,edx` with edx=0 and #GP'd forever.
+     * The BSP waits for this before touching a vCPU another core may be running.
+     */
+    volatile uint8_t vcpu_parked[HYPE_MAX_VCPUS_PER_VM];
+    /*
      * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what
      * its guest is told. 1 until SMT-aware core allocation lands (#479, #190) -- and honestly
      * so, since today a granted core supplies exactly one dispatchable thread.
@@ -4923,6 +4933,36 @@ static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint6
     }
 }
 
+/* SMP-6: set by an AP vCPU loop while it owns its vCPU; read by the BSP's INIT/SIPI path. */
+static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+
+/*
+ * SMP-6 (#190): wait until vCPU `vi`'s core is out of the guest, so its VMCB can be rebuilt.
+ *
+ * Bounded, and loud when it expires: a vCPU that never parks means its core is wedged inside
+ * VMRUN, and proceeding to rebuild the VMCB anyway would corrupt it further. Better to skip the
+ * reset and say so than to race it silently.
+ */
+static void fw_1_wait_vcpu_parked(hype_fw_vm_t *vm, unsigned vi) {
+    unsigned long long spins = 0;
+    if (vi == 0u || vi >= HYPE_MAX_VCPUS_PER_VM) {
+        return; /* the BSP parks itself by definition -- it is the caller */
+    }
+    if (!g_ap_vcpu_live[(unsigned)(vm - g_vms)][vi]) {
+        return; /* never started: nothing can be running it */
+    }
+    while (!vm->vcpu_parked[vi]) {
+        spins++;
+        __asm__ __volatile__("pause" ::: "memory");
+        if (spins > 200000000ull) {
+            hype_debug_print("fw-1 vm%u vCPU %u: did not park for INIT/SIPI -- skipping the "
+                             "reset rather than racing its VMCB [#190]\n",
+                             (unsigned)(vm - g_vms), vi);
+            return;
+        }
+    }
+}
+
 /*
  * SMP-4 (#188): the router declared above. Defined here, after vmm_reset_realmode and
  * vmm_set_topology, which it calls.
@@ -4990,7 +5030,13 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
             }
             for (target = 1; target < n; target++) { /* never the BSP */
                 if (!selected[target]) continue;
+                /*
+                 * Ask the target to leave the guest FIRST, then wait for it to say it has.
+                 * Resetting its LAPIC or VMCB while its core is inside VMRUN is undefined --
+                 * see hype_fw_vm_t.vcpu_parked for the failure that proved it.
+                 */
                 vm->vcpu_state[target] = HYPE_VCPU_STATE_WAIT_SIPI;
+                fw_1_wait_vcpu_parked(vm, target);
                 hype_guest_lapic_reset(&vm->lapic[target]);
                 hype_guest_lapic_set_apic_id(&vm->lapic[target], target);
                 acted++;
@@ -5010,8 +5056,22 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
                 if (!selected[target]) continue;
                 if (vm->vcpu_state[target] != HYPE_VCPU_STATE_WAIT_SIPI) continue;
                 if (vm->vcpu[target] != 0) {
+                    /* Must be parked: the reset rebuilds the VMCB this vCPU's core runs. */
+                    fw_1_wait_vcpu_parked(vm, target);
                     vmm_reset_realmode(kind, vm->vcpu[target], (uint64_t)ipi->vector << 12,
                                        stack_top, npt_root);
+                    /*
+                     * A SIPI sets CS.selector = vector << 8 as well as CS.base = vector << 12.
+                     * The selector is NOT cosmetic here, which cost a long diagnosis:
+                     * set_realmode_seg() zeroes it and calls it "meaningless", true for the
+                     * BSP's reset vector where nothing reads CS -- but an AP's first three
+                     * instructions are `mov ax, cs / mov ds, ax / mov edx, [si]`. With a zero
+                     * selector the guest computed DS.base = 0 and read its DataSegment field
+                     * from guest-physical 0x68 instead of 0x9f068, got 0, and then #GP'd
+                     * forever on `mov ss, edx` with a null selector.
+                     */
+                    vmm_set_cs_ss_selectors(kind, vm->vcpu[target],
+                                            (uint16_t)((ipi->vector & 0xFFu) << 8), 0u);
                     vmm_set_topology(kind, vm->vcpu[target], target,
                                      fw_1_guest_visible_vcpus(vm),
                                      vm->threads_per_core ? vm->threads_per_core : 1u);
@@ -10979,7 +11039,7 @@ static unsigned long long g_ap_vcpu_exits[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM
 static uint64_t g_ap_vcpu_last_reason[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint64_t g_ap_vcpu_last_rip[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static unsigned long long g_ap_vcpu_unhandled[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static unsigned g_ap_vcpu_excp_dumped[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 
 static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t *ops,
                              hype_vmm_kind_t kind) {
@@ -11005,6 +11065,15 @@ static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t
      * BSP starts it, so entering the guest earlier would execute whatever the reset state
      * happens to point at. Read through volatile because the writer is another core.
      */
+    g_ap_vcpu_live[vm_idx][vi] = 1u;
+
+wait_for_sipi:
+    /*
+     * Parked: not inside VMRUN, so the BSP may rebuild this vCPU's VMCB. Published BEFORE the
+     * wait, and cleared only once we are about to enter -- the window between the two is what
+     * fw_1_wait_vcpu_parked() relies on.
+     */
+    vm->vcpu_parked[vi] = 1u;
     for (;;) {
         ctx = *(hype_vcpu_ctx_t *volatile *)&vm->vcpu[vi];
         if (ctx != 0 && *(volatile uint8_t *)&vm->vcpu_state[vi] == HYPE_VCPU_STATE_RUNNABLE) {
@@ -11018,10 +11087,20 @@ static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t
                              (unsigned)vm->vcpu_state[vi]);
         }
     }
+    vm->vcpu_parked[vi] = 0u;
     hype_debug_print("fw-1 vm%u vCPU %u: SIPI received, entering guest [#190]\n", vm_idx, vi);
-    g_ap_vcpu_live[vm_idx][vi] = 1u;
 
     for (;;) {
+        /*
+         * An INIT revokes RUNNABLE. Go back and park rather than re-entering: the BSP is about
+         * to rebuild this VMCB, and running it meanwhile is what produced the #GP storm this
+         * handshake exists to stop -- reset_gprs() zeroed a live AP's registers and the guest
+         * executed `mov ss,edx` with edx = 0.
+         */
+        if (*(volatile uint8_t *)&vm->vcpu_state[vi] != HYPE_VCPU_STATE_RUNNABLE) {
+            hype_debug_print("fw-1 vm%u vCPU %u: INIT -- parking [#190]\n", vm_idx, vi);
+            goto wait_for_sipi;
+        }
         if (ops->vcpu_run(ctx, &info) != 0) {
             hype_debug_print("fw-1 vm%u vCPU %u: vcpu_run failed -- stopping this vCPU "
                              "[#190]\n", vm_idx, vi);
@@ -11075,6 +11154,51 @@ static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t
              * reinjection preserves it. */
             int has_ec = (vec == 8u || vec == 10u || vec == 11u || vec == 12u || vec == 13u ||
                           vec == 14u || vec == 17u || vec == 21u);
+            /* SMP-6: dump the AP's own state on its first few faults. "Reinjected and it
+             * faulted again" is not diagnosable without knowing what mode it is in. */
+            if (g_ap_vcpu_excp_dumped[vm_idx][vi] < 3u) {
+                hype_svm_debug_state_t d;
+                g_ap_vcpu_excp_dumped[vm_idx][vi]++;
+                if (vmm_get_debug_state(kind, ctx, &d)) {
+                    hype_debug_print("fw-1 APVCPU vm%u/%u EXCP vec=%u ec=0x%x cs=0x%x "
+                                     "cs_base=0x%llx rip=0x%llx rflags=0x%llx cr0=0x%llx "
+                                     "cr3=0x%llx cr4=0x%llx rsp=0x%llx [#190]\n", vm_idx, vi,
+                                     vec, (unsigned)vmm_exception_error_code(kind, ctx, &info),
+                                     (unsigned)d.cs_selector, (unsigned long long)d.cs_base,
+                                     (unsigned long long)d.rip, (unsigned long long)d.rflags,
+                                     (unsigned long long)d.cr0, (unsigned long long)d.cr3,
+                                     (unsigned long long)d.cr4, (unsigned long long)d.rsp);
+                    /* Paging is off (CR0.PG clear) and CS.base is 0, so the linear address IS
+                     * the guest-physical one -- read the bytes directly and say what faulted
+                     * rather than guessing at it. */
+                    if ((d.cr0 & 0x80000000ull) == 0ull) {
+                        const uint8_t *pre = fw_1_guest_phys_to_host(vm, d.cs_base + d.rip - 16u);
+                        if (pre != 0) {
+                            hype_debug_print("fw-1 APVCPU vm%u/%u CODE @0x%llx-16: "
+                                             "%02x %02x %02x %02x %02x %02x %02x %02x "
+                                             "%02x %02x %02x %02x %02x %02x %02x %02x | "
+                                             "%02x %02x %02x %02x %02x %02x [#190]\n",
+                                             vm_idx, vi,
+                                             (unsigned long long)(d.cs_base + d.rip),
+                                             pre[0], pre[1], pre[2], pre[3], pre[4], pre[5],
+                                             pre[6], pre[7], pre[8], pre[9], pre[10], pre[11],
+                                             pre[12], pre[13], pre[14], pre[15], pre[16],
+                                             pre[17], pre[18], pre[19], pre[20], pre[21]);
+                        }
+                    }
+                    if (kind == HYPE_VMM_KIND_SVM) {
+                        hype_debug_print("fw-1 APVCPU vm%u/%u GPR rbx=0x%llx rcx=0x%llx "
+                                         "rdx=0x%llx rsi=0x%llx rdi=0x%llx rbp=0x%llx [#190]\n",
+                                         vm_idx, vi,
+                                         (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 3u),
+                                         (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 1u),
+                                         (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 2u),
+                                         (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 6u),
+                                         (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 7u),
+                                         (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 5u));
+                    }
+                }
+            }
             vmm_reinject_exception(kind, ctx, (uint8_t)vec, has_ec,
                                    has_ec ? vmm_exception_error_code(kind, ctx, &info) : 0u);
         } else {
@@ -11103,6 +11227,7 @@ static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t
         }
         (void)vmm_deliver_pending_if_ready(kind, ctx, lapic);
     }
+    vm->vcpu_parked[vi] = 1u;
     g_ap_vcpu_live[vm_idx][vi] = 0u;
 }
 
