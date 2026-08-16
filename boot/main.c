@@ -11227,6 +11227,17 @@ wait_for_sipi:
 
         if (vmm_reason_is_cpuid(kind, info.reason)) {
             vmm_handle_cpuid(kind, ctx);
+        } else if (kind == HYPE_VMM_KIND_SVM && info.reason == HYPE_SVM_EXITCODE_RDTSC) {
+            /*
+             * #438, on the AP too. The BSP loop has retired intercepted RDTSC with hype's
+             * advancing host-derived value since #438; the AP loop never got the same branch,
+             * so every RDTSC the AP executed fell through to "unhandled" and was counted but
+             * not retired. Measured on the first 2-vCPU boot that got this far: 3874188 of
+             * 6036871 AP exits unhandled, last reason 0x6e. A guest polling RDTSC in a wait
+             * loop -- which is what FreeBSD's AP launch does -- cannot make progress against
+             * that.
+             */
+            hype_svm_vcpu_handle_rdtsc(ctx);
         } else if (vmm_reason_is_msr(kind, info.reason)) {
             if (vmm_handle_msr(kind, ctx, info.reason) != 0) {
                 g_ap_vcpu_unhandled[vm_idx][vi]++;
