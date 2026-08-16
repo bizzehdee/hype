@@ -5044,6 +5044,14 @@ static uint64_t g_ap_ecam_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
  * numbers answer it: ticks/elapsed should equal HYPE_GUEST_LAPIC_HZ. */
 static uint64_t g_ap_lapic_ticks[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint64_t g_ap_lapic_tsc_span[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+/* #484: TSC spent by this AP WAITING for the shared-device lock. SMP-7 makes hype hold that
+ * lock whenever it is outside the guest, and a host ATAPI read takes milliseconds -- so while
+ * the BSP services one, the AP is stuck in host code and its guest CPU makes no progress at
+ * all. That is indistinguishable, from inside the guest, from a hung CPU, which is exactly what
+ * the RCU stall reports. Measured rather than argued: if this number is a large fraction of
+ * the run, the lock is the stall. */
+static uint64_t g_ap_devlock_wait[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_ap_devlock_max[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 
 /*
@@ -11302,7 +11310,16 @@ wait_for_sipi:
                              "[#190]\n", vm_idx, vi);
             break;
         }
-        fw_1_dev_lock(vm);
+        {
+            uint64_t lk0 = hype_rdtsc();
+            uint64_t lkd;
+            fw_1_dev_lock(vm);
+            lkd = hype_rdtsc() - lk0;
+            g_ap_devlock_wait[vm_idx][vi] += lkd;
+            if (lkd > g_ap_devlock_max[vm_idx][vi]) {
+                g_ap_devlock_max[vm_idx][vi] = lkd;
+            }
+        }
         g_ap_vcpu_exits[vm_idx][vi]++;
         /*
          * SMP-6: on this vCPU's FIRST exit, read back the two fields the AP has just updated
@@ -13303,7 +13320,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         hype_debug_print(
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
                             "last=0x%llx@0x%llx timer_irqs=%llu init=%u cur=%u lvt=0x%x "
-                            "ahci=%llu ecam=%llu lt=%llu span=%llu "
+                            "ahci=%llu ecam=%llu lt=%llu span=%llu lockwait=%llu lockmax=%llu "
                             "[#190]\n", _vmi, _av,
                             (unsigned)g_ap_vcpu_live[_vmi][_av],
                             g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
@@ -13316,7 +13333,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             (unsigned long long)g_ap_ahci_serves[_vmi][_av],
                             (unsigned long long)g_ap_ecam_serves[_vmi][_av],
                             (unsigned long long)g_ap_lapic_ticks[_vmi][_av],
-                            (unsigned long long)g_ap_lapic_tsc_span[_vmi][_av]);
+                            (unsigned long long)g_ap_lapic_tsc_span[_vmi][_av],
+                            (unsigned long long)g_ap_devlock_wait[_vmi][_av],
+                            (unsigned long long)g_ap_devlock_max[_vmi][_av]);
                     /*
                      * SMP-6: dump the AP's dispatch record ONCE on the normal path, not only
                      * at a fault. The DEBUG guest firmware names its modules but does not
