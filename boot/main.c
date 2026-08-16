@@ -5166,8 +5166,15 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
             }
             for (target = 0; target < n; target++) {
                 if (!selected[target] || vm->vcpu[target] == 0) continue;
-                vmm_request_interrupt(kind, vm->vcpu[target], &vm->lapic[target],
-                                      (uint8_t)ipi->vector);
+                /*
+                 * SMP-6: pend on the TARGET's LAPIC and let its own core inject it. This used
+                 * to call vmm_request_interrupt() against the target's context, which meant
+                 * this core wrote another core's VMCB while that core could be inside VMRUN --
+                 * and hardware writes the control area back on exit, so the injection could be
+                 * lost. That is what left FreeBSD's BSP spinning in a TLB shootdown for an AP
+                 * that was idle and had never seen the IPI.
+                 */
+                hype_guest_lapic_post_vector(&vm->lapic[target], (uint8_t)ipi->vector);
                 acted++;
             }
             break;
@@ -5193,7 +5200,10 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
                 }
             }
             if (best != HYPE_MAX_VCPUS_PER_VM) {
-                vmm_request_interrupt(kind, vm->vcpu[best], &vm->lapic[best],
+                /* SMP-6: same cross-core hazard as the FIXED case above -- pend it on the
+                 * chosen target's LAPIC rather than writing that vCPU's VMCB from here. */
+                (void)kind;
+                hype_guest_lapic_post_vector(&vm->lapic[best],
                                       (uint8_t)ipi->vector);
                 acted++;
             }
@@ -13079,6 +13089,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  */
                 {
                     unsigned _av, _vmi = (unsigned)(vm - g_vms);
+                    /*
+                     * SMP-6: outbound IPI accounting per vCPU. lapic_post_ipi() counts a drop
+                     * whenever a second IPI is posted before the first is drained -- the slot
+                     * holds exactly one -- but nothing ever printed the counter, so drops were
+                     * invisible. FreeBSD's TLB shootdown is a burst of targeted IPIs, and the
+                     * BSP was measured spinning in smp_targeted_tlb_shootdown_native waiting
+                     * for an AP that is idle in cpu_idle_acpi.
+                     */
+                    for (_av = 0u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
+                        hype_debug_print("fw-1 IPIOUT vm%u/%u: sent=%llu dropped=%llu "
+                                         "pending=%u [#190]\n", _vmi, _av,
+                                         (unsigned long long)vm->lapic[_av].ipi_out_count,
+                                         (unsigned long long)vm->lapic[_av].ipi_out_dropped,
+                                         (unsigned)vm->lapic[_av].ipi_out_valid);
+                    }
                     for (_av = 1u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
                         hype_debug_print(
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "

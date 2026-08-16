@@ -300,6 +300,13 @@ int hype_guest_lapic_recover_in_service(hype_guest_lapic_t *lapic);
 int hype_guest_lapic_take_self_ipi(hype_guest_lapic_t *lapic, uint8_t *vector_out);
 
 /*
+ * SMP-6 (#190): pend `vector` on a LAPIC that belongs to a DIFFERENT vCPU. Safe to call from
+ * another core -- it is an atomic OR into the pending set, and the owning vCPU drains it into
+ * its own VMCB. Use this for cross-vCPU delivery instead of touching the target's context.
+ */
+void hype_guest_lapic_post_vector(hype_guest_lapic_t *lapic, uint8_t vector);
+
+/*
  * #311: record that `vector` has been committed to the guest, by setting its ISR bit.
  *
  * Call this wherever hype hands a vector to the guest, so that a guest which reads the ISR

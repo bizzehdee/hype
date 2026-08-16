@@ -478,6 +478,29 @@ int hype_guest_lapic_take_timer_irq(hype_guest_lapic_t *lapic, uint8_t *vector_o
     return 1;
 }
 
+/*
+ * SMP-6 (#190): pend a vector on ANOTHER vCPU's LAPIC, to be injected by that vCPU's own
+ * dispatch loop.
+ *
+ * This exists because the cross-vCPU FIXED IPI path used to call vmm_request_interrupt()
+ * against the target's context -- i.e. the SENDING core wrote the TARGET's VMCB while the
+ * target core could be inside VMRUN. Hardware writes back the VMCB control area on exit, so
+ * that injection could simply be lost. The INIT/SIPI path parks the target first for exactly
+ * this reason; the FIXED path did not.
+ *
+ * Measured consequence: FreeBSD's BSP spun in smp_targeted_tlb_shootdown_native waiting for an
+ * acknowledgement from an AP that was sitting idle in cpu_idle_acpi, having never seen the
+ * shootdown IPI. 26 IPIs sent, none dropped by the outbound slot, and still no progress.
+ *
+ * Posting a bit into the target's pending set is a plain atomic OR on shared memory, and the
+ * target drains it on its own core, into its own VMCB.
+ */
+void hype_guest_lapic_post_vector(hype_guest_lapic_t *lapic, uint8_t vector) {
+    (void)__atomic_fetch_or(&lapic->self_ipi_pending[vector >> 5],
+                            1u << (vector & 31u), __ATOMIC_RELEASE);
+    (void)__atomic_fetch_add(&lapic->self_ipi_count, 1ull, __ATOMIC_RELAXED);
+}
+
 int hype_guest_lapic_take_self_ipi(hype_guest_lapic_t *lapic, uint8_t *vector_out) {
     unsigned int word;
     for (word = 0; word < 8u; word++) {
@@ -488,7 +511,11 @@ int hype_guest_lapic_take_self_ipi(hype_guest_lapic_t *lapic, uint8_t *vector_ou
         }
         for (bit = 0; bit < 32u; bit++) {
             if ((bits & (1u << bit)) != 0) {
-                lapic->self_ipi_pending[word] = bits & ~(1u << bit);
+                /* SMP-6: cleared atomically. Another vCPU's core may be OR-ing a bit into this
+                 * same word via hype_guest_lapic_post_vector() at this instant; a
+                 * read-modify-write would drop that IPI. */
+                (void)__atomic_fetch_and(&lapic->self_ipi_pending[word],
+                                         ~(1u << bit), __ATOMIC_ACQUIRE);
                 *vector_out = (uint8_t)(word * 32u + bit);
                 return 1;
             }
