@@ -4950,6 +4950,9 @@ static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint6
     }
 }
 
+/* Defined further down; the SIPI path below needs it to read the guest's wakeup buffer. */
+static const uint8_t *fw_1_guest_phys_to_host(hype_fw_vm_t *vm, uint64_t gpa);
+
 /* SMP-7 (#191): this VM's shared-device lock. See hype_fw_vm_t.dev_lock_next. */
 static void fw_1_dev_lock(hype_fw_vm_t *vm) {
     hype_ticket_lock_acquire(&vm->dev_lock_next, &vm->dev_lock_owner);
@@ -5097,6 +5100,33 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
                      */
                     vmm_set_cs_ss_selectors(kind, vm->vcpu[target],
                                             (uint16_t)((ipi->vector & 0xFFu) << 8), 0u);
+                    /*
+                     * SMP-6: OVMF's MP_CPU_EXCHANGE_INFO sits in the SIPI buffer, and the AP
+                     * reads BufferStart / DataSegment / Cr3 / the ModeHighMemory far pointer
+                     * out of it. Dumped HERE, at the SIPI, because that is the one moment it
+                     * is guaranteed populated -- OVMF reclaims the page later, so a dump taken
+                     * at a fault reads zeros and proves nothing.
+                     */
+                    {
+                        static unsigned dumped;
+                        const uint8_t *xi =
+                            fw_1_guest_phys_to_host(vm, (uint64_t)ipi->vector << 12);
+                        if (xi != 0 && dumped < 2u) {
+                            unsigned q;
+                            char line[200];
+                            int off = hype_snprintf(line, sizeof(line),
+                                                    "fw-1 vm%u SIPIBUF @0x%llx:",
+                                                    (unsigned)(vm - g_vms),
+                                                    (unsigned long long)ipi->vector << 12);
+                            dumped++;
+                            for (q = 0; q < 56u; q++) {
+                                off += hype_snprintf(line + off, sizeof(line) - (unsigned)off,
+                                                     " %02x", xi[q]);
+                            }
+                            hype_debug_print("%s [#190]\n", line);
+
+                        }
+                    }
                     vmm_set_topology(kind, vm->vcpu[target], target,
                                      fw_1_guest_visible_vcpus(vm),
                                      vm->threads_per_core ? vm->threads_per_core : 1u);
@@ -11223,7 +11253,7 @@ wait_for_sipi:
                           vec == 14u || vec == 17u || vec == 21u);
             /* SMP-6: dump the AP's own state on its first few faults. "Reinjected and it
              * faulted again" is not diagnosable without knowing what mode it is in. */
-            if (g_ap_vcpu_excp_dumped[vm_idx][vi] < 12u) {
+            if (g_ap_vcpu_excp_dumped[vm_idx][vi] < 2u) {
                 hype_svm_debug_state_t d;
                 g_ap_vcpu_excp_dumped[vm_idx][vi]++;
                 if (vmm_get_debug_state(kind, ctx, &d)) {
@@ -11266,6 +11296,25 @@ wait_for_sipi:
                                 unsigned q;
                                 for (q = 0; q < sizeof(ib); q++) ib[q] = ph[q];
                                 got = 2;
+                            }
+                        }
+                        {
+                            /* SMP-6: OVMF's MP_CPU_EXCHANGE_INFO lives at the SIPI buffer
+                             * (vector << 12). The AP reads BufferStart, DataSegment, Cr3 and
+                             * the ModeHighMemory far pointer out of it, so dumping it says
+                             * whether the AP was handed sane values or jumped somewhere wrong. */
+                            const uint8_t *xi = fw_1_guest_phys_to_host(vm, 0x9f000ull);
+                            if (xi != 0) {
+                                unsigned q;
+                                char line[160];
+                                int off = hype_snprintf(line, sizeof(line),
+                                                        "fw-1 APVCPU vm%u/%u XCHG @0x9f000:",
+                                                        vm_idx, vi);
+                                for (q = 0; q < 48u; q++) {
+                                    off += hype_snprintf(line + off, sizeof(line) - (unsigned)off,
+                                                         " %02x", xi[q]);
+                                }
+                                hype_debug_print("%s [#190]\n", line);
                             }
                         }
                         if (got) {
