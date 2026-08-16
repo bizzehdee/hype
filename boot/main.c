@@ -11532,9 +11532,18 @@ wait_for_sipi:
              * faulting exactly as it is designed to, and OVMF's handler fixes it up.
              */
             unsigned vec = (unsigned)vmm_exception_vector(kind, ctx, info.reason);
-            /* The vectors that push an error code (SDM Vol 3, Table 6-1). CR2 for a #PF is
-             * already in the guest save state -- hardware wrote it before the intercept, and
-             * reinjection preserves it. */
+            /*
+             * The vectors that push an error code (SDM Vol 3, Table 6-1).
+             *
+             * #484: an earlier comment here claimed CR2 for a #PF is "already in the guest save
+             * state ... and reinjection preserves it". That is the opposite of the truth, and
+             * svm.h says so: APM 15.12.15 tests the intercept BEFORE the exception writes CR2,
+             * so save.cr2 is STALE and only exitinfo2 holds the address. Acting on the wrong
+             * belief is what made every AP page fault report address 0. #PF is no longer
+             * intercepted on this path (see the mask set after the SIPI wait), so hardware
+             * writes CR2 itself; if #PF is ever re-intercepted here, CR2 must be written from
+             * exitinfo2 before reinjecting.
+             */
             int has_ec = (vec == 8u || vec == 10u || vec == 11u || vec == 12u || vec == 13u ||
                           vec == 14u || vec == 17u || vec == 21u);
             /* SMP-6: dump the AP's own state on its first few faults. "Reinjected and it
