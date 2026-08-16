@@ -94,6 +94,9 @@ void hype_host_kbd_isr(const hype_isr_frame_t *frame);
  */
 int hype_host_kbd_poll_scancode(uint8_t *out_scancode);
 
+/* #218: how many bytes the IRQ-independent polling fallback has taken from the i8042. */
+uint64_t hype_host_kbd_polled_bytes(void);
+
 /*
  * USB-5 (#217): push a scancode into the SAME host queue the PS/2 ISR feeds.
  *

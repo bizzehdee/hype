@@ -2,6 +2,11 @@
 #include "ps2_host.h"
 
 #define HYPE_PS2_HOST_PORT_DATA 0x60u
+/* #218: the i8042 status port. Bit 0 (OBF) means a byte is waiting in the data port; bit 5
+ * distinguishes a mouse byte from a keyboard byte on a controller with a second channel. */
+#define HYPE_PS2_HOST_PORT_STATUS 0x64u
+#define HYPE_PS2_HOST_STATUS_OBF 0x01u
+#define HYPE_PS2_HOST_STATUS_AUX 0x20u
 
 static hype_host_kbd_buffer_t g_host_kbd_buffer;
 
@@ -44,6 +49,10 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
+/* #218: bytes taken by the polling fallback, so a hardware run can tell "the poll found
+ * nothing" from "the poll never ran" -- the distinction that cost this bug a whole session. */
+static uint64_t g_kbd_polled_bytes;
+
 void hype_host_kbd_init(void) {
     hype_host_kbd_buffer_reset(&g_host_kbd_buffer);
     hype_isr_register(HYPE_HOST_KBD_VECTOR, hype_host_kbd_isr);
@@ -60,9 +69,50 @@ void hype_host_kbd_isr(const hype_isr_frame_t *frame) {
     g_kbd_isr_eois++;
 }
 
+/*
+ * #218: drain the i8042 output buffer by POLLING, with no dependency on IRQ1.
+ *
+ * The host keyboard was interrupt-only: hype_host_kbd_isr() pushed into the buffer and
+ * hype_host_kbd_poll_scancode() popped from it. On the operator's laptop IRQ1 never fires --
+ * a full real-hardware run measured isr_entries=0 eois=0 -- so that buffer stayed empty and
+ * no key ever reached hype. USB HID was the workaround, but the same run's inventory found no
+ * HID device at all (a mass-storage stick, a card reader, Bluetooth and a camera), so with
+ * both paths dead the machine had no keyboard input whatsoever.
+ *
+ * Polling the status port needs no interrupt routing, no PIC unmask and no IOAPIC entry, which
+ * is what makes it work where the ISR does not. Bytes are pushed into the SAME buffer the ISR
+ * uses, so ordering and the existing consumer are unchanged, and a machine where IRQ1 DOES
+ * work simply finds the buffer already filled.
+ *
+ * Bounded per call: a stuck controller that always reports OBF must not spin here forever --
+ * this runs on the BSP's render/input loop, which also drives the dashboard.
+ */
+static void host_kbd_drain_polled(void) {
+    unsigned guard;
+    for (guard = 0; guard < 16u; guard++) {
+        uint8_t st = inb(HYPE_PS2_HOST_PORT_STATUS);
+        uint8_t data;
+        if ((st & HYPE_PS2_HOST_STATUS_OBF) == 0u) {
+            return; /* nothing waiting */
+        }
+        data = inb(HYPE_PS2_HOST_PORT_DATA);
+        if ((st & HYPE_PS2_HOST_STATUS_AUX) != 0u) {
+            continue; /* mouse byte: consumed so it cannot block the keyboard, then dropped */
+        }
+        g_kbd_polled_bytes++;
+        hype_host_kbd_buffer_push(&g_host_kbd_buffer, data);
+    }
+}
+
 int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
+    if (hype_host_kbd_buffer_pop(&g_host_kbd_buffer, out_scancode)) {
+        return 1;
+    }
+    host_kbd_drain_polled();
     return hype_host_kbd_buffer_pop(&g_host_kbd_buffer, out_scancode);
 }
+
+uint64_t hype_host_kbd_polled_bytes(void) { return g_kbd_polled_bytes; }
 
 void hype_host_kbd_inject_scancode(uint8_t scancode) {
     /* Same buffer the ISR pushes into -- see the header for why USB HID joins the

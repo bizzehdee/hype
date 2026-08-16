@@ -23001,11 +23001,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              g_fbprobe_skip_rate);
                         }
                         hype_debug_print("fw-1 KBDIRQ: isr_entries=%llu (+%llu since last) eois=%llu "
-                                         "last_apic=%u | polled=%llu chords=%llu | "
+                                         "last_apic=%u | polled=%llu chords=%llu ps2polled=%llu | "
                                          "bsp_usb_timeouts=%llu [#363]\n",
                                          e, e - kbd_prev_entries, eo, ap,
                                          (unsigned long long)g_hostkbd_scancodes,
                                          (unsigned long long)g_hostkbd_chords,
+                                         (unsigned long long)hype_host_kbd_polled_bytes(),
                                          hype_blk_usb_bsp_lock_timeouts());
                         {
                             unsigned vi;
