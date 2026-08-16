@@ -2020,6 +2020,155 @@ static int *g_ap_slot_valid;
  * is running in x2APIC mode and would need the x2APIC ICR MSR instead; that is
  * out of scope here and is reported rather than silently mis-addressed.
  */
+/*
+ * SMP-6 (#190) / §10 decision 40: the host hardware thread each guest vCPU runs on.
+ *
+ * Indexed [vm][vcpu], because the unit that needs a thread is a vCPU, not a VM --
+ * fw_1_ap_apic_id() below asks for one core per VM, which is why a `vcpus = 2` guest could
+ * never have had anywhere to run its second vCPU.
+ *
+ * Allocation is by WHOLE PHYSICAL CORE (#479). A VM's own vCPUs are packed onto sibling
+ * threads of the same core first: a single VM is trivially one trust group, so its vCPUs
+ * sharing a core is the ordinary guest-SMP case and needs no permission. Cores are never
+ * split between VMs, which is what keeps decision 40's cross-owner rule true by construction
+ * here, before any scheduler exists to enforce it.
+ */
+/* Index into g_cpu_topo for an APIC ID, or -1. */
+static int fw_1_topo_index_of(uint32_t apic_id) {
+    unsigned i;
+    for (i = 0; i < g_cpu_topo.count; i++) {
+        if (g_cpu_topo.apic_id[i] == apic_id) return (int)i;
+    }
+    return -1;
+}
+
+static uint32_t g_vcpu_thread[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint8_t g_vcpu_thread_valid[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static unsigned g_vcpu_threads_placed;
+static unsigned g_vcpu_cores_used;
+
+/*
+ * Build the [vm][vcpu] -> host thread map. Returns the number of vCPUs placed.
+ *
+ * A vCPU that cannot be placed is left invalid and reported; the VM still runs with the vCPUs
+ * that were placed, because refusing the whole machine over one missing core is worse than a
+ * guest with fewer CPUs -- and every consumer reads vcpu_count, which is corrected to match.
+ */
+static unsigned fw_1_place_vcpus_on_threads(void) {
+    uint32_t threads[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned ncores_wanted = 0, nthreads, ncores = 0;
+    unsigned vi, ci, next = 0;
+    unsigned per_core[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned core_start[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned placed = 0;
+
+    g_vcpu_threads_placed = 0;
+    g_vcpu_cores_used = 0;
+    for (vi = 0; vi < g_vm_count; vi++) {
+        unsigned k;
+        for (k = 0; k < HYPE_MAX_VCPUS_PER_VM; k++) {
+            g_vcpu_thread_valid[vi][k] = 0u;
+        }
+    }
+    if (g_cpu_topo.count == 0u) {
+        return 0; /* no enumeration: the caller falls back to the pre-#360 literal path */
+    }
+
+    /*
+     * Ask for enough whole cores to hold every VM's vCPUs, counting each VM separately so a
+     * core is never shared between two VMs. When siblings cannot be proven (#378's all-zero
+     * table), select_cores reports one thread per core anyway, so this degrades to the
+     * conservative one-vCPU-per-core placement rather than pairing anyone by accident.
+     */
+    {
+        unsigned threads_per_core = 1u;
+        unsigned cores_total = 0, smt_cores = 0;
+        hype_cpu_topology_core_summary(&g_cpu_topo, &cores_total, &smt_cores);
+        if (hype_cpu_topology_siblings_known(&g_cpu_topo) && cores_total != 0u) {
+            threads_per_core = g_cpu_topo.count / cores_total;
+            if (threads_per_core == 0u) threads_per_core = 1u;
+        }
+        for (vi = 0; vi < g_vm_count; vi++) {
+            unsigned want = g_vms[vi].vcpu_count ? g_vms[vi].vcpu_count : 1u;
+            ncores_wanted += (want + threads_per_core - 1u) / threads_per_core;
+        }
+    }
+
+    nthreads = hype_cpu_topology_select_cores(&g_cpu_topo, ncores_wanted, threads,
+                                              HYPE_CPU_TOPOLOGY_MAX, &ncores);
+    if (nthreads == 0u) {
+        return 0;
+    }
+    g_vcpu_cores_used = ncores;
+
+    /*
+     * Recover each selected core's run of threads, so a VM can be packed core by core.
+     * select_cores emits a core's threads contiguously and never splits one, so walking the
+     * output and breaking whenever the (package, core) changes recovers the boundaries.
+     */
+    {
+        unsigned t = 0;
+        for (ci = 0; ci < ncores && t < nthreads; ci++) {
+            unsigned j;
+            int base = fw_1_topo_index_of(threads[t]);
+            core_start[ci] = t;
+            per_core[ci] = 0;
+            for (j = t; j < nthreads; j++) {
+                int idx = fw_1_topo_index_of(threads[j]);
+                if (base < 0 || idx < 0) break;
+                if (g_cpu_topo.loc[idx].package != g_cpu_topo.loc[base].package ||
+                    g_cpu_topo.loc[idx].core != g_cpu_topo.loc[base].core) {
+                    break;
+                }
+                per_core[ci]++;
+            }
+            if (per_core[ci] == 0u) break; /* cannot happen, but never loop forever on it */
+            t += per_core[ci];
+        }
+    }
+
+    /* Pack each VM onto whole cores, in order. */
+    ci = 0;
+    next = 0;
+    for (vi = 0; vi < g_vm_count; vi++) {
+        unsigned want = g_vms[vi].vcpu_count ? g_vms[vi].vcpu_count : 1u;
+        unsigned got = 0;
+        if (want > HYPE_MAX_VCPUS_PER_VM) want = HYPE_MAX_VCPUS_PER_VM;
+        while (got < want && ci < ncores) {
+            unsigned k;
+            for (k = 0; k < per_core[ci] && got < want; k++) {
+                uint32_t apic = threads[core_start[ci] + k];
+                if (apic > 255u) {
+                    /* hype_ap_start drives the 8-bit xAPIC ICR destination field. Reported,
+                     * never silently mis-addressed -- the #360 lesson. */
+                    hype_debug_print("fw-1 SMP: vm%u vCPU %u would need APIC ID %llu, above the "
+                                     "8-bit xAPIC ICR destination -- not placed [#190]\n",
+                                     vi, got, (unsigned long long)apic);
+                    continue;
+                }
+                g_vcpu_thread[vi][got] = apic;
+                g_vcpu_thread_valid[vi][got] = 1u;
+                got++;
+                placed++;
+            }
+            ci++; /* a core is never shared between VMs, so move on even if partly used */
+            next = ci;
+        }
+        if (got < want) {
+            hype_debug_print("fw-1 SMP: vm%u asked for %u vCPU(s), only %u host thread(s) "
+                             "available -- running with %u [#190]\n", vi, want, got, got);
+            g_vms[vi].vcpu_count = got ? got : 1u;
+        }
+    }
+    (void)next;
+    g_vcpu_threads_placed = placed;
+    hype_debug_print("fw-1 SMP: placed %u vCPU(s) on %u whole physical core(s), %u thread(s) "
+                     "selected, siblings %s [#190 #479]\n", placed, ncores, nthreads,
+                     hype_cpu_topology_siblings_known(&g_cpu_topo) ? "known" : "UNPROVEN "
+                     "(one thread per core)");
+    return placed;
+}
+
 static int fw_1_ap_apic_id(unsigned int n) {
     uint32_t *sel = g_ap_sel;
     int nsel;
@@ -2126,13 +2275,35 @@ static void hype_ap_lapic_timer_isr(const hype_isr_frame_t *frame) {
  * with its own stack). It loads hype's GDT/IDT, enables SVM on this core, and
  * -- under HYPE_RUN_GUEST_ON_AP -- runs the FW-1 guest here (the dedicated-core
  * perf experiment). Never returns. */
+/*
+ * SMP-6 (#190): a host AP's argument encodes WHICH vCPU of which VM it is to run, not just a
+ * VM index -- a VM now has several vCPUs and each needs its own core.
+ */
+#define FW_1_AP_ARG(vm_idx, vcpu_idx) ((uintptr_t)(vm_idx) | ((uintptr_t)(vcpu_idx) << 8))
+#define FW_1_AP_ARG_VM(a) ((unsigned)((a) & 0xFFu))
+#define FW_1_AP_ARG_VCPU(a) ((unsigned)(((a) >> 8) & 0xFFu))
+
+/* SMP-6: defined far below, next to run_fw_1_test, which it deliberately does not share code
+ * with -- see its own comment. */
+static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t *ops,
+                             hype_vmm_kind_t kind);
+
+/* Flat index of a vCPU across all VMs, for the per-core arenas. */
+static unsigned fw_1_vcpu_slot(unsigned vm_idx, unsigned vcpu_idx) {
+    return vm_idx * HYPE_MAX_VCPUS_PER_VM + vcpu_idx;
+}
+
 static void fw_1_ap_main(void *arg) {
     /* STEP 2: `arg` is this core's VM index (0 => g_vms[0] on AP1, 1 =>
      * g_vms[1] on AP2). Selects this core's guest, its own SVM host-save area,
      * and (below) its host_tsc_hz for the LAPIC-timer calibration. */
-    unsigned vm_idx = (unsigned)(uintptr_t)arg;
+    unsigned vm_idx = FW_1_AP_ARG_VM((uintptr_t)arg);
+    unsigned vcpu_idx = FW_1_AP_ARG_VCPU((uintptr_t)arg);
     if (vm_idx >= g_vm_count) {
         vm_idx = 0u;
+    }
+    if (vcpu_idx >= HYPE_MAX_VCPUS_PER_VM) {
+        vcpu_idx = 0u;
     }
     /*
      * #257: move this core onto the BSP's page table.
@@ -2191,7 +2362,10 @@ static void fw_1_ap_main(void *arg) {
     if (g_fw_1_ops != 0 && g_fw_1_ops->enable_on != 0) {
         /* SVM's variant faults rather than returning non-zero, so on AMD a
          * non-fatal return is already success; VMX's reports VMXON's CF. */
-        g_fw_1_ap_vmm_ok = (g_fw_1_ops->enable_on(g_ap_vmm_page[vm_idx]) == 0) ? 1u : 0u;
+        /* SMP-6: this CORE's host-save area, keyed by vCPU rather than VM. */
+        g_fw_1_ap_vmm_ok =
+            (g_fw_1_ops->enable_on(g_ap_vmm_page[fw_1_vcpu_slot(vm_idx, vcpu_idx)]) == 0) ? 1u
+                                                                                          : 0u;
     }
     g_hype_ap_c_alive = 1;
 #if HYPE_229_AP_AHCI_PROBE
@@ -2270,7 +2444,15 @@ static void fw_1_ap_main(void *arg) {
      * NPT/VMCB/devices and enters the dispatch loop; never returns for a live
      * boot. INTERCEPT_INTR + the AP's one-shot timer above give bounded forced
      * exits; the clocksource is kvmclock. */
-    run_fw_1_test(&g_vms[vm_idx], g_fw_1_ops, g_fw_1_kind);
+    /*
+     * SMP-6 (#190): vCPU 0 is the VM's BSP and runs the full loop that owns the VM -- media,
+     * dashboard, devices. Every other vCPU runs the AP loop, which owns only itself.
+     */
+    if (vcpu_idx == 0u) {
+        run_fw_1_test(&g_vms[vm_idx], g_fw_1_ops, g_fw_1_kind);
+    } else {
+        fw_1_run_ap_vcpu(&g_vms[vm_idx], vcpu_idx, g_fw_1_ops, g_fw_1_kind);
+    }
 #endif
     for (;;) {
         __asm__ volatile("cli; hlt");
@@ -4728,9 +4910,9 @@ static uint32_t vmm_exception_error_code(hype_vmm_kind_t kind, hype_vcpu_ctx_t *
  *
  * Returns the number of vCPUs the IPI acted on, for the diagnostics.
  */
-static unsigned fw_1_route_ipi(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
-                               const hype_guest_lapic_ipi_t *ipi, uint64_t npt_root,
-                               uint64_t stack_top);
+static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_kind_t kind,
+                                    const hype_guest_lapic_ipi_t *ipi, uint64_t npt_root,
+                                    uint64_t stack_top);
 
 static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t guest_rip,
                                uint64_t guest_rsp, uint64_t table_root) {
@@ -4745,9 +4927,9 @@ static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint6
  * SMP-4 (#188): the router declared above. Defined here, after vmm_reset_realmode and
  * vmm_set_topology, which it calls.
  */
-static unsigned fw_1_route_ipi(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
-                               const hype_guest_lapic_ipi_t *ipi, uint64_t npt_root,
-                               uint64_t stack_top) {
+static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_kind_t kind,
+                                    const hype_guest_lapic_ipi_t *ipi, uint64_t npt_root,
+                                    uint64_t stack_top) {
     unsigned target;
     unsigned acted = 0;
     unsigned n = vm->vcpu_count ? vm->vcpu_count : 1u;
@@ -4767,7 +4949,9 @@ static unsigned fw_1_route_ipi(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
      */
     for (target = 0; target < n; target++) {
         int sel;
-        if (target == vm->cur_vcpu) {
+        if (target == sender) {
+            /* SMP-6 (#190): the SENDER, passed in -- an AP sends IPIs too, and reading
+             * vm->cur_vcpu here would have called the BSP the sender for every one of them. */
             selected[target] = 0;
             continue;
         }
@@ -10769,6 +10953,159 @@ static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
     }
 }
 
+/*
+ * SMP-6 (#190): the dispatch loop for a guest AP vCPU.
+ *
+ * Deliberately SEPARATE from run_fw_1_test rather than carved out of it. That function is
+ * ~4900 lines and owns the whole VM -- media streaming, the dashboard, the input script,
+ * per-VM diagnostics -- none of which an AP has or wants a second copy of. The repo's own
+ * lesson from #236 is that a one-shot restructuring of this loop stalled the guest and never
+ * bisected; an additive second loop keeps the working BSP path untouched and this one
+ * reviewable on its own.
+ *
+ * What an AP actually takes, and therefore all this handles: CPUID, RDMSR/WRMSR, LAPIC MMIO
+ * (its OWN LAPIC -- vm->lapic[i], which is why SMP-3 had to come first), HLT, the interrupt
+ * window, and the interrupts SMP-5 queues into its pending set. Anything else is reported by
+ * name and count rather than absorbed, because an unhandled exit here is a guest that stops
+ * for a reason nobody can see.
+ *
+ * Shared VM state -- the emulated devices, the PIC/PIT, the IO-APIC -- is NOT touched from
+ * here. Two cores driving one device model is the #343 bug class (hype handed guests corrupt
+ * bytes until the host-I/O path was serialised), and doing it properly is SMP-7. Until then an
+ * AP exit that would need shared state is refused and counted, which is a visible limitation
+ * rather than a silent corruption.
+ */
+static unsigned long long g_ap_vcpu_exits[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_ap_vcpu_last_reason[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_ap_vcpu_last_rip[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static unsigned long long g_ap_vcpu_unhandled[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+
+static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t *ops,
+                             hype_vmm_kind_t kind) {
+    unsigned vm_idx = (unsigned)(vm - g_vms);
+    hype_vcpu_ctx_t *ctx;
+    hype_guest_lapic_t *lapic = &vm->lapic[vi];
+    hype_vmexit_info_t info;
+    unsigned long long spins = 0;
+
+    if (vi == 0u || vi >= HYPE_MAX_VCPUS_PER_VM) {
+        return;
+    }
+
+    /*
+     * Wait for BOTH the context to exist AND the BSP to have sent this vCPU's SIPI.
+     *
+     * The context half is not optional and was a real bug: this core is started before the
+     * VM's BSP core reaches run_fw_1_test, so vm->vcpu[vi] is still NULL here. Reading it once
+     * at entry -- which the first cut did -- returned immediately and the AP never ran at all,
+     * with nothing in the log to say so.
+     *
+     * The SIPI half is architectural: an x86 AP sits in wait-for-SIPI doing nothing until its
+     * BSP starts it, so entering the guest earlier would execute whatever the reset state
+     * happens to point at. Read through volatile because the writer is another core.
+     */
+    for (;;) {
+        ctx = *(hype_vcpu_ctx_t *volatile *)&vm->vcpu[vi];
+        if (ctx != 0 && *(volatile uint8_t *)&vm->vcpu_state[vi] == HYPE_VCPU_STATE_RUNNABLE) {
+            break;
+        }
+        spins++;
+        __asm__ __volatile__("pause" ::: "memory");
+        if ((spins & 0x3FFFFFFFull) == 0ull) {
+            hype_debug_print("fw-1 vm%u vCPU %u: waiting (ctx=%s, state=%u) [#190]\n", vm_idx,
+                             vi, ctx ? "ready" : "not created",
+                             (unsigned)vm->vcpu_state[vi]);
+        }
+    }
+    hype_debug_print("fw-1 vm%u vCPU %u: SIPI received, entering guest [#190]\n", vm_idx, vi);
+    g_ap_vcpu_live[vm_idx][vi] = 1u;
+
+    for (;;) {
+        if (ops->vcpu_run(ctx, &info) != 0) {
+            hype_debug_print("fw-1 vm%u vCPU %u: vcpu_run failed -- stopping this vCPU "
+                             "[#190]\n", vm_idx, vi);
+            break;
+        }
+        g_ap_vcpu_exits[vm_idx][vi]++;
+        g_ap_vcpu_last_reason[vm_idx][vi] = info.reason;
+        g_ap_vcpu_last_rip[vm_idx][vi] = info.guest_rip;
+
+        if (vmm_reason_is_cpuid(kind, info.reason)) {
+            vmm_handle_cpuid(kind, ctx);
+        } else if (vmm_reason_is_msr(kind, info.reason)) {
+            if (vmm_handle_msr(kind, ctx, info.reason) != 0) {
+                g_ap_vcpu_unhandled[vm_idx][vi]++;
+            }
+        } else if (vmm_reason_is_npf(kind, info.reason)) {
+            const uint8_t *insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
+            /* Its OWN LAPIC. Every other MMIO region belongs to a shared device model and is
+             * SMP-7's business, so it is refused here rather than raced on. */
+            if (vmm_handle_lapic_npf(kind, ctx, lapic, HYPE_LAPIC_DEFAULT_BASE, insn) != 0) {
+                if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
+                    hype_debug_print("fw-1 vm%u vCPU %u: NPF at gpa 0x%llx rip 0x%llx needs "
+                                     "shared device state -- refused, see SMP-7 [#190]\n",
+                                     vm_idx, vi, (unsigned long long)info.qualification,
+                                     (unsigned long long)info.guest_rip);
+                }
+                g_ap_vcpu_unhandled[vm_idx][vi]++;
+            }
+        } else if (vmm_reason_is_hlt(kind, info.reason)) {
+            /* Idle until something is queued for this vCPU. SMP-5 puts cross-vCPU IPIs
+             * straight into its pending set, so the wake condition is that set. */
+            vmm_wake_hlt(kind, ctx);
+        } else if (vmm_reason_is_intr_window(kind, info.reason)) {
+            vmm_handle_intr_window(kind, ctx, lapic);
+        } else if (vmm_reason_is_intr(kind, info.reason)) {
+            /* A host interrupt interrupted the guest; nothing to do but re-enter. */
+        } else if (vmm_reason_is_any_exception(kind, info.reason)) {
+            /*
+             * hype intercepts EVERY guest exception (vmcb.c sets intercept_exceptions to all
+             * ones) so a firmware fault is visible rather than looking like a hang. Intercepted
+             * is not handled: each one has to be put back, or the guest re-executes the
+             * faulting instruction forever.
+             *
+             * Measured: without this the AP spun on exit 0x4d -- SVM's exception base plus 13,
+             * a #GP -- at one rip, for the whole run. It is the AP's own long-mode transition
+             * faulting exactly as it is designed to, and OVMF's handler fixes it up.
+             */
+            unsigned vec = (unsigned)vmm_exception_vector(kind, ctx, info.reason);
+            /* The vectors that push an error code (SDM Vol 3, Table 6-1). CR2 for a #PF is
+             * already in the guest save state -- hardware wrote it before the intercept, and
+             * reinjection preserves it. */
+            int has_ec = (vec == 8u || vec == 10u || vec == 11u || vec == 12u || vec == 13u ||
+                          vec == 14u || vec == 17u || vec == 21u);
+            vmm_reinject_exception(kind, ctx, (uint8_t)vec, has_ec,
+                                   has_ec ? vmm_exception_error_code(kind, ctx, &info) : 0u);
+        } else {
+            if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
+                hype_debug_print("fw-1 vm%u vCPU %u: unhandled exit reason 0x%llx at rip "
+                                 "0x%llx [#190]\n", vm_idx, vi,
+                                 (unsigned long long)info.reason,
+                                 (unsigned long long)info.guest_rip);
+            }
+            g_ap_vcpu_unhandled[vm_idx][vi]++;
+        }
+
+        /* Deliver anything queued for THIS vCPU -- its own LAPIC timer self-IPIs and the
+         * cross-vCPU IPIs SMP-5 routes here. */
+        {
+            uint8_t v;
+            while (hype_guest_lapic_take_self_ipi(lapic, &v)) {
+                vmm_request_interrupt(kind, ctx, lapic, v);
+            }
+        }
+        {
+            hype_guest_lapic_ipi_t ipi;
+            while (hype_guest_lapic_take_ipi(lapic, &ipi)) {
+                (void)fw_1_route_ipi_from(vm, vi, kind, &ipi, vm->used_root, 0u);
+            }
+        }
+        (void)vmm_deliver_pending_if_ready(kind, ctx, lapic);
+    }
+    g_ap_vcpu_live[vm_idx][vi] = 0u;
+}
+
 static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
@@ -12013,6 +12350,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     (unsigned long long)(vm->stat_uptime_ms / 1000u), (unsigned)vm->stat_cpu_pct,
                     (unsigned long long)g_vms[0].used_root,
                     (unsigned long long)g_vms[1].used_root);
+                /*
+                 * SMP-6 (#190): each AP vCPU's own liveness. Without it an AP that is spinning
+                 * on one reinjected fault is indistinguishable from one that never started --
+                 * both are silence, and that ambiguity cost a diagnosis already.
+                 */
+                {
+                    unsigned _av, _vmi = (unsigned)(vm - g_vms);
+                    for (_av = 1u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
+                        hype_debug_print(
+                            "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
+                            "last=0x%llx@0x%llx [#190]\n", _vmi, _av,
+                            (unsigned)g_ap_vcpu_live[_vmi][_av],
+                            g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
+                            (unsigned long long)g_ap_vcpu_last_reason[_vmi][_av],
+                            (unsigned long long)g_ap_vcpu_last_rip[_vmi][_av]);
+                    }
+                }
 #if HYPE_RUN_TWO_VMS
                 /*
                  * #339: only meaningful when a second VM exists.
@@ -13252,7 +13606,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             {
                 hype_guest_lapic_ipi_t ipi;
                 while (hype_guest_lapic_take_ipi(&g_fw_1_lapic, &ipi)) {
-                    (void)fw_1_route_ipi(vm, kind, &ipi, vm->used_root, stack_top);
+                    (void)fw_1_route_ipi_from(vm, vm->cur_vcpu, kind, &ipi, vm->used_root,
+                                              stack_top);
                 }
             }
         }
@@ -18748,9 +19103,20 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
     g_vm_log = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log);
     g_vm_log_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log_ready);
     g_vm_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_ready);
-    /* g_ap_vmm_page: 4 KiB-aligned per element -> pages, like g_vms. */
-    g_ap_vmm_page = (uint8_t (*)[4096])(uintptr_t)hype_alloc_pages_any(bs, (UINTN)n);
-    hype_guest_ram_zero(g_ap_vmm_page, (uint64_t)n * 4096ull);
+    /*
+     * g_ap_vmm_page: the SVM host-save area, 4 KiB-aligned per element -> pages, like g_vms.
+     *
+     * SMP-6 (#190): one per guest vCPU, not per VM. This is per-CORE state -- the area VMRUN
+     * saves host registers into -- so two cores sharing one would corrupt each other's host
+     * state on entry, which is #237's failure mode with a different structure. Sized to the
+     * maximum rather than the resolved total because this runs before every VM's vcpu_count is
+     * known; the waste is a handful of pages.
+     */
+    {
+        unsigned slots = n * HYPE_MAX_VCPUS_PER_VM;
+        g_ap_vmm_page = (uint8_t (*)[4096])(uintptr_t)hype_alloc_pages_any(bs, (UINTN)slots);
+        hype_guest_ram_zero(g_ap_vmm_page, (uint64_t)slots * 4096ull);
+    }
     hype_debug_print("fw-1: per-VM aux arena for %u VM(s) allocated [#394]\n", n);
 }
 
@@ -18924,9 +19290,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * sectors to another under concurrent streaming (the 4-VM #392 run's
      * Fedora/Ubuntu boot corruption). */
     hype_iso_stream_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
-    /* #413: one AP stack per VM (HYPE_AP_STACK_BYTES each = 4 pages). */
-    g_ap_stacks = (uint8_t (*)[HYPE_AP_STACK_BYTES])(uintptr_t)
-        fw_alloc_zeroed_pages(g_vm_count * (HYPE_AP_STACK_BYTES / 4096u));
+    /*
+     * #413: one AP stack per host core that runs a guest.
+     *
+     * SMP-6 (#190): keyed by fw_1_vcpu_slot(), i.e. one per guest vCPU rather than one per VM
+     * -- two cores sharing a stack is immediate memory corruption, not a slow path. Sized to
+     * the maximum because vcpu_count is not resolved until the pool sizing below; a handful of
+     * unused 16 KiB stacks is the right trade against getting the ordering wrong.
+     */
+    g_ap_stacks = (uint8_t (*)[HYPE_AP_STACK_BYTES])(uintptr_t)fw_alloc_zeroed_pages(
+        g_vm_count * HYPE_MAX_VCPUS_PER_VM * (HYPE_AP_STACK_BYTES / 4096u));
     vm = &g_vms[0];
     /*
      * INPUT-8 (#281): load each VM's expect script here, PRE-EBS, because this is the
@@ -21042,39 +21415,99 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * come up keep running (fault isolation). g_fw_1_ap_rc / _ap2_rc are
              * kept for vi 0/1 as the existing single-VM diagnostics.
              */
-            for (unsigned vi = 0u; vi < g_vm_count; vi++) {
-                int sel = fw_1_ap_apic_id(vi);
-                if (sel < 0) {
-                    hype_debug_print(
-                        "fw-1 AP[vm%u]: NO isolated core (machine reports %u CPU(s), %u AP(s)) -- "
-                        "vm%u and any later VM will not run [#360/#414]\n",
-                        vi, g_cpu_topo.count, hype_cpu_topology_ap_count(&g_cpu_topo), vi);
-                    if (vi == 0u) g_fw_1_ap_rc = -5;
-                    else if (vi == 1u) g_fw_1_ap2_rc = -5;
-                    break;
-                }
-                {
-                    uint8_t id = (uint8_t)sel;
-                    int rc;
-                    g_ap_slot_apic_id[vi] = id;
-                    g_ap_slot_valid[vi] = 1;
-                    rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
-                                       id, (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
-                                       (uint64_t)(uintptr_t)(g_ap_stacks[vi] + HYPE_AP_STACK_BYTES),
-                                       g_fw_1_host_tsc_hz, fw_1_ap_main, (void *)(uintptr_t)vi);
-                    if (vi == 0u) g_fw_1_ap_rc = rc;
-                    else if (vi == 1u) g_fw_1_ap2_rc = rc;
-                    hype_debug_print(
-                        "fw-1 AP[vm%u]-SMOKETEST: apic_id=%u cr3=0x%llx -> rc=%d (long-mode=%s), "
-                        "last_phase=%u c_entry_ran=%u ap_vmm_ok=%u [#414]\n",
-                        vi, (unsigned)id, (unsigned long long)cr3, rc, (rc == 0) ? "yes" : "NO",
-                        (unsigned int)g_hype_ap_last_phase, (unsigned int)g_hype_ap_c_alive,
-                        (unsigned int)g_fw_1_ap_vmm_ok);
-                    if (rc != 0) {
-                        hype_debug_print(
-                            "fw-1 AP[vm%u]: START FAILED (rc=%d) -- not reusing the trampoline for "
-                            "later VMs; VMs already up keep running [#414]\n", vi, rc);
-                        break;
+            /*
+             * SMP-6 (#190): one host AP per guest vCPU, placed on whole physical cores.
+             *
+             * Was one per VM, which is why a `vcpus = 2` guest had nowhere to run its second
+             * vCPU. Placement comes from fw_1_place_vcpus_on_threads(), which grants cores
+             * whole and packs a VM's own vCPUs onto sibling threads first (§10 decision 40) --
+             * a VM is trivially one trust group, so its vCPUs sharing a core needs no
+             * permission, and no core is ever split between two VMs.
+             *
+             * Still strictly sequential: hype_ap_start re-copies the shared <1 MB trampoline
+             * blob and returns only once THIS core has signalled alive and moved off it.
+             */
+            if (fw_1_place_vcpus_on_threads() == 0u) {
+                hype_debug_print("fw-1 SMP: no per-vCPU placement (topology reports %u CPU(s)) "
+                                 "-- falling back to one core per VM [#190]\n",
+                                 g_cpu_topo.count);
+            }
+            {
+                unsigned vi;
+                int stop = 0;
+                for (vi = 0u; vi < g_vm_count && !stop; vi++) {
+                    /*
+                     * Only the vCPUs the guest is TOLD about. A vCPU the guest cannot see
+                     * never receives a SIPI, so starting a host core for it would park that
+                     * core in the AP loop's wait spin forever -- a wasted core, and one that
+                     * looks alive in every diagnostic.
+                     */
+                    unsigned nv = fw_1_guest_visible_vcpus(&g_vms[vi]);
+                    unsigned cv;
+                    if (nv > HYPE_MAX_VCPUS_PER_VM) nv = HYPE_MAX_VCPUS_PER_VM;
+                    for (cv = 0u; cv < nv; cv++) {
+                        int sel;
+                        unsigned slot = fw_1_vcpu_slot(vi, cv);
+                        if (g_vcpu_thread_valid[vi][cv]) {
+                            sel = (int)g_vcpu_thread[vi][cv];
+                        } else {
+                            /* No SMT-aware placement (no enumeration, or not enough cores).
+                             * vCPU 0 keeps the pre-existing per-VM selector so machines that
+                             * worked before still work; an AP with no thread simply does not
+                             * start, and the count is corrected so nothing advertises it. */
+                            sel = (cv == 0u) ? fw_1_ap_apic_id(vi) : -1;
+                        }
+                        if (sel < 0) {
+                            if (cv == 0u) {
+                                hype_debug_print(
+                                    "fw-1 AP[vm%u]: NO isolated core (machine reports %u CPU(s), "
+                                    "%u AP(s)) -- vm%u and any later VM will not run "
+                                    "[#360/#414]\n", vi, g_cpu_topo.count,
+                                    hype_cpu_topology_ap_count(&g_cpu_topo), vi);
+                                if (vi == 0u) g_fw_1_ap_rc = -5;
+                                else if (vi == 1u) g_fw_1_ap2_rc = -5;
+                                stop = 1;
+                            } else {
+                                hype_debug_print("fw-1 AP[vm%u vCPU %u]: no host thread -- vm%u "
+                                                 "runs with %u vCPU(s) [#190]\n", vi, cv, vi, cv);
+                                g_vms[vi].vcpu_count = cv;
+                            }
+                            break;
+                        }
+                        {
+                            uint8_t id = (uint8_t)sel;
+                            int rc;
+                            if (cv == 0u) {
+                                g_ap_slot_apic_id[vi] = id;
+                                g_ap_slot_valid[vi] = 1;
+                            }
+                            rc = hype_ap_start(
+                                (volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, id,
+                                (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
+                                (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
+                                g_fw_1_host_tsc_hz, fw_1_ap_main,
+                                (void *)FW_1_AP_ARG(vi, cv));
+                            if (cv == 0u) {
+                                if (vi == 0u) g_fw_1_ap_rc = rc;
+                                else if (vi == 1u) g_fw_1_ap2_rc = rc;
+                            }
+                            hype_debug_print(
+                                "fw-1 AP[vm%u vCPU %u]-SMOKETEST: apic_id=%u -> rc=%d "
+                                "(long-mode=%s), last_phase=%u c_entry_ran=%u ap_vmm_ok=%u "
+                                "[#414 #190]\n", vi, cv, (unsigned)id, rc,
+                                (rc == 0) ? "yes" : "NO", (unsigned int)g_hype_ap_last_phase,
+                                (unsigned int)g_hype_ap_c_alive,
+                                (unsigned int)g_fw_1_ap_vmm_ok);
+                            if (rc != 0) {
+                                hype_debug_print(
+                                    "fw-1 AP[vm%u vCPU %u]: START FAILED (rc=%d) -- not reusing "
+                                    "the trampoline; what is already up keeps running "
+                                    "[#414]\n", vi, cv, rc);
+                                if (cv > 0u) g_vms[vi].vcpu_count = cv;
+                                stop = 1;
+                                break;
+                            }
+                        }
                     }
                 }
             }
