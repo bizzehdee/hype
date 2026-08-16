@@ -2321,6 +2321,10 @@ static volatile uint64_t *g_ap_timer_ticks; /* g_vm_count + 1: BSP slot */
  * permanently pending when one host dispatch takes longer than its period;
  * VMX then exits before the guest executes even one instruction. */
 static uint32_t *g_ap_timer_reload;
+/* #484: the same calibrated reload, kept PER CORE -- indexed by (vm, vcpu). g_ap_timer_reload
+ * is per VM and predates one-host-core-per-vCPU: a vCPU-AP core calibrated a value and had
+ * nowhere of its own to keep it, and fw_1_run_ap_vcpu had no way to arm its core's one-shot. */
+static uint32_t g_vcpu_timer_reload[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 /* #436: AP run-loop section breadcrumb. The AP sets these; the BSP prints them.
  * Pinpoints WHERE the loop stops when the AP freezes (deterministic ~127k iters). */
 volatile uint8_t g_436_loop_section[HYPE_FW_MAX_VMS];
@@ -2523,7 +2527,14 @@ static void fw_1_ap_main(void *arg) {
             count = 1;
         }
         hype_isr_register(HYPE_AP_LAPIC_TIMER_VECTOR, hype_ap_lapic_timer_isr);
-        g_ap_timer_reload[vm_idx] = (uint32_t)count;
+        /* #484: only the VM's dispatch core owns the per-VM slot -- a vCPU-AP core writing it
+         * raced the dispatch core for one value. Every core keeps its own copy instead. */
+        if (vcpu_idx == 0u) {
+            g_ap_timer_reload[vm_idx] = (uint32_t)count;
+        }
+        if (vm_idx < HYPE_FW_MAX_VMS && vcpu_idx < HYPE_MAX_VCPUS_PER_VM) {
+            g_vcpu_timer_reload[vm_idx][vcpu_idx] = (uint32_t)count;
+        }
         *lvt = hype_lapic_lvt_timer_oneshot((uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR);
         *icnt = 0; /* armed at the VM-entry site, after host dispatch work */
         hype_sti(); /* enable host interrupts on the AP so the timer fires */
@@ -11517,6 +11528,21 @@ wait_for_sipi:
      * rebuilds this vCPU's VMCB.
      */
     vmm_set_pvclock(kind, ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
+    /*
+     * #484: intercept physical INTR on this vCPU, as run_fw_1_test does for vCPU 0 (RT-2b).
+     *
+     * Without it the one-shot armed before each entry FIRES and nothing happens: on SVM a
+     * physical interrupt with the intercept clear is held pending rather than causing a
+     * #VMEXIT, so a guest thread spinning on memory still never gives hype control, and the
+     * tick that was supposed to bound its execution waits behind the very spin it exists to
+     * break. That is why arming the timer alone did not move `last=0x6e` -- the AP's final
+     * exit stayed RDTSC, never INTR. Applied HERE, with the exception mask and pvclock above,
+     * because every SIPI rebuilds this VMCB and would wipe it.
+     */
+    vmm_enable_intr_intercept(kind, ctx);
+    if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
+        vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
+    }
     hype_debug_print("fw-1 vm%u vCPU %u: SIPI received, entering guest [#190]\n", vm_idx, vi);
     fw_1_dev_lock(vm); /* SMP-7: enter the loop in the "outside the guest" state */
     ap_locked = 1;
@@ -11541,6 +11567,25 @@ wait_for_sipi:
         if (ap_locked) { /* SMP-7: never hold the shared-device lock inside the guest */
             fw_1_dev_unlock(vm);
             ap_locked = 0;
+        }
+        /*
+         * #484: bound this vCPU's uninterrupted guest execution, exactly as the BSP loop does
+         * before ITS entry. fw_1_ap_main calibrates this core's one-shot and leaves it STOPPED
+         * ("armed at the VM-entry site") -- and this loop, the entry site, never armed it. So a
+         * guest thread spinning on memory (no intercepted instruction in the loop) ran forever:
+         * no exit, no injection opportunity, and the pending LAPIC timer/IPI could never be
+         * delivered. Measured: APVCPU vm0/1 frozen at exits=7186552 across 30+ s of periodic
+         * dumps while the other vCPU spun in a cross-CPU wait and rcu_preempt starved. The tick
+         * ISR cannot substitute -- it self-re-arms only for cores in the per-VM slot table, and
+         * a one-shot that was never started never fires it. Re-armed on EVERY entry so a tick
+         * consumed during host dispatch cannot remain pending and starve the next instruction
+         * (#364's rule).
+         */
+        if (vm_idx < HYPE_FW_MAX_VMS && vi < HYPE_MAX_VCPUS_PER_VM &&
+            g_vcpu_timer_reload[vm_idx][vi] != 0u) {
+            hype_lapic_arm_timer_oneshot((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
+                                         (uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR,
+                                         g_vcpu_timer_reload[vm_idx][vi]);
         }
         if (ops->vcpu_run(ctx, &info) != 0) {
             fw_1_dev_lock(vm);
