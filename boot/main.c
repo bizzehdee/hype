@@ -5028,6 +5028,10 @@ static void fw_1_dev_unlock(hype_fw_vm_t *vm) {
 
 /* SMP-6: set by an AP vCPU loop while it owns its vCPU; read by the BSP's INIT/SIPI path. */
 static uint8_t g_ap_apdata_dumped[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+/* SMP-6: AP LAPIC timer accounting. The AP programs its timer (measured: it faults in
+ * lapic_et_start), but whether the timer then FIRES is a separate question, and a guest whose
+ * per-CPU event timer never fires cannot run its scheduler on that CPU. */
+static uint64_t g_ap_timer_injected[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 
 /*
@@ -11935,6 +11939,7 @@ wait_for_sipi:
             uint8_t ap_timer_vector;
             if (hype_guest_lapic_take_timer_irq(lapic, &ap_timer_vector)) {
                 vmm_request_interrupt(kind, ctx, lapic, ap_timer_vector);
+                g_ap_timer_injected[vm_idx][vi]++;
             }
         }
         /* Deliver anything queued for THIS vCPU -- its own LAPIC timer self-IPIs and the
@@ -13237,11 +13242,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     for (_av = 1u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
                         hype_debug_print(
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
-                            "last=0x%llx@0x%llx [#190]\n", _vmi, _av,
+                            "last=0x%llx@0x%llx timer_irqs=%llu init=%u cur=%u lvt=0x%x "
+                            "[#190]\n", _vmi, _av,
                             (unsigned)g_ap_vcpu_live[_vmi][_av],
                             g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
                             (unsigned long long)g_ap_vcpu_last_reason[_vmi][_av],
-                            (unsigned long long)g_ap_vcpu_last_rip[_vmi][_av]);
+                            (unsigned long long)g_ap_vcpu_last_rip[_vmi][_av],
+                            (unsigned long long)g_ap_timer_injected[_vmi][_av],
+                            (unsigned)vm->lapic[_av].init_count,
+                            (unsigned)vm->lapic[_av].current_count,
+                            (unsigned)vm->lapic[_av].lvt_timer);
                     /*
                      * SMP-6: dump the AP's dispatch record ONCE on the normal path, not only
                      * at a fault. The DEBUG guest firmware names its modules but does not
