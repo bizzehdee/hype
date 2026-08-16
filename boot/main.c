@@ -11354,7 +11354,16 @@ wait_for_sipi:
              */
             hype_svm_vcpu_handle_rdtsc(ctx);
         } else if (vmm_reason_is_msr(kind, info.reason)) {
-            if (vmm_handle_msr(kind, ctx, info.reason) != 0) {
+            /*
+             * #484: a REJECTED MSR is a guest fault and must be delivered as one, exactly as
+             * the BSP loop does. The AP used to only bump a counter -- so the guest was neither
+             * faulted nor had the instruction retired, leaving it to re-execute the same RDMSR
+             * or WRMSR and, for a write, to believe a value had been stored that never was.
+             */
+            int ap_msr_rc = vmm_handle_msr(kind, ctx, info.reason);
+            if (ap_msr_rc > 0) {
+                vmm_reinject_exception(kind, ctx, 13u, 1, 0u);
+            } else if (ap_msr_rc != 0) {
                 g_ap_vcpu_unhandled[vm_idx][vi]++;
             }
         } else if (vmm_reason_is_npf(kind, info.reason)) {
