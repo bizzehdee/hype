@@ -2137,18 +2137,19 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
      * table), select_cores reports one thread per core anyway, so this degrades to the
      * conservative one-vCPU-per-core placement rather than pairing anyone by accident.
      */
-    {
-        unsigned threads_per_core = 1u;
-        unsigned cores_total = 0, smt_cores = 0;
-        hype_cpu_topology_core_summary(&g_cpu_topo, &cores_total, &smt_cores);
-        if (hype_cpu_topology_siblings_known(&g_cpu_topo) && cores_total != 0u) {
-            threads_per_core = g_cpu_topo.count / cores_total;
-            if (threads_per_core == 0u) threads_per_core = 1u;
-        }
-        for (vi = 0; vi < g_vm_count; vi++) {
-            unsigned want = g_vms[vi].vcpu_count ? g_vms[vi].vcpu_count : 1u;
-            ncores_wanted += (want + threads_per_core - 1u) / threads_per_core;
-        }
+    /*
+     * ONE WHOLE CORE PER vCPU.
+     *
+     * SMP is processors; SMT is threading within one. A guest vCPU is a processor, so it gets a
+     * core -- both of that core's threads belong to it, and no second vCPU is placed on the
+     * sibling. plan.md decision 40 already says "thread = execution unit, core = allocation
+     * unit"; this code contradicted it by dividing the wanted vCPUs by threads_per_core, which
+     * packed two vCPUs onto one core's two threads. On the operator's laptop that showed up as
+     * "placed 4 vCPU(s) on 2 whole physical core(s)" -- one vCPU per THREAD, two guests' worth
+     * of vCPUs sharing a core's execution resources.
+     */
+    for (vi = 0; vi < g_vm_count; vi++) {
+        ncores_wanted += g_vms[vi].vcpu_count ? g_vms[vi].vcpu_count : 1u;
     }
 
     nthreads = hype_cpu_topology_select_cores(&g_cpu_topo, ncores_wanted, threads,
@@ -2193,7 +2194,13 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
         if (want > HYPE_MAX_VCPUS_PER_VM) want = HYPE_MAX_VCPUS_PER_VM;
         while (got < want && ci < ncores) {
             unsigned k;
-            for (k = 0; k < per_core[ci] && got < want; k++) {
+            /*
+             * One vCPU per core: take the core's FIRST thread and move on. The sibling threads
+             * are deliberately left unassigned -- they belong to this vCPU's core and must not
+             * be handed to another vCPU. Bounded by per_core[ci] only so a core that reported
+             * no threads cannot spin.
+             */
+            for (k = 0; k < per_core[ci] && got < want && k < 1u; k++) {
                 uint32_t apic = threads[core_start[ci] + k];
                 if (apic > 255u) {
                     /* hype_ap_start drives the 8-bit xAPIC ICR destination field. Reported,
@@ -5108,6 +5115,47 @@ static uint8_t g_ap_apdata_dumped[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
  * lapic_et_start), but whether the timer then FIRES is a separate question, and a guest whose
  * per-CPU event timer never fires cannot run its scheduler on that CPU. */
 static uint64_t g_ap_timer_injected[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+/*
+ * #484: how LATE hype delivers a guest LAPIC timer edge.
+ *
+ * The NMI backtrace showed rcu_preempt blocked in schedule_timeout() and starved 6002 jiffies
+ * -- a wakeup that did not arrive, not a stuck CPU. So the question is no longer "is a vCPU
+ * blocked" but "does a programmed deadline fire on time". Measured as the interval between
+ * consecutive timer injections against the interval the guest actually programmed
+ * (init_count * divisor / HYPE_GUEST_LAPIC_HZ); the ratio is the lateness.
+ *
+ * The BSP's M4-6d4 idle wait busy-spins up to 10 ms before re-entering, which bounds how
+ * promptly ANY edge can be serviced on that core, so it is the prime suspect.
+ */
+static uint64_t g_tmr_last_tsc[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_tmr_late_max_us[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_tmr_deliveries[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_tmr_prog_us[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+
+/* #484: called at each timer injection. Compares the real interval since the previous one
+ * against what the guest programmed, and keeps the worst overshoot. */
+static void fw_1_timer_latency_note(unsigned vmi, unsigned vi, const hype_guest_lapic_t *lp,
+                                    uint64_t hz) {
+    uint64_t now = hype_rdtsc();
+    uint64_t prev = g_tmr_last_tsc[vmi][vi];
+    g_tmr_last_tsc[vmi][vi] = now;
+    g_tmr_deliveries[vmi][vi]++;
+    if (prev == 0ull || hz < 1000000ull || lp->init_count == 0u) {
+        return;
+    }
+    {
+        uint32_t div = hype_guest_lapic_divisor(lp->divide_config);
+        uint64_t want_us = ((uint64_t)lp->init_count * (uint64_t)div) / (HYPE_GUEST_LAPIC_HZ / 1000000ull);
+        uint64_t got_us = (now - prev) / (hz / 1000000ull);
+        g_tmr_prog_us[vmi][vi] = want_us;
+        if (got_us > want_us) {
+            uint64_t late = got_us - want_us;
+            if (late > g_tmr_late_max_us[vmi][vi]) {
+                g_tmr_late_max_us[vmi][vi] = late;
+            }
+        }
+    }
+}
 /* #482: how much shared-device work an AP actually serves. The ATAPI read stream freezes at
  * 282 reads under 2 vCPUs against 3899 under 1, and #229 already established that host-backed
  * guest I/O issued from an AP core is its own failure mode -- so whether the AP is serving the
@@ -12176,6 +12224,7 @@ wait_for_sipi:
             if (hype_guest_lapic_take_timer_irq(lapic, &ap_timer_vector)) {
                 vmm_request_interrupt(kind, ctx, lapic, ap_timer_vector);
                 g_ap_timer_injected[vm_idx][vi]++;
+                fw_1_timer_latency_note(vm_idx, vi, lapic, vm->host_tsc_hz);
             }
         }
         /* Deliver anything queued for THIS vCPU -- its own LAPIC timer self-IPIs and the
@@ -13512,6 +13561,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                         hype_debug_print("%s [#509]\n", dl);
                     }
+                    {   /* #484: is a guest timer edge delivered on time? rcu_preempt was
+                         * starved in schedule_timeout(), so lateness is the question. */
+                        unsigned _t;
+                        for (_t = 0u; _t < vm->vcpu_count && _t < HYPE_MAX_VCPUS_PER_VM; _t++) {
+                            hype_debug_print("fw-1 TMRLATE vm%u/%u: deliveries=%llu "
+                                             "programmed=%lluus worst_late=%lluus [#484]\n",
+                                             _vmi, _t,
+                                             (unsigned long long)g_tmr_deliveries[_vmi][_t],
+                                             (unsigned long long)g_tmr_prog_us[_vmi][_t],
+                                             (unsigned long long)g_tmr_late_max_us[_vmi][_t]);
+                        }
+                    }
                     for (_av = 0u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
                         if (kind == HYPE_VMM_KIND_VMX) {
                         hype_debug_print("fw-1 VMCSRELOAD: count=%llu last_cur=0x%llx "
@@ -14830,6 +14891,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
         if (hype_guest_lapic_take_timer_irq(&g_fw_1_lapic, &timer_vector)) {
             vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, timer_vector);
+            fw_1_timer_latency_note((unsigned)(vm - g_vms), vm->cur_vcpu, &g_fw_1_lapic,
+                                    vm->host_tsc_hz);
             timer_irqs++;
         }
         /* GLADDER-6c: deliver guest self-IPIs (ICR fixed-delivery writes aimed
