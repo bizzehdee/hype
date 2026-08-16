@@ -59,9 +59,70 @@ static void test_find_requires_both_width_and_height_to_match(void) {
               hype_gop_mode_find(modes, 1, 1920, 1080));
 }
 
+/*
+ * #465: the `resolution 1920x1080` parse.
+ *
+ * The inline version this replaces handed hype_parse_uint() the whole "1920x1080" as the width.
+ * That function requires the entire string to be digits, so it failed at the 'x' and EVERY
+ * well-formed WxH was rejected -- with a message naming the exact format the operator had just
+ * typed. It survived because the parse lived inline in boot/main.c where nothing could test it.
+ */
+static void test_parse_wxh_accepts_real_resolutions(void) {
+    static const struct { const char *in; uint32_t w, h; } ok[] = {
+        {"1920x1080", 1920u, 1080u},   /* the exact input that was reported failing */
+        {"1280x800",  1280u, 800u},
+        {"640x480",   640u,  480u},
+        {"2560x1600", 2560u, 1600u},
+        {"800X600",   800u,  600u},    /* uppercase separator */
+        {"1x1",       1u,    1u},      /* minimal, still valid */
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        uint32_t w = 0, h = 0;
+        int rc = hype_gop_mode_parse_wxh(ok[i].in, &w, &h);
+        if (rc != 0 || w != ok[i].w || h != ok[i].h) {
+            printf("FAIL: parse \"%s\" -> rc=%d %ux%u, expected 0 %ux%u\n", ok[i].in, rc, w, h,
+                   ok[i].w, ok[i].h);
+            failures++;
+        }
+    }
+}
+
+static void test_parse_wxh_rejects_malformed(void) {
+    static const char *bad[] = {
+        "",            /* empty */
+        "1920",        /* no separator */
+        "x1080",       /* nothing before the separator */
+        "1920x",       /* nothing after it */
+        "1920y1080",   /* wrong separator */
+        "0x1080",      /* zero width -- and NOT to be read as hex */
+        "1920x0",      /* zero height */
+        "19a0x1080",   /* non-digit in the width */
+        "1920x10 80",  /* embedded space in the height */
+        "99999999999999999999x1080", /* overflows, and is longer than the width buffer */
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        uint32_t w = 123u, h = 456u;
+        if (hype_gop_mode_parse_wxh(bad[i], &w, &h) == 0) {
+            printf("FAIL: parse \"%s\" was accepted, expected rejection\n", bad[i]);
+            failures++;
+        }
+    }
+    {
+        uint32_t w = 0, h = 0;
+        if (hype_gop_mode_parse_wxh(0, &w, &h) == 0) {
+            printf("FAIL: NULL input was accepted\n");
+            failures++;
+        }
+    }
+}
+
 int main(void) {
     test_find_matches_exact_wxh();
     test_find_returns_minus_one_when_absent();
+    test_parse_wxh_accepts_real_resolutions();
+    test_parse_wxh_rejects_malformed();
     test_find_on_empty_list();
     test_find_returns_first_match_on_duplicate_wxh();
     test_find_does_not_confuse_width_and_height();

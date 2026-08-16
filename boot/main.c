@@ -17457,30 +17457,22 @@ static void term_resolution_cmd(hype_cmd_t *c) {
         }
 
         {
-            char *x = 0;
-            unsigned int k;
-            unsigned long long w = 0, hgt = 0;
+            uint32_t w = 0, hgt = 0;
             int match;
 
-            for (k = 0; c->arg[k] != '\0'; k++) {
-                if (c->arg[k] == 'x' || c->arg[k] == 'X') {
-                    x = &c->arg[k];
-                    break;
-                }
-            }
-            if (x == 0 || x == c->arg || hype_parse_uint(c->arg, &w) != 0 ||
-                hype_parse_uint(x + 1, &hgt) != 0 || w == 0u || hgt == 0u) {
-                term_resultf(
-                              "resolution: expected <W>x<H>, e.g. 1920x1080");
+            /* #465: hype_gop_mode_parse_wxh(), not an inline parse. The inline one handed
+             * hype_parse_uint() the whole "1920x1080" as the width -- and that function
+             * requires the entire string to be digits, so it failed at the 'x' and every
+             * well-formed WxH was rejected with a message naming the format it had been given. */
+            if (hype_gop_mode_parse_wxh(c->arg, &w, &hgt) != 0) {
+                term_resultf("resolution: expected <W>x<H>, e.g. 1920x1080");
                 return;
             }
 
-            match = hype_gop_mode_find(modes, mode_count, (uint32_t)w, (uint32_t)hgt);
+            match = hype_gop_mode_find(modes, mode_count, w, hgt);
             if (match < 0) {
-                term_resultf(
-                              "resolution: %llux%llu not offered by this GOP (try 'resolution "
-                              "list')",
-                              w, hgt);
+                term_resultf("resolution: %ux%u not offered by this GOP (try 'resolution list')",
+                             w, hgt);
                 return;
             }
             /*
@@ -17495,6 +17487,7 @@ static void term_resolution_cmd(hype_cmd_t *c) {
             g_hype_cfg.hype.has_resolution = 1;
             g_hype_cfg.hype.resolution_width = (unsigned int)w;
             g_hype_cfg.hype.resolution_height = (unsigned int)hgt;
+            (void)match;
 
             {
                 int saved = 0;
@@ -17509,9 +17502,8 @@ static void term_resolution_cmd(hype_cmd_t *c) {
                         saved = 1;
                     }
                 }
-                term_resultf( "resolution %llux%llu%s -- takes effect on the next boot",
-                              w, hgt,
-                              saved ? " saved" : " NOT saved (no writable volume mounted)");
+                term_resultf("resolution %ux%u%s -- takes effect on the next boot", w, hgt,
+                             saved ? " saved" : " NOT saved (no writable volume mounted)");
             }
         }
     }

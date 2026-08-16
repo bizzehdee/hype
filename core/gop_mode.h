@@ -41,6 +41,14 @@ int hype_gop_mode_find(const hype_gop_mode_t *modes, unsigned int count, uint32_
 unsigned int hype_gop_mode_enumerate(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop_mode_t *out,
                                      unsigned int cap);
 
+/*
+ * #465: parses "<W>x<H>" (case-insensitive separator) into `out_width`/`out_height`. Returns 0
+ * on success, -1 for anything malformed -- no separator, an empty or non-numeric half, a zero
+ * dimension, or a value too large for the field. Pure; see gop_mode.c for the bug this exists
+ * to have a test for.
+ */
+int hype_gop_mode_parse_wxh(const char *s, uint32_t *out_width, uint32_t *out_height);
+
 /* Hardware side: applies `mode_number` (as returned by hype_gop_mode_enumerate, NOT a raw
  * WxH) via SetMode. Returns 0 on success, -1 if the firmware refused it. */
 int hype_gop_mode_set(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, uint32_t mode_number);
