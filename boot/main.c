@@ -11122,6 +11122,24 @@ static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t
     hype_guest_lapic_t *lapic = &vm->lapic[vi];
     hype_vmexit_info_t info;
     unsigned long long spins = 0;
+    /*
+     * SMP-6: this AP's own guest LAPIC timer clock. hype_guest_lapic_advance() had exactly ONE
+     * call site -- the BSP loop, on vm->lapic[vm->cur_vcpu], which is always the BSP. So an AP's
+     * LAPIC timer never advanced, and an AP that HLTs waiting for a timer interrupt waited for
+     * one that could not arrive. That is the deadlock behind FreeBSD stopping at
+     * "Launching APs: 1": the AP idled on HLT while the BSP spun waiting for it to check in.
+     *
+     * Advanced HERE, on the AP's own core, rather than from the BSP loop -- the LAPIC state is
+     * read and written by this core every exit, so ticking it from another core would be a
+     * cross-core race on live state. These accumulators are function-local, and this function
+     * runs one invocation per AP core, so they are private by construction.
+     *
+     * Same conversion the BSP uses: TSC delta -> PIT-rate ticks -> HYPE_GUEST_LAPIC_HZ, each
+     * with a fractional accumulator so the base rate is exact regardless of loop granularity.
+     */
+    uint64_t ap_tsc_last = hype_rdtsc();
+    uint64_t ap_tb_accum = 0;
+    uint64_t ap_lt_accum = 0;
 
     if (vi == 0u || vi >= HYPE_MAX_VCPUS_PER_VM) {
         return;
@@ -11225,6 +11243,30 @@ wait_for_sipi:
         g_ap_vcpu_last_reason[vm_idx][vi] = info.reason;
         g_ap_vcpu_last_rip[vm_idx][vi] = info.guest_rip;
 
+        /* SMP-6: tick this AP's own LAPIC timer before dispatching the exit, so a HLT that is
+         * waiting on a one-shot deadline can actually be woken by it. */
+        if (g_fw_1_host_tsc_hz != 0u) {
+            uint64_t ap_now = hype_rdtsc();
+            uint64_t ap_delta = ap_now - ap_tsc_last;
+            uint64_t ap_cap = 300ULL * g_fw_1_host_tsc_hz;
+            uint64_t ap_ticks;
+            ap_tsc_last = ap_now;
+            if (ap_delta > ap_cap) {
+                ap_delta = ap_cap;
+            }
+            ap_tb_accum += ap_delta * HYPE_PIT_HZ;
+            ap_ticks = ap_tb_accum / g_fw_1_host_tsc_hz;
+            ap_tb_accum -= ap_ticks * g_fw_1_host_tsc_hz;
+            if (ap_ticks != 0u) {
+                uint64_t ap_lt;
+                ap_lt_accum += ap_ticks * HYPE_GUEST_LAPIC_HZ;
+                ap_lt = ap_lt_accum / HYPE_PIT_HZ;
+                ap_lt_accum -= ap_lt * HYPE_PIT_HZ;
+                if (ap_lt != 0u) {
+                    hype_guest_lapic_advance(lapic, ap_lt);
+                }
+            }
+        }
         if (vmm_reason_is_cpuid(kind, info.reason)) {
             vmm_handle_cpuid(kind, ctx);
         } else if (kind == HYPE_VMM_KIND_SVM && info.reason == HYPE_SVM_EXITCODE_RDTSC) {
@@ -11742,6 +11784,19 @@ wait_for_sipi:
             g_ap_vcpu_unhandled[vm_idx][vi]++;
         }
 
+        /*
+         * SMP-6: this AP's own LAPIC TIMER interrupt. hype_guest_lapic_take_timer_irq() had
+         * exactly one call site -- the BSP loop, on the BSP's LAPIC -- so a timer IRQ raised on
+         * an AP was generated and never injected. Together with the missing advance() above,
+         * that left an AP which HLTs waiting on its LAPIC timer unable to ever wake: hype
+         * resumed the HLT without delivering anything, 3.4M times.
+         */
+        {
+            uint8_t ap_timer_vector;
+            if (hype_guest_lapic_take_timer_irq(lapic, &ap_timer_vector)) {
+                vmm_request_interrupt(kind, ctx, lapic, ap_timer_vector);
+            }
+        }
         /* Deliver anything queued for THIS vCPU -- its own LAPIC timer self-IPIs and the
          * cross-vCPU IPIs SMP-5 routes here. */
         {
