@@ -11253,6 +11253,25 @@ wait_for_sipi:
         }
     }
     vm->vcpu_parked[vi] = 0u;
+    /*
+     * #484: narrow this AP's exception intercepts to #UD, as the BSP loop and fw_1_vm_reinit()
+     * already do. Done HERE, after the SIPI wait, because every SIPI rebuilds this VMCB through
+     * hype_vmcb_build_realmode_guest(), which sets intercept_exceptions to 0xFFFFFFFF -- so a
+     * mask applied once at loop entry would be undone by the next reset.
+     *
+     * Leaving #PF intercepted is not merely slow, it is WRONG. APM 15.12.15: the intercept is
+     * tested BEFORE the exception writes CR2, so save.cr2 is stale for an intercepted #PF and
+     * only exitinfo2 holds the faulting address -- and hype reinjects without writing CR2. So
+     * every fault taken on an AP reached the guest's handler with a stale, zero CR2:
+     *
+     *   userspace: "init[520]: segfault at 0 ... likely on CPU 1" -- address 0 IS the stale CR2
+     *   kernel:    rodata_test oopsed with "CR2: 0000000000000000" instead of the clean -EFAULT
+     *              its copy_to_kernel_nofault expects
+     *
+     * With #PF left to hardware the CPU writes CR2 itself. #UD stays intercepted because this
+     * loop, like the BSP's, relies on seeing it.
+     */
+    vmm_set_exception_intercepts(kind, ctx, (1u << 6));
     hype_debug_print("fw-1 vm%u vCPU %u: SIPI received, entering guest [#190]\n", vm_idx, vi);
     fw_1_dev_lock(vm); /* SMP-7: enter the loop in the "outside the guest" state */
 
