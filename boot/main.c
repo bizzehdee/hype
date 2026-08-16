@@ -11403,6 +11403,7 @@ wait_for_sipi:
                             const uint8_t *mp = fw_1_guest_phys_to_host(vm, after);
                             if (mp != 0) {
                                 uint64_t f[6];
+                                uint64_t mpinfo_hob = 0;
                                 unsigned q;
                                 /* 0xFC = InitFlag (AP_INIT_STATE: ApInitConfig=1,
                                  * ApInitDone=2 -- any other value means the offset is wrong).
@@ -11411,6 +11412,9 @@ wait_for_sipi:
                                  * per-CPU ApFunction. */
                                 static const unsigned offs[6] = {0x08u, 0x18u, 0x28u,
                                                                  0xB8u, 0xC0u, 0xFCu};
+                                for (q = 0; q < 8u; q++) {
+                                    mpinfo_hob |= (uint64_t)mp[q] << (8u * q);
+                                }
                                 for (q = 0; q < 6u; q++) {
                                     unsigned b;
                                     f[q] = 0;
@@ -11430,6 +11434,50 @@ wait_for_sipi:
                                                  (unsigned long long)f[3],
                                                  (unsigned long long)f[4],
                                                  (unsigned long long)f[5]);
+                                /*
+                                 * SMP-6: CPU_INFO_IN_HOB[] -- the table GetProcessorNumber
+                                 * searches by APIC ID. If the AP's GetApicId() matches no
+                                 * entry, GetProcessorNumber returns EFI_NOT_FOUND WITHOUT
+                                 * writing *ProcessorNumber, and its caller in
+                                 * ApWakeupFunction ignores the return value -- so
+                                 * CpuData[uninitialised] is indexed and its ApFunction called.
+                                 * That is exactly the wild indirect call this fault is.
+                                 *
+                                 * #pragma pack(1), so entries are 20 bytes:
+                                 *   +0x00 InitialApicId  +0x04 ApicId  +0x08 Health
+                                 *   +0x0C ApTopOfStack
+                                 * ApTopOfStack is the self-check: entry N must be
+                                 * Buffer + (N+1) * CpuApStackSize.
+                                 */
+                                if (mpinfo_hob != 0ull) {
+                                    const uint8_t *ci =
+                                        fw_1_guest_phys_to_host(vm, mpinfo_hob);
+                                    if (ci != 0) {
+                                        unsigned e;
+                                        for (e = 0; e < 2u; e++) {
+                                            const uint8_t *b = ci + e * 20u;
+                                            uint32_t iid = 0, aid = 0;
+                                            uint64_t tos = 0;
+                                            unsigned k2;
+                                            for (k2 = 0; k2 < 4u; k2++) {
+                                                iid |= (uint32_t)b[k2] << (8u * k2);
+                                                aid |= (uint32_t)b[4u + k2] << (8u * k2);
+                                            }
+                                            for (k2 = 0; k2 < 8u; k2++) {
+                                                tos |= (uint64_t)b[12u + k2] << (8u * k2);
+                                            }
+                                            hype_debug_print("fw-1 APVCPU vm%u/%u CPUHOB[%u]: "
+                                                             "InitialApicId=%u ApicId=%u "
+                                                             "ApTopOfStack=0x%llx "
+                                                             "(expect 0x%llx) [#190]\n",
+                                                             vm_idx, vi, e,
+                                                             (unsigned)iid, (unsigned)aid,
+                                                             (unsigned long long)tos,
+                                                             (unsigned long long)(f[1] +
+                                                                 (uint64_t)(e + 1u) * f[2]));
+                                        }
+                                    }
+                                }
                                 /* The invariants above did not hold, so the struct base is not
                                  * where it was computed. Dump the raw window and let the known
                                  * values (a small CpuCount, a page-aligned Buffer) locate it
