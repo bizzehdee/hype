@@ -415,7 +415,151 @@ static void test_topology_layout_validation(void) {
     CHECK_INT("first BSP marker remains authoritative", 8, hype_cpu_topology_bsp(&t));
 }
 
+/* ---- SMP-23 (#479): whole-core enumeration, plan.md §10 decision 40 ---- */
+
+/* 4 cores x 2 threads on one package; BSP is apic 0 (package 0, core 0, thread 0). */
+static void build_4c8t(hype_cpu_topology_t *t) {
+    unsigned c, th;
+    hype_cpu_topology_reset(t);
+    for (c = 0; c < 4u; c++) {
+        for (th = 0; th < 2u; th++) {
+            uint32_t apic = (uint32_t)(c * 2u + th);
+            hype_cpu_topology_add_at(t, apic, apic == 0u, 1, 0u, c, th);
+        }
+    }
+}
+
+static void test_core_threads_returns_siblings_together(void) {
+    hype_cpu_topology_t t;
+    uint32_t ids[8];
+    unsigned n;
+
+    build_4c8t(&t);
+    CHECK_INT("4 distinct cores", 4, (int)hype_cpu_topology_core_count(&t));
+
+    n = hype_cpu_topology_core_threads(&t, 0u, ids, 8u);
+    CHECK_INT("core 0 has 2 threads", 2, (int)n);
+    CHECK_INT("core 0 thread 0", 0, (int)ids[0]);
+    CHECK_INT("core 0 thread 1", 1, (int)ids[1]);
+
+    n = hype_cpu_topology_core_threads(&t, 3u, ids, 8u);
+    CHECK_INT("core 3 has 2 threads", 2, (int)n);
+    CHECK_INT("core 3 thread 0", 6, (int)ids[0]);
+    CHECK_INT("core 3 thread 1", 7, (int)ids[1]);
+
+    CHECK_INT("out-of-range core index yields nothing", 0,
+              (int)hype_cpu_topology_core_threads(&t, 4u, ids, 8u));
+}
+
+static void test_select_cores_excludes_both_bsp_threads(void) {
+    /*
+     * The property select_isolated() existed to protect: no guest vCPU on the BSP's core.
+     * Granting cores whole makes it easier to break -- the sibling must go too.
+     */
+    hype_cpu_topology_t t;
+    uint32_t ids[8];
+    unsigned n, cores = 0, i;
+
+    build_4c8t(&t);
+    n = hype_cpu_topology_select_cores(&t, 3u, ids, 8u, &cores);
+    CHECK_INT("3 cores selected", 3, (int)cores);
+    CHECK_INT("6 threads returned", 6, (int)n);
+    for (i = 0; i < n; i++) {
+        if (ids[i] == 0u || ids[i] == 1u) {
+            printf("FAIL: BSP core thread %u was selected\n", ids[i]);
+            failures++;
+        }
+    }
+}
+
+static void test_select_cores_is_all_or_nothing(void) {
+    /* Half a core handed back would let a caller believe it owns a core whose sibling thread
+     * is still available to someone else -- the exact cross-owner co-residency decision 40
+     * forbids. */
+    hype_cpu_topology_t t;
+    uint32_t ids[8];
+    unsigned n, cores = 0;
+
+    build_4c8t(&t);
+    n = hype_cpu_topology_select_cores(&t, 3u, ids, 3u, &cores); /* room for 1.5 cores */
+    CHECK_INT("only whole cores fit", 1, (int)cores);
+    CHECK_INT("2 threads, not 3", 2, (int)n);
+}
+
+static void test_select_cores_on_a_hybrid_mix_of_1_and_2_thread_cores(void) {
+    /* The i5-13420H shape from #360: P-cores with 2 threads, E-cores with 1. No core may be
+     * reported with a thread count it does not have. */
+    hype_cpu_topology_t t;
+    uint32_t ids[8];
+    unsigned cores = 0, n;
+
+    hype_cpu_topology_reset(&t);
+    hype_cpu_topology_add_at(&t, 0u, 1, 1, 0u, 0u, 0u); /* BSP, P-core 0 */
+    hype_cpu_topology_add_at(&t, 1u, 0, 1, 0u, 0u, 1u);
+    hype_cpu_topology_add_at(&t, 2u, 0, 1, 0u, 1u, 0u); /* P-core 1 */
+    hype_cpu_topology_add_at(&t, 3u, 0, 1, 0u, 1u, 1u);
+    hype_cpu_topology_add_at(&t, 8u, 0, 1, 0u, 2u, 0u); /* E-core, single thread */
+
+    CHECK_INT("3 cores", 3, (int)hype_cpu_topology_core_count(&t));
+    n = hype_cpu_topology_core_threads(&t, 2u, ids, 8u);
+    CHECK_INT("the E-core has exactly 1 thread", 1, (int)n);
+    CHECK_INT("and it is apic 8", 8, (int)ids[0]);
+
+    n = hype_cpu_topology_select_cores(&t, 4u, ids, 8u, &cores);
+    CHECK_INT("2 non-BSP cores available", 2, (int)cores);
+    CHECK_INT("3 threads across them", 3, (int)n);
+}
+
+static void test_select_cores_with_sparse_apic_ids(void) {
+    /* #360: APIC IDs are NOT dense. Selection must follow the location map, never adjacency. */
+    hype_cpu_topology_t t;
+    uint32_t ids[8];
+    unsigned cores = 0, n;
+
+    hype_cpu_topology_reset(&t);
+    hype_cpu_topology_add_at(&t, 0u, 1, 1, 0u, 0u, 0u);   /* BSP */
+    hype_cpu_topology_add_at(&t, 40u, 0, 1, 0u, 5u, 0u);
+    hype_cpu_topology_add_at(&t, 41u, 0, 1, 0u, 5u, 1u);
+    hype_cpu_topology_add_at(&t, 96u, 0, 1, 1u, 2u, 0u);  /* another package */
+
+    n = hype_cpu_topology_select_cores(&t, 2u, ids, 8u, &cores);
+    CHECK_INT("both non-BSP cores selected", 2, (int)cores);
+    CHECK_INT("3 threads", 3, (int)n);
+    CHECK_INT("core 5's siblings came together", 40, (int)ids[0]);
+    CHECK_INT("  and its sibling", 41, (int)ids[1]);
+    CHECK_INT("then the other package", 96, (int)ids[2]);
+}
+
+static void test_siblings_known_gates_the_conservative_fallback(void) {
+    hype_cpu_topology_t t;
+    unsigned i;
+
+    build_4c8t(&t);
+    CHECK_INT("a real map is trustworthy", 1, hype_cpu_topology_siblings_known(&t));
+
+    /* The all-zero firmware table #378 found: every processor at the same location. Siblings
+     * cannot be proven, so nothing may claim two processors share a core. */
+    hype_cpu_topology_reset(&t);
+    for (i = 0; i < 4u; i++) {
+        hype_cpu_topology_add_at(&t, i, i == 0u, 1, 0u, 0u, 0u);
+    }
+    CHECK_INT("an all-zero map is NOT trustworthy", 0, hype_cpu_topology_siblings_known(&t));
+
+    hype_cpu_topology_reset(&t);
+    CHECK_INT("an empty table is not trustworthy either", 0,
+              hype_cpu_topology_siblings_known(&t));
+    hype_cpu_topology_add_at(&t, 0u, 1, 1, 0u, 0u, 0u);
+    CHECK_INT("one processor is trivially consistent", 1,
+              hype_cpu_topology_siblings_known(&t));
+}
+
 int main(void) {
+    test_core_threads_returns_siblings_together();
+    test_select_cores_excludes_both_bsp_threads();
+    test_select_cores_is_all_or_nothing();
+    test_select_cores_on_a_hybrid_mix_of_1_and_2_thread_cores();
+    test_select_cores_with_sparse_apic_ids();
+    test_siblings_known_gates_the_conservative_fallback();
     test_consecutive_layout_matches_the_old_assumption();
     test_sparse_layout_gives_real_ids_not_indices();
     test_disabled_processors_are_never_handed_out();

@@ -214,3 +214,111 @@ int hype_cpu_topology_apply_apic_layout(hype_cpu_topology_t *t,
     }
     return 0;
 }
+
+/*
+ * SMP-23 (#479): whole-core enumeration and selection. See cpu_topology.h and plan.md §10
+ * decision 40 -- a thread is the unit of execution, a core the unit of allocation.
+ */
+
+/* Index of the first processor belonging to the `core_index`-th distinct core, or -1. */
+static int topo_first_of_core(const hype_cpu_topology_t *t, unsigned int core_index) {
+    unsigned int i, j, seen = 0;
+    for (i = 0; i < t->count; i++) {
+        int first = 1;
+        for (j = 0; j < i; j++) {
+            if (t->loc[j].package == t->loc[i].package && t->loc[j].core == t->loc[i].core) {
+                first = 0;
+                break;
+            }
+        }
+        if (!first) continue;
+        if (seen == core_index) return (int)i;
+        seen++;
+    }
+    return -1;
+}
+
+unsigned int hype_cpu_topology_core_count(const hype_cpu_topology_t *t) {
+    unsigned int cores = 0;
+    if (t == 0) return 0;
+    hype_cpu_topology_core_summary(t, &cores, 0);
+    return cores;
+}
+
+unsigned int hype_cpu_topology_core_threads(const hype_cpu_topology_t *t, unsigned int core_index,
+                                            uint32_t *out_apic, unsigned int out_max) {
+    int first;
+    unsigned int i, n = 0;
+
+    if (t == 0 || out_apic == 0 || out_max == 0u) return 0;
+    first = topo_first_of_core(t, core_index);
+    if (first < 0) return 0;
+    for (i = 0; i < t->count && n < out_max; i++) {
+        if (t->loc[i].package == t->loc[(unsigned int)first].package &&
+            t->loc[i].core == t->loc[(unsigned int)first].core) {
+            out_apic[n++] = t->apic_id[i];
+        }
+    }
+    return n;
+}
+
+int hype_cpu_topology_siblings_known(const hype_cpu_topology_t *t) {
+    unsigned int i;
+    if (t == 0 || t->count == 0u) return 0;
+    /*
+     * The signature of an untrustworthy map is every processor reporting the SAME location --
+     * which is what the all-zero firmware table #378 found looks like, and what a failed CPUID
+     * repair leaves behind. One processor is trivially consistent, so it counts as known.
+     */
+    if (t->count == 1u) return 1;
+    for (i = 1; i < t->count; i++) {
+        if (t->loc[i].package != t->loc[0].package || t->loc[i].core != t->loc[0].core ||
+            t->loc[i].thread != t->loc[0].thread) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+unsigned int hype_cpu_topology_select_cores(const hype_cpu_topology_t *t, unsigned int want_cores,
+                                            uint32_t *out_apic, unsigned int out_max,
+                                            unsigned int *out_cores) {
+    unsigned int ncores, ci, written = 0, cores_taken = 0;
+    uint32_t bsp_pkg = 0, bsp_core = 0;
+    int have_bsp_loc = 0;
+
+    if (out_cores != 0) *out_cores = 0;
+    if (t == 0 || out_apic == 0 || want_cores == 0u || out_max == 0u) return 0;
+
+    if (t->have_bsp && t->bsp_index < t->count) {
+        bsp_pkg = t->loc[t->bsp_index].package;
+        bsp_core = t->loc[t->bsp_index].core;
+        have_bsp_loc = 1;
+    }
+
+    ncores = hype_cpu_topology_core_count(t);
+    for (ci = 0; ci < ncores && cores_taken < want_cores; ci++) {
+        uint32_t threads[HYPE_CPU_TOPOLOGY_MAX];
+        unsigned int nthreads, k;
+        int first = topo_first_of_core(t, ci);
+
+        if (first < 0) continue;
+        /* The BSP's whole core is excluded, both threads -- no guest vCPU may land on the
+         * sibling of the core running hype's console and log duty. */
+        if (have_bsp_loc && t->loc[(unsigned int)first].package == bsp_pkg &&
+            t->loc[(unsigned int)first].core == bsp_core) {
+            continue;
+        }
+        nthreads = hype_cpu_topology_core_threads(t, ci, threads, HYPE_CPU_TOPOLOGY_MAX);
+        if (nthreads == 0u) continue;
+        /* All-or-nothing: never hand back half a core, or the caller believes it owns a core
+         * whose other thread is still available to someone else. */
+        if (written + nthreads > out_max) continue;
+        for (k = 0; k < nthreads; k++) {
+            out_apic[written++] = threads[k];
+        }
+        cores_taken++;
+    }
+    if (out_cores != 0) *out_cores = cores_taken;
+    return written;
+}

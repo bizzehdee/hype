@@ -89,6 +89,49 @@ void hype_cpu_topology_core_summary(const hype_cpu_topology_t *t, unsigned int *
                                     unsigned int *smt_cores);
 
 /*
+ * SMP-23 (#479) / plan.md §10 decision 40: a hardware thread is the unit of EXECUTION, a
+ * physical core the unit of ALLOCATION. These four exist so a caller can grant a core WHOLE --
+ * every sibling thread of it -- instead of hype_cpu_topology_select_isolated()'s one thread
+ * per core, which discarded the rest of the machine.
+ */
+
+/* Distinct physical cores in the table, in a stable order (first appearance). */
+unsigned int hype_cpu_topology_core_count(const hype_cpu_topology_t *t);
+
+/*
+ * Every logical processor of the `core_index`-th distinct physical core, written to
+ * out_apic[0..out_max). Returns how many were written (0 for an out-of-range index).
+ * Threads come back in enumeration order, which is stable for a given table.
+ */
+unsigned int hype_cpu_topology_core_threads(const hype_cpu_topology_t *t, unsigned int core_index,
+                                            uint32_t *out_apic, unsigned int out_max);
+
+/*
+ * Select `want_cores` whole physical cores, excluding the BSP's own core entirely -- BOTH of
+ * its threads, not just the BSP itself, which is the property select_isolated() exists to
+ * protect and which must survive granting cores whole.
+ *
+ * Writes EVERY thread of each selected core to out_apic[0..out_max) and returns the number of
+ * THREADS written; out_cores, if given, receives the number of cores those threads came from.
+ * A core is all-or-nothing: if its threads would not fit in out_max, it is not selected at all,
+ * so a caller never receives half a core and believes it owns the whole thing.
+ */
+unsigned int hype_cpu_topology_select_cores(const hype_cpu_topology_t *t, unsigned int want_cores,
+                                            uint32_t *out_apic, unsigned int out_max,
+                                            unsigned int *out_cores);
+
+/*
+ * 1 only when the (package, core, thread) map is TRUSTWORTHY -- i.e. it came from firmware or
+ * from a successful #378 CPUID repair, not from the all-zero table some firmware reports.
+ *
+ * Decision 40's conservative fallback hangs off this: when siblings cannot be proven, every
+ * logical processor must be treated as its own single-threaded core. Wasting threads is safe;
+ * pairing distrusting owners on one core by accident is not. Deliberately does NOT infer
+ * siblings from APIC-ID adjacency -- #360 is the standing evidence that APIC IDs are not dense.
+ */
+int hype_cpu_topology_siblings_known(const hype_cpu_topology_t *t);
+
+/*
  * The APIC ID of the `n`-th application processor -- every recorded processor
  * except the BSP, in enumeration order, zero-based. Returns -1 if there is no
  * such AP.
