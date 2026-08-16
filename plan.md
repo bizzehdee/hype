@@ -108,8 +108,9 @@ scope.
                              - Installer media (ISO/VHD/raw img) presented as
                                a virtio-blk / AHCI device
                              - Windows/Linux/BSD installers run unmodified
-                             - Multiple guests run concurrently, each pinned
-                               to 1..N vCPUs, own EPT/NPT address space
+                             - Multiple guests run concurrently, each with
+                               1..N vCPUs on dedicated or shared cores (§3),
+                               own EPT/NPT address space
 ```
 
 The boundary between Phase 0 and Phase 1 is drawn as early as the hardware
@@ -131,13 +132,20 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
 ## 3. Why "thin"
 
 - No general device driver model — a small, fixed board of virtual devices.
-- No process/thread scheduler beyond exclusive 1:1 vCPU-to-pCPU pinning —
-  avoids needing a real scheduler at all for v1. The operator can pin a VM
-  to an explicit **subset** of host cores (§5 `cpu_set`) rather than the
-  hypervisor always auto-assigning whichever cores are free; exclusivity
-  (no two VMs' pinned sets overlap) remains a hard invariant, checked at
-  startup (§6i), since it's what the fault-isolation guarantee (§6g)
-  depends on.
+- No general-purpose process/thread scheduler. hype schedules **vCPUs and
+  nothing else**, across two operator-chosen tiers (§10 decision 39):
+    - **Dedicated** (the default) — exclusive 1:1 vCPU-to-pCPU pinning. No
+      scheduler on the path at all. The operator can pin a VM to an explicit
+      **subset** of host cores (§5 `cpu_set`) rather than the hypervisor
+      auto-assigning whichever are free. Exclusivity — no two dedicated VMs'
+      pinned sets overlap — is a hard invariant of *this tier*, checked at
+      startup (§6i).
+    - **Shared** — a pool of cores that several vCPUs are time-sliced onto,
+      so a host can run more vCPUs than it has cores. A VM opts in per-VM.
+  Fault isolation (§6g) is preserved on both tiers, but by different
+  mechanisms: by construction on the dedicated tier, and by **mandatory
+  preemption** on the shared one. That difference is the whole substance of
+  the scheduler work — see §6g and §10 decision 39.
 - No filesystem in the hypervisor beyond what's needed to read hype's own
   files and the guest images off a host volume — but that reader is the
   **primary** path, not a contingency. hype's own FAT32/exFAT/ext/NTFS/
@@ -176,6 +184,11 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
   vcpus = 4
   cpu_set = 4-7             ; explicit host core subset to pin to (optional;
                             ; auto-assigned from whatever's free if omitted)
+  cpu_mode = dedicated      ; dedicated | shared (§3, §10 decision 39).
+                            ; default dedicated = today's exclusive 1:1 pinning
+  isolation_group = payroll ; VMs naming the same group may share cores and SMT
+                            ; siblings with each other. Default: the VM's own
+                            ; name, i.e. shares with nobody (default-deny)
   mem_mb = 8192
   boot = installer        ; installer | disk
   install_media = \EFI\hype\win11.iso
@@ -616,13 +629,41 @@ which one currently has focus:
 A misbehaving guest must not be able to affect other guests or the
 hypervisor itself:
 
-- **Memory/CPU isolation is mostly inherent to the architecture already
-  chosen**: each VM has its own EPT/NPT address space (§2/§4), so a guest
-  cannot read or corrupt another guest's memory regardless of what it does
-  to itself. With 1:1 vCPU-to-pCPU pinning (§3), a guest's vCPU spinning
-  forever occupies only its own pinned core, not one shared with other
-  guests' vCPUs — so a hung guest doesn't starve others of CPU time by
-  construction, not as an added feature.
+- **Memory isolation is inherent to the architecture already chosen**: each
+  VM has its own EPT/NPT address space (§2/§4), so a guest cannot read or
+  corrupt another guest's memory regardless of what it does to itself. This
+  holds on **both** scheduling tiers (§3): memory isolation comes from
+  nested paging, not from pinning. On the shared tier the scheduler swaps
+  the NPT/EPT root and the ASID/VPID on every vCPU switch, so a descheduled
+  vCPU's memory is unaddressable by whichever vCPU is running. Register and
+  MSR isolation is ordinary context-switch hygiene — the same save/restore
+  that already runs on every exit.
+- **CPU isolation — the same guarantee, two different mechanisms.** A hung
+  or spinning guest must never starve another of CPU time. How that is
+  assured depends on the tier, and the difference matters:
+    - **Dedicated tier: by construction.** A vCPU spinning forever occupies
+      only its own exclusively-pinned core. Nothing else can be affected,
+      because nothing else is there. No mechanism has to work correctly for
+      this to hold.
+    - **Shared tier: by mandatory preemption.** Cores are shared, so the
+      construction argument is gone and an actual mechanism replaces it —
+      the scheduler forcibly preempts a running vCPU at the end of its
+      slice, whatever the guest is doing (interrupts disabled, inside an
+      interrupt shadow, spinning in a tight loop). A guest that could defer
+      its own preemption indefinitely would void this guarantee, so the
+      preemption path must be **proven, not assumed** — that proof is a
+      deliverable (SMP-20), not an implementation detail.
+- **What the shared tier genuinely weakens: microarchitectural side
+  channels.** vCPUs taking turns on one core share caches, TLBs and branch
+  predictors, and SMT siblings share L1D and execution ports concurrently
+  (the L1TF/MDS class). Pinning eliminates this by construction; sharing
+  reintroduces it. This is bounded, not eliminated, by default-deny trust
+  groups: distrusting groups never occupy one physical core simultaneously,
+  and µarch state (L1D + IBPB) is flushed when a core changes group. Within
+  a trust group there is no restriction and no flush, because two vCPUs of
+  one VM already share a core in the SMP case and mutually-trusting VMs are
+  the same situation. A VM that must never share a core with anyone uses the
+  dedicated tier. See §10 decision 39.
 - **What still needs building**: a per-vCPU **watchdog** in the VM-exit
   dispatch loop that detects a guest that's actually gone wrong (not just
   busy) — repeated unhandled/unrecognized VM-exit reasons, a triple fault,
@@ -672,15 +713,25 @@ actual host resources and refuse to start any VM that would overcommit them
   fast with a clear diagnostic (dashboard + serial) naming which VMs would
   need to be reduced or disabled, rather than starting some VMs and running
   out of memory later during arbitrary guest operation.
-- Same principle for total configured `vcpus` against physical core count,
-  given the 1:1 pinning model (§3) — no VM should be admitted if it can't
-  actually get pinned cores.
+- Same principle for CPU, but the rule is now **per tier** (§3):
+  every **dedicated**-tier vCPU needs a core of its own, so the sum of
+  dedicated `vcpus` may not exceed the cores available to them. **Shared**-
+  tier vCPUs are deliberately over-committed onto a pool, so a core count is
+  not the limit there; what is checked instead is that the shared pool is
+  non-empty whenever any shared VM is configured, and that over-commit stays
+  within a configured maximum ratio.
 - **Explicit `cpu_set` validation**: for any VM specifying `cpu_set`, confirm
-  every listed core actually exists on this host, that the count matches
-  `vcpus`, and — critically — that no two VMs' `cpu_set` ranges overlap.
-  Overlap is refused outright (not just warned about), since exclusive
-  pinning is what the fault-isolation guarantee (§6g) relies on; VMs
-  without an explicit `cpu_set` are auto-assigned only from cores no
+  every listed core actually exists on this host and — for the dedicated
+  tier — that the count matches `vcpus`. Overlap rules follow the tier:
+    - Two **dedicated** VMs' `cpu_set` ranges must not overlap. Refused
+      outright (not just warned about), exactly as before: exclusive pinning
+      is what §6g's by-construction argument relies on.
+    - Two **shared** VMs sharing pool cores is the entire point, and is
+      allowed.
+    - A core appearing in both a dedicated `cpu_set` and the shared pool is
+      the new refusal — it would silently break the dedicated VM's
+      exclusivity, which is the one thing that tier promises.
+  VMs without an explicit `cpu_set` are auto-assigned only from cores no
   `cpu_set` entry has claimed.
 - **Target-disk and varstore uniqueness (security-critical, not just
   hygiene)**: reject startup if any two VMs' `target_disk` resolve to the
@@ -887,7 +938,8 @@ Rust, and not one single build system for everything:
 9. **M8 — Multi-VM concurrency + status dashboard.** Run one of each
    (Windows + Linux + BSD) simultaneously, console-switch between them via
    the local dashboard (§6b), confirm isolation (EPT/NPT faults don't cross
-   VM boundaries, vCPU pinning holds) and that reported stats match reality.
+   VM boundaries, each tier's core-allocation rule holds -- §3) and that
+   reported stats match reality.
 10. **M9 — Persistence.** Reboot the *host* into hype.efi again and boot
     already-installed guest disks (not just fresh installers) — validates
     the varstore persistence and disk-image reuse path.
@@ -997,9 +1049,11 @@ isn't lost.
     Force power off (immediate teardown) — available per-VM from the
     dashboard independent of which VM currently has console focus.
 12. **Fault isolation between guests — decided: required.** A misbehaving
-    guest must never affect others. Memory/CPU isolation falls out of the
-    already-chosen EPT/NPT-per-guest + 1:1 vCPU pinning architecture; on top
-    of that, a per-vCPU watchdog (§6g) detects genuinely faulted guests
+    guest must never affect others. Memory isolation falls out of the
+    already-chosen EPT/NPT-per-guest architecture unconditionally; CPU-time
+    isolation comes from exclusive pinning on the dedicated tier and from
+    mandatory preemption on the shared one (§6g, decision 39). On top of
+    that, a per-vCPU watchdog (§6g) detects genuinely faulted guests
     (triple fault, unrecognized VM-exit storm) and auto-applies Force power
     off to that VM alone, never a hypervisor-wide response.
 13. **Host power lifecycle — decided: best-effort clean shutdown of all
@@ -1027,9 +1081,11 @@ isn't lost.
     an explicit set of host cores (e.g. reserve cores for the host/dashboard,
     or split a large machine's cores deliberately across VMs) rather than
     always taking whatever the hypervisor picks. Exclusivity — no two VMs
-    ever share a pinned core — remains mandatory and is enforced at startup
-    admission control (§6i), since §6g's fault-isolation guarantee depends
-    on it.
+    ever share a pinned core — remains mandatory **for the dedicated tier**
+    and is enforced at startup admission control (§6i), since §6g's
+    by-construction fault-isolation argument depends on it. *Amended by
+    decision 39*, which added a second, explicitly-shared tier: that
+    sentence read "no two VMs, ever" when pinning was hype's only model.
 17. **Language/toolchain — decided: C**, via two separate build pipelines
     (§8) — a lightweight freestanding UEFI toolchain (clang/lld or GNU-EFI)
     for `hype.efi` itself, and EDK2 solely for the vendored guest firmware
@@ -1455,9 +1511,11 @@ isn't lost.
     implementation stages, not design, and they are silently wrong on real
     targets: current AMD EPYC parts ship up to 192 cores and quad-socket
     boards exist, so a machine with 700+ usable cores is a legitimate host.
-    The only real bounds are physical: 1:1 pinning gives at most
-    (usable cores - 1) VMs (the BSP keeps console/log duty), and total
-    guest RAM must fit. Decided:
+    The only real bounds are physical: the DEDICATED tier gives at most
+    (usable cores - 1) VMs (the BSP keeps console/log duty); the shared tier
+    is deliberately over-committed and bounded instead by the configured
+    over-commit ratio (§6i, decision 39). Total guest RAM must fit either
+    way. Decided:
     - **Per-VM state is allocated once at startup from the UEFI pool,
       before ExitBootServices, sized by the parsed config and validated
       against the detected CPU topology** — not a static array behind a
@@ -1803,6 +1861,79 @@ isn't lost.
       read path would be the one without real-hardware exposure until a
       config change failed to load on somebody's NVMe machine.
 
+39. **vCPU scheduling — decided: promoted from v2 to v1, as a second tier
+    ALONGSIDE 1:1 pinning, not replacing it (2026-08-16).** Recorded here
+    because this amends decision 16 and rewrites §6g's central argument;
+    §13's own rule requires exactly that before any of it is built.
+
+    v1 originally had no scheduler at all: one vCPU permanently and
+    exclusively owned one pCPU (§3, decision 16), which is *why* §6g's
+    fault-isolation guarantee held "by construction". The cost is that the
+    host can never run more vCPUs than it has cores, and cores reserved for
+    an idle VM are simply unavailable. Promoting the scheduler buys
+    over-commit; the price is that one guarantee stops being free.
+
+    **The model: two operator-chosen tiers, per VM** (`cpu_mode` in §5,
+    validated by §6i).
+    - **Dedicated** — today's path, byte for byte. Exclusive pinning, no
+      scheduler on the dispatch path, no µarch sharing, no new failure mode.
+      This remains the **default**, so an existing config behaves exactly as
+      it did.
+    - **Shared** — a pool of cores that several vCPUs are time-sliced onto.
+      The "never share a core" rule is a property of the dedicated tier and
+      does not govern shared-tier VMs; sharing a core is precisely what a
+      shared VM opts into.
+
+    A dedicated VM is then just a run queue of length one pinned to a core,
+    so both tiers sit on one vCPU-run primitive rather than forking the
+    dispatch path in two.
+
+    **Why this is additive rather than a rewrite.** The VMRUN/exit engine
+    and every emulation path are already per-vCPU and independent of the
+    pinning model. A vCPU's switchable context already exists and is already
+    saved and restored on every exit — VMCB/VMCS, FPU (#260), TSC_AUX
+    (#277), GPR context. The one-shot LAPIC preemption timer (#364) is
+    already a time-slice primitive. Decision 33's no-VM-cap work already
+    decoupled the number of runtime vCPU contexts from the core count, which
+    is exactly what a scheduler needs. What is genuinely new is the
+    scheduler proper, context-switch orchestration across vCPUs, and holding
+    a descheduled vCPU's interrupts until it runs again.
+
+    **§6g re-derived (the required part).** Memory isolation is unchanged
+    and unconditional: it comes from nested paging, not pinning, and the
+    scheduler swaps the NPT/EPT root and ASID/VPID on switch. CPU isolation
+    changes mechanism but not strength — by construction on the dedicated
+    tier, by **mandatory preemption** on the shared one. That mechanism has
+    to actually work: a guest able to defer its own preemption indefinitely
+    would void the guarantee, so SMP-20 exists to prove it as executable
+    tests rather than assert it. If that proof fails, this decision is
+    wrong and comes back here.
+
+    **What genuinely weakens: µarch side channels**, bounded by default-deny
+    trust groups — distrusting groups never co-reside on a physical core,
+    L1D + IBPB on cross-group switch, no restriction and no flush cost
+    within a group. Default is one group per VM, so configuring nothing
+    yields the strict behaviour. A VM that must never share a core with
+    anyone uses the dedicated tier.
+
+    **Also required, not optional:** NUMA-aware placement. Static pinning
+    gave locality for free; scheduling removes it, and cross-node memory
+    access is a measurable cliff this project should not reintroduce by
+    accident.
+
+    **Rejected: replacing pinning outright.** It would trade a guarantee
+    that holds by construction for one that holds only if a mechanism is
+    correct, on every VM, including the latency-sensitive and
+    security-critical ones that have no need of over-commit.
+
+    **Rejected: deferring to v2 as originally planned.** Guest SMP (this
+    milestone) already builds most of the machinery — per-VM multi-vCPU
+    contexts, per-vCPU LAPIC state, IPI delivery. Adding the scheduler while
+    that work is open is far cheaper than retrofitting it afterwards, and
+    doing it later would mean re-opening §6g a second time.
+
+    Delivered by #466–#478.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
@@ -1849,89 +1980,12 @@ should be implemented without first promoting it to a real board milestone
 and, if it changes a v1 decision, updating §10 explicitly (per AGENTS.md's
 own "keeping plan.md and the board in sync" rule).
 
-- **Real vCPU scheduler, alongside (not replacing) 1:1 exclusive pCPU
-  pinning** (noted 2026-07-14; expanded 2026-08-12). v1's hard invariant
-  (§3, §10, AGENTS.md) is one vCPU permanently and exclusively owning one
-  pCPU — simple, and it's *why* §6g's fault-isolation guarantee holds "by
-  construction" (a hung guest occupies only its own core, never one shared
-  with another guest's vCPU). A v2 direction is hype's own scheduler:
-  multiple vCPUs (from the same or different guests) time-sliced across a
-  smaller pCPU pool, exposing a configured vCPU count that need not equal
-  the physical core count.
-
-  **A hybrid of dedicated + shared, not a wholesale replacement.**
-  Partition the physical cores into two tiers, operator-chosen per VM
-  (the existing `cpu_set` admission seam, §6i, extends to carry a mode):
-    - **Dedicated tier** — today's 1:1 pinned path, unchanged. No
-      scheduler overhead, full isolation preserved by construction. For
-      latency-sensitive or security-critical guests.
-    - **Shared tier** — a pool of cores the scheduler multiplexes several
-      vCPUs onto. The "never share a core" invariant is a property of the
-      **dedicated tier**, and does NOT govern shared-tier VMs — sharing a
-      core (time-slicing, and SMT co-residency within a trust group) is
-      exactly what a shared VM opts into.
-  A "dedicated" VM is then just a scheduler run-queue of length one pinned
-  to a core, so both tiers can sit on one vCPU-run primitive.
-
-  **What carries over (most of the CPU work):** the VMRUN/exit engine and
-  every emulation path are per-vCPU and independent of the pinning model.
-  A vCPU's switchable context already exists — its VMCB/VMCS + FPU (§260) +
-  TSC_AUX (§275) + GPR ctx, saved/restored on every exit today. The
-  one-shot LAPIC preemption timer (§364) is already a time-slice
-  primitive. The no-VM-cap work (§10 decision 33; #393/#394/#395) already
-  decouples the number of runtime vCPU contexts from the core count — a
-  scheduler needs exactly that (more vCPU contexts than pCPUs). **What is
-  new:** the scheduler proper (run queue, time accounting, pick-next
-  policy, mandatory preemption), context-switch orchestration across
-  vCPUs, and holding a descheduled vCPU's timer/device interrupts (the
-  pending-IRR machinery already queues them) until it runs again.
-
-  **Isolation under core sharing — spatial holds, temporal is the axis
-  that weakens.** Memory isolation comes from nested paging, not pinning:
-  the scheduler swaps the NPT/EPT root + ASID/VPID on switch, so a
-  descheduled vCPU's memory is unaddressable by the running one (§6j
-  bounds checks unchanged). Register/MSR isolation is standard
-  context-switch hygiene (the same save/restore run on every exit). Fault
-  isolation still holds *provided preemption is mandatory* — a spinning
-  guest cannot monopolise a shared core because the scheduler forcibly
-  preempts it (this is the "new mechanism" replacing what pinning gave for
-  free; it MUST be re-derived and proven, not assumed). The genuinely
-  weaker axis is **microarchitectural/timing side channels**: VMs taking
-  turns on one core share caches/TLB/branch predictors, and SMT siblings
-  share L1D/ports concurrently (the L1TF/MDS class). Pinning eliminates
-  this by construction; sharing reintroduces it.
-
-  **Default-deny core sharing, explicit trust groups** (mirrors the
-  §6e/net_peers default-deny philosophy). The µarch precautions apply
-  **between trust groups, never within one**:
-    1. **Dedicated** — shares with no one (today's path).
-    2. **Shared, same group** — freely shares cores and SMT siblings with
-       group-mates; no cross-VM flush, maximum density. (Two vCPUs of one
-       VM already share a core in the SMP case with no issue; mutually-
-       trusting VMs are the same situation.)
-    3. **Shared, cross group** — the scheduler keeps distrusting groups off
-       the same physical core simultaneously (schedule whole cores as a
-       unit / SMT-off for the pool) and flushes µarch state (L1D + IBPB)
-       when it switches a core between groups; optionally Intel CAT / AMD
-       cache partitioning.
-  A deployment whose shared tier is a single trust domain has no
-  cross-group boundaries and runs completely unrestricted. VMs that must
-  never share a core with anyone use the dedicated tier.
-
-  The scheduler must also be **NUMA-node aware**: on multi-socket/
-  multi-node hosts, place a VM's vCPUs and its guest RAM on the same NUMA
-  node wherever possible (and keep them together across any rebalancing),
-  rather than scheduling purely on core availability — cross-node memory
-  access is a real, measurable performance cliff this project shouldn't
-  reintroduce once it's no longer avoided for free by static pinning.
-
-  **v1-friendly seams (so v2 is additive, not a rewrite):** the `cpu_set`
-  mode field (dedicated vs shared) and an isolation-group field are small
-  config surfaces that can be reserved/validated early; the scheduler
-  itself is v2. Promoting any of this into v1 requires re-deriving §6g
-  fault isolation under scheduling and recording it as a new §10 decision,
-  per the note at the top of this section.
-
+- ~~**Real vCPU scheduler, alongside (not replacing) 1:1 exclusive pCPU
+  pinning**~~ (noted 2026-07-14; expanded 2026-08-12) — **PROMOTED TO v1 on
+  2026-08-16.** No longer future work. See §10 decision 39 for the model and
+  the re-derived §6g argument, §3 for the two tiers, and #466–#478 on the SMP
+  milestone for the delivery plan. Kept as a stub rather than deleted so the
+  promotion is visible to anyone who remembers this section containing it.
 - **Memory ballooning, for dynamic per-VM RAM allocation with a
   configurable floor and ceiling** (noted 2026-07-14). v1's admission
   control (§6i) sizes each VM's RAM as a fixed amount decided at start

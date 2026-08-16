@@ -130,6 +130,8 @@ as the default display name.
 | `label` | free text | the section `<name>` | **human display name surfaced in every management interface** (dashboard NAME column, TUI, future SSH mgmt). Lets a friendly "Windows 11 Workstation" show for id `win11`. |
 | `vcpus` | int, **1 .. host cores** | `1` | ≥1; admission caps at `host_cpu_budget` size (§10) |
 | `cpu_set` | cpu-list | (unpinned) | optional explicit pin subset of `host_cpu_budget` |
+| `cpu_mode` | `dedicated` \| `shared` | `dedicated` | scheduling tier (plan.md §3, §10 decision 39). `dedicated` = exclusive 1:1 pinning, no scheduler on the dispatch path. `shared` = time-sliced onto a pooled set of cores, so the host may run more vCPUs than it has cores. A core may never be in both a dedicated `cpu_set` and the shared pool — admission refuses it (§6i). |
+| `isolation_group` | free text | the section `<name>` | trust group for core sharing. VMs naming the same group may share cores and SMT siblings freely, with no cross-VM µarch flush. Distrusting groups never occupy one physical core simultaneously, and L1D + IBPB are flushed when a core changes group. The default — each VM its own group — is therefore **default-deny**: configuring nothing gives the strict behaviour. Only meaningful with `cpu_mode = shared`. |
 | `mem_mb` | int, **1 .. host usable MB** | — (required) | ≥1 MB; admission caps at host RAM (§10) |
 | `boot` | `installer` \| `disk` | `installer` | two-phase (§5.4 / plan.md §6d) |
 | `firmware` | `uefi` \| `legacy` | `uefi` | |
