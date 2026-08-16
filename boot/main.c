@@ -11396,9 +11396,17 @@ wait_for_sipi:
                 } else if (vm->shared_ahci_mapped &&
                            ap_npf.guest_phys_addr >= vm->shared_ahci_abar &&
                            ap_npf.guest_phys_addr < vm->shared_ahci_abar + HYPE_AHCI_MMIO_SIZE) {
-                    if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_ata_disk,
-                                                     (uint64_t)vm->shared_ahci_abar,
-                                                     &g_fw_1_dma_map, insn) == 0) {
+                    /*
+                     * The ATAPI model, matching the BSP. An earlier cut of this called
+                     * vmm_handle_ahci_disk_npf_map() with the hard-DISK model here, which
+                     * answered the guest's CD probe from the wrong device and produced
+                     * "(aprobe0:ahcich0:0:0:0): CAM status: CCB request was invalid" on the
+                     * 2-vCPU run only. The first HBA carries the ATAPI CD; g_fw_1_ata_disk
+                     * belongs to the separate SATA-disk HBA handled above.
+                     */
+                    if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi,
+                                                (uint64_t)vm->shared_ahci_abar,
+                                                &g_fw_1_dma_map, insn) == 0) {
                         ap_mmio_done = 1;
                     }
                 }
