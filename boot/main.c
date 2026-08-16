@@ -11296,9 +11296,21 @@ wait_for_sipi:
             }
         } else if (vmm_reason_is_npf(kind, info.reason)) {
             const uint8_t *insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
-            /* Its OWN LAPIC. Every other MMIO region belongs to a shared device model and is
-             * SMP-7's business, so it is refused here rather than raced on. */
-            if (vmm_handle_lapic_npf(kind, ctx, lapic, HYPE_LAPIC_DEFAULT_BASE, insn) != 0) {
+            /*
+             * SMP-6: PCI config space, served under the shared-device lock.
+             *
+             * The AP loop used to handle only its own LAPIC and refuse every other MMIO region
+             * as "SMP-7's business". Once the guest got past AP launch, the AP immediately took
+             * 25593 unhandled NPFs whose RIP resolves to pci_docfgregread -- FreeBSD reads PCI
+             * config from whichever CPU it happens to be on, so refusing them on an AP hands
+             * the guest garbage.
+             *
+             * fw_1_dev_lock() is exactly the serialisation SMP-7 added for this: the lock is
+             * already held while outside the guest, so the shared hype_pci_t is not raced.
+             */
+            if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &vm->pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
+                /* handled */
+            } else if (vmm_handle_lapic_npf(kind, ctx, lapic, HYPE_LAPIC_DEFAULT_BASE, insn) != 0) {
                 if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
                     hype_debug_print("fw-1 vm%u vCPU %u: NPF at gpa 0x%llx rip 0x%llx needs "
                                      "shared device state -- refused, see SMP-7 [#190]\n",
