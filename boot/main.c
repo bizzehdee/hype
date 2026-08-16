@@ -11378,6 +11378,70 @@ wait_for_sipi:
                             }
                         }
                         /*
+                         * SMP-6: CpuMpData itself. The AP is running code it must not run, so
+                         * the question is what it was dispatched to -- CPU_MP_DATA.Procedure.
+                         *
+                         * Offsets are derived from edk2's own struct (MP_ASSEMBLY_ADDRESS_MAP
+                         * is 11 pointer-sized fields = 0x58), and DELIBERATELY self-checked
+                         * rather than trusted: CpuCount must equal the vCPU count, BspNumber
+                         * must be 0, and Buffer/CpuApStackSize must be sane. A guessed offset
+                         * that reads plausible garbage has already cost this investigation one
+                         * wrong turn, so the invariants are printed next to the value.
+                         *
+                         * CpuMpData IS ApIdtBase + Limit + 1, not a pointer stored there --
+                         * edk2 assigns `CpuMpData = (CPU_MP_DATA *)(ApIdtBase + Limit + 1)`.
+                         * An earlier round dereferenced it and mistook the first field
+                         * (CpuInfoInHob) for the struct address; the invariants below are what
+                         * caught that, which is the reason they are here.
+                         */
+                        if (after != 0ull) {
+                            const uint8_t *mp = fw_1_guest_phys_to_host(vm, after);
+                            if (mp != 0) {
+                                uint64_t f[5];
+                                unsigned q;
+                                static const unsigned offs[5] = {0x08u, 0x18u, 0x28u,
+                                                                 0xB8u, 0xC0u};
+                                for (q = 0; q < 5u; q++) {
+                                    unsigned b;
+                                    f[q] = 0;
+                                    for (b = 0; b < 8u; b++) {
+                                        f[q] |= (uint64_t)mp[offs[q] + b] << (8u * b);
+                                    }
+                                }
+                                hype_debug_print("fw-1 APVCPU vm%u/%u MPSTRUCT @0x%llx: "
+                                                 "CpuCount/Bsp=0x%llx Buffer=0x%llx "
+                                                 "StackSize=0x%llx Procedure=0x%llx "
+                                                 "ProcArgs=0x%llx [#190]\n", vm_idx, vi,
+                                                 (unsigned long long)after,
+                                                 (unsigned long long)f[0],
+                                                 (unsigned long long)f[1],
+                                                 (unsigned long long)f[2],
+                                                 (unsigned long long)f[3],
+                                                 (unsigned long long)f[4]);
+                                /* The invariants above did not hold, so the struct base is not
+                                 * where it was computed. Dump the raw window and let the known
+                                 * values (a small CpuCount, a page-aligned Buffer) locate it
+                                 * rather than deriving a second offset from the first guess. */
+                                {
+                                    char ml[190];
+                                    int mo = hype_snprintf(ml, sizeof(ml),
+                                                           "fw-1 APVCPU vm%u/%u MPRAW @0x%llx:",
+                                                           vm_idx, vi,
+                                                           (unsigned long long)after);
+                                    for (q = 0; q < 10u; q++) {
+                                        uint64_t v = 0;
+                                        unsigned b;
+                                        for (b = 0; b < 8u; b++) {
+                                            v |= (uint64_t)mp[q * 8u + b] << (8u * b);
+                                        }
+                                        mo += hype_snprintf(ml + mo, sizeof(ml) - (unsigned)mo,
+                                                            " %llx", (unsigned long long)v);
+                                    }
+                                    hype_debug_print("%s [#190]\n", ml);
+                                }
+                            }
+                        }
+                        /*
                          * The BSP's IDTR for comparison. edk2 keeps the PEI Services table
                          * pointer at IDT base - 8; if the BSP's IDT has one and the AP's does
                          * not, the AP is running against the wrong IDT rather than against a
