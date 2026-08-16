@@ -17,10 +17,12 @@
 #define HYPE_CPUID_LEAF1_ECX_MONITOR_BIT (1u << 3)
 #define HYPE_CPUID_LEAFD_SUB1_EAX_XSAVES_BIT (1u << 3)
 #define HYPE_CPUID_LEAF7_ECX_WAITPKG_BIT (1u << 5)
+#define HYPE_CPUID_LEAF1_ECX_OSXSAVE_BIT (1u << 27)
 /* Highest basic leaf hype exposes. Must reach leaf 0xD (XSAVE state-component
  * enumeration) so the guest sees a COHERENT instruction-capability picture:
- * leaf 1 ECX passes the host's XSAVE(26)/OSXSAVE(27)/AVX(28)/FMA(12)/F16C(29)
- * bits straight through, so leaf 7 (AVX2/AVX-512/BMI/...) and leaf 0xD (the
+ * leaf 1 ECX passes the host's XSAVE(26)/AVX(28)/FMA(12)/F16C(29) bits straight through
+ * (OSXSAVE(27) is NOT passed through -- it mirrors the guest's own CR4, see the leaf-1
+ * handler), so leaf 7 (AVX2/AVX-512/BMI/...) and leaf 0xD (the
  * XSAVE area sizes the guest needs to enable XCR0) must be reachable and
  * truthful too -- otherwise glibc resolves ifunc string/memcpy routines to AVX
  * variants off leaf 1 but the kernel never enabled XSAVE (leaf 0xD read as 0),
@@ -179,12 +181,14 @@ uint32_t hype_cpuid_topo_shift(uint32_t n) {
 
 void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
                             const hype_cpuid_result_t *real, hype_cpuid_result_t *out) {
-    hype_cpuid_emulate_topo(eax_in, ecx_in, hv_enabled, (const hype_cpuid_topology_t *)0, real,
-                            out);
+    /* guest_cr4 = 0: OSXSAVE reported clear, which is correct for any caller that has not
+     * told us otherwise -- a guest that has not enabled CR4.OSXSAVE must not be told it has. */
+    hype_cpuid_emulate_topo(eax_in, ecx_in, hv_enabled, (const hype_cpuid_topology_t *)0, 0ull,
+                            real, out);
 }
 
 void hype_cpuid_emulate_topo(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
-                             const hype_cpuid_topology_t *topo,
+                             const hype_cpuid_topology_t *topo, uint64_t guest_cr4,
                              const hype_cpuid_result_t *real, hype_cpuid_result_t *out) {
     /* SMP-2 (#186): a null topo means the pre-SMP machine -- one vCPU, APIC ID 0 -- so every
      * caller that has not been taught about topology keeps reporting exactly what it did. */
@@ -311,6 +315,23 @@ void hype_cpuid_emulate_topo(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
         out->ecx = (real->ecx | HYPE_CPUID_HYPERVISOR_PRESENT_BIT) &
                    ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT & ~HYPE_CPUID_LEAF1_ECX_X2APIC_BIT &
                    ~HYPE_CPUID_LEAF1_ECX_MONITOR_BIT;
+        /*
+         * OSXSAVE (bit 27) is NOT a capability bit. The SDM defines it as a read-only mirror
+         * of the executing processor's CR4.OSXSAVE, so it must track THIS vCPU's CR4, never
+         * the host's.
+         *
+         * Passing the host's through was a real fault, not a purity issue: an OVMF AP read the
+         * bit as set, concluded XSAVE was already enabled, skipped setting CR4.OSXSAVE, and
+         * executed XGETBV -- which #UDs when CR4.OSXSAVE is clear. The AP died in CPUID
+         * leaf-0xD feature detection with CR4=0x668 (bit 18 clear) every boot. Same class as
+         * #436's phantom PCI buses: describe a machine hype is not providing, and the guest
+         * walks into the gap.
+         */
+        if ((guest_cr4 & HYPE_CR4_OSXSAVE_BIT) != 0ull) {
+            out->ecx |= HYPE_CPUID_LEAF1_ECX_OSXSAVE_BIT;
+        } else {
+            out->ecx &= ~HYPE_CPUID_LEAF1_ECX_OSXSAVE_BIT;
+        }
         return;
     }
 

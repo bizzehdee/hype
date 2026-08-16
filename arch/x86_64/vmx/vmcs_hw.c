@@ -1447,8 +1447,16 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     } else {
         vmx_real_cpuid(eax_in, ecx_in, &host_real);
     }
-    hype_cpuid_emulate_topo(eax_in, ecx_in, real->hv_enabled, &real->cpuid_topo, &host_real,
-                            &out); /* SMP-2 */
+    /* SMP-2 topology + the live guest CR4 -- see the SVM twin on why CR4 is read here. */
+    {
+        int cr4_ok = 0;
+        uint64_t guest_cr4 = vmread(HYPE_VMCS_GUEST_CR4, &cr4_ok);
+        if (!cr4_ok) {
+            guest_cr4 = 0ull; /* unreadable: report OSXSAVE clear rather than guess it set */
+        }
+        hype_cpuid_emulate_topo(eax_in, ecx_in, real->hv_enabled, &real->cpuid_topo, guest_cr4,
+                                &host_real, &out);
+    }
 
     real->gprs[0] = out.eax; /* RAX */
     real->gprs[3] = out.ebx; /* RBX */

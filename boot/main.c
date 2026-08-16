@@ -11268,6 +11268,31 @@ wait_for_sipi:
                     /* Paging is off (CR0.PG clear) and CS.base is 0, so the linear address IS
                      * the guest-physical one -- read the bytes directly and say what faulted
                      * rather than guessing at it. */
+                    /*
+                     * SMP-6: the AP's stack. The exception dump OVMF prints gives a RIP but no
+                     * call chain, and a RIP inside data is only explicable by WHO branched
+                     * there -- which the return addresses on the stack name.
+                     */
+                    {
+                        const uint8_t *sp = fw_1_guest_phys_to_host(vm, d.rsp);
+                        if (sp != 0) {
+                            char line[190];
+                            unsigned q;
+                            int off = hype_snprintf(line, sizeof(line),
+                                                    "fw-1 APVCPU vm%u/%u STACK @0x%llx:", vm_idx,
+                                                    vi, (unsigned long long)d.rsp);
+                            for (q = 0; q < 8u; q++) {
+                                uint64_t v = 0;
+                                unsigned b;
+                                for (b = 0; b < 8u; b++) {
+                                    v |= (uint64_t)sp[q * 8u + b] << (8u * b);
+                                }
+                                off += hype_snprintf(line + off, sizeof(line) - (unsigned)off,
+                                                     " %llx", (unsigned long long)v);
+                            }
+                            hype_debug_print("%s [#190]\n", line);
+                        }
+                    }
                     if ((d.cr0 & 0x80000000ull) != 0ull) {
                         /* Paging on: the RIP is a guest VIRTUAL address, so walk the guest's
                          * own page tables rather than treating it as physical. */

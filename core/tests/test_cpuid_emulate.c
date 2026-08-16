@@ -98,13 +98,22 @@ static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
      * AVX(28)/F16C(29) -- real.ecx has them all set, so they survive. */
     CHECK_HEX("FMA bit passthrough", 1, (out.ecx & (1u << 12)) != 0);
     CHECK_HEX("XSAVE bit passthrough", 1, (out.ecx & (1u << 26)) != 0);
-    CHECK_HEX("OSXSAVE bit passthrough", 1, (out.ecx & (1u << 27)) != 0);
+    /*
+     * OSXSAVE is deliberately NOT passed through -- it mirrors the guest's CR4.OSXSAVE, and
+     * this call supplies no CR4, so it must read clear. Telling a guest OSXSAVE is on when its
+     * own CR4 says otherwise made an OVMF AP skip enabling it and #UD on XGETBV.
+     */
+    CHECK_HEX("OSXSAVE is NOT passed through -- it mirrors guest CR4", 0,
+              (out.ecx & (1u << 27)) != 0);
     CHECK_HEX("AVX bit passthrough", 1, (out.ecx & (1u << 28)) != 0);
     CHECK_HEX("F16C bit passthrough", 1, (out.ecx & (1u << 29)) != 0);
-    /* ecx = real | hypervisor-present, minus TSC_DEADLINE, X2APIC and MONITOR (#256:
-     * an un-intercepted MWAIT never exits, so the guest must not be offered it). */
+    /* ecx = real | hypervisor-present, minus TSC_DEADLINE, X2APIC and MONITOR (#256: an
+     * un-intercepted MWAIT never exits, so the guest must not be offered it), and minus
+     * OSXSAVE(27), which is a mirror of the guest's CR4 rather than a capability and is 0
+     * because this call supplies no CR4. */
     CHECK_HEX("ecx otherwise passthrough",
-              (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21) & ~(1u << 3), out.ecx);
+              (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21) & ~(1u << 3) & ~(1u << 27),
+              out.ecx);
     /* #436: MTRR is REPORTED, because hype models the MTRR MSRs (MTRRcap,
      * MTRRdefType, the variable pairs and the fixed ranges). Clearing it while
      * implementing it made a strict guest see a processor missing a required
@@ -556,7 +565,7 @@ static void test_null_topology_reproduces_the_uniprocessor_report(void) {
     hype_cpuid_result_t a, b;
 
     hype_cpuid_emulate(1, 0, &real, &a);
-    hype_cpuid_emulate_topo(1, 0, 0, (const hype_cpuid_topology_t *)0, &real, &b);
+    hype_cpuid_emulate_topo(1, 0, 0, (const hype_cpuid_topology_t *)0, 0ull, &real, &b);
     CHECK_HEX("null topo == legacy entry point (ebx)", a.ebx, b.ebx);
     CHECK_HEX("null topo == legacy entry point (edx)", a.edx, b.edx);
     CHECK_HEX("uniprocessor: 1 logical processor in ebx[23:16]", 1u, (a.ebx >> 16) & 0xFFu);
@@ -572,7 +581,7 @@ static void test_leaf1_reports_this_vcpus_apic_id_and_the_vm_count(void) {
     topo.threads_per_core = 1u;
 
     topo.apic_id = 0u;
-    hype_cpuid_emulate_topo(1, 0, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(1, 0, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("BSP: apic id 0", 0u, (out.ebx >> 24) & 0xFFu);
     CHECK_HEX("4 logical processors", 4u, (out.ebx >> 16) & 0xFFu);
     CHECK_HEX("HTT set once there is more than one", 1u << 28, out.edx & (1u << 28));
@@ -580,7 +589,7 @@ static void test_leaf1_reports_this_vcpus_apic_id_and_the_vm_count(void) {
     CHECK_HEX("ebx low half preserved", 0x7766u, out.ebx & 0xFFFFu);
 
     topo.apic_id = 3u;
-    hype_cpuid_emulate_topo(1, 0, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(1, 0, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("AP: apic id 3", 3u, (out.ebx >> 24) & 0xFFu);
     CHECK_HEX("count is per-VM, not per-vCPU", 4u, (out.ebx >> 16) & 0xFFu);
 
@@ -598,19 +607,19 @@ static void test_leaf_b_reports_smt_and_core_levels(void) {
     topo.vcpu_count = 4u;
     topo.threads_per_core = 2u;
 
-    hype_cpuid_emulate_topo(0xBu, 0u, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(0xBu, 0u, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("SMT level: type 1", 1u, (out.ecx >> 8) & 0xFFu);
     CHECK_HEX("SMT level: echoes input level", 0u, out.ecx & 0xFFu);
     CHECK_HEX("SMT level: 2 threads", 2u, out.ebx);
     CHECK_HEX("SMT level: shift 1 past the thread bit", 1u, out.eax);
     CHECK_HEX("SMT level: x2APIC id is this vCPU's", 2u, out.edx);
 
-    hype_cpuid_emulate_topo(0xBu, 1u, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(0xBu, 1u, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("core level: type 2", 2u, (out.ecx >> 8) & 0xFFu);
     CHECK_HEX("core level: 4 logical processors", 4u, out.ebx);
     CHECK_HEX("core level: shift 2 past the whole package", 2u, out.eax);
 
-    hype_cpuid_emulate_topo(0xBu, 2u, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(0xBu, 2u, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("level 2 terminates enumeration (ebx 0)", 0u, out.ebx);
     CHECK_HEX("level 2 terminates enumeration (type 0)", 0u, (out.ecx >> 8) & 0xFFu);
 }
@@ -622,10 +631,10 @@ static void test_leaf_b_single_vcpu_is_still_a_consistent_machine(void) {
     hype_cpuid_result_t out;
     hype_cpuid_topology_t topo = {0u, 1u, 1u};
 
-    hype_cpuid_emulate_topo(0xBu, 0u, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(0xBu, 0u, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("1 thread at the SMT level", 1u, out.ebx);
     CHECK_HEX("no shift needed", 0u, out.eax);
-    hype_cpuid_emulate_topo(0xBu, 1u, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(0xBu, 1u, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("1 logical processor at the core level", 1u, out.ebx);
 }
 
@@ -636,12 +645,12 @@ static void test_amd_leaf_8_reports_the_vm_not_the_host(void) {
     hype_cpuid_result_t out;
     hype_cpuid_topology_t topo = {0u, 4u, 1u};
 
-    hype_cpuid_emulate_topo(0x80000008u, 0, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(0x80000008u, 0, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("NC = vcpus - 1", 3u, out.ecx & 0xFFu);
     CHECK_HEX("ApicIdCoreIdSize covers 4 ids", 2u, (out.ecx >> 12) & 0xFu);
 
     topo.vcpu_count = 1u;
-    hype_cpuid_emulate_topo(0x80000008u, 0, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(0x80000008u, 0, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("single vCPU: NC 0", 0u, out.ecx & 0xFFu);
     CHECK_HEX("single vCPU: no core id bits", 0u, (out.ecx >> 12) & 0xFu);
 }
@@ -653,9 +662,9 @@ static void test_topology_leaves_agree_with_each_other(void) {
     hype_cpuid_result_t l1, lb, l8;
     hype_cpuid_topology_t topo = {1u, 8u, 2u};
 
-    hype_cpuid_emulate_topo(1u, 0, 0, &topo, &real, &l1);
-    hype_cpuid_emulate_topo(0xBu, 1u, 0, &topo, &real, &lb);
-    hype_cpuid_emulate_topo(0x80000008u, 0, 0, &topo, &real, &l8);
+    hype_cpuid_emulate_topo(1u, 0, 0, &topo, 0ull, &real, &l1);
+    hype_cpuid_emulate_topo(0xBu, 1u, 0, &topo, 0ull, &real, &lb);
+    hype_cpuid_emulate_topo(0x80000008u, 0, 0, &topo, 0ull, &real, &l8);
     CHECK_HEX("leaf 1 count == leaf 0xB core-level count", (l1.ebx >> 16) & 0xFFu, lb.ebx);
     CHECK_HEX("leaf 1 count == leaf 0x80000008 NC + 1", (l1.ebx >> 16) & 0xFFu,
               (l8.ecx & 0xFFu) + 1u);
@@ -667,13 +676,37 @@ static void test_degenerate_topology_values_do_not_produce_nonsense(void) {
     hype_cpuid_result_t out;
     hype_cpuid_topology_t topo = {0u, 0u, 0u};
 
-    hype_cpuid_emulate_topo(0xBu, 0u, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(0xBu, 0u, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("zero threads_per_core floors at 1", 1u, out.ebx);
-    hype_cpuid_emulate_topo(1u, 0, 0, &topo, &real, &out);
+    hype_cpuid_emulate_topo(1u, 0, 0, &topo, 0ull, &real, &out);
     CHECK_HEX("zero vcpu_count floors at 1", 1u, (out.ebx >> 16) & 0xFFu);
 }
 
+static void test_osxsave_mirrors_guest_cr4(void) {
+    /* The SDM makes CPUID.1:ECX[27] a read-only mirror of CR4.OSXSAVE. Both directions matter:
+     * reporting it set when the guest has not enabled XSAVE state is what killed an OVMF AP,
+     * and reporting it clear when the guest HAS enabled it would make the guest disbelieve its
+     * own successful XSETBV. */
+    hype_cpuid_result_t real = {0x00A00F11u, 0x12345678u, 0xFFFFFFFFu, 0xFFFAFBFFu};
+    hype_cpuid_result_t out;
+    hype_cpuid_topology_t topo = {0u, 1u, 1u};
+
+    hype_cpuid_emulate_topo(1u, 0, 0, &topo, 0ull, &real, &out);
+    CHECK_HEX("CR4.OSXSAVE clear -> bit 27 clear", 0u, out.ecx & (1u << 27));
+
+    hype_cpuid_emulate_topo(1u, 0, 0, &topo, HYPE_CR4_OSXSAVE_BIT, &real, &out);
+    CHECK_HEX("CR4.OSXSAVE set -> bit 27 set", 1u << 27, out.ecx & (1u << 27));
+
+    /* Other CR4 bits must not be mistaken for it. */
+    hype_cpuid_emulate_topo(1u, 0, 0, &topo, 0x668ull, &real, &out);
+    CHECK_HEX("CR4=0x668 (no OSXSAVE) -> bit 27 clear", 0u, out.ecx & (1u << 27));
+
+    /* XSAVE (26) is a real capability and still passes through. */
+    CHECK_HEX("XSAVE(26) still passed through", 1u << 26, out.ecx & (1u << 26));
+}
+
 int main(void) {
+    test_osxsave_mirrors_guest_cr4();
     test_topo_shift_rounds_up();
     test_null_topology_reproduces_the_uniprocessor_report();
     test_leaf1_reports_this_vcpus_apic_id_and_the_vm_count();

@@ -180,13 +180,19 @@ typedef struct {
 uint32_t hype_cpuid_topo_shift(uint32_t n);
 
 /*
- * As hype_cpuid_emulate_ex(), plus the guest-visible topology. `topo` may be 0, which means
- * one vCPU with APIC ID 0 -- exactly what the two entry points above report, so they are thin
- * wrappers over this and every existing caller and test reads unchanged.
+ * As hype_cpuid_emulate_ex(), plus the guest-visible topology and the guest's live CR4.
+ *
+ * `topo` may be 0, meaning one vCPU with APIC ID 0. `guest_cr4` must be THIS vCPU's current
+ * CR4, read at CPUID time rather than cached, because CPUID.1:ECX[27] (OSXSAVE) is defined as
+ * a mirror of CR4.OSXSAVE and the guest changes that at runtime.
  */
 void hype_cpuid_emulate_topo(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
-                             const hype_cpuid_topology_t *topo,
+                             const hype_cpuid_topology_t *topo, uint64_t guest_cr4,
                              const hype_cpuid_result_t *real, hype_cpuid_result_t *out);
+
+/* CR4.OSXSAVE. CPUID.1:ECX[27] is architecturally a MIRROR of this bit, not a capability --
+ * see the leaf-1 handling in cpuid_emulate.c. */
+#define HYPE_CR4_OSXSAVE_BIT (1ull << 18)
 
 /* Where the KVM paravirt leaves live -- 0x40000000 normally, 0x40000100 when the
  * Hyper-V leaves have taken the base. */

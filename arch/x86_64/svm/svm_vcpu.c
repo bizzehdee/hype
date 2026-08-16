@@ -895,8 +895,10 @@ void hype_svm_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
     g_spin_cpuid_rip = real->vmcb->save.rip;
 
     real_cpuid(eax_in, ecx_in, &host_real);
-    hype_cpuid_emulate_topo(eax_in, ecx_in, real->hv_enabled, &real->cpuid_topo, &host_real,
-                            &out); /* SMP-2 */
+    /* SMP-2 topology + the live guest CR4: CPUID.1:ECX[27] mirrors CR4.OSXSAVE, so it has to
+     * be read now rather than cached at vCPU creation. */
+    hype_cpuid_emulate_topo(eax_in, ecx_in, real->hv_enabled, &real->cpuid_topo,
+                            real->vmcb->save.cr4, &host_real, &out);
 
     /* CPUID zero-extends all four registers to their full 64-bit width
      * in 64-bit mode -- assigning a uint32_t into a uint64_t field
