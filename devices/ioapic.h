@@ -71,6 +71,7 @@
 #define HYPE_IOAPIC_RTE_VECTOR_MASK 0x000000FFu
 #define HYPE_IOAPIC_RTE_DELMODE_SHIFT 8
 #define HYPE_IOAPIC_RTE_DELMODE_MASK 0x00000700u
+#define HYPE_IOAPIC_RTE_DESTMODE_LOGICAL (1u << 11) /* 0 = physical APIC ID */
 #define HYPE_IOAPIC_RTE_DELIVERY_STATUS (1u << 12) /* RO */
 #define HYPE_IOAPIC_RTE_REMOTE_IRR (1u << 14)      /* RO, level only */
 #define HYPE_IOAPIC_RTE_TRIGGER_LEVEL (1u << 15)
@@ -119,6 +120,13 @@ int hype_ioapic_mmio_write(hype_ioapic_t *io, uint32_t offset, uint32_t value);
  * is already set. Pure.
  */
 int hype_ioapic_raise(hype_ioapic_t *io, uint32_t gsi, uint8_t *out_vector);
+
+/*
+ * SMP-6/#482: the destination APIC ID an RTE targets (bits 63:56), and whether the entry is in
+ * logical destination mode. Needed to deliver a device interrupt to the vCPU the guest actually
+ * programmed, rather than always to the BSP.
+ */
+uint32_t hype_ioapic_rte_dest(const hype_ioapic_t *io, uint32_t gsi, int *logical_out);
 
 /*
  * Guest signalled EOI for `vector` (its LAPIC broadcasts the EOI to the

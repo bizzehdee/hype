@@ -75,6 +75,28 @@ int hype_ioapic_mmio_write(hype_ioapic_t *io, uint32_t offset, uint32_t value) {
     return -1;
 }
 
+/*
+ * SMP-6/#482: the RTE's destination APIC ID (bits 63:56) and whether it is logical.
+ *
+ * Read separately from hype_ioapic_raise() so the raise path keeps its existing signature and
+ * its Remote-IRR side effects. On a single-vCPU guest every RTE points at APIC ID 0 and this
+ * makes no difference; with an AP present, FreeBSD reprograms RTEs to target it, and delivering
+ * to the BSP regardless means the completion interrupt lands on a CPU that is not waiting for
+ * it. That is what stalled the ATAPI CD at "Root mount waiting for: CAM".
+ */
+uint32_t hype_ioapic_rte_dest(const hype_ioapic_t *io, uint32_t gsi, int *logical_out) {
+    uint64_t entry;
+    if (gsi >= HYPE_IOAPIC_NUM_RTES) {
+        if (logical_out != 0) *logical_out = 0;
+        return 0;
+    }
+    entry = io->rte[gsi];
+    if (logical_out != 0) {
+        *logical_out = (entry & HYPE_IOAPIC_RTE_DESTMODE_LOGICAL) != 0 ? 1 : 0;
+    }
+    return (uint32_t)((entry >> 56) & 0xFFu);
+}
+
 int hype_ioapic_raise(hype_ioapic_t *io, uint32_t gsi, uint8_t *out_vector) {
     uint64_t entry;
     uint32_t delmode;

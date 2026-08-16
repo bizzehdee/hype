@@ -4976,6 +4976,49 @@ static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint6
 static const uint8_t *fw_1_guest_phys_to_host(hype_fw_vm_t *vm, uint64_t gpa);
 
 /* SMP-7 (#191): this VM's shared-device lock. See hype_fw_vm_t.dev_lock_next. */
+
+/*
+ * SMP-6/#482: deliver a device interrupt to the vCPU the guest's IO-APIC RTE actually targets.
+ *
+ * Every device-interrupt path used to inject into g_fw_1_lapic -- the BSP's LAPIC -- regardless
+ * of the RTE's destination field. With one vCPU that is always right. With an AP present,
+ * FreeBSD reprograms RTEs to target it, and the completion then lands on a CPU that is not
+ * waiting for it: the ATAPI CD stalled at "Root mount waiting for: CAM" with reads dropping
+ * from 3899 (1 vCPU) to 282 (2 vCPU).
+ *
+ * Physical mode matches the target's APIC ID; logical mode matches its LDR, the same test
+ * fw_1_route_ipi_from uses. An unmatched destination falls back to the BSP rather than dropping
+ * the interrupt -- losing a device completion is worse than delivering it to the wrong core.
+ */
+static void fw_1_deliver_device_vector(hype_fw_vm_t *vm, hype_vmm_kind_t kind, uint32_t gsi,
+                                       uint8_t vector) {
+    unsigned n = vm->vcpu_count ? vm->vcpu_count : 1u;
+    unsigned t;
+    int logical = 0;
+    uint32_t dest;
+
+    if (n > HYPE_MAX_VCPUS_PER_VM) {
+        n = HYPE_MAX_VCPUS_PER_VM;
+    }
+    dest = hype_ioapic_rte_dest(&vm->ioapic, gsi, &logical);
+    for (t = 0; t < n; t++) {
+        int hit;
+        if (vm->vcpu[t] == 0) {
+            continue;
+        }
+        hit = logical ? ((dest & (vm->lapic[t].ldr >> 24)) != 0u)
+                      : (dest == 0xFFu || dest == (vm->lapic[t].apic_id & 0xFFu));
+        if (!hit) {
+            continue;
+        }
+        /* Pend it on that vCPU's own LAPIC; its dispatch loop injects into its own VMCB. */
+        hype_guest_lapic_post_vector(&vm->lapic[t], vector);
+        return;
+    }
+    hype_guest_lapic_post_vector(&vm->lapic[0], vector);
+    (void)kind;
+}
+
 static void fw_1_dev_lock(hype_fw_vm_t *vm) {
     hype_ticket_lock_acquire(&vm->dev_lock_next, &vm->dev_lock_owner);
 }
@@ -14564,7 +14607,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * device re-raises while PxIS stays pending, so a refusal here costs nothing.
                  */
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
-                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                    fw_1_deliver_device_vector(vm, kind, HYPE_FW_1_AHCI_GSI, iov);
                     g_cd_irq_delivered++;
                     ahci_irqs++;
                 }
