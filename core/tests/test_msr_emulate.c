@@ -37,12 +37,29 @@ static void test_unknown_msr_rejected_both_directions(void) {
 }
 
 static void test_apic_base_value(void) {
-    uint64_t value = hype_msr_apic_base_value();
+    uint64_t value = hype_msr_apic_base_value(1);
 
     CHECK_HEX("base address bits", 0xFEE00000ULL, value & 0xFFFFF000ULL);
     CHECK_HEX("global enable bit set", 1, (value & (1ULL << 11)) != 0);
     CHECK_HEX("BSP bit set", 1, (value & (1ULL << 8)) != 0);
     CHECK_HEX("x2APIC bit clear", 0, (value & (1ULL << 10)) != 0);
+}
+
+/*
+ * #190: an AP must report BSP=0. edk2's PEI MpInitLib branches on this bit to
+ * choose between the HOB path (BSP) and reading CpuMpData off the AP's own
+ * stack. An AP told BSP=1 takes the HOB path, which needs PEI services it
+ * cannot reach, and faults. hype returned a hardcoded BSP=1 for every vCPU.
+ */
+static void test_apic_base_value_ap(void) {
+    uint64_t bsp = hype_msr_apic_base_value(1);
+    uint64_t ap = hype_msr_apic_base_value(0);
+
+    CHECK_HEX("AP base address bits", 0xFEE00000ULL, ap & 0xFFFFF000ULL);
+    CHECK_HEX("AP global enable bit set", 1, (ap & (1ULL << 11)) != 0);
+    CHECK_HEX("AP BSP bit CLEAR", 0, (ap & (1ULL << 8)) != 0);
+    CHECK_HEX("AP x2APIC bit clear", 0, (ap & (1ULL << 10)) != 0);
+    CHECK_HEX("BSP and AP differ only in bit 8", (1ULL << 8), bsp ^ ap);
 }
 
 /*
@@ -170,6 +187,7 @@ int main(void) {
     test_tsc_read_allowed_write_rejected();
     test_unknown_msr_rejected_both_directions();
     test_apic_base_value();
+    test_apic_base_value_ap();
     test_hv_msrs_rejected_when_hv_disabled();
     test_hv_os_id_and_hypercall_are_readwrite();
     test_hv_counters_are_read_only();

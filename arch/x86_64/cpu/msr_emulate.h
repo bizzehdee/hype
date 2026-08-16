@@ -54,7 +54,7 @@ typedef enum {
      * to treat as fatal, matching every other fail-closed handler
      * here. */
     HYPE_MSR_ACTION_REJECT = 0,
-    /* Read-only: return hype_msr_apic_base_value()'s fixed value. */
+    /* Read-only: return hype_msr_apic_base_value()'s value for this vCPU. */
     HYPE_MSR_ACTION_READ_APIC_BASE,
     /* Read/write: route directly to/from the VMCB's own
      * save.efer field (already the guest's tracked EFER state --
@@ -136,7 +136,18 @@ hype_msr_action_t hype_msr_decide_ex(uint32_t msr_number, int is_write, int hv_e
  * (xAPIC only so far). Pure computation, no CPU access -- fully unit
  * tested.
  */
-uint64_t hype_msr_apic_base_value(void);
+/*
+ * #190: `is_bsp` drives bit 8, the BSP flag. It is NOT cosmetic. edk2's PEI
+ * MpInitLib branches on it to decide how to find CpuMpData:
+ *
+ *   if (ApicBaseMsr.Bits.BSP == 1)  CpuMpData = GetCpuMpDataFromGuidedHob();
+ *   else                            CpuMpData = ApStackData->MpData;
+ *
+ * The HOB path needs PEI services, which an AP cannot reach -- the shared AP
+ * IDT has no PEI Services pointer below it. An AP told BSP=1 therefore takes
+ * the BSP branch and faults on a null service table.
+ */
+uint64_t hype_msr_apic_base_value(int is_bsp);
 
 /*
  * Convert a TSC delta into Hyper-V reference-counter units (100ns ticks), given the

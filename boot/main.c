@@ -4974,6 +4974,7 @@ static void fw_1_dev_unlock(hype_fw_vm_t *vm) {
 }
 
 /* SMP-6: set by an AP vCPU loop while it owns its vCPU; read by the BSP's INIT/SIPI path. */
+static uint8_t g_ap_apdata_dumped[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 
 /*
@@ -5387,7 +5388,7 @@ static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
      * consistency (the value read back is a plausible 64-bit-mode EFER
      * -- SVME/LME/LMA all set) rather than an external oracle. */
     {
-        uint64_t apic_base_expected = hype_msr_apic_base_value();
+        uint64_t apic_base_expected = hype_msr_apic_base_value(1); /* selftest runs on the BSP */
         uint32_t got_apic_eax = (uint32_t)g_cpumsr_1_result_buf[48] |
                                  ((uint32_t)g_cpumsr_1_result_buf[49] << 8) |
                                  ((uint32_t)g_cpumsr_1_result_buf[50] << 16) |
@@ -13020,6 +13021,54 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
                             (unsigned long long)g_ap_vcpu_last_reason[_vmi][_av],
                             (unsigned long long)g_ap_vcpu_last_rip[_vmi][_av]);
+                    /*
+                     * SMP-6: dump the AP's dispatch record ONCE on the normal path, not only
+                     * at a fault. The DEBUG guest firmware names its modules but does not
+                     * reproduce the fault (it is timing-sensitive), so a fault-only probe can
+                     * never be correlated with those names. Printing ApFunction here lets a
+                     * DEBUG run say which module owns it.
+                     *
+                     * CpuMpData is IDTR.BASE + LIMIT + 1; CpuInfoInHob is its first field;
+                     * CPU_AP_DATA is 0xD8 and the array sits directly before CpuInfoInHob.
+                     * Idtr.Base inside the record is the self-check.
+                     */
+                    for (_av = 1u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
+                        hype_svm_debug_state_t ad;
+                        if (g_ap_vcpu_exits[_vmi][_av] < 200ull ||
+                            g_ap_apdata_dumped[_vmi][_av] || vm->vcpu[_av] == 0) {
+                            continue;
+                        }
+                        if (!vmm_get_debug_state(kind, vm->vcpu[_av], &ad) ||
+                            ad.idtr_base == 0ull) {
+                            continue;
+                        }
+                        {
+                            uint64_t mpd = ad.idtr_base + (uint64_t)ad.idtr_limit + 1ull;
+                            const uint8_t *mh = fw_1_guest_phys_to_host(vm, mpd);
+                            uint64_t hob = 0;
+                            unsigned k4;
+                            if (mh == 0) continue;
+                            for (k4 = 0; k4 < 8u; k4++) hob |= (uint64_t)mh[k4] << (8u * k4);
+                            if (hob <= 0x1B0ull) continue;
+                            {
+                                const uint8_t *dd = fw_1_guest_phys_to_host(vm, hob - 0xD8ull);
+                                uint64_t apfn = 0, idtb = 0;
+                                if (dd == 0) continue;
+                                for (k4 = 0; k4 < 8u; k4++) {
+                                    apfn |= (uint64_t)dd[0x10u + k4] << (8u * k4);
+                                    idtb |= (uint64_t)dd[0x7Cu + k4] << (8u * k4);
+                                }
+                                g_ap_apdata_dumped[_vmi][_av] = 1u;
+                                hype_debug_print("fw-1 APVCPU vm%u/%u APFN: ApFunction=0x%llx "
+                                                 "IdtrBase=0x%llx (expect 0x%llx) exits=%llu "
+                                                 "[#190]\n", _vmi, _av,
+                                                 (unsigned long long)apfn,
+                                                 (unsigned long long)idtb,
+                                                 (unsigned long long)ad.idtr_base,
+                                                 g_ap_vcpu_exits[_vmi][_av]);
+                            }
+                        }
+                    }
                     }
                 }
 #if HYPE_RUN_TWO_VMS

@@ -58,8 +58,13 @@ hype_msr_action_t hype_msr_decide_ex(uint32_t msr_number, int is_write, int hv_e
     return HYPE_MSR_ACTION_REJECT;
 }
 
-uint64_t hype_msr_apic_base_value(void) {
-    return HYPE_LAPIC_DEFAULT_BASE | (1ULL << 11) | (1ULL << 8);
+uint64_t hype_msr_apic_base_value(int is_bsp) {
+    /* bit 11 = global enable (always), bit 8 = BSP (vCPU 0 only -- see the header). */
+    uint64_t value = HYPE_LAPIC_DEFAULT_BASE | (1ULL << 11);
+    if (is_bsp) {
+        value |= (1ULL << 8);
+    }
+    return value;
 }
 
 uint64_t hype_msr_hv_ref_count_from_tsc(uint64_t tsc_delta, uint64_t tsc_khz) {

@@ -2059,7 +2059,7 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     }
 
     case HYPE_MSR_ACTION_READ_APIC_BASE: {
-        uint64_t value = hype_msr_apic_base_value();
+        uint64_t value = hype_msr_apic_base_value(real->cpuid_topo.apic_id == 0u);
         real->vmcb->save.rax = (uint64_t)(uint32_t)value;
         real->gprs[2] = (uint64_t)(uint32_t)(value >> 32); /* RDX */
         break;
