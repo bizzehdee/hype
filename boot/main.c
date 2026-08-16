@@ -11402,11 +11402,16 @@ wait_for_sipi:
                         if (after != 0ull) {
                             const uint8_t *mp = fw_1_guest_phys_to_host(vm, after);
                             if (mp != 0) {
-                                uint64_t f[5];
+                                uint64_t f[6];
                                 unsigned q;
-                                static const unsigned offs[5] = {0x08u, 0x18u, 0x28u,
-                                                                 0xB8u, 0xC0u};
-                                for (q = 0; q < 5u; q++) {
+                                /* 0xFC = InitFlag (AP_INIT_STATE: ApInitConfig=1,
+                                 * ApInitDone=2 -- any other value means the offset is wrong).
+                                 * It selects which branch ApWakeupFunction takes, so it says
+                                 * whether the AP was in first-wakeup config or dispatching a
+                                 * per-CPU ApFunction. */
+                                static const unsigned offs[6] = {0x08u, 0x18u, 0x28u,
+                                                                 0xB8u, 0xC0u, 0xFCu};
+                                for (q = 0; q < 6u; q++) {
                                     unsigned b;
                                     f[q] = 0;
                                     for (b = 0; b < 8u; b++) {
@@ -11416,13 +11421,15 @@ wait_for_sipi:
                                 hype_debug_print("fw-1 APVCPU vm%u/%u MPSTRUCT @0x%llx: "
                                                  "CpuCount/Bsp=0x%llx Buffer=0x%llx "
                                                  "StackSize=0x%llx Procedure=0x%llx "
-                                                 "ProcArgs=0x%llx [#190]\n", vm_idx, vi,
+                                                 "ProcArgs=0x%llx InitFlag=0x%llx [#190]\n",
+                                                 vm_idx, vi,
                                                  (unsigned long long)after,
                                                  (unsigned long long)f[0],
                                                  (unsigned long long)f[1],
                                                  (unsigned long long)f[2],
                                                  (unsigned long long)f[3],
-                                                 (unsigned long long)f[4]);
+                                                 (unsigned long long)f[4],
+                                                 (unsigned long long)f[5]);
                                 /* The invariants above did not hold, so the struct base is not
                                  * where it was computed. Dump the raw window and let the known
                                  * values (a small CpuCount, a page-aligned Buffer) locate it
