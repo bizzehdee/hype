@@ -11478,6 +11478,44 @@ wait_for_sipi:
                                         }
                                     }
                                 }
+                                /*
+                                 * SMP-6: CpuData[1] -- the per-CPU record the AP dispatches
+                                 * from. CPU_AP_DATA is 0xD8 bytes and CpuInfoInHob sits
+                                 * directly after the array, so CpuData is DERIVED rather than
+                                 * read through an offset guessed past MTRR_SETTINGS.
+                                 *   +0x10 ApFunction  +0x18 ApFunctionArgument
+                                 *   +0x24 State (CPU_STATE: 0..4)
+                                 *   +0x7C VolatileRegisters.Idtr.Base
+                                 * Idtr.Base is the self-check: it must equal the AP IDT base
+                                 * already read from the VMCB, or the stride is wrong and
+                                 * ApFunction means nothing.
+                                 */
+                                if (mpinfo_hob > 0x1B0ull) {
+                                    uint64_t cd = mpinfo_hob - 0xD8ull;
+                                    const uint8_t *d1 = fw_1_guest_phys_to_host(vm, cd);
+                                    if (d1 != 0) {
+                                        uint64_t apfn = 0, aparg = 0, idtb = 0;
+                                        uint32_t st = 0;
+                                        unsigned k3;
+                                        for (k3 = 0; k3 < 8u; k3++) {
+                                            apfn |= (uint64_t)d1[0x10u + k3] << (8u * k3);
+                                            aparg |= (uint64_t)d1[0x18u + k3] << (8u * k3);
+                                            idtb |= (uint64_t)d1[0x7Cu + k3] << (8u * k3);
+                                        }
+                                        for (k3 = 0; k3 < 4u; k3++) {
+                                            st |= (uint32_t)d1[0x24u + k3] << (8u * k3);
+                                        }
+                                        hype_debug_print("fw-1 APVCPU vm%u/%u APDATA[1] @0x%llx: "
+                                                         "ApFunction=0x%llx Arg=0x%llx State=%u "
+                                                         "IdtrBase=0x%llx (expect 0x%llx) [#190]\n",
+                                                         vm_idx, vi, (unsigned long long)cd,
+                                                         (unsigned long long)apfn,
+                                                         (unsigned long long)aparg,
+                                                         (unsigned)st,
+                                                         (unsigned long long)idtb,
+                                                         (unsigned long long)d.idtr_base);
+                                    }
+                                }
                                 /* The invariants above did not hold, so the struct base is not
                                  * where it was computed. Dump the raw window and let the known
                                  * values (a small CpuCount, a page-aligned Buffer) locate it
