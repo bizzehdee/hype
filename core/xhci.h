@@ -681,6 +681,16 @@ typedef struct {
     unsigned int route;        /* xHCI Route String; 0 = directly on the root port */
     unsigned int slot;         /* xHCI slot id, 0 if the slot was released */
     unsigned int speed;        /* PORTSC/hub speed id */
+    /*
+     * #218: the Transaction Translator this device reaches its bus through, or 0 when it
+     * needs none (a direct, HS or SS device). A LS/FS device behind a HS hub can only be
+     * talked to through split transactions, and the slot context carries the TT that routes
+     * them. Recorded here because EVERY later command that re-provides the slot context --
+     * Configure Endpoint in particular -- must supply the SAME TT, and a claim path that
+     * cannot look it up ends up passing zero and silently unrouting the device.
+     */
+    unsigned int tt_hub_slot;
+    unsigned int tt_port;
     uint16_t vid;
     uint16_t pid;
     uint8_t dev_class;         /* bDeviceClass from the device descriptor */

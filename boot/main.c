@@ -1396,6 +1396,8 @@ static uint8_t fw_1_usb_record(hype_usb_inventory_t *inv, unsigned int controlle
     di.route = path->route;
     di.slot = slot;
     di.speed = path->speed;
+    di.tt_hub_slot = path->tt_hub_slot; /* #218 */
+    di.tt_port = path->tt_port;
     di.vid = (uint16_t)(devdesc[8] | (devdesc[9] << 8));
     di.pid = (uint16_t)(devdesc[10] | (devdesc[11] << 8));
     di.dev_class = devdesc[4];
@@ -1459,8 +1461,22 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, con
                 hpath.root_port = d->root_port;
                 hpath.route = d->route;
                 hpath.speed = d->speed;
-                hpath.tt_hub_slot = 0u;
-                hpath.tt_port = 0u;
+                /*
+                 * #218: re-provide the SAME Transaction Translator the device was addressed
+                 * with. This used to pass 0, which unrouted every LS/FS device behind a HS
+                 * hub at the moment its endpoint was configured: Address Device set the TT
+                 * correctly during hub descent, then Configure Endpoint overwrote the slot
+                 * context without it.
+                 *
+                 * Measured on the operator's 5950X, where the keyboard and mouse are both
+                 * full-speed behind a high-speed hub: "USB keyboard CLAIMED ... ep=0x81" and
+                 * then "HID polls=2455 reports=0" -- the transfer was armed and rung, and no
+                 * completion ever came, because the controller had no TT to split through.
+                 * The high-speed webcam on the same hub was unaffected, which is what pointed
+                 * at speed rather than at the hub.
+                 */
+                hpath.tt_hub_slot = d->tt_hub_slot;
+                hpath.tt_port = d->tt_port;
                 if (hype_xhci_configure_int_in_endpoint(xc, d->slot, &hpath, hid.int_in_ep,
                                                         hid.mps, hid.interval) == 0) {
                     *xc_out = *xc;
