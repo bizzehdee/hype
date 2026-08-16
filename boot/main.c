@@ -8472,9 +8472,14 @@ static int fw_1_debug_line_wanted(const char *line) {
 /* FW-1g: feed one byte of the guest's OVMF debug-io-port (0x402) log to
  * hype's console, a line at a time, tagged so it's distinguishable from
  * the guest's ConOut console and hype's own output. Debug text is plain
- * ASCII, but reuse the VT filter for safety. */
-static void fw_1_debug_feed(hype_vt_filter_t *filter, char *line, unsigned int *line_len,
-                             unsigned int line_cap, uint8_t byte) {
+ * ASCII, but reuse the VT filter for safety.
+ *
+ * #190: carries the vm index, like the "vmN ttyS0|" and "vmN screen|" records
+ * do. Without it a two-VM run interleaves both firmwares into one anonymous
+ * stream -- which made "BootCpuCount=1" and "BootCpuCount=2" appear in the
+ * same log with no way to say which guest reported which. */
+static void fw_1_debug_feed(unsigned vm_idx, hype_vt_filter_t *filter, char *line,
+                             unsigned int *line_len, unsigned int line_cap, uint8_t byte) {
     char c;
     if (!hype_vt_filter(filter, byte, &c)) {
         return;
@@ -8483,14 +8488,14 @@ static void fw_1_debug_feed(hype_vt_filter_t *filter, char *line, unsigned int *
         line[*line_len] = '\0';
         g_dbgport_lines++;
         if (fw_1_debug_line_wanted(line)) {
-            hype_debug_print("fw-1 ovmf-dbg| %s\n", line);
+            hype_debug_print("fw-1 vm%u ovmf-dbg| %s\n", vm_idx, line);
         }
         *line_len = 0;
         return;
     }
     if (*line_len >= line_cap - 1) {
         line[*line_len] = '\0';
-        hype_debug_print("fw-1 ovmf-dbg| %s\n", line);
+        hype_debug_print("fw-1 vm%u ovmf-dbg| %s\n", vm_idx, line);
         *line_len = 0;
     }
     line[(*line_len)++] = c;
@@ -15812,8 +15817,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     g_dbgport_writes++;
                     g_dbgport_bytes += dbg_n;
                     for (dbi = 0; dbi < dbg_n; dbi++) {
-                        fw_1_debug_feed(&dbg_filter, dbg_line, &dbg_line_len, FW_1_LINE_BUF,
-                                        dbg_bytes[dbi]);
+                        fw_1_debug_feed((unsigned)(vm - g_vms), &dbg_filter, dbg_line,
+                                        &dbg_line_len, FW_1_LINE_BUF, dbg_bytes[dbi]);
                     }
                     continue;
                 }
