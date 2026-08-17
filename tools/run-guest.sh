@@ -140,10 +140,13 @@ SFDISK
     fi
     # HYPE_DISK=<path> drops a raw disk image at \hype\disks\<basename>, which a hype.cfg
     # `[disk.*] backing = file` entry can then point at.
+    # Several images may be given, space separated, for a multi-disk config (#329).
     if [ -n "${HYPE_DISK:-}" ]; then
         mmd -i "$ESP@@1M" ::/hype 2>/dev/null || true
         mmd -i "$ESP@@1M" ::/hype/disks 2>/dev/null || true
-        mcopy -i "$ESP@@1M" "$HYPE_DISK" "::/hype/disks/$(basename "$HYPE_DISK")"
+        for _d in $HYPE_DISK; do
+            mcopy -i "$ESP@@1M" "$_d" "::/hype/disks/$(basename "$_d")"
+        done
     fi
     sync "$ESP"
 
