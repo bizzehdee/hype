@@ -13414,12 +13414,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
 
 #if HYPE_513_PANIC_AT
-        /* #513 fault injection: see the knob's comment at its #define. */
+        /* #513 fault injection: see the knob's comment at its #define. A real #PF (read of an
+         * unmapped address), not a hype_fatal() call, so the injected failure exercises the
+         * SAME path as the hardware panic: ISR -> unhandled -> stack-word dump -> flush hook. */
         if (vm == &g_vms[0] && g_fw_1_host_tsc_hz != 0 &&
             (hype_rdtsc() - perf_boot_start_tsc) / g_fw_1_host_tsc_hz >=
                 (uint64_t)HYPE_513_PANIC_AT) {
-            hype_fatal("fw-1 #513 INJECTED PANIC at %us -- fault injection, not a bug; this text "
-                       "must appear at the END of \\HYPE.LOG", (unsigned)HYPE_513_PANIC_AT);
+            hype_debug_print("fw-1 #513 INJECTING #PF at %us -- fault injection, not a bug; the "
+                             "PANIC line plus stack words must reach \\HYPE.LOG\n",
+                             (unsigned)HYPE_513_PANIC_AT);
+            (void)*(volatile uint64_t *)(uintptr_t)0xdead0000000ull;
         }
 #endif
 #if HYPE_363_WEDGE_VM0

@@ -100,7 +100,7 @@ static unsigned int isr_this_apic(void) {
 }
 
 void hype_isr_dispatch(const hype_isr_frame_t *frame) {
-    char msg[320]; /* #461: the message now carries the core, the stack and the halt note. */
+    char msg[768]; /* #461/#513: core + registers + halt note + raw stack words. */
     hype_isr_handler_fn handler;
     unsigned int apic;
 
@@ -115,5 +115,29 @@ void hype_isr_dispatch(const hype_isr_frame_t *frame) {
      * path itself dies painting the framebuffer. */
     hype_fatal_note_core_panic(apic);
     hype_isr_format_message(msg, sizeof(msg), frame, apic);
+    /*
+     * #513: append the interrupted context's raw stack words -- the poor man's backtrace. The
+     * return addresses in them (0x140xxxxxx values against the image base) name the dying call
+     * chain, which the registers alone do not: the first hardware panic this bought was a #PF
+     * inside the shared formatter, where RIP says "%s handler" and only the caller says WHOSE
+     * string was garbage.
+     *
+     * Deliberately reads UPWARD from frame->rsp only, without following the RBP chain: the CPU
+     * just pushed the exception frame at rsp, so [rsp .. rsp+N) is this core's own live, mapped
+     * stack (the caller's frames), while chasing frame pointers on a possibly-corrupt stack can
+     * fault -- and a second fault here recurses into this dispatcher BEFORE hype_fatal's
+     * re-entry latch is armed, turning a readable panic into a stack-exhausting fault storm.
+     */
+    {
+        unsigned long long off = 0;
+        unsigned w;
+        while (msg[off] != '\0') off++;
+        off += hype_snprintf(msg + off, sizeof(msg) - off, " | stack@0x%llx:",
+                             (unsigned long long)frame->rsp);
+        for (w = 0; w < 24u && off + 18u < sizeof(msg); w++) {
+            off += hype_snprintf(msg + off, sizeof(msg) - off, " %llx",
+                                 (unsigned long long)((volatile uint64_t *)(uintptr_t)frame->rsp)[w]);
+        }
+    }
     hype_fatal("%s", msg);
 }
