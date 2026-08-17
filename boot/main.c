@@ -1969,6 +1969,13 @@ static void term_run_cmdline(void) {
     int idx;
     hype_cmd_parse_at(g_cmdline, &c); /* fill-in-place: no by-value copy in freestanding code */
     idx = term_resolve_vm(c.arg);
+    /* TERM-14: every executed command line, in the log. The result panel is pixels-only, so a
+     * scripted validation run (QMP sendkey, no display) could not tell a mistyped command from
+     * a failing one -- exactly the blindness that cost a rig cycle proving `set`. */
+    if (c.verb != HYPE_CMD_NONE) {
+        hype_debug_print("fw-1 TERMCMD: '%s' -> verb=%d arg='%s' [#490]\n", g_cmdline,
+                         (int)c.verb, c.has_arg ? c.arg : "");
+    }
     const char *nm = (idx >= 0) ? g_vms[idx].name : (c.has_arg ? c.arg : "?");
 
     /* Each command's output replaces the last -- the panel is a result, not a scrollback. */
@@ -20343,6 +20350,7 @@ static void term_set_cmd(int idx, const char *nm, const char *key, const char *v
     if (!found) {
         term_resultf("set: unknown key '%s' (vcpus mem_mb boot install_media media_disk "
                      "target_disk firmware os_hint net_mode label)", key);
+        hype_debug_print("fw-1 SET vm%d: REFUSED unknown key '%s' [#490]\n", idx, key);
         return;
     }
     sr = hype_cfg_serialize(&g_hype_cfg, text, sizeof(text));
@@ -20429,6 +20437,7 @@ static void term_set_cmd(int idx, const char *nm, const char *key, const char *v
     if (check.vm_count != g_hype_cfg.vm_count ||
         (check.vms[idx].seen_fields & bit) == 0u) {
         term_resultf("set: the parser did not accept '%s = %s' -- nothing changed", key, value);
+        hype_debug_print("fw-1 SET vm%d: REFUSED '%s = %s' (parser) [#490]\n", idx, key, value);
         return;
     }
     /* Write-at-once through the verified boot volume. NO log-sink fallback (see above). */

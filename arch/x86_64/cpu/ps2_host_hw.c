@@ -64,11 +64,24 @@ void hype_host_kbd_init(void) {
 }
 
 void hype_host_kbd_isr(const hype_isr_frame_t *frame) {
-    uint8_t scancode = inb(HYPE_PS2_HOST_PORT_DATA);
+    /*
+     * #490: check OBF before reading. Reading port 0x60 with the output buffer EMPTY returns
+     * the PREVIOUS byte again -- and the buffer can legitimately be empty here, because the
+     * #218 poll path races this ISR for each byte and sometimes wins. The unconditional read
+     * pushed that stale repeat as a fresh scancode, doubling keystrokes on every host whose
+     * IRQ1 works (measured: 'sseett  aa  llaabbeell' typed as 'set a label'). A status of
+     * 0xFF is the floating bus, same as the poll path treats it.
+     */
+    uint8_t st = inb(HYPE_PS2_HOST_PORT_STATUS);
     (void)frame;
     g_kbd_isr_entries++;
     g_kbd_isr_last_apic = kbd_this_apic();
-    hype_host_kbd_buffer_push(&g_host_kbd_buffer, scancode);
+    if (st != 0xFFu && (st & HYPE_PS2_HOST_STATUS_OBF) != 0u) {
+        uint8_t scancode = inb(HYPE_PS2_HOST_PORT_DATA);
+        if ((st & HYPE_PS2_HOST_STATUS_AUX) == 0u) {
+            hype_host_kbd_buffer_push(&g_host_kbd_buffer, scancode);
+        } /* else: mouse byte -- consumed so it cannot wedge the keyboard stream, dropped */
+    }
     hype_pic_send_eoi(HYPE_HOST_KBD_IRQ);
     g_kbd_isr_eois++;
 }
@@ -94,8 +107,18 @@ void hype_host_kbd_isr(const hype_isr_frame_t *frame) {
 static void host_kbd_drain_polled(void) {
     unsigned guard;
     for (guard = 0; guard < 8u; guard++) {
-        uint8_t st = inb(HYPE_PS2_HOST_PORT_STATUS);
+        uint8_t st;
         uint8_t data;
+        /*
+         * #490: the status+data pair must be atomic against hype_host_kbd_isr -- IRQ1 landing
+         * BETWEEN them consumes the byte in the ISR, and the poll's data read then returns the
+         * previous byte again, pushed as a duplicate. Measured as the FIRST keystroke of a run
+         * doubling even after the ISR gained its own OBF check. Interrupts are masked only
+         * around the two port reads.
+         */
+        unsigned long long flags;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags)::"memory");
+        st = inb(HYPE_PS2_HOST_PORT_STATUS);
         /*
          * 0xFF is the floating bus -- no i8042 is answering at all. Bit 0 of 0xFF is SET, so a
          * naive OBF test reads "data is waiting" forever and returns 0xFF as a scancode every
@@ -106,12 +129,15 @@ static void host_kbd_drain_polled(void) {
          */
         if (st == 0xFFu) {
             g_kbd_no_controller = 1u;
+            __asm__ volatile("pushq %0; popfq" ::"r"(flags) : "memory", "cc");
             return;
         }
         if ((st & HYPE_PS2_HOST_STATUS_OBF) == 0u) {
+            __asm__ volatile("pushq %0; popfq" ::"r"(flags) : "memory", "cc");
             return; /* nothing waiting -- the normal exit */
         }
         data = inb(HYPE_PS2_HOST_PORT_DATA);
+        __asm__ volatile("pushq %0; popfq" ::"r"(flags) : "memory", "cc");
         if (data == 0xFFu && (st & HYPE_PS2_HOST_STATUS_AUX) == 0u) {
             /* A keyboard never sends 0xFF as a make/break code; it is the floating bus again,
              * or a controller error byte. Consume it and stop rather than feed it upstream. */
@@ -138,6 +164,16 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
      */
     if (g_kbd_no_controller) {
         return 0;
+    }
+    /*
+     * #490: the poll exists ONLY for hosts whose IRQ1 never fires (#218's real-hardware case:
+     * isr_entries=0 across whole runs). On a host where IRQ1 WORKS, poll and ISR race for each
+     * byte, and the loser's read of port 0x60 returns the previous byte again -- measured as
+     * every keystroke doubling ('sseett  aa  llaabbeell') on the QEMU rig, and reported by the
+     * operator on the laptop. One taken IRQ1 proves the interrupt path works; stop polling.
+     */
+    if (g_kbd_isr_entries != 0u) {
+        return hype_host_kbd_buffer_pop(&g_host_kbd_buffer, out_scancode);
     }
     if (g_kbd_drain_busy) {
         return 0; /* re-entered from within the caller's own drain loop */
