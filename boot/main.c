@@ -167,6 +167,15 @@ int hype_vmx_smoke_test(void);
  * never returns, so "the operator keeps the dashboard and keyboard when a guest wedges" can be
  * TESTED rather than waited for. 0 = off, which is the shipping default. See the injection site
  * in run_fw_1_test for why a PAUSE spin is a harsher test than the failure it stands in for. */
+/*
+ * #513 fault injection: hype_fatal() on the vm0 dispatch core, N seconds in. The claim under
+ * test -- "a panic's text reaches the on-stick log via the flush hook" -- cannot be validated
+ * by a healthy run, and the real panic only occurs on the cold-boot-only laptop. Same
+ * manufacture-the-failure shape as HYPE_363_WEDGE_VM0 below.
+ */
+#ifndef HYPE_513_PANIC_AT
+#define HYPE_513_PANIC_AT 0
+#endif
 #ifndef HYPE_363_WEDGE_VM0
 #define HYPE_363_WEDGE_VM0 0
 #endif
@@ -270,6 +279,7 @@ static int g_209_reads_passed;
 /* #230: USB debug-log sink helpers (defined just above efi_main); forward-
  * declared here because the post-EBS run loop appears above the definition. */
 static void usb_log_flush(void);
+static void usb_log_fatal_flush(void); /* #513: registered as the panic flush hook */
 /* USB-5 (#217): defined with the other USB globals, used by the FW-1 dispatch loop and
  * the #233 confirm gate, both of which appear earlier in this file. */
 static unsigned int usb_hid_drain(void);
@@ -13403,6 +13413,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             perf_boot_start_tsc = hype_rdtsc(); /* PERF-1a wall-clock base */
         }
 
+#if HYPE_513_PANIC_AT
+        /* #513 fault injection: see the knob's comment at its #define. */
+        if (vm == &g_vms[0] && g_fw_1_host_tsc_hz != 0 &&
+            (hype_rdtsc() - perf_boot_start_tsc) / g_fw_1_host_tsc_hz >=
+                (uint64_t)HYPE_513_PANIC_AT) {
+            hype_fatal("fw-1 #513 INJECTED PANIC at %us -- fault injection, not a bug; this text "
+                       "must appear at the END of \\HYPE.LOG", (unsigned)HYPE_513_PANIC_AT);
+        }
+#endif
 #if HYPE_363_WEDGE_VM0
         /*
          * #363 fault injection: stop vm0's core dead, N seconds in, and never return.
@@ -19985,6 +20004,15 @@ typedef struct {
 
 static int g_usb_log_ready;
 static int g_usb_log_flush_failed; /* emitted once, not every interval */
+/*
+ * #513: consecutive combined-sink flush failures. One transient USB error used to disable
+ * \HYPE.LOG permanently -- both 2026-08-17 hardware runs lost it at the byte where vm1's ISO
+ * stream attached to the SAME medium, so every later hype-side record (including the panic this
+ * ticket exists for) had nowhere to go. Retry each interval; give up only when the failure is
+ * persistent.
+ */
+static unsigned int g_usb_log_flush_fail_streak;
+#define HYPE_USBLOG_FAIL_STREAK_MAX 64u
 static usblog_ctx_t g_usb_log_ctx;
 /* #374: live BSP-slice evidence. Source bytes count capture-buffer progress
  * across the combined and split sinks; time includes FAT and USB work. */
@@ -21128,6 +21156,7 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
         if (rc == HYPE_LOG_SINK_OK) {
             g_hype_log_ready = 1;
             g_usb_log_ready = 1; /* "a log sink is up", the gate the flush path uses */
+            hype_fatal_set_flush_hook(usb_log_fatal_flush); /* #513: a panic must reach the stick */
             hype_debug_print("usb-log: \\HYPE.LOG + per-VM logs on FAT32 at disk LBA %llu; "
                              "\\HYPEFULL.LOG is retired -- merge the split files by their "
                              "[offset] prefix to recover the combined stream [#338]\n",
@@ -21231,14 +21260,29 @@ static void usb_log_flush_limit(unsigned int max_source_bytes) {
      * project real time more than once. Report the first failure only: it repeats
      * every interval. The report remains visible on serial and the live display
      * even though the failed USB sink cannot persist it. */
-    if (g_hype_log_ready &&
-        hype_log_sink_flush_budget(&g_hype_log, max_source_bytes) != 0 &&
-        !g_usb_log_flush_failed) {
-        g_usb_log_flush_failed = 1;
-        g_hype_log_ready = 0;
-        hype_debug_print("usb-log: FLUSH FAILED -- \\HYPE.LOG has stopped growing and is "
-                         "now INCOMPLETE. hype itself is unaffected; this is the USB block path "
-                         "(xHCI/MSC). Photograph the live display if more evidence is needed.\n");
+    if (g_hype_log_ready && hype_log_sink_flush_budget(&g_hype_log, max_source_bytes) != 0) {
+        /* #513: retry, do not latch off. The old first-error disable turned one transient USB
+         * error (measured: the flush racing vm1's ISO-stream attach on the same medium) into a
+         * permanently silent \HYPE.LOG, which then could not carry even its own failure report
+         * -- the per-VM sinks are guest-filtered. Give up only on a persistent failure. */
+        g_usb_log_flush_fail_streak++;
+        if (!g_usb_log_flush_failed) {
+            g_usb_log_flush_failed = 1;
+            hype_debug_print("usb-log: FLUSH FAILED -- retrying each interval; \\HYPE.LOG is "
+                             "INCOMPLETE until a retry succeeds. hype itself is unaffected; this "
+                             "is the USB block path (xHCI/MSC).\n");
+        }
+        if (g_usb_log_flush_fail_streak >= HYPE_USBLOG_FAIL_STREAK_MAX) {
+            g_hype_log_ready = 0;
+            hype_debug_print("usb-log: %u consecutive flush failures -- \\HYPE.LOG has stopped "
+                             "growing for good. Photograph the live display if more evidence is "
+                             "needed.\n", HYPE_USBLOG_FAIL_STREAK_MAX);
+        }
+    } else if (g_hype_log_ready && g_usb_log_flush_fail_streak != 0u) {
+        hype_debug_print("usb-log: flush RECOVERED after %u failed interval(s) -- \\HYPE.LOG is "
+                         "growing again (a gap may precede this line).\n",
+                         g_usb_log_flush_fail_streak);
+        g_usb_log_flush_fail_streak = 0u;
     }
 
     /*
@@ -21342,6 +21386,29 @@ static void usb_log_flush_slice(void) {
     g_usb_log_slice_tsc += dt;
     if (dt > g_usb_log_slice_max_tsc) g_usb_log_slice_max_tsc = dt;
     if (after >= before) g_usb_log_slice_source_bytes += after - before;
+}
+
+/*
+ * #513: a panicking core's last act -- push the captured log (which now ends with the PANIC
+ * text) out to the USB sinks. fatal.c has carried this hook since #338, with a comment saying
+ * boot/main.c registers it; nothing ever did, so both 2026-08-17 hardware panics left every
+ * on-stick log ending mid-run and the panic text existing only on the frozen screen.
+ *
+ * Only the core that owns the USB/FAT state may flush (the #239 rule -- and the guard below is
+ * the same call the periodic path uses). If another core panics, its message is already in the
+ * logbuf and the owner's cadence persists it, provided the owner survives. Re-entry into
+ * hype_fatal from a fault inside this flush halts quietly via halt.c's in_panic latch.
+ */
+static void usb_log_fatal_flush(void) {
+    if (!usb_log_this_core_owns_usb()) {
+        return;
+    }
+    /* A transiently-disabled combined sink gets one last chance: the panic tail is the single
+     * most valuable record of the run. A repeat failure costs nothing extra. */
+    if (!g_hype_log_ready && g_usb_log_ready) {
+        g_hype_log_ready = 1;
+    }
+    usb_log_flush();
 }
 
 static unsigned int usb_log_flushed_total(void) {
