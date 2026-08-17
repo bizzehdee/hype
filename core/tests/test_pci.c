@@ -109,6 +109,28 @@ static void test_multifunction_device(void) {
                           HYPE_PCI_MSI_CONTROL_ENABLE);
     CHECK_HEX("function 2 MSI enabled", 1, hype_pci_function_msi_enabled(&pci, 31, 2));
     CHECK_HEX("function 2 MSI vector", 0x62u, hype_pci_function_msi_vector(&pci, 31, 2));
+    {   /* #512: destination from the guest-programmed MSI address. Physical fixed first
+         * (RH=0, DM=0), then logical lowest-priority (RH=1, DM=1). */
+        int logical = 1;
+        hype_pci_config_write(&pci, &(hype_pci_ecam_addr_t){0, 31, 2, HYPE_PCI_MSI_ADDR_OFFSET},
+                              4, 0xFEE01000u);
+        CHECK_HEX("function 2 MSI dest physical", 0x01u,
+                  hype_pci_function_msi_dest(&pci, 31, 2, &logical));
+        CHECK_HEX("function 2 MSI dest mode physical", 0, logical);
+        hype_pci_config_write(&pci, &(hype_pci_ecam_addr_t){0, 31, 2, HYPE_PCI_MSI_ADDR_OFFSET},
+                              4, 0xFEE0300Cu);
+        CHECK_HEX("function 2 MSI dest logical", 0x03u,
+                  hype_pci_function_msi_dest(&pci, 31, 2, &logical));
+        CHECK_HEX("function 2 MSI dest mode logical", 1, logical);
+        /* RH alone is not logical mode: DM clear means physical, whatever RH says. */
+        hype_pci_config_write(&pci, &(hype_pci_ecam_addr_t){0, 31, 2, HYPE_PCI_MSI_ADDR_OFFSET},
+                              4, 0xFEE02008u);
+        CHECK_HEX("function 2 MSI dest RH-only", 0x02u,
+                  hype_pci_function_msi_dest(&pci, 31, 2, &logical));
+        CHECK_HEX("function 2 MSI dest mode RH-only", 0, logical);
+        CHECK_HEX("function 2 MSI dest null-logical tolerated", 0x02u,
+                  hype_pci_function_msi_dest(&pci, 31, 2, (int *)0));
+    }
     CHECK_HEX("function 2 raw config is exposed", 0x22u,
               hype_pci_function_config(&pci, 31, 2)[0x02]);
 
@@ -126,6 +148,9 @@ static void test_multifunction_device(void) {
     CHECK_HEX("absent function MSI vector", 0, hype_pci_function_msi_vector(&pci, 31, 3));
     CHECK_HEX("invalid function MSI vector", 0,
               hype_pci_function_msi_vector(&pci, 31, HYPE_PCI_MAX_FUNCTIONS));
+    CHECK_HEX("absent function MSI dest", 0, hype_pci_function_msi_dest(&pci, 31, 3, (int *)0));
+    CHECK_HEX("invalid function MSI dest", 0,
+              hype_pci_function_msi_dest(&pci, 31, HYPE_PCI_MAX_FUNCTIONS, (int *)0));
     CHECK_HEX("absent function interrupt line", 0, hype_pci_get_function_interrupt_line(&pci, 31, 3));
     CHECK_HEX("invalid function interrupt line", 0,
               hype_pci_get_function_interrupt_line(&pci, 31, HYPE_PCI_MAX_FUNCTIONS));

@@ -91,6 +91,7 @@
 #define HYPE_PCI_CAP_ID_MSI 0x05u
 #define HYPE_PCI_MSI_CONTROL_ENABLE 0x0001u
 #define HYPE_PCI_MSI_CONTROL_OFFSET (HYPE_PCI_MSI_CAP_OFFSET + 0x02u)
+#define HYPE_PCI_MSI_ADDR_OFFSET (HYPE_PCI_MSI_CAP_OFFSET + 0x04u)
 #define HYPE_PCI_MSI_DATA_OFFSET (HYPE_PCI_MSI_CAP_OFFSET + 0x08u)
 
 typedef struct {
@@ -202,6 +203,12 @@ int hype_pci_msi_enabled(const hype_pci_t *pci, uint8_t device_number);
 uint8_t hype_pci_msi_vector(const hype_pci_t *pci, uint8_t device_number);
 int hype_pci_function_msi_enabled(const hype_pci_t *pci, uint8_t device_number, uint8_t function_number);
 uint8_t hype_pci_function_msi_vector(const hype_pci_t *pci, uint8_t device_number, uint8_t function_number);
+/* #512: destination ID from the guest-programmed MSI address (bits 19:12); *logical is set
+ * iff the message is logical-mode lowest-priority (RH && DM). Returns 0 when the function or
+ * its MSI capability is absent. */
+uint32_t hype_pci_msi_dest(const hype_pci_t *pci, uint8_t device_number, int *logical);
+uint32_t hype_pci_function_msi_dest(const hype_pci_t *pci, uint8_t device_number,
+                                    uint8_t function_number, int *logical);
 
 /* Reads back a device's current Interrupt Line (config 0x3C) -- whatever
  * value firmware/the guest last programmed there (a guest reads it to

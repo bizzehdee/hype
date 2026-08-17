@@ -234,6 +234,30 @@ uint8_t hype_pci_function_msi_vector(const hype_pci_t *pci, uint8_t device_numbe
     return data_offset < HYPE_PCI_CONFIG_SIZE ? dev->config[data_offset] : 0;
 }
 
+uint32_t hype_pci_msi_dest(const hype_pci_t *pci, uint8_t device_number, int *logical) {
+    return hype_pci_function_msi_dest(pci, device_number, 0, logical);
+}
+
+uint32_t hype_pci_function_msi_dest(const hype_pci_t *pci, uint8_t device_number,
+                                    uint8_t function_number, int *logical) {
+    const hype_pci_device_t *dev = device_const(pci, device_number, function_number);
+    unsigned int offset;
+    uint32_t addr;
+
+    if (logical) *logical = 0;
+    if (!dev || !dev->in_use) return 0;
+    offset = msi_cap_offset(dev);
+    if (offset == 0 || offset + 8u > HYPE_PCI_CONFIG_SIZE) return 0;
+    addr = (uint32_t)dev->config[offset + 4u] | ((uint32_t)dev->config[offset + 5u] << 8) |
+           ((uint32_t)dev->config[offset + 6u] << 16) | ((uint32_t)dev->config[offset + 7u] << 24);
+    /* MSI address word (SDM 3A 11.11.1): destination ID in bits 19:12; the message is
+     * logical-destination lowest-priority only when BOTH the Redirection Hint (bit 3) and
+     * Destination Mode (bit 2) are set -- with RH clear, DM is ignored and delivery is
+     * physical/fixed to the destination ID. */
+    if (logical) *logical = ((addr & 0x8u) != 0u) && ((addr & 0x4u) != 0u);
+    return (addr >> 12) & 0xFFu;
+}
+
 uint8_t hype_pci_get_interrupt_line(const hype_pci_t *pci, uint8_t device_number) {
     return hype_pci_get_function_interrupt_line(pci, device_number, 0);
 }
