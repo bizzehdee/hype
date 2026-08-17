@@ -34,6 +34,18 @@ void hype_scsi_cdb_write10(uint8_t cdb[10], uint32_t lba, uint16_t blocks);
 /* SYNCHRONIZE CACHE(10), whole logical unit: all range fields zero. */
 void hype_scsi_cdb_synchronize_cache10(uint8_t cdb[10]);
 void hype_scsi_cdb_inquiry(uint8_t cdb[6], uint8_t alloc_len);
+/* #516: REQUEST SENSE -- issued after a CSW reports command-failed. Mandatory BOT hygiene:
+ * it names the failure (key/ASC/ASCQ) AND clears the device's pending sense/unit-attention,
+ * without which some devices fail every subsequent command. */
+void hype_scsi_cdb_request_sense(uint8_t cdb[6], uint8_t alloc_len);
+/* #516: structural validity (signature+tag) separately from command success -- a valid CSW
+ * with nonzero status is a DEVICE verdict, not transport damage. */
+int hype_usb_bot_csw_valid(const uint8_t csw[13], uint32_t expect_tag);
+unsigned int hype_usb_bot_csw_status(const uint8_t csw[13]);
+uint32_t hype_usb_bot_csw_residue(const uint8_t csw[13]);
+/* Parse fixed-format sense (SPC-3 4.5.3). -1 if not fixed-format or too short. */
+int hype_scsi_parse_fixed_sense(const uint8_t *sense, unsigned int len, unsigned int *key,
+                                unsigned int *asc, unsigned int *ascq);
 
 /* Parses an 8-byte READ CAPACITY(10) response (big-endian): the LAST LBA and
  * the logical block size in bytes. */

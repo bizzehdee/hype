@@ -34,6 +34,21 @@ int hype_usb_bot_csw_ok(const uint8_t csw[13], uint32_t expect_tag) {
            csw[12] == 0u; /* bCSWStatus: 0 = command passed */
 }
 
+/* #516: the pieces of csw_ok, separately -- a structurally VALID CSW whose status says the
+ * COMMAND failed must not be treated like transport damage: the transport is fine, the device
+ * is reporting, and the answer is REQUEST SENSE, not an endpoint reset. */
+int hype_usb_bot_csw_valid(const uint8_t csw[13], uint32_t expect_tag) {
+    return rd_le32(csw + 0) == HYPE_USB_CSW_SIGNATURE && rd_le32(csw + 4) == expect_tag;
+}
+
+unsigned int hype_usb_bot_csw_status(const uint8_t csw[13]) {
+    return csw[12];
+}
+
+uint32_t hype_usb_bot_csw_residue(const uint8_t csw[13]) {
+    return rd_le32(csw + 8);
+}
+
 void hype_scsi_cdb_read_capacity10(uint8_t cdb[10]) {
     unsigned int i;
     for (i = 0; i < 10u; i++) cdb[i] = 0;
@@ -62,6 +77,22 @@ void hype_scsi_cdb_synchronize_cache10(uint8_t cdb[10]) {
     unsigned int i;
     for (i = 0; i < 10u; i++) cdb[i] = 0;
     cdb[0] = 0x35u; /* SYNCHRONIZE CACHE(10) */
+}
+
+void hype_scsi_cdb_request_sense(uint8_t cdb[6], uint8_t alloc_len) {
+    unsigned int i;
+    for (i = 0; i < 6u; i++) cdb[i] = 0;
+    cdb[0] = 0x03u;     /* REQUEST SENSE */
+    cdb[4] = alloc_len; /* 18 covers fixed-format sense (SPC-3 4.5.3) */
+}
+
+int hype_scsi_parse_fixed_sense(const uint8_t *sense, unsigned int len, unsigned int *key,
+                                unsigned int *asc, unsigned int *ascq) {
+    if (sense == 0 || len < 14u || (sense[0] & 0x7Fu) != 0x70u) return -1;
+    if (key) *key = sense[2] & 0x0Fu;
+    if (asc) *asc = sense[12];
+    if (ascq) *ascq = sense[13];
+    return 0;
 }
 
 void hype_scsi_cdb_inquiry(uint8_t cdb[6], uint8_t alloc_len) {

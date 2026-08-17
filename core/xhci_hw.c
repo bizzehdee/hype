@@ -138,6 +138,13 @@ typedef struct {
      * the controller carrying hype's log is a stall in the datapath the log depends on.
      */
     hype_xhci_parked_t parked;
+    /* #516: the last failed command's sense (0xFF = none captured), and whether this device
+     * rejected SYNCHRONIZE CACHE as an unknown opcode -- cacheless flash sticks legitimately
+     * do (the 64 GB Cruzer answers key=5 asc=0x20), and the sync is then a no-op forever,
+     * exactly how Linux's sd driver treats it. */
+    unsigned int last_sense_key;
+    unsigned int last_sense_asc;
+    int sync_cache_unsupported;
 } xhci_hw_t;
 
 static xhci_hw_t g_hw[HYPE_XHCI_MAX_CTRL];
@@ -1181,7 +1188,81 @@ static int bot_scsi_once(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci
     /* CSW on the bulk IN endpoint. */
     if (bulk_xfer(c, hw->bulk_in_ring, &hw->bin_enq, &hw->bin_cyc, slot, dci_in,
                   phys(hw->csw), HYPE_USB_CSW_LEN) != 0) return -1;
-    return hype_usb_bot_csw_ok(hw->csw, tag) ? 0 : -1;
+    if (hype_usb_bot_csw_ok(hw->csw, tag)) {
+        return 0;
+    }
+    /*
+     * #516: distinguish the DEVICE saying no from the TRANSPORT breaking. A structurally valid
+     * CSW with nonzero status (or unconsumed residue) means the BOT machinery is healthy and
+     * the device rejected/shortened the COMMAND -- the answer is REQUEST SENSE, never an
+     * endpoint reset. This used to collapse into one silent -1: the 64 GB stick failed hype's
+     * first WRITE(10) with a clean status-1 CSW, hype "recovered" a transport that was not
+     * broken, the retry met the same verdict, and the loop spammed the screen while the log
+     * sink (whose create needed that write) stayed dead. The evidence -- WHICH command, WHAT
+     * status -- was discarded exactly where it existed.
+     */
+    if (hype_usb_bot_csw_valid(hw->csw, tag)) {
+        static unsigned int csw_fail_reported = 0;
+        if (csw_fail_reported++ < 16u) {
+            hype_debug_print("host-xhci: #516 CSW: op=0x%02x FAILED status=%u residue=%u "
+                             "(len=%u dir=%s) -- device verdict, transport healthy\n",
+                             cdb[0], hype_usb_bot_csw_status(hw->csw),
+                             hype_usb_bot_csw_residue(hw->csw), data_len, dir_in ? "in" : "out");
+        }
+        return 1; /* command failed cleanly: sense, don't reset */
+    }
+    {
+        static unsigned int csw_bad_reported = 0;
+        if (csw_bad_reported++ < 16u) {
+            hype_debug_print("host-xhci: #516 CSW: op=0x%02x structurally INVALID (bad "
+                             "signature/tag) -- transport-level damage\n", cdb[0]);
+        }
+    }
+    return -1;
+}
+
+/*
+ * #516: absorb a failed command's sense data. Mandatory BOT hygiene after any status!=0 CSW:
+ * REQUEST SENSE both NAMES the failure and CLEARS the device's pending sense/unit-attention
+ * state -- several devices (this 64 GB Cruzer included) fail every later command until it is
+ * read. Bounded reporting; the sense itself travels through a plain BOT transaction.
+ */
+static void bot_absorb_sense(hype_xhci_ctrl_t *c, unsigned int slot,
+                             const hype_xhci_msc_eps_t *msc, uint8_t failed_op) {
+    xhci_hw_t *hw = HW(c);
+    uint8_t cdb[6];
+    uint8_t sense[18];
+    unsigned int i;
+    static unsigned int sense_reported = 0;
+
+    for (i = 0; i < sizeof(sense); i++) sense[i] = 0;
+    hw->last_sense_key = 0xFFu; /* 'none captured' until the parse below succeeds */
+    hw->last_sense_asc = 0xFFu;
+    hype_scsi_cdb_request_sense(cdb, (uint8_t)sizeof(sense));
+    if (bot_scsi_once(c, slot, msc, cdb, 6u, sense, sizeof(sense), 1) < 0) {
+        if (sense_reported < 16u) {
+            hype_debug_print("host-xhci: #516 REQUEST SENSE itself failed (after op=0x%02x)\n",
+                             failed_op);
+            sense_reported++;
+        }
+        return;
+    }
+    {
+        unsigned int key = 0, asc = 0, ascq = 0;
+        if (hype_scsi_parse_fixed_sense(sense, sizeof(sense), &key, &asc, &ascq) == 0) {
+            hw->last_sense_key = key;
+            hw->last_sense_asc = asc;
+            if (sense_reported < 16u) {
+                hype_debug_print("host-xhci: #516 SENSE for op=0x%02x: key=0x%x asc=0x%02x "
+                                 "ascq=0x%02x\n", failed_op, key, asc, ascq);
+                sense_reported++;
+            }
+        } else if (sense_reported < 16u) {
+            hype_debug_print("host-xhci: #516 SENSE for op=0x%02x: unparseable (resp=0x%02x)\n",
+                             failed_op, sense[0]);
+            sense_reported++;
+        }
+    }
 }
 
 /*
@@ -1221,8 +1302,30 @@ static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_
         }
     }
 #endif
-    if (!forced_fail && bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in) == 0) {
-        return 0;
+    if (!forced_fail) {
+        int rc1 = bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in);
+        if (rc1 == 0) {
+            return 0;
+        }
+        /*
+         * #516: a clean device NO (valid CSW, status!=0). The transport is healthy: absorb the
+         * sense (which also clears a pending unit attention -- the reset-recovery this used to
+         * run RE-ARMED unit attention on some devices, guaranteeing the retry failed and the
+         * loop never converged), then retry once for the transient-sense case. A second clean
+         * NO is the device's final answer; resetting endpoints cannot change its mind.
+         */
+        if (rc1 == 1) {
+            bot_absorb_sense(c, slot, msc, cdb[0]);
+            rc1 = bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in);
+            if (rc1 == 0) {
+                return 0;
+            }
+            if (rc1 == 1) {
+                bot_absorb_sense(c, slot, msc, cdb[0]);
+                return -1;
+            }
+            /* rc1 < 0: the retry broke the TRANSPORT -- fall through to ring recovery. */
+        }
     }
     if (bot_recover(c, slot, msc) != 0) {
         hype_debug_print("host-xhci: #266 recovery FAILED -- backend not trustworthy, giving up\n");
@@ -1233,6 +1336,15 @@ static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_
          * path, and it was never reported -- three recoveries in a real-hardware log
          * told us nothing about whether any of them helped. */
         int rc2 = bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in);
+        if (rc2 == 1) {
+            /* Transport restored; the device then said a clean NO. Same policy as above. */
+            bot_absorb_sense(c, slot, msc, cdb[0]);
+            rc2 = bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in);
+            if (rc2 == 1) {
+                bot_absorb_sense(c, slot, msc, cdb[0]);
+                rc2 = -1;
+            }
+        }
         hype_debug_print("host-xhci: #266 post-recovery retry %s\n",
                          (rc2 == 0) ? "SUCCEEDED -- datapath restored"
                                     : "FAILED -- recovery did not restore the datapath");
@@ -1304,9 +1416,29 @@ int hype_xhci_msc_inquiry_vpd(hype_xhci_ctrl_t *c, unsigned int slot,
 
 int hype_xhci_msc_sync_cache(hype_xhci_ctrl_t *c, unsigned int slot,
                              const hype_xhci_msc_eps_t *msc) {
+    xhci_hw_t *hw = HW(c);
     uint8_t cdb[10];
+    int rc;
+
+    /*
+     * #516: a device that rejected SYNCHRONIZE CACHE as an unknown opcode has no cache to
+     * sync; the command is a permanent no-op for it. Re-sending it forever turned every log
+     * flush on the 64 GB Cruzer into a fail/recover/retry storm that killed the whole USB
+     * datapath (and, before the clean-CSW split, looked exactly like transport damage).
+     */
+    if (hw->sync_cache_unsupported) {
+        return 0;
+    }
     hype_scsi_cdb_synchronize_cache10(cdb);
-    return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)0, 0u, 0);
+    rc = bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)0, 0u, 0);
+    if (rc != 0 && hw->last_sense_key == 0x5u && hw->last_sense_asc == 0x20u) {
+        hw->sync_cache_unsupported = 1;
+        hype_debug_print("host-xhci: #516 device rejects SYNCHRONIZE CACHE (ILLEGAL REQUEST/"
+                         "invalid opcode) -- cacheless device, treating sync as a no-op from "
+                         "now on\n");
+        return 0;
+    }
+    return rc;
 }
 
 int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {

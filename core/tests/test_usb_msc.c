@@ -167,6 +167,59 @@ static void test_read_capacity_parse(void) {
     CHECK_HEX("block size", 512u, bs);
 }
 
+/*
+ * #516: the split CSW view -- a structurally valid command-FAILED status must be
+ * distinguishable from transport garbage, and the sense machinery that follows it
+ * must produce/parse the right bytes. The 64 GB Cruzer rejected SYNCHRONIZE CACHE
+ * with a clean status-1 CSW; the old all-or-nothing csw_ok collapsed that into the
+ * same -1 as a torn transport, and the recovery loop never converged.
+ */
+static void test_csw_split_and_sense(void) {
+    uint8_t csw[13];
+    uint8_t cdb[6];
+    uint8_t sense[18];
+    unsigned int key = 9u, asc = 9u, ascq = 9u;
+    unsigned int i;
+
+    /* Valid CSW, command failed, full residue. */
+    for (i = 0; i < 13u; i++) csw[i] = 0;
+    csw[0] = 0x55u; csw[1] = 0x53u; csw[2] = 0x42u; csw[3] = 0x53u; /* 'USBS' */
+    csw[4] = 0x2Au; /* tag 0x2A */
+    csw[8] = 0x00u; csw[9] = 0x02u; /* residue 0x200 */
+    csw[12] = 1u;   /* bCSWStatus: command failed */
+    CHECK_HEX("failed CSW is structurally valid", 1, hype_usb_bot_csw_valid(csw, 0x2Au));
+    CHECK_HEX("failed CSW is not ok", 0, hype_usb_bot_csw_ok(csw, 0x2Au));
+    CHECK_HEX("status extracted", 1u, hype_usb_bot_csw_status(csw));
+    CHECK_HEX("residue extracted", 0x200u, hype_usb_bot_csw_residue(csw));
+    CHECK_HEX("wrong tag is invalid", 0, hype_usb_bot_csw_valid(csw, 0x2Bu));
+    csw[0] = 0x00u;
+    CHECK_HEX("bad signature is invalid", 0, hype_usb_bot_csw_valid(csw, 0x2Au));
+
+    /* REQUEST SENSE CDB shape. */
+    hype_scsi_cdb_request_sense(cdb, 18u);
+    CHECK_HEX("REQUEST SENSE opcode", 0x03u, cdb[0]);
+    CHECK_HEX("REQUEST SENSE alloc", 18u, cdb[4]);
+    CHECK_HEX("REQUEST SENSE reserved", 0u, cdb[1] | cdb[2] | cdb[3] | cdb[5]);
+
+    /* Fixed-format sense: ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE --
+     * the exact bytes the 64 GB Cruzer answers for SYNCHRONIZE CACHE. */
+    for (i = 0; i < 18u; i++) sense[i] = 0;
+    sense[0] = 0x70u; sense[2] = 0x05u; sense[12] = 0x20u; sense[13] = 0x00u;
+    CHECK_HEX("fixed sense parses", 0,
+              hype_scsi_parse_fixed_sense(sense, 18u, &key, &asc, &ascq));
+    CHECK_HEX("sense key", 0x5u, key);
+    CHECK_HEX("sense asc", 0x20u, asc);
+    CHECK_HEX("sense ascq", 0x00u, ascq);
+    sense[0] = 0x71u; /* deferred: still fixed-format per the 0x7F mask */
+    CHECK_HEX("deferred fixed sense parses", 0,
+              hype_scsi_parse_fixed_sense(sense, 18u, &key, &asc, &ascq));
+    sense[0] = 0x72u; /* descriptor format: not parsed */
+    CHECK_HEX("descriptor sense rejected", -1,
+              hype_scsi_parse_fixed_sense(sense, 18u, &key, &asc, &ascq));
+    CHECK_HEX("short sense rejected", -1,
+              hype_scsi_parse_fixed_sense(sense, 13u, &key, &asc, &ascq));
+}
+
 int main(void) {
     test_cbw();
     test_csw();
@@ -174,6 +227,7 @@ int main(void) {
     test_inquiry_vpd_cdb();
     test_vpd80_serial_parse();
     test_read_capacity_parse();
+    test_csw_split_and_sense();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;
