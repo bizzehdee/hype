@@ -1806,6 +1806,133 @@ static void term_post(int idx, hype_vm_event_t ev) {
     g_vms[idx].lifecycle = hype_vm_lifecycle_next(g_vms[idx].lifecycle, ev);
 }
 
+/*
+ * M9-2 (#175): host shutdown/reboot sequence.
+ *
+ * `host reboot` / `host off` shuts every running guest down FIRST -- the same graceful
+ * ACPI-power-button path as the per-VM Shutdown verb, posted to all of them in one pass so
+ * they run their grace periods in PARALLEL (each VM's own dispatch loop already owns its
+ * bounded timeout and the Force-off escalation, M8-6) -- and only then acts on the host.
+ * A host-side deadline covers the case where a VM's dispatch loop itself is wedged and
+ * cannot run its own escalation: past it, stragglers are force-killed from here and the
+ * host action proceeds. Best-effort and bounded, never blocked indefinitely on one guest
+ * (plan.md section 6h).
+ */
+#define HYPE_HOST_ACTION_NONE 0u
+#define HYPE_HOST_ACTION_REBOOT 1u
+#define HYPE_HOST_ACTION_OFF 2u
+static volatile unsigned g_host_action;
+static uint64_t g_host_action_deadline_tsc;
+/* Set in efi_main before ExitBootServices. Runtime Services stay callable at their physical
+ * addresses because hype never calls SetVirtualAddressMap. */
+static EFI_RUNTIME_SERVICES *g_runtime_services;
+
+typedef void(EFIAPI *hype_efi_reset_system_t)(unsigned reset_type, EFI_STATUS reset_status,
+                                              UINTN data_size, void *reset_data);
+#define HYPE_EFI_RESET_COLD 0u
+#define HYPE_EFI_RESET_SHUTDOWN 2u
+
+static inline void host_reset_outb(uint16_t port, uint8_t val) {
+    __asm__ volatile("outb %0, %1" ::"a"(val), "Nd"(port));
+}
+
+/* Perform the host action. Tries UEFI ResetSystem (the section 6h mechanism), then the
+ * chipset reset register, then the keyboard controller -- and if the machine is still
+ * running after all three, says so and parks, which for `off` on a box with no usable
+ * S5 path is also the honest terminal state ("power off the machine now"). */
+static void fw_1_host_power_act(unsigned action) {
+    hype_debug_print("fw-1 HOST: all guests down -- %s the host [#175]\n",
+                     (action == HYPE_HOST_ACTION_OFF) ? "powering off" : "rebooting");
+    if (g_runtime_services != 0 && g_runtime_services->ResetSystem != 0) {
+        ((hype_efi_reset_system_t)g_runtime_services->ResetSystem)(
+            (action == HYPE_HOST_ACTION_OFF) ? HYPE_EFI_RESET_SHUTDOWN : HYPE_EFI_RESET_COLD,
+            0, 0, 0);
+        /* Returns only if the firmware could not do it. */
+    }
+    if (action != HYPE_HOST_ACTION_OFF) {
+        host_reset_outb(0xCF9, 0x02); /* RST_CNT: set SYS_RST */
+        host_reset_outb(0xCF9, 0x06); /* ... then pulse RST_CPU: full reset */
+        host_reset_outb(0x64, 0xFE);  /* keyboard-controller pulse, the classic fallback */
+    }
+    hype_debug_print("fw-1 HOST: %s did not take -- parked; power the machine off "
+                     "manually [#175]\n",
+                     (action == HYPE_HOST_ACTION_OFF) ? "no host S5 path" : "every reset method");
+    for (;;) {
+        __asm__ volatile("cli; hlt");
+    }
+}
+
+/* Begin the sequence: post SHUTDOWN to every non-OFF guest in one pass (their own loops run
+ * the grace timers in parallel) and arm the host-wide deadline. Returns how many were up. */
+static unsigned fw_1_host_action_begin(unsigned action) {
+    unsigned i, posted = 0;
+    uint64_t hz = g_vms[0].host_tsc_hz;
+    for (i = 0; i < g_vm_count; i++) {
+        if (g_vms[i].lifecycle != HYPE_VM_OFF) {
+            g_vms[i].shutdown_deadline_tsc = 0; /* the VM's loop arms its own grace */
+            term_post((int)i, HYPE_VM_EV_SHUTDOWN);
+            posted++;
+        }
+    }
+    g_host_action_deadline_tsc =
+        (hz != 0) ? hype_rdtsc() + (HYPE_FW_1_SHUTDOWN_GRACE_S + 15ull) * hz : 0;
+    g_host_action = action;
+    hype_debug_print("fw-1 HOST: %s requested -- shutting down %u guest(s), grace %llus, "
+                     "force-off fallback [#175]\n",
+                     (action == HYPE_HOST_ACTION_OFF) ? "off" : "reboot", posted,
+                     (unsigned long long)HYPE_FW_1_SHUTDOWN_GRACE_S);
+    return posted;
+}
+
+/* Called from the BSP housekeeping loop every iteration; cheap when idle. */
+static void fw_1_host_action_poll(void) {
+    unsigned i, still_up = 0;
+#ifdef HYPE_175_AUTOTEST_SECS
+    /* Build-gated validation trigger: begin a host reboot N seconds after boot, exactly as the
+     * terminal command would. Exists because the terminal needs a physical keyboard -- QEMU
+     * validation drives this path with -DHYPE_175_AUTOTEST_SECS=<n> instead. */
+    {
+        static uint64_t t175;
+        uint64_t hz175 = g_vms[0].host_tsc_hz;
+        if (hz175 != 0 && g_host_action == HYPE_HOST_ACTION_NONE) {
+            if (t175 == 0) {
+                t175 = hype_rdtsc() + (uint64_t)HYPE_175_AUTOTEST_SECS * hz175;
+            } else if (hype_rdtsc() >= t175) {
+                (void)fw_1_host_action_begin(HYPE_HOST_ACTION_REBOOT);
+            }
+        }
+    }
+#endif
+    if (g_host_action == HYPE_HOST_ACTION_NONE) {
+        return;
+    }
+    for (i = 0; i < g_vm_count; i++) {
+        if (g_vms[i].lifecycle != HYPE_VM_OFF) {
+            still_up++;
+        }
+    }
+    if (still_up == 0) {
+        fw_1_host_power_act(g_host_action);
+    }
+    if (g_host_action_deadline_tsc != 0 && hype_rdtsc() >= g_host_action_deadline_tsc) {
+        /* Grace exhausted host-wide: a wedged dispatch loop cannot run its own M8-6
+         * escalation, so it happens from here, once, then one short extra window for the
+         * loops that ARE alive to notice OFF before the host action proceeds regardless. */
+        hype_debug_print("fw-1 HOST: grace expired with %u guest(s) still up -- forcing off "
+                         "[#175]\n", still_up);
+        for (i = 0; i < g_vm_count; i++) {
+            if (g_vms[i].lifecycle != HYPE_VM_OFF) {
+                term_post((int)i, HYPE_VM_EV_FORCE_OFF);
+            }
+        }
+        g_host_action_deadline_tsc = 0; /* next poll pass acts, whatever the loops did */
+        return;
+    }
+    if (g_host_action_deadline_tsc == 0) {
+        fw_1_host_power_act(g_host_action);
+    }
+}
+
 /* TERM-7 (#443): defined further down, once g_hype_cfg/g_hype_log/g_term_gop are all declared --
  * forward-declared here so term_run_cmdline's switch can call it. Appends its result with
  * term_resultf(), matching every other verb's own convention. */
@@ -1927,6 +2054,26 @@ static void term_run_cmdline(void) {
                 term_config_cmd(idx, nm);
             }
             break;
+        case HYPE_CMD_HOST: {
+            /* M9-2 (#175): shut every running guest down in parallel, then act on the host.
+             * The completion (and the wedge escalation) live in fw_1_host_action_poll(). */
+            unsigned action = HYPE_HOST_ACTION_NONE;
+            unsigned posted;
+            if (c.has_arg && term_streq(c.arg, "reboot")) {
+                action = HYPE_HOST_ACTION_REBOOT;
+            } else if (c.has_arg && (term_streq(c.arg, "off") || term_streq(c.arg, "poweroff"))) {
+                action = HYPE_HOST_ACTION_OFF;
+            }
+            if (action == HYPE_HOST_ACTION_NONE) {
+                term_resultf("host: usage: host <reboot|off>");
+                break;
+            }
+            posted = fw_1_host_action_begin(action);
+            term_resultf("host %s: shutting down %u guest(s), grace %us, force-off fallback",
+                         (action == HYPE_HOST_ACTION_OFF) ? "off" : "reboot", posted,
+                         (unsigned)HYPE_FW_1_SHUTDOWN_GRACE_S);
+            break;
+        }
         case HYPE_CMD_UNKNOWN:
         default:
             term_resultf( "unknown command (try 'help')");
@@ -20784,6 +20931,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* First thing in every log: which build this is. Captures from a
      * serial-less machine otherwise all start with identical boilerplate. */
     hype_debug_print("hype: build " HYPE_BUILD_ID "\n");
+
+    /* M9-2 (#175): keep Runtime Services reachable post-EBS for the host reboot/off action.
+     * Legal at physical addresses because hype never calls SetVirtualAddressMap. */
+    g_runtime_services = SystemTable->RuntimeServices;
     /*
      * Host wall clock, read once here and reused wherever a timestamp is needed
      * (currently the FAT32 log file's directory entry). Read at boot rather than
@@ -23255,6 +23406,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             fw_1_render_console();
             bsp_phase(BSP_PHASE_INPUT);
             fw_1_host_input_poll(); /* #363: keyboard + terminal switching, off the guest core */
+            fw_1_host_action_poll(); /* M9-2 (#175): pending host reboot/off completes here */
             bsp_phase(BSP_PHASE_KBDDIAG);
             {
                 /*

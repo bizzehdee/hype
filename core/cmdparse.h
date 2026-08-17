@@ -31,6 +31,7 @@ typedef enum {
      * Prints that VM's full effective hype.cfg -- every field, tagged (default) or (set) --
      * into the dashboard's multi-line result panel (#460). */
     HYPE_CMD_CONFIG,
+    HYPE_CMD_HOST,       /* M9-2 (#175): host-wide reboot/off -- shut every guest down first */
     HYPE_CMD_UNKNOWN,
 } hype_cmd_verb_t;
 

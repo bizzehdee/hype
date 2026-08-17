@@ -29,6 +29,7 @@ static hype_cmd_verb_t verb_of(const char *tok, unsigned len) {
     if (tok_eq(tok, len, "confirm")) return HYPE_CMD_CONFIRM;
     if (tok_eq(tok, len, "resolution") || tok_eq(tok, len, "res")) return HYPE_CMD_RESOLUTION;
     if (tok_eq(tok, len, "config") || tok_eq(tok, len, "cfg")) return HYPE_CMD_CONFIG;
+    if (tok_eq(tok, len, "host")) return HYPE_CMD_HOST; /* M9-2 (#175): host reboot|off */
     return HYPE_CMD_UNKNOWN;
 }
 
@@ -78,6 +79,7 @@ static const char *const g_cmd_usage[] = {
     "confirm <serial>",
     "resolution [list|<W>x<H>]",
     "config <vm>",
+    "host <reboot|off>",
 };
 
 unsigned hype_cmd_usage_count(void) {
