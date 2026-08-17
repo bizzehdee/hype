@@ -15772,6 +15772,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * deassert its Remote-IRR sticks after the first completion and every
              * later command waits out libata's 30s timeout. */
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI);
+            /*
+             * #519: and the EXTRA disk slots' lines (#329), which were never added to this list
+             * when those slots were introduced -- so every slot-1/slot-2 device inherited the
+             * stuck-Remote-IRR bug the three lines above were each fixed for in turn.
+             *
+             * It bites hardest on NVMe, whose pending condition (an unconsumed completion)
+             * re-arms while the guest is still inside its ISR: the line then never goes low, the
+             * deassert-when-idle branch never runs, and no further completion can interrupt.
+             * Observed as a partition scan that reads three blocks and then hangs forever with
+             * the controller still producing completions nobody could be told about.
+             */
+            {
+                unsigned int s;
+                for (s = 1u; s < HYPE_FW_1_MAX_DISKS; s++) {
+                    hype_ioapic_deassert(&g_fw_1_ioapic, fw_1_slot_gsi(s, fw_1_slot_bus(vm, s)));
+                }
+            }
         }
         if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
