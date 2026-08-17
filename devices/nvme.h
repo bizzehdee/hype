@@ -171,6 +171,25 @@ void hype_nvme_mmio_write32(hype_nvme_t *dev, uint32_t off, uint32_t value);
 uint8_t hype_nvme_cq_advance(hype_nvme_t *dev, unsigned int qid);
 
 /*
+ * #519: does the controller owe the guest an interrupt right now?
+ *
+ * True while ANY completion queue holds an entry the guest has not consumed -- the controller's
+ * producer (cq_tail) is ahead of the head the guest last published through its doorbell. That is a
+ * level condition by construction, so a caller raises while it holds and deasserts when it clears,
+ * with no extra state to keep in step and nothing to lose if an interrupt is missed.
+ *
+ * This was the missing half of the front-end. Completions were posted correctly and nothing told
+ * the guest, so Linux's nvme driver only discovered each one when its 60-second timeout handler
+ * polled the queue ("I/O tag N QID 0 timeout, completion polled") -- and simply enumerating the
+ * controller took over four minutes. An INTx completion interrupt was in #334's design table from
+ * the start; only the raise was never wired.
+ *
+ * Reports nothing while the controller is disabled or bus mastering is off: in either state the
+ * queues are not the guest's to read.
+ */
+int hype_nvme_irq_pending(const hype_nvme_t *dev);
+
+/*
  * Decodes a doorbell write offset into (queue id, is_completion_queue). Returns 0 on success.
  *
  * VALID-3: an out-of-range or misaligned doorbell offset is REFUSED rather than clamped -- a guest
@@ -196,6 +215,20 @@ int hype_nvme_doorbell_decode(uint32_t off, unsigned int *out_qid, int *out_is_c
 /* IDENTIFY CNS values. */
 #define HYPE_NVME_CNS_NAMESPACE 0x00u
 #define HYPE_NVME_CNS_CONTROLLER 0x01u
+/*
+ * #519: the Active Namespace ID List. Linux enumerates namespaces with this and nothing else --
+ * refusing it means the controller attaches and then presents no disk ("Identify NS List failed
+ * (status=0x2)", no /dev/nvme0n1). OVMF never needed it because NvmExpressDxe identifies NSID 1
+ * directly, which is why the front-end got this far without it.
+ */
+#define HYPE_NVME_CNS_ACTIVE_NS_LIST 0x02u
+/*
+ * #519: the Namespace Identification Descriptor list. Linux asks for this immediately after the
+ * namespace list and logs "Identify Descriptors failed (nsid=1, status=0x2)" if it is refused.
+ * hype has no EUI64/NGUID/UUID to give -- its namespaces are identified by NSID alone -- so the
+ * answer is a well-formed EMPTY list, which is a zero descriptor type in the first byte.
+ */
+#define HYPE_NVME_CNS_NS_DESCRIPTORS 0x03u
 
 /* Status codes (SCT=0 generic, in the CQE's status field). */
 #define HYPE_NVME_SC_SUCCESS 0x00u
@@ -252,6 +285,16 @@ void hype_nvme_identify_controller(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], const 
  * will happily read and write at those offsets without complaint.
  */
 void hype_nvme_identify_namespace(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], uint64_t total_sectors);
+
+/*
+ * #519: builds the Active Namespace ID List -- the NSIDs greater than `after_nsid`, ascending, each
+ * a 32-bit little-endian value, zero-padded to the end. hype presents exactly one namespace (NSID
+ * 1), so the list is either that one entry or, once the driver asks what follows it, empty.
+ *
+ * The zero padding is the terminator: a driver stops at the first zero entry, so a list that does
+ * not zero its tail advertises whatever the buffer held before.
+ */
+void hype_nvme_identify_active_ns_list(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], uint32_t after_nsid);
 
 
 /* ---- slice 3: PRP walking (#202) -------------------------------------------------------------- */

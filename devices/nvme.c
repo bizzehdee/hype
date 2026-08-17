@@ -200,6 +200,24 @@ uint8_t hype_nvme_cq_advance(hype_nvme_t *dev, unsigned int qid) {
     return phase;
 }
 
+int hype_nvme_irq_pending(const hype_nvme_t *dev) {
+    unsigned int qid;
+
+    if (dev == 0 || !dev->bus_master || (dev->cc & HYPE_NVME_CC_EN) == 0u) {
+        return 0;
+    }
+    for (qid = 0; qid < HYPE_NVME_MAX_QUEUES; qid++) {
+        /* A queue the guest never created has no entries and cannot owe it anything. */
+        if (dev->cq_entries[qid] == 0u) {
+            continue;
+        }
+        if (dev->cq_tail[qid] != dev->cq_head[qid]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int hype_nvme_doorbell_decode(uint32_t off, unsigned int *out_qid, int *out_is_cq) {
     uint32_t rel, idx;
 
@@ -329,6 +347,15 @@ void hype_nvme_identify_namespace(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], uint64_
      */
     put_le16(buf + 128, 0u);
     buf[130] = 9u;
+}
+
+void hype_nvme_identify_active_ns_list(uint8_t buf[HYPE_NVME_IDENTIFY_BYTES], uint32_t after_nsid) {
+    zero_buf(buf, HYPE_NVME_IDENTIFY_BYTES);
+    /* One namespace, NSID 1. Asked what comes after it (or later), the answer is an empty list --
+     * which the all-zero buffer already is. */
+    if (after_nsid < 1u) {
+        put_le32b(buf + 0, 1u);
+    }
 }
 
 /* ---- slice 3: PRP walking (#202) -------------------------------------------------------------- */
@@ -567,6 +594,16 @@ static uint16_t exec_admin(hype_nvme_t *dev, const hype_nvme_cmd_t *cmd, const h
                 hype_nvme_identify_controller(c->bounce, c->serial);
             } else if (cns == HYPE_NVME_CNS_NAMESPACE) {
                 hype_nvme_identify_namespace(c->bounce, c->total_sectors);
+            } else if (cns == HYPE_NVME_CNS_ACTIVE_NS_LIST) {
+                /* #519: how Linux finds the namespace at all. The NSID field carries the point to
+                 * continue from, so the driver can page through a list longer than one buffer. */
+                hype_nvme_identify_active_ns_list(c->bounce, cmd->nsid);
+            } else if (cns == HYPE_NVME_CNS_NS_DESCRIPTORS) {
+                /* #519: an empty descriptor list. Zeroing the buffer IS the answer -- descriptor
+                 * type 0 terminates the list -- because hype identifies namespaces by NSID and has
+                 * no EUI64/NGUID/UUID to report. Refusing the command instead made the driver log
+                 * a failure and give up on the namespace. */
+                zero_buf(c->bounce, HYPE_NVME_IDENTIFY_BYTES);
             } else {
                 /* An unsupported CNS is a FIELD error, not an opcode error: the driver asked a valid
                  * question hype cannot answer, and it distinguishes the two. */

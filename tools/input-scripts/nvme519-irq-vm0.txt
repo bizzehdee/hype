@@ -1,0 +1,18 @@
+# #519 diagnostic: what interrupt did the guest assign the NVMe function, and did it request it?
+timeout 240000
+
+expect localhost login:
+send root\n
+expect ~#
+
+send echo PCIIRQ-$(cat /sys/bus/pci/devices/0000:00:06.0/irq)\n
+expect PCIIRQ-
+send echo INTXDIS-$(setpci -s 00:06.0 COMMAND)\n
+expect INTXDIS-
+send echo NVMEIRQ-$(grep -c nvme /proc/interrupts)\n
+expect NVMEIRQ-
+send grep -E 'nvme|IO-APIC' /proc/interrupts | head -5\n
+expect ~#
+send echo MSICAP-$(lspci -vv -s 00:06.0 2>/dev/null | grep -c MSI)\n
+expect MSICAP-
+pass nvme519-irq-probe

@@ -1,0 +1,35 @@
+# #519: does the guest NVMe disk actually appear and serve I/O?
+#
+# The bar is not "the controller attached" -- it is a usable block device with no
+# "completion polled" timeout anywhere in dmesg. Markers are quote-split ("O''K") so the
+# tty echo of the typed command cannot satisfy its own expect.
+timeout 300000
+fail-if timeout, completion polled
+
+expect localhost login:
+send root\n
+expect ~#
+
+# The namespace exists as a block device.
+send echo NVME-$(ls /dev/nvme0n1 2>/dev/null | wc -l)\n
+expect NVME-1
+
+# ...with the capacity it was given (8 MiB = 16384 sectors of 512 B).
+send echo SIZE-$(cat /sys/block/nvme0n1/size)\n
+expect SIZE-16384
+
+# It serves real I/O: read the tag the rig wrote at sector 0.
+send dd if=/dev/nvme0n1 bs=512 count=1 2>/dev/null | head -c 17\n
+expect HYPE-DISK-B-SLOT1
+
+# And a write lands and reads back.
+send dd if=/dev/zero of=/dev/nvme0n1 bs=512 count=1 seek=100 2>/dev/null; echo WROTE-O''K\n
+expect WROTE-OK
+send echo READBACK-$(dd if=/dev/nvme0n1 bs=512 count=1 skip=100 2>/dev/null | tr -d '\\0' | wc -c)\n
+expect READBACK-0
+
+# No driver timeout anywhere in the boot.
+send echo NVMETIMEOUT-$(dmesg | grep -c 'completion polled')\n
+expect NVMETIMEOUT-0
+
+pass nvme519-interrupt-and-namespace

@@ -97,6 +97,12 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                 Package () { 0x0002FFFF, 0x02, 0x00, 0x12 },  /* dev 2 INTC -> GSI 18 */
                 Package () { 0x0002FFFF, 0x03, 0x00, 0x13 },  /* dev 2 INTD -> GSI 19 */
                 Package () { 0x0003FFFF, 0x00, 0x00, 0x14 },  /* dev 3 INTA -> GSI 20 (virtio-blk) */
+                /* #519: slot 0's NVMe front-end is device 5, and it had no entry at all -- so its
+                 * completion interrupt was not merely unraised, it was unroutable. It shares GSI 20
+                 * with virtio-blk because the two are alternatives for the same slot (#333 selects
+                 * one front-end) and can never both be present, which is the assumption
+                 * fw_1_slot_gsi() already encodes. */
+                Package () { 0x0005FFFF, 0x00, 0x00, 0x14 },  /* dev 5 INTA -> GSI 20 (NVMe slot 0) */
                 /* #440: the ICH9 SATA function is 00:1f.2. _PRT keys on
                  * device/pin, so function 2 routes via dev31 INTA. GSI 21 keeps
                  * it OFF the CD controller's line (dev 2 INTA -> GSI 16): hype's

@@ -1189,7 +1189,73 @@ static void test_reset_restores_default_queue_sizes(void) {
 }
 
 
+/*
+ * #519: the controller owes the guest an interrupt exactly while a posted completion is still
+ * unconsumed. Before this the front-end raised nothing at all, and Linux found each completion only
+ * when its 60-second timeout handler polled -- so this predicate is the whole level condition the
+ * dispatch loop raises and deasserts on.
+ */
+static void test_irq_pending_tracks_unconsumed_completions(void) {
+    hype_nvme_t d;
+
+    hype_nvme_reset(&d);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_CC, HYPE_NVME_CC_EN);
+    CHECK_HEX("idle controller owes nothing", 0, hype_nvme_irq_pending(&d));
+
+    (void)hype_nvme_cq_advance(&d, 0u);
+    CHECK_HEX("a posted completion is owed", 1, hype_nvme_irq_pending(&d));
+
+    /* The guest consumes it by publishing its new head through the doorbell. */
+    d.cq_head[0] = d.cq_tail[0];
+    CHECK_HEX("consumed completion clears the line", 0, hype_nvme_irq_pending(&d));
+
+    /* Any queue counts, not just the admin pair. */
+    d.cq_entries[1] = 4u;
+    (void)hype_nvme_cq_advance(&d, 1u);
+    CHECK_HEX("an I/O queue owes it too", 1, hype_nvme_irq_pending(&d));
+    d.cq_head[1] = d.cq_tail[1];
+    CHECK_HEX("and clears the same way", 0, hype_nvme_irq_pending(&d));
+
+    /* Not the guest's queues to read while the controller is off or cannot master the bus. */
+    (void)hype_nvme_cq_advance(&d, 0u);
+    CHECK_HEX("pending again", 1, hype_nvme_irq_pending(&d));
+    hype_nvme_set_bus_master(&d, 0);
+    CHECK_HEX("no bus master, no interrupt", 0, hype_nvme_irq_pending(&d));
+    hype_nvme_set_bus_master(&d, 1);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_CC, 0u);
+    CHECK_HEX("disabled controller owes nothing", 0, hype_nvme_irq_pending(&d));
+    CHECK_HEX("null is safe", 0, hype_nvme_irq_pending(0));
+}
+
+/*
+ * #519: the Active Namespace ID List is the only way Linux discovers a namespace. Refusing it left
+ * the controller attached with no disk behind it.
+ */
+static void test_active_ns_list(void) {
+    uint8_t buf[HYPE_NVME_IDENTIFY_BYTES];
+    unsigned int i;
+    int tail_clear = 1;
+
+    memset(buf, 0xAA, sizeof buf);
+    hype_nvme_identify_active_ns_list(buf, 0u);
+    CHECK_HEX("the one namespace is listed first", 1u,
+              (unsigned)(buf[0] | (buf[1] << 8) | (buf[2] << 16) | ((uint32_t)buf[3] << 24)));
+    /* The zero tail is the terminator; a stale byte anywhere in it invents a namespace. */
+    for (i = 4u; i < sizeof buf; i++) {
+        if (buf[i] != 0u) tail_clear = 0;
+    }
+    CHECK_HEX("the rest of the list terminates", 1, tail_clear);
+
+    /* Asked what follows NSID 1, there is nothing -- an empty list, not a repeat of the same id. */
+    memset(buf, 0xAA, sizeof buf);
+    hype_nvme_identify_active_ns_list(buf, 1u);
+    CHECK_HEX("nothing follows the last namespace", 0u,
+              (unsigned)(buf[0] | (buf[1] << 8) | (buf[2] << 16) | ((uint32_t)buf[3] << 24)));
+}
+
 int main(void) {
+    test_irq_pending_tracks_unconsumed_completions(); /* #519 */
+    test_active_ns_list();                            /* #519 */
     test_phase_starts_at_one();
     test_phase_toggles_only_on_wrap();
     test_phase_is_per_queue();

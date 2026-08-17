@@ -15847,6 +15847,30 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
         }
         /*
+         * #519: slot 0's NVMe front-end, the alternative to the virtio-blk device above and
+         * routed to the same GSI 20 -- #333 selects one front-end per slot, so the two are never
+         * both present. Level-triggered on an unconsumed completion, exactly like its siblings.
+         */
+        if (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) {
+            if (hype_nvme_irq_pending(&vm->disk[0].nvme)) {
+                uint8_t iov;
+                uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME);
+                if (line != 0u && line < 16u) {
+                    int in_service = (line < 8u)
+                        ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
+                        : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
+                    if (!in_service) {
+                        hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
+                    }
+                }
+                if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI, &iov)) {
+                    fw_1_deliver_device_vector(vm, kind, HYPE_FW_1_VIRTIO_GSI, iov); /* #512 */
+                }
+            } else {
+                hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
+            }
+        }
+        /*
          * #262: completion IRQ for the SATA-disk HBA on its own GSI 21. The model
          * sets PxIS.DHRS when it completes a command, but nothing was raising the
          * guest's interrupt for this function -- so libata issued IDENTIFY DEVICE,
@@ -15903,8 +15927,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         /*
          * #329 2b(ii): completion IRQs for the EXTRA disk slots, same level-triggered shape as
          * their slot-0 counterparts above: raise while the device holds its pending state
-         * (virtio isr_status / AHCI PxIS), deassert once the guest clears it. Each slot owns its
-         * _PRT-routed GSI (22/23). NVMe slots raise nothing -- that front-end is polled (#335).
+         * (virtio isr_status / AHCI PxIS / an unconsumed NVMe completion), deassert once the guest
+         * clears it. Each slot owns its _PRT-routed GSI (22/23).
+         *
+         * #519: NVMe slots used to be skipped here, on the belief that "that front-end is polled".
+         * Linux's nvme driver does not poll -- it waits for an interrupt and only polls after a
+         * 60-second timeout, so every command cost a full timeout and enumerating the controller
+         * took over four minutes. An INTx completion interrupt was in #334's design from the
+         * start; only the raise was missing.
          */
         {
             unsigned int slot;
@@ -15917,13 +15947,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     continue;
                 }
                 sbus = fw_1_slot_bus(vm, slot);
-                if (sbus == HYPE_CFG_BUS_NVME) {
-                    continue;
-                }
                 gsi = fw_1_slot_gsi(slot, sbus);
-                pending = (sbus == HYPE_CFG_BUS_AHCI_SATA)
-                              ? hype_ahci_irq_pending(&d->ata_ahci)
-                              : (d->vblk.isr_status != 0u);
+                pending = (sbus == HYPE_CFG_BUS_AHCI_SATA) ? hype_ahci_irq_pending(&d->ata_ahci)
+                          : (sbus == HYPE_CFG_BUS_NVME)    ? hype_nvme_irq_pending(&d->nvme)
+                                                           : (d->vblk.isr_status != 0u);
                 if (pending) {
                     uint8_t iov;
                     uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci,
