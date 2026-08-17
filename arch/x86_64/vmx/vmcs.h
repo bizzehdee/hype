@@ -21,6 +21,7 @@
 #include "../../../devices/ps2_keyboard.h"
 #include "../../../devices/ps2_mouse.h"
 #include "../cpu/vmm_ops.h"
+#include "../svm/svm.h" /* #520: hype_svm_debug_state_t, the shared shape both backends report */
 #include "vmcs_fields.h"
 
 /*
@@ -278,6 +279,16 @@ void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
  */
 void hype_vmx_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selector,
                                        uint16_t ss_selector);
+
+/*
+ * #520: the VMX twin of hype_svm_vcpu_get_debug_state(). Until now the dispatcher zeroed this
+ * struct on VMX and said so in its return value, which meant every "dump the guest state on fault"
+ * path in the tree -- including the AP's own exception dump -- printed nothing useful on Intel.
+ * Three rounds of Intel AP debugging had to be inferred from exit-reason counters for want of it.
+ *
+ * cr2 and nrip stay zero: neither has a VMCS equivalent (see the definition).
+ */
+void hype_vmx_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out);
 
 uint32_t hype_vmx_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx);
 

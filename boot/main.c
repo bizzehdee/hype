@@ -5072,33 +5072,16 @@ static int vmm_get_debug_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                hype_svm_debug_state_t *out) {
     if (kind == HYPE_VMM_KIND_VMX) {
         /*
-         * ZERO the struct rather than leaving it untouched, even though the
-         * return value already says "nothing here". Callers declare it on the
-         * stack and several read fields without checking the return -- so on
-         * VMX they were reading uninitialised stack, and two of them fed
-         * .cr3/.rip straight into a guest page-table walk, i.e. dereferencing
-         * through a garbage root. Zeroing makes that deterministic and inert
-         * instead of wild. Check the return value if you need to know whether
-         * the contents mean anything; zeros are not a valid guest state.
+         * #520: this used to zero the struct and return 0 -- "nothing here" -- which meant every
+         * caller that dumps guest state on a fault, including the AP's own exception dump,
+         * printed nothing on Intel. Three rounds of Intel AP debugging had to be inferred from
+         * exit-reason counters because of it. The VMX side reads its VMCS now, so a fault on
+         * either backend explains itself.
          *
-         * Field-by-field, not `*out = (hype_svm_debug_state_t){0}` -- this is a
-         * freestanding UEFI target with no libc, and aggregate assignment emits
-         * a call to memcpy/memset that fails at link time (see AGENTS.md).
+         * cr2 and nrip stay zero there: neither has a VMCS equivalent (see the definition).
          */
-        out->cs_selector = 0;
-        out->cs_base = 0;
-        out->cr0 = 0;
-        out->cr2 = 0;
-        out->cr3 = 0;
-        out->rip = 0;
-        out->rflags = 0;
-        out->rsp = 0;
-        out->exitinfo2 = 0;
-        out->exitintinfo = 0;
-        out->nrip = 0;
-        out->cr4 = 0;
-        out->g_pat = 0;
-        return 0;
+        hype_vmx_vcpu_get_debug_state(ctx, out);
+        return 1;
     }
     hype_svm_vcpu_get_debug_state(ctx, out);
     return 1;

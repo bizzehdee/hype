@@ -3995,6 +3995,42 @@ void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
     vmx_ctx_reset_pending(real);
 }
 
+void hype_vmx_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok = 0;
+
+    if (out == 0) {
+        return;
+    }
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
+
+    out->cs_selector = (uint16_t)vmread(HYPE_VMCS_GUEST_CS_SELECTOR, &ok);
+    out->cs_base = vmread(HYPE_VMCS_GUEST_CS_BASE, &ok);
+    out->cr0 = vmread(HYPE_VMCS_GUEST_CR0, &ok);
+    out->cr3 = vmread(HYPE_VMCS_GUEST_CR3, &ok);
+    out->cr4 = vmread(HYPE_VMCS_GUEST_CR4, &ok);
+    out->rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    out->rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
+    out->rsp = vmread(HYPE_VMCS_GUEST_RSP, &ok);
+    out->g_pat = vmread(HYPE_VMCS_GUEST_IA32_PAT, &ok);
+    out->exitinfo2 = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    out->exitintinfo = vmread(HYPE_VMCS_VM_EXIT_INTR_INFO, &ok);
+    /*
+     * The two SVM-shaped fields with no VMCS equivalent, left at zero rather than filled with
+     * something plausible:
+     *
+     *  - CR2 is a real register on VMX, not guest state the VMCS saves, so it is whatever this
+     *    core holds at the moment of the read -- meaningful only to a caller that knows it just
+     *    took a guest #PF. hype does not track it per vCPU, so reporting it here would be worse
+     *    than reporting nothing.
+     *  - nRIP is an SVM convenience; VMX gives the instruction LENGTH instead, and the resume RIP
+     *    is rip + that, which the caller can compute if it needs to.
+     */
+    out->cr2 = 0;
+    out->nrip = 0;
+    (void)real;
+}
+
 void hype_vmx_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selector,
                                        uint16_t ss_selector) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
