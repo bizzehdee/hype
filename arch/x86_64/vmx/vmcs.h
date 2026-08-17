@@ -194,6 +194,9 @@ void hype_vmx_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector, int 
 /* #455: VMX-side mirror of hype_svm_vcpu_cancel_pending_vector -- see that
  * declaration for the full reasoning. */
 void hype_vmx_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector);
+/* #512: VMX mirrors of hype_svm_vcpu_note_pic_pending / _cancel_pic_pending -- see svm.h. */
+void hype_vmx_vcpu_note_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector);
+void hype_vmx_vcpu_cancel_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector);
 
 /* SMP-2 (#186): the VMX mirror of hype_svm_vcpu_set_topology. */
 void hype_vmx_vcpu_set_topology(hype_vcpu_ctx_t *ctx, uint32_t apic_id, uint32_t vcpu_count,

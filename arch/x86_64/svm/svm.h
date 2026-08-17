@@ -571,6 +571,11 @@ void hype_svm_vcpu_reinject_exception(hype_vcpu_ctx_t *ctx, uint8_t vector,
  */
 void hype_svm_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector);
 
+/* #512: mark a just-queued vector as PIC-sourced / cancel only such vectors. The #455 prune
+ * must not cancel an IO-APIC or MSI vector that merely shares the masked PIC's vector range. */
+void hype_svm_vcpu_note_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector);
+void hype_svm_vcpu_cancel_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector);
+
 /* SMP-2 (#186): set the CPU topology this vCPU's guest sees. Called once per vCPU after
  * creation; see hype_cpuid_topology_t on why it is per-vCPU rather than global. */
 void hype_svm_vcpu_set_topology(hype_vcpu_ctx_t *ctx, uint32_t apic_id, uint32_t vcpu_count,

@@ -292,6 +292,9 @@ struct hype_vcpu_ctx {
      * interrupt would be lost. Now a 256-bit IRR, matching the SVM ctx.
      */
     uint32_t pending_irr[8];
+    /* #512: which pending_irr bits the PIC-acknowledge path queued -- the only ones the #455
+     * prune may cancel. See the SVM ctx's field of the same name. */
+    uint32_t pending_pic[8];
     /* #456: vectors staged into VM_ENTRY_INTR_INFO since the caller last drained this.
      * Mirrors the SVM ctx's field of the same name -- see svm.h on why the guest's
      * emulated LAPIC ISR must be marked at injection time, not at request time. */
@@ -399,6 +402,7 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
     unsigned i;
     for (i = 0; i < 8u; i++) {
         ctx->pending_irr[i] = 0;
+        ctx->pending_pic[i] = 0; /* #512 */
         ctx->inj_notify[i] = 0; /* #456 */
     }
     /* SMP-2: a recycled slot must not inherit the previous guest's topology. */
@@ -1908,6 +1912,7 @@ int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
                 unsigned i;
                 for (i = 0; i < 8u; i++) {
                     hype_svm_irr_clear(real->pending_irr, (uint8_t)(old_offset + i));
+                    hype_svm_irr_clear(real->pending_pic, (uint8_t)(old_offset + i)); /* #512 */
                 }
             }
             rc = hype_pic_emu_io_write(pic, port, rax);
@@ -2867,6 +2872,7 @@ void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
         int v = hype_svm_irr_highest(real->pending_irr);
         if (v >= 0) {
             hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+            hype_svm_irr_clear(real->pending_pic, (uint8_t)v); /* #512 */
             vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
             vmx_note_injected(real, (uint8_t)v); /* #456 */
             g_vmx_int_eventinj++;
@@ -2911,6 +2917,7 @@ int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
         return 0;
     }
     hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+    hype_svm_irr_clear(real->pending_pic, (uint8_t)v); /* #512 */
     vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
     vmx_note_injected(real, (uint8_t)v); /* #456 */
     g_vmx_int_window++; /* drained from the queue once the guest could accept it */
@@ -2931,6 +2938,7 @@ void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx) {
     int v = hype_svm_irr_highest(real->pending_irr);
     if (v >= 0 && !vmx_entry_event_staged()) {
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        hype_svm_irr_clear(real->pending_pic, (uint8_t)v); /* #512 */
         vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
         vmx_note_injected(real, (uint8_t)v); /* #456 */
     }
@@ -3182,6 +3190,25 @@ void hype_vmx_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_irr_clear(real->pending_irr, vector);
+    hype_svm_irr_clear(real->pending_pic, vector); /* #512 */
+}
+
+/* #512: VMX mirrors of the SVM note/cancel pair -- see svm.h. */
+void hype_vmx_vcpu_note_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if ((real->pending_irr[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0u) {
+        hype_svm_irr_set(real->pending_pic, vector);
+    }
+}
+
+void hype_vmx_vcpu_cancel_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if ((real->pending_pic[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0u) {
+        vmx_ensure_current(ctx); /* #483: vmx_set_intr_window writes the CURRENT VMCS */
+        hype_svm_irr_clear(real->pending_irr, vector);
+        hype_svm_irr_clear(real->pending_pic, vector);
+        vmx_set_intr_window(hype_svm_irr_any(real->pending_irr) ? 1 : 0);
+    }
 }
 
 /*
