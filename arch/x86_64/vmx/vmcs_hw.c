@@ -2498,20 +2498,9 @@ static uint32_t vmx_mmio_store_val_at(const hype_mmio_decode_t *d, uint64_t *reg
  */
 static void vmx_mmio_finish_read_at(const hype_mmio_decode_t *d, uint64_t *reg, uint32_t value,
                                     uint64_t *rflags) {
-    if (d->op == HYPE_MMIO_ALU_MOV) {
-        *reg = hype_mmio_merge_read_value(*reg, value, d->size_bytes, d->zero_extend);
-        return;
-    }
-    {
-        uint32_t result = hype_mmio_alu_apply(d->op,
-                                             hype_mmio_extract_write_value(*reg, d->size_bytes),
-                                             value, d->size_bytes, rflags);
-        if (hype_mmio_alu_writes_reg(d->op)) {
-            /* A 32-bit result zero-extends the whole 64-bit register, as a native ALU op would. */
-            *reg = (d->size_bytes == 4u) ? (uint64_t)result
-                                         : hype_mmio_merge_read_value(*reg, result, d->size_bytes, 0);
-        }
-    }
+    /* #457: shared with the SVM handlers -- MOV, register ALU forms, and the immediate CMP
+     * (reg NULL) in one place. */
+    hype_mmio_complete_read(d, reg, value, rflags);
 }
 
 static uint32_t vmx_mmio_store_val(struct vmx_mmio_access *m, uint32_t cur) {
@@ -3338,6 +3327,72 @@ static int vmx_mmio_begin_insn(struct hype_vcpu_ctx *real, uint64_t base, uint64
 
 /* Guest Local APIC MMIO. xAPIC registers are 32-bit only, so a non-4-byte
  * access fails closed rather than being half-emulated. */
+/*
+ * #457: the FW-1-grade pflash handler. hype_vmx_vcpu_handle_pflash_npf() above reads the
+ * faulting instruction at GUEST_RIP as a host pointer -- true only for an identity-mapped
+ * microtest guest. A live guest's RIP needs the caller's fetch, exactly like the LAPIC handler
+ * below. 1/2/4-byte accesses are all legal on a flash window, so no width restriction.
+ */
+int hype_vmx_vcpu_handle_pflash_npf_insn(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
+                                         uint64_t pf_base_phys, const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+
+    if (vmx_mmio_begin_insn(real, pf_base_phys, pf->size, guest_insn_bytes, &m) != 0) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint32_t cur = 0;
+        if (m.decoded.mem_is_dst &&
+            hype_pflash_read(pf, m.offset, m.decoded.size_bytes, &cur) != 0) {
+            return -1;
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
+        if (hype_pflash_write(pf, m.offset, m.decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_pflash_read(pf, m.offset, m.decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        vmx_mmio_finish_read(&m, value);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
+/*
+ * #457: invalidate EPT-derived mappings after a runtime EPT edit. Guest-physical and combined
+ * mappings survive VM entries (they are tagged by EPTP, and by VPID when #273 enabled it), so
+ * editing a leaf without this can leave a vCPU translating through the OLD permission.
+ * Single-context against this vCPU's own EPTP when the CPU supports it, global otherwise --
+ * IA32_VMX_EPT_VPID_CAP bit 25 = single-context INVEPT, bit 26 = global.
+ */
+void hype_vmx_vcpu_invept(hype_vcpu_ctx_t *ctx) {
+    struct {
+        uint64_t eptp;
+        uint64_t reserved;
+    } desc;
+    uint64_t cap = rdmsr(HYPE_MSR_IA32_VMX_EPT_VPID_CAP);
+    uint64_t type;
+    int ok;
+
+    vmx_ensure_current(ctx);
+    desc.eptp = vmread(HYPE_VMCS_EPT_POINTER, &ok);
+    desc.reserved = 0;
+    if ((cap & (1ULL << 25)) != 0ULL && ok) {
+        type = 1; /* single-context */
+    } else if ((cap & (1ULL << 26)) != 0ULL) {
+        type = 2; /* global */
+        desc.eptp = 0;
+    } else {
+        return; /* no INVEPT at all: EPT without INVEPT support does not exist in practice */
+    }
+    __asm__ volatile("invept %0, %1" ::"m"(desc), "r"(type) : "cc", "memory");
+}
+
 int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                    uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */

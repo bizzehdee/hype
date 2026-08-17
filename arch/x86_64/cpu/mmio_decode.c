@@ -335,8 +335,18 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
             unsigned int imm_index = (unsigned int)(modrm_index + 1 + tail_len);
             unsigned int imm_len;
             hype_mmio_alu_op_t op;
+            /*
+             * #457: /7 CMP joins the group as a READ. It writes no destination, so unlike its
+             * siblings the fault is a read and nothing is stored -- OVMF's flash FVB driver
+             * validates the variable-store header with `cmpb $imm, offset(%reg)` and hype
+             * panicked on it as undecodable. The handler applies value-vs-imm and writes
+             * FLAGS only (hype_mmio_alu_writes_reg(CMP) is already 0).
+             */
+            int is_cmp = ((raw_reg_field & 0x07u) == 7u);
 
-            if (group1_op(raw_reg_field, &op) != 0) {
+            if (is_cmp) {
+                op = HYPE_MMIO_ALU_CMP;
+            } else if (group1_op(raw_reg_field, &op) != 0) {
                 return -1;
             }
             out->size_bytes = (opcode == 0x80u) ? 1u : (operand16 ? 2u : 4u);
@@ -344,8 +354,8 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
             if (imm_index + imm_len > num_bytes) {
                 return -1;
             }
-            out->is_write = 1;
-            out->mem_is_dst = 1;
+            out->is_write = is_cmp ? 0 : 1;
+            out->mem_is_dst = is_cmp ? 0 : 1;
             out->reg = 0;
             out->zero_extend = 0;
             out->has_imm = 1;
@@ -517,4 +527,34 @@ uint32_t hype_mmio_alu_apply(hype_mmio_alu_op_t op, uint32_t dst_value, uint32_t
     *rflags &= ~(RFLAGS_CF | RFLAGS_OF);
     set_result_flags(rflags, result, size_bytes);
     return result;
+}
+
+/*
+ * #457: complete a decoded device READ into its destination -- one shared implementation of the
+ * MOV merge, the #305 register-source ALU forms, and the immediate CMP (`cmp $imm, mem`), which
+ * is the one form where `reg` is legitimately NULL. Before this existed every handler carried
+ * its own copy of the tail, and the imm-read case would have been a NULL *reg dereference in
+ * each copy that forgot it.
+ *
+ * Operand order matters and differs by form: the register forms compute reg <op> mem (#305:
+ * `and edx, [rcx+0xf0]`), the immediate CMP computes mem - imm (`cmpb $0x2, 0x37(%rdi)`).
+ */
+void hype_mmio_complete_read(const hype_mmio_decode_t *d, uint64_t *reg, uint32_t value,
+                             uint64_t *rflags) {
+    if (d->op == HYPE_MMIO_ALU_MOV) {
+        *reg = hype_mmio_merge_read_value(*reg, value, d->size_bytes, d->zero_extend);
+        return;
+    }
+    {
+        uint32_t lhs = d->has_imm ? value : hype_mmio_extract_write_value(*reg, d->size_bytes);
+        uint32_t rhs = d->has_imm ? d->imm_value : value;
+        uint32_t result = hype_mmio_alu_apply(d->op, lhs, rhs, d->size_bytes, rflags);
+        if (!d->has_imm && hype_mmio_alu_writes_reg(d->op)) {
+            /* A 32-bit result zero-extends the whole 64-bit register, as a native ALU
+             * op would. */
+            *reg = (d->size_bytes == 4u)
+                       ? (uint64_t)result
+                       : hype_mmio_merge_read_value(*reg, result, d->size_bytes, 0);
+        }
+    }
 }

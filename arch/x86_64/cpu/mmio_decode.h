@@ -163,6 +163,14 @@ uint32_t hype_mmio_extract_write_value(uint64_t reg_value, uint8_t size_bytes);
 uint32_t hype_mmio_store_value(const hype_mmio_decode_t *d, uint64_t reg_value);
 
 /*
+ * #457: complete a decoded device READ -- MOV merge, register-source ALU (#305), or the
+ * immediate CMP, the one read form where `reg` is legitimately NULL. One helper so no handler
+ * can carry a read tail that dereferences reg on the imm form.
+ */
+void hype_mmio_complete_read(const hype_mmio_decode_t *d, uint64_t *reg, uint32_t value,
+                             uint64_t *rflags);
+
+/*
  * #307: the value a memory-DESTINATION ALU instruction writes back, given the device
  * register's current contents. `mem_value` is what the handler just read from the device,
  * `reg_value` the source register's 64-bit contents (ignored when the source is an

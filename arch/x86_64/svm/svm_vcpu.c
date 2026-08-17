@@ -2922,7 +2922,7 @@ static int hype_svm_ahci_atapi_npf_common(struct hype_vcpu_ctx *real, hype_ahci_
             hype_debug_print("ahci-trace: ABAR read  off=0x%x val=0x%x\n", (unsigned int)offset,
                               (unsigned int)value);
         }
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
     }
 
     real->vmcb->save.rip += decoded.instr_len;
@@ -3541,7 +3541,7 @@ static int hype_svm_ahci_disk_npf_common(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci
         if (hype_ahci_mmio_read(ahci, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
     }
 
     real->vmcb->save.rip += decoded.instr_len;
@@ -3727,7 +3727,7 @@ int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uin
     } else {
         uint32_t value = 0;
         hype_pci_config_read(pci, &addr, decoded.size_bytes, &value);
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
     }
 
     real->vmcb->save.rip += decoded.instr_len;
@@ -3774,7 +3774,7 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
         /* Reserved area of the MMIO BAR -- reads as 0, writes ignored,
          * same convention devices/ahci.h's own MMIO model uses. */
         if (!decoded.is_write) {
-            *reg = hype_mmio_merge_read_value(*reg, 0, decoded.size_bytes, decoded.zero_extend);
+            hype_mmio_complete_read(&decoded, reg, 0, &real->vmcb->save.rflags); /* #457 */
         }
         real->vmcb->save.rip += decoded.instr_len;
         return 0;
@@ -3802,7 +3802,7 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
         if (hype_bochs_vbe_mmio_read(dev, offset - HYPE_BOCHS_VBE_DISPI_OFFSET, &value) != 0) {
             return -1;
         }
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
     }
 
     real->vmcb->save.rip += decoded.instr_len;
@@ -3839,8 +3839,9 @@ int hype_svm_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_ins
             return -1;
         }
         if (!decoded.is_write) {
-            *reg = hype_mmio_merge_read_value(*reg, allones, decoded.size_bytes,
-                                              decoded.zero_extend);
+            /* #457: shared completion -- the immediate CMP is a READ with reg NULL, and this
+             * direct merge would have dereferenced it. */
+            hype_mmio_complete_read(&decoded, reg, allones, &real->vmcb->save.rflags);
         } else if (decoded.mem_is_dst) {
             /* #307: the write half is dropped like any other, but the FLAGS an RMW sets are
              * still observable to the guest's next branch, and they are computed against the
@@ -3911,8 +3912,7 @@ int hype_svm_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
         if (decoded.size_bytes == 8u) {
             *reg = value;
         } else {
-            *reg = hype_mmio_merge_read_value(*reg, (uint32_t)value, decoded.size_bytes,
-                                              decoded.zero_extend);
+            hype_mmio_complete_read(&decoded, reg, (uint32_t)value, &real->vmcb->save.rflags); /* #457 */
         }
     }
 
@@ -3937,6 +3937,85 @@ undecoded:
         }
     }
     return -1;
+}
+
+/*
+ * #457: the FW-1-grade pflash NPF handler. hype_svm_vcpu_handle_npf() above reads the faulting
+ * instruction via save.rip AS A HOST POINTER, which is only true for M4-3's identity-mapped
+ * microtest -- a live guest's RIP is guest-virtual under guest paging on a remapped NPT, so the
+ * caller resolves the instruction bytes (decode assist or page-table walk) and passes them in,
+ * exactly as the LAPIC/IO-APIC handlers already take them. Same decode surface as the LAPIC
+ * handler (MOV/imm/RMW/ALU forms), but 1/2/4-byte accesses are all legal on a flash window.
+ */
+int hype_svm_vcpu_handle_pflash_npf_insn(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
+                                         uint64_t pf_base_phys, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < pf_base_phys || npf.guest_phys_addr >= pf_base_phys + pf->size) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - pf_base_phys);
+
+    if (guest_insn_bytes == 0 ||
+        hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value;
+        if (decoded.mem_is_dst) {
+            uint32_t cur = 0;
+            if (hype_pflash_read(pf, offset, decoded.size_bytes, &cur) != 0) {
+                return -1;
+            }
+            value = hype_mmio_rmw_value(&decoded, reg ? *reg : 0u, cur,
+                                        &real->vmcb->save.rflags);
+        } else {
+            value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
+        }
+        if (hype_pflash_write(pf, offset, decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_pflash_read(pf, offset, decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        /* #457: shared read-completion -- handles MOV, the register ALU forms, and the
+         * immediate CMP where reg is NULL. */
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
+/*
+ * #457: arm a flush-this-guest for the NEXT entry, after a runtime NPT edit. The run path
+ * already clears TLB_CONTROL after every VMRUN (#244), so this is consumed exactly once.
+ */
+void hype_svm_vcpu_request_tlb_flush(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real == 0 || real->vmcb == 0) {
+        return;
+    }
+    real->vmcb->control.guest_asid_tlb_ctl =
+        (real->vmcb->control.guest_asid_tlb_ctl & 0xFFFFFFFFull) |
+        ((uint64_t)HYPE_SVM_TLB_CTL_FLUSH_GUEST << 32);
 }
 
 int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
@@ -3993,34 +4072,14 @@ int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
         if (hype_guest_lapic_read(lapic, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        if (decoded.op == HYPE_MMIO_ALU_MOV) {
-            *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes,
-                                              decoded.zero_extend);
-        } else {
-            /*
-             * #305: an ALU form with the LAPIC register as its memory SOURCE. FreeBSD
-             * reads the Spurious Interrupt Vector this way -- `and edx, [rcx+0xf0]` --
-             * where Linux uses a plain MOV, which is why hype only ever needed MOV before
-             * and panicked here as "undecodable MMIO NPF".
-             *
-             * The flags are as much of the instruction as the value: emulating the load
-             * and leaving RFLAGS stale would give the guest a silently wrong conditional
-             * branch, which is worse than the panic this replaces. CMP and TEST write no
-             * register at all -- only flags.
-             */
-            uint32_t result = hype_mmio_alu_apply(decoded.op,
-                                                  hype_mmio_extract_write_value(*reg,
-                                                                                decoded.size_bytes),
-                                                  value, decoded.size_bytes,
-                                                  &real->vmcb->save.rflags);
-            if (hype_mmio_alu_writes_reg(decoded.op)) {
-                /* A 32-bit result zero-extends the whole 64-bit register, exactly as a
-                 * native ALU op would. */
-                *reg = (decoded.size_bytes == 4u)
-                           ? (uint64_t)result
-                           : hype_mmio_merge_read_value(*reg, result, decoded.size_bytes, 0);
-            }
-        }
+        /*
+         * #305: ALU forms with the device register as memory source (FreeBSD reads the
+         * Spurious Interrupt Vector as `and edx, [rcx+0xf0]`); #457: plus the immediate
+         * CMP, where reg is NULL. One shared completion -- hype_mmio_complete_read --
+         * because every hand-rolled copy of this tail was a NULL *reg dereference waiting
+         * for the imm form.
+         */
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags);
     }
 
     real->vmcb->save.rip += decoded.instr_len;
@@ -4117,7 +4176,7 @@ int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
         if (hype_ioapic_mmio_read(ioapic, offset, &value) != 0) {
             return -1;
         }
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
     }
 
     real->vmcb->save.rip += decoded.instr_len;
@@ -4609,7 +4668,7 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
             if (hype_virtio_blk_common_cfg_read(dev, region_offset, decoded.size_bytes, &value) != 0) {
                 return -1;
             }
-            *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+            hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
         }
     } else if (offset >= HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET &&
                offset < HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET + 4u) {
@@ -4620,12 +4679,12 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
                 }
             }
         } else {
-            *reg = hype_mmio_merge_read_value(*reg, 0, decoded.size_bytes, decoded.zero_extend);
+            hype_mmio_complete_read(&decoded, reg, 0, &real->vmcb->save.rflags); /* #457 */
         }
     } else if (offset == HYPE_VIRTIO_BLK_BAR_ISR_CFG_OFFSET) {
         if (!decoded.is_write) {
             uint8_t value = hype_virtio_blk_isr_read(dev);
-            *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+            hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
         }
     } else if (offset >= HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET &&
                offset < HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET + HYPE_VIRTIO_BLK_CFG_SIZE) {
@@ -4635,12 +4694,12 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
             if (hype_virtio_blk_device_cfg_read(dev, region_offset, decoded.size_bytes, &value) != 0) {
                 return -1;
             }
-            *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+            hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
         }
     } else {
         /* Reserved area of the MMIO BAR -- reads as 0, writes ignored. */
         if (!decoded.is_write) {
-            *reg = hype_mmio_merge_read_value(*reg, 0, decoded.size_bytes, decoded.zero_extend);
+            hype_mmio_complete_read(&decoded, reg, 0, &real->vmcb->save.rflags); /* #457 */
         }
     }
 
@@ -4986,7 +5045,8 @@ int hype_svm_vcpu_handle_npf(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf, uint64_t p
         if (hype_pflash_read(pf, offset, decoded.size_bytes, &value) != 0) {
             return -1;
         }
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        /* #457: shared completion -- also covers the immediate CMP, where reg is NULL. */
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags);
     }
 
     /* Same "next-RIP-for-free" convenience as HLT/IOIO, just sourced
@@ -5089,7 +5149,7 @@ int hype_svm_vcpu_handle_nvme_npf(hype_vcpu_ctx_t *ctx, hype_nvme_t *dev,
         if (decoded.op != HYPE_MMIO_ALU_MOV) {
             return -1;
         }
-        *reg = hype_mmio_merge_read_value(*reg, value, decoded.size_bytes, decoded.zero_extend);
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
     }
 
     real->vmcb->save.rip += decoded.instr_len;
