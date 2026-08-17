@@ -12400,6 +12400,16 @@ wait_for_sipi:
                 }
                 g_ap_vcpu_unhandled[vm_idx][vi]++;
             }
+        } else if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_WBINVD) {
+            /*
+             * #520/#368: retire it without flushing any real cache, exactly as the BSP does.
+             *
+             * Missed by the exit-reason diff that found the others because the BSP tests this one
+             * INLINE rather than through a vmm_reason_is_* helper -- so comparing helper names
+             * said the loops agreed when they did not. Measured on the Intel rig once the AP got
+             * as far as OVMF's cache setup: 1,121,883 unhandled WBINVD exits at one RIP.
+             */
+            hype_vmx_vcpu_handle_wbinvd();
         } else if (vmm_reason_is_xsetbv(kind, info.reason)) {
             /*
              * #520: the AP loop was missing this too. Linux executes XSETBV on EVERY CPU as it
@@ -15718,6 +15728,38 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                              (unsigned long long)g_436_lvt_change_count,
                                              (unsigned)g_436_lvt_last_old,
                                              (unsigned)g_436_lvt_last_new);
+                            /*
+                             * #520: where the guest actually IS, every 5s.
+                             *
+                             * A guest that stops exiting is invisible to every counter hype
+                             * keeps -- exit histograms flatline and say nothing about whether it
+                             * is spinning, halted or wandering. This is the one question worth
+                             * asking at that point, and it is answerable now that
+                             * vmm_get_debug_state() reports on VMX as well as SVM.
+                             */
+                            {
+                                hype_svm_debug_state_t gs;
+                                if (vmm_get_debug_state(kind, ctx, &gs)) {
+                                    unsigned gpv = (unsigned)(vm - g_vms);
+                                    hype_debug_print("fw-1 GUESTPC vm%u: exits=%llu lastreason=0x%llx "
+                                                     "lastrip=0x%llx | cs=0x%x:0x%llx rip=0x%llx "
+                                                     "rflags=0x%llx cr0=0x%llx cr3=0x%llx "
+                                                     "cr4=0x%llx rsp=0x%llx activity=%llu [#520]\n",
+                                                     gpv,
+                                                     (unsigned long long)g_bsp_probe_exits[gpv],
+                                                     (unsigned long long)g_bsp_probe_reason[gpv],
+                                                     (unsigned long long)g_bsp_probe_rip[gpv],
+                                                     (unsigned)gs.cs_selector,
+                                                     (unsigned long long)gs.cs_base,
+                                                     (unsigned long long)gs.rip,
+                                                     (unsigned long long)gs.rflags,
+                                                     (unsigned long long)gs.cr0,
+                                                     (unsigned long long)gs.cr3,
+                                                     (unsigned long long)gs.cr4,
+                                                     (unsigned long long)gs.rsp,
+                                                     (unsigned long long)gs.nrip);
+                                }
+                            }
                             lt_prev = lt_sum;
                         }
                     }

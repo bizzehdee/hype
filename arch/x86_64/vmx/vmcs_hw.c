@@ -1288,7 +1288,27 @@ static void vmx_dispatch_acked_interrupt(void) {
     if (!ok || (intr_info & (1ull << 31)) == 0ull) {
         return;
     }
-    (void)hype_isr_dispatch_vector((uint8_t)(intr_info & 0xFFull));
+    if (hype_isr_dispatch_vector((uint8_t)(intr_info & 0xFFull)) == 0) {
+        /*
+         * #520: an acknowledged host interrupt hype has no handler for. The comment above called
+         * that "not an error ... carry on", and it is not, but carrying on SILENTLY is: nothing
+         * then acknowledges the source either, so a level-triggered device re-asserts and the next
+         * VM entry exits immediately on the same interrupt, forever. The guest executes not one
+         * instruction and every counter hype keeps looks healthy.
+         *
+         * Measured on the Intel rig: 83,385 external-interrupt exits at one guest RIP, the guest
+         * frozen mid-boot. The native ISR path panics on an unregistered vector; this path said
+         * nothing at all, which is the worse of the two.
+         */
+        static unsigned long long unowned;
+        unowned++;
+        if (unowned <= 8ull || (unowned % 100000ull) == 0ull) {
+            hype_debug_print("vmx: acked host interrupt vector 0x%x has NO handler (%llu so far) -- "
+                             "nothing acknowledges its source, so a level-triggered line re-exits "
+                             "on every entry [#520]\n",
+                             (unsigned)(intr_info & 0xFFull), (unsigned long long)unowned);
+        }
+    }
 }
 
 
@@ -4028,6 +4048,14 @@ void hype_vmx_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t 
      */
     out->cr2 = 0;
     out->nrip = 0;
+    /*
+     * #520: the guest's ACTIVITY STATE, carried in the unused exitintinfo slot's upper half.
+     * 0 = active, 1 = HLT, 2 = SHUTDOWN (it triple-faulted), 3 = wait-for-SIPI. Worth reporting
+     * because a guest in shutdown executes NOTHING while still taking interrupt exits, so every
+     * counter hype keeps looks alive while the guest is dead -- indistinguishable from a spin
+     * without this field.
+     */
+    out->nrip = vmread(HYPE_VMCS_GUEST_ACTIVITY_STATE, &ok);
     (void)real;
 }
 

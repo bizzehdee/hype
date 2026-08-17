@@ -199,7 +199,7 @@ boot_once() {
         qmp_args=(-qmp "unix:$OUT.qmp,server=on,wait=off")
     fi
     qemu-system-x86_64 \
-      -machine q35 -m 8192 -nodefaults \
+      -machine q35 -m "${QEMU_MEM:-8192}" -nodefaults \
       -accel kvm -cpu host -smp "${SMP:-4}" ${EXTRA_QEMU_ARGS:-} \
       -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
       -drive if=pflash,format=raw,file="$OUT.vars.fd" \
