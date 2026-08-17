@@ -102,4 +102,16 @@ void hype_npt_mark_range_not_present(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_
 void hype_npt_map_range(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE], uint64_t guest_phys_base,
                          uint64_t host_phys_base, uint64_t size);
 
+/*
+ * #457: hype_npt_map_range with the leaf WRITABLE bit clear. Reads and
+ * instruction fetches go direct (XIP firmware keeps full speed); only
+ * guest WRITES fault, which is how the OVMF flash window routes variable
+ * writes into the pflash model without a 4KB NPT level. Same alignment
+ * rules as hype_npt_map_range. Pure struct mutation -- the caller owns
+ * the TLB flush (hype_svm_vcpu_request_tlb_flush) that makes a runtime
+ * edit visible.
+ */
+void hype_npt_map_range_ro(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                           uint64_t guest_phys_base, uint64_t host_phys_base, uint64_t size);
+
 #endif /* HYPE_ARCH_SVM_NPT_H */

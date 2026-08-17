@@ -220,6 +220,12 @@ void hype_vmx_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, 
  * there and the caller resolves it via its own page-table walk. */
 int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                    uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes);
+/* #457: FW-1-grade pflash handler -- takes the faulting instruction's bytes
+ * like the LAPIC handler, bounds to pf->size. */
+int hype_vmx_vcpu_handle_pflash_npf_insn(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
+                                         uint64_t pf_base_phys, const uint8_t *guest_insn_bytes);
+/* #457: invalidate EPT-derived mappings after a runtime EPT edit. */
+void hype_vmx_vcpu_invept(hype_vcpu_ctx_t *ctx);
 int hype_vmx_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
                                     uint64_t ioapic_base_phys, const uint8_t *guest_insn_bytes);
 int hype_vmx_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,

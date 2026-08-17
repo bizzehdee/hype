@@ -68,6 +68,11 @@ void hype_ept_build_identity(hype_ept_pte_t *pml4, hype_ept_pte_t *pdpt,
  */
 void hype_ept_map_range(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
                         uint64_t guest_phys_base, uint64_t host_phys_base, uint64_t size);
+/* #457: hype_ept_map_range without the WRITE grant -- reads/fetches direct,
+ * writes take an EPT violation. Caller owns the INVEPT that makes a runtime
+ * edit visible (hype_vmx_vcpu_invept). */
+void hype_ept_map_range_ro(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                           uint64_t guest_phys_base, uint64_t host_phys_base, uint64_t size);
 void hype_ept_mark_not_present(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
                                uint64_t phys_addr);
 void hype_ept_mark_range_not_present(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],

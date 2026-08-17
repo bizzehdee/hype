@@ -631,6 +631,22 @@ typedef struct hype_fw_vm {
     uint64_t combined_size;
     uint64_t code_size;
     uint64_t vars_size;
+    /*
+     * #457: the VARS region as the CFI flash chip OVMF probes for. Backing = the VARS bytes at
+     * the head of the combined buffer, so flash writes land exactly where #441's varstore
+     * save/restore already looks. The window is NPT/EPT-mapped READ-ONLY while the chip is in
+     * READ_ARRAY mode (reads and XIP fetches direct, writes fault into the model), and flipped
+     * to fully-trapped while a command sequence is in flight so status/query READS can be
+     * synthesized -- the ROMD dance QEMU's pflash does, at 2MB granularity.
+     */
+    hype_pflash_t vars_flash;
+    /* #457: the CODE bytes sharing VARS's flipped 2MB page(s), served as a permanently
+     * READ_ARRAY array so a fetch/read that lands there mid-command still returns true bytes. */
+    hype_pflash_t codehead_flash;
+    uint8_t flash_trap_mode; /* 1 while the VARS pages are fully trapped */
+    /* #457: a runtime NPT/EPT edit needs each vCPU's nested TLB flushed before its next
+     * entry; set for all on every flip, consumed in both dispatch loops. */
+    volatile uint8_t flash_flush_pending[HYPE_MAX_VCPUS_PER_VM];
     /* FW-1a: the guest's own low RAM, NPT-mapped at guest-physical [0,size).
      * Must stay 2MB-aligned and <= 0xE0000000 (the Q35 32-bit MMIO hole base
      * OVMF asserts low RAM stays under). See HYPE_FW_1_GUEST_RAM_BYTES. */
@@ -4465,6 +4481,23 @@ static int vmm_handle_pflash_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hyp
     }
     return hype_svm_vcpu_handle_npf(ctx, pf, pf_base_phys);
 }
+/* #457: the FW-1-grade variant -- takes fetched instruction bytes because a live guest's RIP is
+ * not a host pointer (the handlers above are the M4-3 identity-map microtest's). */
+static int vmm_handle_pflash_npf_insn(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
+                                      uint64_t pf_base_phys, const uint8_t *insn) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_pflash_npf_insn(ctx, pf, pf_base_phys, insn);
+    }
+    return hype_svm_vcpu_handle_pflash_npf_insn(ctx, pf, pf_base_phys, insn);
+}
+/* #457: make a runtime NPT/EPT edit visible to this vCPU's next entry. */
+static void vmm_request_nested_tlb_flush(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_invept(ctx);
+    } else {
+        hype_svm_vcpu_request_tlb_flush(ctx);
+    }
+}
 static int vmm_handle_pci_ecam_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
                                    uint64_t ecam_base_phys, uint64_t guest_rip) {
     if (kind == HYPE_VMM_KIND_VMX) {
@@ -4873,6 +4906,116 @@ static int vmm_handle_ahci_disk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *c
 static int vmm_absorb_mmio_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, const uint8_t *insn) {
     return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_absorb_mmio_npf(ctx, insn)
                                      : hype_svm_vcpu_absorb_mmio_npf(ctx, insn);
+}
+
+/* #457: diagnostics -- flips are rare (a handful per SetVariable), so counting them is cheap
+ * and says whether the mechanism ran at all, which is this ticket's whole history. */
+static uint64_t g_flash_trap_flips;
+static uint64_t g_flash_vars_writes;
+static uint64_t g_flash_code_writes_ignored;
+
+/* #457: 2MB span of the window that must flip -- VARS plus the CODE head sharing its pages. */
+static uint64_t fw_1_flash_trap_span(const hype_fw_vm_t *vm) {
+    return (vm->vars_size + HYPE_PAGING_2MB - 1ull) & ~(HYPE_PAGING_2MB - 1ull);
+}
+
+/*
+ * #457: move the flash window between its two states, in BOTH page-table sets (the unused
+ * vendor's table costs nothing and cannot drift), and mark every vCPU's nested TLB for a flush.
+ *
+ *   direct (trap=0): whole window read-only -- reads/XIP direct, writes fault.
+ *   trap   (trap=1): the VARS-covering pages fully absent -- reads fault too, so the pflash
+ *                    model can synthesize status/query/devid responses mid-command.
+ */
+static void fw_1_flash_set_trap(hype_fw_vm_t *vm, int trap, hype_vmm_kind_t kind,
+                                hype_vcpu_ctx_t *ctx) {
+    uint64_t base = 0x100000000ULL - g_fw_1_combined_size;
+    unsigned i;
+    if (trap) {
+        uint64_t span = fw_1_flash_trap_span(vm);
+        hype_npt_mark_range_not_present(vm->npt_pd, base, span);
+        hype_ept_mark_range_not_present(vm->ept_pd, base, span);
+    } else {
+        hype_npt_map_range_ro(vm->npt_pd, base, g_fw_1_combined_host_phys, g_fw_1_combined_size);
+        hype_ept_map_range_ro(vm->ept_pd, base, g_fw_1_combined_host_phys, g_fw_1_combined_size);
+    }
+    vm->flash_trap_mode = (uint8_t)(trap != 0);
+    g_flash_trap_flips++;
+    for (i = 0; i < HYPE_MAX_VCPUS_PER_VM; i++) {
+        vm->flash_flush_pending[i] = 1u;
+    }
+    /* The calling vCPU flushes NOW -- it is about to re-enter on the edited tables. Its own
+     * pending flag stays set; the duplicate flush at its entry site is harmless. */
+    vmm_request_nested_tlb_flush(kind, ctx);
+}
+
+/* #457: (re)bind the two pflash views to this VM's combined buffer and return the window to
+ * the direct (read-only) state. Called at VM setup and on every restart -- the backing CONTENT
+ * is the caller's business (pristine restore, #441 varstore overlay); this only resets chip
+ * protocol state, which must never survive a guest reset. */
+static void fw_1_flash_reset(hype_fw_vm_t *vm, hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    uint64_t span = fw_1_flash_trap_span(vm);
+    hype_pflash_reset(&vm->vars_flash, (uint8_t *)(uintptr_t)g_fw_1_combined_host_phys,
+                      (uint32_t)g_fw_1_vars_size);
+    hype_pflash_reset(&vm->codehead_flash,
+                      (uint8_t *)(uintptr_t)(g_fw_1_combined_host_phys + g_fw_1_vars_size),
+                      (uint32_t)(span - g_fw_1_vars_size));
+    fw_1_flash_set_trap(vm, 0, kind, ctx);
+}
+
+/*
+ * #457: a nested-paging fault inside the flash window. Returns 0 if consumed.
+ *
+ * VARS range: feed the CFI model. The first write while direct engages trap mode BEFORE the
+ * model runs, so the very next read already synthesizes; the model dropping back to READ_ARRAY
+ * disengages it. CODE range: writes are ignored like the ROM it is; reads only fault in trap
+ * mode (the shared 2MB page) and are served from the true bytes via the permanently-READ_ARRAY
+ * codehead view.
+ */
+static int fw_1_flash_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                          const hype_vmm_npf_t *npf, const uint8_t *insn) {
+    uint64_t base = 0x100000000ULL - g_fw_1_combined_size;
+    uint64_t vars_end = base + g_fw_1_vars_size;
+    if (npf->guest_phys_addr < base || npf->guest_phys_addr >= 0x100000000ULL) {
+        return -1;
+    }
+    if (npf->guest_phys_addr < vars_end) {
+        int rc;
+        int entered = 0;
+        if (!vm->flash_trap_mode && npf->is_write) {
+            fw_1_flash_set_trap(vm, 1, kind, ctx);
+            entered = 1;
+        }
+        rc = vmm_handle_pflash_npf_insn(kind, ctx, &vm->vars_flash, base, insn);
+        if (rc == 0) {
+            if (npf->is_write) {
+                g_flash_vars_writes++;
+            }
+            if (vm->flash_trap_mode && vm->vars_flash.mode == HYPE_PFLASH_MODE_READ_ARRAY) {
+                fw_1_flash_set_trap(vm, 0, kind, ctx);
+            }
+            return 0;
+        }
+        if (entered) {
+            /* Undecodable access: do not leave the window trapped for a command that never
+             * started -- that would turn one bad instruction into a dead firmware. */
+            fw_1_flash_set_trap(vm, 0, kind, ctx);
+        }
+        return -1;
+    }
+    if (npf->is_write) {
+        /* ROM semantics: a write to CODE is dropped, exactly as real hardware ignores writes
+         * to a flash that was never commanded. Counted, and loud the first time. */
+        if (g_flash_code_writes_ignored++ == 0u) {
+            hype_debug_print("fw-1 FLASH: guest write to CODE range gpa=0x%llx IGNORED [#457]\n",
+                             (unsigned long long)npf->guest_phys_addr);
+        }
+        return vmm_absorb_mmio_npf(kind, ctx, insn);
+    }
+    if (vm->flash_trap_mode && npf->guest_phys_addr < base + fw_1_flash_trap_span(vm)) {
+        return vmm_handle_pflash_npf_insn(kind, ctx, &vm->codehead_flash, vars_end, insn);
+    }
+    return -1;
 }
 static int vmm_handle_uart_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_guest_uart_t *uart,
                                 uint16_t base_port) {
@@ -11184,6 +11327,9 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     /* #441: then overlay any PREVIOUSLY saved varstore on top of the fresh pristine copy, so
      * this VM resumes with its own persisted NVRAM state rather than the pristine one. */
     fw_1_vars_request(vm, HYPE_FW_VARS_REQ_LOAD, 1); /* #454: must finish before the VM resumes */
+    /* #457: chip protocol state must never survive a guest reset, and a restart taken
+     * mid-command would otherwise leave the window trapped forever. */
+    fw_1_flash_reset(vm, kind, ctx);
     hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
     hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
 
@@ -11587,6 +11733,10 @@ wait_for_sipi:
                                          (uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR,
                                          g_vcpu_timer_reload[vm_idx][vi]);
         }
+        if (vm->flash_flush_pending[vi]) { /* #457: a flash-window remap happened */
+            vm->flash_flush_pending[vi] = 0u;
+            vmm_request_nested_tlb_flush(kind, ctx);
+        }
         if (ops->vcpu_run(ctx, &info) != 0) {
             fw_1_dev_lock(vm);
             ap_locked = 1;
@@ -11781,6 +11931,17 @@ wait_for_sipi:
                         ap_mmio_done = 1;
                         g_ap_ahci_serves[vm_idx][vi]++;
                     }
+                }
+            }
+            if (!ap_mmio_done) {
+                /* #457: the flash window, shared VM state like the devices above (this AP
+                 * holds the device lock here). A guest OS may call SetVariable from any CPU. */
+                hype_vmm_npf_t fl_npf;
+                vmm_get_last_npf(kind, ctx, &fl_npf);
+                if (fl_npf.guest_phys_addr >= 0x100000000ULL - g_fw_1_combined_size &&
+                    fl_npf.guest_phys_addr < 0x100000000ULL &&
+                    fw_1_flash_npf(vm, kind, ctx, &fl_npf, insn) == 0) {
+                    ap_mmio_done = 1;
                 }
             }
             if (ap_mmio_done) {
@@ -12537,8 +12698,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * so every range below is 2MB-granular. */
     hype_npt_build_identity(vm->npt_pml4, vm->npt_pdpt, vm->npt_pd, HYPE_FW_1_NPT_GB);
     hype_npt_map_range(vm->npt_pd, 0, g_fw_1_ram_host_phys, vm->ram_bytes);
-    hype_npt_map_range(vm->npt_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
-                        g_fw_1_combined_size);
+    /* #457: the flash window is READ-ONLY now -- fw_1_flash_reset() below installs it (in both
+     * table sets) so guest variable writes fault into the pflash model instead of silently
+     * hitting RAM, which is what left OVMF on the RAM-only EmuVariableFvb store. */
     hype_npt_mark_range_not_present(vm->npt_pd, vm->ram_bytes,
                                      (0x100000000ULL - g_fw_1_combined_size) - vm->ram_bytes);
     npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
@@ -12567,13 +12729,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      */
     hype_ept_build_identity(vm->ept_pml4, vm->ept_pdpt, vm->ept_pd, HYPE_FW_1_NPT_GB);
     hype_ept_map_range(vm->ept_pd, 0, g_fw_1_ram_host_phys, vm->ram_bytes);
-    hype_ept_map_range(vm->ept_pd, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
-                       g_fw_1_combined_size);
     hype_ept_mark_range_not_present(vm->ept_pd, vm->ram_bytes,
                                     (0x100000000ULL - g_fw_1_combined_size) - vm->ram_bytes);
     if (g_fw_1_kind == HYPE_VMM_KIND_VMX) {
         npt_root_phys = (uint64_t)(uintptr_t)vm->ept_pml4;
     }
+    /* #457: bind the pflash views and install the read-only flash window in BOTH table sets.
+     * ctx does not exist yet, so no vCPU flush is needed or possible -- nothing has run. */
+    fw_1_flash_reset(vm, kind, 0);
 
     /* VALID-1/VALID-3: the guest-physical -> host map, mirroring the two
      * hype_npt_map_range() calls above exactly. The AHCI DMA path
@@ -13184,6 +13347,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                     g_bsp_disp_start[vd_] = 0ull;
                 }
+            }
+            if (vm->flash_flush_pending[0]) { /* #457: a flash-window remap happened */
+                vm->flash_flush_pending[0] = 0u;
+                vmm_request_nested_tlb_flush(kind, ctx);
             }
             fw_1_dev_unlock(vm);
             g_bsp_probe_entry_tsc[(unsigned)(vm - g_vms)] = hype_rdtsc(); /* #483 */
@@ -16467,6 +16634,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
             vmm_get_last_npf(kind, ctx, &npf);
+            /* #457: the OVMF flash window -- VARS writes feed the CFI model; trapped-mode
+             * reads synthesize status/query; CODE writes are dropped like ROM. Checked
+             * before the absorb catch-all, which would otherwise eat the command bytes. */
+            if (npf.guest_phys_addr >= 0x100000000ULL - g_fw_1_combined_size &&
+                npf.guest_phys_addr < 0x100000000ULL &&
+                fw_1_flash_npf(vm, kind, ctx, &npf, insn) == 0) {
+                continue;
+            }
             /* GLADDER-1: the NPF hit no modeled device. Instead of PANICking
              * (which killed the guest at the FIRST unmodeled region and hid the
              * rest), ABSORB it like real hardware does for absent MMIO: reads
@@ -23383,6 +23558,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                         g_436_last_p60_tsc ? ((now436 - g_436_last_p60_tsc) * 1000ull) / hz : 0ull,
                                         (unsigned)g_436_last_p60_val);
                                 }
+                                /* #457: did the flash machinery run at all -- and did the guest
+                                 * actually write its varstore. Zero writes on a boot that reached
+                                 * BDS means OVMF still concluded "not flash". */
+                                hype_debug_print("fw-1 FLASH: vars_writes=%llu trap_flips=%llu "
+                                                 "code_writes_ignored=%llu trap_now=%u [#457]\n",
+                                                 (unsigned long long)g_flash_vars_writes,
+                                                 (unsigned long long)g_flash_trap_flips,
+                                                 (unsigned long long)g_flash_code_writes_ignored,
+                                                 (unsigned)g_vms[0].flash_trap_mode);
                                 {   /* #483: each VM dispatch core's progress, reported from THIS
                                      * core -- when a dispatch loop wedges (VMX: one exit in
                                      * 180 s) it cannot print its own diagnostics, and the AP-side

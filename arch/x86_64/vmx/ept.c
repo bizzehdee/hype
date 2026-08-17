@@ -61,6 +61,23 @@ void hype_ept_map_range(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
     }
 }
 
+void hype_ept_map_range_ro(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                           uint64_t guest_phys_base, uint64_t host_phys_base, uint64_t size) {
+    /* #457: the EPT twin of hype_npt_map_range_ro -- read+execute, no write, so a guest write
+     * raises an EPT violation (exit reason 48) with the write bit in the qualification. */
+    uint64_t page_flags = HYPE_EPT_READ | HYPE_EPT_EXEC | HYPE_EPT_MEMTYPE_WB | HYPE_EPT_PS;
+    uint64_t offset;
+
+    for (offset = 0; offset < size; offset += HYPE_PAGING_2MB) {
+        uint64_t guest_phys = guest_phys_base + offset;
+        uint64_t host_phys = host_phys_base + offset;
+        unsigned int gb = (unsigned int)(guest_phys / HYPE_PAGING_1GB);
+        unsigned int pd_index = (unsigned int)((guest_phys % HYPE_PAGING_1GB) / HYPE_PAGING_2MB);
+
+        pd_tables[gb][pd_index] = hype_ept_encode_entry(host_phys, page_flags);
+    }
+}
+
 /*
  * Make a guest-physical 2MB page fault on any access. Zero is the not-present
  * encoding for EPT as it is for ordinary paging: with R/W/X all clear the entry

@@ -1127,6 +1127,14 @@ int hype_svm_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
 int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                     uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes);
 
+/* #457: FW-1-grade pflash NPF glue -- takes the faulting instruction's bytes like the LAPIC
+ * handler above, because a live guest's RIP is not a host pointer. Bounds to pf->size. */
+int hype_svm_vcpu_handle_pflash_npf_insn(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
+                                         uint64_t pf_base_phys, const uint8_t *guest_insn_bytes);
+
+/* #457: arm a flush-this-guest for the next entry, after a runtime NPT edit. */
+void hype_svm_vcpu_request_tlb_flush(hype_vcpu_ctx_t *ctx);
+
 /* M4-6b3: FW-1's exempt NPF glue for the emulated I/O APIC (devices/ioapic.h)
  * at 0xFEC00000 -- same shape/exemption reasoning as the LAPIC glue above. */
 int hype_svm_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,

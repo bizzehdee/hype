@@ -54,3 +54,22 @@ void hype_npt_map_range(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE], u
         pd_tables[gb][pd_index] = hype_paging_encode_entry(host_phys, page_flags);
     }
 }
+
+void hype_npt_map_range_ro(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                           uint64_t guest_phys_base, uint64_t host_phys_base, uint64_t size) {
+    /* #457: leaf entries WITHOUT the writable bit. Reads and instruction fetches translate
+     * directly at full speed; a guest write takes #VMEXIT_NPF with EXITINFO1's write bit set.
+     * The upper table levels keep W from the identity build -- NPT permissions AND together
+     * down the walk, so clearing it at the leaf alone is what forbids the write. */
+    uint64_t page_flags = HYPE_PAGING_PRESENT | HYPE_PAGING_USER | HYPE_PAGING_PS;
+    uint64_t offset;
+
+    for (offset = 0; offset < size; offset += HYPE_PAGING_2MB) {
+        uint64_t guest_phys = guest_phys_base + offset;
+        uint64_t host_phys = host_phys_base + offset;
+        unsigned int gb = (unsigned int)(guest_phys / HYPE_PAGING_1GB);
+        unsigned int pd_index = (unsigned int)((guest_phys % HYPE_PAGING_1GB) / HYPE_PAGING_2MB);
+
+        pd_tables[gb][pd_index] = hype_paging_encode_entry(host_phys, page_flags);
+    }
+}
