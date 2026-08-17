@@ -81,6 +81,14 @@ typedef struct {
     uint8_t rx[HYPE_GUEST_UART_RX_RING];
     uint32_t rx_head;
     uint32_t rx_tail;
+    /*
+     * #512: count of 0->1 transitions of the interrupt condition, kept by the MODEL. The run
+     * loop's raise-once-per-assertion latch sampled the level once per loop pass -- with a
+     * second vCPU servicing the ISR and re-arming the condition BETWEEN two passes, the poller
+     * never saw the level fall and swallowed the new edge (ttyS0 died mid-OpenRC; apk blocked
+     * on its progress write). An edge counted where it happens cannot be missed by a poller.
+     */
+    unsigned long long irq_events;
 } hype_guest_uart_t;
 
 void hype_guest_uart_reset(hype_guest_uart_t *u);
@@ -101,6 +109,10 @@ int hype_guest_uart_tx_dequeue(hype_guest_uart_t *u, uint8_t *out);
  * on a write if the serial IRQ is never delivered. The vCPU loop turns
  * this into a raised PIC IRQ on the UART's line (COM1=IRQ4, COM2=IRQ3). */
 int hype_guest_uart_irq_pending(const hype_guest_uart_t *u);
+
+/* #512: the model's count of interrupt-condition 0->1 edges. The caller raises the guest's
+ * line once per count it has not yet acted on, instead of edge-detecting the sampled level. */
+unsigned long long hype_guest_uart_irq_events(const hype_guest_uart_t *u);
 
 /* Feed one input byte to the guest (RBR + LSR.DR). Returns 1 if
  * accepted, 0 if the RX ring is full. Used by an input source (FW-1f);

@@ -94,6 +94,15 @@ struct hype_vcpu_ctx {
      * last, killing a self-re-arming one-shot clockevent that lost its tick.
      * Queue all requests here; drain highest-first, one per VMRUN. */
     uint32_t pending_irr[8];
+    /*
+     * #512: which pending_irr bits came from the legacy-PIC acknowledge path. The #455 pruner
+     * used to cancel any pending vector that NUMERICALLY mapped to a masked PIC line -- but an
+     * APIC-mode Linux guest leaves the (fully masked) PIC based at 0x20 while allocating
+     * IO-APIC vectors 0x21+, so every deferred keyboard (0x21) and COM1 (0x22) interrupt was
+     * silently cancelled as a "masked PIC vector". Measured: 2122 requested, 162 injected,
+     * the rest pruned. Only a bit set HERE may be pruned on the PIC's behalf.
+     */
+    uint32_t pending_pic[8];
     /* M7-1 (#91): the guest's Hyper-V OS identity and hypercall-page MSR values.
      * Per-vCPU for the same reason pvclock_map is: two guests run concurrently and
      * each writes its own. Stored so a read returns what was written; hype services
@@ -379,6 +388,7 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
         int i;
         for (i = 0; i < 8; i++) {
             ctx->pending_irr[i] = 0;
+            ctx->pending_pic[i] = 0; /* #512 */
             ctx->inj_notify[i] = 0; /* #456 */
         }
         for (i = 0; i < 256; i++) {
@@ -761,6 +771,7 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
                 unsigned i;
                 for (i = 0; i < 8u; i++) {
                     hype_svm_irr_clear(real->pending_irr, (uint8_t)(old_offset + i));
+                    hype_svm_irr_clear(real->pending_pic, (uint8_t)(old_offset + i)); /* #512 */
                 }
             }
             rc = hype_pic_emu_io_write(pic, io.port, pv);
@@ -1548,6 +1559,27 @@ void hype_svm_vcpu_inject_nmi(hype_vcpu_ctx_t *ctx) {
 void hype_svm_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_irr_clear(real->pending_irr, vector);
+    hype_svm_irr_clear(real->pending_pic, vector); /* #512 */
+}
+
+/* #512: mark a just-queued vector as PIC-sourced, so the #455 pruner may cancel it if its
+ * line masks. Only a vector still PENDING gets the mark -- a direct EVENTINJ needs none. */
+void hype_svm_vcpu_note_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if ((real->pending_irr[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0u) {
+        hype_svm_irr_set(real->pending_pic, vector);
+    }
+}
+
+/* #512: the #455 prune, restricted to vectors the PIC-acknowledge path queued. An IO-APIC or
+ * MSI vector that merely shares the masked PIC's vector range is not touched. */
+void hype_svm_vcpu_cancel_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if ((real->pending_pic[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0u) {
+        hype_svm_irr_clear(real->pending_irr, vector);
+        hype_svm_irr_clear(real->pending_pic, vector);
+        hype_svm_sync_vintr(real);
+    }
 }
 
 void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
@@ -1561,6 +1593,7 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
         (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) == 0) {
         int v = hype_svm_irr_highest(real->pending_irr);
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        hype_svm_irr_clear(real->pending_pic, (uint8_t)v); /* #512 */
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         real->int_inj_by_vec[(uint8_t)v]++;
         svm_note_injected(real, (uint8_t)v); /* #456 */
@@ -1609,6 +1642,7 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
             return 0;
         }
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        hype_svm_irr_clear(real->pending_pic, (uint8_t)v); /* #512 */
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         real->int_inj_by_vec[(uint8_t)v]++;
         svm_note_injected(real, (uint8_t)v); /* #456 */
@@ -2284,7 +2318,7 @@ static int complete_ahci_soft_reset(hype_ahci_t *ahci, uint64_t rx_fis_phys,
     for (i = 0; i < 20u; i++) {
         rx_fis_host[0x40 + i] = fis[i];
     }
-    ahci->p_is |= HYPE_AHCI_PIS_DHRS;
+    hype_ahci_set_pis(ahci, HYPE_AHCI_PIS_DHRS); /* #512: counted edge */
     if ((ahci->p_is & ahci->p_ie) != 0) {
         ahci->is |= HYPE_AHCI_IS_PORT0;
     }
@@ -2752,7 +2786,7 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
      * (Linux ahci_interrupt) reads IS first to learn which port fired.
      * The vCPU loop turns (GHC.IE && PxIS&PxIE) into a raised PIC IRQ
      * via hype_ahci_irq_pending(). */
-    ahci->p_is |= pis_bit;
+    hype_ahci_set_pis(ahci, pis_bit); /* #512: counted edge */
     if ((ahci->p_is & ahci->p_ie) != 0) {
         ahci->is |= HYPE_AHCI_IS_PORT0;
     }
@@ -3013,7 +3047,7 @@ static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, 
      * the ATAPI path; the M4-5/M5-2 cooperating test guests polled PxCI
      * and never depended on this bit). Latch the global IS port bit for
      * an interrupt-driven guest, same as the ATAPI path (M4-6d2). */
-    ahci->p_is |= pis_bit;
+    hype_ahci_set_pis(ahci, pis_bit); /* #512: counted edge */
     if ((ahci->p_is & ahci->p_ie) != 0) {
         ahci->is |= HYPE_AHCI_IS_PORT0;
     }

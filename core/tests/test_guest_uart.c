@@ -137,6 +137,44 @@ static void test_thre_is_a_latch_not_a_level(void) {
               hype_guest_uart_irq_pending(&u));
 }
 
+/*
+ * #512 regression. The interrupt-condition edges must be COUNTED BY THE MODEL: a poller that
+ * edge-detects the sampled level misses every edge another vCPU consumes-and-rearms between
+ * two polls. Each 0->1 of irq_pending is one irq_events increment; nothing else moves it.
+ */
+static void test_irq_events_counts_model_edges(void) {
+    hype_guest_uart_t u;
+    hype_guest_uart_reset(&u);
+    CHECK_HEX("no events after reset", 0, (unsigned)hype_guest_uart_irq_events(&u));
+
+    /* Enabling ETBEI over an empty transmitter is the first edge. */
+    hype_guest_uart_write(&u, HYPE_UART_REG_IER, HYPE_UART_IER_ETBEI);
+    CHECK_HEX("IER-enable edge counted", 1, (unsigned)hype_guest_uart_irq_events(&u));
+
+    /* Condition already high: more THR writes are not new edges. */
+    hype_guest_uart_write(&u, HYPE_UART_REG_DATA, 'A');
+    hype_guest_uart_write(&u, HYPE_UART_REG_DATA, 'B');
+    CHECK_HEX("no edge while condition stays high", 1,
+              (unsigned)hype_guest_uart_irq_events(&u));
+
+    /* Service (IIR read drops the latch), then the next byte is a NEW edge. */
+    (void)hype_guest_uart_read(&u, HYPE_UART_REG_IIR_FCR);
+    CHECK_HEX("service is not an edge", 1, (unsigned)hype_guest_uart_irq_events(&u));
+    hype_guest_uart_write(&u, HYPE_UART_REG_DATA, 'C');
+    CHECK_HEX("re-arm after service is an edge", 2,
+              (unsigned)hype_guest_uart_irq_events(&u));
+
+    /* RX: first byte with ERBFI enabled is an edge; a second while pending is not. */
+    hype_guest_uart_reset(&u);
+    hype_guest_uart_write(&u, HYPE_UART_REG_IER, HYPE_UART_IER_ERBFI);
+    CHECK_HEX("ERBFI with empty RX is no edge", 0, (unsigned)hype_guest_uart_irq_events(&u));
+    (void)hype_guest_uart_rx_enqueue(&u, 'x');
+    CHECK_HEX("first RX byte is an edge", 1, (unsigned)hype_guest_uart_irq_events(&u));
+    (void)hype_guest_uart_rx_enqueue(&u, 'y');
+    CHECK_HEX("second RX byte while pending is not", 1,
+              (unsigned)hype_guest_uart_irq_events(&u));
+}
+
 static void test_rx_interrupt_and_priority(void) {
     hype_guest_uart_t u;
     hype_guest_uart_reset(&u);
@@ -180,6 +218,7 @@ int main(void) {
     test_misc_registers();
     test_tx_interrupt_generation();
     test_thre_is_a_latch_not_a_level();
+    test_irq_events_counts_model_edges();
     test_rx_interrupt_and_priority();
     test_rx_ring_full_rejects();
 

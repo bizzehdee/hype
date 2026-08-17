@@ -108,7 +108,13 @@ int hype_ahci_mmio_write(hype_ahci_t *ahci, uint32_t offset, uint8_t size_bytes,
              * spinning until timeout and abandoning the controller (the
              * exact stall that kept OVMF's storage stack from ever
              * enumerating the CD-ROM -- FW-1h). */
-            ahci->ghc = value & ~(uint32_t)HYPE_AHCI_GHC_HR;
+            {
+                int was = hype_ahci_irq_pending(ahci);
+                ahci->ghc = value & ~(uint32_t)HYPE_AHCI_GHC_HR;
+                if (!was && hype_ahci_irq_pending(ahci)) {
+                    ahci->irq_events++; /* #512: enabling GHC.IE over pending PxIS is an edge */
+                }
+            }
             return 0;
         case HYPE_AHCI_REG_IS: ahci->is &= ~value; return 0; /* RW1C */
         case HYPE_AHCI_REG_CCC_CTL: ahci->ccc_ctl = value; return 0;
@@ -119,7 +125,14 @@ int hype_ahci_mmio_write(hype_ahci_t *ahci, uint32_t offset, uint8_t size_bytes,
         case HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_FB: ahci->p_fb = value; return 0;
         case HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_FBU: ahci->p_fbu = value; return 0;
         case HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS: ahci->p_is &= ~value; return 0; /* RW1C */
-        case HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IE: ahci->p_ie = value; return 0;
+        case HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IE: {
+            int was = hype_ahci_irq_pending(ahci);
+            ahci->p_ie = value;
+            if (!was && hype_ahci_irq_pending(ahci)) {
+                ahci->irq_events++; /* #512: enabling PxIE over pending PxIS is an edge */
+            }
+            return 0;
+        }
         case HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CMD: {
             uint32_t new_cmd = value;
             if (new_cmd & HYPE_AHCI_PCMD_ST) {
@@ -158,6 +171,14 @@ int hype_ahci_irq_pending(const hype_ahci_t *ahci) {
         return 0;
     }
     return (ahci->p_is & ahci->p_ie) != 0;
+}
+
+void hype_ahci_set_pis(hype_ahci_t *ahci, uint32_t bits) {
+    int was = hype_ahci_irq_pending(ahci);
+    ahci->p_is |= bits;
+    if (!was && hype_ahci_irq_pending(ahci)) {
+        ahci->irq_events++; /* #512 */
+    }
 }
 
 void hype_ahci_decode_cmd_header(const uint8_t raw[32], hype_ahci_cmd_header_t *out) {

@@ -157,6 +157,15 @@ typedef struct {
     uint32_t p_sntf;
 
     /*
+     * #512: count of 0->1 transitions of hype_ahci_irq_pending(), kept by whoever mutates the
+     * state (completion posting, PxIE/GHC writes). The MSI edge sender used a sampled-level
+     * latch; a second vCPU clearing PxIS and a new completion re-raising it between two of the
+     * sender's polls swallowed the new edge (observed on real hardware as `ata7.00: qc timeout
+     * (cmd 0xec)` -- an IDENTIFY whose completion MSI never fired). Count edges at the source.
+     */
+    unsigned long long irq_events;
+
+    /*
      * #309: whether the guest has asserted SRST and not yet released it. A software reset is
      * TWO commands, and only the second one completes with a device signature, so the model
      * has to remember it saw the first. Cleared by hype_ahci_reset().
@@ -318,6 +327,11 @@ int hype_ahci_mmio_write(hype_ahci_t *ahci, uint32_t offset, uint8_t size_bytes,
  * the caller (the vCPU loop) turns a transition-to-pending into a raised
  * PIC IRQ line, and the guest deasserts by clearing PxIS/IS (RW1C). */
 int hype_ahci_irq_pending(const hype_ahci_t *ahci);
+
+/* #512: post completion status -- sets PxIS bits and counts the interrupt-condition edge.
+ * Every completion path must use this instead of writing p_is directly, or an MSI edge can
+ * be swallowed by the sampled-level race described at hype_ahci_t.irq_events. */
+void hype_ahci_set_pis(hype_ahci_t *ahci, uint32_t bits);
 
 /*
  * Processes one issued AHCI command slot: walks the guest's Command List ->

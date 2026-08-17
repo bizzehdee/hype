@@ -153,6 +153,40 @@ static void test_irq_pending_conditions(void) {
     CHECK_HEX("PxIS cleared: irq deasserts", 0, hype_ahci_irq_pending(&ahci));
 }
 
+/*
+ * #512 regression. Interrupt-condition edges are counted by the model, so an MSI sender that
+ * missed a fall-and-rise between two of its polls (a second vCPU's ISR clearing PxIS and a new
+ * completion re-posting it) still sees the count move. One increment per 0->1 of irq_pending.
+ */
+static void test_irq_events_counts_model_edges(void) {
+    hype_ahci_t ahci;
+    hype_ahci_reset(&ahci);
+
+    CHECK_HEX("no events after reset", 0, (unsigned)ahci.irq_events);
+
+    /* Completion posted while interrupts are fully off: no edge. */
+    hype_ahci_set_pis(&ahci, HYPE_AHCI_PIS_DHRS);
+    CHECK_HEX("completion with IE off is no edge", 0, (unsigned)ahci.irq_events);
+
+    /* Enabling PxIE then GHC.IE over the pending bit: the edge lands on the
+     * write that completes the condition. */
+    hype_ahci_mmio_write(&ahci, HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IE, 4, HYPE_AHCI_PIS_DHRS);
+    CHECK_HEX("PxIE alone (GHC.IE clear) is no edge", 0, (unsigned)ahci.irq_events);
+    hype_ahci_mmio_write(&ahci, HYPE_AHCI_REG_GHC, 4, HYPE_AHCI_GHC_IE);
+    CHECK_HEX("GHC.IE completing the condition is an edge", 1, (unsigned)ahci.irq_events);
+
+    /* A second completion while the line is already high coalesces. */
+    hype_ahci_set_pis(&ahci, HYPE_AHCI_PIS_PSS);
+    CHECK_HEX("completion while asserted is no new edge", 1, (unsigned)ahci.irq_events);
+
+    /* The ISR clears PxIS (RW1C); the NEXT completion is a new edge -- the
+     * exact fall-and-rise the sampled-level MSI latch used to swallow. */
+    hype_ahci_mmio_write(&ahci, HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_IS, 4, 0xFFFFFFFFu);
+    CHECK_HEX("service is not an edge", 1, (unsigned)ahci.irq_events);
+    hype_ahci_set_pis(&ahci, HYPE_AHCI_PIS_DHRS);
+    CHECK_HEX("completion after service is a new edge", 2, (unsigned)ahci.irq_events);
+}
+
 static void test_reserved_register_reads_zero_and_ignores_writes(void) {
     hype_ahci_t ahci;
     uint32_t value;
@@ -632,6 +666,7 @@ int main(void) {
     test_is_rw1c();
     test_ci_write_ors_in_bits();
     test_irq_pending_conditions();
+    test_irq_events_counts_model_edges();
     test_reserved_register_reads_zero_and_ignores_writes();
     test_rejects_misaligned_and_wrong_width();
     test_rejects_out_of_range_offset();

@@ -22,6 +22,15 @@ void hype_guest_uart_reset(hype_guest_uart_t *u) {
     for (i = 0; i < HYPE_GUEST_UART_RX_RING; i++) {
         u->rx[i] = 0;
     }
+    u->irq_events = 0; /* #512 */
+}
+
+/* #512: bump the edge counter when a mutation raised the interrupt condition. Callers sample
+ * the level BEFORE mutating and pass it in. */
+static void note_irq_edge(hype_guest_uart_t *u, int was_pending) {
+    if (!was_pending && hype_guest_uart_irq_pending(u)) {
+        u->irq_events++;
+    }
 }
 
 static int rx_available(const hype_guest_uart_t *u) {
@@ -84,7 +93,7 @@ uint8_t hype_guest_uart_read(hype_guest_uart_t *u, uint32_t offset) {
     }
 }
 
-void hype_guest_uart_write(hype_guest_uart_t *u, uint32_t offset, uint8_t value) {
+static void uart_write_reg(hype_guest_uart_t *u, uint32_t offset, uint8_t value) {
     int dlab = (u->lcr & HYPE_UART_LCR_DLAB) != 0;
 
     switch (offset & 0x7u) {
@@ -144,6 +153,16 @@ void hype_guest_uart_write(hype_guest_uart_t *u, uint32_t offset, uint8_t value)
     }
 }
 
+void hype_guest_uart_write(hype_guest_uart_t *u, uint32_t offset, uint8_t value) {
+    int was = hype_guest_uart_irq_pending(u);
+    uart_write_reg(u, offset, value);
+    note_irq_edge(u, was); /* #512: a THR or IER write may raise the condition */
+}
+
+unsigned long long hype_guest_uart_irq_events(const hype_guest_uart_t *u) {
+    return u->irq_events;
+}
+
 int hype_guest_uart_tx_dequeue(hype_guest_uart_t *u, uint8_t *out) {
     if (u->tx_head == u->tx_tail) {
         return 0;
@@ -165,6 +184,7 @@ int hype_guest_uart_irq_pending(const hype_guest_uart_t *u) {
 
 int hype_guest_uart_rx_enqueue(hype_guest_uart_t *u, uint8_t byte) {
     uint32_t next = (u->rx_tail + 1u) % HYPE_GUEST_UART_RX_RING;
+    int was = hype_guest_uart_irq_pending(u); /* #512 */
     if (next == u->rx_head) {
         return 0; /* ring full */
     }
@@ -178,5 +198,6 @@ int hype_guest_uart_rx_enqueue(hype_guest_uart_t *u, uint8_t byte) {
      */
     __atomic_signal_fence(__ATOMIC_RELEASE);
     u->rx_tail = next;
+    note_irq_edge(u, was); /* #512: a first RX byte with ERBFI set raises the condition */
     return 1;
 }
