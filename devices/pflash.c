@@ -15,7 +15,9 @@ void hype_pflash_reset(hype_pflash_t *pf, uint8_t *backing, uint32_t size) {
     pf->backing = backing;
     pf->size = size;
     pf->mode = HYPE_PFLASH_MODE_READ_ARRAY;
-    pf->status = HYPE_PFLASH_STATUS_READY;
+    /* #457: reset status is CLEARED (0), as QEMU's pflash_cfi01 resets it -- READY is earned
+     * by completing a program/erase. OVMF's probe depends on reading 0 after CLEAR_STATUS. */
+    pf->status = 0u;
     pf->erase_offset = 0;
     pf->buffer_offset = 0;
     pf->buffer_remaining = 0;
@@ -86,7 +88,16 @@ static void handle_idle_command(hype_pflash_t *pf, uint32_t offset, uint8_t cmd)
             pf->mode = HYPE_PFLASH_MODE_READ_STATUS;
             return;
         case HYPE_PFLASH_CMD_CLEAR_STATUS:
-            pf->status = HYPE_PFLASH_STATUS_READY;
+            /*
+             * #457: CLEARED status is 0x00, not READY. OVMF's QemuFlashDetected writes
+             * CLEAR_STATUS then READ_STATUS and accepts the chip as writable flash ONLY if the
+             * status reads back as its CLEARED_ARRAY_STATUS (0x00) -- QEMU's pflash_cfi01
+             * behaves this way, and returning READY here made OVMF match none of its three
+             * arms and give up without even sending READ_ARRAY, leaving the chip (and hype's
+             * trap window) stuck in READ_STATUS forever. READY is set again when a program or
+             * erase completes, below, which is the transition the driver actually polls for.
+             */
+            pf->status = 0u;
             pf->mode = HYPE_PFLASH_MODE_READ_ARRAY;
             return;
         case HYPE_PFLASH_CMD_READ_DEVID:
@@ -143,6 +154,7 @@ int hype_pflash_write(hype_pflash_t *pf, uint32_t offset, uint8_t size_bytes, ui
             for (i = 0; i < size_bytes; i++) {
                 pf->backing[offset + i] = (uint8_t)((value >> (8u * i)) & 0xFFu);
             }
+            pf->status |= HYPE_PFLASH_STATUS_READY; /* #457: program completed */
             pf->mode = HYPE_PFLASH_MODE_READ_ARRAY;
             return 0;
 
@@ -156,6 +168,7 @@ int hype_pflash_write(hype_pflash_t *pf, uint32_t offset, uint8_t size_bytes, ui
             for (i = 0; i < HYPE_PFLASH_ERASE_BLOCK_SIZE && (block_start + i) < pf->size; i++) {
                 pf->backing[block_start + i] = 0xFFu; /* erased NOR flash reads as all-1 bits */
             }
+            pf->status |= HYPE_PFLASH_STATUS_READY; /* #457: erase completed */
             pf->mode = HYPE_PFLASH_MODE_READ_ARRAY;
             return 0;
 
@@ -197,6 +210,7 @@ int hype_pflash_write(hype_pflash_t *pf, uint32_t offset, uint8_t size_bytes, ui
             for (i = 0; i < pf->buffer_pos; i++) {
                 pf->backing[pf->buffer_offset + i] = pf->buffer_data[i];
             }
+            pf->status |= HYPE_PFLASH_STATUS_READY; /* #457: buffered program completed */
             pf->mode = HYPE_PFLASH_MODE_READ_ARRAY;
             return 0;
 
