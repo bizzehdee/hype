@@ -552,7 +552,17 @@ static uint64_t g_ram_1_size_bytes;
  * NOT per-VM (stay file-global below): the loaded ISO buffer (both VMs boot
  * the same media) and the host's usable-RAM total.
  */
-#define HYPE_FW_MAX_VMS 2u
+/*
+ * #393: this constant no longer caps the VM COUNT -- g_vms and every load-bearing per-VM
+ * structure are pool-allocated to the parsed config (#394), and admission is
+ * topology-bounded (#396). What still uses it is the residue: statically-sized DIAGNOSTIC
+ * arrays (timer-lateness, AP counters, loop-section breadcrumbs) whose indexes are guarded.
+ * It is raised to match HYPE_CFG_MAX_VMS (core/cfg.h) so a config the parser accepts can
+ * never index a diagnostic array out of bounds -- at 2u, a legitimate 3-VM boot made every
+ * unguarded diagnostic store an out-of-bounds write. Keep the two in lockstep until the
+ * remaining arrays move to the pool.
+ */
+#define HYPE_FW_MAX_VMS 16u
 
 /* #302: console bytes that reach the script matcher, split by whether it was armed -- see
  * fw_1_script_feed for what each combination rules out. */
@@ -977,7 +987,10 @@ typedef struct hype_fw_vm {
  * base, and sizeof(hype_fw_vm_t) is a whole number of pages, so every element is
  * aligned. Sized to g_vm_count for now; the dynamic count is the next step. */
 static hype_fw_vm_t *g_vms;
-static unsigned g_vm_count = HYPE_FW_MAX_VMS;
+/* #393: the pre-config default is an explicit 2, NOT HYPE_FW_MAX_VMS -- that constant is now
+ * the DIAGNOSTIC-array bound (16, lockstep with HYPE_CFG_MAX_VMS) and would make any code
+ * running before the config resolves at efi_main believe sixteen VMs exist. */
+static unsigned g_vm_count = 2u;
 #define FW_1_LINE_BUF_FS 256u /* #394: file-scope twin of FW_1_LINE_BUF */
 static char (*g_uart_line)[FW_1_LINE_BUF_FS];   /* #394: per-VM, were func-static */
 static char (*g_uart_line2)[FW_1_LINE_BUF_FS];
@@ -23556,6 +23569,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             bsp_phase(BSP_PHASE_INPUT);
             fw_1_host_input_poll(); /* #363: keyboard + terminal switching, off the guest core */
             fw_1_host_action_poll(); /* M9-2 (#175): pending host reboot/off completes here */
+            {   /* #447: locate the boot volume ONCE, ~30s in (after device discovery has
+                 * settled), so every run reports whether config write-back is available
+                 * instead of the answer surfacing only when an operator first saves. */
+                static uint64_t bv_at;
+                uint64_t bv_hz = g_vms[0].host_tsc_hz;
+                if (bv_hz != 0 && bv_at != ~0ull) {
+                    if (bv_at == 0) {
+                        bv_at = hype_rdtsc() + 30ull * bv_hz;
+                    } else if (hype_rdtsc() >= bv_at) {
+                        bv_at = ~0ull;
+                        (void)fw_1_boot_volume();
+                    }
+                }
+            }
             bsp_phase(BSP_PHASE_KBDDIAG);
             {
                 /*
