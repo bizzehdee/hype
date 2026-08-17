@@ -337,9 +337,10 @@ static unsigned long long g_sendkey_codes;
  */
 static unsigned long long g_cd_irq_pending, g_cd_irq_delivered;
 static unsigned long long g_ata_irq_pending, g_ata_irq_delivered;
-/* MSI is edge-triggered while AHCI PxIS is level-like.  These latches turn a
- * continuous pending status into one message until the guest acknowledges it. */
-static int g_cd_msi_asserted, g_ata_msi_asserted;
+/* MSI is edge-triggered while AHCI PxIS is level-like. One message per MODEL-counted edge
+ * (hype_ahci_t.irq_events); these hold the last count already sent. #512 replaced the old
+ * sampled-level latches, which missed edges another vCPU consumed-and-rearmed between polls. */
+static unsigned long long g_cd_msi_seen, g_ata_msi_seen;
 /* #440: how often the guest touches the ICH9 SATA target's ABAR at all --
  * distinguishes "Windows never drives the controller" from "Windows drives it
  * and the exchange goes wrong". */
@@ -4934,15 +4935,38 @@ static void vmm_cancel_pending_vector(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx
  * 30", though the delivered vector was IRQ1/33 -- the trap number is whatever the
  * kernel's shared "unclaimed interrupt" stub happens to report, not the real one).
  */
+static void vmm_cancel_pic_pending(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_cancel_pic_pending(ctx, vector);
+    } else {
+        hype_svm_vcpu_cancel_pic_pending(ctx, vector);
+    }
+}
+static void vmm_note_pic_pending(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_note_pic_pending(ctx, vector);
+    } else {
+        hype_svm_vcpu_note_pic_pending(ctx, vector);
+    }
+}
+/*
+ * #512: cancel only vectors the PIC-ACKNOWLEDGE path queued (the provenance mark). The prune
+ * used to cancel any pending vector that NUMERICALLY mapped to a masked line -- but an
+ * APIC-mode guest leaves the fully-masked PIC based at 0x20 and allocates IO-APIC vectors
+ * 0x21+, so every deferred keyboard (0x21) and COM1 (0x22) interrupt was cancelled as a
+ * "masked PIC vector" (measured: 2122 requested, 162 injected, the rest pruned; apk blocked
+ * forever on the ttyS0 TX interrupt). The #455 case still works: those vectors were queued by
+ * hype_pic_emu_acknowledge and carry the mark.
+ */
 static void vmm_prune_masked_pic_pending(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                          const hype_pic_emu_t *pic) {
     unsigned line;
     for (line = 0; line < 8u; line++) {
         if ((pic->master.imr & (uint8_t)(1u << line)) != 0u) {
-            vmm_cancel_pending_vector(kind, ctx, (uint8_t)(pic->master.irq_offset + line));
+            vmm_cancel_pic_pending(kind, ctx, (uint8_t)(pic->master.irq_offset + line));
         }
         if ((pic->slave.imr & (uint8_t)(1u << line)) != 0u) {
-            vmm_cancel_pending_vector(kind, ctx, (uint8_t)(pic->slave.irq_offset + line));
+            vmm_cancel_pic_pending(kind, ctx, (uint8_t)(pic->slave.irq_offset + line));
         }
     }
 }
@@ -5386,17 +5410,19 @@ static const uint8_t *fw_1_guest_phys_to_host(hype_fw_vm_t *vm, uint64_t gpa);
  * fw_1_route_ipi_from uses. An unmatched destination falls back to the BSP rather than dropping
  * the interrupt -- losing a device completion is worse than delivering it to the wrong core.
  */
-static void fw_1_deliver_device_vector(hype_fw_vm_t *vm, hype_vmm_kind_t kind, uint32_t gsi,
-                                       uint8_t vector) {
+/* #512 diagnostics: where device vectors are posted, and how many each vCPU drained. */
+static uint64_t g_dev_posted[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_ipi_fixed_posted[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_bsp_ipi_drained[HYPE_FW_MAX_VMS];
+static uint64_t g_512_trace;
+
+static void fw_1_post_vector_dest(hype_fw_vm_t *vm, uint32_t dest, int logical, uint8_t vector) {
     unsigned n = vm->vcpu_count ? vm->vcpu_count : 1u;
     unsigned t;
-    int logical = 0;
-    uint32_t dest;
 
     if (n > HYPE_MAX_VCPUS_PER_VM) {
         n = HYPE_MAX_VCPUS_PER_VM;
     }
-    dest = hype_ioapic_rte_dest(&vm->ioapic, gsi, &logical);
     for (t = 0; t < n; t++) {
         int hit;
         if (vm->vcpu[t] == 0) {
@@ -5409,10 +5435,36 @@ static void fw_1_deliver_device_vector(hype_fw_vm_t *vm, hype_vmm_kind_t kind, u
         }
         /* Pend it on that vCPU's own LAPIC; its dispatch loop injects into its own VMCB. */
         hype_guest_lapic_post_vector(&vm->lapic[t], vector);
+        g_dev_posted[(unsigned)(vm - g_vms)][t]++;
+        if (g_512_trace < 32ull && t != 0u) {
+            g_512_trace++;
+            hype_debug_print("fw-1 #512 POST: vec=0x%x dest=0x%x logical=%d -> vcpu%u\n",
+                             (unsigned)vector, (unsigned)dest, logical, t);
+        }
         return;
     }
     hype_guest_lapic_post_vector(&vm->lapic[0], vector);
+    g_dev_posted[(unsigned)(vm - g_vms)][0]++;
+}
+
+static void fw_1_deliver_device_vector(hype_fw_vm_t *vm, hype_vmm_kind_t kind, uint32_t gsi,
+                                       uint8_t vector) {
+    int logical = 0;
+    uint32_t dest = hype_ioapic_rte_dest(&vm->ioapic, gsi, &logical);
+    fw_1_post_vector_dest(vm, dest, logical, vector);
     (void)kind;
+}
+
+/*
+ * #512: MSI, under the same destination discipline. The vector accessor existed; the address
+ * (which carries the destination) was never read, so every MSI landed on vCPU 0. A guest that
+ * allocated the vector on CPU 1 then logged "No irq handler for vector" on CPU 0 and lost the
+ * completion -- an MSI edge leaves no level behind to re-raise.
+ */
+static void fw_1_deliver_msi_vector(hype_fw_vm_t *vm, uint8_t dev, uint8_t func, uint8_t vector) {
+    int logical = 0;
+    uint32_t dest = hype_pci_function_msi_dest(&vm->pci, dev, func, &logical);
+    fw_1_post_vector_dest(vm, dest, logical, vector);
 }
 
 /*
@@ -5543,6 +5595,7 @@ static void fw_1_timer_latency_note(unsigned vmi, unsigned vi, const hype_guest_
 static uint64_t g_ap_ahci_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint64_t g_ap_ecam_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint64_t g_ap_vblk_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM]; /* #511 */
+static uint64_t g_ap_ipi_drained[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM]; /* #512 */
 /* #484: total LAPIC base-frequency ticks this AP has been advanced, and the TSC span it was
  * advanced over. The RCU stall says CPU 1 gets ~5 timer IRQs/s where its init_count implies
  * ~1600, so the question is whether the ADVANCE is short or the IRQ delivery is. These two
@@ -5780,6 +5833,7 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
                  * that was idle and had never seen the IPI.
                  */
                 hype_guest_lapic_post_vector(&vm->lapic[target], (uint8_t)ipi->vector);
+                g_ipi_fixed_posted[(unsigned)(vm - g_vms)][target]++; /* #512 */
                 acted++;
             }
             break;
@@ -9350,7 +9404,7 @@ static __attribute__((noinline)) void fw_1_hpet_step(hype_fw_vm_t *vm, hype_vcpu
             gsi = (unsigned)routed;
         }
         if (hype_ioapic_raise(&g_fw_1_ioapic, gsi, &hiov)) {
-            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, hiov);
+            fw_1_deliver_device_vector(vm, kind, gsi, hiov); /* #512 */
         } else if (gsi == 2u) {
             hype_pic_emu_raise_irq(&g_fw_1_pic.master, 0);
         }
@@ -12710,6 +12764,7 @@ wait_for_sipi:
             uint8_t v;
             while (hype_guest_lapic_take_self_ipi(lapic, &v)) {
                 vmm_request_interrupt(kind, ctx, lapic, v);
+                g_ap_ipi_drained[vm_idx][vi]++; /* #512 */
             }
         }
         {
@@ -13139,7 +13194,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      */
     /* #318: last asserted state of each guest UART's interrupt line, so it is raised on the
      * transition rather than continuously while the condition holds. Index 0 = COM1, 1 = COM2. */
-    uint8_t uart_irq_asserted[2] = {0, 0};
+    /* #512: last uart irq_events value whose edge was raised AND accepted, per port. The old
+     * sampled-level latch (raise once per observed 0->1) missed every edge the OTHER vCPU
+     * consumed-and-rearmed between two of this loop's passes. */
+    unsigned long long uart_irq_acked[2] = {0, 0};
     unsigned long long ex_hlt = 0, ex_npf = 0, ex_ioio = 0, ex_msr = 0, ex_cpuid = 0, ex_vintr = 0,
                        ex_other = 0;
     unsigned long long ex_io80 = 0, ex_ahci_npf = 0, ex_pause = 0, ex_intr = 0;
@@ -14051,6 +14109,66 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                  (unsigned long long)c);
                         }
                         hype_debug_print("%s [#509]\n", dl);
+                    }
+                    {   /* #512: device-vector posting per vCPU, and what the AP drained. A
+                         * post that never drains names the loss point. */
+                        hype_debug_print("fw-1 POSTSTAT vm%u: posted0=%llu posted1=%llu "
+                                         "drained1=%llu ipi_to0=%llu ipi_to1=%llu "
+                                         "drained0=%llu [#512]\n", _vmi,
+                                         (unsigned long long)g_dev_posted[_vmi][0],
+                                         (unsigned long long)g_dev_posted[_vmi][1],
+                                         (unsigned long long)g_ap_ipi_drained[_vmi][1],
+                                         (unsigned long long)g_ipi_fixed_posted[_vmi][0],
+                                         (unsigned long long)g_ipi_fixed_posted[_vmi][1],
+                                         (unsigned long long)g_bsp_ipi_drained[_vmi]);
+                    {   /* #512: request-vs-injection per suspect vector on vCPU 0. A req that
+                         * inj never follows = staged but never delivered. */
+                        uint32_t rq[5], ij[5];
+                        static const uint8_t vv[5] = {0xfbu, 0x22u, 0xecu, 0xf9u, 0xfau};
+                        unsigned q_;
+                        for (q_ = 0; q_ < 5u; q_++) {
+                            rq[q_] = ij[q_] = 0u;
+                            if (kind == HYPE_VMM_KIND_SVM) {
+                                hype_svm_vcpu_get_vec_counts(vm->vcpu[0], vv[q_], &rq[q_],
+                                                             &ij[q_]);
+                            }
+                        }
+                        hype_debug_print("fw-1 VECSTAT vm%u/0: fb=%u/%u s22=%u/%u ec=%u/%u "
+                                         "f9=%u/%u fa=%u/%u (req/inj) [#512]\n", _vmi,
+                                         rq[0], ij[0], rq[1], ij[1], rq[2], ij[2],
+                                         rq[3], ij[3], rq[4], ij[4]);
+                        if (kind == HYPE_VMM_KIND_SVM && vm->vcpu_count > 1u &&
+                            vm->vcpu[1] != 0) {
+                            for (q_ = 0; q_ < 5u; q_++) {
+                                rq[q_] = ij[q_] = 0u;
+                                hype_svm_vcpu_get_vec_counts(vm->vcpu[1], vv[q_], &rq[q_],
+                                                             &ij[q_]);
+                            }
+                            hype_debug_print("fw-1 VECSTAT vm%u/1: fb=%u/%u s22=%u/%u ec=%u/%u "
+                                             "f9=%u/%u fa=%u/%u (req/inj) [#512]\n", _vmi,
+                                             rq[0], ij[0], rq[1], ij[1], rq[2], ij[2],
+                                             rq[3], ij[3], rq[4], ij[4]);
+                        }
+                        {   /* #512: if a vector is sitting in a vCPU's pending IRR, say WHICH
+                             * and name the gate that is refusing delivery. */
+                            unsigned t_;
+                            for (t_ = 0; t_ < vm->vcpu_count && t_ < HYPE_MAX_VCPUS_PER_VM;
+                                 t_++) {
+                                hype_vmm_intr_state_t st_;
+                                if (vm->vcpu[t_] == 0) continue;
+                                vmm_get_intr_state(kind, vm->vcpu[t_], &st_);
+                                if (!st_.pending_valid) continue;
+                                hype_debug_print("fw-1 STUCKVEC vm%u/%u: vec=0x%x n=%u IF=%d "
+                                                 "shadow=%d eventinj_v=%d vintr=0x%llx [#512]\n",
+                                                 _vmi, t_, (unsigned)st_.pending_vector,
+                                                 (unsigned)st_.pending_count,
+                                                 (int)((st_.rflags >> 9) & 1u),
+                                                 (int)(st_.interrupt_shadow & 1u),
+                                                 (int)((st_.eventinj >> 31) & 1u),
+                                                 (unsigned long long)st_.vintr);
+                            }
+                        }
+                    }
                     }
                     {   /* #484: is a guest timer edge delivered on time? rcu_preempt was
                          * starved in schedule_timeout(), so lateness is the question. */
@@ -15331,7 +15449,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     if (hype_cmos_advance(&vm->cmos, rtc_ns)) {
                         uint8_t rtciov;
                         if (hype_ioapic_raise(&g_fw_1_ioapic, 8u, &rtciov)) {
-                            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, rtciov);
+                            fw_1_deliver_device_vector(vm, kind, 8u, rtciov); /* #512 */
                         } else {
                             hype_pic_emu_raise_global_irq(&g_fw_1_pic, 8u);
                         }
@@ -15372,7 +15490,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     {
                         uint8_t iov;
                         if (hype_ioapic_raise(&g_fw_1_ioapic, 2u, &iov)) {
-                            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                            fw_1_deliver_device_vector(vm, kind, 2u, iov); /* #512 */
                             pit_irqs_apic++; /* #318 */
                         } else {
                             pit_apic_refused++; /* masked RTE, or Remote-IRR still latched */
@@ -15397,6 +15515,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint8_t sipi_vector;
             while (hype_guest_lapic_take_self_ipi(&g_fw_1_lapic, &sipi_vector)) {
                 vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, sipi_vector);
+                g_bsp_ipi_drained[(unsigned)(vm - g_vms)]++; /* #512 */
             }
             /*
              * SMP-4 (#188): and the IPIs this vCPU sent to OTHERS. Drained here, next to the
@@ -15455,18 +15574,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
             g_cd_irq_pending++;
             if (hype_pci_msi_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI)) {
-                /* MSI is edge-triggered.  The AHCI status bit remains level-like
-                 * until the guest acknowledges it, so send exactly one message
-                 * per assertion instead of re-injecting on every VMM iteration. */
-                if (!g_cd_msi_asserted) {
-                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic,
-                                          hype_pci_msi_vector(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI));
-                    g_cd_msi_asserted = 1;
+                /* MSI is edge-triggered: one message per interrupt-condition edge. #512: the
+                 * edge is the MODEL's counter, not this loop's sampled level -- a second vCPU
+                 * clearing PxIS and a completion re-raising it between two passes here used to
+                 * swallow the new assertion (real-HW signature: `ata7.00: qc timeout`). */
+                if (g_cd_msi_seen != g_fw_1_ahci.irq_events) {
+                    g_cd_msi_seen = g_fw_1_ahci.irq_events;
+                    fw_1_deliver_msi_vector(vm, HYPE_FW_1_PCI_DEV_AHCI, 0,
+                                            hype_pci_msi_vector(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI));
                     g_cd_irq_delivered++;
                     ahci_irqs++;
                 }
             } else if (line != 0u && line < 16u) {
-                g_cd_msi_asserted = 0;
                 int in_service = (line < 8u)
                     ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
                     : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
@@ -15496,8 +15615,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
         } else if (ahci_mapped) {
-            /* A new completion after the guest clears PxIS is a new MSI edge. */
-            g_cd_msi_asserted = 0;
             /* AHCI IRQ line deasserted (guest serviced it -> PxIS cleared):
              * drop the IO-APIC Remote-IRR so the next completion re-injects.
              * Models a level line going low; the guest's LAPIC EOI need not be
@@ -15521,7 +15638,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
             if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI, &iov)) {
-                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                fw_1_deliver_device_vector(vm, kind, HYPE_FW_1_VIRTIO_GSI, iov); /* #512 */
             }
         } else if (vblk_mapped) {
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
@@ -15542,15 +15659,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                                   HYPE_FW_1_PCI_FUNC_ATA);
             if (hype_pci_function_msi_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
                                                HYPE_FW_1_PCI_FUNC_ATA)) {
-                if (!g_ata_msi_asserted) {
-                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic,
-                                          hype_pci_function_msi_vector(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
-                                                                       HYPE_FW_1_PCI_FUNC_ATA));
-                    g_ata_msi_asserted = 1;
+                /* #512: one MSI per model-counted edge, same as the optical HBA above. */
+                if (g_ata_msi_seen != g_fw_1_ata_ahci.irq_events) {
+                    g_ata_msi_seen = g_fw_1_ata_ahci.irq_events;
+                    fw_1_deliver_msi_vector(vm, HYPE_FW_1_PCI_DEV_ATA, HYPE_FW_1_PCI_FUNC_ATA,
+                                            hype_pci_function_msi_vector(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                                                         HYPE_FW_1_PCI_FUNC_ATA));
                     g_ata_irq_delivered++;
                 }
             } else if (line != 0u && line < 16u) {
-                g_ata_msi_asserted = 0;
                 int in_service = (line < 8u)
                     ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
                     : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
@@ -15561,7 +15678,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             if (!hype_pci_function_msi_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
                                                 HYPE_FW_1_PCI_FUNC_ATA)) {
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI, &iov)) {
-                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                    fw_1_deliver_device_vector(vm, kind, HYPE_FW_1_ATA_GSI, iov); /* #512 */
                     g_ata_irq_delivered++;
                 } else {
                     static int ata_undelivered_reported = 0;
@@ -15578,7 +15695,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
         } else if (ata_mapped) {
-            g_ata_msi_asserted = 0;
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI);
         }
         /*
@@ -15618,7 +15734,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         }
                     }
                     if (hype_ioapic_raise(&g_fw_1_ioapic, gsi, &iov)) {
-                        vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                        fw_1_deliver_device_vector(vm, kind, gsi, iov); /* #512 */
                     }
                 } else {
                     hype_ioapic_deassert(&g_fw_1_ioapic, gsi);
@@ -15657,24 +15773,45 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_guest_uart_t *uart = (u == 0) ? &g_fw_1_uart : &g_fw_1_uart2;
                 uint8_t irqn = (u == 0) ? 4u : 3u; /* COM1=IRQ4, COM2=IRQ3 */
                 uint8_t bit = (uint8_t)(1u << irqn);
-                int now_pending = hype_guest_uart_irq_pending(uart);
-                if (!now_pending) {
-                    uart_irq_asserted[u] = 0;
+                unsigned long long ev = hype_guest_uart_irq_events(uart);
+                if (!hype_guest_uart_irq_pending(uart)) {
+                    /* Condition low: any unraised events are stale (the guest consumed or
+                     * disabled them itself). Sync so they are not replayed later. */
+                    uart_irq_acked[u] = ev;
                     continue;
                 }
-                if (uart_irq_asserted[u]) {
-                    continue; /* already raised and not yet serviced */
+                if (uart_irq_acked[u] == ev) {
+                    continue; /* the latest edge was already raised and accepted -- no storm */
                 }
-                uart_irq_asserted[u] = 1;
-                if ((g_fw_1_pic.master.imr & bit) == 0 && (g_fw_1_pic.master.isr & bit) == 0) {
-                    hype_pic_emu_raise_irq(&g_fw_1_pic.master, irqn);
-                }
-                /* M4-6b3: route the serial line (GSI == IRQ, no override)
-                 * through the I/O APIC too, for an ACPI-mode guest. */
                 {
+                    /*
+                     * #512: raise once per MODEL-counted edge, and consume the edge only if
+                     * SOMETHING accepted it. Two failure modes drove this shape, both measured
+                     * on the 2-vCPU rig:
+                     *  - a raise REFUSED (RTE masked between the guest's IER enable and its
+                     *    request_irq unmask; PIC masked in APIC mode) used to consume the
+                     *    port's one latched edge forever -- COM1's ISR ran 0 times over a full
+                     *    boot, getty dead on ttyS0;
+                     *  - a raise keyed on the SAMPLED level missed every edge the other vCPU's
+                     *    ISR consumed-and-rearmed between two loop passes -- ttyS0 died
+                     *    mid-OpenRC while s22 requests froze at 369 with 45 injected.
+                     * A delivered-but-unserviced interrupt re-raises nothing (ev unchanged),
+                     * so #318's edge storm cannot recur.
+                     */
+                    int accepted = 0;
                     uint8_t iov;
+                    if ((g_fw_1_pic.master.imr & bit) == 0 && (g_fw_1_pic.master.isr & bit) == 0) {
+                        hype_pic_emu_raise_irq(&g_fw_1_pic.master, irqn);
+                        accepted = 1;
+                    }
+                    /* M4-6b3: route the serial line (GSI == IRQ, no override)
+                     * through the I/O APIC too, for an ACPI-mode guest. */
                     if (hype_ioapic_raise(&g_fw_1_ioapic, (uint32_t)irqn, &iov)) {
-                        vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, iov);
+                        fw_1_deliver_device_vector(vm, kind, (uint32_t)irqn, iov); /* #512 */
+                        accepted = 1;
+                    }
+                    if (accepted) {
+                        uart_irq_acked[u] = ev;
                     }
                 }
             }
@@ -15710,6 +15847,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint8_t pic_vector;
             if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
                 vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, pic_vector);
+                vmm_note_pic_pending(kind, ctx, pic_vector); /* #512: prunable if masked later */
                 /* Attribute by the master vector base: IRQ0 = PIT
                  * clockevent, anything else = the AHCI line. */
                 if (pic_vector == g_fw_1_pic.master.irq_offset) {
@@ -15966,7 +16104,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         (void)hype_ps2_kbd_take_irq(&g_fw_1_ps2);
                     }
                     kbd_obf_irq_delivered = 1;
-                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, kiov);
+                    fw_1_deliver_device_vector(vm, kind, 1u, kiov); /* #512 */
                 } else if ((g_fw_1_pic.master.imr & (uint8_t)(1u << 1)) == 0) {
                     if (hype_ps2_kbd_has_pending_irq(&g_fw_1_ps2)) {
                         (void)hype_ps2_kbd_take_irq(&g_fw_1_ps2);
@@ -16004,7 +16142,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         (void)hype_ps2_mouse_take_irq(&g_fw_1_mouse);
                     }
                     mouse_obf_irq_delivered = 1;
-                    vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, miov);
+                    fw_1_deliver_device_vector(vm, kind, 12u, miov); /* #512 */
                 } else if ((g_fw_1_pic.master.imr & (uint8_t)(1u << 2)) == 0 &&
                            (g_fw_1_pic.slave.imr & (uint8_t)(1u << 4)) == 0) {
                     if (hype_ps2_mouse_has_pending_irq(&g_fw_1_mouse)) {
@@ -17604,6 +17742,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         uint8_t v;
                         if (hype_pic_emu_acknowledge(&g_fw_1_pic, &v)) {
                             vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, v);
+                            vmm_note_pic_pending(kind, ctx, v); /* #512 */
                             if (v == g_fw_1_pic.master.irq_offset) {
                                 pit_irqs++;
                             } else {
