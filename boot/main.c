@@ -894,6 +894,15 @@ typedef struct hype_fw_vm {
     volatile uint64_t shared_vblk_bar;
     volatile unsigned shared_vblk_mapped;
     /*
+     * #482: the EXTRA disk slots' windows (#329), published for the same reason as the three
+     * above. Held in a BSP loop local they could only be served from the BSP, so a guest driving
+     * its second or third disk from another vCPU would have hit the identical re-fault loop
+     * #511 produced for virtio-blk. Publishing them ahead of that report rather than after it is
+     * the whole point of one shared dispatch.
+     */
+    volatile uint64_t shared_disk_bar[HYPE_FW_1_MAX_DISKS];
+    volatile unsigned shared_disk_mapped[HYPE_FW_1_MAX_DISKS];
+    /*
      * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what
      * its guest is told. 1 until SMT-aware core allocation lands (#479, #190) -- and honestly
      * so, since today a granted core supplies exactly one dispatchable thread.
@@ -11799,6 +11808,237 @@ static unsigned long long g_ap_vcpu_unhandled[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PE
 static unsigned g_ap_vcpu_excp_dumped[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static int g_ap_mpdata_sample;
 
+/*
+ * #482: ONE entry point for a VM's shared device MMIO, so every dispatch loop serves the guest's
+ * devices identically.
+ *
+ * The AP loop used to carry its own copy of this chain, grown a region at a time as each new
+ * unhandled fault was found -- ECAM, then the ABARs, then virtio-blk (#511), then the flash
+ * window. That is precisely the approach this ticket rejects: each addition only moves the fault
+ * to the next region, and two hand-maintained copies of the same dispatch drift apart silently.
+ * A guest that reads a device register gets the same answer regardless of which vCPU it happens
+ * to be running on, or it is not a device model at all.
+ *
+ * Serves per-VM state only. The caller MUST hold fw_1_dev_lock(vm) -- two cores in one device
+ * model is the #343 bug class. The per-vCPU LAPIC is deliberately absent: it needs no lock and
+ * belongs to whichever vCPU faulted, so each loop keeps handling its own.
+ *
+ * Returns which model retired the access, or HYPE_FW_DEV_NONE if no shared device claims it.
+ * Reporting the device rather than a bare 0/-1 lets each caller keep its own counters without
+ * this function knowing anything about them.
+ */
+typedef enum {
+    HYPE_FW_DEV_NONE = 0,
+    HYPE_FW_DEV_ECAM,
+    HYPE_FW_DEV_HPET,
+    HYPE_FW_DEV_IOAPIC,
+    HYPE_FW_DEV_ATA,
+    HYPE_FW_DEV_AHCI,
+    HYPE_FW_DEV_VBLK,
+    HYPE_FW_DEV_NVME,
+    HYPE_FW_DEV_DISK_SLOT,
+    HYPE_FW_DEV_FLASH
+} hype_fw_dev_t;
+
+static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
+                                          hype_vcpu_ctx_t *ctx, const uint8_t *insn) {
+    hype_vmm_npf_t npf;
+
+    if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &vm->pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
+        return HYPE_FW_DEV_ECAM;
+    }
+    if (kind == HYPE_VMM_KIND_SVM &&
+        hype_svm_vcpu_handle_hpet_npf(ctx, &vm->hpet, HYPE_HPET_MMIO_BASE, insn) == 0) {
+        return HYPE_FW_DEV_HPET;
+    }
+    if (vmm_handle_ioapic_npf(kind, ctx, &vm->ioapic, HYPE_FW_1_IOAPIC_GPA, insn) == 0) {
+        return HYPE_FW_DEV_IOAPIC;
+    }
+
+    vmm_get_last_npf(kind, ctx, &npf);
+
+    /*
+     * The device windows are addressed from vm->shared_*, published by the BSP when PciBusDxe
+     * programs each BAR. A loop that kept these bases in its own locals could only serve them
+     * from that one loop, which is why they live on the VM.
+     */
+    if (vm->shared_ata_mapped && npf.guest_phys_addr >= vm->shared_ata_abar &&
+        npf.guest_phys_addr < vm->shared_ata_abar + HYPE_AHCI_MMIO_SIZE) {
+        if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ata_ahci, &g_fw_1_ata_disk,
+                                         (uint64_t)vm->shared_ata_abar, &g_fw_1_dma_map,
+                                         insn) == 0) {
+            return HYPE_FW_DEV_ATA;
+        }
+    } else if (vm->shared_ahci_mapped && npf.guest_phys_addr >= vm->shared_ahci_abar &&
+               npf.guest_phys_addr < vm->shared_ahci_abar + HYPE_AHCI_MMIO_SIZE) {
+        /*
+         * The ATAPI model, matching the BSP. An earlier cut of this called the hard-DISK model
+         * here, which answered the guest's CD probe from the wrong device and produced
+         * "(aprobe0:ahcich0:0:0:0): CAM status: CCB request was invalid" on the 2-vCPU run only.
+         * The first HBA carries the ATAPI CD; g_fw_1_ata_disk belongs to the separate SATA-disk
+         * HBA handled above.
+         */
+        if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi,
+                                    (uint64_t)vm->shared_ahci_abar, &g_fw_1_dma_map, insn) == 0) {
+            return HYPE_FW_DEV_AHCI;
+        }
+    }
+
+    /*
+     * #202: slot 0's NVMe BAR0, read from the PCI model the same way the BSP reads it -- it is
+     * derived state, so there is nothing to publish and nothing to keep in step.
+     */
+    if (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) {
+        uint64_t nvme_bar = hype_pci_get_bar_value(&vm->pci, HYPE_FW_1_PCI_DEV_NVME, 0);
+        if (nvme_bar != 0 && npf.guest_phys_addr >= nvme_bar &&
+            npf.guest_phys_addr < nvme_bar + HYPE_FW_1_NVME_BAR_SIZE) {
+            hype_nvme_ctx_t nctx;
+            nvme_fill_ctx(&nctx, vm, 0u);
+            if (vmm_handle_nvme_npf(kind, ctx, &vm->disk[0].nvme, &nctx, nvme_bar,
+                                    HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
+                return HYPE_FW_DEV_NVME;
+            }
+        }
+    }
+
+    if (vm->shared_vblk_mapped && npf.guest_phys_addr >= vm->shared_vblk_bar &&
+        npf.guest_phys_addr < vm->shared_vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
+        if (vmm_handle_virtio_blk_npf_map(kind, ctx, &vm->disk[0].vblk, &vm->disk[0].be,
+                                          &g_fw_1_dma_map, (uint64_t)vm->shared_vblk_bar,
+                                          insn) == 0) {
+            return HYPE_FW_DEV_VBLK;
+        }
+    }
+
+    /*
+     * #329: the extra disk slots, each over its own model and backend. Reached from any loop
+     * now that the windows are published on the VM.
+     */
+    {
+        unsigned int slot;
+        for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS; slot++) {
+            hype_cfg_bus_t sbus;
+            uint64_t base, wsz;
+            if (!vm->shared_disk_mapped[slot]) continue;
+            base = vm->shared_disk_bar[slot];
+            sbus = fw_1_slot_bus(vm, slot);
+            wsz = (sbus == HYPE_CFG_BUS_AHCI_SATA) ? (uint64_t)HYPE_AHCI_MMIO_SIZE
+                  : (sbus == HYPE_CFG_BUS_NVME)    ? (uint64_t)HYPE_FW_1_NVME_BAR_SIZE
+                                                   : (uint64_t)HYPE_VIRTIO_BLK_BAR_SIZE;
+            if (npf.guest_phys_addr < base || npf.guest_phys_addr >= base + wsz) continue;
+            if (sbus == HYPE_CFG_BUS_AHCI_SATA) {
+                if (vmm_handle_ahci_disk_npf_map(kind, ctx, &vm->disk[slot].ata_ahci,
+                                                 &vm->disk[slot].ata_disk, base, &g_fw_1_dma_map,
+                                                 insn) == 0) {
+                    return HYPE_FW_DEV_DISK_SLOT;
+                }
+            } else if (sbus == HYPE_CFG_BUS_NVME) {
+                hype_nvme_ctx_t nctx;
+                nvme_fill_ctx(&nctx, vm, slot);
+                if (vmm_handle_nvme_npf(kind, ctx, &vm->disk[slot].nvme, &nctx, base,
+                                        HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
+                    return HYPE_FW_DEV_DISK_SLOT;
+                }
+            } else if (vmm_handle_virtio_blk_npf_map(kind, ctx, &vm->disk[slot].vblk,
+                                                     &vm->disk[slot].be, &g_fw_1_dma_map, base,
+                                                     insn) == 0) {
+                return HYPE_FW_DEV_DISK_SLOT;
+            }
+            /*
+             * The window is latched and the model refused the access. The BSP treats that as
+             * fatal, on the argument that absorbing it presents a disk which silently ignores
+             * I/O. This function does not decide that: it reports "no shared device claimed
+             * it" and the caller applies its own policy, because hype_fatal() from an AP takes
+             * every VM on the host down with it.
+             */
+            break;
+        }
+    }
+
+    /* #457: the flash window. A guest OS may call SetVariable from any CPU. */
+    if (npf.guest_phys_addr >= 0x100000000ULL - g_fw_1_combined_size &&
+        npf.guest_phys_addr < 0x100000000ULL && fw_1_flash_npf(vm, kind, ctx, &npf, insn) == 0) {
+        return HYPE_FW_DEV_FLASH;
+    }
+    return HYPE_FW_DEV_NONE;
+}
+
+/*
+ * #482, the port-I/O half: the shared chipset registers, likewise behind one entry point.
+ *
+ * Same drift, found the same way. The AP chain had grown its own list -- UARTs, PCI CF8, PIC/PIT,
+ * PS/2, CMOS, fw_cfg, PM timer -- while the BSP served four more. Measured on a 2-vCPU Alpine
+ * boot: port 0x602 absorbed on the AP, which is PM1a_EN inside the PM1a event block the BSP has
+ * modelled since M8-6. A guest that reads an enable register on one CPU and all-ones on another
+ * has no working ACPI event model, and nothing said so -- the access was counted as "unmodelled".
+ *
+ * Caller must hold fw_1_dev_lock(vm): every register here is per-VM state.
+ *
+ * NOT included, deliberately: the OVMF debug port, whose sink is the BSP loop's own line filter,
+ * and which would need that published before any other loop could feed it without interleaving
+ * two half-lines. An AP writing to it still has its bytes absorbed, which costs diagnostics only.
+ */
+typedef enum {
+    HYPE_FW_PORT_NONE = 0,
+    HYPE_FW_PORT_PM1_EVT,
+    HYPE_FW_PORT_PM1_CNT,
+    HYPE_FW_PORT_PM_TIMER,
+    HYPE_FW_PORT_RESET
+} hype_fw_port_t;
+
+static hype_fw_port_t fw_1_shared_port_io(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
+                                          hype_vcpu_ctx_t *ctx) {
+    /* No VMX twin exists for the event block, so VMX guests keep falling through as before. */
+    if (kind == HYPE_VMM_KIND_SVM &&
+        hype_svm_vcpu_handle_pm1_evt_ioio(ctx, (uint16_t)HYPE_ACPI_PM1A_EVT_PORT,
+                                          &vm->pm1a_evt_en) == 0) {
+        return HYPE_FW_PORT_PM1_EVT;
+    }
+    {
+        int slp_en = 0;
+        int pr = vmm_handle_pm1_cnt_ioio(kind, ctx, (uint16_t)HYPE_ACPI_PM1A_CNT_PORT,
+                                         &vm->pm1a_cnt, &slp_en);
+        if (pr == 0) { /* OUT to PM1a_CNT */
+            if (slp_en) {
+                /* M8-6: an orderly guest power-off. Only \_S5 is declared, so SLP_EN means S5. */
+                vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_S5);
+                hype_debug_print("fw-1: vm%u guest ACPI soft-off (PM1a_CNT SLP_EN) -> OFF\n",
+                                 (unsigned)(vm - g_vms));
+            }
+            return HYPE_FW_PORT_PM1_CNT;
+        }
+        if (pr == 1) {
+            return HYPE_FW_PORT_PM1_CNT; /* IN from PM1a_CNT -- RAX loaded */
+        }
+    }
+    if (vmm_handle_acpi_pm_timer_ioio(kind, ctx) == 0) {
+        return HYPE_FW_PORT_PM_TIMER;
+    }
+    {
+        /*
+         * #94: the ACPI reset register (FADT: I/O 0xCF9, value 6). Windows' HAL writes it to
+         * REBOOT, and it writes it from whichever CPU runs the reboot path -- so serving this
+         * only on the BSP is the same hang #94 fixed, waiting for an SMP guest to find it.
+         * Setting the lifecycle is all this does; the BSP's STARTING branch reinitialises.
+         */
+        int reset_req = 0;
+        int rr = (kind == HYPE_VMM_KIND_VMX)
+                     ? hype_vmx_vcpu_handle_reset_ctl_ioio(ctx, (uint16_t)HYPE_ACPI_RESET_PORT,
+                                                           &reset_req)
+                     : hype_svm_vcpu_handle_reset_ctl_ioio(ctx, (uint16_t)HYPE_ACPI_RESET_PORT,
+                                                           &reset_req);
+        if (rr == 0 && reset_req) {
+            vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_RESET);
+            hype_debug_print("fw-1: vm%u guest reset via ACPI reset register (0xCF9) -> restart\n",
+                             (unsigned)(vm - g_vms));
+        }
+        if (rr != -1) {
+            return HYPE_FW_PORT_RESET;
+        }
+    }
+    return HYPE_FW_PORT_NONE;
+}
+
 static void fw_1_run_ap_vcpu(hype_fw_vm_t *vm, unsigned vi, const hype_vmm_ops_t *ops,
                              hype_vmm_kind_t kind) {
     unsigned vm_idx = (unsigned)(vm - g_vms);
@@ -12141,90 +12381,19 @@ wait_for_sipi:
              * fw_1_dev_lock() is exactly the serialisation SMP-7 added for this: the lock is
              * already held while outside the guest, so the shared hype_pci_t is not raced.
              */
-            int ap_mmio_done = 0;
             /*
-             * #482: the shared device models, served from the AP under fw_1_dev_lock() -- the
-             * same handlers the BSP dispatch calls. The AP loop previously handled only its own
-             * LAPIC and refused everything else, so once the guest got past AP launch it took
-             * tens of thousands of unhandled NPFs (pci_docfgregread, then ahci_ctlr_reset) and
-             * read garbage from device registers on whichever CPU it happened to be on.
-             *
-             * The ABAR windows come from vm->shared_* rather than the BSP's loop locals, which
-             * is why those had to be published on the VM.
+             * #482: the shared device models, through the ONE dispatch every loop uses. This
+             * core holds fw_1_dev_lock(vm) for every non-LAPIC exit, which is the serialisation
+             * that makes serving them from an AP safe.
              */
-            if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &vm->pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
-                ap_mmio_done = 1;
+            hype_fw_dev_t ap_dev = fw_1_shared_mmio_npf(vm, kind, ctx, insn);
+            int ap_mmio_done = (ap_dev != HYPE_FW_DEV_NONE);
+            if (ap_dev == HYPE_FW_DEV_ECAM) {
                 g_ap_ecam_serves[vm_idx][vi]++;
-            } else if (kind == HYPE_VMM_KIND_SVM &&
-                       hype_svm_vcpu_handle_hpet_npf(ctx, &vm->hpet, HYPE_HPET_MMIO_BASE,
-                                                     insn) == 0) {
-                ap_mmio_done = 1;
-            } else if (vmm_handle_ioapic_npf(kind, ctx, &vm->ioapic, HYPE_FW_1_IOAPIC_GPA,
-                                             insn) == 0) {
-                ap_mmio_done = 1;
-            } else if (vm->shared_ahci_mapped || vm->shared_ata_mapped) {
-                hype_vmm_npf_t ap_npf;
-                vmm_get_last_npf(kind, ctx, &ap_npf);
-                if (vm->shared_ata_mapped &&
-                    ap_npf.guest_phys_addr >= vm->shared_ata_abar &&
-                    ap_npf.guest_phys_addr < vm->shared_ata_abar + HYPE_AHCI_MMIO_SIZE) {
-                    if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ata_ahci,
-                                                     &g_fw_1_ata_disk,
-                                                     (uint64_t)vm->shared_ata_abar,
-                                                     &g_fw_1_dma_map, insn) == 0) {
-                        ap_mmio_done = 1;
-                    }
-                } else if (vm->shared_ahci_mapped &&
-                           ap_npf.guest_phys_addr >= vm->shared_ahci_abar &&
-                           ap_npf.guest_phys_addr < vm->shared_ahci_abar + HYPE_AHCI_MMIO_SIZE) {
-                    /*
-                     * The ATAPI model, matching the BSP. An earlier cut of this called
-                     * vmm_handle_ahci_disk_npf_map() with the hard-DISK model here, which
-                     * answered the guest's CD probe from the wrong device and produced
-                     * "(aprobe0:ahcich0:0:0:0): CAM status: CCB request was invalid" on the
-                     * 2-vCPU run only. The first HBA carries the ATAPI CD; g_fw_1_ata_disk
-                     * belongs to the separate SATA-disk HBA handled above.
-                     */
-                    if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi,
-                                                (uint64_t)vm->shared_ahci_abar,
-                                                &g_fw_1_dma_map, insn) == 0) {
-                        ap_mmio_done = 1;
-                        g_ap_ahci_serves[vm_idx][vi]++;
-                    }
-                }
-            }
-            if (!ap_mmio_done && vm->shared_vblk_mapped) {
-                /*
-                 * #511: the virtio-blk window, same treatment as the ABARs above. Linux probes
-                 * virtio PCI from whichever CPU init happens to be on; with this window
-                 * unrecognised here, a probe on vCPU 1 re-faulted on one BAR access forever
-                 * (soft lockup on PID 1, guest never reached userspace). The device state is
-                 * per-VM (vm->disk[0]) and this core holds the device lock for every
-                 * non-LAPIC NPF, so this is the same serialisation the BSP dispatch gets.
-                 */
-                hype_vmm_npf_t vb_npf;
-                vmm_get_last_npf(kind, ctx, &vb_npf);
-                if (vb_npf.guest_phys_addr >= vm->shared_vblk_bar &&
-                    vb_npf.guest_phys_addr < vm->shared_vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
-                    if (vmm_handle_virtio_blk_npf_map(kind, ctx, &vm->disk[0].vblk,
-                                                      &vm->disk[0].be, &g_fw_1_dma_map,
-                                                      (uint64_t)vm->shared_vblk_bar,
-                                                      insn) == 0) {
-                        ap_mmio_done = 1;
-                        g_ap_vblk_serves[vm_idx][vi]++;
-                    }
-                }
-            }
-            if (!ap_mmio_done) {
-                /* #457: the flash window, shared VM state like the devices above (this AP
-                 * holds the device lock here). A guest OS may call SetVariable from any CPU. */
-                hype_vmm_npf_t fl_npf;
-                vmm_get_last_npf(kind, ctx, &fl_npf);
-                if (fl_npf.guest_phys_addr >= 0x100000000ULL - g_fw_1_combined_size &&
-                    fl_npf.guest_phys_addr < 0x100000000ULL &&
-                    fw_1_flash_npf(vm, kind, ctx, &fl_npf, insn) == 0) {
-                    ap_mmio_done = 1;
-                }
+            } else if (ap_dev == HYPE_FW_DEV_AHCI) {
+                g_ap_ahci_serves[vm_idx][vi]++;
+            } else if (ap_dev == HYPE_FW_DEV_VBLK) {
+                g_ap_vblk_serves[vm_idx][vi]++;
             }
             if (ap_mmio_done) {
                 /* handled */
@@ -12278,8 +12447,9 @@ wait_for_sipi:
                 /* handled */
             } else if (vmm_handle_fw_cfg_ioio(kind, ctx, &vm->fw_cfg, &g_fw_1_dma_map) == 0) {
                 /* handled */
-            } else if (vmm_handle_acpi_pm_timer_ioio(kind, ctx) == 0) {
-                /* handled */
+            } else if (fw_1_shared_port_io(vm, kind, ctx) != HYPE_FW_PORT_NONE) {
+                /* #482: the chipset registers the BSP has always served -- PM1a event and
+                 * control, the PM timer, the ACPI reset register -- now from here too. */
             } else {
                 /*
                  * Absorb an unmodelled port -- vmm_handle_unknown_ioio retires the instruction
@@ -16650,6 +16820,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         if (bar != 0) {
                             dwin[slot].bar = bar;
                             dwin[slot].mapped = 1;
+                            /* #482: publish it so every dispatch loop can serve this window,
+                             * not just this one. Base before the flag: a reader that sees
+                             * mapped must see a valid base. */
+                            vm->shared_disk_bar[slot] = bar;
+                            vm->shared_disk_mapped[slot] = 1u;
                             hype_debug_print("fw-1: disk slot %u BAR enabled at guest-physical "
                                              "0x%llx (#329)\n", slot, (unsigned long long)bar);
                         }
@@ -17274,55 +17449,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     continue;
                 }
             }
-            /* M8-6: detect the guest's ACPI power-off. A UEFI guest powers off via
-             * EFI ResetSystem -> OVMF, which writes the classic ACPI PM1a_CNT
-             * (I/O 0x604) with SLP_EN set; only \_S5 is declared, so that is an
-             * orderly S5. Peek the exit (don't consume it -- the write is absorbed
-             * by the unknown-IOIO handler below) and post an S5 lifecycle event so
-             * a guest that ran `poweroff` transitions cleanly to OFF instead of
-             * being force-killed by the shutdown grace timer. */
-            if (kind == HYPE_VMM_KIND_SVM &&
-                hype_svm_vcpu_handle_pm1_evt_ioio(ctx, (uint16_t)HYPE_ACPI_PM1A_EVT_PORT,
-                                                  &vm->pm1a_evt_en) == 0) {
-                continue;
-            }
             {
-                int slp_en = 0;
-                int pr = vmm_handle_pm1_cnt_ioio(kind, ctx, (uint16_t)HYPE_ACPI_PM1A_CNT_PORT,
-                                                &vm->pm1a_cnt, &slp_en);
-                if (pr == 0) { /* OUT to PM1a_CNT */
-                    if (slp_en) {
-                        vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_S5);
-                        hype_debug_print("fw-1: vm%u guest ACPI soft-off (PM1a_CNT SLP_EN) -> OFF\n",
-                                         (unsigned)(vm - g_vms));
-                    }
-                    continue;
-                }
-                if (pr == 1) {
-                    continue; /* IN from PM1a_CNT -- RAX loaded */
-                }
-            }
-            if (vmm_handle_acpi_pm_timer_ioio(kind, ctx) == 0) {
-                continue;
-            }
-            {
-                /* #94: the ACPI reset register (FADT: I/O 0xCF9, value 6).
-                 * Windows' HAL writes it to REBOOT; before this the write fell
-                 * into the absorb-unknown-port path and a mid-install restart
-                 * idled forever. Bit 2 (RST_CPU) is the reset request, as on
-                 * real PIIX/ICH chipsets. */
-                int reset_req = 0;
-                int rr = (kind == HYPE_VMM_KIND_VMX)
-                             ? hype_vmx_vcpu_handle_reset_ctl_ioio(ctx, (uint16_t)HYPE_ACPI_RESET_PORT,
-                                                                   &reset_req)
-                             : hype_svm_vcpu_handle_reset_ctl_ioio(ctx, (uint16_t)HYPE_ACPI_RESET_PORT,
-                                                                   &reset_req);
-                if (rr == 0 && reset_req) {
-                    vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_RESET);
-                    hype_debug_print("fw-1: vm%u guest reset via ACPI reset register (0xCF9) "
-                                     "-> restart\n", (unsigned)(vm - g_vms));
-                }
-                if (rr != -1) {
+                /*
+                 * #482: PM1a event/control, the PM timer and the ACPI reset register, through
+                 * the one dispatch the AP loop uses as well -- see fw_1_shared_port_io(). These
+                 * were four hand-written blocks here and absent there, which is how a guest
+                 * came to read PM1a_EN as all-ones whenever the access landed on vCPU 1.
+                 */
+                if (fw_1_shared_port_io(vm, kind, ctx) != HYPE_FW_PORT_NONE) {
                     continue; /* handled; on reset the STARTING branch reinitialises */
                 }
             }
