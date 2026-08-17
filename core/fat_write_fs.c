@@ -1179,10 +1179,26 @@ static unsigned long long g_fat_rollback_failures;
 void hype_fat_write_note_rollback_failure(void) { g_fat_rollback_failures++; }
 unsigned long long hype_fat_write_rollback_failures(void) { return g_fat_rollback_failures; }
 
+/*
+ * #464: what does the entry ON THE MEDIUM claim right now? The rollback has to decide whether
+ * cutting the chain is safe, and that turns on what was actually published -- not on what a
+ * failed flush intended. A flush refused before writing (the identity check, or a failed read)
+ * leaves the old size published and the new clusters safe to reclaim; a flush that failed while
+ * writing may have left the larger size behind, and then the chain must stay.
+ */
+static int entry_claims_at_most(hype_fat32_wfile_t *f, uint64_t bytes) {
+    hype_fat32_fs_t *fs = f->fs;
+    uint8_t sec[SECSZ];
+    if (f->dirent_off > SECSZ - DIRENT_SIZE) return 0;
+    if (fs->read(fs->ctx, f->dirent_lba, 1u, sec) != 0) return 0;
+    return ((uint64_t)hype_fat_dirent_size(sec + f->dirent_off) <= bytes) ? 1 : 0;
+}
+
 static int growth_rollback(hype_fat32_wfile_t *f, uint32_t first_new, uint32_t old_tail,
                            uint64_t old_size) {
     hype_fat32_fs_t *fs = f->fs;
     int ok = 0;
+    int entry_shrunk = 0;
     /*
      * #464: SHRINK THE DIRECTORY ENTRY BEFORE SHRINKING THE CHAIN.
      *
@@ -1198,11 +1214,32 @@ static int growth_rollback(hype_fat32_wfile_t *f, uint32_t first_new, uint32_t o
      * chain longer than the entry -- is harmless: it is a few leaked clusters that fsck
      * reclaims, and the file simply reads short.
      */
+    /*
+     * The restore must not depend on the barrier. flush_metadata(durable=1) issues its barrier
+     * BEFORE rewriting the entry, so when the rollback was caused by a barrier that keeps
+     * failing -- #516 found this stick rejects SYNCHRONIZE CACHE(10) outright -- the restore
+     * aborted before touching the entry, and the chain was freed anyway. That reproduced the
+     * exact entry-beyond-chain state this function exists to prevent, which is why the first
+     * cut of this fix did not close the issue. Shrinking needs no preceding barrier: ordering
+     * only matters when publishing a size that reaches clusters the medium may not have linked.
+     */
     f->size = old_size;
     if (first_cluster_valid(f)) {
-        ok |= flush_metadata(f, 1, 0);
+        if (flush_metadata(f, 0, 0) != 0) {
+            ok = -1;
+        } else if (fs->sync != (hype_blk_sync_fn)0 && fs->sync(fs->ctx) != 0) {
+            ok = -1; /* the shrink is written but not known durable */
+        }
     }
-    if (first_new >= 2u) {
+    /*
+     * Cut the chain only once the medium itself shows an entry within the old size -- read back,
+     * not inferred from what the restore attempt returned. If it does not, leave the clusters
+     * linked: a chain longer than its entry is leaked space fsck reclaims and a file that reads
+     * short, while a chain shorter than its entry is the volume Linux refuses. Given the choice,
+     * leak.
+     */
+    entry_shrunk = entry_claims_at_most(f, old_size);
+    if (entry_shrunk && first_new >= 2u) {
         ok |= free_chain(fs, first_new);
         if (old_tail >= 2u) {
             ok |= fat_set(fs, old_tail, FAT32_EOC_MIN | 0x7u);

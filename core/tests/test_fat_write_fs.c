@@ -34,6 +34,7 @@ static unsigned int g_write_calls;
 static unsigned int g_max_write_count;
 static unsigned int g_sync_calls;
 static long g_sync_countdown = -1;
+static int g_sync_hardfail; /* once the countdown fires, every later barrier fails too */
 static int g_stale_fat0_reads;
 static uint8_t g_stale_fat0[SECSZ];
 static hype_fat32_wfile_t *g_corrupt_guard_on_data_write;
@@ -73,7 +74,10 @@ static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
 static int vol_sync(void *ctx) {
     (void)ctx;
     g_sync_calls++;
-    if (g_sync_countdown >= 0 && g_sync_countdown-- == 0) return -1;
+    if (g_sync_countdown >= 0 && g_sync_countdown-- == 0) {
+        if (g_sync_hardfail) g_sync_countdown = 0; /* stay failing */
+        return -1;
+    }
     return 0;
 }
 
@@ -100,6 +104,7 @@ static void build_vol(void) {
     g_max_write_count = 0u;
     g_sync_calls = 0u;
     g_sync_countdown = -1;
+    g_sync_hardfail = 0;
     g_stale_fat0_reads = 0;
     g_write_hardfail = 0;
     g_corrupt_guard_on_data_write = 0;
@@ -182,6 +187,60 @@ static void test_failed_growth_leaves_entry_within_chain(void) {
     }
     CHECK("chain terminates", walked < 128u);
     CHECK_HEX("entry size fits the chain it claims", 1u, (unsigned)(dsz <= walked * SECSZ));
+}
+
+/*
+ * #464: the same invariant when the barrier does not recover -- the case the operator's stick
+ * actually presents.
+ *
+ * The first barrier of a growth succeeds, the entry is published at the NEW size, and the barrier
+ * that follows it fails and keeps failing. That is not synthetic: #516 found that this stick
+ * rejects SYNCHRONIZE CACHE(10) outright, and before that fix a rejected barrier was misread as
+ * transport damage, so once one failed the rest of the run failed too.
+ *
+ * growth_rollback() must still shrink the on-disk entry under those conditions. Restoring it
+ * through a DURABLE flush cannot work here: flush_metadata() issues its barrier BEFORE rewriting
+ * the entry, so a still-failing barrier aborts the restore, and the chain is then freed anyway --
+ * leaving exactly the entry-beyond-chain state this rollback exists to prevent.
+ */
+static void test_persistent_barrier_failure_never_leaves_entry_past_chain(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t f;
+    uint8_t data[1500];
+    unsigned int i;
+    uint32_t dsz, clus, walked;
+
+    build_vol();
+    CHECK_HEX("hardfail mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    hype_fat32_fs_set_sync(&fs, vol_sync);
+    CHECK_HEX("hardfail create", 0, hype_fat32_create(&fs, "SYNCDEAD.BIN", &f));
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+    CHECK_HEX("seed 600 while barriers work", 0, hype_fat32_append(&f, data, 600u));
+
+    /*
+     * Fail the SECOND barrier of the growing write and every barrier after it. The first one
+     * (ordering the FAT links) succeeds, so the entry does reach the medium at the new size --
+     * which is the only way to reach the corrupting window.
+     */
+    g_sync_countdown = 1;
+    g_sync_hardfail = 1;
+    CHECK("growing write reports failure", hype_fat32_write_at(&f, 0, data, 1500u) != 0);
+    g_sync_countdown = -1;
+    g_sync_hardfail = 0;
+
+    {
+        const uint8_t *ent = g_vol + clba(2) * SECSZ + 0;
+        dsz = hype_fat_dirent_size(ent);
+        clus = hype_fat_dirent_cluster(ent);
+    }
+    walked = 0u;
+    while (clus >= 2u && clus < 0x0FFFFFF8u && walked < 128u) {
+        walked++;
+        clus = fat0(clus);
+    }
+    CHECK("hardfail chain terminates", walked < 128u);
+    CHECK_HEX("entry never claims more than the chain holds", 1u,
+              (unsigned)(dsz <= walked * SECSZ));
 }
 
 static void test_append_coalesces_contiguous_sectors(void) {
@@ -1732,6 +1791,7 @@ int main(void) {
     test_more_edges();
     test_fault_sweep();
     test_failed_growth_leaves_entry_within_chain(); /* #464 */
+    test_persistent_barrier_failure_never_leaves_entry_past_chain(); /* #464 */
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;
