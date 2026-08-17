@@ -903,6 +903,22 @@ typedef struct hype_fw_vm {
     volatile uint64_t shared_disk_bar[HYPE_FW_1_MAX_DISKS];
     volatile unsigned shared_disk_mapped[HYPE_FW_1_MAX_DISKS];
     /*
+     * #520: the SIPI entry a vCPU must apply to ITSELF.
+     *
+     * On SVM the sender can build the target's state directly -- a VMCB is plain memory and any
+     * core may write it. A VMCS is not: Intel requires it to be VMCLEARed on the processor where
+     * it was last loaded before another processor may load it, so the BSP writing a parked AP's
+     * VMCS is undefined, and in practice the AP resumed from its own cached state as if nothing
+     * had been written. That is why every Intel guest AP ran the leftovers of its previous VMCS.
+     *
+     * So the SIPI is RECORDED here and applied by the target on its own core.
+     */
+    volatile uint64_t sipi_entry[HYPE_MAX_VCPUS_PER_VM];
+    volatile uint64_t sipi_stack[HYPE_MAX_VCPUS_PER_VM];
+    volatile uint64_t sipi_root[HYPE_MAX_VCPUS_PER_VM];
+    volatile uint16_t sipi_cs_selector[HYPE_MAX_VCPUS_PER_VM];
+    volatile uint8_t sipi_apply_on_self[HYPE_MAX_VCPUS_PER_VM];
+    /*
      * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what
      * its guest is told. 1 until SMT-aware core allocation lands (#479, #190) -- and honestly
      * so, since today a granted core supplies exactly one dispatchable thread.
@@ -5763,8 +5779,21 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
                 if (vm->vcpu[target] != 0) {
                     /* Must be parked: the reset rebuilds the VMCB this vCPU's core runs. */
                     fw_1_wait_vcpu_parked(vm, target);
-                    vmm_reset_realmode(kind, vm->vcpu[target], (uint64_t)ipi->vector << 12,
-                                       stack_top, npt_root);
+                    /*
+                     * #520: record the entry either way; who applies it depends on the backend.
+                     * A VMCS may only be loaded by one processor at a time, so the target applies
+                     * its own on VMX (see hype_fw_vm_t.sipi_entry). A VMCB is plain memory, so
+                     * SVM keeps building it here, exactly as it has since #188.
+                     */
+                    vm->sipi_entry[target] = (uint64_t)ipi->vector << 12;
+                    vm->sipi_stack[target] = stack_top;
+                    vm->sipi_root[target] = npt_root;
+                    vm->sipi_cs_selector[target] = (uint16_t)((ipi->vector & 0xFFu) << 8);
+                    if (kind == HYPE_VMM_KIND_VMX) {
+                        vm->sipi_apply_on_self[target] = 1u;
+                    } else {
+                        vmm_reset_realmode(kind, vm->vcpu[target], (uint64_t)ipi->vector << 12,
+                                           stack_top, npt_root);
                     /*
                      * A SIPI sets CS.selector = vector << 8 as well as CS.base = vector << 12.
                      * The selector is NOT cosmetic here, which cost a long diagnosis:
@@ -5775,8 +5804,12 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
                      * from guest-physical 0x68 instead of 0x9f068, got 0, and then #GP'd
                      * forever on `mov ss, edx` with a null selector.
                      */
-                    vmm_set_cs_ss_selectors(kind, vm->vcpu[target],
-                                            (uint16_t)((ipi->vector & 0xFFu) << 8), 0u);
+                        vmm_set_cs_ss_selectors(kind, vm->vcpu[target],
+                                                (uint16_t)((ipi->vector & 0xFFu) << 8), 0u);
+                        vmm_set_topology(kind, vm->vcpu[target], target,
+                                         fw_1_guest_visible_vcpus(vm),
+                                         vm->threads_per_core ? vm->threads_per_core : 1u);
+                    }
                     /*
                      * SMP-6: OVMF's MP_CPU_EXCHANGE_INFO sits in the SIPI buffer, and the AP
                      * reads BufferStart / DataSegment / Cr3 / the ModeHighMemory far pointer
@@ -5804,9 +5837,6 @@ static unsigned fw_1_route_ipi_from(hype_fw_vm_t *vm, unsigned sender, hype_vmm_
 
                         }
                     }
-                    vmm_set_topology(kind, vm->vcpu[target], target,
-                                     fw_1_guest_visible_vcpus(vm),
-                                     vm->threads_per_core ? vm->threads_per_core : 1u);
                 }
                 vm->vcpu_state[target] = HYPE_VCPU_STATE_RUNNABLE;
                 acted++;
@@ -12160,6 +12190,25 @@ wait_for_sipi:
      * With #PF left to hardware the CPU writes CR2 itself. #UD stays intercepted because this
      * loop, like the BSP's, relies on seeing it.
      */
+    /*
+     * #520: apply this vCPU's own SIPI entry, on its own core.
+     *
+     * The sender recorded it rather than writing it, because a VMCS belongs to one processor at a
+     * time: Intel requires a VMCLEAR on the processor that last loaded it before another may load
+     * it, so the BSP building a parked AP's VMCS is undefined and in practice was simply lost --
+     * the AP resumed the leftovers of its previous VMCS, executed garbage, and OVMF's
+     * NumApsExecuting never left 0. Doing it here, before the per-SIPI intercept setup below,
+     * puts the rebuild on the only core allowed to do it.
+     *
+     * SVM applies its VMCB at the sender and leaves this flag clear, so this costs it nothing.
+     */
+    if (vm->sipi_apply_on_self[vi]) {
+        vm->sipi_apply_on_self[vi] = 0u;
+        vmm_reset_realmode(kind, ctx, vm->sipi_entry[vi], vm->sipi_stack[vi], vm->sipi_root[vi]);
+        vmm_set_cs_ss_selectors(kind, ctx, vm->sipi_cs_selector[vi], 0u);
+        vmm_set_topology(kind, ctx, vi, fw_1_guest_visible_vcpus(vm),
+                         vm->threads_per_core ? vm->threads_per_core : 1u);
+    }
     vmm_set_exception_intercepts(kind, ctx, (1u << 6));
     /*
      * #484: give this AP a pvclock map, or its kvmclock never works.
