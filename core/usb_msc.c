@@ -88,7 +88,9 @@ void hype_scsi_cdb_request_sense(uint8_t cdb[6], uint8_t alloc_len) {
 
 int hype_scsi_parse_fixed_sense(const uint8_t *sense, unsigned int len, unsigned int *key,
                                 unsigned int *asc, unsigned int *ascq) {
-    if (sense == 0 || len < 14u || (sense[0] & 0x7Fu) != 0x70u) return -1;
+    /* Fixed format is response code 0x70 (current) or 0x71 (deferred), each with the
+     * VALID bit (0x80) possibly set -- mask both bit 7 and bit 0 to accept all four. */
+    if (sense == 0 || len < 14u || (sense[0] & 0x7Eu) != 0x70u) return -1;
     if (key) *key = sense[2] & 0x0Fu;
     if (asc) *asc = sense[12];
     if (ascq) *ascq = sense[13];
