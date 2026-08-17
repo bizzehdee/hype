@@ -637,7 +637,7 @@ static void test_rmw_refuses_adc_sbb_and_cmp(void) {
      * updated with the wrong carry is silent corruption.
      */
     struct { uint8_t modrm; const char *name; } cases[] = {
-        {0x12u, "ADC (/2)"}, {0x1Au, "SBB (/3)"}, {0x3Au, "CMP (/7)"},
+        {0x12u, "ADC (/2)"}, {0x1Au, "SBB (/3)"},
     };
     unsigned int i;
 
@@ -648,6 +648,31 @@ static void test_rmw_refuses_adc_sbb_and_cmp(void) {
         insn[1] = cases[i].modrm;
         insn[2] = 0x01u;
         CHECK_HEX(cases[i].name, (unsigned)-1, (unsigned)hype_mmio_decode(insn, 3u, &d));
+    }
+    /* #457: /7 CMP is DECODED now -- as the flags-only READ it is, not as an RMW. OVMF's
+     * flash FVB driver validates the variable-store header with `cmpb $imm, off(%reg)`. */
+    {
+        uint8_t insn[3];
+        hype_mmio_decode_t d;
+        insn[0] = 0x83u;
+        insn[1] = 0x3Au; /* /7 = CMP, mem operand [rdx] */
+        insn[2] = 0x01u;
+        CHECK_HEX("imm CMP (/7) decodes", 0u, (unsigned)hype_mmio_decode(insn, 3u, &d));
+        CHECK_HEX("imm CMP is a READ", 0u, (unsigned)d.is_write);
+        CHECK_HEX("imm CMP has no mem destination", 0u, (unsigned)d.mem_is_dst);
+        CHECK_HEX("imm CMP carries the immediate", 1u, (unsigned)d.has_imm);
+        CHECK_HEX("imm CMP op", (unsigned)HYPE_MMIO_ALU_CMP, (unsigned)d.op);
+        CHECK_HEX("imm8 sign-extends via 0x83", 0x1u, d.imm_value);
+    }
+    /* 8-bit form, the exact OVMF shape: cmpb $0x2, 0x37(%rdi). */
+    {
+        static const uint8_t ovmf_cmp[] = {0x80, 0x7F, 0x37, 0x02};
+        hype_mmio_decode_t d;
+        CHECK_HEX("OVMF cmpb decodes", 0u, (unsigned)hype_mmio_decode(ovmf_cmp, 4u, &d));
+        CHECK_HEX("OVMF cmpb width", 1u, (unsigned)d.size_bytes);
+        CHECK_HEX("OVMF cmpb is a READ", 0u, (unsigned)d.is_write);
+        CHECK_HEX("OVMF cmpb immediate", 0x2u, d.imm_value);
+        CHECK_HEX("OVMF cmpb length", 4u, (unsigned)d.instr_len);
     }
     /* The memory-SOURCE CMP (0x3B) is a different instruction and stays supported. */
     {

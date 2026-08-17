@@ -32,6 +32,7 @@ typedef enum {
      * into the dashboard's multi-line result panel (#460). */
     HYPE_CMD_CONFIG,
     HYPE_CMD_HOST,       /* M9-2 (#175): host-wide reboot/off -- shut every guest down first */
+    HYPE_CMD_SET,        /* TERM-14 (#490): set <vm> <key> <value> -- edit config, write back */
     HYPE_CMD_UNKNOWN,
 } hype_cmd_verb_t;
 
@@ -53,12 +54,27 @@ const char *hype_cmd_usage(unsigned index);
 
 typedef struct {
     hype_cmd_verb_t verb;
-    char arg[HYPE_CMD_ARG_MAX]; /* first argument token, "" if none */
+    char arg[HYPE_CMD_ARG_MAX];  /* first argument token, "" if none */
+    char arg2[HYPE_CMD_ARG_MAX]; /* TERM-14: second argument token (the key) */
+    char arg3[HYPE_CMD_ARG_MAX]; /* TERM-14: third argument token (the value) */
     int has_arg;
+    int has_arg2;
+    int has_arg3;
 } hype_cmd_t;
 
 /* Parse one command line. Leading/trailing space ignored; the verb is the first
- * whitespace-delimited token, the arg the second (further tokens ignored). */
-hype_cmd_t hype_cmd_parse(const char *line);
+ * whitespace-delimited token, then up to three argument tokens (further tokens
+ * ignored). Only TERM-14's `set` consumes all three today. */
+/* Fill-in-place form -- the only one the freestanding build may use: hype_cmd_t is too large
+ * to return by value without emitting a memcpy call libc-free code cannot link (AGENTS.md). */
+void hype_cmd_parse_at(const char *line, hype_cmd_t *out);
+
+/* By-value convenience for HOSTED callers (the unit tests). static inline so it is only ever
+ * materialized in a translation unit that calls it -- never in the EFI image. */
+static inline hype_cmd_t hype_cmd_parse(const char *line) {
+    hype_cmd_t c;
+    hype_cmd_parse_at(line, &c);
+    return c;
+}
 
 #endif /* HYPE_CMDPARSE_H */

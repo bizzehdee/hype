@@ -26,7 +26,10 @@ static void test_reset_defaults(void) {
     reset_backing();
     hype_pflash_reset(&pf, g_backing, sizeof(g_backing));
     CHECK_HEX("starts in read-array mode", HYPE_PFLASH_MODE_READ_ARRAY, pf.mode);
-    CHECK_HEX("status starts ready, no errors", HYPE_PFLASH_STATUS_READY, pf.status);
+    /* #457: reset status is CLEARED (0), as QEMU's pflash_cfi01 resets it. OVMF's
+     * QemuFlashDetected requires reading CLEARED_ARRAY_STATUS (0x00) after CLEAR_STATUS to
+     * accept the chip as writable flash; READY is earned by completing a program/erase. */
+    CHECK_HEX("status starts CLEARED (QEMU semantics)", 0u, pf.status);
 }
 
 static void test_read_array_reflects_backing(void) {
@@ -61,6 +64,9 @@ static void test_read_status_and_devid_replicate_across_width(void) {
     reset_backing();
     hype_pflash_reset(&pf, g_backing, sizeof(g_backing));
 
+    /* #457: earn READY first -- a completed byte program sets it. */
+    hype_pflash_write(&pf, 0, 1, HYPE_PFLASH_CMD_WRITE_BYTE);
+    hype_pflash_write(&pf, 0, 1, 0xAAu);
     hype_pflash_write(&pf, 0, 1, HYPE_PFLASH_CMD_READ_STATUS);
     hype_pflash_read(&pf, 0, 4, &value);
     CHECK_HEX("status replicated across all 4 bytes", 0x80808080u, value);
@@ -153,7 +159,8 @@ static void test_clear_status(void) {
 
     pf.status |= HYPE_PFLASH_STATUS_PROGRAM_ERROR;
     hype_pflash_write(&pf, 0, 1, HYPE_PFLASH_CMD_CLEAR_STATUS);
-    CHECK_HEX("CLEAR_STATUS resets to ready-only", HYPE_PFLASH_STATUS_READY, pf.status);
+    /* #457: cleared means CLEARED -- 0x00, the value OVMF's probe demands to see. */
+    CHECK_HEX("CLEAR_STATUS resets to CLEARED", 0u, pf.status);
     CHECK_HEX("CLEAR_STATUS returns to array mode", HYPE_PFLASH_MODE_READ_ARRAY, pf.mode);
 }
 

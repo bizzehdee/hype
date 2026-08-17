@@ -653,6 +653,9 @@ typedef struct hype_fw_vm {
     /* #457: the CODE bytes sharing VARS's flipped 2MB page(s), served as a permanently
      * READ_ARRAY array so a fetch/read that lands there mid-command still returns true bytes. */
     hype_pflash_t codehead_flash;
+    /* TERM-14 (#490): HYPE_CFG_F_* bits edited by `set` while this VM was running -- shown as
+     * pending by `config`, cleared when the VM restarts (the point where config is re-read). */
+    unsigned cfg_pending_bits;
     uint8_t flash_trap_mode; /* 1 while the VARS pages are fully trapped */
     /* #457: a runtime NPT/EPT edit needs each vCPU's nested TLB flushed before its next
      * entry; set for all on every flip, consumed in both dispatch loops. */
@@ -1957,11 +1960,15 @@ static hype_fs_t *fw_1_boot_volume(void);
 /* TERM-6 (#444): same reason/placement as term_resolution_cmd above -- needs g_hype_cfg. `idx` is
  * the VM index term_run_cmdline already resolved from the command's arg. */
 static void term_config_cmd(int idx, const char *nm);
+/* TERM-14 (#490): same placement reason -- needs g_hype_cfg + the serializer + #447. */
+static void term_set_cmd(int idx, const char *nm, const char *key, const char *value);
 
 /* Execute the current command line, replacing the previous result, then clear the line. */
 static void term_run_cmdline(void) {
-    hype_cmd_t c = hype_cmd_parse(g_cmdline);
-    int idx = term_resolve_vm(c.arg);
+    hype_cmd_t c;
+    int idx;
+    hype_cmd_parse_at(g_cmdline, &c); /* fill-in-place: no by-value copy in freestanding code */
+    idx = term_resolve_vm(c.arg);
     const char *nm = (idx >= 0) ? g_vms[idx].name : (c.has_arg ? c.arg : "?");
 
     /* Each command's output replaces the last -- the panel is a result, not a scrollback. */
@@ -2068,6 +2075,15 @@ static void term_run_cmdline(void) {
                 term_resultf( "config: unknown vm '%s'", nm);
             } else {
                 term_config_cmd(idx, nm);
+            }
+            break;
+        case HYPE_CMD_SET:
+            if (idx < 0) {
+                term_resultf("set: unknown vm '%s'", nm);
+            } else if (!c.has_arg2 || !c.has_arg3) {
+                term_resultf("set: usage: set <vm> <key> <value>");
+            } else {
+                term_set_cmd(idx, nm, c.arg2, c.arg3);
             }
             break;
         case HYPE_CMD_HOST: {
@@ -11493,6 +11509,8 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     /* #457: chip protocol state must never survive a guest reset, and a restart taken
      * mid-command would otherwise leave the window trapped forever. */
     fw_1_flash_reset(vm, kind, ctx);
+    /* TERM-14 (#490): a restart is the point where queued config edits are consumed. */
+    vm->cfg_pending_bits = 0u;
     hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
     hype_guest_ram_zero(g_fw_1_guest_stack, sizeof(g_fw_1_guest_stack));
 
@@ -19725,7 +19743,7 @@ static void fw_1_await_phys_confirm_on_bsp(void) {
                      * ("confirm <serial>") and a bare serial -- the prompt says the
                      * former, and refusing the latter would be a gratuitous way to
                      * fail a destructive-write confirmation at the keyboard. */
-                    c = hype_cmd_parse(line);
+                    hype_cmd_parse_at(line, &c);
                     (void)hype_phys_confirm_submit(&g_phys_confirm,
                                                    (c.verb == HYPE_CMD_CONFIRM && c.has_arg)
                                                        ? c.arg
@@ -20247,6 +20265,197 @@ static void term_config_cmd(int idx, const char *nm) {
     term_cfg_line_list(nm, "net_peers", vm->net_peers, vm->net_peers_count,
                       (sf & HYPE_CFG_F_NET_PEERS) != 0);
     hype_debug_print("cfg[%s]: --- end ---\n", nm);
+    /* TERM-14 (#490): name the keys edited while this VM was running -- their new values are
+     * shown above (they are live in g_hype_cfg) but the running VM does not use them yet. */
+    if (idx < (int)g_vm_count && g_vms[idx].cfg_pending_bits != 0u) {
+        term_resultf("pending until %s restarts: %s%s%s%s%s%s%s%s", nm,
+                     (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_VCPUS) ? "vcpus " : "",
+                     (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_MEM_MB) ? "mem_mb " : "",
+                     (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_BOOT) ? "boot " : "",
+                     (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_INSTALL_MEDIA) ? "install_media " : "",
+                     (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_TARGET_DISK) ? "target_disk " : "",
+                     (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_MEDIA_DISK) ? "media_disk " : "",
+                     (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_OS_HINT) ? "os_hint " : "",
+                     (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_NET_MODE) ? "net_mode " : "");
+    }
+}
+
+/*
+ * TERM-14 (#490): `set <vm> <key> <value>` -- edit one config key, validated by the parser
+ * itself, written back at once through the #447 boot-volume path.
+ *
+ * The validation deliberately duplicates NOTHING from core/cfg.c: the current config is
+ * serialized (losslessly, #221/#222), the one line is replaced or inserted textually inside the
+ * VM's own [vm.*] section, and the result is RE-PARSED. The parser is the same code that will
+ * read the file at the next boot, so "the parser accepted it and set the key's seen_fields bit"
+ * is the exact definition of a valid edit -- and an unknown key, which the parser deliberately
+ * warns-and-RETAINS (#222), is caught by that bit staying clear rather than being silently
+ * written as dead weight (the #285 accepted-but-ignored class).
+ *
+ * Nothing is adopted in RAM unless the file write succeeded: an edit the next boot cannot see
+ * is worse than a refused one, which is also why there is NO fallback to the log-sink volume
+ * here (the ticket names that silent path as the thing not to inherit).
+ */
+static const struct {
+    const char *key;
+    unsigned bit;
+    int live; /* 1 = takes effect immediately on a running VM */
+} g_term_set_keys[] = {
+    {"vcpus", HYPE_CFG_F_VCPUS, 0},
+    {"mem_mb", HYPE_CFG_F_MEM_MB, 0},
+    {"boot", HYPE_CFG_F_BOOT, 0},
+    {"install_media", HYPE_CFG_F_INSTALL_MEDIA, 0},
+    {"media_disk", HYPE_CFG_F_MEDIA_DISK, 0},
+    {"target_disk", HYPE_CFG_F_TARGET_DISK, 0},
+    {"firmware", HYPE_CFG_F_FIRMWARE, 0},
+    {"os_hint", HYPE_CFG_F_OS_HINT, 0},
+    {"net_mode", HYPE_CFG_F_NET_MODE, 0},
+    {"label", HYPE_CFG_F_LABEL, 1}, /* display metadata: nothing about the running guest uses it */
+};
+
+static void term_set_cmd(int idx, const char *nm, const char *key, const char *value) {
+    static char text[16384];   /* current config, serialized */
+    static char text2[16384];  /* edited text -- what gets written */
+    static char text3[16384];  /* parse scratch: hype_cfg_parse tokenizes in place */
+    static hype_cfg_t check;
+    unsigned ki, nkeys = (unsigned)(sizeof(g_term_set_keys) / sizeof(g_term_set_keys[0]));
+    unsigned bit = 0;
+    int live = 0, found = 0;
+    hype_cfg_serialize_result_t sr;
+    hype_cfg_result_t pr;
+    unsigned si, di = 0, replaced = 0, in_section = 0, done = 0;
+    const char *vmname;
+    hype_fs_t *bv;
+    hype_fs_file_t f;
+
+    if (idx < 0 || idx >= (int)g_hype_cfg.vm_count) {
+        term_resultf("set: '%s' has no [vm.*] section -- only configured VMs can be edited", nm);
+        return;
+    }
+    for (ki = 0; ki < nkeys; ki++) {
+        if (term_streq(key, g_term_set_keys[ki].key)) {
+            bit = g_term_set_keys[ki].bit;
+            live = g_term_set_keys[ki].live;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        term_resultf("set: unknown key '%s' (vcpus mem_mb boot install_media media_disk "
+                     "target_disk firmware os_hint net_mode label)", key);
+        return;
+    }
+    sr = hype_cfg_serialize(&g_hype_cfg, text, sizeof(text));
+    if (sr.refused_overflow || sr.truncated || sr.len == 0) {
+        term_resultf("set: cannot serialize the current config (overflow=%d trunc=%d) -- "
+                     "nothing changed", sr.refused_overflow, sr.truncated);
+        return;
+    }
+    /* Line surgery: replace `key = ...` inside [vm.<name>], or insert it after the header. */
+    vmname = g_hype_cfg.vms[idx].name;
+    for (si = 0; si < sr.len && di + HYPE_CMD_ARG_MAX * 2u + 8u < sizeof(text2);) {
+        unsigned le = si;
+        while (le < sr.len && text[le] != '\n') le++;
+        {
+            unsigned ll = le - si;
+            int is_hdr = (ll > 0 && text[si] == '[');
+            if (is_hdr && !done) {
+                if (in_section && !replaced) {
+                    /* leaving the target section without a match: insert before this header */
+                    di += (unsigned)hype_snprintf(text2 + di, sizeof(text2) - di, "%s = %s\n",
+                                                  key, value);
+                    replaced = 1;
+                    done = 1;
+                }
+                /* does this header open [vm.<name>]? */
+                in_section = 0;
+                if (ll > 4u && text[si + 1] == 'v' && text[si + 2] == 'm' && text[si + 3] == '.') {
+                    unsigned nx = si + 4u, k = 0;
+                    while (vmname[k] != '\0' && nx < le && text[nx] == vmname[k]) { nx++; k++; }
+                    if (vmname[k] == '\0' && nx < le && text[nx] == ']') in_section = 1;
+                }
+            } else if (in_section && !replaced && ll > 0) {
+                /* first token of the line == key? */
+                unsigned ws = si;
+                while (ws < le && (text[ws] == ' ' || text[ws] == '\t')) ws++;
+                unsigned te = ws, k = 0;
+                while (te < le && text[te] != ' ' && text[te] != '\t' && text[te] != '=') te++;
+                if (te - ws > 0) {
+                    unsigned kl = te - ws;
+                    for (k = 0; k < kl && key[k] != '\0'; k++) {
+                        if (text[ws + k] != key[k]) break;
+                    }
+                    if (k == kl && key[k] == '\0') {
+                        di += (unsigned)hype_snprintf(text2 + di, sizeof(text2) - di,
+                                                      "%s = %s\n", key, value);
+                        replaced = 1;
+                        done = 1;
+                        si = le + 1u;
+                        continue;
+                    }
+                }
+            }
+        }
+        {
+            unsigned n = le - si;
+            unsigned c;
+            for (c = 0; c < n && di < sizeof(text2) - 2u; c++) text2[di++] = text[si + c];
+            if (le < sr.len) text2[di++] = '\n';
+            si = le + 1u;
+        }
+    }
+    if (in_section && !replaced && di + HYPE_CMD_ARG_MAX * 2u + 8u < sizeof(text2)) {
+        /* target section ran to EOF without the key: append it */
+        di += (unsigned)hype_snprintf(text2 + di, sizeof(text2) - di, "%s = %s\n", key, value);
+        replaced = 1;
+    }
+    text2[di] = '\0';
+    if (!replaced) {
+        term_resultf("set: internal: section [vm.%s] not found in serialized config", vmname);
+        return;
+    }
+    /* Re-parse -- the parser destroys its input, so it eats a copy. */
+    {
+        unsigned c;
+        for (c = 0; c <= di && c < sizeof(text3) - 1u; c++) text3[c] = text2[c];
+        text3[(c <= di) ? c : c - 1u] = '\0';
+    }
+    pr = hype_cfg_parse(text3, &check);
+    if (pr.status != HYPE_CFG_OK) {
+        term_resultf("set: '%s = %s' does not parse (status=%d line=%u) -- nothing changed",
+                     key, value, (int)pr.status, pr.line);
+        return;
+    }
+    if (check.vm_count != g_hype_cfg.vm_count ||
+        (check.vms[idx].seen_fields & bit) == 0u) {
+        term_resultf("set: the parser did not accept '%s = %s' -- nothing changed", key, value);
+        return;
+    }
+    /* Write-at-once through the verified boot volume. NO log-sink fallback (see above). */
+    bv = fw_1_boot_volume();
+    if (bv == 0) {
+        term_resultf("set: boot volume unavailable -- refusing an edit the next boot cannot "
+                     "read; nothing changed");
+        return;
+    }
+    if (hype_fs_create(bv, "hype.cfg", &f) != 0 ||
+        hype_fs_write_at(&f, 0, text2, di) != 0) {
+        term_resultf("set: writing hype.cfg failed -- nothing changed in RAM either");
+        return;
+    }
+    /* Adopt (field-by-field copy is impossible here and whole-struct assignment emits memcpy
+     * in a freestanding build, so the shared raw copy helper does it). */
+    hype_guest_ram_copy(&g_hype_cfg, &check, sizeof(hype_cfg_t));
+    if (idx < (int)g_vm_count && g_vms[idx].lifecycle != HYPE_VM_OFF && !live) {
+        g_vms[idx].cfg_pending_bits |= bit;
+        term_resultf("%s: %s = %s written to hype.cfg -- QUEUED, applies when %s next boots",
+                     nm, key, value, nm);
+    } else {
+        term_resultf("%s: %s = %s written to hype.cfg%s", nm, key, value,
+                     live ? " -- applied" : "");
+    }
+    hype_debug_print("fw-1 SET vm%d: %s = %s (%s) [#490]\n", idx, key, value,
+                     live ? "live" : "queued");
 }
 
 /*

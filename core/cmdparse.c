@@ -30,16 +30,25 @@ static hype_cmd_verb_t verb_of(const char *tok, unsigned len) {
     if (tok_eq(tok, len, "resolution") || tok_eq(tok, len, "res")) return HYPE_CMD_RESOLUTION;
     if (tok_eq(tok, len, "config") || tok_eq(tok, len, "cfg")) return HYPE_CMD_CONFIG;
     if (tok_eq(tok, len, "host")) return HYPE_CMD_HOST; /* M9-2 (#175): host reboot|off */
+    if (tok_eq(tok, len, "set")) return HYPE_CMD_SET;   /* TERM-14 (#490) */
     return HYPE_CMD_UNKNOWN;
 }
 
-hype_cmd_t hype_cmd_parse(const char *line) {
-    hype_cmd_t c;
+void hype_cmd_parse_at(const char *line, hype_cmd_t *out) {
+    hype_cmd_t *cp = out;
+#define c (*cp)
+    char *dst[3];
+    int *has[3];
+    unsigned t;
     c.verb = HYPE_CMD_NONE;
     c.arg[0] = '\0';
+    c.arg2[0] = '\0';
+    c.arg3[0] = '\0';
     c.has_arg = 0;
+    c.has_arg2 = 0;
+    c.has_arg3 = 0;
 
-    if (!line) return c;
+    if (!line) return;
 
     unsigned i = 0;
     while (line[i] && is_ws(line[i])) i++;      /* skip leading ws */
@@ -49,18 +58,26 @@ hype_cmd_t hype_cmd_parse(const char *line) {
     unsigned vlen = i - vstart;
     c.verb = verb_of(&line[vstart], vlen);
 
-    while (line[i] && is_ws(line[i])) i++;      /* skip ws before arg */
-    unsigned astart = i;
-    while (line[i] && !is_ws(line[i])) i++;     /* arg token */
-    unsigned alen = i - astart;
-    if (alen > 0) {
-        c.has_arg = 1;
+    dst[0] = c.arg;
+    dst[1] = c.arg2;
+    dst[2] = c.arg3;
+    has[0] = &c.has_arg;
+    has[1] = &c.has_arg2;
+    has[2] = &c.has_arg3;
+    for (t = 0; t < 3u; t++) {
+        while (line[i] && is_ws(line[i])) i++;  /* skip ws before this token */
+        unsigned astart = i;
+        while (line[i] && !is_ws(line[i])) i++;
+        unsigned alen = i - astart;
+        if (alen == 0) break;
+        *has[t] = 1;
         unsigned n = (alen < HYPE_CMD_ARG_MAX - 1) ? alen : HYPE_CMD_ARG_MAX - 1;
-        for (unsigned k = 0; k < n; k++) c.arg[k] = line[astart + k];
-        c.arg[n] = '\0';
+        for (unsigned k = 0; k < n; k++) dst[t][k] = line[astart + k];
+        dst[t][n] = '\0';
     }
-    return c;
+#undef c
 }
+
 
 /*
  * #459: one table, both readers. Order matches the verb_of() chain above so a new verb is added
@@ -80,6 +97,7 @@ static const char *const g_cmd_usage[] = {
     "resolution [list|<W>x<H>]",
     "config <vm>",
     "host <reboot|off>",
+    "set <vm> <key> <value>",
 };
 
 unsigned hype_cmd_usage_count(void) {

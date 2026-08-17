@@ -75,10 +75,30 @@ int main(void) {
      * every usage entry must name a verb the parser knows, and there must be exactly one entry
      * per verb. Adding HYPE_CMD_* without a usage line now fails here.
      */
+    /* TERM-14 (#490): the three-argument form. */
+    {
+        hype_cmd_t c = P("set vm0 mem_mb 1024");
+        CHECK("set verb", c.verb == HYPE_CMD_SET);
+        CHECK("set arg1", c.has_arg && strcmp(c.arg, "vm0") == 0);
+        CHECK("set arg2", c.has_arg2 && strcmp(c.arg2, "mem_mb") == 0);
+        CHECK("set arg3", c.has_arg3 && strcmp(c.arg3, "1024") == 0);
+        c = P("set   vm0    label   webbox");
+        CHECK("set with extra ws", c.has_arg3 && strcmp(c.arg3, "webbox") == 0);
+        c = P("set vm0 mem_mb");
+        CHECK("missing value flagged", c.has_arg2 && !c.has_arg3);
+        c = P("status vm0");
+        CHECK("one-arg verbs leave arg2/3 empty", !c.has_arg2 && !c.has_arg3 &&
+              c.arg2[0] == '\0' && c.arg3[0] == '\0');
+        /* M9-2 (#175). */
+        c = P("host reboot");
+        CHECK("host verb", c.verb == HYPE_CMD_HOST && c.has_arg &&
+              strcmp(c.arg, "reboot") == 0);
+    }
+
     {
         unsigned i, n = hype_cmd_usage_count();
         CHECK("one usage entry per verb",
-              n == (unsigned)(HYPE_CMD_CONFIG - HYPE_CMD_HELP + 1));
+              n == (unsigned)(HYPE_CMD_SET - HYPE_CMD_HELP + 1));
         for (i = 0; i < n; i++) {
             hype_cmd_t c = P(hype_cmd_usage(i));
             if (c.verb == HYPE_CMD_UNKNOWN || c.verb == HYPE_CMD_NONE) {
