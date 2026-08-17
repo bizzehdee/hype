@@ -1,0 +1,24 @@
+# Does a REBOOTED guest keep its vCPUs? The 6th hardware run's operator saw
+# /proc/cpuinfo report 1 CPU after a (spontaneous) guest reboot on a VM whose
+# first boot demonstrably brought up 2.
+timeout 300000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+send echo BOOT1-NPROC-$(grep -c ^processor /proc/cpuinfo)\n
+expect BOOT1-NPROC-2
+send reboot\n
+
+# Alpine's `reboot` returns to the prompt seconds before the actual restart, so
+# gate on the SECOND kernel's own SMP bring-up line -- which is also the assertion:
+# a guest that comes back 1-vCPU prints "1 node, 1 CPU" and this times out.
+expect Brought up 1 node, 2 CPUs
+expect localhost login:
+send root\n
+expect ~#
+send echo BOOT2-NPROC-$(grep -c ^processor /proc/cpuinfo)\n
+expect BOOT2-NPROC-2
+
+pass smp-reboot-keeps-vcpus

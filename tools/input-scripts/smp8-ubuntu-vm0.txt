@@ -1,0 +1,11 @@
+# SMP-8 (#192) Ubuntu leg: 2-vCPU bring-up on an observable console, then a
+# sustained watch. Observe-only -- subiquity is interactive; the userspace
+# evidence is its UI appearing on ttyS0 (checked in the captured log).
+timeout 720000
+fail-if soft lockup
+fail-if detected stalls
+fail-if self-detected stall
+
+expect Brought up 1 node, 2 CPUs
+delay 480000
+pass smp8-ubuntu-2vcpu-sustained
