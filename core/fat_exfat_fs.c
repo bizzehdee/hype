@@ -1613,6 +1613,12 @@ static int chain_materialise(hype_exfat_wfile_t *f);
 static int resolve_tail(hype_exfat_wfile_t *f);
 static int zero_span(hype_exfat_wfile_t *f, uint64_t offset, uint64_t len);
 
+/* #510: a rollback that could not push the restored entry set back to the medium. Zero on every
+ * healthy run; nonzero says the volume may hold an entry claiming freed clusters. Mirrors
+ * hype_fat_write_rollback_failures(). */
+static unsigned long long g_exfat_rollback_failures;
+unsigned long long hype_exfat_write_rollback_failures(void) { return g_exfat_rollback_failures; }
+
 int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data,
                         unsigned int len) {
     hype_exfat_fs_t *fs = f->fs;
@@ -1706,7 +1712,32 @@ int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data
     return 0;
 
 rollback:
-    /* free everything allocated this call and restore the old shape */
+    /*
+     * #510: SHRINK THE ENTRY SET BEFORE SHRINKING THE CHAIN -- the same ordering #464 fixed in
+     * the FAT32 writer. The old order restored size/valid in MEMORY ONLY and never re-flushed
+     * the entry set, so a set_flush() that reached the medium and then failed (partial entry
+     * write, failed barrier) left the on-disk DataLength claiming clusters this rollback was
+     * about to free. fsck reads that as corruption and Linux remounts the volume read-only.
+     *
+     * So: restore the in-memory shape first, push it back to the medium, and only then free
+     * the allocation. At every intermediate point -- including across a power cut -- the
+     * on-disk entry set never describes more bytes than its chain holds. If even the
+     * restoring flush fails the medium is wedged beyond ordering fixes; counted, not hidden.
+     */
+    if (f->first_cluster != 0u && old_size == 0u && first_new == f->first_cluster) {
+        f->first_cluster = 0u;
+        f->tail_cluster = 0u;
+    } else {
+        f->tail_cluster = old_tail;
+    }
+    f->size = old_size;
+    f->valid = old_valid;
+    f->contiguous = (old_contig && first_new == 0u) ? old_contig : f->contiguous;
+    f->seek_index = 0u;
+    f->seek_cluster = f->first_cluster;
+    if (set_flush(f) != 0) {
+        g_exfat_rollback_failures++;
+    }
     if (first_new != 0u) {
         uint32_t cl = first_new;
         uint32_t guard = 0;
@@ -1725,17 +1756,6 @@ rollback:
             (void)fat_set(fs, old_tail, EOC_MARK);
         }
     }
-    if (f->first_cluster != 0u && old_size == 0u && first_new == f->first_cluster) {
-        f->first_cluster = 0u;
-        f->tail_cluster = 0u;
-    } else {
-        f->tail_cluster = old_tail;
-    }
-    f->size = old_size;
-    f->valid = old_valid;
-    f->contiguous = (old_contig && first_new == 0u) ? old_contig : f->contiguous;
-    f->seek_index = 0u;
-    f->seek_cluster = f->first_cluster;
     return -1;
 }
 

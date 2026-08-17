@@ -186,6 +186,10 @@ int hype_exfat_rename(hype_exfat_fs_t *fs, const char *from, const char *to);
  * newly allocated clusters back. Returns 0 or -1 (bounds are refused, not
  * clamped; the volume must be mounted writable).
  */
+/* #510: rollbacks that could not push the restored entry set back to the medium.
+ * Zero on every healthy run; mirrors hype_fat_write_rollback_failures(). */
+unsigned long long hype_exfat_write_rollback_failures(void);
+
 int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data,
                         unsigned int len);
 
