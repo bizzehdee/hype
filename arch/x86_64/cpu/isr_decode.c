@@ -100,7 +100,7 @@ static unsigned int isr_this_apic(void) {
 }
 
 void hype_isr_dispatch(const hype_isr_frame_t *frame) {
-    char msg[768]; /* #461/#513: core + registers + halt note + raw stack words. */
+    char msg[1280]; /* #461/#513: registers + halt note + cr2 + stack words + return-address scan. */
     hype_isr_handler_fn handler;
     unsigned int apic;
 
@@ -132,11 +132,31 @@ void hype_isr_dispatch(const hype_isr_frame_t *frame) {
         unsigned long long off = 0;
         unsigned w;
         while (msg[off] != '\0') off++;
+        /* #513: for a #PF, the faulting ADDRESS is the datum -- for a garbage %s argument, CR2
+         * IS the garbage pointer's value, and its shape (ASCII, near-NULL, guest-physical...)
+         * names where it came from. Read here, not in the pure formatter: CR2 is CPU state. */
+        if (frame->vector == 14u && off + 24u < sizeof(msg)) {
+            uint64_t cr2;
+            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            off += hype_snprintf(msg + off, sizeof(msg) - off, " cr2=0x%llx",
+                                 (unsigned long long)cr2);
+        }
         off += hype_snprintf(msg + off, sizeof(msg) - off, " | stack@0x%llx:",
                              (unsigned long long)frame->rsp);
-        for (w = 0; w < 24u && off + 18u < sizeof(msg); w++) {
+        for (w = 0; w < 16u && off + 18u < sizeof(msg); w++) {
             off += hype_snprintf(msg + off, sizeof(msg) - off, " %llx",
                                  (unsigned long long)((volatile uint64_t *)(uintptr_t)frame->rsp)[w]);
+        }
+        /* The first hardware capture truncated exactly one word short of the real caller's
+         * return address. Scan a much deeper window, but print ONLY image-text values, as
+         * +offset against the image base -- the call chain without the noise. */
+        off += hype_snprintf(msg + off, sizeof(msg) - off, " | ret:");
+        for (w = 0; w < 96u && off + 12u < sizeof(msg); w++) {
+            uint64_t v = ((volatile uint64_t *)(uintptr_t)frame->rsp)[w];
+            if (v >= 0x140000000ull && v < 0x140100000ull) {
+                off += hype_snprintf(msg + off, sizeof(msg) - off, " +%llx",
+                                     (unsigned long long)(v - 0x140000000ull));
+            }
         }
     }
     hype_fatal("%s", msg);
