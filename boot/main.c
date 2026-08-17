@@ -876,6 +876,13 @@ typedef struct hype_fw_vm {
     volatile unsigned shared_ahci_mapped;
     volatile unsigned shared_ata_mapped;
     /*
+     * #511: the virtio-blk BAR window, same publication as the ABARs above. With it BSP-local,
+     * an AP could not recognise a virtio MMIO fault; a guest whose virtio_pci_probe ran on
+     * vCPU 1 re-faulted on one access forever (35.3M of 36.3M AP exits, soft lockup on PID 1).
+     */
+    volatile uint64_t shared_vblk_bar;
+    volatile unsigned shared_vblk_mapped;
+    /*
      * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what
      * its guest is told. 1 until SMT-aware core allocation lands (#479, #190) -- and honestly
      * so, since today a granted core supplies exactly one dispatchable thread.
@@ -5535,6 +5542,7 @@ static void fw_1_timer_latency_note(unsigned vmi, unsigned vi, const hype_guest_
  * AHCI window at all, and how often, decides which of those this is. */
 static uint64_t g_ap_ahci_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
 static uint64_t g_ap_ecam_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t g_ap_vblk_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM]; /* #511 */
 /* #484: total LAPIC base-frequency ticks this AP has been advanced, and the TSC span it was
  * advanced over. The RCU stall says CPU 1 gets ~5 timer IRQs/s where its init_count implies
  * ~1600, so the question is whether the ADVANCE is short or the IRQ delivery is. These two
@@ -12121,6 +12129,28 @@ wait_for_sipi:
                     }
                 }
             }
+            if (!ap_mmio_done && vm->shared_vblk_mapped) {
+                /*
+                 * #511: the virtio-blk window, same treatment as the ABARs above. Linux probes
+                 * virtio PCI from whichever CPU init happens to be on; with this window
+                 * unrecognised here, a probe on vCPU 1 re-faulted on one BAR access forever
+                 * (soft lockup on PID 1, guest never reached userspace). The device state is
+                 * per-VM (vm->disk[0]) and this core holds the device lock for every
+                 * non-LAPIC NPF, so this is the same serialisation the BSP dispatch gets.
+                 */
+                hype_vmm_npf_t vb_npf;
+                vmm_get_last_npf(kind, ctx, &vb_npf);
+                if (vb_npf.guest_phys_addr >= vm->shared_vblk_bar &&
+                    vb_npf.guest_phys_addr < vm->shared_vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
+                    if (vmm_handle_virtio_blk_npf_map(kind, ctx, &vm->disk[0].vblk,
+                                                      &vm->disk[0].be, &g_fw_1_dma_map,
+                                                      (uint64_t)vm->shared_vblk_bar,
+                                                      insn) == 0) {
+                        ap_mmio_done = 1;
+                        g_ap_vblk_serves[vm_idx][vi]++;
+                    }
+                }
+            }
             if (!ap_mmio_done) {
                 /* #457: the flash window, shared VM state like the devices above (this AP
                  * holds the device lock here). A guest OS may call SetVariable from any CPU. */
@@ -14052,7 +14082,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         hype_debug_print(
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
                             "last=0x%llx@0x%llx timer_irqs=%llu init=%u cur=%u lvt=0x%x "
-                            "ahci=%llu ecam=%llu lt=%llu span=%llu lockwait=%llu lockmax=%llu lockmaxsec=%u | held_max=%llu held_tot=%llu house_tot=%llu house_max=%llu "
+                            "ahci=%llu ecam=%llu vblk=%llu lt=%llu span=%llu lockwait=%llu lockmax=%llu lockmaxsec=%u | held_max=%llu held_tot=%llu house_tot=%llu house_max=%llu "
                             "[#190]\n", _vmi, _av,
                             (unsigned)g_ap_vcpu_live[_vmi][_av],
                             g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
@@ -14064,6 +14094,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             (unsigned)vm->lapic[_av].lvt_timer,
                             (unsigned long long)g_ap_ahci_serves[_vmi][_av],
                             (unsigned long long)g_ap_ecam_serves[_vmi][_av],
+                            (unsigned long long)g_ap_vblk_serves[_vmi][_av],
                             (unsigned long long)g_ap_lapic_ticks[_vmi][_av],
                             (unsigned long long)g_ap_lapic_tsc_span[_vmi][_av],
                             (unsigned long long)g_ap_devlock_wait[_vmi][_av],
@@ -16422,6 +16453,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     if (bar != 0) {
                         vblk_bar = bar;
                         vblk_mapped = 1;
+                        vm->shared_vblk_bar = bar;     /* #511: visible to AP loops */
+                        vm->shared_vblk_mapped = 1u;
                         hype_debug_print("fw-1: virtio-blk BAR%u enabled at guest-physical 0x%llx -- "
                                           "routing its MMIO to the virtio-blk model now\n",
                                           (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX, (unsigned long long)bar);
