@@ -3951,9 +3951,60 @@ int hype_vmx_vcpu_handle_pci_ecam_npf_insn(hype_vcpu_ctx_t *ctx, hype_pci_t *pci
  */
 void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
                                   uint64_t ept_root) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    unsigned slot;
+    uint64_t eptp;
+    unsigned i;
+
+    /*
+     * #520: rebuild THIS vCPU, in place.
+     *
+     * This used to ignore ctx entirely and call hype_vmx_vcpu_create(), on the stale "single
+     * static ctx today" assumption from #245. Since the pools were sized per VM (#271, #412) that
+     * allocates a FRESH slot and throws the result away, so the vCPU the caller named kept
+     * whatever state it already had -- and firmware sends two SIPIs, so it burned two slots each
+     * time as well.
+     *
+     * The visible effect was every guest AP on Intel executing whatever its previous VMCS
+     * described instead of the SIPI's real-mode entry: exception exits from its first exit,
+     * OVMF's NumApsExecuting stuck at 0, and eventually a triple fault. The BSP then waited on the
+     * MP handshake forever, which is why both VMs sat at 31M I/O exits with a blank screen.
+     */
+    if (real == 0) {
+        return;
+    }
+    slot = vmx_ctx_slot(real);
+
+    if (ept_root != 0) {
+        eptp = hype_vmx_make_eptp(ept_root);
+    } else {
+        hype_ept_build_identity(g_ept_pml4, g_ept_pdpt, g_ept_pd, HYPE_EPT_MAX_GB);
+        eptp = hype_vmx_make_eptp((uint64_t)(uintptr_t)g_ept_pml4);
+    }
+
+    /* cs_base = guest_rip, rip = 0: CS.base:IP = guest_rip:0, the SIPI entry. */
+    if (hype_vmx_vmcs_build_guest(guest_rip, 0, guest_rsp, eptp, g_vmcs_pool[slot], slot) != 0) {
+        return;
+    }
+    real->vmcs_region = g_vmcs_pool[slot]; /* #483 */
+    for (i = 0; i < 16; i++) {
+        real->gprs[i] = 0;
+    }
+    hype_fpu_area_reset(&real->fpu);
+    real->launched = 0; /* a rebuilt VMCS must be VMLAUNCHed, not VMRESUMEd */
+    vmx_ctx_reset_pending(real);
+}
+
+void hype_vmx_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selector,
+                                       uint16_t ss_selector) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
-    (void)ctx; /* single static ctx today -- see #245 */
-    (void)hype_vmx_vcpu_create(guest_rip, guest_rsp, ept_root);
+    /*
+     * #520: selectors only. The SIPI path has already rebuilt this vCPU as a real-mode guest, so
+     * base/limit/access rights are correct; what was missing is the selector the AP reads back
+     * with `mov ax, cs` to derive its own data segment. See vmcs.h for the whole failure.
+     */
+    (void)vmwrite(HYPE_VMCS_GUEST_CS_SELECTOR, cs_selector);
+    (void)vmwrite(HYPE_VMCS_GUEST_SS_SELECTOR, ss_selector);
 }
 
 /* Same as the SVM accessor: the MSR index (guest RCX) at the last MSR exit. */

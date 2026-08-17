@@ -263,6 +263,22 @@ int hype_vmx_vcpu_handle_pci_ecam_npf_insn(hype_vcpu_ctx_t *ctx, hype_pci_t *pci
 void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
                                   uint64_t ept_root);
 
+/*
+ * #520: set the guest's CS and SS SELECTORS, leaving base/limit/access rights as the builder left
+ * them. The SVM twin has existed since #188; this side was a no-op, on the reasoning that the
+ * long-mode guest already carries 0x08/0x10 -- true for that guest, and wrong for the one caller
+ * that matters.
+ *
+ * A SIPI hands an AP a real-mode entry at CS.base = vector << 12 AND CS.selector = vector << 8.
+ * The selector is load-bearing: an AP's first instructions are `mov ax, cs / mov ds, ax /
+ * mov edx, [si]`, so a zero selector makes the guest compute DS.base = 0, read OVMF's DataSegment
+ * from guest-physical 0x68 instead of 0x9f068, and then #GP forever on `mov ss, edx` with a null
+ * selector. On Intel that killed every guest AP at its first instruction, which stalled the BSP in
+ * OVMF's MP handshake and left the VM with no output at all.
+ */
+void hype_vmx_vcpu_set_cs_ss_selectors(hype_vcpu_ctx_t *ctx, uint16_t cs_selector,
+                                       uint16_t ss_selector);
+
 uint32_t hype_vmx_vcpu_get_msr_index(hype_vcpu_ctx_t *ctx);
 
 /*

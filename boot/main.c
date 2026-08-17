@@ -4766,11 +4766,16 @@ static void vmm_set_idt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t bas
 static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t cs,
                                     uint16_t ss) {
     if (kind == HYPE_VMM_KIND_VMX) {
-        /* No-op: the VMX long-mode guest is already built with CS=0x08 / SS=0x10
-         * (build_guest_common), matching g_int_gdt's own descriptor layout. */
-        (void)ctx;
-        (void)cs;
-        (void)ss;
+        /*
+         * #520: this used to return without doing anything, reasoning that the VMX long-mode
+         * guest is already built with CS=0x08 / SS=0x10 by build_guest_common. That is true of
+         * the long-mode guest and false of the caller that matters: the SIPI path uses this to
+         * give a REAL-MODE AP its CS.selector = vector << 8, without which the AP computes
+         * DS.base = 0 and #GPs on its first instructions -- forever. Every guest AP on Intel died
+         * that way. The long-mode call sites pass exactly the 0x08/0x10 already in the VMCS, so
+         * writing them is a no-op in the case the old comment was actually about.
+         */
+        hype_vmx_vcpu_set_cs_ss_selectors(ctx, cs, ss);
         return;
     }
     hype_svm_vcpu_set_cs_ss_selectors(ctx, cs, ss);
