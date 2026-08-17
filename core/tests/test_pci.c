@@ -625,7 +625,43 @@ static void test_cf8_config_access_to_absent_device_reads_all_ones(void) {
     CHECK_HEX("absent device via cf8/cfc reads all-1s", 0xFFFFFFFFu, value);
 }
 
+/*
+ * #518: CONFIG_ADDRESS is byte-addressable across 0xCF8-0xCFB. Linux's pci_check_type1() writes a
+ * single byte to 0xCFB, which hype used to leave to the absorb-unknown-port path.
+ */
+static void test_cf8_byte_addressable(void) {
+    hype_pci_t pci;
+
+    hype_pci_reset(&pci);
+    hype_pci_cf8_write(&pci, 0x11223344u);
+
+    /* Each byte reads back on its own, in its own low bits. */
+    CHECK_HEX("cf8 byte 0", 0x44u, hype_pci_cf8_read_bytes(&pci, 0u, 1u));
+    CHECK_HEX("cf8 byte 3", 0x11u, hype_pci_cf8_read_bytes(&pci, 3u, 1u));
+    CHECK_HEX("cf8 word at 2", 0x1122u, hype_pci_cf8_read_bytes(&pci, 2u, 2u));
+    CHECK_HEX("cf8 whole dword", 0x11223344u, hype_pci_cf8_read_bytes(&pci, 0u, 4u));
+
+    /* A partial write leaves the bytes it does not cover alone -- the whole point of addressing
+     * the register a byte at a time. */
+    hype_pci_cf8_write_bytes(&pci, 3u, 1u, 0x01u);
+    CHECK_HEX("byte write spliced in", 0x01223344u, hype_pci_cf8_read(&pci));
+    hype_pci_cf8_write_bytes(&pci, 0u, 2u, 0xBEEFu);
+    CHECK_HEX("word write spliced in", 0x0122BEEFu, hype_pci_cf8_read(&pci));
+
+    /* An access that would run past the register is clamped to it, not wrapped. */
+    hype_pci_cf8_write_bytes(&pci, 3u, 4u, 0xFFFFFFFFu);
+    CHECK_HEX("oversized access stays inside the register", 0xFF22BEEFu, hype_pci_cf8_read(&pci));
+
+    /* Out of range is inert rather than corrupting. */
+    hype_pci_cf8_write_bytes(&pci, 4u, 1u, 0x55u);
+    CHECK_HEX("offset past the register is ignored", 0xFF22BEEFu, hype_pci_cf8_read(&pci));
+    CHECK_HEX("read past the register is zero", 0u, hype_pci_cf8_read_bytes(&pci, 4u, 1u));
+    CHECK_HEX("null is safe", 0u, hype_pci_cf8_read_bytes(0, 0u, 4u));
+    hype_pci_cf8_write_bytes(0, 0u, 4u, 0x1234u); /* must not fault */
+}
+
 int main(void) {
+    test_cf8_byte_addressable(); /* #518 */
     test_decode_ecam_offset();
     test_absent_device_reads_all_ones();
     test_non_bus_zero_or_non_function_zero_reads_absent();

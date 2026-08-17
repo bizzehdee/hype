@@ -7,6 +7,7 @@
 #include "../../../core/fatal.h"
 
 #include "../../../devices/pvclock.h"
+#include "../../../devices/acpi.h" /* #518: HYPE_ACPI_RESET_PORT owns 0xCF9 */
 
 /* Defined below (exempt real-hardware helper); forward-declared because the
  * #436 CALTRACE sites in the IOIO handler run earlier in the file. */
@@ -986,13 +987,22 @@ int hype_svm_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
 
     hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
 
-    if (io.port == HYPE_PCI_CF8_PORT) {
+    /*
+     * #518: CONFIG_ADDRESS spans 0xCF8-0xCFB, and its upper bytes are addressed individually --
+     * Linux's pci_check_type1() writes a byte to 0xCFB. 0xCF9 is excluded: within this span it is
+     * the chipset reset register (#94), which its own handler owns, exactly as on real hardware.
+     */
+    if (io.port >= HYPE_PCI_CF8_PORT && io.port <= HYPE_PCI_CF8_PORT + 3u &&
+        io.port != HYPE_ACPI_RESET_PORT) {
+        unsigned int byte_offset = (unsigned int)(io.port - HYPE_PCI_CF8_PORT);
         if (io.is_in) {
-            uint32_t value = hype_pci_cf8_read(pci);
+            uint32_t value = hype_pci_cf8_read_bytes(pci, byte_offset, io.size_bytes);
             real->vmcb->save.rax =
                 hype_mmio_merge_read_value(real->vmcb->save.rax, value, io.size_bytes, io.size_bytes == 4);
         } else {
-            hype_pci_cf8_write(pci, hype_mmio_extract_write_value(real->vmcb->save.rax, io.size_bytes));
+            hype_pci_cf8_write_bytes(pci, byte_offset, io.size_bytes,
+                                     hype_mmio_extract_write_value(real->vmcb->save.rax,
+                                                                   io.size_bytes));
         }
     } else if (io.port >= HYPE_PCI_CFC_PORT && io.port <= HYPE_PCI_CFC_PORT + 3) {
         unsigned int byte_offset = io.port - HYPE_PCI_CFC_PORT;

@@ -340,6 +340,23 @@ void hype_pci_cf8_write(hype_pci_t *pci, uint32_t value);
 uint32_t hype_pci_cf8_read(const hype_pci_t *pci);
 
 /*
+ * #518: CONFIG_ADDRESS is a 32-bit register occupying 0xCF8-0xCFB, and software does reach its
+ * upper bytes individually -- Linux's pci_check_type1() writes a byte to 0xCFB before testing the
+ * register. Decoding only the dword at 0xCF8 left those accesses to the absorb-unknown-port path,
+ * where a read returns all-ones and a write is dropped.
+ *
+ * These splice a byte/word/dword access at `byte_offset` (0..3) into the stored register, so a
+ * partial write leaves the other bytes intact and a partial read returns just its own.
+ *
+ * NOT for 0xCF9: within this register's span that address is the chipset reset register (#94), and
+ * the caller must route it there instead. Real chipsets make the same choice.
+ */
+uint32_t hype_pci_cf8_read_bytes(const hype_pci_t *pci, unsigned int byte_offset,
+                                 unsigned int size);
+void hype_pci_cf8_write_bytes(hype_pci_t *pci, unsigned int byte_offset, unsigned int size,
+                              uint32_t value);
+
+/*
  * Decodes a raw 0xCF8 address value into bus/device/function/register
  * -- pure bit extraction, no CPU/guest-memory access of its own, same
  * shape as hype_pci_decode_ecam_offset().

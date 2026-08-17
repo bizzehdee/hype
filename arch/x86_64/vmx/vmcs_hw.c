@@ -43,6 +43,7 @@
  */
 #include "../svm/vmcb.h"
 #include "ept.h"
+#include "../../../devices/acpi.h" /* #518: HYPE_ACPI_RESET_PORT owns 0xCF9 */
 
 #define HYPE_VMX_MMIO_MAX_INSTR_BYTES 15u
 
@@ -3704,13 +3705,18 @@ int hype_vmx_vcpu_handle_pci_cf8_ioio(hype_vcpu_ctx_t *ctx, hype_pci_t *pci) {
     hype_vmm_ioio_t io;
 
     vmx_decode_ioio(&io);
-    if (io.port == HYPE_PCI_CF8_PORT) {
+    /* #518: the whole 0xCF8-0xCFB register, byte-addressable, minus 0xCF9 which belongs to the
+     * chipset reset register (#94). Mirrors the SVM path. */
+    if (io.port >= HYPE_PCI_CF8_PORT && io.port <= HYPE_PCI_CF8_PORT + 3u &&
+        io.port != HYPE_ACPI_RESET_PORT) {
+        unsigned int addr_byte = (unsigned int)(io.port - HYPE_PCI_CF8_PORT);
         if (io.is_in) {
-            uint32_t value = hype_pci_cf8_read(pci);
+            uint32_t value = hype_pci_cf8_read_bytes(pci, addr_byte, io.size_bytes);
             real->gprs[0] =
                 hype_mmio_merge_read_value(real->gprs[0], value, io.size_bytes, io.size_bytes == 4);
         } else {
-            hype_pci_cf8_write(pci, hype_mmio_extract_write_value(real->gprs[0], io.size_bytes));
+            hype_pci_cf8_write_bytes(pci, addr_byte, io.size_bytes,
+                                     hype_mmio_extract_write_value(real->gprs[0], io.size_bytes));
         }
     } else if (io.port >= HYPE_PCI_CFC_PORT && io.port <= HYPE_PCI_CFC_PORT + 3) {
         unsigned int byte_offset = io.port - HYPE_PCI_CFC_PORT;

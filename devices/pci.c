@@ -418,6 +418,42 @@ uint32_t hype_pci_cf8_read(const hype_pci_t *pci) {
     return pci->cf8_selected;
 }
 
+/* #518: the byte span an access of `size` at `byte_offset` covers, clamped to the register. */
+static uint32_t cf8_byte_mask(unsigned int byte_offset, unsigned int size) {
+    unsigned int bits;
+    if (byte_offset > 3u) {
+        return 0u;
+    }
+    if (size == 0u || size > 4u) {
+        size = 4u;
+    }
+    if (byte_offset + size > 4u) {
+        size = 4u - byte_offset;
+    }
+    bits = size * 8u;
+    return (bits >= 32u) ? 0xFFFFFFFFu : (((1u << bits) - 1u) << (byte_offset * 8u));
+}
+
+uint32_t hype_pci_cf8_read_bytes(const hype_pci_t *pci, unsigned int byte_offset,
+                                 unsigned int size) {
+    uint32_t mask = cf8_byte_mask(byte_offset, size);
+    if (pci == 0 || mask == 0u) {
+        return 0u;
+    }
+    return (pci->cf8_selected & mask) >> (byte_offset * 8u);
+}
+
+void hype_pci_cf8_write_bytes(hype_pci_t *pci, unsigned int byte_offset, unsigned int size,
+                              uint32_t value) {
+    uint32_t mask = cf8_byte_mask(byte_offset, size);
+    if (pci == 0 || mask == 0u) {
+        return;
+    }
+    /* Read-modify-write: the bytes this access does not cover keep whatever the guest put there,
+     * which is the whole point of addressing the register a byte at a time. */
+    pci->cf8_selected = (pci->cf8_selected & ~mask) | ((value << (byte_offset * 8u)) & mask);
+}
+
 void hype_pci_decode_cf8_address(uint32_t cf8_value, hype_pci_ecam_addr_t *out) {
     out->bus = (unsigned int)((cf8_value >> HYPE_PCI_CF8_BUS_SHIFT) & HYPE_PCI_ECAM_BUS_MASK);
     out->device = (unsigned int)((cf8_value >> HYPE_PCI_CF8_DEVICE_SHIFT) & HYPE_PCI_ECAM_DEVICE_MASK);
