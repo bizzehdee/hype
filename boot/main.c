@@ -12397,6 +12397,53 @@ wait_for_sipi:
         }
         if (vmm_reason_is_cpuid(kind, info.reason)) {
             vmm_handle_cpuid(kind, ctx);
+        } else if (vmm_reason_is_cr_access(kind, info.reason)) {
+            /*
+             * #520: VMX-only, and BSP-only until now. The host owns CR4.VMXE and CR0.NE, so a
+             * guest write to either traps here; on SVM the exit does not arise at all, which is
+             * why the AP loop never needed it on AMD.
+             *
+             * Measured: with the SIPI entry finally correct, an Intel AP got through OVMF's
+             * trampoline and into DXE, and then took 46,685,257 unhandled CR-access exits at one
+             * RIP -- the instruction re-executing forever because nothing advanced past it. An
+             * unmodelled access is reported rather than resumed blind, exactly as the BSP does.
+             */
+            if (vmm_handle_cr_access(kind, ctx) == 0) {
+                if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
+                    hype_debug_print("fw-1 vm%u vCPU %u: unmodelled CR-access exit (qual=0x%llx "
+                                     "rip=0x%llx) -- not resuming blind [#520]\n", vm_idx, vi,
+                                     (unsigned long long)info.qualification,
+                                     (unsigned long long)info.guest_rip);
+                }
+                g_ap_vcpu_unhandled[vm_idx][vi]++;
+            }
+        } else if (vmm_reason_is_xsetbv(kind, info.reason)) {
+            /*
+             * #520: the AP loop was missing this too. Linux executes XSETBV on EVERY CPU as it
+             * enables XSAVE state, so an AP reaching that point would re-execute it forever --
+             * the same shape as the CR-access exit above, waiting for a guest that gets far
+             * enough to run it.
+             */
+            if (!vmm_handle_xsetbv(kind, ctx)) {
+                if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
+                    hype_debug_print("fw-1 vm%u vCPU %u: unmodelled XSETBV form at rip=0x%llx -- "
+                                     "not resuming blind [#520]\n", vm_idx, vi,
+                                     (unsigned long long)info.guest_rip);
+                }
+                g_ap_vcpu_unhandled[vm_idx][vi]++;
+            }
+        } else if (vmm_reason_is_hypercall(kind, info.reason)) {
+            /* A guest may make a hypercall from any CPU; the BSP has answered them since #91. */
+            if (vmm_handle_hypercall(kind, ctx) != 0) {
+                g_ap_vcpu_unhandled[vm_idx][vi]++;
+            }
+        } else if (vmm_reason_is_pause(kind, info.reason)) {
+            /* The pause filter this loop arms above trips here. Nothing to do but resume: the
+             * tick advance at the top of the loop has already staged anything due. */
+        } else if (vmm_reason_is_svm_insn(kind, info.reason)) {
+            /* #317: answer VMRUN/VMLOAD/STGI/... with #UD, the same answer the BSP gives -- a
+             * machine whose CPUID clears the SVM bit must not execute them anywhere. */
+            vmm_reinject_exception(kind, ctx, 6u, 0, 0u);
         } else if (kind == HYPE_VMM_KIND_SVM && info.reason == HYPE_SVM_EXITCODE_RDTSC) {
             /*
              * #438, on the AP too. The BSP loop has retired intercepted RDTSC with hype's
