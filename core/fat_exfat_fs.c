@@ -1619,6 +1619,22 @@ static int zero_span(hype_exfat_wfile_t *f, uint64_t offset, uint64_t len);
 static unsigned long long g_exfat_rollback_failures;
 unsigned long long hype_exfat_write_rollback_failures(void) { return g_exfat_rollback_failures; }
 
+/*
+ * #517: what does the entry set ON THE MEDIUM claim right now? The rollback has to decide whether
+ * cutting the chain is safe, and that turns on what was actually published, not on what a failed
+ * flush intended. Reads DataLength straight back out of the Stream Extension entry.
+ *
+ * A read that fails answers "no": unable to confirm is not the same as confirmed, and the safe
+ * direction under doubt is to leave the clusters alone.
+ */
+static int entry_set_claims_at_most(hype_exfat_wfile_t *f, uint64_t bytes) {
+    uint8_t ent[ENTSZ];
+    if (entry_read(f->fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, ent) != 0) {
+        return 0;
+    }
+    return (hype_rd64(ent + 24) <= bytes) ? 1 : 0;
+}
+
 int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data,
                         unsigned int len) {
     hype_exfat_fs_t *fs = f->fs;
@@ -1737,6 +1753,20 @@ rollback:
     f->seek_cluster = f->first_cluster;
     if (set_flush(f) != 0) {
         g_exfat_rollback_failures++;
+    }
+    /*
+     * #517: cut the chain only once the MEDIUM shows an entry set within the old size -- read back,
+     * not inferred from what set_flush() returned. #510 fixed the order but still freed the
+     * clusters whether or not the restore had landed, so a failed entry-set write left DataLength
+     * claiming clusters the next lines released: the same unmountable shape #464 produced on FAT32.
+     *
+     * If it cannot be confirmed, leave the clusters linked. A chain longer than its entry set is
+     * leaked space a repair tool reclaims and a file that reads short; the reverse is a volume the
+     * host refuses. Given the choice, leak.
+     */
+    if (!entry_set_claims_at_most(f, old_size)) {
+        g_exfat_rollback_failures++;
+        return -1;
     }
     if (first_new != 0u) {
         uint32_t cl = first_new;

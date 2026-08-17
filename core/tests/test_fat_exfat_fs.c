@@ -62,6 +62,13 @@ static uint64_t g_fail_read_lba = (uint64_t)-1;
 static uint64_t g_fail_write_lba = (uint64_t)-1;
 static long g_read_countdown = -1;
 static long g_write_countdown = -1;
+/* #517: fail writes to the DIRECTORY sector after the first N of them, and keep failing. That is
+ * the window this bug lives in: set_flush() writes the Stream Extension entry (publishing the new
+ * DataLength) before the File entry, so a failure between the two leaves the larger size on the
+ * medium and sends the writer into its rollback. */
+static long g_dir_writes_allowed = -1;
+static uint64_t g_dir_write_lba;
+static long g_dir_writes_seen;
 
 static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
@@ -76,6 +83,10 @@ static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     if (lba + count > VOL_SECTORS) return -1;
     if (lba == g_fail_write_lba) return -1;
     if (g_write_countdown >= 0 && g_write_countdown-- == 0) return -1;
+    if (g_dir_writes_allowed >= 0 && lba == g_dir_write_lba) {
+        if (g_dir_writes_seen >= g_dir_writes_allowed) return -1;
+        g_dir_writes_seen++;
+    }
     memcpy(g_vol + lba * SECSZ, src, (size_t)count * SECSZ);
     return 0;
 }
@@ -1971,7 +1982,69 @@ static void test_383_rollback_and_faults(void) {
     }
 }
 
+/*
+ * #517: the exFAT half of #464's rule. set_flush() publishes the Stream Extension entry (carrying
+ * DataLength) BEFORE the File entry, so a failure between the two leaves the larger size on the
+ * medium and sends the writer into its rollback. #510 fixed the rollback's ORDER but freed the
+ * clusters whether or not the restoring flush had landed -- leaving an entry set claiming clusters
+ * that had just been released, which is the unmountable shape this whole family is about.
+ *
+ * Fails on the pre-#517 code and passes here.
+ */
+static void test_rollback_never_frees_under_a_published_larger_size(void) {
+    hype_exfat_wfile_t f;
+    static uint8_t data[2000];
+    uint64_t claimed;
+    uint32_t cl, walked = 0;
+    unsigned int i;
+
+    build_vol();
+    CHECK_HEX("517 mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("517 create", 0, hype_exfat_create(&g_fs, "GROW517.BIN", &f));
+    for (i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 5u + 1u);
+    CHECK_HEX("517 seed", 0, hype_exfat_write_at(&f, 0, data, 600u));
+
+    /*
+     * Allow exactly one directory write from here -- the Stream Extension entry that publishes the
+     * new DataLength -- and fail every one after it, including the rollback's restore.
+     */
+    g_dir_write_lba = clba(g_root);
+    g_dir_writes_seen = 0;
+    g_dir_writes_allowed = 1;
+    CHECK("517 growth reports failure", hype_exfat_write_at(&f, 0, data, sizeof data) != 0);
+    g_dir_writes_allowed = -1;
+
+    /* Read the invariant off the volume image: what the entry set claims vs what the chain holds. */
+    /* Find the file's Stream Extension entry rather than assuming its index: the root already
+     * carries the label, bitmap and up-case entries before it. */
+    claimed = 0;
+    cl = 0;
+    {
+        const uint8_t *root = cluster(g_root);
+        unsigned int e;
+        for (e = 0; e < SECSZ / 32u; e++) {
+            if (root[e * 32u] == HYPE_EXFAT_ENT_STREAM) {
+                claimed = get64(root + e * 32u + 24);
+                cl = get32(root + e * 32u + 20);
+                break;
+            }
+        }
+    }
+    CHECK("517 found the stream extension entry", cl != 0u);
+    while (cl >= 2u && cl < 0xFFFFFFF7u && walked < 64u) {
+        uint32_t next;
+        walked++;
+        next = get32(g_vol + g_fs.fat_lba * SECSZ + cl * 4u) & 0xFFFFFFFFu;
+        if (next >= 0xFFFFFFF7u || next < 2u) break;
+        cl = next;
+    }
+    CHECK("517 chain terminates", walked < 64u);
+    CHECK_HEX("517 entry set never claims more than the chain holds", 1u,
+              (unsigned)(claimed <= (uint64_t)walked * SECSZ));
+}
+
 int main(void) {
+    test_rollback_never_frees_under_a_published_larger_size(); /* #517 */
     test_fs_ops_exfat();
     test_383_vdl();
     test_383_rollback_and_faults();
