@@ -20080,6 +20080,8 @@ static int fw_1_vars_region(const hype_fw_vm_t *vm, uint64_t *out_offset, uint64
     return 0;
 }
 
+static int fw_1_vm_name_plausible(const char *name); /* #513: defined with fw_1_vars_service */
+
 static void fw_1_save_vars(hype_fw_vm_t *vm) {
     uint64_t offset, len;
     char path[48];
@@ -20088,7 +20090,7 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
     int rc;
 
     if (!usb_log_this_core_owns_usb() || !g_hype_log_ready || vm->combined_host_phys == 0 ||
-        fw_1_vars_region(vm, &offset, &len) != 0) {
+        fw_1_vars_region(vm, &offset, &len) != 0 || !fw_1_vm_name_plausible(vm->name)) {
         return;
     }
     hype_snprintf(path, sizeof(path), "vars-%s.bin", vm->name);
@@ -20129,7 +20131,8 @@ static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
     hype_fs_file_t f;
 
     if (!usb_log_this_core_owns_usb() || !g_hype_log_ready || vm->combined_host_phys == 0 ||
-        fw_1_vars_region(vm, &offset, &len) != 0 || len > sizeof(g_vars_load_buf)) {
+        fw_1_vars_region(vm, &offset, &len) != 0 || len > sizeof(g_vars_load_buf) ||
+        !fw_1_vm_name_plausible(vm->name)) {
         return;
     }
     hype_snprintf(path, sizeof(path), "vars-%s.bin", vm->name);
@@ -20154,18 +20157,60 @@ static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
  * The seq/done_seq pair is published in that order (work, then done_seq) so a waiter that sees
  * its own sequence completed is guaranteed the file I/O behind it has already happened.
  */
+/*
+ * #513: is this vm->name pointer one hype could legitimately have assigned? Every assignment is
+ * either a string literal (inside the image) or g_hype_cfg.vms[i].name (inside the cfg struct).
+ * The real-hardware panic was a #PF formatting a vm->name that memory corruption had replaced
+ * with {0x870f06fa,0x2c8}; refusing to dereference an impossible pointer keeps the machine
+ * alive so the #513 watchdog can report the corruption instead of dying inside it.
+ */
+static int fw_1_vm_name_plausible(const char *name) {
+    uintptr_t p = (uintptr_t)name;
+    uintptr_t cfg0 = (uintptr_t)&g_hype_cfg;
+    if (name == 0) {
+        return 1; /* the formatter's own (null) fallback handles this safely */
+    }
+    if (p >= 0x140000000ull && p < 0x140100000ull) {
+        return 1; /* string literal in the image */
+    }
+    return p >= cfg0 && p < cfg0 + sizeof(g_hype_cfg);
+}
+
 static void fw_1_vars_service(void) {
     unsigned int i;
 
     if (!usb_log_this_core_owns_usb()) {
         return;
     }
-    for (i = 0; i < HYPE_FW_MAX_VMS; i++) {
+    /*
+     * #513 THE BUG: g_vm_count, never HYPE_FW_MAX_VMS. #394 made g_vms a pool block sized for
+     * g_vm_count elements; this loop kept the old static-array bound and walked SIX phantom
+     * elements of whatever the UEFI pool placed after the block -- treating pool bytes as
+     * vars_req (any nonzero garbage dispatched a LOAD for a phantom VM) and WRITING vars_req/
+     * vars_req_done_seq back into them. On the AMD laptop the phantom's garbage passed every
+     * guard and its 'name' was an unmapped pointer: the deterministic 26.4 s #PF in the
+     * "vars-%s.bin" snprintf, five hardware runs in a row. The write-back trashed the adjacent
+     * aux-pool allocations -- g_vm_ready among them, which is precisely the operator-visible
+     * "no-vcpu" dashboard state. In QEMU the same walk happened but the pool garbage there had
+     * combined_host_phys == 0 (or a mapped name), so the guards ate it silently -- which is why
+     * five QEMU repro attempts stayed green while every hardware run panicked.
+     */
+    for (i = 0; i < g_vm_count && i < HYPE_FW_MAX_VMS; i++) {
         hype_fw_vm_t *vm = &g_vms[i];
         uint32_t kind = vm->vars_req;
         uint32_t seq;
 
         if (kind == HYPE_FW_VARS_REQ_NONE) {
+            continue;
+        }
+        if (!fw_1_vm_name_plausible(vm->name)) {
+            /* #513: corrupted identity -- report (pointer VALUE only, never dereferenced) and
+             * drop the request rather than #PF inside the path snprintf. */
+            hype_debug_print("fw-1 VARS: vm%u name pointer 0x%llx is CORRUPT -- dropping "
+                             "vars request kind=%u [#513]\n", i,
+                             (unsigned long long)(uintptr_t)vm->name, (unsigned)kind);
+            vm->vars_req = HYPE_FW_VARS_REQ_NONE;
+            vm->vars_req_done_seq = vm->vars_req_seq;
             continue;
         }
         seq = vm->vars_req_seq;
@@ -24441,6 +24486,65 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             }
                         }
                         kbd_prev_entries = e;
+                    }
+                }
+            }
+            /*
+             * #513: corruption watchdog. Real-hardware runs deterministically #PF at 26.4 s in
+             * fw_1_load_saved_vars' "vars-%s.bin" snprintf because vm->name -- a pointer into the
+             * IMAGE (a literal) or cfg storage -- has been overwritten with {0x870f06fa, 0x2c8},
+             * and the dashboard's "no-vcpu" state says g_vm_ready got hit too. Snapshot the
+             * vulnerable fields once armed, compare every pass of this loop, and report the FIRST
+             * divergence with values and wall time: that turns "something sprayed the aux pool"
+             * into a bounded window plus a byte pattern that names the writer.
+             */
+            {
+                static const char *snap_name[HYPE_FW_MAX_VMS];
+                static const char *snap_label[HYPE_FW_MAX_VMS];
+                static unsigned snap_vcpus[HYPE_FW_MAX_VMS];
+                static uint8_t snap_ready[HYPE_FW_MAX_VMS];
+                static uint8_t snap_armed[HYPE_FW_MAX_VMS];
+                static uint8_t snap_hit[HYPE_FW_MAX_VMS];
+                static uint64_t snap_t0;
+                unsigned wi;
+                if (snap_t0 == 0u) {
+                    snap_t0 = hype_rdtsc();
+                }
+                for (wi = 0; wi < g_vm_count && wi < HYPE_FW_MAX_VMS; wi++) {
+                    hype_fw_vm_t *wv = &g_vms[wi];
+                    if (!snap_armed[wi]) {
+                        if (wv->name != 0 && wv->vcpu_count != 0u) {
+                            snap_name[wi] = wv->name;
+                            snap_label[wi] = wv->label;
+                            snap_vcpus[wi] = wv->vcpu_count;
+                            snap_ready[wi] = g_vm_ready ? g_vm_ready[wi] : 0u;
+                            snap_armed[wi] = 1;
+                        }
+                        continue;
+                    }
+                    if (snap_hit[wi]) {
+                        continue;
+                    }
+                    /* Readiness legitimately publishes 0->1 exactly once; fold it in. */
+                    if (g_vm_ready != 0 && g_vm_ready[wi] == 1u && snap_ready[wi] == 0u) {
+                        snap_ready[wi] = 1u;
+                    }
+                    if (wv->name != snap_name[wi] || wv->label != snap_label[wi] ||
+                        wv->vcpu_count != snap_vcpus[wi] ||
+                        (g_vm_ready != 0 && g_vm_ready[wi] != snap_ready[wi])) {
+                        uint64_t hzw = g_vms[0].host_tsc_hz;
+                        snap_hit[wi] = 1;
+                        hype_debug_print(
+                            "fw-1 CORRUPT vm%u at watch+%llums: name %llx->%llx label %llx->%llx "
+                            "vcpus %u->%u ready %u->%u [#513]\n", wi,
+                            hzw ? (hype_rdtsc() - snap_t0) * 1000ull / hzw : 0ull,
+                            (unsigned long long)(uintptr_t)snap_name[wi],
+                            (unsigned long long)(uintptr_t)wv->name,
+                            (unsigned long long)(uintptr_t)snap_label[wi],
+                            (unsigned long long)(uintptr_t)wv->label,
+                            snap_vcpus[wi], wv->vcpu_count, (unsigned)snap_ready[wi],
+                            (unsigned)(g_vm_ready ? g_vm_ready[wi] : 0u));
+                        usb_log_flush();
                     }
                 }
             }
