@@ -12243,6 +12243,16 @@ wait_for_sipi:
                 /* handled */
             } else if (vmm_handle_uart_ioio(kind, ctx, &vm->uart2, HYPE_SERIAL_COM2) == 0) {
                 /* handled */
+            /*
+             * #514: legacy PCI config cycles (0xCF8/0xCFC), the port twin of the ECAM window
+             * the NPF chain has served since #482. Ubuntu does its BASE config accesses via
+             * type 1 from whichever CPU udev runs on; absorbing them on an AP returned
+             * all-ones reads and dropped the AHCI MSI-enable write, so the CD's IDENTIFY
+             * PACKET completion had no armed path to the guest and sr0 never attached.
+             * hype_pci_t is per-VM and this core holds the device lock for every IOIO exit.
+             */
+            } else if (vmm_handle_pci_cf8_ioio(kind, ctx, &vm->pci) == 0) {
+                /* handled */
             } else if (vmm_handle_ioio(kind, ctx, &vm->pic, &vm->pit) == 0) {
                 /* handled */
             /*
