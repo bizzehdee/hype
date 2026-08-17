@@ -1937,6 +1937,9 @@ static void fw_1_host_action_poll(void) {
  * forward-declared here so term_run_cmdline's switch can call it. Appends its result with
  * term_resultf(), matching every other verb's own convention. */
 static void term_resolution_cmd(hype_cmd_t *c);
+/* #447: hype's own boot volume, mounted for writing post-EBS -- defined with the other
+ * device-scan plumbing, forward-declared for the config write-back sites above it. */
+static hype_fs_t *fw_1_boot_volume(void);
 
 /* TERM-6 (#444): same reason/placement as term_resolution_cmd above -- needs g_hype_cfg. `idx` is
  * the VM index term_run_cmdline already resolved from the command's arg. */
@@ -18951,6 +18954,22 @@ static int load_iso_head(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable, 
 /* g_hype_cfg is declared up with the media-device plumbing (#285): parsed config;
  * vm_count 0 => none/fallback. */
 static char g_hype_cfg_text[16384];           /* scratch; parser mutates in place */
+/* #447: fingerprint of the RAW \hype.cfg bytes, taken before the in-place parse destroys them.
+ * The boot-volume locator uses it to prove a candidate volume is THE volume hype booted from --
+ * writing a fresh hype.cfg to the wrong FAT volume would be worse than not saving at all. */
+static uint64_t g_hype_cfg_raw_sum;
+static uint64_t g_hype_cfg_raw_len;
+
+static uint64_t fw_1_fnv1a(const void *data, uint64_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 0xcbf29ce484222325ull;
+    uint64_t i;
+    for (i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
 
 /*
  * INPUT-8 (#281): load this VM's expect script from the ESP.
@@ -19382,6 +19401,9 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         return;
     }
     g_hype_cfg_text[sz] = '\0';
+    /* #447: fingerprint BEFORE the parse -- it tokenizes this buffer destructively. */
+    g_hype_cfg_raw_len = sz;
+    g_hype_cfg_raw_sum = fw_1_fnv1a(g_hype_cfg_text, sz);
 
     res = hype_cfg_parse(g_hype_cfg_text, &g_hype_cfg);
     if (res.status != HYPE_CFG_OK) {
@@ -20046,16 +20068,26 @@ static void term_resolution_cmd(hype_cmd_t *c) {
 
             {
                 int saved = 0;
-                if (g_hype_log_ready) {
-                    static char cfgtext[8192];
-                    hype_cfg_serialize_result_t sr =
-                        hype_cfg_serialize(&g_hype_cfg, cfgtext, sizeof(cfgtext));
-                    hype_fs_file_t f;
-                    if (!sr.refused_overflow && !sr.truncated &&
-                        hype_fs_create(&g_hype_log.fs, "hype.cfg", &f) == 0 &&
-                        hype_fs_write_at(&f, 0, cfgtext, sr.len) == 0) {
-                        saved = 1;
-                    }
+                static char cfgtext[8192];
+                hype_cfg_serialize_result_t sr =
+                    hype_cfg_serialize(&g_hype_cfg, cfgtext, sizeof(cfgtext));
+                hype_fs_file_t f;
+                /*
+                 * #447: prefer hype's OWN verified boot volume -- the file the next boot's
+                 * loader actually reads -- over the log sink's volume, which is wherever the
+                 * USB debug stick happens to be and only coincides with the boot ESP on the
+                 * USB-boot deployment. The log-sink fallback stays for exactly that
+                 * deployment when the locator cannot verify (e.g. booted on defaults, so
+                 * there is no \hype.cfg fingerprint to match).
+                 */
+                hype_fs_t *bv = (!sr.refused_overflow && !sr.truncated) ? fw_1_boot_volume() : 0;
+                if (bv != 0 && hype_fs_create(bv, "hype.cfg", &f) == 0 &&
+                    hype_fs_write_at(&f, 0, cfgtext, sr.len) == 0) {
+                    saved = 1;
+                } else if (g_hype_log_ready && !sr.refused_overflow && !sr.truncated &&
+                           hype_fs_create(&g_hype_log.fs, "hype.cfg", &f) == 0 &&
+                           hype_fs_write_at(&f, 0, cfgtext, sr.len) == 0) {
+                    saved = 1;
                 }
                 term_resultf("resolution %ux%u%s -- takes effect on the next boot", w, hgt,
                              saved ? " saved" : " NOT saved (no writable volume mounted)");
@@ -20512,6 +20544,123 @@ static void split_log_setup(void) {
     hype_debug_print("usb-log: split diagnostics -- hype's own output to \\HYPE.LOG, each "
                      "guest's serial to its own file; the combined stream lives on the serial port and is "
                      "recoverable from the [offset] prefixes [#338]\n");
+}
+
+/*
+ * #447: find and mount hype's OWN boot volume for writing, post-ExitBootServices, on any backend.
+ *
+ * The pre-EBS loader reads \hype.cfg through UEFI's Simple File System, which dies at EBS. The
+ * only post-EBS self-write path was usb_log_setup() below -- wired to one USB device. This is
+ * the same partition-base scan (superfloppy, MBR entries, GPT 1/2) generalised over EVERY
+ * registered host device, with one hard extra requirement: the mounted volume must hold a
+ * \hype.cfg whose bytes match what was loaded pre-EBS (length + FNV-1a, fingerprinted before the
+ * in-place parse). Any writable FAT volume is NOT good enough -- persisting config to the wrong
+ * disk is strictly worse than not persisting.
+ *
+ * Located once, lazily, cached; scans hold the #390 media-scan lock because they retarget the
+ * shared g_media binding, and the located device's read/write/ctx are SNAPSHOTTED so later
+ * writes never depend on where g_media points afterwards.
+ */
+static hype_fs_t g_boot_vol;
+static int g_boot_vol_state; /* 0 = not tried, 1 = mounted+verified, -1 = not found */
+static struct {
+    int (*read)(void *ctx, uint64_t lba, uint32_t count, void *dst);
+    int (*write)(void *ctx, uint64_t lba, uint32_t count, const void *src);
+    void *ctx;
+    uint64_t base;
+} g_boot_vol_dev;
+
+static int bootvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    (void)ctx;
+    return g_boot_vol_dev.read(g_boot_vol_dev.ctx, g_boot_vol_dev.base + lba, count, dst);
+}
+static int bootvol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    if (g_boot_vol_dev.write == 0) {
+        return -1;
+    }
+    return g_boot_vol_dev.write(g_boot_vol_dev.ctx, g_boot_vol_dev.base + lba, count, src);
+}
+
+/* Does the mounted candidate carry the same \hype.cfg this boot loaded? */
+static int fw_1_boot_vol_verify(hype_fs_t *fs) {
+    static uint8_t buf[sizeof(g_hype_cfg_text)];
+    hype_fs_file_t f;
+    if (g_hype_cfg_raw_len == 0) {
+        return -1; /* booted on defaults: nothing to match, so nothing can be verified */
+    }
+    if (fs->ops->lookup(fs, "\\hype.cfg", &f) != 0 && fs->ops->lookup(fs, "hype.cfg", &f) != 0) {
+        return -1;
+    }
+    if (f.size != g_hype_cfg_raw_len || f.size > sizeof(buf)) {
+        return -1;
+    }
+    if (fs->ops->read_at(&f, 0, buf, (unsigned)f.size) != 0) {
+        return -1;
+    }
+    return (fw_1_fnv1a(buf, f.size) == g_hype_cfg_raw_sum) ? 0 : -1;
+}
+
+/* Locate (once) and return the verified writable boot volume, or 0. */
+static hype_fs_t *fw_1_boot_volume(void) {
+    unsigned didx;
+    if (g_boot_vol_state == 1) {
+        return &g_boot_vol;
+    }
+    if (g_boot_vol_state == -1) {
+        return 0;
+    }
+    g_boot_vol_state = -1;
+    media_scan_lock();
+    for (didx = 0; didx < g_media_dev_count; didx++) {
+        uint64_t bases[8];
+        unsigned nb = 0, bi;
+        static uint8_t mbr[512];
+        hype_gpt_partition_t part;
+
+        if (media_use_dev(didx) != 0 || g_media.write == 0) {
+            continue; /* absent or read-only device: can never be the writable boot volume */
+        }
+        bases[nb++] = 0u; /* superfloppy */
+        if (g_media.read(g_media.ctx, 0u, 1u, mbr) == 0 && mbr[510] == 0x55u &&
+            mbr[511] == 0xAAu) {
+            unsigned i;
+            for (i = 0; i < 4u && nb < 8u; i++) {
+                const uint8_t *e = mbr + 0x1BEu + i * 16u;
+                uint32_t start = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
+                                 ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+                if (e[4] != 0u && start != 0u) bases[nb++] = start;
+            }
+        }
+        if (hype_gpt_find_partition(g_media.read, g_media.ctx, 1u, &part) == 0 && nb < 8u)
+            bases[nb++] = part.first_lba;
+        if (hype_gpt_find_partition(g_media.read, g_media.ctx, 2u, &part) == 0 && nb < 8u)
+            bases[nb++] = part.first_lba;
+
+        for (bi = 0; bi < nb; bi++) {
+            g_boot_vol_dev.read = g_media.read;
+            g_boot_vol_dev.write = g_media.write;
+            g_boot_vol_dev.ctx = g_media.ctx;
+            g_boot_vol_dev.base = bases[bi];
+            if (hype_fs_mount_auto(&g_boot_vol, bootvol_read, bootvol_write, 0) != 0) {
+                continue;
+            }
+            if (fw_1_boot_vol_verify(&g_boot_vol) != 0) {
+                continue;
+            }
+            g_boot_vol_state = 1;
+            hype_debug_print("fw-1 BOOTVOL: hype's boot volume mounted for writing -- %s on "
+                             "device %u at LBA %llu, \\hype.cfg verified byte-identical [#447]\n",
+                             g_boot_vol.ops->name, didx,
+                             (unsigned long long)bases[bi]);
+            media_scan_unlock();
+            return &g_boot_vol;
+        }
+    }
+    media_scan_unlock();
+    hype_debug_print("fw-1 BOOTVOL: no writable volume carrying this boot's \\hype.cfg found -- "
+                     "config write-back unavailable this boot [#447]\n");
+    return 0;
 }
 
 static void usb_log_setup(const hype_blk_backend_t *be) {
