@@ -4046,7 +4046,15 @@ void hype_vmx_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t 
      *  - nRIP is an SVM convenience; VMX gives the instruction LENGTH instead, and the resume RIP
      *    is rip + that, which the caller can compute if it needs to.
      */
-    out->cr2 = 0;
+    /*
+     * #521: cr2 has no VMCS equivalent, so the slot carries what a stuck guest actually needs:
+     * the INTERRUPTIBILITY state in the high half and what hype is INJECTING at entry in the low
+     * half. A guest that is active, faults nowhere and still does not advance is either blocked
+     * from executing (STI/MOV-SS shadow, NMI blocking) or being handed an event on every entry,
+     * and nothing else in the dump distinguishes those.
+     */
+    out->cr2 = (vmread(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE, &ok) << 32) |
+               (vmread(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, &ok) & 0xFFFFFFFFull);
     out->nrip = 0;
     /*
      * #520: the guest's ACTIVITY STATE, carried in the unused exitintinfo slot's upper half.

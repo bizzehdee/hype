@@ -1289,6 +1289,11 @@ static uint64_t g_usable_ram_bytes;
  * the slow boot (the guest's clock is now kvmclock, so it doesn't need the
  * host-tick-driven timebase). A stepping stone to two Alpines on two cores. */
 #define HYPE_RUN_GUEST_ON_AP 1
+
+/* #521: intercept guest #PF to report the faulting address. Diagnostic only -- see the call site. */
+#ifndef HYPE_521_TRAP_PF
+#define HYPE_521_TRAP_PF 0
+#endif
 /* M8-0b STEP 2: run TWO Alpines, one per dedicated AP -- g_vms[0] on apic_id=1
  * and g_vms[1] on apic_id=2, BSP idle. When 0, only g_vms[0] runs on AP1 and
  * AP2 merely parks (STEP 2a). Requires enough host RAM for two guests (each
@@ -13422,7 +13427,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * user-mode bring-up, and an observation/reinjection loop here can turn a
      * recoverable guest fault into an endless VM-exit storm.  #PF(14) is also
      * deliberately not intercepted (routine, would flood + slow the boot). */
-    vmm_set_exception_intercepts(kind, ctx, (1u << 6));
+    /*
+     * #521: HYPE_521_TRAP_PF=1 additionally intercepts #PF, purely to NAME a fault the guest
+     * otherwise handles invisibly. A guest that page-faults in a loop through its own IDT
+     * produces no exits hype can see, so it is indistinguishable from a spin -- which is exactly
+     * how the Intel boot hang presented. Off by default: intercepting #PF on a working guest is
+     * pure overhead, and Linux takes routine faults by design.
+     */
+    vmm_set_exception_intercepts(kind, ctx,
+                                 (1u << 6) | (HYPE_521_TRAP_PF ? (1u << 14) : 0u));
 
     /* M4-6d4 #5: bound the guest's uninterrupted execution via SVM PAUSE-
      * filtering. Real HW showed a single 40s VMRUN with zero exits (PREEMPT
@@ -13900,6 +13913,33 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * list walks; if resuming from it ever corrupts guest state, every
              * DxeCore walk becomes a random infinite loop. Build with
              * -DHYPE_436_NO_PREEMPT to run the guest preempt-free and test that. */
+            /*
+             * #521/#364: take any ALREADY-PENDING preempt tick before arming the next one.
+             *
+             * This loop runs with interrupts disabled, so a one-shot that expires during host
+             * housekeeping does not run hype's handler -- it sits in the LAPIC's IRR. The very
+             * next VM entry then exits on it immediately, before the guest retires a single
+             * instruction. If the dispatch loop routinely outlasts one interval, the guest gets
+             * NO execution at all: hype spins, entering and exiting on the same stale tick.
+             *
+             * That is not theoretical. On the Intel rig a Linux guest froze at one RIP through
+             * 85,000+ external-interrupt exits, every one of them vector 0x50 -- this timer --
+             * with the guest active, faulting nowhere and advancing not one byte. Building with
+             * -DHYPE_436_NO_PREEMPT let the same guest boot straight past it, which is what named
+             * the tick as the cause rather than the guest.
+             *
+             * Draining here, before the arm below, means the interval the guest gets starts at
+             * entry rather than having already elapsed.
+             *
+             * VMX ONLY, and measured rather than assumed: SVM masks interrupts with GIF and
+             * takes anything pending at its stgi() on the way into the guest, so it needs no
+             * drain -- and opening a window here anyway WEDGED an AMD guest at "Booting SMP
+             * configuration", i.e. exactly during AP bring-up. The two backends do not share
+             * this problem, so they do not share the fix.
+             */
+            if (kind == HYPE_VMM_KIND_VMX) {
+                __asm__ volatile("sti\n\tnop\n\tcli" ::: "memory");
+            }
             hype_lapic_arm_timer_oneshot(
                 (volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
                 (uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR,
@@ -15744,7 +15784,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                     hype_debug_print("fw-1 GUESTPC vm%u: exits=%llu lastreason=0x%llx "
                                                      "lastrip=0x%llx | cs=0x%x:0x%llx rip=0x%llx "
                                                      "rflags=0x%llx cr0=0x%llx cr3=0x%llx "
-                                                     "cr4=0x%llx rsp=0x%llx activity=%llu [#520]\n",
+                                                     "cr4=0x%llx rsp=0x%llx activity=%llu intrblk/entryinj=0x%llx exitintr=0x%llx [#520]\n",
                                                      gpv,
                                                      (unsigned long long)g_bsp_probe_exits[gpv],
                                                      (unsigned long long)g_bsp_probe_reason[gpv],
@@ -15757,7 +15797,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                      (unsigned long long)gs.cr3,
                                                      (unsigned long long)gs.cr4,
                                                      (unsigned long long)gs.rsp,
-                                                     (unsigned long long)gs.nrip);
+                                                     (unsigned long long)gs.nrip,
+                                                     (unsigned long long)gs.cr2,
+                                                     (unsigned long long)gs.exitintinfo);
                                 }
                             }
                             lt_prev = lt_sum;
@@ -17731,7 +17773,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             continue;
         }
         if (vmm_reason_is_exception(kind, ctx, info.reason, 6) ||
-            vmm_reason_is_exception(kind, ctx, info.reason, 13)) {
+            vmm_reason_is_exception(kind, ctx, info.reason, 13) ||
+            (HYPE_521_TRAP_PF && vmm_reason_is_exception(kind, ctx, info.reason, 14))) {
             unsigned vec = (unsigned)vmm_exception_vector(kind, ctx, info.reason);
             int is_gp = (vec == 13u);
             static unsigned guestexcp_log_n = 0;
@@ -17774,7 +17817,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
                 hype_debug_print("fw-1 GUESTEXCP: #%s vec=%u err=0x%llx rip=0x%llx cr3=0x%llx "
                                  "insn=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                                 is_gp ? "GP" : "UD", vec, (unsigned long long)info.qualification,
+                                 (vec == 14u) ? "PF" : (is_gp ? "GP" : "UD"), vec,
+                                 (unsigned long long)info.qualification,
                                  (unsigned long long)xrip, (unsigned long long)xcr3,
                                  ib[0], ib[1], ib[2], ib[3], ib[4], ib[5],
                                  ib[6], ib[7], ib[8], ib[9], ib[10], ib[11]);
