@@ -378,8 +378,9 @@ distinct from any guest's own console:
   command set is the authoritative operator surface for changing the
   machine's configuration at runtime:
   - `create` — interactive VM-creation wizard (§6f Create; TERM-10).
-  - `mkdisk` — create a preallocated qcow2 backing image on a chosen host
-    disk's existing filesystem (§6d; TERM-11).
+  - `mkdisk` — create a qcow2 backing image, preallocated or thin, on a
+    chosen host disk's existing filesystem (§6d, §10 decision 42;
+    TERM-11).
   - `attach` / `detach` — bind or unbind a device (USB, physical disk,
     SATA) to a VM (§10 decision 41; TERM-12/TERM-13).
   - `set` — edit a VM's configuration, applying immediately what can be
@@ -481,16 +482,18 @@ surface for all of this.
 - **Virtual disk target (`target_disk = file:<path>`)**: a raw (or qcow2,
   §10 decision 3) file on host storage. Created ahead of time by
   `tools/make-disk-image.sh`, **or by hype itself** via the terminal's
-  `mkdisk` command (added 2026-08-17, TERM-9/#485; TERM-11): a
-  **preallocated** qcow2 image — every cluster allocated and its metadata
-  written at create time, no thin provisioning (§13) — on a filesystem
-  that already exists on a chosen host disk. hype creates *files on
-  existing volumes*; it does not partition disks or make filesystems. `target_disk_size_gb`
-  is a **declaration of intent that hype validates**, not a creation
-  instruction: hype compares it against the resolved image's real size and
-  reports a mismatch, which catches a VM pointed at a stale or truncated
-  image. The host filesystem controls whether the backing file can remain
-  sparse (§10 decision 29). ext supports true holes. FAT32 and exFAT do not;
+  `mkdisk` command (added 2026-08-17, TERM-9/#485; TERM-11): a qcow2 image on
+  a filesystem that already exists on a chosen host disk. **Preallocated is
+  the default** — every cluster allocated and its metadata written at create
+  time — and **thin provisioning is in scope too** (§10 decision 42): a
+  backing file holding only the clusters the guest has written, grown on
+  demand, on a host filesystem that can represent a hole. hype creates *files
+  on existing volumes*; it does not partition disks or make filesystems.
+  `target_disk_size_gb` is a **declaration of intent that hype validates**,
+  not a creation instruction: hype compares it against the resolved image's
+  real size and reports a mismatch, which catches a VM pointed at a stale or
+  truncated image. The host filesystem controls whether the backing file can
+  remain sparse (§10 decision 29). ext supports true holes. FAT32 and exFAT do not;
   their writers allocate and zero-fill any logical gap before publishing the
   new file size. Reads and writes from the guest use the host filesystem
   driver already needed to load ISOs and guest firmware/varstore.
@@ -1072,6 +1075,11 @@ isn't lost.
    than guessing, so a broken qcow2 already fails loudly. Rejected dropping
    the key: the raw-declared-but-actually-qcow2 direction is worth catching,
    since writing a qcow2 through the raw path would corrupt it.
+   **Amended by decision 42:** the premise above that a pre-created image
+   "must be fully allocated anyway" no longer holds. hype's writer *can* now
+   assign a missing range where the host filesystem can represent one
+   (decision 29), so a backing file may be thin and grow at runtime. Raw
+   still remains the default and the recommended format.
 4. **Testing strategy — decided: QEMU/KVM nested virtualization
    (`-cpu host,+vmx`) for fast day-to-day iteration through M0–M6, plus a
    mandatory real-hardware validation pass at every milestone gate** — not
@@ -2145,6 +2153,75 @@ isn't lost.
     guest; a version of `attach` that always waits for a reboot fails the
     primary use case while being only marginally simpler.
 
+42. **Thin-provisioned virtual disks — decided: promoted from v2 to v1
+    (2026-08-18, #524). A `file:` backing image may be created holding
+    almost nothing and grown as the guest writes; preallocation stays the
+    default.** Reverses §13's own "stays out of v1" position, which rested
+    on a premise decision 29 has since removed: hype's
+    post-`ExitBootServices` writer could not assign a missing range, so a
+    thin image saved nothing. It can now, per filesystem, under a stated
+    crash-ordering contract.
+
+    **Why it is worth v1 scope.** hype runs from a USB stick or a laptop's
+    single disk. A preallocated 100 GB image costs 100 GB the moment it is
+    made, whatever the guest uses, which is routinely the difference between
+    one virtual disk and none.
+
+    **The two creation modes** (§6b `mkdisk`, §6d, TERM-11/#507/#508):
+    - **Preallocated** — every block or cluster allocated and its metadata
+      written at create time. The default, and the only mode offered on a
+      host volume that cannot back a thin image.
+    - **Thin** — the operator asks for it explicitly. `mkdisk` reports both
+      virtual size and host-allocated size after creating either mode, so
+      the difference is visible rather than asserted.
+
+    **Which host filesystems can back which thin image**, following
+    decision 29 rather than inventing new rules:
+    - **Thin qcow2** needs only *growth at the end* of the backing file, as
+      newly allocated clusters are appended. Every writer that can extend a
+      file can back it: ext, and FAT32/exFAT (whose writers allocate and
+      zero-fill through the new size), and NTFS per decision 30.
+    - **Sparse raw** needs *interior holes*, so it is **ext-only**. FAT32
+      and exFAT have no sparse representation at all (decision 29), so the
+      request is **refused, naming the filesystem of that volume** — never
+      silently satisfied by producing a fully allocated file, which is the
+      failure mode being designed out.
+    - Growth is not free of ordering rules: new blocks are zeroed or filled
+      before metadata exposes them, exactly as decision 29 requires. The
+      file-backed backend must therefore re-resolve a file's ranges after it
+      grows instead of resolving them once at open (#506) — that
+      resolve-once behaviour is the actual defect, not the file format.
+
+    **Over-commit is allowed, and reported.** With thin images the sum of
+    every VM's declared virtual disk size may exceed host free space; that
+    is the point. Admission control (§6i) keeps validating each image's
+    virtual size against `target_disk_size_gb` as it does today, and
+    additionally reports total committed virtual size against the host
+    volume's free space. It does not refuse on that basis. Host RAM
+    admission is unchanged and stays a hard refusal.
+
+    **Running out of host space is a guest I/O error, never a host fault.**
+    A write that cannot allocate fails that guest's I/O with a device error
+    and is reported to the operator. It must not panic the hypervisor, halt
+    other VMs, or return false success — the same rule §6g already applies
+    to a faulted guest, reached here through the storage path.
+
+    **Still refused, still v2.** Pooling extents across several physical
+    disks, per-VM encryption at rest, reclaiming space a guest has freed
+    (discard/TRIM punching holes back out) and any defragmentation story.
+    qcow2 refcount-table growth also stays refused: a thin qcow2 sizes its
+    refcount table for the full virtual size at create time, the way
+    `qemu-img` does, so that refusal is never reached in normal operation.
+
+    **Rejected: offering thin raw on FAT32/exFAT by zero-filling the gaps.**
+    That is preallocation with extra steps and a misleading name — it
+    allocates the space it claims to save.
+
+    **Rejected: making thin the default.** Preallocation fails at create
+    time, in front of the operator, when the space is not there. Thin defers
+    that failure into a running guest's write path, which is a worse place
+    to discover it, so the operator opts in.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
@@ -2197,14 +2274,12 @@ own "keeping plan.md and the board in sync" rule).
   the re-derived §6g argument, §3 for the two tiers, and #466–#478 on the SMP
   milestone for the delivery plan. Kept as a stub rather than deleted so the
   promotion is visible to anyone who remembers this section containing it.
-- **Thin-provisioned virtual disks** (made explicit 2026-08-17, TERM-9/#485
-  — previously only implied). qcow2's copy-on-write growth model stays out
-  of v1: `mkdisk` (TERM-11, §6d) **preallocates every cluster** at create
-  time, and the file-backed write path assumes the backing bytes exist.
-  Recorded here precisely so TERM-11 landing a qcow2 *creator* is not read
-  as promoting thin provisioning — allocation-on-first-write, host
-  free-space accounting under overcommit, and the fragmentation/fsck story
-  are the v2 work, not a flag on the v1 creator.
+- ~~**Thin-provisioned virtual disks**~~ (made explicit 2026-08-17,
+  TERM-9/#485) — **PROMOTED TO v1 on 2026-08-18 (#524).** No longer future
+  work. See §10 decision 42 for the model and what it still refuses, §6d for
+  the two creation modes, and #506/#507/#508 on the STORAGE milestone for the
+  delivery plan. Kept as a stub rather than deleted so the promotion is
+  visible to anyone who remembers this section containing it.
 - **Memory ballooning, for dynamic per-VM RAM allocation with a
   configurable floor and ceiling** (noted 2026-07-14). v1's admission
   control (§6i) sizes each VM's RAM as a fixed amount decided at start
@@ -2246,12 +2321,14 @@ own "keeping plan.md and the board in sync" rule).
 
 - **Dynamically-sizable (thin-provisioned) virtual disks, pooled across
   one or more physical disks, encrypted and isolated per VM** (noted
-  2026-07-14). v1's storage model (M5's `blk_backend`, M10's physical-disk
-  target) is a virtual disk mapped to one fixed-size `file:` backing file
-  or one whole `physical:` device -- no thin provisioning, no pooling. v2
-  would let a virtual block device grow on demand (allocated space backed
-  by extents drawn from a shared pool spanning part or all of one or more
-  physical disks, not a single pre-sized file), so multiple VMs' virtual
+  2026-07-14; corrected 2026-08-18). v1's storage model (M5's
+  `blk_backend`, M10's physical-disk target) is a virtual disk mapped to ONE
+  `file:` backing file or one whole `physical:` device. **That single file
+  may be thin and grow on demand** -- promoted to v1 as §10 decision 42 --
+  so what remains v2 here is pooling and encryption, not growth. v2
+  would let a virtual block device draw its space from a pool (allocated
+  space backed by extents drawn from a shared pool spanning part or all of
+  one or more physical disks, not a single file), so multiple VMs' virtual
   disks share the same underlying physical capacity instead of each
   needing its own dedicated, fully-reserved region. Two invariants that
   must hold regardless of pooling: (1) **encryption** -- every VM's data
