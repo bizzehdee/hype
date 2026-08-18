@@ -48,7 +48,10 @@ mcopy -i $S/esp.img $B/hype.efi ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i $S/esp.img fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
 mcopy -i $S/esp.img "$ISO" ::/iso/test.iso
 mcopy -i $S/esp.img "$ISO" ::/iso/vm1.iso
-mcopy -i $S/esp.img $S/hype.cfg ::/hype.cfg
+# NOCFG=1 reproduces the hardware sticks, which ship no hype.cfg at all and so
+# take the built-in defaults -- including HYPE_SMP_STARTABLE_VCPUS for the vCPU
+# count. A rig that always ships a cfg cannot catch a stick built without that knob.
+if [ -z "${NOCFG:-}" ]; then mcopy -i $S/esp.img $S/hype.cfg ::/hype.cfg; fi
 
 for ATTEMPT in 1 2 3; do
   cp /usr/share/OVMF/OVMF_VARS.fd $S/VARS.fd
