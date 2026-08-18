@@ -2222,6 +2222,73 @@ isn't lost.
     that failure into a running guest's write path, which is a worse place
     to discover it, so the operator opts in.
 
+43. **VMCS ownership — decided: a vCPU's VMCS is current on exactly one
+    logical processor, its owner, and every cross-core read or write goes
+    through published state (2026-08-19, #523).**
+
+    **Why this is architectural, not stylistic.** The VMCS current pointer is
+    per logical processor, and the SDM permits a processor to hold VMCS data in
+    on-chip caches -- a VMWRITE may live only in that core's cache until VMCLEAR
+    writes it back. So a VMCS must not be active on two logical processors at
+    once, and moving one between cores requires **VMCLEAR on the core where it
+    is active**, before VMPTRLD on the new core.
+
+    **What hype did instead.** `vmx_ensure_current()` (#483) VMCLEARs and
+    VMPTRLDs from the core that *wants* the VMCS -- the wrong side of the
+    handshake -- and all 63 VMCS field accessors call it, so any core reading
+    any field silently steals the VMCS from the core running that vCPU.
+    Measured on the bare-metal Intel run of `60fb26a`: `VMCSRELOAD: count=73`,
+    then one entry failed with VM-instruction error 4 (VMLAUNCH with non-clear
+    VMCS), hype stopped vm0's AP at t~31s after 13,026,023 successful exits,
+    and the guest -- still believing it had two CPUs -- reported
+    `rcu_preempt detected stalls` on CPU 1 at t=84s, 24 times.
+
+    **The rule.**
+    - Once a vCPU is dispatched, **only its owner** makes its VMCS current.
+    - **Observers read a published snapshot** the owner refreshes at each exit
+      (interrupt state, debug state, exit counts). Reading a VMCS field
+      cross-core is itself the violation, so the prohibition and the mechanism
+      are one rule, not two.
+    - **Cross-core state changes are posted, not written** -- INIT/SIPI reset
+      and topology updates become pending requests the target applies before
+      its own next entry, the shape the pending-vector machinery already uses.
+    - **A vCPU changes owner only by explicit hand-off**: the current owner
+      VMCLEARs and releases before the new owner VMPTRLDs. This is what makes
+      SMP-13's shared tier (#469) legal rather than a licensed version of
+      today's bug.
+    - `vmx_ensure_current()` stays, as a **counted and reported violation
+      detector**. Silence is what let this run for as long as it did.
+
+    **Why it is a hard invariant.** There is no safe degraded mode: a stolen
+    VMCS does not fail fast, the two cores' cached copies diverge, and the
+    loser's writes vanish. Error 4 is the *lucky* case, where the inconsistency
+    lands on the launch state and the CPU refuses; the unlucky case is an
+    exit-control or EPT-pointer write that quietly does not take. The damage is
+    deferred and non-local -- it lands on another core, in another VM, at an
+    unrelated instruction. And a VMCS carries **guest state** (RIP, CR3,
+    segments), drawn from one shared `g_vmcs_pool`, so a cross-core write is a
+    section 6g/6j boundary matter, not only a stability one.
+
+    **Applies to VMX; the mechanism is shared.** SVM's VMCB has no
+    current-pointer or cache-writeback protocol (VMRUN takes the address in
+    RAX), so the specific hazard is VMX-only. The published-state rule is
+    written for both backends anyway, so diagnostics do not grow a per-backend
+    shape -- the same argument #482 made for device dispatch.
+
+    **Rejected: VMCLEAR-and-retry on error 4.** It masks the state bug it is
+    recovering from, and once ownership holds it can never fire. `53f4087`
+    already makes the failure loud, which is what the retry was really for.
+
+    **Rejected: an IPI handshake so the owner VMCLEARs on demand.**
+    Architecturally correct, but it pays an inter-processor round trip on every
+    diagnostic read of a running vCPU. What the readers want is a snapshot, not
+    live registers.
+
+    **Rejected: leaving `vmx_ensure_current()` as the standing protocol with a
+    warning comment.** That is the drift #482 removed for device dispatch: 63
+    call sites auto-steal today, and the next accessor added re-breaks it. The
+    rule has to be structural.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
