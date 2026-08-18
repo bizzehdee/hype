@@ -14533,11 +14533,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                     for (_av = 0u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
                         if (kind == HYPE_VMM_KIND_VMX) {
+                        /*
+                         * #523: reloads are routine; STEALS are the decision-43 violation --
+                         * a core taking a VMCS from the core that owns it. The two were one
+                         * number, so "73 reloads" could not say whether any was a violation.
+                         * steals must read 0.
+                         */
                         hype_debug_print("fw-1 VMCSRELOAD: count=%llu last_cur=0x%llx "
-                                         "last_want=0x%llx [#483]\n",
+                                         "last_want=0x%llx | steals=%llu last owner=%u "
+                                         "thief=%u [#483 #523]\n",
                                          (unsigned long long)g_vmx_vmcs_reload_count,
                                          (unsigned long long)g_vmx_vmcs_reload_last_cur,
-                                         (unsigned long long)g_vmx_vmcs_reload_last_want);
+                                         (unsigned long long)g_vmx_vmcs_reload_last_want,
+                                         (unsigned long long)g_vmx_vmcs_steal_count,
+                                         (unsigned)g_vmx_vmcs_steal_last_owner,
+                                         (unsigned)g_vmx_vmcs_steal_last_thief);
                     }
                     hype_debug_print("fw-1 IPIOUT vm%u/%u: sent=%llu dropped=%llu "
                                          "pending=%u [#190]\n", _vmi, _av,

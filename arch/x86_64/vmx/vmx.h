@@ -139,6 +139,12 @@ extern uint64_t g_vmx_vmcs_reload_count;
 extern uint64_t g_vmx_vmcs_reload_last_cur;
 extern uint64_t g_vmx_vmcs_reload_last_want;
 
+/* #523 (decision 43): of those reloads, how many took a VMCS away from the core that OWNED it.
+ * A reload is routine; a steal is the violation, and the two used to be one number. Must be 0. */
+extern uint64_t g_vmx_vmcs_steal_count;
+extern uint32_t g_vmx_vmcs_steal_last_owner;
+extern uint32_t g_vmx_vmcs_steal_last_thief;
+
 extern const hype_vmm_ops_t hype_vmx_ops;
 
 

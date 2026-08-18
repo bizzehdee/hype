@@ -258,6 +258,29 @@ struct hype_vcpu_ctx {
     hype_fpu_area_t fpu;
     int launched; /* 0 until the first successful VMLAUNCH; VMRESUME thereafter. */
     /*
+     * #523 (plan.md section 10 decision 43): who owns this VMCS, and the snapshot everyone
+     * else reads instead of stealing it.
+     *
+     * The VMCS current pointer is per logical processor and a core may hold VMCS state in its
+     * own caches, so a VMCS must be VMCLEARed on the core where it is active before another
+     * core loads it. Every VMCS field accessor here calls vmx_ensure_current(), which clears
+     * and loads from the core that WANTS it -- so a diagnostic read of a running vCPU steals
+     * its VMCS mid-flight. Measured: 73 steals in one 8-minute Intel run, one of which left
+     * the launch state non-clear and failed the next entry with VM-instruction error 4,
+     * killing the vCPU while the guest went on believing it had that CPU.
+     *
+     * pub_intr is refreshed by the OWNER, and only when someone has asked (pub_request), so a
+     * diagnostic sampled every 30 seconds costs nothing on a path taken millions of times.
+     */
+    uint32_t owner_apic;
+    int owner_valid;
+    hype_vmm_intr_state_t pub_intr;
+    int pub_valid;
+    volatile int pub_request;
+    hype_svm_debug_state_t pub_dbg;
+    int pub_dbg_valid;
+    volatile int pub_dbg_request;
+    /*
      * #483: this vCPU's VMCS region, and the core it is currently loaded on.
      *
      * On Intel the CURRENT-VMCS pointer is per logical processor, unlike SVM where VMRUN takes
@@ -589,6 +612,25 @@ static inline int vmptrld(const void *vmcs_phys_addr_ptr) {
 uint64_t g_vmx_vmcs_reload_count;
 uint64_t g_vmx_vmcs_reload_last_cur;
 uint64_t g_vmx_vmcs_reload_last_want;
+/*
+ * #523: a reload is routine (a core loading a vCPU it owns). A STEAL is a core taking a VMCS
+ * away from the core that owns it, which decision 43 forbids. Counting them separately is what
+ * turns "73 reloads happened" into "N of them were violations, by core A against core B".
+ */
+uint64_t g_vmx_vmcs_steal_count;
+uint32_t g_vmx_vmcs_steal_last_owner;
+uint32_t g_vmx_vmcs_steal_last_thief;
+
+/* #523: defined next to the accessor it serves; declared here because vcpu_run refreshes the
+ * snapshot at exit, long before that definition. */
+struct hype_vcpu_ctx;
+static void vmx_publish_intr_state(struct hype_vcpu_ctx *real);
+static void vmx_publish_debug_state(struct hype_vcpu_ctx *real);
+
+/* This core's LAPIC id, reg 0x20 bits 31:24 -- the same read the dispatch loop uses. */
+static inline uint32_t vmx_exec_apic_id(void) {
+    return (*(volatile uint32_t *)(uintptr_t)(0xFEE00000ULL + 0x20u)) >> 24;
+}
 
 static inline uint64_t vmptrst_current(void) {
     uint64_t out = 0;
@@ -626,6 +668,12 @@ static void vmx_ensure_current(hype_vcpu_ctx_t *ctx) {
     g_vmx_vmcs_reload_count++;
     g_vmx_vmcs_reload_last_cur = cur;
     g_vmx_vmcs_reload_last_want = want;
+    /* #523: name the violation rather than performing it silently. */
+    if (real->owner_valid && real->owner_apic != vmx_exec_apic_id()) {
+        g_vmx_vmcs_steal_count++;
+        g_vmx_vmcs_steal_last_owner = real->owner_apic;
+        g_vmx_vmcs_steal_last_thief = vmx_exec_apic_id();
+    }
     if (vmclear(real->vmcs_region) == 0 && vmptrld(real->vmcs_region) == 0) {
         real->launched = 0;
     }
@@ -1348,6 +1396,12 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
         info->guest_rip = 0;
         return -1;
     }
+    /*
+     * #523: this core is the owner from here until it hands the vCPU over. Claimed AFTER the
+     * currency check above, so a failed reload never records an owner that never ran.
+     */
+    real->owner_apic = vmx_exec_apic_id();
+    real->owner_valid = 1;
     /* #251: run the guest under its own XCR0, and put hype's back afterwards. */
     if (real->guest_xcr0_valid && vmx_ensure_osxsave()) {
         xsetbv0(real->guest_xcr0);
@@ -1374,6 +1428,19 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     info->reason = vmread(HYPE_VMCS_VM_EXIT_REASON, &ok);
     info->qualification = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
     info->guest_rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    /*
+     * #523: refresh the published snapshot, but only when an observer has asked. The four
+     * VMCS-derived fields cost a VMREAD each and this path runs millions of times a run,
+     * while the diagnostic that reads them samples every 30 seconds.
+     */
+    if (real->pub_request) {
+        real->pub_request = 0;
+        vmx_publish_intr_state(real);
+    }
+    if (real->pub_dbg_request) {
+        real->pub_dbg_request = 0;
+        vmx_publish_debug_state(real);
+    }
 
     /*
      * #315: the VMX half of the IDT-delivery recovery. Identical mechanism to SVM's EXITINTINFO, and
@@ -3252,19 +3319,53 @@ void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
     vmwrite(HYPE_VMCS_GUEST_ACTIVITY_STATE, HYPE_VMX_ACTIVITY_STATE_ACTIVE);
 }
 
-void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out) {
-    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
-    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+/*
+ * #523: fill the four VMCS-derived fields of the snapshot. Owner-only -- the caller must
+ * already hold this vCPU's VMCS current, which is true at every VM exit.
+ */
+static void vmx_publish_intr_state(struct hype_vcpu_ctx *real) {
     int ok;
-    out->rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
-    out->interrupt_shadow = vmread(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE, &ok);
-    out->eventinj = vmread(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, &ok);
-    /* "vintr" means "is an interrupt window armed" -- on VMX that is the
-     * interrupt-window-exiting control, not a dedicated field. */
-    out->vintr = (vmread(HYPE_VMCS_CPU_BASED_VM_EXEC_CONTROL, &ok) &
-                  HYPE_VMX_PROCBASED_INTERRUPT_WINDOW_EXITING)
-                     ? 1u
-                     : 0u;
+    real->pub_intr.rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
+    real->pub_intr.interrupt_shadow = vmread(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE, &ok);
+    real->pub_intr.eventinj = vmread(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, &ok);
+    real->pub_intr.vintr = (vmread(HYPE_VMCS_CPU_BASED_VM_EXEC_CONTROL, &ok) &
+                            HYPE_VMX_PROCBASED_INTERRUPT_WINDOW_EXITING)
+                               ? 1u
+                               : 0u;
+    real->pub_valid = 1;
+}
+
+void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    /*
+     * #523 (decision 43): a core that does not own this vCPU must NOT make its VMCS current.
+     * The periodic dump walks every vCPU of a VM from one core, so this single call site was
+     * stealing a running AP's VMCS every 30 seconds.
+     *
+     * The pending-IRR half is plain memory and is always read directly and honestly. The four
+     * VMCS-derived fields come from the snapshot the owner publishes on request: one interval
+     * stale on the first ask, current from then on. A stale interrupt-window bit is worth far
+     * more than a corrupted VM entry.
+     */
+    int owned = !real->owner_valid || real->owner_apic == vmx_exec_apic_id();
+    if (owned) {
+        vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
+        vmx_publish_intr_state(real);
+    } else {
+        real->pub_request = 1;
+    }
+    if (real->pub_valid) {
+        out->rflags = real->pub_intr.rflags;
+        out->interrupt_shadow = real->pub_intr.interrupt_shadow;
+        out->eventinj = real->pub_intr.eventinj;
+        out->vintr = real->pub_intr.vintr;
+    } else {
+        /* Never published: report zeros rather than a plausible guess. */
+        out->rflags = 0;
+        out->interrupt_shadow = 0;
+        out->eventinj = 0;
+        out->vintr = 0;
+    }
     out->can_accept = hype_svm_can_accept_interrupt(out->rflags, out->interrupt_shadow);
     out->pending_valid = hype_svm_irr_any(real->pending_irr);
     out->pending_count = hype_svm_irr_count(real->pending_irr); /* #356 */
@@ -3969,6 +4070,16 @@ int hype_vmx_vcpu_handle_pci_ecam_npf_insn(hype_vcpu_ctx_t *ctx, hype_pci_t *pci
  * incarnation, and forcing launched=0 so the next entry is a VMLAUNCH rather
  * than a VMRESUME of a VMCS that no longer describes the same guest.
  */
+/*
+ * #523: refresh the debug snapshot from the owner's own exit path. Deliberately routed through
+ * the public accessor rather than duplicating its eleven VMREADs -- the owner branch of that
+ * function stores what it read into pub_dbg, so calling it here IS the publish.
+ */
+static void vmx_publish_debug_state(struct hype_vcpu_ctx *real) {
+    hype_svm_debug_state_t tmp;
+    hype_vmx_vcpu_get_debug_state((hype_vcpu_ctx_t *)real, &tmp);
+}
+
 void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
                                   uint64_t ept_root) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
@@ -4022,6 +4133,21 @@ void hype_vmx_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t 
     if (out == 0) {
         return;
     }
+    /*
+     * #523 (decision 43): same rule as get_intr_state. This one is read for every AP from the
+     * core running vCPU 0, so it stole a running AP's VMCS on every periodic dump.
+     */
+    if (real->owner_valid && real->owner_apic != vmx_exec_apic_id()) {
+        real->pub_dbg_request = 1;
+        if (real->pub_dbg_valid) {
+            *out = real->pub_dbg;
+        } else {
+            unsigned zi;
+            uint8_t *b = (uint8_t *)out;
+            for (zi = 0; zi < sizeof(*out); zi++) b[zi] = 0;
+        }
+        return;
+    }
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
 
     out->cs_selector = (uint16_t)vmread(HYPE_VMCS_GUEST_CS_SELECTOR, &ok);
@@ -4046,6 +4172,9 @@ void hype_vmx_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t 
      *  - nRIP is an SVM convenience; VMX gives the instruction LENGTH instead, and the resume RIP
      *    is rip + that, which the caller can compute if it needs to.
      */
+    /* #523: the owner has it current and has just read it -- keep the snapshot fresh. */
+    real->pub_dbg = *out;
+    real->pub_dbg_valid = 1;
     /*
      * #521: cr2 has no VMCS equivalent, so the slot carries what a stuck guest actually needs:
      * the INTERRUPTIBILITY state in the high half and what hype is INJECTING at entry in the low
