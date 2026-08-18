@@ -20384,6 +20384,21 @@ static volatile unsigned long long g_usb_log_slice_calls;
 static volatile unsigned long long g_usb_log_slice_tsc;
 static volatile unsigned long long g_usb_log_slice_max_tsc;
 static volatile unsigned long long g_usb_log_slice_source_bytes;
+/*
+ * #522: why each drain burst ENDED, and the worst backlog reached.
+ *
+ * The counter above is the sum of every sink's cursor advance, which reads like a
+ * production figure and is not one -- it was divided by a single sink's slice budget to
+ * "prove" a 300 KB backlog that the run's own `usb-log: BEHIND` lines put at 28 KB. The
+ * drain is designed to slice every 10ms until the sinks reach the burst's target, so a
+ * burst that ends after ONE slice while still behind is the thing worth counting, and
+ * nothing counted it.
+ */
+static volatile unsigned long long g_usb_log_bursts;
+static volatile unsigned long long g_usb_log_burst_caught;
+static volatile unsigned long long g_usb_log_burst_stalled;
+static volatile unsigned int g_usb_log_max_lag;
+static int g_usb_log_burst_first = 1;
 
 /*
  * #338: the split companions to the combined \HYPEFULL.LOG -- hype's own output
@@ -24533,25 +24548,34 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              "(device time is measured AFTER the lock) [#365]\n",
                                              (lw * 1000ull) / hz, (lwm * 1000000ull) / hz);
                         }
+                        /*
+                         * #522: every figure the drain's health needs, each labelled as what
+                         * it actually is.
+                         *
+                         * `drained` is the SUM of every sink's cursor advance -- three sinks
+                         * consuming one capture buffer, so it is roughly three times the bytes
+                         * produced when the drain keeps up. It was previously called
+                         * `source_bytes`, read as production, and compared against
+                         * slices x one sink's budget; that arithmetic produced a 300 KB
+                         * backlog which the same run's `usb-log: BEHIND` lines put at 28 KB.
+                         *
+                         * `behind` and `peak` are the real backlog of the combined sink: what a
+                         * power-off would cost right now, and the worst it has ever been.
+                         * `caught` vs `stalled` says why bursts end, which is what decides
+                         * whether a bigger budget could help at all.
+                         */
+                        unsigned int produced = hype_logbuf_len();
+                        unsigned int wrote_hype = hype_log_sink_flushed(&g_hype_log);
                         hype_debug_print(
-                            "fw-1 USBFLUSH: slices=%llu source_bytes=%llu total=%llums "
-                            "max=%lluus behind=%uB [#374 #522]\n",
+                            "fw-1 USBFLUSH: slices=%llu drained=%lluB(all sinks) total=%llums "
+                            "max=%lluus | produced=%uB behind=%uB peak=%uB | bursts=%llu "
+                            "caught=%llu stalled=%llu [#374 #522]\n",
                             g_usb_log_slice_calls, g_usb_log_slice_source_bytes,
                             (g_usb_log_slice_tsc * 1000ull) / hz,
-                            (g_usb_log_slice_max_tsc * 1000000ull) / hz,
-                            /*
-                             * #522: how far the on-stick log LAGS the buffer. The drain is rate
-                             * limited so USB writes cannot stall the dispatch loop, and on a
-                             * two-VM run production outruns that budget -- so the backlog grows
-                             * and whatever is still buffered at power-off is simply lost. That
-                             * silently eats the END of a run, which is where its verdict lives:
-                             * this run's script result and everything the operator did by hand
-                             * were missing, and the log gave no hint that it was incomplete.
-                             * Stating the figure makes a truncated record self-evident.
-                             */
-                            (hype_logbuf_len() > hype_log_sink_flushed(&g_hype_log)
-                                 ? hype_logbuf_len() - hype_log_sink_flushed(&g_hype_log)
-                                 : 0u));
+                            (g_usb_log_slice_max_tsc * 1000000ull) / hz, produced,
+                            (produced > wrote_hype) ? produced - wrote_hype : 0u,
+                            g_usb_log_max_lag, g_usb_log_bursts, g_usb_log_burst_caught,
+                            g_usb_log_burst_stalled);
                         /*
                          * #464/#517: the rollback-failure counters, reported ONLY when nonzero.
                          *
@@ -24949,15 +24973,44 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             if (g_vms[0].host_tsc_hz != 0) {
                 uint64_t now_d = hype_rdtsc();
                 unsigned int have = hype_logbuf_len();
+                {   /* #522: worst backlog the combined sink ever reached, kept whether or
+                     * not a slice is due -- the peak is the number an operator needs to
+                     * judge how much of a run's tail a power-off can cost. */
+                    unsigned int wrote_now = hype_log_sink_flushed(&g_hype_log);
+                    if (have > wrote_now && (have - wrote_now) > g_usb_log_max_lag) {
+                        g_usb_log_max_lag = have - wrote_now;
+                    }
+                }
                 if (hype_log_drain_due(&log_drain, now_d, have)) {
                     unsigned int before = usb_log_flushed_total();
                     unsigned int after;
+                    int made_progress;
+                    int reached_target;
+                    /* #522: a burst's first slice, i.e. this call started it. */
+                    if (g_usb_log_burst_first) g_usb_log_bursts++;
+                    g_usb_log_burst_first = 0;
                     bsp_phase(BSP_PHASE_FLUSH);
                     usb_log_flush_slice();
                     bsp_phase(BSP_PHASE_IDLE);
                     after = usb_log_flushed_total();
-                    hype_log_drain_record(&log_drain, hype_rdtsc(), after > before,
-                                          usb_log_reached_target(log_drain.target));
+                    made_progress = after > before;
+                    reached_target = usb_log_reached_target(log_drain.target);
+                    hype_log_drain_record(&log_drain, hype_rdtsc(), made_progress,
+                                          reached_target);
+                    /*
+                     * #522: a burst slices every 10ms until the sinks reach its target, so a
+                     * burst that ends is either caught up or stalled. Which one it is decides
+                     * the fix -- more budget per slice cannot help a burst that is ending
+                     * because it believes it is done.
+                     */
+                    if (!hype_log_drain_active(&log_drain)) {
+                        g_usb_log_burst_first = 1;
+                        if (reached_target) {
+                            g_usb_log_burst_caught++;
+                        } else {
+                            g_usb_log_burst_stalled++;
+                        }
+                    }
                     /*
                      * #338: say how much of the buffer has actually reached the file. A gap that
                      * grows means the sink is behind or dead -- visible IN the log instead of

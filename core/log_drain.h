@@ -27,6 +27,12 @@ void hype_log_drain_init(hype_log_drain_t *drain, uint64_t now_tsc, uint64_t tsc
 int hype_log_drain_due(hype_log_drain_t *drain, uint64_t now_tsc,
                        unsigned int capture_len);
 
+/* #522: 1 while a burst is in progress. Lets a caller tell a burst's FIRST slice from
+ * its later ones, and so count why each burst ended -- caught up, or stalled. */
+static inline int hype_log_drain_active(const hype_log_drain_t *drain) {
+    return drain != (const hype_log_drain_t *)0 && drain->active;
+}
+
 /* Finish a due slice. A caught-up or stalled burst returns to the long cadence. */
 void hype_log_drain_record(hype_log_drain_t *drain, uint64_t now_tsc,
                            int made_progress, int reached_target);
