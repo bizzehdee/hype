@@ -24527,6 +24527,23 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             g_usb_log_slice_calls, g_usb_log_slice_source_bytes,
                             (g_usb_log_slice_tsc * 1000ull) / hz,
                             (g_usb_log_slice_max_tsc * 1000000ull) / hz);
+                        /*
+                         * #464/#517: the rollback-failure counters, reported ONLY when nonzero.
+                         *
+                         * Both writers count a rollback that could not restore the on-disk shape,
+                         * which is the difference between "this write did not happen" and "run
+                         * fsck before trusting this volume". The counters existed and nothing ever
+                         * printed them, so the one signal those tickets asked to watch could not
+                         * be read off a run. Silent on a healthy volume by design.
+                         */
+                        if (hype_fat_write_rollback_failures() != 0ull ||
+                            hype_exfat_write_rollback_failures() != 0ull) {
+                            hype_debug_print("fw-1 FSROLLBACK: fat32=%llu exfat=%llu -- a rollback "
+                                             "could not restore the on-disk shape; fsck this "
+                                             "volume [#464 #517]\n",
+                                             hype_fat_write_rollback_failures(),
+                                             hype_exfat_write_rollback_failures());
+                        }
                         hype_debug_print("fw-1 USBRD: media=%llu calls/%llu sec | "
                                          "fatvol=%llu calls/%llu sec [#365]\n",
                                          g_usbrd_media, g_usbrd_media_sec, g_usbrd_fatvol,
