@@ -9,8 +9,8 @@ rule set, not a replacement for it.
 ## Task tracking
 
 The **GitHub Project board is the single source of truth for task progress**:
-<https://github.com/users/bizzehdee/projects/3>. It has four Status columns —
-**To Do**, **Doing**, **Done**, **Rejected**. Each task is its own issue in
+<https://github.com/users/bizzehdee/projects/3>. It has five Status columns —
+**To Do**, **Doing**, **On Hold**, **Done**, **Rejected**. Each task is its own issue in
 `bizzehdee/hype` (never combine tasks into one ticket). A ticket carries:
 
 - the short task title (e.g. `GLADDER-5: Fedora Server, single-VM …`);
@@ -40,8 +40,17 @@ live design doc.
   add it plus set its Status yourself if the automation did not. An issue left
   off the board is unfinished work, not a shortcut.
 - **Starting a task** → move it to **Doing**.
-- **Parked task** → add a comment saying why it's parked, then move it back to
-  **To Do**.
+- **Blocked or waiting task** → add a comment saying what it is waiting for,
+  then move it to **On Hold**. Anything that has already been through **Doing**
+  and is now waiting on something outside the working session belongs there:
+  a real-hardware run, an intermittent fault to recur, another ticket to land,
+  a decision, hardware or media that is not to hand.
+  It does **not** go back to **To Do**. To Do means "not started"; a ticket that
+  has been worked on and is waiting is a different state, and collapsing the two
+  loses the fact that work exists and the reason it stopped. It also makes the
+  board lie about how much is untouched.
+  Move it back to **Doing** when the thing it waits for arrives — a stick comes
+  back, the fault fires again, the blocking ticket closes.
 - **Completed with a positive outcome** → move to **Done** (and close the
   issue).
 - **No longer needed, with no outcome** → move to **Rejected**.
