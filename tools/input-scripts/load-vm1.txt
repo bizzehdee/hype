@@ -1,0 +1,37 @@
+# #523 probe: drive vm1 under sustained load PAST t=230s.
+#
+# Both recorded wedges caught vm1 mid package-install, never idle, and the
+# 76b3fb7 run's AP went live=0 at t=230s. A run that stops at 180s with an idle
+# vm1 tests neither condition -- the 60fb26a run ended 50s early and vm1 was
+# still installing packages when power was cut.
+#
+# Every beat carries the GUEST's own uptime, so the log says when the guest
+# stopped rather than when hype last sampled it. Markers are quote-split
+# ("DON''E") so the tty echo of the typed command cannot satisfy its own expect.
+timeout 900000
+fail-if soft lockup
+fail-if detected stalls
+fail-if self-detected stall
+
+expect localhost login:
+send root\n
+expect ~#
+
+send echo VM1-NPROC-$(grep -c ^processor /proc/cpuinfo)\n
+expect VM1-NPROC-2
+
+# IPI counters before load, per CPU column -- the previous wedge left the
+# surviving vCPU idle in HLT, so RES in both columns is the thing to compare.
+send grep -E 'RES|CAL|LOC' /proc/interrupts\n
+expect ~#
+
+# Sustained CD reads from two concurrent jobs, so both vCPUs stay busy without
+# needing taskset (busybox may not carry it). Falls back to a RAM copy if the
+# guest has no /dev/sr0, so the beat never stops for want of a device.
+send for i in $(seq 1 200); do echo VM1-BEAT-$i-up$(cut -d. -f1 /proc/uptime); { dd if=/dev/sr0 of=/dev/null bs=1M count=32 2>/dev/null || dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null; } & { dd if=/dev/sr0 of=/dev/null bs=1M count=32 skip=64 2>/dev/null || dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null; } ; wait; done; echo VM1-LOAD-DON''E\n
+expect VM1-LOAD-DONE
+
+send grep -E 'RES|CAL|LOC' /proc/interrupts\n
+expect ~#
+send echo VM1-SCRIPT-EN''D\n
+expect VM1-SCRIPT-END
