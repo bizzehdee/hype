@@ -12282,8 +12282,20 @@ wait_for_sipi:
         if (ops->vcpu_run(ctx, &info) != 0) {
             fw_1_dev_lock(vm);
             ap_locked = 1;
+            /*
+             * #523: say WHY. A VMX entry failure returns reason bit 63 set with the VM-instruction
+             * error in the low bits, and the message used to discard it -- so an AP that died mid
+             * run left "stopping this vCPU" and nothing to diagnose it with. The guest keeps
+             * believing it has that CPU, which is how vm1 wedged in the middle of a package
+             * install on Intel with its remaining vCPU idle in HLT.
+             */
             hype_debug_print("fw-1 vm%u vCPU %u: vcpu_run failed -- stopping this vCPU "
-                             "[#190]\n", vm_idx, vi);
+                             "(reason=0x%llx%s, guest_rip=0x%llx) [#190 #523]\n", vm_idx, vi,
+                             (unsigned long long)info.reason,
+                             (info.reason & (1ull << 63)) ? " = VM-ENTRY FAILURE, low bits are the "
+                                                            "VM-instruction error"
+                                                          : "",
+                             (unsigned long long)info.guest_rip);
             break;
         }
         /*
