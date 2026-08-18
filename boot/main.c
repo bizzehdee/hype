@@ -24523,10 +24523,23 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         }
                         hype_debug_print(
                             "fw-1 USBFLUSH: slices=%llu source_bytes=%llu total=%llums "
-                            "max=%lluus [#374]\n",
+                            "max=%lluus behind=%uB [#374 #522]\n",
                             g_usb_log_slice_calls, g_usb_log_slice_source_bytes,
                             (g_usb_log_slice_tsc * 1000ull) / hz,
-                            (g_usb_log_slice_max_tsc * 1000000ull) / hz);
+                            (g_usb_log_slice_max_tsc * 1000000ull) / hz,
+                            /*
+                             * #522: how far the on-stick log LAGS the buffer. The drain is rate
+                             * limited so USB writes cannot stall the dispatch loop, and on a
+                             * two-VM run production outruns that budget -- so the backlog grows
+                             * and whatever is still buffered at power-off is simply lost. That
+                             * silently eats the END of a run, which is where its verdict lives:
+                             * this run's script result and everything the operator did by hand
+                             * were missing, and the log gave no hint that it was incomplete.
+                             * Stating the figure makes a truncated record self-evident.
+                             */
+                            (hype_logbuf_len() > hype_log_sink_flushed(&g_hype_log)
+                                 ? hype_logbuf_len() - hype_log_sink_flushed(&g_hype_log)
+                                 : 0u));
                         /*
                          * #464/#517: the rollback-failure counters, reported ONLY when nonzero.
                          *
