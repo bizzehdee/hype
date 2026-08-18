@@ -28,7 +28,17 @@ expect ~#
 # Sustained CD reads from two concurrent jobs, so both vCPUs stay busy without
 # needing taskset (busybox may not carry it). Falls back to a RAM copy if the
 # guest has no /dev/sr0, so the beat never stops for want of a device.
-send for i in $(seq 1 200); do echo VM1-BEAT-$i-up$(cut -d. -f1 /proc/uptime); { dd if=/dev/sr0 of=/dev/null bs=1M count=32 2>/dev/null || dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null; } & { dd if=/dev/sr0 of=/dev/null bs=1M count=32 skip=64 2>/dev/null || dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null; } ; wait; done; echo VM1-LOAD-DON''E\n
+# One directive may carry at most HYPE_INPUT_SCRIPT_MAX_ARG (128) bytes, so the
+# loop is built up in short pieces rather than one long line. The first attempt
+# was a single 300-byte send and hype refused to arm the whole script for it --
+# vm1 then ran unscripted, which is exactly the gap this script exists to close.
+send R=\"dd if=/dev/sr0 of=/dev/null bs=1M count=32\"\n
+expect ~#
+send $R 2>/dev/null || R=\"dd if=/dev/zero of=/dev/null bs=1M count=32\"\n
+expect ~#
+send L() { echo VM1-BEAT-$1-up$(cut -d. -f1 /proc/uptime); $R 2>/dev/null & $R 2>/dev/null; wait; }\n
+expect ~#
+send for i in $(seq 1 200); do L $i; done; echo VM1-LOAD-DON''E\n
 expect VM1-LOAD-DONE
 
 send grep -E 'RES|CAL|LOC' /proc/interrupts\n
