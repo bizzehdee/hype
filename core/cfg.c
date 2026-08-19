@@ -470,7 +470,8 @@ enum {
     H_AUTOSTART = 1u << 4,
     /* #529: bit 5 was H_RESOLUTION. Left as a gap rather than renumbered -- the values are a
      * duplicate-key bitmask, not a wire format, and shifting them buys nothing. */
-    H_CPU_AVG_WINDOW = 1u << 6
+    H_CPU_AVG_WINDOW = 1u << 6,
+    H_LOG_LEVEL = 1u << 7 /* #533 */
 };
 
 static void hype_globals_defaults(hype_cfg_hype_t *h) {
@@ -484,6 +485,12 @@ static void hype_globals_defaults(hype_cfg_hype_t *h) {
      * the exceptions -- both have a real, non-zero default. */
     h->config_version = 1u;
     h->cpu_avg_window_secs = 1u;
+    /*
+     * #533: DEBUG, not zero. HYPE_LOG_ERROR is 0, so zeroing this struct would silently make the
+     * quietest level the default -- and the default has to be the loudest, because it is what a
+     * host with no readable config gets.
+     */
+    h->log_level = HYPE_LOG_DEBUG;
 }
 
 /* `autostart = a, b` -- the list form. `all` / `none` are handled by the caller. */
@@ -563,6 +570,16 @@ static hype_cfg_status_t apply_hype_field(hype_cfg_hype_t *h, unsigned int *seen
             h->autostart = HYPE_CFG_AUTOSTART_LIST;
         }
         *seen |= H_AUTOSTART;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "log_level")) {
+        /* #533: an unparseable level leaves DEBUG in place rather than quieting the log, and is
+         * still reported as malformed so the operator knows the key did nothing. */
+        if (*seen & H_LOG_LEVEL) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_log_level_parse(val, &h->log_level) != 0) {
+            return HYPE_CFG_ERR_BAD_VALUE;
+        }
+        *seen |= H_LOG_LEVEL;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "cpu_avg_window_secs")) {
@@ -1019,6 +1036,14 @@ void hype_cfg_init(hype_cfg_t *out) {
     }
     out->vms = out->vms_default;
     out->vm_cap = HYPE_CFG_MAX_VMS;
+    /*
+     * #533: SAFE DEFAULTS (spec section 4.4), not zeroes.
+     *
+     * Zeroing alone made log_level come out as HYPE_LOG_ERROR, which is 0 -- so a host with no
+     * config, the one whose log matters most, got the QUIETEST level instead of the loudest. Caught
+     * by the line that prints which level is in force, which is the whole reason that line exists.
+     */
+    hype_globals_defaults(&out->hype);
 }
 
 int hype_cfg_append_vm(hype_cfg_t *cfg, const hype_cfg_vm_t *vm) {
@@ -1613,6 +1638,7 @@ static void serialize_hype(hype_cfg_w_t *w, const hype_cfg_hype_t *h) {
     }
     /* #429: always has a real, meaningful value (default 1) -- same "always emit" treatment as
      * config_version, no has_* flag needed. */
+    w_kv(w, "log_level", hype_log_level_name(h->log_level)); /* #533 */
     w_kv_uint(w, "cpu_avg_window_secs", h->cpu_avg_window_secs);
 }
 

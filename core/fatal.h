@@ -2,6 +2,7 @@
 #define HYPE_FATAL_H
 
 #include "efi_types.h"
+#include "log_level.h"
 #include "gop_text.h"
 
 /*
@@ -68,6 +69,28 @@ __attribute__((noreturn)) void hype_fatal(const char *fmt, ...);
  * hype_serial_print()/hype_gop_print(), both themselves exempt.
  */
 void hype_debug_print(const char *fmt, ...);
+
+/*
+ * #533: hype_debug_print() above is unconditional and stays that way -- it is the DEBUG level, and
+ * every one of its ~600 existing call sites keeps today's behaviour rather than being reclassified
+ * by guesswork. What a level buys is the ability to keep the lines an operator needs when something
+ * goes wrong and drop the rest, so the loud ones are marked explicitly with HYPE_LOGF() and the
+ * unmarked remainder is debug by definition. That is documented rather than implicit: an unmarked
+ * line is a debug line.
+ */
+void hype_debug_print_always(const char *fmt, ...);
+void hype_debug_vprint_always(const char *fmt, va_list ap);
+void hype_debug_set_level(hype_log_level_t level);
+hype_log_level_t hype_debug_get_level(void);
+int hype_debug_level_enabled(hype_log_level_t level);
+
+/* Emit at `lvl`. A statement, so it reads like a call and costs nothing when filtered out. */
+#define HYPE_LOGF(lvl, ...)                                                                        \
+    do {                                                                                           \
+        if (hype_debug_level_enabled(lvl)) {                                                       \
+            hype_debug_print_always(__VA_ARGS__);                                                         \
+        }                                                                                          \
+    } while (0)
 
 /* RT-2c: defer hype_debug_print()'s framebuffer push (still renders to the
  * shadow buffer) so a hot loop can batch VRAM flushes on its own cadence via

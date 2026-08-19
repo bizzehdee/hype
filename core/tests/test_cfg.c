@@ -2117,6 +2117,42 @@ static void test_parse_into_refuses_past_bound_storage(void) {
     CHECK_STR("and the first of them is named", "v3", out.skipped_vm_name);
 }
 
+/* #533: hype_cfg_init() must apply SAFE defaults, not zeroes. HYPE_LOG_ERROR is 0, so a plain
+ * memset made the quietest log level the default -- on exactly the hosts with no readable config,
+ * whose logs matter most. */
+static void test_cfg_init_gives_safe_defaults_not_zeroes(void) {
+    hype_cfg_t c;
+    hype_cfg_init(&c);
+    CHECK_INT("log_level defaults to debug, not the zero enum", (int)HYPE_LOG_DEBUG,
+              (int)c.hype.log_level);
+    CHECK_INT("config_version defaults to 1", 1, (int)c.hype.config_version);
+    CHECK_INT("cpu_avg_window_secs defaults to 1", 1, (int)c.hype.cpu_avg_window_secs);
+    CHECK_INT("no VMs yet", 0, (int)c.vm_count);
+    CHECK_INT("but storage is bound", (int)HYPE_CFG_MAX_VMS, (int)c.vm_cap);
+}
+
+/* And the key itself round-trips. */
+static void test_log_level_key(void) {
+    hype_cfg_t c;
+    hype_cfg_result_t r;
+    char buf[2048];
+    snprintf(buf, sizeof(buf), "[hype]\nlog_level = info\n%s", VM_A);
+    r = parse_copy(buf, &c);
+    CHECK_INT("info parses", HYPE_CFG_OK, r.status);
+    CHECK_INT("and takes", (int)HYPE_LOG_INFO, (int)c.hype.log_level);
+
+    snprintf(buf, sizeof(buf), "[hype]\nlog_level = shouty\n%s", VM_A);
+    r = parse_copy(buf, &c);
+    CHECK_INT("a bad level is malformation, like any other bad [hype] value", 1,
+              (int)c.hype.malformed);
+    CHECK_INT("and the level stays at the loudest", (int)HYPE_LOG_DEBUG, (int)c.hype.log_level);
+
+    snprintf(buf, sizeof(buf), "[hype]\n%s", VM_A);
+    r = parse_copy(buf, &c);
+    CHECK_INT("an absent key means debug", (int)HYPE_LOG_DEBUG, (int)c.hype.log_level);
+}
+
+
 int main(void) {
     test_label_from_the_spec_example_is_accepted();
     test_label_absent_leaves_an_empty_string();
@@ -2140,6 +2176,8 @@ int main(void) {
     test_serialize_truncation_is_reported_not_silent();
     test_serialize_disk_section_round_trips_optional_fields();
     test_serialize_hype_section_lists();
+    test_cfg_init_gives_safe_defaults_not_zeroes();
+    test_log_level_key();
     test_count_vms_counts_declarations();
     test_parse_into_accepts_more_vms_than_the_default();
     test_parse_into_refuses_past_bound_storage();

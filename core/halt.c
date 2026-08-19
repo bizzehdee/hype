@@ -1,6 +1,7 @@
 #include <stdarg.h>
 
 #include "fatal.h"
+#include "log_level.h"
 #include "format.h"
 #include "gop.h"
 #include "halt.h"
@@ -175,7 +176,57 @@ void hype_debug_flush_gop(void) {
     }
 }
 
+/*
+ * #533: the level in force, and the filter.
+ *
+ * DEBUG until something says otherwise, which is the whole point: Phase 0 logs everything (it runs
+ * before the config exists), and a host that never manages to read a config keeps logging
+ * everything for the rest of the run.
+ */
+static hype_log_level_t g_hype_log_level = HYPE_LOG_DEBUG;
+
+void hype_debug_set_level(hype_log_level_t level) {
+    g_hype_log_level = level;
+}
+
+hype_log_level_t hype_debug_get_level(void) {
+    return g_hype_log_level;
+}
+
+int hype_debug_level_enabled(hype_log_level_t level) {
+    return hype_log_level_enabled(g_hype_log_level, level);
+}
+
+/*
+ * #533: hype_debug_print() IS the debug level, so it is filtered like one.
+ *
+ * The first attempt left it unconditional and marked only the loud lines, which filtered the 47
+ * classified lines and kept the other ~560 -- exactly backwards, and measured as an error-level run
+ * producing a log the same size as a debug one. An unmarked line is a debug line, and at a quieter
+ * level a debug line is what should go.
+ *
+ * hype_debug_print_always() is the unfiltered path, for the levels above debug (via HYPE_LOGF) and
+ * for hype_fatal(), which must never be filtered: a panic that the log level swallowed would be the
+ * worst bug this file could have.
+ */
 void hype_debug_print(const char *fmt, ...) {
+    va_list ap;
+    if (!hype_log_level_enabled(g_hype_log_level, HYPE_LOG_DEBUG)) {
+        return;
+    }
+    va_start(ap, fmt);
+    hype_debug_vprint_always(fmt, ap);
+    va_end(ap);
+}
+
+void hype_debug_print_always(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    hype_debug_vprint_always(fmt, ap);
+    va_end(ap);
+}
+
+void hype_debug_vprint_always(const char *fmt, va_list ap_in) {
     /*
      * #238 mechanism 1: at 192 this cut every record over 191 chars
      * mid-sentence AND ate its trailing newline, so the next record merged
@@ -191,12 +242,9 @@ void hype_debug_print(const char *fmt, ...) {
      */
     char msg[512];
     int n;
-    va_list ap;
     hype_gop_console_t *gop;
 
-    va_start(ap, fmt);
-    n = hype_vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
+    n = hype_vsnprintf(msg, sizeof(msg), fmt, ap_in);
     (void)hype_format_mark_truncated(msg, sizeof(msg), n);
 
     /*

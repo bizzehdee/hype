@@ -2,6 +2,7 @@
 #define HYPE_CFG_H
 
 #include <stdint.h>
+#include "log_level.h"
 
 /*
  * hype.cfg parser (M1-1, plan.md §5). Parses a whole config file already
@@ -288,6 +289,13 @@ typedef struct {
      * meaningful and directly usable, there is no "unset" state to distinguish.
      */
     unsigned int cpu_avg_window_secs;
+
+    /*
+     * #533: the post-ExitBootServices log level, named not numbered. DEFAULTS TO DEBUG, and every
+     * failure to read or understand the config leaves it there -- a host that cannot read its
+     * config is the host whose log matters most.
+     */
+    hype_log_level_t log_level;
 
     /* Set when the section was present but something in it was rejected: the defaults above apply,
      * and the caller should say so rather than let the operator believe a global took effect. */

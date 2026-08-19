@@ -1215,9 +1215,17 @@ static void fw_1_resolve_vcpus(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigne
     /* SMP-2: set explicitly rather than relying on the zeroed arena, so the value the guest is
      * told has one visible origin. SMT-aware allocation (#479/#190) is what raises it. */
     vmp->threads_per_core = 1u;
-    hype_debug_print("fw-1: vm%u vcpus %u -- %s (requested %u, max %u) [#185]\n", vm_index,
+    /*
+     * #532: this runs TWICE -- once in Phase 0 for every slot, before any config exists, and again
+     * in Phase 1 from the config that decides it. Saying which pass this is stops the provisional
+     * line reading as the final answer: with vcpus = 2 in hype.cfg the Phase 0 line says 1 and the
+     * guest still gets 2, and without the marker that looks like the config being ignored.
+     */
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1: vm%u vcpus %u -- %s (requested %u, max %u)%s [#185]\n", vm_index,
                      applied, hype_cfg_ram_status_str(st), cfg_vcpus,
-                     (unsigned)HYPE_MAX_VCPUS_PER_VM);
+                     (unsigned)HYPE_MAX_VCPUS_PER_VM,
+                     (cfg != 0 && cfg->vm_count != 0u) ? "" : " -- PROVISIONAL, re-resolved in "
+                                                              "Phase 1 once hype.cfg is read");
 }
 
 /*
@@ -3473,7 +3481,7 @@ static void fw_1_reserve_guest_pool(EFI_BOOT_SERVICES *bs, uint64_t usable_ram_b
         if (base != 0ull) {
             if (hype_ram_pool_init(&g_guest_pool, base, want) == HYPE_RAM_POOL_OK) {
                 g_guest_pool_ready = 1;
-                hype_debug_print("fw-1 RAMPOOL: reserved %llu MiB at host-physical 0x%llx "
+                HYPE_LOGF(HYPE_LOG_INFO, "fw-1 RAMPOOL: reserved %llu MiB at host-physical 0x%llx "
                                  "(usable %llu MiB, margin %llu MiB) [#449]\n",
                                  (unsigned long long)(g_guest_pool.size / (1024ull * 1024ull)),
                                  (unsigned long long)base,
@@ -3503,7 +3511,7 @@ static uint64_t fw_1_pool_carve(EFI_BOOT_SERVICES *bs, unsigned vm_index, unsign
     hype_ram_pool_status_t st;
     if (!g_guest_pool_ready) {
         if (bs == 0) {
-            hype_debug_print("fw-1 RAMPOOL: vm%u %s needs %llu MiB but there is no pool and no "
+            HYPE_LOGF(HYPE_LOG_INFO, "fw-1 RAMPOOL: vm%u %s needs %llu MiB but there is no pool and no "
                              "Boot Services -- this VM cannot run [#449 #450]\n",
                              vm_index, what, (unsigned long long)(bytes / (1024ull * 1024ull)));
             return 0ull;
@@ -3512,7 +3520,7 @@ static uint64_t fw_1_pool_carve(EFI_BOOT_SERVICES *bs, unsigned vm_index, unsign
     }
     st = hype_ram_pool_carve(&g_guest_pool, bytes, vm_index, kind, &base, &shortfall);
     if (st != HYPE_RAM_POOL_OK) {
-        hype_debug_print("fw-1 RAMPOOL: vm%u %s carve of %llu MiB FAILED (%s, short by %llu MiB, "
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 RAMPOOL: vm%u %s carve of %llu MiB FAILED (%s, short by %llu MiB, "
                          "%llu MiB left of %llu MiB) [#449]\n",
                          vm_index, what, (unsigned long long)(bytes / (1024ull * 1024ull)),
                          hype_ram_pool_status_str(st),
@@ -3528,7 +3536,7 @@ static uint64_t fw_1_pool_carve(EFI_BOOT_SERVICES *bs, unsigned vm_index, unsign
         }
         return hype_alloc_pages_any_2mb_aligned(bs, bytes);
     }
-    hype_debug_print("fw-1 RAMPOOL: vm%u %s carve %llu MiB @0x%llx (%llu MiB left) [#449]\n",
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 RAMPOOL: vm%u %s carve %llu MiB @0x%llx (%llu MiB left) [#449]\n",
                      vm_index, what, (unsigned long long)(bytes / (1024ull * 1024ull)),
                      (unsigned long long)base,
                      (unsigned long long)(hype_ram_pool_remaining(&g_guest_pool) /
@@ -11816,7 +11824,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
      * nothing to fall back to.
      */
     if (fw_1_read_firmware_images(g_fw_1_combined_host_phys, g_fw_1_combined_size) != 0) {
-        hype_debug_print("fw-1 vm%u: could not re-read the pristine firmware for this Start -- the "
+        HYPE_LOGF(HYPE_LOG_WARN, "fw-1 vm%u: could not re-read the pristine firmware for this Start -- the "
                          "buffer still holds the previous run's image [#451]\n",
                          (unsigned)(vm - g_vms));
     }
@@ -12495,7 +12503,7 @@ wait_for_sipi:
              * believing it has that CPU, which is how vm1 wedged in the middle of a package
              * install on Intel with its remaining vCPU idle in HLT.
              */
-            hype_debug_print("fw-1 vm%u vCPU %u: vcpu_run failed -- stopping this vCPU "
+            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u vCPU %u: vcpu_run failed -- stopping this vCPU "
                              "(reason=0x%llx%s, guest_rip=0x%llx) [#190 #523]\n", vm_idx, vi,
                              (unsigned long long)info.reason,
                              (info.reason & (1ull << 63)) ? " = VM-ENTRY FAILURE, low bits are the "
@@ -13383,7 +13391,7 @@ static void fw_1_phase1_firmware(void) {
     t1 = hype_rdtsc();
     /* #451 item 6: the re-read cost, measured rather than assumed -- it is what a VM Start now
      * pays instead of keeping a per-VM pristine copy in RAM. */
-    hype_debug_print("fw-1: firmware %llu B (VARS %llu + CODE %llu) read through hype's own stack "
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1: firmware %llu B (VARS %llu + CODE %llu) read through hype's own stack "
                      "in %llums, mapped %llu B @0x%llx [#451]\n",
                      (unsigned long long)content_size, (unsigned long long)g_vms[0].vars_size,
                      (unsigned long long)g_vms[0].code_size,
@@ -13398,7 +13406,7 @@ static void fw_1_refuse_vm(unsigned vi) {
         return;
     }
     g_vm_refused[vi] = 1u;
-    hype_debug_print("adm: vm%u WILL NOT RUN -- refused by an isolation check above; every other "
+    HYPE_LOGF(HYPE_LOG_ERROR, "adm: vm%u WILL NOT RUN -- refused by an isolation check above; every other "
                      "VM is unaffected [#531]\n", vi);
 }
 
@@ -13407,13 +13415,28 @@ static void fw_1_phase1_config(void) {
      * writing it before anything else means a later fault here does not cost it. */
     fw_1_write_prev_log();
     load_hype_cfg();
+    /*
+     * #533: apply the level and SAY which one is in force and where it came from -- ALWAYS, before
+     * any line it could filter, including when no config was read at all.
+     *
+     * Unconditional because the absence of this line was itself ambiguous: a reader could not tell
+     * a debug-level host that never printed it from a filtered one. A filtered log that does not
+     * admit it is filtered is #522's mistake in a new place.
+     */
+    hype_debug_set_level(g_hype_cfg.hype.log_level);
+    hype_debug_print_always("log: level '%s' -- %s. Lines below are filtered to it; Phase 0 above "
+                            "is always complete, and a panic is never filtered [#533]\n",
+                            hype_log_level_name(g_hype_cfg.hype.log_level),
+                            g_hype_cfg.vm_count != 0u ? "from hype.cfg"
+                                                      : "the default, because no usable config was "
+                                                        "read");
     fw_1_phase1_firmware();
 
     g_vm_count = g_hype_cfg.vm_count;
     if (g_vm_count == 0u) {
         /* Loud, and with the one thing to do about it. A hypervisor with no machines is not a
          * failure -- it is one waiting to be told what to run. */
-        hype_debug_print("fw-1: NO VMs -- hype found no usable \\hype.cfg, and there is no built-in "
+        HYPE_LOGF(HYPE_LOG_WARN, "fw-1: NO VMs -- hype found no usable \\hype.cfg, and there is no built-in "
                          "default set any more (#532). The dashboard and terminal are up: type "
                          "'create' to define a VM, which is written back to hype.cfg and started "
                          "without a reboot [#486]\n");
@@ -13455,7 +13478,7 @@ static void fw_1_phase1_config(void) {
                                                          g_vm_count);
             unsigned int by_cores = (nsel < 0) ? 0u : (unsigned int)nsel;
             if (by_cores < launchable) {
-                hype_debug_print("adm: %u VM(s) configured but only %u isolated core(s) available "
+                HYPE_LOGF(HYPE_LOG_WARN, "adm: %u VM(s) configured but only %u isolated core(s) available "
                                  "(%u usable CPU(s), BSP reserved) -- capping to %u [#396]\n",
                                  g_vm_count, by_cores, g_cpu_topo.count, by_cores);
                 launchable = by_cores;
@@ -13519,7 +13542,7 @@ static void fw_1_phase1_config(void) {
 
             ir = hype_adm_check_cpu_set(&g_hype_cfg, g_cpu_topo.count);
             if (ir.status != HYPE_ADM_OK) {
-                hype_debug_print("adm: REFUSED -- cpu_set breach (code %d) between vm%u and vm%u: "
+                HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- cpu_set breach (code %d) between vm%u and vm%u: "
                                  "two VMs may never share a core, and a core must exist on this "
                                  "host [#531 section 6g]\n", (int)ir.status, ir.vm_index_a,
                                  ir.vm_index_b);
@@ -13529,14 +13552,14 @@ static void fw_1_phase1_config(void) {
             }
             ir = hype_adm_check_target_disk(&g_hype_cfg);
             if (ir.status != HYPE_ADM_OK) {
-                hype_debug_print("adm: REFUSED -- target_disk/varstore collision between vm%u and "
+                HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- target_disk/varstore collision between vm%u and "
                                  "vm%u: two VMs may never write the same backing file [#531 "
                                  "section 6i]\n", ir.vm_index_a, ir.vm_index_b);
                 fw_1_refuse_vm(ir.vm_index_b != HYPE_ADM_NO_VM ? ir.vm_index_b : ir.vm_index_a);
             }
             ir = hype_adm_check_net_peers(&g_hype_cfg);
             if (ir.status != HYPE_ADM_OK) {
-                hype_debug_print("adm: REFUSED -- net_peers breach (code %d) at vm%u: guest-to-"
+                HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- net_peers breach (code %d) at vm%u: guest-to-"
                                  "guest networking is default-deny and a pairing must name a real "
                                  "NAT peer [#531 section 6e]\n", (int)ir.status, ir.vm_index_a);
                 fw_1_refuse_vm(ir.vm_index_a);
@@ -13555,7 +13578,7 @@ static void fw_1_phase1_config(void) {
              * cores and by pool, so this normally changes nothing; when it does, it says so.
              */
             if (launchable > g_max_vms) {
-                hype_debug_print("adm: %u VM(s) would launch but Phase 0 allocated per-VM state "
+                HYPE_LOGF(HYPE_LOG_WARN, "adm: %u VM(s) would launch but Phase 0 allocated per-VM state "
                                  "for %u -- capping to %u [#450 #341]\n", launchable, g_max_vms,
                                  g_max_vms);
                 launchable = g_max_vms;
@@ -13563,7 +13586,7 @@ static void fw_1_phase1_config(void) {
         }
         for (unsigned int vi = launchable; vi < g_vm_count; vi++) {
             const char *nm = (vi < g_hype_cfg.vm_count) ? g_hype_cfg.vms[vi].name : "(default)";
-            hype_debug_print("adm: vm%u '%s' WILL NOT RUN -- exceeds the physical core/RAM budget "
+            HYPE_LOGF(HYPE_LOG_ERROR, "adm: vm%u '%s' WILL NOT RUN -- exceeds the physical core/RAM budget "
                              "[#396]\n", vi, nm);
         }
         /*
@@ -13867,7 +13890,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_gpa_map_add(&g_fw_1_dma_map, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
                       g_fw_1_combined_size);
 
-    hype_debug_print(
+    HYPE_LOGF(HYPE_LOG_INFO, 
         "fw-1: launching real OVMF at cs_base=0x%llx rip=0x%llx (guest-physical [0x%llx,0x100000000) -> "
         "host-physical 0x%llx)\n",
         (unsigned long long)reset_cs_base, (unsigned long long)reset_rip,
@@ -13955,7 +13978,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         vm->in_tail_len = 0;
         vm->in_tail_head = 0;
         hype_input_runner_init(&vm->in_runner, &vm->in_script, vm->in_started_ms);
-        hype_debug_print("fw-1 SCRIPT vm%u: armed, %u directive(s) -- driving this guest\n",
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCRIPT vm%u: armed, %u directive(s) -- driving this guest\n",
                          (unsigned)(vm - g_vms), vm->in_script.count);
     }
 
@@ -14960,7 +14983,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  (unsigned)(vm - g_vms),
                                  g_script_seen[(unsigned)(vm - g_vms)],
                                  g_script_fed[(unsigned)(vm - g_vms)], vm->in_script_armed);
-                hype_debug_print(
+                HYPE_LOGF(HYPE_LOG_INFO, 
                     "fw-1 VMSTAT vm%u: state=%d uptime=%llus cpu=%u%% roots=[0x%llx,0x%llx]\n",
                     (unsigned)(vm - g_vms), (int)vm->lifecycle,
                     (unsigned long long)(vm->stat_uptime_ms / 1000u), (unsigned)vm->stat_cpu_pct,
@@ -20145,7 +20168,7 @@ static void load_input_script(hype_fw_vm_t *vm, unsigned vm_index) {
 
     bv = fw_1_boot_volume();
     if (bv == 0) {
-        hype_debug_print("input: vm%u no boot volume -- no scripted input\n", vm_index);
+        HYPE_LOGF(HYPE_LOG_ERROR, "input: vm%u no boot volume -- no scripted input\n", vm_index);
         return;
     }
     if (hype_fs_lookup(bv, pathbuf, &f) != 0) {
@@ -20169,13 +20192,13 @@ static void load_input_script(hype_fw_vm_t *vm, unsigned vm_index) {
     if (pr.status != HYPE_INPUT_PARSE_OK) {
         /* Loud and specific, with the line number, and NOT half-armed: a script that
          * partly ran would type a fragment of a command into a root shell. */
-        hype_debug_print("input: vm%u %s PARSE ERROR line %u: %s -- refusing to arm\n", vm_index,
+        HYPE_LOGF(HYPE_LOG_WARN, "input: vm%u %s PARSE ERROR line %u: %s -- refusing to arm\n", vm_index,
                          pname, pr.line, hype_input_parse_status_str(pr.status));
         vm->in_script.count = 0;
         return;
     }
     vm->in_script_armed = 1;
-    hype_debug_print("input: vm%u armed %s (%llu bytes, %u directive(s))\n", vm_index, pname,
+    HYPE_LOGF(HYPE_LOG_INFO, "input: vm%u armed %s (%llu bytes, %u directive(s))\n", vm_index, pname,
                      (unsigned long long)sz, vm->in_script.count);
 }
 
@@ -20203,7 +20226,7 @@ static void fw_1_report_script_verdict(hype_fw_vm_t *vm, unsigned vm_index, uint
     }
     reason = hype_input_runner_reason(&vm->in_runner);
 
-    hype_debug_print("fw-1 SCRIPT vm%u: %s %s (%u directive(s), %llums)\n", vm_index,
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCRIPT vm%u: %s %s (%u directive(s), %llums)\n", vm_index,
                      (v == HYPE_INPUT_VERDICT_PASS) ? "PASS" : "FAIL",
                      hype_input_reason_str(reason), vm->in_script.count,
                      (unsigned long long)(now_ms - vm->in_started_ms));
@@ -20228,14 +20251,14 @@ static void fw_1_report_script_verdict(hype_fw_vm_t *vm, unsigned vm_index, uint
             n++;
             if (n == sizeof(buf) - 1u) {
                 buf[n] = '\0';
-                hype_debug_print("fw-1 SCRIPT vm%u:   at line %u: %s\n", vm_index,
+                HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCRIPT vm%u:   at line %u: %s\n", vm_index,
                                  vm->in_runner.detail_line, buf);
                 n = 0;
             }
         }
         if (n != 0) {
             buf[n] = '\0';
-            hype_debug_print("fw-1 SCRIPT vm%u:   at line %u: %s\n", vm_index,
+            HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCRIPT vm%u:   at line %u: %s\n", vm_index,
                              vm->in_runner.detail_line, buf);
         }
 
@@ -20254,13 +20277,13 @@ static void fw_1_report_script_verdict(hype_fw_vm_t *vm, unsigned vm_index, uint
                 n++;
                 if (n == sizeof(buf) - 1u) {
                     buf[n] = '\0';
-                    hype_debug_print("fw-1 SCRIPT vm%u:   tail| %s\n", vm_index, buf);
+                    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCRIPT vm%u:   tail| %s\n", vm_index, buf);
                     n = 0;
                 }
             }
             if (n != 0) {
                 buf[n] = '\0';
-                hype_debug_print("fw-1 SCRIPT vm%u:   tail| %s\n", vm_index, buf);
+                HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCRIPT vm%u:   tail| %s\n", vm_index, buf);
             }
         }
     }
@@ -20308,7 +20331,7 @@ static int fw_1_script_drain_send(hype_fw_vm_t *vm, unsigned vm_index, hype_gues
                 vm->in_send_stall_since_ms = now_ms;
             }
             if (now_ms - vm->in_send_stall_since_ms >= (uint64_t)HYPE_SCRIPT_SEND_STALL_MS) {
-                hype_debug_print("fw-1 SCRIPT vm%u: guest never drained its input -- %u of %u "
+                HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCRIPT vm%u: guest never drained its input -- %u of %u "
                                  "byte(s) of this %s undelivered; failing the script rather than "
                                  "sending a truncated command [#301]\n",
                                  vm_index, (unsigned)(vm->in_send_len - vm->in_send_pos),
@@ -20348,7 +20371,7 @@ static int fw_1_script_wait_for_key_reads(hype_fw_vm_t *vm, unsigned vm_index,
         vm->in_send_read_stall_since_ms = now_ms;
     }
     if (now_ms - vm->in_send_read_stall_since_ms >= (uint64_t)HYPE_SCRIPT_SEND_STALL_MS) {
-        hype_debug_print("fw-1 SCRIPT vm%u: guest did not read %llu delivered sendkey "
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCRIPT vm%u: guest did not read %llu delivered sendkey "
                          "scancode(s); failing the script rather than reporting a false PASS "
                          "[#93]\n", vm_index,
                          vm->in_send_read_goal - read);
@@ -20414,7 +20437,7 @@ static void fw_1_script_step(hype_fw_vm_t *vm, unsigned vm_index, hype_guest_uar
                                                     (unsigned)sizeof(codes));
                 unsigned int j;
                 if (n == 0u) {
-                    hype_debug_print("fw-1 SCRIPT vm%u: sendkey cannot type byte 0x%02x -- "
+                    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCRIPT vm%u: sendkey cannot type byte 0x%02x -- "
                                      "no Set-1 mapping; stopping this sendkey [#284]\n",
                                      vm_index, (unsigned)act.data[i]);
                     break;
@@ -20538,13 +20561,13 @@ static void load_hype_cfg(void) {
 
     bv = fw_1_boot_volume();
     if (bv == 0) {
-        hype_debug_print("cfg: NO BOOT VOLUME -- hype could not locate or mount the volume it "
+        HYPE_LOGF(HYPE_LOG_ERROR, "cfg: NO BOOT VOLUME -- hype could not locate or mount the volume it "
                          "booted from, so it cannot read its own config, firmware images or write "
                          "its own log either. No VMs will run [#450 #532]\n");
         return;
     }
     if (hype_fs_lookup(bv, "\\hype.cfg", &f) != 0) {
-        hype_debug_print("cfg: no \\hype.cfg on the boot volume -- NO VMs will run (the volume mounted "
+        HYPE_LOGF(HYPE_LOG_WARN, "cfg: no \\hype.cfg on the boot volume -- NO VMs will run (the volume mounted "
                          "fine; this is the ABSENT case). Type 'create' at the terminal [#450 #532]\n");
         return;
     }
@@ -20556,7 +20579,7 @@ static void load_hype_cfg(void) {
         return;
     }
     if (hype_fs_read_at(&f, 0ull, g_hype_cfg_text, (unsigned int)sz) != 0) {
-        hype_debug_print("cfg: \\hype.cfg found (%llu bytes) but UNREADABLE through hype's own "
+        HYPE_LOGF(HYPE_LOG_WARN, "cfg: \\hype.cfg found (%llu bytes) but UNREADABLE through hype's own "
                          "stack -- no VMs will run [#450 #532]\n", (unsigned long long)sz);
         return;
     }
@@ -20595,8 +20618,9 @@ static void load_hype_cfg(void) {
         return;
     }
 
-    hype_debug_print("cfg: loaded \\hype.cfg (%llu bytes) -- %u VM(s)\n",
+    HYPE_LOGF(HYPE_LOG_INFO, "cfg: loaded \\hype.cfg (%llu bytes) -- %u VM(s)\n",
                      (unsigned long long)sz, g_hype_cfg.vm_count);
+
     /*
      * #222: say when lines were not understood. Unknown keys and sections are now retained rather
      * than fatal (spec §4.1), which is what makes the format extendable -- but silence about them
@@ -21501,7 +21525,7 @@ static int fw_1_start_new_vm(unsigned vi) {
                            (uint8_t)sel, (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                            (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
                            g_vms[0].host_tsc_hz, fw_1_ap_main, (void *)FW_1_AP_ARG(vi, cv));
-        hype_debug_print("fw-1 CREATE: vm%u vCPU %u on apic=%d -> rc=%d [#486]\n", vi, cv, sel, rc);
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 CREATE: vm%u vCPU %u on apic=%d -> rc=%d [#486]\n", vi, cv, sel, rc);
         if (rc == 0) {
             started++;
         } else if (cv == 0u) {
@@ -21555,7 +21579,7 @@ static void term_create_begin(void) {
     }
     hype_vm_wizard_begin(&g_wizard);
     g_wizard_active = 1;
-    hype_debug_print("fw-1 CREATE: wizard started (%u VM(s) now, %u slot(s) available) [#486]\n",
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 CREATE: wizard started (%u VM(s) now, %u slot(s) available) [#486]\n",
                      g_vm_count, g_max_vms - g_vm_count);
     term_create_show();
 }
@@ -21652,7 +21676,7 @@ static void term_create_finish(void) {
     g_wizard_active = 0;
 
     hype_vm_wizard_summary(&g_wizard, summary, sizeof(summary));
-    hype_debug_print("fw-1 CREATE: vm%u written to hype.cfg -- %s [#486]\n", ni, summary);
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 CREATE: vm%u written to hype.cfg -- %s [#486]\n", ni, summary);
     if (fw_1_start_new_vm(ni) == 0) {
         term_resultf("created vm%u '%s' -- written to hype.cfg and STARTED", ni,
                      g_hype_cfg.vms[ni].name);
@@ -22496,7 +22520,7 @@ static void usb_log_flush_limit(unsigned int max_source_bytes) {
         g_usb_log_flush_fail_streak++;
         if (!g_usb_log_flush_failed) {
             g_usb_log_flush_failed = 1;
-            hype_debug_print("usb-log: FLUSH FAILED -- retrying each interval; \\HYPE.LOG is "
+            HYPE_LOGF(HYPE_LOG_ERROR, "usb-log: FLUSH FAILED -- retrying each interval; \\HYPE.LOG is "
                              "INCOMPLETE until a retry succeeds. hype itself is unaffected; this "
                              "is the USB block path (xHCI/MSC).\n");
         }
@@ -22507,7 +22531,7 @@ static void usb_log_flush_limit(unsigned int max_source_bytes) {
                              "needed.\n", HYPE_USBLOG_FAIL_STREAK_MAX);
         }
     } else if (g_hype_log_ready && g_usb_log_flush_fail_streak != 0u) {
-        hype_debug_print("usb-log: flush RECOVERED after %u failed interval(s) -- \\HYPE.LOG is "
+        HYPE_LOGF(HYPE_LOG_WARN, "usb-log: flush RECOVERED after %u failed interval(s) -- \\HYPE.LOG is "
                          "growing again (a gap may precede this line).\n",
                          g_usb_log_flush_fail_streak);
         g_usb_log_flush_fail_streak = 0u;
@@ -22553,7 +22577,7 @@ static void usb_log_flush_limit(unsigned int max_source_bytes) {
             if (!g_vm_log_ready[vi]) continue;
             if (hype_log_sink_flush_budget(&g_vm_log[vi], max_source_bytes) != 0) {
                 if (hype_fs_file_identity_error(&g_vm_log[vi].file)) {
-                    hype_debug_print(
+                    HYPE_LOGF(HYPE_LOG_ERROR, 
                         "usb-log: VM%u LOG STOPPED -- FAT chain identity changed; "
                         "the writer rejected the metadata update to prevent a cross-link [#377]\n",
                         vi);
@@ -22822,7 +22846,7 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
         g_ap_vmm_page = (uint8_t (*)[4096])(uintptr_t)hype_alloc_pages_any(bs, (UINTN)slots);
         hype_guest_ram_zero(g_ap_vmm_page, (uint64_t)slots * 4096ull);
     }
-    hype_debug_print("fw-1: per-VM aux arena for %u VM(s) allocated [#394]\n", n);
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1: per-VM aux arena for %u VM(s) allocated [#394]\n", n);
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
@@ -23037,7 +23061,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         if (g_max_vms < 2u) {
             g_max_vms = 2u; /* the built-in default is two VMs; never allocate below it */
         }
-        hype_debug_print("fw-1: Phase 0 sizes per-VM state for %u VM(s) -- %u usable core(s), BSP "
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1: Phase 0 sizes per-VM state for %u VM(s) -- %u usable core(s), BSP "
                          "reserved (decision 33) [#450]\n", g_max_vms, usable);
     }
     /* #450: the VM count and the dashboard's default view come from the config, which is now
@@ -23051,7 +23075,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                        g_vm_count, (unsigned long long)vm_pages);
         }
         hype_guest_ram_zero(g_vms, (uint64_t)vm_pages * 4096ull);
-        hype_debug_print("fw-1: g_vms arena %u VM(s) x %llu B, page-aligned @%p [#394]\n",
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1: g_vms arena %u VM(s) x %llu B, page-aligned @%p [#394]\n",
                          g_max_vms, (unsigned long long)sizeof(hype_fw_vm_t), (void *)g_vms);
     }
     fw_alloc_vm_aux_arena(SystemTable->BootServices);
@@ -23094,7 +23118,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         for (vi = 0; vi < g_max_vms; vi++) {
             fw_1_resolve_vcpus(&g_vms[vi], &g_hype_cfg, vi);
         }
-        hype_debug_print("fw-1: vCPU pools sized for %u vCPU(s) -- the host's bound across up to "
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1: vCPU pools sized for %u vCPU(s) -- the host's bound across up to "
                          "%u VM(s) [#185 #450]\n", total_vcpus, g_max_vms);
         hype_svm_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
         hype_vmx_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
@@ -23195,7 +23219,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                              g_gop_modes[pick].width, g_gop_modes[pick].height,
                              (unsigned)HYPE_GOP_TARGET_WIDTH, (unsigned)HYPE_GOP_TARGET_HEIGHT);
         } else {
-            hype_debug_print("TERM-7: GOP mode set to %ux%u -- nearest of %u offered to the "
+            HYPE_LOGF(HYPE_LOG_INFO, "TERM-7: GOP mode set to %ux%u -- nearest of %u offered to the "
                              "%ux%u target [#529]\n", g_gop_modes[pick].width,
                              g_gop_modes[pick].height, g_gop_mode_count,
                              (unsigned)HYPE_GOP_TARGET_WIDTH, (unsigned)HYPE_GOP_TARGET_HEIGHT);
@@ -25055,7 +25079,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 (unsigned int)g_hype_ap_c_alive,
                                 (unsigned int)g_fw_1_ap_vmm_ok);
                             if (rc != 0) {
-                                hype_debug_print(
+                                HYPE_LOGF(HYPE_LOG_ERROR, 
                                     "fw-1 AP[vm%u vCPU %u]: START FAILED (rc=%d) -- not reusing "
                                     "the trampoline; what is already up keeps running "
                                     "[#414]\n", vi, cv, rc);
@@ -25114,7 +25138,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      */
 #if HYPE_RUN_GUEST_ON_AP
     (void)vm;
-    hype_debug_print("fw-1: guest dispatched to the AP (dedicated core); BSP owns console + "
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1: guest dispatched to the AP (dedicated core); BSP owns console + "
                      "%llus bursts drained in %llums/%u-byte USB log slices (#239 #374 #377)\n",
                      (unsigned long long)HYPE_USBLOG_WRITE_INTERVAL_SECS,
                      (unsigned long long)HYPE_USBLOG_SLICE_INTERVAL_MS,
@@ -25661,7 +25685,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         (g_vm_ready != 0 && g_vm_ready[wi] != g_snap_ready[wi])) {
                         uint64_t hzw = g_vms[0].host_tsc_hz;
                         g_snap_hit[wi] = 1;
-                        hype_debug_print(
+                        HYPE_LOGF(HYPE_LOG_ERROR, 
                             "fw-1 CORRUPT vm%u at watch+%llums: name %llx->%llx label %llx->%llx "
                             "vcpus %u->%u ready %u->%u [#513]\n", wi,
                             hzw ? (hype_rdtsc() - snap_t0) * 1000ull / hzw : 0ull,
@@ -25738,7 +25762,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         if (have > wrote && (have - wrote) > 4096u &&
                             (have - last_reported) > 65536u) {
                             last_reported = have;
-                            hype_debug_print("usb-log: BEHIND -- logbuf has %u bytes, file has "
+                            HYPE_LOGF(HYPE_LOG_WARN, "usb-log: BEHIND -- logbuf has %u bytes, file has "
                                              "%u (#338)\n", have, wrote);
                         }
                     }
