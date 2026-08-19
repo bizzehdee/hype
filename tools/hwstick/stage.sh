@@ -71,18 +71,20 @@ for cfg in sorted(glob.glob('tools/hwstick/*.cfg')):
             sys.exit("STAGE FAILED: %s names %s, which is not on the stick" % (cfg, m.strip()))
     print(os.path.basename(cfg), "-- every kernel present")
 PY
-# 4. every install_media and target_disk a config names must be there too.
+# 4. every install_media and target_disk a config names, checked -- but they are NOT equally
+# serious, and the first version of this check got that wrong by calling both fatal.
 #
-# stage.sh checked `kernel =` paths and not these, which is the wrong half: a missing kernel
-# is a config hype refuses loudly, but a missing install_media or target_disk costs a whole
-# cold-boot cycle to discover. hype does NOT invent a disk -- "refusing to substitute a scratch
-# disk" is correct behaviour, because silently inventing one is how an install lands somewhere
-# nobody chose -- so an absent file means that VM simply does not run, and the ticket riding on
-# it produces no evidence at all.
+#   install_media MISSING  -> fatal. A `boot = installer` VM has no boot media at all, so that
+#                             guest cannot start and the ticket riding on it produces nothing.
+#   target_disk   MISSING  -> a WARNING. hype logs "refusing to substitute a scratch disk" and
+#                             the guest still boots from its install media and runs normally --
+#                             verified: a rehearsal with no vdisks reached "Mounting boot media:
+#                             ok" on both guests. What is lost is only the ability to INSTALL to
+#                             disk, which most of these runs do not exercise.
 #
-# These are CHECKED, not created. Their size is the operator's call (it has to hold a real
-# install, and this stick is FAT32, where nothing is sparse), and guessing it is exactly the
-# kind of substitution the rest of this file refuses to make.
+# Neither is created. A disk's size is the operator's call (it has to hold a real install, and
+# this stick is FAT32, where nothing is sparse and no file may reach 4 GiB), and guessing it is
+# exactly the kind of substitution the rest of this file refuses to make.
 python3 - "$DST" <<'PY'
 import re, sys, os, glob
 dst = sys.argv[1]
@@ -95,17 +97,21 @@ for cfg in sorted(glob.glob('tools/hwstick/*.cfg')):
             rel = m.strip().replace('\\', '/').lstrip('/')
             if not os.path.exists(os.path.join(dst, rel)):
                 missing.append((os.path.basename(cfg), key, m.strip()))
-if missing:
-    print("STAGE INCOMPLETE -- these VMs will NOT run:")
-    for cfg, key, path in missing:
+fatal = [m for m in missing if m[1] == 'install_media']
+warn = [m for m in missing if m[1] != 'install_media']
+if warn:
+    print("WARNING -- no target disk, so these VMs cannot INSTALL (they still boot their media):")
+    for cfg, key, path in warn:
         print("  %-16s %-14s %s" % (cfg, key, path))
-    print()
-    print("Put them on the stick before booting. The ISOs are the Alpine install media;")
-    print("the target disks must exist because hype refuses to substitute a scratch disk.")
-    print("  cp <alpine.iso> %s/iso/test.iso" % dst)
-    print("  cp <alpine.iso> %s/iso/vm1.iso" % dst)
-    print("  truncate -s 2G %s/hype/disks/vm0.img   # size is yours to choose; FAT32 caps at 4G" % dst)
-    print("  truncate -s 2G %s/hype/disks/vm1.img" % dst)
+    print("  create with e.g.  truncate -s 2G %s/hype/disks/vm0.img" % dst)
+    print("  (size is yours to choose; this stick is FAT32, so nothing is sparse and 4 GiB is the")
+    print("   per-file ceiling)")
+if fatal:
+    print("STAGE FAILED -- no boot media, so these VMs cannot start at all:")
+    for cfg, key, path in fatal:
+        print("  %-16s %-14s %s" % (cfg, key, path))
+    print("  cp <alpine.iso> %s/iso/<name>.iso" % dst)
     sys.exit(1)
-print("every install_media and target_disk named by a config is present")
+if not missing:
+    print("every install_media and target_disk named by a config is present")
 PY
