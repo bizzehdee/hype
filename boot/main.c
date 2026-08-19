@@ -5702,6 +5702,53 @@ static void fw_1_dev_unlock(hype_fw_vm_t *vm) {
     hype_ticket_lock_release(&vm->dev_lock_owner);
 }
 
+/*
+ * #538: stop THIS VM because of something its GUEST did, and let the host and every other VM
+ * carry on.
+ *
+ * Every caller of this was a hype_fatal(), which halts the machine. That was defensible while
+ * hype ran one firmware guest: an OVMF that faults early means something is deeply wrong and
+ * there is nothing useful left running. It stopped being defensible for two reasons.
+ *
+ * Several VMs are the normal case now, so one guest's fault took down every other guest with it --
+ * an availability failure caused by a VM that is supposed to be isolated, which is section 6g's
+ * concern pointed the other way. And #534's microtest suites make a FAULTING guest an EXPECTED
+ * outcome: those guests exist to fail when hype is wrong, so the more effective the test, the
+ * wider the blast radius. A suite that cannot survive a failing member has to be run one VM at a
+ * time, which is exactly the per-run cost #534 exists to remove.
+ *
+ * Loudness is not lost. Every caller logs its own decode at ERROR first, which is the part that
+ * says what happened; this adds the verdict -- which VM stopped, that the guest caused it, and
+ * that nothing else stopped with it. What is lost is a halted machine to inspect, and the log now
+ * outlives the fault instead, which is the more useful artifact on a serial-less host anyway.
+ *
+ * The shared-device lock IS held at every call site -- the loop holds it everywhere outside the
+ * guest and releases it only across VM entry -- so release it, rather than park with it held and
+ * leave this VM's own APs spinning on a lock whose holder is never coming back.
+ *
+ * Returning is already a supported outcome: run_fw_1_test() returns on the booted-and-idle path
+ * too, and its caller parks the core (cli;hlt). A stopped VM's dedicated core stops with it.
+ */
+static void fw_1_guest_fault_stop(hype_fw_vm_t *vm, const char *what) {
+    unsigned vi = (unsigned)(vm - g_vms);
+    const char *who = (vm->label != 0 && vm->label[0] != '\0')
+                          ? vm->label
+                          : ((vm->name != 0 && vm->name[0] != '\0') ? vm->name : "?");
+
+    vm->lifecycle = HYPE_VM_OFF;
+    HYPE_LOGF(HYPE_LOG_ERROR,
+              "fw-1 vm%u '%s' STOPPED -- %s. The GUEST caused this, not the host: hype, the "
+              "dashboard and every other VM keep running. %s [#538]\n",
+              vi, who, what,
+              vm->kernel_boot ? "Restart it from the terminal to re-read its kernel image."
+                              : "Restart it from the terminal to boot it again.");
+    fw_1_dev_unlock(vm);
+    /* The give-up diagnostics and this verdict must reach the screen, not sit in the deferred
+     * GOP buffer -- on a serial-less host that screen is the only channel there is. */
+    hype_debug_set_gop_deferred(0);
+    hype_debug_flush_gop();
+}
+
 /* SMP-6: set by an AP vCPU loop while it owns its vCPU; read by the BSP's INIT/SIPI path. */
 static uint8_t (*g_ap_apdata_dumped)[HYPE_MAX_VCPUS_PER_VM];
 /* SMP-6: AP LAPIC timer accounting. The AP programs its timer (measured: it faults in
@@ -14853,10 +14900,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
 
         if (++total_exits > HYPE_FW_1_MAX_EXITS) {
-            hype_fatal("fw-1: exceeded %llu VM-exits without reaching a stable idle -- guest stuck "
-                       "(last reason=0x%llx guest_rip=0x%llx)",
-                       (unsigned long long)HYPE_FW_1_MAX_EXITS, (unsigned long long)info.reason,
-                       (unsigned long long)info.guest_rip);
+            HYPE_LOGF(HYPE_LOG_ERROR,
+                      "fw-1: exceeded %llu VM-exits without reaching a stable idle -- guest stuck "
+                      "(last reason=0x%llx guest_rip=0x%llx)\n",
+                      (unsigned long long)HYPE_FW_1_MAX_EXITS, (unsigned long long)info.reason,
+                      (unsigned long long)info.guest_rip);
+            fw_1_guest_fault_stop(vm, "its guest never reached a stable idle within the exit budget");
+            return;
         }
         /* FW-1e: keep the first (riskiest) VMRUN traced, then silence the
          * per-exit CLGI/VMLOAD/VMRUN spam -- real OVMF does thousands of
@@ -17625,10 +17675,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 continue;
             }
             if (msr_rc != 0) {
-                hype_fatal("fw-1: unhandled guest MSR access msr=0x%x %s (guest_rip=0x%llx)",
+                HYPE_LOGF(HYPE_LOG_ERROR,
+                          "fw-1: unhandled guest MSR access msr=0x%x %s (guest_rip=0x%llx)\n",
                            (unsigned int)vmm_get_msr_index(kind, ctx),
                            (info.qualification & 1ull) ? "write" : "read",
                            (unsigned long long)info.guest_rip);
+                fw_1_guest_fault_stop(vm, "its guest touched an MSR hype does not model");
+                return;
             }
             continue;
         }
@@ -18116,7 +18169,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * same reason: without the bytes, "unhandled" cannot be told apart
                      * from "undecodable" or "the register model refused the offset", and
                      * three separate causes wear one message. */
-                    hype_fatal("fw-1: unhandled AHCI ABAR MMIO at guest-physical 0x%llx (%s, "
+                    HYPE_LOGF(HYPE_LOG_ERROR,
+                              "fw-1: unhandled AHCI ABAR MMIO at guest-physical 0x%llx (%s, "
                                "guest_rip=0x%llx, decode_assist_bytes=%u insn=%s %02x %02x %02x "
                                "%02x %02x %02x %02x %02x)",
                                (unsigned long long)ahci_npf.guest_phys_addr,
@@ -18126,6 +18180,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                insn ? insn[0] : 0, insn ? insn[1] : 0, insn ? insn[2] : 0,
                                insn ? insn[3] : 0, insn ? insn[4] : 0, insn ? insn[5] : 0,
                                insn ? insn[6] : 0, insn ? insn[7] : 0);
+                    fw_1_guest_fault_stop(vm, "its guest made an AHCI register access hype does not model");
+                    return;
                 }
             }
             /* M5-7 (#196): virtio-blk BAR4 MMIO -> the VALID-3, GPA-translated
@@ -18148,8 +18204,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                 HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
                             continue;
                         }
-                        hype_fatal("fw-1: unhandled NVMe MMIO at guest-physical 0x%llx",
+                        HYPE_LOGF(HYPE_LOG_ERROR,
+                                  "fw-1: unhandled NVMe MMIO at guest-physical 0x%llx\n",
                                    (unsigned long long)npf.guest_phys_addr);
+                        fw_1_guest_fault_stop(vm, "its guest made an NVMe register access hype does not model");
+                        return;
                     }
                 }
             }
@@ -18171,8 +18230,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                             &g_fw_1_dma_map, vblk_bar, insn) == 0) {
                         continue;
                     }
-                    hype_fatal("fw-1: unhandled virtio-blk MMIO at guest-physical 0x%llx",
+                    HYPE_LOGF(HYPE_LOG_ERROR,
+                              "fw-1: unhandled virtio-blk MMIO at guest-physical 0x%llx\n",
                                (unsigned long long)npf.guest_phys_addr);
+                    fw_1_guest_fault_stop(vm, "its guest made a virtio-blk register access hype does not model");
+                    return;
                 }
             }
             /*
@@ -18222,8 +18284,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             continue;
                         }
                     }
-                    hype_fatal("fw-1: unhandled disk-slot-%u MMIO at guest-physical 0x%llx (#329)",
+                    HYPE_LOGF(HYPE_LOG_ERROR,
+                              "fw-1: unhandled disk-slot-%u MMIO at guest-physical 0x%llx (#329)\n",
                                slot, (unsigned long long)npf.guest_phys_addr);
+                    fw_1_guest_fault_stop(vm, "its guest made a disk register access hype does not model");
+                    return;
                 }
                 if (routed) {
                     continue; /* handler advanced RIP */
@@ -18339,7 +18404,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (kind == HYPE_VMM_KIND_VMX) {
                     hype_vmx_vcpu_dump_ept_violation(ctx);
                 }
-                hype_fatal("fw-1: undecodable MMIO NPF on vm%u at guest-physical 0x%llx (%s, "
+                HYPE_LOGF(HYPE_LOG_ERROR,
+                          "fw-1: undecodable MMIO NPF on vm%u at guest-physical 0x%llx (%s, "
                            "guest_rip=0x%llx, decode_assist_bytes=%u insn=%s %02x %02x %02x %02x "
                            "%02x %02x %02x %02x) -- cannot absorb",
                            (unsigned int)(vm - g_vms), (unsigned long long)npf.guest_phys_addr,
@@ -18348,6 +18414,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                            insn ? (insn_n ? "(assist)" : "(ptwalk)") : "(FETCH FAILED)",
                            insn ? insn[0] : 0, insn ? insn[1] : 0, insn ? insn[2] : 0, insn ? insn[3] : 0,
                            insn ? insn[4] : 0, insn ? insn[5] : 0, insn ? insn[6] : 0, insn ? insn[7] : 0);
+                fw_1_guest_fault_stop(vm, "hype could not decode the instruction behind its guest's MMIO fault");
+                return;
             }
         }
 
@@ -18737,8 +18805,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * zeros here would be a third.
              *
              * So on a backend without the snapshot, say what IS known -- from the
-             * vendor-neutral accessors -- and stop. hype_fatal() is noreturn, so
-             * this returns nothing to the SVM path below.
+             * vendor-neutral accessors -- and stop. #538: the stop is now this VM's, not the
+             * host's, and it returns rather than halting -- so the `return` is load-bearing,
+             * without it control would fall into the SVM-only dump below on VMX.
              */
             if (!vmm_get_debug_state(kind, ctx, &dbg)) {
                 hype_debug_print("fw-1: exc vec=%llu err=0x%llx rip=0x%llx cr3=0x%llx\n",
@@ -18748,18 +18817,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  (unsigned long long)vmm_get_cr3(kind, ctx));
                 hype_debug_print("fw-1: exc regs/exitinfo2/exitintinfo/nrip = n/a on this backend "
                                  "(SVM VMCB fields, no VMCS counterpart) -- not printing zeros\n");
-                hype_fatal("fw-1: unhandled guest exception vec=%llu err=0x%llx rip=0x%llx "
+                HYPE_LOGF(HYPE_LOG_ERROR,
+                          "fw-1: unhandled guest exception vec=%llu err=0x%llx rip=0x%llx "
                            "cr3=0x%llx (svm_regs=n/a)",
                            (unsigned long long)vmm_exception_vector(kind, ctx, info.reason),
                            (unsigned long long)info.qualification,
                            (unsigned long long)info.guest_rip,
                            (unsigned long long)vmm_get_cr3(kind, ctx));
+                fw_1_guest_fault_stop(vm, "its guest took an exception nothing in it handled");
+                return;
             }
 
-            /* Core fault summary. Printed FIRST, via hype_debug_print()
-             * (not hype_fatal(), which halts and would make the deeper
-             * dumps below unreachable), so it survives even if a later
-             * dereference itself faults.
+            /* Core fault summary. Printed FIRST, separately from the verdict
+             * (which stops the VM and returns, making the deeper dumps below
+             * unreachable), so it survives even if a later dereference itself
+             * faults.
              *
              * CRITICAL (APM Vol 2 24593 Rev 3.44 §15.12.15): for an
              * intercepted #PF the intercept is tested BEFORE CR2 is
@@ -18867,11 +18939,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                   (unsigned long long)dbg.rsp);
             }
 
-            hype_fatal("fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr3=0x%llx rip=0x%llx faultaddr=0x%llx",
+            HYPE_LOGF(HYPE_LOG_ERROR,
+                      "fw-1: exc vec=%llu err=0x%llx cr0=0x%llx cr3=0x%llx rip=0x%llx faultaddr=0x%llx\n",
                        (unsigned long long)vmm_exception_vector(kind, ctx, info.reason),
                        (unsigned long long)info.qualification, (unsigned long long)dbg.cr0,
                        (unsigned long long)dbg.cr3, (unsigned long long)dbg.rip,
                        (unsigned long long)dbg.exitinfo2);
+            fw_1_guest_fault_stop(vm, "its guest took an unrecoverable exception");
+            return;
         }
 
         if (vmm_reason_is_hlt(kind, info.reason)) {
@@ -19251,6 +19326,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                           g_fw_1_lapic.timer_irq_pending, g_fw_1_lapic.timer_in_service);
     }
 
+    if (booted && vm->kernel_boot) {
+        /*
+         * #538: a kernel VM reaching a stable idle is the SUCCESS path -- a microtest that has
+         * reported its verdict and halted. Do not describe it as a firmware boot: it has no DXE,
+         * no BDS and no boot manager, and claiming otherwise is the same wrong-subject defect the
+         * give-up message below had.
+         */
+        HYPE_LOGF(HYPE_LOG_INFO,
+                  "fw-1 vm%u: guest kernel '%s' is idle after %llu productive VM-exits and %llu "
+                  "chars of console output (forwarded above). For a microtest that means it ran to "
+                  "its verdict and halted -- the verdict itself is a MICRO PASS/FAIL line in this "
+                  "VM's log, and its ABSENCE is a failure [#538 #536]\n",
+                  (unsigned)(vm - g_vms), vm->kernel_path ? vm->kernel_path : "(unset)",
+                  (unsigned long long)productive_exits, (unsigned long long)console_chars);
+        return;
+    }
     if (booted) {
         hype_debug_print(
             "fw-1: real OVMF BOOTED -- full DXE/BDS (LAPIC timer, PCI/ECAM, PS/2, AHCI CD-ROM), %llu "
@@ -19264,9 +19355,25 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         return;
     }
 
-    hype_fatal("fw-1: real OVMF exited the initial dispatch loop (reason=0x%llx qual=0x%llx guest_rip=0x%llx)",
-               (unsigned long long)info.reason, (unsigned long long)info.qualification,
-               (unsigned long long)info.guest_rip);
+    /*
+     * #538: the guest left the dispatch loop without ever reaching a stable idle. Exit reason
+     * 0x7f is the common one -- an architectural SHUTDOWN, i.e. a triple fault.
+     *
+     * The old message said "real OVMF" unconditionally, which is false for a `boot = kernel` VM
+     * that has no firmware in its path at all, and a diagnostic that names the wrong subject
+     * sends the reader looking in the wrong place. Name what this VM actually boots.
+     */
+    HYPE_LOGF(HYPE_LOG_ERROR,
+              "fw-1: %s exited the dispatch loop without reaching a stable idle (reason=0x%llx "
+              "qual=0x%llx guest_rip=0x%llx)%s\n",
+              vm->kernel_boot ? "the guest kernel" : "the guest firmware",
+              (unsigned long long)info.reason, (unsigned long long)info.qualification,
+              (unsigned long long)info.guest_rip,
+              (info.reason == 0x7full) ? " -- reason 0x7f is an architectural SHUTDOWN, i.e. a "
+                                         "triple fault inside the guest"
+                                       : "");
+    fw_1_guest_fault_stop(vm, "its guest exited the dispatch loop without reaching a stable idle");
+    return;
     }
 }
 

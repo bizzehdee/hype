@@ -2372,6 +2372,46 @@ isn't lost.
     survive, and a microtest still cannot use the media path real guests use --
     which is what retired ISO-2 in #452.
 
+46. **A guest fault stops that VM, not the host -- decided: uniformly, for firmware and
+    kernel guests alike (2026-08-19, #538).**
+
+    **What forced the decision.** Ten `hype_fatal()` calls in the FW-1 dispatch loop were
+    reachable from things a GUEST does: an unmodelled MSR, unmodelled AHCI/NVMe/virtio/disk
+    register access, an MMIO fault hype cannot decode, an exception the guest does not handle,
+    exhausting the exit budget, and leaving the loop without ever reaching idle. `hype_fatal()`
+    halts the machine. That was written when hype ran one firmware guest, where a faulting OVMF
+    means nothing useful is left running.
+
+    Two things made it wrong. Several VMs are the normal case now, so one guest's fault took every
+    other guest down with it -- an availability failure caused by a VM that is supposed to be
+    isolated, which is section 6g's concern pointed the other way. And #534's microtest suites make
+    a faulting guest an EXPECTED outcome: those guests exist to fail when hype is wrong, so the
+    more effective the test, the wider the blast radius. Measured: one deliberately faulting
+    micro-kernel panicked the host and took a healthy second VM with it before that VM could report
+    its own verdict.
+
+    **The rule.** A fault hype attributes to the guest stops THAT VM: lifecycle OFF, one ERROR line
+    naming the VM, what its guest did, and that nothing else stopped. Its dedicated core parks. The
+    host, the dashboard and every other VM continue, and the VM can be restarted from the terminal.
+    A fault hype attributes to ITSELF -- a VM-entry failure, an invalid VMCS/VMCB -- stays fatal:
+    that means hype is broken, and continuing would be reporting results from a hypervisor that
+    cannot be trusted to produce them.
+
+    **Uniform, deliberately.** A firmware guest gets the same treatment as a kernel guest. A
+    wedged OVMF is not more fatal to the host than a wedged kernel, and a split rule ("fatal for
+    firmware, survivable for kernels") would mean the blast radius of a bug depended on which boot
+    mode happened to trip it. The previous split -- fatal for everything -- was never chosen; it is
+    what existed because only firmware guests existed.
+
+    **What is given up.** A halted machine to inspect. The log outlives the fault instead, which on
+    a serial-less host is the more useful artifact anyway: `hype_fatal()`'s flush competes with the
+    on-stick drain at exactly the moment the machine is stopping, and #522 is the standing evidence
+    that the end of a run is the part most likely to be missing.
+
+    **Rejected: absorbing the fault and continuing the guest.** It converts a located failure into
+    a guest that limps with wrong data -- the "benign default MMIO catch-all" bug class this project
+    has already been bitten by (#311). Stopping is a verdict; absorbing is a guess.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
