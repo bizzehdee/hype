@@ -31,7 +31,7 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/png_write.c \
              core/fatal.c core/strutil.c core/guest_ram.c core/mp.c core/linux_boot.c \
              core/admission.c core/file_io.c core/guest_mem.c core/logbuf.c \
-             core/clockfacts.c core/io_histogram.c core/log_drain.c core/ram_pool.c core/render_budget.c core/scancode_queue.c core/ticket_lock.c \
+             core/clockfacts.c core/io_histogram.c core/log_drain.c core/ram_pool.c core/vm_create.c core/render_budget.c core/scancode_queue.c core/ticket_lock.c \
              core/host_pci.c core/host_pci_hw.c core/ahci_host.c core/ahci_host_hw.c \
              core/gpt.c core/iso_stream.c core/fat.c core/file_range.c core/fs_ops.c core/ntfs.c core/ext2_alloc.c core/jbd2.c core/ext_jalloc.c core/ext.c core/ext_write.c core/blk_image.c core/blk_qcow2.c core/nvme_host.c core/nvme_host_hw.c core/blk_backend.c core/blk_phys.c core/blk_phys_hw.c core/phys_guard.c \
              core/kbd_decode.c core/vt_screen.c core/vt_render.c core/dashboard.c core/vm_lifecycle.c core/vm_isolation.c core/input_script.c core/input_runner.c core/vm_watchdog.c core/cmdparse.c \
