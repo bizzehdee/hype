@@ -934,11 +934,24 @@ typedef struct hype_fw_vm {
     volatile uint16_t sipi_cs_selector[HYPE_MAX_VCPUS_PER_VM];
     volatile uint8_t sipi_apply_on_self[HYPE_MAX_VCPUS_PER_VM];
     /*
-     * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what
-     * its guest is told. 1 until SMT-aware core allocation lands (#479, #190) -- and honestly
-     * so, since today a granted core supplies exactly one dispatchable thread.
+     * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what its
+     * guest is told. Set by fw_1_place_vcpus_on_threads() from where this VM's vCPUs actually
+     * landed (#560), so it is a report and never a guess.
      */
     unsigned threads_per_core;
+    /*
+     * #557: the IRQ0-starvation episode, PER VM.
+     *
+     * These were function-level statics in run_fw_1_test(), which runs once per VM and now runs
+     * CONCURRENTLY on several cores. So every VM shared one episode: any VM that dumped set the
+     * one-shot and silenced the others, and each VM's tick delivery reset every other VM's
+     * timer. On the bare-metal AMD run that is exactly what happened -- TIMER-STARVE fired once,
+     * for the Alpine guest with IRQ0 masked, and never for the guest that was actually starved.
+     * The diagnostic built to name this bug is what hid it.
+     */
+    uint64_t starve_irq0_since;
+    unsigned long long starve_pit_irqs_at_arm;
+    int starve_dumped;
     hype_vcpu_ctx_t *vcpu[HYPE_MAX_VCPUS_PER_VM];
     /*
      * #535: `boot = kernel` -- this VM boots a raw kernel image with no guest firmware. Set in
@@ -14518,19 +14531,48 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  "dropped=%llu\n",
                                  g_fw_1_uart.tx_written, g_fw_1_uart.tx_dropped,
                                  g_fw_1_uart2.tx_written, g_fw_1_uart2.tx_dropped);
-                hype_debug_print("fw-1 PITROUTE: pic_delivered=%llu apic_delivered=%llu "
-                                 "apic_refused=%llu | RTE[2]=0x%llx RTE[0]=0x%llx mIMR=0x%x "
-                                 "mIRR=0x%x mISR=0x%x | PIT0 mode=%u reload=%u\n",
-                                 (unsigned long long)pit_irqs,
-                                 (unsigned long long)pit_irqs_apic,
-                                 (unsigned long long)pit_apic_refused,
-                                 (unsigned long long)g_fw_1_ioapic.rte[2],
-                                 (unsigned long long)g_fw_1_ioapic.rte[0],
-                                 (unsigned int)g_fw_1_pic.master.imr,
-                                 (unsigned int)g_fw_1_pic.master.irr,
-                                 (unsigned int)g_fw_1_pic.master.isr,
-                                 (unsigned int)g_fw_1_pit.channels[0].mode,
-                                 (unsigned int)g_fw_1_pit.channels[0].reload);
+                {
+                    /*
+                     * #557: defer/overwrite belong on this line.
+                     *
+                     * A stuck mISR is the whole story of an IRQ0 starvation -- the delivery gate
+                     * requires both ISRs clear -- but the line said nothing about HOW it got
+                     * stuck. hype_pic_emu_acknowledge() SETS ISR and hands the vector to
+                     * vmm_request_interrupt(), which may only defer it; if that deferred slot is
+                     * then overwritten, the injection is lost while the ISR stays set. The guest
+                     * never runs the handler, so it never EOIs, so nothing ever clears it, and
+                     * every later tick is refused forever.
+                     *
+                     * The bare-metal AMD run showed overwrite=422 on the same boot as a frozen
+                     * pic_delivered=1156 with mISR=0x1. That is a correlation, not a proof, and
+                     * putting both numbers on one line is what lets the next run decide it.
+                     *
+                     * HOST-WIDE, and labelled so. g_int_vintr_defer / g_int_defer_overwrite are
+                     * file-global in the SVM backend, summed over every vCPU of every VM, so
+                     * they cannot say WHICH guest lost an injection -- the counter that would
+                     * identify the culprit is exactly the one that is not per-vCPU. Printing
+                     * them beside per-VM numbers without saying so would invent an attribution
+                     * that does not exist.
+                     */
+                    unsigned long long ei_ = 0, df_ = 0, wn_ = 0, ov_ = 0;
+                    (void)vmm_get_int_diag(kind, &ei_, &df_, &wn_, &ov_);
+                    hype_debug_print("fw-1 PITROUTE vm%u: pic_delivered=%llu apic_delivered=%llu "
+                                     "apic_refused=%llu | RTE[2]=0x%llx RTE[0]=0x%llx mIMR=0x%x "
+                                     "mIRR=0x%x mISR=0x%x | PIT0 mode=%u reload=%u | HOST-WIDE "
+                                     "defer=%llu overwrite=%llu [#557]\n",
+                                     (unsigned)(vm - g_vms),
+                                     (unsigned long long)pit_irqs,
+                                     (unsigned long long)pit_irqs_apic,
+                                     (unsigned long long)pit_apic_refused,
+                                     (unsigned long long)g_fw_1_ioapic.rte[2],
+                                     (unsigned long long)g_fw_1_ioapic.rte[0],
+                                     (unsigned int)g_fw_1_pic.master.imr,
+                                     (unsigned int)g_fw_1_pic.master.irr,
+                                     (unsigned int)g_fw_1_pic.master.isr,
+                                     (unsigned int)g_fw_1_pit.channels[0].mode,
+                                     (unsigned int)g_fw_1_pit.channels[0].reload,
+                                     df_, ov_);
+                }
                 hype_debug_print("fw-1 TIMERHIST: pit_irq0=%llu lapic_irq=%llu ahci_irq=%llu | "
                                  "PIT0 mode=%u reload=%u counter=%u | LAPIC lvt=0x%x(%s) init=%u cur=%u | "
                                  "svr=0x%x dcr=0x%x ever_armed=0x%x | "
@@ -15591,35 +15633,37 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * The episode re-arms whenever a PIT IRQ0 is actually delivered
          * (pit_irqs advances) or the IRR bit clears. Pure diagnostic. */
         {
-            static uint64_t irq0_raised_since = 0;
-            static unsigned long long pit_irqs_at_arm = 0;
-            static int starve_dumped = 0;
+            /* #557: per-VM, not function-static -- see hype_fw_vm_t. */
+            uint64_t *const irq0_raised_since = &vm->starve_irq0_since;
+            unsigned long long *const pit_irqs_at_arm = &vm->starve_pit_irqs_at_arm;
+            int *const starve_dumped = &vm->starve_dumped;
             int irq0_in_irr = (g_fw_1_pic.master.irr & 0x01u) != 0;
             uint64_t now_sv = hype_rdtsc();
-            if (pit_irqs != pit_irqs_at_arm) {
+            if (pit_irqs != *pit_irqs_at_arm) {
                 /* A tick was delivered -- reset the episode. */
-                pit_irqs_at_arm = pit_irqs;
-                irq0_raised_since = 0;
-                starve_dumped = 0;
+                *pit_irqs_at_arm = pit_irqs;
+                *irq0_raised_since = 0;
+                *starve_dumped = 0;
             }
             if (!irq0_in_irr) {
-                irq0_raised_since = 0;
-                starve_dumped = 0;
+                *irq0_raised_since = 0;
+                *starve_dumped = 0;
             } else if (g_fw_1_host_tsc_hz != 0) {
-                if (irq0_raised_since == 0) {
-                    irq0_raised_since = now_sv;
-                } else if (!starve_dumped &&
-                           now_sv - irq0_raised_since >= 2ULL * g_fw_1_host_tsc_hz) {
+                if (*irq0_raised_since == 0) {
+                    *irq0_raised_since = now_sv;
+                } else if (!*starve_dumped &&
+                           now_sv - *irq0_raised_since >= 2ULL * g_fw_1_host_tsc_hz) {
                     hype_vmm_intr_state_t sv;
                     unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
-                    starve_dumped = 1;
+                    *starve_dumped = 1;
                     vmm_get_intr_state(kind, ctx, &sv);
                     (void)vmm_get_int_diag(kind, &ei, &df, &wn, &ov);
                     hype_debug_print(
-                        "fw-1 TIMER-STARVE: IRQ0 undelivered >2s | IF=%d shadow=0x%llx can_accept=%d "
+                        "fw-1 TIMER-STARVE vm%u: IRQ0 undelivered >2s | IF=%d shadow=0x%llx can_accept=%d "
                         "pending=%d/vec0x%x eventinj=0x%llx | mIRR=0x%x mISR=0x%x mIMR=0x%x "
                         "sIRR=0x%x sISR=0x%x sIMR=0x%x | ahci p_is=0x%x p_ie=0x%x p_ci=0x%x | "
                         "defer=%llu overwrite=%llu | pit_irqs=%llu ahci_irqs=%llu\n",
+                        (unsigned)(vm - g_vms),
                         (int)((sv.rflags >> 9) & 1u), (unsigned long long)sv.interrupt_shadow,
                         sv.can_accept, sv.pending_valid, (unsigned int)sv.pending_vector,
                         (unsigned long long)sv.eventinj,
