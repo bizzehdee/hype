@@ -10,8 +10,8 @@ unsigned int hype_smp_pack(const unsigned int *per_core, unsigned int ncores,
         return 0;
     }
     for (vi = 0; vi < nvms; vi++) {
-        out[vi].vcpus = 0u;
         out[vi].cores = 0u;
+        out[vi].vcpus = 0u;
         out[vi].first_core = ci;
         out[vi].threads_per_core = 1u;
     }
@@ -21,39 +21,51 @@ unsigned int hype_smp_pack(const unsigned int *per_core, unsigned int ncores,
 
     for (vi = 0; vi < nvms; vi++) {
         unsigned int n = want[vi] ? want[vi] : 1u;
-        unsigned int got = 0u, cores = 0u, widest = 0u;
+        unsigned int cores = 0u, narrowest = 0u;
 
-        if (max_vcpus_per_vm != 0u && n > max_vcpus_per_vm) {
-            n = max_vcpus_per_vm;
-        }
         out[vi].first_core = ci;
         /*
-         * A core with 0 threads ends the run: select_cores cannot emit one, but trusting that
-         * silently would turn a malformed table into an infinite loop.
+         * Take exactly the cores asked for. A core with 0 threads ends the run: select_cores
+         * cannot emit one, but trusting that silently would turn a malformed table into an
+         * infinite loop.
          */
-        while (got < n && ci < ncores && per_core[ci] > 0u) {
-            if (per_core[ci] > widest) {
-                widest = per_core[ci];
+        while (cores < n && ci < ncores && per_core[ci] > 0u) {
+            if (narrowest == 0u || per_core[ci] < narrowest) {
+                narrowest = per_core[ci];
             }
-            got += per_core[ci];
             cores++;
             ci++; /* spent whole: never shared with the next VM */
         }
+        if (narrowest == 0u) {
+            narrowest = 1u;
+        }
         /*
-         * A VM never gets MORE vCPUs than it asked for. The last core may have more threads
-         * than the VM still needed; those threads stay idle and belong to this VM, which is the
-         * point -- they are not offered to anyone else.
+         * Respect the per-VM logical-CPU ceiling by dropping CORES, not by half-using one. A
+         * core whose threads this VM cannot use is hardware taken from another VM for nothing,
+         * and the cores dropped here are handed back for the next VM to take.
          */
-        if (got > n) {
-            got = n;
+        if (max_vcpus_per_vm != 0u) {
+            unsigned int max_cores = max_vcpus_per_vm / narrowest;
+            if (max_cores == 0u) {
+                max_cores = 1u; /* one core is the floor: a VM with no core cannot run */
+            }
+            if (cores > max_cores) {
+                ci -= (cores - max_cores);
+                cores = max_cores;
+            }
+            /*
+             * A ceiling is not a shortage. The VM was given everything it is ALLOWED, so it fit;
+             * counting it as a miss would cap the launchable prefix and stop later VMs starting
+             * for no reason. Only running out of cores is a miss.
+             */
+            if (n > max_cores) {
+                n = max_cores;
+            }
         }
-        if (widest > got) {
-            widest = got;
-        }
-        out[vi].vcpus = got;
         out[vi].cores = cores;
-        out[vi].threads_per_core = widest ? widest : 1u;
-        if (got < n && fit == nvms) {
+        out[vi].threads_per_core = narrowest;
+        out[vi].vcpus = cores * narrowest;
+        if (cores < n && fit == nvms) {
             fit = vi; /* first VM that did not fit; cores are spent in order, so this is the cap */
         }
     }

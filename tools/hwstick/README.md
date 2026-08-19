@@ -79,33 +79,34 @@ the wrong reason. Both layouts are worth running — the config is designed to f
 The logs are on the stick because this machine has no serial port. They contain invalid UTF-8, so
 read them with `LC_ALL=C grep -a`.
 
-## Why only three VMs, and why five vCPUs now fit
+## Why only three VMs
 
-A VM is granted **whole physical cores** with the BSP's core reserved, and it gets **all of those
-cores' threads** as vCPUs (#560). So the VM count is bounded by cores, and the vCPU count by
-threads:
+**A vCPU is a physical core** (#564). `vcpus = N` costs exactly N cores on any host, with the BSP's
+core reserved — so the budget is simply:
 
-| machine | logical | physical | RAM | max VMs | max vCPUs |
-|---|---|---|---|---|---|
-| AMD laptop | 8 | **4** | 12 GB | **3** | **6** |
-| Intel i5-13420H | 12 | 8 | 8 GB | 7 | 12 |
+| machine | logical | physical | RAM | max vCPUs |
+|---|---|---|---|---|
+| AMD laptop | 8 | **4** | 12 GB | **3** |
+| Intel i5-13420H | 12 | 8 | 8 GB | 7 |
+| Ryzen 5950X | 32 | 16 | — | 15 |
 
-This stick runs 2 + 2 + 1 = **five vCPUs on three cores**, and it did not fit the AMD laptop before
-#560: a vCPU used to cost a whole core, so the budget was three vCPUs in total and the two Alpine
-guests could not both start. There were two configs for that reason; there is now one, and it runs
-on both machines.
+This stick is 1 + 1 + 1 = **three cores, exactly the AMD laptop's budget**.
 
-It fits **either way**, which is what makes one config safe. If sibling detection fails (#378's
-all-zero `EFI_CPU_PHYSICAL_LOCATION` table, repaired from CPUID `0x8000001E` on AMD), hype falls
-back to treating every logical processor as a single-threaded core — eight of them, seven for
-guests — and five vCPUs still fits. Which case happened is in the log:
+**SMT is a bonus, not extra vCPUs.** Each Alpine asks for one core and its guest still reports
+**2 CPUs** on this laptop, so #527's bar (`Brought up 1 node, 2 CPUs`) is met — at a third of what
+the same evidence used to cost. With SMT off in the BIOS each would report 1 CPU and the config
+would **still fit**, which is the point of pricing in cores: this file cannot stop fitting because
+of someone's firmware setting.
+
+Which case happened is in the log:
 
 ```
-fw-1 SMP: vm0 placed 2 vCPU(s) on 1 whole physical core(s), 2 thread(s)/core   <- SMT proven
-fw-1 SMP: placed 5 vCPU(s) on 3 whole physical core(s) ... siblings known
+fw-1 SMP: vm0 granted 1 whole physical core(s) -> 2 logical CPU(s), 2 thread(s)/core (SMT bonus)
+fw-1 SMP: 3 whole physical core(s) granted -> 6 logical CPU(s) ... siblings known
 ```
 
-`siblings UNPROVEN (one thread per core)` is the fallback, and is not a failure.
+`siblings UNPROVEN (one thread per core)` is the #378 fallback, and is not a failure — the guests
+simply lose the bonus.
 
 The first version of this stick listed seven VMs. The AMD run dropped four of them — including both
 High-priority reproductions it existed to carry — and RAM was never close (pool 7012 of 10165 MiB

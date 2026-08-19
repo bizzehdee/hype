@@ -114,7 +114,7 @@ kinds are ignored (§4.1).
 | key | type / domain | default | notes |
 |---|---|---|---|
 | `config_version` | int | `1` | §4.2 |
-| `host_cpu_budget` | cpu-list (`0-3`, `0,1,2`) | all cores | **physical cores** hype may dispatch VMs on (plan.md §5 `cpu_set` is the per-VM subset of this). A listed core is granted whole, so on an SMT host each entry supplies all of that core's hardware threads (plan.md §10 decision 40) |
+| `host_cpu_budget` | cpu-list (`0-3`, `0,1,2`) | all cores | **physical cores** hype may dispatch VMs on (plan.md §5 `cpu_set` is the per-VM subset of this). A listed core is granted whole, so on an SMT host each entry supplies all of that core's hardware threads to the one VM that owns it (plan.md §10 decisions 40, 47) |
 | `default_net_mode` | `none` \| `nat` | `none` | per-VM `net_mode` overrides |
 | `dashboard_default_view` | `dashboard` \| `vm:<name>` | `dashboard` | which view the GOP shows at boot (TERM) |
 | `autostart` | `all` \| `none` \| list | `all` | which VMs to Start at boot (plan.md §6h/§9) |
@@ -131,8 +131,8 @@ as the default display name.
 | key | type / domain | default | notes |
 |---|---|---|---|
 | `label` | free text | the section `<name>` | **human display name surfaced in every management interface** (dashboard NAME column, TUI, future SSH mgmt). Lets a friendly "Windows 11 Workstation" show for id `win11`. |
-| `vcpus` | int, **1 .. host hardware threads** | `1` | ≥1; counts **hardware threads**, not physical cores (plan.md §10 decision 40). Admission caps at the total threads of the cores in `host_cpu_budget` / `cpu_set` (§10) |
-| `cpu_set` | cpu-list | (unpinned) | optional explicit pin subset of `host_cpu_budget`, naming **physical cores**. Each listed core is granted whole, so on an SMT host `cpu_set` of 2 cores supports `vcpus = 4`. `vcpus` below the available thread count is legal; the surplus threads stay idle and admission reports it |
+| `vcpus` | int, **1 .. host physical cores − 1** | `1` | ≥1; counts **PHYSICAL CORES**, not threads (plan.md §10 decision 47). The guest sees `vcpus × threads_per_core` logical CPUs — 2 per core with SMT, 1 without — so SMT is a bonus it was never promised. Admission caps at the cores in `host_cpu_budget` / `cpu_set`, with the BSP's core reserved (§10) |
+| `cpu_set` | cpu-list | (unpinned) | optional explicit pin subset of `host_cpu_budget`, naming **physical cores**. Each listed core is granted whole, and since a vCPU *is* a core the entry count must equal `vcpus` — the operator is naming exactly the cores asked for. SMT does not enter it |
 | `cpu_mode` | `dedicated` \| `shared` | `dedicated` | scheduling tier (plan.md §3, §10 decision 39). `dedicated` = exclusive 1:1 pinning, no scheduler on the dispatch path. `shared` = time-sliced onto a pooled set of cores, so the host may run more vCPUs than it has cores. A core may never be in both a dedicated `cpu_set` and the shared pool — admission refuses it (§6i). |
 | `isolation_group` | free text | the section `<name>` | trust group for core sharing. VMs naming the same group may share cores and SMT siblings freely, with no cross-VM µarch flush. Distrusting groups never occupy one physical core simultaneously, and L1D + IBPB are flushed when a core changes group. Enforced by allocating **whole physical cores** to one group at a time, **not** by disabling SMT (plan.md §10 decision 40) — so the pool's allocation quantum is a core, and many small distrusting groups leave sibling threads idle. Naming one group for mutually-trusting VMs restores full thread density. The default — each VM its own group — is **default-deny**: configuring nothing gives the strict behaviour. Only meaningful with `cpu_mode = shared`. |
 | `mem_mb` | int, **1 .. host usable MB** | — (required) | ≥1 MB; admission caps at host RAM (§10) |
@@ -313,7 +313,7 @@ correct for when they exist.)
 | hard disks / VM (`disks`) | 0 .. `HYPE_CFG_MAX_DISKS_PER_VM` (~24) | parser cap; guest bus limits (AHCI ≤ 32 ports, PCI slots) at admission |
 | optical / VM (`cdroms`) | 0 .. `HYPE_CFG_MAX_CDROMS_PER_VM` (~4) | parser cap |
 | NICs / VM (`nics`) | 0 .. `HYPE_CFG_MAX_NICS_PER_VM` (~8) | parser cap |
-| `vcpus` | 1 .. host hardware **thread** count | parser ≥1; **admission** caps at the total threads of the cores in `host_cpu_budget` (a VM owns whole cores and gets all their threads, plan.md §10 decisions 40/47) |
+| `vcpus` | 1 .. host **physical core** count | parser ≥1; **admission** caps at the cores in `host_cpu_budget` with the BSP's reserved. A vCPU is a physical core; SMT multiplies what the guest SEES, not what it costs (plan.md §10 decision 47) |
 | `mem_mb` | 1 .. host usable RAM (MB) | parser ≥1; **admission** caps at real free RAM |
 
 The parser accepts any value ≥ the minimum and ≤ the compile cap; the
@@ -395,7 +395,8 @@ size_gb = 8
 ; --- a Windows VM: mixed disks (1 SATA system + 2 NVMe data), 1 NIC, installer CD ---
 [vm.win11]
 label = Windows 11 Workstation
-vcpus = 4
+vcpus = 4                             ; four PHYSICAL cores; on an SMT host the
+                                      ; guest sees eight logical CPUs
 cpu_set = 3-6
 mem_mb = 8192
 boot = installer
@@ -475,8 +476,8 @@ switch = lab-lan
 - **Parser (CONFIG-2):** single-file well-formedness + each field in-domain +
   §4 tolerance. No cross-entity checks.
 - **Admission (ADM / §6i):** cross-VM — `cpu_set` within `host_cpu_budget` and
-  non-overlapping (or intentionally shared), `vcpus` ≤ the hardware threads of
-  the cores in `cpu_set`, total `mem_mb` ≤ host RAM, `disks`
+  non-overlapping (or intentionally shared), `vcpus` == the number of cores in
+  `cpu_set` (a vCPU is a core), total `mem_mb` ≤ host RAM, `disks`
   reference existing `[disk.*]`, no two VMs claim the same physical drive /
   partition, `net_peers` reference real VMs.
 
@@ -499,9 +500,14 @@ suits it.
 
 ## 12. Resolved / remaining
 
-Resolved 2026-08-16 (plan.md §10 decision 40): `cpu_set` and `host_cpu_budget`
-name **physical cores**, `vcpus` counts **hardware threads**, and a listed core
-is granted whole — so on an SMT host two cores support four vCPUs.
+Resolved 2026-08-19 (plan.md §10 decision 47, #564): `cpu_set` and
+`host_cpu_budget` name **physical cores**, **`vcpus` also counts physical
+cores**, and a listed core is granted whole — so on an SMT host one core is one
+vCPU that the guest sees as two logical CPUs. SMT is a bonus, not extra vCPUs.
+
+Superseded: an earlier pass (2026-08-16, #560) read decision 40 as making
+`vcpus` count hardware threads. It does not; decision 40 fixes the allocation
+quantum only. Any statement that two cores support four vCPUs predates this.
 
 Resolved this pass: one-file + `[hype]` (§2); `bus` defaults per `os_hint`
 (§5.5); `install_media` kept, extra optical reserved as `[disk.*] bus=ahci-atapi`

@@ -91,10 +91,8 @@ static void test_cpu_set_must_match_vcpus(void) {
 
     /*
      * One cpu_set entry per vCPU -- the same rule admission enforces as CPU_SET_COUNT_MISMATCH.
-     * This test PINS THE CURRENT BEHAVIOUR, which #561 says is wrong: §6i's rule is
-     * `vcpus <= total threads of the listed cores`, so on an SMT host one core really does hold
-     * two vCPUs and "one core for two vcpus is refused" below must become an acceptance. Left
-     * failing-if-changed on purpose, so fixing #561 cannot pass silently with a stale test.
+     * Correct on every host, SMT or not, because a vCPU IS a physical core (§10 decision 47):
+     * asking for two cores while naming one is a real mismatch.
      */
     CHECK("one core for two vcpus is refused", hype_vm_wizard_feed(&w, "3", 0) == HYPE_VMW_CPU_SET);
     CHECK("and says why", w.have_error);

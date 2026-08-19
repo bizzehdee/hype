@@ -276,14 +276,9 @@ hype_vmw_step_t hype_vm_wizard_feed(hype_vm_wizard_t *w, const char *line,
                 wiz_err(w, "cpu_set must be like 2, 2-3 or 2,4 with cores under 256");
                 return w->step;
             } else if (w->vm.cpu_set_count != w->vm.vcpus) {
-                /*
-                 * The same rule admission enforces (HYPE_ADM_ERR_CPU_SET_COUNT_MISMATCH): one
-                 * cpu_set entry per vCPU. That is the PRE-SMT form of §6i's rule, which is
-                 * `vcpus <= total hardware threads of the listed cores` -- since #560 a VM's
-                 * vCPUs may be siblings of one named core, so this refuses pinning that hype
-                 * performs happily when no cpu_set is given. Tracked as #561; both sites change
-                 * together, and both must keep spending the same currency.
-                 */
+                /* The same rule admission enforces (HYPE_ADM_ERR_CPU_SET_COUNT_MISMATCH): one
+                 * cpu_set entry per vCPU, because a vCPU IS a physical core (§10 decision 47)
+                 * and cpu_set names cores. */
                 wiz_err(w, "cpu_set must name exactly as many cores as vcpus");
                 w->vm.cpu_set_count = 0u;
                 return w->step;

@@ -940,6 +940,13 @@ typedef struct hype_fw_vm {
      */
     unsigned threads_per_core;
     /*
+     * #564: physical cores this VM ASKED for (hype.cfg `vcpus`), kept apart from vcpu_count,
+     * which placement overwrites with the LOGICAL CPUs it was granted. On an SMT host those
+     * differ -- 1 core becomes 2 logical -- so re-reading vcpu_count as the request on a restart
+     * would double the VM's core cost every time it was restarted.
+     */
+    unsigned cores_req;
+    /*
      * #557: the IRQ0-starvation episode, PER VM.
      *
      * These were function-level statics in run_fw_1_test(), which runs once per VM and now runs
@@ -1236,6 +1243,7 @@ static void fw_1_resolve_vcpus(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigne
                       : HYPE_MAX_VCPUS_PER_VM;
     }
     vmp->vcpu_count = applied;
+    vmp->cores_req = applied; /* #564: `vcpus` names physical CORES; see the field's comment */
     /* SMP-2: set explicitly rather than relying on the zeroed arena, so the value the guest is
      * told has one visible origin. This is the PROVISIONAL value; the real one comes from where
      * fw_1_place_vcpus_on_threads() actually put this VM's vCPUs, which runs later (#560). */
@@ -2549,22 +2557,23 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
      * conservative one-vCPU-per-core placement rather than pairing anyone by accident.
      */
     /*
-     * A CORE IS GRANTED WHOLE, AND ALL OF ITS THREADS GO TO THE SAME VM (#560).
+     * A vCPU IS A PHYSICAL CORE, AND SMT IS A BONUS (#564).
      *
-     * plan.md §10 decision 40: the unit of *execution* is a hardware thread, the unit of
-     * *allocation* is a physical core. So a dedicated VM given one 2-thread core gets TWO
-     * vCPUs, and a VM's cost is ceil(vcpus / threads_per_core) cores -- not one core per vCPU.
+     * `vcpus = N` asks for N whole cores and costs exactly N cores on every host. What the guest
+     * SEES is whatever those cores provide: 2 logical CPUs from a 2-thread core, 1 from a
+     * single-threaded one. The guest was never promised the sibling, so losing it on a non-SMT
+     * host costs it CPUs but never stops the config fitting.
+     *
      * What the isolation rule forbids is two DISTRUSTING owners on one core at the same time
-     * (§6g), and that is preserved below: ci advances past a core once any VM has touched it,
-     * so no core is ever split between two VMs.
+     * (§6g), and that is preserved below: a core is spent whole once any VM has touched it, so
+     * no core is ever split between two VMs.
      *
-     * This asks for an upper bound (one core per vCPU) because the true requirement depends on
-     * each selected core's thread count, and select_cores is what reports that. Over-asking is
-     * free: select_cores clamps to the cores that exist, and g_vcpu_cores_used is recomputed
-     * from what packing actually consumed.
+     * The requested core count IS the cost, so this is exact rather than an upper bound.
+     * select_cores clamps to the cores that exist, and g_vcpu_cores_used is recomputed from what
+     * packing actually consumed.
      */
     for (vi = 0; vi < g_vm_count; vi++) {
-        ncores_wanted += g_vms[vi].vcpu_count ? g_vms[vi].vcpu_count : 1u;
+        ncores_wanted += g_vms[vi].cores_req ? g_vms[vi].cores_req : 1u;
     }
 
     nthreads = hype_cpu_topology_select_cores(&g_cpu_topo, ncores_wanted, threads,
@@ -2582,7 +2591,7 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
      * separately is exactly what drifted in #559 and started two VMs on one core.
      */
     for (vi = 0; vi < g_vm_count && vi < HYPE_CFG_MAX_VMS; vi++) {
-        want[vi] = g_vms[vi].vcpu_count ? g_vms[vi].vcpu_count : 1u;
+        want[vi] = g_vms[vi].cores_req ? g_vms[vi].cores_req : 1u;
     }
     nvms = (g_vm_count < HYPE_CFG_MAX_VMS) ? g_vm_count : HYPE_CFG_MAX_VMS;
     (void)hype_smp_pack(per_core, ncores, want, nvms, packed, HYPE_MAX_VCPUS_PER_VM);
@@ -2593,20 +2602,22 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
         unsigned got = 0, vm_cores = packed[vi].cores, vm_tpc = packed[vi].threads_per_core;
         unsigned c;
 
-        want[vi] = packed[vi].vcpus; /* what it was actually given, clamps included */
+        want[vi] = packed[vi].vcpus; /* logical CPUs granted = cores * threads_per_core */
         for (c = 0; c < vm_cores; c++) {
             unsigned k;
             unsigned pc = packed[vi].first_core + c;
             /*
-             * Take EVERY thread of this core. They all belong to this one VM, so a sibling is
-             * never left idle to satisfy an isolation rule -- the rule is about two OWNERS on a
-             * core, and a core being spent whole is what enforces it.
+             * Take vm_tpc threads of this core -- the VM's uniform width, which is its
+             * NARROWEST core. They all belong to this one VM, so a sibling is never left idle to
+             * satisfy an isolation rule; the rule is about two OWNERS on a core, and a core
+             * being spent whole is what enforces it. A wider core's surplus threads stay idle
+             * and stay owned by this VM, because CPUID reports one threads-per-core for a guest.
              *
              * When siblings cannot be proven (#378's all-zero table) select_cores reports one
-             * thread per core, so this degrades to one vCPU per core rather than pairing two
-             * vCPUs by accident. Wasting a thread is safe; guessing at siblings is not.
+             * thread per core, so vm_tpc is 1 and the guest simply loses the bonus. Wasting a
+             * thread is safe; guessing at siblings is not.
              */
-            for (k = 0; k < per_core[pc] && got < want[vi]; k++) {
+            for (k = 0; k < per_core[pc] && k < vm_tpc && got < want[vi]; k++) {
                 uint32_t apic = threads[core_start[pc] + k];
                 if (apic > 255u) {
                     /* hype_ap_start drives the 8-bit xAPIC ICR destination field. Reported,
@@ -2625,37 +2636,34 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
             next = ci;
         }
         if (got < want[vi]) {
-            hype_debug_print("fw-1 SMP: vm%u asked for %u vCPU(s), only %u host thread(s) "
-                             "available -- running with %u [#190]\n", vi, want[vi], got, got);
-            g_vms[vi].vcpu_count = got ? got : 1u;
+            hype_debug_print("fw-1 SMP: vm%u asked for %u core(s), only %u host thread(s) "
+                             "placed -- running with %u logical CPU(s) [#190 #564]\n",
+                             vi, g_vms[vi].cores_req, got, got);
         }
-        if (got < vm_tpc) {
-            vm_tpc = got; /* never advertise a sibling this guest has no vCPU on */
-        }
+        g_vms[vi].vcpu_count = got ? got : 1u;
         /*
-         * #560: tell this guest the truth about its own SMT. A guest placed on two real
-         * siblings but told "1 thread/core" cannot reason about its internal SMT exposure, and
-         * the value must agree with CPUID leaf 0xB/0x1F and 0x8000001E. Never report more
-         * threads/core than this VM got vCPUs, or a 1-vCPU VM on a 2-thread core would
-         * advertise a sibling that does not exist.
+         * Tell this guest the truth about its own SMT: the value must agree with CPUID leaf
+         * 0xB/0x1F and 0x8000001E, and a guest on two real siblings that believes it has two
+         * single-threaded cores cannot reason about its internal SMT exposure. Never report more
+         * threads/core than the guest actually got logical CPUs.
          */
         if (got > 0u && vm_tpc > got) {
             vm_tpc = got;
         }
         g_vms[vi].threads_per_core = vm_tpc ? vm_tpc : 1u;
         if (vm_cores > 0u) {
-            hype_debug_print("fw-1 SMP: vm%u placed %u vCPU(s) on %u whole physical core(s), "
-                             "%u thread(s)/core [#560 #190]\n", vi, got, vm_cores,
-                             g_vms[vi].threads_per_core);
+            hype_debug_print("fw-1 SMP: vm%u granted %u whole physical core(s) -> %u logical "
+                             "CPU(s), %u thread(s)/core%s [#564 #190]\n",
+                             vi, vm_cores, got, g_vms[vi].threads_per_core,
+                             g_vms[vi].threads_per_core > 1u ? " (SMT bonus)" : "");
         }
     }
     (void)next;
     g_vcpu_threads_placed = placed;
-    /* Cores actually consumed, not cores offered: ncores_wanted over-asks on purpose (#560). */
-    g_vcpu_cores_used = ci;
-    hype_debug_print("fw-1 SMP: placed %u vCPU(s) on %u whole physical core(s) (%u offered, %u "
-                     "thread(s) selected), siblings %s [#190 #479 #560]\n", placed, ci, ncores,
-                     nthreads,
+    g_vcpu_cores_used = ci; /* cores actually consumed */
+    hype_debug_print("fw-1 SMP: %u whole physical core(s) granted -> %u logical CPU(s) (%u "
+                     "offered, %u thread(s) selected), siblings %s [#190 #479 #564]\n", ci,
+                     placed, ncores, nthreads,
                      hype_cpu_topology_siblings_known(&g_cpu_topo) ? "known" : "UNPROVEN "
                      "(one thread per core)");
     return placed;
@@ -11997,9 +12005,9 @@ static void fw_1_refuse_vm(unsigned vi) {
 }
 
 /*
- * How many of the configured VMs actually fit, spending cores the way placement does: a VM takes
- * whole cores and gets ALL of their threads as vCPUs, so it costs ceil(vcpus / threads_per_core)
- * cores (#560). Reports the guest-available cores and threads for the message.
+ * How many of the configured VMs actually fit, spending cores the way placement does: a vCPU IS
+ * a physical core, so a VM costs exactly its `vcpus` in cores and SMT changes what its guest
+ * SEES rather than what it costs (#564). Reports the guest-available cores and threads.
  *
  * Reads vcpu counts from the CONFIG, not from g_vms[].vcpu_count: this runs BEFORE
  * fw_1_resolve_vcpus(), so the per-VM field still holds its provisional 1. The first version of
@@ -12102,7 +12110,7 @@ static void fw_1_phase1_config(void) {
         unsigned int launchable = g_vm_count;
         if (g_cpu_topo.count != 0u) {
             /*
-             * #559/#560: admission must spend cores the way placement spends them.
+             * #559/#564: admission must spend cores the way placement spends them.
              *
              * This once counted VMs against isolated cores while placement spent a core per
              * vCPU. The two disagreed, and the disagreement was silent: on a 4-core host, three
@@ -12111,20 +12119,18 @@ static void fw_1_phase1_config(void) {
              * -- which handed it an APIC ID placement had already given to another VM. Both VMs
              * were started on the same core, one silently never ran, and nothing said so.
              *
-             * #559's fix made that loud but priced a vCPU at a whole core, which is stricter
-             * than decision 40: a core is granted whole and ALL of its threads are vCPUs of the
-             * one VM that owns it, so a VM costs ceil(vcpus / threads_per_core) cores. Both
-             * sides now call fw_1_vms_that_fit()/fw_1_core_runs(), so they cannot drift again.
+             * A vCPU is a physical core (decision 47), so a VM's cost is exactly its `vcpus`.
+             * Both sides call fw_1_vms_that_fit()/hype_smp_pack(), so they cannot drift again.
              */
             unsigned int cores = 0u, hthreads = 0u;
             unsigned int vi_c = fw_1_vms_that_fit(&cores, &hthreads);
 
             if (vi_c < launchable) {
                 HYPE_LOGF(HYPE_LOG_WARN,
-                          "adm: %u VM(s) configured wanting %u vCPU(s) in total, but this host "
+                          "adm: %u VM(s) configured wanting %u core(s) in total, but this host "
                           "offers %u guest core(s) / %u thread(s) with the BSP's core reserved "
-                          "-- only the first %u VM(s) fit (a VM takes whole cores and all their "
-                          "threads, decision 40) [#396 #559 #560]\n",
+                          "-- only the first %u VM(s) fit (a vCPU IS a physical core; SMT gives "
+                          "each one extra threads, not extra vCPUs) [#396 #559 #564]\n",
                           g_vm_count, fw_1_total_configured_vcpus(), cores, hthreads, vi_c);
                 launchable = vi_c;
             }

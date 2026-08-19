@@ -140,13 +140,18 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
       auto-assigning whichever are free. Exclusivity — no two dedicated VMs'
       pinned sets overlap — is a hard invariant of *this tier*, checked at
       startup (§6i).
-    - **Shared** — a pool of cores that several vCPUs are time-sliced onto,
-      so a host can run more vCPUs than it has cores. A VM opts in per-VM.
+    - **Shared** — a pool of cores that several **sCPUs** ("scheduled CPUs")
+      are time-sliced onto, so a host can run far more of them than it has
+      cores. An sCPU is a *share* of scheduler time rather than hardware, and
+      a guest with N sCPUs sees exactly N CPUs for compatibility (§10
+      decision 47). A VM opts in per-VM.
   On both tiers the unit of **execution** is a hardware thread and the unit
-  of **allocation** is a physical core (§10 decision 40). A core is granted
-  whole: every SMT sibling thread of a granted core may run a vCPU. A
-  dedicated VM given one 2-thread core therefore gets two vCPUs, and a
-  two-core shared pool dispatches on all four of its threads. A sibling
+  of **allocation** is a physical core (§10 decision 40), and **a vCPU IS a
+  physical core** (decision 47). A core is granted whole: every SMT sibling
+  thread of a granted core may run a thread of the VM that owns it, so a
+  dedicated VM given one 2-thread core gets **one vCPU that the guest sees as
+  two logical CPUs** — SMT is a bonus the guest was never promised, and on a
+  non-SMT host the same config costs the same core and yields one. A sibling
   thread is never left idle to satisfy an isolation rule; what the isolation
   rule forbids is two *distrusting* owners occupying one physical core at the
   same time (§6g).
@@ -189,12 +194,14 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
   tiny parser — no libc) enumerates guest definitions:
   ```
   [vm.win11]
-  vcpus = 4                 ; hardware threads, not physical cores
+  vcpus = 4                 ; PHYSICAL CORES, not threads (decision 47); on an SMT
+                            ; host the guest sees 4 x threads_per_core logical CPUs
                             ; (§10 decision 40)
   cpu_set = 4-7             ; explicit host PHYSICAL core subset to pin to
                             ; (optional; auto-assigned from whatever's free if
-                            ; omitted). A core is granted whole, so on an SMT
-                            ; host two listed cores supply four vCPUs
+                            ; omitted). One entry per vCPU, since a vCPU IS a
+                            ; core; a core is granted whole, so its threads all
+                            ; go to this VM
   cpu_mode = dedicated      ; dedicated | shared (§3, §10 decision 39).
                             ; default dedicated = today's exclusive 1:1 pinning
   isolation_group = payroll ; VMs naming the same group may share cores and SMT
@@ -779,24 +786,22 @@ actual host resources and refuse to start any VM that would overcommit them
   need to be reduced or disabled, rather than starting some VMs and running
   out of memory later during arbitrary guest operation.
 - Same principle for CPU, but the rule is now **per tier** (§3):
-  every **dedicated**-tier vCPU needs a hardware thread of its own, so the
-  sum of dedicated `vcpus` may not exceed the *threads* of the cores
-  available to them — not the core count, since a granted core supplies all
-  of its threads (§10 decision 40). **Shared**-tier vCPUs are deliberately
-  over-committed onto a pool, so a thread count is not the limit there; what
-  is checked instead is that the shared pool is non-empty whenever any
-  shared VM is configured, and that over-commit stays within a configured
-  maximum ratio.
+  every **dedicated**-tier vCPU needs a whole physical core of its own
+  (§10 decision 47), so the sum of dedicated `vcpus` may not exceed the
+  **cores** available to them, with the BSP's core reserved. Threads do not
+  enter it — a granted core supplies all of its threads to the one VM that
+  owns it, which changes what that guest *sees* and never what it costs.
+  **Shared**-tier sCPUs are deliberately over-committed onto a pool, so a
+  core count is not the limit there; what is checked instead is that the
+  shared pool is non-empty whenever any shared VM is configured, and that
+  over-commit stays within a configured maximum ratio.
 - **Explicit `cpu_set` validation**: `cpu_set` names **physical cores**, and
-  each listed core is granted whole. For any VM specifying `cpu_set`,
-  confirm every listed core actually exists on this host and — for the
-  dedicated tier — that `vcpus` does not exceed the total hardware threads
-  of the listed cores. (Before SMT was accounted for, the check was
-  `cpu_set` entry count == `vcpus`; that is the same rule only on a
-  non-SMT host.) A `vcpus` lower than the available thread count is legal
-  and leaves the surplus threads of those cores idle, because the core is
-  still owned exclusively; admission reports it rather than silently
-  accepting a half-used core. Overlap rules follow the tier:
+  each listed core is granted whole. Since a vCPU *is* a physical core
+  (decision 47), the rule is simply **`cpu_set` entry count == `vcpus`** —
+  the operator is naming exactly the cores they are asking for. Confirm every
+  listed core actually exists on this host. Nothing about SMT enters this
+  check: the threads of those cores are what the guest ends up seeing, not
+  what it is charged for. Overlap rules follow the tier:
     - Two **dedicated** VMs' `cpu_set` ranges must not overlap. Refused
       outright (not just warned about), exactly as before: exclusive pinning
       is what §6g's by-construction argument relies on.
@@ -2071,11 +2076,13 @@ isn't lost.
       core is drained of the outgoing owner and flushed (L1D + IBPB, SMP-18)
       before the incoming owner enters.
 
-    **What this settles.** A dedicated VM given one 2-thread core gets two
-    vCPUs, not one. A two-core shared pool dispatches on four threads, not
-    two. A single VM is trivially one trust group, so its own vCPUs may
-    always occupy sibling threads — that is the ordinary guest-SMP case and
-    needs no special permission.
+    **What this settles.** A dedicated VM given one 2-thread core runs on both
+    of them — one vCPU, which its guest sees as two logical CPUs (decision 47
+    fixes which of those numbers `vcpus` counts). A two-core shared pool
+    dispatches on four threads, not two. A single VM is trivially one trust
+    group, so its own threads may always occupy sibling threads of its own
+    cores — that is the ordinary guest-SMP case and needs no special
+    permission.
 
     **Rejected: running the shared pool with SMT disabled** (the alternative
     #473 offered). It idles half the machine unconditionally, including in
@@ -2112,15 +2119,20 @@ isn't lost.
 
     Delivered by #479 plus scope amendments on #186, #190, #472, #473, #477.
 
-    **Conformance history (2026-08-19).** This decision was written before the
-    code implemented it, and three sites then enforced a *stricter* rule while
-    citing it: placement took each granted core's first thread and left the
-    sibling unassigned (#560), admission priced a vCPU at a whole core (#559),
-    and `cpu_set` validation still required one entry per vCPU (#561, the
-    pre-SMT form §6i already marks obsolete). The lesson is recorded, not just
-    the fixes: "a core is the allocation unit" and "a vCPU costs a core" are
-    different statements, and the second is what the code kept implementing.
-    Decision 47 states the per-tier vCPU definition explicitly for that reason.
+    **Conformance history (2026-08-19).** This decision defines the allocation
+    quantum and was for a day read as also defining what `vcpus` counts. It
+    does not, and the attempt to make the code match that reading (#560) was
+    reverted by decision 47 and #564: `vcpus` counts **cores**, and SMT changes
+    what the guest sees rather than what it is charged.
+
+    Two things worth keeping from that day. First, **"a core is the allocation
+    unit" and "a vCPU costs a core" are different statements** — this decision
+    only ever asserted the first, and four sites had quietly assumed one or the
+    other (#559, #560, #561, #562). Second, **admission and placement must
+    spend the same currency computed by the same code**: they did not, and
+    #559 was two VMs started on one APIC ID with one of them silently never
+    running. They now share `core/smp_pack.c`.
+
     A guest is also now told its real `threads_per_core` rather than a
     hardcoded 1, because a VM on two siblings that believes it has two
     single-threaded cores cannot reason about its own internal SMT exposure.
@@ -2426,66 +2438,73 @@ isn't lost.
     a guest that limps with wrong data -- the "benign default MMIO catch-all" bug class this project
     has already been bitten by (#311). Stopping is a verdict; absorbing is a guess.
 
-47. **What a vCPU *is*, on each tier — decided: a dedicated vCPU is a hardware
-    thread of a wholly-owned core; a shared vCPU is a guaranteed minimum share
-    of execution time on a thread (2026-08-19).** Recorded because decisions 39
-    and 40 together imply this but neither states it, and the gap produced four
-    conformance bugs in one day (#559, #560, #561, #562) — every one of them a
-    piece of code pricing or describing a vCPU differently from the plan and
-    from the other pieces.
+47. **What a vCPU *is*, on each tier — decided: a dedicated vCPU is a PHYSICAL
+    CORE and SMT is a bonus; a shared vCPU is a share of scheduler time
+    (2026-08-19).** Recorded because decisions 39 and 40 together left it
+    unstated, and the gap produced four bugs in one day (#559, #560, #561,
+    #562), each a piece of code pricing or describing a vCPU differently from
+    the plan and from the other pieces.
 
-    - **Dedicated tier.** A vCPU is a hardware thread. Its VM owns whole
-      physical cores, so `vcpus` costs `ceil(vcpus / threads_per_core)` cores.
-      One 2-thread core gives two vCPUs. Capacity is therefore bounded by
-      *threads*, not cores: a 4-core/8-thread host with the BSP's core reserved
-      offers 6 vCPUs across 3 cores, not 3 vCPUs.
-    - **Shared tier.** A vCPU is **a guaranteed minimum quantity of execution
-      time, burstable above it when the pool is idle.** It is not a piece of
-      hardware at all, which is what makes over-commit meaningful: 128 VMs on a
-      16-core/32-thread host is a legitimate configuration if each is
-      guaranteed, say, 10% of a thread and may burst to N%. The guaranteed
-      floor and the burst ceiling are both operator-configured; the pool's
-      admission rule is that the sum of the *floors* fits the pool's threads,
-      not the sum of the ceilings.
+    - **Dedicated tier — a vCPU IS a physical core.** `vcpus = N` asks for N
+      whole cores and costs exactly N cores **on every host**. What the guest
+      sees is whatever those cores provide: `N × threads_per_core` logical
+      CPUs, so 2 per core with SMT on and 1 without. **The guest was never
+      promised the sibling**, so a non-SMT host costs it CPUs and never stops
+      the config fitting. On a 5950X — 16 cores, 32 threads — one core for the
+      BSP leaves **15 vCPUs**, each carrying 2 threads.
+    - **Shared tier — an sCPU is a share of scheduler time.** `N` sCPUs
+      ("scheduled CPUs") is a weight, not hardware: more sCPUs means a larger
+      share of the pool. 50 VMs at 1 sCPU each with two or three at 2 or 4 is a
+      normal configuration. **A guest with N sCPUs sees exactly N CPUs**, for
+      compatibility — its own OS needs a stable CPU count to configure against.
+    - **The guest's CPU count is therefore DERIVED on one tier and LITERAL on
+      the other**, and that asymmetry is deliberate. A dedicated VM is buying
+      hardware and gets what that hardware is; a shared VM is buying time, and
+      the number of CPUs it presents is a compatibility choice rather than a
+      physical fact.
     - **The two tiers must never be priced by one rule.** A dedicated vCPU
-      consumes hardware whether or not the guest is running; a shared vCPU
-      consumes it only while dispatched. Admission has to spend the two
-      currencies separately (§6i).
+      consumes a core whether or not the guest runs; an sCPU consumes hardware
+      only while dispatched. Admission spends the two currencies separately
+      (§6i).
 
-    **What this settles that decision 40 did not.** Decision 40 defines the
-    allocation quantum; it says nothing about what the operator is *buying*
-    when they write `vcpus = 4`. On the dedicated tier they are buying four
-    threads of exclusively-owned cores. On the shared tier they are buying four
-    run queues with a floor and a ceiling — and the honest consequence is that
-    a shared `vcpus = 4` and a dedicated `vcpus = 4` are not comparable
-    quantities and must not be reported to an operator as if they were.
+    **Why cores and not threads.** The rejected alternative — `vcpus` counting
+    hardware threads, so one 2-thread core yields two independently-countable
+    vCPUs — was implemented for one day as #560 and reverted. Three reasons:
 
-    **Industry cross-check.** The dedicated tier's rule — a core owned by one
-    trust domain at a time, SMT exposed *within* that domain — is what
-    Hyper-V's core scheduler does (introduced for L1TF, the default for
-    hypervisor-enabled hosts from Server 2019), what Xen's `sched-gran=core`
-    does (4.13+, opt-in), and what Linux/KVM's cookie-based core scheduling
-    does (`CONFIG_SCHED_CORE`, 5.14+). All three gang-schedule a VM's vCPUs
-    onto one core's siblings and leave a sibling idle rather than lend it to
-    another VM. Recorded as convergent evidence, not as authority: the version
-    numbers and defaults above are from memory and are not archived under
-    `research/`. Xen's earlier answer, and several cloud providers', was
-    simply to disable SMT — decision 40 already rejects that and says why.
+    - **The µarch CVEs.** Treating threads as independently allocatable units
+      is one step from handing sibling threads of one core to *different* VMs.
+      That is the exposure decision 40 rejects, and it is the one no flush can
+      mitigate: PortSmash (CVE-2018-5407), TLBleed and SQUIP (CVE-2021-46778)
+      are *contention* channels rather than errata, and both owners execute
+      concurrently so there is no switch boundary to clean at. Pricing in cores
+      keeps the allocation unit and the exclusion unit the same object, which
+      is what §6g's argument actually rests on.
+    - **It matches the isolation model of Hyper-V, KVM and Xen** — a core
+      belongs to one trust domain at a time, SMT exposed only *within* it.
+      (Those three differ from hype in the counting convention: their vCPU
+      counts are logical processors the guest sees. The isolation property is
+      the part worth matching, and it is identical.)
+    - **One config fits every host.** The core cost never moves, so a config
+      validated on an SMT machine cannot fail to fit a non-SMT one. Under the
+      thread-counting model it could, silently, by needing twice the cores.
 
-    **Rejected again, explicitly: a vCPU as a logical CPU across VMs**
+    **Rejected, and stays rejected: a vCPU as a logical CPU across VMs**
     (thread-granular allocation, so a 16-core/32-thread host offers 32
     dedicated vCPUs by letting two VMs share a core's threads). It doubles
-    apparent dedicated capacity and breaks the one property the dedicated tier
-    sells. The exposure is not hypothetical and not patchable: PortSmash
-    (CVE-2018-5407, execution-port contention), TLBleed, and SQUIP
-    (CVE-2021-46778, AMD scheduler queues) are *contention* channels — they are
-    how SMT works, not errata, so no microcode or flush removes them, and
-    unlike the buffer-leak classes (L1TF, MDS/ZombieLoad/RIDL/Fallout,
-    Downfall) they cannot be mitigated on a switch boundary because there is no
-    switch: both owners execute concurrently. STIBP addresses only the
+    apparent capacity and breaks the one property the dedicated tier sells.
+    Unlike the buffer-leak classes (L1TF, MDS/ZombieLoad/RIDL/Fallout,
+    Downfall), the contention channels above cannot be mitigated on a switch
+    boundary, because there is no switch. STIBP addresses only the
     branch-predictor axis. If an operator ever wants this it arrives as an
     explicit opt-in key naming the risk, never as a default or a capacity
     optimisation.
+
+    **Naming debt, recorded.** The config key is `vcpus` and now names cores,
+    so `vcpus = 1` can produce a guest reporting 2 CPUs. Renaming it to `cores`
+    — keeping `vcpus` as an accepted alias for §4.1's lossless round-trip — is
+    the honest fix and needs its own ticket.
+
+    Delivered by #564, superseding #560.
 
 48. **Not-present nested-paging entries must be L1TF-safe — decided:
     unconditional, both tiers (2026-08-19).** A not-present NPT/EPT entry whose
