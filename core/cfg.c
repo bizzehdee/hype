@@ -913,8 +913,8 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
             return HYPE_CFG_ERR_DUPLICATE_VM_NAME;
         }
     }
-    if (out->vm_count >= HYPE_CFG_MAX_VMS) {
-        return HYPE_CFG_ERR_TOO_MANY_VMS;
+    if (out->vm_count >= out->vm_cap) {
+        return HYPE_CFG_ERR_TOO_MANY_VMS; /* #393: the BOUND capacity, not a constant */
     }
 
     *cur = (int)out->vm_count;
@@ -998,11 +998,37 @@ static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
     return st;
 }
 
+/*
+ * #393: count the [vm.*] section headers, so a caller can size storage before parsing. Read-only
+ * and deliberately dumb -- it counts declarations, and the parse is what judges them.
+ */
+unsigned int hype_cfg_count_vms(const char *text) {
+    unsigned int n = 0;
+    const char *p = text;
+    while (p != 0 && *p) {
+        const char *ls = p;
+        while (*p == ' ' || *p == '\t') p++;
+        if (p[0] == '[' && p[1] == 'v' && p[2] == 'm' && p[3] == '.') {
+            n++;
+        }
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+        if (p == ls) break;
+    }
+    return n;
+}
+
 hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
+    /* #393: the struct's own storage, which is a convenience default and not a cap on hype --
+     * see the note in cfg.h. hype itself calls hype_cfg_parse_into() with pool storage. */
+    return hype_cfg_parse_into(text, out, out->vms_default, HYPE_CFG_MAX_VMS);
+}
+
+hype_cfg_result_t hype_cfg_parse_into(char *text, hype_cfg_t *out, hype_cfg_vm_t *vms,
+                                      unsigned int vm_cap) {
     hype_cfg_result_t res;
     unsigned int disk_seen = 0;
     unsigned int in_hype_seen = 0;
-    int vm_bad[HYPE_CFG_MAX_VMS];
     hype_cfg_status_t first_err = HYPE_CFG_OK;
     int in_vm_key = 0;
     unsigned int first_err_line = 0;
@@ -1016,6 +1042,8 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
 
     res.status = HYPE_CFG_OK;
     res.line = 0;
+    out->vms = vms;
+    out->vm_cap = vm_cap;
     out->vm_count = 0;
     hype_globals_defaults(&out->hype);
     out->disk_count = 0;
@@ -1031,9 +1059,6 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
      * a test that parses twice into the same struct -- which is exactly how the loader uses it. */
     out->unknown_first_line = 0u;
     out->unknown_first[0] = '\0';
-    for (i = 0; i < HYPE_CFG_MAX_VMS; i++) {
-        vm_bad[i] = 0;
-    }
 
     while (*p) {
         char *line_start = p;
@@ -1110,8 +1135,8 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
              * successful parse.
              */
             if (in_vm_key) {
-                if (!vm_bad[cur]) {
-                    vm_bad[cur] = 1;
+                if (!out->vms[cur].parse_bad) {
+                    out->vms[cur].parse_bad = 1;
                     if (out->skipped_vms == 0u) {
                         (void)hype_strlcpy(out->skipped_vm_name, out->vms[cur].name,
                                            HYPE_CFG_NAME_MAX);
@@ -1186,12 +1211,12 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
     for (i = 0; i < out->vm_count; i++) {
         hype_cfg_status_t st;
 
-        if (vm_bad[i]) {
+        if (out->vms[i].parse_bad) {
             continue; /* already counted; do not report the same VM twice */
         }
         st = validate_required(&out->vms[i], out->vms[i].seen_fields);
         if (st != HYPE_CFG_OK) {
-            vm_bad[i] = 1;
+            out->vms[i].parse_bad = 1;
             if (out->skipped_vms == 0u) {
                 (void)hype_strlcpy(out->skipped_vm_name, out->vms[i].name, HYPE_CFG_NAME_MAX);
                 out->skipped_vm_line = 0; /* a missing key has no line of its own */
@@ -1213,7 +1238,7 @@ hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out) {
         unsigned int si;
 
         for (i = 0; i < out->vm_count; i++) {
-            if (vm_bad[i]) {
+            if (out->vms[i].parse_bad) {
                 remap[i] = -1;
                 continue;
             }

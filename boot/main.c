@@ -573,7 +573,16 @@ static uint64_t g_ram_1_size_bytes;
  * unguarded diagnostic store an out-of-bounds write. Keep the two in lockstep until the
  * remaining arrays move to the pool.
  */
-#define HYPE_FW_MAX_VMS 16u
+/*
+ * #393 (plan.md section 10 decision 33): there is NO compile-time VM cap any more.
+ *
+ * This was 2, then 16, and every value of it was a silent clamp on a machine that could carry
+ * more -- current parts ship 192 cores, so 700+ usable cores on a quad-socket board is a real
+ * host. Every per-VM array is now allocated once from the UEFI pool, sized by the parsed
+ * config and bounded by detected topology (1:1 pinning allows usable cores - 1 VMs, the BSP
+ * keeping console and log duty). The bound is physical and reported with real numbers, not a
+ * constant somebody has to remember to raise.
+ */
 
 /* #302: console bytes that reach the script matcher, split by whether it was armed -- see
  * fw_1_script_feed for what each combination rules out. */
@@ -1033,6 +1042,13 @@ typedef struct hype_fw_vm {
  * base, and sizeof(hype_fw_vm_t) is a whole number of pages, so every element is
  * aligned. Sized to g_vm_count for now; the dynamic count is the next step. */
 static hype_fw_vm_t *g_vms;
+static const char **g_snap_name;   /* #393/#513: corruption-watcher snapshot, per VM */
+static const char **g_snap_label;
+static unsigned *g_snap_vcpus;
+static uint8_t *g_snap_ready;
+static uint8_t *g_snap_armed;
+static uint8_t *g_snap_hit;
+
 /* #393: the pre-config default is an explicit 2, NOT HYPE_FW_MAX_VMS -- that constant is now
  * the DIAGNOSTIC-array bound (16, lockstep with HYPE_CFG_MAX_VMS) and would make any code
  * running before the config resolves at efi_main believe sixteen VMs exist. */
@@ -2373,8 +2389,8 @@ static int fw_1_topo_index_of(uint32_t apic_id) {
     return -1;
 }
 
-static uint32_t g_vcpu_thread[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint8_t g_vcpu_thread_valid[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint32_t (*g_vcpu_thread)[HYPE_MAX_VCPUS_PER_VM];
+static uint8_t (*g_vcpu_thread_valid)[HYPE_MAX_VCPUS_PER_VM];
 static unsigned g_vcpu_threads_placed;
 static unsigned g_vcpu_cores_used;
 
@@ -2574,15 +2590,15 @@ static uint32_t *g_ap_timer_reload;
 /* #484: the same calibrated reload, kept PER CORE -- indexed by (vm, vcpu). g_ap_timer_reload
  * is per VM and predates one-host-core-per-vCPU: a vCPU-AP core calibrated a value and had
  * nowhere of its own to keep it, and fw_1_run_ap_vcpu had no way to arm its core's one-shot. */
-static uint32_t g_vcpu_timer_reload[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint32_t (*g_vcpu_timer_reload)[HYPE_MAX_VCPUS_PER_VM];
 /* #436: AP run-loop section breadcrumb. The AP sets these; the BSP prints them.
  * Pinpoints WHERE the loop stops when the AP freezes (deterministic ~127k iters). */
-volatile uint8_t g_436_loop_section[HYPE_FW_MAX_VMS];
-volatile uint64_t g_436_loop_iter[HYPE_FW_MAX_VMS];
-volatile uint64_t g_436_last_reason[HYPE_FW_MAX_VMS];
-volatile uint64_t g_436_last_rip[HYPE_FW_MAX_VMS];
+volatile uint8_t *g_436_loop_section;
+volatile uint64_t *g_436_loop_iter;
+volatile uint64_t *g_436_last_reason;
+volatile uint64_t *g_436_last_rip;
 
-volatile uint64_t g_436_ap_host_rip[HYPE_FW_MAX_VMS + 1u];
+volatile uint64_t *g_436_ap_host_rip; /* #393: n+1, like g_ap_timer_ticks */
 volatile uint64_t g_436_hpet_accesses;
 volatile uint64_t g_436_kmod_base;
 volatile uint64_t g_436_last_cr3;
@@ -2782,7 +2798,7 @@ static void fw_1_ap_main(void *arg) {
         if (vcpu_idx == 0u) {
             g_ap_timer_reload[vm_idx] = (uint32_t)count;
         }
-        if (vm_idx < HYPE_FW_MAX_VMS && vcpu_idx < HYPE_MAX_VCPUS_PER_VM) {
+        if (vm_idx < g_vm_count && vcpu_idx < HYPE_MAX_VCPUS_PER_VM) {
             g_vcpu_timer_reload[vm_idx][vcpu_idx] = (uint32_t)count;
         }
         *lvt = hype_lapic_lvt_timer_oneshot((uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR);
@@ -5439,9 +5455,9 @@ static const uint8_t *fw_1_guest_phys_to_host(hype_fw_vm_t *vm, uint64_t gpa);
  * the interrupt -- losing a device completion is worse than delivering it to the wrong core.
  */
 /* #512 diagnostics: where device vectors are posted, and how many each vCPU drained. */
-static uint64_t g_dev_posted[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_ipi_fixed_posted[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_bsp_ipi_drained[HYPE_FW_MAX_VMS];
+static uint64_t (*g_dev_posted)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ipi_fixed_posted)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t *g_bsp_ipi_drained;
 static uint64_t g_512_trace;
 
 static void fw_1_post_vector_dest(hype_fw_vm_t *vm, uint32_t dest, int logical, uint8_t vector) {
@@ -5504,17 +5520,17 @@ static void fw_1_deliver_msi_vector(hype_fw_vm_t *vm, uint8_t dev, uint8_t func,
  * the section at RELEASE does: whatever section is stamped when the longest hold ends is the code
  * that ran while the other vCPU's guest was frozen.
  */
-static uint64_t g_devlock_held_tsc[HYPE_FW_MAX_VMS];
-static uint64_t g_devlock_hold_max[HYPE_FW_MAX_VMS];
-static unsigned g_devlock_hold_max_sec[HYPE_FW_MAX_VMS];
-static uint64_t g_devlock_hold_total[HYPE_FW_MAX_VMS];
+static uint64_t *g_devlock_held_tsc;
+static uint64_t *g_devlock_hold_max;
+static unsigned *g_devlock_hold_max_sec;
+static uint64_t *g_devlock_hold_total;
 /* #484: the BSP's loop body split in two, both measured under the device lock. "Housekeeping"
  * is everything from re-acquiring the lock after VMRUN up to the exit-dispatch chain; the rest
  * is dispatch. held_tot/span already says the lock is held ~97% of wall time, so which half of
  * the body that is decides what to fix. */
-static uint64_t g_bsp_house_tsc[HYPE_FW_MAX_VMS];
-static uint64_t g_bsp_house_max[HYPE_FW_MAX_VMS];
-static uint64_t g_bsp_lock_tsc[HYPE_FW_MAX_VMS];
+static uint64_t *g_bsp_house_tsc;
+static uint64_t *g_bsp_house_max;
+static uint64_t *g_bsp_lock_tsc;
 /*
  * #509: where the BSP's per-exit host time actually goes.
  *
@@ -5527,19 +5543,19 @@ static uint64_t g_bsp_lock_tsc[HYPE_FW_MAX_VMS];
  * Buckets: 0 npf, 1 ioio, 2 msr, 3 cpuid, 4 hlt, 5 intr, 6 intr-window, 7 everything else.
  */
 #define HYPE_509_BUCKETS 8u
-static uint64_t g_bsp_disp_tsc[HYPE_FW_MAX_VMS][HYPE_509_BUCKETS];
-static uint64_t g_bsp_disp_cnt[HYPE_FW_MAX_VMS][HYPE_509_BUCKETS];
-static uint64_t g_bsp_disp_start[HYPE_FW_MAX_VMS];
-static unsigned g_bsp_disp_bucket[HYPE_FW_MAX_VMS];
+static uint64_t (*g_bsp_disp_tsc)[HYPE_509_BUCKETS];
+static uint64_t (*g_bsp_disp_cnt)[HYPE_509_BUCKETS];
+static uint64_t *g_bsp_disp_start;
+static unsigned *g_bsp_disp_bucket;
 /* #483: BSP progress, sampled CROSS-CORE by the AP's wait-for-SIPI watchdog. The 2-vCPU VMX
  * wedge takes ONE exit in 180 s, so the BSP cannot report its own state -- every diagnostic
  * print in this file runs on the per-exit path. The parked AP reports it instead: whether the
  * BSP is inside the guest or in host code, since when, and what its last exit was. */
-static volatile uint64_t g_bsp_probe_entry_tsc[HYPE_FW_MAX_VMS];
-static volatile uint64_t g_bsp_probe_exit_tsc[HYPE_FW_MAX_VMS];
-static volatile uint64_t g_bsp_probe_exits[HYPE_FW_MAX_VMS];
-static volatile uint64_t g_bsp_probe_reason[HYPE_FW_MAX_VMS];
-static volatile uint64_t g_bsp_probe_rip[HYPE_FW_MAX_VMS];
+static volatile uint64_t *g_bsp_probe_entry_tsc;
+static volatile uint64_t *g_bsp_probe_exit_tsc;
+static volatile uint64_t *g_bsp_probe_exits;
+static volatile uint64_t *g_bsp_probe_reason;
+static volatile uint64_t *g_bsp_probe_rip;
 
 static void fw_1_dev_lock(hype_fw_vm_t *vm) {
     hype_ticket_lock_acquire(&vm->dev_lock_next, &vm->dev_lock_owner);
@@ -5570,11 +5586,11 @@ static void fw_1_dev_unlock(hype_fw_vm_t *vm) {
 }
 
 /* SMP-6: set by an AP vCPU loop while it owns its vCPU; read by the BSP's INIT/SIPI path. */
-static uint8_t g_ap_apdata_dumped[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint8_t (*g_ap_apdata_dumped)[HYPE_MAX_VCPUS_PER_VM];
 /* SMP-6: AP LAPIC timer accounting. The AP programs its timer (measured: it faults in
  * lapic_et_start), but whether the timer then FIRES is a separate question, and a guest whose
  * per-CPU event timer never fires cannot run its scheduler on that CPU. */
-static uint64_t g_ap_timer_injected[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_timer_injected)[HYPE_MAX_VCPUS_PER_VM];
 /*
  * #484: how LATE hype delivers a guest LAPIC timer edge.
  *
@@ -5587,10 +5603,10 @@ static uint64_t g_ap_timer_injected[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
  * The BSP's M4-6d4 idle wait busy-spins up to 10 ms before re-entering, which bounds how
  * promptly ANY edge can be serviced on that core, so it is the prime suspect.
  */
-static uint64_t g_tmr_last_tsc[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_tmr_late_max_us[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_tmr_deliveries[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_tmr_prog_us[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_tmr_last_tsc)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_tmr_late_max_us)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_tmr_deliveries)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_tmr_prog_us)[HYPE_MAX_VCPUS_PER_VM];
 
 /* #484: called at each timer injection. Compares the real interval since the previous one
  * against what the guest programmed, and keeps the worst overshoot. */
@@ -5620,30 +5636,30 @@ static void fw_1_timer_latency_note(unsigned vmi, unsigned vi, const hype_guest_
  * 282 reads under 2 vCPUs against 3899 under 1, and #229 already established that host-backed
  * guest I/O issued from an AP core is its own failure mode -- so whether the AP is serving the
  * AHCI window at all, and how often, decides which of those this is. */
-static uint64_t g_ap_ahci_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_ap_ecam_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_ap_vblk_serves[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM]; /* #511 */
-static uint64_t g_ap_ipi_drained[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM]; /* #512 */
+static uint64_t (*g_ap_ahci_serves)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_ecam_serves)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_vblk_serves)[HYPE_MAX_VCPUS_PER_VM]; /* #511 */
+static uint64_t (*g_ap_ipi_drained)[HYPE_MAX_VCPUS_PER_VM]; /* #512 */
 /* #484: total LAPIC base-frequency ticks this AP has been advanced, and the TSC span it was
  * advanced over. The RCU stall says CPU 1 gets ~5 timer IRQs/s where its init_count implies
  * ~1600, so the question is whether the ADVANCE is short or the IRQ delivery is. These two
  * numbers answer it: ticks/elapsed should equal HYPE_GUEST_LAPIC_HZ. */
-static uint64_t g_ap_lapic_ticks[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_ap_lapic_tsc_span[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_lapic_ticks)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_lapic_tsc_span)[HYPE_MAX_VCPUS_PER_VM];
 /* #484: TSC spent by this AP WAITING for the shared-device lock. SMP-7 makes hype hold that
  * lock whenever it is outside the guest, and a host ATAPI read takes milliseconds -- so while
  * the BSP services one, the AP is stuck in host code and its guest CPU makes no progress at
  * all. That is indistinguishable, from inside the guest, from a hung CPU, which is exactly what
  * the RCU stall reports. Measured rather than argued: if this number is a large fraction of
  * the run, the lock is the stall. */
-static uint64_t g_ap_devlock_wait[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_ap_devlock_max[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_devlock_wait)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_devlock_max)[HYPE_MAX_VCPUS_PER_VM];
 /* #484: the BSP's loop-section marker sampled at the START of the AP's longest wait for the
  * shared-device lock. The AP still loses 38.9% of its life to that lock with single waits of
  * 0.29 s, and "which code holds it that long" is not guessable -- #436 already stamps the BSP's
  * position into g_436_loop_section, so record the value that was live while the AP was stuck. */
-static unsigned g_ap_devlock_max_section[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint8_t g_ap_vcpu_live[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static unsigned (*g_ap_devlock_max_section)[HYPE_MAX_VCPUS_PER_VM];
+static uint8_t (*g_ap_vcpu_live)[HYPE_MAX_VCPUS_PER_VM];
 
 /*
  * SMP-6 (#190): wait until vCPU `vi`'s core is out of the guest, so its VMCB can be rebuilt.
@@ -10017,6 +10033,34 @@ static void fw_1_view_switch_pass(int view, int complete, uint64_t tsc_hz) {
     }
 }
 
+/*
+ * #393: per-VM display fallbacks for a host with any number of VMs.
+ *
+ * Both of these were `i == 0 ? a : b`, which silently labels every VM from #2 onward as vm1 and
+ * its media as vm1.iso. The names follow the same \iso\vmN.iso convention the media resolver
+ * already generalised to. Static per-VM storage is allocated with the rest of the aux arena.
+ */
+static char (*g_default_vm_name)[8];
+static char (*g_default_media_name)[16];
+static const char *fw_1_default_vm_name(unsigned i) {
+    if (g_default_vm_name == 0) return "vm";
+    if (g_default_vm_name[i][0] == 0) {
+        hype_snprintf(g_default_vm_name[i], sizeof g_default_vm_name[i], "vm%u", i);
+    }
+    return g_default_vm_name[i];
+}
+static const char *fw_1_default_media_name(unsigned i) {
+    if (g_default_media_name == 0) return "test.iso";
+    if (g_default_media_name[i][0] == 0) {
+        if (i == 0u) {
+            hype_snprintf(g_default_media_name[i], sizeof g_default_media_name[i], "test.iso");
+        } else {
+            hype_snprintf(g_default_media_name[i], sizeof g_default_media_name[i], "vm%u.iso", i);
+        }
+    }
+    return g_default_media_name[i];
+}
+
 static void fw_1_render_console(void) {
     static uint64_t last_gop_flush_tsc = 0;
     static int term_last_view = -2; /* neither a VM index nor the dashboard, so the first frame clears */
@@ -10207,10 +10251,11 @@ static void fw_1_render_console(void) {
             int ready = __atomic_load_n(&g_vm_ready[i], __ATOMIC_ACQUIRE) != 0;
             /* #357: show the operator's `label` when they set one; the section-id/vm0 identity is
              * what they TYPE, and stays available for commands either way. */
+            /* #393: the fallbacks are per-VM strings built once (below), not a two-VM
+             * ternary -- 'vm0 or else vm1' is a two-VM assumption in the dashboard. */
             info[i].name = (g_vms[i].label != 0)
                                ? g_vms[i].label
-                               : (g_vms[i].name != 0 ? g_vms[i].name
-                                                    : (i == 0u ? "vm0" : "vm1"));
+                               : (g_vms[i].name != 0 ? g_vms[i].name : fw_1_default_vm_name(i));
             info[i].os_hint = g_vms[i].os_hint;
             info[i].state = ready ? hype_vm_lifecycle_name(g_vms[i].lifecycle) : "no-vcpu";
             info[i].cpu_pct = (ready && g_vms[i].lifecycle == HYPE_VM_RUNNING)
@@ -10218,9 +10263,7 @@ static void fw_1_render_console(void) {
                                   : 0u;
             info[i].mem_mb = g_vms[i].mem_mb;
             info[i].uptime_s = g_vms[i].stat_uptime_ms / 1000u;
-            info[i].media = g_vms[i].media != 0
-                                ? g_vms[i].media
-                                : (i == 0u ? "test.iso" : "vm1.iso");
+            info[i].media = g_vms[i].media != 0 ? g_vms[i].media : fw_1_default_media_name(i);
             info[i].focused = 0;
         }
         {
@@ -11824,11 +11867,11 @@ static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
  * AP exit that would need shared state is refused and counted, which is a visible limitation
  * rather than a silent corruption.
  */
-static unsigned long long g_ap_vcpu_exits[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_ap_vcpu_last_reason[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static uint64_t g_ap_vcpu_last_rip[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static unsigned long long g_ap_vcpu_unhandled[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
-static unsigned g_ap_vcpu_excp_dumped[HYPE_FW_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static unsigned long long (*g_ap_vcpu_exits)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_vcpu_last_reason)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_vcpu_last_rip)[HYPE_MAX_VCPUS_PER_VM];
+static unsigned long long (*g_ap_vcpu_unhandled)[HYPE_MAX_VCPUS_PER_VM];
+static unsigned (*g_ap_vcpu_excp_dumped)[HYPE_MAX_VCPUS_PER_VM];
 static int g_ap_mpdata_sample;
 
 /*
@@ -12269,7 +12312,7 @@ wait_for_sipi:
          * consumed during host dispatch cannot remain pending and starve the next instruction
          * (#364's rule).
          */
-        if (vm_idx < HYPE_FW_MAX_VMS && vi < HYPE_MAX_VCPUS_PER_VM &&
+        if (vm_idx < g_vm_count && vi < HYPE_MAX_VCPUS_PER_VM &&
             g_vcpu_timer_reload[vm_idx][vi] != 0u) {
             hype_lapic_arm_timer_oneshot((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
                                          (uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR,
@@ -20018,7 +20061,38 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     g_hype_cfg_raw_len = sz;
     g_hype_cfg_raw_sum = fw_1_fnv1a(g_hype_cfg_text, sz);
 
-    res = hype_cfg_parse(g_hype_cfg_text, &g_hype_cfg);
+    /*
+     * #393 (decision 33): size VM storage from what the file DECLARES, not from a constant.
+     *
+     * The parser used to refuse VM #17 because its array was 16 long. Count the [vm.*] sections
+     * first, allocate that many from the UEFI pool, and let admission be the thing that refuses
+     * -- with the host's real core and RAM numbers -- rather than a compile-time bound nobody
+     * can see from the config file. Falls back to the struct's own storage only if the pool
+     * cannot serve the request, which keeps a small config bootable on a starved host.
+     */
+    {
+        unsigned int declared = hype_cfg_count_vms(g_hype_cfg_text);
+        hype_cfg_vm_t *vms = g_hype_cfg.vms_default;
+        unsigned int cap = HYPE_CFG_MAX_VMS;
+        if (declared > cap) {
+            void *blk = 0;
+            UINTN want = (UINTN)declared * sizeof(hype_cfg_vm_t);
+            if (SystemTable->BootServices->AllocatePool(EfiLoaderData, want, &blk) ==
+                    EFI_SUCCESS && blk != 0) {
+                hype_guest_ram_zero(blk, (uint64_t)want);
+                vms = (hype_cfg_vm_t *)blk;
+                cap = declared;
+                hype_debug_print("cfg: %u [vm.*] section(s) declared -- VM storage sized to "
+                                 "match (%llu bytes) [#393]\n",
+                                 declared, (unsigned long long)want);
+            } else {
+                hype_debug_print("cfg: %u [vm.*] section(s) declared but the pool refused "
+                                 "%llu bytes -- parsing the first %u [#393]\n",
+                                 declared, (unsigned long long)want, cap);
+            }
+        }
+        res = hype_cfg_parse_into(g_hype_cfg_text, &g_hype_cfg, vms, cap);
+    }
     if (res.status != HYPE_CFG_OK) {
         hype_debug_print("cfg: \\hype.cfg parse error (status=%d, line=%u) -- ignoring config\n",
                          (int)res.status, res.line);
@@ -20580,7 +20654,7 @@ static void fw_1_vars_service(void) {
      * combined_host_phys == 0 (or a mapped name), so the guards ate it silently -- which is why
      * five QEMU repro attempts stayed green while every hardware run panicked.
      */
-    for (i = 0; i < g_vm_count && i < HYPE_FW_MAX_VMS; i++) {
+    for (i = 0; i < g_vm_count; i++) {
         hype_fw_vm_t *vm = &g_vms[i];
         uint32_t kind = vm->vars_req;
         uint32_t seq;
@@ -21950,6 +22024,69 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
     g_vm_log = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log);
     g_vm_log_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log_ready);
     g_vm_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_ready);
+    /*
+     * #393: the diagnostic and per-vCPU accounting arrays. These were the last statically-sized
+     * per-VM state in the file -- 53 arrays behind HYPE_FW_MAX_VMS, which decision 33 forbids.
+     * Same shape as the block above: a pointer allocated once from the pool, so every index
+     * expression at the use sites is unchanged.
+     */
+    g_vcpu_thread = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vcpu_thread);
+    g_vcpu_thread_valid = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vcpu_thread_valid);
+    g_vcpu_timer_reload = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vcpu_timer_reload);
+    g_436_loop_section = fw_aux_alloc(bs, (UINTN)n * sizeof *g_436_loop_section);
+    g_436_loop_iter = fw_aux_alloc(bs, (UINTN)n * sizeof *g_436_loop_iter);
+    g_436_last_reason = fw_aux_alloc(bs, (UINTN)n * sizeof *g_436_last_reason);
+    g_436_last_rip = fw_aux_alloc(bs, (UINTN)n * sizeof *g_436_last_rip);
+    g_dev_posted = fw_aux_alloc(bs, (UINTN)n * sizeof *g_dev_posted);
+    g_ipi_fixed_posted = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ipi_fixed_posted);
+    g_bsp_ipi_drained = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_ipi_drained);
+    g_devlock_held_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_devlock_held_tsc);
+    g_devlock_hold_max = fw_aux_alloc(bs, (UINTN)n * sizeof *g_devlock_hold_max);
+    g_devlock_hold_max_sec = fw_aux_alloc(bs, (UINTN)n * sizeof *g_devlock_hold_max_sec);
+    g_devlock_hold_total = fw_aux_alloc(bs, (UINTN)n * sizeof *g_devlock_hold_total);
+    g_bsp_house_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_house_tsc);
+    g_bsp_house_max = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_house_max);
+    g_bsp_lock_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_lock_tsc);
+    g_bsp_disp_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_disp_tsc);
+    g_bsp_disp_cnt = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_disp_cnt);
+    g_bsp_disp_start = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_disp_start);
+    g_bsp_disp_bucket = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_disp_bucket);
+    g_bsp_probe_entry_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_probe_entry_tsc);
+    g_bsp_probe_exit_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_probe_exit_tsc);
+    g_bsp_probe_exits = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_probe_exits);
+    g_bsp_probe_reason = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_probe_reason);
+    g_bsp_probe_rip = fw_aux_alloc(bs, (UINTN)n * sizeof *g_bsp_probe_rip);
+    g_ap_apdata_dumped = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_apdata_dumped);
+    g_ap_timer_injected = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_timer_injected);
+    g_tmr_last_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_tmr_last_tsc);
+    g_tmr_late_max_us = fw_aux_alloc(bs, (UINTN)n * sizeof *g_tmr_late_max_us);
+    g_tmr_deliveries = fw_aux_alloc(bs, (UINTN)n * sizeof *g_tmr_deliveries);
+    g_tmr_prog_us = fw_aux_alloc(bs, (UINTN)n * sizeof *g_tmr_prog_us);
+    g_ap_ahci_serves = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_ahci_serves);
+    g_ap_ecam_serves = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_ecam_serves);
+    g_ap_vblk_serves = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vblk_serves);
+    g_ap_ipi_drained = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_ipi_drained);
+    g_ap_lapic_ticks = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_lapic_ticks);
+    g_ap_lapic_tsc_span = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_lapic_tsc_span);
+    g_ap_devlock_wait = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_devlock_wait);
+    g_ap_devlock_max = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_devlock_max);
+    g_ap_devlock_max_section = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_devlock_max_section);
+    g_ap_vcpu_live = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_live);
+    g_ap_vcpu_exits = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_exits);
+    g_ap_vcpu_last_reason = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_last_reason);
+    g_ap_vcpu_last_rip = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_last_rip);
+    g_ap_vcpu_unhandled = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_unhandled);
+    g_ap_vcpu_excp_dumped = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_excp_dumped);
+    g_snap_name = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_name);
+    g_snap_label = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_label);
+    g_snap_vcpus = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_vcpus);
+    g_snap_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_ready);
+    g_snap_armed = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_armed);
+    g_snap_hit = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_hit);
+    g_436_ap_host_rip = fw_aux_alloc(bs, (UINTN)(n + 1u) * sizeof *g_436_ap_host_rip);
+    g_default_vm_name = fw_aux_alloc(bs, (UINTN)n * sizeof *g_default_vm_name);
+    g_default_media_name = fw_aux_alloc(bs, (UINTN)n * sizeof *g_default_media_name);
+
     /*
      * g_ap_vmm_page: the SVM host-save area, 4 KiB-aligned per element -> pages, like g_vms.
      *
@@ -24626,7 +24763,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 unsigned long long routed = 0, handed = 0, route_drop = 0;
                                 unsigned long long dev_queued = 0, guest_read = 0, dev_drop = 0;
                                 {
-                                    extern volatile uint64_t g_436_ap_host_rip[];
+                                    /* #393: declared at file scope now that it is a pool pointer. */
                                 hype_debug_print("fw-1 APLOOP vm%u: section=%u iter=%llu reason=0x%llx grip=0x%llx HOSTRIP=0x%llx [#436]\n",
                                                  vi, (unsigned)g_436_loop_section[vi],
                                                  (unsigned long long)g_436_loop_iter[vi],
@@ -24841,7 +24978,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                      * watchdog only exists once a vCPU-AP core is live. */
                                     unsigned pv;
                                     uint64_t pnow = hype_rdtsc();
-                                    for (pv = 0u; pv < g_vm_count && pv < HYPE_FW_MAX_VMS; pv++) {
+                                    for (pv = 0u; pv < g_vm_count; pv++) {
                                         uint64_t p_in = g_bsp_probe_entry_tsc[pv];
                                         uint64_t p_out = g_bsp_probe_exit_tsc[pv];
                                         int p_guest = (p_in != 0ull && p_in >= p_out);
@@ -24923,50 +25060,47 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * into a bounded window plus a byte pattern that names the writer.
              */
             {
-                static const char *snap_name[HYPE_FW_MAX_VMS];
-                static const char *snap_label[HYPE_FW_MAX_VMS];
-                static unsigned snap_vcpus[HYPE_FW_MAX_VMS];
-                static uint8_t snap_ready[HYPE_FW_MAX_VMS];
-                static uint8_t snap_armed[HYPE_FW_MAX_VMS];
-                static uint8_t snap_hit[HYPE_FW_MAX_VMS];
+                /* #393: the snapshot arrays are per-VM state and live in the aux arena with
+                 * the rest of it -- a function-scope [MAX] array is the same compile-time cap
+                 * wearing a different hat. */
                 static uint64_t snap_t0;
                 unsigned wi;
                 if (snap_t0 == 0u) {
                     snap_t0 = hype_rdtsc();
                 }
-                for (wi = 0; wi < g_vm_count && wi < HYPE_FW_MAX_VMS; wi++) {
+                for (wi = 0; wi < g_vm_count; wi++) {
                     hype_fw_vm_t *wv = &g_vms[wi];
-                    if (!snap_armed[wi]) {
+                    if (!g_snap_armed[wi]) {
                         if (wv->name != 0 && wv->vcpu_count != 0u) {
-                            snap_name[wi] = wv->name;
-                            snap_label[wi] = wv->label;
-                            snap_vcpus[wi] = wv->vcpu_count;
-                            snap_ready[wi] = g_vm_ready ? g_vm_ready[wi] : 0u;
-                            snap_armed[wi] = 1;
+                            g_snap_name[wi] = wv->name;
+                            g_snap_label[wi] = wv->label;
+                            g_snap_vcpus[wi] = wv->vcpu_count;
+                            g_snap_ready[wi] = g_vm_ready ? g_vm_ready[wi] : 0u;
+                            g_snap_armed[wi] = 1;
                         }
                         continue;
                     }
-                    if (snap_hit[wi]) {
+                    if (g_snap_hit[wi]) {
                         continue;
                     }
                     /* Readiness legitimately publishes 0->1 exactly once; fold it in. */
-                    if (g_vm_ready != 0 && g_vm_ready[wi] == 1u && snap_ready[wi] == 0u) {
-                        snap_ready[wi] = 1u;
+                    if (g_vm_ready != 0 && g_vm_ready[wi] == 1u && g_snap_ready[wi] == 0u) {
+                        g_snap_ready[wi] = 1u;
                     }
-                    if (wv->name != snap_name[wi] || wv->label != snap_label[wi] ||
-                        wv->vcpu_count != snap_vcpus[wi] ||
-                        (g_vm_ready != 0 && g_vm_ready[wi] != snap_ready[wi])) {
+                    if (wv->name != g_snap_name[wi] || wv->label != g_snap_label[wi] ||
+                        wv->vcpu_count != g_snap_vcpus[wi] ||
+                        (g_vm_ready != 0 && g_vm_ready[wi] != g_snap_ready[wi])) {
                         uint64_t hzw = g_vms[0].host_tsc_hz;
-                        snap_hit[wi] = 1;
+                        g_snap_hit[wi] = 1;
                         hype_debug_print(
                             "fw-1 CORRUPT vm%u at watch+%llums: name %llx->%llx label %llx->%llx "
                             "vcpus %u->%u ready %u->%u [#513]\n", wi,
                             hzw ? (hype_rdtsc() - snap_t0) * 1000ull / hzw : 0ull,
-                            (unsigned long long)(uintptr_t)snap_name[wi],
+                            (unsigned long long)(uintptr_t)g_snap_name[wi],
                             (unsigned long long)(uintptr_t)wv->name,
-                            (unsigned long long)(uintptr_t)snap_label[wi],
+                            (unsigned long long)(uintptr_t)g_snap_label[wi],
                             (unsigned long long)(uintptr_t)wv->label,
-                            snap_vcpus[wi], wv->vcpu_count, (unsigned)snap_ready[wi],
+                            g_snap_vcpus[wi], wv->vcpu_count, (unsigned)g_snap_ready[wi],
                             (unsigned)(g_vm_ready ? g_vm_ready[wi] : 0u));
                         usb_log_flush();
                     }

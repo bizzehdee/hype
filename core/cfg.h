@@ -180,6 +180,12 @@ typedef struct {
      * needed it to outlive the parse.
      */
     unsigned int seen_fields;
+    /*
+     * #393: the parser's "this VM is invalid" marker, moved out of a parallel
+     * int vm_bad[HYPE_CFG_MAX_VMS] stack array so nothing in the parse path is sized by a
+     * compile-time VM cap. Internal to parsing; callers have no reason to read it.
+     */
+    int parse_bad;
 } hype_cfg_vm_t;
 
 /*
@@ -399,7 +405,17 @@ typedef struct {
 } hype_cfg_retained_t;
 
 typedef struct {
-    hype_cfg_vm_t vms[HYPE_CFG_MAX_VMS];
+    /*
+     * #393 (plan.md section 10 decision 33): VM storage is BOUND, not fixed.
+     *
+     * `vms` points at whatever the caller gave hype_cfg_parse_into(), and `vm_cap` says how
+     * many it holds. hype_cfg_parse() binds `vms_default` below, which is a convenience for
+     * tests and small configs -- NOT a cap on the hypervisor, which sizes its own storage from
+     * a pre-pass count and the host's detected topology. A parser that refused VM #17 was the
+     * same silent clamp as the old two-VM firmware array, one layer up.
+     */
+    hype_cfg_vm_t *vms;
+    unsigned int vm_cap;
     unsigned int vm_count;
 
     /* #222 (§5.1): hypervisor-global settings; defaults applied when the section is absent. */
@@ -408,6 +424,9 @@ typedef struct {
     /* #222 (§5.3): named devices, referenced by VMs via disks =/cdroms =. */
     hype_cfg_disk_t disks[HYPE_CFG_MAX_DISKS];
     unsigned int disk_count;
+
+    /* #393: default VM storage, bound by hype_cfg_parse(). See the note on `vms` above. */
+    hype_cfg_vm_t vms_default[HYPE_CFG_MAX_VMS];
 
     /*
      * §4.3: a malformed [disk.*] is REPORTED AND SKIPPED, not fatal -- one bad device must not stop
@@ -490,6 +509,20 @@ typedef struct {
  * result.status.
  */
 hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out);
+
+/*
+ * #393: parse into caller-owned VM storage. `hype_cfg_parse()` is this with the struct's own
+ * default array bound, so existing callers are unchanged; hype passes pool storage sized from
+ * hype_cfg_count_vms() and refuses at admission, with real numbers, rather than at VM #17.
+ */
+hype_cfg_result_t hype_cfg_parse_into(char *text, hype_cfg_t *out, hype_cfg_vm_t *vms,
+                                      unsigned int vm_cap);
+
+/*
+ * #393: how many [vm.*] sections the text declares. Read-only pre-pass, so the caller can size
+ * storage before parsing. Counts declarations, not validity -- the parse is what judges those.
+ */
+unsigned int hype_cfg_count_vms(const char *text);
 
 /*
  * CONFIG-3 (#221): serialize `cfg` back into `hype.cfg` text, for the GUI/TUI

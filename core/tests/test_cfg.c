@@ -2093,6 +2093,55 @@ static void test_serialize_hype_section_lists(void) {
 
 /* A config that never set `resolution` at all must not gain one from serializing -- the key
  * itself must be omitted, not written as some zero/default value. */
+
+/* ---- #393: no compile-time VM cap ---- */
+
+static void test_count_vms_counts_declarations(void) {
+    const char *cfg =
+        "[hype]\nconfig_version = 1\n"
+        "[vm.a]\n" REQ
+        "[disk.d0]\npath = file:\\x.img\n"
+        "  [vm.b]\n" REQ          /* leading whitespace still counts */
+        "[vm.c]\n" REQ;
+    CHECK_INT("three [vm.*] sections are counted", 3, (int)hype_cfg_count_vms(cfg));
+    CHECK_INT("a config with no VMs counts zero", 0, (int)hype_cfg_count_vms("[hype]\n"));
+}
+
+/* The old parser refused VM #17 because its array was 16 long. With storage bound by the
+ * caller, the bound is whatever the caller sized -- which is what lets hype size from the
+ * host's real topology instead of a constant. */
+static void test_parse_into_accepts_more_vms_than_the_default(void) {
+    static char buf[32768];
+    static hype_cfg_vm_t storage[24];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    unsigned i;
+    unsigned pos = 0;
+    for (i = 0; i < 20; i++) {
+        pos += (unsigned)snprintf(buf + pos, sizeof(buf) - pos, "[vm.v%u]\n%s", i, REQ);
+    }
+    CHECK_INT("twenty declared", 20, (int)hype_cfg_count_vms(buf));
+    res = hype_cfg_parse_into(buf, &out, storage, 24u);
+    CHECK_INT("parse succeeds past the old 16 cap", (int)HYPE_CFG_OK, (int)res.status);
+    CHECK_INT("all twenty VMs parsed", 20, (int)out.vm_count);
+    CHECK_STR("the seventeenth VM is real", "v16", out.vms[16].name);
+}
+
+/* Bounded storage still refuses rather than overrunning -- the cap moved, it did not vanish. */
+static void test_parse_into_refuses_past_bound_storage(void) {
+    static char buf[32768];
+    static hype_cfg_vm_t storage[3];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    unsigned i, pos = 0;
+    for (i = 0; i < 5; i++) {
+        pos += (unsigned)snprintf(buf + pos, sizeof(buf) - pos, "[vm.v%u]\n%s", i, REQ);
+    }
+    res = hype_cfg_parse_into(buf, &out, storage, 3u);
+    CHECK_INT("too many VMs for the bound storage is an error",
+              (int)HYPE_CFG_ERR_TOO_MANY_VMS, (int)res.status);
+}
+
 static void test_serialize_omits_resolution_when_unset(void) {
     hype_cfg_t before, after;
     hype_cfg_serialize_result_t sr;
@@ -2133,6 +2182,9 @@ int main(void) {
     test_serialize_disk_section_round_trips_optional_fields();
     test_serialize_hype_section_lists();
     test_serialize_omits_resolution_when_unset();
+    test_count_vms_counts_declarations();
+    test_parse_into_accepts_more_vms_than_the_default();
+    test_parse_into_refuses_past_bound_storage();
     test_size_gb_to_bytes();
     test_resolve_mem_mb();
     test_full_example_from_plan();
