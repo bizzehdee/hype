@@ -107,12 +107,15 @@ static void test_leaf1_forces_hypervisor_bit_and_clears_mtrr(void) {
               (out.ecx & (1u << 27)) != 0);
     CHECK_HEX("AVX bit passthrough", 1, (out.ecx & (1u << 28)) != 0);
     CHECK_HEX("F16C bit passthrough", 1, (out.ecx & (1u << 29)) != 0);
-    /* ecx = real | hypervisor-present, minus TSC_DEADLINE, X2APIC and MONITOR (#256: an
-     * un-intercepted MWAIT never exits, so the guest must not be offered it), and minus
-     * OSXSAVE(27), which is a mirror of the guest's CR4 rather than a capability and is 0
-     * because this call supplies no CR4. */
+    /* ecx = real | hypervisor-present, minus TSC_DEADLINE(24), X2APIC(21), MONITOR(3) (#256: an
+     * un-intercepted MWAIT never exits, so the guest must not be offered it), VMX(5) (#552: the
+     * Intel half of #316's "hype does not expose virtualization to guests", which this expectation
+     * did not include until the ported CPUMSR microtest found a guest being told VT-x existed), and
+     * OSXSAVE(27), which is a mirror of the guest's CR4 rather than a capability and is 0 because
+     * this call supplies no CR4. */
     CHECK_HEX("ecx otherwise passthrough",
-              (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21) & ~(1u << 3) & ~(1u << 27),
+              (real.ecx | (1u << 31)) & ~(1u << 24) & ~(1u << 21) & ~(1u << 3) & ~(1u << 5) &
+                  ~(1u << 27),
               out.ecx);
     /* #436: MTRR is REPORTED, because hype models the MTRR MSRs (MTRRcap,
      * MTRRdefType, the variable pairs and the fixed ranges). Clearing it while
@@ -306,6 +309,35 @@ static void test_unhandled_extended_leaf_returns_all_zero(void) {
     CHECK_HEX("ebx", 0, out.ebx);
     CHECK_HEX("ecx", 0, out.ecx);
     CHECK_HEX("edx", 0, out.edx);
+}
+
+/*
+ * #552: leaf 1 ECX bit 5, VMX. The Intel mirror of the SVM mask on 0x80000001, and it was missing
+ * -- so a guest on an Intel host was told VT-x was available while a guest on AMD correctly saw no
+ * SVM. #316's rule is that hype does not expose virtualization to guests; this is the half of it
+ * that was never applied.
+ *
+ * The test that should have caught it is test_leaf_ext1_clears_svm_bit above, which existed for the
+ * AMD bit alone. Written as its deliberate mirror.
+ */
+static void test_leaf1_masks_vmx(void) {
+    hype_cpuid_result_t real, out;
+    real.eax = 0; real.ebx = 0; real.edx = 0;
+    real.ecx = 0xFFFFFFFFu; /* a host advertising everything, VMX included */
+    hype_cpuid_emulate(1u, 0u, &real, &out);
+    if ((out.ecx & (1u << 5)) != 0u) {
+        printf("FAIL: leaf 1 ECX VMX (bit 5) must be masked -- hype does not expose "
+               "virtualization to guests (#316/#552)\n");
+        failures++;
+    }
+    /* And it must stay masked when the host does not advertise it either -- idempotent, the same
+     * property test_leaf_ext1_svm_already_clear_is_idempotent asserts for SVM. */
+    real.ecx = 0xFFFFFFFFu & ~(1u << 5);
+    hype_cpuid_emulate(1u, 0u, &real, &out);
+    if ((out.ecx & (1u << 5)) != 0u) {
+        printf("FAIL: leaf 1 ECX VMX must stay clear when the host's is clear\n");
+        failures++;
+    }
 }
 
 static void test_leaf1_masks_monitor_mwait(void) {
@@ -743,6 +775,7 @@ int main(void) {
     test_hv_leaf_beyond_max_is_not_claimed();
     test_hv_version_leaf_is_populated();
 
+    test_leaf1_masks_vmx();
     test_leaf1_masks_monitor_mwait();
     test_leafd_masks_xsaves();
 

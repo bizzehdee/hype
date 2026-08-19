@@ -45,6 +45,14 @@
 #define HYPE_CPUID_LEAF7_EDX_SPECCTRL_MASK                                     \
     ((1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 30) | (1u << 31))
 #define HYPE_CPUID_EXT1_ECX_SVM_BIT (1u << 2)
+/*
+ * #552: leaf 1 ECX bit 5, VMX. The Intel half of #316's rule -- hype does not expose
+ * virtualization to guests -- which was applied to SVM on 0x80000001 and never here. An Intel guest
+ * was told VT-x was available, which is what /proc/cpuinfo and lscpu then report to an operator,
+ * and what a nested KVM/VirtualBox/vmm inside the guest acts on before executing a VMXON hype does
+ * not emulate.
+ */
+#define HYPE_CPUID_LEAF1_ECX_VMX_BIT (1u << 5)
 #define HYPE_CPUID_EXT7_EDX_INVARIANT_TSC_BIT (1u << 8)
 #define HYPE_CPUID_LEAF6_EAX_ARAT_BIT (1u << 2)
 
@@ -312,9 +320,15 @@ void hype_cpuid_emulate_topo(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
          * exactly 100% for an idle guest (#264). Masking the bit is what any
          * hypervisor that does not emulate MONITOR/MWAIT does; Linux falls back to
          * HLT idle, which hype already models. */
+        /*
+         * #552: VMX (5) joins them. It is the same rule as the SVM mask on 0x80000001 below, and it
+         * was missing here -- so a guest on an Intel host saw VT-x while a guest on an AMD host
+         * correctly saw no SVM. Found by the ported CPUMSR microtest asserting, from inside the
+         * guest, what #316 says a guest must see.
+         */
         out->ecx = (real->ecx | HYPE_CPUID_HYPERVISOR_PRESENT_BIT) &
                    ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT & ~HYPE_CPUID_LEAF1_ECX_X2APIC_BIT &
-                   ~HYPE_CPUID_LEAF1_ECX_MONITOR_BIT;
+                   ~HYPE_CPUID_LEAF1_ECX_MONITOR_BIT & ~HYPE_CPUID_LEAF1_ECX_VMX_BIT;
         /*
          * OSXSAVE (bit 27) is NOT a capability bit. The SDM defines it as a read-only mirror
          * of the executing processor's CR4.OSXSAVE, so it must track THIS vCPU's CR4, never
