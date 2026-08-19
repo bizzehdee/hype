@@ -37,6 +37,7 @@
 #include "../core/ahci_host.h"
 #include "../core/disk_inventory.h"
 #include "../core/cpu_topology.h"
+#include "../core/smp_pack.h"
 #include "../core/pe_ident.h"
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
@@ -1222,7 +1223,8 @@ static void fw_1_resolve_vcpus(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigne
     }
     vmp->vcpu_count = applied;
     /* SMP-2: set explicitly rather than relying on the zeroed arena, so the value the guest is
-     * told has one visible origin. SMT-aware allocation (#479/#190) is what raises it. */
+     * told has one visible origin. This is the PROVISIONAL value; the real one comes from where
+     * fw_1_place_vcpus_on_threads() actually put this VM's vCPUs, which runs later (#560). */
     vmp->threads_per_core = 1u;
     /*
      * #532: this runs TWICE -- once in Phase 0 for every slot, before any config exists, and again
@@ -2462,6 +2464,42 @@ static unsigned g_vcpu_threads_placed;
 static unsigned g_vcpu_cores_used;
 
 /*
+ * Recover each selected core's run of threads from select_cores() output, so a VM can be packed
+ * core by core. select_cores emits a core's threads contiguously and never splits one, so
+ * walking the output and breaking whenever the (package, core) changes recovers the boundaries.
+ *
+ * Shared by placement and by admission (#560) on purpose: the two used to reason about cost
+ * separately and disagreed silently (#559). Spending the same currency computed the same way is
+ * what keeps the cap admission reports equal to the one placement enforces.
+ */
+static void fw_1_core_runs(const uint32_t *threads, unsigned nthreads, unsigned ncores,
+                           unsigned *per_core, unsigned *core_start) {
+    unsigned t = 0, ci;
+
+    for (ci = 0; ci < ncores && t < nthreads; ci++) {
+        unsigned j;
+        int base = fw_1_topo_index_of(threads[t]);
+        core_start[ci] = t;
+        per_core[ci] = 0;
+        for (j = t; j < nthreads; j++) {
+            int idx = fw_1_topo_index_of(threads[j]);
+            if (base < 0 || idx < 0) break;
+            if (g_cpu_topo.loc[idx].package != g_cpu_topo.loc[base].package ||
+                g_cpu_topo.loc[idx].core != g_cpu_topo.loc[base].core) {
+                break;
+            }
+            per_core[ci]++;
+        }
+        if (per_core[ci] == 0u) break; /* cannot happen, but never loop forever on it */
+        t += per_core[ci];
+    }
+    for (; ci < ncores; ci++) {
+        per_core[ci] = 0;
+        core_start[ci] = nthreads;
+    }
+}
+
+/*
  * Build the [vm][vcpu] -> host thread map. Returns the number of vCPUs placed.
  *
  * A vCPU that cannot be placed is left invalid and reported; the VM still runs with the vCPUs
@@ -2471,9 +2509,11 @@ static unsigned g_vcpu_cores_used;
 static unsigned fw_1_place_vcpus_on_threads(void) {
     uint32_t threads[HYPE_CPU_TOPOLOGY_MAX];
     unsigned ncores_wanted = 0, nthreads, ncores = 0;
-    unsigned vi, ci, next = 0;
+    unsigned vi, ci, next = 0, nvms;
     unsigned per_core[HYPE_CPU_TOPOLOGY_MAX];
     unsigned core_start[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned want[HYPE_CFG_MAX_VMS];
+    hype_smp_pack_vm_t packed[HYPE_CFG_MAX_VMS];
     unsigned placed = 0;
 
     g_vcpu_threads_placed = 0;
@@ -2495,15 +2535,19 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
      * conservative one-vCPU-per-core placement rather than pairing anyone by accident.
      */
     /*
-     * ONE WHOLE CORE PER vCPU.
+     * A CORE IS GRANTED WHOLE, AND ALL OF ITS THREADS GO TO THE SAME VM (#560).
      *
-     * SMP is processors; SMT is threading within one. A guest vCPU is a processor, so it gets a
-     * core -- both of that core's threads belong to it, and no second vCPU is placed on the
-     * sibling. plan.md decision 40 already says "thread = execution unit, core = allocation
-     * unit"; this code contradicted it by dividing the wanted vCPUs by threads_per_core, which
-     * packed two vCPUs onto one core's two threads. On the operator's laptop that showed up as
-     * "placed 4 vCPU(s) on 2 whole physical core(s)" -- one vCPU per THREAD, two guests' worth
-     * of vCPUs sharing a core's execution resources.
+     * plan.md §10 decision 40: the unit of *execution* is a hardware thread, the unit of
+     * *allocation* is a physical core. So a dedicated VM given one 2-thread core gets TWO
+     * vCPUs, and a VM's cost is ceil(vcpus / threads_per_core) cores -- not one core per vCPU.
+     * What the isolation rule forbids is two DISTRUSTING owners on one core at the same time
+     * (§6g), and that is preserved below: ci advances past a core once any VM has touched it,
+     * so no core is ever split between two VMs.
+     *
+     * This asks for an upper bound (one core per vCPU) because the true requirement depends on
+     * each selected core's thread count, and select_cores is what reports that. Over-asking is
+     * free: select_cores clamps to the cores that exist, and g_vcpu_cores_used is recomputed
+     * from what packing actually consumed.
      */
     for (vi = 0; vi < g_vm_count; vi++) {
         ncores_wanted += g_vms[vi].vcpu_count ? g_vms[vi].vcpu_count : 1u;
@@ -2516,49 +2560,40 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
     }
     g_vcpu_cores_used = ncores;
 
-    /*
-     * Recover each selected core's run of threads, so a VM can be packed core by core.
-     * select_cores emits a core's threads contiguously and never splits one, so walking the
-     * output and breaking whenever the (package, core) changes recovers the boundaries.
-     */
-    {
-        unsigned t = 0;
-        for (ci = 0; ci < ncores && t < nthreads; ci++) {
-            unsigned j;
-            int base = fw_1_topo_index_of(threads[t]);
-            core_start[ci] = t;
-            per_core[ci] = 0;
-            for (j = t; j < nthreads; j++) {
-                int idx = fw_1_topo_index_of(threads[j]);
-                if (base < 0 || idx < 0) break;
-                if (g_cpu_topo.loc[idx].package != g_cpu_topo.loc[base].package ||
-                    g_cpu_topo.loc[idx].core != g_cpu_topo.loc[base].core) {
-                    break;
-                }
-                per_core[ci]++;
-            }
-            if (per_core[ci] == 0u) break; /* cannot happen, but never loop forever on it */
-            t += per_core[ci];
-        }
-    }
+    fw_1_core_runs(threads, nthreads, ncores, per_core, core_start);
 
-    /* Pack each VM onto whole cores, in order. */
+    /*
+     * Price every VM in cores with the SAME function admission uses (#560), then lay its vCPUs
+     * down on the threads of the cores it was given. Admission and placement computing this
+     * separately is exactly what drifted in #559 and started two VMs on one core.
+     */
+    for (vi = 0; vi < g_vm_count && vi < HYPE_CFG_MAX_VMS; vi++) {
+        want[vi] = g_vms[vi].vcpu_count ? g_vms[vi].vcpu_count : 1u;
+    }
+    nvms = (g_vm_count < HYPE_CFG_MAX_VMS) ? g_vm_count : HYPE_CFG_MAX_VMS;
+    (void)hype_smp_pack(per_core, ncores, want, nvms, packed, HYPE_MAX_VCPUS_PER_VM);
+
     ci = 0;
     next = 0;
-    for (vi = 0; vi < g_vm_count; vi++) {
-        unsigned want = g_vms[vi].vcpu_count ? g_vms[vi].vcpu_count : 1u;
-        unsigned got = 0;
-        if (want > HYPE_MAX_VCPUS_PER_VM) want = HYPE_MAX_VCPUS_PER_VM;
-        while (got < want && ci < ncores) {
+    for (vi = 0; vi < nvms; vi++) {
+        unsigned got = 0, vm_cores = packed[vi].cores, vm_tpc = packed[vi].threads_per_core;
+        unsigned c;
+
+        want[vi] = packed[vi].vcpus; /* what it was actually given, clamps included */
+        for (c = 0; c < vm_cores; c++) {
             unsigned k;
+            unsigned pc = packed[vi].first_core + c;
             /*
-             * One vCPU per core: take the core's FIRST thread and move on. The sibling threads
-             * are deliberately left unassigned -- they belong to this vCPU's core and must not
-             * be handed to another vCPU. Bounded by per_core[ci] only so a core that reported
-             * no threads cannot spin.
+             * Take EVERY thread of this core. They all belong to this one VM, so a sibling is
+             * never left idle to satisfy an isolation rule -- the rule is about two OWNERS on a
+             * core, and a core being spent whole is what enforces it.
+             *
+             * When siblings cannot be proven (#378's all-zero table) select_cores reports one
+             * thread per core, so this degrades to one vCPU per core rather than pairing two
+             * vCPUs by accident. Wasting a thread is safe; guessing at siblings is not.
              */
-            for (k = 0; k < per_core[ci] && got < want && k < 1u; k++) {
-                uint32_t apic = threads[core_start[ci] + k];
+            for (k = 0; k < per_core[pc] && got < want[vi]; k++) {
+                uint32_t apic = threads[core_start[pc] + k];
                 if (apic > 255u) {
                     /* hype_ap_start drives the 8-bit xAPIC ICR destination field. Reported,
                      * never silently mis-addressed -- the #360 lesson. */
@@ -2572,19 +2607,41 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
                 got++;
                 placed++;
             }
-            ci++; /* a core is never shared between VMs, so move on even if partly used */
+            ci = pc + 1; /* cores are spent in order, so this tracks the high-water mark */
             next = ci;
         }
-        if (got < want) {
+        if (got < want[vi]) {
             hype_debug_print("fw-1 SMP: vm%u asked for %u vCPU(s), only %u host thread(s) "
-                             "available -- running with %u [#190]\n", vi, want, got, got);
+                             "available -- running with %u [#190]\n", vi, want[vi], got, got);
             g_vms[vi].vcpu_count = got ? got : 1u;
+        }
+        if (got < vm_tpc) {
+            vm_tpc = got; /* never advertise a sibling this guest has no vCPU on */
+        }
+        /*
+         * #560: tell this guest the truth about its own SMT. A guest placed on two real
+         * siblings but told "1 thread/core" cannot reason about its internal SMT exposure, and
+         * the value must agree with CPUID leaf 0xB/0x1F and 0x8000001E. Never report more
+         * threads/core than this VM got vCPUs, or a 1-vCPU VM on a 2-thread core would
+         * advertise a sibling that does not exist.
+         */
+        if (got > 0u && vm_tpc > got) {
+            vm_tpc = got;
+        }
+        g_vms[vi].threads_per_core = vm_tpc ? vm_tpc : 1u;
+        if (vm_cores > 0u) {
+            hype_debug_print("fw-1 SMP: vm%u placed %u vCPU(s) on %u whole physical core(s), "
+                             "%u thread(s)/core [#560 #190]\n", vi, got, vm_cores,
+                             g_vms[vi].threads_per_core);
         }
     }
     (void)next;
     g_vcpu_threads_placed = placed;
-    hype_debug_print("fw-1 SMP: placed %u vCPU(s) on %u whole physical core(s), %u thread(s) "
-                     "selected, siblings %s [#190 #479]\n", placed, ncores, nthreads,
+    /* Cores actually consumed, not cores offered: ncores_wanted over-asks on purpose (#560). */
+    g_vcpu_cores_used = ci;
+    hype_debug_print("fw-1 SMP: placed %u vCPU(s) on %u whole physical core(s) (%u offered, %u "
+                     "thread(s) selected), siblings %s [#190 #479 #560]\n", placed, ci, ncores,
+                     nthreads,
                      hype_cpu_topology_siblings_known(&g_cpu_topo) ? "known" : "UNPROVEN "
                      "(one thread per core)");
     return placed;
@@ -11925,6 +11982,47 @@ static void fw_1_refuse_vm(unsigned vi) {
                      "other VM is unaffected [#531]\n", vi);
 }
 
+/*
+ * How many of the configured VMs actually fit, spending cores the way placement does: a VM takes
+ * whole cores and gets ALL of their threads as vCPUs, so it costs ceil(vcpus / threads_per_core)
+ * cores (#560). Reports the guest-available cores and threads for the message.
+ *
+ * Reads vcpu counts from the CONFIG, not from g_vms[].vcpu_count: this runs BEFORE
+ * fw_1_resolve_vcpus(), so the per-VM field still holds its provisional 1. The first version of
+ * #559 read that field and therefore never capped anything -- caught by reproducing the hardware
+ * case under QEMU, not by inspection.
+ */
+static unsigned fw_1_vms_that_fit(unsigned *out_cores, unsigned *out_threads) {
+    uint32_t threads[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned per_core[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned core_start[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned want[HYPE_CFG_MAX_VMS];
+    hype_smp_pack_vm_t packed[HYPE_CFG_MAX_VMS];
+    unsigned nthreads, ncores = 0, vi;
+
+    if (out_cores) *out_cores = 0;
+    if (out_threads) *out_threads = 0;
+    if (g_cpu_topo.count == 0u) {
+        return g_vm_count; /* no enumeration: the literal fallback path decides, not this */
+    }
+    /* Ask for every core; select_cores excludes the BSP's core entirely and clamps the rest. */
+    nthreads = hype_cpu_topology_select_cores(&g_cpu_topo, g_cpu_topo.count, threads,
+                                              HYPE_CPU_TOPOLOGY_MAX, &ncores);
+    if (out_cores) *out_cores = ncores;
+    if (out_threads) *out_threads = nthreads;
+    if (nthreads == 0u || ncores == 0u) {
+        return 0;
+    }
+    fw_1_core_runs(threads, nthreads, ncores, per_core, core_start);
+
+    for (vi = 0; vi < g_vm_count && vi < HYPE_CFG_MAX_VMS; vi++) {
+        want[vi] = (vi < g_hype_cfg.vm_count && g_hype_cfg.vms[vi].vcpus)
+                       ? g_hype_cfg.vms[vi].vcpus
+                       : 1u;
+    }
+    return hype_smp_pack(per_core, ncores, want, vi, packed, HYPE_MAX_VCPUS_PER_VM);
+}
+
 static void fw_1_phase1_config(void) {
     /* #452: the previous boot's log first -- it is the one thing a failed run leaves, and
      * writing it before anything else means a later fault here does not cost it. */
@@ -11990,45 +12088,30 @@ static void fw_1_phase1_config(void) {
         unsigned int launchable = g_vm_count;
         if (g_cpu_topo.count != 0u) {
             /*
-             * #559: a VM costs ONE CORE PER vCPU, not one core.
+             * #559/#560: admission must spend cores the way placement spends them.
              *
-             * This counted VMs against isolated cores while fw_1_place_vcpus_on_threads() asks for
-             * one whole core per vCPU (decision 40: thread = execution unit, core = allocation
-             * unit). The two disagreed, and the disagreement was silent: on a 4-core host, three
-             * VMs wanting 2+2+1 vCPUs were all admitted against 3 cores, placement ran out after
-             * the first two, and the LAST VM fell through to the legacy per-VM selector -- which
-             * handed it an APIC ID the placement had already given to another VM. Both VMs were
-             * started on the same core, one of them silently never ran, and nothing said so.
+             * This once counted VMs against isolated cores while placement spent a core per
+             * vCPU. The two disagreed, and the disagreement was silent: on a 4-core host, three
+             * VMs wanting 2+2+1 vCPUs were all admitted against 3 cores, placement ran out
+             * after the first two, and the LAST VM fell through to the legacy per-VM selector
+             * -- which handed it an APIC ID placement had already given to another VM. Both VMs
+             * were started on the same core, one silently never ran, and nothing said so.
              *
-             * Admission now spends the same currency placement does, so the cap it reports is the
-             * one that will actually hold.
+             * #559's fix made that loud but priced a vCPU at a whole core, which is stricter
+             * than decision 40: a core is granted whole and ALL of its threads are vCPUs of the
+             * one VM that owns it, so a VM costs ceil(vcpus / threads_per_core) cores. Both
+             * sides now call fw_1_vms_that_fit()/fw_1_core_runs(), so they cannot drift again.
              */
-            unsigned int cores = hype_cpu_topology_core_count(&g_cpu_topo);
-            unsigned int avail = (cores > 1u) ? (cores - 1u) : 0u; /* the BSP's core is reserved */
-            unsigned int used = 0u, vi_c;
+            unsigned int cores = 0u, hthreads = 0u;
+            unsigned int vi_c = fw_1_vms_that_fit(&cores, &hthreads);
 
-            /*
-             * Read the count from the CONFIG, not from g_vms[].vcpu_count: fw_1_resolve_vcpus()
-             * runs AFTER this block, so the per-VM field still holds its provisional 1 here. The
-             * first version of this fix read that field and therefore never capped anything --
-             * caught by reproducing the hardware case under QEMU rather than by inspection.
-             */
-            for (vi_c = 0u; vi_c < g_vm_count; vi_c++) {
-                unsigned int want = (vi_c < g_hype_cfg.vm_count && g_hype_cfg.vms[vi_c].vcpus)
-                                        ? g_hype_cfg.vms[vi_c].vcpus
-                                        : 1u;
-                if (used + want > avail) {
-                    break;
-                }
-                used += want;
-            }
             if (vi_c < launchable) {
                 HYPE_LOGF(HYPE_LOG_WARN,
-                          "adm: %u VM(s) configured wanting %u vCPU(s) in total, but this host has "
-                          "%u physical core(s) and reserves the BSP's -- %u core(s) for guests, so "
-                          "only the first %u VM(s) fit (each vCPU takes a WHOLE core, decision 40) "
-                          "[#396 #559]\n",
-                          g_vm_count, fw_1_total_configured_vcpus(), cores, avail, vi_c);
+                          "adm: %u VM(s) configured wanting %u vCPU(s) in total, but this host "
+                          "offers %u guest core(s) / %u thread(s) with the BSP's core reserved "
+                          "-- only the first %u VM(s) fit (a VM takes whole cores and all their "
+                          "threads, decision 40) [#396 #559 #560]\n",
+                          g_vm_count, fw_1_total_configured_vcpus(), cores, hthreads, vi_c);
                 launchable = vi_c;
             }
         }
@@ -12532,10 +12615,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * exactly -- a disagreement makes Linux log "[Firmware Bug]: APIC ID mismatch" and pick
      * one of the two to believe.
      *
-     * threads_per_core is 1 until SMT-aware core allocation lands (#479/#190). That is an
-     * honest report of what hype gives a VM today, not a placeholder: with one thread per
-     * granted core, "N vCPUs" really is N single-threaded cores. §10 decision 40 is what
-     * makes it more than 1, and it is set from one place when it does.
+     * threads_per_core comes from where this VM's vCPUs were actually placed (#560): a VM on
+     * both threads of one core reports 2, a VM on one thread of each of two cores reports 1.
+     * It is never a guess -- when siblings cannot be proven (#378) placement hands out one
+     * thread per core and this stays 1. fw_1_place_vcpus_on_threads is the single origin.
      */
     {
         unsigned vi;
