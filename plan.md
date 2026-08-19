@@ -2289,6 +2289,48 @@ isn't lost.
     call sites auto-steal today, and the next accessor added re-breaks it. The
     rule has to be structural.
 
+44. **Display mode -- decided: no config key; hype sets the mode nearest 1920x1080
+    at boot (2026-08-19, #529).**
+
+    **What forced the decision.** `resolution = WxH` in `hype.cfg` was the one
+    config key that had to be read before `ExitBootServices`: applying it calls
+    `hype_gop_mode_set(gop, ...)`, which goes through the GOP protocol, and
+    `core/gop_mode_hw.c` has exactly one setter taking that protocol pointer.
+    Decision 37 moves config reading into Phase 1, so "Phase 0 does no file
+    I/O" and "a configured resolution applies on this boot" could not both
+    hold.
+
+    **The rule.** The key is gone. At boot hype picks, from whatever modes the
+    firmware's GOP offers, the one closest to 1920x1080 -- minimum difference in
+    total pixels, tie-broken toward the wider mode, so an exact match wins by
+    construction. No GOP, or no mode list, keeps the firmware's current mode.
+    Which mode was chosen, and why, is logged.
+
+    **Rejected: applying the configured value on the NEXT boot.** It keeps the
+    key but makes `set resolution` a two-boot operation, and the value still has
+    to be persisted and read early by something.
+
+    **Rejected: a narrow pre-EBS read of display keys only.** It preserves
+    today's behaviour at the cost of the property decision 37 exists to
+    establish -- Phase 0 stops doing file I/O -- for one cosmetic setting.
+
+    **Rejected: hype writing its own display driver so it never needs GOP.**
+    Priced seriously and it is not close. Real VESA is INT 10h and unreachable
+    on a UEFI boot, so this means a KMS-class driver per display engine: PLL and
+    clock setup, DP/HDMI link training, AUX/DPCD, EDID parsing, panel power
+    sequencing, bandwidth and watermark calculation, all generation-specific.
+    i915's display code alone is >100k lines and AMD's DC is larger, against one
+    config key, and it contradicts section 3's "thin". The decisive cost is the
+    failure mode: mode-setting that is wrong on real hardware gives a black
+    panel with no console, on the serial-less laptops where that screen is the
+    only diagnostic channel there is. Firmware currently guarantees a working
+    framebuffer before hype touches anything, and that guarantee is worth more
+    than a configurable resolution.
+
+    A Bochs/QEMU-register-only setter, which needs no per-generation work, is a
+    reasonable follow-up if live resolution changes on a rig are ever wanted; it
+    would not remove the GOP dependency on real hardware.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
