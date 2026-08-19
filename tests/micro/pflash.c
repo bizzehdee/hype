@@ -25,16 +25,22 @@
  * human inspecting the file afterwards still sees a recognisable FV.
  */
 /*
- * STATUS: THIS TEST FAILS TODAY, and the failure is the point -- see #556.
+ * #556 WAS A WRONG DIAGNOSIS -- MINE -- AND IT IS WORTH KEEPING THE RECORD.
  *
- * A guest CFI read after a command returns array data rather than the model's synthesized response:
- * READ_STATUS gives 0x00 where devices/pflash.h makes 0x80 unconditional. hype's own counters show
- * the writes arriving (vars_writes=4, trap_flips=5), so only the read side is wrong, and #457's trap
- * appears to disengage before the guest's read executes.
+ * This test originally asserted that READ_STATUS returns READY (0x80) unconditionally, on the
+ * strength of pflash.h's comment "(always, this stub never busies)". It got 0x00 and I filed a
+ * ticket against hype's trap machinery, hypothesising that #457's trap disengaged before the
+ * guest's read.
  *
- * It is excluded from run-micro.sh's default list (MICRO_EXCLUDE_DEFAULT) so a default run stays a
- * signal, and it is committed rather than held back because the test IS the reproduction. Run it
- * with `tools/micro/run-micro.sh pflash`.
+ * A counter settled it: `vars_reads=2` -- both reads DID fault into the model, with the right mode
+ * in force (2 = READ_DEVID, 1 = READ_STATUS) and the trap engaged. So the model was consulted and
+ * answered 0x00 deliberately: `hype_pflash_reset` clears status because QEMU's pflash_cfi01 does,
+ * and OVMF's probe accepts the chip only if CLEAR_STATUS reads back 0.
+ *
+ * The behaviour was right, the header comment was stale, and the test asserted the header. The
+ * lesson is the one #318 already taught: a bounded assumption about what a value SHOULD be is not
+ * evidence, and one counter distinguishing "never reached the model" from "the model said this"
+ * would have saved the whole detour.
  */
 #include "micro.h"
 
@@ -132,15 +138,29 @@ void micro_main(uint64_t zero_page_gpa) {
         micro_halt();
     }
 
-    /* Status register: the model never reports busy, so READY must be set. */
+    /*
+     * STATUS BEFORE ANY PROGRAM MUST BE CLEARED (0x00), NOT READY.
+     *
+     * This is the opposite of what an obvious reading of pflash.h suggests, and asserting the
+     * obvious thing is what made this test fail for a day against correct behaviour (#556). READY
+     * is EARNED by completing a program or erase -- `hype_pflash_reset` sets status to 0 on
+     * purpose, matching QEMU's pflash_cfi01, because OVMF's QemuFlashDetected writes CLEAR_STATUS
+     * then READ_STATUS and accepts the chip as writable flash ONLY if it reads back 0. A model
+     * that reported READY here would make OVMF match none of its three arms and give up (#457).
+     *
+     * So this asserts the property firmware actually depends on, and the READY transition is
+     * checked after the program below -- which is a state machine test rather than a constant.
+     */
     mmio_write8(base + TEST_OFFSET, PFLASH_CMD_READ_STATUS);
     st = mmio_read8(base + TEST_OFFSET);
     mmio_write8(base + TEST_OFFSET, PFLASH_CMD_READ_ARRAY);
-    micro_puts("micro/" NAME ": status ");
+    micro_puts("micro/" NAME ": status before any program ");
     micro_put_hex(st);
-    micro_puts("\n");
-    if ((st & PFLASH_STATUS_READY) == 0u) {
-        micro_fail(NAME, "the CFI status register does not report the write state machine ready");
+    micro_puts(" (must be 0x00 -- cleared; OVMF's probe depends on it)\n");
+    if (st != 0u) {
+        micro_fail(NAME, "the CFI status register is not CLEARED on a fresh chip -- OVMF's "
+                         "QemuFlashDetected accepts the chip only if CLEAR_STATUS reads back 0, "
+                         "so a non-zero status here makes real firmware reject the flash");
         micro_halt();
     }
 
@@ -158,6 +178,23 @@ void micro_main(uint64_t zero_page_gpa) {
     micro_puts("\n");
     if (got != 0xABu) {
         micro_fail(NAME, "the byte programmed through the CFI model did not read back");
+        micro_halt();
+    }
+
+    /*
+     * NOW READY must be set: a completed program is what earns it. Checking the transition rather
+     * than the value is what makes this a test of the write state machine instead of a constant.
+     */
+    mmio_write8(base + TEST_OFFSET, PFLASH_CMD_READ_STATUS);
+    st = mmio_read8(base + TEST_OFFSET);
+    mmio_write8(base + TEST_OFFSET, PFLASH_CMD_READ_ARRAY);
+    micro_puts("micro/" NAME ": status after a completed program ");
+    micro_put_hex(st);
+    micro_puts(" (READY 0x80 must now be set)\n");
+    if ((st & PFLASH_STATUS_READY) == 0u) {
+        micro_fail(NAME, "a byte was programmed successfully but the status register never "
+                         "reported READY -- the write state machine does not signal completion, "
+                         "which is the bit a firmware driver polls");
         micro_halt();
     }
 

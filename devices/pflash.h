@@ -43,7 +43,15 @@
 #define HYPE_PFLASH_CMD_READ_ARRAY 0xFFu
 
 /* Status register bits this project actually sets. */
-#define HYPE_PFLASH_STATUS_READY 0x80u        /* Write State Machine ready (always, this stub never "busies") */
+/*
+ * Write State Machine ready. NOT always set: #457 made reset and CLEAR_STATUS leave status
+ * CLEARED (0x00), matching QEMU's pflash_cfi01, because OVMF's QemuFlashDetected accepts the chip
+ * as writable flash only if CLEAR_STATUS reads back 0. READY is EARNED by completing a program or
+ * erase. The previous comment here said "(always, this stub never busies)", which was true of
+ * busy-ness and false as a statement about the register -- it is what sent #556 chasing a
+ * non-existent trap bug for a day.
+ */
+#define HYPE_PFLASH_STATUS_READY 0x80u
 #define HYPE_PFLASH_STATUS_PROGRAM_ERROR 0x10u /* set if a write/erase targets an out-of-range offset */
 
 typedef enum {

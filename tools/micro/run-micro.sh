@@ -220,7 +220,7 @@ fi
 #
 # A silent exclusion would be worse than a failing default: it would make the suite claim coverage it
 # does not have. Both are printed, so a run says what it did not do.
-MICRO_EXCLUDE_DEFAULT="faulter pflash"
+MICRO_EXCLUDE_DEFAULT="faulter"
 
 if [ $# -eq 0 ]; then
     all=$(sed -n 's/^MICRO_NAMES := //p' Makefile | tr ' ' '\n' | grep -v '^$')

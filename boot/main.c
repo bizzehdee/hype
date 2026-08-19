@@ -4795,6 +4795,17 @@ static int vmm_absorb_mmio_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, const
 static uint64_t g_flash_trap_flips;
 static uint64_t g_flash_vars_writes;
 static uint64_t g_flash_code_writes_ignored;
+/*
+ * #556: reads that actually FAULTED into the model, versus writes.
+ *
+ * The counters this joins (vars_writes, trap_flips) proved the write path and the trap machinery
+ * both behave as designed -- 5 flips is exactly right for a devid/array/status/array command
+ * sequence. What they cannot say is whether the guest's READS reach the model at all. A read that
+ * never faults is served from the direct mapping and returns array bytes, which is precisely the
+ * reported symptom, and it is indistinguishable in the existing counters from a model that
+ * synthesized the wrong value. One counter separates those two.
+ */
+static uint64_t g_flash_vars_reads;
 
 /* #457: 2MB span of the window that must flip -- VARS plus the CODE head sharing its pages. */
 static uint64_t fw_1_flash_trap_span(const hype_fw_vm_t *vm) {
@@ -4872,6 +4883,18 @@ static int fw_1_flash_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind, hype_vcpu_ctx_
         if (rc == 0) {
             if (npf->is_write) {
                 g_flash_vars_writes++;
+            } else {
+                /* #556: the first few reads, with the mode that was in force -- so a wrong
+                 * synthesized value and a read that never got here look different. */
+                if (g_flash_vars_reads < 8u) {
+                    hype_debug_print("fw-1 FLASH: VARS read #%llu gpa=0x%llx mode=%u trap=%u "
+                                     "[#556]\n",
+                                     (unsigned long long)g_flash_vars_reads,
+                                     (unsigned long long)npf->guest_phys_addr,
+                                     (unsigned)vm->vars_flash.mode,
+                                     (unsigned)vm->flash_trap_mode);
+                }
+                g_flash_vars_reads++;
             }
             if (vm->flash_trap_mode && vm->vars_flash.mode == HYPE_PFLASH_MODE_READ_ARRAY) {
                 fw_1_flash_set_trap(vm, 0, kind, ctx);
@@ -23514,9 +23537,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 /* #457: did the flash machinery run at all -- and did the guest
                                  * actually write its varstore. Zero writes on a boot that reached
                                  * BDS means OVMF still concluded "not flash". */
-                                hype_debug_print("fw-1 FLASH: vars_writes=%llu trap_flips=%llu "
-                                                 "code_writes_ignored=%llu trap_now=%u [#457]\n",
+                                hype_debug_print("fw-1 FLASH: vars_writes=%llu vars_reads=%llu "
+                                                 "trap_flips=%llu "
+                                                 "code_writes_ignored=%llu trap_now=%u [#457 #556]\n",
                                                  (unsigned long long)g_flash_vars_writes,
+                                                 (unsigned long long)g_flash_vars_reads,
                                                  (unsigned long long)g_flash_trap_flips,
                                                  (unsigned long long)g_flash_code_writes_ignored,
                                                  (unsigned)g_vms[0].flash_trap_mode);
