@@ -51,14 +51,14 @@ CFG
     # The disk is declared here rather than in the test so the same artifact can be aimed at a
     # raw image, a qcow2 (#336) or a thin target (decision 42) by editing a config.
     case "$1" in
-        virtioblk) cat >> "$2" <<CFG
+        virtioblk|atadisk|ahci) cat >> "$2" <<CFG
 disks = d0
 
 [disk.d0]
 type = disk
 backing = file
 path = \\hype\\disks\\$1.img
-bus = virtio-blk
+bus = $(case "$1" in virtioblk) echo virtio-blk ;; *) echo ahci-sata ;; esac)
 CFG
         ;;
     esac
@@ -144,7 +144,7 @@ run_one() {   # $1 = test name
     # anything.
     local disk=""
     case "$name" in
-        virtioblk)
+        virtioblk|atadisk|ahci)
             disk="$OUTDIR/$name.img"
             rm -f "$disk"
             dd if=/dev/zero of="$disk" bs=1M count=1 status=none
@@ -155,9 +155,12 @@ run_one() {   # $1 = test name
         timeout $((SECS + 150)) tools/run-guest.sh "$ISO" "micro-$name" "$SECS" >/dev/null 2>&1
 
     report "$log" "$name" || return 1
-    if [ -n "$disk" ]; then
-        verify_backing_file "$name" 1 || return 1
-    fi
+    # Only the tests that WRITE data get the host-side pattern check. ahci issues IDENTIFY, which
+    # transfers device metadata and touches no sector -- demanding a pattern there would fail a
+    # correct run.
+    case "$name" in
+        virtioblk|atadisk) verify_backing_file "$name" 1 || return 1 ;;
+    esac
 }
 
 report() {   # $1 = log, $2.. = test names present in it

@@ -94,7 +94,7 @@ ESP       := $(BUILD_DIR)/esp
 # belong with the others -- but it is the one thing that surprises.
 MICRO_DIR   := tests/micro
 MICRO_OUT   := $(BUILD_DIR)/micro
-MICRO_NAMES := hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2 pflash pci ramfb virtioblk ahci
+MICRO_NAMES := hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2 pflash pci ramfb virtioblk ahci atadisk
 MICRO_IMAGES := $(patsubst %,$(MICRO_OUT)/%.bin,$(MICRO_NAMES))
 MICRO_CFLAGS := --target=x86_64-unknown-elf -ffreestanding -fno-stack-protector -fno-pic \
                 -mno-red-zone -mno-sse -Wall -Wextra -Werror -O2 -std=c11
@@ -113,10 +113,15 @@ micro: $(MICRO_IMAGES) $(MICRO_OUT)/suite.bin
 # faulter is deliberately NOT a member: it triple-faults on purpose, which would take the suite VM
 # and every test after it down. It stays a standalone artifact where that is the whole point.
 MICRO_SUITE_MEMBERS := hello ram1 cpumsr fwcfg pci pflash intdeliver pausespin ps2 ramfb
+# Every header a microtest may include, in ONE place: the per-test rule and the suite rule both
+# use it, so a new shared header cannot be added to one and forgotten in the other. A missing
+# entry does not fail the build -- it silently links a STALE object, which is the worst way for a
+# dependency to be wrong.
+MICRO_HDRS := $(MICRO_DIR)/micro.h $(MICRO_DIR)/micro_pci.h $(MICRO_DIR)/micro_idt.h \
+              $(MICRO_DIR)/micro_fwcfg.h $(MICRO_DIR)/micro_ahci.h
 MICRO_SUITE_OBJS := $(patsubst %,$(MICRO_OUT)/suite-%.o,$(MICRO_SUITE_MEMBERS))
 
-$(MICRO_OUT)/suite-%.o: $(MICRO_DIR)/%.c $(MICRO_DIR)/micro.h $(MICRO_DIR)/micro_pci.h \
-                        $(MICRO_DIR)/micro_idt.h
+$(MICRO_OUT)/suite-%.o: $(MICRO_DIR)/%.c $(MICRO_HDRS)
 	@mkdir -p $(MICRO_OUT)
 	$(CC) $(MICRO_CFLAGS) -DMICRO_SUITE -Dmicro_main=micro_test_$* -c $< -o $@
 
@@ -130,8 +135,7 @@ $(MICRO_OUT)/suite.elf: $(MICRO_DIR)/suite.c $(MICRO_SUITE_OBJS) $(MICRO_DIR)/cr
 	$(LD) $(MICRO_LDFLAGS) -o $@ $(MICRO_OUT)/crt0.o $(MICRO_OUT)/suite_jmp.o \
 	      $(MICRO_OUT)/suite-main.o $(MICRO_SUITE_OBJS)
 
-$(MICRO_OUT)/%.elf: $(MICRO_DIR)/%.c $(MICRO_DIR)/crt0.S $(MICRO_DIR)/micro.h \
-                    $(MICRO_DIR)/micro_pci.h $(MICRO_DIR)/micro_idt.h $(MICRO_DIR)/micro.ld
+$(MICRO_OUT)/%.elf: $(MICRO_DIR)/%.c $(MICRO_DIR)/crt0.S $(MICRO_HDRS) $(MICRO_DIR)/micro.ld
 	@mkdir -p $(MICRO_OUT)
 	$(CC) $(MICRO_CFLAGS) -c $< -o $(MICRO_OUT)/$*.o
 	$(CC) --target=x86_64-unknown-elf -ffreestanding -c $(MICRO_DIR)/crt0.S -o $(MICRO_OUT)/crt0.o

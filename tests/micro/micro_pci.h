@@ -62,6 +62,30 @@ static inline void micro_pci_write32(unsigned dev, unsigned off, uint32_t v) {
     *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, 0u, off) = v;
 }
 
+/*
+ * Function-aware variants. A real bus walk enumerates FUNCTIONS as well as devices: hype puts the
+ * SATA AHCI controller on device 31 as an ICH9 function, exactly where a real chipset does
+ * (00:1f.2), while the optical HBA is a device of its own. A test that walks devices only finds
+ * the wrong controller and concludes there is no disk (#548).
+ */
+static inline uint32_t micro_pci_fread32(unsigned dev, unsigned func, unsigned off) {
+    return *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, func, off);
+}
+
+static inline void micro_pci_fwrite32(unsigned dev, unsigned func, unsigned off, uint32_t v) {
+    *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, func, off) = v;
+}
+
+static inline int micro_pci_fpresent(unsigned dev, unsigned func) {
+    uint32_t id = micro_pci_fread32(dev, func, MICRO_PCI_VENDOR_ID);
+    return (id != 0xFFFFFFFFu && (id & 0xFFFFu) != 0xFFFFu) ? 1 : 0;
+}
+
+/* class(31:24) | subclass(23:16) | prog-IF(15:8) from the class/revision dword. */
+static inline uint32_t micro_pci_fclass(unsigned dev, unsigned func) {
+    return micro_pci_fread32(dev, func, MICRO_PCI_CLASS_REV) >> 8;
+}
+
 static inline uint16_t micro_pci_vendor(unsigned dev) {
     return (uint16_t)(micro_pci_read32(dev, MICRO_PCI_VENDOR_ID) & 0xFFFFu);
 }
@@ -81,14 +105,14 @@ static inline int micro_pci_present(unsigned dev) {
  * what the decoder handles is the existing convention here rather than something to extend for one
  * test's convenience.
  */
-static inline uint32_t micro_pci_bar_size(unsigned dev, unsigned bar_index) {
+static inline uint32_t micro_pci_fbar_size(unsigned dev, unsigned func, unsigned bar_index) {
     unsigned off = MICRO_PCI_BAR0 + bar_index * 4u;
-    uint32_t saved = micro_pci_read32(dev, off);
+    uint32_t saved = micro_pci_fread32(dev, func, off);
     uint32_t probe;
 
-    micro_pci_write32(dev, off, 0xFFFFFFFFu);
-    probe = micro_pci_read32(dev, off);
-    micro_pci_write32(dev, off, saved);
+    micro_pci_fwrite32(dev, func, off, 0xFFFFFFFFu);
+    probe = micro_pci_fread32(dev, func, off);
+    micro_pci_fwrite32(dev, func, off, saved);
 
     if (probe == 0u || probe == 0xFFFFFFFFu) {
         return 0u;
@@ -97,15 +121,24 @@ static inline uint32_t micro_pci_bar_size(unsigned dev, unsigned bar_index) {
     return (~probe) + 1u;
 }
 
+static inline uint32_t micro_pci_bar_size(unsigned dev, unsigned bar_index) {
+    return micro_pci_fbar_size(dev, 0u, bar_index);
+}
+
 /* Place a memory BAR at `gpa` and enable memory decoding + bus mastering. Returns `gpa`. */
-static inline uint64_t micro_pci_place_bar(unsigned dev, unsigned bar_index, uint64_t gpa) {
+static inline uint64_t micro_pci_fplace_bar(unsigned dev, unsigned func, unsigned bar_index,
+                                            uint64_t gpa) {
     unsigned off = MICRO_PCI_BAR0 + bar_index * 4u;
 
-    micro_pci_write32(dev, off, (uint32_t)gpa);
-    micro_pci_write32(dev, MICRO_PCI_COMMAND,
-                      (micro_pci_read32(dev, MICRO_PCI_COMMAND) & 0xFFFF0000u) |
-                          MICRO_PCI_CMD_MEM_SPACE | MICRO_PCI_CMD_BUS_MASTER);
+    micro_pci_fwrite32(dev, func, off, (uint32_t)gpa);
+    micro_pci_fwrite32(dev, func, MICRO_PCI_COMMAND,
+                       (micro_pci_fread32(dev, func, MICRO_PCI_COMMAND) & 0xFFFF0000u) |
+                           MICRO_PCI_CMD_MEM_SPACE | MICRO_PCI_CMD_BUS_MASTER);
     return gpa;
+}
+
+static inline uint64_t micro_pci_place_bar(unsigned dev, unsigned bar_index, uint64_t gpa) {
+    return micro_pci_fplace_bar(dev, 0u, bar_index, gpa);
 }
 
 #endif /* HYPE_MICRO_PCI_H */
