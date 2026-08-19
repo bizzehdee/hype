@@ -24,7 +24,8 @@ static UINT64 adm_round_up(UINT64 v, UINT64 granule) {
     return ((v + granule - 1ULL) / granule) * granule;
 }
 
-hype_adm_result_t hype_adm_check_pool(const hype_cfg_t *cfg, UINT64 pool_bytes,
+hype_adm_result_t hype_adm_check_pool(const hype_cfg_t *cfg, unsigned int vm_count,
+                                      UINT64 default_mem_bytes, UINT64 pool_bytes,
                                       UINT64 per_vm_firmware_bytes, UINT64 per_vm_vdisk_bytes,
                                       UINT64 granule_bytes, unsigned int *fit_out,
                                       UINT64 *shortfall_bytes_out) {
@@ -41,8 +42,12 @@ hype_adm_result_t hype_adm_check_pool(const hype_cfg_t *cfg, UINT64 pool_bytes,
     if (cfg == 0) {
         return adm_err(HYPE_ADM_ERR_MEMORY_OVERCOMMIT, HYPE_ADM_NO_VM, HYPE_ADM_NO_VM);
     }
-    for (i = 0; i < cfg->vm_count; i++) {
-        UINT64 want = adm_round_up((UINT64)cfg->vms[i].mem_mb * 1024ULL * 1024ULL, granule_bytes) +
+    for (i = 0; i < vm_count; i++) {
+        UINT64 mem = default_mem_bytes;
+        if (i < cfg->vm_count && cfg->vms[i].mem_mb != 0u) {
+            mem = (UINT64)cfg->vms[i].mem_mb * 1024ULL * 1024ULL;
+        }
+        UINT64 want = adm_round_up(mem, granule_bytes) +
                       adm_round_up(per_vm_firmware_bytes, granule_bytes) +
                       adm_round_up(per_vm_vdisk_bytes, granule_bytes);
         if (used + want > pool_bytes) {

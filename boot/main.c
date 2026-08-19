@@ -63,6 +63,7 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #include "../core/logbuf.h"
 #include "../core/log_drain.h"
 #include "../core/ram_pool.h"
+#include "../core/vm_create.h"
 /* #529: the display target hype aims at on every host -- decision 44. */
 #define HYPE_GOP_TARGET_WIDTH 1920u
 #define HYPE_GOP_TARGET_HEIGHT 1080u
@@ -2048,10 +2049,25 @@ static void load_input_script(hype_fw_vm_t *vm, unsigned vm_index);
 static void term_config_cmd(int idx, const char *nm);
 /* TERM-14 (#490): same placement reason -- needs g_hype_cfg + the serializer + #447. */
 static void term_set_cmd(int idx, const char *nm, const char *key, const char *value);
+/* TERM-10 (#486): the create wizard owns the command line while it is active. */
+static void term_create_begin(void);
+static void term_create_feed(const char *line);
+static int g_wizard_active;
 
 /* Execute the current command line, replacing the previous result, then clear the line. */
 static void term_run_cmdline(void) {
     hype_cmd_t c;
+    /*
+     * TERM-10 (#486): while the wizard is up it owns every line. Parsing verbs first would make
+     * an operator unable to name a VM "off" or answer "no", and worse, would silently execute a
+     * command instead of the answer they meant.
+     */
+    if (g_wizard_active) {
+        term_create_feed(g_cmdline);
+        g_cmdline[0] = '\0';
+        g_cmdline_len = 0;
+        return;
+    }
     int idx;
     hype_cmd_parse_at(g_cmdline, &c); /* fill-in-place: no by-value copy in freestanding code */
     idx = term_resolve_vm(c.arg);
@@ -2197,6 +2213,9 @@ static void term_run_cmdline(void) {
             break;
         }
         case HYPE_CMD_UNKNOWN:
+        case HYPE_CMD_CREATE:
+            term_create_begin();
+            break;
         default:
             term_resultf( "unknown command (try 'help')");
             break;
@@ -13446,7 +13465,9 @@ static void fw_1_phase1_config(void) {
                                  "skipped this boot [#453]\n");
                 fit = launchable;
             } else {
-                pr = hype_adm_check_pool(acfg, pool_bytes, g_vms[0].combined_size,
+                pr = hype_adm_check_pool(acfg, launchable,
+                                         (uint64_t)HYPE_FW_1_GUEST_RAM_MB * 1024ull * 1024ull,
+                                         pool_bytes, g_vms[0].combined_size,
                                          HYPE_FW_1_VDISK_BYTES, HYPE_RAM_POOL_ALIGN, &fit,
                                          &shortfall);
                 if (pr.status != HYPE_ADM_OK) {
@@ -20478,7 +20499,15 @@ static void load_hype_cfg(void) {
     UINT64 sz = 0;
     hype_cfg_result_t res;
 
-    g_hype_cfg.vm_count = 0;
+    /*
+     * #486: bind storage BEFORE any early return, not only on the parse path.
+     *
+     * Every "no config" outcome below leaves g_hype_cfg as it found it, and a struct that was never
+     * parsed into has vms == 0 and vm_cap == 0. That is fine for reading -- vm_count is 0 too --
+     * but it means the runtime `create` path saw a config that could hold ZERO VMs and refused to
+     * start on exactly the hosts that most need it: a fresh stick with no hype.cfg yet.
+     */
+    hype_cfg_init(&g_hype_cfg);
 
     bv = fw_1_boot_volume();
     if (bv == 0) {
@@ -21375,6 +21404,315 @@ static const struct {
     {"net_mode", HYPE_CFG_F_NET_MODE, 0},
     {"label", HYPE_CFG_F_LABEL, 1}, /* display metadata: nothing about the running guest uses it */
 };
+
+/*
+ * TERM-10 (#486): bring a newly created VM up with no host reboot.
+ *
+ * The boot path does this for every configured VM inside efi_main's launch loop; this is the same
+ * sequence for one VM, at runtime, on a slot Phase 0 already allocated state for (#393). Order
+ * matters and mirrors the boot path's: resolve the config values, carve guest memory and copy the
+ * firmware (#449/#451), resolve media, arm any script, then start one host core per guest-visible
+ * vCPU.
+ *
+ * Returns 0 when at least vCPU 0 started. A failure leaves the VM defined in hype.cfg -- it will
+ * come up on the next boot -- and says so at the call site rather than reporting a plain success.
+ */
+static int fw_1_start_new_vm(unsigned vi) {
+    hype_fw_vm_t *vmn;
+    unsigned cv, started = 0u, nv;
+
+    if (vi >= g_max_vms || vi != g_vm_count) {
+        return -1; /* only the next free slot; the launch paths index by VM number */
+    }
+    vmn = &g_vms[vi];
+
+    fw_1_resolve_guest_ram(vmn, &g_hype_cfg, vi);
+    fw_1_resolve_os_hint(vmn, &g_hype_cfg, vi);
+    fw_1_resolve_vcpus(vmn, &g_hype_cfg, vi);
+
+    /* Firmware: its own buffer, never shared. OVMF's VARS store is writable, so two guests sharing
+     * one would be a guest<->guest leak -- the property #451 had to preserve when it dropped the
+     * per-VM pristine SNAPSHOT but kept the per-VM working copy. */
+    vmn->code_size = g_vms[0].code_size;
+    vmn->vars_size = g_vms[0].vars_size;
+    vmn->combined_size = g_vms[0].combined_size;
+    vmn->combined_host_phys = fw_1_pool_carve(0, vi, HYPE_POOL_KIND_FW, vmn->combined_size,
+                                              "firmware");
+    if (vmn->combined_host_phys == 0ull) {
+        return -1;
+    }
+    hype_guest_ram_copy((void *)(uintptr_t)vmn->combined_host_phys,
+                        (const void *)(uintptr_t)g_vms[0].combined_host_phys, vmn->combined_size);
+    if (fw_1_ensure_guest_ram(vmn, vi) != 0) {
+        return -1;
+    }
+    vmn->host_tsc_hz = g_vms[0].host_tsc_hz;
+    vmn->disk[0].backing_phys = fw_1_pool_carve(0, vi, HYPE_POOL_KIND_VDISK,
+                                                HYPE_FW_1_VDISK_BYTES, "vdisk backing");
+    if (vmn->disk[0].backing_phys != 0ull) {
+        hype_guest_ram_zero((void *)(uintptr_t)vmn->disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
+    }
+
+    /* Published BEFORE the media resolve and the AP start: both index by VM number, and the
+     * dashboard renderer is already running on the BSP. */
+    g_vm_count = vi + 1u;
+
+    load_input_script(vmn, vi);
+    (void)fw_1_resolve_media_stream(vi);
+
+    nv = fw_1_guest_visible_vcpus(vmn);
+    if (nv > HYPE_MAX_VCPUS_PER_VM) nv = HYPE_MAX_VCPUS_PER_VM;
+    for (cv = 0u; cv < nv; cv++) {
+        unsigned slot = fw_1_vcpu_slot(vi, cv);
+        int sel = g_vcpu_thread_valid[vi][cv] ? (int)g_vcpu_thread[vi][cv]
+                                              : ((cv == 0u) ? fw_1_ap_apic_id(vi) : -1);
+        int rc;
+        if (sel < 0) {
+            continue;
+        }
+        rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
+                           (uint8_t)sel, (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
+                           (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
+                           g_vms[0].host_tsc_hz, fw_1_ap_main, (void *)FW_1_AP_ARG(vi, cv));
+        hype_debug_print("fw-1 CREATE: vm%u vCPU %u on apic=%d -> rc=%d [#486]\n", vi, cv, sel, rc);
+        if (rc == 0) {
+            started++;
+        } else if (cv == 0u) {
+            /* No vCPU 0 means no guest. Roll the count back so nothing advertises a VM that is
+             * not running -- a dashboard row for a VM with no core is #513's failure again. */
+            g_vm_count = vi;
+            return -1;
+        }
+    }
+    return (started != 0u) ? 0 : -1;
+}
+
+/*
+ * TERM-10 (#486): the wizard's terminal half -- prompts in, answers out, and on completion the two
+ * things the ticket asks for: the VM is written to hype.cfg so it survives a power cycle, and it is
+ * allocated and started with no host reboot.
+ *
+ * Admission (#453) is re-checked here, against the reserved pool, BEFORE anything is written or
+ * allocated. A create that would not have been admitted at boot is refused at runtime with the same
+ * real numbers -- decision 33's reversal names that as a condition, not a nicety.
+ */
+static hype_vm_wizard_t g_wizard;
+
+static void term_create_show(void) {
+    if (g_wizard.have_error) {
+        term_resultf("create: %s\n%s", g_wizard.error, hype_vm_wizard_prompt(&g_wizard));
+    } else {
+        term_resultf("create: %s", hype_vm_wizard_prompt(&g_wizard));
+    }
+}
+
+static void term_create_begin(void) {
+    if (g_hype_cfg.vm_count >= g_hype_cfg.vm_cap) {
+        term_resultf("create: the config already holds %u VM(s), its storage limit -- nothing "
+                     "created", g_hype_cfg.vm_count);
+        return;
+    }
+    if (g_hype_cfg.vm_count != g_vm_count) {
+        /*
+         * #486: the config must describe the VMs that are running, or a create changes the VM set
+         * on the next boot rather than adding to it.
+         *
+         * This is the no-hype.cfg case: hype is running its built-in defaults, which no [vm.*]
+         * section describes, so writing a config containing only the new VM would leave the next
+         * boot with ONE machine instead of three. Refused rather than done silently -- the ticket's
+         * own bar starts from a host whose VMs came from hype.cfg, and materialising the defaults
+         * into sections is its own piece of work (a 'save' verb), not a side effect of create.
+         */
+        term_resultf("create: this host is running %u VM(s) that hype.cfg does not describe (it "
+                     "has %u section(s)) -- creating one now would change the VM set on the next "
+                     "boot; nothing created", g_vm_count, g_hype_cfg.vm_count);
+        return;
+    }
+    if (g_vm_count >= g_max_vms) {
+        /* #393's slot, from decision 33's own reversal conditions: per-VM state was allocated for
+         * the host's core bound, and there is no more of it. Said plainly rather than discovered
+         * as a failure three prompts later. */
+        term_resultf("create: all %u per-VM slot(s) this host can pin are in use -- nothing "
+                     "created", g_max_vms);
+        return;
+    }
+    hype_vm_wizard_begin(&g_wizard);
+    g_wizard_active = 1;
+    hype_debug_print("fw-1 CREATE: wizard started (%u VM(s) now, %u slot(s) available) [#486]\n",
+                     g_vm_count, g_max_vms - g_vm_count);
+    term_create_show();
+}
+
+/* Serialize the candidate config and write it through the verified boot volume. 0 on success. */
+static int term_create_write_cfg(const hype_cfg_t *cand) {
+    static char text[16384];
+    hype_cfg_serialize_result_t sr;
+    hype_fs_t *bv;
+    hype_fs_file_t f;
+
+    sr = hype_cfg_serialize(cand, text, sizeof(text));
+    if (sr.truncated || sr.refused_overflow) {
+        term_resultf("create: the config would not serialize (too large) -- nothing changed");
+        return -1;
+    }
+    bv = fw_1_boot_volume();
+    if (bv == 0) {
+        /* Refusing rather than creating a RAM-only VM: a machine that exists until the next reboot
+         * and then silently does not is worse than one that was never created. */
+        term_resultf("create: boot volume unavailable -- refusing to create a VM the next boot "
+                     "cannot see; nothing changed");
+        return -1;
+    }
+    if (hype_fs_create(bv, "hype.cfg", &f) != 0 ||
+        hype_fs_write_at(&f, 0, text, sr.len) != 0) {
+        term_resultf("create: writing hype.cfg failed -- nothing changed in RAM either");
+        return -1;
+    }
+    (void)hype_fs_sync(bv);
+    return 0;
+}
+
+static void term_create_finish(void) {
+    static hype_cfg_t cand;
+    unsigned int ni;
+    hype_adm_result_t ar;
+    unsigned int fit = 0u;
+    uint64_t shortfall = 0ull;
+    char summary[192];
+
+    /* Candidate = the live config plus the new VM. Admitted, written and adopted as a whole, so a
+     * refusal leaves nothing half-applied. */
+    hype_guest_ram_copy(&cand, &g_hype_cfg, sizeof(hype_cfg_t));
+    cand.vms = cand.vms_default;
+    hype_guest_ram_copy(cand.vms, g_hype_cfg.vms,
+                        sizeof(hype_cfg_vm_t) * (unsigned long long)g_hype_cfg.vm_count);
+    ni = cand.vm_count;
+    /* Appended through the config module, which adds the SECTION as well as the VM -- the
+     * serializer emits sections, so a VM without one is written nowhere. */
+    if (hype_cfg_append_vm(&cand, &g_wizard.vm) != 0) {
+        term_resultf("create: no room left in the config for another VM -- nothing created");
+        g_wizard_active = 0;
+        return;
+    }
+
+    ar = hype_adm_check_cpu_set(&cand, g_cpu_topo.count);
+    if (ar.status == HYPE_ADM_OK) {
+        ar = hype_adm_check_target_disk(&cand);
+    }
+    if (ar.status == HYPE_ADM_OK) {
+        ar = hype_adm_check_net_peers(&cand);
+    }
+    if (ar.status != HYPE_ADM_OK) {
+        term_resultf("create: REFUSED -- isolation check %d fails between vm%u and vm%u; nothing "
+                     "created", (int)ar.status, ar.vm_index_a, ar.vm_index_b);
+        g_wizard_active = 0;
+        return;
+    }
+    if (g_guest_pool_ready) {
+        ar = hype_adm_check_pool(&cand, cand.vm_count,
+                                 (uint64_t)HYPE_FW_1_GUEST_RAM_MB * 1024ull * 1024ull,
+                                 g_guest_pool.size, g_vms[0].combined_size,
+                                 HYPE_FW_1_VDISK_BYTES, HYPE_RAM_POOL_ALIGN, &fit, &shortfall);
+        if (ar.status != HYPE_ADM_OK) {
+            term_resultf("create: REFUSED -- the %llu MiB pool is short by %llu MiB for this VM "
+                         "(%u fit); nothing created",
+                         (unsigned long long)(g_guest_pool.size / (1024ull * 1024ull)),
+                         (unsigned long long)(shortfall / (1024ull * 1024ull)), fit);
+            g_wizard_active = 0;
+            return;
+        }
+    }
+    if (term_create_write_cfg(&cand) != 0) {
+        g_wizard_active = 0;
+        return;
+    }
+    /* Adopt only after the write succeeded, so RAM and disk never disagree. */
+    hype_guest_ram_copy(g_hype_cfg.vms, cand.vms,
+                        sizeof(hype_cfg_vm_t) * (unsigned long long)cand.vm_count);
+    hype_guest_ram_copy(g_hype_cfg.sections, cand.sections, sizeof(g_hype_cfg.sections));
+    g_hype_cfg.section_count = cand.section_count;
+    g_hype_cfg.vm_count = cand.vm_count;
+    g_wizard_active = 0;
+
+    hype_vm_wizard_summary(&g_wizard, summary, sizeof(summary));
+    hype_debug_print("fw-1 CREATE: vm%u written to hype.cfg -- %s [#486]\n", ni, summary);
+    if (fw_1_start_new_vm(ni) == 0) {
+        term_resultf("created vm%u '%s' -- written to hype.cfg and STARTED", ni,
+                     g_hype_cfg.vms[ni].name);
+    } else {
+        /* The config is on disk, so the VM exists from the next boot even if this host could not
+         * bring it up now. Said explicitly rather than reported as a plain success. */
+        term_resultf("created vm%u '%s' -- written to hype.cfg, but it could NOT be started now; "
+                     "it will come up on the next boot", ni, g_hype_cfg.vms[ni].name);
+    }
+}
+
+static void term_create_feed(const char *line) {
+    hype_vmw_step_t st = hype_vm_wizard_feed(&g_wizard, line, &g_hype_cfg);
+    if (st == HYPE_VMW_CANCELLED) {
+        g_wizard_active = 0;
+        term_resultf("create: cancelled -- nothing was written or started");
+        return;
+    }
+    if (st == HYPE_VMW_DONE) {
+        term_create_finish();
+        return;
+    }
+    if (st == HYPE_VMW_CONFIRM && !g_wizard.have_error) {
+        char summary[192];
+        hype_vm_wizard_summary(&g_wizard, summary, sizeof(summary));
+        term_resultf("create: %s\n%s", summary, hype_vm_wizard_prompt(&g_wizard));
+        return;
+    }
+    term_create_show();
+}
+
+
+/*
+ * TERM-10 (#486) validation hook, build-gated and off by default.
+ *
+ * The wizard's rules are unit-tested; what needs proving on a running host is the half that cannot
+ * be: admission against the reserved pool, the hype.cfg write, and a VM that starts with no host
+ * reboot. Driving it through emulated keystrokes proved unreliable on the QEMU rig (chords=0, most
+ * keys dropped -- a host-input concern, not a create-path one), so this synthesises the answers the
+ * operator would have typed and runs the same code the terminal runs.
+ *
+ * Deliberately not reachable in a normal build: -DHYPE_486_AUTOCREATE=1 only.
+ */
+#ifndef HYPE_486_AUTOCREATE
+#define HYPE_486_AUTOCREATE 0
+#endif
+#if HYPE_486_AUTOCREATE
+static void fw_1_autocreate_probe(void) {
+    static int done;
+    static uint64_t at;
+    uint64_t hz = g_vms[0].host_tsc_hz;
+    const char *answers[] = {"probe1", "linux", "1", "256", "", "-", "disk", "", "yes"};
+    unsigned i;
+
+    if (done || hz == 0ull) {
+        return;
+    }
+    if (at == 0ull) {
+        at = hype_rdtsc() + 25ull * hz; /* let both configured guests get going first */
+        return;
+    }
+    if (hype_rdtsc() < at) {
+        return;
+    }
+    done = 1;
+    hype_debug_print("fw-1 CREATE-PROBE: driving the wizard with fixed answers [#486]\n");
+    term_create_begin();
+    if (!g_wizard_active) {
+        hype_debug_print("fw-1 CREATE-PROBE: wizard refused to start [#486]\n");
+        return;
+    }
+    for (i = 0; i < sizeof(answers) / sizeof(answers[0]) && g_wizard_active; i++) {
+        term_create_feed(answers[i]);
+    }
+    hype_debug_print("fw-1 CREATE-PROBE: finished -- %u VM(s) now [#486]\n", g_vm_count);
+}
+#endif
 
 static void term_set_cmd(int idx, const char *nm, const char *key, const char *value) {
     static char text[16384];   /* current config, serialized */
@@ -25325,6 +25663,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * the log-drain gate below: that only fires when there is log data to write, and a
              * quiet run would otherwise leave a waiting VM spinning until its own timeout.
              */
+#if HYPE_486_AUTOCREATE
+            fw_1_autocreate_probe();
+#endif
             bsp_phase(BSP_PHASE_FLUSH);
             fw_1_vars_service();
             bsp_phase(BSP_PHASE_IDLE);

@@ -530,6 +530,18 @@ hype_cfg_result_t hype_cfg_parse_into(char *text, hype_cfg_t *out, hype_cfg_vm_t
 unsigned int hype_cfg_count_vms(const char *text);
 
 /*
+ * TERM-10 (#486): append a VM to a parsed config so the serializer will emit it.
+ *
+ * hype_cfg_serialize() walks sections[], not vms[] -- that is how CONFIG-3 preserves comments,
+ * unknown keys and the operator's own ordering. A VM appended to vms[] alone therefore has no
+ * section to emit, and the write-back silently drops it: measured as a create that started the VM
+ * and wrote a hype.cfg without it, so the machine existed until the next boot and then did not.
+ *
+ * Returns 0 on success, -1 when either the VM array or the section table is full.
+ */
+int hype_cfg_append_vm(hype_cfg_t *cfg, const hype_cfg_vm_t *vm);
+
+/*
  * CONFIG-3 (#221): serialize `cfg` back into `hype.cfg` text, for the GUI/TUI
  * dashboard to persist a runtime edit (mem, vcpus, net, boot=installer->disk,
  * attach/detach a disk, ...) across a host reboot.

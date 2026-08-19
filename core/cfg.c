@@ -1021,6 +1021,37 @@ void hype_cfg_init(hype_cfg_t *out) {
     out->vm_cap = HYPE_CFG_MAX_VMS;
 }
 
+int hype_cfg_append_vm(hype_cfg_t *cfg, const hype_cfg_vm_t *vm) {
+    hype_cfg_section_t *sec;
+    unsigned int ni;
+    unsigned char *dst;
+    const unsigned char *src;
+    unsigned long long k;
+
+    if (cfg == 0 || vm == 0) {
+        return -1;
+    }
+    if (cfg->vm_count >= cfg->vm_cap || cfg->section_count >= HYPE_CFG_MAX_SECTIONS) {
+        return -1;
+    }
+    ni = cfg->vm_count;
+    dst = (unsigned char *)&cfg->vms[ni];
+    src = (const unsigned char *)vm;
+    for (k = 0; k < sizeof(*vm); k++) {
+        dst[k] = src[k];
+    }
+    cfg->vm_count = ni + 1u;
+
+    sec = &cfg->sections[cfg->section_count];
+    sec->kind = HYPE_CFG_SECTION_VM;
+    sec->index = (int)ni;
+    (void)hype_strlcpy(sec->name, vm->name, HYPE_CFG_NAME_MAX);
+    /* The header is written the way an operator would write it, because it IS re-emitted verbatim. */
+    hype_snprintf(sec->raw, HYPE_CFG_LINE_MAX, "[vm.%s]", vm->name);
+    cfg->section_count++;
+    return 0;
+}
+
 unsigned int hype_cfg_count_vms(const char *text) {
     unsigned int n = 0;
     const char *p = text;

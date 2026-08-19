@@ -66,10 +66,16 @@ typedef struct {
  * Counts what a VM actually carves: its guest RAM, its firmware image and its vdisk backing, each
  * rounded up to the pool's 2 MB granularity, because a carve consumes whole granules.
  *
+ * `vm_count` is how many VMs hype will actually run, which is NOT always cfg->vm_count: with no
+ * hype.cfg at all, hype runs its built-in default set and the config describes none of them.
+ * `default_mem_bytes` covers those. Checking only the configured ones reported "0 VMs fit" on a
+ * default boot and capped the host to a single VM.
+ *
  * `fit_out` receives how many VMs fit in config order, so the caller can name the ones that will
  * not run rather than reporting a bare total. `shortfall_bytes_out` receives what was missing.
  */
-hype_adm_result_t hype_adm_check_pool(const hype_cfg_t *cfg, UINT64 pool_bytes,
+hype_adm_result_t hype_adm_check_pool(const hype_cfg_t *cfg, unsigned int vm_count,
+                                      UINT64 default_mem_bytes, UINT64 pool_bytes,
                                       UINT64 per_vm_firmware_bytes, UINT64 per_vm_vdisk_bytes,
                                       UINT64 granule_bytes, unsigned int *fit_out,
                                       UINT64 *shortfall_bytes_out);
