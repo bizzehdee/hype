@@ -159,7 +159,23 @@ hype_adm_result_t hype_adm_check_target_disk(const hype_cfg_t *cfg) {
     unsigned int i, j;
 
     for (i = 0; i < cfg->vm_count; i++) {
+        /*
+         * #537: only VMs that actually DECLARE an inline target can collide on one.
+         *
+         * An absent target_disk leaves the struct zeroed -- kind FILE (enum 0) and an empty path
+         * -- so two VMs with no inline target compared equal and the later one was refused. Two
+         * empty strings are not the same disk; they are the absence of a disk. This was reachable
+         * long before #535's storage-less boot mode: the `disks = <disk-id>` reference form of
+         * §5.2 leaves target_disk empty too, so any config with two reference-form VMs already
+         * lost the second one silently.
+         */
+        if (!hype_cfg_vm_has_target_disk(&cfg->vms[i])) {
+            continue;
+        }
         for (j = i + 1; j < cfg->vm_count; j++) {
+            if (!hype_cfg_vm_has_target_disk(&cfg->vms[j])) {
+                continue;
+            }
             if (target_disk_equal(&cfg->vms[i].target_disk, &cfg->vms[j].target_disk)) {
                 return adm_err(HYPE_ADM_ERR_TARGET_DISK_COLLISION, i, j);
             }

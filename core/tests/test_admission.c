@@ -281,6 +281,74 @@ static void test_target_disk_same_path_different_kind_is_ok(void) {
               (int)HYPE_ADM_OK, (int)r.status);
 }
 
+/*
+ * #537: two VMs with NO target_disk must NOT collide. An absent inline target leaves the struct
+ * zeroed -- kind FILE (enum 0), empty path -- so this compared equal and refused the second VM.
+ * Reachable without #535's storage-less boot mode: §5.2's `disks = <id>` reference form leaves
+ * target_disk empty too.
+ */
+static void test_target_disk_absent_on_both_is_ok(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    /* Both VMs declare no inline target -- what a reference-form or kernel-boot VM looks like. */
+    cfg.vms[0].target_disk.path_or_id[0] = '\0';
+    cfg.vms[1].target_disk.path_or_id[0] = '\0';
+
+    r = hype_adm_check_target_disk(&cfg);
+    CHECK_INT("two VMs with no target_disk do not collide", (int)HYPE_ADM_OK, (int)r.status);
+}
+
+static void test_target_disk_absent_on_one_is_ok(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    cfg.vms[1].target_disk.path_or_id[0] = '\0';
+
+    r = hype_adm_check_target_disk(&cfg);
+    CHECK_INT("one VM with a target and one without do not collide", (int)HYPE_ADM_OK,
+              (int)r.status);
+
+    /* And the other way round, so the fix is not order-dependent. */
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    cfg.vms[0].target_disk.path_or_id[0] = '\0';
+    r = hype_adm_check_target_disk(&cfg);
+    CHECK_INT("absent on the FIRST VM does not collide either", (int)HYPE_ADM_OK, (int)r.status);
+}
+
+/*
+ * The invariant itself must be untouched: three VMs where only the middle pair share a real path
+ * must still be refused, and named correctly.
+ */
+static void test_target_disk_collision_still_caught_among_absent_ones(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 3;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "shared.img");
+    make_vm(&cfg.vms[2], "c", 1, 512, "shared.img");
+    cfg.vms[0].target_disk.path_or_id[0] = '\0';
+
+    r = hype_adm_check_target_disk(&cfg);
+    CHECK_INT("a real collision is still refused", (int)HYPE_ADM_ERR_TARGET_DISK_COLLISION,
+              (int)r.status);
+    CHECK_INT("and names the right first VM", 1, r.vm_index_a);
+    CHECK_INT("and the right second VM", 2, r.vm_index_b);
+}
+
 /* ---- hype_adm_check_net_peers ---- */
 
 static void test_net_peers_valid_pairing_is_ok(void) {
@@ -810,6 +878,9 @@ int main(void) {
     test_target_disk_unique_is_ok();
     test_target_disk_collision_same_kind();
     test_target_disk_same_path_different_kind_is_ok();
+    test_target_disk_absent_on_both_is_ok();
+    test_target_disk_absent_on_one_is_ok();
+    test_target_disk_collision_still_caught_among_absent_ones();
     test_net_peers_valid_pairing_is_ok();
     test_net_peers_unknown_vm_rejected();
     test_net_peers_requires_nat_on_both_sides();
