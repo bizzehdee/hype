@@ -34,7 +34,14 @@ if bad:
 print("safety: no physical: target in any config -- OK")
 PY
 
-rm -f "$DST"/HYPE.LOG "$DST"/VM0.LOG "$DST"/VM1.LOG "$DST"/vars-vm*.bin
+# Clear the previous run's evidence and state. The glob was `vars-vm*.bin`, which missed
+# `vars-intdeliver.bin` -- #441 names a varstore after the VM's SECTION, not vmN, so a stale one
+# survived a stage that claimed to clear varstores. Per-VM logs are named after the VM too, so the
+# same mistake applied to them.
+rm -f "$DST"/HYPE.LOG "$DST"/*.LOG "$DST"/vars-*.bin
+# Stale input scripts are worse than none: a leftover \input\vm8.txt from a different config looks
+# like a script that should be driving something. Replace the directories wholesale.
+rm -rf "$DST"/input "$DST"/input-micro
 mkdir -p "$DST/EFI/BOOT" "$DST/EFI/hype/micro" "$DST/input" "$DST/input-micro"
 cp build/hype.efi "$DST/EFI/BOOT/BOOTX64.EFI"
 cp fw/OVMF_CODE.fd fw/OVMF_VARS.fd "$DST/EFI/hype/"
