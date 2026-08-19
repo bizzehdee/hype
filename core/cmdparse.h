@@ -26,7 +26,7 @@ typedef enum {
     /* TERM-7 (#443): the first entry in TERM's general host-settings mechanism. arg = "list" (show
      * every resolution the GOP offers), "<W>x<H>" (apply and persist one), or absent (show the
      * current setting). */
-    HYPE_CMD_RESOLUTION,
+    /* #529: HYPE_CMD_RESOLUTION retired with the config key (decision 44). */
     /* TERM-6 (#444): arg = a VM name/index (the same addressing every other per-VM verb uses).
      * Prints that VM's full effective hype.cfg -- every field, tagged (default) or (set) --
      * into the dashboard's multi-line result panel (#460). */

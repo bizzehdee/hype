@@ -56,3 +56,25 @@ int hype_gop_mode_parse_wxh(const char *s, uint32_t *out_width, uint32_t *out_he
     *out_height = (uint32_t)h;
     return 0;
 }
+
+int hype_gop_mode_find_nearest(const hype_gop_mode_t *modes, unsigned int count, uint32_t target_w,
+                               uint32_t target_h) {
+    unsigned int i;
+    int best = -1;
+    uint64_t best_dist = 0ull;
+    uint64_t target_px = (uint64_t)target_w * (uint64_t)target_h;
+
+    if (modes == 0 || count == 0u) {
+        return -1;
+    }
+    for (i = 0; i < count; i++) {
+        uint64_t px = (uint64_t)modes[i].width * (uint64_t)modes[i].height;
+        uint64_t dist = (px > target_px) ? (px - target_px) : (target_px - px);
+        if (best < 0 || dist < best_dist ||
+            (dist == best_dist && modes[i].width > modes[best].width)) {
+            best = (int)i;
+            best_dist = dist;
+        }
+    }
+    return best;
+}

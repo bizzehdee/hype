@@ -468,7 +468,8 @@ enum {
     H_DEFAULT_NET_MODE = 1u << 2,
     H_DASHBOARD_VIEW = 1u << 3,
     H_AUTOSTART = 1u << 4,
-    H_RESOLUTION = 1u << 5,
+    /* #529: bit 5 was H_RESOLUTION. Left as a gap rather than renumbered -- the values are a
+     * duplicate-key bitmask, not a wire format, and shifting them buys nothing. */
     H_CPU_AVG_WINDOW = 1u << 6
 };
 
@@ -562,27 +563,6 @@ static hype_cfg_status_t apply_hype_field(hype_cfg_hype_t *h, unsigned int *seen
             h->autostart = HYPE_CFG_AUTOSTART_LIST;
         }
         *seen |= H_AUTOSTART;
-        return HYPE_CFG_OK;
-    }
-    if (hype_streq(key, "resolution")) {
-        /* TERM-7 (#443): `<width>x<height>`, e.g. `1920x1080`. Both dimensions must be nonzero --
-         * a 0 is not a real resolution and `has_resolution` already carries "unset", so a 0 here
-         * would only mean the operator wrote something meaningless. */
-        char *x = find_char(val, 'x');
-        unsigned long long w, hgt;
-        if (*seen & H_RESOLUTION) return HYPE_CFG_ERR_DUPLICATE_KEY;
-        if (*x != 'x') return HYPE_CFG_ERR_BAD_VALUE;
-        *x = '\0';
-        if (hype_parse_uint(val, &w) != 0 || hype_parse_uint(x + 1, &hgt) != 0) {
-            return HYPE_CFG_ERR_BAD_VALUE;
-        }
-        if (w == 0u || hgt == 0u || w > 0xFFFFFFFFULL || hgt > 0xFFFFFFFFULL) {
-            return HYPE_CFG_ERR_BAD_VALUE;
-        }
-        h->resolution_width = (unsigned int)w;
-        h->resolution_height = (unsigned int)hgt;
-        h->has_resolution = 1;
-        *seen |= H_RESOLUTION;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "cpu_avg_window_secs")) {
@@ -1570,13 +1550,6 @@ static void serialize_hype(hype_cfg_w_t *w, const hype_cfg_hype_t *h) {
         w_kv_list(w, "autostart", h->autostart_vms, h->autostart_count);
     } else {
         w_kv(w, "autostart", "all");
-    }
-    /* TERM-7 (#443): omitted entirely when unset -- that is what makes "no setting found" fall
-     * back to the firmware's own current mode instead of a hardcoded resolution. */
-    if (h->has_resolution) {
-        char tmp[24];
-        hype_snprintf(tmp, sizeof(tmp), "%ux%u", h->resolution_width, h->resolution_height);
-        w_kv(w, "resolution", tmp);
     }
     /* #429: always has a real, meaningful value (default 1) -- same "always emit" treatment as
      * config_version, no has_* flag needed. */

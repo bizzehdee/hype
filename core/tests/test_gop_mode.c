@@ -118,7 +118,38 @@ static void test_parse_wxh_rejects_malformed(void) {
     }
 }
 
+/* #529 (decision 44): there is no resolution config key -- hype aims at 1920x1080 and takes the
+ * nearest mode offered. */
+static void test_nearest_mode_to_1080p(void) {
+    hype_gop_mode_t modes[5];
+    modes[0].mode_number = 0; modes[0].width = 800;  modes[0].height = 600;
+    modes[1].mode_number = 1; modes[1].width = 1920; modes[1].height = 1080;
+    modes[2].mode_number = 2; modes[2].width = 3840; modes[2].height = 2160;
+    modes[3].mode_number = 3; modes[3].width = 1600; modes[3].height = 900;
+    modes[4].mode_number = 4; modes[4].width = 1920; modes[4].height = 1200;
+
+    CHECK_INT("an exact 1920x1080 wins", 1, (hype_gop_mode_find_nearest(modes, 5u, 1920u, 1080u) == 1) ? 1 : 0);
+    /* Without the exact match, 1920x1200 beats 1600x900: nearer in total pixels, and the mode an
+     * operator looking at the panel would call closer. */
+    CHECK_INT("1920x1200 beats 1600x900 for a 1080p target", 1, (hype_gop_mode_find_nearest(modes + 2, 3u, 1920u, 1080u) == 2) ? 1 : 0);
+    CHECK_INT("an empty list has no answer", 1, (hype_gop_mode_find_nearest(modes, 0u, 1920u, 1080u) == -1) ? 1 : 0);
+    CHECK_INT("a null list has no answer", 1, (hype_gop_mode_find_nearest(0, 5u, 1920u, 1080u) == -1) ? 1 : 0);
+    CHECK_INT("a single offered mode is the answer whatever it is", 1, (hype_gop_mode_find_nearest(modes, 1u, 1920u, 1080u) == 0) ? 1 : 0);
+}
+
+/* Equidistant modes must resolve the same way every boot, or the console size becomes a coin
+ * toss between builds. */
+static void test_nearest_mode_tie_breaks_on_width(void) {
+    hype_gop_mode_t modes[2];
+    modes[0].mode_number = 0; modes[0].width = 1000; modes[0].height = 2073;
+    modes[1].mode_number = 1; modes[1].width = 2073; modes[1].height = 1000;
+    CHECK_INT("the wider of two equidistant modes wins", 1, (hype_gop_mode_find_nearest(modes, 2u, 1440u, 1440u) == 1) ? 1 : 0);
+}
+
+
 int main(void) {
+    test_nearest_mode_to_1080p();
+    test_nearest_mode_tie_breaks_on_width();
     test_find_matches_exact_wxh();
     test_find_returns_minus_one_when_absent();
     test_parse_wxh_accepts_real_resolutions();

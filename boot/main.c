@@ -63,6 +63,9 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #include "../core/logbuf.h"
 #include "../core/log_drain.h"
 #include "../core/ram_pool.h"
+/* #529: the display target hype aims at on every host -- decision 44. */
+#define HYPE_GOP_TARGET_WIDTH 1920u
+#define HYPE_GOP_TARGET_HEIGHT 1080u
 #include "../core/clockfacts.h"
 #include "../core/io_histogram.h"
 #include "../core/format.h"
@@ -1372,7 +1375,7 @@ static int g_view_switch_pending_view = -2;
 #define HYPE_FW_1_SHUTDOWN_GRACE_S 10ull
 
 /* TERM-8 (#445): defined further down (needs g_gop_console, g_hype_cfg, g_host_time -- same
- * reason term_resolution_cmd/term_config_cmd are forward-declared). Dumps the current on-screen
+ * reason term_config_cmd is forward-declared). Dumps the current on-screen
  * framebuffer to a PNG on whichever writable volume is mounted. */
 static void term_take_screenshot(void);
 
@@ -2019,12 +2022,11 @@ static void fw_1_host_action_poll(void) {
 /* TERM-7 (#443): defined further down, once g_hype_cfg/g_hype_log/g_term_gop are all declared --
  * forward-declared here so term_run_cmdline's switch can call it. Appends its result with
  * term_resultf(), matching every other verb's own convention. */
-static void term_resolution_cmd(hype_cmd_t *c);
 /* #447: hype's own boot volume, mounted for writing post-EBS -- defined with the other
  * device-scan plumbing, forward-declared for the config write-back sites above it. */
 static hype_fs_t *fw_1_boot_volume(void);
 
-/* TERM-6 (#444): same reason/placement as term_resolution_cmd above -- needs g_hype_cfg. `idx` is
+/* TERM-6 (#444): needs g_hype_cfg, hence the forward declaration. `idx` is
  * the VM index term_run_cmdline already resolved from the command's arg. */
 static void term_config_cmd(int idx, const char *nm);
 /* TERM-14 (#490): same placement reason -- needs g_hype_cfg + the serializer + #447. */
@@ -2141,9 +2143,6 @@ static void term_run_cmdline(void) {
             }
             break;
         }
-        case HYPE_CMD_RESOLUTION:
-            term_resolution_cmd(&c);
-            break;
         case HYPE_CMD_CONFIG:
             if (idx < 0) {
                 term_resultf( "config: unknown vm '%s'", nm);
@@ -3455,6 +3454,12 @@ static uint64_t fw_1_pool_carve(EFI_BOOT_SERVICES *bs, unsigned vm_index, unsign
     uint64_t shortfall = 0ull;
     hype_ram_pool_status_t st;
     if (!g_guest_pool_ready) {
+        if (bs == 0) {
+            hype_debug_print("fw-1 RAMPOOL: vm%u %s needs %llu MiB but there is no pool and no "
+                             "Boot Services -- this VM cannot run [#449 #450]\n",
+                             vm_index, what, (unsigned long long)(bytes / (1024ull * 1024ull)));
+            return 0ull;
+        }
         return hype_alloc_pages_any_2mb_aligned(bs, bytes);
     }
     st = hype_ram_pool_carve(&g_guest_pool, bytes, vm_index, kind, &base, &shortfall);
@@ -3468,7 +3473,11 @@ static uint64_t fw_1_pool_carve(EFI_BOOT_SERVICES *bs, unsigned vm_index, unsign
                                               (1024ull * 1024ull)),
                          (unsigned long long)(g_guest_pool.size / (1024ull * 1024ull)));
         /* Fall back rather than refuse the VM here: the pool is an allocation strategy, not a
-         * policy, and admission (section 6i) is where a VM is told it cannot run. */
+         * policy, and admission (section 6i) is where a VM is told it cannot run. Post-EBS there
+         * is nothing to fall back TO, so the caller gets zero and reports it. */
+        if (bs == 0) {
+            return 0ull;
+        }
         return hype_alloc_pages_any_2mb_aligned(bs, bytes);
     }
     hype_debug_print("fw-1 RAMPOOL: vm%u %s carve %llu MiB @0x%llx (%llu MiB left) [#449]\n",
@@ -3477,6 +3486,34 @@ static uint64_t fw_1_pool_carve(EFI_BOOT_SERVICES *bs, unsigned vm_index, unsign
                      (unsigned long long)(hype_ram_pool_remaining(&g_guest_pool) /
                                           (1024ull * 1024ull)));
     return base;
+}
+
+/*
+ * #450: carve this VM's guest RAM the first time it runs, and re-zero it on every start.
+ *
+ * The carve used to happen pre-EBS, at a size read from hype.cfg -- which is what forced the
+ * config to be parsed by firmware. Doing it here instead means the size comes from a config read
+ * through hype's own storage stack, and it makes section 6f's "zero on every (re)start" invariant
+ * structural rather than incidental: a restart finds its OWN carve (pool memory is reused, so a
+ * missed zero hands a previous guest's RAM to the next one) and zeroes it again.
+ */
+static int fw_1_ensure_guest_ram(hype_fw_vm_t *vmp, unsigned vi) {
+    const hype_ram_carve_t *c;
+    if (vmp->ram_bytes == 0ull) {
+        return -1;
+    }
+    c = hype_ram_pool_find(&g_guest_pool, vi, HYPE_POOL_KIND_RAM);
+    if (c != 0) {
+        vmp->ram_host_phys = c->base;
+    } else if (vmp->ram_host_phys == 0ull) {
+        vmp->ram_host_phys = fw_1_pool_carve(0, vi, HYPE_POOL_KIND_RAM, vmp->ram_bytes,
+                                             "guest RAM");
+    }
+    if (vmp->ram_host_phys == 0ull) {
+        return -1;
+    }
+    hype_guest_ram_zero((void *)(uintptr_t)vmp->ram_host_phys, vmp->ram_bytes);
+    return 0;
 }
 
 static uint64_t hype_alloc_pages_any_2mb_aligned(EFI_BOOT_SERVICES *bs, uint64_t size) {
@@ -20898,107 +20935,6 @@ static void fw_1_vars_request(hype_fw_vm_t *vm, uint32_t kind, int wait) {
  * ExitBootServices and persists the choice for the next boot; it does not SetMode. Both
  * QueryMode and SetMode are Boot-Services-era protocol calls and panicked here on real hardware.
  */
-static void term_resolution_cmd(hype_cmd_t *c) {
-    if (!c->has_arg) {
-        if (g_hype_cfg.hype.has_resolution) {
-            term_resultf( "resolution: %ux%u (configured)",
-                          g_hype_cfg.hype.resolution_width, g_hype_cfg.hype.resolution_height);
-        } else {
-            term_resultf(
-                          "resolution: unset (using the firmware's current mode)");
-        }
-        return;
-    }
-
-    if (g_term_gop == 0) {
-        term_resultf( "resolution: no GOP on this host");
-        return;
-    }
-
-    {
-        /* #462: the pre-ExitBootServices snapshot, never a live QueryMode -- see g_gop_modes. */
-        const hype_gop_mode_t *modes = g_gop_modes;
-        unsigned int mode_count = g_gop_mode_count;
-
-        if (hype_streq(c->arg, "list")) {
-            unsigned int i;
-            if (mode_count == 0u) {
-                term_resultf("resolutions: none reported");
-                return;
-            }
-            /* #460: one mode per line. This used to pack them comma-separated into the 96-byte
-             * result and stop at whatever fit, so the tail of the list was simply invisible --
-             * on a host with many modes, the one the operator wanted usually was. */
-            term_resultf("%u mode(s) reported by GOP:", mode_count);
-            for (i = 0; i < mode_count; i++) {
-                term_resultf("  %ux%u", modes[i].width, modes[i].height);
-            }
-            return;
-        }
-
-        {
-            uint32_t w = 0, hgt = 0;
-            int match;
-
-            /* #465: hype_gop_mode_parse_wxh(), not an inline parse. The inline one handed
-             * hype_parse_uint() the whole "1920x1080" as the width -- and that function
-             * requires the entire string to be digits, so it failed at the 'x' and every
-             * well-formed WxH was rejected with a message naming the format it had been given. */
-            if (hype_gop_mode_parse_wxh(c->arg, &w, &hgt) != 0) {
-                term_resultf("resolution: expected <W>x<H>, e.g. 1920x1080");
-                return;
-            }
-
-            match = hype_gop_mode_find(modes, mode_count, w, hgt);
-            if (match < 0) {
-                term_resultf("resolution: %ux%u not offered by this GOP (try 'resolution list')",
-                             w, hgt);
-                return;
-            }
-            /*
-             * #462: NO SetMode here. It is the same Boot-Services-era protocol call QueryMode
-             * is, and it does more damage: it reprograms the display and can hand back a
-             * different framebuffer base -- while hype is painting the old one from its own
-             * post-EBS page tables. The setting is persisted and applied at the next boot, in
-             * the pre-EBS window where SetMode is legal (see the TERM-7 block in efi_main).
-             * #443 listed live mode switching as out of scope "unless it falls out trivially";
-             * it does not.
-             */
-            g_hype_cfg.hype.has_resolution = 1;
-            g_hype_cfg.hype.resolution_width = (unsigned int)w;
-            g_hype_cfg.hype.resolution_height = (unsigned int)hgt;
-            (void)match;
-
-            {
-                int saved = 0;
-                static char cfgtext[8192];
-                hype_cfg_serialize_result_t sr =
-                    hype_cfg_serialize(&g_hype_cfg, cfgtext, sizeof(cfgtext));
-                hype_fs_file_t f;
-                /*
-                 * #447: prefer hype's OWN verified boot volume -- the file the next boot's
-                 * loader actually reads -- over the log sink's volume, which is wherever the
-                 * USB debug stick happens to be and only coincides with the boot ESP on the
-                 * USB-boot deployment. The log-sink fallback stays for exactly that
-                 * deployment when the locator cannot verify (e.g. booted on defaults, so
-                 * there is no \hype.cfg fingerprint to match).
-                 */
-                hype_fs_t *bv = (!sr.refused_overflow && !sr.truncated) ? fw_1_boot_volume() : 0;
-                if (bv != 0 && hype_fs_create(bv, "hype.cfg", &f) == 0 &&
-                    hype_fs_write_at(&f, 0, cfgtext, sr.len) == 0) {
-                    saved = 1;
-                } else if (g_hype_log_ready && !sr.refused_overflow && !sr.truncated &&
-                           hype_fs_create(&g_hype_log.fs, "hype.cfg", &f) == 0 &&
-                           hype_fs_write_at(&f, 0, cfgtext, sr.len) == 0) {
-                    saved = 1;
-                }
-                term_resultf("resolution %ux%u%s -- takes effect on the next boot", w, hgt,
-                             saved ? " saved" : " NOT saved (no writable volume mounted)");
-            }
-        }
-    }
-}
-
 /*
  * One "<key> = <value> (default|set)" field. `set` is whether this field's F_* bit is present in
  * the VM's seen_fields -- the whole point of #444.
@@ -21698,6 +21634,81 @@ static int fw_1_boot_vol_verify(hype_fs_t *fs) {
 }
 
 /* Locate (once) and return the verified writable boot volume, or 0. */
+/*
+ * CONFIG (#450, plan.md section 10 decision 37): read and parse \hype.cfg through hype's OWN
+ * storage stack, post-ExitBootServices.
+ *
+ * The old path went through UEFI's Simple File System, which only works when hype booted from a
+ * volume firmware can mount -- and hype already reads far harder things off the same disks with
+ * its own drivers: AHCI, NVMe and xHCI/USB-MSC underneath FAT32/exFAT/ext/NTFS, streaming
+ * multi-GB ISOs off its own boot stick. Whether hype booted from USB, SATA or NVMe must not be a
+ * distinction hype's own code makes.
+ *
+ * Failure policy is mandatory here, not advisory: this runs after the point of no return, so
+ * every case falls back to built-in defaults and says WHICH case it was. A boot volume that
+ * cannot be located at all is reported as the louder, different failure it is -- it means hype
+ * cannot read its own firmware images or write its own log either.
+ */
+static void fw_1_load_hype_cfg_post_ebs(void) {
+    hype_fs_t *bv;
+    hype_fs_file_t f;
+    hype_cfg_result_t res;
+    unsigned int declared;
+    unsigned long long sz;
+
+    bv = fw_1_boot_volume();
+    if (bv == 0) {
+        /* Item 5: distinct from "no config file", and louder. */
+        hype_debug_print("cfg: NO BOOT VOLUME -- hype could not locate or mount the volume it "
+                         "booted from, so it cannot read its own config, firmware images or write "
+                         "its own log. Using built-in defaults for %u VM(s) [#450]\n", g_vm_count);
+        return;
+    }
+    if (hype_fs_lookup(bv, "\\hype.cfg", &f) != 0) {
+        hype_debug_print("cfg: no \\hype.cfg on the boot volume -- using built-in defaults "
+                         "(volume mounted fine; this is the ABSENT case) [#450]\n");
+        return;
+    }
+    sz = (unsigned long long)f.size;
+    if (sz == 0ull) {
+        hype_debug_print("cfg: \\hype.cfg is EMPTY (0 bytes) -- using built-in defaults [#450]\n");
+        return;
+    }
+    if (sz > (unsigned long long)(sizeof(g_hype_cfg_text) - 1u)) {
+        hype_debug_print("cfg: \\hype.cfg is OVERSIZED (%llu bytes, limit %llu) -- using built-in "
+                         "defaults [#450]\n", sz, (unsigned long long)(sizeof(g_hype_cfg_text) - 1u));
+        return;
+    }
+    if (hype_fs_read_at(&f, 0ull, g_hype_cfg_text, (unsigned int)sz) != 0) {
+        hype_debug_print("cfg: \\hype.cfg found (%llu bytes) but UNREADABLE through hype's own "
+                         "stack -- using built-in defaults [#450]\n", sz);
+        return;
+    }
+    g_hype_cfg_text[sz] = '\0';
+    /* #447: fingerprint BEFORE the parse -- it tokenizes this buffer destructively. */
+    g_hype_cfg_raw_len = (UINTN)sz;
+    g_hype_cfg_raw_sum = fw_1_fnv1a(g_hype_cfg_text, (UINTN)sz);
+
+    /* #393: size VM storage from what the file declares. Post-EBS there is no AllocatePool, so a
+     * config declaring more VMs than the struct's own default holds is bounded by that default
+     * and says so -- the pool carve path is for guest memory, not for host structures. */
+    declared = hype_cfg_count_vms(g_hype_cfg_text);
+    if (declared > HYPE_CFG_MAX_VMS) {
+        hype_debug_print("cfg: %u [vm.*] section(s) declared but post-EBS storage holds %u -- "
+                         "parsing the first %u [#450 #393]\n", declared, (unsigned)HYPE_CFG_MAX_VMS,
+                         (unsigned)HYPE_CFG_MAX_VMS);
+    }
+    res = hype_cfg_parse(g_hype_cfg_text, &g_hype_cfg);
+    if (res.status != HYPE_CFG_OK) {
+        hype_debug_print("cfg: \\hype.cfg UNPARSEABLE (status=%d, line=%u) -- using built-in "
+                         "defaults [#450]\n", (int)res.status, res.line);
+        g_hype_cfg.vm_count = 0;
+        return;
+    }
+    hype_debug_print("cfg: loaded \\hype.cfg (%llu bytes) through hype's own stack -- %u VM(s) "
+                     "[#450]\n", sz, g_hype_cfg.vm_count);
+}
+
 static hype_fs_t *fw_1_boot_volume(void) {
     unsigned didx;
     if (g_boot_vol_state == 1) {
@@ -22670,19 +22681,33 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_debug_print("TERM-7: GOP reports %u mode(s), snapshotted pre-ExitBootServices "
                          "[#443 #462]\n", g_gop_mode_count);
     }
-    if (have_gop && g_hype_cfg.hype.has_resolution) {
-        int match = hype_gop_mode_find(g_gop_modes, g_gop_mode_count,
-                                       g_hype_cfg.hype.resolution_width,
-                                       g_hype_cfg.hype.resolution_height);
-        if (match < 0) {
-            hype_debug_print("TERM-7: configured resolution %ux%u is not offered by this "
-                             "firmware's GOP -- keeping its current mode\n",
-                             g_hype_cfg.hype.resolution_width, g_hype_cfg.hype.resolution_height);
-        } else if (hype_gop_mode_set(gop, g_gop_modes[match].mode_number) != 0) {
-            hype_debug_print("TERM-7: configured resolution %ux%u was offered but SetMode "
-                             "refused it -- keeping the firmware's current mode\n",
-                             g_hype_cfg.hype.resolution_width, g_hype_cfg.hype.resolution_height);
+    /*
+     * #529 (plan.md section 10 decision 44): no config key. hype aims at 1920x1080 on every host
+     * and takes the nearest mode the firmware offers.
+     *
+     * This is the last thing in Phase 0 that ever wanted the config, and it wanted it here
+     * because hype_gop_mode_set() goes through the GOP protocol -- Boot Services. Removing the
+     * key is what lets the config parse move past ExitBootServices entirely (#450).
+     */
+    if (have_gop && g_gop_mode_count != 0u) {
+        int pick = hype_gop_mode_find_nearest(g_gop_modes, g_gop_mode_count,
+                                              HYPE_GOP_TARGET_WIDTH, HYPE_GOP_TARGET_HEIGHT);
+        if (pick < 0) {
+            hype_debug_print("TERM-7: no GOP mode could be chosen -- keeping the firmware's "
+                             "current mode [#529]\n");
+        } else if (hype_gop_mode_set(gop, g_gop_modes[pick].mode_number) != 0) {
+            hype_debug_print("TERM-7: mode %ux%u (nearest %ux%u) was offered but SetMode refused "
+                             "it -- keeping the firmware's current mode [#529]\n",
+                             g_gop_modes[pick].width, g_gop_modes[pick].height,
+                             (unsigned)HYPE_GOP_TARGET_WIDTH, (unsigned)HYPE_GOP_TARGET_HEIGHT);
+        } else {
+            hype_debug_print("TERM-7: GOP mode set to %ux%u -- nearest of %u offered to the "
+                             "%ux%u target [#529]\n", g_gop_modes[pick].width,
+                             g_gop_modes[pick].height, g_gop_mode_count,
+                             (unsigned)HYPE_GOP_TARGET_WIDTH, (unsigned)HYPE_GOP_TARGET_HEIGHT);
         }
+    } else if (have_gop) {
+        hype_debug_print("TERM-7: GOP offered no mode list -- keeping its current mode [#529]\n");
     }
 
     /*

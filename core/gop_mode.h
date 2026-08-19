@@ -49,6 +49,19 @@ unsigned int hype_gop_mode_enumerate(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, hype_gop
  */
 int hype_gop_mode_parse_wxh(const char *s, uint32_t *out_width, uint32_t *out_height);
 
+/*
+ * #529 (plan.md section 10 decision 44): the mode closest to target_w x target_h, or -1 when the
+ * list is empty. hype has no resolution config key -- it aims at 1920x1080 on every host and
+ * takes the nearest thing offered.
+ *
+ * Closest means the smallest difference in TOTAL PIXELS, tie-broken toward the wider mode. Pixel
+ * count rather than per-axis distance because it ranks 1920x1200 above 1600x900 for a 1080p
+ * target, which is what an operator looking at the panel would call closer; the tie-break keeps
+ * the choice deterministic when two modes are equidistant.
+ */
+int hype_gop_mode_find_nearest(const hype_gop_mode_t *modes, unsigned int count, uint32_t target_w,
+                               uint32_t target_h);
+
 /* Hardware side: applies `mode_number` (as returned by hype_gop_mode_enumerate, NOT a raw
  * WxH) via SetMode. Returns 0 on success, -1 if the firmware refused it. */
 int hype_gop_mode_set(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, uint32_t mode_number);

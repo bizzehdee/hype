@@ -27,7 +27,8 @@ static hype_cmd_verb_t verb_of(const char *tok, unsigned len) {
     if (tok_eq(tok, len, "off") || tok_eq(tok, len, "kill") || tok_eq(tok, len, "force")) return HYPE_CMD_POWEROFF;
     if (tok_eq(tok, len, "focus") || tok_eq(tok, len, "switch") || tok_eq(tok, len, "sw")) return HYPE_CMD_FOCUS;
     if (tok_eq(tok, len, "confirm")) return HYPE_CMD_CONFIRM;
-    if (tok_eq(tok, len, "resolution") || tok_eq(tok, len, "res")) return HYPE_CMD_RESOLUTION;
+    /* #529: `resolution`/`res` retired with the config key -- hype picks the mode nearest
+     * 1920x1080 at boot, and SetMode is Boot Services so a runtime command could not work. */
     if (tok_eq(tok, len, "config") || tok_eq(tok, len, "cfg")) return HYPE_CMD_CONFIG;
     if (tok_eq(tok, len, "host")) return HYPE_CMD_HOST; /* M9-2 (#175): host reboot|off */
     if (tok_eq(tok, len, "set")) return HYPE_CMD_SET;   /* TERM-14 (#490) */
@@ -94,7 +95,6 @@ static const char *const g_cmd_usage[] = {
     "off <vm>",
     "focus <vm>",
     "confirm <serial>",
-    "resolution [list|<W>x<H>]",
     "config <vm>",
     "host <reboot|off>",
     "set <vm> <key> <value>",

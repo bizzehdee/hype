@@ -270,16 +270,13 @@ typedef struct {
     char autostart_vms[HYPE_CFG_MAX_VMS][HYPE_CFG_NAME_MAX]; /* only for AUTOSTART_LIST */
 
     /*
-     * TERM-7 (#443): the host GOP mode, `<width>x<height>` (e.g. `1920x1080`). Absent (the
-     * default) means "whatever mode the firmware already left GOP in" -- hype has never called
-     * SetMode itself, so "no setting found" must reproduce that exact pre-existing behavior
-     * rather than falling back to a hardcoded resolution. `has_resolution` is what distinguishes
-     * "operator asked for 0x0" (impossible, the parser rejects a zero dimension) from "operator
-     * said nothing at all" -- width/height alone cannot, since 0 is also mem_mb's own zero-init.
+     * #529 (plan.md section 10 decision 44): there is NO resolution key. It was the one setting
+     * that had to be read before ExitBootServices -- applying it goes through the GOP protocol --
+     * and decision 37 moves config reading into Phase 1. hype now aims at 1920x1080 on every host
+     * and takes the nearest mode the firmware offers (hype_gop_mode_find_nearest), so there is
+     * nothing per-machine left to configure. A config still carrying `resolution` is reported by
+     * the existing unknown-key path rather than silently ignored.
      */
-    int has_resolution;
-    unsigned int resolution_width;
-    unsigned int resolution_height;
 
     /*
      * #429: how many seconds the dashboard's CPU%% column averages over. Always holds a valid

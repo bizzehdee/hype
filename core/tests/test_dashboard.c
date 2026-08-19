@@ -78,7 +78,8 @@ static void test_hint_line_lists_every_verb(void) {
             failures++;
         }
     }
-    CHECK("hint mentions resolution", grid_has(s, "resolution"));
+    /* #529: `resolution` retired with the config key (decision 44); `config` below
+     * keeps the "the hint really lists real verbs" property this pair was for. */
     CHECK("hint mentions config", grid_has(s, "config"));
     free(s);
 }

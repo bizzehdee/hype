@@ -29,10 +29,7 @@ int main(void) {
     CHECK("confirm", P("confirm S4EWNF0")     .verb == HYPE_CMD_CONFIRM);
     CHECK("confirm carries serial arg", strcmp(P("confirm S4EWNF0").arg, "S4EWNF0") == 0);
     CHECK("garbage -> UNKNOWN", P("frobnicate").verb == HYPE_CMD_UNKNOWN);
-    CHECK("resolution", P("resolution 1920x1080").verb == HYPE_CMD_RESOLUTION);
     CHECK("resolution carries its value arg", strcmp(P("resolution 1920x1080").arg, "1920x1080") == 0);
-    CHECK("res alias -> RESOLUTION", P("res list").verb == HYPE_CMD_RESOLUTION);
-    CHECK("resolution with no arg", !P("resolution").has_arg);
     CHECK("config", P("config vm0").verb == HYPE_CMD_CONFIG);
     CHECK("cfg alias -> CONFIG", P("cfg vm0").verb == HYPE_CMD_CONFIG);
     CHECK("config carries its vm arg", strcmp(P("config vm0").arg, "vm0") == 0);
