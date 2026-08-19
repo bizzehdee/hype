@@ -2112,6 +2112,19 @@ isn't lost.
 
     Delivered by #479 plus scope amendments on #186, #190, #472, #473, #477.
 
+    **Conformance history (2026-08-19).** This decision was written before the
+    code implemented it, and three sites then enforced a *stricter* rule while
+    citing it: placement took each granted core's first thread and left the
+    sibling unassigned (#560), admission priced a vCPU at a whole core (#559),
+    and `cpu_set` validation still required one entry per vCPU (#561, the
+    pre-SMT form §6i already marks obsolete). The lesson is recorded, not just
+    the fixes: "a core is the allocation unit" and "a vCPU costs a core" are
+    different statements, and the second is what the code kept implementing.
+    Decision 47 states the per-tier vCPU definition explicitly for that reason.
+    A guest is also now told its real `threads_per_core` rather than a
+    hardcoded 1, because a VM on two siblings that believes it has two
+    single-threaded cores cannot reason about its own internal SMT exposure.
+
 41. **Device hotplug — decided: attaching and detaching guest-visible
     hardware while a VM runs is in v1 scope, on the buses that can
     express it; every other bus queues the change to the VM's next boot
@@ -2412,6 +2425,94 @@ isn't lost.
     **Rejected: absorbing the fault and continuing the guest.** It converts a located failure into
     a guest that limps with wrong data -- the "benign default MMIO catch-all" bug class this project
     has already been bitten by (#311). Stopping is a verdict; absorbing is a guess.
+
+47. **What a vCPU *is*, on each tier — decided: a dedicated vCPU is a hardware
+    thread of a wholly-owned core; a shared vCPU is a guaranteed minimum share
+    of execution time on a thread (2026-08-19).** Recorded because decisions 39
+    and 40 together imply this but neither states it, and the gap produced four
+    conformance bugs in one day (#559, #560, #561, #562) — every one of them a
+    piece of code pricing or describing a vCPU differently from the plan and
+    from the other pieces.
+
+    - **Dedicated tier.** A vCPU is a hardware thread. Its VM owns whole
+      physical cores, so `vcpus` costs `ceil(vcpus / threads_per_core)` cores.
+      One 2-thread core gives two vCPUs. Capacity is therefore bounded by
+      *threads*, not cores: a 4-core/8-thread host with the BSP's core reserved
+      offers 6 vCPUs across 3 cores, not 3 vCPUs.
+    - **Shared tier.** A vCPU is **a guaranteed minimum quantity of execution
+      time, burstable above it when the pool is idle.** It is not a piece of
+      hardware at all, which is what makes over-commit meaningful: 128 VMs on a
+      16-core/32-thread host is a legitimate configuration if each is
+      guaranteed, say, 10% of a thread and may burst to N%. The guaranteed
+      floor and the burst ceiling are both operator-configured; the pool's
+      admission rule is that the sum of the *floors* fits the pool's threads,
+      not the sum of the ceilings.
+    - **The two tiers must never be priced by one rule.** A dedicated vCPU
+      consumes hardware whether or not the guest is running; a shared vCPU
+      consumes it only while dispatched. Admission has to spend the two
+      currencies separately (§6i).
+
+    **What this settles that decision 40 did not.** Decision 40 defines the
+    allocation quantum; it says nothing about what the operator is *buying*
+    when they write `vcpus = 4`. On the dedicated tier they are buying four
+    threads of exclusively-owned cores. On the shared tier they are buying four
+    run queues with a floor and a ceiling — and the honest consequence is that
+    a shared `vcpus = 4` and a dedicated `vcpus = 4` are not comparable
+    quantities and must not be reported to an operator as if they were.
+
+    **Industry cross-check.** The dedicated tier's rule — a core owned by one
+    trust domain at a time, SMT exposed *within* that domain — is what
+    Hyper-V's core scheduler does (introduced for L1TF, the default for
+    hypervisor-enabled hosts from Server 2019), what Xen's `sched-gran=core`
+    does (4.13+, opt-in), and what Linux/KVM's cookie-based core scheduling
+    does (`CONFIG_SCHED_CORE`, 5.14+). All three gang-schedule a VM's vCPUs
+    onto one core's siblings and leave a sibling idle rather than lend it to
+    another VM. Recorded as convergent evidence, not as authority: the version
+    numbers and defaults above are from memory and are not archived under
+    `research/`. Xen's earlier answer, and several cloud providers', was
+    simply to disable SMT — decision 40 already rejects that and says why.
+
+    **Rejected again, explicitly: a vCPU as a logical CPU across VMs**
+    (thread-granular allocation, so a 16-core/32-thread host offers 32
+    dedicated vCPUs by letting two VMs share a core's threads). It doubles
+    apparent dedicated capacity and breaks the one property the dedicated tier
+    sells. The exposure is not hypothetical and not patchable: PortSmash
+    (CVE-2018-5407, execution-port contention), TLBleed, and SQUIP
+    (CVE-2021-46778, AMD scheduler queues) are *contention* channels — they are
+    how SMT works, not errata, so no microcode or flush removes them, and
+    unlike the buffer-leak classes (L1TF, MDS/ZombieLoad/RIDL/Fallout,
+    Downfall) they cannot be mitigated on a switch boundary because there is no
+    switch: both owners execute concurrently. STIBP addresses only the
+    branch-predictor axis. If an operator ever wants this it arrives as an
+    explicit opt-in key naming the risk, never as a default or a capacity
+    optimisation.
+
+48. **Not-present nested-paging entries must be L1TF-safe — decided:
+    unconditional, both tiers (2026-08-19).** A not-present NPT/EPT entry whose
+    address bits are zero names host physical address 0, which is real memory.
+    On L1TF-affected parts a speculative load can resolve through a
+    not-present entry and leave the referenced line in L1D, so those bits must
+    point at nothing: hype sets the physical-address bits of every
+    not-present/reserved entry above the host's supported physical width, the
+    same PTE-inversion mitigation Xen and Linux/KVM use.
+
+    Recorded as its own decision because it is the **only** mitigation in this
+    family that needs neither a scheduling change nor a switch boundary — it
+    works while both threads are live, which is exactly what the contention
+    channels in decision 47 do not allow. It is cheap, it is unconditional, and
+    it helps most on the older or unpatched silicon a bare-metal hypervisor is
+    most likely to meet.
+
+    Scope: `hype_npt_mark_range_not_present` / `hype_ept_mark_range_not_present`
+    and every other producer of a not-present entry, including the initial
+    zeroed state of a freshly allocated table — a zero-filled page IS the unsafe
+    pattern, so allocation must not be trusted to leave a safe default.
+    Related but separate, and not covered here: hype reads no
+    `IA32_ARCH_CAPABILITIES` (MSR 0x10A) `*_NO` bits today, so it cannot tell
+    an affected part from a fixed one and does not try to — the mitigation is
+    applied unconditionally rather than gated on a feature bit hype does not
+    read.
+
 
 ## 11. Pre-M0 readiness checklist
 

@@ -1,11 +1,14 @@
 # hype hardware-validation stick — multi-ticket run
 
-Build: **a86e313** (`hype: build a86e313-dirty`).
+Build: whatever `stage.sh` prints when it stages — it echoes the binary's own stamp
+(`hype: build <sha>-dirty`), and that stamp is the authority, not this line. **Check it against the
+banner in the log after the run**; a stick staged from a stale `build/hype.efi` is indistinguishable
+from a fix that did not work.
 
 The `-dirty` is the **vendored `edk2` submodule**, which carries local #436 research patches and is
 **not compiled into `hype.efi`**. hype.efi is built by the clang/lld pipeline from `boot/`, `core/`,
 `arch/` and `devices/` only; the guest firmware on this stick is the pre-built `fw/*.fd` pair. So the
-binary corresponds exactly to a86e313 — but the stamp is left honest rather than forced clean.
+binary corresponds exactly to its sha — the stamp is left honest rather than forced clean.
 
 ## SAFETY — read this first
 
@@ -38,30 +41,56 @@ The second swap matters: with no Alpine guests, `ps2`'s input script must land a
 and `input-micro/` is what puts it there. That config also includes `ps2`, which the primary one
 cannot (vm0 and vm1's scripts already occupy those indices).
 
-Both configs were rehearsed under QEMU at `QEMU_MEM=12288 SMP=8` — matching the AMD laptop — with
-**zero VMs dropped** and both input scripts armed. Note that a QEMU rehearsal cannot reproduce the
-core count that actually binds here: `-smp 8` gives eight single-thread cores, not four cores with
-two threads each. The VM count was therefore derived from the machine's real topology rather than
-from a rehearsal.
+Rehearse this stick before shipping it with:
+
+```sh
+tools/560/rehearse-560.sh            # 4 cores x 2 threads, the AMD laptop's real shape
+tools/560/rehearse-560.sh 150 8      # 8 single-threaded cores, the sibling-detection fallback
+```
+
+It stages this directory exactly as `stage.sh` does, boots it, and prints the three things that
+decide whether the stick is worth a cold boot: VMs dropped, the placement lines, and whether both
+input scripts armed.
+
+Use the explicit SMT layout, not plain `SMP=8`: `-smp 8` gives eight **single-threaded** cores, so
+the SMT placement path never runs and a config that fits only because of #560 appears to fit for
+the wrong reason. Both layouts are worth running — the config is designed to fit either way.
 
 The logs are on the stick because this machine has no serial port. They contain invalid UTF-8, so
 read them with `LC_ALL=C grep -a`.
 
-## Why only three VMs
+## Why only three VMs, and why five vCPUs now fit
 
-Admission grants one **whole physical core** per VM with the BSP's core reserved, so a host runs at
-most `physical cores - 1` VMs however much RAM it has:
+A VM is granted **whole physical cores** with the BSP's core reserved, and it gets **all of those
+cores' threads** as vCPUs (#560). So the VM count is bounded by cores, and the vCPU count by
+threads:
 
-| machine | logical | physical | RAM | max VMs |
-|---|---|---|---|---|
-| AMD laptop | 8 | **4** | 12 GB | **3** |
-| Intel i5-13420H | 12 | 8 | 8 GB | 7 |
+| machine | logical | physical | RAM | max VMs | max vCPUs |
+|---|---|---|---|---|---|
+| AMD laptop | 8 | **4** | 12 GB | **3** | **6** |
+| Intel i5-13420H | 12 | 8 | 8 GB | 7 | 12 |
+
+This stick runs 2 + 2 + 1 = **five vCPUs on three cores**, and it did not fit the AMD laptop before
+#560: a vCPU used to cost a whole core, so the budget was three vCPUs in total and the two Alpine
+guests could not both start. There were two configs for that reason; there is now one, and it runs
+on both machines.
+
+It fits **either way**, which is what makes one config safe. If sibling detection fails (#378's
+all-zero `EFI_CPU_PHYSICAL_LOCATION` table, repaired from CPUID `0x8000001E` on AMD), hype falls
+back to treating every logical processor as a single-threaded core — eight of them, seven for
+guests — and five vCPUs still fits. Which case happened is in the log:
+
+```
+fw-1 SMP: vm0 placed 2 vCPU(s) on 1 whole physical core(s), 2 thread(s)/core   <- SMT proven
+fw-1 SMP: placed 5 vCPU(s) on 3 whole physical core(s) ... siblings known
+```
+
+`siblings UNPROVEN (one thread per core)` is the fallback, and is not a failure.
 
 The first version of this stick listed seven VMs. The AMD run dropped four of them — including both
 High-priority reproductions it existed to carry — and RAM was never close (pool 7012 of 10165 MiB
-usable). So the layout is now two Alpine guests plus **one VM running the suite kernel** (#554),
-which runs the microtests in turn inside a single guest. Three VMs fits the smaller machine, and the
-bigger one simply has cores to spare.
+usable). So the layout is two Alpine guests plus **one VM running the suite kernel** (#554), which
+runs the microtests in turn inside a single guest.
 
 ## What this is trying to settle
 

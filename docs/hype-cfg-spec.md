@@ -313,7 +313,7 @@ correct for when they exist.)
 | hard disks / VM (`disks`) | 0 .. `HYPE_CFG_MAX_DISKS_PER_VM` (~24) | parser cap; guest bus limits (AHCI ≤ 32 ports, PCI slots) at admission |
 | optical / VM (`cdroms`) | 0 .. `HYPE_CFG_MAX_CDROMS_PER_VM` (~4) | parser cap |
 | NICs / VM (`nics`) | 0 .. `HYPE_CFG_MAX_NICS_PER_VM` (~8) | parser cap |
-| `vcpus` | 1 .. host core count | parser ≥1; **admission** caps at `host_cpu_budget` |
+| `vcpus` | 1 .. host hardware **thread** count | parser ≥1; **admission** caps at the total threads of the cores in `host_cpu_budget` (a VM owns whole cores and gets all their threads, plan.md §10 decisions 40/47) |
 | `mem_mb` | 1 .. host usable RAM (MB) | parser ≥1; **admission** caps at real free RAM |
 
 The parser accepts any value ≥ the minimum and ≤ the compile cap; the

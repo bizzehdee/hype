@@ -584,8 +584,9 @@ static uint64_t g_m2_7_guest_stack_top_phys;
  * This was 2, then 16, and every value of it was a silent clamp on a machine that could carry
  * more -- current parts ship 192 cores, so 700+ usable cores on a quad-socket board is a real
  * host. Every per-VM array is now allocated once from the UEFI pool, sized by the parsed
- * config and bounded by detected topology (1:1 pinning allows usable cores - 1 VMs, the BSP
- * keeping console and log duty). The bound is physical and reported with real numbers, not a
+ * config and bounded by detected topology (a VM is granted whole cores, so at most usable
+ * cores - 1 VMs, the BSP keeping console and log duty -- #560 changed how many vCPUs those VMs
+ * may have, not how many VMs fit). The bound is physical and reported with real numbers, not a
  * constant somebody has to remember to raise.
  */
 
@@ -21753,10 +21754,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      *
      * The arena, g_vms and the vCPU pools were sized to the parsed VM count, which is the last
      * thing pinning the config parse before ExitBootServices -- #449 removed the guest-RAM
-     * dependency, this removes the sizing one. The bound is decision 33's own: 1:1 pinning
-     * allows at most (usable cores - 1) VMs, the BSP keeping console and log duty. Allocating
-     * for the physical maximum costs a few MB on a real host and makes Phase 0 independent of
-     * anything read off a disk.
+     * dependency, this removes the sizing one. The bound is decision 33's own: a VM is granted
+     * whole cores, so at most (usable cores - 1) VMs, the BSP keeping console and log duty.
+     * Sized from the LOGICAL processor count below, which is an over-estimate of that on an SMT
+     * host and deliberately so -- this is an allocation ceiling, not the admission cap, and
+     * over-allocating a few MB is the safe direction. Admission (#559/#560) is what refuses.
+     * Allocating for the physical maximum makes Phase 0 independent of anything read off a
+     * disk.
      */
     {
         unsigned usable = g_cpu_topo.count;

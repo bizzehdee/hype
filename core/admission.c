@@ -124,6 +124,14 @@ hype_adm_result_t hype_adm_check_cpu_set(const hype_cfg_t *cfg, unsigned int phy
         if (!vm->has_cpu_set) {
             continue;
         }
+        /*
+         * #561: this is the PRE-SMT form of §6i's rule. cpu_set names physical CORES and each is
+         * granted whole, so the rule is `vcpus <= total hardware threads of the listed cores`;
+         * one entry per vCPU is the same rule only on a non-SMT host. Since #560 hype places a
+         * VM's vCPUs on its cores' siblings without being asked, so this refuses stated
+         * explicitly what it performs by default. Needs the per-core thread counts, which this
+         * function is not given -- changed together with core/vm_create.c's copy of the check.
+         */
         if (vm->cpu_set_count != vm->vcpus) {
             return adm_err(HYPE_ADM_ERR_CPU_SET_COUNT_MISMATCH, i, HYPE_ADM_NO_VM);
         }

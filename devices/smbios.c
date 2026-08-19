@@ -144,7 +144,16 @@ int hype_smbios_build(const hype_smbios_config_t *cfg, uint8_t *anchor, uint32_t
         p[32] = 0; /* Serial */
         p[33] = 0; /* Asset tag */
         p[34] = 0; /* Part number */
-        p[35] = 1; /* Core count: one core per vCPU */
+        /*
+         * One socket per vCPU, each declaring a single single-threaded core. That was exact
+         * while a vCPU cost a whole core; since #560 a VM's vCPUs may be SMT siblings of one
+         * core, and CPUID now reports that truthfully -- so these three bytes can disagree with
+         * CPUID leaf 0xB/0x1F. Tracked separately (#562) rather than changed here: Linux takes
+         * its topology from CPUID and ACPI, not SMBIOS, so this is a reporting inconsistency
+         * and not a wrong topology, and correcting it means restructuring Type 4 to be
+         * per-socket with real core/thread counts.
+         */
+        p[35] = 1; /* Core count */
         p[36] = 1; /* Cores enabled */
         p[37] = 1; /* Thread count */
         put_le16(p + 38, 0x0004); /* Characteristics: 64-bit capable */

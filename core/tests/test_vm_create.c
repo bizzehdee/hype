@@ -89,8 +89,13 @@ static void test_cpu_set_must_match_vcpus(void) {
     hype_vm_wizard_begin(&w);
     CHECK("reaches cpu_set", drive(&w, 0, upto, 7) == HYPE_VMW_CPU_SET);
 
-    /* One pinned core per vCPU, or the 1:1 guarantee is not a guarantee -- the same rule
-     * admission enforces as CPU_SET_COUNT_MISMATCH. */
+    /*
+     * One cpu_set entry per vCPU -- the same rule admission enforces as CPU_SET_COUNT_MISMATCH.
+     * This test PINS THE CURRENT BEHAVIOUR, which #561 says is wrong: §6i's rule is
+     * `vcpus <= total threads of the listed cores`, so on an SMT host one core really does hold
+     * two vCPUs and "one core for two vcpus is refused" below must become an acceptance. Left
+     * failing-if-changed on purpose, so fixing #561 cannot pass silently with a stale test.
+     */
     CHECK("one core for two vcpus is refused", hype_vm_wizard_feed(&w, "3", 0) == HYPE_VMW_CPU_SET);
     CHECK("and says why", w.have_error);
     CHECK("a range of two is accepted", hype_vm_wizard_feed(&w, "2-3", 0) == HYPE_VMW_CONFIRM);
