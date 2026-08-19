@@ -102,7 +102,33 @@ MICRO_LDFLAGS := -T $(MICRO_DIR)/micro.ld -nostdlib --build-id=none
 
 .PHONY: all clean test run run-cd run-2disk micro
 
-micro: $(MICRO_IMAGES)
+micro: $(MICRO_IMAGES) $(MICRO_OUT)/suite.bin
+
+# #554: the suite kernel. Every member is compiled a SECOND time from the same unedited source, with
+# -DMICRO_SUITE (which turns micro_halt() into a longjmp back to the dispatcher) and
+# -Dmicro_main=micro_test_<name> (which renames its entry point without touching the file). That is
+# what keeps a suite member and a standalone artifact the same code -- neither can drift from the
+# other, because there is only one source.
+#
+# faulter is deliberately NOT a member: it triple-faults on purpose, which would take the suite VM
+# and every test after it down. It stays a standalone artifact where that is the whole point.
+MICRO_SUITE_MEMBERS := hello ram1 cpumsr fwcfg pci pflash intdeliver pausespin ps2
+MICRO_SUITE_OBJS := $(patsubst %,$(MICRO_OUT)/suite-%.o,$(MICRO_SUITE_MEMBERS))
+
+$(MICRO_OUT)/suite-%.o: $(MICRO_DIR)/%.c $(MICRO_DIR)/micro.h $(MICRO_DIR)/micro_pci.h \
+                        $(MICRO_DIR)/micro_idt.h
+	@mkdir -p $(MICRO_OUT)
+	$(CC) $(MICRO_CFLAGS) -DMICRO_SUITE -Dmicro_main=micro_test_$* -c $< -o $@
+
+$(MICRO_OUT)/suite.elf: $(MICRO_DIR)/suite.c $(MICRO_SUITE_OBJS) $(MICRO_DIR)/crt0.S \
+                        $(MICRO_DIR)/suite_jmp.S $(MICRO_DIR)/micro.ld
+	@mkdir -p $(MICRO_OUT)
+	$(CC) $(MICRO_CFLAGS) -DMICRO_SUITE -c $(MICRO_DIR)/suite.c -o $(MICRO_OUT)/suite-main.o
+	$(CC) --target=x86_64-unknown-elf -ffreestanding -c $(MICRO_DIR)/crt0.S -o $(MICRO_OUT)/crt0.o
+	$(CC) --target=x86_64-unknown-elf -ffreestanding -c $(MICRO_DIR)/suite_jmp.S \
+	      -o $(MICRO_OUT)/suite_jmp.o
+	$(LD) $(MICRO_LDFLAGS) -o $@ $(MICRO_OUT)/crt0.o $(MICRO_OUT)/suite_jmp.o \
+	      $(MICRO_OUT)/suite-main.o $(MICRO_SUITE_OBJS)
 
 $(MICRO_OUT)/%.elf: $(MICRO_DIR)/%.c $(MICRO_DIR)/crt0.S $(MICRO_DIR)/micro.h \
                     $(MICRO_DIR)/micro_pci.h $(MICRO_DIR)/micro_idt.h $(MICRO_DIR)/micro.ld

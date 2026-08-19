@@ -81,17 +81,27 @@ static inline void micro_put_uint(uint64_t v) {
 }
 
 /*
+ * #554: what a verdict was, so a SUITE can tell a test that passed from one that printed nothing.
+ *
+ * Weak so every translation unit may define it and the linker collapses them to one -- the suite
+ * links ten tests together, and a `static` here would give each its own invisible copy.
+ */
+__attribute__((weak)) volatile int g_micro_verdict; /* 0 none, 1 pass, 2 fail */
+
+/*
  * Verdict discipline (#282's rule, one level down): the verdict is a LINE IN THE LOG, not an exit
  * code. A harness greps for these. Absence of either is a failure -- a kernel that wedges or
  * triple-faults prints neither, and treating silence as success is how a dead test passes.
  */
 static inline void micro_pass(const char *name) {
+    g_micro_verdict = 1;
     micro_puts("MICRO PASS: ");
     micro_puts(name);
     micro_puts("\n");
 }
 
 static inline void micro_fail(const char *name, const char *what) {
+    g_micro_verdict = 2;
     micro_puts("MICRO FAIL: ");
     micro_puts(name);
     micro_puts(": ");
@@ -153,12 +163,34 @@ static inline const char *micro_cmdline_value(const char *cmdline, const char *k
     return 0;
 }
 
-/* Stop this guest. Halting with interrupts left as the loader set them parks the vCPU in a HLT
- * exit, which hype reports as an idle guest rather than as a fault. */
+/*
+ * Stop this guest -- or, in a suite, hand control back to the dispatcher.
+ *
+ * Standalone, halting with interrupts as the loader left them parks the vCPU in a HLT exit, which
+ * hype reports as an idle guest rather than as a fault.
+ *
+ * Under MICRO_SUITE it longjmps instead. That is what lets a suite member be the SAME SOURCE as a
+ * standalone artifact: every test already ends by calling this, including on its failure paths, so
+ * no test needed editing to become suite-capable.
+ */
+#ifdef MICRO_SUITE
+typedef unsigned long long micro_jmp_buf[8];
+int micro_setjmp(micro_jmp_buf b);
+void micro_longjmp(micro_jmp_buf b, int v);
+extern micro_jmp_buf g_micro_suite_env;
+
+static inline void micro_halt(void) {
+    micro_longjmp(g_micro_suite_env, 1);
+    for (;;) {
+        __asm__ volatile("hlt"); /* unreachable; keeps the noreturn shape if longjmp ever fails */
+    }
+}
+#else
 static inline void micro_halt(void) {
     for (;;) {
         __asm__ volatile("hlt");
     }
 }
+#endif
 
 #endif /* HYPE_MICRO_H */
