@@ -5865,179 +5865,21 @@ static int vmm_handle_virtio_blk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *
                : hype_svm_vcpu_handle_virtio_blk_npf(ctx, dev, be, dma_map, mmio_base_phys, insn);
 }
 
-#define HYPE_INT_TEST_VECTOR 0x31u
-
 /*
- * A real guest GDT (3 entries: null, flat 64-bit code at selector
- * 0x08, flat data at selector 0x10) -- access/flags bytes match
- * vmcb.c's own LONGMODE_CODE_ACCESS/FLAGS and LONGMODE_DATA_ACCESS/
- * FLAGS constants exactly, so a hardware-driven CS reload during
- * interrupt delivery ends up with the same effective attributes
- * hype_vmcb_build_long_mode_guest() already gave CS directly.
- * hype_vmcb_build_long_mode_guest()'s own default GDTR/IDTR (base=0,
- * limit=0xFFFF) has no real table behind it -- fine for every prior
- * long-mode test guest, none of which ever took a real hardware-
- * validated segment/gate reload, but genuine interrupt delivery does
- * exactly that (see hype_svm_vcpu_set_gdt()'s own comment).
- */
-static uint8_t g_int_gdt[24] __attribute__((aligned(16))) = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* null descriptor */
-    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9B, 0xAF, 0x00, /* 0x08: flat code */
-    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x93, 0xCF, 0x00, /* 0x10: flat data */
-};
-
-/* A real guest IDT (256 entries, 16 bytes each) -- zero-filled at
- * reset (an absent/not-present gate for every vector but the one this
- * test actually uses), with HYPE_INT_TEST_VECTOR's own entry populated
- * at runtime once the ISR's address is known (run_int_test() itself). */
-static uint8_t g_int_idt[4096] __attribute__((aligned(4096)));
-
-static uint8_t g_int_guest_stack[4096] __attribute__((aligned(4096)));
-static uint8_t g_int_marker[4096] __attribute__((aligned(4096)));
-
-/*
- * Guest payload: loads the marker's guest-physical address, enables
- * interrupts, then busy-polls the marker until the (host-triggered)
- * interrupt handler sets it, matching the real "STI; idle-wait" pattern
- * every real OS's own interrupt-driven idle loop uses. The ISR itself
- * sits at a fixed offset in the same buffer (HYPE_INT_PAYLOAD_ISR_OFFSET)
- * -- every store here is register-to-memory (0x89/0xC6) or memory-to-
- * register (0x8B), the same forms hype_mmio_decode() already supports,
- * though nothing here actually traps (this is ordinary guest RAM, not
- * MMIO) -- RBX is never touched between the initial load and the ISR
- * running, so it's still valid whenever the interrupt actually lands.
+ * #541: INT-1/INT-2's guest GDT, IDT, marker page, 40-byte payload template and run_int_test are
+ * gone -- ported to tests/micro/intdeliver.c, booted as a configured VM (#535).
  *
- *   mov rbx, <patched: marker guest-physical address>
- *                                        48 BB 00*8
- *   sti                                  FB
- * poll:
- *   cmp byte [rbx], 0                    80 3B 00
- *   je poll                              74 FB
- *   hlt                                  F4
- *   jmp $-3                              EB FD
- *   ... padding to isr's own fixed offset ...
- * isr:
- *   mov byte [rbx], 1                    C6 03 01
- *   iretq                                48 CF
+ * The port does what the in-binary test could not: the GUEST loads its own GDT, reloads CS via a far
+ * return and SS/DS/ES from its own data descriptor, loads its own IDT with a real 64-bit interrupt
+ * gate, remaps the 8259 pair, programs the 8254, unmasks IRQ0 and takes real ticks -- HLTing between
+ * them, so delivery has to WAKE the guest rather than find it polling.
+ *
+ * Here the host installed the guest's GDT and IDT for it (vmm_set_gdt/vmm_set_idt), forced its CS/SS
+ * selectors, and requested the vector directly. So what it validated was hype's injection primitive
+ * against descriptor tables hype had built itself; the lgdt/lidt/CS-reload path a real guest uses had
+ * never been exercised from inside a guest. The injection primitive is still covered -- it is what
+ * delivers each tick -- and now the PIC and PIT models are covered with it.
  */
-static const uint8_t g_int_payload_template[] = {
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xFB,
-    0x80, 0x3B, 0x00,
-    0x74, 0xFB,
-    0xF4,
-    0xEB, 0xFD,
-    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-    0xC6, 0x03, 0x01,
-    0x48, 0xCF,
-};
-#define HYPE_INT_PAYLOAD_RBX_IMM_OFFSET 2
-#define HYPE_INT_PAYLOAD_ISR_OFFSET 32
-static uint8_t g_int_guest_code[sizeof(g_int_payload_template)] __attribute__((aligned(4096)));
-
-/*
- * INT-1/INT-2: proves real guest-interrupt injection end-to-end -- not
- * just the pure encode/decode logic (already unit tested), but an
- * actual VMRUN delivering a synthesized vector into a real guest ISR.
- * hype_svm_vcpu_request_interrupt() is called *before* the first
- * VMRUN, while RFLAGS.IF is still 0 (hype_vmcb_build_long_mode_guest()'s
- * own default) -- this deliberately exercises INT-2's deferred path
- * first (arms an interrupt-window request, since the guest can't
- * accept yet), then INT-1's direct EVENTINJ path once the guest's own
- * STI (a couple of instructions into its first VMRUN) opens that
- * window and fires EXITCODE_VINTR -- both mechanisms, in the one
- * natural sequence a real device's "raise this IRQ whenever the guest
- * happens to be ready" call already needs.
- */
-static void run_int_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    unsigned long long i;
-    uint64_t entry_rip, guest_cr3, rsp, marker_phys, isr_phys, gdt_phys, idt_phys;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-
-    (void)ops; /* VMX-2: runs under SVM and VMX now. */
-
-    hype_guest_ram_zero(g_int_idt, sizeof(g_int_idt));
-    hype_guest_ram_zero(g_int_guest_code, sizeof(g_int_guest_code));
-    hype_guest_ram_zero(g_int_guest_stack, sizeof(g_int_guest_stack));
-    hype_guest_ram_zero(g_int_marker, sizeof(g_int_marker));
-
-    for (i = 0; i < sizeof(g_int_payload_template); i++) {
-        g_int_guest_code[i] = g_int_payload_template[i];
-    }
-    marker_phys = (uint64_t)(uintptr_t)g_int_marker;
-    hype_write_le64(g_int_guest_code + HYPE_INT_PAYLOAD_RBX_IMM_OFFSET, marker_phys);
-
-    isr_phys = (uint64_t)(uintptr_t)(g_int_guest_code + HYPE_INT_PAYLOAD_ISR_OFFSET);
-
-    /* IDT entry HYPE_INT_TEST_VECTOR: a 64-bit interrupt gate (type
-     * 0xE) pointing at the ISR, selector 0x08 (g_int_gdt's own flat
-     * code descriptor). */
-    {
-        uint8_t *gate = g_int_idt + (unsigned)HYPE_INT_TEST_VECTOR * 16;
-        gate[0] = (uint8_t)(isr_phys & 0xFFu);
-        gate[1] = (uint8_t)((isr_phys >> 8) & 0xFFu);
-        gate[2] = 0x08; /* selector low byte */
-        gate[3] = 0x00; /* selector high byte */
-        gate[4] = 0x00; /* IST -- use the current stack, no IST switch */
-        gate[5] = 0x8E; /* P=1, DPL=00, type=0xE (64-bit interrupt gate) */
-        gate[6] = (uint8_t)((isr_phys >> 16) & 0xFFu);
-        gate[7] = (uint8_t)((isr_phys >> 24) & 0xFFu);
-        hype_write_le32(gate + 8, (uint32_t)(isr_phys >> 32));
-        hype_write_le32(gate + 12, 0);
-    }
-
-    entry_rip = (uint64_t)(uintptr_t)g_int_guest_code;
-    rsp = (uint64_t)(uintptr_t)(g_int_guest_stack + sizeof(g_int_guest_stack));
-    gdt_phys = (uint64_t)(uintptr_t)g_int_gdt;
-    idt_phys = (uint64_t)(uintptr_t)g_int_idt;
-
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    hype_debug_print("int: entry_rip=0x%llx isr_phys=0x%llx marker_phys=0x%llx\n",
-                      (unsigned long long)entry_rip, (unsigned long long)isr_phys,
-                      (unsigned long long)marker_phys);
-
-    /* No NPT for this test -- pure register/memory + real IDT/GDT
-     * descriptor-table content, no MMIO-trapped device involved (same
-     * reasoning as CPUMSR's own test). */
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
-    if (ctx == 0) {
-        hype_fatal("int: vcpu_create_long_mode failed");
-    }
-
-    vmm_set_gdt(kind, ctx, gdt_phys, (uint16_t)(sizeof(g_int_gdt) - 1));
-    vmm_set_idt(kind, ctx, idt_phys, (uint16_t)(sizeof(g_int_idt) - 1));
-    vmm_set_cs_ss_selectors(kind, ctx, 0x08u, 0x10u); /* g_int_gdt's own code/data selectors */
-    vmm_request_interrupt(kind, ctx, 0, HYPE_INT_TEST_VECTOR);
-
-    for (;;) {
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("int: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-        }
-
-        if (vmm_reason_is_intr_window(kind, info.reason)) {
-            vmm_handle_intr_window(kind, ctx, 0);
-            continue;
-        }
-
-        break;
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("int: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-    }
-    if (g_int_marker[0] != 1) {
-        hype_fatal("int: interrupt handler never ran (marker=0x%x)", g_int_marker[0]);
-    }
-
-    hype_debug_print(
-        "int: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- vector 0x%x delivered "
-        "via an armed VINTR window (INT-2) then direct EVENTINJ (INT-1), ISR ran and set the marker\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_INT_TEST_VECTOR);
-}
 
 /* Same flat code/data GDT content as g_int_gdt (INT-1/INT-2) -- a
  * fresh, dedicated copy rather than sharing that buffer, matching this
@@ -18876,7 +18718,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     HYPE_ST_RUN(4, run_m4_5_ahci_test(args->ops, args->kind));
     HYPE_ST_RUN(5, run_video_2_ramfb_test(args->ops, args->kind));
     /* 6 was CPUMSR, ported out in #539 -- see the note at its old definition. */
-    HYPE_ST_RUN(7, run_int_test(args->ops, args->kind));
+    /* 7 was INT-1/INT-2, ported out in #541 -- see the note at its old definition. */
     HYPE_ST_RUN(8, run_input_1_test(args->ops, args->kind));
     HYPE_ST_RUN(9, run_input_2_test(args->ops, args->kind));
     /* 10 was RAM-1/RAM-2, ported out in #536 -- see the note at its old definition. */

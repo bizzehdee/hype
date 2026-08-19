@@ -94,7 +94,7 @@ ESP       := $(BUILD_DIR)/esp
 # belong with the others -- but it is the one thing that surprises.
 MICRO_DIR   := tests/micro
 MICRO_OUT   := $(BUILD_DIR)/micro
-MICRO_NAMES := hello faulter ram1 cpumsr fwcfg
+MICRO_NAMES := hello faulter ram1 cpumsr fwcfg intdeliver
 MICRO_IMAGES := $(patsubst %,$(MICRO_OUT)/%.bin,$(MICRO_NAMES))
 MICRO_CFLAGS := --target=x86_64-unknown-elf -ffreestanding -fno-stack-protector -fno-pic \
                 -mno-red-zone -mno-sse -Wall -Wextra -Werror -O2 -std=c11
@@ -104,7 +104,8 @@ MICRO_LDFLAGS := -T $(MICRO_DIR)/micro.ld -nostdlib --build-id=none
 
 micro: $(MICRO_IMAGES)
 
-$(MICRO_OUT)/%.elf: $(MICRO_DIR)/%.c $(MICRO_DIR)/crt0.S $(MICRO_DIR)/micro.h $(MICRO_DIR)/micro.ld
+$(MICRO_OUT)/%.elf: $(MICRO_DIR)/%.c $(MICRO_DIR)/crt0.S $(MICRO_DIR)/micro.h \
+                    $(MICRO_DIR)/micro_pci.h $(MICRO_DIR)/micro_idt.h $(MICRO_DIR)/micro.ld
 	@mkdir -p $(MICRO_OUT)
 	$(CC) $(MICRO_CFLAGS) -c $< -o $(MICRO_OUT)/$*.o
 	$(CC) --target=x86_64-unknown-elf -ffreestanding -c $(MICRO_DIR)/crt0.S -o $(MICRO_OUT)/crt0.o
