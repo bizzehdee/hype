@@ -85,7 +85,25 @@ static void test_has_eff_freq(void) {
               hype_cpu_has_eff_freq(HYPE_CPU_VENDOR_UNKNOWN, ~0u, ~0u));
 }
 
+/* #393 follow-up: IA32_THERM_STATUS is gated by CPUID.6:EAX[0], not by the vendor alone.
+ * Reading it on a machine without the digital thermal sensor raises #GP, which post-EBS is a
+ * dead BSP -- observed on every boot of the Intel nested rig. */
+static void test_therm_status_requires_the_dts_bit(void) {
+    CHECK_INT("Intel with DTS is readable", 1,
+              hype_cpu_has_therm_status(HYPE_CPU_VENDOR_INTEL, 1u));
+    CHECK_INT("Intel without DTS is NOT readable", 0,
+              hype_cpu_has_therm_status(HYPE_CPU_VENDOR_INTEL, 0u));
+    CHECK_INT("a missing leaf 6 reads as zero and refuses", 0,
+              hype_cpu_has_therm_status(HYPE_CPU_VENDOR_INTEL, 0u));
+    CHECK_INT("AMD never claims it", 0,
+              hype_cpu_has_therm_status(HYPE_CPU_VENDOR_AMD, 1u));
+    CHECK_INT("an unknown vendor never claims it", 0,
+              hype_cpu_has_therm_status(HYPE_CPU_VENDOR_UNKNOWN, 1u));
+}
+
+
 int main(void) {
+    test_therm_status_requires_the_dts_bit();
     test_vendor_from_string();
     test_has_vmx();
     test_has_svm();

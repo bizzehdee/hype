@@ -9738,6 +9738,16 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
      * twice now: a diagnostic must not be able to kill the thing it is diagnosing.
      */
     static int amperf_readable = -1; /* -1 = not yet decided */
+    /*
+     * IA32_THERM_STATUS gets its OWN decision. It was read whenever smi_readable was set, i.e.
+     * whenever the vendor was Intel -- but SMI_COUNT and THERM_STATUS are different MSRs with
+     * different availability, and the Intel nested-VMX rig emulates the first and not the
+     * second. Every boot there ended with the BSP dead in this probe:
+     *   PANIC: unhandled interrupt on apic=0: vector=13 rip=<rdmsr 0x19C>
+     * which is #370's exact failure, one MSR along, and it made every measurement taken on that
+     * box a measurement of a machine with no BSP.
+     */
+    static int therm_readable = -1;
     uint64_t now = hype_rdtsc();
     uint64_t t0, t1, t2, t3, t4, t5, t6, t7, ns, ns_ram, ns_scat, ns_cli, smi_now = 0;
     uint64_t rflags = 0, ticks_before = 0, ticks_after = 0;
@@ -9789,6 +9799,10 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
         amperf_readable = hype_cpu_has_eff_freq(hype_cpu_detect_vmm_kind_diag().vendor,
                                                 hype_cpu_leaf6_ecx(),
                                                 hype_cpu_leaf80000007_edx());
+    }
+    if (therm_readable < 0) {
+        therm_readable = hype_cpu_has_therm_status(hype_cpu_detect_vmm_kind_diag().vendor,
+                                                   hype_cpu_leaf6_eax());
     }
     if (smi_readable) smi_now = hype_smi_count_unchecked();
 
@@ -9957,7 +9971,7 @@ static void fw_1_fb_speed_probe(uint64_t tsc_hz) {
                       (unsigned long long)(mperf1 - mperf0),
                       amperf_readable ? "" : " NOT READABLE on this cpu",
                       (unsigned long long)hype_read_cr0(),
-                      (unsigned long long)(smi_readable ? hype_therm_status_unchecked() : 0ull));
+                      (unsigned long long)(therm_readable ? hype_therm_status_unchecked() : 0ull));
     hype_debug_print("fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=%u usb_held=%u/%u "
                       "| usb_sectors=+%llu usb_calls=+%llu [#368]\n",
                       usb_waiters_max, usb_held_samples, (unsigned int)PROBE_CHUNKS,

@@ -93,6 +93,10 @@ uint32_t hype_cpu_svm_feature_edx(void);
  */
 int hype_cpu_has_eff_freq(hype_cpu_vendor_t vendor, uint32_t leaf6_ecx, uint32_t leaf80000007_edx);
 
+/* Is IA32_THERM_STATUS (0x19C) readable: CPUID.6:EAX[0], the digital thermal sensor. Reading it
+ * without this raises #GP, which post-EBS is a panic -- see the note in cpu_features.c. */
+int hype_cpu_has_therm_status(hype_cpu_vendor_t vendor, uint32_t leaf6_eax);
+
 /*
  * Real CPUID.06H:ECX / CPUID.8000_0007H:EDX reads. Exempt hw shims.
  *
@@ -100,6 +104,7 @@ int hype_cpu_has_eff_freq(hype_cpu_vendor_t vendor, uint32_t leaf6_ecx, uint32_t
  * maximum leaf returns another leaf's contents, and mistaking those for a feature bitmap is how a
  * capability check ends up authorising the very #GP it exists to prevent.
  */
+uint32_t hype_cpu_leaf6_eax(void);
 uint32_t hype_cpu_leaf6_ecx(void);
 uint32_t hype_cpu_leaf80000007_edx(void);
 

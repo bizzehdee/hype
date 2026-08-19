@@ -41,6 +41,16 @@ uint32_t hype_cpu_svm_feature_edx(void) {
 }
 
 /* #370: leaf reads that check the leaf EXISTS first -- see the header. */
+/* CPUID.6:EAX -- bit 0 is the digital thermal sensor, which is what makes IA32_THERM_STATUS
+ * readable. Zero when the leaf does not exist, so the caller refuses rather than guesses. */
+uint32_t hype_cpu_leaf6_eax(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    cpuid(0, &a, &b, &c, &d);
+    if (a < 6u) return 0u;
+    cpuid(6u, &a, &b, &c, &d);
+    return a;
+}
+
 uint32_t hype_cpu_leaf6_ecx(void) {
     uint32_t a = 0, b = 0, c = 0, d = 0;
     cpuid(0, &a, &b, &c, &d);

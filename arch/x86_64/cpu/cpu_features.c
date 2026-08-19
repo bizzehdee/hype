@@ -58,6 +58,17 @@ int hype_cpu_has_pause_threshold(uint32_t leaf8000000a_edx) {
 }
 
 /* #370: see the header. Vendor-specific bit, and "unknown vendor" must mean no. */
+/*
+ * #370's lesson, applied to the MSR it was NOT applied to: IA32_THERM_STATUS (0x19C) is gated by
+ * the digital thermal sensor bit, CPUID.6:EAX[0] -- not by the vendor, and not by whatever gate
+ * MSR_SMI_COUNT happens to use. hype read it whenever the vendor was Intel, which #GP-panicked
+ * the BSP on every boot of the Intel nested-VMX rig, where KVM emulates SMI_COUNT but not this.
+ */
+int hype_cpu_has_therm_status(hype_cpu_vendor_t vendor, uint32_t leaf6_eax) {
+    if (vendor != HYPE_CPU_VENDOR_INTEL) return 0;
+    return (int)(leaf6_eax & 1u);
+}
+
 int hype_cpu_has_eff_freq(hype_cpu_vendor_t vendor, uint32_t leaf6_ecx,
                           uint32_t leaf80000007_edx) {
     if (vendor == HYPE_CPU_VENDOR_INTEL) return (int)(leaf6_ecx & 1u);
