@@ -3684,7 +3684,8 @@ static void EFIAPI run_test_guest(void *arg) {
 }
 
 /* VMX-2 vendor-dispatch shims -- forward declarations (defined just before
- * run_cpumsr_test). Let each microtest's exit loop stay vendor-neutral. */
+ * the first microtest that needs them). Let each microtest's exit loop stay
+ * vendor-neutral. */
 static hype_vcpu_ctx_t *vmm_create_long_mode(hype_vmm_kind_t kind, uint64_t entry_rip,
                                              uint64_t guest_cr3, uint64_t rsp, uint64_t root);
 static int vmm_reason_is_cpuid(hype_vmm_kind_t kind, uint64_t reason);
@@ -4615,114 +4616,23 @@ static void run_video_2_ramfb_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t ki
 }
 
 /*
- * CPUMSR-1/CPUMSR-2: exercises the new CPUID and MSR VM-exit paths
- * (hype_svm_vcpu_handle_cpuid()/hype_svm_vcpu_handle_msr(),
- * arch/x86_64/svm/svm_vcpu.c) end-to-end, not just
- * hype_cpuid_emulate()/hype_msr_decide() in isolation -- proves the
- * VMCB intercept bits, exit-code dispatch, and register write-back all
- * actually work together. Guest executes real CPUID for leaves 0, 1,
- * and the hypervisor-signature leaf (0x40000000), then RDMSR for
- * APIC_BASE and EFER (both read-only exercises here -- WRMSR against
- * EFER mid-test would risk destabilizing the guest's own long-mode
- * state, not worth the risk for a baseline test). M7-1b (#300) then
- * establishes a Hyper-V hypercall page, calls an unknown code through
- * the installed vendor opcode, and stores the returned status. Every
- * result into a host-inspectable guest buffer via RDI-relative stores
- * (ordinary guest-RAM writes, no MMIO/NPF involved -- unlike M4-3/
- * M4-5's device tests).
+ * #539: CPUMSR's payload template, its four static buffers and its host-side CPUID oracle are gone
+ * -- ported to tests/micro/cpumsr.c, booted as a configured VM (`boot = kernel`, #535).
+ *
+ * The oracle did NOT move, deliberately. It re-ran the real `cpuid` instruction on the host, fed it
+ * through hype_cpuid_emulate_ex() and compared byte-for-byte with what the guest saw; a guest
+ * cannot know the host's raw CPUID, and faking that comparison would be worse than not having it.
+ * The pure decode logic it exercised is already unit-tested directly
+ * (core/tests/test_cpuid_emulate.c), so what it added over those tests was the intercept path --
+ * which the ported test still crosses on every leaf it reads.
+ *
+ * What the port asserts instead is the set of guest-VISIBLE invariants, each of which broke a real
+ * guest once: x2APIC and MONITOR must read as absent (#256 -- a guest that idles on MWAIT never
+ * HLTs), TSC_DEADLINE absent, SVM/VMX absent and EFER.SVME masked (#316 -- OpenBSD reads EFER back
+ * and checks it), hypervisor-present set. Those are statements about what a guest sees, and the
+ * host asserting them was checking its own arithmetic rather than the guest's view.
  */
-static uint8_t g_cpumsr_1_guest_code[160] __attribute__((aligned(4096)));
-static uint8_t g_cpumsr_1_guest_stack[4096] __attribute__((aligned(4096)));
-static uint8_t g_cpumsr_1_result_buf[72] __attribute__((aligned(16)));
-static uint8_t g_cpumsr_1_hypercall_page[4096] __attribute__((aligned(4096)));
 
-/*
- *   mov rdi, <patched: result_buf guest-physical address>
- *                                        48 BF 00 00 00 00 00 00 00 00
- *   mov eax, 0                           B8 00 00 00 00
- *   cpuid                                0F A2
- *   mov [rdi+0], eax                     89 47 00
- *   mov [rdi+4], ebx                     89 5F 04
- *   mov [rdi+8], ecx                     89 4F 08
- *   mov [rdi+12], edx                    89 57 0C
- *   mov eax, 1                           B8 01 00 00 00
- *   cpuid                                0F A2
- *   mov [rdi+16], eax                    89 47 10
- *   mov [rdi+20], ebx                    89 5F 14
- *   mov [rdi+24], ecx                    89 4F 18
- *   mov [rdi+28], edx                    89 57 1C
- *   mov eax, 0x40000000                  B8 00 00 00 40
- *   cpuid                                0F A2
- *   mov [rdi+32], eax                    89 47 20
- *   mov [rdi+36], ebx                    89 5F 24
- *   mov [rdi+40], ecx                    89 4F 28
- *   mov [rdi+44], edx                    89 57 2C
- *   mov ecx, 0x1B        (APIC_BASE)     B9 1B 00 00 00
- *   rdmsr                                0F 32
- *   mov [rdi+48], eax                    89 47 30
- *   mov [rdi+52], edx                    89 57 34
- *   mov ecx, 0xC0000080  (EFER)          B9 80 00 00 C0
- *   rdmsr                                0F 32
- *   mov [rdi+56], eax                    89 47 38
- *   mov [rdi+60], edx                    89 57 3C
- *   mov ecx, HV_GUEST_OS_ID              B9 00 00 00 40
- *   mov eax, 1; xor edx, edx; wrmsr
- *   mov ecx, HV_HYPERCALL                 B9 01 00 00 40
- *   mov rax, <patched: page GPA>; split into EDX:EAX; set Enable; wrmsr
- *   mov ecx, 0xBEEF                       B9 EF BE 00 00
- *   mov rax, <patched: page GPA>; call rax
- *   mov [rdi+64], rax                     48 89 47 40
- *   hlt                                  F4
- *   jmp $-3                              EB FD
- */
-static const uint8_t g_cpumsr_1_payload_template[] = {
-    0x48, 0xBF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x0F, 0xA2,
-    0x89, 0x47, 0x00,
-    0x89, 0x5F, 0x04,
-    0x89, 0x4F, 0x08,
-    0x89, 0x57, 0x0C,
-    0xB8, 0x01, 0x00, 0x00, 0x00,
-    0x0F, 0xA2,
-    0x89, 0x47, 0x10,
-    0x89, 0x5F, 0x14,
-    0x89, 0x4F, 0x18,
-    0x89, 0x57, 0x1C,
-    0xB8, 0x00, 0x00, 0x00, 0x40,
-    0x0F, 0xA2,
-    0x89, 0x47, 0x20,
-    0x89, 0x5F, 0x24,
-    0x89, 0x4F, 0x28,
-    0x89, 0x57, 0x2C,
-    0xB9, 0x1B, 0x00, 0x00, 0x00,
-    0x0F, 0x32,
-    0x89, 0x47, 0x30,
-    0x89, 0x57, 0x34,
-    0xB9, 0x80, 0x00, 0x00, 0xC0,
-    0x0F, 0x32,
-    0x89, 0x47, 0x38,
-    0x89, 0x57, 0x3C,
-    0xB9, 0x00, 0x00, 0x00, 0x40,
-    0xB8, 0x01, 0x00, 0x00, 0x00,
-    0x31, 0xD2,
-    0x0F, 0x30,
-    0xB9, 0x01, 0x00, 0x00, 0x40,
-    0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x48, 0x89, 0xC2,
-    0x48, 0xC1, 0xEA, 0x20,
-    0x83, 0xC8, 0x01,
-    0x0F, 0x30,
-    0xB9, 0xEF, 0xBE, 0x00, 0x00,
-    0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xFF, 0xD0,
-    0x48, 0x89, 0x47, 0x40,
-    0xF4,
-    0xEB, 0xFD
-};
-#define HYPE_CPUMSR_1_PAYLOAD_RDI_IMM_OFFSET 2
-#define HYPE_CPUMSR_1_PAYLOAD_PAGE_MSR_IMM_OFFSET 114
-#define HYPE_CPUMSR_1_PAYLOAD_PAGE_CALL_IMM_OFFSET 141
 
 /*
  * VMX-2 vendor dispatch. SVM and VMX expose parallel create_long_mode + CPUID/
@@ -6140,227 +6050,6 @@ static int vmm_handle_virtio_blk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *
     return kind == HYPE_VMM_KIND_VMX
                ? hype_vmx_vcpu_handle_virtio_blk_npf_map(ctx, dev, be, dma_map, mmio_base_phys, insn)
                : hype_svm_vcpu_handle_virtio_blk_npf(ctx, dev, be, dma_map, mmio_base_phys, insn);
-}
-
-static void run_cpumsr_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    unsigned long long i;
-    uint64_t entry_rip, guest_cr3, rsp, result_buf_phys, hypercall_page_phys;
-    hype_gpa_map_t hypercall_map;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-    hype_cpuid_result_t real, expected;
-
-    /* VMX-2: runs under SVM and VMX now (was SVM-only). */
-    (void)ops;
-
-    hype_guest_ram_zero(g_cpumsr_1_guest_code, sizeof(g_cpumsr_1_guest_code));
-    hype_guest_ram_zero(g_cpumsr_1_guest_stack, sizeof(g_cpumsr_1_guest_stack));
-    hype_guest_ram_zero(g_cpumsr_1_result_buf, sizeof(g_cpumsr_1_result_buf));
-    hype_guest_ram_zero(g_cpumsr_1_hypercall_page, sizeof(g_cpumsr_1_hypercall_page));
-
-    result_buf_phys = (uint64_t)(uintptr_t)g_cpumsr_1_result_buf;
-    hypercall_page_phys = (uint64_t)(uintptr_t)g_cpumsr_1_hypercall_page;
-
-    for (i = 0; i < sizeof(g_cpumsr_1_payload_template); i++) {
-        g_cpumsr_1_guest_code[i] = g_cpumsr_1_payload_template[i];
-    }
-    hype_write_le64(g_cpumsr_1_guest_code + HYPE_CPUMSR_1_PAYLOAD_RDI_IMM_OFFSET, result_buf_phys);
-    hype_write_le64(g_cpumsr_1_guest_code + HYPE_CPUMSR_1_PAYLOAD_PAGE_MSR_IMM_OFFSET,
-                    hypercall_page_phys);
-    hype_write_le64(g_cpumsr_1_guest_code + HYPE_CPUMSR_1_PAYLOAD_PAGE_CALL_IMM_OFFSET,
-                    hypercall_page_phys);
-
-    entry_rip = (uint64_t)(uintptr_t)g_cpumsr_1_guest_code;
-    rsp = (uint64_t)(uintptr_t)(g_cpumsr_1_guest_stack + sizeof(g_cpumsr_1_guest_stack));
-
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    hype_debug_print("cpumsr: entry_rip=0x%llx result_buf=0x%llx\n", (unsigned long long)entry_rip,
-                      (unsigned long long)result_buf_phys);
-
-    /* No NPT for this test -- pure register/memory-write test, no
-     * MMIO-trapped device involved (same reasoning as M4-4's fw_cfg
-     * test). */
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
-    if (ctx == 0) {
-        hype_fatal("cpumsr: vcpu_create_long_mode failed");
-    }
-    hype_gpa_map_reset(&hypercall_map);
-    if (hype_gpa_map_add(&hypercall_map, hypercall_page_phys, hypercall_page_phys,
-                         sizeof(g_cpumsr_1_hypercall_page)) != 0) {
-        hype_fatal("cpumsr: could not map Hyper-V hypercall page");
-    }
-    vmm_set_pvclock(kind, ctx, &hypercall_map, g_vms[0].host_tsc_hz);
-    vmm_set_hv_enabled(kind, ctx, 1);
-
-    for (;;) {
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("cpumsr: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-        }
-
-        if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_WBINVD) {
-            /* #368: retire it without flushing any real cache. See the handler's comment. */
-            hype_vmx_vcpu_handle_wbinvd();
-            continue;
-        }
-        if (vmm_reason_is_cpuid(kind, info.reason)) {
-            vmm_handle_cpuid(kind, ctx);
-            continue;
-        }
-        if (kind == HYPE_VMM_KIND_SVM && info.reason == HYPE_SVM_EXITCODE_RDTSC) {
-            hype_svm_vcpu_handle_rdtsc(ctx);
-            continue;
-        }
-        if (vmm_reason_is_msr(kind, info.reason)) {
-            if (vmm_handle_msr(kind, ctx, info.reason) != 0) {
-                hype_fatal("cpumsr: unhandled guest MSR access (qual=0x%llx guest_rip=0x%llx)",
-                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
-            }
-            continue;
-        }
-        if (vmm_reason_is_hypercall(kind, info.reason)) {
-            if (vmm_handle_hypercall(kind, ctx) != 0) {
-                hype_fatal("cpumsr: active Hyper-V hypercall was rejected at guest_rip=0x%llx",
-                           (unsigned long long)info.guest_rip);
-            }
-            continue;
-        }
-
-        break;
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("cpumsr: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-    }
-
-    /* Host independently recomputes the same expected result via
-     * hype_cpuid_emulate() (already fully unit tested in isolation)
-     * fed with the real host CPU's own CPUID output for each leaf, and
-     * confirms the guest's VM-exit-mediated result matches byte-for-
-     * byte -- proving the whole intercept path, not just the pure
-     * decode logic. */
-    for (i = 0; i < 3; i++) {
-        uint32_t eax_in = (i == 0) ? 0u : (i == 1) ? 1u : 0x40000000u;
-        const uint8_t *slot = g_cpumsr_1_result_buf + i * 16;
-        uint32_t got_eax, got_ebx, got_ecx, got_edx;
-
-        __asm__ volatile("cpuid"
-                          : "=a"(real.eax), "=b"(real.ebx), "=c"(real.ecx), "=d"(real.edx)
-                          : "a"(eax_in), "c"(0));
-        hype_cpuid_emulate_ex(eax_in, 0, 1, &real, &expected);
-
-        got_eax = (uint32_t)slot[0] | ((uint32_t)slot[1] << 8) | ((uint32_t)slot[2] << 16) |
-                  ((uint32_t)slot[3] << 24);
-        got_ebx = (uint32_t)slot[4] | ((uint32_t)slot[5] << 8) | ((uint32_t)slot[6] << 16) |
-                  ((uint32_t)slot[7] << 24);
-        got_ecx = (uint32_t)slot[8] | ((uint32_t)slot[9] << 8) | ((uint32_t)slot[10] << 16) |
-                  ((uint32_t)slot[11] << 24);
-        got_edx = (uint32_t)slot[12] | ((uint32_t)slot[13] << 8) | ((uint32_t)slot[14] << 16) |
-                  ((uint32_t)slot[15] << 24);
-
-        if (got_eax != expected.eax || got_ebx != expected.ebx || got_ecx != expected.ecx ||
-            got_edx != expected.edx) {
-            hype_fatal("cpumsr: CPUID leaf 0x%x mismatch (got eax=0x%x ebx=0x%x ecx=0x%x edx=0x%x, "
-                       "expected eax=0x%x ebx=0x%x ecx=0x%x edx=0x%x)",
-                       eax_in, got_eax, got_ebx, got_ecx, got_edx, expected.eax, expected.ebx,
-                       expected.ecx, expected.edx);
-        }
-    }
-
-    /* MSR results: APIC_BASE at offset 48 (eax/edx), EFER at offset
-     * 56. APIC_BASE's expected value is hype_msr_apic_base_value()
-     * directly (a fixed synthesized constant, no real-hardware input
-     * needed); EFER's expected value is whatever this test guest's own
-     * VMCB actually has in save.efer -- not independently
-     * recomputable from outside the VMCB, so this confirms internal
-     * consistency (the value read back is a plausible 64-bit-mode EFER
-     * -- SVME/LME/LMA all set) rather than an external oracle. */
-    {
-        uint64_t apic_base_expected = hype_msr_apic_base_value(1); /* selftest runs on the BSP */
-        uint32_t got_apic_eax = (uint32_t)g_cpumsr_1_result_buf[48] |
-                                 ((uint32_t)g_cpumsr_1_result_buf[49] << 8) |
-                                 ((uint32_t)g_cpumsr_1_result_buf[50] << 16) |
-                                 ((uint32_t)g_cpumsr_1_result_buf[51] << 24);
-        uint32_t got_apic_edx = (uint32_t)g_cpumsr_1_result_buf[52] |
-                                 ((uint32_t)g_cpumsr_1_result_buf[53] << 8) |
-                                 ((uint32_t)g_cpumsr_1_result_buf[54] << 16) |
-                                 ((uint32_t)g_cpumsr_1_result_buf[55] << 24);
-        uint64_t got_apic_base = ((uint64_t)got_apic_edx << 32) | (uint64_t)got_apic_eax;
-
-        uint32_t got_efer_eax = (uint32_t)g_cpumsr_1_result_buf[56] |
-                                 ((uint32_t)g_cpumsr_1_result_buf[57] << 8) |
-                                 ((uint32_t)g_cpumsr_1_result_buf[58] << 16) |
-                                 ((uint32_t)g_cpumsr_1_result_buf[59] << 24);
-        uint32_t got_efer_edx = (uint32_t)g_cpumsr_1_result_buf[60] |
-                                 ((uint32_t)g_cpumsr_1_result_buf[61] << 8) |
-                                 ((uint32_t)g_cpumsr_1_result_buf[62] << 16) |
-                                 ((uint32_t)g_cpumsr_1_result_buf[63] << 24);
-        uint64_t got_efer = ((uint64_t)got_efer_edx << 32) | (uint64_t)got_efer_eax;
-
-        if (got_apic_base != apic_base_expected) {
-            hype_fatal("cpumsr: RDMSR(APIC_BASE) mismatch (got 0x%llx, expected 0x%llx)",
-                       (unsigned long long)got_apic_base, (unsigned long long)apic_base_expected);
-        }
-        /*
-         * EFER plausibility: a long-mode guest has LMA set on BOTH backends, so that is the bit to
-         * check, and SVME must be invisible on both.
-         *
-         * This arm used to require SVME *set* under SVM, on the reasoning that the guest is inside
-         * VMRUN. #316 deliberately ended that: hype must force EFER.SVME on in the VMCB (a VMRUN
-         * consistency check) but MASK IT OUT of what the guest reads, because hype does not expose
-         * SVM to guests -- a guest seeing SVME set while its own CPUID reports no SVM is
-         * self-contradictory, and OpenBSD reads EFER back and checks it. So the old assertion
-         * contradicted the fix and this build panicked with "SVME bit not set (0x500)" -- 0x500
-         * being LME|LMA, i.e. a perfectly healthy long-mode guest.
-         *
-         * Inverted deliberately rather than deleted: asserting SVME is ABSENT makes this a guard
-         * for #316, so a regression that leaks SVME back to guests fails here instead of in a BSD
-         * install months later.
-         */
-        if ((got_efer & 0x400ULL) == 0) { /* LMA */
-            hype_fatal("cpumsr: RDMSR(EFER) implausible -- LMA bit not set (0x%llx)",
-                       (unsigned long long)got_efer);
-        }
-        if ((got_efer & HYPE_SVM_SAVE_EFER_SVME) != 0) {
-            hype_fatal("cpumsr: RDMSR(EFER) leaks SVME to the guest (0x%llx) -- #316 requires it be "
-                       "masked on read; hype does not expose SVM to guests",
-                       (unsigned long long)got_efer);
-        }
-    }
-
-    {
-        uint8_t vendor_opcode = (kind == HYPE_VMM_KIND_VMX) ? 0xC1u : 0xD9u;
-        uint8_t result_or = 0;
-        unsigned j;
-        for (j = 65u; j < sizeof(g_cpumsr_1_result_buf); j++) {
-            result_or |= g_cpumsr_1_result_buf[j];
-        }
-        if (g_cpumsr_1_result_buf[64] != HYPE_HV_STATUS_INVALID_HYPERCALL_CODE ||
-            result_or != 0u) {
-            hype_fatal("cpumsr: Hyper-V unknown call returned malformed status "
-                       "(low=0x%x high-or=0x%x)",
-                       (unsigned)g_cpumsr_1_result_buf[64], (unsigned)result_or);
-        }
-        if (g_cpumsr_1_hypercall_page[0] != 0x0Fu ||
-            g_cpumsr_1_hypercall_page[1] != 0x01u ||
-            g_cpumsr_1_hypercall_page[2] != vendor_opcode ||
-            g_cpumsr_1_hypercall_page[3] != 0xC3u) {
-            hype_fatal("cpumsr: Hyper-V page has wrong %s stub (%02x %02x %02x %02x)",
-                       kind == HYPE_VMM_KIND_VMX ? "VMCALL" : "VMMCALL",
-                       (unsigned)g_cpumsr_1_hypercall_page[0],
-                       (unsigned)g_cpumsr_1_hypercall_page[1],
-                       (unsigned)g_cpumsr_1_hypercall_page[2],
-                       (unsigned)g_cpumsr_1_hypercall_page[3]);
-        }
-    }
-
-    hype_debug_print(
-        "cpumsr: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- CPUID leaves "
-        "0/1/0x40000000, RDMSR(APIC_BASE/EFER), and unknown Hyper-V hypercall status "
-        "all verified via the real VM-exit path [#300]\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
 }
 
 #define HYPE_INT_TEST_VECTOR 0x31u
@@ -19373,7 +19062,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     HYPE_ST_RUN(3, run_m4_4_fw_cfg_test(args->ops, args->kind));
     HYPE_ST_RUN(4, run_m4_5_ahci_test(args->ops, args->kind));
     HYPE_ST_RUN(5, run_video_2_ramfb_test(args->ops, args->kind));
-    HYPE_ST_RUN(6, run_cpumsr_test(args->ops, args->kind));
+    /* 6 was CPUMSR, ported out in #539 -- see the note at its old definition. */
     HYPE_ST_RUN(7, run_int_test(args->ops, args->kind));
     HYPE_ST_RUN(8, run_input_1_test(args->ops, args->kind));
     HYPE_ST_RUN(9, run_input_2_test(args->ops, args->kind));
