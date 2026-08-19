@@ -668,11 +668,20 @@ static void vmx_ensure_current(hype_vcpu_ctx_t *ctx) {
     g_vmx_vmcs_reload_count++;
     g_vmx_vmcs_reload_last_cur = cur;
     g_vmx_vmcs_reload_last_want = want;
-    /* #523: name the violation rather than performing it silently. */
-    if (real->owner_valid && real->owner_apic != vmx_exec_apic_id()) {
-        g_vmx_vmcs_steal_count++;
-        g_vmx_vmcs_steal_last_owner = real->owner_apic;
-        g_vmx_vmcs_steal_last_thief = vmx_exec_apic_id();
+    /*
+     * #523: name the violation rather than performing it silently, then record the new owner --
+     * ownership tracks where the VMCS actually is, so a ping-pong between two cores reports a
+     * steal each way instead of going quiet after the first.
+     */
+    {
+        uint32_t me = vmx_exec_apic_id();
+        if (real->owner_valid && real->owner_apic != me) {
+            g_vmx_vmcs_steal_count++;
+            g_vmx_vmcs_steal_last_owner = real->owner_apic;
+            g_vmx_vmcs_steal_last_thief = me;
+        }
+        real->owner_apic = me;
+        real->owner_valid = 1;
     }
     if (vmclear(real->vmcs_region) == 0 && vmptrld(real->vmcs_region) == 0) {
         real->launched = 0;
@@ -1249,6 +1258,14 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
      * MXCSR=0, which unmasks every SIMD exception. */
     hype_fpu_area_reset(&ctx->fpu);
     ctx->launched = 0;
+    /*
+     * #523: and no owner yet. A pool slot is recycled (#271), so a fresh or rebuilt vCPU that
+     * inherited owner_valid=1 from its predecessor made the WRONG core believe it owned the
+     * VMCS -- which sent that core down the owner path in the accessors, stealing the VMCS from
+     * the core actually running the vCPU, and counting no violation while doing it. Ownership is
+     * claimed by whichever core first enters this vCPU.
+     */
+    ctx->owner_valid = 0;
     vmx_ctx_reset_pending(ctx);
     return (hype_vcpu_ctx_t *)ctx;
 }
@@ -1283,6 +1300,14 @@ hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
         ctx->gprs[i] = 0;
     }
     ctx->launched = 0;
+    /*
+     * #523: and no owner yet. A pool slot is recycled (#271), so a fresh or rebuilt vCPU that
+     * inherited owner_valid=1 from its predecessor made the WRONG core believe it owned the
+     * VMCS -- which sent that core down the owner path in the accessors, stealing the VMCS from
+     * the core actually running the vCPU, and counting no violation while doing it. Ownership is
+     * claimed by whichever core first enters this vCPU.
+     */
+    ctx->owner_valid = 0;
     vmx_ctx_reset_pending(ctx);
     return (hype_vcpu_ctx_t *)ctx;
 }
@@ -1399,9 +1424,17 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     /*
      * #523: this core is the owner from here until it hands the vCPU over. Claimed AFTER the
      * currency check above, so a failed reload never records an owner that never ran.
+     *
+     * Claimed ONCE, not per entry. vmx_exec_apic_id() is an uncached LAPIC MMIO read, and this
+     * path runs millions of times a run -- the first version read it on every entry, which put
+     * a ~200-cycle device access in the hottest loop hype has and showed up as guest soft
+     * lockups on the nested rig. Ownership changes only when a reload moves the VMCS to another
+     * core, and vmx_ensure_current() re-claims it there.
      */
-    real->owner_apic = vmx_exec_apic_id();
-    real->owner_valid = 1;
+    if (!real->owner_valid) {
+        real->owner_apic = vmx_exec_apic_id();
+        real->owner_valid = 1;
+    }
     /* #251: run the guest under its own XCR0, and put hype's back afterwards. */
     if (real->guest_xcr0_valid && vmx_ensure_osxsave()) {
         xsetbv0(real->guest_xcr0);
@@ -4123,6 +4156,7 @@ void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
     }
     hype_fpu_area_reset(&real->fpu);
     real->launched = 0; /* a rebuilt VMCS must be VMLAUNCHed, not VMRESUMEd */
+    real->owner_valid = 0; /* #523: and re-owned by whichever core enters it next */
     vmx_ctx_reset_pending(real);
 }
 
