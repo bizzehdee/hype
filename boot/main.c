@@ -14817,8 +14817,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * injected, skip acknowledging a new one this iteration so the
          * freshly-staged EVENTINJ isn't clobbered. */
         vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic);
-        if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic) &&
-            g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
+        /*
+         * #364: the "both ISRs clear" gate is GONE -- hype_pic_emu_acknowledge() now enforces
+         * fully-nested 8259 priority itself, which is where that rule belongs and where it can be
+         * unit-tested.
+         *
+         * The old gate blocked EVERY line while ANY was in service, which is not 8259 behaviour:
+         * IR0 preempts IR1. An IRQ1 left in service therefore starved IRQ0 permanently, and with
+         * the guest's PIC masked (APIC mode) nothing would ever EOI it. FreeBSD on VMX chose the
+         * i8254 as its event timer and waited forever for a 100 Hz tick -- mISR=0x2, mIMR=0xff,
+         * pit_irq0=0 across a 240 s run.
+         *
+         * The flood the old comment worried about is what priority prevents properly: a timer at
+         * IR0 cannot nest inside itself, because equal priority still waits for the EOI.
+         */
+        if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic)) {
             uint8_t pic_vector;
             if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
                 vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, pic_vector);
@@ -16686,7 +16699,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 int if_set, pic_ready;
                 vmm_get_intr_state(kind, ctx, &is);
                 if_set = (int)((is.rflags >> 9) & 1u);
-                pic_ready = (g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) &&
+                /* #364: no ISR precondition -- priority is the model's business now. */
+                pic_ready =
                             (((g_fw_1_pic.master.irr & (uint8_t)~g_fw_1_pic.master.imr) != 0) ||
                              ((g_fw_1_pic.slave.irr & (uint8_t)~g_fw_1_pic.slave.imr) != 0 &&
                               (g_fw_1_pic.master.imr & (uint8_t)(1u << 2)) == 0));
@@ -16716,8 +16730,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (if_set && (is.pending_valid || pic_ready)) {
                     vmm_wake_hlt(kind, ctx); /* retire HLT + clear STI shadow */
                     vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic); /* #455 */
-                    if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic) &&
-                        g_fw_1_pic.master.isr == 0 && g_fw_1_pic.slave.isr == 0) {
+                    if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic)) { /* #364 */
                         uint8_t v;
                         if (hype_pic_emu_acknowledge(&g_fw_1_pic, &v)) {
                             vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, v);

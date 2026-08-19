@@ -2533,6 +2533,53 @@ isn't lost.
     read.
 
 
+49. **A guest-visible Bochs VBE adapter is config-selected, default OFF — decided
+    (2026-08-20).** Recorded because it adds a device every guest could see, and
+    #549 showed the alternative was not safe.
+
+    hype already gives every VM a **ramfb** framebuffer through fw_cfg (§6e's
+    display path, `etc/ramfb`), which needs no PCI device at all — the guest
+    allocates the framebuffer in its own RAM and tells hype where it is. The
+    Bochs VBE adapter (`devices/bochs_vbe.c`, PCI `0x1234:0x1111`) is a second,
+    independent answer to the same question, and it exists today only inside the
+    in-binary VIDEO-3 self-test, which builds a private PCI bus for itself.
+
+    **Decided: `display = none | bochs` per VM in `hype.cfg`, defaulting to
+    `none`.** A VM gets a VBE adapter only when asked.
+
+    **Why not present it to every VM.** A Linux guest with `bochs-drm` inbox
+    would bind it and move its console there, away from the ramfb surface hype
+    renders and away from the serial console the scripted-input runner (#280)
+    drives. That changes the console of every existing guest as a side effect of
+    adding a device — and the guests it would change are the ones carrying the
+    highest-value hardware evidence (#527's two Alpines). A display device is not
+    chipset furniture like the Q35 MCH or the ICH9 LPC; it is the thing the
+    operator watches, so it must not appear uninvited.
+
+    **Why not a mode key.** Decision 44 already settled that hype picks the
+    display mode itself, nearest 1920x1080, with no config key. This does not
+    reopen that: `display` selects WHICH adapter a guest is offered, not what
+    resolution it runs at. Mode stays hype's business.
+
+    **Why config-selected rather than derived from `os_hint`.** The storage split
+    (§6a: AHCI for Windows, virtio for Linux/BSD) is derived from `os_hint`
+    because each OS has exactly one sensible answer. Display does not: a Linux
+    guest is perfectly served by ramfb, and the reason to want VBE is usually a
+    specific driver or a test, which is an operator intent rather than a property
+    of the OS. Deriving it would guess at intent that the operator has.
+
+    **Consequence for the microtest suite.** VIDEO-3's port (#565) sets
+    `display = bochs` in its own config, so it exercises a real PCI device on the
+    VM's own bus that the guest discovers, sizes and programs itself — rather
+    than the private fixture the in-binary test built. Every other VM is
+    unchanged, which is the property that makes this safe to land while the
+    hardware-validation guests are the critical path.
+
+    Rejected: presenting both surfaces to one guest with no way to choose. Two
+    display devices with no stated precedence is a configuration whose behaviour
+    depends on which driver binds first, and that is not a thing to leave to
+    chance in the component the operator uses to see what is happening.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

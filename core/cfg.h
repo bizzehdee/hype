@@ -24,6 +24,8 @@
  *   target_disk = file:\hype\disks\win11.img   ; file:<path> | physical:<id>
  *   target_disk_size_gb = 128            ; optional, only for new file: targets
  *   firmware = uefi          ; uefi | legacy
+ *   display = none           ; none | bochs -- an extra Bochs VBE adapter (decision 49);
+ *                            ; ramfb is always present regardless
  *   os_hint = windows        ; windows | linux | bsd | none
  *   net_mode = nat           ; none | nat, default none
  *   net_peers = freebsd      ; optional, comma-separated VM names
@@ -87,6 +89,21 @@ typedef enum {
     HYPE_CFG_FW_UEFI,
     HYPE_CFG_FW_LEGACY
 } hype_cfg_firmware_t;
+
+/*
+ * #565 / §10 decision 49: which guest-visible display adapter this VM is offered.
+ *
+ * `none` (the default) does NOT mean "no display": every VM gets a ramfb surface through fw_cfg
+ * (`etc/ramfb`), which needs no PCI device. This key adds the Bochs VBE adapter
+ * (PCI 0x1234:0x1111) as a second, independent surface, and it is off by default because a Linux
+ * guest with bochs-drm inbox would bind it and move its console there -- away from the ramfb
+ * surface hype renders and away from the serial console the scripted-input runner drives. A
+ * display device is the thing the operator watches, so it must not appear uninvited.
+ */
+typedef enum {
+    HYPE_CFG_DISPLAY_NONE = 0,
+    HYPE_CFG_DISPLAY_BOCHS
+} hype_cfg_display_t;
 
 typedef enum {
     HYPE_CFG_OS_WINDOWS,
@@ -182,6 +199,7 @@ typedef struct {
 
     hype_cfg_firmware_t firmware;
     hype_cfg_os_hint_t os_hint;
+    hype_cfg_display_t display; /* #565: defaults to HYPE_CFG_DISPLAY_NONE */
 
     hype_cfg_net_mode_t net_mode; /* defaults to HYPE_CFG_NET_NONE */
 
@@ -251,7 +269,8 @@ enum {
     HYPE_CFG_F_BOOT_ORDER = 1u << 16, /* #323 */
     HYPE_CFG_F_LABEL = 1u << 17,      /* #357 */
     HYPE_CFG_F_KERNEL = 1u << 18,     /* #535 */
-    HYPE_CFG_F_CMDLINE = 1u << 19     /* #546 */
+    HYPE_CFG_F_CMDLINE = 1u << 19,    /* #546 */
+    HYPE_CFG_F_DISPLAY = 1u << 20     /* #565 */
 };
 
 /*

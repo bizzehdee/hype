@@ -391,6 +391,15 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         *seen |= HYPE_CFG_F_FIRMWARE;
         return HYPE_CFG_OK;
     }
+    /* #565 / decision 49: an extra Bochs VBE adapter, off unless asked for. */
+    if (hype_streq(key, "display")) {
+        if (*seen & HYPE_CFG_F_DISPLAY) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_streq(val, "none")) vm->display = HYPE_CFG_DISPLAY_NONE;
+        else if (hype_streq(val, "bochs")) vm->display = HYPE_CFG_DISPLAY_BOCHS;
+        else return HYPE_CFG_ERR_BAD_VALUE;
+        *seen |= HYPE_CFG_F_DISPLAY;
+        return HYPE_CFG_OK;
+    }
     /*
      * #357: `label` was documented in the spec's own worked examples and not implemented, so a
      * config copied out of the documentation produced "line(s) not understood" and the setting
@@ -1745,6 +1754,11 @@ static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {
         w_kv_list(w, "boot_order", vm->boot_order, vm->boot_order_count);
     }
     w_kv(w, "firmware", vm->firmware == HYPE_CFG_FW_LEGACY ? "legacy" : "uefi");
+    /* #565: emitted only when set, like every other non-default -- writing `display = none` into
+     * every config would add a line the operator never wrote. */
+    if (vm->display != HYPE_CFG_DISPLAY_NONE) {
+        w_kv(w, "display", "bochs");
+    }
     if (vm->label[0] != '\0') {
         w_kv(w, "label", vm->label);
     }

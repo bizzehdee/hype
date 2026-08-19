@@ -155,10 +155,28 @@ void hype_pic_emu_raise_global_irq(hype_pic_emu_t *pic, uint8_t global_irq) {
     }
 }
 
+/*
+ * #364: the highest-priority line currently IN SERVICE on `chip`, or 8 when none is.
+ *
+ * On an 8259 in fully-nested mode (its reset default, and what every PC OS uses) priority runs
+ * from IR0 down to IR7, and a pending line only reaches the CPU if it is HIGHER priority than
+ * everything already in service. A line of equal or lower priority waits for the EOI.
+ */
+static int highest_in_service(const hype_pic_emu_chip_t *chip) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        if ((chip->isr & (uint8_t)(1u << i)) != 0u) {
+            return i;
+        }
+    }
+    return 8;
+}
+
 int hype_pic_emu_acknowledge(hype_pic_emu_t *pic, uint8_t *out_vector) {
     uint8_t m_pending = pic->master.irr & (uint8_t)~pic->master.imr;
     uint8_t s_pending = pic->slave.irr & (uint8_t)~pic->slave.imr;
     uint8_t effective;
+    int m_isr = highest_in_service(&pic->master);
     int i;
 
     /* The slave's INT drives master IR2 (the cascade line), gated by
@@ -173,12 +191,31 @@ int hype_pic_emu_acknowledge(hype_pic_emu_t *pic, uint8_t *out_vector) {
         if ((effective & (uint8_t)(1u << i)) == 0) {
             continue;
         }
+        /*
+         * #364: FULLY-NESTED PRIORITY. Only a line strictly higher-priority than what is already
+         * in service may be acknowledged.
+         *
+         * hype's caller used to gate delivery on "both ISRs completely clear", which blocks EVERY
+         * line while ANY is in service -- so an IRQ1 left in service starved IRQ0, the HIGHEST
+         * priority line on the chip, forever. FreeBSD on VMX selected the i8254 as its event timer
+         * and then waited for a 100 Hz tick that could never arrive: mISR=0x2 with mIMR=0xff, so
+         * nothing would ever EOI the stuck line either. That is not 8259 behaviour -- IR0 preempts
+         * IR1 -- and modelling it as a single-in-service chip turned a lost injection into a dead
+         * clock.
+         */
+        if (i >= m_isr) {
+            return 0; /* every remaining line is lower priority still */
+        }
         if (i == 2 && s_pending != 0) {
             /* Cascade: the winning line is the slave's highest-priority
              * pending IRQ. Put it in service on the slave and mark the
              * cascade (master IR2) in service too. */
             int j;
+            int s_isr = highest_in_service(&pic->slave);
             for (j = 0; j < 8; j++) {
+                if (j >= s_isr) {
+                    break; /* #364: the slave nests by its own priority, same rule */
+                }
                 if (s_pending & (uint8_t)(1u << j)) {
                     pic->slave.irr &= (uint8_t) ~(1u << j);
                     pic->slave.isr |= (uint8_t)(1u << j);

@@ -283,6 +283,90 @@ static void test_acknowledge_cascade_blocked_when_master_ir2_masked(void) {
               hype_pic_emu_acknowledge(&pic, &vector));
 }
 
+/*
+ * #364: FULLY-NESTED PRIORITY. A higher-priority line preempts one in service; an equal or lower
+ * one waits for the EOI.
+ *
+ * This is the rule whose absence killed FreeBSD's clock on VMX. hype's caller gated delivery on
+ * "both ISRs completely clear", which blocks EVERY line while ANY is in service -- so an IRQ1 left
+ * in service starved IRQ0, the highest-priority line on the chip. FreeBSD chose the i8254 as its
+ * event timer and waited forever for a 100 Hz tick, with mISR=0x2 and mIMR=0xff so nothing would
+ * ever EOI the stuck line either.
+ */
+static void test_higher_priority_preempts_in_service(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.master.imr = 0x00u;
+
+    /* IRQ1 in service, IRQ0 pending: IR0 is higher priority and must be delivered. */
+    pic.master.isr = (uint8_t)(1u << 1);
+    hype_pic_emu_raise_irq(&pic.master, 0);
+    CHECK_HEX("IRQ0 preempts an in-service IRQ1", 1, hype_pic_emu_acknowledge(&pic, &vector));
+    CHECK_HEX("and reports IRQ0's vector", 0x20u, vector);
+    CHECK_HEX("both are now in service", 0x03u, pic.master.isr);
+}
+
+static void test_equal_or_lower_priority_waits_for_eoi(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.master.imr = 0x00u;
+
+    /* IRQ0 in service, IRQ1 pending: lower priority, so it must WAIT. */
+    pic.master.isr = (uint8_t)(1u << 0);
+    hype_pic_emu_raise_irq(&pic.master, 1);
+    CHECK_HEX("a lower-priority line does not preempt", 0, hype_pic_emu_acknowledge(&pic, &vector));
+    CHECK_HEX("it stays pending", 1, (pic.master.irr & (1u << 1)) != 0);
+
+    /* The same line does not preempt ITSELF either -- equal priority waits. */
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.master.imr = 0x00u;
+    pic.master.isr = (uint8_t)(1u << 0);
+    hype_pic_emu_raise_irq(&pic.master, 0);
+    CHECK_HEX("equal priority does not preempt", 0, hype_pic_emu_acknowledge(&pic, &vector));
+
+    /* After the EOI clears it, the same line is deliverable. */
+    pic.master.isr = 0u;
+    CHECK_HEX("after EOI it is delivered", 1, hype_pic_emu_acknowledge(&pic, &vector));
+    CHECK_HEX("with its own vector", 0x20u, vector);
+}
+
+/* The slave nests by its own priority, independently of the master's cascade bit. */
+static void test_slave_nests_by_its_own_priority(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.slave.irq_offset = 0x28u;
+    pic.master.imr = 0x00u;
+    pic.slave.imr = 0x00u;
+
+    /* Slave IRQ10 (index 2) in service, IRQ8 (index 0) pending: higher priority, so it goes. */
+    pic.master.isr = (uint8_t)(1u << 2); /* cascade in service */
+    pic.slave.isr = (uint8_t)(1u << 2);
+    hype_pic_emu_raise_global_irq(&pic, 8u);
+    CHECK_HEX("a higher slave line preempts", 1, hype_pic_emu_acknowledge(&pic, &vector));
+    CHECK_HEX("and reports IRQ8's vector", 0x28u, vector);
+
+    /* A LOWER slave line waits, even though the cascade is already in service. */
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.slave.irq_offset = 0x28u;
+    pic.master.imr = 0x00u;
+    pic.slave.imr = 0x00u;
+    pic.master.isr = (uint8_t)(1u << 2);
+    pic.slave.isr = (uint8_t)(1u << 0);
+    hype_pic_emu_raise_global_irq(&pic, 10u);
+    CHECK_HEX("a lower slave line waits", 0, hype_pic_emu_acknowledge(&pic, &vector));
+}
+
 int main(void) {
     test_reset_is_fully_masked();
     test_unrecognized_port_rejected();
@@ -304,6 +388,9 @@ int main(void) {
     test_acknowledge_cascade_delivers_slave_irq();
     test_acknowledge_master_beats_cascade_by_priority();
     test_acknowledge_cascade_blocked_when_master_ir2_masked();
+    test_higher_priority_preempts_in_service();
+    test_equal_or_lower_priority_waits_for_eoi();
+    test_slave_nests_by_its_own_priority();
 
     if (failures == 0) {
         printf("all tests passed\n");
