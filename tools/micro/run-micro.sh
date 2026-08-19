@@ -58,6 +58,22 @@ verdict_of() {   # $1 = log, $2 = test name
         return 1
     fi
     if LC_ALL=C grep -aq "MICRO PASS: $name" "$log"; then
+        # SOME TESTS HAVE A HOST-SIDE HALF, and a guest-only pass would be a test that cannot
+        # fail for the reason that matters. The guest can prove it owns the framebuffer it
+        # announced; only hype can say the config was accepted (#549). Same split the
+        # PAUSE-filter test settled (#540).
+        if [ "$name" = ramfb ]; then
+            if ! LC_ALL=C grep -aq "RAMFB vm[0-9]*: decoded " "$log"; then
+                echo "FAIL   $name -- the guest passed but hype never decoded a ramfb config;" \
+                     "the guest half alone does not prove the transport"
+                return 1
+            fi
+            local blits
+            blits=$(LC_ALL=C grep -ao "blits=[0-9]*" "$log" | tail -1 | cut -d= -f2)
+            echo "PASS   $name (hype decoded the config; blits=${blits:-0} -- 0 only means this VM"\
+                 "was not the on-screen view)"
+            return 0
+        fi
         echo "PASS   $name"
         return 0
     fi

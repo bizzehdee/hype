@@ -94,7 +94,7 @@ ESP       := $(BUILD_DIR)/esp
 # belong with the others -- but it is the one thing that surprises.
 MICRO_DIR   := tests/micro
 MICRO_OUT   := $(BUILD_DIR)/micro
-MICRO_NAMES := hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2 pflash pci
+MICRO_NAMES := hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2 pflash pci ramfb
 MICRO_IMAGES := $(patsubst %,$(MICRO_OUT)/%.bin,$(MICRO_NAMES))
 MICRO_CFLAGS := --target=x86_64-unknown-elf -ffreestanding -fno-stack-protector -fno-pic \
                 -mno-red-zone -mno-sse -Wall -Wextra -Werror -O2 -std=c11
@@ -112,7 +112,7 @@ micro: $(MICRO_IMAGES) $(MICRO_OUT)/suite.bin
 #
 # faulter is deliberately NOT a member: it triple-faults on purpose, which would take the suite VM
 # and every test after it down. It stays a standalone artifact where that is the whole point.
-MICRO_SUITE_MEMBERS := hello ram1 cpumsr fwcfg pci pflash intdeliver pausespin ps2
+MICRO_SUITE_MEMBERS := hello ram1 cpumsr fwcfg pci pflash intdeliver pausespin ps2 ramfb
 MICRO_SUITE_OBJS := $(patsubst %,$(MICRO_OUT)/suite-%.o,$(MICRO_SUITE_MEMBERS))
 
 $(MICRO_OUT)/suite-%.o: $(MICRO_DIR)/%.c $(MICRO_DIR)/micro.h $(MICRO_DIR)/micro_pci.h \
