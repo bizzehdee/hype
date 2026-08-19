@@ -1002,6 +1002,19 @@ static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
  * #393: count the [vm.*] section headers, so a caller can size storage before parsing. Read-only
  * and deliberately dumb -- it counts declarations, and the parse is what judges them.
  */
+void hype_cfg_init(hype_cfg_t *out) {
+    unsigned char *b = (unsigned char *)out;
+    unsigned long long i;
+    if (out == 0) {
+        return;
+    }
+    for (i = 0; i < sizeof(*out); i++) {
+        b[i] = 0;
+    }
+    out->vms = out->vms_default;
+    out->vm_cap = HYPE_CFG_MAX_VMS;
+}
+
 unsigned int hype_cfg_count_vms(const char *text) {
     unsigned int n = 0;
     const char *p = text;

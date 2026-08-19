@@ -32,7 +32,7 @@ static void test_memory_within_budget(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 1, 1024, "a.img");
     make_vm(&cfg.vms[1], "b", 1, 2048, "b.img");
@@ -46,7 +46,7 @@ static void test_memory_overcommit(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 9000, "a.img");
 
@@ -60,7 +60,7 @@ static void test_memory_reserved_exceeds_usable(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 1, "a.img");
 
@@ -74,7 +74,7 @@ static void test_memory_no_vms_is_ok(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 0;
 
     r = hype_adm_check_memory(&cfg, 0, 0);
@@ -87,7 +87,7 @@ static void test_vcpus_within_budget(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 2, 512, "a.img");
     make_vm(&cfg.vms[1], "b", 3, 512, "b.img");
@@ -100,7 +100,7 @@ static void test_vcpus_overcommit(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 4, 512, "a.img");
     make_vm(&cfg.vms[1], "b", 5, 512, "b.img");
@@ -113,7 +113,7 @@ static void test_vcpus_exact_fit_is_ok(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 8, 512, "a.img");
 
@@ -127,7 +127,7 @@ static void test_cpu_set_no_explicit_sets_is_ok(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 2, 512, "a.img");
     make_vm(&cfg.vms[1], "b", 2, 512, "b.img");
@@ -140,7 +140,7 @@ static void test_cpu_set_count_mismatch(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 2, 512, "a.img");
     cfg.vms[0].has_cpu_set = 1;
@@ -159,7 +159,7 @@ static void test_cpu_set_core_out_of_range(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     cfg.vms[0].has_cpu_set = 1;
@@ -175,7 +175,7 @@ static void test_cpu_set_overlap_rejected(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 2, 512, "a.img");
     cfg.vms[0].has_cpu_set = 1;
@@ -199,7 +199,7 @@ static void test_cpu_set_disjoint_is_ok(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 2, 512, "a.img");
     cfg.vms[0].has_cpu_set = 1;
@@ -221,7 +221,7 @@ static void test_cpu_set_mixed_explicit_and_auto_is_ok(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 2, 512, "a.img");
     cfg.vms[0].has_cpu_set = 1;
@@ -241,7 +241,7 @@ static void test_target_disk_unique_is_ok(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
@@ -254,7 +254,7 @@ static void test_target_disk_collision_same_kind(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 1, 512, "shared.img");
     make_vm(&cfg.vms[1], "b", 1, 512, "shared.img");
@@ -269,7 +269,7 @@ static void test_target_disk_same_path_different_kind_is_ok(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 1, 512, "SN-1234");
     cfg.vms[0].target_disk.kind = HYPE_CFG_DISK_PHYSICAL;
@@ -287,7 +287,7 @@ static void test_net_peers_valid_pairing_is_ok(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "debian", 1, 512, "a.img");
     cfg.vms[0].net_mode = HYPE_CFG_NET_NAT;
@@ -305,7 +305,7 @@ static void test_net_peers_unknown_vm_rejected(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "debian", 1, 512, "a.img");
     cfg.vms[0].net_mode = HYPE_CFG_NET_NAT;
@@ -322,7 +322,7 @@ static void test_net_peers_requires_nat_on_both_sides(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "debian", 1, 512, "a.img");
     cfg.vms[0].net_mode = HYPE_CFG_NET_NAT;
@@ -342,7 +342,7 @@ static void test_net_peers_none_is_ok(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
 
@@ -361,7 +361,7 @@ static void test_media_disk_unset_is_auto(void) {
     hype_cfg_t cfg;
     static const char *const devs[2] = {"SN-A", "SN-B"};
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
 
@@ -375,7 +375,7 @@ static void test_media_disk_matches_second_device(void) {
     hype_cfg_t cfg;
     static const char *const devs[3] = {"SN-A", "SN-B", "SN-C"};
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     set_media_disk(&cfg.vms[0], "SN-B");
@@ -391,7 +391,7 @@ static void test_media_disk_absent_is_refused_not_substituted(void) {
     hype_adm_result_t r;
     static const char *const devs[2] = {"SN-A", "SN-B"};
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
@@ -409,7 +409,7 @@ static void test_media_disk_absent_is_refused_not_substituted(void) {
 static void test_media_disk_no_devices_enumerated_is_refused(void) {
     hype_cfg_t cfg;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     set_media_disk(&cfg.vms[0], "SN-A");
@@ -423,7 +423,7 @@ static void test_media_disk_unidentified_devices_never_match(void) {
     hype_cfg_t cfg;
     static const char *const devs[3] = {0, "", "SN-C"};
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     set_media_disk(&cfg.vms[0], "");
@@ -440,7 +440,7 @@ static void test_media_disk_is_exact_match(void) {
     hype_cfg_t cfg;
     static const char *const devs[2] = {"SN-ABC", "SN-ABCDEF"};
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     set_media_disk(&cfg.vms[0], "SN-ABCDEF");
@@ -453,7 +453,7 @@ static void test_media_disk_out_of_range_vm_is_auto(void) {
     hype_cfg_t cfg;
     static const char *const devs[1] = {"SN-A"};
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     set_media_disk(&cfg.vms[0], "SN-A");
@@ -489,7 +489,7 @@ static void attach(hype_cfg_vm_t *vm, const char *id, int as_cdrom) {
 static void test_disk_refs_must_exist_and_match_type(void) {
     hype_cfg_t cfg;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     add_disk(&cfg, "sys", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 0);
@@ -525,7 +525,7 @@ static void test_writable_disks_cannot_be_shared_but_read_only_can(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 2;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
@@ -560,7 +560,7 @@ static void test_writable_disks_cannot_be_shared_but_read_only_can(void) {
 static void test_physical_overlap_allows_distinct_partitions(void) {
     hype_cfg_t cfg;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 0;
 
     /* THE case this ticket calls out as easy to get wrong: two DIFFERENT partitions on one drive are
@@ -598,7 +598,7 @@ static void test_physical_overlap_allows_distinct_partitions(void) {
 static void test_unpresentable_bus_is_refused(void) {
     hype_cfg_t cfg;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     cfg.vms[0].os_hint = HYPE_CFG_OS_LINUX;
@@ -638,7 +638,7 @@ static void test_disk_count_over_frontend_budget_is_refused(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
-    memset(&cfg, 0, sizeof(cfg));
+    hype_cfg_init(&cfg); /* #393: zeroes AND binds VM storage */
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
     add_disk(&cfg, "d0", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_FILE, 0);

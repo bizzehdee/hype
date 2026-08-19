@@ -508,6 +508,14 @@ typedef struct {
  * into *out. On any error, *out's contents are unspecified; check
  * result.status.
  */
+/*
+ * #393: zero a config AND bind its default VM storage. Any hype_cfg_t built by hand rather
+ * than by parsing must go through this -- `vms` is a pointer now, so a memset alone leaves it
+ * null and the first cfg->vms[i] write is a fault. Callers that parse do not need it;
+ * hype_cfg_parse() binds storage itself.
+ */
+void hype_cfg_init(hype_cfg_t *out);
+
 hype_cfg_result_t hype_cfg_parse(char *text, hype_cfg_t *out);
 
 /*

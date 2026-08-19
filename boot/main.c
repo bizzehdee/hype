@@ -62,6 +62,7 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 }
 #include "../core/logbuf.h"
 #include "../core/log_drain.h"
+#include "../core/ram_pool.h"
 #include "../core/clockfacts.h"
 #include "../core/io_histogram.h"
 #include "../core/format.h"
@@ -3362,10 +3363,140 @@ static uint64_t hype_alloc_pages_any(EFI_BOOT_SERVICES *bs, UINTN pages) {
  * are simply left allocated and unused (never freed -- this hypervisor
  * never exits).
  */
+/* Defined just below; the pool helpers call it, and they read better next to the sites they
+ * replace than after the allocator they wrap. */
+static uint64_t hype_alloc_pages_any_2mb_aligned(EFI_BOOT_SERVICES *bs, uint64_t size);
+static uint64_t hype_alloc_pages_any_2mb_aligned_try(EFI_BOOT_SERVICES *bs, uint64_t size);
+
+/*
+ * RAM-3 (#449, plan.md section 10 decision 37): ONE guest-memory reservation.
+ *
+ * Every guest-owned block -- guest RAM, the firmware image, its pristine snapshot, the vdisk
+ * backing -- used to be its own AllocatePages run, one per VM, each sized from hype.cfg. That
+ * made the SIZE of every reservation a pre-EBS decision, which is the whole reason the config
+ * had to be parsed by firmware. It also failed for a reason operators found baffling: #290's
+ * diagnostic says "Not out of memory: out of contiguity", and N separate large contiguous runs
+ * are strictly harder to satisfy than one.
+ *
+ * So: reserve once, from the memory map rather than from the config, and carve in Phase 1.
+ */
+static hype_ram_pool_t g_guest_pool;
+static int g_guest_pool_ready;
+
+/* Carve kinds -- the tag that lets a VM restart find its own existing carve. */
+#define HYPE_POOL_KIND_RAM 0u
+#define HYPE_POOL_KIND_FW 1u
+#define HYPE_POOL_KIND_FW_PRISTINE 2u
+#define HYPE_POOL_KIND_VDISK 3u
+
+/*
+ * Reserve the pool. Sized from usable RAM minus a margin for hype's own later allocations, and
+ * halved on failure down to a floor -- firmware owns some of that memory and will refuse the
+ * first ask on most machines. Reports what it got, because a smaller pool than intended is the
+ * thing that will later show up as a carve failure.
+ */
+static void fw_1_reserve_guest_pool(EFI_BOOT_SERVICES *bs, uint64_t usable_ram_bytes,
+                                    uint64_t largest_block_bytes) {
+    /*
+     * Ask for what the map can actually GIVE, not for what is free in total. #290's own
+     * diagnostic exists because those two differ: "Not out of memory: out of contiguity". The
+     * first attempt asked usable-minus-margin (7148 MiB) against a largest free block of
+     * 5100 MiB, and the allocator panics on failure, so the retry loop never ran.
+     *
+     * The margin is subtracted ONCE, from whichever of the two is smaller. Subtracting it from
+     * both left the pool 30 MiB short of two 2 GiB guests, and a carve that falls back lands on
+     * a machine whose contiguous memory this pool has just taken -- so being slightly too greedy
+     * and slightly too shy fail the same way.
+     */
+    uint64_t avail = usable_ram_bytes;
+    uint64_t margin = usable_ram_bytes / 16ull;
+    uint64_t want;
+    uint64_t floor_bytes = 64ull * 1024ull * 1024ull;
+    if (margin < 256ull * 1024ull * 1024ull) {
+        margin = 256ull * 1024ull * 1024ull;
+    }
+    if (largest_block_bytes != 0ull && largest_block_bytes < avail) {
+        avail = largest_block_bytes;
+    }
+    want = (avail > margin) ? (avail - margin) : 0ull;
+    while (want >= floor_bytes) {
+        uint64_t base = hype_alloc_pages_any_2mb_aligned_try(bs, want);
+        if (base != 0ull) {
+            if (hype_ram_pool_init(&g_guest_pool, base, want) == HYPE_RAM_POOL_OK) {
+                g_guest_pool_ready = 1;
+                hype_debug_print("fw-1 RAMPOOL: reserved %llu MiB at host-physical 0x%llx "
+                                 "(usable %llu MiB, margin %llu MiB) [#449]\n",
+                                 (unsigned long long)(g_guest_pool.size / (1024ull * 1024ull)),
+                                 (unsigned long long)base,
+                                 (unsigned long long)(usable_ram_bytes / (1024ull * 1024ull)),
+                                 (unsigned long long)(margin / (1024ull * 1024ull)));
+                return;
+            }
+        }
+        want /= 2ull;
+    }
+    /* Not fatal: the per-carve path falls back to a direct AllocatePages, which is exactly what
+     * hype did before this existed. Said out loud so the fallback is never silent. */
+    hype_debug_print("fw-1 RAMPOOL: could NOT reserve a guest pool (usable %llu MiB) -- falling "
+                     "back to one AllocatePages per block, as before [#449]\n",
+                     (unsigned long long)(usable_ram_bytes / (1024ull * 1024ull)));
+}
+
+/*
+ * Carve guest-owned memory. Falls back to a direct reservation when no pool exists, so a host
+ * too fragmented to give up one big block still boots. Names the VM and the shortfall on
+ * failure, matching #290's diagnostic bar.
+ */
+static uint64_t fw_1_pool_carve(EFI_BOOT_SERVICES *bs, unsigned vm_index, unsigned kind,
+                                uint64_t bytes, const char *what) {
+    uint64_t base = 0ull;
+    uint64_t shortfall = 0ull;
+    hype_ram_pool_status_t st;
+    if (!g_guest_pool_ready) {
+        return hype_alloc_pages_any_2mb_aligned(bs, bytes);
+    }
+    st = hype_ram_pool_carve(&g_guest_pool, bytes, vm_index, kind, &base, &shortfall);
+    if (st != HYPE_RAM_POOL_OK) {
+        hype_debug_print("fw-1 RAMPOOL: vm%u %s carve of %llu MiB FAILED (%s, short by %llu MiB, "
+                         "%llu MiB left of %llu MiB) [#449]\n",
+                         vm_index, what, (unsigned long long)(bytes / (1024ull * 1024ull)),
+                         hype_ram_pool_status_str(st),
+                         (unsigned long long)(shortfall / (1024ull * 1024ull)),
+                         (unsigned long long)(hype_ram_pool_remaining(&g_guest_pool) /
+                                              (1024ull * 1024ull)),
+                         (unsigned long long)(g_guest_pool.size / (1024ull * 1024ull)));
+        /* Fall back rather than refuse the VM here: the pool is an allocation strategy, not a
+         * policy, and admission (section 6i) is where a VM is told it cannot run. */
+        return hype_alloc_pages_any_2mb_aligned(bs, bytes);
+    }
+    hype_debug_print("fw-1 RAMPOOL: vm%u %s carve %llu MiB @0x%llx (%llu MiB left) [#449]\n",
+                     vm_index, what, (unsigned long long)(bytes / (1024ull * 1024ull)),
+                     (unsigned long long)base,
+                     (unsigned long long)(hype_ram_pool_remaining(&g_guest_pool) /
+                                          (1024ull * 1024ull)));
+    return base;
+}
+
 static uint64_t hype_alloc_pages_any_2mb_aligned(EFI_BOOT_SERVICES *bs, uint64_t size) {
     UINTN pages = (UINTN)((size + HYPE_PAGING_2MB) / 4096ULL);
     uint64_t raw = hype_alloc_pages_any(bs, pages);
     return (raw + HYPE_PAGING_2MB - 1) & ~(HYPE_PAGING_2MB - 1);
+}
+
+/*
+ * #449: the same, but a failure RETURNS ZERO instead of panicking.
+ *
+ * The pool reservation asks for a large block and expects to be told no -- it halves and tries
+ * again. The fatal variant is right for a reservation hype cannot proceed without; it is wrong
+ * for one that has a smaller fallback, and using it there turned a retry loop into a panic.
+ */
+static uint64_t hype_alloc_pages_any_2mb_aligned_try(EFI_BOOT_SERVICES *bs, uint64_t size) {
+    EFI_PHYSICAL_ADDRESS mem = 0;
+    UINTN pages = (UINTN)((size + HYPE_PAGING_2MB) / 4096ULL);
+    if (bs->AllocatePages(AllocateAnyPages, EfiLoaderData, pages, &mem) != EFI_SUCCESS) {
+        return 0ull;
+    }
+    return ((uint64_t)mem + HYPE_PAGING_2MB - 1) & ~(HYPE_PAGING_2MB - 1);
 }
 
 typedef struct {
@@ -22206,6 +22337,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * machine's own real usable RAM, not a guess. */
     usable_ram_bytes = hype_memmap_usable_bytes(map, map_size, desc_size);
     g_usable_ram_bytes = usable_ram_bytes;
+    /* RAM-3 (#449): reserve the one guest pool here -- the first point the memory map has
+     * been read, and before any per-VM block is taken. */
+    fw_1_reserve_guest_pool(SystemTable->BootServices, usable_ram_bytes,
+                            hype_memmap_largest_conventional_bytes(map, map_size, desc_size));
 
     /* RT-1b: while the map is still in hand (it names which physical ranges
      * are safe to read) and Boot Services file I/O is still up, scan RAM for
@@ -22702,13 +22837,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         {
             static hype_cfg_t ram_1_cfg;
             hype_adm_result_t adm_result;
-            unsigned char *raw = (unsigned char *)&ram_1_cfg;
-            unsigned long long z;
             UINTN pages;
 
-            for (z = 0; z < sizeof(ram_1_cfg); z++) {
-                raw[z] = 0;
-            }
+            /* #393: zero AND bind VM storage -- `vms` is a pointer now, so the hand-rolled
+             * memset this used to do would leave the first vms[0] write faulting. */
+            hype_cfg_init(&ram_1_cfg);
             ram_1_cfg.vm_count = 1;
             ram_1_cfg.vms[0].mem_mb = HYPE_RAM_1_TEST_MEM_MB;
 
@@ -22769,8 +22902,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             mapped_size = (content_size + HYPE_PAGING_2MB - 1) & ~(HYPE_PAGING_2MB - 1);
             g_fw_1_combined_size = mapped_size;
 
-            g_fw_1_combined_host_phys =
-                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, mapped_size);
+            g_fw_1_combined_host_phys = fw_1_pool_carve(SystemTable->BootServices, 0u,
+                                                        HYPE_POOL_KIND_FW, mapped_size,
+                                                        "firmware");
             hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_combined_host_phys, mapped_size);
 
             content_start = g_fw_1_combined_host_phys + (mapped_size - content_size);
@@ -22798,8 +22932,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * firmware so a VM Start can restore it -- the ESP is unreachable
              * post-EBS. Same 2MB-aligned allocator, done while Boot Services
              * still exist. */
-            vm->fw_pristine_host_phys =
-                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, mapped_size);
+            vm->fw_pristine_host_phys = fw_1_pool_carve(SystemTable->BootServices, 0u,
+                                                        HYPE_POOL_KIND_FW_PRISTINE, mapped_size,
+                                                        "firmware snapshot");
             hype_guest_ram_copy((void *)(uintptr_t)vm->fw_pristine_host_phys,
                                 (const void *)(uintptr_t)g_fw_1_combined_host_phys, mapped_size);
         }
@@ -22818,8 +22953,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * allocation instead of being overwritten after the fact. */
         fw_1_resolve_guest_ram(vm, &g_hype_cfg, 0u);
         fw_1_resolve_os_hint(vm, &g_hype_cfg, 0u);
-        g_fw_1_ram_host_phys =
-            hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vm->ram_bytes);
+        g_fw_1_ram_host_phys = fw_1_pool_carve(SystemTable->BootServices, 0u,
+                                               HYPE_POOL_KIND_RAM, vm->ram_bytes, "guest RAM");
         hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
 
         /* M8-0b: grab a <1MB page now (Boot Services only) to stage the AP
@@ -22912,8 +23047,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * (AllocatePages is gone afterward), zeroed so the guest sees a blank
          * disk. Later steps swap the backend to a raw file / physical disk. */
         {
-            UINTN vdisk_pages = (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL);
-            g_vms[0].disk[0].backing_phys = hype_alloc_pages_any(SystemTable->BootServices, vdisk_pages);
+            /* #449: carved with every other guest-owned block, so vm0's scratch disk is not
+             * the one reservation still competing with the pool for contiguity. */
+            g_vms[0].disk[0].backing_phys =
+                fw_1_pool_carve(SystemTable->BootServices, 0u, HYPE_POOL_KIND_VDISK,
+                                HYPE_FW_1_VDISK_BYTES, "vdisk backing");
             hype_guest_ram_zero((void *)(uintptr_t)g_vms[0].disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
             /* #267: this is the RAM fallback being RESERVED, not the backend being
              * chosen -- that happens later in fw_1_setup_virtio_blk. Say so: read as
@@ -22965,22 +23103,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             vmn->code_size = vm->code_size;
             vmn->vars_size = vm->vars_size;
             vmn->combined_size = vm->combined_size;
-            vmn->combined_host_phys =
-                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vmn->combined_size);
+            vmn->combined_host_phys = fw_1_pool_carve(SystemTable->BootServices, vi,
+                                                      HYPE_POOL_KIND_FW, vmn->combined_size,
+                                                      "firmware");
             hype_guest_ram_copy((void *)(uintptr_t)vmn->combined_host_phys,
                                 (const void *)(uintptr_t)vm->combined_host_phys, vmn->combined_size);
             fw_1_resolve_guest_ram(vmn, &g_hype_cfg, vi);
             fw_1_resolve_os_hint(vmn, &g_hype_cfg, vi);
-            vmn->ram_host_phys =
-                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vmn->ram_bytes);
+            vmn->ram_host_phys = fw_1_pool_carve(SystemTable->BootServices, vi,
+                                                 HYPE_POOL_KIND_RAM, vmn->ram_bytes, "guest RAM");
             hype_guest_ram_zero((void *)(uintptr_t)vmn->ram_host_phys, vmn->ram_bytes);
-            vmn->fw_pristine_host_phys =
-                hype_alloc_pages_any_2mb_aligned(SystemTable->BootServices, vmn->combined_size);
+            vmn->fw_pristine_host_phys = fw_1_pool_carve(SystemTable->BootServices, vi,
+                                                         HYPE_POOL_KIND_FW_PRISTINE,
+                                                         vmn->combined_size, "firmware snapshot");
             hype_guest_ram_copy((void *)(uintptr_t)vmn->fw_pristine_host_phys,
                                 (const void *)(uintptr_t)vmn->combined_host_phys, vmn->combined_size);
             vmn->host_tsc_hz = vm->host_tsc_hz;
-            vmn->disk[0].backing_phys =
-                hype_alloc_pages_any(SystemTable->BootServices, (UINTN)(HYPE_FW_1_VDISK_BYTES / 4096ULL));
+            vmn->disk[0].backing_phys = fw_1_pool_carve(SystemTable->BootServices, vi,
+                                                        HYPE_POOL_KIND_VDISK,
+                                                        HYPE_FW_1_VDISK_BYTES, "vdisk backing");
             hype_guest_ram_zero((void *)(uintptr_t)vmn->disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
             hype_debug_print(
                 "fw-1 VM%u: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
