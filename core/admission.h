@@ -52,6 +52,28 @@ typedef struct {
  */
 #define HYPE_ADM_RESERVED_MB_DEFAULT 256u
 
+/*
+ * ADM-7 (#453, plan.md section 10 decision 37): does every VM's guest memory fit the POOL hype has
+ * already reserved?
+ *
+ * hype_adm_check_memory() below compares against a memory-map estimate minus a fixed reserve,
+ * which was the best answer available while the allocation was still ahead of the check. It is no
+ * longer: #449 reserves one pool up front, so the size is known rather than predicted -- and the
+ * prediction was wrong in the way that mattered, because AllocatePages fails on CONTIGUITY, not on
+ * total free RAM (#290: "Not out of memory: out of contiguity"). One pool removes that variable,
+ * so this check is exact.
+ *
+ * Counts what a VM actually carves: its guest RAM, its firmware image and its vdisk backing, each
+ * rounded up to the pool's 2 MB granularity, because a carve consumes whole granules.
+ *
+ * `fit_out` receives how many VMs fit in config order, so the caller can name the ones that will
+ * not run rather than reporting a bare total. `shortfall_bytes_out` receives what was missing.
+ */
+hype_adm_result_t hype_adm_check_pool(const hype_cfg_t *cfg, UINT64 pool_bytes,
+                                      UINT64 per_vm_firmware_bytes, UINT64 per_vm_vdisk_bytes,
+                                      UINT64 granule_bytes, unsigned int *fit_out,
+                                      UINT64 *shortfall_bytes_out);
+
 hype_adm_result_t hype_adm_check_memory(const hype_cfg_t *cfg, UINT64 usable_ram_bytes,
                                          UINT64 reserved_bytes);
 

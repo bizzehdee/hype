@@ -17,6 +17,54 @@ static hype_adm_result_t adm_err(hype_adm_status_t status, unsigned int a, unsig
     return r;
 }
 
+static UINT64 adm_round_up(UINT64 v, UINT64 granule) {
+    if (granule == 0ULL) {
+        return v;
+    }
+    return ((v + granule - 1ULL) / granule) * granule;
+}
+
+hype_adm_result_t hype_adm_check_pool(const hype_cfg_t *cfg, UINT64 pool_bytes,
+                                      UINT64 per_vm_firmware_bytes, UINT64 per_vm_vdisk_bytes,
+                                      UINT64 granule_bytes, unsigned int *fit_out,
+                                      UINT64 *shortfall_bytes_out) {
+    UINT64 used = 0ULL;
+    unsigned int i;
+    unsigned int fit = 0u;
+
+    if (fit_out != 0) {
+        *fit_out = 0u;
+    }
+    if (shortfall_bytes_out != 0) {
+        *shortfall_bytes_out = 0ULL;
+    }
+    if (cfg == 0) {
+        return adm_err(HYPE_ADM_ERR_MEMORY_OVERCOMMIT, HYPE_ADM_NO_VM, HYPE_ADM_NO_VM);
+    }
+    for (i = 0; i < cfg->vm_count; i++) {
+        UINT64 want = adm_round_up((UINT64)cfg->vms[i].mem_mb * 1024ULL * 1024ULL, granule_bytes) +
+                      adm_round_up(per_vm_firmware_bytes, granule_bytes) +
+                      adm_round_up(per_vm_vdisk_bytes, granule_bytes);
+        if (used + want > pool_bytes) {
+            /* Stop at the first VM that does not fit: the caller names this one and every one
+             * after it, in config order, so the operator sees WHICH machines will not exist. */
+            if (shortfall_bytes_out != 0) {
+                *shortfall_bytes_out = (used + want) - pool_bytes;
+            }
+            if (fit_out != 0) {
+                *fit_out = fit;
+            }
+            return adm_err(HYPE_ADM_ERR_MEMORY_OVERCOMMIT, i, HYPE_ADM_NO_VM);
+        }
+        used += want;
+        fit++;
+    }
+    if (fit_out != 0) {
+        *fit_out = fit;
+    }
+    return adm_ok();
+}
+
 hype_adm_result_t hype_adm_check_memory(const hype_cfg_t *cfg, UINT64 usable_ram_bytes,
                                          UINT64 reserved_bytes) {
     UINT64 total_mb = 0;

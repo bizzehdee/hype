@@ -662,7 +662,109 @@ static void test_disk_count_over_frontend_budget_is_refused(void) {
 }
 
 
+/* ---- ADM-7 (#453): memory checked against the RESERVED POOL, not a memory-map estimate ---- */
+
+#define ADM_MB (1024ULL * 1024ULL)
+#define ADM_GRANULE (2ULL * ADM_MB)
+#define ADM_FW (4ULL * ADM_MB)
+#define ADM_VDISK (64ULL * ADM_MB)
+
+static void test_pool_admits_what_fits(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+    unsigned int fit = 99u;
+    UINT64 short_by = 1ULL;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+
+    /* Each VM costs 512 MiB + 4 MiB firmware + 64 MiB vdisk = 580 MiB; two is 1160 MiB. */
+    r = hype_adm_check_pool(&cfg, 2048ULL * ADM_MB, ADM_FW, ADM_VDISK, ADM_GRANULE, &fit,
+                            &short_by);
+    CHECK_INT("both fit a 2 GiB pool", (int)HYPE_ADM_OK, (int)r.status);
+    CHECK_INT("and both are counted", 2, (int)fit);
+    CHECK_INT("with no shortfall", 0, (int)short_by);
+}
+
+/* The point of the change: a VM that does not fit is named, and the ones before it still run. */
+static void test_pool_names_the_first_vm_that_does_not_fit(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+    unsigned int fit = 99u;
+    UINT64 short_by = 0ULL;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 3;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    make_vm(&cfg.vms[2], "c", 1, 512, "c.img");
+
+    /* 580 MiB each; a 1200 MiB pool holds two. */
+    r = hype_adm_check_pool(&cfg, 1200ULL * ADM_MB, ADM_FW, ADM_VDISK, ADM_GRANULE, &fit,
+                            &short_by);
+    CHECK_INT("the third VM is refused", (int)HYPE_ADM_ERR_MEMORY_OVERCOMMIT, (int)r.status);
+    CHECK_INT("and it is named by index", 2, (int)r.vm_index_a);
+    CHECK_INT("the two that fit are still counted", 2, (int)fit);
+    /* 3 x 580 = 1740 against 1200 leaves 540 MiB missing at the third. */
+    CHECK_INT("the shortfall is reported in whole MiB", 540, (int)(short_by / ADM_MB));
+}
+
+/* A carve consumes whole granules, so admission must count them that way or it will admit a
+ * config the allocator then cannot serve -- which is the exact failure #449's own margin bug was. */
+static void test_pool_counts_whole_granules(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+    unsigned int fit = 0u;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 1, "a.img"); /* 1 MiB asked, 2 MiB consumed */
+
+    r = hype_adm_check_pool(&cfg, 2ULL * ADM_MB, 0ULL, 0ULL, ADM_GRANULE, &fit, 0);
+    CHECK_INT("a 1 MiB guest fills a 2 MiB pool exactly", (int)HYPE_ADM_OK, (int)r.status);
+    CHECK_INT("and it fits", 1, (int)fit);
+
+    /* Two of them need two granules, not 2 MiB total. */
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[1], "b", 1, 1, "b.img");
+    r = hype_adm_check_pool(&cfg, 2ULL * ADM_MB, 0ULL, 0ULL, ADM_GRANULE, &fit, 0);
+    CHECK_INT("two 1 MiB guests do NOT fit one granule",
+              (int)HYPE_ADM_ERR_MEMORY_OVERCOMMIT, (int)r.status);
+    CHECK_INT("the first still fits", 1, (int)fit);
+}
+
+static void test_pool_edge_cases(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+    unsigned int fit = 5u;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 0;
+    r = hype_adm_check_pool(&cfg, 0ULL, 0ULL, 0ULL, ADM_GRANULE, &fit, 0);
+    CHECK_INT("no VMs fit any pool, including an empty one", (int)HYPE_ADM_OK, (int)r.status);
+    CHECK_INT("and nothing is counted", 0, (int)fit);
+
+    r = hype_adm_check_pool(0, 1024ULL * ADM_MB, 0ULL, 0ULL, ADM_GRANULE, &fit, 0);
+    CHECK_INT("a null config is refused, not admitted",
+              (int)HYPE_ADM_ERR_MEMORY_OVERCOMMIT, (int)r.status);
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 8, "a.img");
+    r = hype_adm_check_pool(&cfg, 64ULL * ADM_MB, 0ULL, 0ULL, 0ULL, &fit, 0);
+    CHECK_INT("a zero granule means no rounding, not a divide", (int)HYPE_ADM_OK, (int)r.status);
+    CHECK_INT("optional out-params may be null", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_pool(&cfg, 64ULL * ADM_MB, 0ULL, 0ULL, ADM_GRANULE, 0, 0).status);
+}
+
+
 int main(void) {
+    test_pool_admits_what_fits();
+    test_pool_names_the_first_vm_that_does_not_fit();
+    test_pool_counts_whole_granules();
+    test_pool_edge_cases();
     test_memory_within_budget();
     test_memory_overcommit();
     test_memory_reserved_exceeds_usable();

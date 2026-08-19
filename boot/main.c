@@ -1060,6 +1060,16 @@ static uint8_t *g_snap_hit;
 static unsigned g_vm_count = 2u;
 /* #450: what Phase 0 ALLOCATED for -- the host's physical bound, not the config's ask. */
 static unsigned g_max_vms = 2u;
+/*
+ * #531: refused per VM, not by truncating the list.
+ *
+ * An isolation breach names two specific VMs. Capping the launch count at the first
+ * of them also drops every VM after it, including ones with their own core and their
+ * own disk -- so a config with one bad pair lost three machines and reported the
+ * innocent one as over budget. Refusing by index keeps the report honest and the
+ * blast radius the size of the actual fault.
+ */
+static uint8_t *g_vm_refused;
 #define FW_1_LINE_BUF_FS 256u /* #394: file-scope twin of FW_1_LINE_BUF */
 static char (*g_uart_line)[FW_1_LINE_BUF_FS];   /* #394: per-VM, were func-static */
 static char (*g_uart_line2)[FW_1_LINE_BUF_FS];
@@ -13351,6 +13361,16 @@ static void fw_1_phase1_firmware(void) {
                      (unsigned long long)g_vms[0].combined_host_phys);
 }
 
+/* #531: mark one VM as refused, by index, and say so once. */
+static void fw_1_refuse_vm(unsigned vi) {
+    if (g_vm_refused == 0 || vi >= g_max_vms || g_vm_refused[vi] != 0u) {
+        return;
+    }
+    g_vm_refused[vi] = 1u;
+    hype_debug_print("adm: vm%u WILL NOT RUN -- refused by an isolation check above; every other "
+                     "VM is unaffected [#531]\n", vi);
+}
+
 static void fw_1_phase1_config(void) {
     /* #452: the previous boot's log first -- it is the one thing a failed run leaves, and
      * writing it before anything else means a later fault here does not cost it. */
@@ -13359,12 +13379,11 @@ static void fw_1_phase1_config(void) {
     fw_1_phase1_firmware();
 
     g_vm_count = g_hype_cfg.vm_count ? g_hype_cfg.vm_count : 2u;
-    if (g_vm_count > g_max_vms) {
-        g_vm_count = g_max_vms; /* #396 reports the refusal per VM further down */
-    }
     if (g_hype_cfg.hype.dashboard_default_view == HYPE_CFG_VIEW_VM) {
         unsigned int vi;
-        for (vi = 0u; vi < g_hype_cfg.vm_count; vi++) {
+        /* #450: bounded by the array, not by the config -- a config can declare more VMs than
+         * this fixed name table holds, and writing past it would corrupt whatever follows. */
+        for (vi = 0u; vi < g_hype_cfg.vm_count && vi < HYPE_CFG_MAX_VMS; vi++) {
             g_term_cfg_vm_names[vi] = g_hype_cfg.vms[vi].name;
         }
         g_term_default_view_target = hype_term_focus_find_name(
@@ -13403,25 +13422,101 @@ static void fw_1_phase1_config(void) {
             }
         }
         {
-            /* RAM: cumulative configured guest RAM must fit the usable budget. */
-            uint64_t budget = g_usable_ram_bytes;
-            uint64_t used = 0;
+            /*
+             * ADM-7 (#453): checked against the POOL hype has already reserved, not against a
+             * memory-map estimate.
+             *
+             * The estimate was the best answer available while allocation was still ahead of the
+             * check; #449 makes the size known instead of predicted. It also removes the variable
+             * that made the prediction wrong in the way that mattered: AllocatePages fails on
+             * CONTIGUITY, not on total free RAM (#290 -- "Not out of memory: out of contiguity"),
+             * and one pool has no contiguity question left. Counts what a VM really carves --
+             * guest RAM, firmware, vdisk -- each rounded to the pool's own granule, because a
+             * carve consumes whole granules and admitting a config the allocator cannot then
+             * serve is worse than refusing it.
+             */
+            hype_adm_result_t pr;
             unsigned int fit = 0u;
-            unsigned int i;
-            for (i = 0u; i < launchable; i++) {
-                uint64_t mb = (i < g_hype_cfg.vm_count && g_hype_cfg.vms[i].mem_mb != 0u)
-                                  ? (uint64_t)g_hype_cfg.vms[i].mem_mb
-                                  : HYPE_FW_1_GUEST_RAM_MB;
-                uint64_t bytes = mb * 1024ull * 1024ull;
-                if (used + bytes > budget) break;
-                used += bytes;
-                fit = i + 1u;
+            uint64_t shortfall = 0ull;
+            hype_cfg_t *acfg = &g_hype_cfg;
+            uint64_t pool_bytes = g_guest_pool_ready ? g_guest_pool.size : 0ull;
+
+            if (pool_bytes == 0ull) {
+                hype_debug_print("adm: no reserved pool to check against -- guest RAM admission is "
+                                 "skipped this boot [#453]\n");
+                fit = launchable;
+            } else {
+                pr = hype_adm_check_pool(acfg, pool_bytes, g_vms[0].combined_size,
+                                         HYPE_FW_1_VDISK_BYTES, HYPE_RAM_POOL_ALIGN, &fit,
+                                         &shortfall);
+                if (pr.status != HYPE_ADM_OK) {
+                    hype_debug_print("adm: the %llu MiB reserved pool cannot hold vm%u's carves -- "
+                                     "short by %llu MiB; %u VM(s) fit [#453]\n",
+                                     (unsigned long long)(pool_bytes / (1024ull * 1024ull)),
+                                     pr.vm_index_a, (unsigned long long)(shortfall / (1024ull * 1024ull)),
+                                     fit);
+                }
             }
             if (fit < launchable) {
-                hype_debug_print("adm: guest RAM budget %llu MiB exceeded at vm%u -- %u VM(s) fit, "
-                                 "capping to %u [#396]\n",
-                                 (unsigned long long)(budget / (1024ull * 1024ull)), fit, fit, fit);
                 launchable = fit;
+            }
+        }
+        /*
+         * #531: the three checks AGENTS.md lists as HARD INVARIANTS -- cpu_set overlap,
+         * target_disk/varstore collision, and net_peers -- were implemented, unit-tested, and
+         * never called from the boot path. A config pinning two VMs to the same core, or pointing
+         * two VMs at the same target_disk, was accepted.
+         *
+         * These are refusals, not warnings: launching a VM that breaches one of them is a
+         * guest<->guest isolation failure, which section 6g/6j puts above availability. The
+         * colliding VM is excluded by capping `launchable` at it, so the earlier VM still runs and
+         * the operator gets a machine to fix the config from.
+         */
+        {
+            hype_adm_result_t ir;
+
+            ir = hype_adm_check_cpu_set(&g_hype_cfg, g_cpu_topo.count);
+            if (ir.status != HYPE_ADM_OK) {
+                hype_debug_print("adm: REFUSED -- cpu_set breach (code %d) between vm%u and vm%u: "
+                                 "two VMs may never share a core, and a core must exist on this "
+                                 "host [#531 section 6g]\n", (int)ir.status, ir.vm_index_a,
+                                 ir.vm_index_b);
+                /* Refuse the LATER of the pair: that resolves the overlap, and the earlier VM
+                 * is not made to pay for a collision it did not introduce. */
+                fw_1_refuse_vm(ir.vm_index_b != HYPE_ADM_NO_VM ? ir.vm_index_b : ir.vm_index_a);
+            }
+            ir = hype_adm_check_target_disk(&g_hype_cfg);
+            if (ir.status != HYPE_ADM_OK) {
+                hype_debug_print("adm: REFUSED -- target_disk/varstore collision between vm%u and "
+                                 "vm%u: two VMs may never write the same backing file [#531 "
+                                 "section 6i]\n", ir.vm_index_a, ir.vm_index_b);
+                fw_1_refuse_vm(ir.vm_index_b != HYPE_ADM_NO_VM ? ir.vm_index_b : ir.vm_index_a);
+            }
+            ir = hype_adm_check_net_peers(&g_hype_cfg);
+            if (ir.status != HYPE_ADM_OK) {
+                hype_debug_print("adm: REFUSED -- net_peers breach (code %d) at vm%u: guest-to-"
+                                 "guest networking is default-deny and a pairing must name a real "
+                                 "NAT peer [#531 section 6e]\n", (int)ir.status, ir.vm_index_a);
+                fw_1_refuse_vm(ir.vm_index_a);
+            }
+            /* Capacity, not an invariant: reported and capped like #396's core bound. */
+            ir = hype_adm_check_vcpus(&g_hype_cfg, g_cpu_topo.count);
+            if (ir.status != HYPE_ADM_OK) {
+                hype_debug_print("adm: configured vCPUs exceed this host's %u usable core(s) -- "
+                                 "1:1 pinning cannot satisfy every VM [#531]\n", g_cpu_topo.count);
+            }
+            /*
+             * #341: the last word, and it must not be silent. Phase 0 allocated per-VM state for
+             * g_max_vms, so a config asking for more cannot be served -- but trimming g_vm_count
+             * quietly before admission ran is how a VM vanishes without being named, which is the
+             * failure #396's whole report exists to prevent. Admission above has already capped by
+             * cores and by pool, so this normally changes nothing; when it does, it says so.
+             */
+            if (launchable > g_max_vms) {
+                hype_debug_print("adm: %u VM(s) would launch but Phase 0 allocated per-VM state "
+                                 "for %u -- capping to %u [#450 #341]\n", launchable, g_max_vms,
+                                 g_max_vms);
+                launchable = g_max_vms;
             }
         }
         for (unsigned int vi = launchable; vi < g_vm_count; vi++) {
@@ -22294,6 +22389,7 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
     g_vm_log = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log);
     g_vm_log_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_log_ready);
     g_vm_ready = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_ready);
+    g_vm_refused = fw_aux_alloc(bs, (UINTN)n * sizeof *g_vm_refused); /* #531 */
     /*
      * #393: the diagnostic and per-vCPU accounting arrays. These were the last statically-sized
      * per-VM state in the file -- 53 arrays behind HYPE_FW_MAX_VMS, which decision 33 forbids.
@@ -24540,6 +24636,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 unsigned vi;
                 int stop = 0;
                 for (vi = 0u; vi < g_vm_count && !stop; vi++) {
+                    if (g_vm_refused != 0 && g_vm_refused[vi]) continue; /* #531 */
                     /*
                      * Only the vCPUs the guest is TOLD about. A vCPU the guest cannot see
                      * never receives a SIPI, so starting a host core for it would park that
