@@ -43,6 +43,17 @@ MICRO_ISR(irq0_isr,
           "movb $0x20, %al\n\t"
           "outb %al, $0x20\n\t")
 
+static inline unsigned long long cpuid_ext7_edx(void) {
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x80000007u), "c"(0u));
+    (void)eax; (void)ebx; (void)ecx;
+    return (unsigned long long)edx;
+}
+
+#define EXT7_EDX_INVARIANT_TSC (1u << 8)
+
 static inline unsigned long long rdtsc(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
@@ -82,6 +93,29 @@ void micro_main(uint64_t zero_page_gpa) {
             spin_iters = got;
         }
     }
+
+    /*
+     * INVARIANT TSC FIRST, because the rate check below is only meaningful if it holds.
+     *
+     * An invariant TSC counts at a fixed reference rate regardless of core frequency, P-states,
+     * C-states or boost -- so a host that boosts from 3.4 to 4.4 GHz mid-spin changes nothing this
+     * guest can see through RDTSC, and the implied figure stays put. Without the bit, RDTSC could
+     * track the core clock and the number below would drift with boost for reasons that have nothing
+     * to do with hype's tick pacing.
+     *
+     * hype advertises this deliberately (cpuid_emulate.c, leaf 0x80000007 EDX bit 8): it passes the
+     * host TSC straight through, and the bit's absence makes a real Linux guest's clocksource
+     * watchdog see the emulated PIT drift against the raw TSC, mark the TSC unstable and fall back
+     * to a slow skewed clock -- "clock skew detected", observed on real hardware. So checking it
+     * here guards a real guest's timekeeping, not just this test's arithmetic.
+     */
+    if ((cpuid_ext7_edx() & EXT7_EDX_INVARIANT_TSC) == 0ull) {
+        micro_fail(NAME, "CPUID 0x80000007 EDX bit 8 (invariant TSC) is NOT advertised -- a real "
+                         "guest's clocksource watchdog would mark the TSC unstable and fall back to "
+                         "a skewed clock, and this test's rate figure would be meaningless");
+        micro_halt();
+    }
+    micro_puts("micro/" NAME ": invariant TSC advertised, so RDTSC is boost-independent\n");
 
     micro_cli();
     micro_gdt_load();
@@ -161,17 +195,25 @@ void micro_main(uint64_t zero_page_gpa) {
      * running slow because preemption is too coarse -- lands outside those bounds and fails, while a
      * correct rate on any plausible host passes.
      *
-     * Measured on AMD: 11.84e9 cycles for 348 ticks implies 3.40 GHz, which is that host. The two
-     * numbers the guest can see agree on how much time passed, which is what makes this an
-     * assertion rather than a note.
+     * Measured on AMD: 11.84e9 cycles for 348 ticks implies a 3.40 GHz TSC rate. The two numbers the
+     * guest can see agree on how much time passed, which is what makes this an assertion rather
+     * than a note.
+     *
+     * The bounds are wide on purpose. This is a 10x-error detector, not a precision measurement --
+     * so it is insensitive to anything that shifts the figure by a factor of two or less, which
+     * includes every plausible boost ratio even on a part whose TSC did track core frequency.
      */
     {
         unsigned long long ticks = after - before;
         unsigned long long implied_hz = ((t1 - t0) * 100ull) / ticks;
 
-        micro_puts("micro/" NAME ": implied TSC frequency ");
+        /* "TSC rate", not "CPU frequency": on an invariant-TSC part this is the fixed reference
+         * rate, which is typically the nominal/base frequency and is NOT whatever the core happens
+         * to be boosting to. Comparing it against a datasheet max-turbo figure would be a mistake,
+         * so the label says which number it is. */
+        micro_puts("micro/" NAME ": implied TSC rate ");
         micro_put_uint(implied_hz / 1000000ull);
-        micro_puts(" MHz (from the spin's cycles and the 100 Hz tick count)\n");
+        micro_puts(" MHz (invariant, so boost-independent; NOT the core clock)\n");
 
         if (implied_hz < 200000000ull || implied_hz > 20000000000ull) {
             micro_fail(NAME, "the tick rate during the spin implies an impossible TSC frequency -- "
