@@ -11902,6 +11902,16 @@ static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi) {
     return 0;
 }
 
+/* #559: how many vCPUs the whole configuration asks for -- reported when admission caps, so the
+ * operator sees the number that actually bound rather than a VM count. */
+static unsigned int fw_1_total_configured_vcpus(void) {
+    unsigned int i, n = 0u;
+    for (i = 0u; i < g_vm_count; i++) {
+        n += (i < g_hype_cfg.vm_count && g_hype_cfg.vms[i].vcpus) ? g_hype_cfg.vms[i].vcpus : 1u;
+    }
+    return n;
+}
+
 /* #531: mark one VM as refused, by index, and say so once. */
 static void fw_1_refuse_vm(unsigned vi) {
     if (g_vm_refused == 0 || vi >= g_max_vms || g_vm_refused[vi] != 0u) {
@@ -11979,14 +11989,47 @@ static void fw_1_phase1_config(void) {
     {
         unsigned int launchable = g_vm_count;
         if (g_cpu_topo.count != 0u) {
-            int nsel = hype_cpu_topology_select_isolated(&g_cpu_topo, g_vm_count, g_ap_sel,
-                                                         g_vm_count);
-            unsigned int by_cores = (nsel < 0) ? 0u : (unsigned int)nsel;
-            if (by_cores < launchable) {
-                HYPE_LOGF(HYPE_LOG_WARN, "adm: %u VM(s) configured but only %u isolated core(s) available "
-                                 "(%u usable CPU(s), BSP reserved) -- capping to %u [#396]\n",
-                                 g_vm_count, by_cores, g_cpu_topo.count, by_cores);
-                launchable = by_cores;
+            /*
+             * #559: a VM costs ONE CORE PER vCPU, not one core.
+             *
+             * This counted VMs against isolated cores while fw_1_place_vcpus_on_threads() asks for
+             * one whole core per vCPU (decision 40: thread = execution unit, core = allocation
+             * unit). The two disagreed, and the disagreement was silent: on a 4-core host, three
+             * VMs wanting 2+2+1 vCPUs were all admitted against 3 cores, placement ran out after
+             * the first two, and the LAST VM fell through to the legacy per-VM selector -- which
+             * handed it an APIC ID the placement had already given to another VM. Both VMs were
+             * started on the same core, one of them silently never ran, and nothing said so.
+             *
+             * Admission now spends the same currency placement does, so the cap it reports is the
+             * one that will actually hold.
+             */
+            unsigned int cores = hype_cpu_topology_core_count(&g_cpu_topo);
+            unsigned int avail = (cores > 1u) ? (cores - 1u) : 0u; /* the BSP's core is reserved */
+            unsigned int used = 0u, vi_c;
+
+            /*
+             * Read the count from the CONFIG, not from g_vms[].vcpu_count: fw_1_resolve_vcpus()
+             * runs AFTER this block, so the per-VM field still holds its provisional 1 here. The
+             * first version of this fix read that field and therefore never capped anything --
+             * caught by reproducing the hardware case under QEMU rather than by inspection.
+             */
+            for (vi_c = 0u; vi_c < g_vm_count; vi_c++) {
+                unsigned int want = (vi_c < g_hype_cfg.vm_count && g_hype_cfg.vms[vi_c].vcpus)
+                                        ? g_hype_cfg.vms[vi_c].vcpus
+                                        : 1u;
+                if (used + want > avail) {
+                    break;
+                }
+                used += want;
+            }
+            if (vi_c < launchable) {
+                HYPE_LOGF(HYPE_LOG_WARN,
+                          "adm: %u VM(s) configured wanting %u vCPU(s) in total, but this host has "
+                          "%u physical core(s) and reserves the BSP's -- %u core(s) for guests, so "
+                          "only the first %u VM(s) fit (each vCPU takes a WHOLE core, decision 40) "
+                          "[#396 #559]\n",
+                          g_vm_count, fw_1_total_configured_vcpus(), cores, avail, vi_c);
+                launchable = vi_c;
             }
         }
         {
@@ -23587,6 +23630,30 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                              * worked before still work; an AP with no thread simply does not
                              * start, and the count is corrected so nothing advertises it. */
                             sel = (cv == 0u) ? fw_1_ap_apic_id(vi) : -1;
+                            /*
+                             * #559: and it must not hand back a core another VM is already on.
+                             *
+                             * This fallback and fw_1_place_vcpus_on_threads() are two allocators
+                             * over the same cores, and nothing reconciled them. When placement ran
+                             * out of cores for a later VM, the fallback returned an APIC ID an
+                             * EARLIER VM had already been started on -- so hype sent INIT/SIPI to a
+                             * core that was already running someone else's guest. hype_ap_start()
+                             * returned 0, the smoke test looked healthy, and the VM never ran: it
+                             * had no core. Measured on the AMD laptop as vm1 and vm2 both starting
+                             * on apic_id=6, with vm1 taking zero VM exits for the whole run.
+                             *
+                             * Admission above now bounds by vCPUs so this should be unreachable.
+                             * It is checked anyway, because the failure it prevents is silent and
+                             * the check is one comparison against state that already exists.
+                             */
+                            if (sel >= 0 && fw_1_ap_slot_of((uint32_t)sel) >= 0) {
+                                HYPE_LOGF(HYPE_LOG_ERROR,
+                                          "fw-1 AP[vm%u vCPU %u]: apic_id=%d is ALREADY running "
+                                          "vm%d -- refusing to start two VMs on one core; vm%u "
+                                          "will not run [#559]\n",
+                                          vi, cv, sel, fw_1_ap_slot_of((uint32_t)sel), vi);
+                                sel = -1;
+                            }
                         }
                         if (sel < 0) {
                             if (cv == 0u) {
