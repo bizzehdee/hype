@@ -3985,57 +3985,12 @@ static uint8_t g_m4_4_dest_buffer[64] __attribute__((aligned(16)));
 static hype_acpi_rsdp_t g_m4_4_rsdp;
 static uint8_t g_m4_4_tables_blob[4096] __attribute__((aligned(64)));
 static hype_acpi_loader_entry_t g_m4_4_loader_script[HYPE_ACPI_LOADER_SCRIPT_ENTRIES];
-static hype_fw_cfg_t g_m4_4_fw_cfg;
-
 /*
- * Guest payload: writes the DMA access-struct's guest-physical address
- * to ports 0x514/0x518 (triggering the transfer on the second write,
- * per fw_cfg's own protocol), then polls the access struct's own
- * Control field (an ordinary guest-RAM load, not a port access) until
- * the device clears it to 0. The access struct's own CONTENT (control/
- * length/address, all big-endian) is written directly into guest
- * memory by the host before launch, matching how earlier test guests'
- * initial state (M3-5's zero page, M4-3's pflash backing) were always
- * host-populated rather than guest-computed -- only the two immediate
- * values ports 0x514/0x518 actually need (RBX's address and the two
- * pre-byte-swapped 32-bit halves) are patched into this template at
- * runtime, same convention as M4-3's payload.
- *
- *   mov rbx, <patched: access struct guest-physical address>
- *                                        48 BB 00 00 00 00 00 00 00 00
- *   mov dx, 0x514                        66 BA 14 05
- *   mov eax, <patched: byte-swapped upper 32 bits of that address>
- *                                        B8 00 00 00 00
- *   out dx, eax                          EF
- *   mov dx, 0x518                        66 BA 18 05
- *   mov eax, <patched: byte-swapped lower 32 bits of that address>
- *                                        B8 00 00 00 00
- *   out dx, eax                          EF
- * poll:
- *   mov eax, [rbx]                       8B 03
- *   test eax, eax                        85 C0
- *   jnz poll                             75 FA
- *   hlt                                  F4
- *   jmp $-3                              EB FD
+ * Big-endian writers and a 32-bit byteswap. They arrived with M4-4's fw_cfg DMA payload (whose
+ * access struct is big-endian on the wire) and outlived it: #543 ported that test out, and M4-5's
+ * AHCI command list needs the same conversions. Kept here rather than moved into core/ because two
+ * call sites in one file is not yet an abstraction worth a header.
  */
-static const uint8_t g_m4_4_payload_template[] = {
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x66, 0xBA, 0x14, 0x05,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0xEF,
-    0x66, 0xBA, 0x18, 0x05,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0xEF,
-    0x8B, 0x03,
-    0x85, 0xC0,
-    0x75, 0xFA,
-    0xF4,
-    0xEB, 0xFD
-};
-#define HYPE_M4_4_PAYLOAD_RBX_IMM_OFFSET 2
-#define HYPE_M4_4_PAYLOAD_DMA_HIGH_IMM_OFFSET 15
-#define HYPE_M4_4_PAYLOAD_DMA_LOW_IMM_OFFSET 25
-
 static void hype_write_be32(unsigned char *dst, uint32_t value) {
     dst[0] = (unsigned char)(value >> 24);
     dst[1] = (unsigned char)(value >> 16);
@@ -4055,170 +4010,28 @@ static uint32_t hype_byteswap32(uint32_t v) {
            ((v & 0xFF000000u) >> 24);
 }
 
-static void run_m4_4_fw_cfg_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    unsigned long long i;
-    uint64_t entry_rip, guest_cr3, rsp, access_struct_phys, dest_buffer_phys;
-    uint32_t access_high, access_low;
-    int rsdp_key;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-    hype_acpi_layout_t layout;
-    hype_acpi_config_t cfg;
-    uint32_t loader_entries;
-
-    /* VMX-2: ported to the vmm_* shims, but skipped on VMX pending the same
-     * guest<->hype memory-coherency fix as m5-1: the fw_cfg DMA writes the
-     * result into guest RAM correctly (host-verified), but the GUEST then reads
-     * that buffer as 0 -- hype's write isn't visible to the guest's later read.
-     * The control field in the same page IS seen (the guest's poll completes),
-     * so it's a narrow visibility/caching anomaly. Runs on SVM unchanged. */
-    (void)ops; /* VMX-2: runs under SVM and VMX now. */
-
-    hype_guest_ram_zero(g_m4_4_guest_code, sizeof(g_m4_4_guest_code));
-    hype_guest_ram_zero(g_m4_4_guest_stack, sizeof(g_m4_4_guest_stack));
-    hype_guest_ram_zero(g_m4_4_access_struct, sizeof(g_m4_4_access_struct));
-    hype_guest_ram_zero(g_m4_4_dest_buffer, sizeof(g_m4_4_dest_buffer));
-
-    for (i = 0; i < HYPE_ACPI_MAX_CPUS; i++) {
-        cfg.apic_ids[i] = (uint8_t)i;
-    }
-    cfg.cpu_count = 1;
-    cfg.local_apic_address = 0xFEE00000u;
-    cfg.io_apic_id = (uint8_t)HYPE_IOAPIC_DEFAULT_ID; /* #312: one definition, shared with the model */
-    cfg.io_apic_address = 0xFEC00000u;
-    cfg.io_apic_gsi_base = 0;
-    cfg.mcfg_base_address = 0xE0000000ULL;
-    cfg.pci_segment = 0;
-    cfg.pci_start_bus = 0;
-    cfg.pci_end_bus = 255;
-    cfg.sci_interrupt = 9;
-    /* #355: this microtest's guest is a fixed tiny image with no configurable RAM, so the
-     * historical 2 GiB line is still the right window base for it. Named rather than left to a
-     * default, so it is a stated choice and not an omission. */
-    cfg.pci_window_base = 0x80000000u;
-
-    if (hype_acpi_build_tables_blob(g_m4_4_tables_blob, sizeof(g_m4_4_tables_blob), &cfg, &layout) != 0) {
-        hype_fatal("m4-4: hype_acpi_build_tables_blob failed");
-    }
-    hype_acpi_build_rsdp(&g_m4_4_rsdp, layout.xsdt_offset);
-    loader_entries = hype_acpi_loader_build_script(g_m4_4_loader_script, &layout);
-
-    hype_fw_cfg_reset(&g_m4_4_fw_cfg);
-    rsdp_key = hype_fw_cfg_add_file(&g_m4_4_fw_cfg, HYPE_ACPI_LOADER_FILE_RSDP, (const uint8_t *)&g_m4_4_rsdp,
-                                     sizeof(g_m4_4_rsdp));
-    if (rsdp_key < 0) {
-        hype_fatal("m4-4: fw_cfg registry full while registering rsdp");
-    }
-    if (hype_fw_cfg_add_file(&g_m4_4_fw_cfg, HYPE_ACPI_LOADER_FILE_TABLES, g_m4_4_tables_blob,
-                              layout.total_length) < 0) {
-        hype_fatal("m4-4: fw_cfg registry full while registering tables");
-    }
-    if (hype_fw_cfg_add_file(&g_m4_4_fw_cfg, "etc/table-loader", (const uint8_t *)g_m4_4_loader_script,
-                              loader_entries * (uint32_t)sizeof(hype_acpi_loader_entry_t)) < 0) {
-        hype_fatal("m4-4: fw_cfg registry full while registering table-loader");
-    }
-
-    /* Host pre-populates the DMA access struct's content directly in
-     * guest memory (control/length/address, all big-endian) -- the
-     * guest payload itself only needs to trigger the transfer and poll
-     * for completion, not construct this struct. select_key in the
-     * upper 16 bits of control, matching fw_cfg's own DMA SELECT
-     * convention. */
-    access_struct_phys = (uint64_t)(uintptr_t)g_m4_4_access_struct;
-    dest_buffer_phys = (uint64_t)(uintptr_t)g_m4_4_dest_buffer;
-    {
-        uint32_t control = ((uint32_t)rsdp_key << 16) | HYPE_FW_CFG_DMA_CTL_SELECT | HYPE_FW_CFG_DMA_CTL_READ;
-        hype_write_be32(g_m4_4_access_struct + 0, control);
-        hype_write_be32(g_m4_4_access_struct + 4, (uint32_t)sizeof(g_m4_4_rsdp));
-        hype_write_be64(g_m4_4_access_struct + 8, dest_buffer_phys);
-    }
-
-    /* Ports 0x514/0x518 expect each 32-bit half byte-swapped on the
-     * wire (matching OVMF's own SwapBytes32(AccessHigh/Low) before
-     * IoWrite32 -- see devices/fw_cfg.h's own top comment) -- computed
-     * here, at host build time, since this is a fully host-controlled
-     * synthetic payload (same "known values baked in at build time"
-     * pattern M4-3's payload already uses). */
-    access_high = (uint32_t)(access_struct_phys >> 32);
-    access_low = (uint32_t)access_struct_phys;
-
-    for (i = 0; i < sizeof(g_m4_4_payload_template); i++) {
-        g_m4_4_guest_code[i] = g_m4_4_payload_template[i];
-    }
-    hype_write_le64(g_m4_4_guest_code + HYPE_M4_4_PAYLOAD_RBX_IMM_OFFSET, access_struct_phys);
-    hype_write_le32(g_m4_4_guest_code + HYPE_M4_4_PAYLOAD_DMA_HIGH_IMM_OFFSET,
-                     hype_byteswap32(access_high));
-    hype_write_le32(g_m4_4_guest_code + HYPE_M4_4_PAYLOAD_DMA_LOW_IMM_OFFSET, hype_byteswap32(access_low));
-
-    entry_rip = (uint64_t)(uintptr_t)g_m4_4_guest_code;
-    rsp = (uint64_t)(uintptr_t)(g_m4_4_guest_stack + sizeof(g_m4_4_guest_stack));
-
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    hype_debug_print("m4-4: entry_rip=0x%llx access_struct=0x%llx dest_buffer=0x%llx rsdp_key=0x%x\n",
-                       (unsigned long long)entry_rip, (unsigned long long)access_struct_phys,
-                       (unsigned long long)dest_buffer_phys, rsdp_key);
-
-    /* No NPT for this test -- everything here is ordinary port I/O
-     * plus plain guest-RAM reads/writes, no MMIO-trapped device
-     * involved (unlike M4-3's pflash test). */
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
-    if (ctx == 0) {
-        hype_fatal("m4-4: vcpu_create_long_mode failed");
-    }
-
-    for (;;) {
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("m4-4: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-        }
-
-        if (vmm_reason_is_ioio(kind, info.reason)) {
-            if (vmm_handle_fw_cfg_ioio(kind, ctx, &g_m4_4_fw_cfg, 0) != 0) {
-                hype_fatal("m4-4: unhandled guest port I/O (qual=0x%llx guest_rip=0x%llx)",
-                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
-            }
-            continue;
-        }
-
-        break;
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("m4-4: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-    }
-
-    for (i = 0; i < sizeof(g_m4_4_rsdp); i++) {
-        if (g_m4_4_dest_buffer[i] != ((const uint8_t *)&g_m4_4_rsdp)[i]) {
-            hype_fatal(
-                "m4-4: fw_cfg DMA read mismatch at byte %llu: guest received 0x%x, expected 0x%x",
-                i, g_m4_4_dest_buffer[i], ((const uint8_t *)&g_m4_4_rsdp)[i]);
-        }
-    }
-
-    hype_debug_print(
-        "m4-4: fw_cfg DMA test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- %llu-byte "
-        "etc/acpi/rsdp round trip verified byte-for-byte\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
-        (unsigned long long)sizeof(g_m4_4_rsdp));
-}
+/*
+ * #543: M4-4's fw_cfg globals, its 40-byte hand-assembled DMA payload and its private one-file
+ * registry are gone -- ported to tests/micro/fwcfg.c, booted as a configured VM (#535).
+ *
+ * The port reads hype's REAL registry, the one fw_1_setup_fw_cfg() publishes for an actual guest,
+ * and it reads a file BOTH ways -- classic PIO and DMA -- requiring the two to agree byte for byte.
+ * Neither is an oracle for the other, which is a check neither path alone can make. It picks
+ * etc/e820 deliberately: hype builds that from the VM's CONFIGURED RAM, so a device handing back a
+ * stale or shared buffer shows up as bytes that do not describe this VM.
+ *
+ * The in-binary version was skipped on VMX -- "the fw_cfg DMA writes the result into guest RAM
+ * correctly (host-verified), but the GUEST then reads that buffer as 0". Its buffers were static
+ * arrays inside hype's image; a configured VM's RAM is a carve mapped through EPT, which is a
+ * different question, and the ported test answers it on both backends.
+ */
 
 /*
- * M4-5: synthesizes a single-port AHCI HBA (devices/ahci.h) with one
- * ATAPI CD-ROM attached (devices/atapi.h), backed by an in-memory
- * "ISO" buffer (host-file reading needs M5's disk driver, the same
- * circular dependency M4-3's flash persistence and M4-4's ACPI table
- * blob already had -- build the primitive now, wire real media later).
- * A hand-written long-mode test guest drives the real AHCI/ATAPI
- * protocol: initializes the port's registers, issues a READ(10) ATAPI
- * PACKET command for one sector, polls for completion, halts -- the
- * host then confirms the transferred sector matches the backing
- * buffer byte-for-byte. This validates the AHCI+ATAPI device model
- * itself end-to-end under real QEMU/SVM; it does NOT yet validate a
- * real guest OS's own AHCI/ATAPI driver against it -- that's M4-6's
- * job, matching this project's established "build the primitive now,
- * defer the harder integration" pattern.
+ * M4-5: the AHCI/ATAPI device model, exercised by a hand-written long-mode test guest that drives
+ * the real protocol -- port register init, a READ(10) ATAPI PACKET command for one sector, a poll
+ * for completion, halt -- after which the host confirms the transferred sector matches the backing
+ * buffer byte for byte. It validates the device model end to end; it does NOT validate a real guest
+ * OS's own AHCI/ATAPI driver against it, which is M4-6's job.
  */
 #define HYPE_M4_5_AHCI_GPA (HYPE_M4_3_PFLASH_GPA + HYPE_PAGING_2MB)
 
@@ -19059,7 +18872,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     HYPE_ST_RUN(0, run_test_guest(arg));
     HYPE_ST_RUN(1, run_m3_5_linux_shim_test(args->ops, args->kind));
     HYPE_ST_RUN(2, run_m4_3_pflash_mmio_test(args->ops, args->kind));
-    HYPE_ST_RUN(3, run_m4_4_fw_cfg_test(args->ops, args->kind));
+    /* 3 was M4-4 fw_cfg, ported out in #543 -- see the note at its old definition. */
     HYPE_ST_RUN(4, run_m4_5_ahci_test(args->ops, args->kind));
     HYPE_ST_RUN(5, run_video_2_ramfb_test(args->ops, args->kind));
     /* 6 was CPUMSR, ported out in #539 -- see the note at its old definition. */
