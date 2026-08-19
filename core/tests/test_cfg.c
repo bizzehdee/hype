@@ -374,7 +374,11 @@ static void test_too_many_vms(void) {
         strncat(cfg, section, sizeof(cfg) - strlen(cfg) - 1);
     }
     res = parse_copy(cfg, &out);
-    CHECK_INT("too many VMs rejected", HYPE_CFG_ERR_TOO_MANY_VMS, res.status);
+    /* #450: one VM too many bounds the list instead of discarding the file -- see
+     * test_parse_into_refuses_past_bound_storage for the same property against caller storage. */
+    CHECK_INT("a config one VM past capacity still parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("exactly the capacity is kept", HYPE_CFG_MAX_VMS, (int)out.vm_count);
+    CHECK_INT("the extra VM is reported, not dropped silently", 1, (int)out.skipped_vms);
 }
 
 static void test_net_peers_multiple_unique(void) {
@@ -2101,8 +2105,16 @@ static void test_parse_into_refuses_past_bound_storage(void) {
         pos += (unsigned)snprintf(buf + pos, sizeof(buf) - pos, "[vm.v%u]\n%s", i, REQ);
     }
     res = hype_cfg_parse_into(buf, &out, storage, 3u);
-    CHECK_INT("too many VMs for the bound storage is an error",
-              (int)HYPE_CFG_ERR_TOO_MANY_VMS, (int)res.status);
+    /*
+     * #450: BOUNDED, not rejected. Returning an error here aborted the whole parse, so a config
+     * with one VM too many was discarded entirely and hype fell back to its built-in two --
+     * measured as 'parse error (status=7, line=148)' on a 20-VM config against 16 slots. The VMs
+     * that fit are kept and the rest are named through the skipped-VM channel.
+     */
+    CHECK_INT("a config past capacity still parses", (int)HYPE_CFG_OK, (int)res.status);
+    CHECK_INT("the VMs that fit are kept", 3, (int)out.vm_count);
+    CHECK_INT("the two that do not fit are reported", 2, (int)out.skipped_vms);
+    CHECK_STR("and the first of them is named", "v3", out.skipped_vm_name);
 }
 
 int main(void) {

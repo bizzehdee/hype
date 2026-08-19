@@ -815,10 +815,14 @@ static int add_section(hype_cfg_t *out, hype_cfg_section_kind_t kind, const char
     return (int)out->section_count - 1;
 }
 
+/* #450: *cur_over_cap is raised for a [vm.*] past capacity and cleared by any other section, so
+ * that VM's keys are ignored instead of read as keys outside a section. */
 static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int *cur,
                                                  const char *raw, int *cur_disk,
                                                  unsigned int *disk_seen, int *cur_is_hype,
-                                                 unsigned int *in_hype_seen) {
+                                                 unsigned int *in_hype_seen,
+                                                 unsigned int line_no, int *cur_over_cap) {
+    *cur_over_cap = 0;
     unsigned long long len = hype_strlen(line);
     char *body;
     char *name;
@@ -894,7 +898,29 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
         }
     }
     if (out->vm_count >= out->vm_cap) {
-        return HYPE_CFG_ERR_TOO_MANY_VMS; /* #393: the BOUND capacity, not a constant */
+        /*
+         * #450: BOUNDED, not rejected.
+         *
+         * This used to return HYPE_CFG_ERR_TOO_MANY_VMS, which aborts the whole parse -- so a
+         * config with one VM too many was discarded entirely and hype fell back to its built-in
+         * two, silently losing the fifteen VMs it had already read. Measured: a 20-VM config on
+         * a build whose post-EBS storage holds 16 produced 'parse error (status=7, line=148)'
+         * and then booted two default VMs.
+         *
+         * The VMs that fit are kept, and the ones past capacity are reported through the same
+         * skipped-VM channel a VM missing a required key uses -- the mechanism that exists
+         * precisely so a VM never vanishes without being named (#341).
+         */
+        if (out->skipped_vms == 0u) {
+            (void)hype_strlcpy(out->skipped_vm_name, name, HYPE_CFG_NAME_MAX);
+            out->skipped_vm_line = line_no;
+        }
+        out->skipped_vms++;
+        *cur = -1;      /* subsequent keys belong to a VM that does not exist */
+        *cur_disk = -1;
+        *cur_is_hype = 0;
+        *cur_over_cap = 1; /* ...and are IGNORED rather than reported outside-a-section */
+        return HYPE_CFG_OK;
     }
 
     *cur = (int)out->vm_count;
@@ -1028,6 +1054,7 @@ hype_cfg_result_t hype_cfg_parse_into(char *text, hype_cfg_t *out, hype_cfg_vm_t
     int cur = -1;
     int cur_disk = -1;
     int cur_is_hype = 0;
+    int cur_over_cap = 0;
     unsigned int line_no = 0;
     unsigned int unknown_before = 0;
     char *p = text;
@@ -1100,11 +1127,13 @@ hype_cfg_result_t hype_cfg_parse_into(char *text, hype_cfg_t *out, hype_cfg_vm_t
         in_vm_key = 0;
         if (line[0] == '[') {
             st = process_section_header(line, out, &cur, raw, &cur_disk, &disk_seen,
-                                        &cur_is_hype, &in_hype_seen);
+                                        &cur_is_hype, &in_hype_seen, line_no, &cur_over_cap);
         } else {
             in_vm_key = (cur >= 0);
-            st = process_key_value(line, out, cur, raw, raw_truncated, cur_disk,
-                                   &disk_seen, cur_is_hype, &in_hype_seen);
+            st = cur_over_cap
+                     ? HYPE_CFG_OK /* #450: a VM past capacity was reported; its keys are noise */
+                     : process_key_value(line, out, cur, raw, raw_truncated, cur_disk,
+                                         &disk_seen, cur_is_hype, &in_hype_seen);
         }
         if (out->unknown_count > unknown_before && out->unknown_first_line == 0u) {
             out->unknown_first_line = line_no;

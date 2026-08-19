@@ -2025,6 +2025,8 @@ static void fw_1_host_action_poll(void) {
 /* #447: hype's own boot volume, mounted for writing post-EBS -- defined with the other
  * device-scan plumbing, forward-declared for the config write-back sites above it. */
 static hype_fs_t *fw_1_boot_volume(void);
+/* #450: defined further down (needs the boot-volume locator and the cfg parser). */
+static void load_hype_cfg(void);
 
 /* TERM-6 (#444): needs g_hype_cfg, hence the forward declaration. `idx` is
  * the VM index term_run_cmdline already resolved from the command's arg. */
@@ -13311,6 +13313,145 @@ wait_for_sipi:
     g_ap_vcpu_live[vm_idx][vi] = 0u;
 }
 
+/*
+ * CONFIG (#450, plan.md section 10 decision 37): everything that needs the config, in Phase 1.
+ *
+ * Phase 0 now reserves and sizes from the machine alone -- the memory map (#449) and the core
+ * count (g_max_vms) -- so this is the first point that knows what the operator actually asked
+ * for. It runs after the storage stack is up, because that is what reads the config, and before
+ * media resolution, because that consumes it.
+ *
+ * Order matters and is the order the ticket asks the log to show: locator and mount, config read,
+ * parse result, admission result, then per-VM setup.
+ */
+static void fw_1_phase1_config(void) {
+    load_hype_cfg();
+
+    g_vm_count = g_hype_cfg.vm_count ? g_hype_cfg.vm_count : 2u;
+    if (g_vm_count > g_max_vms) {
+        g_vm_count = g_max_vms; /* #396 reports the refusal per VM further down */
+    }
+    if (g_hype_cfg.hype.dashboard_default_view == HYPE_CFG_VIEW_VM) {
+        unsigned int vi;
+        for (vi = 0u; vi < g_hype_cfg.vm_count; vi++) {
+            g_term_cfg_vm_names[vi] = g_hype_cfg.vms[vi].name;
+        }
+        g_term_default_view_target = hype_term_focus_find_name(
+            g_hype_cfg.hype.dashboard_default_vm, g_term_cfg_vm_names, g_hype_cfg.vm_count);
+        if (g_term_default_view_target < 0) {
+            hype_debug_print("cfg: dashboard_default_view names unknown vm '%s' -- using dashboard [#437]\n",
+                             g_hype_cfg.hype.dashboard_default_vm);
+        } else {
+            g_term_default_view_pending = 1;
+            hype_debug_print("cfg: dashboard_default_view waiting for vm%d ('%s') runtime [#437]\n",
+                             g_term_default_view_target, g_hype_cfg.hype.dashboard_default_vm);
+        }
+    }
+
+    /*
+     * #396: topology-bounded admission. The config count sized the arena; now
+     * bound the number that will actually LAUNCH by the two physical limits --
+     * one isolated core per VM (1:1 pinning, the BSP is reserved) and the guest
+     * RAM budget -- and REPORT every VM that will not run, by name, with the
+     * real numbers (never a silent drop, #341). The RAM setup loop and the AP
+     * launch below both use the bounded g_vm_count, so no un-launchable VM's
+     * guest RAM is allocated. Enumeration failure (count==0) keeps the whole
+     * configured count and the fw_1_ap_apic_id literal fallback.
+     */
+    {
+        unsigned int launchable = g_vm_count;
+        if (g_cpu_topo.count != 0u) {
+            int nsel = hype_cpu_topology_select_isolated(&g_cpu_topo, g_vm_count, g_ap_sel,
+                                                         g_vm_count);
+            unsigned int by_cores = (nsel < 0) ? 0u : (unsigned int)nsel;
+            if (by_cores < launchable) {
+                hype_debug_print("adm: %u VM(s) configured but only %u isolated core(s) available "
+                                 "(%u usable CPU(s), BSP reserved) -- capping to %u [#396]\n",
+                                 g_vm_count, by_cores, g_cpu_topo.count, by_cores);
+                launchable = by_cores;
+            }
+        }
+        {
+            /* RAM: cumulative configured guest RAM must fit the usable budget. */
+            uint64_t budget = g_usable_ram_bytes;
+            uint64_t used = 0;
+            unsigned int fit = 0u;
+            unsigned int i;
+            for (i = 0u; i < launchable; i++) {
+                uint64_t mb = (i < g_hype_cfg.vm_count && g_hype_cfg.vms[i].mem_mb != 0u)
+                                  ? (uint64_t)g_hype_cfg.vms[i].mem_mb
+                                  : HYPE_FW_1_GUEST_RAM_MB;
+                uint64_t bytes = mb * 1024ull * 1024ull;
+                if (used + bytes > budget) break;
+                used += bytes;
+                fit = i + 1u;
+            }
+            if (fit < launchable) {
+                hype_debug_print("adm: guest RAM budget %llu MiB exceeded at vm%u -- %u VM(s) fit, "
+                                 "capping to %u [#396]\n",
+                                 (unsigned long long)(budget / (1024ull * 1024ull)), fit, fit, fit);
+                launchable = fit;
+            }
+        }
+        for (unsigned int vi = launchable; vi < g_vm_count; vi++) {
+            const char *nm = (vi < g_hype_cfg.vm_count) ? g_hype_cfg.vms[vi].name : "(default)";
+            hype_debug_print("adm: vm%u '%s' WILL NOT RUN -- exceeds the physical core/RAM budget "
+                             "[#396]\n", vi, nm);
+        }
+        g_vm_count = launchable ? launchable : 1u; /* always keep at least vm0 */
+    }
+
+
+    /* Every VM's size, hint and vCPU count, from the config that has just been read. The vCPU
+     * pools were sized from the host in Phase 0, so a count resolved upward here still has a
+     * context to run in. */
+    {
+        unsigned vi;
+        for (vi = 0; vi < g_vm_count; vi++) {
+            fw_1_resolve_guest_ram(&g_vms[vi], &g_hype_cfg, vi);
+            fw_1_resolve_os_hint(&g_vms[vi], &g_hype_cfg, vi);
+            fw_1_resolve_vcpus(&g_vms[vi], &g_hype_cfg, vi);
+        }
+    }
+
+    /* vm0's own RAM carve, and then every secondary's firmware copy, RAM and vdisk. */
+    (void)fw_1_ensure_guest_ram(&g_vms[0], 0u);
+
+    for (unsigned vi = 1u; vi < g_vm_count; vi++) {
+        hype_fw_vm_t *vmn = &g_vms[vi];
+            hype_fw_vm_t *vm = &g_vms[0];
+        vmn->code_size = vm->code_size;
+        vmn->vars_size = vm->vars_size;
+        vmn->combined_size = vm->combined_size;
+        vmn->combined_host_phys = fw_1_pool_carve(0, vi,
+                                                  HYPE_POOL_KIND_FW, vmn->combined_size,
+                                                  "firmware");
+        hype_guest_ram_copy((void *)(uintptr_t)vmn->combined_host_phys,
+                            (const void *)(uintptr_t)vm->combined_host_phys, vmn->combined_size);
+        fw_1_resolve_guest_ram(vmn, &g_hype_cfg, vi);
+        fw_1_resolve_os_hint(vmn, &g_hype_cfg, vi);
+        vmn->ram_host_phys = fw_1_pool_carve(0, vi,
+                                             HYPE_POOL_KIND_RAM, vmn->ram_bytes, "guest RAM");
+        hype_guest_ram_zero((void *)(uintptr_t)vmn->ram_host_phys, vmn->ram_bytes);
+        vmn->fw_pristine_host_phys = fw_1_pool_carve(0, vi,
+                                                     HYPE_POOL_KIND_FW_PRISTINE,
+                                                     vmn->combined_size, "firmware snapshot");
+        hype_guest_ram_copy((void *)(uintptr_t)vmn->fw_pristine_host_phys,
+                            (const void *)(uintptr_t)vmn->combined_host_phys, vmn->combined_size);
+        vmn->host_tsc_hz = vm->host_tsc_hz;
+        vmn->disk[0].backing_phys = fw_1_pool_carve(0, vi,
+                                                    HYPE_POOL_KIND_VDISK,
+                                                    HYPE_FW_1_VDISK_BYTES, "vdisk backing");
+        hype_guest_ram_zero((void *)(uintptr_t)vmn->disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
+        hype_debug_print(
+            "fw-1 VM%u: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
+            vi, (unsigned long long)vmn->combined_host_phys, (unsigned long long)vmn->combined_size,
+            (unsigned long long)vmn->ram_host_phys,
+            (unsigned long long)(vmn->ram_bytes / (1024ULL * 1024ULL)),
+            (unsigned long long)vmn->host_tsc_hz);
+    }
+}
+
 static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
     uint64_t reset_cs_base, reset_rip, stack_top, npt_root_phys;
     hype_vcpu_ctx_t *ctx;
@@ -20207,37 +20348,51 @@ static void fw_1_script_feed(hype_fw_vm_t *vm, uint8_t byte) {
     hype_input_runner_feed(&vm->in_runner, byte);
 }
 
-static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
-    EFI_FILE_PROTOCOL *root = 0;
-    EFI_STATUS st;
+/*
+ * CONFIG (#450, plan.md section 10 decision 37): read and parse \hype.cfg POST-EBS, through
+ * hype's own storage stack.
+ *
+ * This used to go through UEFI's Simple File System, which only works when hype booted from a
+ * volume firmware can mount -- while hype already reads far harder things off the same disks with
+ * its own drivers: AHCI, NVMe and xHCI/USB-MSC underneath FAT32/exFAT/ext/NTFS, streaming
+ * multi-GB installer ISOs off its own boot stick. Whether hype booted from USB, SATA or NVMe must
+ * not be a distinction hype's own code makes.
+ *
+ * Failure policy is now mandatory rather than advisory, because this runs after the point of no
+ * return: every case falls back to built-in defaults and says WHICH of them happened. A boot
+ * volume that cannot be located at all is reported as the louder, different failure it is -- it
+ * means hype cannot read its own firmware images or write its own log either.
+ */
+static void load_hype_cfg(void) {
+    hype_fs_t *bv;
+    hype_fs_file_t f;
     UINT64 sz = 0;
     hype_cfg_result_t res;
 
     g_hype_cfg.vm_count = 0;
 
-    st = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
-    if (st != EFI_SUCCESS || root == 0) {
-        hype_debug_print("cfg: cannot open ESP root (0x%llx) -- using built-in defaults\n",
-                         (unsigned long long)st);
+    bv = fw_1_boot_volume();
+    if (bv == 0) {
+        hype_debug_print("cfg: NO BOOT VOLUME -- hype could not locate or mount the volume it "
+                         "booted from, so it cannot read its own config, firmware images or write "
+                         "its own log either. Using built-in defaults [#450]\n");
         return;
     }
-
-    st = hype_file_get_size(root, SystemTable->BootServices, (CHAR16 *)L"\\hype.cfg", &sz);
-    if (st != EFI_SUCCESS) {
-        hype_debug_print("cfg: no \\hype.cfg on ESP -- using built-in defaults\n");
+    if (hype_fs_lookup(bv, "\\hype.cfg", &f) != 0) {
+        hype_debug_print("cfg: no \\hype.cfg on the boot volume -- using built-in defaults (the "
+                         "volume mounted fine; this is the ABSENT case) [#450]\n");
         return;
     }
+    sz = f.size;
     if (sz == 0 || sz >= sizeof(g_hype_cfg_text)) {
-        hype_debug_print("cfg: \\hype.cfg size %llu unusable (1..%llu) -- ignoring config\n",
-                         (unsigned long long)sz,
+        hype_debug_print("cfg: \\hype.cfg size %llu unusable (1..%llu) -- using built-in defaults "
+                         "(EMPTY or OVERSIZED) [#450]\n", (unsigned long long)sz,
                          (unsigned long long)(sizeof(g_hype_cfg_text) - 1));
         return;
     }
-
-    st = hype_file_read_range(root, (CHAR16 *)L"\\hype.cfg", 0, g_hype_cfg_text, (UINTN)sz);
-    if (st != EFI_SUCCESS) {
-        hype_debug_print("cfg: read \\hype.cfg failed (0x%llx) -- ignoring config\n",
-                         (unsigned long long)st);
+    if (hype_fs_read_at(&f, 0ull, g_hype_cfg_text, (unsigned int)sz) != 0) {
+        hype_debug_print("cfg: \\hype.cfg found (%llu bytes) but UNREADABLE through hype's own "
+                         "stack -- using built-in defaults [#450]\n", (unsigned long long)sz);
         return;
     }
     g_hype_cfg_text[sz] = '\0';
@@ -20259,21 +20414,12 @@ static void load_hype_cfg(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         hype_cfg_vm_t *vms = g_hype_cfg.vms_default;
         unsigned int cap = HYPE_CFG_MAX_VMS;
         if (declared > cap) {
-            void *blk = 0;
-            UINTN want = (UINTN)declared * sizeof(hype_cfg_vm_t);
-            if (SystemTable->BootServices->AllocatePool(EfiLoaderData, want, &blk) ==
-                    EFI_SUCCESS && blk != 0) {
-                hype_guest_ram_zero(blk, (uint64_t)want);
-                vms = (hype_cfg_vm_t *)blk;
-                cap = declared;
-                hype_debug_print("cfg: %u [vm.*] section(s) declared -- VM storage sized to "
-                                 "match (%llu bytes) [#393]\n",
-                                 declared, (unsigned long long)want);
-            } else {
-                hype_debug_print("cfg: %u [vm.*] section(s) declared but the pool refused "
-                                 "%llu bytes -- parsing the first %u [#393]\n",
-                                 declared, (unsigned long long)want, cap);
-            }
+            /* #450: post-EBS there is no AllocatePool. The guest pool is for guest memory, not
+             * host structures, so a config declaring more VMs than the struct's own storage holds
+             * is bounded here and says so -- never silently truncated. */
+            hype_debug_print("cfg: %u [vm.*] section(s) declared but post-EBS storage holds %u -- "
+                             "the first %u are used and the rest are named below [#450 #393]\n",
+                             declared, cap, cap);
         }
         res = hype_cfg_parse_into(g_hype_cfg_text, &g_hype_cfg, vms, cap);
     }
@@ -21615,100 +21761,52 @@ static int bootvol_write(void *ctx, uint64_t lba, uint32_t count, const void *sr
 }
 
 /* Does the mounted candidate carry the same \hype.cfg this boot loaded? */
+/*
+ * #530: identify hype's boot volume by what makes it HYPE'S, not by a file hype may not have read.
+ *
+ * This used to match the candidate's \hype.cfg against a fingerprint taken during the pre-EBS
+ * config read, and gave up outright when there was no config:
+ *
+ *     if (g_hype_cfg_raw_len == 0) return -1;  // "nothing to match"
+ *
+ * Two problems. It made the locator depend on the config read, which #450 moves to Phase 1 --
+ * where it needs the locator. And it meant a hype booted with NO hype.cfg had no boot volume on
+ * any build, so config write-back and every other user of it silently did nothing in exactly the
+ * case an operator is most likely to be in: a fresh stick with no config yet.
+ *
+ * The structural check is available always and says the same thing: hype's boot volume is the
+ * writable one carrying hype's own loader and its guest firmware images. A volume with those is
+ * the one hype wants; a volume without them cannot serve it. The config fingerprint stays as a
+ * CONFIRMATION when a config has been read, never as a precondition.
+ */
 static int fw_1_boot_vol_verify(hype_fs_t *fs) {
     static uint8_t buf[sizeof(g_hype_cfg_text)];
     hype_fs_file_t f;
-    if (g_hype_cfg_raw_len == 0) {
-        return -1; /* booted on defaults: nothing to match, so nothing can be verified */
-    }
-    if (fs->ops->lookup(fs, "\\hype.cfg", &f) != 0 && fs->ops->lookup(fs, "hype.cfg", &f) != 0) {
+    int have_loader, have_code, have_vars;
+
+    have_loader = (fs->ops->lookup(fs, "\\EFI\\BOOT\\BOOTX64.EFI", &f) == 0);
+    have_code = (fs->ops->lookup(fs, "\\EFI\\hype\\OVMF_CODE.fd", &f) == 0);
+    have_vars = (fs->ops->lookup(fs, "\\EFI\\hype\\OVMF_VARS.fd", &f) == 0);
+    if (!have_loader || !have_code || !have_vars) {
         return -1;
     }
-    if (f.size != g_hype_cfg_raw_len || f.size > sizeof(buf)) {
-        return -1;
+    /* Confirmation only. A config that has been read and does NOT match is worth saying out loud;
+     * it means this volume looks like hype's but is not the one hype booted from. */
+    if (g_hype_cfg_raw_len != 0 &&
+        (fs->ops->lookup(fs, "\\hype.cfg", &f) == 0 ||
+         fs->ops->lookup(fs, "hype.cfg", &f) == 0)) {
+        if (f.size == g_hype_cfg_raw_len && f.size <= sizeof(buf) &&
+            fs->ops->read_at(&f, 0, buf, (unsigned)f.size) == 0 &&
+            fw_1_fnv1a(buf, f.size) != g_hype_cfg_raw_sum) {
+            hype_debug_print("boot-vol: candidate carries hype's loader and firmware but its "
+                             "\\hype.cfg does not match the one hype parsed -- taking it anyway, "
+                             "flagging the mismatch [#530]\n");
+        }
     }
-    if (fs->ops->read_at(&f, 0, buf, (unsigned)f.size) != 0) {
-        return -1;
-    }
-    return (fw_1_fnv1a(buf, f.size) == g_hype_cfg_raw_sum) ? 0 : -1;
+    return 0;
 }
 
 /* Locate (once) and return the verified writable boot volume, or 0. */
-/*
- * CONFIG (#450, plan.md section 10 decision 37): read and parse \hype.cfg through hype's OWN
- * storage stack, post-ExitBootServices.
- *
- * The old path went through UEFI's Simple File System, which only works when hype booted from a
- * volume firmware can mount -- and hype already reads far harder things off the same disks with
- * its own drivers: AHCI, NVMe and xHCI/USB-MSC underneath FAT32/exFAT/ext/NTFS, streaming
- * multi-GB ISOs off its own boot stick. Whether hype booted from USB, SATA or NVMe must not be a
- * distinction hype's own code makes.
- *
- * Failure policy is mandatory here, not advisory: this runs after the point of no return, so
- * every case falls back to built-in defaults and says WHICH case it was. A boot volume that
- * cannot be located at all is reported as the louder, different failure it is -- it means hype
- * cannot read its own firmware images or write its own log either.
- */
-static void fw_1_load_hype_cfg_post_ebs(void) {
-    hype_fs_t *bv;
-    hype_fs_file_t f;
-    hype_cfg_result_t res;
-    unsigned int declared;
-    unsigned long long sz;
-
-    bv = fw_1_boot_volume();
-    if (bv == 0) {
-        /* Item 5: distinct from "no config file", and louder. */
-        hype_debug_print("cfg: NO BOOT VOLUME -- hype could not locate or mount the volume it "
-                         "booted from, so it cannot read its own config, firmware images or write "
-                         "its own log. Using built-in defaults for %u VM(s) [#450]\n", g_vm_count);
-        return;
-    }
-    if (hype_fs_lookup(bv, "\\hype.cfg", &f) != 0) {
-        hype_debug_print("cfg: no \\hype.cfg on the boot volume -- using built-in defaults "
-                         "(volume mounted fine; this is the ABSENT case) [#450]\n");
-        return;
-    }
-    sz = (unsigned long long)f.size;
-    if (sz == 0ull) {
-        hype_debug_print("cfg: \\hype.cfg is EMPTY (0 bytes) -- using built-in defaults [#450]\n");
-        return;
-    }
-    if (sz > (unsigned long long)(sizeof(g_hype_cfg_text) - 1u)) {
-        hype_debug_print("cfg: \\hype.cfg is OVERSIZED (%llu bytes, limit %llu) -- using built-in "
-                         "defaults [#450]\n", sz, (unsigned long long)(sizeof(g_hype_cfg_text) - 1u));
-        return;
-    }
-    if (hype_fs_read_at(&f, 0ull, g_hype_cfg_text, (unsigned int)sz) != 0) {
-        hype_debug_print("cfg: \\hype.cfg found (%llu bytes) but UNREADABLE through hype's own "
-                         "stack -- using built-in defaults [#450]\n", sz);
-        return;
-    }
-    g_hype_cfg_text[sz] = '\0';
-    /* #447: fingerprint BEFORE the parse -- it tokenizes this buffer destructively. */
-    g_hype_cfg_raw_len = (UINTN)sz;
-    g_hype_cfg_raw_sum = fw_1_fnv1a(g_hype_cfg_text, (UINTN)sz);
-
-    /* #393: size VM storage from what the file declares. Post-EBS there is no AllocatePool, so a
-     * config declaring more VMs than the struct's own default holds is bounded by that default
-     * and says so -- the pool carve path is for guest memory, not for host structures. */
-    declared = hype_cfg_count_vms(g_hype_cfg_text);
-    if (declared > HYPE_CFG_MAX_VMS) {
-        hype_debug_print("cfg: %u [vm.*] section(s) declared but post-EBS storage holds %u -- "
-                         "parsing the first %u [#450 #393]\n", declared, (unsigned)HYPE_CFG_MAX_VMS,
-                         (unsigned)HYPE_CFG_MAX_VMS);
-    }
-    res = hype_cfg_parse(g_hype_cfg_text, &g_hype_cfg);
-    if (res.status != HYPE_CFG_OK) {
-        hype_debug_print("cfg: \\hype.cfg UNPARSEABLE (status=%d, line=%u) -- using built-in "
-                         "defaults [#450]\n", (int)res.status, res.line);
-        g_hype_cfg.vm_count = 0;
-        return;
-    }
-    hype_debug_print("cfg: loaded \\hype.cfg (%llu bytes) through hype's own stack -- %u VM(s) "
-                     "[#450]\n", sz, g_hype_cfg.vm_count);
-}
-
 static hype_fs_t *fw_1_boot_volume(void) {
     unsigned didx;
     if (g_boot_vol_state == 1) {
@@ -22447,11 +22545,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * survived in RAM. */
     fw_1_dump_prev_log(ImageHandle, SystemTable->BootServices, map, map_size, desc_size);
 
-    /* CONFIG-4 (#225): load + parse \hype.cfg off the ESP now, while Boot
-     * Services file I/O is still up (pre-EBS), into g_hype_cfg. Advisory:
-     * absent/malformed -> empty config + built-in fallback, never a boot stop.
-     * #125/#126 consume the parsed physical target + partition qualifiers. */
-    load_hype_cfg(ImageHandle, SystemTable);
+    /* #450: the config is read POST-EBS now, through hype's own storage stack -- see
+     * fw_1_phase1_config(). Phase 0 no longer reads it at all. */
 
     /* #411: the VM count is now a runtime value from the parsed config, and the
      * #394 arena is sized to it. Still bounded to what the (not-yet-generalised)
@@ -22480,26 +22575,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_debug_print("fw-1: Phase 0 sizes per-VM state for %u VM(s) -- %u usable core(s), BSP "
                          "reserved (decision 33) [#450]\n", g_max_vms, usable);
     }
-    g_vm_count = g_hype_cfg.vm_count ? g_hype_cfg.vm_count : 2u;
-    if (g_vm_count > g_max_vms) {
-        g_vm_count = g_max_vms; /* #396 reports the refusal per VM further down */
-    }
-    if (g_hype_cfg.hype.dashboard_default_view == HYPE_CFG_VIEW_VM) {
-        unsigned int vi;
-        for (vi = 0u; vi < g_hype_cfg.vm_count; vi++) {
-            g_term_cfg_vm_names[vi] = g_hype_cfg.vms[vi].name;
-        }
-        g_term_default_view_target = hype_term_focus_find_name(
-            g_hype_cfg.hype.dashboard_default_vm, g_term_cfg_vm_names, g_hype_cfg.vm_count);
-        if (g_term_default_view_target < 0) {
-            hype_debug_print("cfg: dashboard_default_view names unknown vm '%s' -- using dashboard [#437]\n",
-                             g_hype_cfg.hype.dashboard_default_vm);
-        } else {
-            g_term_default_view_pending = 1;
-            hype_debug_print("cfg: dashboard_default_view waiting for vm%d ('%s') runtime [#437]\n",
-                             g_term_default_view_target, g_hype_cfg.hype.dashboard_default_vm);
-        }
-    }
+    /* #450: the VM count and the dashboard's default view come from the config, which is now
+     * read post-EBS -- see fw_1_phase1_config(). */
     {
         UINTN vm_bytes = (UINTN)g_max_vms * sizeof(hype_fw_vm_t);
         UINTN vm_pages = (vm_bytes + 4095u) / 4096u;
@@ -22546,7 +22623,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          */
         unsigned vi;
         unsigned total_vcpus = (g_cpu_topo.count > 8u) ? g_cpu_topo.count : 8u;
-        for (vi = 0; vi < g_vm_count; vi++) {
+        /* #450: every slot Phase 0 allocated for, not just the ones the built-in default will
+         * use -- fw_1_vcpu_slot() indexes by VM, so a slot with a zero vcpu_count is a slot the
+         * AP-start path cannot reason about. Phase 1 re-resolves these from the real config. */
+        for (vi = 0; vi < g_max_vms; vi++) {
             fw_1_resolve_vcpus(&g_vms[vi], &g_hype_cfg, vi);
         }
         hype_debug_print("fw-1: vCPU pools sized for %u vCPU(s) -- the host's bound across up to "
@@ -22563,12 +22643,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * #413: one AP stack per host core that runs a guest.
      *
      * SMP-6 (#190): keyed by fw_1_vcpu_slot(), i.e. one per guest vCPU rather than one per VM
-     * -- two cores sharing a stack is immediate memory corruption, not a slow path. Sized to
-     * the maximum because vcpu_count is not resolved until the pool sizing below; a handful of
-     * unused 16 KiB stacks is the right trade against getting the ordering wrong.
+     * -- two cores sharing a stack is immediate memory corruption, not a slow path.
+     *
+     * #450: sized from g_max_vms, the HOST's bound, not from g_vm_count. The config is read in
+     * Phase 1 now, so g_vm_count is still the built-in default here -- sizing from it gave the
+     * first seven-VM run five APs with no stack at all, and the seventh jumped through a garbage
+     * entry pointer: `vector=14 rip=0x1000000039 cr2=0x1000000039` on apic=7. A handful of
+     * unused 16 KiB stacks is the right trade; an AP without one is not a slow path either.
      */
     g_ap_stacks = (uint8_t (*)[HYPE_AP_STACK_BYTES])(uintptr_t)fw_alloc_zeroed_pages(
-        g_vm_count * HYPE_MAX_VCPUS_PER_VM * (HYPE_AP_STACK_BYTES / 4096u));
+        g_max_vms * HYPE_MAX_VCPUS_PER_VM * (HYPE_AP_STACK_BYTES / 4096u));
     vm = &g_vms[0];
     /*
      * INPUT-8 (#281): load each VM's expect script here, PRE-EBS, because this is the
@@ -22576,8 +22660,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * unconditionally even when only one runs -- an absent file is the normal case
      * and costs one log line.
      */
+    /* #450: for every VM Phase 0 allocated for. The config is read in Phase 1, so keying this to
+     * g_vm_count would load scripts for the built-in two and silently skip every VM a real config
+     * declares -- and this is the last point the UEFI Simple File System is usable. */
     load_input_script(ImageHandle, SystemTable, &g_vms[0], 0u);
-    for (unsigned vi = 1u; vi < g_vm_count; vi++) { /* #414 */
+    for (unsigned vi = 1u; vi < g_max_vms; vi++) { /* #414 */
         load_input_script(ImageHandle, SystemTable, &g_vms[vi], vi);
     }
 
@@ -22591,59 +22678,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * reservation. Phase 0 sizes per-VM state from the host's core count, so it must know the
      * topology before it can allocate anything, and it must not need the config to do it. */
 
-    /*
-     * #396: topology-bounded admission. The config count sized the arena; now
-     * bound the number that will actually LAUNCH by the two physical limits --
-     * one isolated core per VM (1:1 pinning, the BSP is reserved) and the guest
-     * RAM budget -- and REPORT every VM that will not run, by name, with the
-     * real numbers (never a silent drop, #341). The RAM setup loop and the AP
-     * launch below both use the bounded g_vm_count, so no un-launchable VM's
-     * guest RAM is allocated. Enumeration failure (count==0) keeps the whole
-     * configured count and the fw_1_ap_apic_id literal fallback.
-     */
-    {
-        unsigned int launchable = g_vm_count;
-        if (g_cpu_topo.count != 0u) {
-            int nsel = hype_cpu_topology_select_isolated(&g_cpu_topo, g_vm_count, g_ap_sel,
-                                                         g_vm_count);
-            unsigned int by_cores = (nsel < 0) ? 0u : (unsigned int)nsel;
-            if (by_cores < launchable) {
-                hype_debug_print("adm: %u VM(s) configured but only %u isolated core(s) available "
-                                 "(%u usable CPU(s), BSP reserved) -- capping to %u [#396]\n",
-                                 g_vm_count, by_cores, g_cpu_topo.count, by_cores);
-                launchable = by_cores;
-            }
-        }
-        {
-            /* RAM: cumulative configured guest RAM must fit the usable budget. */
-            uint64_t budget = usable_ram_bytes;
-            uint64_t used = 0;
-            unsigned int fit = 0u;
-            unsigned int i;
-            for (i = 0u; i < launchable; i++) {
-                uint64_t mb = (i < g_hype_cfg.vm_count && g_hype_cfg.vms[i].mem_mb != 0u)
-                                  ? (uint64_t)g_hype_cfg.vms[i].mem_mb
-                                  : HYPE_FW_1_GUEST_RAM_MB;
-                uint64_t bytes = mb * 1024ull * 1024ull;
-                if (used + bytes > budget) break;
-                used += bytes;
-                fit = i + 1u;
-            }
-            if (fit < launchable) {
-                hype_debug_print("adm: guest RAM budget %llu MiB exceeded at vm%u -- %u VM(s) fit, "
-                                 "capping to %u [#396]\n",
-                                 (unsigned long long)(budget / (1024ull * 1024ull)), fit, fit, fit);
-                launchable = fit;
-            }
-        }
-        for (unsigned int vi = launchable; vi < g_vm_count; vi++) {
-            const char *nm = (vi < g_hype_cfg.vm_count) ? g_hype_cfg.vms[vi].name : "(default)";
-            hype_debug_print("adm: vm%u '%s' WILL NOT RUN -- exceeds the physical core/RAM budget "
-                             "[#396]\n", vi, nm);
-        }
-        g_vm_count = launchable ? launchable : 1u; /* always keep at least vm0 */
-    }
-
+    /* #450: topology-bounded admission runs with the config, post-EBS -- fw_1_phase1_config(). */
     status = hype_gop_locate(SystemTable->BootServices, &gop);
     have_gop = (status == EFI_SUCCESS);
     g_term_gop = have_gop ? gop : 0; /* TERM-7 (#443): so the `resolution` command can reach it */
@@ -23017,11 +23052,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * deliberately -- the config is parsed pre-EBS well above, and this is the
          * first point that consumes it, so a configured mem_mb now decides the
          * allocation instead of being overwritten after the fact. */
-        fw_1_resolve_guest_ram(vm, &g_hype_cfg, 0u);
-        fw_1_resolve_os_hint(vm, &g_hype_cfg, 0u);
-        g_fw_1_ram_host_phys = fw_1_pool_carve(SystemTable->BootServices, 0u,
-                                               HYPE_POOL_KIND_RAM, vm->ram_bytes, "guest RAM");
-        hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_ram_host_phys, vm->ram_bytes);
+        /* #450: this VM's RAM size comes from the config, which is read post-EBS; the carve
+         * itself now happens in fw_1_ensure_guest_ram() when the VM starts. */
 
         /* M8-0b: grab a <1MB page now (Boot Services only) to stage the AP
          * startup trampoline in; the post-EBS smoketest below uses it. */
@@ -23164,38 +23196,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * mem_mb (#290) and os_hint. Media is resolved POST-EBS per VM by
          * fw_1_resolve_media_stream(vi) (\iso\vmN.iso etc.). run_fw_1_test builds
          * each VM's own NPT/devices/VMCB/ACPI from these fields. */
-        for (unsigned vi = 1u; vi < g_vm_count; vi++) {
-            hype_fw_vm_t *vmn = &g_vms[vi];
-            vmn->code_size = vm->code_size;
-            vmn->vars_size = vm->vars_size;
-            vmn->combined_size = vm->combined_size;
-            vmn->combined_host_phys = fw_1_pool_carve(SystemTable->BootServices, vi,
-                                                      HYPE_POOL_KIND_FW, vmn->combined_size,
-                                                      "firmware");
-            hype_guest_ram_copy((void *)(uintptr_t)vmn->combined_host_phys,
-                                (const void *)(uintptr_t)vm->combined_host_phys, vmn->combined_size);
-            fw_1_resolve_guest_ram(vmn, &g_hype_cfg, vi);
-            fw_1_resolve_os_hint(vmn, &g_hype_cfg, vi);
-            vmn->ram_host_phys = fw_1_pool_carve(SystemTable->BootServices, vi,
-                                                 HYPE_POOL_KIND_RAM, vmn->ram_bytes, "guest RAM");
-            hype_guest_ram_zero((void *)(uintptr_t)vmn->ram_host_phys, vmn->ram_bytes);
-            vmn->fw_pristine_host_phys = fw_1_pool_carve(SystemTable->BootServices, vi,
-                                                         HYPE_POOL_KIND_FW_PRISTINE,
-                                                         vmn->combined_size, "firmware snapshot");
-            hype_guest_ram_copy((void *)(uintptr_t)vmn->fw_pristine_host_phys,
-                                (const void *)(uintptr_t)vmn->combined_host_phys, vmn->combined_size);
-            vmn->host_tsc_hz = vm->host_tsc_hz;
-            vmn->disk[0].backing_phys = fw_1_pool_carve(SystemTable->BootServices, vi,
-                                                        HYPE_POOL_KIND_VDISK,
-                                                        HYPE_FW_1_VDISK_BYTES, "vdisk backing");
-            hype_guest_ram_zero((void *)(uintptr_t)vmn->disk[0].backing_phys, HYPE_FW_1_VDISK_BYTES);
-            hype_debug_print(
-                "fw-1 VM%u: firmware@0x%llx (%llu B) ram@0x%llx (%llu MiB) tsc=%llu Hz -- STEP 2b\n",
-                vi, (unsigned long long)vmn->combined_host_phys, (unsigned long long)vmn->combined_size,
-                (unsigned long long)vmn->ram_host_phys,
-                (unsigned long long)(vmn->ram_bytes / (1024ULL * 1024ULL)),
-                (unsigned long long)vmn->host_tsc_hz);
-        }
+        /* #450: every secondary VM's firmware copy, RAM and vdisk are set up post-EBS, from
+         * the config read there -- fw_1_phase1_config(). */
 #endif
 
         /* RT-2a: capture ops/kind for the post-EBS guest run below. The
@@ -24489,6 +24491,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         }
     }
 
+    fw_1_phase1_config();
+
     /*
      * #326: resolve each VM's media, AFTER every host-discovery pass (NVMe, USB, then AHCI) has
      * registered its devices.
@@ -24721,29 +24725,30 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 }
             }
             /*
-             * #461: retire the trampoline page by filling it with INT3.
+             * #461: the trampoline page is deliberately NOT retired.
              *
-             * An intermittent host fault was reported as `vector=13 (General Protection Fault)
-             * rip=0x9f01f cs=0x8` -- inside this page. That rip is unreadable as it stands: the
-             * page still holds the 16-bit startup blob, so a 64-bit core that branches in decodes
-             * leftover real-mode bytes into whatever fault they happen to make, and `cs=0x8` is
-             * ambiguous besides (it is both hype's host code selector AND the trampoline's own
-             * 32-bit one). Neither the vector nor the selector identifies the mistake.
+             * Filling it with INT3 was tried, to make a stray branch report an unambiguous
+             * vector 3 instead of whatever the leftover 16-bit blob happens to decode to. It has
+             * been removed because it caused the fault it was meant to explain.
              *
-             * Filled with 0xCC, any stray branch here instead reports vector 3 (Breakpoint) with
-             * an rip in this page -- which can only mean one thing, and says so on the first
-             * occurrence rather than after a hunt.
+             * Two things make the page live long after the start loop:
              *
-             * Safe to clobber: hype_ap_start() re-copies the whole blob and re-zeroes its alive
-             * flag on every call, so a later VM restart that starts an AP again is unaffected.
+             *  - the trampoline signals `tramp_alive` and then still reads `tramp_entry` and
+             *    `tramp_arg` from the page before its `callq`, so a fill in that window feeds an
+             *    AP 0xCC or corrupts the pointer it is about to call through;
+             *  - APs are started LATER too, one per guest vCPU (SMP-6), so the page is re-entered
+             *    long after this point -- hype_ap_start() re-copies the blob for exactly that
+             *    reason.
+             *
+             * Measured on an 8-VM run: `vector=3 rip=0x9f001` on apic=6, twice, once even with a
+             * bounded wait for the last AP's C entry in place. A diagnostic that panics a core
+             * that was doing nothing wrong is worse than the ambiguity it removes -- the same
+             * lesson #370 records about diagnostics that kill what they measure.
+             *
+             * What stays from #461 is the part that carries the diagnosis: the fault message
+             * names the executing APIC id and carries rsp/ss/rbp, and the dashboard shows a
+             * core-panic banner. An rip inside this page still means something branched here.
              */
-            if (g_ap_tramp_page != 0) {
-                volatile uint8_t *tp = (volatile uint8_t *)(uintptr_t)g_ap_tramp_page;
-                unsigned int bi;
-                for (bi = 0; bi < 4096u; bi++) {
-                    tp[bi] = 0xCCu;
-                }
-            }
         }
     }
 #endif
