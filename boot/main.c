@@ -1058,7 +1058,19 @@ static uint8_t *g_snap_hit;
 /* #393: the pre-config default is an explicit 2, NOT HYPE_FW_MAX_VMS -- that constant is now
  * the DIAGNOSTIC-array bound (16, lockstep with HYPE_CFG_MAX_VMS) and would make any code
  * running before the config resolves at efi_main believe sixteen VMs exist. */
-static unsigned g_vm_count = 2u;
+/*
+ * #532: there is NO built-in VM set. With no hype.cfg, hype runs zero VMs -- it boots to a
+ * dashboard and a terminal, says it found no config, and waits to be told what to run (`create`,
+ * #486).
+ *
+ * The built-in two existed from before the config path was trustworthy, and it cost more than it
+ * gave: it split the boot path in two, because hype ran VMs no [vm.*] section described, so the
+ * config index and the runtime index disagreed -- which is where #486's guard, #453's
+ * cap-to-one-VM regression and #450's double-reasoned Phase 0 sizing all came from. It also meant
+ * every rig that did not pass a config, and every hardware-stick run, tested the defaults instead
+ * of the parser, admission, media resolution and write-back.
+ */
+static unsigned g_vm_count;
 /* #450: what Phase 0 ALLOCATED for -- the host's physical bound, not the config's ask. */
 static unsigned g_max_vms = 2u;
 /*
@@ -13397,7 +13409,16 @@ static void fw_1_phase1_config(void) {
     load_hype_cfg();
     fw_1_phase1_firmware();
 
-    g_vm_count = g_hype_cfg.vm_count ? g_hype_cfg.vm_count : 2u;
+    g_vm_count = g_hype_cfg.vm_count;
+    if (g_vm_count == 0u) {
+        /* Loud, and with the one thing to do about it. A hypervisor with no machines is not a
+         * failure -- it is one waiting to be told what to run. */
+        hype_debug_print("fw-1: NO VMs -- hype found no usable \\hype.cfg, and there is no built-in "
+                         "default set any more (#532). The dashboard and terminal are up: type "
+                         "'create' to define a VM, which is written back to hype.cfg and started "
+                         "without a reboot [#486]\n");
+        hype_serial_print("fw-1: no VMs configured -- type 'create' at the terminal [#532]\n");
+    }
     if (g_hype_cfg.hype.dashboard_default_view == HYPE_CFG_VIEW_VM) {
         unsigned int vi;
         /* #450: bounded by the array, not by the config -- a config can declare more VMs than
@@ -13545,7 +13566,13 @@ static void fw_1_phase1_config(void) {
             hype_debug_print("adm: vm%u '%s' WILL NOT RUN -- exceeds the physical core/RAM budget "
                              "[#396]\n", vi, nm);
         }
-        g_vm_count = launchable ? launchable : 1u; /* always keep at least vm0 */
+        /*
+         * #532: no floor. "Always keep at least vm0" made sense while hype had a built-in VM set --
+         * there was always a machine to fall back to. With the set gone, zero VMs is a legitimate
+         * outcome, and forcing one meant a host with no config still launched a guest nobody had
+         * asked for: measured as VMSTAT vm0 and a full OVMF boot on a run shipping no hype.cfg.
+         */
+        g_vm_count = launchable;
     }
 
 
@@ -20513,12 +20540,12 @@ static void load_hype_cfg(void) {
     if (bv == 0) {
         hype_debug_print("cfg: NO BOOT VOLUME -- hype could not locate or mount the volume it "
                          "booted from, so it cannot read its own config, firmware images or write "
-                         "its own log either. Using built-in defaults [#450]\n");
+                         "its own log either. No VMs will run [#450 #532]\n");
         return;
     }
     if (hype_fs_lookup(bv, "\\hype.cfg", &f) != 0) {
-        hype_debug_print("cfg: no \\hype.cfg on the boot volume -- using built-in defaults (the "
-                         "volume mounted fine; this is the ABSENT case) [#450]\n");
+        hype_debug_print("cfg: no \\hype.cfg on the boot volume -- NO VMs will run (the volume mounted "
+                         "fine; this is the ABSENT case). Type 'create' at the terminal [#450 #532]\n");
         return;
     }
     sz = f.size;
@@ -20530,7 +20557,7 @@ static void load_hype_cfg(void) {
     }
     if (hype_fs_read_at(&f, 0ull, g_hype_cfg_text, (unsigned int)sz) != 0) {
         hype_debug_print("cfg: \\hype.cfg found (%llu bytes) but UNREADABLE through hype's own "
-                         "stack -- using built-in defaults [#450]\n", (unsigned long long)sz);
+                         "stack -- no VMs will run [#450 #532]\n", (unsigned long long)sz);
         return;
     }
     g_hype_cfg_text[sz] = '\0';
@@ -21512,22 +21539,12 @@ static void term_create_begin(void) {
                      "created", g_hype_cfg.vm_count);
         return;
     }
-    if (g_hype_cfg.vm_count != g_vm_count) {
-        /*
-         * #486: the config must describe the VMs that are running, or a create changes the VM set
-         * on the next boot rather than adding to it.
-         *
-         * This is the no-hype.cfg case: hype is running its built-in defaults, which no [vm.*]
-         * section describes, so writing a config containing only the new VM would leave the next
-         * boot with ONE machine instead of three. Refused rather than done silently -- the ticket's
-         * own bar starts from a host whose VMs came from hype.cfg, and materialising the defaults
-         * into sections is its own piece of work (a 'save' verb), not a side effect of create.
-         */
-        term_resultf("create: this host is running %u VM(s) that hype.cfg does not describe (it "
-                     "has %u section(s)) -- creating one now would change the VM set on the next "
-                     "boot; nothing created", g_vm_count, g_hype_cfg.vm_count);
-        return;
-    }
+    /*
+     * #532: no built-in VM set any more, so the config always describes exactly the VMs that are
+     * running and the config index equals the runtime index. The guard this replaced existed only
+     * for the default-VM case, where writing a config would have changed the VM set on the next
+     * boot rather than adding to it.
+     */
     if (g_vm_count >= g_max_vms) {
         /* #393's slot, from decision 33's own reversal conditions: per-VM state was allocated for
          * the host's core bound, and there is no more of it. Said plainly rather than discovered

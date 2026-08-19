@@ -129,7 +129,30 @@ SFDISK
     # HYPE_CFG=<path> drops a config at \hype.cfg, which is where hype looks (boot/main.c:14699).
     # Without one hype uses its built-in defaults, so the entire config path -- and everything it
     # decides, from guest RAM to display names -- goes untested here unless a run asks for it.
-    [ -n "${HYPE_CFG:-}" ] && mcopy -i "$ESP@@1M" "$HYPE_CFG" ::/hype.cfg
+    # #532: hype has no built-in VM set, so a run with no config runs NO guests. Rather than
+    # silently testing nothing, generate a minimal one-VM config and say so -- and the generated
+    # file is a real config, so a run can be re-aimed by swapping it rather than rebuilding.
+    if [ -n "${NO_CFG:-}" ]; then
+        echo "NO_CFG=1 -- shipping NO hype.cfg, so hype should run zero VMs (#532)"
+    elif [ -n "${HYPE_CFG:-}" ]; then
+        mcopy -i "$ESP@@1M" "$HYPE_CFG" ::/hype.cfg
+    else
+        cat > "$OUT.gen.cfg" <<CFGEOF
+[hype]
+config_version = 1
+
+[vm.g0]
+vcpus = ${GEN_VCPUS:-2}
+mem_mb = ${GEN_MEM_MB:-2048}
+boot = installer
+install_media = \\iso\\test.iso
+firmware = uefi
+os_hint = linux
+target_disk = file:\\hype\\disks\\g0.img
+CFGEOF
+        mcopy -i "$ESP@@1M" "$OUT.gen.cfg" ::/hype.cfg
+        echo "no HYPE_CFG given -- generated a one-VM config at $OUT.gen.cfg (#532)"
+    fi
     # HYPE_INPUT=<path> drops a section 6k input script at \input\vm0.txt, so a run can drive the
     # guest -- log in, run a workload -- instead of only watching it boot. #295 needs one: its own
     # first instruction is to re-measure the write-size histogram, and nothing writes to a disk
