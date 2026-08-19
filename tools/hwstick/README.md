@@ -10,6 +10,26 @@ The `-dirty` is the **vendored `edk2` submodule**, which carries local #436 rese
 `arch/` and `devices/` only; the guest firmware on this stick is the pre-built `fw/*.fd` pair. So the
 binary corresponds exactly to its sha — the stamp is left honest rather than forced clean.
 
+## Before the first boot: two files per Alpine guest
+
+`stage.sh` does not put these on the stick, and **without them that VM does not run at all** —
+hype refuses to substitute a scratch disk, which is correct, but it means the ticket riding on
+that VM produces no evidence:
+
+| path | what it is |
+|---|---|
+| `\iso\test.iso` | vm0's Alpine install media |
+| `\iso\vm1.iso` | vm1's Alpine install media |
+| `\hype\disks\vm0.img` | vm0's install target |
+| `\hype\disks\vm1.img` | vm1's install target |
+
+`stage.sh` now **refuses to finish** if any is missing and prints the commands to create them.
+The disk size is yours to choose — it must hold a real install, and this stick is FAT32, where
+nothing is sparse and no single file may reach 4 GiB.
+
+**vm1 is new.** It was added when #560 made two 2-vCPU guests fit the AMD laptop, so a stick
+staged before that has no `vm1.iso` and no `vm1.img`.
+
 ## SAFETY — read this first
 
 **Nothing in this run writes to a physical disk.** Every `target_disk` is `file:` on this stick;

@@ -42,7 +42,10 @@ rm -f "$DST"/HYPE.LOG "$DST"/*.LOG "$DST"/vars-*.bin
 # Stale input scripts are worse than none: a leftover \input\vm8.txt from a different config looks
 # like a script that should be driving something. Replace the directories wholesale.
 rm -rf "$DST"/input "$DST"/input-micro
-mkdir -p "$DST/EFI/BOOT" "$DST/EFI/hype/micro" "$DST/input" "$DST/input-micro"
+# \iso and \hype\disks are created empty so the operator's copy/truncate commands land
+# somewhere. Their CONTENTS are checked below and never invented.
+mkdir -p "$DST/EFI/BOOT" "$DST/EFI/hype/micro" "$DST/input" "$DST/input-micro" \
+         "$DST/iso" "$DST/hype/disks"
 cp build/hype.efi "$DST/EFI/BOOT/BOOTX64.EFI"
 cp fw/OVMF_CODE.fd fw/OVMF_VARS.fd "$DST/EFI/hype/"
 cp build/micro/*.bin "$DST/EFI/hype/micro/"
@@ -68,7 +71,41 @@ for cfg in sorted(glob.glob('tools/hwstick/*.cfg')):
             sys.exit("STAGE FAILED: %s names %s, which is not on the stick" % (cfg, m.strip()))
     print(os.path.basename(cfg), "-- every kernel present")
 PY
-echo
-echo "NOT staged (put them there yourself if the primary config needs them):"
-echo "  \\iso\\test.iso and \\iso\\vm1.iso -- the Alpine media for vm0 and vm1"
-ls -la "$DST/iso" 2>/dev/null | tail -3 || echo "  (no \\iso directory on this stick yet)"
+# 4. every install_media and target_disk a config names must be there too.
+#
+# stage.sh checked `kernel =` paths and not these, which is the wrong half: a missing kernel
+# is a config hype refuses loudly, but a missing install_media or target_disk costs a whole
+# cold-boot cycle to discover. hype does NOT invent a disk -- "refusing to substitute a scratch
+# disk" is correct behaviour, because silently inventing one is how an install lands somewhere
+# nobody chose -- so an absent file means that VM simply does not run, and the ticket riding on
+# it produces no evidence at all.
+#
+# These are CHECKED, not created. Their size is the operator's call (it has to hold a real
+# install, and this stick is FAT32, where nothing is sparse), and guessing it is exactly the
+# kind of substitution the rest of this file refuses to make.
+python3 - "$DST" <<'PY'
+import re, sys, os, glob
+dst = sys.argv[1]
+missing = []
+for cfg in sorted(glob.glob('tools/hwstick/*.cfg')):
+    text = open(cfg).read()
+    for key, pat in (('install_media', r'^install_media = (.+)$'),
+                     ('target_disk', r'^target_disk = file:(.+)$')):
+        for m in re.findall(pat, text, re.M):
+            rel = m.strip().replace('\\', '/').lstrip('/')
+            if not os.path.exists(os.path.join(dst, rel)):
+                missing.append((os.path.basename(cfg), key, m.strip()))
+if missing:
+    print("STAGE INCOMPLETE -- these VMs will NOT run:")
+    for cfg, key, path in missing:
+        print("  %-16s %-14s %s" % (cfg, key, path))
+    print()
+    print("Put them on the stick before booting. The ISOs are the Alpine install media;")
+    print("the target disks must exist because hype refuses to substitute a scratch disk.")
+    print("  cp <alpine.iso> %s/iso/test.iso" % dst)
+    print("  cp <alpine.iso> %s/iso/vm1.iso" % dst)
+    print("  truncate -s 2G %s/hype/disks/vm0.img   # size is yours to choose; FAT32 caps at 4G" % dst)
+    print("  truncate -s 2G %s/hype/disks/vm1.img" % dst)
+    sys.exit(1)
+print("every install_media and target_disk named by a config is present")
+PY
