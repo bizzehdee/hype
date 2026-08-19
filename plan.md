@@ -202,6 +202,7 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
                             ; name, i.e. shares with nobody (default-deny)
   mem_mb = 8192
   boot = installer        ; installer | disk | kernel (§10 decision 45)
+                          ; kernel = <path> and cmdline = <string> apply to that mode
   install_media = \EFI\hype\win11.iso
   target_disk = file:\hype\disks\win11.img   ; file:<path> | physical:<serial-or-guid>
   target_disk_size_gb = 128                  ; only used when creating a new file: target

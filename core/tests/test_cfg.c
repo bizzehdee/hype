@@ -285,6 +285,80 @@ static void test_boot_kernel_write_back(void) {
     CHECK_STR("kernel path survived the round trip", "\\micro\\k.bin", back.vms[0].kernel);
 }
 
+/*
+ * #546: the kernel command line. Three states that must stay distinguishable -- absent, explicitly
+ * empty, and set -- because the loader turns them into cmd_line_ptr == 0, a pointer to a NUL, and a
+ * pointer to a string, and a kernel reads all three differently.
+ */
+static void test_cmdline(void) {
+    const char *cfg =
+        "[vm.k]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = kernel\n"
+        "kernel = \\k.bin\n"
+        "cmdline = console=ttyS0 acpi=off\n"
+        "os_hint = none\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+
+    CHECK_INT("cmdline parses on a kernel VM", HYPE_CFG_OK, res.status);
+    CHECK_INT("has_cmdline set", 1, out.vms[0].has_cmdline);
+    CHECK_STR("cmdline value", "console=ttyS0 acpi=off", out.vms[0].cmdline);
+}
+
+static void test_cmdline_absent_vs_empty(void) {
+    const char *absent =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=kernel\nkernel=\\k.bin\nos_hint=none\n";
+    const char *empty =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=kernel\nkernel=\\k.bin\ncmdline=\nos_hint=none\n";
+    hype_cfg_t a, b;
+
+    CHECK_INT("no cmdline key is valid", HYPE_CFG_OK, parse_copy(absent, &a).status);
+    CHECK_INT("and has_cmdline stays clear", 0, a.vms[0].has_cmdline);
+
+    CHECK_INT("an EMPTY cmdline is valid", HYPE_CFG_OK, parse_copy(empty, &b).status);
+    CHECK_INT("and has_cmdline is SET -- explicitly nothing is not nothing", 1,
+              b.vms[0].has_cmdline);
+    CHECK_STR("with an empty string", "", b.vms[0].cmdline);
+}
+
+/* A cmdline longer than the key can hold must be refused, not truncated: `console=ttyS0` cut to
+ * `console=tty` is a valid, wrong setting. */
+static void test_cmdline_too_long(void) {
+    static char cfg[HYPE_CFG_CMDLINE_MAX + 256];
+    hype_cfg_t out;
+    unsigned i, n;
+
+    strcpy(cfg, "[vm.k]\nvcpus=1\nmem_mb=512\nboot=kernel\nkernel=\\k.bin\ncmdline=");
+    n = (unsigned)strlen(cfg);
+    for (i = 0; i < HYPE_CFG_CMDLINE_MAX; i++) {
+        cfg[n + i] = 'x';
+    }
+    strcpy(cfg + n + i, "\nos_hint=none\n");
+
+    CHECK_INT("an over-long cmdline is refused", HYPE_CFG_ERR_VALUE_TOO_LONG,
+              parse_copy(cfg, &out).status);
+}
+
+/* #546: it must round-trip, or #486's create/write-back would silently drop it. */
+static void test_cmdline_write_back(void) {
+    const char *cfg =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=kernel\nkernel=\\k.bin\n"
+        "cmdline=console=ttyS0 pages=all\nos_hint=none\n";
+    hype_cfg_t out, back;
+    static char written[16384];
+    hype_cfg_serialize_result_t ser;
+
+    CHECK_INT("parse ok", HYPE_CFG_OK, parse_copy(cfg, &out).status);
+    ser = hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("serialize not truncated", 0, ser.truncated);
+    CHECK_INT("cmdline was written", 1,
+              strstr(written, "cmdline = console=ttyS0 pages=all") != NULL);
+    CHECK_INT("re-parse ok", HYPE_CFG_OK, parse_copy(written, &back).status);
+    CHECK_STR("cmdline survived the round trip", "console=ttyS0 pages=all", back.vms[0].cmdline);
+}
+
 /* ---- error cases ---- */
 
 struct error_case {
@@ -380,6 +454,16 @@ static const struct error_case ERROR_CASES[] = {
      HYPE_CFG_ERR_MISSING_REQUIRED},
     {"duplicate key kernel", "[vm.a]\nkernel=x\nkernel=y\n", HYPE_CFG_ERR_DUPLICATE_KEY},
     {"empty kernel", "[vm.a]\nkernel=\n", HYPE_CFG_ERR_BAD_VALUE},
+    /* #546 */
+    {"duplicate key cmdline", "[vm.a]\ncmdline=x\ncmdline=y\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+    {"cmdline on a boot=disk VM has no kernel to give it to",
+     "[vm.a]\nvcpus=1\nmem_mb=1\nboot=disk\ntarget_disk=file:x\nfirmware=uefi\nos_hint=none\n"
+     "cmdline=console=ttyS0\n",
+     HYPE_CFG_ERR_BAD_VALUE},
+    {"cmdline on a boot=installer VM likewise",
+     "[vm.a]\nvcpus=1\nmem_mb=1\nboot=installer\ninstall_media=\\a.iso\ntarget_disk=file:x\n"
+     "firmware=uefi\nos_hint=none\ncmdline=console=ttyS0\n",
+     HYPE_CFG_ERR_BAD_VALUE},
 };
 
 static void test_error_cases(void) {
@@ -2277,6 +2361,10 @@ int main(void) {
     test_boot_kernel();
     test_boot_kernel_with_disk_allowed();
     test_boot_kernel_write_back();
+    test_cmdline();
+    test_cmdline_absent_vs_empty();
+    test_cmdline_too_long();
+    test_cmdline_write_back();
     test_error_cases();
     test_too_many_vms();
     test_value_too_long();

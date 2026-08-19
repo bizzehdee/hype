@@ -946,6 +946,7 @@ typedef struct hype_fw_vm {
     int kernel_boot;
     int kernel_loaded;
     const char *kernel_path;
+    const char *kernel_cmdline; /* #546: 0 = no command line at all */
     hype_kboot_plan_t kplan;
     const char *media;      /* boot-media short name; points at media_buf below */
     /*
@@ -13369,14 +13370,21 @@ static void fw_1_resolve_kernel(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsign
     vmp->kernel_boot = 0;
     vmp->kernel_loaded = 0;
     vmp->kernel_path = 0;
+    vmp->kernel_cmdline = 0;
     if (cv == 0 || cv->boot != HYPE_CFG_BOOT_KERNEL) {
         return;
     }
     vmp->kernel_boot = 1;
     vmp->kernel_path = cv->kernel;
+    /* #546: optional. A NULL pointer here means "no command line at all", which is what the kernel
+     * sees as cmd_line_ptr == 0 -- deliberately distinct from a configured empty string. */
+    vmp->kernel_cmdline = cv->has_cmdline ? cv->cmdline : 0;
     HYPE_LOGF(HYPE_LOG_INFO,
-              "fw-1 vm%u: boot = kernel -- '%s', no guest firmware in the path [#535]\n", vm_index,
-              cv->kernel);
+              "fw-1 vm%u: boot = kernel -- '%s', no guest firmware in the path; cmdline %s%s%s "
+              "[#535 #546]\n", vm_index, cv->kernel,
+              (vmp->kernel_cmdline == 0) ? "(none)" : "'",
+              (vmp->kernel_cmdline == 0) ? "" : vmp->kernel_cmdline,
+              (vmp->kernel_cmdline == 0) ? "" : "'");
 }
 
 /*
@@ -13425,7 +13433,16 @@ static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi) {
                   vm->kernel_path);
         return -1;
     }
-    st = hype_kboot_plan(head, head_read, f.size, vm->ram_bytes, &vm->kplan);
+    {
+        unsigned int cl_len = 0u;
+        if (vm->kernel_cmdline != 0) {
+            while (vm->kernel_cmdline[cl_len] != '\0') {
+                cl_len++;
+            }
+        }
+        st = hype_kboot_plan(head, head_read, f.size, vm->ram_bytes, cl_len,
+                             vm->kernel_cmdline != 0 ? 1 : 0, &vm->kplan);
+    }
     if (st != HYPE_KBOOT_OK) {
         HYPE_LOGF(HYPE_LOG_ERROR,
                   "fw-1 vm%u: kernel '%s' REFUSED -- %s (image %llu B, this VM has %llu MiB; a "
@@ -13463,23 +13480,35 @@ static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi) {
     hype_paging_build_identity_at(ram, HYPE_KBOOT_PML4_GPA, HYPE_KBOOT_PDPT_GPA,
                                   HYPE_KBOOT_PD0_GPA, vm->kplan.gb_to_map);
 
+    /* #546: the command line, before the zero page that points at it. */
+    if (vm->kplan.cmdline_gpa != 0ull && vm->kernel_cmdline != 0) {
+        char *dst = (char *)(ram + vm->kplan.cmdline_gpa);
+        unsigned int ci = 0u;
+        while (vm->kernel_cmdline[ci] != '\0' && ci < HYPE_KBOOT_CMDLINE_MAX) {
+            dst[ci] = vm->kernel_cmdline[ci];
+            ci++;
+        }
+        dst[ci] = '\0';
+    }
+
     e820[0].addr = 0ull;
     e820[0].size = vm->ram_bytes;
     e820[0].type = HYPE_LINUX_E820_TYPE_RAM;
     hype_linux_build_zero_page(
         (hype_linux_boot_params_t *)(ram + vm->kplan.zero_page_gpa),
-        (const hype_linux_setup_header_t *)(head + HYPE_LINUX_SETUP_HEADER_OFFSET), 0u, 0u, 0u,
-        e820, 1u);
+        (const hype_linux_setup_header_t *)(head + HYPE_LINUX_SETUP_HEADER_OFFSET), 0u, 0u,
+        (uint32_t)vm->kplan.cmdline_gpa, e820, 1u);
 
     vm->kernel_loaded = 1;
     HYPE_LOGF(HYPE_LOG_INFO,
               "fw-1 vm%u: kernel '%s' loaded -- %llu B payload @gpa 0x%llx, entry 0x%llx, cr3 "
-              "0x%llx, rsp 0x%llx, zero page 0x%llx, %u GB identity-mapped [#535]\n",
+              "0x%llx, rsp 0x%llx, zero page 0x%llx, cmdline gpa 0x%llx, %u GB identity-mapped "
+              "[#535 #546]\n",
               vi, vm->kernel_path, (unsigned long long)vm->kplan.payload_bytes,
               (unsigned long long)vm->kplan.payload_load_gpa,
               (unsigned long long)vm->kplan.entry_gpa, (unsigned long long)vm->kplan.cr3_gpa,
               (unsigned long long)vm->kplan.rsp_gpa, (unsigned long long)vm->kplan.zero_page_gpa,
-              vm->kplan.gb_to_map);
+              (unsigned long long)vm->kplan.cmdline_gpa, vm->kplan.gb_to_map);
     return 0;
 }
 

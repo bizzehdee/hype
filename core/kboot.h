@@ -32,9 +32,19 @@
 #define HYPE_KBOOT_PD_PAGES 4u
 #define HYPE_KBOOT_ZERO_PAGE_GPA 0x7000ull
 /*
- * Stack top at 512 KB, growing down into the gap above the zero page. Below the 640 KB
+ * #546: the kernel command line, one page immediately after the zero page. The kernel finds it
+ * through boot_params.hdr.cmd_line_ptr, so its address is not something a guest hardcodes -- it is
+ * here only so the layout has one owner.
+ */
+#define HYPE_KBOOT_CMDLINE_GPA 0x8000ull
+#define HYPE_KBOOT_CMDLINE_MAX 4095u /* one page, less the NUL */
+/*
+ * Stack top at 512 KB, growing down toward the command-line page. Below the 640 KB
  * conventional-memory ceiling, so it cannot collide with anything a PC-shaped guest expects to
- * find in the 0xA0000-0xFFFFF hole.
+ * find in the 0xA0000-0xFFFFF hole. That leaves 0x77000 (476 KB) of stack before it would reach
+ * the command line -- far more than a test kernel uses, and stated here because a silent collision
+ * between a deep stack and the command line would corrupt the one string that says what the guest
+ * was asked to do.
  */
 #define HYPE_KBOOT_STACK_TOP_GPA 0x80000ull
 /* Payload at 16 MB: clear of the low 1 MB entirely, and 2MB-aligned. */
@@ -49,7 +59,8 @@ typedef enum {
     HYPE_KBOOT_ERR_BAD_HEADER,    /* not a bzImage, or 32-bit-only (no XLF_KERNEL_64) */
     HYPE_KBOOT_ERR_NO_PAYLOAD,    /* header is valid but nothing follows the setup region */
     HYPE_KBOOT_ERR_RAM_TOO_SMALL, /* the payload will not fit in this VM's guest RAM */
-    HYPE_KBOOT_ERR_HEAD_TOO_SMALL /* caller passed fewer head bytes than the header needs */
+    HYPE_KBOOT_ERR_HEAD_TOO_SMALL, /* caller passed fewer head bytes than the header needs */
+    HYPE_KBOOT_ERR_CMDLINE_TOO_LONG /* #546: longer than the layout, or than the kernel accepts */
 } hype_kboot_status_t;
 
 typedef struct {
@@ -61,6 +72,13 @@ typedef struct {
     uint32_t payload_file_offset; /* first payload byte's offset in the image file */
     uint64_t payload_bytes;    /* how many bytes to copy from there */
     unsigned int gb_to_map;    /* GB of identity map to build */
+    /*
+     * #546: where the command line goes, and 0 for cmd_line_ptr when there is none. The kernel
+     * reads cmd_line_ptr, so 0 means "no command line" to it -- distinct from an empty string at a
+     * valid address, which means "an empty command line". Both are legitimate; they are not the
+     * same thing, and conflating them would make `cmdline =` indistinguishable from no key.
+     */
+    uint64_t cmdline_gpa;
 } hype_kboot_plan_t;
 
 /*
@@ -69,8 +87,17 @@ typedef struct {
  * file's size; `ram_bytes` is the VM's guest RAM. `out` is untouched unless the result is
  * HYPE_KBOOT_OK.
  */
+/*
+ * `cmdline_len` is the command line's length in bytes excluding any NUL, or 0 for none;
+ * `have_cmdline` distinguishes "no command line at all" from "an empty one". The length is checked
+ * against BOTH the page this layout reserves and, when the image declares one, the kernel's own
+ * cmdline_size -- which is the kernel telling the loader how much it will read. A longer string is
+ * refused rather than truncated: a truncated command line silently means something ELSE, and
+ * `console=ttyS0` cut to `console=tty` is a valid, wrong setting.
+ */
 hype_kboot_status_t hype_kboot_plan(const void *image_head, uint64_t head_bytes,
                                     uint64_t image_bytes, uint64_t ram_bytes,
+                                    unsigned int cmdline_len, int have_cmdline,
                                     hype_kboot_plan_t *out);
 
 /* The refusal reason, so every caller words it the same way. */

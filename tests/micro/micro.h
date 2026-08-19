@@ -99,6 +99,60 @@ static inline void micro_fail(const char *name, const char *what) {
     micro_puts("\n");
 }
 
+/*
+ * #546: the kernel command line hype was told to pass this VM, or 0 if there was none.
+ *
+ * boot_params.hdr.cmd_line_ptr is at offset 0x228 of the zero page (the setup header starts at
+ * 0x1F1 and cmd_line_ptr is at 0x228 within the file layout core/linux_boot.h transcribes). A zero
+ * pointer means no command line AT ALL, which is distinct from an empty string at a valid address
+ * -- `cmdline =` in the config means "explicitly nothing", and a test that cannot tell those apart
+ * cannot report which one it got.
+ */
+static inline const char *micro_cmdline(uint64_t zero_page_gpa) {
+    uint32_t ptr;
+    if (zero_page_gpa == 0ull) {
+        return 0;
+    }
+    ptr = *(const volatile uint32_t *)(uintptr_t)(zero_page_gpa + 0x228ull);
+    return (ptr == 0u) ? 0 : (const char *)(uintptr_t)ptr;
+}
+
+/*
+ * Find `key=` in a command line and return the value, or 0 if absent. Matches only at a word
+ * boundary, so `verify=strict` is not found by looking for `ify=`.
+ *
+ * A microtest that reads a parameter must FAIL on one it does not understand rather than ignore it:
+ * an ignored parameter is a test that silently did not do what the config asked, which is the same
+ * class of defect as a config key that parses and has no effect.
+ */
+static inline const char *micro_cmdline_value(const char *cmdline, const char *key) {
+    const char *p = cmdline;
+
+    if (cmdline == 0 || key == 0) {
+        return 0;
+    }
+    while (*p != '\0') {
+        const char *k = key;
+        const char *q = p;
+
+        while (*k != '\0' && *q == *k) {
+            k++;
+            q++;
+        }
+        if (*k == '\0' && *q == '=') {
+            return q + 1;
+        }
+        /* Advance to the start of the next space-separated word. */
+        while (*p != '\0' && *p != ' ') {
+            p++;
+        }
+        while (*p == ' ') {
+            p++;
+        }
+    }
+    return 0;
+}
+
 /* Stop this guest. Halting with interrupts left as the loader set them parks the vCPU in a HLT
  * exit, which hype reports as an idle guest rather than as a fault. */
 static inline void micro_halt(void) {

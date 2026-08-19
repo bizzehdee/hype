@@ -49,7 +49,7 @@ static void test_plan_accepts_a_valid_image(void) {
     uint64_t image = 2560ull + 0x40000ull; /* 256 KB of payload */
 
     make_valid_head();
-    st = hype_kboot_plan(g_head, sizeof(g_head), image, 512ull * 1024ull * 1024ull, &p);
+    st = hype_kboot_plan(g_head, sizeof(g_head), image, 512ull * 1024ull * 1024ull, 0u, 0, &p);
 
     CHECK_INT("a valid bzImage plans", HYPE_KBOOT_OK, st);
     CHECK_INT("payload starts after the setup region", 2560, p.payload_file_offset);
@@ -69,7 +69,7 @@ static void test_setup_sects_zero_means_four(void) {
     make_valid_head();
     head_hdr()->setup_sects = 0;
     CHECK_INT("plans", HYPE_KBOOT_OK,
-              hype_kboot_plan(g_head, sizeof(g_head), 4096ull * 64ull, 512ull * 1024ull * 1024ull, &p));
+              hype_kboot_plan(g_head, sizeof(g_head), 4096ull * 64ull, 512ull * 1024ull * 1024ull, 0u, 0, &p));
     CHECK_INT("setup_sects 0 is treated as 4", 2560, p.payload_file_offset);
 }
 
@@ -79,36 +79,36 @@ static void test_rejections(void) {
 
     make_valid_head();
     head_hdr()->boot_flag = 0;
-    st = hype_kboot_plan(g_head, sizeof(g_head), 1ull << 20, 1ull << 30, &p);
+    st = hype_kboot_plan(g_head, sizeof(g_head), 1ull << 20, 1ull << 30, 0u, 0, &p);
     CHECK_INT("no 0xAA55 boot flag is refused", HYPE_KBOOT_ERR_BAD_HEADER, st);
 
     make_valid_head();
     head_hdr()->xloadflags = 0;
-    st = hype_kboot_plan(g_head, sizeof(g_head), 1ull << 20, 1ull << 30, &p);
+    st = hype_kboot_plan(g_head, sizeof(g_head), 1ull << 20, 1ull << 30, 0u, 0, &p);
     CHECK_INT("a 32-bit-only kernel is refused, not degraded", HYPE_KBOOT_ERR_BAD_HEADER, st);
 
     make_valid_head();
-    st = hype_kboot_plan(g_head, HYPE_LINUX_SETUP_HEADER_OFFSET, 1ull << 20, 1ull << 30, &p);
+    st = hype_kboot_plan(g_head, HYPE_LINUX_SETUP_HEADER_OFFSET, 1ull << 20, 1ull << 30, 0u, 0, &p);
     CHECK_INT("too few head bytes to decide", HYPE_KBOOT_ERR_HEAD_TOO_SMALL, st);
 
     make_valid_head();
-    st = hype_kboot_plan(g_head, sizeof(g_head), 16ull, 1ull << 30, &p);
+    st = hype_kboot_plan(g_head, sizeof(g_head), 16ull, 1ull << 30, 0u, 0, &p);
     CHECK_INT("a file too small to hold a header", HYPE_KBOOT_ERR_SHORT_IMAGE, st);
 
     /* Header valid, but the file ends exactly where the payload would begin. */
     make_valid_head();
-    st = hype_kboot_plan(g_head, sizeof(g_head), 2560ull, 1ull << 30, &p);
+    st = hype_kboot_plan(g_head, sizeof(g_head), 2560ull, 1ull << 30, 0u, 0, &p);
     CHECK_INT("no payload after the setup region", HYPE_KBOOT_ERR_NO_PAYLOAD, st);
 
     /* A 64 MB payload cannot load at 16 MB inside 32 MB of guest RAM. */
     make_valid_head();
-    st = hype_kboot_plan(g_head, sizeof(g_head), 2560ull + (64ull << 20), 32ull << 20, &p);
+    st = hype_kboot_plan(g_head, sizeof(g_head), 2560ull + (64ull << 20), 32ull << 20, 0u, 0, &p);
     CHECK_INT("a payload larger than the VM's RAM is refused", HYPE_KBOOT_ERR_RAM_TOO_SMALL, st);
 
-    st = hype_kboot_plan(0, sizeof(g_head), 1ull << 20, 1ull << 30, &p);
+    st = hype_kboot_plan(0, sizeof(g_head), 1ull << 20, 1ull << 30, 0u, 0, &p);
     CHECK_INT("a null image head is refused", HYPE_KBOOT_ERR_BAD_HEADER, st);
     make_valid_head();
-    st = hype_kboot_plan(g_head, sizeof(g_head), 1ull << 20, 1ull << 30, 0);
+    st = hype_kboot_plan(g_head, sizeof(g_head), 1ull << 20, 1ull << 30, 0u, 0, 0);
     CHECK_INT("a null plan output is refused", HYPE_KBOOT_ERR_BAD_HEADER, st);
 }
 
@@ -125,17 +125,71 @@ static void test_min_ram_is_the_payload_plus_the_layout(void) {
         make_valid_head();
         CHECK_INT("exactly the reported floor is enough", HYPE_KBOOT_OK,
                   hype_kboot_plan(g_head, sizeof(g_head), 2560ull + payload,
-                                  hype_kboot_min_ram_bytes(payload), &p));
+                                  hype_kboot_min_ram_bytes(payload), 0u, 0, &p));
         CHECK_INT("one byte under the floor is not", HYPE_KBOOT_ERR_RAM_TOO_SMALL,
                   hype_kboot_plan(g_head, sizeof(g_head), 2560ull + payload,
-                                  hype_kboot_min_ram_bytes(payload) - 1ull, &p));
+                                  hype_kboot_min_ram_bytes(payload) - 1ull, 0u, 0, &p));
     }
+}
+
+/*
+ * #546: the command line. The distinction that matters is "no command line at all" (cmd_line_ptr
+ * must be 0, which is what a kernel reads as absent) versus "an empty one" (a valid pointer to a
+ * NUL) -- both legitimate, not the same thing.
+ */
+static void test_cmdline_placement(void) {
+    hype_kboot_plan_t p;
+    uint64_t image = 2560ull + 0x40000ull;
+    uint64_t ram = 512ull * 1024ull * 1024ull;
+
+    make_valid_head();
+    CHECK_INT("no cmdline plans", HYPE_KBOOT_OK,
+              hype_kboot_plan(g_head, sizeof(g_head), image, ram, 0u, 0, &p));
+    CHECK_HEX("and cmd_line_ptr must be 0, i.e. absent", 0ull, p.cmdline_gpa);
+
+    CHECK_INT("an EMPTY cmdline plans", HYPE_KBOOT_OK,
+              hype_kboot_plan(g_head, sizeof(g_head), image, ram, 0u, 1, &p));
+    CHECK_HEX("and gets a real address, so the kernel sees an empty string not none",
+              HYPE_KBOOT_CMDLINE_GPA, p.cmdline_gpa);
+
+    CHECK_INT("a normal cmdline plans", HYPE_KBOOT_OK,
+              hype_kboot_plan(g_head, sizeof(g_head), image, ram, 40u, 1, &p));
+    CHECK_HEX("placed after the zero page", HYPE_KBOOT_CMDLINE_GPA, p.cmdline_gpa);
+
+    /* Exactly the layout's limit fits; one more does not. */
+    CHECK_INT("the longest cmdline the page holds fits", HYPE_KBOOT_OK,
+              hype_kboot_plan(g_head, sizeof(g_head), image, ram, HYPE_KBOOT_CMDLINE_MAX, 1, &p));
+    CHECK_INT("one byte longer is REFUSED, not truncated", HYPE_KBOOT_ERR_CMDLINE_TOO_LONG,
+              hype_kboot_plan(g_head, sizeof(g_head), image, ram, HYPE_KBOOT_CMDLINE_MAX + 1u, 1,
+                              &p));
+
+    /* The kernel's OWN stated limit binds too, and is the tighter one here. */
+    make_valid_head();
+    head_hdr()->cmdline_size = 32u;
+    CHECK_INT("within the kernel's stated cmdline_size", HYPE_KBOOT_OK,
+              hype_kboot_plan(g_head, sizeof(g_head), image, ram, 32u, 1, &p));
+    CHECK_INT("beyond it is refused even though the page would hold it",
+              HYPE_KBOOT_ERR_CMDLINE_TOO_LONG,
+              hype_kboot_plan(g_head, sizeof(g_head), image, ram, 33u, 1, &p));
+
+    /* cmdline_size 0 means the image did not state one, so only the layout binds. */
+    make_valid_head();
+    head_hdr()->cmdline_size = 0u;
+    CHECK_INT("cmdline_size 0 means unstated, not zero-length", HYPE_KBOOT_OK,
+              hype_kboot_plan(g_head, sizeof(g_head), image, ram, 200u, 1, &p));
+
+    /* The command-line page must not collide with the zero page below it or the stack above it. */
+    CHECK_INT("cmdline starts after the zero page", 1,
+              (HYPE_KBOOT_ZERO_PAGE_GPA + 4096ull <= HYPE_KBOOT_CMDLINE_GPA) ? 1 : 0);
+    CHECK_INT("and ends below the stack top", 1,
+              (HYPE_KBOOT_CMDLINE_GPA + 4096ull <= HYPE_KBOOT_STACK_TOP_GPA) ? 1 : 0);
 }
 
 static void test_status_strings(void) {
     hype_kboot_status_t all[] = {HYPE_KBOOT_OK,           HYPE_KBOOT_ERR_SHORT_IMAGE,
                                 HYPE_KBOOT_ERR_BAD_HEADER, HYPE_KBOOT_ERR_NO_PAYLOAD,
-                                HYPE_KBOOT_ERR_RAM_TOO_SMALL, HYPE_KBOOT_ERR_HEAD_TOO_SMALL};
+                                HYPE_KBOOT_ERR_RAM_TOO_SMALL, HYPE_KBOOT_ERR_HEAD_TOO_SMALL,
+                                HYPE_KBOOT_ERR_CMDLINE_TOO_LONG};
     unsigned i;
     for (i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         const char *s = hype_kboot_status_str(all[i]);
@@ -216,6 +270,7 @@ int main(void) {
     test_setup_sects_zero_means_four();
     test_rejections();
     test_min_ram_is_the_payload_plus_the_layout();
+    test_cmdline_placement();
     test_status_strings();
     test_guest_page_tables_name_guest_addresses();
     if (failures == 0) {

@@ -138,6 +138,7 @@ as the default display name.
 | `mem_mb` | int, **1 .. host usable MB** | — (required) | ≥1 MB; admission caps at host RAM (§10) |
 | `boot` | `installer` \| `disk` \| `kernel` | `installer` | two-phase (§5.4 / plan.md §6d); `kernel` is the firmware-free direct kernel boot of §5.4b (#535) |
 | `kernel` | path | (none) | required when `boot = kernel`, and rejected otherwise — a raw guest kernel image loaded straight into guest RAM (§5.4b, #535) |
+| `cmdline` | free text | (none) | kernel command line, `boot = kernel` only and rejected otherwise (§5.4b, #546). Absent, empty and set are three distinct states |
 | `firmware` | `uefi` \| `legacy` | `uefi` | |
 | `os_hint` | `windows`\|`linux`\|`bsd`\|`none` | `none` | drives `bus` defaults (§5.6) |
 | `disks` | `<disk-id>` list | (empty) | ordered hard disks (`type=disk` `[disk.*]`); **0..N**, mixed bus allowed (§5.7) |
@@ -238,6 +239,32 @@ not legal is naming both a `kernel` and an `install_media`, which is two answers
 A kernel that cannot be loaded — missing file, bad header, payload too large for
 the VM's RAM — refuses **that VM** and says why. It is never fatal to the host, so
 one bad artifact in a suite config cannot take the other VMs down with it.
+
+### `cmdline` (#546)
+
+`cmdline = <string>` is the kernel command line, and applies to `boot = kernel` only —
+the firmware modes have no kernel to hand it to, so the key is a config error there
+rather than a silent no-op.
+
+Three states are deliberately distinguishable, because a kernel reads all three
+differently:
+
+| config | what the kernel gets |
+|---|---|
+| no `cmdline` key | `cmd_line_ptr = 0` — no command line at all |
+| `cmdline =` | a valid pointer to an empty string — explicitly nothing |
+| `cmdline = console=ttyS0` | a pointer to that string |
+
+The value is bounded twice: by `HYPE_CFG_CMDLINE_MAX`, which is kept inside
+`HYPE_CFG_LINE_MAX` so the write-back serializer can always emit it as one line, and
+by the image's own `cmdline_size` when it declares one — the kernel stating how much
+it will read. Exceeding either **refuses that VM and names the limit**; it is never
+truncated, because a truncated command line silently means something else
+(`console=ttyS0` cut to `console=tty` is a valid, wrong setting).
+
+For a real Linux kernel this is not a convenience. Without `console=ttyS0` the kernel
+writes nothing to the UART, and silence is indistinguishable from never having
+started — see #545 for the rest of what a real kernel needs.
 
 The originating use is #534's microtest suites: each in-binary self-test guest
 becomes its own build artifact, selected by a config rather than compiled into the

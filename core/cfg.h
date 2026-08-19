@@ -20,6 +20,7 @@
  *   boot = installer         ; installer | disk | kernel
  *   install_media = \EFI\hype\win11.iso   ; required when boot=installer
  *   kernel = \EFI\hype\micro\ram1.bin    ; required when boot=kernel
+ *   cmdline = console=ttyS0 acpi=off      ; optional, only for boot=kernel
  *   target_disk = file:\hype\disks\win11.img   ; file:<path> | physical:<id>
  *   target_disk_size_gb = 128            ; optional, only for new file: targets
  *   firmware = uefi          ; uefi | legacy
@@ -37,6 +38,15 @@
 #define HYPE_CFG_MAX_VMS 16
 /* Longer than NAME_MAX because a label is prose ("Windows 11 Workstation"), not an identifier. */
 #define HYPE_CFG_LABEL_MAX 64
+
+/*
+ * #546: the kernel command line. Deliberately shorter than a kernel's own limit (which
+ * cmdline_size in the image's setup header states, typically 2048): HYPE_CFG_LINE_MAX bounds what
+ * the write-back serializer can emit as one line, so a longer value could be parsed and then not
+ * survive a round trip -- which is #221's own refusal condition, and worse than refusing it here.
+ * "cmdline = " is 10 bytes, so this leaves comfortable margin inside a 192-byte line.
+ */
+#define HYPE_CFG_CMDLINE_MAX 160
 
 #define HYPE_CFG_NAME_MAX 32
 #define HYPE_CFG_PATH_MAX 256
@@ -143,6 +153,15 @@ typedef struct {
     char kernel[HYPE_CFG_PATH_MAX];
 
     /*
+     * #546: the kernel command line, for boot = kernel only. Optional -- a micro-kernel needs
+     * none, and a real Linux needs at least console=ttyS0 to be visible at all. Rejected for the
+     * firmware boot modes: they have no kernel to hand it to, and accepting a setting that does
+     * nothing is the defect class this parser keeps being extended to avoid (#285/#331/#339/#357).
+     */
+    int has_cmdline;
+    char cmdline[HYPE_CFG_CMDLINE_MAX];
+
+    /*
      * #323: WHICH host drive the media (and file-backed image) lives on, matched by drive
      * serial/GUID -- the "where" axis to install_media's "which". Optional: unset means
      * auto-detect, which is what hype did exclusively before, so every existing config is
@@ -231,7 +250,8 @@ enum {
     HYPE_CFG_F_CDROMS = 1u << 15,
     HYPE_CFG_F_BOOT_ORDER = 1u << 16, /* #323 */
     HYPE_CFG_F_LABEL = 1u << 17,      /* #357 */
-    HYPE_CFG_F_KERNEL = 1u << 18      /* #535 */
+    HYPE_CFG_F_KERNEL = 1u << 18,     /* #535 */
+    HYPE_CFG_F_CMDLINE = 1u << 19     /* #546 */
 };
 
 /*

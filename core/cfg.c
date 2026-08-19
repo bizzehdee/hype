@@ -317,6 +317,18 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         *seen |= HYPE_CFG_F_KERNEL;
         return HYPE_CFG_OK;
     }
+    if (hype_streq(key, "cmdline")) {
+        /* #546: the kernel command line. An EMPTY value is accepted and means an empty command
+         * line -- distinct from the key being absent, which is why has_cmdline exists separately.
+         * `cmdline =` is a legitimate way to say "explicitly nothing". */
+        unsigned long long len;
+        if (*seen & HYPE_CFG_F_CMDLINE) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        len = hype_strlcpy(vm->cmdline, val, HYPE_CFG_CMDLINE_MAX);
+        if (len >= HYPE_CFG_CMDLINE_MAX) return HYPE_CFG_ERR_VALUE_TOO_LONG;
+        vm->has_cmdline = 1;
+        *seen |= HYPE_CFG_F_CMDLINE;
+        return HYPE_CFG_OK;
+    }
     if (hype_streq(key, "media_disk")) {
         /* #323: the drive the media lives on, by serial/GUID. Optional -- absent means
          * auto-detect, preserving the pre-#323 behaviour for every existing config. */
@@ -490,6 +502,10 @@ static hype_cfg_status_t validate_required(const hype_cfg_vm_t *vm, unsigned int
         return HYPE_CFG_ERR_BAD_VALUE;
     }
     if (vm->boot == HYPE_CFG_BOOT_KERNEL && (seen & HYPE_CFG_F_INSTALL_MEDIA)) {
+        return HYPE_CFG_ERR_BAD_VALUE;
+    }
+    /* #546: a command line with no kernel to give it to. */
+    if (vm->boot != HYPE_CFG_BOOT_KERNEL && (seen & HYPE_CFG_F_CMDLINE)) {
         return HYPE_CFG_ERR_BAD_VALUE;
     }
     return HYPE_CFG_OK;
@@ -1688,6 +1704,9 @@ static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {
                                               : "installer");
     if (vm->has_kernel) {
         w_kv(w, "kernel", vm->kernel);
+    }
+    if (vm->has_cmdline) {
+        w_kv(w, "cmdline", vm->cmdline); /* #546 */
     }
     if (vm->has_install_media) {
         w_kv(w, "install_media", vm->install_media);

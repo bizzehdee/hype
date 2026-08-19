@@ -47,6 +47,22 @@ void micro_main(uint64_t zero_page_gpa) {
     }
     ram_bytes = *(const uint64_t *)(uintptr_t)(zero_page_gpa + 0x2D0 + 8);
 
+    /* #546: say what command line, if any, the config asked for -- and distinguish "none" from
+     * "empty", because they are different configs and only one of them is a mistake. */
+    {
+        const char *cl = micro_cmdline(zero_page_gpa);
+        micro_puts("micro/" NAME ": cmdline ");
+        if (cl == 0) {
+            micro_puts("(none -- cmd_line_ptr was 0)\n");
+        } else if (cl[0] == '\0') {
+            micro_puts("(empty -- a valid pointer to an empty string)\n");
+        } else {
+            micro_puts("'");
+            micro_puts(cl);
+            micro_puts("'\n");
+        }
+    }
+
     micro_puts("micro/" NAME ": e820 entries=");
     micro_put_uint(e820_entries);
     micro_puts(", usable RAM=");
