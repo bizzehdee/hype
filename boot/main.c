@@ -2285,9 +2285,18 @@ static void term_run_cmdline(void) {
                          (unsigned)HYPE_FW_1_SHUTDOWN_GRACE_S);
             break;
         }
-        case HYPE_CMD_UNKNOWN:
         case HYPE_CMD_CREATE:
             term_create_begin();
+            break;
+        case HYPE_CMD_UNKNOWN:
+            /*
+             * #566: this used to share the CREATE arm, so ANY typo silently started the VM
+             * creation wizard -- and the `default:` arm below, which exists to say "unknown
+             * command", was unreachable for the one verb it was written for. The operator's next
+             * line was then eaten as a VM name and answered with a name-validation message about
+             * text never meant to be a name, which is what made the terminal feel broken.
+             */
+            term_resultf("unknown command '%s' -- try 'help'", g_cmdline);
             break;
         default:
             term_resultf( "unknown command (try 'help')");
@@ -20174,7 +20183,26 @@ static void split_log_setup(void) {
     unsigned int i;
     int rc;
 
-    for (i = 0; i < g_vm_count; i++) {
+    /*
+     * #558: RUN THIS AFTER THE CONFIG IS PARSED, and run it again if it was called too early.
+     *
+     * It used to be called only from usb_log_setup(), which runs ~430 lines before
+     * fw_1_phase1_config() sets g_vm_count. Since #532 removed the built-in VM set, g_vm_count is
+     * ZERO there, so this loop executed zero times and no per-VM sink was ever created.
+     *
+     * That silently DELETED every guest console record. The classifier routes a guest record to
+     * its VM's sink and away from \HYPE.LOG (log_split.h: hype's own output to \HYPE.LOG, each
+     * guest's serial to its own file), so with no per-VM sink the records matched nothing and
+     * were dropped -- while hype still counted them and reported "4338 chars of console output
+     * (forwarded above)". Two bare-metal runs produced zero guest records on both vendors, and it
+     * cost a misdiagnosis (#557) and an apparent VM freeze that was only a frozen screen.
+     *
+     * Idempotent, so the early call is harmless and the later one does the work.
+     */
+    for (i = 0; i < g_vm_count && i < HYPE_CFG_MAX_VMS; i++) {
+        if (g_vm_log_ready[i]) {
+            continue; /* already opened by an earlier call */
+        }
         const char *cfg_name = (i < g_hype_cfg.vm_count) ? g_hype_cfg.vms[i].name : 0;
         vm_log_name(i, cfg_name, name, sizeof(name));
         rc = hype_log_sink_open_shared_ordered(
@@ -20184,9 +20212,27 @@ static void split_log_setup(void) {
             hype_debug_print("usb-log: \\%s not opened (rc=%d) [#338]\n", name, rc);
         }
     }
-    hype_debug_print("usb-log: split diagnostics -- hype's own output to \\HYPE.LOG, each "
-                     "guest's serial to its own file; the combined stream lives on the serial port and is "
-                     "recoverable from the [offset] prefixes [#338]\n");
+    {
+        unsigned int opened = 0;
+        for (i = 0; i < g_vm_count && i < HYPE_CFG_MAX_VMS; i++) {
+            if (g_vm_log_ready[i]) opened++;
+        }
+        /*
+         * Report the COUNT. The old line asserted the split was set up without saying for how
+         * many VMs, so "0 of 0" and "3 of 3" printed identically -- which is exactly why this
+         * being broken looked like a working configuration for two hardware runs.
+         */
+        hype_debug_print("usb-log: split diagnostics -- %u of %u per-VM log(s) open; hype's own "
+                         "output to \\HYPE.LOG, each guest's serial to its own file; the combined "
+                         "stream lives on the serial port and is recoverable from the [offset] "
+                         "prefixes [#338 #558]\n", opened, g_vm_count);
+        if (g_vm_count != 0u && opened == 0u) {
+            HYPE_LOGF(HYPE_LOG_ERROR,
+                      "usb-log: NO per-VM log is open but %u VM(s) exist -- every guest console "
+                      "record will be DROPPED, because the classifier routes them away from "
+                      "\\HYPE.LOG [#558]\n", g_vm_count);
+        }
+    }
 }
 
 /*
@@ -22812,6 +22858,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
 
     fw_1_phase1_config();
+
+    /*
+     * #558: NOW open the per-VM log files. g_vm_count is real only after this point; the call
+     * inside usb_log_setup() ran with zero VMs and created nothing.
+     */
+    if (g_hype_log.active) {
+        split_log_setup();
+    }
 
     /*
      * #326: resolve each VM's media, AFTER every host-discovery pass (NVMe, USB, then AHCI) has
