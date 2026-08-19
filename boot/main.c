@@ -2288,6 +2288,11 @@ static void term_run_cmdline(void) {
         case HYPE_CMD_CREATE:
             term_create_begin();
             break;
+        case HYPE_CMD_SCREENSHOT:
+            /* #568: the same capture the hotkey performs. term_take_screenshot() reports its own
+             * outcome on every path, including where it saved to, so nothing is needed here. */
+            term_take_screenshot();
+            break;
         case HYPE_CMD_UNKNOWN:
             /*
              * #566: this used to share the CREATE arm, so ANY typo silently started the VM
@@ -13214,6 +13219,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      g_hid_polls, g_hid_reports, g_hid_poll_errs,
                                      g_hid_slot, g_hid_ep, g_hostkbd_scancodes,
                                      g_hostkbd_chords);
+                }
+                /*
+                 * #568: Print Screen / SysRq seen without both modifiers. Reported only when it
+                 * has happened, so it is silence-by-default and a real signal when present: on
+                 * the Intel laptop the operator pressed the screenshot chord repeatedly and the
+                 * log contained no trace of either the key or a rejection, which made a missing
+                 * key indistinguishable from missing modifiers.
+                 */
+                if (g_hostin.chord.screenshot_near_miss != 0u) {
+                    hype_debug_print("fw-1 DIAG: screenshot key seen %u time(s) WITHOUT "
+                                     "Right-Ctrl+Right-Alt -- the chord needs all three; type "
+                                     "`screenshot` at the dashboard instead [#568]\n",
+                                     g_hostin.chord.screenshot_near_miss);
                 }
                 {
                     const hype_virtio_blk_depth_t *qd = hype_virtio_blk_depth();

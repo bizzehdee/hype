@@ -94,8 +94,11 @@ int main(void) {
 
     {
         unsigned i, n = hype_cmd_usage_count();
+        /* The range END must name the LAST verb in the enum before HYPE_CMD_UNKNOWN. Adding a
+         * verb without a usage entry (or the reverse) fails here, which is what caught #568's
+         * `screenshot` before it shipped half-added. */
         CHECK("one usage entry per verb",
-              n == (unsigned)(HYPE_CMD_SET - HYPE_CMD_HELP + 1));
+              n == (unsigned)(HYPE_CMD_SCREENSHOT - HYPE_CMD_HELP + 1));
         for (i = 0; i < n; i++) {
             hype_cmd_t c = P(hype_cmd_usage(i));
             if (c.verb == HYPE_CMD_UNKNOWN || c.verb == HYPE_CMD_NONE) {

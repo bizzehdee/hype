@@ -34,6 +34,14 @@ typedef enum {
     HYPE_CMD_CONFIG,
     HYPE_CMD_HOST,       /* M9-2 (#175): host-wide reboot/off -- shut every guest down first */
     HYPE_CMD_SET,        /* TERM-14 (#490): set <vm> <key> <value> -- edit config, write back */
+    /*
+     * #568: capture the screen to a PNG. A SECOND trigger for what was a hotkey only:
+     * Right-Ctrl+Right-Alt+Print Screen needs three keys laptops vary on -- Print Screen is
+     * often behind Fn and resolved in keyboard firmware, Right-Alt is AltGr on many layouts,
+     * and some compact keyboards have no Right-Ctrl at all. On the Intel laptop the chord never
+     * fired. A verb works on any keyboard that can type.
+     */
+    HYPE_CMD_SCREENSHOT,
     HYPE_CMD_UNKNOWN,
 } hype_cmd_verb_t;
 

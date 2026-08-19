@@ -5,6 +5,13 @@ void hype_chord_state_reset(hype_chord_state_t *state) {
     state->right_alt_held = 0;
     state->pending_extended = 0;
     state->printscreen_step = 0;
+    /*
+     * #568: added with the field. This function sets every member by name rather than zeroing the
+     * struct, so a new member is uninitialised until it is listed HERE -- the tests read a
+     * constant 4 from uninitialised stack until this line existed, which is exactly the failure a
+     * field-by-field reset invites.
+     */
+    state->screenshot_near_miss = 0u;
 }
 
 hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t byte) {
@@ -61,6 +68,13 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
                     result.vm_index = 0;
                     return result;
                 }
+                /*
+                 * #568: Print Screen arrived WITHOUT both modifiers. Recorded so the caller can
+                 * say so: on the Intel laptop the operator pressed this repeatedly and nothing
+                 * happened, and with no trace at all a key that was never delivered looked
+                 * identical to a chord that was seen and rejected. Those are different faults.
+                 */
+                state->screenshot_near_miss++;
                 return none;
             }
             /* `E0 37` without the preceding `E0 2A` this same press -- not Print Screen at
@@ -106,6 +120,7 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
             result.vm_index = 0;
             return result;
         }
+        state->screenshot_near_miss++; /* #568: seen, but without both modifiers */
         return none;
     }
     if (byte == HYPE_SCANCODE_SYSRQ_BREAK) {

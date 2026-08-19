@@ -94,6 +94,14 @@ typedef struct {
      * interrupted by another key, since the make sequence is emitted atomically by real
      * hardware. */
     int printscreen_step;
+    /*
+     * #568: Print Screen / SysRq seen WITHOUT both modifiers held. Counted rather than acted on,
+     * so a chord that was pressed and rejected is distinguishable from one that never arrived at
+     * all. On the Intel laptop the operator pressed the screenshot chord repeatedly and there was
+     * no trace of either case -- the two are different faults (a keyboard that does not emit the
+     * key, versus modifiers the layout does not have) and need different fixes.
+     */
+    unsigned int screenshot_near_miss;
 } hype_chord_state_t;
 
 void hype_chord_state_reset(hype_chord_state_t *state);

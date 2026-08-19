@@ -384,6 +384,47 @@ static void test_unrelated_plain_key_is_ignored_and_held_state_survives(void) {
               HYPE_CHORD_ACTION_TOGGLE_DASHBOARD, result.action);
 }
 
+/*
+ * #568: a screenshot chord that arrives WITHOUT both modifiers must be counted, not merely
+ * ignored. On the Intel laptop the operator pressed the chord repeatedly and nothing happened;
+ * with no trace at all, a key the keyboard never emitted looked identical to a chord that was
+ * seen and rejected. Those are different faults -- one is a missing key, the other missing
+ * modifiers -- and they need different fixes, so the counter has to tell them apart.
+ */
+static void test_near_miss_distinguishes_pressed_from_never_arrived(void) {
+    hype_chord_state_t state;
+    hype_chord_result_t result;
+
+    /* SysRq with no modifiers: no action, but it WAS seen. */
+    hype_chord_state_reset(&state);
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_SYSRQ_MAKE);
+    CHECK_HEX("bare SysRq takes no action", HYPE_CHORD_ACTION_NONE, result.action);
+    CHECK_HEX("bare SysRq is counted as a near miss", 1u, state.screenshot_near_miss);
+
+    /* Print Screen's full two-byte sequence with no modifiers: same. */
+    hype_chord_state_reset(&state);
+    feed_extended(&state, HYPE_SCANCODE_PRINTSCREEN_MAKE_1);
+    /* Both halves are EXTENDED-prefixed (E0 2A E0 37); the near-miss lives in that branch, so
+     * feeding the second byte bare would test a different path entirely. */
+    hype_chord_feed_scancode(&state, HYPE_SCANCODE_EXTENDED_PREFIX);
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_PRINTSCREEN_MAKE_2);
+    CHECK_HEX("bare PrtScn takes no action", HYPE_CHORD_ACTION_NONE, result.action);
+    CHECK_HEX("bare PrtScn is counted as a near miss", 1u, state.screenshot_near_miss);
+
+    /* A key that never arrives leaves the counter at zero -- the whole point of the distinction. */
+    hype_chord_state_reset(&state);
+    (void)hype_chord_feed_scancode(&state, HYPE_SCANCODE_RIGHT_CTRL_MAKE);
+    CHECK_HEX("a modifier alone is not a near miss", 0u, state.screenshot_near_miss);
+
+    /* And a SUCCESSFUL chord is not a near miss either. */
+    hype_chord_state_reset(&state);
+    feed_extended(&state, HYPE_SCANCODE_RIGHT_CTRL_MAKE);
+    feed_extended(&state, HYPE_SCANCODE_RIGHT_ALT_MAKE);
+    result = hype_chord_feed_scancode(&state, HYPE_SCANCODE_SYSRQ_MAKE);
+    CHECK_HEX("the full chord still fires", HYPE_CHORD_ACTION_SCREENSHOT, result.action);
+    CHECK_HEX("a successful chord is not a near miss", 0u, state.screenshot_near_miss);
+}
+
 int main(void) {
     test_reset_clears_held_state();
     test_extended_prefix_alone_produces_no_action();
@@ -409,6 +450,7 @@ int main(void) {
     test_screenshot_without_both_modifiers_is_ignored();
     test_printscreen_second_half_alone_is_not_mistaken_for_the_chord();
     test_printscreen_sequence_interrupted_does_not_fire_later();
+    test_near_miss_distinguishes_pressed_from_never_arrived();
 
     if (failures == 0) {
         printf("all tests passed\n");
