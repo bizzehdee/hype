@@ -138,6 +138,17 @@ SFDISK
         mmd -i "$ESP@@1M" ::/input 2>/dev/null || true
         mcopy -i "$ESP@@1M" "$HYPE_INPUT" ::/input/vm0.txt
     fi
+    # #452: per-VM scripts, space separated, dropped at \input\vm0.txt, vm1.txt, ... hype reads
+    # \input\vmN.txt for any N now (it used to read vm0's or else vm1's, so every VM from the
+    # third onward ran vm1's script), and this is how a rig exercises more than one of them.
+    if [ -n "${HYPE_INPUTS:-}" ]; then
+        mmd -i "$ESP@@1M" ::/input 2>/dev/null || true
+        _n=0
+        for _s in $HYPE_INPUTS; do
+            mcopy -i "$ESP@@1M" "$_s" "::/input/vm$_n.txt"
+            _n=$((_n + 1))
+        done
+    fi
     # HYPE_DISK=<path> drops a raw disk image at \hype\disks\<basename>, which a hype.cfg
     # `[disk.*] backing = file` entry can then point at.
     # Several images may be given, space separated, for a multi-disk config (#329).

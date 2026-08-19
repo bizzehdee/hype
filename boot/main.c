@@ -2030,6 +2030,8 @@ static hype_fs_t *fw_1_boot_volume(void);
 static void load_hype_cfg(void);
 /* #451: defined with the Phase 1 loaders; the VM-restart path re-reads through it. */
 static int fw_1_read_firmware_images(uint64_t dst_phys, uint64_t mapped_size);
+/* #452: read in Phase 1 now; defined with the other config-fed loaders. */
+static void load_input_script(hype_fw_vm_t *vm, unsigned vm_index);
 
 /* TERM-6 (#444): needs g_hype_cfg, hence the forward declaration. `idx` is
  * the VM index term_run_cmdline already resolved from the command's arg. */
@@ -4362,14 +4364,6 @@ static void run_m4_5_ahci_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) 
 #define HYPE_ISO_2_AHCI_GPA (HYPE_M4_5_AHCI_GPA + HYPE_PAGING_2MB)
 #define HYPE_ISO_2_PVD_LBA 16 /* ISO9660 Primary Volume Descriptor: always the 17th 2048-byte sector */
 
-static uint8_t g_iso_2_cmd_list[4096] __attribute__((aligned(4096)));
-static uint8_t g_iso_2_cmd_table[4096] __attribute__((aligned(4096)));
-static uint8_t g_iso_2_rx_fis[4096] __attribute__((aligned(4096)));
-static uint8_t g_iso_2_dest_buffer[HYPE_ATAPI_SECTOR_SIZE] __attribute__((aligned(4096)));
-static uint8_t g_iso_2_guest_code[256] __attribute__((aligned(4096)));
-static uint8_t g_iso_2_guest_stack[4096] __attribute__((aligned(4096)));
-static hype_ahci_t g_iso_2_ahci;
-static hype_atapi_t g_iso_2_atapi;
 
 /*
  * #326: the ONLY ISO bytes hype still copies into RAM, and a bounded 64 KiB of them.
@@ -4383,145 +4377,20 @@ static hype_atapi_t g_iso_2_atapi;
  * removing what #326 is actually about: the multi-GB whole-file copy that capped ISO size at
  * contiguous AllocatePages.
  */
-#define HYPE_ISO_2_HEAD_BYTES (64u * 1024u)
-static uint8_t g_iso_2_head[HYPE_ISO_2_HEAD_BYTES];
-static uint64_t g_iso_2_head_len;
 
 /*
- * ISO-2: backs M4-5's own AHCI/ATAPI in-memory model with ISO-1's real
- * loaded head of \iso\test.iso (g_iso_2_head, #326) instead of a
- * synthetic pattern -- otherwise an exact copy of M4-5's own test
- * guest (same payload template, same fixed-address convention; PCI
- * discovery is PCI-2's own separate concern, not needed here). Reads
- * LBA 16, the ISO9660 Primary Volume Descriptor sector (always the
- * 17th 2048-byte sector, ECMA-119 SS8.4), and verifies both a
- * byte-for-byte match against the real file content at that same
- * offset *and* the "CD001" identifier at the sector's own byte offset
- * 1 -- the same signature ISO-1 already verified via direct UEFI file
- * I/O, now confirmed reachable through the emulated AHCI/ATAPI
- * hardware path instead.
+ * #452: run_iso_2_test and its 64 KiB head buffer are RETIRED.
+ *
+ * ISO-2 proved that the emulated AHCI/ATAPI path delivers real ISO content, by comparing an
+ * emulated read of the ISO9660 PVD at LBA 16 against the same bytes read directly. Keeping it
+ * meant keeping a UEFI Simple File System read alive in Phase 0 purely to fill its buffer -- and
+ * the battery is dispatched before host media discovery, so it cannot be repointed at the stream
+ * that serves every real guest.
+ *
+ * Its assertion is subsumed by that streaming path, which every guest boot exercises for real and
+ * which reports its own counters (ATAPIOPS, the READ(10) histogram in DIAG). Decision 37's bar is
+ * that Phase 0 does no file I/O; a microtest is not a reason to miss it.
  */
-static void run_iso_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    unsigned long long i;
-    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
-    uint64_t cmd_list_phys, cmd_table_phys, rx_fis_phys, dest_phys;
-    const uint8_t *iso_bytes;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-
-    (void)ops; /* VMX-2: runs under SVM and VMX now. */
-
-    hype_guest_ram_zero(g_iso_2_cmd_list, sizeof(g_iso_2_cmd_list));
-    hype_guest_ram_zero(g_iso_2_cmd_table, sizeof(g_iso_2_cmd_table));
-    hype_guest_ram_zero(g_iso_2_rx_fis, sizeof(g_iso_2_rx_fis));
-    hype_guest_ram_zero(g_iso_2_dest_buffer, sizeof(g_iso_2_dest_buffer));
-    hype_guest_ram_zero(g_iso_2_guest_code, sizeof(g_iso_2_guest_code));
-    hype_guest_ram_zero(g_iso_2_guest_stack, sizeof(g_iso_2_guest_stack));
-
-    /* #326: no media configured (boot=disk, or none found) means there is nothing for this test to
-     * verify. Skip cleanly -- it used to be handed a NULL buffer with size 0 and would have failed
-     * the byte comparison against address 0. */
-    if (g_iso_2_head_len == 0) {
-        hype_debug_print("iso-2: no installer media head loaded -- test skipped\n");
-        return;
-    }
-    hype_atapi_reset(&g_iso_2_atapi, g_iso_2_head, g_iso_2_head_len);
-    hype_ahci_reset(&g_iso_2_ahci);
-
-    cmd_list_phys = (uint64_t)(uintptr_t)g_iso_2_cmd_list;
-    cmd_table_phys = (uint64_t)(uintptr_t)g_iso_2_cmd_table;
-    rx_fis_phys = (uint64_t)(uintptr_t)g_iso_2_rx_fis;
-    dest_phys = (uint64_t)(uintptr_t)g_iso_2_dest_buffer;
-
-    hype_write_le32(g_iso_2_cmd_list + 0, 0x00010025u);
-    hype_write_le32(g_iso_2_cmd_list + 4, 0);
-    hype_write_le32(g_iso_2_cmd_list + 8, (uint32_t)cmd_table_phys);
-    hype_write_le32(g_iso_2_cmd_list + 12, (uint32_t)(cmd_table_phys >> 32));
-
-    g_iso_2_cmd_table[0] = 0x27;
-    g_iso_2_cmd_table[1] = 0x80;
-    g_iso_2_cmd_table[2] = 0xA0;
-    g_iso_2_cmd_table[0x40 + 0] = HYPE_ATAPI_CMD_READ10;
-    g_iso_2_cmd_table[0x40 + 5] = HYPE_ISO_2_PVD_LBA; /* LBA low byte */
-    g_iso_2_cmd_table[0x40 + 8] = 1;                  /* transfer length: 1 block */
-    hype_write_le32(g_iso_2_cmd_table + 0x80 + 0, (uint32_t)dest_phys);
-    hype_write_le32(g_iso_2_cmd_table + 0x80 + 4, (uint32_t)(dest_phys >> 32));
-    hype_write_le32(g_iso_2_cmd_table + 0x80 + 12, HYPE_ATAPI_SECTOR_SIZE - 1u);
-
-    for (i = 0; i < sizeof(g_m4_5_payload_template); i++) {
-        g_iso_2_guest_code[i] = g_m4_5_payload_template[i];
-    }
-    hype_write_le64(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_RBX_IMM_OFFSET, HYPE_ISO_2_AHCI_GPA);
-    hype_write_le32(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_CLB_LOW_IMM_OFFSET, (uint32_t)cmd_list_phys);
-    hype_write_le32(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_CLB_HIGH_IMM_OFFSET,
-                     (uint32_t)(cmd_list_phys >> 32));
-    hype_write_le32(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_FB_LOW_IMM_OFFSET, (uint32_t)rx_fis_phys);
-    hype_write_le32(g_iso_2_guest_code + HYPE_M4_5_PAYLOAD_FB_HIGH_IMM_OFFSET,
-                     (uint32_t)(rx_fis_phys >> 32));
-
-    entry_rip = (uint64_t)(uintptr_t)g_iso_2_guest_code;
-    rsp = (uint64_t)(uintptr_t)(g_iso_2_guest_stack + sizeof(g_iso_2_guest_stack));
-
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
-    hype_npt_mark_not_present(g_npt_pd, HYPE_ISO_2_AHCI_GPA);
-    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
-
-    hype_debug_print("iso-2: entry_rip=0x%llx ahci_gpa=0x%llx reading real ISO LBA %u\n",
-                      (unsigned long long)entry_rip, (unsigned long long)HYPE_ISO_2_AHCI_GPA,
-                      HYPE_ISO_2_PVD_LBA);
-
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
-    if (ctx == 0) {
-        hype_fatal("iso-2: vcpu_create_long_mode failed");
-    }
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_ept_mark_mmio_hole(HYPE_ISO_2_AHCI_GPA);
-    }
-
-    for (;;) {
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("iso-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-        }
-
-        if (vmm_reason_is_npf(kind, info.reason)) {
-            if (vmm_handle_ahci_npf(kind, ctx, &g_iso_2_ahci, &g_iso_2_atapi, HYPE_ISO_2_AHCI_GPA) !=
-                0) {
-                hype_fatal("iso-2: unhandled/unrecognized AHCI MMIO access (qual=0x%llx guest_rip=0x%llx)",
-                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
-            }
-            continue;
-        }
-
-        break;
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("iso-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-    }
-
-    iso_bytes = g_iso_2_head;
-    for (i = 0; i < HYPE_ATAPI_SECTOR_SIZE; i++) {
-        uint64_t file_offset = (uint64_t)HYPE_ISO_2_PVD_LBA * HYPE_ATAPI_SECTOR_SIZE + i;
-        if (g_iso_2_dest_buffer[i] != iso_bytes[file_offset]) {
-            hype_fatal("iso-2: AHCI/ATAPI READ(10) mismatch at byte %llu: got 0x%x, expected 0x%x", i,
-                       g_iso_2_dest_buffer[i], iso_bytes[file_offset]);
-        }
-    }
-    if (g_iso_2_dest_buffer[1] != 'C' || g_iso_2_dest_buffer[2] != 'D' || g_iso_2_dest_buffer[3] != '0' ||
-        g_iso_2_dest_buffer[4] != '0' || g_iso_2_dest_buffer[5] != '1') {
-        hype_fatal("iso-2: \"CD001\" identifier missing from the AHCI/ATAPI-read sector");
-    }
-
-    hype_debug_print(
-        "iso-2: AHCI/ATAPI test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- real ISO LBA "
-        "%u read byte-for-byte via emulated hardware, \"CD001\" identifier verified\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_ISO_2_PVD_LBA);
-}
-
 /*
  * VIDEO-2: exercises devices/ramfb.h/fw_cfg.c's new writable-file DMA
  * WRITE path against the exact "etc/ramfb" protocol this project's own
@@ -9441,6 +9310,11 @@ static void fw_1_debug_feed(unsigned vm_idx, hype_vt_filter_t *filter, char *lin
  * hit. First valid, non-empty, non-live buffer wins. Always reports its
  * outcome (RT-1d) and always deletes any stale \hype-log.txt (retired in
  * RT-2a) so a ghost file can never masquerade as a fresh log. */
+/* #452: the prior boot's log, copied pre-EBS and written in Phase 1. */
+static const char *g_prev_log_data;
+static unsigned int g_prev_log_len;
+static int g_prev_log_truncated;
+
 static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
                                const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size, UINTN desc_size) {
     EFI_FILE_PROTOCOL *root = 0;
@@ -9474,31 +9348,79 @@ static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
         }
     }
 
-    /* Locate the boot volume once, whether or not we found a prior log: we
-     * always want to delete a stale \hype-log.txt, and write \hype-log-prev.txt
-     * if there is something to recover. A non-FAT/read-only volume just means
-     * the on-screen outcome line below is the only record. */
-    if (hype_file_locate_root(image_handle, bs, &root) == EFI_SUCCESS && root != 0) {
-        hype_file_delete(root, (CHAR16 *)L"\\hype-log.txt"); /* RT-2a: no longer written; kill the ghost */
-        hype_file_delete(root, (CHAR16 *)L"\\hype-log-prev.txt");
-        if (found != 0 &&
-            hype_file_write_new(root, (CHAR16 *)L"\\hype-log-prev.txt", found->data,
-                                (UINTN)found->len) == EFI_SUCCESS) {
-            hype_debug_print("RT-1b: recovered %u bytes of the previous boot's log%s -> "
-                             "\\hype-log-prev.txt\n",
-                             (unsigned int)found->len, found->truncated ? " (truncated)" : "");
-            return;
-        }
-    }
-
+    /*
+     * #452: the SCAN stays here -- it needs the memory map, which firmware frees at EBS -- but the
+     * WRITE moves to Phase 1, through hype's own storage stack. This was the last file hype wrote
+     * through firmware, and decision 37's bar is that Phase 0 does no file I/O at all.
+     *
+     * The bytes are COPIED rather than remembered by pointer. The prior log sits in memory the
+     * #449 pool reservation may cover, and a Phase 1 carve zeroes what it hands out -- so a
+     * pointer held across that boundary would be read after the region it names was wiped.
+     */
     if (found == 0) {
         hype_debug_print("RT-1b: no prior boot log found in RAM (expected after a cold power "
                          "cycle; persistent live-run capture is on USB)\n");
-    } else {
-        hype_debug_print("RT-1b: found %u bytes of prior log but could not write it (no "
-                         "writable boot volume)\n",
-                         (unsigned int)found->len);
+        return;
     }
+    {
+        void *buf = 0;
+        UINTN want = (UINTN)found->len;
+        if (bs->AllocatePool(EfiLoaderData, want, &buf) != EFI_SUCCESS || buf == 0) {
+            hype_debug_print("RT-1b: found %u bytes of prior log but could not reserve a buffer to "
+                             "carry it past ExitBootServices [#452]\n", (unsigned int)found->len);
+            return;
+        }
+        {
+            const unsigned char *src = (const unsigned char *)found->data;
+            unsigned char *dst = (unsigned char *)buf;
+            UINTN k;
+            for (k = 0; k < want; k++) {
+                dst[k] = src[k];
+            }
+        }
+        g_prev_log_data = (const char *)buf;
+        g_prev_log_len = (unsigned int)want;
+        g_prev_log_truncated = found->truncated ? 1 : 0;
+        hype_debug_print("RT-1b: found %u bytes of the previous boot's log%s -- carried past EBS, "
+                         "written in Phase 1 [#452]\n", (unsigned int)found->len,
+                         found->truncated ? " (truncated)" : "");
+    }
+    (void)image_handle;
+    (void)root;
+}
+
+/*
+ * #452: write the previous boot's log in Phase 1, through hype's own stack.
+ *
+ * Also deletes the two ghosts RT-2a left behind, for the same reason it did: a stale
+ * \hype-log.txt on the volume reads as this run's log and is not.
+ */
+static void fw_1_write_prev_log(void) {
+    hype_fs_t *bv = fw_1_boot_volume();
+    hype_fs_file_t f;
+
+    if (bv == 0) {
+        if (g_prev_log_len != 0u) {
+            hype_debug_print("RT-1b: %u bytes of prior log recovered but there is no writable boot "
+                             "volume to put them on [#452]\n", g_prev_log_len);
+        }
+        return;
+    }
+    (void)hype_fs_unlink(bv, "\\hype-log.txt");
+    (void)hype_fs_unlink(bv, "\\hype-log-prev.txt");
+    if (g_prev_log_len == 0u || g_prev_log_data == 0) {
+        return;
+    }
+    if (hype_fs_create(bv, "\\hype-log-prev.txt", &f) != 0 ||
+        hype_fs_append(&f, g_prev_log_data, g_prev_log_len) != 0) {
+        hype_debug_print("RT-1b: could not write \\hype-log-prev.txt through hype's own stack "
+                         "(%u bytes recovered) [#452]\n", g_prev_log_len);
+        return;
+    }
+    (void)hype_fs_sync(bv);
+    hype_debug_print("RT-1b: recovered %u bytes of the previous boot's log%s -> "
+                     "\\hype-log-prev.txt, written through hype's own stack [#452]\n",
+                     g_prev_log_len, g_prev_log_truncated ? " (truncated)" : "");
 }
 
 /*
@@ -13430,6 +13352,9 @@ static void fw_1_phase1_firmware(void) {
 }
 
 static void fw_1_phase1_config(void) {
+    /* #452: the previous boot's log first -- it is the one thing a failed run leaves, and
+     * writing it before anything else means a later fault here does not cost it. */
+    fw_1_write_prev_log();
     load_hype_cfg();
     fw_1_phase1_firmware();
 
@@ -13517,6 +13442,14 @@ static void fw_1_phase1_config(void) {
             fw_1_resolve_guest_ram(&g_vms[vi], &g_hype_cfg, vi);
             fw_1_resolve_os_hint(&g_vms[vi], &g_hype_cfg, vi);
             fw_1_resolve_vcpus(&g_vms[vi], &g_hype_cfg, vi);
+        }
+    }
+
+    /* #452: every VM's scripted input, for the VMs that will actually run. */
+    {
+        unsigned vi;
+        for (vi = 0; vi < g_vm_count; vi++) {
+            load_input_script(&g_vms[vi], vi);
         }
     }
 
@@ -19058,7 +18991,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     HYPE_ST_RUN(10, run_ram_1_test(args->ops, args->kind));
     HYPE_ST_RUN(11, run_pci_1_test(args->ops, args->kind));
     HYPE_ST_RUN(12, run_pci_2_test(args->ops, args->kind));
-    HYPE_ST_RUN(13, run_iso_2_test(args->ops, args->kind));
+    /* 13 was ISO-2, retired in #452 -- see the note at its old definition. */
     HYPE_ST_RUN(14, run_video_3_test(args->ops, args->kind));
     HYPE_ST_RUN(15, run_m5_1_test(args->ops, args->kind));
     HYPE_ST_RUN(16, run_m5_2_test(args->ops, args->kind));
@@ -19992,34 +19925,6 @@ static int fw_1_resolve_media_stream(unsigned vi) {
  * Returns 0 and sets *out_len on success; -1 if the file is absent, too small, unreadable, or not an
  * ISO9660 image. Pre-EBS only: uses UEFI Simple File System.
  */
-static int load_iso_head(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable, CHAR16 *path,
-                         uint8_t *buf, unsigned buflen, uint64_t *out_len) {
-    EFI_FILE_PROTOCOL *root = 0;
-    UINT64 iso_size = 0;
-    uint64_t want;
-
-    *out_len = 0;
-    if (hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root) != EFI_SUCCESS) {
-        return -1;
-    }
-    if (hype_file_get_size(root, SystemTable->BootServices, path, &iso_size) != EFI_SUCCESS) {
-        return -1; /* file absent */
-    }
-    if (iso_size < 32769 + 5) {
-        return -1;
-    }
-    want = (iso_size < (uint64_t)buflen) ? iso_size : (uint64_t)buflen;
-    if (hype_file_read_range(root, path, 0, buf, (UINTN)want) != EFI_SUCCESS) {
-        return -1;
-    }
-    if (buf[32769] != 'C' || buf[32770] != 'D' || buf[32771] != '0' || buf[32772] != '0' ||
-        buf[32773] != '1') {
-        return -1; /* not a real ISO9660 image */
-    }
-    *out_len = want;
-    return 0;
-}
-
 /*
  * CONFIG-4 (#225): the ESP loader half of the hype.cfg layer. The parser
  * (core/cfg.c) is pure text-in/struct-out and fully unit-tested; this is the
@@ -20072,40 +19977,48 @@ static uint64_t fw_1_fnv1a(const void *data, uint64_t len) {
  */
 static char g_in_script_text[8192];
 
-static void load_input_script(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable,
-                              hype_fw_vm_t *vm, unsigned vm_index) {
-    EFI_FILE_PROTOCOL *root = 0;
-    EFI_STATUS st;
+/*
+ * #452: read a VM's scripted input in Phase 1, through hype's own storage stack.
+ *
+ * This was the caller whose own comment said it sat at "the last point where the UEFI Simple File
+ * System is usable" -- a statement #450 and #451 already made false. Scripts are only consumed
+ * once a guest is running, so there was never ordering pressure to read them early.
+ *
+ * Also generalised from two VMs to any number: the path was `vm0.txt` or else `vm1.txt`, so every
+ * VM from the third onward read vm1's script. Same two-VM assumption class as #393.
+ */
+static void load_input_script(hype_fw_vm_t *vm, unsigned vm_index) {
+    hype_fs_t *bv;
+    hype_fs_file_t f;
     UINT64 sz = 0;
     hype_input_parse_result_t pr;
-    CHAR16 *path = (vm_index == 0u) ? (CHAR16 *)L"\\input\\vm0.txt" : (CHAR16 *)L"\\input\\vm1.txt";
-    const char *pname = (vm_index == 0u) ? "\\input\\vm0.txt" : "\\input\\vm1.txt";
+    static char pathbuf[32];
+    const char *pname = pathbuf;
 
     vm->in_script_armed = 0;
     vm->in_script.count = 0;
 
-    st = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
-    if (st != EFI_SUCCESS || root == 0) {
-        hype_debug_print("input: vm%u cannot open ESP root (0x%llx) -- no scripted input\n",
-                         vm_index, (unsigned long long)st);
+    hype_snprintf(pathbuf, sizeof(pathbuf), "\\input\\vm%u.txt", vm_index);
+
+    bv = fw_1_boot_volume();
+    if (bv == 0) {
+        hype_debug_print("input: vm%u no boot volume -- no scripted input\n", vm_index);
         return;
     }
-    st = hype_file_get_size(root, SystemTable->BootServices, path, &sz);
-    if (st != EFI_SUCCESS) {
+    if (hype_fs_lookup(bv, pathbuf, &f) != 0) {
         hype_debug_print("input: vm%u no %s -- no scripted input (this is the default)\n", vm_index,
                          pname);
         return;
     }
+    sz = f.size;
     if (sz == 0 || sz >= sizeof(g_in_script_text)) {
         hype_debug_print("input: vm%u %s size %llu unusable (1..%llu) -- no scripted input\n",
                          vm_index, pname, (unsigned long long)sz,
                          (unsigned long long)(sizeof(g_in_script_text) - 1u));
         return;
     }
-    st = hype_file_read_range(root, path, 0, g_in_script_text, (UINTN)sz);
-    if (st != EFI_SUCCESS) {
-        hype_debug_print("input: vm%u read %s failed (0x%llx) -- no scripted input\n", vm_index,
-                         pname, (unsigned long long)st);
+    if (hype_fs_read_at(&f, 0ull, g_in_script_text, (unsigned int)sz) != 0) {
+        hype_debug_print("input: vm%u read %s failed -- no scripted input\n", vm_index, pname);
         return;
     }
 
@@ -22761,13 +22674,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * unconditionally even when only one runs -- an absent file is the normal case
      * and costs one log line.
      */
-    /* #450: for every VM Phase 0 allocated for. The config is read in Phase 1, so keying this to
-     * g_vm_count would load scripts for the built-in two and silently skip every VM a real config
-     * declares -- and this is the last point the UEFI Simple File System is usable. */
-    load_input_script(ImageHandle, SystemTable, &g_vms[0], 0u);
-    for (unsigned vi = 1u; vi < g_max_vms; vi++) { /* #414 */
-        load_input_script(ImageHandle, SystemTable, &g_vms[vi], vi);
-    }
+    /* #452: input scripts are read in Phase 1 now, through hype's own stack. */
 
     SystemTable->BootServices->FreePool(map);
 
@@ -23123,54 +23030,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                           (unsigned long long)(vm->ram_bytes / (1024ULL * 1024ULL)),
                           (unsigned long long)g_fw_1_ram_host_phys);
 
-        /*
-         * ISO-1 / #261 / #326: read the HEAD of vm0's installer media, for the ISO-2 microtest.
-         *
-         * This is no longer how a guest gets its media. Until #326 this loaded the WHOLE ISO into a
-         * RAM chunk list and that was the backing the guest CD was served from; guests are now served
-         * exclusively by streaming (fw_1_resolve_media_stream). What remains is a bounded 64 KiB
-         * read, done here because UEFI file services still exist, for a microtest that runs before
-         * any stream has been resolved.
-         *
-         * `boot = disk` still means no media -- but note the decision that MATTERS now lives in the
-         * streaming resolver, not here: this read only affects whether a microtest has something to
-         * verify.
-         */
-        {
-            const hype_cfg_vm_t *cv = (g_hype_cfg.vm_count > 0u) ? &g_hype_cfg.vms[0] : 0;
-            static uint16_t iso_path_w[HYPE_CFG_PATH_MAX];
-            CHAR16 *iso_path = (CHAR16 *)L"\\iso\\test.iso";
-
-            if (cv != 0 && cv->boot == HYPE_CFG_BOOT_DISK) {
-                g_iso_2_head_len = 0;
-                hype_debug_print("iso-1: vm0 boot=disk -- no installer media\n");
-            } else {
-                /* #322: through the shared chooser, so this and the streaming resolver cannot
-                 * disagree about which ISO the operator asked for. */
-                const char *want = fw_1_media_path(0u);
-                if (hype_ascii_to_utf16(want, iso_path_w,
-                                        (unsigned long long)HYPE_CFG_PATH_MAX) == 0) {
-                    iso_path = (CHAR16 *)iso_path_w;
-                } else {
-                    hype_debug_print("iso-1: media path '%s' is not usable (too long or "
-                                     "non-ASCII) -- falling back to the built-in default\n", want);
-                }
-                if (load_iso_head(ImageHandle, SystemTable, iso_path, g_iso_2_head,
-                                  HYPE_ISO_2_HEAD_BYTES, &g_iso_2_head_len) != 0) {
-                    /* Not a panic, and NOT a media failure either: the guest's media comes from the
-                     * streaming resolver, which has not run yet. Only ISO-2 loses its input. */
-                    g_iso_2_head_len = 0;
-                    hype_debug_print("iso-1: could not read the head of vm0's media via UEFI "
-                                     "(absent, unreadable, or not an ISO9660 image) -- the ISO-2 "
-                                     "microtest will skip; guest media is unaffected\n");
-                } else {
-                    hype_debug_print("iso-1: read %llu bytes of vm0's media head, \"CD001\" "
-                                     "verified -- ISO-2 input ready (guest media is STREAMED, "
-                                     "not this)\n", (unsigned long long)g_iso_2_head_len);
-                }
-            }
-        }
-
+        /* #452: the ISO-1 head read is gone with the ISO-2 microtest it fed -- the streaming
+         * resolver is the only media path, and it runs in Phase 1. */
         /* M5-7 (#196): allocate vm0's virtio-blk scratch disk backing pre-EBS
          * (AllocatePages is gone afterward), zeroed so the guest sees a blank
          * disk. Later steps swap the backend to a raw file / physical disk. */

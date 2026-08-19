@@ -102,6 +102,7 @@ $(BUILD_DIR)/%.o: %.S
 $(OUT): $(OBJS)
 	$(LD) $(LDFLAGS) -out:$@ $(OBJS)
 	@tools/check-no-vex.sh $(OUT)
+	@tools/check-no-preebs-fileio.sh boot/main.c
 
 test:
 	core/tests/run.sh
