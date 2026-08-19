@@ -442,25 +442,23 @@ static uint64_t g_m2_7_guest_code_phys;
 static uint64_t g_m2_7_guest_stack_top_phys;
 
 /*
- * RAM-1: a real, mem_mb-sized guest RAM region -- the first guest
- * memory in this project that isn't a small, fixed-size static array.
- * Allocated via AllocatePages(AllocateAnyPages) (no address
- * constraint, unlike g_m2_7's below-4GB requirement above: this
- * region is only ever used by a long-mode guest, whose CS.base is
- * architecturally forced to 0, so the same 32-bit segment-base
- * truncation risk doesn't apply here) on the BSP before MP dispatch,
- * same timing/ordering reasoning as g_m2_7_guest_code_phys. Sized from
- * HYPE_RAM_1_TEST_MEM_MB, standing in for a real per-VM mem_mb until a
- * real hype.cfg is actually read from the ESP (a separate, later piece
- * -- see the RAM-1 ticket) -- gated by ADM-1's own already-tested
- * hype_adm_check_memory() against this machine's real usable RAM
- * (computed in efi_main(), see usable_ram_bytes), the first time that
- * check runs in the real boot path rather than only under its own
- * unit tests.
+ * #536: RAM-1's 64 MB guest-RAM allocation, its NPT-coverage arithmetic and its whole test guest
+ * are gone -- ported to tests/micro/ram1.c, booted as a configured VM (`boot = kernel`, #535).
+ *
+ * The port is not a like-for-like move. The in-binary test's guest was `hlt; jmp $-3` and its only
+ * assertion was host-side: the guest halted, therefore its first instruction fetch had been
+ * translatable. The micro-kernel walks every page of the RAM its e820 reports, in two separate
+ * passes -- write everything, then verify everything -- which additionally catches pages that
+ * ALIAS and a nested map that falls short of the configured mem_mb. Neither is visible from a
+ * clean halt.
+ *
+ * What made the in-binary version necessary is also gone: it computed its own NPT coverage because
+ * its guest's page tables were static arrays in hype's image, placed wherever UEFI loaded it
+ * (observed ~5.4 GB) and far from the guest RAM AllocatePages returned. A configured VM's page
+ * tables live inside its own guest RAM at GPA 0x1000 (hype_paging_build_identity_at), so "the map
+ * must also reach the tables" -- #206, the bug that arithmetic existed for -- holds by
+ * construction rather than by calculation.
  */
-#define HYPE_RAM_1_TEST_MEM_MB 64u
-static uint64_t g_ram_1_base_phys;
-static uint64_t g_ram_1_size_bytes;
 
 /*
  * FW-1: this project's own vendored guest firmware (M4-2), read from
@@ -507,7 +505,7 @@ static uint64_t g_ram_1_size_bytes;
  * services would ever touch VARS, so this is unlikely to matter yet.
  *
  * Loaded once, on the BSP in efi_main() before MP dispatch (same
- * ordering/reasoning as g_m2_7_guest_code_phys/g_ram_1_base_phys
+ * ordering/reasoning as g_m2_7_guest_code_phys
  * above -- Boot Services calls from a non-BSP AP context is untested
  * territory this project has deliberately avoided all session).
  */
@@ -7075,144 +7073,6 @@ static void run_input_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
         (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
         (unsigned int)HYPE_INPUT_2_TEST_STATUS, (unsigned int)HYPE_INPUT_2_TEST_DX,
         (unsigned int)HYPE_INPUT_2_TEST_DY, (unsigned int)HYPE_INPUT_2_MOUSE_VECTOR);
-}
-
-/*
- * RAM-1/RAM-2: exercises the new dynamically-allocated,
- * dynamically-NPT-sized guest RAM path (g_ram_1_base_phys/
- * g_ram_1_size_bytes, allocated in efi_main() before this test runs --
- * see that allocation's own comment for why it happens on the BSP
- * before MP dispatch rather than here). Deliberately trivial guest
- * code (a single HLT) -- what's actually being validated is that
- * dynamically-computed NPT/guest-CR3 coverage (hype_ram_1_gb_to_map())
- * genuinely reaches wherever AllocatePages(AllocateAnyPages) actually
- * put this allocation, not a fixed guess -- the same class of bug this
- * project already found and fixed the hard way on real hardware
- * (arch/x86_64/svm/npt.h's own HYPE_NPT_MAX_GB comment) for a
- * differently-sized gap (compiler-placed static buffers vs. firmware-
- * placed dynamic allocations).
- */
-static const uint8_t g_ram_1_payload[] = {
-    0xF4,      /* hlt */
-    0xEB, 0xFD /* jmp $-3 */
-};
-
-/* Computes how many GB hype_paging_build_identity()/
- * hype_npt_build_identity() need to map to cover guest-physical
- * address `end_phys` -- both builders map from GB index 0 upward (the
- * same shape as the host's own identity map and every existing guest/
- * NPT identity map here), so this is "round up to the next whole GB,"
- * not "map only the allocated region in isolation." Bounded by
- * HYPE_PAGING_MAX_GB, the actual compile-time capacity of every
- * g_npt_pd/g_guest_pd-style array in this file -- fails closed rather
- * than silently overrunning a static array if a future, much larger
- * mem_mb ever needs more than that. */
-static unsigned int hype_ram_1_gb_to_map(uint64_t end_phys) {
-    unsigned int gb = (unsigned int)((end_phys + HYPE_PAGING_1GB - 1) / HYPE_PAGING_1GB);
-
-    if (gb == 0) {
-        gb = 1;
-    }
-    if (gb > HYPE_PAGING_MAX_GB) {
-        hype_fatal("ram-1: guest RAM allocation needs %u GB of identity map, only %u available", gb,
-                   HYPE_PAGING_MAX_GB);
-    }
-    return gb;
-}
-
-static uint64_t hype_ram_1_max_u64(uint64_t a, uint64_t b) { return a > b ? a : b; }
-
-/*
- * The NPT has to cover strictly more than the dynamic RAM allocation.
- * EVERY guest-physical address the guest touches is translated through
- * it -- and that includes the guest's own page tables, which are static
- * arrays in hype's image (g_guest_pml4/pdpt/pd), placed wherever UEFI
- * loaded that image: observed ~5.4GB under QEMU -m 8192, far above the
- * ~2GB region AllocatePages() handed back for guest RAM.
- *
- * Sizing the NPT to the RAM region alone (what this test did until
- * #206) therefore left the guest CR3 walk itself untranslatable, so the
- * very first instruction fetch took an NPF with nothing retired --
- * reason=0x400, guest_rip still == entry_rip. This is the same bug
- * class as HYPE_NPT_MAX_GB/HYPE_M3_5_GUEST_PAGING_GB above, one level
- * down: a map that reaches the guest's RAM is useless if it does not
- * also reach the tables that describe that RAM. (Every other test guest
- * here sidesteps it by mapping HYPE_NPT_MAX_GB unconditionally; only
- * this one computes its own coverage, which is the point of RAM-2 --
- * so it is the only one that has to get this right.)
- *
- * Returns the highest guest-physical address that walk can touch: past
- * the end of the RAM region, or past whichever paging-structure array
- * the linker placed highest (their relative order is not guaranteed, so
- * all three are considered).
- */
-static uint64_t hype_ram_1_npt_end_phys(void) {
-    uint64_t end = g_ram_1_base_phys + g_ram_1_size_bytes;
-
-    end = hype_ram_1_max_u64(end, (uint64_t)(uintptr_t)g_guest_pml4 + sizeof(g_guest_pml4));
-    end = hype_ram_1_max_u64(end, (uint64_t)(uintptr_t)g_guest_pdpt + sizeof(g_guest_pdpt));
-    end = hype_ram_1_max_u64(end, (uint64_t)(uintptr_t)g_guest_pd + sizeof(g_guest_pd));
-    return end;
-}
-
-static void run_ram_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
-    unsigned int gb_to_map, npt_gb_to_map;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-    uint8_t *guest_code;
-    unsigned long long i;
-
-    (void)ops; /* VMX-2: runs under SVM and VMX now. */
-
-    /* Guest CR3 only ever resolves the guest's own code/stack, both inside the
-     * RAM region, so it stays sized to the allocation -- that dynamic sizing is
-     * exactly what RAM-2 is validating. The NPT needs the wider figure; see
-     * hype_ram_1_npt_end_phys(). */
-    gb_to_map = hype_ram_1_gb_to_map(g_ram_1_base_phys + g_ram_1_size_bytes);
-    npt_gb_to_map = hype_ram_1_gb_to_map(hype_ram_1_npt_end_phys());
-
-    /* M2-6 hard invariant: zero the WHOLE allocated region before this
-     * guest's first VM-entry, not just the bytes written below. */
-    hype_guest_ram_zero((void *)(uintptr_t)g_ram_1_base_phys, g_ram_1_size_bytes);
-
-    guest_code = (uint8_t *)(uintptr_t)g_ram_1_base_phys;
-    for (i = 0; i < sizeof(g_ram_1_payload); i++) {
-        guest_code[i] = g_ram_1_payload[i];
-    }
-
-    entry_rip = g_ram_1_base_phys;
-    rsp = g_ram_1_base_phys + g_ram_1_size_bytes; /* top of the same allocated region */
-
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, gb_to_map);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, npt_gb_to_map);
-    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
-
-    hype_debug_print("ram-1: base_phys=0x%llx size=0x%llx gb_to_map=%u npt_gb_to_map=%u (guest_pml4=0x%llx)\n",
-                      (unsigned long long)g_ram_1_base_phys, (unsigned long long)g_ram_1_size_bytes,
-                      gb_to_map, npt_gb_to_map, (unsigned long long)(uintptr_t)g_guest_pml4);
-
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
-    if (ctx == 0) {
-        hype_fatal("ram-1: vcpu_create_long_mode failed");
-    }
-
-    if (ops->vcpu_run(ctx, &info) != 0) {
-        hype_fatal("ram-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("ram-1: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-    }
-
-    hype_debug_print(
-        "ram-1: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- %u MB dynamic guest "
-        "RAM, guest CR3 sized to %u GB, NPT sized to %u GB\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_RAM_1_TEST_MEM_MB,
-        gb_to_map, npt_gb_to_map);
 }
 
 /*
@@ -19488,7 +19348,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     HYPE_ST_RUN(7, run_int_test(args->ops, args->kind));
     HYPE_ST_RUN(8, run_input_1_test(args->ops, args->kind));
     HYPE_ST_RUN(9, run_input_2_test(args->ops, args->kind));
-    HYPE_ST_RUN(10, run_ram_1_test(args->ops, args->kind));
+    /* 10 was RAM-1/RAM-2, ported out in #536 -- see the note at its old definition. */
     HYPE_ST_RUN(11, run_pci_1_test(args->ops, args->kind));
     HYPE_ST_RUN(12, run_pci_2_test(args->ops, args->kind));
     /* 13 was ISO-2, retired in #452 -- see the note at its old definition. */
@@ -23747,36 +23607,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             g_m2_7_guest_stack_top_phys = pages_phys + 2 * 4096;
         }
 
-        /*
-         * RAM-1: a synthetic one-VM config standing in for a real
-         * parsed hype.cfg (reading one from the ESP is a separate,
-         * later piece -- see the relevant ticket) exercises ADM-1's
-         * already-tested hype_adm_check_memory() against this
-         * machine's real usable RAM for the first time in the actual
-         * boot path, then allocates that many MB of real guest RAM.
-         */
-        {
-            static hype_cfg_t ram_1_cfg;
-            hype_adm_result_t adm_result;
-            UINTN pages;
-
-            /* #393: zero AND bind VM storage -- `vms` is a pointer now, so the hand-rolled
-             * memset this used to do would leave the first vms[0] write faulting. */
-            hype_cfg_init(&ram_1_cfg);
-            ram_1_cfg.vm_count = 1;
-            ram_1_cfg.vms[0].mem_mb = HYPE_RAM_1_TEST_MEM_MB;
-
-            adm_result = hype_adm_check_memory(&ram_1_cfg, usable_ram_bytes,
-                                                (UINT64)HYPE_ADM_RESERVED_MB_DEFAULT * 1024ULL * 1024ULL);
-            if (adm_result.status != HYPE_ADM_OK) {
-                hype_fatal("ram-1: admission check rejected a %u MB VM (status=%d)",
-                           HYPE_RAM_1_TEST_MEM_MB, (int)adm_result.status);
-            }
-
-            g_ram_1_size_bytes = (uint64_t)HYPE_RAM_1_TEST_MEM_MB * 1024ULL * 1024ULL;
-            pages = (UINTN)(g_ram_1_size_bytes / 4096ULL);
-            g_ram_1_base_phys = hype_alloc_pages_any(SystemTable->BootServices, pages);
-        }
+        /* #536: RAM-1's synthetic one-VM config and its 64 MB AllocatePages call are gone with
+         * the test guest they fed. Real admission against real usable RAM now happens in Phase 1
+         * for every configured VM (#453), which is where it belonged; this was the stand-in for a
+         * config hype could not yet read. */
 
         /*
          * FW-1: read this project's own vendored guest firmware from

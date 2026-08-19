@@ -280,6 +280,41 @@ live design doc.
   as the real-hardware validation gate above, not treated as a nice-to-have
   cleanup for later.
 
+### Microtest guests (`tests/micro/`)
+
+Guest-side tests of hype's own emulation. Each is a small freestanding kernel
+built to a bzImage-shaped artifact and booted as an ordinary configured VM
+(`boot = kernel`, `plan.md` §10 decision 45) — so it goes through the same
+config parse, admission, RAM carve, device model and dispatch loop a real guest
+does. They replace the in-binary self-test battery (#534).
+
+```
+make micro                                            # build the artifacts
+tools/micro/run-micro.sh                              # every test, one VM each
+tools/micro/run-micro.sh ram1                         # just one
+tools/micro/run-micro.sh --suite tests/micro/suite-all.cfg   # all in one boot
+```
+
+Rules that are not optional:
+
+- **A microtest reports its own verdict**, `MICRO PASS: <name>` or
+  `MICRO FAIL: <name> <what and what was expected>`, on the guest UART. hype
+  relays it into that VM's log. This is #282's rule one level down: the verdict
+  is a line in the log, not an exit code.
+- **A missing verdict is a FAILURE, not an absence of news.** A guest that wedges
+  or triple-faults prints neither, and silence is the failure mode that looks most
+  like success. The harness fails on no-verdict and on a host panic, and reports a
+  boot that never reached hype as NOBOOT (#371) — which is neither a pass nor a
+  fail, and must not be scored as either.
+- **Never pad a guest payload with zeros.** `0x00 0x00` decodes as
+  `add byte [rax], al`, so zeroed guest RAM is a NOP slide: a guest entered at the
+  wrong address slides into the payload and reports a perfectly correct PASS.
+  That happened (#535). `tests/micro/crt0.S` fills its pre-entry region with
+  `0xCC` for exactly this reason.
+- **The artifacts are built once and selected by config**, never by a rebuild of
+  hype. "Run only test N" is an edit to a `.cfg`, not `-D` on the build line.
+- `make clean` removes `build/micro/`, so re-run `make micro` after one.
+
 ## Feature requests vs. bugfixes
 
 - A **bugfix** (existing behavior doesn't match what `plan.md` or the ticket

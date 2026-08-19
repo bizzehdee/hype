@@ -88,9 +88,13 @@ ESP       := $(BUILD_DIR)/esp
 # NOT built by `all`, deliberately: these are GUESTS, not part of the hypervisor. They change only
 # when a test changes, and decoupling the two is the whole argument of #534 -- a build of hype must
 # not depend on them, and rebuilding hype must not rebuild them.
+#
+# They DO live under $(BUILD_DIR), so `make clean` removes them: re-run `make micro` after one, or
+# the harness reports MISSING rather than a verdict. Deliberate -- they are build outputs and
+# belong with the others -- but it is the one thing that surprises.
 MICRO_DIR   := tests/micro
 MICRO_OUT   := $(BUILD_DIR)/micro
-MICRO_NAMES := hello faulter
+MICRO_NAMES := hello faulter ram1
 MICRO_IMAGES := $(patsubst %,$(MICRO_OUT)/%.bin,$(MICRO_NAMES))
 MICRO_CFLAGS := --target=x86_64-unknown-elf -ffreestanding -fno-stack-protector -fno-pic \
                 -mno-red-zone -mno-sse -Wall -Wextra -Werror -O2 -std=c11

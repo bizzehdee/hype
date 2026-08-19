@@ -1,0 +1,111 @@
+#ifndef HYPE_MICRO_PCI_H
+#define HYPE_MICRO_PCI_H
+
+#include "micro.h"
+
+/*
+ * #536: guest-side PCI/ECAM access for micro-kernels.
+ *
+ * A kernel-boot VM has NO firmware, so nothing has enumerated the bus or programmed a single BAR
+ * before the guest's first instruction. Every microtest that talks to a memory-mapped device
+ * therefore has to do what firmware would: find the device, size its BAR, place it, and enable it.
+ *
+ * That is a feature, not a chore. The in-binary versions of these tests were handed a device at a
+ * hardcoded guest-physical address by their own launch code, so they never exercised the ECAM path,
+ * the BAR sizing protocol, or the command register at all. Doing it here means each device test
+ * also covers how a real guest reaches that device.
+ *
+ * The addresses below are hype's real device model (boot/main.c's HYPE_FW_1_* constants), not
+ * test-only ones. A microtest that pointed itself at a private aperture would re-create exactly the
+ * coupling #534 exists to remove.
+ */
+
+/* HYPE_FW_1_ECAM_GPA. Bus 0 only -- hype implements one bus and advertises one (#436). */
+#define MICRO_ECAM_BASE 0xE0000000ull
+
+/* Device numbers on bus 0, from boot/main.c. */
+#define MICRO_PCI_DEV_MCH 0u        /* Q35 host bridge */
+#define MICRO_PCI_DEV_AHCI 2u       /* HYPE_FW_1_PCI_DEV_AHCI */
+#define MICRO_PCI_DEV_VIRTIO_BLK 3u /* HYPE_FW_1_PCI_DEV_VIRTIO_BLK */
+#define MICRO_PCI_DEV_NVME 5u       /* HYPE_FW_1_PCI_DEV_NVME */
+#define MICRO_PCI_DEV_LPC 31u       /* HYPE_FW_1_PCI_DEV_ICH9_LPC */
+
+#define MICRO_PCI_VENDOR_ID 0x00u
+#define MICRO_PCI_DEVICE_ID 0x02u
+#define MICRO_PCI_COMMAND 0x04u
+#define MICRO_PCI_CLASS_REV 0x08u
+#define MICRO_PCI_BAR0 0x10u
+#define MICRO_PCI_INTERRUPT_LINE 0x3Cu
+
+#define MICRO_PCI_CMD_IO_SPACE 0x0001u
+#define MICRO_PCI_CMD_MEM_SPACE 0x0002u
+#define MICRO_PCI_CMD_BUS_MASTER 0x0004u
+
+/*
+ * A guest-physical window for BARs this test programs. 0xC0000000 (3 GB) is below the ECAM window
+ * at 0xE0000000 and far above any plausible mem_mb, so it collides with neither RAM nor ECAM. The
+ * identity map covers it (4 GB, core/kboot.h), and hype's nested tables leave it not-present -- so
+ * an access to an unprogrammed or wrongly-placed BAR faults into hype's MMIO decode and is
+ * reported, rather than quietly reaching RAM.
+ */
+#define MICRO_BAR_WINDOW 0xC0000000ull
+
+static inline uint64_t micro_ecam_addr(unsigned dev, unsigned func, unsigned off) {
+    return MICRO_ECAM_BASE + ((uint64_t)dev << 15) + ((uint64_t)func << 12) + (uint64_t)off;
+}
+
+static inline uint32_t micro_pci_read32(unsigned dev, unsigned off) {
+    return *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, 0u, off);
+}
+
+static inline void micro_pci_write32(unsigned dev, unsigned off, uint32_t v) {
+    *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, 0u, off) = v;
+}
+
+static inline uint16_t micro_pci_vendor(unsigned dev) {
+    return (uint16_t)(micro_pci_read32(dev, MICRO_PCI_VENDOR_ID) & 0xFFFFu);
+}
+
+static inline int micro_pci_present(unsigned dev) {
+    /* The standard convention every real bus-walk relies on: an absent device reads as all-1s. */
+    uint32_t id = micro_pci_read32(dev, MICRO_PCI_VENDOR_ID);
+    return (id != 0xFFFFFFFFu && (id & 0xFFFFu) != 0xFFFFu) ? 1 : 0;
+}
+
+/*
+ * The BAR sizing protocol, exactly as firmware does it: write all-1s, read back, and the lowest
+ * set bit of the writable field is the size. Returns 0 if the BAR is unimplemented.
+ *
+ * Note the reads go through EAX rather than an immediate-to-memory store: hype's MMIO decoder
+ * supports the MOV/MOVZX register forms (0x88/0x89/0x8A/0x8B/0F B6/0F B7), not 0xC7, and matching
+ * what the decoder handles is the existing convention here rather than something to extend for one
+ * test's convenience.
+ */
+static inline uint32_t micro_pci_bar_size(unsigned dev, unsigned bar_index) {
+    unsigned off = MICRO_PCI_BAR0 + bar_index * 4u;
+    uint32_t saved = micro_pci_read32(dev, off);
+    uint32_t probe;
+
+    micro_pci_write32(dev, off, 0xFFFFFFFFu);
+    probe = micro_pci_read32(dev, off);
+    micro_pci_write32(dev, off, saved);
+
+    if (probe == 0u || probe == 0xFFFFFFFFu) {
+        return 0u;
+    }
+    probe &= ~0xFu; /* memory BAR: low 4 bits are type/prefetch flags, not address */
+    return (~probe) + 1u;
+}
+
+/* Place a memory BAR at `gpa` and enable memory decoding + bus mastering. Returns `gpa`. */
+static inline uint64_t micro_pci_place_bar(unsigned dev, unsigned bar_index, uint64_t gpa) {
+    unsigned off = MICRO_PCI_BAR0 + bar_index * 4u;
+
+    micro_pci_write32(dev, off, (uint32_t)gpa);
+    micro_pci_write32(dev, MICRO_PCI_COMMAND,
+                      (micro_pci_read32(dev, MICRO_PCI_COMMAND) & 0xFFFF0000u) |
+                          MICRO_PCI_CMD_MEM_SPACE | MICRO_PCI_CMD_BUS_MASTER);
+    return gpa;
+}
+
+#endif /* HYPE_MICRO_PCI_H */
