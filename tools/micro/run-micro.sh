@@ -47,6 +47,54 @@ boot = kernel
 kernel = \\EFI\\hype\\micro\\$1.bin
 os_hint = none
 CFG
+    # #550: a storage test needs a REAL backing file, or it is testing its own scaffolding.
+    # The disk is declared here rather than in the test so the same artifact can be aimed at a
+    # raw image, a qcow2 (#336) or a thin target (decision 42) by editing a config.
+    case "$1" in
+        virtioblk) cat >> "$2" <<CFG
+disks = d0
+
+[disk.d0]
+type = disk
+backing = file
+path = \\hype\\disks\\$1.img
+bus = virtio-blk
+CFG
+        ;;
+    esac
+}
+
+# The host half of a storage test's verdict (#343's re-read-and-compare). A read that returns what
+# was written proves the round trip through the DEVICE; it does not prove the bytes reached the
+# FILE, because a device serving from its own cache would pass identically. Only the host can tell
+# those apart, so this pulls the image back out of the ESP and checks the sector itself.
+verify_backing_file() {   # $1 = test name, $2 = sector
+    local name="$1" sector="${2:-1}" img="$OUTDIR/$name.verify.img" esp="$OUTDIR/run-micro-$name.esp.img"
+    [ -f "$esp" ] || { echo "       (no ESP image to verify against)"; return 1; }
+    rm -f "$img"
+    if ! mcopy -i "$esp@@1M" "::/hype/disks/$name.img" "$img" 2>/dev/null; then
+        echo "       HOST-SIDE VERIFY FAILED: could not read the backing image back out of the ESP"
+        return 1
+    fi
+    python3 - "$img" "$sector" "$name" <<'PY'
+import sys
+path, sector, name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+with open(path, 'rb') as f:
+    f.seek(sector * 512)
+    got = f.read(512)
+if len(got) != 512:
+    print("       HOST-SIDE VERIFY FAILED: image is shorter than sector %d" % sector)
+    sys.exit(1)
+want = bytes(((0x5A ^ i ^ (sector & 0xFF)) & 0xFF) for i in range(512))
+if got != want:
+    first = next(i for i in range(512) if got[i] != want[i])
+    print("       HOST-SIDE VERIFY FAILED: sector %d byte %d is 0x%02x, expected 0x%02x" %
+          (sector, first, got[first], want[first]))
+    if got == bytes(512):
+        print("       the sector is all zeros -- the guest's write never reached the file")
+    sys.exit(1)
+print("       host-side verify: sector %d in the backing FILE matches the guest's pattern" % sector)
+PY
 }
 
 # Reports one VM's verdict from a finished log. Echoes a status word and returns non-zero on
@@ -90,10 +138,26 @@ run_one() {   # $1 = test name
 
     killall -9 qemu-system-x86_64 2>/dev/null
     sleep 1
-    HYPE_CFG="$cfg" HYPE_KERNELS="build/micro/$name.bin" \
+
+    # A storage test gets a freshly zeroed image, so a pattern found afterwards can only have been
+    # written by this run -- a leftover from the previous one would pass without the guest doing
+    # anything.
+    local disk=""
+    case "$name" in
+        virtioblk)
+            disk="$OUTDIR/$name.img"
+            rm -f "$disk"
+            dd if=/dev/zero of="$disk" bs=1M count=1 status=none
+            ;;
+    esac
+
+    HYPE_CFG="$cfg" HYPE_KERNELS="build/micro/$name.bin" HYPE_DISK="$disk" \
         timeout $((SECS + 150)) tools/run-guest.sh "$ISO" "micro-$name" "$SECS" >/dev/null 2>&1
 
-    report "$log" "$name"
+    report "$log" "$name" || return 1
+    if [ -n "$disk" ]; then
+        verify_backing_file "$name" 1 || return 1
+    fi
 }
 
 report() {   # $1 = log, $2.. = test names present in it

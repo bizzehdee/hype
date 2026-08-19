@@ -16582,9 +16582,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                             &g_fw_1_dma_map, vblk_bar, insn) == 0) {
                         continue;
                     }
+                    /*
+                     * #550: say WHICH access, not just where. "unhandled MMIO at 0x...c0000014"
+                     * cost twenty minutes of bisecting a guest driver whose PREVIOUS two writes
+                     * to that same register had succeeded -- the offset alone cannot distinguish
+                     * an unmodelled register from an unmodelled access WIDTH or instruction form,
+                     * and those are three different bugs in three different files.
+                     */
                     HYPE_LOGF(HYPE_LOG_ERROR,
-                              "fw-1: unhandled virtio-blk MMIO at guest-physical 0x%llx\n",
-                               (unsigned long long)npf.guest_phys_addr);
+                              "fw-1: unhandled virtio-blk MMIO at guest-physical 0x%llx "
+                              "(BAR+0x%llx, %s) -- the offset, the access width or the "
+                              "instruction form is not modelled [#550]\n",
+                              (unsigned long long)npf.guest_phys_addr,
+                              (unsigned long long)(npf.guest_phys_addr - vblk_bar),
+                              npf.is_write ? "write" : "read");
                     fw_1_guest_fault_stop(vm, "its guest made a virtio-blk register access hype does not model");
                     return;
                 }
