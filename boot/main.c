@@ -4129,15 +4129,6 @@ static uint32_t hype_byteswap32(uint32_t v) {
  */
 #define HYPE_M4_5_AHCI_GPA (HYPE_M4_3_PFLASH_GPA + HYPE_PAGING_2MB)
 
-static uint8_t g_m4_5_media[4 * HYPE_ATAPI_SECTOR_SIZE] __attribute__((aligned(4096)));
-static uint8_t g_m4_5_cmd_list[4096] __attribute__((aligned(4096)));
-static uint8_t g_m4_5_cmd_table[4096] __attribute__((aligned(4096)));
-static uint8_t g_m4_5_rx_fis[4096] __attribute__((aligned(4096)));
-static uint8_t g_m4_5_dest_buffer[HYPE_ATAPI_SECTOR_SIZE] __attribute__((aligned(4096)));
-static uint8_t g_m4_5_guest_code[256] __attribute__((aligned(4096)));
-static uint8_t g_m4_5_guest_stack[4096] __attribute__((aligned(4096)));
-static hype_ahci_t g_m4_5_ahci;
-static hype_atapi_t g_m4_5_atapi;
 
 /*
  * Guest payload: initializes the AHCI port (GHC.AE, PxCLB/PxCLBU,
@@ -4175,157 +4166,21 @@ static hype_atapi_t g_m4_5_atapi;
  *   hlt                                    F4
  *   jmp $-3                                EB FD
  */
-static const uint8_t g_m4_5_payload_template[] = {
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x80,
-    0x89, 0x43, 0x04,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x00, 0x01, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x04, 0x01, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x08, 0x01, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x0C, 0x01, 0x00, 0x00,
-    0xB8, 0x11, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x18, 0x01, 0x00, 0x00,
-    0xB8, 0x01, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x38, 0x01, 0x00, 0x00,
-    0x8B, 0x83, 0x38, 0x01, 0x00, 0x00,
-    0x85, 0xC0,
-    0x75, 0xF6,
-    0xF4,
-    0xEB, 0xFD
-};
 #define HYPE_M4_5_PAYLOAD_RBX_IMM_OFFSET 2
 #define HYPE_M4_5_PAYLOAD_CLB_LOW_IMM_OFFSET 19
 #define HYPE_M4_5_PAYLOAD_CLB_HIGH_IMM_OFFSET 30
 #define HYPE_M4_5_PAYLOAD_FB_LOW_IMM_OFFSET 41
 #define HYPE_M4_5_PAYLOAD_FB_HIGH_IMM_OFFSET 52
 
-static void run_m4_5_ahci_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    unsigned long long i;
-    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
-    uint64_t ahci_gpa, cmd_list_phys, cmd_table_phys, rx_fis_phys, dest_phys;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-
-    (void)ops; /* VMX-2: runs under SVM and VMX now. */
-
-    hype_guest_ram_zero(g_m4_5_cmd_list, sizeof(g_m4_5_cmd_list));
-    hype_guest_ram_zero(g_m4_5_cmd_table, sizeof(g_m4_5_cmd_table));
-    hype_guest_ram_zero(g_m4_5_rx_fis, sizeof(g_m4_5_rx_fis));
-    hype_guest_ram_zero(g_m4_5_dest_buffer, sizeof(g_m4_5_dest_buffer));
-    hype_guest_ram_zero(g_m4_5_guest_code, sizeof(g_m4_5_guest_code));
-    hype_guest_ram_zero(g_m4_5_guest_stack, sizeof(g_m4_5_guest_stack));
-
-    /* Recognizable synthetic "ISO" content -- sector N's bytes are all
-     * (N & 0xFF), letting the read-back check confirm both the right
-     * sector was fetched and the right byte count. */
-    for (i = 0; i < sizeof(g_m4_5_media); i++) {
-        g_m4_5_media[i] = (uint8_t)((i / HYPE_ATAPI_SECTOR_SIZE) & 0xFFu);
-    }
-    hype_atapi_reset(&g_m4_5_atapi, g_m4_5_media, sizeof(g_m4_5_media));
-    hype_ahci_reset(&g_m4_5_ahci);
-
-    cmd_list_phys = (uint64_t)(uintptr_t)g_m4_5_cmd_list;
-    cmd_table_phys = (uint64_t)(uintptr_t)g_m4_5_cmd_table;
-    rx_fis_phys = (uint64_t)(uintptr_t)g_m4_5_rx_fis;
-    dest_phys = (uint64_t)(uintptr_t)g_m4_5_dest_buffer;
-
-    /* Command Header, slot 0: CFL=5 (Register H2D FIS is 5 DWORDs),
-     * ATAPI bit (0x20) set, PRDTL=1 (one PRDT entry) -> opts =
-     * (1 << 16) | 0x20 | 5 = 0x00010025. */
-    hype_write_le32(g_m4_5_cmd_list + 0, 0x00010025u);
-    hype_write_le32(g_m4_5_cmd_list + 4, 0);          /* PRDBC, device-written on completion */
-    hype_write_le32(g_m4_5_cmd_list + 8, (uint32_t)cmd_table_phys);
-    hype_write_le32(g_m4_5_cmd_list + 12, (uint32_t)(cmd_table_phys >> 32));
-
-    /* Command Table: Register H2D FIS (20 bytes) at offset 0 --
-     * command = ATA_CMD_PACKET (0xA0), C bit set (bit 7 of byte 1). */
-    g_m4_5_cmd_table[0] = 0x27;
-    g_m4_5_cmd_table[1] = 0x80;
-    g_m4_5_cmd_table[2] = 0xA0;
-    /* ATAPI CDB (16 bytes) at offset 0x40 -- READ(10): LBA=2, transfer
-     * length=1 block, matching HYPE_ATAPI_CMD_READ10's own byte layout
-     * (devices/atapi.c's handle_read10()). */
-    g_m4_5_cmd_table[0x40 + 0] = HYPE_ATAPI_CMD_READ10;
-    g_m4_5_cmd_table[0x40 + 5] = 2; /* LBA low byte (LBA = 2) */
-    g_m4_5_cmd_table[0x40 + 8] = 1; /* transfer length low byte (1 block) */
-    /* PRDT entry 0 (16 bytes) at offset 0x80: destination buffer,
-     * DBC field = byte_count - 1 (a real hardware/spec quirk, see
-     * hype_ahci_decode_prdt_entry()'s own comment). */
-    hype_write_le32(g_m4_5_cmd_table + 0x80 + 0, (uint32_t)dest_phys);
-    hype_write_le32(g_m4_5_cmd_table + 0x80 + 4, (uint32_t)(dest_phys >> 32));
-    hype_write_le32(g_m4_5_cmd_table + 0x80 + 12, HYPE_ATAPI_SECTOR_SIZE - 1u);
-
-    for (i = 0; i < sizeof(g_m4_5_payload_template); i++) {
-        g_m4_5_guest_code[i] = g_m4_5_payload_template[i];
-    }
-    ahci_gpa = HYPE_M4_5_AHCI_GPA;
-    hype_write_le64(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_RBX_IMM_OFFSET, ahci_gpa);
-    hype_write_le32(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_CLB_LOW_IMM_OFFSET, (uint32_t)cmd_list_phys);
-    hype_write_le32(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_CLB_HIGH_IMM_OFFSET,
-                     (uint32_t)(cmd_list_phys >> 32));
-    hype_write_le32(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_FB_LOW_IMM_OFFSET, (uint32_t)rx_fis_phys);
-    hype_write_le32(g_m4_5_guest_code + HYPE_M4_5_PAYLOAD_FB_HIGH_IMM_OFFSET,
-                     (uint32_t)(rx_fis_phys >> 32));
-
-    entry_rip = (uint64_t)(uintptr_t)g_m4_5_guest_code;
-    rsp = (uint64_t)(uintptr_t)(g_m4_5_guest_stack + sizeof(g_m4_5_guest_stack));
-
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
-    hype_npt_mark_not_present(g_npt_pd, HYPE_M4_5_AHCI_GPA);
-    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
-
-    hype_debug_print("m4-5: entry_rip=0x%llx ahci_gpa=0x%llx cmd_list=0x%llx cmd_table=0x%llx\n",
-                       (unsigned long long)entry_rip, (unsigned long long)ahci_gpa,
-                       (unsigned long long)cmd_list_phys, (unsigned long long)cmd_table_phys);
-
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
-    if (ctx == 0) {
-        hype_fatal("m4-5: vcpu_create_long_mode failed");
-    }
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_ept_mark_mmio_hole(HYPE_M4_5_AHCI_GPA);
-    }
-
-    for (;;) {
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("m4-5: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-        }
-
-        if (vmm_reason_is_npf(kind, info.reason)) {
-            if (vmm_handle_ahci_npf(kind, ctx, &g_m4_5_ahci, &g_m4_5_atapi, HYPE_M4_5_AHCI_GPA) != 0) {
-                hype_fatal("m4-5: unhandled/unrecognized AHCI MMIO access (qual=0x%llx guest_rip=0x%llx)",
-                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
-            }
-            continue;
-        }
-
-        break;
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("m4-5: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-    }
-
-    for (i = 0; i < HYPE_ATAPI_SECTOR_SIZE; i++) {
-        if (g_m4_5_dest_buffer[i] != g_m4_5_media[2 * HYPE_ATAPI_SECTOR_SIZE + i]) {
-            hype_fatal("m4-5: AHCI/ATAPI READ(10) mismatch at byte %llu: got 0x%x, expected 0x%x", i,
-                       g_m4_5_dest_buffer[i], g_m4_5_media[2 * HYPE_ATAPI_SECTOR_SIZE + i]);
-        }
-    }
-
-    hype_debug_print(
-        "m4-5: AHCI/ATAPI test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- %u-byte "
-        "READ(10) round trip verified byte-for-byte\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_ATAPI_SECTOR_SIZE);
-}
+/*
+ * #548: M4-5's AHCI test is gone -- ported to tests/micro/ahci.c and booted as a configured VM.
+ *
+ * The host handed the test a device at a fixed address and did the register work itself, so the
+ * sequence a real guest's libata performs had never been driven from inside a guest. The port has
+ * the guest walk the bus by CLASS CODE, place ABAR itself, build its own command list and issue
+ * IDENTIFY -- which immediately found that hype presents two AHCI controllers and the SATA one is
+ * an ICH9 function on device 31, something the fixed-address version could not have noticed.
+ */
 
 #define HYPE_ISO_2_AHCI_GPA (HYPE_M4_5_AHCI_GPA + HYPE_PAGING_2MB)
 #define HYPE_ISO_2_PVD_LBA 16 /* ISO9660 Primary Volume Descriptor: always the 17th 2048-byte sector */
@@ -6167,14 +6022,6 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
  * per notify, not just one), then the guest polls the used ring until
  * both have completed.
  */
-static uint8_t g_m5_1_guest_code[512] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_guest_stack[4096] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_backing[0x10000] __attribute__((aligned(4096))); /* 128 sectors */
-/* M5-7a: the virtio-blk frontend now drives a hype_blk_backend, not a raw buffer.
- * For M5-1 the backend is a file-backed store over g_m5_1_backing (same bytes the
- * test seeds + verifies), so the refactor is behaviour-preserving here. */
-static hype_blk_file_t g_m5_1_blk_file;
-static hype_blk_backend_t g_m5_1_be;
 /*
  * Sized FROM the advertised queue size, not hardcoded. This guest never writes
  * QUEUE_SIZE, so it runs at whatever the device advertises -- and
@@ -6185,20 +6032,6 @@ static hype_blk_backend_t g_m5_1_be;
  * been an out-of-bounds read and write inside hype's own BSS. Deriving them
  * means the two cannot drift apart again.
  */
-static uint8_t g_m5_1_desc_table[HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX * 16u]
-    __attribute__((aligned(4096)));
-static uint8_t g_m5_1_avail[4u + 2u * HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX + 2u]
-    __attribute__((aligned(4096)));
-static uint8_t g_m5_1_used[4u + 8u * HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX + 2u]
-    __attribute__((aligned(4096)));
-static uint8_t g_m5_1_req1_header[16] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_req1_data[512] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_req1_status[1] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_req2_header[16] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_req2_data[512] __attribute__((aligned(4096)));
-static uint8_t g_m5_1_req2_status[1] __attribute__((aligned(4096)));
-static hype_pci_t g_m5_1_pci;
-static hype_virtio_blk_t g_m5_1_virtio_blk;
 
 #define HYPE_M5_1_VIRTIO_DEV 1u
 #define HYPE_M5_1_BAR_INDEX 4u
@@ -6322,55 +6155,6 @@ static void hype_write_virtq_desc(uint8_t *raw, uint64_t addr, uint32_t len, uin
  *   hlt                                            F4
  *   jmp $-3                                        EB FD
  */
-static const uint8_t g_m5_1_payload_template[] = {
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x20, 0x80, 0x00, 0x00,
-    0xB8, 0x02, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x04, 0x80, 0x00, 0x00,
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB0, 0x00,
-    0x88, 0x83, 0x14, 0x00, 0x00, 0x00,
-    0xB0, 0x01,
-    0x88, 0x83, 0x14, 0x00, 0x00, 0x00,
-    0xB0, 0x03,
-    0x88, 0x83, 0x14, 0x00, 0x00, 0x00,
-    0xB8, 0x01, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x00, 0x00, 0x00, 0x00,
-    0x8B, 0x83, 0x04, 0x00, 0x00, 0x00,
-    0xB9, 0x01, 0x00, 0x00, 0x00,
-    0x89, 0x8B, 0x08, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x0C, 0x00, 0x00, 0x00,
-    0xB0, 0x0B,
-    0x88, 0x83, 0x14, 0x00, 0x00, 0x00,
-    0x66, 0xB8, 0x00, 0x00,
-    0x66, 0x89, 0x83, 0x16, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x20, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x24, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x28, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x2C, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x30, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x34, 0x00, 0x00, 0x00,
-    0x66, 0xB8, 0x01, 0x00,
-    0x66, 0x89, 0x83, 0x1C, 0x00, 0x00, 0x00,
-    0xB0, 0x0F,
-    0x88, 0x83, 0x14, 0x00, 0x00, 0x00,
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x03,
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x66, 0x8B, 0x83, 0x02, 0x00, 0x00, 0x00,
-    0x66, 0x3D, 0x02, 0x00,
-    0x75, 0xF3,
-    0xF4,
-    0xEB, 0xFD
-};
 #define HYPE_M5_1_PAYLOAD_ECAM_RBX_IMM_OFFSET 2
 #define HYPE_M5_1_PAYLOAD_BAR4_VALUE_IMM_OFFSET 11
 #define HYPE_M5_1_PAYLOAD_MMIO_RBX_IMM_OFFSET 34
@@ -6383,243 +6167,14 @@ static const uint8_t g_m5_1_payload_template[] = {
 #define HYPE_M5_1_PAYLOAD_NOTIFY_RBX_IMM_OFFSET 206
 #define HYPE_M5_1_PAYLOAD_USED_RING_RBX_IMM_OFFSET 223
 
-static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    unsigned long long i;
-    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
-    uint64_t mmio_phys, desc_phys, avail_phys, used_phys;
-    uint8_t *config;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-    int mmio_mapped;
-    uint64_t mmio_mapped_base;
-    uint64_t sector10_offset;
-
-    /* VMX-2: ported to the vmm_* shims like the other M5 tests, but skipped on
-     * VMX pending a fix. Under VMX the two request chains' data buffers come out
-     * cross-assigned in process_virtio_blk_queue() (the WRITE reads the READ's
-     * buffer and vice versa; the WRITE source reads 0, so the write persists
-     * zeros). The virtqueue base addresses are programmed correctly (verified),
-     * and AHCI DMA over the same guest-RAM range works, so this is a
-     * virtio-specific descriptor/avail-ring read anomaly under VMX -- its own
-     * focused debug pass. Runs on SVM unchanged. */
-    (void)ops; /* VMX-2: runs under SVM and VMX now. */
-
-    hype_guest_ram_zero(g_m5_1_guest_code, sizeof(g_m5_1_guest_code));
-    hype_guest_ram_zero(g_m5_1_guest_stack, sizeof(g_m5_1_guest_stack));
-    hype_guest_ram_zero(g_m5_1_backing, sizeof(g_m5_1_backing));
-    hype_guest_ram_zero(g_m5_1_desc_table, sizeof(g_m5_1_desc_table));
-    hype_guest_ram_zero(g_m5_1_avail, sizeof(g_m5_1_avail));
-    hype_guest_ram_zero(g_m5_1_used, sizeof(g_m5_1_used));
-    hype_guest_ram_zero(g_m5_1_req1_header, sizeof(g_m5_1_req1_header));
-    hype_guest_ram_zero(g_m5_1_req1_data, sizeof(g_m5_1_req1_data));
-    hype_guest_ram_zero(g_m5_1_req1_status, sizeof(g_m5_1_req1_status));
-    hype_guest_ram_zero(g_m5_1_req2_header, sizeof(g_m5_1_req2_header));
-    hype_guest_ram_zero(g_m5_1_req2_data, sizeof(g_m5_1_req2_data));
-    hype_guest_ram_zero(g_m5_1_req2_status, sizeof(g_m5_1_req2_status));
-
-    /* Request 1 (WRITE): the guest wants to persist this pattern at
-     * HYPE_M5_1_REQ1_SECTOR. */
-    hype_write_le32(g_m5_1_req1_header + 0, HYPE_VIRTIO_BLK_T_OUT);
-    hype_write_le32(g_m5_1_req1_header + 4, 0);
-    hype_write_le64(g_m5_1_req1_header + 8, HYPE_M5_1_REQ1_SECTOR);
-    for (i = 0; i < HYPE_M5_1_DATA_LEN; i++) {
-        g_m5_1_req1_data[i] = (uint8_t)(0xA0u + i);
-    }
-    g_m5_1_req1_status[0] = 0xFFu; /* poison -- expect the device to overwrite with S_OK (0) */
-
-    /* Request 2 (READ): the host places its own known pattern on the
-     * "disk" at HYPE_M5_1_REQ2_SECTOR first, standing in for data a
-     * prior write (or the disk image itself) already put there. */
-    sector10_offset = HYPE_M5_1_REQ2_SECTOR * HYPE_VIRTIO_BLK_SECTOR_SIZE;
-    for (i = 0; i < HYPE_M5_1_DATA_LEN; i++) {
-        g_m5_1_backing[sector10_offset + i] = (uint8_t)(0xB0u + i);
-    }
-    hype_write_le32(g_m5_1_req2_header + 0, HYPE_VIRTIO_BLK_T_IN);
-    hype_write_le32(g_m5_1_req2_header + 4, 0);
-    hype_write_le64(g_m5_1_req2_header + 8, HYPE_M5_1_REQ2_SECTOR);
-    g_m5_1_req2_status[0] = 0xFFu;
-
-    /* Descriptor table: two 3-descriptor chains (header/data/status). */
-    hype_write_virtq_desc(g_m5_1_desc_table + 0 * 16, (uint64_t)(uintptr_t)g_m5_1_req1_header, 16,
-                           HYPE_VIRTQ_DESC_F_NEXT, 1);
-    hype_write_virtq_desc(g_m5_1_desc_table + 1 * 16, (uint64_t)(uintptr_t)g_m5_1_req1_data,
-                           HYPE_M5_1_DATA_LEN, HYPE_VIRTQ_DESC_F_NEXT, 2);
-    hype_write_virtq_desc(g_m5_1_desc_table + 2 * 16, (uint64_t)(uintptr_t)g_m5_1_req1_status, 1,
-                           HYPE_VIRTQ_DESC_F_WRITE, 0);
-    hype_write_virtq_desc(g_m5_1_desc_table + 3 * 16, (uint64_t)(uintptr_t)g_m5_1_req2_header, 16,
-                           HYPE_VIRTQ_DESC_F_NEXT, 4);
-    hype_write_virtq_desc(g_m5_1_desc_table + 4 * 16, (uint64_t)(uintptr_t)g_m5_1_req2_data,
-                           HYPE_M5_1_DATA_LEN, (uint16_t)(HYPE_VIRTQ_DESC_F_NEXT | HYPE_VIRTQ_DESC_F_WRITE),
-                           5);
-    hype_write_virtq_desc(g_m5_1_desc_table + 5 * 16, (uint64_t)(uintptr_t)g_m5_1_req2_status, 1,
-                           HYPE_VIRTQ_DESC_F_WRITE, 0);
-
-    /* Avail ring: both chains queued up front (idx=2), so the guest's
-     * own single notify kick below drains both. */
-    hype_write_le16(g_m5_1_avail + 0, 0);
-    hype_write_le16(g_m5_1_avail + 2, 2);
-    hype_write_le16(g_m5_1_avail + 4, 0); /* ring[0] = head descriptor of chain 1 */
-    hype_write_le16(g_m5_1_avail + 6, 3); /* ring[1] = head descriptor of chain 2 */
-
-    hype_virtio_blk_reset(&g_m5_1_virtio_blk, HYPE_M5_1_CAPACITY_SECTORS);
-    hype_blk_file_init(&g_m5_1_blk_file, &g_m5_1_be, g_m5_1_backing, sizeof(g_m5_1_backing));
-    hype_pci_reset(&g_m5_1_pci);
-    hype_pci_add_device(&g_m5_1_pci, HYPE_M5_1_VIRTIO_DEV, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
-                         HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
-                         HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE);
-    hype_pci_set_bar_size(&g_m5_1_pci, HYPE_M5_1_VIRTIO_DEV, HYPE_M5_1_BAR_INDEX, HYPE_VIRTIO_BLK_BAR_SIZE);
-
-    /* Real virtio-pci capability list (spec §4.1.4) -- not walked by
-     * this synthetic guest (which targets BAR4 directly, the same
-     * "test guest knows the device's own structure" convention PCI-2/
-     * VIDEO-3 already established), but built faithfully so a real
-     * guest OS driver's own generic capability walk would find it. */
-    config = g_m5_1_pci.devices[HYPE_M5_1_VIRTIO_DEV].config;
-    config[HYPE_M5_1_PCI_STATUS_OFFSET] |= HYPE_M5_1_PCI_STATUS_CAP_LIST;
-    config[HYPE_M5_1_PCI_CAP_POINTER_OFFSET] = HYPE_M5_1_CAP_COMMON_OFF;
-    hype_write_virtio_pci_cap(config, HYPE_M5_1_CAP_COMMON_OFF, HYPE_M5_1_CAP_NOTIFY_OFF, 16,
-                               HYPE_M5_1_CFG_TYPE_COMMON, HYPE_M5_1_BAR_INDEX,
-                               HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET, HYPE_VIRTIO_COMMON_CFG_SIZE);
-    hype_write_virtio_pci_cap(config, HYPE_M5_1_CAP_NOTIFY_OFF, HYPE_M5_1_CAP_ISR_OFF, 20,
-                               HYPE_M5_1_CFG_TYPE_NOTIFY, HYPE_M5_1_BAR_INDEX,
-                               HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET, 4);
-    hype_write_le32(config + HYPE_M5_1_CAP_NOTIFY_OFF + 16, HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_MULTIPLIER);
-    hype_write_virtio_pci_cap(config, HYPE_M5_1_CAP_ISR_OFF, HYPE_M5_1_CAP_DEVICE_OFF, 16,
-                               HYPE_M5_1_CFG_TYPE_ISR, HYPE_M5_1_BAR_INDEX,
-                               HYPE_VIRTIO_BLK_BAR_ISR_CFG_OFFSET, 1);
-    hype_write_virtio_pci_cap(config, HYPE_M5_1_CAP_DEVICE_OFF, 0, 16, HYPE_M5_1_CFG_TYPE_DEVICE,
-                               HYPE_M5_1_BAR_INDEX, HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET,
-                               HYPE_VIRTIO_BLK_CFG_SIZE);
-
-    mmio_phys = HYPE_M5_1_MMIO_GPA;
-    desc_phys = (uint64_t)(uintptr_t)g_m5_1_desc_table;
-    avail_phys = (uint64_t)(uintptr_t)g_m5_1_avail;
-    used_phys = (uint64_t)(uintptr_t)g_m5_1_used;
-
-    for (i = 0; i < sizeof(g_m5_1_payload_template); i++) {
-        g_m5_1_guest_code[i] = g_m5_1_payload_template[i];
-    }
-    hype_write_le64(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_ECAM_RBX_IMM_OFFSET, HYPE_PCI_1_ECAM_GPA);
-    hype_write_le32(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_BAR4_VALUE_IMM_OFFSET, (uint32_t)mmio_phys);
-    hype_write_le64(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_MMIO_RBX_IMM_OFFSET, mmio_phys);
-    hype_write_le32(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_DESC_LOW_IMM_OFFSET, (uint32_t)desc_phys);
-    hype_write_le32(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_DESC_HIGH_IMM_OFFSET, (uint32_t)(desc_phys >> 32));
-    hype_write_le32(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_AVAIL_LOW_IMM_OFFSET, (uint32_t)avail_phys);
-    hype_write_le32(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_AVAIL_HIGH_IMM_OFFSET,
-                     (uint32_t)(avail_phys >> 32));
-    hype_write_le32(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_USED_LOW_IMM_OFFSET, (uint32_t)used_phys);
-    hype_write_le32(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_USED_HIGH_IMM_OFFSET, (uint32_t)(used_phys >> 32));
-    hype_write_le64(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_NOTIFY_RBX_IMM_OFFSET,
-                     mmio_phys + HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET);
-    hype_write_le64(g_m5_1_guest_code + HYPE_M5_1_PAYLOAD_USED_RING_RBX_IMM_OFFSET, used_phys);
-
-    entry_rip = (uint64_t)(uintptr_t)g_m5_1_guest_code;
-    rsp = (uint64_t)(uintptr_t)(g_m5_1_guest_stack + sizeof(g_m5_1_guest_stack));
-
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
-    hype_npt_mark_not_present(g_npt_pd, HYPE_PCI_1_ECAM_GPA);
-    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
-
-    hype_debug_print("m5-1: entry_rip=0x%llx ecam_gpa=0x%llx mmio_addr=0x%llx\n",
-                      (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
-                      (unsigned long long)mmio_phys);
-
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
-    if (ctx == 0) {
-        hype_fatal("m5-1: vcpu_create_long_mode failed");
-    }
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_ept_mark_mmio_hole(HYPE_PCI_1_ECAM_GPA);
-    }
-
-    mmio_mapped = 0;
-    mmio_mapped_base = 0;
-
-    for (;;) {
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("m5-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-        }
-
-        if (vmm_reason_is_npf(kind, info.reason)) {
-            if (vmm_handle_pci_ecam_npf(kind, ctx, &g_m5_1_pci, HYPE_PCI_1_ECAM_GPA,
-                                        info.guest_rip) == 0) {
-                if (!mmio_mapped && hype_pci_memory_space_enabled(&g_m5_1_pci, HYPE_M5_1_VIRTIO_DEV)) {
-                    uint64_t bar4 = hype_pci_get_bar_value(&g_m5_1_pci, HYPE_M5_1_VIRTIO_DEV,
-                                                            HYPE_M5_1_BAR_INDEX);
-                    if (bar4 != 0) {
-                        hype_npt_mark_not_present(g_npt_pd, bar4);
-                        if (kind == HYPE_VMM_KIND_VMX) {
-                            hype_vmx_ept_mark_mmio_hole(bar4);
-                        }
-                        mmio_mapped_base = bar4;
-                        mmio_mapped = 1;
-                        hype_debug_print("m5-1: virtio-blk BAR%u (MMIO) enabled at 0x%llx -- mapping "
-                                          "it now\n",
-                                          HYPE_M5_1_BAR_INDEX, (unsigned long long)bar4);
-                    }
-                }
-                continue;
-            }
-
-            if (mmio_mapped &&
-                vmm_handle_virtio_blk_npf(kind, ctx, &g_m5_1_virtio_blk, &g_m5_1_be,
-                                          /*dma_map=*/0, mmio_mapped_base, info.guest_rip) == 0) {
-                continue;
-            }
-
-            hype_fatal("m5-1: unhandled NPF (qual=0x%llx guest_rip=0x%llx)",
-                       (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
-        }
-
-        break;
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("m5-1: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-    }
-    if (!mmio_mapped || mmio_mapped_base != HYPE_M5_1_MMIO_GPA) {
-        hype_fatal("m5-1: virtio-blk device's MMIO BAR was never dynamically mapped");
-    }
-
-    /* Request 1 (WRITE) round trip: the guest's own pattern must now
-     * be in the backing store at HYPE_M5_1_REQ1_SECTOR, and its status
-     * byte must read S_OK. */
-    {
-        uint64_t sector3_offset = HYPE_M5_1_REQ1_SECTOR * HYPE_VIRTIO_BLK_SECTOR_SIZE;
-        for (i = 0; i < HYPE_M5_1_DATA_LEN; i++) {
-            if (g_m5_1_backing[sector3_offset + i] != (uint8_t)(0xA0u + i)) {
-                hype_fatal("m5-1: WRITE request did not persist correctly at byte %llu", i);
-            }
-        }
-    }
-    if (g_m5_1_req1_status[0] != HYPE_VIRTIO_BLK_S_OK) {
-        hype_fatal("m5-1: WRITE request's own status byte is not S_OK (got 0x%x)",
-                   g_m5_1_req1_status[0]);
-    }
-
-    /* Request 2 (READ) round trip: the host's own pre-placed pattern
-     * at HYPE_M5_1_REQ2_SECTOR must now be in the guest's own data
-     * buffer, and its status byte must read S_OK. */
-    for (i = 0; i < HYPE_M5_1_DATA_LEN; i++) {
-        if (g_m5_1_req2_data[i] != (uint8_t)(0xB0u + i)) {
-            hype_fatal("m5-1: READ request did not deliver the backing store's own data at byte %llu", i);
-        }
-    }
-    if (g_m5_1_req2_status[0] != HYPE_VIRTIO_BLK_S_OK) {
-        hype_fatal("m5-1: READ request's own status byte is not S_OK (got 0x%x)", g_m5_1_req2_status[0]);
-    }
-
-    hype_debug_print(
-        "m5-1: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- virtio-blk discovered "
-        "via PCI BAR%u=0x%llx, feature negotiation + queue setup succeeded, WRITE and READ requests "
-        "both round-tripped correctly through the backing store\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, HYPE_M5_1_BAR_INDEX,
-        (unsigned long long)mmio_mapped_base);
-}
+/*
+ * #550: M5-1's virtio-blk test is gone -- ported to tests/micro/virtioblk.c.
+ *
+ * It pointed the device at a synthetic in-RAM buffer its own launch code set up, so nothing it did
+ * could distinguish a working device from a working memcpy. The port is a modern-virtio driver
+ * against a real `[disk.*] backing = file`, and the harness verifies the written pattern in the
+ * FILE on the host afterwards (#343).
+ */
 
 /*
  * M5-2: a plain ATA hard-disk device (devices/ata_disk.h) behind its
@@ -6647,18 +6202,6 @@ static void run_m5_1_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
  * -> a guest destination buffer) -- exercising both data directions
  * the same way M5-1's own virtio-blk test does.
  */
-static uint8_t g_m5_2_cmd_list[1024] __attribute__((aligned(4096)));
-static uint8_t g_m5_2_cmd_table[4096] __attribute__((aligned(4096)));
-static uint8_t g_m5_2_rx_fis[4096] __attribute__((aligned(4096)));
-static uint8_t g_m5_2_guest_code[512] __attribute__((aligned(4096)));
-static uint8_t g_m5_2_guest_stack[4096] __attribute__((aligned(4096)));
-static uint8_t g_m5_2_media[0x10000] __attribute__((aligned(4096))); /* 128 sectors */
-static uint8_t g_m5_2_identify_result[512] __attribute__((aligned(4096)));
-static uint8_t g_m5_2_write_data[16] __attribute__((aligned(4096)));
-static uint8_t g_m5_2_read_dest[16] __attribute__((aligned(4096)));
-static hype_pci_t g_m5_2_pci;
-static hype_ahci_t g_m5_2_ahci;
-static hype_ata_disk_t g_m5_2_disk;
 
 #define HYPE_M5_2_ATA_DISK_DEV 1u
 /* Same "arbitrary offset from an existing constant, always NPT-
@@ -6716,63 +6259,6 @@ static hype_ata_disk_t g_m5_2_disk;
  *   hlt                                                F4
  *   jmp $-3                                            EB FD
  */
-static const uint8_t g_m5_2_payload_template[] = {
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x24, 0x80, 0x00, 0x00,
-    0xB8, 0x02, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x04, 0x80, 0x00, 0x00,
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x80,
-    0x89, 0x43, 0x04,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x00, 0x01, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x04, 0x01, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x08, 0x01, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x0C, 0x01, 0x00, 0x00,
-    0xB8, 0x11, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x18, 0x01, 0x00, 0x00,
-    0xB8, 0x01, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x38, 0x01, 0x00, 0x00,
-    0x8B, 0x83, 0x38, 0x01, 0x00, 0x00,
-    0x85, 0xC0,
-    0x75, 0xF6,
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB0, 0x35,
-    0x88, 0x83, 0x02, 0x00, 0x00, 0x00,
-    0xB8, 0x05, 0x00, 0x00, 0x40,
-    0x89, 0x83, 0x04, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x80, 0x00, 0x00, 0x00,
-    0xB8, 0x0F, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x8C, 0x00, 0x00, 0x00,
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB8, 0x01, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x38, 0x01, 0x00, 0x00,
-    0x8B, 0x83, 0x38, 0x01, 0x00, 0x00,
-    0x85, 0xC0,
-    0x75, 0xF6,
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB0, 0x25,
-    0x88, 0x83, 0x02, 0x00, 0x00, 0x00,
-    0xB8, 0x14, 0x00, 0x00, 0x40,
-    0x89, 0x83, 0x04, 0x00, 0x00, 0x00,
-    0xB8, 0x00, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x80, 0x00, 0x00, 0x00,
-    0xB8, 0x0F, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x8C, 0x00, 0x00, 0x00,
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB8, 0x01, 0x00, 0x00, 0x00,
-    0x89, 0x83, 0x38, 0x01, 0x00, 0x00,
-    0x8B, 0x83, 0x38, 0x01, 0x00, 0x00,
-    0x85, 0xC0,
-    0x75, 0xF6,
-    0xF4,
-    0xEB, 0xFD
-};
 #define HYPE_M5_2_PAYLOAD_ECAM_RBX_IMM_OFFSET 2
 #define HYPE_M5_2_PAYLOAD_BAR5_VALUE_IMM_OFFSET 11
 #define HYPE_M5_2_PAYLOAD_AHCI_RBX_IMM_OFFSET 34
@@ -6787,205 +6273,12 @@ static const uint8_t g_m5_2_payload_template[] = {
 #define HYPE_M5_2_PAYLOAD_READ_DEST_ADDR_IMM_OFFSET 238
 #define HYPE_M5_2_PAYLOAD_AHCI_RBX_3_IMM_OFFSET 261
 
-static void run_m5_2_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    unsigned long long i;
-    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
-    uint64_t cmd_list_phys, cmd_table_phys, rx_fis_phys;
-    uint64_t identify_phys, write_data_phys, read_dest_phys;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-    int ahci_mapped;
-    uint64_t ahci_mapped_base;
-    uint64_t write_sector_offset, read_sector_offset;
-
-    (void)ops; /* VMX-2: runs under SVM and VMX now. */
-
-    hype_guest_ram_zero(g_m5_2_cmd_list, sizeof(g_m5_2_cmd_list));
-    hype_guest_ram_zero(g_m5_2_cmd_table, sizeof(g_m5_2_cmd_table));
-    hype_guest_ram_zero(g_m5_2_rx_fis, sizeof(g_m5_2_rx_fis));
-    hype_guest_ram_zero(g_m5_2_guest_code, sizeof(g_m5_2_guest_code));
-    hype_guest_ram_zero(g_m5_2_guest_stack, sizeof(g_m5_2_guest_stack));
-    hype_guest_ram_zero(g_m5_2_media, sizeof(g_m5_2_media));
-    hype_guest_ram_zero(g_m5_2_identify_result, sizeof(g_m5_2_identify_result));
-    hype_guest_ram_zero(g_m5_2_write_data, sizeof(g_m5_2_write_data));
-    hype_guest_ram_zero(g_m5_2_read_dest, sizeof(g_m5_2_read_dest));
-
-    for (i = 0; i < HYPE_M5_2_DATA_LEN; i++) {
-        g_m5_2_write_data[i] = (uint8_t)(0xC0u + i);
-    }
-    read_sector_offset = HYPE_M5_2_READ_SECTOR * HYPE_ATA_SECTOR_SIZE;
-    for (i = 0; i < HYPE_M5_2_DATA_LEN; i++) {
-        g_m5_2_media[read_sector_offset + i] = (uint8_t)(0xD0u + i);
-    }
-
-    hype_ata_disk_reset(&g_m5_2_disk, g_m5_2_media, sizeof(g_m5_2_media));
-    hype_ahci_reset(&g_m5_2_ahci);
-    hype_pci_reset(&g_m5_2_pci);
-    hype_pci_add_device(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV, HYPE_PCI_VENDOR_ID_HYPE, 0x0004u, 0x01, 0x06,
-                         0x01);
-    hype_pci_set_bar_size(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV, 5, 0x1000u);
-
-    cmd_list_phys = (uint64_t)(uintptr_t)g_m5_2_cmd_list;
-    cmd_table_phys = (uint64_t)(uintptr_t)g_m5_2_cmd_table;
-    rx_fis_phys = (uint64_t)(uintptr_t)g_m5_2_rx_fis;
-    identify_phys = (uint64_t)(uintptr_t)g_m5_2_identify_result;
-    write_data_phys = (uint64_t)(uintptr_t)g_m5_2_write_data;
-    read_dest_phys = (uint64_t)(uintptr_t)g_m5_2_read_dest;
-
-    /* Command Header slot 0: CFL=5 (unused by this project's own ATA
-     * dispatch), prdtl=1 -- stays fixed across all 3 commands, only
-     * the Command Table's own FIS/PRDT bytes change between them. */
-    hype_write_le32(g_m5_2_cmd_list + 0, 0x00010005u);
-    hype_write_le32(g_m5_2_cmd_list + 4, 0);
-    hype_write_le32(g_m5_2_cmd_list + 8, (uint32_t)cmd_table_phys);
-    hype_write_le32(g_m5_2_cmd_list + 12, (uint32_t)(cmd_table_phys >> 32));
-
-    /* Command Table: H2D Register FIS pre-built for command 1
-     * (IDENTIFY DEVICE) -- the guest's own asm triggers this one
-     * as-is, then patches command/LBA/PRDT bytes in place for
-     * commands 2 and 3. */
-    g_m5_2_cmd_table[0] = 0x27;
-    g_m5_2_cmd_table[1] = 0x80;
-    g_m5_2_cmd_table[2] = HYPE_ATA_CMD_IDENTIFY_DEVICE;
-    /* Count field (bytes 12-13): IDENTIFY ignores it, but WRITE/READ
-     * DMA EXT (commands 2/3) both want exactly 1 sector -- the guest's
-     * own asm never patches these two bytes between commands (nothing
-     * else needs to change here), so setting it once, here, is enough
-     * for all 3 commands. Left at 0 this would resolve to 65536 via
-     * the real "0 means max" convention, failing WRITE/READ's own
-     * bounds check against this test's 128-sector disk. */
-    g_m5_2_cmd_table[12] = 1;
-    g_m5_2_cmd_table[13] = 0;
-    hype_write_le32(g_m5_2_cmd_table + 0x80 + 0, (uint32_t)identify_phys);
-    hype_write_le32(g_m5_2_cmd_table + 0x80 + 4, (uint32_t)(identify_phys >> 32));
-    hype_write_le32(g_m5_2_cmd_table + 0x80 + 12, HYPE_ATA_IDENTIFY_SIZE - 1u);
-
-    for (i = 0; i < sizeof(g_m5_2_payload_template); i++) {
-        g_m5_2_guest_code[i] = g_m5_2_payload_template[i];
-    }
-    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_ECAM_RBX_IMM_OFFSET, HYPE_PCI_1_ECAM_GPA);
-    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_BAR5_VALUE_IMM_OFFSET,
-                     (uint32_t)HYPE_M5_2_AHCI_GPA);
-    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_AHCI_RBX_IMM_OFFSET, HYPE_M5_2_AHCI_GPA);
-    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_CLB_LOW_IMM_OFFSET, (uint32_t)cmd_list_phys);
-    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_CLB_HIGH_IMM_OFFSET,
-                     (uint32_t)(cmd_list_phys >> 32));
-    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_FB_LOW_IMM_OFFSET, (uint32_t)rx_fis_phys);
-    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_FB_HIGH_IMM_OFFSET,
-                     (uint32_t)(rx_fis_phys >> 32));
-    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_TABLE_RBX_1_IMM_OFFSET, cmd_table_phys);
-    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_WRITE_DATA_ADDR_IMM_OFFSET,
-                     (uint32_t)write_data_phys);
-    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_AHCI_RBX_2_IMM_OFFSET, HYPE_M5_2_AHCI_GPA);
-    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_TABLE_RBX_2_IMM_OFFSET, cmd_table_phys);
-    hype_write_le32(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_READ_DEST_ADDR_IMM_OFFSET,
-                     (uint32_t)read_dest_phys);
-    hype_write_le64(g_m5_2_guest_code + HYPE_M5_2_PAYLOAD_AHCI_RBX_3_IMM_OFFSET, HYPE_M5_2_AHCI_GPA);
-
-    entry_rip = (uint64_t)(uintptr_t)g_m5_2_guest_code;
-    rsp = (uint64_t)(uintptr_t)(g_m5_2_guest_stack + sizeof(g_m5_2_guest_stack));
-
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
-    hype_npt_mark_not_present(g_npt_pd, HYPE_PCI_1_ECAM_GPA);
-    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
-
-    hype_debug_print("m5-2: entry_rip=0x%llx ecam_gpa=0x%llx chosen_ahci_gpa=0x%llx\n",
-                      (unsigned long long)entry_rip, (unsigned long long)HYPE_PCI_1_ECAM_GPA,
-                      (unsigned long long)HYPE_M5_2_AHCI_GPA);
-
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
-    if (ctx == 0) {
-        hype_fatal("m5-2: vcpu_create_long_mode failed");
-    }
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_ept_mark_mmio_hole(HYPE_PCI_1_ECAM_GPA);
-    }
-
-    ahci_mapped = 0;
-    ahci_mapped_base = 0;
-
-    for (;;) {
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("m5-2: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-        }
-
-        if (vmm_reason_is_npf(kind, info.reason)) {
-            if (vmm_handle_pci_ecam_npf(kind, ctx, &g_m5_2_pci, HYPE_PCI_1_ECAM_GPA,
-                                        info.guest_rip) == 0) {
-                if (!ahci_mapped &&
-                    hype_pci_memory_space_enabled(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV)) {
-                    uint64_t bar5 = hype_pci_get_bar_value(&g_m5_2_pci, HYPE_M5_2_ATA_DISK_DEV, 5);
-                    if (bar5 != 0) {
-                        hype_npt_mark_not_present(g_npt_pd, bar5);
-                        if (kind == HYPE_VMM_KIND_VMX) {
-                            hype_vmx_ept_mark_mmio_hole(bar5);
-                        }
-                        ahci_mapped_base = bar5;
-                        ahci_mapped = 1;
-                        hype_debug_print("m5-2: ATA disk BAR5 enabled at 0x%llx -- mapping it now\n",
-                                          (unsigned long long)bar5);
-                    }
-                }
-                continue;
-            }
-
-            if (ahci_mapped &&
-                vmm_handle_ahci_disk_npf(kind, ctx, &g_m5_2_ahci, &g_m5_2_disk, ahci_mapped_base) ==
-                    0) {
-                continue;
-            }
-
-            hype_fatal("m5-2: unhandled NPF (qual=0x%llx guest_rip=0x%llx)",
-                       (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
-        }
-
-        break;
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("m5-2: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-    }
-    if (!ahci_mapped || ahci_mapped_base != HYPE_M5_2_AHCI_GPA) {
-        hype_fatal("m5-2: ATA disk device was never dynamically mapped at the chosen BAR5 address");
-    }
-
-    /* IDENTIFY DEVICE round trip. Word 0's bit 15 lives in its own
-     * HIGH byte (byte 1 of the little-endian word), not byte 0. */
-    if ((g_m5_2_identify_result[1] & 0x80u) != 0) {
-        hype_fatal("m5-2: IDENTIFY DEVICE word 0 bit 15 (ATAPI) is set on what should be an ATA device");
-    }
-    if ((g_m5_2_identify_result[99] & 0x02u) == 0) {
-        hype_fatal("m5-2: IDENTIFY DEVICE word 49 does not report LBA support");
-    }
-    if ((g_m5_2_identify_result[167] & 0x04u) == 0) {
-        hype_fatal("m5-2: IDENTIFY DEVICE word 83 does not report LBA48 support");
-    }
-
-    /* WRITE DMA EXT round trip. */
-    write_sector_offset = HYPE_M5_2_WRITE_SECTOR * HYPE_ATA_SECTOR_SIZE;
-    for (i = 0; i < HYPE_M5_2_DATA_LEN; i++) {
-        if (g_m5_2_media[write_sector_offset + i] != (uint8_t)(0xC0u + i)) {
-            hype_fatal("m5-2: WRITE DMA EXT did not persist correctly at byte %llu", i);
-        }
-    }
-
-    /* READ DMA EXT round trip. */
-    for (i = 0; i < HYPE_M5_2_DATA_LEN; i++) {
-        if (g_m5_2_read_dest[i] != (uint8_t)(0xD0u + i)) {
-            hype_fatal("m5-2: READ DMA EXT did not deliver the backing store's own data at byte %llu", i);
-        }
-    }
-
-    hype_debug_print(
-        "m5-2: test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx) -- ATA disk discovered via "
-        "PCI BAR5=0x%llx, IDENTIFY DEVICE + WRITE DMA EXT + READ DMA EXT all round-tripped correctly\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
-        (unsigned long long)ahci_mapped_base);
-}
+/*
+ * #550: M5-2's ATA-disk test is gone -- ported to tests/micro/atadisk.c, sharing its AHCI bring-up
+ * with #548's port. WRITE DMA EXT then READ DMA EXT against a real backing file, with the buffer
+ * poisoned between them so a read that transfers nothing cannot pass by finding what the write
+ * left behind.
+ */
 
 /*
  * FW-1: the first attempt at launching this project's own real,
@@ -17786,7 +17079,7 @@ static void EFIAPI run_all_test_guests(void *arg) {
     HYPE_ST_RUN(1, run_m3_5_linux_shim_test(args->ops, args->kind));
     HYPE_ST_RUN(2, run_m4_3_pflash_mmio_test(args->ops, args->kind));
     /* 3 was M4-4 fw_cfg, ported out in #543 -- see the note at its old definition. */
-    HYPE_ST_RUN(4, run_m4_5_ahci_test(args->ops, args->kind));
+    /* 4 was M4-5 AHCI, ported out in #548 -- see the note at its old definition. */
     /* 5 was VIDEO-2 ramfb, ported out in #549 -- see the note at its old definition. */
     /* 6 was CPUMSR, ported out in #539 -- see the note at its old definition. */
     /* 7 was INT-1/INT-2, ported out in #541 -- see the note at its old definition. */
@@ -17797,8 +17090,8 @@ static void EFIAPI run_all_test_guests(void *arg) {
     /* 12 was PCI-2, ported out in #547 -- see the note at its old definition. */
     /* 13 was ISO-2, retired in #452 -- see the note at its old definition. */
     HYPE_ST_RUN(14, run_video_3_test(args->ops, args->kind));
-    HYPE_ST_RUN(15, run_m5_1_test(args->ops, args->kind));
-    HYPE_ST_RUN(16, run_m5_2_test(args->ops, args->kind));
+    /* 15 was M5-1 virtio-blk, ported out in #550 -- see the note at its old definition. */
+    /* 16 was M5-2 ATA disk, ported out in #550 -- see the note at its old definition. */
     /* M4-6d4 #3: preemption mechanism proof */
     /* 17 was the PAUSE-filter test, ported out in #540 -- see the note at its old definition. */
 
