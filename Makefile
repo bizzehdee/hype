@@ -94,7 +94,7 @@ ESP       := $(BUILD_DIR)/esp
 # belong with the others -- but it is the one thing that surprises.
 MICRO_DIR   := tests/micro
 MICRO_OUT   := $(BUILD_DIR)/micro
-MICRO_NAMES := hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2
+MICRO_NAMES := hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2 pflash
 MICRO_IMAGES := $(patsubst %,$(MICRO_OUT)/%.bin,$(MICRO_NAMES))
 MICRO_CFLAGS := --target=x86_64-unknown-elf -ffreestanding -fno-stack-protector -fno-pic \
                 -mno-red-zone -mno-sse -Wall -Wextra -Werror -O2 -std=c11
