@@ -217,6 +217,74 @@ static void test_boot_disk_no_install_media_required(void) {
     CHECK_INT("firmware legacy", (int)HYPE_CFG_FW_LEGACY, (int)out.vms[0].firmware);
 }
 
+/*
+ * #535: boot = kernel -- a VM with a raw kernel image and no storage and no firmware.
+ * The waivers are the point: a microtest VM has nothing to boot from a disk, so requiring
+ * target_disk and firmware would force every suite config to carry two inert lines.
+ */
+static void test_boot_kernel(void) {
+    const char *cfg =
+        "[vm.ram1]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = kernel\n"
+        "kernel = \\EFI\\hype\\micro\\ram1.bin\n"
+        "os_hint = none\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+
+    CHECK_INT("boot=kernel needs no storage or firmware", HYPE_CFG_OK, res.status);
+    CHECK_INT("one VM parsed", 1, (int)out.vm_count);
+    CHECK_INT("boot mode is kernel", (int)HYPE_CFG_BOOT_KERNEL, (int)out.vms[0].boot);
+    CHECK_INT("has_kernel set", 1, out.vms[0].has_kernel);
+    CHECK_STR("kernel path", "\\EFI\\hype\\micro\\ram1.bin", out.vms[0].kernel);
+}
+
+/* A kernel VM may still be handed a disk -- the keys are no longer REQUIRED, not forbidden. */
+static void test_boot_kernel_with_disk_allowed(void) {
+    const char *cfg =
+        "[vm.ram1]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = kernel\n"
+        "kernel = \\micro\\k.bin\n"
+        "target_disk = file:x.img\n"
+        "firmware = uefi\n"
+        "os_hint = none\n";
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+
+    CHECK_INT("boot=kernel with a disk is still valid", HYPE_CFG_OK, res.status);
+    CHECK_INT("boot mode is kernel", (int)HYPE_CFG_BOOT_KERNEL, (int)out.vms[0].boot);
+}
+
+/* #535: the serializer must round-trip the new mode and its key (#486's write-back path). */
+static void test_boot_kernel_write_back(void) {
+    const char *cfg =
+        "[vm.ram1]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = kernel\n"
+        "kernel = \\micro\\k.bin\n"
+        "os_hint = none\n";
+    hype_cfg_t out;
+    hype_cfg_t back;
+    static char written[16384];
+    hype_cfg_serialize_result_t ser;
+    hype_cfg_result_t res = parse_copy(cfg, &out);
+
+    CHECK_INT("parse ok", HYPE_CFG_OK, res.status);
+    ser = hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("serialize not truncated", 0, ser.truncated);
+    CHECK_INT("boot = kernel was written", 1, strstr(written, "boot = kernel") != NULL);
+    CHECK_INT("kernel path was written", 1, strstr(written, "kernel = \\micro\\k.bin") != NULL);
+
+    res = parse_copy(written, &back);
+    CHECK_INT("re-parse of written config ok", HYPE_CFG_OK, res.status);
+    CHECK_INT("boot mode survived the round trip", (int)HYPE_CFG_BOOT_KERNEL, (int)back.vms[0].boot);
+    CHECK_STR("kernel path survived the round trip", "\\micro\\k.bin", back.vms[0].kernel);
+}
+
 /* ---- error cases ---- */
 
 struct error_case {
@@ -295,6 +363,23 @@ static const struct error_case ERROR_CASES[] = {
     {"cpu_set exceeds MAX_CPUS", "[vm.a]\ncpu_set=0-300\n", HYPE_CFG_ERR_TOO_MANY_ENTRIES},
     {"net_peers too many", "[vm.a]\nnet_peers=a,b,c,d,e,f,g,h,i\n", HYPE_CFG_ERR_TOO_MANY_ENTRIES},
     {"section header too short for '[' + ']'", "[\nvcpus=1\n", HYPE_CFG_ERR_SYNTAX},
+    /* #535 */
+    {"missing kernel when boot=kernel",
+     "[vm.a]\nvcpus=1\nmem_mb=1\nboot=kernel\nos_hint=none\n",
+     HYPE_CFG_ERR_MISSING_REQUIRED},
+    {"kernel set but boot=disk",
+     "[vm.a]\nvcpus=1\nmem_mb=1\nboot=disk\ntarget_disk=file:x\nfirmware=uefi\nos_hint=none\n"
+     "kernel=\\k.bin\n",
+     HYPE_CFG_ERR_BAD_VALUE},
+    {"boot=kernel with install_media",
+     "[vm.a]\nvcpus=1\nmem_mb=1\nboot=kernel\nkernel=\\k.bin\ninstall_media=\\a.iso\n"
+     "os_hint=none\n",
+     HYPE_CFG_ERR_BAD_VALUE},
+    {"missing os_hint when boot=kernel",
+     "[vm.a]\nvcpus=1\nmem_mb=1\nboot=kernel\nkernel=\\k.bin\n",
+     HYPE_CFG_ERR_MISSING_REQUIRED},
+    {"duplicate key kernel", "[vm.a]\nkernel=x\nkernel=y\n", HYPE_CFG_ERR_DUPLICATE_KEY},
+    {"empty kernel", "[vm.a]\nkernel=\n", HYPE_CFG_ERR_BAD_VALUE},
 };
 
 static void test_error_cases(void) {
@@ -2189,6 +2274,9 @@ int main(void) {
     test_seen_fields_survives_compaction();
     test_cpu_set_comma_list();
     test_boot_disk_no_install_media_required();
+    test_boot_kernel();
+    test_boot_kernel_with_disk_allowed();
+    test_boot_kernel_write_back();
     test_error_cases();
     test_too_many_vms();
     test_value_too_long();

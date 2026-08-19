@@ -25,6 +25,33 @@ void hype_paging_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
     }
 }
 
+void hype_paging_build_identity_at(void *gpa0_host, uint64_t pml4_gpa, uint64_t pdpt_gpa,
+                                   uint64_t pd0_gpa, unsigned int gb_to_map) {
+    unsigned char *base = (unsigned char *)gpa0_host;
+    hype_pte_t *pml4 = (hype_pte_t *)(base + pml4_gpa);
+    hype_pte_t *pdpt = (hype_pte_t *)(base + pdpt_gpa);
+    unsigned int i, j;
+
+    for (i = 0; i < HYPE_PAGING_ENTRIES_PER_TABLE; i++) {
+        pml4[i] = 0;
+        pdpt[i] = 0;
+    }
+
+    pml4[0] = hype_paging_encode_entry(pdpt_gpa, HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE);
+
+    for (i = 0; i < gb_to_map; i++) {
+        uint64_t pd_gpa = pd0_gpa + (uint64_t)i * 4096ull;
+        hype_pte_t *pd = (hype_pte_t *)(base + pd_gpa);
+
+        pdpt[i] = hype_paging_encode_entry(pd_gpa, HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE);
+        for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
+            uint64_t phys = (uint64_t)i * HYPE_PAGING_1GB + (uint64_t)j * HYPE_PAGING_2MB;
+            pd[j] = hype_paging_encode_entry(phys,
+                                             HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_PS);
+        }
+    }
+}
+
 unsigned int hype_paging_map_mmio_1gb(hype_pte_t *pml4, hype_pte_t *pdpt, hype_pte_t *pd,
                                        uint64_t phys) {
     uint64_t gb = phys / HYPE_PAGING_1GB;

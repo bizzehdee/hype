@@ -31,7 +31,7 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/png_write.c \
              core/fatal.c core/strutil.c core/guest_ram.c core/mp.c core/linux_boot.c \
              core/admission.c core/file_io.c core/guest_mem.c core/logbuf.c \
-             core/clockfacts.c core/io_histogram.c core/log_drain.c core/log_level.c core/ram_pool.c core/vm_create.c core/render_budget.c core/scancode_queue.c core/ticket_lock.c \
+             core/clockfacts.c core/io_histogram.c core/log_drain.c core/log_level.c core/kboot.c core/ram_pool.c core/vm_create.c core/render_budget.c core/scancode_queue.c core/ticket_lock.c \
              core/host_pci.c core/host_pci_hw.c core/ahci_host.c core/ahci_host_hw.c \
              core/gpt.c core/iso_stream.c core/fat.c core/file_range.c core/fs_ops.c core/ntfs.c core/ext2_alloc.c core/jbd2.c core/ext_jalloc.c core/ext.c core/ext_write.c core/blk_image.c core/blk_qcow2.c core/nvme_host.c core/nvme_host_hw.c core/blk_backend.c core/blk_phys.c core/blk_phys_hw.c core/phys_guard.c \
              core/kbd_decode.c core/vt_screen.c core/vt_render.c core/dashboard.c core/vm_lifecycle.c core/vm_isolation.c core/input_script.c core/input_runner.c core/vm_watchdog.c core/cmdparse.c \
@@ -82,7 +82,36 @@ OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS.fd
 TEST_ISO  ?= /usr/share/edk2/ovmf/UefiShell.iso
 ESP       := $(BUILD_DIR)/esp
 
-.PHONY: all clean test run run-cd run-2disk
+# #535/#534: micro-kernel guest artifacts. Freestanding ELF -> flat binary -> bzImage-shaped
+# image, through the same clang/lld pipeline as hype.efi (no edk2, no extra toolchain).
+#
+# NOT built by `all`, deliberately: these are GUESTS, not part of the hypervisor. They change only
+# when a test changes, and decoupling the two is the whole argument of #534 -- a build of hype must
+# not depend on them, and rebuilding hype must not rebuild them.
+MICRO_DIR   := tests/micro
+MICRO_OUT   := $(BUILD_DIR)/micro
+MICRO_NAMES := hello
+MICRO_IMAGES := $(patsubst %,$(MICRO_OUT)/%.bin,$(MICRO_NAMES))
+MICRO_CFLAGS := --target=x86_64-unknown-elf -ffreestanding -fno-stack-protector -fno-pic \
+                -mno-red-zone -mno-sse -Wall -Wextra -Werror -O2 -std=c11
+MICRO_LDFLAGS := -T $(MICRO_DIR)/micro.ld -nostdlib --build-id=none
+
+.PHONY: all clean test run run-cd run-2disk micro
+
+micro: $(MICRO_IMAGES)
+
+$(MICRO_OUT)/%.elf: $(MICRO_DIR)/%.c $(MICRO_DIR)/crt0.S $(MICRO_DIR)/micro.h $(MICRO_DIR)/micro.ld
+	@mkdir -p $(MICRO_OUT)
+	$(CC) $(MICRO_CFLAGS) -c $< -o $(MICRO_OUT)/$*.o
+	$(CC) --target=x86_64-unknown-elf -ffreestanding -c $(MICRO_DIR)/crt0.S -o $(MICRO_OUT)/crt0.o
+	$(LD) $(MICRO_LDFLAGS) -o $@ $(MICRO_OUT)/crt0.o $(MICRO_OUT)/$*.o
+
+$(MICRO_OUT)/%.flat: $(MICRO_OUT)/%.elf
+	llvm-objcopy -O binary $< $@
+
+$(MICRO_OUT)/%.bin: $(MICRO_OUT)/%.flat
+	tools/micro/mkbzimage.py $< $@
+
 
 all: $(OUT)
 

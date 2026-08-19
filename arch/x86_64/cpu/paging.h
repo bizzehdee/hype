@@ -62,6 +62,27 @@ void hype_paging_build_identity(hype_pte_t *pml4, hype_pte_t *pdpt,
                                  unsigned int gb_to_map);
 
 /*
+ * #535: the same identity hierarchy, but for tables that live at a DIFFERENT
+ * address than the one the entries must name.
+ *
+ * hype_paging_build_identity() encodes each table's own C pointer as the next
+ * level's physical address, which is only correct when the pointer already IS
+ * that address -- true for hype's own host tables and for the identity-mapped
+ * microtest guests, and false for a configured VM. Such a guest's page tables
+ * have to sit in ITS guest RAM, so hype writes them through a host pointer
+ * (`gpa0_host` + offset) while the entries must name guest-physical addresses.
+ * Encoding the host pointer there hands the guest a CR3 pointing into host RAM.
+ *
+ * `gpa0_host` is where guest-physical 0 is mapped in the caller's address
+ * space. `pml4_gpa`, `pdpt_gpa` and `pd0_gpa` are guest-physical, 4KB-aligned,
+ * and must all fall inside the caller's mapping; the PD tables are `gb_to_map`
+ * consecutive pages from `pd0_gpa`. The resulting map is identity over
+ * [0, gb_to_map GB) in 2MB pages, so guest-virtual == guest-physical.
+ */
+void hype_paging_build_identity_at(void *gpa0_host, uint64_t pml4_gpa, uint64_t pdpt_gpa,
+                                   uint64_t pd0_gpa, unsigned int gb_to_map);
+
+/*
  * Adds a 2MB-page identity mapping for the 1GB-aligned region(s) that
  * cover [phys_base, phys_base+size) into an already-built PML4[0]->pdpt
  * hierarchy (i.e. call after hype_paging_build_identity, sharing its

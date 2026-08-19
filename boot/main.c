@@ -92,6 +92,7 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #include "../arch/x86_64/vmx/ept.h" /* VMX-4 (#236): per-VM EPT build */
 #include "../arch/x86_64/vmx/vmx.h"  /* #242: hype_vmx_enable_on for the AP landing */
 #include "../core/linux_boot.h"
+#include "../core/kboot.h"
 #include "../devices/pic.h"
 #include "../devices/pit.h"
 #include "../devices/pflash.h"
@@ -939,6 +940,15 @@ typedef struct hype_fw_vm {
      */
     unsigned threads_per_core;
     hype_vcpu_ctx_t *vcpu[HYPE_MAX_VCPUS_PER_VM];
+    /*
+     * #535: `boot = kernel` -- this VM boots a raw kernel image with no guest firmware. Set in
+     * Phase 1 by fw_1_resolve_kernel(); kplan is filled by fw_1_load_kernel() once the image has
+     * been read and validated, and holds the entry/CR3/RSP/zero-page this VM enters at.
+     */
+    int kernel_boot;
+    int kernel_loaded;
+    const char *kernel_path;
+    hype_kboot_plan_t kplan;
     const char *media;      /* boot-media short name; points at media_buf below */
     /*
      * #391: fw_1_media_path()'s generated default ("\iso\vmN.iso" for a VM with no
@@ -5529,6 +5539,20 @@ static void vmm_reset_realmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint6
     }
 }
 
+/*
+ * #535: the same shim for a long-mode entry. `table_root` is passed THROUGH to both backends,
+ * unlike vmm_create_long_mode() which forces 0 on VMX -- there the root is an SVM NPT table the
+ * microtests built, here it is this VM's own EPT root and must be used (#272).
+ */
+static void vmm_reset_longmode(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t guest_rip,
+                               uint64_t guest_cr3, uint64_t guest_rsp, uint64_t table_root) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_reset_longmode(ctx, guest_rip, guest_cr3, guest_rsp, table_root);
+    } else {
+        hype_svm_vcpu_reset_longmode(ctx, guest_rip, guest_cr3, guest_rsp, table_root);
+    }
+}
+
 /* Defined further down; the SIPI path below needs it to read the guest's wakeup buffer. */
 static const uint8_t *fw_1_guest_phys_to_host(hype_fw_vm_t *vm, uint64_t gpa);
 
@@ -9628,6 +9652,7 @@ static hype_cfg_t g_hype_cfg;
  * #454: these two do the actual file I/O and must run on the BSP. Callers use
  * fw_1_vars_request() below instead, which runs them inline when the caller IS the BSP and
  * otherwise posts the work to it. */
+static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi); /* #535 */
 static void fw_1_save_vars(hype_fw_vm_t *vm);
 static void fw_1_load_saved_vars(hype_fw_vm_t *vm);
 
@@ -11888,10 +11913,37 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
         }
     }
 
-    vmm_reset_realmode(kind, ctx, reset_cs_base, stack_top, npt_root_phys);
+    /*
+     * #535: a kernel-boot VM restarts by RE-READING its image. The RAM zero above wiped the
+     * payload, the guest page tables and the zero page, so resetting the vCPU without reloading
+     * would enter a guest whose entry point is now zeroed memory. Re-reading is also the honest
+     * behaviour for a restart: it picks up an artifact the operator has replaced since boot,
+     * which is the whole point of decoupling the artifacts from the build (#534).
+     */
+    if (vm->kernel_boot) {
+        unsigned vi_k = (unsigned)(vm - g_vms);
+        if (fw_1_load_kernel(vm, vi_k) != 0) {
+            /* Do not reset the vCPU at all: there is nothing valid to enter. Leaving the VM OFF
+             * keeps the host and every other VM up, and the reason is already logged above. */
+            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1: vm%u restart ABANDONED -- its kernel could not be "
+                             "re-read; the VM stays off [#535]\n", vi_k);
+            vm->lifecycle = HYPE_VM_OFF;
+            return;
+        }
+        vmm_reset_longmode(kind, ctx, vm->kplan.entry_gpa, vm->kplan.cr3_gpa, vm->kplan.rsp_gpa,
+                           npt_root_phys);
+        vmm_set_rsi(kind, ctx, vm->kplan.zero_page_gpa);
+    } else {
+        vmm_reset_realmode(kind, ctx, reset_cs_base, stack_top, npt_root_phys);
+    }
     vmm_set_pvclock(kind, ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
     vmm_set_hv_enabled(kind, ctx, vm->hv_leaves);
-    vmm_set_rip(kind, ctx, reset_rip);
+    /* #535: a kernel guest's RIP is its 64-bit entry point, already set by the long-mode reset
+     * above. Overwriting it with the real-mode reset RIP would enter the kernel at offset 0xFFF0
+     * of its own load address. */
+    if (!vm->kernel_boot) {
+        vmm_set_rip(kind, ctx, reset_rip);
+    }
     vmm_set_exception_intercepts(kind, ctx, (1u << 6));
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
         vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
@@ -13400,14 +13452,141 @@ static void fw_1_phase1_firmware(void) {
                      (unsigned long long)g_vms[0].combined_host_phys);
 }
 
+/*
+ * #535: which kernel image, if any, this VM boots. Nothing is read here -- this only records
+ * the config's answer, because Phase 1 resolves every VM's shape before any of their RAM exists.
+ */
+static void fw_1_resolve_kernel(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigned vm_index) {
+    const hype_cfg_vm_t *cv = (vm_index < cfg->vm_count) ? &cfg->vms[vm_index] : 0;
+
+    vmp->kernel_boot = 0;
+    vmp->kernel_loaded = 0;
+    vmp->kernel_path = 0;
+    if (cv == 0 || cv->boot != HYPE_CFG_BOOT_KERNEL) {
+        return;
+    }
+    vmp->kernel_boot = 1;
+    vmp->kernel_path = cv->kernel;
+    HYPE_LOGF(HYPE_LOG_INFO,
+              "fw-1 vm%u: boot = kernel -- '%s', no guest firmware in the path [#535]\n", vm_index,
+              cv->kernel);
+}
+
+/*
+ * #535: read this VM's kernel image through hype's own FS stack and lay its guest RAM out for a
+ * long-mode entry -- payload, guest page tables and zero page.
+ *
+ * Returns 0 when the VM is ready to launch. A non-zero return means THIS VM cannot run and says
+ * why; the caller refuses it and every other VM is unaffected. Nothing here is fatal to the host:
+ * one bad artifact in a suite config must not take a whole board of VMs down with it.
+ */
+static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi) {
+    hype_fs_t *bv = fw_1_boot_volume();
+    hype_fs_file_t f;
+    static unsigned char head[HYPE_KBOOT_HEAD_BYTES];
+    hype_kboot_status_t st;
+    unsigned char *ram;
+    unsigned int head_read;
+    hype_linux_e820_entry_t e820[1];
+
+    if (!vm->kernel_boot) {
+        return 0;
+    }
+    if (bv == 0) {
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u: no boot volume -- '%s' cannot be read [#535]\n", vi,
+                  vm->kernel_path ? vm->kernel_path : "(unset)");
+        return -1;
+    }
+    if (vm->ram_host_phys == 0ull || vm->ram_bytes == 0ull) {
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u: no guest RAM carved -- '%s' has nowhere to load "
+                                  "[#535]\n", vi, vm->kernel_path ? vm->kernel_path : "(unset)");
+        return -1;
+    }
+    if (vm->kernel_path == 0 || vm->kernel_path[0] == '\0') {
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u: boot = kernel with no kernel path [#535]\n", vi);
+        return -1;
+    }
+    if (hype_fs_lookup(bv, vm->kernel_path, &f) != 0) {
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u: kernel '%s' not found on the boot volume [#535]\n",
+                  vi, vm->kernel_path);
+        return -1;
+    }
+    head_read = (f.size < (uint64_t)HYPE_KBOOT_HEAD_BYTES) ? (unsigned int)f.size
+                                                          : HYPE_KBOOT_HEAD_BYTES;
+    if (hype_fs_read_at(&f, 0ull, head, head_read) != 0) {
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u: kernel '%s' could not be read [#535]\n", vi,
+                  vm->kernel_path);
+        return -1;
+    }
+    st = hype_kboot_plan(head, head_read, f.size, vm->ram_bytes, &vm->kplan);
+    if (st != HYPE_KBOOT_OK) {
+        HYPE_LOGF(HYPE_LOG_ERROR,
+                  "fw-1 vm%u: kernel '%s' REFUSED -- %s (image %llu B, this VM has %llu MiB; a "
+                  "%llu B payload needs mem_mb >= %llu) [#535]\n",
+                  vi, vm->kernel_path, hype_kboot_status_str(st), (unsigned long long)f.size,
+                  (unsigned long long)(vm->ram_bytes / (1024ull * 1024ull)),
+                  (unsigned long long)f.size,
+                  (unsigned long long)(hype_kboot_min_ram_bytes(f.size) / (1024ull * 1024ull) + 1ull));
+        return -1;
+    }
+    /* hype_fs_read_at takes a 32-bit length. A microtest kernel is kilobytes; anything near 4 GB
+     * is a wrong file, not a kernel, and is refused rather than silently short-read. */
+    if (vm->kplan.payload_bytes > 0xFFFF0000ull) {
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u: kernel '%s' payload is %llu B -- too large to load "
+                                  "[#535]\n", vi, vm->kernel_path,
+                  (unsigned long long)vm->kplan.payload_bytes);
+        return -1;
+    }
+
+    ram = (unsigned char *)(uintptr_t)vm->ram_host_phys;
+    /* M2-6 hard invariant: the whole region zeroed before this guest's first VM-entry. The carve
+     * path already zeroes, and a RESTART comes back through here -- so do it again rather than
+     * depend on which path got here. */
+    hype_guest_ram_zero(ram, vm->ram_bytes);
+
+    if (hype_fs_read_at(&f, (uint64_t)vm->kplan.payload_file_offset,
+                        ram + vm->kplan.payload_load_gpa,
+                        (unsigned int)vm->kplan.payload_bytes) != 0) {
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u: kernel '%s' payload read failed [#535]\n", vi,
+                  vm->kernel_path);
+        return -1;
+    }
+
+    /* The guest's OWN page tables, inside its OWN RAM -- see hype_paging_build_identity_at(). */
+    hype_paging_build_identity_at(ram, HYPE_KBOOT_PML4_GPA, HYPE_KBOOT_PDPT_GPA,
+                                  HYPE_KBOOT_PD0_GPA, vm->kplan.gb_to_map);
+
+    e820[0].addr = 0ull;
+    e820[0].size = vm->ram_bytes;
+    e820[0].type = HYPE_LINUX_E820_TYPE_RAM;
+    hype_linux_build_zero_page(
+        (hype_linux_boot_params_t *)(ram + vm->kplan.zero_page_gpa),
+        (const hype_linux_setup_header_t *)(head + HYPE_LINUX_SETUP_HEADER_OFFSET), 0u, 0u, 0u,
+        e820, 1u);
+
+    vm->kernel_loaded = 1;
+    HYPE_LOGF(HYPE_LOG_INFO,
+              "fw-1 vm%u: kernel '%s' loaded -- %llu B payload @gpa 0x%llx, entry 0x%llx, cr3 "
+              "0x%llx, rsp 0x%llx, zero page 0x%llx, %u GB identity-mapped [#535]\n",
+              vi, vm->kernel_path, (unsigned long long)vm->kplan.payload_bytes,
+              (unsigned long long)vm->kplan.payload_load_gpa,
+              (unsigned long long)vm->kplan.entry_gpa, (unsigned long long)vm->kplan.cr3_gpa,
+              (unsigned long long)vm->kplan.rsp_gpa, (unsigned long long)vm->kplan.zero_page_gpa,
+              vm->kplan.gb_to_map);
+    return 0;
+}
+
 /* #531: mark one VM as refused, by index, and say so once. */
 static void fw_1_refuse_vm(unsigned vi) {
     if (g_vm_refused == 0 || vi >= g_max_vms || g_vm_refused[vi] != 0u) {
         return;
     }
     g_vm_refused[vi] = 1u;
-    HYPE_LOGF(HYPE_LOG_ERROR, "adm: vm%u WILL NOT RUN -- refused by an isolation check above; every other "
-                     "VM is unaffected [#531]\n", vi);
+    /* #537: the reason is always logged on its own line immediately before this, and it is not
+     * always an isolation check -- #535 refuses a VM whose kernel image will not load. Do not
+     * assert a category this function cannot know. */
+    HYPE_LOGF(HYPE_LOG_ERROR, "adm: vm%u WILL NOT RUN -- refused by the check reported above; every "
+                     "other VM is unaffected [#531]\n", vi);
 }
 
 static void fw_1_phase1_config(void) {
@@ -13608,6 +13787,7 @@ static void fw_1_phase1_config(void) {
             fw_1_resolve_guest_ram(&g_vms[vi], &g_hype_cfg, vi);
             fw_1_resolve_os_hint(&g_vms[vi], &g_hype_cfg, vi);
             fw_1_resolve_vcpus(&g_vms[vi], &g_hype_cfg, vi);
+            fw_1_resolve_kernel(&g_vms[vi], &g_hype_cfg, vi); /* #535 */
         }
     }
 
@@ -13649,6 +13829,17 @@ static void fw_1_phase1_config(void) {
             (unsigned long long)vmn->ram_host_phys,
             (unsigned long long)(vmn->ram_bytes / (1024ULL * 1024ULL)),
             (unsigned long long)vmn->host_tsc_hz);
+    }
+
+    /*
+     * #535: every kernel-boot VM's image, last -- it writes into guest RAM, so it can only run
+     * once every carve above has happened. A VM whose kernel will not load is refused here rather
+     * than launched into a guest that would execute zeroed RAM.
+     */
+    for (unsigned vi = 0u; vi < g_vm_count; vi++) {
+        if (g_vms[vi].kernel_boot && fw_1_load_kernel(&g_vms[vi], vi) != 0) {
+            fw_1_refuse_vm(vi);
+        }
     }
 }
 
@@ -13890,12 +14081,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_gpa_map_add(&g_fw_1_dma_map, 0x100000000ULL - g_fw_1_combined_size, g_fw_1_combined_host_phys,
                       g_fw_1_combined_size);
 
-    HYPE_LOGF(HYPE_LOG_INFO, 
-        "fw-1: launching real OVMF at cs_base=0x%llx rip=0x%llx (guest-physical [0x%llx,0x100000000) -> "
-        "host-physical 0x%llx)\n",
-        (unsigned long long)reset_cs_base, (unsigned long long)reset_rip,
-        (unsigned long long)(0x100000000ULL - g_fw_1_combined_size),
-        (unsigned long long)g_fw_1_combined_host_phys);
+    if (vm->kernel_boot) {
+        /* #535: no firmware in this VM's path -- the flash window above is still mapped and still
+         * read-only, and simply never executed. */
+        HYPE_LOGF(HYPE_LOG_INFO,
+                  "fw-1: launching kernel '%s' in long mode at rip=0x%llx cr3=0x%llx rsp=0x%llx "
+                  "(no guest firmware) [#535]\n",
+                  vm->kernel_path ? vm->kernel_path : "(unset)",
+                  (unsigned long long)vm->kplan.entry_gpa, (unsigned long long)vm->kplan.cr3_gpa,
+                  (unsigned long long)vm->kplan.rsp_gpa);
+    } else {
+        HYPE_LOGF(HYPE_LOG_INFO, 
+            "fw-1: launching real OVMF at cs_base=0x%llx rip=0x%llx (guest-physical [0x%llx,0x100000000) -> "
+            "host-physical 0x%llx)\n",
+            (unsigned long long)reset_cs_base, (unsigned long long)reset_rip,
+            (unsigned long long)(0x100000000ULL - g_fw_1_combined_size),
+            (unsigned long long)g_fw_1_combined_host_phys);
+    }
 
     /* VMX-4 (#236): through the vtable, not the SVM entry point. npt_root_phys
      * was already set to this VM's EPT root above when the backend is VMX. */
@@ -13915,6 +14117,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * Dispatching them is SMP-6.
      */
     vm->vcpu[0] = ctx;
+    /*
+     * #535: a kernel-boot VM's BSP enters in LONG mode, not at the reset vector. Done here, right
+     * after create and before anything else writes this vCPU's VMCB/VMCS: the reset rebuilds the
+     * control block from scratch, so a bit set earlier would be silently discarded. Everything
+     * after this point -- topology, pvclock, the intercept edits below -- applies on top.
+     *
+     * The APs below are deliberately NOT reset: an x86 AP comes out of reset in real mode and
+     * waits for INIT/SIPI whatever its BSP is running, so real mode is the correct state for
+     * them here too.
+     */
+    if (vm->kernel_boot) {
+        vmm_reset_longmode(kind, ctx, vm->kplan.entry_gpa, vm->kplan.cr3_gpa, vm->kplan.rsp_gpa,
+                           npt_root_phys);
+        /* The Linux boot protocol's one register contract: RSI holds the zero page. After the
+         * reset, which zeroes every GPR. */
+        vmm_set_rsi(kind, ctx, vm->kplan.zero_page_gpa);
+    }
     if (vm->vcpu_count == 0u) {
         vm->vcpu_count = 1u; /* a VM created outside the resolver path (self-tests) */
     }
@@ -13993,7 +14212,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * pvclock writes land in the other's RAM (M8-0b STEP 2 dead-halt bug). */
     vmm_set_pvclock(kind, ctx, &g_fw_1_dma_map, g_fw_1_host_tsc_hz);
     vmm_set_hv_enabled(kind, ctx, vm->hv_leaves);
-    vmm_set_rip(kind, ctx, reset_rip);
+    /* #535: a kernel guest's RIP is its 64-bit entry point, set by the long-mode reset above.
+     * Overwriting it with the real-mode reset RIP starts the guest at linear 0xFFF0 -- which
+     * does not fail cleanly: it slides through zeroed guest RAM (0x00 0x00 decodes as
+     * `add [rax],al`) all the way to the payload and runs it anyway, so the guest LOOKS correct
+     * while the entry point was never used. Caught exactly that way; the artifacts now fill
+     * their pre-entry region with INT3 so a slide cannot reach the payload again. */
+    if (!vm->kernel_boot) {
+        vmm_set_rip(kind, ctx, reset_rip);
+    }
     /* M4-6: let the guest own every exception vector. OVMF and any OS it
      * boots (real Linux takes routine #PF/#GP/#UD/#NM) handle their own
      * faults via their own IDTs; intercepting exceptions -- the strict
@@ -21367,7 +21594,10 @@ static void term_config_cmd(int idx, const char *nm) {
         term_cfg_line(nm, "cpu_set", "(unpinned)", 0);
     }
     term_cfg_line_uint(nm, "mem_mb", vm->mem_mb, (sf & HYPE_CFG_F_MEM_MB) != 0);
-    term_cfg_line(nm, "boot", vm->boot == HYPE_CFG_BOOT_DISK ? "disk" : "installer",
+    term_cfg_line(nm, "boot",
+                  (vm->boot == HYPE_CFG_BOOT_DISK)     ? "disk"
+                  : (vm->boot == HYPE_CFG_BOOT_KERNEL) ? "kernel" /* #535 */
+                                                       : "installer",
                  (sf & HYPE_CFG_F_BOOT) != 0);
     term_cfg_line(nm, "install_media", vm->has_install_media ? vm->install_media : "(none)",
                  (sf & HYPE_CFG_F_INSTALL_MEDIA) != 0);

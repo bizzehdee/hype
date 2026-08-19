@@ -172,6 +172,14 @@ CFGEOF
             _n=$((_n + 1))
         done
     fi
+    # #535: HYPE_KERNELS=<paths> drops micro-kernel images at \EFI\hype\micro\<basename>, which a
+    # `boot = kernel` VM points at. Space separated, so one config can boot several of them.
+    if [ -n "${HYPE_KERNELS:-}" ]; then
+        mmd -i "$ESP@@1M" ::/EFI/hype/micro 2>/dev/null || true
+        for _k in $HYPE_KERNELS; do
+            mcopy -i "$ESP@@1M" "$_k" "::/EFI/hype/micro/$(basename "$_k")"
+        done
+    fi
     # HYPE_DISK=<path> drops a raw disk image at \hype\disks\<basename>, which a hype.cfg
     # `[disk.*] backing = file` entry can then point at.
     # Several images may be given, space separated, for a multi-disk config (#329).

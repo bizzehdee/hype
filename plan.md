@@ -201,7 +201,7 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
                             ; siblings with each other. Default: the VM's own
                             ; name, i.e. shares with nobody (default-deny)
   mem_mb = 8192
-  boot = installer        ; installer | disk
+  boot = installer        ; installer | disk | kernel (§10 decision 45)
   install_media = \EFI\hype\win11.iso
   target_disk = file:\hype\disks\win11.img   ; file:<path> | physical:<serial-or-guid>
   target_disk_size_gb = 128                  ; only used when creating a new file: target
@@ -2330,6 +2330,47 @@ isn't lost.
     A Bochs/QEMU-register-only setter, which needs no per-generation work, is a
     reasonable follow-up if live resolution changes on a rig are ever wanted; it
     would not remove the GOP dependency on real hardware.
+
+45. **Direct kernel boot -- decided: `boot = kernel` is a first-class boot mode,
+    not a test-only hook (2026-08-19, #535/#534).**
+
+    **What forced the decision.** #534 moves the 18 self-test guests out of
+    `boot/main.c` and into build artifacts "booted like any other kernel in a
+    configured VM". Nothing in `hype.cfg` could point a VM at a kernel image:
+    `boot` took `installer` or `disk`, and both go through OVMF. The M3 shim that
+    makes a firmware-free boot possible (`core/linux_boot.c`) had existed and been
+    unit-tested since M3-3, and was reachable only from one in-binary microtest --
+    exactly the coupling #534 exists to remove.
+
+    **The rule.** `boot = kernel` plus `kernel = <path>` loads a bzImage-shaped
+    image into the VM's guest RAM and enters it in long mode at its 64-bit entry
+    with `RSI` on the zero page. No guest firmware is in the path. Everything else
+    is the ordinary VM path: the same admission, the same RAM carve, the same
+    NPT/EPT build and DMA map, the same device model, the same dispatch loop, the
+    same per-VM log. A kernel VM needs no storage and no `firmware` key, so those
+    are waived for that mode alone; naming both a `kernel` and an `install_media`
+    is refused rather than resolved by precedence. A kernel that will not load
+    refuses that one VM and says why -- never fatal to the host, so one bad
+    artifact in a suite config cannot take the other VMs down.
+
+    **Guest page tables live in guest RAM.** Guest CR3 is a guest-physical
+    address, and a configured VM's RAM starts at GPA 0 mapped to a host carve, so
+    the tables cannot be the host-resident ones the existing microtests use. Those
+    only work because they run identity-mapped, which is itself a way the
+    in-binary battery differs from every real guest.
+
+    **Rejected: a UEFI-application microtest on a FAT image, booted via
+    `boot = disk`.** It needs no new load path at all, which is genuinely
+    attractive. It was rejected because it changes what the tests test: OVMF has
+    already enumerated PCI, programmed BARs and claimed the framebuffer before the
+    first instruction of a test whose subject is often exactly that emulation, and
+    it spends seconds of firmware startup per guest that executes tens of bytes.
+
+    **Rejected: keeping the battery in-binary and only extracting the payloads.**
+    It shrinks `boot/main.c` without removing the coupling: the asserts, the
+    bespoke launch path and the `HYPE_SELFTEST_LIMIT` rebuild-to-bisect knob all
+    survive, and a microtest still cannot use the media path real guests use --
+    which is what retired ISO-2 in #452.
 
 ## 11. Pre-M0 readiness checklist
 

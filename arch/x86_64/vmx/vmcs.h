@@ -81,6 +81,14 @@ void hype_vmx_ept_mark_mmio_hole(uint64_t gpa);
  */
 hype_vcpu_ctx_t *hype_vmx_vcpu_create(uint64_t guest_rip, uint64_t guest_rsp,
                                       uint64_t ept_or_npt_root);
+/*
+ * #535: rebuild an EXISTING vCPU as a long-mode guest, keeping its pool slot and this VM's EPT
+ * root. The reset counterpart of hype_vmx_vcpu_reset_realmode, for `boot = kernel`. A zero
+ * ept_root selects VMX's own identity EPT, same convention as the realmode reset.
+ */
+void hype_vmx_vcpu_reset_longmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_cr3,
+                                  uint64_t guest_rsp, uint64_t ept_root);
+
 /* Long-mode vCPU create (VMX mirror of hype_svm_vcpu_create_long_mode), used by
  * the M2-M4-5 microtests: flat 64-bit guest at entry_rip with guest_cr3. */
 hype_vcpu_ctx_t *hype_vmx_vcpu_create_long_mode(uint64_t entry_rip, uint64_t guest_cr3,

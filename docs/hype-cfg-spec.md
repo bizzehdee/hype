@@ -136,7 +136,8 @@ as the default display name.
 | `cpu_mode` | `dedicated` \| `shared` | `dedicated` | scheduling tier (plan.md §3, §10 decision 39). `dedicated` = exclusive 1:1 pinning, no scheduler on the dispatch path. `shared` = time-sliced onto a pooled set of cores, so the host may run more vCPUs than it has cores. A core may never be in both a dedicated `cpu_set` and the shared pool — admission refuses it (§6i). |
 | `isolation_group` | free text | the section `<name>` | trust group for core sharing. VMs naming the same group may share cores and SMT siblings freely, with no cross-VM µarch flush. Distrusting groups never occupy one physical core simultaneously, and L1D + IBPB are flushed when a core changes group. Enforced by allocating **whole physical cores** to one group at a time, **not** by disabling SMT (plan.md §10 decision 40) — so the pool's allocation quantum is a core, and many small distrusting groups leave sibling threads idle. Naming one group for mutually-trusting VMs restores full thread density. The default — each VM its own group — is **default-deny**: configuring nothing gives the strict behaviour. Only meaningful with `cpu_mode = shared`. |
 | `mem_mb` | int, **1 .. host usable MB** | — (required) | ≥1 MB; admission caps at host RAM (§10) |
-| `boot` | `installer` \| `disk` | `installer` | two-phase (§5.4 / plan.md §6d) |
+| `boot` | `installer` \| `disk` \| `kernel` | `installer` | two-phase (§5.4 / plan.md §6d); `kernel` is the firmware-free direct kernel boot of §5.4b (#535) |
+| `kernel` | path | (none) | required when `boot = kernel`, and rejected otherwise — a raw guest kernel image loaded straight into guest RAM (§5.4b, #535) |
 | `firmware` | `uefi` \| `legacy` | `uefi` | |
 | `os_hint` | `windows`\|`linux`\|`bsd`\|`none` | `none` | drives `bus` defaults (§5.6) |
 | `disks` | `<disk-id>` list | (empty) | ordered hard disks (`type=disk` `[disk.*]`); **0..N**, mixed bus allowed (§5.7) |
@@ -214,6 +215,34 @@ host memory.
 `[disk.<id>]` carries the same axis as `source_disk` (§5.3), added with the
 stanza in #222 — so a `[disk.*]` image or ISO can also name the drive it lives
 on, not just a VM's `install_media`.
+
+### 5.4b `boot = kernel` — direct kernel boot, no guest firmware (#535)
+
+`boot = kernel` loads the image named by `kernel` into the VM's guest RAM through
+the Linux/x86_64 boot protocol (`core/linux_boot.h`) and enters it in long mode at
+its 64-bit entry point, with `RSI` pointing at the zero page. No guest firmware
+runs: there is no OVMF, no BDS, no boot order, and nothing has touched PCI or the
+framebuffer before the guest's first instruction.
+
+The image must be bzImage-shaped — a valid `setup_header` at file offset `0x1F1`
+with `boot_flag = 0xAA55`, `header = "HdrS"`, `version >= 2.10` and the
+`XLF_KERNEL_64` bit set. A 32-bit-only kernel is unsupported, not degraded
+(plan.md: x86_64 guests only).
+
+Such a VM needs no storage and no firmware, so `target_disk`/`disks`/`cdroms` and
+`firmware` are **not required** for it — the only mode where that is true. They
+stay legal: a kernel VM may be given a disk to exercise the block path. What is
+not legal is naming both a `kernel` and an `install_media`, which is two answers to
+"what does this VM boot"; that is refused, not resolved by precedence.
+
+A kernel that cannot be loaded — missing file, bad header, payload too large for
+the VM's RAM — refuses **that VM** and says why. It is never fatal to the host, so
+one bad artifact in a suite config cannot take the other VMs down with it.
+
+The originating use is #534's microtest suites: each in-binary self-test guest
+becomes its own build artifact, selected by a config rather than compiled into the
+hypervisor. The mode itself is general — it is the M3 direct-boot path reaching
+the config, not a test-only hook.
 
 ### 5.5 `[nic.<id>]` — a network device + `[switch.<id>]` — a virtual network (NEW)
 

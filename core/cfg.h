@@ -17,8 +17,9 @@
  *   vcpus = 4
  *   cpu_set = 4-7            ; optional; ranges and comma lists both work
  *   mem_mb = 8192
- *   boot = installer         ; installer | disk
+ *   boot = installer         ; installer | disk | kernel
  *   install_media = \EFI\hype\win11.iso   ; required when boot=installer
+ *   kernel = \EFI\hype\micro\ram1.bin    ; required when boot=kernel
  *   target_disk = file:\hype\disks\win11.img   ; file:<path> | physical:<id>
  *   target_disk_size_gb = 128            ; optional, only for new file: targets
  *   firmware = uefi          ; uefi | legacy
@@ -62,7 +63,14 @@
 
 typedef enum {
     HYPE_CFG_BOOT_INSTALLER,
-    HYPE_CFG_BOOT_DISK
+    HYPE_CFG_BOOT_DISK,
+    /*
+     * #535: a raw guest kernel image, loaded straight into guest RAM through the Linux
+     * x86_64 boot protocol (core/linux_boot.h) with no guest firmware in the path at all.
+     * Needs `kernel = <path>` and no storage: such a VM has no disk to boot from by
+     * construction, which is why validate_required() waives the storage requirement for it.
+     */
+    HYPE_CFG_BOOT_KERNEL
 } hype_cfg_boot_t;
 
 typedef enum {
@@ -124,6 +132,15 @@ typedef struct {
 
     int has_install_media;
     char install_media[HYPE_CFG_PATH_MAX];
+
+    /*
+     * #535: the guest kernel image for boot = kernel. Required for that mode and rejected
+     * for the other two -- a config naming both a kernel and an installer ISO is giving two
+     * answers to "what does this VM boot", and picking one silently is the #285 class of
+     * defect this parser keeps being extended to avoid.
+     */
+    int has_kernel;
+    char kernel[HYPE_CFG_PATH_MAX];
 
     /*
      * #323: WHICH host drive the media (and file-backed image) lives on, matched by drive
@@ -213,7 +230,8 @@ enum {
     HYPE_CFG_F_DISKS = 1u << 14,
     HYPE_CFG_F_CDROMS = 1u << 15,
     HYPE_CFG_F_BOOT_ORDER = 1u << 16, /* #323 */
-    HYPE_CFG_F_LABEL = 1u << 17       /* #357 */
+    HYPE_CFG_F_LABEL = 1u << 17,      /* #357 */
+    HYPE_CFG_F_KERNEL = 1u << 18      /* #535 */
 };
 
 /*

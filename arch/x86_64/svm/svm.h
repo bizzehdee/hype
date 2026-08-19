@@ -257,6 +257,14 @@ hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t gue
                                                  uint64_t npt_root);
 
 /*
+ * #535: rebuild an EXISTING vCPU as a long-mode guest, keeping its VMCB pool slot and this VM's
+ * NPT root -- the reset counterpart of hype_svm_vcpu_reset_realmode, for `boot = kernel`.
+ * Exempt from unit testing for the same reason as the create above.
+ */
+void hype_svm_vcpu_reset_longmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_cr3,
+                                  uint64_t guest_rsp, uint64_t npt_root);
+
+/*
  * Sets the value RSI will hold at this vCPU's next VM-entry (M3-5) --
  * see vmcb.h's hype_vmcb_build_long_mode_guest() comment for why this
  * isn't a VMCB field. The Linux boot protocol requires RSI to hold the

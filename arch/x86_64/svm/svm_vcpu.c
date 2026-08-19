@@ -597,6 +597,38 @@ void hype_svm_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
     reset_gprs(ctx);
 }
 
+/*
+ * #535: rebuild THIS vCPU as a 64-bit long-mode guest, in place -- the long-mode counterpart of
+ * hype_svm_vcpu_reset_realmode above, for `boot = kernel`.
+ *
+ * A reset rather than hype_svm_vcpu_create_long_mode() because a configured VM's vCPU already
+ * exists and already holds this VM's pool slot: creating would take a second slot for the same
+ * vCPU, which is #237's failure (two cores, one VMCB) reintroduced by a different route.
+ */
+void hype_svm_vcpu_reset_longmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_cr3,
+                                  uint64_t guest_rsp, uint64_t npt_root) {
+    unsigned i;
+    hype_vmcb_t *vmcb;
+
+    if (ctx == 0) {
+        return;
+    }
+    vmcb = ctx->vmcb; /* reuse this vCPU's already-allocated slot/VMCB */
+    for (i = 0; i < sizeof(g_iopm); i++) {
+        g_iopm[i] = 0xFFu;
+    }
+    configure_guest_msrpm(g_msrpm);
+    hype_vmcb_build_long_mode_guest(vmcb, guest_rip, guest_cr3, guest_rsp,
+                                    (uint64_t)(uintptr_t)g_iopm, (uint64_t)(uintptr_t)g_msrpm);
+    /* AFTER the build, which zeroes the VMCB and hardcodes ASID 1 -- same ordering trap as the
+     * realmode reset (#244). */
+    svm_assign_asid(vmcb, svm_ctx_slot((const struct hype_vcpu_ctx *)ctx));
+    if (npt_root != 0) {
+        hype_vmcb_enable_nested_paging(vmcb, npt_root);
+    }
+    reset_gprs(ctx);
+}
+
 hype_vcpu_ctx_t *hype_svm_vcpu_create_long_mode(uint64_t entry_rip, uint64_t guest_cr3, uint64_t rsp,
                                                  uint64_t npt_root) {
     unsigned i;

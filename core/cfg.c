@@ -292,6 +292,7 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         if (*seen & HYPE_CFG_F_BOOT) return HYPE_CFG_ERR_DUPLICATE_KEY;
         if (hype_streq(val, "installer")) vm->boot = HYPE_CFG_BOOT_INSTALLER;
         else if (hype_streq(val, "disk")) vm->boot = HYPE_CFG_BOOT_DISK;
+        else if (hype_streq(val, "kernel")) vm->boot = HYPE_CFG_BOOT_KERNEL; /* #535 */
         else return HYPE_CFG_ERR_BAD_VALUE;
         *seen |= HYPE_CFG_F_BOOT;
         return HYPE_CFG_OK;
@@ -303,6 +304,17 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         if (len >= HYPE_CFG_PATH_MAX) return HYPE_CFG_ERR_VALUE_TOO_LONG;
         vm->has_install_media = 1;
         *seen |= HYPE_CFG_F_INSTALL_MEDIA;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "kernel")) {
+        /* #535: the raw kernel image for boot = kernel. */
+        unsigned long long len;
+        if (*seen & HYPE_CFG_F_KERNEL) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        len = hype_strlcpy(vm->kernel, val, HYPE_CFG_PATH_MAX);
+        if (len >= HYPE_CFG_PATH_MAX) return HYPE_CFG_ERR_VALUE_TOO_LONG;
+        if (vm->kernel[0] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
+        vm->has_kernel = 1;
+        *seen |= HYPE_CFG_F_KERNEL;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "media_disk")) {
@@ -450,13 +462,35 @@ static hype_cfg_status_t validate_required(const hype_cfg_vm_t *vm, unsigned int
      * looks accepted and produces a machine that cannot boot. Revisit with #329, which is what will
      * make an attached-device list mean anything at launch.
      */
-    if (!(seen & HYPE_CFG_F_TARGET_DISK) && !(seen & HYPE_CFG_F_DISKS) && !(seen & HYPE_CFG_F_CDROMS)) {
+    if (vm->boot != HYPE_CFG_BOOT_KERNEL && !(seen & HYPE_CFG_F_TARGET_DISK) &&
+        !(seen & HYPE_CFG_F_DISKS) && !(seen & HYPE_CFG_F_CDROMS)) {
         return HYPE_CFG_ERR_MISSING_REQUIRED;
     }
-    if (!(seen & HYPE_CFG_F_FIRMWARE)) return HYPE_CFG_ERR_MISSING_REQUIRED;
+    /*
+     * #535: boot = kernel waives storage and firmware, and requires `kernel`.
+     *
+     * Waived rather than defaulted-and-ignored: such a VM has nothing to boot from a disk and
+     * no firmware in its path, so demanding `target_disk` and `firmware` would force every
+     * microtest config to carry two lines that do nothing -- which is how a reader learns to
+     * stop believing what a config says. The keys stay legal (a kernel VM may still be given a
+     * disk to exercise the block path); they are simply no longer required.
+     */
+    if (vm->boot != HYPE_CFG_BOOT_KERNEL && !(seen & HYPE_CFG_F_FIRMWARE)) {
+        return HYPE_CFG_ERR_MISSING_REQUIRED;
+    }
     if (!(seen & HYPE_CFG_F_OS_HINT)) return HYPE_CFG_ERR_MISSING_REQUIRED;
     if (vm->boot == HYPE_CFG_BOOT_INSTALLER && !(seen & HYPE_CFG_F_INSTALL_MEDIA)) {
         return HYPE_CFG_ERR_MISSING_REQUIRED;
+    }
+    if (vm->boot == HYPE_CFG_BOOT_KERNEL && !(seen & HYPE_CFG_F_KERNEL)) {
+        return HYPE_CFG_ERR_MISSING_REQUIRED;
+    }
+    /* Two answers to "what does this VM boot" is a contradiction, not a precedence question. */
+    if (vm->boot != HYPE_CFG_BOOT_KERNEL && (seen & HYPE_CFG_F_KERNEL)) {
+        return HYPE_CFG_ERR_BAD_VALUE;
+    }
+    if (vm->boot == HYPE_CFG_BOOT_KERNEL && (seen & HYPE_CFG_F_INSTALL_MEDIA)) {
+        return HYPE_CFG_ERR_BAD_VALUE;
     }
     return HYPE_CFG_OK;
 }
@@ -1648,7 +1682,13 @@ static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {
         w_kv_cpu_list(w, "cpu_set", vm->cpu_set, vm->cpu_set_count);
     }
     w_kv_uint(w, "mem_mb", vm->mem_mb);
-    w_kv(w, "boot", vm->boot == HYPE_CFG_BOOT_DISK ? "disk" : "installer");
+    w_kv(w, "boot",
+         (vm->boot == HYPE_CFG_BOOT_DISK)     ? "disk"
+         : (vm->boot == HYPE_CFG_BOOT_KERNEL) ? "kernel"
+                                              : "installer");
+    if (vm->has_kernel) {
+        w_kv(w, "kernel", vm->kernel);
+    }
     if (vm->has_install_media) {
         w_kv(w, "install_media", vm->install_media);
     }

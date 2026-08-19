@@ -4160,6 +4160,49 @@ void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
     vmx_ctx_reset_pending(real);
 }
 
+/*
+ * #535: rebuild THIS vCPU as a 64-bit long-mode guest, in place.
+ *
+ * Deliberately a reset of an existing ctx rather than a call to
+ * hype_vmx_vcpu_create_long_mode(): that one allocates a FRESH pool slot and forces its own
+ * identity EPT, which is the microtest path. A configured VM's vCPU already exists, already
+ * holds this VM's slot, and must keep this VM's EPT root -- a guest whose RAM is not
+ * identity-mapped is exactly what #272 showed goes silently wrong when the wrong root is used.
+ * Same shape as hype_vmx_vcpu_reset_realmode above, and the same reasons for each step.
+ */
+void hype_vmx_vcpu_reset_longmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_cr3,
+                                  uint64_t guest_rsp, uint64_t ept_root) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    unsigned slot;
+    uint64_t eptp;
+    unsigned i;
+
+    if (real == 0) {
+        return;
+    }
+    slot = vmx_ctx_slot(real);
+
+    if (ept_root != 0) {
+        eptp = hype_vmx_make_eptp(ept_root);
+    } else {
+        hype_ept_build_identity(g_ept_pml4, g_ept_pdpt, g_ept_pd, HYPE_EPT_MAX_GB);
+        eptp = hype_vmx_make_eptp((uint64_t)(uintptr_t)g_ept_pml4);
+    }
+
+    if (hype_vmx_vmcs_build_long_mode_guest(guest_rip, guest_cr3, guest_rsp, eptp,
+                                            g_vmcs_pool[slot], slot) != 0) {
+        return;
+    }
+    real->vmcs_region = g_vmcs_pool[slot]; /* #483 */
+    for (i = 0; i < 16; i++) {
+        real->gprs[i] = 0;
+    }
+    hype_fpu_area_reset(&real->fpu);
+    real->launched = 0;    /* a rebuilt VMCS must be VMLAUNCHed, not VMRESUMEd */
+    real->owner_valid = 0; /* #523 */
+    vmx_ctx_reset_pending(real);
+}
+
 void hype_vmx_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t *out) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok = 0;
