@@ -28,7 +28,28 @@ expect ~#
 # Sustained CD reads from two concurrent jobs, so both vCPUs stay busy without
 # needing taskset (busybox may not carry it). Falls back to a RAM copy if the
 # guest has no /dev/sr0, so the beat never stops for want of a device.
-send for i in $(seq 1 200); do echo VM1-BEAT-$i-up$(cut -d. -f1 /proc/uptime); { dd if=/dev/sr0 of=/dev/null bs=1M count=32 2>/dev/null || dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null; } & { dd if=/dev/sr0 of=/dev/null bs=1M count=32 skip=64 2>/dev/null || dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null; } ; wait; done; echo VM1-LOAD-DON''E\n
+# The load loop, BUILT LINE BY LINE inside the guest rather than sent as one command.
+#
+# The single-line version of this was 358 bytes against HYPE_INPUT_SCRIPT_MAX_ARG's 128, so hype
+# refused to arm the whole script -- "PARSE ERROR line 31: argument too long" -- and it had been
+# doing so silently for every run that used this file. vm1's guest still booted and still logged,
+# which is why nobody noticed: a VM1.LOG existed, so the script looked like it had worked. The load
+# it was written to apply never ran once.
+#
+# Each send below is well under the limit. Two concurrent dd jobs plus `wait` keep BOTH vCPUs busy,
+# which is the point of the loop; the original used /dev/sr0 with a /dev/zero fallback, and plain
+# /dev/zero is enough for load and removes the dependency on the guest having an optical device.
+send printf '%s\\n' 'for i in $(seq 1 200); do' > /tmp/l.sh\n
+expect ~#
+send printf '%s\\n' ' echo VM1-BEAT-$i-up$(cut -d. -f1 /proc/uptime)' >> /tmp/l.sh\n
+expect ~#
+send printf '%s\\n' ' dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null &' >> /tmp/l.sh\n
+expect ~#
+send printf '%s\\n' ' dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null; wait' >> /tmp/l.sh\n
+expect ~#
+send printf '%s\\n' 'done; echo VM1-LOAD-DON''E' >> /tmp/l.sh\n
+expect ~#
+send sh /tmp/l.sh\n
 expect VM1-LOAD-DONE
 
 send grep -E 'RES|CAL|LOC' /proc/interrupts\n

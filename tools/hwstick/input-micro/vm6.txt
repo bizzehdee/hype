@@ -1,3 +1,0 @@
-# placeholder: vm6 in hype-micro.cfg needs no scripted input.
-# A file is supplied so the ps2 script lands at vm8 and not at some earlier index.
-pass no-input-needed

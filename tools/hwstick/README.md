@@ -26,53 +26,71 @@ highest-value microtests.
 3. Power off. **Copy `HYPE.LOG`, `VM0.LOG` and `VM1.LOG` off the stick, or rename them** — boot 2
    overwrites them.
 
-**Boot 2 (about 2 minutes)** — the complete microtest sweep, ten VMs, no Alpine.
+**Boot 2 (about 1 minute, optional)** — the suite alone, one VM. Use it when the Alpine guests are
+not the point, e.g. re-checking #556 or #557 after a fix.
 
 ```sh
 mv hype.cfg hype-alpine.cfg && mv hype-micro.cfg hype.cfg
 mv input input-alpine       && mv input-micro input
 ```
 
-Then boot again. The second swap matters: without it the Alpine scripts get fed to microtests that
-never print a login prompt, and you get two harmless-but-confusing script timeouts.
+The second swap matters: with no Alpine guests, `ps2`'s input script must land at `\input\vm0.txt`,
+and `input-micro/` is what puts it there. That config also includes `ps2`, which the primary one
+cannot (vm0 and vm1's scripts already occupy those indices).
 
-Why two boots rather than one: a microtest costs 196 MiB of the guest pool whatever its `mem_mb`
-says (a 128 MiB floor — #290 — plus a 64 MiB vdisk carve and a 4 MiB firmware copy), and the pool
-on an 8 GiB host measures 4590 MiB. Everything at once does not fit, and an over-committed config
-loses its **tail**, which would be the microtests. Both halves as shipped sit inside comfortable
-margins (8% and 57%), and both were rehearsed under QEMU at `QEMU_MEM=8192 SMP=12` — matching this
-laptop — with **zero VMs dropped**.
+Both configs were rehearsed under QEMU at `QEMU_MEM=12288 SMP=8` — matching the AMD laptop — with
+**zero VMs dropped** and both input scripts armed. Note that a QEMU rehearsal cannot reproduce the
+core count that actually binds here: `-smp 8` gives eight single-thread cores, not four cores with
+two threads each. The VM count was therefore derived from the machine's real topology rather than
+from a rehearsal.
 
 The logs are on the stick because this machine has no serial port. They contain invalid UTF-8, so
 read them with `LC_ALL=C grep -a`.
 
-## What this single boot is trying to settle
+## Why only three VMs
 
-Eight VMs, in this order — **order is load-bearing**, because admission caps from the end and names
-whatever it drops (#396). The two Alpine guests come first: they carry the highest-value ticket and
-need the whole run, while every microtest finishes in seconds.
+Admission grants one **whole physical core** per VM with the BSP's core reserved, so a host runs at
+most `physical cores - 1` VMs however much RAM it has:
 
-| # | VM | Ticket | What to look for |
-|---|---|---|---|
-| 0 | `alpine-smp8` | **#527** | both APs `live=1`, AP exits in the millions, `Brought up 1 node, 2 CPUs`, `VMCSRELOAD ... steals=0`, entry failures 0, sustained past 8 min |
-| 0,1 | both Alpines | **#526** | how many `soft lockup` lines appear. The nested rig gives **2 per 240 s**; bare metal is the comparison that has never been taken |
-| 0,1 | both Alpines | **#461** | watch-only: a host `#GP (vector 13)` with RIP inside the AP trampoline, if it recurs |
-| 1 | `alpine-load-cf9` | **#525** | after the 10-minute delay: `HAVE-TASKSET`, then a `0xcf9` write in HYPE.LOG and vm1 restarting. `NO-TASKSET` means the arm did not run and #525 is untouched |
-| 2 | `micro/intdeliver` | **#553** (High) | `resumes past HLT=` against the tick count. QEMU gives ~1154 ticks to **1** resume. If bare metal shows resumes ≈ ticks, the bug is a nested-KVM artefact and #553 narrows sharply |
-| 3 | `micro/pflash` | **#556** (High) | expected to **FAIL** on QEMU (`status 0x00`, where 0x80 is unconditional). If it PASSES here, #556 is nested-only |
-| 4 | `micro/cpumsr` | **#552** | `vmx = absent`. The fix was found and made on the nested box, so this is the first assertion of it on silicon that genuinely has VT-x |
-| 5 | `micro/pci` | — | first hardware run of a real guest bus walk: ECAM, BAR sizing, a self-programmed BAR, and the MSI capability #512's delivery depends on |
-| 6 | `micro/ram1` | — | every page written then verified in two passes, so **page aliasing** in the real EPT would show |
+| machine | logical | physical | RAM | max VMs |
+|---|---|---|---|---|
+| AMD laptop | 8 | **4** | 12 GB | **3** |
+| Intel i5-13420H | 12 | 8 | 8 GB | 7 |
 
-### Boot 2 adds
+The first version of this stick listed seven VMs. The AMD run dropped four of them — including both
+High-priority reproductions it existed to carry — and RAM was never close (pool 7012 of 10165 MiB
+usable). So the layout is now two Alpine guests plus **one VM running the suite kernel** (#554),
+which runs the microtests in turn inside a single guest. Three VMs fits the smaller machine, and the
+bigger one simply has cores to spare.
+
+## What this is trying to settle
 
 | VM | Ticket | What to look for |
 |---|---|---|
-| `micro/pausespin` | #555 | preemption of a spinning guest; the implied TSC rate should be this laptop's **base** clock, and is boost-independent |
-| `micro/fwcfg` | — | the fw_cfg directory, and `etc/e820` read both by PIO and by DMA with the two required to agree byte for byte. Its in-binary predecessor was skipped on VMX entirely |
-| `micro/hello` | — | the load path itself, plus a `cmdline` echoed back |
-| `micro/ps2` | — | keyboard **and** mouse driven by `\input\vm8.txt`, distinguished by the AUX_DATA status bit |
-| `micro/faulter` | **#538** | expected to **FAIL**, deliberately. It triple-faults, and the point is that every verdict above it is still present and the host survived — proving a guest fault stops only its own VM |
+| `vm0` alpine | **#527** | both APs `live=1`, AP exits in the millions, `Brought up 1 node, 2 CPUs`, `VMCSRELOAD ... steals=0`, entry failures 0, sustained past 8 min |
+| `vm0`,`vm1` | **#526** | how many `soft lockup` lines appear. The nested rig gives 2 per 240 s; the AMD baseline from the last run was **zero** |
+| `vm0`,`vm1` | **#461** | watch-only: a host `#GP (vector 13)` with RIP inside the AP trampoline |
+| `vm1` | **#525** | after the 10-minute delay: `HAVE-TASKSET`, then a `0xcf9` write and vm1 restarting. `NO-TASKSET` means the arm did not run |
+| `vm2` suite | **#553** | `intdeliver`: `resumes past HLT=` vs the tick count |
+| `vm2` suite | **#557** | `intdeliver` on the last AMD run got **38M HLT exits and zero interrupts**. If it PASSES now, #557 was mis-scoped |
+| `vm2` suite | **#556** | `pflash` is expected to **FAIL** |
+| `vm2` suite | **#552** | `cpumsr`: `vmx = absent` |
+| `vm2` suite | — | `ram1` (page aliasing in the real nested tables), `pci` (ECAM/BAR/MSI), `fwcfg` (PIO vs DMA agreement), `pausespin` (preemption + invariant TSC) |
+
+### Reading the suite
+
+Each member is announced **before** it runs:
+
+```
+MICRO RUN: ram1
+MICRO PASS: ram1
+...
+MICRO SUITE: ran=8 passed=7 failed=1 noverdict=0 skipped=0 unknown=0
+```
+
+**The summary line's absence is the signal** that the sweep was truncated — a suite that died halfway
+otherwise looks like a suite with fewer members. And a `MICRO RUN` with no matching verdict names
+the member that took the VM down.
 
 ## Reading the result quickly
 
@@ -86,9 +104,9 @@ LC_ALL=C grep -a -iE "0xcf9|reset" HYPE.LOG | head           # #525
 LC_ALL=C grep -a -E "resumes past HLT|TSC (rate|cycles)" HYPE.LOG   # #553, #555
 ```
 
-Expected results, so a real regression is not lost in the noise: on **boot 1** everything should
-PASS except `pflash`; on **boot 2** everything should PASS except `pflash` and `faulter`. Any other
-FAIL, or any missing verdict, is new.
+Expected results, so a real regression is not lost in the noise: **`pflash` FAILS** (#556) and
+**`intdeliver` may FAIL** (#557 — it got zero interrupts on the last AMD run). Everything else should
+PASS. Any other FAIL, any missing verdict, or a missing `MICRO SUITE:` summary is new.
 
 **A missing microtest verdict is a failure, not an absence of news** — a guest that wedges or
 triple-faults prints neither PASS nor FAIL. Two verdicts are expected to be interesting rather than
