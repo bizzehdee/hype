@@ -228,14 +228,16 @@ hype_input_action_kind_t hype_input_runner_poll(hype_input_runner_t *r, uint64_t
 
             case HYPE_INPUT_OP_SEND:
             case HYPE_INPUT_OP_SENDKEY:
+            case HYPE_INPUT_OP_SENDMOUSE:
                 /* Identical control flow; only the transport differs, which is the
                  * caller's business. Sharing the case is deliberate -- duplicating it
-                 * would be two places for the "returned exactly once per directive"
+                 * would be three places for the "returned exactly once per directive"
                  * rule to drift apart. */
                 r->pc++;
                 r->phase_started = 0;
-                out->kind = (d->op == HYPE_INPUT_OP_SENDKEY) ? HYPE_INPUT_ACTION_SENDKEY
-                                                             : HYPE_INPUT_ACTION_SEND;
+                out->kind = (d->op == HYPE_INPUT_OP_SENDKEY)     ? HYPE_INPUT_ACTION_SENDKEY
+                            : (d->op == HYPE_INPUT_OP_SENDMOUSE) ? HYPE_INPUT_ACTION_SENDMOUSE
+                                                                 : HYPE_INPUT_ACTION_SEND;
                 out->data = d->text;
                 out->len = d->len;
                 return out->kind;

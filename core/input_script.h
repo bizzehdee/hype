@@ -12,6 +12,7 @@
  * Line-oriented and deliberately small -- this is a test fixture, not a shell:
  *
  *     timeout 120000                       # ms, applies to each expect
+ *     sendmouse -5 3 1                     # dx, dy, buttons (#542)
  *     expect  localhost login:
  *     send    root\n
  *     expect  ~#
@@ -41,6 +42,22 @@ typedef enum {
      * GRUB, graphical installers. Same runner, second transport.
      */
     HYPE_INPUT_OP_SENDKEY,
+    /*
+     * #542: move the guest's emulated MOUSE. `sendmouse <dx> <dy> [buttons]`, deltas in
+     * -128..127 and buttons a 0-7 bitmask (bit 0 left, 1 right, 2 middle).
+     *
+     * The directive takes SIGNED deltas and the parser computes the PS/2 packet's status byte,
+     * including its sign bits. That deliberately keeps device encoding out of scripts: a script
+     * author writing "move left by 5" should not have to know that a negative dx means setting
+     * bit 4 of a status byte, and putting that knowledge in every script is how one of them gets
+     * it wrong. It lives in one unit-tested place instead.
+     *
+     * Why this exists at all: before it, hype's guest mouse model had NO stimulus path that did
+     * not involve a human at a physical mouse. The in-binary INPUT-2 test hid that by calling
+     * hype_ps2_mouse_enqueue_movement() directly from the host, which is exactly the coupling
+     * #534 removes -- and removing it showed the model was unreachable from an automated run.
+     */
+    HYPE_INPUT_OP_SENDMOUSE,
     HYPE_INPUT_OP_DELAY,      /* pause `ms` */
     HYPE_INPUT_OP_TIMEOUT,    /* set the per-expect timeout to `ms` */
     HYPE_INPUT_OP_FAIL_IF,    /* arm `text`: if it EVER appears, the run fails */

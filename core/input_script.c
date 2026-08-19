@@ -44,6 +44,64 @@ static int parse_u32(const char *s, uint32_t len, uint32_t *out) {
  * Returns 0, or -1 for an unknown escape / trailing backslash, or -2 if it does
  * not fit.
  */
+/*
+ * #542: parse `<dx> <dy> [buttons]` from a whitespace-separated argument. Returns how many fields
+ * were read (2 or 3 on success, <2 on failure). Deltas are signed decimals in -128..127; buttons is
+ * 0-7. A value out of range is a failure rather than a silent clamp -- `sendmouse 500 0` is a script
+ * bug, and clamping it to 127 would move the mouse a different distance than the script asked for.
+ */
+static int parse_mouse_args(const char *a, uint32_t len, int32_t *dx, int32_t *dy,
+                            uint32_t *buttons) {
+    uint32_t i = 0;
+    int field = 0;
+    int32_t vals[3] = {0, 0, 0};
+
+    while (field < 3) {
+        int neg = 0;
+        int digits = 0;
+        int32_t v = 0;
+
+        while (i < len && (a[i] == ' ' || a[i] == '\t')) {
+            i++;
+        }
+        if (i >= len) {
+            break;
+        }
+        if (a[i] == '-') {
+            neg = 1;
+            i++;
+        } else if (a[i] == '+') {
+            i++;
+        }
+        while (i < len && a[i] >= '0' && a[i] <= '9') {
+            v = v * 10 + (a[i] - '0');
+            if (v > 100000) {
+                return -1; /* absurd, and stops runaway accumulation */
+            }
+            digits++;
+            i++;
+        }
+        if (digits == 0) {
+            return -1;
+        }
+        vals[field++] = neg ? -v : v;
+    }
+
+    if (field < 2) {
+        return field;
+    }
+    if (vals[0] < -128 || vals[0] > 127 || vals[1] < -128 || vals[1] > 127) {
+        return -1;
+    }
+    if (field == 3 && (vals[2] < 0 || vals[2] > 7)) {
+        return -1;
+    }
+    *dx = vals[0];
+    *dy = vals[1];
+    *buttons = (field == 3) ? (uint32_t)vals[2] : 0u;
+    return field;
+}
+
 static int copy_payload(hype_input_directive_t *d, const char *src, uint32_t len) {
     uint32_t i = 0;
     uint32_t n = 0;
@@ -90,6 +148,7 @@ hype_input_parse_result_t hype_input_script_parse(const char *text, uint32_t len
         uint32_t kw_start, kw_end, arg_start, arg_end;
         hype_input_directive_t *d;
         int takes_number = 0;
+        int takes_mouse = 0; /* #542 */
         int rc;
 
         if (pos == len) {
@@ -162,6 +221,9 @@ hype_input_parse_result_t hype_input_script_parse(const char *text, uint32_t len
             uint32_t kwlen = kw_end - kw_start;
             if (keyword_is(kw, kwlen, "expect")) {
                 d->op = HYPE_INPUT_OP_EXPECT;
+            } else if (keyword_is(kw, kwlen, "sendmouse")) {
+                d->op = HYPE_INPUT_OP_SENDMOUSE; /* #542 */
+                takes_mouse = 1;
             } else if (keyword_is(kw, kwlen, "sendkey")) {
                 /* Checked BEFORE "send" would be a prefix problem only if the matcher
                  * were a prefix match; keyword_is compares the whole token, so order is
@@ -195,7 +257,27 @@ hype_input_parse_result_t hype_input_script_parse(const char *text, uint32_t len
             return r;
         }
 
-        if (takes_number) {
+        if (takes_mouse) {
+            /*
+             * #542: `<dx> <dy> [buttons]`. Stored as the three bytes the device wants --
+             * text[0] = status (with the sign bits already folded in), text[1] = dx,
+             * text[2] = dy -- so the runner and the routing layer carry no encoding logic.
+             */
+            int32_t dx = 0, dy = 0;
+            uint32_t buttons = 0;
+            int nfields = parse_mouse_args(text + arg_start, arg_end - arg_start, &dx, &dy,
+                                           &buttons);
+            if (nfields < 2) {
+                r.status = HYPE_INPUT_PARSE_BAD_NUMBER;
+                r.line = line;
+                return r;
+            }
+            d->text[0] = (uint8_t)(0x08u | (buttons & 0x07u) | (dx < 0 ? 0x10u : 0u) |
+                                   (dy < 0 ? 0x20u : 0u));
+            d->text[1] = (uint8_t)(dx & 0xFF);
+            d->text[2] = (uint8_t)(dy & 0xFF);
+            d->len = 3u;
+        } else if (takes_number) {
             if (parse_u32(text + arg_start, arg_end - arg_start, &d->ms) != 0) {
                 r.status = HYPE_INPUT_PARSE_BAD_NUMBER;
                 r.line = line;

@@ -204,6 +204,63 @@ static void test_edge_inputs(void) {
     CHECK_INT("newlines only -> no directives", 0, sc.count);
 }
 
+/*
+ * #542: sendmouse. The parser folds the PS/2 status byte's sign bits so scripts never carry device
+ * encoding -- so these tests are about that encoding being right, since a wrong sign bit moves the
+ * pointer the opposite way and nothing in a script would show it.
+ */
+static void test_sendmouse(void) {
+    hype_input_script_t sc;
+
+    CHECK_INT("positive deltas parse", HYPE_INPUT_PARSE_OK, parse("sendmouse 5 3\n", &sc).status);
+    CHECK_INT("one directive", 1, (int)sc.count);
+    CHECK_INT("op is sendmouse", (int)HYPE_INPUT_OP_SENDMOUSE, (int)sc.d[0].op);
+    CHECK_INT("three bytes of payload", 3, (int)sc.d[0].len);
+    /* 0x08 is the always-1 bit; no buttons, no sign bits. This is the same status the in-binary
+     * INPUT-2 test used as its expected value, which is why it is spelled out. */
+    CHECK_INT("status has the always-1 bit only", 0x08, (int)sc.d[0].text[0]);
+    CHECK_INT("dx", 5, (int)sc.d[0].text[1]);
+    CHECK_INT("dy", 3, (int)sc.d[0].text[2]);
+
+    CHECK_INT("negative dx parses", HYPE_INPUT_PARSE_OK, parse("sendmouse -5 3\n", &sc).status);
+    CHECK_INT("dx sign bit (0x10) set", 0x18, (int)sc.d[0].text[0]);
+    CHECK_INT("dx is the two's-complement byte", 0xFB, (int)sc.d[0].text[1]);
+
+    CHECK_INT("negative dy parses", HYPE_INPUT_PARSE_OK, parse("sendmouse 5 -3\n", &sc).status);
+    CHECK_INT("dy sign bit (0x20) set", 0x28, (int)sc.d[0].text[0]);
+    CHECK_INT("dy is the two's-complement byte", 0xFD, (int)sc.d[0].text[2]);
+
+    CHECK_INT("both negative", HYPE_INPUT_PARSE_OK, parse("sendmouse -1 -1\n", &sc).status);
+    CHECK_INT("both sign bits set", 0x38, (int)sc.d[0].text[0]);
+
+    CHECK_INT("buttons parse", HYPE_INPUT_PARSE_OK, parse("sendmouse 0 0 5\n", &sc).status);
+    CHECK_INT("left+middle in the low bits", 0x0D, (int)sc.d[0].text[0]);
+
+    /* Extra whitespace between fields, and a leading +. */
+    CHECK_INT("tolerant of spacing", HYPE_INPUT_PARSE_OK,
+              parse("sendmouse   +7    -8   2\n", &sc).status);
+    CHECK_INT("status", 0x2A, (int)sc.d[0].text[0]);
+    CHECK_INT("dx", 7, (int)sc.d[0].text[1]);
+    CHECK_INT("dy", 0xF8, (int)sc.d[0].text[2]);
+
+    /* Out of range is a FAILURE, not a clamp: `sendmouse 500 0` asks for a move the device cannot
+     * express, and clamping would move the pointer a different distance than the script said. */
+    CHECK_INT("dx above 127 refused", HYPE_INPUT_PARSE_BAD_NUMBER,
+              parse("sendmouse 500 0\n", &sc).status);
+    CHECK_INT("dx below -128 refused", HYPE_INPUT_PARSE_BAD_NUMBER,
+              parse("sendmouse -129 0\n", &sc).status);
+    CHECK_INT("dy out of range refused", HYPE_INPUT_PARSE_BAD_NUMBER,
+              parse("sendmouse 0 200\n", &sc).status);
+    CHECK_INT("buttons above 7 refused", HYPE_INPUT_PARSE_BAD_NUMBER,
+              parse("sendmouse 0 0 9\n", &sc).status);
+    CHECK_INT("one field is not enough", HYPE_INPUT_PARSE_BAD_NUMBER,
+              parse("sendmouse 5\n", &sc).status);
+    CHECK_INT("non-numeric refused", HYPE_INPUT_PARSE_BAD_NUMBER,
+              parse("sendmouse left 3\n", &sc).status);
+    CHECK_INT("no argument at all refused", HYPE_INPUT_PARSE_MISSING_ARG,
+              parse("sendmouse\n", &sc).status);
+}
+
 static void test_status_strings(void) {
     /* Every status needs a message: an error reported as "unknown error" wastes the
      * line number it came with. */
@@ -234,6 +291,7 @@ int main(void) {
     test_errors();
     test_too_long_and_too_many();
     test_edge_inputs();
+    test_sendmouse();
     test_status_strings();
 
     if (failures == 0) {
