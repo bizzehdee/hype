@@ -1054,6 +1054,8 @@ static uint8_t *g_snap_hit;
  * the DIAGNOSTIC-array bound (16, lockstep with HYPE_CFG_MAX_VMS) and would make any code
  * running before the config resolves at efi_main believe sixteen VMs exist. */
 static unsigned g_vm_count = 2u;
+/* #450: what Phase 0 ALLOCATED for -- the host's physical bound, not the config's ask. */
+static unsigned g_max_vms = 2u;
 #define FW_1_LINE_BUF_FS 256u /* #394: file-scope twin of FW_1_LINE_BUF */
 static char (*g_uart_line)[FW_1_LINE_BUF_FS];   /* #394: per-VM, were func-static */
 static char (*g_uart_line2)[FW_1_LINE_BUF_FS];
@@ -22141,7 +22143,7 @@ static void *fw_aux_alloc(EFI_BOOT_SERVICES *bs, UINTN bytes) {
 }
 
 static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
-    unsigned n = g_vm_count;
+    unsigned n = g_max_vms; /* #450: the host's bound, so Phase 0 needs no config */
     g_script_seen = fw_aux_alloc(bs, (UINTN)n * sizeof *g_script_seen);
     g_script_fed = fw_aux_alloc(bs, (UINTN)n * sizeof *g_script_fed);
     g_fw_phase_mark_tsc = fw_aux_alloc(bs, (UINTN)n * sizeof *g_fw_phase_mark_tsc);
@@ -22342,119 +22344,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     fw_1_reserve_guest_pool(SystemTable->BootServices, usable_ram_bytes,
                             hype_memmap_largest_conventional_bytes(map, map_size, desc_size));
 
-    /* RT-1b: while the map is still in hand (it names which physical ranges
-     * are safe to read) and Boot Services file I/O is still up, scan RAM for
-     * a PREVIOUS boot's self-describing log region and dump it to
-     * \hype-log-prev.txt. Best-effort observability for a post-EBS crash
-     * whose in-loop \hype-log.txt flush never ran; a no-op when no prior log
-     * survived in RAM. */
-    fw_1_dump_prev_log(ImageHandle, SystemTable->BootServices, map, map_size, desc_size);
-
-    /* CONFIG-4 (#225): load + parse \hype.cfg off the ESP now, while Boot
-     * Services file I/O is still up (pre-EBS), into g_hype_cfg. Advisory:
-     * absent/malformed -> empty config + built-in fallback, never a boot stop.
-     * #125/#126 consume the parsed physical target + partition qualifiers. */
-    load_hype_cfg(ImageHandle, SystemTable);
-
-    /* #411: the VM count is now a runtime value from the parsed config, and the
-     * #394 arena is sized to it. Still bounded to what the (not-yet-generalised)
-     * launch handles -- one or two VMs; #393b-d raises the ceiling to the
-     * cfg count under core/RAM admission. Every per-VM loop below uses
-     * g_vm_count, so raising it there needs no further loop edits. */
-    /* #414: the number of VMs to launch is the parsed config's VM count
-     * (the parser caps it at HYPE_CFG_MAX_VMS; the core/RAM admission bound is
-     * #396). No hype.cfg keeps the built-in two-VM default. */
-    g_vm_count = g_hype_cfg.vm_count ? g_hype_cfg.vm_count : 2u;
-    if (g_hype_cfg.hype.dashboard_default_view == HYPE_CFG_VIEW_VM) {
-        unsigned int vi;
-        for (vi = 0u; vi < g_hype_cfg.vm_count; vi++) {
-            g_term_cfg_vm_names[vi] = g_hype_cfg.vms[vi].name;
-        }
-        g_term_default_view_target = hype_term_focus_find_name(
-            g_hype_cfg.hype.dashboard_default_vm, g_term_cfg_vm_names, g_hype_cfg.vm_count);
-        if (g_term_default_view_target < 0) {
-            hype_debug_print("cfg: dashboard_default_view names unknown vm '%s' -- using dashboard [#437]\n",
-                             g_hype_cfg.hype.dashboard_default_vm);
-        } else {
-            g_term_default_view_pending = 1;
-            hype_debug_print("cfg: dashboard_default_view waiting for vm%d ('%s') runtime [#437]\n",
-                             g_term_default_view_target, g_hype_cfg.hype.dashboard_default_vm);
-        }
-    }
-    {
-        UINTN vm_bytes = (UINTN)g_vm_count * sizeof(hype_fw_vm_t);
-        UINTN vm_pages = (vm_bytes + 4095u) / 4096u;
-        g_vms = (hype_fw_vm_t *)(uintptr_t)hype_alloc_pages_any(SystemTable->BootServices, vm_pages);
-        if (g_vms == 0) {
-            hype_fatal("fw-1: g_vms allocation (%u VM(s), %llu pages) failed",
-                       g_vm_count, (unsigned long long)vm_pages);
-        }
-        hype_guest_ram_zero(g_vms, (uint64_t)vm_pages * 4096ull);
-        hype_debug_print("fw-1: g_vms arena %u VM(s) x %llu B, page-aligned @%p [#394]\n",
-                         g_vm_count, (unsigned long long)sizeof(hype_fw_vm_t), (void *)g_vms);
-    }
-    fw_alloc_vm_aux_arena(SystemTable->BootServices);
-    /* #412: size the per-vCPU pools (VMCB/VMCS/ctx/MSR/virtual-APIC) to the VM
-     * count too, before any vCPU is created -- so N VMs get N distinct
-     * hardware contexts (#237). The self-test battery that also uses these pools
-     * is gated off for a normal boot, so this is the first user. */
-    g_pool_bs = SystemTable->BootServices;
-    /*
-     * SMP-1 (#185): the pools are sized to the total number of vCPUs across all VMs, not to
-     * the VM count. Each vCPU needs its OWN VMCB/VMCS + ctx pair -- #237 was two vCPUs sharing
-     * one VMCB, and it took both guests down with no panic on real hardware, so an
-     * under-sized pool here is not a slow path, it is that bug again.
-     *
-     * Every VM's vcpu_count is resolved HERE, not at the per-VM setup sites further down: this
-     * is the first thing that needs the total, and it runs before them. Resolving it lazily
-     * there and summing here would read zeros off the freshly-zeroed g_vms arena and size the
-     * pools for one vCPU each -- which is exactly the old behaviour, arrived at silently.
-     * load_hype_cfg() has already run (just above), so g_hype_cfg is populated.
-     */
-    {
-        unsigned vi, total_vcpus = 0u;
-        for (vi = 0; vi < g_vm_count; vi++) {
-            fw_1_resolve_vcpus(&g_vms[vi], &g_hype_cfg, vi);
-            total_vcpus += g_vms[vi].vcpu_count;
-        }
-        hype_debug_print("fw-1: vCPU pools sized for %u vCPU(s) across %u VM(s) [#185]\n",
-                         total_vcpus, g_vm_count);
-        hype_svm_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
-        hype_vmx_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
-    }
-    /* #428: one ISO-stream bounce buffer per VM. The old fixed 2-slot array
-     * silently aliased vm2+ onto vm0's buffer, which served one VM's CD
-     * sectors to another under concurrent streaming (the 4-VM #392 run's
-     * Fedora/Ubuntu boot corruption). */
-    hype_iso_stream_pool_alloc(g_vm_count, fw_alloc_zeroed_pages);
-    /*
-     * #413: one AP stack per host core that runs a guest.
-     *
-     * SMP-6 (#190): keyed by fw_1_vcpu_slot(), i.e. one per guest vCPU rather than one per VM
-     * -- two cores sharing a stack is immediate memory corruption, not a slow path. Sized to
-     * the maximum because vcpu_count is not resolved until the pool sizing below; a handful of
-     * unused 16 KiB stacks is the right trade against getting the ordering wrong.
-     */
-    g_ap_stacks = (uint8_t (*)[HYPE_AP_STACK_BYTES])(uintptr_t)fw_alloc_zeroed_pages(
-        g_vm_count * HYPE_MAX_VCPUS_PER_VM * (HYPE_AP_STACK_BYTES / 4096u));
-    vm = &g_vms[0];
-    /*
-     * INPUT-8 (#281): load each VM's expect script here, PRE-EBS, because this is the
-     * last point where the UEFI Simple File System is usable. Both VMs are loaded
-     * unconditionally even when only one runs -- an absent file is the normal case
-     * and costs one log line.
-     */
-    load_input_script(ImageHandle, SystemTable, &g_vms[0], 0u);
-    for (unsigned vi = 1u; vi < g_vm_count; vi++) { /* #414 */
-        load_input_script(ImageHandle, SystemTable, &g_vms[vi], vi);
-    }
-
-    SystemTable->BootServices->FreePool(map);
-
-    /* LocateProtocol is a Boot Services call like the memory map fetch
-     * above -- must happen before ExitBootServices(). A GOP-less system
-     * isn't fatal: serial remains available regardless, so just note it
-     * and move on rather than hype_panic(). */
     /*
      * #360: enumerate the host's REAL local-APIC IDs, here, because
      * EFI_MP_SERVICES_PROTOCOL is a Boot Services protocol and disappears at
@@ -22538,6 +22427,158 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                       : "");
         }
     }
+
+    /* RT-1b: while the map is still in hand (it names which physical ranges
+     * are safe to read) and Boot Services file I/O is still up, scan RAM for
+     * a PREVIOUS boot's self-describing log region and dump it to
+     * \hype-log-prev.txt. Best-effort observability for a post-EBS crash
+     * whose in-loop \hype-log.txt flush never ran; a no-op when no prior log
+     * survived in RAM. */
+    fw_1_dump_prev_log(ImageHandle, SystemTable->BootServices, map, map_size, desc_size);
+
+    /* CONFIG-4 (#225): load + parse \hype.cfg off the ESP now, while Boot
+     * Services file I/O is still up (pre-EBS), into g_hype_cfg. Advisory:
+     * absent/malformed -> empty config + built-in fallback, never a boot stop.
+     * #125/#126 consume the parsed physical target + partition qualifiers. */
+    load_hype_cfg(ImageHandle, SystemTable);
+
+    /* #411: the VM count is now a runtime value from the parsed config, and the
+     * #394 arena is sized to it. Still bounded to what the (not-yet-generalised)
+     * launch handles -- one or two VMs; #393b-d raises the ceiling to the
+     * cfg count under core/RAM admission. Every per-VM loop below uses
+     * g_vm_count, so raising it there needs no further loop edits. */
+    /* #414: the number of VMs to launch is the parsed config's VM count
+     * (the parser caps it at HYPE_CFG_MAX_VMS; the core/RAM admission bound is
+     * #396). No hype.cfg keeps the built-in two-VM default. */
+    /*
+     * #450: Phase 0 sizes per-VM state from the HOST, not from the config.
+     *
+     * The arena, g_vms and the vCPU pools were sized to the parsed VM count, which is the last
+     * thing pinning the config parse before ExitBootServices -- #449 removed the guest-RAM
+     * dependency, this removes the sizing one. The bound is decision 33's own: 1:1 pinning
+     * allows at most (usable cores - 1) VMs, the BSP keeping console and log duty. Allocating
+     * for the physical maximum costs a few MB on a real host and makes Phase 0 independent of
+     * anything read off a disk.
+     */
+    {
+        unsigned usable = g_cpu_topo.count;
+        g_max_vms = (usable > 1u) ? (usable - 1u) : 1u;
+        if (g_max_vms < 2u) {
+            g_max_vms = 2u; /* the built-in default is two VMs; never allocate below it */
+        }
+        hype_debug_print("fw-1: Phase 0 sizes per-VM state for %u VM(s) -- %u usable core(s), BSP "
+                         "reserved (decision 33) [#450]\n", g_max_vms, usable);
+    }
+    g_vm_count = g_hype_cfg.vm_count ? g_hype_cfg.vm_count : 2u;
+    if (g_vm_count > g_max_vms) {
+        g_vm_count = g_max_vms; /* #396 reports the refusal per VM further down */
+    }
+    if (g_hype_cfg.hype.dashboard_default_view == HYPE_CFG_VIEW_VM) {
+        unsigned int vi;
+        for (vi = 0u; vi < g_hype_cfg.vm_count; vi++) {
+            g_term_cfg_vm_names[vi] = g_hype_cfg.vms[vi].name;
+        }
+        g_term_default_view_target = hype_term_focus_find_name(
+            g_hype_cfg.hype.dashboard_default_vm, g_term_cfg_vm_names, g_hype_cfg.vm_count);
+        if (g_term_default_view_target < 0) {
+            hype_debug_print("cfg: dashboard_default_view names unknown vm '%s' -- using dashboard [#437]\n",
+                             g_hype_cfg.hype.dashboard_default_vm);
+        } else {
+            g_term_default_view_pending = 1;
+            hype_debug_print("cfg: dashboard_default_view waiting for vm%d ('%s') runtime [#437]\n",
+                             g_term_default_view_target, g_hype_cfg.hype.dashboard_default_vm);
+        }
+    }
+    {
+        UINTN vm_bytes = (UINTN)g_max_vms * sizeof(hype_fw_vm_t);
+        UINTN vm_pages = (vm_bytes + 4095u) / 4096u;
+        g_vms = (hype_fw_vm_t *)(uintptr_t)hype_alloc_pages_any(SystemTable->BootServices, vm_pages);
+        if (g_vms == 0) {
+            hype_fatal("fw-1: g_vms allocation (%u VM(s), %llu pages) failed",
+                       g_vm_count, (unsigned long long)vm_pages);
+        }
+        hype_guest_ram_zero(g_vms, (uint64_t)vm_pages * 4096ull);
+        hype_debug_print("fw-1: g_vms arena %u VM(s) x %llu B, page-aligned @%p [#394]\n",
+                         g_max_vms, (unsigned long long)sizeof(hype_fw_vm_t), (void *)g_vms);
+    }
+    fw_alloc_vm_aux_arena(SystemTable->BootServices);
+    /* #412: size the per-vCPU pools (VMCB/VMCS/ctx/MSR/virtual-APIC) to the VM
+     * count too, before any vCPU is created -- so N VMs get N distinct
+     * hardware contexts (#237). The self-test battery that also uses these pools
+     * is gated off for a normal boot, so this is the first user. */
+    g_pool_bs = SystemTable->BootServices;
+    /*
+     * SMP-1 (#185): the pools are sized to the total number of vCPUs across all VMs, not to
+     * the VM count. Each vCPU needs its OWN VMCB/VMCS + ctx pair -- #237 was two vCPUs sharing
+     * one VMCB, and it took both guests down with no panic on real hardware, so an
+     * under-sized pool here is not a slow path, it is that bug again.
+     *
+     * Every VM's vcpu_count is resolved HERE, not at the per-VM setup sites further down: this
+     * is the first thing that needs the total, and it runs before them. Resolving it lazily
+     * there and summing here would read zeros off the freshly-zeroed g_vms arena and size the
+     * pools for one vCPU each -- which is exactly the old behaviour, arrived at silently.
+     * load_hype_cfg() has already run (just above), so g_hype_cfg is populated.
+     */
+    {
+        /*
+         * #450: sized from the host, not the config. Every vCPU is pinned 1:1 to a core
+         * (decision 39's dedicated tier), so the total across all VMs can never exceed the
+         * usable cores. One context per usable core is therefore the most that can ever run,
+         * and it does not need the config to know it. Resolving each VM's configured
+         * vcpu_count still happens; it now decides how many pooled contexts get USED rather
+         * than how many exist.
+         *
+         * Floored at 8 rather than taken as cores-minus-BSP: the built-in default is two VMs
+         * of two vCPUs, which needs four contexts on a four-core box where 'usable - 1' gives
+         * three. An under-sized pool here is #237 again -- two vCPUs sharing one VMCB took
+         * both guests down with no panic -- so the floor is the cheap side to err on.
+         */
+        unsigned vi;
+        unsigned total_vcpus = (g_cpu_topo.count > 8u) ? g_cpu_topo.count : 8u;
+        for (vi = 0; vi < g_vm_count; vi++) {
+            fw_1_resolve_vcpus(&g_vms[vi], &g_hype_cfg, vi);
+        }
+        hype_debug_print("fw-1: vCPU pools sized for %u vCPU(s) -- the host's bound across up to "
+                         "%u VM(s) [#185 #450]\n", total_vcpus, g_max_vms);
+        hype_svm_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
+        hype_vmx_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
+    }
+    /* #428: one ISO-stream bounce buffer per VM. The old fixed 2-slot array
+     * silently aliased vm2+ onto vm0's buffer, which served one VM's CD
+     * sectors to another under concurrent streaming (the 4-VM #392 run's
+     * Fedora/Ubuntu boot corruption). */
+    hype_iso_stream_pool_alloc(g_max_vms, fw_alloc_zeroed_pages);
+    /*
+     * #413: one AP stack per host core that runs a guest.
+     *
+     * SMP-6 (#190): keyed by fw_1_vcpu_slot(), i.e. one per guest vCPU rather than one per VM
+     * -- two cores sharing a stack is immediate memory corruption, not a slow path. Sized to
+     * the maximum because vcpu_count is not resolved until the pool sizing below; a handful of
+     * unused 16 KiB stacks is the right trade against getting the ordering wrong.
+     */
+    g_ap_stacks = (uint8_t (*)[HYPE_AP_STACK_BYTES])(uintptr_t)fw_alloc_zeroed_pages(
+        g_vm_count * HYPE_MAX_VCPUS_PER_VM * (HYPE_AP_STACK_BYTES / 4096u));
+    vm = &g_vms[0];
+    /*
+     * INPUT-8 (#281): load each VM's expect script here, PRE-EBS, because this is the
+     * last point where the UEFI Simple File System is usable. Both VMs are loaded
+     * unconditionally even when only one runs -- an absent file is the normal case
+     * and costs one log line.
+     */
+    load_input_script(ImageHandle, SystemTable, &g_vms[0], 0u);
+    for (unsigned vi = 1u; vi < g_vm_count; vi++) { /* #414 */
+        load_input_script(ImageHandle, SystemTable, &g_vms[vi], vi);
+    }
+
+    SystemTable->BootServices->FreePool(map);
+
+    /* LocateProtocol is a Boot Services call like the memory map fetch
+     * above -- must happen before ExitBootServices(). A GOP-less system
+     * isn't fatal: serial remains available regardless, so just note it
+     * and move on rather than hype_panic(). */
+    /* #450: CPU enumeration moved ABOVE the config load -- see the block just after the pool
+     * reservation. Phase 0 sizes per-VM state from the host's core count, so it must know the
+     * topology before it can allocate anything, and it must not need the config to do it. */
 
     /*
      * #396: topology-bounded admission. The config count sized the arena; now
