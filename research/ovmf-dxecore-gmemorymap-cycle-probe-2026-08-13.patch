@@ -1,0 +1,85 @@
+diff --git a/MdeModulePkg/Core/Dxe/Mem/Page.c b/MdeModulePkg/Core/Dxe/Mem/Page.c
+index 8e73811597..981d1c98e5 100644
+--- a/MdeModulePkg/Core/Dxe/Mem/Page.c
++++ b/MdeModulePkg/Core/Dxe/Mem/Page.c
+@@ -1112,6 +1112,44 @@ CoreUpdateMemoryAttributes (
+   CoreReleaseMemoryLock ();
+ }
+ 
++// HYPE #436: unconditional debug-port (0x402) emit, independent of DEBUG()/
++// PcdDebugPrintErrorLevel (RELEASE compiles DEBUG() out). hype captures 0x402.
++STATIC
++VOID
++HypeDbgByte (
++  IN UINT8  C
++  )
++{
++  __asm__ __volatile__ ("outb %0, %1" : : "a" (C), "Nd" ((UINT16)0x402));
++}
++
++STATIC
++VOID
++HypeDbgStr (
++  IN CONST CHAR8  *S
++  )
++{
++  while (*S != '\0') {
++    HypeDbgByte ((UINT8)*S++);
++  }
++}
++
++STATIC
++VOID
++HypeDbgHex (
++  IN UINT64  V
++  )
++{
++  CONST CHAR8  *Hex = "0123456789abcdef";
++  INTN         I;
++
++  HypeDbgByte ('0');
++  HypeDbgByte ('x');
++  for (I = 60; I >= 0; I -= 4) {
++    HypeDbgByte ((UINT8)Hex[(V >> I) & 0xF]);
++  }
++}
++
+ /**
+   Internal function. Finds a consecutive free page range below
+   the requested address.
+@@ -1173,7 +1211,35 @@ CoreFindFreePagesI (
+   NumberOfBytes = LShiftU64 (NumberOfPages, EFI_PAGE_SHIFT);
+   Target        = 0;
+ 
++  UINTN  HypeIter = 0;
+   for (Link = gMemoryMap.ForwardLink; Link != &gMemoryMap; Link = Link->ForwardLink) {
++    // HYPE #436: gMemoryMap is a bounded list; if this walk exceeds any sane
++    // entry count the list is cyclic/corrupt. Dump the first entries + the
++    // offending node, then break so the hang is escaped and diagnosable.
++    if (++HypeIter > 4096) {
++      LIST_ENTRY  *L2;
++      UINTN       N;
++      HypeDbgStr ("\r\nHYPE #436 gMemoryMap CYCLE head=");
++      HypeDbgHex ((UINT64)(UINTN)&gMemoryMap);
++      HypeDbgStr (" cur=");
++      HypeDbgHex ((UINT64)(UINTN)Link);
++      HypeDbgStr ("\r\n");
++      for (L2 = gMemoryMap.ForwardLink, N = 0; N < 24; L2 = L2->ForwardLink, N++) {
++        MEMORY_MAP  *E2 = CR (L2, MEMORY_MAP, Link, MEMORY_MAP_SIGNATURE);
++        HypeDbgStr ("  node=");   HypeDbgHex ((UINT64)(UINTN)L2);
++        HypeDbgStr (" flink=");   HypeDbgHex ((UINT64)(UINTN)L2->ForwardLink);
++        HypeDbgStr (" sig=");     HypeDbgHex ((UINT64)E2->Signature);
++        HypeDbgStr (" type=");    HypeDbgHex ((UINT64)E2->Type);
++        HypeDbgStr (" s=");       HypeDbgHex (E2->Start);
++        HypeDbgStr (" e=");       HypeDbgHex (E2->End);
++        HypeDbgStr ("\r\n");
++        if (L2->ForwardLink == L2) {
++          HypeDbgStr ("  (self-loop)\r\n");
++          break;
++        }
++      }
++      break;
++    }
+     Entry = CR (Link, MEMORY_MAP, Link, MEMORY_MAP_SIGNATURE);
+ 
+     //

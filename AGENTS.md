@@ -198,11 +198,13 @@ live design doc.
   `isolation_group`s may never occupy one physical core simultaneously
   (default is one group per VM, so configuring nothing is the strict case).
 - **A hardware thread is the unit of execution; a physical core is the unit
-  of allocation** (plan.md §10 decision 40). A granted core is granted
-  whole, so every SMT sibling thread of it may run a vCPU: a dedicated VM
-  given one 2-thread core gets two vCPUs, and a two-core shared pool
-  dispatches on all four threads. Never idle a sibling thread to satisfy an
-  isolation rule and never disable SMT for the pool — the rule forbids two
+  of allocation** (plan.md §10 decision 40) — **and a vCPU IS a physical
+  core** (decision 47). `vcpus = N` costs exactly N cores on every host, and
+  SMT is a **bonus**: a granted core is granted whole, so a dedicated VM
+  given one 2-thread core gets one vCPU whose guest sees two logical CPUs,
+  and the same config on a non-SMT host costs the same core and yields one.
+  Never idle a sibling thread to satisfy an isolation rule and never disable
+  SMT for the pool — the rule forbids two
   *distrusting* owners on one core at the same time, which core-granular
   allocation already delivers. If (package, core, thread) cannot be proven
   for this host, fall back to treating every logical processor as its own

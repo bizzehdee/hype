@@ -167,7 +167,7 @@ void hype_cpuid_emulate_ex(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
 typedef struct {
     uint32_t apic_id;          /* this vCPU's local APIC ID; 0 for the BSP */
     uint32_t vcpu_count;       /* logical processors in THIS VM; >= 1 */
-    uint32_t threads_per_core; /* SMT threads per core hype gave this VM; >= 1 (§10 decision 40) */
+    uint32_t threads_per_core; /* SMT threads per core hype gave this VM; >= 1 (§10 decision 47) */
 } hype_cpuid_topology_t;
 
 /*

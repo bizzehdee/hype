@@ -634,7 +634,11 @@ static void test_leaf_b_reports_smt_and_core_levels(void) {
     hype_cpuid_result_t out;
     hype_cpuid_topology_t topo;
 
-    /* 4 vCPUs as 2 cores x 2 threads -- the shape §10 decision 40 says an SMT host gives. */
+    /*
+     * 4 LOGICAL CPUs as 2 cores x 2 threads -- what `vcpus = 2` yields on an SMT host, since a
+     * vCPU is a physical core and SMT is a bonus (§10 decision 47). vcpu_count at this layer is
+     * the count the GUEST sees, not the config's core count.
+     */
     topo.apic_id = 2u;
     topo.vcpu_count = 4u;
     topo.threads_per_core = 2u;

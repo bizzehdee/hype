@@ -195,8 +195,8 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
   ```
   [vm.win11]
   vcpus = 4                 ; PHYSICAL CORES, not threads (decision 47); on an SMT
-                            ; host the guest sees 4 x threads_per_core logical CPUs
-                            ; (§10 decision 40)
+                            ; host the guest sees 4 x threads_per_core logical
+                            ; CPUs -- SMT is a bonus, not extra vCPUs
   cpu_set = 4-7             ; explicit host PHYSICAL core subset to pin to
                             ; (optional; auto-assigned from whatever's free if
                             ; omitted). One entry per vCPU, since a vCPU IS a
@@ -1149,10 +1149,10 @@ isn't lost.
     non-goal (§1).
 14. **Startup admission control — decided: required, not best-effort**
     (§6i). Total configured `mem_mb` and `vcpus` across all VMs in
-    `hype.cfg` are checked against actual physical RAM and hardware-thread
-    count at hypervisor startup (thread, not core — decision 40); any VM
-    that would overcommit either is refused with a clear diagnostic rather
-    than allowed to start and fail later.
+    `hype.cfg` are checked against actual physical RAM and the physical
+    **core** count at hypervisor startup, with the BSP's core reserved (core,
+    not thread — decision 47); any VM that would overcommit either is refused
+    with a clear diagnostic rather than allowed to start and fail later.
 15. **Guest RAM zeroing on boot — decided: required, on every (re)start.**
     Every page of a VM's reserved guest RAM is zeroed immediately before
     that VM's first instruction executes (§2, §6f) — including restarts

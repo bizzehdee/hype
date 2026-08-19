@@ -934,7 +934,7 @@ typedef struct hype_fw_vm {
     volatile uint16_t sipi_cs_selector[HYPE_MAX_VCPUS_PER_VM];
     volatile uint8_t sipi_apply_on_self[HYPE_MAX_VCPUS_PER_VM];
     /*
-     * SMP-2 (#186) / §10 decision 40: SMT threads per core hype gave this VM, which is what its
+     * SMP-2 (#186) / §10 decision 47: SMT threads per core hype gave this VM, which is what its
      * guest is told. Set by fw_1_place_vcpus_on_threads() from where this VM's vCPUs actually
      * landed (#560), so it is a report and never a guess.
      */
@@ -1254,7 +1254,15 @@ static void fw_1_resolve_vcpus(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsigne
      * line reading as the final answer: with vcpus = 2 in hype.cfg the Phase 0 line says 1 and the
      * guest still gets 2, and without the marker that looks like the config being ignored.
      */
-    HYPE_LOGF(HYPE_LOG_INFO, "fw-1: vm%u vcpus %u -- %s (requested %u, max %u)%s [#185]\n", vm_index,
+    /*
+     * #564: this reports CORES, because that is what `vcpus` asks for. Saying "vcpus N" here
+     * while the guest ends up with 2N logical CPUs is how a gate on this line reads a correct
+     * run as a failure -- #527's gate was `fw-1: vm0 vcpus 2`, which a 1-core/2-CPU guest never
+     * prints. The count the guest actually gets is on the SMP placement line.
+     */
+    HYPE_LOGF(HYPE_LOG_INFO,
+              "fw-1: vm%u vcpus %u (= physical core(s); the guest sees this x threads/core) "
+              "-- %s (requested %u, max %u)%s [#185 #564]\n", vm_index,
                      applied, hype_cfg_ram_status_str(st), cfg_vcpus,
                      (unsigned)HYPE_MAX_VCPUS_PER_VM,
                      (cfg != 0 && cfg->vm_count != 0u) ? "" : " -- PROVISIONAL, re-resolved in "
@@ -23730,7 +23738,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              *
              * Was one per VM, which is why a `vcpus = 2` guest had nowhere to run its second
              * vCPU. Placement comes from fw_1_place_vcpus_on_threads(), which grants cores
-             * whole and packs a VM's own vCPUs onto sibling threads first (§10 decision 40) --
+             * whole and packs a VM's own threads onto its cores' siblings first (decision 47) --
              * a VM is trivially one trust group, so its vCPUs sharing a core needs no
              * permission, and no core is ever split between two VMs.
              *
