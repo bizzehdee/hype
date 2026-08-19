@@ -966,7 +966,8 @@ typedef struct hype_fw_vm {
     /* M8-4: a retained pristine copy of the loaded firmware image (OVMF), so a
      * VM Start can restore fresh firmware -- post-ExitBootServices the ESP file
      * I/O that first loaded it is gone, so it cannot be re-read from disk. */
-    uint64_t fw_pristine_host_phys;
+    /* #451: fw_pristine_host_phys is gone -- a Start re-reads the images from the boot
+     * volume, so a VM no longer carries a second copy of a constant in RAM. */
     /* #441: last TSC this VM's varstore content was saved to disk (0 = never). Rate-limits the
      * periodic save in fw_1_publish_and_render() to roughly once every few seconds, since it is
      * called on every VM exit and a real disk write on every exit would be pathological. */
@@ -2027,6 +2028,8 @@ static void fw_1_host_action_poll(void) {
 static hype_fs_t *fw_1_boot_volume(void);
 /* #450: defined further down (needs the boot-volume locator and the cfg parser). */
 static void load_hype_cfg(void);
+/* #451: defined with the Phase 1 loaders; the VM-restart path re-reads through it. */
+static int fw_1_read_firmware_images(uint64_t dst_phys, uint64_t mapped_size);
 
 /* TERM-6 (#444): needs g_hype_cfg, hence the forward declaration. `idx` is
  * the VM index term_run_cmdline already resolved from the command's arg. */
@@ -3389,7 +3392,7 @@ static int g_guest_pool_ready;
 /* Carve kinds -- the tag that lets a VM restart find its own existing carve. */
 #define HYPE_POOL_KIND_RAM 0u
 #define HYPE_POOL_KIND_FW 1u
-#define HYPE_POOL_KIND_FW_PRISTINE 2u
+/* #451: kind 2 was FW_PRISTINE, retired with the per-VM snapshot. */
 #define HYPE_POOL_KIND_VDISK 3u
 
 /*
@@ -11839,9 +11842,20 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
      * periodic checkpoint.
      */
     fw_1_vars_request(vm, HYPE_FW_VARS_REQ_SAVE, 1); /* #454: must finish before the overwrite */
-    if (vm->fw_pristine_host_phys != 0) {
-        hype_guest_ram_copy((void *)(uintptr_t)g_fw_1_combined_host_phys,
-                            (const void *)(uintptr_t)vm->fw_pristine_host_phys, g_fw_1_combined_size);
+    /*
+     * #451: re-read the pristine images from the boot volume instead of copying a per-VM RAM
+     * snapshot of them. The snapshot existed only because "the ESP is unreachable post-EBS" was
+     * true when M8-4 was written; hype reaches its own volume now, so every VM was carrying a
+     * second full copy of a constant.
+     *
+     * A failure here leaves the buffer holding the LAST run's firmware, which is wrong but
+     * runnable, so it is reported rather than fatal -- unlike the initial load, where there is
+     * nothing to fall back to.
+     */
+    if (fw_1_read_firmware_images(g_fw_1_combined_host_phys, g_fw_1_combined_size) != 0) {
+        hype_debug_print("fw-1 vm%u: could not re-read the pristine firmware for this Start -- the "
+                         "buffer still holds the previous run's image [#451]\n",
+                         (unsigned)(vm - g_vms));
     }
     /* #441: then overlay any PREVIOUSLY saved varstore on top of the fresh pristine copy, so
      * this VM resumes with its own persisted NVRAM state rather than the pristine one. */
@@ -13324,8 +13338,100 @@ wait_for_sipi:
  * Order matters and is the order the ticket asks the log to show: locator and mount, config read,
  * parse result, admission result, then per-VM setup.
  */
+/*
+ * #451 (plan.md section 10 decision 37, firmware half): load the guest firmware images in Phase 1,
+ * through hype's own storage stack.
+ *
+ * These were read pre-EBS through UEFI's Simple File System, and that assumption -- "the ESP is
+ * unreachable post-EBS" -- is what made every VM carry a SECOND full copy of the firmware in RAM
+ * (fw_pristine_host_phys), purely so a VM Start could restore a clean image. hype can reach its
+ * own volume post-EBS, so the snapshot is gone and a Start re-reads from disk.
+ *
+ * Fatal on failure, unlike a missing hype.cfg (#450): no guest can boot without firmware, so
+ * falling back to a default is not a thing that exists here.
+ *
+ * Returns 0 on success. Reads into the caller-supplied host-physical buffer, VARS then CODE, both
+ * flush against the END of the mapped region -- padding goes at the START so guest-physical
+ * 4 GiB - 16 (the reset vector) keeps landing on CODE's own real last bytes.
+ */
+static int fw_1_read_firmware_images(uint64_t dst_phys, uint64_t mapped_size) {
+    hype_fs_t *bv = fw_1_boot_volume();
+    hype_fs_file_t f;
+    uint64_t content_size = g_vms[0].code_size + g_vms[0].vars_size;
+    uint64_t content_start;
+
+    if (bv == 0 || dst_phys == 0ull || content_size == 0ull || content_size > mapped_size) {
+        return -1;
+    }
+    content_start = dst_phys + (mapped_size - content_size);
+    if (hype_fs_lookup(bv, "\\EFI\\hype\\OVMF_VARS.fd", &f) != 0 ||
+        hype_fs_read_at(&f, 0ull, (void *)(uintptr_t)content_start,
+                        (unsigned int)g_vms[0].vars_size) != 0) {
+        return -1;
+    }
+    if (hype_fs_lookup(bv, "\\EFI\\hype\\OVMF_CODE.fd", &f) != 0 ||
+        hype_fs_read_at(&f, 0ull, (void *)(uintptr_t)(content_start + g_vms[0].vars_size),
+                        (unsigned int)g_vms[0].code_size) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * #451: size the images, carve vm0's buffer from the #449 pool and fill it. Runs in Phase 1,
+ * before any per-VM copy.
+ */
+static void fw_1_phase1_firmware(void) {
+    hype_fs_t *bv = fw_1_boot_volume();
+    hype_fs_file_t f;
+    uint64_t content_size, mapped_size;
+    uint64_t t0, t1, hz;
+
+    if (bv == 0) {
+        hype_fatal("fw-1: no boot volume -- the guest firmware images cannot be read, so no guest "
+                   "can boot [#451]");
+    }
+    if (hype_fs_lookup(bv, "\\EFI\\hype\\OVMF_CODE.fd", &f) != 0) {
+        hype_fatal("fw-1: \\EFI\\hype\\OVMF_CODE.fd not found on the boot volume [#451]");
+    }
+    g_vms[0].code_size = f.size;
+    if (hype_fs_lookup(bv, "\\EFI\\hype\\OVMF_VARS.fd", &f) != 0) {
+        hype_fatal("fw-1: \\EFI\\hype\\OVMF_VARS.fd not found on the boot volume [#451]");
+    }
+    g_vms[0].vars_size = f.size;
+
+    content_size = g_vms[0].code_size + g_vms[0].vars_size;
+    mapped_size = (content_size + HYPE_PAGING_2MB - 1) & ~(HYPE_PAGING_2MB - 1);
+    g_vms[0].combined_size = mapped_size;
+
+    g_vms[0].combined_host_phys = fw_1_pool_carve(0, 0u, HYPE_POOL_KIND_FW, mapped_size, "firmware");
+    if (g_vms[0].combined_host_phys == 0ull) {
+        hype_fatal("fw-1: no room to carve %llu MiB for vm0's firmware [#451]",
+                   (unsigned long long)(mapped_size / (1024ull * 1024ull)));
+    }
+    hype_guest_ram_zero((void *)(uintptr_t)g_vms[0].combined_host_phys, mapped_size);
+
+    hz = g_vms[0].host_tsc_hz;
+    t0 = hype_rdtsc();
+    if (fw_1_read_firmware_images(g_vms[0].combined_host_phys, mapped_size) != 0) {
+        hype_fatal("fw-1: the guest firmware images could not be READ from the boot volume -- no "
+                   "guest can boot [#451]");
+    }
+    t1 = hype_rdtsc();
+    /* #451 item 6: the re-read cost, measured rather than assumed -- it is what a VM Start now
+     * pays instead of keeping a per-VM pristine copy in RAM. */
+    hype_debug_print("fw-1: firmware %llu B (VARS %llu + CODE %llu) read through hype's own stack "
+                     "in %llums, mapped %llu B @0x%llx [#451]\n",
+                     (unsigned long long)content_size, (unsigned long long)g_vms[0].vars_size,
+                     (unsigned long long)g_vms[0].code_size,
+                     (unsigned long long)(hz ? ((t1 - t0) * 1000ull) / hz : 0ull),
+                     (unsigned long long)mapped_size,
+                     (unsigned long long)g_vms[0].combined_host_phys);
+}
+
 static void fw_1_phase1_config(void) {
     load_hype_cfg();
+    fw_1_phase1_firmware();
 
     g_vm_count = g_hype_cfg.vm_count ? g_hype_cfg.vm_count : 2u;
     if (g_vm_count > g_max_vms) {
@@ -13433,11 +13539,6 @@ static void fw_1_phase1_config(void) {
         vmn->ram_host_phys = fw_1_pool_carve(0, vi,
                                              HYPE_POOL_KIND_RAM, vmn->ram_bytes, "guest RAM");
         hype_guest_ram_zero((void *)(uintptr_t)vmn->ram_host_phys, vmn->ram_bytes);
-        vmn->fw_pristine_host_phys = fw_1_pool_carve(0, vi,
-                                                     HYPE_POOL_KIND_FW_PRISTINE,
-                                                     vmn->combined_size, "firmware snapshot");
-        hype_guest_ram_copy((void *)(uintptr_t)vmn->fw_pristine_host_phys,
-                            (const void *)(uintptr_t)vmn->combined_host_phys, vmn->combined_size);
         vmn->host_tsc_hz = vm->host_tsc_hz;
         vmn->disk[0].backing_phys = fw_1_pool_carve(0, vi,
                                                     HYPE_POOL_KIND_VDISK,
@@ -22967,79 +23068,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * CODE.fd immediately after, matching their real relative
          * guest-physical layout.
          */
-        {
-            EFI_FILE_PROTOCOL *root = 0;
-            EFI_STATUS fw_status;
-            uint64_t content_size, mapped_size, content_start;
-
-            fw_status = hype_file_locate_root(ImageHandle, SystemTable->BootServices, &root);
-            if (fw_status != EFI_SUCCESS) {
-                hype_fatal("fw-1: hype_file_locate_root failed: 0x%llx", (unsigned long long)fw_status);
-            }
-
-            fw_status = hype_file_get_size(root, SystemTable->BootServices,
-                                            (CHAR16 *)L"\\EFI\\hype\\OVMF_CODE.fd", &g_fw_1_code_size);
-            if (fw_status != EFI_SUCCESS) {
-                hype_fatal("fw-1: hype_file_get_size(OVMF_CODE.fd) failed: 0x%llx",
-                           (unsigned long long)fw_status);
-            }
-            fw_status = hype_file_get_size(root, SystemTable->BootServices,
-                                            (CHAR16 *)L"\\EFI\\hype\\OVMF_VARS.fd", &g_fw_1_vars_size);
-            if (fw_status != EFI_SUCCESS) {
-                hype_fatal("fw-1: hype_file_get_size(OVMF_VARS.fd) failed: 0x%llx",
-                           (unsigned long long)fw_status);
-            }
-
-            /* hype_npt_map_range() requires a whole-2MB-multiple size
-             * -- round up rather than assume this vendored build's own
-             * file sizes happen to add up to one exactly (they
-             * currently do, but a rebuilt OVMF might not). Any padding
-             * goes at the START of the allocated/mapped region (the
-             * lowest addresses) -- real file content is always placed
-             * flush against the END, so guest-physical 4GB - 16 (the
-             * reset vector) keeps landing on CODE's own real last
-             * bytes regardless of padding. */
-            content_size = g_fw_1_code_size + g_fw_1_vars_size;
-            mapped_size = (content_size + HYPE_PAGING_2MB - 1) & ~(HYPE_PAGING_2MB - 1);
-            g_fw_1_combined_size = mapped_size;
-
-            g_fw_1_combined_host_phys = fw_1_pool_carve(SystemTable->BootServices, 0u,
-                                                        HYPE_POOL_KIND_FW, mapped_size,
-                                                        "firmware");
-            hype_guest_ram_zero((void *)(uintptr_t)g_fw_1_combined_host_phys, mapped_size);
-
-            content_start = g_fw_1_combined_host_phys + (mapped_size - content_size);
-            fw_status = hype_file_read_into(root, (CHAR16 *)L"\\EFI\\hype\\OVMF_VARS.fd",
-                                             (void *)(uintptr_t)content_start, g_fw_1_vars_size);
-            if (fw_status != EFI_SUCCESS) {
-                hype_fatal("fw-1: hype_file_read_into(OVMF_VARS.fd) failed: 0x%llx",
-                           (unsigned long long)fw_status);
-            }
-            fw_status = hype_file_read_into(root, (CHAR16 *)L"\\EFI\\hype\\OVMF_CODE.fd",
-                                             (void *)(uintptr_t)(content_start + g_fw_1_vars_size),
-                                             g_fw_1_code_size);
-            if (fw_status != EFI_SUCCESS) {
-                hype_fatal("fw-1: hype_file_read_into(OVMF_CODE.fd) failed: 0x%llx",
-                           (unsigned long long)fw_status);
-            }
-
-            hype_debug_print(
-                "fw-1: OVMF_VARS.fd+OVMF_CODE.fd (%llu bytes content, %llu bytes mapped) loaded at "
-                "host-physical 0x%llx\n",
-                (unsigned long long)content_size, (unsigned long long)mapped_size,
-                (unsigned long long)g_fw_1_combined_host_phys);
-
-            /* M8-4: snapshot the freshly-loaded (pristine, no guest has run yet)
-             * firmware so a VM Start can restore it -- the ESP is unreachable
-             * post-EBS. Same 2MB-aligned allocator, done while Boot Services
-             * still exist. */
-            vm->fw_pristine_host_phys = fw_1_pool_carve(SystemTable->BootServices, 0u,
-                                                        HYPE_POOL_KIND_FW_PRISTINE, mapped_size,
-                                                        "firmware snapshot");
-            hype_guest_ram_copy((void *)(uintptr_t)vm->fw_pristine_host_phys,
-                                (const void *)(uintptr_t)g_fw_1_combined_host_phys, mapped_size);
-        }
-
+        /* #451: the guest firmware images are read in Phase 1, through hype's own storage
+         * stack -- fw_1_phase1_firmware(). Phase 0 no longer opens a file. */
         /*
          * FW-1a: allocate + zero the guest's low RAM as a real,
          * contiguous host buffer (NPT-mapped at guest-physical
