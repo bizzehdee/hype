@@ -15,12 +15,12 @@ which is exactly the device hype's host-input path owns.
 Prints one line per key sent so the run log can be correlated against hype's own VIEWSWITCH and
 KBDIRQ lines.
 
-SPACE LETTERS AT LEAST 2 SECONDS APART (#582). At 1-second spacing most scancodes never reach
-hype's poller -- measured 4 of 18 -- so a typed command never forms a word and the run reads as
-"typed dashboard commands do not work", which is a wrong and expensive conclusion. At 2 seconds
-nothing is lost (18 of 18). A chord is a single event and is unaffected, which is why #363's
-original use of this never hit it. The cause is not yet attributed to QEMU's i8042 model or to
-hype's own BSP poll rate; #582 has the measurements.
+Key spacing no longer matters (#582, fixed). It used to: at 1-second spacing only 4 of 18
+scancodes reached hype, so a typed command never formed a word and a run read as "typed dashboard
+commands do not work". The cause was hype's, not this script's -- its PS/2 poll disabled itself
+after a single taken IRQ1, and the i8042 holds ONE byte, so anything arriving before the BSP took
+the next interrupt was dropped by the controller. Now 18 of 18 at the same spacing. A chord was
+always a single event and was never affected, which is why #363's original use never hit this.
 """
 import json
 import socket

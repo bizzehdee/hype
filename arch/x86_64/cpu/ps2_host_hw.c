@@ -166,15 +166,29 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
         return 0;
     }
     /*
-     * #490: the poll exists ONLY for hosts whose IRQ1 never fires (#218's real-hardware case:
-     * isr_entries=0 across whole runs). On a host where IRQ1 WORKS, poll and ISR race for each
-     * byte, and the loser's read of port 0x60 returns the previous byte again -- measured as
-     * every keystroke doubling ('sseett  aa  llaabbeell') on the QEMU rig, and reported by the
-     * operator on the laptop. One taken IRQ1 proves the interrupt path works; stop polling.
+     * #582: THE POLL RUNS EVEN WHERE IRQ1 WORKS, and this used to be the opposite.
+     *
+     * #490 disabled polling the moment a single IRQ1 was taken -- "one taken IRQ1 proves the
+     * interrupt path works; stop polling" -- to end a poll/ISR race in which the loser's read of
+     * port 0x60 returned the previous byte again, doubling every keystroke.
+     *
+     * The race was real and the conclusion was too strong. "The interrupt path works" is not "the
+     * interrupt path is SUFFICIENT". The i8042's output buffer holds ONE byte: if the BSP does not
+     * take IRQ1 before the next key arrives, the controller drops it, and the BSP has plenty to be
+     * busy with -- rendering, and a USB log flush that measurably falls behind. One taken interrupt
+     * therefore disabled the safety net for the whole run.
+     *
+     * Measured on the QEMU rig at one-second key spacing: isr_entries=4, polled=4, against 18
+     * make/break events sent. FOURTEEN OF EIGHTEEN KEYS LOST -- and a typed command missing 14 of
+     * its 18 events never forms a word, so it reads as "typed commands do not work" rather than as
+     * dropped input. That cost two runs on #177 before the spacing was suspected.
+     *
+     * Polling alongside a working ISR is safe now, and that is what changed: #490 also made the
+     * status+data pair ATOMIC in host_kbd_drain_polled() by masking interrupts across it, and the
+     * ISR does its own OBF check. Two readers, each testing OBF atomically with its read, cannot
+     * both take the same byte -- which is what the doubling was. The early return was belt and
+     * braces on top of a fix that had already removed the cause, and it cost correctness.
      */
-    if (g_kbd_isr_entries != 0u) {
-        return hype_host_kbd_buffer_pop(&g_host_kbd_buffer, out_scancode);
-    }
     if (g_kbd_drain_busy) {
         return 0; /* re-entered from within the caller's own drain loop */
     }

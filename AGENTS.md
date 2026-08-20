@@ -316,13 +316,13 @@ Rules that are not optional:
   batch consumed, so a rising rate is visible instead of absorbed. A boot that
   DOES reach hype and then wedges is never retried — that one has to keep failing,
   which is why a blind "no banner → retry" is the wrong guard.
-- **`SENDKEYS` needs 2 seconds between keys (#582).** At 1-second spacing most
-  injected scancodes never reach hype (measured: 4 of 18 polled), so a typed
-  command silently never forms and the run reads as "typed commands do not
-  work" — a wrong conclusion that cost two runs on #177. At 2-second spacing
-  nothing is lost (18 of 18). Chords are one event each and were unaffected,
-  which is why #363's original use never hit it. Cause not yet attributed;
-  until #582 says otherwise, space letters 2s apart.
+- **`SENDKEYS` key loss is FIXED (#582)** — no spacing rule any more. The cause was
+  hype's, not the harness's: the PS/2 poll disabled itself after a single taken
+  IRQ1, and the i8042 holds ONE byte, so every key arriving before the BSP took
+  the next interrupt was dropped by the controller. Measured at 1-second spacing:
+  4 of 18 events before, **18 of 18 after**. A typed command missing 14 of its 18
+  events never forms a word, so it read as "typed commands do not work" — which
+  cost two runs on #177.
 - QEMU is stopped with `SIGTERM` and only then `SIGKILL` (`QUIT_GRACE`, 5s).
   `STOP_SIGNAL=KILL` restores the old behaviour for an A/B. Measured on 5 boots:
   log sizes differ by under 10 bytes either way, so `-serial file:` output is NOT
