@@ -22,6 +22,7 @@
 #include "../core/mp.h"
 #include "../core/admission.h"
 #include "../core/cfg.h"
+#include "../core/run_state.h"
 #include "../core/strutil.h"
 #include "../core/phys_guard.h"
 #include "../core/phys_confirm.h"
@@ -2254,11 +2255,24 @@ static void fw_1_host_power_act(unsigned action) {
     }
 }
 
+/* M9-3 (#176): defined further down, with the other boot-volume writers -- it needs
+ * fw_1_boot_volume(), which is itself forward-declared below this point. */
+static int fw_1_write_run_state(unsigned action);
+
 /* Begin the sequence: post SHUTDOWN to every non-OFF guest in one pass (their own loops run
  * the grace timers in parallel) and arm the host-wide deadline. Returns how many were up. */
 static unsigned fw_1_host_action_begin(unsigned action) {
     unsigned i, posted = 0;
     uint64_t hz = g_vms[0].host_tsc_hz;
+    /*
+     * M9-3 (#176): the run-state record is written HERE, before a single SHUTDOWN is posted.
+     *
+     * plan.md section 6h persists "which VMs were running at the moment shutdown began", and this
+     * is that moment: one line later every VM's lifecycle has been moved to SHUTTING and the fact
+     * the record exists to capture is gone. Writing it afterwards would record a host on which
+     * nothing was running, which is a record that restores nothing.
+     */
+    (void)fw_1_write_run_state(action);
     for (i = 0; i < g_vm_count; i++) {
         if (g_vms[i].lifecycle != HYPE_VM_OFF) {
             g_vms[i].shutdown_deadline_tsc = 0; /* the VM's loop arms its own grace */
@@ -20785,6 +20799,83 @@ static hype_fs_t *fw_1_boot_volume(void) {
     media_scan_unlock();
     hype_debug_print("fw-1 BOOTVOL: no writable volume carrying this boot's \\hype.cfg found -- "
                      "config write-back unavailable this boot [#447]\n");
+    return 0;
+}
+
+/*
+ * M9-3 (#176): write the run-state record, as part of the host shutdown sequence.
+ *
+ * plan.md section 6h: "a small state record (which VMs were running vs. stopped at the moment
+ * shutdown began) is written to persistent storage (the ESP, alongside hype.cfg) as part of the
+ * shutdown sequence. Both the write and the next boot's read go through hype's own storage stack
+ * via the shared boot-volume locator (decisions 37/38), not through firmware." That is exactly
+ * fw_1_boot_volume() plus the hype_fs_* calls the config write-back already uses.
+ *
+ * RUNNING here means "not OFF", which is the same test fw_1_host_action_begin() uses to decide who
+ * gets a SHUTDOWN -- so the record describes precisely the set of guests this shutdown is about to
+ * take down. A PAUSED VM is recorded as running: the next boot's Start is a fresh boot either way
+ * (section 6f), pause is not persisted state, and coming back running is the closer answer to
+ * "this machine was up" than coming back off.
+ *
+ * Best-effort, and it says so out loud when it fails. It must never delay or block the host action:
+ * a host that will not power off because a file could not be written is a worse outcome than one
+ * that comes back with every VM started, which is also this record's absent-file default (#177).
+ *
+ * Statics rather than stack: this runs once per host power event, from the BSP, post-ExitBootServices
+ * where the stack is the one hype set up for itself -- and one-per-host is CORRECT here rather than
+ * merely tolerable, because there is exactly one host power event in flight (#563's rule).
+ */
+static int fw_1_write_run_state(unsigned action) {
+    static hype_run_state_t st;           /* one-per-host: one host power event at a time */
+    static char text[HYPE_RUN_STATE_MAX_VMS * (HYPE_CFG_NAME_MAX + 16) + 192];
+    unsigned int i, len = 0, up = 0;
+    hype_fs_t *bv;
+    hype_fs_file_t f;
+
+    hype_run_state_init(&st, (action == HYPE_HOST_ACTION_OFF) ? HYPE_RUN_STATE_REASON_OFF
+                                                             : HYPE_RUN_STATE_REASON_REBOOT);
+    for (i = 0; i < g_vm_count; i++) {
+        int running = (g_vms[i].lifecycle != HYPE_VM_OFF);
+        const char *nm = g_vms[i].name;
+        if (nm == 0 || nm[0] == '\0') {
+            /* A VM with no config name cannot be looked up on the next boot, so recording it would
+             * write a line that could only ever be ignored. Say so rather than skip it silently. */
+            HYPE_LOGF(HYPE_LOG_WARN, "fw-1 M9-3: vm%u has no name -- it cannot be restored by "
+                             "name and is left out of the run-state record [#176]\n", i);
+            continue;
+        }
+        (void)hype_run_state_add(&st, nm, running);
+        if (running) up++;
+    }
+    if (st.dropped != 0u) {
+        HYPE_LOGF(HYPE_LOG_WARN, "fw-1 M9-3: %u VM(s) beyond the record's %u-machine ceiling were "
+                         "NOT recorded and will take the default on the next boot [#176]\n",
+                         st.dropped, (unsigned)HYPE_RUN_STATE_MAX_VMS);
+    }
+    if (hype_run_state_serialize(&st, text, (unsigned int)sizeof(text), &len) != 0) {
+        /* Refusing to write a truncated record: a record whose last line was cut says a machine was
+         * stopped when it was running, and the next boot acts on it. */
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 M9-3: the run-state record does not fit hype's %u-byte "
+                         "buffer -- NOT written; the next boot will start every VM [#176]\n",
+                         (unsigned)sizeof(text));
+        return -1;
+    }
+    bv = fw_1_boot_volume();
+    if (bv == 0) {
+        hype_debug_print("fw-1 M9-3: no writable boot volume -- run-state NOT persisted; the next "
+                         "boot will start every VM [#176]\n");
+        return -1;
+    }
+    if (hype_fs_create(bv, HYPE_RUN_STATE_PATH, &f) != 0 ||
+        hype_fs_write_at(&f, 0, text, len) != 0) {
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 M9-3: writing \\%s failed -- run-state NOT persisted; the "
+                         "next boot will start every VM [#176]\n", HYPE_RUN_STATE_PATH);
+        return -1;
+    }
+    (void)hype_fs_sync(bv);
+    hype_debug_print("fw-1 M9-3: run-state recorded to \\%s -- %u of %u VM(s) were up, reason=%s, "
+                     "%u bytes [#176]\n", HYPE_RUN_STATE_PATH, up, g_vm_count,
+                     (action == HYPE_HOST_ACTION_OFF) ? "off" : "reboot", len);
     return 0;
 }
 

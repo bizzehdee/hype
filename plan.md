@@ -763,7 +763,13 @@ it starts back up again:
   written to persistent storage (the ESP, alongside `hype.cfg`) as part of
   the shutdown sequence. Both the write and the next boot's read go through
   hype's own storage stack via the shared boot-volume locator (§10 decisions
-  37/38), not through firmware.
+  37/38), not through firmware. Implemented (#176) as `\hype-state.txt`, a
+  versioned plain-text record **keyed by VM name, not by index** — an
+  operator who reorders their `[vm.*]` sections between boots would
+  otherwise have the record start a different machine than the one that was
+  up. A record whose version this build does not know, or that is damaged,
+  is refused whole rather than read in part: a half-restored host cannot be
+  told apart from a correctly restored one.
 - **On next hypervisor startup**: read that state record and automatically
   re-**Start** every VM that was previously running (a fresh boot from its
   disk/target per §6f's Start semantics), leaving previously-stopped VMs
