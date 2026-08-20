@@ -773,7 +773,14 @@ it starts back up again:
 - **On next hypervisor startup**: read that state record and automatically
   re-**Start** every VM that was previously running (a fresh boot from its
   disk/target per §6f's Start semantics), leaving previously-stopped VMs
-  stopped. This is explicitly a **restart-to-the-same-run-state**
+  stopped. Implemented (#177): read once on the BSP in Phase 1, applied per
+  VM by name. Only an explicit `stopped` holds a VM back — a missing record,
+  a refused one, or a VM added to `hype.cfg` since the last shutdown all
+  keep the default and start, because an absent record must never read as
+  "stop everything" (the first boot on a fresh stick has none, and a host
+  that came up with nothing running because of that looks exactly like one
+  that failed to boot its guests). The record is not consumed, so it also
+  covers a power cut hype could not catch. This is explicitly a **restart-to-the-same-run-state**
   mechanism, not a live-memory snapshot/resume — guest RAM contents are not
   preserved across the host power event (that would be VM
   snapshotting/hibernation, an explicit non-goal, §1). What's restored is

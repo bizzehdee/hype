@@ -2258,6 +2258,13 @@ static void fw_1_host_power_act(unsigned action) {
 /* M9-3 (#176): defined further down, with the other boot-volume writers -- it needs
  * fw_1_boot_volume(), which is itself forward-declared below this point. */
 static int fw_1_write_run_state(unsigned action);
+/*
+ * M9-4 (#177): the record this boot read, and the reader that fills it. Read ONCE on the BSP in
+ * Phase 1; every VM's own setup then does a pure lookup by name. One-per-host is correct rather
+ * than merely tolerable (#563): there is one record per boot, and it describes the whole host.
+ */
+static hype_run_state_t g_run_state;
+static void fw_1_read_run_state(void);
 
 /* Begin the sequence: post SHUTDOWN to every non-OFF guest in one pass (their own loops run
  * the grace timers in parallel) and arm the host-wide deadline. Returns how many were up. */
@@ -11906,6 +11913,12 @@ static void fw_1_phase1_config(void) {
                                                       : "the default, because no usable config was "
                                                         "read");
     fw_1_phase1_firmware();
+    /*
+     * M9-4 (#177): the previous shutdown's run-state, read once, here -- after the boot volume is
+     * known to be reachable (fw_1_phase1_firmware just read through it) and before any VM's core
+     * has started. Each VM's setup then consults it by name with no further I/O.
+     */
+    fw_1_read_run_state();
 
     g_vm_count = g_hype_cfg.vm_count;
     if (g_vm_count == 0u) {
@@ -12791,6 +12804,34 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (ready_index < g_vm_count) {
             __atomic_store_n(&g_vm_ready[ready_index], 1u, __ATOMIC_RELEASE);
         }
+    }
+
+    /*
+     * M9-4 (#177): a VM the last shutdown recorded as STOPPED comes up stopped.
+     *
+     * Applied HERE, at the last moment before the loop, and only to the lifecycle -- every piece of
+     * this VM's setup has still run exactly as it does for a VM that will execute. That is
+     * deliberate: the OFF branch of the loop below renders and polls, and the STARTING branch calls
+     * fw_1_vm_reinit() on this vCPU context, so a half-initialised VM could not be started from the
+     * terminal at all. The cost is one guest's firmware load that is then thrown away by the Start;
+     * the alternative is a VM the operator cannot bring up, which is worse.
+     *
+     * Only STOPPED holds a VM back. UNKNOWN -- no record, a refused record, or a VM added to
+     * hype.cfg since the last shutdown -- keeps today's behaviour and starts it. An absent record
+     * must never read as "stop everything": the first boot on a fresh stick has no record, and a
+     * host that came up with nothing running because of that looks exactly like one that failed.
+     */
+    if (hype_run_state_lookup(&g_run_state, vm->name) == HYPE_RUN_STATE_STOPPED) {
+        vm->lifecycle = HYPE_VM_OFF;
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 M9-4: vm%u '%s' was STOPPED when the host last went down -- "
+                         "left off, not started. 'start %s' at the terminal boots it [#177]\n",
+                         (unsigned)(vm - g_vms), vm->name, vm->name);
+    } else {
+        hype_debug_print("fw-1 M9-4: vm%u '%s' starts (%s) [#177]\n", (unsigned)(vm - g_vms),
+                         vm->name,
+                         (hype_run_state_lookup(&g_run_state, vm->name) == HYPE_RUN_STATE_RUNNING)
+                             ? "it was running when the host last went down"
+                             : "no run-state record covers it, so it takes the default");
     }
 
     /* SMP-7 (#191): enter the loop in the "outside the guest" state -- the loop releases this
@@ -20877,6 +20918,93 @@ static int fw_1_write_run_state(unsigned action) {
                      "%u bytes [#176]\n", HYPE_RUN_STATE_PATH, up, g_vm_count,
                      (action == HYPE_HOST_ACTION_OFF) ? "off" : "reboot", len);
     return 0;
+}
+
+/*
+ * M9-4 (#177): read the run-state record, ONCE, on the BSP, before any VM's loop starts.
+ *
+ * Read here rather than from each VM's own core because it is I/O: the boot-volume locator takes
+ * the media scan lock, and doing that N times from N cores to answer one question per core would
+ * be N reads of one small file for no gain. The parsed record is then a pure lookup by name, which
+ * is what each VM's setup does.
+ *
+ * NOT CONSUMED. The record is left in place after being read, so it also covers the case hype
+ * cannot catch -- a power cut with no shutdown sequence. On that boot the record describes the last
+ * state hype was told about, which is strictly better information than "start everything". It is
+ * overwritten by the next orderly shutdown.
+ *
+ * Every failure -- no volume, absent file, unreadable, refused -- leaves g_run_state malformed, and
+ * a malformed record has no opinion about any VM (hype_run_state_lookup returns UNKNOWN), so every
+ * VM keeps its default and starts. An absent record must never mean "stop everything": the first
+ * boot on a fresh stick has no record, and a host that came up with nothing running because of that
+ * would look exactly like a host that failed to boot its guests.
+ */
+static void fw_1_read_run_state(void) {
+    static char text[HYPE_RUN_STATE_MAX_VMS * (HYPE_CFG_NAME_MAX + 16) + 192];
+    hype_fs_t *bv;
+    hype_fs_file_t f;
+    uint64_t sz;
+
+    /* Start from a refused record, so every early return below already means "no opinion". */
+    hype_run_state_init(&g_run_state, HYPE_RUN_STATE_REASON_UNKNOWN);
+    g_run_state.malformed = 1;
+
+    bv = fw_1_boot_volume();
+    if (bv == 0) {
+        hype_debug_print("fw-1 M9-4: no boot volume -- no run-state record; every VM starts "
+                         "[#177]\n");
+        return;
+    }
+    if (hype_fs_lookup(bv, HYPE_RUN_STATE_PATH, &f) != 0) {
+        hype_debug_print("fw-1 M9-4: no \\%s on the boot volume -- the ABSENT case, not a failure: "
+                         "every VM starts [#177]\n", HYPE_RUN_STATE_PATH);
+        return;
+    }
+    sz = f.size;
+    if (sz == 0 || sz >= sizeof(text)) {
+        HYPE_LOGF(HYPE_LOG_WARN, "fw-1 M9-4: \\%s size %llu unusable (1..%llu) -- ignored; every VM "
+                         "starts [#177]\n", HYPE_RUN_STATE_PATH, (unsigned long long)sz,
+                         (unsigned long long)(sizeof(text) - 1));
+        return;
+    }
+    if (hype_fs_read_at(&f, 0ull, text, (unsigned int)sz) != 0) {
+        HYPE_LOGF(HYPE_LOG_WARN, "fw-1 M9-4: \\%s found (%llu bytes) but UNREADABLE -- ignored; "
+                         "every VM starts [#177]\n", HYPE_RUN_STATE_PATH,
+                         (unsigned long long)sz);
+        return;
+    }
+    if (hype_run_state_parse(text, (unsigned int)sz, &g_run_state) != 0) {
+        /*
+         * Refused, not partially applied. A record whose version this build does not know, or that
+         * is damaged, would otherwise restore SOME machines -- and a half-restored host cannot be
+         * told apart from a correctly restored one until an operator notices something missing.
+         */
+        HYPE_LOGF(HYPE_LOG_WARN, "fw-1 M9-4: \\%s REFUSED (version=%u read, this build knows %u) -- "
+                         "no VM is held off by a record hype cannot fully read; every VM starts "
+                         "[#177]\n", HYPE_RUN_STATE_PATH, g_run_state.version,
+                         (unsigned)HYPE_RUN_STATE_VERSION);
+        return;
+    }
+    {
+        unsigned int i, was_up = 0;
+        for (i = 0; i < g_run_state.count; i++) {
+            if (g_run_state.vms[i].running) was_up++;
+        }
+        hype_debug_print("fw-1 M9-4: \\%s read -- %u VM(s) described, %u were up, reason=%s%s "
+                         "[#177]\n", HYPE_RUN_STATE_PATH, g_run_state.count, was_up,
+                         (g_run_state.reason == HYPE_RUN_STATE_REASON_OFF)
+                             ? "off"
+                             : ((g_run_state.reason == HYPE_RUN_STATE_REASON_REBOOT) ? "reboot"
+                                                                                    : "unknown"),
+                         (g_run_state.unknown_keys != 0u)
+                             ? " (it carries keys this build does not know -- written by a newer "
+                               "hype)"
+                             : "");
+        if (g_run_state.dropped != 0u) {
+            HYPE_LOGF(HYPE_LOG_WARN, "fw-1 M9-4: the record named %u more VM(s) than hype can hold "
+                             "-- those take the default and START [#177]\n", g_run_state.dropped);
+        }
+    }
 }
 
 static void usb_log_setup(const hype_blk_backend_t *be) {
