@@ -171,6 +171,7 @@ $(OUT): $(OBJS)
 
 test:
 	@python3 tools/check-fw1-statics.py
+	@python3 tools/check-one-mmio-list.py
 	core/tests/run.sh
 
 # Boot hype.efi under QEMU+OVMF as a removable-media ESP (M0-4).

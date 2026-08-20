@@ -1130,6 +1130,14 @@ typedef struct hype_fw_vm {
     volatile uint64_t shared_disk_bar[HYPE_FW_1_MAX_DISKS];
     volatile unsigned shared_disk_mapped[HYPE_FW_1_MAX_DISKS];
     /*
+     * #576: the Bochs VBE BAR2 window (#565), published on the same argument. It was the last
+     * window left in a BSP loop local, so a guest that touched a display register from any other
+     * vCPU had the access absorbed as all-ones instead of served -- #511's shape, in the display
+     * path, waiting to be found the expensive way.
+     */
+    volatile uint64_t shared_vbe_bar;
+    volatile unsigned shared_vbe_mapped;
+    /*
      * #520: the SIPI entry a vCPU must apply to ITSELF.
      *
      * On SVM the sender can build the target's state directly -- a VMCB is plain memory and any
@@ -9982,8 +9990,8 @@ static unsigned (*g_ap_vcpu_excp_dumped)[HYPE_MAX_VCPUS_PER_VM];
 static int g_ap_mpdata_sample;
 
 /*
- * #482: ONE entry point for a VM's shared device MMIO, so every dispatch loop serves the guest's
- * devices identically.
+ * #482/#576: ONE entry point for a VM's shared device MMIO, so every dispatch loop serves the
+ * guest's devices identically.
  *
  * The AP loop used to carry its own copy of this chain, grown a region at a time as each new
  * unhandled fault was found -- ECAM, then the ABARs, then virtio-blk (#511), then the flash
@@ -9991,6 +9999,13 @@ static int g_ap_mpdata_sample;
  * to the next region, and two hand-maintained copies of the same dispatch drift apart silently.
  * A guest that reads a device register gets the same answer regardless of which vCPU it happens
  * to be running on, or it is not a device model at all.
+ *
+ * #482 moved the AP's copy here and left the BSP's in place, so for a while "one entry point" was
+ * the intent and not the state: this function had one caller and it was the AP loop. #81 landed a
+ * window here only, and the guest found its device, sized and placed BAR4, walked its whole
+ * capability chain, then read a register as 0xff -- a single-vCPU guest runs on the BSP, and the
+ * BSP had never heard of the window. #576 finished the merge. THIS IS NOW THE ONLY LIST OF
+ * WINDOWS: add a device here and every vCPU serves it.
  *
  * Serves per-VM state only. The caller MUST hold fw_1_dev_lock(vm) -- two cores in one device
  * model is the #343 bug class. The per-vCPU LAPIC is deliberately absent: it needs no lock and
@@ -10000,13 +10015,15 @@ static int g_ap_mpdata_sample;
  * Reporting the device rather than a bare 0/-1 lets each caller keep its own counters without
  * this function knowing anything about them.
  *
- * #576, AND READ THIS BEFORE ADDING A WINDOW HERE: "ONE entry point" above is the intent, not yet
- * the state. This function has ONE caller and it is the AP loop; the BSP still keeps its own chain
- * (search for `if (vblk_mapped)` in the BSP dispatch). So a window added ONLY here is served on
- * every vCPU EXCEPT the boot one, and nothing fails at build time to tell you. #81 landed that way
- * first: the guest found its device, placed its BAR, walked its whole capability chain, then read a
- * register as 0xff, because a single-vCPU guest runs on the BSP. EVERY NEW WINDOW GOES IN BOTH
- * PLACES until #576 merges them.
+ * `is_bsp` gates only the #436 loop-section markers. Those record where the BSP is standing so a
+ * stalled AP can name the core holding the device lock (#484); an AP stamping them would overwrite
+ * the very answer it is about to read.
+ *
+ * `refusal` (may be NULL) reports a LATCHED window whose model declined the access. That is a
+ * different fact from "no window matched" and the two callers act on it differently, which is why
+ * this function reports it instead of deciding: the BSP stops the guest, because absorbing the
+ * access would present a device that silently ignores I/O, while an AP counts it and carries on --
+ * hype_fatal() from an AP takes every VM on the host down with it.
  */
 typedef enum {
     HYPE_FW_DEV_NONE = 0,
@@ -10017,15 +10034,46 @@ typedef enum {
     HYPE_FW_DEV_AHCI,
     HYPE_FW_DEV_VBLK,
     HYPE_FW_DEV_VNET, /* #81 */
+    HYPE_FW_DEV_VBE,  /* #565 */
     HYPE_FW_DEV_NVME,
     HYPE_FW_DEV_DISK_SLOT,
     HYPE_FW_DEV_FLASH
 } hype_fw_dev_t;
 
-static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
-                                          hype_vcpu_ctx_t *ctx, const uint8_t *insn) {
-    hype_vmm_npf_t npf;
+typedef struct {
+    hype_fw_dev_t dev;  /* which latched window declined, or HYPE_FW_DEV_NONE */
+    uint64_t base;      /* that window's base, so a report can say BAR+offset (#550) */
+    unsigned int slot;  /* the disk slot, when dev == HYPE_FW_DEV_DISK_SLOT */
+} hype_fw_mmio_refusal_t;
 
+static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
+                                          hype_vcpu_ctx_t *ctx, const uint8_t *insn, int is_bsp,
+                                          hype_fw_mmio_refusal_t *refusal) {
+    hype_vmm_npf_t npf;
+    unsigned int vidx = (unsigned int)(vm - g_vms);
+
+    if (refusal != 0) {
+        refusal->dev = HYPE_FW_DEV_NONE;
+        refusal->base = 0;
+        refusal->slot = 0;
+    }
+
+    if (is_bsp) g_436_loop_section[vidx] = 771;
+    {   /* #440: who reads config space, and when. A ring of the last 16 decoded B/D/F+register
+         * accesses separates "Windows never enumerates PCI" from "enumerates and declines the
+         * device". */
+        hype_vmm_npf_t cfg_npf;
+        vmm_get_last_npf(kind, ctx, &cfg_npf);
+        if (cfg_npf.guest_phys_addr >= HYPE_FW_1_ECAM_GPA &&
+            cfg_npf.guest_phys_addr < HYPE_FW_1_ECAM_GPA + (1ull << 28)) {
+            hype_pci_ecam_addr_t a;
+            hype_pci_decode_ecam_offset(cfg_npf.guest_phys_addr - HYPE_FW_1_ECAM_GPA, &a);
+            g_440_cfg_ring[g_440_cfg_total % 16u] =
+                ((uint32_t)a.device << 24) | ((uint32_t)a.function << 16) |
+                ((uint32_t)a.register_offset << 4) | (cfg_npf.is_write ? 1u : 0u);
+            g_440_cfg_total++;
+        }
+    }
     if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &vm->pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
         return HYPE_FW_DEV_ECAM;
     }
@@ -10046,6 +10094,17 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
      */
     if (vm->shared_ata_mapped && npf.guest_phys_addr >= vm->shared_ata_abar &&
         npf.guest_phys_addr < vm->shared_ata_abar + HYPE_AHCI_MMIO_SIZE) {
+        /*
+         * #262 slice 3: route the SATA-disk HBA's MMIO to the ATA model, through the _map handler
+         * with this VM's DMA map and the instruction bytes the loop already fetched. Slice 2
+         * deliberately left this unrouted because the plain handler treats guest-physical
+         * addresses as host pointers and page-faulted hype on the first access.
+         *
+         * A refusal here is NOT recorded: an out-of-model ATA register falls through to the
+         * absorb catch-all, as it always has. Only the windows below treat it as fatal.
+         */
+        if (is_bsp) g_436_loop_section[vidx] = 772;
+        g_440_ata_npf_accesses++;
         if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ata_ahci, &g_fw_1_ata_disk,
                                          (uint64_t)vm->shared_ata_abar, &g_fw_1_dma_map,
                                          insn) == 0) {
@@ -10054,16 +10113,206 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
     } else if (vm->shared_ahci_mapped && npf.guest_phys_addr >= vm->shared_ahci_abar &&
                npf.guest_phys_addr < vm->shared_ahci_abar + HYPE_AHCI_MMIO_SIZE) {
         /*
-         * The ATAPI model, matching the BSP. An earlier cut of this called the hard-DISK model
-         * here, which answered the guest's CD probe from the wrong device and produced
-         * "(aprobe0:ahcich0:0:0:0): CAM status: CCB request was invalid" on the 2-vCPU run only.
-         * The first HBA carries the ATAPI CD; g_fw_1_ata_disk belongs to the separate SATA-disk
-         * HBA handled above.
+         * The ATAPI model. An earlier cut of this called the hard-DISK model here, which answered
+         * the guest's CD probe from the wrong device and produced "(aprobe0:ahcich0:0:0:0): CAM
+         * status: CCB request was invalid" on the 2-vCPU run only. The first HBA carries the ATAPI
+         * CD; g_fw_1_ata_disk belongs to the separate SATA-disk HBA handled above.
          */
-        if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi,
-                                    (uint64_t)vm->shared_ahci_abar, &g_fw_1_dma_map, insn) == 0) {
+        uint64_t ahci_abar = (uint64_t)vm->shared_ahci_abar;
+        if (is_bsp) g_436_loop_section[vidx] = 773;
+#if HYPE_262_DISK_ON_FIRST_HBA
+        /* #262 PROBE (see the SIG_ATA note in the BSP loop): serve HBA1 from the ATA disk model
+         * instead of the ATAPI one. */
+        if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_ata_disk, ahci_abar,
+                                         &g_fw_1_dma_map, insn) == 0) {
             return HYPE_FW_DEV_AHCI;
         }
+#endif
+        /*
+         * #367: time THIS exit type specifically.
+         *
+         * I previously claimed AHCI register polling was 46% of run time. That number was invalid:
+         * I multiplied the AHCI exit COUNT by the GLOBAL mean exit cost, and that mean is dominated
+         * by media-read page faults costing milliseconds each. A register read and a disc read are
+         * both "an NPF" and nothing else about them is comparable.
+         *
+         * MMIOCOST already showed the instruction fetch is ~15 ns, i.e. free, which killed the
+         * decode-cache idea. What remains unmeasured is the emulation itself -- and that is the
+         * number that decides whether restructuring NPT/EPT for a read-only shadow page is worth
+         * its risk.
+         */
+        uint64_t t_ahci = hype_rdtsc();
+        uint32_t cmds_before = g_fw_1_atapi.command_count;
+        /* #365: the USB transfer accumulator at the same instant, so the medium's share of this
+         * command's service time comes out of one window, not two. */
+        unsigned long long usb_tsc_before = g_media_io_tsc;
+        uint32_t pre_cmd = g_fw_1_ahci.p_cmd, pre_ghc = g_fw_1_ahci.ghc;
+        uint32_t pre_ie = g_fw_1_ahci.p_ie;
+        {
+            /* #364: record the register offset before the handler runs, so the histogram reflects
+             * what the guest asked for even if the handler declines it. */
+            uint64_t off = npf.guest_phys_addr - ahci_abar;
+            if (vidx < g_vm_count) {
+                if (off < 0x180u) {
+                    g_ahci_reg_hist[vidx][off / 4u]++;
+                } else {
+                    g_ahci_reg_other[vidx]++;
+                }
+            }
+        }
+        if (is_bsp) g_436_loop_section[vidx] = 774;
+        if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
+                                    &g_fw_1_dma_map, insn) == 0) {
+            /*
+             * #364: what the guest actually WRITES, not just which offsets it touches.
+             *
+             * The read histogram says vm0 reads PxCMD 12078 times and never appears to write it:
+             * PxCMD reads back 0x03000000, and since the write handler replaces the whole register
+             * and only ORs CR/FR in, those static ATAPI/DLAE bits surviving imply no write ever
+             * landed. That is an inference from bits that did NOT change, which is exactly the kind
+             * of reasoning that has been wrong repeatedly on this ticket.
+             *
+             * Decoding the instruction here is not possible (insn is raw guest bytes and the decode
+             * lives inside the handler), so snapshot the registers around the call and report what
+             * CHANGED. A change is a write, and it carries the value.
+             */
+            if (vidx < g_vm_count) {
+                uint64_t woff = npf.guest_phys_addr - ahci_abar;
+                /* A command issue (PxCI write) or a start/stop transition, with the completion
+                 * state the driver will poll. Separate budget from the write trace below, which is
+                 * bounded for a different reason. */
+                {
+                    uint32_t st_now = g_fw_1_ahci.p_cmd & 1u;
+                    int issue = (npf.is_write && woff == 0x138u);
+                    int transition = (st_now != g_ahci_prev_st[vidx]);
+                    g_ahci_prev_st[vidx] = st_now;
+                    if ((issue || transition) && g_ahci_cyc_logged[vidx] < 64u) {
+                        g_ahci_cyc_logged[vidx]++;
+                        hype_debug_print(
+                            "fw-1 AHCICYC vm%u #%u %s: PxCMD=0x%08x PxCI=0x%08x "
+                            "PxIS=0x%08x PxIE=0x%08x PxTFD=0x%08x PxSERR=0x%08x "
+                            "GHC=0x%08x cmds=%u [#364]\n",
+                            vidx, g_ahci_cyc_logged[vidx],
+                            issue ? "ISSUE" : (st_now ? "START" : "STOP"),
+                            (unsigned)g_fw_1_ahci.p_cmd, (unsigned)g_fw_1_ahci.p_ci,
+                            (unsigned)g_fw_1_ahci.p_is, (unsigned)g_fw_1_ahci.p_ie,
+                            (unsigned)g_fw_1_ahci.p_tfd, (unsigned)g_fw_1_ahci.p_serr,
+                            (unsigned)g_fw_1_ahci.ghc,
+                            (unsigned)g_fw_1_atapi.command_count);
+                    }
+                }
+                /* is_write comes from the fault itself (SVM EXITINFO1 / VMX exit qualification
+                 * bit 1), so this is the hardware's own answer rather than my inference from which
+                 * bits changed. PxCI is excluded: a driver writes it per command and would flood. */
+                if (npf.is_write && woff != 0x138u && g_ahci_wr_logged[vidx] < 48u) {
+                    g_ahci_wr_logged[vidx]++;
+                    hype_debug_print(
+                        "fw-1 AHCIWR vm%u #%u: +0x%02x | PxCMD 0x%08x->0x%08x "
+                        "GHC 0x%08x->0x%08x PxIE 0x%08x->0x%08x [#364]\n",
+                        vidx, g_ahci_wr_logged[vidx], (unsigned)woff,
+                        (unsigned)pre_cmd, (unsigned)g_fw_1_ahci.p_cmd,
+                        (unsigned)pre_ghc, (unsigned)g_fw_1_ahci.ghc,
+                        (unsigned)pre_ie, (unsigned)g_fw_1_ahci.p_ie);
+                }
+            }
+            /* M4-6 real-AMD DIAG (compact, screen-only-friendly): report CD progress at
+             * milestones instead of tracing every command. First ATAPI command proves OVMF is
+             * driving the controller; first READ(10) proves CD data I/O works; the running
+             * READ(10) count (every 64) shows sustained reads. If the guest OVMF drops to the
+             * shell with read10=0, its storage stack never read the CD (AHCI/ATAPI issue); with
+             * read10>0 but no boot, it's a boot-order/bootable-media issue. */
+            {
+                if (vm->diag.read10_first_tsc == 0 && g_fw_1_atapi.read10_count >= 1) {
+                    vm->diag.read10_first_tsc = hype_rdtsc();
+                }
+                if (!vm->diag.first_cmd_reported && g_fw_1_atapi.command_count > 0) {
+                    vm->diag.first_cmd_reported = 1;
+                    hype_debug_print("fw-1 DIAG: guest issued 1st ATAPI CDB (opcode=0x%x)\n",
+                                      (unsigned int)g_fw_1_atapi.last_cdb);
+                }
+                if (g_fw_1_atapi.read10_count >= 1 && vm->diag.last_reported_reads == 0) {
+                    vm->diag.last_reported_reads = 1; /* latch: fire once, not per-MMIO-access */
+                    hype_debug_print("fw-1 DIAG: 1st ATAPI READ(10) done -- CD data I/O "
+                                      "works on real HW (cmds=%u)\n",
+                                      (unsigned int)g_fw_1_atapi.command_count);
+                }
+                if (g_fw_1_atapi.read10_count >= vm->diag.last_reported_reads + 64) {
+                    /* task #105 measure-first: READ(10) size profile + throughput. avg =
+                     * sectors/reads shows how big the guest's CD reads actually are; the hist
+                     * buckets (1 / 2-8 / 9-16 / 17-64 / 65-256 / >256 blocks) show whether they
+                     * cluster small (many exits) or are already large. ms/KBps time the read-heavy
+                     * phase from the first READ(10), so the real bottleneck (transfer size vs
+                     * per-command latency) is visible rather than assumed. */
+                    uint64_t r10_ms = 0, r10_kbps = 0;
+                    vm->diag.last_reported_reads = g_fw_1_atapi.read10_count;
+                    if (vm->diag.read10_first_tsc != 0 && g_fw_1_host_tsc_hz != 0) {
+                        uint64_t dt = hype_rdtsc() - vm->diag.read10_first_tsc;
+                        r10_ms = (dt * 1000ULL) / g_fw_1_host_tsc_hz;
+                        if (r10_ms != 0) {
+                            r10_kbps = (g_fw_1_atapi.read10_sectors_total * 2ULL * 1000ULL)
+                                       / r10_ms; /* 2 KiB/block */
+                        }
+                    }
+                    hype_debug_print("fw-1 BSPALIVE: ticks=%llu phase=%u seq=%llu "
+                                     "(0=idle 1=render 2=input 3=kbddiag 4=flush "
+                                     "5=fbprobe 6=fbcli 7=fbreport 8=inval 9=band "
+                                     "10=gopflush 11=dash) [#363 #370]\n",
+                                     (unsigned long long)g_bsp_ticks,
+                                     (unsigned int)g_bsp_phase,
+                                     (unsigned long long)g_bsp_phase_seq);
+                    hype_debug_print("fw-1 DIAG: ATAPI READ(10) count=%u (cmds=%u) "
+                                      "sectors=%llu max=%u hist=%u/%u/%u/%u/%u/%u "
+                                      "seq=%u/%u/%u(contig/near/far) "
+                                      "elapsed=%llums thru=%lluKB/s [#365]\n",
+                                      (unsigned int)g_fw_1_atapi.read10_count,
+                                      (unsigned int)g_fw_1_atapi.command_count,
+                                      (unsigned long long)g_fw_1_atapi.read10_sectors_total,
+                                      (unsigned int)g_fw_1_atapi.read10_max_count,
+                                      (unsigned int)g_fw_1_atapi.read10_size_hist[0],
+                                      (unsigned int)g_fw_1_atapi.read10_size_hist[1],
+                                      (unsigned int)g_fw_1_atapi.read10_size_hist[2],
+                                      (unsigned int)g_fw_1_atapi.read10_size_hist[3],
+                                      (unsigned int)g_fw_1_atapi.read10_size_hist[4],
+                                      (unsigned int)g_fw_1_atapi.read10_size_hist[5],
+                                      (unsigned int)g_fw_1_atapi.read10_seq_contig,
+                                      (unsigned int)g_fw_1_atapi.read10_seq_near,
+                                      (unsigned int)g_fw_1_atapi.read10_seq_far,
+                                      (unsigned long long)r10_ms,
+                                      (unsigned long long)r10_kbps);
+                }
+            }
+            /* #367: account BEFORE returning. The first version of this put the two lines after
+             * the continue, where they are unreachable -- ahci_emul reported calls=0 for a whole
+             * run while ahci_npf reported 670,578, which is what exposed it. A counter that cannot
+             * increment reads exactly like an event that never happens. */
+            {
+                /* Attribute by whether a command was issued: the ATAPI model's own command counter
+                 * moving is the discriminator, and it is exact rather than inferred from which
+                 * register was touched. */
+                uint64_t dt = hype_rdtsc() - t_ahci;
+                if (g_fw_1_atapi.command_count != cmds_before) {
+                    /* #365: split this command into medium time and hype time. */
+                    unsigned long long usb_tsc_after = g_media_io_tsc;
+                    unsigned long long usb_dt = (usb_tsc_after > usb_tsc_before)
+                                 ? (usb_tsc_after - usb_tsc_before)
+                                 : 0ull;
+                    g_ahci_cmd_tsc += dt;
+                    g_ahci_cmd_usb_tsc += usb_dt;
+                    if (dt > g_ahci_cmd_max_tsc) g_ahci_cmd_max_tsc = dt;
+                    if (usb_dt > g_ahci_cmd_usb_max_tsc) g_ahci_cmd_usb_max_tsc = usb_dt;
+                    g_ahci_cmd_calls++;
+                } else {
+                    g_ahci_poll_tsc += dt;
+                    g_ahci_poll_calls++;
+                }
+            }
+            return HYPE_FW_DEV_AHCI;
+        }
+        if (refusal != 0) {
+            refusal->dev = HYPE_FW_DEV_AHCI;
+            refusal->base = ahci_abar;
+        }
+        return HYPE_FW_DEV_NONE;
     }
 
     /*
@@ -10080,16 +10329,48 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
                                     HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
                 return HYPE_FW_DEV_NVME;
             }
+            if (refusal != 0) {
+                refusal->dev = HYPE_FW_DEV_NVME;
+                refusal->base = nvme_bar;
+            }
+            return HYPE_FW_DEV_NONE;
         }
+    }
+
+    /* #565: the Bochs VBE adapter's BAR2. Served from THIS dispatch since #576, so a guest that
+     * touches a display register from any vCPU is answered there rather than absorbed. */
+    if (vm->shared_vbe_mapped && npf.guest_phys_addr >= vm->shared_vbe_bar &&
+        npf.guest_phys_addr < vm->shared_vbe_bar + HYPE_BOCHS_VBE_MMIO_SIZE) {
+        if (vmm_handle_bochs_vbe_npf(kind, ctx, &vm->bochs_vbe, (uint64_t)vm->shared_vbe_bar,
+                                     insn) == 0) {
+            return HYPE_FW_DEV_VBE;
+        }
+        if (refusal != 0) {
+            refusal->dev = HYPE_FW_DEV_VBE;
+            refusal->base = (uint64_t)vm->shared_vbe_bar;
+        }
+        return HYPE_FW_DEV_NONE;
     }
 
     if (vm->shared_vblk_mapped && npf.guest_phys_addr >= vm->shared_vblk_bar &&
         npf.guest_phys_addr < vm->shared_vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
+        if (vm->disk[0].is_physical && !vm->diag.dbg229_once) {
+            vm->diag.dbg229_once = 1;
+            hype_debug_print("#229dbg npf: CR3=0x%llx g_pml4=0x%llx nvme_bar=0x%llx\n",
+                             (unsigned long long)hype_dbg_read_cr3(),
+                             (unsigned long long)(uintptr_t)g_pml4,
+                             (unsigned long long)g_hostnvme_bar);
+        }
         if (vmm_handle_virtio_blk_npf_map(kind, ctx, &vm->disk[0].vblk, &vm->disk[0].be,
                                           &g_fw_1_dma_map, (uint64_t)vm->shared_vblk_bar,
                                           insn) == 0) {
             return HYPE_FW_DEV_VBLK;
         }
+        if (refusal != 0) {
+            refusal->dev = HYPE_FW_DEV_VBLK;
+            refusal->base = (uint64_t)vm->shared_vblk_bar;
+        }
+        return HYPE_FW_DEV_NONE;
     }
 
     /* #81/#82: the guest NIC's BAR, whichever frontend. Served from THIS dispatch, so a guest whose
@@ -10101,6 +10382,11 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
                                      (uint64_t)vm->shared_vnet_bar, insn) == 0) {
             return HYPE_FW_DEV_VNET;
         }
+        if (refusal != 0) {
+            refusal->dev = HYPE_FW_DEV_VNET;
+            refusal->base = (uint64_t)vm->shared_vnet_bar;
+        }
+        return HYPE_FW_DEV_NONE;
     }
 
     /*
@@ -10120,6 +10406,7 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
                                                    : (uint64_t)HYPE_VIRTIO_BLK_BAR_SIZE;
             if (npf.guest_phys_addr < base || npf.guest_phys_addr >= base + wsz) continue;
             if (sbus == HYPE_CFG_BUS_AHCI_SATA) {
+                if (is_bsp) g_436_loop_section[vidx] = 775;
                 if (vmm_handle_ahci_disk_npf_map(kind, ctx, &vm->disk[slot].ata_ahci,
                                                  &vm->disk[slot].ata_disk, base, &g_fw_1_dma_map,
                                                  insn) == 0) {
@@ -10140,11 +10427,16 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
             /*
              * The window is latched and the model refused the access. The BSP treats that as
              * fatal, on the argument that absorbing it presents a disk which silently ignores
-             * I/O. This function does not decide that: it reports "no shared device claimed
-             * it" and the caller applies its own policy, because hype_fatal() from an AP takes
-             * every VM on the host down with it.
+             * I/O. This function does not decide that: it reports the refusal and the caller
+             * applies its own policy, because hype_fatal() from an AP takes every VM on the
+             * host down with it.
              */
-            break;
+            if (refusal != 0) {
+                refusal->dev = HYPE_FW_DEV_DISK_SLOT;
+                refusal->base = base;
+                refusal->slot = slot;
+            }
+            return HYPE_FW_DEV_NONE;
         }
     }
 
@@ -10667,7 +10959,14 @@ wait_for_sipi:
              * core holds fw_1_dev_lock(vm) for every non-LAPIC exit, which is the serialisation
              * that makes serving them from an AP safe.
              */
-            hype_fw_dev_t ap_dev = fw_1_shared_mmio_npf(vm, kind, ctx, insn);
+            /*
+             * is_bsp = 0: the #436 loop-section markers name where the BSP stands, so an AP
+             * stamping them would destroy the answer a stalled AP reads (#484). refusal = NULL:
+             * this loop's policy for a latched window whose model declined is the same as for
+             * an unmatched fault -- count it and carry on, because hype_fatal() from an AP
+             * takes every VM on the host down with it.
+             */
+            hype_fw_dev_t ap_dev = fw_1_shared_mmio_npf(vm, kind, ctx, insn, 0, 0);
             int ap_mmio_done = (ap_dev != HYPE_FW_DEV_NONE);
             if (ap_dev == HYPE_FW_DEV_ECAM) {
                 g_ap_ecam_serves[vm_idx][vi]++;
@@ -12407,14 +12706,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     /* FW-1h: set once OVMF has sized+placed BAR5 and enabled Memory
      * Space on the AHCI function -- from then on, faults inside the
      * ABAR window route to the (RAM-remap-aware) AHCI MMIO handler. */
-    int ahci_mapped = 0;
-    uint64_t ahci_abar = 0;
-    uint64_t ata_abar = 0; /* #262: the SATA-disk HBA's ABAR, once the firmware places it */
-    int ata_mapped = 0;
-    int vblk_mapped = 0;    /* M5-7 (#196): virtio-blk BAR4 latched + routed */
-    uint64_t vblk_bar = 0;
-    int vbe_mapped = 0;     /* #565: Bochs VBE BAR2, only for a VM with display = bochs */
-    uint64_t vbe_bar = 0;
     /* #329 2b(ii): BAR windows for the EXTRA disk slots (1..2). Slot 0 keeps the dedicated
      * vblk_/ata_/nvme latches above -- extra slots are uniform: one window each, whatever the
      * bus (virtio BAR4, ahci BAR5, nvme BAR0). */
@@ -14919,7 +15210,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 }
             }
         }
-        if (ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
+        if (vm->shared_ahci_mapped && hype_ahci_irq_pending(&g_fw_1_ahci)) {
             uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
             g_cd_irq_pending++;
             if (hype_pci_msi_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI)) {
@@ -14963,7 +15254,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     ahci_irqs++;
                 }
             }
-        } else if (ahci_mapped) {
+        } else if (vm->shared_ahci_mapped) {
             /* AHCI IRQ line deasserted (guest serviced it -> PxIS cleared):
              * drop the IO-APIC Remote-IRR so the next completion re-injects.
              * Models a level line going low; the guest's LAPIC EOI need not be
@@ -14988,7 +15279,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * computed as one.
          */
         {
-            int vblk_pending = (vblk_mapped && g_fw_1_vblk.isr_status != 0u);
+            int vblk_pending = (vm->shared_vblk_mapped && g_fw_1_vblk.isr_status != 0u);
             int nvme_present = (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME);
             int nvme_pending = (nvme_present && hype_nvme_irq_pending(&vm->disk[0].nvme));
             /*
@@ -15004,7 +15295,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     vnet_pending = (vm->virtio_net.isr_status != 0u);
                 }
             }
-            int line_present = (vblk_mapped || nvme_present || vm->shared_vnet_mapped);
+            int line_present = (vm->shared_vblk_mapped || nvme_present ||
+                               vm->shared_vnet_mapped);
 
             if (vblk_pending || nvme_pending || vnet_pending) {
                 uint8_t iov;
@@ -15044,7 +15336,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * as the optical HBA above: raise while PxIS is set, deassert once the guest
          * has cleared it (and on LAPIC EOI, above).
          */
-        if (ata_mapped && hype_ahci_irq_pending(&g_fw_1_ata_ahci)) {
+        if (vm->shared_ata_mapped && hype_ahci_irq_pending(&g_fw_1_ata_ahci)) {
             uint8_t iov;
             g_ata_irq_pending++;
             uint8_t line = hype_pci_get_function_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
@@ -15085,7 +15377,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                 }
             }
-        } else if (ata_mapped) {
+        } else if (vm->shared_ata_mapped) {
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_ATA_GSI);
         }
         /*
@@ -15897,660 +16189,240 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
             }
             /* FW-1b: the guest Local APIC at 0xFEE00000 is the expected
-             * NPF here (the region is not-present by design). */
+             * NPF here (the region is not-present by design). It stays on this loop's own chain
+             * rather than moving into the shared dispatch: the LAPIC is per-vCPU state, needs no
+             * device lock, and belongs to whichever vCPU faulted. */
             g_436_loop_section[(unsigned)(vm-g_vms)]=767;
-            if (kind == HYPE_VMM_KIND_SVM &&
-                hype_svm_vcpu_handle_hpet_npf(ctx, &g_fw_1_hpet, HYPE_HPET_MMIO_BASE, insn) == 0) {
-                continue;
-            }
             if (vmm_handle_lapic_npf(kind, ctx, &g_fw_1_lapic, HYPE_LAPIC_DEFAULT_BASE, insn) == 0) {
                 continue;
             }
-            /* M4-6b3: the guest I/O APIC at 0xFEC00000. Once ACPI is delivered
-             * the kernel masks the 8259 PIC and programs this chip's
-             * redirection table to route external IRQ lines (incl. the PIT via
-             * the MADT's IRQ0->GSI2 override) to LAPIC vectors. */
-            if (vmm_handle_ioapic_npf(kind, ctx, &g_fw_1_ioapic, HYPE_FW_1_IOAPIC_GPA, insn) == 0) {
-                continue;
-            }
-            /* FW-1c: PCI config space via MMCONFIG ECAM at 0xE0000000
-             * (OVMF's Q35 PcdPciExpressBaseAddress). Reuses PCI-1's ECAM
-             * config model over FW-1's own host bridge + LPC devices. */
-            g_436_loop_section[(unsigned)(vm-g_vms)]=771;
-            {   /* #440: who reads config space, and when. A ring of the last 16
-                 * decoded B/D/F+register accesses separates "Windows never
-                 * enumerates PCI" from "enumerates and declines the device". */
-                hype_vmm_npf_t cfg_npf;
-                vmm_get_last_npf(kind, ctx, &cfg_npf);
-                if (cfg_npf.guest_phys_addr >= HYPE_FW_1_ECAM_GPA &&
-                    cfg_npf.guest_phys_addr < HYPE_FW_1_ECAM_GPA + (1ull << 28)) {
-                    hype_pci_ecam_addr_t a;
-                    hype_pci_decode_ecam_offset(cfg_npf.guest_phys_addr - HYPE_FW_1_ECAM_GPA, &a);
-                    g_440_cfg_ring[g_440_cfg_total % 16u] =
-                        ((uint32_t)a.device << 24) | ((uint32_t)a.function << 16) |
-                        ((uint32_t)a.register_offset << 4) | (cfg_npf.is_write ? 1u : 0u);
-                    g_440_cfg_total++;
-                }
-            }
-            if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &g_fw_1_pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
-                /* FW-1h: an ECAM config write may have just programmed
-                 * BAR5 and set Memory Space Enable on the AHCI function.
-                 * That is the moment OVMF's PciBusDxe finalizes the
-                 * controller's MMIO window -- capture the guest-physical
-                 * ABAR base so ABAR-window faults route to the AHCI
-                 * handler from here on. No NPT change is needed: the
-                 * whole [GUEST_RAM, 4GB-flash) span is already not-
-                 * present (FW-1a's mark_range_not_present), so the ABAR
-                 * OVMF assigns inside the 32-bit PCI aperture already
-                 * faults as an NPF -- unlike PCI-2's full identity map,
-                 * which had to mark it not-present explicitly. Only
-                 * latched once; this guest never reprograms BAR5. */
-                /*
-                 * #372: mirror the guest's Bus Master Enable into both HBAs, beside the
-                 * memory-space latch that already reads the same register.
-                 *
-                 * Re-read every pass rather than latched once, because unlike a BAR the guest can
-                 * legitimately clear this bit again -- a driver unbinding, or resetting the device,
-                 * does exactly that, and a latch would leave hype mastering the bus for a
-                 * controller the guest has switched off. Cheap: it is a byte out of a struct.
-                 */
-                hype_ahci_set_bus_master(&g_fw_1_ahci,
-                                         HYPE_372_CLEAR_BME
-                                             ? 0
-                                             : hype_pci_bus_master_enabled(&g_fw_1_pci,
-                                                                           HYPE_FW_1_PCI_DEV_AHCI));
-                hype_ahci_set_bus_master(&g_fw_1_ata_ahci, hype_pci_function_bus_master_enabled(
-                                                               &g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
-                                                               HYPE_FW_1_PCI_FUNC_ATA));
-                hype_virtio_blk_set_bus_master(
-                    &g_fw_1_vblk,
-                    hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK));
-                hype_nvme_set_bus_master(
-                    &vm->disk[0].nvme,
-                    hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME));
-                if (!ahci_mapped && hype_pci_memory_space_enabled(&g_fw_1_pci,
-                                                                    HYPE_FW_1_PCI_DEV_AHCI)) {
-                    uint64_t bar5 = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5);
-                    if (bar5 != 0) {
-                        ahci_abar = bar5;
-                        ahci_mapped = 1;
-                        vm->shared_ahci_abar = bar5;   /* #482: visible to AP loops */
-                        vm->shared_ahci_mapped = 1u;
-                        hype_debug_print("fw-1: AHCI BAR5 (ABAR) enabled at guest-physical 0x%llx -- "
-                                          "routing its MMIO to the CD-ROM model now\n",
-                                          (unsigned long long)bar5);
-                    }
-                }
-                /* #262 slice 2: same latch for the SATA-disk HBA's BAR5. */
-                if (!ata_mapped && hype_pci_function_memory_space_enabled(&g_fw_1_pci,
-                                                                            HYPE_FW_1_PCI_DEV_ATA,
-                                                                            HYPE_FW_1_PCI_FUNC_ATA)) {
-                    uint64_t abar = hype_pci_get_function_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
-                                                                       HYPE_FW_1_PCI_FUNC_ATA, 5);
-                    if (abar != 0) {
-                        ata_abar = abar;
-                        ata_mapped = 1;
-                        vm->shared_ata_abar = abar;    /* #482: visible to AP loops */
-                        vm->shared_ata_mapped = 1u;
-                        hype_debug_print("fw-1: #262 SATA-disk AHCI BAR5 (ABAR) enabled at "
-                                          "guest-physical 0x%llx -- the guest firmware has "
-                                          "enumerated the second HBA\n", (unsigned long long)abar);
-                    }
-                }
-                /* M5-7 (#196): same latch for the virtio-blk device's BAR4 window.
-                 * No NPT map needed -- it sits in the not-present 32-bit PCI
-                 * aperture, so its MMIO already faults as an NPF (routed below). */
-                if (!vblk_mapped &&
-                    hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK)) {
-                    uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK,
-                                                          HYPE_FW_1_VIRTIO_BAR_INDEX);
-                    if (bar != 0) {
-                        vblk_bar = bar;
-                        vblk_mapped = 1;
-                        vm->shared_vblk_bar = bar;     /* #511: visible to AP loops */
-                        vm->shared_vblk_mapped = 1u;
-                        hype_debug_print("fw-1: virtio-blk BAR%u enabled at guest-physical 0x%llx -- "
-                                          "routing its MMIO to the virtio-blk model now\n",
-                                          (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX, (unsigned long long)bar);
-                    }
-                }
-                /*
-                 * #81: the same latch for virtio-net's BAR4. `in_use` is tested first because the
-                 * device is only there when `net_mode = nat` -- an absent PCI function reads back
-                 * all-ones from config space, and hype_pci_memory_space_enabled() on a slot that
-                 * was never populated would be asking a question about nothing.
-                 */
-                if (!vm->shared_vnet_mapped &&
-                    vm->pci.devices[HYPE_FW_1_PCI_DEV_VIRTIO_NET].in_use &&
-                    hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_NET)) {
-                    /* virtio puts its regions in BAR4 (§ the transport's own choice); the e1000's
-                     * registers are BAR0, which is architectural. Reading the wrong index gives 0
-                     * and the window never latches, so the NIC simply never answers. */
-                    unsigned int bar_idx =
-                        (vm->nic_ops == &hype_guest_nic_e1000) ? 0u : HYPE_FW_1_VIRTIO_BAR_INDEX;
-                    uint64_t nbar = hype_pci_get_bar_value(&g_fw_1_pci,
-                                                           HYPE_FW_1_PCI_DEV_VIRTIO_NET, bar_idx);
-                    if (nbar != 0) {
-                        vm->shared_vnet_bar = nbar;
-                        vm->shared_vnet_mapped = 1u;
-                        /* Bus mastering mirrored in at the same moment (#372): a NIC reaches its
-                         * rings by mastering the bus, so the model must not act on a notify before
-                         * the guest has enabled it. */
-                        {
-                            int bm = hype_pci_bus_master_enabled(&g_fw_1_pci,
-                                                                 HYPE_FW_1_PCI_DEV_VIRTIO_NET);
-                            if (vm->nic_ops == &hype_guest_nic_e1000) {
-                                hype_e1000_dev_set_bus_master(&vm->e1000_net, bm);
-                            } else {
-                                hype_virtio_net_set_bus_master(&vm->virtio_net, bm);
-                            }
-                        }
-                        hype_debug_print("fw-1: guest NIC (%s) BAR%u enabled at guest-physical "
-                                          "0x%llx -- routing its MMIO to the model now [#81 #82]\n",
-                                          (vm->nic_ops != 0) ? vm->nic_ops->name : "none",
-                                          bar_idx, (unsigned long long)nbar);
-                    }
-                }
-                /*
-                 * #565: the same latch for the Bochs VBE adapter's BAR2, when the VM has one.
-                 * Like virtio-blk's BAR4 it sits in the not-present 32-bit PCI aperture, so its
-                 * MMIO already faults as an NPF and only needs routing (below) -- no NPT map.
-                 */
-                if (!vbe_mapped &&
-                    hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE)) {
-                    uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci,
-                                                          HYPE_FW_1_PCI_DEV_BOCHS_VBE, 2);
-                    if (bar != 0) {
-                        vbe_bar = bar;
-                        vbe_mapped = 1;
-                        hype_debug_print("fw-1: Bochs VBE BAR2 enabled at guest-physical 0x%llx -- "
-                                         "routing its MMIO to the VBE model now [#565]\n",
-                                         (unsigned long long)bar);
-                    }
-                }
-                /* #329 2b(ii): same latch for each EXTRA disk slot's window. */
-                {
-                    unsigned int slot;
-                    for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS; slot++) {
-                        hype_cfg_bus_t sbus = fw_1_slot_bus(vm, slot);
-                        unsigned int sdev = fw_1_slot_pci_dev(slot, sbus);
-                        unsigned int sbar = (sbus == HYPE_CFG_BUS_AHCI_SATA) ? 5u
-                                            : (sbus == HYPE_CFG_BUS_NVME)
-                                                ? 0u
-                                                : (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX;
-                        uint64_t bar;
-                        if (dwin[slot].mapped || fw_1_slot_cfg(vm, slot) == 0 ||
-                            !hype_pci_memory_space_enabled(&g_fw_1_pci, sdev)) {
-                            continue;
-                        }
-                        bar = hype_pci_get_bar_value(&g_fw_1_pci, sdev, sbar);
-                        if (bar != 0) {
-                            dwin[slot].bar = bar;
-                            dwin[slot].mapped = 1;
-                            /* #482: publish it so every dispatch loop can serve this window,
-                             * not just this one. Base before the flag: a reader that sees
-                             * mapped must see a valid base. */
-                            vm->shared_disk_bar[slot] = bar;
-                            vm->shared_disk_mapped[slot] = 1u;
-                            hype_debug_print("fw-1: disk slot %u BAR enabled at guest-physical "
-                                             "0x%llx (#329)\n", slot, (unsigned long long)bar);
-                        }
-                    }
-                }
-                continue;
-            }
-            /* FW-1h: AHCI ABAR MMIO. Gate on the faulting guest-physical
-             * address so this only claims accesses actually inside the
-             * ABAR window (the ATAPI handler itself now range-checks too,
-             * but keeping the gate here keeps an out-of-window fault on
-             * the clear "unhandled NPF" path below). The _xlat variant
-             * adds g_fw_1_ram_host_phys to every guest-physical DMA
-             * pointer OVMF programmed, since FW-1 remaps guest RAM. */
             /*
-             * #262 slice 3: route the SATA-disk HBA's MMIO to the ATA model, through
-             * the _map handler with this VM's DMA map and the instruction bytes the
-             * loop already fetched. Slice 2 deliberately left this unrouted because
-             * the plain handler treats guest-physical addresses as host pointers and
-             * page-faulted hype on the first access; that is what 3a/3b fixed.
-             */
-            if (ata_mapped) {
-                hype_vmm_npf_t ata_npf;
-                vmm_get_last_npf(kind, ctx, &ata_npf);
-                if (ata_npf.guest_phys_addr >= ata_abar &&
-                    ata_npf.guest_phys_addr < ata_abar + HYPE_AHCI_MMIO_SIZE) {
-                    g_436_loop_section[(unsigned)(vm-g_vms)]=772;
-                    g_440_ata_npf_accesses++;
-                    if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ata_ahci,
-                                                     &g_fw_1_ata_disk, ata_abar, &g_fw_1_dma_map,
-                                                     insn) == 0) {
-                        continue; /* the handler advances RIP, as M5-2's caller assumes */
-                    }
-                }
-            }
-            if (ahci_mapped) {
-                hype_vmm_npf_t ahci_npf;
-                vmm_get_last_npf(kind, ctx, &ahci_npf);
-#if HYPE_262_DISK_ON_FIRST_HBA
-                /* #262 PROBE (see the SIG_ATA note above): serve HBA1 from the ATA
-                 * disk model instead of the ATAPI one. */
-                if (ahci_npf.guest_phys_addr >= ahci_abar &&
-                    ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
-                    g_436_loop_section[(unsigned)(vm-g_vms)]=773;
-                    if (vmm_handle_ahci_disk_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_ata_disk,
-                                                     ahci_abar, &g_fw_1_dma_map, insn) == 0) {
-                        continue;
-                    }
-                }
-#endif
-                if (ahci_npf.guest_phys_addr >= ahci_abar &&
-                    ahci_npf.guest_phys_addr < ahci_abar + HYPE_AHCI_MMIO_SIZE) {
-                    /*
-                     * #367: time THIS exit type specifically.
-                     *
-                     * I previously claimed AHCI register polling was 46% of run time. That number
-                     * was invalid: I multiplied the AHCI exit COUNT by the GLOBAL mean exit cost,
-                     * and that mean is dominated by media-read page faults costing milliseconds
-                     * each. A register read and a disc read are both "an NPF" and nothing else
-                     * about them is comparable.
-                     *
-                     * MMIOCOST already showed the instruction fetch is ~15 ns, i.e. free, which
-                     * killed the decode-cache idea. What remains unmeasured is the emulation
-                     * itself -- and that is the number that decides whether restructuring NPT/EPT
-                     * for a read-only shadow page is worth its risk.
-                     */
-                    uint64_t t_ahci = hype_rdtsc();
-                    uint32_t cmds_before = g_fw_1_atapi.command_count;
-                    /* #365: the USB transfer accumulator at the same instant, so the medium's share
-                     * of this command's service time comes out of one window, not two. */
-                    unsigned long long usb_tsc_before = g_media_io_tsc;
-                    {
-                        /* #364: record the register offset before the handler runs, so the
-                         * histogram reflects what the guest asked for even if the handler
-                         * declines it. */
-                        uint64_t off = ahci_npf.guest_phys_addr - ahci_abar;
-                        unsigned vidx = (unsigned)(vm - g_vms);
-                        if (vidx < g_vm_count) {
-                            if (off < 0x180u) {
-                                g_ahci_reg_hist[vidx][off / 4u]++;
-                            } else {
-                                g_ahci_reg_other[vidx]++;
-                            }
-                        }
-                    }
-                    /*
-                     * #364: what the guest actually WRITES, not just which offsets it touches.
-                     *
-                     * The read histogram says vm0 reads PxCMD 12078 times and never appears to
-                     * write it: PxCMD reads back 0x03000000, and since the write handler replaces
-                     * the whole register and only ORs CR/FR in, those static ATAPI/DLAE bits
-                     * surviving imply no write ever landed. That is an inference from bits that
-                     * did NOT change, which is exactly the kind of reasoning that has been wrong
-                     * repeatedly on this ticket.
-                     *
-                     * A guest AHCI driver that has taken the port must write PxCLB/PxFB, set FRE,
-                     * then set ST. If FreeBSD's ahci(4) never does, no CD device appears, root
-                     * cannot be mounted, and the kernel drops to the mountroot prompt -- which is
-                     * the emergency console actually observed.
-                     *
-                     * Decoding the instruction here is not possible (insn is raw guest bytes and
-                     * the decode lives inside the handler), so snapshot the registers around the
-                     * call and report what CHANGED. A change is a write, and it carries the value.
-                     */
-                    uint32_t pre_cmd = g_fw_1_ahci.p_cmd, pre_ghc = g_fw_1_ahci.ghc;
-                    uint32_t pre_ie = g_fw_1_ahci.p_ie;
-                    g_436_loop_section[(unsigned)(vm-g_vms)]=774;
-                    if (vmm_handle_ahci_npf_map(kind, ctx, &g_fw_1_ahci, &g_fw_1_atapi, ahci_abar,
-                                                           &g_fw_1_dma_map, insn) == 0) {
-                        {
-                            unsigned vidx2 = (unsigned)(vm - g_vms);
-                            if (vidx2 < g_vm_count) {
-                                uint64_t woff = ahci_npf.guest_phys_addr - ahci_abar;
-                                /* A command issue (PxCI write) or a start/stop transition, with
-                                 * the completion state the driver will poll. Separate budget from
-                                 * the write trace above, which is bounded for a different reason. */
-                                {
-                                    uint32_t st_now = g_fw_1_ahci.p_cmd & 1u;
-                                    int issue = (ahci_npf.is_write && woff == 0x138u);
-                                    int transition = (st_now != g_ahci_prev_st[vidx2]);
-                                    g_ahci_prev_st[vidx2] = st_now;
-                                    if ((issue || transition) && g_ahci_cyc_logged[vidx2] < 64u) {
-                                        g_ahci_cyc_logged[vidx2]++;
-                                        hype_debug_print(
-                                            "fw-1 AHCICYC vm%u #%u %s: PxCMD=0x%08x PxCI=0x%08x "
-                                            "PxIS=0x%08x PxIE=0x%08x PxTFD=0x%08x PxSERR=0x%08x "
-                                            "GHC=0x%08x cmds=%u [#364]\n",
-                                            vidx2, g_ahci_cyc_logged[vidx2],
-                                            issue ? "ISSUE" : (st_now ? "START" : "STOP"),
-                                            (unsigned)g_fw_1_ahci.p_cmd, (unsigned)g_fw_1_ahci.p_ci,
-                                            (unsigned)g_fw_1_ahci.p_is, (unsigned)g_fw_1_ahci.p_ie,
-                                            (unsigned)g_fw_1_ahci.p_tfd,
-                                            (unsigned)g_fw_1_ahci.p_serr,
-                                            (unsigned)g_fw_1_ahci.ghc,
-                                            (unsigned)g_fw_1_atapi.command_count);
-                                    }
-                                }
-                                /* is_write comes from the fault itself (SVM EXITINFO1 / VMX exit
-                                 * qualification bit 1), so this is the hardware's own answer
-                                 * rather than my inference from which bits changed. PxCI is
-                                 * excluded: a driver writes it per command and would flood. */
-                                if (ahci_npf.is_write && woff != 0x138u &&
-                                    g_ahci_wr_logged[vidx2] < 48u) {
-                                    g_ahci_wr_logged[vidx2]++;
-                                    hype_debug_print(
-                                        "fw-1 AHCIWR vm%u #%u: +0x%02x | PxCMD 0x%08x->0x%08x "
-                                        "GHC 0x%08x->0x%08x PxIE 0x%08x->0x%08x [#364]\n",
-                                        vidx2, g_ahci_wr_logged[vidx2], (unsigned)woff,
-                                        (unsigned)pre_cmd, (unsigned)g_fw_1_ahci.p_cmd,
-                                        (unsigned)pre_ghc, (unsigned)g_fw_1_ahci.ghc,
-                                        (unsigned)pre_ie, (unsigned)g_fw_1_ahci.p_ie);
-                                }
-                            }
-                        }
-                        ex_ahci_npf++; /* exit-histogram sub-bucket */
-                        /* M4-6 real-AMD DIAG (compact, screen-only-friendly):
-                         * report CD progress at milestones instead of tracing
-                         * every command. First ATAPI command proves OVMF is
-                         * driving the controller; first READ(10) proves CD
-                         * data I/O works; the running READ(10) count (every
-                         * 64) shows sustained reads. If the guest OVMF drops
-                         * to the shell with read10=0, its storage stack never
-                         * read the CD (AHCI/ATAPI issue); with read10>0 but no
-                         * boot, it's a boot-order/bootable-media issue. */
-                        {
-                            if (vm->diag.read10_first_tsc == 0 && g_fw_1_atapi.read10_count >= 1) {
-                                vm->diag.read10_first_tsc = hype_rdtsc();
-                            }
-                            if (!vm->diag.first_cmd_reported && g_fw_1_atapi.command_count > 0) {
-                                vm->diag.first_cmd_reported = 1;
-                                hype_debug_print("fw-1 DIAG: guest issued 1st ATAPI CDB (opcode=0x%x)\n",
-                                                  (unsigned int)g_fw_1_atapi.last_cdb);
-                            }
-                            if (g_fw_1_atapi.read10_count >= 1 && vm->diag.last_reported_reads == 0) {
-                                vm->diag.last_reported_reads = 1; /* latch: fire once, not per-MMIO-access */
-                                hype_debug_print("fw-1 DIAG: 1st ATAPI READ(10) done -- CD data I/O "
-                                                  "works on real HW (cmds=%u)\n",
-                                                  (unsigned int)g_fw_1_atapi.command_count);
-                            }
-                            if (g_fw_1_atapi.read10_count >= vm->diag.last_reported_reads + 64) {
-                                /* task #105 measure-first: READ(10) size profile
-                                 * + throughput. avg = sectors/reads shows how big
-                                 * the guest's CD reads actually are; the hist
-                                 * buckets (1 / 2-8 / 9-16 / 17-64 / 65-256 / >256
-                                 * blocks) show whether they cluster small (many
-                                 * exits) or are already large. ms/KBps time the
-                                 * read-heavy phase from the first READ(10), so the
-                                 * real bottleneck (transfer size vs per-command
-                                 * latency) is visible rather than assumed. */
-                                uint64_t r10_ms = 0, r10_kbps = 0;
-                                vm->diag.last_reported_reads = g_fw_1_atapi.read10_count;
-                                if (vm->diag.read10_first_tsc != 0 && g_fw_1_host_tsc_hz != 0) {
-                                    uint64_t dt = hype_rdtsc() - vm->diag.read10_first_tsc;
-                                    r10_ms = (dt * 1000ULL) / g_fw_1_host_tsc_hz;
-                                    if (r10_ms != 0) {
-                                        r10_kbps = (g_fw_1_atapi.read10_sectors_total * 2ULL * 1000ULL)
-                                                   / r10_ms; /* 2 KiB/block */
-                                    }
-                                }
-                                hype_debug_print("fw-1 BSPALIVE: ticks=%llu phase=%u seq=%llu "
-                                                 "(0=idle 1=render 2=input 3=kbddiag 4=flush "
-                                                 "5=fbprobe 6=fbcli 7=fbreport 8=inval 9=band "
-                                                 "10=gopflush 11=dash) [#363 #370]\n",
-                                                 (unsigned long long)g_bsp_ticks,
-                                                 (unsigned int)g_bsp_phase,
-                                                 (unsigned long long)g_bsp_phase_seq);
-                                hype_debug_print("fw-1 DIAG: ATAPI READ(10) count=%u (cmds=%u) "
-                                                  "sectors=%llu max=%u hist=%u/%u/%u/%u/%u/%u "
-                                                  "seq=%u/%u/%u(contig/near/far) "
-                                                  "elapsed=%llums thru=%lluKB/s [#365]\n",
-                                                  (unsigned int)g_fw_1_atapi.read10_count,
-                                                  (unsigned int)g_fw_1_atapi.command_count,
-                                                  (unsigned long long)g_fw_1_atapi.read10_sectors_total,
-                                                  (unsigned int)g_fw_1_atapi.read10_max_count,
-                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[0],
-                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[1],
-                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[2],
-                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[3],
-                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[4],
-                                                  (unsigned int)g_fw_1_atapi.read10_size_hist[5],
-                                                  (unsigned int)g_fw_1_atapi.read10_seq_contig,
-                                                  (unsigned int)g_fw_1_atapi.read10_seq_near,
-                                                  (unsigned int)g_fw_1_atapi.read10_seq_far,
-                                                  (unsigned long long)r10_ms,
-                                                  (unsigned long long)r10_kbps);
-                            }
-                        }
-                        /* #367: account BEFORE the continue. The first version of this put the
-                         * two lines after it, where they are unreachable -- ahci_emul reported
-                         * calls=0 for a whole run while ahci_npf reported 670,578, which is what
-                         * exposed it. A counter that cannot increment reads exactly like an event
-                         * that never happens. */
-                        {
-                            /* Attribute by whether a command was issued: the ATAPI model's own
-                             * command counter moving is the discriminator, and it is exact rather
-                             * than inferred from which register was touched. */
-                            uint64_t dt = hype_rdtsc() - t_ahci;
-                            if (g_fw_1_atapi.command_count != cmds_before) {
-                                /* #365: split this command into medium time and hype time. */
-                                unsigned long long usb_tsc_after = g_media_io_tsc;
-                                unsigned long long usb_dt = (usb_tsc_after > usb_tsc_before)
-                                             ? (usb_tsc_after - usb_tsc_before)
-                                             : 0ull;
-                                g_ahci_cmd_tsc += dt;
-                                g_ahci_cmd_usb_tsc += usb_dt;
-                                if (dt > g_ahci_cmd_max_tsc) g_ahci_cmd_max_tsc = dt;
-                                if (usb_dt > g_ahci_cmd_usb_max_tsc) g_ahci_cmd_usb_max_tsc = usb_dt;
-                                g_ahci_cmd_calls++;
-                            } else {
-                                g_ahci_poll_tsc += dt;
-                                g_ahci_poll_calls++;
-                            }
-                        }
-                        continue;
-                    }
-                    /* Same evidence the generic undecodable-NPF fatal prints, for the
-                     * same reason: without the bytes, "unhandled" cannot be told apart
-                     * from "undecodable" or "the register model refused the offset", and
-                     * three separate causes wear one message. */
-                    HYPE_LOGF(HYPE_LOG_ERROR,
-                              "fw-1: unhandled AHCI ABAR MMIO at guest-physical 0x%llx (%s, "
-                               "guest_rip=0x%llx, decode_assist_bytes=%u insn=%s %02x %02x %02x "
-                               "%02x %02x %02x %02x %02x)",
-                               (unsigned long long)ahci_npf.guest_phys_addr,
-                               ahci_npf.is_write ? "write" : "read", (unsigned long long)info.guest_rip,
-                               (unsigned int)insn_n,
-                               insn ? (insn_n ? "(assist)" : "(ptwalk)") : "(FETCH FAILED)",
-                               insn ? insn[0] : 0, insn ? insn[1] : 0, insn ? insn[2] : 0,
-                               insn ? insn[3] : 0, insn ? insn[4] : 0, insn ? insn[5] : 0,
-                               insn ? insn[6] : 0, insn ? insn[7] : 0);
-                    fw_1_guest_fault_stop(vm, "its guest made an AHCI register access hype does not model");
-                    return;
-                }
-            }
-            /* M5-7 (#196): virtio-blk BAR4 MMIO -> the VALID-3, GPA-translated
-             * virtio handler (guest RAM remap handled inside via &g_fw_1_dma_map).
-             * Gated on the fault landing in the device's BAR window. */
-            /*
-             * #202: NVMe BAR0. Checked before virtio-blk simply because the two are never both
-             * attached (#333 selects one front-end), so the order only decides which range test runs
-             * first on a fault that belongs to neither.
-             */
-            if (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) {
-                uint64_t nvme_bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, 0);
-                if (nvme_bar != 0) {
-                    vmm_get_last_npf(kind, ctx, &npf);
-                    if (npf.guest_phys_addr >= nvme_bar &&
-                        npf.guest_phys_addr < nvme_bar + HYPE_FW_1_NVME_BAR_SIZE) {
-                        hype_nvme_ctx_t nctx;
-                        nvme_fill_ctx(&nctx, vm, 0u);
-                        if (vmm_handle_nvme_npf(kind, ctx, &vm->disk[0].nvme, &nctx, nvme_bar,
-                                                HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
-                            continue;
-                        }
-                        HYPE_LOGF(HYPE_LOG_ERROR,
-                                  "fw-1: unhandled NVMe MMIO at guest-physical 0x%llx\n",
-                                   (unsigned long long)npf.guest_phys_addr);
-                        fw_1_guest_fault_stop(vm, "its guest made an NVMe register access hype does not model");
-                        return;
-                    }
-                }
-            }
-            if (vbe_mapped) {
-                vmm_get_last_npf(kind, ctx, &npf);
-                if (npf.guest_phys_addr >= vbe_bar &&
-                    npf.guest_phys_addr < vbe_bar + HYPE_BOCHS_VBE_MMIO_SIZE) {
-                    if (vmm_handle_bochs_vbe_npf(kind, ctx, &vm->bochs_vbe, vbe_bar, insn) == 0) {
-                        continue;
-                    }
-                    /* #550's lesson: an address alone cannot distinguish an unmodelled REGISTER
-                     * from an unmodelled WIDTH from an unmodelled instruction form, and those are
-                     * three different bugs in three different files. */
-                    HYPE_LOGF(HYPE_LOG_ERROR,
-                              "fw-1: unhandled Bochs VBE MMIO at guest-physical 0x%llx "
-                              "(BAR2+0x%llx, %s) [#565]\n",
-                              (unsigned long long)npf.guest_phys_addr,
-                              (unsigned long long)(npf.guest_phys_addr - vbe_bar),
-                              npf.is_write ? "write" : "read");
-                    fw_1_guest_fault_stop(vm, "its guest made a Bochs VBE register access hype "
-                                              "does not model");
-                    return;
-                }
-            }
-            if (vblk_mapped) {
-                vmm_get_last_npf(kind, ctx, &npf);
-                if (npf.guest_phys_addr >= vblk_bar &&
-                    npf.guest_phys_addr < vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
-                    if (vm->disk[0].is_physical) {
-                        if (!vm->diag.dbg229_once) {
-                            vm->diag.dbg229_once = 1;
-                            hype_debug_print("#229dbg npf: CR3=0x%llx g_pml4=0x%llx nvme_bar=0x%llx\n",
-                                             (unsigned long long)hype_dbg_read_cr3(),
-                                             (unsigned long long)(uintptr_t)g_pml4,
-                                             (unsigned long long)g_hostnvme_bar);
-                        }
-                    }
-                    if (vmm_handle_virtio_blk_npf_map(kind, ctx, &g_fw_1_vblk, &g_fw_1_vblk_be,
-                                                            &g_fw_1_dma_map, vblk_bar, insn) == 0) {
-                        continue;
-                    }
-                    /*
-                     * #550: say WHICH access, not just where. "unhandled MMIO at 0x...c0000014"
-                     * cost twenty minutes of bisecting a guest driver whose PREVIOUS two writes
-                     * to that same register had succeeded -- the offset alone cannot distinguish
-                     * an unmodelled register from an unmodelled access WIDTH or instruction form,
-                     * and those are three different bugs in three different files.
-                     */
-                    HYPE_LOGF(HYPE_LOG_ERROR,
-                              "fw-1: unhandled virtio-blk MMIO at guest-physical 0x%llx "
-                              "(BAR+0x%llx, %s) -- the offset, the access width or the "
-                              "instruction form is not modelled [#550]\n",
-                              (unsigned long long)npf.guest_phys_addr,
-                              (unsigned long long)(npf.guest_phys_addr - vblk_bar),
-                              npf.is_write ? "write" : "read");
-                    fw_1_guest_fault_stop(vm, "its guest made a virtio-blk register access hype does not model");
-                    return;
-                }
-            }
-            /*
-             * #81: the virtio-net window, on the BSP's own chain.
+             * #576: every shared device window, through the ONE dispatch the AP loop also calls.
              *
-             * IT HAS TO BE HERE AS WELL AS IN fw_1_shared_mmio_npf(), because that function has
-             * exactly one caller and it is the AP loop. The BSP keeps its own chain -- which is the
-             * drift #482 describes, still half-finished -- so a window added only to the shared
-             * dispatch is served on every vCPU EXCEPT the boot one. That is how this landed the
-             * first time: the guest found the device, sized and placed BAR4, walked the whole
-             * capability chain, and then read device_status as 0xff, because a single-vCPU guest
-             * runs on the BSP and the BSP had never heard of the window.
-             */
-            if (vm->shared_vnet_mapped) {
-                vmm_get_last_npf(kind, ctx, &npf);
-                if (npf.guest_phys_addr >= vm->shared_vnet_bar &&
-                    npf.guest_phys_addr < vm->shared_vnet_bar + fw_1_nic_window_bytes(vm)) {
-                    if (vmm_handle_guest_nic_npf(kind, ctx, vm, &g_fw_1_dma_map,
-                                                 (uint64_t)vm->shared_vnet_bar, insn) == 0) {
-                        continue;
-                    }
-                    /* #550's rule: say WHICH access. The offset alone cannot distinguish an
-                     * unmodelled register from an unmodelled width or instruction form, and those
-                     * are three different bugs in three different files. */
-                    HYPE_LOGF(HYPE_LOG_ERROR,
-                              "fw-1: unhandled virtio-net MMIO at guest-physical 0x%llx "
-                              "(BAR+0x%llx, %s) -- the offset, the access width or the "
-                              "instruction form is not modelled [#81]\n",
-                              (unsigned long long)npf.guest_phys_addr,
-                              (unsigned long long)(npf.guest_phys_addr - vm->shared_vnet_bar),
-                              npf.is_write ? "write" : "read");
-                    fw_1_guest_fault_stop(vm,
-                                          "its guest made a virtio-net register access hype does "
-                                          "not model");
-                    return;
-                }
-            }
-            /*
-             * #329 2b(ii): route each EXTRA slot's window to ITS OWN device model over ITS OWN
-             * backend -- the same three handlers slot 0 uses, with &vm->disk[slot] state. A fault
-             * inside a latched window that the handler refuses is fatal, exactly as for slot 0:
-             * absorbing it would present a disk that silently ignores I/O.
+             * This loop used to carry its own copy of the chain -- ECAM, both ABARs, NVMe, VBE,
+             * virtio-blk, virtio-net, the extra disk slots, flash -- beside the copy #482 built
+             * for the APs. Two hand-maintained lists of the same windows drift, and nothing fails
+             * at build time when they do: #81's NIC was added to the shared list only, so it was
+             * served on every vCPU EXCEPT this one, and a single-vCPU guest read its device_status
+             * as 0xff after successfully walking the whole capability chain. There is now one list.
+             *
+             * is_bsp = 1: this loop owns the #436 loop-section markers a stalled AP reads (#484).
              */
             {
-                unsigned int slot;
-                int routed = 0;
-                for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS && !routed; slot++) {
-                    hype_fw_disk_t *d = &vm->disk[slot];
-                    hype_cfg_bus_t sbus;
-                    uint64_t wsz;
-                    if (!dwin[slot].mapped) {
-                        continue;
-                    }
-                    sbus = fw_1_slot_bus(vm, slot);
-                    wsz = (sbus == HYPE_CFG_BUS_AHCI_SATA) ? (uint64_t)HYPE_AHCI_MMIO_SIZE
-                          : (sbus == HYPE_CFG_BUS_NVME)    ? (uint64_t)HYPE_FW_1_NVME_BAR_SIZE
-                                                           : (uint64_t)HYPE_VIRTIO_BLK_BAR_SIZE;
-                    vmm_get_last_npf(kind, ctx, &npf);
-                    if (npf.guest_phys_addr < dwin[slot].bar ||
-                        npf.guest_phys_addr >= dwin[slot].bar + wsz) {
-                        continue;
-                    }
-                    routed = 1;
-                    if (sbus == HYPE_CFG_BUS_AHCI_SATA) {
-                        g_436_loop_section[(unsigned)(vm-g_vms)]=775;
-                        if (vmm_handle_ahci_disk_npf_map(kind, ctx, &d->ata_ahci, &d->ata_disk,
-                                                         dwin[slot].bar, &g_fw_1_dma_map,
-                                                         insn) == 0) {
-                            continue;
+                hype_fw_mmio_refusal_t refusal;
+                hype_fw_dev_t dev = fw_1_shared_mmio_npf(vm, kind, ctx, insn, 1, &refusal);
+                if (dev == HYPE_FW_DEV_ECAM) {
+                    /* FW-1h: an ECAM config write may have just programmed
+                     * BAR5 and set Memory Space Enable on the AHCI function.
+                     * That is the moment OVMF's PciBusDxe finalizes the
+                     * controller's MMIO window -- capture the guest-physical
+                     * ABAR base so ABAR-window faults route to the AHCI
+                     * handler from here on. No NPT change is needed: the
+                     * whole [GUEST_RAM, 4GB-flash) span is already not-
+                     * present (FW-1a's mark_range_not_present), so the ABAR
+                     * OVMF assigns inside the 32-bit PCI aperture already
+                     * faults as an NPF -- unlike PCI-2's full identity map,
+                     * which had to mark it not-present explicitly. Only
+                     * latched once; this guest never reprograms BAR5. */
+                    /*
+                     * #372: mirror the guest's Bus Master Enable into both HBAs, beside the
+                     * memory-space latch that already reads the same register.
+                     *
+                     * Re-read every pass rather than latched once, because unlike a BAR the guest can
+                     * legitimately clear this bit again -- a driver unbinding, or resetting the device,
+                     * does exactly that, and a latch would leave hype mastering the bus for a
+                     * controller the guest has switched off. Cheap: it is a byte out of a struct.
+                     */
+                    hype_ahci_set_bus_master(&g_fw_1_ahci,
+                                             HYPE_372_CLEAR_BME
+                                                 ? 0
+                                                 : hype_pci_bus_master_enabled(&g_fw_1_pci,
+                                                                               HYPE_FW_1_PCI_DEV_AHCI));
+                    hype_ahci_set_bus_master(&g_fw_1_ata_ahci, hype_pci_function_bus_master_enabled(
+                                                                   &g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                                                   HYPE_FW_1_PCI_FUNC_ATA));
+                    hype_virtio_blk_set_bus_master(
+                        &g_fw_1_vblk,
+                        hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK));
+                    hype_nvme_set_bus_master(
+                        &vm->disk[0].nvme,
+                        hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME));
+                    if (!vm->shared_ahci_mapped && hype_pci_memory_space_enabled(&g_fw_1_pci,
+                                                                        HYPE_FW_1_PCI_DEV_AHCI)) {
+                        uint64_t bar5 = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5);
+                        if (bar5 != 0) {
+                            /* #576: base before the flag, and nowhere else -- a reader that sees
+                             * mapped must see a valid base, and there is no loop-local copy left to
+                             * fall out of step with. */
+                            vm->shared_ahci_abar = bar5;
+                            vm->shared_ahci_mapped = 1u;
+                            hype_debug_print("fw-1: AHCI BAR5 (ABAR) enabled at guest-physical 0x%llx -- "
+                                              "routing its MMIO to the CD-ROM model now\n",
+                                              (unsigned long long)bar5);
                         }
-                    } else if (sbus == HYPE_CFG_BUS_NVME) {
-                        hype_nvme_ctx_t nctx;
-                        nvme_fill_ctx(&nctx, vm, slot);
-                        if (vmm_handle_nvme_npf(kind, ctx, &d->nvme, &nctx, dwin[slot].bar,
-                                                HYPE_FW_1_NVME_BAR_SIZE, insn) == 0) {
-                            continue;
-                        }
-                    } else {
-                        if (vmm_handle_virtio_blk_npf_map(kind, ctx, &d->vblk, &d->be,
-                                                          &g_fw_1_dma_map, dwin[slot].bar,
-                                                          insn) == 0) {
-                            continue;
+                    }
+                    /* #262 slice 2: same latch for the SATA-disk HBA's BAR5. */
+                    if (!vm->shared_ata_mapped && hype_pci_function_memory_space_enabled(&g_fw_1_pci,
+                                                                                HYPE_FW_1_PCI_DEV_ATA,
+                                                                                HYPE_FW_1_PCI_FUNC_ATA)) {
+                        uint64_t abar = hype_pci_get_function_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                                                           HYPE_FW_1_PCI_FUNC_ATA, 5);
+                        if (abar != 0) {
+                            vm->shared_ata_abar = abar;
+                            vm->shared_ata_mapped = 1u;
+                            hype_debug_print("fw-1: #262 SATA-disk AHCI BAR5 (ABAR) enabled at "
+                                              "guest-physical 0x%llx -- the guest firmware has "
+                                              "enumerated the second HBA\n", (unsigned long long)abar);
                         }
                     }
-                    HYPE_LOGF(HYPE_LOG_ERROR,
-                              "fw-1: unhandled disk-slot-%u MMIO at guest-physical 0x%llx (#329)\n",
-                               slot, (unsigned long long)npf.guest_phys_addr);
-                    fw_1_guest_fault_stop(vm, "its guest made a disk register access hype does not model");
-                    return;
+                    /* M5-7 (#196): same latch for the virtio-blk device's BAR4 window.
+                     * No NPT map needed -- it sits in the not-present 32-bit PCI
+                     * aperture, so its MMIO already faults as an NPF (routed below). */
+                    if (!vm->shared_vblk_mapped &&
+                        hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK)) {
+                        uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK,
+                                                              HYPE_FW_1_VIRTIO_BAR_INDEX);
+                        if (bar != 0) {
+                            vm->shared_vblk_bar = bar;
+                            vm->shared_vblk_mapped = 1u;
+                            hype_debug_print("fw-1: virtio-blk BAR%u enabled at guest-physical 0x%llx -- "
+                                              "routing its MMIO to the virtio-blk model now\n",
+                                              (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX, (unsigned long long)bar);
+                        }
+                    }
+                    /*
+                     * #81: the same latch for virtio-net's BAR4. `in_use` is tested first because the
+                     * device is only there when `net_mode = nat` -- an absent PCI function reads back
+                     * all-ones from config space, and hype_pci_memory_space_enabled() on a slot that
+                     * was never populated would be asking a question about nothing.
+                     */
+                    if (!vm->shared_vnet_mapped &&
+                        vm->pci.devices[HYPE_FW_1_PCI_DEV_VIRTIO_NET].in_use &&
+                        hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_NET)) {
+                        /* virtio puts its regions in BAR4 (§ the transport's own choice); the e1000's
+                         * registers are BAR0, which is architectural. Reading the wrong index gives 0
+                         * and the window never latches, so the NIC simply never answers. */
+                        unsigned int bar_idx =
+                            (vm->nic_ops == &hype_guest_nic_e1000) ? 0u : HYPE_FW_1_VIRTIO_BAR_INDEX;
+                        uint64_t nbar = hype_pci_get_bar_value(&g_fw_1_pci,
+                                                               HYPE_FW_1_PCI_DEV_VIRTIO_NET, bar_idx);
+                        if (nbar != 0) {
+                            vm->shared_vnet_bar = nbar;
+                            vm->shared_vnet_mapped = 1u;
+                            /* Bus mastering mirrored in at the same moment (#372): a NIC reaches its
+                             * rings by mastering the bus, so the model must not act on a notify before
+                             * the guest has enabled it. */
+                            {
+                                int bm = hype_pci_bus_master_enabled(&g_fw_1_pci,
+                                                                     HYPE_FW_1_PCI_DEV_VIRTIO_NET);
+                                if (vm->nic_ops == &hype_guest_nic_e1000) {
+                                    hype_e1000_dev_set_bus_master(&vm->e1000_net, bm);
+                                } else {
+                                    hype_virtio_net_set_bus_master(&vm->virtio_net, bm);
+                                }
+                            }
+                            hype_debug_print("fw-1: guest NIC (%s) BAR%u enabled at guest-physical "
+                                              "0x%llx -- routing its MMIO to the model now [#81 #82]\n",
+                                              (vm->nic_ops != 0) ? vm->nic_ops->name : "none",
+                                              bar_idx, (unsigned long long)nbar);
+                        }
+                    }
+                    /*
+                     * #565: the same latch for the Bochs VBE adapter's BAR2, when the VM has one.
+                     * Like virtio-blk's BAR4 it sits in the not-present 32-bit PCI aperture, so its
+                     * MMIO already faults as an NPF and only needs routing (below) -- no NPT map.
+                     */
+                    if (!vm->shared_vbe_mapped &&
+                        hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE)) {
+                        uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci,
+                                                              HYPE_FW_1_PCI_DEV_BOCHS_VBE, 2);
+                        if (bar != 0) {
+                            /* #576: published on the VM, not held in a loop local -- that is what
+                             * lets every dispatch loop serve this window. */
+                            vm->shared_vbe_bar = bar;
+                            vm->shared_vbe_mapped = 1u;
+                            hype_debug_print("fw-1: Bochs VBE BAR2 enabled at guest-physical 0x%llx -- "
+                                             "routing its MMIO to the VBE model now [#565]\n",
+                                             (unsigned long long)bar);
+                        }
+                    }
+                    /* #329 2b(ii): same latch for each EXTRA disk slot's window. */
+                    {
+                        unsigned int slot;
+                        for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS; slot++) {
+                            hype_cfg_bus_t sbus = fw_1_slot_bus(vm, slot);
+                            unsigned int sdev = fw_1_slot_pci_dev(slot, sbus);
+                            unsigned int sbar = (sbus == HYPE_CFG_BUS_AHCI_SATA) ? 5u
+                                                : (sbus == HYPE_CFG_BUS_NVME)
+                                                    ? 0u
+                                                    : (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX;
+                            uint64_t bar;
+                            if (dwin[slot].mapped || fw_1_slot_cfg(vm, slot) == 0 ||
+                                !hype_pci_memory_space_enabled(&g_fw_1_pci, sdev)) {
+                                continue;
+                            }
+                            bar = hype_pci_get_bar_value(&g_fw_1_pci, sdev, sbar);
+                            if (bar != 0) {
+                                dwin[slot].bar = bar;
+                                dwin[slot].mapped = 1;
+                                /* #482: publish it so every dispatch loop can serve this window,
+                                 * not just this one. Base before the flag: a reader that sees
+                                 * mapped must see a valid base. */
+                                vm->shared_disk_bar[slot] = bar;
+                                vm->shared_disk_mapped[slot] = 1u;
+                                hype_debug_print("fw-1: disk slot %u BAR enabled at guest-physical "
+                                                 "0x%llx (#329)\n", slot, (unsigned long long)bar);
+                            }
+                        }
+                    }
+                    continue;
                 }
-                if (routed) {
-                    continue; /* handler advanced RIP */
+                if (dev == HYPE_FW_DEV_AHCI) {
+                    ex_ahci_npf++; /* exit-histogram sub-bucket, this loop's own local */
+                }
+                if (dev != HYPE_FW_DEV_NONE) {
+                    continue; /* the handler advanced RIP, as M5-2's caller assumes */
+                }
+                /*
+                 * A latched window whose model declined the access. Fatal here, and only here:
+                 * absorbing it would present a device that silently ignores I/O, while the AP loop
+                 * counts the same refusal and carries on because hype_fatal() from an AP takes
+                 * every VM on the host down with it.
+                 *
+                 * #550: say WHICH access, not just where. "unhandled MMIO at 0x...c0000014" cost
+                 * twenty minutes of bisecting a guest driver whose PREVIOUS two writes to that same
+                 * register had succeeded -- the offset alone cannot distinguish an unmodelled
+                 * register from an unmodelled access WIDTH or instruction form, and those are three
+                 * different bugs in three different files.
+                 */
+                if (refusal.dev != HYPE_FW_DEV_NONE) {
+                    const char *what =
+                        (refusal.dev == HYPE_FW_DEV_AHCI)  ? "AHCI ABAR"
+                        : (refusal.dev == HYPE_FW_DEV_NVME) ? "NVMe"
+                        : (refusal.dev == HYPE_FW_DEV_VBE)  ? "Bochs VBE [#565]"
+                        : (refusal.dev == HYPE_FW_DEV_VBLK) ? "virtio-blk"
+                        : (refusal.dev == HYPE_FW_DEV_VNET) ? "virtio-net [#81]"
+                                                            : "disk-slot [#329]";
+                    vmm_get_last_npf(kind, ctx, &npf);
+                    HYPE_LOGF(HYPE_LOG_ERROR,
+                              "fw-1: unhandled %s MMIO at guest-physical 0x%llx (BAR+0x%llx, %s, "
+                              "slot=%u, guest_rip=0x%llx, decode_assist_bytes=%u insn=%s "
+                              "%02x %02x %02x %02x %02x %02x %02x %02x) -- the offset, the access "
+                              "width or the instruction form is not modelled [#550]",
+                              what, (unsigned long long)npf.guest_phys_addr,
+                              (unsigned long long)(npf.guest_phys_addr - refusal.base),
+                              npf.is_write ? "write" : "read", refusal.slot,
+                              (unsigned long long)info.guest_rip, (unsigned int)insn_n,
+                              insn ? (insn_n ? "(assist)" : "(ptwalk)") : "(FETCH FAILED)",
+                              insn ? insn[0] : 0, insn ? insn[1] : 0, insn ? insn[2] : 0,
+                              insn ? insn[3] : 0, insn ? insn[4] : 0, insn ? insn[5] : 0,
+                              insn ? insn[6] : 0, insn ? insn[7] : 0);
+                    fw_1_guest_fault_stop(vm, "its guest made a device register access hype does "
+                                              "not model");
+                    return;
                 }
             }
             vmm_get_last_npf(kind, ctx, &npf);
-            /* #457: the OVMF flash window -- VARS writes feed the CFI model; trapped-mode
-             * reads synthesize status/query; CODE writes are dropped like ROM. Checked
-             * before the absorb catch-all, which would otherwise eat the command bytes. */
-            if (npf.guest_phys_addr >= 0x100000000ULL - g_fw_1_combined_size &&
-                npf.guest_phys_addr < 0x100000000ULL &&
-                fw_1_flash_npf(vm, kind, ctx, &npf, insn) == 0) {
-                continue;
-            }
             /* GLADDER-1: the NPF hit no modeled device. Instead of PANICking
              * (which killed the guest at the FIRST unmodeled region and hid the
              * rest), ABSORB it like real hardware does for absent MMIO: reads
