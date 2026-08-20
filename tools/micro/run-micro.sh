@@ -15,6 +15,12 @@
 #                       113-byte log that reads exactly like a guest wedge). Reported as NOBOOT,
 #                       which is distinct from a failure -- scoring it as either would be a lie.
 #
+# #581: run-guest.sh retries the two INVALID outcomes -- QEMU dying on a signal (the upstream AHCI
+# crash, qemu-project/qemu#437, fixed in QEMU 11.1.0) and alive-but-bannerless -- and this runner
+# prints every one it consumed plus a per-batch total. A NOBOOT reaching this file therefore means
+# run-guest.sh exhausted its attempts, not that one boot went wrong. A guest that DOES reach hype
+# and then wedges is untouched by any of that and still fails, which is the point.
+#
 # The third and fourth exist because SILENCE IS THE FAILURE MODE THAT LOOKS MOST LIKE SUCCESS, and
 # it is the one that actually happened: #535's first run reported a correct PASS from a guest
 # entered at the wrong address entirely. A harness that greps only for FAIL passes a dead test.
@@ -173,6 +179,26 @@ verdict_of() {   # $1 = log, $2 = test name
     return 1
 }
 
+#
+# #581: run-guest.sh's output is discarded here EXCEPT its invalid-boot lines. A batch that quietly
+# consumed six retries looks identical to one that consumed none, and "the harness never presents an
+# invalid run as a result" has to include a valid result that took three goes to reach -- otherwise
+# a rising rate is invisible until it becomes a wall.
+#
+RETRIES_TOTAL=0
+run_guest_quiet() {   # $@ = run-guest.sh arguments; env already exported by the caller
+    local out rc=0
+    out="$OUTDIR/.run-guest.out"
+    "$@" >"$out" 2>&1 || rc=$?
+    if LC_ALL=C grep -aqE '^(INVALID|RETRIES|HARNESS FAILURE):' "$out"; then
+        LC_ALL=C grep -aE '^(INVALID|RETRIES|HARNESS FAILURE):' "$out" | sed 's/^/       /'
+        local n
+        n=$(LC_ALL=C grep -ac '^INVALID:' "$out" || true)
+        RETRIES_TOTAL=$((RETRIES_TOTAL + n))
+    fi
+    return $rc
+}
+
 run_one() {   # $1 = test name
     local name="$1" cfg log
     cfg="$OUTDIR/micro-$name.cfg"
@@ -212,9 +238,9 @@ run_one() {   # $1 = test name
         qargs="$qargs $NET_QEMU_ARGS"
     fi
 
-    HYPE_CFG="$cfg" HYPE_KERNELS="build/micro/$name.bin" HYPE_DISK="$disk" HYPE_INPUTS="$inputs" \
-        EXTRA_QEMU_ARGS="$qargs" \
-        timeout $((SECS + 150)) tools/run-guest.sh "$ISO" "micro-$name" "$SECS" >/dev/null 2>&1
+    run_guest_quiet env HYPE_CFG="$cfg" HYPE_KERNELS="build/micro/$name.bin" HYPE_DISK="$disk" \
+        HYPE_INPUTS="$inputs" EXTRA_QEMU_ARGS="$qargs" \
+        timeout $((SECS + 150)) tools/run-guest.sh "$ISO" "micro-$name" "$SECS" || true
 
     report "$log" "$name" || return 1
     # Only the tests that WRITE data get the host-side pattern check. ahci issues IDENTIFY, which
@@ -303,8 +329,9 @@ if [ "${1:-}" = "--suite" ]; then
 
     killall -9 qemu-system-x86_64 2>/dev/null
     sleep 1
-    HYPE_CFG="$cfg" HYPE_KERNELS="$kernels" HYPE_INPUTS="$inputs" EXTRA_QEMU_ARGS="$suite_qargs" \
-        timeout $((SECS + 180)) tools/run-guest.sh "$ISO" "$tag" "$SECS" >/dev/null 2>&1
+    run_guest_quiet env HYPE_CFG="$cfg" HYPE_KERNELS="$kernels" HYPE_INPUTS="$inputs" \
+        EXTRA_QEMU_ARGS="$suite_qargs" \
+        timeout $((SECS + 180)) tools/run-guest.sh "$ISO" "$tag" "$SECS" || true
     # A VERDICT PER VM, matched on the TEST each VM boots rather than on the VM's own name.
     #
     # A microtest prints `MICRO PASS: <its own NAME>` -- the binary's name, not the config section's.
@@ -394,4 +421,7 @@ rc=0
 for t in "$@"; do
     run_one "$t" || rc=1
 done
+# #581: how many invalid boots this batch discarded. Printed even when it is 0, because a line that
+# only appears when something is wrong cannot be used to see that nothing is.
+echo "RETRIES: $RETRIES_TOTAL invalid boot(s) discarded across this batch [#581]"
 exit $rc

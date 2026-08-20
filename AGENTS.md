@@ -308,6 +308,19 @@ Rules that are not optional:
   like success. The harness fails on no-verdict and on a host panic, and reports a
   boot that never reached hype as NOBOOT (#371) — which is neither a pass nor a
   fail, and must not be scored as either.
+- **An INVALID boot is retried, and the retry is printed (#581).** Two outcomes are
+  not results: QEMU dying on a signal (its own AHCI crash,
+  `qemu-project/qemu#437`, fixed in QEMU 11.1.0 — hosts below that still hit it)
+  and QEMU alive with no `hype: build` banner. `tools/run-guest.sh` retries both
+  up to `BOOT_ATTEMPTS` (3), counts them apart, and prints how many a run and a
+  batch consumed, so a rising rate is visible instead of absorbed. A boot that
+  DOES reach hype and then wedges is never retried — that one has to keep failing,
+  which is why a blind "no banner → retry" is the wrong guard.
+- QEMU is stopped with `SIGTERM` and only then `SIGKILL` (`QUIT_GRACE`, 5s).
+  `STOP_SIGNAL=KILL` restores the old behaviour for an A/B. Measured on 5 boots:
+  log sizes differ by under 10 bytes either way, so `-serial file:` output is NOT
+  lost to a `SIGKILL` — #581's candidate (1) is ruled out, and a bannerless boot
+  is not the harness damaging its own evidence.
 - **Never pad a guest payload with zeros.** `0x00 0x00` decodes as
   `add byte [rax], al`, so zeroed guest RAM is a NOP slide: a guest entered at the
   wrong address slides into the payload and reports a perfectly correct PASS.

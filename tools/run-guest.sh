@@ -36,6 +36,18 @@
 set -e
 cd "$(dirname "$0")/.."
 ISO="$1"; NAME="${2:-guest}"; SECS="${3:-180}"
+# #581: seconds to let QEMU shut down in order after SIGTERM before resorting to SIGKILL. Five is
+# enough for a machine that is answering and short enough that a wedged one does not stall a batch.
+QUIT_GRACE="${QUIT_GRACE:-5}"
+# A QEMU that dies before opening its chardev leaves no log at all, and `wc -c <missing` is an error
+# message in the middle of a report. Found by #581's own crash test.
+log_bytes() { [ -f "$LOG" ] && wc -c < "$LOG" || echo 0; }
+# The A/B knob for #581's candidate (1) -- "is `-serial file:` output lost when we SIGKILL QEMU?".
+# STOP_SIGNAL=KILL reproduces the pre-#581 behaviour exactly, so the two can be compared on the same
+# guest and the same wall clock instead of against memory of older runs.
+STOP_SIGNAL="${STOP_SIGNAL:-TERM}"
+LAST_STOP=none      # how the last attempt's QEMU ended: selfexit | sigterm | sigkill
+LAST_STATUS=0       # that QEMU's wait status; >= 128 means it died on a signal
 [ -n "$ISO" ] && [ -f "$ISO" ] || { echo "usage: $0 <iso> <log-name> [seconds]"; exit 1; }
 [ -f build/hype.efi ] || { echo "build/hype.efi missing -- run make all"; exit 1; }
 
@@ -256,15 +268,66 @@ boot_once() {
     fi
     # Bounded by wall clock: these guests never exit on their own, and a hung run must still
     # leave a log behind to read.
-    local i
-    for i in $(seq "$SECS"); do kill -0 $qpid 2>/dev/null || break; sleep 1; done
-    kill -9 $qpid 2>/dev/null || true
-    wait $qpid 2>/dev/null || true
+    local i selfexit=0
+    for i in $(seq "$SECS"); do
+        kill -0 $qpid 2>/dev/null || { selfexit=1; break; }
+        sleep 1
+    done
+    #
+    # #581: STOP QEMU GRACEFULLY, and find out whether the run was even valid.
+    #
+    # SIGTERM first, because #581's candidate (1) is that `-serial file:` output is lost when the
+    # harness SIGKILLs QEMU -- if so, a share of this rig's historical "flakes" were self-inflicted
+    # and the harness was reporting its own damage as a hype result. QEMU handles SIGTERM by
+    # shutting the machine down in order, which closes its chardevs; SIGKILL gives it no chance to.
+    # SIGKILL is still here as the fallback, because a QEMU wedged in the host kernel will not
+    # answer SIGTERM and a run that never returns is worse than one that loses its tail.
+    local status=0
+    if [ "$selfexit" = 0 ]; then
+        kill -"$STOP_SIGNAL" $qpid 2>/dev/null || true
+        for i in $(seq "$QUIT_GRACE"); do kill -0 $qpid 2>/dev/null || break; sleep 1; done
+        if kill -0 $qpid 2>/dev/null; then
+            kill -9 $qpid 2>/dev/null || true
+            LAST_STOP=sigkill
+        else
+            LAST_STOP=$(echo "sig$STOP_SIGNAL" | tr 'A-Z' 'a-z')
+        fi
+        wait $qpid 2>/dev/null || status=$?
+    else
+        wait $qpid 2>/dev/null || status=$?
+        LAST_STOP=selfexit
+    fi
+    LAST_STATUS=$status
     if [ -n "$keypid" ]; then
         kill -9 "$keypid" 2>/dev/null || true
         wait "$keypid" 2>/dev/null || true
         [ -s "$OUT.keys" ] && cat "$OUT.keys"
     fi
+
+    #
+    # #581: the three outcomes are DISTINGUISHABLE, and collapsing them is what cost time on #344
+    # and #365. Classify, and never let an invalid run be scored.
+    #
+    #   QEMU died on a signal by itself     the QEMU AHCI crash (upstream issue 437, SIGSEGV in
+    #                                      ahci_commit_buf(), fixed in QEMU 11.1.0). Retry, and
+    #                                      never score: nothing about hype was under test.
+    #   QEMU alive, no `hype: build`        not attributed. Retry, and COUNT, so the rate stays
+    #                                      visible instead of being absorbed.
+    #   QEMU alive, banner, no verdict      a real guest wedge. This must keep FAILING, which is
+    #                                      why a blind "no banner -> retry" is the wrong guard:
+    #                                      it would mask a hype failure that dies before its
+    #                                      first serial write, the exact case #371's probe was
+    #                                      built to tell apart.
+    #
+    # A self-exit with status 0 is not a crash -- the guest powered itself off, which some runs do
+    # on purpose -- so only a signal counts.
+    if [ "$selfexit" = 1 ] && [ "$status" -ge 128 ]; then
+        return 3
+    fi
+    if ! LC_ALL=C grep -aq "^hype: build" "$LOG"; then
+        return 4
+    fi
+    return 0
 }
 
 build_esp() {
@@ -275,18 +338,25 @@ build_esp || exit 1
 echo "delivery mode: $ISO_MODE ($(( ISO_BYTES / 1048576 )) MB ISO)"
 echo "booting $(basename "$ISO") for ${SECS}s -> $LOG"
 #
-# #371: a boot with no hype banner is INVALID, not failed. Retry it, and never return it as a result.
+# #371/#581: an INVALID boot is not a failed one. Retry it, and never return it as a result.
 #
 # The firmware fails to reach hype in 5-15% of boots on this rig: OVMF selects the boot device,
-# issues the first READ DMA for LBA 0, and QEMU never completes it. Measured cause -- a 2,560-byte
-# hello-world reproduces it, two independent OVMF builds fail at identical rates, the host disk is
-# completely idle at the time, and it never happens on virtio. Nothing to do with hype, which is
-# never entered: the log holds only OVMF's mode-setting escape sequences, 113 bytes.
+# issues the first READ DMA for LBA 0, and QEMU never completes it. Root-caused under #371 and it
+# is not ours -- SIGSEGV in QEMU's own ahci_commit_buf(), qemu-project/qemu#437, fixed by
+# d9f78431d8eb and first shipped in QEMU 11.1.0. Hosts below that version still hit it. Nothing
+# about hype is under test on such a boot: hype is never entered, and the log holds only OVMF's
+# mode-setting escape sequences, 113 bytes.
 #
 # That log reads exactly like a guest wedge -- "hype silent, zero exits, no output" -- and has
 # already produced two wrong diagnoses (#344 scored these as wedges; #365 read four of them as a
 # regression in a binary that had booted minutes earlier). At this rate a 10-run batch expects 1-2,
 # so filtering them is not a rare-event nicety.
+#
+# boot_once() classifies the three outcomes rather than collapsing them (see the table there). The
+# two invalid ones are retried and counted SEPARATELY, because one is attributed to an upstream
+# defect and the other is not; a single total would hide a change in either rate behind the other.
+# The valid-but-wedged outcome is deliberately NOT retried: that is a real hype failure and it must
+# keep failing, which is the reason a blind "no banner -> retry" is the wrong guard.
 #
 # The ESP is deliberately NOT rebuilt between attempts, unlike the previous version of this retry.
 # #371 proved the image is fine -- six of eight boots loaded BOOTX64.EFI from the very same file --
@@ -294,19 +364,45 @@ echo "booting $(basename "$ISO") for ${SECS}s -> $LOG"
 #
 BOOT_ATTEMPTS="${BOOT_ATTEMPTS:-3}"
 attempt=1
+retries_crash=0
+retries_noboot=0
+rc=0
 while :; do
-    boot_once
-    grep -aq "^hype: build" "$LOG" && break
+    rc=0
+    boot_once || rc=$?
+    [ "$rc" = 0 ] && break
+    #
+    # #581: report WHICH invalid outcome, per attempt, and keep the two counts apart. The crash is
+    # attributed (upstream QEMU, fixed in 11.1.0) and the bannerless-but-alive case is not, so
+    # summing them would hide a change in either rate behind the other.
+    #
+    if [ "$rc" = 3 ]; then
+        retries_crash=$((retries_crash + 1))
+        echo "INVALID: QEMU died on signal $((LAST_STATUS - 128)) -- the upstream AHCI crash" \
+             "(qemu-project/qemu#437, fixed in 11.1.0). Nothing about hype was under test."
+        [ -s "$OUT.stderr" ] && tail -2 "$OUT.stderr" | sed 's/^/    /'
+    else
+        retries_noboot=$((retries_noboot + 1))
+        echo "INVALID: no hype banner, QEMU alive and stopped by $LAST_STOP" \
+             "($(log_bytes) byte log) -- the firmware never launched hype."
+    fi
     if [ "$attempt" -ge "$BOOT_ATTEMPTS" ]; then
-        echo "HARNESS FAILURE: firmware never launched hype in $BOOT_ATTEMPTS attempts (no banner)."
-        echo "  This is #371 (QEMU/OVMF loses the first AHCI DMA completion), NOT a hype result."
-        echo "  Do not score this run. Log: $LOG ($(wc -c < "$LOG") bytes)"
+        echo "HARNESS FAILURE: $BOOT_ATTEMPTS attempts, none valid" \
+             "(crash=$retries_crash no-banner=$retries_noboot)."
+        echo "  Do not score this run. Log: $LOG ($(log_bytes) bytes)"
         exit 2
     fi
-    echo "WARNING: no hype banner (#371, ~5-15% of boots) -- retrying, attempt $((attempt + 1)) of $BOOT_ATTEMPTS"
+    echo "  retrying, attempt $((attempt + 1)) of $BOOT_ATTEMPTS"
     attempt=$((attempt + 1))
 done
-echo "done: $(wc -c < "$LOG") bytes in $LOG"
+# The rate must stay VISIBLE. A retry absorbed in silence reads as a first-attempt pass, and the
+# whole point of #581 is that an invalid run must never be presented as a result -- including a
+# clean-looking result that took three goes to get.
+if [ "$((retries_crash + retries_noboot))" -gt 0 ]; then
+    echo "RETRIES: $((retries_crash + retries_noboot)) invalid boot(s) discarded before this one" \
+         "(crash=$retries_crash no-banner=$retries_noboot) [#581]"
+fi
+echo "done: $(log_bytes) bytes in $LOG, stopped by $LAST_STOP"
 
 #
 # #343: score the GUEST's own health, not just "did the installer appear".
