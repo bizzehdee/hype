@@ -373,6 +373,59 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
             out->instr_len = (uint8_t)(imm_index + imm_len);
             return 0;
         }
+        /*
+         * #575: group 3 /0 -- `TEST r/m, imm`. A READ: it reads memory, computes flags, and
+         * writes no register and no memory. Same profile as the #457 immediate CMP above, so it
+         * takes the same shape (is_write 0, mem_is_dst 0, has_imm 1) and
+         * hype_mmio_complete_read() already does the right thing for it --
+         * hype_mmio_alu_writes_reg(TEST) is 0.
+         *
+         * NOT a test-only artefact. A guest driver doing an ordinary bit test on a device
+         * register -- `if (readl(reg) & FLAG)` -- lets the compiler fold the volatile load, the
+         * mask and the compare into this single instruction, because TEST-with-memory performs
+         * exactly ONE memory access and so preserves the volatile contract. clang did precisely
+         * that at -O2 to the virtio-net driver's PCI status read and hype STOPPED the VM:
+         *   undecodable MMIO NPF ... insn=41 f7 84 19 04 00 00 20   (testl $imm32, disp(%r9,%rbx,1))
+         *
+         * ModRM.reg is an opcode extension here (Intel SDM Table A-6, group 3: /0 TEST,
+         * /1 blank, /2 NOT, /3 NEG, /4 MUL, /5 IMUL, /6 DIV, /7 IDIV). Only /0 is decoded.
+         * NOT and NEG are memory-destination read-modify-writes and MUL..IDIV write rDX:rAX
+         * implicitly; decoding any of them as a TEST would silently corrupt a device register or
+         * a register pair, so they are refused as before.
+         *
+         * The immediate is the OPERAND WIDTH -- imm8 for F6, imm16/imm32 for F7. There is no
+         * sign-extended-imm8 short form in this group, unlike 0x83; treating F7 as one-byte would
+         * resume the guest three bytes into its own immediate.
+         */
+        case 0xF6u:   /* TEST r/m8, imm8 */
+        case 0xF7u: { /* TEST r/m16, imm16 or r/m32, imm32 */
+            unsigned int imm_index = (unsigned int)(modrm_index + 1 + tail_len);
+            unsigned int imm_len;
+
+            if ((raw_reg_field & 0x07u) != 0u) {
+                return -1; /* only /0 is TEST */
+            }
+            out->size_bytes = (opcode == 0xF6u) ? 1u : (operand16 ? 2u : 4u);
+            imm_len = out->size_bytes;
+            if (imm_index + imm_len > num_bytes) {
+                return -1; /* the immediate is not in the bytes we were given */
+            }
+            out->is_write = 0;
+            out->mem_is_dst = 0;
+            out->reg = 0;
+            out->zero_extend = 0;
+            out->has_imm = 1;
+            out->op = HYPE_MMIO_ALU_TEST;
+            out->imm_value = 0;
+            {
+                unsigned int k;
+                for (k = 0; k < imm_len; k++) {
+                    out->imm_value |= ((uint32_t)bytes[imm_index + k]) << (8u * k);
+                }
+            }
+            out->instr_len = (uint8_t)(imm_index + imm_len);
+            return 0;
+        }
         default:
             return -1;
     }

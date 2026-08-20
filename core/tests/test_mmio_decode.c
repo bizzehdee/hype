@@ -743,6 +743,117 @@ static void test_rejects_unaddressable_byte_registers(void) {
     }
 }
 
+/*
+ * #575: `TEST r/m, imm` -- group 3 /0, opcodes F6 and F7. A guest driver testing a bit in a
+ * device register can legitimately emit it, and hype STOPPED the VM for it.
+ */
+static void test_immediate_test_decodes_as_a_flags_only_read(void) {
+    /*
+     * THE EXACT INSTRUCTION FROM THE TICKET, byte for byte:
+     *   41 f7 84 19 04 00 00 20 00 00 00 02
+     * = testl $0x02000000, 0x20000004(%r9,%rbx,1)
+     * REX.B, F7 /0, ModRM 0x84 (mod=10 disp32, reg=000, rm=100 -> SIB), SIB 0x19, disp32, imm32.
+     * clang folded a volatile readl() plus a shift-and-mask plus a compare into it at -O2.
+     */
+    {
+        static const uint8_t insn[] = {0x41, 0xF7, 0x84, 0x19, 0x04, 0x00, 0x00, 0x20,
+                                       0x00, 0x00, 0x00, 0x02};
+        hype_mmio_decode_t d;
+        CHECK_HEX("the ticket's testl decodes", 0u, (unsigned)hype_mmio_decode(insn, 12u, &d));
+        CHECK_HEX("it is a READ", 0u, (unsigned)d.is_write);
+        CHECK_HEX("memory is not its destination", 0u, (unsigned)d.mem_is_dst);
+        CHECK_HEX("it carries an immediate", 1u, (unsigned)d.has_imm);
+        CHECK_HEX("the op is TEST", (unsigned)HYPE_MMIO_ALU_TEST, (unsigned)d.op);
+        CHECK_HEX("32-bit operand", 4u, (unsigned)d.size_bytes);
+        CHECK_HEX("imm32 read whole", 0x02000000u, d.imm_value);
+        /* The length is the thing that must not be guessed: resuming the guest anywhere but
+         * exactly past the imm32 lands it inside its own instruction stream. */
+        CHECK_HEX("instr_len covers REX+opcode+ModRM+SIB+disp32+imm32", 12u, (unsigned)d.instr_len);
+    }
+    /* 8-bit form: testb $0x20, 0x10(%rax). imm is ONE byte for F6. */
+    {
+        static const uint8_t insn[] = {0xF6, 0x40, 0x10, 0x20};
+        hype_mmio_decode_t d;
+        CHECK_HEX("testb decodes", 0u, (unsigned)hype_mmio_decode(insn, 4u, &d));
+        CHECK_HEX("testb width", 1u, (unsigned)d.size_bytes);
+        CHECK_HEX("testb is a READ", 0u, (unsigned)d.is_write);
+        CHECK_HEX("testb immediate", 0x20u, d.imm_value);
+        CHECK_HEX("testb length", 4u, (unsigned)d.instr_len);
+    }
+    /* 16-bit form via the 0x66 prefix: imm is TWO bytes, not four. */
+    {
+        static const uint8_t insn[] = {0x66, 0xF7, 0x00, 0x34, 0x12};
+        hype_mmio_decode_t d;
+        CHECK_HEX("testw decodes", 0u, (unsigned)hype_mmio_decode(insn, 5u, &d));
+        CHECK_HEX("testw width", 2u, (unsigned)d.size_bytes);
+        CHECK_HEX("testw immediate", 0x1234u, d.imm_value);
+        CHECK_HEX("testw length", 5u, (unsigned)d.instr_len);
+    }
+    /*
+     * There is NO sign-extended-imm8 short form in group 3, unlike 0x81/0x83. A plain
+     * `testl $imm32, (%rax)` is 6 bytes; reading the immediate as one byte would resume the
+     * guest three bytes into its own immediate.
+     */
+    {
+        static const uint8_t insn[] = {0xF7, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
+        hype_mmio_decode_t d;
+        CHECK_HEX("testl imm32 decodes", 0u, (unsigned)hype_mmio_decode(insn, 6u, &d));
+        CHECK_HEX("testl imm32 is not truncated", 0xFFFFFFFFu, d.imm_value);
+        CHECK_HEX("testl imm32 length is 6, not 3", 6u, (unsigned)d.instr_len);
+    }
+    /* A truncated fetch must be refused, not decoded with a half-read immediate. */
+    {
+        static const uint8_t insn[] = {0xF7, 0x00, 0x01, 0x00};
+        hype_mmio_decode_t d;
+        CHECK_HEX("imm32 not fully present is refused", 1u,
+                  (unsigned)(hype_mmio_decode(insn, 4u, &d) != 0));
+    }
+    /*
+     * Intel SDM Table A-6, group 3: /0 TEST, /1 blank, /2 NOT, /3 NEG, /4 MUL, /5 IMUL,
+     * /6 DIV, /7 IDIV. Only /0 may decode. NOT and NEG are memory-destination RMWs and
+     * MUL..IDIV write rDX:rAX implicitly, so decoding any of them as a TEST would silently
+     * corrupt a device register or a register pair.
+     */
+    {
+        unsigned int ext;
+        for (ext = 1u; ext < 8u; ext++) {
+            uint8_t insn[6];
+            hype_mmio_decode_t d;
+            insn[0] = 0xF7u;
+            insn[1] = (uint8_t)(0x00u | (ext << 3)); /* mod=00, reg=ext, rm=000 -> [rax] */
+            insn[2] = 0x01u;
+            insn[3] = 0x00u;
+            insn[4] = 0x00u;
+            insn[5] = 0x00u;
+            CHECK_HEX("group 3 non-/0 extension refused", 1u,
+                      (unsigned)(hype_mmio_decode(insn, 6u, &d) != 0));
+        }
+    }
+}
+
+/* The read-completion tail must treat an immediate TEST as flags-only: no register is written,
+ * and the flags come from memory AND immediate. */
+static void test_immediate_test_writes_flags_and_no_register(void) {
+    static const uint8_t insn[] = {0xF7, 0x00, 0x04, 0x00, 0x00, 0x00}; /* testl $4, (%rax) */
+    hype_mmio_decode_t d;
+    uint64_t reg = 0xDEADBEEFCAFEBABEULL;
+    uint64_t rflags = 0;
+
+    CHECK_HEX("decodes", 0u, (unsigned)hype_mmio_decode(insn, 6u, &d));
+
+    /* Bit 2 SET in the device register -> ZF clear. */
+    rflags = 0;
+    hype_mmio_complete_read(&d, &reg, 0x00000004u, &rflags);
+    CHECK_HEX("register untouched by TEST", 0xDEADBEEFCAFEBABEULL, reg);
+    CHECK_HEX("ZF clear when the bit is set", 0u, (unsigned)(rflags & (1u << 6)));
+
+    /* Bit 2 CLEAR -> ZF set. This is the branch the guest driver actually takes. */
+    rflags = 0;
+    hype_mmio_complete_read(&d, &reg, 0x00000002u, &rflags);
+    CHECK_HEX("register still untouched", 0xDEADBEEFCAFEBABEULL, reg);
+    CHECK_HEX("ZF set when the bit is clear", (1u << 6), (unsigned)(rflags & (1u << 6)));
+}
+
 int main(void) {
     test_decodes_mov_m32_imm32();
     test_decodes_mov_m8_imm8();
@@ -755,6 +866,8 @@ int main(void) {
     test_mov_is_still_a_mov();
     test_alu_bitwise_flags();
     test_alu_test_and_cmp_do_not_produce_a_register_value_by_accident();
+    test_immediate_test_decodes_as_a_flags_only_read();  /* #575 */
+    test_immediate_test_writes_flags_and_no_register();  /* #575 */
     test_alu_arithmetic_flags();
     test_alu_respects_operand_width();
     test_alu_null_rflags_is_safe();

@@ -75,29 +75,30 @@ static inline void micro_pci_write32(unsigned dev, unsigned off, uint32_t v) {
  * the wrong controller and concludes there is no disk (#548).
  */
 /*
- * EXPLICIT MOV, not a volatile dereference, and this is a real finding rather than style.
+ * A PLAIN VOLATILE DEREFERENCE, deliberately, and the history is worth keeping.
  *
  * A `volatile uint32_t` load is a single memory access, so clang is free to lower
  * `if ((read32(dev, 4) >> 16) & BIT)` to one `testl $imm32, disp(%reg,%reg)` -- the access count is
- * preserved, so the volatile contract holds. hype's MMIO decoder does not handle the F7 /0
- * TEST-with-immediate form, so the guest faulted undecodably at its ECAM window and hype stopped
- * the VM. The test looked like a device bug; it was the compiler picking a legal encoding.
+ * preserved, so the volatile contract holds. It did exactly that at -O2, and hype's MMIO decoder
+ * had no F7 /0 TEST-with-immediate form, so the guest faulted undecodably at its ECAM window and
+ * hype STOPPED the VM. The test looked like a device bug; it was the compiler picking a legal
+ * encoding hype could not read.
  *
- * virtioblk.c already carries this lesson for its BAR accesses ("at -O2 clang folded one of these
- * into a form hype's virtio path refused"). It belongs here too, because config-space reads are
- * shared by every test and the fold depends on what the caller does with the value -- so any test
- * that masks a config field could trip it, at any optimisation level, without changing this file.
+ * This file worked around it with an explicit `movl` asm. #575 fixed the actual gap in
+ * arch/x86_64/cpu/mmio_decode.c, so the workaround is gone and the natural C is back -- which is
+ * the better state for a reason beyond tidiness: with the volatile load restored, clang emits that
+ * `testl` against the ECAM window again, so `virtionet` now exercises hype's decoder for it on
+ * every run. It is an END-TO-END regression test for #575 that no unit test can be (fault ->
+ * decode -> flags-only completion -> resume at the right length), and it cost nothing to get.
  *
- * Filed separately as the decoder gap it also is: a real guest driver testing a bit in an MMIO
- * register can emit exactly this instruction.
+ * KEEP IT THAT WAY. If a future compiler folds a config read into some form hype still cannot
+ * decode, this test will stop the VM and say which instruction -- and that is a real decoder gap a
+ * real guest driver would hit too, which is precisely what the explicit-asm workaround HID. Do not
+ * paper over the next one here; fix the decoder and pin the encoding in
+ * core/tests/test_mmio_decode.c, as #575 did.
  */
 static inline uint32_t micro_pci_fread32(unsigned dev, unsigned func, unsigned off) {
-    uint32_t v;
-    __asm__ volatile("movl (%1), %0"
-                     : "=r"(v)
-                     : "r"((volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, func, off))
-                     : "memory");
-    return v;
+    return *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, func, off);
 }
 
 static inline void micro_pci_fwrite32(unsigned dev, unsigned func, unsigned off, uint32_t v) {
