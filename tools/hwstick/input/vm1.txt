@@ -81,8 +81,40 @@ expect ~#
 send echo 1 > /proc/sys/kernel/sysrq\n
 expect ~#
 
-# The reset itself. If this works the guest dies here and hype logs the 0xCF9 write plus a VM
-# restart; the script's own verdict below records only that it was ISSUED.
+# The reset itself. If this works the guest dies here and hype logs the 0xCF9 write, naming the
+# vCPU that served it, plus a VM restart.
 send taskset -c 1 sh -c 'echo b > /proc/sysrq-trigger'\n
 
-pass vm1-smp8-load-then-cf9-reboot-issued-from-vcpu1
+# ---------------------------------------------------------------------------
+# #525 asks for three things and the script used to prove only the first: that the write was
+# ISSUED. "the guest actually restarts, exactly once, and reaches a login prompt again" is the rest
+# of the bar, and a verdict of `reboot-issued` passes whether or not any of it happened -- a guest
+# that took the reset and never came back would have produced the same PASS.
+#
+# So wait for the login prompt to come round again. This is the FRESH boot's prompt: hype's restart
+# zeroes the guest's RAM and re-enters at the reset vector (M8-4), so everything below runs against
+# a guest that has genuinely started over.
+expect localhost login:
+send root\n
+expect ~#
+
+# UPTIME IS THE PROOF, not the prompt. A guest that ignored the reset and kept running would also
+# be sitting at a shell -- with an uptime near 700s, since the delay above banked ten minutes
+# before the write. A fresh boot reports single or double digits. The marker carries the number so
+# the log answers "did it restart" rather than "was something alive afterwards".
+send echo VM1-REBOOTED-up$(cut -d. -f1 /proc/uptime)\n
+expect VM1-REBOOTED-up
+
+# And the second vCPU has to come back with it. A restart that returns a 1-CPU guest would satisfy
+# every check above while quietly losing the AP -- which is #523's failure, arriving by a different
+# route.
+send echo VM1-RENPROC-$(grep -c ^processor /proc/cpuinfo)\n
+expect VM1-RENPROC-2
+
+pass vm1-cf9-reboot-from-vcpu1-restarted-and-back-to-login
+
+# EXACTLY ONCE is the one part of the bar a script cannot assert -- there is no counting directive,
+# and a second restart would simply replay these same expects. It is checked in the log instead:
+#   LC_ALL=C grep -ac "0xCF9" HYPE.LOG        -> must be 1
+#   LC_ALL=C grep -ac "vm1 restarted (M8-4)" HYPE.LOG -> must be 1
+# tools/hwstick/README.md carries both greps.

@@ -27,18 +27,38 @@ STICK=$S/stick
 [ -f "$ISO" ] || { echo "no ISO at $ISO"; exit 2; }
 
 mkdir -p "$S"
-rm -rf "$STICK"; mkdir -p "$STICK"
-tools/hwstick/stage.sh "$STICK" >/dev/null
-mkdir -p "$STICK/iso" "$STICK/hype/disks"
+rm -rf "$STICK"; mkdir -p "$STICK/iso" "$STICK/hype/disks"
+
+# THE MEDIA GOES ON BEFORE stage.sh RUNS, and the order is load-bearing now. stage.sh's last check
+# refuses to finish when a VM has no boot device -- which is right, and since vm1 became a
+# `boot = disk` guest (#120) a blank stick trips it. Staging first and populating afterwards meant
+# the stage exited 1 with its output discarded, so the rehearsal died silently: RC=1, zero bytes.
+# Caught by making that check fatal, which is the check earning its keep on its first run.
+
+
 cp "$ISO" "$STICK/iso/test.iso"
-cp "$ISO" "$STICK/iso/vm1.iso"
 # The target_disk files must EXIST. hype refuses to substitute a scratch disk for a missing one
 # ("refusing to substitute a scratch disk"), which is correct -- silently inventing a disk is how
 # an install lands somewhere nobody chose. stage.sh makes the directory but not the images, so a
 # freshly staged stick has no vdisks until something creates them.
-for d in vm0 vm1; do
-    dd if=/dev/zero of="$STICK/hype/disks/$d.img" bs=1M count="${VDISK_MB:-64}" status=none
-done
+dd if=/dev/zero of="$STICK/hype/disks/vm0.img" bs=1M count="${VDISK_MB:-64}" status=none
+
+# vm1 boots its OWN DISK now (#120), so a blank image is not a disk it can boot -- it is a VM that
+# does not start. The artefact is built and control-booted once and then cached, because the builder
+# spends up to two minutes proving in bare QEMU that the image reaches a login prompt, and paying
+# that on every rehearsal would discourage rehearsing.
+VM1_DISK="${VM1_DISK:-build/guestdisk/alpine-disk.img}"
+if [ ! -f "$VM1_DISK" ]; then
+    echo "building vm1's boot disk once (control-booted, then cached at $VM1_DISK)"
+    tools/make-guest-disk-from-iso.sh "$ISO" "$VM1_DISK" || {
+        echo "vm1's boot disk could not be built -- see above. Not rehearsing a stick that cannot"
+        echo "start vm1: the ticket riding on it (#120) would produce no evidence."
+        exit 1
+    }
+fi
+cp "$VM1_DISK" "$STICK/hype/disks/vm1-alpine-disk.img"
+
+tools/hwstick/stage.sh "$STICK"
 
 # The image MUST be GPT-partitioned with partition 1 = FAT32, not a bare FAT filesystem: hype
 # locates the volume with hype_gpt_find_partition() before handing it to core/fat.c. A bare
@@ -64,6 +84,10 @@ mdir -i "$S/esp.img@@1M" ::/EFI/BOOT 2>/dev/null | grep -q BOOTX64 || \
     { echo "ESP verify FAILED: BOOTX64.EFI not readable at partition 1"; exit 1; }
 mdir -i "$S/esp.img@@1M" ::/iso 2>/dev/null | grep -qi "test" || \
     { echo "ESP verify FAILED: \\iso\\test.iso not readable at partition 1"; exit 1; }
+# vm1's boot disk, verified through the partition offset for the same reason: a short write here
+# leaves a VM with no boot device, and the only symptom is a guest that never appears.
+mdir -i "$S/esp.img@@1M" ::/hype/disks 2>/dev/null | grep -qi "alpine" || \
+    { echo "ESP verify FAILED: vm1's boot disk not readable at partition 1"; exit 1; }
 
 killall -9 qemu-system-x86_64 2>/dev/null || true
 sleep 1

@@ -71,47 +71,94 @@ for cfg in sorted(glob.glob('tools/hwstick/*.cfg')):
             sys.exit("STAGE FAILED: %s names %s, which is not on the stick" % (cfg, m.strip()))
     print(os.path.basename(cfg), "-- every kernel present")
 PY
-# 4. every install_media and target_disk a config names, checked -- but they are NOT equally
-# serious, and the first version of this check got that wrong by calling both fatal.
+# 4. every install_media and target_disk a config names, checked -- and the severity depends on the
+# VM's own `boot` mode, which the first two versions of this check both got wrong.
 #
-#   install_media MISSING  -> fatal. A `boot = installer` VM has no boot media at all, so that
-#                             guest cannot start and the ticket riding on it produces nothing.
-#   target_disk   MISSING  -> a WARNING. hype logs "refusing to substitute a scratch disk" and
-#                             the guest still boots from its install media and runs normally --
-#                             verified: a rehearsal with no vdisks reached "Mounting boot media:
-#                             ok" on both guests. What is lost is only the ability to INSTALL to
-#                             disk, which most of these runs do not exercise.
+#   install_media missing, boot = installer  -> FATAL. No boot media at all, so that guest cannot
+#                                               start and the ticket riding on it produces nothing.
+#   target_disk missing, boot = disk         -> FATAL. #120's VM has no media to fall back to: the
+#                                               disk IS its boot device. hype refuses to substitute
+#                                               a scratch (correctly), so the guest simply does not
+#                                               run. This case did not exist when the check was
+#                                               written and would have been reported as a warning.
+#   target_disk missing, boot = installer    -> a WARNING. hype says "refusing to substitute a
+#                                               scratch disk" and the guest still boots its media
+#                                               and runs normally -- verified: a rehearsal with no
+#                                               vdisks reached "Mounting boot media: ok" on both
+#                                               guests. Only the ability to INSTALL is lost, which
+#                                               most of these runs do not exercise.
 #
-# Neither is created. A disk's size is the operator's call (it has to hold a real install, and
-# this stick is FAT32, where nothing is sparse and no file may reach 4 GiB), and guessing it is
-# exactly the kind of substitution the rest of this file refuses to make.
+# Nothing is created. A disk's size is the operator's call (it has to hold a real install, and this
+# stick is FAT32, where nothing is sparse and no file may reach 4 GiB), and guessing it is exactly
+# the kind of substitution the rest of this file refuses to make. The one exception is the #120
+# disk, which is not a blank image but a specific bootable artefact -- so the message names the
+# script that builds AND control-boots it rather than a `truncate` that would produce something
+# unbootable.
 python3 - "$DST" <<'PY'
 import re, sys, os, glob
+
 dst = sys.argv[1]
-missing = []
+
+def sections(text):
+    """[(section-name, {key: value})] -- per-section, because severity depends on `boot`."""
+    out, cur, keys = [], None, {}
+    for line in text.splitlines():
+        line = line.split(';')[0].strip()
+        if not line:
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            if cur is not None:
+                out.append((cur, keys))
+            cur, keys = line[1:-1], {}
+        elif '=' in line and cur is not None:
+            k, v = line.split('=', 1)
+            keys[k.strip()] = v.strip()
+    if cur is not None:
+        out.append((cur, keys))
+    return out
+
+fatal, warn = [], []
 for cfg in sorted(glob.glob('tools/hwstick/*.cfg')):
-    text = open(cfg).read()
-    for key, pat in (('install_media', r'^install_media = (.+)$'),
-                     ('target_disk', r'^target_disk = file:(.+)$')):
-        for m in re.findall(pat, text, re.M):
-            rel = m.strip().replace('\\', '/').lstrip('/')
-            if not os.path.exists(os.path.join(dst, rel)):
-                missing.append((os.path.basename(cfg), key, m.strip()))
-fatal = [m for m in missing if m[1] == 'install_media']
-warn = [m for m in missing if m[1] != 'install_media']
+    for name, keys in sections(open(cfg).read()):
+        boot = keys.get('boot', '')
+        for key in ('install_media', 'target_disk'):
+            val = keys.get(key)
+            if val is None:
+                continue
+            if key == 'target_disk':
+                if not val.startswith('file:'):
+                    continue      # a physical: target is a real drive, not a file to stage
+                val = val[len('file:'):]
+            rel = val.replace('\\', '/').lstrip('/')
+            if os.path.exists(os.path.join(dst, rel)):
+                continue
+            row = (os.path.basename(cfg), name, key, val)
+            if key == 'install_media' or boot == 'disk':
+                fatal.append(row)
+            else:
+                warn.append(row)
+
 if warn:
     print("WARNING -- no target disk, so these VMs cannot INSTALL (they still boot their media):")
-    for cfg, key, path in warn:
-        print("  %-16s %-14s %s" % (cfg, key, path))
+    for cfg, name, key, path in warn:
+        print("  %-16s %-10s %-14s %s" % (cfg, name, key, path))
     print("  create with e.g.  truncate -s 2G %s/hype/disks/vm0.img" % dst)
     print("  (size is yours to choose; this stick is FAT32, so nothing is sparse and 4 GiB is the")
     print("   per-file ceiling)")
 if fatal:
-    print("STAGE FAILED -- no boot media, so these VMs cannot start at all:")
-    for cfg, key, path in fatal:
-        print("  %-16s %-14s %s" % (cfg, key, path))
-    print("  cp <alpine.iso> %s/iso/<name>.iso" % dst)
+    print("STAGE FAILED -- these VMs have no boot device at all and cannot start:")
+    for cfg, name, key, path in fatal:
+        why = "boot = disk, so this disk IS the boot device" if key == 'target_disk' \
+              else "boot = installer with no media"
+        print("  %-16s %-10s %-14s %s   (%s)" % (cfg, name, key, path, why))
+    print()
+    print("  installer media:  cp <alpine.iso> %s/iso/<name>.iso" % dst)
+    print("  a #120 boot disk: tools/make-guest-disk-from-iso.sh <hybrid.iso> \\")
+    print("                        %s/hype/disks/<name>.img" % dst)
+    print("                    -- it control-boots the image in bare QEMU first and refuses to")
+    print("                       produce one that does not reach a login prompt, because a")
+    print("                       `truncate`d blank here would give the guest nothing to boot.")
     sys.exit(1)
-if not missing:
+if not fatal and not warn:
     print("every install_media and target_disk named by a config is present")
 PY

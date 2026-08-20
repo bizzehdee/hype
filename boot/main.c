@@ -10493,7 +10493,7 @@ typedef enum {
 } hype_fw_port_t;
 
 static hype_fw_port_t fw_1_shared_port_io(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
-                                          hype_vcpu_ctx_t *ctx) {
+                                          hype_vcpu_ctx_t *ctx, unsigned vcpu) {
     /* No VMX twin exists for the event block, so VMX guests keep falling through as before. */
     if (kind == HYPE_VMM_KIND_SVM &&
         hype_svm_vcpu_handle_pm1_evt_ioio(ctx, (uint16_t)HYPE_ACPI_PM1A_EVT_PORT,
@@ -10535,8 +10535,21 @@ static hype_fw_port_t fw_1_shared_port_io(hype_fw_vm_t *vm, hype_vmm_kind_t kind
                                                            &reset_req);
         if (rr == 0 && reset_req) {
             vm->lifecycle = hype_vm_lifecycle_next(vm->lifecycle, HYPE_VM_EV_RESET);
-            hype_debug_print("fw-1: vm%u guest reset via ACPI reset register (0xCF9) -> restart\n",
-                             (unsigned)(vm - g_vms));
+            /*
+             * #525: SAY WHICH vCPU WROTE IT. The whole point of moving 0xCF9 into this shared
+             * dispatch (#482) was that a guest reboots from whichever CPU runs its reboot path,
+             * and #482's own notes flag the VMX side as compile-tested only. The bare-metal run
+             * that closed #482 rebooted nothing, so `grep 0xcf9` in that log finds nothing -- and
+             * even a run that did reboot could not have answered #525's bar, because this line
+             * named the VM and not the vCPU. A log that cannot distinguish a BSP reboot from an
+             * AP one cannot prove the path this ticket is about.
+             *
+             * The index is a parameter rather than vm->cur_vcpu: that field is 0 throughout the
+             * BSP loop by construction (see its declaration), so reading it here would have
+             * called the BSP the writer for every reboot, including the ones that were not.
+             */
+            hype_debug_print("fw-1: vm%u vCPU %u guest reset via ACPI reset register (0xCF9) -> "
+                             "restart [#94 #525]\n", (unsigned)(vm - g_vms), vcpu);
         }
         if (rr != -1) {
             return HYPE_FW_PORT_RESET;
@@ -11048,7 +11061,7 @@ wait_for_sipi:
                 /* handled */
             } else if (vmm_handle_fw_cfg_ioio(kind, ctx, &vm->fw_cfg, &g_fw_1_dma_map) == 0) {
                 /* handled */
-            } else if (fw_1_shared_port_io(vm, kind, ctx) != HYPE_FW_PORT_NONE) {
+            } else if (fw_1_shared_port_io(vm, kind, ctx, vi) != HYPE_FW_PORT_NONE) {
                 /* #482: the chipset registers the BSP has always served -- PM1a event and
                  * control, the PM timer, the ACPI reset register -- now from here too. */
             } else {
@@ -16805,7 +16818,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * were four hand-written blocks here and absent there, which is how a guest
                  * came to read PM1a_EN as all-ones whenever the access landed on vCPU 1.
                  */
-                if (fw_1_shared_port_io(vm, kind, ctx) != HYPE_FW_PORT_NONE) {
+                /* vCPU 0: this loop is the BSP's, always. */
+                if (fw_1_shared_port_io(vm, kind, ctx, 0u) != HYPE_FW_PORT_NONE) {
                     continue; /* handled; on reset the STARTING branch reinitialises */
                 }
             }
