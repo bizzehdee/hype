@@ -12119,6 +12119,49 @@ static void fw_1_phase1_config(void) {
                  * report above is the whole action. */
             }
             /*
+             * ADM-6 (#583, §5.5): the network model's reference integrity.
+             *
+             * A dangling `switch` is REFUSED rather than defaulted, and the reason is §5.5's own
+             * default: a NIC with no switch legitimately means "its own private isolated segment".
+             * So treating `switch = lan0` with no [switch.lan0] as "no switch" would move a guest
+             * from a shared network to an isolated one -- connectivity asked for, isolation
+             * delivered, nothing said. Sharing a NIC is refused for the same class of reason: one
+             * device, one MAC, and the forwarding plane identifies a guest by its source address
+             * (#81), so two guests behind one MAC are two guests it cannot tell apart.
+             *
+             * Sharing a SWITCH is not checked and must not be -- that is the feature.
+             */
+            ir = hype_adm_check_nic_refs(&g_hype_cfg);
+            if (ir.status != HYPE_ADM_OK) {
+                if (ir.status == HYPE_ADM_ERR_NIC_REF_UNKNOWN) {
+                    HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- vm%u's nics= names a [nic.*] that does not "
+                                     "exist; a guest given a NIC that is not defined has no network "
+                                     "and nothing would say so [#583 section 5.5]\n", ir.vm_index_a);
+                    fw_1_refuse_vm(ir.vm_index_a);
+                } else {
+                    HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- a [nic.*] names a switch that does not exist. "
+                                     "Defaulting it would put that guest on its OWN isolated segment "
+                                     "instead of the shared one asked for [#583 section 5.5]\n");
+                }
+            }
+            ir = hype_adm_check_nic_sharing(&g_hype_cfg);
+            if (ir.status != HYPE_ADM_OK) {
+                HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- vm%u and vm%u attach the SAME [nic.*]: one device "
+                                 "and one MAC cannot be two guests, and the forwarding plane keys "
+                                 "off the source address. Put them on one [switch.*] instead "
+                                 "[#583 section 5.5]\n", ir.vm_index_a, ir.vm_index_b);
+                fw_1_refuse_vm(ir.vm_index_b != HYPE_ADM_NO_VM ? ir.vm_index_b : ir.vm_index_a);
+            }
+            /* Capacity, not an invariant: hype presents ONE guest NIC today (#81/#82, PCI device 4),
+             * so report and let the VM run with what can be attached rather than refusing it. */
+            ir = hype_adm_check_nic_count(&g_hype_cfg, 1u);
+            if (ir.status != HYPE_ADM_OK) {
+                HYPE_LOGF(HYPE_LOG_WARN, "adm: vm%u attaches %u NIC(s) and hype can present 1 -- the rest "
+                                 "will NOT be attached [#583]\n", ir.vm_index_a,
+                                 (ir.vm_index_a < g_hype_cfg.vm_count)
+                                     ? g_hype_cfg.vms[ir.vm_index_a].nics_count : 0u);
+            }
+            /*
              * ADM-6 (#224): host_cpu_budget, and each VM's own vCPU request.
              *
              * A budget breach is capacity rather than an isolation failure -- the operator has said

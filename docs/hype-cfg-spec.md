@@ -293,7 +293,12 @@ becomes its own build artifact, selected by a config rather than compiled into t
 hypervisor. The mode itself is general — it is the M3 direct-boot path reaching
 the config, not a test-only hook.
 
-### 5.5 `[nic.<id>]` — a network device + `[switch.<id>]` — a virtual network (NEW)
+### 5.5 `[nic.<id>]` — a network device + `[switch.<id>]` — a virtual network
+
+**Implemented (#583):** parsed, serialized (write-back round-trips), and checked by startup
+admission — every `nics` id must name a real `[nic.*]`, every `[nic.*].switch` a real
+`[switch.*]`, no two VMs may attach the same `[nic.*]`, and a VM's NIC count is capped at what
+hype can present. Sharing a **switch** is deliberately never an error: that is the feature.
 
 A VM attaches **0..N** NICs via `nics =`. Each `[nic.<id>]`:
 

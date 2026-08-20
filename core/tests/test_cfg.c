@@ -1039,7 +1039,10 @@ static void test_unknown_key_is_retained_not_fatal(void) {
 }
 
 static void test_unknown_section_and_its_keys_are_retained(void) {
-    /* Exactly the forward-compatibility case: a [nic.*] section an older hype cannot model. */
+    /* Exactly the forward-compatibility case: a section kind an older hype cannot model.
+     * This used [nic.*], which #583 implemented -- so it now needs a kind that is still
+     * genuinely unknown, or the test would be asserting forward compatibility against a
+     * feature that had arrived. */
     const char *cfg =
         "[vm.a]\n"
         "vcpus = 1\n"
@@ -1049,7 +1052,7 @@ static void test_unknown_section_and_its_keys_are_retained(void) {
         "firmware = uefi\n"
         "os_hint = linux\n"
         "\n"
-        "[nic.net0]\n"
+        "[future.net0]\n"
         "mode = nat\n"
         "mac = 52:54:00:12:34:56\n";
     hype_cfg_t out;
@@ -1062,7 +1065,7 @@ static void test_unknown_section_and_its_keys_are_retained(void) {
     CHECK_STR("section 0 names the VM", "a", out.sections[0].name);
     CHECK_INT("section 0 points at vms[0]", 0, out.sections[0].index);
     CHECK_INT("section 1 is unknown", (int)HYPE_CFG_SECTION_UNKNOWN, (int)out.sections[1].kind);
-    CHECK_STR("the unknown header is kept verbatim", "[nic.net0]", out.sections[1].raw);
+    CHECK_STR("the unknown header is kept verbatim", "[future.net0]", out.sections[1].raw);
     /* Both keys inside it survive, attached to that section rather than to the VM. */
     CHECK_INT("both keys inside it retained", 2, out.retained_count);
     CHECK_STR("first retained key", "mode = nat", retained_text(&out, 0));
@@ -2252,7 +2255,7 @@ static void test_serialize_preserves_comments_section_order_and_unknown_content(
         "[hype]\n"
         "config_version = 1\n"
         "future_hype_key = surprise ; an unknown [hype] key, retained\n"
-        "[nic.eth0] ; an entirely unknown section kind\n"
+        "[future.eth0] ; an entirely unknown section kind\n"
         "mode = bridge\n"
         "[vm.a] ; trailing comment on a section header\n"
         "; a comment inside the VM section\n"
@@ -2266,7 +2269,7 @@ static void test_serialize_preserves_comments_section_order_and_unknown_content(
     pr = parse_copy(cfg, &before);
     CHECK_INT("parses OK (unknown content is retained, not fatal)", HYPE_CFG_OK, pr.status);
     /* The unknown SECTION header itself counts too, alongside its one key and the two unknown
-     * keys inside known sections: [nic.eth0] + mode=bridge + future_hype_key + future_vm_key. */
+     * keys inside known sections: [future.eth0] + mode=bridge + future_hype_key + future_vm_key. */
     CHECK_INT("four unknown lines counted", 4, (int)before.unknown_count);
 
     sr = hype_cfg_serialize(&before, buf, sizeof(buf));
@@ -2277,7 +2280,7 @@ static void test_serialize_preserves_comments_section_order_and_unknown_content(
     CHECK_INT("unknown [hype] key survives verbatim",
               1, strstr(buf, "future_hype_key = surprise ; an unknown [hype] key, retained") != 0);
     CHECK_INT("unknown section header survives",
-              1, strstr(buf, "[nic.eth0] ; an entirely unknown section kind") != 0);
+              1, strstr(buf, "[future.eth0] ; an entirely unknown section kind") != 0);
     CHECK_INT("unknown section's key survives", 1, strstr(buf, "mode = bridge") != 0);
     CHECK_INT("VM section header comment survives",
               1, strstr(buf, "[vm.a] ; trailing comment on a section header") != 0);
@@ -2286,10 +2289,10 @@ static void test_serialize_preserves_comments_section_order_and_unknown_content(
     CHECK_INT("unknown VM key survives verbatim",
               1, strstr(buf, "future_vm_key = 1 ; an unknown VM key") != 0);
 
-    /* Section order itself: [hype] before [nic.eth0] before [vm.a]. */
+    /* Section order itself: [hype] before [future.eth0] before [vm.a]. */
     {
         const char *p_hype = strstr(buf, "[hype]");
-        const char *p_nic = strstr(buf, "[nic.eth0]");
+        const char *p_nic = strstr(buf, "[future.eth0]");
         const char *p_vm = strstr(buf, "[vm.a]");
         CHECK_INT("all three sections found", 1, p_hype != 0 && p_nic != 0 && p_vm != 0);
         CHECK_INT("hype before nic", 1, p_hype < p_nic);
@@ -2657,6 +2660,274 @@ static void test_worst_case_config_fits_the_documented_buffer(void) {
     CHECK_INT("and is not refused", 0, sr.refused_overflow);
 }
 
+/* ---- #583 (§5.5): [nic.*] and [switch.*] ---- */
+
+static void test_nic_and_switch_sections_parse(void) {
+    char cfg[2048];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "[switch.lan0]\n"
+             "uplink = nat\n"
+             "[nic.a-eth0]\n"
+             "switch = lan0\n"
+             "mac = 52:54:00:12:34:56\n"
+             "[nic.private]\n");
+    res = parse_copy(cfg, &out);
+
+    CHECK_INT("the sections parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("nothing retained as unknown -- these are KNOWN kinds now", 0, out.unknown_count);
+    CHECK_INT("one switch", 1, out.switch_count);
+    CHECK_STR("switch id", "lan0", out.switches[0].id);
+    CHECK_INT("uplink nat", (int)HYPE_CFG_UPLINK_NAT, (int)out.switches[0].uplink);
+    CHECK_INT("two nics", 2, out.nic_count);
+    CHECK_STR("nic id", "a-eth0", out.nics[0].id);
+    CHECK_INT("nic has a switch", 1, out.nics[0].has_switch);
+    CHECK_STR("nic switch id", "lan0", out.nics[0].switch_id);
+    CHECK_INT("nic has a mac", 1, out.nics[0].has_mac);
+    CHECK_INT("mac byte 0", 0x52, out.nics[0].mac[0]);
+    CHECK_INT("mac byte 5", 0x56, out.nics[0].mac[5]);
+    /* §5.5: an empty [nic.*] is a complete configuration -- its own private isolated segment. */
+    CHECK_INT("the switchless nic has no switch", 0, out.nics[1].has_switch);
+    CHECK_INT("and no mac either", 0, out.nics[1].has_mac);
+}
+
+/* §5.1's default: a switch with no `uplink` is PRIVATE. Isolation by default (§6e), so the absence
+ * of the key must not read as "nat". */
+static void test_switch_uplink_defaults_to_none(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A, "[switch.priv]\n");
+    (void)parse_copy(cfg, &out);
+    CHECK_INT("one switch", 1, out.switch_count);
+    CHECK_INT("uplink defaults to none", (int)HYPE_CFG_UPLINK_NONE, (int)out.switches[0].uplink);
+    CHECK_INT("and says it was not set", 0, out.switches[0].has_uplink);
+}
+
+static void test_vm_nics_list(void) {
+    char cfg[2048];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "nics = eth0, eth1\n"
+             "[nic.eth0]\n[nic.eth1]\n");
+    res = parse_copy(cfg, &out);
+    CHECK_INT("parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("two nics attached", 2, out.vms[0].nics_count);
+    CHECK_STR("first", "eth0", out.vms[0].nics[0]);
+    CHECK_STR("second", "eth1", out.vms[0].nics[1]);
+    /* Whether those ids EXIST is admission's question, not the parser's -- the same split `disks`
+     * follows, and it is what lets a config name a device defined further down the file. */
+    CHECK_INT("nothing retained", 0, out.unknown_count);
+}
+
+/*
+ * A MAC is an identity the forwarding plane keys guests off (#81), so a half-parsed one that
+ * silently became 00:00:00:00:00:00 would make two guests indistinguishable to every mapping. Every
+ * malformed form is refused, and the multicast bit by name -- a multicast source address is not an
+ * identity at all.
+ */
+static void test_bad_mac_is_refused(void) {
+    static const char *bad[] = {
+        "52:54:00:12:34",        /* too few octets */
+        "52:54:00:12:34:56:78",  /* too many */
+        "52-54-00-12-34-56",     /* wrong separator */
+        "52:54:00:12:34:5g",     /* not hex */
+        "525400123456",          /* no separators */
+        "53:54:00:12:34:56",     /* multicast bit set in the first octet */
+    };
+    unsigned int i;
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char cfg[1024];
+        hype_cfg_t out;
+        snprintf(cfg, sizeof(cfg), "%s[nic.e]\nmac = %s\n", VM_A, bad[i]);
+        (void)parse_copy(cfg, &out);
+        /* §4.3: a malformed [nic.*] key is a BAD VALUE inside a known section, so the section is
+         * kept and the key is not applied -- what must never happen is a MAC that looks accepted. */
+        CHECK_INT("a malformed mac is never applied", 0, out.nics[0].has_mac);
+    }
+    /* And the good form still works, so the rejections are not a blanket refusal. */
+    {
+        char cfg[1024];
+        hype_cfg_t out;
+        snprintf(cfg, sizeof(cfg), "%s[nic.e]\nmac = 02:00:00:00:00:01\n", VM_A);
+        (void)parse_copy(cfg, &out);
+        CHECK_INT("a valid locally-administered unicast mac is applied", 1, out.nics[0].has_mac);
+        CHECK_INT("first octet", 0x02, out.nics[0].mac[0]);
+    }
+}
+
+static void test_duplicate_nic_and_switch_ids_refused(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s[nic.e]\n[nic.e]\n", VM_A);
+    res = parse_copy(cfg, &out);
+    CHECK_INT("a duplicated nic id is refused", HYPE_CFG_ERR_DUPLICATE_VM_NAME, res.status);
+
+    snprintf(cfg, sizeof(cfg), "%s[switch.w]\n[switch.w]\n", VM_A);
+    res = parse_copy(cfg, &out);
+    CHECK_INT("a duplicated switch id is refused", HYPE_CFG_ERR_DUPLICATE_VM_NAME, res.status);
+}
+
+static void test_nameless_nic_section_refused(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s[nic.]\n", VM_A);
+    res = parse_copy(cfg, &out);
+    CHECK_INT("an id-less [nic.] is refused -- nothing could reference it",
+              HYPE_CFG_ERR_BAD_VALUE, res.status);
+}
+
+/* An unknown key inside a KNOWN [nic.*] is retained, not fatal -- §4.1's keystone, so a NIC key from
+ * a newer hype does not stop an older one booting. */
+static void test_unknown_nic_key_is_retained(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s[nic.e]\nswitch = w\nfuture_nic_key = 7\n[switch.w]\n", VM_A);
+    res = parse_copy(cfg, &out);
+    CHECK_INT("parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("the unknown key is retained", 1, out.unknown_count);
+    CHECK_INT("and the known one still applied", 1, out.nics[0].has_switch);
+}
+
+/* Round trip: what the serializer writes must parse back to the same model, or a GUI write-back
+ * silently changes the network. */
+static void test_nic_switch_round_trip(void) {
+    char cfg[2048];
+    char buf[4096];
+    hype_cfg_t a, b;
+    hype_cfg_serialize_result_t sr;
+
+    snprintf(cfg, sizeof(cfg), "%s%s", VM_A,
+             "nics = e0\n"
+             "[switch.lan0]\nuplink = nat\n"
+             "[nic.e0]\nswitch = lan0\nmac = 52:54:00:ab:cd:ef\n");
+    (void)parse_copy(cfg, &a);
+    sr = hype_cfg_serialize(&a, buf, sizeof(buf));
+    CHECK_INT("serialized", 0, sr.truncated);
+    (void)parse_copy(buf, &b);
+    CHECK_INT("same nic count", (int)a.nic_count, (int)b.nic_count);
+    CHECK_INT("same switch count", (int)a.switch_count, (int)b.switch_count);
+    CHECK_STR("switch survives", a.nics[0].switch_id, b.nics[0].switch_id);
+    CHECK_INT("mac survives byte 3", a.nics[0].mac[3], b.nics[0].mac[3]);
+    CHECK_INT("uplink survives", (int)a.switches[0].uplink, (int)b.switches[0].uplink);
+    CHECK_INT("the VM's nics list survives", (int)a.vms[0].nics_count, (int)b.vms[0].nics_count);
+    CHECK_STR("by id", a.vms[0].nics[0], b.vms[0].nics[0]);
+}
+
+/* The parser's own ceilings. Refused, not silently truncated: a NIC that parses and is never
+ * attached is the failure mode every cap in this file exists to avoid. */
+static void test_nic_and_switch_caps(void) {
+    char cfg[8192];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    unsigned int i;
+    int n;
+
+    n = snprintf(cfg, sizeof(cfg), "%s", VM_A);
+    for (i = 0; i < HYPE_CFG_MAX_NICS + 1u; i++) {
+        n += snprintf(cfg + n, sizeof(cfg) - (unsigned)n, "[nic.e%u]\n", i);
+    }
+    res = parse_copy(cfg, &out);
+    CHECK_INT("one NIC past the cap is refused", HYPE_CFG_ERR_TOO_MANY_ENTRIES, res.status);
+
+    n = snprintf(cfg, sizeof(cfg), "%s", VM_A);
+    for (i = 0; i < HYPE_CFG_MAX_SWITCHES + 1u; i++) {
+        n += snprintf(cfg + n, sizeof(cfg) - (unsigned)n, "[switch.w%u]\n", i);
+    }
+    res = parse_copy(cfg, &out);
+    CHECK_INT("one switch past the cap is refused", HYPE_CFG_ERR_TOO_MANY_ENTRIES, res.status);
+
+    /* And a VM attaching more NICs than the per-VM list holds. */
+    n = snprintf(cfg, sizeof(cfg), "%s", VM_A);
+    n += snprintf(cfg + n, sizeof(cfg) - (unsigned)n, "nics = a, b, c, d, e\n");
+    res = parse_copy(cfg, &out);
+    CHECK_INT("more attached NICs than the list holds is refused",
+              HYPE_CFG_ERR_TOO_MANY_ENTRIES, res.status);
+}
+
+/* An id longer than the field. Refused rather than truncated, because a truncated id resolves to a
+ * DIFFERENT device -- or to none -- and nothing would say so. */
+static void test_over_long_nic_id_refused(void) {
+    char cfg[1024];
+    char id[HYPE_CFG_NAME_MAX + 8];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    unsigned int i;
+
+    for (i = 0; i + 1u < sizeof(id); i++) id[i] = 'n';
+    id[sizeof(id) - 1u] = '\0';
+    snprintf(cfg, sizeof(cfg), "%s[nic.%s]\n", VM_A, id);
+    res = parse_copy(cfg, &out);
+    CHECK_INT("an over-long nic id is refused", HYPE_CFG_ERR_VALUE_TOO_LONG, res.status);
+
+    snprintf(cfg, sizeof(cfg), "%s[nic.e]\nswitch = %s\n", VM_A, id);
+    (void)parse_copy(cfg, &out);
+    CHECK_INT("an over-long switch reference is never applied", 0, out.nics[0].has_switch);
+}
+
+/* A nameless [switch.] mirrors [nic.]: nothing could reference it. */
+static void test_nameless_switch_section_refused(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    snprintf(cfg, sizeof(cfg), "%s[switch.]\n", VM_A);
+    res = parse_copy(cfg, &out);
+    CHECK_INT("an id-less [switch.] is refused", HYPE_CFG_ERR_BAD_VALUE, res.status);
+}
+
+/* A duplicated key inside a [nic.*] or [switch.*]. Refused, so which value wins never depends on
+ * file order -- the same rule every other section follows. */
+static void test_duplicate_nic_keys_refused(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    snprintf(cfg, sizeof(cfg), "%s[switch.w]\n[nic.e]\nswitch = w\nswitch = w\n", VM_A);
+    res = parse_copy(cfg, &out);
+    CHECK_INT("a repeated switch key is refused", HYPE_CFG_ERR_DUPLICATE_KEY, res.status);
+
+    snprintf(cfg, sizeof(cfg), "%s[switch.w]\nuplink = nat\nuplink = none\n", VM_A);
+    res = parse_copy(cfg, &out);
+    CHECK_INT("a repeated uplink key is refused", HYPE_CFG_ERR_DUPLICATE_KEY, res.status);
+}
+
+/* A bad uplink VALUE is a bad value, not an unknown key -- it must not be quietly retained as
+ * forward compatibility and leave the switch on its default. */
+static void test_bad_uplink_value(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+
+    snprintf(cfg, sizeof(cfg), "%s[switch.w]\nuplink = bridge\n", VM_A);
+    (void)parse_copy(cfg, &out);
+    CHECK_INT("an unrecognised uplink is never applied", 0, out.switches[0].has_uplink);
+}
+
+/* The uplink=none spelling, and a MAC on a switchless NIC -- the two remaining shapes a real config
+ * uses that nothing above exercises. */
+static void test_uplink_none_and_switchless_mac(void) {
+    char cfg[1024];
+    hype_cfg_t out;
+
+    snprintf(cfg, sizeof(cfg), "%s[switch.priv]\nuplink = none\n[nic.e]\nmac = 02:11:22:33:44:55\n",
+             VM_A);
+    (void)parse_copy(cfg, &out);
+    CHECK_INT("uplink none is applied explicitly", 1, out.switches[0].has_uplink);
+    CHECK_INT("and is NONE", (int)HYPE_CFG_UPLINK_NONE, (int)out.switches[0].uplink);
+    CHECK_INT("a MAC without a switch is fine", 1, out.nics[0].has_mac);
+    CHECK_INT("still its own private segment", 0, out.nics[0].has_switch);
+    CHECK_INT("mac last octet", 0x55, out.nics[0].mac[5]);
+}
+
 int main(void) {
     test_label_from_the_spec_example_is_accepted();
     test_label_absent_leaves_an_empty_string();
@@ -2679,6 +2950,20 @@ int main(void) {
     test_serialize_refuses_on_retained_overflow();
     test_serialize_truncation_is_reported_not_silent();
     test_serialize_disk_section_round_trips_optional_fields();
+    test_nic_and_switch_sections_parse();
+    test_switch_uplink_defaults_to_none();
+    test_vm_nics_list();
+    test_bad_mac_is_refused();
+    test_duplicate_nic_and_switch_ids_refused();
+    test_nameless_nic_section_refused();
+    test_unknown_nic_key_is_retained();
+    test_nic_switch_round_trip();
+    test_nic_and_switch_caps();
+    test_over_long_nic_id_refused();
+    test_nameless_switch_section_refused();
+    test_duplicate_nic_keys_refused();
+    test_bad_uplink_value();
+    test_uplink_none_and_switchless_mac();
     test_serialize_hype_section_lists();
     test_cfg_init_gives_safe_defaults_not_zeroes();
     test_log_level_key();

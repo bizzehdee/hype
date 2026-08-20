@@ -69,6 +69,22 @@
  * with room for the mixed-bus multi-disk case §5.3 exists for. */
 #define HYPE_CFG_MAX_DISKS 16
 
+/*
+ * #583 (§5.5): named network devices and the virtual networks they sit on.
+ *
+ * 16 NICs matches HYPE_CFG_MAX_DISKS for the same reason -- one per VM plus headroom. 8 switches
+ * because a switch is a shared L2 segment, so the useful count is far lower than the device count:
+ * the point of §5.5 is several NICs on ONE switch.
+ *
+ * HYPE_CFG_MAX_VM_NICS is what a single VM may attach, and it is deliberately small. hype presents
+ * a guest exactly one NIC today (PCI device 4, #81/#82), so a config asking for four is already
+ * ahead of the machine model; admission is where that is refused with the real number rather than
+ * here, so the parse stays lossless and the diagnostic names the VM.
+ */
+#define HYPE_CFG_MAX_NICS 16
+#define HYPE_CFG_MAX_SWITCHES 8
+#define HYPE_CFG_MAX_VM_NICS 4
+
 #define HYPE_CFG_MAX_SECTIONS 32
 /*
  * #567: 256, raised from 64, and the number is CHOSEN rather than doubled by reflex.
@@ -245,6 +261,17 @@ typedef struct {
     unsigned int cdroms_count;
     char cdroms[HYPE_CFG_MAX_VM_DISKS][HYPE_CFG_NAME_MAX];
 
+    /*
+     * #583 (§5.2/§5.5): ordered network devices, by [nic.<id>] id. 0..N, and zero is a real answer
+     * -- a network-less VM has no `nics` key at all.
+     *
+     * `net_mode`/`net_peers` remain sugar over this (§5.5): `net_mode = nat` is one implicit NIC on
+     * an implicit uplink=nat switch. They are NOT merged into this list, because the sugar is what
+     * every existing config uses and rewriting it here would change what a write-back emits.
+     */
+    unsigned int nics_count;
+    char nics[HYPE_CFG_MAX_VM_NICS][HYPE_CFG_NAME_MAX];
+
     /* Which bootable targets BDS tries, in order. Empty means the documented default: cdroms then
      * disks. Entries may name either kind. */
     unsigned int boot_order_count;
@@ -295,7 +322,8 @@ enum {
     HYPE_CFG_F_LABEL = 1u << 17,      /* #357 */
     HYPE_CFG_F_KERNEL = 1u << 18,     /* #535 */
     HYPE_CFG_F_CMDLINE = 1u << 19,    /* #546 */
-    HYPE_CFG_F_DISPLAY = 1u << 20     /* #565 */
+    HYPE_CFG_F_DISPLAY = 1u << 20,    /* #565 */
+    HYPE_CFG_F_NICS = 1u << 21        /* #583 */
 };
 
 /*
@@ -492,10 +520,47 @@ typedef struct {
     int allow_overwrite;
 } hype_cfg_disk_t;
 
+/*
+ * #583 (§5.5): `[switch.<id>] uplink = none | nat`.
+ *
+ * `none` is a fully private inter-VM LAN; `nat` additionally gives its members outbound WAN through
+ * the host NIC (plan.md §6e). Default `none`, because §6e makes isolation the default and a switch
+ * that silently reached the internet would be the opposite of what its name promises.
+ */
+typedef enum {
+    HYPE_CFG_UPLINK_NONE = 0,
+    HYPE_CFG_UPLINK_NAT
+} hype_cfg_uplink_t;
+
+typedef struct {
+    char id[HYPE_CFG_NAME_MAX]; /* the <id> in [switch.<id>] */
+    hype_cfg_uplink_t uplink;
+    int has_uplink;
+} hype_cfg_switch_t;
+
+typedef struct {
+    char id[HYPE_CFG_NAME_MAX]; /* the <id> in [nic.<id>] */
+    /*
+     * §5.5: which virtual network this NIC is on. EMPTY is not "unset pending a default" -- it is
+     * the documented default and it MEANS something: an implicit private, isolated per-NIC segment.
+     * So `has_switch` distinguishes "on switch lan0" from "on its own private segment", and the
+     * second is a real configuration rather than a missing value.
+     */
+    int has_switch;
+    char switch_id[HYPE_CFG_NAME_MAX];
+    /* Optional explicit MAC. Absent means derived and stable per id -- the forwarding plane
+     * identifies a guest by its source address, so a MAC that moved between boots would look like
+     * a different guest to every mapping (#81). */
+    int has_mac;
+    uint8_t mac[6];
+} hype_cfg_nic_t;
+
 typedef enum {
     HYPE_CFG_SECTION_VM = 0,
     HYPE_CFG_SECTION_DISK,
     HYPE_CFG_SECTION_HYPE,
+    HYPE_CFG_SECTION_NIC,    /* #583 */
+    HYPE_CFG_SECTION_SWITCH, /* #583 */
     HYPE_CFG_SECTION_UNKNOWN
 } hype_cfg_section_kind_t;
 
@@ -532,6 +597,12 @@ typedef struct {
     hype_cfg_disk_t disks[HYPE_CFG_MAX_DISKS];
     unsigned int disk_count;
 
+    /* #583 (§5.5): named NICs and switches, referenced by VMs via nics = and by NICs via switch =. */
+    hype_cfg_nic_t nics[HYPE_CFG_MAX_NICS];
+    unsigned int nic_count;
+    hype_cfg_switch_t switches[HYPE_CFG_MAX_SWITCHES];
+    unsigned int switch_count;
+
     /* #393: default VM storage, bound by hype_cfg_parse(). See the note on `vms` above. */
     hype_cfg_vm_t vms_default[HYPE_CFG_MAX_VMS];
 
@@ -542,6 +613,14 @@ typedef struct {
      * absent disk is how a VM ends up with no boot device for no visible reason.
      */
     unsigned int skipped_disks;
+
+    /*
+     * #583: same §4.3 treatment for a malformed [nic.*] or [switch.*] -- reported and skipped, not
+     * fatal. One bad device must not stop the rest of the config loading, and a silently absent NIC
+     * is how a VM ends up with no network for no visible reason.
+     */
+    unsigned int skipped_nics;
+    unsigned int skipped_switches;
 
     /*
      * #341 (§4.3): VMs dropped because something in their section was malformed. The rest of the

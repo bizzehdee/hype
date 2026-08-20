@@ -1381,6 +1381,184 @@ static void test_cpu_sets_alone_can_over_claim_the_budget(void) {
               (int)hype_adm_check_cpu_budget(&cfg, 8u).status);
 }
 
+/* ---- #583 (§5.5): the network model ---- */
+
+static void add_nic(hype_cfg_t *c, const char *id, const char *sw) {
+    hype_cfg_nic_t *n = &c->nics[c->nic_count++];
+    memset(n, 0, sizeof(*n));
+    strncpy(n->id, id, sizeof(n->id) - 1);
+    if (sw != 0) {
+        n->has_switch = 1;
+        strncpy(n->switch_id, sw, sizeof(n->switch_id) - 1);
+    }
+}
+
+static void add_switch(hype_cfg_t *c, const char *id, hype_cfg_uplink_t up) {
+    hype_cfg_switch_t *w = &c->switches[c->switch_count++];
+    memset(w, 0, sizeof(*w));
+    strncpy(w->id, id, sizeof(w->id) - 1);
+    w->uplink = up;
+    w->has_uplink = 1;
+}
+
+static void vm_attach_nic(hype_cfg_vm_t *vm, const char *id) {
+    strncpy(vm->nics[vm->nics_count++], id, HYPE_CFG_NAME_MAX - 1);
+}
+
+/* A well-formed network: two VMs, one NIC each, both on one switch. That is the SHARED-NETWORK case
+ * §5.5 exists for, so it must pass every check -- including the sharing one. */
+static void test_two_vms_on_one_switch_is_fine(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    add_switch(&cfg, "lan0", HYPE_CFG_UPLINK_NONE);
+    add_nic(&cfg, "a-eth0", "lan0");
+    add_nic(&cfg, "b-eth0", "lan0");
+    vm_attach_nic(&cfg.vms[0], "a-eth0");
+    vm_attach_nic(&cfg.vms[1], "b-eth0");
+
+    CHECK_INT("refs resolve", (int)HYPE_ADM_OK, (int)hype_adm_check_nic_refs(&cfg).status);
+    CHECK_INT("sharing a SWITCH is the feature, not a breach", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_nic_sharing(&cfg).status);
+    CHECK_INT("one NIC each fits a one-NIC machine model", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_nic_count(&cfg, 1u).status);
+}
+
+/* A VM naming a NIC that does not exist. Refused and the VM named -- a guest given a NIC that is
+ * not defined has no network at all, and nothing else would say so. */
+static void test_dangling_nic_ref_is_refused(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    add_nic(&cfg, "a-eth0", 0);
+    vm_attach_nic(&cfg.vms[0], "a-eth0");
+    vm_attach_nic(&cfg.vms[1], "typo-eth0");
+
+    r = hype_adm_check_nic_refs(&cfg);
+    CHECK_INT("a nics= id with no [nic.*] is refused", (int)HYPE_ADM_ERR_NIC_REF_UNKNOWN,
+              (int)r.status);
+    CHECK_INT("and it names the VM", 1u, r.vm_index_a);
+}
+
+/*
+ * A [nic.*] naming a switch that does not exist. THE REASON THIS IS REFUSED RATHER THAN DEFAULTED is
+ * §5.5's own default: no switch means "its own private isolated segment". So quietly treating
+ * `switch = lan0` with no [switch.lan0] as "no switch" would move that guest from the shared network
+ * it asked for onto an isolated one -- connectivity requested, isolation delivered, nothing said.
+ */
+static void test_dangling_switch_ref_is_refused_not_defaulted(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    add_nic(&cfg, "a-eth0", "lan-that-does-not-exist");
+    vm_attach_nic(&cfg.vms[0], "a-eth0");
+
+    CHECK_INT("a switch id with no [switch.*] is refused",
+              (int)HYPE_ADM_ERR_SWITCH_REF_UNKNOWN, (int)hype_adm_check_nic_refs(&cfg).status);
+
+    /* Define it and the same config passes -- the check is about existence, not about naming. */
+    add_switch(&cfg, "lan-that-does-not-exist", HYPE_CFG_UPLINK_NAT);
+    CHECK_INT("defining the switch resolves it", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_nic_refs(&cfg).status);
+}
+
+/* No switch at all is a REAL configuration, not a missing value: §5.5 gives that NIC its own private
+ * isolated segment. It must not be mistaken for a dangling reference. */
+static void test_nic_with_no_switch_is_valid(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    add_nic(&cfg, "a-eth0", 0); /* isolation by default (section 6e) */
+    vm_attach_nic(&cfg.vms[0], "a-eth0");
+    CHECK_INT("a switchless NIC is its own segment, not an error", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_nic_refs(&cfg).status);
+}
+
+/*
+ * Two VMs attaching the SAME [nic.*]. One device, one MAC -- and the forwarding plane identifies a
+ * guest by its source address (#81), so two guests behind one MAC are two guests it cannot tell
+ * apart. Sharing a switch is the supported way to share a network; sharing a NIC is not.
+ */
+static void test_two_vms_cannot_share_one_nic(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    add_nic(&cfg, "shared-eth0", 0);
+    vm_attach_nic(&cfg.vms[0], "shared-eth0");
+    vm_attach_nic(&cfg.vms[1], "shared-eth0");
+
+    r = hype_adm_check_nic_sharing(&cfg);
+    CHECK_INT("the same NIC on two VMs is refused", (int)HYPE_ADM_ERR_NIC_SHARED, (int)r.status);
+    CHECK_INT("naming the first VM", 0u, r.vm_index_a);
+    CHECK_INT("and the second", 1u, r.vm_index_b);
+}
+
+/* An unattached [nic.*] is fine and is not reported: NICs may be declared ahead of the VMs that use
+ * them, exactly as [disk.*] may. */
+static void test_unattached_nic_is_not_an_error(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    add_switch(&cfg, "lan0", HYPE_CFG_UPLINK_NONE);
+    add_nic(&cfg, "spare", "lan0"); /* declared, attached by nobody */
+    CHECK_INT("a NIC nobody attaches is not an error", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_nic_refs(&cfg).status);
+    CHECK_INT("and it is not a sharing breach either", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_nic_sharing(&cfg).status);
+}
+
+/* More NICs than hype can present. Capacity, so it names the VM and the caller reports rather than
+ * refusing -- but silence would mean NICs that parse and are never attached. */
+static void test_nic_count_over_the_machine_model(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "greedy", 1, 512, "a.img");
+    add_nic(&cfg, "e0", 0);
+    add_nic(&cfg, "e1", 0);
+    vm_attach_nic(&cfg.vms[0], "e0");
+    vm_attach_nic(&cfg.vms[0], "e1");
+
+    r = hype_adm_check_nic_count(&cfg, 1u);
+    CHECK_INT("two NICs against a one-NIC machine model is reported",
+              (int)HYPE_ADM_ERR_NIC_COUNT_EXCEEDED, (int)r.status);
+    CHECK_INT("and it names the VM", 0u, r.vm_index_a);
+    CHECK_INT("two fits a two-NIC budget", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_nic_count(&cfg, 2u).status);
+}
+
+/* A network-less VM: no nics key at all. Every check must be silent -- zero NICs is a supported
+ * configuration, not an omission. */
+static void test_network_less_vm_is_silent(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "offline", 1, 512, "a.img");
+    CHECK_INT("refs", (int)HYPE_ADM_OK, (int)hype_adm_check_nic_refs(&cfg).status);
+    CHECK_INT("sharing", (int)HYPE_ADM_OK, (int)hype_adm_check_nic_sharing(&cfg).status);
+    CHECK_INT("count", (int)HYPE_ADM_OK, (int)hype_adm_check_nic_count(&cfg, 1u).status);
+}
+
 int main(void) {
     test_peers_default_deny();
     test_peers_one_sided_listing_is_bidirectional();
@@ -1442,6 +1620,14 @@ int main(void) {
     test_physical_cdrom_claim_is_attributed_too();
     test_physical_device_without_an_identity_is_skipped();
     test_cpu_sets_alone_can_over_claim_the_budget();
+    test_two_vms_on_one_switch_is_fine();
+    test_dangling_nic_ref_is_refused();
+    test_dangling_switch_ref_is_refused_not_defaulted();
+    test_nic_with_no_switch_is_valid();
+    test_two_vms_cannot_share_one_nic();
+    test_unattached_nic_is_not_an_error();
+    test_nic_count_over_the_machine_model();
+    test_network_less_vm_is_silent();
 
     if (failures == 0) {
         printf("all tests passed\n");

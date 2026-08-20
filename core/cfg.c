@@ -349,6 +349,17 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         *seen |= HYPE_CFG_F_DISKS;
         return HYPE_CFG_OK;
     }
+    if (hype_streq(key, "nics")) {
+        /* #583 (§5.2): ordered network devices, by [nic.<id>] id. Whether those ids EXIST is
+         * admission's question, not the parser's -- the same split `disks` already follows, and it
+         * is what keeps a parse lossless when a config names a device defined further down. */
+        hype_cfg_status_t st;
+        if (*seen & HYPE_CFG_F_NICS) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        st = parse_id_list(val, vm, vm->nics, &vm->nics_count, HYPE_CFG_MAX_VM_NICS);
+        if (st != HYPE_CFG_OK) return st;
+        *seen |= HYPE_CFG_F_NICS;
+        return HYPE_CFG_OK;
+    }
     if (hype_streq(key, "cdroms")) {
         hype_cfg_status_t st;
         if (*seen & HYPE_CFG_F_CDROMS) return HYPE_CFG_ERR_DUPLICATE_KEY;
@@ -796,6 +807,103 @@ static hype_cfg_status_t apply_disk_str(char *dst, int *has, unsigned int *seen,
     return HYPE_CFG_OK;
 }
 
+/* #583 (§5.5): the per-section seen-masks, one bit per key, so a duplicate is refused rather than
+ * silently letting the later value win. Same shape as the D_* masks below. */
+#define N_SWITCH (1u << 0)
+#define N_MAC (1u << 1)
+#define SW_UPLINK (1u << 0)
+
+static void zero_nic(hype_cfg_nic_t *n) {
+    unsigned char *p = (unsigned char *)n;
+    unsigned long long i;
+    for (i = 0; i < sizeof(*n); i++) p[i] = 0;
+    /* Zero IS the documented default: no switch (an implicit private per-NIC segment, §5.5) and no
+     * explicit MAC (derived, stable per id). */
+}
+
+static void zero_switch(hype_cfg_switch_t *w) {
+    unsigned char *p = (unsigned char *)w;
+    unsigned long long i;
+    for (i = 0; i < sizeof(*w); i++) p[i] = 0;
+    /* Zero is HYPE_CFG_UPLINK_NONE -- §6e's isolation-by-default. */
+}
+
+/*
+ * #583: one MAC, "aa:bb:cc:dd:ee:ff". Hex only, exactly six octets, colon-separated.
+ *
+ * Strict on purpose. A MAC is an identity the forwarding plane keys guests off (#81), so a
+ * half-parsed one that silently became 00:00:00:00:00:00 would make two guests indistinguishable to
+ * every mapping -- and a broadcast/multicast source address would be worse. Rejected rather than
+ * coerced, and the multicast bit is refused by name.
+ */
+static hype_cfg_status_t parse_mac(const char *val, uint8_t *out) {
+    unsigned int i;
+    const char *p = val;
+    for (i = 0; i < 6u; i++) {
+        unsigned int j, byte = 0u;
+        for (j = 0; j < 2u; j++) {
+            char c = *p++;
+            unsigned int d;
+            if (c >= '0' && c <= '9') d = (unsigned int)(c - '0');
+            else if (c >= 'a' && c <= 'f') d = (unsigned int)(c - 'a') + 10u;
+            else if (c >= 'A' && c <= 'F') d = (unsigned int)(c - 'A') + 10u;
+            else return HYPE_CFG_ERR_BAD_VALUE;
+            byte = (byte << 4) | d;
+        }
+        out[i] = (uint8_t)byte;
+        if (i < 5u) {
+            if (*p++ != ':') return HYPE_CFG_ERR_BAD_VALUE;
+        }
+    }
+    if (*p != '\0') return HYPE_CFG_ERR_BAD_VALUE; /* trailing junk is not a MAC */
+    if ((out[0] & 0x01u) != 0u) {
+        return HYPE_CFG_ERR_BAD_VALUE; /* multicast/broadcast bit set: not a source address */
+    }
+    return HYPE_CFG_OK;
+}
+
+static hype_cfg_status_t apply_nic_field(hype_cfg_nic_t *n, unsigned int *seen, const char *key,
+                                         char *val) {
+    if (hype_streq(key, "switch")) {
+        if (*seen & N_SWITCH) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (*val == '\0') return HYPE_CFG_ERR_BAD_VALUE;
+        if (hype_strlcpy(n->switch_id, val, HYPE_CFG_NAME_MAX) >= HYPE_CFG_NAME_MAX) {
+            return HYPE_CFG_ERR_VALUE_TOO_LONG;
+        }
+        n->has_switch = 1;
+        *seen |= N_SWITCH;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "mac")) {
+        hype_cfg_status_t st;
+        if (*seen & N_MAC) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        st = parse_mac(val, n->mac);
+        if (st != HYPE_CFG_OK) return st;
+        n->has_mac = 1;
+        *seen |= N_MAC;
+        return HYPE_CFG_OK;
+    }
+    return HYPE_CFG_ERR_UNKNOWN_KEY;
+}
+
+static hype_cfg_status_t apply_switch_field(hype_cfg_switch_t *w, unsigned int *seen,
+                                            const char *key, char *val) {
+    if (hype_streq(key, "uplink")) {
+        if (*seen & SW_UPLINK) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_streq(val, "none")) {
+            w->uplink = HYPE_CFG_UPLINK_NONE;
+        } else if (hype_streq(val, "nat")) {
+            w->uplink = HYPE_CFG_UPLINK_NAT;
+        } else {
+            return HYPE_CFG_ERR_BAD_VALUE;
+        }
+        w->has_uplink = 1;
+        *seen |= SW_UPLINK;
+        return HYPE_CFG_OK;
+    }
+    return HYPE_CFG_ERR_UNKNOWN_KEY;
+}
+
 static hype_cfg_status_t apply_disk_field(hype_cfg_disk_t *d, unsigned int *seen, const char *key,
                                           char *val) {
     if (hype_streq(key, "type")) {
@@ -989,7 +1097,9 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
                                                  const char *raw, int *cur_disk,
                                                  unsigned int *disk_seen, int *cur_is_hype,
                                                  unsigned int *in_hype_seen,
-                                                 unsigned int line_no, int *cur_over_cap) {
+                                                 unsigned int line_no, int *cur_over_cap,
+                                                 int *cur_nic, int *cur_switch,
+                                                 unsigned int *nic_seen) {
     *cur_over_cap = 0;
     unsigned long long len = hype_strlen(line);
     char *body;
@@ -1010,6 +1120,8 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
         }
         *cur = -1;
         *cur_disk = -1;
+        *cur_nic = -1;   /* #583 */
+        *cur_switch = -1;
         *cur_is_hype = 1;
         (void)add_section(out, HYPE_CFG_SECTION_HYPE, "", raw, -1);
         return HYPE_CFG_OK;
@@ -1032,6 +1144,8 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
         }
         *cur = -1; /* not a VM: VM keys must not land in a disk section */
         *cur_is_hype = 0;
+        *cur_nic = -1;   /* #583 */
+        *cur_switch = -1;
         *cur_disk = (int)out->disk_count;
         zero_disk(&out->disks[*cur_disk]);
         if (hype_strlcpy(out->disks[*cur_disk].id, name, HYPE_CFG_NAME_MAX) >= HYPE_CFG_NAME_MAX) {
@@ -1040,6 +1154,59 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
         *disk_seen = 0;
         (void)add_section(out, HYPE_CFG_SECTION_DISK, name, raw, *cur_disk);
         out->disk_count++;
+        return HYPE_CFG_OK;
+    }
+    if (hype_strneq(body, "nic.", 4) || hype_strneq(body, "switch.", 7)) {
+        /*
+         * #583 (§5.5). Same shape as [disk.*]: a non-empty, unique id, because `nics = a, b` and
+         * `switch = lan0` both resolve by id and a duplicate would make which device is meant depend
+         * on parse order.
+         *
+         * A malformed one is skipped and COUNTED (§4.3), like a bad [disk.*] -- one typo in a NIC
+         * nothing may even reference must not stop the machine booting, and a silently absent NIC is
+         * how a VM ends up with no network for no visible reason.
+         */
+        int is_nic = hype_strneq(body, "nic.", 4);
+        name = body + (is_nic ? 4 : 7);
+        if (*name == '\0') {
+            return HYPE_CFG_ERR_BAD_VALUE;
+        }
+        if (is_nic) {
+            for (i = 0; i < out->nic_count; i++) {
+                if (hype_streq(out->nics[i].id, name)) return HYPE_CFG_ERR_DUPLICATE_VM_NAME;
+            }
+            if (out->nic_count >= HYPE_CFG_MAX_NICS) return HYPE_CFG_ERR_TOO_MANY_ENTRIES;
+        } else {
+            for (i = 0; i < out->switch_count; i++) {
+                if (hype_streq(out->switches[i].id, name)) return HYPE_CFG_ERR_DUPLICATE_VM_NAME;
+            }
+            if (out->switch_count >= HYPE_CFG_MAX_SWITCHES) return HYPE_CFG_ERR_TOO_MANY_ENTRIES;
+        }
+        *cur = -1; /* not a VM, and not a disk: those sections' keys must not land here */
+        *cur_disk = -1;
+        *cur_is_hype = 0;
+        if (is_nic) {
+            *cur_nic = (int)out->nic_count;
+            *cur_switch = -1;
+            zero_nic(&out->nics[*cur_nic]);
+            if (hype_strlcpy(out->nics[*cur_nic].id, name, HYPE_CFG_NAME_MAX) >= HYPE_CFG_NAME_MAX) {
+                return HYPE_CFG_ERR_VALUE_TOO_LONG;
+            }
+            *nic_seen = 0;
+            (void)add_section(out, HYPE_CFG_SECTION_NIC, name, raw, *cur_nic);
+            out->nic_count++;
+        } else {
+            *cur_switch = (int)out->switch_count;
+            *cur_nic = -1;
+            zero_switch(&out->switches[*cur_switch]);
+            if (hype_strlcpy(out->switches[*cur_switch].id, name, HYPE_CFG_NAME_MAX) >=
+                HYPE_CFG_NAME_MAX) {
+                return HYPE_CFG_ERR_VALUE_TOO_LONG;
+            }
+            *nic_seen = 0;
+            (void)add_section(out, HYPE_CFG_SECTION_SWITCH, name, raw, *cur_switch);
+            out->switch_count++;
+        }
         return HYPE_CFG_OK;
     }
     if (!hype_strneq(body, "vm.", 3)) {
@@ -1051,6 +1218,8 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
          */
         *cur = -1;
         *cur_disk = -1;
+        *cur_nic = -1;   /* #583 */
+        *cur_switch = -1;
         *cur_is_hype = 0;
         (void)add_section(out, HYPE_CFG_SECTION_UNKNOWN, "", raw, -1);
         out->unknown_count++;
@@ -1086,6 +1255,8 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
         out->skipped_vms++;
         *cur = -1;      /* subsequent keys belong to a VM that does not exist */
         *cur_disk = -1;
+        *cur_nic = -1;   /* #583 */
+        *cur_switch = -1;
         *cur_is_hype = 0;
         *cur_over_cap = 1; /* ...and are IGNORED rather than reported outside-a-section */
         return HYPE_CFG_OK;
@@ -1093,6 +1264,8 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
 
     *cur = (int)out->vm_count;
     *cur_disk = -1;
+    *cur_nic = -1;   /* #583 */
+    *cur_switch = -1;
     *cur_is_hype = 0;
     zero_vm(&out->vms[*cur]);
     name_len = hype_strlcpy(out->vms[*cur].name, name, HYPE_CFG_NAME_MAX);
@@ -1110,13 +1283,14 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
 static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
                                             const char *raw, int raw_truncated,
                                             int cur_disk, unsigned int *disk_seen, int cur_is_hype,
-                                            unsigned int *in_hype_seen) {
+                                            unsigned int *in_hype_seen, int cur_nic, int cur_switch,
+                                            unsigned int *nic_seen) {
     char *eq;
     char *key;
     char *val;
     hype_cfg_status_t st;
 
-    if (cur < 0 && cur_disk < 0 && !cur_is_hype) {
+    if (cur < 0 && cur_disk < 0 && cur_nic < 0 && cur_switch < 0 && !cur_is_hype) {
         /*
          * #222: no CURRENT typed section. Two different cases, deliberately distinguished: inside a
          * retained unknown section the line is retained (section_count > 0), whereas a key before
@@ -1158,6 +1332,10 @@ static hype_cfg_status_t process_key_value(char *line, hype_cfg_t *out, int cur,
             *in_hype_seen = 0;
             return HYPE_CFG_OK;
         }
+    } else if (cur_nic >= 0) {
+        st = apply_nic_field(&out->nics[cur_nic], nic_seen, key, val); /* #583 */
+    } else if (cur_switch >= 0) {
+        st = apply_switch_field(&out->switches[cur_switch], nic_seen, key, val); /* #583 */
     } else {
         st = (cur_disk >= 0) ? apply_disk_field(&out->disks[cur_disk], disk_seen, key, val)
                              : apply_field(&out->vms[cur], &out->vms[cur].seen_fields, key, val);
@@ -1260,6 +1438,9 @@ hype_cfg_result_t hype_cfg_parse_into(char *text, hype_cfg_t *out, hype_cfg_vm_t
     unsigned int first_err_line = 0;
     int cur = -1;
     int cur_disk = -1;
+    int cur_nic = -1;         /* #583 */
+    int cur_switch = -1;      /* #583 */
+    unsigned int nic_seen = 0u; /* one mask: a NIC and a switch section are never both current */
     int cur_is_hype = 0;
     int cur_over_cap = 0;
     unsigned int line_no = 0;
@@ -1275,6 +1456,10 @@ hype_cfg_result_t hype_cfg_parse_into(char *text, hype_cfg_t *out, hype_cfg_vm_t
     hype_globals_defaults(&out->hype);
     out->disk_count = 0;
     out->skipped_disks = 0;
+    out->skipped_nics = 0;      /* #583 */
+    out->skipped_switches = 0;
+    out->nic_count = 0;
+    out->switch_count = 0;
     out->skipped_vms = 0;
     out->skipped_vm_name[0] = '\0';
     out->skipped_vm_line = 0;
@@ -1334,13 +1519,15 @@ hype_cfg_result_t hype_cfg_parse_into(char *text, hype_cfg_t *out, hype_cfg_vm_t
         in_vm_key = 0;
         if (line[0] == '[') {
             st = process_section_header(line, out, &cur, raw, &cur_disk, &disk_seen,
-                                        &cur_is_hype, &in_hype_seen, line_no, &cur_over_cap);
+                                        &cur_is_hype, &in_hype_seen, line_no, &cur_over_cap,
+                                        &cur_nic, &cur_switch, &nic_seen);
         } else {
             in_vm_key = (cur >= 0);
             st = cur_over_cap
                      ? HYPE_CFG_OK /* #450: a VM past capacity was reported; its keys are noise */
                      : process_key_value(line, out, cur, raw, raw_truncated, cur_disk,
-                                         &disk_seen, cur_is_hype, &in_hype_seen);
+                                         &disk_seen, cur_is_hype, &in_hype_seen, cur_nic,
+                                         cur_switch, &nic_seen);
         }
         if (out->unknown_count > unknown_before && out->unknown_first_line == 0u) {
             out->unknown_first_line = line_no;
@@ -1859,6 +2046,19 @@ static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {
             w_kv_list(w, "cdroms", vm->cdroms, vm->cdroms_count);
         }
     }
+
+    /*
+     * #583: NICs are emitted OUTSIDE the storage branch, and that is not a style choice -- the first
+     * cut put them beside `disks`, inside the else of "does this VM use an inline target_disk". A VM
+     * with a target_disk took the other branch, so its `nics` line was silently dropped on
+     * write-back: the round-trip test caught a config that lost its network by being saved.
+     * Networking has nothing to do with which storage form a VM uses.
+     */
+    if (vm->nics_count > 0u) {
+        /* Only when non-empty: zero NICs is a network-less VM (§5.5), and writing `nics = ` would
+         * turn that into an empty list nobody asked for. */
+        w_kv_list(w, "nics", vm->nics, vm->nics_count);
+    }
     if (vm->boot_order_count > 0u) {
         w_kv_list(w, "boot_order", vm->boot_order, vm->boot_order_count);
     }
@@ -1899,6 +2099,38 @@ static const char *disk_bus_str(hype_cfg_bus_t bus) {
         case HYPE_CFG_BUS_NVME: return "nvme";
         case HYPE_CFG_BUS_AHCI_ATAPI: return "ahci-atapi";
         default: return 0;
+    }
+}
+
+/*
+ * #583: a NIC and a switch round-trip like every other section -- emitted from their CURRENT struct
+ * values, so a GUI edit lands and a comment nobody touched survives (§4.1's write-back contract).
+ *
+ * Only what was SET is emitted. `switch` absent means the documented default -- an implicit private
+ * per-NIC segment -- and writing `switch = ` for it would turn a default into a value, which is the
+ * shape of bug this file keeps calling out: something that looks configured and is not.
+ */
+static void serialize_nic(hype_cfg_w_t *w, const hype_cfg_nic_t *n) {
+    if (n->has_switch) {
+        w_kv(w, "switch", n->switch_id);
+    }
+    if (n->has_mac) {
+        char mac[18];
+        static const char hexd[] = "0123456789abcdef";
+        unsigned int i;
+        for (i = 0; i < 6u; i++) {
+            mac[i * 3u] = hexd[(n->mac[i] >> 4) & 0x0Fu];
+            mac[i * 3u + 1u] = hexd[n->mac[i] & 0x0Fu];
+            if (i < 5u) mac[i * 3u + 2u] = ':';
+        }
+        mac[17] = '\0';
+        w_kv(w, "mac", mac);
+    }
+}
+
+static void serialize_switch(hype_cfg_w_t *w, const hype_cfg_switch_t *sw) {
+    if (sw->has_uplink) {
+        w_kv(w, "uplink", sw->uplink == HYPE_CFG_UPLINK_NAT ? "nat" : "none");
     }
 }
 
@@ -1976,6 +2208,12 @@ hype_cfg_serialize_result_t hype_cfg_serialize(const hype_cfg_t *cfg, char *out,
                 break;
             case HYPE_CFG_SECTION_DISK:
                 serialize_disk(&w, &cfg->disks[sec->index]);
+                break;
+            case HYPE_CFG_SECTION_NIC: /* #583 */
+                serialize_nic(&w, &cfg->nics[sec->index]);
+                break;
+            case HYPE_CFG_SECTION_SWITCH:
+                serialize_switch(&w, &cfg->switches[sec->index]);
                 break;
             case HYPE_CFG_SECTION_UNKNOWN:
             default:

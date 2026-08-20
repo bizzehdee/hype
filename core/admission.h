@@ -37,7 +37,12 @@ typedef enum {
     HYPE_ADM_ERR_CPU_BUDGET_OUT_OF_RANGE, /* host_cpu_budget names a core this host does not have */
     HYPE_ADM_ERR_CPU_SET_OUTSIDE_BUDGET,  /* a cpu_set core is outside host_cpu_budget */
     HYPE_ADM_ERR_VCPU_EXCEEDS_BUDGET,     /* the VMs want more cores than the budget offers */
-    HYPE_ADM_ERR_VCPUS_EXCEED_HOST        /* ONE VM alone wants more cores than the host has */
+    HYPE_ADM_ERR_VCPUS_EXCEED_HOST,       /* ONE VM alone wants more cores than the host has */
+    /* #583 (§5.5) */
+    HYPE_ADM_ERR_NIC_REF_UNKNOWN,   /* nics= names no [nic.*] that exists */
+    HYPE_ADM_ERR_SWITCH_REF_UNKNOWN, /* a [nic.*].switch names no [switch.*] that exists */
+    HYPE_ADM_ERR_NIC_SHARED,        /* two VMs attach the same [nic.*] */
+    HYPE_ADM_ERR_NIC_COUNT_EXCEEDED /* a VM attaches more NICs than hype can present */
 } hype_adm_status_t;
 
 typedef struct {
@@ -249,5 +254,42 @@ hype_adm_result_t hype_adm_check_cpu_budget(const hype_cfg_t *cfg,
  */
 hype_adm_result_t hype_adm_check_vm_ranges(const hype_cfg_t *cfg,
                                            unsigned int physical_core_count);
+
+/*
+ * #583 (§5.5): reference integrity for the network model, the last piece of ADM-6.
+ *
+ * Every id in a VM's `nics` must name a defined [nic.*], and every [nic.*].switch must name a
+ * defined [switch.*]. A dangling reference is refused rather than defaulted, for the reason §5.5's
+ * own default makes sharp: a NIC with NO switch is a legitimate configuration meaning "its own
+ * private isolated segment". So silently treating `switch = lan0` with no [switch.lan0] as "no
+ * switch" would move a guest from a shared network to an isolated one -- the operator asked for
+ * connectivity and would get isolation, with nothing said. That is the #285/#331/#339 class: a
+ * setting that appears accepted and does something else.
+ *
+ * A NIC referenced by NO VM is fine and is not reported: [nic.*] blocks may be defined ahead of the
+ * VMs that will use them, exactly as [disk.*] may.
+ */
+hype_adm_result_t hype_adm_check_nic_refs(const hype_cfg_t *cfg);
+
+/*
+ * #583: no two VMs may attach the same [nic.*].
+ *
+ * A NIC is one device with one MAC. Two guests behind one MAC is not a shared network -- that is
+ * what a [switch.*] is for -- it is two guests the forwarding plane cannot tell apart, because it
+ * identifies a guest by its source address (#81). Sharing a SWITCH is the intended case and is
+ * deliberately NOT checked; sharing a NIC is not.
+ */
+hype_adm_result_t hype_adm_check_nic_sharing(const hype_cfg_t *cfg);
+
+/*
+ * #583: a VM's NIC count against what hype can actually present.
+ *
+ * `max_nics_per_vm` is the caller's, for the same reason hype_adm_check_disk_count() takes its
+ * bound: it is a fact of the FW-1 machine model (one guest NIC on PCI device 4 today, #81/#82, and
+ * the IO-APIC's 24 pins are fully allocated) and admission stays a pure library. The parser's own
+ * cap is larger, so without this a config asking for three NICs would parse cleanly and then have
+ * two of them silently never attached.
+ */
+hype_adm_result_t hype_adm_check_nic_count(const hype_cfg_t *cfg, unsigned int max_nics_per_vm);
 
 #endif /* HYPE_ADMISSION_H */

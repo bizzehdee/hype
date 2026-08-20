@@ -573,6 +573,83 @@ hype_adm_result_t hype_adm_check_cpu_budget(const hype_cfg_t *cfg,
     return adm_ok();
 }
 
+/* #583: index of a [nic.*] by id, or -1. */
+static int nic_by_id(const hype_cfg_t *cfg, const char *id) {
+    unsigned int i;
+    for (i = 0; i < cfg->nic_count; i++) {
+        if (hype_streq(cfg->nics[i].id, id)) return (int)i;
+    }
+    return -1;
+}
+
+static int switch_exists(const hype_cfg_t *cfg, const char *id) {
+    unsigned int i;
+    for (i = 0; i < cfg->switch_count; i++) {
+        if (hype_streq(cfg->switches[i].id, id)) return 1;
+    }
+    return 0;
+}
+
+hype_adm_result_t hype_adm_check_nic_refs(const hype_cfg_t *cfg) {
+    unsigned int vi, k, i;
+
+    for (vi = 0; vi < cfg->vm_count; vi++) {
+        for (k = 0; k < cfg->vms[vi].nics_count; k++) {
+            if (nic_by_id(cfg, cfg->vms[vi].nics[k]) < 0) {
+                return adm_err(HYPE_ADM_ERR_NIC_REF_UNKNOWN, vi, HYPE_ADM_NO_VM);
+            }
+        }
+    }
+    /*
+     * Every declared NIC's switch, whether or not a VM attaches it yet. A dangling switch on an
+     * unattached NIC is still a config error the operator wants told about now, rather than the
+     * first time they add it to a VM.
+     */
+    for (i = 0; i < cfg->nic_count; i++) {
+        if (!cfg->nics[i].has_switch) {
+            continue; /* §5.5: no switch IS the default -- its own private isolated segment */
+        }
+        if (!switch_exists(cfg, cfg->nics[i].switch_id)) {
+            return adm_err(HYPE_ADM_ERR_SWITCH_REF_UNKNOWN, HYPE_ADM_NO_VM, HYPE_ADM_NO_VM);
+        }
+    }
+    return adm_ok();
+}
+
+hype_adm_result_t hype_adm_check_nic_sharing(const hype_cfg_t *cfg) {
+    unsigned int a, b, ka, kb;
+
+    for (a = 0; a < cfg->vm_count; a++) {
+        for (ka = 0; ka < cfg->vms[a].nics_count; ka++) {
+            for (b = a + 1u; b < cfg->vm_count; b++) {
+                for (kb = 0; kb < cfg->vms[b].nics_count; kb++) {
+                    if (hype_streq(cfg->vms[a].nics[ka], cfg->vms[b].nics[kb])) {
+                        return adm_err(HYPE_ADM_ERR_NIC_SHARED, a, b);
+                    }
+                }
+            }
+        }
+    }
+    /*
+     * Two VMs on the same SWITCH is deliberately not checked here and must never be: it is the
+     * whole point of §5.5. Unlike cpu_set, where overlap is a breach, switch membership IS the
+     * shared-network case (NET-6 #223) -- put three VMs' NICs on one [switch.lan0] and those three
+     * share a network. A check here would refuse the feature.
+     */
+    return adm_ok();
+}
+
+hype_adm_result_t hype_adm_check_nic_count(const hype_cfg_t *cfg, unsigned int max_nics_per_vm) {
+    unsigned int vi;
+
+    for (vi = 0; vi < cfg->vm_count; vi++) {
+        if (cfg->vms[vi].nics_count > max_nics_per_vm) {
+            return adm_err(HYPE_ADM_ERR_NIC_COUNT_EXCEEDED, vi, HYPE_ADM_NO_VM);
+        }
+    }
+    return adm_ok();
+}
+
 hype_adm_result_t hype_adm_check_vm_ranges(const hype_cfg_t *cfg,
                                            unsigned int physical_core_count) {
     unsigned int i;
