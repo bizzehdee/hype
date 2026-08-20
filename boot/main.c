@@ -19978,14 +19978,38 @@ static void term_create_begin(void) {
 
 /* Serialize the candidate config and write it through the verified boot volume. 0 on success. */
 static int term_create_write_cfg(const hype_cfg_t *cand) {
-    static char text[16384];
+    /*
+     * #567: 64 KiB, not 16. cfg.h states that "a 64 KiB buffer comfortably covers the structure's
+     * own maximums" and this used 16 KiB, so the code and the guidance disagreed -- and the code
+     * was the wrong one. A config built to every structural maximum serializes to 53.0 KiB
+     * (measured), and even at the OLD 64-line retention cap the worst case was 17.2 KiB, so a
+     * 16 KiB buffer was already reachable rather than a future problem.
+     */
+    static char text[65536];
     hype_cfg_serialize_result_t sr;
     hype_fs_t *bv;
     hype_fs_file_t f;
 
     sr = hype_cfg_serialize(cand, text, sizeof(text));
-    if (sr.truncated || sr.refused_overflow) {
-        term_resultf("create: the config would not serialize (too large) -- nothing changed");
+    /*
+     * #567: these are two DIFFERENT failures and they used to share one message that asserted a
+     * cause neither had been checked for. `refused_overflow` is not a size problem at all -- it
+     * means the parser could not capture every line, so writing back would DELETE content, and
+     * `out` is left untouched rather than truncated. Reporting that as "too large" told the
+     * operator to shrink a config that was not too large.
+     */
+    if (sr.refused_overflow) {
+        term_resultf("create: REFUSED to write hype.cfg -- this config has more than %u retained "
+                     "lines (comments and blank lines), so saving would DELETE the ones hype could "
+                     "not hold. Nothing changed. Reduce the comments or raise "
+                     "HYPE_CFG_MAX_RETAINED.",
+                     (unsigned)HYPE_CFG_MAX_RETAINED);
+        return -1;
+    }
+    if (sr.truncated) {
+        term_resultf("create: the serialized config does not fit hype's %u-byte buffer -- nothing "
+                     "changed",
+                     (unsigned)sizeof(text));
         return -1;
     }
     bv = fw_1_boot_volume();
@@ -20148,8 +20172,14 @@ static void fw_1_autocreate_probe(void) {
 #endif
 
 static void term_set_cmd(int idx, const char *nm, const char *key, const char *value) {
-    static char text[16384];   /* current config, serialized */
-    static char text2[16384];  /* edited text -- what gets written */
+    /*
+     * #567: 64 KiB each, not 16. Same defect as term_create_write_cfg() and the same reason: cfg.h
+     * documents a 64 KiB buffer as what covers the structure's maximums, and a maximal config
+     * serializes to 53.0 KiB (measured). `set` would otherwise refuse on exactly the documented
+     * configs `create` now accepts, which is a worse state than both being wrong.
+     */
+    static char text[65536];   /* current config, serialized */
+    static char text2[65536];  /* edited text -- what gets written */
     static char text3[16384];  /* parse scratch: hype_cfg_parse tokenizes in place */
     static hype_cfg_t check;
     unsigned ki, nkeys = (unsigned)(sizeof(g_term_set_keys) / sizeof(g_term_set_keys[0]));

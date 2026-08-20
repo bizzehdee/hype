@@ -70,7 +70,32 @@
 #define HYPE_CFG_MAX_DISKS 16
 
 #define HYPE_CFG_MAX_SECTIONS 32
-#define HYPE_CFG_MAX_RETAINED 64
+/*
+ * #567: 256, raised from 64, and the number is CHOSEN rather than doubled by reflex.
+ *
+ * Comment-only lines are retained, because a lossless serializer must preserve them. 64 is about
+ * one screen of comments, so any config with real explanation in it -- which is precisely what the
+ * spec's lossless round-trip exists to protect -- overflowed and could never be written back.
+ * tools/hwstick/hype.cfg, the config hype ships on its own validation stick, has 68 comment lines:
+ * four over, so write-back was permanently unavailable on that stick.
+ *
+ * Why 256 and not more: it is the largest cap whose WORST-CASE serialization still fits the 64 KiB
+ * buffer this header already tells callers to provide. Measured, by parsing a config built to every
+ * structural maximum (MAX_RETAINED lines at LINE_MAX-1 chars, 16 VMs, 16 disks, 32 sections) and
+ * serializing it:
+ *
+ *     cap=128  ->  29.1 KiB out,  struct 104.5 KiB
+ *     cap=256  ->  53.0 KiB out,  struct 129.0 KiB   <- fits 64 KiB, 11 KiB spare
+ *     cap=384  ->  76.9 KiB out,  struct 153.5 KiB   <- would BREAK the 64 KiB guidance
+ *
+ * Cost: the retained array goes 12.2 KiB -> 49.0 KiB, so hype_cfg_t goes 92.3 KiB -> 129.0 KiB.
+ * Every instance is a static, so this is .bss in a UEFI application that carves guest RAM in
+ * hundreds of megabytes.
+ *
+ * 256 is also 3.8x the shipped config, which is the headroom that matters in practice: it holds a
+ * config where all 16 VMs and all 16 disks carry a commented block AND a substantial preamble.
+ */
+#define HYPE_CFG_MAX_RETAINED 256
 #define HYPE_CFG_LINE_MAX 192
 
 typedef enum {

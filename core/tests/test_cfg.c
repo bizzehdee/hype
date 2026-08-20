@@ -2494,6 +2494,169 @@ static void test_log_level_key(void) {
 }
 
 
+/*
+ * #567: write-back was refused on hype's OWN shipped config, and the operator was told the config
+ * was "too large" when it was not. Two independent bugs behind one message.
+ *
+ * Comment-only lines are retained because a lossless serializer must preserve them, and the cap was
+ * 64 -- roughly one screen. tools/hwstick/hype.cfg has 68 comment lines, so `retained_overflow` was
+ * set at parse time on the validation stick and create/set/any write-back could never succeed
+ * there.
+ */
+static char g_big[262144];
+static char g_out[262144];
+
+/* Build a config with `comments` comment-only lines plus one valid VM. */
+static void build_commented_cfg(unsigned comments) {
+    char *p = g_big;
+    unsigned i;
+    p += sprintf(p, "[hype]\nconfig_version = 1\n");
+    for (i = 0; i < comments; i++) {
+        p += sprintf(p, "; comment line number %u, of the kind an operator is supposed to write\n", i);
+    }
+    p += sprintf(p, "[vm.one]\n" REQ);
+    *p = '\0';
+}
+
+static void test_retained_overflow_is_not_a_size_problem(void) {
+    static hype_cfg_t cfg;
+    hype_cfg_serialize_result_t sr;
+
+    /* One MORE than the cap, so the parser cannot capture every line. */
+    build_commented_cfg((unsigned)HYPE_CFG_MAX_RETAINED + 1u);
+    (void)hype_cfg_parse(g_big, &cfg);
+    CHECK_INT("over the cap sets retained_overflow", 1, cfg.retained_overflow);
+
+    sr = hype_cfg_serialize(&cfg, g_out, sizeof(g_out));
+    /*
+     * THE DISTINCTION THAT WAS MISSING. refused_overflow means "saving would delete content the
+     * parser never captured"; truncated means "the output buffer was too small". Only the second is
+     * a size problem, and the buffer here is 256 KiB, so it must NOT be set. Reporting these as one
+     * message is what told the operator to shrink a config that fitted comfortably.
+     */
+    CHECK_INT("serialize refuses", 1, sr.refused_overflow);
+    CHECK_INT("and NOT because of size", 0, sr.truncated);
+    /* `out` is untouched rather than half-written, so a caller cannot save a partial file. */
+    CHECK_INT("out is left empty", 0, (int)strlen(g_out));
+}
+
+static void test_truncated_is_reported_separately_from_refusal(void) {
+    static hype_cfg_t cfg;
+    static char tiny[64];
+    hype_cfg_serialize_result_t sr;
+
+    /* Well under the cap, so nothing is refused -- only the buffer is too small. */
+    build_commented_cfg(8u);
+    (void)hype_cfg_parse(g_big, &cfg);
+    CHECK_INT("under the cap retains everything", 0, cfg.retained_overflow);
+
+    sr = hype_cfg_serialize(&cfg, tiny, sizeof(tiny));
+    CHECK_INT("a small buffer sets truncated", 1, sr.truncated);
+    CHECK_INT("and NOT refused_overflow", 0, sr.refused_overflow);
+}
+
+/*
+ * The shipped validation-stick config's shape: 68 comment lines. This is the case that could never
+ * be written back, and it is asserted by COUNT rather than by reading the file, so the test does not
+ * depend on tools/hwstick/hype.cfg staying exactly 68 lines long -- what matters is that a config
+ * documented at that scale round-trips.
+ */
+static void test_a_documented_config_round_trips(void) {
+    static hype_cfg_t cfg;
+    static hype_cfg_t again;
+    hype_cfg_serialize_result_t sr;
+    unsigned i;
+    unsigned comments_out = 0u;
+
+    build_commented_cfg(68u);
+    (void)hype_cfg_parse(g_big, &cfg);
+    CHECK_INT("68 comment lines are all retained", 68, (int)cfg.retained_count);
+    CHECK_INT("no overflow at the shipped config's scale", 0, cfg.retained_overflow);
+
+    sr = hype_cfg_serialize(&cfg, g_out, sizeof(g_out));
+    CHECK_INT("it serializes", 0, sr.refused_overflow);
+    CHECK_INT("without truncation", 0, sr.truncated);
+
+    /* Every comment must come back out, or "lossless" is not what happened. */
+    for (i = 0; g_out[i] != '\0'; i++) {
+        if (g_out[i] == ';' && (i == 0u || g_out[i - 1u] == '\n')) {
+            comments_out++;
+        }
+    }
+    CHECK_INT("every comment survives the write-back", 68, (int)comments_out);
+
+    /* Re-parsing the output must give the same thing: a serializer that is not idempotent loses
+     * content on the second save rather than the first, which is worse to diagnose. */
+    (void)hype_cfg_parse(g_out, &again);
+    CHECK_INT("reparse retains the same count", (int)cfg.retained_count, (int)again.retained_count);
+    CHECK_INT("reparse does not overflow", 0, again.retained_overflow);
+}
+
+/*
+ * The wizard's actual path: take a documented config, append a VM, serialize. This is what
+ * term_create_finish() does, and it is the step that failed on bare metal.
+ */
+static void test_appending_a_vm_to_a_documented_config_writes_back(void) {
+    static hype_cfg_t cfg;
+    hype_cfg_vm_t nv;
+    hype_cfg_serialize_result_t sr;
+
+    build_commented_cfg(68u);
+    (void)hype_cfg_parse(g_big, &cfg);
+    CHECK_INT("baseline has no overflow", 0, cfg.retained_overflow);
+
+    memset(&nv, 0, sizeof nv);
+    strncpy(nv.name, "created", sizeof nv.name - 1);
+    nv.mem_mb = 512u;
+    nv.vcpus = 1u;
+    nv.boot = HYPE_CFG_BOOT_DISK;
+    nv.os_hint = HYPE_CFG_OS_LINUX;
+    nv.target_disk.kind = HYPE_CFG_DISK_FILE;
+    strncpy(nv.target_disk.path_or_id, "\\hype\\disks\\new.img",
+            sizeof nv.target_disk.path_or_id - 1);
+
+    CHECK_INT("the VM is appended", 0, hype_cfg_append_vm(&cfg, &nv));
+    sr = hype_cfg_serialize(&cfg, g_out, sizeof(g_out));
+    CHECK_INT("the wizard's write-back is not refused", 0, sr.refused_overflow);
+    CHECK_INT("nor truncated", 0, sr.truncated);
+    CHECK_INT("and the new VM is in the config", 2, (int)cfg.vm_count);
+    CHECK_INT("the serialized text names it", 1, strstr(g_out, "[vm.created]") != 0);
+}
+
+/*
+ * The cap must stay consistent with the buffer size cfg.h tells callers to provide. A config built
+ * to every structural maximum has to serialize into 64 KiB, or the guidance is a lie and the next
+ * caller sizes a buffer from it. This is the check that pins the 256 chosen in #567: at 384 the
+ * worst case is 76.9 KiB and this fails.
+ */
+static void test_worst_case_config_fits_the_documented_buffer(void) {
+    static hype_cfg_t cfg;
+    static char buf64k[65536];
+    hype_cfg_serialize_result_t sr;
+    char *p = g_big;
+    unsigned i;
+
+    p += sprintf(p, "[hype]\nconfig_version = 1\n");
+    for (i = 0; i < (unsigned)HYPE_CFG_MAX_RETAINED; i++) {
+        unsigned k;
+        *p++ = ';';
+        for (k = 1u; k < (unsigned)HYPE_CFG_LINE_MAX - 2u; k++) {
+            *p++ = 'x';
+        }
+        *p++ = '\n';
+    }
+    for (i = 0; i < (unsigned)HYPE_CFG_MAX_VMS; i++) {
+        p += sprintf(p, "[vm.vmnamenumber%02u]\n" REQ, i);
+    }
+    *p = '\0';
+
+    (void)hype_cfg_parse(g_big, &cfg);
+    CHECK_INT("the maximal config retains without overflow", 0, cfg.retained_overflow);
+    sr = hype_cfg_serialize(&cfg, buf64k, sizeof(buf64k));
+    CHECK_INT("the worst case fits the 64 KiB cfg.h documents", 0, sr.truncated);
+    CHECK_INT("and is not refused", 0, sr.refused_overflow);
+}
+
 int main(void) {
     test_label_from_the_spec_example_is_accepted();
     test_label_absent_leaves_an_empty_string();
@@ -2601,6 +2764,11 @@ int main(void) {
     test_section_level_errors_stay_fatal();
     test_skipped_vm_section_entry_does_not_alias();
     test_resolve_vcpus();
+    test_retained_overflow_is_not_a_size_problem();          /* #567 */
+    test_truncated_is_reported_separately_from_refusal();    /* #567 */
+    test_a_documented_config_round_trips();                  /* #567 */
+    test_appending_a_vm_to_a_documented_config_writes_back(); /* #567 */
+    test_worst_case_config_fits_the_documented_buffer();      /* #567 */
 
     if (failures == 0) {
         printf("all tests passed\n");
