@@ -55,6 +55,20 @@ static void fsinfo_refresh(hype_fat32_fs_t *fs) {
     uint8_t fsi[SECSZ];
     uint32_t next;
     if (fs->fsinfo_dirty || fs->fsinfo_sector == 0u) return;
+    /*
+     * #584: never re-read the hint once this mount has allocated something.
+     *
+     * The hint is a starting point for a scan, and after the first allocation this mount's own
+     * cursor is the better one -- it knows what it handed out, and the medium may not. Re-reading it
+     * is how the allocator came to scan BACKWARDS into clusters it had already given away, which
+     * with a stale FAT read produced two log files sharing 60 clusters. See allocated_any in the
+     * header for the measurement.
+     *
+     * This is the whole fix: the free/used test still consults the FAT, so on-medium corruption
+     * stays detectable (the #382 chain checks depend on that) and nothing shadows or second-guesses
+     * a read. Only the scan's STARTING POINT stops going backwards.
+     */
+    if (fs->allocated_any) return;
     if (fs->read(fs->ctx, fs->fsinfo_sector, 1u, fsi) != 0 ||
         rd32(fsi + 0) != 0x41615252u) {
         fs->free_count = UNKNOWN;
@@ -139,6 +153,7 @@ static int alloc_cluster(hype_fat32_fs_t *fs, uint32_t *out) {
             fs->next_free = (cl + 1u > fs->max_cluster) ? 2u : (cl + 1u);
             if (fs->free_count != UNKNOWN && fs->free_count != 0u) fs->free_count--;
             fs->fsinfo_dirty = 1;
+            fs->allocated_any = 1; /* #584: our cursor is authoritative from here on */
             *out = cl;
             return 0;
         }
@@ -191,6 +206,7 @@ int hype_fat32_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
     out->root_cluster = rd32(bpb + 0x2C);
     out->fsinfo_sector = rd16(bpb + 0x30);
     out->fsinfo_dirty = 0;
+    out->allocated_any = 0; /* #584: the disk hint is trusted until we allocate our first cluster */
     out->fat_cache_off = 0u;
     out->fat_cache_valid = 0;
     if (out->spc == 0u || out->reserved == 0u || out->num_fats == 0u || out->root_cluster < 2u) {

@@ -52,6 +52,23 @@ typedef struct {
      * prevents a medium with stale read-after-write data from making a cluster
      * allocated earlier in this mount appear free again.
      */
+    /*
+     * #584: has THIS mount allocated a cluster yet?
+     *
+     * Once it has, its own `next_free` is strictly better information than the on-disk FSInfo hint,
+     * and re-reading that hint is how a cross-link happened. Measured: HYPE.LOG and CDTEST.LOG came
+     * to share 60 clusters, with CDTEST's second cluster being 37 -- a cluster HYPE already owned --
+     * even though CDTEST's first was 1188. The allocator had scanned BACKWARDS, because
+     * fsinfo_refresh() re-reads the hint whenever `fsinfo_dirty` is clear, and every append clears
+     * it via fsinfo_flush(). A stale or simply older hint then sends the scan into a region this
+     * mount already handed out, where a stale FAT read -- the same staleness fat_set() already
+     * defends against at write time -- finishes the job by reporting a used cluster as free.
+     *
+     * Freed clusters below the cursor are not lost: the scan still wraps to 2 when it reaches the
+     * end, and free_chain() lowers `next_free` itself, which is an in-mount decision this mount can
+     * trust.
+     */
+    int allocated_any;
     uint32_t fat_cache_off;
     int fat_cache_valid;
     uint8_t fat_cache[HYPE_BLK_SECTOR_SIZE];
