@@ -12819,6 +12819,32 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      */
     unsigned long long pit_irqs_apic = 0;
     unsigned long long pit_apic_refused = 0;
+    /*
+     * #557: PIT channel-0 terminal-count crossings -- the EDGES, not the deliveries.
+     *
+     * Every other counter here is downstream of this one, so without it PITROUTE cannot tell "the
+     * PIT never ticked" from "it ticked and nothing was delivered", and those have nothing in
+     * common: the first is upstream of the whole IOAPIC-versus-PIC question the ticket asks, and
+     * the second is that question. The bare-metal run this ticket is built on read `intr=0` out of
+     * EXHIST and called it "zero interrupts injected" -- but EXHIST's `intr` counts VMEXIT_INTR,
+     * i.e. HOST interrupts that interrupted the guest, and says nothing about injections. So the
+     * measurement the ticket rests on does not mean what it says, and a second run without a
+     * complete funnel would be just as unattributable.
+     *
+     * `coalesced` is what stops this counter being alarming in every healthy run. The PIC's IRR is
+     * ONE BIT per line, so an edge arriving while IRQ0 is already pending is merged -- exactly as
+     * real hardware does. A guest that has stopped acknowledging (finished its test, or idling on
+     * the LAPIC timer instead) therefore leaves `edges` climbing at 100 Hz with nothing delivered,
+     * and that is correct behaviour rather than loss. Measured on tests/micro/intdeliver: 5972
+     * edges against 5 deliveries -- and the 5 arrived at 31,779,432 TSC cycles apart, i.e. 10 ms
+     * on this host, so the RATE was perfect and the other 5967 edges happened after the guest had
+     * finished waiting. Without the coalesced split, that reads as a 99.9% loss.
+     *
+     * So the funnel is: edges = pic_delivered + apic_delivered + apic_refused + coalesced
+     * (+ at most one in flight). A gap with coalesced=0 is the one worth chasing.
+     */
+    unsigned long long pit_edges = 0;
+    unsigned long long pit_coalesced = 0;
     unsigned long long ahci_irqs = 0;    /* M4-6d2: AHCI completion IRQs raised on the guest's line */
     unsigned long long console_chars = 0;
     hype_vt_filter_t dbg_filter;
@@ -14617,11 +14643,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      */
                     unsigned long long ei_ = 0, df_ = 0, wn_ = 0, ov_ = 0;
                     (void)vmm_get_int_diag(kind, ctx, &ei_, &df_, &wn_, &ov_);
-                    hype_debug_print("fw-1 PITROUTE vm%u: pic_delivered=%llu apic_delivered=%llu "
+                    hype_debug_print("fw-1 PITROUTE vm%u: edges=%llu coalesced=%llu "
+                                     "pic_delivered=%llu apic_delivered=%llu "
                                      "apic_refused=%llu | RTE[2]=0x%llx RTE[0]=0x%llx mIMR=0x%x "
                                      "mIRR=0x%x mISR=0x%x | PIT0 mode=%u reload=%u | THIS-VCPU "
                                      "defer=%llu overwrite=%llu [#557/#563]\n",
                                      (unsigned)(vm - g_vms),
+                                     (unsigned long long)pit_edges,
+                                     (unsigned long long)pit_coalesced,
                                      (unsigned long long)pit_irqs,
                                      (unsigned long long)pit_irqs_apic,
                                      (unsigned long long)pit_apic_refused,
@@ -15252,6 +15281,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 /* Channel-0 terminal-count crossings during this advance
                  * are PIT IRQ0 timer edges (M4-6b4). */
                 if (hype_pit_emu_advance(&g_fw_1_pit, ticks) != 0) {
+                    pit_edges++; /* #557: counted BEFORE either raise, so it is the funnel's top */
+                    /* #557: was IRQ0 already pending? Then this edge merges into it, which is what
+                     * a one-bit IRR does on real hardware. Read before the raise, or every edge
+                     * looks coalesced. */
+                    if ((g_fw_1_pic.master.irr & 1u) != 0u) {
+                        pit_coalesced++;
+                    }
                     hype_pic_emu_raise_irq(&g_fw_1_pic.master, 0);
                     /* M4-6b3: the PIT output is also wired to the I/O APIC. The
                      * MADT maps ISA IRQ0 -> GSI2 (the standard PC override), so
@@ -15700,10 +15736,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * point to the instruction FOLLOWING the hlt; hype_svm_vcpu_wake_hlt() does that, and this
          * path never calls it.
          *
-         * Measured on tests/micro/intdeliver: 1153 of 1154 deliveries resumed AT the hlt. Tracked
-         * as #580 rather than patched here, because retiring correctly needs a per-vCPU
-         * "halted at a hlt" fact that this loop does not currently carry, and this is the most
-         * regression-prone path in the tree (#318, #455, #521 all landed in it).
+         * Measured on tests/micro/intdeliver: 1153 of 1154 deliveries resumed AT the hlt.
+         *
+         * FIXED under #580, and NOT the way this comment used to predict. It guessed the fix
+         * needed a per-vCPU "halted at a hlt" fact; it did not. vmm_wake_hlt() already retires
+         * correctly -- the HLT branch's wake block simply sat BELOW the
+         * `productive_exits < HYPE_FW_1_BOOTED_EXITS` continue, so until a guest had taken 1500
+         * non-HLT exits the retire was never considered. Hoisting it was the whole change.
+         *
+         * This path is still the un-retiring one, and that is now correct rather than a gap: it
+         * only runs when the guest is NOT at a hlt exit. A guest sitting at a hlt is served by
+         * the block above, which retires first.
          */
         if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic)) {
             uint8_t pic_vector;
