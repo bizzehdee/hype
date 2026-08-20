@@ -37,7 +37,7 @@ this VM the disk-boot path is never exercised on hardware. Build the artefact wi
 
 ```sh
 tools/make-guest-disk-from-iso.sh disk-images/alpine-virt-3.21.7-x86_64.iso \
-    build/guestdisk/alpine-disk.img
+    rig/guestdisk/alpine-disk.img
 ```
 
 It checks the ISO really is a hybrid image (an MBR partition of type 0xEF plus a GPT — which is why

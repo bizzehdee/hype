@@ -47,7 +47,10 @@ dd if=/dev/zero of="$STICK/hype/disks/vm0.img" bs=1M count="${VDISK_MB:-64}" sta
 # does not start. The artefact is built and control-booted once and then cached, because the builder
 # spends up to two minutes proving in bare QEMU that the image reaches a login prompt, and paying
 # that on every rehearsal would discourage rehearsing.
-VM1_DISK="${VM1_DISK:-build/guestdisk/alpine-disk.img}"
+# rig/, not build/: `make clean` is `rm -rf build/`, and the README's own build line for a stick is
+# `make clean && make all` -- so caching this under build/ meant the artefact was deleted by the very
+# command that precedes every stage, and the 2-minute control boot paid again each time.
+VM1_DISK="${VM1_DISK:-rig/guestdisk/alpine-disk.img}"
 if [ ! -f "$VM1_DISK" ]; then
     echo "building vm1's boot disk once (control-booted, then cached at $VM1_DISK)"
     tools/make-guest-disk-from-iso.sh "$ISO" "$VM1_DISK" || {
