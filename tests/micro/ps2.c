@@ -232,14 +232,28 @@ void micro_main(uint64_t zero_page_gpa) {
                 }
                 micro_puts("\n");
             }
-            if (g_all_n != 0ull && g_mouse_n < 3ull) {
+            /*
+             * TWO different failures reach here and the first version of this could only ever
+             * report one of them. This test provokes a 0xFA ACK itself (the 0xD4/0xF4 aux-enable
+             * above), so g_all_n is NEVER zero -- which made the "no scripted input" branch
+             * below unreachable, and made a run with no input script report an AUX_DATA defect
+             * that had not happened. hype set the bit correctly on the one byte it had.
+             *
+             * The distinguishing question is whether AUX was set on ANY byte, not how many
+             * bytes arrived. A wrong verdict is worse than no verdict: it sends the reader to
+             * the wrong subsystem, and this suite exists to be believed.
+             */
+            if (g_all_n != 0ull && g_mouse_n == 0ull) {
                 micro_fail(NAME, "bytes arrived but AUX_DATA (status bit 5) never marked any of them "
                                  "as mouse bytes -- see the status/data pairs above; a guest cannot "
                                  "tell the two devices apart without that bit");
                 micro_halt();
             }
-            micro_fail(NAME, "scripted input did not arrive -- check the VM has an input script "
-                             "with sendkey and sendmouse directives");
+            micro_fail(NAME, "scripted input did not arrive in full -- one keyboard byte and a "
+                             "3-byte mouse packet are needed, and the counts above say what came "
+                             "(a lone 0xFA is this test's own command ACK, not input); check the "
+                             "VM has an input script at \\input\\vmN.txt with sendkey and "
+                             "sendmouse directives");
             micro_halt();
         }
     }

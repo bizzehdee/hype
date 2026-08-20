@@ -155,7 +155,19 @@ run_one() {   # $1 = test name
             ;;
     esac
 
-    HYPE_CFG="$cfg" HYPE_KERNELS="build/micro/$name.bin" HYPE_DISK="$disk" \
+    # A test that needs input from OUTSIDE the guest declares it by having a script at
+    # tests/micro/input/<name>.txt, and the runner stages it at \input\vm0.txt. Derived from the
+    # file's existence rather than a name list, so a new test gets input by adding a file.
+    #
+    # This was missing, and its absence was invisible in the worst way: ps2 could not pass in the
+    # default run at all, because its script existed in the repo and was never shipped. The test
+    # said out loud that it needed one; nothing carried it across.
+    local inputs=""
+    if [ -f "tests/micro/input/$name.txt" ]; then
+        inputs="tests/micro/input/$name.txt"
+    fi
+
+    HYPE_CFG="$cfg" HYPE_KERNELS="build/micro/$name.bin" HYPE_DISK="$disk" HYPE_INPUTS="$inputs" \
         timeout $((SECS + 150)) tools/run-guest.sh "$ISO" "micro-$name" "$SECS" >/dev/null 2>&1
 
     report "$log" "$name" || return 1
@@ -203,9 +215,25 @@ if [ "${1:-}" = "--suite" ]; then
         kernels="$kernels build/micro/$n.bin"
     done
     tag="suite-$(basename "$cfg" .cfg)"
+    # HYPE_INPUTS is POSITIONAL -- the first path becomes \input\vm0.txt, the second vm1.txt. So a
+    # VM with no script of its own still needs a slot, or every VM after it is handed the wrong
+    # script. An empty placeholder holds the position; the tests that read no input cannot tell an
+    # empty script from an absent one, and the ones that do read input get theirs.
+    inputs=""
+    have_input=0
+    : > "$OUTDIR/micro-noinput.txt"
+    for n in $names; do
+        if [ -f "tests/micro/input/$n.txt" ]; then
+            inputs="$inputs tests/micro/input/$n.txt"
+            have_input=1
+        else
+            inputs="$inputs $OUTDIR/micro-noinput.txt"
+        fi
+    done
+    [ "$have_input" = "1" ] || inputs=""
     killall -9 qemu-system-x86_64 2>/dev/null
     sleep 1
-    HYPE_CFG="$cfg" HYPE_KERNELS="$kernels" \
+    HYPE_CFG="$cfg" HYPE_KERNELS="$kernels" HYPE_INPUTS="$inputs" \
         timeout $((SECS + 180)) tools/run-guest.sh "$ISO" "$tag" "$SECS" >/dev/null 2>&1
     # shellcheck disable=SC2086
     report "$OUTDIR/run-$tag.log" $names
@@ -217,13 +245,15 @@ fi
 # EXCLUSIONS ARE NAMED WITH A REASON, and there are only two kinds:
 #
 #   faulter  exists to fail (#538). Including it would make a healthy run look broken.
-#   pflash   FAILS TODAY on a real hype defect, #556: a guest CFI read after a command returns
-#            array data instead of the synthesized response. The test is correct and its failure is
-#            the bug report -- run it explicitly with `run-micro.sh pflash` to see it. It is excluded
-#            so the default run stays a signal, and this line is deleted when #556 is fixed.
 #
 # A silent exclusion would be worse than a failing default: it would make the suite claim coverage it
-# does not have. Both are printed, so a run says what it did not do.
+# does not have. Every exclusion is printed, so a run says what it did not do.
+#
+# pflash used to be listed here for #556 -- "a guest CFI read after a command returns array data".
+# There was no such defect: the model returns 0 because hype_pflash_reset() clears the status
+# register, which OVMF's probe depends on, and the test was asserting the wrong thing. pflash is
+# in the default run and passes. Recorded rather than deleted because an exclusion citing a defect
+# that does not exist removes real coverage for as long as nobody rechecks it.
 MICRO_EXCLUDE_DEFAULT="faulter"
 
 if [ $# -eq 0 ]; then
