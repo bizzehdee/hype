@@ -43,7 +43,7 @@ OUTDIR=disk-images
 # assuming a QEMU-shaped world.
 needs_uplink() {
     case "$1" in
-        netdns|netgoal) return 0 ;;
+        netdns|netgoal|e1000dns) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -71,7 +71,16 @@ vcpus = 1
 mem_mb = $MEM_MB
 boot = kernel
 kernel = \\EFI\\hype\\micro\\$1.bin
-os_hint = none
+CFG
+    # os_hint is emitted ONCE, here, because it selects the NIC frontend (#82) and a duplicate key is
+    # a parse error -- correctly so. Appending a second `os_hint` to a base that already had one made
+    # hype refuse the whole config ("parse error status=4 line=17") and the guest booted with no
+    # config at all, which presented as a test that produced no output whatsoever.
+    case "$1" in
+        e1000dns) printf 'os_hint = windows\n' >> "$2" ;;
+        *) printf 'os_hint = none\n' >> "$2" ;;
+    esac
+    cat >> "$2" <<CFG
 CFG
     # #550: a storage test needs a REAL backing file, or it is testing its own scaffolding.
     # The disk is declared here rather than in the test so the same artifact can be aimed at a
@@ -83,7 +92,7 @@ CFG
     # #81: the virtio-net adapter exists only when the VM asks for a network (plan.md 6e's default
     # is `none`, so a test that needs a NIC has to say so, exactly as bochsvbe does for a display).
     case "$1" in
-        virtionet|netdns) printf 'net_mode = nat\n' >> "$2" ;;
+        virtionet|netdns|netgoal|netpeer|e1000dns) printf 'net_mode = nat\n' >> "$2" ;;
     esac
     case "$1" in
         virtioblk|atadisk|ahci) cat >> "$2" <<CFG
@@ -354,7 +363,16 @@ fi
 # register, which OVMF's probe depends on, and the test was asserting the wrong thing. pflash is
 # in the default run and passes. Recorded rather than deleted because an exclusion citing a defect
 # that does not exist removes real coverage for as long as nobody rechecks it.
-MICRO_EXCLUDE_DEFAULT="faulter"
+#   netpeer  needs TWO VMs to have anything to talk to, and a `self=`/`peer=` cmdline the per-test
+#            path does not generate. Run it as a suite: `--suite tests/micro/suite-peers.cfg`, and
+#            `suite-peers-denied.cfg` for the isolation case whose healthy result is a failure.
+#   netgoal  the same, and it is the whole-goal config: two VMs each pinging www.google.com and each
+#            other. `--suite tests/micro/suite-goal.cfg`.
+#
+# Both are EXCLUDED RATHER THAN LEFT TO FAIL, because a test that cannot pass in the default run is
+# noise that trains a reader to ignore the run -- and they are named here with how to run them, so
+# the exclusion does not hide them either.
+MICRO_EXCLUDE_DEFAULT="faulter netpeer netgoal"
 
 if [ $# -eq 0 ]; then
     all=$(sed -n 's/^MICRO_NAMES := //p' Makefile | tr ' ' '\n' | grep -v '^$')

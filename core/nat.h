@@ -45,9 +45,22 @@
 #define HYPE_NAT_MAX_CONN 256u
 
 /*
- * The port/id range hype substitutes from. Deliberately high and away from the registered range so
- * a translated source port cannot be mistaken for a service, and sized so the cursor wraps long
- * before it collides with anything a host stack would pick for itself.
+ * The port/id range hype substitutes from. Deliberately high and away from the registered range so a
+ * translated source port cannot be mistaken for a service.
+ *
+ * THE RANGE IS PARTITIONED PER VM, and that is a correctness requirement rather than tidiness.
+ *
+ * The tables are per VM (see HYPE_NAT_MAX_CONN) but the PORT SPACE is not: every guest is masqueraded
+ * behind one uplink address, so the translated port is the ONLY thing that distinguishes one guest's
+ * reply from another's. Two VMs allocating from their own cursors both picked 49152, the inbound
+ * lookup took the first table that matched, and one guest received the other's DNS replies -- a
+ * cross-VM misdelivery, found by running two guests at once (a unit test that shared one table
+ * between two "guests" could not see it, and did not).
+ *
+ * Partitioning by VM index gives uniqueness BY CONSTRUCTION: no shared allocator, no lock, and
+ * nothing to get wrong at runtime. Each VM's slice is exactly HYPE_NAT_MAX_CONN wide, so a guest can
+ * never exhaust its ports before it exhausts its table -- the two limits coincide instead of one
+ * masking the other.
  */
 #define HYPE_NAT_PORT_BASE 49152u
 #define HYPE_NAT_PORT_COUNT 16384u
@@ -75,9 +88,19 @@ typedef struct {
     unsigned int fin_from_remote;
 } hype_nat_conn_t;
 
+/*
+ * How many VMs the partitioned range supports. Beyond this, slices would overlap and the
+ * cross-VM misdelivery above would return -- so a VM past the limit is refused NAT and told so,
+ * rather than silently sharing another VM's ports.
+ */
+#define HYPE_NAT_MAX_VMS (HYPE_NAT_PORT_COUNT / HYPE_NAT_MAX_CONN)
+
 typedef struct {
     hype_nat_conn_t conn[HYPE_NAT_MAX_CONN];
-    /* Allocation cursor, so successive flows do not all get the same port after an expiry. */
+    /* The first translated port this VM may use -- its slice of the shared port space. */
+    uint16_t port_base;
+    /* Allocation cursor WITHIN the slice, so successive flows do not all get the same port after an
+     * expiry: a remote end may still be sending to a just-released one. */
     uint16_t next_port;
     unsigned long long out_translated;
     unsigned long long out_dropped_malformed;
@@ -91,7 +114,17 @@ typedef struct {
     unsigned long long conns_expired;
 } hype_nat_t;
 
-void hype_nat_reset(hype_nat_t *nat);
+/*
+ * `vm_index` selects this VM's slice of the translated-port space. Passed rather than defaulted
+ * because there is no safe default: two tables sharing a slice is the cross-VM misdelivery described
+ * above, and a caller that has to supply the index cannot forget that the slices must differ.
+ *
+ * Returns 0 on success, -1 if `vm_index` is at or past HYPE_NAT_MAX_VMS -- in which case the table is
+ * left EMPTY and unusable rather than aliased onto another VM's ports. The caller must report that:
+ * a guest with no NAT is a guest with no network, and it must not look like one that simply has no
+ * traffic.
+ */
+int hype_nat_reset(hype_nat_t *nat, unsigned int vm_index);
 
 /* The standard 16-bit one's-complement checksum over `len` bytes. Exposed because both the IPv4
  * header and ICMP use it directly and the tests check it against known values. */

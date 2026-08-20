@@ -9,6 +9,7 @@
 #include "../../../devices/atapi.h"
 #include "../../../devices/bochs_vbe.h"
 #include "../../../core/virtio_net_ring.h" /* NET-2 (#81) */
+#include "../../../core/e1000_dev_ring.h"   /* NET-3 (#82) */
 #include "../../../devices/fw_cfg.h"
 #include "../../../devices/pci.h"
 #include "../../../devices/cmos.h"
@@ -267,6 +268,14 @@ uint32_t hype_vmx_vcpu_exit_exception_error_code(hype_vcpu_ctx_t *ctx);
  * Exempt from unit testing (this whole file is): it reads the live VMCS. Everything it calls is
  * tested in isolation -- core/tests/test_virtio_net.c and test_virtio_net_ring.c.
  */
+/* NET-3 (#82): the guest e1000's register window. A write to TDT is the transmit doorbell. Exempt
+ * from unit testing (this whole file is); everything it calls is tested in isolation. */
+int hype_vmx_vcpu_handle_e1000_dev_npf(hype_vcpu_ctx_t *ctx, hype_e1000_dev_t *dev,
+                                      const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                      hype_virtio_net_tx_fn sink, void *user, uint8_t *scratch,
+                                      unsigned int scratch_len,
+                                      hype_virtio_net_ring_stats_t *stats, const uint8_t *insn);
+
 int hype_vmx_vcpu_handle_virtio_net_npf(hype_vcpu_ctx_t *ctx, hype_virtio_net_t *dev,
                                        const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
                                        hype_virtio_net_tx_fn sink, void *user, uint8_t *scratch,

@@ -29,6 +29,8 @@
 #include "../core/host_pci.h"
 #include "../core/e1000.h"
 #include "../core/virtio_net_ring.h" /* NET-2 (#81) */
+#include "../core/e1000_dev_ring.h"   /* NET-3 (#82) */
+#include "../core/guest_nic.h"        /* the one interface the forwarding plane sees */
 #include "../core/nat.h"            /* NET-4 (#83) */
 #include "../core/arp.h"
 #include "../core/xhci.h"
@@ -815,6 +817,19 @@ typedef struct hype_fw_vm {
      * that reports one VM's traffic under another's name.
      */
     hype_virtio_net_t virtio_net;
+    /*
+     * NET-3 (#82): the alternative frontend, for a guest with no inbox virtio-net driver. Exactly
+     * one of the two is presented per VM, chosen from `os_hint` -- the same split §6a uses for
+     * storage, one layer up. Both are allocated; presenting is what differs.
+     */
+    hype_e1000_dev_t e1000_net;
+    /*
+     * WHICH one this VM has. The forwarding plane -- proxy ARP, address learning, the on-link check,
+     * NAPT, the peer mailbox -- is identical for both, so it goes through this rather than branching
+     * at every site. `nic_ops` being NULL means this VM has no NIC, which is the default.
+     */
+    const hype_guest_nic_ops_t *nic_ops;
+    void *nic_dev;
     uint8_t vnet_scratch[HYPE_VIRTIO_NET_MAX_FRAME_LEN];
     hype_virtio_net_ring_stats_t vnet_stats;
     /*
@@ -5435,10 +5450,13 @@ static void fw_1_vnet_router_mac(hype_fw_vm_t *vm) {
     vm->vnet_router_mac[5] = (uint8_t)(idx & 0xFFu);
 }
 
-/* Hands one frame to the guest's receive ring. Caller must hold this VM's device lock. */
+/* Hands one frame to the guest's receive path, whichever NIC it has. Caller must hold this VM's
+ * device lock. */
 static int fw_1_vnet_to_guest(hype_fw_vm_t *vm, const uint8_t *frame, unsigned int len) {
-    return hype_virtio_net_deliver_rx(&vm->virtio_net, &g_fw_1_dma_map, frame, len,
-                                      &vm->vnet_stats);
+    if (vm->nic_ops == 0) {
+        return -1;
+    }
+    return vm->nic_ops->deliver_rx(vm->nic_dev, &g_fw_1_dma_map, frame, len, &vm->vnet_stats);
 }
 
 /*
@@ -5849,6 +5867,43 @@ static unsigned int fw_1_uplink_pump(hype_vmm_kind_t kind) {
         }
     }
     return delivered;
+}
+
+static int vmm_handle_virtio_net_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_vm_t *vm,
+                                     const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                     const uint8_t *insn);
+
+/*
+ * #82: the guest NIC's MMIO, whichever frontend and whichever vendor. Four combinations behind one
+ * call, so the two dispatch chains each have a single site to add rather than two.
+ *
+ * The WINDOW SIZE differs between frontends (virtio 0x4000, e1000 0x20000), so the caller's range
+ * check has to come from the VM's frontend too -- see fw_1_nic_window_bytes().
+ */
+static int vmm_handle_guest_nic_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_vm_t *vm,
+                                    const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                    const uint8_t *insn) {
+    if (vm->nic_ops == &hype_guest_nic_e1000) {
+        return kind == HYPE_VMM_KIND_VMX
+                   ? hype_vmx_vcpu_handle_e1000_dev_npf(ctx, &vm->e1000_net, dma_map,
+                                                        mmio_base_phys, fw_1_vnet_tx_sink, vm,
+                                                        vm->vnet_scratch,
+                                                        (unsigned int)sizeof(vm->vnet_scratch),
+                                                        &vm->vnet_stats, insn)
+                   : hype_svm_vcpu_handle_e1000_dev_npf(ctx, &vm->e1000_net, dma_map,
+                                                        mmio_base_phys, fw_1_vnet_tx_sink, vm,
+                                                        vm->vnet_scratch,
+                                                        (unsigned int)sizeof(vm->vnet_scratch),
+                                                        &vm->vnet_stats, insn);
+    }
+    return vmm_handle_virtio_net_npf(kind, ctx, vm, dma_map, mmio_base_phys, insn);
+}
+
+/* The BAR window this VM's NIC decodes. Two frontends, two sizes; a range check using the wrong one
+ * either misses faults in the tail of the e1000's window or claims faults that are not the NIC's. */
+static unsigned int fw_1_nic_window_bytes(const hype_fw_vm_t *vm) {
+    return (vm->nic_ops == &hype_guest_nic_e1000) ? HYPE_E1000_DEV_BAR_SIZE
+                                                  : HYPE_VIRTIO_BLK_BAR_SIZE;
 }
 
 static int vmm_handle_virtio_net_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_vm_t *vm,
@@ -9020,7 +9075,23 @@ static void fw_1_bochs_vbe_present(hype_fw_vm_t *vm) {
  * prefix QEMU uses, so it cannot collide with a real vendor's assignment, and the low bytes carry
  * the VM index.
  */
-static void fw_1_virtio_net_pci_present(hype_fw_vm_t *vm) {
+/*
+ * NET-3 (#82): WHICH frontend this VM gets, derived from `os_hint` exactly as §6a derives the
+ * storage frontend -- Windows gets AHCI and an e1000 because it has inbox drivers for both; Linux
+ * and BSD get virtio for both because theirs are better and inbox too.
+ *
+ * Derived rather than configured, for §6a's own reason: each OS has exactly one sensible answer, so a
+ * key would be a key whose only correct value is the one hype can work out. That is the opposite of
+ * `display` (decision 49), where the operator genuinely has a choice.
+ */
+static int fw_1_net_frontend_is_e1000(unsigned int idx) {
+    if (idx >= g_hype_cfg.vm_count) {
+        return 0;
+    }
+    return (g_hype_cfg.vms[idx].os_hint == HYPE_CFG_OS_WINDOWS) ? 1 : 0;
+}
+
+static void fw_1_guest_nic_present(hype_fw_vm_t *vm) {
     unsigned int idx = (unsigned int)(vm - g_vms);
     uint8_t *config;
     uint8_t mac[HYPE_VIRTIO_NET_MAC_BYTES];
@@ -9039,12 +9110,56 @@ static void fw_1_virtio_net_pci_present(hype_fw_vm_t *vm) {
     mac[4] = (uint8_t)((idx >> 8) & 0xFFu);
     /* +1 so VM 0 never gets ...:00, which reads like an unset address in a packet capture. */
     mac[5] = (uint8_t)((idx & 0xFFu) + 1u);
-    hype_virtio_net_reset(&vm->virtio_net, mac);
+
+    /*
+     * THE SAME MAC WHICHEVER FRONTEND, because the forwarding plane identifies a guest by its source
+     * address. Changing `os_hint` changes which device the guest sees; it must not change who the
+     * guest IS to every conntrack entry and peer rule.
+     */
+    if (fw_1_net_frontend_is_e1000(idx)) {
+        hype_e1000_dev_reset(&vm->e1000_net, mac);
+        vm->nic_ops = &hype_guest_nic_e1000;
+        vm->nic_dev = &vm->e1000_net;
+    } else {
+        hype_virtio_net_reset(&vm->virtio_net, mac);
+        vm->nic_ops = &hype_guest_nic_virtio;
+        vm->nic_dev = &vm->virtio_net;
+    }
     /* #83: this VM's forwarding state, reset with the device. The router MAC is derived here rather
      * than at first use so it is stable and printable from the moment the NIC exists. */
-    hype_nat_reset(&vm->nat);
+    /*
+     * #83: this VM's slice of the translated-port space, selected by its index. Two VMs sharing a
+     * slice is a cross-VM misdelivery -- one guest receiving the other's replies -- which is what
+     * happened before the range was partitioned, so the failure to get a slice is reported rather
+     * than absorbed.
+     */
+    if (hype_nat_reset(&vm->nat, idx) != 0) {
+        hype_debug_print("fw-1[vm %u]: NO NAT -- the translated-port space supports %u VMs and this "
+                         "is VM %u, so there is no slice left. This guest's NIC will forward "
+                         "NOTHING outbound; guest-to-guest still works. [#83]\n",
+                         idx, (unsigned)HYPE_NAT_MAX_VMS, idx);
+    }
     fw_1_vnet_router_mac(vm);
     vm->vnet_guest_known = 0u;
+
+    if (fw_1_net_frontend_is_e1000(idx)) {
+        /*
+         * The e1000 is a far simpler presentation than virtio's: one BAR of registers and no
+         * capability chain, because the driver finds everything at architectural offsets. That is
+         * also why Windows can drive it with no help -- there is nothing to discover.
+         */
+        hype_pci_add_device(&vm->pci, dev, HYPE_E1000_DEV_PCI_VENDOR, HYPE_E1000_DEV_PCI_DEVICE,
+                            HYPE_E1000_DEV_PCI_CLASS_BASE, HYPE_E1000_DEV_PCI_CLASS_SUB,
+                            HYPE_E1000_DEV_PCI_CLASS_INTERFACE);
+        hype_pci_set_bar_size(&vm->pci, dev, 0, HYPE_E1000_DEV_BAR_SIZE);
+        hype_pci_set_interrupt(&vm->pci, dev, 1, 10);
+        hype_debug_print("fw-1[vm %u]: e1000 presented at PCI dev %u, BAR0 %u bytes, MAC "
+                         "%02x:%02x:%02x:%02x:%02x:%02x (net_mode = nat, os_hint = windows) "
+                         "[#82]\n",
+                         idx, dev, HYPE_E1000_DEV_BAR_SIZE, mac[0], mac[1], mac[2], mac[3], mac[4],
+                         mac[5]);
+        return;
+    }
 
     hype_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_NET_PCI_VENDOR_ID,
                         HYPE_VIRTIO_NET_PCI_DEVICE_ID, HYPE_VIRTIO_NET_PCI_CLASS_BASE,
@@ -9306,7 +9421,7 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      */
     fw_1_setup_virtio_blk(vm);
     fw_1_bochs_vbe_present(vm); /* #565: only when display = bochs */
-    fw_1_virtio_net_pci_present(vm); /* #81: only when net_mode = nat */
+    fw_1_guest_nic_present(vm); /* #81/#82: only when net_mode = nat */
     if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
         /* AFTER fw_1_setup_virtio_blk: that is what fills in the capacity. Attaching before it
          * snapshots total_sectors == 0, and a zero-sector LBA disk makes libata fall back to CHS and
@@ -9808,13 +9923,13 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
         }
     }
 
-    /* #81: the virtio-net BAR. Served from THIS dispatch, so a guest whose network driver probes on
-     * any vCPU is answered there -- #511's re-fault loop was exactly this window missing from the
-     * AP's chain for virtio-blk. */
+    /* #81/#82: the guest NIC's BAR, whichever frontend. Served from THIS dispatch, so a guest whose
+     * network driver probes on any vCPU is answered there -- #511's re-fault loop was exactly this
+     * window missing from the AP's chain for virtio-blk. */
     if (vm->shared_vnet_mapped && npf.guest_phys_addr >= vm->shared_vnet_bar &&
-        npf.guest_phys_addr < vm->shared_vnet_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
-        if (vmm_handle_virtio_net_npf(kind, ctx, vm, &g_fw_1_dma_map,
-                                      (uint64_t)vm->shared_vnet_bar, insn) == 0) {
+        npf.guest_phys_addr < vm->shared_vnet_bar + fw_1_nic_window_bytes(vm)) {
+        if (vmm_handle_guest_nic_npf(kind, ctx, vm, &g_fw_1_dma_map,
+                                     (uint64_t)vm->shared_vnet_bar, insn) == 0) {
             return HYPE_FW_DEV_VNET;
         }
     }
@@ -14714,7 +14829,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             int vblk_pending = (vblk_mapped && g_fw_1_vblk.isr_status != 0u);
             int nvme_present = (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME);
             int nvme_pending = (nvme_present && hype_nvme_irq_pending(&vm->disk[0].nvme));
-            int vnet_pending = (vm->shared_vnet_mapped && vm->virtio_net.isr_status != 0u);
+            /*
+             * #82: whichever frontend, asked the way that frontend reports a pending interrupt.
+             * virtio has an ISR byte; the e1000 has ICR masked by IMS. Asking the wrong one of a VM
+             * would leave its NIC's interrupts undelivered while every counter looked healthy.
+             */
+            int vnet_pending = 0;
+            if (vm->shared_vnet_mapped) {
+                if (vm->nic_ops == &hype_guest_nic_e1000) {
+                    vnet_pending = hype_e1000_dev_irq_pending(&vm->e1000_net);
+                } else {
+                    vnet_pending = (vm->virtio_net.isr_status != 0u);
+                }
+            }
             int line_present = (vblk_mapped || nvme_present || vm->shared_vnet_mapped);
 
             if (vblk_pending || nvme_pending || vnet_pending) {
@@ -15731,23 +15858,32 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (!vm->shared_vnet_mapped &&
                     vm->pci.devices[HYPE_FW_1_PCI_DEV_VIRTIO_NET].in_use &&
                     hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_NET)) {
+                    /* virtio puts its regions in BAR4 (§ the transport's own choice); the e1000's
+                     * registers are BAR0, which is architectural. Reading the wrong index gives 0
+                     * and the window never latches, so the NIC simply never answers. */
+                    unsigned int bar_idx =
+                        (vm->nic_ops == &hype_guest_nic_e1000) ? 0u : HYPE_FW_1_VIRTIO_BAR_INDEX;
                     uint64_t nbar = hype_pci_get_bar_value(&g_fw_1_pci,
-                                                           HYPE_FW_1_PCI_DEV_VIRTIO_NET,
-                                                           HYPE_FW_1_VIRTIO_BAR_INDEX);
+                                                           HYPE_FW_1_PCI_DEV_VIRTIO_NET, bar_idx);
                     if (nbar != 0) {
                         vm->shared_vnet_bar = nbar;
                         vm->shared_vnet_mapped = 1u;
                         /* Bus mastering mirrored in at the same moment (#372): a NIC reaches its
                          * rings by mastering the bus, so the model must not act on a notify before
                          * the guest has enabled it. */
-                        hype_virtio_net_set_bus_master(
-                            &vm->virtio_net,
-                            hype_pci_bus_master_enabled(&g_fw_1_pci,
-                                                        HYPE_FW_1_PCI_DEV_VIRTIO_NET));
-                        hype_debug_print("fw-1: virtio-net BAR%u enabled at guest-physical 0x%llx "
-                                          "-- routing its MMIO to the virtio-net model now [#81]\n",
-                                          (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX,
-                                          (unsigned long long)nbar);
+                        {
+                            int bm = hype_pci_bus_master_enabled(&g_fw_1_pci,
+                                                                 HYPE_FW_1_PCI_DEV_VIRTIO_NET);
+                            if (vm->nic_ops == &hype_guest_nic_e1000) {
+                                hype_e1000_dev_set_bus_master(&vm->e1000_net, bm);
+                            } else {
+                                hype_virtio_net_set_bus_master(&vm->virtio_net, bm);
+                            }
+                        }
+                        hype_debug_print("fw-1: guest NIC (%s) BAR%u enabled at guest-physical "
+                                          "0x%llx -- routing its MMIO to the model now [#81 #82]\n",
+                                          (vm->nic_ops != 0) ? vm->nic_ops->name : "none",
+                                          bar_idx, (unsigned long long)nbar);
                     }
                 }
                 /*
@@ -16167,9 +16303,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             if (vm->shared_vnet_mapped) {
                 vmm_get_last_npf(kind, ctx, &npf);
                 if (npf.guest_phys_addr >= vm->shared_vnet_bar &&
-                    npf.guest_phys_addr < vm->shared_vnet_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
-                    if (vmm_handle_virtio_net_npf(kind, ctx, vm, &g_fw_1_dma_map,
-                                                  (uint64_t)vm->shared_vnet_bar, insn) == 0) {
+                    npf.guest_phys_addr < vm->shared_vnet_bar + fw_1_nic_window_bytes(vm)) {
+                    if (vmm_handle_guest_nic_npf(kind, ctx, vm, &g_fw_1_dma_map,
+                                                 (uint64_t)vm->shared_vnet_bar, insn) == 0) {
                         continue;
                     }
                     /* #550's rule: say WHICH access. The offset alone cannot distinguish an

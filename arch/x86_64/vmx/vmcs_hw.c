@@ -2947,6 +2947,53 @@ int hype_vmx_vcpu_handle_virtio_net_npf(hype_vcpu_ctx_t *ctx, hype_virtio_net_t 
     return 0;
 }
 
+
+/*
+ * NET-3 (#82): the VMX half of the guest e1000's register window. Mirror of
+ * hype_svm_vcpu_handle_e1000_dev_npf, with the same rule about TDT being the doorbell.
+ */
+int hype_vmx_vcpu_handle_e1000_dev_npf(hype_vcpu_ctx_t *ctx, hype_e1000_dev_t *dev,
+                                      const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                      hype_virtio_net_tx_fn sink, void *user, uint8_t *scratch,
+                                      unsigned int scratch_len,
+                                      hype_virtio_net_ring_stats_t *stats, const uint8_t *insn) {
+    struct vmx_mmio_access m;
+    uint32_t off;
+
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
+    if (vmx_mmio_begin_insn((struct hype_vcpu_ctx *)ctx, mmio_base_phys, HYPE_E1000_DEV_BAR_SIZE,
+                            insn, &m) != 0) {
+        return -1;
+    }
+    off = m.offset;
+
+    if (m.decoded.is_write) {
+        uint32_t cur = 0;
+        uint32_t value;
+        if (m.decoded.mem_is_dst &&
+            hype_e1000_dev_reg_read(dev, off, m.decoded.size_bytes, &cur) != 0) {
+            return -1;
+        }
+        value = vmx_mmio_store_val(&m, cur);
+        if (hype_e1000_dev_reg_write(dev, off, m.decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+        /* TDT is the transmit doorbell -- see the SVM handler's own note on what missing it costs. */
+        if (off == HYPE_E1000_REG_TDT) {
+            (void)hype_e1000_dev_drain_tx(dev, dma_map, sink, user, scratch, scratch_len, stats);
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_e1000_dev_reg_read(dev, off, m.decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        vmx_mmio_finish_read(&m, value);
+    }
+
+    vmx_mmio_end(&m);
+    return 0;
+}
+
 /* VMX guest GDTR/IDTR setup (VMX-2, INT): mirrors of hype_svm_vcpu_set_gdt/idt.
  * Real interrupt delivery reloads CS from the guest GDT and vectors through the
  * guest IDT, so both must point at real tables (VMWRITE base+limit). */

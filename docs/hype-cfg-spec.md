@@ -162,7 +162,7 @@ as the default display name.
 | `kernel` | path | (none) | required when `boot = kernel`, and rejected otherwise — a raw guest kernel image loaded straight into guest RAM (§5.4b, #535) |
 | `cmdline` | free text | (none) | kernel command line, `boot = kernel` only and rejected otherwise (§5.4b, #546). Absent, empty and set are three distinct states |
 | `firmware` | `uefi` \| `legacy` | `uefi` | |
-| `os_hint` | `windows`\|`linux`\|`bsd`\|`none` | `none` | drives `bus` defaults (§5.6) |
+| `os_hint` | `windows`\|`linux`\|`bsd`\|`none` | `none` | drives `bus` defaults (§5.6) **and the NIC frontend** (§5.5, #82): `windows` gets an e1000, everything else virtio-net |
 | `disks` | `<disk-id>` list | (empty) | ordered hard disks (`type=disk` `[disk.*]`); **0..N**, mixed bus allowed (§5.7) |
 | `cdroms` | `<disk-id>` list | (empty) | ordered optical drives (`type=cdrom` `[disk.*]`); **0..N** (§5.4) |
 | `install_media` | path | (none) | sugar: an implicit boot `cdrom` (§5.4) — *which* ISO |
@@ -318,22 +318,44 @@ segment — put 3 VMs' NICs on the same `[switch.lan0]` and those 3 (and only th
 `net_peers` → the legacy pairwise point-to-point forward). Zero NICs = no `nics`
 (a network-less VM). L3 routing *between* switches is deferred (future NET-7).
 
-**What `net_mode = nat` does today (#81).** It presents the VM a **virtio-net**
-adapter (PCI `0x1AF4:0x1041`, class network/ethernet, on PCI device 4 in BAR4),
-with a MAC derived from the VM index and stable for the life of the VM — the
-forwarding plane identifies a guest by its source address, so a MAC that moved
-between boots would look like a different guest to every mapping. The default
-stays `none`, and a VM with `net_mode = none` has **no** virtual NIC at all,
-rather than a NIC with no uplink: an offline install must not depend on the host
-NIC driver or the NAT path working, and a device the operator did not ask for
-must not appear (the same rule as `display`).
+**What `net_mode = nat` does today (#81/#82).** It presents the VM one virtual
+NIC, on PCI device 4, with a MAC derived from the VM index and stable for the life
+of the VM — the forwarding plane identifies a guest by its source address, so a
+MAC that moved between boots would look like a different guest to every mapping.
 
-Only ONE feature is offered beyond the modern-virtio baseline: `VIRTIO_NET_F_MAC`.
-Checksum and segmentation offloads are deliberately absent — hype would have to
-perform what it claimed to offload, and the NAT path already has to fix
-checksums up after rewriting addresses, so advertising an offload hype does not
-do hands the guest a frame the wire rejects. The control queue (and with it
-multiqueue and MAC filtering) is also absent.
+**Which** NIC is derived from `os_hint`, mirroring §5.6's storage split exactly:
+
+| `os_hint` | NIC | why |
+|---|---|---|
+| `windows` | **e1000** (`8086:100E`, 82540EM, registers in BAR0) | Windows has driven an 82540EM out of the box for twenty years; virtio-net needs virtio-win injected |
+| anything else | **virtio-net** (`1AF4:1041`, regions in BAR4) | inbox on Linux and BSD, and the better device |
+
+Derived rather than configured, for §5.6's own reason: each OS has exactly one
+sensible answer, so a key's only correct value would be the one hype can work
+out. That is the opposite of `display` (decision 49), where the operator
+genuinely has a choice. **The MAC is the same either way** — changing `os_hint`
+changes which device the guest sees, not who the guest *is* to every conntrack
+entry and peer rule.
+
+The default stays `none`, and a VM with `net_mode = none` has **no** virtual NIC
+at all, rather than a NIC with no uplink: an offline install must not depend on
+the host NIC driver or the NAT path working, and a device the operator did not
+ask for must not appear (the same rule as `display`).
+
+Both frontends are deliberately minimal, and the omissions are the same for both:
+**no checksum or segmentation offload** (hype would have to perform what it
+claimed, and the NAT path already recomputes checksums after rewriting
+addresses — advertising an offload hype does not do hands the guest a frame the
+wire rejects), **no multicast filter** (hype delivers what the forwarding plane
+decided belongs to this guest, so a filter could only discard frames hype had
+already decided to deliver), **no VLAN**, and **no MSI-X** (all 24 IO-APIC pins
+are allocated — decision 51 — so a single shared legacy line is what the
+arrangement supports). virtio-net additionally offers no control queue, and with
+it no multiqueue or MAC programming.
+
+Both sit behind one interface (`hype_guest_nic_ops_t`), so everything above the
+device — proxy ARP, address learning, the on-link check, NAPT, the peer mailbox —
+is written once and does not know which NIC a guest has.
 
 **Where frames go (#83/#84/#85).** hype routes them:
 

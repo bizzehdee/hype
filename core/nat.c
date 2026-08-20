@@ -25,11 +25,11 @@ static void ip_copy(uint8_t dst[4], const uint8_t src[4]) {
     dst[3] = src[3];
 }
 
-void hype_nat_reset(hype_nat_t *nat) {
+int hype_nat_reset(hype_nat_t *nat, unsigned int vm_index) {
     unsigned int i;
 
     if (nat == 0) {
-        return;
+        return -1;
     }
     for (i = 0; i < HYPE_NAT_MAX_CONN; i++) {
         nat->conn[i].in_use = 0;
@@ -45,6 +45,19 @@ void hype_nat_reset(hype_nat_t *nat) {
     nat->in_dropped_malformed = 0;
     nat->conns_opened = 0;
     nat->conns_expired = 0;
+
+    if (vm_index >= HYPE_NAT_MAX_VMS) {
+        /*
+         * No slice left. port_base is set to 0, which every allocation path treats as "not
+         * configured" -- so this table translates nothing at all rather than aliasing onto the
+         * ports of VM (vm_index % HYPE_NAT_MAX_VMS). Failing loudly beats a guest quietly receiving
+         * another guest's replies.
+         */
+        nat->port_base = 0;
+        return -1;
+    }
+    nat->port_base = (uint16_t)(HYPE_NAT_PORT_BASE + vm_index * HYPE_NAT_MAX_CONN);
+    return 0;
 }
 
 uint16_t hype_inet_checksum(const uint8_t *data, unsigned int len) {
@@ -254,24 +267,25 @@ static hype_nat_conn_t *alloc_conn(hype_nat_t *nat, uint8_t proto) {
          */
         return 0;
     }
+    if (nat->port_base == 0u) {
+        /* No slice: hype_nat_reset() refused this VM an index (see HYPE_NAT_MAX_VMS). Translating
+         * anyway would put this guest's traffic on another VM's ports. */
+        return 0;
+    }
     /*
-     * Find a free translated port. Scanning from a moving cursor rather than from the base means
-     * successive flows do not all reuse the port a just-expired one had, which matters because a
-     * remote end may still be sending to it.
+     * Find a free translated port WITHIN THIS VM'S SLICE. Scanning from a moving cursor rather than
+     * from the base means successive flows do not all reuse the port a just-expired one had, which
+     * matters because a remote end may still be sending to it.
      *
-     * The nesting reads worse than it is: HYPE_NAT_PORT_COUNT iterations each doing an
-     * O(HYPE_NAT_MAX_CONN) scan. But at most HYPE_NAT_MAX_CONN ports can be in use, and the slot
-     * check above already returned if none were free -- so a free port is found within
-     * HYPE_NAT_MAX_CONN + 1 candidates. The bound is ~257 * 256 comparisons in the pathological
-     * case, once, on connection SETUP; the steady-state cost is one candidate. The loop still runs
-     * to PORT_COUNT rather than to that tighter bound because the bound depends on an invariant two
-     * functions apart, and a loop that terminates for its own visible reason is worth more here
-     * than the iterations it saves.
+     * The slice is exactly HYPE_NAT_MAX_CONN wide and the slot check above already returned if the
+     * table was full, so at most HYPE_NAT_MAX_CONN - 1 ports are taken and a free one is found
+     * within HYPE_NAT_MAX_CONN candidates. The loop bound is that width, which makes the
+     * termination argument local: it does not depend on an invariant two functions away.
      */
-    for (tries = 0; tries < HYPE_NAT_PORT_COUNT; tries++) {
-        uint16_t candidate = (uint16_t)(HYPE_NAT_PORT_BASE +
-                                        ((unsigned int)nat->next_port % HYPE_NAT_PORT_COUNT));
-        nat->next_port = (uint16_t)((nat->next_port + 1u) % HYPE_NAT_PORT_COUNT);
+    for (tries = 0; tries < HYPE_NAT_MAX_CONN; tries++) {
+        uint16_t candidate = (uint16_t)(nat->port_base +
+                                        ((unsigned int)nat->next_port % HYPE_NAT_MAX_CONN));
+        nat->next_port = (uint16_t)((nat->next_port + 1u) % HYPE_NAT_MAX_CONN);
         if (!port_in_use(nat, proto, candidate)) {
             slot->xlate_id = candidate;
             return slot;

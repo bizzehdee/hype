@@ -168,7 +168,7 @@ static void test_udp_round_trip(void) {
     uint8_t who[4] = {0, 0, 0, 0};
     const uint8_t payload[4] = {'d', 'n', 's', '?'};
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, payload,
                 sizeof(payload));
     CHECK_TRUE("the packet we built is valid to begin with", checksums_ok(pkt, len));
@@ -201,7 +201,7 @@ static void test_icmp_echo_round_trip(void) {
     uint16_t xlate;
     uint8_t who[4] = {0, 0, 0, 0};
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     /* This is the shape of `ping www.google.com`: an echo request whose identifier is the mapping
      * key, because ICMP has no ports. */
     len = build(pkt, HYPE_IPV4_PROTO_ICMP, GUEST_IP, REMOTE_IP, 0x1234u, 0u, 0, 0);
@@ -233,7 +233,7 @@ static void test_unsolicited_inbound_is_dropped(void) {
     unsigned int len;
     uint8_t who[4] = {9, 9, 9, 9};
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, REMOTE_IP, OUR_IP, 53u, HYPE_NAT_PORT_BASE, 0, 0);
     CHECK_HEX("refused", -1, hype_nat_translate_inbound(&nat, pkt, len, who, 1ull));
     CHECK_HEX("counted as unsolicited, not as an error", 1, nat.in_dropped_no_mapping);
@@ -251,7 +251,7 @@ static void test_reply_from_the_wrong_host_is_dropped(void) {
     uint16_t xlate;
     const uint8_t impostor[4] = {203, 0, 113, 7};
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull);
     xlate = get16(pkt + 20);
@@ -276,7 +276,7 @@ static void test_same_source_port_to_two_services(void) {
     uint16_t x80;
     uint16_t x443;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_TCP, GUEST_IP, REMOTE_IP, 40000u, 80u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull);
     x80 = get16(pkt + 20);
@@ -289,11 +289,22 @@ static void test_same_source_port_to_two_services(void) {
     CHECK_TRUE("and two distinct translated ports", x80 != x443);
 }
 
-/* Two guests may legitimately use the SAME source port to the same service. They must get different
- * translated ports, or their replies go to the wrong VM -- which is a cross-VM data leak, not just a
- * bug. */
-static void test_two_guests_same_port_do_not_collide(void) {
-    hype_nat_t nat;
+/*
+ * TWO GUESTS, TWO TABLES -- which is how hype actually deploys this, and the reason this test exists
+ * in the shape it does.
+ *
+ * The first version used ONE table for both "guests" and passed, and it was testing a configuration
+ * that does not exist: the tables are per VM. With separate tables and separate cursors, both VMs
+ * allocated 49152, the inbound lookup took the first table that matched, and one guest received the
+ * other's DNS replies. That is a cross-VM misdelivery and it took two real guests to find.
+ *
+ * The property is now structural: each table gets a SLICE of the port space by index, so uniqueness
+ * does not depend on any runtime coordination. The test asserts the slices really are disjoint and
+ * that a reply lands in exactly one of them.
+ */
+static void test_two_guests_get_disjoint_port_slices(void) {
+    hype_nat_t nat_a;
+    hype_nat_t nat_b;
     uint8_t pkt[128];
     unsigned int len;
     uint16_t xa;
@@ -301,20 +312,82 @@ static void test_two_guests_same_port_do_not_collide(void) {
     const uint8_t guest_b[4] = {10, 0, 2, 16};
     uint8_t who[4] = {0, 0, 0, 0};
 
-    hype_nat_reset(&nat);
+    CHECK_HEX("VM 0 gets a slice", 0, hype_nat_reset(&nat_a, 0u));
+    CHECK_HEX("VM 1 gets a slice", 0, hype_nat_reset(&nat_b, 1u));
+
+    /* Identical flows from two guests: same source port, same service, same host. */
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
-    (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull);
+    CHECK_HEX("VM 0 translated", 0, hype_nat_translate_outbound(&nat_a, pkt, len, OUR_IP, 1ull));
     xa = get16(pkt + 20);
 
     len = build(pkt, HYPE_IPV4_PROTO_UDP, guest_b, REMOTE_IP, 5353u, 53u, 0, 0);
-    (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull);
+    CHECK_HEX("VM 1 translated", 0, hype_nat_translate_outbound(&nat_b, pkt, len, OUR_IP, 1ull));
     xb = get16(pkt + 20);
 
-    CHECK_TRUE("distinct translated ports for distinct guests", xa != xb);
+    CHECK_TRUE("the two guests got DIFFERENT translated ports", xa != xb);
+    CHECK_TRUE("VM 0's port is in VM 0's slice",
+               xa >= HYPE_NAT_PORT_BASE && xa < HYPE_NAT_PORT_BASE + HYPE_NAT_MAX_CONN);
+    CHECK_TRUE("VM 1's port is in VM 1's slice",
+               xb >= HYPE_NAT_PORT_BASE + HYPE_NAT_MAX_CONN &&
+                   xb < HYPE_NAT_PORT_BASE + 2u * HYPE_NAT_MAX_CONN);
 
+    /* A reply on VM 1's port must match VM 1's table and NOT VM 0's -- both directions of the check,
+     * because a lookup that matched both is the bug. */
     len = build(pkt, HYPE_IPV4_PROTO_UDP, REMOTE_IP, OUR_IP, 53u, xb, 0, 0);
-    CHECK_HEX("translated", 0, hype_nat_translate_inbound(&nat, pkt, len, who, 2ull));
-    CHECK_HEX("and it went to the SECOND guest, not the first", 16, who[3]);
+    CHECK_HEX("VM 0's table does not claim it", -1,
+              hype_nat_translate_inbound(&nat_a, pkt, len, who, 2ull));
+    CHECK_HEX("VM 1's table does", 0, hype_nat_translate_inbound(&nat_b, pkt, len, who, 2ull));
+    CHECK_HEX("and it is addressed to the second guest", 16, who[3]);
+}
+
+/* Every VM's slice must be disjoint from every other's, not just the first two. */
+static void test_all_slices_are_disjoint(void) {
+    unsigned int i;
+    unsigned int j;
+    hype_nat_t n;
+    uint16_t base[HYPE_NAT_MAX_VMS];
+
+    for (i = 0; i < HYPE_NAT_MAX_VMS; i++) {
+        CHECK_HEX("slice allocated", 0, hype_nat_reset(&n, i));
+        base[i] = n.port_base;
+    }
+    for (i = 0; i < HYPE_NAT_MAX_VMS; i++) {
+        for (j = i + 1u; j < HYPE_NAT_MAX_VMS; j++) {
+            if (base[i] == base[j]) {
+                printf("FAIL: VMs %u and %u share port base %u\n", i, j, (unsigned)base[i]);
+                failures++;
+            }
+        }
+        /* And every slice sits inside the range, so no VM's ports stray into the registered range
+         * where a translated port could be mistaken for a service. */
+        if (base[i] < HYPE_NAT_PORT_BASE ||
+            (unsigned int)base[i] + HYPE_NAT_MAX_CONN >
+                HYPE_NAT_PORT_BASE + HYPE_NAT_PORT_COUNT) {
+            printf("FAIL: VM %u's slice at %u is outside the range\n", i, (unsigned)base[i]);
+            failures++;
+        }
+    }
+}
+
+/*
+ * A VM past the supported count is refused a slice and translates NOTHING -- rather than aliasing
+ * onto VM (index % MAX_VMS) and receiving its replies. A guest with no NAT is a guest with no
+ * outbound network, and that has to be visible instead of silently wrong.
+ */
+static void test_a_vm_past_the_limit_gets_no_nat(void) {
+    hype_nat_t nat;
+    uint8_t pkt[128];
+    unsigned int len;
+
+    CHECK_HEX("refused", -1, hype_nat_reset(&nat, HYPE_NAT_MAX_VMS));
+    CHECK_HEX("and left with no slice", 0, nat.port_base);
+
+    len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
+    CHECK_HEX("so nothing is translated", -1,
+              hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull));
+    CHECK_HEX("counted as having no slot rather than looking like success", 1,
+              nat.out_dropped_no_slot);
+    CHECK_HEX("and no mapping was created", 0, hype_nat_active(&nat));
 }
 
 static void test_fragments_are_dropped_with_their_own_reason(void) {
@@ -322,7 +395,7 @@ static void test_fragments_are_dropped_with_their_own_reason(void) {
     uint8_t pkt[128];
     unsigned int len;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
     put16(pkt + 6, 0x2000u); /* MF set: more fragments follow */
     put16(pkt + 10, 0);
@@ -349,7 +422,7 @@ static void test_malformed_packets_are_refused(void) {
     uint8_t pkt[128];
     unsigned int len;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
 
     put16(pkt + 2, 4000u); /* total_length far past the frame */
@@ -384,7 +457,7 @@ static void test_unsupported_protocols_are_dropped(void) {
     uint8_t pkt[128];
     unsigned int len;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
     pkt[9] = 47u; /* GRE */
     put16(pkt + 10, 0);
@@ -411,7 +484,7 @@ static void test_zero_udp_checksum_is_left_alone(void) {
     uint8_t pkt[128];
     unsigned int len;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
     put16(pkt + 26, 0); /* UDP checksum field = "not computed" */
     CHECK_HEX("translated", 0, hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull));
@@ -426,7 +499,7 @@ static void test_the_table_fills_and_refuses_new_flows(void) {
     unsigned int i;
     unsigned int refused = 0;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     for (i = 0; i < HYPE_NAT_MAX_CONN + 4u; i++) {
         len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, (uint16_t)(20000u + i), 53u, 0,
                     0);
@@ -450,7 +523,7 @@ static void test_idle_mappings_expire_by_protocol(void) {
     uint8_t pkt[128];
     unsigned int len;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_ICMP, GUEST_IP, REMOTE_IP, 1u, 0u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 100ull);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
@@ -488,7 +561,7 @@ static void test_a_backwards_clock_does_not_flush_everything(void) {
     uint8_t pkt[128];
     unsigned int len;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_TCP, GUEST_IP, REMOTE_IP, 40000u, 80u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 100000ull);
     CHECK_HEX("nothing expired by a clock that went backwards", 0, hype_nat_expire(&nat, 5ull));
@@ -506,7 +579,7 @@ static void test_tcp_teardown_releases_the_mapping(void) {
     unsigned int len;
     uint16_t xlate;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_TCP, GUEST_IP, REMOTE_IP, 40000u, 80u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull);
     xlate = get16(pkt + 20);
@@ -527,7 +600,7 @@ static void test_tcp_teardown_releases_the_mapping(void) {
     CHECK_HEX("both halves closed releases it", 0, hype_nat_active(&nat));
 
     /* RST ends it in one packet. */
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_TCP, GUEST_IP, REMOTE_IP, 40001u, 80u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull);
     len = build(pkt, HYPE_IPV4_PROTO_TCP, GUEST_IP, REMOTE_IP, 40001u, 80u, 0, 0);
@@ -545,7 +618,7 @@ static void test_inbound_rst_releases_the_mapping(void) {
     unsigned int len;
     uint16_t xlate;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_TCP, GUEST_IP, REMOTE_IP, 40002u, 80u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull);
     xlate = get16(pkt + 20);
@@ -565,7 +638,7 @@ static void test_the_same_flow_reuses_its_mapping(void) {
     uint16_t first;
     uint16_t second;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull);
     first = get16(pkt + 20);
@@ -583,7 +656,7 @@ static void test_traffic_refreshes_the_timer(void) {
     uint8_t pkt[128];
     unsigned int len;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 100ull);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
@@ -603,7 +676,7 @@ static void test_ip_options_shift_the_l4_header(void) {
     unsigned int i;
     unsigned int total = 24u + 8u; /* IHL 6 (one 4-byte option) + UDP */
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     memset(pkt, 0, sizeof(pkt));
     pkt[0] = 0x46u; /* IPv4, IHL 6 */
     put16(pkt + 2, (uint16_t)total);
@@ -639,7 +712,7 @@ static void test_headers_too_short_for_their_own_protocol(void) {
     uint8_t pkt[128];
     unsigned int i;
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
 
     /* total_length = 24: a full IPv4 header plus 4 bytes, which is not a UDP header. */
     memset(pkt, 0, sizeof(pkt));
@@ -699,8 +772,8 @@ static void test_headers_too_short_for_their_own_protocol(void) {
 static void test_null_arguments(void) {
     hype_nat_t nat;
 
-    hype_nat_reset(0); /* must not fault */
-    hype_nat_reset(&nat);
+    hype_nat_reset(0, 0u); /* must not fault */
+    hype_nat_reset(&nat, 0u);
     CHECK_HEX("a null packet outbound is refused", -1,
               hype_nat_translate_outbound(&nat, 0, 64u, OUR_IP, 1ull));
     CHECK_HEX("a null packet inbound is refused", -1,
@@ -716,7 +789,7 @@ static void test_address_compare_checks_every_octet(void) {
     uint16_t xlate;
     const uint8_t near_miss[4] = {142, 250, 187, 101}; /* REMOTE_IP with the last octet changed */
 
-    hype_nat_reset(&nat);
+    hype_nat_reset(&nat, 0u);
     len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
     (void)hype_nat_translate_outbound(&nat, pkt, len, OUR_IP, 1ull);
     xlate = get16(pkt + 20);
@@ -733,7 +806,9 @@ int main(void) {
     test_unsolicited_inbound_is_dropped();
     test_reply_from_the_wrong_host_is_dropped();
     test_same_source_port_to_two_services();
-    test_two_guests_same_port_do_not_collide();
+    test_two_guests_get_disjoint_port_slices();
+    test_all_slices_are_disjoint();
+    test_a_vm_past_the_limit_gets_no_nat();
     test_fragments_are_dropped_with_their_own_reason();
     test_malformed_packets_are_refused();
     test_unsupported_protocols_are_dropped();
