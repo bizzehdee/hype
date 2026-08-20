@@ -20,25 +20,54 @@
  * interchangeable -- hand the volume to each registered driver and let the one
  * that recognises it claim it, instead of the caller hardcoding the family.
  *
- * Capability honesty (the ticket's hard rule): the four drivers are NOT
+ * Capability honesty (the ticket's hard rule): the FIVE drivers are NOT
  * equally capable, and this interface exposes that rather than papering over
  * it. A driver that cannot do an operation has a NULL slot and a missing caps
  * bit -- never a stub returning fake success. The wrappers below turn a NULL
  * slot into a clean -1 so no caller ever dereferences one.
  *
- * Capabilities as of #293:
+ * THIS LIST IS CHECKED, NOT MAINTAINED BY HAND (#493). It went stale -- it
+ * described exFAT as an in-place-only writer for months after #383 gave it
+ * growth, and that was read as authoritative while scoping TERM-11, producing
+ * the wrong conclusion that FAT32 is the only host filesystem that can grow a
+ * file. A capability table that UNDER-reports misleads exactly as much as one
+ * that over-reports. core/tests/test_fs_ops.c derives the check from
+ * hype_fs_registry() itself: a declared caps bit with a NULL slot, or a
+ * non-NULL mutation slot with no matching bit, fails the tests. So the prose
+ * below can still drift, but the CAPS-to-SLOT agreement cannot -- and if you
+ * change a driver's abilities, that check is what tells you this paragraph
+ * needs the same edit.
+ *
+ * Capabilities, against what each hype_fs_ops_t in fs_ops.c actually declares:
  *   ISO9660  read-only, streaming; lookup resolves only the whole image.
+ *            READ.
  *   FAT32    read + create/append + namespace + random write_at (#382):
  *            in-place inside the size, allocate-and-zero-fill growth past it.
- *   exFAT    read + full mutation + IN-PLACE write_at (never grows/moves).
+ *            READ | WRITE_INPLACE | WRITE_GROW | APPEND | NAMESPACE.
+ *   exFAT    read + full mutation, and write_at GROWS (#383, VDL semantics) --
+ *            it materialises a FAT chain the first time a NoFatChain file
+ *            grows, allocating through the allocation bitmap and the FAT.
+ *            Same bits as FAT32: READ | WRITE_INPLACE | WRITE_GROW | APPEND |
+ *            NAMESPACE.
  *   ext      sparse-aware read (#384: holes/unwritten read as zeros);
  *            write_at in place, plus HOLE-FILLING allocation -- journaled
  *            (jbd2) on ext3/4, direct on ext2 -- and unwritten-extent
- *            conversion on ext4 (#385); no namespace mutation.
+ *            conversion on ext4 (#385); no namespace mutation, no append.
+ *            Filling a hole does not change the file SIZE, which is why this
+ *            is WRITE_INPLACE and not WRITE_GROW.
+ *            READ | WRITE_INPLACE | SPARSE.
  *   NTFS     read (sparse runs read as zeroes) + IN-PLACE write_at into
  *            DATA ranges only; a write into a HOLE or UNWRITTEN range is
  *            refused (#337, plan.md §10 decision 30). No mutation beyond
  *            that, permanently.
+ *            READ | WRITE_INPLACE | SPARSE.
+ *
+ * Two interface-wide gaps, recorded so they are not mistaken for exFAT limits:
+ * there is no `truncate` slot for ANY driver (`create` truncating to empty is
+ * the only shrink path), and above HYPE_EXFAT_MAX_BITMAP_SCAN (4096 bitmap
+ * sectors, 16M clusters) exFAT does not scan the allocation bitmap at mount,
+ * so its used-cluster total stays unknown and PercentInUse is left untouched
+ * on flush. Large media reach that.
  *
  * File mapping and reads speak the #381 logical range contract
  * (hype_file_rmap_t): DATA / HOLE / UNWRITTEN, zeros synthesized by the

@@ -100,6 +100,24 @@ static void test_registry(void) {
               ((reg[i]->append != 0)) == ((reg[i]->caps & HYPE_FS_CAP_APPEND) != 0));
         CHECK("namespace slots match caps",
               ((reg[i]->create != 0)) == ((reg[i]->caps & HYPE_FS_CAP_NAMESPACE) != 0));
+        /*
+         * #493: three invariants this loop was missing. It tied write_at to WRITE_INPLACE only,
+         * so a driver could declare WRITE_GROW with no writer at all; it checked `create` alone
+         * for CAP_NAMESPACE, so a driver could wire create and not unlink and pass; and nothing
+         * tied CAP_SPARSE to the slot that emits HOLE/UNWRITTEN ranges.
+         *
+         * Partial namespace support is not a thing -- a caller that can create but not unlink
+         * leaves files it cannot remove -- so all five move together or none do.
+         */
+        CHECK("WRITE_GROW implies a writer",
+              (reg[i]->caps & HYPE_FS_CAP_WRITE_GROW) == 0 || reg[i]->write_at != 0);
+        CHECK("all five namespace slots move together",
+              (reg[i]->create != 0) == (reg[i]->unlink != 0) &&
+                  (reg[i]->create != 0) == (reg[i]->mkdir != 0) &&
+                  (reg[i]->create != 0) == (reg[i]->rmdir != 0) &&
+                  (reg[i]->create != 0) == (reg[i]->rename != 0));
+        CHECK("CAP_SPARSE implies map_ranges",
+              (reg[i]->caps & HYPE_FS_CAP_SPARSE) == 0 || reg[i]->map_ranges != 0);
         CHECK("WRITE_GROW is fat32/exfat so far (#382/#383)",
               ((reg[i]->caps & HYPE_FS_CAP_WRITE_GROW) == 0) ||
                   (reg[i]->name[0] == 'f' && reg[i]->name[1] == 'a') ||
@@ -298,8 +316,37 @@ static void test_unmounted_and_unclaimed(void) {
     CHECK("identity error on NULL handle", hype_fs_file_identity_error(0) == 0);
 }
 
+/*
+ * #493: and the specific claim the stale comment got wrong, pinned by name so a regression is
+ * unambiguous rather than showing up as a generic caps mismatch. exFAT is a GROWING writer with
+ * full namespace mutation (#383), not the in-place-only writer fs_ops.h used to describe.
+ */
+static void test_exfat_is_a_growing_writer(void) {
+    unsigned n = 0;
+    const hype_fs_ops_t *const *reg = hype_fs_registry(&n);
+    const hype_fs_ops_t *exfat = 0;
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        if (reg[i]->name != 0 && strcmp(reg[i]->name, "exfat") == 0) {
+            exfat = reg[i];
+        }
+    }
+    CHECK("exfat is registered", exfat != 0);
+    if (exfat == 0) {
+        return;
+    }
+    CHECK("exfat declares WRITE_GROW", (exfat->caps & HYPE_FS_CAP_WRITE_GROW) != 0u);
+    CHECK("exfat declares APPEND", (exfat->caps & HYPE_FS_CAP_APPEND) != 0u);
+    CHECK("exfat declares NAMESPACE", (exfat->caps & HYPE_FS_CAP_NAMESPACE) != 0u);
+    CHECK("exfat wires append", exfat->append != 0);
+    CHECK("exfat wires rename", exfat->rename != 0);
+    CHECK("exfat wires sync", exfat->sync != 0);
+}
+
 int main(void) {
     test_registry();
+    test_exfat_is_a_growing_writer();  /* #493 */
     test_iso();
     test_fat32_through_interface();
     test_claimed_but_unmountable();
