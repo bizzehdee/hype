@@ -19,13 +19,37 @@
  *
  * A plain linear buffer: appends stop (setting a truncated flag) once
  * capacity is reached rather than wrapping, so the START of the log is
- * always intact -- capacity is sized well above a full boot's output, so
- * in practice the whole run is captured. Header + data are one contiguous,
- * 8-byte-aligned region so the magic sits at a fixed offset ahead of the
- * bytes. Pure logic, fully unit tested.
+ * always intact. Header + data are one contiguous, 8-byte-aligned region
+ * so the magic sits at a fixed offset ahead of the bytes. Pure logic,
+ * fully unit tested.
+ *
+ * CAPACITY, and the claim that used to sit here. This comment said capacity was
+ * "sized well above a full boot's output, so in practice the whole run is
+ * captured". That stopped being true once a validation stick ran three VMs at
+ * `log_level = debug`. Measured on the bare-metal AMD run of `f1a831f`:
+ *
+ *     *** hype: the 2 MiB in-RAM log buffer is FULL. Capture stopped here ***
+ *
+ * at t=660s, with the machine still running for much longer. 2 MiB bought about
+ * ELEVEN MINUTES. That is not a diagnostic inconvenience, it is the binding
+ * constraint on what a cold boot can prove: #527 wants a guest sustained past
+ * eight minutes, and the #525 guest-reboot arm fires at about eleven -- so the
+ * evidence for the second landed exactly where capture died, and no amount of
+ * leaving the machine on could recover it.
+ *
+ * 8 MiB is roughly 44 minutes at that rate. It costs 6 MiB of BSS in a UEFI
+ * application on a 12 GB machine, which is the cheapest possible fix for a
+ * problem whose alternative is guessing which diagnostics to switch off before
+ * a run that takes a cold boot to repeat.
+ *
+ * NOT a ring buffer, deliberately, and this run is why the non-wrapping choice
+ * is right: hype says out loud that capture stopped and that the log is
+ * incomplete rather than the end of the run. A wrap would have silently eaten
+ * the boot and placement lines -- the ones every ticket is gated on -- and left
+ * a log that looked complete.
  */
 
-#define HYPE_LOGBUF_CAPACITY (2u * 1024u * 1024u)
+#define HYPE_LOGBUF_CAPACITY (8u * 1024u * 1024u)
 
 /* RT-1d: the buffer is page-aligned (see g_logbuf's __attribute__((aligned))
  * in logbuf.c) and UEFI loads hype.efi's image at a page-aligned physical

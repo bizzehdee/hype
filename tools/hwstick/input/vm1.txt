@@ -73,17 +73,29 @@ expect VM1-SCRIPT-END
 # it, a reboot at t=90s would cost the ticket this stick mainly exists for.
 delay 600000
 
-# Say whether taskset exists before relying on it. busybox builds vary, and a missing taskset
-# would otherwise reboot from whatever CPU the shell happened to be on -- which looks like
-# evidence for #525 and is not. Split so the tty echo cannot satisfy its own expect.
+# Say whether taskset exists before relying on it. Its guard earned its keep on the bare-metal AMD
+# run of f1a831f, which reported NO-TASKSET: this Alpine's busybox does not carry it. The old line
+# then sent `taskset -c 1 ...` anyway, which failed with "not found", so the sysrq write NEVER
+# HAPPENED -- and hype logged no 0xCF9, no restart and no 8042 pulse on both that run and the Intel
+# one before it. Two cold boots spent on a command that could not run.
 send command -v taskset >/dev/null && echo HAVE-TASK''SET || echo NO-TASK''SET\n
 expect ~#
 send echo 1 > /proc/sys/kernel/sysrq\n
 expect ~#
 
-# The reset itself. If this works the guest dies here and hype logs the 0xCF9 write, naming the
-# vCPU that served it, plus a VM restart.
-send taskset -c 1 sh -c 'echo b > /proc/sysrq-trigger'\n
+# THE RESET, no longer conditional on taskset existing.
+#
+# Pinning was only ever a way to make the write come from a non-BSP vCPU. It is not the only way to
+# LEARN which vCPU served it: hype now names the vCPU in its own log line (#525, d4391ce), so
+# observing beats forcing. So try the pin, and fall back to an unpinned write when taskset is
+# absent -- Linux's sysrq-b calls emergency_restart() on the CURRENT CPU with no stop_machine and no
+# migration, so an unpinned write still comes from whichever vCPU the shell is on, and hype's line
+# says which. With two vCPUs that is a coin toss per boot rather than a guarantee, and a run that
+# lands on vCPU 0 is still a valid data point instead of no data at all.
+#
+# One line, because HYPE_INPUT_SCRIPT_MAX_ARG is 128 bytes and a 358-byte send once silently
+# refused this whole script.
+send taskset -c 1 sh -c 'echo b >/proc/sysrq-trigger' 2>/dev/null || echo b >/proc/sysrq-trigger\n
 
 # ---------------------------------------------------------------------------
 # #525 asks for three things and the script used to prove only the first: that the write was
