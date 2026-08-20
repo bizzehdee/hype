@@ -1,9 +1,13 @@
 # hype hardware-validation stick — multi-ticket run
 
-Build: whatever `stage.sh` prints when it stages — it echoes the binary's own stamp
-(`hype: build <sha>-dirty`), and that stamp is the authority, not this line. **Check it against the
-banner in the log after the run**; a stick staged from a stale `build/hype.efi` is indistinguishable
-from a fix that did not work.
+Build: **`make clean && make all && make micro`, default flags, no `EXTRA_CFLAGS`.** Every ticket
+this stick carries is satisfied by a default build; nothing here needs a variant, and #527's
+instruction to build with `-DHYPE_SMP_STARTABLE_VCPUS=2` is stale (that knob has raised only the
+NO-CONFIG default since #192, and this stick ships a config — see the correction on #527).
+
+`stage.sh` echoes the binary's own stamp (`hype: build <sha>-dirty`), and that stamp is the
+authority, not this line. **Check it against the banner in the log after the run**; a stick staged
+from a stale `build/hype.efi` is indistinguishable from a fix that did not work.
 
 The `-dirty` is the **vendored `edk2` submodule**, which carries local #436 research patches and is
 **not compiled into `hype.efi`**. hype.efi is built by the clang/lld pipeline from `boot/`, `core/`,
@@ -137,7 +141,7 @@ runs the microtests in turn inside a single guest.
 
 | VM | Ticket | What to look for |
 |---|---|---|
-| `vm0` alpine | **#527** | both APs `live=1`, AP exits in the millions, `Brought up 1 node, 2 CPUs`, `VMCSRELOAD ... steals=0`, entry failures 0, sustained past 8 min |
+| `vm0` alpine | **#527** | `fw-1 SMP: vm0 granted 1 whole physical core(s) -> 2 logical CPU(s)`, then both APs `live=1`, AP exits in the millions, the guest's own `Brought up 1 node, 2 CPUs`, `VMCSRELOAD ... steals=0`, entry failures 0, sustained past 8 min. **Do not look for `fw-1: vm0 vcpus 2`** — the ticket's original gate names a line hype does not emit for a one-core config |
 | `vm0`,`vm1` | **#526** | how many `soft lockup` lines appear. The nested rig gives 2 per 240 s; the AMD baseline from the last run was **zero** |
 | `vm0`,`vm1` | **#461** | watch-only: a host `#GP (vector 13)` with RIP inside the AP trampoline |
 | `vm1` | **#120** | `vm1 boot=disk -- no installer media attached`, then the guest reaching a login prompt. It booted its own disk with nothing to stream from |
