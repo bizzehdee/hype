@@ -170,6 +170,7 @@ $(OUT): $(OBJS)
 	@tools/check-no-preebs-fileio.sh boot/main.c
 
 test:
+	@python3 tools/check-fw1-statics.py
 	core/tests/run.sh
 
 # Boot hype.efi under QEMU+OVMF as a removable-media ESP (M0-4).

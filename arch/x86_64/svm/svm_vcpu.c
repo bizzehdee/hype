@@ -121,6 +121,21 @@ struct hype_vcpu_ctx {
     uint32_t int_req_by_vec[256];
     uint32_t int_inj_by_vec[256];
     /*
+     * #563: the injection-outcome counters, PER vCPU. These were four file-globals
+     * (g_int_eventinj / g_int_vintr_defer / g_int_vintr_window / g_int_defer_overwrite) plus a
+     * collision count, summed over every vCPU of every VM -- so the counter that would identify
+     * WHICH guest is losing an injection was precisely the one that could not. Same reasoning as
+     * int_req_by_vec/int_inj_by_vec two lines up, which #359 already moved for the same reason.
+     *
+     * The VMX backend increments these through the same `real` pointer, so both vendors report
+     * the same thing per vCPU and the INTDIAG line keeps meaning one thing on both.
+     */
+    unsigned long long int_eventinj;  /* accepted immediately (direct EVENTINJ / entry-intr-info) */
+    unsigned long long int_defer;     /* could not accept -> queued in the IRR */
+    unsigned long long int_window;    /* interrupt window fired -> deferred inject drained */
+    unsigned long long int_overwrite; /* vector already pending -> coalesced, not lost */
+    unsigned long long int_collision; /* wanted to inject, an event was already staged */
+    /*
      * #456: the vectors staged into EVENTINJ since the caller last drained this,
      * as a 256-bit set. The guest's emulated LAPIC ISR must be marked at the
      * moment a vector is COMMITTED to the guest, not when it is requested --
@@ -375,6 +390,14 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
             ctx->pending_pic[i] = 0; /* #512 */
             ctx->inj_notify[i] = 0; /* #456 */
         }
+        /* #563: and the injection-outcome counters, for the same reason -- a recycled slot
+         * reporting the previous guest's totals is exactly the mis-attribution this moved them
+         * per-vCPU to prevent. */
+        ctx->int_eventinj = 0;
+        ctx->int_defer = 0;
+        ctx->int_window = 0;
+        ctx->int_overwrite = 0;
+        ctx->int_collision = 0;
         for (i = 0; i < 256; i++) {
             ctx->int_req_by_vec[i] = 0;   /* #359: a recycled slot must not inherit */
             ctx->int_inj_by_vec[i] = 0;   /* the previous guest's interrupt history */
@@ -1339,16 +1362,18 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
  * interrupt stub, not back at the instruction the guest was running.
  */
 
-static unsigned long long g_int_eventinj = 0;   /* accepted immediately (direct EVENTINJ) */
-static unsigned long long g_int_vintr_defer = 0; /* couldn't accept -> VINTR window armed */
-static unsigned long long g_int_vintr_window = 0;/* VINTR window fired -> deferred inject */
-static unsigned long long g_int_defer_overwrite = 0; /* requested a vector already pending in the IRR (coalesced, not lost) */
-/* M4-6b2: times a request found EVENTINJ.V already staged for the next VMRUN
- * and QUEUED the new vector in the IRR instead of clobbering the staged one.
- * Under the old code this was an INVISIBLE lost interrupt (the direct-EVENTINJ
- * path overwrote unconditionally and counted nothing) -- the actual cause of
- * the one-shot-clockevent death. Now counted and never lost. */
-static unsigned long long g_int_eventinj_collision = 0;
+/*
+ * #563: these four counters, plus the collision count below, are PER vCPU now -- see
+ * int_eventinj/int_defer/int_window/int_overwrite/int_collision on the context struct. As
+ * file-globals they summed every vCPU of every VM, so a lost injection could not be attributed to
+ * the guest that lost it.
+ *
+ * M4-6b2, on the collision count: it records a request that found an event already staged for the
+ * next VM entry and QUEUED the new vector in the IRR instead of clobbering the staged one. Under
+ * the old code that was an INVISIBLE lost interrupt -- the direct path overwrote unconditionally
+ * and counted nothing -- and it was the actual cause of the one-shot-clockevent death. Counted,
+ * and never lost.
+ */
 
 /*
  * #343: ATAPI transfer accounting. A SHORT transfer -- the PRDT list exhausted with bytes still
@@ -1386,16 +1411,23 @@ void hype_svm_vcpu_get_read_verify(unsigned long long *checked, unsigned long lo
 }
 #endif
 
-void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
-                                 unsigned long long *window, unsigned long long *overwrite) {
-    *eventinj = g_int_eventinj;
-    *defer = g_int_vintr_defer;
-    *window = g_int_vintr_window;
-    *overwrite = g_int_defer_overwrite;
+void hype_svm_vcpu_get_int_diag(hype_vcpu_ctx_t *ctx, unsigned long long *eventinj,
+                                 unsigned long long *defer, unsigned long long *window,
+                                 unsigned long long *overwrite) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real == 0) {
+        *eventinj = 0; *defer = 0; *window = 0; *overwrite = 0;
+        return;
+    }
+    *eventinj = real->int_eventinj;
+    *defer = real->int_defer;
+    *window = real->int_window;
+    *overwrite = real->int_overwrite;
 }
 
-unsigned long long hype_svm_vcpu_get_eventinj_collisions(void) {
-    return g_int_eventinj_collision;
+unsigned long long hype_svm_vcpu_get_eventinj_collisions(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    return (real != 0) ? real->int_collision : 0ull;
 }
 
 /* Arm the VINTR interrupt-window intercept iff vectors are still queued in the
@@ -1526,7 +1558,7 @@ trace_done:
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr(vector);
         real->int_inj_by_vec[vector]++;
         svm_note_injected(real, vector); /* #456 */
-        g_int_eventinj++;
+        real->int_eventinj++;
         return;
     }
 
@@ -1535,14 +1567,14 @@ trace_done:
      * drains as soon as the guest can accept it. Requesting an already-pending
      * vector coalesces (correct IRR semantics: one delivery per set bit). */
     if (eventinj_busy) {
-        g_int_eventinj_collision++;
+        real->int_collision++;
     }
     if ((real->pending_irr[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0) {
-        g_int_defer_overwrite++; /* vector already pending -> coalesced (not lost) */
+        real->int_overwrite++; /* vector already pending -> coalesced (not lost) */
     }
     hype_svm_irr_set(real->pending_irr, vector);
     hype_svm_sync_vintr(real);
-    g_int_vintr_defer++;
+    real->int_defer++;
 }
 
 /* GLADDER-6c DIAG: reinject a guest exception that hype intercepted purely to
@@ -1622,7 +1654,7 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         real->int_inj_by_vec[(uint8_t)v]++;
         svm_note_injected(real, (uint8_t)v); /* #456 */
-        g_int_vintr_window++;
+        real->int_window++;
     }
     hype_svm_sync_vintr(real);
 }
@@ -1674,7 +1706,7 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
     }
     /* Keep the window armed if more vectors remain; disarm once drained. */
     hype_svm_sync_vintr(real);
-    g_int_eventinj++;
+    real->int_eventinj++;
     return 1;
 }
 

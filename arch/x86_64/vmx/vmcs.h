@@ -167,9 +167,10 @@ void hype_vmx_vcpu_pool_alloc(unsigned count, uint64_t (*alloc_zeroed_pages)(uns
 /* #248: the VMX half of the interrupt-delivery counters. Same field meanings as
  * hype_svm_vcpu_get_int_diag() so the INTDIAG log line reads identically on both
  * vendors; without these the line printed all-zeros on Intel regardless. */
-void hype_vmx_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
+void hype_vmx_vcpu_get_int_diag(hype_vcpu_ctx_t *ctx, unsigned long long *eventinj,
+                                unsigned long long *defer,
                                 unsigned long long *window, unsigned long long *overwrite);
-unsigned long long hype_vmx_vcpu_get_eventinj_collisions(void);
+unsigned long long hype_vmx_vcpu_get_eventinj_collisions(hype_vcpu_ctx_t *ctx);
 
 /*
  * VMX-1 smoke test: launches a self-contained 3-byte guest (CPUID; HLT) via

@@ -648,14 +648,15 @@ void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *o
  * deliver a deferred vector, and how many deferrals clobbered a still-
  * undelivered pending vector. defer >> window (or overwrite > 0) means
  * deferred injections are getting stuck/lost. */
-void hype_svm_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
+void hype_svm_vcpu_get_int_diag(hype_vcpu_ctx_t *ctx, unsigned long long *eventinj,
+                                 unsigned long long *defer,
                                  unsigned long long *window, unsigned long long *overwrite);
 
 /* M4-6b2: count of interrupt requests that found EVENTINJ already staged for
  * the next VMRUN and QUEUED the vector in the IRR instead of clobbering it.
  * Nonzero proves same-iteration IRQ collisions occur (they were previously an
  * invisible lost-interrupt) -- now safely serialized, never dropped. */
-unsigned long long hype_svm_vcpu_get_eventinj_collisions(void);
+unsigned long long hype_svm_vcpu_get_eventinj_collisions(hype_vcpu_ctx_t *ctx);
 
 /* #343: ATAPI transfer accounting. `short_xfers` counts transfers that ended with bytes still owed
  * because the guest's PRDT list ran out -- reported to the guest as SUCCESS, so nothing else can

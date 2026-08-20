@@ -324,6 +324,17 @@ struct hype_vcpu_ctx {
      * Mirrors the SVM ctx's field of the same name -- see svm.h on why the guest's
      * emulated LAPIC ISR must be marked at injection time, not at request time. */
     uint32_t inj_notify[8];
+    /*
+     * #563: injection-outcome counters, PER vCPU -- the VMX half of the same change made on the
+     * SVM context. These were five file-globals summed over every vCPU of every VM, so the
+     * counter meant to attribute a lost injection was the one that could not. Field names match
+     * the SVM side exactly, because the INTDIAG line must mean the same thing on both vendors.
+     */
+    unsigned long long int_eventinj;
+    unsigned long long int_defer;
+    unsigned long long int_window;
+    unsigned long long int_overwrite;
+    unsigned long long int_collision;
     /* SMP-2 (#186): the topology THIS vCPU's guest sees. Mirrors the SVM ctx's field of the
      * same name -- per-vCPU, never file-global (#237/#276). */
     hype_cpuid_topology_t cpuid_topo;
@@ -420,6 +431,14 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
         ctx->pending_pic[i] = 0; /* #512 */
         ctx->inj_notify[i] = 0; /* #456 */
     }
+    /* #563: and the injection-outcome counters, for the same reason -- a recycled slot
+     * reporting the previous guest's totals is exactly the mis-attribution this moved them
+     * per-vCPU to prevent. */
+    ctx->int_eventinj = 0;
+    ctx->int_defer = 0;
+    ctx->int_window = 0;
+    ctx->int_overwrite = 0;
+    ctx->int_collision = 0;
     /* SMP-2: a recycled slot must not inherit the previous guest's topology. */
     ctx->cpuid_topo.apic_id = 0u;
     ctx->cpuid_topo.vcpu_count = 1u;
@@ -3062,22 +3081,29 @@ static int vmx_can_accept_interrupt(void) {
  *   overwrite  -- vector was already pending -> coalesced (one delivery per IRR bit)
  *   collision  -- wanted to inject but an event was already staged for VM-entry
  */
-static unsigned long long g_vmx_int_eventinj = 0;
-static unsigned long long g_vmx_int_defer = 0;
-static unsigned long long g_vmx_int_window = 0;
-static unsigned long long g_vmx_int_overwrite = 0;
-static unsigned long long g_vmx_int_collision = 0;
-
-void hype_vmx_vcpu_get_int_diag(unsigned long long *eventinj, unsigned long long *defer,
-                                unsigned long long *window, unsigned long long *overwrite) {
-    *eventinj = g_vmx_int_eventinj;
-    *defer = g_vmx_int_defer;
-    *window = g_vmx_int_window;
-    *overwrite = g_vmx_int_overwrite;
+/*
+ * #563: PER vCPU, in the shared context struct, exactly as the SVM half now is. These were five
+ * file-globals summed over every vCPU of every VM, so the counter that would say WHICH guest lost
+ * an injection was the one that could not. Both backends increment the same fields through `real`,
+ * which is what keeps the INTDIAG line meaning one thing on both vendors.
+ */
+void hype_vmx_vcpu_get_int_diag(hype_vcpu_ctx_t *ctx, unsigned long long *eventinj,
+                                unsigned long long *defer, unsigned long long *window,
+                                unsigned long long *overwrite) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real == 0) {
+        *eventinj = 0; *defer = 0; *window = 0; *overwrite = 0;
+        return;
+    }
+    *eventinj = real->int_eventinj;
+    *defer = real->int_defer;
+    *window = real->int_window;
+    *overwrite = real->int_overwrite;
 }
 
-unsigned long long hype_vmx_vcpu_get_eventinj_collisions(void) {
-    return g_vmx_int_collision;
+unsigned long long hype_vmx_vcpu_get_eventinj_collisions(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    return (real != 0) ? real->int_collision : 0ull;
 }
 
 /* #456: see svm_note_injected -- the VMX mirror. */
@@ -3129,16 +3155,16 @@ void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
             hype_svm_irr_clear(real->pending_pic, (uint8_t)v); /* #512 */
             vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
             vmx_note_injected(real, (uint8_t)v); /* #456 */
-            g_vmx_int_eventinj++;
+            real->int_eventinj++;
         }
     } else {
         if (staged) {
-            g_vmx_int_collision++;
+            real->int_collision++;
         }
         if (already_pending) {
-            g_vmx_int_overwrite++;
+            real->int_overwrite++;
         }
-        g_vmx_int_defer++;
+        real->int_defer++;
     }
     /* Keep the window armed while anything remains queued. */
     vmx_set_intr_window(hype_svm_irr_any(real->pending_irr) ? 1 : 0);
@@ -3174,7 +3200,7 @@ int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
     hype_svm_irr_clear(real->pending_pic, (uint8_t)v); /* #512 */
     vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
     vmx_note_injected(real, (uint8_t)v); /* #456 */
-    g_vmx_int_window++; /* drained from the queue once the guest could accept it */
+    real->int_window++; /* drained from the queue once the guest could accept it */
     vmx_set_intr_window(hype_svm_irr_any(real->pending_irr) ? 1 : 0);
     return 1;
 }

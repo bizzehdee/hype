@@ -669,6 +669,90 @@ typedef struct hype_fw_disk {
     int is_physical;
 } hype_fw_disk_t;
 
+/*
+ * #563: run_fw_1_test()'s DIAGNOSTIC state, per VM.
+ *
+ * That function had 46 function-level `static` variables. It runs once per VM and, since SMP, runs
+ * CONCURRENTLY on several cores -- and a function-level static is one object for the whole program.
+ * So every VM shared them and every write raced. The default reading of a bare `static` inside that
+ * function is "this is my VM's variable"; that reading is wrong, which is why these live in a named
+ * per-VM struct now rather than being fixed one at a time as each is noticed.
+ *
+ * Not hypothetical tidying. #557's three fields (starve_*, above) cost a real misdiagnosis:
+ * `starve_dumped` was a one-shot across ALL VMs, so the first VM to dump silenced every other one.
+ * The single TIMER-STARVE line on a bare-metal AMD run belonged to a guest that was NOT starved,
+ * while the guest under investigation never got a line. The diagnostic built to name a bug class
+ * is what hid it.
+ *
+ * Three groups, and the third is a correctness problem rather than only an attribution one:
+ *
+ *  - LATCHES of guest-observed state (kbd_rte1_last, ata_undelivered_reported, first_cmd_reported,
+ *    bp_hit, frame_done, bugchk_done, dbg229_once, fw1_da_diag, rtc_last_irqs, ...). Shared, these
+ *    report one VM's observation under another VM's name.
+ *  - ONE-SHOT gates and log budgets (deadhalt_dumped, wedge_dumped, hba_dumps, ent_n,
+ *    guestexcp_log_n, excdump_n, cr_probe_n). Shared, the first VM to spend the budget silences
+ *    every other VM for the rest of the boot.
+ *  - SHARED BUFFERS (vl, rl, snap, dbg_bytes, seen_ports, seen_mmio, ib). Two VMs formatting into
+ *    one buffer concurrently interleave into a line that is NEITHER guest's -- a log that lies,
+ *    which is worse than no log.
+ *
+ * The arrays stay ARRAYS rather than becoming pointers into a shared block, because `sizeof(vl)`,
+ * `sizeof(rl)` and `sizeof(dbg_bytes)` are all used as the bound for hype_snprintf: aliasing them
+ * through a pointer would silently turn a 300-byte bound into 8.
+ *
+ * g_vms is zeroed at allocation (hype_guest_ram_zero over the whole arena), so every field starts
+ * at 0 exactly as the `= 0` initializers on the old statics did.
+ *
+ * ANY NEW `static` INSIDE run_fw_1_test() MUST justify itself in a comment at its declaration,
+ * saying why one-per-host is intended. The three that remain there are `const` -- read-only, so
+ * they cannot race -- and say so where they are declared.
+ */
+typedef struct hype_fw_diag {
+    uint64_t selw_last;           /* selective-write sampling watermark */
+    char vl[300];                 /* VECHIST line under construction */
+    char rl[300];                 /* IOAPICRT line under construction */
+    unsigned hba_dumps;
+    int frame_done;
+    int bugchk_done;
+    uint64_t usblog_last_tsc;
+    uint64_t lt_sum;
+    uint64_t lt_last;
+    uint64_t lt_prev;
+    uint64_t rtc_last_tsc;
+    unsigned long long rtc_last_irqs;
+    int ata_undelivered_reported;
+    uint8_t snap[HYPE_VT_MAX_ROWS * (HYPE_VT_MAX_COLS + 1u)]; /* terminal surface, frame to frame */
+    uint64_t dr_last;
+    uint64_t dr_n;
+    uint64_t kbd_rte1_last;
+    unsigned long long kbd_queued_last;
+    int kbd_rte1_seen;
+    int kbd_obf_irq_delivered;
+    uint64_t mouse_rte12_last;
+    int mouse_rte12_seen;
+    int mouse_obf_irq_delivered;
+    unsigned long long svm_insn_n;
+    int fw1_da_diag;
+    uint32_t last_reported_reads;
+    int first_cmd_reported;
+    uint64_t read10_first_tsc;
+    int dbg229_once;
+    uint64_t seen_mmio[128];      /* windows already reported, so each is named once per VM */
+    unsigned seen_mmio_n;
+    uint8_t dbg_bytes[256];
+    uint32_t seen_ports[128];     /* ports already reported, same reason */
+    unsigned int seen_ports_n;
+    unsigned ent_n;
+    unsigned guestexcp_log_n;
+    unsigned excdump_n;
+    unsigned cr_probe_n;
+    int deadhalt_dumped;
+    /* Instruction-byte scratch. It was `static` to keep run_fw_1_test's frame under __chkstk,
+     * which a per-VM field achieves without the sharing that came with it. */
+    uint8_t ib[16];
+    int wedge_dumped;
+} hype_fw_diag_t;
+
 typedef struct hype_fw_vm {
     /* --- guest memory (OVMF firmware + low RAM) --- */
     uint64_t combined_host_phys; /* OVMF_VARS+CODE, host-physical */
@@ -1087,6 +1171,8 @@ typedef struct hype_fw_vm {
     uint64_t starve_irq0_since;
     unsigned long long starve_pit_irqs_at_arm;
     int starve_dumped;
+    /* #563: the REST of run_fw_1_test()'s diagnostic state, same bug class as the three above. */
+    hype_fw_diag_t diag;
     hype_vcpu_ctx_t *vcpu[HYPE_MAX_VCPUS_PER_VM];
     /*
      * #535: `boot = kernel` -- this VM boots a raw kernel image with no guest firmware. Set in
@@ -4436,14 +4522,19 @@ static int vmm_get_debug_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
     hype_svm_vcpu_get_debug_state(ctx, out);
     return 1;
 }
-static int vmm_get_int_diag(hype_vmm_kind_t kind, unsigned long long *eventinj,
-                            unsigned long long *defer, unsigned long long *window,
-                            unsigned long long *overwrite) {
+/*
+ * #563: takes a ctx now, because the counters are per-vCPU. As file-globals they summed every vCPU
+ * of every VM, so the INTDIAG line could say injections were being deferred but never WHOSE -- the
+ * counter built to attribute a lost interrupt was the one that could not.
+ */
+static int vmm_get_int_diag(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                            unsigned long long *eventinj, unsigned long long *defer,
+                            unsigned long long *window, unsigned long long *overwrite) {
     if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_vcpu_get_int_diag(eventinj, defer, window, overwrite);
+        hype_vmx_vcpu_get_int_diag(ctx, eventinj, defer, window, overwrite);
         return 1;
     }
-    hype_svm_vcpu_get_int_diag(eventinj, defer, window, overwrite);
+    hype_svm_vcpu_get_int_diag(ctx, eventinj, defer, window, overwrite);
     return 1;
 }
 #if HYPE_FW1_DEBUG
@@ -4462,9 +4553,10 @@ static uint32_t vmm_get_msr_index(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
     return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_msr_index(ctx)
                                      : hype_svm_vcpu_get_msr_index(ctx);
 }
-static unsigned long long vmm_get_eventinj_collisions(hype_vmm_kind_t kind) {
-    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_eventinj_collisions()
-                                     : hype_svm_vcpu_get_eventinj_collisions();
+static unsigned long long vmm_get_eventinj_collisions(hype_vmm_kind_t kind,
+                                                     hype_vcpu_ctx_t *ctx) {
+    return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_get_eventinj_collisions(ctx)
+                                     : hype_svm_vcpu_get_eventinj_collisions(ctx);
 }
 
 /* VMX-4 (#236): the FW-1 device surface. */
@@ -12193,6 +12285,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * lines shows which exit type dominates a slow stretch. Just integer
      * increments -- no per-exit formatting. */
 #define HYPE_EXCOST_BUCKETS 9
+    /* #563: `static` and one-per-host is CORRECT here -- const, so read-only and unraceable. */
     static const char *const excost_names[HYPE_EXCOST_BUCKETS] = {
         "hlt", "npf", "ioio", "msr", "cpuid", "vintr", "pause", "intr", "other"};
     /*
@@ -12587,7 +12680,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * failed, and that is the one untested explanation for the
                  * arm-routine contradiction. Placed at the loop top because the
                  * dispatch below `continue`s for most exits. */
-                static uint64_t selw_last;
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 uint64_t selw_now = hype_rdtsc();
                 if (g_436_kmod_base == 0 && info.guest_rip >= 0xFFFF800000000000ULL) {
                     fw_1_pe_ctx_t sctx;
@@ -12610,9 +12703,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                 }
                 if (g_436_kmod_base != 0 && g_fw_1_host_tsc_hz != 0 &&
-                    selw_now - selw_last > 5u * g_fw_1_host_tsc_hz) {
+                    selw_now - vm->diag.selw_last > 5u * g_fw_1_host_tsc_hz) {
                     uint64_t sel = 0, arm = 0, cr3w = vmm_get_cr3(kind, ctx);
-                    selw_last = selw_now;
+                    vm->diag.selw_last = selw_now;
                     if (cr3w != 0 &&
                         fw_1_read_guest_va(vm, cr3w, g_436_kmod_base + 0xfc2230ull, &sel, 8) &&
                         sel != 0) {
@@ -12874,8 +12967,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     /* #318: which vectors actually reach the guest. SVM-only -- reported as
                      * unavailable on VMX rather than as zeros, which would read as "no
                      * interrupts" instead of "not measured". */
-                    static char vl[300];
-                    int vo = hype_snprintf(vl, sizeof(vl), "fw-1 VECHIST vm%u:",
+                    /* #563: was a shared `static`; per-VM in vm->diag now. */
+                    int vo = hype_snprintf(vm->diag.vl, sizeof(vm->diag.vl), "fw-1 VECHIST vm%u:",
                                            (unsigned)(vm - g_vms));
                     unsigned vv, shown = 0;
                     for (vv = 0; vv < 256u && shown < 10u; vv++) {
@@ -12884,11 +12977,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         if (rq == 0u && ij == 0u) {
                             continue;
                         }
-                        vo += hype_snprintf(vl + vo, sizeof(vl) - (unsigned)vo,
+                        vo += hype_snprintf(vm->diag.vl + vo, sizeof(vm->diag.vl) - (unsigned)vo,
                                             " 0x%02x=%u/%u", vv, (unsigned)ij, (unsigned)rq);
                         shown++;
                     }
-                    hype_debug_print("%s (injected/requested)\n", vl);
+                    hype_debug_print("%s (injected/requested)\n", vm->diag.vl);
                     /*
                      * #359: VECHIST reports vectors, but a vector alone does not say which
                      * device it belongs to -- the guest's own IOAPIC redirection table is what
@@ -12899,8 +12992,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * a second run: for every unmasked redirection entry, GSI -> vector.
                      */
                     {
-                        static char rl[300];
-                        int ro = hype_snprintf(rl, sizeof(rl), "fw-1 IOAPICRT vm%u:",
+                        /* #563: was a shared `static`; per-VM in vm->diag now. */
+                        int ro = hype_snprintf(vm->diag.rl, sizeof(vm->diag.rl), "fw-1 IOAPICRT vm%u:",
                                                (unsigned)(vm - g_vms));
                         unsigned gsi;
                         for (gsi = 0; gsi < HYPE_IOAPIC_NUM_RTES; gsi++) {
@@ -12908,10 +13001,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             if ((rte & (1ull << 16)) != 0ull) {
                                 continue; /* masked: guest has no delivery expectation here */
                             }
-                            ro += hype_snprintf(rl + ro, sizeof(rl) - (unsigned)ro,
+                            ro += hype_snprintf(vm->diag.rl + ro, sizeof(vm->diag.rl) - (unsigned)ro,
                                                 " gsi%u->0x%02x", gsi, (unsigned)(rte & 0xFFu));
                         }
-                        hype_debug_print("%s (unmasked only)\n", rl);
+                        hype_debug_print("%s (unmasked only)\n", vm->diag.rl);
                     }
                 }
                 if (kind != HYPE_VMM_KIND_VMX) {
@@ -13185,9 +13278,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * booted by this same firmware; the SATA disk's is refused. Any
                      * register that differs is a candidate, and unlike EDK2 internals
                      * it is directly observable from here. */
-                    static unsigned hba_dumps = 0;
-                    if (hba_dumps < 3u) {
-                        hba_dumps++;
+                    /* #563: was a shared `static`; per-VM in vm->diag now. */
+                    if (vm->diag.hba_dumps < 3u) {
+                        vm->diag.hba_dumps++;
                         fw_1_262_hba_dump("cd-works", &g_fw_1_ahci);
                         fw_1_262_hba_dump("sata-fails", &g_fw_1_ata_ahci);
                     }
@@ -13223,6 +13316,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     {   /* #509: per-exit-reason dispatch cost -- which handler is EXPENSIVE,
                          * as opposed to which is frequent. Those are different questions: intr
                          * is ~32% of exits and does almost nothing. */
+                        /* #563: const, so one-per-host is correct -- read-only, cannot race. */
                         static const char *bn[HYPE_509_BUCKETS] = {
                             "npf", "ioio", "msr", "cpuid", "hlt", "intr", "iwin", "other"};
                         char dl[240];
@@ -13257,6 +13351,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     {   /* #512: request-vs-injection per suspect vector on vCPU 0. A req that
                          * inj never follows = staged but never delivered. */
                         uint32_t rq[5], ij[5];
+                        /* #563: const, so one-per-host is correct -- read-only, cannot race. */
                         static const uint8_t vv[5] = {0xfbu, 0x22u, 0xecu, 0xf9u, 0xfau};
                         unsigned q_;
                         for (q_ = 0; q_ < 5u; q_++) {
@@ -13811,14 +13906,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      * disassembling KeBugCheckEx forward). Read it once, through
                                      * the guest's own page tables.
                                      */
-                                    static int frame_done = 0;
-                                    static int bugchk_done = 0;
-                                    if (!bugchk_done && riphist_rip[top[0]] >= 0xFFFF800000000000ULL) {
+                                    /* #563: was a shared `static`; per-VM in vm->diag now. */
+                                    /* #563: was a shared `static`; per-VM in vm->diag now. */
+                                    if (!vm->diag.bugchk_done && riphist_rip[top[0]] >= 0xFFFF800000000000ULL) {
                                         hype_svm_debug_state_t bs;
                                         unsigned bq;
-                                        bugchk_done = 1;
+                                        vm->diag.bugchk_done = 1;
                                         hype_svm_vcpu_get_debug_state(ctx, &bs);
-                                        if (!frame_done && bs.rsp != 0) {
+                                        if (!vm->diag.frame_done && bs.rsp != 0) {
                                             /* #436: which dispatch was actually taken? Scan the
                                              * guest stack for the return addresses that follow
                                              * each one. Static analysis has now been wrong nine
@@ -13826,7 +13921,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                             uint64_t want1 = mbase + 0x2adb1aull; /* mode-3 site */
                                             uint64_t want2 = mbase + 0x2adbfbull; /* mode-1/2 site */
                                             unsigned si;
-                                            frame_done = 1;
+                                            vm->diag.frame_done = 1;
                                             for (si = 0; si < 512u; si++) {
                                                 uint64_t v = 0;
                                                 if (!fw_1_read_guest_va(vm, bs.cr3,
@@ -14080,19 +14175,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * pic_delivered=1156 with mISR=0x1. That is a correlation, not a proof, and
                      * putting both numbers on one line is what lets the next run decide it.
                      *
-                     * HOST-WIDE, and labelled so. g_int_vintr_defer / g_int_defer_overwrite are
-                     * file-global in the SVM backend, summed over every vCPU of every VM, so
-                     * they cannot say WHICH guest lost an injection -- the counter that would
-                     * identify the culprit is exactly the one that is not per-vCPU. Printing
-                     * them beside per-VM numbers without saying so would invent an attribution
-                     * that does not exist.
+                     * #563: PER-VCPU now, and labelled so. These were file-global in both
+                     * backends, summed over every vCPU of every VM, so they could not say WHICH
+                     * guest lost an injection -- the counter that would identify the culprit was
+                     * exactly the one that was not per-vCPU, and the label had to say HOST-WIDE
+                     * to avoid inventing an attribution that did not exist. It exists now: these
+                     * come from this vCPU's own context.
                      */
                     unsigned long long ei_ = 0, df_ = 0, wn_ = 0, ov_ = 0;
-                    (void)vmm_get_int_diag(kind, &ei_, &df_, &wn_, &ov_);
+                    (void)vmm_get_int_diag(kind, ctx, &ei_, &df_, &wn_, &ov_);
                     hype_debug_print("fw-1 PITROUTE vm%u: pic_delivered=%llu apic_delivered=%llu "
                                      "apic_refused=%llu | RTE[2]=0x%llx RTE[0]=0x%llx mIMR=0x%x "
-                                     "mIRR=0x%x mISR=0x%x | PIT0 mode=%u reload=%u | HOST-WIDE "
-                                     "defer=%llu overwrite=%llu [#557]\n",
+                                     "mIRR=0x%x mISR=0x%x | PIT0 mode=%u reload=%u | THIS-VCPU "
+                                     "defer=%llu overwrite=%llu [#557/#563]\n",
                                      (unsigned)(vm - g_vms),
                                      (unsigned long long)pit_irqs,
                                      (unsigned long long)pit_irqs_apic,
@@ -14177,13 +14272,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 {
                     hype_vmm_intr_state_t idg;
                     unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
-                    (void)vmm_get_int_diag(kind, &ei, &df, &wn, &ov);
+                    (void)vmm_get_int_diag(kind, ctx, &ei, &df, &wn, &ov);
                     vmm_get_intr_state(kind, ctx, &idg);
                     hype_debug_print("fw-1 INTDIAG: eventinj=%llu defer=%llu window=%llu coalesced=%llu "
                                      "collisions=%llu | pending=%d(top 0x%x) staged_eventinj=0x%llx "
                                      "IF=%d shadow=0x%llx\n",
                                      ei, df, wn, ov,
-                                     vmm_get_eventinj_collisions(kind),
+                                     vmm_get_eventinj_collisions(kind, ctx),
                                      idg.pending_count, (unsigned int)idg.pending_vector,
                                      (unsigned long long)idg.eventinj,
                                      (int)((idg.rflags >> 9) & 1u),
@@ -14270,12 +14365,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* #239: retain the legacy guest-loop cadence for BSP-guest builds.
              * AP calls are no-ops; the normal AP build drains from the BSP loop. */
             if (g_fw_1_host_tsc_hz != 0) {
-                static uint64_t usblog_last_tsc = 0;
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 uint64_t now_u = hype_rdtsc();
                 uint64_t usb_interval = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_fw_1_host_tsc_hz;
-                if (usblog_last_tsc == 0 || now_u - usblog_last_tsc >= usb_interval) {
+                if (vm->diag.usblog_last_tsc == 0 || now_u - vm->diag.usblog_last_tsc >= usb_interval) {
                     unsigned sec_prev = g_436_loop_section[(unsigned)(vm - g_vms)];
-                    usblog_last_tsc = now_u;
+                    vm->diag.usblog_last_tsc = now_u;
                     /* #484: distinct marker so a long lock hold can be attributed to the USB
                      * log flush rather than to "somewhere in the BSP's housekeeping". */
                     g_436_loop_section[(unsigned)(vm - g_vms)] = 21;
@@ -14626,14 +14721,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     lapic_ticks = lapic_tick_accum / HYPE_PIT_HZ;
                     lapic_tick_accum -= lapic_ticks * HYPE_PIT_HZ;
                     { /* #436: feed rate + full latch state, one line per 5s */
-                        static uint64_t lt_sum, lt_last, lt_prev;
-                        lt_sum += lapic_ticks;
+                        /* #563: was a shared `static`; per-VM in vm->diag now. */
+                        vm->diag.lt_sum += lapic_ticks;
                         uint64_t now_lt = hype_rdtsc();
-                        if (g_fw_1_host_tsc_hz && now_lt - lt_last > 5u * g_fw_1_host_tsc_hz) {
-                            lt_last = now_lt;
+                        if (g_fw_1_host_tsc_hz && now_lt - vm->diag.lt_last > 5u * g_fw_1_host_tsc_hz) {
+                            vm->diag.lt_last = now_lt;
                             hype_debug_print("fw-1 LAPSTATE: feed+%llu/5s pend=%d insvc=%d cur=%u init=%u "
                                              "lvt=0x%x eoi=%llu [#436]\n",
-                                             (unsigned long long)(lt_sum - lt_prev),
+                                             (unsigned long long)(vm->diag.lt_sum - vm->diag.lt_prev),
                                              g_fw_1_lapic.timer_irq_pending,
                                              g_fw_1_lapic.timer_in_service,
                                              (unsigned)g_fw_1_lapic.current_count,
@@ -14678,7 +14773,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                      (unsigned long long)gs.exitintinfo);
                                 }
                             }
-                            lt_prev = lt_sum;
+                            vm->diag.lt_prev = vm->diag.lt_sum;
                         }
                     }
                     hype_guest_lapic_advance(&g_fw_1_lapic, lapic_ticks);
@@ -14706,21 +14801,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          * timer left masked), and the guest's InterruptTime runs
                          * ~3.7x its wall clock. Print the PROGRAMMED rate next to
                          * the DELIVERED rate so a mismatch names itself. */
-                        static uint64_t rtc_last_tsc;
-                        static unsigned long long rtc_last_irqs;
+                        /* #563: was a shared `static`; per-VM in vm->diag now. */
+                        /* #563: was a shared `static`; per-VM in vm->diag now. */
                         uint64_t now_rtc = hype_rdtsc();
-                        if (now_rtc - rtc_last_tsc > 5u * g_fw_1_host_tsc_hz) {
-                            if (rtc_last_tsc != 0u) {
+                        if (now_rtc - vm->diag.rtc_last_tsc > 5u * g_fw_1_host_tsc_hz) {
+                            if (vm->diag.rtc_last_tsc != 0u) {
                                 hype_debug_print(
                                     "fw-1 #94 RTCRATE: delivered=%llu/5s programmed=%uHz "
                                     "regA=0x%02x regB=0x%02x\n",
-                                    (unsigned long long)(g_94_rtc_irqs - rtc_last_irqs),
+                                    (unsigned long long)(g_94_rtc_irqs - vm->diag.rtc_last_irqs),
                                     (unsigned)hype_cmos_periodic_hz(&vm->cmos),
                                     (unsigned)vm->cmos.registers[HYPE_CMOS_REG_STATUS_A],
                                     (unsigned)vm->cmos.registers[HYPE_CMOS_REG_STATUS_B]);
                             }
-                            rtc_last_tsc = now_rtc;
-                            rtc_last_irqs = g_94_rtc_irqs;
+                            vm->diag.rtc_last_tsc = now_rtc;
+                            vm->diag.rtc_last_irqs = g_94_rtc_irqs;
                         }
                     }
                 }
@@ -14988,9 +15083,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     fw_1_deliver_device_vector(vm, kind, HYPE_FW_1_ATA_GSI, iov); /* #512 */
                     g_ata_irq_delivered++;
                 } else {
-                    static int ata_undelivered_reported = 0;
-                    if (!ata_undelivered_reported) {
-                        ata_undelivered_reported = 1;
+                    /* #563: was a shared `static`; per-VM in vm->diag now. */
+                    if (!vm->diag.ata_undelivered_reported) {
+                        vm->diag.ata_undelivered_reported = 1;
                         hype_debug_print("fw-1 ATA-IRQ-UNDELIVERED: gsi=%u rte=0x%llx p_is=0x%x "
                                          "p_ie=0x%x ghc=0x%x pci_line=%u\n",
                                          (unsigned int)HYPE_FW_1_ATA_GSI,
@@ -15250,7 +15345,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
                     *starve_dumped = 1;
                     vmm_get_intr_state(kind, ctx, &sv);
-                    (void)vmm_get_int_diag(kind, &ei, &df, &wn, &ov);
+                    (void)vmm_get_int_diag(kind, ctx, &ei, &df, &wn, &ov);
                     hype_debug_print(
                         "fw-1 TIMER-STARVE vm%u: IRQ0 undelivered >2s | IF=%d shadow=0x%llx can_accept=%d "
                         "pending=%d/vec0x%x eventinj=0x%llx | mIRR=0x%x mISR=0x%x mIMR=0x%x "
@@ -15336,18 +15431,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint64_t hz = g_fw_1_host_tsc_hz;
             uint64_t now_s = hype_rdtsc();
             if (hz != 0 && (g_scan_last[svi] == 0 || now_s - g_scan_last[svi] >= hz / 10u)) {
-                static uint8_t snap[HYPE_VT_MAX_ROWS * (HYPE_VT_MAX_COLS + 1u)];
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 unsigned row, col, n = 0;
                 g_scan_last[svi] = now_s;
                 for (row = 0; row < vm->term.rows; row++) {
                     for (col = 0; col < vm->term.cols; col++) {
-                        snap[n++] = hype_vt_screen_cell(&vm->term, col, row).ch;
+                        vm->diag.snap[n++] = hype_vt_screen_cell(&vm->term, col, row).ch;
                     }
                     /* Row boundaries matter: without them the last column of one row and the first
                      * of the next would splice into words neither row contains. */
-                    snap[n++] = '\n';
+                    vm->diag.snap[n++] = '\n';
                 }
-                hype_input_runner_scan(&vm->in_runner, snap, n);
+                hype_input_runner_scan(&vm->in_runner, vm->diag.snap, n);
             }
         }
         g_436_loop_section[(unsigned)(vm-g_vms)]=6;
@@ -15360,13 +15455,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * sequences from being collapsed into one notification.
          */
         {   /* #436: prove the drain gate runs and what blocks it */
-            static uint64_t dr_last; static uint64_t dr_n;
-            dr_n++;
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
+            vm->diag.dr_n++;
 #ifndef HYPE_QUIET
-            if (g_fw_1_host_tsc_hz && hype_rdtsc() - dr_last > 5u * g_fw_1_host_tsc_hz) {
-                dr_last = hype_rdtsc();
+            if (g_fw_1_host_tsc_hz && hype_rdtsc() - vm->diag.dr_last > 5u * g_fw_1_host_tsc_hz) {
+                vm->diag.dr_last = hype_rdtsc();
                 hype_debug_print("fw-1 DRAIN: iters=%llu kbd_pending=%d q_pending=%u [#436]\n",
-                                 (unsigned long long)dr_n,
+                                 (unsigned long long)vm->diag.dr_n,
                                  hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2),
                                  hype_scancode_queue_pending(&vm->host_ps2_queue));
             }
@@ -15403,38 +15498,38 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * that buffer must still cause IRQ1: a real i8042 keeps the
              * output condition asserted, whereas a one-shot FIFO edge loses
              * the input forever behind the pre-existing byte. */
-            static uint64_t kbd_rte1_last;
-            static unsigned long long kbd_queued_last;
-            static int kbd_rte1_seen;
-            static int kbd_obf_irq_delivered;
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
             unsigned long long kbd_queued = 0;
             unsigned long long ignored_read = 0, ignored_dropped = 0;
-            int kbd_route_changed = kbd_rte1_seen &&
-                kbd_rte1_last != g_fw_1_ioapic.rte[1];
+            int kbd_route_changed = vm->diag.kbd_rte1_seen &&
+                vm->diag.kbd_rte1_last != g_fw_1_ioapic.rte[1];
             uint8_t kiov;
 
             hype_ps2_kbd_scancode_stats(&g_fw_1_ps2, &kbd_queued, &ignored_read,
                                          &ignored_dropped);
-            if (kbd_route_changed || kbd_queued != kbd_queued_last ||
+            if (kbd_route_changed || kbd_queued != vm->diag.kbd_queued_last ||
                 !hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
-                kbd_obf_irq_delivered = 0;
+                vm->diag.kbd_obf_irq_delivered = 0;
             }
-            kbd_rte1_last = g_fw_1_ioapic.rte[1];
-            kbd_rte1_seen = 1;
-            kbd_queued_last = kbd_queued;
+            vm->diag.kbd_rte1_last = g_fw_1_ioapic.rte[1];
+            vm->diag.kbd_rte1_seen = 1;
+            vm->diag.kbd_queued_last = kbd_queued;
             if (hype_ps2_kbd_has_pending_irq(&g_fw_1_ps2) ||
-                (!kbd_obf_irq_delivered && hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2))) {
+                (!vm->diag.kbd_obf_irq_delivered && hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2))) {
                 if (hype_ioapic_raise(&g_fw_1_ioapic, 1u, &kiov)) {
                     if (hype_ps2_kbd_has_pending_irq(&g_fw_1_ps2)) {
                         (void)hype_ps2_kbd_take_irq(&g_fw_1_ps2);
                     }
-                    kbd_obf_irq_delivered = 1;
+                    vm->diag.kbd_obf_irq_delivered = 1;
                     fw_1_deliver_device_vector(vm, kind, 1u, kiov); /* #512 */
                 } else if ((g_fw_1_pic.master.imr & (uint8_t)(1u << 1)) == 0) {
                     if (hype_ps2_kbd_has_pending_irq(&g_fw_1_ps2)) {
                         (void)hype_ps2_kbd_take_irq(&g_fw_1_ps2);
                     }
-                    kbd_obf_irq_delivered = 1;
+                    vm->diag.kbd_obf_irq_delivered = 1;
                     hype_pic_emu_raise_global_irq(&g_fw_1_pic, 1u);
                 }
             }
@@ -15448,32 +15543,32 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * masked IO-APIC route. Reassert that existing AUX byte once when
              * the guest enables GSI12; otherwise the old edge is lost and the
              * keyboard driver correctly remains behind AUX_DATA forever. */
-            static uint64_t mouse_rte12_last;
-            static int mouse_rte12_seen;
-            static int mouse_obf_irq_delivered;
-            int mouse_route_changed = mouse_rte12_seen &&
-                mouse_rte12_last != g_fw_1_ioapic.rte[12];
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
+            int mouse_route_changed = vm->diag.mouse_rte12_seen &&
+                vm->diag.mouse_rte12_last != g_fw_1_ioapic.rte[12];
             uint8_t miov;
 
             if (mouse_route_changed || !hype_ps2_mouse_has_pending_byte(&g_fw_1_mouse)) {
-                mouse_obf_irq_delivered = 0;
+                vm->diag.mouse_obf_irq_delivered = 0;
             }
-            mouse_rte12_last = g_fw_1_ioapic.rte[12];
-            mouse_rte12_seen = 1;
+            vm->diag.mouse_rte12_last = g_fw_1_ioapic.rte[12];
+            vm->diag.mouse_rte12_seen = 1;
             if (hype_ps2_mouse_has_pending_irq(&g_fw_1_mouse) ||
-                (!mouse_obf_irq_delivered && hype_ps2_mouse_has_pending_byte(&g_fw_1_mouse))) {
+                (!vm->diag.mouse_obf_irq_delivered && hype_ps2_mouse_has_pending_byte(&g_fw_1_mouse))) {
                 if (hype_ioapic_raise(&g_fw_1_ioapic, 12u, &miov)) {
                     if (hype_ps2_mouse_has_pending_irq(&g_fw_1_mouse)) {
                         (void)hype_ps2_mouse_take_irq(&g_fw_1_mouse);
                     }
-                    mouse_obf_irq_delivered = 1;
+                    vm->diag.mouse_obf_irq_delivered = 1;
                     fw_1_deliver_device_vector(vm, kind, 12u, miov); /* #512 */
                 } else if ((g_fw_1_pic.master.imr & (uint8_t)(1u << 2)) == 0 &&
                            (g_fw_1_pic.slave.imr & (uint8_t)(1u << 4)) == 0) {
                     if (hype_ps2_mouse_has_pending_irq(&g_fw_1_mouse)) {
                         (void)hype_ps2_mouse_take_irq(&g_fw_1_mouse);
                     }
-                    mouse_obf_irq_delivered = 1;
+                    vm->diag.mouse_obf_irq_delivered = 1;
                     hype_pic_emu_raise_global_irq(&g_fw_1_pic, 12u);
                 }
             }
@@ -15538,13 +15633,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * (AGENTS.md): CLGI in particular would otherwise mask physical interrupts on this
              * guest's pinned core, taking the host's timer tick with it.
              */
-            static unsigned long long svm_insn_n = 0;
-            svm_insn_n++;
-            if (svm_insn_n <= 8ull) {
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
+            vm->diag.svm_insn_n++;
+            if (vm->diag.svm_insn_n <= 8ull) {
                 hype_debug_print("fw-1 %s: guest executed an SVM instruction (exit=0x%llx) at "
                                  "guest_rip=0x%llx -- injecting #UD (#%llu)\n",
                                  vm->name, (unsigned long long)info.reason,
-                                 (unsigned long long)info.guest_rip, svm_insn_n);
+                                 (unsigned long long)info.guest_rip, vm->diag.svm_insn_n);
             }
             vmm_reinject_exception(kind, ctx, 6u, 0, 0u); /* #UD pushes no error code */
             continue;
@@ -15794,9 +15889,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * instruction bytes means the path is live and we can trust the
              * MMIO decode. */
             {
-                static int fw1_da_diag = 0;
-                if (!fw1_da_diag) {
-                    fw1_da_diag = 1;
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
+                if (!vm->diag.fw1_da_diag) {
+                    vm->diag.fw1_da_diag = 1;
                     hype_debug_print("fw-1 DIAG: 1st NPF decode-assist n=%u (0=none->ptwalk) "
                                       "insn=%02x %02x %02x %02x guest_rip=0x%llx\n",
                                       (unsigned int)insn_n,
@@ -16169,24 +16264,24 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          * read the CD (AHCI/ATAPI issue); with read10>0 but no
                          * boot, it's a boot-order/bootable-media issue. */
                         {
-                            static uint32_t last_reported_reads = 0;
-                            static int first_cmd_reported = 0;
-                            static uint64_t read10_first_tsc = 0;
-                            if (read10_first_tsc == 0 && g_fw_1_atapi.read10_count >= 1) {
-                                read10_first_tsc = hype_rdtsc();
+                            /* #563: was a shared `static`; per-VM in vm->diag now. */
+                            /* #563: was a shared `static`; per-VM in vm->diag now. */
+                            /* #563: was a shared `static`; per-VM in vm->diag now. */
+                            if (vm->diag.read10_first_tsc == 0 && g_fw_1_atapi.read10_count >= 1) {
+                                vm->diag.read10_first_tsc = hype_rdtsc();
                             }
-                            if (!first_cmd_reported && g_fw_1_atapi.command_count > 0) {
-                                first_cmd_reported = 1;
+                            if (!vm->diag.first_cmd_reported && g_fw_1_atapi.command_count > 0) {
+                                vm->diag.first_cmd_reported = 1;
                                 hype_debug_print("fw-1 DIAG: guest issued 1st ATAPI CDB (opcode=0x%x)\n",
                                                   (unsigned int)g_fw_1_atapi.last_cdb);
                             }
-                            if (g_fw_1_atapi.read10_count >= 1 && last_reported_reads == 0) {
-                                last_reported_reads = 1; /* latch: fire once, not per-MMIO-access */
+                            if (g_fw_1_atapi.read10_count >= 1 && vm->diag.last_reported_reads == 0) {
+                                vm->diag.last_reported_reads = 1; /* latch: fire once, not per-MMIO-access */
                                 hype_debug_print("fw-1 DIAG: 1st ATAPI READ(10) done -- CD data I/O "
                                                   "works on real HW (cmds=%u)\n",
                                                   (unsigned int)g_fw_1_atapi.command_count);
                             }
-                            if (g_fw_1_atapi.read10_count >= last_reported_reads + 64) {
+                            if (g_fw_1_atapi.read10_count >= vm->diag.last_reported_reads + 64) {
                                 /* task #105 measure-first: READ(10) size profile
                                  * + throughput. avg = sectors/reads shows how big
                                  * the guest's CD reads actually are; the hist
@@ -16197,9 +16292,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  * real bottleneck (transfer size vs per-command
                                  * latency) is visible rather than assumed. */
                                 uint64_t r10_ms = 0, r10_kbps = 0;
-                                last_reported_reads = g_fw_1_atapi.read10_count;
-                                if (read10_first_tsc != 0 && g_fw_1_host_tsc_hz != 0) {
-                                    uint64_t dt = hype_rdtsc() - read10_first_tsc;
+                                vm->diag.last_reported_reads = g_fw_1_atapi.read10_count;
+                                if (vm->diag.read10_first_tsc != 0 && g_fw_1_host_tsc_hz != 0) {
+                                    uint64_t dt = hype_rdtsc() - vm->diag.read10_first_tsc;
                                     r10_ms = (dt * 1000ULL) / g_fw_1_host_tsc_hz;
                                     if (r10_ms != 0) {
                                         r10_kbps = (g_fw_1_atapi.read10_sectors_total * 2ULL * 1000ULL)
@@ -16335,9 +16430,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (npf.guest_phys_addr >= vblk_bar &&
                     npf.guest_phys_addr < vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
                     if (vm->disk[0].is_physical) {
-                        static int dbg229_once = 0;
-                        if (!dbg229_once) {
-                            dbg229_once = 1;
+                        /* #563: was a shared `static`; per-VM in vm->diag now. */
+                        if (!vm->diag.dbg229_once) {
+                            vm->diag.dbg229_once = 1;
                             hype_debug_print("#229dbg npf: CR3=0x%llx g_pml4=0x%llx nvme_bar=0x%llx\n",
                                              (unsigned long long)hype_dbg_read_cr3(),
                                              (unsigned long long)(uintptr_t)g_pml4,
@@ -16491,13 +16586,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             fw_1_watchdog_observe(vm, (unsigned)(vm - g_vms), (uint64_t)info.reason,
                                   info.guest_rip, 0, 0);
             if (vmm_absorb_mmio_npf(kind, ctx, insn) == 0) {
-                static uint64_t seen_mmio[128];
-                static unsigned seen_mmio_n = 0;
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 uint64_t page = npf.guest_phys_addr & ~0xFFFULL;
                 unsigned k;
                 int already = 0;
-                for (k = 0; k < seen_mmio_n; k++) {
-                    if (seen_mmio[k] == page) {
+                for (k = 0; k < vm->diag.seen_mmio_n; k++) {
+                    if (vm->diag.seen_mmio[k] == page) {
                         already = 1;
                         break;
                     }
@@ -16508,8 +16603,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                       (unsigned long long)npf.guest_phys_addr,
                                       npf.is_write ? "write" : "read",
                                       (unsigned long long)info.guest_rip);
-                    if (seen_mmio_n < 128u) {
-                        seen_mmio[seen_mmio_n++] = page;
+                    if (vm->diag.seen_mmio_n < 128u) {
+                        vm->diag.seen_mmio[vm->diag.seen_mmio_n++] = page;
                     }
                 }
                 continue;
@@ -16690,18 +16785,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * buffer. 256 covers a DEBUG line; a longer transfer is consumed and
                  * truncated rather than left half-done, which would desynchronise the
                  * guest's own rep. */
-                static uint8_t dbg_bytes[256];
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 unsigned int dbg_n = 0;
                 int dr = vmm_handle_debug_port_ioio(kind, ctx, HYPE_FW_1_DEBUG_PORT,
-                                                    &g_fw_1_dma_map, dbg_bytes,
-                                                    (unsigned)sizeof(dbg_bytes), &dbg_n);
+                                                    &g_fw_1_dma_map, vm->diag.dbg_bytes,
+                                                    (unsigned)sizeof(vm->diag.dbg_bytes), &dbg_n);
                 if (dr == 0) {
                     unsigned int dbi;
                     g_dbgport_writes++;
                     g_dbgport_bytes += dbg_n;
                     for (dbi = 0; dbi < dbg_n; dbi++) {
                         fw_1_debug_feed((unsigned)(vm - g_vms), &dbg_filter, dbg_line,
-                                        &dbg_line_len, FW_1_LINE_BUF, dbg_bytes[dbi]);
+                                        &dbg_line_len, FW_1_LINE_BUF, vm->diag.dbg_bytes[dbi]);
                     }
                     continue;
                 }
@@ -16731,8 +16826,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * the boot to a crawl on real hardware; latch it like the
                  * MSR-trace flood so discovery still works without the
                  * per-access render. */
-                static uint32_t seen_ports[128];
-                static unsigned int seen_ports_n = 0;
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 uint32_t key;
                 unsigned int k;
                 int already = 0;
@@ -16741,8 +16836,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     ex_io80++; /* exit-histogram sub-bucket: io_delay port */
                 }
                 key = (uint32_t)io.port | (io.is_in ? 0x80000000u : 0u);
-                for (k = 0; k < seen_ports_n; k++) {
-                    if (seen_ports[k] == key) {
+                for (k = 0; k < vm->diag.seen_ports_n; k++) {
+                    if (vm->diag.seen_ports[k] == key) {
                         already = 1;
                         break;
                     }
@@ -16752,8 +16847,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                       "(further hits on this port silenced)\n",
                                       (unsigned int)io.port, io.is_in ? "IN" : "OUT",
                                       (unsigned int)io.size_bytes, (unsigned long long)info.guest_rip);
-                    if (seen_ports_n < 128u) {
-                        seen_ports[seen_ports_n++] = key;
+                    if (vm->diag.seen_ports_n < 128u) {
+                        vm->diag.seen_ports[vm->diag.seen_ports_n++] = key;
                     }
                 }
             }
@@ -16778,7 +16873,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (vmm_reason_is_exception(kind, ctx, info.reason, 1)) {
             /* #436: the KeBugCheckEx breakpoint. Report the call exactly as the
              * guest made it, then disarm so the bugcheck proceeds untouched. */
-            static int bp_hit = 0;
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
             /* #436: this probe runs constantly and succeeds; report only the
              * execution that is about to fault -- the one whose clamped address
              * equals the value the bugcheck reported. */
@@ -16793,12 +16888,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * line in the log is the execution that faulted -- no condition
                  * needed, and no risk of the condition being wrong (which it has
                  * been twice). */
-                static unsigned ent_n = 0;
-                ent_n++;
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
+                vm->diag.ent_n++;
                 {
                 hype_svm_debug_state_t ds;
                 uint64_t ret = 0, p5 = 0;
-                bp_hit = 1;
                 hype_svm_vcpu_get_debug_state(ctx, &ds);
                 (void)fw_1_read_guest_va(vm, ds.cr3, ds.rsp, &ret, 8);
                 (void)fw_1_read_guest_va(vm, ds.cr3, ds.rsp + 0x28ull, &p5, 8);
@@ -16811,7 +16905,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     (void)fw_1_read_guest_va(vm, es.cr3, r8v, &srcv, 8);
                     hype_debug_print("fw-1 #436 HIT[%u]: rbx=0x%llx r8=0x%llx *(r8)=0x%llx "
                                      "rsi=0x%llx rdi=0x%llx\n",
-                                     ent_n,
+                                     vm->diag.ent_n,
                                      (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 3),
                                      (unsigned long long)r8v,
                                      (unsigned long long)srcv,
@@ -16826,8 +16920,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             (HYPE_521_TRAP_PF && vmm_reason_is_exception(kind, ctx, info.reason, 14))) {
             unsigned vec = (unsigned)vmm_exception_vector(kind, ctx, info.reason);
             int is_gp = (vec == 13u);
-            static unsigned guestexcp_log_n = 0;
-            if (guestexcp_log_n < 96u) {
+            /* #563: was a shared `static`; per-VM in vm->diag now. */
+            if (vm->diag.guestexcp_log_n < 96u) {
                 /*
                  * Take RIP/CR3 from the VENDOR-NEUTRAL exit info, not from
                  * hype_svm_debug_state_t. vmm_get_debug_state() is SVM-only: on
@@ -16847,7 +16941,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 uint64_t xcr3 = vmm_get_cr3(kind, ctx);
                 uint8_t ib[12];
                 unsigned k;
-                guestexcp_log_n++;
+                vm->diag.guestexcp_log_n++;
                 for (k = 0; k < 12u; k++) { ib[k] = 0; }
                 /*
                  * userspace/kernel RIP -> read insn bytes via the guest CR3, but
@@ -16893,19 +16987,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * this is three lines per fault and the fault repeats.
                  */
                 if (kind == HYPE_VMM_KIND_VMX) {
-                    static unsigned excdump_n = 0;
-                    if (excdump_n < 3u) {
-                        excdump_n++;
+                    /* #563: was a shared `static`; per-VM in vm->diag now. */
+                    if (vm->diag.excdump_n < 3u) {
+                        vm->diag.excdump_n++;
                         hype_vmx_vcpu_dump_ept_violation(ctx);
                     }
                 }
                 if (kind == HYPE_VMM_KIND_VMX && ib[0] == 0x0Fu && ib[1] == 0x22u) {
-                    static unsigned cr_probe_n = 0;
-                    if (cr_probe_n < 4u) {
+                    /* #563: was a shared `static`; per-VM in vm->diag now. */
+                    if (vm->diag.cr_probe_n < 4u) {
                         hype_vmx_cr_diag_t cd;
                         unsigned crn = (unsigned)((ib[2] >> 3) & 7u);
                         unsigned rm = (unsigned)(ib[2] & 7u);
-                        cr_probe_n++;
+                        vm->diag.cr_probe_n++;
                         hype_vmx_vcpu_get_cr_diag(ctx, rm, &cd);
                         hype_debug_print(
                             "fw-1 CRPROBE: MOV CR%u, gpr%u -> attempted=0x%llx | GUEST_CR0=0x%llx "
@@ -17200,20 +17294,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * silent -- resolve the RIP against winload/ntoskrnl offline.
              */
             if (kind != HYPE_VMM_KIND_VMX) {
-                static int deadhalt_dumped = 0;
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 hype_vmm_intr_state_t dh;
                 vmm_get_intr_state(kind, ctx, &dh);
-                if (!deadhalt_dumped && productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
+                if (!vm->diag.deadhalt_dumped && productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
                     ((dh.rflags >> 9) & 1u) == 0u) {
                     uint64_t rip = info.guest_rip;
                     uint64_t cr3 = vmm_get_cr3(kind, ctx);
-                    static uint8_t ib[16]; /* static: keep run_fw_1_test frame under __chkstk */
+                    /* #563: was a shared `static`; per-VM in vm->diag now. */ /* static: keep run_fw_1_test frame under __chkstk */
                     unsigned k;
-                    deadhalt_dumped = 1;
-                    for (k = 0; k < 16u; k++) { ib[k] = 0; }
-                    if (cr3 == 0 || !fw_1_read_guest_va(vm, cr3, rip, ib, 16)) {
+                    vm->diag.deadhalt_dumped = 1;
+                    for (k = 0; k < 16u; k++) { vm->diag.ib[k] = 0; }
+                    if (cr3 == 0 || !fw_1_read_guest_va(vm, cr3, rip, vm->diag.ib, 16)) {
                         const uint8_t *phys = fw_1_guest_phys_to_host(vm, rip);
-                        if (phys != 0) { for (k = 0; k < 16u; k++) { ib[k] = phys[k]; } }
+                        if (phys != 0) { for (k = 0; k < 16u; k++) { vm->diag.ib[k] = phys[k]; } }
                     }
                     hype_debug_print("fw-1 #436 DEADHALT: rip=0x%llx cr3=0x%llx IF=0 | "
                                      "rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx | "
@@ -17228,8 +17322,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 6),
                                      (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 7),
                                      (unsigned long long)hype_svm_vcpu_get_gpr(ctx, 5),
-                                     ib[0], ib[1], ib[2], ib[3], ib[4], ib[5], ib[6], ib[7],
-                                     ib[8], ib[9], ib[10], ib[11], ib[12], ib[13], ib[14], ib[15]);
+                                     vm->diag.ib[0], vm->diag.ib[1], vm->diag.ib[2], vm->diag.ib[3], vm->diag.ib[4], vm->diag.ib[5], vm->diag.ib[6], vm->diag.ib[7],
+                                     vm->diag.ib[8], vm->diag.ib[9], vm->diag.ib[10], vm->diag.ib[11], vm->diag.ib[12], vm->diag.ib[13], vm->diag.ib[14], vm->diag.ib[15]);
                     usb_log_flush();
                 }
             }
@@ -17251,12 +17345,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * the timer-IRQ wedge, and IF/shadow/eventinj/vintr/pending
              * tell whether it's a dead IF=0 halt or ready-but-undelivered. */
             {
-                static int wedge_dumped = 0;
-                if (!wedge_dumped && g_fw_1_host_tsc_hz != 0 &&
+                /* #563: was a shared `static`; per-VM in vm->diag now. */
+                if (!vm->diag.wedge_dumped && g_fw_1_host_tsc_hz != 0 &&
                     tb_last_tsc - last_progress_tsc >= 2ULL * g_fw_1_host_tsc_hz &&
                     (g_fw_1_pic.master.isr != 0 || g_fw_1_pic.slave.isr != 0)) {
                     hype_vmm_intr_state_t is;
-                    wedge_dumped = 1;
+                    vm->diag.wedge_dumped = 1;
                     vmm_get_intr_state(kind, ctx, &is);
                     hype_debug_print("fw-1: M4-6d2 WEDGE: IF=%d shadow=0x%llx eventinj=0x%llx vintr=0x%llx "
                                       "can_accept=%d pending=%d/vec0x%x (master ISR=0x%x IMR=0x%x, "
@@ -17424,10 +17518,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * (or AHCI) IRQ delivery wedges, defer >> window or overwrite > 0
          * shows deferred injections stuck/lost via the VINTR path. */
         unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
-        (void)vmm_get_int_diag(kind, &ei, &df, &wn, &ov);
+        (void)vmm_get_int_diag(kind, ctx, &ei, &df, &wn, &ov);
         hype_debug_print("fw-1: M4-6d2 int diag: EVENTINJ=%llu, VINTR-defer=%llu, VINTR-window=%llu, "
                           "coalesced=%llu, eventinj-collisions=%llu\n", ei, df, wn, ov,
-                          vmm_get_eventinj_collisions(kind));
+                          vmm_get_eventinj_collisions(kind, ctx));
     }
 
     /* M4-6d3 real-HW diag: characterise WHY the loop gave up. On real
