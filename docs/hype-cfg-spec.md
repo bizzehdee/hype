@@ -116,11 +116,33 @@ kinds are ignored (§4.1).
 | `config_version` | int | `1` | §4.2 |
 | `host_cpu_budget` | cpu-list (`0-3`, `0,1,2`) | all cores | **physical cores** hype may dispatch VMs on (plan.md §5 `cpu_set` is the per-VM subset of this). A listed core is granted whole, so on an SMT host each entry supplies all of that core's hardware threads to the one VM that owns it (plan.md §10 decisions 40, 47) |
 | `default_net_mode` | `none` \| `nat` | `none` | per-VM `net_mode` overrides |
+| `uplink_ip` | dotted quad | (none) | **hype's own address on the physical network** (HNET-8 #405). NAPT cannot masquerade guests behind a port that has no address, so this is what makes `net_mode = nat` functional |
+| `uplink_mask` | dotted quad | (none) | netmask for `uplink_ip` |
+| `uplink_gateway` | dotted quad | (none) | next hop for anything off-link |
 | `dashboard_default_view` | `dashboard` \| `vm:<name>` | `dashboard` | which view the GOP shows at boot (TERM) |
 | `autostart` | `all` \| `none` \| list | `all` | which VMs to Start at boot (plan.md §6h/§9) |
 | `shared_overcommit_ratio` | float, `>= 1.0` | `4.0` | max vCPU:thread over-commit ratio for the shared scheduling tier's pool (plan.md §10 decision 39). Admission (§6i) refuses startup if any `cpu_mode = shared` VM is configured while this is `< 1.0` — that would forbid the pool from over-committing at all, which is the tier's whole point |
 | `log_level` | `error` \| `warn` \| `info` \| `debug` | `debug` | post-`ExitBootServices` log verbosity (#533). **Defaults to `debug` (everything), and every failure to read or understand the config leaves it there** — a host that cannot read its config is the host whose log matters most, so a broken value must never quiet it. Named, not numbered: a number in a config file is unreadable six months later. Phase 0 always logs in full; it runs before the config exists (plan.md §10 decision 37) and it is short. A panic is never filtered at any level. The level in force is printed before any line it could filter, so a reader can tell a quiet host from a quiet logger |
 | `shared_timeslice_us` | int, microseconds | `4000` | LAPIC one-shot preemption-timer slice length for the shared tier (plan.md §10 decision 39, SMP-20). Global only — no per-VM override; a shorter slice for one latency-sensitive shared VM is a plausible future knob, but nothing today asks for it, and it would multiply SMP-20's timing proof surface |
+
+**The three `uplink_*` keys are all-or-nothing** (#405). A partial set — an
+address with no gateway, say — parses, but leaves hype with **no** uplink rather
+than a half-configured one: a NAT plane that translates packets and has nowhere
+to send them is worse than one that plainly is not running. All three absent is a
+supported configuration, not a failure; a host running only offline guests needs
+no address. Either way the state is logged, because a guest whose network
+silently does not work is the case this project has paid for most often.
+
+There is deliberately **no `uplink_mode = dhcp`** key yet. DHCP is #405's other
+half and is not implemented, and a key that parsed and then acquired nothing
+would read as "networking is configured" while nothing worked — worse than a
+config that says nothing. When the DHCP client lands it gets its own key and its
+own default.
+
+Note the asymmetry with §5.5's `[nic.*]`: those keys describe the addresses
+**guests** use, which hype learns from their own traffic rather than being told.
+These describe the address **hype itself** answers to on the physical network,
+which nothing can tell it but the operator or a DHCP server.
 
 ### 5.2 `[vm.<name>]` — per VM
 

@@ -520,6 +520,57 @@ static hype_cfg_status_t validate_required(const hype_cfg_vm_t *vm, unsigned int
     return HYPE_CFG_OK;
 }
 
+/*
+ * #405: dotted-quad IPv4. Returns 0 and fills `out` on success, -1 otherwise.
+ *
+ * Strict on purpose: exactly four decimal octets, each 0-255, separated by single dots, nothing
+ * before or after. A lenient parser here would accept "10.0.2" or "10.0.2.15 " and silently give
+ * hype the wrong address, and the symptom of a wrong uplink address is a network that does not work
+ * with nothing pointing at the config.
+ */
+static int parse_ipv4_quad(const char *s, uint8_t out[4]) {
+    unsigned int part = 0;
+    unsigned int value = 0;
+    unsigned int digits = 0;
+
+    if (s == 0) {
+        return -1;
+    }
+    for (;;) {
+        if (*s >= '0' && *s <= '9') {
+            if (digits >= 3u) {
+                return -1; /* more than three digits cannot be an octet */
+            }
+            value = value * 10u + (unsigned int)(*s - '0');
+            digits++;
+            s++;
+            continue;
+        }
+        if (digits == 0u) {
+            return -1; /* an empty octet: a leading dot, a double dot, or a trailing dot */
+        }
+        if (value > 255u) {
+            return -1;
+        }
+        if (part >= 4u) {
+            return -1;
+        }
+        out[part] = (uint8_t)value;
+        part++;
+        value = 0;
+        digits = 0;
+        if (*s == '.') {
+            s++;
+            continue;
+        }
+        if (*s == '\0') {
+            break;
+        }
+        return -1; /* any other trailing character */
+    }
+    return (part == 4u) ? 0 : -1;
+}
+
 /* #222 (§5.1): per-[hype] duplicate-key tracking. */
 enum {
     H_CONFIG_VERSION = 1u << 0,
@@ -530,7 +581,10 @@ enum {
     /* #529: bit 5 was H_RESOLUTION. Left as a gap rather than renumbered -- the values are a
      * duplicate-key bitmask, not a wire format, and shifting them buys nothing. */
     H_CPU_AVG_WINDOW = 1u << 6,
-    H_LOG_LEVEL = 1u << 7 /* #533 */
+    H_LOG_LEVEL = 1u << 7, /* #533 */
+    H_UPLINK_IP = 1u << 8,      /* #405 */
+    H_UPLINK_MASK = 1u << 9,
+    H_UPLINK_GATEWAY = 1u << 10
 };
 
 static void hype_globals_defaults(hype_cfg_hype_t *h) {
@@ -591,6 +645,44 @@ static hype_cfg_status_t apply_hype_field(hype_cfg_hype_t *h, unsigned int *seen
             return HYPE_CFG_ERR_BAD_VALUE;
         }
         *seen |= H_DEFAULT_NET_MODE;
+        return HYPE_CFG_OK;
+    }
+    /*
+     * #405: hype's own uplink address, statically configured. Parsed here rather than in a
+     * [network] section of its own because there is exactly one physical uplink (plan.md 6e: "the
+     * one physical NIC the hypervisor owns"), so a section would be a section with one member.
+     */
+    if (hype_streq(key, "uplink_ip") || hype_streq(key, "uplink_mask") ||
+        hype_streq(key, "uplink_gateway")) {
+        uint8_t quad[4];
+        unsigned int flag;
+        uint8_t *dst;
+
+        if (hype_streq(key, "uplink_ip")) {
+            flag = H_UPLINK_IP;
+            dst = h->uplink_ip;
+        } else if (hype_streq(key, "uplink_mask")) {
+            flag = H_UPLINK_MASK;
+            dst = h->uplink_mask;
+        } else {
+            flag = H_UPLINK_GATEWAY;
+            dst = h->uplink_gateway;
+        }
+        if (*seen & flag) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (parse_ipv4_quad(val, quad) != 0) return HYPE_CFG_ERR_BAD_VALUE;
+        dst[0] = quad[0];
+        dst[1] = quad[1];
+        dst[2] = quad[2];
+        dst[3] = quad[3];
+        /*
+         * has_uplink is set only once ALL THREE are present. A partial uplink -- an address with no
+         * gateway, say -- is not a usable configuration, and treating it as one would produce a NAT
+         * plane that translated packets and had nowhere to send them. Requiring the set is the same
+         * rule the per-VM keys already follow (#225: all six or the config is ignored).
+         */
+        h->has_uplink = ((*seen | flag) & (H_UPLINK_IP | H_UPLINK_MASK | H_UPLINK_GATEWAY)) ==
+                        (H_UPLINK_IP | H_UPLINK_MASK | H_UPLINK_GATEWAY);
+        *seen |= flag;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "dashboard_default_view")) {
@@ -1681,6 +1773,23 @@ static void serialize_hype(hype_cfg_w_t *w, const hype_cfg_hype_t *h) {
         w_kv_cpu_list(w, "host_cpu_budget", h->host_cpu_budget, h->host_cpu_budget_count);
     }
     w_kv(w, "default_net_mode", h->default_net_mode == HYPE_CFG_NET_NAT ? "nat" : "none");
+    /* #405: emitted only when configured, like every other non-default -- writing an uplink of
+     * 0.0.0.0 into a config that had none would turn "no uplink" into "a broken uplink". */
+    if (h->has_uplink) {
+        char q[16];
+        hype_snprintf(q, sizeof(q), "%u.%u.%u.%u", (unsigned)h->uplink_ip[0],
+                      (unsigned)h->uplink_ip[1], (unsigned)h->uplink_ip[2],
+                      (unsigned)h->uplink_ip[3]);
+        w_kv(w, "uplink_ip", q);
+        hype_snprintf(q, sizeof(q), "%u.%u.%u.%u", (unsigned)h->uplink_mask[0],
+                      (unsigned)h->uplink_mask[1], (unsigned)h->uplink_mask[2],
+                      (unsigned)h->uplink_mask[3]);
+        w_kv(w, "uplink_mask", q);
+        hype_snprintf(q, sizeof(q), "%u.%u.%u.%u", (unsigned)h->uplink_gateway[0],
+                      (unsigned)h->uplink_gateway[1], (unsigned)h->uplink_gateway[2],
+                      (unsigned)h->uplink_gateway[3]);
+        w_kv(w, "uplink_gateway", q);
+    }
     if (h->dashboard_default_view == HYPE_CFG_VIEW_VM) {
         char tmp[HYPE_CFG_NAME_MAX + 4];
         hype_snprintf(tmp, sizeof(tmp), "vm:%s", h->dashboard_default_vm);

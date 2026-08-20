@@ -320,6 +320,26 @@ typedef struct {
 
     hype_cfg_net_mode_t default_net_mode; /* a per-VM net_mode overrides it */
 
+    /*
+     * HNET-8 (#405), the static half: hype's OWN address on the physical network, which NAPT needs
+     * before it can masquerade anything. plan.md 6e admits a DHCP client as the single sanctioned
+     * host endpoint and requires this static path alongside it, "so an operator who does not want
+     * even this can turn it off entirely".
+     *
+     * All three absent means NO UPLINK, and that is a supported configuration rather than a
+     * failure: a host running only offline guests must not need an address. It is LOGGED, because a
+     * guest whose network silently does not work is the case this project has paid for repeatedly.
+     *
+     * DHCP is not implemented yet. Until it is, absent means absent -- there is deliberately no
+     * `uplink_mode = dhcp` key that would parse and then do nothing, because a config that reads as
+     * "networking is configured" while nothing acquires an address is worse than one that says
+     * nothing at all.
+     */
+    int has_uplink;
+    uint8_t uplink_ip[4];
+    uint8_t uplink_mask[4];
+    uint8_t uplink_gateway[4];
+
     hype_cfg_view_t dashboard_default_view;
     char dashboard_default_vm[HYPE_CFG_NAME_MAX]; /* only meaningful for VIEW_VM */
 

@@ -232,6 +232,135 @@ static void test_boot_disk_no_install_media_required(void) {
     "kernel = \\k.bin\n"                                                                           \
     "os_hint = none\n"
 
+/*
+ * #405: hype's OWN uplink address, statically configured. The default matters most here too: a
+ * config with no uplink keys is a supported configuration (a host running only offline guests), not
+ * a broken one.
+ */
+#define UPLINK_TEST_BASE                                                                           \
+    "[hype]\n"                                                                                      \
+    "config_version = 1\n"
+
+#define UPLINK_TEST_VM                                                                             \
+    "[vm.a]\n"                                                                                      \
+    "vcpus = 1\n"                                                                                    \
+    "mem_mb = 512\n"                                                                                 \
+    "boot = kernel\n"                                                                                \
+    "kernel = \\k.bin\n"                                                                             \
+    "os_hint = none\n"
+
+static void test_uplink_static_address(void) {
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    res = parse_copy(UPLINK_TEST_BASE UPLINK_TEST_VM, &out);
+    CHECK_INT("no uplink keys parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("and means no uplink, which is a supported state", 0, out.hype.has_uplink);
+
+    res = parse_copy(UPLINK_TEST_BASE
+                     "uplink_ip = 10.0.2.15\n"
+                     "uplink_mask = 255.255.255.0\n"
+                     "uplink_gateway = 10.0.2.2\n" UPLINK_TEST_VM,
+                     &out);
+    CHECK_INT("a full uplink parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("and is marked present", 1, out.hype.has_uplink);
+    CHECK_INT("address octet 0", 10, out.hype.uplink_ip[0]);
+    CHECK_INT("address octet 3", 15, out.hype.uplink_ip[3]);
+    CHECK_INT("mask octet 0", 255, out.hype.uplink_mask[0]);
+    CHECK_INT("mask octet 3", 0, out.hype.uplink_mask[3]);
+    CHECK_INT("gateway octet 3", 2, out.hype.uplink_gateway[3]);
+
+    /* A PARTIAL uplink is not a usable configuration: an address with no gateway gives a NAT plane
+     * that translates packets and has nowhere to send them. It parses, and has_uplink stays clear,
+     * so the caller sees "no uplink" rather than a half one. */
+    res = parse_copy(UPLINK_TEST_BASE "uplink_ip = 10.0.2.15\n" UPLINK_TEST_VM, &out);
+    CHECK_INT("an address alone parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("but does not count as an uplink", 0, out.hype.has_uplink);
+
+    res = parse_copy(UPLINK_TEST_BASE
+                     "uplink_ip = 10.0.2.15\n"
+                     "uplink_mask = 255.255.255.0\n" UPLINK_TEST_VM,
+                     &out);
+    CHECK_INT("address and mask without a gateway parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("and still does not count", 0, out.hype.has_uplink);
+
+    /*
+     * A duplicate does NOT fail the parse, and that is [hype]'s documented rule rather than a gap:
+     * §4.3 says a malformed global falls back to defaults and sets `malformed`, because a bad global
+     * cannot make a VM wrong -- it can only make hype behave as it did before the section existed.
+     * My first version of this test asserted ERR_DUPLICATE_KEY and was wrong about the contract, not
+     * about the code.
+     *
+     * What must hold is that the operator is not left believing a rejected uplink took effect.
+     */
+    res = parse_copy(UPLINK_TEST_BASE
+                     "uplink_ip = 10.0.2.15\n"
+                     "uplink_ip = 10.0.2.16\n" UPLINK_TEST_VM,
+                     &out);
+    CHECK_INT("a duplicate uplink_ip does not fail the parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("but the section is marked malformed", 1, out.hype.malformed);
+    CHECK_INT("and no uplink is left configured", 0, out.hype.has_uplink);
+    CHECK_INT("the VM still parsed -- a bad global cannot make a VM wrong", 1, out.vm_count);
+}
+
+/*
+ * The address parser is strict, and every case here is one a lenient parser would have accepted --
+ * silently giving hype the wrong address, whose only symptom is a network that does not work.
+ */
+static void test_uplink_address_parsing_is_strict(void) {
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    unsigned int i;
+    const char *bad[] = {
+        "10.0.2",          /* three octets */
+        "10.0.2.15.1",     /* five */
+        "10.0.2.256",      /* octet out of range */
+        "10.0.2.1500",     /* four digits */
+        "10.0..15",        /* empty octet */
+        ".10.0.2.15",      /* leading dot */
+        "10.0.2.15.",      /* trailing dot */
+        "10.0.2.15x",      /* trailing junk */
+        "ten.0.2.15",      /* not a number */
+        "",                /* empty */
+        "10 .0.2.15"       /* embedded space */
+    };
+
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        /* Assembled with strcpy/strcat rather than hype_snprintf: this file includes <string.h> and
+         * NOT core/format.h, and using an undeclared hype_snprintf here once made `make test` fail
+         * to BUILD while a grep for FAIL reported the suite clean. */
+        char text[256];
+        text[0] = '\0';
+        strcat(text, UPLINK_TEST_BASE "uplink_ip = ");
+        strcat(text, bad[i]);
+        strcat(text, "\n");
+        strcat(text, UPLINK_TEST_VM);
+        res = parse_copy(text, &out);
+        /*
+         * Per §4.3 the parse still succeeds; what must be true is that the bad address DID NOT
+         * become hype's uplink, and that the section is flagged so the rejection is not silent.
+         * Checking `malformed` rather than the status is the difference between testing the parser's
+         * error code and testing the thing that matters -- an unusable address must never reach the
+         * NAT plane.
+         */
+        if (res.status != HYPE_CFG_OK || out.hype.malformed != 1 || out.hype.has_uplink != 0) {
+            printf("FAIL: uplink_ip = '%s' -- status %d, malformed %d, has_uplink %d\n", bad[i],
+                   (int)res.status, out.hype.malformed, out.hype.has_uplink);
+            failures++;
+        }
+    }
+
+    /* And the boundary values that ARE legal. */
+    res = parse_copy(UPLINK_TEST_BASE
+                     "uplink_ip = 0.0.0.0\n"
+                     "uplink_mask = 255.255.255.255\n"
+                     "uplink_gateway = 1.2.3.4\n" UPLINK_TEST_VM,
+                     &out);
+    CHECK_INT("0 and 255 octets are legal values", HYPE_CFG_OK, res.status);
+    CHECK_INT("255 parsed", 255, out.hype.uplink_mask[0]);
+    CHECK_INT("0 parsed", 0, out.hype.uplink_ip[0]);
+}
+
 static void test_display_key(void) {
     hype_cfg_t out;
     hype_cfg_result_t res;
@@ -2402,6 +2531,8 @@ int main(void) {
     test_cpu_set_comma_list();
     test_boot_disk_no_install_media_required();
     test_display_key();
+    test_uplink_static_address();
+    test_uplink_address_parsing_is_strict();
     test_boot_kernel();
     test_boot_kernel_with_disk_allowed();
     test_boot_kernel_write_back();
