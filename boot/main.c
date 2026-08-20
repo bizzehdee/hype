@@ -3276,19 +3276,36 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * stride without advertising space hype does not model.
  */
 #define HYPE_FW_1_PCI_DEV_NVME 5u
-/* #565 / decision 49: the optional Bochs VBE adapter, present only when `display = bochs`. Slot 6
- * is the next free one after NVMe; a display device is not chipset furniture, so it does not take
- * a low slot alongside the host bridge and LPC. */
-#define HYPE_FW_1_PCI_DEV_BOCHS_VBE 6u
+/*
+ * #565 / decision 49: the optional Bochs VBE adapter, present only when `display = bochs`. A
+ * display device is not chipset furniture, so it does not take a low slot alongside the host
+ * bridge and LPC.
+ *
+ * #573: device 8, NOT 6. Slot 6 was described as "the next free one after NVMe", but it is not
+ * free -- fw_1_slot_pci_dev() hands the extra disk slots (#329) devices 6 and 7 arithmetically,
+ * so `display = bochs` plus two or more disks put two different devices at 00:06.0. Devices 6 and
+ * 7 are the ones that cannot move: devices/dsdt.asl _PRT-routes dev 6 INTA -> GSI 22 and dev 7
+ * INTA -> GSI 23 for those disk slots. The VBE adapter raises no interrupt and so has no _PRT
+ * entry, which makes it the side that relocates for free.
+ *
+ * The full device map, since no single place held it before: 0 Q35 host bridge, 2 AHCI,
+ * 3 virtio-blk, 4 virtio-net/e1000, 5 NVMe, 6 and 7 extra disk slots, 8 Bochs VBE, 31 ICH9 LPC
+ * (fn2 = the SATA disk). Free: 1, 9-30.
+ */
+#define HYPE_FW_1_PCI_DEV_BOCHS_VBE 8u
 /*
  * NET-2 (#81): the guest virtio-net adapter, present only when `net_mode = nat`. Device 4 -- the
- * lowest free slot, and free of #573's device-6 aliasing between the VBE adapter and disk slot 1.
+ * lowest free slot, and clear of the device-6 aliasing between the VBE adapter and disk slot 1
+ * that #573 has since fixed by moving the VBE adapter to device 8.
  *
  * IT SHARES GSI 20 WITH virtio-blk, and that is forced rather than chosen: the 24-pin IO-APIC is
  * fully allocated (16-19 the dev-2 block, 20 virtio-blk and the NVMe front-end, 21 the ICH9 SATA
  * function, 22 and 23 the extra disk slots), and there is no 25th pin to hand out. Sharing a
  * level-triggered PCI interrupt is ordinary and legal; what it demands is that the LINE be treated
- * as the OR of its devices rather than as one device's property. See fw_1_virtio_line_pending().
+ * as the OR of its devices rather than as one device's property. That is done as ONE
+ * raise-or-deassert over vblk_pending || nvme_pending || vnet_pending in the device-interrupt
+ * block of the dispatch loop -- search HYPE_FW_1_VIRTIO_GSI. (#573: this used to name a
+ * fw_1_virtio_line_pending() helper, which does not exist; the OR is computed inline.)
  *
  * The alternative was to widen the IO-APIC past 24 entries. Rejected for now: the pin count is a
  * guest-visible property of the chipset hype claims to be, every VM would inherit the change, and
@@ -9051,6 +9068,29 @@ vblk_pci:
  * layout is identical per function, only the device number and its _PRT-routed GSI differ.
  */
 /*
+ * #573: hype_pci_add_device() now refuses an occupied slot instead of overwriting it, but a
+ * refusal the caller drops on the floor is the same silence in a new place. Every guest-device
+ * presenter goes through this so a collision names both the slot and the device that lost it.
+ *
+ * Not fatal by choice: a missing display adapter or a missing second disk is a degraded VM, not a
+ * compromised one, and stopping the VM would turn a mis-ordered slot map into an unbootable host.
+ * The log line is what turns the next collision into a five-minute diagnosis instead of #573's
+ * "read the slot map and notice" -- which took a device-model bug hunt to reach.
+ */
+static int fw_1_pci_add_device(hype_pci_t *pci, uint8_t device_number, uint16_t vendor_id,
+                               uint16_t device_id, uint8_t class_base, uint8_t class_sub,
+                               uint8_t class_interface, const char *what) {
+    int rc = hype_pci_add_device(pci, device_number, vendor_id, device_id, class_base, class_sub,
+                                 class_interface);
+    if (rc != 0) {
+        hype_debug_print("fw-1: PCI slot %u REFUSED for %s (vendor 0x%04x device 0x%04x) -- slot "
+                         "already in use, so this device is NOT presented to the guest [#573]\n",
+                         (unsigned)device_number, what, (unsigned)vendor_id, (unsigned)device_id);
+    }
+    return rc;
+}
+
+/*
  * #565 / §10 decision 49: present the Bochs VBE adapter, ONLY when this VM's config asked for it.
  *
  * Default-off is the decision, not a convenience: a Linux guest with bochs-drm inbox binds this and
@@ -9069,9 +9109,12 @@ static void fw_1_bochs_vbe_present(hype_fw_vm_t *vm) {
     if (want != HYPE_CFG_DISPLAY_BOCHS) {
         return;
     }
-    hype_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE, HYPE_BOCHS_VBE_PCI_VENDOR_ID,
-                        HYPE_BOCHS_VBE_PCI_DEVICE_ID, HYPE_BOCHS_VBE_PCI_CLASS_BASE,
-                        HYPE_BOCHS_VBE_PCI_CLASS_SUB, HYPE_BOCHS_VBE_PCI_CLASS_INTERFACE);
+    if (fw_1_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE, HYPE_BOCHS_VBE_PCI_VENDOR_ID,
+                            HYPE_BOCHS_VBE_PCI_DEVICE_ID, HYPE_BOCHS_VBE_PCI_CLASS_BASE,
+                            HYPE_BOCHS_VBE_PCI_CLASS_SUB, HYPE_BOCHS_VBE_PCI_CLASS_INTERFACE,
+                            "Bochs VBE display adapter") != 0) {
+        return;
+    }
     hype_pci_set_bar_size(&vm->pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE, 2, HYPE_BOCHS_VBE_MMIO_SIZE);
     hype_bochs_vbe_reset(&vm->bochs_vbe);
     hype_debug_print("fw-1[vm %u]: Bochs VBE adapter presented at PCI dev %u, BAR2 %u bytes "
@@ -9161,9 +9204,12 @@ static void fw_1_guest_nic_present(hype_fw_vm_t *vm) {
          * capability chain, because the driver finds everything at architectural offsets. That is
          * also why Windows can drive it with no help -- there is nothing to discover.
          */
-        hype_pci_add_device(&vm->pci, dev, HYPE_E1000_DEV_PCI_VENDOR, HYPE_E1000_DEV_PCI_DEVICE,
-                            HYPE_E1000_DEV_PCI_CLASS_BASE, HYPE_E1000_DEV_PCI_CLASS_SUB,
-                            HYPE_E1000_DEV_PCI_CLASS_INTERFACE);
+        if (fw_1_pci_add_device(&vm->pci, dev, HYPE_E1000_DEV_PCI_VENDOR,
+                                HYPE_E1000_DEV_PCI_DEVICE, HYPE_E1000_DEV_PCI_CLASS_BASE,
+                                HYPE_E1000_DEV_PCI_CLASS_SUB,
+                                HYPE_E1000_DEV_PCI_CLASS_INTERFACE, "e1000 guest NIC") != 0) {
+            return;
+        }
         hype_pci_set_bar_size(&vm->pci, dev, 0, HYPE_E1000_DEV_BAR_SIZE);
         hype_pci_set_interrupt(&vm->pci, dev, 1, 10);
         hype_debug_print("fw-1[vm %u]: e1000 presented at PCI dev %u, BAR0 %u bytes, MAC "
@@ -9174,13 +9220,17 @@ static void fw_1_guest_nic_present(hype_fw_vm_t *vm) {
         return;
     }
 
-    hype_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_NET_PCI_VENDOR_ID,
-                        HYPE_VIRTIO_NET_PCI_DEVICE_ID, HYPE_VIRTIO_NET_PCI_CLASS_BASE,
-                        HYPE_VIRTIO_NET_PCI_CLASS_SUB, HYPE_VIRTIO_NET_PCI_CLASS_INTERFACE);
+    if (fw_1_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_NET_PCI_VENDOR_ID,
+                            HYPE_VIRTIO_NET_PCI_DEVICE_ID, HYPE_VIRTIO_NET_PCI_CLASS_BASE,
+                            HYPE_VIRTIO_NET_PCI_CLASS_SUB, HYPE_VIRTIO_NET_PCI_CLASS_INTERFACE,
+                            "virtio-net guest NIC") != 0) {
+        return;
+    }
     hype_pci_set_bar_size(&vm->pci, dev, HYPE_FW_1_VIRTIO_BAR_INDEX, HYPE_VIRTIO_BLK_BAR_SIZE);
     /* INTA on legacy line 10, same as virtio-blk: in APIC mode the DSDT _PRT routes dev 4 INTA to
      * GSI 20, which virtio-blk also uses -- see HYPE_FW_1_PCI_DEV_VIRTIO_NET on why the pin is
-     * shared and fw_1_virtio_line_pending() on what sharing requires. */
+     * shared, and the single raise-or-deassert over HYPE_FW_1_VIRTIO_GSI in the dispatch loop for
+     * what sharing requires. */
     hype_pci_set_interrupt(&vm->pci, dev, 1, 10);
 
     /*
@@ -9222,9 +9272,12 @@ static void fw_1_guest_nic_present(hype_fw_vm_t *vm) {
 
 static void fw_1_virtio_pci_present(hype_fw_vm_t *vm, unsigned int dev) {
     uint8_t *config;
-    hype_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
-                        HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
-                        HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE);
+    if (fw_1_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
+                            HYPE_VIRTIO_BLK_PCI_DEVICE_ID, HYPE_VIRTIO_BLK_PCI_CLASS_BASE,
+                            HYPE_VIRTIO_BLK_PCI_CLASS_SUB, HYPE_VIRTIO_BLK_PCI_CLASS_INTERFACE,
+                            "virtio-blk disk") != 0) {
+        return;
+    }
     hype_pci_set_bar_size(&vm->pci, dev, HYPE_FW_1_VIRTIO_BAR_INDEX,
                           HYPE_VIRTIO_BLK_BAR_SIZE);
     /* INTA, legacy line 10 (PIC-mode fallback); APIC-mode guests route via the
@@ -9380,8 +9433,8 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      * tag and never uses an interrupt, so no MSI/MSI-X is needed and hype models none.
      */
     if (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) {
-        hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, HYPE_PCI_VENDOR_ID_HYPE, 0x0007u,
-                            0x01, 0x08, 0x02);
+        (void)fw_1_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, HYPE_PCI_VENDOR_ID_HYPE,
+                                  0x0007u, 0x01, 0x08, 0x02, "NVMe controller (disk slot 0)");
         hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, 0, HYPE_FW_1_NVME_BAR_SIZE);
         hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME, 1, 11);
         hype_nvme_reset(&vm->disk[0].nvme);
@@ -9490,8 +9543,10 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
             dev = fw_1_slot_pci_dev(slot, bus);
             switch (bus) {
             case HYPE_CFG_BUS_AHCI_SATA:
-                hype_pci_add_device(&g_fw_1_pci, dev, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u, 0x01,
-                                    0x06, 0x01);
+                if (fw_1_pci_add_device(&g_fw_1_pci, dev, HYPE_PCI_VENDOR_ID_HYPE, 0x0006u, 0x01,
+                                        0x06, 0x01, "extra disk slot (AHCI/SATA)") != 0) {
+                    continue;
+                }
                 hype_pci_set_bar_size(&g_fw_1_pci, dev, 5, 0x1000u);
                 hype_pci_set_interrupt(&g_fw_1_pci, dev, 1, 11);
                 hype_pci_set_msi_capability(&g_fw_1_pci, dev);
@@ -9502,8 +9557,10 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
                 hype_ata_disk_set_backend(&d->ata_disk, &d->be);
                 break;
             case HYPE_CFG_BUS_NVME:
-                hype_pci_add_device(&g_fw_1_pci, dev, HYPE_PCI_VENDOR_ID_HYPE, 0x0007u, 0x01,
-                                    0x08, 0x02);
+                if (fw_1_pci_add_device(&g_fw_1_pci, dev, HYPE_PCI_VENDOR_ID_HYPE, 0x0007u, 0x01,
+                                        0x08, 0x02, "extra disk slot (NVMe)") != 0) {
+                    continue;
+                }
                 hype_pci_set_bar_size(&g_fw_1_pci, dev, 0, HYPE_FW_1_NVME_BAR_SIZE);
                 hype_pci_set_interrupt(&g_fw_1_pci, dev, 1, 11);
                 hype_nvme_reset(&d->nvme);

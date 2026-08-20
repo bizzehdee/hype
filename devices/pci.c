@@ -70,6 +70,18 @@ int hype_pci_add_device(hype_pci_t *pci, uint8_t device_number, uint16_t vendor_
         return -1;
     }
 
+    /*
+     * #573: refuse an occupied slot rather than overwriting it. The guest PCI slot map is spread
+     * across a constant list and a function that derives slot numbers arithmetically, so the two
+     * cannot be kept in agreement by inspection -- and this silently aliased device 6 between the
+     * VBE adapter and disk slot 1. An overwrite loses the first device from the guest's view with
+     * nothing logged: the guest does not see a conflict, it sees a device that was never
+     * presented. Refusing turns the next collision into a caller-reported error instead.
+     */
+    if (pci->devices[device_number].in_use) {
+        return -1;
+    }
+
     dev = &pci->devices[device_number];
     clear_device(dev);
     dev->in_use = 1;
@@ -92,6 +104,11 @@ int hype_pci_add_function(hype_pci_t *pci, uint8_t device_number, uint8_t functi
 
     if (device_number >= HYPE_PCI_MAX_DEVICES || function_number == 0 ||
         function_number >= HYPE_PCI_MAX_FUNCTIONS || !pci->devices[device_number].in_use) {
+        return -1;
+    }
+
+    /* #573: the function slots alias the same way the device slots do. */
+    if (pci->functions[device_number][function_number - 1u].in_use) {
         return -1;
     }
 

@@ -660,6 +660,74 @@ static void test_cf8_byte_addressable(void) {
     hype_pci_cf8_write_bytes(0, 0u, 4u, 0x1234u); /* must not fault */
 }
 
+/*
+ * #573: the guest slot map is maintained in two places that cannot be checked against each other
+ * by inspection -- a constant list and fw_1_slot_pci_dev()'s arithmetic -- and they aliased device
+ * 6 between the Bochs VBE adapter and disk slot 1. An overwrite is the worst available outcome:
+ * the loser is gone from the guest's view and nothing says so.
+ */
+static void test_add_device_refuses_an_occupied_slot(void) {
+    hype_pci_t pci;
+    hype_pci_ecam_addr_t addr;
+    uint32_t value;
+    int rc;
+
+    hype_pci_reset(&pci);
+    CHECK_HEX("first claim on slot 6 succeeds", 0,
+              hype_pci_add_device(&pci, 6, 0x1234u, 0x1111u, 0x03, 0x00, 0x00) != 0);
+
+    rc = hype_pci_add_device(&pci, 6, 0x5678u, 0x2222u, 0x01, 0x06, 0x01);
+    CHECK_HEX("second claim on slot 6 refused", 1, rc < 0);
+
+    /* The refusal must leave the FIRST device intact. Clearing the slot and then failing would
+     * lose both devices, which is worse than the bug being fixed. */
+    addr.bus = 0;
+    addr.device = 6;
+    addr.function = 0;
+    addr.register_offset = 0x00;
+    hype_pci_config_read(&pci, &addr, 4, &value);
+    CHECK_HEX("incumbent vendor/device id survives", ((uint32_t)0x1111u << 16) | 0x1234u, value);
+    addr.register_offset = 0x08;
+    hype_pci_config_read(&pci, &addr, 4, &value);
+    CHECK_HEX("incumbent class code survives", 0x03000000u, value);
+}
+
+/* A refused slot must not become unusable: after a reset the same number is claimable again, which
+ * is what the per-VM hype_pci_reset() at every VM (re)start depends on. */
+static void test_reset_releases_a_claimed_slot(void) {
+    hype_pci_t pci;
+
+    hype_pci_reset(&pci);
+    CHECK_HEX("claim before reset", 0, hype_pci_add_device(&pci, 8, 0x1234u, 0x1111u, 0x03, 0x00, 0x00) != 0);
+    hype_pci_reset(&pci);
+    CHECK_HEX("claim again after reset", 0,
+              hype_pci_add_device(&pci, 8, 0x1234u, 0x1111u, 0x03, 0x00, 0x00) != 0);
+}
+
+/* The function slots alias the same way, so they get the same guarantee. */
+static void test_add_function_refuses_an_occupied_function(void) {
+    hype_pci_t pci;
+    hype_pci_ecam_addr_t addr;
+    uint32_t value;
+    int rc;
+
+    hype_pci_reset(&pci);
+    (void)hype_pci_add_device(&pci, 31, 0x8086u, 0x2918u, 0x06, 0x01, 0x00);
+    CHECK_HEX("first claim on 31.2 succeeds", 0,
+              hype_pci_add_function(&pci, 31, 2, 0x8086u, 0x2922u, 0x01, 0x06, 0x01) != 0);
+
+    rc = hype_pci_add_function(&pci, 31, 2, 0x1234u, 0x9999u, 0x03, 0x00, 0x00);
+    CHECK_HEX("second claim on 31.2 refused", 1, rc < 0);
+
+    addr.bus = 0;
+    addr.device = 31;
+    addr.function = 2;
+    addr.register_offset = 0x00;
+    hype_pci_config_read(&pci, &addr, 4, &value);
+    CHECK_HEX("incumbent function vendor/device id survives",
+              ((uint32_t)0x2922u << 16) | 0x8086u, value);
+}
+
 int main(void) {
     test_cf8_byte_addressable(); /* #518 */
     test_decode_ecam_offset();
@@ -680,6 +748,9 @@ int main(void) {
     test_bus_master_enabled();
     test_bus_master_out_of_range_and_absent();
     test_add_device_out_of_range_rejected();
+    test_add_device_refuses_an_occupied_slot();       /* #573 */
+    test_reset_releases_a_claimed_slot();             /* #573 */
+    test_add_function_refuses_an_occupied_function(); /* #573 */
     test_set_bar_size_out_of_range_is_a_no_op();
     test_get_bar_value_out_of_range_and_absent();
     test_memory_space_enabled_out_of_range_and_absent();
