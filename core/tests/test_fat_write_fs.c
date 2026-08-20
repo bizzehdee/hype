@@ -22,6 +22,7 @@ static int failures = 0;
 #define NUM_FATS 2u
 #define FATSZ 1u
 #define DATA_START (RESERVED + NUM_FATS * FATSZ) /* 34 */
+#define RESECTOR_FAT0 RESERVED /* first sector of FAT copy 0, for the tests that walk it */
 static uint8_t g_vol[VOL_SECTORS * SECSZ];
 static uint64_t g_fail_write_lba = (uint64_t)-1;
 static uint64_t g_fail_read_lba = (uint64_t)-1;
@@ -570,6 +571,7 @@ static void test_shared_mount_survives_stale_fat_reads(void) {
               hype_fat32_append(&h, "x", 1u));
     CHECK("HYPE extension does not link to VM0 root", fat0(h.first_cluster) != v.first_cluster);
     CHECK_HEX("VM0 root remains end-of-chain", 0x0FFFFFFFu, fat0(v.first_cluster));
+
     g_stale_fat0_reads = 0;
 }
 
@@ -1757,6 +1759,75 @@ static void test_382_spc2(void) {
     }
 }
 
+/*
+ * #584: TWO FILES ON ONE VOLUME MUST NEVER SHARE A CLUSTER.
+ *
+ * Measured on a real stick and reproduced under QEMU: HYPE.LOG's directory entry claimed 203,837
+ * bytes while its chain held 94 clusters (48,128 bytes), and reading the tail gave EIO. Walking the
+ * FAT showed why -- HYPE.LOG and CDTEST.LOG shared 60 clusters. CDTEST's second cluster was 37,
+ * which HYPE.LOG already owned, so the two chains merged and each file's length became a fiction.
+ *
+ * A cross-link is the worst class of filesystem bug this writer can have: nothing fails at the time,
+ * both files keep "working", and the damage is only visible later as a short read on whichever file
+ * the merge orphaned. On a serial-less machine that log IS the evidence, so a silently truncated one
+ * is worse than no log.
+ *
+ * This drives the shape the rig produced -- one fs, two files, appends interleaved, growing past
+ * several cluster boundaries each -- and asserts the invariant directly by walking both chains.
+ */
+static void collect_chain(hype_fat32_fs_t *fs, uint32_t first, uint32_t *out, unsigned int cap,
+                          unsigned int *n_out) {
+    uint32_t cl = first;
+    unsigned int n = 0;
+    (void)fs;
+    while (cl >= 2u && cl < 0x0FFFFFF8u && n < cap) {
+        const uint8_t *fat = g_vol + RESECTOR_FAT0 * SECSZ;
+        out[n++] = cl;
+        cl = (uint32_t)(fat[cl * 4u] | ((uint32_t)fat[cl * 4u + 1] << 8) |
+                        ((uint32_t)fat[cl * 4u + 2] << 16) |
+                        ((uint32_t)fat[cl * 4u + 3] << 24)) & 0x0FFFFFFFu;
+    }
+    *n_out = n;
+}
+
+static void test_two_files_never_share_a_cluster(void) {
+    hype_fat32_fs_t fs;
+    hype_fat32_wfile_t a, b;
+    static uint8_t payload[512];
+    uint32_t ca[64], cb[64];
+    unsigned int na = 0, nb = 0, i, j, shared = 0;
+    unsigned int round;
+
+    build_vol();
+    memset(payload, 'a', sizeof(payload));
+    CHECK_HEX("mount", 0, hype_fat32_fs_mount(vol_read, vol_write, NULL, &fs));
+    CHECK_HEX("create A", 0, hype_fat32_create(&fs, "A.LOG", &a));
+    /* A gets a head start, exactly as the combined log does before any per-VM sink exists. */
+    for (round = 0; round < 6u; round++) {
+        CHECK_HEX("append A (head start)", 0, hype_fat32_append(&a, payload, sizeof(payload)));
+    }
+    /* THEN the second file appears -- a per-VM sink opens when that guest first says anything. */
+    CHECK_HEX("create B", 0, hype_fat32_create(&fs, "B.LOG", &b));
+    for (round = 0; round < 6u; round++) {
+        CHECK_HEX("append A (interleaved)", 0, hype_fat32_append(&a, payload, sizeof(payload)));
+        CHECK_HEX("append B (interleaved)", 0, hype_fat32_append(&b, payload, sizeof(payload)));
+    }
+
+    collect_chain(&fs, a.first_cluster, ca, 64u, &na);
+    collect_chain(&fs, b.first_cluster, cb, 64u, &nb);
+    CHECK("A's chain covers its size", (uint64_t)na * SECSZ >= a.size);
+    CHECK("B's chain covers its size", (uint64_t)nb * SECSZ >= b.size);
+    for (i = 0; i < na; i++) {
+        for (j = 0; j < nb; j++) {
+            if (ca[i] == cb[j]) shared++;
+        }
+    }
+    if (shared != 0u) {
+        printf("       A: %u clusters, B: %u clusters, %u SHARED\n", na, nb, shared);
+    }
+    CHECK("the two chains are disjoint", shared == 0u);
+}
+
 int main(void) {
     test_open_existing();
     test_write_at_growth();
@@ -1764,6 +1835,7 @@ int main(void) {
     test_write_at_fault_sweep();
     test_382_edge_branches();
     test_382_spc2();
+    test_two_files_never_share_a_cluster();
     test_dirent_timestamp_from_clock();
     test_cluster_growth_uses_durability_barriers();
     test_append_coalesces_contiguous_sectors();
