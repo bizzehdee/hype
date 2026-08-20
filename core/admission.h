@@ -32,7 +32,12 @@ typedef enum {
     HYPE_ADM_ERR_DISK_SHARED_WRITABLE, /* two VMs attach the same writable device */
     HYPE_ADM_ERR_DISK_PHYS_OVERLAP,    /* two devices claim overlapping physical storage */
     HYPE_ADM_ERR_DISK_BUS_UNSUPPORTED, /* a bus hype cannot present yet */
-    HYPE_ADM_ERR_DISK_COUNT_EXCEEDED   /* a VM attaches more disks than hype can present */
+    HYPE_ADM_ERR_DISK_COUNT_EXCEEDED,  /* a VM attaches more disks than hype can present */
+    /* ADM-6 (#224) */
+    HYPE_ADM_ERR_CPU_BUDGET_OUT_OF_RANGE, /* host_cpu_budget names a core this host does not have */
+    HYPE_ADM_ERR_CPU_SET_OUTSIDE_BUDGET,  /* a cpu_set core is outside host_cpu_budget */
+    HYPE_ADM_ERR_VCPU_EXCEEDS_BUDGET,     /* the VMs want more cores than the budget offers */
+    HYPE_ADM_ERR_VCPUS_EXCEED_HOST        /* ONE VM alone wants more cores than the host has */
 } hype_adm_status_t;
 
 typedef struct {
@@ -197,5 +202,52 @@ hype_adm_result_t hype_adm_check_disk_bus(const hype_cfg_t *cfg);
  * config would parse cleanly and then have its tail silently never attached.
  */
 hype_adm_result_t hype_adm_check_disk_count(const hype_cfg_t *cfg, unsigned int max_disks_per_vm);
+
+/*
+ * ADM-6 (#224): `[hype] host_cpu_budget` -- the cores the operator has given hype at all.
+ *
+ * ADM-2/ADM-3 assumed every core on the host was hype's to spend. host_cpu_budget (spec §5.1) says
+ * otherwise: it is an explicit list, and a core outside it belongs to whatever else the machine is
+ * doing. Three things then have to hold, and none of them was checked:
+ *
+ *   - every budget core must EXIST on this host. A budget naming core 12 on an 8-core box is a
+ *     typo that would otherwise place a VM on a core that is not there.
+ *   - every `cpu_set` core must be INSIDE the budget. A cpu_set is the operator naming exact
+ *     cores; naming one they also declared off-limits is a contradiction in their own config, and
+ *     honouring either half silently picks a winner.
+ *   - the VMs must FIT. Every cpu_set core is claimed exclusively (decision 47, one whole core per
+ *     vCPU), so the VMs WITHOUT a cpu_set are drawn from what is left -- and that remainder, not
+ *     the whole budget, is what has to cover them.
+ *
+ * With no budget declared this is a no-op: the whole host is the budget, which is what
+ * hype_adm_check_vcpus/check_cpu_set already assume, so there is nothing here to duplicate.
+ */
+hype_adm_result_t hype_adm_check_cpu_budget(const hype_cfg_t *cfg,
+                                            unsigned int physical_core_count);
+
+/*
+ * ADM-6 (#224): each VM's OWN vCPU request against the host, not just the sum.
+ *
+ * hype_adm_check_vcpus() sums every VM and compares once, which cannot distinguish "four VMs each
+ * asking for two cores on a four-core host" from "one VM asking for eight". Both overcommit, but
+ * only the second is a request no host of this size could ever satisfy, and telling the operator
+ * WHICH VM is impossible is more useful than telling them the total is too big.
+ *
+ * A REPORT, NOT A REFUSAL, and that is the spec's choice rather than a softening: §5.2 gives
+ * `vcpus` the range "1 .. host physical cores - 1" with the note that admission CAPS at the
+ * available cores, and hype_cfg_resolve_vcpus() implements exactly that clamp. Refusing here would
+ * contradict a documented clamp and stop a VM that hype is supposed to run narrower.
+ *
+ * `vcpus == 0` IS DELIBERATELY NOT AN ERROR, which is the opposite of the obvious reading. Zero in
+ * the struct means the key was ABSENT, and §5.2's default is 1 -- hype_cfg_resolve_vcpus() turns it
+ * into one vCPU and says DEFAULTED. A check that refused zero would refuse every config that simply
+ * does not mention vcpus, which is most of them.
+ *
+ * Per-VM MEMORY is deliberately not repeated here: hype_adm_check_pool() already walks the VMs one
+ * at a time against the pool that has actually been reserved, and it names the first VM that does
+ * not fit. A second, less exact per-VM memory check could only disagree with it.
+ */
+hype_adm_result_t hype_adm_check_vm_ranges(const hype_cfg_t *cfg,
+                                           unsigned int physical_core_count);
 
 #endif /* HYPE_ADMISSION_H */

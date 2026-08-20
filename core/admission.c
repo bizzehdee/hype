@@ -367,24 +367,97 @@ static int phys_ranges_overlap(unsigned int part_a, unsigned int part_b) {
     return part_a == part_b;
 }
 
-hype_adm_result_t hype_adm_check_disk_phys_overlap(const hype_cfg_t *cfg) {
-    unsigned int i, j;
+/*
+ * ADM-6 (#224): one flat list of every physical claim in the config, from BOTH places a config can
+ * make one.
+ *
+ * The check used to compare `[disk.*]` devices against each other only. A VM's inline
+ * `target_disk = physical:<id>` was compared only against other inline targets, and only by string
+ * equality (hype_adm_check_target_disk), which knows nothing about partition scope. So a
+ * `[disk.*]` scoped to partition 2 of a drive and an inline target scoped to the WHOLE of that same
+ * drive were two claims on the same storage that nothing rejected -- and §6d's "exclusively owned"
+ * is a promise, not a description, so an unenforced version of it is worse than none.
+ *
+ * Attribution matters as much as detection here. The old version returned NO_VM for both indices,
+ * because it was comparing devices rather than machines -- which left the caller able to report a
+ * breach but not to act on it. Every claim now carries the VM that made it, so the boot path can
+ * refuse the offending machine the way #531 refuses a cpu_set overlap.
+ */
+#define ADM_PHYS_CLAIM_MAX (HYPE_CFG_MAX_DISKS + HYPE_CFG_MAX_VMS)
 
-    for (i = 0; i < cfg->disk_count; i++) {
-        const hype_cfg_disk_t *da = &cfg->disks[i];
-        if (da->backing != HYPE_CFG_BACKING_PHYSICAL || !da->has_id_match) {
+typedef struct {
+    const char *id;         /* the drive identity: id_match, or an inline target's path_or_id */
+    unsigned int partition; /* 1-based; 0 = the whole drive */
+    unsigned int vm_index;  /* who claimed it, or HYPE_ADM_NO_VM for an unattached [disk.*] */
+} adm_phys_claim_t;
+
+static unsigned int adm_collect_phys_claims(const hype_cfg_t *cfg, adm_phys_claim_t *out,
+                                            unsigned int cap) {
+    unsigned int n = 0, i, vi, k;
+
+    /* Every declared physical [disk.*], attributed to the first VM that attaches it. An
+     * UNATTACHED one still counts: a config declaring two overlapping physical devices is a config
+     * to fix, and waiting until someone attaches it means the breach lands at the worst moment. */
+    for (i = 0; i < cfg->disk_count && n < cap; i++) {
+        const hype_cfg_disk_t *d = &cfg->disks[i];
+        unsigned int owner = HYPE_ADM_NO_VM;
+        if (d->backing != HYPE_CFG_BACKING_PHYSICAL || !d->has_id_match) {
             continue;
         }
-        for (j = i + 1u; j < cfg->disk_count; j++) {
-            const hype_cfg_disk_t *db = &cfg->disks[j];
-            if (db->backing != HYPE_CFG_BACKING_PHYSICAL || !db->has_id_match) {
-                continue;
+        for (vi = 0; vi < cfg->vm_count && owner == HYPE_ADM_NO_VM; vi++) {
+            for (k = 0; k < cfg->vms[vi].disks_count; k++) {
+                if (hype_streq(cfg->vms[vi].disks[k], d->id)) {
+                    owner = vi;
+                    break;
+                }
             }
-            if (!hype_streq(da->id_match, db->id_match)) {
+            for (k = 0; k < cfg->vms[vi].cdroms_count && owner == HYPE_ADM_NO_VM; k++) {
+                if (hype_streq(cfg->vms[vi].cdroms[k], d->id)) {
+                    owner = vi;
+                }
+            }
+        }
+        out[n].id = d->id_match;
+        out[n].partition = d->partition;
+        out[n].vm_index = owner;
+        n++;
+    }
+    /* And every VM's inline physical target. */
+    for (vi = 0; vi < cfg->vm_count && n < cap; vi++) {
+        const hype_cfg_vm_t *vm = &cfg->vms[vi];
+        if (!hype_cfg_vm_has_target_disk(vm) || vm->target_disk.kind != HYPE_CFG_DISK_PHYSICAL) {
+            continue;
+        }
+        out[n].id = vm->target_disk.path_or_id;
+        out[n].partition = vm->target_disk.partition;
+        out[n].vm_index = vi;
+        n++;
+    }
+    return n;
+}
+
+hype_adm_result_t hype_adm_check_disk_phys_overlap(const hype_cfg_t *cfg) {
+    adm_phys_claim_t claims[ADM_PHYS_CLAIM_MAX];
+    unsigned int n, i, j;
+
+    n = adm_collect_phys_claims(cfg, claims, ADM_PHYS_CLAIM_MAX);
+    for (i = 0; i < n; i++) {
+        for (j = i + 1u; j < n; j++) {
+            if (!hype_streq(claims[i].id, claims[j].id)) {
                 continue; /* different drives cannot overlap */
             }
-            if (phys_ranges_overlap(da->partition, db->partition)) {
-                return adm_err(HYPE_ADM_ERR_DISK_PHYS_OVERLAP, HYPE_ADM_NO_VM, HYPE_ADM_NO_VM);
+            /*
+             * Two claims by the SAME VM are not a breach: a machine given both the whole drive and
+             * a partition of it is redundant, not unsafe, and refusing it would stop a VM booting
+             * over a config that harms nobody.
+             */
+            if (claims[i].vm_index != HYPE_ADM_NO_VM &&
+                claims[i].vm_index == claims[j].vm_index) {
+                continue;
+            }
+            if (phys_ranges_overlap(claims[i].partition, claims[j].partition)) {
+                return adm_err(HYPE_ADM_ERR_DISK_PHYS_OVERLAP, claims[i].vm_index,
+                               claims[j].vm_index);
             }
         }
     }
@@ -423,8 +496,93 @@ hype_adm_result_t hype_adm_check_disk_count(const hype_cfg_t *cfg, unsigned int 
     unsigned int vi;
 
     for (vi = 0; vi < cfg->vm_count; vi++) {
-        if (cfg->vms[vi].disks_count > max_disks_per_vm) {
+        /*
+         * ADM-6 (#224): cdroms count too. The bound is the FW-1 machine model's per-VM STORAGE
+         * DEVICE budget -- an interrupt line and a PCI slot each -- and a cdrom spends both exactly
+         * as a disk does. Counting only `disks` let a config with 2 disks and 3 cdroms pass a
+         * 4-device budget and then have its tail silently never attached, which is the failure this
+         * check exists to prevent, one list over.
+         */
+        if (cfg->vms[vi].disks_count + cfg->vms[vi].cdroms_count > max_disks_per_vm) {
             return adm_err(HYPE_ADM_ERR_DISK_COUNT_EXCEEDED, vi, HYPE_ADM_NO_VM);
+        }
+    }
+    return adm_ok();
+}
+
+/* ADM-6 (#224): is `core` one of the cores host_cpu_budget offers? */
+static int adm_in_budget(const hype_cfg_t *cfg, unsigned int core) {
+    unsigned int i;
+    for (i = 0; i < cfg->hype.host_cpu_budget_count; i++) {
+        if (cfg->hype.host_cpu_budget[i] == core) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+hype_adm_result_t hype_adm_check_cpu_budget(const hype_cfg_t *cfg,
+                                            unsigned int physical_core_count) {
+    unsigned int i, k, claimed = 0, want_auto = 0, total = 0;
+
+    /* No budget declared means the whole host is the budget, which is what check_vcpus and
+     * check_cpu_set already assume. Nothing to add. */
+    if (!cfg->hype.has_host_cpu_budget || cfg->hype.host_cpu_budget_count == 0u) {
+        return adm_ok();
+    }
+    for (i = 0; i < cfg->hype.host_cpu_budget_count; i++) {
+        if (cfg->hype.host_cpu_budget[i] >= physical_core_count) {
+            return adm_err(HYPE_ADM_ERR_CPU_BUDGET_OUT_OF_RANGE, HYPE_ADM_NO_VM, HYPE_ADM_NO_VM);
+        }
+    }
+    for (i = 0; i < cfg->vm_count; i++) {
+        const hype_cfg_vm_t *vm = &cfg->vms[i];
+        /*
+         * The EFFECTIVE cost, not the literal field. vcpus == 0 means the key was absent and §5.2's
+         * default of 1 applies (hype_cfg_resolve_vcpus). Summing the raw zeroes would price a
+         * three-VM config at nothing and pass it against a one-core budget it cannot fit.
+         */
+        unsigned int want = (vm->vcpus != 0u) ? vm->vcpus : 1u;
+        total += want;
+        if (vm->has_cpu_set) {
+            for (k = 0; k < vm->cpu_set_count; k++) {
+                if (!adm_in_budget(cfg, vm->cpu_set[k])) {
+                    return adm_err(HYPE_ADM_ERR_CPU_SET_OUTSIDE_BUDGET, i, HYPE_ADM_NO_VM);
+                }
+            }
+            /* cpu_set_count, not vcpus: check_cpu_set is what insists the two agree, and this must
+             * price what was actually named even when they do not. */
+            claimed += vm->cpu_set_count;
+        } else {
+            want_auto += want;
+        }
+    }
+    if (total > cfg->hype.host_cpu_budget_count) {
+        return adm_err(HYPE_ADM_ERR_VCPU_EXCEEDS_BUDGET, HYPE_ADM_NO_VM, HYPE_ADM_NO_VM);
+    }
+    /*
+     * The auto-assigned VMs draw from what the cpu_sets have NOT claimed. Checking them against the
+     * whole budget instead would accept a config where the pinned VMs have already taken every core
+     * -- and the VMs that would then silently have nowhere to go are exactly the ones the operator
+     * did not think hard about.
+     */
+    if (claimed > cfg->hype.host_cpu_budget_count ||
+        want_auto > cfg->hype.host_cpu_budget_count - claimed) {
+        return adm_err(HYPE_ADM_ERR_VCPU_EXCEEDS_BUDGET, HYPE_ADM_NO_VM, HYPE_ADM_NO_VM);
+    }
+    return adm_ok();
+}
+
+hype_adm_result_t hype_adm_check_vm_ranges(const hype_cfg_t *cfg,
+                                           unsigned int physical_core_count) {
+    unsigned int i;
+
+    for (i = 0; i < cfg->vm_count; i++) {
+        /* vcpus == 0 means the key was ABSENT and §5.2's default of 1 applies (see the header):
+         * refusing it would refuse most configs. A core count of 0 means enumeration failed, and
+         * comparing against an unknown host is worse than not comparing. */
+        if (physical_core_count != 0u && cfg->vms[i].vcpus > physical_core_count) {
+            return adm_err(HYPE_ADM_ERR_VCPUS_EXCEED_HOST, i, HYPE_ADM_NO_VM);
         }
     }
     return adm_ok();

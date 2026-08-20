@@ -971,6 +971,416 @@ static void test_peers_self_and_bounds(void) {
     CHECK_INT("a null config is refused", 0, hype_adm_vms_are_peers(0, 0, 1));
 }
 
+
+/* ---- ADM-6 (#224): host_cpu_budget ---- */
+
+/* No budget declared means the whole host is hype's, which is what check_vcpus/check_cpu_set
+ * already assume. This check must add nothing there rather than inventing a constraint. */
+static void test_cpu_budget_absent_is_a_no_op(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 4, 1024, "a.img");
+    make_vm(&cfg.vms[1], "b", 4, 1024, "b.img");
+    /* Eight vCPUs on a 4-core host: an overcommit check_vcpus catches and this one must not
+     * duplicate, because with no budget there is no budget to breach. */
+    CHECK_INT("no host_cpu_budget means no budget breach", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_cpu_budget(&cfg, 4u).status);
+}
+
+/* A budget naming a core the host does not have is a typo that would otherwise place a VM on a
+ * core that is not there. */
+static void test_cpu_budget_core_must_exist(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 0;
+    cfg.hype.has_host_cpu_budget = 1;
+    cfg.hype.host_cpu_budget_count = 3;
+    cfg.hype.host_cpu_budget[0] = 1u;
+    cfg.hype.host_cpu_budget[1] = 2u;
+    cfg.hype.host_cpu_budget[2] = 12u; /* not on an 8-core host */
+    CHECK_INT("a budget core beyond the host is refused",
+              (int)HYPE_ADM_ERR_CPU_BUDGET_OUT_OF_RANGE,
+              (int)hype_adm_check_cpu_budget(&cfg, 8u).status);
+
+    cfg.hype.host_cpu_budget[2] = 7u; /* the last core of an 8-core host */
+    CHECK_INT("the last core of the host is in range", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_cpu_budget(&cfg, 8u).status);
+}
+
+/*
+ * A cpu_set naming a core the operator also declared off-limits is a contradiction inside their own
+ * config. Honouring either half silently picks a winner, so it is refused and the VM is named.
+ */
+static void test_cpu_set_must_lie_inside_the_budget(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "pinned", 1, 1024, "a.img");
+    cfg.vms[0].has_cpu_set = 1;
+    cfg.vms[0].cpu_set_count = 1;
+    cfg.vms[0].cpu_set[0] = 5u;
+    cfg.hype.has_host_cpu_budget = 1;
+    cfg.hype.host_cpu_budget_count = 2;
+    cfg.hype.host_cpu_budget[0] = 1u;
+    cfg.hype.host_cpu_budget[1] = 2u;
+
+    r = hype_adm_check_cpu_budget(&cfg, 8u);
+    CHECK_INT("a cpu_set core outside the budget is refused",
+              (int)HYPE_ADM_ERR_CPU_SET_OUTSIDE_BUDGET, (int)r.status);
+    CHECK_INT("and it names the VM", 0u, r.vm_index_a);
+
+    cfg.vms[0].cpu_set[0] = 2u; /* inside the budget now */
+    CHECK_INT("a cpu_set core inside the budget is fine", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_cpu_budget(&cfg, 8u).status);
+}
+
+/*
+ * THE CHECK THIS TICKET EXISTS FOR. Every cpu_set core is claimed exclusively, so the VMs WITHOUT
+ * one are drawn from the REMAINDER. Comparing them against the whole budget would accept a config
+ * where the pinned VMs have already taken every core -- and the VMs then left with nowhere to go
+ * are exactly the ones the operator did not think hard about.
+ */
+static void test_auto_vcpus_draw_only_from_unclaimed_budget_cores(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.hype.has_host_cpu_budget = 1;
+    cfg.hype.host_cpu_budget_count = 3;
+    cfg.hype.host_cpu_budget[0] = 1u;
+    cfg.hype.host_cpu_budget[1] = 2u;
+    cfg.hype.host_cpu_budget[2] = 3u;
+
+    cfg.vm_count = 2;
+    /* The pinned VM takes 2 of the 3 budget cores; one is left, and the auto VM wants exactly one. */
+    make_vm(&cfg.vms[0], "pinned", 2, 1024, "a.img");
+    cfg.vms[0].has_cpu_set = 1;
+    cfg.vms[0].cpu_set_count = 2;
+    cfg.vms[0].cpu_set[0] = 1u;
+    cfg.vms[0].cpu_set[1] = 2u;
+    make_vm(&cfg.vms[1], "auto", 1, 1024, "b.img");
+    CHECK_INT("2 pinned + 1 auto fits a 3-core budget", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_cpu_budget(&cfg, 8u).status);
+
+    /* Now the auto VM wants two, and only one budget core is unclaimed. The TOTAL (4) also exceeds
+     * the budget, so raise the budget to 4 cores to isolate the remainder rule from the sum rule:
+     * total 4 <= budget 4, and yet it must still be refused, because core 4 is the only one left
+     * and the auto VM needs two. */
+    cfg.vms[1].vcpus = 2;
+    cfg.hype.host_cpu_budget_count = 4;
+    cfg.hype.host_cpu_budget[3] = 4u;
+    cfg.vms[0].cpu_set_count = 3;
+    cfg.vms[0].cpu_set[2] = 3u;
+    cfg.vms[0].vcpus = 3;
+    CHECK_INT("the sum fits the budget but the UNCLAIMED remainder does not",
+              (int)HYPE_ADM_ERR_VCPU_EXCEEDS_BUDGET,
+              (int)hype_adm_check_cpu_budget(&cfg, 8u).status);
+}
+
+/* The plain sum against the budget size, which is the refinement of ADM-2/3 the ticket asks for:
+ * those compared against every host core, and the budget may be smaller than the host. */
+static void test_total_vcpus_against_the_budget_not_the_host(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.hype.has_host_cpu_budget = 1;
+    cfg.hype.host_cpu_budget_count = 2;
+    cfg.hype.host_cpu_budget[0] = 1u;
+    cfg.hype.host_cpu_budget[1] = 2u;
+    cfg.vm_count = 3;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    make_vm(&cfg.vms[2], "c", 1, 512, "c.img");
+
+    /* Three vCPUs would fit this 16-core HOST and do not fit the 2-core BUDGET. ADM-2 passes it;
+     * this must not. */
+    CHECK_INT("three VMs fit the host", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_vcpus(&cfg, 16u).status);
+    CHECK_INT("three VMs do NOT fit a two-core budget", (int)HYPE_ADM_ERR_VCPU_EXCEEDS_BUDGET,
+              (int)hype_adm_check_cpu_budget(&cfg, 16u).status);
+}
+
+/* ---- ADM-6 (#224): per-VM ranges ---- */
+
+/*
+ * The sum cannot express this. Four VMs each wanting two cores on a four-core host and ONE VM
+ * wanting eight are both overcommits, but only the second is impossible at any host size -- and
+ * naming that VM is more useful than reporting a total.
+ */
+static void test_one_vm_alone_may_not_exceed_the_host(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "small", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "huge", 8, 512, "b.img");
+
+    r = hype_adm_check_vm_ranges(&cfg, 4u);
+    CHECK_INT("a VM wanting more cores than the host has is refused",
+              (int)HYPE_ADM_ERR_VCPUS_EXCEED_HOST, (int)r.status);
+    CHECK_INT("and it names the VM, not the total", 1u, r.vm_index_a);
+
+    cfg.vms[1].vcpus = 3;
+    CHECK_INT("three vCPUs on a four-core host is a per-VM pass", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_vm_ranges(&cfg, 4u).status);
+}
+
+/*
+ * THE OPPOSITE OF THE OBVIOUS READING, and worth a test of its own so nobody "fixes" it. vcpus == 0
+ * in the struct means the key was ABSENT, and §5.2's default is 1 -- hype_cfg_resolve_vcpus() turns
+ * it into one vCPU and reports DEFAULTED. A check that refused zero would refuse every config that
+ * simply does not mention vcpus, which is most of them.
+ */
+static void test_absent_vcpus_is_not_an_error(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "unstated", 0, 512, "a.img");
+    CHECK_INT("an absent vcpus is a default, not a breach", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_vm_ranges(&cfg, 4u).status);
+
+    /* And it is priced as ONE core by the budget check, not as nothing. */
+    cfg.vm_count = 3;
+    make_vm(&cfg.vms[1], "b", 0, 512, "b.img");
+    make_vm(&cfg.vms[2], "c", 0, 512, "c.img");
+    cfg.hype.has_host_cpu_budget = 1;
+    cfg.hype.host_cpu_budget_count = 2;
+    cfg.hype.host_cpu_budget[0] = 0u;
+    cfg.hype.host_cpu_budget[1] = 1u;
+    CHECK_INT("three VMs with no vcpus key cost three cores, not zero",
+              (int)HYPE_ADM_ERR_VCPU_EXCEEDS_BUDGET,
+              (int)hype_adm_check_cpu_budget(&cfg, 8u).status);
+}
+
+/* An unknown core count (enumeration failed) must not turn every VM into a breach: hype falls back
+ * to its literal AP ids in that case, and refusing every machine would be worse than proceeding. */
+static void test_unknown_core_count_only_checks_zero(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 64, 512, "a.img");
+    CHECK_INT("an unknown core count compares against nothing", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_vm_ranges(&cfg, 0u).status);
+    /* And the same request against a KNOWN host of that size is refused, so the pass above is the
+     * unknown-host rule and not the check failing to look. */
+    CHECK_INT("64 vCPUs against a known 4-core host is reported",
+              (int)HYPE_ADM_ERR_VCPUS_EXCEED_HOST,
+              (int)hype_adm_check_vm_ranges(&cfg, 4u).status);
+}
+
+/* ---- ADM-6 (#224): physical claims from BOTH places a config makes them ---- */
+
+/*
+ * THE GAP THIS TICKET NAMES AS SECURITY-CRITICAL. A [disk.*] scoped to partition 2 of a drive and
+ * another VM's INLINE `target_disk = physical:<same drive>` scoped to the whole of it are two
+ * claims on the same storage. The old check compared [disk.*] entries against each other only, and
+ * hype_adm_check_target_disk compares inline targets by string equality with no notion of
+ * partition scope -- so nothing rejected this.
+ */
+static void test_inline_physical_target_overlaps_a_named_disk(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "byref", 1, 512, "");
+    cfg.vms[0].target_disk.path_or_id[0] = '\0'; /* storage by reference, no inline target */
+    cfg.vms[0].disks_count = 1;
+    strncpy(cfg.vms[0].disks[0], "p2", sizeof(cfg.vms[0].disks[0]) - 1);
+    add_disk(&cfg, "p2", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_PHYSICAL, 0);
+    cfg.disks[0].has_id_match = 1;
+    strncpy(cfg.disks[0].id_match, "SN-1", sizeof(cfg.disks[0].id_match) - 1);
+    cfg.disks[0].partition = 2u;
+
+    make_vm(&cfg.vms[1], "inline", 1, 512, "");
+    cfg.vms[1].target_disk.kind = HYPE_CFG_DISK_PHYSICAL;
+    strncpy(cfg.vms[1].target_disk.path_or_id, "SN-1",
+            sizeof(cfg.vms[1].target_disk.path_or_id) - 1);
+    cfg.vms[1].target_disk.partition = 0u; /* the WHOLE drive */
+
+    r = hype_adm_check_disk_phys_overlap(&cfg);
+    CHECK_INT("whole-drive inline target overlaps a partition-scoped [disk.*]",
+              (int)HYPE_ADM_ERR_DISK_PHYS_OVERLAP, (int)r.status);
+    /* Attribution is what lets the boot path refuse a machine rather than only print. */
+    CHECK_INT("the named disk's VM is attributed", 0u, r.vm_index_a);
+    CHECK_INT("the inline target's VM is attributed", 1u, r.vm_index_b);
+
+    /* Scope the inline target to a DIFFERENT partition and the two are disjoint again -- the
+     * #332 case that must keep working. */
+    cfg.vms[1].target_disk.partition = 3u;
+    CHECK_INT("distinct partitions across the two forms are allowed", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_phys_overlap(&cfg).status);
+}
+
+/*
+ * ONE VM holding two overlapping claims is redundant, not unsafe. Refusing it would stop a machine
+ * booting over a config that harms nobody, and §6d is about exclusivity BETWEEN guests.
+ */
+static void test_one_vm_may_hold_overlapping_claims_on_its_own_drive(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "solo", 1, 512, "");
+    cfg.vms[0].disks_count = 1;
+    strncpy(cfg.vms[0].disks[0], "p2", sizeof(cfg.vms[0].disks[0]) - 1);
+    add_disk(&cfg, "p2", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_PHYSICAL, 0);
+    cfg.disks[0].has_id_match = 1;
+    strncpy(cfg.disks[0].id_match, "SN-1", sizeof(cfg.disks[0].id_match) - 1);
+    cfg.disks[0].partition = 2u;
+    cfg.vms[0].target_disk.kind = HYPE_CFG_DISK_PHYSICAL;
+    strncpy(cfg.vms[0].target_disk.path_or_id, "SN-1",
+            sizeof(cfg.vms[0].target_disk.path_or_id) - 1);
+    cfg.vms[0].target_disk.partition = 0u;
+
+    CHECK_INT("one VM's own overlapping claims are not a breach", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_phys_overlap(&cfg).status);
+}
+
+/* Two INLINE physical targets on the same drive, scoped differently: string equality (ADM-4) sees
+ * two different strings only when the ids differ, so partition scope has to be what decides. */
+static void test_two_inline_physical_targets_overlap_by_scope(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "");
+    cfg.vms[0].target_disk.kind = HYPE_CFG_DISK_PHYSICAL;
+    strncpy(cfg.vms[0].target_disk.path_or_id, "SN-9",
+            sizeof(cfg.vms[0].target_disk.path_or_id) - 1);
+    cfg.vms[0].target_disk.partition = 1u;
+    make_vm(&cfg.vms[1], "b", 1, 512, "");
+    cfg.vms[1].target_disk.kind = HYPE_CFG_DISK_PHYSICAL;
+    strncpy(cfg.vms[1].target_disk.path_or_id, "SN-9",
+            sizeof(cfg.vms[1].target_disk.path_or_id) - 1);
+    cfg.vms[1].target_disk.partition = 1u;
+
+    CHECK_INT("the same partition of one drive, claimed inline by two VMs",
+              (int)HYPE_ADM_ERR_DISK_PHYS_OVERLAP,
+              (int)hype_adm_check_disk_phys_overlap(&cfg).status);
+
+    cfg.vms[1].target_disk.partition = 2u;
+    CHECK_INT("different partitions of one drive, claimed inline, are allowed", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_phys_overlap(&cfg).status);
+}
+
+/* ---- ADM-6 (#224): cdroms count against the device budget ---- */
+
+/*
+ * A cdrom spends an interrupt line and a PCI slot exactly as a disk does. Counting only `disks`
+ * let a 2-disk + 3-cdrom VM pass a 4-device budget and then have its tail silently never attached,
+ * which is the failure this check exists to prevent, one list over.
+ */
+static void test_cdroms_count_against_the_device_budget(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "many", 1, 512, "");
+    cfg.vms[0].disks_count = 2;
+    cfg.vms[0].cdroms_count = 3;
+
+    r = hype_adm_check_disk_count(&cfg, 4u);
+    CHECK_INT("2 disks + 3 cdroms exceeds a 4-device budget",
+              (int)HYPE_ADM_ERR_DISK_COUNT_EXCEEDED, (int)r.status);
+    CHECK_INT("and it names the VM", 0u, r.vm_index_a);
+
+    cfg.vms[0].cdroms_count = 2;
+    CHECK_INT("2 disks + 2 cdroms fits exactly", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_count(&cfg, 4u).status);
+}
+
+/*
+ * A physical device can be attached through `cdroms` as well as `disks` -- a raw partition handed
+ * to a guest read-only, say -- and the claim is just as real. Attribution has to look in both
+ * lists, or the breach is found and blamed on nobody.
+ */
+static void test_physical_cdrom_claim_is_attributed_too(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "reader", 1, 512, "");
+    cfg.vms[0].cdroms_count = 1;
+    strncpy(cfg.vms[0].cdroms[0], "raw-part", sizeof(cfg.vms[0].cdroms[0]) - 1);
+    add_disk(&cfg, "raw-part", HYPE_CFG_DISK_TYPE_CDROM, HYPE_CFG_BACKING_PHYSICAL, 1);
+    cfg.disks[0].has_id_match = 1;
+    strncpy(cfg.disks[0].id_match, "SN-7", sizeof(cfg.disks[0].id_match) - 1);
+    cfg.disks[0].partition = 4u;
+
+    make_vm(&cfg.vms[1], "writer", 1, 512, "");
+    cfg.vms[1].target_disk.kind = HYPE_CFG_DISK_PHYSICAL;
+    strncpy(cfg.vms[1].target_disk.path_or_id, "SN-7",
+            sizeof(cfg.vms[1].target_disk.path_or_id) - 1);
+    cfg.vms[1].target_disk.partition = 4u;
+
+    r = hype_adm_check_disk_phys_overlap(&cfg);
+    CHECK_INT("a physical cdrom claim still collides", (int)HYPE_ADM_ERR_DISK_PHYS_OVERLAP,
+              (int)r.status);
+    CHECK_INT("the cdrom's VM is attributed", 0u, r.vm_index_a);
+    CHECK_INT("the inline target's VM is attributed", 1u, r.vm_index_b);
+}
+
+/*
+ * A backing=physical device with no `id_match` names no drive, so it cannot be compared to
+ * anything. phys_guard refuses it later for that reason; here it must simply not participate,
+ * rather than matching every other claim through an empty string.
+ */
+static void test_physical_device_without_an_identity_is_skipped(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 0;
+    add_disk(&cfg, "nameless", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_PHYSICAL, 0);
+    /* has_id_match deliberately left 0 */
+    add_disk(&cfg, "also-nameless", HYPE_CFG_DISK_TYPE_DISK, HYPE_CFG_BACKING_PHYSICAL, 0);
+
+    CHECK_INT("identity-less physical devices do not collide with each other", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_phys_overlap(&cfg).status);
+}
+
+/*
+ * The cpu_sets alone can over-claim the budget even when the vCPU TOTAL fits it, because this
+ * check prices what the operator actually NAMED rather than what they asked for -- keeping the two
+ * in step is hype_adm_check_cpu_set's job, and this must still be right while they disagree.
+ */
+static void test_cpu_sets_alone_can_over_claim_the_budget(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.hype.has_host_cpu_budget = 1;
+    cfg.hype.host_cpu_budget_count = 3;
+    cfg.hype.host_cpu_budget[0] = 0u;
+    cfg.hype.host_cpu_budget[1] = 1u;
+    cfg.hype.host_cpu_budget[2] = 2u;
+
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "");
+    cfg.vms[0].has_cpu_set = 1;
+    cfg.vms[0].cpu_set_count = 2;
+    cfg.vms[0].cpu_set[0] = 0u;
+    cfg.vms[0].cpu_set[1] = 1u;
+    make_vm(&cfg.vms[1], "b", 1, 512, "");
+    cfg.vms[1].has_cpu_set = 1;
+    cfg.vms[1].cpu_set_count = 2;
+    cfg.vms[1].cpu_set[0] = 1u;
+    cfg.vms[1].cpu_set[1] = 2u;
+
+    /* Total vcpus = 2, which fits the 3-core budget; named cores = 4, which does not. */
+    CHECK_INT("named cores over-claiming the budget is refused",
+              (int)HYPE_ADM_ERR_VCPU_EXCEEDS_BUDGET,
+              (int)hype_adm_check_cpu_budget(&cfg, 8u).status);
+}
+
 int main(void) {
     test_peers_default_deny();
     test_peers_one_sided_listing_is_bidirectional();
@@ -1017,6 +1427,21 @@ int main(void) {
     test_physical_overlap_allows_distinct_partitions();
     test_unpresentable_bus_is_refused();
     test_disk_count_over_frontend_budget_is_refused();
+    test_cpu_budget_absent_is_a_no_op();
+    test_cpu_budget_core_must_exist();
+    test_cpu_set_must_lie_inside_the_budget();
+    test_auto_vcpus_draw_only_from_unclaimed_budget_cores();
+    test_total_vcpus_against_the_budget_not_the_host();
+    test_one_vm_alone_may_not_exceed_the_host();
+    test_absent_vcpus_is_not_an_error();
+    test_unknown_core_count_only_checks_zero();
+    test_inline_physical_target_overlaps_a_named_disk();
+    test_one_vm_may_hold_overlapping_claims_on_its_own_drive();
+    test_two_inline_physical_targets_overlap_by_scope();
+    test_cdroms_count_against_the_device_budget();
+    test_physical_cdrom_claim_is_attributed_too();
+    test_physical_device_without_an_identity_is_skipped();
+    test_cpu_sets_alone_can_over_claim_the_budget();
 
     if (failures == 0) {
         printf("all tests passed\n");

@@ -12068,6 +12068,86 @@ static void fw_1_phase1_config(void) {
                                  "NAT peer [#531 section 6e]\n", (int)ir.status, ir.vm_index_a);
                 fw_1_refuse_vm(ir.vm_index_a);
             }
+            /*
+             * ADM-6 (#224): the two DISK isolation invariants, enforced here rather than merely
+             * reported in load_hype_cfg().
+             *
+             * Both were already checked and printed at parse time -- and printing was all that
+             * happened, so two VMs writing one backing store, or claiming overlapping storage on
+             * one physical drive, were told to the operator and then allowed. Section 6d's
+             * "exclusively owned" is a promise, and an unenforced promise is worse than an absent
+             * one: the operator has been told the machine is safe. These belong in this block with
+             * the other §6g/§6j breaches, at the same severity and with the same remedy.
+             */
+            ir = hype_adm_check_disk_sharing(&g_hype_cfg);
+            if (ir.status != HYPE_ADM_OK) {
+                HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- vm%u and vm%u attach the SAME WRITABLE disk: "
+                                 "two guests writing one backing store corrupt it and neither can "
+                                 "detect the other [#224 section 6d]\n", ir.vm_index_a,
+                                 ir.vm_index_b);
+                fw_1_refuse_vm(ir.vm_index_b != HYPE_ADM_NO_VM ? ir.vm_index_b : ir.vm_index_a);
+            }
+            ir = hype_adm_check_disk_phys_overlap(&g_hype_cfg);
+            if (ir.status != HYPE_ADM_OK) {
+                HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- overlapping PHYSICAL storage claims between "
+                                 "vm%u and vm%u (whole-drive conflicts with any partition; the same "
+                                 "partition conflicts with itself) [#224 section 6d]\n",
+                                 ir.vm_index_a, ir.vm_index_b);
+                if (ir.vm_index_b != HYPE_ADM_NO_VM) {
+                    fw_1_refuse_vm(ir.vm_index_b);
+                } else if (ir.vm_index_a != HYPE_ADM_NO_VM) {
+                    fw_1_refuse_vm(ir.vm_index_a);
+                }
+                /* Both indices NO_VM means two UNATTACHED [disk.*] devices overlap: a config to
+                 * fix, but no VM is claiming either, so there is no machine to refuse and the
+                 * report above is the whole action. */
+            }
+            /*
+             * ADM-6 (#224): host_cpu_budget, and each VM's own vCPU request.
+             *
+             * A budget breach is capacity rather than an isolation failure -- the operator has said
+             * which cores hype may use, and asking for more of them is the same class of mistake as
+             * #396's core bound, which is reported and capped rather than refused. The per-VM range
+             * check is here for the case the sum cannot express: one VM asking for more cores than
+             * the host has is impossible at any host size, and naming that VM beats reporting a
+             * total.
+             */
+            ir = hype_adm_check_cpu_budget(&g_hype_cfg, g_cpu_topo.count);
+            if (ir.status != HYPE_ADM_OK) {
+                /* Two of the three budget failures are whole-config facts with no VM to name, and
+                 * printing HYPE_ADM_NO_VM as a decimal ("at vm4294967295") reads like corruption.
+                 * Say which VM only when there is one. */
+                if (ir.vm_index_a != HYPE_ADM_NO_VM) {
+                    HYPE_LOGF(HYPE_LOG_WARN, "adm: host_cpu_budget breach (code %d) at vm%u -- its cpu_set "
+                                     "names a core outside the %u core(s) the budget offers of this "
+                                     "host's %u [#224 section 6i]\n", (int)ir.status,
+                                     ir.vm_index_a, g_hype_cfg.hype.host_cpu_budget_count,
+                                     g_cpu_topo.count);
+                } else {
+                    HYPE_LOGF(HYPE_LOG_WARN, "adm: host_cpu_budget breach (code %d) -- the budget names %u "
+                                     "core(s) of this host's %u, and either a named core does not "
+                                     "exist or the VMs want more than the budget offers [#224 "
+                                     "section 6i]\n", (int)ir.status,
+                                     g_hype_cfg.hype.host_cpu_budget_count, g_cpu_topo.count);
+                }
+            }
+            /*
+             * Reported and capped, NOT refused -- §5.2 gives `vcpus` the range "1 .. host physical
+             * cores - 1" and says admission caps at the available cores, which
+             * hype_cfg_resolve_vcpus() then does. Refusing here would contradict a documented clamp
+             * and stop a VM hype is supposed to run narrower. What this adds over
+             * hype_adm_check_vcpus() is the VM's NAME: a total that is too big does not say which
+             * machine asked for something no host of this size could ever give it.
+             */
+            ir = hype_adm_check_vm_ranges(&g_hype_cfg, g_cpu_topo.count);
+            if (ir.status != HYPE_ADM_OK) {
+                HYPE_LOGF(HYPE_LOG_WARN, "adm: vm%u asks for %u vCPU(s) and this host has %u core(s) -- "
+                                 "it will be CAPPED, not refused (section 5.2's documented clamp) "
+                                 "[#224]\n", ir.vm_index_a,
+                                 (ir.vm_index_a < g_hype_cfg.vm_count)
+                                     ? g_hype_cfg.vms[ir.vm_index_a].vcpus : 0u,
+                                 g_cpu_topo.count);
+            }
             /* Capacity, not an invariant: reported and capped like #396's core bound. */
             ir = hype_adm_check_vcpus(&g_hype_cfg, g_cpu_topo.count);
             if (ir.status != HYPE_ADM_OK) {
@@ -19076,10 +19156,19 @@ static void load_hype_cfg(void) {
             dr = hype_adm_check_disk_count(&g_hype_cfg, HYPE_FW_1_MAX_DISKS);
         }
         if (dr.status != HYPE_ADM_OK) {
-            hype_serial_print("cfg: DISK CONFIG REJECTED (code %d, vm %u) -- a referenced [disk.*] is "
+            /*
+             * ADM-6 (#224): "REJECTED" was the wrong word here, because nothing was rejected --
+             * this site only ever printed. The two ISOLATION breaches in that list (shared writable,
+             * overlapping physical claims) are now enforced in the admission block beside the other
+             * §6g/§6j invariants, which is where a breach can actually refuse the VM. The rest are
+             * configuration errors that leave a VM with a missing or unattachable disk, and those
+             * stay reported so the operator keeps a machine to fix the config from.
+             */
+            hype_serial_print("cfg: DISK CONFIG PROBLEM (code %d, vm %u) -- a referenced [disk.*] is "
                               "missing, of the wrong type, shared writable, overlapping another "
-                              "physical claim, on a bus hype cannot present, or more disks than the "
-                              "%u hype can attach\n",
+                              "physical claim, on a bus hype cannot present, or more devices than "
+                              "the %u hype can attach. An isolation breach is refused by admission; "
+                              "the rest are reported here [#224]\n",
                               (int)dr.status, dr.vm_index_a, (unsigned)HYPE_FW_1_MAX_DISKS);
         }
     }
