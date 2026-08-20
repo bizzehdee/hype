@@ -23,19 +23,21 @@
  * pattern in the host-side file after the run. That is #343's re-read-and-compare discipline, and
  * it is the only way to tell storage from a memory buffer with a storage-shaped interface.
  *
- * ONE FINDING, recorded here because it surprised me: hype's virtio-blk publishes NO virtio PCI
- * capability chain. The spec (§4.1.4) has a driver discover the common-cfg / notify / ISR /
- * device-cfg regions by walking vendor capabilities; hype instead fixes them at BAR offsets 0,
- * 0x1000, 0x2000 and 0x3000, and devices/virtio_blk.h says so ("this implementation's own
- * choice ... shared between the exempt NPF glue and whatever builds the device's own PCI
- * capability list bytes at setup time" -- nothing builds them). A real Linux or FreeBSD driver
- * walks the capabilities, so this test uses the fixed offsets and NAMES the assumption rather
- * than pretending it discovered them.
+ * REGIONS ARE DISCOVERED, NOT ASSUMED (#569). The spec (§4.1.4) has a driver find the common-cfg /
+ * notify / ISR / device-cfg regions by walking the PCI vendor capabilities, which is how Linux's
+ * virtio_pci_modern and FreeBSD's virtio_pci bind. This test used hype's fixed BAR offsets (0,
+ * 0x1000, 0x2000, 0x3000) and named the assumption instead -- honest, but it meant the test was
+ * written against hype rather than against the spec, and could not have noticed a missing or wrong
+ * capability chain at all.
+ *
+ * It now walks the chain (micro_virtio.h, shared with virtionet.c) and uses what it finds. The
+ * fixed offsets in devices/virtio_blk.h are unchanged and still correct; what changed is that the
+ * guest is told about them and this test proves a conforming driver could bind.
  *
  * cmdline (#546): `sector=N` picks the LBA. Default 1 rather than 0, so a test run cannot
  * overwrite a partition table on an image someone cares about.
  */
-#include "micro_pci.h"
+#include "micro_virtio.h"
 
 #define NAME "virtioblk"
 
@@ -67,10 +69,18 @@
 #define CFG_QUEUE_DEVICE_LO 0x30u
 #define CFG_QUEUE_DEVICE_HI 0x34u
 
-#define BAR_COMMON_CFG 0x0000u
-#define BAR_NOTIFY_CFG 0x1000u
-#define BAR_NOTIFY_MULTIPLIER 4u
-#define BAR_DEVICE_CFG 0x3000u
+/*
+ * #569: DISCOVERED, not hardcoded. These were `#define`s for hype's own fixed BAR offsets (0,
+ * 0x1000, 0x2000, 0x3000), which made this a test written against hype rather than against the
+ * spec. They are now filled by walking the PCI capability chain, exactly as Linux's
+ * virtio_pci_modern and FreeBSD's virtio_pci do, so a chain hype gets wrong fails here instead of
+ * being bypassed.
+ */
+static uint32_t g_common_off;
+static uint32_t g_notify_off;
+static uint32_t g_isr_off;
+static uint32_t g_device_off;
+static uint32_t g_notify_mult;
 
 #define BLK_CFG_CAPACITY_LO 0x00u
 #define BLK_CFG_BLK_SIZE 0x14u
@@ -190,7 +200,7 @@ static int do_request(uint32_t type, uint64_t sector, uint64_t data_gpa, uint16_
     avail[2 + (*used_idx_seen % QUEUE_SIZE)] = 0u;
     avail[1] = (uint16_t)(*used_idx_seen + 1u);
 
-    mmio_w16(BAR_NOTIFY_CFG + (uint32_t)notify_off * BAR_NOTIFY_MULTIPLIER, 0u);
+    mmio_w16(g_notify_off + (uint32_t)notify_off * g_notify_mult, 0u);
 
     /* used ring: {u16 flags, u16 idx, {u32 id, u32 len}[]}. Bounded, so a device that never
      * completes produces a named failure rather than a wedge with no verdict. */
@@ -250,10 +260,10 @@ void micro_main(uint64_t zero_page_gpa) {
         micro_halt();
     }
 
-    /* BAR 4, not 0: hype puts the virtio-pci regions there (HYPE_FW_1_VIRTIO_BAR_INDEX). A real
-     * driver would learn this from the vendor capabilities, which hype does not publish -- see the
-     * note at the top. Assuming BAR0 is what the first version of this test did, and it failed
-     * with "BAR0 is too small", which is the right way for a wrong assumption to end. */
+    /* BAR 4, not 0: hype puts the virtio-pci regions there (HYPE_FW_1_VIRTIO_BAR_INDEX). Assuming
+     * BAR0 is what the first version of this test did, and it failed with "BAR0 is too small",
+     * which is the right way for a wrong assumption to end. The capability walk below CHECKS this
+     * rather than trusting it: every region must name the BAR that was placed here (#569). */
     bar_size = micro_pci_bar_size(MICRO_PCI_DEV_VIRTIO_BLK, 4u);
     bar_gpa = micro_pci_place_bar(MICRO_PCI_DEV_VIRTIO_BLK, 4u, MICRO_BAR_WINDOW);
     g_bar = (volatile uint8_t *)(uintptr_t)bar_gpa;
@@ -269,21 +279,65 @@ void micro_main(uint64_t zero_page_gpa) {
     micro_pci_write32(MICRO_PCI_DEV_VIRTIO_BLK, MICRO_PCI_COMMAND,
                       MICRO_PCI_CMD_MEM_SPACE | MICRO_PCI_CMD_BUS_MASTER);
 
+    /*
+     * ---- discover the four regions by walking the capability chain (#569) --------------
+     *
+     * Before this, everything below used hype's fixed offsets. Now a chain that is absent,
+     * incomplete, points at the wrong BAR, or publishes notify_off_multiplier = 0 fails HERE, with
+     * a message naming which region is missing -- rather than being silently bypassed by a test
+     * that already knew the answer.
+     */
+    {
+        micro_virtio_caps_t caps;
+        if (micro_virtio_walk_caps(MICRO_PCI_DEV_VIRTIO_BLK, 4u, NAME, &caps) != 0) {
+            micro_halt(); /* the walk has already reported which part of the chain failed */
+        }
+        g_common_off = caps.common_off;
+        g_notify_off = caps.notify_off;
+        g_isr_off = caps.isr_off;
+        g_device_off = caps.device_off;
+        g_notify_mult = caps.notify_mult;
+
+        /*
+         * A region that overruns the BAR would have the driver poking past the window hype
+         * decodes, which reads as a device bug from inside the guest. Checked against the size
+         * actually read back from the BAR rather than against a constant.
+         */
+        if (caps.common_off + caps.common_len > bar_size ||
+            caps.notify_off + caps.notify_len > bar_size ||
+            caps.isr_off + caps.isr_len > bar_size ||
+            caps.device_off + caps.device_len > bar_size) {
+            micro_fail(NAME, "a discovered virtio region extends past the end of BAR4");
+            micro_halt();
+        }
+        micro_puts("micro/" NAME ": regions discovered -- common ");
+        micro_put_hex(g_common_off);
+        micro_puts(" notify ");
+        micro_put_hex(g_notify_off);
+        micro_puts(" (x");
+        micro_put_uint(g_notify_mult);
+        micro_puts(") isr ");
+        micro_put_hex(g_isr_off);
+        micro_puts(" device ");
+        micro_put_hex(g_device_off);
+        micro_puts("\n");
+    }
+
     /* ---- reset, then ACKNOWLEDGE | DRIVER (spec §3.1.1 steps 1-2) ---------------------- */
-    mmio_w8(BAR_COMMON_CFG + CFG_DEVICE_STATUS, 0u);
+    mmio_w8(g_common_off + CFG_DEVICE_STATUS, 0u);
     spins = 0;
-    while (mmio_r8(BAR_COMMON_CFG + CFG_DEVICE_STATUS) != 0u) {
+    while (mmio_r8(g_common_off + CFG_DEVICE_STATUS) != 0u) {
         if (++spins > 10000000ull) {
             micro_fail(NAME, "device_status never read back 0 after a reset");
             micro_halt();
         }
     }
-    mmio_w8(BAR_COMMON_CFG + CFG_DEVICE_STATUS,
+    mmio_w8(g_common_off + CFG_DEVICE_STATUS,
             VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
     /* ---- features (steps 3-6). Require VERSION_1; offer nothing optional. -------------- */
-    mmio_w32(BAR_COMMON_CFG + CFG_DEVICE_FEATURE_SELECT, 1u);
-    feat_hi = mmio_r32(BAR_COMMON_CFG + CFG_DEVICE_FEATURE);
+    mmio_w32(g_common_off + CFG_DEVICE_FEATURE_SELECT, 1u);
+    feat_hi = mmio_r32(g_common_off + CFG_DEVICE_FEATURE);
     micro_puts("micro/" NAME ": device features[63:32] ");
     micro_put_hex(feat_hi);
     micro_puts("\n");
@@ -292,29 +346,29 @@ void micro_main(uint64_t zero_page_gpa) {
                          "requires");
         micro_halt();
     }
-    mmio_w32(BAR_COMMON_CFG + CFG_DRIVER_FEATURE_SELECT, 0u);
-    mmio_w32(BAR_COMMON_CFG + CFG_DRIVER_FEATURE, 0u);
-    mmio_w32(BAR_COMMON_CFG + CFG_DRIVER_FEATURE_SELECT, 1u);
-    mmio_w32(BAR_COMMON_CFG + CFG_DRIVER_FEATURE, 1u); /* VERSION_1 only */
+    mmio_w32(g_common_off + CFG_DRIVER_FEATURE_SELECT, 0u);
+    mmio_w32(g_common_off + CFG_DRIVER_FEATURE, 0u);
+    mmio_w32(g_common_off + CFG_DRIVER_FEATURE_SELECT, 1u);
+    mmio_w32(g_common_off + CFG_DRIVER_FEATURE, 1u); /* VERSION_1 only */
 
     st = (uint8_t)(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
-    mmio_w8(BAR_COMMON_CFG + CFG_DEVICE_STATUS, st);
+    mmio_w8(g_common_off + CFG_DEVICE_STATUS, st);
     /* Read it back: a device that clears FEATURES_OK has refused what the driver offered, and
      * carrying on from there is how a driver ends up talking a protocol the device is not. */
-    if ((mmio_r8(BAR_COMMON_CFG + CFG_DEVICE_STATUS) & VIRTIO_STATUS_FEATURES_OK) == 0u) {
+    if ((mmio_r8(g_common_off + CFG_DEVICE_STATUS) & VIRTIO_STATUS_FEATURES_OK) == 0u) {
         micro_fail(NAME, "the device cleared FEATURES_OK -- it rejected the negotiated features");
         micro_halt();
     }
 
-    num_queues = mmio_r16(BAR_COMMON_CFG + CFG_NUM_QUEUES);
+    num_queues = mmio_r16(g_common_off + CFG_NUM_QUEUES);
     if (num_queues == 0u) {
         micro_fail(NAME, "the device reports zero virtqueues");
         micro_halt();
     }
 
     /* ---- virtqueue 0 (step 7) ---------------------------------------------------------- */
-    mmio_w16(BAR_COMMON_CFG + CFG_QUEUE_SELECT, 0u);
-    qsize = mmio_r16(BAR_COMMON_CFG + CFG_QUEUE_SIZE);
+    mmio_w16(g_common_off + CFG_QUEUE_SELECT, 0u);
+    qsize = mmio_r16(g_common_off + CFG_QUEUE_SIZE);
     micro_puts("micro/" NAME ": queues=");
     micro_put_uint(num_queues);
     micro_puts(" queue0 max size=");
@@ -325,24 +379,24 @@ void micro_main(uint64_t zero_page_gpa) {
         micro_halt();
     }
     /* Shrink to something whose rings fit comfortably; the device must accept a smaller size. */
-    mmio_w16(BAR_COMMON_CFG + CFG_QUEUE_SIZE, (uint16_t)QUEUE_SIZE);
+    mmio_w16(g_common_off + CFG_QUEUE_SIZE, (uint16_t)QUEUE_SIZE);
 
     for (i = 0; i < 4096u; i++) {
         ((volatile uint8_t *)(uintptr_t)DESC_GPA)[i] = 0u;
         ((volatile uint8_t *)(uintptr_t)AVAIL_GPA)[i] = 0u;
         ((volatile uint8_t *)(uintptr_t)USED_GPA)[i] = 0u;
     }
-    mmio_w32(BAR_COMMON_CFG + CFG_QUEUE_DESC_LO, (uint32_t)DESC_GPA);
-    mmio_w32(BAR_COMMON_CFG + CFG_QUEUE_DESC_HI, (uint32_t)(DESC_GPA >> 32));
-    mmio_w32(BAR_COMMON_CFG + CFG_QUEUE_DRIVER_LO, (uint32_t)AVAIL_GPA);
-    mmio_w32(BAR_COMMON_CFG + CFG_QUEUE_DRIVER_HI, (uint32_t)(AVAIL_GPA >> 32));
-    mmio_w32(BAR_COMMON_CFG + CFG_QUEUE_DEVICE_LO, (uint32_t)USED_GPA);
-    mmio_w32(BAR_COMMON_CFG + CFG_QUEUE_DEVICE_HI, (uint32_t)(USED_GPA >> 32));
-    notify_off = mmio_r16(BAR_COMMON_CFG + CFG_QUEUE_NOTIFY_OFF);
-    mmio_w16(BAR_COMMON_CFG + CFG_QUEUE_ENABLE, 1u);
+    mmio_w32(g_common_off + CFG_QUEUE_DESC_LO, (uint32_t)DESC_GPA);
+    mmio_w32(g_common_off + CFG_QUEUE_DESC_HI, (uint32_t)(DESC_GPA >> 32));
+    mmio_w32(g_common_off + CFG_QUEUE_DRIVER_LO, (uint32_t)AVAIL_GPA);
+    mmio_w32(g_common_off + CFG_QUEUE_DRIVER_HI, (uint32_t)(AVAIL_GPA >> 32));
+    mmio_w32(g_common_off + CFG_QUEUE_DEVICE_LO, (uint32_t)USED_GPA);
+    mmio_w32(g_common_off + CFG_QUEUE_DEVICE_HI, (uint32_t)(USED_GPA >> 32));
+    notify_off = mmio_r16(g_common_off + CFG_QUEUE_NOTIFY_OFF);
+    mmio_w16(g_common_off + CFG_QUEUE_ENABLE, 1u);
 
-    mmio_w8(BAR_COMMON_CFG + CFG_DEVICE_STATUS, (uint8_t)(st | VIRTIO_STATUS_DRIVER_OK));
-    st = mmio_r8(BAR_COMMON_CFG + CFG_DEVICE_STATUS);
+    mmio_w8(g_common_off + CFG_DEVICE_STATUS, (uint8_t)(st | VIRTIO_STATUS_DRIVER_OK));
+    st = mmio_r8(g_common_off + CFG_DEVICE_STATUS);
     if ((st & (VIRTIO_STATUS_FAILED | VIRTIO_STATUS_NEEDS_RESET)) != 0u) {
         micro_puts("micro/" NAME ": device_status ");
         micro_put_hex(st);
@@ -352,8 +406,8 @@ void micro_main(uint64_t zero_page_gpa) {
     }
 
     /* Device-specific config, read AFTER DRIVER_OK so it reflects a live device. */
-    capacity_lo = mmio_r32(BAR_DEVICE_CFG + BLK_CFG_CAPACITY_LO);
-    blk_size = mmio_r32(BAR_DEVICE_CFG + BLK_CFG_BLK_SIZE);
+    capacity_lo = mmio_r32(g_device_off + BLK_CFG_CAPACITY_LO);
+    blk_size = mmio_r32(g_device_off + BLK_CFG_BLK_SIZE);
     micro_puts("micro/" NAME ": capacity ");
     micro_put_uint(capacity_lo);
     micro_puts(" sector(s), blk_size ");

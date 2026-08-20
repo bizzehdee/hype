@@ -31,7 +31,7 @@
  * proves the DEVICE -- discovery, negotiation, both rings, a completed transmit -- and says so,
  * rather than implying the guest reached a network.
  */
-#include "micro_pci.h"
+#include "micro_virtio.h"
 
 #define NAME "virtionet"
 
@@ -73,16 +73,6 @@
 #define CFG_QUEUE_DEVICE_LO 0x30u
 #define CFG_QUEUE_DEVICE_HI 0x34u
 
-/* PCI capability walking (spec 4.1.4). */
-#define PCI_STATUS_OFFSET 0x06u
-#define PCI_STATUS_CAP_LIST 0x0010u
-#define PCI_CAP_POINTER 0x34u
-#define PCI_CAP_ID_VENDOR 0x09u
-#define VIRTIO_PCI_CAP_COMMON_CFG 1u
-#define VIRTIO_PCI_CAP_NOTIFY_CFG 2u
-#define VIRTIO_PCI_CAP_ISR_CFG 3u
-#define VIRTIO_PCI_CAP_DEVICE_CFG 4u
-
 #define VIRTQ_DESC_F_NEXT 0x0001u
 #define VIRTQ_DESC_F_WRITE 0x0002u
 
@@ -116,7 +106,7 @@ typedef struct {
 static volatile uint8_t *g_bar;
 
 /* Region offsets, DISCOVERED rather than assumed. 0xFFFFFFFF means "not found in the chain". */
-#define NOT_FOUND 0xFFFFFFFFu
+#define NOT_FOUND MICRO_VIRTIO_NOT_FOUND
 static uint32_t g_common_off = NOT_FOUND;
 static uint32_t g_notify_off = NOT_FOUND;
 static uint32_t g_isr_off = NOT_FOUND;
@@ -193,103 +183,22 @@ static int find_nic(void) {
 }
 
 /*
- * Walk the vendor capability chain and record where each virtio region lives. This is the part a
- * real driver does and the in-binary tests never could.
- *
- * A virtio_pci_cap is: cap_vndr(1) cap_next(1) cap_len(1) cfg_type(1) bar(1) padding(3)
- * offset(4) length(4), and the notify capability adds notify_off_multiplier(4).
+ * #569: the walk itself now lives in micro_virtio.h, shared with virtioblk.c. This keeps the
+ * file-local offsets the rest of the test reads so those ~50 call sites are untouched, and gains
+ * the property that matters: ONE implementation of the bus walk, so the two virtio tests cannot
+ * drift on what "discovered the regions" means.
  */
 static int walk_caps(unsigned dev) {
-    uint32_t status = micro_pci_read32(dev, 0x04u);
-    unsigned cap;
-    unsigned guard = 0;
-    int found = 0;
+    micro_virtio_caps_t caps;
 
-    if (((status >> 16) & PCI_STATUS_CAP_LIST) == 0u) {
-        micro_fail(NAME, "the device does not advertise a capability list, so a real virtio driver "
-                         "has no way to find its configuration regions (PCI status bit 4 clear)");
-        return -1;
+    if (micro_virtio_walk_caps(dev, 4u, NAME, &caps) != 0) {
+        return -1; /* already reported which part of the chain failed */
     }
-    cap = micro_pci_read32(dev, PCI_CAP_POINTER) & 0xFFu;
-
-    /* The chain is device-supplied, so it is bounded: 48 links is far more than any real device
-     * has, and a chain that loops must not spin here forever. */
-    while (cap >= 0x40u && cap < 0x100u && guard++ < 48u) {
-        uint32_t w0 = micro_pci_read32(dev, cap);        /* vndr | next | len | cfg_type */
-        uint32_t bar = micro_pci_read32(dev, cap + 4u) & 0xFFu;
-        uint32_t off = micro_pci_read32(dev, cap + 8u);
-        uint32_t len = micro_pci_read32(dev, cap + 12u);
-        unsigned id = w0 & 0xFFu;
-        unsigned next = (w0 >> 8) & 0xFFu;
-        unsigned type = (w0 >> 24) & 0xFFu;
-
-        if (id == PCI_CAP_ID_VENDOR) {
-            micro_puts("micro/" NAME ": cap at ");
-            micro_put_hex(cap);
-            micro_puts(" type ");
-            micro_put_uint(type);
-            micro_puts(" bar ");
-            micro_put_uint(bar);
-            micro_puts(" off ");
-            micro_put_hex(off);
-            micro_puts(" len ");
-            micro_put_hex(len);
-            micro_puts("\n");
-
-            if (bar != 4u) {
-                micro_fail(NAME, "a virtio capability points at a BAR other than 4 -- this device's "
-                                 "regions all live in BAR4, so the driver would map nothing");
-                return -1;
-            }
-            if (type == VIRTIO_PCI_CAP_COMMON_CFG) {
-                g_common_off = off;
-                found++;
-            } else if (type == VIRTIO_PCI_CAP_NOTIFY_CFG) {
-                g_notify_off = off;
-                g_notify_mult = micro_pci_read32(dev, cap + 16u);
-                found++;
-            } else if (type == VIRTIO_PCI_CAP_ISR_CFG) {
-                g_isr_off = off;
-                found++;
-            } else if (type == VIRTIO_PCI_CAP_DEVICE_CFG) {
-                g_device_off = off;
-                found++;
-            }
-        }
-        if (next == 0u || next == cap) {
-            break;
-        }
-        cap = next;
-    }
-
-    if (g_common_off == NOT_FOUND || g_notify_off == NOT_FOUND || g_isr_off == NOT_FOUND ||
-        g_device_off == NOT_FOUND) {
-        /* Which ones were found is printed, because "the chain is incomplete" sends a reader to
-         * the whole chain while "three of four, device-cfg missing" names the capability to look
-         * at. */
-        micro_puts("micro/" NAME ": vendor caps found=");
-        micro_put_uint(found);
-        micro_puts(" common=");
-        micro_put_hex(g_common_off);
-        micro_puts(" notify=");
-        micro_put_hex(g_notify_off);
-        micro_puts(" isr=");
-        micro_put_hex(g_isr_off);
-        micro_puts(" device=");
-        micro_put_hex(g_device_off);
-        micro_puts("\n");
-        micro_fail(NAME, "the capability chain does not describe all four virtio regions "
-                         "(common/notify/isr/device) -- a real driver binds by walking this chain, "
-                         "so whatever is missing here is a region no driver can find");
-        return -1;
-    }
-    /* The multiplier is what turns a queue's notify_off into an address. Zero would put every
-     * queue's doorbell at the same place, which is legal for a one-queue device and wrong here. */
-    if (g_notify_mult == 0u) {
-        micro_fail(NAME, "notify_off_multiplier is 0, so both queues' doorbells would be at one "
-                         "address and hype could not tell a transmit kick from a receive one");
-        return -1;
-    }
+    g_common_off = caps.common_off;
+    g_notify_off = caps.notify_off;
+    g_isr_off = caps.isr_off;
+    g_device_off = caps.device_off;
+    g_notify_mult = caps.notify_mult;
     return 0;
 }
 
