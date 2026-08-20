@@ -50,6 +50,10 @@ CFG
     # #550: a storage test needs a REAL backing file, or it is testing its own scaffolding.
     # The disk is declared here rather than in the test so the same artifact can be aimed at a
     # raw image, a qcow2 (#336) or a thin target (decision 42) by editing a config.
+    # #565: the VBE adapter exists only when a config asks for it (decision 49).
+    case "$1" in
+        bochsvbe) printf 'display = bochs\n' >> "$2" ;;
+    esac
     case "$1" in
         virtioblk|atadisk|ahci) cat >> "$2" <<CFG
 disks = d0

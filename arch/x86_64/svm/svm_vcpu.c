@@ -3811,7 +3811,7 @@ int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uin
 }
 
 int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
-                                        uint64_t mmio_base_phys) {
+                                        uint64_t mmio_base_phys, const uint8_t *insn) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_npf_t npf;
     hype_mmio_decode_t decoded;
@@ -3827,7 +3827,17 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
     }
     offset = (uint32_t)(npf.guest_phys_addr - mmio_base_phys);
 
-    guest_bytes = (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    /*
+     * #565: prefer caller-supplied instruction bytes, fetched through the guest page walk.
+     *
+     * The guest RIP is a guest-VIRTUAL address and is only dereferenceable as a host pointer for
+     * an IDENTITY-MAPPED guest. This handler was written for the in-binary VIDEO-3 self-test,
+     * which was exactly that -- so it never needed `insn`. A real VM remaps its RAM, so
+     * dereferencing its RIP here reads unrelated host memory, the decode fails, and the access
+     * comes back as "a register hype does not model" when the register was fine all along. NULL
+     * keeps the identity fast path for any caller that still has one.
+     */
+    guest_bytes = (insn != 0) ? insn : (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
     if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
         return -1;
     }

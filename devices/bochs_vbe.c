@@ -80,6 +80,31 @@ int hype_bochs_vbe_mmio_write(hype_bochs_vbe_t *dev, uint32_t offset, uint16_t v
     }
 
     dev->regs[index] = value;
+
+    /*
+     * #565: enabling the device LATCHES the effective virtual width into the register a guest
+     * reads, the way real bochs-display hardware does.
+     *
+     * hype already computed it -- effective_virtual_dimension() in hype_bochs_vbe_get_mode() --
+     * but only for hype's own view of the surface. The register itself still read back whatever
+     * the guest had written, which is 0 for a driver that never set it. A driver reads
+     * VIRT_WIDTH to compute its stride, so it got a stride of zero and would render nothing,
+     * while hype's own rendering path was perfectly correct. Two views of one device that
+     * disagreed, with only the guest's being wrong.
+     *
+     * Found by tests/micro/bochsvbe.c: the in-binary VIDEO-3 test wrote every register from the
+     * host and read hype's computed mode, so it could not see the register a guest would read.
+     */
+    if (index == HYPE_BOCHS_VBE_INDEX_ENABLE && (value & HYPE_BOCHS_VBE_ENABLE_ENABLED) != 0u) {
+        uint16_t xres = (uint16_t)dev->regs[HYPE_BOCHS_VBE_INDEX_XRES];
+        uint16_t yres = (uint16_t)dev->regs[HYPE_BOCHS_VBE_INDEX_YRES];
+        if (dev->regs[HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH] < xres) {
+            dev->regs[HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH] = xres;
+        }
+        if (dev->regs[HYPE_BOCHS_VBE_INDEX_VIRT_HEIGHT] < yres) {
+            dev->regs[HYPE_BOCHS_VBE_INDEX_VIRT_HEIGHT] = yres;
+        }
+    }
     return 0;
 }
 

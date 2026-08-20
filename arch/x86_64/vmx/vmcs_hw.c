@@ -2739,11 +2739,13 @@ int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ah
 /* VMX MMIO handler for the Bochs VBE (DISPI) display (VMX-2): mirror of
  * hype_svm_vcpu_handle_bochs_vbe_npf. DISPI registers are 16-bit only. */
 int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
-                                       uint64_t mmio_base_phys) {
+                                       uint64_t mmio_base_phys, const uint8_t *insn) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
-    if (vmx_mmio_begin(real, mmio_base_phys, HYPE_BOCHS_VBE_MMIO_SIZE, &m) != 0) {
+    /* #565: see the SVM twin -- vmx_mmio_begin() dereferences the guest RIP as a host pointer,
+     * which is only valid for an identity-mapped guest. A real VM must pass `insn`. */
+    if (vmx_mmio_begin_insn(real, mmio_base_phys, HYPE_BOCHS_VBE_MMIO_SIZE, insn, &m) != 0) {
         return -1;
     }
     if (m.decoded.size_bytes != 2u) {

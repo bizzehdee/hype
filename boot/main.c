@@ -793,6 +793,13 @@ typedef struct hype_fw_vm {
     hype_pic_emu_t pic;
     hype_pit_emu_t pit;
     hype_pci_t pci;
+    /*
+     * #565 / decision 49: this VM's Bochs VBE adapter. Present only when `display = bochs`, so on
+     * every other VM this state is initialised and never touched -- which is cheaper than a
+     * conditional pointer and keeps the device's lifetime the same as the VM's, like every other
+     * per-VM device here.
+     */
+    hype_bochs_vbe_t bochs_vbe;
     hype_cmos_t cmos;
     /*
      * FW-1b: guest Local APIC (0xFEE00000).
@@ -3832,7 +3839,7 @@ static int vmm_handle_ahci_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_
 static int vmm_handle_ahci_disk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
                                     hype_ata_disk_t *disk, uint64_t ahci_base_phys);
 static int vmm_handle_bochs_vbe_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
-                                    uint64_t mmio_base_phys);
+                                    uint64_t mmio_base_phys, const uint8_t *insn);
 static int vmm_handle_virtio_blk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
                                      const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
                                      uint64_t mmio_base_phys, uint64_t guest_rip);
@@ -4411,11 +4418,11 @@ static int vmm_handle_ahci_disk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, 
     return hype_svm_vcpu_handle_ahci_disk_npf(ctx, ahci, disk, ahci_base_phys);
 }
 static int vmm_handle_bochs_vbe_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
-                                    uint64_t mmio_base_phys) {
+                                    uint64_t mmio_base_phys, const uint8_t *insn) {
     if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys);
+        return hype_vmx_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys, insn);
     }
-    return hype_svm_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys);
+    return hype_svm_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys, insn);
 }
 static int vmm_handle_virtio_blk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
                                      const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
@@ -5979,7 +5986,10 @@ static void run_video_3_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
             }
 
             if (mmio_mapped &&
-                vmm_handle_bochs_vbe_npf(kind, ctx, &g_video_3_bochs_vbe, mmio_mapped_base) == 0) {
+                /* NULL insn: this in-binary guest is identity-mapped, so the RIP fast path is
+                 * valid for it. Deleted with the rest of VIDEO-3 once its port passes (#565). */
+                vmm_handle_bochs_vbe_npf(kind, ctx, &g_video_3_bochs_vbe, mmio_mapped_base, 0) ==
+                    0) {
                 continue;
             }
 
@@ -9316,6 +9326,7 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      * consumes it.
      */
     fw_1_setup_virtio_blk(vm);
+    fw_1_bochs_vbe_present(vm); /* #565: only when display = bochs */
     if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
         /* AFTER fw_1_setup_virtio_blk: that is what fills in the capacity. Attaching before it
          * snapshots total_sectors == 0, and a zero-sector LBA disk makes libata fall back to CHS and
@@ -12117,6 +12128,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     int ata_mapped = 0;
     int vblk_mapped = 0;    /* M5-7 (#196): virtio-blk BAR4 latched + routed */
     uint64_t vblk_bar = 0;
+    int vbe_mapped = 0;     /* #565: Bochs VBE BAR2, only for a VM with display = bochs */
+    uint64_t vbe_bar = 0;
     /* #329 2b(ii): BAR windows for the EXTRA disk slots (1..2). Slot 0 keeps the dedicated
      * vblk_/ata_/nvme latches above -- extra slots are uniform: one window each, whatever the
      * bus (virtio BAR4, ahci BAR5, nvme BAR0). */
@@ -15625,6 +15638,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                           (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX, (unsigned long long)bar);
                     }
                 }
+                /*
+                 * #565: the same latch for the Bochs VBE adapter's BAR2, when the VM has one.
+                 * Like virtio-blk's BAR4 it sits in the not-present 32-bit PCI aperture, so its
+                 * MMIO already faults as an NPF and only needs routing (below) -- no NPT map.
+                 */
+                if (!vbe_mapped &&
+                    hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE)) {
+                    uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci,
+                                                          HYPE_FW_1_PCI_DEV_BOCHS_VBE, 2);
+                    if (bar != 0) {
+                        vbe_bar = bar;
+                        vbe_mapped = 1;
+                        hype_debug_print("fw-1: Bochs VBE BAR2 enabled at guest-physical 0x%llx -- "
+                                         "routing its MMIO to the VBE model now [#565]\n",
+                                         (unsigned long long)bar);
+                    }
+                }
                 /* #329 2b(ii): same latch for each EXTRA disk slot's window. */
                 {
                     unsigned int slot;
@@ -15952,6 +15982,27 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         fw_1_guest_fault_stop(vm, "its guest made an NVMe register access hype does not model");
                         return;
                     }
+                }
+            }
+            if (vbe_mapped) {
+                vmm_get_last_npf(kind, ctx, &npf);
+                if (npf.guest_phys_addr >= vbe_bar &&
+                    npf.guest_phys_addr < vbe_bar + HYPE_BOCHS_VBE_MMIO_SIZE) {
+                    if (vmm_handle_bochs_vbe_npf(kind, ctx, &vm->bochs_vbe, vbe_bar, insn) == 0) {
+                        continue;
+                    }
+                    /* #550's lesson: an address alone cannot distinguish an unmodelled REGISTER
+                     * from an unmodelled WIDTH from an unmodelled instruction form, and those are
+                     * three different bugs in three different files. */
+                    HYPE_LOGF(HYPE_LOG_ERROR,
+                              "fw-1: unhandled Bochs VBE MMIO at guest-physical 0x%llx "
+                              "(BAR2+0x%llx, %s) [#565]\n",
+                              (unsigned long long)npf.guest_phys_addr,
+                              (unsigned long long)(npf.guest_phys_addr - vbe_bar),
+                              npf.is_write ? "write" : "read");
+                    fw_1_guest_fault_stop(vm, "its guest made a Bochs VBE register access hype "
+                                              "does not model");
+                    return;
                 }
             }
             if (vblk_mapped) {

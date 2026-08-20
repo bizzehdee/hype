@@ -217,6 +217,56 @@ static void test_virt_width_smaller_than_xres_is_clamped_up(void) {
     CHECK_HEX("a too-small VIRT_WIDTH is clamped up to XRES", 640u * 4u, mode.stride_bytes);
 }
 
+/*
+ * #565: enabling the device must LATCH the effective virtual dimensions into the registers a GUEST
+ * reads, not only into hype's own computed mode.
+ *
+ * The two views used to disagree, with only the guest's being wrong: hype rendered correctly from
+ * effective_virtual_dimension() while a driver reading VIRT_WIDTH got the 0 it had never set, and
+ * therefore a stride of zero. The in-binary VIDEO-3 test could not see this -- it wrote every
+ * register from the host and then read hype's computed mode, never the register.
+ */
+static void test_enable_latches_virtual_dimensions(void) {
+    hype_bochs_vbe_t dev;
+    hype_bochs_vbe_reset(&dev);
+    /* A driver that programs a mode and never touches VIRT_WIDTH -- the ordinary case. */
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_XRES, 640u);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_YRES, 480u);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_BPP, 32u);
+
+    /* Before enabling, the register still reads what the guest wrote: nothing. */
+        CHECK_HEX("virt_width is 0 before enable", 0u, read_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH));
+
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_ENABLE, HYPE_BOCHS_VBE_ENABLE_ENABLED);
+
+        CHECK_HEX("enable latches virt_width to xres", 640u, read_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH));
+        CHECK_HEX("enable latches virt_height to yres", 480u, read_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_HEIGHT));
+}
+
+/* A guest that DID set a larger virtual width keeps it -- latching must not overwrite an
+ * explicit choice, which is what panning depends on. */
+static void test_enable_keeps_a_larger_virtual_width(void) {
+    hype_bochs_vbe_t dev;
+    hype_bochs_vbe_reset(&dev);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_XRES, 640u);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_YRES, 480u);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_BPP, 32u);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH, 1024u);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_ENABLE, HYPE_BOCHS_VBE_ENABLE_ENABLED);
+
+        CHECK_HEX("a larger virt_width survives enable", 1024u, read_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH));
+}
+
+/* Disabling must NOT latch: a driver reprogramming a mode writes ENABLE=0 first, and latching
+ * there would fix the old mode's dimensions into the new one. */
+static void test_disable_does_not_latch(void) {
+    hype_bochs_vbe_t dev;
+    hype_bochs_vbe_reset(&dev);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_XRES, 800u);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_ENABLE, 0u);
+        CHECK_HEX("disable leaves virt_width alone", 0u, read_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH));
+}
+
 int main(void) {
     test_reset_clears_all_registers();
     test_id_register_always_reads_id5();
@@ -230,6 +280,9 @@ int main(void) {
     test_mode_valid_16bpp_simple();
     test_mode_valid_32bpp_with_virtual_width_and_panning();
     test_virt_width_smaller_than_xres_is_clamped_up();
+    test_enable_latches_virtual_dimensions();
+    test_enable_keeps_a_larger_virtual_width();
+    test_disable_does_not_latch();
 
     if (failures == 0) {
         printf("all tests passed\n");

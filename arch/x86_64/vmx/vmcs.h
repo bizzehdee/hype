@@ -146,7 +146,7 @@ int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ah
                                            const hype_gpa_map_t *dma_map,
                                            const uint8_t *guest_insn_bytes);
 int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
-                                       uint64_t mmio_base_phys);
+                                       uint64_t mmio_base_phys, const uint8_t *insn);
 int hype_vmx_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
                                         const hype_blk_backend_t *be, uint64_t mmio_base_phys);
 /* Guest interrupt delivery (VMX-2, INT-1/INT-2): set guest GDTR/IDTR, request a
