@@ -27,6 +27,7 @@
 #include "../core/phys_confirm.h"
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
+#include "../core/e1000.h"
 #include "../core/xhci.h"
 #include "../core/usb_hid.h" /* USB-5 (#217): HID boot-keyboard host input */
 #include "../core/scancode.h"  /* INPUT-11 (#284): ASCII -> PS/2 Set-1 for `sendkey` */
@@ -3149,6 +3150,10 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * stride without advertising space hype does not model.
  */
 #define HYPE_FW_1_PCI_DEV_NVME 5u
+/* #565 / decision 49: the optional Bochs VBE adapter, present only when `display = bochs`. Slot 6
+ * is the next free one after NVMe; a display device is not chipset furniture, so it does not take
+ * a low slot alongside the host bridge and LPC. */
+#define HYPE_FW_1_PCI_DEV_BOCHS_VBE 6u
 #define HYPE_FW_1_NVME_BAR_SIZE 0x2000u
 #define HYPE_FW_1_VIRTIO_BAR_INDEX 4u
 #define HYPE_FW_1_VIRTIO_GSI 20u
@@ -9069,6 +9074,35 @@ vblk_pci:
  * (where it hardcoded device 3) so an extra disk slot can present its own function -- the caps
  * layout is identical per function, only the device number and its _PRT-routed GSI differ.
  */
+/*
+ * #565 / §10 decision 49: present the Bochs VBE adapter, ONLY when this VM's config asked for it.
+ *
+ * Default-off is the decision, not a convenience: a Linux guest with bochs-drm inbox binds this and
+ * moves its console to it -- away from the ramfb surface hype renders and away from the serial
+ * console the scripted-input runner (#280) drives. Every VM already has a ramfb framebuffer through
+ * fw_cfg, which needs no PCI device at all, so this is a SECOND surface an operator opts into.
+ *
+ * BAR2 is the register window, which is where devices/bochs_vbe.h puts it and where a driver
+ * written against real bochs-display hardware looks.
+ */
+static void fw_1_bochs_vbe_present(hype_fw_vm_t *vm) {
+    unsigned int idx = (unsigned int)(vm - g_vms);
+    hype_cfg_display_t want = (idx < g_hype_cfg.vm_count) ? g_hype_cfg.vms[idx].display
+                                                         : HYPE_CFG_DISPLAY_NONE;
+
+    if (want != HYPE_CFG_DISPLAY_BOCHS) {
+        return;
+    }
+    hype_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE, HYPE_BOCHS_VBE_PCI_VENDOR_ID,
+                        HYPE_BOCHS_VBE_PCI_DEVICE_ID, HYPE_BOCHS_VBE_PCI_CLASS_BASE,
+                        HYPE_BOCHS_VBE_PCI_CLASS_SUB, HYPE_BOCHS_VBE_PCI_CLASS_INTERFACE);
+    hype_pci_set_bar_size(&vm->pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE, 2, HYPE_BOCHS_VBE_MMIO_SIZE);
+    hype_bochs_vbe_reset(&vm->bochs_vbe);
+    hype_debug_print("fw-1[vm %u]: Bochs VBE adapter presented at PCI dev %u, BAR2 %u bytes "
+                     "(display = bochs) [#565]\n",
+                     idx, HYPE_FW_1_PCI_DEV_BOCHS_VBE, HYPE_BOCHS_VBE_MMIO_SIZE);
+}
+
 static void fw_1_virtio_pci_present(hype_fw_vm_t *vm, unsigned int dev) {
     uint8_t *config;
     hype_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
@@ -22106,6 +22140,70 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         /* Give the driver the calibrated TSC so it can honor real USB timing
          * (post-reset settle, SET_ADDRESS recovery) -- critical on real HW where
          * High-Speed devices NAK a too-early Address Device. */
+        /*
+         * NET-1 (#80): the host NIC, before USB so its line appears early in the log next to the
+         * other host-device discovery.
+         *
+         * Enumerated by CLASS and reported by IDENTITY, because those answer different questions.
+         * Every Ethernet controller in the machine is listed; hype attaches to the first one it
+         * can actually drive. A NIC it cannot drive is named rather than skipped silently --
+         * "this machine has a Realtek hype has no driver for" is a far more useful line than the
+         * absence of any line, and it is the difference between a missing feature and a missing
+         * device.
+         *
+         * Failure here is never fatal: networking is opt-in per VM (net_mode defaults to none),
+         * so a machine with no NIC, or one hype cannot drive, must boot exactly as before.
+         */
+        {
+            hype_host_nic_t hnic;
+            uint32_t nic_cur = 0, nic_bdf = 0;
+            unsigned int nic_count = 0;
+            int attached = 0;
+
+            while (hype_host_pci_find_nic_from(hype_host_pci_read32_hw, 255u, nic_cur, &hnic,
+                                               &nic_bdf)) {
+                int drivable = (hnic.vendor_id == HYPE_E1000_PCI_VENDOR &&
+                                hnic.device_id == HYPE_E1000_PCI_DEVICE_82540EM);
+                nic_count++;
+                hype_debug_print("net: NIC %u at %02x:%02x.%u %04x:%04x BAR0=0x%llx -- %s [#80]\n",
+                                 nic_count, hnic.bus, hnic.dev, hnic.func, hnic.vendor_id,
+                                 hnic.device_id, (unsigned long long)hnic.bar_phys,
+                                 drivable ? "e1000, hype can drive this"
+                                          : "no hype driver for this device");
+                if (drivable && !attached) {
+                    hype_host_pci_wake_enable_mmio(hype_host_pci_read32_hw,
+                                                   hype_host_pci_write32_hw, hnic.bus, hnic.dev,
+                                                   hnic.func);
+                    attached = (hype_e1000_attach(hnic.bar_phys) == 0);
+                    if (!attached) {
+                        hype_debug_print("net: e1000 at %02x:%02x.%u did not come up -- continuing "
+                                         "without networking [#80]\n",
+                                         hnic.bus, hnic.dev, hnic.func);
+                    }
+                }
+                nic_cur = nic_bdf + 1u;
+            }
+            if (attached) {
+                /*
+                 * #80's bar: prove the driver with a real exchange. Under QEMU user networking the
+                 * host is 10.0.2.2 and the first DHCP address is 10.0.2.15; hype has no DHCP
+                 * client yet (#83's territory), so those are used directly here. On a real
+                 * network they are wrong and the probe simply gets no answer, which is reported
+                 * rather than treated as a driver fault -- and NAT is where hype learns its real
+                 * address.
+                 */
+                static const uint8_t probe_us[4] = {10u, 0u, 2u, 15u};
+                static const uint8_t probe_gw[4] = {10u, 0u, 2u, 2u};
+                (void)hype_e1000_arp_probe(probe_us, probe_gw);
+            }
+            if (nic_count == 0u) {
+                hype_debug_print("net: no Ethernet controller found -- networking unavailable, "
+                                 "which is not an error (net_mode defaults to none) [#80]\n");
+            } else if (!attached) {
+                hype_debug_print("net: %u NIC(s) present, none hype can drive -- networking "
+                                 "unavailable [#80]\n", nic_count);
+            }
+        }
         hype_xhci_set_tsc_hz(g_fw_1_host_tsc_hz);
         /* USB-8 (#231): real HW has MULTIPLE xHCI controllers (chipset + add-in),
          * multiple ports each, and the boot stick may be on ANY of them (behind a

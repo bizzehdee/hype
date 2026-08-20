@@ -148,4 +148,40 @@ int hype_e1000_rxd_done(uint8_t status);
  */
 uint32_t hype_e1000_ring_len_bytes(unsigned int descriptors);
 
+/*
+ * The hardware half (core/e1000_hw.c). Polled: no interrupt is routed for this device, so the
+ * caller drains it from hype's dispatch loop like every other host device.
+ */
+
+/* Reset, read the MAC, program the rings, bring the link up. 0 on success. Refuses rather than
+ * coming up half-configured -- a NIC with no usable MAC or an unresponsive reset is reported. */
+int hype_e1000_attach(uint64_t bar_phys);
+
+int hype_e1000_ready(void);
+int hype_e1000_link_up(void);
+const hype_e1000_mac_t *hype_e1000_mac(void);
+
+/* Send one frame, returning only once the device has written the descriptor back. 0 on success. */
+int hype_e1000_tx(const uint8_t *frame, unsigned int len);
+
+/*
+ * Take one received frame if there is one. Returns 1 and fills out/out_len, or 0 when the ring is
+ * empty. A frame larger than out_cap is DROPPED and counted rather than truncated -- half a frame
+ * is worse than none, and the count makes the mismatch visible.
+ */
+int hype_e1000_poll_rx(uint8_t *out, unsigned int out_cap, unsigned int *out_len);
+
+/*
+ * #80's bring-up proof: ARP for `target_ip` and wait for the reply. 0 when answered.
+ *
+ * A real exchange rather than a register dump -- it exercises TX, RX, descriptor write-back and
+ * the MAC together, and needs no IP stack. A gateway that never answers is reported as a network
+ * fact rather than a driver failure, because that is what it is.
+ */
+int hype_e1000_arp_probe(const uint8_t our_ip[4], const uint8_t target_ip[4]);
+
+/* Counters, so "no traffic" is a number rather than a theory. */
+void hype_e1000_stats(unsigned long long *tx, unsigned long long *tx_full, unsigned long long *rx,
+                      unsigned long long *rx_dropped);
+
 #endif /* HYPE_CORE_E1000_H */

@@ -38,7 +38,7 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/cfg.c core/phys_confirm.c core/scancode.c core/xhci.c core/xhci_hw.c core/usb_msc.c core/usb_hid.c core/blk_usb.c \
              core/fat_write.c core/fat_write_fs.c core/fat_exfat.c core/fat_exfat_fs.c \
              core/rtc.c core/rtc_hw.c \
-             core/log_sink.c core/log_split.c core/disk_inventory.c core/cpu_topology.c core/smp_pack.c core/e1000.c core/pe_ident.c core/mtrr.c
+             core/log_sink.c core/log_split.c core/disk_inventory.c core/cpu_topology.c core/smp_pack.c core/e1000.c core/e1000_hw.c core/arp.c core/pe_ident.c core/mtrr.c
 ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
              arch/x86_64/cpu/paging.c arch/x86_64/cpu/paging_load.c arch/x86_64/cpu/mtrr_hw.c \
