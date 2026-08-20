@@ -8,6 +8,7 @@
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
 #include "../../../devices/bochs_vbe.h"
+#include "../../../core/virtio_net_ring.h" /* NET-2 (#81) */
 #include "../../../devices/fw_cfg.h"
 #include "../../../devices/pci.h"
 #include "../../../devices/cmos.h"
@@ -257,6 +258,20 @@ int hype_vmx_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx);
 
 int hype_vmx_vcpu_exit_exception_vector(hype_vcpu_ctx_t *ctx);
 uint32_t hype_vmx_vcpu_exit_exception_error_code(hype_vcpu_ctx_t *ctx);
+
+/*
+ * NET-2 (#81): the guest virtio-net BAR. One entry point, not the pair virtio-blk has -- every
+ * virtio-net guest is an FW-1 guest reached through the shared dispatch, which already supplies
+ * page-walked instruction bytes and a real dma_map.
+ *
+ * Exempt from unit testing (this whole file is): it reads the live VMCS. Everything it calls is
+ * tested in isolation -- core/tests/test_virtio_net.c and test_virtio_net_ring.c.
+ */
+int hype_vmx_vcpu_handle_virtio_net_npf(hype_vcpu_ctx_t *ctx, hype_virtio_net_t *dev,
+                                       const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                       hype_virtio_net_tx_fn sink, void *user, uint8_t *scratch,
+                                       unsigned int scratch_len,
+                                       hype_virtio_net_ring_stats_t *stats, const uint8_t *insn);
 
 int hype_vmx_vcpu_handle_virtio_blk_npf_map(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
                                             const hype_blk_backend_t *be,

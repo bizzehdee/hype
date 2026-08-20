@@ -2856,6 +2856,97 @@ static int vmx_virtio_blk_npf_common(struct hype_vcpu_ctx *real, hype_virtio_blk
     return 0;
 }
 
+
+/*
+ * NET-2 (#81): the VMX half of the virtio-net BAR, mirror of
+ * hype_svm_vcpu_handle_virtio_net_npf. ONE entry point rather than the microtest/live-guest pair
+ * virtio-blk has: every virtio-net guest is an FW-1 guest reached through the shared dispatch,
+ * which already resolves instruction bytes through the page walk and carries a real dma_map. A
+ * second identity-mapped flavour would be a path nothing calls.
+ */
+int hype_vmx_vcpu_handle_virtio_net_npf(hype_vcpu_ctx_t *ctx, hype_virtio_net_t *dev,
+                                       const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                       hype_virtio_net_tx_fn sink, void *user, uint8_t *scratch,
+                                       unsigned int scratch_len,
+                                       hype_virtio_net_ring_stats_t *stats, const uint8_t *insn) {
+    struct vmx_mmio_access m;
+    uint32_t off;
+
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
+    if (vmx_mmio_begin_insn((struct hype_vcpu_ctx *)ctx, mmio_base_phys, HYPE_VIRTIO_BLK_BAR_SIZE,
+                            insn, &m) != 0) {
+        return -1;
+    }
+    off = m.offset;
+
+    if (off >= HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET &&
+        off < HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET + HYPE_VIRTIO_COMMON_CFG_SIZE) {
+        uint32_t ro = off - HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET;
+        if (m.decoded.is_write) {
+            uint32_t cur = 0;
+            uint32_t value;
+            /* #307: an RMW needs the register's current value. */
+            if (m.decoded.mem_is_dst &&
+                hype_virtio_net_common_cfg_read(dev, ro, m.decoded.size_bytes, &cur) != 0) {
+                return -1;
+            }
+            value = vmx_mmio_store_val(&m, cur);
+            if (hype_virtio_net_common_cfg_write(dev, ro, m.decoded.size_bytes, value) != 0) {
+                return -1;
+            }
+        } else {
+            uint32_t value = 0;
+            if (hype_virtio_net_common_cfg_read(dev, ro, m.decoded.size_bytes, &value) != 0) {
+                return -1;
+            }
+            vmx_mmio_finish_read(&m, value);
+        }
+    } else if (off >= HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET &&
+               off < HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET +
+                         HYPE_VIRTIO_NET_NUM_QUEUES * HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_MULTIPLIER) {
+        /* One doorbell per queue at a 4-byte stride, so WHICH queue was rung is derived from the
+         * offset rather than assumed -- see the SVM handler's own note on what assuming costs. */
+        uint32_t slot = (off - HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET) /
+                        HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_MULTIPLIER;
+        if (m.decoded.is_write) {
+            if (slot == HYPE_VIRTIO_NET_VQ_TX) {
+                /* A ring that cannot be walked is not an emulation failure -- the store itself
+                 * succeeded -- so RIP still advances rather than re-faulting the guest forever. */
+                (void)hype_virtio_net_drain_tx(dev, dma_map, sink, user, scratch, scratch_len,
+                                               stats);
+            }
+            /* A receive notify says buffers were posted, not that a frame is waiting. Those
+             * descriptors are read on the next delivery. */
+        } else {
+            vmx_mmio_finish_read(&m, 0);
+        }
+    } else if (off == HYPE_VIRTIO_BLK_BAR_ISR_CFG_OFFSET) {
+        if (!m.decoded.is_write) {
+            uint8_t value = hype_virtio_net_isr_read(dev); /* read-to-clear */
+            vmx_mmio_finish_read(&m, value);
+        }
+    } else if (off >= HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET &&
+               off < HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET + HYPE_VIRTIO_NET_CFG_SIZE) {
+        if (!m.decoded.is_write) {
+            uint32_t value = 0;
+            uint32_t ro = off - HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET;
+            if (hype_virtio_net_device_cfg_read(dev, ro, m.decoded.size_bytes, &value) != 0) {
+                return -1;
+            }
+            vmx_mmio_finish_read(&m, value);
+        }
+        /* Writes dropped: the MAC is hype's. A driver wanting another address would use the control
+         * queue, which this device does not offer. */
+    } else {
+        if (!m.decoded.is_write) {
+            vmx_mmio_finish_read(&m, 0);
+        }
+    }
+
+    vmx_mmio_end(&m);
+    return 0;
+}
+
 /* VMX guest GDTR/IDTR setup (VMX-2, INT): mirrors of hype_svm_vcpu_set_gdt/idt.
  * Real interrupt delivery reloads CS from the guest GDT and vectors through the
  * guest IDT, so both must point at real tables (VMWRITE base+limit). */

@@ -2626,6 +2626,53 @@ isn't lost.
     equivalent. Every case turned out to have one, and a two-mechanism test
     estate means the weaker mechanism is where a defect hides.
 
+51. **The guest's interrupt pins are exhausted, so shared lines are now the norm
+    and must be computed as such — decided (2026-08-20), from #81.** Recorded
+    because it is a hard limit that will shape every guest device added from here,
+    and because the correct handling of a shared line is not what the existing
+    code did.
+
+    hype presents each guest a 24-entry IO-APIC, matching the ICH9 it claims to
+    be. All 24 are allocated: 0-15 are the ISA lines, 16-19 the PCI device-2
+    block, 20 virtio-blk and the slot-0 NVMe front-end, 21 the ICH9 SATA
+    function, and 22 and 23 the two extra disk slots (#329, which is itself why
+    a VM caps at three disks). **There is no 25th pin.** virtio-net (#81)
+    therefore shares GSI 20 rather than taking one.
+
+    **A shared level-triggered PCI interrupt is the OR of its devices, and has
+    to be computed that way.** The pre-existing code asked each device
+    separately and deasserted the line in its own `else`. That is correct only
+    while at most one device on the pin can be pending — true for virtio-blk and
+    NVMe, because §5.6's front-end selection means they are never both present.
+    virtio-net breaks it: a VM with a disk and a NIC is the ordinary case, and
+    with per-device deasserts the quiet device withdraws the busy one's
+    still-pending level and the guest waits for an interrupt that was already
+    taken away. #440's comment had warned about exactly this hazard on GSI 21;
+    adding a third device to GSI 20 is what made it reachable. The dispatch now
+    computes one pending state per line and raises or deasserts once.
+
+    **Why not widen the IO-APIC.** The pin count is a guest-visible property of
+    the chipset hype claims to be, every VM would inherit the change, and the
+    blast radius is every guest's interrupt routing — against the benefit of
+    avoiding arithmetic that a correct shared-line implementation needs anyway.
+    Sharing is also what real hardware does: PCI interrupt pins have always been
+    shared, and any guest OS handles it.
+
+    **The consequence for future devices.** A new guest device does not get to
+    assume a free GSI. It picks a line to share, and whoever adds it extends
+    that line's pending computation — which is now one place per line rather
+    than one place per device. If a future device genuinely cannot share (a
+    latency-sensitive one where another device's ISR would add jitter), that is
+    the argument for widening the IO-APIC, and it should be made explicitly
+    rather than by quietly taking pin 24.
+
+    Rejected: MSI/MSI-X for the new devices as a way round the pin limit. It
+    would work and it is where this eventually goes, but hype's guest-facing
+    virtio and AHCI models answer NO_VECTOR for MSI-X today, so adopting it for
+    one device means building the delivery path for one device — and the pin
+    shortage is not urgent enough to justify that before something needs MSI for
+    its own sake.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

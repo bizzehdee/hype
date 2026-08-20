@@ -28,6 +28,7 @@
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/e1000.h"
+#include "../core/virtio_net_ring.h" /* NET-2 (#81) */
 #include "../core/xhci.h"
 #include "../core/usb_hid.h" /* USB-5 (#217): HID boot-keyboard host input */
 #include "../core/scancode.h"  /* INPUT-11 (#284): ASCII -> PS/2 Set-1 for `sendkey` */
@@ -802,6 +803,27 @@ typedef struct hype_fw_vm {
      * per-VM device here.
      */
     hype_bochs_vbe_t bochs_vbe;
+    /*
+     * NET-2 (#81): this VM's virtio-net adapter, present only when `net_mode = nat`. Same
+     * always-allocated/conditionally-presented shape as the VBE adapter above.
+     *
+     * The scratch buffer and the counters are PER VM and live here for the reason #557 made
+     * expensive: a file-static would be shared by every VM, and this path runs concurrently on one
+     * core per VM. For frame data that is silent corruption; for the counters it is a diagnostic
+     * that reports one VM's traffic under another's name.
+     */
+    hype_virtio_net_t virtio_net;
+    uint8_t vnet_scratch[HYPE_VIRTIO_NET_MAX_FRAME_LEN];
+    hype_virtio_net_ring_stats_t vnet_stats;
+    /*
+     * #81: frames the guest handed over that went NOWHERE, because no forwarding plane exists yet.
+     * Counted separately from the ring walker's own tx_frames/tx_dropped, and that separation is
+     * the point: the ring stats describe the DEVICE (a descriptor was taken, a frame was gathered),
+     * and on their own they would read as a working network. This counter is the difference between
+     * "the guest transmitted" and "anything left the host", which is exactly the distinction the
+     * operator needs while #83 is unlanded.
+     */
+    unsigned long long vnet_no_plane;
     hype_cmos_t cmos;
     /*
      * FW-1b: guest Local APIC (0xFEE00000).
@@ -918,6 +940,14 @@ typedef struct hype_fw_vm {
      */
     volatile uint64_t shared_vblk_bar;
     volatile unsigned shared_vblk_mapped;
+    /*
+     * #81: the virtio-net BAR window, published for exactly the reason #511 established for
+     * virtio-blk -- a guest whose network driver probes on a vCPU other than the BSP must be able
+     * to have its MMIO fault recognised there. Keeping this BSP-local would reproduce #511's
+     * re-fault loop in the network path.
+     */
+    volatile uint64_t shared_vnet_bar;
+    volatile unsigned shared_vnet_mapped;
     /*
      * #482: the EXTRA disk slots' windows (#329), published for the same reason as the three
      * above. Held in a BSP loop local they could only be served from the BSP, so a guest driving
@@ -3162,6 +3192,22 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * is the next free one after NVMe; a display device is not chipset furniture, so it does not take
  * a low slot alongside the host bridge and LPC. */
 #define HYPE_FW_1_PCI_DEV_BOCHS_VBE 6u
+/*
+ * NET-2 (#81): the guest virtio-net adapter, present only when `net_mode = nat`. Device 4 -- the
+ * lowest free slot, and free of #573's device-6 aliasing between the VBE adapter and disk slot 1.
+ *
+ * IT SHARES GSI 20 WITH virtio-blk, and that is forced rather than chosen: the 24-pin IO-APIC is
+ * fully allocated (16-19 the dev-2 block, 20 virtio-blk and the NVMe front-end, 21 the ICH9 SATA
+ * function, 22 and 23 the extra disk slots), and there is no 25th pin to hand out. Sharing a
+ * level-triggered PCI interrupt is ordinary and legal; what it demands is that the LINE be treated
+ * as the OR of its devices rather than as one device's property. See fw_1_virtio_line_pending().
+ *
+ * The alternative was to widen the IO-APIC past 24 entries. Rejected for now: the pin count is a
+ * guest-visible property of the chipset hype claims to be, every VM would inherit the change, and
+ * it would be a much larger blast radius than one shared line for the benefit of avoiding
+ * arithmetic that a correct implementation needs anyway.
+ */
+#define HYPE_FW_1_PCI_DEV_VIRTIO_NET 4u
 #define HYPE_FW_1_NVME_BAR_SIZE 0x2000u
 #define HYPE_FW_1_VIRTIO_BAR_INDEX 4u
 #define HYPE_FW_1_VIRTIO_GSI 20u
@@ -5230,6 +5276,52 @@ static int vmm_handle_nvme_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_
     return kind == HYPE_VMM_KIND_VMX
                ? hype_vmx_vcpu_handle_nvme_npf(ctx, dev, nctx, mmio_base_phys, bar_size, insn)
                : hype_svm_vcpu_handle_nvme_npf(ctx, dev, nctx, mmio_base_phys, bar_size, insn);
+}
+
+/*
+ * NET-2 (#81): where a guest's outbound frame goes today -- nowhere, counted.
+ *
+ * The device works: the guest's driver transmits, the descriptor comes back used, and the counters
+ * say how many frames left. What does not exist yet is the FORWARDING PLANE (#83's NAT, #85's peer
+ * rules), which is what decides where a frame is allowed to go. Bridging the frame straight onto the
+ * wire in the meantime would be wrong rather than incomplete: the guest's own MAC and IP would
+ * appear on the physical network with no translation, which is not what `net_mode = nat` promises
+ * and not something an operator asked for.
+ *
+ * So this drops and counts, and #83 replaces the body. Returning 0 (accepted) rather than nonzero is
+ * deliberate: a real network drops packets, and a NIC that reported every frame as a failure would
+ * make the guest's driver log an error storm for what is a configuration state.
+ */
+static int fw_1_vnet_tx_sink(void *user, const uint8_t *frame, unsigned int len) {
+    hype_fw_vm_t *vm = (hype_fw_vm_t *)user;
+
+    (void)frame;
+    (void)len;
+    if (vm != 0) {
+        vm->vnet_no_plane++;
+    }
+    /*
+     * 0 means ACCEPTED, and that is deliberate even though the frame is discarded. Returning
+     * nonzero would make the ring walker count every frame as a drop, and a driver would see a NIC
+     * failing every transmit -- an error storm describing a configuration state. A real network
+     * drops packets silently; what must not be silent is that NOTHING is forwarding them, and
+     * vnet_no_plane is where that is said.
+     */
+    return 0;
+}
+
+static int vmm_handle_virtio_net_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_vm_t *vm,
+                                     const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                     const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX
+               ? hype_vmx_vcpu_handle_virtio_net_npf(ctx, &vm->virtio_net, dma_map, mmio_base_phys,
+                                                     fw_1_vnet_tx_sink, vm, vm->vnet_scratch,
+                                                     (unsigned int)sizeof(vm->vnet_scratch),
+                                                     &vm->vnet_stats, insn)
+               : hype_svm_vcpu_handle_virtio_net_npf(ctx, &vm->virtio_net, dma_map, mmio_base_phys,
+                                                     fw_1_vnet_tx_sink, vm, vm->vnet_scratch,
+                                                     (unsigned int)sizeof(vm->vnet_scratch),
+                                                     &vm->vnet_stats, insn);
 }
 
 static int vmm_handle_virtio_blk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
@@ -8330,6 +8422,82 @@ static void fw_1_bochs_vbe_present(hype_fw_vm_t *vm) {
                      idx, HYPE_FW_1_PCI_DEV_BOCHS_VBE, HYPE_BOCHS_VBE_MMIO_SIZE);
 }
 
+/*
+ * NET-2 (#81): the guest's virtio-net adapter, presented only when `net_mode = nat`.
+ *
+ * The MAC is DERIVED FROM THE VM INDEX and is stable for the life of the VM, because the NAT plane
+ * identifies a guest by its source address: a MAC that changed between boots would look like a
+ * different guest to every conntrack entry and every peer rule. 52:54:00 is the locally-administered
+ * prefix QEMU uses, so it cannot collide with a real vendor's assignment, and the low bytes carry
+ * the VM index.
+ */
+static void fw_1_virtio_net_pci_present(hype_fw_vm_t *vm) {
+    unsigned int idx = (unsigned int)(vm - g_vms);
+    uint8_t *config;
+    uint8_t mac[HYPE_VIRTIO_NET_MAC_BYTES];
+    hype_cfg_net_mode_t want = (idx < g_hype_cfg.vm_count) ? g_hype_cfg.vms[idx].net_mode
+                                                           : HYPE_CFG_NET_NONE;
+    unsigned int dev = HYPE_FW_1_PCI_DEV_VIRTIO_NET;
+
+    if (want != HYPE_CFG_NET_NAT) {
+        return;
+    }
+
+    mac[0] = 0x52u;
+    mac[1] = 0x54u;
+    mac[2] = 0x00u;
+    mac[3] = 0x00u;
+    mac[4] = (uint8_t)((idx >> 8) & 0xFFu);
+    /* +1 so VM 0 never gets ...:00, which reads like an unset address in a packet capture. */
+    mac[5] = (uint8_t)((idx & 0xFFu) + 1u);
+    hype_virtio_net_reset(&vm->virtio_net, mac);
+
+    hype_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_NET_PCI_VENDOR_ID,
+                        HYPE_VIRTIO_NET_PCI_DEVICE_ID, HYPE_VIRTIO_NET_PCI_CLASS_BASE,
+                        HYPE_VIRTIO_NET_PCI_CLASS_SUB, HYPE_VIRTIO_NET_PCI_CLASS_INTERFACE);
+    hype_pci_set_bar_size(&vm->pci, dev, HYPE_FW_1_VIRTIO_BAR_INDEX, HYPE_VIRTIO_BLK_BAR_SIZE);
+    /* INTA on legacy line 10, same as virtio-blk: in APIC mode the DSDT _PRT routes dev 4 INTA to
+     * GSI 20, which virtio-blk also uses -- see HYPE_FW_1_PCI_DEV_VIRTIO_NET on why the pin is
+     * shared and fw_1_virtio_line_pending() on what sharing requires. */
+    hype_pci_set_interrupt(&vm->pci, dev, 1, 10);
+
+    /*
+     * The virtio-pci capability chain, byte-for-byte the same transport layout as virtio-blk's --
+     * the BAR sub-offsets are the transport's, not the device type's, so they are reused rather
+     * than redeclared. #550 is why this is written out at all: nothing had ever walked the
+     * capability chain from inside a guest, and it did not exist.
+     */
+    config = vm->pci.devices[dev].config;
+    config[HYPE_M5_1_PCI_STATUS_OFFSET] |= HYPE_M5_1_PCI_STATUS_CAP_LIST;
+    config[HYPE_M5_1_PCI_CAP_POINTER_OFFSET] = HYPE_FW_1_VIRTIO_CAP_COMMON_OFF;
+    hype_write_virtio_pci_cap(config, HYPE_FW_1_VIRTIO_CAP_COMMON_OFF,
+                              HYPE_FW_1_VIRTIO_CAP_NOTIFY_OFF, 16, HYPE_M5_1_CFG_TYPE_COMMON,
+                              HYPE_FW_1_VIRTIO_BAR_INDEX, HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET,
+                              HYPE_VIRTIO_COMMON_CFG_SIZE);
+    /*
+     * The notify region is 8 bytes here, not 4: with a multiplier of 4 and one notify slot per
+     * queue, queue 0 rings at +0 and queue 1 at +4. Advertising 4 would put the transmit doorbell
+     * outside the region the capability describes, and a driver is entitled to refuse to write it.
+     */
+    hype_write_virtio_pci_cap(config, HYPE_FW_1_VIRTIO_CAP_NOTIFY_OFF,
+                              HYPE_FW_1_VIRTIO_CAP_ISR_OFF, 20, HYPE_M5_1_CFG_TYPE_NOTIFY,
+                              HYPE_FW_1_VIRTIO_BAR_INDEX, HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET,
+                              HYPE_VIRTIO_NET_NUM_QUEUES * HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_MULTIPLIER);
+    hype_write_le32(config + HYPE_FW_1_VIRTIO_CAP_NOTIFY_OFF + 16,
+                    HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_MULTIPLIER);
+    hype_write_virtio_pci_cap(config, HYPE_FW_1_VIRTIO_CAP_ISR_OFF,
+                              HYPE_FW_1_VIRTIO_CAP_DEVICE_OFF, 16, HYPE_M5_1_CFG_TYPE_ISR,
+                              HYPE_FW_1_VIRTIO_BAR_INDEX, HYPE_VIRTIO_BLK_BAR_ISR_CFG_OFFSET, 1);
+    hype_write_virtio_pci_cap(config, HYPE_FW_1_VIRTIO_CAP_DEVICE_OFF, 0, 16,
+                              HYPE_M5_1_CFG_TYPE_DEVICE, HYPE_FW_1_VIRTIO_BAR_INDEX,
+                              HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET, HYPE_VIRTIO_NET_CFG_SIZE);
+
+    hype_debug_print("fw-1[vm %u]: virtio-net presented at PCI dev %u, BAR%u, MAC "
+                     "%02x:%02x:%02x:%02x:%02x:%02x (net_mode = nat) [#81]\n",
+                     idx, dev, HYPE_FW_1_VIRTIO_BAR_INDEX, mac[0], mac[1], mac[2], mac[3], mac[4],
+                     mac[5]);
+}
+
 static void fw_1_virtio_pci_present(hype_fw_vm_t *vm, unsigned int dev) {
     uint8_t *config;
     hype_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_BLK_PCI_VENDOR_ID,
@@ -8544,6 +8712,7 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      */
     fw_1_setup_virtio_blk(vm);
     fw_1_bochs_vbe_present(vm); /* #565: only when display = bochs */
+    fw_1_virtio_net_pci_present(vm); /* #81: only when net_mode = nat */
     if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
         /* AFTER fw_1_setup_virtio_blk: that is what fills in the capacity. Attaching before it
          * snapshots total_sectors == 0, and a zero-sector LBA disk makes libata fall back to CHS and
@@ -8952,6 +9121,14 @@ static int g_ap_mpdata_sample;
  * Returns which model retired the access, or HYPE_FW_DEV_NONE if no shared device claims it.
  * Reporting the device rather than a bare 0/-1 lets each caller keep its own counters without
  * this function knowing anything about them.
+ *
+ * #576, AND READ THIS BEFORE ADDING A WINDOW HERE: "ONE entry point" above is the intent, not yet
+ * the state. This function has ONE caller and it is the AP loop; the BSP still keeps its own chain
+ * (search for `if (vblk_mapped)` in the BSP dispatch). So a window added ONLY here is served on
+ * every vCPU EXCEPT the boot one, and nothing fails at build time to tell you. #81 landed that way
+ * first: the guest found its device, placed its BAR, walked its whole capability chain, then read a
+ * register as 0xff, because a single-vCPU guest runs on the BSP. EVERY NEW WINDOW GOES IN BOTH
+ * PLACES until #576 merges them.
  */
 typedef enum {
     HYPE_FW_DEV_NONE = 0,
@@ -8961,6 +9138,7 @@ typedef enum {
     HYPE_FW_DEV_ATA,
     HYPE_FW_DEV_AHCI,
     HYPE_FW_DEV_VBLK,
+    HYPE_FW_DEV_VNET, /* #81 */
     HYPE_FW_DEV_NVME,
     HYPE_FW_DEV_DISK_SLOT,
     HYPE_FW_DEV_FLASH
@@ -9033,6 +9211,17 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
                                           &g_fw_1_dma_map, (uint64_t)vm->shared_vblk_bar,
                                           insn) == 0) {
             return HYPE_FW_DEV_VBLK;
+        }
+    }
+
+    /* #81: the virtio-net BAR. Served from THIS dispatch, so a guest whose network driver probes on
+     * any vCPU is answered there -- #511's re-fault loop was exactly this window missing from the
+     * AP's chain for virtio-blk. */
+    if (vm->shared_vnet_mapped && npf.guest_phys_addr >= vm->shared_vnet_bar &&
+        npf.guest_phys_addr < vm->shared_vnet_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
+        if (vmm_handle_virtio_net_npf(kind, ctx, vm, &g_fw_1_dma_map,
+                                      (uint64_t)vm->shared_vnet_bar, insn) == 0) {
+            return HYPE_FW_DEV_VNET;
         }
     }
 
@@ -12084,6 +12273,25 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  "msr=%llu cpuid=%llu vintr=%llu pause=%llu intr=%llu other=%llu\n",
                                  total_exits, ex_hlt, ex_npf, ex_ahci_npf, ex_ioio, ex_io80, ex_msr,
                                  ex_cpuid, ex_vintr, ex_pause, ex_intr, ex_other);
+                /*
+                 * #81: the guest NIC, printed only for a VM that has one so it does not add a line
+                 * of zeros to every other VM's log.
+                 *
+                 * no_plane is deliberately alongside the ring counters rather than folded into
+                 * them. tx_frames says the DEVICE worked; no_plane says nothing left the host. Read
+                 * on its own, "tx_frames=412 dropped=0" is exactly what a working network looks
+                 * like, which is how a missing forwarding plane would get mistaken for a working
+                 * one -- the #557 lesson that counters consistent with success are not a verdict.
+                 */
+                if (vm->shared_vnet_mapped) {
+                    hype_debug_print("fw-1 VNET vm%u: tx_chains=%llu tx_frames=%llu "
+                                     "tx_bad_desc=%llu tx_dropped=%llu | rx_delivered=%llu "
+                                     "rx_no_buffer=%llu | NOT FORWARDED (no plane yet)=%llu [#81]\n",
+                                     (unsigned)(vm - g_vms), vm->vnet_stats.tx_chains,
+                                     vm->vnet_stats.tx_frames, vm->vnet_stats.tx_bad_desc,
+                                     vm->vnet_stats.tx_dropped, vm->vnet_stats.rx_delivered,
+                                     vm->vnet_stats.rx_no_buffer, vm->vnet_no_plane);
+                }
 #if HYPE_IO_HISTOGRAM
                 /* PERF-1: name the dominant IOIO ports (which the ioio= total
                  * above can't split). One line: "IOHIST vmN total=T: 0xPORT=N ..."
@@ -13833,37 +14041,42 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * decoded (hype's minimal LAPIC doesn't track the ISR vector). */
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
         }
-        /* M5-7 (#196): virtio-blk completion IRQ on GSI 20 (its own line, no
-         * interference with the boot-critical AHCI CD line). The device sets
-         * isr_status when it consumes a request; the guest's ISR reads the ISR
-         * register (NPF handler -> hype_virtio_blk_isr_read clears it), so this
-         * is level-triggered on isr_status. */
-        if (vblk_mapped && g_fw_1_vblk.isr_status != 0u) {
-            uint8_t iov;
-            uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK);
-            if (line != 0u && line < 16u) {
-                int in_service = (line < 8u)
-                    ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
-                    : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
-                if (!in_service) {
-                    hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
-                }
-            }
-            if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI, &iov)) {
-                fw_1_deliver_device_vector(vm, kind, HYPE_FW_1_VIRTIO_GSI, iov); /* #512 */
-            }
-        } else if (vblk_mapped) {
-            hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
-        }
         /*
-         * #519: slot 0's NVMe front-end, the alternative to the virtio-blk device above and
-         * routed to the same GSI 20 -- #333 selects one front-end per slot, so the two are never
-         * both present. Level-triggered on an unconsumed completion, exactly like its siblings.
+         * GSI 20, and it now carries THREE devices: virtio-blk (M5-7 #196), the slot-0 NVMe
+         * front-end (#519) and virtio-net (#81). It is its own line, clear of the boot-critical
+         * AHCI CD line on GSI 16.
+         *
+         * ONE COMPUTATION, ONE RAISE-OR-DEASSERT. This used to be two independent blocks, each
+         * asking its own device and deasserting in its own `else`, which is correct only while at
+         * most one device on the pin can be pending -- true when the pair was virtio-blk and NVMe,
+         * because #333 selects one front-end per slot so they are never both present. virtio-net
+         * breaks that: a VM with a disk AND a NIC is the ordinary case. With per-device deasserts,
+         * the quiet device's `else` drops the busy one's still-pending level and the guest waits
+         * for an interrupt that was already withdrawn. #440's comment warned about exactly this
+         * hazard on GSI 21; adding a third device to GSI 20 is what makes it reachable.
+         *
+         * A shared PCI interrupt is the OR of its devices. That is what a level line IS, so it is
+         * computed as one.
          */
-        if (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) {
-            if (hype_nvme_irq_pending(&vm->disk[0].nvme)) {
+        {
+            int vblk_pending = (vblk_mapped && g_fw_1_vblk.isr_status != 0u);
+            int nvme_present = (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME);
+            int nvme_pending = (nvme_present && hype_nvme_irq_pending(&vm->disk[0].nvme));
+            int vnet_pending = (vm->shared_vnet_mapped && vm->virtio_net.isr_status != 0u);
+            int line_present = (vblk_mapped || nvme_present || vm->shared_vnet_mapped);
+
+            if (vblk_pending || nvme_pending || vnet_pending) {
                 uint8_t iov;
-                uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_NVME);
+                /*
+                 * The legacy PIC line is read from whichever device is actually asserting. All
+                 * three are configured on line 10, so this is the same answer today -- but reading
+                 * it from the asserting device is what stays correct if one of them is ever moved,
+                 * and a hardcoded 10 here would silently keep raising the old line.
+                 */
+                unsigned int owner = vblk_pending ? HYPE_FW_1_PCI_DEV_VIRTIO_BLK
+                                     : nvme_pending ? HYPE_FW_1_PCI_DEV_NVME
+                                                    : HYPE_FW_1_PCI_DEV_VIRTIO_NET;
+                uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, (uint8_t)owner);
                 if (line != 0u && line < 16u) {
                     int in_service = (line < 8u)
                         ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
@@ -13875,7 +14088,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI, &iov)) {
                     fw_1_deliver_device_vector(vm, kind, HYPE_FW_1_VIRTIO_GSI, iov); /* #512 */
                 }
-            } else {
+            } else if (line_present) {
+                /* Every device on the pin is quiet, so the level really is low. Deasserting drops
+                 * the IO-APIC Remote-IRR so the next completion re-injects. */
                 hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_VIRTIO_GSI);
             }
         }
@@ -14856,6 +15071,34 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                 }
                 /*
+                 * #81: the same latch for virtio-net's BAR4. `in_use` is tested first because the
+                 * device is only there when `net_mode = nat` -- an absent PCI function reads back
+                 * all-ones from config space, and hype_pci_memory_space_enabled() on a slot that
+                 * was never populated would be asking a question about nothing.
+                 */
+                if (!vm->shared_vnet_mapped &&
+                    vm->pci.devices[HYPE_FW_1_PCI_DEV_VIRTIO_NET].in_use &&
+                    hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_NET)) {
+                    uint64_t nbar = hype_pci_get_bar_value(&g_fw_1_pci,
+                                                           HYPE_FW_1_PCI_DEV_VIRTIO_NET,
+                                                           HYPE_FW_1_VIRTIO_BAR_INDEX);
+                    if (nbar != 0) {
+                        vm->shared_vnet_bar = nbar;
+                        vm->shared_vnet_mapped = 1u;
+                        /* Bus mastering mirrored in at the same moment (#372): a NIC reaches its
+                         * rings by mastering the bus, so the model must not act on a notify before
+                         * the guest has enabled it. */
+                        hype_virtio_net_set_bus_master(
+                            &vm->virtio_net,
+                            hype_pci_bus_master_enabled(&g_fw_1_pci,
+                                                        HYPE_FW_1_PCI_DEV_VIRTIO_NET));
+                        hype_debug_print("fw-1: virtio-net BAR%u enabled at guest-physical 0x%llx "
+                                          "-- routing its MMIO to the virtio-net model now [#81]\n",
+                                          (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX,
+                                          (unsigned long long)nbar);
+                    }
+                }
+                /*
                  * #565: the same latch for the Bochs VBE adapter's BAR2, when the VM has one.
                  * Like virtio-blk's BAR4 it sits in the not-present 32-bit PCI aperture, so its
                  * MMIO already faults as an NPF and only needs routing (below) -- no NPT map.
@@ -15255,6 +15498,41 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                               (unsigned long long)(npf.guest_phys_addr - vblk_bar),
                               npf.is_write ? "write" : "read");
                     fw_1_guest_fault_stop(vm, "its guest made a virtio-blk register access hype does not model");
+                    return;
+                }
+            }
+            /*
+             * #81: the virtio-net window, on the BSP's own chain.
+             *
+             * IT HAS TO BE HERE AS WELL AS IN fw_1_shared_mmio_npf(), because that function has
+             * exactly one caller and it is the AP loop. The BSP keeps its own chain -- which is the
+             * drift #482 describes, still half-finished -- so a window added only to the shared
+             * dispatch is served on every vCPU EXCEPT the boot one. That is how this landed the
+             * first time: the guest found the device, sized and placed BAR4, walked the whole
+             * capability chain, and then read device_status as 0xff, because a single-vCPU guest
+             * runs on the BSP and the BSP had never heard of the window.
+             */
+            if (vm->shared_vnet_mapped) {
+                vmm_get_last_npf(kind, ctx, &npf);
+                if (npf.guest_phys_addr >= vm->shared_vnet_bar &&
+                    npf.guest_phys_addr < vm->shared_vnet_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
+                    if (vmm_handle_virtio_net_npf(kind, ctx, vm, &g_fw_1_dma_map,
+                                                  (uint64_t)vm->shared_vnet_bar, insn) == 0) {
+                        continue;
+                    }
+                    /* #550's rule: say WHICH access. The offset alone cannot distinguish an
+                     * unmodelled register from an unmodelled width or instruction form, and those
+                     * are three different bugs in three different files. */
+                    HYPE_LOGF(HYPE_LOG_ERROR,
+                              "fw-1: unhandled virtio-net MMIO at guest-physical 0x%llx "
+                              "(BAR+0x%llx, %s) -- the offset, the access width or the "
+                              "instruction form is not modelled [#81]\n",
+                              (unsigned long long)npf.guest_phys_addr,
+                              (unsigned long long)(npf.guest_phys_addr - vm->shared_vnet_bar),
+                              npf.is_write ? "write" : "read");
+                    fw_1_guest_fault_stop(vm,
+                                          "its guest made a virtio-net register access hype does "
+                                          "not model");
                     return;
                 }
             }

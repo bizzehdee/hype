@@ -12,6 +12,7 @@
 #include "../../../devices/pit.h"
 #include "../../../devices/hpet.h" /* #436: the HPET block the NPF handler drives */
 #include "../../../devices/pflash.h"
+#include "../../../core/virtio_net_ring.h" /* NET-2 (#81) */
 #include "../../../devices/fw_cfg.h"
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
@@ -1307,6 +1308,28 @@ void hype_svm_set_msr_trace(int enabled);
 int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
                                          const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
                                          uint64_t mmio_base_phys, const uint8_t *insn);
+
+
+/*
+ * NET-2 (#81): the guest virtio-net BAR window. Same shape as the virtio-blk handler above -- the
+ * transport layout is identical and the sub-offsets are shared -- with one difference that matters:
+ * the NOTIFY region is per-queue, so which queue was rung is derived from the offset within it
+ * rather than assumed. Ringing the wrong doorbell would drain the transmit ring on a receive
+ * notify, and the symptom is packets that appear only when traffic happens to flow the other way.
+ *
+ * `sink` and `user` are how a frame leaves: the caller supplies them, so this file needs to know
+ * nothing about NAT or peer forwarding. `scratch` is the caller's per-VM gather buffer -- see
+ * core/virtio_net_ring.h on why it is not a static here.
+ *
+ * Exempt from unit testing for the same reason as its siblings: it reaches into the exempt VMCB
+ * fields a real VMRUN produces. Everything it calls -- hype_mmio_decode(), the
+ * hype_virtio_net_*_cfg_read/write() family, hype_virtio_net_drain_tx() -- is tested in isolation.
+ */
+int hype_svm_vcpu_handle_virtio_net_npf(hype_vcpu_ctx_t *ctx, hype_virtio_net_t *dev,
+                                        const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                        hype_virtio_net_tx_fn sink, void *user, uint8_t *scratch,
+                                        unsigned int scratch_len,
+                                        hype_virtio_net_ring_stats_t *stats, const uint8_t *insn);
 
 /* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
  * vcpu_enable_apic_accel signature. */

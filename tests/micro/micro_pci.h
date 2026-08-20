@@ -54,12 +54,18 @@ static inline uint64_t micro_ecam_addr(unsigned dev, unsigned func, unsigned off
     return MICRO_ECAM_BASE + ((uint64_t)dev << 15) + ((uint64_t)func << 12) + (uint64_t)off;
 }
 
+/* Declared below micro_pci_fread32/fwrite32, which carry the explanation of why these use an
+ * explicit MOV. Function 0 of a device is just func == 0, so these delegate rather than repeat the
+ * encoding -- two spellings of one access is how the two would drift. */
+static inline uint32_t micro_pci_fread32(unsigned dev, unsigned func, unsigned off);
+static inline void micro_pci_fwrite32(unsigned dev, unsigned func, unsigned off, uint32_t v);
+
 static inline uint32_t micro_pci_read32(unsigned dev, unsigned off) {
-    return *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, 0u, off);
+    return micro_pci_fread32(dev, 0u, off);
 }
 
 static inline void micro_pci_write32(unsigned dev, unsigned off, uint32_t v) {
-    *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, 0u, off) = v;
+    micro_pci_fwrite32(dev, 0u, off, v);
 }
 
 /*
@@ -68,12 +74,37 @@ static inline void micro_pci_write32(unsigned dev, unsigned off, uint32_t v) {
  * (00:1f.2), while the optical HBA is a device of its own. A test that walks devices only finds
  * the wrong controller and concludes there is no disk (#548).
  */
+/*
+ * EXPLICIT MOV, not a volatile dereference, and this is a real finding rather than style.
+ *
+ * A `volatile uint32_t` load is a single memory access, so clang is free to lower
+ * `if ((read32(dev, 4) >> 16) & BIT)` to one `testl $imm32, disp(%reg,%reg)` -- the access count is
+ * preserved, so the volatile contract holds. hype's MMIO decoder does not handle the F7 /0
+ * TEST-with-immediate form, so the guest faulted undecodably at its ECAM window and hype stopped
+ * the VM. The test looked like a device bug; it was the compiler picking a legal encoding.
+ *
+ * virtioblk.c already carries this lesson for its BAR accesses ("at -O2 clang folded one of these
+ * into a form hype's virtio path refused"). It belongs here too, because config-space reads are
+ * shared by every test and the fold depends on what the caller does with the value -- so any test
+ * that masks a config field could trip it, at any optimisation level, without changing this file.
+ *
+ * Filed separately as the decoder gap it also is: a real guest driver testing a bit in an MMIO
+ * register can emit exactly this instruction.
+ */
 static inline uint32_t micro_pci_fread32(unsigned dev, unsigned func, unsigned off) {
-    return *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, func, off);
+    uint32_t v;
+    __asm__ volatile("movl (%1), %0"
+                     : "=r"(v)
+                     : "r"((volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, func, off))
+                     : "memory");
+    return v;
 }
 
 static inline void micro_pci_fwrite32(unsigned dev, unsigned func, unsigned off, uint32_t v) {
-    *(volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, func, off) = v;
+    __asm__ volatile("movl %0, (%1)"
+                     :
+                     : "r"(v), "r"((volatile uint32_t *)(uintptr_t)micro_ecam_addr(dev, func, off))
+                     : "memory");
 }
 
 static inline int micro_pci_fpresent(unsigned dev, unsigned func) {

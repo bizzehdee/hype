@@ -296,6 +296,26 @@ segment — put 3 VMs' NICs on the same `[switch.lan0]` and those 3 (and only th
 `net_peers` → the legacy pairwise point-to-point forward). Zero NICs = no `nics`
 (a network-less VM). L3 routing *between* switches is deferred (future NET-7).
 
+**What `net_mode = nat` does today (#81).** It presents the VM a **virtio-net**
+adapter (PCI `0x1AF4:0x1041`, class network/ethernet, on PCI device 4 in BAR4),
+with a MAC derived from the VM index and stable for the life of the VM — the
+forwarding plane identifies a guest by its source address, so a MAC that moved
+between boots would look like a different guest to every mapping. The default
+stays `none`, and a VM with `net_mode = none` has **no** virtual NIC at all,
+rather than a NIC with no uplink: an offline install must not depend on the host
+NIC driver or the NAT path working, and a device the operator did not ask for
+must not appear (the same rule as `display`).
+
+Only ONE feature is offered beyond the modern-virtio baseline: `VIRTIO_NET_F_MAC`.
+Checksum and segmentation offloads are deliberately absent — hype would have to
+perform what it claimed to offload, and the NAT path already has to fix
+checksums up after rewriting addresses, so advertising an offload hype does not
+do hands the guest a frame the wire rejects. The control queue (and with it
+multiqueue and MAC filtering) is also absent.
+
+Frames leave the guest and are counted; where they go is the forwarding plane's
+decision (NAT, NET-4/#83) and is landing separately.
+
 ### 5.6 `bus` default derivation
 
 When a `type=disk` device's `bus` is not given, it defaults from the owning VM's

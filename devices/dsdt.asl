@@ -103,6 +103,14 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                  * one front-end) and can never both be present, which is the assumption
                  * fw_1_slot_gsi() already encodes. */
                 Package () { 0x0005FFFF, 0x00, 0x00, 0x14 },  /* dev 5 INTA -> GSI 20 (NVMe slot 0) */
+                /* #81: virtio-net is device 4, and it shares GSI 20 rather than taking a new pin
+                 * because there is no new pin -- the 24-entry IO-APIC is fully allocated (16-19
+                 * dev 2, 20 here, 21 dev 31, 22 and 23 the extra disk slots). Sharing a
+                 * level-triggered PCI interrupt is ordinary; what it requires is that hype treat
+                 * the line as the OR of its devices, which fw-1's dispatch now does in one place.
+                 * Present unconditionally, like the disk-slot entries: a _PRT entry for an absent
+                 * device is inert, and a conditional table would need a per-config DSDT. */
+                Package () { 0x0004FFFF, 0x00, 0x00, 0x14 },  /* dev 4 INTA -> GSI 20 (virtio-net) */
                 /* #440: the ICH9 SATA function is 00:1f.2. _PRT keys on
                  * device/pin, so function 2 routes via dev31 INTA. GSI 21 keeps
                  * it OFF the CD controller's line (dev 2 INTA -> GSI 16): hype's

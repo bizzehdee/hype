@@ -4776,6 +4776,137 @@ int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
     return 0;
 }
 
+int hype_svm_vcpu_handle_virtio_net_npf(hype_vcpu_ctx_t *ctx, hype_virtio_net_t *dev,
+                                        const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                        hype_virtio_net_tx_fn sink, void *user, uint8_t *scratch,
+                                        unsigned int scratch_len,
+                                        hype_virtio_net_ring_stats_t *stats, const uint8_t *insn) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < mmio_base_phys ||
+        npf.guest_phys_addr >= mmio_base_phys + HYPE_VIRTIO_BLK_BAR_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - mmio_base_phys);
+
+    /* The guest RIP is a guest-VIRTUAL address, only dereferenceable as a host pointer for an
+     * identity-mapped guest. A real VM must pass `insn`, fetched through the page walk; NULL keeps
+     * the identity fast path the microtests use. #565 is what this costs when it is missing: the
+     * decode fails and the access is reported as a register hype does not model. */
+    guest_bytes = (insn != 0) ? insn : (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+
+    /* #306: an immediate store carries its value in the instruction and has no source register --
+     * the ModRM reg field is an opcode extension -- so the GPR lookup is skipped rather than
+     * resolving register 0 and writing RAX to the device. */
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
+        return -1;
+    }
+
+    if (offset >= HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET &&
+        offset < HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET + HYPE_VIRTIO_COMMON_CFG_SIZE) {
+        uint32_t region_offset = offset - HYPE_VIRTIO_BLK_BAR_COMMON_CFG_OFFSET;
+        if (decoded.is_write) {
+            uint32_t value;
+            if (decoded.mem_is_dst) {
+                /* #307: a read-modify-write of this register -- read it, combine, store the
+                 * result, rather than storing the other operand alone. */
+                uint32_t cur = 0;
+                if (hype_virtio_net_common_cfg_read(dev, region_offset, decoded.size_bytes,
+                                                    &cur) != 0) {
+                    return -1;
+                }
+                value = hype_mmio_rmw_value(&decoded, reg ? *reg : 0u, cur,
+                                            &real->vmcb->save.rflags);
+            } else {
+                value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
+            }
+            if (hype_virtio_net_common_cfg_write(dev, region_offset, decoded.size_bytes,
+                                                 value) != 0) {
+                return -1;
+            }
+        } else {
+            uint32_t value = 0;
+            if (hype_virtio_net_common_cfg_read(dev, region_offset, decoded.size_bytes,
+                                                &value) != 0) {
+                return -1;
+            }
+            hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags);
+        }
+    } else if (offset >= HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET &&
+               offset < HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET +
+                            HYPE_VIRTIO_NET_NUM_QUEUES * HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_MULTIPLIER) {
+        /*
+         * WHICH queue was rung comes from the offset. One doorbell per queue at a 4-byte stride, as
+         * the notify capability's multiplier advertises. A single doorbell for both -- which is all
+         * a one-queue device needs -- would make a receive notify drain the transmit ring, and that
+         * failure looks like packets moving only when traffic happens to flow the other way.
+         */
+        uint32_t slot = (offset - HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_OFFSET) /
+                        HYPE_VIRTIO_BLK_BAR_NOTIFY_CFG_MULTIPLIER;
+        if (decoded.is_write) {
+            if (slot == HYPE_VIRTIO_NET_VQ_TX) {
+                /* A negative return means the ring could not be walked at all, and nothing was
+                 * consumed. That is not an instruction-emulation failure -- the store itself
+                 * succeeded -- so RIP still advances and the guest is not re-faulted forever on a
+                 * doorbell write it is entitled to make. */
+                (void)hype_virtio_net_drain_tx(dev, dma_map, sink, user, scratch, scratch_len,
+                                               stats);
+            }
+            /*
+             * A receive notify means the driver has POSTED buffers, not that a frame is waiting.
+             * There is nothing to do here: hype delivers into those buffers when a frame arrives,
+             * from the dispatch loop. Accepting the write and doing nothing is correct, and is
+             * different from ignoring it -- the descriptors the driver just published are read on
+             * the next delivery.
+             */
+        } else {
+            hype_mmio_complete_read(&decoded, reg, 0, &real->vmcb->save.rflags);
+        }
+    } else if (offset == HYPE_VIRTIO_BLK_BAR_ISR_CFG_OFFSET) {
+        if (!decoded.is_write) {
+            uint8_t value = hype_virtio_net_isr_read(dev); /* read-to-clear */
+            hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags);
+        }
+    } else if (offset >= HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET &&
+               offset < HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET + HYPE_VIRTIO_NET_CFG_SIZE) {
+        if (!decoded.is_write) {
+            uint32_t value = 0;
+            uint32_t region_offset = offset - HYPE_VIRTIO_BLK_BAR_DEVICE_CFG_OFFSET;
+            if (hype_virtio_net_device_cfg_read(dev, region_offset, decoded.size_bytes,
+                                                &value) != 0) {
+                return -1;
+            }
+            hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags);
+        }
+        /* Writes to the device config are dropped: the MAC is hype's, not the driver's. A driver
+         * that wants a different address uses the control queue, which this device does not offer
+         * (see the feature list in devices/virtio_net.h). */
+    } else {
+        /* Reserved area of the BAR -- reads as 0, writes ignored, the same convention every other
+         * MMIO model here uses. */
+        if (!decoded.is_write) {
+            hype_mmio_complete_read(&decoded, reg, 0, &real->vmcb->save.rflags);
+        }
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
                                      const hype_gpa_map_t *dma_map) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;

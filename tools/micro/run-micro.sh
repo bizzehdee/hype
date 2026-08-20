@@ -54,6 +54,11 @@ CFG
     case "$1" in
         bochsvbe) printf 'display = bochs\n' >> "$2" ;;
     esac
+    # #81: the virtio-net adapter exists only when the VM asks for a network (plan.md 6e's default
+    # is `none`, so a test that needs a NIC has to say so, exactly as bochsvbe does for a display).
+    case "$1" in
+        virtionet) printf 'net_mode = nat\n' >> "$2" ;;
+    esac
     case "$1" in
         virtioblk|atadisk|ahci) cat >> "$2" <<CFG
 disks = d0
