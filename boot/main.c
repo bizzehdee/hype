@@ -29,6 +29,8 @@
 #include "../core/host_pci.h"
 #include "../core/e1000.h"
 #include "../core/virtio_net_ring.h" /* NET-2 (#81) */
+#include "../core/nat.h"            /* NET-4 (#83) */
+#include "../core/arp.h"
 #include "../core/xhci.h"
 #include "../core/usb_hid.h" /* USB-5 (#217): HID boot-keyboard host input */
 #include "../core/scancode.h"  /* INPUT-11 (#284): ASCII -> PS/2 Set-1 for `sendkey` */
@@ -824,6 +826,77 @@ typedef struct hype_fw_vm {
      * operator needs while #83 is unlanded.
      */
     unsigned long long vnet_no_plane;
+    /*
+     * #83: this VM's own NAPT table. PER VM, which is the isolation property rather than a sizing
+     * convenience -- a shared table would let one guest exhaust another's ability to open any
+     * connection at all, between VMs that are meant to be isolated (plan.md 6e).
+     */
+    hype_nat_t nat;
+    /*
+     * The MAC hype answers the guest's ARP with, and the guest's own address pair, LEARNED from its
+     * traffic rather than configured.
+     *
+     * Learning is not a shortcut, it is the only thing that works: hype has to build an Ethernet
+     * header addressed to the guest for every inbound frame, and nothing tells it the guest's MAC.
+     * A config key would have to be kept in step with whatever the guest's own OS actually
+     * configured, and would be wrong the first time someone changed it inside the guest.
+     */
+    uint8_t vnet_router_mac[6];
+    uint8_t vnet_guest_mac[6];
+    uint8_t vnet_guest_ip[4];
+    unsigned int vnet_guest_known;
+    unsigned long long vnet_arp_answered;
+    unsigned long long vnet_out_sent;
+    unsigned long long vnet_out_nat_refused;
+    unsigned long long vnet_out_no_uplink;
+    unsigned long long vnet_out_not_ipv4;
+    unsigned long long vnet_in_delivered;
+    /*
+     * NET-4b (#85): frames another guest sent to this one, waiting to be put in its receive ring.
+     *
+     * A MAILBOX RATHER THAN A DIRECT HANDOFF, and the reason is lock ordering, not buffering. The
+     * transmit path runs with the SENDING VM's device lock held (a guest's MMIO fault took it), so
+     * writing straight into the peer's receive ring would mean holding one VM's lock while taking
+     * another's. Two guests sending to each other at once would then deadlock the two cores
+     * outright.
+     *
+     * So the sender only ever touches the peer's INBOX lock, and the pump -- which holds no device
+     * lock -- copies a frame out under the inbox lock, RELEASES it, and only then takes the target's
+     * device lock to deliver. Nothing ever holds an inbox lock and a device lock at the same time,
+     * which is what removes the cycle rather than just making it less likely.
+     *
+     * Four slots: a mailbox is a hand-off point, not a queue with a queueing discipline. If it is
+     * full the frame is dropped and counted, exactly as a real network drops when a buffer fills.
+     */
+    uint8_t peer_inbox[4][HYPE_VIRTIO_NET_MAX_FRAME_LEN];
+    unsigned int peer_inbox_len[4];
+    unsigned int peer_inbox_head;
+    unsigned int peer_inbox_tail;
+    unsigned int inbox_lock_next;
+    unsigned int inbox_lock_owner;
+    unsigned long long vnet_peer_sent;
+    unsigned long long vnet_peer_recv;
+    unsigned long long vnet_peer_denied;
+    unsigned long long vnet_peer_inbox_full;
+    /*
+     * Addresses THIS GUEST BELIEVES ARE ON ITS OWN SEGMENT, learned from the ARP requests it sends.
+     *
+     * An ARP request is a statement: "I think this address is on my link." That is information hype
+     * cannot get any other way -- proxy ARP means hype never configures the guest's subnet or mask,
+     * so it has no netmask to reason from.
+     *
+     * It closes a real leak. Without it, a packet addressed to a guest that has not yet ARPed falls
+     * through to NAT, gets hype's uplink address as its source, and goes out the physical port with
+     * a private destination -- which the upstream gateway either drops or, if that private range
+     * exists on the real network, forwards to a stranger. A packet for another guest must never
+     * reach the wire just because hype had not learned the recipient yet.
+     *
+     * Eight entries, oldest overwritten: a guest's own segment has exactly one other thing on it
+     * (hype), so this only ever holds the gateway plus whatever peers it has been told to talk to.
+     */
+    uint8_t vnet_onlink[8][4];
+    unsigned int vnet_onlink_count;
+    unsigned long long vnet_out_onlink_dropped;
     hype_cmos_t cmos;
     /*
      * FW-1b: guest Local APIC (0xFEE00000).
@@ -5279,35 +5352,503 @@ static int vmm_handle_nvme_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_
 }
 
 /*
- * NET-2 (#81): where a guest's outbound frame goes today -- nowhere, counted.
+ * ===========================================================================================
+ * NET-4 (#83): the forwarding plane. Where a guest's frames actually go.
+ * ===========================================================================================
  *
- * The device works: the guest's driver transmits, the descriptor comes back used, and the counters
- * say how many frames left. What does not exist yet is the FORWARDING PLANE (#83's NAT, #85's peer
- * rules), which is what decides where a frame is allowed to go. Bridging the frame straight onto the
- * wire in the meantime would be wrong rather than incomplete: the guest's own MAC and IP would
- * appear on the physical network with no translation, which is not what `net_mode = nat` promises
- * and not something an operator asked for.
+ * hype is a FORWARDING PLANE, never an endpoint (plan.md decision 36). It rewrites packets passing
+ * between a guest and the wire; it owns no socket and is never the address a packet is sent to.
  *
- * So this drops and counts, and #83 replaces the body. Returning 0 (accepted) rather than nonzero is
- * deliberate: a real network drops packets, and a NIC that reported every frame as a failure would
- * make the guest's driver log an error storm for what is a configuration state.
+ * HYPE ANSWERS EVERY ARP REQUEST FROM A GUEST WITH ITS OWN MAC (proxy ARP), rather than answering
+ * only for a configured gateway address. That is a decision, not laziness:
+ *
+ *   - hype does not have to be told the guest's subnet, gateway or address. Whatever the guest's OS
+ *     is configured with, its first hop resolves to hype and every packet arrives here to be routed.
+ *     A config key naming the segment would have to be kept in step with whatever was configured
+ *     INSIDE the guest, and would be wrong the first time someone changed it there.
+ *   - it is what makes the guest's own address learnable: the ARP carries the sender's MAC and IP
+ *     together, so hype knows how to address inbound frames back to it before any IPv4 flows.
+ *   - claiming to be every address is safe here precisely BECAUSE hype is the router. A frame for
+ *     another guest arrives at hype and is dropped unless a peer rule allows it (#85), which is the
+ *     default-deny 6e requires. On a shared L2 segment proxy ARP would be a hijack; on a
+ *     point-to-point link to a router it is the router doing its job.
+ */
+
+/*
+ * The parsed config, declared here as a tentative definition because the forwarding plane needs to
+ * ask about `net_peers` and the real declaration is further down. C merges tentative definitions of
+ * the same static object, so this is one variable, not two -- and it beats moving several hundred
+ * lines of unrelated code to satisfy an ordering.
+ */
+static hype_cfg_t g_hype_cfg;
+
+/* The uplink: hype's own address on the physical network, and the gateway's MAC once resolved. */
+static uint8_t g_uplink_ip[4];
+static uint8_t g_uplink_mask[4];
+static uint8_t g_uplink_gw[4];
+static int g_uplink_configured;
+static uint8_t g_uplink_gw_mac[6];
+static int g_uplink_gw_mac_known;
+static unsigned long long g_uplink_arp_requests;
+static unsigned long long g_uplink_rx_frames;
+static unsigned long long g_uplink_rx_arp;
+static unsigned long long g_uplink_rx_unclaimed;
+static unsigned long long g_uplink_tx_fail;
+/*
+ * The NAT clock. Ticks are whatever the expiry sweep is called with; it only has to be monotonic
+ * and roughly known in wall-clock terms, which is why it is driven off the same second counter the
+ * dispatch loop already keeps rather than a new timer.
+ */
+static unsigned long long g_nat_tick;
+
+/*
+ * The host NIC is ONE device shared by every VM, so exactly one core may drive it at a time. This
+ * is the #343 bug class -- per-VM structures are not enough when the DEVICE is shared, and hype was
+ * handing guests corrupt bytes until host I/O was serialised.
+ */
+static unsigned int g_uplink_lock_next;
+static unsigned int g_uplink_lock_owner;
+
+static int ip4_eq(const uint8_t a[4], const uint8_t b[4]) {
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+static void eth_build(uint8_t *out, const uint8_t dst[6], const uint8_t src[6], uint16_t type) {
+    unsigned int i;
+    for (i = 0; i < 6u; i++) {
+        out[i] = dst[i];
+        out[6 + i] = src[i];
+    }
+    out[12] = (uint8_t)(type >> 8);
+    out[13] = (uint8_t)(type & 0xFFu);
+}
+
+/* The per-VM router MAC hype answers ARP with. Locally administered, and distinct from the MAC the
+ * guest's own adapter has, so the guest sees a real neighbour rather than itself. */
+static void fw_1_vnet_router_mac(hype_fw_vm_t *vm) {
+    unsigned int idx = (unsigned int)(vm - g_vms);
+    vm->vnet_router_mac[0] = 0x52u;
+    vm->vnet_router_mac[1] = 0x54u;
+    vm->vnet_router_mac[2] = 0x00u;
+    vm->vnet_router_mac[3] = 0xFFu;
+    vm->vnet_router_mac[4] = (uint8_t)((idx >> 8) & 0xFFu);
+    vm->vnet_router_mac[5] = (uint8_t)(idx & 0xFFu);
+}
+
+/* Hands one frame to the guest's receive ring. Caller must hold this VM's device lock. */
+static int fw_1_vnet_to_guest(hype_fw_vm_t *vm, const uint8_t *frame, unsigned int len) {
+    return hype_virtio_net_deliver_rx(&vm->virtio_net, &g_fw_1_dma_map, frame, len,
+                                      &vm->vnet_stats);
+}
+
+/*
+ * A frame the guest transmitted. Called from the ring walker with the virtio-net header already
+ * stripped, so this is a bare Ethernet frame.
+ *
+ * Returns 0 always -- see the note on the old drop-and-count sink: a NIC that reported every
+ * unforwardable frame as a transmit failure would make the guest's driver log an error storm for
+ * what is a routing decision. What must not be silent is WHY nothing was forwarded, and each reason
+ * has its own counter.
  */
 static int fw_1_vnet_tx_sink(void *user, const uint8_t *frame, unsigned int len) {
     hype_fw_vm_t *vm = (hype_fw_vm_t *)user;
+    uint16_t ethertype;
+    uint8_t out[HYPE_VIRTIO_NET_MAX_FRAME_LEN + HYPE_ETH_HDR_LEN];
 
-    (void)frame;
-    (void)len;
-    if (vm != 0) {
-        vm->vnet_no_plane++;
+    if (vm == 0 || frame == 0 || len < HYPE_ETH_HDR_LEN) {
+        return 0;
     }
+    ethertype = (uint16_t)(((uint16_t)frame[12] << 8) | (uint16_t)frame[13]);
+
+    if (ethertype == 0x0806u) {
+        hype_arp_t a;
+        if (!hype_arp_parse(frame, len, &a) || a.op != HYPE_ARP_OP_REQUEST) {
+            return 0; /* an ARP reply from the guest tells hype nothing it does not already learn */
+        }
+        /* Learn the guest from its own request: the sender fields carry exactly the pair hype needs
+         * to address inbound frames back to it. */
+        {
+            unsigned int i;
+            for (i = 0; i < 6u; i++) {
+                vm->vnet_guest_mac[i] = a.sender_mac[i];
+            }
+            for (i = 0; i < 4u; i++) {
+                vm->vnet_guest_ip[i] = a.sender_ip[i];
+            }
+            vm->vnet_guest_known = 1u;
+        }
+        /*
+         * Record what the guest thinks is on its link. Done BEFORE the reply, because the reply is
+         * what makes the guest start sending to that address.
+         */
+        {
+            unsigned int k;
+            int seen = 0;
+            for (k = 0; k < vm->vnet_onlink_count && k < 8u; k++) {
+                if (ip4_eq(vm->vnet_onlink[k], a.target_ip)) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (!seen) {
+                unsigned int slot = vm->vnet_onlink_count % 8u;
+                for (k = 0; k < 4u; k++) {
+                    vm->vnet_onlink[slot][k] = a.target_ip[k];
+                }
+                vm->vnet_onlink_count++;
+            }
+        }
+        /* Answer for whatever was asked -- see the proxy-ARP reasoning above. */
+        {
+            unsigned int n = hype_arp_build_reply(out, sizeof(out), vm->vnet_router_mac, a.target_ip,
+                                                  a.sender_mac, a.sender_ip);
+            if (n != 0u && fw_1_vnet_to_guest(vm, out, n) == 1) {
+                vm->vnet_arp_answered++;
+            }
+        }
+        return 0;
+    }
+
+    if (ethertype != 0x0800u) {
+        /* Not IPv4. IPv6 is out of scope (HNET-6 defers it), and anything else -- 802.1Q, LLDP,
+         * a guest's own multicast discovery -- has no forwarding rule here. Counted, not logged per
+         * frame: a chatty guest would drown the log. */
+        vm->vnet_out_not_ipv4++;
+        return 0;
+    }
+
     /*
-     * 0 means ACCEPTED, and that is deliberate even though the frame is discarded. Returning
-     * nonzero would make the ring walker count every frame as a drop, and a driver would see a NIC
-     * failing every transmit -- an error storm describing a configuration state. A real network
-     * drops packets silently; what must not be silent is that NOTHING is forwarding them, and
-     * vnet_no_plane is where that is said.
+     * NET-4a/4b (#84/#85): is this packet for ANOTHER GUEST? Decided before NAT, and that order is
+     * the point -- a private address translated onto the uplink would put one guest's traffic on the
+     * physical network addressed to hype's own IP, which is worse than dropping it.
+     *
+     * Default-deny (#84): unless an operator named the pair in `net_peers`, the frame is dropped and
+     * counted. Guests are never reachable from each other by accident, which is the isolation
+     * property, and the counter is how an operator finds out that is what happened.
      */
+    if (len >= HYPE_ETH_HDR_LEN + 20u) {
+        const uint8_t *dst_ip = frame + HYPE_ETH_HDR_LEN + 16u;
+        unsigned int me = (unsigned int)(vm - g_vms);
+        unsigned int vi;
+
+        for (vi = 0; vi < g_vm_count; vi++) {
+            hype_fw_vm_t *tv = &g_vms[vi];
+            if (vi == me || !tv->vnet_guest_known || !ip4_eq(tv->vnet_guest_ip, dst_ip)) {
+                continue;
+            }
+            if (!hype_adm_vms_are_peers(&g_hype_cfg, me, vi)) {
+                vm->vnet_peer_denied++;
+                return 0;
+            }
+            /*
+             * Into the peer's MAILBOX, never straight into its ring -- see the field comment. Only
+             * the peer's inbox lock is taken here, and this path already holds THIS vm's device
+             * lock.
+             */
+            hype_ticket_lock_acquire(&tv->inbox_lock_next, &tv->inbox_lock_owner);
+            {
+                unsigned int next = (tv->peer_inbox_tail + 1u) % 4u;
+                if (next == tv->peer_inbox_head) {
+                    tv->vnet_peer_inbox_full++;
+                } else {
+                    unsigned int n = len;
+                    unsigned int k;
+                    if (n > HYPE_VIRTIO_NET_MAX_FRAME_LEN) {
+                        n = HYPE_VIRTIO_NET_MAX_FRAME_LEN;
+                    }
+                    for (k = 0; k < n; k++) {
+                        tv->peer_inbox[tv->peer_inbox_tail][k] = frame[k];
+                    }
+                    tv->peer_inbox_len[tv->peer_inbox_tail] = n;
+                    tv->peer_inbox_tail = next;
+                    vm->vnet_peer_sent++;
+                }
+            }
+            hype_ticket_lock_release(&tv->inbox_lock_owner);
+            return 0;
+        }
+
+        /*
+         * No VM owns that address -- but if the GUEST thinks it is on its own link, it must not go
+         * to the uplink. Either it is a peer that has not finished booting (so hype has not learned
+         * it yet) or it is nothing at all; in both cases hype's segments hold exactly one guest, so
+         * there is nobody there. NATting it would put a private destination on the physical network.
+         *
+         * This is the case that made the check necessary: without it, whichever of two peers started
+         * first leaked its first few packets to the wire before the other had ARPed.
+         */
+        {
+            unsigned int k;
+            for (k = 0; k < vm->vnet_onlink_count && k < 8u; k++) {
+                if (ip4_eq(vm->vnet_onlink[k], dst_ip)) {
+                    vm->vnet_out_onlink_dropped++;
+                    return 0;
+                }
+            }
+        }
+    }
+
+    if (!g_uplink_configured) {
+        vm->vnet_out_no_uplink++;
+        return 0;
+    }
+
+    /* Learn the guest's address from its IPv4 source too, so a guest that never ARPs (a static
+     * neighbour entry, or a second address) is still addressable. */
+    if (len >= HYPE_ETH_HDR_LEN + 20u) {
+        unsigned int i;
+        for (i = 0; i < 6u; i++) {
+            vm->vnet_guest_mac[i] = frame[6 + i];
+        }
+        for (i = 0; i < 4u; i++) {
+            vm->vnet_guest_ip[i] = frame[HYPE_ETH_HDR_LEN + 12u + i];
+        }
+        vm->vnet_guest_known = 1u;
+    }
+
+    /*
+     * Translate a COPY. The frame is still in the guest's own buffer via the ring walker's scratch,
+     * and rewriting it in place would be rewriting memory the guest can see mid-flight -- harmless
+     * today because the descriptor is already consumed, but a habit worth not forming.
+     */
+    {
+        unsigned int pkt_len = len - HYPE_ETH_HDR_LEN;
+        unsigned int i;
+        if (pkt_len + HYPE_ETH_HDR_LEN > sizeof(out)) {
+            vm->vnet_out_nat_refused++;
+            return 0;
+        }
+        for (i = 0; i < pkt_len; i++) {
+            out[HYPE_ETH_HDR_LEN + i] = frame[HYPE_ETH_HDR_LEN + i];
+        }
+        if (hype_nat_translate_outbound(&vm->nat, out + HYPE_ETH_HDR_LEN, pkt_len, g_uplink_ip,
+                                        g_nat_tick) != 0) {
+            /* The NAT plane's own counters say which of malformed / fragment / unsupported /
+             * no-slot it was; this one only says a packet did not make it out. */
+            vm->vnet_out_nat_refused++;
+            return 0;
+        }
+        if (!g_uplink_gw_mac_known) {
+            /* Nowhere to send it until the gateway's MAC is known. The request is issued by the
+             * pump, not here: this path runs under the guest's device lock and must not also take
+             * the uplink's. */
+            vm->vnet_out_no_uplink++;
+            return 0;
+        }
+        eth_build(out, g_uplink_gw_mac, hype_e1000_mac()->addr, 0x0800u);
+        hype_ticket_lock_acquire(&g_uplink_lock_next, &g_uplink_lock_owner);
+        if (hype_e1000_tx(out, pkt_len + HYPE_ETH_HDR_LEN) == 0) {
+            vm->vnet_out_sent++;
+        } else {
+            g_uplink_tx_fail++;
+        }
+        hype_ticket_lock_release(&g_uplink_lock_owner);
+    }
     return 0;
+}
+
+/*
+ * Drain the host NIC and deliver what belongs to a guest.
+ *
+ * Called from ONE core's dispatch loop, and it must be called with NO VM's device lock held: it
+ * acquires the target VM's lock to deliver, and holding one VM's lock while taking another's is how
+ * a deadlock gets built.
+ *
+ * Returns how many frames were delivered to guests.
+ */
+static unsigned int fw_1_uplink_pump(hype_vmm_kind_t kind) {
+    uint8_t frame[HYPE_VIRTIO_NET_MAX_FRAME_LEN + HYPE_ETH_HDR_LEN];
+    unsigned int flen = 0;
+    unsigned int delivered = 0;
+    unsigned int budget;
+
+    (void)kind;
+
+    /*
+     * NET-4b (#85): deliver guest-to-guest frames first, and OUTSIDE the uplink check -- two guests
+     * talking to each other must work on a host with no network at all. That is the point of a
+     * private inter-VM link.
+     *
+     * THE LOCK DANCE IS THE LOAD-BEARING PART. A frame is copied out under the inbox lock, the lock
+     * is RELEASED, and only then is the target's device lock taken. Nothing here ever holds both, so
+     * the sender's ordering (device lock, then a peer's inbox lock) cannot close a cycle with this
+     * one. Holding the inbox lock across the delivery would reintroduce exactly the deadlock the
+     * mailbox exists to avoid.
+     */
+    {
+        unsigned int vi;
+        for (vi = 0; vi < g_vm_count; vi++) {
+            hype_fw_vm_t *tv = &g_vms[vi];
+            uint8_t peer[HYPE_VIRTIO_NET_MAX_FRAME_LEN];
+            unsigned int plen = 0;
+
+            if (!tv->shared_vnet_mapped) {
+                continue;
+            }
+            hype_ticket_lock_acquire(&tv->inbox_lock_next, &tv->inbox_lock_owner);
+            if (tv->peer_inbox_head != tv->peer_inbox_tail) {
+                unsigned int k;
+                plen = tv->peer_inbox_len[tv->peer_inbox_head];
+                if (plen > sizeof(peer)) {
+                    plen = sizeof(peer);
+                }
+                for (k = 0; k < plen; k++) {
+                    peer[k] = tv->peer_inbox[tv->peer_inbox_head][k];
+                }
+                tv->peer_inbox_head = (tv->peer_inbox_head + 1u) % 4u;
+            }
+            hype_ticket_lock_release(&tv->inbox_lock_owner);
+
+            if (plen == 0u) {
+                continue;
+            }
+            /*
+             * Rewrite the Ethernet header so the frame arrives from hype rather than from the other
+             * guest's MAC. hype is the ROUTER between two isolated segments, not a bridge across
+             * one: the receiving guest's ARP cache maps its gateway to hype, so a frame whose source
+             * MAC was the far guest's would arrive from an address the receiver has no route to --
+             * and it would leak the other guest's hardware address across a boundary that exists to
+             * keep them apart.
+             */
+            {
+                unsigned int k;
+                for (k = 0; k < 6u; k++) {
+                    peer[k] = tv->vnet_guest_mac[k];
+                    peer[6 + k] = tv->vnet_router_mac[k];
+                }
+            }
+            fw_1_dev_lock(tv);
+            if (fw_1_vnet_to_guest(tv, peer, plen) == 1) {
+                tv->vnet_peer_recv++;
+                delivered++;
+            }
+            fw_1_dev_unlock(tv);
+        }
+    }
+
+    if (!g_uplink_configured || !hype_e1000_ready()) {
+        return delivered;
+    }
+
+    /*
+     * A BUDGET, not "drain until empty". An unbounded drain on a busy network starves every guest
+     * on this core's dispatch loop -- the loop is also what services their device MMIO. 16 frames
+     * per pass is enough to keep a ping and a DNS lookup moving without the loop noticing.
+     */
+    for (budget = 0; budget < 16u; budget++) {
+        uint16_t ethertype;
+        hype_ticket_lock_acquire(&g_uplink_lock_next, &g_uplink_lock_owner);
+        {
+            int got = hype_e1000_poll_rx(frame, sizeof(frame), &flen);
+            hype_ticket_lock_release(&g_uplink_lock_owner);
+            if (!got) {
+                break;
+            }
+        }
+        if (flen < HYPE_ETH_HDR_LEN) {
+            continue;
+        }
+        g_uplink_rx_frames++;
+        ethertype = (uint16_t)(((uint16_t)frame[12] << 8) | (uint16_t)frame[13]);
+
+        if (ethertype == 0x0806u) {
+            hype_arp_t a;
+            g_uplink_rx_arp++;
+            if (hype_arp_parse(frame, flen, &a) && a.op == HYPE_ARP_OP_REPLY &&
+                ip4_eq(a.sender_ip, g_uplink_gw)) {
+                unsigned int i;
+                for (i = 0; i < 6u; i++) {
+                    g_uplink_gw_mac[i] = a.sender_mac[i];
+                }
+                if (!g_uplink_gw_mac_known) {
+                    g_uplink_gw_mac_known = 1;
+                    hype_debug_print("net: uplink gateway %u.%u.%u.%u is at "
+                                     "%02x:%02x:%02x:%02x:%02x:%02x [#83]\n",
+                                     (unsigned)g_uplink_gw[0], (unsigned)g_uplink_gw[1],
+                                     (unsigned)g_uplink_gw[2], (unsigned)g_uplink_gw[3],
+                                     g_uplink_gw_mac[0], g_uplink_gw_mac[1], g_uplink_gw_mac[2],
+                                     g_uplink_gw_mac[3], g_uplink_gw_mac[4], g_uplink_gw_mac[5]);
+                }
+            }
+            continue;
+        }
+        if (ethertype != 0x0800u) {
+            continue;
+        }
+
+        /*
+         * WHICH guest does this belong to? Every VM's mapping table is asked in turn and the first
+         * match wins. There can only be one: a translated port is allocated from the owning VM's
+         * table, and two VMs holding the same port toward the same remote is what
+         * test_two_guests_same_port_do_not_collide() exists to forbid.
+         *
+         * O(VMs) per inbound packet. Fine at this scale, and the alternative -- a host-wide port
+         * table -- is exactly the shared structure the per-VM design rejects.
+         */
+        {
+            unsigned int vi;
+            /*
+             * PER-FRAME, not the function's running total. `delivered` now also counts
+             * guest-to-guest frames from the inbox drain above, so testing it here would have made
+             * `unclaimed` stop counting the moment any peer traffic flowed -- a diagnostic silently
+             * switched off by unrelated activity, which is the #557 shape.
+             */
+            int claimed = 0;
+            for (vi = 0; vi < g_vm_count; vi++) {
+                hype_fw_vm_t *tv = &g_vms[vi];
+                uint8_t who[4];
+                uint8_t out[HYPE_VIRTIO_NET_MAX_FRAME_LEN + HYPE_ETH_HDR_LEN];
+                unsigned int pkt_len = flen - HYPE_ETH_HDR_LEN;
+                unsigned int i;
+
+                if (!tv->shared_vnet_mapped || !tv->vnet_guest_known) {
+                    continue;
+                }
+                if (pkt_len + HYPE_ETH_HDR_LEN > sizeof(out)) {
+                    break;
+                }
+                for (i = 0; i < pkt_len; i++) {
+                    out[HYPE_ETH_HDR_LEN + i] = frame[HYPE_ETH_HDR_LEN + i];
+                }
+                if (hype_nat_translate_inbound(&tv->nat, out + HYPE_ETH_HDR_LEN, pkt_len, who,
+                                               g_nat_tick) != 0) {
+                    continue;
+                }
+                eth_build(out, tv->vnet_guest_mac, tv->vnet_router_mac, 0x0800u);
+                fw_1_dev_lock(tv);
+                if (fw_1_vnet_to_guest(tv, out, pkt_len + HYPE_ETH_HDR_LEN) == 1) {
+                    tv->vnet_in_delivered++;
+                    delivered++;
+                }
+                fw_1_dev_unlock(tv);
+                claimed = 1;
+                break;
+            }
+            if (!claimed) {
+                /* Nobody claimed it. The ordinary case for background network noise, and exactly
+                 * what default-deny means: unsolicited inbound reaches no guest. */
+                g_uplink_rx_unclaimed++;
+            }
+        }
+    }
+
+    /*
+     * Resolve the gateway's MAC if it is not known yet. Issued from here rather than from the
+     * transmit path because this is the one place that already owns the uplink lock's context and
+     * holds no VM's device lock.
+     */
+    if (!g_uplink_gw_mac_known && g_uplink_arp_requests < 64ull) {
+        uint8_t req[HYPE_ARP_FRAME_LEN];
+        unsigned int n = hype_arp_build_request(req, sizeof(req), hype_e1000_mac()->addr,
+                                               g_uplink_ip, g_uplink_gw);
+        if (n != 0u) {
+            hype_ticket_lock_acquire(&g_uplink_lock_next, &g_uplink_lock_owner);
+            (void)hype_e1000_tx(req, n);
+            hype_ticket_lock_release(&g_uplink_lock_owner);
+            g_uplink_arp_requests++;
+        }
+    }
+    return delivered;
 }
 
 static int vmm_handle_virtio_net_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_vm_t *vm,
@@ -6542,6 +7083,54 @@ static __attribute__((noinline)) void fw_1_hpet_step(hype_fw_vm_t *vm, hype_vcpu
  * from the file that defaults the value is the whole point of that fix), and #429's CPU-average
  * window needs it even earlier, in fw_1_publish_and_render() immediately below. */
 static hype_cfg_t g_hype_cfg;
+
+/*
+ * #83/#405: take hype's uplink address from the config.
+ *
+ * Called from the config-load path and not from the NIC-attach path, because the NIC is bound in an
+ * earlier phase than the one that reads \hype.cfg. Getting that backwards produced a run where
+ * everything looked right -- NIC attached, link up, proxy ARP answered, the guest's ARP reply
+ * delivered -- and every packet was dropped as `no_uplink`, because the address was read before it
+ * existed. Worth stating, because the failure did not point at ordering.
+ */
+static void fw_1_uplink_adopt_config(void) {
+    unsigned int i;
+
+    if (!hype_e1000_ready()) {
+        /* No drivable NIC. Not an error: plenty of hosts run only offline guests. The absence was
+         * already reported by the attach path. */
+        return;
+    }
+    if (!g_hype_cfg.hype.has_uplink) {
+        /*
+         * A drivable NIC and no address. Said loudly, because this is exactly the state in which
+         * every guest with `net_mode = nat` gets a NIC that forwards nothing -- and a guest whose
+         * network silently does not work is the failure this project has paid for most often.
+         */
+        hype_debug_print("net: NIC is up but no uplink address is configured -- guests with "
+                         "net_mode = nat will have a NIC that forwards NOTHING. Set uplink_ip / "
+                         "uplink_mask / uplink_gateway in [hype] (DHCP is #405's other half, not "
+                         "implemented) [#83 #405]\n");
+        return;
+    }
+    for (i = 0; i < 4u; i++) {
+        g_uplink_ip[i] = g_hype_cfg.hype.uplink_ip[i];
+        g_uplink_mask[i] = g_hype_cfg.hype.uplink_mask[i];
+        g_uplink_gw[i] = g_hype_cfg.hype.uplink_gateway[i];
+    }
+    g_uplink_configured = 1;
+    hype_debug_print("net: uplink %u.%u.%u.%u/%u.%u.%u.%u via %u.%u.%u.%u, MAC "
+                     "%02x:%02x:%02x:%02x:%02x:%02x -- NAT armed [#83 #405]\n",
+                     (unsigned)g_uplink_ip[0], (unsigned)g_uplink_ip[1], (unsigned)g_uplink_ip[2],
+                     (unsigned)g_uplink_ip[3], (unsigned)g_uplink_mask[0],
+                     (unsigned)g_uplink_mask[1], (unsigned)g_uplink_mask[2],
+                     (unsigned)g_uplink_mask[3], (unsigned)g_uplink_gw[0],
+                     (unsigned)g_uplink_gw[1], (unsigned)g_uplink_gw[2], (unsigned)g_uplink_gw[3],
+                     hype_e1000_mac()->addr[0], hype_e1000_mac()->addr[1],
+                     hype_e1000_mac()->addr[2], hype_e1000_mac()->addr[3],
+                     hype_e1000_mac()->addr[4], hype_e1000_mac()->addr[5]);
+}
+
 
 /* #441: defined further down (needs g_hype_log, declared later) -- forward-declared here so the
  * periodic checkpoint in fw_1_publish_and_render() and the restore points in fw_1_vm_reinit() /
@@ -8451,6 +9040,11 @@ static void fw_1_virtio_net_pci_present(hype_fw_vm_t *vm) {
     /* +1 so VM 0 never gets ...:00, which reads like an unset address in a packet capture. */
     mac[5] = (uint8_t)((idx & 0xFFu) + 1u);
     hype_virtio_net_reset(&vm->virtio_net, mac);
+    /* #83: this VM's forwarding state, reset with the device. The router MAC is derived here rather
+     * than at first use so it is stable and printable from the moment the NIC exists. */
+    hype_nat_reset(&vm->nat);
+    fw_1_vnet_router_mac(vm);
+    vm->vnet_guest_known = 0u;
 
     hype_pci_add_device(&vm->pci, dev, HYPE_VIRTIO_NET_PCI_VENDOR_ID,
                         HYPE_VIRTIO_NET_PCI_DEVICE_ID, HYPE_VIRTIO_NET_PCI_CLASS_BASE,
@@ -11896,6 +12490,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 vmm_request_nested_tlb_flush(kind, ctx);
             }
             fw_1_dev_unlock(vm);
+            /*
+             * #83: drain the host NIC here, with NO device lock held.
+             *
+             * The position is the whole point. The pump acquires the TARGET VM's device lock to
+             * deliver a frame, and holding one VM's lock while taking another's is how a deadlock
+             * gets built -- so it runs in the one window this loop has where it owns nothing. The
+             * transmit side has the opposite nesting (a guest's MMIO fault already holds that VM's
+             * lock and then takes the uplink's), and the two orders do not form a cycle only
+             * because the pump releases the uplink lock BEFORE it takes a VM's.
+             *
+             * Every core may call it: the uplink lock serialises the shared device (#343 -- per-VM
+             * structures are not enough when the DEVICE is shared), so there is no need to elect an
+             * owner core, and electing one would stop the network the moment that VM stopped.
+             */
+            (void)fw_1_uplink_pump(kind);
             g_bsp_probe_entry_tsc[(unsigned)(vm - g_vms)] = hype_rdtsc(); /* #483 */
             if (ops->vcpu_run(ctx, &info) != 0) {
                 fw_1_dev_lock(vm);
@@ -12284,6 +12893,49 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * one -- the #557 lesson that counters consistent with success are not a verdict.
                  */
                 if (vm->shared_vnet_mapped) {
+                    /*
+                     * #83: advance the NAT clock and sweep expired mappings. Driven off this
+                     * already-time-gated diagnostic rather than a new timer, because the clock only
+                     * has to be monotonic and roughly right in seconds -- the timeouts it feeds are
+                     * 30s, 120s and 3600s.
+                     *
+                     * The sweep is here and not in the packet path so a busy connection never pays
+                     * for a table scan.
+                     */
+                    if (g_fw_1_host_tsc_hz != 0ull) {
+                        unsigned long long now = hype_rdtsc() / g_fw_1_host_tsc_hz;
+                        if (now > g_nat_tick) {
+                            g_nat_tick = now;
+                        }
+                    }
+                    (void)hype_nat_expire(&vm->nat, g_nat_tick);
+                    hype_debug_print("fw-1 NAT vm%u: out=%llu(sent=%llu refused=%llu no_uplink=%llu "
+                                     "not_ipv4=%llu) in=%llu arp_answered=%llu | conns=%u "
+                                     "opened=%llu expired=%llu | drops: frag=%llu bad=%llu "
+                                     "unsup=%llu full=%llu unsolicited=%llu [#83]\n",
+                                     (unsigned)(vm - g_vms), vm->nat.out_translated,
+                                     vm->vnet_out_sent, vm->vnet_out_nat_refused,
+                                     vm->vnet_out_no_uplink, vm->vnet_out_not_ipv4,
+                                     vm->vnet_in_delivered, vm->vnet_arp_answered,
+                                     hype_nat_active(&vm->nat), vm->nat.conns_opened,
+                                     vm->nat.conns_expired, vm->nat.out_dropped_fragment,
+                                     vm->nat.out_dropped_malformed,
+                                     vm->nat.out_dropped_unsupported, vm->nat.out_dropped_no_slot,
+                                     vm->nat.in_dropped_no_mapping);
+                    hype_debug_print("fw-1 PEER vm%u: sent=%llu recv=%llu DENIED=%llu "
+                                     "inbox_full=%llu | onlink_known=%u onlink_dropped=%llu "
+                                     "[#84 #85]\n",
+                                     (unsigned)(vm - g_vms), vm->vnet_peer_sent,
+                                     vm->vnet_peer_recv, vm->vnet_peer_denied,
+                                     vm->vnet_peer_inbox_full,
+                                     (vm->vnet_onlink_count > 8u) ? 8u : vm->vnet_onlink_count,
+                                     vm->vnet_out_onlink_dropped);
+                    hype_debug_print("fw-1 UPLINK: cfg=%d gw_mac=%d arp_req=%llu rx=%llu(arp=%llu "
+                                     "unclaimed=%llu) tx_fail=%llu link=%d [#83]\n",
+                                     g_uplink_configured, g_uplink_gw_mac_known,
+                                     g_uplink_arp_requests, g_uplink_rx_frames, g_uplink_rx_arp,
+                                     g_uplink_rx_unclaimed, g_uplink_tx_fail,
+                                     hype_e1000_ready() ? hype_e1000_link_up() : -1);
                     hype_debug_print("fw-1 VNET vm%u: tx_chains=%llu tx_frames=%llu "
                                      "tx_bad_desc=%llu tx_dropped=%llu | rx_delivered=%llu "
                                      "rx_no_buffer=%llu | NOT FORWARDED (no plane yet)=%llu [#81]\n",
@@ -18148,6 +18800,10 @@ static void load_hype_cfg(void) {
     HYPE_LOGF(HYPE_LOG_INFO, "cfg: loaded \\hype.cfg (%llu bytes) -- %u VM(s)\n",
                      (unsigned long long)sz, g_hype_cfg.vm_count);
 
+    /* #83/#405: the NIC was bound before this point; its ADDRESS could only come from the config
+     * that has just been read. */
+    fw_1_uplink_adopt_config();
+
     /*
      * #222: say when lines were not understood. Unknown keys and sections are now retained rather
      * than fatal (spec §4.1), which is what makes the format extendable -- but silence about them
@@ -21651,16 +22307,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             }
             if (attached) {
                 /*
-                 * #80's bar: prove the driver with a real exchange. Under QEMU user networking the
-                 * host is 10.0.2.2 and the first DHCP address is 10.0.2.15; hype has no DHCP
-                 * client yet (#83's territory), so those are used directly here. On a real
-                 * network they are wrong and the probe simply gets no answer, which is reported
-                 * rather than treated as a driver fault -- and NAT is where hype learns its real
-                 * address.
+                 * #83/#405: adopt the configured uplink address. This is what turns the driver into
+                 * a usable uplink -- NAPT cannot masquerade guests behind a port with no address.
+                 *
+                 * #80's ARP probe used to live here with 10.0.2.x hardcoded, on the argument that
+                 * QEMU user networking always hands out those. It is gone: hype now takes its
+                 * address from `hype.cfg` and the pump resolves the gateway's MAC as part of
+                 * forwarding, so a hardcoded probe would be testing a guess rather than the
+                 * configuration -- and on a real network it tested nothing at all.
                  */
-                static const uint8_t probe_us[4] = {10u, 0u, 2u, 15u};
-                static const uint8_t probe_gw[4] = {10u, 0u, 2u, 2u};
-                (void)hype_e1000_arp_probe(probe_us, probe_gw);
+                /*
+                 * The uplink ADDRESS is adopted later, from fw_1_uplink_adopt_config(), because
+                 * this whole block runs before \hype.cfg has been read. That ordering cost a
+                 * confusing first run: the NIC attached, proxy ARP worked, the guest got its ARP
+                 * reply -- and every packet was dropped with `no_uplink`, because the config the
+                 * address comes from did not exist yet at this point in the boot.
+                 */
+                hype_debug_print("net: e1000 attached and link is %s -- waiting for hype.cfg to "
+                                 "supply an uplink address [#83 #405]\n",
+                                 hype_e1000_link_up() ? "up" : "down");
             }
             if (nic_count == 0u) {
                 hype_debug_print("net: no Ethernet controller found -- networking unavailable, "

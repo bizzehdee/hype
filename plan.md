@@ -2673,6 +2673,73 @@ isn't lost.
     shortage is not urgent enough to justify that before something needs MSI for
     its own sake.
 
+52. **How hype learns a guest's addressing, and how it hands a frame to
+    another VM — decided (2026-08-20), from #83/#84/#85.** Two choices in the
+    forwarding plane that are not obvious from the code and that a later change
+    could quietly undo.
+
+    **hype answers EVERY ARP request a guest sends, with its own MAC (proxy
+    ARP).** Not just requests for a configured gateway address.
+
+    The alternative was for hype to hold each guest's segment address, mask and
+    gateway in `hype.cfg`. Rejected because that configuration would have to
+    stay in step with whatever the guest's own OS was configured with, and would
+    be wrong the first time someone changed it inside the guest — a mismatch
+    whose only symptom is a network that does not work. Proxy ARP removes the
+    question: whatever the guest believes its first hop is, the ARP for it
+    resolves to hype, and every packet arrives here to be routed.
+
+    It also solves the reverse problem. hype has to build an Ethernet header
+    addressed to the guest for every inbound frame, and nothing tells it the
+    guest's MAC. An ARP request carries the sender's MAC and IP together, so the
+    guest's own first ARP teaches hype exactly the pair it needs, before any
+    IPv4 flows.
+
+    **Claiming to be every address is safe here because hype IS the router, not
+    a peer on a shared segment.** Each guest's NIC is alone on its own
+    point-to-point link (§6e's default isolation), so there is no other host
+    whose address hype could be stealing. On a shared L2 segment the same
+    behaviour would be a hijack; on a link with exactly one guest and one router
+    it is the router doing its job. This is a reason the isolation default has to
+    stay: proxy ARP is only correct while it holds.
+
+    **What it cost, and how that was closed.** hype no longer knows the guest's
+    netmask, so it cannot tell an on-link destination from a remote one — and a
+    packet for a guest that has not yet ARPed would fall through to NAPT and go
+    out the physical port with a private destination. So hype also records the
+    addresses each guest ARPS FOR: an ARP request is the guest stating "I believe
+    this is on my link", which is the information a netmask would have given.
+    A destination in that set is forwarded to a peer or dropped, never
+    translated. Without it, whichever of two peers booted first leaked its
+    opening packets to the wire.
+
+    **A frame for another VM goes through a per-VM MAILBOX, never straight into
+    the peer's receive ring.** This is a locking decision, not buffering.
+
+    The transmit path runs with the SENDING VM's device lock held — a guest's
+    MMIO fault took it on the way in. Writing into the peer's receive ring there
+    would mean holding one VM's lock while acquiring another's, and two guests
+    transmitting to each other simultaneously would deadlock both cores. So the
+    sender only ever touches the peer's inbox lock, and the pump — which holds no
+    device lock — copies a frame out under the inbox lock, RELEASES it, and only
+    then takes the target's device lock. **Nothing ever holds an inbox lock and a
+    device lock at the same time**, which removes the cycle rather than making it
+    rarer. A future change that "simplifies" this by delivering directly
+    reintroduces a deadlock that only appears under simultaneous bidirectional
+    traffic.
+
+    The mailbox holds four frames and drops when full, counted. It is a hand-off
+    point, not a queue with a queueing discipline — a real network drops when a
+    buffer fills.
+
+    **hype rewrites the Ethernet source to its own router MAC when forwarding
+    between guests**, rather than passing the sending guest's MAC through. hype
+    is a router between two isolated segments, not a bridge across one: the
+    receiving guest's ARP cache maps its gateway to hype, so a frame from the far
+    guest's MAC would arrive from an address it has no route to — and it would
+    leak the other guest's hardware address across a boundary that exists to keep
+    them apart.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

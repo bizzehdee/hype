@@ -856,7 +856,127 @@ static void test_pool_accounts_for_unconfigured_default_vms(void) {
 }
 
 
+/* ---- hype_adm_vms_are_peers (#84/#85) ---- */
+
+/*
+ * DEFAULT-DENY is the property, so the no-config case is tested first and hardest: two VMs that both
+ * have networking and neither names the other must not be able to reach each other. Guests are never
+ * reachable from one another by accident.
+ */
+static void test_peers_default_deny(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    cfg.vms[0].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[1].net_mode = HYPE_CFG_NET_NAT;
+
+    CHECK_INT("two networked VMs naming nobody are not peers", 0,
+              hype_adm_vms_are_peers(&cfg, 0, 1));
+    CHECK_INT("and it is symmetric", 0, hype_adm_vms_are_peers(&cfg, 1, 0));
+}
+
+/* Listing on EITHER side establishes the pair -- plan.md §6e: "no need to list it on both". */
+static void test_peers_one_sided_listing_is_bidirectional(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    cfg.vms[0].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[1].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[0].net_peers_count = 1;
+    strncpy(cfg.vms[0].net_peers[0], "b", sizeof(cfg.vms[0].net_peers[0]) - 1);
+
+    CHECK_INT("a names b, so a may reach b", 1, hype_adm_vms_are_peers(&cfg, 0, 1));
+    CHECK_INT("and b may reach a WITHOUT naming a", 1, hype_adm_vms_are_peers(&cfg, 1, 0));
+
+    /* The other direction of the same rule. */
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    cfg.vms[0].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[1].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[1].net_peers_count = 1;
+    strncpy(cfg.vms[1].net_peers[0], "a", sizeof(cfg.vms[1].net_peers[0]) - 1);
+    CHECK_INT("b names a, so a may reach b", 1, hype_adm_vms_are_peers(&cfg, 0, 1));
+}
+
+/*
+ * A pairing must not open a third VM. This is the difference between `net_peers` and a shared
+ * broadcast domain, and it is the whole reason §6e keeps the pairwise mechanism.
+ */
+static void test_peers_a_pairing_does_not_include_a_third_vm(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 3;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    make_vm(&cfg.vms[2], "c", 1, 512, "c.img");
+    cfg.vms[0].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[1].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[2].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[0].net_peers_count = 1;
+    strncpy(cfg.vms[0].net_peers[0], "b", sizeof(cfg.vms[0].net_peers[0]) - 1);
+
+    CHECK_INT("a and b are peers", 1, hype_adm_vms_are_peers(&cfg, 0, 1));
+    CHECK_INT("c is not reachable from a", 0, hype_adm_vms_are_peers(&cfg, 0, 2));
+    CHECK_INT("nor from b", 0, hype_adm_vms_are_peers(&cfg, 1, 2));
+    CHECK_INT("nor is a reachable from c", 0, hype_adm_vms_are_peers(&cfg, 2, 0));
+}
+
+/*
+ * A named pair where one end has no networking is not a pair. The startup check refuses that config
+ * (test_net_peers_requires_nat_on_both_sides), but a forwarding decision must not depend on the
+ * check having run -- it is the last thing between a packet and another guest's ring.
+ */
+static void test_peers_requires_networking_on_both_sides(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    cfg.vms[0].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[1].net_mode = HYPE_CFG_NET_NONE; /* named, but has no NIC */
+    cfg.vms[0].net_peers_count = 1;
+    strncpy(cfg.vms[0].net_peers[0], "b", sizeof(cfg.vms[0].net_peers[0]) - 1);
+
+    CHECK_INT("a peer with no NIC is not a peer", 0, hype_adm_vms_are_peers(&cfg, 0, 1));
+}
+
+/* A VM is not its own peer: forwarding a guest's packet back into its own ring is a loop, not
+ * connectivity. And out-of-range indices answer no rather than reading past the array. */
+static void test_peers_self_and_bounds(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    cfg.vms[0].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[1].net_mode = HYPE_CFG_NET_NAT;
+    cfg.vms[0].net_peers_count = 1;
+    strncpy(cfg.vms[0].net_peers[0], "a", sizeof(cfg.vms[0].net_peers[0]) - 1); /* names itself */
+
+    CHECK_INT("a VM naming itself is still not its own peer", 0,
+              hype_adm_vms_are_peers(&cfg, 0, 0));
+    CHECK_INT("an index past vm_count is refused", 0, hype_adm_vms_are_peers(&cfg, 0, 9));
+    CHECK_INT("...either way round", 0, hype_adm_vms_are_peers(&cfg, 9, 0));
+    CHECK_INT("a null config is refused", 0, hype_adm_vms_are_peers(0, 0, 1));
+}
+
 int main(void) {
+    test_peers_default_deny();
+    test_peers_one_sided_listing_is_bidirectional();
+    test_peers_a_pairing_does_not_include_a_third_vm();
+    test_peers_requires_networking_on_both_sides();
+    test_peers_self_and_bounds();
     test_pool_admits_what_fits();
     test_pool_names_the_first_vm_that_does_not_fit();
     test_pool_counts_whole_granules();

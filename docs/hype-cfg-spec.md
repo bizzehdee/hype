@@ -335,8 +335,23 @@ checksums up after rewriting addresses, so advertising an offload hype does not
 do hands the guest a frame the wire rejects. The control queue (and with it
 multiqueue and MAC filtering) is also absent.
 
-Frames leave the guest and are counted; where they go is the forwarding plane's
-decision (NAT, NET-4/#83) and is landing separately.
+**Where frames go (#83/#84/#85).** hype routes them:
+
+| destination | what happens |
+|---|---|
+| an ARP request, for anything | hype answers with its own per-VM router MAC (proxy ARP), and learns this guest's MAC+IP from the request. hype is **never told** the guest's subnet, mask or gateway — whatever the guest is configured with resolves to hype |
+| another VM's address, pair in `net_peers` | forwarded directly between the two isolated segments. Never touches the physical network, so it works on a host with no uplink at all |
+| another VM's address, pair **not** listed | **dropped**, and counted as `DENIED`. This is the default (#84): guests are never reachable from each other by accident |
+| an address the guest ARPed for that no VM owns | dropped. The guest said it believed that address was on its link, so it must not be translated onto the physical network |
+| anything else | NAPT: source address becomes `uplink_ip`, source port or ICMP identifier is rewritten, checksums fixed. Return traffic is matched against the mapping this guest created — nothing else reaches it |
+
+Neither guest needs an address hype knows about. Two guests only have to agree
+with **each other**, which is why the test configs put both on `192.168.77.0/24`
+with no mention of that subnet anywhere in `[hype]`.
+
+The per-VM `fw-1 NAT`, `fw-1 PEER` and `fw-1 UPLINK` log lines report every
+counter above, including each drop reason separately — "NAT dropped it" is not a
+diagnosis.
 
 ### 5.6 `bus` default derivation
 

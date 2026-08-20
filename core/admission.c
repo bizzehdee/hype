@@ -251,6 +251,49 @@ hype_adm_result_t hype_adm_check_net_peers(const hype_cfg_t *cfg) {
     return adm_ok();
 }
 
+/*
+ * NET-4b (#85): may these two VMs exchange traffic directly?
+ *
+ * Lives next to hype_adm_check_net_peers() ON PURPOSE. That function decides whether a `net_peers`
+ * configuration is ACCEPTABLE; this one decides whether a PACKET is allowed. They have to agree
+ * about what "peer" means, and the way to guarantee that is for the rule to exist once.
+ *
+ * The rule (plan.md 6e): listing a peer on EITHER side establishes it bidirectionally -- "no need
+ * to list it on both". So this is symmetric by construction rather than by the caller remembering
+ * to ask twice.
+ *
+ * DEFAULT-DENY, which is #84: an empty or absent `net_peers` means no guest-to-guest connectivity
+ * at all, regardless of `net_mode`. A VM is never reachable from another VM by accident -- it takes
+ * an operator naming it.
+ *
+ * A VM is not its own peer. Returning 1 for a == b would make hype forward a guest's packet back
+ * into its own receive ring, which is not connectivity, it is a loop.
+ */
+int hype_adm_vms_are_peers(const hype_cfg_t *cfg, unsigned int a, unsigned int b) {
+    unsigned int p;
+
+    if (cfg == 0 || a == b || a >= cfg->vm_count || b >= cfg->vm_count) {
+        return 0;
+    }
+    /* Both ends must actually have networking. A `net_peers` entry naming a VM with
+     * `net_mode = none` is refused at startup (hype_adm_check_net_peers), but a forwarding decision
+     * must not depend on that check having run -- it is the last line before a packet moves. */
+    if (cfg->vms[a].net_mode != HYPE_CFG_NET_NAT || cfg->vms[b].net_mode != HYPE_CFG_NET_NAT) {
+        return 0;
+    }
+    for (p = 0; p < cfg->vms[a].net_peers_count; p++) {
+        if (hype_streq(cfg->vms[a].net_peers[p], cfg->vms[b].name)) {
+            return 1;
+        }
+    }
+    for (p = 0; p < cfg->vms[b].net_peers_count; p++) {
+        if (hype_streq(cfg->vms[b].net_peers[p], cfg->vms[a].name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* #329: index of the [disk.*] with this id, or -1. */
 static int disk_by_id(const hype_cfg_t *cfg, const char *id) {
     unsigned int i;

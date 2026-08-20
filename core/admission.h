@@ -113,6 +113,17 @@ hype_adm_result_t hype_adm_check_target_disk(const hype_cfg_t *cfg);
 hype_adm_result_t hype_adm_check_net_peers(const hype_cfg_t *cfg);
 
 /*
+ * NET-4a/4b (#84/#85): may VMs `a` and `b` exchange traffic directly? Symmetric -- listing a peer on
+ * either side establishes the pair bidirectionally (plan.md 6e). Returns 0 for anything not
+ * explicitly configured, which is #84's default-deny, and 0 for a == b.
+ *
+ * Deliberately alongside hype_adm_check_net_peers(): that decides whether a CONFIG is acceptable,
+ * this decides whether a PACKET is allowed, and the two must not be able to disagree about what a
+ * peer is.
+ */
+int hype_adm_vms_are_peers(const hype_cfg_t *cfg, unsigned int a, unsigned int b);
+
+/*
  * #323: resolves a VM's media_disk (which host drive its install_media
  * lives on) against the drives host discovery actually enumerated.
  * dev_serials[i] is drive i's serial/GUID, or 0/"" for a drive that
