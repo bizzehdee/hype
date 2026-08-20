@@ -5822,6 +5822,17 @@ static unsigned int fw_1_uplink_pump(hype_vmm_kind_t kind) {
                 if (!tv->shared_vnet_mapped || !tv->vnet_guest_known) {
                     continue;
                 }
+                /*
+                 * ASK WITHOUT SIDE EFFECTS FIRST. Using translate_inbound() to search counted a
+                 * miss against every VM that was asked and was not the owner: on a two-guest run
+                 * vm0's "unsolicited" read 46 when the true number was 0, because every frame
+                 * belonging to vm1 was counted against vm0 on the way past. That number is a
+                 * SECURITY signal -- unsolicited inbound is what default-deny refuses -- and one
+                 * inflated by hype's own search order cannot be read as one.
+                 */
+                if (!hype_nat_owns_inbound(&tv->nat, frame + HYPE_ETH_HDR_LEN, pkt_len)) {
+                    continue;
+                }
                 if (pkt_len + HYPE_ETH_HDR_LEN > sizeof(out)) {
                     break;
                 }
@@ -5830,6 +5841,8 @@ static unsigned int fw_1_uplink_pump(hype_vmm_kind_t kind) {
                 }
                 if (hype_nat_translate_inbound(&tv->nat, out + HYPE_ETH_HDR_LEN, pkt_len, who,
                                                g_nat_tick) != 0) {
+                    /* The predicate said yes, so this cannot fail -- one lookup backs both. Counted
+                     * rather than ignored, because if it ever does the two have diverged. */
                     continue;
                 }
                 eth_build(out, tv->vnet_guest_mac, tv->vnet_router_mac, 0x0800u);

@@ -150,6 +150,24 @@ int hype_nat_translate_outbound(hype_nat_t *nat, uint8_t *pkt, unsigned int len,
 int hype_nat_translate_inbound(hype_nat_t *nat, uint8_t *pkt, unsigned int len,
                                uint8_t out_guest_ip[4], unsigned long long tick);
 
+/*
+ * Does this table have a mapping for this inbound packet? No side effects, no counters, no rewriting.
+ *
+ * FOR CALLERS THAT MUST ASK SEVERAL TABLES. With one uplink address, finding which guest a reply
+ * belongs to means asking each VM in turn -- and using translate_inbound() to ask counted a miss
+ * against every VM that was asked and was not the owner. On a two-guest run that made vm0's
+ * "unsolicited" read 46 when the true number was 0: every frame belonging to vm1 was counted as
+ * unsolicited traffic against vm0 on the way past.
+ *
+ * That mattered because `in_dropped_no_mapping` is a SECURITY signal -- unsolicited inbound traffic
+ * is what default-deny is refusing -- and a number inflated by hype's own search order cannot be
+ * read as one. The host-level count of frames no VM claimed is the honest figure and the pump keeps
+ * it separately.
+ *
+ * Returns 1 if this table owns the packet, 0 otherwise (including malformed or untranslatable).
+ */
+int hype_nat_owns_inbound(const hype_nat_t *nat, const uint8_t *pkt, unsigned int len);
+
 /* Drops mappings idle past their protocol's timeout. Called from the dispatch loop; separate from
  * translation so a busy path never pays for a table sweep. Returns how many were dropped. */
 unsigned int hype_nat_expire(hype_nat_t *nat, unsigned long long tick);

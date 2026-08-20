@@ -406,6 +406,56 @@ int hype_nat_translate_outbound(hype_nat_t *nat, uint8_t *pkt, unsigned int len,
     return 0;
 }
 
+/*
+ * The inbound lookup, shared by the predicate and the translation so the two cannot disagree about
+ * what "owns" means. Returns the matching entry or 0. `nat` is const-cast away by the translating
+ * caller, which is the only one that mutates.
+ */
+static hype_nat_conn_t *lookup_inbound(const hype_nat_t *nat, const uint8_t *pkt, unsigned int len) {
+    ipv4_view_t v;
+    unsigned int id_off;
+    int csum_off;
+    int pseudo;
+    unsigned int i;
+    uint16_t xlate_id;
+    uint16_t remote_id;
+
+    if (nat == 0) {
+        return 0;
+    }
+    /* parse_ipv4 takes a mutable pointer because its callers rewrite through the view; nothing here
+     * writes, so the cast is safe and keeps one parser rather than two. */
+    if (parse_ipv4((uint8_t *)pkt, len, &v) != 0) {
+        return 0;
+    }
+    if (l4_layout(v.proto, v.l4, v.l4_len, &id_off, &csum_off, &pseudo) != 0) {
+        return 0;
+    }
+    xlate_id = (v.proto == HYPE_IPV4_PROTO_ICMP) ? rd16be(v.l4 + 4u) : rd16be(v.l4 + 2u);
+    remote_id = (v.proto == HYPE_IPV4_PROTO_ICMP) ? 0u : rd16be(v.l4 + 0u);
+
+    for (i = 0; i < HYPE_NAT_MAX_CONN; i++) {
+        const hype_nat_conn_t *k = &nat->conn[i];
+        if (!k->in_use || k->proto != v.proto || k->xlate_id != xlate_id) {
+            continue;
+        }
+        /*
+         * The SOURCE must be the host this mapping was created towards. Without this check any host
+         * on the internet could reach a guest by guessing a translated port, which would make
+         * "outbound plus established return" mean "outbound plus whatever anyone sends".
+         */
+        if (!ip_eq(k->remote_ip, v.src) || k->remote_id != remote_id) {
+            continue;
+        }
+        return (hype_nat_conn_t *)k;
+    }
+    return 0;
+}
+
+int hype_nat_owns_inbound(const hype_nat_t *nat, const uint8_t *pkt, unsigned int len) {
+    return (lookup_inbound(nat, pkt, len) != 0) ? 1 : 0;
+}
+
 int hype_nat_translate_inbound(hype_nat_t *nat, uint8_t *pkt, unsigned int len,
                                uint8_t out_guest_ip[4], unsigned long long tick) {
     ipv4_view_t v;
@@ -439,25 +489,7 @@ int hype_nat_translate_inbound(hype_nat_t *nat, uint8_t *pkt, unsigned int len,
     xlate_id = (v.proto == HYPE_IPV4_PROTO_ICMP) ? rd16be(v.l4 + 4u) : rd16be(v.l4 + 2u);
     remote_id = (v.proto == HYPE_IPV4_PROTO_ICMP) ? 0u : rd16be(v.l4 + 0u);
 
-    for (i = 0; i < HYPE_NAT_MAX_CONN; i++) {
-        hype_nat_conn_t *k = &nat->conn[i];
-        if (!k->in_use || k->proto != v.proto || k->xlate_id != xlate_id) {
-            continue;
-        }
-        /*
-         * The SOURCE must be the host this mapping was created towards. Without this check any host
-         * on the internet could reach a guest by guessing a translated port, which would make
-         * "outbound plus established return" mean "outbound plus whatever anyone sends".
-         */
-        if (!ip_eq(k->remote_ip, v.src)) {
-            continue;
-        }
-        if (k->remote_id != remote_id) {
-            continue;
-        }
-        c = k;
-        break;
-    }
+    c = lookup_inbound(nat, pkt, len);
     if (c == 0) {
         /* Unsolicited. The ordinary case for background internet noise, so it is counted and
          * dropped rather than reported as a fault. */

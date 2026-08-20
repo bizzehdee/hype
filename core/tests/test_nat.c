@@ -799,6 +799,68 @@ static void test_address_compare_checks_every_octet(void) {
               hype_nat_translate_inbound(&nat, pkt, len, 0, 2ull));
 }
 
+/*
+ * THE OWNERSHIP PREDICATE, which exists because using the translation to search inflated a security
+ * counter. With one uplink address, finding which guest a reply belongs to means asking each VM's
+ * table in turn -- and asking with translate_inbound() counted a miss against every VM that was not
+ * the owner. On a two-guest run vm0's "unsolicited" read 46 when the true number was 0.
+ *
+ * So: asking must be free of side effects, and it must agree exactly with the translation.
+ */
+static void test_owns_inbound_has_no_side_effects_and_agrees(void) {
+    hype_nat_t nat_a;
+    hype_nat_t nat_b;
+    uint8_t pkt[128];
+    uint8_t copy[128];
+    unsigned int len;
+    uint16_t xb;
+    unsigned int i;
+
+    (void)hype_nat_reset(&nat_a, 0u);
+    (void)hype_nat_reset(&nat_b, 1u);
+
+    /* VM 1 makes a mapping. */
+    len = build(pkt, HYPE_IPV4_PROTO_UDP, GUEST_IP, REMOTE_IP, 5353u, 53u, 0, 0);
+    (void)hype_nat_translate_outbound(&nat_b, pkt, len, OUR_IP, 1ull);
+    xb = get16(pkt + 20);
+
+    /* The reply, as it arrives from the wire. */
+    len = build(pkt, HYPE_IPV4_PROTO_UDP, REMOTE_IP, OUR_IP, 53u, xb, 0, 0);
+    for (i = 0; i < len; i++) {
+        copy[i] = pkt[i];
+    }
+
+    /* Asking the WRONG table must change nothing at all: no counter, no packet bytes. */
+    CHECK_HEX("VM 0 does not own it", 0, hype_nat_owns_inbound(&nat_a, pkt, len));
+    CHECK_HEX("and asking did NOT count an unsolicited packet", 0, nat_a.in_dropped_no_mapping);
+    CHECK_HEX("nor any inbound translation", 0, nat_a.in_translated);
+    for (i = 0; i < len; i++) {
+        CHECK_HEX("the packet was not modified by asking", copy[i], pkt[i]);
+    }
+
+    /* Asking the right one agrees with what translating does. */
+    CHECK_HEX("VM 1 owns it", 1, hype_nat_owns_inbound(&nat_b, pkt, len));
+    CHECK_HEX("and asking still counted nothing", 0, nat_b.in_dropped_no_mapping);
+    CHECK_HEX("translating it now succeeds", 0,
+              hype_nat_translate_inbound(&nat_b, pkt, len, 0, 2ull));
+    CHECK_HEX("and THAT counted", 1, nat_b.in_translated);
+
+    /* Malformed and untranslatable packets are simply not owned -- never a crash, never a count. */
+    CHECK_HEX("a null table owns nothing", 0, hype_nat_owns_inbound(0, pkt, len));
+    CHECK_HEX("a null packet is not owned", 0, hype_nat_owns_inbound(&nat_b, 0, len));
+    CHECK_HEX("a truncated frame is not owned", 0, hype_nat_owns_inbound(&nat_b, pkt, 8u));
+    len = build(pkt, HYPE_IPV4_PROTO_UDP, REMOTE_IP, OUR_IP, 53u, xb, 0, 0);
+    pkt[9] = 47u; /* GRE: no translatable identifier */
+    CHECK_HEX("an unsupported protocol is not owned", 0, hype_nat_owns_inbound(&nat_b, pkt, len));
+    CHECK_HEX("and none of that counted anything", 0, nat_b.in_dropped_no_mapping);
+
+    /* A definitive miss -- a caller that translates without asking -- still counts, because that is
+     * a genuinely unsolicited packet and the signal has to survive. */
+    len = build(pkt, HYPE_IPV4_PROTO_UDP, REMOTE_IP, OUR_IP, 53u, 60000u, 0, 0);
+    CHECK_HEX("refused", -1, hype_nat_translate_inbound(&nat_b, pkt, len, 0, 3ull));
+    CHECK_HEX("and counted as unsolicited", 1, nat_b.in_dropped_no_mapping);
+}
+
 int main(void) {
     test_checksum_known_value();
     test_udp_round_trip();
@@ -809,6 +871,7 @@ int main(void) {
     test_two_guests_get_disjoint_port_slices();
     test_all_slices_are_disjoint();
     test_a_vm_past_the_limit_gets_no_nat();
+    test_owns_inbound_has_no_side_effects_and_agrees();
     test_fragments_are_dropped_with_their_own_reason();
     test_malformed_packets_are_refused();
     test_unsupported_protocols_are_dropped();
