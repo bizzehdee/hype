@@ -58,7 +58,20 @@ typedef struct {
 } hype_smbios_layout_t;
 
 typedef struct {
+    /*
+     * Guest-visible LOGICAL CPUs -- the same number CPUID leaf 0xB/0x1F is told, so the two
+     * guest-visible topology surfaces cannot disagree.
+     */
     uint32_t cpu_count;
+    /*
+     * #562: SMT threads per core this VM was granted, from the placement that also feeds
+     * vmm_set_topology(). 0 is read as 1 (no SMT).
+     *
+     * The CORE count is DERIVED from these two rather than passed in. That is deliberate: a third
+     * field could disagree with the first two, and computing one guest's topology twice from two
+     * places is exactly what #559, #560 and #561 each were.
+     */
+    uint32_t threads_per_core;
     uint64_t ram_bytes;
 } hype_smbios_config_t;
 

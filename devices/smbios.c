@@ -64,6 +64,15 @@ int hype_smbios_build(const hype_smbios_config_t *cfg, uint8_t *anchor, uint32_t
     if (cfg->cpu_count == 0u) {
         return -1;
     }
+    /*
+     * #562: threads_per_core must divide the logical CPU count, or the core count derived below is
+     * a fiction. 0 means "not stated" and is read as 1; anything else that does not divide is a
+     * caller bug and is refused rather than rounded, since a rounded topology is the kind of
+     * almost-right table that gets believed.
+     */
+    if (cfg->threads_per_core > 1u && (cfg->cpu_count % cfg->threads_per_core) != 0u) {
+        return -1;
+    }
     for (i = 0; i < tables_size; i++) {
         tables[i] = 0;
     }
@@ -118,12 +127,41 @@ int hype_smbios_build(const hype_smbios_config_t *cfg, uint8_t *anchor, uint32_t
         off = end_strings(tables, off);
     }
 
-    /* Type 4 -- Processor Information, one per vCPU hype actually provides. */
-    for (i = 0; i < cfg->cpu_count; i++) {
+    /*
+     * Type 4 -- Processor Information. ONE structure, per SOCKET (#562).
+     *
+     * This used to emit one per vCPU, each declaring a single single-threaded core -- so a 2-vCPU
+     * guest was described as two sockets of one thread each, contradicting CPUID leaf 0xB/0x1F and
+     * 0x8000001E, which report this VM's real threads_per_core. Worse, the only caller passed
+     * cpu_count = 1 unconditionally, so EVERY guest was described as a single-core single-thread
+     * machine whatever its `vcpus` said, and `dmidecode -t 4` disagreed with `lscpu` in the guest.
+     *
+     * One socket is what hype can honestly claim: it does not track which host package a VM's
+     * cores came from, and inventing a socket split would be a second fiction. The core and thread
+     * counts are the real ones.
+     */
+    {
+        uint32_t tpc = cfg->threads_per_core ? cfg->threads_per_core : 1u;
+        /*
+         * cores cannot be 0: the guard above rejects a tpc > 1 that does not divide cpu_count, so
+         * cpu_count >= tpc whenever tpc > 1, and cpu_count >= 1 always. No clamp for it -- an
+         * unreachable branch is dead code that reads as a real case.
+         */
+        uint32_t cores = cfg->cpu_count / tpc;
+        uint32_t threads = cfg->cpu_count;
+        /* SMBIOS 2.x's core/thread fields are single BYTES. Saturating is the spec's own answer
+         * (3.0 adds 16-bit counts at offset 0x2A, which this 0x2A-length structure does not
+         * reach), and it beats letting the cast wrap: 256 threads would otherwise report as 0. */
+        if (cores > 255u) {
+            cores = 255u;
+        }
+        if (threads > 255u) {
+            threads = 255u;
+        }
         uint8_t *p = tables + off;
         p[0] = HYPE_SMBIOS_TYPE_PROCESSOR;
         p[1] = 0x2A;
-        put_le16(p + 2, (uint16_t)(0x0400u + i));
+        put_le16(p + 2, 0x0400u); /* one socket, so one fixed handle */
         p[4] = 1;    /* Socket Designation */
         p[5] = 0x03; /* Processor Type: Central Processor */
         p[6] = 0x02; /* Family: Unknown -- hype passes the host's CPUID through,
@@ -145,17 +183,13 @@ int hype_smbios_build(const hype_smbios_config_t *cfg, uint8_t *anchor, uint32_t
         p[33] = 0; /* Asset tag */
         p[34] = 0; /* Part number */
         /*
-         * One socket per vCPU, each declaring a single single-threaded core. That was exact
-         * while a vCPU cost a whole core; since #560 a VM's vCPUs may be SMT siblings of one
-         * core, and CPUID now reports that truthfully -- so these three bytes can disagree with
-         * CPUID leaf 0xB/0x1F. Tracked separately (#562) rather than changed here: Linux takes
-         * its topology from CPUID and ACPI, not SMBIOS, so this is a reporting inconsistency
-         * and not a wrong topology, and correcting it means restructuring Type 4 to be
-         * per-socket with real core/thread counts.
+         * #562: the real counts. Per plan.md §10 decision 47 a granted core is granted WHOLE, so
+         * the guest sees cores * threads_per_core logical CPUs -- cpu_count already IS that
+         * product, which is why cores divides out of it.
          */
-        p[35] = 1; /* Core count */
-        p[36] = 1; /* Cores enabled */
-        p[37] = 1; /* Thread count */
+        p[35] = (uint8_t)cores;   /* Core count */
+        p[36] = (uint8_t)cores;   /* Cores enabled */
+        p[37] = (uint8_t)threads; /* Thread count */
         put_le16(p + 38, 0x0004); /* Characteristics: 64-bit capable */
         put_le16(p + 40, 0x0002); /* Family 2: Unknown, per byte 6 */
         off += 0x2A;

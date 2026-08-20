@@ -9820,7 +9820,14 @@ static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
         hype_smbios_config_t sm_cfg;
         hype_smbios_layout_t sm_lay;
 
-        sm_cfg.cpu_count = 1u;
+        /*
+         * #562: the REAL topology, from the same per-VM placement that feeds vmm_set_topology()
+         * -- not a constant. This was `1u`, so every guest's Type 4 said one single-threaded core
+         * whatever its `vcpus` was, and `dmidecode -t 4` disagreed with `lscpu`. The core count is
+         * derived inside the builder from these two so the number cannot be computed twice.
+         */
+        sm_cfg.cpu_count = fw_1_guest_visible_vcpus(vm);
+        sm_cfg.threads_per_core = vm->threads_per_core ? vm->threads_per_core : 1u;
         sm_cfg.ram_bytes = vm->ram_bytes;
         if (hype_smbios_build(&sm_cfg, smbios_anchor, (uint32_t)sizeof(smbios_anchor),
                               smbios_tables, (uint32_t)sizeof(smbios_tables), &sm_lay) != 0 ||
