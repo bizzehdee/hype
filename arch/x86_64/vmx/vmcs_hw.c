@@ -55,10 +55,11 @@
  * moment run_fw_1_test() dispatches each VM to its own AP: two cores would share
  * one VMCS.
  *
- * Sized for the CONCURRENT guests. The sequential self-test battery allocates
- * first, so hype_vmx_vcpu_pool_reset() hands the slots back before the concurrent
- * guests are created -- without that the battery drains the pool and the real VMs
- * both clamp to the same slot, which is #237 exactly.
+ * Sized for the CONCURRENT guests, and #551 removed the only thing that ever
+ * needed slots handed back: the in-binary self-test battery allocated ahead of
+ * the real VMs and drained the pool, so both clamped to one slot (#237). With
+ * the battery gone (#534) slots are handed out monotonically and never returned
+ * within a boot, so every live vCPU has its own.
  */
 /* #412 step 2: VMX per-vCPU pools are runtime-allocated and sized to the VM
  * count (hype_vmx_vcpu_pool_alloc), not fixed arrays -- so N VMs get N distinct
@@ -396,16 +397,6 @@ static unsigned vmx_alloc_slot(void) {
                      "if these guests never run concurrently (see #237/#245)\n",
                      g_vmx_pool_n, slot, g_vmx_pool_n - 1u);
     return g_vmx_pool_n - 1u;
-}
-
-/*
- * #271: hand every slot back. The pool is sized for the concurrent guests; the
- * battery runs strictly earlier and strictly sequentially, so resetting once it
- * finishes restores the invariant the pool was designed around. Mirrors
- * hype_svm_vcpu_pool_reset(). Not for use while any vCPU is live.
- */
-void hype_vmx_vcpu_pool_reset(void) {
-    __atomic_store_n(&g_vmx_vcpu_count, 0u, __ATOMIC_SEQ_CST);
 }
 
 /*
@@ -891,11 +882,13 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     rc |= vmwrite(HYPE_VMCS_EXCEPTION_BITMAP, 0);
 
     /*
-     * #273: tag this guest, then flush the tag. The flush matters because the
-     * VPID comes from a POOL SLOT, so a slot recycled after
-     * hype_vmx_vcpu_pool_reset() hands the new guest its predecessor's VPID; the
-     * automatic every-entry flush that made VPID 0 safe is exactly what enabling
-     * this control gives up.
+     * #273: tag this guest, then flush the tag. Enabling VPID gives up the
+     * automatic every-entry flush that made VPID 0 safe, so a stale translation
+     * carrying this tag would be used. Today no slot is ever recycled within a
+     * boot (#551 removed the pool reset), so the flush is belt-and-braces -- it
+     * stays because it becomes load-bearing again the moment slot reuse does,
+     * which VM start/stop (M8) will introduce, and a missing flush there is a
+     * guest reading another guest's memory rather than a visible failure.
      */
     /*
      * Record the EFFECTIVE tag for this slot -- the value the hardware will use,

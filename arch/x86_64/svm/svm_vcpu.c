@@ -229,8 +229,9 @@ static unsigned svm_alloc_vcpu_slot(void) {
     }
     /*
      * #237: exhaustion used to clamp SILENTLY, which is how this bug hid. The
-     * clamp is only safe for guests that run strictly sequentially (the
-     * self-test battery); if two CONCURRENT vCPUs ever land on one slot they
+     * clamp is only safe for guests that run strictly sequentially, and since
+     * #534 retired the in-binary battery NOTHING here does: every VM is
+     * concurrent. If two CONCURRENT vCPUs ever land on one slot they
      * VMRUN the same VMCB and ctx from two cores, and the second guest reads
      * garbage -- the exact corruption the atomic above exists to prevent.
      * Nothing downstream can detect that, so say it loudly here.
@@ -239,24 +240,6 @@ static unsigned svm_alloc_vcpu_slot(void) {
                      "if these guests never run concurrently (see #237)\n",
                      g_svm_pool_n, slot, g_svm_pool_n - 1u);
     return g_svm_pool_n - 1u;
-}
-
-/*
- * #237: hands every slot back. The pool is sized for the CONCURRENT guests
- * (one per VM), and the comment above is right that the sequential self-test
- * guests can safely share the last slot among themselves -- but only if they
- * do not consume the concurrent VMs' slots on the way. With the battery
- * enabled they allocate first, so by the time vm0 and vm1 create their vCPUs
- * the counter is already >= HYPE_SVM_MAX_VCPUS and BOTH clamp to the same
- * slot: two cores, one VMCB. That is #237, and on real AMD hardware it wedges
- * the whole machine rather than panicking.
- *
- * The battery runs strictly before, and strictly sequentially with respect to,
- * the concurrent guests, so resetting once it finishes restores exactly the
- * invariant the pool was designed around. Not for use while any vCPU is live.
- */
-void hype_svm_vcpu_pool_reset(void) {
-    __atomic_store_n(&g_vcpu_count, 0u, __ATOMIC_SEQ_CST);
 }
 
 /* AMD SDM: 12KB I/O permission map, 8KB MSR permission map -- VMRUN

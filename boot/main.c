@@ -109,15 +109,9 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #include "../devices/e820.h"
 #include "../devices/vt_filter.h"
 
-/* RT-2c: run the M2-M5/VIDEO/INPUT regression self-test guests before the
- * FW-1 Alpine guest? 0 = skip (a normal boot goes straight to Alpine -- less
- * startup time + log clutter); 1 = run the suite (after touching the VM-exit
- * core). The machinery they check is HW-proven, so off by default.
- * #ifndef-guarded so -DHYPE_RUN_SELFTEST_GUESTS=1 on the build line wins (used
- * to validate VMX-2's microtest port on the Intel box). */
-#ifndef HYPE_RUN_SELFTEST_GUESTS
-#define HYPE_RUN_SELFTEST_GUESTS 0
-#endif
+/* #551: HYPE_RUN_SELFTEST_GUESTS is gone with the battery it gated. Running the regression suite
+ * is `tools/micro/run-micro.sh`, or a hype.cfg with a `boot = kernel` VM per test -- neither
+ * needs a rebuild, which is what the flag existed to avoid. */
 
 /*
  * HYPE_USB_PROBE: build a single-purpose diagnostic image that halts right after
@@ -238,8 +232,15 @@ int hype_vmx_smoke_test(void);
 #ifndef HYPE_209_NVME_WRITE
 #define HYPE_209_NVME_WRITE 0
 #endif
-/* Set by the #209 read sweep. The write half refuses without it -- see its own comment. */
+/* Set by the #209 read sweep. The write half refuses without it -- see its own comment.
+ *
+ * Guarded because both the write and the read of it sit inside `#if HYPE_209_NVME_PROBE`, which is
+ * off by default -- so in every ordinary build this was a variable nothing touched, and it was the
+ * one -Wunused-variable warning the tree carried. A diagnostic's storage belongs inside the same
+ * gate as the diagnostic. */
+#if HYPE_209_NVME_PROBE
 static int g_209_reads_passed;
+#endif
 #ifndef HYPE_209_EXPECT_SERIAL
 #define HYPE_209_EXPECT_SERIAL ""
 #endif
@@ -548,8 +549,9 @@ static uint64_t g_m2_7_guest_stack_top_phys;
 /* M8-0a: the FW-1 guest only ever maps the low 4 GiB of guest-physical space
  * (1 GiB RAM at 0, the OVMF flash window just under 4 GiB, everything between
  * left not-present so MMIO/stray accesses take a located NPF). So each VM's
- * own NPT needs just 4 page-directory tables -- ~24 KiB/VM, vs. the 64-entry
- * shared g_npt_pd the (gated-off) self-test guests still use. */
+ * own NPT needs just 4 page-directory tables -- ~24 KiB/VM. It used to be contrasted here with a
+ * 64-entry shared page directory the in-binary self-test guests built in; #551 deleted both those
+ * guests and that array, so a per-VM NPT is now the only kind there is. */
 #define HYPE_FW_1_NPT_GB 4u
 
 /*
@@ -1216,7 +1218,7 @@ static void fw_1_reset_all_lapics(hype_fw_vm_t *vmp) {
  * run, and SMP-6 is what raises HYPE_SMP_STARTABLE_VCPUS.
  */
 /* #ifndef-guarded so -DHYPE_SMP_STARTABLE_VCPUS=N on the build line wins, the same knob shape
- * HYPE_FW_1_GUEST_RAM_MB and HYPE_SELFTEST_LIMIT use. That is how SMP-4's INIT/SIPI path was
+ * HYPE_FW_1_GUEST_RAM_MB used. That is how SMP-4's INIT/SIPI path was
  * exercised before SMP-6 could dispatch the AP it starts. */
 #ifndef HYPE_SMP_STARTABLE_VCPUS
 #define HYPE_SMP_STARTABLE_VCPUS 1u
@@ -1462,7 +1464,6 @@ static uint64_t g_view_switch_started_tsc;
 static unsigned g_view_switch_passes;
 static int g_view_switch_pending_view = -2;
 /* Number of VMs the operator can cycle through (mirrors HYPE_RUN_TWO_VMS). */
-#define HYPE_TERM_NVMS (HYPE_RUN_TWO_VMS ? 2 : 1)
 /* M8-6: seconds a guest gets to reach ACPI S5 after a shutdown request before
  * hype escalates to a forced power-off. */
 #define HYPE_FW_1_SHUTDOWN_GRACE_S 10ull
@@ -3216,7 +3217,6 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * guest stays idle for HYPE_FW_1_KEY_WAIT_EXITS total VM-exits after the
  * key, it didn't consume it on a ConIn source we feed -- don't claim it
  * advanced. */
-#define HYPE_FW_1_KEY_REARM_INTERVAL 256ULL /* re-arm the scancode every N exits (leaves OBF-clear windows) */
 #define HYPE_FW_1_KEY_WAIT_EXITS 20000ULL   /* give up waiting for a reaction after this many exits post-key */
 /* FW-1g: inject a key once the guest has done this many *consecutive*
  * empty keyboard status polls -- an interactive prompt busy-waiting for
@@ -3254,31 +3254,13 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
 static uint8_t g_262_good_id[512];
 static int g_262_good_id_valid = 0;
 
-static hype_pte_t g_npt_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
-static hype_pte_t g_npt_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
-static hype_pte_t g_npt_pd[HYPE_NPT_MAX_GB][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
-
-/* M3-5: guest identity page tables (the GUEST's own CR3) for the
- * long-mode Linux boot-protocol test guest -- distinct from both the
- * host's own paging (g_pml4 etc.) and NPT (g_npt_pml4 etc.): the
- * Linux boot protocol requires paging already enabled at 64-bit
- * entry, with the kernel/zero-page/stack range identity-mapped.
- * Reuses hype_paging_build_identity() directly (arch/x86_64/cpu/
- * paging.h) -- a ring-0-only guest CR3 needs no User/Supervisor bit,
- * unlike NPT (arch/x86_64/svm/npt.h).
- *
- * Tied to HYPE_PAGING_MAX_GB, not a separate smaller constant, for the
- * same real-hardware reason as HYPE_NPT_MAX_GB (arch/x86_64/svm/npt.h)
- * -- a 4GB-only map left this guest's own entry point (a static buffer
- * in the same image) unmapped and immediately triple-faulting
- * (VMEXIT_SHUTDOWN) the first time this ran on real AMD hardware whose
- * firmware happened to load the image above 4GB, something QEMU's own
- * small test VMs never exercised. */
-#define HYPE_M3_5_GUEST_PAGING_GB HYPE_PAGING_MAX_GB
-static hype_pte_t g_guest_pml4[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
-static hype_pte_t g_guest_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
-static hype_pte_t g_guest_pd[HYPE_M3_5_GUEST_PAGING_GB][HYPE_PAGING_ENTRIES_PER_TABLE]
-    __attribute__((aligned(4096)));
+/*
+ * #551: the SHARED host-side NPT and guest-CR3 page tables that the in-binary test guests built
+ * their address spaces in are gone with them -- six 4 KiB-aligned arrays, two of them
+ * HYPE_PAGING_MAX_GB (64) page directories each, so 528 KiB of BSS that no live path had
+ * referenced since the last test guest was ported. Every real VM builds its own NPT sized to
+ * HYPE_FW_1_NPT_GB (see that constant) from its own per-VM allocation.
+ */
 
 /*
  * M3-5: a synthetic, hand-built "bzImage" -- a real setup_header
@@ -3289,11 +3271,6 @@ static hype_pte_t g_guest_pd[HYPE_M3_5_GUEST_PAGING_GB][HYPE_PAGING_ENTRIES_PER_
  * paging, long-mode VMCB, IOIO intercept -> device stubs) actually
  * works, before attempting a real, unpredictable kernel.
  */
-static uint8_t g_m3_5_bzimage[4096] __attribute__((aligned(4096)));
-static uint8_t g_m3_5_guest_stack[8192] __attribute__((aligned(4096)));
-static hype_linux_boot_params_t g_m3_5_zero_page __attribute__((aligned(4096)));
-static hype_pic_emu_t g_m3_5_pic;
-static hype_pit_emu_t g_m3_5_pit;
 
 /*
  * The hand-written payload standing in for a kernel's 64-bit entry
@@ -3311,16 +3288,6 @@ static hype_pit_emu_t g_m3_5_pit;
  * (register-implicit MOV/IN/OUT/HLT forms -- no ModRM/SIB byte
  * complexity anywhere in this sequence).
  */
-static const uint8_t g_m3_5_payload[] = {
-    0xB0, 0xFF,             /* mov al, 0xff */
-    0xE6, 0x21,             /* out 0x21, al -- PIC: mask all IRQs */
-    0xB0, 0x00,             /* mov al, 0x00 */
-    0xE6, 0x43,             /* out 0x43, al -- PIT: latch channel 0 */
-    0xE4, 0x40,             /* in al, 0x40  -- PIT: read latched lobyte */
-    0xE4, 0x40,             /* in al, 0x40  -- PIT: read latched hibyte */
-    0xF4,                   /* hlt */
-    0xEB, 0xFD              /* jmp $-3 (back to hlt, belt-and-braces) */
-};
 
 /*
  * M4-3: dedicated backing store + device state for the emulated CFI
@@ -3329,10 +3296,6 @@ static const uint8_t g_m3_5_payload[] = {
  * real persistence to a host file is explicitly deferred (M5's disk
  * driver doesn't exist yet -- see the M4-3 ticket).
  */
-static uint8_t g_m4_3_pflash_backing[4096] __attribute__((aligned(4096)));
-static hype_pflash_t g_m4_3_pflash;
-static uint8_t g_m4_3_guest_code[4096] __attribute__((aligned(4096)));
-static uint8_t g_m4_3_guest_stack[4096] __attribute__((aligned(4096)));
 
 /* Guest-physical address the emulated flash is mapped at: 3GB,
  * comfortably inside the NPT/guest identity map this test guest reuses
@@ -3346,7 +3309,6 @@ static uint8_t g_m4_3_guest_stack[4096] __attribute__((aligned(4096)));
  * software-emulated from there -- the underlying "physical" address is
  * never actually touched), it does not matter whether QEMU's
  * configured RAM even reaches 3GB. */
-#define HYPE_M4_3_PFLASH_GPA (3ULL * HYPE_PAGING_1GB)
 
 /*
  * M4-3's hand-written MMIO test payload: issues a real CFI WRITE_BYTE
@@ -3381,33 +3343,11 @@ static uint8_t g_m4_3_guest_stack[4096] __attribute__((aligned(4096)));
  *   hlt                  F4
  *   jmp $-3              EB FD  (belt-and-braces, matching M3-5's payload)
  */
-static const uint8_t g_m4_3_payload_template[] = {
-    0x48, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB0, 0x10,
-    0x88, 0x03,
-    0xB0, 0xAB,
-    0x88, 0x03,
-    0x8A, 0x0B,
-    0xB0, 0x10,
-    0x88, 0x02,
-    0x88, 0x0A,
-    0xF4,
-    0xEB, 0xFD
-};
-#define HYPE_M4_3_PAYLOAD_RBX_IMM_OFFSET 2
-#define HYPE_M4_3_PAYLOAD_RDX_IMM_OFFSET 12
 
 /* Writes `value` little-endian into dst[0..7] -- avoids an unaligned
  * uint64_t* store (dst is not necessarily 8-byte aligned within the
  * guest code buffer), matching this file's existing byte-at-a-time
  * conventions elsewhere. */
-static void hype_write_le64(unsigned char *dst, uint64_t value) {
-    int i;
-    for (i = 0; i < 8; i++) {
-        dst[i] = (unsigned char)(value >> (8 * i));
-    }
-}
 
 /* Same as hype_write_le64() above, but for a 4-byte immediate slot --
  * NOT interchangeable with it: calling the 8-byte version against a
@@ -3421,10 +3361,6 @@ static void hype_write_le32(unsigned char *dst, uint32_t value) {
 
 /* Same as hype_write_le32() above, but for a 2-byte field -- used for
  * virtq_desc's own 16-bit flags/next fields (M5-1). */
-static void hype_write_le16(unsigned char *dst, uint16_t value) {
-    dst[0] = (unsigned char)(value & 0xFFu);
-    dst[1] = (unsigned char)((value >> 8) & 0xFFu);
-}
 
 /* M4-6b1: the real host TSC, for driving the guest timebase from real
  * elapsed time rather than one tick per VM-exit. */
@@ -3734,95 +3670,25 @@ typedef struct {
 } hype_test_guest_args_t;
 
 /*
- * M2-7/M3-1's test-guest launch, factored out so it can run either
- * inline on the BSP (no extra pCPU available) or dispatched onto a
- * pinned AP (M3-2, see efi_main). Nothing here depends on our own
- * GDT/IDT/paging being active -- RDMSR/WRMSR, VMLOAD/VMRUN/VMSAVE/
- * CLGI/STGI, and struct-filling are all self-contained under whatever
- * valid environment is currently active, which matters because the
- * AP dispatch below runs this *before* ExitBootServices (see the
- * comment at the StartupThisAP call for why).
+ * #551: M2-7/M3-1's test-guest launch is gone, covered by construction rather than ported.
+ *
+ * It proved hype could build a VMCB/VMCS, VMRUN into a guest and return. Every microtest VM does
+ * exactly that through the same vmm_* ops, so any `MICRO PASS` line is proof a guest was created,
+ * entered, ran real instructions and halted cleanly -- on both vendors, from a config, with its
+ * own page tables. A dedicated test for "can we enter a guest at all" cannot fail while any other
+ * test passes.
  */
-static void EFIAPI run_test_guest(void *arg) {
-    hype_test_guest_args_t *args = (hype_test_guest_args_t *)arg;
-    const hype_vmm_ops_t *ops = args->ops;
-    hype_vmm_kind_t kind = args->kind;
-
-    /* RT-2c: SVM is now enabled once in efi_main (before any guest), not
-     * here -- so this self-test guest works whether or not it's the first
-     * thing to run. */
-
-    /*
-     * VMX's vcpu_create/vcpu_run stay NULL past M2-7 (see vmx_ops.c)
-     * -- only SVM actually launches here; VMX's equivalent is
-     * deferred to M2-8's real Intel hardware pass.
-     */
-    if (ops->vcpu_create == 0 || ops->vcpu_run == 0) {
-        hype_debug_print("vmm: %s vCPU launch not implemented yet -- test guest skipped\n", ops->name);
-        return;
-    }
-
-    /* M2-6 hard invariant: zero every byte of a guest's reserved RAM
-     * before its first VM-entry, on every (re)start -- not just the
-     * bytes we're about to write ourselves. g_m2_7_guest_code_phys/
-     * g_m2_7_guest_stack_top_phys are below-4GB pages allocated by
-     * efi_main() (see hype_alloc_pages_below_4gb()) before this
-     * function ever runs -- see this test's own buffer-declaration
-     * comment above for why a plain static buffer isn't safe here. */
-    uint8_t *guest_code = (uint8_t *)(uintptr_t)g_m2_7_guest_code_phys;
-    hype_guest_ram_zero(guest_code, 4096);
-    hype_guest_ram_zero((void *)(uintptr_t)(g_m2_7_guest_stack_top_phys - 4096), 4096);
-    guest_code[0] = 0xF4; /* HLT */
-
-    uint64_t entry_phys = g_m2_7_guest_code_phys;
-    uint64_t stack_phys = g_m2_7_guest_stack_top_phys;
-    hype_debug_print("vmm: %s test guest: entry_phys=0x%llx stack_phys=0x%llx\n", ops->name,
-                      (unsigned long long)entry_phys, (unsigned long long)stack_phys);
-
-    /* M3-1: SVM's NPT is real and QEMU-validated (unlike EPT, which
-     * has nowhere to be wired in yet -- VMX's vcpu_create stays NULL,
-     * see above). Building it fresh for every (re)start, same as
-     * everything else here. */
-    uint64_t npt_root_phys = 0;
-    if (kind == HYPE_VMM_KIND_SVM) {
-        hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
-        npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
-        hype_debug_print("vmm: %s NPT identity map built (root=0x%llx, %u GB)\n", ops->name,
-                          (unsigned long long)npt_root_phys, HYPE_NPT_MAX_GB);
-    }
-
-    hype_debug_print("vmm: about to call %s vcpu_create...\n", ops->name);
-    hype_vcpu_ctx_t *ctx = ops->vcpu_create(entry_phys, stack_phys, npt_root_phys);
-    if (ctx == 0) {
-        hype_fatal("vmm: %s vcpu_create failed", ops->name);
-    }
-    hype_debug_print("vmm: %s vcpu_create done -- entering dispatch loop...\n", ops->name);
-
-    hype_vmexit_info_t info;
-    int rc = hype_vmexit_dispatch_loop(ops, ctx, kind, &info);
-    if (rc != 0) {
-        hype_fatal("vmm: %s test guest did not exit cleanly (reason=0x%llx qual=0x%llx)", ops->name,
-                   (unsigned long long)info.reason, (unsigned long long)info.qualification);
-    }
-    hype_debug_print("vmm: %s test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx)\n", ops->name,
-                      (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-}
 
 /* VMX-2 vendor-dispatch shims -- forward declarations (defined just before
  * the first microtest that needs them). Let each microtest's exit loop stay
  * vendor-neutral. */
-static hype_vcpu_ctx_t *vmm_create_long_mode(hype_vmm_kind_t kind, uint64_t entry_rip,
-                                             uint64_t guest_cr3, uint64_t rsp, uint64_t root);
 static int vmm_reason_is_cpuid(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_reason_is_msr(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_reason_is_hlt(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_handle_fw_cfg_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
                                   const hype_gpa_map_t *dma_map);
-static int vmm_handle_ps2_kbd_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd);
 static int vmm_handle_ps2_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd,
                                hype_ps2_mouse_t *mouse, int *out_kbd_wait);
-static void vmm_deliver_pic_irq(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip,
-                                uint8_t irq);
 static int vmm_reason_is_ioio(hype_vmm_kind_t kind, uint64_t reason);
 static void vmm_handle_cpuid(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx);
 static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason);
@@ -3830,21 +3696,8 @@ static void vmm_set_rsi(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rsi
 static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic,
                            hype_pit_emu_t *pit);
 static int vmm_reason_is_npf(hype_vmm_kind_t kind, uint64_t reason);
-static int vmm_handle_pflash_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
-                                 uint64_t pf_base_phys);
-static int vmm_handle_pci_ecam_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
-                                   uint64_t ecam_base_phys, uint64_t guest_rip);
-static int vmm_handle_ahci_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
-                               hype_atapi_t *atapi, uint64_t ahci_base_phys);
-static int vmm_handle_ahci_disk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
-                                    hype_ata_disk_t *disk, uint64_t ahci_base_phys);
 static int vmm_handle_bochs_vbe_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                     uint64_t mmio_base_phys, const uint8_t *insn);
-static int vmm_handle_virtio_blk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
-                                     const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
-                                     uint64_t mmio_base_phys, uint64_t guest_rip);
-static void vmm_set_gdt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
-static void vmm_set_idt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
 static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t cs,
                                     uint16_t ss);
 static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
@@ -3854,237 +3707,26 @@ static void vmm_handle_intr_window(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
                                    hype_guest_lapic_t *lapic);
 
 /*
- * M3-5: builds the synthetic bzImage (real setup_header validated
- * through core/linux_boot.h's shim, not bypassed), builds guest
- * identity page tables, launches the long-mode test guest, and runs a
- * real VM-exit loop that keeps resuming the guest across IOIO exits
- * (routed to devices/pic.h and devices/pit.h) until it halts. VMX-2:
- * runs under SVM and VMX now via the vmm_* dispatch shims.
+ * #551: M3-5's Linux-shim test is gone, and NOT because it was ported -- it is covered by
+ * construction, which is worth stating with its evidence rather than asserting.
+ *
+ * It tested that core/linux_boot.h's shim builds a zero page a guest can consume. Every
+ * `boot = kernel` VM now goes through that same shim: fw_1_load_kernel() calls
+ * hype_linux_build_zero_page() and hands the guest its GPA in RSI. The microtests READ it --
+ * tests/micro/hello.c prints `rsi=0x7000`, then parses the e820 table and the command line out of
+ * that page, and every suite member takes its cmdline from it (#546).
+ *
+ * So the shim is not merely called on the live path; its output is consumed and checked by a guest
+ * on every microtest run, which is strictly more than this test did.
  */
-static void run_m3_5_linux_shim_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    hype_linux_setup_header_t hdr;
-    unsigned char *hdr_bytes = (unsigned char *)&hdr;
-    unsigned long long i;
-    unsigned char *img;
-    hype_linux_setup_header_t *img_hdr;
-    uint32_t payload_offset;
-    unsigned char *payload_at;
-    uint64_t payload_load_address, entry_rip, guest_cr3, rsp, rsi;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-
-    (void)ops; /* VMX-2: runs under SVM and VMX now. */
-
-    /* M2-6 hard invariant: zero every byte of this guest's reserved
-     * RAM before its first VM-entry, on every (re)start. */
-    hype_guest_ram_zero(g_m3_5_bzimage, sizeof(g_m3_5_bzimage));
-    hype_guest_ram_zero(g_m3_5_guest_stack, sizeof(g_m3_5_guest_stack));
-    hype_guest_ram_zero(&g_m3_5_zero_page, sizeof(g_m3_5_zero_page));
-
-    for (i = 0; i < sizeof(hdr); i++) {
-        hdr_bytes[i] = 0;
-    }
-    hdr.setup_sects = 4; /* real-mode/setup region = (4+1)*512 = 2560 bytes */
-    hdr.boot_flag = HYPE_LINUX_BOOT_FLAG;
-    hdr.header = HYPE_LINUX_HDR_MAGIC;
-    hdr.version = 0x020Fu;
-    hdr.xloadflags = HYPE_LINUX_XLF_KERNEL_64;
-
-    if (!hype_linux_header_is_valid(&hdr)) {
-        hype_fatal("m3-5: synthetic setup header failed its own validity check");
-    }
-
-    /* Write the header into the synthetic bzImage buffer at its real
-     * file offset -- exactly where a real loader would find it, not a
-     * shortcut around the shim being tested. */
-    img = g_m3_5_bzimage;
-    img_hdr = (hype_linux_setup_header_t *)(img + HYPE_LINUX_SETUP_HEADER_OFFSET);
-    *img_hdr = hdr;
-
-    payload_offset = hype_linux_payload_file_offset(&hdr);
-    payload_at = img + payload_offset;
-    payload_load_address = (uint64_t)(uintptr_t)payload_at;
-    entry_rip = hype_linux_64bit_entry(payload_load_address);
-
-    /* The 64-bit entry point is payload_load_address + 0x200, not
-     * payload_load_address itself (hype_linux_64bit_entry()) -- write
-     * the hand-written test payload AT the entry point, not at the
-     * start of the payload region a few hundred bytes before it. */
-    for (i = 0; i < sizeof(g_m3_5_payload); i++) {
-        ((unsigned char *)(uintptr_t)entry_rip)[i] = g_m3_5_payload[i];
-    }
-
-    hype_pic_emu_reset(&g_m3_5_pic);
-    hype_pit_emu_reset(&g_m3_5_pit);
-
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    rsp = (uint64_t)(uintptr_t)(g_m3_5_guest_stack + sizeof(g_m3_5_guest_stack));
-    rsi = (uint64_t)(uintptr_t)&g_m3_5_zero_page;
-
-    /*
-     * #238: hype_debug_print(), NOT hype_serial_print() -- this and every other
-     * result line in the battery. hype_serial_print() writes ONLY to the UART,
-     * and the machines this battery exists to validate have no serial port, so
-     * such a record reaches neither \HYPEFULL.LOG (no logbuf tee) nor the GOP
-     * screen (no framebuffer tee). m3-5/m4-3/m4-4/m4-5 were the only tests
-     * using it, and that is exactly why their confirmations were missing from
-     * the 2026-07-25 AMD log AND from the Intel bare-metal screen photo, while
-     * every neighbouring test's lines came through -- the results existed only
-     * on a wire nobody was listening to. Keep new test output on this call.
-     */
-    hype_debug_print("m3-5: entry_rip=0x%llx guest_cr3=0x%llx zero_page=0x%llx\n",
-                       (unsigned long long)entry_rip, (unsigned long long)guest_cr3,
-                       (unsigned long long)rsi);
-
-    /* No NPT for this first pass (0) -- see the M3-5 ticket
-     * on why full AVIC interrupt-delivery validation is deferred. */
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, 0);
-    if (ctx == 0) {
-        hype_fatal("m3-5: vcpu_create_long_mode failed");
-    }
-    vmm_set_rsi(kind, ctx, rsi);
-
-    for (;;) {
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("m3-5: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-        }
-
-        if (vmm_reason_is_ioio(kind, info.reason)) {
-            if (vmm_handle_ioio(kind, ctx, &g_m3_5_pic, &g_m3_5_pit) != 0) {
-                hype_fatal("m3-5: unhandled guest port I/O (qual=0x%llx)",
-                           (unsigned long long)info.qualification);
-            }
-            continue;
-        }
-
-        break;
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("m3-5: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx "
-                   "expected_entry=0x%llx qual=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip,
-                   (unsigned long long)entry_rip, (unsigned long long)info.qualification);
-    }
-
-    hype_debug_print(
-        "m3-5: Linux boot-protocol shim test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx, "
-        "PIC master IMR=0x%x, PIT ch0 latch_pending=%d)\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, g_m3_5_pic.master.imr,
-        g_m3_5_pit.channels[0].latch_pending);
-}
 
 /*
- * M4-3: builds a minimal 64-bit long-mode guest (NOT a Linux
- * boot-protocol shim like M3-5 -- hype_svm_vcpu_create_long_mode()
- * itself has no such requirement, it just needs an entry RIP/RSP/CR3,
- * so this test skips core/linux_boot.h entirely), this time with
- * nested paging genuinely enabled (M3-5 passed npt_root=0 -- "no NPT
- * for this first pass"), and with the emulated flash's covering NPT
- * entry marked not-present so the guest's own memory-mapped accesses
- * to it take a real NPF, decoded and dispatched by
- * hype_svm_vcpu_handle_npf() to devices/pflash.h. SVM-only, same
- * reasoning as run_m3_5_linux_shim_test() above (VMX's vcpu_run stays
- * NULL past M2-7).
+ * #544/#551: M4-3's pflash MMIO test is gone -- ported to tests/micro/pflash.c, which drives the
+ * CFI model at the REAL flash window a guest sees rather than a private one at a private address,
+ * and discovers that window by its _FVH signature rather than being told. The port also corrected
+ * the assertion: status is CLEARED on a fresh chip and READY is EARNED by a completed program,
+ * which is what OVMF's probe depends on (#556).
  */
-static void run_m4_3_pflash_mmio_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t kind) {
-    unsigned long long i;
-    uint64_t entry_rip, guest_cr3, rsp, npt_root_phys;
-    hype_vcpu_ctx_t *ctx;
-    hype_vmexit_info_t info;
-
-    (void)ops; /* VMX-2: runs under SVM and VMX now. */
-
-    /* M2-6 hard invariant: zero every byte of this guest's reserved
-     * RAM before its first VM-entry, on every (re)start. NOT applied to
-     * g_m4_3_pflash_backing -- that is the guest's *persistent*
-     * variable store (devices/pflash.h's own hype_pflash_reset() doc
-     * comment), which by definition must survive a restart; this test
-     * starts it from a known all-zero state itself instead, since
-     * there is nothing to persist across yet (M5's disk driver). */
-    hype_guest_ram_zero(g_m4_3_guest_code, sizeof(g_m4_3_guest_code));
-    hype_guest_ram_zero(g_m4_3_guest_stack, sizeof(g_m4_3_guest_stack));
-    for (i = 0; i < sizeof(g_m4_3_pflash_backing); i++) {
-        g_m4_3_pflash_backing[i] = 0;
-    }
-    hype_pflash_reset(&g_m4_3_pflash, g_m4_3_pflash_backing, sizeof(g_m4_3_pflash_backing));
-
-    for (i = 0; i < sizeof(g_m4_3_payload_template); i++) {
-        g_m4_3_guest_code[i] = g_m4_3_payload_template[i];
-    }
-    hype_write_le64(g_m4_3_guest_code + HYPE_M4_3_PAYLOAD_RBX_IMM_OFFSET, HYPE_M4_3_PFLASH_GPA);
-    hype_write_le64(g_m4_3_guest_code + HYPE_M4_3_PAYLOAD_RDX_IMM_OFFSET, HYPE_M4_3_PFLASH_GPA + 0x100);
-
-    entry_rip = (uint64_t)(uintptr_t)g_m4_3_guest_code;
-    rsp = (uint64_t)(uintptr_t)(g_m4_3_guest_stack + sizeof(g_m4_3_guest_stack));
-
-    /* Rebuilt fresh here (same "fresh on every (re)start" convention as
-     * every other identity map in this file) -- reusing the same
-     * static tables run_m3_5_linux_shim_test() already used above is
-     * safe since that guest has already finished running by the time
-     * this one starts (see run_all_test_guests()), never concurrently. */
-    hype_paging_build_identity(g_guest_pml4, g_guest_pdpt, g_guest_pd, HYPE_M3_5_GUEST_PAGING_GB);
-    guest_cr3 = (uint64_t)(uintptr_t)g_guest_pml4;
-
-    hype_npt_build_identity(g_npt_pml4, g_npt_pdpt, g_npt_pd, HYPE_NPT_MAX_GB);
-    hype_npt_mark_not_present(g_npt_pd, HYPE_M4_3_PFLASH_GPA);
-    npt_root_phys = (uint64_t)(uintptr_t)g_npt_pml4;
-
-    hype_debug_print("m4-3: entry_rip=0x%llx guest_cr3=0x%llx npt_root=0x%llx pflash_gpa=0x%llx\n",
-                       (unsigned long long)entry_rip, (unsigned long long)guest_cr3,
-                       (unsigned long long)npt_root_phys, (unsigned long long)HYPE_M4_3_PFLASH_GPA);
-
-    ctx = vmm_create_long_mode(kind, entry_rip, guest_cr3, rsp, npt_root_phys);
-    if (ctx == 0) {
-        hype_fatal("m4-3: vcpu_create_long_mode failed");
-    }
-    /* VMX builds its own identity EPT inside create (ignoring npt_root_phys),
-     * so the pflash MMIO hole -- punched into the SVM NPT above -- must be
-     * punched into the EPT too, else the guest access hits RAM with no exit. */
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_ept_mark_mmio_hole(HYPE_M4_3_PFLASH_GPA);
-    }
-
-    for (;;) {
-        if (ops->vcpu_run(ctx, &info) != 0) {
-            hype_fatal("m4-3: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
-        }
-
-        if (vmm_reason_is_npf(kind, info.reason)) {
-            if (vmm_handle_pflash_npf(kind, ctx, &g_m4_3_pflash, HYPE_M4_3_PFLASH_GPA) != 0) {
-                hype_fatal("m4-3: unhandled/unrecognized MMIO access (qual=0x%llx guest_rip=0x%llx)",
-                           (unsigned long long)info.qualification, (unsigned long long)info.guest_rip);
-            }
-            continue;
-        }
-
-        break;
-    }
-
-    if (!vmm_reason_is_hlt(kind, info.reason)) {
-        hype_fatal("m4-3: test guest did not halt cleanly (reason=0x%llx guest_rip=0x%llx)",
-                   (unsigned long long)info.reason, (unsigned long long)info.guest_rip);
-    }
-
-    if (g_m4_3_pflash_backing[0] != 0xABu) {
-        hype_fatal("m4-3: pflash write path failed: backing[0]=0x%x, expected 0xab",
-                   g_m4_3_pflash_backing[0]);
-    }
-    if (g_m4_3_pflash_backing[0x100] != 0xABu) {
-        hype_fatal(
-            "m4-3: pflash read path failed: backing[0x100]=0x%x, expected 0xab (the guest's own "
-            "memory-mapped read must not have returned 0xab)",
-            g_m4_3_pflash_backing[0x100]);
-    }
-
-    hype_debug_print(
-        "m4-3: pflash MMIO test guest halted cleanly (reason=0x%llx, guest_rip=0x%llx, backing[0]=0x%x "
-        "backing[0x100]=0x%x -- write and read-back round trip both verified)\n",
-        (unsigned long long)info.reason, (unsigned long long)info.guest_rip, g_m4_3_pflash_backing[0],
-        g_m4_3_pflash_backing[0x100]);
-}
 
 /*
  * M4-4: synthesizes RSDP/XSDT/FADT/MADT/MCFG/DSDT (devices/acpi.h) plus
@@ -4111,24 +3753,6 @@ static void run_m4_3_pflash_mmio_test(const hype_vmm_ops_t *ops, hype_vmm_kind_t
  * AHCI command list needs the same conversions. Kept here rather than moved into core/ because two
  * call sites in one file is not yet an abstraction worth a header.
  */
-static void hype_write_be32(unsigned char *dst, uint32_t value) {
-    dst[0] = (unsigned char)(value >> 24);
-    dst[1] = (unsigned char)(value >> 16);
-    dst[2] = (unsigned char)(value >> 8);
-    dst[3] = (unsigned char)value;
-}
-
-static void hype_write_be64(unsigned char *dst, uint64_t value) {
-    int i;
-    for (i = 0; i < 8; i++) {
-        dst[i] = (unsigned char)(value >> (8 * (7 - i)));
-    }
-}
-
-static uint32_t hype_byteswap32(uint32_t v) {
-    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) | ((v & 0x00FF0000u) >> 8) |
-           ((v & 0xFF000000u) >> 24);
-}
 
 /*
  * #543: M4-4's fw_cfg globals, its 40-byte hand-assembled DMA payload and its private one-file
@@ -4153,7 +3777,6 @@ static uint32_t hype_byteswap32(uint32_t v) {
  * buffer byte for byte. It validates the device model end to end; it does NOT validate a real guest
  * OS's own AHCI/ATAPI driver against it, which is M4-6's job.
  */
-#define HYPE_M4_5_AHCI_GPA (HYPE_M4_3_PFLASH_GPA + HYPE_PAGING_2MB)
 
 
 /*
@@ -4192,11 +3815,6 @@ static uint32_t hype_byteswap32(uint32_t v) {
  *   hlt                                    F4
  *   jmp $-3                                EB FD
  */
-#define HYPE_M4_5_PAYLOAD_RBX_IMM_OFFSET 2
-#define HYPE_M4_5_PAYLOAD_CLB_LOW_IMM_OFFSET 19
-#define HYPE_M4_5_PAYLOAD_CLB_HIGH_IMM_OFFSET 30
-#define HYPE_M4_5_PAYLOAD_FB_LOW_IMM_OFFSET 41
-#define HYPE_M4_5_PAYLOAD_FB_HIGH_IMM_OFFSET 52
 
 /*
  * #548: M4-5's AHCI test is gone -- ported to tests/micro/ahci.c and booted as a configured VM.
@@ -4208,15 +3826,13 @@ static uint32_t hype_byteswap32(uint32_t v) {
  * an ICH9 function on device 31, something the fixed-address version could not have noticed.
  */
 
-#define HYPE_ISO_2_AHCI_GPA (HYPE_M4_5_AHCI_GPA + HYPE_PAGING_2MB)
-#define HYPE_ISO_2_PVD_LBA 16 /* ISO9660 Primary Volume Descriptor: always the 17th 2048-byte sector */
 
 
 /*
  * #326: the ONLY ISO bytes hype still copies into RAM, and a bounded 64 KiB of them.
  *
  * ISO-2 (below) proves the emulated AHCI/ATAPI path delivers real ISO content, and it runs BEFORE
- * the media stream is resolved (run_all_test_guests() is dispatched well ahead of host media
+ * the media stream is resolved (the self-test battery was dispatched well ahead of host media
  * discovery), so it cannot be repointed at the stream; the microtest would have to be deleted to
  * remove this buffer entirely. The buffer is FILLED pre-ExitBootServices, because that is when UEFI
  * file services still exist. It reads exactly one sector, the ISO9660 PVD at LBA 16, so it needs 16*2048+2048 =
@@ -4275,18 +3891,6 @@ static uint32_t hype_byteswap32(uint32_t v) {
  * the right one by kind so a microtest's exit loop stays vendor-neutral. Lets
  * the M2-M4-5 self-tests run under either backend from one body.
  */
-static hype_vcpu_ctx_t *vmm_create_long_mode(hype_vmm_kind_t kind, uint64_t entry_rip,
-                                             uint64_t guest_cr3, uint64_t rsp, uint64_t root) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        /* 0, deliberately: `root` is an SVM NPT root here (the microtests build
-         * one), and an NPT table is not a valid EPT table. 0 selects VMX's own
-         * identity EPT, which is correct for these identity-mapped guests.
-         * VMX-4 (#236) made a non-zero root meaningful, so passing it through
-         * would now silently install a bogus EPT rather than being ignored. */
-        return hype_vmx_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, 0);
-    }
-    return hype_svm_vcpu_create_long_mode(entry_rip, guest_cr3, rsp, root);
-}
 static int vmm_reason_is_cpuid(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_CPUID)
                                      : (reason == HYPE_SVM_EXITCODE_CPUID);
@@ -4328,26 +3932,12 @@ static int vmm_handle_fw_cfg_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hy
     }
     return hype_svm_vcpu_handle_fw_cfg_ioio(ctx, fw, dma_map);
 }
-static int vmm_handle_ps2_kbd_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_handle_ps2_kbd_ioio(ctx, kbd);
-    }
-    return hype_svm_vcpu_handle_ps2_kbd_ioio(ctx, kbd);
-}
 static int vmm_handle_ps2_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ps2_kbd_t *kbd,
                                hype_ps2_mouse_t *mouse, int *out_kbd_wait) {
     if (kind == HYPE_VMM_KIND_VMX) {
         return hype_vmx_vcpu_handle_ps2_ioio(ctx, kbd, mouse, out_kbd_wait);
     }
     return hype_svm_vcpu_handle_ps2_ioio(ctx, kbd, mouse, out_kbd_wait);
-}
-static void vmm_deliver_pic_irq(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_chip_t *chip,
-                                uint8_t irq) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_vcpu_deliver_pic_irq(ctx, chip, irq);
-    } else {
-        hype_svm_vcpu_deliver_pic_irq(ctx, chip, irq);
-    }
 }
 static int vmm_reason_is_ioio(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_IO_INSTRUCTION)
@@ -4371,13 +3961,6 @@ static int vmm_reason_is_npf(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_EPT_VIOLATION)
                                      : (reason == HYPE_SVM_EXITCODE_NPF);
 }
-static int vmm_handle_pflash_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
-                                 uint64_t pf_base_phys) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_handle_pflash_npf(ctx, pf, pf_base_phys);
-    }
-    return hype_svm_vcpu_handle_npf(ctx, pf, pf_base_phys);
-}
 /* #457: the FW-1-grade variant -- takes fetched instruction bytes because a live guest's RIP is
  * not a host pointer (the handlers above are the M4-3 identity-map microtest's). */
 static int vmm_handle_pflash_npf_insn(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
@@ -4395,57 +3978,12 @@ static void vmm_request_nested_tlb_flush(hype_vmm_kind_t kind, hype_vcpu_ctx_t *
         hype_svm_vcpu_request_tlb_flush(ctx);
     }
 }
-static int vmm_handle_pci_ecam_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pci_t *pci,
-                                   uint64_t ecam_base_phys, uint64_t guest_rip) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_handle_pci_ecam_npf(ctx, pci, ecam_base_phys);
-    }
-    return hype_svm_vcpu_handle_pci_ecam_npf(ctx, pci, ecam_base_phys,
-                                             (const uint8_t *)(uintptr_t)guest_rip);
-}
-static int vmm_handle_ahci_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
-                               hype_atapi_t *atapi, uint64_t ahci_base_phys) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_handle_ahci_npf(ctx, ahci, atapi, ahci_base_phys);
-    }
-    return hype_svm_vcpu_handle_ahci_npf(ctx, ahci, atapi, ahci_base_phys);
-}
-static int vmm_handle_ahci_disk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci,
-                                    hype_ata_disk_t *disk, uint64_t ahci_base_phys) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_handle_ahci_disk_npf(ctx, ahci, disk, ahci_base_phys);
-    }
-    return hype_svm_vcpu_handle_ahci_disk_npf(ctx, ahci, disk, ahci_base_phys);
-}
 static int vmm_handle_bochs_vbe_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                     uint64_t mmio_base_phys, const uint8_t *insn) {
     if (kind == HYPE_VMM_KIND_VMX) {
         return hype_vmx_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys, insn);
     }
     return hype_svm_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys, insn);
-}
-static int vmm_handle_virtio_blk_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
-                                     const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
-                                     uint64_t mmio_base_phys, uint64_t guest_rip) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_handle_virtio_blk_npf(ctx, dev, be, mmio_base_phys);
-    }
-    return hype_svm_vcpu_handle_virtio_blk_npf(ctx, dev, be, dma_map, mmio_base_phys,
-                                               (const uint8_t *)(uintptr_t)guest_rip);
-}
-static void vmm_set_gdt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_vcpu_set_gdt(ctx, base, limit);
-    } else {
-        hype_svm_vcpu_set_gdt(ctx, base, limit);
-    }
-}
-static void vmm_set_idt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_vcpu_set_idt(ctx, base, limit);
-    } else {
-        hype_svm_vcpu_set_idt(ctx, base, limit);
-    }
 }
 static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t cs,
                                     uint16_t ss) {
@@ -4620,13 +4158,6 @@ static void vmm_wake_hlt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
         hype_vmx_vcpu_wake_hlt(ctx);
     } else {
         hype_svm_vcpu_wake_hlt(ctx);
-    }
-}
-static void vmm_cancel_pending_vector(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector) {
-    if (kind == HYPE_VMM_KIND_VMX) {
-        hype_vmx_vcpu_cancel_pending_vector(ctx, vector);
-    } else {
-        hype_svm_vcpu_cancel_pending_vector(ctx, vector);
     }
 }
 /*
@@ -5748,7 +5279,6 @@ static int vmm_handle_virtio_blk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *
  * their own devices relative to it, so it stays -- renaming it to match its remaining users would
  * touch more lines than it clarifies, and the note below says where it came from.
  */
-#define HYPE_PCI_1_ECAM_GPA (4ULL * HYPE_PAGING_1GB)
 
 /*
  * #547: PCI-1 and PCI-2 are gone -- ported to tests/micro/pci.c, booted as a configured VM (#535).
@@ -5820,25 +5350,14 @@ static int vmm_handle_virtio_blk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *
  * means the two cannot drift apart again.
  */
 
-#define HYPE_M5_1_VIRTIO_DEV 1u
-#define HYPE_M5_1_BAR_INDEX 4u
 /* Same "arbitrary offset from an existing constant, always NPT-
  * trapped so real backing doesn't matter" scheme PCI-2/VIDEO-3 both
  * established. */
-#define HYPE_M5_1_MMIO_GPA (HYPE_M4_3_PFLASH_GPA + 4ULL * 1024 * 1024)
-#define HYPE_M5_1_CAPACITY_SECTORS 128u
-#define HYPE_M5_1_REQ1_SECTOR 3ull
-#define HYPE_M5_1_REQ2_SECTOR 10ull
 /* One full sector: the virtio-blk data descriptor length MUST be a
  * sector multiple, or hype_blk_backend_write/read reject it (VALID-3, added in
  * #205 -- which silently regressed this test's original 16-byte descriptor,
  * exposed when the microtests were first re-run under VMX-2). */
-#define HYPE_M5_1_DATA_LEN HYPE_VIRTIO_BLK_SECTOR_SIZE
 
-#define HYPE_M5_1_CAP_COMMON_OFF 0x40u
-#define HYPE_M5_1_CAP_NOTIFY_OFF 0x50u
-#define HYPE_M5_1_CAP_ISR_OFF 0x64u
-#define HYPE_M5_1_CAP_DEVICE_OFF 0x74u
 #define HYPE_M5_1_CFG_TYPE_COMMON 1u
 #define HYPE_M5_1_CFG_TYPE_NOTIFY 2u
 #define HYPE_M5_1_CFG_TYPE_ISR 3u
@@ -5868,14 +5387,6 @@ static void hype_write_virtio_pci_cap(uint8_t *config, uint8_t cap_offset, uint8
     config[cap_offset + 7] = 0;
     hype_write_le32(config + cap_offset + 8, region_offset);
     hype_write_le32(config + cap_offset + 12, region_length);
-}
-
-static void hype_write_virtq_desc(uint8_t *raw, uint64_t addr, uint32_t len, uint16_t flags,
-                                   uint16_t next) {
-    hype_write_le64(raw + 0, addr);
-    hype_write_le32(raw + 8, len);
-    hype_write_le16(raw + 12, flags);
-    hype_write_le16(raw + 14, next);
 }
 
 /*
@@ -5942,17 +5453,6 @@ static void hype_write_virtq_desc(uint8_t *raw, uint64_t addr, uint32_t len, uin
  *   hlt                                            F4
  *   jmp $-3                                        EB FD
  */
-#define HYPE_M5_1_PAYLOAD_ECAM_RBX_IMM_OFFSET 2
-#define HYPE_M5_1_PAYLOAD_BAR4_VALUE_IMM_OFFSET 11
-#define HYPE_M5_1_PAYLOAD_MMIO_RBX_IMM_OFFSET 34
-#define HYPE_M5_1_PAYLOAD_DESC_LOW_IMM_OFFSET 120
-#define HYPE_M5_1_PAYLOAD_DESC_HIGH_IMM_OFFSET 131
-#define HYPE_M5_1_PAYLOAD_AVAIL_LOW_IMM_OFFSET 142
-#define HYPE_M5_1_PAYLOAD_AVAIL_HIGH_IMM_OFFSET 153
-#define HYPE_M5_1_PAYLOAD_USED_LOW_IMM_OFFSET 164
-#define HYPE_M5_1_PAYLOAD_USED_HIGH_IMM_OFFSET 175
-#define HYPE_M5_1_PAYLOAD_NOTIFY_RBX_IMM_OFFSET 206
-#define HYPE_M5_1_PAYLOAD_USED_RING_RBX_IMM_OFFSET 223
 
 /*
  * #550: M5-1's virtio-blk test is gone -- ported to tests/micro/virtioblk.c.
@@ -5990,14 +5490,9 @@ static void hype_write_virtq_desc(uint8_t *raw, uint64_t addr, uint32_t len, uin
  * the same way M5-1's own virtio-blk test does.
  */
 
-#define HYPE_M5_2_ATA_DISK_DEV 1u
 /* Same "arbitrary offset from an existing constant, always NPT-
  * trapped so real backing doesn't matter" scheme M4-5/PCI-2/VIDEO-3/
  * M5-1 all already established. */
-#define HYPE_M5_2_AHCI_GPA (HYPE_M4_3_PFLASH_GPA + 4ULL * 1024 * 1024)
-#define HYPE_M5_2_WRITE_SECTOR 5ull
-#define HYPE_M5_2_READ_SECTOR 20ull
-#define HYPE_M5_2_DATA_LEN 16u
 
 /*
  * Section A/B (RBX = ECAM base, then RBX = AHCI addr): PCI discovery +
@@ -6046,19 +5541,6 @@ static void hype_write_virtq_desc(uint8_t *raw, uint64_t addr, uint32_t len, uin
  *   hlt                                                F4
  *   jmp $-3                                            EB FD
  */
-#define HYPE_M5_2_PAYLOAD_ECAM_RBX_IMM_OFFSET 2
-#define HYPE_M5_2_PAYLOAD_BAR5_VALUE_IMM_OFFSET 11
-#define HYPE_M5_2_PAYLOAD_AHCI_RBX_IMM_OFFSET 34
-#define HYPE_M5_2_PAYLOAD_CLB_LOW_IMM_OFFSET 51
-#define HYPE_M5_2_PAYLOAD_CLB_HIGH_IMM_OFFSET 62
-#define HYPE_M5_2_PAYLOAD_FB_LOW_IMM_OFFSET 73
-#define HYPE_M5_2_PAYLOAD_FB_HIGH_IMM_OFFSET 84
-#define HYPE_M5_2_PAYLOAD_TABLE_RBX_1_IMM_OFFSET 128
-#define HYPE_M5_2_PAYLOAD_WRITE_DATA_ADDR_IMM_OFFSET 156
-#define HYPE_M5_2_PAYLOAD_AHCI_RBX_2_IMM_OFFSET 179
-#define HYPE_M5_2_PAYLOAD_TABLE_RBX_2_IMM_OFFSET 210
-#define HYPE_M5_2_PAYLOAD_READ_DEST_ADDR_IMM_OFFSET 238
-#define HYPE_M5_2_PAYLOAD_AHCI_RBX_3_IMM_OFFSET 261
 
 /*
  * #550: M5-2's ATA-disk test is gone -- ported to tests/micro/atadisk.c, sharing its AHCI bring-up
@@ -16934,92 +16416,25 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
  */
 
 /*
- * #237 bisect knob: run only the FIRST N tests of the battery. Default = all.
- * Exists because #237 ("the FW-1 guest dies after the battery runs in the same
- * boot") needs the culprit narrowed to a single test, and the target machine is
- * cold-boot-only + serial-less -- so the search has to happen under QEMU, where
- * one -DHYPE_SELFTEST_LIMIT=N build per probe is far cheaper than editing this
- * list by hand and risking a mis-edit between runs.
+ * #551: THE SELF-TEST BATTERY IS GONE -- run_all_test_guests(), HYPE_ST_RUN and
+ * HYPE_SELFTEST_LIMIT with it.
+ *
+ * All 18 indices are accounted for: sixteen ported to tests/micro/ as guest-side artifacts
+ * selected by hype.cfg (#536, #539..#543, #547..#550, #554, #565), one retired as untestable in
+ * place (#452's ISO-2), and the two that were never ports -- entering a guest at all, and the
+ * Linux shim -- covered by construction, with the evidence recorded at each deleted definition.
+ *
+ * HYPE_SELFTEST_LIMIT was a #237 bisect knob so that "run only the first N tests" needed a
+ * rebuild rather than a hand edit of the list. Choosing which guests run is now a config edit and
+ * needs no build at all, which is what made the knob obsolete.
+ *
+ * The vCPU-pool reset that ended this function is gone too, and that ordering was deliberate:
+ * #551 warned not to remove it before the last port landed. The battery allocated pool slots
+ * sequentially before the real guests were created, and without handing them back vm0 and vm1
+ * would both clamp to the last slot and share one VMCS across two cores -- #237's failure, which
+ * does not panic, it wedges. With no battery there is nothing to hand back, and a pool reset in a
+ * boot path that no longer needs one is residue that later reads as load-bearing.
  */
-#ifndef HYPE_SELFTEST_LIMIT
-#define HYPE_SELFTEST_LIMIT 18
-#endif
-#define HYPE_ST_RUN(idx, call)                                                                     \
-    do {                                                                                           \
-        if ((idx) < HYPE_SELFTEST_LIMIT) {                                                         \
-            call;                                                                                  \
-        }                                                                                          \
-    } while (0)
-
-static void EFIAPI run_all_test_guests(void *arg) {
-    hype_test_guest_args_t *args = (hype_test_guest_args_t *)arg;
-#if HYPE_SELFTEST_LIMIT != 18
-    hype_debug_print("selftest: BISECT BUILD -- running only the first %d of 18 battery tests "
-                     "(#237 search); this is NOT a full battery run\n",
-                     (int)HYPE_SELFTEST_LIMIT);
-#endif
-    HYPE_ST_RUN(0, run_test_guest(arg));
-    HYPE_ST_RUN(1, run_m3_5_linux_shim_test(args->ops, args->kind));
-    HYPE_ST_RUN(2, run_m4_3_pflash_mmio_test(args->ops, args->kind));
-    /* 3 was M4-4 fw_cfg, ported out in #543 -- see the note at its old definition. */
-    /* 4 was M4-5 AHCI, ported out in #548 -- see the note at its old definition. */
-    /* 5 was VIDEO-2 ramfb, ported out in #549 -- see the note at its old definition. */
-    /* 6 was CPUMSR, ported out in #539 -- see the note at its old definition. */
-    /* 7 was INT-1/INT-2, ported out in #541 -- see the note at its old definition. */
-    /* 8 was INPUT-1, ported out in #542 -- see the note at its old definition. */
-    /* 9 was INPUT-2, ported out in #542 -- see the note at its old definition. */
-    /* 10 was RAM-1/RAM-2, ported out in #536 -- see the note at its old definition. */
-    /* 11 was PCI-1, ported out in #547 -- see the note at its old definition. */
-    /* 12 was PCI-2, ported out in #547 -- see the note at its old definition. */
-    /* 13 was ISO-2, retired in #452 -- see the note at its old definition. */
-    /* 14 was VIDEO-3 Bochs VBE, ported out in #565 -- see the note at its old definition. */
-    /* 15 was M5-1 virtio-blk, ported out in #550 -- see the note at its old definition. */
-    /* 16 was M5-2 ATA disk, ported out in #550 -- see the note at its old definition. */
-    /* M4-6d4 #3: preemption mechanism proof */
-    /* 17 was the PAUSE-filter test, ported out in #540 -- see the note at its old definition. */
-
-    /*
-     * #237: hand the vCPU slots back before the real guests are created.
-     *
-     * The SVM pool has one slot per CONCURRENT vCPU (HYPE_SVM_MAX_VCPUS = 2, for
-     * vm0 and vm1). Every test guest above allocates a slot and never releases
-     * it, so with the battery enabled the counter is already past the end by the
-     * time run_fw_1_test() creates vm0's and vm1's vCPUs -- and the allocator's
-     * exhaustion clamp then hands BOTH of them the same slot. Two cores VMRUN the
-     * same VMCB and register-save context, the second guest reads garbage, and
-     * OVMF wanders into unwritten memory: under QEMU that surfaces as
-     * "undecodable MMIO NPF ... insn=(ptwalk) 00 00 00 00", on real AMD hardware
-     * it wedges the machine at the dashboard with no panic at all.
-     *
-     * That is why #237 only ever appeared in battery+guest builds and never in
-     * the live-only build, and why ONE test guest is enough to trigger it. The
-     * battery is strictly sequential and strictly earlier than the concurrent
-     * guests, so releasing here restores the invariant the pool documents.
-     */
-    /*
-     * #249: SVM-only, and the last raw hype_svm_* call left in this path that could
-     * run on Intel. It releases VMCB pool slots; VMX has no pool to release (#245:
-     * one static VMCS), so on Intel the call is inert but semantically wrong -- it
-     * asserts ownership of a structure that backend does not have. Gated rather
-     * than shimmed, for the same reason as the EXITINFO2/NRIP snapshots: there is
-     * nothing on the other side to port it to.
-     */
-    if (args->kind == HYPE_VMM_KIND_SVM) {
-        hype_svm_vcpu_pool_reset();
-    } else if (args->kind == HYPE_VMM_KIND_VMX) {
-        /* #271: same reasoning on Intel. The battery allocates VMX slots first and
-         * strictly sequentially; without handing them back, vm0 and vm1 would both
-         * clamp to the last slot and share one VMCS across two cores -- #237's
-         * failure, which does not panic, it just wedges. */
-        hype_vmx_vcpu_pool_reset();
-    }
-    /* RT-2b: run_fw_1_test is deliberately NOT run here. The quick regression
-     * guests above all run under `cli` (no host timer, no INTR intercept) --
-     * they halt in milliseconds and need no timekeeping. efi_main brings up
-     * hype's periodic timer + `sti` AFTER this returns and only THEN runs the
-     * FW-1 guest, which is the sole guest that intercepts INTR and needs
-     * host-tick preemption to keep its clock alive. */
-}
 
 /* RT-2b: 8259 spurious IRQ7/IRQ15 handlers. On real hardware the PIC raises
  * IRQ7 (master) or IRQ15 (slave) when an IRQ line is withdrawn between the
@@ -21173,7 +20588,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * detection, all guest allocations (guest code pages, RAM-1 guest RAM,
      * FW-1 firmware read from the ESP), and host-TSC calibration -- every
      * one of which needs Boot Services. It no longer RUNS the guest; that
-     * moved past ExitBootServices (see run_all_test_guests(&args) far below),
+     * moved past ExitBootServices (the self-test battery ran there before #551 retired it),
      * where the guest executes under hype's own GDT/IDT/paging with firmware
      * fully out of the picture.
      *
@@ -21274,7 +20689,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_debug_print("vmm: %s detected\n", ops->name);
 
         /* Must happen here, before ExitBootServices(), and before
-         * run_all_test_guests() below actually uses these -- see
+         * the self-test battery used these before #551 retired it -- see
          * g_m2_7_guest_code_phys's own comment for why a static buffer
          * isn't safe for this particular (real-mode) test guest. One
          * single 2-page allocation, not two separate 1-page ones: the
@@ -21589,32 +21004,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
 
     /*
-     * RT-2a: run the guests HERE -- post-ExitBootServices, on the BSP, under
-     * hype's own GDT/IDT/paging loaded just above, with firmware entirely
-     * out of the picture. This is the whole point of the RT track: VMRUN now
-     * saves/restores HYPE's host state (not firmware's), a host CPU fault in
-     * the loop lands in hype's IDT -> hype_fatal() with full context (not a
-     * silent firmware triple-fault), and there is no 5-minute firmware
-     * watchdog to race.
+     * RT-2a, and still the reason guests run HERE: post-ExitBootServices, on the BSP, under hype's
+     * own GDT/IDT/paging loaded just above, with firmware entirely out of the picture. VMRUN
+     * saves and restores HYPE's host state rather than firmware's, a host CPU fault in the loop
+     * lands in hype's IDT and reaches hype_fatal() with full context instead of a silent firmware
+     * triple-fault, and there is no 5-minute firmware watchdog to race.
      *
-     * run_all_test_guests() runs ONLY the quick M2-M5/VIDEO/INPUT regression
-     * guests -- all self-contained (static/pre-EBS-allocated memory, no Boot
-     * Services), each halting in milliseconds. They run here with interrupts
-     * still MASKED (the post-EBS cli holds); they need no timekeeping. The
-     * FW-1 Alpine guest runs separately BELOW, after the host timer + sti come
-     * up (RT-2b), because it is the one guest that needs host-tick preemption
-     * to keep its clock alive through long non-intercepting stretches.
-     *
-     * RT-2c: gated off for a normal boot. These are a regression self-test of
-     * the M2-M5/VIDEO/INPUT VMM machinery -- valuable, but they add startup
-     * time + log clutter on every Alpine boot, and the machinery they check is
-     * long since HW-proven. Flip HYPE_RUN_SELFTEST_GUESTS to 1 to run the
-     * suite (e.g. after touching the VM-exit core); a normal boot skips
-     * straight to the FW-1 guest.
+     * #551: the self-test battery used to run at this point, gated off by
+     * HYPE_RUN_SELFTEST_GUESTS. Both are gone -- the tests are guest-side artifacts chosen by
+     * hype.cfg, so "run the regression suite" is a config a person writes rather than a
+     * compile-time flag they have to remember. The configured VMs run below, after the host timer
+     * and sti come up (RT-2b), because a guest that intercepts INTR needs host-tick preemption to
+     * keep its clock alive through long non-intercepting stretches.
      */
-    if (HYPE_RUN_SELFTEST_GUESTS) {
-        run_all_test_guests(&args);
-    }
 
     /*
      * M1-8: bring up the host's own timer tick. Ordering matters again:

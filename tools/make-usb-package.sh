@@ -45,8 +45,13 @@ for tool in mformat mmd mcopy dd; do
 done
 
 # EXTRA_CFLAGS is passed through so a validation stick can select a build
-# variant (e.g. -DHYPE_RUN_SELFTEST_GUESTS=1 to run the M2-M5 battery AND the
-# live guest in ONE cold boot, which is what a serial-less machine needs).
+# variant (e.g. -DHYPE_FW_1_GUEST_RAM_MB=1024).
+#
+# #534 (closed 2026-08-20) removed what used to be the headline example here,
+# -DHYPE_RUN_SELFTEST_GUESTS=1. The self-test battery is no longer in the binary
+# at all; it is guest-side artifacts under tests/micro/ chosen by the stick's
+# hype.cfg. Running the suite AND a live guest in ONE cold boot -- still what a
+# serial-less machine needs -- is now a config edit, not a rebuild.
 #
 # A `make clean` first when EXTRA_CFLAGS is set is deliberate and not
 # belt-and-braces: make does NOT track changes to the compiler flags, so a tree

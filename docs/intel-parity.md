@@ -104,10 +104,17 @@ last five fixes came from reading guest oopses, not from reasoning about VMX.
 ### Resume here (exact steps)
 1. `cp disk-images/alpine-hype-earlycon.iso /mnt/data/hype-bisect/test.iso`
    (first `mv` the existing `test.iso` aside — do NOT overwrite, it has ~47 hard links).
-2. `intel-probe.sh <label> "-DHYPE_RUN_SELFTEST_GUESTS=1 -DHYPE_VMX_SMOKE_TEST=1 \
+2. `intel-probe.sh <label> "-DHYPE_VMX_SMOKE_TEST=1 \
     -DHYPE_FW_1_GUEST_RAM_MB=1024 -DHYPE_RUN_TWO_VMS=0"`
    Single VM matters: two VMs share one VMCS (#245) and inject a spurious
    VM-instruction-error 7 that contaminates every reading.
+
+   `-DHYPE_RUN_SELFTEST_GUESTS=1` used to belong in that list and no longer
+   exists (#534 closed 2026-08-20): the self-test battery is now guest-side
+   artifacts under `tests/micro/`, selected by a `hype.cfg` suite rather than a
+   compile-time knob. To carry the regression suite on the same cold boot as a
+   live guest, add the suite's VMs to the stick's config -- but read plan.md
+   decision 47 first, because each one now costs a whole physical core.
 3. Read the log for the next kernel oops / hype panic and fix that. Repeat.
 4. `mv` the original `test.iso` back when done.
 

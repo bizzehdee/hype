@@ -2580,6 +2580,52 @@ isn't lost.
     depends on which driver binds first, and that is not a thing to leave to
     chance in the component the operator uses to see what is happening.
 
+50. **The self-test battery is guest-side and config-selected, not
+    hypervisor-resident — decided (2026-08-20), closing #534.** Recorded because
+    it removes a facility hype had carried since M3, and because the reason it
+    had to go is not visible from the code that replaced it.
+
+    hype used to carry 18 self-test guests inside `hype.efi` itself: each was a
+    C function in `boot/main.c` that hand-built a guest — page tables, a fake
+    PCI bus, a private device model — ran it, and checked the result. They were
+    reached through a compile-time knob (`HYPE_RUN_SELFTEST_GUESTS`) and a
+    per-index macro. They are now **guest binaries under `tests/micro/`**, run by
+    an ordinary VM entry from an ordinary `hype.cfg` suite file, selected by
+    configuration like any other guest.
+
+    **Why they had to move.** An in-binary test builds its own fixture, so it
+    tests hype against hype's own idea of the hardware. Four real defects were
+    found the week the ports landed, every one of them invisible to the test it
+    replaced: #552 (hype leaked a VMX CPUID bit to guests — the old test compared
+    hype's emulation against hype's emulation), #550 (no virtio PCI capability
+    chain existed at all — nothing had ever walked the guest's bus), and #565's
+    two (the VBE MMIO decode only worked identity-mapped, and `VIRT_WIDTH` was
+    never latched, so hype rendered correctly while a real guest driver would
+    have rendered nothing). A fixture cannot find a defect in the thing it is a
+    fixture for.
+
+    **The second reason is the verdict.** A guest-side test prints
+    `MICRO PASS:`/`MICRO FAIL:` on its own console, through the same log path a
+    real guest uses, so the operator reads the same evidence for a test as for a
+    workload — and a *missing* verdict is a failure rather than a silence
+    (#558 was exactly this: a test printed PASS and the log lost it, and counters
+    that were consistent with passing got read as proof of failing).
+
+    **What this actually cost and saved.** `boot/main.c` went from 25,803 to
+    23,357 lines: **2,446 removed**, against roughly 7,560 estimated when the
+    epic opened. The estimate was wrong, and worth recording as wrong: it was
+    built by summing function spans, and those spans included machinery shared
+    with code that stays (VIDEO-2's span is the documented case). The ports also
+    *added* to `boot/main.c` — the `display` key, the VBE presenter, per-VM state
+    that used to be function statics — and the tests themselves are 4,334 lines
+    across 16 guests, so the code did not vanish, it moved to where a guest can
+    run it. The honest summary is that the epic bought correctness and a real
+    verdict channel, and bought about a third of the size reduction it promised.
+
+    Rejected: keeping a small in-binary battery for the cases with no guest-side
+    equivalent. Every case turned out to have one, and a two-mechanism test
+    estate means the weaker mechanism is where a defect hides.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
