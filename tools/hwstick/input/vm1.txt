@@ -94,6 +94,18 @@ send taskset -c 1 sh -c 'echo b > /proc/sysrq-trigger'\n
 # So wait for the login prompt to come round again. This is the FRESH boot's prompt: hype's restart
 # zeroes the guest's RAM and re-enters at the reset vector (M8-4), so everything below runs against
 # a guest that has genuinely started over.
+# TIGHTEN THE TIMEOUT FIRST, because the 900s ceiling set at the top is now the difference between
+# a FAIL inside the run and no verdict at all. Each `expect` gets the whole timeout, so if the reset
+# does not restart the guest, this one would sit for 15 minutes -- pushing the script's verdict to
+# ~26 min, well past when an operator on a cold-boot-only machine would have cut power. A run that
+# ends with no verdict is indistinguishable from a run still in progress, which is the failure mode
+# this project keeps paying for.
+#
+# 3 minutes is generous for an Alpine boot off a local 63 MB disk on bare metal (the ISO-streamed
+# first boot is the slow one, and this is not that), so a genuine restart is never cut off, while a
+# reset that did nothing is reported at ~14 min instead of ~26.
+timeout 180000
+
 expect localhost login:
 send root\n
 expect ~#
