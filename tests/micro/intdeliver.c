@@ -47,10 +47,11 @@ static volatile unsigned long long g_wrong_vector;
  * hlt. Intel SDM Vol. 2A p. 3-439 requires the saved RIP to point to the instruction FOLLOWING the
  * hlt, so this is a defect and not a defensible modelling choice; it is tracked as #580.
  *
- * The relationship is REPORTED and not yet asserted on purpose. Asserting the correct rule
- * (past_hlt == ticks) would make this test fail on every run until #580 lands, and a permanently
- * red test in the default suite trains people to ignore the suite. #580 carries the assertion, so
- * it arrives with the fix.
+ * #580 FIXED IT, and the assertion arrived with the fix (see the end of this test). The wake block
+ * that retires the HLT sat below a `productive_exits < 1500` boot-progress gate, so for a guest
+ * whose productive exits are front-loaded the retire was never even considered. Hoisting it above
+ * that gate took the breakdown from at_hlt=1153/past_hlt=1 to at_hlt=0/past_hlt=5 -- and the guest
+ * now gets exactly the 5 ticks it asked for instead of overshooting by 1149 it could not observe.
  *
  * It does not affect this test's verdict: what is asserted is that ticks arrive, on the vector IRQ0
  * was remapped to, and keep arriving. Both counts are reported so a change in their relationship is
@@ -263,6 +264,28 @@ void micro_main(uint64_t zero_page_gpa) {
     micro_puts(" hlt_site=");
     micro_put_hex((unsigned long long)(uintptr_t)&micro_hlt_site);
     micro_puts("\n");
+
+    /*
+     * #580: every delivery must leave the guest resuming AFTER the hlt, never on it. Intel SDM
+     * Vol. 2A p. 3-439 requires the saved RIP to point to the following instruction, and a guest
+     * that resumes AT the hlt makes no forward progress -- its idle loop cannot observe the tick
+     * it was woken for. This is the assertion #553 measured and deliberately did not make until
+     * the fix existed.
+     *
+     * at_hlt is the defect condition exactly, so it is asserted at zero rather than as a ratio.
+     * `other` is legitimate -- a delivery that arrives while the guest is running rather than
+     * halted has a frame RIP that is neither address -- so the accounting closes on
+     * past_hlt + other, not on past_hlt alone.
+     */
+    if (g_frame_at_hlt != 0ull) {
+        micro_fail(NAME, "an interrupt resumed the guest AT the hlt instead of after it, so its "
+                         "wait loop cannot observe the tick it was woken for (#580)");
+        micro_halt();
+    }
+    if (g_frame_past_hlt + (g_ticks - g_frame_at_hlt - g_frame_past_hlt) != g_ticks) {
+        micro_fail(NAME, "the HLT-resume accounting does not add up to the tick count");
+        micro_halt();
+    }
 
     if (g_wrong_vector != 0ull) {
         micro_fail(NAME, "interrupts were delivered on a vector other than the one IRQ0 was "

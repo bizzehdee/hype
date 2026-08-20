@@ -17187,21 +17187,30 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
 
         if (vmm_reason_is_hlt(kind, info.reason)) {
-            /* OVMF's idle wait (CpuSleep). It never HLTs during DXE/BDS
-             * init, so a HLT past HYPE_FW_1_BOOTED_EXITS productive exits
-             * means the firmware finished booting and is idle-waiting for
-             * a timer tick / a keypress. An earlier HLT is plain
-             * wait-for-interrupt: keep running so the LAPIC timer wakes
-             * it (bounded by HYPE_FW_1_MAX_EXITS above). */
-            if (productive_exits < HYPE_FW_1_BOOTED_EXITS) {
-                continue;
-            }
-            /* FW-1f: OVMF is idle at "Press any key to enter the Boot
-             * Manager Menu". Inject one keystroke (Enter) into the guest
-             * serial RX to exercise guest console INPUT. Feed BOTH COM1
-             * and COM2 -- this build's DEBUG log is on COM2, so the
-             * interactive Terminal ConIn may be on either; whichever OVMF
-             * actually polls consumes it. */
+            /*
+             * #580: THE WAKE COMES FIRST, ABOVE THE BOOT-PROGRESS GATE.
+             *
+             * Retiring a HLT is a correctness requirement, not a heuristic. Intel SDM Vol. 2A
+             * "HLT-Halt" p. 3-439: an interrupt that resumes execution after a HLT leaves the
+             * saved RIP pointing at the instruction FOLLOWING it. Injecting while RIP is still on
+             * the hlt makes the guest's iretq re-execute it, so the guest re-halts and its idle
+             * loop makes no forward progress per tick.
+             *
+             * This block used to sit BELOW the `productive_exits < HYPE_FW_1_BOOTED_EXITS`
+             * continue, so until a guest had taken 1500 non-HLT exits the retire was never even
+             * considered. tests/micro/intdeliver's productive exits are front-loaded -- PIC and
+             * PIT programming plus two lines of output, a couple of hundred exits -- so its whole
+             * wait loop ran below the gate:
+             *
+             *     [#553] frame RIP at_hlt=1153 past_hlt=1 other=0     (of 1154 deliveries)
+             *
+             * The gate is about OVMF; its own comment says so, and a `boot = kernel` guest has no
+             * OVMF at all. Gating architectural behaviour on a firmware-progress heuristic was
+             * wrong for every guest and completely wrong for a kernel one.
+             *
+             * Hoisting is safe because the block only retires when an interrupt is deliverable
+             * NOW -- which is exactly when hardware would have woken the guest.
+             */
             /* M4-6d2: a HLT with IF=1 is an interrupt-wait (Linux idle /
              * msleep does `sti; hlt`). Because we intercept the HLT before
              * it retires, the STI interrupt-shadow that covered it never
@@ -17263,6 +17272,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     continue;
                 }
             }
+            /* OVMF's idle wait (CpuSleep). It never HLTs during DXE/BDS
+             * init, so a HLT past HYPE_FW_1_BOOTED_EXITS productive exits
+             * means the firmware finished booting and is idle-waiting for
+             * a timer tick / a keypress. An earlier HLT is plain
+             * wait-for-interrupt: keep running so the LAPIC timer wakes
+             * it (bounded by HYPE_FW_1_MAX_EXITS above). */
+            if (productive_exits < HYPE_FW_1_BOOTED_EXITS) {
+                continue;
+            }
+            /* FW-1f: OVMF is idle at "Press any key to enter the Boot
+             * Manager Menu". Inject one keystroke (Enter) into the guest
+             * serial RX to exercise guest console INPUT. Feed BOTH COM1
+             * and COM2 -- this build's DEBUG log is on COM2, so the
+             * interactive Terminal ConIn may be on either; whichever OVMF
+             * actually polls consumes it. */
             /*
              * #436: a HLT with interrupts MASKED (IF=0), past boot, that we do not wake, is a
              * DEAD halt -- the guest chose to stop and will take no interrupt. For a Windows
