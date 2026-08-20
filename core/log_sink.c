@@ -8,16 +8,30 @@ void hype_log_sink_set_ordered(hype_log_sink_t *s, int ordered) {
 
 /* "[00012345] " -- fixed width so the files sort lexically as well as numerically,
  * which means a plain `sort` merges them correctly with no tooling. */
-static unsigned int order_prefix(char *buf, unsigned int off) {
+/*
+ * #338's total order over every record ever written, and #585's reason it had to widen.
+ *
+ * The offset must be ABSOLUTE. Once the capture buffer reclaims its already-written prefix, a
+ * buffer index restarts near zero, so indices would repeat within one run and a merge tool sorting
+ * by them would interleave hour six with hour one. hype_logbuf_reclaimed() is what makes it
+ * absolute.
+ *
+ * Ten digits, not eight. Eight wraps at 100 MB, and an overnight run at the measured ~3.2 KB/s
+ * passes that in about nine hours -- so the field would have wrapped inside the very run reclaim
+ * exists to enable, which is a worse failure than the one it fixes because it looks like ordinary
+ * data. Ten digits reach 10 GB, i.e. five weeks at that rate. Any tool matching the prefix has to
+ * accept 10 digits.
+ */
+static unsigned int order_prefix(char *buf, uint64_t off) {
     unsigned int i;
     buf[0] = '[';
-    for (i = 0; i < 8u; i++) {
-        buf[8u - i] = (char)('0' + (off % 10u));
+    for (i = 0; i < 10u; i++) {
+        buf[10u - i] = (char)('0' + (unsigned int)(off % 10u));
         off /= 10u;
     }
-    buf[9] = ']';
-    buf[10] = ' ';
-    return 11u;
+    buf[11] = ']';
+    buf[12] = ' ';
+    return 13u;
 }
 
 static int sink_start(hype_log_sink_t *s, hype_fs_t *fs, const char *filename,
@@ -131,7 +145,7 @@ static int flush_filtered(hype_log_sink_t *s, const char *data, unsigned int len
         unsigned int off = 0u;
         unsigned int plen = 0u;
         unsigned int body_len;
-        char pfx[12];
+        char pfx[16];
         while (nl < len && data[nl] != '\n') nl++;
         if (nl == len) break; /* partial record: leave it for the next flush */
         reclen = nl - pos;
@@ -140,7 +154,7 @@ static int flush_filtered(hype_log_sink_t *s, const char *data, unsigned int len
                       ? 0u
                       : hype_log_record_body_off(data + pos, reclen);
             if (s->ordered) {
-                plen = order_prefix(pfx, pos);
+                plen = order_prefix(pfx, hype_logbuf_reclaimed() + (uint64_t)pos);
             }
             body_len = (nl + 1u) - (pos + off); /* keep the newline */
             if (plen + body_len > HYPE_LOG_SINK_BATCH_BYTES) {

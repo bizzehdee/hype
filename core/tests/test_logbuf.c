@@ -61,15 +61,25 @@ static void test_truncates_at_capacity(void) {
 /* Lay down a header at the struct's field offsets (magic@0, version@8,
  * len@12, truncated@16, checksum@20, data@24) so find()/validate() can be
  * exercised against a synthetic region without a full 2MB struct. */
+/*
+ * Field offsets come from the STRUCT, not from arithmetic in this function.
+ *
+ * They used to be hand-written (`p + 24` for the data), and #585 adding a uint64_t to the header
+ * moved data[] -- so six tests in this file started failing for a reason that had nothing to do
+ * with what they were testing, and one of them (`bad checksum rejected`) failed by ACCEPTING a bad
+ * checksum, because the bytes it meant to corrupt landed in padding. A test that encodes a layout
+ * it does not own breaks every time that layout legitimately changes, and the failure points at the
+ * wrong thing. The compiler knows where the fields are.
+ */
 static void put_header(unsigned char *p, uint64_t magic, uint32_t ver, uint32_t len,
                        uint32_t trunc, uint32_t cksum, const char *data) {
-    memcpy(p + 0, &magic, 8);
-    memcpy(p + 8, &ver, 4);
-    memcpy(p + 12, &len, 4);
-    memcpy(p + 16, &trunc, 4);
-    memcpy(p + 20, &cksum, 4);
+    memcpy(p + __builtin_offsetof(hype_logbuf_t, magic), &magic, sizeof(magic));
+    memcpy(p + __builtin_offsetof(hype_logbuf_t, version), &ver, sizeof(ver));
+    memcpy(p + __builtin_offsetof(hype_logbuf_t, len), &len, sizeof(len));
+    memcpy(p + __builtin_offsetof(hype_logbuf_t, truncated), &trunc, sizeof(trunc));
+    memcpy(p + __builtin_offsetof(hype_logbuf_t, checksum), &cksum, sizeof(cksum));
     if (data && len) {
-        memcpy(p + 24, data, len);
+        memcpy(p + __builtin_offsetof(hype_logbuf_t, data), data, len);
     }
 }
 
@@ -293,6 +303,116 @@ static void test_null_and_empty_appends_are_safe(void) {
 }
 
 
+/* ---- #585: reclaim ---- */
+
+/*
+ * The whole point: drop the already-written prefix, keep the rest, and leave the buffer VALID -- a
+ * next-boot scanner has to be able to trust what is left, and the checksum is maintained by
+ * subtraction rather than recomputed, so an error there is silent until a scan rejects the region.
+ */
+static void test_reclaim_drops_prefix_and_slides(void) {
+    hype_logbuf_reset();
+    hype_logbuf_append("AAAABBBBCCCC");
+    CHECK_INT("dropped what was asked", 4, hype_logbuf_reclaim_unlocked(4));
+    CHECK_INT("len shrank", 8, hype_logbuf_len());
+    CHECK_INT("the residue slid to the front", 0, memcmp(hype_logbuf_data(), "BBBBCCCC", 8));
+    CHECK_INT("reclaimed total", 4, (int)hype_logbuf_reclaimed());
+    CHECK_INT("still a valid, self-describing region", 1,
+              hype_logbuf_validate(hype_logbuf_get()));
+
+    /* Again, so the total accumulates rather than being overwritten. */
+    CHECK_INT("second reclaim", 4, hype_logbuf_reclaim_unlocked(4));
+    CHECK_INT("len shrank again", 4, hype_logbuf_len());
+    CHECK_INT("residue is the tail", 0, memcmp(hype_logbuf_data(), "CCCC", 4));
+    CHECK_INT("reclaimed accumulates", 8, (int)hype_logbuf_reclaimed());
+    CHECK_INT("still valid", 1, hype_logbuf_validate(hype_logbuf_get()));
+}
+
+/* Appending after a reclaim must land after the residue, not overwrite it -- the buffer is still a
+ * linear append region, just with a shorter history. */
+static void test_append_after_reclaim_continues(void) {
+    hype_logbuf_reset();
+    hype_logbuf_append("0123456789");
+    (void)hype_logbuf_reclaim_unlocked(6);
+    hype_logbuf_append("abc");
+    CHECK_INT("len is residue + new", 7, hype_logbuf_len());
+    CHECK_INT("content is residue then new", 0, memcmp(hype_logbuf_data(), "6789abc", 7));
+    CHECK_INT("valid", 1, hype_logbuf_validate(hype_logbuf_get()));
+}
+
+/*
+ * A reclaim of everything, and of MORE than everything. An over-large `upto` is clamped rather than
+ * sliding bytes in from beyond the buffer -- the caller derives it from sink cursors, and a cursor
+ * that has run ahead of the buffer is a bug elsewhere that must not become a memory error here.
+ */
+static void test_reclaim_clamps_and_empties(void) {
+    hype_logbuf_reset();
+    hype_logbuf_append("12345");
+    CHECK_INT("clamped to len", 5, hype_logbuf_reclaim_unlocked(9999));
+    CHECK_INT("empty", 0, hype_logbuf_len());
+    CHECK_INT("valid when empty", 1, hype_logbuf_validate(hype_logbuf_get()));
+    CHECK_INT("reclaimed counted the clamped amount", 5, (int)hype_logbuf_reclaimed());
+    CHECK_INT("reclaiming an empty buffer is a no-op", 0, hype_logbuf_reclaim_unlocked(1));
+}
+
+/* Zero means zero. The driver calls this whenever the buffer is under pressure, and with no live
+ * sink the watermark is 0 -- that path must not move a byte. */
+static void test_reclaim_zero_is_a_noop(void) {
+    hype_logbuf_reset();
+    hype_logbuf_append("keep me");
+    CHECK_INT("no bytes dropped", 0, hype_logbuf_reclaim_unlocked(0));
+    CHECK_INT("len unchanged", 7, hype_logbuf_len());
+    CHECK_INT("content unchanged", 0, memcmp(hype_logbuf_data(), "keep me", 7));
+    CHECK_INT("reclaimed still zero", 0, (int)hype_logbuf_reclaimed());
+}
+
+/* reset() clears the total, or a second boot would report the first boot's reclaim and every record
+ * offset would start at a lie. */
+static void test_reset_clears_reclaimed(void) {
+    hype_logbuf_reset();
+    hype_logbuf_append("xyz");
+    (void)hype_logbuf_reclaim_unlocked(2);
+    CHECK_INT("reclaimed before reset", 2, (int)hype_logbuf_reclaimed());
+    hype_logbuf_reset();
+    CHECK_INT("reclaimed cleared", 0, (int)hype_logbuf_reclaimed());
+    CHECK_INT("len cleared", 0, hype_logbuf_len());
+}
+
+/*
+ * TRUNCATED IS NOT CLEARED BY RECLAIM, and this is the test that says why. `truncated` means output
+ * was LOST; giving the buffer room afterwards does not un-lose it. A run that filled up before any
+ * sink existed produced an incomplete log, and a later reclaim must not make it look fine.
+ */
+static void test_reclaim_does_not_clear_truncated(void) {
+    unsigned int i;
+    hype_logbuf_reset();
+    for (i = 0; i < (HYPE_LOGBUF_CAPACITY / 8u) + 2u; i++) {
+        hype_logbuf_append("XXXXXXXX");
+    }
+    CHECK_INT("filled and latched", 1, hype_logbuf_truncated());
+    (void)hype_logbuf_reclaim_unlocked(1024);
+    CHECK_INT("room made", 1, hype_logbuf_len() < HYPE_LOGBUF_CAPACITY);
+    CHECK_INT("but the loss is still reported", 1, hype_logbuf_truncated());
+}
+
+/*
+ * A reclaimed buffer must survive the next-boot SCAN, not merely validate() -- hype_logbuf_find()
+ * checks that the claimed data fits inside the region it was given, and #585 added a field ahead of
+ * data[], so a hand-counted header size would have let it validate a candidate whose bytes ran past
+ * what was checked. Scanning a real region containing a reclaimed buffer is what catches that.
+ */
+static void test_reclaimed_buffer_is_still_findable(void) {
+    const hype_logbuf_t *found;
+    hype_logbuf_reset();
+    hype_logbuf_append("find me after a reclaim\n");
+    (void)hype_logbuf_reclaim_unlocked(5);
+    found = hype_logbuf_find(hype_logbuf_get(), sizeof(hype_logbuf_t), 8u);
+    CHECK_INT("found", 1, found == hype_logbuf_get());
+    CHECK_INT("and it reports what went", 5, (int)(found ? found->reclaimed : 0));
+    CHECK_INT("residue is the tail", 0,
+              memcmp(hype_logbuf_data(), "me after a reclaim\n", 19));
+}
+
 int main(void) {
     test_append_accumulates_in_order();
     test_reset_clears();
@@ -306,6 +426,13 @@ int main(void) {
     test_panic_path_never_blocks();
     test_capacity_truncation_is_flagged();
     test_null_and_empty_appends_are_safe();
+    test_reclaim_drops_prefix_and_slides();
+    test_append_after_reclaim_continues();
+    test_reclaim_clamps_and_empties();
+    test_reclaim_zero_is_a_noop();
+    test_reset_clears_reclaimed();
+    test_reclaim_does_not_clear_truncated();
+    test_reclaimed_buffer_is_still_findable();
 
     if (failures == 0) {
         printf("all tests passed\n");

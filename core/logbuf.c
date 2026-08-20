@@ -15,6 +15,7 @@ void hype_logbuf_reset(void) {
     g_logbuf.len = 0;
     g_logbuf.truncated = 0;
     g_logbuf.checksum = 0;
+    g_logbuf.reclaimed = 0;
 }
 
 /*
@@ -93,6 +94,44 @@ int hype_logbuf_truncated(void) {
     return g_logbuf.truncated;
 }
 
+/*
+ * #585: drop the already-written prefix and slide the rest down.
+ *
+ * The checksum is maintained by SUBTRACTING the departing bytes rather than recomputed over what
+ * remains. Recomputing would walk up to 8 MiB on every reclaim, on the BSP, in the middle of the
+ * drain loop that also renders the dashboard -- and the whole reason this exists is a run long
+ * enough for that to happen thousands of times. Subtraction is exact for a rolling sum.
+ *
+ * `truncated` is deliberately NOT cleared. It means "output was lost", and reclaiming does not
+ * un-lose it: a run that hit capacity before any sink existed still produced an incomplete log, and
+ * a later reclaim must not make that look fine.
+ */
+unsigned int hype_logbuf_reclaim_unlocked(unsigned int upto) {
+    unsigned int i;
+
+    if (upto > g_logbuf.len) {
+        upto = g_logbuf.len;
+    }
+    if (upto == 0u) {
+        return 0u;
+    }
+    for (i = 0; i < upto; i++) {
+        g_logbuf.checksum -= (unsigned char)g_logbuf.data[i];
+    }
+    /* Forward copy is correct for a downward move even when the ranges overlap: the destination
+     * index is always below the source, so a byte is read before anything writes over it. */
+    for (i = upto; i < g_logbuf.len; i++) {
+        g_logbuf.data[i - upto] = g_logbuf.data[i];
+    }
+    g_logbuf.len -= upto;
+    g_logbuf.reclaimed += (uint64_t)upto;
+    return upto;
+}
+
+uint64_t hype_logbuf_reclaimed(void) {
+    return g_logbuf.reclaimed;
+}
+
 const hype_logbuf_t *hype_logbuf_get(void) {
     return &g_logbuf;
 }
@@ -119,9 +158,13 @@ int hype_logbuf_validate(const hype_logbuf_t *hdr) {
 const hype_logbuf_t *hype_logbuf_find(const void *base, unsigned long size, unsigned long stride) {
     const unsigned char *p;
     unsigned long off;
-    /* The header must fit before we can even read its fields: magic(8) +
-     * version(4) + len(4) + truncated(4) + checksum(4). */
-    const unsigned long header_prefix = 8u + 4u + 4u + 4u + 4u;
+    /*
+     * Bytes ahead of data[], taken from the struct rather than added up by hand. The hand-written
+     * sum said 8+4+4+4+4 and #585 added a uint64_t to the header, so it would have understated the
+     * offset by 8 (plus padding) and let the scan validate a candidate whose data ran past the
+     * region it had checked. A layout fact belongs to the compiler.
+     */
+    const unsigned long header_prefix = (unsigned long)__builtin_offsetof(hype_logbuf_t, data);
 
     /* 8 is the minimum at which the 8-byte magic is readable; a caller
      * asking for less is clamped up rather than reading misaligned/OOB. */

@@ -2171,6 +2171,9 @@ static hype_disk_inventory_t g_disk_inv;
 
 /* One-shot latch for the "capture buffer is full" report -- see usb_log_flush(). */
 static int g_logbuf_full_reported;
+static int g_logbuf_reclaim_reported; /* #585: reclaim says so once, not every time */
+/* #585: defined with the other log-sink plumbing, below the sinks it reads the cursors of. */
+static void fw_1_logbuf_reclaim(void);
 static hype_blk_phys_ahci_t g_hostdisk_ahci; /* backend hw ctx (outlives the VM) */
 
 static int term_streq(const char *a, const char *b) {
@@ -21350,23 +21353,36 @@ static void usb_log_flush_limit(unsigned int max_source_bytes) {
      * one report is the useful one.
      */
     /*
-     * The in-RAM capture buffer is a fixed 2 MiB and STOPS accepting appends once full
-     * (hype_logbuf_append_unlocked latches `truncated` and drops the rest). Until now nothing ever
-     * read that flag, so a long run simply stopped logging and every file just... ended -- the same
-     * silent-truncation failure as #348, one layer up, and indistinguishable from a hang.
+     * The in-RAM capture buffer STOPS accepting appends once full (hype_logbuf_append_unlocked
+     * latches `truncated` and drops the rest). Until #338 nothing ever read that flag, so a long
+     * run simply stopped logging and every file just... ended -- the same silent-truncation failure
+     * as #348, one layer up, and indistinguishable from a hang.
      *
      * Say it, once, and say it IN THE FILES: a message routed through hype_debug_print would go to
      * the logbuf, which is by definition full, so it would never reach them. Written straight to
      * the combined sink's file instead, and to the serial port, which are the two channels still
      * working at that point.
+     *
+     * #585: with reclaim below, reaching this state at all now means the sinks were not draining --
+     * so the message says which, because "the buffer filled" and "the buffer filled WHILE NOTHING
+     * WAS BEING WRITTEN OUT" send you to different layers.
      */
     if (hype_logbuf_truncated() && !g_logbuf_full_reported) {
-        static const char msg[] =
-            "\n*** hype: the 2 MiB in-RAM log buffer is FULL. Capture stopped here; hype is still "
-            "running and this log is INCOMPLETE, not the end of the run. ***\n";
+        static char msg[240];
+        int n = hype_snprintf(msg, sizeof(msg),
+            "\n*** hype: the %u KiB in-RAM log buffer FILLED. Capture stopped here; hype is still "
+            "running and this log is INCOMPLETE, not the end of the run. Reclaimed %llu byte(s) "
+            "before this, so the sinks %s. ***\n",
+            (unsigned)(HYPE_LOGBUF_CAPACITY / 1024u),
+            (unsigned long long)hype_logbuf_reclaimed(),
+            (hype_logbuf_reclaimed() != 0ull) ? "were draining and could not keep up"
+                                              : "never drained a byte -- look at the volume, "
+                                                "not the buffer");
         g_logbuf_full_reported = 1;
-        hype_serial_print("%s", msg);
-        (void)hype_fs_append(&g_hype_log.file, msg, (unsigned int)(sizeof(msg) - 1u));
+        if (n > 0) {
+            hype_serial_print("%s", msg);
+            (void)hype_fs_append(&g_hype_log.file, msg, (unsigned int)n);
+        }
     }
     {
         unsigned int vi;
@@ -21382,6 +21398,99 @@ static void usb_log_flush_limit(unsigned int max_source_bytes) {
                 g_vm_log_ready[vi] = 0;
             }
         }
+    }
+    fw_1_logbuf_reclaim();
+}
+
+/*
+ * #585: give the capture buffer its space back once every file already has the bytes.
+ *
+ * Capacity was the run-length limit, not the stick. Two bare-metal AMD runs of f1a831f stopped
+ * capturing at t=659s -- one left running 11 minutes, one 20 -- because 8 MiB at three VMs on
+ * `log_level = debug` is about 44 minutes, and an overnight stress run needs ~92 MiB. Raising
+ * capacity to fit the longest run anyone might attempt would hold, in BSS, bytes already written to
+ * a 58 GB stick.
+ *
+ * THE WATERMARK IS THE MINIMUM FLUSH CURSOR ACROSS EVERY SINK THAT IS STILL LIVE, and that is what
+ * makes this safe by arithmetic rather than by policy: a byte is dropped only once the combined log
+ * AND every per-VM log already contain it. Two consequences worth stating because both are
+ * load-bearing:
+ *
+ *   - A sink that has FAILED (g_vm_log_ready[vi] == 0) is excluded. It is never going to advance,
+ *     so counting it would pin the watermark at wherever it died and reclaim nothing for the rest
+ *     of the run -- one dead split file would cost the whole run's capture.
+ *   - With NO live sink at all the watermark is 0 and nothing is reclaimed, so hype behaves exactly
+ *     as it did before this existed: fill up, latch `truncated`, say so. That is also the only case
+ *     where the in-RAM copy is the sole artefact, so "the start of the log is always intact"
+ *     survives precisely where it matters.
+ *
+ * Reclaim is not free (it slides the residue down), so it runs only when the buffer is actually
+ * under pressure -- above the high-water mark -- rather than on every flush. Below that threshold a
+ * whole run behaves byte-for-byte as before.
+ *
+ * The append lock is held across the move because it relocates the bytes a concurrent append would
+ * be writing into. Cursors are adjusted under the same lock, so no sink can be mid-read of a stale
+ * index; every reader is this core (#239: the BSP owns the whole log path).
+ */
+/* 75% full. Overridable for the same reason capacity is: a validation build lowers it so the
+ * pressure path runs in seconds instead of in three quarters of an hour. */
+#ifndef HYPE_LOGBUF_RECLAIM_ABOVE
+#define HYPE_LOGBUF_RECLAIM_ABOVE ((HYPE_LOGBUF_CAPACITY / 4u) * 3u)
+#endif
+
+static void fw_1_logbuf_reclaim(void) {
+    unsigned int watermark = 0u;
+    unsigned int dropped;
+    unsigned int vi;
+    int live = 0;
+
+    if (hype_logbuf_len() < HYPE_LOGBUF_RECLAIM_ABOVE) {
+        return;
+    }
+    if (g_hype_log_ready) {
+        watermark = hype_log_sink_flushed(&g_hype_log);
+        live = 1;
+    }
+    for (vi = 0; vi < g_vm_count; vi++) {
+        unsigned int f;
+        if (!g_vm_log_ready[vi]) continue;
+        f = hype_log_sink_flushed(&g_vm_log[vi]);
+        if (!live || f < watermark) {
+            watermark = f;
+        }
+        live = 1;
+    }
+    if (!live || watermark == 0u) {
+        return;
+    }
+
+    hype_logbuf_lock();
+    dropped = hype_logbuf_reclaim_unlocked(watermark);
+    if (dropped != 0u) {
+        if (g_hype_log_ready) {
+            g_hype_log.flushed -= dropped;
+        }
+        for (vi = 0; vi < g_vm_count; vi++) {
+            if (g_vm_log_ready[vi]) {
+                g_vm_log[vi].flushed -= dropped;
+            }
+        }
+    }
+    hype_logbuf_unlock();
+
+    /*
+     * Reported once per boot, not per reclaim: a run that reclaims every few seconds for eight
+     * hours would otherwise spend a slice of the very buffer this is protecting on saying so. The
+     * absolute total is always available on any later line through the ordering prefix, which is
+     * now absolute for exactly this reason.
+     */
+    if (dropped != 0u && !g_logbuf_reclaim_reported) {
+        g_logbuf_reclaim_reported = 1;
+        HYPE_LOGF(HYPE_LOG_INFO,
+                  "usb-log: capture buffer RECLAIMED %u byte(s) already written to every log -- "
+                  "run length is now bounded by the medium, not by the %u KiB buffer. Record "
+                  "offsets stay absolute across this [#585]\n",
+                  dropped, (unsigned)(HYPE_LOGBUF_CAPACITY / 1024u));
     }
 }
 

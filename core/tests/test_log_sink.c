@@ -268,7 +268,7 @@ static void test_filtered_flush_batches_records_and_respects_budget(void) {
     CHECK("twenty ordered records use fewer than twenty block writes",
           g_write_calls - writes_before < 20u);
     file_text(&s, out, sizeof out);
-    CHECK("first ordered record present", strstr(out, "[00000000] ttyS0| record 00\n") != 0);
+    CHECK("first ordered record present", strstr(out, "[0000000000] ttyS0| record 00\n") != 0);
     CHECK("last ordered record present", strstr(out, "ttyS0| record 19\n") != 0);
 }
 
@@ -504,7 +504,9 @@ static void test_ordered_prefix_is_fixed_width(void) {
     file_text(&s, out, sizeof out);
     for (p = out; (p = strchr(p, '[')) != 0; p++) {
         seen++;
-        CHECK("prefix is 8 digits then ']'", p[9] == ']' && p[10] == ' ');
+        /* #585: TEN digits. Eight wrapped at 100 MB, which an overnight run passes in about
+         * nine hours -- inside the very run reclaim exists to make capturable. */
+        CHECK("prefix is 10 digits then ']'", p[11] == ']' && p[12] == ' ');
     }
     CHECK("both later records stamped", seen == 2u);
 }
@@ -545,8 +547,44 @@ static void test_ordering_covers_records_written_at_open(void) {
     file_text(&s, out, sizeof out);
     CHECK("first backlog record is stamped", out[0] == '[');
     CHECK_STR("both backlog records stamped, offsets are their positions",
-              "[00000000] usb-log: early boot line\n"
-              "[00000025] usb-log: second early line\n",
+              "[0000000000] usb-log: early boot line\n"
+              "[0000000025] usb-log: second early line\n",
+              out);
+}
+
+/*
+ * #585: THE ORDERING KEY MUST SURVIVE A RECLAIM.
+ *
+ * Reclaim slides the buffer down, so a buffer INDEX restarts near zero. If the prefix used the
+ * index, offsets would repeat within one run and a merge tool sorting by them would interleave hour
+ * six with hour one -- silently, because the numbers still look like numbers. The key is
+ * hype_logbuf_reclaimed() + index for exactly this reason, and this is the test that pins it.
+ */
+static void test_order_key_is_absolute_across_reclaim(void) {
+    hype_log_sink_t s;
+    char out[4096];
+    build_vol();
+    hype_logbuf_reset();
+    hype_logbuf_append("usb-log: before\n");
+    CHECK_HEX("open ordered", HYPE_LOG_SINK_OK,
+              hype_log_sink_open_ordered(&s, vol_read, vol_write, NULL, "AB.LOG", 0,
+                                         HYPE_LOG_SINK_HYPE));
+    /* The sink has flushed all 16 bytes; reclaim exactly those and rebase its cursor, which is what
+     * fw_1_logbuf_reclaim() does on the real path. */
+    {
+        unsigned int dropped = hype_logbuf_reclaim_unlocked(hype_log_sink_flushed(&s));
+        CHECK("reclaimed the flushed prefix", dropped == 16u);
+        s.flushed -= dropped;
+        CHECK("cursor rebased to the front", s.flushed == 0u);
+    }
+    hype_logbuf_append("usb-log: after\n");
+    CHECK_HEX("flush", 0, hype_log_sink_flush(&s));
+    file_text(&s, out, sizeof out);
+    /* The second record sits at buffer index 0 but absolute position 16. A relative key would have
+     * written [0000000000] twice. */
+    CHECK_STR("the post-reclaim record keeps its absolute position",
+              "[0000000000] usb-log: before\n"
+              "[0000000016] usb-log: after\n",
               out);
 }
 
@@ -593,6 +631,7 @@ int main(void) {
     test_ordered_prefix_reconstructs_the_combined_stream();
     test_ordered_prefix_is_fixed_width();
     test_ordered_off_by_default();
+    test_order_key_is_absolute_across_reclaim();
     test_ordered_set_on_null_is_safe();
     test_ordering_covers_records_written_at_open();
     test_every_record_is_keyed();

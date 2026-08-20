@@ -42,14 +42,41 @@
  * problem whose alternative is guessing which diagnostics to switch off before
  * a run that takes a cold boot to repeat.
  *
- * NOT a ring buffer, deliberately, and this run is why the non-wrapping choice
- * is right: hype says out loud that capture stopped and that the log is
- * incomplete rather than the end of the run. A wrap would have silently eaten
- * the boot and placement lines -- the ones every ticket is gated on -- and left
- * a log that looked complete.
+ * NOT a ring buffer, deliberately: hype says out loud that capture stopped and that the log is
+ * incomplete rather than the end of the run. A wrap would have silently eaten the boot and
+ * placement lines -- the ones every ticket is gated on -- and left a log that looked complete.
+ *
+ * #585: RECLAIM, which is how an overnight run becomes capturable without becoming a ring.
+ *
+ * Capacity was still the run-length limit, not the stick: 8 MiB buys about 44 minutes at the rate
+ * measured above, and an 8-hour stress run needs ~92 MiB. Raising capacity to fit the longest run
+ * anyone might attempt would hold, in BSS, data that has ALREADY been written to a 58 GB stick.
+ *
+ * So bytes every active sink has already streamed out are dropped from the front and the remainder
+ * slides down. The buffer then holds only the not-yet-written window, and the run length is bounded
+ * by the medium instead of by RAM.
+ *
+ * The safety property is not a policy, it is arithmetic: reclaim is bounded by the MINIMUM flush
+ * position across the sinks, so a byte is only dropped once every file already has it. With no
+ * writable volume no sink advances, the minimum stays 0, nothing is reclaimed, and the behaviour is
+ * exactly what it was -- stop at capacity and say so. That is also precisely the case where the
+ * in-RAM copy is the only artefact, so "the start is always intact" survives where it matters and
+ * is traded away only when a complete copy exists on disk.
+ *
+ * `reclaimed` records how many bytes went, so a next-boot dump describes what it has instead of
+ * presenting a mid-stream buffer as the beginning of a run.
  */
 
+/*
+ * #ifndef-guarded so a VALIDATION build can shrink it, the same knob shape HYPE_FW_1_GUEST_RAM_MB
+ * uses. Reclaim only engages once the buffer is under pressure, and at 8 MiB that takes ~44 minutes
+ * of real output -- far too slow to iterate on. A build with a 256 KiB buffer reaches the same state
+ * in about a minute and exercises the identical code path, which is how the mechanism gets tested
+ * under QEMU rather than only on the hardware it exists for.
+ */
+#ifndef HYPE_LOGBUF_CAPACITY
 #define HYPE_LOGBUF_CAPACITY (8u * 1024u * 1024u)
+#endif
 
 /* RT-1d: the buffer is page-aligned (see g_logbuf's __attribute__((aligned))
  * in logbuf.c) and UEFI loads hype.efi's image at a page-aligned physical
@@ -63,7 +90,7 @@
  * that finds it (RT-1b) has almost certainly found a real hype log rather
  * than coincidental bytes. */
 #define HYPE_LOGBUF_MAGIC 0x00474F4C65707968ULL /* 'h''y''p''e''L''O''G''\0' */
-#define HYPE_LOGBUF_VERSION 1u
+#define HYPE_LOGBUF_VERSION 2u
 
 /*
  * Self-describing capture region. The header precedes the data so a
@@ -75,9 +102,23 @@
 typedef struct {
     uint64_t magic;     /* HYPE_LOGBUF_MAGIC once stamped */
     uint32_t version;   /* HYPE_LOGBUF_VERSION */
-    uint32_t len;       /* captured bytes in data[] (<= HYPE_LOGBUF_CAPACITY) */
+    uint32_t len;       /* bytes RESIDENT in data[] (<= HYPE_LOGBUF_CAPACITY) */
     uint32_t truncated; /* non-zero if any append was dropped for capacity */
     uint32_t checksum;  /* rolling sum of data[0..len) */
+    /*
+     * #585: bytes dropped from the FRONT of data[] because every active sink had already written
+     * them out. Zero on a run with no writable log volume, which is the case where the in-RAM copy
+     * is the only artefact -- so this is 0 exactly when the old "the start is always intact"
+     * guarantee still matters, and non-zero only when a complete copy exists on disk.
+     *
+     * A next-boot dumper MUST report it. `len` alone would describe a buffer whose first byte is
+     * mid-stream as though it were the start of the run, and silently presenting a log that begins
+     * nowhere in particular is the failure this field exists to prevent.
+     *
+     * 64-bit: an overnight run at the measured ~3.2 KB/s reclaims about 92 MiB, and a multi-day
+     * soak would pass 4 GiB.
+     */
+    uint64_t reclaimed;
     char data[HYPE_LOGBUF_CAPACITY];
 } hype_logbuf_t;
 
@@ -98,6 +139,25 @@ unsigned int hype_logbuf_len(void);
 
 /* Non-zero if any append was dropped for lack of capacity. */
 int hype_logbuf_truncated(void);
+
+/*
+ * #585: drop bytes [0, upto) from the front, sliding the remainder down. `upto` MUST be a position
+ * every active sink has already flushed -- the caller owns that (it is the minimum of their flush
+ * cursors), because only the caller knows how many sinks there are.
+ *
+ * Returns the number of bytes actually dropped, which the caller subtracts from each sink's cursor.
+ * Clamped to the resident length, so an over-large `upto` empties the buffer rather than reading
+ * past it.
+ *
+ * Called with the append lock held by the caller (hype_logbuf_lock), because it MOVES the bytes a
+ * concurrent append would be writing into.
+ */
+unsigned int hype_logbuf_reclaim_unlocked(unsigned int upto);
+
+/* Total bytes ever dropped from the front. Added to a buffer index it gives the absolute stream
+ * position, which is what an ordering prefix must use so records stay totally ordered across a
+ * reclaim (#338's whole reason for that prefix). */
+uint64_t hype_logbuf_reclaimed(void);
 
 /* The live capture region, header included -- boot uses this to place/
  * persist it (RT-1a physical placement, RT-1b dump). */
