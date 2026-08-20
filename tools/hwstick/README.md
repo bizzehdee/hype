@@ -74,7 +74,7 @@ media, one from its own disk) plus the microtest suite. Each guest gets one phys
    overwrites them.
 
 **Boot 2 (about 1 minute, optional)** — the suite alone, one VM. Use it when the Alpine guests are
-not the point, e.g. re-checking #556 or #557 after a fix.
+not the point, e.g. re-checking #557 after a fix.
 
 ```sh
 mv hype.cfg hype-alpine.cfg && mv hype-micro.cfg hype.cfg
@@ -146,9 +146,8 @@ runs the microtests in turn inside a single guest.
 | `vm0`,`vm1` | **#461** | watch-only: a host `#GP (vector 13)` with RIP inside the AP trampoline |
 | `vm1` | **#120** | `vm1 boot=disk -- no installer media attached`, then the guest reaching a login prompt. It booted its own disk with nothing to stream from |
 | `vm1` | **#525** | after the 10-minute delay: `HAVE-TASKSET`, then a `0xcf9` write **naming vCPU 1**, vm1 restarting, and `VM1-REBOOTED-up<small>` + `VM1-RENPROC-2` from the fresh boot. `NO-TASKSET` means the arm did not run |
-| `vm2` suite | **#553** | `intdeliver`: `resumes past HLT=` vs the tick count |
-| `vm2` suite | **#557** | `intdeliver` on the last AMD run got **38M HLT exits and zero interrupts**. If it PASSES now, #557 was mis-scoped |
-| `vm2` suite | **#556** | `pflash` is expected to **FAIL** |
+| `vm2` suite | **#580** | `intdeliver`: `at_hlt=` must be **0** and `past_hlt=` must equal the tick count. Fixed in 22997ce; this is the bare-metal confirmation of its bar ("a real guest still boots on both vendors") |
+| `vm2` suite | **#557** | the **`PITROUTE`** line, not the verdict. `edges=` is the denominator this ticket lacked; `coalesced=` accounts for the PIC's one-bit IRR merging edges a guest is not acknowledging. A guest served by the 8259 shows `pic_delivered` climbing; one genuinely starved shows `pic_delivered=0` **with `coalesced=0`**, and `mIMR`/`mISR` on the same line say why |
 | `vm2` suite | **#552** | `cpumsr`: `vmx = absent` |
 | `vm2` suite | — | `ram1` (page aliasing in the real nested tables), `pci` (ECAM/BAR/MSI), `fwcfg` (PIO vs DMA agreement), `pausespin` (preemption + invariant TSC) |
 
@@ -160,7 +159,7 @@ Each member is announced **before** it runs:
 MICRO RUN: ram1
 MICRO PASS: ram1
 ...
-MICRO SUITE: ran=8 passed=7 failed=1 noverdict=0 skipped=0 unknown=0
+MICRO SUITE: ran=8 passed=8 failed=0 noverdict=0 skipped=0 unknown=0
 ```
 
 **The summary line's absence is the signal** that the sweep was truncated — a suite that died halfway
@@ -183,14 +182,25 @@ LC_ALL=C grep -a "boot=disk" HYPE.LOG                       # #120
 LC_ALL=C grep -a -E "resumes past HLT|TSC (rate|cycles)" HYPE.LOG   # #553, #555
 ```
 
-Expected results, so a real regression is not lost in the noise: **`pflash` FAILS** (#556) and
-**`intdeliver` may FAIL** (#557 — it got zero interrupts on the last AMD run). Everything else should
-PASS. Any other FAIL, any missing verdict, or a missing `MICRO SUITE:` summary is new.
+Expected results, so a real regression is not lost in the noise: **all 8 PASS.** That is a change —
+this section used to say `pflash` FAILS (#556) and `intdeliver` may FAIL (#557), and both are out of
+date: #556 is closed, and the QEMU rehearsal of this exact stick now reports
+
+```
+MICRO SUITE: ran=8 passed=8 failed=0 noverdict=0 skipped=0 unknown=0
+```
+
+Leaving "expected to fail" text in place after the failure is gone is worse than having none: a real
+`pflash` regression would be dismissed as expected, and 8/8 would read as suspicious. **Any FAIL,
+any missing verdict, or a missing `MICRO SUITE:` summary is now new.**
+
+`intdeliver` passing here says nothing about #557, which is a BARE-METAL ticket — the same binary
+and the same test got 38M HLT exits on the last AMD run. Read its `PITROUTE` line, not its verdict.
 
 **A missing microtest verdict is a failure, not an absence of news** — a guest that wedges or
-triple-faults prints neither PASS nor FAIL. Two verdicts are expected to be interesting rather than
-green: `pflash` should FAIL (that is #556's reproduction), and `intdeliver`'s resume count is the
-measurement rather than its PASS.
+triple-faults prints neither PASS nor FAIL. One verdict is still not the interesting part:
+`intdeliver`'s `PITROUTE` funnel and its `at_hlt`/`past_hlt` split are the measurement, and it can
+PASS while carrying the answer to #557 either way.
 
 ## If the run comes up short
 
