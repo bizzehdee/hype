@@ -73,7 +73,11 @@ int hype_virtio_blk_common_cfg_read(const hype_virtio_blk_t *dev, uint32_t offse
             return 0;
         case HYPE_VIRTIO_COMMON_CFG_DEVICE_FEATURE:
             if (size_bytes != 4u) return -1;
-            if (dev->device_feature_select == 1u) {
+            if (dev->device_feature_select == 0u) {
+                /* #295 step 0: VIRTIO_BLK_F_SEG_MAX. Without it Linux sets max_segments to 1 and
+                 * every request is one page -- see the header for the measurement. */
+                *out_value = 1u << HYPE_VIRTIO_BLK_F_SEG_MAX_BIT;
+            } else if (dev->device_feature_select == 1u) {
                 *out_value = 1u << (HYPE_VIRTIO_F_VERSION_1_BIT - 32u);
             } else {
                 *out_value = 0u;
@@ -270,12 +274,21 @@ int hype_virtio_blk_device_cfg_read(const hype_virtio_blk_t *dev, uint32_t offse
             if (size_bytes != 4u) return -1;
             *out_value = (uint32_t)(dev->capacity_sectors >> 32);
             return 0;
+        case HYPE_VIRTIO_BLK_CFG_SEG_MAX:
+            /*
+             * #295 step 0: read by a driver that accepted VIRTIO_BLK_F_SEG_MAX. Reported
+             * unconditionally rather than only when the bit was negotiated -- config space is
+             * read-only state, a driver that did not take the bit has no reason to read this
+             * offset, and a value that appears only after a successful negotiation is one more
+             * thing that can be wrong in a way nothing reports.
+             */
+            if (size_bytes != 4u) return -1;
+            *out_value = HYPE_VIRTIO_BLK_SEG_MAX;
+            return 0;
         default:
-            /* size_max/seg_max/geometry/blk_size are all gated behind
-             * optional feature bits this project deliberately doesn't
-             * offer (see this header's own top comment) -- a
-             * compliant driver has no reason to read them, and this
-             * project has no real value to report for them. */
+            /* size_max/geometry/blk_size are still gated behind optional feature bits this project
+             * does not offer -- a compliant driver has no reason to read them, and this project has
+             * no real value to report for them. */
             *out_value = 0u;
             return 0;
     }

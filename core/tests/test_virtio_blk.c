@@ -24,6 +24,25 @@ static uint32_t common_read(const hype_virtio_blk_t *dev, uint32_t offset, uint8
     return value;
 }
 
+#define CHECK_INT(desc, expected, actual) \
+    do { \
+        if ((long long)(expected) != (long long)(actual)) { \
+            printf("FAIL: %s: expected %lld, got %lld\n", (desc), (long long)(expected), \
+                   (long long)(actual)); \
+            failures++; \
+        } \
+    } while (0)
+
+static uint32_t device_read(const hype_virtio_blk_t *dev, uint32_t offset, uint8_t size) {
+    uint32_t value = 0xDEADBEEFu;
+    int rc = hype_virtio_blk_device_cfg_read(dev, offset, size, &value);
+    if (rc != 0) {
+        printf("FAIL: device_read(0x%x, %u) unexpectedly rejected\n", offset, size);
+        failures++;
+    }
+    return value;
+}
+
 static void common_write(hype_virtio_blk_t *dev, uint32_t offset, uint8_t size, uint32_t value) {
     int rc = hype_virtio_blk_common_cfg_write(dev, offset, size, value);
     if (rc != 0) {
@@ -53,7 +72,14 @@ static void test_feature_negotiation_offers_only_version_1(void) {
     CHECK_HEX("device_feature_select reads back", 0u,
               common_read(&dev, HYPE_VIRTIO_COMMON_CFG_DEVICE_FEATURE_SELECT, 4u));
     value = common_read(&dev, HYPE_VIRTIO_COMMON_CFG_DEVICE_FEATURE, 4u);
-    CHECK_HEX("low feature word offers nothing", 0u, value);
+    /*
+     * #295 step 0: the low word now offers VIRTIO_BLK_F_SEG_MAX (bit 2) and nothing else. It used
+     * to offer nothing, and that silence told Linux ONE SEGMENT PER REQUEST -- which shredded a
+     * 1 MiB write into 256 four-kilobyte ones. Asserted as an exact word rather than a bit test, so
+     * a future optional feature cannot be added without this test being read.
+     */
+    CHECK_HEX("low feature word offers exactly VIRTIO_BLK_F_SEG_MAX",
+              1u << HYPE_VIRTIO_BLK_F_SEG_MAX_BIT, value);
 
     common_write(&dev, HYPE_VIRTIO_COMMON_CFG_DEVICE_FEATURE_SELECT, 4u, 1u);
     CHECK_HEX("device_feature_select reads back after re-selecting", 1u,
@@ -218,8 +244,36 @@ static void test_read_only_and_unmodeled_registers(void) {
     common_write(&dev, HYPE_VIRTIO_COMMON_CFG_DEVICE_FEATURE, 4u, 0xFFFFFFFFu);
     CHECK_HEX("num_queues is unaffected by a write", 1u,
               common_read(&dev, HYPE_VIRTIO_COMMON_CFG_NUM_QUEUES, 2u));
-    CHECK_HEX("device_feature is unaffected by a write", 0u,
+    CHECK_HEX("device_feature is unaffected by a write",
+              1u << HYPE_VIRTIO_BLK_F_SEG_MAX_BIT,
               common_read(&dev, HYPE_VIRTIO_COMMON_CFG_DEVICE_FEATURE, 4u));
+}
+
+
+/*
+ * #295 step 0: seg_max in device config space, and the invariant that makes it safe.
+ *
+ * The number is a trade, not a maximum: a request costs seg_max + 2 descriptors (header +
+ * segments + status), so it has to leave room for more than one request in the queue hype
+ * advertises. Asserting the relationship rather than just the constant is what stops a later
+ * "let's raise seg_max" from quietly making the queue hold a single request.
+ */
+static void test_seg_max_is_reported_and_fits_the_queue(void) {
+    hype_virtio_blk_t dev;
+
+    hype_virtio_blk_reset(&dev, 1);
+    CHECK_HEX("seg_max is reported in device config space", HYPE_VIRTIO_BLK_SEG_MAX,
+              device_read(&dev, HYPE_VIRTIO_BLK_CFG_SEG_MAX, 4u));
+    /* At least two requests of the advertised width must fit the queue, or a deep queue buys
+     * nothing and the guest serialises on descriptor supply instead of on I/O. */
+    CHECK_INT("two full-width requests fit the advertised queue", 1,
+              (int)((HYPE_VIRTIO_BLK_SEG_MAX + 2u) * 2u <= HYPE_VIRTIO_BLK_QUEUE_SIZE_MAX));
+    /* A 4-byte read is the only legal width for this field. */
+    {
+        uint32_t v = 0xDEADu;
+        CHECK_INT("a non-4-byte seg_max read is refused", -1,
+                  hype_virtio_blk_device_cfg_read(&dev, HYPE_VIRTIO_BLK_CFG_SEG_MAX, 2u, &v));
+    }
 }
 
 static void test_reserved_offset_reads_as_zero(void) {
@@ -1195,6 +1249,7 @@ static void test_queue_size_bounds_requests_in_flight(void) {
 int main(void) {
     test_reset_sets_capacity_and_default_queue_size();
     test_feature_negotiation_offers_only_version_1();
+    test_seg_max_is_reported_and_fits_the_queue();
     test_driver_feature_write_accumulates_across_both_halves();
     test_device_status_handshake();
     test_queue_registers_only_apply_to_queue_zero();

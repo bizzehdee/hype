@@ -55,15 +55,51 @@
 #define HYPE_VIRTIO_STATUS_DEVICE_NEEDS_RESET 0x40u
 #define HYPE_VIRTIO_STATUS_FAILED 0x80u
 
-/* The one transport feature bit this project offers -- VIRTIO_F_VERSION_1
+/* The transport feature bit this project offers -- VIRTIO_F_VERSION_1
  * (bit 32 of the 64-bit feature space, i.e. bit 0 of the HIGH 32-bit
- * half a driver reads via device_feature_select=1). Offering zero
- * optional VIRTIO_BLK_F_* bits is spec- and driver-confirmed
- * sufficient for Linux's own virtio_blk to probe and bind (every
- * optional feature's absence is a safe, already-handled fallback
- * path in the real driver) -- deliberately minimal, matching this
- * project's "primitive now, integration later" bias. */
+ * half a driver reads via device_feature_select=1). */
 #define HYPE_VIRTIO_F_VERSION_1_BIT 32u
+
+/*
+ * VIRTIO_BLK_F_SEG_MAX (bit 2 of the LOW half), and why "offering zero optional bits is a safe
+ * fallback" was true of the driver and false of the PERFORMANCE.
+ *
+ * Linux's virtblk_probe() does:
+ *
+ *     err = virtio_cread_feature(vdev, VIRTIO_BLK_F_SEG_MAX, ..., seg_max, &sg_elems);
+ *     if (err || !sg_elems) sg_elems = 1;
+ *     blk_queue_max_segments(q, sg_elems);
+ *
+ * So a device that does not offer this bit is telling the guest ONE SEGMENT PER REQUEST. The block
+ * layer then cannot merge anything: every request is a single physically-contiguous run, which on a
+ * 4 KiB-page host means every request is 4 KiB. Measured on this rig before this bit existed (#295
+ * step 0): `dd bs=1M count=64` to a virtio-blk disk produced count=20480 max=8 hist=0/0/20480/0/0/0
+ * -- twenty thousand 4 KiB writes, not one of them larger, at 443-656 KB/s. A one-megabyte write
+ * was being shredded into 256 requests by hype's own silence.
+ *
+ * The fallback was safe in the sense that mattered at the time (the driver binds and works), and
+ * that is why it stood -- but "the absence of every optional feature is handled" was read as "the
+ * absence costs nothing", and those are different claims.
+ *
+ * hype has been able to serve multi-segment chains since #268, which transfers every data segment
+ * in a chain and advances the LBA per segment. Without this bit that loop could never see more than
+ * one segment, so #268's work was unreachable in practice from a Linux guest.
+ */
+#define HYPE_VIRTIO_BLK_F_SEG_MAX_BIT 2u
+
+/*
+ * What to report in `seg_max`, and it is a trade rather than "as large as possible".
+ *
+ * A request costs seg_max + 2 descriptors (header + segments + status), so a big seg_max means few
+ * requests fit the 256-descriptor queue at once. And the drain issues ONE BACKEND I/O PER SEGMENT
+ * (#268), so a long chain is not fewer disk commands -- it is fewer guest exits and fewer virtqueue
+ * round trips for the same disk work. 32 segments is 128 KiB per request at 4 KiB a segment, and
+ * 256 / (32 + 2) = 7 requests can still be outstanding.
+ *
+ * Turning those contiguous segments into ONE multi-PRDT AHCI command is #295, and it is a separate
+ * change: this bit is what gives it something to gather.
+ */
+#define HYPE_VIRTIO_BLK_SEG_MAX 32u
 
 /* Common configuration structure byte offsets (within the MMIO region
  * a VIRTIO_PCI_CAP_COMMON_CFG capability points at) -- spec §4.1.4.3. */
