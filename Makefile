@@ -22,6 +22,7 @@ HYPE_BUILD_ID := $(shell git describe --always --dirty --abbrev=7 2>/dev/null ||
 
 CFLAGS  := --target=$(TARGET) -ffreestanding -fshort-wchar -mno-red-zone \
            -Wall -Wextra -g -O1 -std=c11 -MMD -MP \
+           -Werror=constant-conversion \
            -DHYPE_BUILD_ID='"$(HYPE_BUILD_ID)"' $(EXTRA_CFLAGS)
 LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 

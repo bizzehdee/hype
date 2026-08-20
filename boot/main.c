@@ -2900,7 +2900,7 @@ static uint32_t *g_ap_timer_reload;
 static uint32_t (*g_vcpu_timer_reload)[HYPE_MAX_VCPUS_PER_VM];
 /* #436: AP run-loop section breadcrumb. The AP sets these; the BSP prints them.
  * Pinpoints WHERE the loop stops when the AP freezes (deterministic ~127k iters). */
-volatile uint8_t *g_436_loop_section;
+volatile uint16_t *g_436_loop_section;
 volatile uint64_t *g_436_loop_iter;
 volatile uint64_t *g_436_last_reason;
 volatile uint64_t *g_436_last_rip;
@@ -10169,7 +10169,7 @@ wait_for_sipi:
                                  (unsigned long long)g_bsp_probe_reason[vm_idx],
                                  (unsigned long long)g_bsp_probe_rip[vm_idx],
                                  bp_guest ? "IN-GUEST" : "IN-HOST", bp_ms,
-                                 g_436_loop_section[vm_idx]);
+                                 (unsigned)g_436_loop_section[vm_idx]);
             }
         }
     }
@@ -24027,7 +24027,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                             (unsigned long long)g_bsp_probe_rip[pv],
                                             p_guest ? "IN-GUEST" : "IN-HOST",
                                             (p_ref != 0ull) ? (pnow - p_ref) * 1000ull / hz : 0ull,
-                                            g_436_loop_section[pv]);
+                                            (unsigned)g_436_loop_section[pv]);
                                     }
                                 }
                                 /* #92 diag: name the CPUID leaves / MSRs a spinning guest hammers.
