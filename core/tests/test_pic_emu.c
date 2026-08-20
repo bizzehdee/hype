@@ -337,8 +337,19 @@ static void test_equal_or_lower_priority_waits_for_eoi(void) {
     CHECK_HEX("with its own vector", 0x20u, vector);
 }
 
-/* The slave nests by its own priority, independently of the master's cascade bit. */
-static void test_slave_nests_by_its_own_priority(void) {
+/*
+ * The cascade is ORDINARY fully nested, not Special Fully Nested Mode.
+ *
+ * My first version of this test asserted that a higher-priority SLAVE line preempts a lower one
+ * while the cascade is in service. It does not, and the code was right: at the master, a second
+ * slave interrupt is another IR2, which is EQUAL priority to the IR2 already in service, so it
+ * waits. Allowing it is exactly what Special Fully Nested Mode (ICW4's SFNM bit) exists for, and
+ * hype does not model SFNM -- no PC BIOS or OS enables it on the legacy pair.
+ *
+ * Recorded rather than quietly corrected, because "a higher slave line should preempt" is the
+ * intuitive and wrong answer, and the next person to read this will have the same intuition.
+ */
+static void test_cascade_is_ordinary_fully_nested(void) {
     hype_pic_emu_t pic;
     uint8_t vector = 0;
 
@@ -348,23 +359,36 @@ static void test_slave_nests_by_its_own_priority(void) {
     pic.master.imr = 0x00u;
     pic.slave.imr = 0x00u;
 
-    /* Slave IRQ10 (index 2) in service, IRQ8 (index 0) pending: higher priority, so it goes. */
-    pic.master.isr = (uint8_t)(1u << 2); /* cascade in service */
+    /* Cascade in service, slave IRQ10 in service, slave IRQ8 (higher) pending: it WAITS. */
+    pic.master.isr = (uint8_t)(1u << 2);
     pic.slave.isr = (uint8_t)(1u << 2);
     hype_pic_emu_raise_global_irq(&pic, 8u);
-    CHECK_HEX("a higher slave line preempts", 1, hype_pic_emu_acknowledge(&pic, &vector));
-    CHECK_HEX("and reports IRQ8's vector", 0x28u, vector);
+    CHECK_HEX("a second slave IRQ waits behind the in-service cascade", 0,
+              hype_pic_emu_acknowledge(&pic, &vector));
+    CHECK_HEX("and stays pending on the slave", 1, (pic.slave.irr & (1u << 0)) != 0);
 
-    /* A LOWER slave line waits, even though the cascade is already in service. */
+    /* A MASTER line higher than the cascade still preempts it -- IR0 beats IR2. */
     hype_pic_emu_reset(&pic);
     pic.master.irq_offset = 0x20u;
     pic.slave.irq_offset = 0x28u;
     pic.master.imr = 0x00u;
     pic.slave.imr = 0x00u;
-    pic.master.isr = (uint8_t)(1u << 2);
-    pic.slave.isr = (uint8_t)(1u << 0);
-    hype_pic_emu_raise_global_irq(&pic, 10u);
-    CHECK_HEX("a lower slave line waits", 0, hype_pic_emu_acknowledge(&pic, &vector));
+    pic.master.isr = (uint8_t)(1u << 2); /* cascade in service */
+    hype_pic_emu_raise_irq(&pic.master, 0);
+    CHECK_HEX("IRQ0 preempts an in-service cascade", 1, hype_pic_emu_acknowledge(&pic, &vector));
+    CHECK_HEX("and reports IRQ0's vector", 0x20u, vector);
+
+    /* With the cascade NOT in service, a slave line is delivered normally. */
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.slave.irq_offset = 0x28u;
+    pic.master.imr = 0x00u;
+    pic.slave.imr = 0x00u;
+    hype_pic_emu_raise_global_irq(&pic, 8u);
+    CHECK_HEX("a slave line goes when the cascade is free", 1,
+              hype_pic_emu_acknowledge(&pic, &vector));
+    CHECK_HEX("with the slave's vector", 0x28u, vector);
+    CHECK_HEX("and the cascade is now in service", 1, (pic.master.isr & (1u << 2)) != 0);
 }
 
 int main(void) {
@@ -390,7 +414,7 @@ int main(void) {
     test_acknowledge_cascade_blocked_when_master_ir2_masked();
     test_higher_priority_preempts_in_service();
     test_equal_or_lower_priority_waits_for_eoi();
-    test_slave_nests_by_its_own_priority();
+    test_cascade_is_ordinary_fully_nested();
 
     if (failures == 0) {
         printf("all tests passed\n");

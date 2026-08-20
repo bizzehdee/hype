@@ -224,44 +224,39 @@ static void test_boot_disk_no_install_media_required(void) {
  * PCI display device, because a Linux guest with bochs-drm inbox would bind it and move its
  * console away from the ramfb surface hype renders and the serial console the input runner drives.
  */
+#define DISPLAY_TEST_BASE                                                                          \
+    "[vm.a]\n"                                                                                     \
+    "vcpus = 1\n"                                                                                  \
+    "mem_mb = 512\n"                                                                               \
+    "boot = kernel\n"                                                                              \
+    "kernel = \\k.bin\n"                                                                           \
+    "os_hint = none\n"
+
 static void test_display_key(void) {
-    const char *base =
-        "[vm.a]\n"
-        "vcpus = 1\n"
-        "mem_mb = 512\n"
-        "boot = kernel\n"
-        "kernel = \\k.bin\n"
-        "os_hint = none\n";
-    char buf[512];
     hype_cfg_t out;
     hype_cfg_result_t res;
 
-    /* Absent -> none. */
-    res = parse_copy(base, &out);
+    /* Absent -> none. This is the case that matters most: a config that never mentions `display`
+     * must not acquire a PCI display device. */
+    res = parse_copy(DISPLAY_TEST_BASE, &out);
     CHECK_INT("no display key parses", HYPE_CFG_OK, res.status);
     CHECK_INT("display defaults to none", (int)HYPE_CFG_DISPLAY_NONE, (int)out.vms[0].display);
 
-    /* Explicit none. */
-    hype_snprintf(buf, sizeof(buf), "%s%s", base, "display = none\n");
-    res = parse_copy(buf, &out);
+    res = parse_copy(DISPLAY_TEST_BASE "display = none\n", &out);
     CHECK_INT("display = none parses", HYPE_CFG_OK, res.status);
     CHECK_INT("display none", (int)HYPE_CFG_DISPLAY_NONE, (int)out.vms[0].display);
 
-    /* Explicit bochs. */
-    hype_snprintf(buf, sizeof(buf), "%s%s", base, "display = bochs\n");
-    res = parse_copy(buf, &out);
+    res = parse_copy(DISPLAY_TEST_BASE "display = bochs\n", &out);
     CHECK_INT("display = bochs parses", HYPE_CFG_OK, res.status);
     CHECK_INT("display bochs", (int)HYPE_CFG_DISPLAY_BOCHS, (int)out.vms[0].display);
 
-    /* A wrong value is refused, not silently defaulted -- a typo must not disable a device the
-     * operator asked for. */
-    hype_snprintf(buf, sizeof(buf), "%s%s", base, "display = vga\n");
-    res = parse_copy(buf, &out);
+    /* A wrong value is refused, not silently defaulted -- a typo must not quietly disable a
+     * device the operator asked for. */
+    res = parse_copy(DISPLAY_TEST_BASE "display = vga\n", &out);
     CHECK_INT("an unknown display value is refused", HYPE_CFG_ERR_BAD_VALUE, res.status);
 
-    /* Duplicate keys are refused like every other key. */
-    hype_snprintf(buf, sizeof(buf), "%s%s", base, "display = bochs\ndisplay = none\n");
-    res = parse_copy(buf, &out);
+    /* Duplicates are refused like every other key. */
+    res = parse_copy(DISPLAY_TEST_BASE "display = bochs\ndisplay = none\n", &out);
     CHECK_INT("a duplicate display is refused", HYPE_CFG_ERR_DUPLICATE_KEY, res.status);
 }
 
