@@ -302,6 +302,95 @@ static void test_wake_enable_mmio(void) {
     CHECK_HEX("MEM|BME set without PM cap", 0x0006u, g_cfg[0x04 / 4] & 0x0006u);
 }
 
+/*
+ * #80: QEMU's e1000 as hype sees it -- 8086:100E, class 0x02/0x00, BAR0 a 32-bit memory BAR.
+ * Real values, so a byte-order or shift mistake in the finder shows up as a wrong address rather
+ * than passing against a made-up fixture.
+ */
+static uint32_t cfg_e1000(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
+    if (bus != 0 || dev != 3 || func != 0) {
+        return 0xFFFFFFFFu;
+    }
+    switch (off) {
+        case 0x00: return 0x100E8086u;  /* Intel 82540EM */
+        case 0x08: return 0x02000003u;  /* class 0x02 / subclass 0x00 / prog-if 0x00 */
+        case 0x10: return 0xFEB80000u;  /* BAR0: 32-bit memory BAR */
+        default:   return 0x00000000u;
+    }
+}
+
+/* A wireless NIC: class 0x02 SUBCLASS 0x80 (other), which must NOT match an Ethernet search. */
+static uint32_t cfg_wifi(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
+    if (bus != 0 || dev != 0x14 || func != 3) {
+        return 0xFFFFFFFFu;
+    }
+    switch (off) {
+        case 0x00: return 0x24fb8086u;
+        case 0x08: return 0x02800000u;  /* 0x02/0x80 -- a network device, not Ethernet */
+        case 0x10: return 0xFEC00004u;
+        default:   return 0x00000000u;
+    }
+}
+
+/* Two Ethernet NICs, to exercise resumable enumeration -- a machine with chipset plus add-in. */
+static uint32_t cfg_two_nics(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
+    if (bus == 0 && dev == 3 && func == 0) {
+        switch (off) {
+            case 0x00: return 0x100E8086u;
+            case 0x08: return 0x02000003u;
+            case 0x10: return 0xFEB80000u;
+            default:   return 0x00000000u;
+        }
+    }
+    if (bus == 2 && dev == 0 && func == 0) {
+        switch (off) {
+            case 0x00: return 0x816810ecu;  /* Realtek RTL8168 -- found, but not drivable */
+            case 0x08: return 0x02000000u;
+            case 0x10: return 0xFE900000u;
+            default:   return 0x00000000u;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+static void test_find_nic(void) {
+    hype_host_nic_t n;
+
+    CHECK_HEX("the e1000 is found", 1, hype_host_pci_find_nic(cfg_e1000, 0, &n));
+    CHECK_HEX("vendor", 0x8086u, n.vendor_id);
+    CHECK_HEX("device", 0x100Eu, n.device_id);
+    CHECK_HEX("BAR0 base", 0xFEB80000u, (unsigned)n.bar_phys);
+    CHECK_HEX("bus", 0, n.bus);
+    CHECK_HEX("dev", 3, n.dev);
+
+    /* A network device that is not Ethernet must not match: reporting a wireless NIC as the
+     * uplink would have hype try to drive a device it has no driver for, and the failure would
+     * look like a broken e1000 driver rather than the wrong device. */
+    CHECK_HEX("a wireless NIC is not an Ethernet match", 0, hype_host_pci_find_nic(cfg_wifi, 0, &n));
+
+    /* No NIC at all is a normal outcome -- networking is opt-in per VM, so this must not be an
+     * error path. */
+    CHECK_HEX("no NIC reports zero", 0, hype_host_pci_find_nic(cfg_no_storage, 0, &n));
+}
+
+static void test_find_all_nics(void) {
+    hype_host_nic_t n;
+    uint32_t bdf = 0;
+
+    CHECK_HEX("first NIC found", 1, hype_host_pci_find_nic_from(cfg_two_nics, 3, 0u, &n, &bdf));
+    CHECK_HEX("first is the Intel", 0x8086u, n.vendor_id);
+
+    /* Resume past it: the second is a Realtek, which hype cannot drive -- but it must be
+     * ENUMERABLE, so the operator is told what else is in the machine rather than left with
+     * "hype picked one and said nothing about the others". */
+    CHECK_HEX("second NIC found", 1,
+              hype_host_pci_find_nic_from(cfg_two_nics, 3, bdf + 1u, &n, &bdf));
+    CHECK_HEX("second is the Realtek", 0x10ecu, n.vendor_id);
+    CHECK_HEX("with its own BAR", 0xFE900000u, (unsigned)n.bar_phys);
+
+    CHECK_HEX("no third NIC", 0, hype_host_pci_find_nic_from(cfg_two_nics, 3, bdf + 1u, &n, &bdf));
+}
+
 static void test_find_xhci(void) {
     hype_host_xhci_t x;
     CHECK_HEX("xHCI found", 1, hype_host_pci_find_xhci(cfg_xhci, 0, &x));
@@ -360,6 +449,8 @@ int main(void) {
     test_find_cap();
     test_disable_interrupts();
     test_wake_enable_mmio();
+    test_find_nic();
+    test_find_all_nics();
     test_find_xhci();
 
     if (failures == 0) {

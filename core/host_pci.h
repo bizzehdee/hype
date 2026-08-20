@@ -28,6 +28,8 @@
 #define HYPE_HOST_PCI_CLASS_STORAGE 0x01u
 #define HYPE_HOST_PCI_SUBCLASS_AHCI 0x06u /* SATA controller; prog-if 0x01 = AHCI 1.0 */
 #define HYPE_HOST_PCI_SUBCLASS_NVME 0x08u /* Non-Volatile Memory; prog-if 0x02 = NVMe */
+#define HYPE_HOST_PCI_CLASS_NETWORK 0x02u
+#define HYPE_HOST_PCI_SUBCLASS_ETHERNET 0x00u /* #80: class 0x02/0x00 is an Ethernet controller */
 #define HYPE_HOST_PCI_CLASS_SERIAL_BUS 0x0Cu
 #define HYPE_HOST_PCI_SUBCLASS_USB 0x03u  /* USB controller; prog-if 0x30 = xHCI */
 #define HYPE_HOST_PCI_PROGIF_XHCI 0x30u
@@ -146,6 +148,39 @@ typedef struct {
     uint16_t device_id;
     uint64_t bar_phys; /* xHCI register window = BAR0 (64-bit memory BAR) */
 } hype_host_xhci_t;
+
+/*
+ * NET-1 (#80): a host Ethernet controller hype can own as its uplink.
+ *
+ * hype owns exactly ONE NIC (plan.md §6e) -- it is the hypervisor's link to the world and guests
+ * reach it through NAT rather than by touching it. The resumable form exists for the same reason
+ * find_xhci_from does: a machine commonly has several NICs (chipset plus add-in, or wired plus
+ * wireless), and reporting only the first makes an unusable choice look like the only one.
+ */
+typedef struct {
+    uint8_t bus;
+    uint8_t dev;
+    uint8_t func;
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint64_t bar_phys; /* the e1000 register window is BAR0 */
+} hype_host_nic_t;
+
+/*
+ * Scans buses 0..max_bus for the first Ethernet controller (class 0x02 / subclass 0x00), filling
+ * *out with its location and BAR0. Returns 1 if found, else 0. Pure given read32.
+ *
+ * Deliberately matches by CLASS, not by vendor/device: the class says "this is a NIC", which is
+ * what the caller needs to report, and whether hype can actually DRIVE it is a separate question
+ * the caller answers from vendor_id/device_id. Matching only 8086:100E here would make an
+ * unsupported NIC indistinguishable from no NIC at all, and "this machine has a Realtek hype
+ * cannot drive" is a far more useful thing to log than silence.
+ */
+int hype_host_pci_find_nic(hype_host_pci_read32_fn read32, uint8_t max_bus, hype_host_nic_t *out);
+
+/* Resumable: scans from `start_bdf` so a caller can enumerate EVERY NIC. */
+int hype_host_pci_find_nic_from(hype_host_pci_read32_fn read32, uint8_t max_bus,
+                                uint32_t start_bdf, hype_host_nic_t *out, uint32_t *out_bdf);
 
 /*
  * USB-1 (#213): scans buses 0..max_bus for the first xHCI USB host controller
