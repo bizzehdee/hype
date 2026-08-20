@@ -1659,6 +1659,32 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
     hype_svm_sync_vintr(real);
 }
 
+/*
+ * #553: THE RULE, measured and cited, because this has been got wrong twice.
+ *
+ * Intel SDM Vol. 2A, "HLT-Halt" (p. 3-439, research/325462-092-sdm-vol-1-2abcd-3abcd-4.pdf):
+ *
+ *   "If an interrupt (including NMI) is used to resume execution after a HLT instruction, the
+ *    saved instruction pointer (CS:EIP) points to the instruction FOLLOWING the HLT instruction."
+ *
+ * So retiring the HLT before injecting is not an optimisation or a Linux quirk -- it is the
+ * architectural requirement. An interrupt delivered while RIP still points AT the hlt makes the
+ * guest's iretq re-execute it, so the guest re-halts and its idle loop makes NO forward progress
+ * per tick.
+ *
+ * MEASURED, on tests/micro/intdeliver: 1154 IRQ0 deliveries at exactly the right 100 Hz rate, and
+ *
+ *     [#553] frame RIP at_hlt=1153 past_hlt=1 other=0
+ *
+ * -- 1153 of them resumed AT the hlt. The guest's own `while (ticks < N) { hlt; resumes++; }` loop
+ * advanced once in 1154 wakeups. Any guest counting one wake per interrupt (a jiffies-driven
+ * timeout, a bounded retry spinner) therefore advances ~1000x slower than the wall clock says,
+ * which is the shape of several past guest stalls here.
+ *
+ * This function is correct. The defect is that the dispatch loop's OTHER injection paths reach a
+ * halted guest without coming through here -- see #580. Anything that injects into a guest that is
+ * sitting at a hlt must retire it first.
+ */
 void hype_svm_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     /* Model an interrupt waking a halted CPU: the HLT retires (so the

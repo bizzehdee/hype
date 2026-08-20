@@ -12680,7 +12680,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * failed, and that is the one untested explanation for the
                  * arm-routine contradiction. Placed at the loop top because the
                  * dispatch below `continue`s for most exits. */
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 uint64_t selw_now = hype_rdtsc();
                 if (g_436_kmod_base == 0 && info.guest_rip >= 0xFFFF800000000000ULL) {
                     fw_1_pe_ctx_t sctx;
@@ -12967,7 +12966,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     /* #318: which vectors actually reach the guest. SVM-only -- reported as
                      * unavailable on VMX rather than as zeros, which would read as "no
                      * interrupts" instead of "not measured". */
-                    /* #563: was a shared `static`; per-VM in vm->diag now. */
                     int vo = hype_snprintf(vm->diag.vl, sizeof(vm->diag.vl), "fw-1 VECHIST vm%u:",
                                            (unsigned)(vm - g_vms));
                     unsigned vv, shown = 0;
@@ -12992,7 +12990,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * a second run: for every unmasked redirection entry, GSI -> vector.
                      */
                     {
-                        /* #563: was a shared `static`; per-VM in vm->diag now. */
                         int ro = hype_snprintf(vm->diag.rl, sizeof(vm->diag.rl), "fw-1 IOAPICRT vm%u:",
                                                (unsigned)(vm - g_vms));
                         unsigned gsi;
@@ -13278,7 +13275,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * booted by this same firmware; the SATA disk's is refused. Any
                      * register that differs is a candidate, and unlike EDK2 internals
                      * it is directly observable from here. */
-                    /* #563: was a shared `static`; per-VM in vm->diag now. */
                     if (vm->diag.hba_dumps < 3u) {
                         vm->diag.hba_dumps++;
                         fw_1_262_hba_dump("cd-works", &g_fw_1_ahci);
@@ -13906,8 +13902,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      * disassembling KeBugCheckEx forward). Read it once, through
                                      * the guest's own page tables.
                                      */
-                                    /* #563: was a shared `static`; per-VM in vm->diag now. */
-                                    /* #563: was a shared `static`; per-VM in vm->diag now. */
                                     if (!vm->diag.bugchk_done && riphist_rip[top[0]] >= 0xFFFF800000000000ULL) {
                                         hype_svm_debug_state_t bs;
                                         unsigned bq;
@@ -14365,7 +14359,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* #239: retain the legacy guest-loop cadence for BSP-guest builds.
              * AP calls are no-ops; the normal AP build drains from the BSP loop. */
             if (g_fw_1_host_tsc_hz != 0) {
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 uint64_t now_u = hype_rdtsc();
                 uint64_t usb_interval = HYPE_USBLOG_WRITE_INTERVAL_SECS * g_fw_1_host_tsc_hz;
                 if (vm->diag.usblog_last_tsc == 0 || now_u - vm->diag.usblog_last_tsc >= usb_interval) {
@@ -14721,7 +14714,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     lapic_ticks = lapic_tick_accum / HYPE_PIT_HZ;
                     lapic_tick_accum -= lapic_ticks * HYPE_PIT_HZ;
                     { /* #436: feed rate + full latch state, one line per 5s */
-                        /* #563: was a shared `static`; per-VM in vm->diag now. */
                         vm->diag.lt_sum += lapic_ticks;
                         uint64_t now_lt = hype_rdtsc();
                         if (g_fw_1_host_tsc_hz && now_lt - vm->diag.lt_last > 5u * g_fw_1_host_tsc_hz) {
@@ -14801,8 +14793,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          * timer left masked), and the guest's InterruptTime runs
                          * ~3.7x its wall clock. Print the PROGRAMMED rate next to
                          * the DELIVERED rate so a mismatch names itself. */
-                        /* #563: was a shared `static`; per-VM in vm->diag now. */
-                        /* #563: was a shared `static`; per-VM in vm->diag now. */
                         uint64_t now_rtc = hype_rdtsc();
                         if (now_rtc - vm->diag.rtc_last_tsc > 5u * g_fw_1_host_tsc_hz) {
                             if (vm->diag.rtc_last_tsc != 0u) {
@@ -15083,7 +15073,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     fw_1_deliver_device_vector(vm, kind, HYPE_FW_1_ATA_GSI, iov); /* #512 */
                     g_ata_irq_delivered++;
                 } else {
-                    /* #563: was a shared `static`; per-VM in vm->diag now. */
                     if (!vm->diag.ata_undelivered_reported) {
                         vm->diag.ata_undelivered_reported = 1;
                         hype_debug_print("fw-1 ATA-IRQ-UNDELIVERED: gsi=%u rte=0x%llx p_is=0x%x "
@@ -15261,6 +15250,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * The flood the old comment worried about is what priority prevents properly: a timer at
          * IR0 cannot nest inside itself, because equal priority still waits for the EOI.
          */
+        /*
+         * #553/#580: THIS PATH DOES NOT RETIRE A HLT, and it is the one that services most ticks.
+         *
+         * If the guest is sitting at a hlt (a HLT exit that the branch further down chose not to
+         * wake, because nothing was pending yet), injecting from here delivers the interrupt with
+         * the frame RIP still pointing AT the hlt -- so the guest's iretq re-executes it and its
+         * idle loop makes no forward progress. Intel SDM Vol. 2A p. 3-439 requires the saved RIP to
+         * point to the instruction FOLLOWING the hlt; hype_svm_vcpu_wake_hlt() does that, and this
+         * path never calls it.
+         *
+         * Measured on tests/micro/intdeliver: 1153 of 1154 deliveries resumed AT the hlt. Tracked
+         * as #580 rather than patched here, because retiring correctly needs a per-vCPU
+         * "halted at a hlt" fact that this loop does not currently carry, and this is the most
+         * regression-prone path in the tree (#318, #455, #521 all landed in it).
+         */
         if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic)) {
             uint8_t pic_vector;
             if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
@@ -15431,7 +15435,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint64_t hz = g_fw_1_host_tsc_hz;
             uint64_t now_s = hype_rdtsc();
             if (hz != 0 && (g_scan_last[svi] == 0 || now_s - g_scan_last[svi] >= hz / 10u)) {
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 unsigned row, col, n = 0;
                 g_scan_last[svi] = now_s;
                 for (row = 0; row < vm->term.rows; row++) {
@@ -15455,7 +15458,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * sequences from being collapsed into one notification.
          */
         {   /* #436: prove the drain gate runs and what blocks it */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
             vm->diag.dr_n++;
 #ifndef HYPE_QUIET
             if (g_fw_1_host_tsc_hz && hype_rdtsc() - vm->diag.dr_last > 5u * g_fw_1_host_tsc_hz) {
@@ -15498,10 +15500,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * that buffer must still cause IRQ1: a real i8042 keeps the
              * output condition asserted, whereas a one-shot FIFO edge loses
              * the input forever behind the pre-existing byte. */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
             unsigned long long kbd_queued = 0;
             unsigned long long ignored_read = 0, ignored_dropped = 0;
             int kbd_route_changed = vm->diag.kbd_rte1_seen &&
@@ -15543,9 +15541,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * masked IO-APIC route. Reassert that existing AUX byte once when
              * the guest enables GSI12; otherwise the old edge is lost and the
              * keyboard driver correctly remains behind AUX_DATA forever. */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
             int mouse_route_changed = vm->diag.mouse_rte12_seen &&
                 vm->diag.mouse_rte12_last != g_fw_1_ioapic.rte[12];
             uint8_t miov;
@@ -15633,7 +15628,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * (AGENTS.md): CLGI in particular would otherwise mask physical interrupts on this
              * guest's pinned core, taking the host's timer tick with it.
              */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
             vm->diag.svm_insn_n++;
             if (vm->diag.svm_insn_n <= 8ull) {
                 hype_debug_print("fw-1 %s: guest executed an SVM instruction (exit=0x%llx) at "
@@ -15889,7 +15883,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * instruction bytes means the path is live and we can trust the
              * MMIO decode. */
             {
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 if (!vm->diag.fw1_da_diag) {
                     vm->diag.fw1_da_diag = 1;
                     hype_debug_print("fw-1 DIAG: 1st NPF decode-assist n=%u (0=none->ptwalk) "
@@ -16264,9 +16257,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          * read the CD (AHCI/ATAPI issue); with read10>0 but no
                          * boot, it's a boot-order/bootable-media issue. */
                         {
-                            /* #563: was a shared `static`; per-VM in vm->diag now. */
-                            /* #563: was a shared `static`; per-VM in vm->diag now. */
-                            /* #563: was a shared `static`; per-VM in vm->diag now. */
                             if (vm->diag.read10_first_tsc == 0 && g_fw_1_atapi.read10_count >= 1) {
                                 vm->diag.read10_first_tsc = hype_rdtsc();
                             }
@@ -16430,7 +16420,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (npf.guest_phys_addr >= vblk_bar &&
                     npf.guest_phys_addr < vblk_bar + HYPE_VIRTIO_BLK_BAR_SIZE) {
                     if (vm->disk[0].is_physical) {
-                        /* #563: was a shared `static`; per-VM in vm->diag now. */
                         if (!vm->diag.dbg229_once) {
                             vm->diag.dbg229_once = 1;
                             hype_debug_print("#229dbg npf: CR3=0x%llx g_pml4=0x%llx nvme_bar=0x%llx\n",
@@ -16586,8 +16575,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             fw_1_watchdog_observe(vm, (unsigned)(vm - g_vms), (uint64_t)info.reason,
                                   info.guest_rip, 0, 0);
             if (vmm_absorb_mmio_npf(kind, ctx, insn) == 0) {
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 uint64_t page = npf.guest_phys_addr & ~0xFFFULL;
                 unsigned k;
                 int already = 0;
@@ -16785,7 +16772,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * buffer. 256 covers a DEBUG line; a longer transfer is consumed and
                  * truncated rather than left half-done, which would desynchronise the
                  * guest's own rep. */
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 unsigned int dbg_n = 0;
                 int dr = vmm_handle_debug_port_ioio(kind, ctx, HYPE_FW_1_DEBUG_PORT,
                                                     &g_fw_1_dma_map, vm->diag.dbg_bytes,
@@ -16826,8 +16812,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * the boot to a crawl on real hardware; latch it like the
                  * MSR-trace flood so discovery still works without the
                  * per-access render. */
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 uint32_t key;
                 unsigned int k;
                 int already = 0;
@@ -16873,7 +16857,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (vmm_reason_is_exception(kind, ctx, info.reason, 1)) {
             /* #436: the KeBugCheckEx breakpoint. Report the call exactly as the
              * guest made it, then disarm so the bugcheck proceeds untouched. */
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
             /* #436: this probe runs constantly and succeeds; report only the
              * execution that is about to fault -- the one whose clamped address
              * equals the value the bugcheck reported. */
@@ -16888,7 +16871,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * line in the log is the execution that faulted -- no condition
                  * needed, and no risk of the condition being wrong (which it has
                  * been twice). */
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 vm->diag.ent_n++;
                 {
                 hype_svm_debug_state_t ds;
@@ -16920,7 +16902,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             (HYPE_521_TRAP_PF && vmm_reason_is_exception(kind, ctx, info.reason, 14))) {
             unsigned vec = (unsigned)vmm_exception_vector(kind, ctx, info.reason);
             int is_gp = (vec == 13u);
-            /* #563: was a shared `static`; per-VM in vm->diag now. */
             if (vm->diag.guestexcp_log_n < 96u) {
                 /*
                  * Take RIP/CR3 from the VENDOR-NEUTRAL exit info, not from
@@ -16987,14 +16968,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * this is three lines per fault and the fault repeats.
                  */
                 if (kind == HYPE_VMM_KIND_VMX) {
-                    /* #563: was a shared `static`; per-VM in vm->diag now. */
                     if (vm->diag.excdump_n < 3u) {
                         vm->diag.excdump_n++;
                         hype_vmx_vcpu_dump_ept_violation(ctx);
                     }
                 }
                 if (kind == HYPE_VMM_KIND_VMX && ib[0] == 0x0Fu && ib[1] == 0x22u) {
-                    /* #563: was a shared `static`; per-VM in vm->diag now. */
                     if (vm->diag.cr_probe_n < 4u) {
                         hype_vmx_cr_diag_t cd;
                         unsigned crn = (unsigned)((ib[2] >> 3) & 7u);
@@ -17294,14 +17273,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * silent -- resolve the RIP against winload/ntoskrnl offline.
              */
             if (kind != HYPE_VMM_KIND_VMX) {
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 hype_vmm_intr_state_t dh;
                 vmm_get_intr_state(kind, ctx, &dh);
                 if (!vm->diag.deadhalt_dumped && productive_exits >= HYPE_FW_1_BOOTED_EXITS &&
                     ((dh.rflags >> 9) & 1u) == 0u) {
                     uint64_t rip = info.guest_rip;
                     uint64_t cr3 = vmm_get_cr3(kind, ctx);
-                    /* #563: was a shared `static`; per-VM in vm->diag now. */ /* static: keep run_fw_1_test frame under __chkstk */
                     unsigned k;
                     vm->diag.deadhalt_dumped = 1;
                     for (k = 0; k < 16u; k++) { vm->diag.ib[k] = 0; }
@@ -17345,7 +17322,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * the timer-IRQ wedge, and IF/shadow/eventinj/vintr/pending
              * tell whether it's a dead IF=0 halt or ready-but-undelivered. */
             {
-                /* #563: was a shared `static`; per-VM in vm->diag now. */
                 if (!vm->diag.wedge_dumped && g_fw_1_host_tsc_hz != 0 &&
                     tb_last_tsc - last_progress_tsc >= 2ULL * g_fw_1_host_tsc_hz &&
                     (g_fw_1_pic.master.isr != 0 || g_fw_1_pic.slave.isr != 0)) {

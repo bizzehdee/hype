@@ -38,27 +38,76 @@ static volatile unsigned long long g_wrong_vector;
  * How many times control got past the HLT. Volatile so it counts what its name says -- it began as a
  * plain local, which at -O2 the compiler was free not to keep coherent.
  *
- * Making it volatile did NOT change the number, which is the interesting part: the guest reports
- * ~1154 deliveries against ONE resume past the HLT. Those should be close. #553 exists to explain
- * it and deliberately is not guessed at here; the most likely mechanism is that the HLT is not
- * retired before injection, so each iretq returns to the hlt itself, but that has not been
- * confirmed and this comment is not the place to assert it.
+ * Making it volatile did NOT change the number, which was the first clue: the guest reports ~1154
+ * deliveries against ONE resume past the HLT.
+ *
+ * #553 ANSWERED IT, and the mechanism is the one that was suspected: the HLT is not retired before
+ * injection, so each iretq returns to the hlt itself. The evidence is the at_hlt/past_hlt
+ * breakdown this test now prints -- 1153 of 1154 deliveries had an interrupt frame pointing AT the
+ * hlt. Intel SDM Vol. 2A p. 3-439 requires the saved RIP to point to the instruction FOLLOWING the
+ * hlt, so this is a defect and not a defensible modelling choice; it is tracked as #580.
+ *
+ * The relationship is REPORTED and not yet asserted on purpose. Asserting the correct rule
+ * (past_hlt == ticks) would make this test fail on every run until #580 lands, and a permanently
+ * red test in the default suite trains people to ignore the suite. #580 carries the assertion, so
+ * it arrives with the fix.
  *
  * It does not affect this test's verdict: what is asserted is that ticks arrive, on the vector IRQ0
  * was remapped to, and keep arriving. Both counts are reported so a change in their relationship is
  * visible rather than silent.
  */
 static volatile unsigned long long g_resumes;
+/*
+ * #553: WHERE the interrupt frame says the guest was, so "1154 deliveries, 1 resume" can be
+ * explained rather than guessed at. The frame's RIP is the first quadword the CPU pushes, so the
+ * ISR can read it off its own stack and no host-side instrumentation is needed.
+ *
+ * If the HLT was RETIRED before injection, the frame RIP is the byte AFTER the hlt (hlt is one
+ * byte, 0xF4) and each iretq resumes the C loop. If it was NOT retired, the frame RIP is the hlt
+ * itself and every iretq re-executes it -- the guest re-halts and the loop never advances, which is
+ * the mechanism #318 already found once.
+ */
+extern const char micro_hlt_site[]; /* #553: the labelled hlt, defined in the asm below */
+static volatile unsigned long long g_frame_rip;      /* the most recent frame's RIP */
+static volatile unsigned long long g_frame_at_hlt;   /* deliveries whose frame RIP == the hlt */
+static volatile unsigned long long g_frame_past_hlt; /* deliveries whose frame RIP == hlt + 1 */
 
 /*
  * The handler. Increments the counter and EOIs the master. Written in asm because a naked function
  * must not have a compiler prologue -- an interrupt frame is not a call frame, and a pushed
  * register would be popped as part of it.
  */
+/*
+ * #553: also records WHERE the interrupt frame points, which is what distinguishes an unretired
+ * HLT from a mis-counted tick. The frame RIP is at (%rsp) on entry -- an interrupt gate with no
+ * error code -- so it is 16(%rsp) after two pushes.
+ *
+ * The pushes are not optional. An ISR is not a call frame: a naked handler that clobbers a register
+ * corrupts the interrupted code's copy of it. This handler used to write %al with no save at all,
+ * which happened to be harmless only because the interrupted instruction is a hlt with nothing live
+ * in rax -- true today, and not a property to rely on.
+ */
 MICRO_ISR(irq0_isr,
+          "pushq %rax\n\t"
+          "pushq %rcx\n\t"
+          "movq 16(%rsp), %rax\n\t"
+          "movq %rax, g_frame_rip(%rip)\n\t"
+          "leaq micro_hlt_site(%rip), %rcx\n\t"
+          "cmpq %rcx, %rax\n\t"
+          "jne 1f\n\t"
+          "incq g_frame_at_hlt(%rip)\n\t"
+          "jmp 2f\n\t"
+          "1:\n\t"
+          "incq %rcx\n\t"
+          "cmpq %rcx, %rax\n\t"
+          "jne 2f\n\t"
+          "incq g_frame_past_hlt(%rip)\n\t"
+          "2:\n\t"
           "incq g_ticks(%rip)\n\t"
           "movb $0x20, %al\n\t"
-          "outb %al, $0x20\n\t")
+          "outb %al, $0x20\n\t"
+          "popq %rcx\n\t"
+          "popq %rax\n\t")
 
 /*
  * A gate for one OTHER vector, so a delivery that lands on the wrong vector is counted rather than
@@ -142,7 +191,10 @@ void micro_main(uint64_t zero_page_gpa) {
      * a verdict instead of a wedge.
      */
     while (g_ticks < want) {
-        __asm__ volatile("hlt" ::: "memory");
+        /* #553: the hlt carries a label so the ISR can compare the interrupt frame's RIP against
+         * it. One instance in the binary; if a future compiler duplicates this asm block the
+         * duplicate-symbol error is a loud failure, which is the right outcome. */
+        __asm__ volatile("micro_hlt_site:\n\thlt" ::: "memory");
         g_resumes++;
         if (g_resumes > 200000ull) {
             micro_puts("micro/" NAME ": only ");
@@ -194,6 +246,23 @@ void micro_main(uint64_t zero_page_gpa) {
     micro_puts(", TSC cycles/tick=");
     micro_put_uint(g_ticks != 0ull ? (t1 - t0) / g_ticks : 0ull);
     micro_puts(" (reported, not asserted -- no independent clock in here)\n");
+
+    /*
+     * #553: the answer to "1154 deliveries, 1 resume past the HLT", measured rather than theorised.
+     * at_hlt counts deliveries whose interrupt frame pointed AT the hlt (so the iretq re-executes
+     * it and the C loop does not advance); past_hlt counts those that pointed after it.
+     */
+    micro_puts("micro/" NAME ": [#553] frame RIP at_hlt=");
+    micro_put_uint(g_frame_at_hlt);
+    micro_puts(" past_hlt=");
+    micro_put_uint(g_frame_past_hlt);
+    micro_puts(" other=");
+    micro_put_uint(g_ticks - g_frame_at_hlt - g_frame_past_hlt);
+    micro_puts(" last_frame_rip=");
+    micro_put_hex(g_frame_rip);
+    micro_puts(" hlt_site=");
+    micro_put_hex((unsigned long long)(uintptr_t)&micro_hlt_site);
+    micro_puts("\n");
 
     if (g_wrong_vector != 0ull) {
         micro_fail(NAME, "interrupts were delivered on a vector other than the one IRQ0 was "
