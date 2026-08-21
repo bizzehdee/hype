@@ -1,0 +1,21 @@
+# #525: prove the 0xCF9 guest-reboot path from a NON-BSP vCPU. Linux migrates
+# every reboot to reboot_cpu (default 0 = the guest BSP), which would make the
+# 0xCF9 write always come from vCPU 0 and prove nothing -- so pin it to CPU 1
+# via /sys/kernel/reboot/cpu first. hype's shared port dispatch then logs
+# "vCPU 1 guest reset via ACPI reset register (0xCF9)"; that line, plus exactly
+# one clean restart back to a login prompt, is the ticket's bar.
+timeout 420000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+send echo 1 > /sys/kernel/reboot/cpu && echo CPU525-PINNED-$(cat /sys/kernel/reboot/cpu)\n
+expect CPU525-PINNED-1
+send reboot\n
+
+# The second kernel's own SMP line gates the restart; a guest that comes back
+# 1-vCPU (or never comes back) times out here.
+expect Brought up 1 node, 2 CPUs
+expect localhost login:
+pass smp525-nonbsp-reboot
