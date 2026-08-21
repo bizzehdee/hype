@@ -28,6 +28,7 @@
 #include "../core/phys_confirm.h"
 #include "../core/vm_delete.h" /* TERM-15 (#491) */
 #include "../core/l2switch.h" /* NET-6 (#223) */
+#include "../core/qcow2_create.h" /* TERM-11 (#487) */
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/e1000.h"
@@ -2401,6 +2402,8 @@ static void term_create_feed(const char *line);
 static int g_wizard_active;
 /* TERM-15 (#491): the delete confirmation owns the command line while it is active. */
 static void term_delete_begin(int idx);
+static void term_mkdisk_begin(const char *serial, const char *path, const char *gb_str);
+static void fw_1_mkdisk_pump(void);
 static void term_delete_feed(const char *line);
 static int g_delete_active;
 
@@ -2570,6 +2573,10 @@ static void term_run_cmdline(void) {
                          (unsigned)HYPE_FW_1_SHUTDOWN_GRACE_S);
             break;
         }
+        case HYPE_CMD_MKDISK:
+            term_mkdisk_begin(c.has_arg ? c.arg : 0, c.has_arg2 ? c.arg2 : 0,
+                              c.has_arg3 ? c.arg3 : "");
+            break;
         case HYPE_CMD_DELETE:
             if (idx < 0) {
                 term_resultf("delete: unknown vm '%s'", nm);
@@ -13632,6 +13639,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * owner core, and electing one would stop the network the moment that VM stopped.
              */
             (void)fw_1_uplink_pump(kind);
+            fw_1_mkdisk_pump(); /* TERM-11 (#487): paced qcow2 create, never a blocking one */
             g_bsp_probe_entry_tsc[(unsigned)(vm - g_vms)] = hype_rdtsc(); /* #483 */
             if (ops->vcpu_run(ctx, &info) != 0) {
                 fw_1_dev_lock(vm);
@@ -19877,6 +19885,216 @@ static void fw_1_arm_physical_targets(void) {
             arm_physical_write_confirm(&g_hype_cfg, g_hostnvme_serial, e->model,
                                        g_hostnvme_total_sectors, 0, s0, s1, media_nvme_read);
         }
+    }
+}
+
+/*
+ * TERM-11 (#487): the mkdisk job -- create a FULLY PREALLOCATED qcow2 on a filesystem that
+ * already exists on a named host disk. The content decisions are core/qcow2_create.c's (pure,
+ * tested, qemu-img-clean); this is the pacing and the plumbing.
+ *
+ * PUMPED from the BSP dispatch loop, a few clusters per pass, because a 1 GiB create written
+ * synchronously would park every guest this core serves for minutes. Progress lands on the
+ * terminal's result line each percent, per the ticket: report progress rather than appearing
+ * hung.
+ */
+static struct {
+    int active;
+    hype_qcow2_layout_t lo;
+    uint64_t next_cluster;
+    unsigned last_pct;
+    char path[48];
+    hype_fs_t fs;
+    hype_fs_file_t file;
+    /* the named disk + the mounted volume's partition base */
+    hype_disk_entry_t dev;
+    uint64_t part_base;
+} g_mkdisk;
+
+static int mkdisk_dev_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    uint8_t *d = (uint8_t *)dst;
+    (void)ctx;
+    lba += g_mkdisk.part_base;
+    while (count > 0u) {
+        uint32_t chunk = (count > 8192u) ? 8192u : count;
+        int rc = (g_mkdisk.dev.bus == HYPE_DISK_BUS_AHCI)
+                     ? hype_ahci_host_read(g_mkdisk.dev.bar_phys, g_mkdisk.dev.port, lba,
+                                           (uint16_t)chunk, d)
+                     : hype_nvme_host_read(g_mkdisk.dev.bar_phys, lba, (uint16_t)chunk, d);
+        if (rc != 0) return -1;
+        lba += chunk;
+        d += (uint64_t)chunk * 512u;
+        count -= chunk;
+    }
+    return 0;
+}
+static int mkdisk_dev_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    const uint8_t *s = (const uint8_t *)src;
+    (void)ctx;
+    lba += g_mkdisk.part_base;
+    while (count > 0u) {
+        uint32_t chunk = (count > 8192u) ? 8192u : count;
+        int rc = (g_mkdisk.dev.bus == HYPE_DISK_BUS_AHCI)
+                     ? hype_ahci_host_write(g_mkdisk.dev.bar_phys, g_mkdisk.dev.port, lba,
+                                            (uint16_t)chunk, s)
+                     : hype_nvme_host_write(g_mkdisk.dev.bar_phys, lba, (uint16_t)chunk, s);
+        if (rc != 0) return -1;
+        lba += chunk;
+        s += (uint64_t)chunk * 512u;
+        count -= chunk;
+    }
+    return 0;
+}
+
+/* Mount the first writable, grow-capable volume on g_mkdisk.dev. 0 on success. */
+static int mkdisk_mount_volume(void) {
+    uint64_t bases[8];
+    unsigned nb = 0, bi;
+    static uint8_t mbr[512];
+    hype_gpt_partition_t part;
+    unsigned p;
+
+    g_mkdisk.part_base = 0;
+    bases[nb++] = 0u; /* superfloppy */
+    if (mkdisk_dev_read(0, 0u, 1u, mbr) == 0 && mbr[510] == 0x55u && mbr[511] == 0xAAu) {
+        for (p = 0; p < 4u && nb < 8u; p++) {
+            const uint8_t *e = mbr + 0x1BEu + p * 16u;
+            uint32_t start = (uint32_t)e[8] | ((uint32_t)e[9] << 8) | ((uint32_t)e[10] << 16) |
+                             ((uint32_t)e[11] << 24);
+            if (e[4] != 0u && start != 0u) bases[nb++] = start;
+        }
+    }
+    for (p = 1; p <= 4u && nb < 8u; p++) {
+        if (hype_gpt_find_partition(mkdisk_dev_read, 0, p, &part) == 0) bases[nb++] = part.first_lba;
+    }
+    for (bi = 0; bi < nb; bi++) {
+        g_mkdisk.part_base = bases[bi];
+        if (hype_fs_mount_auto(&g_mkdisk.fs, mkdisk_dev_read, mkdisk_dev_write, 0) != 0) {
+            continue;
+        }
+        if ((hype_fs_caps(&g_mkdisk.fs) & (HYPE_FS_CAP_WRITE_GROW | HYPE_FS_CAP_APPEND)) !=
+            (HYPE_FS_CAP_WRITE_GROW | HYPE_FS_CAP_APPEND)) {
+            continue; /* a volume whose writer cannot grow a file cannot hold this create */
+        }
+        return 0;
+    }
+    return -1;
+}
+
+static void term_mkdisk_begin(const char *serial, const char *path, const char *gb_str) {
+    unsigned i;
+    uint64_t gb = 0;
+    const char *p2 = gb_str;
+
+    if (g_mkdisk.active) {
+        term_resultf("mkdisk: a create is already running (%llu/%llu clusters) -- one at a time",
+                     (unsigned long long)g_mkdisk.next_cluster,
+                     (unsigned long long)g_mkdisk.lo.total_clusters);
+        return;
+    }
+    if (serial == 0 || serial[0] == '\0') {
+        /* No arguments: LIST the disks, per the ticket -- selection is by serial, never index. */
+        char line[96];
+        int off = 0;
+        (void)off;
+        term_resultf("mkdisk: usage mkdisk <disk-serial> <path> <GiB> -- disks present:");
+        for (i = 0; i < g_disk_inv.count; i++) {
+            hype_snprintf(line, sizeof(line), "  %s '%s' %s %lluMiB",
+                          g_disk_inv.disks[i].bus == HYPE_DISK_BUS_AHCI ? "ahci" : "nvme",
+                          g_disk_inv.disks[i].serial, g_disk_inv.disks[i].model,
+                          (unsigned long long)(g_disk_inv.disks[i].total_sectors / 2048u));
+            hype_dash_text_add(&g_cmd_text, line);
+        }
+        return;
+    }
+    for (; *p2 >= '0' && *p2 <= '9'; p2++) {
+        gb = gb * 10u + (uint64_t)(*p2 - '0');
+    }
+    if (gb == 0u || *p2 != '\0' || path == 0 || path[0] == '\0') {
+        term_resultf("mkdisk: usage: mkdisk <disk-serial> <path> <GiB>");
+        return;
+    }
+    for (i = 0; i < g_disk_inv.count; i++) {
+        if (term_streq(g_disk_inv.disks[i].serial, serial)) break;
+    }
+    if (i == g_disk_inv.count) {
+        term_resultf("mkdisk: no disk with serial '%s' -- run mkdisk with no arguments for the "
+                     "list", serial);
+        return;
+    }
+    g_mkdisk.dev = g_disk_inv.disks[i];
+    if (mkdisk_mount_volume() != 0) {
+        term_resultf("mkdisk: no writable, grow-capable volume (FAT32 or ext) found on '%s' -- "
+                     "the create needs a filesystem that already exists there", serial);
+        return;
+    }
+    if (hype_qcow2_layout(gb << 30, &g_mkdisk.lo) != 0) {
+        term_resultf("mkdisk: bad size");
+        return;
+    }
+    (void)hype_strlcpy(g_mkdisk.path, path, sizeof(g_mkdisk.path));
+    /* Create where the filesystem can (FAT32); on ext -- no namespace mutation -- the file must
+     * already exist and is OVERWRITTEN from offset 0, growing as needed. */
+    if (hype_fs_create(&g_mkdisk.fs, g_mkdisk.path, &g_mkdisk.file) != 0 &&
+        hype_fs_lookup(&g_mkdisk.fs, g_mkdisk.path, &g_mkdisk.file) != 0) {
+        term_resultf("mkdisk: cannot create or open '%s' on the %s volume (ext volumes need the "
+                     "file to already exist -- no namespace mutation)", g_mkdisk.path,
+                     g_mkdisk.fs.ops->name);
+        return;
+    }
+    g_mkdisk.next_cluster = 0;
+    g_mkdisk.last_pct = ~0u;
+    g_mkdisk.active = 1;
+    HYPE_LOGF(HYPE_LOG_INFO,
+              "fw-1 MKDISK: creating %s (%llu GiB virtual, %llu clusters) on %s '%s' [#487]\n",
+              g_mkdisk.path, (unsigned long long)gb,
+              (unsigned long long)g_mkdisk.lo.total_clusters,
+              g_mkdisk.fs.ops->name, serial);
+}
+
+/* A few clusters per BSP pass: enough to finish a 1 GiB create in minutes without ever holding
+ * the dispatch loop for more than one write's latency. */
+static void fw_1_mkdisk_pump(void) {
+    static uint8_t cl[HYPE_QCOW2_CREATE_CLUSTER_SIZE];
+    unsigned burst;
+
+    if (!g_mkdisk.active) {
+        return;
+    }
+    for (burst = 0; burst < 8u && g_mkdisk.next_cluster < g_mkdisk.lo.total_clusters; burst++) {
+        if (hype_qcow2_create_cluster(&g_mkdisk.lo, g_mkdisk.next_cluster, cl) != 0 ||
+            hype_fs_write_at(&g_mkdisk.file, g_mkdisk.next_cluster *
+                             (uint64_t)HYPE_QCOW2_CREATE_CLUSTER_SIZE, cl, sizeof(cl)) != 0) {
+            term_resultf("mkdisk: WRITE FAILED at cluster %llu of %llu -- '%s' is INCOMPLETE and "
+                         "not a usable image (volume full?)",
+                         (unsigned long long)g_mkdisk.next_cluster,
+                         (unsigned long long)g_mkdisk.lo.total_clusters, g_mkdisk.path);
+            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 MKDISK: FAILED at cluster %llu/%llu [#487]\n",
+                      (unsigned long long)g_mkdisk.next_cluster,
+                      (unsigned long long)g_mkdisk.lo.total_clusters);
+            g_mkdisk.active = 0;
+            return;
+        }
+        g_mkdisk.next_cluster++;
+    }
+    {
+        unsigned pct = (unsigned)((g_mkdisk.next_cluster * 100u) / g_mkdisk.lo.total_clusters);
+        if (pct != g_mkdisk.last_pct) {
+            g_mkdisk.last_pct = pct;
+            term_resultf("mkdisk: %s -- %u%% (%llu/%llu clusters)", g_mkdisk.path, pct,
+                         (unsigned long long)g_mkdisk.next_cluster,
+                         (unsigned long long)g_mkdisk.lo.total_clusters);
+        }
+    }
+    if (g_mkdisk.next_cluster >= g_mkdisk.lo.total_clusters) {
+        (void)hype_fs_sync(&g_mkdisk.fs);
+        g_mkdisk.active = 0;
+        term_resultf("mkdisk: DONE -- %s, %llu MiB virtual, fully preallocated. Attach it with a "
+                     "[disk.*] entry or target_disk = file:%s",
+                     g_mkdisk.path,
+                     (unsigned long long)(g_mkdisk.lo.virtual_bytes >> 20), g_mkdisk.path);
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 MKDISK: DONE -- %s (%llu clusters) [#487]\n", g_mkdisk.path,
+                  (unsigned long long)g_mkdisk.lo.total_clusters);
     }
 }
 

@@ -1,0 +1,21 @@
+# #487 boot 2: the guest sees the mkdisk-created qcow2 as a 1 GiB disk, writes a marker,
+# reboots itself, and reads the marker back -- "writes survive a VM restart".
+timeout 480000
+expect localhost login:
+send root\n
+expect ~#
+# 1 GiB = 2097152 sectors; the marker carries the guest's OWN reading of the size.
+send echo QSIZE-$(cat /sys/block/vda/size)\n
+expect QSIZE-2097152
+send printf 'HYPE487MARKER' | dd of=/dev/vda bs=512 seek=2048 conv=fsync 2>/dev/null && echo WR-OK\n
+expect WR-OK
+send echo 1 > /proc/sys/kernel/sysrq\n
+expect ~#
+send echo b >/proc/sysrq-trigger\n
+timeout 240000
+expect localhost login:
+send root\n
+expect ~#
+send dd if=/dev/vda bs=512 skip=2048 count=1 2>/dev/null | head -c 13\n
+expect HYPE487MARKER
+pass qcow2-marker-survived-restart
