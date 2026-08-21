@@ -11470,6 +11470,9 @@ wait_for_sipi:
     fw_1_dev_lock(vm); /* SMP-7: enter the loop in the "outside the guest" state */
     ap_locked = 1;
 
+#if HYPE_ENABLE_APICV
+    unsigned int apicv_trace = 0; /* #599 bring-up probe: the first exits after each SIPI */
+#endif
     for (;;) {
         /*
          * An INIT revokes RUNNABLE. Go back and park rather than re-entering: the BSP is about
@@ -11603,6 +11606,14 @@ wait_for_sipi:
         }
         g_ap_vcpu_last_reason[vm_idx][vi] = info.reason;
         g_ap_vcpu_last_rip[vm_idx][vi] = info.guest_rip;
+#if HYPE_ENABLE_APICV
+        if (apicv_trace < 64u) {
+            apicv_trace++;
+            hype_debug_print("fw-1 vm%u/%u apicv-trace #%u: reason=0x%llx rip=0x%llx [#599]\n",
+                             vm_idx, vi, apicv_trace, (unsigned long long)info.reason,
+                             (unsigned long long)info.guest_rip);
+        }
+#endif
 
         /* SMP-6: tick this AP's own LAPIC timer before dispatching the exit, so a HLT that is
          * waiting on a one-shot deadline can actually be woken by it. */
